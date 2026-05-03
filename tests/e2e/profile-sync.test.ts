@@ -25,6 +25,7 @@ import { OrbitDbAdapter } from '../../profile/orbitdb-adapter';
 import { DEFAULT_IPFS_GATEWAYS, DEFAULT_IPFS_BOOTSTRAP_PEERS } from '../../constants';
 import type { FullIdentity } from '../../types';
 import type { TxfStorageDataBase } from '../../storage';
+import { preflightSkip } from './lib/preflight';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -108,7 +109,9 @@ async function makeProfilePair(label: string) {
 // Test Suite
 // ---------------------------------------------------------------------------
 
-describe('Profile (OrbitDB + IPFS) Sync E2E', () => {
+const SKIP_INFRA = preflightSkip(["nostr","ipfs"], 'profile-sync');
+
+describe.skipIf(SKIP_INFRA)('Profile (OrbitDB + IPFS) Sync E2E', () => {
   const cleanups: Array<() => Promise<void>> = [];
 
   afterAll(async () => {

@@ -24,6 +24,16 @@ set -euo pipefail
 
 SDK_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 
+# Infra-probe preflight — swap CLI flow needs nostr (proposal/announce
+# DMs + gift wraps) and aggregator (commitment submission + inclusion
+# proofs). Skip cleanly if any are unreachable.
+TEST_NAME="${TEST_NAME:-swap-cli-e2e}"
+# shellcheck source=./preflight-infra.sh
+source "$(dirname "${BASH_SOURCE[0]}")/preflight-infra.sh"
+if [[ "${E2E_NO_AUTO_PREFLIGHT:-0}" != "1" ]]; then
+  preflight_infra "${E2E_PREFLIGHT_SERVICES:-nostr,aggregator}"
+fi
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------

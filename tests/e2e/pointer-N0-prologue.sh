@@ -116,6 +116,24 @@ maybe_skip_no_testnet() {
 }
 
 # ---------------------------------------------------------------------------
+# Infra-probe preflight — runs @unicitylabs/infra-probe to confirm the live
+# testnet is functional before we spend minutes inside the test. Skips
+# cleanly (exit 0) if any required service is reported UNREACHABLE; warns
+# but proceeds if degraded. Pointer-layer tests need aggregator + nostr
+# (identity binding events) + ipfs (pointer publishes are CAR-encoded
+# bundles pinned to IPFS).
+#
+# Bypass with E2E_SKIP_PREFLIGHT=1; override services via the optional
+# arg to preflight_infra (defaults to "nostr,aggregator,ipfs").
+# ---------------------------------------------------------------------------
+# shellcheck source=./preflight-infra.sh
+source "$(dirname "${BASH_SOURCE[0]}")/preflight-infra.sh"
+
+maybe_preflight_infra() {
+  preflight_infra "${POINTER_PREFLIGHT_SERVICES:-nostr,aggregator,ipfs}"
+}
+
+# ---------------------------------------------------------------------------
 # Workspace setup — one tmpdir per script, under /tmp/sphere-pointer-e2e-*.
 # ---------------------------------------------------------------------------
 setup_workspace() {
@@ -302,11 +320,28 @@ Usage from a test script:
   set -Eeuo pipefail
   TEST_NAME="pointer-NX"
   source "$(dirname "$0")/pointer-N0-prologue.sh"
-  maybe_skip_no_testnet
+  # NO_TESTNET + infra-probe preflight are invoked automatically on
+  # source; set E2E_NO_AUTO_PREFLIGHT=1 to suppress the probe.
   setup_workspace
   trap cleanup_workspace EXIT
   ...
   script_summary
 EOF
   exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Automatic gates on source (post-source).
+#
+# Every pointer-NX script needs the same two checks before the test does
+# anything expensive: NO_TESTNET fast-skip, and the @unicitylabs/infra-
+# probe preflight (the latter prevents flaky-infra false-negatives — see
+# tests/e2e/preflight-infra.sh).
+#
+# Opt out either with NO_TESTNET=1 (skip everything) or
+# E2E_NO_AUTO_PREFLIGHT=1 (run anyway despite probe outcome).
+# ---------------------------------------------------------------------------
+maybe_skip_no_testnet
+if [[ "${E2E_NO_AUTO_PREFLIGHT:-0}" != "1" ]]; then
+  maybe_preflight_infra
 fi

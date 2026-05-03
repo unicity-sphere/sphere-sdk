@@ -36,3 +36,6 @@ ref_materials/
 # Integration test data
 tests/integration/.test-*/
 .claude
+
+# E2e preflight infra-probe result (regenerated each run)
+tests/e2e/.preflight-result.json

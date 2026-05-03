@@ -38,12 +38,15 @@ import {
   syncUntilAllCoins,
   type BalanceSnapshot,
 } from './helpers';
+import { preflightSkip } from './lib/preflight';
 
 // =============================================================================
 // Test Suite
 // =============================================================================
 
-describe('IPFS Active Token Persistence E2E', () => {
+const SKIP_INFRA = preflightSkip(["nostr","aggregator","ipfs"], 'ipfs-token-persistence');
+
+describe.skipIf(SKIP_INFRA)('IPFS Active Token Persistence E2E', () => {
   // Shared state across ordered tests
   let dirsA: ReturnType<typeof makeTempDirs>;
   let sphereA: Sphere;

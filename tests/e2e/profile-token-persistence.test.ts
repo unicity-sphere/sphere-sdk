@@ -38,12 +38,15 @@ import {
   type BalanceSnapshot,
 } from './helpers';
 import { makeProfileProviders } from './profile-helpers';
+import { preflightSkip } from './lib/preflight';
 
 // =============================================================================
 // Test Suite
 // =============================================================================
 
-describe('Profile (OrbitDB) Active Token Persistence E2E', () => {
+const SKIP_INFRA = preflightSkip(["nostr","aggregator","ipfs"], 'profile-token-persistence');
+
+describe.skipIf(SKIP_INFRA)('Profile (OrbitDB) Active Token Persistence E2E', () => {
   // Shared state across ordered tests
   let dirsA: ReturnType<typeof makeTempDirs>;
   let sphereA: Sphere;

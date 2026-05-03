@@ -82,6 +82,7 @@ import {
   requestFaucet,
   TEST_COINS,
 } from './helpers';
+import { preflightSkip } from './lib/preflight';
 
 /**
  * Local poll cadence (overrides the shared POLL_INTERVAL_MS=1000ms from
@@ -106,7 +107,15 @@ import type { TransferResult } from '../../types';
 //   - default: skipped because of the known UXF orchestrator blockers
 //     documented in the file header.
 //   - RUN_UXF_E2E=1: opt in.
-const SKIP = process.env.NO_TESTNET === '1' || process.env.RUN_UXF_E2E !== '1';
+// Honour existing opt-in/-out env vars AND the infra-probe preflight gate
+// (see tests/e2e/lib/preflight.ts). The probe runs once at suite start
+// via globalSetup; this suite needs nostr (transfer events), aggregator
+// (commitment submission + inclusion proofs), and ipfs (CID-by-reference
+// delivery). Set E2E_SKIP_PREFLIGHT=1 to bypass the probe entirely.
+const SKIP =
+  process.env.NO_TESTNET === '1' ||
+  process.env.RUN_UXF_E2E !== '1' ||
+  preflightSkip(['nostr', 'aggregator', 'ipfs'], 'uxf-send-receive');
 
 /** UCT smoke is opt-in even when RUN_UXF_E2E=1; UCT amounts overflow uint64. */
 const UCT_SMOKE_DISABLED = process.env.RUN_UCT_SMOKE !== '1';

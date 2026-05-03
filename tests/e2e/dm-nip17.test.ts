@@ -15,6 +15,7 @@ import { mkdirSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { DirectMessage } from '../../types';
+import { preflightSkip } from './lib/preflight';
 
 const rand = () => Math.random().toString(36).slice(2, 8);
 
@@ -69,7 +70,9 @@ async function createSphere(label: string, nametag?: string) {
   return { sphere: result.sphere, dirs };
 }
 
-describe('NIP-17 DM end-to-end', () => {
+const SKIP_INFRA = preflightSkip(["nostr"], 'dm-nip17');
+
+describe.skipIf(SKIP_INFRA)('NIP-17 DM end-to-end', () => {
   const cleanupDirs: string[] = [];
   const spheres: Sphere[] = [];
 

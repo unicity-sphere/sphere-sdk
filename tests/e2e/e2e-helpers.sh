@@ -14,6 +14,25 @@ ESCROW_REPO="${ESCROW_REPO:-https://github.com/unicity-sphere/escrow-service.git
 ESCROW_STARTUP_TIMEOUT=120
 
 # ---------------------------------------------------------------------------
+# Infra-probe preflight gate.
+#
+# Swap e2e tests need `nostr` (proposal / announce DMs + NIP-17 gift
+# wraps) and `aggregator` (commitment submission + inclusion proofs).
+# We run the @unicitylabs/infra-probe once on source so a degraded /
+# unreachable testnet skips the test cleanly rather than producing a
+# 5-minute false-negative inside escrow setup or faucet polling.
+#
+# Override the default service set for a script with E2E_PREFLIGHT_SERVICES
+# (comma-separated, see preflight-infra.sh). Bypass with
+# E2E_SKIP_PREFLIGHT=1 or E2E_NO_AUTO_PREFLIGHT=1.
+# ---------------------------------------------------------------------------
+# shellcheck source=./preflight-infra.sh
+source "$(dirname "${BASH_SOURCE[0]}")/preflight-infra.sh"
+if [[ "${E2E_NO_AUTO_PREFLIGHT:-0}" != "1" ]]; then
+  preflight_infra "${E2E_PREFLIGHT_SERVICES:-nostr,aggregator}"
+fi
+
+# ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
 PASS=0; FAIL=0

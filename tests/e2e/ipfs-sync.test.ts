@@ -11,6 +11,7 @@ import { InMemoryIpfsStatePersistence } from '../../impl/shared/ipfs/ipfs-state-
 import { getIpfsGatewayUrls } from '../../constants';
 import type { TxfStorageDataBase } from '../../storage';
 import type { FullIdentity } from '../../types';
+import { preflightSkip } from './lib/preflight';
 
 // Use a random key to avoid conflicts between test runs
 function randomHex(length: number): string {
@@ -23,7 +24,9 @@ function randomHex(length: number): string {
     .join('');
 }
 
-describe('IPFS Sync E2E', () => {
+const SKIP_INFRA = preflightSkip(["nostr","ipfs"], 'ipfs-sync');
+
+describe.skipIf(SKIP_INFRA)('IPFS Sync E2E', () => {
   let provider: IpfsStorageProvider;
   let statePersistence: InMemoryIpfsStatePersistence;
   const testPrivateKey = randomHex(32);

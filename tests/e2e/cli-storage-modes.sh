@@ -40,6 +40,18 @@
 set -euo pipefail
 
 SDK_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+
+# Infra-probe preflight — tests 3-7 need aggregator (commitment submission +
+# inclusion proofs) and ipfs (profile-mode storage) and nostr (identity
+# binding). Skip cleanly if any are unreachable; bypass via
+# E2E_SKIP_PREFLIGHT=1 / E2E_NO_AUTO_PREFLIGHT=1.
+TEST_NAME="${TEST_NAME:-cli-storage-modes}"
+# shellcheck source=./preflight-infra.sh
+source "$(dirname "${BASH_SOURCE[0]}")/preflight-infra.sh"
+if [[ "${E2E_NO_AUTO_PREFLIGHT:-0}" != "1" ]]; then
+  preflight_infra "${E2E_PREFLIGHT_SERVICES:-nostr,aggregator,ipfs}"
+fi
+
 KEEP_WORKSPACE=false
 LOCAL_ONLY=false
 

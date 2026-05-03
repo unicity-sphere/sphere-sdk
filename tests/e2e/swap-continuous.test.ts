@@ -37,8 +37,14 @@ import {
   getBalance,
   rand,
 } from './helpers';
+import { preflightSkip } from './lib/preflight';
 
-const SKIP = !process.env.RUN_CONTINUOUS_TESTS;
+// Continuous swap exercises the full transfer lifecycle: nostr (proposal +
+// gift-wrap delivery), aggregator (commitment submission + inclusion proofs).
+// Gated by RUN_CONTINUOUS_TESTS opt-in AND the infra-probe preflight.
+const SKIP =
+  !process.env.RUN_CONTINUOUS_TESTS ||
+  preflightSkip(['nostr', 'aggregator'], 'swap-continuous');
 const ESCROW_SRC = process.env.ESCROW_DIR || join(__dirname, '../../../../escrow-service');
 const SDK_ROOT = join(__dirname, '../..');
 

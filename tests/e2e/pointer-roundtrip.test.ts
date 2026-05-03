@@ -90,14 +90,21 @@ import {
 import type { ProfileStorageProvider } from '../../profile/profile-storage-provider';
 import type { ProfileTokenStorageProvider } from '../../profile/profile-token-storage-provider';
 import type { StorageEvent, TxfStorageDataBase } from '../../storage';
+import { preflightSkip } from './lib/preflight';
 
 // =============================================================================
 // Skip gates
 // =============================================================================
 
+// Suite needs `aggregator` (pointer round-trip is an aggregator RPC) and
+// `nostr` (wallet identity binding events). The infra-probe runs once at
+// suite start via globalSetup; if either service is unreachable we skip
+// here rather than burning the 30 s pointer-isReachable timeout. Set
+// E2E_SKIP_PREFLIGHT=1 to bypass the probe entirely.
 const SKIP =
   process.env.E2E_SKIP_POINTER_ROUNDTRIP === '1' ||
-  process.env.NO_TESTNET === '1';
+  process.env.NO_TESTNET === '1' ||
+  preflightSkip(['aggregator', 'nostr'], 'pointer-roundtrip');
 
 // =============================================================================
 // Providers — direct construction so we control oracle threading

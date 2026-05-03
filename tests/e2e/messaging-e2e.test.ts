@@ -20,6 +20,7 @@ import { rmSync } from 'node:fs';
 import { join } from 'node:path';
 import type { DirectMessage } from '../../types';
 import { rand, makeTempDirs, ensureTrustbase, DEFAULT_API_KEY } from './helpers';
+import { preflightSkip } from './lib/preflight';
 
 // =============================================================================
 // Helpers
@@ -94,7 +95,9 @@ async function createSphere(
 // DM Communications Module E2E
 // =============================================================================
 
-describe('DM Communications Module E2E', () => {
+const SKIP_INFRA = preflightSkip(["nostr"], 'messaging-e2e');
+
+describe.skipIf(SKIP_INFRA)('DM Communications Module E2E', () => {
   const cleanupDirs: string[] = [];
   const spheres: Sphere[] = [];
 

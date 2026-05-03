@@ -36,12 +36,15 @@ import {
   type BalanceSnapshot,
 } from './helpers';
 import { makeProfileProviders } from './profile-helpers';
+import { preflightSkip } from './lib/preflight';
 
 // =============================================================================
 // Test Suite
 // =============================================================================
 
-describe('Profile Multi-Device Sync E2E', () => {
+const SKIP_INFRA = preflightSkip(["nostr","ipfs"], 'profile-multi-device-sync');
+
+describe.skipIf(SKIP_INFRA)('Profile Multi-Device Sync E2E', () => {
   let savedMnemonic: string;
   let savedNametag: string;
   let originalBalances: Map<string, BalanceSnapshot>;
