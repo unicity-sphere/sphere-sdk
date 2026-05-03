@@ -118,7 +118,9 @@ describe('revaluate — happy paths', () => {
     expect(r.tokenId).toBe(TOKEN_ID);
     if (r.disposition === 'VALID') {
       expect(r.manifest.status).toBe('valid');
-      expect(r.manifest.rootHash).toBe(TOKEN_ROOT_HASH);
+      // Chain head is last tx destinationState (#162) — default
+      // single-tx builder uses dst='s1'.
+      expect(r.manifest.rootHash).toBe('s1');
       expect(r.bundleCid).toBe(BUNDLE_CID);
       expect(r.senderTransportPubkey).toBe(SENDER_PUBKEY);
     }
@@ -127,7 +129,8 @@ describe('revaluate — happy paths', () => {
   it('VALID even with local manifest matching the new head', async () => {
     const r = await revaluate(
       buildInput({
-        localManifest: { rootHash: TOKEN_ROOT_HASH, status: 'pending' },
+        // Match the new head (last tx destinationState='s1').
+        localManifest: { rootHash: 's1' as ContentHash, status: 'pending' },
       }),
     );
     expect(r.disposition).toBe('VALID');
@@ -173,7 +176,9 @@ describe('revaluate — [D] conflict check', () => {
     expect(r.disposition).toBe('CONFLICTING');
     if (r.disposition === 'CONFLICTING') {
       expect(r.conflictingHeads).toContain(ALT_HEAD_HASH);
-      expect(r.manifest.rootHash).toBe(TOKEN_ROOT_HASH);
+      // Chain head is last tx destinationState (#162) — default
+      // single-tx builder uses dst='s1'.
+      expect(r.manifest.rootHash).toBe('s1');
       expect(r.manifest.status).toBe('conflicting');
     }
   });

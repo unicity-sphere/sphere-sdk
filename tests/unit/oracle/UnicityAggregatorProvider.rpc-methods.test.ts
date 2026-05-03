@@ -120,6 +120,108 @@ describe('UnicityAggregatorProvider — JSON-RPC wire method names', () => {
     });
   });
 
+  describe('getProof() — shape validation (steelman #157)', () => {
+    // The aggregator can return arbitrary JSON — without shape validation
+    // the historical caller treats {inclusionProof: true},
+    // {inclusionProof: {}}, {inclusionProof: "string"} as "got a proof".
+    // Now: each must be rejected (returns null, logs WARN).
+    it('rejects boolean inclusionProof', async () => {
+      const { mockFetch } = makeMockFetch({
+        result: { inclusionProof: true },
+      });
+      global.fetch = mockFetch as unknown as typeof fetch;
+
+      const provider = new UnicityAggregatorProvider({
+        url: 'https://test.example/',
+        timeout: 1000,
+        skipVerification: true,
+      });
+      (provider as unknown as { status: string }).status = 'connected';
+
+      const result = await provider.getProof('any-id');
+      expect(result).toBeNull();
+    });
+
+    it('rejects string inclusionProof', async () => {
+      const { mockFetch } = makeMockFetch({
+        result: { inclusionProof: 'cheese' },
+      });
+      global.fetch = mockFetch as unknown as typeof fetch;
+
+      const provider = new UnicityAggregatorProvider({
+        url: 'https://test.example/',
+        timeout: 1000,
+        skipVerification: true,
+      });
+      (provider as unknown as { status: string }).status = 'connected';
+
+      const result = await provider.getProof('any-id');
+      expect(result).toBeNull();
+    });
+
+    it('rejects array inclusionProof', async () => {
+      const { mockFetch } = makeMockFetch({
+        result: { inclusionProof: [1, 2, 3] },
+      });
+      global.fetch = mockFetch as unknown as typeof fetch;
+
+      const provider = new UnicityAggregatorProvider({
+        url: 'https://test.example/',
+        timeout: 1000,
+        skipVerification: true,
+      });
+      (provider as unknown as { status: string }).status = 'connected';
+
+      const result = await provider.getProof('any-id');
+      expect(result).toBeNull();
+    });
+
+    it('rejects object inclusionProof missing required fields', async () => {
+      // Object but lacks authenticator/merkleTreePath/transactionHash/unicityCertificate.
+      const { mockFetch } = makeMockFetch({
+        result: { inclusionProof: { foo: 'bar' } },
+      });
+      global.fetch = mockFetch as unknown as typeof fetch;
+
+      const provider = new UnicityAggregatorProvider({
+        url: 'https://test.example/',
+        timeout: 1000,
+        skipVerification: true,
+      });
+      (provider as unknown as { status: string }).status = 'connected';
+
+      const result = await provider.getProof('any-id');
+      expect(result).toBeNull();
+    });
+
+    it('rejects object inclusionProof that the SDK fromJSON refuses to parse', async () => {
+      // Has all four required keys but the values are nonsense.
+      // SdkInclusionProof.fromJSON should throw, getProof should
+      // return null (not throw — null lets callers retry).
+      const { mockFetch } = makeMockFetch({
+        result: {
+          inclusionProof: {
+            authenticator: null,
+            merkleTreePath: 'not a path',
+            transactionHash: null,
+            unicityCertificate: 'not a cert',
+          },
+        },
+      });
+      global.fetch = mockFetch as unknown as typeof fetch;
+
+      const provider = new UnicityAggregatorProvider({
+        url: 'https://test.example/',
+        timeout: 1000,
+        skipVerification: true,
+      });
+      (provider as unknown as { status: string }).status = 'connected';
+
+      const result = await provider.getProof('any-id');
+      expect(result).toBeNull();
+    });
+  });
+
   describe('submitCommitment() — non-SDK fallback path', () => {
     it('sends method "submit_commitment" (snake_case, NOT "submitCommitment")', async () => {
       const { mockFetch, calls } = makeMockFetch({ result: { requestId: 'rpc-req-1' } });

@@ -68,7 +68,7 @@ import { SphereError } from '../../../core/errors.js';
 import type { SphereEventMap } from '../../../types/index.js';
 import { extractCarRootCid } from '../../../uxf/transfer-payload.js';
 
-import { MAX_FETCHED_CAR_BYTES } from './limits.js';
+import { MAX_FETCHED_CAR_BYTES, MAX_TOTAL_FETCH_MS } from './limits.js';
 
 // =============================================================================
 // 1. Public types
@@ -142,6 +142,23 @@ export interface CidFetcherOptions {
    * to exercise the streaming-abort path with feasible mock data.
    */
   readonly maxBytes?: number;
+  /**
+   * Total wall-clock cap on the entire `fetchCarByCid` call, in
+   * milliseconds. When this fires, every in-flight gateway fetch is
+   * aborted via the composed AbortController, the gateway-walking loop
+   * exits, and the fetcher throws a transient-class error with
+   * `cause.reason === 'total-fetch-timeout'`.
+   *
+   * Defaults to {@link MAX_TOTAL_FETCH_MS} (5 minutes). DoS defense
+   * against a hostile peer drip-feeding N gateways under each one's
+   * idle-timeout window: without this cap, the worker can hang for
+   * hours per bundle. Tests pass small values (e.g., 50 ms) with fake
+   * timers to exercise the abort path deterministically.
+   *
+   * MUST be a positive finite number. Inputs that are non-finite,
+   * zero, or negative are rejected with `VALIDATION_ERROR` upfront.
+   */
+  readonly maxTotalFetchMs?: number;
 }
 
 /**
@@ -171,9 +188,13 @@ export interface CidFetcherResult {
  *
  * @throws {SphereError} `VALIDATION_ERROR` if `gateways` is empty.
  * @throws {SphereError} `BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT` if every
- *         gateway fails. The error's `cause` is `{ bundleCid,
- *         gatewaysAttempted, failureReasons }`. Per §9.2 + W13 the
- *         caller MUST treat this as TRANSIENT — no disposition record.
+ *         gateway fails OR the total wall-clock cap fires. The error's
+ *         `cause` is `{ bundleCid, gatewaysAttempted, failureReasons,
+ *         reason }`. The `reason` field is `'all-gateways-failed'` for
+ *         the per-gateway exhaustion path or `'total-fetch-timeout'`
+ *         when {@link CidFetcherOptions.maxTotalFetchMs} fires. Per
+ *         §9.2 + W13 the caller MUST treat both as TRANSIENT — no
+ *         disposition record.
  * @throws The original `AbortError` (whose name === 'AbortError') if
  *         `options.signal` aborts mid-flight. Subsequent gateways are
  *         NOT attempted.
@@ -202,6 +223,13 @@ export async function fetchCarByCid(
       'VALIDATION_ERROR',
     );
   }
+  const maxTotalFetchMs = options.maxTotalFetchMs ?? MAX_TOTAL_FETCH_MS;
+  if (!Number.isFinite(maxTotalFetchMs) || maxTotalFetchMs <= 0) {
+    throw new SphereError(
+      `fetchCarByCid: maxTotalFetchMs must be a positive finite number (got ${String(maxTotalFetchMs)})`,
+      'VALIDATION_ERROR',
+    );
+  }
   // Resolve fetch lazily so tests that monkey-patch `globalThis.fetch`
   // BETWEEN module-load and call-site see the patched value. Static-
   // binding at module load would freeze the original in place.
@@ -209,61 +237,118 @@ export async function fetchCarByCid(
     options.fetch ??
     ((input, init) => globalThis.fetch(input, init));
 
+  // ---- Compose the call-level signal ----
+  // Steelman fix #161: even with a 60s per-gateway IDLE timeout, a
+  // hostile peer can chain N gateways at idle-window boundaries and
+  // drip-feed the recipient for hours. The `totalTimeoutController`
+  // bounds the entire call to `maxTotalFetchMs` (default 5 minutes),
+  // and we expose its signal — composed with the caller-supplied
+  // `options.signal` — to every gateway hop. When EITHER the caller
+  // aborts OR the total timeout fires, every in-flight network read
+  // is cancelled.
+  const totalTimeoutController = new AbortController();
+  const totalTimer = setTimeout(() => {
+    totalTimeoutController.abort();
+  }, maxTotalFetchMs);
+  const composedSignal = composeAbortSignals(
+    options.signal,
+    totalTimeoutController.signal,
+  );
+
   // ---- Walk gateways ----
   const failureReasons: string[] = [];
-  for (const gateway of options.gateways) {
-    // Cooperative cancellation between gateways — if the caller aborted
-    // during the previous gateway's hop, surface immediately rather
-    // than trying the next gateway.
-    if (options.signal?.aborted) {
-      throw makeAbortError(
-        'fetchCarByCid: aborted by caller before next gateway',
-      );
-    }
-
-    const url = buildGatewayUrl(gateway, bundleCid);
-    let outcome: GatewayOutcome;
-    try {
-      outcome = await fetchOneGateway({
-        url,
-        bundleCid,
-        maxBytes,
-        fetchImpl: doFetch,
-        signal: options.signal,
-      });
-    } catch (cause) {
-      // Re-throw caller cancellations verbatim.
-      if (isAbortError(cause)) {
-        throw cause;
+  let totalTimedOut = false;
+  try {
+    for (const gateway of options.gateways) {
+      // Total-timeout check between gateways. If the deadline expired
+      // during the previous hop, exit cleanly with the timeout reason
+      // instead of starting a fresh one.
+      if (totalTimeoutController.signal.aborted) {
+        totalTimedOut = true;
+        failureReasons.push('total-fetch-timeout');
+        break;
       }
-      // Anything else is a per-gateway failure — record reason and
-      // continue.
-      outcome = {
-        ok: false,
-        reason: `network: ${stringifyError(cause)}`,
-      };
-    }
+      // Cooperative caller cancellation between gateways — if the
+      // caller aborted during the previous gateway's hop, surface
+      // immediately rather than trying the next gateway.
+      if (options.signal?.aborted) {
+        throw makeAbortError(
+          'fetchCarByCid: aborted by caller before next gateway',
+        );
+      }
 
-    if (outcome.ok) {
-      return { carBytes: outcome.carBytes, gatewayUsed: gateway };
+      const url = buildGatewayUrl(gateway, bundleCid);
+      let outcome: GatewayOutcome;
+      try {
+        outcome = await fetchOneGateway({
+          url,
+          bundleCid,
+          maxBytes,
+          fetchImpl: doFetch,
+          signal: composedSignal,
+        });
+      } catch (cause) {
+        // If the total timeout fired during this hop, the abort error
+        // came from OUR timeout controller (not the caller). Treat
+        // that as the timeout outcome, NOT as a caller cancellation.
+        if (totalTimeoutController.signal.aborted && !options.signal?.aborted) {
+          totalTimedOut = true;
+          failureReasons.push('total-fetch-timeout');
+          break;
+        }
+        // Re-throw genuine caller cancellations verbatim.
+        if (isAbortError(cause) && options.signal?.aborted) {
+          throw cause;
+        }
+        // Anything else is a per-gateway failure — record reason and
+        // continue.
+        outcome = {
+          ok: false,
+          reason: `network: ${stringifyError(cause)}`,
+        };
+      }
+
+      if (outcome.ok) {
+        return { carBytes: outcome.carBytes, gatewayUsed: gateway };
+      }
+      failureReasons.push(outcome.reason);
+
+      // Defensive re-check: a per-gateway hop that swallowed the abort
+      // (e.g., classified it as `oversize`/`http 5xx`) should not let
+      // the loop walk to the next gateway after the deadline.
+      if (totalTimeoutController.signal.aborted) {
+        totalTimedOut = true;
+        if (failureReasons[failureReasons.length - 1] !== 'total-fetch-timeout') {
+          failureReasons.push('total-fetch-timeout');
+        }
+        break;
+      }
     }
-    failureReasons.push(outcome.reason);
+  } finally {
+    clearTimeout(totalTimer);
   }
 
-  // ---- All gateways failed → emit + throw transient ----
+  // ---- All gateways failed (or total deadline hit) → emit + throw transient ----
+  const reason: 'total-fetch-timeout' | 'all-gateways-failed' = totalTimedOut
+    ? 'total-fetch-timeout'
+    : 'all-gateways-failed';
   options.emit?.('transfer:fetch-failed', {
     bundleCid,
     senderTransportPubkey: options.senderTransportPubkey,
     gatewaysAttempted: [...options.gateways],
     failureReasons: [...failureReasons],
   });
+  const message = totalTimedOut
+    ? `fetchCarByCid: total wall-clock cap (${maxTotalFetchMs}ms) exceeded for ${bundleCid}`
+    : `fetchCarByCid: all ${options.gateways.length} gateway(s) failed for ${bundleCid}`;
   throw new SphereError(
-    `fetchCarByCid: all ${options.gateways.length} gateway(s) failed for ${bundleCid}`,
+    message,
     'BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT',
     {
       bundleCid,
       gatewaysAttempted: [...options.gateways],
       failureReasons: [...failureReasons],
+      reason,
     },
   );
 }
@@ -527,6 +612,55 @@ function concatChunks(chunks: ReadonlyArray<Uint8Array>, totalLen: number): Uint
     offset += chunk.byteLength;
   }
   return out;
+}
+
+/**
+ * Compose two AbortSignals into one that aborts when EITHER source
+ * aborts. We don't rely on `AbortSignal.any([...])` because (a) it's
+ * Node 20+ only and we keep node>=18 as the minimum-supported, and
+ * (b) the caller-supplied signal is `undefined`-allowed — falling back
+ * to a manually-wired `AbortController` is simpler than threading
+ * `AbortSignal.any` through both branches.
+ *
+ * Usage contract: pass the caller's `signal` (may be `undefined`) and
+ * the total-timeout controller's `signal`. Returns a single
+ * `AbortSignal` that is aborted iff at least one of the inputs is
+ * aborted.
+ *
+ * @internal
+ */
+function composeAbortSignals(
+  callerSignal: AbortSignal | undefined,
+  totalTimeoutSignal: AbortSignal,
+): AbortSignal {
+  // If the caller supplied no signal, the total-timeout signal IS the
+  // composed signal — no wiring needed.
+  if (!callerSignal) return totalTimeoutSignal;
+  // Either signal already aborted? Return a pre-aborted controller's
+  // signal. Constructing an AbortController and aborting it in the same
+  // tick is the cross-platform equivalent of `AbortSignal.abort()`
+  // (which is also Node 17.3+ but we stay defensive).
+  if (callerSignal.aborted || totalTimeoutSignal.aborted) {
+    const c = new AbortController();
+    c.abort();
+    return c.signal;
+  }
+  const composed = new AbortController();
+  const onCallerAbort = (): void => {
+    composed.abort();
+    cleanup();
+  };
+  const onTimeoutAbort = (): void => {
+    composed.abort();
+    cleanup();
+  };
+  const cleanup = (): void => {
+    callerSignal.removeEventListener('abort', onCallerAbort);
+    totalTimeoutSignal.removeEventListener('abort', onTimeoutAbort);
+  };
+  callerSignal.addEventListener('abort', onCallerAbort, { once: true });
+  totalTimeoutSignal.addEventListener('abort', onTimeoutAbort, { once: true });
+  return composed.signal;
 }
 
 /**

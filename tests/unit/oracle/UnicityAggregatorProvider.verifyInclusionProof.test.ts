@@ -149,6 +149,28 @@ describe('UnicityAggregatorProvider.verifyInclusionProof — cache-key uniquenes
     expect(verifyCallCount).toBe(1); // unchanged
   });
 
+  // Steelman finding #156: verifyInclusionProof must throw NOT_INITIALIZED
+  // when the trust base never loaded — silently returning false is a
+  // degraded crypto state where every legitimate proof is dropped.
+  it('throws NOT_INITIALIZED (not returns false) when trustBase is null', async () => {
+    const noTrustBaseProvider = new UnicityAggregatorProvider({
+      url: 'https://test.example/',
+      apiKey: undefined,
+      timeoutMs: 1000,
+      skipVerification: true,
+    });
+    // Explicitly clear (constructor leaves it null too, but be belt-and-braces).
+    (noTrustBaseProvider as unknown as { trustBase: unknown }).trustBase = null;
+
+    await expect(
+      noTrustBaseProvider.verifyInclusionProof!({
+        proofJson: { stub: 'irrelevant' },
+        transactionHash: TX_IMPRINT,
+        proofHash: REAL_PROOF_HASH,
+      }),
+    ).rejects.toThrow(/trustBase not loaded/i);
+  });
+
   it('two callers — one with proofHash, one without — do NOT collide on the same tx imprint', async () => {
     // proofHash-included key: `${proofHash}:${transactionHash}`
     // proofHash-omitted key:  `${transactionHash}`

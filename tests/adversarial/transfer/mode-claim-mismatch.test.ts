@@ -194,11 +194,18 @@ describe('§11.4 — mode-claim mismatch: payload.mode is advisory only', () => 
     expect(conservativeResult.disposition).toBe('VALID');
   });
 
-  it('multi-tx chain with mid-chain unfinalized + CONSERVATIVE claim → PENDING', async () => {
+  it('multi-tx chain with mid-chain unfinalized + CONSERVATIVE claim → INVALID(proof-invalid)', async () => {
     // Subtle adversarial: chain has a finalized tx[0], unfinalized
-    // tx[1], finalized tx[2]. Sender claims conservative. The mid-chain
-    // unfinalized tx triggers PENDING — recipient must NOT believe the
-    // sender's claim that "all txs are anchored".
+    // tx[1], finalized tx[2]. Sender claims conservative.
+    //
+    // Per #154 / W41 monotonic-proof invariant: proof finality is
+    // monotonic over the chain. If tx[2] is anchored then tx[1] MUST
+    // also be anchored — only the SUFFIX of a chain may be unfinalized.
+    // A mid-chain null-proof with a later anchored tx is a structural
+    // forgery (a hostile sender stripping a mid-chain proof to lure
+    // the recipient into PENDING for a tx already anchored to a
+    // competing successor). The engine routes this to
+    // INVALID(proof-invalid) regardless of the mode claim.
     const result = await processDisposition(
       makeInput({
         mode: 'conservative',
@@ -209,7 +216,10 @@ describe('§11.4 — mode-claim mismatch: payload.mode is advisory only', () => 
         ]),
       }),
     );
-    expect(result.disposition).toBe('PENDING');
+    expect(result.disposition).toBe('INVALID');
+    if (result.disposition === 'INVALID') {
+      expect(result.reason).toBe('proof-invalid');
+    }
   });
 
   it('CONSERVATIVE-claim + unfinalized + isSpent=true → still PENDING (mid-chain unfinalized wins)', async () => {

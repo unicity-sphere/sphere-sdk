@@ -562,6 +562,22 @@ describe('fetchCarByCid — AbortSignal cancellation', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
+  it('throws VALIDATION_ERROR on non-positive maxTotalFetchMs', async () => {
+    let caught: unknown;
+    try {
+      await fetchCarByCid('bafytest', {
+        gateways: ['https://gw.example'],
+        senderTransportPubkey: SENDER,
+        maxTotalFetchMs: 0,
+      });
+    } catch (err) {
+      caught = err;
+    }
+    if (!isSphereError(caught)) throw new Error('expected SphereError');
+    expect(caught.code).toBe('VALIDATION_ERROR');
+    expect(caught.message).toContain('maxTotalFetchMs');
+  });
+
   it('caller aborts mid-stream → throws AbortError; later gateways NOT tried', async () => {
     // Build a long-running stream where each pull waits for a tick
     // (microtask + macrotask) so the fetcher's between-chunk abort
@@ -616,5 +632,143 @@ describe('fetchCarByCid — AbortSignal cancellation', () => {
     // Only the first gateway was visited; the second was NOT — caller
     // cancellation halts the walk.
     expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+});
+
+// =============================================================================
+// 9. Total wall-clock cap (steelman fix #161)
+// =============================================================================
+
+describe('fetchCarByCid — total wall-clock cap (steelman #161)', () => {
+  it('total-fetch-timeout fires across multiple drip-feeding gateways', async () => {
+    // Hostile scenario: every gateway hangs forever (or under the
+    // per-gateway idle window). Without the total cap, the fetcher
+    // walks N gateways one by one for hours. With the total cap
+    // (`maxTotalFetchMs: 50`), the very first hang trips the deadline,
+    // every in-flight fetch is aborted via the composed signal, and we
+    // surface the typed transient error with cause.reason ===
+    // 'total-fetch-timeout'.
+    //
+    // We use real timers + a tiny cap (50ms) so the test doesn't need
+    // fake-timer plumbing through ReadableStream pulls. The per-hop
+    // hangs are implemented by returning a Response whose body never
+    // yields (a stream that resolves only when its signal fires —
+    // wired via the `init.signal` argument).
+    const cap = makeEmitCapture();
+    const fetchImpl: CidFetcherFetch = vi.fn((_url, init) => {
+      // Build a stream that pulls forever — only resolves when the
+      // composed signal fires (which causes the awaited reader.read()
+      // to reject with an AbortError-shaped error).
+      const stream = new ReadableStream<Uint8Array>({
+        pull() {
+          return new Promise<void>((_resolve, reject) => {
+            const sig = init?.signal;
+            if (sig?.aborted) {
+              reject(new DOMException('aborted', 'AbortError'));
+              return;
+            }
+            sig?.addEventListener(
+              'abort',
+              () => reject(new DOMException('aborted', 'AbortError')),
+              { once: true },
+            );
+          });
+        },
+      });
+      return Promise.resolve(new Response(stream));
+    });
+
+    let caught: unknown;
+    const start = Date.now();
+    try {
+      await fetchCarByCid('bafytotal', {
+        gateways: [
+          'https://drip1.example',
+          'https://drip2.example',
+          'https://drip3.example',
+          'https://drip4.example',
+          'https://drip5.example',
+        ],
+        senderTransportPubkey: SENDER,
+        fetch: fetchImpl,
+        emit: cap.emit,
+        maxTotalFetchMs: 50, // very small cap so the test runs fast
+      });
+    } catch (err) {
+      caught = err;
+    }
+    const elapsed = Date.now() - start;
+
+    // (1) The fetcher threw the typed transient error.
+    if (!isSphereError(caught)) throw new Error('expected SphereError');
+    expect(caught.code).toBe('BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT');
+    // (2) The cause carries the new `reason: 'total-fetch-timeout'`
+    //     discriminator so callers can distinguish from per-gateway
+    //     exhaustion.
+    const cause = caught.context as
+      | {
+          readonly reason?: string;
+          readonly bundleCid?: string;
+          readonly gatewaysAttempted?: ReadonlyArray<string>;
+          readonly failureReasons?: ReadonlyArray<string>;
+        }
+      | undefined;
+    expect(cause?.reason).toBe('total-fetch-timeout');
+    // (3) The error message mentions the cap.
+    expect(caught.message).toContain('total wall-clock cap');
+    // (4) `transfer:fetch-failed` was emitted (W13 — same as the
+    //     per-gateway exhaustion path; callers don't need a separate
+    //     event for the total-timeout sub-case).
+    const evt = cap.events.find((e) => e.name === 'transfer:fetch-failed');
+    expect(evt).toBeDefined();
+    // (5) Wall-clock sanity: we took NOWHERE NEAR 5 minutes —
+    //     the cap fired well under 1 second. Allow generous CI slack.
+    expect(elapsed).toBeLessThan(2000);
+    // (6) We did NOT walk all 5 gateways — the abort halted the loop
+    //     after the deadline fired (typically only 1 gateway visited).
+    expect((fetchImpl as unknown as { mock: { calls: unknown[] } }).mock.calls.length).toBeLessThan(5);
+  });
+
+  it('caller signal stays distinct from total-timeout: caller abort still throws AbortError', async () => {
+    // If the caller aborts during a hang, we MUST surface AbortError
+    // (not the total-timeout transient) — the test guards the
+    // composed-signal classification logic.
+    const callerCtrl = new AbortController();
+    const fetchImpl: CidFetcherFetch = vi.fn((_url, init) => {
+      const stream = new ReadableStream<Uint8Array>({
+        pull() {
+          return new Promise<void>((_resolve, reject) => {
+            const sig = init?.signal;
+            if (sig?.aborted) {
+              reject(new DOMException('aborted', 'AbortError'));
+              return;
+            }
+            sig?.addEventListener(
+              'abort',
+              () => reject(new DOMException('aborted', 'AbortError')),
+              { once: true },
+            );
+          });
+        },
+      });
+      return Promise.resolve(new Response(stream));
+    });
+    // Schedule the caller-side abort to land BEFORE the (much larger)
+    // total-timeout cap fires. We expect AbortError, not transient.
+    setTimeout(() => callerCtrl.abort(), 20);
+
+    let caught: unknown;
+    try {
+      await fetchCarByCid('bafycaller', {
+        gateways: ['https://hang.example'],
+        senderTransportPubkey: SENDER,
+        fetch: fetchImpl,
+        signal: callerCtrl.signal,
+        maxTotalFetchMs: 5000, // way bigger than the caller-abort delay
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect((caught as Error).name).toBe('AbortError');
   });
 });

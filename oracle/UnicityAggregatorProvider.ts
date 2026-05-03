@@ -244,14 +244,45 @@ export class UnicityAggregatorProvider implements OracleProvider {
     if (trustBase) {
       this.trustBase = trustBase;
     } else if (!this.config.skipVerification && this.config.trustBaseLoader) {
-      // Load trust base using injected loader
+      // Steelman finding #156: trust-base load failures MUST NOT be
+      // silently swallowed. The historical implementation logged at
+      // debug level and left `this.trustBase = null`, which then
+      // forced every downstream `verifyInclusionProof` to fail closed
+      // (returning `false` for a verify call is indistinguishable
+      // from "we proved this proof is invalid"). An attacker who
+      // can poison the trust-base loader (DNS hijack, file system
+      // permissions, MITM on the bundled URL) flips the SDK into
+      // a degraded crypto state where every legitimate proof is
+      // refused.
+      //
+      // Fail loudly: surface the underlying failure as a SphereError
+      // so callers can route around or escalate. `Sphere.init` /
+      // adapter wiring catches this and refuses to come up — better
+      // than booting in a state where every verification is silently
+      // wrong.
       try {
         const trustBaseJson = await this.config.trustBaseLoader.load();
         if (trustBaseJson) {
           this.trustBase = RootTrustBase.fromJSON(trustBaseJson);
+        } else {
+          throw new SphereError(
+            'TrustBaseLoader.load() returned null/undefined — cannot verify proofs',
+            'NOT_INITIALIZED',
+          );
         }
       } catch (error) {
-        this.log('Failed to load trust base:', error);
+        // Don't double-wrap an existing SphereError; preserve forensic detail
+        // in `cause` for non-SphereError errors so the caller can drill in.
+        if (error instanceof SphereError) {
+          throw error;
+        }
+        throw new SphereError(
+          `Failed to load trust base — refusing to initialize aggregator: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+          'NOT_INITIALIZED',
+          error,
+        );
       }
     }
 
@@ -358,6 +389,71 @@ export class UnicityAggregatorProvider implements OracleProvider {
       // some legacy / mock responders use `proof`. Accept either.
       const proof = response.inclusionProof ?? response.proof;
       if (!proof) {
+        return null;
+      }
+
+      // Steelman finding #157: shape-validate the aggregator's proof
+      // payload before handing it back to callers. A malicious or
+      // misbehaving aggregator can return arbitrary JSON
+      // (`{inclusionProof: true}`, `{inclusionProof: {}}`,
+      // `{inclusionProof: "string"}`, etc.). Without validation the
+      // historical caller treats every non-null payload as a successful
+      // proof, which silently drives finalization, race-lost detection,
+      // and Rule-4 enrichment off forged shapes.
+      //
+      // Two-layer validation:
+      //   1. Structural pre-check: must be a plain object (not primitive,
+      //      not array) and carry every field required by the SDK's
+      //      `IInclusionProofJson` (`authenticator`, `merkleTreePath`,
+      //      `transactionHash`, `unicityCertificate`).
+      //   2. Cryptographic parse: try `SdkInclusionProof.fromJSON(proof)`.
+      //      The SDK enforces invariants the aggregator wrapper cannot
+      //      (auth+tx pairing, merkle-path well-formedness, etc.). On
+      //      throw, return null (logged at WARN). getProof is allowed
+      //      to return null for "no proof yet" so callers retry; throwing
+      //      here would break poll loops.
+      if (
+        typeof proof !== 'object' ||
+        proof === null ||
+        Array.isArray(proof)
+      ) {
+        logger.warn(
+          'Aggregator',
+          `getProof: rejected non-object inclusion proof shape (got ${
+            Array.isArray(proof) ? 'array' : typeof proof
+          })`,
+        );
+        return null;
+      }
+      const proofObj = proof as Record<string, unknown>;
+      const requiredKeys = [
+        'authenticator',
+        'merkleTreePath',
+        'transactionHash',
+        'unicityCertificate',
+      ] as const;
+      for (const k of requiredKeys) {
+        if (!(k in proofObj)) {
+          logger.warn(
+            'Aggregator',
+            `getProof: rejected inclusion proof missing required field "${k}"`,
+          );
+          return null;
+        }
+      }
+      try {
+        // Cryptographic structure check. The parsed instance is not
+        // retained here — callers consume the JSON shape — but a
+        // throw on fromJSON proves the payload is structurally
+        // SDK-valid. Verification against the trust base happens in
+        // `verifyInclusionProof` at the caller.
+        SdkInclusionProof.fromJSON(proof);
+      } catch (parseErr) {
+        logger.warn(
+          'Aggregator',
+          'getProof: SDK fromJSON rejected inclusion proof shape',
+          parseErr,
+        );
         return null;
       }
 
@@ -512,7 +608,20 @@ export class UnicityAggregatorProvider implements OracleProvider {
     transactionHash: string;
     proofHash?: string;
   }): Promise<boolean> {
-    if (!this.trustBase) return false;
+    // Steelman finding #156: don't silently return false when the
+    // trust base never loaded — that masks an init-time failure as a
+    // crypto-time invalid proof. Callers who interpret `false` as
+    // "this proof is invalid" make the wrong decision (e.g., dropping
+    // a perfectly valid proof from the merge candidates) when the
+    // real cause is "we never bootstrapped". Throw NOT_INITIALIZED
+    // so callers either (a) escalate, or (b) explicitly catch and
+    // treat it as a soft failure with eyes open.
+    if (this.trustBase === null) {
+      throw new SphereError(
+        'verifyInclusionProof: trustBase not loaded — call initialize() first',
+        'NOT_INITIALIZED',
+      );
+    }
     // Wave I.6 + Wave J: sanity-check that transactionHash looks
     // like a DataHash imprint hex (algorithm-prefix + digest). The
     // SDK currently emits 68 chars (sha2-256 = 2-byte prefix + 32-

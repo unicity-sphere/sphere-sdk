@@ -404,16 +404,44 @@ function conflictingDisposition(
 
 /**
  * Defensive helper: compute the chain-head ContentHash. The chain-head
- * for an N-tx chain is the destinationState of the last tx; for a
- * 0-tx chain (genesis-only) it falls back to `tokenRootHash` (the
- * recipient's manifest stores rootHash, not stateHash, so this fall
- * back is consistent with `TokenManifestEntry.rootHash` semantics).
+ * for an N-tx chain (N > 0) is the `destinationState` of the LAST
+ * transaction — the post-state the head transition is anchored to. For
+ * a 0-tx chain (genesis-only token) it falls back to `tokenRootHash`,
+ * the only stable identifier available at genesis.
+ *
+ * **Why destinationState, not tokenRootHash, for non-empty chains.**
+ * The §5.3 [D] conflict check at the call sites compares this value
+ * with the local manifest's `rootHash` to decide CONFLICTING. Returning
+ * `tokenRootHash` unconditionally has two failure modes:
+ *
+ *   1. A re-anchor of the same token-root CID under a new chain bypasses
+ *      the conflict check (both sides match `tokenRootHash`) — even
+ *      though the chain head genuinely diverged.
+ *   2. Legitimately-divergent chains that share a tokenId but were
+ *      hydrated from different token-roots ALWAYS trigger CONFLICTING
+ *      regardless of whether their actual head states match.
+ *
+ * The fix: track the head state. Two chains that progressed through
+ * different transitions land on different `destinationState`s; two
+ * chains that converged on the same head state are NOT in conflict.
  *
  * Wrapped to never throw; defensive against a hydration that produces
- * a chain with malformed last-element shape.
+ * a chain with a malformed last-element shape (defaults to
+ * `tokenRootHash` rather than propagating an undefined access).
  */
 function chainHeadHash(chain: HydratedChain): ContentHash {
-  return chain.tokenRootHash;
+  if (chain.chain.length === 0) {
+    return chain.tokenRootHash;
+  }
+  const lastTx = chain.chain[chain.chain.length - 1];
+  // Defensive: a malformed hydration that drops `destinationState` falls
+  // back to `tokenRootHash` rather than crashing the engine. The
+  // structural check at hydration time SHOULD have caught this; this
+  // branch is defense-in-depth.
+  if (typeof lastTx.destinationState !== 'string' || lastTx.destinationState.length === 0) {
+    return chain.tokenRootHash;
+  }
+  return lastTx.destinationState as ContentHash;
 }
 
 // =============================================================================
@@ -555,11 +583,46 @@ export async function processDisposition(
   // For every tx WITH a proof, verify it. Transactions without
   // proofs (instant-mode unfinalized, chain-mode mid-hop) advance
   // the unfinalizedCount we already computed at step 0.
+  //
+  // **Monotonic-proof invariant (W41 / §5.6 monotonic-graft):** proof
+  // finality is monotonic over the chain — if tx[i+1] has a proof,
+  // then tx[i] MUST have a proof too. Only the SUFFIX of a chain may
+  // be unfinalized (instant-mode head-pending, chain-mode tail-pending).
+  // A K-tx chain with valid auth on every tx but `inclusionProof:
+  // null` on tx[i] (i < K-1) and a proof on some tx[j] (j > i) is
+  // STRUCTURALLY a forgery — a hostile sender stripping a mid-chain
+  // proof to lure the recipient into a `PENDING` state for a tx that
+  // is in fact already anchored to a competing successor.
+  //
+  // We precompute the highest-indexed proofed tx; any null-proof tx
+  // with a strictly-higher proofed sibling routes to INVALID(
+  // `proof-invalid`), the same reason as a clean PATH_INVALID failure
+  // — the §5.3 [C](3) family.
+  let lastProofedIndex = -1;
+  for (let i = chain.chain.length - 1; i >= 0; i--) {
+    if (chain.chain[i].inclusionProof !== null) {
+      lastProofedIndex = i;
+      break;
+    }
+  }
   for (let i = 0; i < chain.chain.length; i++) {
     const tx = chain.chain[i];
     if (tx.inclusionProof === null) {
-      // Skipped: this tx has no proof to verify yet. The
-      // unfinalizedCount counter we computed at step 0 will drive
+      // Mid-chain null-proof rejection: a strictly-later tx is anchored
+      // (`lastProofedIndex > i`), so this gap violates the monotonic-
+      // proof invariant and must be flagged. The check fires whether
+      // or not the bundle is in instant or conservative mode — the
+      // forgery is structural, not mode-specific.
+      if (lastProofedIndex > i) {
+        return cryptoInvalid(
+          input,
+          chain.tokenId,
+          input.tokenRootHash,
+          'proof-invalid',
+        );
+      }
+      // Suffix-only unfinalized: this tx has no proof to verify yet.
+      // The unfinalizedCount counter computed at step 0 will drive
       // the PENDING outcome at step 7.
       continue;
     }

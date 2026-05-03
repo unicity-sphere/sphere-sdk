@@ -1095,15 +1095,32 @@ export class CountingSemaphore implements Semaphore {
   }
 
   async acquire(): Promise<() => void> {
+    // Steelman finding #158: the release closure MUST be idempotent.
+    // Worker error paths frequently call `release()` from a finally
+    // block AND from an inline-cleanup branch — without a `released`
+    // guard, a double-release silently inflates `permits` past
+    // `maxConcurrent` and the W14/W26 process-global cap is meaningless
+    // after a few error iterations. Wrapping with a one-shot flag
+    // makes accidental double-release a no-op.
     if (this.permits > 0) {
       this.permits--;
-      return () => this.release();
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        this.release();
+      };
     }
     // Wait for a permit.
     return new Promise<() => void>((resolve) => {
       this.waiters.push(() => {
         this.permits--;
-        resolve(() => this.release());
+        let released = false;
+        resolve(() => {
+          if (released) return;
+          released = true;
+          this.release();
+        });
       });
     });
   }

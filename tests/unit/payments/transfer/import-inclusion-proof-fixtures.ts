@@ -268,9 +268,12 @@ export function buildImporterHarness(args: {
    */
   readonly mutex?: PerTokenMutex;
   /**
-   * Optional override of the mutex strategy. Default `'cas'` (matches
-   * production wiring per W34). Tests that want strict serialization
-   * to assert ordering pass `'rpc-release'` or `'bounded-hold'`.
+   * Optional override of the mutex strategy. When omitted the
+   * harness leaves `perTokenMutexStrategy` undefined so the
+   * importer's own default applies — `'rpc-release'` post #153.
+   * Tests that want strict-serialization assertions can set this
+   * explicitly; tests that want to exercise the no-serialization
+   * pass-through pass `'cas'`.
    */
   readonly mutexStrategy?: PerTokenMutexStrategy;
   /**
@@ -319,7 +322,11 @@ export function buildImporterHarness(args: {
     emit: events.emit,
     now: () => 1700000000000,
     perTokenMutex: mutex,
-    perTokenMutexStrategy: args.mutexStrategy ?? 'cas',
+    // Leave undefined when the test doesn't override — the
+    // importer's own default ('rpc-release' post #153) applies.
+    ...(args.mutexStrategy !== undefined
+      ? { perTokenMutexStrategy: args.mutexStrategy }
+      : {}),
   };
 
   return {

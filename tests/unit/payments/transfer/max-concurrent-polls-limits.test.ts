@@ -163,4 +163,69 @@ describe('FinalizationWorkerSender — concurrency caps (W14)', () => {
     expect(result.terminal).toBe('finalized');
     expect(perTokenSemaphore.available).toBe(4);
   });
+
+  // Steelman finding #158: the release closure returned by acquire()
+  // MUST be idempotent. Without a `released` guard, a finally-then-
+  // catch double-release inflates `permits` past `maxConcurrent` and
+  // the W14/W26 cap silently degrades after a few error iterations.
+  describe('CountingSemaphore — release idempotency (#158)', () => {
+    it('double-release on the fast-path closure is a no-op', async () => {
+      const sem = new CountingSemaphore(2);
+      const release = await sem.acquire();
+      expect(sem.available).toBe(1);
+      release();
+      expect(sem.available).toBe(2);
+      // Second call: must NOT push permits past the configured cap.
+      release();
+      expect(sem.available).toBe(2);
+    });
+
+    it('triple-release is still capped at the original maxConcurrent', async () => {
+      const sem = new CountingSemaphore(1);
+      const release = await sem.acquire();
+      release();
+      release();
+      release();
+      expect(sem.available).toBe(1);
+    });
+
+    it('double-release on the wait-path closure is also a no-op', async () => {
+      // Force the waiter codepath: drain the semaphore, queue a waiter,
+      // release one permit to wake it, then verify the woken closure
+      // is also idempotent.
+      const sem = new CountingSemaphore(1);
+      const r1 = await sem.acquire();
+      let woken: (() => void) | null = null;
+      const wakerPromise = sem.acquire().then((release) => {
+        woken = release;
+      });
+      // Release first permit to wake the waiter.
+      r1();
+      await wakerPromise;
+      expect(woken).not.toBeNull();
+      expect(sem.available).toBe(0);
+      woken!();
+      expect(sem.available).toBe(1);
+      // Double-release: must NOT inflate.
+      woken!();
+      expect(sem.available).toBe(1);
+    });
+
+    it('double-release on N concurrently-acquired permits keeps total at maxConcurrent', async () => {
+      // Worst case: a buggy caller double-releases every single permit.
+      // Without idempotency, `available` drifts to 2*maxConcurrent.
+      const sem = new CountingSemaphore(8);
+      const releases: Array<() => void> = [];
+      for (let i = 0; i < 8; i++) {
+        releases.push(await sem.acquire());
+      }
+      expect(sem.available).toBe(0);
+      // First release wave (legit).
+      for (const r of releases) r();
+      expect(sem.available).toBe(8);
+      // Buggy second release wave.
+      for (const r of releases) r();
+      expect(sem.available).toBe(8);
+    });
+  });
 });

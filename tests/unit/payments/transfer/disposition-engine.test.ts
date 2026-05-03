@@ -596,9 +596,10 @@ describe('[D-conflict] CONFLICTING', () => {
     );
     expect(result.disposition).toBe('CONFLICTING');
     if (result.disposition === 'CONFLICTING') {
-      // The new chain head is the manifest entry's rootHash; the
-      // existing head is in conflictingHeads.
-      expect(result.manifest.rootHash).toBe(TOKEN_ROOT_HASH);
+      // The new chain head is the LAST tx's destinationState (#162);
+      // the default `tx()` builder produces dst='s1'. The existing
+      // head is in conflictingHeads.
+      expect(result.manifest.rootHash).toBe('s1');
       expect(result.manifest.status).toBe('conflicting');
       expect(result.conflictingHeads).toContain(ALT_HEAD_HASH);
     }
@@ -668,7 +669,9 @@ describe('[D-fresh] / [E-pending] / [E-valid] / [E-unspendable]', () => {
     );
     expect(result.disposition).toBe('PENDING');
     if (result.disposition === 'PENDING') {
-      expect(result.manifest.rootHash).toBe(TOKEN_ROOT_HASH);
+      // Chain head is last tx destinationState (#162) — 's2' for this
+      // two-tx chain (tx[0] dst=s1, tx[1] dst=s2).
+      expect(result.manifest.rootHash).toBe('s2');
       expect(result.manifest.status).toBe('pending');
     }
   });
@@ -683,7 +686,9 @@ describe('[D-fresh] / [E-pending] / [E-valid] / [E-unspendable]', () => {
     expect(result.disposition).toBe('VALID');
     if (result.disposition === 'VALID') {
       expect(result.manifest.status).toBe('valid');
-      expect(result.manifest.rootHash).toBe(TOKEN_ROOT_HASH);
+      // Chain head is last tx destinationState (#162) — default
+      // single-tx builder uses dst='s1'.
+      expect(result.manifest.rootHash).toBe('s1');
     }
   });
 
@@ -992,6 +997,244 @@ describe('empty chain (genesis-only token)', () => {
     expect(r.disposition).toBe('AUDIT');
     if (r.disposition === 'AUDIT') {
       expect(r.reason).toBe('not-our-state');
+    }
+  });
+});
+
+// =============================================================================
+// 14. Mid-chain null-proof rejection (#154 — monotonic-proof invariant)
+// =============================================================================
+
+describe('mid-chain null-proof rejection (#154)', () => {
+  it('rejects 2-tx chain where tx[0] is null-proof and tx[1] is anchored', async () => {
+    // The classic forgery shape: a hostile sender strips the proof
+    // from tx[0] to lure us into PENDING for a tx that is in fact
+    // already anchored to a competing successor.
+    const r = await processDisposition(
+      buildInput({
+        mode: 'conservative',
+        chain: chain({
+          txs: [
+            tx({ src: 's0', dst: 's1', hasProof: false }),
+            tx({ src: 's1', dst: 's2', hasProof: true }),
+          ],
+        }),
+      }),
+    );
+    expect(r.disposition).toBe('INVALID');
+    if (r.disposition === 'INVALID') {
+      expect(r.reason).toBe('proof-invalid');
+    }
+  });
+
+  it('rejects 3-tx chain where tx[1] (middle) is null-proof and tx[2] is anchored', async () => {
+    const r = await processDisposition(
+      buildInput({
+        mode: 'conservative',
+        chain: chain({
+          txs: [
+            tx({ src: 's0', dst: 's1', hasProof: true }),
+            tx({ src: 's1', dst: 's2', hasProof: false }),
+            tx({ src: 's2', dst: 's3', hasProof: true }),
+          ],
+        }),
+      }),
+    );
+    expect(r.disposition).toBe('INVALID');
+    if (r.disposition === 'INVALID') {
+      expect(r.reason).toBe('proof-invalid');
+    }
+  });
+
+  it('accepts a SUFFIX-only unfinalized chain (PENDING)', async () => {
+    // Defense: the rejection MUST only fire when a strictly-later tx
+    // has a proof. A tail-pending chain is the legitimate
+    // chain-mode-mid-hop / instant-mode-head-pending shape.
+    const r = await processDisposition(
+      buildInput({
+        mode: 'conservative',
+        chain: chain({
+          txs: [
+            tx({ src: 's0', dst: 's1', hasProof: true }),
+            tx({ src: 's1', dst: 's2', hasProof: false }),
+            tx({ src: 's2', dst: 's3', hasProof: false }),
+          ],
+        }),
+      }),
+    );
+    expect(r.disposition).toBe('PENDING');
+  });
+
+  it('accepts a fully-unfinalized chain (no proofs anywhere → PENDING)', async () => {
+    // No tx has a proof, so `lastProofedIndex === -1` and the gate
+    // never fires. PENDING is the right outcome (conservative mode).
+    const r = await processDisposition(
+      buildInput({
+        mode: 'conservative',
+        chain: chain({
+          txs: [
+            tx({ src: 's0', dst: 's1', hasProof: false }),
+            tx({ src: 's1', dst: 's2', hasProof: false }),
+          ],
+        }),
+      }),
+    );
+    expect(r.disposition).toBe('PENDING');
+  });
+
+  it('rejects mid-chain null-proof BEFORE attempting proof-verify on the anchored tx', async () => {
+    // The mid-chain gap is detected by the pre-check loop; we should
+    // never reach the proof verifier (which here is set to PATH_INVALID
+    // — the test would surface a different reason if the engine got
+    // past the gate). The reason returned is the gate's `proof-invalid`,
+    // which is the same string as the verifier-driven outcome, but
+    // arises here without the verifier hook running.
+    let proofVerifyCount = 0;
+    const input = buildInput({
+      mode: 'conservative',
+      chain: chain({
+        txs: [
+          tx({ src: 's0', dst: 's1', hasProof: false }),
+          tx({ src: 's1', dst: 's2', hasProof: true }),
+        ],
+      }),
+      proofResults: ['OK'],
+    });
+    const wrapped: DispositionEngineInput = {
+      ...input,
+      verifyProof: async (proof, trustBase, requestId) => {
+        proofVerifyCount++;
+        return input.verifyProof(proof, trustBase, requestId);
+      },
+    };
+    const r = await processDisposition(wrapped);
+    expect(r.disposition).toBe('INVALID');
+    if (r.disposition === 'INVALID') {
+      expect(r.reason).toBe('proof-invalid');
+    }
+    expect(proofVerifyCount).toBe(0);
+  });
+});
+
+// =============================================================================
+// 15. chainHeadHash returns last tx destinationState (#162)
+// =============================================================================
+
+describe('chainHeadHash uses last tx destinationState (#162)', () => {
+  it('VALID single-tx chain reports head=tx.destinationState', async () => {
+    const r = await processDisposition(
+      buildInput({
+        chain: chain({ txs: [tx({ src: 's0', dst: 'head-1', hasProof: true })] }),
+      }),
+    );
+    expect(r.disposition).toBe('VALID');
+    if (r.disposition === 'VALID') {
+      expect(r.manifest.rootHash).toBe('head-1');
+    }
+  });
+
+  it('VALID multi-tx chain reports head=last-tx.destinationState', async () => {
+    const r = await processDisposition(
+      buildInput({
+        chain: chain({
+          txs: [
+            tx({ src: 's0', dst: 's1', hasProof: true }),
+            tx({ src: 's1', dst: 's2', hasProof: true }),
+            tx({ src: 's2', dst: 'final-head', hasProof: true }),
+          ],
+        }),
+      }),
+    );
+    expect(r.disposition).toBe('VALID');
+    if (r.disposition === 'VALID') {
+      expect(r.manifest.rootHash).toBe('final-head');
+    }
+  });
+
+  it('PENDING multi-tx chain reports head=last-tx.destinationState (suffix-pending)', async () => {
+    const r = await processDisposition(
+      buildInput({
+        mode: 'conservative',
+        chain: chain({
+          txs: [
+            tx({ src: 's0', dst: 's1', hasProof: true }),
+            tx({ src: 's1', dst: 'tail-head', hasProof: false }),
+          ],
+        }),
+      }),
+    );
+    expect(r.disposition).toBe('PENDING');
+    if (r.disposition === 'PENDING') {
+      expect(r.manifest.rootHash).toBe('tail-head');
+    }
+  });
+
+  it('empty chain reports head=tokenRootHash (genesis-only fallback)', async () => {
+    const r = await processDisposition(
+      buildInput({
+        chain: chain({ txs: [] }),
+        oracleIsSpent: false,
+      }),
+    );
+    expect(r.disposition).toBe('VALID');
+    if (r.disposition === 'VALID') {
+      // Genesis-only fallback — no transitions to anchor a head state.
+      expect(r.manifest.rootHash).toBe(TOKEN_ROOT_HASH);
+    }
+  });
+
+  it('CONFLICTING compares against destinationState — re-anchor of same tokenRootHash with diverged head IS conflict', async () => {
+    // Pre-fix bug: the engine compared `tokenRootHash` against the
+    // local manifest's rootHash. A re-anchor of the same token-root
+    // CID under a NEW chain (different head state) would NOT trigger
+    // CONFLICTING. With the fix the comparison is against the chain
+    // head's destinationState, so this case correctly surfaces.
+    const localManifest: ManifestEntryDelta = {
+      // Local manifest's recorded head is `s-old`.
+      rootHash: 's-old' as ContentHash,
+      status: 'valid',
+    };
+    const r = await processDisposition(
+      buildInput({
+        chain: chain({
+          txs: [
+            tx({ src: 's0', dst: 's1', hasProof: true }),
+            tx({ src: 's1', dst: 's-new', hasProof: true }),
+          ],
+        }),
+        localManifest,
+      }),
+    );
+    expect(r.disposition).toBe('CONFLICTING');
+    if (r.disposition === 'CONFLICTING') {
+      expect(r.manifest.rootHash).toBe('s-new');
+      expect(r.conflictingHeads).toContain('s-old');
+    }
+  });
+
+  it('NO conflict when local manifest head matches the new chain head (converged chains)', async () => {
+    // Defense: two chains may have legitimately converged on the same
+    // head state (e.g., the user already imported this exact manifest
+    // entry in a prior bundle). The engine MUST NOT fire CONFLICTING
+    // in that case.
+    const localManifest: ManifestEntryDelta = {
+      rootHash: 'same-head' as ContentHash,
+      status: 'valid',
+    };
+    const r = await processDisposition(
+      buildInput({
+        chain: chain({
+          txs: [
+            tx({ src: 's0', dst: 's1', hasProof: true }),
+            tx({ src: 's1', dst: 'same-head', hasProof: true }),
+          ],
+        }),
+        localManifest,
+      }),
+    );
+    expect(r.disposition).toBe('VALID');
+    if (r.disposition === 'VALID') {
+      expect(r.manifest.rootHash).toBe('same-head');
     }
   });
 });

@@ -64,6 +64,41 @@ export const RELAY_SAFE_CAP_BYTES = 96 * 1024;
 export const MAX_FETCHED_CAR_BYTES = 32 * 1024 * 1024;
 
 /**
+ * Total wall-clock cap on a single `fetchCarByCid` call (steelman fix #161).
+ *
+ * The per-gateway IDLE timeout (60s, refreshed on every chunk read) bounds a
+ * single hop, but says nothing about how long the fetcher will run across the
+ * full gateway list. A hostile peer can drip-feed N gateways at idle-window
+ * boundaries (each one stalling for 59s, then yielding a single byte, then
+ * stalling another 59s, ...) and hold a worker hostage for hours. With the
+ * sender able to enumerate up to MAX_INGEST_WORKERS=16 simultaneous bundles
+ * before the per-token cap fires, this is enough to lock up the entire pool.
+ *
+ * 10 minutes is the cap we surface to callers as the default. It's
+ * comfortably above the §11.2 / W29 cross-mode edge case (5-minute IPFS
+ * fetch delay) so legitimate slow fetches succeed, while still bounding the
+ * worst-case drip-feed scenario to a fixed multiple of the per-gateway
+ * idle-timeout window. With 10 gateways at 60s each in series, the existing
+ * idle-timer caps the walk at ~10 minutes anyway — this constant ensures
+ * a single-gateway drip-feed (1 chunk every 59s for hours) cannot exceed
+ * the same bound.
+ *
+ * Callers needing a higher cap can override via the `maxTotalFetchMs`
+ * option — see `CidFetcherOptions`. Tests pass small values (e.g., 50ms)
+ * with mock fetch implementations to exercise the abort path
+ * deterministically.
+ *
+ * Spec rationale:
+ *  - The §9.2 retry semantics promise a deterministic gateway-walk outcome,
+ *    NOT a deterministic wall-clock budget. This cap is a defensive bound
+ *    on the worst case, not part of the protocol contract.
+ *  - `BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT` already covers all-gateway
+ *    failure; the total-timeout outcome surfaces under the same code so
+ *    callers route it through the W13 transient-retry path identically.
+ */
+export const MAX_TOTAL_FETCH_MS = 10 * 60 * 1000;
+
+/**
  * Per-bundle cap on the number of `token-root` (or future root-equivalent)
  * elements present in the pool but absent from `payload.tokenIds` (i.e.
  * "smuggled" roots). Beyond this, the bundle is rejected with

@@ -181,11 +181,13 @@ describe('§6.3 importInclusionProof — per-tokenId mutex (steelman post-cutove
     expect(h.mutex.size()).toBe(0);
   });
 
-  it('default CAS strategy is the no-serialization pass-through', async () => {
-    // Under CAS the mutex does NOT serialize — verify both callers
-    // enter verifyProof concurrently. Production correctness is
-    // provided by ManifestCas inside the override callback, not by
-    // the mutex.
+  it('default strategy (post #153) serializes concurrent imports on the SAME tokenId', async () => {
+    // Per #153 the production default flipped from 'cas' to
+    // 'rpc-release', so callers who DON'T pass an explicit strategy
+    // get real per-tokenId serialization. This test omits
+    // `mutexStrategy` from the harness — the importer's internal
+    // default applies — and asserts the same serialization invariant
+    // as the explicit-rpc-release test above.
     let resolveFirstVerify!: () => void;
     const firstVerifyGate = new Promise<void>((r) => {
       resolveFirstVerify = r;
@@ -193,7 +195,76 @@ describe('§6.3 importInclusionProof — per-tokenId mutex (steelman post-cutove
     let verifyEntries = 0;
 
     const h = buildImporterHarness({
-      // mutexStrategy defaults to 'cas' — the production W34 default.
+      // No mutexStrategy passed — importer default ('rpc-release').
+      verifyHook: async () => {
+        verifyEntries++;
+        if (verifyEntries === 1) {
+          await firstVerifyGate;
+        }
+      },
+    });
+
+    h.disposition.entries.set(
+      `${ADDR}.invalid.t-default.${'aa'.repeat(32)}`,
+      invalidEntryFor({ tokenId: 't-default', reason: 'oracle-rejected' }),
+    );
+    h.manifest.entries.set(`${ADDR}:t-default`, manifestEntryFor({
+      status: 'invalid',
+      invalidReason: 'oracle-rejected',
+      rootHashHex: 'aa'.repeat(32),
+    }));
+    h.queue.entries.push(queueEntryFor({
+      tokenId: 't-default',
+      commitmentRequestId: 'rq-default-c',
+      status: 'hard-fail',
+    }));
+
+    const p1 = h.importer.importInclusionProof(
+      ADDR,
+      't-default',
+      proofFor({ requestId: 'rq-default-c' }),
+      { allowInvalidOverride: true, operatorPubkey: 'op-A' },
+    );
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    expect(verifyEntries).toBe(1);
+    expect(h.mutex.isLocked('t-default')).toBe(true);
+
+    const p2 = h.importer.importInclusionProof(
+      ADDR,
+      't-default',
+      proofFor({ requestId: 'rq-default-c' }),
+      { allowInvalidOverride: true, operatorPubkey: 'op-B' },
+    );
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    // p2 has NOT entered verifyProof — the default IS serializing.
+    expect(verifyEntries).toBe(1);
+
+    resolveFirstVerify();
+    await p1;
+    await p2;
+    expect(verifyEntries).toBe(2);
+    expect(h.mutex.size()).toBe(0);
+  });
+
+  it('CAS strategy (opt-in) is the no-serialization pass-through', async () => {
+    // Under CAS the mutex does NOT serialize — verify both callers
+    // enter verifyProof concurrently. Production correctness is
+    // provided by ManifestCas inside the override callback, not by
+    // the mutex. Per #153 the production default flipped from 'cas'
+    // to 'rpc-release'; CAS is now opt-in and exercised here only to
+    // confirm the legacy behaviour still applies when explicitly
+    // selected.
+    let resolveFirstVerify!: () => void;
+    const firstVerifyGate = new Promise<void>((r) => {
+      resolveFirstVerify = r;
+    });
+    let verifyEntries = 0;
+
+    const h = buildImporterHarness({
+      // Explicit opt-in to CAS — the production default is now
+      // 'rpc-release' (#153) so we must select 'cas' to assert
+      // pass-through behaviour.
+      mutexStrategy: 'cas',
       verifyHook: async () => {
         verifyEntries++;
         if (verifyEntries === 1) {

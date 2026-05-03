@@ -387,4 +387,232 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
     // ADDR has no entry → case 1.
     expect(result).toEqual({ ok: false, reason: 'no-such-token' });
   });
+
+  // ---------------------------------------------------------------------------
+  // (#155) proof-binding-mismatch — pending path. The proof's requestId
+  // matches an outstanding queue entry, but its transactionHash and/or
+  // authenticator disagree with the queue entry's bound triple.
+  // ---------------------------------------------------------------------------
+  it('CASE 3 (#155): pending + transactionHash mismatch → reason="proof-binding-mismatch"', async () => {
+    const h = buildImporterHarness();
+    h.manifest.entries.set(`${ADDR}:t-tx-mismatch`, manifestEntryFor({
+      status: 'pending',
+    }));
+    h.queue.entries.push(queueEntryFor({
+      tokenId: 't-tx-mismatch',
+      commitmentRequestId: 'rq-tx',
+      status: 'pending',
+      transactionHash: '0000' + 'aa'.repeat(32),
+      authenticator: 'authn-A',
+    }));
+    const result = await h.importer.importInclusionProof(
+      ADDR,
+      't-tx-mismatch',
+      proofFor({
+        requestId: 'rq-tx',
+        // Different transactionHash — same requestId.
+        transactionHash: '0000' + 'bb'.repeat(32),
+        authenticator: 'authn-A',
+      }),
+    );
+    expect(result).toEqual({ ok: false, reason: 'proof-binding-mismatch' });
+    expect(h.graftCalls.length).toBe(0);
+    expect(h.overrideCalls.length).toBe(0);
+  });
+
+  it('CASE 3 (#155): pending + authenticator mismatch → reason="proof-binding-mismatch"', async () => {
+    const h = buildImporterHarness();
+    h.manifest.entries.set(`${ADDR}:t-auth-mismatch`, manifestEntryFor({
+      status: 'pending',
+    }));
+    h.queue.entries.push(queueEntryFor({
+      tokenId: 't-auth-mismatch',
+      commitmentRequestId: 'rq-auth',
+      status: 'pending',
+      transactionHash: '0000' + 'aa'.repeat(32),
+      authenticator: 'authn-A',
+    }));
+    const result = await h.importer.importInclusionProof(
+      ADDR,
+      't-auth-mismatch',
+      proofFor({
+        requestId: 'rq-auth',
+        transactionHash: '0000' + 'aa'.repeat(32),
+        authenticator: 'authn-B', // mismatch
+      }),
+    );
+    expect(result).toEqual({ ok: false, reason: 'proof-binding-mismatch' });
+    expect(h.graftCalls.length).toBe(0);
+  });
+
+  it('CASE 3 (#155): pending + case-different but byte-equal hex → graft accepted', async () => {
+    const h = buildImporterHarness();
+    h.manifest.entries.set(`${ADDR}:t-case`, manifestEntryFor({
+      status: 'pending',
+    }));
+    h.queue.entries.push(queueEntryFor({
+      tokenId: 't-case',
+      commitmentRequestId: 'rq-case',
+      status: 'pending',
+      transactionHash: '0000' + 'AB'.repeat(32),
+      authenticator: 'AUTHn-X',
+    }));
+    const result = await h.importer.importInclusionProof(
+      ADDR,
+      't-case',
+      proofFor({
+        requestId: 'rq-case',
+        // Same bytes, different case — must compare equal.
+        transactionHash: '0000' + 'ab'.repeat(32),
+        authenticator: 'authN-x',
+      }),
+    );
+    expect(result).toEqual({ ok: true, transition: 'pending→valid' });
+    expect(h.graftCalls.length).toBe(1);
+  });
+
+  // ---------------------------------------------------------------------------
+  // (#155) proof-binding-mismatch — invalid path. An attacker who knows
+  // the victim's tokenId + a hard-failed requestId could otherwise paste
+  // any aggregator-anchored proof sharing that requestId and flip
+  // `_invalid → valid`. The §6.3 most-recent-proof / single-spend
+  // forbidden-case checks require the full triple to match.
+  // ---------------------------------------------------------------------------
+  it('CASE 5 (#155): _invalid + requestId match but transactionHash mismatch → reason="proof-binding-mismatch"', async () => {
+    const h = buildImporterHarness();
+    h.disposition.entries.set(
+      `${ADDR}.invalid.t-evil.${'aa'.repeat(32)}`,
+      invalidEntryFor({ tokenId: 't-evil', reason: 'oracle-rejected' }),
+    );
+    h.manifest.entries.set(`${ADDR}:t-evil`, manifestEntryFor({
+      status: 'invalid',
+      invalidReason: 'oracle-rejected',
+      rootHashHex: 'aa'.repeat(32),
+    }));
+    h.queue.entries.push(queueEntryFor({
+      tokenId: 't-evil',
+      commitmentRequestId: 'rq-evil',
+      status: 'hard-fail',
+      transactionHash: '0000' + 'aa'.repeat(32),
+      authenticator: 'authn-victim',
+    }));
+    const result = await h.importer.importInclusionProof(
+      ADDR,
+      't-evil',
+      proofFor({
+        // Attacker brings a different proof (different transaction)
+        // that happens to share the requestId.
+        requestId: 'rq-evil',
+        transactionHash: '0000' + 'cc'.repeat(32),
+        authenticator: 'authn-attacker',
+      }),
+      { allowInvalidOverride: true },
+    );
+    expect(result).toEqual({ ok: false, reason: 'proof-binding-mismatch' });
+    // Override callback NOT invoked, no event emitted — the §5.6
+    // monotonicity invariant remains intact.
+    expect(h.overrideCalls.length).toBe(0);
+    expect(
+      h.events.events.filter((e) => e.type === 'transfer:override-applied').length,
+    ).toBe(0);
+  });
+
+  // ---------------------------------------------------------------------------
+  // (#165) invalid-record-missing — manifest carries `status='invalid'`
+  // but no `_invalid` record exists. Default behaviour is to refuse the
+  // override; opt-in via `allowSyntheticInvalidEntry: true` to fall back
+  // to synthesis from the manifest fields.
+  // ---------------------------------------------------------------------------
+  it('CASE invalid-record-missing (#165): manifest=invalid + no _invalid record → reason="invalid-record-missing"', async () => {
+    const h = buildImporterHarness();
+    h.manifest.entries.set(`${ADDR}:t-orphan`, manifestEntryFor({
+      status: 'invalid',
+      invalidReason: 'oracle-rejected',
+      rootHashHex: 'aa'.repeat(32),
+    }));
+    // NB: no disposition entry written — structurally inconsistent.
+    h.queue.entries.push(queueEntryFor({
+      tokenId: 't-orphan',
+      commitmentRequestId: 'rq-orphan',
+      status: 'hard-fail',
+    }));
+    const result = await h.importer.importInclusionProof(
+      ADDR,
+      't-orphan',
+      proofFor({ requestId: 'rq-orphan' }),
+      { allowInvalidOverride: true },
+    );
+    expect(result).toEqual({ ok: false, reason: 'invalid-record-missing' });
+    expect(h.overrideCalls.length).toBe(0);
+    expect(
+      h.events.events.filter((e) => e.type === 'transfer:override-applied').length,
+    ).toBe(0);
+  });
+
+  it('CASE invalid-record-missing (#165): allowSyntheticInvalidEntry=true falls back to synthesis', async () => {
+    const h = buildImporterHarness();
+    h.manifest.entries.set(`${ADDR}:t-orphan-ok`, manifestEntryFor({
+      status: 'invalid',
+      invalidReason: 'oracle-rejected',
+      rootHashHex: 'aa'.repeat(32),
+    }));
+    h.queue.entries.push(queueEntryFor({
+      tokenId: 't-orphan-ok',
+      commitmentRequestId: 'rq-orphan-ok',
+      status: 'hard-fail',
+    }));
+    const result = await h.importer.importInclusionProof(
+      ADDR,
+      't-orphan-ok',
+      proofFor({ requestId: 'rq-orphan-ok' }),
+      {
+        allowInvalidOverride: true,
+        allowSyntheticInvalidEntry: true,
+        currentTime: 1700000004000,
+      },
+    );
+    expect(result).toEqual({ ok: true, transition: 'invalid→valid' });
+    expect(h.overrideCalls.length).toBe(1);
+    // The synthesized invalid entry has empty-string provenance — the
+    // operator opted into accepting that loss.
+    expect(h.overrideCalls[0]!.previousInvalidEntry.bundleCid).toBe('');
+    expect(h.overrideCalls[0]!.previousInvalidEntry.senderTransportPubkey).toBe('');
+  });
+
+  it('CASE invalid-record-missing (#165): _invalid record present → falls through to case 5/6 (no synthesis)', async () => {
+    // When both the manifest entry and the disposition record are
+    // present, we use the disposition record (real provenance), not
+    // the synthesized one.
+    const h = buildImporterHarness();
+    h.disposition.entries.set(
+      `${ADDR}.invalid.t-paired.${'aa'.repeat(32)}`,
+      invalidEntryFor({
+        tokenId: 't-paired',
+        reason: 'oracle-rejected',
+        bundleCid: 'bafy-real',
+        senderTransportPubkey: 'pk-real',
+      }),
+    );
+    h.manifest.entries.set(`${ADDR}:t-paired`, manifestEntryFor({
+      status: 'invalid',
+      invalidReason: 'oracle-rejected',
+      rootHashHex: 'aa'.repeat(32),
+    }));
+    h.queue.entries.push(queueEntryFor({
+      tokenId: 't-paired',
+      commitmentRequestId: 'rq-paired',
+      status: 'hard-fail',
+    }));
+    const result = await h.importer.importInclusionProof(
+      ADDR,
+      't-paired',
+      proofFor({ requestId: 'rq-paired' }),
+      { allowInvalidOverride: true },
+    );
+    expect(result).toEqual({ ok: true, transition: 'invalid→valid' });
+    expect(h.overrideCalls.length).toBe(1);
+    // Real provenance preserved — not the empty-string synthesis.
+    expect(h.overrideCalls[0]!.previousInvalidEntry.bundleCid).toBe('bafy-real');
+    expect(h.overrideCalls[0]!.previousInvalidEntry.senderTransportPubkey).toBe('pk-real');
+  });
 });

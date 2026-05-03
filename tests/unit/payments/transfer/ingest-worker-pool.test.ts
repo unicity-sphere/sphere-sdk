@@ -81,6 +81,14 @@ interface BundleSpec {
   readonly forceTransient?: boolean;
   /** Optional knob: if set, the acquirer stub awaits this many ms. */
   readonly delayMs?: number;
+  /**
+   * Optional advisory-unclaimed root tokenIds (smuggled / found-money,
+   * §5.2 #2). The verifier returns these in
+   * `verified.advisoryUnclaimedRoots` so the pool can pass them
+   * through to `processToken` with `ctx.isClaimed === false`. Used by
+   * the steelman fix #160 tests below.
+   */
+  readonly advisoryTokenIds?: ReadonlyArray<string>;
 }
 
 function buildPayload(spec: BundleSpec): UxfV1Payload {
@@ -100,12 +108,19 @@ function buildVerifiedBundle(spec: BundleSpec): VerifiedBundle {
     tokenId: id,
     chainDepth: 1,
   }));
+  const advisoryUnclaimedRoots: RootRef[] = (spec.advisoryTokenIds ?? []).map(
+    (id, idx) => ({
+      contentHash: syntheticHash(`advisory-${id}-${idx}`),
+      tokenId: id,
+      chainDepth: 1,
+    }),
+  );
   return {
     verified: true,
     pkg: {} as never,
     bundleCid: spec.bundleCid,
     claimedTokens,
-    advisoryUnclaimedRoots: [],
+    advisoryUnclaimedRoots,
     missingClaimedTokenIds: [],
     droppedDeepUnclaimed: 0,
   };
@@ -624,6 +639,124 @@ describe('IngestWorkerPool — W13 transient routing', () => {
     // Conversely, NO error-level log for a successful transient.
     const errorLog = logEvents.find((e) => e.level === 'error');
     expect(errorLog).toBeUndefined();
+  });
+});
+
+// =============================================================================
+// 7b. ProcessTokenContext.isClaimed discriminator (steelman #160)
+// =============================================================================
+
+describe('IngestWorkerPool — ProcessTokenContext.isClaimed (steelman #160)', () => {
+  let pool: IngestWorkerPool | null = null;
+
+  afterEach(async () => {
+    if (pool) {
+      await pool.destroy();
+      pool = null;
+    }
+  });
+
+  it('claimed tokens get ctx.isClaimed === true', async () => {
+    const claimedId = syntheticTokenId('claimed1');
+    const cid = syntheticBundleCid('claimedonly');
+    const spec: BundleSpec = {
+      bundleCid: cid,
+      tokenIds: [claimedId],
+      // No advisoryTokenIds → only claimed roots in the bundle.
+    };
+    const fixtures = new Map<string, { spec: BundleSpec; type: 'verified' }>([
+      [cid, { spec, type: 'verified' }],
+    ]);
+
+    const observed: Array<{ tokenId: string; isClaimed: boolean }> = [];
+    const processToken: ProcessTokenFn = async (tokenRoot, _verified, ctx) => {
+      observed.push({ tokenId: tokenRoot.tokenId, isClaimed: ctx.isClaimed });
+    };
+
+    pool = new IngestWorkerPool({
+      lru: new ReplayLRU(),
+      perTokenMutex: new PerTokenMutex(),
+      processToken,
+      emit: () => undefined,
+      acquireBundle: makeAcquirer(fixtures),
+      mutexStrategy: 'rpc-release',
+    });
+
+    await pool.enqueue(buildPayload(spec), SENDER);
+
+    expect(observed).toEqual([{ tokenId: claimedId, isClaimed: true }]);
+  });
+
+  it('advisory roots get ctx.isClaimed === false', async () => {
+    const advisoryId = syntheticTokenId('advisory1');
+    const cid = syntheticBundleCid('advisoryonly');
+    const spec: BundleSpec = {
+      bundleCid: cid,
+      // No claimed tokens — sender ships only an advisory unclaimed root.
+      tokenIds: [],
+      advisoryTokenIds: [advisoryId],
+    };
+    const fixtures = new Map<string, { spec: BundleSpec; type: 'verified' }>([
+      [cid, { spec, type: 'verified' }],
+    ]);
+
+    const observed: Array<{ tokenId: string; isClaimed: boolean }> = [];
+    const processToken: ProcessTokenFn = async (tokenRoot, _verified, ctx) => {
+      observed.push({ tokenId: tokenRoot.tokenId, isClaimed: ctx.isClaimed });
+    };
+
+    pool = new IngestWorkerPool({
+      lru: new ReplayLRU(),
+      perTokenMutex: new PerTokenMutex(),
+      processToken,
+      emit: () => undefined,
+      acquireBundle: makeAcquirer(fixtures),
+      mutexStrategy: 'rpc-release',
+    });
+
+    await pool.enqueue(buildPayload(spec), SENDER);
+
+    expect(observed).toEqual([{ tokenId: advisoryId, isClaimed: false }]);
+  });
+
+  it('mixed bundle: claimed first (true), then advisory (false), preserving order', async () => {
+    const claimedId = syntheticTokenId('mclaim');
+    const advisoryId = syntheticTokenId('madv');
+    const cid = syntheticBundleCid('mixed');
+    const spec: BundleSpec = {
+      bundleCid: cid,
+      tokenIds: [claimedId],
+      advisoryTokenIds: [advisoryId],
+    };
+    const fixtures = new Map<string, { spec: BundleSpec; type: 'verified' }>([
+      [cid, { spec, type: 'verified' }],
+    ]);
+
+    const observed: Array<{ tokenId: string; isClaimed: boolean }> = [];
+    const processToken: ProcessTokenFn = async (tokenRoot, _verified, ctx) => {
+      observed.push({ tokenId: tokenRoot.tokenId, isClaimed: ctx.isClaimed });
+    };
+
+    pool = new IngestWorkerPool({
+      lru: new ReplayLRU(),
+      perTokenMutex: new PerTokenMutex(),
+      processToken,
+      emit: () => undefined,
+      acquireBundle: makeAcquirer(fixtures),
+      mutexStrategy: 'rpc-release',
+    });
+
+    await pool.enqueue(buildPayload(spec), SENDER);
+
+    // The pool walks claimedTokens BEFORE advisoryUnclaimedRoots — an
+    // attacker who tries to smuggle K candidates can't have them
+    // upgraded to claimed-token treatment because the discriminator is
+    // derived from which list they came from in the verified bundle,
+    // not from any sender-controlled field.
+    expect(observed).toEqual([
+      { tokenId: claimedId, isClaimed: true },
+      { tokenId: advisoryId, isClaimed: false },
+    ]);
   });
 });
 

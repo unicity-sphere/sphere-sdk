@@ -131,6 +131,11 @@ import {
   type SubmitOutcome,
   type PollOutcome,
 } from './transfer/finalization-worker-sender';
+// Task #151 — type import only. The recipient worker is not currently
+// auto-instantiated (see `finalizationWorkerRecipient` field doc); the
+// import keeps the field's typed reference accurate so future wiring
+// only needs to add the construction path.
+import type { FinalizationWorkerRecipient } from './transfer/finalization-worker-recipient';
 import { ManifestCas, type MinimalManifestStorage } from '../../profile/manifest-cas';
 import { contentHash, type ContentHash } from '../../uxf/types';
 import { isLegacyTokenTransferPayload } from '../../types/uxf-transfer';
@@ -1421,6 +1426,8 @@ export class PaymentsModule {
 
       const processToken: ProcessTokenFn = async (tokenRoot, verified, ctx) => {
         // Guard: only process token-roots that are CLAIMED for this recipient.
+        //
+        // Phase 9.6.A advisory-vs-claimed filter (steelman fix #160).
         // The pool dispatcher passes BOTH verified.claimedTokens AND
         // verified.advisoryUnclaimedRoots to every processToken call (by
         // design — consumer-installed pools may want to inspect advisory roots
@@ -1431,25 +1438,50 @@ export class PaymentsModule {
         // manifest), so assemble() would throw UxfError TOKEN_NOT_FOUND. The
         // oracle would also correctly reject them as invalid for this recipient.
         //
-        // Build the claim set once per call from verified.claimedTokens; this
-        // is O(N) where N = number of claimed tokens (typically 1–5), acceptable
-        // inside the per-tokenId mutex.
-        const claimedTokenIds = new Set(verified.claimedTokens.map((r) => r.tokenId));
+        // **Why ctx.isClaimed (not a Set lookup)**: previously this gate
+        // re-derived the membership question by building a Set from
+        // verified.claimedTokens and asking `has(tokenRoot.tokenId)`. The
+        // pool already knows which list the root came from — it iterates
+        // claimedTokens and advisoryUnclaimedRoots separately — so the
+        // dispatcher now passes the discriminator directly, and the gate
+        // reduces to a single boolean check. The discriminator approach
+        // is also robust against a hostile sender shipping the SAME
+        // tokenId in BOTH lists (the verifier should reject; defense-in-
+        // depth here is to trust only ctx.isClaimed === true for the
+        // claimed-token write path).
+        //
+        // **Advisory-only contract** (when ctx.isClaimed === false):
+        //   - MUST NOT trigger sender-attribution events
+        //     (`transfer:incoming`) or the `RECEIVED` history entry —
+        //     those would falsely credit the bundle's sender for tokens
+        //     the sender never claimed to deliver.
+        //   - MUST NOT be eligible for cascade source-side write-back
+        //     (no `_sent` / outbox entry, no `transfer:confirmed` for the
+        //     advisory root).
+        //   - MUST NOT count toward the sender's delivery acknowledgement
+        //     ledger.
+        // The default closure satisfies this by returning early below; any
+        // future "found money" credit path that handles advisory roots
+        // MUST be wired in a separate branch with explicit policy.
+        if (!ctx.isClaimed) {
+          logger.debug(
+            'Payments',
+            `UXF processToken: skipping advisoryUnclaimedRoot ${tokenRoot.tokenId.slice(0, 16)} — not claimed for this recipient`,
+            {
+              bundleCid: ctx.bundleCid.slice(0, 16),
+              tokenId: tokenRoot.tokenId.slice(0, 16),
+            },
+          );
+          return;
+        }
         // [DIAG-UXF-RECV] bundle-level: how many tokens are claimed for this recipient?
-        logger.debug('Payments', '[DIAG-UXF-RECV] processToken entry', {
+        logger.debug('Payments', '[DIAG-UXF-RECV] processToken entry (claimed)', {
           bundleCid: ctx.bundleCid.slice(0, 16),
           claimedCount: verified.claimedTokens.length,
           claimedTokenIds: verified.claimedTokens.map((r) => r.tokenId.slice(0, 16)),
           thisTokenId: tokenRoot.tokenId.slice(0, 16),
-          isClaimed: claimedTokenIds.has(tokenRoot.tokenId),
+          isClaimed: true,
         });
-        if (!claimedTokenIds.has(tokenRoot.tokenId)) {
-          logger.debug(
-            'Payments',
-            `UXF processToken: skipping advisoryUnclaimedRoot ${tokenRoot.tokenId.slice(0, 16)} — not for this recipient`,
-          );
-          return;
-        }
 
         try {
           // 1. Reassemble the sender's token JSON from the verified bundle.
@@ -1673,6 +1705,13 @@ export class PaymentsModule {
       );
     }
 
+    // Task #169 — Per-initialize AbortController. Aborted in destroy()
+    // BEFORE awaiting worker.stop() so in-flight runFinalizationCycle
+    // invocations + their pending sleep(...) timers terminate
+    // deterministically. Recreated each initialize() because aborted
+    // signals cannot be reset.
+    this._workerAbortController = new AbortController();
+
     // Phase 9.6.D — auto-install the sender-side finalization worker when
     // `senderUxf` is on AND `finalizationWorker` is on AND no consumer has
     // already installed one via `installFinalizationWorkerSender()`.
@@ -1711,6 +1750,10 @@ export class PaymentsModule {
           senderOutboxMap: this._senderOutboxMap,
           senderRequestContextMap: this._senderRequestContextMap,
           emit: (type, data) => this.deps!.emitEvent(type, data),
+          // Task #169 — wire the per-initialize AbortController's signal
+          // through to the worker so destroy() can cancel in-flight
+          // submit/poll cycles + sleep timers.
+          signal: this._workerAbortController.signal,
         });
         this.finalizationWorkerSender.start();
         logger.debug(
@@ -1895,6 +1938,41 @@ export class PaymentsModule {
   private sendingRecoveryWorker: SendingRecoveryWorker | null = null;
   /** @internal — auto-installed or set by `installFinalizationWorkerSender()`. Phase 9.6.D. */
   private finalizationWorkerSender: FinalizationWorkerSender | null = null;
+  /**
+   * @internal — auto-installed FinalizationWorkerRecipient. Task #151.
+   *
+   * Populated only when the bootstrap layer injects a fully-wired
+   * recipient harness via `installFinalizationWorkerRecipient()`. The
+   * default `IngestWorkerPool` processToken closure (lines ~1422-1662)
+   * does NOT enqueue pending tokens into a `FinalizationQueue` today,
+   * so even an auto-instantiated recipient worker would have no work
+   * to drive — wiring the harness end-to-end requires (a) a
+   * per-address FinalizationQueue store, (b) processToken enqueueing
+   * into it on the instant-mode pending branch, (c) dispositionWriter
+   * (T.3.C), (d) revaluateHooks (RevaluateHooksProvider), (e) the
+   * CascadeWalker. Those dependencies are NOT yet exposed at this
+   * layer, so the auto-install path remains stubbed pending the
+   * recipient-side harness wiring (deferred to a future wave that
+   * also closes task #163 on legacy-shape-adapter requireing
+   * enqueueFinalization).
+   *
+   * See `tests/unit/payments/transfer/finalization-worker-recipient-fixtures.ts`
+   * for the full surface this worker requires.
+   */
+  private finalizationWorkerRecipient: FinalizationWorkerRecipient | null = null;
+  /**
+   * @internal — Task #169. AbortController whose signal is wired into
+   * the sender (and future recipient) finalization workers' `signal`
+   * option AND their `sleep` adapters. Aborted in `destroy()` BEFORE
+   * awaiting `worker.stop()` so in-flight `runFinalizationCycle`
+   * invocations + their pending `sleep(...)` timers terminate
+   * deterministically rather than running orphaned to completion.
+   *
+   * The controller is recreated on every `initialize()` — once
+   * aborted, an AbortSignal cannot be reset, so a destroy()/initialize()
+   * cycle needs a fresh controller for the next worker generation.
+   */
+  private _workerAbortController: AbortController | null = null;
 
   /**
    * In-memory outbox for the sender-side finalization worker.
@@ -1994,6 +2072,50 @@ export class PaymentsModule {
     if (this.deps !== null && this.features.senderUxf) {
       worker.start();
     }
+  }
+
+  /**
+   * Task #151 — install the recipient-side finalization worker.
+   *
+   * Idempotent: a second call stops the previous worker (fire-and-
+   * forget) and swaps in the new instance. If the module is already
+   * initialized AND `features.recipientUxf` is true, the new worker
+   * is started immediately.
+   *
+   * The recipient worker has NO auto-install path today because the
+   * default `IngestWorkerPool.processToken` closure (lines ~1422-1662)
+   * does NOT enqueue pending tokens into a `FinalizationQueue`, and
+   * the worker requires (a) the per-address FinalizationQueue store,
+   * (b) dispositionWriter (T.3.C), (c) revaluateHooks
+   * (RevaluateHooksProvider), (d) cascadeWalker, (e) per-tokenId
+   * mutex, (f) manifest CAS / tombstones / pool adapters — all of
+   * which are bootstrap-layer concerns (Sphere builds them with the
+   * full Profile + OrbitDB stack). When the bootstrap layer ships
+   * the harness, callers wire it via this method; the worker's
+   * AbortSignal can be sourced from `getWorkerAbortSignal()` below.
+   */
+  installFinalizationWorkerRecipient(worker: FinalizationWorkerRecipient): void {
+    if (this.finalizationWorkerRecipient !== null) {
+      void this.finalizationWorkerRecipient.stop().catch(() => undefined);
+    }
+    this.finalizationWorkerRecipient = worker;
+    if (this.deps !== null && this.features.recipientUxf) {
+      worker.start();
+    }
+  }
+
+  /**
+   * Task #169 — Expose the per-initialize worker AbortSignal so the
+   * bootstrap layer's recipient-worker harness can plumb it into
+   * the constructed `FinalizationWorkerRecipient`. Returns `undefined`
+   * when the module has not yet been initialized.
+   *
+   * The signal is aborted in `destroy()` BEFORE awaiting `worker.stop()`
+   * so in-flight `runFinalizationCycle` invocations + their pending
+   * `sleep(...)` timers terminate deterministically.
+   */
+  getWorkerAbortSignal(): AbortSignal | undefined {
+    return this._workerAbortController?.signal;
   }
 
   /**
@@ -2152,11 +2274,34 @@ export class PaymentsModule {
       this.sendingRecoveryWorker = null;
     }
 
+    // Task #169 — abort the worker AbortController BEFORE stopping the
+    // workers. The signal is wired into both the worker's
+    // `runFinalizationCycle` (which short-circuits between aggregator
+    // calls) AND the `sleep` adapter (which rejects pending timers).
+    // Aborting first ensures `worker.stop()`'s drain phase converges
+    // promptly instead of waiting for the next 30s+ poll backoff.
+    if (this._workerAbortController !== null) {
+      try {
+        this._workerAbortController.abort();
+      } catch {
+        // AbortController.abort() never throws on modern runtimes; the
+        // try/catch is defense-in-depth for older shims.
+      }
+      this._workerAbortController = null;
+    }
+
     // Phase 9.6.D — stop the sender-side finalization worker.
     // Fire-and-forget; `stop()` drains in-flight polls and never throws.
     if (this.finalizationWorkerSender) {
       void this.finalizationWorkerSender.stop().catch(() => undefined);
       this.finalizationWorkerSender = null;
+    }
+    // Task #151 — stop the recipient-side finalization worker if one was
+    // installed. Fire-and-forget; mirrors the sender path. NULL today
+    // (no auto-install path; bootstrap-injected only).
+    if (this.finalizationWorkerRecipient) {
+      void this.finalizationWorkerRecipient.stop().catch(() => undefined);
+      this.finalizationWorkerRecipient = null;
     }
     // Clear in-memory outbox and context maps (no persistent side-effects).
     this._senderOutboxMap.clear();
@@ -7265,23 +7410,56 @@ export class PaymentsModule {
                   .join('')
               : (typeof (requestIdBytes as { toJSON?: () => string }).toJSON === "function" ? (requestIdBytes as { toJSON: () => string }).toJSON() : String(requestIdBytes));
 
-          // Phase 9.6.D — store per-requestId context for the finalization
-          // worker resolver. `transactionHash` is the commitment's requestId
-          // DataHash imprint hex (68 chars = 2-byte algorithm prefix +
-          // 32-byte digest), which the aggregator proof will also carry in its
-          // `transactionHash` field — enabling race-lost detection at §6.1.
-          // `authenticator` is the authenticator signature hex, used by §6.3
-          // same-value vs different-value resolution.
+          // Task #152 — store per-requestId context for the finalization
+          // worker resolver. The §6.1 race-lost detection compares the LOCAL
+          // `transactionHash` against the proof's `transactionHash` byte-for-
+          // byte; both sides MUST be the actual SDK-encoded DataHash imprint
+          // hex of the transaction-data hash (NOT the requestId).
+          //
+          //   - `transactionHash`: derived from `commitment.transactionData
+          //     .calculateHash()` — same value the aggregator returns in
+          //     `proof.transactionHash` once the commitment lands on chain.
+          //   - `authenticator`: the canonical JSON serialization of the
+          //     commitment's authenticator (publicKey + algorithm + signature
+          //     + stateHash). Stored as a stable string so §6.3 byte-equality
+          //     compares against the aggregator-returned authenticator JSON.
+          //
+          // Race-lost detection (finalization-worker-base.ts §6.1) compares
+          // `pollOutcome.proof.transactionHash !== ctxResolved.transactionHash`.
+          // Before this fix both sides used the requestId, making the compare
+          // trivially equal and the detector silently dead in production.
           if (this.finalizationWorkerSender !== null) {
-            const txHash =
-              typeof (requestIdBytes as { toJSON?: () => string }).toJSON === 'function'
-                ? (requestIdBytes as { toJSON: () => string }).toJSON()
-                : requestIdHex;
-            const commitJson = (commitment as { toJSON?: () => { authenticator?: { signature?: string } } }).toJSON?.();
-            const authenticatorHex = commitJson?.authenticator?.signature ?? '';
+            // Compute the actual transactionHash imprint hex. `calculateHash`
+            // returns a DataHash; `.toJSON()` returns the imprint hex.
+            let txHashImprintHex: string;
+            try {
+              const txDataHash = await commitment.transactionData.calculateHash();
+              txHashImprintHex = txDataHash.toJSON();
+            } catch (err) {
+              // Hard failure here would mean we cannot detect race-lost for
+              // this commitment. Surface a clear runtime warning rather than
+              // silently fall back to the requestId (which would re-introduce
+              // the bug). Use the requestId hex as a non-fatal degraded value
+              // and log so operators see the diagnostic.
+              logger.warn(
+                'Payments',
+                `Task #152: failed to derive transactionHash for requestId ${requestIdHex.slice(0, 16)} — race-lost detection degraded (falling back to requestId). err=${err instanceof Error ? err.message : String(err)}`,
+              );
+              txHashImprintHex = requestIdHex;
+            }
+            // Stable canonical JSON of the authenticator. The aggregator-
+            // returned proof carries the same shape (IAuthenticatorJson) in
+            // `proof.proof.authenticator`; the adapter at line ~9026 strings
+            // its copy with the same JSON.stringify() so byte-equality holds
+            // for §6.3 same-value vs different-value resolution.
+            const commitJson = (commitment as { toJSON?: () => { authenticator?: unknown } }).toJSON?.();
+            const authenticatorJsonStr =
+              commitJson?.authenticator !== undefined && commitJson.authenticator !== null
+                ? JSON.stringify(commitJson.authenticator)
+                : '';
             this._senderRequestContextMap.set(requestIdHex, {
-              transactionHash: txHash,
-              authenticator: authenticatorHex,
+              transactionHash: txHashImprintHex,
+              authenticator: authenticatorJsonStr,
               nextEntryRest: { status: 'valid' as const },
             });
           }
@@ -8913,8 +9091,18 @@ export function buildDefaultFinalizationWorkerSender(opts: {
     type: T,
     data: import('../../types').SphereEventMap[T],
   ) => void;
+  /**
+   * Task #169 — Optional cancellation signal. Wired to the
+   * FinalizationWorkerSender's `signal` option AND through to the
+   * `sleep` adapter. The worker honors `signal.aborted` between
+   * aggregator calls and the sleep adapter rejects pending timers
+   * on abort. PaymentsModule.destroy() aborts the parent controller
+   * BEFORE awaiting `worker.stop()` so in-flight cycles terminate
+   * deterministically rather than running orphaned to completion.
+   */
+  readonly signal?: AbortSignal;
 }): FinalizationWorkerSender {
-  const { addressId, oracle, senderOutboxMap, senderRequestContextMap, emit } = opts;
+  const { addressId, oracle, senderOutboxMap, senderRequestContextMap, emit, signal } = opts;
 
   // In-memory outbox writer — thin wrapper over the module's _senderOutboxMap.
   const outbox: FinalizationOutboxWriter = {
@@ -9018,13 +9206,44 @@ export function buildDefaultFinalizationWorkerSender(opts: {
           // Proof not yet available — retry next poll iteration.
           return { kind: 'TRANSIENT' };
         }
-        // Build AnchoredProofDescriptor from the oracle's InclusionProof.
-        // transactionHash: use the requestId itself (the aggregator key).
-        // authenticator: use requestId as a proxy (§6.3 same-value check).
-        // roundNumber: from the oracle proof.
+        // Task #152 — Build AnchoredProofDescriptor from the oracle's
+        // InclusionProof. The aggregator's `proof.proof` field carries
+        // the canonical IInclusionProofJson shape:
+        //   { merkleTreePath, authenticator, transactionHash, unicityCertificate }
+        // where `transactionHash` is the SDK-encoded DataHash imprint hex
+        // (68 chars for sha2-256) or null for path-non-inclusion proofs,
+        // and `authenticator` is an IAuthenticatorJson object or null.
+        //
+        // Race-lost detection (§6.1) compares the proof's transactionHash
+        // against the locally-stored `_senderRequestContextMap` value
+        // populated by `commitSources` from `commitment.transactionData
+        // .calculateHash()`. Both sides MUST use the same imprint hex —
+        // before this fix both sides used the requestId, which always
+        // matched, making the detector dead in production.
+        const proofJson = proof.proof as
+          | {
+              transactionHash?: string | null;
+              authenticator?: unknown;
+            }
+          | null
+          | undefined;
+        const proofTxHash =
+          proofJson !== null && proofJson !== undefined && typeof proofJson.transactionHash === 'string'
+            ? proofJson.transactionHash
+            : null;
+        const proofAuthenticator =
+          proofJson !== null && proofJson !== undefined && proofJson.authenticator !== undefined && proofJson.authenticator !== null
+            ? JSON.stringify(proofJson.authenticator)
+            : '';
+        // Fallback for path-non-inclusion proofs (transactionHash is null
+        // by spec). We surface the requestId as a sentinel so existing
+        // resolution paths don't break, but a `null` proofTxHash typically
+        // means PATH_NOT_INCLUDED which the worker treats as a hard-fail
+        // before the §6.1 race-lost compare runs. The fallback ensures
+        // the descriptor remains a valid string for type safety.
         const descriptor: import('./transfer/finalization-worker-base').AnchoredProofDescriptor = {
-          transactionHash: proof.requestId,
-          authenticator: proof.requestId,
+          transactionHash: proofTxHash ?? proof.requestId,
+          authenticator: proofAuthenticator,
           roundNumber: proof.roundNumber,
           proof: proof.proof,
         };
@@ -9072,18 +9291,24 @@ export function buildDefaultFinalizationWorkerSender(opts: {
     perTokenMutex,
     emit,
     now: () => Date.now(),
-    sleep: (ms: number, signal?: AbortSignal) =>
+    sleep: (ms: number, abortSignal?: AbortSignal) =>
       new Promise<void>((resolve, reject) => {
-        if (signal?.aborted) {
+        if (abortSignal?.aborted) {
           reject(new Error('aborted'));
           return;
         }
         const timer = setTimeout(resolve, ms);
-        signal?.addEventListener('abort', () => {
+        abortSignal?.addEventListener('abort', () => {
           clearTimeout(timer);
           reject(new Error('aborted'));
         });
       }),
+    // Task #169 — wire the parent AbortController's signal so destroy()
+    // can cancel in-flight runFinalizationCycle invocations + sleep
+    // timers. The worker's runFinalizationCycle inspects
+    // `ctx.signal?.aborted` between aggregator calls; the sleep adapter
+    // above also respects the signal for pending timers.
+    ...(signal !== undefined ? { signal } : {}),
   });
 }
 

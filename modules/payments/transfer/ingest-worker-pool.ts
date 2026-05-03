@@ -210,6 +210,33 @@ export interface ProcessTokenContext {
   readonly senderTransportPubkey: string;
   /** The bundleCid the acquirer extracted (and confirmed). */
   readonly bundleCid: string;
+  /**
+   * Discriminator: which list did this `tokenRoot` come from?
+   *
+   *  - `true`  → the root was enumerated in `payload.tokenIds` (the
+   *              sender's claimed-targets list); recipient runs the
+   *              full claimed-token write path (assemble → oracle →
+   *              addToken → emit `transfer:incoming` → cascade).
+   *  - `false` → the root was discovered as an "advisory unclaimed"
+   *              root (in the CAR but absent from `payload.tokenIds`,
+   *              §5.2 #2). The recipient processes it ONLY for the
+   *              ownership-binding/credit path: it MUST NOT trigger
+   *              sender-attribution events (`transfer:incoming` /
+   *              history `RECEIVED`), MUST NOT be eligible for
+   *              cascade source-side write-back, and MUST NOT be
+   *              counted toward the sender's delivery acknowledgement
+   *              ledger. (Without this discriminator, a hostile sender
+   *              could ship `tokenIds: ['T1']` plus K smuggled root
+   *              candidates under MAX_UNCLAIMED_ROOTS=16 and have all
+   *              K+1 processed identically — the §5.2 #2 advisory-vs-
+   *              claimed distinction would be lost.)
+   *
+   * Default `processToken` implementations MUST gate the claimed-only
+   * write path on `isClaimed === true`. Consumer-installed pools that
+   * deliberately want to inspect advisory roots (telemetry, §5.4 / §B'
+   * replica-merge, found-money credit) read this flag to decide.
+   */
+  readonly isClaimed: boolean;
 }
 
 /**
@@ -675,12 +702,29 @@ export class IngestWorkerPool {
     // Bundle verified. Walk every token-root (claimed + advisory)
     // SEQUENTIALLY (W23). Per-tokenId mutex serializes against any
     // OTHER bundle's worker that touches the same id.
-    const allTokens = [
-      ...verified.claimedTokens,
-      ...verified.advisoryUnclaimedRoots,
+    //
+    // Each entry carries an `isClaimed` discriminator that records
+    // whether the root came from `verified.claimedTokens` (the sender's
+    // enumerated targets in `payload.tokenIds`) or
+    // `verified.advisoryUnclaimedRoots` (smuggled / advisory roots,
+    // §5.2 #2). The flag MUST be propagated to `processToken` so the
+    // default closure (and any consumer override) can apply the
+    // claimed-vs-advisory policy split — without it, a hostile sender
+    // who ships `tokenIds: ['T1']` plus K smuggled root candidates
+    // (under MAX_UNCLAIMED_ROOTS=16) could have all K+1 processed
+    // identically as if they were all claimed.
+    const allTokens: ReadonlyArray<{
+      readonly root: RootRef;
+      readonly isClaimed: boolean;
+    }> = [
+      ...verified.claimedTokens.map((root) => ({ root, isClaimed: true })),
+      ...verified.advisoryUnclaimedRoots.map((root) => ({
+        root,
+        isClaimed: false,
+      })),
     ];
 
-    for (const tokenRoot of allTokens) {
+    for (const { root: tokenRoot, isClaimed } of allTokens) {
       try {
         await this.perTokenMutex.acquire(
           tokenRoot.tokenId,
@@ -689,6 +733,7 @@ export class IngestWorkerPool {
               payload: entry.payload,
               senderTransportPubkey: entry.senderTransportPubkey,
               bundleCid: verified!.bundleCid,
+              isClaimed,
             }),
           { strategy: this.mutexStrategy },
         );

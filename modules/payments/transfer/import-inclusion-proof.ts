@@ -308,7 +308,27 @@ export type ImportProofResult =
         | 'tokenId-in-invalid'
         | 'proof-trustbase-failed'
         | 'proof-not-anchored'
-        | 'requestid-mismatch';
+        | 'requestid-mismatch'
+        // (#155) Operator-supplied proof matched the queue entry by
+        // requestId but its `transactionHash` and/or `authenticator`
+        // disagree with the queue entry's bound triple. An attacker
+        // who knows the victim's tokenId + a hard-failed requestId
+        // could otherwise paste any aggregator-anchored proof sharing
+        // that requestId and flip `_invalid → valid`. The §6.3
+        // most-recent-proof / single-spend forbidden-case checks
+        // require the proof's full triple to match the queue entry
+        // verbatim — see {@link ImportableInclusionProof}.
+        | 'proof-binding-mismatch'
+        // (#165) `manifest.status === 'invalid'` but no corresponding
+        // `_invalid` record exists. The disposition writer's normal
+        // routing always pairs the manifest entry with an `_invalid`
+        // record; a missing record is structurally inconsistent and
+        // would force the importer to synthesize provenance fields
+        // (bundleCid, senderTransportPubkey) as empty strings — the
+        // audit trail loses forensic value. Operators that explicitly
+        // accept the synthesized provenance pass
+        // `allowSyntheticInvalidEntry: true` to override.
+        | 'invalid-record-missing';
     };
 
 // =============================================================================
@@ -351,16 +371,19 @@ export interface ImportInclusionProofOptions {
    */
   readonly perTokenMutex?: PerTokenMutex;
   /**
-   * Strategy passed to `perTokenMutex.acquire`. Default `'cas'` (W34).
-   * The CAS strategy is the no-serialization pass-through — the mutex
-   * is used only for telemetry / inflight tracking; manifest-level
-   * mutual exclusion is provided by `ManifestCas` inside the override
-   * callback. Concurrent `importInclusionProof` calls on the same
-   * `tokenId` therefore still race against each other in the read-
-   * decide phase, but the write-phase CAS guarantees correctness.
-   * Callers that need strict serialization (e.g. operator UIs that
-   * want a single-flight guarantee) can pass `'rpc-release'` or
-   * `'bounded-hold'`.
+   * Strategy passed to `perTokenMutex.acquire`. Default
+   * `'rpc-release'` (#153 steelman fix). The CAS strategy is the
+   * no-serialization pass-through — concurrent
+   * `importInclusionProof` calls on the same `tokenId` race against
+   * each other in the read-decide phase, and ManifestCas inside the
+   * override callback only protects the write-phase. Two operators
+   * who simultaneously hit the override path would both pass case-5/6
+   * split, both invoke `applyOverride`, and corrupt the audit trail
+   * OR re-queue duplicate K-1 entries. The default is therefore
+   * `'rpc-release'` which serializes the entire read-decide-write
+   * sequence per `tokenId`. Callers that explicitly opt out (e.g.
+   * because they coordinate exclusion at a higher layer) can pass
+   * `'cas'` or `'bounded-hold'`.
    */
   readonly perTokenMutexStrategy?: PerTokenMutexStrategy;
 }
@@ -375,6 +398,19 @@ export interface ImportInclusionProofCallOptions {
    * monotonicity invariantly. The operator UI MUST surface the choice.
    */
   readonly allowInvalidOverride?: boolean;
+  /**
+   * (#165) When `manifest.status === 'invalid'` but no `_invalid`
+   * record is found, the importer would otherwise synthesize a minimal
+   * {@link InvalidEntry} from the manifest fields — this coerces
+   * `bundleCid` and `senderTransportPubkey` to empty strings and the
+   * audit trail loses forensic value. Default `false` returns
+   * `'invalid-record-missing'` instead so the operator can investigate
+   * the disposition writer's routing. Set `true` only when the
+   * operator has out-of-band reason to accept the synthesized
+   * provenance fields (e.g. a corrupted disposition KV recovered from
+   * backup).
+   */
+  readonly allowSyntheticInvalidEntry?: boolean;
   /**
    * Operator pubkey (hex) at the call site. Stamped into the audit
    * trail (`overrideAppliedBy`). Optional — callers that don't have a
@@ -414,7 +450,12 @@ export class InclusionProofImporter {
     // wiring SHOULD inject the same `PerTokenMutex` used by T.5.B /
     // T.5.C so all paths touching a tokenId serialize together.
     this.perTokenMutex = options.perTokenMutex ?? new PerTokenMutex();
-    this.perTokenMutexStrategy = options.perTokenMutexStrategy ?? 'cas';
+    // (#153) Default strategy is 'rpc-release' so callers who don't
+    // explicitly choose get real per-tokenId serialization. The
+    // previous 'cas' default was a no-serialization pass-through and
+    // T.5.D's "serialize concurrent imports" promise didn't deliver
+    // — see the concurrency test that proves it.
+    this.perTokenMutexStrategy = options.perTokenMutexStrategy ?? 'rpc-release';
   }
 
   /**
@@ -431,15 +472,15 @@ export class InclusionProofImporter {
     proof: ImportableInclusionProof,
     callOptions: ImportInclusionProofCallOptions = {},
   ): Promise<ImportProofResult> {
-    // T.5.D steelman post-cutover: serialize the entire read-decide-write
-    // sequence under the per-tokenId mutex. Without this, two concurrent
-    // operator overrides on the same tokenId race — both read state, both
-    // pass case-5/6 split, both call `applyOverride`, corrupting the
-    // manifest's audit trail OR re-queuing duplicate entries. The default
-    // CAS strategy from T.1.F is the no-serialization pass-through —
-    // ManifestCas inside the override callback handles concurrent writes;
-    // the mutex is for telemetry / inflight tracking and gives callers
-    // who pass `'rpc-release'` / `'bounded-hold'` strict single-flight.
+    // T.5.D steelman post-cutover (#153): serialize the entire
+    // read-decide-write sequence under the per-tokenId mutex. Without
+    // this, two concurrent operator overrides on the same tokenId
+    // race — both read state, both pass case-5/6 split, both call
+    // `applyOverride`, corrupting the manifest's audit trail OR
+    // re-queuing duplicate entries. The default strategy is
+    // `'rpc-release'` which provides per-tokenId serialization; CAS
+    // is opt-in for callers who coordinate exclusion at a higher
+    // layer.
     return this.perTokenMutex.acquire(
       tokenId,
       () => this._importInclusionProofUnderMutex(addr, tokenId, proof, callOptions),
@@ -516,17 +557,42 @@ export class InclusionProofImporter {
       // active pool. Mirror the `_invalid`-bucket routing — the operator
       // can flip back via override.
       const invalidEntry = await this._findInvalidEntry(addr, tokenId);
-      // Synthesize a minimal InvalidEntry surface if no `_invalid`
-      // record exists — the manifest entry alone has the reason via
-      // `invalidReason`.
-      const synthEntry: InvalidEntry =
-        invalidEntry ??
-        this._synthesizeInvalidFromManifest(tokenId, manifestEntry);
+      if (invalidEntry === null) {
+        // (#165) `manifest.status === 'invalid'` without a paired
+        // `_invalid` record is structurally inconsistent — the
+        // disposition writer's normal routing always pairs the two.
+        // Synthesizing here would coerce the bundleCid /
+        // senderTransportPubkey provenance fields to empty strings,
+        // gutting the audit trail. An attacker who can corrupt a
+        // single manifest entry to `status='invalid'` (without a
+        // corresponding `_invalid` record) and submit a stale proof
+        // could otherwise launder the override.
+        //
+        // Refuse by default; require the operator to explicitly opt in
+        // via `allowSyntheticInvalidEntry: true` if they have
+        // out-of-band reason to accept the synthesized provenance.
+        if (callOptions.allowSyntheticInvalidEntry !== true) {
+          return { ok: false, reason: 'invalid-record-missing' };
+        }
+        const synthEntry = this._synthesizeInvalidFromManifest(
+          tokenId,
+          manifestEntry,
+        );
+        return this._handleInvalidPath({
+          addr,
+          tokenId,
+          proof,
+          invalidEntry: synthEntry,
+          allowInvalidOverride,
+          now,
+          operatorPubkey: callOptions.operatorPubkey,
+        });
+      }
       return this._handleInvalidPath({
         addr,
         tokenId,
         proof,
-        invalidEntry: synthEntry,
+        invalidEntry,
         allowInvalidOverride,
         now,
         operatorPubkey: callOptions.operatorPubkey,
@@ -589,6 +655,22 @@ export class InclusionProofImporter {
     // status as already-attached so a replay-after-crash doesn't
     // double-graft.
     const target = matching[0]!;
+
+    // (#155) Bind the proof to the queue entry's full triple
+    // (transactionHash + authenticator), not just the requestId. The
+    // §6.3 most-recent-proof / single-spend forbidden-case checks
+    // require this — see `ImportableInclusionProof.transactionHash` /
+    // `.authenticator` JSDoc. An attacker who knows the victim's
+    // tokenId + an outstanding requestId could otherwise paste any
+    // aggregator-anchored proof sharing that requestId and graft a
+    // different transaction onto the live queue entry.
+    if (
+      !hexEqualsIgnoreCase(proof.transactionHash, target.transactionHash) ||
+      !hexEqualsIgnoreCase(proof.authenticator, target.authenticator)
+    ) {
+      return { ok: false, reason: 'proof-binding-mismatch' };
+    }
+
     if (target.status === 'attached') {
       return { ok: true, transition: 'pending-still' }; // case 4a
     }
@@ -687,6 +769,22 @@ export class InclusionProofImporter {
     }
 
     const resolvingEntry = matching[0]!;
+
+    // (#155) Bind the proof to the queue entry's full triple
+    // (transactionHash + authenticator), not just the requestId. Per
+    // §6.3 the most-recent-proof / single-spend forbidden-case checks
+    // require the proof's full triple to match the queue entry
+    // verbatim. Without this, an attacker who knows the victim's
+    // tokenId + a hard-failed requestId could paste any aggregator-
+    // anchored proof sharing that requestId and flip
+    // `_invalid → valid` (case 5) or trigger a K-1 re-queue (case 6)
+    // bound to a different transaction.
+    if (
+      !hexEqualsIgnoreCase(proof.transactionHash, resolvingEntry.transactionHash) ||
+      !hexEqualsIgnoreCase(proof.authenticator, resolvingEntry.authenticator)
+    ) {
+      return { ok: false, reason: 'proof-binding-mismatch' };
+    }
 
     // Case 5 vs case 6 split: count OTHER hard-failed entries that
     // still need a proof. If zero → case 5; if ≥ 1 → case 6 (chain
@@ -862,6 +960,31 @@ export class InclusionProofImporter {
     }
     return contentHash('00'.repeat(32));
   }
+}
+
+/**
+ * @internal
+ *
+ * Case-insensitive byte-equal compare for hex strings. Used to bind a
+ * proof's `transactionHash` / `authenticator` to a queue entry's bound
+ * triple (#155). Two hex strings are byte-equal when they have the
+ * same length and every position has the same nibble value regardless
+ * of letter case. Non-hex characters are NOT normalized — callers are
+ * responsible for ensuring both inputs are hex.
+ *
+ * Returns `false` if either input is `null`/`undefined` or if their
+ * lengths differ, so a missing field on either side fails closed.
+ */
+function hexEqualsIgnoreCase(
+  a: string | null | undefined,
+  b: string | null | undefined,
+): boolean {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  if (a.length !== b.length) return false;
+  // Localeless lower-case compare. `toLowerCase` on a-z range is
+  // locale-invariant; the canonical hex alphabet [0-9a-fA-F] doesn't
+  // contain any locale-sensitive code points.
+  return a.toLowerCase() === b.toLowerCase();
 }
 
 // =============================================================================
