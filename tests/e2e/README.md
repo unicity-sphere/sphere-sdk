@@ -38,6 +38,24 @@ E2E_NETWORK=mainnet npm run test:e2e
 E2E_PROBE_TIMEOUT=15000 bash tests/e2e/swap-cli-e2e.sh
 ```
 
+### Probing only the services your tests need (UXF-friendly)
+
+The default probe checks all five services. If the test you're running doesn't depend on a service (e.g. UXF tests don't depend on Fulcrum or Market), set `E2E_PREFLIGHT_ONLY` to skip that service from the probe entirely. Combined with vitest's path filter, this lets you run a UXF-only dev cycle without paying the probe-timeout cost on services UXF doesn't gate on:
+
+```sh
+# UXF dev cycle — probe only what UXF tests need; ignore Fulcrum + Market state.
+E2E_PREFLIGHT_ONLY=nostr,aggregator,ipfs RUN_UXF_E2E=1 \
+  npm run test:e2e -- tests/e2e/uxf-send-receive.test.ts
+
+# Pointer-roundtrip dev cycle — same idea, narrower set.
+E2E_PREFLIGHT_ONLY=nostr,aggregator npm run test:e2e -- tests/e2e/pointer-roundtrip.test.ts
+
+# Same env var works for shell scripts (it's the auto-invoke service list there).
+E2E_PREFLIGHT_ONLY=nostr,aggregator bash tests/e2e/swap-cli-e2e.sh
+```
+
+Per-suite gates are unaffected — they declare their own required services (see the table below) and remain authoritative for "should this suite run?". Filtering the probe just means a service the suite didn't list is also not probed; if the suite *did* list a service that's filtered out, the gate logs a warning and falls through to running anyway (your filter is your responsibility).
+
 ## How the gate is wired
 
 ### vitest
@@ -73,12 +91,12 @@ For reference, this is what each suite declares it needs:
 | `pointer-roundtrip.test.ts` | aggregator, nostr | Pointer-layer round-trip |
 | `network-health.test.ts` | (none) | Tests SDK's own check; runs unconditionally |
 
-Pointer + swap shell scripts default to `nostr,aggregator,ipfs` and `nostr,aggregator` respectively. Override per-script via `E2E_PREFLIGHT_SERVICES`.
+Pointer + swap shell scripts default to `nostr,aggregator,ipfs` and `nostr,aggregator` respectively. Override per-script via `E2E_PREFLIGHT_ONLY`.
 
 ## Adding a new test
 
 1. Decide which services your test actually depends on (NOT every service the SDK transitively touches — only the ones whose downtime would invalidate the test's signal).
 2. Add the corresponding gate at the top of the file:
    - **vitest**: `import { preflightSkip } from './lib/preflight';` then `const SKIP_INFRA = preflightSkip(['nostr', '...'], 'my-suite-name');` and use `describe.skipIf(SKIP_INFRA)('my suite', ...)`.
-   - **shell**: source `pointer-N0-prologue.sh` or `e2e-helpers.sh` and the gate fires automatically. To override services use `E2E_PREFLIGHT_SERVICES` before sourcing.
+   - **shell**: source `pointer-N0-prologue.sh` or `e2e-helpers.sh` and the gate fires automatically. To override services use `E2E_PREFLIGHT_ONLY` before sourcing.
 3. Update the per-suite table above.

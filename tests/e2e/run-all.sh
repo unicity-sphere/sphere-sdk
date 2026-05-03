@@ -25,7 +25,7 @@ TEST_NAME="${TEST_NAME:-run-all}"
 # shellcheck source=./preflight-infra.sh
 source "$SCRIPT_DIR/preflight-infra.sh"
 if [[ "${E2E_NO_AUTO_PREFLIGHT:-0}" != "1" ]]; then
-  preflight_infra "${E2E_PREFLIGHT_SERVICES:-nostr,aggregator}"
+  preflight_infra "${E2E_PREFLIGHT_ONLY:-nostr,aggregator}"
 fi
 
 # Parse our args vs passthrough args

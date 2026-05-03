@@ -49,7 +49,7 @@ TEST_NAME="${TEST_NAME:-cli-storage-modes}"
 # shellcheck source=./preflight-infra.sh
 source "$(dirname "${BASH_SOURCE[0]}")/preflight-infra.sh"
 if [[ "${E2E_NO_AUTO_PREFLIGHT:-0}" != "1" ]]; then
-  preflight_infra "${E2E_PREFLIGHT_SERVICES:-nostr,aggregator,ipfs}"
+  preflight_infra "${E2E_PREFLIGHT_ONLY:-nostr,aggregator,ipfs}"
 fi
 
 KEEP_WORKSPACE=false

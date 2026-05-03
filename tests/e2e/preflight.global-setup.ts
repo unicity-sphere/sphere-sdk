@@ -11,14 +11,26 @@
  * file knows which services it depends on, so an IPFS-only test
  * shouldn't be blocked by an unhealthy aggregator).
  *
- * Skip the preflight entirely with `E2E_SKIP_PREFLIGHT=1` (useful when
- * working offline or when the probe itself is what you're debugging).
- *
- * Override the probed network with `E2E_NETWORK=mainnet|testnet|dev`;
- * default is `testnet` (matches the rest of the e2e suite).
+ * Env vars:
+ *   `E2E_SKIP_PREFLIGHT=1`       — bypass entirely; never run the probe
+ *   `E2E_NETWORK=<name>`         — `mainnet|testnet|dev` (default: testnet)
+ *   `E2E_PREFLIGHT_ONLY=<list>`  — comma-separated subset of services to
+ *                                  probe. Default: all five services.
+ *                                  Use this to skip a Fulcrum/Market
+ *                                  probe when the tests you're running
+ *                                  don't need them — saves the probe-
+ *                                  timeout wall-clock on degraded
+ *                                  components your tests don't gate on.
+ *                                  Example for a UXF-only dev cycle:
+ *                                    E2E_PREFLIGHT_ONLY=nostr,aggregator,ipfs
+ *                                  Per-suite gates only block on
+ *                                  services they explicitly require, so
+ *                                  filtering the probe never causes a
+ *                                  test to incorrectly run — it just
+ *                                  speeds up the preflight phase.
  */
 
-import { runProbes } from '@unicitylabs/infra-probe';
+import { runProbes, SERVICES } from '@unicitylabs/infra-probe';
 import { writeFileSync, unlinkSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -33,12 +45,32 @@ export async function setup(): Promise<void> {
     return;
   }
   const network = (process.env.E2E_NETWORK ?? 'testnet') as 'mainnet' | 'testnet' | 'dev';
+
+  // Optional `E2E_PREFLIGHT_ONLY=nostr,aggregator,ipfs` filter. Validate
+  // each entry against SERVICES so a typo fails fast rather than
+  // silently probing nothing.
+  let only: string[] | undefined;
+  if (process.env.E2E_PREFLIGHT_ONLY) {
+    only = process.env.E2E_PREFLIGHT_ONLY.split(',').map((s) => s.trim()).filter(Boolean);
+    const unknown = only.filter((s) => !SERVICES.includes(s as (typeof SERVICES)[number]));
+    if (unknown.length > 0) {
+      throw new Error(
+        `[preflight] E2E_PREFLIGHT_ONLY contains unknown service(s): ${unknown.join(', ')}. ` +
+          `Valid: ${SERVICES.join(', ')}`,
+      );
+    }
+  }
+
   // eslint-disable-next-line no-console
-  console.log(`[preflight] running @unicitylabs/infra-probe --network ${network} (this may take ~30s)…`);
+  console.log(
+    `[preflight] running @unicitylabs/infra-probe --network ${network}` +
+      (only ? ` --only ${only.join(',')}` : '') +
+      ` (this may take ~30s)…`,
+  );
 
   let report;
   try {
-    report = await runProbes({ network, timeoutMs: 60_000 });
+    report = await runProbes({ network, only, timeoutMs: 60_000 });
   } catch (err) {
     // eslint-disable-next-line no-console
     console.warn(

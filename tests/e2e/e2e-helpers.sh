@@ -22,14 +22,14 @@ ESCROW_STARTUP_TIMEOUT=120
 # unreachable testnet skips the test cleanly rather than producing a
 # 5-minute false-negative inside escrow setup or faucet polling.
 #
-# Override the default service set for a script with E2E_PREFLIGHT_SERVICES
+# Override the default service set for a script with E2E_PREFLIGHT_ONLY
 # (comma-separated, see preflight-infra.sh). Bypass with
 # E2E_SKIP_PREFLIGHT=1 or E2E_NO_AUTO_PREFLIGHT=1.
 # ---------------------------------------------------------------------------
 # shellcheck source=./preflight-infra.sh
 source "$(dirname "${BASH_SOURCE[0]}")/preflight-infra.sh"
 if [[ "${E2E_NO_AUTO_PREFLIGHT:-0}" != "1" ]]; then
-  preflight_infra "${E2E_PREFLIGHT_SERVICES:-nostr,aggregator}"
+  preflight_infra "${E2E_PREFLIGHT_ONLY:-nostr,aggregator}"
 fi
 
 # ---------------------------------------------------------------------------
