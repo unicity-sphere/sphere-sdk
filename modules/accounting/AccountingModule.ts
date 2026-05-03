@@ -2471,6 +2471,54 @@ export class AccountingModule {
           this.dirtyLedgerEntries.add(invoiceId);
           // Invalidate balance cache for this invoice
           this.balanceCache.delete(invoiceId);
+
+          // BUG-002 Fix 2 (durability extension): Force the provisional entry to disk
+          // before payInvoice returns. Without this, BUG-002 Fix 2's in-memory provisional
+          // entry would protect concurrent in-process callers from double-spend, but a
+          // crash between this `send()` returning and the next deferred-flush trigger
+          // (e.g. an incoming-transfer event in `_handleTokenChange`) would lose the
+          // provisional entry. On recovery the on-disk ledger has no record of the
+          // committed `send()`, so callers that recompute `remaining = expected - covered`
+          // see `remaining = expected` and re-issue the full amount — producing a
+          // distinct second on-chain transferId and over-coverage on the receiver.
+          // The crash-mid-conclude race in escrow-service `_concludeSwap` → `_resumePayouts`
+          // is exactly this pattern (see escrow-service crash-recovery audit, May 2026).
+          //
+          // Implementation notes (review feedback):
+          //
+          // (a) We schedule via the existing `_flushPromise` chain to serialize
+          //     against other in-flight flushes, then `await` THIS flush directly
+          //     rather than `_drainFlushPromise()`. Draining the whole chain would
+          //     spin while concurrent `_handleTokenChange` events keep replacing
+          //     `_flushPromise`, holding the per-invoice gate for an unbounded
+          //     number of additional flushes. We only need OUR provisional entry
+          //     durable; subsequent chain entries are someone else's responsibility.
+          //
+          // (b) `_flushDirtyLedgerEntries` itself catches its per-invoice
+          //     `storage.set` rejection and aborts internally (sets a local
+          //     `step1Failed` flag), leaving the dirty entry on the in-memory
+          //     set without re-throwing. So awaiting the flush is not enough —
+          //     we must detect post-flush whether OUR specific invoice still
+          //     sits in `dirtyLedgerEntries` and surface that as a rejection
+          //     of `payInvoice`. Otherwise `payInvoice` would silently return
+          //     success while the durability goal is silently broken.
+          const flushTrigger = (this._flushPromise ?? Promise.resolve())
+            .then(() => this._flushDirtyLedgerEntries());
+          const tracked: Promise<void> = flushTrigger.catch(() => {/* swallow for chain */}).finally(() => {
+            if (this._flushPromise === tracked) this._flushPromise = null;
+          });
+          this._flushPromise = tracked;
+          await flushTrigger;
+          // Verify durability: if our invoice is still dirty after the flush,
+          // its persistence failed. Propagate as a rejection so the caller can
+          // retry or compensate (the in-memory entry remains so the next flush
+          // attempt — explicit or via `_handleTokenChange` — will retry).
+          if (this.dirtyLedgerEntries.has(invoiceId)) {
+            throw new SphereError(
+              `payInvoice: provisional ledger entry for invoice ${invoiceId} failed to persist — caller should retry`,
+              'STORAGE_ERROR',
+            );
+          }
         }
 
         return result;
@@ -2713,6 +2761,28 @@ export class AccountingModule {
           }
           // Invalidate balance cache for this invoice
           this.balanceCache.delete(invoiceId);
+
+          // Force the provisional entry to disk before returning. Same rationale
+          // and review-feedback constraints as `payInvoice` above:
+          // (a) await OUR flush directly (not `_drainFlushPromise`) so we don't
+          //     spin while concurrent `_handleTokenChange` events keep extending
+          //     the chain.
+          // (b) detect post-flush whether OUR invoice is still dirty (the helper
+          //     swallows storage errors internally) and propagate as a rejection
+          //     so the caller learns when durability fails — never silently OK.
+          const flushTrigger = (this._flushPromise ?? Promise.resolve())
+            .then(() => this._flushDirtyLedgerEntries());
+          const tracked: Promise<void> = flushTrigger.catch(() => {/* swallow for chain */}).finally(() => {
+            if (this._flushPromise === tracked) this._flushPromise = null;
+          });
+          this._flushPromise = tracked;
+          await flushTrigger;
+          if (this.dirtyLedgerEntries.has(invoiceId)) {
+            throw new SphereError(
+              `returnInvoicePayment: provisional ledger entry for invoice ${invoiceId} failed to persist — caller should retry`,
+              'STORAGE_ERROR',
+            );
+          }
         }
 
         return result;
