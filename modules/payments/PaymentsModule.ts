@@ -174,6 +174,7 @@ import { MintCommitment } from '@unicitylabs/state-transition-sdk/lib/transactio
 import { MintTransactionData } from '@unicitylabs/state-transition-sdk/lib/transaction/MintTransactionData';
 import { waitInclusionProof } from '@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils';
 import { InclusionProof } from '@unicitylabs/state-transition-sdk/lib/transaction/InclusionProof';
+import { TransferTransactionData } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferTransactionData';
 import type { IAddress } from '@unicitylabs/state-transition-sdk/lib/address/IAddress';
 import type { StateTransitionClient } from '@unicitylabs/state-transition-sdk/lib/StateTransitionClient';
 import type { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/bft/RootTrustBase';
@@ -1408,16 +1409,126 @@ export class PaymentsModule {
         }
 
         try {
-          // 1. Reassemble the SDK-shaped token JSON from the verified bundle.
-          const tokenData: unknown = verified.pkg.assemble(tokenRoot.tokenId);
+          // 1. Reassemble the sender's token JSON from the verified bundle.
+          //    The sender packages the bundle with the SOURCE token's state
+          //    (the sender's predicate), not the recipient's.  The last
+          //    transaction in the bundle IS the transfer-to-recipient tx,
+          //    but the top-level `state` field still points at the sender.
+          //    SdkToken.verify(trustBase) rejects this because
+          //      state.predicate → sender address
+          //      ≠ transactions[-1].data.recipient → recipient address.
+          //    We must construct the recipient's UnmaskedPredicate + state
+          //    and call finalizeTransferToken() (conservative) or patch
+          //    the state JSON and store as pending (instant).
+          const assembledJson = verified.pkg.assemble(tokenRoot.tokenId) as Record<string, unknown>;
 
-          // 2. Validate via oracle — mirrors legacy arm line ~7744.
-          const validation = await this.deps!.oracle.validateToken(tokenData);
-          if (!validation.valid) {
-            logger.warn('Payments', 'Received invalid UXF token', {
-              tokenId: tokenRoot.tokenId.slice(0, 16),
-            });
-            return;
+          // Decide whether recipient-side finalization is needed.
+          // A token with no transfer transactions cannot be finalized (and
+          // is unlikely in production, but guard for tests / edge cases).
+          const txArray = Array.isArray(assembledJson.transactions)
+            ? (assembledJson.transactions as Record<string, unknown>[])
+            : [];
+
+          // Working variables updated by the finalization block.
+          let tokenData: unknown = assembledJson;
+          let tokenStatus: Token['status'] = 'confirmed';
+
+          if (txArray.length > 0) {
+            const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const trustBase = (this.deps!.oracle as any).getTrustBase?.();
+            const lastTxJson = txArray.at(-1) as Record<string, unknown> | undefined;
+            const hasNullProof = lastTxJson?.inclusionProof === null;
+
+            if (stClient && trustBase && lastTxJson?.data != null) {
+              try {
+                // Parse TransferTransactionData to get the salt.
+                // This works for BOTH conservative (proof present) and
+                // instant (inclusionProof: null) because we only parse
+                // the `data` sub-object, not the full TransferTransaction.
+                const txData = await TransferTransactionData.fromJSON(lastTxJson.data);
+                const transferSalt = txData.salt;
+
+                // Assemble the source token at state N-1 (genesis + all
+                // transactions EXCEPT the final transfer-to-us).
+                const txCount = verified.pkg.transactionCount(tokenRoot.tokenId);
+                const sourceTokenJson = verified.pkg.assembleAtState(
+                  tokenRoot.tokenId,
+                  txCount - 1,
+                );
+                const sourceToken = await SdkToken.fromJSON(sourceTokenJson);
+
+                // Construct recipient UnmaskedPredicate and TokenState.
+                const signingService = await this.createSigningService();
+                const recipientPredicate = await UnmaskedPredicate.create(
+                  sourceToken.id,
+                  sourceToken.type,
+                  signingService,
+                  HashAlgorithm.SHA256,
+                  transferSalt,
+                );
+                const recipientState = new TokenState(recipientPredicate, null);
+
+                if (!hasNullProof) {
+                  // 2a. Conservative path: all inclusion proofs are present.
+                  //    Call the shared finalizeTransferToken helper which
+                  //    mirrors the legacy receive arm (line ~7873).
+                  //    This calls stClient.finalizeTransaction() to produce
+                  //    a fully-verified SDK Token with the recipient's state.
+                  const lastTx = await TransferTransaction.fromJSON(lastTxJson);
+                  const finalizedToken = await this.finalizeTransferToken(
+                    sourceToken,
+                    lastTx,
+                    stClient,
+                    trustBase,
+                  );
+                  tokenData = finalizedToken.toJSON();
+                  // tokenStatus remains 'confirmed'
+                } else {
+                  // 2b. Instant path: the last tx has inclusionProof: null.
+                  //    TransferTransaction.fromJSON(null_proof) throws, so
+                  //    we cannot call finalizeTransaction().  Instead:
+                  //    - Patch the assembled JSON's `state` field with the
+                  //      recipient's state (so the stored sdkData records
+                  //      the correct owner predicate).
+                  //    - Store as status='pending'; oracle validation is
+                  //      deferred per spec §5.3 [E] (unfinalizedCount > 0).
+                  //    The finalization worker (§5.5 / T.5.C) is responsible
+                  //    for attaching the proof and re-running [B]/[E] once
+                  //    the aggregator returns it.
+                  tokenData = { ...assembledJson, state: recipientState.toJSON() };
+                  tokenStatus = 'pending';
+                }
+              } catch (finalizeErr) {
+                // If recipient-side finalization fails unexpectedly, fall
+                // back to submitting the assembled JSON directly to the
+                // oracle for a best-effort RPC validation.  This preserves
+                // the previous behaviour and keeps the pipeline running.
+                logger.warn(
+                  'Payments',
+                  'UXF recipient-side finalization failed, falling back to assembled JSON',
+                  { tokenId: tokenRoot.tokenId.slice(0, 16), err: finalizeErr },
+                );
+                tokenData = assembledJson;
+                // tokenStatus remains 'confirmed'
+              }
+            }
+            // If stClient/trustBase are absent (e.g., in tests with mocked
+            // oracle), fall through with tokenData = assembledJson and
+            // tokenStatus = 'confirmed' (pre-existing behaviour).
+          }
+
+          // 2. Validate via oracle — skipped for pending instant-mode tokens
+          //    (spec §5.3 [E]: unfinalizedCount > 0 → PENDING, isSpent
+          //    check deferred until allFinalized).
+          if (tokenStatus !== 'pending') {
+            const validation = await this.deps!.oracle.validateToken(tokenData);
+            if (!validation.valid) {
+              logger.warn('Payments', 'Received invalid UXF token', {
+                tokenId: tokenRoot.tokenId.slice(0, 16),
+              });
+              return;
+            }
           }
 
           // 3. Parse + build wallet Token — mirrors legacy arm lines ~7751-7768.
@@ -1433,7 +1544,7 @@ export class PaymentsModule {
             decimals: tokenInfo.decimals,
             iconUrl: tokenInfo.iconUrl,
             amount: tokenInfo.amount,
-            status: 'confirmed',
+            status: tokenStatus,
             createdAt: Date.now(),
             updatedAt: Date.now(),
             sdkData: sdkDataStr,

@@ -66,11 +66,26 @@ vi.mock('@unicitylabs/state-transition-sdk/lib/transaction/TransferCommitment', 
 }));
 
 vi.mock('@unicitylabs/state-transition-sdk/lib/transaction/TransferTransaction', () => ({
-  TransferTransaction: class {},
+  TransferTransaction: class {
+    static fromJSON = vi.fn().mockResolvedValue({
+      data: {
+        recipient: { scheme: 0 /* AddressScheme.DIRECT */, address: 'DIRECT://test' },
+        salt: new Uint8Array(32),
+      },
+    });
+  },
+}));
+
+vi.mock('@unicitylabs/state-transition-sdk/lib/transaction/TransferTransactionData', () => ({
+  TransferTransactionData: {
+    fromJSON: vi.fn().mockResolvedValue({ salt: new Uint8Array(32) }),
+  },
 }));
 
 vi.mock('@unicitylabs/state-transition-sdk/lib/sign/SigningService', () => ({
-  SigningService: class {},
+  SigningService: class {
+    static createFromSecret = vi.fn().mockResolvedValue({});
+  },
 }));
 
 vi.mock('@unicitylabs/state-transition-sdk/lib/address/AddressScheme', () => ({
@@ -78,7 +93,9 @@ vi.mock('@unicitylabs/state-transition-sdk/lib/address/AddressScheme', () => ({
 }));
 
 vi.mock('@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicate', () => ({
-  UnmaskedPredicate: class {},
+  UnmaskedPredicate: class {
+    static create = vi.fn().mockResolvedValue({ toJSON: () => ({ mock: 'predicate' }) });
+  },
 }));
 
 vi.mock('@unicitylabs/state-transition-sdk/lib/token/TokenState', () => ({
@@ -602,6 +619,206 @@ describe('PaymentsModule — default IngestWorkerPool auto-install (Phase 9.5.E)
       const hasB = tokens.some((t) => t.sdkData?.includes(TOKEN_ID_B));
       expect(hasA).toBe(true);
       expect(hasB).toBe(false);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 4. Conservative-mode recipient-side finalization (Phase 9.6.C)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Verifies that the default processToken closure performs recipient-side
+   * finalization when:
+   *   - the bundle carries a transfer transaction WITH a non-null inclusionProof
+   *     (conservative mode), and
+   *   - the oracle exposes `getStateTransitionClient()` + `getTrustBase()`.
+   *
+   * The expected sequence inside processToken:
+   *   1. assembledJson.transactions is non-empty → enter finalization block.
+   *   2. stClient and trustBase are present → enter inner try.
+   *   3. TransferTransactionData.fromJSON() extracts the salt.
+   *   4. pkg.assembleAtState(tokenId, txCount-1) produces the source token JSON.
+   *   5. SdkToken.fromJSON(sourceTokenJson) builds the source SDK token.
+   *   6. UnmaskedPredicate.create(...) builds the recipient predicate.
+   *   7. TransferTransaction.fromJSON(lastTxJson) succeeds (proof is present).
+   *   8. finalizeTransferToken(sourceToken, lastTx, stClient, trustBase) is called;
+   *      stClient.finalizeTransaction() returns the finalized mock SDK token.
+   *   9. finalizedToken.toJSON() → tokenData used to build the wallet Token.
+   *  10. oracle.validateToken(tokenData) is called (status is 'confirmed').
+   *  11. addToken() persists it; emitEvent('transfer:incoming', ...) fires.
+   *
+   * The finalized token's status MUST be 'confirmed' (not 'pending').
+   */
+  describe('conservative-mode recipient-side finalization', () => {
+    const FINALIZED_TOKEN_JSON = {
+      genesis: {
+        data: {
+          tokenId: TOKEN_ID_A,
+          coinData: [[COIN_ID_HEX, '1000000']],
+          tokenType: '00',
+          tokenData: '',
+          salt: '00',
+        },
+      },
+      state: { stateHash: '2'.repeat(64) },  // different from sender's state
+      transactions: [
+        {
+          data: { recipient: 'DIRECT://test', salt: '00' },
+          inclusionProof: { path: [], leaf: {} },  // non-null → conservative
+        },
+      ],
+    };
+
+    /** Build a VerifiedBundle whose pkg carries a transfer transaction. */
+    function buildConservativeBundle(): VerifiedBundle {
+      const sourceTokenJson = {
+        genesis: {
+          data: {
+            tokenId: TOKEN_ID_A,
+            coinData: [[COIN_ID_HEX, '1000000']],
+            tokenType: '00',
+            tokenData: '',
+            salt: '00',
+          },
+        },
+        state: { stateHash: '1'.repeat(64) },
+        // no transactions → N-1 state (source)
+      };
+
+      // assemble() returns the full sender's view (with transactions).
+      // assembleAtState(tokenId, 0) returns the source token (no transactions).
+      // transactionCount() returns 1.
+      const assembleSpy = vi.fn((tokenId: string) => {
+        if (tokenId === TOKEN_ID_A) return FINALIZED_TOKEN_JSON;
+        throw new Error(`unexpected assemble(${tokenId})`);
+      });
+      const assembleAtStateSpy = vi.fn((_tokenId: string, _stateIdx: number) => sourceTokenJson);
+      const transactionCountSpy = vi.fn((_tokenId: string) => 1);
+
+      const rootRef: RootRef = {
+        contentHash: ('cc' + '0'.repeat(62)) as never,
+        tokenId: TOKEN_ID_A,
+        chainDepth: 1,
+      };
+
+      return {
+        verified: true as const,
+        pkg: {
+          assemble: assembleSpy,
+          assembleAtState: assembleAtStateSpy,
+          transactionCount: transactionCountSpy,
+        } as never,
+        bundleCid: BUNDLE_CID,
+        claimedTokens: [rootRef],
+        advisoryUnclaimedRoots: [],
+        missingClaimedTokenIds: [],
+        droppedDeepUnclaimed: 0,
+      };
+    }
+
+    /** Oracle that exposes stClient + trustBase for recipient-side finalization. */
+    function makeOracleWithStClient(): OracleProvider {
+      const finalizedSdkToken = {
+        toJSON: vi.fn(() => FINALIZED_TOKEN_JSON),
+        id: {
+          toJSON: () => TOKEN_ID_A,
+          toString: () => TOKEN_ID_A,
+        },
+        coins: {
+          coins: [[[{ toJSON: () => COIN_ID_HEX }, '1000000']]],
+        },
+        state: {},
+      };
+
+      const mockStClient = {
+        finalizeTransaction: vi.fn().mockResolvedValue(finalizedSdkToken),
+      };
+
+      const mockTrustBase = {};
+
+      return {
+        validateToken: vi.fn().mockResolvedValue({ valid: true }),
+        getStateTransitionClient: vi.fn().mockReturnValue(mockStClient),
+        // getTrustBase is not part of OracleProvider interface; added via cast
+        getTrustBase: vi.fn().mockReturnValue(mockTrustBase),
+        waitForProofSdk: vi.fn(),
+      } as unknown as OracleProvider;
+    }
+
+    let module: ReturnType<typeof createPaymentsModule>;
+    let emitEvent: ReturnType<typeof vi.fn>;
+    let handleTransfer: (transfer: IncomingTokenTransfer) => Promise<void>;
+    let oracle: OracleProvider;
+
+    beforeEach(() => {
+      vi.clearAllMocks();
+
+      mockAcquireBundle.mockResolvedValue(buildConservativeBundle());
+
+      module = createPaymentsModule({ features: { recipientUxf: true } });
+      emitEvent = vi.fn();
+      oracle = makeOracleWithStClient();
+
+      handleTransfer = (t: IncomingTokenTransfer) =>
+        (module as unknown as { handleIncomingTransfer: (t: IncomingTokenTransfer) => Promise<void> }).handleIncomingTransfer(t);
+
+      module.initialize({
+        identity: makeIdentity(),
+        storage: makeStorage(),
+        transport: makeTransport(),
+        oracle,
+        emitEvent,
+      });
+
+      (module as unknown as { loaded: boolean }).loaded = true;
+      (module as unknown as { loadedPromise: Promise<void> | null }).loadedPromise = null;
+    });
+
+    afterEach(() => {
+      module.destroy();
+    });
+
+    it('calls stClient.finalizeTransaction() for a conservative-mode bundle', async () => {
+      const payload = buildUxfCarPayload(TOKEN_ID_A);
+      await handleTransfer(buildIncomingTransfer(payload));
+
+      // stClient.finalizeTransaction() must have been called (via finalizeTransferToken).
+      const stClient = (oracle.getStateTransitionClient as ReturnType<typeof vi.fn>)()! as {
+        finalizeTransaction: ReturnType<typeof vi.fn>;
+      };
+      expect(stClient.finalizeTransaction).toHaveBeenCalled();
+    });
+
+    it('emits transfer:incoming with status confirmed (not pending)', async () => {
+      const payload = buildUxfCarPayload(TOKEN_ID_A);
+      await handleTransfer(buildIncomingTransfer(payload));
+
+      const incomingCalls = (emitEvent as ReturnType<typeof vi.fn>).mock.calls.filter(
+        ([event]: [string]) => event === 'transfer:incoming',
+      );
+      expect(incomingCalls.length).toBe(1);
+
+      const [, transferPayload] = incomingCalls[0] as [string, { tokens: { status?: string }[] }];
+      expect(transferPayload.tokens).toHaveLength(1);
+      expect(transferPayload.tokens[0].status).toBe('confirmed');
+    });
+
+    it('calls oracle.validateToken() for the finalized token data', async () => {
+      const payload = buildUxfCarPayload(TOKEN_ID_A);
+      await handleTransfer(buildIncomingTransfer(payload));
+
+      expect((oracle.validateToken as ReturnType<typeof vi.fn>)).toHaveBeenCalledTimes(1);
+    });
+
+    it('adds the finalized token to getTokens() with status confirmed', async () => {
+      const payload = buildUxfCarPayload(TOKEN_ID_A);
+      await handleTransfer(buildIncomingTransfer(payload));
+
+      const tokens = module.getTokens();
+      expect(tokens.length).toBeGreaterThanOrEqual(1);
+      const token = tokens.find((t) => t.sdkData?.includes(TOKEN_ID_A));
+      expect(token).toBeDefined();
+      expect(token!.status).toBe('confirmed');
     });
   });
 });
