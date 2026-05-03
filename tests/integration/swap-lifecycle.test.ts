@@ -1008,4 +1008,143 @@ describe('Swap Lifecycle Integration Tests', () => {
     expect(idsA.size).toBe(3);
     expect(idsB.size).toBe(3);
   });
+
+  // ---------------------------------------------------------------------------
+  // INT-SWAP-007: Over-coverage on payout invoice fails fast with OVER_COVERAGE
+  //
+  // Regression coverage for the silent-acceptance path that previously let an
+  // over-paid payout invoice (e.g. from an escrow crash-recovery double-send,
+  // a duplicate `payInvoice()` from any source) progress past the coverage gate
+  // and surface as an opaque 20-min retry-loop hang in the trader's wrapper. The
+  // SwapModule must now treat `netCoveredAmount > expectedAmount` as a terminal
+  // settlement fault (OVER_COVERAGE), failing the swap with an explicit error so
+  // the application layer can recover and surplus auto-return can refund payers.
+  // ---------------------------------------------------------------------------
+  it('INT-SWAP-007: over-coverage on payout fails fast with OVER_COVERAGE error', async () => {
+    const deal = createDeal();
+
+    // Walk the happy-path lifecycle up to the verifyPayout step.
+    const proposalResult = await ctx.partyA.module.proposeSwap(deal);
+    const swapId = proposalResult.swapId;
+    const manifest = proposalResult.manifest;
+    await settle();
+
+    configureAccountingForDeposit(ctx.partyA, ctx.escrow);
+    configureAccountingForDeposit(ctx.partyB, ctx.escrow);
+
+    await ctx.partyB.module.acceptSwap(swapId);
+    await settle(150);
+
+    await ctx.partyA.module.deposit(swapId);
+    await ctx.partyB.module.deposit(swapId);
+
+    ctx.escrow.simulateDeposit(swapId, PARTY_A_TRANSPORT_PUBKEY);
+    ctx.escrow.simulateDeposit(swapId, PARTY_B_TRANSPORT_PUBKEY);
+    await settle(100);
+
+    const partyAAfterDeposit = await ctx.partyA.module.getSwapStatus(swapId, { queryEscrow: false });
+    expect(partyAAfterDeposit.payoutInvoiceId).toBeTruthy();
+
+    // Configure accounting for normal payout — terms expect party_b_value_to_change.
+    configureAccountingForPayout(
+      ctx.partyA,
+      swapId,
+      partyAAfterDeposit.payoutInvoiceId!,
+      PARTY_A_ADDRESS,
+      manifest.party_b_currency_to_change,
+      manifest.party_b_value_to_change,
+    );
+
+    // Override the invoice-status mock to simulate over-coverage:
+    // `netCoveredAmount` is double the expected amount (the symptom seen when the
+    // escrow crash-recovery double-sends a payout). Exact arithmetic, not a
+    // probabilistic check.
+    const expectedAmount = manifest.party_b_value_to_change;
+    const overCoveredAmount = (BigInt(expectedAmount) * 2n).toString();
+    const surplus = (BigInt(expectedAmount)).toString();
+
+    const payoutInvoiceId = partyAAfterDeposit.payoutInvoiceId!;
+    const prevStatus = ctx.partyA.accounting.getInvoiceStatus.getMockImplementation();
+    ctx.partyA.accounting.getInvoiceStatus.mockImplementation((invoiceId: string) => {
+      if (invoiceId === payoutInvoiceId) {
+        return {
+          invoiceId,
+          state: 'COVERED',
+          targets: [{
+            coinAssets: [{
+              coin: [manifest.party_b_currency_to_change, expectedAmount],
+              netCoveredAmount: overCoveredAmount,
+              isCovered: true,
+              surplusAmount: surplus,
+            }],
+          }],
+          totalForward: { [manifest.party_b_currency_to_change]: overCoveredAmount },
+          totalBack: {},
+          allConfirmed: true,
+          lastActivityAt: Date.now(),
+        };
+      }
+      return prevStatus ? prevStatus(invoiceId) : null;
+    });
+
+    // verifyPayout must return false (settlement halted) AND transition the swap
+    // to 'failed' with an OVER_COVERAGE error.
+    const verified = await ctx.partyA.module.verifyPayout(swapId);
+    expect(verified).toBe(false);
+
+    const finalStatus = await ctx.partyA.module.getSwapStatus(swapId, { queryEscrow: false });
+    expect(finalStatus.progress).toBe('failed');
+    expect((finalStatus as { error?: string }).error).toMatch(/OVER_COVERAGE/);
+    expect((finalStatus as { error?: string }).error).toMatch(new RegExp(`expected=${expectedAmount}`));
+    expect((finalStatus as { error?: string }).error).toMatch(new RegExp(`surplus=${surplus}`));
+
+    // Should have emitted swap:failed (not swap:completed with payoutVerified=false).
+    expect(findEvent(ctx.partyA.events, 'swap:failed')).toBeDefined();
+  });
+
+  // ---------------------------------------------------------------------------
+  // INT-SWAP-008: Exact-coverage payout passes verification (regression guard)
+  //
+  // Confirms the equality check at the swap settlement boundary still accepts
+  // exact coverage — i.e. `netCoveredAmount === expectedAmount` is the success
+  // path, not the over-coverage path. Catches accidental tightening that would
+  // reject the happy path.
+  // ---------------------------------------------------------------------------
+  it('INT-SWAP-008: exact coverage on payout passes verification', async () => {
+    const deal = createDeal();
+
+    const proposalResult = await ctx.partyA.module.proposeSwap(deal);
+    const swapId = proposalResult.swapId;
+    const manifest = proposalResult.manifest;
+    await settle();
+
+    configureAccountingForDeposit(ctx.partyA, ctx.escrow);
+    configureAccountingForDeposit(ctx.partyB, ctx.escrow);
+    await ctx.partyB.module.acceptSwap(swapId);
+    await settle(150);
+
+    await ctx.partyA.module.deposit(swapId);
+    await ctx.partyB.module.deposit(swapId);
+    ctx.escrow.simulateDeposit(swapId, PARTY_A_TRANSPORT_PUBKEY);
+    ctx.escrow.simulateDeposit(swapId, PARTY_B_TRANSPORT_PUBKEY);
+    await settle(100);
+
+    const partyAAfterDeposit = await ctx.partyA.module.getSwapStatus(swapId, { queryEscrow: false });
+    expect(partyAAfterDeposit.payoutInvoiceId).toBeTruthy();
+
+    configureAccountingForPayout(
+      ctx.partyA,
+      swapId,
+      partyAAfterDeposit.payoutInvoiceId!,
+      PARTY_A_ADDRESS,
+      manifest.party_b_currency_to_change,
+      manifest.party_b_value_to_change,
+    );
+
+    const verified = await ctx.partyA.module.verifyPayout(swapId);
+    expect(verified).toBe(true);
+
+    const finalStatus = await ctx.partyA.module.getSwapStatus(swapId, { queryEscrow: false });
+    expect(finalStatus.progress).toBe('completed');
+  });
 });

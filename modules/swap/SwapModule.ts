@@ -1687,6 +1687,7 @@ export class SwapModule {
           coin: [string, string];
           netCoveredAmount: string;
           isCovered: boolean;
+          surplusAmount?: string;
         }>;
       }>;
     };
@@ -1811,8 +1812,36 @@ export class SwapModule {
       return returnFalse();
     }
 
-    if (BigInt(targetStatus.coinAssets[0].netCoveredAmount) < BigInt(expectedAmount)) {
+    // Coverage equality check (exact-amount enforcement).
+    //
+    // The accounting layer permits the payout invoice to receive more than the
+    // requested amount (`netCoveredAmount > expectedAmount`) — surplus is tracked
+    // per-payer and refunded by the SDK's auto-return mechanism on closeInvoice.
+    // For *swap settlement*, however, over-coverage indicates one of:
+    //   (a) the escrow paid out twice for the same swap (e.g., a crash-mid-conclude
+    //       race in which crash-recovery's `_resumePayouts` re-issued payInvoice
+    //       because the SDK's provisional ledger entry had not yet been flushed);
+    //   (b) a malicious or buggy third party deposited into the same payout invoice;
+    //   (c) some other settlement-layer fault.
+    // In all three cases the swap should NOT silently complete — the surplus must be
+    // returned (auto-return on the receiver) and the swap explicitly failed so the
+    // application layer can recover with a clear reason. Without this check, the
+    // swap would either continue with `verified=true` (accepting an invalid token
+    // mix that subsequent state transitions would reject) or hang for the trader's
+    // verifyPayout retry budget while `validate()` repeatedly rejects an unrelated
+    // wallet token, producing a 20-min opaque hang instead of a clear failure.
+    const netCoveredAmount = BigInt(targetStatus.coinAssets[0].netCoveredAmount);
+    const expectedAmountBigInt = BigInt(expectedAmount);
+    if (netCoveredAmount < expectedAmountBigInt) {
+      // Not yet fully covered — keep retrying (transient).
       return returnFalse();
+    }
+    if (netCoveredAmount > expectedAmountBigInt) {
+      // Over-coverage is a settlement fault — fail explicitly.
+      const surplus = netCoveredAmount - expectedAmountBigInt;
+      return failPayout(
+        `OVER_COVERAGE: net=${netCoveredAmount.toString()}, expected=${expectedAmount}, surplus=${surplus.toString()} — surplus refund expected via auto-return; settlement halted`,
+      );
     }
 
     // Verify escrow creator identity
