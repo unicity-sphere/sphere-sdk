@@ -234,17 +234,51 @@ async function initWallet(label: string, nametag: string): Promise<{
  * assert on the actual wire payload structure (kind: 'uxf-car' or
  * 'uxf-cid'). Returns an array that captures every payload sent during
  * the wrap window, plus an `unwrap()` to restore the original.
+ *
+ * IMPORTANT — hook target selection:
+ *   UXF sends go through `PaymentsModule.deps.transport`, which is the
+ *   *per-address AddressTransportAdapter* returned by
+ *   `MultiAddressTransportMux.addAddress()` and stored in
+ *   `Sphere._transportMux`. It is set as `transport: addressTransport`
+ *   inside `Sphere._initializeModules()` (core/Sphere.ts ~line 2493).
+ *
+ *   The bare `sphere._transport` (NostrTransportProvider) is suppressed
+ *   after the Mux takes over — its `sendTokenTransfer` is never called
+ *   for UXF sends. Hooking it captures 0 events even when the send
+ *   succeeds, which is exactly the Phase 9 testnet failure we observed:
+ *   status=completed/submitted for all 3 scenarios, captured.length===0.
+ *
+ *   Resolution path:
+ *     sphere._transportMux                     (MultiAddressTransportMux)
+ *       .getAdapter(sphere._currentAddressIndex) (AddressTransportAdapter)
+ *         .sendTokenTransfer                    ← hook THIS
+ *
+ *   Falls back to `sphere._transport` only when no Mux exists (e.g. a
+ *   custom transport that does not support the Mux interface).
  */
 function captureSentPayloads(sphere: Sphere): {
   captured: Array<{ recipient: string; payload: TokenTransferPayload }>;
   unwrap: () => void;
 } {
-  const transport = (sphere as unknown as {
+  // Reach into the Mux for the per-address adapter that PaymentsModule uses.
+  // Both _transportMux and _currentAddressIndex are private — accessed via
+  // `as any` here in test code only; never leak into production paths.
+  const sphereAny = sphere as unknown as {
+    _transportMux: { getAdapter: (idx: number) => { sendTokenTransfer: (r: string, p: TokenTransferPayload) => Promise<string> } | undefined } | null;
+    _currentAddressIndex: number;
     _transport: { sendTokenTransfer: (r: string, p: TokenTransferPayload) => Promise<string> };
-  })._transport;
+  };
+
+  const addrIndex = sphereAny._currentAddressIndex ?? 0;
+  // Prefer the Mux adapter (the exact object PaymentsModule calls).
+  // Fall back to the bare transport if the Mux is absent (non-Nostr transport).
+  const transport: { sendTokenTransfer: (r: string, p: TokenTransferPayload) => Promise<string> } =
+    sphereAny._transportMux?.getAdapter(addrIndex) ?? sphereAny._transport;
+
   const original = transport.sendTokenTransfer.bind(transport);
   const captured: Array<{ recipient: string; payload: TokenTransferPayload }> = [];
   transport.sendTokenTransfer = async (recipient: string, payload: TokenTransferPayload) => {
+    console.log('[captureSentPayloads] captured payload kind:', (payload as unknown as Record<string, unknown>).kind);
     captured.push({ recipient, payload });
     return original(recipient, payload);
   };

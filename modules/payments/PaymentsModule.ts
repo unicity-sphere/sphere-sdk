@@ -1384,6 +1384,29 @@ export class PaymentsModule {
       const mutex = new PerTokenMutex();
 
       const processToken: ProcessTokenFn = async (tokenRoot, verified, ctx) => {
+        // Guard: only process token-roots that are CLAIMED for this recipient.
+        // The pool dispatcher passes BOTH verified.claimedTokens AND
+        // verified.advisoryUnclaimedRoots to every processToken call (by
+        // design — consumer-installed pools may want to inspect advisory roots
+        // for telemetry or §5.4 / §B' replica-merge purposes). The default
+        // wallet-receive closure must NOT attempt pkg.assemble() on advisory
+        // roots — they have no manifest entry in the recipient's view of the
+        // bundle (only the sender's claimed targets are written into the
+        // manifest), so assemble() would throw UxfError TOKEN_NOT_FOUND. The
+        // oracle would also correctly reject them as invalid for this recipient.
+        //
+        // Build the claim set once per call from verified.claimedTokens; this
+        // is O(N) where N = number of claimed tokens (typically 1–5), acceptable
+        // inside the per-tokenId mutex.
+        const claimedTokenIds = new Set(verified.claimedTokens.map((r) => r.tokenId));
+        if (!claimedTokenIds.has(tokenRoot.tokenId)) {
+          logger.debug(
+            'Payments',
+            `UXF processToken: skipping advisoryUnclaimedRoot ${tokenRoot.tokenId.slice(0, 16)} — not for this recipient`,
+          );
+          return;
+        }
+
         try {
           // 1. Reassemble the SDK-shaped token JSON from the verified bundle.
           const tokenData: unknown = verified.pkg.assemble(tokenRoot.tokenId);

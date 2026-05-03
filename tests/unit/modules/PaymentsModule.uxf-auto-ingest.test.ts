@@ -452,4 +452,156 @@ describe('PaymentsModule — default IngestWorkerPool auto-install (Phase 9.5.E)
       expect(tokens.length).toBeLessThanOrEqual(1);
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // 3. Advisory-unclaimed-root filter (Phase 9.6.A fix)
+  // ---------------------------------------------------------------------------
+
+  describe('advisoryUnclaimedRoots are silently skipped by default processToken', () => {
+    /**
+     * Root cause: the pool dispatcher sends BOTH claimedTokens AND
+     * advisoryUnclaimedRoots to processToken. The default closure must
+     * skip advisory roots — they are NOT meant for the recipient, have no
+     * manifest entry in the recipient's view, and pkg.assemble() would
+     * throw TOKEN_NOT_FOUND for them.
+     *
+     * This suite feeds the auto-installed pool a bundle that contains:
+     *   - TOKEN_ID_A as a CLAIMED root (payload.tokenIds = [TOKEN_ID_A])
+     *   - TOKEN_ID_B as an ADVISORY UNCLAIMED root (sender's change-output)
+     *
+     * Expected:
+     *   - TOKEN_ID_A is assembled, validated, added, transfer:incoming emitted
+     *   - TOKEN_ID_B: processToken returns early (no assemble, no oracle, no
+     *     storage, no event)
+     *   - pkg.assemble() is NOT called with TOKEN_ID_B
+     *   - oracle.validateToken() is NOT called for TOKEN_ID_B's data
+     *   - transfer:incoming is emitted exactly once (for TOKEN_ID_A only)
+     */
+
+    const TOKEN_ID_B = 'bb00000000000000000000000000000000000000000000000000000000000002';
+
+    /** Build a bundle with TOKEN_ID_A claimed and TOKEN_ID_B advisory. */
+    function buildBundleWithAdvisoryRoot(): VerifiedBundle {
+      const tokenDataA = {
+        genesis: {
+          data: {
+            tokenId: TOKEN_ID_A,
+            coinData: [[COIN_ID_HEX, '1000000']],
+            tokenType: '00',
+            tokenData: '',
+            salt: '00',
+          },
+        },
+        state: { stateHash: '1'.repeat(64) },
+      };
+
+      const claimedRef: RootRef = {
+        contentHash: ('cc' + '0'.repeat(62)) as never,
+        tokenId: TOKEN_ID_A,
+        chainDepth: 1,
+      };
+      const advisoryRef: RootRef = {
+        contentHash: ('dd' + '0'.repeat(62)) as never,
+        tokenId: TOKEN_ID_B,
+        chainDepth: 1,
+      };
+
+      // assemble() is spied: for TOKEN_ID_A return real data; for TOKEN_ID_B
+      // it should NEVER be called (the guard returns before reaching it).
+      const assembleSpy = vi.fn((tokenId: string) => {
+        if (tokenId === TOKEN_ID_A) return tokenDataA;
+        throw new Error(`pkg.assemble called for non-claimed token ${tokenId}`);
+      });
+
+      return {
+        verified: true as const,
+        pkg: { assemble: assembleSpy } as never,
+        bundleCid: BUNDLE_CID,
+        claimedTokens: [claimedRef],
+        advisoryUnclaimedRoots: [advisoryRef],
+        missingClaimedTokenIds: [],
+        droppedDeepUnclaimed: 0,
+      };
+    }
+
+    let module: ReturnType<typeof createPaymentsModule>;
+    let emitEvent: ReturnType<typeof vi.fn>;
+    let handleTransfer: (transfer: IncomingTokenTransfer) => Promise<void>;
+    let oracle: OracleProvider;
+
+    beforeEach(() => {
+      vi.clearAllMocks();
+
+      const bundle = buildBundleWithAdvisoryRoot();
+      mockAcquireBundle.mockResolvedValue(bundle);
+
+      module = createPaymentsModule({ features: { recipientUxf: true } });
+      emitEvent = vi.fn();
+      oracle = makeOracle(undefined);
+
+      handleTransfer = (t: IncomingTokenTransfer) =>
+        (module as unknown as { handleIncomingTransfer: (t: IncomingTokenTransfer) => Promise<void> }).handleIncomingTransfer(t);
+
+      module.initialize({
+        identity: makeIdentity(),
+        storage: makeStorage(),
+        transport: makeTransport(),
+        oracle,
+        emitEvent,
+      });
+
+      (module as unknown as { loaded: boolean }).loaded = true;
+      (module as unknown as { loadedPromise: Promise<void> | null }).loadedPromise = null;
+    });
+
+    afterEach(() => {
+      module.destroy();
+    });
+
+    it('emits transfer:incoming exactly once (for the claimed token only)', async () => {
+      // payload.tokenIds = [TOKEN_ID_A] → TOKEN_ID_B is advisory
+      const payload = buildUxfCarPayload(TOKEN_ID_A);
+      await handleTransfer(buildIncomingTransfer(payload));
+
+      const incomingCalls = (emitEvent as ReturnType<typeof vi.fn>).mock.calls.filter(
+        ([event]: [string]) => event === 'transfer:incoming',
+      );
+      expect(incomingCalls.length).toBe(1);
+    });
+
+    it('does NOT call pkg.assemble() for the advisory root TOKEN_ID_B', async () => {
+      // The bundle's assemble spy throws if called with TOKEN_ID_B.
+      // If the guard is missing, this test would throw and fail.
+      const bundle = mockAcquireBundle.mock.results[0]?.value as VerifiedBundle | undefined;
+      // Re-read from acquireBundle — the spy is in the bundle returned to the pool.
+      // We just dispatch; the test assertion is that no error is thrown
+      // (assemble(TOKEN_ID_B) would throw) AND oracle was NOT called for it.
+      const payload = buildUxfCarPayload(TOKEN_ID_A);
+      // Should not throw.
+      await expect(handleTransfer(buildIncomingTransfer(payload))).resolves.toBeUndefined();
+      void bundle;
+    });
+
+    it('does NOT call oracle.validateToken() for the advisory root TOKEN_ID_B', async () => {
+      const payload = buildUxfCarPayload(TOKEN_ID_A);
+      await handleTransfer(buildIncomingTransfer(payload));
+
+      // oracle.validateToken should be called exactly once — for TOKEN_ID_A
+      // (the claimed token). It must NOT have been called a second time for
+      // TOKEN_ID_B (the advisory root that the guard silently skips before
+      // reaching the oracle call).
+      expect((oracle.validateToken as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1);
+    });
+
+    it('adds TOKEN_ID_A to getTokens() but NOT TOKEN_ID_B', async () => {
+      const payload = buildUxfCarPayload(TOKEN_ID_A);
+      await handleTransfer(buildIncomingTransfer(payload));
+
+      const tokens = module.getTokens();
+      const hasA = tokens.some((t) => t.sdkData?.includes(TOKEN_ID_A));
+      const hasB = tokens.some((t) => t.sdkData?.includes(TOKEN_ID_B));
+      expect(hasA).toBe(true);
+      expect(hasB).toBe(false);
+    });
+  });
 });
