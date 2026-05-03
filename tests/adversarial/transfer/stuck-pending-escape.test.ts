@@ -60,6 +60,7 @@ import {
   manifestEntryFor,
   proofFor,
   queueEntryFor,
+  tk,
 } from '../../unit/payments/transfer/import-inclusion-proof-fixtures';
 
 describe('§11.4 — stuck-PENDING escape via importInclusionProof', () => {
@@ -67,7 +68,7 @@ describe('§11.4 — stuck-PENDING escape via importInclusionProof', () => {
     // Hostile state: token has been pending for days. User obtains
     // the proof out-of-band and feeds it in.
     const h = buildImporterHarness();
-    const TOKEN = 't-stuck-pending';
+    const TOKEN = tk('t-stuck-pending');
     const RQ = 'rq-stuck';
     h.manifest.entries.set(`${ADDR}:${TOKEN}`, manifestEntryFor({
       status: 'pending',
@@ -106,7 +107,7 @@ describe('§11.4 — stuck-PENDING escape via importInclusionProof', () => {
     // The token has outstanding `rq-X` but the proof claims `rq-Z`.
     // Defense: return mismatch, do not graft.
     const h = buildImporterHarness();
-    const TOKEN = 't-mismatch';
+    const TOKEN = tk('t-mismatch');
     h.manifest.entries.set(`${ADDR}:${TOKEN}`, manifestEntryFor({
       status: 'pending',
     }));
@@ -136,7 +137,7 @@ describe('§11.4 — stuck-PENDING escape via importInclusionProof', () => {
     const h = buildImporterHarness();
     const result = await h.importer.importInclusionProof(
       ADDR,
-      'completely-unknown-tokenid',
+      tk('completely-unknown-tokenid'),
       proofFor({ requestId: 'rq-fake' }),
     );
 
@@ -149,7 +150,7 @@ describe('§11.4 — stuck-PENDING escape via importInclusionProof', () => {
     // The user has already grafted this proof previously. A re-import
     // is a no-op, NOT a double-graft.
     const h = buildImporterHarness();
-    const TOKEN = 't-already-valid';
+    const TOKEN = tk('t-already-valid');
     h.manifest.entries.set(`${ADDR}:${TOKEN}`, manifestEntryFor({
       status: 'valid',
     }));
@@ -173,7 +174,7 @@ describe('§11.4 — stuck-PENDING escape via importInclusionProof', () => {
     // ADDR_A's pending state into ADDR_B's pool just because the
     // tokenId collides.
     const h = buildImporterHarness();
-    const SHARED_TOKEN = 't-shared-id';
+    const SHARED_TOKEN = tk('t-shared-id');
 
     // Only ADDR has this token; ADDR_ALT does not.
     h.manifest.entries.set(`${ADDR}:${SHARED_TOKEN}`, manifestEntryFor({

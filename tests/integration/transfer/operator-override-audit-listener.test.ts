@@ -31,6 +31,7 @@ import {
   manifestEntryFor,
   proofFor,
   queueEntryFor,
+  tk,
 } from '../../unit/payments/transfer/import-inclusion-proof-fixtures';
 import type { SphereEventMap } from '../../../types';
 import type { DispositionReason } from '../../../types/disposition';
@@ -132,12 +133,13 @@ describe('N4 — operator override audit-trail listener', () => {
     });
 
     // Seed the disposition + manifest + queue for a case-5 setup.
+    const T_BAD = tk('t-bad');
     h2.disposition.entries.set(
-      `${ADDR}.invalid.t-bad.${'aa'.repeat(32)}`,
-      invalidEntryFor({ tokenId: 't-bad', reason: 'oracle-rejected' }),
+      `${ADDR}.invalid.${T_BAD}.${'aa'.repeat(32)}`,
+      invalidEntryFor({ tokenId: T_BAD, reason: 'oracle-rejected' }),
     );
     h2.manifest.entries.set(
-      `${ADDR}:t-bad`,
+      `${ADDR}:${T_BAD}`,
       manifestEntryFor({
         status: 'invalid',
         invalidReason: 'oracle-rejected',
@@ -146,7 +148,7 @@ describe('N4 — operator override audit-trail listener', () => {
     );
     h2.queue.entries.push(
       queueEntryFor({
-        tokenId: 't-bad',
+        tokenId: T_BAD,
         commitmentRequestId: 'rq-bad',
         status: 'hard-fail',
       }),
@@ -154,7 +156,7 @@ describe('N4 — operator override audit-trail listener', () => {
 
     const result = await wiredImporter.importInclusionProof(
       ADDR,
-      't-bad',
+      T_BAD,
       proofFor({ requestId: 'rq-bad' }),
       {
         allowInvalidOverride: true,
@@ -167,7 +169,7 @@ describe('N4 — operator override audit-trail listener', () => {
     // The listener captured exactly one record.
     expect(listener.ledger.length).toBe(1);
     const r = listener.ledger[0]!;
-    expect(r.tokenId).toBe('t-bad');
+    expect(r.tokenId).toBe(T_BAD);
     expect(r.overrideAppliedAt).toBe(1700000001000);
     expect(r.overrideAppliedBy).toBe('op-pk-N4');
     expect(r.previousReason).toBe('oracle-rejected');
@@ -210,12 +212,14 @@ describe('N4 — operator override audit-trail listener', () => {
     });
 
     // Token A — case 5.
+    const T_A = tk('t-A');
+    const T_B = tk('t-B');
     h.disposition.entries.set(
-      `${ADDR}.invalid.t-A.${'aa'.repeat(32)}`,
-      invalidEntryFor({ tokenId: 't-A', reason: 'oracle-rejected' }),
+      `${ADDR}.invalid.${T_A}.${'aa'.repeat(32)}`,
+      invalidEntryFor({ tokenId: T_A, reason: 'oracle-rejected' }),
     );
     h.manifest.entries.set(
-      `${ADDR}:t-A`,
+      `${ADDR}:${T_A}`,
       manifestEntryFor({
         status: 'invalid',
         invalidReason: 'oracle-rejected',
@@ -224,7 +228,7 @@ describe('N4 — operator override audit-trail listener', () => {
     );
     h.queue.entries.push(
       queueEntryFor({
-        tokenId: 't-A',
+        tokenId: T_A,
         commitmentRequestId: 'rq-A0',
         status: 'hard-fail',
       }),
@@ -232,11 +236,11 @@ describe('N4 — operator override audit-trail listener', () => {
 
     // Token B — case 6 (chain-mode K-1 re-queue).
     h.disposition.entries.set(
-      `${ADDR}.invalid.t-B.${'bb'.repeat(32)}`,
-      invalidEntryFor({ tokenId: 't-B', reason: 'oracle-rejected' }),
+      `${ADDR}.invalid.${T_B}.${'bb'.repeat(32)}`,
+      invalidEntryFor({ tokenId: T_B, reason: 'oracle-rejected' }),
     );
     h.manifest.entries.set(
-      `${ADDR}:t-B`,
+      `${ADDR}:${T_B}`,
       manifestEntryFor({
         status: 'invalid',
         invalidReason: 'oracle-rejected',
@@ -245,13 +249,13 @@ describe('N4 — operator override audit-trail listener', () => {
     );
     h.queue.entries.push(
       queueEntryFor({
-        tokenId: 't-B',
+        tokenId: T_B,
         commitmentRequestId: 'rq-B0',
         txIndex: 0,
         status: 'hard-fail',
       }),
       queueEntryFor({
-        tokenId: 't-B',
+        tokenId: T_B,
         commitmentRequestId: 'rq-B1',
         txIndex: 1,
         status: 'hard-fail',
@@ -260,7 +264,7 @@ describe('N4 — operator override audit-trail listener', () => {
 
     const rA = await importer.importInclusionProof(
       ADDR,
-      't-A',
+      T_A,
       proofFor({ requestId: 'rq-A0' }),
       {
         allowInvalidOverride: true,
@@ -272,7 +276,7 @@ describe('N4 — operator override audit-trail listener', () => {
 
     const rB = await importer.importInclusionProof(
       ADDR,
-      't-B',
+      T_B,
       proofFor({ requestId: 'rq-B0' }),
       {
         allowInvalidOverride: true,
@@ -284,10 +288,10 @@ describe('N4 — operator override audit-trail listener', () => {
 
     // Listener captured both, in arrival order.
     expect(listener.ledger.length).toBe(2);
-    expect(listener.ledger[0]!.tokenId).toBe('t-A');
+    expect(listener.ledger[0]!.tokenId).toBe(T_A);
     expect(listener.ledger[0]!.transition).toBe('invalid→valid');
     expect(listener.ledger[0]!.overrideAppliedBy).toBe('op-A');
-    expect(listener.ledger[1]!.tokenId).toBe('t-B');
+    expect(listener.ledger[1]!.tokenId).toBe(T_B);
     expect(listener.ledger[1]!.transition).toBe('invalid→pending');
     expect(listener.ledger[1]!.overrideAppliedBy).toBe('op-B');
 

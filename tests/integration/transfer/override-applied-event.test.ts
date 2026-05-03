@@ -37,17 +37,19 @@ import {
   manifestEntryFor,
   proofFor,
   queueEntryFor,
+  tk,
 } from '../../unit/payments/transfer/import-inclusion-proof-fixtures';
 
 describe('§6.3 W31 — transfer:override-applied integration', () => {
   it('case 5 (single hard-failed entry) emits override-applied with invalid→valid', async () => {
     const h = buildImporterHarness();
+    const T_BAD = tk('t-bad');
     h.disposition.entries.set(
-      `${ADDR}.invalid.t-bad.${'aa'.repeat(32)}`,
-      invalidEntryFor({ tokenId: 't-bad', reason: 'oracle-rejected' }),
+      `${ADDR}.invalid.${T_BAD}.${'aa'.repeat(32)}`,
+      invalidEntryFor({ tokenId: T_BAD, reason: 'oracle-rejected' }),
     );
     h.manifest.entries.set(
-      `${ADDR}:t-bad`,
+      `${ADDR}:${T_BAD}`,
       manifestEntryFor({
         status: 'invalid',
         invalidReason: 'oracle-rejected',
@@ -56,7 +58,7 @@ describe('§6.3 W31 — transfer:override-applied integration', () => {
     );
     h.queue.entries.push(
       queueEntryFor({
-        tokenId: 't-bad',
+        tokenId: T_BAD,
         commitmentRequestId: 'rq-bad',
         status: 'hard-fail',
       }),
@@ -64,7 +66,7 @@ describe('§6.3 W31 — transfer:override-applied integration', () => {
 
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't-bad',
+      T_BAD,
       proofFor({ requestId: 'rq-bad' }),
       {
         allowInvalidOverride: true,
@@ -90,7 +92,7 @@ describe('§6.3 W31 — transfer:override-applied integration', () => {
 
     // Event payload matches the W31 spec.
     expect(events[0]!.data).toEqual({
-      tokenId: 't-bad',
+      tokenId: T_BAD,
       overrideAppliedAt: 1700000001000,
       overrideAppliedBy: 'op-pk-1',
       previousReason: 'oracle-rejected',
@@ -100,12 +102,13 @@ describe('§6.3 W31 — transfer:override-applied integration', () => {
 
   it('case 6 (K-1 re-queue / chain mode) emits override-applied with invalid→pending', async () => {
     const h = buildImporterHarness();
+    const T_CHAIN = tk('t-chain');
     h.disposition.entries.set(
-      `${ADDR}.invalid.t-chain.${'bb'.repeat(32)}`,
-      invalidEntryFor({ tokenId: 't-chain', reason: 'oracle-rejected' }),
+      `${ADDR}.invalid.${T_CHAIN}.${'bb'.repeat(32)}`,
+      invalidEntryFor({ tokenId: T_CHAIN, reason: 'oracle-rejected' }),
     );
     h.manifest.entries.set(
-      `${ADDR}:t-chain`,
+      `${ADDR}:${T_CHAIN}`,
       manifestEntryFor({
         status: 'invalid',
         invalidReason: 'oracle-rejected',
@@ -114,19 +117,19 @@ describe('§6.3 W31 — transfer:override-applied integration', () => {
     );
     h.queue.entries.push(
       queueEntryFor({
-        tokenId: 't-chain',
+        tokenId: T_CHAIN,
         commitmentRequestId: 'rq-c0',
         txIndex: 0,
         status: 'hard-fail',
       }),
       queueEntryFor({
-        tokenId: 't-chain',
+        tokenId: T_CHAIN,
         commitmentRequestId: 'rq-c1',
         txIndex: 1,
         status: 'hard-fail',
       }),
       queueEntryFor({
-        tokenId: 't-chain',
+        tokenId: T_CHAIN,
         commitmentRequestId: 'rq-c2',
         txIndex: 2,
         status: 'hard-fail',
@@ -135,7 +138,7 @@ describe('§6.3 W31 — transfer:override-applied integration', () => {
 
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't-chain',
+      T_CHAIN,
       proofFor({ requestId: 'rq-c0' }),
       { allowInvalidOverride: true, currentTime: 1700000002000 },
     );
@@ -153,7 +156,7 @@ describe('§6.3 W31 — transfer:override-applied integration', () => {
       previousReason: string;
       transition: string;
     };
-    expect(data.tokenId).toBe('t-chain');
+    expect(data.tokenId).toBe(T_CHAIN);
     expect(data.overrideAppliedAt).toBe(1700000002000);
     expect(data.transition).toBe('invalid→pending');
     // operatorPubkey was omitted in this call — must reflect undefined.
@@ -163,12 +166,13 @@ describe('§6.3 W31 — transfer:override-applied integration', () => {
 
   it('case 7 (no override flag) does NOT emit override-applied', async () => {
     const h = buildImporterHarness();
+    const T_BAD = tk('t-bad');
     h.disposition.entries.set(
-      `${ADDR}.invalid.t-bad.${'aa'.repeat(32)}`,
-      invalidEntryFor({ tokenId: 't-bad' }),
+      `${ADDR}.invalid.${T_BAD}.${'aa'.repeat(32)}`,
+      invalidEntryFor({ tokenId: T_BAD }),
     );
     h.manifest.entries.set(
-      `${ADDR}:t-bad`,
+      `${ADDR}:${T_BAD}`,
       manifestEntryFor({
         status: 'invalid',
         rootHashHex: 'aa'.repeat(32),
@@ -176,7 +180,7 @@ describe('§6.3 W31 — transfer:override-applied integration', () => {
     );
     h.queue.entries.push(
       queueEntryFor({
-        tokenId: 't-bad',
+        tokenId: T_BAD,
         commitmentRequestId: 'rq-bad',
         status: 'hard-fail',
       }),
@@ -184,7 +188,7 @@ describe('§6.3 W31 — transfer:override-applied integration', () => {
 
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't-bad',
+      T_BAD,
       proofFor({ requestId: 'rq-bad' }),
       // allowInvalidOverride OMITTED → defaults to false.
     );
@@ -200,12 +204,13 @@ describe('§6.3 W31 — transfer:override-applied integration', () => {
     // Even with the override flag set, a bad proof MUST NOT flip the
     // token. The event is only emitted on SUCCESSFUL override.
     const h = buildImporterHarness({ verifyResult: 'PATH_NOT_INCLUDED' });
+    const T_BAD = tk('t-bad');
     h.disposition.entries.set(
-      `${ADDR}.invalid.t-bad.${'aa'.repeat(32)}`,
-      invalidEntryFor({ tokenId: 't-bad' }),
+      `${ADDR}.invalid.${T_BAD}.${'aa'.repeat(32)}`,
+      invalidEntryFor({ tokenId: T_BAD }),
     );
     h.manifest.entries.set(
-      `${ADDR}:t-bad`,
+      `${ADDR}:${T_BAD}`,
       manifestEntryFor({
         status: 'invalid',
         rootHashHex: 'aa'.repeat(32),
@@ -214,7 +219,7 @@ describe('§6.3 W31 — transfer:override-applied integration', () => {
 
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't-bad',
+      T_BAD,
       proofFor({ requestId: 'rq-anything' }),
       { allowInvalidOverride: true },
     );
@@ -233,12 +238,13 @@ describe('§6.3 W31 — transfer:override-applied integration', () => {
     // twice). The PRODUCTION manifest mutation is idempotent; the
     // event is the call counter.
     const h = buildImporterHarness();
+    const T_BAD = tk('t-bad');
     h.disposition.entries.set(
-      `${ADDR}.invalid.t-bad.${'aa'.repeat(32)}`,
-      invalidEntryFor({ tokenId: 't-bad', reason: 'oracle-rejected' }),
+      `${ADDR}.invalid.${T_BAD}.${'aa'.repeat(32)}`,
+      invalidEntryFor({ tokenId: T_BAD, reason: 'oracle-rejected' }),
     );
     h.manifest.entries.set(
-      `${ADDR}:t-bad`,
+      `${ADDR}:${T_BAD}`,
       manifestEntryFor({
         status: 'invalid',
         invalidReason: 'oracle-rejected',
@@ -247,7 +253,7 @@ describe('§6.3 W31 — transfer:override-applied integration', () => {
     );
     h.queue.entries.push(
       queueEntryFor({
-        tokenId: 't-bad',
+        tokenId: T_BAD,
         commitmentRequestId: 'rq-bad',
         status: 'hard-fail',
       }),
@@ -255,7 +261,7 @@ describe('§6.3 W31 — transfer:override-applied integration', () => {
 
     const r1 = await h.importer.importInclusionProof(
       ADDR,
-      't-bad',
+      T_BAD,
       proofFor({ requestId: 'rq-bad' }),
       {
         allowInvalidOverride: true,
@@ -267,7 +273,7 @@ describe('§6.3 W31 — transfer:override-applied integration', () => {
 
     const r2 = await h.importer.importInclusionProof(
       ADDR,
-      't-bad',
+      T_BAD,
       proofFor({ requestId: 'rq-bad' }),
       {
         allowInvalidOverride: true,

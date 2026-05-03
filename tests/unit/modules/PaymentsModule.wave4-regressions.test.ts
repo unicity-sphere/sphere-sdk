@@ -95,13 +95,14 @@ async function buildRealisticTransferTxJson(): Promise<{
   /** Canonical authenticator JSON (for §6.3 byte-equality). */
   expectedAuthenticatorJson: string;
 }> {
-  // Sender keypair.
+  // Sender keypair. Use canonical createFromSecret factory (P4 conformance:
+  // raw `new SigningService(...)` is forbidden outside the ignorelist).
   const senderPrivKey = SigningService.generatePrivateKey();
-  const senderSigningService = new SigningService(senderPrivKey);
+  const senderSigningService = await SigningService.createFromSecret(senderPrivKey);
 
   // Recipient keypair.
   const recipientPrivKey = SigningService.generatePrivateKey();
-  const recipientSigningService = new SigningService(recipientPrivKey);
+  const recipientSigningService = await SigningService.createFromSecret(recipientPrivKey);
 
   // Token IDs / types — synthesize via fromJSON with canonical hex.
   const tokenId = TokenId.fromJSON('aa'.repeat(32));

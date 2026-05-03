@@ -35,6 +35,7 @@ import {
   manifestEntryFor,
   proofFor,
   queueEntryFor,
+  tk,
 } from '../../unit/payments/transfer/import-inclusion-proof-fixtures';
 
 // =============================================================================
@@ -44,7 +45,7 @@ import {
 describe('§11.2 — chain-mode merge: backup-import grafts mid-resolution', () => {
   it('K=3 outstanding entries → import 1 → pending-still + 1 graft', async () => {
     const h = buildImporterHarness();
-    const tokenId = 't-chain';
+    const tokenId = tk('t-chain');
 
     // Manifest: pending (active pool). The chain has 3 outstanding
     // queue entries.
@@ -80,7 +81,7 @@ describe('§11.2 — chain-mode merge: backup-import grafts mid-resolution', () 
 
   it('importing proofs for all 3 entries → final import returns pending→valid', async () => {
     const h = buildImporterHarness();
-    const tokenId = 't-chain';
+    const tokenId = tk('t-chain');
     h.manifest.entries.set(
       `${ADDR}:${tokenId}`,
       manifestEntryFor({ status: 'pending' }),
@@ -138,7 +139,7 @@ describe('§11.2 — chain-mode merge: backup-import grafts mid-resolution', () 
 
   it('proof for unknown requestId → requestid-mismatch (no graft, no state mutation)', async () => {
     const h = buildImporterHarness();
-    const tokenId = 't-chain';
+    const tokenId = tk('t-chain');
     h.manifest.entries.set(
       `${ADDR}:${tokenId}`,
       manifestEntryFor({ status: 'pending' }),
@@ -167,7 +168,7 @@ describe('§11.2 — chain-mode merge: backup-import grafts mid-resolution', () 
     // window after the graft completes but before queue removal.
     // Importing the same proof again in that window is a no-op.
     const h = buildImporterHarness();
-    const tokenId = 't-chain';
+    const tokenId = tk('t-chain');
     h.manifest.entries.set(
       `${ADDR}:${tokenId}`,
       manifestEntryFor({ status: 'pending' }),
