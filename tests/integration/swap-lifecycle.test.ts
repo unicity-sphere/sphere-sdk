@@ -1087,6 +1087,10 @@ describe('Swap Lifecycle Integration Tests', () => {
       return prevStatus ? prevStatus(invoiceId) : null;
     });
 
+    // Snapshot swap:failed event count before — assert exactly-one emission
+    // (no double-fire from direct-mutation + a downstream listener; review W4).
+    const failedEventsBefore = findEvents(ctx.partyA.events, 'swap:failed').length;
+
     // verifyPayout must return false (settlement halted) AND transition the swap
     // to 'failed' with an OVER_COVERAGE error.
     const verified = await ctx.partyA.module.verifyPayout(swapId);
@@ -1098,8 +1102,9 @@ describe('Swap Lifecycle Integration Tests', () => {
     expect((finalStatus as { error?: string }).error).toMatch(new RegExp(`expected=${expectedAmount}`));
     expect((finalStatus as { error?: string }).error).toMatch(new RegExp(`surplus=${surplus}`));
 
-    // Should have emitted swap:failed (not swap:completed with payoutVerified=false).
-    expect(findEvent(ctx.partyA.events, 'swap:failed')).toBeDefined();
+    // Exactly one swap:failed emission for this call.
+    const failedEventsAfter = findEvents(ctx.partyA.events, 'swap:failed').length;
+    expect(failedEventsAfter - failedEventsBefore).toBe(1);
   });
 
   // ---------------------------------------------------------------------------
@@ -1140,6 +1145,37 @@ describe('Swap Lifecycle Integration Tests', () => {
       manifest.party_b_currency_to_change,
       manifest.party_b_value_to_change,
     );
+
+    // Override status mock to assert the exact-equality boundary
+    // (review feedback W3): `netCoveredAmount === expectedAmount` exactly,
+    // not "≥ expectedAmount". A future regression that accidentally tightened
+    // the check (e.g. to `> expectedAmount`) would slip past the original
+    // happy-path assertion but be caught here because the test pins the
+    // exact value path.
+    const expectedAmount = manifest.party_b_value_to_change;
+    const payoutInvoiceId = partyAAfterDeposit.payoutInvoiceId!;
+    const prevStatus = ctx.partyA.accounting.getInvoiceStatus.getMockImplementation();
+    ctx.partyA.accounting.getInvoiceStatus.mockImplementation((invoiceId: string) => {
+      if (invoiceId === payoutInvoiceId) {
+        return {
+          invoiceId,
+          state: 'COVERED',
+          targets: [{
+            coinAssets: [{
+              coin: [manifest.party_b_currency_to_change, expectedAmount],
+              netCoveredAmount: expectedAmount, // EXACT
+              isCovered: true,
+              surplusAmount: '0',
+            }],
+          }],
+          totalForward: { [manifest.party_b_currency_to_change]: expectedAmount },
+          totalBack: {},
+          allConfirmed: true,
+          lastActivityAt: Date.now(),
+        };
+      }
+      return prevStatus ? prevStatus(invoiceId) : null;
+    });
 
     const verified = await ctx.partyA.module.verifyPayout(swapId);
     expect(verified).toBe(true);

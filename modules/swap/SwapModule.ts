@@ -1751,7 +1751,18 @@ export class SwapModule {
         try {
           await this.persistSwap(swap);
         } catch (persistErr) {
-          // Storage failed — roll back so next load retries fraud detection.
+          // Storage failure rollback. Note the partial-failure window:
+          // `persistSwap` writes the swap record FIRST then the index. If the
+          // record write succeeded and only the index write failed, the on-disk
+          // record already says `'failed'`; rolling back in-memory creates a
+          // brief in-memory/disk skew until either the index write retries on
+          // next save or the next load picks up the on-disk `'failed'`. The
+          // "next load retries fraud detection" story holds when the
+          // record-write itself failed (the most common case for ENOSPC /
+          // permissions / disk-quota errors); for partial-write failures,
+          // the on-disk state is the source of truth on next load and our
+          // in-memory rollback only restores responsiveness for the current
+          // session.
           swap.progress = prevProgress;
           (swap as { payoutVerified?: boolean }).payoutVerified = prevPayoutVerified;
           (swap as { error?: string }).error = prevError;
@@ -1842,8 +1853,24 @@ export class SwapModule {
     // mix that subsequent state transitions would reject) or hang for the trader's
     // verifyPayout retry budget while `validate()` repeatedly rejects an unrelated
     // wallet token, producing a 20-min opaque hang instead of a clear failure.
-    const netCoveredAmount = BigInt(targetStatus.coinAssets[0].netCoveredAmount);
-    const expectedAmountBigInt = BigInt(expectedAmount);
+    // Parse defensively: a malformed `netCoveredAmount` (non-numeric, undefined,
+    // or NaN-like) from a buggy/compromised accounting backend would synchronously
+    // throw `TypeError`/`SyntaxError` from BigInt(). That escapes the gate and is
+    // swallowed by the auto-verify catch, surfacing as an opaque error rather than
+    // a structured SphereError. Treat parse failures as a settlement-layer fault —
+    // consistent with the rest of the over-coverage rationale below.
+    let netCoveredAmount: bigint;
+    let expectedAmountBigInt: bigint;
+    try {
+      netCoveredAmount = BigInt(targetStatus.coinAssets[0].netCoveredAmount);
+      expectedAmountBigInt = BigInt(expectedAmount);
+    } catch (parseErr) {
+      return failPayout(
+        `MALFORMED_AMOUNT: failed to parse coverage amounts (netCoveredAmount=${
+          targetStatus.coinAssets[0].netCoveredAmount
+        }, expectedAmount=${expectedAmount}): ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`,
+      );
+    }
     if (netCoveredAmount < expectedAmountBigInt) {
       // Not yet fully covered — keep retrying (transient).
       return returnFalse();
