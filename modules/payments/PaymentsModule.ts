@@ -2500,7 +2500,7 @@ export class PaymentsModule {
           const requestIdBytes = commitment.requestId;
           const requestIdHex = requestIdBytes instanceof Uint8Array
             ? Array.from(requestIdBytes).map(b => b.toString(16).padStart(2, '0')).join('')
-            : String(requestIdBytes);
+            : (typeof (requestIdBytes as { toJSON?: () => string }).toJSON === "function" ? (requestIdBytes as { toJSON: () => string }).toJSON() : String(requestIdBytes));
 
           result.tokenTransfers.push({
             sourceTokenId: token.id,
@@ -2672,7 +2672,7 @@ export class PaymentsModule {
           const requestIdBytes = commitment.requestId;
           const requestIdHex = requestIdBytes instanceof Uint8Array
             ? Array.from(requestIdBytes).map(b => b.toString(16).padStart(2, '0')).join('')
-            : String(requestIdBytes);
+            : (typeof (requestIdBytes as { toJSON?: () => string }).toJSON === "function" ? (requestIdBytes as { toJSON: () => string }).toJSON() : String(requestIdBytes));
 
           result.tokenTransfers.push({
             sourceTokenId: token.id,
@@ -3234,7 +3234,7 @@ export class PaymentsModule {
       const requestIdBytes = commitment.requestId;
       const requestIdHex = requestIdBytes instanceof Uint8Array
         ? Array.from(requestIdBytes).map(b => b.toString(16).padStart(2, '0')).join('')
-        : String(requestIdBytes);
+        : (typeof (requestIdBytes as { toJSON?: () => string }).toJSON === "function" ? (requestIdBytes as { toJSON: () => string }).toJSON() : String(requestIdBytes));
 
       if (!deferPersistence) {
         // Submit commitment to aggregator immediately (standalone path)
@@ -7037,7 +7037,7 @@ export class PaymentsModule {
               ? Array.from(requestIdBytes)
                   .map((b) => b.toString(16).padStart(2, '0'))
                   .join('')
-              : String(requestIdBytes);
+              : (typeof (requestIdBytes as { toJSON?: () => string }).toJSON === "function" ? (requestIdBytes as { toJSON: () => string }).toJSON() : String(requestIdBytes));
           out.push({
             sourceTokenId: token.id,
             method: 'direct',
@@ -7263,7 +7263,7 @@ export class PaymentsModule {
               ? Array.from(requestIdBytes)
                   .map((b) => b.toString(16).padStart(2, '0'))
                   .join('')
-              : String(requestIdBytes);
+              : (typeof (requestIdBytes as { toJSON?: () => string }).toJSON === "function" ? (requestIdBytes as { toJSON: () => string }).toJSON() : String(requestIdBytes));
 
           // Phase 9.6.D — store per-requestId context for the finalization
           // worker resolver. `transactionHash` is the commitment's requestId
@@ -7580,7 +7580,7 @@ export class PaymentsModule {
               ? Array.from(requestIdBytes)
                   .map((b) => b.toString(16).padStart(2, '0'))
                   .join('')
-              : String(requestIdBytes);
+              : (typeof (requestIdBytes as { toJSON?: () => string }).toJSON === "function" ? (requestIdBytes as { toJSON: () => string }).toJSON() : String(requestIdBytes));
 
           // Class discrimination per C11 — read sdkData's coinData.
           const sourceTokenLike = {
