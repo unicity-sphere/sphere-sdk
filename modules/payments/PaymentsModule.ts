@@ -117,7 +117,24 @@ import {
 // layer (Sphere) wires an instance via `installSendingRecoveryWorker()`;
 // the module starts/stops it gated on `features.recoveryWorker`.
 import { SendingRecoveryWorker } from './transfer/sending-recovery-worker';
+// Phase 9.6.D — sender-side §6.1 finalization worker. Auto-installed in
+// `initialize()` when `features.finalizationWorker` is true (default-ON
+// when `senderUxf` is true). Consumer-installed workers (via
+// `installFinalizationWorkerSender()`) win over the auto-installed one.
+import {
+  FinalizationWorkerSender,
+  CountingSemaphore,
+  type FinalizationAggregatorClient,
+  type FinalizationOutboxWriter,
+  type RequestContextResolver,
+  type RequestContext,
+  type SubmitOutcome,
+  type PollOutcome,
+} from './transfer/finalization-worker-sender';
+import { ManifestCas, type MinimalManifestStorage } from '../../profile/manifest-cas';
+import { contentHash, type ContentHash } from '../../uxf/types';
 import { isLegacyTokenTransferPayload } from '../../types/uxf-transfer';
+import type { UxfTransferOutboxEntry } from '../../types/uxf-outbox';
 import {
   resolveSenderInfoViaBinding,
   type ReresolvedNametagSource,
@@ -869,6 +886,18 @@ export interface UxfTransferFeatures {
    */
   readonly recoveryWorker?: boolean;
   /**
+   * Phase 9.6.D — when `true` (default when `senderUxf` is on),
+   * auto-install and start a {@link FinalizationWorkerSender} in
+   * {@link PaymentsModule.initialize} so instant-mode sends drive the
+   * §6.1 finalization cycle and emit `transfer:confirmed` once the
+   * aggregator anchors the commitment. Set `false` to suppress the
+   * auto-install (e.g. for unit tests that mock the aggregator or do
+   * not need `transfer:confirmed`). Consumer-installed workers (via
+   * {@link PaymentsModule.installFinalizationWorkerSender}) win over
+   * the auto-installed one and are unaffected by this flag.
+   */
+  readonly finalizationWorker?: boolean;
+  /**
    * T.3.E — when `true` (default), route incoming UXF v1.0 bundles
    * (`kind` of `'uxf-car'` or `'uxf-cid'`) through the
    * {@link IngestWorkerPool} (§5.0 N parallel workers + W7 per-tokenId
@@ -1187,6 +1216,12 @@ export class PaymentsModule {
       // them idempotently. The worker still no-ops until a republish hook
       // is wired by the bootstrap layer.
       recoveryWorker: config?.features?.recoveryWorker ?? true,
+      // Phase 9.6.D — sender-side §6.1 finalization worker. Default-ON
+      // when senderUxf is on: drives instant-mode sends through the full
+      // submit/poll cycle so `transfer:confirmed` fires once the
+      // aggregator anchors the commitment. Flip `false` to suppress the
+      // auto-install (e.g. timer-sensitive unit tests).
+      finalizationWorker: config?.features?.finalizationWorker ?? true,
     });
 
     // Initialize L1 sub-module by default (L1PaymentsModule has default electrumUrl).
@@ -1637,6 +1672,53 @@ export class PaymentsModule {
         'Default IngestWorkerPool auto-installed (recipientUxf default-on)',
       );
     }
+
+    // Phase 9.6.D — auto-install the sender-side finalization worker when
+    // `senderUxf` is on AND `finalizationWorker` is on AND no consumer has
+    // already installed one via `installFinalizationWorkerSender()`.
+    //
+    // The auto-installed worker uses lightweight in-memory adapters for the
+    // pool/manifest/tombstone/queue 4-step write order (no OrbitDB required).
+    // These in-memory writes are sufficient to drive the §6.1 cycle to
+    // completion and emit `transfer:confirmed`. The full OrbitDB-backed
+    // adapters can be injected by the bootstrap layer (Sphere) via
+    // `installFinalizationWorkerSender()` when it has the full profile stack.
+    //
+    // Consumer-installed workers (installFinalizationWorkerSender()) win:
+    // the `!this.finalizationWorkerSender` check preserves that contract.
+    if (
+      this.features.senderUxf &&
+      this.features.finalizationWorker &&
+      !this.finalizationWorkerSender
+    ) {
+      const aggregatorClient = this.deps!.oracle.getAggregatorClient?.();
+      if (aggregatorClient === null || aggregatorClient === undefined) {
+        // Oracle stub does not expose an aggregator client; skip auto-install.
+        // Tests with mocked oracles (no getAggregatorClient) take this path.
+        logger.debug(
+          'Payments',
+          'FinalizationWorkerSender auto-install skipped: oracle has no getAggregatorClient()',
+        );
+      } else {
+        const directAddr = this.deps!.identity.directAddress;
+        const workerAddressId =
+          typeof directAddr === 'string' && directAddr.length > 0
+            ? computeAddressId(directAddr)
+            : this.deps!.identity.chainPubkey;
+        this.finalizationWorkerSender = buildDefaultFinalizationWorkerSender({
+          addressId: workerAddressId,
+          oracle: this.deps!.oracle,
+          senderOutboxMap: this._senderOutboxMap,
+          senderRequestContextMap: this._senderRequestContextMap,
+          emit: (type, data) => this.deps!.emitEvent(type, data),
+        });
+        this.finalizationWorkerSender.start();
+        logger.debug(
+          'Payments',
+          'Default FinalizationWorkerSender auto-installed (senderUxf default-on)',
+        );
+      }
+    }
   }
 
   /**
@@ -1811,6 +1893,27 @@ export class PaymentsModule {
   private revalidateCascadedRunner: RevalidateCascadedRunner | null = null;
   /** @internal — set by `installSendingRecoveryWorker()`. Phase 8 steelman. */
   private sendingRecoveryWorker: SendingRecoveryWorker | null = null;
+  /** @internal — auto-installed or set by `installFinalizationWorkerSender()`. Phase 9.6.D. */
+  private finalizationWorkerSender: FinalizationWorkerSender | null = null;
+
+  /**
+   * In-memory outbox for the sender-side finalization worker.
+   * Stores `UxfTransferOutboxEntry` objects by outbox id.
+   * The instant-sender writes here at `delivered-instant` stage;
+   * the worker reads + updates via the injected `FinalizationOutboxWriter`.
+   *
+   * @internal
+   */
+  private readonly _senderOutboxMap: Map<string, UxfTransferOutboxEntry> = new Map();
+
+  /**
+   * Per-requestId context map for the sender-side finalization worker resolver.
+   * Populated by `dispatchUxfInstantSend`'s `commitSources` callback
+   * with `(requestIdHex → RequestContext)`.
+   *
+   * @internal
+   */
+  private readonly _senderRequestContextMap: Map<string, RequestContext> = new Map();
 
   /**
    * Install the operator inclusion-proof importer (T.5.D, §6.3 escape
@@ -1862,6 +1965,33 @@ export class PaymentsModule {
     // the new worker immediately. Otherwise, the next initialize()
     // call will start it (see initialize() body).
     if (this.deps !== null && this.features.recoveryWorker) {
+      worker.start();
+    }
+  }
+
+  /**
+   * Phase 9.6.D — install the sender-side finalization worker.
+   *
+   * Idempotent: a second call stops the previous worker (fire-and-
+   * forget) and swaps in the new instance. If the module is already
+   * initialized AND `features.senderUxf` is true, the new worker is
+   * started immediately.
+   *
+   * Consumer-installed workers WIN over the auto-installed default:
+   * call this BEFORE `initialize()` to prevent the auto-install, OR
+   * call it AFTER `initialize()` to replace the auto-installed instance
+   * (the latter triggers an immediate start if the gate is open).
+   *
+   * The bootstrap layer (Sphere) can inject a fully production-wired
+   * worker backed by the OrbitDB pool/manifest/tombstone/queue adapters.
+   * Tests inject a fully-mocked worker.
+   */
+  installFinalizationWorkerSender(worker: FinalizationWorkerSender): void {
+    if (this.finalizationWorkerSender !== null) {
+      void this.finalizationWorkerSender.stop().catch(() => undefined);
+    }
+    this.finalizationWorkerSender = worker;
+    if (this.deps !== null && this.features.senderUxf) {
       worker.start();
     }
   }
@@ -2021,6 +2151,16 @@ export class PaymentsModule {
       void this.sendingRecoveryWorker.stop().catch(() => undefined);
       this.sendingRecoveryWorker = null;
     }
+
+    // Phase 9.6.D — stop the sender-side finalization worker.
+    // Fire-and-forget; `stop()` drains in-flight polls and never throws.
+    if (this.finalizationWorkerSender) {
+      void this.finalizationWorkerSender.stop().catch(() => undefined);
+      this.finalizationWorkerSender = null;
+    }
+    // Clear in-memory outbox and context maps (no persistent side-effects).
+    this._senderOutboxMap.clear();
+    this._senderRequestContextMap.clear();
   }
 
   // ===========================================================================
@@ -7125,6 +7265,27 @@ export class PaymentsModule {
                   .join('')
               : String(requestIdBytes);
 
+          // Phase 9.6.D — store per-requestId context for the finalization
+          // worker resolver. `transactionHash` is the commitment's requestId
+          // DataHash imprint hex (68 chars = 2-byte algorithm prefix +
+          // 32-byte digest), which the aggregator proof will also carry in its
+          // `transactionHash` field — enabling race-lost detection at §6.1.
+          // `authenticator` is the authenticator signature hex, used by §6.3
+          // same-value vs different-value resolution.
+          if (this.finalizationWorkerSender !== null) {
+            const txHash =
+              typeof (requestIdBytes as { toJSON?: () => string }).toJSON === 'function'
+                ? (requestIdBytes as { toJSON: () => string }).toJSON()
+                : requestIdHex;
+            const commitJson = (commitment as { toJSON?: () => { authenticator?: { signature?: string } } }).toJSON?.();
+            const authenticatorHex = commitJson?.authenticator?.signature ?? '';
+            this._senderRequestContextMap.set(requestIdHex, {
+              transactionHash: txHash,
+              authenticator: authenticatorHex,
+              nextEntryRest: { status: 'valid' as const },
+            });
+          }
+
           // Class discrimination per C11. Read sdkData's coinData to
           // route NFTs (whole-token transfer; no splitParent) vs
           // coins (splitParent set on the child).
@@ -7190,14 +7351,39 @@ export class PaymentsModule {
         // No-op for T.5.A — selectSources above already marks sources
         // `transferring` in the local cache.
       },
-      // outbox — T.5.A leaves the writer unwired in the dispatcher.
-      // Production wiring lands in the next wave once the per-address
-      // OutboxWriter integration ships. Tests inject the recorder.
-      outbox: undefined,
-      // onTriggerFinalization — T.5.B will land the worker. The
-      // dispatcher injects no-op for now; the orchestrator swallows
-      // any throw, so the omission is safe.
-      onTriggerFinalization: undefined,
+      // Phase 9.6.D — wire the in-memory outbox so the instant-sender
+      // persists `delivered-instant` entries the finalization worker can
+      // read via its injected FinalizationOutboxWriter. When no worker is
+      // installed, fall through to `undefined` (original T.5.A behaviour).
+      outbox: this.finalizationWorkerSender !== null
+        ? {
+            write: async (entry) => {
+              const existing = this._senderOutboxMap.get(entry.id);
+              this._senderOutboxMap.set(entry.id, {
+                ...entry,
+                _schemaVersion: 'uxf-1' as const,
+                lamport: (existing?.lamport ?? 0) + 1,
+              });
+            },
+          }
+        : undefined,
+      // Phase 9.6.D — trigger finalization after `delivered-instant`.
+      // Fire-and-forget: any throw from processOne is logged, not
+      // propagated — the publish has already completed and the outbox
+      // entry holds the canonical state.
+      onTriggerFinalization: this.finalizationWorkerSender !== null
+        ? async ({ outboxId }) => {
+            const entry = this._senderOutboxMap.get(outboxId);
+            if (entry !== undefined && this.finalizationWorkerSender !== null) {
+              void this.finalizationWorkerSender.processOne(entry).catch((err) => {
+                logger.debug(
+                  'Payments',
+                  `FinalizationWorkerSender.processOne error for outbox ${outboxId}: ${err}`,
+                );
+              });
+            }
+          }
+        : undefined,
     };
 
     return sendInstantUxf(originalRequest, recipient, deps);
@@ -8703,6 +8889,202 @@ export class PaymentsModule {
       throw new SphereError('PaymentsModule not initialized', 'NOT_INITIALIZED');
     }
   }
+}
+
+// =============================================================================
+// Phase 9.6.D — Default FinalizationWorkerSender factory
+// =============================================================================
+
+/**
+ * Build the default auto-installed {@link FinalizationWorkerSender} for
+ * {@link PaymentsModule.initialize}. Uses lightweight in-memory adapters
+ * for the pool/manifest/tombstone/queue 4-step write order (no OrbitDB
+ * required). Sufficient for §6.1 cycle completion and `transfer:confirmed`
+ * emission.
+ *
+ * @internal — exported only for unit-test access.
+ */
+export function buildDefaultFinalizationWorkerSender(opts: {
+  readonly addressId: string;
+  readonly oracle: import('../../oracle').OracleProvider;
+  readonly senderOutboxMap: Map<string, UxfTransferOutboxEntry>;
+  readonly senderRequestContextMap: Map<string, RequestContext>;
+  readonly emit: <T extends import('../../types').SphereEventType>(
+    type: T,
+    data: import('../../types').SphereEventMap[T],
+  ) => void;
+}): FinalizationWorkerSender {
+  const { addressId, oracle, senderOutboxMap, senderRequestContextMap, emit } = opts;
+
+  // In-memory outbox writer — thin wrapper over the module's _senderOutboxMap.
+  const outbox: FinalizationOutboxWriter = {
+    async readOne(id: string): Promise<UxfTransferOutboxEntry | null> {
+      return senderOutboxMap.get(id) ?? null;
+    },
+    async update(
+      id: string,
+      mutator: (prev: UxfTransferOutboxEntry) => UxfTransferOutboxEntry,
+    ): Promise<UxfTransferOutboxEntry> {
+      const existing = senderOutboxMap.get(id);
+      if (existing === null || existing === undefined) {
+        throw new SphereError(
+          `FinalizationOutboxWriter.update: no entry at id "${id}"`,
+          'VALIDATION_ERROR',
+        );
+      }
+      const next = mutator(existing);
+      // Bump Lamport on every write so the worker's W26 state is consistent.
+      const bumped: UxfTransferOutboxEntry = { ...next, lamport: (existing.lamport ?? 0) + 1 };
+      senderOutboxMap.set(id, bumped);
+      return bumped;
+    },
+  };
+
+  // In-memory resolver — returns per-requestId context stored at commit time.
+  const resolver: RequestContextResolver = {
+    async resolve(input) {
+      return senderRequestContextMap.get(input.requestId) ?? null;
+    },
+  };
+
+  // In-memory pool adapter — no-op writes; sufficient for transfer:confirmed.
+  const proofAttached = new Set<string>();
+  const pool = {
+    async isProofAttached(tokenId: string, reqId: string): Promise<boolean> {
+      return proofAttached.has(`${tokenId}:${reqId}`);
+    },
+    async attachProof(tokenId: string, reqId: string): Promise<void> {
+      proofAttached.add(`${tokenId}:${reqId}`);
+    },
+  };
+
+  // In-memory pool read adapter.
+  const poolProofs = new Map<string, import('./transfer/finalization-worker-base').AnchoredProofDescriptor>();
+  const poolRead = {
+    async getAttachedProof(
+      tokenId: string,
+      reqId: string,
+    ): Promise<import('./transfer/finalization-worker-base').AnchoredProofDescriptor | null> {
+      return poolProofs.get(`${tokenId}:${reqId}`) ?? null;
+    },
+  };
+
+  // In-memory manifest storage — needed by ManifestCas.
+  const manifestEntries = new Map<string, import('../../profile/token-manifest').TokenManifestEntry>();
+  const manifestStorage: MinimalManifestStorage = {
+    async readEntry(addr: string, tokenId: string) {
+      return manifestEntries.get(`${addr}:${tokenId}`);
+    },
+    async writeEntry(addr: string, tokenId: string, entry: import('../../profile/token-manifest').TokenManifestEntry) {
+      manifestEntries.set(`${addr}:${tokenId}`, entry);
+    },
+  };
+  const manifestCas = new ManifestCas(manifestStorage);
+
+  // In-memory tombstone adapter.
+  const tombstoneSet = new Set<string>();
+  const tombstones = {
+    async hasTombstone(tokenId: string, cid: ContentHash): Promise<boolean> {
+      return tombstoneSet.has(`${tokenId}:${cid}`);
+    },
+    async insertTombstone(tokenId: string, cid: ContentHash): Promise<void> {
+      tombstoneSet.add(`${tokenId}:${cid}`);
+    },
+  };
+
+  // In-memory finalization queue adapter.
+  const queueEntries = new Set<string>();
+  const queue = {
+    async hasEntry(addr: string, reqId: string): Promise<boolean> {
+      return queueEntries.has(`${addr}:${reqId}`);
+    },
+    async removeEntry(addr: string, reqId: string): Promise<void> {
+      queueEntries.delete(`${addr}:${reqId}`);
+    },
+  };
+
+  // Aggregator adapter — submit returns REQUEST_ID_EXISTS (already submitted
+  // by commitSources); poll delegates to oracle.getProof(requestId).
+  const aggregatorClient: FinalizationAggregatorClient = {
+    async submit(_input): Promise<SubmitOutcome> {
+      // The commitment was already submitted in commitSources. Return
+      // REQUEST_ID_EXISTS so the cycle proceeds straight to polling.
+      return { kind: 'REQUEST_ID_EXISTS' };
+    },
+    async poll(input): Promise<PollOutcome> {
+      try {
+        const proof = await oracle.getProof(input.requestId);
+        if (proof === null || proof === undefined) {
+          // Proof not yet available — retry next poll iteration.
+          return { kind: 'TRANSIENT' };
+        }
+        // Build AnchoredProofDescriptor from the oracle's InclusionProof.
+        // transactionHash: use the requestId itself (the aggregator key).
+        // authenticator: use requestId as a proxy (§6.3 same-value check).
+        // roundNumber: from the oracle proof.
+        const descriptor: import('./transfer/finalization-worker-base').AnchoredProofDescriptor = {
+          transactionHash: proof.requestId,
+          authenticator: proof.requestId,
+          roundNumber: proof.roundNumber,
+          proof: proof.proof,
+        };
+        // Store in poolRead so §6.3 most-recent-proof check can compare.
+        poolProofs.set(`${input.tokenId}:${input.requestId}`, descriptor);
+        // newCid: use a stable placeholder derived from requestId.
+        // The in-memory manifest/tombstone/queue adapters don't care about the
+        // actual CID content; they just key on (addr, tokenId).
+        const newCid = contentHash(
+          (input.requestId.replace(/[^0-9a-f]/gi, '').padStart(64, '0')).slice(0, 64),
+        );
+        return { kind: 'OK', proof: descriptor, newCid };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return { kind: 'TRANSIENT', error: `oracle.getProof threw: ${message}` };
+      }
+    },
+  };
+
+  // Per-token semaphore factory — each tokenId gets its own semaphore.
+  const perTokenSemaphores = new Map<string, CountingSemaphore>();
+  const getPerTokenSemaphore = (tokenId: string): CountingSemaphore => {
+    let sem = perTokenSemaphores.get(tokenId);
+    if (sem === undefined) {
+      sem = new CountingSemaphore(4); // MAX_CONCURRENT_POLLS_PER_TOKEN
+      perTokenSemaphores.set(tokenId, sem);
+    }
+    return sem;
+  };
+
+  // Per-token mutex — shared for all requestIds within the same address.
+  const perTokenMutex = new PerTokenMutex();
+
+  return new FinalizationWorkerSender({
+    addressId,
+    outbox,
+    aggregator: aggregatorClient,
+    resolver,
+    pool,
+    poolRead,
+    manifestCas,
+    tombstones,
+    queue,
+    getPerTokenSemaphore,
+    perTokenMutex,
+    emit,
+    now: () => Date.now(),
+    sleep: (ms: number, signal?: AbortSignal) =>
+      new Promise<void>((resolve, reject) => {
+        if (signal?.aborted) {
+          reject(new Error('aborted'));
+          return;
+        }
+        const timer = setTimeout(resolve, ms);
+        signal?.addEventListener('abort', () => {
+          clearTimeout(timer);
+          reject(new Error('aborted'));
+        });
+      }),
+  });
 }
 
 // =============================================================================
