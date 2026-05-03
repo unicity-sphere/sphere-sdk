@@ -68,6 +68,7 @@ import type {
   ManifestAuxiliary,
   ManifestSignatures,
 } from './types.js';
+import type { InvoiceStatus } from '../accounting/types.js';
 
 // Logger tag
 const LOG_TAG = 'Swap';
@@ -1679,18 +1680,11 @@ export class SwapModule {
       return returnFalse();
     }
 
-    // Get invoice status for coverage check
-    const status = await deps.accounting.getInvoiceStatus(swap.payoutInvoiceId) as {
-      state: string;
-      targets: Array<{
-        coinAssets: Array<{
-          coin: [string, string];
-          netCoveredAmount: string;
-          isCovered: boolean;
-          surplusAmount?: string;
-        }>;
-      }>;
-    };
+    // Get invoice status for coverage check. Use the canonical `InvoiceStatus`
+    // type from accounting/types.ts rather than an inline structural cast —
+    // keeps this consumer in lockstep with upstream field changes (e.g. the
+    // `surplusAmount` field is required, not optional, per the canonical type).
+    const status = (await deps.accounting.getInvoiceStatus(swap.payoutInvoiceId)) as InvoiceStatus;
 
     // Determine expected currency and amount based on our role
     const myDirectAddress = deps.identity.directAddress;
@@ -1739,7 +1733,15 @@ export class SwapModule {
         swap.updatedAt = Date.now();
         this.clearLocalTimer(swap.swapId);
         this.terminalSwapIds.add(swap.swapId);
-        const entryIdx = this._storedTerminalEntries.length;
+        // Append our terminal-entry marker. We deliberately DO NOT capture a
+        // positional index here for rollback — `_storedTerminalEntries` is
+        // shared across all swaps in this module, and a concurrent swap's
+        // own `transitionProgress(*, terminal)` can append to this same array
+        // during the `await persistSwap()` below. A `splice(entryIdx, 1)`
+        // rollback would then remove the WRONG entry, silently corrupting an
+        // unrelated swap's terminal record. Roll back by `(swapId, progress)`
+        // identity instead — uniquely identifies our marker regardless of
+        // intervening appends.
         this._storedTerminalEntries.push({
           swapId: swap.swapId,
           progress: 'failed',
@@ -1755,7 +1757,17 @@ export class SwapModule {
           (swap as { error?: string }).error = prevError;
           swap.updatedAt = prevUpdatedAt;
           this.terminalSwapIds.delete(swap.swapId);
-          this._storedTerminalEntries.splice(entryIdx, 1);
+          // Remove BY IDENTITY (swapId + progress), not positional index, so a
+          // concurrent swap's terminal entry that landed during the await is
+          // not accidentally evicted. Iterate from the end since our marker
+          // was the most recent push for this swap.
+          for (let i = this._storedTerminalEntries.length - 1; i >= 0; i--) {
+            const entry = this._storedTerminalEntries[i]!;
+            if (entry.swapId === swap.swapId && entry.progress === 'failed') {
+              this._storedTerminalEntries.splice(i, 1);
+              break;
+            }
+          }
           logger.warn(LOG_TAG, `failPayout: persistSwap failed for ${swapId}; fraud detection will retry on next load:`, persistErr);
           throw persistErr;
         }
