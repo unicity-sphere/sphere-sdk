@@ -821,4 +821,163 @@ describe('PaymentsModule — default IngestWorkerPool auto-install (Phase 9.5.E)
       expect(token!.status).toBe('confirmed');
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // 5. Multi-token bundle: both claimed tokens processed (S3 regression)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Regression guard for the S3 multi-coin receive failure (Phase 9.6.E).
+   *
+   * Root cause: IngestWorkerPool.processBundle iterates `claimedTokens`
+   * sequentially and calls processToken for EACH. The default processToken
+   * closure must process all N claimed tokens — not short-circuit after the
+   * first one. This test feeds a two-token bundle (TOKEN_ID_A + TOKEN_ID_B,
+   * both claimed) and verifies:
+   *   - transfer:incoming is emitted TWICE (once per token)
+   *   - both tokens land in getTokens()
+   */
+  describe('multi-token bundle: both claimed tokens are processed (S3 regression)', () => {
+    const TOKEN_ID_B = 'bb00000000000000000000000000000000000000000000000000000000000002';
+    const COIN_ID_B = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
+
+    /** Build a VerifiedBundle with TWO claimed tokens: TOKEN_ID_A (COIN_ID_HEX) and TOKEN_ID_B (COIN_ID_B). */
+    function buildTwoTokenBundle(): VerifiedBundle {
+      const tokenDataA = {
+        genesis: {
+          data: {
+            tokenId: TOKEN_ID_A,
+            coinData: [[COIN_ID_HEX, '1000000']],
+            tokenType: '00',
+            tokenData: '',
+            salt: '00',
+          },
+        },
+        state: { stateHash: '1'.repeat(64) },
+        transactions: [],
+      };
+      const tokenDataB = {
+        genesis: {
+          data: {
+            tokenId: TOKEN_ID_B,
+            coinData: [[COIN_ID_B, '500000']],
+            tokenType: '00',
+            tokenData: '',
+            salt: '00',
+          },
+        },
+        state: { stateHash: '3'.repeat(64) },
+        transactions: [],
+      };
+
+      const claimedRefA: RootRef = {
+        contentHash: ('cc' + '0'.repeat(62)) as never,
+        tokenId: TOKEN_ID_A,
+        chainDepth: 0,
+      };
+      const claimedRefB: RootRef = {
+        contentHash: ('dd' + '0'.repeat(62)) as never,
+        tokenId: TOKEN_ID_B,
+        chainDepth: 0,
+      };
+
+      const assembleSpy = vi.fn((tokenId: string) => {
+        if (tokenId === TOKEN_ID_A) return tokenDataA;
+        if (tokenId === TOKEN_ID_B) return tokenDataB;
+        throw new Error(`pkg.assemble called for unexpected token ${tokenId}`);
+      });
+
+      return {
+        verified: true as const,
+        pkg: { assemble: assembleSpy } as never,
+        bundleCid: BUNDLE_CID,
+        claimedTokens: [claimedRefA, claimedRefB],
+        advisoryUnclaimedRoots: [],
+        missingClaimedTokenIds: [],
+        droppedDeepUnclaimed: 0,
+      };
+    }
+
+    /** Build a uxf-car payload claiming both TOKEN_ID_A and TOKEN_ID_B. */
+    function buildTwoTokenPayload(): UxfV1Payload {
+      return {
+        kind: 'uxf-car',
+        version: '1.0',
+        mode: 'conservative',
+        bundleCid: BUNDLE_CID,
+        tokenIds: [TOKEN_ID_A, TOKEN_ID_B],
+        carBase64: 'AAAA',
+        memo: 'multi-coin-test',
+      };
+    }
+
+    let module: ReturnType<typeof createPaymentsModule>;
+    let emitEvent: ReturnType<typeof vi.fn>;
+    let handleTransfer: (transfer: IncomingTokenTransfer) => Promise<void>;
+
+    beforeEach(() => {
+      vi.clearAllMocks();
+
+      mockAcquireBundle.mockResolvedValue(buildTwoTokenBundle());
+
+      module = createPaymentsModule({ features: { recipientUxf: true } });
+      emitEvent = vi.fn();
+
+      handleTransfer = (t: IncomingTokenTransfer) =>
+        (module as unknown as { handleIncomingTransfer: (t: IncomingTokenTransfer) => Promise<void> }).handleIncomingTransfer(t);
+
+      module.initialize({
+        identity: makeIdentity(),
+        storage: makeStorage(),
+        transport: makeTransport(),
+        oracle: makeOracle(undefined),
+        emitEvent,
+      });
+
+      (module as unknown as { loaded: boolean }).loaded = true;
+      (module as unknown as { loadedPromise: Promise<void> | null }).loadedPromise = null;
+    });
+
+    afterEach(() => {
+      module.destroy();
+    });
+
+    it('emits transfer:incoming twice — once per claimed token in a 2-token bundle', async () => {
+      const payload = buildTwoTokenPayload();
+      await handleTransfer(buildIncomingTransfer(payload));
+
+      const incomingCalls = (emitEvent as ReturnType<typeof vi.fn>).mock.calls.filter(
+        ([event]: [string]) => event === 'transfer:incoming',
+      );
+      expect(incomingCalls.length).toBe(2);
+    });
+
+    it('adds BOTH claimed tokens to getTokens() after processing a 2-token bundle', async () => {
+      const payload = buildTwoTokenPayload();
+      await handleTransfer(buildIncomingTransfer(payload));
+
+      const tokens = module.getTokens();
+      const hasA = tokens.some((t) => t.sdkData?.includes(TOKEN_ID_A));
+      const hasB = tokens.some((t) => t.sdkData?.includes(TOKEN_ID_B));
+      expect(hasA).toBe(true);
+      expect(hasB).toBe(true);
+    });
+
+    it('calls pkg.assemble() for EACH claimed token in the bundle', async () => {
+      const bundle = buildTwoTokenBundle();
+      mockAcquireBundle.mockResolvedValue(bundle);
+
+      const payload = buildTwoTokenPayload();
+      await handleTransfer(buildIncomingTransfer(payload));
+
+      // assemble() is a spy inside buildTwoTokenBundle; check it was called
+      // for both TOKEN_ID_A and TOKEN_ID_B.
+      const assembleSpy = (bundle.pkg as unknown as { assemble: ReturnType<typeof vi.fn> }).assemble;
+      const calledIds = (assembleSpy as ReturnType<typeof vi.fn>).mock.calls.map(
+        ([id]: [string]) => id,
+      );
+      expect(calledIds).toContain(TOKEN_ID_A);
+      expect(calledIds).toContain(TOKEN_ID_B);
+    });
+  });
 });

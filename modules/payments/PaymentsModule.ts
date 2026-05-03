@@ -1400,6 +1400,14 @@ export class PaymentsModule {
         // is O(N) where N = number of claimed tokens (typically 1–5), acceptable
         // inside the per-tokenId mutex.
         const claimedTokenIds = new Set(verified.claimedTokens.map((r) => r.tokenId));
+        // [DIAG-UXF-RECV] bundle-level: how many tokens are claimed for this recipient?
+        logger.debug('Payments', '[DIAG-UXF-RECV] processToken entry', {
+          bundleCid: ctx.bundleCid.slice(0, 16),
+          claimedCount: verified.claimedTokens.length,
+          claimedTokenIds: verified.claimedTokens.map((r) => r.tokenId.slice(0, 16)),
+          thisTokenId: tokenRoot.tokenId.slice(0, 16),
+          isClaimed: claimedTokenIds.has(tokenRoot.tokenId),
+        });
         if (!claimedTokenIds.has(tokenRoot.tokenId)) {
           logger.debug(
             'Payments',
@@ -1421,6 +1429,11 @@ export class PaymentsModule {
           //    and call finalizeTransferToken() (conservative) or patch
           //    the state JSON and store as pending (instant).
           const assembledJson = verified.pkg.assemble(tokenRoot.tokenId) as Record<string, unknown>;
+          // [DIAG-UXF-RECV] assemble succeeded
+          logger.debug('Payments', '[DIAG-UXF-RECV] pkg.assemble succeeded', {
+            tokenId: tokenRoot.tokenId.slice(0, 16),
+            txCount: Array.isArray(assembledJson.transactions) ? (assembledJson.transactions as unknown[]).length : 'n/a',
+          });
 
           // Decide whether recipient-side finalization is needed.
           // A token with no transfer transactions cannot be finalized (and
@@ -1523,6 +1536,11 @@ export class PaymentsModule {
           //    check deferred until allFinalized).
           if (tokenStatus !== 'pending') {
             const validation = await this.deps!.oracle.validateToken(tokenData);
+            // [DIAG-UXF-RECV] oracle validation outcome
+            logger.debug('Payments', '[DIAG-UXF-RECV] oracle.validateToken result', {
+              tokenId: tokenRoot.tokenId.slice(0, 16),
+              valid: validation.valid,
+            });
             if (!validation.valid) {
               logger.warn('Payments', 'Received invalid UXF token', {
                 tokenId: tokenRoot.tokenId.slice(0, 16),
@@ -1553,6 +1571,13 @@ export class PaymentsModule {
           // 4. addToken() deduplicates (tombstone check + stateHash check)
           //    and persists via save() — mirrors legacy arm line ~7772.
           const added = await this.addToken(token);
+          // [DIAG-UXF-RECV] addToken outcome
+          logger.debug('Payments', '[DIAG-UXF-RECV] addToken result', {
+            tokenId: tokenRoot.tokenId.slice(0, 16),
+            added,
+            coinId: token.coinId.slice(0, 16),
+            amount: token.amount,
+          });
           const senderInfo = await this.resolveSenderInfo(ctx.senderTransportPubkey);
 
           if (added) {
@@ -6711,6 +6736,9 @@ export class PaymentsModule {
       availableSources: () => Array.from(this.tokens.values()),
       transferId,
       selectSources: async ({ request: req }) => {
+        const out: Token[] = [];
+
+        // ── Primary coin ──────────────────────────────────────────────────────
         const parsedPool = await this.spendPlanner.buildParsedPool(
           Array.from(this.tokens.values()),
           request.coinId,
@@ -6721,26 +6749,75 @@ export class PaymentsModule {
             pendingChangeAmount += BigInt(t.amount || '0');
           }
         }
+        // Use a per-coin reservation id so additional-coin plans never
+        // collide in SpendQueue.promises (which is keyed by entry id).
+        const primaryQueueId = `${transferId}:${request.coinId}`;
         const planResult = this.spendPlanner.planSend(
           { amount: req.amount ?? '0', coinId: request.coinId },
           parsedPool,
           this.reservationLedger,
           this.spendQueue,
-          transferId,
+          primaryQueueId,
           pendingChangeAmount,
         );
         let splitPlan: SplitPlan;
         if (planResult === 'queued') {
-          const queueResult = await this.spendQueue.waitForEntry(transferId);
+          const queueResult = await this.spendQueue.waitForEntry(primaryQueueId);
           splitPlan = queueResult.splitPlan;
         } else {
           splitPlan = planResult.splitPlan;
         }
-        const out: Token[] = splitPlan.tokensToTransferDirectly.map(
-          (t) => t.uiToken,
-        );
+        out.push(...splitPlan.tokensToTransferDirectly.map((t) => t.uiToken));
         if (splitPlan.tokenToSplit) out.push(splitPlan.tokenToSplit.uiToken);
-        // Mark sources as transferring + persist (matches legacy semantics).
+
+        // ── Additional assets (coin entries only) ─────────────────────────────
+        // Each additional coin is planned independently with a unique
+        // queue id (${transferId}:${addCoinId}:${i}) to prevent promise-map
+        // collisions when two entries queue for the same SpendQueue.
+        const additional = req.additionalAssets ?? [];
+        for (let i = 0; i < additional.length; i++) {
+          const asset = additional[i];
+          if (asset.kind !== 'coin') continue; // NFT: whole-token, handled by commitSources
+          const addCoinId = asset.coinId;
+          const addParsedPool = await this.spendPlanner.buildParsedPool(
+            Array.from(this.tokens.values()),
+            addCoinId,
+          );
+          let addPendingChange = 0n;
+          for (const [, t] of this.tokens) {
+            if (t.coinId === addCoinId && t.status === 'transferring') {
+              addPendingChange += BigInt(t.amount || '0');
+            }
+          }
+          const addQueueId = `${transferId}:${addCoinId}:${i}`;
+          const addPlanResult = this.spendPlanner.planSend(
+            { amount: asset.amount, coinId: addCoinId },
+            addParsedPool,
+            this.reservationLedger,
+            this.spendQueue,
+            addQueueId,
+            addPendingChange,
+          );
+          let addSplitPlan: SplitPlan;
+          if (addPlanResult === 'queued') {
+            const addQueueResult = await this.spendQueue.waitForEntry(addQueueId);
+            addSplitPlan = addQueueResult.splitPlan;
+          } else {
+            addSplitPlan = addPlanResult.splitPlan;
+          }
+          out.push(...addSplitPlan.tokensToTransferDirectly.map((t) => t.uiToken));
+          if (addSplitPlan.tokenToSplit) out.push(addSplitPlan.tokenToSplit.uiToken);
+        }
+
+        // [DIAG-UXF-SEND] all sources selected across primary + additionalAssets
+        logger.debug('Payments', '[DIAG-UXF-SEND] selectSources result', {
+          totalSelected: out.length,
+          selectedIds: out.map((t) => `${t.id.slice(0, 12)}(${t.coinId.slice(0, 12)})`),
+          primaryCoinId: request.coinId.slice(0, 16),
+          additionalCount: (req.additionalAssets ?? []).filter((a) => a.kind === 'coin').length,
+        });
+        // Mark all selected sources as transferring + persist (matches legacy
+        // semantics — prevents double-spend within the same session).
         for (const tok of out) {
           tok.status = 'transferring';
           this.tokens.set(tok.id, tok);
@@ -6764,6 +6841,11 @@ export class PaymentsModule {
         extractPendingChain: () => [],
       }),
       commitSources: async ({ sources }) => {
+        // [DIAG-UXF-SEND] how many source tokens are being committed?
+        logger.debug('Payments', '[DIAG-UXF-SEND] commitSources entry', {
+          sourceCount: sources.length,
+          sourceIds: sources.map((t) => `${t.id.slice(0, 12)}(${t.coinId.slice(0, 12)})`),
+        });
         const out: ConservativeCommitResult[] = [];
         for (const token of sources) {
           // The legacy arm splits-then-mints for the source-to-be-split,
