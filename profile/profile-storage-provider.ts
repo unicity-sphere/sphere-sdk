@@ -867,6 +867,28 @@ export class ProfileStorageProvider implements StorageProvider {
     this.localCache.setIdentity(identity);
 
     this.log('Identity set:', identity.l1Address);
+
+    // If OrbitDB attached BEFORE setIdentity (the common Sphere.init/import
+    // ordering: storage.connect() runs while identity is still null, then
+    // Sphere derives identity from mnemonic and calls setIdentity), retry
+    // the pointer-layer build now that the identity prerequisite is met.
+    // Fire-and-forget — setIdentity is sync per the StorageProvider
+    // interface contract; downstream callers (tokenStorage.initialize →
+    // recoverFromAggregatorPointerBestEffort) poll for the pointer with a
+    // short timeout so they don't race the build.
+    if (
+      this.dbStatus === 'attached' &&
+      this.pointerLayer === null &&
+      !this.isPointerSkipSticky()
+    ) {
+      void this.tryBuildPointerLayer(identity).catch((err) => {
+        this.log(
+          `setIdentity: deferred pointer-layer build failed: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      });
+    }
   }
 
   /**

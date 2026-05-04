@@ -171,9 +171,20 @@ export async function fetchFromIpfs(
 
   for (const gateway of effectiveGateways) {
     try {
-      const url = `${gateway.replace(/\/$/, '')}/ipfs/${cid}`;
+      // Use Kubo's `/api/v0/block/get` to retrieve the raw block bytes.
+      // Why not `/ipfs/<cid>`? Many gateways (incl. unicity-ipfs1) ignore
+      // `Accept: application/octet-stream` and `?format=raw`, returning
+      // a CAR-wrapped response instead of the raw block. That breaks the
+      // sha256(bytes) == CID-hash verification below. The block/get API
+      // is symmetric with `pinToIpfs` (which uses `/api/v0/dag/put` with
+      // `store-codec=raw`) and consistently returns the original bytes.
+      // Kubo declares POST, but accepts GET as a documented alias —
+      // sticking with POST for compatibility with strict deployments.
+      const url =
+        `${gateway.replace(/\/$/, '')}/api/v0/block/get?arg=${encodeURIComponent(cid)}`;
 
       const response = await fetch(url, {
+        method: 'POST',
         headers: { Accept: 'application/octet-stream' },
         signal: AbortSignal.timeout(timeoutMs),
       });

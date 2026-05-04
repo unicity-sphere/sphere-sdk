@@ -276,8 +276,27 @@ export class LifecycleManager {
    * caller falls through to IPNS.
    */
   private async recoverFromAggregatorPointerBestEffort(): Promise<boolean> {
-    const pointer = this.host.options?.getPointerLayer?.() ?? null;
-    if (!pointer) return false;
+    // Poll for the pointer layer briefly. Sphere.init/import calls
+    // storage.connect() (which builds the pointer when identity is
+    // already set) BEFORE setIdentity (which is when identity becomes
+    // available); setIdentity then fire-and-forgets a deferred pointer
+    // rebuild. tokenStorage.initialize() — where this method runs —
+    // races against that deferred rebuild on the very first connect.
+    // Polling with a 5s ceiling lets the rebuild complete without
+    // forcing the caller to know about the ordering quirk.
+    const pollDeadline = Date.now() + 5_000;
+    let pointer = this.host.options?.getPointerLayer?.() ?? null;
+    while (!pointer && Date.now() < pollDeadline) {
+      await new Promise((r) => setTimeout(r, 100));
+      pointer = this.host.options?.getPointerLayer?.() ?? null;
+    }
+    if (!pointer) {
+      this.host.log(
+        'Pointer recover: no pointer layer wired after 5s wait — ' +
+          'wallet has no aggregator pointer recovery (e.g., oracle not configured)',
+      );
+      return false;
+    }
 
     let recovered: { readonly cid: Uint8Array; readonly version: number } | null;
     try {
@@ -288,8 +307,6 @@ export class LifecycleManager {
         const code = (err as { code?: string }).code ?? 'UNKNOWN';
         this.host.log(`Pointer recover PERMANENT failure (${code}): ${msg}`);
         this.host.emitEvent(this.host.buildErrorEvent('storage:error', err));
-        // Do NOT fall through to IPNS on permanent integrity
-        // failures — return true so the IPNS path is skipped.
         return true;
       }
       this.host.log(`Pointer recover failed (transient, best-effort): ${msg}`);
@@ -303,9 +320,6 @@ export class LifecycleManager {
 
     try {
       const cidString = CID.decode(recovered.cid).toString();
-      // Idempotent: if the bundle already exists locally, this is a
-      // no-op. Token count is unknown from the pointer alone — the
-      // next flush re-counts.
       await this.bundleIndex.addBundle(cidString, {
         cid: cidString,
         status: 'active',

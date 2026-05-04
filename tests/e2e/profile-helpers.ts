@@ -46,9 +46,22 @@ export function makeProfileProviders(dirs: {
   dataDir: string;
   tokensDir: string;
 }): NodeProviders {
+  // Build the legacy factory FIRST so we can reuse its oracle for the
+  // Profile pointer-layer wiring. Without an oracle the pointer layer
+  // never gets constructed and cold-start recovery silently fails.
+  const legacyForNonStorage = createNodeProviders({
+    network: NETWORK,
+    dataDir: dirs.dataDir,
+    tokensDir: dirs.tokensDir,
+    tokenSync: { ipfs: { enabled: false } },
+    market: true,
+    groupChat: true,
+  });
+
   const profile = createNodeProfileProviders({
     network: NETWORK,
     dataDir: dirs.dataDir,
+    oracle: legacyForNonStorage.oracle,
     profileConfig: {
       orbitDb: {
         privateKey: '', // set later via setIdentity()
@@ -57,17 +70,6 @@ export function makeProfileProviders(dirs: {
       },
       encrypt: true,
     },
-  });
-
-  // Reuse the legacy factory to get transport/oracle/price/l1 — we
-  // just ignore its storage/tokenStorage/ipfsTokenStorage.
-  const legacyForNonStorage = createNodeProviders({
-    network: NETWORK,
-    dataDir: dirs.dataDir,
-    tokensDir: dirs.tokensDir,
-    tokenSync: { ipfs: { enabled: false } },
-    market: true,
-    groupChat: true,
   });
 
   return {

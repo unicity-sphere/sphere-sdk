@@ -578,7 +578,18 @@ export class ProfileTokenStorageProvider
         }
       }
 
-      if (newCids.length === 0 && removedCids.length === 0) {
+      // Cold-start: pointer-layer recovery in `initialize()` may have
+      // populated `knownBundleCids` (and the OrbitDB bundle ref) before
+      // any token state was loaded. In that case `previousCids` and the
+      // refreshed list are identical, so newCids/removedCids are empty,
+      // BUT we have never actually fetched the CAR for those bundles and
+      // assembled tokens. Force a full load when bundles exist but
+      // `lastLoadedData` is still null — the very first sync after
+      // cold-start MUST hydrate the token pool.
+      const coldStartLoadNeeded =
+        this.lastLoadedData === null && this.knownBundleCids.size > 0;
+
+      if (newCids.length === 0 && removedCids.length === 0 && !coldStartLoadNeeded) {
         // No changes -- return local data as-is
         this.emitEvent({ type: 'sync:completed', timestamp: Date.now() });
         return {
