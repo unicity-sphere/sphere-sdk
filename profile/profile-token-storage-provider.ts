@@ -71,6 +71,8 @@ import {
   isArchivedKey,
   isForkedKey,
 } from '../types/txf.js';
+import { buildLocalEntry } from './oplog-entry.js';
+import type { OpLogEntryEnvelope } from './oplog-entry.js';
 import {
   encryptProfileValue,
   decryptProfileValue,
@@ -1783,18 +1785,64 @@ export class ProfileTokenStorageProvider
   // ===========================================================================
 
   /**
+   * Cached envelope-support probe. Lazy-initialised by `supportsEnvelopes()`.
+   * Both `putEntry` and `getEntry` must exist together — same invariant as
+   * ProfileStorageProvider. See that class's `supportsEnvelopes` for the
+   * asymmetry-rejection rationale.
+   */
+  private _envelopesSupported: boolean | null = null;
+
+  private supportsEnvelopes(): boolean {
+    if (this._envelopesSupported !== null) return this._envelopesSupported;
+    const hasPut = typeof this.db.putEntry === 'function';
+    const hasGet = typeof this.db.getEntry === 'function';
+    if (hasPut !== hasGet) {
+      throw new Error(
+        `ProfileDatabase adapter has asymmetric envelope support: putEntry=${hasPut}, ` +
+          `getEntry=${hasGet}. Adapter must implement BOTH methods or NEITHER.`,
+      );
+    }
+    this._envelopesSupported = hasPut;
+    return this._envelopesSupported;
+  }
+
+  /**
    * Write a string value to an OrbitDB key, encrypting if enabled.
+   *
+   * **Routes through the OpLog envelope path** (`db.putEntry`) — same
+   * format ProfileStorageProvider uses for `set()`. Both providers share
+   * a single OrbitDB instance via the factory; if either side wrote raw
+   * bytes via `db.put` while the other side read via `db.getEntry`, the
+   * decode would fail with bogus errors like `tag not supported (21)` —
+   * the dag-cbor decoder choking on encrypted-ciphertext bytes that
+   * happen to start with byte values that look like CBOR tags. By
+   * routing both providers through the envelope path, the OrbitDB key
+   * is byte-compatible across consumers.
    */
   private async writeProfileKey(key: string, value: string): Promise<void> {
     const encoded = new TextEncoder().encode(value);
-    const toWrite = this.encryptionKey
+    const ciphertext = this.encryptionKey
       ? await encryptProfileValue(this.encryptionKey, encoded)
       : encoded;
-    await this.db.put(key, toWrite);
+    if (this.supportsEnvelopes()) {
+      const envelope = buildLocalEntry({
+        type: 'cache_index',
+        originated: 'user',
+        payload: ciphertext,
+      });
+      await this.db.putEntry!(key, envelope);
+    } else {
+      await this.db.put(key, ciphertext);
+    }
   }
 
   /**
    * Read a string value from an OrbitDB key, decrypting if needed.
+   *
+   * Symmetric with `writeProfileKey`: reads via the OpLog envelope path
+   * (`db.getEntry`) so the same OrbitDB key is byte-compatible regardless
+   * of which provider wrote it. See `writeProfileKey` for the cross-
+   * provider decoding-collision rationale.
    *
    * Wave G.1 — deferred follow-up: emit a typed `storage:error` event
    * with `code: 'PROFILE_KEY_DECRYPT_FAILED'` so callers can route on
@@ -1806,18 +1854,35 @@ export class ProfileTokenStorageProvider
    * derived sources), but observability now distinguishes the two.
    */
   private async readProfileKey(key: string): Promise<string | null> {
-    const raw = await this.db.get(key);
-    if (!raw) return null;
+    let ciphertext: Uint8Array | null = null;
+    try {
+      if (this.supportsEnvelopes()) {
+        const envelope = (await this.db.getEntry!(key, {
+          trustLocalClaim: true,
+        })) as OpLogEntryEnvelope | null;
+        ciphertext = envelope ? envelope.payload : null;
+      } else {
+        ciphertext = (await this.db.get(key)) as Uint8Array | null;
+      }
+    } catch (err) {
+      this.log(`Failed to read OpLog entry at "${key}": ${err instanceof Error ? err.message : String(err)}`);
+      // Surface decode failures explicitly — silent null on tag-21 / wrong-encoding
+      // would have hidden the cross-provider write/read asymmetry that motivated this fix.
+      this.emitEvent({
+        ...this.buildErrorEvent('storage:error', err),
+        code: 'PROFILE_KEY_READ_FAILED',
+      });
+      return null;
+    }
+    if (!ciphertext) return null;
     try {
       const decrypted = this.encryptionKey
-        ? await decryptProfileValue(this.encryptionKey, raw)
-        : raw;
+        ? await decryptProfileValue(this.encryptionKey, ciphertext)
+        : ciphertext;
       return new TextDecoder().decode(decrypted);
     } catch (err) {
-      this.log(`Failed to read/decrypt key "${key}": ${err instanceof Error ? err.message : String(err)}`);
+      this.log(`Failed to decrypt key "${key}": ${err instanceof Error ? err.message : String(err)}`);
       const evt = this.buildErrorEvent('storage:error', err);
-      // Override the generic code with the specific decrypt-failure
-      // signal so consumers can distinguish from other storage errors.
       this.emitEvent({ ...evt, code: 'PROFILE_KEY_DECRYPT_FAILED' });
       return null;
     }
