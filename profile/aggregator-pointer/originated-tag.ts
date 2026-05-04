@@ -66,6 +66,25 @@ for (const t of USER_ACTION_TYPES) {
 }
 
 /**
+ * Derive the canonical `originated` tag for a given entry type. System
+ * entry types (`session_receipt`, `cache_index`, `last_opened_ts`) MUST
+ * carry `originated='system'`; user action types MUST carry
+ * `originated='user'`. Routes through the same SYSTEM_ACTION_SET that
+ * `assertOriginTagLocal` validates against, so write-side stamping and
+ * read-side validation use a single source of truth.
+ *
+ * Replaces a local duplicate in profile-storage-provider.ts that
+ * silently diverged when new entry types were added — same DRY
+ * violation pattern that caused the cross-provider OpLog encoding
+ * collision in profile-token-storage-provider.ts.
+ */
+export function deriveOriginForType(
+  entryType: OpLogEntryType,
+): 'user' | 'system' {
+  return SYSTEM_ACTION_SET.has(entryType) ? 'system' : 'user';
+}
+
+/**
  * Stamp an originated tag onto an OpLog entry payload.
  * Returns a new object with `originated` set; does not mutate the input.
  *

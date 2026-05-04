@@ -73,6 +73,7 @@ import {
 } from '../types/txf.js';
 import { buildLocalEntry } from './oplog-entry.js';
 import type { OpLogEntryEnvelope } from './oplog-entry.js';
+import { deriveOriginForType } from './aggregator-pointer/originated-tag.js';
 import {
   encryptProfileValue,
   decryptProfileValue,
@@ -1825,9 +1826,13 @@ export class ProfileTokenStorageProvider
       ? await encryptProfileValue(this.encryptionKey, encoded)
       : encoded;
     if (this.supportsEnvelopes()) {
+      // `cache_index` is in SYSTEM_ACTION_TYPES — must carry
+      // `originated='system'` per assertOriginTagLocal (SPEC §10.2.3).
+      // Route through the canonical helper rather than hardcoding the tag
+      // so future entry-type additions stay in sync automatically.
       const envelope = buildLocalEntry({
         type: 'cache_index',
-        originated: 'user',
+        originated: deriveOriginForType('cache_index'),
         payload: ciphertext,
       });
       await this.db.putEntry!(key, envelope);

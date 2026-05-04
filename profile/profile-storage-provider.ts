@@ -72,16 +72,12 @@ const SWAP_KEY_PATTERN = /^(.+)_swap:(.+)$/;
  * `buildLocalEntry`, so drift between this set and the canonical list
  * produces an error at the write site.
  */
-const SYSTEM_ACTION_TYPE_SET: ReadonlySet<OpLogEntryType> = new Set<OpLogEntryType>([
-  'session_receipt',
-  'cache_index',
-  'last_opened_ts',
-]);
-
-/** Derive the originated tag for a given entry type. */
-function deriveOriginForType(entryType: OpLogEntryType): 'user' | 'system' {
-  return SYSTEM_ACTION_TYPE_SET.has(entryType) ? 'system' : 'user';
-}
+// Canonical SYSTEM_ACTION_SET + deriveOriginForType live in
+// `aggregator-pointer/originated-tag.ts` to prevent the silent-divergence
+// pattern that caused the cross-provider OpLog encoding collision (see
+// profile-token-storage-provider.ts: writeProfileKey/readProfileKey
+// envelope-path fix). Re-export for callers within this module.
+import { deriveOriginForType } from './aggregator-pointer/originated-tag';
 
 /**
  * Soft-warn threshold for OpLog payload size (PROFILE-CID-REFERENCES.md §9).
