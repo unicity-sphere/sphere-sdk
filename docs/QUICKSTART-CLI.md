@@ -1,6 +1,10 @@
-# Sphere SDK - CLI Quick Start
+# Sphere CLI Quick Start
 
-The Sphere SDK includes a built-in CLI for wallet management, payments, messaging, and invoicing — no code required. All data is stored locally in `.sphere-cli/`.
+> **Note:** The CLI is now a standalone package at [`@unicity-sphere/cli`](https://github.com/unicity-sphere/sphere-cli).
+> Install it with `npm install -g @unicity-sphere/cli` and run `sphere --help`.
+> The `npm run cli` script in sphere-sdk no longer works.
+
+The Sphere CLI covers wallet management, payments, messaging, and invoicing — no code required. All data is stored locally in `~/.config/sphere/` (or `.sphere-cli/` in the working directory for legacy compatibility).
 
 **Node.js version:** 18.0.0 or higher required.
 

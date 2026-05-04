@@ -68,6 +68,7 @@ import type {
   ManifestAuxiliary,
   ManifestSignatures,
 } from './types.js';
+import type { InvoiceStatus } from '../accounting/types.js';
 
 // Logger tag
 const LOG_TAG = 'Swap';
@@ -1631,16 +1632,93 @@ export class SwapModule {
       myDirectAddresses.add(addr.directAddress);
     }
 
-    let assetIndex: number;
-    if (myDirectAddresses.has(swap.manifest.party_a_address)) {
-      assetIndex = 0; // party A
-    } else if (myDirectAddresses.has(swap.manifest.party_b_address)) {
-      assetIndex = 1; // party B
+    // Determine the currency this party owes. The party's slot is identified
+    // by address match against the manifest, and the currency comes directly
+    // from the manifest fields — NOT from positional indexing into the
+    // invoice's assets array.
+    //
+    // Why not positional? `accounting/serialization.ts:canonicalSerialize()`
+    // sorts each target's assets by coinId hash for deterministic invoice IDs.
+    // After that sort, `assets[0]` is whichever currency happens to sort
+    // earlier — it may belong to either party. Selecting `assetIndex` by
+    // position breaks silently when the manifest's party_a_currency hashes
+    // *after* party_b_currency (the buyer ends up paying party B's currency).
+    // We instead look up the asset slot whose coinId matches our expected
+    // currency.
+    // SECURITY (W4): if the local wallet has BOTH party_a_address AND
+    // party_b_address (legitimate via address rotation, OR a hostile
+    // manifest crafted to point both parties at the same address), the
+    // first branch wins silently and the wallet always deposits as party
+    // A. Reject this ambiguity loudly rather than guessing.
+    const matchesPartyA = myDirectAddresses.has(swap.manifest.party_a_address);
+    const matchesPartyB = myDirectAddresses.has(swap.manifest.party_b_address);
+    if (matchesPartyA && matchesPartyB) {
+      throw new SphereError(
+        'Ambiguous party identity: local wallet matches both party_a_address and party_b_address',
+        'SWAP_DEPOSIT_FAILED',
+      );
+    }
+    let myExpectedCurrency: string;
+    if (matchesPartyA) {
+      myExpectedCurrency = swap.manifest.party_a_currency_to_change;
+    } else if (matchesPartyB) {
+      myExpectedCurrency = swap.manifest.party_b_currency_to_change;
     } else {
       throw new SphereError(
         'Local wallet address does not match either party in the swap manifest',
         'SWAP_DEPOSIT_FAILED',
       );
+    }
+    // SECURITY (W3 prereq): assert manifest's expected currency is non-empty
+    // before lookup — coinIdsMatch('', '') would return true and select
+    // slot 0 unconditionally on a malformed manifest.
+    if (!myExpectedCurrency || myExpectedCurrency === '') {
+      throw new SphereError(
+        'Manifest currency_to_change is empty for this party',
+        'SWAP_DEPOSIT_FAILED',
+      );
+    }
+
+    const invoiceRefForAssetLookup = deps.accounting.getInvoice(swap.depositInvoiceId) as
+      | { terms: { targets: Array<{ address: string; assets: Array<{ coin?: [string, string] }> }> } }
+      | null;
+    if (!invoiceRefForAssetLookup) {
+      // Same SWAP_WRONG_STATE error semantics as the in-gate re-check below —
+      // caller can retry once the invoice token has been imported.
+      throw new SphereError(
+        'Deposit invoice not yet imported into accounting module',
+        'SWAP_WRONG_STATE',
+      );
+    }
+    const depositTarget = invoiceRefForAssetLookup.terms.targets[0];
+    if (!depositTarget) {
+      throw new SphereError(
+        'Deposit invoice has no targets',
+        'SWAP_DEPOSIT_FAILED',
+      );
+    }
+    const assetIndex = depositTarget.assets.findIndex(
+      (a) => a.coin !== undefined && coinIdsMatch(a.coin[0], myExpectedCurrency),
+    );
+    if (assetIndex < 0) {
+      throw new SphereError(
+        `No asset matching expected currency ${myExpectedCurrency} found in deposit invoice`,
+        'SWAP_DEPOSIT_FAILED',
+      );
+    }
+    // SECURITY (W3): findIndex returns the first match. If the invoice has
+    // two slots that both coinIdsMatch the manifest currency (degenerate
+    // / malicious manifest where party_a_currency_to_change equals
+    // party_b_currency_to_change normalized form), wallet would pay into
+    // slot 0 unconditionally. Reject ambiguity loudly.
+    for (let i = assetIndex + 1; i < depositTarget.assets.length; i += 1) {
+      const a = depositTarget.assets[i];
+      if (a?.coin !== undefined && coinIdsMatch(a.coin[0], myExpectedCurrency)) {
+        throw new SphereError(
+          `Ambiguous asset match in deposit invoice: slots ${assetIndex} and ${i} both match currency ${myExpectedCurrency}`,
+          'SWAP_DEPOSIT_FAILED',
+        );
+      }
     }
 
     return this.withSwapGate(swapId, async () => {
@@ -1769,17 +1847,11 @@ export class SwapModule {
       return returnFalse();
     }
 
-    // Get invoice status for coverage check
-    const status = await deps.accounting.getInvoiceStatus(swap.payoutInvoiceId) as {
-      state: string;
-      targets: Array<{
-        coinAssets: Array<{
-          coin: [string, string];
-          netCoveredAmount: string;
-          isCovered: boolean;
-        }>;
-      }>;
-    };
+    // Get invoice status for coverage check. Use the canonical `InvoiceStatus`
+    // type from accounting/types.ts rather than an inline structural cast —
+    // keeps this consumer in lockstep with upstream field changes (e.g. the
+    // `surplusAmount` field is required, not optional, per the canonical type).
+    const status = (await deps.accounting.getInvoiceStatus(swap.payoutInvoiceId)) as InvoiceStatus;
 
     // Determine expected currency and amount based on our role
     const myDirectAddress = deps.identity.directAddress;
@@ -1828,7 +1900,15 @@ export class SwapModule {
         swap.updatedAt = Date.now();
         this.clearLocalTimer(swap.swapId);
         this.terminalSwapIds.add(swap.swapId);
-        const entryIdx = this._storedTerminalEntries.length;
+        // Append our terminal-entry marker. We deliberately DO NOT capture a
+        // positional index here for rollback — `_storedTerminalEntries` is
+        // shared across all swaps in this module, and a concurrent swap's
+        // own `transitionProgress(*, terminal)` can append to this same array
+        // during the `await persistSwap()` below. A `splice(entryIdx, 1)`
+        // rollback would then remove the WRONG entry, silently corrupting an
+        // unrelated swap's terminal record. Roll back by `(swapId, progress)`
+        // identity instead — uniquely identifies our marker regardless of
+        // intervening appends.
         this._storedTerminalEntries.push({
           swapId: swap.swapId,
           progress: 'failed',
@@ -1838,13 +1918,34 @@ export class SwapModule {
         try {
           await this.persistSwap(swap);
         } catch (persistErr) {
-          // Storage failed — roll back so next load retries fraud detection.
+          // Storage failure rollback. Note the partial-failure window:
+          // `persistSwap` writes the swap record FIRST then the index. If the
+          // record write succeeded and only the index write failed, the on-disk
+          // record already says `'failed'`; rolling back in-memory creates a
+          // brief in-memory/disk skew until either the index write retries on
+          // next save or the next load picks up the on-disk `'failed'`. The
+          // "next load retries fraud detection" story holds when the
+          // record-write itself failed (the most common case for ENOSPC /
+          // permissions / disk-quota errors); for partial-write failures,
+          // the on-disk state is the source of truth on next load and our
+          // in-memory rollback only restores responsiveness for the current
+          // session.
           swap.progress = prevProgress;
           (swap as { payoutVerified?: boolean }).payoutVerified = prevPayoutVerified;
           (swap as { error?: string }).error = prevError;
           swap.updatedAt = prevUpdatedAt;
           this.terminalSwapIds.delete(swap.swapId);
-          this._storedTerminalEntries.splice(entryIdx, 1);
+          // Remove BY IDENTITY (swapId + progress), not positional index, so a
+          // concurrent swap's terminal entry that landed during the await is
+          // not accidentally evicted. Iterate from the end since our marker
+          // was the most recent push for this swap.
+          for (let i = this._storedTerminalEntries.length - 1; i >= 0; i--) {
+            const entry = this._storedTerminalEntries[i]!;
+            if (entry.swapId === swap.swapId && entry.progress === 'failed') {
+              this._storedTerminalEntries.splice(i, 1);
+              break;
+            }
+          }
           logger.warn(LOG_TAG, `failPayout: persistSwap failed for ${swapId}; fraud detection will retry on next load:`, persistErr);
           throw persistErr;
         }
@@ -1901,8 +2002,52 @@ export class SwapModule {
       return returnFalse();
     }
 
-    if (BigInt(targetStatus.coinAssets[0].netCoveredAmount) < BigInt(expectedAmount)) {
+    // Coverage equality check (exact-amount enforcement).
+    //
+    // The accounting layer permits the payout invoice to receive more than the
+    // requested amount (`netCoveredAmount > expectedAmount`) — surplus is tracked
+    // per-payer and refunded by the SDK's auto-return mechanism on closeInvoice.
+    // For *swap settlement*, however, over-coverage indicates one of:
+    //   (a) the escrow paid out twice for the same swap (e.g., a crash-mid-conclude
+    //       race in which crash-recovery's `_resumePayouts` re-issued payInvoice
+    //       because the SDK's provisional ledger entry had not yet been flushed);
+    //   (b) a malicious or buggy third party deposited into the same payout invoice;
+    //   (c) some other settlement-layer fault.
+    // In all three cases the swap should NOT silently complete — the surplus must be
+    // returned (auto-return on the receiver) and the swap explicitly failed so the
+    // application layer can recover with a clear reason. Without this check, the
+    // swap would either continue with `verified=true` (accepting an invalid token
+    // mix that subsequent state transitions would reject) or hang for the trader's
+    // verifyPayout retry budget while `validate()` repeatedly rejects an unrelated
+    // wallet token, producing a 20-min opaque hang instead of a clear failure.
+    // Parse defensively: a malformed `netCoveredAmount` (non-numeric, undefined,
+    // or NaN-like) from a buggy/compromised accounting backend would synchronously
+    // throw `TypeError`/`SyntaxError` from BigInt(). That escapes the gate and is
+    // swallowed by the auto-verify catch, surfacing as an opaque error rather than
+    // a structured SphereError. Treat parse failures as a settlement-layer fault —
+    // consistent with the rest of the over-coverage rationale below.
+    let netCoveredAmount: bigint;
+    let expectedAmountBigInt: bigint;
+    try {
+      netCoveredAmount = BigInt(targetStatus.coinAssets[0].netCoveredAmount);
+      expectedAmountBigInt = BigInt(expectedAmount);
+    } catch (parseErr) {
+      return failPayout(
+        `MALFORMED_AMOUNT: failed to parse coverage amounts (netCoveredAmount=${
+          targetStatus.coinAssets[0].netCoveredAmount
+        }, expectedAmount=${expectedAmount}): ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`,
+      );
+    }
+    if (netCoveredAmount < expectedAmountBigInt) {
+      // Not yet fully covered — keep retrying (transient).
       return returnFalse();
+    }
+    if (netCoveredAmount > expectedAmountBigInt) {
+      // Over-coverage is a settlement fault — fail explicitly.
+      const surplus = netCoveredAmount - expectedAmountBigInt;
+      return failPayout(
+        `OVER_COVERAGE: net=${netCoveredAmount.toString()}, expected=${expectedAmount}, surplus=${surplus.toString()} — surplus refund expected via auto-return; settlement halted`,
+      );
     }
 
     // Verify escrow creator identity
@@ -1914,15 +2059,60 @@ export class SwapModule {
       }
     }
 
-    // Validate L3 inclusion proofs.
-    // NOTE: validate() checks ALL wallet tokens, not only payout tokens. An unrelated
-    // invalid token should NOT cause the swap to fail — the swap's payout may be
-    // perfectly valid. We therefore do not call failPayout() here; instead we return
-    // false so the caller can retry once the unrelated token issue is resolved.
+    // Validate L3 inclusion proofs — but ONLY for tokens that cover this
+    // specific payout invoice. validate() checks the full wallet; any
+    // unrelated invalid token (e.g. a now-spent original UCT consumed by
+    // a split for some other operation, or an unrelated incoming transfer
+    // that hasn't finalized yet) would otherwise pin verifyPayout to false
+    // forever even when the payout itself is fully covered and valid.
+    //
+    // Multiple wallet tokens can share the same coinId (e.g. the original
+    // funded balance + the incoming payout); coinId-only filtering is too
+    // loose. Use accounting.getTokenIdsForInvoice() to get the exact set of
+    // tokens linked to THIS invoice and filter the invalid set to that.
     const validationResult = await deps.payments.validate();
     if (validationResult.invalid.length > 0) {
-      logger.warn(LOG_TAG, `verifyPayout for ${swapId.slice(0, 12)}: L3 validation found ${validationResult.invalid.length} invalid token(s) — retry after wallet sync`);
-      return returnFalse();
+      const payoutTokenIds = (
+        deps.accounting as unknown as {
+          getTokenIdsForInvoice?: (invoiceId: string) => Set<string>;
+        }
+      ).getTokenIdsForInvoice?.(swap.payoutInvoiceId) ?? new Set<string>();
+
+      // SECURITY: fail-CLOSED when payoutTokenIds is empty AND there are
+      // invalid tokens we can't classify. An empty set means the reverse
+      // index (tokenInvoiceMap) hasn't been rebuilt yet OR the orphan-buffer
+      // hasn't been replayed for this invoice. We cannot determine relevance,
+      // so we cannot safely fall through to "verified". The next retry tick
+      // will pick up after the rebuild/replay completes.
+      if (payoutTokenIds.size === 0) {
+        logger.warn(
+          LOG_TAG,
+          `verifyPayout for ${swapId.slice(0, 12)}: ${validationResult.invalid.length} invalid token(s) but tokenInvoiceMap is empty for this payout invoice — failing closed until reverse index rebuilds`,
+        );
+        return returnFalse();
+      }
+
+      // Filter the validate-invalid set to tokens that are linked to THIS
+      // payout invoice via tokenInvoiceMap (populated by both
+      // _processTokenTransactions's on-chain path AND the synthetic /
+      // orphan-buffer paths after the round-1/2/3 fixes). Unrelated
+      // invalids — typically the now-spent original UCT consumed by an
+      // earlier deposit split, or unrelated incoming transfers in flight —
+      // must not block this swap's verification.
+      const relevantInvalid = validationResult.invalid.filter((t) =>
+        payoutTokenIds.has(t.id),
+      );
+      if (relevantInvalid.length > 0) {
+        logger.warn(
+          LOG_TAG,
+          `verifyPayout for ${swapId.slice(0, 12)}: L3 validation found ${relevantInvalid.length} invalid token(s) covering this payout invoice — retry after wallet sync`,
+        );
+        return returnFalse();
+      }
+      logger.debug(
+        LOG_TAG,
+        `verifyPayout for ${swapId.slice(0, 12)}: ${validationResult.invalid.length} unrelated invalid token(s) ignored (not linked to this payout invoice)`,
+      );
     }
 
     // All checks passed — mark payout as verified.
@@ -2172,9 +2362,24 @@ export class SwapModule {
     readonly senderNametag?: string;
     readonly timestamp?: number;
   }): void {
+    // Round-5 diag (basic-roundtrip flake investigation 2026-04-29):
+    // log every non-prefixed JSON DM that mentions invoice_delivery —
+    // helps confirm the SDK saw the DM at all before parseSwapDM rejects.
+    if (dm.content.startsWith('{') && dm.content.includes('"invoice_delivery"')) {
+      logger.warn(LOG_TAG,
+        `diag_swap_dm_arrived sender=${dm.senderPubkey.slice(0, 16)} length=${dm.content.length}`);
+    }
     // Parse the DM into a typed discriminated union (returns null for non-swap DMs)
     const parsed = parseSwapDM(dm.content);
-    if (!parsed) return;
+    if (!parsed) {
+      // Round-5 diag: explicit log when an invoice_delivery DM was parsed away.
+      if (dm.content.startsWith('{') && dm.content.includes('"invoice_delivery"')) {
+        logger.warn(LOG_TAG,
+          `diag_swap_dm_parse_rejected sender=${dm.senderPubkey.slice(0, 16)} ` +
+          `prefix=${dm.content.slice(0, 80)}`);
+      }
+      return;
+    }
 
     // Wrap everything in a promise chain — NEVER propagate errors from DM handler
     void (async () => {
@@ -2690,16 +2895,43 @@ export class SwapModule {
               // invoice_delivery (§12.4.2 + §12.4.3)
               // ---------------------------------------------------------------
               case 'invoice_delivery': {
-                if (!swapId) return;
+                // Round-5 diag (basic-roundtrip flake investigation 2026-04-29):
+                // log every invoice_delivery DM at every gate. Asymmetric
+                // observation — proposer side received the invoice and
+                // deposited, acceptor side never had the invoice in
+                // accounting. Need to know: did the DM arrive?
+                // pass `isFromExpectedEscrow`? was importInvoice called?
+                logger.warn(LOG_TAG,
+                  `diag_invoice_delivery_received swap_id=${swapId?.slice(0, 16)} sender=${dm.senderPubkey.slice(0, 16)} ` +
+                  `invoice_type=${msg.invoice_type} invoice_id=${msg.invoice_id?.slice(0, 16)}`);
+                if (!swapId) {
+                  logger.warn(LOG_TAG, 'diag_invoice_delivery_dropped reason=no_swap_id');
+                  return;
+                }
                 const swap = this.swaps.get(swapId);
-                if (!swap) return;
+                if (!swap) {
+                  logger.warn(LOG_TAG,
+                    `diag_invoice_delivery_dropped reason=swap_not_in_map swap_id=${swapId.slice(0, 16)} ` +
+                    `known_swap_ids_count=${this.swaps.size}`);
+                  return;
+                }
 
                 // Verify escrow sender
-                if (!this.isFromExpectedEscrow(dm.senderPubkey, swap)) return;
+                if (!this.isFromExpectedEscrow(dm.senderPubkey, swap)) {
+                  logger.warn(LOG_TAG,
+                    `diag_invoice_delivery_dropped reason=not_expected_escrow swap_id=${swapId.slice(0, 16)} ` +
+                    `sender=${dm.senderPubkey.slice(0, 16)} ` +
+                    `expected_escrow_pubkey=${swap.escrowPubkey?.slice(0, 16)} ` +
+                    `expected_escrow_addr=${swap.escrowDirectAddress?.slice(0, 24)}`);
+                  return;
+                }
 
                 const deps = this.deps!;
 
                 if (msg.invoice_type === 'deposit') {
+                  logger.warn(LOG_TAG,
+                    `diag_invoice_delivery_proceeding_to_import swap_id=${swapId.slice(0, 16)} ` +
+                    `progress=${swap.progress} invoice_id=${(msg.invoice_id ?? '').slice(0, 16)}`);
                   // §12.4.2: Deposit invoice delivery
                   await this.withSwapGate(swapId, async () => {
                     // Skip terminal swaps — late delivery after cancel/fail creates orphan invoices.
@@ -2707,6 +2939,8 @@ export class SwapModule {
 
                     try {
                       await deps.accounting.importInvoice(msg.invoice_token);
+                      logger.warn(LOG_TAG,
+                        `diag_invoice_imported swap_id=${swapId.slice(0, 16)} invoice_id=${(msg.invoice_id ?? '').slice(0, 16)} type=deposit`);
                     } catch (err) {
                       if (err instanceof SphereError && err.code === 'INVOICE_ALREADY_EXISTS') {
                         // Benign: invoice was already imported (relay re-delivery or

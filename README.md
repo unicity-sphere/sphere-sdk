@@ -32,92 +32,20 @@ Choose your platform:
 |----------|-------|----------|----------|
 | **Browser** | [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) | SDK only | IPFS sync (built-in) |
 | **Node.js** | [QUICKSTART-NODEJS.md](docs/QUICKSTART-NODEJS.md) | SDK + `ws` | IPFS sync (built-in) |
-| **CLI** | See below | SDK + `tsx` | - |
+| **CLI** | [@unicity-sphere/cli](https://github.com/unicity-sphere/sphere-cli) | Separate package | - |
 | **dApp integration** | [CONNECT.md](docs/CONNECT.md) | SDK only | Sphere extension |
 | **Wire protocol spec** | [UXF-TRANSFER-PROTOCOL.md](docs/uxf/UXF-TRANSFER-PROTOCOL.md) | — | Authoritative inter-wallet transfer spec (transfer modes, multi-asset, NFT model, chain mode, error model) |
 
 ## CLI (Command Line Interface)
 
-The SDK includes a CLI for quick testing and development:
+The CLI has moved to a dedicated package: [`@unicity-sphere/cli`](https://github.com/unicity-sphere/sphere-cli).
 
 ```bash
-# Show help
-npm run cli -- --help
-
-# Initialize new wallet on testnet
-npm run cli -- init --network testnet
-
-# Initialize with nametag (mints token on-chain)
-npm run cli -- init --network testnet --nametag alice
-
-# Import existing wallet
-npm run cli -- init --mnemonic "your 24 words here"
-
-# Check wallet status
-npm run cli -- status
-
-# Check balance
-npm run cli -- balance
-
-# Fetch pending transfers and finalize unconfirmed tokens
-npm run cli -- balance --finalize
-
-# Check for incoming transfers
-npm run cli -- receive
-
-# Check for incoming transfers and finalize unconfirmed tokens
-npm run cli -- receive --finalize
-
-# Send tokens (instant mode, default)
-npm run cli -- send @alice 1 UCT --instant
-
-# Send tokens (conservative mode — collect all proofs first)
-npm run cli -- send @alice 1 UCT --conservative
-
-# Request test tokens from faucet
-npm run cli -- topup
-
-# Register nametag
-npm run cli -- nametag myname
-
-# Show transaction history
-npm run cli -- history 10
-
-# Verify tokens against aggregator (detect spent tokens)
-npm run cli -- verify-balance
+npm install -g @unicity-sphere/cli
+sphere --help
 ```
 
-### Available CLI Commands
-
-| Category | Command | Description |
-|----------|---------|-------------|
-| **Wallet** | `init [--network <net>] [--mnemonic "<words>"] [--nametag <name>]` | Create or import wallet |
-| | `status` | Show wallet identity |
-| | `config` | Show/set configuration |
-| **Profiles** | `wallet list` | List all wallet profiles |
-| | `wallet use <name>` | Switch to a wallet profile |
-| | `wallet create <name> [--network <net>]` | Create a new wallet profile |
-| | `wallet delete <name>` | Delete a wallet profile |
-| | `wallet current` | Show current wallet profile |
-| **Balance** | `balance [--finalize]` | Show L3 token balance (--finalize: fetch pending + resolve) |
-| | `tokens` | List all tokens with details |
-| | `l1-balance` | Show L1 (ALPHA) balance |
-| | `topup [<amount> <symbol>]` | Request test tokens from faucet |
-| | `verify-balance [--remove] [-v]` | Verify tokens against aggregator |
-| **Transfers** | `send <to> <amount> <symbol> [--instant\|--conservative]` | Send tokens |
-| | `receive [--finalize]` | Check for incoming transfers |
-| | `history [limit]` | Show transaction history |
-| **Nametags** | `nametag <name>` | Register a nametag |
-| | `nametag-info <name>` | Lookup nametag info |
-| | `my-nametag` | Show current nametag |
-| | `nametag-sync` | Re-publish nametag with chainPubkey |
-| **Utils** | `generate-key` | Generate random key |
-| | `to-human <amount>` | Convert to human readable |
-| | `parse-wallet <file>` | Parse wallet file |
-
-CLI data is stored in `./.sphere-cli/` directory.
-
-> **Shell completion:** Run `npm link && sphere-cli completions bash >> ~/.bashrc` for tab-completion of all commands. See [CLI Quickstart](docs/QUICKSTART-CLI.md) for details.
+See [docs/QUICKSTART-CLI.md](docs/QUICKSTART-CLI.md) for the full command reference.
 
 ## Quick Start
 

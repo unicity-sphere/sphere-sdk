@@ -142,7 +142,7 @@
     "test:relay": "vitest run --config vitest.relay.config.ts",
     "lint": "eslint . --ext .ts",
     "typecheck": "tsc --noEmit",
-    "cli": "npx tsx cli/index.ts"
+    "cli": "echo 'The CLI has moved to @unicity-sphere/cli — install it with: npm install -g @unicity-sphere/cli' && exit 1"
   },
   "keywords": [
     "unicity",

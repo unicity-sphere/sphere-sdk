@@ -236,6 +236,25 @@ export class AccountingModule {
   /** Count of unknown (not in invoiceTermsCache) invoice IDs in the ledger. */
   private unknownLedgerCount = 0;
 
+  /**
+   * Per-unknown-invoice first-seen timestamp for TTL eviction.
+   *
+   * W1 (steelman round-4): without TTL, an attacker who can deliver 500
+   * inbound transfers with synthesized memo invoiceIds permanently exhausts
+   * the unknown-ledger cap, after which legitimate orphan transfers (out-of-
+   * order delivery for real swaps) are silently dropped at the cap-check.
+   *
+   * Round-5 perf: gated by `unknownLedgerNextSweepMs` to amortize the
+   * sweep cost. The naive every-call sweep is O(N) where N=cap=500;
+   * combined with the per-token cleanup loop inside the sweep it became
+   * O(N×M) on every transfer under flood. Now we sweep at most every
+   * `UNKNOWN_LEDGER_SWEEP_INTERVAL_MS` (60s) UNLESS the cap is currently
+   * full, in which case we sweep on each call (the only path that can
+   * actually drop a legitimate orphan).
+   */
+  private unknownLedgerFirstSeen: Map<string, number> = new Map();
+  private unknownLedgerNextSweepMs: number = 0;
+
   /** W17: Tracks whether tokenScanState has been mutated since last flush. */
   private tokenScanDirty = false;
 
@@ -1698,6 +1717,9 @@ export class AccountingModule {
     // W11: Decrement unknown count if this invoice was previously indexed as unknown
     if (this.invoiceLedger.has(tokenId) && !this.invoiceTermsCache.has(tokenId)) {
       this.unknownLedgerCount = Math.max(0, this.unknownLedgerCount - 1);
+      // W1 (round-4): also clear the first-seen timestamp — this invoice
+      // graduated, no longer a TTL eviction candidate.
+      this.unknownLedgerFirstSeen.delete(tokenId);
     }
     this.invoiceTermsCache.set(tokenId, terms);
     this._addToHashIndex(tokenId);
@@ -2077,6 +2099,30 @@ export class AccountingModule {
       cancelled: this.cancelledInvoices.has(invoiceId),
       closed: this.closedInvoices.has(invoiceId),
     };
+  }
+
+  /**
+   * Return the set of token IDs that are currently linked to the given
+   * invoice. Populated by both the on-chain `_processTokenTransactions`
+   * path (tokens with `inv:` references) and the transport-memo orphan
+   * buffering path in `_handleIncomingTransfer`.
+   *
+   * Used by callers that want to scope per-invoice operations (e.g.
+   * SwapModule.verifyPayout's L3 validation) to only the tokens that
+   * cover this invoice — avoiding false negatives when the wallet
+   * contains unrelated tokens of the same currency in unconfirmed or
+   * spent state.
+   *
+   * Returns an empty set if no tokens are currently linked.
+   */
+  getTokenIdsForInvoice(invoiceId: string): Set<string> {
+    const result = new Set<string>();
+    for (const [tokenId, invoiceIds] of this.tokenInvoiceMap) {
+      if (invoiceIds.has(invoiceId)) {
+        result.add(tokenId);
+      }
+    }
+    return result;
   }
 
   /**
@@ -2605,6 +2651,13 @@ export class AccountingModule {
           this.dirtyLedgerEntries.add(invoiceId);
           // Invalidate balance cache for this invoice
           this.balanceCache.delete(invoiceId);
+
+          // BUG-002 Fix 2 (durability extension): Force the provisional entry
+          // to disk before payInvoice returns. The crash-mid-conclude race in
+          // escrow-service `_concludeSwap` → `_resumePayouts` produces
+          // over-coverage on receivers without this — see the audit and the
+          // helper docstring for the full rationale and implementation notes.
+          await this._persistProvisionalAndVerify(invoiceId, 'payInvoice');
         }
 
         // T.7.D / W21: surface the forced-conservative coercion to the caller
@@ -2866,6 +2919,11 @@ export class AccountingModule {
           }
           // Invalidate balance cache for this invoice
           this.balanceCache.delete(invoiceId);
+
+          // Force the provisional entry to disk before returning. Same
+          // rationale as `payInvoice` above — see `_persistProvisionalAndVerify`
+          // for the full implementation rationale.
+          await this._persistProvisionalAndVerify(invoiceId, 'returnInvoicePayment');
         }
 
         return result;
@@ -4386,11 +4444,67 @@ export class AccountingModule {
             continue; // skip loading this entry
           }
           innerMap.set(entryKey, ref);
-          // Rebuild tokenInvoiceMap — only for positional entries (tokenId:txIndex format).
-          // Provisional entries (provisional:uuid) don't map to real tokens.
-          if (!ref.transferId.startsWith('provisional:') && ref.transferId.includes(':')) {
+          // Rebuild tokenInvoiceMap. Four key shapes can appear in the
+          // ledger:
+          //   1. on-chain `${tokenId}:${txIndex}::${coinId}` — token id is
+          //      the prefix of `ref.transferId` (positional id), with `:`
+          //      separator. Original code path.
+          //   2. orphan `mt:${tokenId}:${transferId}` — token id is
+          //      embedded in the ENTRY KEY between the `mt:` prefix and the
+          //      next `:`, NOT in `ref.transferId`.
+          //   3. synthetic `synthetic:${tokenId}::${coinId}` — instant-mode
+          //      payouts. Without this branch, post-restart
+          //      `getTokenIdsForInvoice` returns empty for instant-mode
+          //      payouts and SwapModule.verifyPayout fails dangerously open.
+          //   4. provisional `provisional:${uuid}` — does not map to a real
+          //      token, skip.
+          //
+          // Token IDs are validated with /^[a-f0-9]{64}$/ to defend against
+          // a corrupt-on-disk attacker who writes crafted entry keys to
+          // poison the reverse index.
+          const HEX_64 = /^[a-f0-9]{64}$/i;
+          if (entryKey.startsWith('mt:')) {
+            // mt:<tokenId>:<transferId> — extract tokenId between the two
+            // first colons.
+            const firstColon = entryKey.indexOf(':');
+            const secondColon = entryKey.indexOf(':', firstColon + 1);
+            if (secondColon > firstColon + 1) {
+              const tokenIdFromKey = entryKey.slice(firstColon + 1, secondColon);
+              if (HEX_64.test(tokenIdFromKey)) {
+                this._addToTokenInvoiceMap(tokenIdFromKey, invoiceId);
+              }
+            }
+          } else if (entryKey.startsWith('synthetic:')) {
+            // synthetic:<tokenId>::<coinId> — extract tokenId between the
+            // 'synthetic:' prefix and the next ':'.
+            //
+            // Round-5 migration guard: round-4 BUGGY builds wrote keys
+            // `synthetic:${transferId}::${coinId}` where transferId is a
+            // Nostr event id (also 64-hex). Those entries also have
+            // `ref.transferId === parsed_tokenId`. Round-5+ builds use
+            // the distinct `synthetic-tx:` prefix for the transferId
+            // fallback, so legitimate `synthetic:` entries always have
+            // `ref.transferId !== parsed_tokenId` (the ref carries the
+            // raw transport id, not a tokenId-shaped value). Skip
+            // entries that match the bug fingerprint to avoid polluting
+            // tokenInvoiceMap with Nostr event ids on first reload after
+            // upgrade.
+            const afterPrefix = entryKey.slice('synthetic:'.length);
+            const tokenIdEnd = afterPrefix.indexOf(':');
+            if (tokenIdEnd > 0) {
+              const tokenId = afterPrefix.slice(0, tokenIdEnd);
+              if (HEX_64.test(tokenId) && ref.transferId !== tokenId) {
+                this._addToTokenInvoiceMap(tokenId, invoiceId);
+              }
+            }
+          } else if (
+            !ref.transferId.startsWith('provisional:') &&
+            ref.transferId.includes(':')
+          ) {
             const tokenIdFromRef = ref.transferId.slice(0, ref.transferId.indexOf(':'));
-            this._addToTokenInvoiceMap(tokenIdFromRef, invoiceId);
+            if (HEX_64.test(tokenIdFromRef)) {
+              this._addToTokenInvoiceMap(tokenIdFromRef, invoiceId);
+            }
           }
         }
       } catch (err) {
@@ -4680,12 +4794,42 @@ export class AccountingModule {
         // "synthetic:{transportTransferId}::{coinId}" — match by coinId + direction.
         for (const [existingKey, existingRef] of ledger) {
           if (
-            existingKey.startsWith('synthetic:') &&
+            (existingKey.startsWith('synthetic:') || existingKey.startsWith('synthetic-tx:')) &&
             existingRef.coinId === coinId &&
             existingRef.paymentDirection === paymentDirection
           ) {
             keysToDelete.push(existingKey);
             break; // one-for-one — remove only one synthetic per on-chain entry
+          }
+        }
+        // 2026-04-30 FIX (basic-roundtrip flake investigation):
+        // Also remove matching ORPHAN (mt:) entries. The orphan-buffer
+        // path writes `mt:${tokenId}:${transferId}` when a transport memo
+        // arrives BEFORE the on-chain rescan finds the same payment. The
+        // existing orphan-write-time dedup (line ~4944) skips writing
+        // an mt: entry IF an on-chain entry already exists, but the
+        // REVERSE direction (mt: written first, on-chain arrives later)
+        // had no cleanup — both entries persisted, causing double-
+        // attribution. Symptom in live e2e: payout invoice showed
+        // coveredAmount=20 (expected 10) with surplusAmount=10, gating
+        // verifyPayout's `allConfirmed` check forever because the mt:
+        // entry never gets `confirmed: true`.
+        //
+        // Match by tokenId prefix in the key — `mt:${tokenId}:*` — since
+        // the mt: key encodes the SAME tokenId we're now writing
+        // on-chain. coinId + direction are also matched as defense in
+        // depth (a wallet shouldn't have two different mt: entries for
+        // the same tokenId+coinId+direction, but defensive programming
+        // is cheap here).
+        const mtPrefix = `mt:${tokenId}:`;
+        for (const [existingKey, existingRef] of ledger) {
+          if (
+            existingKey.startsWith(mtPrefix) &&
+            existingRef.coinId === coinId &&
+            existingRef.paymentDirection === paymentDirection
+          ) {
+            keysToDelete.push(existingKey);
+            break; // one-for-one — remove only one mt: per on-chain entry
           }
         }
         for (const pKey of keysToDelete) {
@@ -4839,6 +4983,55 @@ export class AccountingModule {
     }
   }
 
+  /**
+   * Synchronously persist any pending provisional ledger entry for `invoiceId`
+   * before returning to the caller. Used by `payInvoice` and
+   * `returnInvoicePayment` to make the in-memory provisional entry durable
+   * inside the same per-invoice gate that wrote it, closing the
+   * crash-mid-conclude race that produces over-coverage on receivers.
+   *
+   * Implementation:
+   *   1. Schedule a flush via the existing `_flushPromise` chain (so
+   *      concurrent `_handleTokenChange` callers waiting on the chain
+   *      observe ours as part of the sequence).
+   *   2. Await OUR flush directly — NOT `_drainFlushPromise()`, which would
+   *      spin while concurrent token changes keep extending the chain and
+   *      hold the per-invoice gate for an unbounded number of additional
+   *      flushes. We only need OUR provisional entry durable.
+   *   3. `_flushDirtyLedgerEntries` swallows per-invoice `storage.set`
+   *      rejections internally (sets a local `step1Failed` flag), leaving
+   *      the dirty entry on the set without re-throwing. So we post-check
+   *      `dirtyLedgerEntries.has(invoiceId)` and throw a `STORAGE_ERROR`
+   *      `SphereError` if our entry is still dirty — propagating to the
+   *      caller so they learn about the durability failure rather than
+   *      receiving a silent "success" return that lies on disk.
+   *
+   * @param invoiceId    The invoice whose provisional entry must be durable.
+   * @param callContext  Used in the error message so the caller is named
+   *                     ('payInvoice' / 'returnInvoicePayment') without
+   *                     forcing a stack-trace inspection.
+   */
+  private async _persistProvisionalAndVerify(
+    invoiceId: string,
+    callContext: string,
+  ): Promise<void> {
+    const flushTrigger = (this._flushPromise ?? Promise.resolve())
+      .then(() => this._flushDirtyLedgerEntries());
+    const tracked: Promise<void> = flushTrigger
+      .catch(() => { /* swallow for chain */ })
+      .finally(() => {
+        if (this._flushPromise === tracked) this._flushPromise = null;
+      });
+    this._flushPromise = tracked;
+    await flushTrigger;
+    if (this.dirtyLedgerEntries.has(invoiceId)) {
+      throw new SphereError(
+        `${callContext}: provisional ledger entry for invoice ${invoiceId} failed to persist — caller should retry`,
+        'STORAGE_ERROR',
+      );
+    }
+  }
+
   // ===========================================================================
   // Internal: Event handlers
   // ===========================================================================
@@ -4912,8 +5105,34 @@ export class AccountingModule {
       }
     }
 
-    // §6.2 step 2: Invoice not in local store → fire unknown_reference and return
+    // §6.2 step 2: Invoice not in local store → fire unknown_reference and
+    // BUFFER the synthetic ref so importInvoice() can attribute it later.
+    //
+    // Without buffering, transport-memo attribution is permanently lost when
+    // the actual token payment arrives BEFORE the corresponding invoice token
+    // (a real race in the swap-payout flow: escrow's payInvoice publishes the
+    // payment on the wallet/transfer Nostr filter, then sends an invoice
+    // delivery DM on the chat filter — the relay may deliver them in either
+    // order). Mirrors the proactive-indexing buffer used by
+    // _processTokenTransactions for on-chain `inv:` references.
     if (!this.invoiceTermsCache.has(invoiceId)) {
+      // W2 (round-4) + round-5 reentrancy fix: serialize the orphan
+      // cap-check + ledger mutation under withInvoiceGate. The previous
+      // round-4 attempt called `_processInvoiceTransferEvent` from inside
+      // the gate when the invoice graduated mid-flight — that callee
+      // re-acquires the SAME gate and AsyncGateMap throws REENTRANT_GATE
+      // (non-reentrant by contract, see core/async-gate.ts). Round-5
+      // pattern: do the cache re-check INSIDE the gate, but if the
+      // invoice graduated, EXIT the gate (don't recurse), then re-enter
+      // _handleIncomingTransfer's normal path on the outside. The
+      // graduated-invoice path will go through `_processInvoiceTransferEvent`
+      // which acquires its own gate — no nesting.
+      let gracefullyGraduated = false;
+      await this.withInvoiceGate(invoiceId, async () => {
+        if (this.invoiceTermsCache.has(invoiceId)) {
+          gracefullyGraduated = true;
+          return;
+        }
       const syntheticRef = this._buildSyntheticTransferRef(
         transfer,
         invoiceId,
@@ -4921,6 +5140,166 @@ export class AccountingModule {
         confirmed,
       );
       deps.emitEvent('invoice:unknown_reference', { invoiceId, transfer: syntheticRef });
+
+      // Buffer the synthetic ref into an orphan ledger keyed by the (yet-
+      // unknown) invoiceId. The ledger persists; on importInvoice(), the
+      // existing migration logic preserves any pre-existing ledger entries
+      // for the imported ID, so getInvoiceStatus() will see this transfer
+      // immediately after import.
+      const MAX_UNKNOWN_INVOICE_IDS = 500;
+      const UNKNOWN_LEDGER_TTL_MS = 30 * 60 * 1000; // 30 min
+      // Per-invoice entry cap — defends against unbounded growth within a
+      // single unknown invoice id. Without this, a relay redelivering the
+      // same logical payment with different transport `transfer.id` values
+      // could accumulate arbitrarily many `mt:` entries, each persisted to
+      // disk on every dirty-flush. 50 is generous: real swap deposits use
+      // ≤2 transfers per invoice; partial-fill payouts ≤handful.
+      const MAX_ORPHAN_ENTRIES_PER_INVOICE = 50;
+
+      // W1 (round-4) TTL eviction sweep: remove unknown-ledger entries
+      // that haven't graduated to a real invoice import within the TTL.
+      // This defends against the orphan-flood DoS — without TTL, an
+      // attacker can permanently exhaust the 500-entry cap with garbage
+      // memo invoiceIds, dropping legitimate orphan transfers forever.
+      //
+      // Round-5 perf: skip the sweep when (a) it ran recently (60s ago)
+      // AND (b) the cap is not full. Under flood (cap full), every call
+      // sweeps so legitimate transfers can land. Under normal traffic,
+      // sweeps are amortized across 60s windows.
+      const UNKNOWN_LEDGER_SWEEP_INTERVAL_MS = 60_000;
+      const nowMs = Date.now();
+      const capFull = this.unknownLedgerCount >= MAX_UNKNOWN_INVOICE_IDS;
+      const sweepDue = nowMs >= this.unknownLedgerNextSweepMs;
+      if (this.unknownLedgerFirstSeen.size > 0 && (capFull || sweepDue)) {
+        // Round-5 audit fix (TTL busy-loop): always advance the next-sweep
+        // window AND specifically when capFull found nothing evictable —
+        // without this, capFull forces O(N) scan on every transfer
+        // forever. The sweep cadence + cap-full is bounded by O(500)
+        // per call (small constant), but advancing the next-sweep
+        // window keeps it amortized.
+        this.unknownLedgerNextSweepMs = nowMs + UNKNOWN_LEDGER_SWEEP_INTERVAL_MS;
+        const expiredIds: string[] = [];
+        for (const [unkId, firstSeen] of this.unknownLedgerFirstSeen) {
+          if (nowMs - firstSeen > UNKNOWN_LEDGER_TTL_MS) {
+            expiredIds.push(unkId);
+          }
+        }
+        for (const expiredId of expiredIds) {
+          if (!this.invoiceTermsCache.has(expiredId) && this.invoiceLedger.has(expiredId)) {
+            this.invoiceLedger.delete(expiredId);
+            this.unknownLedgerCount = Math.max(0, this.unknownLedgerCount - 1);
+            // Sweep tokenInvoiceMap entries that pointed only at this orphan
+            // invoice (otherwise verifyPayout's reverse lookup would still
+            // see a stale association even after the ledger is gone).
+            for (const [tokenId, invoiceSet] of this.tokenInvoiceMap) {
+              if (invoiceSet.has(expiredId)) {
+                invoiceSet.delete(expiredId);
+                if (invoiceSet.size === 0) this.tokenInvoiceMap.delete(tokenId);
+              }
+            }
+          }
+          this.unknownLedgerFirstSeen.delete(expiredId);
+        }
+      }
+
+      if (!this.invoiceLedger.has(invoiceId)) {
+        if (this.unknownLedgerCount >= MAX_UNKNOWN_INVOICE_IDS) {
+          // Cap reached — drop this orphan. Caller would have to
+          // importInvoice() and rely on its on-chain rescan, which won't
+          // help for transport-memo-only attribution. This is a soft
+          // guarantee: under normal operation, importInvoice() runs within
+          // seconds of the transfer arriving, far below the 500-entry cap.
+          return;
+        }
+        this.invoiceLedger.set(invoiceId, new Map());
+        this.unknownLedgerCount++;
+        this.unknownLedgerFirstSeen.set(invoiceId, nowMs);
+      }
+      const orphanLedger = this.invoiceLedger.get(invoiceId)!;
+      // Per-invoice entry cap — once reached, drop further `mt:` orphans
+      // for this invoiceId. The counter is also re-checked INSIDE the
+      // per-token loop below: a single transfer can carry many tokens, so
+      // a hostile burst could otherwise bypass the cap by overshooting in
+      // one event. We use a mutable local counter rather than rescanning
+      // the keys per token (O(N²) at the cap value).
+      let mtEntryCount = 0;
+      for (const k of orphanLedger.keys()) {
+        if (k.startsWith('mt:')) mtEntryCount++;
+      }
+      if (mtEntryCount >= MAX_ORPHAN_ENTRIES_PER_INVOICE) {
+        return;
+      }
+      // Key by token-id+transfer-id so duplicate event delivery doesn't
+      // create double-counted entries. Prefixed with `mt:` (memo-transport)
+      // to avoid collision with the on-chain dedup keys used elsewhere.
+      //
+      // CRITICAL — dedup against on-chain entries from _processTokenTransactions
+      // (which ran above as part of this same _handleIncomingTransfer call).
+      // Those entries are keyed `${tokenId}:${txIndex}::${coinId}` and represent
+      // the same logical payment. If we wrote an `mt:` entry alongside the
+      // on-chain entry, computeInvoiceStatus would iterate both and DOUBLE-COUNT
+      // the amount, breaking coverage tracking. Skip the orphan write whenever
+      // the on-chain path already attributed this token+invoice pair.
+      for (const token of transfer.tokens) {
+        if (!token.id) continue;
+
+        // Detect on-chain attribution: scan the ledger for any key starting
+        // with `${token.id}:` (the on-chain dedup-key format). One match means
+        // _processTokenTransactions already wrote an entry for this token →
+        // skip the orphan write.
+        let onChainAttributed = false;
+        const tokenKeyPrefix = `${token.id}:`;
+        for (const existingKey of orphanLedger.keys()) {
+          if (
+            existingKey.startsWith(tokenKeyPrefix) &&
+            !existingKey.startsWith('mt:') // mt: keys are NOT on-chain attributions
+          ) {
+            onChainAttributed = true;
+            break;
+          }
+        }
+
+        if (!onChainAttributed) {
+          // Re-check the cap inside the loop. A single transfer carrying
+          // N tokens would otherwise bypass the cap by writing all N
+          // entries before the next event re-checks. Bounded total per
+          // invoice: MAX_ORPHAN_ENTRIES_PER_INVOICE strictly.
+          if (mtEntryCount >= MAX_ORPHAN_ENTRIES_PER_INVOICE) {
+            // Cap reached — drop remaining tokens entirely. Tokens already
+            // processed earlier in this loop iteration retain BOTH their
+            // ledger entry and their tokenInvoiceMap entry; subsequent
+            // tokens (which would have been dropped from the ledger anyway)
+            // get NEITHER. This means verifyPayout's reverse lookup on a
+            // capped-out token returns empty → its new fail-closed branch
+            // returns unverified, which is the safer outcome under DOS.
+            break;
+          }
+          const orphanKey = `mt:${token.id}:${transfer.id}`;
+          if (!orphanLedger.has(orphanKey)) {
+            orphanLedger.set(orphanKey, syntheticRef);
+            mtEntryCount++;
+          }
+        }
+
+        // tokenInvoiceMap is a Set, so adding the same invoiceId twice is a
+        // no-op — safe to populate unconditionally as a downstream-lookup hint.
+        if (!this.tokenInvoiceMap.has(token.id)) {
+          this.tokenInvoiceMap.set(token.id, new Set());
+        }
+        this.tokenInvoiceMap.get(token.id)!.add(invoiceId);
+      }
+      this.dirtyLedgerEntries.add(invoiceId);
+      this.balanceCache.delete(invoiceId);
+      await this._flushDirtyLedgerEntries();
+      });
+      // Round-5 reentrancy fix: if the invoice graduated WHILE we held the
+      // orphan gate, dispatch to the normal path AFTER releasing the gate.
+      // Calling `_processInvoiceTransferEvent` inside the gate would
+      // re-acquire the same lock and AsyncGateMap would throw
+      // REENTRANT_GATE per its non-reentrant contract.
+      if (gracefullyGraduated) {
+        await this._processInvoiceTransferEvent(transfer, invoiceId, paymentDirection, confirmed);
+      }
       return;
     }
 
@@ -5564,7 +5943,11 @@ export class AccountingModule {
       const firstTokenId = transfer.tokens.find((t) => t.id)?.id;
       const syntheticKey = firstTokenId
         ? `synthetic:${firstTokenId}::${syntheticRef.coinId}`
-        : `synthetic:${syntheticRef.transferId}::${syntheticRef.coinId}`;
+        // Round-5 fix: distinct prefix `synthetic-tx:` so the rebuild
+        // parser doesn't mis-attribute the transferId (a 64-hex Nostr
+        // event id) to tokenInvoiceMap as if it were a tokenId.
+        : `synthetic-tx:${syntheticRef.transferId}::${syntheticRef.coinId}`;
+      let mutated = false;
       if (!existingLedger.has(syntheticKey)) {
         // Check no real entry exists for this transfer's tokens (by tokenId prefix match).
         let hasRealEntry = false;
@@ -5580,7 +5963,40 @@ export class AccountingModule {
         }
         if (!hasRealEntry) {
           existingLedger.set(syntheticKey, { ...syntheticRef });
+          mutated = true;
         }
+      }
+
+      // ALSO populate tokenInvoiceMap for every token in the transfer so the
+      // reverse lookup (verifyPayout's `getTokenIdsForInvoice` filter) sees
+      // these tokens as linked to this invoice. Without this, instant-mode
+      // payouts (no on-chain TXF transactions yet) end up with an empty
+      // payoutTokenIds set, and verifyPayout's fail-closed branch returns
+      // unverified — silently failing legitimate swap payouts that happen to
+      // route through the synthetic-ledger path.
+      for (const tok of transfer.tokens) {
+        if (!tok.id) continue;
+        if (!this.tokenInvoiceMap.has(tok.id)) {
+          this.tokenInvoiceMap.set(tok.id, new Set());
+          mutated = true;
+        }
+        const beforeSize = this.tokenInvoiceMap.get(tok.id)!.size;
+        this.tokenInvoiceMap.get(tok.id)!.add(invoiceId);
+        if (this.tokenInvoiceMap.get(tok.id)!.size !== beforeSize) {
+          mutated = true;
+        }
+      }
+
+      // PERSISTENCE: synthetic-ledger entries and tokenInvoiceMap mutations
+      // must be flushed to disk. Without this, on restart both the ledger
+      // entry and the reverse map are gone — verifyPayout's reverse lookup
+      // returns empty for instant-mode payouts even though the actual swap
+      // succeeded, and the post-restart fail-closed branch (correctly) holds
+      // the swap unverified. By marking dirty here we let the next flush
+      // tick checkpoint the synthetic state alongside the on-chain state.
+      if (mutated) {
+        this.dirtyLedgerEntries.add(invoiceId);
+        this.balanceCache.delete(invoiceId);
       }
 
       // §6.2 step 6a: Matches target + asset
@@ -5792,7 +6208,11 @@ export class AccountingModule {
       // history record and matches the token ID used in the transfer event.
       const hKey = entry.tokenId
         ? `synthetic:${entry.tokenId}::${syntheticRef.coinId}`
-        : `synthetic:${syntheticRef.transferId}::${syntheticRef.coinId}`;
+        // Round-5 fix: distinct prefix `synthetic-tx:` so the rebuild
+        // parser doesn't mis-attribute the transferId (a 64-hex Nostr
+        // event id) to tokenInvoiceMap as if it were a tokenId.
+        : `synthetic-tx:${syntheticRef.transferId}::${syntheticRef.coinId}`;
+      let hMutated = false;
       if (!hLedger.has(hKey)) {
         // Check for real entries for this specific token (scoped by tokenId, not broad coinId)
         let hasRealEntry = false;
@@ -5806,7 +6226,30 @@ export class AccountingModule {
         }
         if (!hasRealEntry) {
           hLedger.set(hKey, { ...syntheticRef });
+          hMutated = true;
         }
+      }
+
+      // Also populate tokenInvoiceMap so post-restart verifyPayout's reverse
+      // lookup sees this token as linked to the invoice (parallel to the
+      // _processInvoiceTransferEvent path).
+      if (entry.tokenId) {
+        if (!this.tokenInvoiceMap.has(entry.tokenId)) {
+          this.tokenInvoiceMap.set(entry.tokenId, new Set());
+          hMutated = true;
+        }
+        const beforeSize = this.tokenInvoiceMap.get(entry.tokenId)!.size;
+        this.tokenInvoiceMap.get(entry.tokenId)!.add(invoiceId);
+        if (this.tokenInvoiceMap.get(entry.tokenId)!.size !== beforeSize) {
+          hMutated = true;
+        }
+      }
+
+      // PERSISTENCE: same rationale as _processInvoiceTransferEvent —
+      // synthetic-ledger and tokenInvoiceMap mutations must be flushed.
+      if (hMutated) {
+        this.dirtyLedgerEntries.add(invoiceId);
+        this.balanceCache.delete(invoiceId);
       }
 
       deps.emitEvent('invoice:payment', {

@@ -37,7 +37,16 @@ let mocks: TestSwapModuleMocks;
 const DEPOSIT_INVOICE_ID = 'mock-deposit-invoice-abc123';
 
 /**
- * Create a swap in 'announced' state with a depositInvoiceId.
+ * Create a swap in 'announced' state with a depositInvoiceId, and seed the
+ * mock accounting module with a corresponding 2-asset deposit invoice.
+ *
+ * Real escrows construct the deposit invoice with assets in
+ * `[party_a_currency, party_b_currency]` order, but the SDK's
+ * `canonicalSerialize()` then re-orders them by coinId for hash-determinism.
+ * The seeded invoice mirrors that post-canonical state: assets are sorted by
+ * coinId. SwapModule.deposit() must select the right asset by *currency*,
+ * not by position.
+ *
  * By default the local identity matches party A.
  */
 function setupAnnouncedSwap(overrides?: Partial<SwapRef>): SwapRef {
@@ -51,6 +60,34 @@ function setupAnnouncedSwap(overrides?: Partial<SwapRef>): SwapRef {
     ...overrides,
   });
   injectSwapRef(module, ref);
+
+  // Seed the deposit invoice in the mock accounting store. Assets ordered
+  // canonically (sort by coinId ascending) — same shape the real
+  // canonicalSerialize() produces.
+  const m = ref.manifest;
+  const sortedAssets = [
+    { coin: [m.party_a_currency_to_change, m.party_a_value_to_change] as [string, string] },
+    { coin: [m.party_b_currency_to_change, m.party_b_value_to_change] as [string, string] },
+  ].sort((a, b) =>
+    a.coin[0] < b.coin[0] ? -1 : a.coin[0] > b.coin[0] ? 1 : 0,
+  );
+  mocks.accounting._invoices.set(DEPOSIT_INVOICE_ID, {
+    invoiceId: DEPOSIT_INVOICE_ID,
+    terms: {
+      creator: ref.escrowPubkey,
+      createdAt: Date.now(),
+      targets: [
+        {
+          address: DEFAULT_TEST_ESCROW_ADDRESS,
+          assets: sortedAssets,
+        },
+      ],
+    },
+    isCreator: false,
+    cancelled: false,
+    closed: false,
+  });
+
   return ref;
 }
 
@@ -180,5 +217,87 @@ describe('SwapModule.deposit()', () => {
 
     const updatedSwap = (module as any).swaps.get(ref.swapId) as SwapRef;
     expect(updatedSwap.localDepositTransferId).toBe('tx-123');
+  });
+
+  // ---------------------------------------------------------------------------
+  // UT-SWAP-DEP-009 — Regression: party-currency vs. asset-position skew
+  //
+  // BUG: Before this fix, SwapModule.deposit() chose `assetIndex` by *party
+  // role* (assetIndex=0 for party A, =1 for party B). That assumption broke
+  // because `canonicalSerialize()` sorts each target's assets by coinId for
+  // hash-determinism. When party A's currency hashes *after* party B's, the
+  // sort flips them — and the positional `assetIndex=0` then points at party
+  // B's slot, causing party A to deposit the wrong currency.
+  //
+  // FIX: deposit() now looks up the slot whose coinId matches the party's
+  // expected currency from the manifest, ignoring position.
+  //
+  // This test forces the reverse-sorting case: party A's currency ('ZUSD')
+  // sorts AFTER party B's currency ('AUSD'). With the bug, the test would
+  // fail because party A would pay slot 0 = AUSD (party B's currency).
+  // ---------------------------------------------------------------------------
+  it('UT-SWAP-DEP-009: picks asset by currency match when canonical sort flips party-A↔B order', async () => {
+    // Party A = 'ZUSD', Party B = 'AUSD'. Sort order: AUSD < ZUSD.
+    // After canonical sort, assets[0] = AUSD (party B's), assets[1] = ZUSD (party A's).
+    const deal = createTestSwapDeal({
+      partyACurrency: 'ZUSD',
+      partyBCurrency: 'AUSD',
+      partyAAmount: '1000',
+      partyBAmount: '2000',
+    });
+    // Default identity is party A — should look up its expected currency
+    // ('ZUSD') in the post-sort assets and find it at index 1, NOT 0.
+    const ref = setupAnnouncedSwap({ deal });
+
+    await module.deposit(ref.swapId);
+
+    expect(mocks.accounting.payInvoice).toHaveBeenCalledTimes(1);
+    const [invoiceId, params] = mocks.accounting.payInvoice.mock.calls[0];
+    expect(invoiceId).toBe(DEPOSIT_INVOICE_ID);
+    expect(params.targetIndex).toBe(0);
+    // The fix: party A pays the ZUSD slot, which after canonical sort is
+    // index 1 (NOT 0 as positional party-A logic would have chosen).
+    expect(params.assetIndex).toBe(1);
+  });
+
+  it('UT-SWAP-DEP-010: party B with reverse-sorting currencies picks the partner slot', async () => {
+    // Same scenario as UT-SWAP-DEP-009 but local identity is party B.
+    // Party B's expected currency is 'AUSD' which sorts FIRST → slot 0.
+    // With the old bug, party B would have used assetIndex=1 → pay ZUSD (wrong).
+    const deal = createTestSwapDeal({
+      partyA: DEFAULT_TEST_PARTY_B_ADDRESS, // swap so local identity = party B
+      partyB: DEFAULT_TEST_PARTY_A_ADDRESS,
+      partyACurrency: 'ZUSD',
+      partyBCurrency: 'AUSD',
+      partyAAmount: '1000',
+      partyBAmount: '2000',
+    });
+    const ref = setupAnnouncedSwap({ deal });
+
+    await module.deposit(ref.swapId);
+
+    expect(mocks.accounting.payInvoice).toHaveBeenCalledTimes(1);
+    const [, params] = mocks.accounting.payInvoice.mock.calls[0];
+    // Party B's currency 'AUSD' sorts before 'ZUSD' → slot 0.
+    expect(params.assetIndex).toBe(0);
+  });
+
+  it('UT-SWAP-DEP-011: throws SWAP_DEPOSIT_FAILED when expected currency missing from invoice', async () => {
+    // Manifest declares party A pays 'XYZ' but the seeded invoice contains
+    // only the default UCT/USDU pair — the lookup must fail loudly rather
+    // than silently picking the wrong slot.
+    const ref = setupAnnouncedSwap();
+    // Mutate the on-the-fly manifest so the expected currency no longer
+    // matches any seeded invoice asset.
+    (ref as any).manifest = {
+      ...ref.manifest,
+      party_a_currency_to_change: 'XYZ',
+    };
+    (module as any).swaps.set(ref.swapId, ref);
+
+    await expect(module.deposit(ref.swapId)).rejects.toMatchObject({
+      code: 'SWAP_DEPOSIT_FAILED',
+      message: expect.stringContaining('XYZ'),
+    });
   });
 });
