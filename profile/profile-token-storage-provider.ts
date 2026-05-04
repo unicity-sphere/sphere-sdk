@@ -67,6 +67,11 @@ import {
 } from './types.js';
 import type { ProfileDatabase } from './orbitdb-adapter.js';
 import {
+  isTokenKey,
+  isArchivedKey,
+  isForkedKey,
+} from '../types/txf.js';
+import {
   encryptProfileValue,
   decryptProfileValue,
 } from './encryption.js';
@@ -794,34 +799,36 @@ export class ProfileTokenStorageProvider
     data: TxfStorageDataBase,
   ): Map<string, unknown> {
     const tokens = new Map<string, unknown>();
-    const operationalKeys = new Set([
-      '_meta',
-      '_tombstones',
-      '_outbox',
-      '_sent',
-      '_invalid',
-      '_history',
-      '_mintOutbox',
-      '_invalidatedNametags',
-    ]);
 
+    // Use canonical token-key predicates from `types/txf.ts` rather than a
+    // local ad-hoc operational-key allowlist. The local list previously
+    // missed `_nametags`, `_nametag`, and `_integrity` — when those keys
+    // were present in storage data, they were misclassified as token
+    // entries and passed to `pkg.ingestAll`, which threw
+    // `[UXF:INVALID_PACKAGE] Token must have a genesis field` because
+    // arrays of NametagData / IntegrityRecord don't have a `genesis`
+    // field. The flush silently re-queued forever, the pointer never
+    // published, and recovery was systematically broken on real infra.
+    // Routing through `RESERVED_KEYS` (the single source of truth) keeps
+    // the two callsites in sync and prevents future drift.
     for (const key of Object.keys(data)) {
-      // Standard token keys start with `_` (includes `_forked_` tokens)
-      if (key.startsWith('_') && !operationalKeys.has(key)) {
-        const value = (data as unknown as Record<string, unknown>)[key];
-        if (value && typeof value === 'object') {
-          tokens.set(key, value);
-        }
+      if (!isTokenKey(key) && !isArchivedKey(key) && !isForkedKey(key)) continue;
+      const value = (data as unknown as Record<string, unknown>)[key];
+      // Defense-in-depth: skip anything that isn't a non-array object
+      // (TxfToken is shaped { genesis, state, transactions, ... }).
+      // An array would be an operational entry that snuck past the key
+      // filter; a primitive is an unrecognized payload.
+      if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+      // Defense-in-depth: validate the TxfToken shape before adding to the
+      // ingest set. UxfPackage.ingestAll requires `genesis`. If a future
+      // storage entry slips through the key filter without a `genesis`
+      // field, log + skip rather than DOS the entire flush by throwing.
+      const candidate = value as { genesis?: unknown };
+      if (!candidate.genesis || typeof candidate.genesis !== 'object') {
+        logger.warn('Profile', `extractTokensFromTxfData: skipping malformed token at key="${key}" (no genesis field)`);
         continue;
       }
-
-      // Archived tokens start with `archived-`
-      if (key.startsWith('archived-')) {
-        const value = (data as unknown as Record<string, unknown>)[key];
-        if (value && typeof value === 'object') {
-          tokens.set(key, value);
-        }
-      }
+      tokens.set(key, value);
     }
 
     return tokens;

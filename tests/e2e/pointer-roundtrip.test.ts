@@ -6,16 +6,23 @@
  * `createNodeProfileProviders` so Phase C of `ProfileStorageProvider.
  * doConnect()` actually constructs a ProfilePointerLayer).
  *
+ * REAL-FAUCET FLOW — no stubs. The positive scenario drives the COMPLETE
+ * production path:
+ *
+ *     faucet → Nostr receive → save → debounced flush → CAR pin →
+ *     bundleIndex.addBundle → publishAggregatorPointerBestEffort →
+ *     emit storage:saved{cid}
+ *
+ * This is the same path a wallet hits in production when it receives a
+ * payment. The test then re-runs the discovery side and asserts the
+ * pointer layer recovers the exact CID that was just published.
+ *
  * Real infrastructure:
  *   - Aggregator:  https://goggregator-test.unicity.network
  *   - Nostr relay: wss://nostr-relay.testnet.unicity.network
+ *   - Faucet:      https://faucet.unicity.network
  *   - IPFS:        DEFAULT_IPFS_GATEWAYS (testnet)
  *   - OrbitDB:     Helia + @orbitdb/core (Node, isolated libp2p mode)
- *
- * Test shape mirrors `profile-sync.test.ts` for dataDir setup, identity
- * fixtures, timeouts, and cleanup — but drives the full `Sphere.init`
- * flow end-to-end so the pointer layer is exercised as a runtime
- * subsystem, not as a unit.
  *
  * What this test proves:
  *
@@ -31,9 +38,12 @@
  *      aggregator HTTP RPC responds (HEALTH_CHECK_REQUEST_ID round-
  *      trip per SPEC §11.12).
  *
- *   3. A real save + flush + pointer publish succeeds. The
- *      `storage:saved` event carries the CID that was pinned and
- *      anchored — we capture it for the assertion below.
+ *   3. A REAL faucet receive triggers a save + flush + pointer publish.
+ *      The `storage:saved{cid}` event carries the CID that was pinned
+ *      and anchored — captured here for the assertion below. This is
+ *      the production save path: real Tokens with full `genesis`
+ *      fields, real UXF package validation, real CAR encoding, real
+ *      pin, real aggregator commitment.
  *
  *   4. `pointer.recoverLatest()` returns a non-null `{cid, version}`
  *      and the CID decodes to the same bundle CID the flush published.
@@ -62,14 +72,19 @@
  *   the pointer layer behaviour, not the initialize-ordering bug.
  *
  * Skip conditions:
- *   - `E2E_SKIP_POINTER_ROUNDTRIP=1` — explicit opt-out for CI
- *     environments without testnet access.
+ *   - `RUN_UXF_E2E=1` opt-in — by default the live-network scenarios
+ *     are SKIPPED (matches `uxf-send-receive.test.ts` and the rest of
+ *     the faucet-driven e2e suite). Opt in to drive the actual
+ *     publish/recover.
+ *   - `E2E_SKIP_POINTER_ROUNDTRIP=1` — explicit opt-out for CI shards.
  *   - `NO_TESTNET=1` — ecosystem-wide convention for "no testnet".
+ *   - Preflight infra-probe gate — see `tests/e2e/lib/preflight.ts`.
  *
  * This test is NOT included in the default vitest run — it lives
  * under `tests/e2e/` which is excluded by vitest.config.ts. Invoke
  * explicitly via:
- *   npx vitest run --config vitest.e2e.config.ts tests/e2e/pointer-roundtrip.test.ts
+ *   RUN_UXF_E2E=1 npx vitest run --config vitest.e2e.config.ts \
+ *     tests/e2e/pointer-roundtrip.test.ts
  */
 
 import { describe, it, expect, afterAll } from 'vitest';
@@ -83,28 +98,61 @@ import { DEFAULT_IPFS_BOOTSTRAP_PEERS } from '../../constants';
 import {
   NETWORK,
   DEFAULT_API_KEY,
+  getBalance,
   makeTempDirs,
   ensureTrustbase,
   rand,
+  requestFaucet,
 } from './helpers';
 import type { ProfileStorageProvider } from '../../profile/profile-storage-provider';
 import type { ProfileTokenStorageProvider } from '../../profile/profile-token-storage-provider';
-import type { StorageEvent, TxfStorageDataBase } from '../../storage';
+import type { StorageEvent } from '../../storage';
 import { preflightSkip } from './lib/preflight';
 
 // =============================================================================
 // Skip gates
 // =============================================================================
 
-// Suite needs `aggregator` (pointer round-trip is an aggregator RPC) and
-// `nostr` (wallet identity binding events). The infra-probe runs once at
-// suite start via globalSetup; if either service is unreachable we skip
-// here rather than burning the 30 s pointer-isReachable timeout. Set
+// Suite needs `aggregator` (pointer round-trip is an aggregator RPC),
+// `nostr` (wallet identity binding events + faucet delivery), and `ipfs`
+// (CAR pinning + bundle retrieval). The infra-probe runs once at suite
+// start via globalSetup; if any service is unreachable we skip here
+// rather than burning the 30 s pointer-isReachable timeout. Set
 // E2E_SKIP_PREFLIGHT=1 to bypass the probe entirely.
+//
+// RUN_UXF_E2E=1 is the same opt-in used by `uxf-send-receive.test.ts`
+// — kept identical so both suites are exercised by the same CI flag
+// and so this suite stays SKIPPED in the default run (which has no
+// faucet contract).
 const SKIP =
   process.env.E2E_SKIP_POINTER_ROUNDTRIP === '1' ||
   process.env.NO_TESTNET === '1' ||
-  preflightSkip(['aggregator', 'nostr'], 'pointer-roundtrip');
+  process.env.RUN_UXF_E2E !== '1' ||
+  preflightSkip(['aggregator', 'nostr', 'ipfs'], 'pointer-roundtrip');
+
+// =============================================================================
+// Constants — match uxf-send-receive.test.ts so both suites share infra
+// expectations (testnet relay/faucet/aggregator can be slow under load).
+// =============================================================================
+
+/** Faucet top-up budget — same as uxf-send-receive.test.ts. */
+const FAUCET_TOPUP_MS = 240_000;
+/** Faucet HTTP retries on per-call failures. */
+const FAUCET_HTTP_RETRIES = 3;
+const FAUCET_RETRY_DELAY_MS = 5_000;
+/** Storage flush window — the pointer publish runs at the tail of the flush. */
+const FLUSH_WAIT_MS = 240_000;
+
+// Primary test coin: USDU (6 decimals). Faucet drops 1000 USDU = 1e9
+// smallest units, well below uint64 — avoids the CBOR overflow
+// documented in uxf-send-receive.test.ts for UCT.
+const PRIMARY_SYMBOL = 'USDU' as const;
+const PRIMARY_FAUCET = 'unicity-usd' as const;
+const PRIMARY_FAUCET_AMOUNT = 1000;
+/** Minimum confirmed amount before we declare the faucet receive complete. */
+const PRIMARY_MIN_CONFIRMED = 1_000_000n; // 1 USDU at 6 decimals
+
+const POLL_INTERVAL_MS = 250;
 
 // =============================================================================
 // Providers — direct construction so we control oracle threading
@@ -116,10 +164,14 @@ const SKIP =
  * to the CLI. Without this oracle-threading, `tryBuildPointerLayer`
  * exits with `oracle_missing` and the pointer layer is never built.
  *
- * We do NOT reuse `makeProfileProviders` from `profile-helpers.ts`
- * because it does not thread the oracle — deliberately kept so this
- * test's provider setup is self-contained and explicit about the
- * invariant it needs.
+ * We do NOT reuse `makeProviders` from `helpers.ts` because:
+ *   - It does not thread the oracle into a Profile factory (it builds
+ *     the legacy file-backed storage instead).
+ *   - The pointer layer is part of `ProfileStorageProvider`, not the
+ *     legacy `FileStorageProvider`.
+ *
+ * Kept self-contained so this test's provider setup is explicit about
+ * the invariant it needs.
  */
 function makePointerProviders(dirs: {
   dataDir: string;
@@ -137,9 +189,9 @@ function makePointerProviders(dirs: {
       trustBasePath: join(dirs.dataDir, 'trustbase.json'),
       apiKey: DEFAULT_API_KEY,
     },
-    // No IPFS token sync — pointer layer replaces IPNS-based recovery
-    // so we don't want the legacy IPFS provider fighting for the same
-    // state.
+    // No legacy IPFS token sync — pointer layer replaces IPNS-based
+    // recovery, so we don't want the legacy IPFS provider fighting for
+    // the same state.
     tokenSync: { ipfs: { enabled: false } },
     market: false,
     groupChat: false,
@@ -199,6 +251,10 @@ function profileTokenStorageOf(sphere: Sphere): ProfileTokenStorageProvider {
  * `data.debounced === true` and NO cid — we skip that one. The
  * second `storage:saved`, emitted at the end of `flushToIpfs()`,
  * carries the published CID.
+ *
+ * Subscribe BEFORE triggering the flush (the faucet receive saves
+ * synchronously inside PaymentsModule's incoming-transfer handler, so
+ * the debounced flush starts almost immediately).
  */
 function waitForFlushedCid(
   tokenStorage: ProfileTokenStorageProvider,
@@ -215,6 +271,22 @@ function waitForFlushedCid(
       );
     }, timeoutMs);
     const unsubscribe = tokenStorage.onEvent((event: StorageEvent) => {
+      // Fast-fail on flush errors so regressions don't hide behind the
+      // 240s wait-for-cid timeout. A storage:error during the wait
+      // window means the flush threw — surface a precise message rather
+      // than a generic "did not reach publishAggregatorPointerBestEffort".
+      if (event.type === 'storage:error') {
+        const ev = event as { error?: unknown; code?: unknown };
+        clearTimeout(timer);
+        unsubscribe();
+        reject(
+          new Error(
+            `Profile flush emitted storage:error during pointer publish — ` +
+              `code=${String(ev.code)} error=${String(ev.error)}`,
+          ),
+        );
+        return;
+      }
       if (event.type !== 'storage:saved') return;
       const data = event.data as { cid?: string; debounced?: boolean } | undefined;
       if (!data || typeof data.cid !== 'string') return;
@@ -252,32 +324,87 @@ async function waitForReachable(
 }
 
 /**
- * Minimal synthetic UXF inventory for triggering a flush. The token
- * storage provider's `save()` schedules a debounced flush; the flush
- * reads `pendingData`, builds a UXF package, pins a CAR, writes the
- * bundle ref to OrbitDB, and finally calls
- * `publishAggregatorPointerBestEffort()`. We need at least `_meta`
- * populated so the extract helpers do not bail out.
+ * Top up `nametag` with `symbol` (via faucet name `faucetName`) until
+ * the wallet sees `>= minAmount` confirmed. Mirrors the helper in
+ * `uxf-send-receive.test.ts` exactly — same retry policy, same poll
+ * cadence — so both suites have identical faucet timing expectations.
  *
- * The `archived-*` prefix keeps the tokens out of the operational-
- * state extraction path (`_outbox`, `_sent`, `_history`) and routes
- * them through the token-extraction path that ends up in the CAR.
+ * The faucet pushes real Tokens to the wallet via the testnet Nostr
+ * relay. PaymentsModule's incoming-transfer handler decodes the
+ * payload, calls `provider.save()` on the per-address token storage,
+ * which schedules the debounced flush that ultimately publishes the
+ * pointer anchor.
  */
-function buildSyntheticInventory(
-  ownerAddress: string,
-): TxfStorageDataBase {
-  return {
-    _meta: {
-      version: 1,
-      address: ownerAddress,
-      formatVersion: '2.0',
-      updatedAt: Date.now(),
-    },
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    ['archived-alpha']: { id: 'alpha', coinId: 'UCT', amount: '1000' } as any,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    ['archived-bravo']: { id: 'bravo', coinId: 'UCT', amount: '2500' } as any,
-  };
+async function topUpCoin(
+  sphere: Sphere,
+  nametag: string,
+  symbol: string,
+  faucetName: string,
+  faucetAmount: number,
+  minAmount: bigint,
+  timeoutMs: number,
+): Promise<bigint> {
+  let lastErr: string | undefined;
+  for (let attempt = 1; attempt <= FAUCET_HTTP_RETRIES; attempt++) {
+    const faucet = await requestFaucet(nametag, faucetName, faucetAmount);
+    if (faucet.success) {
+      lastErr = undefined;
+      break;
+    }
+    lastErr = faucet.message;
+    if (attempt < FAUCET_HTTP_RETRIES) {
+      console.warn(
+        `  Faucet ${symbol} attempt ${attempt}/${FAUCET_HTTP_RETRIES} failed: ${faucet.message}; retrying in ${FAUCET_RETRY_DELAY_MS / 1000}s`,
+      );
+      await new Promise((r) => setTimeout(r, FAUCET_RETRY_DELAY_MS));
+    }
+  }
+  if (lastErr !== undefined) {
+    console.warn(
+      `  Faucet ${symbol} all ${FAUCET_HTTP_RETRIES} attempts failed (continuing — may already be funded): ${lastErr}`,
+    );
+  }
+  const start = performance.now();
+  let confirmed = 0n;
+  while (performance.now() - start < timeoutMs) {
+    try {
+      await sphere.payments.receive({ finalize: true });
+    } catch {
+      /* keep polling */
+    }
+    const bal = getBalance(sphere, symbol);
+    confirmed = bal.confirmed;
+    if (confirmed >= minAmount) return confirmed;
+    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+  }
+  throw new Error(
+    `Faucet top-up timed out after ${(timeoutMs / 1000).toFixed(0)}s: have ${confirmed} confirmed ${symbol}, need >= ${minAmount}` +
+      (lastErr ? ` (last faucet error: ${lastErr})` : ''),
+  );
+}
+
+/**
+ * Sphere.init() with a Profile-backed wallet on real testnet. Returns
+ * the sphere plus the dataDir so the caller can register it for
+ * cleanup. Nametag is REQUIRED — the faucet can only deliver to a
+ * wallet whose `@nametag` binding event has propagated to the relay.
+ */
+async function initWallet(label: string, nametag: string): Promise<{
+  sphere: Sphere;
+  baseDir: string;
+}> {
+  const dirs = makeTempDirs(`pointer-${label}-${rand()}`);
+  await ensureTrustbase(dirs.dataDir);
+  const providers = makePointerProviders(dirs);
+  const { sphere, generatedMnemonic } = await Sphere.init({
+    ...providers,
+    autoGenerate: true,
+    nametag,
+  });
+  if (!generatedMnemonic) {
+    throw new Error(`Wallet ${label} should be created with a fresh mnemonic`);
+  }
+  return { sphere, baseDir: dirs.base };
 }
 
 // =============================================================================
@@ -310,178 +437,184 @@ describe.skipIf(SKIP)('ProfilePointerLayer round-trip (Unicity testnet)', () => 
   }, 30_000);
 
   // ---------------------------------------------------------------------------
-  // Test 1: Full round-trip — publish then recover
+  // Test 1: Full round-trip — real faucet receive publishes a pointer anchor,
+  // recoverLatest finds the same CID.
   // ---------------------------------------------------------------------------
 
-  it('publishes a pointer anchor and recovers it on the same wallet', async () => {
-    const label = `pointer-roundtrip-${rand()}`;
-    const dirs = makeTempDirs(label);
-    cleanupDirs.push(dirs.base);
-    await ensureTrustbase(dirs.dataDir);
+  it(
+    'publishes a pointer anchor via real-faucet receive and recovers it on the same wallet',
+    async () => {
+      const tag = rand();
+      const aliceTag = `e2e-pointer-${tag}`;
 
-    const providers = makePointerProviders(dirs);
+      console.log(`\n[pointer-roundtrip] Alice=@${aliceTag} (primary coin: ${PRIMARY_SYMBOL})`);
+      const t0 = performance.now();
+      const a = await initWallet('alice', aliceTag);
+      const tInit = performance.now() - t0;
+      cleanupDirs.push(a.baseDir);
+      spheres.push(a.sphere);
+      console.log(`[pointer-roundtrip] Sphere.init took ${tInit.toFixed(0)}ms`);
+      console.log(`[pointer-roundtrip] identity=${a.sphere.identity!.l1Address}`);
 
-    console.log(`\n[pointer-roundtrip] dataDir=${dirs.dataDir}`);
-    console.log('[pointer-roundtrip] Creating Profile-backed wallet...');
-    const t0 = performance.now();
-    const { sphere, created, generatedMnemonic } = await Sphere.init({
-      ...providers,
-      autoGenerate: true,
-      // No nametag — the on-chain mint adds ~30-60s of latency we
-      // do not need for the pointer-layer assertions. The pointer
-      // layer's signing key is HKDF-derived from the master key,
-      // independent of the nametag.
-    });
-    const tInit = performance.now() - t0;
-    spheres.push(sphere);
+      // See ORDERING NOTE at the top of this file. Force a Phase-C
+      // retry now that the oracle is initialized — without this, the
+      // pointer layer stays in `aggregator_client_unavailable` skip
+      // state.
+      const profileStorage = profileStorageOf(a.sphere);
+      await profileStorage.connect();
 
-    expect(created).toBe(true);
-    expect(generatedMnemonic).toBeTruthy();
-    console.log(`[pointer-roundtrip] Sphere.init took ${tInit.toFixed(0)}ms`);
-    console.log(`[pointer-roundtrip] identity=${sphere.identity!.l1Address}`);
+      // Assertion 1: pointer layer is constructed AND skip reason is null.
+      const skipReason = profileStorage.getPointerSkipReason();
+      const pointer = profileStorage.getPointerLayer();
+      console.log(`[pointer-roundtrip] skipReason=${skipReason ?? '(null)'}`);
+      expect(skipReason).toBeNull();
+      expect(pointer).not.toBeNull();
+      if (!pointer) throw new Error('unreachable: narrowed by expect above');
 
-    // See ORDERING NOTE at the top of this file. Force a Phase-C
-    // retry now that the oracle is initialized — without this, the
-    // pointer layer stays in `aggregator_client_unavailable` skip
-    // state.
-    const profileStorage = profileStorageOf(sphere);
-    await profileStorage.connect();
+      // Assertion 2: aggregator HTTP RPC responds to our probe within
+      // 30s. This is the first real network call that hits the testnet
+      // aggregator — if it fails, every subsequent publish/recover
+      // assertion is guaranteed to fail too, so fail fast with a clear
+      // error message instead of waiting for a publish timeout.
+      console.log('[pointer-roundtrip] Probing aggregator reachability...');
+      const tReach0 = performance.now();
+      await waitForReachable(pointer, 30_000);
+      const tReach = performance.now() - tReach0;
+      console.log(`[pointer-roundtrip] isReachable=true (${tReach.toFixed(0)}ms)`);
 
-    // Assertion 1: pointer layer is constructed AND skip reason is null.
-    const skipReason = profileStorage.getPointerSkipReason();
-    const pointer = profileStorage.getPointerLayer();
-    console.log(`[pointer-roundtrip] skipReason=${skipReason ?? '(null)'}`);
-    expect(skipReason).toBeNull();
-    expect(pointer).not.toBeNull();
-    if (!pointer) throw new Error('unreachable: narrowed by expect above');
+      // Assertion 2b: BLOCKED must be false on a fresh wallet.
+      const blockedBefore = await pointer.getBlockedState();
+      expect(blockedBefore.blocked).toBe(false);
 
-    // Assertion 2: aggregator HTTP RPC responds to our probe within
-    // 30s. This is the first real network call that hits the testnet
-    // aggregator — if it fails, every subsequent publish/recover
-    // assertion is guaranteed to fail too, so fail fast with a clear
-    // error message instead of waiting for a publish timeout.
-    console.log('[pointer-roundtrip] Probing aggregator reachability...');
-    const tReach0 = performance.now();
-    await waitForReachable(pointer, 30_000);
-    const tReach = performance.now() - tReach0;
-    console.log(`[pointer-roundtrip] isReachable=true (${tReach.toFixed(0)}ms)`);
+      // Subscribe to storage:saved BEFORE the faucet so we don't miss
+      // the flush event. PaymentsModule saves synchronously inside the
+      // incoming-transfer handler, so the debounced flush starts as
+      // soon as the first faucet token arrives.
+      const tokenStorage = profileTokenStorageOf(a.sphere);
+      const flushedCidPromise = waitForFlushedCid(tokenStorage, FLUSH_WAIT_MS);
 
-    // Assertion 2b: BLOCKED must be false on a fresh wallet.
-    const blockedBefore = await pointer.getBlockedState();
-    expect(blockedBefore.blocked).toBe(false);
+      // Real faucet — drops real Tokens (with full `genesis` fields,
+      // valid for UXF package validation) into Alice's wallet via the
+      // testnet Nostr relay. The receive triggers the natural
+      // PaymentsModule save → debounced flush → CAR pin →
+      // bundleIndex.addBundle → publishAggregatorPointerBestEffort →
+      // emit storage:saved{cid} sequence.
+      console.log(`[pointer-roundtrip] Requesting ${PRIMARY_FAUCET_AMOUNT} ${PRIMARY_SYMBOL} from faucet...`);
+      const tFaucet0 = performance.now();
+      const aliceBalance = await topUpCoin(
+        a.sphere,
+        aliceTag,
+        PRIMARY_SYMBOL,
+        PRIMARY_FAUCET,
+        PRIMARY_FAUCET_AMOUNT,
+        PRIMARY_MIN_CONFIRMED,
+        FAUCET_TOPUP_MS,
+      );
+      const tFaucet = performance.now() - tFaucet0;
+      console.log(
+        `[pointer-roundtrip] Faucet receive complete in ${tFaucet.toFixed(0)}ms — Alice has ${aliceBalance} ${PRIMARY_SYMBOL} confirmed`,
+      );
 
-    // Trigger a pointer publish by calling `save()` directly on the
-    // token storage provider. This schedules a debounced flush
-    // which calls `flushToIpfs()` which calls
-    // `publishAggregatorPointerBestEffort()`. We watch for the
-    // terminal `storage:saved` event carrying the CID.
-    //
-    // Why NOT go through `sphere.payments.sync()`:
-    //   `sync()` calls `provider.sync(localData)` (read-only merge),
-    //   not `provider.save(localData)`. No flush is scheduled. A
-    //   read-only sync on a fresh wallet sees no remote bundles and
-    //   returns immediately with `{added:0, removed:0}`. See
-    //   PaymentsModule._doSync path (lines ~5193-5210).
-    //
-    // Why NOT go through `sphere.payments.send()`:
-    //   Would require L3 identity resolution + aggregator round-trip
-    //   for the state transition, adding ~5-15s to the test and
-    //   exercising subsystems unrelated to the pointer layer. A
-    //   synthetic save keeps the test focused on the pointer
-    //   publish/recover code path.
-    const tokenStorage = profileTokenStorageOf(sphere);
-    const flushWaiter = waitForFlushedCid(tokenStorage, 90_000);
+      // Wait for the flush at the tail of the receive to publish the
+      // pointer anchor.
+      console.log('[pointer-roundtrip] Waiting for storage:saved{cid} event...');
+      const publishedCid = await flushedCidPromise;
+      console.log(`[pointer-roundtrip] Flush published cid=${publishedCid}`);
 
-    console.log('[pointer-roundtrip] Triggering save + flush...');
-    const tPub0 = performance.now();
-    const saveResult = await tokenStorage.save(
-      buildSyntheticInventory(sphere.identity!.directAddress ?? sphere.identity!.l1Address),
-    );
-    expect(saveResult.success).toBe(true);
+      // Assertion 3: the published CID parses as a valid CID.
+      const parsedPublished = CID.parse(publishedCid);
+      expect(parsedPublished.version).toBeGreaterThanOrEqual(0);
 
-    const publishedCid = await flushWaiter;
-    const tPub = performance.now() - tPub0;
-    console.log(
-      `[pointer-roundtrip] Flush completed in ${tPub.toFixed(0)}ms, cid=${publishedCid}`,
-    );
+      // Assertion 3b: BLOCKED remains false after publish.
+      const blockedAfter = await pointer.getBlockedState();
+      expect(blockedAfter.blocked).toBe(false);
 
-    // Assertion 3: the published CID parses as a valid CID.
-    const parsedPublished = CID.parse(publishedCid);
-    expect(parsedPublished.version).toBeGreaterThanOrEqual(0);
+      // Assertion 4: recoverLatest returns non-null with matching CID
+      // and a version >= 1.
+      //
+      // Retry briefly: pointer.publish returns once the aggregator has
+      // accepted the submission, but discover may need a moment for the
+      // SMT to settle. 10× 1s is more than enough on a healthy testnet.
+      console.log('[pointer-roundtrip] Recovering latest via pointer layer...');
+      const tRec0 = performance.now();
+      let recovered: { cid: Uint8Array; version: number } | null = null;
+      for (let attempt = 0; attempt < 10; attempt++) {
+        recovered = await pointer.recoverLatest();
+        if (recovered) break;
+        if (attempt < 9) await new Promise((r) => setTimeout(r, 1000));
+      }
+      const tRec = performance.now() - tRec0;
+      console.log(`[pointer-roundtrip] recoverLatest took ${tRec.toFixed(0)}ms (recovered=${recovered ? `v${recovered.version}` : 'null'})`);
 
-    // Assertion 3b: BLOCKED remains false after publish.
-    const blockedAfter = await pointer.getBlockedState();
-    expect(blockedAfter.blocked).toBe(false);
+      expect(recovered).not.toBeNull();
+      if (!recovered) throw new Error('unreachable: narrowed by expect above');
+      expect(recovered.version).toBeGreaterThanOrEqual(1);
 
-    // Assertion 4: recoverLatest returns non-null with matching CID
-    // and a version >= 1.
-    console.log('[pointer-roundtrip] Recovering latest via pointer layer...');
-    const tRec0 = performance.now();
-    const recovered = await pointer.recoverLatest();
-    const tRec = performance.now() - tRec0;
-    console.log(`[pointer-roundtrip] recoverLatest took ${tRec.toFixed(0)}ms`);
+      // The CID bytes decoded by the pointer layer must match the CID
+      // the flush published. This is the critical end-to-end assertion
+      // — it proves the anchor we published IS the anchor the discover
+      // algorithm finds.
+      const recoveredCidString = CID.decode(recovered.cid).toString();
+      expect(recoveredCidString).toBe(publishedCid);
+      console.log(
+        `[pointer-roundtrip] recovered v=${recovered.version} cid=${recoveredCidString}`,
+      );
 
-    expect(recovered).not.toBeNull();
-    if (!recovered) throw new Error('unreachable: narrowed by expect above');
-    expect(recovered.version).toBeGreaterThanOrEqual(1);
-
-    // The CID bytes decoded by the pointer layer must match the CID
-    // the flush published. This is the critical end-to-end assertion
-    // — it proves the anchor we published IS the anchor the discover
-    // algorithm finds.
-    const recoveredCidString = CID.decode(recovered.cid).toString();
-    expect(recoveredCidString).toBe(publishedCid);
-    console.log(
-      `[pointer-roundtrip] recovered v=${recovered.version} cid=${recoveredCidString}`,
-    );
-
-    // Summary line for operator logs.
-    console.log(
-      `[pointer-roundtrip] TIMING init=${tInit.toFixed(0)}ms ` +
-        `reach=${tReach.toFixed(0)}ms publish=${tPub.toFixed(0)}ms ` +
-        `recover=${tRec.toFixed(0)}ms`,
-    );
-  }, 120_000);
+      // Summary line for operator logs.
+      console.log(
+        `[pointer-roundtrip] TIMING init=${tInit.toFixed(0)}ms ` +
+          `reach=${tReach.toFixed(0)}ms faucet=${tFaucet.toFixed(0)}ms ` +
+          `recover=${tRec.toFixed(0)}ms`,
+      );
+    },
+    480_000,
+  );
 
   // ---------------------------------------------------------------------------
   // Test 2: Negative — fresh wallet has no anchor to recover
   // ---------------------------------------------------------------------------
 
-  it('returns null from recoverLatest on a freshly-created wallet that has never published', async () => {
-    const label = `pointer-empty-${rand()}`;
-    const dirs = makeTempDirs(label);
-    cleanupDirs.push(dirs.base);
-    await ensureTrustbase(dirs.dataDir);
+  it(
+    'returns null from recoverLatest on a freshly-created wallet that has never published',
+    async () => {
+      const label = `pointer-empty-${rand()}`;
+      const dirs = makeTempDirs(label);
+      cleanupDirs.push(dirs.base);
+      await ensureTrustbase(dirs.dataDir);
 
-    const providers = makePointerProviders(dirs);
+      const providers = makePointerProviders(dirs);
 
-    // Fresh mnemonic — guaranteed to have never published a pointer
-    // anchor against the testnet aggregator (keyspace is 2^256).
-    const { sphere } = await Sphere.init({
-      ...providers,
-      autoGenerate: true,
-    });
-    spheres.push(sphere);
+      // Fresh mnemonic — guaranteed to have never published a pointer
+      // anchor against the testnet aggregator (keyspace is 2^256). No
+      // nametag either: this wallet never receives, never sends,
+      // never saves.
+      const { sphere } = await Sphere.init({
+        ...providers,
+        autoGenerate: true,
+      });
+      spheres.push(sphere);
 
-    // Same ordering workaround as the positive test — reconnect
-    // triggers Phase C retry now that the oracle is initialized.
-    const profileStorage = profileStorageOf(sphere);
-    await profileStorage.connect();
+      // Same ordering workaround as the positive test — reconnect
+      // triggers Phase C retry now that the oracle is initialized.
+      const profileStorage = profileStorageOf(sphere);
+      await profileStorage.connect();
 
-    const pointer = profileStorage.getPointerLayer();
-    expect(pointer).not.toBeNull();
-    if (!pointer) throw new Error('unreachable: narrowed by expect above');
+      const pointer = profileStorage.getPointerLayer();
+      expect(pointer).not.toBeNull();
+      if (!pointer) throw new Error('unreachable: narrowed by expect above');
 
-    // Must return null WITHOUT throwing. A fresh wallet must not
-    // leave the pointer layer in a BLOCKED state from the discovery
-    // probe alone — BLOCKED is reserved for integrity violations
-    // (§10.2).
-    const recovered = await pointer.recoverLatest();
-    expect(recovered).toBeNull();
+      // Must return null WITHOUT throwing. A fresh wallet must not
+      // leave the pointer layer in a BLOCKED state from the discovery
+      // probe alone — BLOCKED is reserved for integrity violations
+      // (§10.2).
+      const recovered = await pointer.recoverLatest();
+      expect(recovered).toBeNull();
 
-    const blocked = await pointer.getBlockedState();
-    expect(blocked.blocked).toBe(false);
+      const blocked = await pointer.getBlockedState();
+      expect(blocked.blocked).toBe(false);
 
-    console.log('[pointer-empty] recoverLatest returned null as expected');
-  }, 60_000);
+      console.log('[pointer-empty] recoverLatest returned null as expected');
+    },
+    60_000,
+  );
 });

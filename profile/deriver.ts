@@ -40,6 +40,10 @@ import type {
   TxfSentEntry,
   HistoryRecord,
 } from '../storage/storage-provider.js';
+import {
+  isTokenKey as isActiveTokenKeyCanonical,
+  isArchivedKey as isArchivedKeyCanonical,
+} from '../types/txf.js';
 
 // =============================================================================
 // Token shape helpers
@@ -82,23 +86,18 @@ interface MinimalTxfTransaction {
   } | null;
 }
 
-const TOKEN_KEY_OPERATIONAL = new Set([
-  '_meta',
-  '_tombstones',
-  '_outbox',
-  '_sent',
-  '_invalid',
-  '_history',
-  '_mintOutbox',
-  '_invalidatedNametags',
-]);
-
+// Local aliases to the canonical predicates from `types/txf.ts`. The
+// previous local `TOKEN_KEY_OPERATIONAL` set silently diverged from the
+// canonical `RESERVED_KEYS` (missing `_nametags`, `_nametag`, `_integrity`)
+// — the same divergence that broke `extractTokensFromTxfData` in the
+// Profile flush. Routing through the canonical predicates keeps both
+// callsites in sync.
 function isArchivedKey(key: string): boolean {
-  return key.startsWith('archived-');
+  return isArchivedKeyCanonical(key);
 }
 
 function isActiveTokenKey(key: string): boolean {
-  return key.startsWith('_') && !TOKEN_KEY_OPERATIONAL.has(key);
+  return isActiveTokenKeyCanonical(key);
 }
 
 function asMinimalToken(value: unknown): MinimalTxfToken | null {
