@@ -44,7 +44,7 @@ import { preflightSkip } from './lib/preflight';
 // Test Suite
 // =============================================================================
 
-const SKIP_INFRA = preflightSkip(["nostr","aggregator","ipfs"], 'profile-token-persistence');
+const SKIP_INFRA = preflightSkip(["nostr","aggregator","ipfs","faucet"], 'profile-token-persistence');
 
 describe.skipIf(SKIP_INFRA)('Profile (OrbitDB) Active Token Persistence E2E', () => {
   // Shared state across ordered tests

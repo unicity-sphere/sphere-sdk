@@ -46,7 +46,7 @@ import { preflightSkip } from './lib/preflight';
 // Constants
 // ---------------------------------------------------------------------------
 
-const SKIP_INFRA = preflightSkip(['nostr', 'aggregator', 'ipfs'], 'profile-sync');
+const SKIP_INFRA = preflightSkip(['nostr', 'aggregator', 'ipfs', 'faucet'], 'profile-sync');
 
 // Faucet primary coin: USDU (6 decimals). 1000 USDU = 1e9 smallest units —
 // well below the uint64 ceiling, so no CBOR overflow for the CAR encoder.

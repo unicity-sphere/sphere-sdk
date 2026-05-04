@@ -49,7 +49,7 @@ import { preflightSkip } from './lib/preflight';
 // Test Suite
 // =============================================================================
 
-const SKIP_INFRA = preflightSkip(["nostr","ipfs"], 'ipfs-multi-device-sync');
+const SKIP_INFRA = preflightSkip(["nostr","ipfs","faucet"], 'ipfs-multi-device-sync');
 
 describe.skipIf(SKIP_INFRA)('IPFS Multi-Device Sync E2E', () => {
   // Shared state across ordered tests

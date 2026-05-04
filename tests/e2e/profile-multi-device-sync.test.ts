@@ -42,7 +42,7 @@ import { preflightSkip } from './lib/preflight';
 // Test Suite
 // =============================================================================
 
-const SKIP_INFRA = preflightSkip(["nostr","ipfs"], 'profile-multi-device-sync');
+const SKIP_INFRA = preflightSkip(["nostr","ipfs","faucet"], 'profile-multi-device-sync');
 
 describe.skipIf(SKIP_INFRA)('Profile Multi-Device Sync E2E', () => {
   let savedMnemonic: string;

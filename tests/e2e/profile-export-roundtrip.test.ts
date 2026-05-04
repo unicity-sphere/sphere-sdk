@@ -50,7 +50,7 @@ import type { ProfileTokenStorageProvider } from '../../profile/profile-token-st
 // =============================================================================
 
 const SKIP_INFRA = preflightSkip(
-  ['nostr', 'aggregator', 'ipfs'],
+  ['nostr', 'aggregator', 'ipfs', 'faucet'],
   'profile-export-roundtrip',
 );
 const RUN_OPT_IN = process.env.RUN_PROFILE_EXPORT_E2E === '1';

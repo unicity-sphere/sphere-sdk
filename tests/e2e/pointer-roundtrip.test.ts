@@ -128,7 +128,7 @@ const SKIP =
   process.env.E2E_SKIP_POINTER_ROUNDTRIP === '1' ||
   process.env.NO_TESTNET === '1' ||
   process.env.RUN_UXF_E2E !== '1' ||
-  preflightSkip(['aggregator', 'nostr', 'ipfs'], 'pointer-roundtrip');
+  preflightSkip(['aggregator', 'nostr', 'ipfs', 'faucet'], 'pointer-roundtrip');
 
 // =============================================================================
 // Constants — match uxf-send-receive.test.ts so both suites share infra

@@ -30,7 +30,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 export const PREFLIGHT_RESULT_FILE = join(HERE, '..', '.preflight-result.json');
 
 /** Service names the probe reports — keep in sync with @unicitylabs/infra-probe SERVICES. */
-export type ServiceName = 'nostr' | 'aggregator' | 'ipfs' | 'fulcrum' | 'market';
+export type ServiceName = 'nostr' | 'aggregator' | 'ipfs' | 'fulcrum' | 'market' | 'faucet';
 
 export interface ServiceCheck {
   readonly name: string;

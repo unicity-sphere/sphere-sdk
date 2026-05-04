@@ -142,7 +142,7 @@ function getUctBalance(sphere: Sphere): BalanceSnapshot | null {
 // Test
 // =============================================================================
 
-const SKIP_INFRA = preflightSkip(["nostr","aggregator","ipfs"], 'wallet-lifecycle');
+const SKIP_INFRA = preflightSkip(["nostr","aggregator","ipfs","faucet"], 'wallet-lifecycle');
 
 describe.skipIf(SKIP_INFRA)('Wallet lifecycle: create → topup → send → destroy → import → IPFS recover', () => {
   const cleanupDirs: string[] = [];

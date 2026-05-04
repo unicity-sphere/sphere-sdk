@@ -44,7 +44,7 @@ import { preflightSkip } from './lib/preflight';
 // Gated by RUN_CONTINUOUS_TESTS opt-in AND the infra-probe preflight.
 const SKIP =
   !process.env.RUN_CONTINUOUS_TESTS ||
-  preflightSkip(['nostr', 'aggregator'], 'swap-continuous');
+  preflightSkip(['nostr', 'aggregator', 'faucet'], 'swap-continuous');
 const ESCROW_SRC = process.env.ESCROW_DIR || join(__dirname, '../../../../escrow-service');
 const SDK_ROOT = join(__dirname, '../..');
 

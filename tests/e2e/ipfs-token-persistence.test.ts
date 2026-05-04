@@ -44,7 +44,7 @@ import { preflightSkip } from './lib/preflight';
 // Test Suite
 // =============================================================================
 
-const SKIP_INFRA = preflightSkip(["nostr","aggregator","ipfs"], 'ipfs-token-persistence');
+const SKIP_INFRA = preflightSkip(["nostr","aggregator","ipfs","faucet"], 'ipfs-token-persistence');
 
 describe.skipIf(SKIP_INFRA)('IPFS Active Token Persistence E2E', () => {
   // Shared state across ordered tests

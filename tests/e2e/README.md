@@ -80,18 +80,25 @@ For reference, this is what each suite declares it needs:
 | `dm-nip17.test.ts` | nostr | NIP-17 DM only |
 | `messaging-e2e.test.ts` | nostr | DM Communications module |
 | `wallet-clear.test.ts` | nostr, aggregator | Nametag mint + cleanup |
-| `wallet-lifecycle.test.ts` | nostr, aggregator, ipfs | Full lifecycle |
-| `ipfs-multi-device-sync.test.ts` | nostr, ipfs | Multi-device |
-| `ipfs-token-persistence.test.ts` | nostr, aggregator, ipfs | Active tokens (covers legacy IPFS save/recover/merge with real-faucet flows; supersedes the deleted `ipfs-sync.test.ts`) |
-| `profile-sync.test.ts` | nostr, ipfs | OrbitDB+IPFS profile |
-| `profile-multi-device-sync.test.ts` | nostr, ipfs | Profile multi-device |
-| `profile-token-persistence.test.ts` | nostr, aggregator, ipfs | Profile active tokens |
-| `swap-continuous.test.ts` | nostr, aggregator | Full swap lifecycle (also opt-in via RUN_CONTINUOUS_TESTS) |
-| `uxf-send-receive.test.ts` | nostr, aggregator, ipfs | UXF transfer (also opt-in via RUN_UXF_E2E) |
-| `migrate-to-profile-conservation.test.ts` | nostr, aggregator, ipfs | migrate-to-profile token conservation (opt-in via RUN_MIGRATION_E2E) |
-| `profile-export-roundtrip.test.ts` | nostr, aggregator, ipfs | Whole-Profile export/import CAR round-trip (opt-in via RUN_PROFILE_EXPORT_E2E) |
-| `pointer-roundtrip.test.ts` | aggregator, nostr, ipfs | Pointer-layer round-trip via real-faucet receive (also opt-in via RUN_UXF_E2E) |
+| `wallet-lifecycle.test.ts` | nostr, aggregator, ipfs, faucet | Full lifecycle |
+| `ipfs-multi-device-sync.test.ts` | nostr, ipfs, faucet | Multi-device |
+| `ipfs-token-persistence.test.ts` | nostr, aggregator, ipfs, faucet | Active tokens (covers legacy IPFS save/recover/merge with real-faucet flows; supersedes the deleted `ipfs-sync.test.ts`) |
+| `profile-sync.test.ts` | nostr, aggregator, ipfs, faucet | OrbitDB+IPFS profile |
+| `profile-multi-device-sync.test.ts` | nostr, ipfs, faucet | Profile multi-device |
+| `profile-token-persistence.test.ts` | nostr, aggregator, ipfs, faucet | Profile active tokens |
+| `swap-continuous.test.ts` | nostr, aggregator, faucet | Full swap lifecycle (also opt-in via RUN_CONTINUOUS_TESTS) |
+| `uxf-send-receive.test.ts` | nostr, aggregator, ipfs, faucet | UXF transfer (also opt-in via RUN_UXF_E2E) |
+| `migrate-to-profile-conservation.test.ts` | nostr, aggregator, ipfs, faucet | migrate-to-profile token conservation (opt-in via RUN_MIGRATION_E2E) |
+| `profile-export-roundtrip.test.ts` | nostr, aggregator, ipfs, faucet | Whole-Profile export/import CAR round-trip (opt-in via RUN_PROFILE_EXPORT_E2E) |
+| `pointer-roundtrip.test.ts` | aggregator, nostr, ipfs, faucet | Pointer-layer round-trip via real-faucet receive (also opt-in via RUN_UXF_E2E) |
 | `network-health.test.ts` | (none) | Tests SDK's own check; runs unconditionally |
+
+The `faucet` service was added in `@unicitylabs/infra-probe` v0.4.0. Tests that
+depend on the test faucet (`https://faucet.unicity.network`) declare it
+explicitly so a faucet outage cleanly skips the suite up-front instead of
+timing out at 240 s on `Faucet top-up timed out`. Mainnet has no faucet by
+design — the probe layer treats `network=mainnet` as a clean skip-pass for
+the faucet check.
 
 Pointer + swap shell scripts default to `nostr,aggregator,ipfs` and `nostr,aggregator` respectively. Override per-script via `E2E_PREFLIGHT_ONLY`.
 

@@ -115,7 +115,7 @@ import type { TransferResult } from '../../types';
 const SKIP =
   process.env.NO_TESTNET === '1' ||
   process.env.RUN_UXF_E2E !== '1' ||
-  preflightSkip(['nostr', 'aggregator', 'ipfs'], 'uxf-send-receive');
+  preflightSkip(['nostr', 'aggregator', 'ipfs', 'faucet'], 'uxf-send-receive');
 
 /** UCT smoke is opt-in even when RUN_UXF_E2E=1; UCT amounts overflow uint64. */
 const UCT_SMOKE_DISABLED = process.env.RUN_UCT_SMOKE !== '1';

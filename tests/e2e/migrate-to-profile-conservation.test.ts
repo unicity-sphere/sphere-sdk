@@ -79,7 +79,7 @@ const SKIP =
   process.env.NO_TESTNET === '1' ||
   process.env.RUN_MIGRATION_E2E !== '1' ||
   preflightSkip(
-    ['nostr', 'aggregator', 'ipfs'],
+    ['nostr', 'aggregator', 'ipfs', 'faucet'],
     'migrate-to-profile-conservation',
   );
 
