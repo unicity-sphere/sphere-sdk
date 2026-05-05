@@ -28,14 +28,35 @@ import { preflightSkip } from './lib/preflight';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Wait for an INCOMING DM matching the test's expectations.
+ *
+ * CommunicationsModule.onDirectMessage replays the existing message
+ * store to every newly registered handler (so handlers added late don't
+ * miss DMs that arrived during init). Tests using this helper to wait
+ * for a SPECIFIC incoming DM must therefore:
+ *   (1) skip own outbound DMs — sendDM writes to `messages` before
+ *       publishing, so replay would otherwise fire immediately with
+ *       the sphere's last outgoing DM.
+ *   (2) treat subscription time as the horizon — only fire on messages
+ *       whose timestamp is AFTER we subscribed, so a stale inbound
+ *       from an earlier exchange in the same test doesn't satisfy the
+ *       next waitForDM call.
+ */
 function waitForDM(sphere: Sphere, timeoutMs = 30000): Promise<DirectMessage> {
+  const horizon = Date.now();
+  const selfPubkey = sphere.identity?.chainPubkey;
   return new Promise((resolve, reject) => {
     const timer = setTimeout(
       () => reject(new Error(`Timeout: DM not received within ${timeoutMs}ms`)),
       timeoutMs,
     );
-    sphere.communications.onDirectMessage((msg) => {
+    let unsub: (() => void) | null = null;
+    unsub = sphere.communications.onDirectMessage((msg) => {
+      if (selfPubkey && msg.senderPubkey === selfPubkey) return;
+      if (typeof msg.timestamp === 'number' && msg.timestamp < horizon) return;
       clearTimeout(timer);
+      if (unsub) unsub();
       resolve(msg);
     });
   });
@@ -46,16 +67,22 @@ function collectDMs(
   count: number,
   timeoutMs = 30000,
 ): Promise<DirectMessage[]> {
+  const horizon = Date.now();
+  const selfPubkey = sphere.identity?.chainPubkey;
   return new Promise((resolve, reject) => {
     const received: DirectMessage[] = [];
     const timer = setTimeout(
       () => reject(new Error(`Timeout: only ${received.length}/${count} DMs received`)),
       timeoutMs,
     );
-    sphere.communications.onDirectMessage((msg) => {
+    let unsub: (() => void) | null = null;
+    unsub = sphere.communications.onDirectMessage((msg) => {
+      if (selfPubkey && msg.senderPubkey === selfPubkey) return;
+      if (typeof msg.timestamp === 'number' && msg.timestamp < horizon) return;
       received.push(msg);
       if (received.length >= count) {
         clearTimeout(timer);
+        if (unsub) unsub();
         resolve(received);
       }
     });

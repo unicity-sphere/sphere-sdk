@@ -44,10 +44,34 @@ async function ensureTrustbase(dataDir: string): Promise<void> {
 }
 
 function waitForDM(sphere: Sphere, timeoutMs = 15000): Promise<DirectMessage> {
+  // CommunicationsModule.onDirectMessage REPLAYS the existing message
+  // store to every newly registered handler (so handlers added late
+  // don't miss DMs that arrived during init). For tests using this
+  // helper to wait for a SPECIFIC incoming DM, we must:
+  //
+  //   (1) filter out messages sent by this sphere itself — sendDM
+  //       writes the outgoing DM to `messages` before publishing, so
+  //       the replay would otherwise fire immediately with the
+  //       sphere's last outgoing DM (sender == self).
+  //   (2) treat the registration time as the "horizon": only fire on
+  //       messages whose timestamp is AFTER we subscribed, so a stale
+  //       inbound DM from an earlier exchange in the same test
+  //       doesn't satisfy the next waitForDM call.
+  const horizon = Date.now();
+  const selfPubkey = sphere.identity?.chainPubkey;
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`Timeout: DM not received within ${timeoutMs}ms`)), timeoutMs);
-    sphere.communications.onDirectMessage((msg) => {
+    const timer = setTimeout(
+      () => reject(new Error(`Timeout: DM not received within ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+    let unsub: (() => void) | null = null;
+    unsub = sphere.communications.onDirectMessage((msg) => {
+      // Skip own outbound DMs (replayed from sendDM's local cache).
+      if (selfPubkey && msg.senderPubkey === selfPubkey) return;
+      // Skip messages received before the wait started.
+      if (typeof msg.timestamp === 'number' && msg.timestamp < horizon) return;
       clearTimeout(timer);
+      if (unsub) unsub();
       resolve(msg);
     });
   });

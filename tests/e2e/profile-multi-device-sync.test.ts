@@ -155,26 +155,21 @@ describe.skipIf(SKIP_INFRA)('Profile Multi-Device Sync E2E', () => {
       spheres.push(sphereB);
       console.log(`  Device B imported: ${sphereB.identity!.l1Address}`);
 
-      // Before sync: Device B has ZERO tokens (no Nostr, empty local cache).
-      for (const coin of TEST_COINS) {
-        const pre = getBalance(sphereB, coin.symbol);
-        console.log(`  Pre-sync ${coin.symbol}: total=${pre.total}`);
-        expect(pre.total).toBe(0n);
-        expect(pre.tokens).toBe(0);
-      }
-
-      // Sync is the ONLY token source. Retry while libp2p discovers
-      // peers and the OrbitDB OpLog tail arrives.
-      console.log('  Syncing from Profile layer...');
-      const deadline = performance.now() + 150_000;
-      let syncAdded = 0;
+      // Profile recovery happens during Sphere.import() itself: the
+      // import path runs `payments.load()` which calls each token-storage
+      // provider's `load()`. The Profile token storage provider's
+      // `load()` walks the aggregator pointer → recovers the latest CAR
+      // CID → fetches the CAR over IPFS → assembles tokens. The no-op
+      // transport cannot have delivered anything; therefore any tokens
+      // present in the post-import state came strictly from the Profile
+      // layer.
+      //
+      // Allow a brief retry loop for libp2p peer discovery if the
+      // pointer layer happened to walk an older CID and a fresher OpLog
+      // entry replicates after import.
+      console.log('  Verifying post-import recovery (Profile is the only source)...');
+      const deadline = performance.now() + 60_000;
       while (performance.now() < deadline) {
-        try {
-          const r = await sphereB.payments.sync();
-          syncAdded += r.added;
-        } catch (err) {
-          console.log(`  sync() attempt failed: ${err instanceof Error ? err.message : err}`);
-        }
         let allReady = true;
         for (const coin of TEST_COINS) {
           if (getBalance(sphereB, coin.symbol).total < 1n) {
@@ -183,11 +178,13 @@ describe.skipIf(SKIP_INFRA)('Profile Multi-Device Sync E2E', () => {
           }
         }
         if (allReady) break;
-        await new Promise((r) => setTimeout(r, 5000));
+        try {
+          await sphereB.payments.sync();
+        } catch (err) {
+          console.log(`  sync() attempt failed: ${err instanceof Error ? err.message : err}`);
+        }
+        await new Promise((r) => setTimeout(r, 2000));
       }
-
-      // Profile actually delivered tokens — not a noop.
-      expect(syncAdded).toBeGreaterThan(0);
 
       // Full inventory match
       for (const coin of TEST_COINS) {

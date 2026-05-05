@@ -7,9 +7,37 @@
 # =============================================================================
 
 SDK_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
-# Run CLI via npx tsx from the SDK root so it works from any directory.
-# The --cwd flag ensures wallet profiles are created in CLI_DIR (the workspace).
-CLI_BASE="npx --prefix ${SDK_ROOT} tsx ${SDK_ROOT}/cli/index.ts"
+
+# Resolve the CLI entry point.
+#
+# The sphere-sdk CLI was extracted to its own package
+# (@unicity-sphere/cli) — `${SDK_ROOT}/cli/index.ts` no longer exists in
+# the SDK tree. The shell-based swap/pointer e2e suite still needs a
+# CLI to drive wallets, so we fall back through the following options:
+#
+#   1. SDK_CLI_BIN env override          — explicit path/command for CI.
+#   2. ${SDK_ROOT}/cli/index.ts          — legacy in-tree CLI (pre-split).
+#   3. ../sphere-cli/cli/index.ts        — sibling repo on developer
+#                                          machines that have both checked
+#                                          out side-by-side.
+#   4. `which sphere-cli`                — globally installed
+#                                          @unicity-sphere/cli binary.
+#
+# If none resolve, sourcing scripts skip cleanly with a SKIP: message
+# that `run-all.sh` greps as a non-failure (matches the pre-split
+# behaviour for missing infrastructure).
+if [[ -n "${SDK_CLI_BIN:-}" ]]; then
+  CLI_BASE="${SDK_CLI_BIN}"
+elif [[ -f "${SDK_ROOT}/cli/index.ts" ]]; then
+  CLI_BASE="npx --prefix ${SDK_ROOT} tsx ${SDK_ROOT}/cli/index.ts"
+elif [[ -f "${SDK_ROOT}/../sphere-cli/cli/index.ts" ]]; then
+  CLI_BASE="npx --prefix ${SDK_ROOT}/../sphere-cli tsx ${SDK_ROOT}/../sphere-cli/cli/index.ts"
+elif command -v sphere-cli >/dev/null 2>&1; then
+  CLI_BASE="$(command -v sphere-cli)"
+else
+  echo "SKIP: sphere-sdk CLI not available (cli/ extracted to @unicity-sphere/cli; install globally or set SDK_CLI_BIN)"
+  exit 0
+fi
 ESCROW_REPO="${ESCROW_REPO:-https://github.com/unicity-sphere/escrow-service.git}"
 ESCROW_STARTUP_TIMEOUT=120
 

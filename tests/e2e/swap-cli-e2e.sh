@@ -24,6 +24,27 @@ set -euo pipefail
 
 SDK_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 
+# CLI availability check — fail-fast BEFORE the 30s preflight probe.
+# The sphere-sdk CLI was extracted to @unicity-sphere/cli; the in-tree
+# `npm run cli` script now exits with a migration message. Resolve via:
+#   1. $SDK_CLI_BIN env override.
+#   2. ${SDK_ROOT}/cli/index.ts (legacy in-tree CLI).
+#   3. ${SDK_ROOT}/../sphere-cli/cli/index.ts (sibling repo).
+#   4. globally-installed sphere-cli binary.
+# Otherwise SKIP cleanly (run-all.sh greps SKIP as non-failure).
+if [[ -n "${SDK_CLI_BIN:-}" ]]; then
+  CLI="$SDK_CLI_BIN"
+elif [[ -f "$SDK_ROOT/cli/index.ts" ]]; then
+  CLI="npx --prefix $SDK_ROOT tsx $SDK_ROOT/cli/index.ts"
+elif [[ -f "$SDK_ROOT/../sphere-cli/cli/index.ts" ]]; then
+  CLI="npx --prefix $SDK_ROOT/../sphere-cli tsx $SDK_ROOT/../sphere-cli/cli/index.ts"
+elif command -v sphere-cli >/dev/null 2>&1; then
+  CLI="$(command -v sphere-cli)"
+else
+  echo "SKIP: sphere-sdk CLI not available (cli/ extracted to @unicity-sphere/cli; install globally or set SDK_CLI_BIN)"
+  exit 0
+fi
+
 # Infra-probe preflight — swap CLI flow needs nostr (proposal/announce
 # DMs + gift wraps) and aggregator (commitment submission + inclusion
 # proofs). Skip cleanly if any are unreachable.
@@ -87,7 +108,8 @@ WANT_AMOUNT="10"          # Alice wants 10 ETH
 ALICE_FAUCET_AMOUNT="10"  # Topup alice with 10 BTC
 BOB_FAUCET_AMOUNT="100"   # Topup bob with 100 ETH
 SWAP_TIMEOUT=3600
-CLI="npm run cli --"
+# CLI is resolved at the top of this script via the same fallback logic
+# used by e2e-helpers.sh / pointer-N0-prologue.sh. Do NOT shadow it here.
 DEPOSIT_WAIT=120   # seconds to wait for swap:announced after deposit
 ESCROW_WAIT=300    # seconds to wait for escrow to complete swap
 

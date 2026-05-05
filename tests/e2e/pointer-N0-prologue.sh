@@ -49,9 +49,33 @@ SDK_ROOT="$(cd -- "${POINTER_PROLOGUE_DIR}/../.." && pwd -P)"
 export POINTER_PROLOGUE_DIR SDK_ROOT
 
 # CLI invocation. Env override lets CI pin a specific command (e.g., a
-# pre-built binary). Default: run the TS source via npx tsx from SDK_ROOT.
-# The --prefix ensures npx resolves tsx from the SDK's node_modules.
-export SPHERE_CLI="${SPHERE_CLI:-npx --prefix ${SDK_ROOT} tsx ${SDK_ROOT}/cli/index.ts}"
+# pre-built binary). Resolution order:
+#   1. $SPHERE_CLI / $SDK_CLI_BIN env overrides — explicit command for CI.
+#   2. ${SDK_ROOT}/cli/index.ts                  — legacy in-tree CLI
+#                                                  (pre-extraction).
+#   3. ${SDK_ROOT}/../sphere-cli/cli/index.ts    — sibling sphere-cli repo
+#                                                  (developers who keep
+#                                                  both checked out).
+#   4. globally-installed sphere-cli             — @unicity-sphere/cli
+#                                                  binary on PATH.
+#
+# If none resolve, exit cleanly with a SKIP: line that run-all.sh greps
+# as a non-failure (matches the pre-extraction skip semantics for missing
+# infrastructure).
+if [[ -n "${SPHERE_CLI:-}" ]]; then
+  : # use as-is
+elif [[ -n "${SDK_CLI_BIN:-}" ]]; then
+  export SPHERE_CLI="${SDK_CLI_BIN}"
+elif [[ -f "${SDK_ROOT}/cli/index.ts" ]]; then
+  export SPHERE_CLI="npx --prefix ${SDK_ROOT} tsx ${SDK_ROOT}/cli/index.ts"
+elif [[ -f "${SDK_ROOT}/../sphere-cli/cli/index.ts" ]]; then
+  export SPHERE_CLI="npx --prefix ${SDK_ROOT}/../sphere-cli tsx ${SDK_ROOT}/../sphere-cli/cli/index.ts"
+elif command -v sphere-cli >/dev/null 2>&1; then
+  export SPHERE_CLI="$(command -v sphere-cli)"
+else
+  echo "SKIP: sphere-sdk CLI not available (cli/ extracted to @unicity-sphere/cli; install globally or set SDK_CLI_BIN/SPHERE_CLI)"
+  exit 0
+fi
 
 # Endpoints (kept for N-scripts that might probe /health manually; the CLI
 # itself already defaults to these on testnet).
