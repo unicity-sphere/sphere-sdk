@@ -40,6 +40,30 @@ export interface CommunicationsModuleConfig {
 }
 
 // =============================================================================
+// DM middleware pipeline
+// =============================================================================
+
+/**
+ * Ordered DM consumer with propagation control.
+ *
+ * Each middleware receives the incoming DM and a `next()` continuation.
+ * It can:
+ *   - call `await next()` to pass the DM to downstream consumers
+ *     (consume-and-pass, the typical observer case);
+ *   - omit `next()` to stop propagation
+ *     (consume-and-stop, e.g. when this consumer fully owns the message);
+ *   - throw — the dispatcher logs the error and stops the chain to avoid
+ *     silent partial dispatch.
+ *
+ * Middleware run synchronously by default; returning a Promise causes the
+ * dispatcher to await before invoking downstream consumers.
+ */
+export type DmMiddleware = (
+  message: DirectMessage,
+  next: () => Promise<void> | void,
+) => Promise<void> | void;
+
+// =============================================================================
 // Pagination Types
 // =============================================================================
 
@@ -89,6 +113,20 @@ export class CommunicationsModule {
   private replayedHandlers: WeakSet<(message: DirectMessage) => void> = new WeakSet();
   private composingHandlers: Set<(indicator: ComposingIndicator) => void> = new Set();
   private broadcastHandlers: Set<(message: BroadcastMessage) => void> = new Set();
+
+  /**
+   * Ordered DM middleware pipeline. Higher priority runs first; ties
+   * resolve by registration order. Each middleware can:
+   *   - call `next()` to pass the DM downstream (consume-and-pass)
+   *   - omit `next()` to stop propagation (consume-and-stop)
+   *   - throw — caught and logged; chain stops to avoid silent partial dispatch
+   *
+   * Middleware fire BEFORE the legacy `dmHandlers` set. Legacy handlers
+   * always run unconditionally afterwards regardless of middleware
+   * propagation, preserving backward compat with code that registered
+   * via `onDirectMessage(handler)`.
+   */
+  private dmMiddleware: Array<{ priority: number; fn: DmMiddleware }> = [];
 
   // Timestamp of module initialization — messages older than this are historical
   private initializedAt: number = 0;
@@ -444,7 +482,48 @@ export class CommunicationsModule {
   }
 
   /**
-   * Subscribe to incoming DMs
+   * Register an ordered, propagation-aware DM consumer (middleware-style).
+   *
+   * Higher `priority` runs first. Ties resolve by registration order. The
+   * middleware decides whether to call `next()`:
+   *   - `await next()` — pass the DM downstream (consume-and-pass)
+   *   - omit `next()` — stop propagation (consume-and-stop)
+   *   - throw — logged; chain stops to avoid silent partial dispatch
+   *
+   * Middleware fire BEFORE the legacy `onDirectMessage` handler set, which
+   * always runs unconditionally afterwards (preserving backward compat
+   * with consumers that don't participate in propagation control).
+   *
+   * Use this when you need ordered consumers — e.g., a tenant-side ACP
+   * filter that wants to consume manager-addressed DMs before they reach
+   * application code, OR multiple cooperating observers that share a
+   * canonical dispatch order.
+   *
+   * @param mw — the middleware function
+   * @param priority — higher runs first; default 0
+   * @returns unsubscribe function
+   */
+  useDmMiddleware(mw: DmMiddleware, priority: number = 0): () => void {
+    const entry = { priority, fn: mw };
+    // Insert before the first entry with strictly lower priority.
+    // Stable: ties (equal priority) keep registration order.
+    const idx = this.dmMiddleware.findIndex((e) => e.priority < priority);
+    if (idx === -1) this.dmMiddleware.push(entry);
+    else this.dmMiddleware.splice(idx, 0, entry);
+    return () => {
+      const i = this.dmMiddleware.indexOf(entry);
+      if (i >= 0) this.dmMiddleware.splice(i, 1);
+    };
+  }
+
+  /**
+   * Subscribe to incoming DMs (legacy broadcast-style API).
+   *
+   * Every registered handler runs unconditionally for every DM. There is
+   * no propagation control — for ordered consumers with consume-and-stop
+   * semantics, use {@link useDmMiddleware} instead. This API is kept
+   * stable for SDK modules (PaymentsModule, SwapModule) and existing
+   * application code.
    */
   onDirectMessage(handler: (message: DirectMessage) => void): () => void {
     this.dmHandlers.add(handler);
@@ -629,8 +708,20 @@ export class CommunicationsModule {
     // Emit event
     this.deps!.emitEvent('message:dm', message);
 
-    // Notify handlers — snapshot Set before iterating to prevent mid-dispatch
-    // registration (JS Set spec: new entries added during for-of are visited)
+    // Run middleware chain first — ordered consumers with propagation
+    // control (see DmMiddleware docstring). Fire-and-forget if async;
+    // dispatchDm catches errors internally so we don't unhandled-reject.
+    this.dispatchDm(message).catch((err) => {
+      // dispatchDm's chain already catches per-mw errors; this is a
+      // belt-and-braces guard for any unexpected throw at the
+      // dispatcher level.
+      logger.error('Communications', 'dispatchDm rejected:', err);
+    });
+
+    // Notify legacy handlers UNCONDITIONALLY — they run regardless of
+    // middleware-chain consumption. Snapshot Set before iterating to
+    // prevent mid-dispatch registration (JS Set spec: new entries added
+    // during for-of are visited).
     const handlers = Array.from(this.dmHandlers);
     for (const handler of handlers) {
       try {
@@ -647,6 +738,38 @@ export class CommunicationsModule {
       }
       this.pruneIfNeeded();
     }
+  }
+
+  /**
+   * Walk the DM middleware chain. Snapshots the chain at dispatch time
+   * so a middleware that registers/unregisters siblings doesn't change
+   * the order for THIS dispatch. Each middleware decides whether to
+   * call `next()` to advance the chain.
+   *
+   * Errors inside any middleware are caught and logged; the chain stops
+   * at the throwing middleware to avoid silent partial dispatch
+   * (downstream consumers might depend on assumptions the throwing
+   * consumer was supposed to set up).
+   */
+  private async dispatchDm(message: DirectMessage): Promise<void> {
+    if (this.dmMiddleware.length === 0) return;
+    const chain = this.dmMiddleware.slice();
+    let i = -1;
+    let stoppedByThrow = false;
+
+    const next = async (): Promise<void> => {
+      i++;
+      if (i >= chain.length || stoppedByThrow) return;
+      const entry = chain[i]!;
+      try {
+        await entry.fn(message, next);
+      } catch (err) {
+        stoppedByThrow = true;
+        logger.error('Communications', `Middleware (priority ${String(entry.priority)}) threw — chain stopped:`, err);
+      }
+    };
+
+    await next();
   }
 
   private handleComposingIndicator(indicator: ComposingIndicator): void {
