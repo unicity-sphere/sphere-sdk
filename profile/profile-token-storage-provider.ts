@@ -130,6 +130,16 @@ export class ProfileTokenStorageProvider
   private flushPromise: Promise<void> | null = null;
   private readonly flushDebounceMs: number;
 
+  // --- Cold-start sync dedup (steelman) ---
+  // When two sync() calls race during cold-start, both observe
+  // `lastLoadedData === null && knownBundleCids.size > 0` and both fall
+  // through to load(). load() is idempotent for a single CAR but not
+  // for the surrounding event emissions (sync:completed fires twice;
+  // history-import counts may double-count). Dedupe by latching the
+  // first cold-start sync's promise and have parallel callers await
+  // the same result.
+  private coldStartSyncPromise: Promise<SyncResult<TxfStorageDataBase>> | null = null;
+
   // --- Event system ---
   private readonly eventCallbacks: Set<StorageEventCallback> = new Set();
 
@@ -589,6 +599,15 @@ export class ProfileTokenStorageProvider
       const coldStartLoadNeeded =
         this.lastLoadedData === null && this.knownBundleCids.size > 0;
 
+      // Steelman dedup: if a cold-start load is already in flight,
+      // attach to it instead of starting a parallel fetch. load() is
+      // idempotent on the bytes but its surrounding event emissions
+      // (sync:completed, history-import) are not. Returning the same
+      // promise to all racing callers avoids double-emit / double-import.
+      if (coldStartLoadNeeded && this.coldStartSyncPromise !== null) {
+        return await this.coldStartSyncPromise;
+      }
+
       if (newCids.length === 0 && removedCids.length === 0 && !coldStartLoadNeeded) {
         // No changes -- return local data as-is
         this.emitEvent({ type: 'sync:completed', timestamp: Date.now() });
@@ -601,44 +620,64 @@ export class ProfileTokenStorageProvider
         };
       }
 
-      // Full reload to get merged result
-      const loadResult = await this.load();
-      if (!loadResult.success || !loadResult.data) {
+      // Full reload to get merged result. For cold-start path, latch the
+      // promise so concurrent racing sync()s share a single load + a
+      // single set of post-load events.
+      const computeResult = async (): Promise<SyncResult<TxfStorageDataBase>> => {
+        const loadResult = await this.load();
+        if (!loadResult.success || !loadResult.data) {
+          return {
+            success: false,
+            added: newCids.length,
+            removed: removedCids.length,
+            conflicts: 0,
+            error: loadResult.error ?? 'Failed to load merged data',
+          };
+        }
+
+        // Count tokens added/removed by comparing
+        const localTokenIds = new Set(this.extractTokenIds(localData));
+        const remoteTokenIds = new Set(this.extractTokenIds(loadResult.data));
+
+        let added = 0;
+        let removed = 0;
+        for (const id of remoteTokenIds) {
+          if (!localTokenIds.has(id)) added++;
+        }
+        for (const id of localTokenIds) {
+          if (!remoteTokenIds.has(id)) removed++;
+        }
+
+        this.emitEvent({
+          type: 'sync:completed',
+          timestamp: Date.now(),
+          data: { added, removed, newBundles: newCids.length },
+        });
+
         return {
-          success: false,
-          added: newCids.length,
-          removed: removedCids.length,
+          success: true,
+          merged: loadResult.data,
+          added,
+          removed,
           conflicts: 0,
-          error: loadResult.error ?? 'Failed to load merged data',
         };
-      }
-
-      // Count tokens added/removed by comparing
-      const localTokenIds = new Set(this.extractTokenIds(localData));
-      const remoteTokenIds = new Set(this.extractTokenIds(loadResult.data));
-
-      let added = 0;
-      let removed = 0;
-      for (const id of remoteTokenIds) {
-        if (!localTokenIds.has(id)) added++;
-      }
-      for (const id of localTokenIds) {
-        if (!remoteTokenIds.has(id)) removed++;
-      }
-
-      this.emitEvent({
-        type: 'sync:completed',
-        timestamp: Date.now(),
-        data: { added, removed, newBundles: newCids.length },
-      });
-
-      return {
-        success: true,
-        merged: loadResult.data,
-        added,
-        removed,
-        conflicts: 0,
       };
+
+      if (coldStartLoadNeeded) {
+        const inflight = computeResult();
+        this.coldStartSyncPromise = inflight;
+        try {
+          return await inflight;
+        } finally {
+          // Clear only if THIS promise is still latched (a peer reset
+          // the field e.g. via clear() may have replaced it already).
+          if (this.coldStartSyncPromise === inflight) {
+            this.coldStartSyncPromise = null;
+          }
+        }
+      }
+
+      return await computeResult();
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
       this.emitEvent(this.buildErrorEvent('sync:error', err));

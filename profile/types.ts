@@ -114,8 +114,22 @@ export interface ProfileConfig {
 export interface UxfBundleRef {
   /** CID of the UXF CAR file on IPFS */
   readonly cid: string;
-  /** Bundle lifecycle status */
-  readonly status: 'active' | 'superseded';
+  /**
+   * Bundle lifecycle status.
+   *
+   *   - `active`     — JOIN walker includes this bundle.
+   *   - `superseded` — older bundle subsumed by a consolidated one.
+   *   - `unverified` — recovered from the aggregator pointer but the
+   *                    CAR was not fetchable / verifiable at recovery
+   *                    time. Excluded from JOIN until a subsequent
+   *                    sync re-fetches and promotes to `active`.
+   *                    Steelman defense: prevents a compromised
+   *                    aggregator from poisoning the local bundle
+   *                    index with un-fetchable CIDs. See
+   *                    profile/profile-token-storage/lifecycle-
+   *                    manager.ts:recoverFromAggregatorPointerBestEffort.
+   */
+  readonly status: 'active' | 'superseded' | 'unverified';
   /** Creation timestamp (Unix seconds) */
   readonly createdAt: number;
   /** Optional device identifier that created this bundle */
@@ -275,6 +289,22 @@ export interface ProfileTokenStorageProviderOptions {
    * pre-pointer mode (IPNS-only cold-start recovery).
    */
   readonly getPointerLayer?: () => ProfilePointerLayer | null;
+  /**
+   * Optional accessor for the storage provider's pointer-build status.
+   * Used by `recoverFromAggregatorPointerBestEffort` to distinguish:
+   *   - 'pending'      — a build is in flight; caller should wait.
+   *   - 'unavailable'  — no oracle wired or build deterministically skipped;
+   *                      caller falls through to legacy IPNS migration
+   *                      WITHOUT polling further.
+   *   - 'ready'        — pointer layer is constructed (`getPointerLayer()`
+   *                      already returns non-null).
+   *
+   * Without this accessor the lifecycle manager has to time-bound its
+   * poll, which conflates "still building (slow CI)" with "build will
+   * never produce one" — leading to spurious legacy-IPNS fallbacks that
+   * fork the pointer history. Optional during rollout.
+   */
+  readonly getPointerBuildStatus?: () => 'pending' | 'unavailable' | 'ready';
   /** Enable debug logging */
   readonly debug?: boolean;
 }

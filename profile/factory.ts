@@ -99,6 +99,7 @@ export function createProfileProviders(
     // token-storage constructor runs. A closure defers the read
     // until it is actually needed (inside initialize() / flushToIpfs).
     getPointerLayer: () => storage.getPointerLayer(),
+    getPointerBuildStatus: () => storage.getPointerBuildStatus(),
     debug: resolvedConfig.debug,
   };
 

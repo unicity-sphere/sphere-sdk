@@ -436,6 +436,20 @@ export class ProfileStorageProvider implements StorageProvider {
    * diagnostics and test assertions.
    */
   private pointerSkipReason: PointerWiringSkipReason | null = null;
+  /**
+   * Steelman pass — serialize concurrent tryBuildPointerLayer() calls.
+   * Both connect()'s Phase C and setIdentity()'s deferred fire-and-
+   * forget can call tryBuildPointerLayer concurrently when they
+   * interleave. Without serialization the buildProfilePointerLayer()
+   * lock-file path and master-key construction can race; the layer
+   * for identity A may be overwritten by a slower build for identity B
+   * (or vice-versa) — silent divergence with OrbitDB writes.
+   *
+   * The dedup is an in-flight promise: while ANY build is running,
+   * subsequent callers wait for it (idempotent re-entry); after it
+   * settles, the next caller starts a fresh build.
+   */
+  private pointerBuildPromise: Promise<void> | null = null;
 
   /**
    * Derived: true iff OrbitDB has been attached.
@@ -626,7 +640,41 @@ export class ProfileStorageProvider implements StorageProvider {
       !this.isPointerSkipSticky() &&
       identityAtStart !== null
     ) {
-      await this.tryBuildPointerLayer(identityAtStart);
+      await this.runPointerBuildSerialized(identityAtStart);
+    }
+  }
+
+  /**
+   * Serialized wrapper around tryBuildPointerLayer. Dedupes concurrent
+   * calls from connect()'s Phase C and setIdentity()'s deferred build
+   * (steelman). While a build is in-flight, subsequent callers await
+   * the same promise; after settle, the field is cleared so a future
+   * caller starts a fresh build.
+   */
+  private async runPointerBuildSerialized(identity: FullIdentity): Promise<void> {
+    if (this.pointerBuildPromise) {
+      try {
+        await this.pointerBuildPromise;
+      } catch {
+        // Prior build already logged its failure; we still re-attempt
+        // below if the layer is still null (transient retry).
+      }
+      // If a peer build already produced the layer (or set a sticky
+      // skip reason), don't re-enter.
+      if (this.pointerLayer !== null || this.isPointerSkipSticky()) {
+        return;
+      }
+    }
+    const promise = this.tryBuildPointerLayer(identity);
+    this.pointerBuildPromise = promise;
+    try {
+      await promise;
+    } finally {
+      // Only clear if THIS promise is still the latched value. If a
+      // concurrent setIdentity replaced it, leave the new one alone.
+      if (this.pointerBuildPromise === promise) {
+        this.pointerBuildPromise = null;
+      }
     }
   }
 
@@ -708,6 +756,35 @@ export class ProfileStorageProvider implements StorageProvider {
    */
   getPointerLayer(): ProfilePointerLayer | null {
     return this.pointerLayer;
+  }
+
+  /**
+   * Steelman accessor: the pointer-build state machine viewed from the
+   * outside.
+   *   - 'ready'       — `pointerLayer !== null`.
+   *   - 'pending'     — a build is in-flight (`pointerBuildPromise`),
+   *                     OR the preconditions are present but the build
+   *                     hasn't started yet (e.g., `setIdentity` is about
+   *                     to fire-and-forget the build).
+   *   - 'unavailable' — no oracle wired, sticky skip reason, or the
+   *                     pointer is structurally inaccessible. Callers
+   *                     SHOULD NOT poll further; fall through to the
+   *                     legacy path immediately.
+   *
+   * The "pending" classification is conservative: when in doubt, we
+   * prefer to keep callers waiting rather than to fire the legacy
+   * IPNS migration prematurely (which would fork the pointer chain).
+   */
+  getPointerBuildStatus(): 'pending' | 'unavailable' | 'ready' {
+    if (this.pointerLayer !== null) return 'ready';
+    if (this.pointerBuildPromise !== null) return 'pending';
+    if (this.isPointerSkipSticky()) return 'unavailable';
+    if (!this.options?.oracle) return 'unavailable';
+    // Oracle is wired, no sticky failure, no in-flight build —
+    // either the deferred build hasn't kicked off yet or a previous
+    // attempt failed transiently and will re-attempt on next connect.
+    // Treat as pending so the caller waits.
+    return 'pending';
   }
 
   /**
@@ -876,12 +953,20 @@ export class ProfileStorageProvider implements StorageProvider {
     // interface contract; downstream callers (tokenStorage.initialize →
     // recoverFromAggregatorPointerBestEffort) poll for the pointer with a
     // short timeout so they don't race the build.
+    //
+    // Steelman serialization: route through `runPointerBuildSerialized`
+    // so concurrent identity rotations + connect()'s Phase C don't both
+    // race buildProfilePointerLayer's lock-file path and master-key
+    // construction. Errors are also routed to `pointerSkipReason` via
+    // tryBuildPointerLayer's internal handler so a future call can
+    // observe the skip state instead of treating the layer as "not yet
+    // attempted".
     if (
       this.dbStatus === 'attached' &&
       this.pointerLayer === null &&
       !this.isPointerSkipSticky()
     ) {
-      void this.tryBuildPointerLayer(identity).catch((err) => {
+      void this.runPointerBuildSerialized(identity).catch((err) => {
         this.log(
           `setIdentity: deferred pointer-layer build failed: ${
             err instanceof Error ? err.message : String(err)

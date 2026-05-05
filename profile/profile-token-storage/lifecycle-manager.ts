@@ -34,6 +34,7 @@ import {
 import { computeAddressId } from '../types.js';
 import type { BundleIndex } from './bundle-index.js';
 import type { ProfileTokenStorageHost } from './host.js';
+import { fetchFromIpfs } from '../ipfs-client.js';
 
 /**
  * Pointer-layer error codes that indicate a permanent integrity /
@@ -276,26 +277,59 @@ export class LifecycleManager {
    * caller falls through to IPNS.
    */
   private async recoverFromAggregatorPointerBestEffort(): Promise<boolean> {
-    // Poll for the pointer layer briefly. Sphere.init/import calls
-    // storage.connect() (which builds the pointer when identity is
-    // already set) BEFORE setIdentity (which is when identity becomes
-    // available); setIdentity then fire-and-forgets a deferred pointer
-    // rebuild. tokenStorage.initialize() — where this method runs —
-    // races against that deferred rebuild on the very first connect.
-    // Polling with a 5s ceiling lets the rebuild complete without
-    // forcing the caller to know about the ordering quirk.
-    const pollDeadline = Date.now() + 5_000;
+    // Wait for the pointer layer with a "build status"-aware policy.
+    //
+    // History: the original 5s ceiling conflated "build in flight on
+    // slow CI" with "build will never produce one (no oracle wired)".
+    // Both manifested as `getPointerLayer() === null` after 5s, and
+    // both fell through to the legacy IPNS migration. On a fast happy
+    // path the legacy path is a harmless no-op (no IPNS history). On
+    // an oracle-wired-but-slow boot, the legacy path FORKS the pointer
+    // chain: it stamps `profile.pointer.migration.done` AND seeds the
+    // bundle index from the (probably empty) IPNS state, while the
+    // deferred pointer build is still in flight elsewhere. Subsequent
+    // flushes then publish a NEW pointer chain divergent from the one
+    // the build was about to recover.
+    //
+    // Steelman fix: ask the storage provider whether a build is
+    // pending. If yes, wait up to 30s (room for slow Helia bootstrap +
+    // master-key denylist + lock-file acquisition on Node CI). If no
+    // (no oracle, sticky skip, structurally unavailable), bail
+    // immediately so the caller can take the legacy path with full
+    // knowledge that no future build will reconcile.
+    const getStatus = this.host.options?.getPointerBuildStatus;
+    const pollDeadline = Date.now() + 30_000;
     let pointer = this.host.options?.getPointerLayer?.() ?? null;
     while (!pointer && Date.now() < pollDeadline) {
+      // If the build status accessor reports a deterministic
+      // 'unavailable', skip the wait entirely — polling won't help.
+      if (getStatus && getStatus() === 'unavailable') {
+        this.host.log(
+          'Pointer recover: build status reports unavailable (no oracle / sticky skip); ' +
+            'skipping pointer-layer wait, falling through to legacy IPNS migration',
+        );
+        return false;
+      }
       await new Promise((r) => setTimeout(r, 100));
       pointer = this.host.options?.getPointerLayer?.() ?? null;
     }
     if (!pointer) {
+      const status = getStatus ? getStatus() : 'unknown';
       this.host.log(
-        'Pointer recover: no pointer layer wired after 5s wait — ' +
-          'wallet has no aggregator pointer recovery (e.g., oracle not configured)',
+        `Pointer recover: no pointer layer wired after 30s wait (build status=${status}); ` +
+          (status === 'pending'
+            ? 'build is still in flight — bailing to avoid legacy-fallback fork. ' +
+              'Subsequent sync()s will retry once the build completes.'
+            : 'wallet has no aggregator pointer recovery (e.g., oracle not configured)'),
       );
-      return false;
+      // When the build is STILL pending, we MUST NOT fall through to
+      // the legacy IPNS migration: doing so could stamp the migration-
+      // done marker before the eventual successful build observes it.
+      // Returning `true` here tells the caller "pointer path was the
+      // chosen path; do not fall back to legacy" — even though no CID
+      // was recovered. The next sync() will retry the recovery via
+      // the standard `coldStartLoadNeeded` gate.
+      return status === 'pending';
     }
 
     let recovered: { readonly cid: Uint8Array; readonly version: number } | null;
@@ -318,15 +352,60 @@ export class LifecycleManager {
       return false;
     }
 
+    let cidString: string;
     try {
-      const cidString = CID.decode(recovered.cid).toString();
+      cidString = CID.decode(recovered.cid).toString();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.host.log(`Pointer recover: failed to decode recovered CID bytes: ${msg}`);
+      return false;
+    }
+
+    // Steelman defense — verify the recovered CID is fetchable AND its
+    // bytes match the CID hash BEFORE writing to the durable bundle
+    // index. The pointer layer's verification covers the
+    // pointer→aggregator anchor cryptography; it does NOT prove the
+    // CID points to legitimate CAR bytes that this wallet's encryption
+    // key can decrypt. A compromised aggregator could redirect the
+    // pointer to attacker-controlled CIDs that decrypt as garbage —
+    // surviving in OrbitDB and propagating to peers.
+    //
+    // The fetch+verify pre-flight is best-effort: a transient gateway
+    // failure must not POISON the recovery. We fall back to writing
+    // the bundle ref under `status: 'unverified'` so a future sync
+    // can retry the verification before the JOIN walker promotes it
+    // to 'active'.
+    let verifiedActive = false;
+    try {
+      const carBytes = await fetchFromIpfs(this.host.ipfsGateways, cidString);
+      // fetchFromIpfs already verifies CID-hash binding (sha256 vs
+      // multihash). Reaching here means the CAR bytes are
+      // content-authentic. The encryption key check is delegated to
+      // the JOIN walker (UxfPackage.fromCar throws on malformed bytes;
+      // bundleIndex.listBundles' decryption path drops un-decryptable
+      // entries). Promote to 'active' once we know the bytes resolve.
+      verifiedActive = carBytes.byteLength > 0;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.host.log(
+        `Pointer recover: CAR fetch+verify failed for cid=${cidString} ` +
+          `(treating as unverified, will retry via sync): ${msg}`,
+      );
+    }
+
+    try {
       await this.bundleIndex.addBundle(cidString, {
         cid: cidString,
-        status: 'active',
+        // Steelman: only mark 'active' after the fetch+verify step
+        // succeeded. Otherwise the bundle ref persists but is gated
+        // out of the JOIN until a subsequent sync re-fetches and
+        // promotes it. listActiveBundles filters on `status === 'active'`.
+        status: verifiedActive ? 'active' : 'unverified',
         createdAt: Math.floor(Date.now() / 1000),
       });
       this.host.log(
-        `Pointer recover ok: cid=${cidString} version=${recovered.version}`,
+        `Pointer recover ok: cid=${cidString} version=${recovered.version} ` +
+          `status=${verifiedActive ? 'active' : 'unverified'}`,
       );
       return true;
     } catch (err) {

@@ -367,6 +367,19 @@ async function readAndFetchBundles(
   let missingCount = 0;
 
   for (const [cid, ref] of bundleMap) {
+    // Skip bundles still pending verification — they are not yet
+    // proven fetchable / decodable and the export snapshot schema
+    // (`'active' | 'superseded'`) doesn't carry an unverified state.
+    // A subsequent recovery pass will promote them to 'active' once
+    // verified; until then they cannot be safely embedded in a
+    // portable snapshot.
+    if (ref.status === 'unverified') {
+      logger.debug(
+        'ProfileExport',
+        `skipping unverified bundle ${cid} (will be exported after promotion to active)`,
+      );
+      continue;
+    }
     try {
       const carBytes = await fetchFromIpfs(
         gateways,
