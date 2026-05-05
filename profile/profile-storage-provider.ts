@@ -859,8 +859,19 @@ export class ProfileStorageProvider implements StorageProvider {
       // Reset pointer-layer state so the next connect() re-probes — an
       // oracle or durability marker may be wired in only on the second
       // connect cycle.
+      //
+      // Steelman fix: preserve STICKY skip reasons across disconnect.
+      // `lock_file_path_missing` and `pointer_init_failed` reflect
+      // permanent config / crypto failures that won't be resolved by
+      // a reconnect against the same inputs. Wiping them on disconnect
+      // means every reconnect re-runs `buildProfilePointerLayer`,
+      // which re-runs the same expensive master-key denylist check
+      // and re-fails with the same code — wasted CPU on every reboot.
+      // Retain sticky reasons; clear only retryable ones.
       this.pointerLayer = null;
-      this.pointerSkipReason = null;
+      if (!this.isPointerSkipSticky()) {
+        this.pointerSkipReason = null;
+      }
     }
 
     // 3. Close local cache

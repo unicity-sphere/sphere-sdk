@@ -169,59 +169,104 @@ export async function fetchFromIpfs(
   validateGatewayUrls(effectiveGateways);
   let lastError: Error | null = null;
 
+  // One attempt: try POST first, fall back to GET for gateways that
+  // disable POST to /api/v0/. The fall-through is per-gateway —
+  // failures roll over to the next gateway in the outer loop.
+  const tryFetchBlock = async (
+    gateway: string,
+    method: 'POST' | 'GET',
+  ): Promise<{ bytes: Uint8Array | null; reason: string | null; retryAsGet: boolean }> => {
+    const url =
+      `${gateway.replace(/\/$/, '')}/api/v0/block/get?arg=${encodeURIComponent(cid)}`;
+    const response = await fetch(url, {
+      method,
+      headers: { Accept: 'application/octet-stream' },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+
+    if (!response.ok) {
+      // POST disabled on this gateway? Retry as GET (Kubo's documented
+      // alias) before giving up on the gateway.
+      const retryAsGet =
+        method === 'POST' && (response.status === 405 || response.status === 501);
+      return {
+        bytes: null,
+        reason: `HTTP ${response.status} from ${gateway} (${method})`,
+        retryAsGet,
+      };
+    }
+
+    // Steelman fix W2 — sniff Content-Type so a "200 OK but it's HTML"
+    // response (some hardened nginx fronts return an "API disabled"
+    // page with 200) surfaces a useful error instead of the misleading
+    // sha256-mismatch. block/get on a real Kubo returns
+    // application/octet-stream (or unset, which we treat as raw).
+    const contentType = (response.headers.get('Content-Type') ?? '').toLowerCase();
+    const isHtmlOrJson =
+      contentType.startsWith('text/html') || contentType.startsWith('application/json');
+    if (isHtmlOrJson) {
+      return {
+        bytes: null,
+        reason: `gateway ${gateway} returned ${contentType} for /api/v0/block/get (likely API disabled or wrong endpoint)`,
+        retryAsGet: false,
+      };
+    }
+
+    // Check Content-Length header before reading body
+    const contentLength = response.headers.get('Content-Length');
+    if (contentLength != null) {
+      const size = parseInt(contentLength, 10);
+      if (!isNaN(size) && size > maxSizeBytes) {
+        return {
+          bytes: null,
+          reason: `Response size ${size} bytes exceeds limit of ${maxSizeBytes} bytes from ${gateway}`,
+          retryAsGet: false,
+        };
+      }
+    }
+
+    // Always use streaming reader with size enforcement.
+    // Content-Length is only a fast-reject pre-check — a malicious gateway
+    // can set Content-Length: 1000 but stream 500MB.
+    let bytes: Uint8Array;
+    if (response.body != null) {
+      bytes = await readStreamWithLimit(response.body, maxSizeBytes, gateway);
+    } else {
+      // Fallback for environments without ReadableStream (unlikely in Node 18+)
+      const buffer = await response.arrayBuffer();
+      if (buffer.byteLength > maxSizeBytes) {
+        throw new ProfileError(
+          'BUNDLE_NOT_FOUND',
+          `Response ${buffer.byteLength} bytes exceeds limit ${maxSizeBytes} from ${gateway}`,
+        );
+      }
+      bytes = new Uint8Array(buffer);
+    }
+
+    return { bytes, reason: null, retryAsGet: false };
+  };
+
   for (const gateway of effectiveGateways) {
     try {
-      // Use Kubo's `/api/v0/block/get` to retrieve the raw block bytes.
-      // Why not `/ipfs/<cid>`? Many gateways (incl. unicity-ipfs1) ignore
-      // `Accept: application/octet-stream` and `?format=raw`, returning
-      // a CAR-wrapped response instead of the raw block. That breaks the
-      // sha256(bytes) == CID-hash verification below. The block/get API
-      // is symmetric with `pinToIpfs` (which uses `/api/v0/dag/put` with
-      // `store-codec=raw`) and consistently returns the original bytes.
-      // Kubo declares POST, but accepts GET as a documented alias —
-      // sticking with POST for compatibility with strict deployments.
-      const url =
-        `${gateway.replace(/\/$/, '')}/api/v0/block/get?arg=${encodeURIComponent(cid)}`;
-
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { Accept: 'application/octet-stream' },
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-
-      if (!response.ok) {
-        lastError = new Error(`HTTP ${response.status} from ${gateway}`);
-        continue;
-      }
-
-      // Check Content-Length header before reading body
-      const contentLength = response.headers.get('Content-Length');
-      if (contentLength != null) {
-        const size = parseInt(contentLength, 10);
-        if (!isNaN(size) && size > maxSizeBytes) {
-          lastError = new Error(
-            `Response size ${size} bytes exceeds limit of ${maxSizeBytes} bytes from ${gateway}`,
-          );
+      let bytesOrNull: Uint8Array | null = null;
+      // First attempt: POST (Kubo's declared method).
+      let attempt = await tryFetchBlock(gateway, 'POST');
+      if (attempt.bytes !== null) {
+        bytesOrNull = attempt.bytes;
+      } else if (attempt.retryAsGet) {
+        // POST blocked on this gateway — retry as GET (Kubo accepts
+        // it as a documented alias). Avoids skipping a healthy
+        // gateway just because its proxy disables POST.
+        const second = await tryFetchBlock(gateway, 'GET');
+        if (second.bytes !== null) {
+          bytesOrNull = second.bytes;
+        } else {
+          lastError = new Error(`${attempt.reason}; GET retry: ${second.reason}`);
           continue;
         }
-      }
-
-      // Always use streaming reader with size enforcement.
-      // Content-Length is only a fast-reject pre-check — a malicious gateway
-      // can set Content-Length: 1000 but stream 500MB.
-      let bytes: Uint8Array;
-      if (response.body != null) {
-        bytes = await readStreamWithLimit(response.body, maxSizeBytes, gateway);
       } else {
-        // Fallback for environments without ReadableStream (unlikely in Node 18+)
-        const buffer = await response.arrayBuffer();
-        if (buffer.byteLength > maxSizeBytes) {
-          throw new ProfileError(
-            'BUNDLE_NOT_FOUND',
-            `Response ${buffer.byteLength} bytes exceeds limit ${maxSizeBytes} from ${gateway}`,
-          );
-        }
-        bytes = new Uint8Array(buffer);
+        lastError = new Error(attempt.reason ?? 'unknown gateway error');
+        continue;
       }
 
       // Content-address verification. Without this, a malicious gateway can
@@ -234,14 +279,14 @@ export async function fetchFromIpfs(
       // fallback loop with `throw err` the way size-limit failures do.
       // Catch and record as lastError so the next gateway is tried.
       try {
-        verifyCidMatchesBytes(cid, bytes);
+        verifyCidMatchesBytes(cid, bytesOrNull);
       } catch (verifyErr) {
         lastError =
           verifyErr instanceof Error ? verifyErr : new Error(String(verifyErr));
         continue;
       }
 
-      return bytes;
+      return bytesOrNull;
     } catch (err) {
       // Size-limit ProfileError is fatal for this request (not per-gateway)
       // because the caller already constrained maxSizeBytes; retrying won't
