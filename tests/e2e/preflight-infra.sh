@@ -58,6 +58,71 @@ preflight_infra() {
   local network="${E2E_NETWORK:-testnet}"
   local timeout="${E2E_PROBE_TIMEOUT:-60000}"
 
+  # Local-infra mode: when the test harness has booted a local Nostr
+  # relay + faucet (via tests/e2e/local-infra/local-infra.sh), the
+  # public testnet relay/faucet are NOT what we want to probe.
+  # Strategy:
+  #   - Drop `nostr` and `faucet` from the services list passed to
+  #     the public probe — those are local now.
+  #   - Run the public probe on whatever's left (aggregator/ipfs/
+  #     fulcrum/market). Same gate semantics for non-local services.
+  #   - For `nostr`: hand-roll a NIP-11 doc check against
+  #     $SPHERE_NOSTR_RELAYS — a quick HTTP GET that proves the
+  #     local relay container is up and serving.
+  #   - For `faucet`: trust the boot-time check in local-infra.sh.
+  #     The faucet's chain_pubkey was already verified before
+  #     E2E_LOCAL_FAUCET_PUBKEY was exported. No HTTP probe path
+  #     exists for the DM-driven faucet.
+  if [[ "${E2E_LOCAL_INFRA:-0}" == "1" ]]; then
+    local include_local_nostr=0
+    local include_local_faucet=0
+    local public_only=""
+    local IFS_SAVE="$IFS"
+    IFS=','
+    for svc in $services; do
+      svc="${svc//[[:space:]]/}"
+      case "$svc" in
+        nostr) include_local_nostr=1 ;;
+        faucet) include_local_faucet=1 ;;
+        *) public_only="${public_only:+$public_only,}$svc" ;;
+      esac
+    done
+    IFS="$IFS_SAVE"
+
+    if (( include_local_nostr == 1 )); then
+      local relay_url="${SPHERE_NOSTR_RELAYS:-ws://127.0.0.1:7777}"
+      # ws://… → http://…; wss://… → https://…
+      local http_url="${relay_url/ws:/http:}"
+      http_url="${http_url/wss:/https:}"
+      if curl -sf -H "Accept: application/nostr+json" "$http_url" -o /dev/null 2>/dev/null; then
+        echo "  [preflight] ✓ local nostr relay healthy ($relay_url)"
+      else
+        echo "  [preflight] ✗ local nostr relay UNREACHABLE ($relay_url) — skipping"
+        echo "SKIP: ${TEST_NAME:-unknown} — local nostr relay unreachable"
+        exit 0
+      fi
+    fi
+
+    if (( include_local_faucet == 1 )); then
+      if [[ -n "${E2E_LOCAL_FAUCET_PUBKEY:-}" ]]; then
+        echo "  [preflight] ✓ local faucet booted (pubkey=${E2E_LOCAL_FAUCET_PUBKEY:0:16}…)"
+      else
+        echo "  [preflight] ✗ local faucet not booted (E2E_LOCAL_FAUCET_PUBKEY unset) — skipping"
+        echo "SKIP: ${TEST_NAME:-unknown} — local faucet not booted"
+        exit 0
+      fi
+    fi
+
+    # If only nostr/faucet were requested, we're done.
+    if [[ -z "$public_only" ]]; then
+      echo "  [preflight] ✓ infra healthy — proceeding"
+      return 0
+    fi
+
+    services="$public_only"
+    echo "  [preflight] E2E_LOCAL_INFRA=1 — public probe restricted to: $services"
+  fi
+
   echo "  [preflight] running @unicitylabs/infra-probe --network ${network} --only ${services} (this may take ~30s)…"
 
   # Run the probe. Capture stdout for the human-readable summary line

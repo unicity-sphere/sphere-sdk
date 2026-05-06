@@ -72,6 +72,12 @@ fi
 TEST_NAME="${TEST_NAME:-cli-storage-modes}"
 # shellcheck source=./preflight-infra.sh
 source "$(dirname "${BASH_SOURCE[0]}")/preflight-infra.sh"
+
+# Local-infra harness — see local-infra/local-infra.sh. Boots a local
+# relay + faucet when E2E_LOCAL_INFRA=1; no-op otherwise.
+# shellcheck source=./local-infra/local-infra.sh
+source "$(dirname "${BASH_SOURCE[0]}")/local-infra/local-infra.sh"
+
 if [[ "${E2E_NO_AUTO_PREFLIGHT:-0}" != "1" ]]; then
   preflight_infra "${E2E_PREFLIGHT_ONLY:-nostr,aggregator,ipfs}"
 fi

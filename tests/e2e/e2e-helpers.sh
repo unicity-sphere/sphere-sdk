@@ -56,6 +56,14 @@ ESCROW_STARTUP_TIMEOUT=120
 # ---------------------------------------------------------------------------
 # shellcheck source=./preflight-infra.sh
 source "$(dirname "${BASH_SOURCE[0]}")/preflight-infra.sh"
+
+# Local-infra harness — boots a local Nostr relay + faucet via Docker
+# when E2E_LOCAL_INFRA=1. No-op otherwise. Sourced BEFORE the public
+# preflight so SPHERE_NOSTR_RELAYS / E2E_LOCAL_FAUCET_PUBKEY are
+# already in env when the preflight checks them.
+# shellcheck source=./local-infra/local-infra.sh
+source "$(dirname "${BASH_SOURCE[0]}")/local-infra/local-infra.sh"
+
 if [[ "${E2E_NO_AUTO_PREFLIGHT:-0}" != "1" ]]; then
   preflight_infra "${E2E_PREFLIGHT_ONLY:-nostr,aggregator}"
 fi

@@ -153,6 +153,16 @@ maybe_skip_no_testnet() {
 # shellcheck source=./preflight-infra.sh
 source "$(dirname "${BASH_SOURCE[0]}")/preflight-infra.sh"
 
+# Local-infra harness — sourced ONLY when E2E_LOCAL_INFRA=1, no-op
+# otherwise. Boots a local Nostr relay + faucet via Docker so the
+# pointer-NX scripts can run against a deterministic local stack.
+# Exports SPHERE_NOSTR_RELAYS + E2E_LOCAL_FAUCET_PUBKEY which the SDK
+# (createNodeProviders' env-override) and pointer-NX wallets pick up
+# transparently. State is persisted under /tmp/uxf-e2e-local-infra/
+# so concurrent N-scripts share a single boot.
+# shellcheck source=./local-infra/local-infra.sh
+source "$(dirname "${BASH_SOURCE[0]}")/local-infra/local-infra.sh"
+
 maybe_preflight_infra() {
   preflight_infra "${POINTER_PREFLIGHT_SERVICES:-nostr,aggregator,ipfs}"
 }
