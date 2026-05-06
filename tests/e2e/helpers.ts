@@ -37,13 +37,13 @@ export const POLL_INTERVAL_MS = 1_000;
  *    6 decimals: USDT, USDC, USDU
  */
 export const TEST_COINS = [
-  { faucetName: 'solana', symbol: 'SOL', amount: 1000 },
-  { faucetName: 'ethereum', symbol: 'ETH', amount: 42 },
-  { faucetName: 'bitcoin', symbol: 'BTC', amount: 1 },
-  { faucetName: 'unicity', symbol: 'UCT', amount: 100 },
-  { faucetName: 'tether', symbol: 'USDT', amount: 1000 },
-  { faucetName: 'usd-coin', symbol: 'USDC', amount: 1000 },
-  { faucetName: 'unicity-usd', symbol: 'USDU', amount: 1000 },
+  { faucetName: 'solana', symbol: 'SOL', amount: 1000, decimals: 9 },
+  { faucetName: 'ethereum', symbol: 'ETH', amount: 42, decimals: 18 },
+  { faucetName: 'bitcoin', symbol: 'BTC', amount: 1, decimals: 8 },
+  { faucetName: 'unicity', symbol: 'UCT', amount: 100, decimals: 18 },
+  { faucetName: 'tether', symbol: 'USDT', amount: 1000, decimals: 6 },
+  { faucetName: 'usd-coin', symbol: 'USDC', amount: 1000, decimals: 6 },
+  { faucetName: 'unicity-usd', symbol: 'USDU', amount: 1000, decimals: 6 },
 ] as const;
 
 // =============================================================================
@@ -135,11 +135,71 @@ export function makeProviders(dirs: {
 // Faucet
 // =============================================================================
 
+/**
+ * Resolve TEST_COINS' coin slug + human amount to the local-faucet's
+ * (asset, smallest-unit-amount) input shape. Used when E2E_LOCAL_INFRA
+ * routes faucet requests through the DM-based js-faucet container
+ * instead of the public HTTP faucet.
+ */
+function lookupCoinForLocalFaucet(faucetName: string, humanAmount: number):
+  | { asset: string; amount: string }
+  | null {
+  const entry = TEST_COINS.find((c) => c.faucetName === faucetName);
+  if (!entry) return null;
+  // Decimals → smallest unit. BigInt math avoids precision loss for
+  // 18-decimal coins (UCT/ETH).
+  const factor = 10n ** BigInt(entry.decimals);
+  let smallest = BigInt(humanAmount) * factor;
+  // The local js-faucet caps a single asset at 10^18 smallest units
+  // (faucet-handler.ts: MAX_PER_ASSET_AMOUNT = 10n ** 18n) to prevent
+  // accidental over-mint. ETH/UCT at 18 decimals would exceed that
+  // for any human amount > 1; clamp to the cap so local mode delivers
+  // a usable balance instead of erroring out the test. Tests assert
+  // post-sync == pre-faucet via getBalance(), both taken AFTER the
+  // mint, so the clamped amount stays internally consistent.
+  const FAUCET_PER_ASSET_CAP = 10n ** 18n;
+  if (smallest > FAUCET_PER_ASSET_CAP) {
+    smallest = FAUCET_PER_ASSET_CAP;
+  }
+  return { asset: entry.symbol, amount: smallest.toString() };
+}
+
 export async function requestFaucet(
   nametag: string,
   coin: string,
   amount: number,
 ): Promise<{ success: boolean; message?: string }> {
+  // Local-infra path: when E2E_LOCAL_FAUCET_PUBKEY is exported by the
+  // global-setup, route through the DM-based js-faucet instead of the
+  // public HTTP endpoint. The local faucet bypasses the relay outage
+  // that motivates the harness — it talks to ws://127.0.0.1:7777.
+  const localFaucetPubkey = process.env['E2E_LOCAL_FAUCET_PUBKEY'];
+  if (localFaucetPubkey) {
+    const resolved = lookupCoinForLocalFaucet(coin, amount);
+    if (!resolved) {
+      return { success: false, message: `local-faucet: unknown coin slug "${coin}"` };
+    }
+    try {
+      // Lazy-import to avoid loading the local-infra helpers when the
+      // suite runs in public-testnet mode (vitest globalSetup is the
+      // only call site that touches them).
+      const { getOrCreateFaucetClient } = await import('./local-infra/faucet-client.js');
+      const client = await getOrCreateFaucetClient();
+      await client.request(localFaucetPubkey, {
+        recipient: nametag.startsWith('@') ? nametag : `@${nametag}`,
+        asset: resolved.asset,
+        amount: resolved.amount,
+      });
+      return { success: true };
+    } catch (err) {
+      return {
+        success: false,
+        message: `local-faucet DM error: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  }
+
+  // Default path: public HTTP faucet at faucet.unicity.network.
   try {
     const response = await fetch(FAUCET_URL, {
       method: 'POST',

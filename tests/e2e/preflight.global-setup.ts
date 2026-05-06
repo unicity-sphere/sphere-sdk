@@ -44,6 +44,31 @@ export async function setup(): Promise<void> {
     console.log('[preflight] E2E_SKIP_PREFLIGHT=1 — skipping infra probe');
     return;
   }
+
+  // Local-infra mode: when the local-infra/global-setup booted a local
+  // relay + faucet, the public Nostr relay (and faucet) endpoints are
+  // irrelevant — probing them only delays the run and produces
+  // misleading "unreachable" markers when those services are
+  // intentionally bypassed. Filter both out of the default probe set.
+  // The infra-probe library doesn't currently support per-service
+  // endpoint overrides, so we can't probe the local relay through it
+  // — the local relay's own boot wait already verifies it; the absence
+  // here is fine.
+  if (process.env.E2E_LOCAL_INFRA === '1') {
+    const drop = new Set<string>(['nostr', 'faucet']);
+    const incoming = (process.env.E2E_PREFLIGHT_ONLY ?? 'aggregator,ipfs,fulcrum,market')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const filtered = incoming.filter((s) => !drop.has(s));
+    process.env.E2E_PREFLIGHT_ONLY = filtered.length > 0 ? filtered.join(',') : 'aggregator';
+    // eslint-disable-next-line no-console
+    console.log(
+      `[preflight] E2E_LOCAL_INFRA=1 — dropping nostr+faucet from probe set (local). ` +
+        `Probing only: ${process.env.E2E_PREFLIGHT_ONLY}`,
+    );
+  }
+
   const network = (process.env.E2E_NETWORK ?? 'testnet') as 'mainnet' | 'testnet' | 'dev';
 
   // Optional `E2E_PREFLIGHT_ONLY=nostr,aggregator,ipfs` filter. Validate
