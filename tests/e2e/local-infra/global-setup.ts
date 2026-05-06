@@ -42,9 +42,36 @@ const log = (msg: string): void => {
   console.log(`${PREFIX}${msg}`);
 };
 
+/**
+ * Did a parent process (e.g., the bash smoke-test driver, run-all.sh
+ * fanning out per-test scripts, or a CI orchestrator) already boot
+ * the local stack and export its env? When SPHERE_NOSTR_RELAYS and
+ * E2E_LOCAL_FAUCET_PUBKEY are both set on entry, we trust the parent's
+ * boot and skip our own — otherwise we'd race the parent's faucet
+ * container (`docker rm -f` pre-clean would yank the running parent
+ * faucet mid-test) and double-publish the relay's port.
+ *
+ * This DOES NOT prevent normal vitest runs from booting the stack —
+ * those start with neither env var set, so this returns false.
+ */
+function parentAlreadyBootedStack(): boolean {
+  return Boolean(
+    process.env['SPHERE_NOSTR_RELAYS'] &&
+    process.env['E2E_LOCAL_FAUCET_PUBKEY'],
+  );
+}
+
 export async function setup(): Promise<void> {
   if (process.env['E2E_LOCAL_INFRA'] !== '1') {
     log('E2E_LOCAL_INFRA != 1 — skipping local infra; tests run against public testnet.');
+    return;
+  }
+
+  if (parentAlreadyBootedStack()) {
+    log(
+      `parent already booted stack: relay=${process.env['SPHERE_NOSTR_RELAYS']} ` +
+        `faucet=${process.env['E2E_LOCAL_FAUCET_PUBKEY']?.slice(0, 16)}… — reusing.`,
+    );
     return;
   }
 
@@ -85,6 +112,16 @@ export async function setup(): Promise<void> {
 
 export async function teardown(): Promise<void> {
   if (process.env['E2E_LOCAL_INFRA'] !== '1') return;
+
+  // Symmetric with setup() — only tear down what WE booted. If a
+  // parent process owns the stack lifecycle, leaving the containers
+  // running is correct (the parent will tear them down at its own
+  // exit). The module-scoped `relay` / `faucet` handles are non-null
+  // ONLY when this module's setup() actually booted them.
+  if (!relay && !faucet) {
+    log('parent owns stack lifecycle — skipping teardown.');
+    return;
+  }
 
   log('stopping local infra…');
   // Faucet first so it can shut down its DM subscription cleanly
