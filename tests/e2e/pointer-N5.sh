@@ -47,27 +47,33 @@ GW_PRIMARY="${POINTER_N5_GW_PRIMARY:-https://ipfs.unicity.network}"
 GW_SECONDARY="${POINTER_N5_GW_SECONDARY:-${GW_PRIMARY}}"
 
 log "=== Step 1: init device A with --ipfs-gateway ${GW_PRIMARY} ==="
-INIT_A=$(_cd_cli "$DD_A" --no-nostr --ipfs-gateway "${GW_PRIMARY}" \
-           init --profile --network testnet 2>&1) || die "A init failed"
+# Argv order — flags AFTER the subcommand (Commander.js positional
+# parser; legacy flag-first ordering rejected post-extraction).
+INIT_A=$(_cd_cli "$DD_A" \
+           init --no-nostr --ipfs-gateway "${GW_PRIMARY}" \
+           --profile --network testnet 2>&1) || die "A init failed"
 MN_A=$(extract_mnemonic "$INIT_A")
 [[ -n "$MN_A" ]] || die "A mnemonic extraction failed"
 ok "device A initialized (mnemonic ${MN_A%% *}…)"
 
 log "=== Step 2: device A pointer flush via ${GW_PRIMARY} ==="
-# --no-nostr applied consistently across all CLI invocations: this script
-# is the IPFS-only path (Nostr replication is N6's territory).
-_cd_cli "$DD_A" --no-nostr --ipfs-gateway "${GW_PRIMARY}" pointer flush 2>&1 \
+# `--no-nostr` is an `init`-time flag only (the wallet records its
+# transport choice at bootstrap). Pointer subcommands don't accept it.
+# `--ipfs-gateway` similarly applies at SDK construction; the gateway
+# baked into the wallet's persisted config is what flush/recover use.
+_cd_cli "$DD_A" pointer flush 2>&1 \
   | tail -3 | sed 's/^/    /' || die "A flush failed"
 ok "device A flush succeeded via primary gateway"
 
 log "=== Step 3: init device B with mnemonic + --ipfs-gateway ${GW_SECONDARY} ==="
-_cd_cli "$DD_B" --no-nostr --ipfs-gateway "${GW_SECONDARY}" \
-        init --profile --network testnet --mnemonic "${MN_A}" >/dev/null 2>&1 \
+_cd_cli "$DD_B" \
+        init --no-nostr --ipfs-gateway "${GW_SECONDARY}" \
+        --profile --network testnet --mnemonic "${MN_A}" >/dev/null 2>&1 \
         || die "B init failed"
 ok "device B initialized via mnemonic (different gateway list)"
 
 log "=== Step 4: device B recovers A's published pointer via ${GW_SECONDARY} ==="
-RECOVER_B=$(_cd_cli "$DD_B" --no-nostr --ipfs-gateway "${GW_SECONDARY}" pointer recover 2>&1) \
+RECOVER_B=$(_cd_cli "$DD_B" pointer recover 2>&1) \
   || die "B recover errored"
 echo "$RECOVER_B" | tail -3 | sed 's/^/    /'
 if echo "$RECOVER_B" | grep -qE 'Recovered v=[0-9]+ cid='; then
