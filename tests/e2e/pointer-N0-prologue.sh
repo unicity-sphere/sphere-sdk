@@ -48,32 +48,44 @@ POINTER_PROLOGUE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 SDK_ROOT="$(cd -- "${POINTER_PROLOGUE_DIR}/../.." && pwd -P)"
 export POINTER_PROLOGUE_DIR SDK_ROOT
 
-# CLI invocation. Env override lets CI pin a specific command (e.g., a
-# pre-built binary). Resolution order:
-#   1. $SPHERE_CLI / $SDK_CLI_BIN env overrides — explicit command for CI.
-#   2. ${SDK_ROOT}/cli/index.ts                  — legacy in-tree CLI
-#                                                  (pre-extraction).
-#   3. ${SDK_ROOT}/../sphere-cli/cli/index.ts    — sibling sphere-cli repo
-#                                                  (developers who keep
-#                                                  both checked out).
-#   4. globally-installed sphere-cli             — @unicity-sphere/cli
-#                                                  binary on PATH.
-#
-# If none resolve, exit cleanly with a SKIP: line that run-all.sh greps
-# as a non-failure (matches the pre-extraction skip semantics for missing
-# infrastructure).
-if [[ -n "${SPHERE_CLI:-}" ]]; then
-  : # use as-is
-elif [[ -n "${SDK_CLI_BIN:-}" ]]; then
-  export SPHERE_CLI="${SDK_CLI_BIN}"
-elif [[ -f "${SDK_ROOT}/cli/index.ts" ]]; then
-  export SPHERE_CLI="npx --prefix ${SDK_ROOT} tsx ${SDK_ROOT}/cli/index.ts"
-elif [[ -f "${SDK_ROOT}/../sphere-cli/cli/index.ts" ]]; then
-  export SPHERE_CLI="npx --prefix ${SDK_ROOT}/../sphere-cli tsx ${SDK_ROOT}/../sphere-cli/cli/index.ts"
-elif command -v sphere-cli >/dev/null 2>&1; then
-  export SPHERE_CLI="$(command -v sphere-cli)"
-else
-  echo "SKIP: sphere-sdk CLI not available (cli/ extracted to @unicity-sphere/cli; install globally or set SDK_CLI_BIN/SPHERE_CLI)"
+# CLI invocation. The resolver is centralized in lib/resolve-cli.sh so
+# every shell entry-point uses the same fallback chain. See that file
+# for the full lookup order — env override → in-tree → sibling repo
+# (post-split layouts) → globally-installed binary → SKIP.
+# shellcheck source=./lib/resolve-cli.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/resolve-cli.sh"
+if ! resolve_sphere_cli "${SDK_ROOT}" SPHERE_CLI; then
+  print_resolve_failure_help "${SDK_ROOT}"
+  exit 0
+fi
+
+# Pointer-N* tests drive the legacy top-level command shape:
+#   sphere init --profile --network testnet
+#   sphere pointer flush / pointer status / pointer recover
+# The post-extraction `@unicity-sphere/cli` is mid-migration — it has
+# `wallet init` (legacy bridge) but the top-level `init` and the
+# entire `pointer` namespace haven't been ported yet. Probe for
+# `pointer` and SKIP cleanly with a precise reason instead of
+# crashing inside `init_wallet` with a generic "init failed".
+if ! cli_supports_command "$SPHERE_CLI" pointer; then
+  echo "SKIP: ${TEST_NAME:-pointer-test} — CLI does not implement \`pointer\` namespace."
+  echo "  Resolved CLI: $SPHERE_CLI"
+  echo "  This branch's pointer-N* tests use the legacy top-level"
+  echo "  \`pointer\` and \`init\` commands. \`@unicity-sphere/cli\` Phase 2"
+  echo "  hasn't ported them yet (wallet init exists; pointer namespace"
+  echo "  is missing). Either install a sphere-cli build that exposes"
+  echo "  \`sphere pointer\`, or wait for Phase 2 to land."
+  exit 0
+fi
+if ! cli_supports_command "$SPHERE_CLI" init; then
+  echo "SKIP: ${TEST_NAME:-pointer-test} — CLI does not implement top-level \`init\` command."
+  echo "  Resolved CLI: $SPHERE_CLI"
+  echo "  Pointer-N* tests use \`sphere init --profile --network testnet\`"
+  echo "  to bootstrap a fresh Profile wallet. The post-extraction CLI"
+  echo "  exposes \`sphere wallet init <name>\` instead — different shape."
+  echo "  Either install a sphere-cli build with the legacy top-level"
+  echo "  \`init\`, or wait for the pointer-N* tests to be ported to the"
+  echo "  new command shape."
   exit 0
 fi
 

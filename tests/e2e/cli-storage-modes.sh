@@ -42,26 +42,12 @@ set -euo pipefail
 SDK_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 
 # CLI availability check — fail-fast BEFORE the 30s preflight probe.
-# The sphere-sdk CLI was extracted to @unicity-sphere/cli; cli/index.ts
-# no longer exists in the SDK tree. Resolution order:
-#   1. $SDK_CLI_BIN env override          — explicit command for CI.
-#   2. ${SDK_ROOT}/cli/index.ts           — legacy in-tree CLI.
-#   3. ${SDK_ROOT}/../sphere-cli/cli/...  — sibling sphere-cli repo.
-#   4. globally-installed sphere-cli      — @unicity-sphere/cli on PATH.
-#
-# If none resolve, exit cleanly with SKIP (matches pre-split skip
-# semantics for missing infrastructure; run-all.sh greps SKIP as
-# non-failure).
-if [[ -n "${SDK_CLI_BIN:-}" ]]; then
-  CLI="$SDK_CLI_BIN"
-elif [[ -f "$SDK_ROOT/cli/index.ts" ]]; then
-  CLI="npx --prefix $SDK_ROOT tsx $SDK_ROOT/cli/index.ts"
-elif [[ -f "$SDK_ROOT/../sphere-cli/cli/index.ts" ]]; then
-  CLI="npx --prefix $SDK_ROOT/../sphere-cli tsx $SDK_ROOT/../sphere-cli/cli/index.ts"
-elif command -v sphere-cli >/dev/null 2>&1; then
-  CLI="$(command -v sphere-cli)"
-else
-  echo "SKIP: sphere-sdk CLI not available (cli/ extracted to @unicity-sphere/cli; install globally or set SDK_CLI_BIN)"
+# Centralized resolver in lib/resolve-cli.sh covers the sphere-sdk →
+# @unicity-sphere/cli post-split fallback chain.
+# shellcheck source=./lib/resolve-cli.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/resolve-cli.sh"
+if ! resolve_sphere_cli "${SDK_ROOT}" CLI; then
+  print_resolve_failure_help "${SDK_ROOT}"
   exit 0
 fi
 
