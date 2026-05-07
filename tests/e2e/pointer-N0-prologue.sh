@@ -94,6 +94,16 @@ fi
 export AGGREGATOR_URL="${AGGREGATOR_URL:-https://goggregator-test.unicity.network}"
 export FAUCET_URL="${FAUCET_URL:-https://faucet.unicity.network/api/v1/faucet/request}"
 
+# E2E harness: opt into the CLI's non-TTY mnemonic emission so
+# `extract_mnemonic` can capture the 24-word phrase from `init`'s
+# stdout. The CLI suppresses the mnemonic on non-TTY by default to
+# prevent accidental persistence in logs; pointer-N* / profile-*
+# tests need it for recovery-script chaining (N2 imports the mnemonic
+# that N1 produced) and run in a controlled tmpdir, so the tradeoff
+# is worth it for these specific runs. Operators can flip the var
+# off explicitly to debug a flaky extract.
+export SPHERE_ALLOW_MNEMONIC_NON_TTY="${SPHERE_ALLOW_MNEMONIC_NON_TTY:-1}"
+
 # ---------------------------------------------------------------------------
 # Global state (reset per script via setup_workspace)
 # ---------------------------------------------------------------------------
@@ -221,25 +231,46 @@ _cd_cli() {
 # ---------------------------------------------------------------------------
 init_wallet() {
   local datadir="$1"; shift
-  _cd_cli "$datadir" --no-nostr init --profile --network testnet "$@"
+  # Argv order — flags AFTER the subcommand. The legacy in-tree CLI
+  # used a custom argv parser that accepted `--no-nostr init …`
+  # (flag-first) and `init --no-nostr …` (flag-after) interchangeably.
+  # The post-extraction @unicity-sphere/cli is built on Commander.js,
+  # which is positional: anything before the subcommand is parsed as
+  # a top-level program option and rejected with "unknown option".
+  # Always emit `init --no-nostr …` for cross-CLI compatibility.
+  _cd_cli "$datadir" init --no-nostr --profile --network testnet "$@"
 }
 
 # ---------------------------------------------------------------------------
 # extract_mnemonic <init-stdout>
-# Parses 24 consecutive lowercase words out of init output (BIP-39). The
-# CLI prints the mnemonic between two `──────` dashes on a fresh init.
+# Parses a BIP-39 mnemonic phrase out of init output. BIP-39 defines five
+# valid word counts — 12 / 15 / 18 / 21 / 24. The legacy in-tree CLI
+# generated 24-word phrases unconditionally; the post-extraction
+# @unicity-sphere/cli inherits the SDK default which is 12 words. Match
+# any valid length so the helper works against both CLIs without
+# branching.
+#
 # Returns empty string on import (--mnemonic given), which is expected —
 # callers that need the mnemonic must init without --mnemonic.
 # ---------------------------------------------------------------------------
 extract_mnemonic() {
   local out="$1"
-  # Grep the single line that holds 24 lowercase space-separated words.
-  # Fall back to empty on any mismatch — callers must decide if that's an
-  # error (N1/N2: yes; N13 re-init of same wallet: no).
-  echo "$out" \
-    | grep -oE '\b[a-z]+( [a-z]+){23}\b' \
-    | head -1 \
-    || true
+  # Grep the single line that holds 12+ space-separated lowercase words
+  # of length 3-8 (BIP-39 dictionary entries are 3-8 chars). Tightening
+  # the per-word length keeps the regex from matching English prose
+  # in the CLI's surrounding output. We try 24 first (legacy emit), then
+  # 12 (post-extraction default) — first match wins.
+  for n in 23 11; do
+    local m
+    m=$(echo "$out" \
+        | grep -oE "\\b[a-z]{3,8}( [a-z]{3,8}){${n}}\\b" \
+        | head -1)
+    if [[ -n "$m" ]]; then
+      echo "$m"
+      return 0
+    fi
+  done
+  echo ""
 }
 
 # ---------------------------------------------------------------------------
