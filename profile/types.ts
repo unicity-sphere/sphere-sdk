@@ -345,8 +345,23 @@ export interface ProfileDatabase {
   /**
    * Return all entries, optionally filtered by key prefix.
    * Used for listing `tokens.bundle.*` keys.
+   *
+   * **Round 5 (FIX 3) — `maxResults` cap.** Backends MAY accept an
+   * optional `maxResults` cap to short-circuit iteration once that many
+   * matching entries have been buffered. Without the cap, a hostile peer
+   * planting millions of crafted prefix matches forces unbounded
+   * materialization at the OrbitDB layer (the cap on the
+   * disposition-storage adapter only bounds DECRYPT calls — the
+   * underlying map is still fully populated). Backends that don't
+   * support short-circuiting MAY ignore the cap (returning the full
+   * matching set, as before) — callers MUST treat the cap as a request,
+   * not a guarantee. The returned Map size MAY exceed the cap; the
+   * caller still applies its own cap on the result.
    */
-  all(prefix?: string): Promise<Map<string, Uint8Array>>;
+  all(
+    prefix?: string,
+    opts?: { readonly maxResults?: number },
+  ): Promise<Map<string, Uint8Array>>;
 
   /** Close the database, Helia, and libp2p connections. */
   close(): Promise<void>;

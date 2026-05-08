@@ -502,13 +502,28 @@ export class OrbitDbAdapter implements ProfileDatabase {
     }
   }
 
-  async all(prefix?: string): Promise<Map<string, Uint8Array>> {
+  async all(
+    prefix?: string,
+    opts?: { readonly maxResults?: number },
+  ): Promise<Map<string, Uint8Array>> {
     this.ensureConnected();
     try {
       const result = new Map<string, Uint8Array>();
       // OrbitDB keyvalue databases expose an `all()` method that returns
       // all entries as an object or iterable.
       const allEntries = await this.db.all();
+      // Round 5 (FIX 3) — short-circuit iteration once the requested
+      // `maxResults` matching entries have been buffered. Defends
+      // against a hostile peer planting millions of crafted prefix
+      // matches — without the cap, the entire matching set is
+      // materialized regardless of the disposition adapter's own cap.
+      const maxResults =
+        opts?.maxResults !== undefined &&
+        Number.isFinite(opts.maxResults) &&
+        opts.maxResults >= 0
+          ? Math.floor(opts.maxResults)
+          : undefined;
+      const isCapped = maxResults !== undefined;
 
       // Steelman³ remediation: skip malformed values rather than throwing.
       // `keys()` and `clear()` use `all()` purely for key enumeration —
@@ -561,11 +576,18 @@ export class OrbitDbAdapter implements ProfileDatabase {
         }
       };
 
+      // Round 5 (FIX 3) — early-out helper. When `maxResults` is set,
+      // stop iterating as soon as the requested number of matching
+      // entries have been successfully buffered.
+      const reachedCap = (): boolean =>
+        isCapped && result.size >= (maxResults as number);
+
       // allEntries may be an array of {key,value,hash}, an async iterable,
       // a Map, or a plain object depending on the OrbitDB version.
       if (Array.isArray(allEntries)) {
         // OrbitDB v3 keyvalue `all()` returns Array<{key, value, hash}>
         for (const entry of allEntries) {
+          if (reachedCap()) break;
           const entryKey: string = entry.key ?? entry[0];
           const entryValue = entry.value ?? entry[1];
           if (prefix && !entryKey.startsWith(prefix)) {
@@ -575,6 +597,7 @@ export class OrbitDbAdapter implements ProfileDatabase {
         }
       } else if (allEntries && typeof allEntries[Symbol.asyncIterator] === 'function') {
         for await (const entry of allEntries) {
+          if (reachedCap()) break;
           const entryKey: string = entry.key ?? entry[0];
           const entryValue = entry.value ?? entry[1];
           if (prefix && !entryKey.startsWith(prefix)) {
@@ -584,6 +607,7 @@ export class OrbitDbAdapter implements ProfileDatabase {
         }
       } else if (allEntries instanceof Map) {
         for (const [entryKey, entryValue] of allEntries) {
+          if (reachedCap()) break;
           if (prefix && !entryKey.startsWith(prefix)) {
             continue;
           }
@@ -591,6 +615,7 @@ export class OrbitDbAdapter implements ProfileDatabase {
         }
       } else if (typeof allEntries === 'object' && allEntries !== null) {
         for (const [entryKey, entryValue] of Object.entries(allEntries)) {
+          if (reachedCap()) break;
           if (prefix && !entryKey.startsWith(prefix)) {
             continue;
           }

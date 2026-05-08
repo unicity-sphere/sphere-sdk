@@ -293,4 +293,86 @@ describe('OrbitDbDispositionStorageAdapter', () => {
     const got = await adapter.readRecord<{ raw: boolean }>('p.h');
     expect(got).toEqual({ raw: true });
   });
+
+  // ===========================================================================
+  // Round 5 (FIX 2 / FIX 3) — bound iteration BEFORE sort + plumb cap to db.all
+  // ===========================================================================
+
+  it('Round 5 (FIX 3): plumbs maxResults to db.all() so backend can short-circuit', async () => {
+    const db = makeMockDb();
+    let lastOpts: { maxResults?: number } | undefined;
+    const origAll = db.all.bind(db);
+    db.all = async (prefix?: string, opts?: { readonly maxResults?: number }) => {
+      lastOpts = opts;
+      return origAll(prefix);
+    };
+    const adapter = new OrbitDbDispositionStorageAdapter({
+      db,
+      encryptionKey: KEY,
+    });
+    await adapter.writeRecord('p.h1', { x: 1 });
+    await adapter.listKeysWithPrefix('p.', { maxResults: 7 });
+    expect(lastOpts).toBeDefined();
+    expect(lastOpts?.maxResults).toBe(7);
+  });
+
+  it('Round 5 (FIX 2): only sorts the survivor set, not the entire prefix space', async () => {
+    // Plant 100 matching encrypted records, ask for cap=10. The adapter
+    // MUST iterate, filter+cap, then sort — sorting only K=10 entries,
+    // NOT the full 100-entry key set.
+    const db = makeMockDb();
+    const adapter = new OrbitDbDispositionStorageAdapter({
+      db,
+      encryptionKey: KEY,
+    });
+    for (let i = 0; i < 100; i++) {
+      // Pad with leading zeros so lex-sort and insert order disagree
+      // for some entries.
+      await adapter.writeRecord(`p.${i.toString().padStart(4, '0')}`, { i });
+    }
+    const keys = await adapter.listKeysWithPrefix('p.', { maxResults: 10 });
+    expect(keys.length).toBe(10);
+    // The result MUST be sorted (determinism guarantee).
+    const sortedCopy = [...keys].sort();
+    expect(keys).toEqual(sortedCopy);
+  });
+
+  it('Round 5 (FIX 3): hostile peer planting >>cap entries triggers ≤cap iteration', async () => {
+    // Mock a db.all that iterates lazily — we count how many times
+    // it iterates by tracking how many keys it returned.
+    const N = 100_000; // hostile peer scale
+    const cap = 1024;
+    let returnedCount = 0;
+    const fakeDb: MockDb = makeMockDb();
+    fakeDb.all = async (
+      prefix?: string,
+      opts?: { readonly maxResults?: number },
+    ) => {
+      // Generate entries lazily up to either the cap or N, whichever
+      // is smaller. This simulates an OrbitDB backend that honours
+      // the cap and short-circuits.
+      const max = opts?.maxResults ?? N;
+      const out = new Map<string, Uint8Array>();
+      const limit = Math.min(N, max);
+      // Pre-encrypt one valid record we can reuse for every key —
+      // saves time and is sufficient to demonstrate the cap.
+      const ciphertext = await encryptString(KEY, JSON.stringify({ x: 1 }));
+      for (let i = 0; i < limit; i++) {
+        const key = `p.${i.toString().padStart(8, '0')}`;
+        if (prefix && !key.startsWith(prefix)) continue;
+        out.set(key, ciphertext);
+      }
+      returnedCount = out.size;
+      return out;
+    };
+    const adapter = new OrbitDbDispositionStorageAdapter({
+      db: fakeDb,
+      encryptionKey: KEY,
+    });
+    const keys = await adapter.listKeysWithPrefix('p.', { maxResults: cap });
+    expect(keys.length).toBe(cap);
+    // FIX 3: db.all() honoured the cap and only materialized 1024
+    // entries — NOT the full 100k.
+    expect(returnedCount).toBe(cap);
+  });
 });

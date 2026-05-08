@@ -240,9 +240,16 @@ export class OrbitDbDispositionStorageAdapter
         `OrbitDbDispositionStorageAdapter.listKeysWithPrefix: maxResults must be a non-negative finite number (got ${String(cap)})`,
       );
     }
+    // Round 5 (FIX 3) — plumb the cap through to ProfileDatabase.all() so
+    // a hostile peer planting millions of crafted prefix matches cannot
+    // trigger an unbounded materialization at the OrbitDB layer. The
+    // adapter previously only bounded DECRYPT calls; the underlying map
+    // was still fully populated. The new optional `maxResults` parameter
+    // on ProfileDatabase.all() lets the OrbitDB backend short-circuit
+    // iteration once it has buffered enough live entries.
     let entries: Map<string, Uint8Array>;
     try {
-      entries = await this.db.all(keyPrefix);
+      entries = await this.db.all(keyPrefix, { maxResults: cap });
     } catch (err) {
       logger.warn(
         'OrbitDbDispositionStorageAdapter',
@@ -250,21 +257,27 @@ export class OrbitDbDispositionStorageAdapter
       );
       return [];
     }
+    // Round 5 (FIX 2) — filter + cap FIRST, then sort. The previous
+    // `[...entries.keys()].sort()` materialized ALL keys then sorted
+    // O(N log N) BEFORE applying the cap. A hostile prefix saturation
+    // (db.all() returning N >> cap entries with the same prefix) made
+    // this the DoS vector; the result-set sort is O(K log K) where
+    // K = cap, while the iteration is bounded but unsorted until the
+    // cap is hit.
     const out: string[] = [];
-    // Sort the keys for deterministic ordering — callers that want
-    // most-recent-by-observedAt sort by the read record value, but
-    // determinism in the key enumeration helps testability and helps
-    // operators triage by-eye.
-    const sortedKeys = [...entries.keys()].sort();
-    for (const k of sortedKeys) {
-      if (!k.startsWith(keyPrefix)) continue; // db.all may return wider matches
+    for (const [k, ciphertext] of entries) {
       if (out.length >= cap) break;
-      const ciphertext = entries.get(k)!;
+      if (!k.startsWith(keyPrefix)) continue; // db.all may return wider matches
       const decoded = await this.tryDecode<unknown>(ciphertext, k);
       if (decoded === undefined) continue; // decode failure
       if (isTombstone(decoded)) continue;
       out.push(k);
     }
+    // Sort the survivors for deterministic ordering — callers that want
+    // most-recent-by-observedAt sort by the read record value, but
+    // determinism in the key enumeration helps testability and helps
+    // operators triage by-eye. The sort is O(K log K) where K <= cap.
+    out.sort();
     return out;
   }
 
