@@ -491,3 +491,38 @@ describe('Round 7 — safeErrorMessage / sanitizeError defend against hostile Pr
   });
 });
 
+describe('Round 7 — sanitizeReasonString pre-truncates oversized input', () => {
+  it('completes quickly on a 10MB hostile input (defense-in-depth)', () => {
+    // Pre-Round-7, a 10MB raw string would cause a full O(input.length)
+    // `replace()` allocation followed by an O(input.length) `Array.from`
+    // before truncation — non-trivial pause + memory pressure.
+    // Post-Round-7, input is pre-truncated to `cap * 8` UTF-16 code
+    // units BEFORE replace + Array.from, so the work is bounded by
+    // the cap.
+    const tenMb = 'a'.repeat(10 * 1024 * 1024);
+    const start = Date.now();
+    const out = sanitizeReasonString(tenMb);
+    const elapsed = Date.now() - start;
+    // The sanitized output must be cap-bounded.
+    expect(Array.from(out).length).toBeLessThanOrEqual(
+      DEFAULT_MAX_REASON_LENGTH,
+    );
+    expect(out.endsWith('…')).toBe(true);
+    // Defense-in-depth perf bound: should complete WELL under 100ms
+    // even on slow CI hardware. Pre-fix, the same input could pause
+    // for hundreds of ms while allocating the intermediate strings.
+    expect(elapsed).toBeLessThan(500);
+  });
+
+  it('cap-bounded output regardless of input size', () => {
+    // Various oversized inputs all collapse to within cap.
+    for (const size of [1024, 65536, 1024 * 1024]) {
+      const input = 'x'.repeat(size);
+      const out = sanitizeReasonString(input);
+      expect(Array.from(out).length).toBeLessThanOrEqual(
+        DEFAULT_MAX_REASON_LENGTH,
+      );
+    }
+  });
+});
+

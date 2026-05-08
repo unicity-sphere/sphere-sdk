@@ -63,11 +63,24 @@ export function sanitizeReasonString(
   raw: string,
   cap: number = DEFAULT_MAX_REASON_LENGTH,
 ): string {
+  // Round 7 fix (MED NEW): pre-truncate hostile oversized input BEFORE
+  // running `replace` + `Array.from`. A 10MB hostile string would
+  // otherwise allocate an O(input.length) intermediate (the
+  // `replace`-stripped copy AND the code-point array) before the
+  // final cap is applied. Pre-truncating to `cap * 8` UTF-16 code
+  // units bounds memory while still leaving headroom for the
+  // surrogate-pair-padded worst case (up to ~2 code units per code
+  // point) plus a safety margin so the post-strip code-point count
+  // can still saturate the cap.
+  let bounded = raw;
+  if (bounded.length > cap * 8) {
+    bounded = bounded.slice(0, cap * 8);
+  }
   // Drop control characters and HTML markup characters in a single pass.
   // We use literal-range replacement (rather than Unicode property escapes)
   // so the regex stays portable across Node 18+ and the browser runtimes
   // we support.
-  const stripped = raw.replace(
+  const stripped = bounded.replace(
     // eslint-disable-next-line no-control-regex
     /[\x00-\x1F\x7F-\x9F<>&]/g,
     '',
