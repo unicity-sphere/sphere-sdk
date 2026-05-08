@@ -2577,6 +2577,33 @@ export class Sphere {
       }
     }
 
+    // Round 7 (FIX 1) — Wire production OrbitDb-backed disposition
+    // storage into the operator escape-hatch importer. Mirrors the
+    // wiring in `initializeModules()` for the default-address path. See
+    // there for full rationale + KNOWN LIMITATION docstring.
+    try {
+      const storageWithBuilder = this._storage as unknown as {
+        buildDispositionStorageAdapter?: () =>
+          | import('../profile/disposition-storage-adapters').OrbitDbDispositionStorageAdapter
+          | null;
+      };
+      if (typeof storageWithBuilder.buildDispositionStorageAdapter === 'function') {
+        const adapter = storageWithBuilder.buildDispositionStorageAdapter();
+        if (adapter !== null && adapter !== undefined) {
+          payments.configureOperatorEscapeHatchStorage(adapter);
+          logger.debug(
+            'Sphere',
+            `Wired OrbitDb-backed disposition storage for address ${index}`,
+          );
+        }
+      }
+    } catch (err) {
+      logger.warn(
+        'Sphere',
+        `Failed to wire OrbitDb-backed disposition storage for address ${index}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
     // payments.load() is critical — must succeed for wallet to be usable
     await payments.load();
 
@@ -4560,6 +4587,67 @@ export class Sphere {
         logger.warn('Sphere', 'Swap module enabled but accounting module not available — disabling');
         this._swap = null;
       }
+    }
+
+    // Round 7 (FIX 1) — Wire production OrbitDb-backed disposition
+    // storage into the operator escape-hatch InclusionProofImporter.
+    // Round 5 auto-installed an in-memory default that fails closed on
+    // every operator-supplied proof; this hop swaps the disposition
+    // storage for an OrbitDb-backed adapter so `_invalid` / `_audit`
+    // records persist across restarts.
+    //
+    // The swap is best-effort: when the storage provider is not a
+    // `ProfileStorageProvider` (e.g. legacy IndexedDB / file storage),
+    // the auto-installed in-memory default stays in place. When it is
+    // but encryption is disabled or identity isn't set yet,
+    // `buildDispositionStorageAdapter()` returns null and we leave the
+    // default alone. Bootstrap callers that need stricter guarantees
+    // SHOULD verify by calling `payments.importInclusionProof()` with
+    // a probe payload at startup and inspecting the result.
+    //
+    // KNOWN LIMITATION: `verifyProof` / `graftCallback` /
+    // `overrideCallback` are NOT yet wired to production
+    // implementations. The auto-installed defaults still return
+    // `'NOT_AUTHENTICATED'` for every proof. Closing those gaps requires
+    // stable trustBase plumbing on the oracle (deferred to a follow-up
+    // wave). The dispositionStorage swap alone delivers cross-restart
+    // persistence — the highest-value gap surfaced by Round 6.
+    //
+    // TODO(round-8): Wire the real `verifyProof` from
+    //   `oracle/UnicityAggregatorProvider.verifyInclusionProof()` and
+    //   the real graft/override callbacks against PaymentsModule's
+    //   existing graft pipeline once trustBase is exposed lazily.
+    try {
+      // Duck-typed check: ProfileStorageProvider exposes
+      // `buildDispositionStorageAdapter`. Other providers don't.
+      const storageWithBuilder = this._storage as unknown as {
+        buildDispositionStorageAdapter?: () =>
+          | import('../profile/disposition-storage-adapters').OrbitDbDispositionStorageAdapter
+          | null;
+      };
+      if (typeof storageWithBuilder.buildDispositionStorageAdapter === 'function') {
+        const adapter = storageWithBuilder.buildDispositionStorageAdapter();
+        if (adapter !== null && adapter !== undefined) {
+          this._payments.configureOperatorEscapeHatchStorage(adapter);
+          logger.debug(
+            'Sphere',
+            'Wired OrbitDb-backed disposition storage into operator escape-hatch importer',
+          );
+        } else {
+          logger.debug(
+            'Sphere',
+            'ProfileStorageProvider returned null disposition adapter (encryption disabled or identity pending) — escape-hatch importer keeps in-memory default',
+          );
+        }
+      }
+    } catch (err) {
+      // Non-fatal: bootstrap continues with the in-memory default. The
+      // operator escape-hatch still works (just without cross-restart
+      // persistence).
+      logger.warn(
+        'Sphere',
+        `Failed to wire OrbitDb-backed disposition storage — falling back to in-memory default: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
 
     // Load modules in parallel — they are independent of each other.

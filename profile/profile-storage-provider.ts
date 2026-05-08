@@ -24,6 +24,7 @@ import {
 } from './types';
 import { ProfileError } from './errors';
 import { deriveProfileEncryptionKey, encryptString, decryptString } from './encryption';
+import { OrbitDbDispositionStorageAdapter } from './disposition-storage-adapters';
 import {
   buildLocalEntry,
   type OpLogEntryEnvelope,
@@ -794,6 +795,49 @@ export class ProfileStorageProvider implements StorageProvider {
    */
   getPointerSkipReason(): PointerWiringSkipReason | null {
     return this.pointerSkipReason;
+  }
+
+  /**
+   * Round 7 (FIX 1) — Build an {@link OrbitDbDispositionStorageAdapter}
+   * bound to this provider's OrbitDB instance and profile encryption
+   * key. Returns null when:
+   *  - encryption is disabled (no key to encrypt records with), OR
+   *  - identity has not been set yet (no key derived), OR
+   *  - the caller passes nothing useful (defensive null-check).
+   *
+   * The adapter is intentionally constructed lazily: bootstrap callers
+   * (Sphere) invoke this AFTER `setIdentity()` (which derives the
+   * encryption key) but possibly BEFORE OrbitDB has finished attaching
+   * (Phase B). The underlying `OrbitDbAdapter.put/get/all` methods all
+   * `ensureConnected()`, so the adapter's actual reads/writes are
+   * deferred until the DB is ready — there's no need for the adapter
+   * to wait at construction time.
+   *
+   * Returned adapter is a fresh instance each call; callers SHOULD
+   * cache the reference (the returned adapter holds a reference to
+   * `this.db` and `this.profileEncryptionKey`, so it follows the
+   * lifecycle of this provider).
+   *
+   * Encryption key sharing: the returned adapter shares the encryption
+   * key reference with this provider's internal encrypt/decrypt. If the
+   * provider's encryption key is rotated (e.g. via setIdentity with a
+   * different chainPubkey), the existing adapter holds the OLD key.
+   * Bootstrap layers that detect identity rotation MUST rebuild the
+   * adapter via this method.
+   */
+  buildDispositionStorageAdapter(): OrbitDbDispositionStorageAdapter | null {
+    if (!this.encryptionEnabled) {
+      this.log('buildDispositionStorageAdapter: encryption disabled — returning null');
+      return null;
+    }
+    if (this.profileEncryptionKey === null) {
+      this.log('buildDispositionStorageAdapter: encryption key not yet derived (setIdentity pending) — returning null');
+      return null;
+    }
+    return new OrbitDbDispositionStorageAdapter({
+      db: this.db,
+      encryptionKey: this.profileEncryptionKey,
+    });
   }
 
   async disconnect(): Promise<void> {
