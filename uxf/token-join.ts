@@ -541,7 +541,11 @@ function altProofIsStructurallyValid(
   if (proofEl.type !== ELEMENT_TYPE_INCLUSION_PROOF) return false;
   const pc = proofEl.children as Record<string, unknown>;
   if (typeof pc.authenticator !== 'string') return false;
-  if (typeof pc.smtPath !== 'string') return false;
+  // Steelman remediation: schema field is `merkleTreePath` (types.ts:223,
+  // deconstruct.ts:338, assemble.ts:273, verify.ts:59); previous typo
+  // `smtPath` ALWAYS evaluated to undefined -> `false`, silently disabling
+  // Rule 4 enrichment for every well-formed alt candidate.
+  if (typeof pc.merkleTreePath !== 'string') return false;
   return true;
 }
 

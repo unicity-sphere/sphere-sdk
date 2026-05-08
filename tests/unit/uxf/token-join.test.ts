@@ -824,4 +824,92 @@ describe('resolveTokenRoot', () => {
     expect(outcome.kind).toBe('single');
     expect(outcome.rootHash).toBe(rootH);
   });
+
+  // ---------------------------------------------------------------------------
+  // Rule 4 — FIX 4 regression: altProofIsStructurallyValid checks the
+  // schema-correct field `merkleTreePath` (was `smtPath` typo) so the
+  // gate actually accepts well-formed alt candidates. Previously
+  // `pc.smtPath !== 'string'` ALWAYS returned `false`, silently disabling
+  // Rule 4 enrichment for every alt whose proof element was present in
+  // the pool.
+  // ---------------------------------------------------------------------------
+  it('Rule 4 — FIX 4: enrichment activates when alt has well-formed inclusion-proof element with merkleTreePath child', () => {
+    const t0 = makeTransaction('0', { committed: true });
+    const HEX_STATE_A = 'a'.repeat(64);
+    const HEX_STATE_B = 'b'.repeat(64);
+    const HEX_DATA_1 = 'c'.repeat(64);
+    const HEX_PROOF_1 = 'd'.repeat(64);
+    const HEX_AUTH = 'e'.repeat(64);
+    const HEX_MERKLE = 'f'.repeat(64);
+    const HEX_CERT = '1'.repeat(64);
+
+    const t1Unproved: PoolEntry = [
+      hexTag('tx1u'),
+      {
+        header: { representation: 1, semantics: 1, kind: 'default' as const, predecessor: null },
+        type: 'transaction',
+        content: {},
+        children: { sourceState: HEX_STATE_A, data: HEX_DATA_1, inclusionProof: null, destinationState: HEX_STATE_B },
+      },
+    ];
+    // The proved alt's transaction references HEX_PROOF_1 as its
+    // inclusion-proof child.
+    const t1Proved: PoolEntry = [
+      hexTag('tx1p'),
+      {
+        header: { representation: 1, semantics: 1, kind: 'default' as const, predecessor: null },
+        type: 'transaction',
+        content: {},
+        children: { sourceState: HEX_STATE_A, data: HEX_DATA_1, inclusionProof: HEX_PROOF_1, destinationState: HEX_STATE_B },
+      },
+    ];
+    // The actual inclusion-proof element with the schema-correct
+    // children: authenticator + merkleTreePath (+ unicityCertificate).
+    // Pre-fix this element would be REJECTED because the gate looked
+    // for the wrong field name `smtPath`.
+    const proofEl: PoolEntry = [
+      HEX_PROOF_1 as ContentHash,
+      {
+        header: { representation: 1, semantics: 1, kind: 'default' as const, predecessor: null },
+        type: 'inclusion-proof',
+        content: { transactionHash: HEX_DATA_1 },
+        children: {
+          authenticator: HEX_AUTH,
+          merkleTreePath: HEX_MERKLE,
+          unicityCertificate: HEX_CERT,
+        },
+      },
+    ];
+    const t2 = makeTransaction('2', { committed: false });
+    const [shortRootH, shortRoot] = makeTokenRoot('short', [t0[0], t1Proved[0]]);
+    const [longRootH, longRoot] = makeTokenRoot('long', [t0[0], t1Unproved[0], t2[0]]);
+    const pool = buildPool(
+      t0,
+      t1Unproved,
+      t1Proved,
+      proofEl,
+      t2,
+      [shortRootH, shortRoot],
+      [longRootH, longRoot],
+    );
+
+    const outcome = resolveTokenRoot({
+      tokenId: 'T',
+      candidates: [shortRootH, longRootH],
+      pool,
+      verifiedProofs: new Set([HEX_PROOF_1 as ContentHash]),
+    });
+
+    // With the typo fixed, the alt's structural validation passes and
+    // Rule 4 enrichment fires. Before the fix, this same fixture
+    // would have classified as `divergent` because the gate rejected
+    // the proof element on a non-existent `smtPath` field.
+    expect(outcome.kind).toBe('enriched');
+    if (outcome.kind !== 'enriched') return;
+    expect(outcome.syntheticRoot.children.transactions).toEqual([
+      t0[0],
+      t1Proved[0],
+      t2[0],
+    ]);
+  });
 });
