@@ -39,6 +39,7 @@ import { UxfError } from './errors.js';
 import { computeElementHash } from './hash.js';
 import { hexToBytesAllowEmpty } from '../core/hex.js';
 import { assertHeaderKindField, assertHeaderVersionField } from './header-validation.js';
+import { MANIFEST_MAX_SIZE } from './limits.js';
 
 // ---------------------------------------------------------------------------
 // Type ID <-> String Tag mapping
@@ -340,10 +341,14 @@ export function packageFromJson(json: string): UxfPackageData {
     throw new UxfError('SERIALIZATION_ERROR', 'JSON root must be an object');
   }
 
-  if (typeof raw.uxf !== 'string') {
+  // Steelman remediation (FIX 8): strict equality on the version
+  // literal — accepting any string here lets a hostile peer ride
+  // unknown-version semantics under our 1.0.0 parser. The on-the-wire
+  // wrapper version is explicitly pinned by SPEC §5.8.
+  if (raw.uxf !== '1.0.0') {
     throw new UxfError(
       'SERIALIZATION_ERROR',
-      'Missing or invalid "uxf" version field',
+      `Unsupported uxf version: ${typeof raw.uxf === 'string' ? `"${raw.uxf}"` : String(raw.uxf)}`,
     );
   }
 
@@ -357,8 +362,11 @@ export function packageFromJson(json: string): UxfPackageData {
   }
   const envelope: UxfEnvelope = {
     version: requireString(meta, 'version', 'metadata'),
-    createdAt: requireNumber(meta, 'createdAt', 'metadata'),
-    updatedAt: requireNumber(meta, 'updatedAt', 'metadata'),
+    // Steelman remediation (FIX 7): timestamps are non-negative
+    // integers (unix-seconds). Reject NaN/Infinity/-0/fractional/
+    // negative values explicitly.
+    createdAt: requireTimestamp(meta, 'createdAt', 'metadata'),
+    updatedAt: requireTimestamp(meta, 'updatedAt', 'metadata'),
     ...(meta.creator !== undefined ? { creator: meta.creator } : {}),
     ...(meta.description !== undefined
       ? { description: meta.description }
@@ -372,8 +380,30 @@ export function packageFromJson(json: string): UxfPackageData {
       'Missing or invalid "manifest" field',
     );
   }
+  const manifestEntries = Object.entries(raw.manifest);
+  // Steelman remediation (FIX 9): cap manifest size BEFORE iterating —
+  // a hostile package with millions of token entries would otherwise
+  // burn parse time and memory before the per-element-count cap fires
+  // (the element-count cap targets pool elements, not manifest keys).
+  if (manifestEntries.length > MANIFEST_MAX_SIZE) {
+    throw new UxfError(
+      'LIMIT_EXCEEDED',
+      `Manifest entry count exceeds MANIFEST_MAX_SIZE=${MANIFEST_MAX_SIZE}: ${manifestEntries.length}`,
+    );
+  }
   const tokens = new Map<string, ContentHash>();
-  for (const [tokenId, rootHash] of Object.entries(raw.manifest)) {
+  for (const [tokenId, rootHash] of manifestEntries) {
+    // Steelman remediation (FIX 6): validate tokenId against the
+    // canonical /^[0-9a-f]{64}$/ regex (matching deconstruct.ts:213
+    // ingest gate). The regex naturally rejects `__proto__`,
+    // `constructor`, `prototype`, empty strings, non-hex unicode,
+    // wrong-length keys.
+    if (!/^[0-9a-f]{64}$/.test(tokenId)) {
+      throw new UxfError(
+        'SERIALIZATION_ERROR',
+        `Invalid manifest tokenId: ${tokenId.slice(0, 32)}…`,
+      );
+    }
     tokens.set(tokenId, contentHash(rootHash));
   }
   const manifest: UxfManifest = { tokens };
@@ -633,17 +663,51 @@ function requireString(
   return value;
 }
 
-/** Require a number field on an object, throw SERIALIZATION_ERROR if missing. */
+/** Require a number field on an object, throw SERIALIZATION_ERROR if missing.
+ *
+ * Steelman remediation (FIX 7): NaN, +Infinity, -Infinity are valid
+ * `typeof === 'number'` but never valid wire-form values. Reject them
+ * explicitly via Number.isFinite to prevent downstream surprise
+ * (NaN propagates through arithmetic; Infinity breaks comparisons).
+ */
 function requireNumber(
   obj: Record<string, unknown>,
   field: string,
   context: string,
 ): number {
   const value = obj[field];
-  if (typeof value !== 'number') {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
     throw new UxfError(
       'SERIALIZATION_ERROR',
-      `Missing or invalid "${field}" in ${context}: expected number`,
+      `Missing or invalid "${field}" in ${context}: expected finite number`,
+    );
+  }
+  return value;
+}
+
+/**
+ * Require a timestamp field — a non-negative integer (unix-seconds).
+ *
+ * Steelman remediation (FIX 7): `createdAt` / `updatedAt` are wire
+ * timestamps with strict semantics. Fractional / negative / Infinity
+ * values are all malformed; flagging them at the parse boundary
+ * keeps downstream code simple.
+ */
+function requireTimestamp(
+  obj: Record<string, unknown>,
+  field: string,
+  context: string,
+): number {
+  const value = obj[field];
+  if (
+    typeof value !== 'number' ||
+    !Number.isFinite(value) ||
+    !Number.isInteger(value) ||
+    value < 0
+  ) {
+    throw new UxfError(
+      'SERIALIZATION_ERROR',
+      `Missing or invalid "${field}" in ${context}: expected non-negative integer (got ${typeof value === 'number' ? value : typeof value})`,
     );
   }
   return value;

@@ -248,8 +248,27 @@ function prepareSmtSegments(
     data: seg.data === null || seg.data === undefined
       ? null
       : hexToBytes(seg.data as string),
-    path: bigIntTo32Bytes(BigInt(seg.path)),
+    // Steelman remediation (FIX 11): BigInt() is permissive — it accepts
+    // " 100 ", "00100", "+100", "0xff", and many other lexical shapes
+    // that are NOT canonical decimal integers. Validate against a
+    // strict decimal regex BEFORE handing the string to BigInt() so a
+    // hostile peer cannot smuggle a path under a non-canonical
+    // representation that round-trips to a different bigint.
+    path: bigIntTo32Bytes(parseSmtPathDecimal(seg.path)),
   }));
+}
+
+/**
+ * Parse a strict decimal-integer string into a non-negative bigint.
+ *
+ * Accepts: "0", "1", "12345" (no leading zeros, no sign, no whitespace,
+ * no hex/octal/scientific). Rejects everything else with INVALID_INPUT.
+ */
+function parseSmtPathDecimal(s: string): bigint {
+  if (typeof s !== 'string' || !/^(0|[1-9][0-9]*)$/.test(s)) {
+    throw new UxfError('INVALID_INPUT', `Invalid SMT path string: ${s}`);
+  }
+  return BigInt(s);
 }
 
 // ---------------------------------------------------------------------------

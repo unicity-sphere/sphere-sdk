@@ -342,10 +342,14 @@ describe('packageToJson / packageFromJson', () => {
     });
 
     it('invalid content hash in manifest throws INVALID_HASH', () => {
+      // FIX 6 note: tokenId itself must now match /^[0-9a-f]{64}$/, so use
+      // a structurally-valid tokenId. The invalid contentHash on the
+      // VALUE side is what we want to surface as INVALID_HASH.
+      const validTokenId = 'a'.repeat(64);
       const json = JSON.stringify({
         uxf: '1.0.0',
         metadata: { version: '1.0.0', createdAt: 0, updatedAt: 0, elementCount: 0, tokenCount: 0 },
-        manifest: { someToken: 'ABCD' },
+        manifest: { [validTokenId]: 'ABCD' },
         elements: {},
       });
       expect(() => packageFromJson(json)).toThrow(/INVALID_HASH/);
@@ -405,5 +409,274 @@ describe('packageToJson / packageFromJson', () => {
         expect(String(e)).toMatch(/ghost-token-id/);
       }
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Steelman regression — FIX 6: manifest tokenId regex validation on import.
+// ---------------------------------------------------------------------------
+
+describe('packageFromJson — manifest tokenId validation (FIX 6)', () => {
+  function makeMinimalJson(manifest: Record<string, string>): string {
+    return JSON.stringify({
+      uxf: '1.0.0',
+      metadata: {
+        version: '1.0.0',
+        createdAt: 1,
+        updatedAt: 1,
+        elementCount: 0,
+        tokenCount: Object.keys(manifest).length,
+      },
+      manifest,
+      instanceChainIndex: {},
+      indexes: { byTokenType: {}, byCoinId: {}, byStateHash: {} },
+      elements: {},
+    });
+  }
+
+  it('rejects __proto__ as manifest tokenId', () => {
+    // Hand-craft JSON: passing `{ __proto__: ... }` to JSON.stringify
+    // sets the prototype rather than emitting a `__proto__` key, so
+    // we string-build the JSON to make the malicious key reach the
+    // parse boundary.
+    const json = '{"uxf":"1.0.0","metadata":{"version":"1.0.0","createdAt":1,"updatedAt":1,"elementCount":0,"tokenCount":0},"manifest":{"__proto__":"' + 'a'.repeat(64) + '"},"instanceChainIndex":{},"indexes":{"byTokenType":{},"byCoinId":{},"byStateHash":{}},"elements":{}}';
+    let err: any;
+    try {
+      packageFromJson(json);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('SERIALIZATION_ERROR');
+    expect(String(err.message)).toMatch(/Invalid manifest tokenId/);
+  });
+
+  it('rejects empty-string manifest tokenId', () => {
+    const json = makeMinimalJson({ '': 'a'.repeat(64) });
+    let err: any;
+    try {
+      packageFromJson(json);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('SERIALIZATION_ERROR');
+  });
+
+  it('rejects non-hex unicode tokenId', () => {
+    const json = makeMinimalJson({ ['zz'.repeat(32)]: 'a'.repeat(64) });
+    let err: any;
+    try {
+      packageFromJson(json);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('SERIALIZATION_ERROR');
+  });
+
+  it('rejects 65-char hex tokenId', () => {
+    const json = makeMinimalJson({ ['ab'.repeat(32) + 'cd']: 'a'.repeat(64) });
+    let err: any;
+    try {
+      packageFromJson(json);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('SERIALIZATION_ERROR');
+  });
+
+  it('rejects 63-char hex tokenId', () => {
+    const json = makeMinimalJson({ ['ab'.repeat(31) + 'a']: 'a'.repeat(64) });
+    let err: any;
+    try {
+      packageFromJson(json);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('SERIALIZATION_ERROR');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Steelman regression — FIX 7: NaN/Infinity rejection in requireNumber +
+// integer/non-negative checks for createdAt/updatedAt.
+// ---------------------------------------------------------------------------
+
+describe('packageFromJson — timestamp validation (FIX 7)', () => {
+  function makeJsonWithCreatedAt(createdAt: unknown): string {
+    return JSON.stringify({
+      uxf: '1.0.0',
+      metadata: {
+        version: '1.0.0',
+        createdAt,
+        updatedAt: 1,
+        elementCount: 0,
+        tokenCount: 0,
+      },
+      manifest: {},
+      instanceChainIndex: {},
+      indexes: { byTokenType: {}, byCoinId: {}, byStateHash: {} },
+      elements: {},
+    });
+  }
+
+  // Note: JSON.stringify drops NaN/Infinity to `null`. We hand-craft a
+  // JSON string with literal `NaN`/`Infinity` to exercise the parser's
+  // typeof-narrowing path. JSON.parse will reject literal NaN/Infinity
+  // outright, so the malformed-payload path lands inside the JSON.parse
+  // try/catch (SERIALIZATION_ERROR). Either way the call MUST throw.
+  it('rejects literal NaN createdAt (parse-error or typed-error)', () => {
+    const json = '{"uxf":"1.0.0","metadata":{"version":"1.0.0","createdAt":NaN,"updatedAt":1,"elementCount":0,"tokenCount":0},"manifest":{},"instanceChainIndex":{},"indexes":{"byTokenType":{},"byCoinId":{},"byStateHash":{}},"elements":{}}';
+    let err: any;
+    try {
+      packageFromJson(json);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('SERIALIZATION_ERROR');
+  });
+
+  it('rejects literal Infinity createdAt', () => {
+    const json = '{"uxf":"1.0.0","metadata":{"version":"1.0.0","createdAt":Infinity,"updatedAt":1,"elementCount":0,"tokenCount":0},"manifest":{},"instanceChainIndex":{},"indexes":{"byTokenType":{},"byCoinId":{},"byStateHash":{}},"elements":{}}';
+    let err: any;
+    try {
+      packageFromJson(json);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('SERIALIZATION_ERROR');
+  });
+
+  it('rejects negative createdAt', () => {
+    const json = makeJsonWithCreatedAt(-1);
+    let err: any;
+    try {
+      packageFromJson(json);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('SERIALIZATION_ERROR');
+    expect(String(err.message)).toMatch(/non-negative integer/);
+  });
+
+  it('rejects fractional createdAt', () => {
+    const json = makeJsonWithCreatedAt(1.5);
+    let err: any;
+    try {
+      packageFromJson(json);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('SERIALIZATION_ERROR');
+    expect(String(err.message)).toMatch(/non-negative integer/);
+  });
+
+  it('accepts createdAt: 0 (legitimate boundary)', () => {
+    const json = makeJsonWithCreatedAt(0);
+    // Should NOT throw (0 is a valid non-negative integer).
+    const pkg = packageFromJson(json);
+    expect(pkg.envelope.createdAt).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Steelman regression — FIX 8: version literal whitelist.
+// ---------------------------------------------------------------------------
+
+describe('packageFromJson — version whitelist (FIX 8)', () => {
+  function makeJsonWithVersion(version: unknown): string {
+    return JSON.stringify({
+      uxf: version,
+      metadata: { version: '1.0.0', createdAt: 1, updatedAt: 1, elementCount: 0, tokenCount: 0 },
+      manifest: {},
+      instanceChainIndex: {},
+      indexes: { byTokenType: {}, byCoinId: {}, byStateHash: {} },
+      elements: {},
+    });
+  }
+
+  it('rejects version "99.0.0"', () => {
+    const json = makeJsonWithVersion('99.0.0');
+    let err: any;
+    try {
+      packageFromJson(json);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('SERIALIZATION_ERROR');
+    expect(String(err.message)).toMatch(/Unsupported uxf version/);
+  });
+
+  it('rejects empty-string version', () => {
+    const json = makeJsonWithVersion('');
+    let err: any;
+    try {
+      packageFromJson(json);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('SERIALIZATION_ERROR');
+    expect(String(err.message)).toMatch(/Unsupported uxf version/);
+  });
+
+  it('rejects "DROP TABLE" SQL-injection-style version', () => {
+    const json = makeJsonWithVersion('DROP TABLE');
+    let err: any;
+    try {
+      packageFromJson(json);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('SERIALIZATION_ERROR');
+  });
+
+  it('accepts canonical version "1.0.0"', () => {
+    const json = makeJsonWithVersion('1.0.0');
+    const pkg = packageFromJson(json);
+    expect(pkg.envelope.version).toBe('1.0.0');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Steelman regression — FIX 9: MANIFEST_MAX_SIZE cap on import.
+// ---------------------------------------------------------------------------
+
+describe('packageFromJson — manifest size cap (FIX 9)', () => {
+  it('rejects manifest with >MANIFEST_MAX_SIZE entries with LIMIT_EXCEEDED', () => {
+    // Generate 100_001 valid 64-char hex keys; even without elements,
+    // the manifest size cap MUST fire before the loop iterates.
+    const manifest: Record<string, string> = {};
+    for (let i = 0; i <= 100_000; i++) {
+      // Pad i to 64 hex chars deterministically.
+      const k = i.toString(16).padStart(64, '0');
+      manifest[k] = 'a'.repeat(64);
+    }
+    const json = JSON.stringify({
+      uxf: '1.0.0',
+      metadata: { version: '1.0.0', createdAt: 1, updatedAt: 1, elementCount: 0, tokenCount: Object.keys(manifest).length },
+      manifest,
+      instanceChainIndex: {},
+      indexes: { byTokenType: {}, byCoinId: {}, byStateHash: {} },
+      elements: {},
+    });
+    let err: any;
+    try {
+      packageFromJson(json);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('LIMIT_EXCEEDED');
+    expect(String(err.message)).toMatch(/Manifest entry count exceeds/);
   });
 });

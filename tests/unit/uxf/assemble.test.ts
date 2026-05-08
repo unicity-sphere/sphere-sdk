@@ -509,3 +509,73 @@ describe('assembleToken', () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Steelman regression — FIX 10: assembleTokenAtState NaN/Infinity guard.
+// ---------------------------------------------------------------------------
+
+describe('assembleTokenAtState — stateIndex validation (FIX 10)', () => {
+  let pool: ElementPool;
+  beforeEach(() => {
+    pool = new ElementPool();
+  });
+
+  function setup() {
+    const { manifest, tokenId } = deconstructAndManifest(pool, TOKEN_C);
+    return { manifest, tokenId };
+  }
+
+  it('rejects NaN stateIndex with INVALID_INPUT', () => {
+    const { manifest, tokenId } = setup();
+    let err: any;
+    try {
+      assembleTokenAtState(pool, manifest, tokenId, NaN, emptyChains);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(UxfError);
+    expect((err as UxfError).code).toBe('INVALID_INPUT');
+  });
+
+  it('rejects Infinity stateIndex with INVALID_INPUT', () => {
+    const { manifest, tokenId } = setup();
+    let err: any;
+    try {
+      assembleTokenAtState(pool, manifest, tokenId, Infinity, emptyChains);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(UxfError);
+    expect((err as UxfError).code).toBe('INVALID_INPUT');
+  });
+
+  it('rejects -1 stateIndex with INVALID_INPUT', () => {
+    const { manifest, tokenId } = setup();
+    let err: any;
+    try {
+      assembleTokenAtState(pool, manifest, tokenId, -1, emptyChains);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(UxfError);
+    expect((err as UxfError).code).toBe('INVALID_INPUT');
+  });
+
+  it('rejects 1.5 fractional stateIndex with INVALID_INPUT', () => {
+    const { manifest, tokenId } = setup();
+    let err: any;
+    try {
+      assembleTokenAtState(pool, manifest, tokenId, 1.5, emptyChains);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(UxfError);
+    expect((err as UxfError).code).toBe('INVALID_INPUT');
+  });
+
+  it('accepts stateIndex=0 (genesis state, valid boundary)', () => {
+    const { manifest, tokenId } = setup();
+    // Should NOT throw on legitimate non-negative integer.
+    expect(() => assembleTokenAtState(pool, manifest, tokenId, 0, emptyChains)).not.toThrow();
+  });
+});

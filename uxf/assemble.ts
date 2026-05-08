@@ -583,6 +583,22 @@ export function assembleTokenAtState(
   instanceChains: InstanceChainIndex,
   strategy: InstanceSelectionStrategy = STRATEGY_LATEST,
 ): unknown {
+  // Steelman remediation (FIX 10): explicit NaN/Infinity/fractional/
+  // negative guard at function entry. A `stateIndex: NaN` slips past
+  // the `< 0 || > totalTx` range check below (NaN comparisons are
+  // always false), letting NaN propagate into `slice(0, NaN)` which
+  // returns an empty array — silently masking caller bugs.
+  if (
+    !Number.isFinite(stateIndex) ||
+    !Number.isInteger(stateIndex) ||
+    stateIndex < 0
+  ) {
+    throw new UxfError(
+      'INVALID_INPUT',
+      `assembleTokenAtState: stateIndex must be a non-negative integer (got ${stateIndex})`,
+    );
+  }
+
   const rootHash = manifest.tokens.get(tokenId);
   if (!rootHash) {
     throw new UxfError('TOKEN_NOT_FOUND', `Token ${tokenId} not in manifest`);

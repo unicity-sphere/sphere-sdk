@@ -497,3 +497,76 @@ describe('computeElementHash', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Steelman regression — FIX 11: prepareSmtSegments path field is now
+// validated against /^(0|[1-9][0-9]*)$/ before BigInt() coerces it.
+// BigInt() accepts " 100 ", "00100", "+100", "0xff" — none of which are
+// canonical decimals; a hostile peer could otherwise smuggle a path
+// under a non-canonical representation.
+// ---------------------------------------------------------------------------
+
+describe('prepareSmtSegments — strict decimal regex on path (FIX 11)', () => {
+  function attempt(path: string): UxfError | null {
+    try {
+      prepareContentForHashing('smt-path', {
+        segments: [{ data: 'aabb', path }],
+      });
+      return null;
+    } catch (e) {
+      return e as UxfError;
+    }
+  }
+
+  it('rejects whitespace-padded " 100 "', () => {
+    const err = attempt(' 100 ');
+    expect(err).not.toBeNull();
+    expect(err!.code).toBe('INVALID_INPUT');
+  });
+
+  it('rejects leading-zero "00100"', () => {
+    const err = attempt('00100');
+    expect(err).not.toBeNull();
+    expect(err!.code).toBe('INVALID_INPUT');
+  });
+
+  it('rejects positive-sign "+100"', () => {
+    const err = attempt('+100');
+    expect(err).not.toBeNull();
+    expect(err!.code).toBe('INVALID_INPUT');
+  });
+
+  it('rejects hex literal "0xff"', () => {
+    const err = attempt('0xff');
+    expect(err).not.toBeNull();
+    expect(err!.code).toBe('INVALID_INPUT');
+  });
+
+  it('rejects empty string', () => {
+    const err = attempt('');
+    expect(err).not.toBeNull();
+    expect(err!.code).toBe('INVALID_INPUT');
+  });
+
+  it('rejects negative "-1"', () => {
+    const err = attempt('-1');
+    expect(err).not.toBeNull();
+    expect(err!.code).toBe('INVALID_INPUT');
+  });
+
+  it('rejects fractional "1.5"', () => {
+    const err = attempt('1.5');
+    expect(err).not.toBeNull();
+    expect(err!.code).toBe('INVALID_INPUT');
+  });
+
+  it('accepts canonical "0"', () => {
+    const err = attempt('0');
+    expect(err).toBeNull();
+  });
+
+  it('accepts canonical "12345"', () => {
+    const err = attempt('12345');
+    expect(err).toBeNull();
+  });
+});
