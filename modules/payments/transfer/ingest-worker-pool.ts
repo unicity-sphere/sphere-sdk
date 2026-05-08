@@ -476,6 +476,32 @@ export class IngestWorkerPool {
       );
     }
 
+    // ---- Step 0: enqueue-time inline-CAR size cap ----
+    //
+    // **Steelman warning fix:** the recipient cap
+    // {@link RECIPIENT_MAX_INLINE_CARBASE64_LENGTH} previously fired
+    // INSIDE bundle-acquirer.ts after enqueue. A hostile sender could
+    // fill the 256-entry queue with 5 MiB payloads ≈ 1.3 GiB resident
+    // before any of them reached the acquirer. We now reject oversize
+    // inline payloads at enqueue time so the queue never holds them.
+    //
+    // The check is intentionally synchronous and BEFORE any per-token
+    // cap accounting / wakers (so a hostile sender cannot perturb pool
+    // counters with rejected payloads). We do NOT validate base64
+    // alphabet / structural well-formedness here — those are the
+    // acquirer's job. We only bound MEMORY ALLOCATED IN THE QUEUE.
+    if (
+      payload.kind === 'uxf-car' &&
+      payload.carBase64.length > RECIPIENT_MAX_INLINE_CARBASE64_LENGTH
+    ) {
+      throw new SphereError(
+        `IngestWorkerPool.enqueue: carBase64 length ${payload.carBase64.length} ` +
+          `exceeds recipient inline cap ${RECIPIENT_MAX_INLINE_CARBASE64_LENGTH}; ` +
+          `bundle bundleCid=${payload.bundleCid} dropped at enqueue (queue not allocated)`,
+        'BUNDLE_REJECTED_INLINE_CAP_EXCEEDED',
+      );
+    }
+
     // ---- Step 1: total queue cap ----
     if (this.queue.length >= this.queueCapacity) {
       this.emitQueueFull('queue-full', payload, senderTransportPubkey);

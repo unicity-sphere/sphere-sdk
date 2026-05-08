@@ -92,27 +92,43 @@ export interface ManifestStoreOptions {
  * rules. Pure / deterministic — no side effects, no clock mutation.
  *
  * **Field merge semantics** (per §5.4):
- *  - `rootHash` — taken from `next` when `prev.rootHash === next.rootHash`
- *    (canonical path: conflict-merger stamped the winner as `next`). On
- *    divergence, defense-in-depth symmetric tie-break: lex-min
- *    `bundleCid` if either side carries it; lex-min `rootHash` otherwise.
- *    Ensures `mergeManifestEntry(A, B) === mergeManifestEntry(B, A)`
- *    even if a future caller bypasses `conflict-merger` (T.3.D).
- *  - `status`   — taken from the chain-content winner (per the rootHash
- *    selection above). When rootHashes match, that's `next`.
- *  - `invalidReason` — preserved if either side has it set; on
- *    divergence, prefer `next` (the latest signal).
+ *  - `rootHash` — same on both sides on the canonical path (the §5.3 [D]
+ *    conflict-merger stamps the winner as `next`); on divergence, the
+ *    symmetric defense-in-depth tie-break {@link pickChainWinnerSymmetric}
+ *    selects a stable winner. Ensures `mergeManifestEntry(A, B) ===
+ *    mergeManifestEntry(B, A)` even if a future caller bypasses the
+ *    conflict-merger.
+ *  - `status` — when rootHashes diverge, taken from the same chain-content
+ *    winner as `rootHash`. When rootHashes match, FIELD-BY-FIELD symmetric
+ *    tie-break: prefer the stronger observation per
+ *    {@link STATUS_STRENGTH_ORDER} (`valid > pending > pending-conflicting
+ *    > conflicting > invalid`); on tie, lex-min. Required because two
+ *    replicas may reach the same rootHash via independent paths and stamp
+ *    different `status` values.
+ *  - `invalidReason` — non-null wins over null; both null → undefined; on
+ *    both-set tie, lex-min.
  *  - `splitParent` — preserved if either side has it set. On
- *    divergence, log warning (defect: a token cannot have two parents)
- *    and use the lex-min value (deterministic across replicas).
+ *    divergence, lex-min value (deterministic across replicas).
  *  - `audit_promoted_from` — set-OR (deduplicated, lex-sorted union).
  *  - `conflictingHeads` — set-OR (deduplicated, sorted union).
  *  - `lamport` — `max(prev, next)` per §7.1.
  *  - `lastProofRefreshAt` — `max(prev, next)` (most-recent-proof rule
  *    per §6.3; prefer the side with fresher proof material).
- *  - `bundleCid` / `senderTransportPubkey` — taken from the
- *    chain-winning side (i.e., `next`); preserved when `next` lacks
- *    them.
+ *  - `bundleCid` — when rootHashes diverge, taken from the chain winner
+ *    (with carry-through from the loser). When rootHashes match: non-null
+ *    wins over null; on both-set tie, lex-min.
+ *  - `senderTransportPubkey` — when rootHashes diverge, taken from the
+ *    chain winner (with carry-through). When rootHashes match: non-null
+ *    wins over null; on both-set tie, lex-min.
+ *
+ * **Symmetry contract** (steelman crit #13). For ANY two manifest entries
+ * with identical `rootHash` but disagreeing `status` / `invalidReason` /
+ * `bundleCid` / `senderTransportPubkey`, `mergeManifestEntry(A, B)` and
+ * `mergeManifestEntry(B, A)` produce structurally-equal outputs. The
+ * previous implementation took these fields wholesale from `next`, which
+ * broke commutativity when replicas observed the same rootHash but
+ * different metadata. The field-by-field symmetric tie-break above
+ * closes that hole.
  *
  * @param prev The currently-persisted entry, or `undefined` for first write.
  * @param next The new entry to fold in.
