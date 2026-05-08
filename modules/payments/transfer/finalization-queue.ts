@@ -462,6 +462,15 @@ export class FinalizationQueue {
    * 5-minute tolerance matches `import-inclusion-proof.ts`'s
    * `CLOCK_SKEW_TOLERANCE_MS`.
    *
+   * **Operator note (Round 7 doc gap):** operators whose host clock
+   * drifts by more than 5 minutes from a peer's clock will see
+   * `setPollStartedAt` throw `VALIDATION_ERROR` (with the exact
+   * computed window in the message). This is by design — the §5.5
+   * step 6 anchor is meaningless if the timestamp is hours off — but
+   * it does mean clock drift surfaces here as a hard failure rather
+   * than as silent miscalibration. Run NTP / chrony or equivalent
+   * before troubleshooting "out of clock-skew tolerance" errors.
+   *
    * **CRDT race semantics (last-writer-wins).** The read-modify-write
    * is NOT atomic at the storage layer. Two concurrent calls (e.g.,
    * across replicating devices) may both observe `pollStartedAt ===
