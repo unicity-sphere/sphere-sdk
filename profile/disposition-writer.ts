@@ -233,7 +233,15 @@ export function invalidKeyFor(
   if (tokenId === '') {
     return `${addr}.invalid-orphan.${observedTokenContentHash}`;
   }
-  return `${addr}.invalid.${tokenId}.${observedTokenContentHash}`;
+  // Round 5 (FIX 4) — lowercase-normalize the tokenId at the WRITE-side
+  // entry point so the prefix-scan path (which always normalizes via the
+  // PaymentsModule.importInclusionProof wrapper) cannot miss records
+  // written with a mixed-case tokenId. Round 3 closed the read-side gap
+  // by lowercasing at the importer entry; this closes the symmetric
+  // write-side gap. Without it, a non-Round-3 code path that writes an
+  // INVALID record with `'ABC...'` produces a key under
+  // `${addr}.invalid.ABC...` that the lowercase prefix-scan never sees.
+  return `${addr}.invalid.${tokenId.toLowerCase()}.${observedTokenContentHash}`;
 }
 
 /**
@@ -255,7 +263,12 @@ export function auditKeyFor(
   if (tokenId === '') {
     return `${addr}.audit-orphan.${observedTokenContentHash}`;
   }
-  return `${addr}.audit.${tokenId}.${observedTokenContentHash}`;
+  // Round 5 (FIX 4) — symmetric write-side lowercase-normalization. See
+  // {@link invalidKeyFor} for the full rationale: without lowering the
+  // tokenId here, an INVALID/AUDIT record written via a non-Round-3
+  // path produces a mixed-case key that the (always-lowercased)
+  // prefix-scan in `_findInvalidEntry` / `_findAuditEntry` cannot match.
+  return `${addr}.audit.${tokenId.toLowerCase()}.${observedTokenContentHash}`;
 }
 
 /**
@@ -320,6 +333,24 @@ export class DispositionWriter {
         'DispositionWriter.write: addr must be a non-empty string',
         'VALIDATION_ERROR',
       );
+    }
+    // Round 5 (FIX 4) — defense-in-depth: lowercase the tokenId on the
+    // record itself before routing to any of the variant writers. The
+    // key composers (`invalidKeyFor` / `auditKeyFor`) ALSO lowercase,
+    // but the manifest store path (`writeManifest` /
+    // `writeConflictingManifest`) calls `manifestStore.upsert(addr,
+    // record.tokenId, ...)` which has no key-side normalization step.
+    // Without this defensive normalize, a writer-side mixed-case
+    // tokenId would produce manifest entries that the lowercase
+    // prefix-scan in cascade-walker / importer cannot find.
+    if (
+      record.disposition !== undefined &&
+      typeof (record as { tokenId?: unknown }).tokenId === 'string'
+    ) {
+      const t = (record as { tokenId: string }).tokenId;
+      if (t !== '' && t !== t.toLowerCase()) {
+        record = { ...record, tokenId: t.toLowerCase() } as DispositionRecord;
+      }
     }
 
     switch (record.disposition) {

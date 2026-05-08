@@ -56,8 +56,12 @@ import type { ContentHash } from '../../../uxf/types.js';
 // =============================================================================
 
 const ADDR = 'DIRECT_aabbcc_ddeeff';
-const TOKEN_A = '0xtokenA';
-const TOKEN_B = '0xtokenB';
+// Round 5 (FIX 4): canonical lowercase tokenIds. The disposition writer
+// now lowercases tokenIds at the key-composition boundary AND defensively
+// at the record-routing boundary; tests use lowercase fixtures so they
+// observe the canonical (non-coerced) shape.
+const TOKEN_A = '0xtokena';
+const TOKEN_B = '0xtokenb';
 // Wave 3 steelman: writer now validates observedTokenContentHash is canonical
 // 64-char hex. Fixture constants therefore must be lowercase hex characters.
 const HASH_X = '12'.repeat(32);
@@ -1221,5 +1225,63 @@ describe('Empty tokenId routes to invalid-orphan / audit-orphan keyspace', () =>
         }),
       ),
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+  });
+});
+
+// =============================================================================
+// Round 5 (FIX 4) — write-side tokenId case-normalization
+// =============================================================================
+
+describe('Round 5 (FIX 4): write-side tokenId case-normalization', () => {
+  it('invalidKeyFor lowercases tokenId so write-side keys align with read-side prefix-scan', () => {
+    const upper = '0xTOKENA';
+    const lower = '0xtokena';
+    const k1 = invalidKeyFor(ADDR, upper, ch(HASH_X));
+    const k2 = invalidKeyFor(ADDR, lower, ch(HASH_X));
+    expect(k1).toBe(k2);
+    // The composed key uses the lowercased form.
+    expect(k1).toContain('0xtokena');
+    expect(k1).not.toContain('TOKENA');
+  });
+
+  it('auditKeyFor lowercases tokenId symmetrically with invalidKeyFor', () => {
+    const upper = '0xTOKENB';
+    const lower = '0xtokenb';
+    const k1 = auditKeyFor(ADDR, upper, ch(HASH_X));
+    const k2 = auditKeyFor(ADDR, lower, ch(HASH_X));
+    expect(k1).toBe(k2);
+    expect(k1).toContain('0xtokenb');
+  });
+
+  it('writer.write() defensively lowercases tokenId on the record before routing', async () => {
+    const perEntry = new FakePerEntryStorage();
+    const manifest = new FakeManifestStorage();
+    const recorder = makeRecorder();
+    const writer = makeWriter(perEntry, manifest, recorder.emit);
+
+    const upper = '0xTOKENc';
+    const lower = '0xtokenc';
+    await writer.write(ADDR, {
+      disposition: 'INVALID',
+      tokenId: upper,
+      observedTokenContentHash: ch(HASH_X),
+      bundleCid: BUNDLE_CID_1,
+      senderTransportPubkey: SENDER_PUBKEY,
+      reason: 'proof-invalid',
+    });
+
+    // The record landed under the LOWERCASE key so the read-side prefix-
+    // scan (always lowercased via the importer wrapper) finds it.
+    const lowerKey = invalidKeyFor(ADDR, lower, ch(HASH_X));
+    expect(perEntry.store.has(lowerKey)).toBe(true);
+
+    // The stored record's tokenId field is also lowercased (defensive
+    // mutation).
+    const stored = perEntry.store.get(lowerKey) as InvalidEntry;
+    expect(stored.tokenId).toBe(lower);
+
+    // A lowercased prefix-scan finds the record.
+    const keys = await perEntry.listKeysWithPrefix(`${ADDR}.invalid.${lower}.`);
+    expect(keys).toContain(lowerKey);
   });
 });
