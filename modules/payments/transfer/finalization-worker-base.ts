@@ -75,6 +75,7 @@ import type {
   SphereEventType,
 } from '../../../types';
 import { SphereError } from '../../../core/errors';
+import { sanitizeReasonString } from '../../../core/error-sanitize';
 import type { TrustBaseStaleness } from './trustbase-staleness';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
@@ -803,27 +804,36 @@ export async function runSubmitPhase(
       return { kind: 'submitted' };
     }
     if (outcome.kind === 'AUTHENTICATOR_VERIFICATION_FAILED') {
+      // FIX 3 (steelman warning): aggregator-supplied error string is
+      // sanitized — strip control chars, HTML markup, truncate to 200
+      // chars — before splicing into the thrown SphereError message.
+      // A hostile aggregator could otherwise plant newlines (log-record
+      // splitting), HTML (stored XSS in dashboards), or multi-MB
+      // payloads (log flood).
+      const safeErr = outcome.error ? sanitizeReasonString(outcome.error) : '';
       return {
         kind: 'hard-fail',
         reason: 'belief-divergence',
         skipCascade: false,
-        message: `belief-divergence: aggregator rejected authenticator for ${ctx.subjectPhrase}${outcome.error ? ` (${outcome.error})` : ''}`,
+        message: `belief-divergence: aggregator rejected authenticator for ${ctx.subjectPhrase}${safeErr ? ` (${safeErr})` : ''}`,
       };
     }
     if (outcome.kind === 'REQUEST_ID_MISMATCH') {
       // C12 / C13 — CLIENT BUG. Hard-fail with reason='client-error'.
       // Operator alert via `transfer:operator-alert`. NO cascade per
       // §6.1.1 (client-error is not in the §6.1.1 cascade set).
+      // FIX 3 (steelman warning): aggregator error sanitization.
+      const safeErr = outcome.error ? sanitizeReasonString(outcome.error) : '';
       ctx.emit('transfer:operator-alert', {
         code: 'client-error',
         tokenId: ctx.tokenId,
-        message: `REQUEST_ID_MISMATCH on submit: client computed an inconsistent (requestId, sourceState, transactionHash) tuple for ${ctx.subjectPhrase}${outcome.error ? ` (${outcome.error})` : ''}`,
+        message: `REQUEST_ID_MISMATCH on submit: client computed an inconsistent (requestId, sourceState, transactionHash) tuple for ${ctx.subjectPhrase}${safeErr ? ` (${safeErr})` : ''}`,
       });
       return {
         kind: 'hard-fail',
         reason: 'client-error',
         skipCascade: true,
-        message: `client-error: REQUEST_ID_MISMATCH on submit for ${ctx.subjectPhrase}${outcome.error ? ` (${outcome.error})` : ''}`,
+        message: `client-error: REQUEST_ID_MISMATCH on submit for ${ctx.subjectPhrase}${safeErr ? ` (${safeErr})` : ''}`,
       };
     }
     // TRANSIENT — count this failed attempt and (if budget remains) back off.
@@ -838,11 +848,14 @@ export async function runSubmitPhase(
     // typically a sub-second outage.
     await ctx.sleep(getSubmitRetryBackoffMs(attempts - 1), ctx.signal);
   }
+  // FIX 3 (steelman warning): aggregator-supplied last-error string
+  // sanitized before splicing into the thrown SphereError message.
+  const safeLastError = lastError ? sanitizeReasonString(lastError) : '';
   return {
     kind: 'hard-fail',
     reason: 'oracle-rejected',
     skipCascade: false,
-    message: `submit transient retries exhausted (max=${ctx.maxSubmitRetries}) for ${ctx.subjectPhrase}${lastError ? ` last error: ${lastError}` : ''}`,
+    message: `submit transient retries exhausted (max=${ctx.maxSubmitRetries}) for ${ctx.subjectPhrase}${safeLastError ? ` last error: ${safeLastError}` : ''}`,
   };
 }
 
@@ -1032,11 +1045,13 @@ export async function runPollPhase(
       if (pollOutcome.kind === 'PATH_INVALID') {
         pathInvalidRetries++;
         if (pathInvalidRetries >= ctx.maxProofErrorRetries) {
+          // FIX 3 (steelman warning): aggregator error sanitization.
+          const safeErr = pollOutcome.error ? sanitizeReasonString(pollOutcome.error) : '';
           return {
             kind: 'hard-fail',
             reason: 'proof-invalid',
             skipCascade: false,
-            message: `PATH_INVALID after ${pathInvalidRetries} retries: ${ctx.subjectEqPhrase}${pollOutcome.error ? ` (${pollOutcome.error})` : ''}`,
+            message: `PATH_INVALID after ${pathInvalidRetries} retries: ${ctx.subjectEqPhrase}${safeErr ? ` (${safeErr})` : ''}`,
           };
         }
         continue;
@@ -1047,6 +1062,11 @@ export async function runPollPhase(
         // the trail in the order it happens; T.5.F's escalation logic
         // runs AFTER the warning so the security-alert always
         // carries a corresponding warning.
+        // FIX 3 (steelman warning): aggregator error sanitization
+        // before splicing into emitted event payload.
+        const safePollErr = pollOutcome.error
+          ? sanitizeReasonString(pollOutcome.error)
+          : undefined;
         ctx.emit('transfer:trustbase-warning', {
           tokenId: ctx.tokenId,
           requestId: ctx.requestId,
@@ -1054,7 +1074,7 @@ export async function runPollPhase(
           ...(ctx.bundleCid !== undefined ? { bundleCid: ctx.bundleCid } : {}),
           attempt: attempts,
           message:
-            pollOutcome.error ??
+            safePollErr ??
             'NOT_AUTHENTICATED — proof verifier rejected validator signatures (likely stale local trustBase per §9.4.1)',
         });
 

@@ -64,7 +64,8 @@
  * @packageDocumentation
  */
 
-import { SphereError } from '../../../core/errors.js';
+import { SphereError, redactCause } from '../../../core/errors.js';
+import { sanitizeReasonString as sharedSanitizeReason } from '../../../core/error-sanitize.js';
 import type { SphereEventMap } from '../../../types/index.js';
 import { extractCarRootCid } from '../../../uxf/transfer-payload.js';
 
@@ -747,8 +748,12 @@ function stringifyError(err: unknown): string {
   } else if (typeof err === 'string') {
     raw = err;
   } else {
+    // FIX 4 (steelman warning): walk the value through W40 redactCause
+    // before JSON.stringify so any sensitive own-properties (e.g.,
+    // `signedTransferTxBytes`) are scrubbed. The redactor preserves
+    // Error prototype identity but redacts known sensitive fields.
     try {
-      raw = JSON.stringify(err);
+      raw = JSON.stringify(redactCause(err));
     } catch {
       raw = String(err);
     }
@@ -758,22 +763,13 @@ function stringifyError(err: unknown): string {
 
 /**
  * Apply the sanitize-and-truncate rules described on
- * {@link stringifyError}. Exported under `@internal` JSDoc only — the
- * function is module-private so test files import it via the source path.
+ * {@link stringifyError}. Module-local thin wrapper around the shared
+ * {@link sharedSanitizeReason} helper; kept under the original name so
+ * existing in-file call sites and tests reading `cid-fetcher` source do
+ * not need to be updated.
  *
  * @internal
  */
 function sanitizeReasonString(raw: string): string {
-  // Drop control characters and HTML markup characters in a single pass.
-  // We use String.fromCharCode replacement (rather than Unicode property
-  // escapes) so the regex stays portable across Node 18+ and the browser
-  // runtimes we support.
-  const stripped = raw.replace(
-    // eslint-disable-next-line no-control-regex
-    /[\x00-\x1F\x7F-\x9F<>&]/g,
-    '',
-  );
-  if (stripped.length <= MAX_REASON_LENGTH) return stripped;
-  // Reserve 1 char for the truncation marker `…`.
-  return `${stripped.slice(0, MAX_REASON_LENGTH - 1)}…`;
+  return sharedSanitizeReason(raw, MAX_REASON_LENGTH);
 }
