@@ -2159,3 +2159,62 @@ describe('hashAuthenticatorForLog — W40 privacy helper', () => {
     expect(a).not.toBe(b);
   });
 });
+
+// =============================================================================
+// Round 3 regression — internalController is re-created on each start()
+// =============================================================================
+//
+// FIX 1: pre-Round-3 the internalController was a `readonly` field-
+// initialized AbortController. `stop()` aborted it; the next `start()`
+// did NOT rebuild it, so every cycle's combined signal was pre-aborted
+// and the first poll/submit returned `worker aborted before submit`.
+// This regression test asserts a `start() → stop() → start()` sequence
+// runs a fresh cycle WITHOUT the worker-aborted hard-fail.
+
+describe('FinalizationWorkerSender — internalController rebuild on start (Round 3 regression)', () => {
+  it('start → stop → start → cycle: NOT pre-aborted', async () => {
+    const entry = makeOutboxEntry({ id: 'outbox-restart' });
+    const aggregator = makeFakeAggregator({
+      submit: async () => ({ kind: 'SUCCESS' as const }),
+      poll: async () => ({
+        kind: 'OK' as const,
+        proof: makeProof(),
+        newCid: NEW_CID,
+      }),
+    });
+    const h = buildScanHarness({
+      initialEntries: [entry],
+      scanIntervalMs: 50,
+      aggregator,
+    });
+
+    h.worker.start();
+    await h.worker.stop();
+    expect(h.worker.isRunning()).toBe(false);
+
+    // Second start — pre-Round-3 inherited the already-aborted signal.
+    h.worker.start();
+    expect(h.worker.isRunning()).toBe(true);
+
+    // Drive a cycle; pre-Round-3 the cycle would short-circuit with
+    // `worker aborted before submit` because the combined signal was
+    // already aborted. Post-fix, the cycle runs to a real terminal.
+    const entryAfter = makeOutboxEntry({ id: 'outbox-after-restart' });
+    const result = await h.worker.processOne(entryAfter);
+
+    // The exact terminal kind depends on harness wiring (the aggregator
+    // success path drives `finalized`; an in-flight collision drives
+    // `in-progress`). The key assertion is that NEITHER terminal carries
+    // the pre-Round-3 hard-fail signature.
+    expect(result.terminal).not.toBe('failed-permanent');
+
+    // Sanity: no events should carry the pre-Round-3 abort message.
+    for (const e of h.events.events) {
+      const data = e.data as { message?: string };
+      const msg = typeof data.message === 'string' ? data.message : '';
+      expect(msg.includes('worker aborted before submit')).toBe(false);
+    }
+
+    await h.worker.stop();
+  });
+});

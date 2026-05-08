@@ -467,9 +467,19 @@ export class FinalizationWorkerSender {
    * cycle's `signal` field so aggregator.submit / aggregator.poll /
    * sleep see the abort the moment `stop()` runs.
    *
+   * Round 3 regression fix: this field is RE-CREATED at each
+   * {@link start} invocation. The pre-Round-3 implementation made the
+   * field a `readonly` field-initialized AbortController, which meant
+   * a second `start()` after `stop()` reused the already-aborted
+   * controller — every cycle's combined signal was pre-aborted, so the
+   * very first poll/submit hard-failed with `worker aborted before
+   * submit`. Re-creating on `start()` restores correct lifecycle
+   * semantics for stop-then-start sequences (e.g., test harnesses,
+   * operational restarts after a config tweak).
+   *
    * @internal
    */
-  private readonly internalController = new AbortController();
+  private internalController: AbortController = new AbortController();
   /** In-flight `processOne` invocations, keyed by outbox id. The scan
    *  loop skips entries already being driven so an external caller
    *  (e.g. PaymentsModule's synchronous send path at line ~7556) and
@@ -597,11 +607,23 @@ export class FinalizationWorkerSender {
     }
   }
 
-  /** Start the long-running scan loop. Idempotent. */
+  /** Start the long-running scan loop. Idempotent.
+   *
+   * Round 3 regression fix: re-create {@link internalController} so a
+   * `start() → stop() → start()` sequence does NOT inherit the stop's
+   * already-aborted signal. The pre-Round-3 implementation made the
+   * controller a field-initialized `readonly` member; subsequent
+   * starts ran with a pre-aborted signal and every cycle hard-failed
+   * with `worker aborted before submit` on the first iteration.
+   */
   start(): void {
     if (this.running) return;
     this.running = true;
     this.stopRequested = false;
+    // Round 3 regression fix: rebuild the internal controller so
+    // signal.aborted starts at false on each start. Field initializer
+    // only fires at construction; subsequent starts must rebuild.
+    this.internalController = new AbortController();
     this.loopPromise = this.scanLoop();
   }
 

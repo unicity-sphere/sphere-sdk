@@ -475,9 +475,19 @@ export class FinalizationWorkerRecipient {
    * cycle's `signal` field so aggregator.submit / aggregator.poll /
    * sleep see the abort the moment `stop()` runs.
    *
+   * Round 3 regression fix: this field is RE-CREATED at each
+   * {@link start} invocation. The pre-Round-3 implementation made the
+   * field a `readonly` field-initialized AbortController, which meant
+   * a second `start()` after `stop()` reused the already-aborted
+   * controller — every cycle's combined signal was pre-aborted, so the
+   * very first poll/submit hard-failed with `worker aborted before
+   * submit`. Re-creating on `start()` restores correct lifecycle
+   * semantics for stop-then-start sequences (e.g., test harnesses,
+   * operational restarts after a config tweak).
+   *
    * @internal
    */
-  private readonly internalController = new AbortController();
+  private internalController: AbortController = new AbortController();
   /** In-flight `processOneToken` invocations, keyed by tokenId. The
    *  scan loop skips tokens already being driven so an external caller
    *  and the loop don't race the same token. Guards the per-tokenId
@@ -611,11 +621,20 @@ export class FinalizationWorkerRecipient {
     }
   }
 
-  /** Start the long-running scan loop. Idempotent. */
+  /** Start the long-running scan loop. Idempotent.
+   *
+   * Round 3 regression fix: re-create {@link internalController} so a
+   * `start() → stop() → start()` sequence does NOT inherit the stop's
+   * already-aborted signal. See sender-side `start()` doc for the full
+   * rationale.
+   */
   start(): void {
     if (this.running) return;
     this.running = true;
     this.stopRequested = false;
+    // Round 3 regression fix: rebuild the internal controller so
+    // signal.aborted starts at false on each start.
+    this.internalController = new AbortController();
     this.loopPromise = this.scanLoop();
   }
 

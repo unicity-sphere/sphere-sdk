@@ -1124,6 +1124,97 @@ describe('FinalizationWorkerRecipient — W26 deadline anchor floor (CRIT #8)', 
   });
 });
 
+// =============================================================================
+// Round 3 regression — internalController is re-created on each start() (FIX 1)
+// =============================================================================
+//
+// Pre-Round-3 the internalController was a `readonly` field-initialized
+// AbortController. `stop()` aborted it; the next `start()` did NOT
+// rebuild it, so every cycle's combined signal was pre-aborted and the
+// first poll/submit hard-failed with `worker aborted before submit`.
+
+describe('FinalizationWorkerRecipient — internalController rebuild on start (Round 3 regression)', () => {
+  it('start → stop → start: internal signal NOT pre-aborted', async () => {
+    // Use yieldingSleep so the scan loop's safeSleep gives the event
+    // loop a turn (the default `async () => undefined` is microtask-
+    // only and starves macrotask-driven test infrastructure).
+    const harness = buildWorker({ sleepFn: yieldingSleep });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const w = harness.worker as any;
+
+    harness.worker.start();
+    const sigAfterFirstStart = w.internalController.signal;
+    expect(sigAfterFirstStart.aborted).toBe(false);
+
+    await harness.worker.stop();
+    // After stop, the (then-active) controller IS aborted.
+    expect(sigAfterFirstStart.aborted).toBe(true);
+
+    // Second start — pre-Round-3 the field was readonly so this
+    // observed the ALREADY-ABORTED signal from before. Post-fix, the
+    // start() path rebuilds the controller.
+    harness.worker.start();
+    const sigAfterSecondStart = w.internalController.signal;
+    expect(sigAfterSecondStart.aborted).toBe(false);
+    // The new controller MUST be a different object than the old one.
+    expect(sigAfterSecondStart).not.toBe(sigAfterFirstStart);
+
+    await harness.worker.stop();
+  });
+
+  it('start → stop → start → drive cycle: NO worker-aborted hard-fail', async () => {
+    const harness = buildWorker({ sleepFn: yieldingSleep });
+
+    harness.worker.start();
+    await harness.worker.stop();
+    harness.worker.start();
+    // Stop the scan loop before driving processOneToken so the test
+    // doesn't race the loop. processOneToken doesn't depend on the
+    // running loop — it's the synchronous external entry-point.
+    await harness.worker.stop();
+
+    // After stop(), processOneToken still works because runFinalizationCycle
+    // uses the most-recently-rebuilt internal controller. Pre-Round-3
+    // the controller from the previous start() was reused; post-fix the
+    // current start() rebuilt it. The cycle should NOT short-circuit.
+    //
+    // Note: this asserts the field-rebuild isn't sticky-aborted across
+    // start/stop cycles. The cycle is exercised through processOneToken
+    // which uses the worker's current internalController.signal as
+    // part of its combined signal.
+    //
+    // Re-build a fresh harness so we don't have a stopped scan loop
+    // interfering.
+    const h2 = buildWorker();
+    const entry = makeQueueEntry();
+    await seedQueue(h2, [entry]);
+
+    // Simulate the lifecycle: pre-Round-3, this would have to start +
+    // stop to re-create the controller; post-fix, start() always
+    // gives a fresh non-aborted controller.
+    h2.worker.start();
+    await h2.worker.stop();
+    h2.worker.start();
+
+    const result = await h2.worker.processOneToken(TOKEN_ID);
+
+    // Pre-fix: result.terminal was 'invalid' or similar with cascade
+    // because the cycle hard-failed `structural` with 'worker aborted
+    // before submit'. Post-fix: the cycle reaches a real terminal.
+    expect(result.terminal).not.toBe('invalid');
+
+    for (const e of h2.events.events) {
+      const data = e.data as { message?: string };
+      const msg = typeof data.message === 'string' ? data.message : '';
+      expect(msg.includes('worker aborted before submit')).toBe(false);
+      expect(msg.includes('worker aborted while polling')).toBe(false);
+    }
+
+    await h2.worker.stop();
+  });
+});
+
 // Suppress unused-import warnings for this block.
 void RACE_TX_HASH;
 void makeFakePoolRead;
