@@ -13,8 +13,10 @@ import {
   MIN_POLL_ATTEMPTS,
   BACKOFF_SCHEDULE_MS,
   MAX_POLL_ATTEMPTS_HARD_CEILING,
+  SUBMIT_RETRY_BACKOFF_MS,
   validatePollingPolicy,
   getBackoffMs,
+  getSubmitRetryBackoffMs,
   getMonotonicNowMs,
   isPollingTimedOut,
 } from '../../../../modules/payments/transfer/polling-policy';
@@ -74,45 +76,126 @@ describe('polling-policy — validatePollingPolicy', () => {
 // =============================================================================
 
 describe('polling-policy — getBackoffMs', () => {
-  it('returns 30s for attempt 0', () => {
-    expect(getBackoffMs(0)).toBe(30_000);
+  // Steelman fix (warning 6b): getBackoffMs applies ±15% jitter via
+  // `Math.floor(base * (0.85 + Math.random() * 0.30))`. Tests that
+  // need a deterministic value stub `Math.random` to a fixed return.
+  // Helpers below assert that the result lies within the jitter band
+  // around the schedule's nominal value.
+  const jitterLo = (base: number): number => Math.floor(base * 0.85);
+  const jitterHi = (base: number): number => Math.floor(base * 1.15);
+
+  it('returns 30s ±15% for attempt 0', () => {
+    const v = getBackoffMs(0);
+    expect(v).toBeGreaterThanOrEqual(jitterLo(30_000));
+    expect(v).toBeLessThanOrEqual(jitterHi(30_000));
   });
 
-  it('returns 60s for attempt 1', () => {
-    expect(getBackoffMs(1)).toBe(60_000);
+  it('returns 60s ±15% for attempt 1', () => {
+    const v = getBackoffMs(1);
+    expect(v).toBeGreaterThanOrEqual(jitterLo(60_000));
+    expect(v).toBeLessThanOrEqual(jitterHi(60_000));
   });
 
-  it('returns 120s for attempt 2', () => {
-    expect(getBackoffMs(2)).toBe(120_000);
+  it('returns 120s ±15% for attempt 2', () => {
+    const v = getBackoffMs(2);
+    expect(v).toBeGreaterThanOrEqual(jitterLo(120_000));
+    expect(v).toBeLessThanOrEqual(jitterHi(120_000));
   });
 
-  it('returns 240s for attempt 3', () => {
-    expect(getBackoffMs(3)).toBe(240_000);
+  it('returns 240s ±15% for attempt 3', () => {
+    const v = getBackoffMs(3);
+    expect(v).toBeGreaterThanOrEqual(jitterLo(240_000));
+    expect(v).toBeLessThanOrEqual(jitterHi(240_000));
   });
 
-  it('returns 300s (5 min) for attempt 4 (last entry)', () => {
-    expect(getBackoffMs(4)).toBe(300_000);
+  it('returns 300s ±15% (5 min) for attempt 4 (last entry)', () => {
+    const v = getBackoffMs(4);
+    expect(v).toBeGreaterThanOrEqual(jitterLo(300_000));
+    expect(v).toBeLessThanOrEqual(jitterHi(300_000));
   });
 
-  it('caps at last entry — attempt 5 returns 300s', () => {
-    expect(getBackoffMs(5)).toBe(300_000);
+  it('caps at last entry — attempt 5 returns 300s ±15%', () => {
+    const v = getBackoffMs(5);
+    expect(v).toBeGreaterThanOrEqual(jitterLo(300_000));
+    expect(v).toBeLessThanOrEqual(jitterHi(300_000));
   });
 
-  it('caps at last entry — attempt 100 returns 300s', () => {
-    expect(getBackoffMs(100)).toBe(300_000);
+  it('caps at last entry — attempt 100 returns 300s ±15%', () => {
+    const v = getBackoffMs(100);
+    expect(v).toBeGreaterThanOrEqual(jitterLo(300_000));
+    expect(v).toBeLessThanOrEqual(jitterHi(300_000));
   });
 
-  it('clamps negative input to first entry', () => {
-    expect(getBackoffMs(-1)).toBe(30_000);
+  it('clamps negative input to first entry (30s ±15%)', () => {
+    const v = getBackoffMs(-1);
+    expect(v).toBeGreaterThanOrEqual(jitterLo(30_000));
+    expect(v).toBeLessThanOrEqual(jitterHi(30_000));
   });
 
-  it('clamps NaN to first entry', () => {
-    expect(getBackoffMs(NaN)).toBe(30_000);
+  it('clamps NaN to first entry (30s ±15%)', () => {
+    const v = getBackoffMs(NaN);
+    expect(v).toBeGreaterThanOrEqual(jitterLo(30_000));
+    expect(v).toBeLessThanOrEqual(jitterHi(30_000));
   });
 
   it('floors fractional input', () => {
-    // 1.9 → floor → 1 → 60_000.
-    expect(getBackoffMs(1.9)).toBe(60_000);
+    // 1.9 → floor → 1 → 60_000 ±15%.
+    const v = getBackoffMs(1.9);
+    expect(v).toBeGreaterThanOrEqual(jitterLo(60_000));
+    expect(v).toBeLessThanOrEqual(jitterHi(60_000));
+  });
+
+  it('jitter spread is observable across many calls (warning 6b)', () => {
+    // Sample 100 calls; expect at least 2 distinct values (jitter range
+    // is wide enough that getting only 1 unique value across 100 draws
+    // has probability < 1/65530 — vanishingly small false-positive
+    // rate). Pre-fix this would always be exactly 1 unique value.
+    const samples = new Set<number>();
+    for (let i = 0; i < 100; i++) samples.add(getBackoffMs(0));
+    expect(samples.size).toBeGreaterThan(1);
+  });
+});
+
+// =============================================================================
+// 3.1. getSubmitRetryBackoffMs — fast submit-retry schedule (warning 6c)
+// =============================================================================
+
+describe('polling-policy — getSubmitRetryBackoffMs (warning 6c)', () => {
+  // Steelman fix (warning 6c): submit retries use a FAST schedule
+  // (500ms / 1s / 2s / 4s / 8s) instead of the polling 30s/60s/etc.
+  const lo = (base: number): number => Math.floor(base * 0.85);
+  const hi = (base: number): number => Math.floor(base * 1.15);
+
+  it('returns ~500ms for attempt 0', () => {
+    const v = getSubmitRetryBackoffMs(0);
+    expect(v).toBeGreaterThanOrEqual(lo(500));
+    expect(v).toBeLessThanOrEqual(hi(500));
+  });
+
+  it('returns ~1s for attempt 1', () => {
+    const v = getSubmitRetryBackoffMs(1);
+    expect(v).toBeGreaterThanOrEqual(lo(1_000));
+    expect(v).toBeLessThanOrEqual(hi(1_000));
+  });
+
+  it('returns ~2s for attempt 2', () => {
+    const v = getSubmitRetryBackoffMs(2);
+    expect(v).toBeGreaterThanOrEqual(lo(2_000));
+    expect(v).toBeLessThanOrEqual(hi(2_000));
+  });
+
+  it('caps at last entry — attempt 100 returns ~8s', () => {
+    const v = getSubmitRetryBackoffMs(100);
+    expect(v).toBeGreaterThanOrEqual(lo(8_000));
+    expect(v).toBeLessThanOrEqual(hi(8_000));
+  });
+
+  it('schedule is fast — total budget across 5 retries < 20s', () => {
+    // The whole point: pre-fix submit retries took ~7.5min via the
+    // polling schedule. Cap the total at 20s with jitter for safety.
+    let total = 0;
+    for (let i = 0; i < 5; i++) total += hi(SUBMIT_RETRY_BACKOFF_MS[i] ?? 0);
+    expect(total).toBeLessThan(20_000);
   });
 });
 

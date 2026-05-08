@@ -1026,9 +1026,24 @@ export class FinalizationWorkerRecipient {
     if (sameProofValue(attachedProof, ctxResolved)) {
       // Merge-path graft — proof already present + same value.
       // Remove the queue entry; we're done.
-      await this.options.queueStore.remove(
-        this.options.addressId,
-        entry.entryId,
+      //
+      // Steelman fix (warning 6d): wrap the queue-removal inside the
+      // per-tokenId mutex critical section. Pre-fix the merge-path
+      // queue.remove ran outside the mutex, racing the §5.5 step 5
+      // 4-step write's "queue-entry removal LAST" step on a sibling
+      // queue entry of the SAME token (multi-K chain-mode). Two
+      // concurrent removals targeting different entries of the same
+      // tokenId from different code paths could observe interleaved
+      // queue states; the mutex serializes them.
+      await this.options.perTokenMutex.acquire(
+        entry.tokenId,
+        async () => {
+          await this.options.queueStore.remove(
+            this.options.addressId,
+            entry.entryId,
+          );
+        },
+        { strategy: this.perTokenMutexStrategy },
       );
       return { kind: 'merge-path-graft' };
     }

@@ -304,7 +304,20 @@ export class UnicityAggregatorProvider implements OracleProvider {
       if (this.isSdkTransferCommitment(commitment)) {
         // Use SDK client directly
         const response = await this.stateTransitionClient!.submitTransferCommitment(commitment);
-        requestId = commitment.requestId?.toString() ?? response.status;
+        // Steelman fix (warning 6e): mirror PaymentsModule's 6-site
+        // `toJSON ?? String(...)` pattern. SDK requestIds are objects
+        // with a custom `toJSON` that yields the canonical hex
+        // imprint; bare `toString()` falls back to the object's
+        // default `[object Object]` for objects that don't override
+        // it. Always prefer `toJSON()`, fall back to `String(...)`.
+        requestId =
+          (typeof commitment.requestId === 'object' &&
+            commitment.requestId !== null &&
+            typeof (commitment.requestId as { toJSON?: () => string }).toJSON === 'function'
+            ? (commitment.requestId as { toJSON: () => string }).toJSON()
+            : commitment.requestId !== undefined
+              ? String(commitment.requestId)
+              : response.status);
       } else {
         // Fallback to RPC for simple commitment objects
         const response = await this.rpcCall<RpcSubmitResponse>('submit_commitment', {
@@ -347,7 +360,16 @@ export class UnicityAggregatorProvider implements OracleProvider {
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const response = await this.stateTransitionClient!.submitMintCommitment(commitment as any);
-      const requestId = commitment.requestId?.toString() ?? response.status;
+      // Steelman fix (warning 6e): mirror PaymentsModule's 6-site pattern.
+      // See submitCommitment above for rationale.
+      const requestId =
+        (typeof commitment.requestId === 'object' &&
+          commitment.requestId !== null &&
+          typeof (commitment.requestId as { toJSON?: () => string }).toJSON === 'function'
+          ? (commitment.requestId as { toJSON: () => string }).toJSON()
+          : commitment.requestId !== undefined
+            ? String(commitment.requestId)
+            : response.status);
 
       this.emitEvent({
         type: 'commitment:submitted',

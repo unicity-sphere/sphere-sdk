@@ -57,6 +57,7 @@ import {
 import {
   isPollingTimedOut,
   getBackoffMs,
+  getSubmitRetryBackoffMs,
 } from './polling-policy';
 import {
   performManifestCidRewrite,
@@ -383,6 +384,53 @@ export function combineAbortSignals(
 }
 
 /**
+ * Steelman fix (warning 6a): canonicalize a transactionHash imprint
+ * string so equality is shape-checked once and downstream comparisons
+ * are byte-exact.
+ *
+ * Pre-fix `sameTransactionHash` did a bare `.toLowerCase()` compare.
+ * That tolerated leading whitespace, optional `0x` prefixes, and
+ * malformed lengths — silently. A producer that emitted `'0xAA…'`
+ * vs another that emitted `'aa…'` could spuriously race-lose, and
+ * malformed inputs (truncated hex, non-hex chars) would compare as
+ * inequal without surfacing the corruption.
+ *
+ * The canonical form: trimmed, no `0x` prefix, lowercase hex, exactly
+ * 68 chars (4-hex algo prefix + 64-hex 32-byte digest = 68 hex chars
+ * total, per §6.1 / `inclusion-proof.content.transactionHash`).
+ * Anything else throws — the caller MUST surface as a security-alert
+ * or operator-alert at the call site.
+ *
+ * @internal
+ */
+export function parseTransactionHashImprint(s: string): string {
+  if (typeof s !== 'string') {
+    throw new SphereError(
+      `parseTransactionHashImprint: expected string, got ${typeof s}`,
+      'VALIDATION_ERROR',
+    );
+  }
+  let canonical = s.trim();
+  if (canonical.startsWith('0x') || canonical.startsWith('0X')) {
+    canonical = canonical.slice(2);
+  }
+  canonical = canonical.toLowerCase();
+  if (canonical.length !== 68) {
+    throw new SphereError(
+      `parseTransactionHashImprint: expected 68 hex chars (2-byte algo prefix + 32-byte digest), got length=${canonical.length}`,
+      'VALIDATION_ERROR',
+    );
+  }
+  if (!/^[0-9a-f]{68}$/.test(canonical)) {
+    throw new SphereError(
+      `parseTransactionHashImprint: malformed hex — must match /^[0-9a-f]{68}$/`,
+      'VALIDATION_ERROR',
+    );
+  }
+  return canonical;
+}
+
+/**
  * `transactionHash` and `authenticator` equality are byte-exact; we
  * lower-case both sides defensively in case the producer used a
  * different case-mode. (Hex is canonically lowercase but the spec is
@@ -402,15 +450,21 @@ export function sameProofValue(
 }
 
 /**
- * `transactionHash` equality only (byte-exact, lowercase). Used by
- * the §6.1 race-loser detection. Authenticator differences do NOT
- * imply race-lost — only different transactionHash matters at the
- * race step.
+ * `transactionHash` equality only (byte-exact). Used by the §6.1
+ * race-loser detection. Authenticator differences do NOT imply
+ * race-lost — only different transactionHash matters at the race step.
+ *
+ * Steelman fix (warning 6a): both inputs are normalized via
+ * {@link parseTransactionHashImprint} before compare so a `'0x'` prefix
+ * mismatch or whitespace difference doesn't trigger a spurious race-
+ * lost / mismatch path. Throws if either input is malformed — the
+ * worker treats that as fatal to surface upstream as a security-alert
+ * or operator-alert (downstream callers MUST handle the throw).
  *
  * @internal
  */
 export function sameTransactionHash(a: string, b: string): boolean {
-  return a.toLowerCase() === b.toLowerCase();
+  return parseTransactionHashImprint(a) === parseTransactionHashImprint(b);
 }
 
 // =============================================================================
@@ -746,10 +800,13 @@ export async function runSubmitPhase(
     lastError = outcome.error;
     attempts++;
     if (attempts >= ctx.maxSubmitRetries) break;
-    // Reuse the polling-policy's backoff schedule for submit retries —
-    // matches §6.1's "back off; retry. Bounded by MAX_SUBMIT_RETRIES"
-    // wording.
-    await ctx.sleep(getBackoffMs(attempts - 1), ctx.signal);
+    // Steelman fix (warning 6c): submit retries use a FAST backoff
+    // schedule (500ms / 1s / 2s / 4s / 8s, tail-clamped) — submit
+    // failures are transient network blips, not deadline-driven polls.
+    // Pre-fix the loop reused the 30s+ polling schedule, making
+    // MAX_SUBMIT_RETRIES exhaustion take ~7.5 minutes for what's
+    // typically a sub-second outage.
+    await ctx.sleep(getSubmitRetryBackoffMs(attempts - 1), ctx.signal);
   }
   return {
     kind: 'hard-fail',

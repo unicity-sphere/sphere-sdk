@@ -176,10 +176,22 @@ export function validatePollingPolicy(): ValidatePollingPolicyResult {
  * against caller-side off-by-one or float arithmetic). NaN yields the
  * first entry. Fractional inputs are floored before lookup.
  *
- * Pure function. No side effects.
+ * **Steelman fix (warning 6b)**: applies ±15% multiplicative jitter
+ * via `floor(base * (0.85 + Math.random() * 0.30))`. Pre-fix the
+ * backoff was deterministic — N concurrent finalization workers all
+ * waking on the SAME 30s/60s/120s schedule synchronously hammer the
+ * aggregator with periodic poll bursts. Jitter de-syncs the wake
+ * times across workers, smoothing aggregator load and cutting tail
+ * latency under contention. The ±15% bound preserves the "feel" of
+ * the schedule (still close to 30s/60s/etc.) while delivering
+ * meaningful spread.
+ *
+ * Pure function modulo `Math.random()`. No other side effects. Tests
+ * that need deterministic timing should stub `Math.random` (e.g.
+ * `vi.spyOn(Math, 'random').mockReturnValue(0.5)`).
  *
  * @param attemptIndex Zero-based attempt counter.
- * @returns Backoff in ms.
+ * @returns Jittered backoff in ms.
  */
 export function getBackoffMs(attemptIndex: number): number {
   const len = BACKOFF_SCHEDULE_MS.length;
@@ -190,14 +202,63 @@ export function getBackoffMs(attemptIndex: number): number {
     // a misconfiguration upstream).
     return 0;
   }
+  let base: number;
   if (!Number.isFinite(attemptIndex) || attemptIndex < 0) {
-    return BACKOFF_SCHEDULE_MS[0];
+    base = BACKOFF_SCHEDULE_MS[0];
+  } else {
+    const i = Math.floor(attemptIndex);
+    base = i >= len ? BACKOFF_SCHEDULE_MS[len - 1] : BACKOFF_SCHEDULE_MS[i];
   }
-  const i = Math.floor(attemptIndex);
-  if (i >= len) {
-    return BACKOFF_SCHEDULE_MS[len - 1];
+  // Apply ±15% jitter to de-sync concurrent workers.
+  return Math.floor(base * (0.85 + Math.random() * 0.30));
+}
+
+// =============================================================================
+// 2.1. Submit-retry backoff (separate fast schedule)
+// =============================================================================
+
+/**
+ * Submit-retry backoff schedule (ms). Distinct from the polling-loop
+ * schedule — submit retries should be FAST (transient network blips
+ * resolve quickly), not slow like a polling-deadline schedule.
+ *
+ * Schedule: 500ms / 1s / 2s / 4s / 8s, tail-clamped at 8s. With the
+ * default `MAX_SUBMIT_RETRIES=5` budget the worker spends at most
+ * 500ms+1s+2s+4s = 7.5s on retries (the 5th attempt has no follow-up
+ * sleep). Pre-fix submit retries reused `getBackoffMs` (the polling
+ * schedule starting at 30s) — exhausting MAX_SUBMIT_RETRIES took
+ * ~30+60+120+240 ≈ 7.5 minutes, way too slow for a transient submit
+ * failure.
+ *
+ * @internal
+ */
+export const SUBMIT_RETRY_BACKOFF_MS: ReadonlyArray<number> = [
+  500, 1_000, 2_000, 4_000, 8_000,
+];
+
+/**
+ * Submit-retry backoff for the `attemptIndex`-th retry (0-indexed).
+ * See {@link SUBMIT_RETRY_BACKOFF_MS} for the schedule.
+ *
+ * Applies the same ±15% jitter as {@link getBackoffMs}.
+ *
+ * Steelman fix (warning 6c): pre-fix the submit-retry path reused
+ * {@link getBackoffMs} (the 30s+ polling schedule). Submit retries
+ * are network-blip recovery, NOT polling — they should be sub-10s.
+ *
+ * @internal
+ */
+export function getSubmitRetryBackoffMs(attemptIndex: number): number {
+  const len = SUBMIT_RETRY_BACKOFF_MS.length;
+  if (len === 0) return 0;
+  let base: number;
+  if (!Number.isFinite(attemptIndex) || attemptIndex < 0) {
+    base = SUBMIT_RETRY_BACKOFF_MS[0];
+  } else {
+    const i = Math.floor(attemptIndex);
+    base = i >= len ? SUBMIT_RETRY_BACKOFF_MS[len - 1] : SUBMIT_RETRY_BACKOFF_MS[i];
   }
-  return BACKOFF_SCHEDULE_MS[i];
+  return Math.floor(base * (0.85 + Math.random() * 0.30));
 }
 
 // =============================================================================
