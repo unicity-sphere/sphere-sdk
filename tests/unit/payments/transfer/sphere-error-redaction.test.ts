@@ -74,6 +74,24 @@ describe('W40 — REDACTED_FIELDS inventory', () => {
   it('is frozen so nothing can mutate the set at runtime', () => {
     expect(Object.isFrozen(REDACTED_FIELDS)).toBe(true);
   });
+
+  // Round 5 — defensive sister-name additions. These are aggregator-/peer-
+  // supplied untrusted strings that historically leaked into err.cause
+  // unchanged. Listing them in REDACTED_FIELDS makes the W40 layer the
+  // single choke point for redaction; sanitizers at throw sites are the
+  // complementary defense for the human-readable `message` field.
+  it('lists Round 5 sister names (aggregatorError + friends)', () => {
+    expect(REDACTED_FIELDS).toContain('aggregatorError');
+    expect(REDACTED_FIELDS).toContain('failureReasons');
+    expect(REDACTED_FIELDS).toContain('errorMessage');
+    expect(REDACTED_FIELDS).toContain('serverError');
+    expect(REDACTED_FIELDS).toContain('responseBody');
+    expect(REDACTED_FIELDS).toContain('requestBody');
+    expect(REDACTED_FIELDS).toContain('responseText');
+    expect(REDACTED_FIELDS).toContain('body');
+    expect(REDACTED_FIELDS).toContain('rawError');
+    expect(REDACTED_FIELDS).toContain('errorBody');
+  });
 });
 
 // =============================================================================
@@ -357,6 +375,115 @@ describe('W40 — isSphereError type guard works after redaction', () => {
       signedTransferTxBytes: new Uint8Array([1]),
     });
     expect(isSphereError(err)).toBe(true);
+  });
+});
+
+// =============================================================================
+// 11. Round 5 — sister-name redaction (FIX 6).
+// =============================================================================
+
+describe('Round 5 — defensive sister-name redaction', () => {
+  it('redacts aggregatorError to the marker', () => {
+    const err = new SphereError('m', 'SOURCE_CHAIN_HARD_FAIL', {
+      tokenId: 't1',
+      aggregatorError: 'attacker-controlled string with <script>alert(1)</script>',
+    });
+    const ctx = err.context as { tokenId: string; aggregatorError: string };
+    expect(ctx.aggregatorError.startsWith('[REDACTED: aggregatorError')).toBe(true);
+    expect(ctx.aggregatorError).not.toContain('<script>');
+    expect(ctx.aggregatorError).not.toContain('alert(1)');
+    // Non-redacted sibling preserved.
+    expect(ctx.tokenId).toBe('t1');
+  });
+
+  it('redacts aggregatorError nested under another object', () => {
+    const err = new SphereError('m', 'SOURCE_CHAIN_HARD_FAIL', {
+      details: { aggregatorError: 'nested attacker payload' },
+    });
+    const ctx = err.context as { details: { aggregatorError: string } };
+    expect(ctx.details.aggregatorError.startsWith('[REDACTED: aggregatorError')).toBe(
+      true,
+    );
+  });
+
+  it('redacts failureReasons (array of strings)', () => {
+    const err = new SphereError('m', 'BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT', {
+      bundleCid: 'bafyXYZ',
+      failureReasons: ['gateway-1: 500', 'gateway-2: cid-mismatch'],
+    });
+    const ctx = err.context as { failureReasons: unknown };
+    // The whole array value gets the marker because `failureReasons` is in REDACTED_FIELDS.
+    expect(typeof ctx.failureReasons).toBe('string');
+    expect(ctx.failureReasons as string).toMatch(/^\[REDACTED: failureReasons/);
+  });
+
+  it.each(['serverError', 'responseBody', 'requestBody', 'responseText', 'body', 'rawError', 'errorBody', 'errorMessage'])(
+    'redacts %s field to the marker',
+    (field) => {
+      const cause: Record<string, unknown> = { [field]: 'attacker stuff' };
+      const err = new SphereError('m', 'STRUCTURAL_INVALID', cause);
+      const ctx = err.context as Record<string, unknown>;
+      expect(typeof ctx[field]).toBe('string');
+      expect(ctx[field] as string).toMatch(new RegExp(`^\\[REDACTED: ${field}`));
+    },
+  );
+});
+
+// =============================================================================
+// 12. Round 5 — hostile-Proxy / throwing-trap defenses (FIX 3).
+//
+// A `Proxy` whose `getPrototypeOf` trap throws (or whose target's
+// `[Symbol.hasInstance]` throws) would crash `redactValue` itself
+// before W40 fix. The constructor MUST NOT propagate the throw out;
+// it must fail closed, treat the value as a non-Error, and finish
+// constructing a usable SphereError.
+// =============================================================================
+
+describe('Round 5 — hostile Proxy / throwing-trap closure', () => {
+  it('SphereError construction does NOT throw when cause has throwing getPrototypeOf trap', () => {
+    const target = new Error('inner');
+    const hostileProxy = new Proxy(target, {
+      getPrototypeOf() {
+        throw new Error('hostile getPrototypeOf');
+      },
+    });
+    // Use the proxy as cause. Must NOT throw out of SphereError.
+    expect(() => {
+      new SphereError('outer', 'STRUCTURAL_INVALID', hostileProxy);
+    }).not.toThrow();
+  });
+
+  it('SphereError construction does NOT throw when cause has throwing Symbol.hasInstance', () => {
+    // Crafting a value where `value instanceof Error` itself throws.
+    class HostileCtor {
+      static [Symbol.hasInstance](): boolean {
+        throw new Error('hostile hasInstance');
+      }
+    }
+    const obj = Object.create(HostileCtor.prototype);
+    obj.message = 'forensic';
+    expect(() => {
+      new SphereError('outer', 'STRUCTURAL_INVALID', obj);
+    }).not.toThrow();
+  });
+
+  it('SphereError construction handles nested cause with throwing .message getter', () => {
+    const errCause = new Error('initial');
+    Object.defineProperty(errCause, 'message', {
+      configurable: true,
+      get() {
+        throw new Error('hostile message getter');
+      },
+    });
+    expect(() => {
+      new SphereError('outer', 'STRUCTURAL_INVALID', errCause);
+    }).not.toThrow();
+    const err = new SphereError('outer', 'STRUCTURAL_INVALID', errCause);
+    const ctx = err.context as { message?: string };
+    // The redacted clone has either the sentinel or no message — no throw propagation.
+    expect(ctx.message === undefined || ctx.message === '[REDACTED: getter-threw]').toBe(
+      true,
+    );
   });
 });
 

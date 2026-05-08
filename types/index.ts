@@ -704,6 +704,17 @@ export interface SphereEventMap {
     readonly bundleCid?: string;
     readonly observedTokenContentHash?: import('../uxf/types').ContentHash;
     readonly senderTransportPubkey?: string;
+    /**
+     * Human-readable diagnostic. **Round 5 contract:** emit sites MUST
+     * pre-sanitize this field via `sanitizeReasonString` (from
+     * `core/error-sanitize.ts`) so any peer-/aggregator-supplied content
+     * is stripped of control characters, HTML markup, and oversize
+     * payloads before reaching operator dashboards. The dispatcher does
+     * NOT centrally sanitize — callers own this for explicitness. New
+     * emit sites: pipe untrusted text (especially `safeErrorMessage(err)`)
+     * through `sanitizeReasonString(...)` before splicing into this
+     * field. Audit closure tracks the existing emit sites.
+     */
     readonly message: string;
   };
   /**
