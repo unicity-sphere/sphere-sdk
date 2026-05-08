@@ -315,6 +315,17 @@ const VERIFY_FAILED_LRU_TTL_MS = 30_000;
  * main pipeline retries. Bounded entries (FIFO eviction) prevent
  * unbounded memory growth even under hostile flooding.
  *
+ * **Round 3 regression fix — transient errors are NOT cached.** The
+ * Round 2 implementation cached ANY `SphereError`, including
+ * {@link TRANSIENT_REJECT_CODES} like
+ * `BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT`. A one-time gateway blip
+ * would then short-circuit the W13 retry path for
+ * {@link VERIFY_FAILED_LRU_TTL_MS} (30 s) — e.g., a temporary IPFS
+ * outage poisons the cache for 30 s, blocking legitimate retries from
+ * the same sender. {@link recordVerifyFailure} now filters these out
+ * so transient failures continue to re-run the pipeline immediately.
+ * Permanent / structural rejections still cache correctly.
+ *
  * **Why it is local to bundle-acquirer (NOT integrated with
  * ReplayLRU):** the two have different semantics — ReplayLRU keys on
  * successful verifications and gates short-circuit; this one keys on
@@ -336,15 +347,43 @@ interface VerifyFailedEntry {
 const verifyFailedLru = new Map<string, VerifyFailedEntry>();
 
 /**
+ * Round 3 fix — error codes that are CLASS:transient and MUST NOT be
+ * cached in the negative LRU. Caching a transient failure would block
+ * the legitimate W13 retry pathway for the negative-LRU TTL (30 s),
+ * which conflicts with the spec requirement that transient failures
+ * surface only to the sender's outbox timeout (no recipient-side
+ * disposition / retry suppression).
+ *
+ * Currently a single code, but exported as a set so future
+ * documented-transient codes can be added in one place. Search the
+ * `core/errors.ts` file for "TRANSIENT" to confirm scope.
+ */
+const TRANSIENT_REJECT_CODES = new Set<string>([
+  'BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT',
+]);
+
+/**
  * Insert a negative-LRU entry for `(senderPubkey, bundleCid)`. Evicts
  * the oldest entry (Map insertion order ≡ insertion-time recency) when
  * the cap is exceeded.
+ *
+ * **Round 3 regression fix:** transient-class error codes (see
+ * {@link TRANSIENT_REJECT_CODES}) are filtered out and NOT cached. A
+ * one-time gateway blip on a `uxf-cid` payload should not block the
+ * W13 retry pathway for the cache TTL — that would convert a transient
+ * failure into a recipient-side persistent rejection. Permanent /
+ * structural rejections (root-CID mismatch, malformed envelope, verify
+ * failure, ...) still cache correctly so a hostile re-publish loop
+ * cannot amplify CPU.
  */
 function recordVerifyFailure(
   senderPubkey: string,
   bundleCid: string,
   err: SphereError,
 ): void {
+  if (TRANSIENT_REJECT_CODES.has(err.code)) {
+    return;
+  }
   const key = `${senderPubkey}|${bundleCid}`;
   // Refresh on insert: delete-then-insert pushes the entry to the back
   // of iteration order (LRU semantics). FIFO eviction at the front.

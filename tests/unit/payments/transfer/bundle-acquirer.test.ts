@@ -794,3 +794,115 @@ describe('acquireBundle — negative-LRU short-circuit (steelman warning)', () =
     expect(isReplayOutcome(r2)).toBe(true);
   });
 });
+
+// =============================================================================
+// 10. Round 3 fix — negative LRU skips transient-classified errors
+// =============================================================================
+//
+// Round 2 cached ANY SphereError in the negative LRU. A one-time gateway
+// blip surfacing as `BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT` would then
+// short-circuit the W13 retry pathway for the cache TTL (30 s),
+// converting a transient failure into a recipient-side persistent
+// rejection. Round 3 fix: filter transient codes out of
+// `recordVerifyFailure`. Permanent / structural rejections still cache.
+
+describe('acquireBundle — negative LRU skips transient errors (Round 3)', () => {
+  afterEach(() => __clearInflightForTests());
+
+  it('TRANSIENT failure is NOT cached: immediate retry runs the pipeline afresh', async () => {
+    // Setup: a uxf-cid payload whose gateways fail intermittently. First
+    // attempt: every gateway fetch fails (network blip) → fetcher throws
+    // BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT. Second attempt: gateways
+    // recover. The Round 3 fix means the second arrival is NOT
+    // short-circuited by the negative LRU — it runs the full pipeline
+    // and succeeds.
+
+    const realPkg = UxfPackage.create();
+    realPkg.ingestAll([TOKEN_A]);
+    const realCarBytes = await realPkg.toCar();
+    const realCid = await extractCarRootCid(realCarBytes);
+
+    const payload: UxfTransferPayloadCid = {
+      kind: 'uxf-cid',
+      version: '1.0',
+      mode: 'instant',
+      bundleCid: realCid,
+      tokenIds: [TOKEN_A_ID],
+    };
+
+    let attempts = 0;
+    const fetchImpl: typeof fetch = vi.fn(async () => {
+      attempts++;
+      // First two calls (one per gateway, both attempts in attempt #1)
+      // simulate a network blip — every gateway returns 503. After
+      // that, gateways recover and serve the real CAR bytes.
+      if (attempts <= 2) {
+        return new Response('upstream blip', { status: 503 });
+      }
+      return new Response(realCarBytes, { status: 200 });
+    });
+
+    const lru = new ReplayLRU();
+
+    // First arrival — every gateway fails → TRANSIENT.
+    let firstErr: unknown;
+    try {
+      await acquireBundle(payload, SENDER, lru, {
+        gateways: ['https://m1.example', 'https://m2.example'],
+        fetch: fetchImpl,
+      });
+    } catch (err) {
+      firstErr = err;
+    }
+    if (!isSphereError(firstErr)) throw new Error('expected SphereError');
+    expect(firstErr.code).toBe('BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT');
+
+    // Second arrival — gateways have recovered. Round 3 fix: the
+    // negative LRU MUST NOT short-circuit because the prior failure
+    // was TRANSIENT. The pipeline re-runs, the fetcher succeeds, and
+    // verification completes.
+    const result = await acquireBundle(payload, SENDER, lru, {
+      gateways: ['https://m1.example', 'https://m2.example'],
+      fetch: fetchImpl,
+    });
+    if (isReplayOutcome(result)) throw new Error('unreachable');
+    expect(result.verified).toBe(true);
+    expect(result.bundleCid).toBe(realCid);
+  });
+
+  it('PERMANENT failure IS cached: immediate retry short-circuits via negative LRU', async () => {
+    // Counterpart to the previous test. A non-transient SphereError
+    // (e.g., BUNDLE_REJECTED_ROOT_CID_MISMATCH) must still cache so
+    // a hostile re-publish loop cannot amplify CPU.
+    const payload = await buildCarPayload({
+      tokens: [TOKEN_A],
+      claimedTokenIds: [TOKEN_A_ID],
+      bundleCidOverride:
+        'bafyreid7gzkd7m2ovmh7y4hgsthhqhwlrbeenoaq2obuycoswbsedfsy5e',
+    });
+    const lru = new ReplayLRU();
+
+    let firstErr: unknown;
+    try {
+      await acquireBundle(payload, SENDER, lru);
+    } catch (err) {
+      firstErr = err;
+    }
+    if (!isSphereError(firstErr)) throw new Error('expected SphereError');
+    expect(firstErr.code).toBe('BUNDLE_REJECTED_ROOT_CID_MISMATCH');
+    // The first error message should NOT be a cache-hit yet (just the
+    // canonical mismatch message).
+    expect(firstErr.message).not.toContain('negative-LRU short-circuit');
+
+    // Second arrival — IS short-circuited.
+    let secondErr: unknown;
+    try {
+      await acquireBundle(payload, SENDER, lru);
+    } catch (err) {
+      secondErr = err;
+    }
+    if (!isSphereError(secondErr)) throw new Error('expected SphereError');
+    expect(secondErr.code).toBe('BUNDLE_REJECTED_ROOT_CID_MISMATCH');
+    expect(secondErr.message).toContain('negative-LRU short-circuit');
+  });
+});
