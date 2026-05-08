@@ -680,3 +680,48 @@ describe('packageFromJson — manifest size cap (FIX 9)', () => {
     expect(String(err.message)).toMatch(/Manifest entry count exceeds/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Steelman³ regression — FIX 1 (Round 3): ELEMENTS_MAX_SIZE pool size cap.
+// ---------------------------------------------------------------------------
+
+describe('packageFromJson — elements pool size cap (FIX 1, Round 3)', () => {
+  it('rejects elements pool with >ELEMENTS_MAX_SIZE entries with LIMIT_EXCEEDED', () => {
+    // Generate 100_001 valid 64-char hex element keys. The bodies are
+    // arbitrary objects — the cap MUST fire BEFORE any element body is
+    // processed (no contentHash + computeElementHash invocations).
+    const elements: Record<string, unknown> = {};
+    for (let i = 0; i <= 100_000; i++) {
+      const k = i.toString(16).padStart(64, '0');
+      elements[k] = {
+        header: { representation: 1, semantics: 1, kind: 'default', predecessor: null },
+        type: 0,
+        content: {},
+        children: {},
+      };
+    }
+    const json = JSON.stringify({
+      uxf: '1.0.0',
+      metadata: {
+        version: '1.0.0',
+        createdAt: 1,
+        updatedAt: 1,
+        elementCount: Object.keys(elements).length,
+        tokenCount: 0,
+      },
+      manifest: {},
+      instanceChainIndex: {},
+      indexes: { byTokenType: {}, byCoinId: {}, byStateHash: {} },
+      elements,
+    });
+    let err: any;
+    try {
+      packageFromJson(json);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('LIMIT_EXCEEDED');
+    expect(String(err.message)).toMatch(/Elements pool size exceeds ELEMENTS_MAX_SIZE/);
+  });
+});

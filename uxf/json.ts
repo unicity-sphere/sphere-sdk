@@ -39,7 +39,7 @@ import { UxfError } from './errors.js';
 import { computeElementHash } from './hash.js';
 import { hexToBytesAllowEmpty } from '../core/hex.js';
 import { assertHeaderKindField, assertHeaderVersionField } from './header-validation.js';
-import { MANIFEST_MAX_SIZE } from './limits.js';
+import { ELEMENTS_MAX_SIZE, MANIFEST_MAX_SIZE } from './limits.js';
 
 // ---------------------------------------------------------------------------
 // Type ID <-> String Tag mapping
@@ -416,7 +416,21 @@ export function packageFromJson(json: string): UxfPackageData {
     );
   }
   const pool = new Map<ContentHash, UxfElement>();
-  for (const [hashStr, jsonElem] of Object.entries(raw.elements)) {
+  // Steelman³ remediation (FIX 1, Round 3): cap elements pool size at the
+  // parse boundary — otherwise a hostile JSON payload with 10M elements
+  // forces 10M `Object.entries` iterations + 10M `contentHash` /
+  // `computeElementHash` evaluations BEFORE `WRAP_POOL_MAX_SIZE = 1M`
+  // (UxfPackage.ts wrapPool) finally fires. The CAR path correctly caps
+  // via `CAR_IMPORT_MAX_BLOCK_COUNT = 10_000` BEFORE pool insertion;
+  // mirror that defense here for the JSON path.
+  const elementEntries = Object.entries(raw.elements);
+  if (elementEntries.length > ELEMENTS_MAX_SIZE) {
+    throw new UxfError(
+      'LIMIT_EXCEEDED',
+      `Elements pool size exceeds ELEMENTS_MAX_SIZE=${ELEMENTS_MAX_SIZE}: ${elementEntries.length}`,
+    );
+  }
+  for (const [hashStr, jsonElem] of elementEntries) {
     const hash = contentHash(hashStr);
     const element = deserializeElement(jsonElem);
     // Verify element hash matches the claimed key (catches hex case mismatches, etc.)
