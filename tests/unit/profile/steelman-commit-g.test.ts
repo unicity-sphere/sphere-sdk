@@ -50,6 +50,8 @@ describe('Commit G — steelman³ critical fixes', () => {
 
       // Hand-craft JSON matching packageFromJson's expected shape.
       // type uses the integer ID (0x01 = token-root). children use string CIDs.
+      // Manifest tokenId must be 64-char lowercase hex (FIX 6 gate).
+      const validTokenId = 'a'.repeat(64);
       const handcrafted = {
         uxf: '1.0.0',
         metadata: {
@@ -59,7 +61,7 @@ describe('Commit G — steelman³ critical fixes', () => {
           elementCount: 1,
           tokenCount: 1,
         },
-        manifest: { T: rootHashStr },
+        manifest: { [validTokenId]: rootHashStr },
         instanceChainIndex: {},
         elements: {
           [rootHashStr]: {
