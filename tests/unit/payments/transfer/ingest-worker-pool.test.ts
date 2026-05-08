@@ -41,6 +41,7 @@ import type {
   RootRef,
   VerifiedBundle,
 } from '../../../../modules/payments/transfer/bundle-verifier';
+import { RECIPIENT_MAX_INLINE_CARBASE64_LENGTH } from '../../../../modules/payments/transfer/limits';
 import type { ContentHash } from '../../../../uxf/types';
 import type { SphereEventMap, SphereEventType } from '../../../../types';
 

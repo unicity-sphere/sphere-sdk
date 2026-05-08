@@ -57,6 +57,46 @@ export const MAX_INLINE_CAR_BYTES = 16 * 1024;
 export const RELAY_SAFE_CAP_BYTES = 96 * 1024;
 
 /**
+ * Slack added to {@link RECIPIENT_MAX_INLINE_CARBASE64_LENGTH} to absorb
+ * whitespace / padding without false-positives on legitimately-sized
+ * bundles. 16 bytes is sufficient for trailing `=` padding plus any
+ * stray whitespace from intermediate JSON encodings.
+ */
+export const INLINE_BASE64_SLACK_BYTES = 16;
+
+/**
+ * Maximum size (in characters) of the `carBase64` string in a
+ * `kind: 'uxf-car'` payload that the recipient will accept.
+ *
+ * **Why a recipient-side cap exists:** the sender enforces
+ * `clampInlineCap` against `RELAY_SAFE_CAP_BYTES = 96 KiB` before
+ * inlining a CAR. But the cap is only authoritative if the RECIPIENT
+ * also enforces it. Without recipient-side enforcement, a hostile
+ * sender (or a mis-configured one) can ship a 6 MiB base64 payload
+ * (~4.5 MiB CAR) inline, bypassing the relay-safe cap entirely. The
+ * recipient then base64-decodes the entire blob and runs CAR parse on
+ * it — both expensive operations the cap was supposed to prevent.
+ *
+ * **Authoritative bound:** the recipient's check is the canonical
+ * enforcement point. The sender's clamp is a politeness layer for the
+ * relay; the recipient's check is a defense.
+ *
+ * **Computation:** base64 inflates 4 bytes → 3 bytes (ratio 4/3). For
+ * a raw byte cap of {@link RELAY_SAFE_CAP_BYTES}, the base64 string is
+ * at most `ceil(RELAY_SAFE_CAP_BYTES * 4 / 3)` characters; we add
+ * {@link INLINE_BASE64_SLACK_BYTES} slack for padding/whitespace.
+ *
+ * **Steelman warning fix — exported from this module so both the
+ * recipient acquirer (post-decode validation) AND the ingest worker
+ * pool (enqueue-time guard, BEFORE allocating the multi-megabyte
+ * buffer in the queue) share the same authoritative bound.** A queue
+ * of 256 entries × 5 MiB hostile payloads ≈ 1.3 GiB resident; the
+ * enqueue-time guard prevents that allocation entirely.
+ */
+export const RECIPIENT_MAX_INLINE_CARBASE64_LENGTH =
+  Math.ceil((RELAY_SAFE_CAP_BYTES * 4) / 3) + INLINE_BASE64_SLACK_BYTES;
+
+/**
  * Maximum CAR size the recipient will fetch via `kind: 'uxf-cid'`. Streaming
  * fetches abort with `FETCHED_CAR_TOO_LARGE` once running byte-count crosses
  * this threshold. DoS defense against hostile pinned CIDs. (§3.3.1.)
