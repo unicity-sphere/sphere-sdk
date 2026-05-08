@@ -80,11 +80,25 @@ export function sanitizeReasonString(
   // We use literal-range replacement (rather than Unicode property escapes)
   // so the regex stays portable across Node 18+ and the browser runtimes
   // we support.
-  const stripped = bounded.replace(
+  let stripped = bounded.replace(
     // eslint-disable-next-line no-control-regex
     /[\x00-\x1F\x7F-\x9F<>&]/g,
     '',
   );
+  // Round 7 fix (LOW NEW — defense-in-depth): strip LONE surrogate
+  // code units (a high surrogate not followed by a low surrogate, or
+  // a low surrogate not preceded by a high surrogate). Valid surrogate
+  // PAIRS — which encode astral code points like emoji — are
+  // preserved. After the UTF-16 pre-truncation above, the boundary
+  // may have severed a pair, leaving an unpaired surrogate that
+  // breaks downstream `JSON.stringify` / `Buffer.from('utf8')` / log
+  // shippers (which reject or replace unpaired surrogates
+  // inconsistently). The naive `[\uD800-\uDFFF]` class would also
+  // destroy valid emoji, so we use lookbehind/lookahead to match only
+  // the orphans. Two passes — high-surrogate-not-followed-by-low,
+  // then low-surrogate-not-preceded-by-high.
+  stripped = stripped.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, '');
+  stripped = stripped.replace(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '');
   // Iterate by Unicode code point (not UTF-16 code unit) so the cap
   // boundary never lands inside a surrogate pair. `Array.from(str)`
   // uses the string iterator, which yields one element per code point.

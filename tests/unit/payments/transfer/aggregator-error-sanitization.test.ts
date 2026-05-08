@@ -526,3 +526,41 @@ describe('Round 7 — sanitizeReasonString pre-truncates oversized input', () =>
   });
 });
 
+describe('Round 7 — sanitizeReasonString strips lone surrogates', () => {
+  // A lone high surrogate followed by a non-surrogate code unit.
+  it('strips a lone high surrogate (no following low surrogate)', () => {
+    const raw = 'pre\uD800post'; // U+D800 alone, then 'post'
+    const out = sanitizeReasonString(raw);
+    expect(out).toBe('prepost');
+    expect(out).not.toMatch(/[\uD800-\uDBFF]/);
+  });
+
+  it('strips a lone low surrogate (no preceding high surrogate)', () => {
+    const raw = 'pre\uDC00post'; // U+DC00 alone
+    const out = sanitizeReasonString(raw);
+    expect(out).toBe('prepost');
+    expect(out).not.toMatch(/[\uDC00-\uDFFF]/);
+  });
+
+  it('strips multiple lone surrogates in mixed positions', () => {
+    const raw = '\uD800a\uDC00b\uD801c\uDFFF';
+    const out = sanitizeReasonString(raw);
+    expect(out).toBe('abc');
+  });
+
+  it('preserves valid surrogate pairs (emoji)', () => {
+    // U+1F600 (😀) is encoded as U+D83D U+DE00 — a valid pair.
+    const raw = 'hello 😀 world';
+    const out = sanitizeReasonString(raw);
+    expect(out).toBe(raw);
+    expect(out).toContain('😀');
+  });
+
+  it('preserves valid pairs while stripping a lone surrogate next to them', () => {
+    // 😀 (D83D DE00) followed by lone high surrogate then text.
+    const raw = '😀\uD800x';
+    const out = sanitizeReasonString(raw);
+    expect(out).toBe('😀x');
+  });
+});
+
