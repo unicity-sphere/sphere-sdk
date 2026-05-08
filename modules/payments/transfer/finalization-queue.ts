@@ -138,10 +138,41 @@ export interface FinalizationQueueEntry {
    * `submittedAt === createdAt` (no submit yet) — protects against
    * restart-resume of an already-old entry hitting the deadline after
    * a single poll.
+   *
+   * Round 3 regression status: this field's CAS-update on first
+   * submit was historically the planned W26 anchor; in practice the
+   * recipient never wired a `submittedAt`-CAS path. The Round-3 fix
+   * uses the separate {@link pollStartedAt} field below as the W26
+   * anchor — it is stamped once on first poll-loop entry and surface
+   * the wall-clock submit time without forcing every queue-store
+   * implementation to bake a CAS-update method.
    */
   readonly submittedAt: number;
   /** Wall-clock millisecond timestamp of queue creation. */
   readonly createdAt: number;
+  /**
+   * Round 3 regression fix: wall-clock millisecond timestamp at which
+   * the recipient finalization worker FIRST entered the poll-loop for
+   * this entry. Stamped exactly once via
+   * {@link FinalizationQueue.setPollStartedAt}, never re-stamped.
+   *
+   * The §5.5 step 6 hard polling deadline (2 × POLLING_WINDOW_MS) is
+   * anchored at THIS field, NOT at {@link createdAt} or
+   * {@link submittedAt}. Pre-Round-3 the deadline anchor read
+   * `submittedAt > createdAt ? submittedAt : now()` — but no code path
+   * ever updated `submittedAt` post-creation, so the `now()` branch
+   * fired on every cycle and the W26 cross-restart safety net was
+   * effectively inert (the deadline restarted on every worker
+   * re-entry). Promoting `pollStartedAt` to its own persisted field
+   * gives the worker an honest "wall-clock when polling actually
+   * started" anchor; on the second pass after a restart, the
+   * persisted value wins so the deadline survives crashes.
+   *
+   * Optional: a freshly-enqueued entry has `pollStartedAt: undefined`
+   * until the first poll-loop entry stamps it. Once stamped, the
+   * field is immutable for the lifetime of the queue entry.
+   */
+  readonly pollStartedAt?: number;
   /** Submit-side retry counter (bounded by `MAX_SUBMIT_RETRIES`). */
   readonly submitRetryCount: number;
   /** Poll-side proof-error retry counter (PATH_INVALID /
@@ -376,6 +407,56 @@ export class FinalizationQueue {
     validateEntry(entry);
     const key = keyFor(addr, entry.entryId);
     await this.storage.writeKey(key, JSON.stringify(serializeEntry(entry)));
+  }
+
+  /**
+   * Round 3 regression fix: stamp the W26 polling-deadline anchor on a
+   * live queue entry. Read-modify-write the entry to set
+   * `pollStartedAt = now`. Idempotent if `pollStartedAt` is already set
+   * (no-op) — the worker's stamp-once contract prevents re-stamping
+   * after a successful first poll-loop entry. Returns:
+   *
+   *   - `'set'`           — field stamped on this call.
+   *   - `'already-set'`   — field was already populated; no-op.
+   *   - `'absent'`        — entry not found (tombstoned or removed).
+   *
+   * The recipient finalization worker calls this at the top of each
+   * cycle's poll loop: if `'set'` was returned the in-memory entry
+   * MUST be refreshed (next call to `lookupByTokenId` carries the new
+   * value). Persisted across worker restarts so the §5.5 step 6 hard
+   * safety net (2 × POLLING_WINDOW_MS) is anchored at the real
+   * wall-clock first-poll time, not at every worker re-entry's `now()`.
+   *
+   * **Why this method instead of mutating `submittedAt`**: the
+   * `submittedAt` CAS-update path was historically the planned anchor
+   * but was never wired into the recipient. Adding a dedicated
+   * `pollStartedAt` field avoids overloading `submittedAt`'s "first
+   * successful submit time" semantics (used by other code paths) and
+   * makes the W26 contract explicit + self-documenting.
+   */
+  async setPollStartedAt(
+    addr: string,
+    entryId: string,
+    when: number,
+  ): Promise<'set' | 'already-set' | 'absent'> {
+    validateAddr(addr);
+    validateEntryId(entryId);
+    if (!Number.isFinite(when)) {
+      throw new SphereError(
+        `FinalizationQueue.setPollStartedAt: when must be a finite number; got ${when}`,
+        'VALIDATION_ERROR',
+      );
+    }
+    const existing = await this.get(addr, entryId);
+    if (existing === undefined) return 'absent';
+    if (existing.pollStartedAt !== undefined) return 'already-set';
+    const updated: FinalizationQueueEntry = {
+      ...existing,
+      pollStartedAt: when,
+    };
+    const key = keyFor(addr, entryId);
+    await this.storage.writeKey(key, JSON.stringify(serializeEntry(updated)));
+    return 'set';
   }
 
   /**
@@ -688,6 +769,11 @@ function serializeEntry(
   if (entry.signedTransferTxBytes !== undefined) {
     out.signedTransferTxBytes = bytesToBase64(entry.signedTransferTxBytes);
   }
+  // Round 3 regression fix: persist pollStartedAt when set so the W26
+  // anchor survives crash/restart.
+  if (entry.pollStartedAt !== undefined) {
+    out.pollStartedAt = entry.pollStartedAt;
+  }
   return out;
 }
 
@@ -757,6 +843,15 @@ function deserializeEntry(
             obj.signedTransferTxBytes,
           ),
         }
+      : {}),
+    // Round 3 regression fix: read pollStartedAt when present so the
+    // W26 anchor survives crash/restart. Absent ⇒ no poll-loop entry
+    // has happened yet (or this is a legacy entry written before the
+    // field was introduced — both cases handled identically by the
+    // worker's "stamp on first poll" code path).
+    ...(typeof obj.pollStartedAt === 'number' &&
+    Number.isFinite(obj.pollStartedAt)
+      ? { pollStartedAt: obj.pollStartedAt }
       : {}),
   };
   return out;

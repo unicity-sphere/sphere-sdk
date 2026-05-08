@@ -902,6 +902,42 @@ export class FinalizationWorkerRecipient {
     // rewrite under the per-tokenId mutex with `entryId` as the queue-
     // removal key).
     const perTokenSemaphore = this.options.getPerTokenSemaphore(entry.tokenId);
+
+    // Round 3 regression fix (CRIT #2): resolve the W26 cross-restart
+    // anchor via the dedicated `pollStartedAt` field — stamp it once
+    // on first poll-loop entry; on subsequent passes the persisted
+    // value wins so the deadline survives crash/restart.
+    //
+    // Pre-Round-3 the anchor was `entry.submittedAt > entry.createdAt
+    // ? entry.submittedAt : now()` — but no code path ever updated
+    // `submittedAt` post-creation, so the `now()` branch fired on
+    // EVERY cycle and the W26 safety net was effectively inert.
+    let pollStartedAt: number;
+    if (
+      typeof entry.pollStartedAt === 'number' &&
+      Number.isFinite(entry.pollStartedAt)
+    ) {
+      pollStartedAt = entry.pollStartedAt;
+    } else {
+      pollStartedAt = this.options.now();
+      // Best-effort: persist the stamp. If the queue write fails
+      // (storage outage, race with sibling), the next cycle will
+      // re-stamp at its `now()` — the worst case is a slightly
+      // delayed deadline, never an infinite poll, because every
+      // cycle's anchor is at MOST one cycle of skew behind the
+      // canonical first-entry time.
+      try {
+        await this.options.queueStore.setPollStartedAt(
+          this.options.addressId,
+          entry.entryId,
+          pollStartedAt,
+        );
+      } catch {
+        // Stamp failures are recoverable — operator alert is noisy
+        // for an inherently transient condition.
+      }
+    }
+
     const cycle = await runFinalizationCycle({
       addressId: this.options.addressId,
       tokenId: entry.tokenId,
@@ -921,31 +957,15 @@ export class FinalizationWorkerRecipient {
       poolRead: this.options.poolRead,
       perAggregatorSemaphore: this.perAggregatorSemaphore,
       perTokenSemaphore,
-      // W26 cross-restart fix: use the queue entry's PERSISTED
-      // `submittedAt` as the deadline anchor, NOT a fresh `now()`.
-      // Otherwise the §5.5 step 6 hard safety net (2 ×
-      // POLLING_WINDOW_MS) restarts on every worker re-entry, letting
-      // a token poll indefinitely across crash/restart cycles.
-      //
-      // Steelman fix (CRIT #8): the queue's writer contract initializes
-      // `submittedAt = createdAt` and updates it on the FIRST successful
-      // submit; until that update lands, the field carries the queue's
-      // creation timestamp. If a queue entry is enqueued and then sits
-      // for ≥ 2 × POLLING_WINDOW_MS before pickup (e.g. a worker that
-      // restarts after a long outage, or a queue that accumulates entries
-      // before the worker starts), using `entry.submittedAt` as the
-      // deadline anchor would hard-fail oracle-rejected on the first
-      // poll attempt — BEFORE we've even submitted. The fix:
-      // `submittedAt === createdAt` is the sentinel "no submit yet" — in
-      // that case anchor the deadline at `now()` (this cycle's start)
-      // so the polling window measures from when the worker actually
-      // begins polling. Once a submit succeeds the queue writer should
-      // CAS-update submittedAt; on subsequent passes the persisted value
-      // wins and W26 cross-restart termination is preserved.
-      pollStartedAt:
-        entry.submittedAt > entry.createdAt
-          ? entry.submittedAt
-          : this.options.now(),
+      // Round 3 regression fix (CRIT #2): W26 anchor sourced from the
+      // queue entry's dedicated `pollStartedAt` field (resolved above).
+      // Pre-Round-3 the `submittedAt > createdAt` heuristic was inert
+      // because nothing ever updated `submittedAt` post-creation; the
+      // `now()` branch fired every cycle and the §5.5 step 6 hard
+      // safety net (2 × POLLING_WINDOW_MS) restarted on every worker
+      // re-entry. The dedicated field is stamped exactly once on the
+      // first poll-loop entry and persisted across worker restarts.
+      pollStartedAt,
       emit: this.options.emit,
       now: this.options.now,
       sleep: this.options.sleep,

@@ -439,3 +439,97 @@ describe('FinalizationQueue — keyFor / prefixFor / entryIdFor', () => {
     expect(entryIdFor(TOKEN_A, 7)).toBe(`${TOKEN_A}:7`);
   });
 });
+
+// =============================================================================
+// Round 3 regression — pollStartedAt persistence + setPollStartedAt API (FIX 2)
+// =============================================================================
+//
+// Pre-Round-3 the recipient's W26 cross-restart polling-deadline anchor
+// was supposed to be the queue entry's `submittedAt`, with a CAS-update
+// to wall-clock-now on first successful submit. But no code path
+// actually performed that CAS-update — `submittedAt === createdAt` was
+// the steady state and the deadline kept restarting on every cycle.
+//
+// Round 3 fix: dedicated `pollStartedAt` field on the queue entry,
+// stamped exactly once via `setPollStartedAt`. Persisted across
+// restarts; reads back the wall-clock first-poll time.
+
+describe('FinalizationQueue — pollStartedAt (Round 3 regression)', () => {
+  it('serialize + deserialize round-trips pollStartedAt when set', async () => {
+    const storage = makeFakeStorage();
+    const q = new FinalizationQueue({ storage });
+    const e = makeEntry({ pollStartedAt: 1700000005000 });
+    await q.add(ADDR, e);
+    const got = await q.get(ADDR, e.entryId);
+    expect(got).toBeDefined();
+    expect(got?.pollStartedAt).toBe(1700000005000);
+  });
+
+  it('serialize + deserialize handles undefined pollStartedAt (legacy entries)', async () => {
+    const storage = makeFakeStorage();
+    const q = new FinalizationQueue({ storage });
+    const e = makeEntry();
+    expect(e.pollStartedAt).toBeUndefined();
+    await q.add(ADDR, e);
+    const got = await q.get(ADDR, e.entryId);
+    expect(got).toBeDefined();
+    expect(got?.pollStartedAt).toBeUndefined();
+  });
+
+  it('setPollStartedAt stamps the field on first call and persists', async () => {
+    const storage = makeFakeStorage();
+    const q = new FinalizationQueue({ storage });
+    const e = makeEntry();
+    await q.add(ADDR, e);
+
+    const result = await q.setPollStartedAt(ADDR, e.entryId, 1700000010000);
+    expect(result).toBe('set');
+
+    const got = await q.get(ADDR, e.entryId);
+    expect(got?.pollStartedAt).toBe(1700000010000);
+  });
+
+  it('setPollStartedAt is idempotent — second call returns "already-set" and does NOT overwrite', async () => {
+    const storage = makeFakeStorage();
+    const q = new FinalizationQueue({ storage });
+    const e = makeEntry();
+    await q.add(ADDR, e);
+
+    const r1 = await q.setPollStartedAt(ADDR, e.entryId, 1700000010000);
+    expect(r1).toBe('set');
+
+    const r2 = await q.setPollStartedAt(ADDR, e.entryId, 1700000020000);
+    expect(r2).toBe('already-set');
+
+    const got = await q.get(ADDR, e.entryId);
+    expect(got?.pollStartedAt).toBe(1700000010000); // first stamp wins
+  });
+
+  it('setPollStartedAt on a tombstoned entry returns "absent"', async () => {
+    const storage = makeFakeStorage();
+    const q = new FinalizationQueue({ storage });
+    const e = makeEntry();
+    await q.add(ADDR, e);
+    await q.remove(ADDR, e.entryId);
+
+    const result = await q.setPollStartedAt(ADDR, e.entryId, 1700000010000);
+    expect(result).toBe('absent');
+  });
+
+  it('setPollStartedAt on a never-added entry returns "absent"', async () => {
+    const storage = makeFakeStorage();
+    const q = new FinalizationQueue({ storage });
+    const result = await q.setPollStartedAt(ADDR, 'nonexistent-entry-id', 1700000010000);
+    expect(result).toBe('absent');
+  });
+
+  it('setPollStartedAt rejects non-finite when values', async () => {
+    const storage = makeFakeStorage();
+    const q = new FinalizationQueue({ storage });
+    const e = makeEntry();
+    await q.add(ADDR, e);
+
+    await expect(q.setPollStartedAt(ADDR, e.entryId, NaN)).rejects.toThrow();
+    await expect(q.setPollStartedAt(ADDR, e.entryId, Infinity)).rejects.toThrow();
+  });
+});

@@ -1215,6 +1215,87 @@ describe('FinalizationWorkerRecipient — internalController rebuild on start (R
   });
 });
 
+// =============================================================================
+// Round 3 regression — W26 anchor wired via persisted pollStartedAt (FIX 2)
+// =============================================================================
+//
+// Pre-Round-3 the recipient cycle's W26 deadline anchor was
+//   `entry.submittedAt > entry.createdAt ? entry.submittedAt : now()`
+// but no code path ever updated `submittedAt` post-creation, so the
+// `now()` branch fired on EVERY cycle and the W26 cross-restart safety
+// net was effectively inert. The fix promotes `pollStartedAt` to its
+// own queue-entry field, stamped once on first poll-loop entry and
+// persisted across restarts.
+
+describe('FinalizationWorkerRecipient — W26 anchor via pollStartedAt (Round 3 regression)', () => {
+  it('entry stale by 2+ hours does NOT hard-fail oracle-rejected on first poll', async () => {
+    const TWO_HOURS_AGO = 1700000000000 - 2 * 60 * 60 * 1000;
+    const entry = makeQueueEntry({
+      createdAt: TWO_HOURS_AGO,
+      submittedAt: TWO_HOURS_AGO,
+      // Note: NO pollStartedAt — first-pickup case.
+    });
+
+    const aggregator = makeFakeAggregator({
+      submit: async () => ({ kind: 'SUCCESS' as const }),
+      poll: async () => ({
+        kind: 'OK' as const,
+        proof: makeProof(),
+        newCid: NEW_CID,
+      }),
+    });
+
+    const harness = buildWorker({ aggregator });
+    await seedQueue(harness, [entry]);
+
+    const result = await harness.worker.processOneToken(TOKEN_ID);
+
+    // Should reach VALID — anchor was stamped at `now()`, not at
+    // the stale createdAt.
+    expect(result.terminal).toBe('valid');
+    expect(result.successCount).toBe(1);
+    expect(result.hardFailCount).toBe(0);
+
+    // No event carries the pre-Round-3 hard-fail signature.
+    for (const e of harness.events.events) {
+      const data = e.data as { message?: string };
+      const msg = typeof data.message === 'string' ? data.message : '';
+      expect(msg.includes('oracle-rejected')).toBe(false);
+    }
+  });
+
+  it('worker calls setPollStartedAt at the cycle entry (best-effort persist)', async () => {
+    const entry = makeQueueEntry({ entryId: 'queue-pollstart-stamp' });
+    const harness = buildWorker();
+    await seedQueue(harness, [entry]);
+
+    // Spy on the queue store's setPollStartedAt method to confirm the
+    // worker invokes it BEFORE runFinalizationCycle.
+    const calls: Array<{ entryId: string; when: number }> = [];
+    const real = harness.queueStore.setPollStartedAt.bind(harness.queueStore);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (harness.queueStore as any).setPollStartedAt = async (
+      addr: string,
+      entryId: string,
+      when: number,
+    ): Promise<'set' | 'already-set' | 'absent'> => {
+      calls.push({ entryId, when });
+      return real(addr, entryId, when);
+    };
+
+    const result = await harness.worker.processOneToken(TOKEN_ID);
+    expect(result.terminal).toBe('valid');
+
+    // The worker MUST call setPollStartedAt for the entry on the
+    // FIRST poll-loop entry (pollStartedAt was undefined).
+    const stampCall = calls.find((c) => c.entryId === entry.entryId);
+    expect(stampCall).toBeDefined();
+    // The stamp time MUST be the worker's current `now()`, not the
+    // stale createdAt.
+    expect(stampCall?.when).toBe(1700000000000);
+  });
+});
+
 // Suppress unused-import warnings for this block.
 void RACE_TX_HASH;
 void makeFakePoolRead;
