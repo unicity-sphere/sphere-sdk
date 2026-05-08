@@ -4589,34 +4589,38 @@ export class Sphere {
       }
     }
 
-    // Round 7 (FIX 1) — Wire production OrbitDb-backed disposition
-    // storage into the operator escape-hatch InclusionProofImporter.
-    // Round 5 auto-installed an in-memory default that fails closed on
-    // every operator-supplied proof; this hop swaps the disposition
+    // Round 7 (FIX 1) / Round 8 (FIX 1) — Wire production OrbitDb-backed
+    // disposition storage AND the trust-base-aware proof verifier into
+    // the operator escape-hatch InclusionProofImporter.
+    //
+    // Round 5 auto-installed an in-memory default that failed closed on
+    // every operator-supplied proof; Round 7 swapped the disposition
     // storage for an OrbitDb-backed adapter so `_invalid` / `_audit`
-    // records persist across restarts.
+    // records persist across restarts. Round 8 closes the remaining
+    // verification gap: the importer's case 8 / 9 short-circuits now
+    // run through `oracle.verifyInclusionProof()` (the same trust-base-
+    // aware verifier the regular finalization workers use) instead of
+    // the Round 7 fail-closed stub.
     //
-    // The swap is best-effort: when the storage provider is not a
-    // `ProfileStorageProvider` (e.g. legacy IndexedDB / file storage),
-    // the auto-installed in-memory default stays in place. When it is
-    // but encryption is disabled or identity isn't set yet,
-    // `buildDispositionStorageAdapter()` returns null and we leave the
-    // default alone. Bootstrap callers that need stricter guarantees
-    // SHOULD verify by calling `payments.importInclusionProof()` with
-    // a probe payload at startup and inspecting the result.
+    // The disposition-storage swap is best-effort: when the storage
+    // provider is not a `ProfileStorageProvider` (e.g. legacy IndexedDB
+    // / file storage), the auto-installed in-memory default stays in
+    // place. The verifyProof wiring is ALWAYS attempted regardless of
+    // storage provider — a real verifier on top of in-memory disposition
+    // storage is still strictly better than the fail-closed stub
+    // (operator probe calls return structured `proof-not-anchored` /
+    // `proof-trustbase-failed` results instead of every proof being
+    // dismissed as `NOT_AUTHENTICATED`).
     //
-    // KNOWN LIMITATION: `verifyProof` / `graftCallback` /
-    // `overrideCallback` are NOT yet wired to production
-    // implementations. The auto-installed defaults still return
-    // `'NOT_AUTHENTICATED'` for every proof. Closing those gaps requires
-    // stable trustBase plumbing on the oracle (deferred to a follow-up
-    // wave). The dispositionStorage swap alone delivers cross-restart
-    // persistence — the highest-value gap surfaced by Round 6.
-    //
-    // TODO(round-8): Wire the real `verifyProof` from
-    //   `oracle/UnicityAggregatorProvider.verifyInclusionProof()` and
-    //   the real graft/override callbacks against PaymentsModule's
-    //   existing graft pipeline once trustBase is exposed lazily.
+    // KNOWN LIMITATION: `graftCallback` / `overrideCallback` are NOT
+    // wired here because the default builder's `queueScanner` returns
+    // no entries — case 3 / 5 / 6 are unreachable in the auto-installed
+    // harness. A follow-up wave will land a real `queueScanner` (the
+    // FinalizationQueue-backed scanner) alongside production graft +
+    // override callbacks; until then the no-op defaults are correct
+    // (every reachable case routes through `verifyProof` first, and a
+    // verified proof against an empty queue/manifest correctly resolves
+    // to `'no-such-token'` or `'requestid-mismatch'`).
     try {
       // Duck-typed check: ProfileStorageProvider exposes
       // `buildDispositionStorageAdapter`. Other providers don't.
@@ -4625,28 +4629,121 @@ export class Sphere {
           | import('../profile/disposition-storage-adapters').OrbitDbDispositionStorageAdapter
           | null;
       };
-      if (typeof storageWithBuilder.buildDispositionStorageAdapter === 'function') {
-        const adapter = storageWithBuilder.buildDispositionStorageAdapter();
-        if (adapter !== null && adapter !== undefined) {
-          this._payments.configureOperatorEscapeHatchStorage(adapter);
-          logger.debug(
-            'Sphere',
-            'Wired OrbitDb-backed disposition storage into operator escape-hatch importer',
+      const builderAvailable =
+        typeof storageWithBuilder.buildDispositionStorageAdapter === 'function';
+      const adapter = builderAvailable
+        ? storageWithBuilder.buildDispositionStorageAdapter!()
+        : null;
+
+      // Round 8 (FIX 1) — Build a verifyProof adapter that bridges the
+      // {@link ImportableInclusionProof} shape used by the importer to
+      // the oracle's `verifyInclusionProof` boolean API. The oracle
+      // returns `true` only on `OK`; every other status (PATH_INVALID,
+      // PATH_NOT_INCLUDED, NOT_AUTHENTICATED, THROWN) collapses to
+      // `false`. We map `true → 'OK'` and `false → 'NOT_AUTHENTICATED'`
+      // — losing the granular distinction between PATH_INVALID and
+      // PATH_NOT_INCLUDED is acceptable because the importer's case 8
+      // / 9 routing treats both as proof-trustbase-failed (only OK
+      // proceeds to graft/override). A follow-up wave can plumb the
+      // granular status if forensic distinction becomes load-bearing.
+      //
+      // The trustBase is loaded LAZILY: oracle.initialize() may run
+      // after this hop (the oracle wires trustBase at first connect),
+      // so the adapter resolves the trust-base on each call by calling
+      // through `oracle.verifyInclusionProof()` which performs its own
+      // null-check and throws `NOT_INITIALIZED` when trustBase is not
+      // yet loaded. We catch and translate to `'NOT_AUTHENTICATED'` so
+      // a probe call before oracle init does not crash bootstrap.
+      const oracleForVerify = this._oracle as unknown as {
+        verifyInclusionProof?: (input: {
+          readonly proofJson: unknown;
+          readonly transactionHash: string;
+          readonly proofHash?: string;
+        }) => Promise<boolean>;
+      };
+      const oracleHasVerify =
+        typeof oracleForVerify.verifyInclusionProof === 'function';
+      const verifyProofAdapter:
+        | import('../modules/payments/transfer/import-inclusion-proof').ProofVerifier
+        | undefined = oracleHasVerify
+        ? async (
+            proof: import('../modules/payments/transfer/import-inclusion-proof').ImportableInclusionProof,
+          ): Promise<import('../modules/payments/transfer/proof-verifier').ProofVerifyStatus> => {
+            try {
+              const ok = await oracleForVerify.verifyInclusionProof!({
+                proofJson: proof.proof,
+                transactionHash: proof.transactionHash,
+              });
+              return ok ? 'OK' : 'NOT_AUTHENTICATED';
+            } catch {
+              // Trust-base not loaded yet, network blip, malformed
+              // input. Fail closed — the operator can retry once the
+              // oracle finishes initialize(). Distinct from a
+              // structurally-bad proof (which the oracle itself
+              // returns false for); both collapse to the same case-9
+              // routing here.
+              return 'NOT_AUTHENTICATED';
+            }
+          }
+        : undefined;
+
+      if (adapter !== null && adapter !== undefined) {
+        this._payments.configureOperatorEscapeHatchStorage(
+          adapter,
+          verifyProofAdapter !== undefined
+            ? { verifyProof: verifyProofAdapter }
+            : undefined,
+        );
+        logger.debug(
+          'Sphere',
+          'Wired OrbitDb-backed disposition storage + oracle.verifyInclusionProof into operator escape-hatch importer',
+        );
+      } else if (verifyProofAdapter !== undefined) {
+        // No OrbitDb adapter, but we still have a real oracle —
+        // upgrade just the verifier so the importer can validate
+        // proofs even when running against in-memory disposition
+        // storage. Use the public install* hook by rebuilding the
+        // default importer with the verifier override.
+        // Round 8 (FIX 1) — even without dispositionStorage upgrade,
+        // verifyProof wiring is strictly better than the stub.
+        const paymentsForVerify = this._payments as unknown as {
+          configureOperatorEscapeHatchStorage?: (
+            ds: import('../profile/disposition-writer').DispositionPerEntryStorage,
+            options?: {
+              readonly verifyProof?: import('../modules/payments/transfer/import-inclusion-proof').ProofVerifier;
+            },
+          ) => void;
+        };
+        // Synthesize an in-memory dispositionStorage. We could reach
+        // through to the auto-installed importer's existing
+        // dispositionStorage instance, but rebuilding fresh keeps the
+        // public surface narrow — the cost is one extra empty Map.
+        const { InMemoryDispositionStorageAdapter } = await import(
+          '../profile/disposition-storage-adapters'
+        );
+        if (typeof paymentsForVerify.configureOperatorEscapeHatchStorage === 'function') {
+          paymentsForVerify.configureOperatorEscapeHatchStorage(
+            new InMemoryDispositionStorageAdapter(),
+            { verifyProof: verifyProofAdapter },
           );
-        } else {
           logger.debug(
             'Sphere',
-            'ProfileStorageProvider returned null disposition adapter (encryption disabled or identity pending) — escape-hatch importer keeps in-memory default',
+            'Wired oracle.verifyInclusionProof into operator escape-hatch importer (in-memory disposition storage)',
           );
         }
+      } else if (builderAvailable) {
+        logger.debug(
+          'Sphere',
+          'ProfileStorageProvider returned null disposition adapter (encryption disabled or identity pending) — escape-hatch importer keeps in-memory default',
+        );
       }
     } catch (err) {
-      // Non-fatal: bootstrap continues with the in-memory default. The
-      // operator escape-hatch still works (just without cross-restart
-      // persistence).
+      // Non-fatal: bootstrap continues with the auto-installed default.
+      // The operator escape-hatch still works (just with the Round 7
+      // fail-closed verifier stub).
       logger.warn(
         'Sphere',
-        `Failed to wire OrbitDb-backed disposition storage — falling back to in-memory default: ${err instanceof Error ? err.message : String(err)}`,
+        `Failed to wire operator-escape-hatch importer overrides — falling back to in-memory default: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
 

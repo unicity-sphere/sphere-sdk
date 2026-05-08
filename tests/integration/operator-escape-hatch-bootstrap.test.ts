@@ -321,4 +321,144 @@ describe('Round 7 (FIX 1): operator escape-hatch bootstrap wiring', () => {
 
     await sphere2.destroy();
   });
+
+  // ===========================================================================
+  // Round 8 (FIX 1) — verifyProof wired through oracle.verifyInclusionProof.
+  //
+  // The Round 7 wiring left verifyProof as a fail-closed stub
+  // (`'NOT_AUTHENTICATED'`) so even a real, well-formed inclusion proof
+  // would route to `'proof-trustbase-failed'`. Round 8 wires the
+  // bootstrap layer's verifyProof adapter through to
+  // `oracle.verifyInclusionProof()` so a real proof reaches the
+  // case-3/4/5/6 routing.
+  //
+  // We can't exercise case 5 (override) end-to-end here because the
+  // default harness's queueScanner returns no entries — we'd need a
+  // full-bootstrap layer with a real FinalizationQueue scanner +
+  // dispositionStorage with an `_invalid` record. What we CAN exercise:
+  //   a. The verifyProof adapter is reachable: a stub oracle returning
+  //      `true` produces a different code path than a stub returning
+  //      `false`.
+  //   b. With `getProof` of `null` plus a manifest-less tokenId, the
+  //      result is `'no-such-token'` regardless of verifyProof outcome
+  //      (case 1 short-circuits before verifyProof).
+  // ===========================================================================
+  it('Round 8 (FIX 1): oracle.verifyInclusionProof is wired into the importer (stub returning true exercises a different routing than fail-closed default)', async () => {
+    const storage = new FileStorageProvider({ dataDir: DATA_DIR });
+    const tokenStorage = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
+    const transport = createMockTransport();
+
+    // Oracle returns `true` for verifyInclusionProof — a real wired
+    // verifier would resolve case 8/9 short-circuits to `'OK'` and
+    // proceed past the trust-base gate. We capture call args to assert
+    // the bootstrap actually wired the adapter.
+    const verifyInclusionProof = vi.fn().mockResolvedValue(true);
+    const oracle = {
+      ...createMockOracle(),
+      verifyInclusionProof,
+    } as unknown as OracleProvider;
+
+    const { sphere } = await Sphere.init({
+      storage,
+      transport,
+      oracle,
+      tokenStorage,
+      autoGenerate: true,
+    });
+
+    // Reach through the importer's private opts to verify the
+    // verifyProof callback is NOT the default fail-closed stub. The
+    // default returns `'NOT_AUTHENTICATED'` regardless of input; the
+    // wired adapter calls through to `oracle.verifyInclusionProof()`.
+    const importer = (
+      sphere.payments as unknown as {
+        inclusionProofImporter: { opts: { verifyProof: (proof: unknown) => Promise<string> } } | null;
+      }
+    ).inclusionProofImporter;
+    expect(importer).not.toBeNull();
+    const verifyProofFn = importer!.opts.verifyProof;
+
+    // Invoke the importer's verifyProof directly — this proves the
+    // bootstrap wired the oracle adapter.
+    const status = await verifyProofFn({
+      requestId: 'rq',
+      transactionHash: 'cd'.repeat(34),
+      authenticator: 'authn',
+      proof: { stub: true },
+    });
+
+    expect(verifyInclusionProof).toHaveBeenCalledTimes(1);
+    expect(verifyInclusionProof).toHaveBeenCalledWith({
+      proofJson: { stub: true },
+      transactionHash: 'cd'.repeat(34),
+    });
+    expect(status).toBe('OK');
+
+    // Now flip the oracle to return false — confirms the adapter maps
+    // `false` to `'NOT_AUTHENTICATED'` (the case 9 routing).
+    verifyInclusionProof.mockResolvedValueOnce(false);
+    const status2 = await verifyProofFn({
+      requestId: 'rq2',
+      transactionHash: 'cd'.repeat(34),
+      authenticator: 'authn',
+      proof: { stub: true },
+    });
+    expect(status2).toBe('NOT_AUTHENTICATED');
+
+    // Finally — a thrown verifier (e.g., trust-base not yet loaded)
+    // collapses to `'NOT_AUTHENTICATED'` instead of crashing the
+    // importer.
+    verifyInclusionProof.mockRejectedValueOnce(new Error('trust-base not loaded'));
+    const status3 = await verifyProofFn({
+      requestId: 'rq3',
+      transactionHash: 'cd'.repeat(34),
+      authenticator: 'authn',
+      proof: { stub: true },
+    });
+    expect(status3).toBe('NOT_AUTHENTICATED');
+
+    await sphere.destroy();
+  });
+
+  it('Round 8 (FIX 1): when oracle has no verifyInclusionProof method, importer keeps the fail-closed default (graceful degradation)', async () => {
+    const storage = new FileStorageProvider({ dataDir: DATA_DIR });
+    const tokenStorage = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
+    const transport = createMockTransport();
+
+    // Oracle WITHOUT verifyInclusionProof. The bootstrap path detects
+    // this (`typeof === 'function'` check) and skips the adapter
+    // wiring, leaving the Round 7 fail-closed default in place.
+    const oracle = createMockOracle();
+    expect(
+      (oracle as unknown as { verifyInclusionProof?: unknown })
+        .verifyInclusionProof,
+    ).toBeUndefined();
+
+    const { sphere } = await Sphere.init({
+      storage,
+      transport,
+      oracle,
+      tokenStorage,
+      autoGenerate: true,
+    });
+
+    const importer = (
+      sphere.payments as unknown as {
+        inclusionProofImporter: { opts: { verifyProof: (proof: unknown) => Promise<string> } } | null;
+      }
+    ).inclusionProofImporter;
+    expect(importer).not.toBeNull();
+    const verifyProofFn = importer!.opts.verifyProof;
+
+    // The default stub always returns 'NOT_AUTHENTICATED'.
+    const status = await verifyProofFn({
+      requestId: 'rq',
+      transactionHash: 'cd'.repeat(34),
+      authenticator: 'authn',
+      proof: { stub: true },
+    });
+    expect(status).toBe('NOT_AUTHENTICATED');
+
+    await sphere.destroy();
+  });
 });

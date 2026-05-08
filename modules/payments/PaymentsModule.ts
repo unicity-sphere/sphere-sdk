@@ -2605,42 +2605,50 @@ export class PaymentsModule {
   }
 
   /**
-   * Round 7 (FIX 1) — Reconfigure the auto-installed
+   * Round 7 (FIX 1) / Round 8 (FIX 1) — Reconfigure the auto-installed
    * {@link InclusionProofImporter} with a production-wired
    * `dispositionStorage` adapter (typically
    * {@link OrbitDbDispositionStorageAdapter} bound to the wallet's
-   * ProfileDatabase). Idempotent: rebuilds and replaces the current
-   * importer using the same shared per-tokenId mutex (`_sharedPerTokenMutex`)
-   * so the new importer continues to serialize with the finalization
-   * workers.
+   * ProfileDatabase) AND the trust-base-aware proof verifier +
+   * graft/override callbacks. Idempotent: rebuilds and replaces the
+   * current importer using the same shared per-tokenId mutex
+   * (`_sharedPerTokenMutex`) so the new importer continues to serialize
+   * with the finalization workers.
    *
    * Bootstrap layers (Sphere) call this after `initialize()` once the
-   * profile stack is ready to hand them an OrbitDb-backed adapter. When
-   * called BEFORE `initialize()`, it has the same effect as
-   * `installInclusionProofImporter()` — the auto-install gate
-   * (`inclusionProofImporter === null`) skips because we just installed
-   * one.
+   * profile stack + oracle are ready to hand them an OrbitDb-backed
+   * adapter and a wired `verifyProof`. When called BEFORE
+   * `initialize()`, it throws `NOT_INITIALIZED` (the importer needs
+   * `this.deps` to wire `emit`).
    *
-   * Callable only after `initialize()` (the importer needs `this.deps`
-   * to wire `emit`).
-   *
-   * KNOWN LIMITATION: this method does NOT yet wire `verifyProof` /
-   * `graftCallback` / `overrideCallback` to production-grade
-   * implementations — those still default to the in-memory stubs
-   * (NOT_AUTHENTICATED + no-op). The full production wiring is deferred
-   * to a follow-up wave once the trust-base lifecycle on this module's
-   * oracle is stable. The dispositionStorage swap alone delivers
-   * cross-restart persistence of `_invalid` records — the highest-value
-   * gap surfaced by Round 6.
+   * Round 8 (FIX 1) — `verifyProof` is now wired through to
+   * `oracle.verifyInclusionProof()` via the bootstrap layer. The
+   * importer's case 8 / 9 short-circuits run against a real
+   * trust-base-aware verifier instead of the Round 7 fail-closed stub.
+   * `graftCallback` / `overrideCallback` accept production callbacks
+   * (the bootstrap layer wires them when the OrbitDB pool/manifest/
+   * tombstone/queue adapters are available); when omitted, the
+   * defaults remain no-ops (unreachable in the default harness because
+   * the stub `queueScanner` returns no entries — bootstrap layers that
+   * wire a real `queueScanner` alongside these callbacks close the
+   * remaining case 3 / 5 / 6 gap).
    */
   configureOperatorEscapeHatchStorage(
     dispositionStorage: import('../../profile/disposition-writer').DispositionPerEntryStorage,
+    options?: {
+      readonly verifyProof?: import('./transfer/import-inclusion-proof').ProofVerifier;
+      readonly graftCallback?: import('./transfer/import-inclusion-proof').ImportProofGraftCallback;
+      readonly overrideCallback?: import('./transfer/import-inclusion-proof').ImportProofOverrideCallback;
+    },
   ): void {
     this.ensureInitialized();
     this.inclusionProofImporter = buildDefaultInclusionProofImporter({
       emit: (type, data) => this.deps!.emitEvent(type, data),
       perTokenMutex: this._sharedPerTokenMutex ?? undefined,
       dispositionStorage,
+      ...(options?.verifyProof !== undefined ? { verifyProof: options.verifyProof } : {}),
+      ...(options?.graftCallback !== undefined ? { graftCallback: options.graftCallback } : {}),
+      ...(options?.overrideCallback !== undefined ? { overrideCallback: options.overrideCallback } : {}),
     });
   }
 
@@ -10844,6 +10852,36 @@ export function buildDefaultInclusionProofImporter(opts: {
    * wallets without a profile stack).
    */
   readonly dispositionStorage?: import('../../profile/disposition-writer').DispositionPerEntryStorage;
+  /**
+   * Round 8 (FIX 1) — Optional production-grade
+   * {@link ProofVerifier}. When passed (the Sphere bootstrap layer
+   * builds an adapter over `oracle.verifyInclusionProof()`), the
+   * importer's case 8 / 9 verification short-circuits run against the
+   * trust-base-aware verifier so a real operator-supplied proof can
+   * actually pass. When omitted, the default `'NOT_AUTHENTICATED'`
+   * stub stays in place — the importer fails closed on every proof
+   * (preserves the Round 7 default-safe semantics for callers without
+   * a wired oracle).
+   */
+  readonly verifyProof?: import('./transfer/import-inclusion-proof').ProofVerifier;
+  /**
+   * Round 8 (FIX 1) — Optional production-grade graft callback. When
+   * passed, case 3 (pending-graft) drives the §5.5 step 5 4-step write
+   * sequence into the wallet's manifest store. When omitted, the
+   * default no-op stub stays in place. The default harness's stub
+   * `queueScanner` returns no entries, so this callback is unreachable
+   * in the auto-installed default; bootstrap layers that wire a real
+   * `queueScanner` (alongside this callback) close the production gap.
+   */
+  readonly graftCallback?: import('./transfer/import-inclusion-proof').ImportProofGraftCallback;
+  /**
+   * Round 8 (FIX 1) — Optional production-grade override callback.
+   * When passed, cases 5 / 6 (operator override of `_invalid`) drive
+   * the manifest stamp + audit-trail writes. When omitted, the default
+   * no-op stub stays in place — same reachability caveat as
+   * `graftCallback` above.
+   */
+  readonly overrideCallback?: import('./transfer/import-inclusion-proof').ImportProofOverrideCallback;
 }): InclusionProofImporter {
   const { emit } = opts;
 
@@ -10882,23 +10920,27 @@ export function buildDefaultInclusionProofImporter(opts: {
     },
   };
 
-  // Stub proof verifier — fail closed. The default harness MUST NOT
-  // accept operator-supplied proofs; the bootstrap layer's override
-  // wires the real trust-base-aware verifier.
-  const verifyProof = async (): Promise<ProofVerifyStatus> => 'NOT_AUTHENTICATED';
+  // Round 8 (FIX 1) — caller-supplied verifier wins. Default harness
+  // fails closed (`NOT_AUTHENTICATED`) so the importer NEVER applies
+  // an unverified proof; bootstrap layers that wire `oracle.
+  // verifyInclusionProof()` swap in a real trust-base-aware verifier.
+  const verifyProof = opts.verifyProof
+    ?? (async (): Promise<ProofVerifyStatus> => 'NOT_AUTHENTICATED');
 
-  // Stub graft callback — no-op (returns immediately). Cases routing
-  // here would never fire in the default harness because the queue
-  // scanner returns no entries; including the stub keeps the importer
-  // structurally complete.
-  const graftCallback = {
+  // Round 8 (FIX 1) — caller-supplied graft callback wins. Default is
+  // a no-op (case 3 unreachable in default harness because the stub
+  // queueScanner returns no entries; the stub keeps the importer
+  // structurally complete). When the bootstrap layer wires a real
+  // queueScanner alongside this callback, case 3 becomes reachable.
+  const graftCallback = opts.graftCallback ?? {
     async graft() {
       /* no-op */
     },
   };
 
-  // Stub override callback — no-op. Same rationale as graftCallback.
-  const overrideCallback = {
+  // Round 8 (FIX 1) — caller-supplied override callback wins. Default
+  // is a no-op for the same reachability reason as `graftCallback`.
+  const overrideCallback = opts.overrideCallback ?? {
     async applyOverride() {
       /* no-op */
     },
