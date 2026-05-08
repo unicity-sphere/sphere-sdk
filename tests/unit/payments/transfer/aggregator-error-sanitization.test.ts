@@ -421,3 +421,73 @@ describe('finalization-worker-base — aggregator error sanitization integration
     expect(message).toContain('aggregator panic');
   });
 });
+
+// =============================================================================
+// 7. Round 7 — defensive enhancements.
+// =============================================================================
+
+describe('Round 7 — safeErrorMessage / sanitizeError defend against hostile Proxy', () => {
+  // Build a Proxy whose getPrototypeOf trap throws. Pre-fix, evaluating
+  // `err instanceof Error` against this Proxy would re-throw out of the
+  // sanitizer, bypassing every downstream safety net. The fix wraps the
+  // instanceof check in try/catch.
+  function buildHostileProxy(): unknown {
+    const target = {};
+    return new Proxy(target, {
+      getPrototypeOf() {
+        throw new Error('hostile getPrototypeOf');
+      },
+    });
+  }
+
+  it('safeErrorMessage does not throw on Proxy with throwing getPrototypeOf', () => {
+    const hostile = buildHostileProxy();
+    let result: string | undefined;
+    expect(() => {
+      result = safeErrorMessage(hostile);
+    }).not.toThrow();
+    // Returned value should be a string (the String(err) fallback or
+    // the redaction sentinel) — never undefined and never the raw
+    // hostile object.
+    expect(typeof result).toBe('string');
+  });
+
+  it('sanitizeError does not throw on Proxy with throwing getPrototypeOf', () => {
+    const hostile = buildHostileProxy();
+    let result: string | undefined;
+    expect(() => {
+      result = sanitizeError(hostile);
+    }).not.toThrow();
+    expect(typeof result).toBe('string');
+    // Result must be capped to DEFAULT_MAX_REASON_LENGTH code points.
+    expect(Array.from(result!).length).toBeLessThanOrEqual(
+      DEFAULT_MAX_REASON_LENGTH,
+    );
+  });
+
+  it('safeErrorMessage handles Proxy that throws on EVERY operation gracefully', () => {
+    // Worst case: every trap throws. instanceof, String(err), JSON.stringify
+    // all blow up. The helper must still return a string.
+    const target = {};
+    const hostile = new Proxy(target, {
+      getPrototypeOf() {
+        throw new Error('boom');
+      },
+      get() {
+        throw new Error('boom');
+      },
+      has() {
+        throw new Error('boom');
+      },
+      ownKeys() {
+        throw new Error('boom');
+      },
+    });
+    let result: string | undefined;
+    expect(() => {
+      result = safeErrorMessage(hostile);
+    }).not.toThrow();
+    expect(typeof result).toBe('string');
+  });
+});
+

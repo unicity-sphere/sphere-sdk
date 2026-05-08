@@ -109,17 +109,31 @@ const REDACTED_GETTER_THREW = '[REDACTED: getter-threw]';
  * call when a sanitized result is needed.
  */
 export function safeErrorMessage(err: unknown): string {
-  if (err instanceof Error) {
+  // Round 7 fix (MED GAP): wrap the `instanceof Error` check itself in
+  // try/catch. A hostile `Proxy` whose `getPrototypeOf` trap throws
+  // makes `err instanceof Error` re-throw out of this helper —
+  // bypassing every downstream sanitizer. core/errors.ts:697-703
+  // already wraps this idiom; this site was inconsistent. On throw,
+  // treat the value as non-Error and fall through to the
+  // String-conversion branch.
+  let isError = false;
+  try {
+    isError = err instanceof Error;
+  } catch {
+    isError = false;
+  }
+  if (isError) {
+    const errAsErr = err as Error;
     let message: unknown;
     try {
-      message = err.message;
+      message = errAsErr.message;
     } catch {
       return REDACTED_GETTER_THREW;
     }
     if (typeof message === 'string' && message.length > 0) return message;
     let name: unknown;
     try {
-      name = err.name;
+      name = errAsErr.name;
     } catch {
       return REDACTED_GETTER_THREW;
     }
@@ -152,7 +166,18 @@ export function safeErrorMessage(err: unknown): string {
  */
 export function sanitizeError(err: unknown, cap?: number): string {
   let raw: string;
-  if (err instanceof Error) {
+  // Round 7 fix (MED GAP): same Proxy-getPrototypeOf-throws defense as
+  // safeErrorMessage above. Wrap the `instanceof Error` check so a
+  // hostile Proxy cannot throw OUT of the sanitizer. On throw, fall
+  // through into safeErrorMessage's defended path (which itself
+  // tries instanceof, then degrades).
+  let isError = false;
+  try {
+    isError = err instanceof Error;
+  } catch {
+    isError = false;
+  }
+  if (isError) {
     raw = safeErrorMessage(err);
   } else if (typeof err === 'string') {
     raw = err;
