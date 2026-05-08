@@ -56,6 +56,7 @@
  * @packageDocumentation
  */
 
+import { safeErrorMessage } from '../../../core/error-sanitize';
 import { MAX_CHAIN_DEPTH } from './limits';
 import type { CascadeManifestScanner } from './cascade-walker';
 import type { TokenManifestEntry } from '../../../profile/token-manifest';
@@ -364,11 +365,17 @@ export class RevalidateCascadedRunner {
         }
       }
       try {
+        // Round 7 fix (HIGH GAP): redact raw `err` argument — a hostile
+        // scanner can plant `err.signedTransferTxBytes` (or any other
+        // sensitive bytes) on the thrown Error, which `console.warn`
+        // would otherwise log verbatim. Sister-fix to cascade-walker.ts
+        // (Round 5 fix at lines ~603/981); this site was missed in the
+        // initial sweep. Log only the sanitized message string.
         // eslint-disable-next-line no-console
         console.warn(
           '[revalidate-cascaded] findChildren failed for',
           { addr, tokenId: currentTokenId },
-          err,
+          { error: safeErrorMessage(err) },
         );
       } catch {
         // ignore logging failures
@@ -411,10 +418,23 @@ export class RevalidateCascadedRunner {
       // different invalidReason (e.g. `'off-record-spend'`) is in
       // `_invalid` for an unrelated reason and is NOT this
       // revalidation's responsibility.
+      //
+      // Round 7 (FIX 4) — lowercase BOTH sides of the splitParent
+      // comparison defensively. Disposition writers now lowercase
+      // splitParent at write time, but legacy manifests written before
+      // that fix may carry mixed-case values. Combined with the public
+      // entry's `currentTokenId` already being lowercased (Round 5
+      // fix), strict-equality on the legacy mixed-case path silently
+      // misses cascade victims. Lowercasing both sides defensively
+      // catches that case without semantic change.
+      const childSplitParentLc =
+        typeof childEntry.splitParent === 'string'
+          ? childEntry.splitParent.toLowerCase()
+          : childEntry.splitParent;
       const wasParentRejected =
         childEntry.status === 'invalid' &&
         childEntry.invalidReason === 'parent-rejected' &&
-        childEntry.splitParent === currentTokenId;
+        childSplitParentLc === currentTokenId.toLowerCase();
 
       if (!wasParentRejected) {
         // Child is not a cascade victim of this parent. Skip without

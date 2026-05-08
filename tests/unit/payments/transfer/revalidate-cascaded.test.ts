@@ -556,5 +556,58 @@ describe('§6.1.1 revalidateCascadedChildren', () => {
       expect(h.scannerErrors[0]!.phase).toBe('find-children');
       expect(h.scannerErrors[0]!.tokenId).toBe(PARENT);
     });
+
+    // Round 7 fix (HIGH GAP): the scanner-error catch site must not
+    // log the raw `err` object via console.warn — a hostile scanner
+    // can plant sensitive bytes (e.g., signedTransferTxBytes) on the
+    // thrown Error and rely on `console.warn(..., err)` to leak them
+    // into operator log shippers. Sister to cascade-walker.ts (Round 5
+    // fix at lines ~603/981).
+    it('console.warn output does NOT include raw err properties (sensitive byte leak)', async () => {
+      const PARENT = 'p-scanner-err-leak';
+      const SECRET_HEX = 'deadbeefcafebabe1337b00b1eb000b5';
+      // Hostile scanner: throws an Error decorated with sensitive bytes.
+      const hostileScanner: import('../../../../modules/payments/transfer/cascade-walker').CascadeManifestScanner = {
+        async readEntry() {
+          return undefined;
+        },
+        async findChildren() {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const err: any = new Error('hostile scanner failure');
+          err.signedTransferTxBytes = SECRET_HEX;
+          err.privateKey = 'priv-' + SECRET_HEX;
+          throw err;
+        },
+      };
+      const h = buildRevalidatorHarness({
+        manifestScannerOverride: hostileScanner,
+      });
+      h.manifest.entries.set(`${ADDR}:${PARENT}`, manifestEntryFor({
+        status: 'valid',
+        rootHashHex: 'aa'.repeat(32),
+      }));
+      const warnSpy = vi
+        .spyOn(console, 'warn')
+        .mockImplementation(() => undefined);
+      const r = await h.runner.run(ADDR, PARENT);
+      // Capture all warn calls before restoring.
+      const allWarnArgs = warnSpy.mock.calls
+        .map((call) => call.map((a) => {
+          try {
+            return typeof a === 'string' ? a : JSON.stringify(a);
+          } catch {
+            return String(a);
+          }
+        }).join(' '))
+        .join('\n');
+      warnSpy.mockRestore();
+
+      expect(r.scannerErrors).toBe(1);
+      // CRITICAL: secret bytes MUST NOT appear in any warn argument.
+      expect(allWarnArgs).not.toContain(SECRET_HEX);
+      expect(allWarnArgs).not.toContain('priv-');
+      // The sanitized message string SHOULD be present.
+      expect(allWarnArgs).toContain('hostile scanner failure');
+    });
   });
 });
