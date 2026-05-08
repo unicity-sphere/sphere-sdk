@@ -126,10 +126,16 @@ export function makeFakeDispositionStorage(): FakeDispositionStorage {
     async writeRecord<T>(key: string, value: T): Promise<void> {
       entries.set(key, value);
     },
-    async listKeysWithPrefix(keyPrefix: string): Promise<ReadonlyArray<string>> {
+    async listKeysWithPrefix(
+      keyPrefix: string,
+      opts?: { readonly maxResults?: number },
+    ): Promise<ReadonlyArray<string>> {
+      const cap = opts?.maxResults ?? Number.POSITIVE_INFINITY;
       const out: string[] = [];
       for (const k of entries.keys()) {
-        if (k.startsWith(keyPrefix)) out.push(k);
+        if (!k.startsWith(keyPrefix)) continue;
+        out.push(k);
+        if (out.length >= cap) break;
       }
       return out;
     },

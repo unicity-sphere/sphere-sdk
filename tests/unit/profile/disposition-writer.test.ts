@@ -90,10 +90,16 @@ class FakePerEntryStorage implements DispositionPerEntryStorage {
     this.store.set(key, value);
   }
 
-  async listKeysWithPrefix(keyPrefix: string): Promise<ReadonlyArray<string>> {
+  async listKeysWithPrefix(
+    keyPrefix: string,
+    opts?: { readonly maxResults?: number },
+  ): Promise<ReadonlyArray<string>> {
+    const cap = opts?.maxResults ?? Number.POSITIVE_INFINITY;
     const out: string[] = [];
     for (const k of this.store.keys()) {
-      if (k.startsWith(keyPrefix)) out.push(k);
+      if (!k.startsWith(keyPrefix)) continue;
+      out.push(k);
+      if (out.length >= cap) break;
     }
     return out;
   }

@@ -97,10 +97,13 @@ function buildDispositionRecorder(): DispositionRecorder {
       writes.push({ key, value });
       storeEntries.set(key, value);
     },
-    async listKeysWithPrefix(keyPrefix) {
+    async listKeysWithPrefix(keyPrefix, opts) {
+      const cap = opts?.maxResults ?? Number.POSITIVE_INFINITY;
       const out: string[] = [];
       for (const k of storeEntries.keys()) {
-        if (k.startsWith(keyPrefix)) out.push(k);
+        if (!k.startsWith(keyPrefix)) continue;
+        out.push(k);
+        if (out.length >= cap) break;
       }
       return out;
     },

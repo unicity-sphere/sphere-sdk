@@ -190,6 +190,15 @@ export type {
   DispositionEventEmitter,
 } from './disposition-writer';
 
+export {
+  DEFAULT_LIST_KEYS_MAX_RESULTS,
+  InMemoryDispositionStorageAdapter,
+  OrbitDbDispositionStorageAdapter,
+} from './disposition-storage-adapters';
+export type {
+  OrbitDbDispositionStorageAdapterOptions,
+} from './disposition-storage-adapters';
+
 // =============================================================================
 // Shared Factory
 // =============================================================================

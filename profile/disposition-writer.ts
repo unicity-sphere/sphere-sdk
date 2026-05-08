@@ -107,11 +107,15 @@ export const MAX_AUDIT_BUNDLE_CIDS = 32;
  * Minimal abstraction over the per-entry-key writer/reader required by
  * {@link DispositionWriter} for `_invalid` and `_audit` records.
  *
- * The production implementation is the
- * {@link OrbitDbDispositionStorageAdapter} below, which wraps a
- * {@link ProfileDatabase} (the same OrbitDB key-value store the rest of
- * the profile system uses) and reuses the encryption helpers from
- * `profile/encryption.ts`.
+ * Production implementations live in
+ * `profile/disposition-storage-adapters.ts`:
+ *   - `OrbitDbDispositionStorageAdapter` wraps a `ProfileDatabase`
+ *     (the same OrbitDB key-value store the rest of the profile system
+ *     uses) and reuses the encryption helpers from
+ *     `profile/encryption.ts`.
+ *   - `InMemoryDispositionStorageAdapter` provides a pure-memory
+ *     implementation suitable for tests, CLI dev tools, and dev-mode
+ *     wallets that don't need OrbitDB persistence.
  *
  * Tests inject an in-memory implementation that bypasses encryption.
  */
@@ -132,6 +136,16 @@ export interface DispositionPerEntryStorage {
    * filtered out by the implementation so the importer / promoter sees
    * only live records.
    *
+   * **maxResults cap.** Callers SHOULD pass `opts.maxResults` to bound
+   * the enumeration. Implementations MUST honour the cap and stop
+   * scanning once `maxResults` keys have been collected. The cap
+   * defends against DoS scenarios where a hostile peer plants
+   * millions of crafted prefix matches — without the cap a single
+   * `_findInvalidEntry` call degrades into N sequential `readRecord`
+   * round-trips. When `maxResults` is omitted, implementations
+   * SHOULD impose a sane internal default (e.g. 1024) rather than
+   * scanning unbounded.
+   *
    * Used by the §6.3 stuck-PENDING importer to recover the
    * `_invalid` / `_audit` records keyed under
    * `${addr}.invalid.${tokenId}.${observedTokenContentHash}` /
@@ -141,7 +155,10 @@ export interface DispositionPerEntryStorage {
    * `_invalid`, so the importer cannot recover it from the manifest
    * cross-reference).
    */
-  listKeysWithPrefix(keyPrefix: string): Promise<ReadonlyArray<string>>;
+  listKeysWithPrefix(
+    keyPrefix: string,
+    opts?: { readonly maxResults?: number },
+  ): Promise<ReadonlyArray<string>>;
 }
 
 /**
