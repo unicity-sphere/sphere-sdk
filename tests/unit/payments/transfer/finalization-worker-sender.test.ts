@@ -826,6 +826,67 @@ describe('FinalizationWorkerSender — Round 5 FIX 4: start/stop/start lifecycle
     expect(h.worker.isRunning()).toBe(false);
     await expect(h.worker.stop()).resolves.toBeUndefined();
   });
+
+  // =============================================================================
+  // Round 7 FIX 2 — four-step race: start() → stop()(A) → start() → stop()(B)
+  // =============================================================================
+  //
+  // Pre-Round-7, the second `stop()` (call B) arriving while state is
+  // `'starting'` would fall through (its `'stopping' && stopInFlight`
+  // guard saw `'starting'`) and OVERWRITE state to `'stopping'` — silently
+  // dropping the third start()'s deferred restart, with no explicit
+  // signal of cancellation. With the explicit `restartPending` flag, the
+  // semantics are deterministic: the fourth stop CONSUMES the third
+  // start's restart intent. End state: idle.
+  it('start → stop(A) → start → stop(B): ends deterministically in idle', async () => {
+    const h = buildWorker();
+    expect(h.worker.isRunning()).toBe(false);
+
+    // 1. start() — running.
+    h.worker.start();
+    expect(h.worker.isRunning()).toBe(true);
+
+    // 2. stop()(A) — kick async, do not await.
+    const stopA = h.worker.stop();
+
+    // 3. start() — fires while A is in flight (state == 'stopping').
+    //    Sets restartPending = true, transitions to 'starting'.
+    h.worker.start();
+
+    // 4. stop()(B) — fires while state is 'starting'. MUST clear
+    //    restartPending so the deferred handler bails when A's
+    //    inflight resolves.
+    const stopB = h.worker.stop();
+
+    // Both stops complete.
+    await Promise.all([stopA, stopB]);
+    // Yield enough microtasks for the deferred .then() to fire (and
+    // bail because restartPending was cleared).
+    for (let i = 0; i < 32; i++) await Promise.resolve();
+
+    // CRITICAL invariant: the third start was canceled by the fourth
+    // stop. End state: idle.
+    expect(h.worker.isRunning()).toBe(false);
+  });
+
+  it('after the four-step race, a fifth start() succeeds', async () => {
+    const h = buildWorker();
+
+    h.worker.start();
+    const stopA = h.worker.stop();
+    h.worker.start();
+    const stopB = h.worker.stop();
+    await Promise.all([stopA, stopB]);
+    for (let i = 0; i < 32; i++) await Promise.resolve();
+    expect(h.worker.isRunning()).toBe(false);
+
+    // Fifth call — must resume cleanly from 'idle'.
+    h.worker.start();
+    expect(h.worker.isRunning()).toBe(true);
+
+    await h.worker.stop();
+    expect(h.worker.isRunning()).toBe(false);
+  });
 });
 
 // =============================================================================

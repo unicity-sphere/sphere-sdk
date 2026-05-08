@@ -1544,6 +1544,52 @@ describe('FinalizationWorkerRecipient — Round 5 FIX 4: start/stop/start lifecy
     expect(harness.worker.isRunning()).toBe(false);
     await expect(harness.worker.stop()).resolves.toBeUndefined();
   });
+
+  // =============================================================================
+  // Round 7 FIX 2 — four-step race: start() → stop()(A) → start() → stop()(B)
+  // =============================================================================
+  //
+  // Pre-Round-7, the second stop() (B) arriving while state is
+  // `'starting'` would fall through and silently overwrite state to
+  // `'stopping'`, dropping the third start()'s deferred restart with
+  // no explicit signal of cancellation. With the explicit
+  // `restartPending` flag, the fourth stop deterministically consumes
+  // the third start's restart intent. End state: idle. A subsequent
+  // fifth start() proceeds cleanly.
+  it('start → stop(A) → start → stop(B): ends deterministically in idle', async () => {
+    const harness = buildWorker({ sleepFn: async () => undefined });
+    expect(harness.worker.isRunning()).toBe(false);
+
+    harness.worker.start();
+    expect(harness.worker.isRunning()).toBe(true);
+
+    const stopA = harness.worker.stop();
+    harness.worker.start(); // restartPending = true; state = 'starting'
+    const stopB = harness.worker.stop(); // clears restartPending
+
+    await Promise.all([stopA, stopB]);
+    for (let i = 0; i < 32; i++) await Promise.resolve();
+
+    expect(harness.worker.isRunning()).toBe(false);
+  });
+
+  it('after the four-step race, a fifth start() succeeds', async () => {
+    const harness = buildWorker({ sleepFn: async () => undefined });
+
+    harness.worker.start();
+    const stopA = harness.worker.stop();
+    harness.worker.start();
+    const stopB = harness.worker.stop();
+    await Promise.all([stopA, stopB]);
+    for (let i = 0; i < 32; i++) await Promise.resolve();
+    expect(harness.worker.isRunning()).toBe(false);
+
+    harness.worker.start();
+    expect(harness.worker.isRunning()).toBe(true);
+
+    await harness.worker.stop();
+    expect(harness.worker.isRunning()).toBe(false);
+  });
 });
 
 // =============================================================================

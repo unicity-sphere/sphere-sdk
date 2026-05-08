@@ -543,6 +543,40 @@ export class FinalizationWorkerRecipient {
    */
   private stopInFlight: Promise<void> | null = null;
   /**
+   * Round 7 fix (HIGH NEW) — explicit "deferred restart pending" flag.
+   *
+   * Round 5 introduced the `'starting'` state for the
+   * `start() → stop()(A) → start()` case: the second `start()` chains
+   * a deferred `inflight.then(restart)` and marks state `'starting'`.
+   * Pre-Round-7, the deferred handler used `state === 'starting'` as
+   * its "should I actually restart?" signal — but a fourth call,
+   * `stop()(B)` arriving while state is `'starting'`, would fall
+   * through and OVERWRITE the state to `'stopping'` (since the
+   * `'stopping' && stopInFlight !== null` guard saw `'starting'`),
+   * silently destroying the third `start()`'s restart intent without
+   * any explicit signal of cancellation.
+   *
+   * This flag makes the cancellation explicit:
+   *
+   *   - `start()` during `'stopping'` sets `restartPending = true` and
+   *     transitions to `'starting'`, then chains a deferred
+   *     `inflight.then(restart)`.
+   *   - `stop()` ALWAYS clears `restartPending` at the top — any stop
+   *     supersedes any pending start intent.
+   *   - The deferred `inflight.then(restart)` checks `restartPending`
+   *     instead of state. If the flag has been cleared (by an
+   *     intervening `stop()`), the handler bails without restarting.
+   *
+   * The four-step sequence
+   * `start() → stop()(A) → start() → stop()(B)` now ends DETERMINISTI-
+   * CALLY in `'idle'`, with the third `start()`'s restart consumed
+   * by the fourth `stop()`. A subsequent fifth `start()` proceeds
+   * cleanly from `'idle'`.
+   *
+   * @internal
+   */
+  private restartPending = false;
+  /**
    * Steelman fix (CRIT #10): internal AbortController so `stop()` can
    * IMMEDIATELY abort an in-flight cycle (long aggregator hang, sleep
    * loop) without waiting for the natural completion. Pre-fix, `stop()`
@@ -759,8 +793,15 @@ export class FinalizationWorkerRecipient {
     // second `start()` observe `running === true` (because `stop()`
     // had set `stopRequested = true` but had not yet cleared
     // `running`) and silently no-op, leaving the worker dead.
-    if (this.lifecycleState === 'running' || this.lifecycleState === 'starting') {
+    if (this.lifecycleState === 'running') {
       return; // already started — preserve idempotent semantics
+    }
+    if (this.lifecycleState === 'starting') {
+      // Round 7 fix (HIGH NEW) — re-assert restart intent in case a
+      // prior `stop()` cleared `restartPending`. Idempotent for the
+      // common case (the flag was already true).
+      this.restartPending = true;
+      return;
     }
     if (this.lifecycleState === 'stopping') {
       // Concurrent stop in flight — chain a deferred restart that
@@ -772,11 +813,29 @@ export class FinalizationWorkerRecipient {
         // Mark as starting so a second concurrent start() coalesces
         // onto the same continuation (no double-start).
         this.lifecycleState = 'starting';
+        // Round 7 fix (HIGH NEW) — restartPending is the explicit
+        // signal a stop() must clear to cancel us. Using state alone
+        // (as Round 5 did) is racy: a `stop()` arriving while state
+        // is `'starting'` would overwrite to `'stopping'` (silently
+        // dropping the restart). The flag survives state transitions
+        // and is only cleared by a subsequent `stop()`.
+        this.restartPending = true;
         void inflight.then(() => {
-          // The stop has fully completed. If a stop() arrived while
-          // we were waiting, the latest desire wins — bail out.
+          // Round 7 fix (HIGH NEW) — check the explicit flag, NOT
+          // the state field. If a stop() cleared it, bail with no
+          // restart. Otherwise, transition to running.
+          if (!this.restartPending) {
+            // Stop superseded us. The stop's finally block
+            // transitions state to 'idle'; nothing for us to do.
+            return;
+          }
+          // Idempotent guard: another start could have observed
+          // 'starting' and re-asserted; we still proceed.
           if (this.lifecycleState !== 'starting') return;
+          // Reset to idle then re-enter start() for the actual
+          // controller rebuild + scanLoop kickoff.
           this.lifecycleState = 'idle';
+          this.restartPending = false;
           this.start();
         });
         return;
@@ -786,6 +845,7 @@ export class FinalizationWorkerRecipient {
       this.lifecycleState = 'idle';
     }
     this.lifecycleState = 'running';
+    this.restartPending = false;
     this.running = true;
     this.stopRequested = false;
     // Round 3 regression fix: rebuild the internal controller so
@@ -812,8 +872,38 @@ export class FinalizationWorkerRecipient {
    * the same internalController and need stop() to interrupt them.
    */
   async stop(): Promise<void> {
+    // Round 7 fix (HIGH NEW) — clear restartPending FIRST, before any
+    // state inspection. Any pending deferred-restart (from a prior
+    // `start()` during `'stopping'`) is now cancelled — when its
+    // `inflight.then(...)` fires it will read `restartPending=false`
+    // and bail. The semantics are: stop ALWAYS supersedes a pending
+    // restart intent.
+    this.restartPending = false;
     if (this.lifecycleState === 'stopping' && this.stopInFlight !== null) {
       // Coalesce onto in-flight stop.
+      await this.stopInFlight;
+      return;
+    }
+    // Round 7 fix (HIGH NEW) — `stop()` during `'starting'` (a
+    // deferred-restart is pending). We've already cleared
+    // `restartPending` above, so the deferred handler will bail
+    // when it fires. We still need to await the underlying
+    // stopInFlight (if any) so callers observe the same "stop has
+    // fully drained" semantics. Pre-Round-7 this branch fell
+    // through and overwrote the state to 'stopping' (silently
+    // discarding the existing inflight + the restart intent).
+    if (this.lifecycleState === 'starting' && this.stopInFlight !== null) {
+      // Always abort the internalController too (defense-in-depth —
+      // if a deferred restart somehow does fire, the rebuild on
+      // start() will replace this controller).
+      this.stopRequested = true;
+      if (!this.internalController.signal.aborted) {
+        this.internalController.abort();
+      }
+      // Transition to 'stopping' so subsequent stops coalesce, and
+      // so the underlying inflight's finally block (which guards on
+      // `state === 'stopping'`) lands us in 'idle'.
+      this.lifecycleState = 'stopping';
       await this.stopInFlight;
       return;
     }
