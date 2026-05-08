@@ -550,6 +550,7 @@ export class IngestWorkerPool {
       settled,
       resolveSettled,
       rejectSettled,
+      attempts: 0,
     };
 
     // Steelman fix #170 — increment per-token counters BEFORE pushing to
@@ -665,29 +666,122 @@ export class IngestWorkerPool {
         // and the queue is empty. Exit cleanly.
         return;
       }
+      // Steelman warning fix — per-bundle wall-clock budget. Wrap
+      // processBundle in a Promise.race against a setTimeout sentinel.
+      // On timeout, emit an operator alert and either re-enqueue ONCE
+      // or hard-fail (handled by `handleBundleTimeout`). The
+      // AbortController gives processToken hooks a way to cancel
+      // in-flight network calls / mutex acquires.
+      const abortController = new AbortController();
+      let timedOut = false;
+      const timeoutSentinel: Promise<'__timeout__'> = new Promise((resolve) => {
+        const t = setTimeout(() => {
+          timedOut = true;
+          abortController.abort();
+          resolve('__timeout__');
+        }, this.bundleMaxProcessingMs);
+        if (typeof (t as { unref?: () => void }).unref === 'function') {
+          (t as { unref: () => void }).unref();
+        }
+      });
       try {
-        await this.processBundle(entry, workerIndex);
-        entry.resolveSettled();
+        const winner = await Promise.race([
+          this.processBundle(entry, workerIndex, abortController.signal).then(
+            () => '__done__' as const,
+          ),
+          timeoutSentinel,
+        ]);
+        if (winner === '__timeout__') {
+          this.handleBundleTimeout(entry, workerIndex);
+        } else {
+          entry.resolveSettled();
+        }
       } catch (err) {
-        // processBundle is expected to swallow per-bundle errors via
-        // its own routing (W13 transient vs hard reject). If an error
-        // escapes, log it loudly — it's a programmer-error path.
-        // Steelman fix #170 — W40 alignment: redact bundleCid to first
-        // 16 hex chars in public log payloads.
-        this.logEmit('error', 'IngestWorkerPool: worker caught unexpected error', {
-          workerIndex,
-          bundleCidPrefix: redactBundleCid(entry.payload.bundleCid),
-          err: errorToShape(err),
-        });
-        // Resolve the caller's enqueue promise — the pool's contract
-        // is "we tried, the bundle was either processed or rejected
-        // for a known reason"; bubbling exceptions here would surprise
-        // callers who rely on enqueue() to never throw post-accept.
-        entry.resolveSettled();
+        if (timedOut) {
+          // Timeout already routed by handleBundleTimeout; the late
+          // throw from processBundle is suppressed.
+        } else {
+          // processBundle is expected to swallow per-bundle errors via
+          // its own routing (W13 transient vs hard reject). If an error
+          // escapes, log it loudly — it's a programmer-error path.
+          // Steelman fix #170 — W40 alignment: redact bundleCid to first
+          // 16 hex chars in public log payloads.
+          this.logEmit('error', 'IngestWorkerPool: worker caught unexpected error', {
+            workerIndex,
+            bundleCidPrefix: redactBundleCid(entry.payload.bundleCid),
+            err: errorToShape(err),
+          });
+          // Resolve the caller's enqueue promise — the pool's contract
+          // is "we tried, the bundle was either processed or rejected
+          // for a known reason"; bubbling exceptions here would surprise
+          // callers who rely on enqueue() to never throw post-accept.
+          entry.resolveSettled();
+        }
       } finally {
+        // ALWAYS decrement: this worker is releasing this entry. On a
+        // retry, handleBundleTimeout re-pushes the entry and
+        // re-increments the per-token counter — netting to zero across
+        // the (decrement + increment) pair, preserving cap accounting.
         this.decrementPerTokenCounters(entry.claimedTokenIds);
       }
     }
+  }
+
+  /**
+   * Steelman warning fix — per-bundle wall-clock timeout handler.
+   *
+   * Called by the worker loop when {@link bundleMaxProcessingMs}
+   * elapsed before `processBundle` resolved. First-attempt timeout:
+   * emit `transfer:operator-alert`, increment `attempts`, re-push the
+   * entry. Second-attempt timeout: emit a final operator alert and
+   * drop the bundle (caller's enqueue promise resolves cleanly per
+   * pool contract).
+   */
+  private handleBundleTimeout(entry: QueueEntry, workerIndex: number): void {
+    if (entry.attempts === 0) {
+      this.emit('transfer:operator-alert', {
+        code: 'structural',
+        bundleCid: entry.payload.bundleCid,
+        senderTransportPubkey: entry.senderTransportPubkey,
+        message:
+          `IngestWorkerPool.processBundle wall-clock budget ` +
+          `(${this.bundleMaxProcessingMs} ms) exceeded; bundle re-enqueued ` +
+          `for one retry attempt`,
+      });
+      this.logEmit('warn', 'IngestWorkerPool: bundle processing timeout — retrying', {
+        workerIndex,
+        bundleCidPrefix: redactBundleCid(entry.payload.bundleCid),
+        senderPubkeyPrefix: redactSenderPubkey(entry.senderTransportPubkey),
+        attempts: entry.attempts,
+        budgetMs: this.bundleMaxProcessingMs,
+      });
+      entry.attempts += 1;
+      // Re-increment counter for the retry (the worker's `finally`
+      // will decrement once, for the original attempt).
+      this.incrementPerTokenCounters(entry.claimedTokenIds);
+      this.queue.push(entry);
+      const waker = this.wakers.shift();
+      if (waker !== undefined) waker();
+      return;
+    }
+    // Second timeout — hard-fail.
+    this.emit('transfer:operator-alert', {
+      code: 'structural',
+      bundleCid: entry.payload.bundleCid,
+      senderTransportPubkey: entry.senderTransportPubkey,
+      message:
+        `IngestWorkerPool.processBundle wall-clock budget ` +
+        `(${this.bundleMaxProcessingMs} ms) exceeded a SECOND time; ` +
+        `bundle dropped (no disposition record written)`,
+    });
+    this.logEmit('error', 'IngestWorkerPool: bundle processing timeout — hard-fail', {
+      workerIndex,
+      bundleCidPrefix: redactBundleCid(entry.payload.bundleCid),
+      senderPubkeyPrefix: redactSenderPubkey(entry.senderTransportPubkey),
+      attempts: entry.attempts,
+      budgetMs: this.bundleMaxProcessingMs,
+    });
+    entry.resolveSettled();
   }
 
   /**
@@ -730,7 +824,17 @@ export class IngestWorkerPool {
    * per-token and logged; they DO NOT abort processing of the
    * remaining tokens in the same bundle.
    */
-  private async processBundle(entry: QueueEntry, workerIndex: number): Promise<void> {
+  private async processBundle(
+    entry: QueueEntry,
+    workerIndex: number,
+    // Per-bundle wall-clock budget abort signal. The pool's runWorker
+    // loop wraps processBundle in a Promise.race against a timeout
+    // sentinel; on timeout it aborts via this signal. processToken
+    // hooks that observe it can cancel in-flight async work; ones
+    // that don't will eventually resolve and have their late result
+    // suppressed by the runWorker's `timedOut` flag.
+    _abortSignal?: AbortSignal,
+  ): Promise<void> {
     let verified: VerifiedBundle | null = null;
     try {
       const acquired = await this.acquireBundleFn(
