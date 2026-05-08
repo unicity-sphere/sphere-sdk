@@ -101,6 +101,25 @@ const SEMAPHORE_RESET_ERROR_MESSAGE = 'semaphore reset for testing';
 class RejectableSemaphore implements Semaphore {
   private readonly inner: CountingSemaphore;
   private readonly pendingRejecters: Set<(err: Error) => void> = new Set();
+  /**
+   * Steelman fix (CRIT #9): track held (currently acquired but not yet
+   * released) permits so the LRU evictor can refuse to evict an entry
+   * with active in-flight cycles. Pre-fix, evicting an entry that still
+   * had held permits caused the next `getAggregatorSemaphore` call for
+   * the same canonical id to mint a FRESH semaphore — two semaphores for
+   * the same endpoint, total in-flight exceeded
+   * MAX_CONCURRENT_POLLS_PER_AGGREGATOR.
+   *
+   * Incremented when an `acquire()` resolves with a permit; decremented
+   * when the returned release closure runs. The wrapper's release
+   * closure is idempotent (CountingSemaphore guards against
+   * double-release) — we mirror that with a `released` flag here so
+   * heldPermits stays accurate even if the caller's release closure
+   * is invoked twice.
+   *
+   * @internal
+   */
+  private heldPermits = 0;
 
   constructor(maxConcurrent: number) {
     this.inner = new CountingSemaphore(maxConcurrent);
@@ -112,6 +131,17 @@ class RejectableSemaphore implements Semaphore {
    */
   get available(): number {
     return this.inner.available;
+  }
+
+  /**
+   * Number of permits currently held (acquired but not yet released).
+   * Used by the LRU evictor to refuse evicting an entry with active
+   * in-flight cycles. See {@link evictLruIfFull}.
+   *
+   * @internal
+   */
+  get held(): number {
+    return this.heldPermits;
   }
 
   /**
@@ -139,11 +169,19 @@ class RejectableSemaphore implements Semaphore {
     try {
       // Race the real acquire against the external rejector. Whichever
       // settles first wins; the loser's settlement is silently dropped.
-      const release = await Promise.race<() => void>([
+      const innerRelease = await Promise.race<() => void>([
         this.inner.acquire(),
         rejector,
       ]);
-      return release;
+      // Permit acquired — track it for the LRU evictor.
+      this.heldPermits++;
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        this.heldPermits = Math.max(0, this.heldPermits - 1);
+        innerRelease();
+      };
     } finally {
       // Always deregister the rejector — whether we obtained the
       // permit or were rejected. A still-registered rejector after
@@ -349,26 +387,59 @@ function touchLruKey(
  * its size cap. The first key in `Map`'s iteration order is the
  * oldest insertion that hasn't been touched since.
  *
+ * **Steelman fix (CRIT #9)**: skip entries with held permits.
+ * Pre-fix, evicting an entry whose permits were still held by ongoing
+ * cycles allowed the next `getAggregatorSemaphore` for the same
+ * canonical id to mint a FRESH 16-permit semaphore — total in-flight
+ * for the endpoint exceeded the W14 cap. The fix scans the registry
+ * in LRU order and skips any entry with `held > 0`. If ALL entries
+ * have held permits, throw a fatal error: the cap configuration is
+ * unsustainable, and silently exceeding it would void the W14
+ * invariant.
+ *
  * @internal
  */
 function evictLruIfFull(): void {
   while (aggregatorSemaphores.size >= REGISTRY_MAX_ENTRIES) {
-    const oldestKey = aggregatorSemaphores.keys().next().value;
-    if (oldestKey === undefined) break;
-    const evicted = aggregatorSemaphores.get(oldestKey);
-    aggregatorSemaphores.delete(oldestKey);
+    // Find the LRU-most entry that has NO held permits. Iterate in
+    // insertion order (Map preserves it) — the first viable eviction
+    // candidate is the lex-earliest LRU with held === 0.
+    let evictableKey: string | undefined;
+    let evictableSem: RejectableSemaphore | undefined;
+    for (const [key, sem] of aggregatorSemaphores) {
+      if (sem.held === 0) {
+        evictableKey = key;
+        evictableSem = sem;
+        break;
+      }
+    }
+    if (evictableKey === undefined || evictableSem === undefined) {
+      // Every entry has at least one held permit. Evicting any of them
+      // would let the next acquire mint a duplicate semaphore for that
+      // endpoint, breaking the W14 cap. This is a fatal misconfiguration:
+      // either REGISTRY_MAX_ENTRIES is too small for the deployment's
+      // aggregator cardinality, or callers are leaking permits without
+      // releasing them. The caller would see a silently-bypassed cap
+      // otherwise — fail loud instead.
+      throw new Error(
+        `aggregator-semaphore registry FULL (size=${aggregatorSemaphores.size}, ` +
+          `cap=${REGISTRY_MAX_ENTRIES}) and EVERY entry has held permits — ` +
+          'cannot evict without breaking the per-aggregator concurrency cap ' +
+          '(W14). Increase REGISTRY_MAX_ENTRIES or fix the permit-leak in the ' +
+          'finalization workers.',
+      );
+    }
+    aggregatorSemaphores.delete(evictableKey);
     // If the evicted semaphore had pending waiters, they are now
     // orphaned (registry no longer holds the wrapper). Reject them
     // so the awaiting callers don't dangle forever — same rationale
     // as the test-only reset hook, but for the production LRU path.
-    if (evicted !== undefined) {
-      evicted.rejectAllPending(
-        new Error(
-          'aggregator-semaphore evicted from registry (LRU); ' +
-            'caller should re-acquire',
-        ),
-      );
-    }
+    evictableSem.rejectAllPending(
+      new Error(
+        'aggregator-semaphore evicted from registry (LRU); ' +
+          'caller should re-acquire',
+      ),
+    );
   }
 }
 

@@ -97,6 +97,13 @@ function buildDispositionRecorder(): DispositionRecorder {
       writes.push({ key, value });
       storeEntries.set(key, value);
     },
+    async listKeysWithPrefix(keyPrefix) {
+      const out: string[] = [];
+      for (const k of storeEntries.keys()) {
+        if (k.startsWith(keyPrefix)) out.push(k);
+      }
+      return out;
+    },
   };
   // Minimal manifest store — tests never trigger an active-pool write
   // (writes are gated by a VALID/PENDING/CONFLICTING disposition,

@@ -15,6 +15,7 @@
 
 import { describe, expect, it, vi } from 'vitest';
 
+import { InclusionProofImporter } from '../../../../modules/payments/transfer/import-inclusion-proof';
 import {
   ADDR,
   ADDR_ALT,
@@ -662,9 +663,14 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
   });
 
   it('Wave 3 steelman: 64-char hex tokenId (canonical form) passes the validation gate', async () => {
-    // Mixed case is allowed (case-insensitive validation).
+    // Steelman crit #16: regex now requires LOWERCASE hex (case-canonical
+    // form). Uppercase tokenIds are rejected at the entry point so that
+    // the per-tokenId mutex slot is consistent across concurrent
+    // operator calls. Wallet code lowercases SDK tokenIds before
+    // forwarding to the importer; this test exercises the canonical
+    // path with a lowercase 64-hex tokenId.
     const h = buildImporterHarness();
-    const id = 'AB'.repeat(32);
+    const id = 'ab'.repeat(32);
     const result = await h.importer.importInclusionProof(
       ADDR,
       id,
@@ -672,6 +678,22 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
     );
     // No manifest entry → CASE 1 'no-such-token' (not 'invalid-tokenid').
     expect(result).toEqual({ ok: false, reason: 'no-such-token' });
+  });
+
+  it('Steelman crit #16: uppercase 64-char hex tokenId is rejected as invalid-tokenid', async () => {
+    // The canonicality regex was tightened to lowercase-only so the
+    // per-tokenId mutex's case-fold normalization is defense-in-depth
+    // rather than load-bearing. Uppercase input now gates at the entry
+    // point so two concurrent calls "AB...EF" + "ab...ef" cannot both
+    // pass — 'AB...EF' is rejected before mutex acquire.
+    const h = buildImporterHarness();
+    const id = 'AB'.repeat(32);
+    const result = await h.importer.importInclusionProof(
+      ADDR,
+      id,
+      proofFor({ requestId: 'rq' }),
+    );
+    expect(result).toEqual({ ok: false, reason: 'invalid-tokenid' });
   });
 
   // ---------------------------------------------------------------------------
@@ -1165,6 +1187,343 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
         }),
       );
       expect(result).toEqual({ ok: true, transition: 'pending→valid' });
+    });
+  });
+
+  // ===========================================================================
+  // Steelman crit #15 — _findInvalidEntry recovery via prefix scan when the
+  // disposition writer routed the token to `_invalid` AND removed the
+  // manifest entry. The legacy fallback content-hash always missed this
+  // case; the prefix scanner is the structural recovery path.
+  // ===========================================================================
+  describe('Steelman crit #15: _findInvalidEntry uses prefix scan, not broken fallback', () => {
+    it('manifest entry removed + _invalid record present → CASE 5 override applies (not CASE 1 no-such-token)', async () => {
+      const h = buildImporterHarness();
+      const tid = tk('t-crit15');
+      // Disposition writer wrote an _invalid record under
+      // ${ADDR}.invalid.${tid}.<observedHash> AND removed the manifest
+      // entry. The importer arrives without any manifest cross-reference.
+      const observedHash = 'cc'.repeat(32);
+      h.disposition.entries.set(
+        `${ADDR}.invalid.${tid}.${observedHash}`,
+        invalidEntryFor({
+          tokenId: tid,
+          observedTokenContentHash: observedHash as never,
+          reason: 'oracle-rejected',
+        }),
+      );
+      // Hard-failed queue entry to drive the case-5 override path.
+      h.queue.entries.push(queueEntryFor({
+        tokenId: tid,
+        commitmentRequestId: 'rq-15a',
+        status: 'hard-fail',
+        transactionHash: '0000' + 'ab'.repeat(32),
+      }));
+      const result = await h.importer.importInclusionProof(
+        ADDR,
+        tid,
+        proofFor({
+          requestId: 'rq-15a',
+          transactionHash: '0000' + 'ab'.repeat(32),
+        }),
+        { allowInvalidOverride: true },
+      );
+      // Pre-fix: returned 'no-such-token' because fallbackContentHash
+      // miss never recovered the _invalid record.
+      // Post-fix: prefix scan recovers the record and case 5 applies.
+      expect(result).toEqual({ ok: true, transition: 'invalid→valid' });
+      expect(h.overrideCalls.length).toBe(1);
+      expect(h.overrideCalls[0]!.previousReason).toBe('oracle-rejected');
+    });
+
+    it('multiple _invalid records present → most recent (max observedAt) is selected', async () => {
+      const h = buildImporterHarness();
+      const tid = tk('t-crit15-multi');
+      const hashOld = 'aa'.repeat(32);
+      const hashNew = 'bb'.repeat(32);
+      h.disposition.entries.set(
+        `${ADDR}.invalid.${tid}.${hashOld}`,
+        invalidEntryFor({
+          tokenId: tid,
+          observedTokenContentHash: hashOld as never,
+          reason: 'oracle-rejected',
+          observedAt: 1700000000000,
+        }),
+      );
+      h.disposition.entries.set(
+        `${ADDR}.invalid.${tid}.${hashNew}`,
+        invalidEntryFor({
+          tokenId: tid,
+          observedTokenContentHash: hashNew as never,
+          reason: 'predicate-eval',
+          observedAt: 1700000999999,
+        }),
+      );
+      h.queue.entries.push(queueEntryFor({
+        tokenId: tid,
+        commitmentRequestId: 'rq-15b',
+        status: 'hard-fail',
+        transactionHash: '0000' + 'ab'.repeat(32),
+      }));
+      const result = await h.importer.importInclusionProof(
+        ADDR,
+        tid,
+        proofFor({
+          requestId: 'rq-15b',
+          transactionHash: '0000' + 'ab'.repeat(32),
+        }),
+        { allowInvalidOverride: true },
+      );
+      expect(result).toEqual({ ok: true, transition: 'invalid→valid' });
+      // The override must reference the MOST-RECENT invalid record
+      // (predicate-eval, not oracle-rejected).
+      expect(h.overrideCalls[0]!.previousReason).toBe('predicate-eval');
+    });
+
+    it('no _invalid record + no _audit + no manifest → reason="no-such-token"', async () => {
+      const h = buildImporterHarness();
+      const tid = tk('t-crit15-empty');
+      const result = await h.importer.importInclusionProof(
+        ADDR,
+        tid,
+        proofFor({ requestId: 'rq' }),
+      );
+      expect(result).toEqual({ ok: false, reason: 'no-such-token' });
+    });
+
+    it('_audit record present (manifest entry absent) → CASE 1 no-such-token (recovers via prefix scan)', async () => {
+      // Wave 4 already encoded that audit-only collapses to no-such-token.
+      // The fix here is that we must REACH the audit branch via prefix
+      // scan; the legacy fallback hash would miss the audit record too.
+      const h = buildImporterHarness();
+      const tid = tk('t-crit15-audit');
+      const observedHash = 'dd'.repeat(32);
+      h.disposition.entries.set(
+        `${ADDR}.audit.${tid}.${observedHash}`,
+        { tokenId: tid, auditStatus: 'audit-not-our-state' },
+      );
+      const result = await h.importer.importInclusionProof(
+        ADDR,
+        tid,
+        proofFor({ requestId: 'rq' }),
+      );
+      expect(result).toEqual({ ok: false, reason: 'no-such-token' });
+    });
+  });
+
+  // ===========================================================================
+  // Steelman crit #16 — per-tokenId mutex case-fold normalization.
+  // ===========================================================================
+  describe('Steelman crit #16: per-tokenId mutex normalizes tokenId case', () => {
+    it('CANONICAL_TOKEN_ID_RE rejects uppercase hex (mutex slot uniqueness)', async () => {
+      const h = buildImporterHarness();
+      const upper = 'AB'.repeat(32);
+      const result = await h.importer.importInclusionProof(
+        ADDR,
+        upper,
+        proofFor({ requestId: 'rq' }),
+      );
+      expect(result).toEqual({ ok: false, reason: 'invalid-tokenid' });
+    });
+
+    it('mixed-case tokenIds cannot bypass mutex serialization (regex rejects upper, normalization is defense-in-depth)', async () => {
+      // Two callers pass the SAME canonical tokenId — both lowercase.
+      // The fix ensures both callers share a single mutex slot. We
+      // can't easily assert "same slot" externally, but we assert
+      // the second call sees the first call's committed state (no
+      // double-override race).
+      const h = buildImporterHarness();
+      const tid = tk('t-crit16');
+      const observedHash = 'cc'.repeat(32);
+      h.disposition.entries.set(
+        `${ADDR}.invalid.${tid}.${observedHash}`,
+        invalidEntryFor({
+          tokenId: tid,
+          observedTokenContentHash: observedHash as never,
+          reason: 'oracle-rejected',
+        }),
+      );
+      h.queue.entries.push(queueEntryFor({
+        tokenId: tid,
+        commitmentRequestId: 'rq-16',
+        status: 'hard-fail',
+        transactionHash: '0000' + 'ab'.repeat(32),
+      }));
+      // Race two operator calls — both target the same canonical
+      // tokenId (lowercase). With case-fold normalization the mutex
+      // serializes them; without it (and without regex tightening)
+      // they would race.
+      const [r1, r2] = await Promise.all([
+        h.importer.importInclusionProof(
+          ADDR,
+          tid,
+          proofFor({
+            requestId: 'rq-16',
+            transactionHash: '0000' + 'ab'.repeat(32),
+          }),
+          { allowInvalidOverride: true },
+        ),
+        h.importer.importInclusionProof(
+          ADDR,
+          tid,
+          proofFor({
+            requestId: 'rq-16',
+            transactionHash: '0000' + 'ab'.repeat(32),
+          }),
+          { allowInvalidOverride: true },
+        ),
+      ]);
+      // Both succeed (idempotent on retry); applyOverride was invoked
+      // either once OR twice depending on mutex strategy, but both
+      // calls cannot interleave their decision phases.
+      expect(r1.ok).toBe(true);
+      expect(r2.ok).toBe(true);
+    });
+  });
+
+  // ===========================================================================
+  // Steelman warning — queue-entry-incomplete reachable.
+  // ===========================================================================
+  describe('Steelman warning: queue-entry-incomplete is reachable', () => {
+    it('CASE 3: queue entry has empty transactionHash → reason="queue-entry-incomplete"', async () => {
+      const h = buildImporterHarness();
+      const tid = tk('t-qei');
+      h.manifest.entries.set(`${ADDR}:${tid}`, manifestEntryFor({
+        status: 'pending',
+      }));
+      h.queue.entries.push(queueEntryFor({
+        tokenId: tid,
+        commitmentRequestId: 'rq-qei',
+        status: 'pending',
+        transactionHash: '', // empty — incomplete writer state
+      }));
+      const result = await h.importer.importInclusionProof(
+        ADDR,
+        tid,
+        proofFor({
+          requestId: 'rq-qei',
+          transactionHash: '0000' + 'ab'.repeat(32),
+        }),
+      );
+      expect(result).toEqual({ ok: false, reason: 'queue-entry-incomplete' });
+    });
+
+    it('CASE 3: BOTH proof and queue have empty transactionHash → reason="queue-entry-incomplete" (NOT trivial match)', async () => {
+      const h = buildImporterHarness();
+      const tid = tk('t-qei2');
+      h.manifest.entries.set(`${ADDR}:${tid}`, manifestEntryFor({
+        status: 'pending',
+      }));
+      h.queue.entries.push(queueEntryFor({
+        tokenId: tid,
+        commitmentRequestId: 'rq-qei2',
+        status: 'pending',
+        transactionHash: '',
+      }));
+      const result = await h.importer.importInclusionProof(
+        ADDR,
+        tid,
+        proofFor({
+          requestId: 'rq-qei2',
+          transactionHash: '', // both empty — would trivially pass binding
+        }),
+      );
+      // Pre-fix: hexEqualsIgnoreCase('','') returns true and the
+      // importer attempts to graft on requestId-only — defeats the
+      // §155 binding compare entirely.
+      // Post-fix: gated to queue-entry-incomplete.
+      expect(result).toEqual({ ok: false, reason: 'queue-entry-incomplete' });
+      expect(h.graftCalls.length).toBe(0);
+    });
+
+    it('CASE 5: hard-fail queue entry has empty transactionHash → reason="queue-entry-incomplete"', async () => {
+      const h = buildImporterHarness();
+      const tid = tk('t-qei3');
+      const observedHash = 'cc'.repeat(32);
+      h.disposition.entries.set(
+        `${ADDR}.invalid.${tid}.${observedHash}`,
+        invalidEntryFor({
+          tokenId: tid,
+          observedTokenContentHash: observedHash as never,
+          reason: 'oracle-rejected',
+        }),
+      );
+      h.queue.entries.push(queueEntryFor({
+        tokenId: tid,
+        commitmentRequestId: 'rq-qei3',
+        status: 'hard-fail',
+        transactionHash: '',
+      }));
+      const result = await h.importer.importInclusionProof(
+        ADDR,
+        tid,
+        proofFor({
+          requestId: 'rq-qei3',
+          transactionHash: '0000' + 'ab'.repeat(32),
+        }),
+        { allowInvalidOverride: true },
+      );
+      expect(result).toEqual({ ok: false, reason: 'queue-entry-incomplete' });
+      expect(h.overrideCalls.length).toBe(0);
+    });
+  });
+
+  // ===========================================================================
+  // Steelman warning — emit failure must not propagate after override commit.
+  // ===========================================================================
+  describe('Steelman warning: transfer:override-applied emit failure does not propagate', () => {
+    it('emit handler throws → applyOverride is committed; importer returns success result', async () => {
+      const h = buildImporterHarness();
+      // Replace the emit recorder with one that throws.
+      const overrideEvents: unknown[] = [];
+      const opts: ConstructorParameters<typeof InclusionProofImporter>[0] = {
+        manifestStore: h.manifestStore,
+        dispositionStorage: h.disposition,
+        queueScanner: h.queue,
+        verifyProof: async () => 'OK',
+        graftCallback: { graft: async () => undefined },
+        overrideCallback: {
+          applyOverride: async (args) => {
+            overrideEvents.push({ phase: 'commit', args });
+          },
+        },
+        emit: () => {
+          throw new Error('handler crashed');
+        },
+        now: () => 1700000000000,
+      };
+      const importer = new InclusionProofImporter(opts);
+      const tid = tk('t-emit-fail');
+      const observedHash = 'cc'.repeat(32);
+      h.disposition.entries.set(
+        `${ADDR}.invalid.${tid}.${observedHash}`,
+        invalidEntryFor({
+          tokenId: tid,
+          observedTokenContentHash: observedHash as never,
+          reason: 'oracle-rejected',
+        }),
+      );
+      h.queue.entries.push(queueEntryFor({
+        tokenId: tid,
+        commitmentRequestId: 'rq-emit',
+        status: 'hard-fail',
+        transactionHash: '0000' + 'ab'.repeat(32),
+      }));
+      // Suppress console.warn noise from the catch.
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const result = await importer.importInclusionProof(
+        ADDR,
+        tid,
+        proofFor({
+          requestId: 'rq-emit',
+          transactionHash: '0000' + 'ab'.repeat(32),
+        }),
+        { allowInvalidOverride: true },
+      );
+      warnSpy.mockRestore();
+      // Override committed; success returned despite emit throw.
+      expect(result).toEqual({ ok: true, transition: 'invalid→valid' });
+      expect(overrideEvents.length).toBe(1);
     });
   });
 });

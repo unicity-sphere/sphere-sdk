@@ -123,6 +123,25 @@ export interface DispositionPerEntryStorage {
    *  same value twice is a no-op apart from any per-write side effects
    *  in the storage backend (e.g. OpLog growth). */
   writeRecord<T>(key: string, value: T): Promise<void>;
+  /**
+   * Enumerate every key whose stored prefix begins with `keyPrefix`.
+   *
+   * Implementations MUST return a snapshot (changes after the call
+   * began MAY or MAY NOT appear). Order is implementation-defined; the
+   * caller sorts when determinism is required. Tombstoned keys MUST be
+   * filtered out by the implementation so the importer / promoter sees
+   * only live records.
+   *
+   * Used by the §6.3 stuck-PENDING importer to recover the
+   * `_invalid` / `_audit` records keyed under
+   * `${addr}.invalid.${tokenId}.${observedTokenContentHash}` /
+   * `${addr}.audit.${tokenId}.${observedTokenContentHash}` when the
+   * importer arrives without the observedTokenContentHash
+   * disambiguator (the manifest entry was deleted on routing to
+   * `_invalid`, so the importer cannot recover it from the manifest
+   * cross-reference).
+   */
+  listKeysWithPrefix(keyPrefix: string): Promise<ReadonlyArray<string>>;
 }
 
 /**

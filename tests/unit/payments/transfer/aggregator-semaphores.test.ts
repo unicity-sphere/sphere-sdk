@@ -523,3 +523,122 @@ describe('aggregator-semaphores — Wave 3 reset rejects pending waiters', () =>
     expect(__aggregatorSemaphoreRegistrySizeForTesting()).toBe(0);
   });
 });
+
+// =============================================================================
+// CRIT #9 — LRU eviction respects held permits
+// =============================================================================
+//
+// Pre-fix: evictLruIfFull picked the lex-earliest LRU entry without
+// inspecting whether its permits were currently held. Evicting an entry
+// with held permits caused the next getAggregatorSemaphore() call for the
+// same canonical id to mint a FRESH 16-permit semaphore — total
+// in-flight for that endpoint exceeded MAX_CONCURRENT_POLLS_PER_AGGREGATOR.
+//
+// The fix scans in LRU order and skips any entry with `held > 0`. If
+// every entry has held permits AND we're at the cap, throw a fatal
+// error: silently bypassing W14 is worse than a loud crash.
+
+describe('aggregator-semaphores — CRIT #9 LRU eviction respects held permits', () => {
+  beforeEach(() => {
+    __resetAggregatorSemaphoresForTesting();
+  });
+
+  it('LRU eviction skips entries with held permits', async () => {
+    const cap = 32;
+    // Insert 32 entries, all permit-free (no acquires).
+    for (let i = 0; i < cap; i++) {
+      getAggregatorSemaphore(`https://agg-${i}.example/`);
+    }
+    expect(__aggregatorSemaphoreRegistrySizeForTesting()).toBe(cap);
+
+    // Hold one permit on the LRU-most entry (agg-0). It is now NON-evictable.
+    const lruSem = getAggregatorSemaphore('https://agg-0.example/');
+    // ^^ Touching agg-0 moves it to MRU. To exercise "LRU has held
+    // permit" we restart and re-insert without touching.
+    __resetAggregatorSemaphoresForTesting();
+    for (let i = 0; i < cap; i++) {
+      getAggregatorSemaphore(`https://agg-${i}.example/`);
+    }
+    // Now hold a permit on a non-LRU entry (agg-5) to test that an
+    // arbitrary held-permits entry is skipped.
+    const heldSem = getAggregatorSemaphore('https://agg-5.example/');
+    // Touching agg-5 moves it to MRU. We want it to NOT be MRU.
+    __resetAggregatorSemaphoresForTesting();
+    for (let i = 0; i < cap; i++) {
+      getAggregatorSemaphore(`https://agg-${i}.example/`);
+    }
+    // Hold a permit on agg-0 (the LRU). Once held, it MUST NOT be evicted.
+    const sem0 = getAggregatorSemaphore('https://agg-0.example/');
+    // After this getAggregatorSemaphore call, agg-0 is touched to MRU.
+    // Re-insert so agg-0 is again LRU.
+    __resetAggregatorSemaphoresForTesting();
+    const heldFirst = getAggregatorSemaphore('https://agg-0.example/');
+    const release = await heldFirst.acquire();
+    // Fill the rest of the registry without touching agg-0 again. Each
+    // new entry pushes agg-0 further toward LRU.
+    for (let i = 1; i < cap; i++) {
+      getAggregatorSemaphore(`https://agg-${i}.example/`);
+    }
+    expect(__aggregatorSemaphoreRegistrySizeForTesting()).toBe(cap);
+
+    // Push a new entry — eviction MUST skip agg-0 (held permit) and pick
+    // the next-LRU (agg-1).
+    getAggregatorSemaphore('https://agg-newest.example/');
+    expect(__aggregatorSemaphoreRegistrySizeForTesting()).toBe(cap);
+
+    // agg-0's semaphore identity preserved across the eviction wave.
+    const stillHeld = getAggregatorSemaphore('https://agg-0.example/');
+    expect(stillHeld).toBe(heldFirst);
+
+    // agg-1 was evicted (no permit held); re-fetch yields a fresh instance.
+    // (We can't directly compare against the original since we never
+    // captured it.)
+    expect(__aggregatorSemaphoreRegistrySizeForTesting()).toBe(cap);
+
+    release();
+    void lruSem;
+    void heldSem;
+    void sem0;
+  });
+
+  it('evictLruIfFull throws if every entry has held permits', async () => {
+    const cap = 32;
+    // Fill the registry AND hold one permit on every entry.
+    const releases: Array<() => void> = [];
+    for (let i = 0; i < cap; i++) {
+      const sem = getAggregatorSemaphore(`https://agg-held-${i}.example/`);
+      releases.push(await sem.acquire());
+    }
+    expect(__aggregatorSemaphoreRegistrySizeForTesting()).toBe(cap);
+
+    // Adding a NEW entry MUST throw (cannot evict any holder).
+    expect(() =>
+      getAggregatorSemaphore('https://agg-overflow.example/'),
+    ).toThrow(/registry FULL/);
+
+    // Cleanup.
+    for (const r of releases) r();
+  });
+
+  it('held permits decrement on release and entry becomes evictable', async () => {
+    const cap = 32;
+    const sem0 = getAggregatorSemaphore('https://agg-evictable-0.example/');
+    const release = await sem0.acquire();
+    for (let i = 1; i < cap; i++) {
+      getAggregatorSemaphore(`https://agg-evictable-${i}.example/`);
+    }
+    expect(__aggregatorSemaphoreRegistrySizeForTesting()).toBe(cap);
+
+    // Release the held permit on agg-0; it is now evictable.
+    release();
+
+    // Eviction can now pick agg-0 (the LRU) since no permits held.
+    getAggregatorSemaphore('https://agg-evictable-newest.example/');
+    expect(__aggregatorSemaphoreRegistrySizeForTesting()).toBe(cap);
+
+    // Re-fetching agg-0 yields a fresh instance (the previous one was
+    // evicted now that its hold was released).
+    const sem0Again = getAggregatorSemaphore('https://agg-evictable-0.example/');
+    expect(sem0Again).not.toBe(sem0);
+  });
+});

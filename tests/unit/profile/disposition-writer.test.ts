@@ -89,6 +89,14 @@ class FakePerEntryStorage implements DispositionPerEntryStorage {
     }
     this.store.set(key, value);
   }
+
+  async listKeysWithPrefix(keyPrefix: string): Promise<ReadonlyArray<string>> {
+    const out: string[] = [];
+    for (const k of this.store.keys()) {
+      if (k.startsWith(keyPrefix)) out.push(k);
+    }
+    return out;
+  }
 }
 
 class FakeManifestStorage implements MinimalManifestStorage {

@@ -64,13 +64,10 @@
  * @packageDocumentation
  */
 
-import type { ContentHash } from '../../../uxf/types';
-import { contentHash } from '../../../uxf/types';
 import type {
   DispositionReason,
 } from '../../../types/disposition';
 import type {
-  AuditEntry,
   InvalidEntry,
 } from '../../../types/disposition';
 import type {
@@ -80,8 +77,6 @@ import type {
 import type { TokenManifestEntry } from '../../../profile/token-manifest';
 import type { ManifestStore } from '../../../profile/manifest-store';
 import {
-  auditKeyFor,
-  invalidKeyFor,
   type DispositionPerEntryStorage,
 } from '../../../profile/disposition-writer';
 import {
@@ -462,14 +457,27 @@ export interface ImportInclusionProofCallOptions {
 
 /**
  * Canonical lowercase 64-char-hex regex for a tokenId — the spec form
- * (BYTE_FIELDS) all wallet code paths produce. Used at the importer entry
- * point to reject malformed operator input (steelman finding, Wave 3).
+ * (BYTE_FIELDS) all wallet code paths produce.
  *
- * Why both cases match: the importer also accepts upper-case hex (case-
- * insensitive comparison everywhere downstream — see `hexEqualsIgnoreCase`),
- * so the entry-point check is permissive on case but strict on shape.
+ * **Case-canonicality** (steelman crit #16). The importer keys its
+ * per-tokenId mutex on the tokenId; if two operator calls arrive with
+ * different cases (e.g. `'AB...'` vs `'ab...'`) but the regex is
+ * case-insensitive, they would acquire SEPARATE mutex slots and race
+ * past the read-decide-write serialization promise. Two solutions are
+ * applied together (defense-in-depth):
+ *   1. The shape regex requires LOWERCASE hex — uppercase tokenIds are
+ *      rejected at the entry point with `'invalid-tokenid'`. Wallet code
+ *      lowercases SDK tokenIds before passing them to the importer
+ *      (see PaymentsModule wiring); operator scripts that paste raw
+ *      input get a clear shape error.
+ *   2. The importer ALSO lowercase-normalizes the tokenId before every
+ *      Map / mutex / storage operation as a defense-in-depth layer
+ *      (see `_importInclusionProofUnderMutex`).
+ *
+ * Used at the importer entry point to reject malformed operator input
+ * (steelman finding, Wave 3 + #16).
  */
-const CANONICAL_TOKEN_ID_RE = /^[0-9a-f]{64}$/i;
+const CANONICAL_TOKEN_ID_RE = /^[0-9a-f]{64}$/;
 
 // =============================================================================
 // 4. InclusionProofImporter
@@ -538,6 +546,15 @@ export class InclusionProofImporter {
     if (typeof tokenId !== 'string' || !CANONICAL_TOKEN_ID_RE.test(tokenId)) {
       return { ok: false, reason: 'invalid-tokenid' };
     }
+    // (Steelman crit #16) Lowercase-normalize the tokenId BEFORE every
+    // Map / mutex / storage operation. Defense-in-depth even though
+    // CANONICAL_TOKEN_ID_RE is now strict-lowercase: if a future caller
+    // path sneaks an uppercase tokenId past the regex (regression), the
+    // normalization here keeps the per-tokenId mutex slot consistent.
+    // Two concurrent calls "AB...EF" + "ab...ef" would otherwise acquire
+    // SEPARATE mutex slots and race past the read-decide-write
+    // serialization promise.
+    const normalizedTokenId = tokenId.toLowerCase();
     // T.5.D steelman post-cutover (#153): serialize the entire
     // read-decide-write sequence under the per-tokenId mutex. Without
     // this, two concurrent operator overrides on the same tokenId
@@ -548,8 +565,14 @@ export class InclusionProofImporter {
     // is opt-in for callers who coordinate exclusion at a higher
     // layer.
     return this.perTokenMutex.acquire(
-      tokenId,
-      () => this._importInclusionProofUnderMutex(addr, tokenId, proof, callOptions),
+      normalizedTokenId,
+      () =>
+        this._importInclusionProofUnderMutex(
+          addr,
+          normalizedTokenId,
+          proof,
+          callOptions,
+        ),
       { strategy: this.perTokenMutexStrategy },
     );
   }
@@ -735,6 +758,32 @@ export class InclusionProofImporter {
     // double-graft.
     const target = matching[0]!;
 
+    // (Steelman warning) Empty / missing `transactionHash` on EITHER
+    // side gates the §155 binding compare. Without this guard, two
+    // dead branches collapse the binding decision into a security hole:
+    //   1. `target.transactionHash === ''` AND `proof.transactionHash`
+    //      non-empty → `hexEqualsIgnoreCase` length-mismatches and
+    //      returns false → routed to `'proof-binding-mismatch'` —
+    //      misleading because the queue entry is structurally
+    //      incomplete (writer bug), not a binding mismatch.
+    //   2. BOTH `target.transactionHash === ''` AND
+    //      `proof.transactionHash === ''` → `hexEqualsIgnoreCase('','')`
+    //      trivially passes the length and content checks, the
+    //      binding compare succeeds with no actual transaction-hash
+    //      bound, and the importer grafts on the requestId-only —
+    //      exactly the §6.3 attack the binding compare exists to
+    //      defeat. Surfacing `'queue-entry-incomplete'` routes the
+    //      operator to manual triage and unblocks the dead enum
+    //      branch declared in the result type.
+    if (
+      typeof target.transactionHash !== 'string' ||
+      target.transactionHash.length === 0 ||
+      typeof proof.transactionHash !== 'string' ||
+      proof.transactionHash.length === 0
+    ) {
+      return { ok: false, reason: 'queue-entry-incomplete' };
+    }
+
     // (#155) Bind the proof to the queue entry's full triple
     // (transactionHash + authenticator), not just the requestId. The
     // §6.3 most-recent-proof / single-spend forbidden-case checks
@@ -883,6 +932,21 @@ export class InclusionProofImporter {
 
     const resolvingEntry = matching[0]!;
 
+    // (Steelman warning) Same dead-branch guard as the pending path —
+    // see `_handlePendingPath`. Empty `transactionHash` on either side
+    // collapses the binding compare into a trivial pass (both empty
+    // → `hexEqualsIgnoreCase('','')` returns true) which is the §6.3
+    // attack the binding compare exists to defeat. Surface
+    // `'queue-entry-incomplete'` for either side missing.
+    if (
+      typeof resolvingEntry.transactionHash !== 'string' ||
+      resolvingEntry.transactionHash.length === 0 ||
+      typeof proof.transactionHash !== 'string' ||
+      proof.transactionHash.length === 0
+    ) {
+      return { ok: false, reason: 'queue-entry-incomplete' };
+    }
+
     // (#155) Bind the proof to the queue entry's full triple
     // (transactionHash + authenticator), not just the requestId. Per
     // §6.3 the most-recent-proof / single-spend forbidden-case checks
@@ -934,13 +998,38 @@ export class InclusionProofImporter {
 
     // Emit the audit event AFTER applyOverride so a callback failure
     // does NOT generate a misleading event.
-    this.opts.emit('transfer:override-applied', {
-      tokenId,
-      overrideAppliedAt: args.now,
-      overrideAppliedBy: args.operatorPubkey,
-      previousReason: invalidEntry.reason,
-      transition,
-    });
+    //
+    // (Steelman warning) Wrap emit in try/catch — the override IS
+    // committed (applyOverride wrote `overrideAppliedBy` /
+    // `overrideAppliedAt` to the manifest), `previousInvalidEntry` is
+    // on-disk; the event emission is best-effort telemetry, NOT a
+    // commit barrier. A misbehaving handler that throws here would
+    // otherwise propagate the throw back to the operator caller —
+    // and the caller, seeing the throw, would assume the override
+    // was NOT applied. The next retry on a non-idempotent override
+    // path could then double-apply or skew the audit pair. Logging
+    // the emit failure preserves observability without coupling the
+    // commit to handler reliability.
+    try {
+      this.opts.emit('transfer:override-applied', {
+        tokenId,
+        overrideAppliedAt: args.now,
+        overrideAppliedBy: args.operatorPubkey,
+        previousReason: invalidEntry.reason,
+        transition,
+      });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      try {
+        console.warn(
+          '[import-inclusion-proof] transfer:override-applied emit failed',
+          { tokenId, transition },
+          err,
+        );
+      } catch {
+        // ignore logging failures
+      }
+    }
 
     return { ok: true, transition };
   }
@@ -954,11 +1043,28 @@ export class InclusionProofImporter {
    *
    * Find the `_invalid` record for `(addr, tokenId)`. The per-entry
    * key includes the `observedTokenContentHash` disambiguator, so a
-   * tokenId may have multiple records; we scan via prefix and return
-   * the FIRST hit (the operator's `importInclusionProof` is keyed on
-   * tokenId alone — multiple `_invalid` records for the same tokenId
-   * are forensic evidence, but the override applies to the canonical
-   * tokenId, not to a specific observed-content-hash).
+   * tokenId may have multiple records; we use the storage's prefix
+   * scanner to enumerate every record under
+   * `${addr}.invalid.${tokenId}.` and return the most recent (max
+   * `observedAt`) so the override applies against the freshest
+   * forensic record.
+   *
+   * Why prefix scan (steelman crit #15). The legacy implementation
+   * relied on the manifest entry's `rootHash` as the disambiguator,
+   * falling back to a sentinel content hash when no manifest entry
+   * was available. But the disposition writer routes hard-failed
+   * tokens to `_invalid` AND removes their manifest entries — so the
+   * importer's case 1 path enters here with `manifestEntry ===
+   * undefined`. The fallback hash (`contentHash(tokenId.toLowerCase())`)
+   * is a different SHA-256 than the disposition writer's element-hash
+   * key suffix, so the probe always missed. Case 1 collapsed
+   * "token-bound-to-_invalid" into "no-such-token" — the operator
+   * lost the override path entirely.
+   *
+   * The prefix scanner is the structural fix: enumerate every
+   * `_invalid` record under the canonical prefix and pick the
+   * authoritative one regardless of the observed-content-hash the
+   * importer arrived with.
    *
    * Returns `null` when no record exists.
    */
@@ -966,25 +1072,18 @@ export class InclusionProofImporter {
     addr: string,
     tokenId: string,
   ): Promise<InvalidEntry | null> {
-    // Probe the canonical key first using the manifest entry's
-    // `rootHash` if available — most cases will have exactly one
-    // observed-content-hash. If that misses, fall back to a scan over
-    // the prefix `${addr}.invalid.${tokenId}.`.
-    //
-    // The `DispositionPerEntryStorage` contract is read/write keyed —
-    // it does NOT expose a prefix scanner. So the importer can only
-    // reliably recover the record via the canonical key. The
-    // production wiring of `DispositionPerEntryStorage` over the
-    // OrbitDB key-value store carries the same opacity — the writer
-    // never indexes records by `(tokenId)` alone, so an importer that
-    // arrives without the observed-content-hash needs the manifest
-    // store as the cross-reference.
-    const manifestEntry = await this.opts.manifestStore.readEntry(addr, tokenId);
-    const observedHash =
-      manifestEntry?.rootHash ?? this._fallbackContentHash(tokenId);
-    const key = invalidKeyFor(addr, tokenId, observedHash);
-    const record = await this.opts.dispositionStorage.readRecord<InvalidEntry>(key);
-    return record ?? null;
+    const prefix = `${addr}.invalid.${tokenId}.`;
+    const keys = await this.opts.dispositionStorage.listKeysWithPrefix(prefix);
+    if (keys.length === 0) return null;
+    let best: InvalidEntry | null = null;
+    for (const k of keys) {
+      const rec = await this.opts.dispositionStorage.readRecord<InvalidEntry>(k);
+      if (rec === undefined) continue;
+      if (best === null || rec.observedAt > best.observedAt) {
+        best = rec;
+      }
+    }
+    return best;
   }
 
   /**
@@ -995,15 +1094,19 @@ export class InclusionProofImporter {
    * (structurally valid, unspendable by us)" — both collapse to
    * `'no-such-token'` per §6.3 case 1, but the disambiguation lives
    * here so future spec changes can route differently.
+   *
+   * Uses the prefix scanner so a token whose manifest entry was deleted
+   * on routing to `_audit` is correctly recovered. The legacy fallback
+   * hash always missed (steelman crit #15) — same root cause as
+   * `_findInvalidEntry`.
    */
   private async _hasAuditEntry(
     addr: string,
     tokenId: string,
   ): Promise<boolean> {
-    const fallbackHash = this._fallbackContentHash(tokenId);
-    const key = auditKeyFor(addr, tokenId, fallbackHash);
-    const record = await this.opts.dispositionStorage.readRecord<AuditEntry>(key);
-    return record !== undefined;
+    const prefix = `${addr}.audit.${tokenId}.`;
+    const keys = await this.opts.dispositionStorage.listKeysWithPrefix(prefix);
+    return keys.length > 0;
   }
 
   /**
@@ -1064,26 +1167,6 @@ export class InclusionProofImporter {
       : null;
   }
 
-  /**
-   * @internal
-   *
-   * Build a deterministic placeholder {@link ContentHash} from a
-   * tokenId — the importer probes `_invalid` / `_audit` via the
-   * `(tokenId, observedHash)` composite key, so when the manifest
-   * does not surface an observed hash we fall back to a stable
-   * derivation. Hex form so the `contentHash()` brand validates.
-   */
-  private _fallbackContentHash(tokenId: string): ContentHash {
-    // Use the tokenId itself when it's a 64-char hex (the canonical
-    // form per the spec); otherwise fall back to a sentinel that will
-    // miss every key (so the lookup correctly returns `undefined` and
-    // we fall through to `case 1`). 32 bytes of zero hex is the
-    // sentinel.
-    if (/^[0-9a-fA-F]{64}$/.test(tokenId)) {
-      return contentHash(tokenId.toLowerCase());
-    }
-    return contentHash('00'.repeat(32));
-  }
 }
 
 /**
