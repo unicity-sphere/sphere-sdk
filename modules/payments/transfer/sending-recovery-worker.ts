@@ -55,6 +55,7 @@ import type {
   UxfTransferOutboxEntry,
 } from '../../../types/uxf-outbox';
 import type { OutboxWriter } from '../../../profile/outbox-writer';
+import { redactCause } from '../../../core/errors';
 
 // =============================================================================
 // 1. Public types — dependency surface + options
@@ -225,6 +226,25 @@ export class SendingRecoveryWorker {
    * @returns Number of entries the cycle attempted to recover.
    */
   async runScanCycle(): Promise<number> {
+    // FIX 5 (steelman warning): O(N) scan, not O(N²).
+    //
+    // Previously every `recoverOne` call did its own `readAllNew()` for a
+    // pre-republish status re-check. With N stuck entries that produced
+    // 1 (outer scan) + N (per-entry pre-flight) = O(N) reads on a healthy
+    // outbox but O(N²) work overall (each readAllNew filters across the
+    // full outbox). On a stuck-heavy outbox this dominated cycle latency
+    // and storage pressure.
+    //
+    // New plan: snapshot once here, pass the live snapshot entry into
+    // `recoverOne`. The race between snapshot and re-publish is then
+    // handled by the existing CAS guard inside `transitionToDelivered`'s
+    // `update()` closure (the mutator returns `prev` unchanged if
+    // `prev.status !== 'sending'`, and `didTransition` stays false so no
+    // false-success emit fires).
+    //
+    // A duplicate Nostr publish in the racing window is still possible
+    // but harmless — the recipient's replay-LRU short-circuits duplicates
+    // (see §6.3 / T.3.A idempotency contract on `bundleCid`).
     let entries: ReadonlyArray<UxfTransferOutboxEntry>;
     try {
       entries = await this.deps.outbox.readAllNew();
@@ -273,28 +293,13 @@ export class SendingRecoveryWorker {
    * actually transitioned, gating the event emission.
    */
   private async recoverOne(entry: UxfTransferOutboxEntry): Promise<void> {
-    // Pre-flight: re-read the current entry state. If a concurrent
-    // mutator advanced it past `'sending'` since our scan snapshot, do
-    // nothing. The freshly-published recipient already saw the original
-    // bundle; we MUST NOT re-publish.
-    let liveEntry: UxfTransferOutboxEntry | undefined;
+    // FIX 5: no per-entry `readAllNew()` — the caller's snapshot is
+    // authoritative for status@scan-time. Race between snapshot and
+    // republish is handled by the CAS guard inside
+    // `transitionToDelivered`'s `update()` closure (no-op on advance,
+    // and `didTransition` stays false so no false-success emit fires).
     try {
-      const all = await this.deps.outbox.readAllNew();
-      liveEntry = all.find((e) => e.id === entry.id);
-    } catch (err) {
-      this.warn('pre-republish readAllNew failed; skipping entry', {
-        outboxId: entry.id,
-        err: errMessage(err),
-      });
-      return;
-    }
-    if (liveEntry === undefined || liveEntry.status !== 'sending') {
-      // Entry advanced (or vanished) — nothing to recover.
-      return;
-    }
-
-    try {
-      await this.deps.republish(liveEntry);
+      await this.deps.republish(entry);
     } catch (err) {
       const count = (this.failureCounts.get(entry.id) ?? 0) + 1;
       this.failureCounts.set(entry.id, count);
@@ -310,9 +315,12 @@ export class SendingRecoveryWorker {
       return;
     }
 
-    // Success path — transition to delivered / delivered-instant.
+    // Success path — transition to delivered / delivered-instant. The
+    // CAS guard inside the update closure protects against the race
+    // where a concurrent mutator advanced the entry between the scan
+    // snapshot and this post-republish call.
     this.failureCounts.delete(entry.id);
-    await this.transitionToDelivered(liveEntry);
+    await this.transitionToDelivered(entry);
   }
 
   /**
@@ -475,8 +483,12 @@ export class SendingRecoveryWorker {
 function errMessage(err: unknown): string {
   if (err instanceof Error) return err.message;
   if (typeof err === 'string') return err;
+  // FIX 4 (steelman warning): walk unknown-shape inputs through W40
+  // redactCause before JSON.stringify so any sensitive own-properties
+  // (e.g., signedTransferTxBytes attached to a non-Error throw) are
+  // scrubbed before reaching the log line.
   try {
-    return JSON.stringify(err);
+    return JSON.stringify(redactCause(err));
   } catch {
     return String(err);
   }
