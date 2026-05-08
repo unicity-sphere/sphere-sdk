@@ -542,11 +542,19 @@ export interface FinalizationCycleContext {
  * Steps (mirroring §6.1 verbatim):
  *  1. Resolve `signedTx` + context via {@link RequestContextResolver}.
  *     Null → hard-fail `'structural'`.
- *  2. Submit phase — bounded by `maxSubmitRetries` on `TRANSIENT`.
+ *  2. Acquire per-aggregator + per-token semaphores. **Steelman fix
+ *     (CRIT #7)**: the W14 / `MAX_CONCURRENT_POLLS_PER_AGGREGATOR` cap
+ *     bounds the full submit + poll pair, NOT just the poll loop. Pre-
+ *     fix the semaphores were acquired inside `runPollPhase` only, so
+ *     N pending requestIds launched N concurrent `aggregator.submit()`
+ *     calls before the per-aggregator cap could push back. The semaphore
+ *     is released in the `finally` block AFTER the poll loop completes
+ *     (or hard-fails / aborts), preserving the "permits cover the FULL
+ *     cycle" invariant.
+ *  3. Submit phase — bounded by `maxSubmitRetries` on `TRANSIENT`.
  *     Maps each {@link SubmitOutcomeKind} per §6.1 table.
- *  3. Poll phase — bounded by polling-window + `2x` safety net (W26).
- *     Per-aggregator + per-token semaphores held for the FULL poll
- *     loop. `TRANSIENT` does NOT advance attempt counter.
+ *  4. Poll phase — bounded by polling-window + `2x` safety net (W26).
+ *     `TRANSIENT` does NOT advance attempt counter.
  *     - `OK + matching txHash` → §6.3 conflict check, then `attachProof`,
  *       then return success.
  *     - `OK + mismatching txHash` → race-lost (skip cascade per §6.1.1).
@@ -591,10 +599,25 @@ export async function runFinalizationCycle(
     };
   }
 
-  const submitResult = await runSubmitPhase(ctx);
-  if (submitResult.kind === 'hard-fail') return submitResult;
+  // Steelman fix (CRIT #7): acquire per-aggregator + per-token permits
+  // BEFORE the submit phase and hold for the entire submit + poll cycle.
+  // The W14/W26 caps are meaningless if N concurrent submits race past
+  // them — sender's `processOne` and recipient's `processOneToken` both
+  // launch all outstanding requestIds via `Promise.allSettled`, so
+  // semaphore acquisition MUST gate the whole cycle.
+  const releaseAgg = await ctx.perAggregatorSemaphore.acquire();
+  let releaseTok: (() => void) | null = null;
+  try {
+    releaseTok = await ctx.perTokenSemaphore.acquire();
 
-  return await runPollPhase(ctx, ctxResolved);
+    const submitResult = await runSubmitPhase(ctx);
+    if (submitResult.kind === 'hard-fail') return submitResult;
+
+    return await runPollPhase(ctx, ctxResolved);
+  } finally {
+    if (releaseTok !== null) releaseTok();
+    releaseAgg();
+  }
 }
 
 // =============================================================================
@@ -739,17 +762,13 @@ export async function runPollPhase(
   let localNotAuthStrikes = 0;
   let localRefreshAppliedSinceFirstStrike = false;
 
-  // Acquire per-aggregator + per-token permits for the full poll loop
-  // for this requestId. Production wiring uses these as DoS-defense
-  // budgets; keeping them for the full poll loop matches the spec's
-  // "MAX_CONCURRENT_POLLS_PER_TOKEN" framing (concurrent requestIds
-  // of the SAME token).
-  const releaseAgg = await ctx.perAggregatorSemaphore.acquire();
-  let releaseTok: (() => void) | null = null;
-  try {
-    releaseTok = await ctx.perTokenSemaphore.acquire();
-
-    for (;;) {
+  // Steelman fix (CRIT #7): per-aggregator + per-token permits are
+  // acquired/released by `runFinalizationCycle`'s outer try/finally so
+  // they cover BOTH submit AND poll phases. The poll loop runs under
+  // those held permits — do NOT re-acquire here. (Pre-fix: this fn
+  // owned the acquire/release; that caused submit to escape the W14
+  // cap when N parallel requestIds were dispatched via Promise.allSettled.)
+  for (;;) {
       if (ctx.signal?.aborted === true || ctx.isStopped()) {
         return {
           kind: 'hard-fail',
@@ -984,10 +1003,6 @@ export async function runPollPhase(
         continue;
       }
     }
-  } finally {
-    if (releaseTok !== null) releaseTok();
-    releaseAgg();
-  }
 }
 
 // =============================================================================

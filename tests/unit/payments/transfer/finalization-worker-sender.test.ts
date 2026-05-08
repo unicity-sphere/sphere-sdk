@@ -1913,3 +1913,117 @@ describe('FinalizationWorkerSender — SCAN_LIST_HARD_GUARD truncation backoff (
     expect(data.message).toMatch(/4 consecutive failure/);
   });
 });
+
+// =============================================================================
+// CRIT #7 — perAggregatorSemaphore wraps full submit + poll cycle
+// =============================================================================
+//
+// Pre-fix: `runFinalizationCycle` invoked `runSubmitPhase` BEFORE acquiring
+// the per-aggregator semaphore (acquired only inside `runPollPhase`). When
+// `processOne` launched N outstanding requestIds via `Promise.allSettled`,
+// all N submits ran concurrently — voiding the W14
+// `MAX_CONCURRENT_POLLS_PER_AGGREGATOR` cap. The fix moves the semaphore
+// acquire/release into the cycle driver so it covers the full submit + poll
+// sequence.
+
+describe('FinalizationWorkerSender — perAggregatorSemaphore covers submit phase (CRIT #7)', () => {
+  it('100 outstanding requestIds: at most cap concurrent submit() calls', async () => {
+    const N = 100;
+    const CAP = 4;
+    const requestIds = Array.from({ length: N }, (_, i) => `req-${i}`);
+    const entry = makeOutboxEntry({ outstandingRequestIds: requestIds });
+
+    let inFlightSubmits = 0;
+    let peakInFlightSubmits = 0;
+    const submitGate: Array<() => void> = [];
+
+    const aggregator: ReturnType<typeof makeFakeAggregator> = {
+      get submitCalls() {
+        return submitCallCount;
+      },
+      get pollCalls() {
+        return pollCallCount;
+      },
+      async submit() {
+        inFlightSubmits += 1;
+        peakInFlightSubmits = Math.max(peakInFlightSubmits, inFlightSubmits);
+        submitCallCount += 1;
+        // Hold the submit until released so we can observe peak concurrency.
+        await new Promise<void>((resolve) => {
+          submitGate.push(resolve);
+        });
+        inFlightSubmits -= 1;
+        return { kind: 'SUCCESS' as const };
+      },
+      async poll() {
+        pollCallCount += 1;
+        return { kind: 'OK' as const, proof: makeProof(), newCid: NEW_CID };
+      },
+    };
+    let submitCallCount = 0;
+    let pollCallCount = 0;
+
+    // Inject our own caps to enforce the bound at CAP=4 (well below N=100).
+    const perAgg = new CountingSemaphore(CAP);
+    const perTok = new CountingSemaphore(CAP);
+    // Pre-seed the queue with all requestIds so attach 4-step write succeeds.
+    const queue = makeFakeQueue(requestIds.map((r) => ({ addr: ADDR, requestId: r })));
+    const outbox = makeFakeOutboxWriter(entry);
+    const pool = makeFakePool();
+    const poolRead = makeFakePoolRead();
+    const tombstones = makeFakeTombstones();
+    const events = makeEventRecorder();
+    const manifestStorage = makeFakeManifestStorage([
+      { addr: ADDR, tokenId: TOKEN_ID, entry: { rootHash: PREVIOUS_CID, status: 'pending' } },
+    ]);
+    const manifestCas = new ManifestCas(manifestStorage);
+    const mutex = new PerTokenMutex();
+    const resolver = makeFakeResolver();
+
+    const worker = new FinalizationWorkerSender({
+      addressId: ADDR,
+      outbox: outbox.writer,
+      aggregator,
+      resolver,
+      pool,
+      poolRead,
+      manifestCas,
+      tombstones,
+      queue,
+      perAggregatorSemaphore: perAgg,
+      getPerTokenSemaphore: () => perTok,
+      perTokenMutex: mutex,
+      perTokenMutexStrategy: 'cas',
+      emit: events.emit,
+      now: () => Date.now(),
+      sleep: async () => undefined,
+    });
+
+    // Start processing in the background.
+    const processPromise = worker.processOne(entry);
+
+    // Drain submit-gate as long as new submits arrive — release in batches
+    // and observe the peak concurrency stays bounded.
+    // Yield repeatedly so promises settle, then release whatever has queued.
+    while (true) {
+      // Yield enough microtasks for all currently-released cycles to enqueue
+      // at the gate.
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+      if (submitGate.length === 0 && submitCallCount >= N) break;
+      // The cap holds — we should NEVER see more than CAP concurrent submits
+      // queued at the gate at once.
+      expect(submitGate.length).toBeLessThanOrEqual(CAP);
+      const releases = submitGate.splice(0);
+      for (const r of releases) r();
+      // If we've completed all submits without seeing more queue up, exit.
+      if (submitCallCount >= N && submitGate.length === 0) break;
+    }
+
+    await processPromise;
+
+    expect(submitCallCount).toBe(N);
+    // The W14 invariant: peak concurrent submits never exceeded the cap.
+    expect(peakInFlightSubmits).toBeLessThanOrEqual(CAP);
+    expect(peakInFlightSubmits).toBeGreaterThan(0);
+  });
+});
