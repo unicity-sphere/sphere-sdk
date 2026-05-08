@@ -2218,3 +2218,61 @@ describe('FinalizationWorkerSender — internalController rebuild on start (Roun
     await h.worker.stop();
   });
 });
+
+// =============================================================================
+// Round 3 regression — scan-loop safeSleep observes internalController (FIX 3)
+// =============================================================================
+//
+// Pre-Round-3 the scan-loop's `safeSleep` watched only the user-supplied
+// signal. An idle worker (no work in the outbox) that called `stop()`
+// waited up to `scanIntervalMs` (default 30s) before the loop exited
+// because the internal controller's signal wasn't combined with the
+// user signal. This regression test asserts an idle-loop stop returns
+// in tens of ms.
+
+describe('FinalizationWorkerSender — idle-loop stop wakes immediately (Round 3 regression)', () => {
+  it('stop() during idle scan-loop sleep returns within tens of ms', async () => {
+    // No initial entries → scan-loop will sleep `scanIntervalMs` after
+    // the first pass.
+    const longInterval = 60_000; // 1 minute
+    const h = buildScanHarness({
+      scanIntervalMs: longInterval,
+      processOneOverride: async () => undefined,
+    });
+
+    // Use a real-timer sleep that respects the abort signal (the
+    // harness's default sleep clamps to 5ms which masks the bug).
+    // Replace via Object.defineProperty since `options` is private.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const wAny = h.worker as any;
+    wAny.options.sleep = (ms: number, signal?: AbortSignal): Promise<void> =>
+      new Promise<void>((resolve, reject) => {
+        const t = setTimeout(resolve, ms);
+        if (signal !== undefined) {
+          if (signal.aborted) {
+            clearTimeout(t);
+            reject(new Error('aborted'));
+            return;
+          }
+          signal.addEventListener('abort', () => {
+            clearTimeout(t);
+            reject(new Error('aborted'));
+          });
+        }
+      });
+
+    h.worker.start();
+
+    // Let the scan loop reach its idle sleep (one tick).
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const startedAt = Date.now();
+    await h.worker.stop();
+    const elapsed = Date.now() - startedAt;
+
+    // Pre-Round-3: stop would block for up to `longInterval`. Post-fix:
+    // the internal controller's signal aborts the sleep immediately.
+    expect(elapsed).toBeLessThan(500);
+    expect(h.worker.isRunning()).toBe(false);
+  });
+});

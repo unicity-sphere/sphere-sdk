@@ -1278,11 +1278,26 @@ export class FinalizationWorkerSender {
    * via reject"; the loop's outer `while` checks `signal.aborted` to
    * exit cleanly.
    *
+   * Round 3 regression fix: combine the user-supplied signal with the
+   * internal controller's signal so `stop()` immediately wakes up an
+   * idle scan-loop sleep. Pre-fix, an idle worker that called
+   * `stop()` waited the full `scanIntervalMs` (default 30s) before the
+   * loop iteration completed because only the user-supplied signal
+   * was passed in. The internal controller is the abort surface that
+   * `stop()` triggers, so it MUST also be observed by the scan-loop
+   * sleep for prompt shutdown.
+   *
    * @internal
    */
   private async safeSleep(ms: number): Promise<void> {
     try {
-      await this.options.sleep(ms, this.options.signal);
+      await this.options.sleep(
+        ms,
+        combineAbortSignals(
+          this.options.signal,
+          this.internalController.signal,
+        ),
+      );
     } catch {
       // Sleep aborted via signal — fall through; loop condition
       // re-evaluates and exits.

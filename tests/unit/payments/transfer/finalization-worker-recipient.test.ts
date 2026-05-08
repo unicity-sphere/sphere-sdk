@@ -1296,6 +1296,50 @@ describe('FinalizationWorkerRecipient — W26 anchor via pollStartedAt (Round 3 
   });
 });
 
+// =============================================================================
+// Round 3 regression — scan-loop safeSleep observes internalController (FIX 3)
+// =============================================================================
+
+describe('FinalizationWorkerRecipient — idle-loop stop wakes immediately (Round 3 regression)', () => {
+  it('stop() during idle scan-loop sleep returns within tens of ms', async () => {
+    const longInterval = 60_000; // 1 minute
+    const harness = buildWorker({
+      sleepFn: (ms: number, signal?: AbortSignal): Promise<void> =>
+        new Promise<void>((resolve, reject) => {
+          const t = setTimeout(resolve, ms);
+          if (signal !== undefined) {
+            if (signal.aborted) {
+              clearTimeout(t);
+              reject(new Error('aborted'));
+              return;
+            }
+            signal.addEventListener('abort', () => {
+              clearTimeout(t);
+              reject(new Error('aborted'));
+            });
+          }
+        }),
+    });
+
+    // The recipient harness doesn't expose scanIntervalMs in
+    // buildWorker; reach into the worker to override.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (harness.worker as any).scanIntervalMs = longInterval;
+
+    harness.worker.start();
+
+    // Let the scan loop reach its idle sleep.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const startedAt = Date.now();
+    await harness.worker.stop();
+    const elapsed = Date.now() - startedAt;
+
+    expect(elapsed).toBeLessThan(500);
+    expect(harness.worker.isRunning()).toBe(false);
+  });
+});
+
 // Suppress unused-import warnings for this block.
 void RACE_TX_HASH;
 void makeFakePoolRead;

@@ -1517,11 +1517,22 @@ export class FinalizationWorkerRecipient {
   /**
    * Wrap `options.sleep` so abort exceptions don't escape the loop.
    *
+   * Round 3 regression fix: combine the user-supplied signal with the
+   * internal controller's signal so `stop()` immediately wakes up an
+   * idle scan-loop sleep. See sender-side `safeSleep` doc for the
+   * full rationale.
+   *
    * @internal
    */
   private async safeSleep(ms: number): Promise<void> {
     try {
-      await this.options.sleep(ms, this.options.signal);
+      await this.options.sleep(
+        ms,
+        combineAbortSignals(
+          this.options.signal,
+          this.internalController.signal,
+        ),
+      );
     } catch {
       // Sleep aborted via signal — fall through.
     }
