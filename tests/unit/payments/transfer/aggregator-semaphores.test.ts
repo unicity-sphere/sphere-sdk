@@ -249,6 +249,50 @@ describe('canonicalizeAggregatorId — URL form collapsing', () => {
     // Whitespace handling: leading/trailing trim then verbatim.
     expect(canonicalizeAggregatorId('   shared-aggregator   ')).toBe('shared-aggregator');
   });
+
+  // Round 7 fix (LOW NEW): the URL-parse catch in canonicalizeAggregatorId
+  // previously logged the raw `err` argument. A hostile or pathological
+  // URLError might carry sensitive bytes on the Error object; we now
+  // route through `safeErrorMessage` and log only `{ error: <string> }`.
+  it('URL-parse failure path: logger receives sanitized {error: string}, not raw err', async () => {
+    const { logger } = await import('../../../../core/logger');
+    const captured: Array<{
+      level: string;
+      tag: string;
+      message: string;
+      args: unknown[];
+    }> = [];
+    logger.configure({
+      handler: (level, tag, message, ...args) => {
+        captured.push({ level, tag, message, args });
+      },
+    });
+    try {
+      // 'https://[bad' fails URL parsing (invalid IPv6 literal).
+      const out = canonicalizeAggregatorId('https://[bad');
+      // Verbatim fallback works.
+      expect(out).toBe('https://[bad');
+      // Logger was called.
+      const warnCalls = captured.filter((c) => c.level === 'warn');
+      expect(warnCalls.length).toBeGreaterThan(0);
+      const call = warnCalls[0]!;
+      expect(call.tag).toBe('AggregatorSemaphore');
+      // CRITICAL invariant: the 4th positional argument (the first
+      // extra arg after message) MUST be a plain `{ error: string }`
+      // object — NOT a raw Error instance.
+      expect(call.args.length).toBeGreaterThanOrEqual(1);
+      const errArg = call.args[0];
+      expect(errArg).not.toBeInstanceOf(Error);
+      expect(typeof errArg).toBe('object');
+      expect(errArg).not.toBeNull();
+      const errAsObj = errArg as { error?: unknown };
+      expect(typeof errAsObj.error).toBe('string');
+      // Sanitized: no control chars, no HTML markup.
+      expect(errAsObj.error as string).not.toMatch(/[\x00-\x1F\x7F]/); // eslint-disable-line no-control-regex
+    } finally {
+      logger.configure({ handler: undefined as never });
+    }
+  });
 });
 
 describe('aggregator-semaphores — URL canonicalization (#159)', () => {

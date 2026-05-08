@@ -33,6 +33,7 @@
  * @packageDocumentation
  */
 
+import { safeErrorMessage } from '../../../core/error-sanitize';
 import { logger } from '../../../core/logger';
 import { MAX_CONCURRENT_POLLS_PER_AGGREGATOR } from './limits';
 import {
@@ -357,10 +358,14 @@ export function canonicalizeAggregatorId(id: string): string {
     //   transport layer, not in the rate-budget key.
     return `${protocol}//${hostport}${path}`;
   } catch (err) {
+    // Round 7 fix (LOW NEW): sanitize `err` before passing to logger.
+    // Sister to revalidate-cascaded.ts and cascade-walker.ts —
+    // log diagnostics MUST never include raw Error objects whose
+    // properties may carry sensitive bytes from the failed URL parse.
     logger.warn(
       'AggregatorSemaphore',
       `canonicalizeAggregatorId: failed to parse '${trimmed}', using verbatim`,
-      err,
+      { error: safeErrorMessage(err) },
     );
     return trimmed;
   }
