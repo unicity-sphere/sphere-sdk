@@ -358,4 +358,82 @@ describe('§6.1.1 cascade — coin-class splitParent walk', () => {
     const childEntry = await storage.readEntry(ADDR, CHILD);
     expect(childEntry?.status).toBe('invalid');
   });
+
+  // ===========================================================================
+  // Round 7 (FIX 4) — idempotency check defensively case-insensitive on
+  //                   splitParent
+  // ===========================================================================
+  it('idempotency check tolerates mixed-case splitParent on stored child entry', async () => {
+    // Simulates legacy data: a child manifest entry written before
+    // FIX 4 landed at the writer side, carrying a mixed-case
+    // splitParent. The cascade walker's idempotency branch (line 818)
+    // must lowercase both sides — otherwise it would re-write the
+    // entry on every pass instead of recognizing it as already
+    // cascaded.
+    const PARENT_LOWER = 'parent-mixed';
+    const CHILD = 'c-mixed';
+    // Stored splitParent in mixed case (legacy pre-FIX 4 data).
+    const PARENT_MIXED = 'PARENT-MIXED';
+
+    const storage = makeFakeManifestStorage([
+      {
+        addr: ADDR,
+        tokenId: PARENT_LOWER,
+        entry: makeManifestEntry({
+          status: 'invalid',
+          invalidReason: 'oracle-rejected',
+        }),
+      },
+      {
+        addr: ADDR,
+        tokenId: CHILD,
+        entry: makeManifestEntry({
+          status: 'invalid',
+          invalidReason: 'parent-rejected',
+          // Mixed-case splitParent — simulates legacy data on disk.
+          splitParent: PARENT_MIXED,
+        }),
+      },
+    ]);
+
+    // Custom scanner: returns the mixed-case child for the lowercase
+    // parent (mirrors what a properly-lowercasing scanner would do).
+    const customScanner = {
+      async readEntry(addr: string, tokenId: string) {
+        return storage.readEntry(addr, tokenId);
+      },
+      async findChildren(_addr: string, parentTokenId: string) {
+        if (parentTokenId.toLowerCase() === PARENT_LOWER) {
+          return [CHILD];
+        }
+        return [];
+      },
+    };
+
+    const harness = buildWalker({
+      storage,
+      classes: { [PARENT_LOWER]: 'coin' },
+      manifestScanner: customScanner,
+    });
+
+    // Capture the stored child entry BEFORE cascade so we can detect a
+    // re-write (production reuses splitParent: parentTokenId.toLowerCase()
+    // — different reference object iff a write occurred).
+    const childEntryBefore = await storage.readEntry(ADDR, CHILD);
+
+    const r = await harness.walker.cascade(ADDR, PARENT_LOWER, 'oracle-rejected');
+
+    // Without the case-normalization fix at cascade-walker.ts:818,
+    // the idempotency branch would silently miss (strict-equality
+    // mismatch on mixed-case splitParent), and the walker would
+    // re-write the entry needlessly. With the fix, the idempotency
+    // branch matches: no write happens for an already-cascaded child.
+    expect(r.cascaded).toBe(1);
+
+    // The stored entry's reference is unchanged (no re-write happened).
+    // If the idempotency branch had missed, the walker would have
+    // overwritten the entry with a fresh object via storage.set().
+    const childEntryAfter = await storage.readEntry(ADDR, CHILD);
+    expect(childEntryAfter).toBe(childEntryBefore);
+  });
 });

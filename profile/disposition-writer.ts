@@ -665,12 +665,22 @@ export class DispositionWriter {
     >,
     overrides: Partial<TokenManifestEntry> = {},
   ): TokenManifestEntry {
+    // Round 7 (FIX 4) — lowercase splitParent at write time so the
+    // canonical-tokenId regex contract (lowercase hex) holds across
+    // all writers. Downstream comparison sites (cascade-walker,
+    // revalidate-cascaded) lowercase the lookup key; if a mixed-case
+    // splitParent slipped through here it would silently fail strict-
+    // equality match, leaving cascade victims orphaned.
+    const normalizedSplitParent =
+      typeof delta.splitParent === 'string' && delta.splitParent.length > 0
+        ? delta.splitParent.toLowerCase()
+        : delta.splitParent;
     const entry: TokenManifestEntry = {
       rootHash: delta.rootHash,
       status: delta.status,
       conflictingHeads: delta.conflictingHeads,
       invalidReason: delta.invalidReason,
-      splitParent: delta.splitParent,
+      splitParent: normalizedSplitParent,
       bundleCid: record.bundleCid,
       senderTransportPubkey: record.senderTransportPubkey,
       lastProofRefreshAt: this.now(),

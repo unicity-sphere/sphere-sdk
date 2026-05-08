@@ -611,3 +611,78 @@ describe('§6.1.1 revalidateCascadedChildren', () => {
     });
   });
 });
+
+// =============================================================================
+// Round 7 (FIX 4) — splitParent comparison defensively case-insensitive
+// =============================================================================
+
+describe('Round 7 (FIX 4): splitParent compare-time case-normalization', () => {
+  it('mixed-case splitParent in stored manifest entry matches lowercase parent token id', async () => {
+    // Simulates legacy data: a manifest entry written before FIX 4
+    // landed at the writer side, carrying a mixed-case splitParent.
+    // The runner's public entry has already lowercased the parent (per
+    // Round 5's fix); the comparison at revalidate-cascaded.ts:421
+    // must lowercase the stored splitParent too so we don't silently
+    // miss the cascade victim.
+    //
+    // Note: the default `makeManifestScanner` uses strict equality on
+    // splitParent in `findChildren`, so we must override the scanner
+    // to surface the mixed-case child. The fix targets the runner's
+    // `wasParentRejected` filter — the scanner is just plumbing.
+    const PARENT_LOWER = '0xparentab';
+    const PARENT_MIXED = '0xPaReNtAb';
+    const C1 = 'c-mixed';
+
+    // Build the harness first so we can use its manifest in the
+    // scanner override.
+    const h = buildRevalidatorHarness({
+      verdicts: new Map([[C1, { kind: 'revalidated' }]]),
+      // Scanner override: returns the mixed-case child for the lowercase
+      // parent (mirroring what a properly-lowercasing scanner would do
+      // in production once it's also fixed — for now we simulate the
+      // intermediate state).
+      manifestScannerOverride: {
+        readEntry: async (addr: string, tokenId: string) => {
+          // Defer manifest lookup via closure; harness initialized below
+          // shares the same manifest instance.
+          return undefined;
+        },
+        findChildren: async (_addr: string, parentTokenId: string) => {
+          if (parentTokenId.toLowerCase() === PARENT_LOWER) {
+            return [C1];
+          }
+          return [];
+        },
+      },
+    });
+    // Patch the scanner's readEntry to use h.manifest now that h exists.
+    // (Scanner is captured by value in opts; mutating after construction
+    // is OK — the runner reads through the same reference each call.)
+    const scannerRef = (h.runner as unknown as {
+      opts: { manifestScanner: { readEntry: typeof h.manifest.readEntry } };
+    }).opts.manifestScanner;
+    scannerRef.readEntry = async (addr: string, tokenId: string) =>
+      h.manifest.entries.get(`${addr}:${tokenId}`);
+    h.manifest.entries.set(`${ADDR}:${PARENT_LOWER}`, manifestEntryFor({
+      status: 'valid',
+      rootHashHex: 'aa'.repeat(32),
+    }));
+    // Mixed-case splitParent in stored child entry — simulates legacy
+    // pre-FIX 4 data on disk.
+    h.manifest.entries.set(`${ADDR}:${C1}`, manifestEntryFor({
+      status: 'invalid',
+      invalidReason: 'parent-rejected',
+      splitParent: PARENT_MIXED,
+      rootHashHex: 'b1'.repeat(32),
+    }));
+
+    const r = await h.runner.run(ADDR, PARENT_LOWER);
+    // Without the case-normalization fix at revalidate-cascaded.ts:421,
+    // the strict-equality check would silently drop C1 as "not a
+    // cascade victim of this parent", leaving counters at 0. The fix
+    // lowercases both sides → C1 is correctly recognized.
+    expect(r.checked).toBe(1);
+    expect(r.revalidated).toBe(1);
+    expect(h.callsByChild).toEqual([C1]);
+  });
+});

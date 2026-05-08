@@ -812,10 +812,22 @@ export class CascadeWalker {
       }
       // Idempotency: if the child is already invalid/parent-rejected,
       // treat as success without re-writing.
+      //
+      // Round 7 (FIX 4) — lowercase BOTH sides of the splitParent
+      // comparison. Disposition writers now lowercase splitParent at
+      // write time, but legacy manifests written before that fix may
+      // carry mixed-case values. The walker is invoked with parent
+      // tokenIds normalized at the public entry; legacy
+      // `childEntry.splitParent` strict-equality would silently miss
+      // and re-write a manifest entry that's already idempotent.
+      const childSplitParentLc =
+        typeof childEntry.splitParent === 'string'
+          ? childEntry.splitParent.toLowerCase()
+          : childEntry.splitParent;
       if (
         childEntry.status === 'invalid' &&
         childEntry.invalidReason === 'parent-rejected' &&
-        childEntry.splitParent === parentTokenId
+        childSplitParentLc === parentTokenId.toLowerCase()
       ) {
         return 'ok';
       }
@@ -835,7 +847,11 @@ export class CascadeWalker {
         invalidReason: 'parent-rejected',
         // Preserve splitParent — operator's `revalidateCascadedChildren`
         // uses this to find the parent for re-validation.
-        splitParent: parentTokenId,
+        // Round 7 (FIX 4) — lowercase splitParent at write time so the
+        // canonical-tokenId regex contract holds. Combined with the
+        // defensive lowercase comparison above, mixed-case input is
+        // caught at both the read and write seams.
+        splitParent: parentTokenId.toLowerCase(),
       };
 
       const result: ManifestCasResult = await this.options.manifestCas.update(

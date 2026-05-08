@@ -1285,3 +1285,65 @@ describe('Round 5 (FIX 4): write-side tokenId case-normalization', () => {
     expect(keys).toContain(lowerKey);
   });
 });
+
+// =============================================================================
+// Round 7 (FIX 4) — splitParent lowercased at write time
+// =============================================================================
+
+describe('Round 7 (FIX 4): splitParent write-time case-normalization', () => {
+  it('VALID disposition with mixed-case splitParent in manifest delta lowercases at the manifest-entry write seam', async () => {
+    const perEntry = new FakePerEntryStorage();
+    const manifest = new FakeManifestStorage();
+    const recorder = makeRecorder();
+    const writer = makeWriter(perEntry, manifest, recorder.emit);
+
+    // Mixed-case splitParent — simulating a delta produced by a code
+    // path that didn't apply the canonical lowercase contract upstream.
+    // The deltaToManifestEntry helper must lowercase before storing.
+    const upperParent = '0xPARENTAB';
+    const lowerParent = '0xparentab';
+
+    await writer.write(ADDR, {
+      disposition: 'VALID',
+      tokenId: TOKEN_A,
+      observedTokenContentHash: ch(HASH_X),
+      bundleCid: BUNDLE_CID_1,
+      senderTransportPubkey: SENDER_PUBKEY,
+      manifest: {
+        rootHash: ch(ROOT),
+        status: 'valid',
+        splitParent: upperParent,
+      },
+    });
+
+    // The stored manifest entry's splitParent field is lowercased
+    // (FIX 4 — preserves the canonical-tokenId contract across writers).
+    const stored = await manifest.readEntry(ADDR, TOKEN_A);
+    expect(stored).toBeDefined();
+    expect(stored!.splitParent).toBe(lowerParent);
+  });
+
+  it('preserves splitParent semantically — null and undefined pass through unchanged', async () => {
+    const perEntry = new FakePerEntryStorage();
+    const manifest = new FakeManifestStorage();
+    const recorder = makeRecorder();
+    const writer = makeWriter(perEntry, manifest, recorder.emit);
+
+    // No splitParent in delta — manifest entry stores undefined.
+    await writer.write(ADDR, {
+      disposition: 'VALID',
+      tokenId: TOKEN_A,
+      observedTokenContentHash: ch(HASH_X),
+      bundleCid: BUNDLE_CID_1,
+      senderTransportPubkey: SENDER_PUBKEY,
+      manifest: {
+        rootHash: ch(ROOT),
+        status: 'valid',
+      },
+    });
+
+    const stored = await manifest.readEntry(ADDR, TOKEN_A);
+    expect(stored).toBeDefined();
+    expect(stored!.splitParent).toBeUndefined();
+  });
+});
