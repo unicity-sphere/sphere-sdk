@@ -924,6 +924,73 @@ describe('FinalizationWorkerRecipient — Wave 7 emit-if-emitted recovery semant
 });
 
 // =============================================================================
+// CRIT #10 — internal AbortController plumbed through stop()
+// =============================================================================
+//
+// Pre-fix: `stop()` set `stopRequested` and awaited `loopPromise`, but did
+// NOT abort an in-flight aggregator call or sleep. A poll that hung on a
+// stuck aggregator kept stop() blocked. The fix adds an internal
+// AbortController, aborts BEFORE awaiting loopPromise, and combines its
+// signal with the caller-supplied signal via combineAbortSignals.
+
+describe('FinalizationWorkerRecipient — stop() aborts in-flight cycle (CRIT #10)', () => {
+  it('stop() returns within ~500ms even when aggregator hangs forever', async () => {
+    // Aggregator that hangs on submit until aborted via signal.
+    const harness = buildWorker({
+      aggregator: {
+        submitCalls: [],
+        pollCalls: [],
+        async submit(input) {
+          await new Promise<void>((_, reject) => {
+            if (input.signal !== undefined) {
+              const onAbort = (): void => reject(new Error('aborted'));
+              if (input.signal.aborted) onAbort();
+              else input.signal.addEventListener('abort', onAbort, { once: true });
+            }
+          });
+        },
+        async poll(input) {
+          await new Promise<void>((_, reject) => {
+            if (input.signal !== undefined) {
+              const onAbort = (): void => reject(new Error('aborted'));
+              if (input.signal.aborted) onAbort();
+              else input.signal.addEventListener('abort', onAbort, { once: true });
+            }
+          });
+          return { kind: 'TRANSIENT' as const };
+        },
+      },
+      sleepFn: async (ms, signal) => {
+        await new Promise<void>((resolve) => {
+          if (signal?.aborted) {
+            resolve();
+            return;
+          }
+          const t = setTimeout(() => resolve(), ms);
+          signal?.addEventListener('abort', () => {
+            clearTimeout(t);
+            resolve();
+          }, { once: true });
+        });
+      },
+    });
+    const entry = makeQueueEntry();
+    await seedQueue(harness, [entry]);
+
+    // Kick processOneToken in the background — submit will hang.
+    const inflight = harness.worker.processOneToken(TOKEN_ID);
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+
+    const stopStart = Date.now();
+    await harness.worker.stop();
+    const stopMs = Date.now() - stopStart;
+    expect(stopMs).toBeLessThan(500);
+
+    await inflight;
+  });
+});
+
+// =============================================================================
 // CRIT #8 — W26 deadline anchor uses createdAt only as a floor
 // =============================================================================
 //

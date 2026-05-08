@@ -1926,6 +1926,94 @@ describe('FinalizationWorkerSender — SCAN_LIST_HARD_GUARD truncation backoff (
 // acquire/release into the cycle driver so it covers the full submit + poll
 // sequence.
 
+// =============================================================================
+// CRIT #10 — internal AbortController plumbed through stop()
+// =============================================================================
+//
+// Pre-fix: `stop()` set `stopRequested` and awaited `loopPromise`, but did
+// NOT abort an in-flight aggregator call or sleep. A poll that hung on a
+// stuck aggregator kept stop() blocked for the full polling-window. The
+// fix adds an internal AbortController, aborts BEFORE awaiting loopPromise,
+// and combines its signal with the caller-supplied signal via
+// combineAbortSignals so the abort propagates into aggregator.submit /
+// aggregator.poll / sleep immediately.
+
+describe('FinalizationWorkerSender — stop() aborts in-flight cycle (CRIT #10)', () => {
+  it('stop() returns within ~100ms even when aggregator hangs forever', async () => {
+    const entry = makeOutboxEntry();
+    // Aggregator that hangs forever — both submit and poll wait for an
+    // unfulfilled promise. The hang resolves only on signal abort.
+    const aggregator: ReturnType<typeof makeFakeAggregator> = {
+      get submitCalls() { return submitCount; },
+      get pollCalls() { return pollCount; },
+      async submit(input) {
+        submitCount++;
+        await new Promise<void>((resolve, reject) => {
+          if (input.signal !== undefined) {
+            const onAbort = (): void => {
+              const err = new Error('aborted');
+              reject(err);
+            };
+            if (input.signal.aborted) onAbort();
+            else input.signal.addEventListener('abort', onAbort, { once: true });
+          }
+          // never resolve naturally — only reject on abort
+        });
+      },
+      async poll(input) {
+        pollCount++;
+        await new Promise<void>((resolve, reject) => {
+          if (input.signal !== undefined) {
+            const onAbort = (): void => {
+              const err = new Error('aborted');
+              reject(err);
+            };
+            if (input.signal.aborted) onAbort();
+            else input.signal.addEventListener('abort', onAbort, { once: true });
+          }
+        });
+        // unreachable
+        return { kind: 'TRANSIENT' as const };
+      },
+    };
+    let submitCount = 0;
+    let pollCount = 0;
+
+    const h = buildWorker({
+      entry,
+      aggregator,
+      // Use a sleep that respects abort to avoid spurious 30s waits.
+      sleepFn: async (ms, signal) => {
+        await new Promise<void>((resolve) => {
+          if (signal?.aborted) {
+            resolve();
+            return;
+          }
+          const t = setTimeout(() => resolve(), ms);
+          signal?.addEventListener('abort', () => {
+            clearTimeout(t);
+            resolve();
+          }, { once: true });
+        });
+      },
+    });
+
+    // Kick off processOne in the background — it will hang on submit.
+    const inflight = h.worker.processOne(entry);
+    // Yield enough microtasks for processOne to reach the hung submit().
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+
+    // Now stop() — should return promptly (< 100ms) even though submit hangs.
+    const stopStart = Date.now();
+    await h.worker.stop();
+    const stopMs = Date.now() - stopStart;
+    expect(stopMs).toBeLessThan(500); // generous bound for CI flake
+
+    // The hung inflight must also resolve (the hard-fail propagates).
+    await inflight;
+  });
+});
+
 describe('FinalizationWorkerSender — perAggregatorSemaphore covers submit phase (CRIT #7)', () => {
   it('100 outstanding requestIds: at most cap concurrent submit() calls', async () => {
     const N = 100;

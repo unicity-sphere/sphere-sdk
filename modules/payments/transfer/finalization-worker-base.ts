@@ -345,6 +345,44 @@ export interface PoolReadAdapter {
 // =============================================================================
 
 /**
+ * Combine multiple {@link AbortSignal}s into one that aborts as soon as
+ * ANY input aborts. Chosen over `AbortSignal.any` for compatibility with
+ * Node 18 (target floor in `package.json` engines) — `AbortSignal.any`
+ * landed in Node 20.3 and is not available on the older runtime.
+ *
+ * The returned signal is a fresh {@link AbortController}'s signal; the
+ * controller is held internally and aborted when any input signal
+ * fires. If any input is already aborted at the time of the call, the
+ * returned signal is aborted synchronously before return.
+ *
+ * If only one input signal is supplied (or all-but-one are undefined),
+ * returns it directly without allocation. If no input signals are
+ * supplied, returns `undefined` so callers can pass it through to APIs
+ * that accept an optional signal.
+ *
+ * @internal
+ */
+export function combineAbortSignals(
+  ...signals: ReadonlyArray<AbortSignal | undefined>
+): AbortSignal | undefined {
+  const live = signals.filter((s): s is AbortSignal => s !== undefined);
+  if (live.length === 0) return undefined;
+  if (live.length === 1) return live[0];
+  const controller = new AbortController();
+  const propagate = (sig: AbortSignal): void => {
+    if (sig.aborted) {
+      controller.abort(sig.reason);
+      return;
+    }
+    sig.addEventListener('abort', () => controller.abort(sig.reason), {
+      once: true,
+    });
+  };
+  for (const s of live) propagate(s);
+  return controller.signal;
+}
+
+/**
  * `transactionHash` and `authenticator` equality are byte-exact; we
  * lower-case both sides defensively in case the producer used a
  * different case-mode. (Hex is canonically lowercase but the spec is

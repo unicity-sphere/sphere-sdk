@@ -92,6 +92,7 @@ import { SphereError } from '../../../core/errors';
 import type { TrustBaseStaleness } from './trustbase-staleness';
 import {
   attachProofUnderMutex,
+  combineAbortSignals,
   runFinalizationCycle,
   type AnchoredProofDescriptor,
   type CycleResult,
@@ -454,6 +455,21 @@ export class FinalizationWorkerSender {
   private running = false;
   private stopRequested = false;
   private loopPromise: Promise<void> | null = null;
+  /**
+   * Steelman fix (CRIT #10): internal AbortController so `stop()` can
+   * IMMEDIATELY abort an in-flight cycle (long aggregator hang, sleep
+   * loop) without waiting for the natural completion. Pre-fix, `stop()`
+   * just set `stopRequested` and awaited `loopPromise` — a poll waiting
+   * on a hung aggregator could keep the caller blocked for the full
+   * polling-window duration.
+   *
+   * The signal is plumbed via {@link combineAbortSignals} into every
+   * cycle's `signal` field so aggregator.submit / aggregator.poll /
+   * sleep see the abort the moment `stop()` runs.
+   *
+   * @internal
+   */
+  private readonly internalController = new AbortController();
   /** In-flight `processOne` invocations, keyed by outbox id. The scan
    *  loop skips entries already being driven so an external caller
    *  (e.g. PaymentsModule's synchronous send path at line ~7556) and
@@ -592,9 +608,20 @@ export class FinalizationWorkerSender {
   /**
    * Request the worker to stop and await the in-flight loop iteration.
    * Idempotent. Safe to call from a non-worker context.
+   *
+   * Steelman fix (CRIT #10): aborts the internal AbortController BEFORE
+   * awaiting `loopPromise`. The signal is propagated into every active
+   * cycle's `signal` slot so an in-flight `aggregator.poll()` /
+   * `aggregator.submit()` / sleep returns immediately (or rejects) and
+   * `stop()` returns within ~tens of ms instead of waiting for the
+   * natural cycle completion (which could be the full polling window
+   * for a hung aggregator).
    */
   async stop(): Promise<void> {
     this.stopRequested = true;
+    if (!this.internalController.signal.aborted) {
+      this.internalController.abort();
+    }
     if (this.loopPromise !== null) {
       await this.loopPromise.catch(() => undefined);
       this.loopPromise = null;
@@ -931,7 +958,13 @@ export class FinalizationWorkerSender {
       emit: this.options.emit,
       now: this.options.now,
       sleep: this.options.sleep,
-      signal: this.options.signal,
+      // Steelman fix (CRIT #10): combine the caller-supplied signal
+      // with the worker's internal AbortController signal so `stop()`
+      // immediately propagates into the cycle (aggregator calls + sleep).
+      signal: combineAbortSignals(
+        this.options.signal,
+        this.internalController.signal,
+      ),
       isStopped: () => this.stopRequested,
       maxSubmitRetries: this.maxSubmitRetries,
       maxProofErrorRetries: this.maxProofErrorRetries,
