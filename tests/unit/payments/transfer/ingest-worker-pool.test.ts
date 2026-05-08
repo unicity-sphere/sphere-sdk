@@ -1295,3 +1295,193 @@ describe('IngestWorkerPool — enqueue-time carBase64 cap (steelman warning)', (
     await expect(pool.enqueue(cidPayload, SENDER)).resolves.toBeUndefined();
   });
 });
+
+// =============================================================================
+// 12. Steelman warning fix — per-bundle wall-clock budget
+// =============================================================================
+
+describe('IngestWorkerPool — per-bundle wall-clock budget (steelman warning)', () => {
+  let pool: IngestWorkerPool | null = null;
+
+  afterEach(async () => {
+    if (pool) {
+      await pool.destroy();
+      pool = null;
+    }
+  });
+
+  it('first timeout fires operator-alert and re-enqueues; second timeout hard-fails with second alert', async () => {
+    // Setup: a slow processToken that takes ~3× the budget. The first
+    // worker pickup times out → alert + retry. The retry (still slow)
+    // times out a second time → hard-fail alert.
+    const cid = syntheticBundleCid('slow1');
+    const tokenId = syntheticTokenId('s1');
+    const fixtures = new Map<string, { spec: BundleSpec; type: 'verified' }>([
+      [cid, { spec: { bundleCid: cid, tokenIds: [tokenId] }, type: 'verified' }],
+    ]);
+
+    const processToken: ProcessTokenFn = async () => {
+      // Sleep > 3× budget (50 ms × 3 = 150 ms). Two timeouts → ~300 ms
+      // total of waited time across the two attempts.
+      await new Promise((r) => setTimeout(r, 150));
+    };
+
+    const events: Array<{ event: SphereEventType; payload: unknown }> = [];
+    const emit: IngestPoolEventEmitter = (event, payload) => {
+      events.push({ event, payload: payload as unknown });
+    };
+
+    pool = new IngestWorkerPool({
+      lru: new ReplayLRU(),
+      perTokenMutex: new PerTokenMutex(),
+      processToken,
+      emit,
+      acquireBundle: makeAcquirer(fixtures),
+      mutexStrategy: 'rpc-release',
+      bundleMaxProcessingMs: 50,
+    });
+
+    await pool.enqueue(buildPayload({ bundleCid: cid, tokenIds: [tokenId] }), SENDER);
+
+    // Two operator-alert events expected: first retry, then hard-fail.
+    const alerts = events.filter((e) => e.event === 'transfer:operator-alert');
+    expect(alerts.length).toBe(2);
+
+    // First alert: re-enqueued for retry.
+    const firstAlert = alerts[0].payload as {
+      code: string;
+      bundleCid: string;
+      message: string;
+    };
+    expect(firstAlert.code).toBe('structural');
+    expect(firstAlert.bundleCid).toBe(cid);
+    expect(firstAlert.message).toContain('re-enqueued');
+
+    // Second alert: hard-fail.
+    const secondAlert = alerts[1].payload as {
+      code: string;
+      bundleCid: string;
+      message: string;
+    };
+    expect(secondAlert.code).toBe('structural');
+    expect(secondAlert.bundleCid).toBe(cid);
+    expect(secondAlert.message).toContain('SECOND time');
+    expect(secondAlert.message).toContain('dropped');
+  });
+
+  it('fast bundles continue to drain after a slow bundle times out', async () => {
+    // The whole point of the budget: a slow bundle on one worker MUST
+    // NOT prevent the rest of the pool from making progress.
+    const slowCid = syntheticBundleCid('slow2');
+    const slowToken = syntheticTokenId('slow2tok');
+    const fastCids = Array.from({ length: 5 }, (_, i) =>
+      syntheticBundleCid(`fast${i}`),
+    );
+    const fastTokens = fastCids.map((_, i) => syntheticTokenId(`f${i}`));
+
+    const fixtures = new Map<string, { spec: BundleSpec; type: 'verified' }>();
+    fixtures.set(slowCid, {
+      spec: { bundleCid: slowCid, tokenIds: [slowToken] },
+      type: 'verified',
+    });
+    for (let i = 0; i < fastCids.length; i++) {
+      fixtures.set(fastCids[i], {
+        spec: { bundleCid: fastCids[i], tokenIds: [fastTokens[i]] },
+        type: 'verified',
+      });
+    }
+
+    const processed = new Set<string>();
+    const processToken: ProcessTokenFn = async (tokenRoot) => {
+      if (tokenRoot.tokenId === slowToken) {
+        // Slow longer than the budget × 2.
+        await new Promise((r) => setTimeout(r, 1000));
+      } else {
+        processed.add(tokenRoot.tokenId);
+      }
+    };
+
+    pool = new IngestWorkerPool({
+      lru: new ReplayLRU(),
+      perTokenMutex: new PerTokenMutex(),
+      processToken,
+      emit: () => undefined,
+      acquireBundle: makeAcquirer(fixtures),
+      mutexStrategy: 'rpc-release',
+      maxWorkers: 2,
+      bundleMaxProcessingMs: 50,
+    });
+
+    const slowPromise = pool.enqueue(
+      buildPayload({ bundleCid: slowCid, tokenIds: [slowToken] }),
+      SENDER,
+    );
+    const fastPromises = fastCids.map((cid, i) =>
+      pool!.enqueue(
+        buildPayload({ bundleCid: cid, tokenIds: [fastTokens[i]] }),
+        SENDER,
+      ),
+    );
+
+    await Promise.all(fastPromises);
+    expect(processed.size).toBe(fastCids.length);
+
+    await slowPromise;
+  });
+
+  it('the bundleMaxProcessingMs option overrides the default', async () => {
+    // Sanity: passing 50ms budget triggers timeout for a 200ms slow
+    // processToken; default would not.
+    const cid = syntheticBundleCid('budget');
+    const tokenId = syntheticTokenId('b');
+    const fixtures = new Map<string, { spec: BundleSpec; type: 'verified' }>([
+      [cid, { spec: { bundleCid: cid, tokenIds: [tokenId] }, type: 'verified' }],
+    ]);
+
+    const processToken: ProcessTokenFn = async () => {
+      await new Promise((r) => setTimeout(r, 200));
+    };
+
+    const events: Array<{ event: SphereEventType }> = [];
+    const emit: IngestPoolEventEmitter = (event) => {
+      events.push({ event });
+    };
+
+    pool = new IngestWorkerPool({
+      lru: new ReplayLRU(),
+      perTokenMutex: new PerTokenMutex(),
+      processToken,
+      emit,
+      acquireBundle: makeAcquirer(fixtures),
+      mutexStrategy: 'rpc-release',
+      bundleMaxProcessingMs: 50,
+    });
+
+    await pool.enqueue(buildPayload({ bundleCid: cid, tokenIds: [tokenId] }), SENDER);
+    const alerts = events.filter((e) => e.event === 'transfer:operator-alert');
+    expect(alerts.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('rejects invalid bundleMaxProcessingMs at construction', () => {
+    expect(
+      () =>
+        new IngestWorkerPool({
+          lru: new ReplayLRU(),
+          perTokenMutex: new PerTokenMutex(),
+          processToken: vi.fn(),
+          emit: () => undefined,
+          bundleMaxProcessingMs: 0,
+        }),
+    ).toThrow(SphereError);
+    expect(
+      () =>
+        new IngestWorkerPool({
+          lru: new ReplayLRU(),
+          perTokenMutex: new PerTokenMutex(),
+          processToken: vi.fn(),
+          emit: () => undefined,
+          bundleMaxProcessingMs: -10,
+        }),
+    ).toThrow(SphereError);
+  });
+});
