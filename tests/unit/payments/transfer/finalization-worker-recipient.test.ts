@@ -967,8 +967,11 @@ describe('FinalizationWorkerRecipient — cascade tombstone (CRIT #11)', () => {
 
     // Pre-set the cascade tombstone (simulating a sibling cycle's
     // cascade firing concurrently).
+    //
+    // Round 3 regression fix: cascadeTombstones is now a Map (bounded
+    // LRU); the Set-style `add` was migrated to `set(key, true)`.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (harness.worker as any).cascadeTombstones.add(TOKEN_ID);
+    (harness.worker as any).cascadeTombstones.set(TOKEN_ID, true);
 
     // Pre-fix this would attach a proof; with the fix, the attachProof
     // closure short-circuits.
@@ -1365,8 +1368,9 @@ describe('FinalizationWorkerRecipient — cascade tombstone check inside mutex (
     ): Promise<void> => {
       // Simulate the sibling cascade firing JUST after the outside
       // check passed but BEFORE the mutex protects the rewrite.
+      // Round 3 regression fix: cascadeTombstones is now a Map.
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (harness.worker as any).cascadeTombstones.add(tokenId);
+      (harness.worker as any).cascadeTombstones.set(tokenId, true);
       return realAcquire(tokenId, fn, opts);
     };
 
@@ -1388,6 +1392,84 @@ describe('FinalizationWorkerRecipient — cascade tombstone check inside mutex (
       );
     });
     expect(skipAlerts.length).toBeGreaterThan(0);
+  });
+});
+
+// =============================================================================
+// Round 3 regression — cascadeTombstones bounded LRU + watermark alert (FIX 5)
+// =============================================================================
+
+describe('FinalizationWorkerRecipient — cascadeTombstones bounded LRU (Round 3 regression)', () => {
+  it('inserting > HARD_CAP entries evicts the oldest', async () => {
+    const harness = buildWorker();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const w = harness.worker as any;
+
+    const HARD_CAP = 10000;
+    for (let i = 0; i < HARD_CAP + 5; i++) {
+      w.insertCascadeTombstone(`token-${i}`);
+    }
+
+    expect(w.cascadeTombstones.size).toBe(HARD_CAP);
+
+    // The first 5 should have been evicted; the last HARD_CAP remain.
+    expect(w.cascadeTombstones.has('token-0')).toBe(false);
+    expect(w.cascadeTombstones.has('token-4')).toBe(false);
+    expect(w.cascadeTombstones.has('token-5')).toBe(true);
+    expect(w.cascadeTombstones.has(`token-${HARD_CAP + 4}`)).toBe(true);
+  });
+
+  it('crossing HIGH_WATERMARK fires a single CASCADE_TOMBSTONE_HIGH_WATERMARK alert', async () => {
+    const harness = buildWorker();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const w = harness.worker as any;
+
+    const HIGH_WATERMARK = 8000;
+    for (let i = 0; i < HIGH_WATERMARK - 1; i++) {
+      w.insertCascadeTombstone(`token-${i}`);
+    }
+    let alerts = harness.events.events.filter((e) => {
+      if (e.type !== 'transfer:operator-alert') return false;
+      const data = e.data as { message?: string };
+      return (
+        typeof data.message === 'string' &&
+        data.message.includes('CASCADE_TOMBSTONE_HIGH_WATERMARK')
+      );
+    });
+    expect(alerts.length).toBe(0);
+
+    // Cross the watermark — exactly one alert despite 101 further
+    // insertions (debounced via cascadeTombstoneHighWatermarkAlerted).
+    for (let i = HIGH_WATERMARK - 1; i < HIGH_WATERMARK + 100; i++) {
+      w.insertCascadeTombstone(`token-${i}`);
+    }
+    alerts = harness.events.events.filter((e) => {
+      if (e.type !== 'transfer:operator-alert') return false;
+      const data = e.data as { message?: string };
+      return (
+        typeof data.message === 'string' &&
+        data.message.includes('CASCADE_TOMBSTONE_HIGH_WATERMARK')
+      );
+    });
+    expect(alerts.length).toBe(1);
+  });
+
+  it('re-inserting an existing tombstone re-ranks it to MRU (LRU semantics)', async () => {
+    const harness = buildWorker();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const w = harness.worker as any;
+
+    w.insertCascadeTombstone('token-A');
+    w.insertCascadeTombstone('token-B');
+    w.insertCascadeTombstone('token-C');
+
+    // Re-insert token-A: it MUST move to the most-recent slot (last
+    // in iteration order).
+    w.insertCascadeTombstone('token-A');
+
+    const keys = Array.from(w.cascadeTombstones.keys()) as string[];
+    expect(keys[keys.length - 1]).toBe('token-A');
+    expect(w.cascadeTombstones.size).toBe(3);
   });
 });
 

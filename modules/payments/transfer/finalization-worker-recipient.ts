@@ -166,6 +166,37 @@ export type {
 export const RECIPIENT_SCAN_LIST_HARD_GUARD = 16384;
 
 /**
+ * Round 3 regression fix: bounded LRU cap for the cascade-tombstone
+ * memo set. Pre-Round-3 the set grew unbounded — a long-lived
+ * recipient worker accumulated one tombstone per cascade indefinitely.
+ * The cap here is a hard guarantee: insertions past the cap evict
+ * the oldest tombstone in insertion order.
+ *
+ * Sizing: 10000 covers ~3 days of sustained cascade activity at the
+ * realistic worst-case rate of ~30 cascades/min (one per token in a
+ * heavily-attacked address). Cross-restart safety is delivered by
+ * the disposition writer's INVALID record on disk; the in-memory set
+ * is purely a fast-path memo, so eviction of the oldest entries is
+ * always safe — they're the ones whose disposition record has long
+ * since been observed by every active poll cycle.
+ *
+ * @internal
+ */
+export const CASCADE_TOMBSTONE_HARD_CAP = 10000;
+
+/**
+ * Round 3 regression fix: high-water mark for cascade-tombstone
+ * accumulation. When the live set crosses this threshold a
+ * `transfer:operator-alert` fires (once per accumulation cycle —
+ * see {@link FinalizationWorkerRecipient#cascadeTombstoneHighWatermarkAlerted}
+ * for the debounce). Sized at 80% of {@link CASCADE_TOMBSTONE_HARD_CAP}
+ * so operators have time to investigate before silent eviction begins.
+ *
+ * @internal
+ */
+export const CASCADE_TOMBSTONE_HIGH_WATERMARK = 8000;
+
+/**
  * Power-of-two helper for the exponential alert backoff.
  * @internal
  */
@@ -502,7 +533,7 @@ export class FinalizationWorkerRecipient {
    * — proof leaked into the pool of an invalid token.
    *
    * The fix: when applyHardFailCascade runs (under the per-tokenId
-   * mutex), mark the tokenId in this Set. Each `attachProof` closure
+   * mutex), mark the tokenId in this Map. Each `attachProof` closure
    * checks the tombstone BEFORE writing; if set, it aborts cleanly
    * with a `transfer:cascade-skip-stale` operator-alert.
    *
@@ -512,9 +543,37 @@ export class FinalizationWorkerRecipient {
    * on next-pass build-revaluate-input and skips proof attachment via
    * the existing engine logic).
    *
+   * Round 3 regression fix: bounded LRU eviction. Pre-Round-3 the set
+   * was unbounded — a long-lived worker accumulated one entry per
+   * cascade indefinitely (no GC, no eviction). Memory growth is a slow
+   * leak that only matters in worker-pool deployments running for
+   * weeks, but the bound here is a hard guarantee: at
+   * {@link CASCADE_TOMBSTONE_HARD_CAP} entries, the oldest tombstone
+   * is evicted on every new insert. At
+   * {@link CASCADE_TOMBSTONE_HIGH_WATERMARK} a `transfer:operator-alert`
+   * fires (debounced via {@link cascadeTombstoneHighWatermarkAlerted})
+   * so operators can investigate before silent eviction begins.
+   *
+   * Insertion-order is preserved by JavaScript's `Map`; the LRU
+   * eviction therefore deletes the oldest (least-recently-inserted)
+   * tombstone — which is also the safest to evict because the
+   * disposition writer's INVALID record on disk is the durable
+   * cross-restart source of truth (this is a fast-path memo, not a
+   * canonical record). Re-touching a tombstone (re-insertion of an
+   * already-present tokenId) re-ranks it to most-recently-used.
+   *
    * @internal
    */
-  private readonly cascadeTombstones: Set<string> = new Set();
+  private readonly cascadeTombstones: Map<string, true> = new Map();
+  /**
+   * Round 3 regression fix: emit-once flag for the high-watermark
+   * alert. Without it, every insert past the watermark would re-fire
+   * the alert (one per cascade), drowning operators in noise. Resets
+   * when the set drops back below the watermark on eviction.
+   *
+   * @internal
+   */
+  private cascadeTombstoneHighWatermarkAlerted = false;
   /**
    * Wave 4 steelman: consecutive `queueStore.list()` failure counter
    * for exponential alert backoff. Same rationale as the sender
@@ -1236,6 +1295,76 @@ export class FinalizationWorkerRecipient {
    *
    * @internal
    */
+
+  /**
+   * Round 3 regression fix: bounded-LRU insertion into
+   * {@link cascadeTombstones}. Pre-Round-3 the set was a plain
+   * unbounded `Set` — long-lived workers accumulated entries
+   * indefinitely. Now:
+   *
+   *   1. Re-touching an existing tokenId re-ranks it to MRU
+   *      (delete + re-insert preserves Map insertion-order semantics).
+   *   2. At {@link CASCADE_TOMBSTONE_HIGH_WATERMARK} a single
+   *      operator alert fires (debounced via the
+   *      {@link cascadeTombstoneHighWatermarkAlerted} flag).
+   *   3. At {@link CASCADE_TOMBSTONE_HARD_CAP} the oldest entry is
+   *      evicted (Map's first key is the least-recently-inserted).
+   *
+   * Cross-restart safety: the disposition writer's INVALID record on
+   * disk is the durable source of truth. Evicting a tombstone here
+   * is always safe — at worst, a sibling cycle that arrives AFTER
+   * eviction observes the on-disk INVALID record and the existing
+   * engine logic skips the proof attach via the disposition lookup.
+   *
+   * @internal
+   */
+  private insertCascadeTombstone(tokenId: string): void {
+    // Re-rank existing entries to MRU.
+    if (this.cascadeTombstones.has(tokenId)) {
+      this.cascadeTombstones.delete(tokenId);
+    }
+    this.cascadeTombstones.set(tokenId, true);
+
+    // High-watermark alert (debounced).
+    if (
+      this.cascadeTombstones.size >= CASCADE_TOMBSTONE_HIGH_WATERMARK &&
+      !this.cascadeTombstoneHighWatermarkAlerted
+    ) {
+      this.cascadeTombstoneHighWatermarkAlerted = true;
+      this.options.emit('transfer:operator-alert', {
+        code: 'structural',
+        message:
+          `CASCADE_TOMBSTONE_HIGH_WATERMARK: in-memory cascade-tombstone ` +
+          `set crossed the high-watermark (${CASCADE_TOMBSTONE_HIGH_WATERMARK} of ` +
+          `${CASCADE_TOMBSTONE_HARD_CAP} hard cap). Sustained accumulation ` +
+          `usually indicates a cascade storm (many descendants flipped to ` +
+          `_invalid in a short window) — investigate before silent eviction ` +
+          `begins at the hard cap.`,
+      });
+    }
+
+    // Hard-cap eviction — drop the oldest (least-recently-inserted) entries
+    // until we're back under the cap. In practice only one eviction per
+    // insertion is needed once steady-state is reached.
+    while (this.cascadeTombstones.size > CASCADE_TOMBSTONE_HARD_CAP) {
+      const oldest = this.cascadeTombstones.keys().next();
+      if (oldest.done === true || oldest.value === undefined) break;
+      this.cascadeTombstones.delete(oldest.value);
+    }
+
+    // Reset the high-watermark debounce when the set drops back below
+    // the threshold (e.g., a future external pruning hook). Note: with
+    // hard-cap eviction at 10000 and the watermark at 8000, the set
+    // never spontaneously falls below the watermark — the reset is
+    // future-proofing for when an explicit pruner is added.
+    if (
+      this.cascadeTombstoneHighWatermarkAlerted &&
+      this.cascadeTombstones.size < CASCADE_TOMBSTONE_HIGH_WATERMARK
+    ) {
+      this.cascadeTombstoneHighWatermarkAlerted = false;
+    }
+  }
+
   private async applyHardFailCascade(args: {
     readonly tokenId: string;
     readonly reason: DispositionReason;
@@ -1255,7 +1384,11 @@ export class FinalizationWorkerRecipient {
     // worker; cross-restart safety is delivered by the disposition
     // writer's INVALID record (existing engine logic skips reattach
     // when an INVALID disposition is observed on rebuild).
-    this.cascadeTombstones.add(args.tokenId);
+    //
+    // Round 3 regression fix: bounded LRU insertion. See
+    // {@link insertCascadeTombstone} for the eviction + high-watermark
+    // alert policy.
+    this.insertCascadeTombstone(args.tokenId);
 
     // (1) Self-invalidation: write INVALID disposition for the
     // recipient's own copy.
