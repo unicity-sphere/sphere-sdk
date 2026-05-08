@@ -39,7 +39,12 @@ import { UxfError } from './errors.js';
 import { computeElementHash } from './hash.js';
 import { hexToBytesAllowEmpty } from '../core/hex.js';
 import { assertHeaderKindField, assertHeaderVersionField } from './header-validation.js';
-import { ELEMENTS_MAX_SIZE, MANIFEST_MAX_SIZE } from './limits.js';
+import {
+  ELEMENTS_MAX_SIZE,
+  MANIFEST_MAX_SIZE,
+  MAX_CREATOR_LENGTH,
+  MAX_DESCRIPTION_LENGTH,
+} from './limits.js';
 
 // ---------------------------------------------------------------------------
 // Type ID <-> String Tag mapping
@@ -360,6 +365,29 @@ export function packageFromJson(json: string): UxfPackageData {
       'Missing or invalid "metadata" field',
     );
   }
+  // Steelman³ remediation (FIX 3, Round 3): meta.creator / meta.description
+  // were forwarded with NO type validation — ipld.ts had explicit string
+  // guards (lines 448-462) but the JSON path silently accepted any type.
+  // Apply optional-string guards here so a hostile JSON payload with
+  // `creator: 42` or `description: { __proto__: ... }` cannot smuggle
+  // garbage through.
+  // Steelman³ remediation (FIX 4, Round 3): also enforce length caps so
+  // a 100 MiB creator/description string cannot be persisted via the
+  // JSON path even if its `typeof` matches.
+  const creator = requireOptionalString(meta, 'creator', 'metadata');
+  if (creator !== undefined && creator.length > MAX_CREATOR_LENGTH) {
+    throw new UxfError(
+      'LIMIT_EXCEEDED',
+      `metadata.creator exceeds MAX_CREATOR_LENGTH=${MAX_CREATOR_LENGTH}: ${creator.length}`,
+    );
+  }
+  const description = requireOptionalString(meta, 'description', 'metadata');
+  if (description !== undefined && description.length > MAX_DESCRIPTION_LENGTH) {
+    throw new UxfError(
+      'LIMIT_EXCEEDED',
+      `metadata.description exceeds MAX_DESCRIPTION_LENGTH=${MAX_DESCRIPTION_LENGTH}: ${description.length}`,
+    );
+  }
   const envelope: UxfEnvelope = {
     version: requireString(meta, 'version', 'metadata'),
     // Steelman remediation (FIX 7): timestamps are non-negative
@@ -367,10 +395,8 @@ export function packageFromJson(json: string): UxfPackageData {
     // negative values explicitly.
     createdAt: requireTimestamp(meta, 'createdAt', 'metadata'),
     updatedAt: requireTimestamp(meta, 'updatedAt', 'metadata'),
-    ...(meta.creator !== undefined ? { creator: meta.creator } : {}),
-    ...(meta.description !== undefined
-      ? { description: meta.description }
-      : {}),
+    ...(creator !== undefined ? { creator } : {}),
+    ...(description !== undefined ? { description } : {}),
   };
 
   // -- manifest --
@@ -672,6 +698,34 @@ function requireString(
     throw new UxfError(
       'SERIALIZATION_ERROR',
       `Missing or invalid "${field}" in ${context}: expected string`,
+    );
+  }
+  return value;
+}
+
+/**
+ * Require an OPTIONAL string field on an object: returns the value when
+ * `typeof === 'string'`, returns `undefined` when the field is absent
+ * (or explicitly `undefined`), throws SERIALIZATION_ERROR for any other
+ * type.
+ *
+ * Steelman³ remediation (FIX 3, Round 3): meta.creator / meta.description
+ * were silently accepted at any type. Mirror the `ipld.ts` runtime guards
+ * exactly via this helper.
+ */
+function requireOptionalString(
+  obj: Record<string, unknown>,
+  field: string,
+  context: string,
+): string | undefined {
+  const value = obj[field];
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== 'string') {
+    throw new UxfError(
+      'SERIALIZATION_ERROR',
+      `Invalid "${field}" in ${context}: expected string or undefined, got ${typeof value}`,
     );
   }
   return value;

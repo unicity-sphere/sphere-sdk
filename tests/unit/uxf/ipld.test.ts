@@ -754,3 +754,239 @@ describe('importFromCar — runtime envelope type guards (FIX 12)', () => {
     expect(String(err.message)).toMatch(/is not a CID/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Steelman³ regression — FIX 2 (Round 3): symmetric envelope.version pinning.
+// ---------------------------------------------------------------------------
+
+describe('importFromCar — envelope.version whitelist (FIX 2, Round 3)', () => {
+  async function buildCarWithVersion(version: unknown): Promise<Uint8Array> {
+    const manifestNode = { tokens: {} };
+    const manifestBytes = dagCborEncode(manifestNode);
+    const manifestCid = CID.createV1(DAG_CBOR_CODE_TEST, makeSha256Digest(nobleSha256(manifestBytes)));
+    const envelopeNode = {
+      version,
+      createdAt: 1,
+      updatedAt: 1,
+      manifest: manifestCid,
+    };
+    const envelopeBytes = dagCborEncode(envelopeNode);
+    const envelopeCid = CID.createV1(DAG_CBOR_CODE_TEST, makeSha256Digest(nobleSha256(envelopeBytes)));
+    const { writer, out } = CarWriter.create([envelopeCid]);
+    const collectPromise = (async () => {
+      const chunks: Uint8Array[] = [];
+      for await (const c of out) chunks.push(c);
+      return chunks;
+    })();
+    await writer.put({ cid: envelopeCid, bytes: envelopeBytes });
+    await writer.put({ cid: manifestCid, bytes: manifestBytes });
+    await writer.close();
+    const chunks = await collectPromise;
+    let total = 0;
+    for (const c of chunks) total += c.byteLength;
+    const car = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) {
+      car.set(c, off);
+      off += c.byteLength;
+    }
+    return car;
+  }
+
+  it('rejects envelope.version "2.0.0" with SERIALIZATION_ERROR', async () => {
+    const car = await buildCarWithVersion('2.0.0');
+    let err: any;
+    try {
+      await importFromCar(car);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('SERIALIZATION_ERROR');
+    expect(String(err.message)).toMatch(/Unsupported uxf version/);
+  });
+
+  it('rejects envelope.version "999.0.0-malicious"', async () => {
+    const car = await buildCarWithVersion('999.0.0-malicious');
+    let err: any;
+    try {
+      await importFromCar(car);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('SERIALIZATION_ERROR');
+    expect(String(err.message)).toMatch(/Unsupported uxf version/);
+  });
+
+  it('rejects empty envelope.version', async () => {
+    const car = await buildCarWithVersion('');
+    let err: any;
+    try {
+      await importFromCar(car);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('SERIALIZATION_ERROR');
+  });
+
+  it('accepts canonical envelope.version "1.0.0"', async () => {
+    const car = await buildCarWithVersion('1.0.0');
+    const pkg = await importFromCar(car);
+    expect(pkg.envelope.version).toBe('1.0.0');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Steelman³ regression — FIX 5 (Round 3): rebuildInstanceChains cycle detection.
+// ---------------------------------------------------------------------------
+
+describe('rebuildInstanceChains — predecessor cycle rejection (FIX 5, Round 3)', () => {
+  it('rejects pool with predecessor cycle (A → B → A) with INVALID_INSTANCE_CHAIN', async () => {
+    // SHA-256 fixed-points make CAR-level cycles computationally infeasible
+    // to forge (each element hash depends on its predecessor hash), so the
+    // cycle guard is exercised by direct in-memory pool construction. This
+    // mirrors the threat model the guard defends against: an in-memory
+    // merge / token-join bug that aliases hashes into a cycle.
+    //
+    // The test pattern: pick three pool entries where the head-finder
+    // identifies a unique walk start, and the walk encounters a back-edge.
+    // Specifically: A has predecessor=B, B has predecessor=C, C has
+    // predecessor=B → walking from A: A→B→C→B (cycle). A is the head
+    // (no successors), so the walk starts.
+    const { rebuildInstanceChains: rebuild } = await import('../../../uxf/ipld.js');
+    const elA: UxfElement = {
+      header: { representation: 1, semantics: 1, kind: 'default', predecessor: 'bb'.repeat(32) as ContentHash },
+      type: 'token-state',
+      content: {},
+      children: {},
+    };
+    const elB: UxfElement = {
+      header: { representation: 1, semantics: 1, kind: 'default', predecessor: 'cc'.repeat(32) as ContentHash },
+      type: 'token-state',
+      content: {},
+      children: {},
+    };
+    const elC: UxfElement = {
+      header: { representation: 1, semantics: 1, kind: 'default', predecessor: 'bb'.repeat(32) as ContentHash },
+      type: 'token-state',
+      content: {},
+      children: {},
+    };
+    const hA = 'aa'.repeat(32) as ContentHash;
+    const hB = 'bb'.repeat(32) as ContentHash;
+    const hC = 'cc'.repeat(32) as ContentHash;
+    const pool = new Map<ContentHash, UxfElement>();
+    pool.set(hA, elA);
+    pool.set(hB, elB);
+    pool.set(hC, elC);
+
+    // Head-finder: A is not a successor of anything (B is successor of A
+    // and C; C is successor of B; A has no incoming predecessor edge), so
+    // A is a head. Walk: A→B→C→B → cycle on B.
+    let err: any;
+    try {
+      rebuild(pool);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('INVALID_INSTANCE_CHAIN');
+    expect(String(err.message)).toMatch(/predecessor cycle detected/);
+  });
+
+  it('rejects pool with self-loop predecessor (X → X)', async () => {
+    // Edge case: a single element X whose predecessor=X. The head-finder
+    // skips X (it IS a successor of itself, so it's in successorsOf), so
+    // no walk starts via the primary head path. But the secondary
+    // "Also find heads" branch checks successors-of-something-not-preds-
+    // of-anything-else; in a self-loop, X's successor is X (itself), so
+    // X is a successor and ALSO a key in successorsOf — so it isn't
+    // added as head there either. In this corner case the walk simply
+    // never starts, and rebuild returns an empty chains map. That's
+    // still safe (no infinite loop). Verify behaviour.
+    const { rebuildInstanceChains: rebuild } = await import('../../../uxf/ipld.js');
+    const hX = 'aa'.repeat(32) as ContentHash;
+    const elX: UxfElement = {
+      header: { representation: 1, semantics: 1, kind: 'default', predecessor: hX },
+      type: 'token-state',
+      content: {},
+      children: {},
+    };
+    const pool = new Map<ContentHash, UxfElement>();
+    pool.set(hX, elX);
+    // Should NOT infinite-loop, even if no exception is thrown.
+    const chains = rebuild(pool);
+    expect(chains).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Steelman³ regression — FIX 7 (Round 3): clearer error on non-sha2-256 multihash.
+// ---------------------------------------------------------------------------
+
+describe('importFromCar — assertBlockHashMatchesCid clearer non-sha256 error (FIX 7, Round 3)', () => {
+  it('envelope CID with sha2-512 multihash → clear VERIFICATION_FAILED', async () => {
+    // Build a CAR where the envelope CID uses sha2-512 (0x13) instead
+    // of sha2-256 (0x12). The previous implementation would compute
+    // sha256 of the bytes, find a length mismatch (32 vs 64), and
+    // throw a confusing "length mismatch" error. The new guard should
+    // throw a clear "must use sha2-256" error.
+    const realEnvelopeBytes = dagCborEncode({
+      version: '1.0.0',
+      createdAt: 1,
+      updatedAt: 1,
+      manifest: CID.createV1(DAG_CBOR_CODE_TEST, makeSha256Digest(nobleSha256(dagCborEncode({ tokens: {} })))),
+    });
+    // Create a sha2-512-style multihash (code = 0x13). We don't actually
+    // hash with sha512 — we just craft a 64-byte digest under code 0x13
+    // and trust the CID library will accept it (the multiformats lib
+    // accepts any multihash code at construction time).
+    const fakeDigest64 = new Uint8Array(64);
+    for (let i = 0; i < 64; i++) fakeDigest64[i] = i;
+    const code = 0x13; // sha2-512
+    const size = 64;
+    const bytes = new Uint8Array(2 + size);
+    bytes[0] = code;
+    bytes[1] = size;
+    bytes.set(fakeDigest64, 2);
+    const sha512Multihash = { code: code as unknown as 0x12, size, digest: fakeDigest64, bytes };
+    // Create CID v1 with dag-cbor codec (0x71) and sha2-512 multihash.
+    const fakeCid = CID.createV1(DAG_CBOR_CODE_TEST, sha512Multihash as unknown as ReturnType<typeof makeSha256Digest>);
+
+    const { writer, out } = CarWriter.create([fakeCid]);
+    const collectPromise = (async () => {
+      const chunks: Uint8Array[] = [];
+      for await (const c of out) chunks.push(c);
+      return chunks;
+    })();
+    await writer.put({ cid: fakeCid, bytes: realEnvelopeBytes });
+    await writer.close();
+    const chunks = await collectPromise;
+    let total = 0;
+    for (const c of chunks) total += c.byteLength;
+    const car = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) {
+      car.set(c, off);
+      off += c.byteLength;
+    }
+
+    let err: any;
+    try {
+      await importFromCar(car);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    // The error may surface from cidToContentHash (called for
+    // envelopeCid → roots[0] check) or from assertBlockHashMatchesCid.
+    // Both paths use the same multihash check; either error is
+    // acceptable. The key requirement: the message clearly mentions
+    // sha2-256 expectation — NOT a confusing length-mismatch error.
+    const msg = String(err.message);
+    expect(err.code).toMatch(/SERIALIZATION_ERROR|VERIFICATION_FAILED/);
+    expect(msg).toMatch(/sha2-256/);
+  });
+});

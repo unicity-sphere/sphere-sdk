@@ -598,6 +598,20 @@ export function assembleTokenAtState(
       `assembleTokenAtState: stateIndex must be a non-negative integer (got ${stateIndex})`,
     );
   }
+  // Steelman³ remediation (FIX 6, Round 3): explicit upper bound. The
+  // `Number.isInteger` guard above does NOT reject 2**53 (precision
+  // loss makes 2**53 === 2**53 + 1 = true), so the previous code would
+  // happily accept `Number.MAX_SAFE_INTEGER + 1` and pass it down to
+  // `transactions.slice(0, stateIndex)`. JS arrays are bounded at
+  // uint32 max (2**32 - 1) anyway, so cap there as the practical
+  // ceiling — anything beyond is provably out-of-range and most
+  // callers genuinely meant a typo.
+  if (stateIndex > 4_294_967_295) {
+    throw new UxfError(
+      'INVALID_INPUT',
+      `assembleTokenAtState: stateIndex out of range (got ${stateIndex}, max=4294967295)`,
+    );
+  }
 
   const rootHash = manifest.tokens.get(tokenId);
   if (!rootHash) {

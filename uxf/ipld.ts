@@ -47,6 +47,8 @@ import {
   CAR_IMPORT_MAX_BLOCK_BYTES,
   CAR_IMPORT_MAX_TOTAL_BYTES,
   MANIFEST_MAX_SIZE,
+  MAX_CREATOR_LENGTH,
+  MAX_DESCRIPTION_LENGTH,
 } from './limits.js';
 
 // ---------------------------------------------------------------------------
@@ -431,6 +433,18 @@ export async function importFromCar(car: Uint8Array): Promise<UxfPackageData> {
       `Envelope.version must be a string, got ${typeof envVersion}`,
     );
   }
+  // Steelman³ remediation (FIX 2, Round 3): symmetric envelope.version
+  // pinning. The JSON outer-wrapper gate (json.ts:348) strictly requires
+  // `raw.uxf === '1.0.0'`, but the CAR side previously accepted ANY
+  // string. A hostile peer could ship `version: "999.0.0-malicious"` and
+  // ride unknown-version semantics under our 1.0.0 parser. Mirror the
+  // JSON whitelist here so both deserializers reject the same shape.
+  if (envVersion !== '1.0.0') {
+    throw new UxfError(
+      'SERIALIZATION_ERROR',
+      `Unsupported uxf version: "${envVersion}"`,
+    );
+  }
   const envCreatedAt = envelopeNode.createdAt;
   if (typeof envCreatedAt !== 'number' || !Number.isFinite(envCreatedAt)) {
     throw new UxfError(
@@ -451,6 +465,20 @@ export async function importFromCar(car: Uint8Array): Promise<UxfPackageData> {
       `Envelope.creator must be a string or undefined, got ${typeof envelopeNode.creator}`,
     );
   }
+  // Steelman³ remediation (FIX 4, Round 3): length caps on
+  // creator/description. Without them, a 100 MiB string smuggled in
+  // either field passes the typeof guard above and lives for the
+  // import's lifetime. Cap at the parse boundary (mirrors json.ts
+  // post-FIX 4 cap so both deserializers reject the same shape).
+  if (
+    typeof envelopeNode.creator === 'string' &&
+    envelopeNode.creator.length > MAX_CREATOR_LENGTH
+  ) {
+    throw new UxfError(
+      'LIMIT_EXCEEDED',
+      `Envelope.creator exceeds MAX_CREATOR_LENGTH=${MAX_CREATOR_LENGTH}: ${envelopeNode.creator.length}`,
+    );
+  }
   if (
     envelopeNode.description !== undefined &&
     typeof envelopeNode.description !== 'string'
@@ -458,6 +486,15 @@ export async function importFromCar(car: Uint8Array): Promise<UxfPackageData> {
     throw new UxfError(
       'SERIALIZATION_ERROR',
       `Envelope.description must be a string or undefined, got ${typeof envelopeNode.description}`,
+    );
+  }
+  if (
+    typeof envelopeNode.description === 'string' &&
+    envelopeNode.description.length > MAX_DESCRIPTION_LENGTH
+  ) {
+    throw new UxfError(
+      'LIMIT_EXCEEDED',
+      `Envelope.description exceeds MAX_DESCRIPTION_LENGTH=${MAX_DESCRIPTION_LENGTH}: ${envelopeNode.description.length}`,
     );
   }
 
@@ -882,8 +919,13 @@ function decodeIpldChildren(
 /**
  * Rebuild instance chains from element predecessor links.
  * Scans all elements in the pool and groups them by predecessor chains.
+ *
+ * Exported for testing the FIX 5 cycle-detection guard. SHA-256 fixed
+ * points make a CAR-level cycle computationally infeasible to forge,
+ * so the cycle guard is exercised via direct in-memory pool
+ * construction (e.g. token-join / merge regression tests).
  */
-function rebuildInstanceChains(
+export function rebuildInstanceChains(
   pool: ReadonlyMap<ContentHash, UxfElement>,
 ): Map<ContentHash, InstanceChainEntry> {
   const chains = new Map<ContentHash, InstanceChainEntry>();
@@ -929,11 +971,25 @@ function rebuildInstanceChains(
   }
 
   // For each head, walk the predecessor chain
+  // Steelman³ remediation (FIX 5, Round 3): cycle detection. A hostile
+  // CAR can construct two elements pointing at each other via
+  // `header.predecessor`, sending the `while (current !== null)` walk
+  // into an infinite loop (chain.push grows the array unbounded; the
+  // process eventually OOMs). Track visited hashes per-walk and throw
+  // if the same hash reappears.
   for (const head of heads) {
     const chain: Array<{ hash: ContentHash; kind: UxfInstanceKind }> = [];
+    const seen = new Set<string>();
     let current: ContentHash | null = head;
 
     while (current !== null) {
+      if (seen.has(current as string)) {
+        throw new UxfError(
+          'INVALID_INSTANCE_CHAIN',
+          `predecessor cycle detected at element ${current}`,
+        );
+      }
+      seen.add(current as string);
       const element = pool.get(current);
       if (!element) break;
       chain.push({ hash: current, kind: element.header.kind });
@@ -992,6 +1048,20 @@ function assertBlockHashMatchesCid(
   cid: CID,
   label: string,
 ): void {
+  // Steelman³ remediation (FIX 7, Round 3): explicit guard for non-sha2-256
+  // multihashes. Without this, a CID built with a different hash algorithm
+  // (e.g. sha2-512 = 0x13) hits the generic length-mismatch branch below
+  // and emits a confusing message ("length mismatch: 32 vs 64") that hides
+  // the root cause (wrong multihash code). The CID-builder side
+  // (`cidToContentHash`) already enforces 0x12 — mirror that gate here so
+  // the verification path has a clear, dedicated error for the algorithm
+  // mismatch.
+  if (cid.multihash.code !== 0x12) {
+    throw new UxfError(
+      'VERIFICATION_FAILED',
+      `${label} CID must use sha2-256 (0x12); got 0x${cid.multihash.code.toString(16)}`,
+    );
+  }
   const computed = sha256Sync(bytes);
   const claimed = cid.multihash.digest;
   if (computed.length !== claimed.length) {

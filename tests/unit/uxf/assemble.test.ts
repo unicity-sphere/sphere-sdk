@@ -579,3 +579,73 @@ describe('assembleTokenAtState — stateIndex validation (FIX 10)', () => {
     expect(() => assembleTokenAtState(pool, manifest, tokenId, 0, emptyChains)).not.toThrow();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Steelman³ regression — FIX 6 (Round 3): stateIndex uint32 max cap.
+//
+// `Number.isInteger(2**53)` returns true (precision loss makes 2**53 ===
+// 2**53 + 1), so the FIX 10 guard alone passes Number.MAX_SAFE_INTEGER
+// silently. JS arrays are bounded at uint32 max anyway; cap there.
+// ---------------------------------------------------------------------------
+
+describe('assembleTokenAtState — uint32 max stateIndex cap (FIX 6, Round 3)', () => {
+  let pool: ElementPool;
+  beforeEach(() => {
+    pool = new ElementPool();
+  });
+
+  function setup() {
+    const { manifest, tokenId } = deconstructAndManifest(pool, TOKEN_C);
+    return { manifest, tokenId };
+  }
+
+  it('rejects Number.MAX_SAFE_INTEGER (2**53 - 1) with INVALID_INPUT', () => {
+    const { manifest, tokenId } = setup();
+    let err: any;
+    try {
+      assembleTokenAtState(pool, manifest, tokenId, Number.MAX_SAFE_INTEGER, emptyChains);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(UxfError);
+    expect((err as UxfError).code).toBe('INVALID_INPUT');
+    expect(String((err as UxfError).message)).toMatch(/out of range/);
+  });
+
+  it('rejects Number.MAX_SAFE_INTEGER + 1 (2**53) with INVALID_INPUT', () => {
+    const { manifest, tokenId } = setup();
+    let err: any;
+    try {
+      assembleTokenAtState(pool, manifest, tokenId, Number.MAX_SAFE_INTEGER + 1, emptyChains);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(UxfError);
+    expect((err as UxfError).code).toBe('INVALID_INPUT');
+  });
+
+  it('rejects 2**32 (just over uint32 max) with INVALID_INPUT', () => {
+    const { manifest, tokenId } = setup();
+    let err: any;
+    try {
+      assembleTokenAtState(pool, manifest, tokenId, 2 ** 32, emptyChains);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(UxfError);
+    expect((err as UxfError).code).toBe('INVALID_INPUT');
+    expect(String((err as UxfError).message)).toMatch(/out of range/);
+  });
+
+  it('rejects 4_294_967_296 (uint32 max + 1) with INVALID_INPUT', () => {
+    const { manifest, tokenId } = setup();
+    let err: any;
+    try {
+      assembleTokenAtState(pool, manifest, tokenId, 4_294_967_296, emptyChains);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(UxfError);
+    expect((err as UxfError).code).toBe('INVALID_INPUT');
+  });
+});

@@ -128,3 +128,43 @@ export const MANIFEST_MAX_SIZE = 100_000;
  * by reasonable DAG depth, keeping the two layers consistent.
  */
 export const ELEMENTS_MAX_SIZE = 100_000;
+
+/**
+ * Maximum byte length of `metadata.creator` accepted by JSON / CAR
+ * deserializers.
+ *
+ * Steelman³ remediation (FIX 4, Round 3): without an explicit length
+ * cap, a hostile package can ship a 100 MiB `creator` string under
+ * the existing `typeof === 'string'` guard. The string is held for
+ * the lifetime of the imported package and round-trips on every
+ * subsequent serialize. 256 chars matches typical username/handle
+ * sizes (e.g. legal email-addr length is 254) and rejects bloat at
+ * the parse boundary.
+ */
+export const MAX_CREATOR_LENGTH = 256;
+
+/**
+ * Maximum byte length of `metadata.description` accepted by JSON /
+ * CAR deserializers.
+ *
+ * Steelman³ remediation (FIX 4, Round 3): same threat model as
+ * MAX_CREATOR_LENGTH; descriptions are user-facing free-form text
+ * but a 1 KiB ceiling is generous slack while preventing memory
+ * bloat through a free-form metadata field.
+ */
+export const MAX_DESCRIPTION_LENGTH = 1024;
+
+/**
+ * Maximum decimal-digit length for an SMT path string.
+ *
+ * Steelman³ remediation (FIX 4, Round 3): `parseSmtPathDecimal`
+ * accepts an arbitrary-length decimal string then hands it to
+ * `BigInt()`. A hostile peer can ship a 100 MiB string of decimal
+ * digits — `BigInt()` will allocate the corresponding bigint
+ * (megabytes of mantissa) before the downstream `bigIntTo32Bytes`
+ * cap rejects it. Cap upfront to the maximum decimal-digit count
+ * that fits into a uint256 (which is the SMT path domain).
+ *
+ * 2^256 - 1 = 78 decimal digits.
+ */
+export const MAX_SMT_PATH_DECIMAL_LENGTH = 78;

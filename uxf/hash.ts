@@ -21,6 +21,7 @@ import {
   ELEMENT_TYPE_IDS,
 } from './types.js';
 import { UxfError } from './errors.js';
+import { MAX_SMT_PATH_DECIMAL_LENGTH } from './limits.js';
 
 // ---------------------------------------------------------------------------
 // Hex/Bytes helpers
@@ -267,6 +268,19 @@ function prepareSmtSegments(
 function parseSmtPathDecimal(s: string): bigint {
   if (typeof s !== 'string' || !/^(0|[1-9][0-9]*)$/.test(s)) {
     throw new UxfError('INVALID_INPUT', `Invalid SMT path string: ${s}`);
+  }
+  // Steelman³ remediation (FIX 4, Round 3): cap decimal-digit length
+  // BEFORE handing the string to BigInt(). The SMT path domain is
+  // uint256 (78 decimal digits maximum); a hostile peer can ship a
+  // 100 MiB string of `9`s, and BigInt() will allocate the
+  // corresponding mantissa (megabytes) before bigIntTo32Bytes finally
+  // rejects the result. Reject upfront so the BigInt() allocation
+  // never starts.
+  if (s.length > MAX_SMT_PATH_DECIMAL_LENGTH) {
+    throw new UxfError(
+      'LIMIT_EXCEEDED',
+      `SMT path decimal exceeds MAX_SMT_PATH_DECIMAL_LENGTH=${MAX_SMT_PATH_DECIMAL_LENGTH}: ${s.length}`,
+    );
   }
   return BigInt(s);
 }

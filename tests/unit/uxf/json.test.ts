@@ -693,6 +693,8 @@ describe('packageFromJson — elements pool size cap (FIX 1, Round 3)', () => {
     const elements: Record<string, unknown> = {};
     for (let i = 0; i <= 100_000; i++) {
       const k = i.toString(16).padStart(64, '0');
+      // Minimal element shape; will never be inspected because the cap
+      // fires first.
       elements[k] = {
         header: { representation: 1, semantics: 1, kind: 'default', predecessor: null },
         type: 0,
@@ -723,5 +725,153 @@ describe('packageFromJson — elements pool size cap (FIX 1, Round 3)', () => {
     expect(err).toBeDefined();
     expect(err.code).toBe('LIMIT_EXCEEDED');
     expect(String(err.message)).toMatch(/Elements pool size exceeds ELEMENTS_MAX_SIZE/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Steelman³ regression — FIX 3 (Round 3): meta.creator/description type guards.
+// ---------------------------------------------------------------------------
+
+describe('packageFromJson — meta.creator/description type guards (FIX 3, Round 3)', () => {
+  function makeJsonWithMeta(meta: Record<string, unknown>): string {
+    return JSON.stringify({
+      uxf: '1.0.0',
+      metadata: {
+        version: '1.0.0',
+        createdAt: 1,
+        updatedAt: 1,
+        elementCount: 0,
+        tokenCount: 0,
+        ...meta,
+      },
+      manifest: {},
+      instanceChainIndex: {},
+      indexes: { byTokenType: {}, byCoinId: {}, byStateHash: {} },
+      elements: {},
+    });
+  }
+
+  it('rejects meta.creator: 42 (number) with SERIALIZATION_ERROR', () => {
+    const json = makeJsonWithMeta({ creator: 42 });
+    let err: any;
+    try {
+      packageFromJson(json);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('SERIALIZATION_ERROR');
+    expect(String(err.message)).toMatch(/Invalid "creator"/);
+  });
+
+  it('rejects meta.creator: { __proto__: ... } (object) with SERIALIZATION_ERROR', () => {
+    const json = makeJsonWithMeta({ creator: { evil: true } });
+    let err: any;
+    try {
+      packageFromJson(json);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('SERIALIZATION_ERROR');
+  });
+
+  it('rejects meta.description: 42 (number) with SERIALIZATION_ERROR', () => {
+    const json = makeJsonWithMeta({ description: 42 });
+    let err: any;
+    try {
+      packageFromJson(json);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('SERIALIZATION_ERROR');
+    expect(String(err.message)).toMatch(/Invalid "description"/);
+  });
+
+  it('rejects meta.description: [] (array) with SERIALIZATION_ERROR', () => {
+    const json = makeJsonWithMeta({ description: [] });
+    let err: any;
+    try {
+      packageFromJson(json);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('SERIALIZATION_ERROR');
+  });
+
+  it('accepts meta.creator: undefined / absent (legitimate)', () => {
+    const json = makeJsonWithMeta({});
+    const pkg = packageFromJson(json);
+    expect(pkg.envelope.creator).toBeUndefined();
+  });
+
+  it('accepts meta.creator: "alice" (legitimate string)', () => {
+    const json = makeJsonWithMeta({ creator: 'alice' });
+    const pkg = packageFromJson(json);
+    expect(pkg.envelope.creator).toBe('alice');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Steelman³ regression — FIX 4 (Round 3): length caps on creator / description.
+// ---------------------------------------------------------------------------
+
+describe('packageFromJson — creator/description length caps (FIX 4, Round 3)', () => {
+  function makeJsonWithMeta(meta: Record<string, unknown>): string {
+    return JSON.stringify({
+      uxf: '1.0.0',
+      metadata: {
+        version: '1.0.0',
+        createdAt: 1,
+        updatedAt: 1,
+        elementCount: 0,
+        tokenCount: 0,
+        ...meta,
+      },
+      manifest: {},
+      instanceChainIndex: {},
+      indexes: { byTokenType: {}, byCoinId: {}, byStateHash: {} },
+      elements: {},
+    });
+  }
+
+  it('rejects 257-char creator with LIMIT_EXCEEDED', () => {
+    const json = makeJsonWithMeta({ creator: 'a'.repeat(257) });
+    let err: any;
+    try {
+      packageFromJson(json);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('LIMIT_EXCEEDED');
+    expect(String(err.message)).toMatch(/MAX_CREATOR_LENGTH/);
+  });
+
+  it('rejects 1025-char description with LIMIT_EXCEEDED', () => {
+    const json = makeJsonWithMeta({ description: 'd'.repeat(1025) });
+    let err: any;
+    try {
+      packageFromJson(json);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('LIMIT_EXCEEDED');
+    expect(String(err.message)).toMatch(/MAX_DESCRIPTION_LENGTH/);
+  });
+
+  it('accepts 256-char creator (boundary)', () => {
+    const json = makeJsonWithMeta({ creator: 'a'.repeat(256) });
+    const pkg = packageFromJson(json);
+    expect(pkg.envelope.creator?.length).toBe(256);
+  });
+
+  it('accepts 1024-char description (boundary)', () => {
+    const json = makeJsonWithMeta({ description: 'd'.repeat(1024) });
+    const pkg = packageFromJson(json);
+    expect(pkg.envelope.description?.length).toBe(1024);
   });
 });

@@ -570,3 +570,67 @@ describe('prepareSmtSegments — strict decimal regex on path (FIX 11)', () => {
     expect(err).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Steelman³ regression — FIX 4 (Round 3): SMT path decimal length cap.
+// ---------------------------------------------------------------------------
+
+describe('parseSmtPathDecimal — length cap (FIX 4, Round 3)', () => {
+  function attempt(path: string): UxfError | null {
+    try {
+      prepareContentForHashing('smt-path', {
+        segments: [{ data: 'aabb', path }],
+      });
+      return null;
+    } catch (e) {
+      return e as UxfError;
+    }
+  }
+
+  it('rejects 79-digit decimal (uint256 max + 1 digit) with LIMIT_EXCEEDED', () => {
+    // 78-digit max for uint256; 79 digits is one over. The string
+    // passes the regex (no leading zero) but exceeds the length cap.
+    const path = '1' + '0'.repeat(78); // 79 digits total, valid regex
+    const err = attempt(path);
+    expect(err).not.toBeNull();
+    expect(err!.code).toBe('LIMIT_EXCEEDED');
+    expect(String(err!.message)).toMatch(/MAX_SMT_PATH_DECIMAL_LENGTH/);
+  });
+
+  it('rejects 1000-digit decimal with LIMIT_EXCEEDED', () => {
+    const path = '1' + '0'.repeat(999);
+    const err = attempt(path);
+    expect(err).not.toBeNull();
+    expect(err!.code).toBe('LIMIT_EXCEEDED');
+  });
+
+  it('rejects 1-MiB decimal string with LIMIT_EXCEEDED (memory bloat DoS)', () => {
+    // Hostile case: 1-MiB string of `9`s. Cap MUST fire before BigInt()
+    // is invoked.
+    const path = '9'.repeat(1024 * 1024);
+    const err = attempt(path);
+    expect(err).not.toBeNull();
+    expect(err!.code).toBe('LIMIT_EXCEEDED');
+  });
+
+  it('accepts 78-digit decimal (uint256 max boundary)', () => {
+    // 2^256 - 1 ≈ 1.158e77 → 78 digits. Take a value that fits.
+    // Use `9` * 78 — that's actually larger than uint256 max but the
+    // length cap is the only thing under test here; bigIntTo32Bytes
+    // would later reject it. The length boundary IS 78 digits.
+    const path = '9'.repeat(78);
+    const err = attempt(path);
+    // Length cap allows 78 digits; downstream `bigIntTo32Bytes` may
+    // reject because 9*78 > 2^256. That's the next layer's job, not
+    // the length cap. So we expect either null OR an error from a
+    // downstream layer (NOT LIMIT_EXCEEDED from this cap).
+    if (err !== null) {
+      expect(err.code).not.toBe('LIMIT_EXCEEDED');
+    }
+  });
+
+  it('accepts "0" (boundary)', () => {
+    const err = attempt('0');
+    expect(err).toBeNull();
+  });
+});
