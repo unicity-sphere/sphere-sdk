@@ -273,13 +273,123 @@ export interface AcquireBundleCidOptions {
  */
 const inflight = new Map<string, Promise<AcquireBundleResult>>();
 
+// =============================================================================
+// 3.5. Steelman warning fix — negative-LRU for verify-failed sequences
+// =============================================================================
+
 /**
- * Test-only: clear all inflight latches. Production code must never
- * call this. Tests use it between assertions to avoid cross-test
- * leakage when a fixture deliberately holds a verify promise open.
+ * Maximum entries in {@link verifyFailedLru} before FIFO eviction.
+ * Distinct from the main {@link ReplayLRU} bounds — this is a small,
+ * dedicated cache local to bundle-acquirer.
+ */
+const VERIFY_FAILED_LRU_MAX_ENTRIES = 1024;
+
+/**
+ * Time-to-live (ms) for negative-LRU entries. After this window
+ * elapses, a re-arrival of the same `(senderPubkey, bundleCid)` pair
+ * will run the full verification pipeline again — at which point the
+ * sender may have shipped a corrected bundle (e.g. retry after a
+ * transient encoding bug). 30 seconds is long enough to absorb the
+ * inflight-latch finally-microtask + repeated re-arrivals from a
+ * hostile loop, but short enough to be operationally invisible to a
+ * legitimate retry.
+ */
+const VERIFY_FAILED_LRU_TTL_MS = 30_000;
+
+/**
+ * Negative LRU keyed on `${senderPubkey}|${bundleCid}` recording recent
+ * `pkg.verify()` failures (and other hard rejections from
+ * {@link doAcquireBundle}'s catch path).
+ *
+ * **Why this exists (steelman warning fix):** the main {@link ReplayLRU}
+ * is marked ONLY on successful verification (intentional — failures
+ * MUST NOT short-circuit a corrected republish; see Step 7 doc). But
+ * after a failed verify, sequential re-arrivals of the SAME (sender,
+ * bundleCid) pair (post the inflight-latch finally microtask) re-run
+ * the full §5.2 pipeline (CAR-parse, hash recompute, `pkg.verify()`).
+ * A hostile sender can amplify this by re-publishing the same invalid
+ * bundleCid in a tight loop.
+ *
+ * The negative LRU plugs that gap: a recent failure short-circuits to
+ * the cached failure for {@link VERIFY_FAILED_LRU_TTL_MS} before the
+ * main pipeline retries. Bounded entries (FIFO eviction) prevent
+ * unbounded memory growth even under hostile flooding.
+ *
+ * **Why it is local to bundle-acquirer (NOT integrated with
+ * ReplayLRU):** the two have different semantics — ReplayLRU keys on
+ * successful verifications and gates short-circuit; this one keys on
+ * failures and gates re-attempt. Mixing them would either pollute
+ * ReplayLRU's success-only invariant or force ReplayLRU to grow a
+ * second class of entries with different eviction rules. A separate
+ * Map is simpler and keeps the failure semantics scoped to where they
+ * are produced.
+ *
+ * **Memory bound:** at most {@link VERIFY_FAILED_LRU_MAX_ENTRIES}
+ * entries × ~200-byte composite key + 16-byte timestamp ≈ 220 KiB
+ * resident worst case. Acceptable for an interactive wallet.
+ */
+interface VerifyFailedEntry {
+  readonly cachedAt: number;
+  readonly errorCode: string;
+  readonly errorMessage: string;
+}
+const verifyFailedLru = new Map<string, VerifyFailedEntry>();
+
+/**
+ * Insert a negative-LRU entry for `(senderPubkey, bundleCid)`. Evicts
+ * the oldest entry (Map insertion order ≡ insertion-time recency) when
+ * the cap is exceeded.
+ */
+function recordVerifyFailure(
+  senderPubkey: string,
+  bundleCid: string,
+  err: SphereError,
+): void {
+  const key = `${senderPubkey}|${bundleCid}`;
+  // Refresh on insert: delete-then-insert pushes the entry to the back
+  // of iteration order (LRU semantics). FIFO eviction at the front.
+  verifyFailedLru.delete(key);
+  verifyFailedLru.set(key, {
+    cachedAt: Date.now(),
+    errorCode: err.code,
+    errorMessage: err.message,
+  });
+  while (verifyFailedLru.size > VERIFY_FAILED_LRU_MAX_ENTRIES) {
+    const oldest = verifyFailedLru.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    verifyFailedLru.delete(oldest);
+  }
+}
+
+/**
+ * Look up `(senderPubkey, bundleCid)` in the negative LRU. Returns the
+ * cached failure if present AND within {@link VERIFY_FAILED_LRU_TTL_MS}
+ * of `cachedAt`; otherwise null. Stale entries are silently dropped on
+ * read so the cache never accumulates expired entries.
+ */
+function getCachedVerifyFailure(
+  senderPubkey: string,
+  bundleCid: string,
+): VerifyFailedEntry | null {
+  const key = `${senderPubkey}|${bundleCid}`;
+  const entry = verifyFailedLru.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.cachedAt > VERIFY_FAILED_LRU_TTL_MS) {
+    verifyFailedLru.delete(key);
+    return null;
+  }
+  return entry;
+}
+
+/**
+ * Test-only: clear all inflight latches AND the negative LRU.
+ * Production code must never call this. Tests use it between
+ * assertions to avoid cross-test leakage when a fixture deliberately
+ * holds a verify promise open or seeds the negative LRU.
  */
 export function __clearInflightForTests(): void {
   inflight.clear();
+  verifyFailedLru.clear();
 }
 
 /**
@@ -364,19 +474,48 @@ export async function acquireBundle(
   if (!isUxfTransferPayloadCar(payload) && !isUxfTransferPayloadCid(payload)) {
     return doAcquireBundle(payload, senderPubkey, lru, cidOptions);
   }
+
+  // Steelman warning fix — negative LRU short-circuit. If we recently
+  // failed to verify this exact (sender, bundleCid) pair, re-throw the
+  // cached failure rather than re-running the full pipeline. Bounded
+  // TTL ({@link VERIFY_FAILED_LRU_TTL_MS}) so a corrected republish
+  // does eventually retry; bounded size ({@link
+  // VERIFY_FAILED_LRU_MAX_ENTRIES}) so a hostile flood cannot bloat
+  // memory.
+  const cachedFailure = getCachedVerifyFailure(senderPubkey, payload.bundleCid);
+  if (cachedFailure) {
+    throw new SphereError(
+      `acquireBundle: negative-LRU short-circuit — recent failure cached ` +
+        `(${cachedFailure.errorCode}: ${cachedFailure.errorMessage})`,
+      cachedFailure.errorCode as never,
+    );
+  }
+
   const latchKey = `${senderPubkey}|${payload.bundleCid}`;
   const existing = inflight.get(latchKey);
   if (existing) {
     return existing;
   }
-  const promise = doAcquireBundle(payload, senderPubkey, lru, cidOptions).finally(() => {
-    // Remove the latch only AFTER doAcquireBundle resolves/rejects.
-    // For success: doAcquireBundle has already called lru.add(), so the
-    // next `acquireBundle` for the same key hits the LRU short-circuit.
-    // For failure: the LRU is unchanged; a re-arrival will retry §5.2
-    // afresh (intended — failures must not poison legitimate retries).
-    inflight.delete(latchKey);
-  });
+  const promise = doAcquireBundle(payload, senderPubkey, lru, cidOptions)
+    .catch((err: unknown) => {
+      // Negative-LRU population (steelman warning fix). Record only
+      // SphereError instances — system-level errors (out-of-memory,
+      // abort) are not bundle-attributable and shouldn't poison the
+      // cache against a corrected re-arrival.
+      if (err instanceof SphereError) {
+        recordVerifyFailure(senderPubkey, payload.bundleCid, err);
+      }
+      throw err;
+    })
+    .finally(() => {
+      // Remove the latch only AFTER doAcquireBundle resolves/rejects.
+      // For success: doAcquireBundle has already called lru.add(), so
+      // the next `acquireBundle` for the same key hits the main LRU
+      // short-circuit. For failure: the negative-LRU short-circuits
+      // immediate re-arrivals; the main LRU is unchanged so a fresh
+      // pipeline runs after the negative-LRU TTL elapses.
+      inflight.delete(latchKey);
+    });
   inflight.set(latchKey, promise);
   return promise;
 }

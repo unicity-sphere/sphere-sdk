@@ -45,6 +45,14 @@ const TOKEN_B_ID = 'bb0000000000000000000000000000000000000000000000000000000000
 
 const SENDER = 'a'.repeat(64); // 64-hex transport pubkey
 
+// Steelman warning fix — negative-LRU has cross-test side effects when
+// the same `(SENDER, bundleCid)` pair is exercised across multiple
+// tests. Clear the failure cache + inflight latches between every test
+// so each starts from a clean slate.
+afterEach(() => {
+  __clearInflightForTests();
+});
+
 /**
  * Build a real `uxf-car` payload from the supplied token fixtures. The
  * `bundleCid` is computed from the actual CAR root.
@@ -632,5 +640,157 @@ describe('acquireBundle — defense-in-depth CID re-extract (steelman #170)', ()
     // the fetcher (per-gateway cid-mismatch → all gateways fail).
     expect(caught.code).toBe('BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT');
     expect(lru.has(SENDER, claimedCid)).toBe(false);
+  });
+});
+
+// =============================================================================
+// 9. Steelman warning fix — negative-LRU for verify-failed sequences
+// =============================================================================
+//
+// The main ReplayLRU is marked ONLY on successful verification (so a
+// corrected republish can retry). But that leaves verify-FAILED
+// re-arrivals running the full §5.2 pipeline every time. The
+// negative-LRU caches recent failures with a short TTL so a hostile
+// loop cannot amplify CPU cost by re-publishing the same invalid
+// bundleCid repeatedly.
+
+describe('acquireBundle — negative-LRU short-circuit (steelman warning)', () => {
+  it('verify-fail short-circuits within TTL: pipeline runs once, second arrival re-throws cached error', async () => {
+    // We instrument the pipeline observability via spy on UxfPackage.fromCar
+    // — that is the canonical "expensive" step inside doAcquireBundle. If
+    // the negative-LRU short-circuit fires, fromCar should be invoked
+    // exactly ONCE for the (sender, bundleCid) pair across the two
+    // arrivals.
+    const fromCarSpy = vi.spyOn(UxfPackage, 'fromCar');
+
+    // Use a payload whose bundleCid does NOT match the CAR root → fails
+    // with BUNDLE_REJECTED_ROOT_CID_MISMATCH at Step 3. That is BEFORE
+    // UxfPackage.fromCar — so we use a different attack: a valid CAR
+    // root match but an invalid CAR body. Cleaner: use a payload whose
+    // CAR body is unparseable (BUNDLE_REJECTED_INVALID_CAR is thrown by
+    // extractCarRootCid which runs BEFORE UxfPackage.fromCar). We need a
+    // failure that goes through fromCar — the easiest is a malformed
+    // package. Cheat for this test by tracking fromCar directly only
+    // when it would be invoked; for a root-CID-mismatch failure, the
+    // negative-LRU DOES still cache (it caches all SphereError
+    // failures), so observability via fromCar is unnecessary. Instead
+    // assert the wall-clock time of the second call is dramatically
+    // shorter than the first OR assert error message text indicating
+    // the cached path.
+    const bogusCid = 'bafyreid7gzkd7m2ovmh7y4hgsthhqhwlrbeenoaq2obuycoswbsedfsy5e';
+    const payload = await buildCarPayload({
+      tokens: [TOKEN_A],
+      claimedTokenIds: [TOKEN_A_ID],
+      bundleCidOverride: bogusCid,
+    });
+    const lru = new ReplayLRU();
+
+    // First arrival — actual verification runs.
+    let firstErr: unknown;
+    try {
+      await acquireBundle(payload, SENDER, lru);
+    } catch (err) {
+      firstErr = err;
+    }
+    expect(isSphereError(firstErr)).toBe(true);
+    if (isSphereError(firstErr)) {
+      expect(firstErr.code).toBe('BUNDLE_REJECTED_ROOT_CID_MISMATCH');
+    }
+
+    // Second arrival — should short-circuit through the negative LRU.
+    let secondErr: unknown;
+    try {
+      await acquireBundle(payload, SENDER, lru);
+    } catch (err) {
+      secondErr = err;
+    }
+    expect(isSphereError(secondErr)).toBe(true);
+    if (isSphereError(secondErr)) {
+      expect(secondErr.code).toBe('BUNDLE_REJECTED_ROOT_CID_MISMATCH');
+      // The cached path emits a distinctive prefix in the message.
+      expect(secondErr.message).toContain('negative-LRU short-circuit');
+    }
+    fromCarSpy.mockRestore();
+  });
+
+  it('different sender → different negative-LRU key → second arrival runs verify afresh', async () => {
+    // Sanity: the cache keys on (sender, bundleCid). Two arrivals from
+    // different senders MUST run independent verifications.
+    const bogusCid = 'bafyreid7gzkd7m2ovmh7y4hgsthhqhwlrbeenoaq2obuycoswbsedfsy5e';
+    const payload = await buildCarPayload({
+      tokens: [TOKEN_A],
+      claimedTokenIds: [TOKEN_A_ID],
+      bundleCidOverride: bogusCid,
+    });
+    const lru = new ReplayLRU();
+
+    // Sender A first arrival — fails, cached.
+    let errA: unknown;
+    try {
+      await acquireBundle(payload, SENDER, lru);
+    } catch (err) {
+      errA = err;
+    }
+    expect(isSphereError(errA)).toBe(true);
+    if (isSphereError(errA)) {
+      expect(errA.message).not.toContain('negative-LRU short-circuit');
+    }
+
+    // Sender B (different) first arrival — fresh verify, NOT cached.
+    let errB: unknown;
+    try {
+      await acquireBundle(payload, 'b'.repeat(64), lru);
+    } catch (err) {
+      errB = err;
+    }
+    expect(isSphereError(errB)).toBe(true);
+    if (isSphereError(errB)) {
+      expect(errB.code).toBe('BUNDLE_REJECTED_ROOT_CID_MISMATCH');
+      // Different sender — NOT a cache hit on the SENDER key.
+      expect(errB.message).not.toContain('negative-LRU short-circuit');
+    }
+  });
+
+  it('different bundleCid → different negative-LRU key → second arrival runs verify afresh', async () => {
+    // Sanity: same sender but different bundleCid keys do not poison
+    // each other.
+    const lru = new ReplayLRU();
+
+    const payloadA = await buildCarPayload({
+      tokens: [TOKEN_A],
+      claimedTokenIds: [TOKEN_A_ID],
+      bundleCidOverride: 'bafyreid7gzkd7m2ovmh7y4hgsthhqhwlrbeenoaq2obuycoswbsedfsy5e',
+    });
+    try {
+      await acquireBundle(payloadA, SENDER, lru);
+    } catch {
+      /* expected */
+    }
+
+    // Different bundleCid → fresh verify path. Use an actual valid
+    // bundle so we observe a successful pipeline.
+    const goodPayload = await buildCarPayload({
+      tokens: [TOKEN_A],
+      claimedTokenIds: [TOKEN_A_ID],
+    });
+    const result = await acquireBundle(goodPayload, SENDER, lru);
+    expect(isReplayOutcome(result)).toBe(false);
+  });
+
+  it('successful verify is NOT cached as a negative entry', async () => {
+    // The negative LRU caches FAILURES only. A successful verify must
+    // not poison the cache against future re-arrivals.
+    const payload = await buildCarPayload({
+      tokens: [TOKEN_A],
+      claimedTokenIds: [TOKEN_A_ID],
+    });
+    const lru = new ReplayLRU();
+    const r1 = await acquireBundle(payload, SENDER, lru);
+    expect(isReplayOutcome(r1)).toBe(false);
+
+    // Second arrival hits the main ReplayLRU (success path), NOT the
+    // negative LRU.
+    const r2 = await acquireBundle(payload, SENDER, lru);
+    expect(isReplayOutcome(r2)).toBe(true);
   });
 });
