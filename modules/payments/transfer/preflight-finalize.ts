@@ -48,6 +48,7 @@
  */
 
 import { SphereError } from '../../../core/errors';
+import { sanitizeReasonString, safeErrorMessage } from '../../../core/error-sanitize';
 import type {
   InclusionProof,
   OracleProvider,
@@ -253,8 +254,26 @@ export interface SourceChainHardFailCause {
    */
   readonly currentStep: number;
   readonly chainDepth: number;
-  /** Original aggregator error string, if any. Best-effort. */
+  /**
+   * Original aggregator error string, if any. Best-effort.
+   *
+   * **W40 redaction (Round 5).** This field name is in `REDACTED_FIELDS`,
+   * so the value visible in `err.cause.aggregatorError` after the
+   * `SphereError` constructor walks the cause is `[REDACTED:
+   * aggregatorError(...)]`. The originally-supplied (pre-redaction)
+   * string is sanitized at the throw site (`raiseHardFail`) and ALSO
+   * surfaced under the W40-survive name `aggregatorErrorSummary` for
+   * operators who need readable forensics.
+   */
   readonly aggregatorError?: string;
+  /**
+   * Sanitized rendering of {@link aggregatorError} that survives W40
+   * redaction (the field name is NOT in `REDACTED_FIELDS`). The throw
+   * site (`raiseHardFail`) splices `sanitizeReasonString(aggregatorError)`
+   * here so operators retain readable diagnostic text without the W40
+   * raw-bytes-leak risk. See `core/errors.ts` REDACTED_FIELDS docs.
+   */
+  readonly aggregatorErrorSummary?: string;
 }
 
 // =============================================================================
@@ -358,12 +377,46 @@ function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
  * Construct + throw a `SOURCE_CHAIN_HARD_FAIL` SphereError with structured
  * cause. Caller (T.2.D.1) catches and re-throws as `INSUFFICIENT_BALANCE`
  * with reason='source-cascade-failed'; preflight stays purely descriptive.
+ *
+ * **Round 5 fix.** Sanitize `aggregatorError` at the SINGLE throw site so
+ * a hostile aggregator-supplied error string (control chars, HTML, multi-MB
+ * body) cannot ride through `err.cause.aggregatorError` unchanged. The
+ * existing `redactCause` in `core/errors.ts` walks the cause for sensitive
+ * field names, but does NOT sanitize string content; sanitization is the
+ * complementary defense per §6.1 / steelman closure round 1. Mirrors the
+ * pattern already in place in `finalization-worker-base.ts` (commit 87bc99e).
  */
 function raiseHardFail(cause: SourceChainHardFailCause): never {
+  // Sanitize untrusted fields ONCE at the throw site so every downstream
+  // observer (logger, Sentry, operator dashboard, JSON.stringify) sees a
+  // safe form. Leave structured fields (tokenId, requestId, reason,
+  // currentStep, chainDepth) alone — they are caller-shaped and not
+  // aggregator-attacker-shaped.
+  //
+  // The W40 redaction layer in core/errors.ts now lists `aggregatorError`
+  // among the REDACTED_FIELDS (defense-in-depth — Round 5), so the raw
+  // value visible in `err.cause.aggregatorError` is the redaction marker.
+  // We surface the sanitized text under a different field name
+  // (`aggregatorErrorSummary`) that survives W40, so operator forensics
+  // retain a readable, sanitized diagnostic.
+  const safeAggregatorError =
+    cause.aggregatorError !== undefined
+      ? sanitizeReasonString(cause.aggregatorError)
+      : undefined;
+  const sanitizedCause: SourceChainHardFailCause = {
+    ...cause,
+    // The raw key is still attached so existing call sites that look it
+    // up by name find SOMETHING — but the W40 layer will replace its
+    // value with `[REDACTED: aggregatorError(...)]` once the SphereError
+    // constructor walks the cause. The sanitized summary below is the
+    // operator-friendly, W40-safe alternative.
+    aggregatorError: safeAggregatorError,
+    aggregatorErrorSummary: safeAggregatorError,
+  };
   const msg =
     `Preflight finalize hard-fail at step ${cause.currentStep}/${cause.chainDepth} ` +
     `for token ${cause.tokenId} (requestId=${cause.requestId}, reason=${cause.reason})`;
-  throw new SphereError(msg, 'SOURCE_CHAIN_HARD_FAIL', cause);
+  throw new SphereError(msg, 'SOURCE_CHAIN_HARD_FAIL', sanitizedCause);
 }
 
 /**
@@ -475,7 +528,7 @@ async function submitAndAwaitProof(args: {
       }
       // Native throw — treat as transient (could be network / 5xx wrapped
       // by the adapter). Apply same retry budget as a non-success result.
-      submitError = err instanceof Error ? err.message : String(err);
+      submitError = safeErrorMessage(err);
       const hardReason = mapAggregatorRejection(submitError);
       if (hardReason !== null) {
         raiseHardFail({
@@ -523,7 +576,7 @@ async function submitAndAwaitProof(args: {
     try {
       proof = await aggregator.getProof(descriptor.requestId);
     } catch (err) {
-      pollError = err instanceof Error ? err.message : String(err);
+      pollError = safeErrorMessage(err);
       const hardReason = mapAggregatorRejection(pollError);
       if (hardReason !== null) {
         raiseHardFail({
@@ -743,7 +796,7 @@ export async function preflightFinalize(
       try {
         descriptor = await resolveRequestId(token, pendingTxs[i], i);
       } catch (err) {
-        const aggregatorError = err instanceof Error ? err.message : String(err);
+        const aggregatorError = safeErrorMessage(err);
         raiseHardFail({
           tokenId: token.id,
           requestId: '',
