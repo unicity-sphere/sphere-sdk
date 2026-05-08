@@ -10,13 +10,17 @@
  *    only ever increment, so `max(a, b)` is the join (least upper bound)
  *    in the standard G-counter lattice.
  *
- *  - **Rule 5 (error-field rule)**: the `error` string lives on the entry
- *    whose `status` is "more advanced" per the partition lattice (Rule 1).
- *    Tie among equal-partition replicas → take the side with the **earlier**
- *    Lamport timestamp (the first-decided error survives subsequent
- *    transient retries). The status-merge orchestrator already decided the
- *    winner; this module reuses that decision via {@link StatusMergeResult}
- *    rather than re-running the partition rule.
+ *  - **Rule 5 (error-field rule)**: strictly-associative CRDT join in the
+ *    lattice `undefined < string`. Both `undefined` → `undefined`; exactly
+ *    one defined → the defined string (error stickiness); both defined →
+ *    **lex-min** of the error string (deterministic tie-break).
+ *
+ *    NOTE — alignment with UXF-TRANSFER-PROTOCOL.md §7.1 row 5: the spec
+ *    text was updated to lex-min on equal-partition (the implementation is
+ *    the canonical CRDT-associative join; an earlier-Lamport rule was
+ *    non-associative under 3-way merges). See §7.1 row 5 rationale. The
+ *    earlier-Lamport language has been removed from the spec; this module
+ *    documentation now matches the spec verbatim.
  *
  *  - **W45 helper — `audit_promoted_from`** (set-OR set-merge, §5.4 / §7.1
  *    "array fields union with dedupe"). Exported as a standalone function
@@ -109,44 +113,28 @@ export function mergeErrorFields(
 /**
  * Internal: implement Rule 5 as a strictly-associative CRDT join.
  *
- * **§7.1 row 5 (pairwise wording)**:
- *   "the replica with the more-advanced `status` wins; among
- *    equal-status replicas, the earlier Lamport timestamp wins (the
- *    first-decided error is preserved)."
+ * **§7.1 row 5 (canonical, post-alignment)**:
+ *   strictly-associative CRDT join in the lattice `undefined < string`:
+ *     - Both `undefined`               → `undefined`.
+ *     - Exactly one defined            → the defined one (error stickiness).
+ *     - Both defined                   → **lex-min of the error string**
+ *                                        (deterministic tie-break).
  *
- * **Associativity caveat (T.6.B / W9 audit)**. The literal pairwise rule
- * is NOT associative in 3-way merges:
- *
- *  1. Earlier-Lamport tie-break — pairwise-merged Lamport is `max(a, b)`,
- *     which obliterates the original "earlier" timestamp and produces
- *     different outcomes for `merge(merge(a, b), c)` vs
- *     `merge(a, merge(b, c))`.
- *
- *  2. Status-winner-takes-error rule — the status of the merged entry is
- *     not the same as the status of any constituent replica when the
- *     hard-terminal preference / override arc / lattice rules cause
- *     different intermediate winners depending on merge order. The error
- *     payload from a "lost" intermediate replica is then irrecoverable.
- *
- * The §7.1 invariants up the page demand deterministic merge outcomes
- * ("Implementations that fail to follow this rule will see
- * non-deterministic merge outcomes") and the surrounding text describes
- * OrbitDB CRDT semantics, which require associativity by the standard
- * CRDT join-semilattice contract.
- *
- * **Strictly associative variant we implement** (status-independent join):
- *   - Both `undefined`               → `undefined`.
- *   - Exactly one defined            → the defined one (error stickiness).
- *   - Both defined                   → **lex-min of the error string**.
- *
- * This is a join in the lattice where `undefined < anything` and the
- * `string` partial order is total via lex-min. The result is purely a
- * function of the multiset {a.error, b.error}, which makes it commutative
- * and associative by construction. It honors the spec's INTENT
- * ("first-decided error is preserved") with one narrow trade-off: when
- * both replicas independently set distinct error strings, the lex-min
- * string survives instead of the earlier-Lamport one. This is the
- * standard CRDT lattice resolution for such ties.
+ * NOTE — implementation/spec alignment (steelman note #N5). Earlier
+ * drafts of §7.1 row 5 used "more-advanced status wins; equal-status →
+ * earlier Lamport wins." That formulation is non-associative under 3-way
+ * merges (pairwise-merged Lamport is `max(a, b)`, obliterating the
+ * "earlier" timestamp; different intermediate winners cause the
+ * status-takes-error rule to drop different error strings depending on
+ * fold order). The spec text was updated to match this implementation —
+ * the lex-min rule is purely a function of the multiset
+ * `{a.error, b.error}`, commutative and associative by construction.
+ * It honors the spec's INTENT ("first-decided error is preserved" —
+ * usually only one replica records an error per cascade) with one narrow
+ * trade-off: when two replicas independently set distinct error strings,
+ * lex-min survives instead of the temporally-earlier one. This is the
+ * standard CRDT lattice resolution. See UXF-TRANSFER-PROTOCOL.md §7.1
+ * row 5 for the canonical wording.
  *
  * The `statusMergeResult` argument is retained in the signature for
  * forward compatibility (future spec revisions may layer additional

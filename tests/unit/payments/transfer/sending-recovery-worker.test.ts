@@ -352,47 +352,36 @@ describe('SendingRecoveryWorker', () => {
   // republish (skip if status changed), AND moves `emitRepublished` inside
   // the mutator's success branch (gate emit on actual transition).
   describe('Wave 3 — concurrency race against in-flight status change', () => {
-    it('skips republish if entry advanced to delivered-instant before scan handles it', async () => {
+    // FIX 5: snapshot is now authoritative; recoverOne does NOT re-read
+    // before republishing. The race between snapshot and republish is
+    // handled by the CAS guard inside transitionToDelivered's update
+    // closure — no false-success emit fires.
+    it('FIX 5: snapshot authoritative; republish fires when entry advances DURING republish, but no false-success emit', async () => {
       const stuckEntry = makeEntry({
-        id: 'race-advance-instant',
+        id: 'race-advance-during-republish',
         mode: 'instant',
         status: 'sending',
         updatedAt: 1_000,
       });
       const outboxFixture = makeFakeOutbox([stuckEntry]);
 
-      // Simulate a concurrent process: between the worker's first
-      // `readAllNew()` (snapshot) and its second `readAllNew()` (pre-
-      // republish CAS check), advance the entry to `delivered-instant`.
-      let snapshotReadCount = 0;
-      const baseReadAll = outboxFixture.outbox.readAllNew;
-      const racingOutbox: Pick<typeof outboxFixture.outbox, 'readAllNew' | 'update'> = {
-        async readAllNew() {
-          snapshotReadCount += 1;
-          // First read = scan snapshot (returns the stuck entry).
-          // Subsequent reads (pre-republish CAS) see advanced status.
-          if (snapshotReadCount === 1) {
-            return baseReadAll();
-          }
-          const entries = outboxFixture.entries();
-          // Mutate the live store to reflect the concurrent advance.
-          const live = entries.get('race-advance-instant');
-          if (live !== undefined && live.status === 'sending') {
-            entries.set('race-advance-instant', {
-              ...live,
-              status: 'delivered-instant',
-            });
-          }
-          return baseReadAll();
-        },
-        update: outboxFixture.outbox.update,
-      };
+      // Hand-rolled republish: when called, mutates the live outbox
+      // to simulate a concurrent advance HAPPENING during the publish.
+      const republish: RepublishFn = vi.fn(async (): Promise<void> => {
+        const entries = outboxFixture.entries();
+        const live = entries.get('race-advance-during-republish');
+        if (live !== undefined && live.status === 'sending') {
+          entries.set('race-advance-during-republish', {
+            ...live,
+            status: 'delivered-instant',
+          });
+        }
+      });
 
-      const republish = vi.fn<RepublishFn>().mockResolvedValue(undefined);
       const recorder = makeEventRecorder();
 
       const worker = new SendingRecoveryWorker({
-        outbox: racingOutbox,
+        outbox: outboxFixture.outbox,
         republish,
         emit: recorder.emit,
         logger: { warn: () => undefined, info: () => undefined },
@@ -401,17 +390,14 @@ describe('SendingRecoveryWorker', () => {
 
       const attempted = await worker.runScanCycle();
 
-      // The scan saw 1 stuck entry, but the pre-republish CAS check
-      // discovered the entry had already advanced — republish MUST NOT
-      // have fired, and no recovery event MUST have been emitted.
+      // FIX 5: snapshot-authoritative — republish IS called.
       expect(attempted).toBe(1);
-      expect(republish).not.toHaveBeenCalled();
+      expect(republish).toHaveBeenCalledTimes(1);
+      // Post-republish CAS detected the advance — no false-success.
       const recoveryEvents = recorder.events.filter(
         (e) => e.type === 'transfer:recovery-republished',
       );
       expect(recoveryEvents).toHaveLength(0);
-      // The state-machine transition recorder should be empty — no
-      // false self-loop write either.
       expect(outboxFixture.transitions()).toEqual([]);
     });
 
@@ -494,6 +480,116 @@ describe('SendingRecoveryWorker', () => {
       expect(outboxFixture.transitions()).toEqual([
         { id: 'happy-path', from: 'sending', to: 'delivered' },
       ]);
+    });
+  });
+
+  // ===========================================================================
+  // FIX 4 — errMessage(err) routes unknown-shape errors through W40
+  // redactCause so sensitive own-properties never leak into the log line.
+  // ===========================================================================
+  describe('FIX 4 — errMessage redacts sensitive own-properties on non-Error throws', () => {
+    it('does NOT leak signedTransferTxBytes content into the warn log on republish failure', async () => {
+      const stuckEntry = makeEntry({
+        id: 'forensic-entry',
+        status: 'sending',
+        updatedAt: 1_000,
+      });
+      const outboxFixture = makeFakeOutbox([stuckEntry]);
+
+      const SECRET_BYTES = new Uint8Array([
+        0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe,
+      ]);
+      const hostileThrow = {
+        kind: 'transient',
+        signedTransferTxBytes: SECRET_BYTES,
+        nestedDetail: {
+          signedCommitmentBytes: SECRET_BYTES,
+        },
+      };
+      const republish: RepublishFn = vi.fn(async () => {
+        throw hostileThrow;
+      });
+
+      const warnLogs: Array<{ msg: string; ctx: unknown }> = [];
+      const worker = new SendingRecoveryWorker({
+        outbox: outboxFixture.outbox,
+        republish,
+        emit: () => undefined,
+        logger: {
+          warn: (msg: string, ctx?: Record<string, unknown>) => {
+            warnLogs.push({ msg, ctx });
+          },
+          info: () => undefined,
+        },
+        now: () => 1_000_000,
+      });
+
+      await worker.runScanCycle();
+
+      const failureLogs = warnLogs.filter((l) => l.msg.includes('republish failed'));
+      expect(failureLogs.length).toBeGreaterThanOrEqual(1);
+      const errStr = String((failureLogs[0]!.ctx as { err: string }).err);
+      expect(errStr.toLowerCase()).not.toContain('deadbeef');
+      const b64 = Buffer.from(SECRET_BYTES).toString('base64');
+      expect(errStr).not.toContain(b64);
+      // The redaction marker DOES surface (proves redactCause ran).
+      expect(errStr).toContain('REDACTED: signedTransferTxBytes');
+      expect(errStr).toContain('REDACTED: signedCommitmentBytes');
+      expect(errStr).toContain('transient');
+    });
+  });
+
+  // ===========================================================================
+  // FIX 5 — runScanCycle is O(N) reads, not O(N²).
+  // ===========================================================================
+  describe('FIX 5 — O(N) read budget per scan cycle', () => {
+    it('readAllNew is invoked exactly once per scan cycle, regardless of N stuck entries', async () => {
+      const N = 10;
+      const stuck: UxfTransferOutboxEntry[] = [];
+      for (let i = 0; i < N; i++) {
+        stuck.push(
+          makeEntry({
+            id: `stuck-${i}`,
+            status: 'sending',
+            updatedAt: 1_000,
+          }),
+        );
+      }
+      const outboxFixture = makeFakeOutbox(stuck);
+
+      let readCount = 0;
+      const baseReadAll = outboxFixture.outbox.readAllNew;
+      const baseUpdate = outboxFixture.outbox.update;
+      const countingOutbox: Pick<typeof outboxFixture.outbox, 'readAllNew' | 'update'> = {
+        async readAllNew() {
+          readCount += 1;
+          return baseReadAll();
+        },
+        update: baseUpdate,
+      };
+
+      const republish = vi.fn<RepublishFn>().mockResolvedValue(undefined);
+      const recorder = makeEventRecorder();
+
+      const worker = new SendingRecoveryWorker({
+        outbox: countingOutbox,
+        republish,
+        emit: recorder.emit,
+        logger: { warn: () => undefined, info: () => undefined },
+        now: () => 1_000_000,
+      });
+
+      const attempted = await worker.runScanCycle();
+
+      // Pre-FIX 5: readCount would be N+1 (1 outer scan + N pre-flight).
+      // Post-FIX 5: exactly 1 (snapshot at scan time only).
+      expect(readCount).toBe(1);
+      expect(attempted).toBe(N);
+      expect(republish).toHaveBeenCalledTimes(N);
+      const recoveryEvents = recorder.events.filter(
+        (e) => e.type === 'transfer:recovery-republished',
+      );
+      expect(recoveryEvents).toHaveLength(N);
     });
   });
 
