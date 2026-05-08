@@ -1241,13 +1241,17 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
       const tid = tk('t-crit15-multi');
       const hashOld = 'aa'.repeat(32);
       const hashNew = 'bb'.repeat(32);
+      // Both observedAt values must be at-or-before the harness clock
+      // (1700000000000) — Round 3 rejects records observed beyond
+      // `now + 5min` as forgeries. The "newer" record is therefore
+      // the one closer to the harness clock.
       h.disposition.entries.set(
         `${ADDR}.invalid.${tid}.${hashOld}`,
         invalidEntryFor({
           tokenId: tid,
           observedTokenContentHash: hashOld as never,
           reason: 'oracle-rejected',
-          observedAt: 1700000000000,
+          observedAt: 1699999000000, // 1000s before harness clock
         }),
       );
       h.disposition.entries.set(
@@ -1256,7 +1260,7 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
           tokenId: tid,
           observedTokenContentHash: hashNew as never,
           reason: 'predicate-eval',
-          observedAt: 1700000999999,
+          observedAt: 1700000000000, // exactly at harness clock (most recent)
         }),
       );
       h.queue.entries.push(queueEntryFor({
@@ -1524,6 +1528,284 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
       // Override committed; success returned despite emit throw.
       expect(result).toEqual({ ok: true, transition: 'invalid→valid' });
       expect(overrideEvents.length).toBe(1);
+    });
+  });
+
+  // ===========================================================================
+  // Round 3 — _findInvalidEntry observedAt validation
+  //
+  // Pre-Round-3, `rec.observedAt > best.observedAt` returned `false` for
+  // NaN-vs-numeric comparisons, allowing a corrupt NaN-baseline record
+  // to dominate ranking. A compromised local writer could plant
+  // Number.MAX_VALUE to always win the freshest-record selection. Round
+  // 3 validates observedAt per-read and skips invalid records entirely.
+  // ===========================================================================
+  describe('Round 3: _findInvalidEntry validates observedAt', () => {
+    it('NaN observedAt + legitimate record present → legitimate record selected', async () => {
+      const h = buildImporterHarness();
+      const tid = tk('t-r3-nan');
+      const hashCorrupt = 'aa'.repeat(32);
+      const hashGood = 'bb'.repeat(32);
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      // Plant the NaN record FIRST (in storage iteration order; Map
+      // iteration is insertion-ordered) so the legacy bug would
+      // incorrectly seed `best = { observedAt: NaN }` and every
+      // subsequent comparison `legit.observedAt > NaN` returns false.
+      h.disposition.entries.set(
+        `${ADDR}.invalid.${tid}.${hashCorrupt}`,
+        invalidEntryFor({
+          tokenId: tid,
+          observedTokenContentHash: hashCorrupt as never,
+          reason: 'oracle-rejected',
+          observedAt: Number.NaN,
+        }),
+      );
+      h.disposition.entries.set(
+        `${ADDR}.invalid.${tid}.${hashGood}`,
+        invalidEntryFor({
+          tokenId: tid,
+          observedTokenContentHash: hashGood as never,
+          reason: 'predicate-eval',
+          observedAt: 1700000000000,
+        }),
+      );
+      h.queue.entries.push(queueEntryFor({
+        tokenId: tid,
+        commitmentRequestId: 'rq-r3-nan',
+        status: 'hard-fail',
+        transactionHash: '0000' + 'ab'.repeat(32),
+      }));
+      const result = await h.importer.importInclusionProof(
+        ADDR,
+        tid,
+        proofFor({
+          requestId: 'rq-r3-nan',
+          transactionHash: '0000' + 'ab'.repeat(32),
+        }),
+        { allowInvalidOverride: true },
+      );
+      warnSpy.mockRestore();
+
+      // The legitimate (predicate-eval) record must be selected.
+      expect(result).toEqual({ ok: true, transition: 'invalid→valid' });
+      expect(h.overrideCalls.length).toBe(1);
+      expect(h.overrideCalls[0]!.previousReason).toBe('predicate-eval');
+    });
+
+    it('MAX_VALUE observedAt + legitimate record → MAX_VALUE rejected, legitimate selected', async () => {
+      const h = buildImporterHarness();
+      const tid = tk('t-r3-maxval');
+      const hashAttack = 'aa'.repeat(32);
+      const hashGood = 'bb'.repeat(32);
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      // Compromised local writer plants MAX_VALUE to dominate.
+      h.disposition.entries.set(
+        `${ADDR}.invalid.${tid}.${hashAttack}`,
+        invalidEntryFor({
+          tokenId: tid,
+          observedTokenContentHash: hashAttack as never,
+          reason: 'oracle-rejected',
+          observedAt: Number.MAX_VALUE,
+        }),
+      );
+      h.disposition.entries.set(
+        `${ADDR}.invalid.${tid}.${hashGood}`,
+        invalidEntryFor({
+          tokenId: tid,
+          observedTokenContentHash: hashGood as never,
+          reason: 'predicate-eval',
+          observedAt: 1700000000000,
+        }),
+      );
+      h.queue.entries.push(queueEntryFor({
+        tokenId: tid,
+        commitmentRequestId: 'rq-r3-max',
+        status: 'hard-fail',
+        transactionHash: '0000' + 'ab'.repeat(32),
+      }));
+      const result = await h.importer.importInclusionProof(
+        ADDR,
+        tid,
+        proofFor({
+          requestId: 'rq-r3-max',
+          transactionHash: '0000' + 'ab'.repeat(32),
+        }),
+        { allowInvalidOverride: true },
+      );
+      warnSpy.mockRestore();
+
+      // MAX_VALUE is rejected (>> now + tolerance); legitimate wins.
+      expect(result).toEqual({ ok: true, transition: 'invalid→valid' });
+      expect(h.overrideCalls.length).toBe(1);
+      expect(h.overrideCalls[0]!.previousReason).toBe('predicate-eval');
+    });
+
+    it('Infinity / negative / non-number observedAt all rejected', async () => {
+      const h = buildImporterHarness();
+      const tid = tk('t-r3-bad-shapes');
+      const hashInf = 'aa'.repeat(32);
+      const hashNeg = 'bb'.repeat(32);
+      const hashStr = 'cc'.repeat(32);
+      const hashGood = 'dd'.repeat(32);
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      h.disposition.entries.set(
+        `${ADDR}.invalid.${tid}.${hashInf}`,
+        invalidEntryFor({
+          tokenId: tid,
+          observedTokenContentHash: hashInf as never,
+          reason: 'oracle-rejected',
+          observedAt: Number.POSITIVE_INFINITY,
+        }),
+      );
+      h.disposition.entries.set(
+        `${ADDR}.invalid.${tid}.${hashNeg}`,
+        invalidEntryFor({
+          tokenId: tid,
+          observedTokenContentHash: hashNeg as never,
+          reason: 'oracle-rejected',
+          observedAt: -1,
+        }),
+      );
+      h.disposition.entries.set(
+        `${ADDR}.invalid.${tid}.${hashStr}`,
+        // Force a non-number value via cast — production InvalidEntry
+        // is typed `observedAt: number`, but a corrupt JSON read could
+        // surface a string. The validator must reject it.
+        invalidEntryFor({
+          tokenId: tid,
+          observedTokenContentHash: hashStr as never,
+          reason: 'oracle-rejected',
+          observedAt: 'not-a-number' as unknown as number,
+        }),
+      );
+      h.disposition.entries.set(
+        `${ADDR}.invalid.${tid}.${hashGood}`,
+        invalidEntryFor({
+          tokenId: tid,
+          observedTokenContentHash: hashGood as never,
+          reason: 'continuity-broken',
+          observedAt: 1700000123456,
+        }),
+      );
+      h.queue.entries.push(queueEntryFor({
+        tokenId: tid,
+        commitmentRequestId: 'rq-r3-shapes',
+        status: 'hard-fail',
+        transactionHash: '0000' + 'ab'.repeat(32),
+      }));
+      const result = await h.importer.importInclusionProof(
+        ADDR,
+        tid,
+        proofFor({
+          requestId: 'rq-r3-shapes',
+          transactionHash: '0000' + 'ab'.repeat(32),
+        }),
+        { allowInvalidOverride: true },
+      );
+      warnSpy.mockRestore();
+
+      expect(result).toEqual({ ok: true, transition: 'invalid→valid' });
+      expect(h.overrideCalls[0]!.previousReason).toBe('continuity-broken');
+    });
+
+    it('all records have invalid observedAt → treated as no record (no-such-token)', async () => {
+      const h = buildImporterHarness();
+      const tid = tk('t-r3-all-bad');
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      // Two entries, both with corrupt observedAt. With no manifest,
+      // no audit, and no valid invalid record, the importer collapses
+      // to CASE 1 no-such-token.
+      h.disposition.entries.set(
+        `${ADDR}.invalid.${tid}.${'aa'.repeat(32)}`,
+        invalidEntryFor({
+          tokenId: tid,
+          observedTokenContentHash: 'aa'.repeat(32) as never,
+          reason: 'oracle-rejected',
+          observedAt: Number.NaN,
+        }),
+      );
+      h.disposition.entries.set(
+        `${ADDR}.invalid.${tid}.${'bb'.repeat(32)}`,
+        invalidEntryFor({
+          tokenId: tid,
+          observedTokenContentHash: 'bb'.repeat(32) as never,
+          reason: 'oracle-rejected',
+          observedAt: Number.MAX_VALUE,
+        }),
+      );
+      const result = await h.importer.importInclusionProof(
+        ADDR,
+        tid,
+        proofFor({ requestId: 'rq-r3-all-bad' }),
+        { allowInvalidOverride: true },
+      );
+      warnSpy.mockRestore();
+
+      // No valid record → no-such-token
+      expect(result).toEqual({ ok: false, reason: 'no-such-token' });
+    });
+  });
+
+  // ===========================================================================
+  // Round 3 — _findInvalidEntry prefix-scan cap surfacing
+  //
+  // The cap defends against hostile peers planting millions of crafted
+  // matches. When the cap is hit, an operator-alert is emitted so the
+  // operator can investigate.
+  // ===========================================================================
+  describe('Round 3: _findInvalidEntry caps prefix-scan results', () => {
+    it('2000 matching records → at most cap (1024) keys read; alert emitted; valid record still selected', async () => {
+      const h = buildImporterHarness();
+      const tid = tk('t-r3-overflow');
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      // Plant 2000 records under the prefix. The legitimate "winner"
+      // is at index 1500 (within cap reach when keys are sorted by
+      // hash; we just plant enough to exceed the cap).
+      for (let i = 0; i < 2000; i++) {
+        const hash = i.toString(16).padStart(64, '0');
+        h.disposition.entries.set(
+          `${ADDR}.invalid.${tid}.${hash}`,
+          invalidEntryFor({
+            tokenId: tid,
+            observedTokenContentHash: hash as never,
+            reason: 'oracle-rejected',
+            observedAt: 1700000000000 + i,
+          }),
+        );
+      }
+      h.queue.entries.push(queueEntryFor({
+        tokenId: tid,
+        commitmentRequestId: 'rq-r3-overflow',
+        status: 'hard-fail',
+        transactionHash: '0000' + 'ab'.repeat(32),
+      }));
+
+      const result = await h.importer.importInclusionProof(
+        ADDR,
+        tid,
+        proofFor({
+          requestId: 'rq-r3-overflow',
+          transactionHash: '0000' + 'ab'.repeat(32),
+        }),
+        { allowInvalidOverride: true },
+      );
+      warnSpy.mockRestore();
+
+      // The override should still apply against the freshest valid
+      // record within the cap (call succeeds rather than failing
+      // silently).
+      expect(result).toEqual({ ok: true, transition: 'invalid→valid' });
+      // Operator-alert was emitted at least once (the cap-hit alert
+      // routes to 'transfer:operator-alert' with code 'oracle-rejected').
+      const alerts = h.events.events.filter(
+        (e) => e.type === 'transfer:operator-alert',
+      );
+      expect(alerts.length).toBeGreaterThanOrEqual(1);
     });
   });
 });

@@ -479,6 +479,68 @@ export interface ImportInclusionProofCallOptions {
  */
 const CANONICAL_TOKEN_ID_RE = /^[0-9a-f]{64}$/;
 
+/**
+ * Round 3 — wall-clock skew tolerance applied when validating
+ * `observedAt` timestamps in `_findInvalidEntry`.
+ *
+ * A record's `observedAt` is stamped by the writer using the local
+ * `Date.now()`. Replicas may legitimately disagree on the wall clock
+ * by a small margin (NTP-tolerated drift, virtualization clock skew,
+ * etc.). We accept records up to {@link CLOCK_SKEW_TOLERANCE_MS} in
+ * the future relative to our local clock; records beyond that are
+ * rejected as forgeries (a compromised local writer planting
+ * `Number.MAX_VALUE` to dominate the freshest-record selection).
+ *
+ * 5 minutes covers realistic clock skew between cooperating wallets
+ * while still rejecting `Number.MAX_VALUE` (≈ 2.85e305 days into the
+ * future) and any near-bound forgery.
+ */
+const CLOCK_SKEW_TOLERANCE_MS = 5 * 60 * 1000;
+
+/**
+ * Round 3 — cap on the number of `_invalid` keys enumerated by
+ * {@link InclusionProofImporter._findInvalidEntry} per call.
+ *
+ * Without a cap, a hostile peer planting millions of crafted prefix
+ * matches forces the importer into N sequential `readRecord`
+ * round-trips. The cap bounds the worst-case latency and read budget;
+ * reaching the cap surfaces an operator alert so the operator can
+ * investigate (real workloads NEVER produce thousands of entries for
+ * a single tokenId).
+ *
+ * 1024 is comfortably above the realistic ceiling (a few dozen
+ * forensic re-arrivals per tokenId) and tight enough that an
+ * unbounded scan is cut off before it materially impacts a single
+ * import call.
+ */
+const FIND_INVALID_ENTRY_MAX_RESULTS = 1024;
+
+/**
+ * Round 3 — guard against forged `observedAt` fields when ranking
+ * `_invalid` records by recency.
+ *
+ * The legacy `rec.observedAt > best.observedAt` comparison silently
+ * produced `false` when `rec.observedAt` was `NaN`, leaving an
+ * earlier record as `best`. That meant a corrupt entry with NaN read
+ * FIRST became `best` and dominated subsequent comparisons — every
+ * legitimate record returned `false` against a NaN baseline. Worse,
+ * a compromised local writer planting `Number.MAX_VALUE` always won
+ * the comparison and dominated the freshest-record selection.
+ *
+ * This validator clamps `observedAt` to `[0, now + CLOCK_SKEW_TOLERANCE_MS]`
+ * and rejects every other shape (NaN, Infinity, negative, post-tolerance
+ * future, non-number). Rejected records are skipped entirely; the
+ * importer behaves as if they did not exist.
+ */
+function isValidObservedAt(value: unknown, now: number): value is number {
+  return (
+    typeof value === 'number' &&
+    Number.isFinite(value) &&
+    value >= 0 &&
+    value <= now + CLOCK_SKEW_TOLERANCE_MS
+  );
+}
+
 // =============================================================================
 // 4. InclusionProofImporter
 // =============================================================================
@@ -1073,14 +1135,77 @@ export class InclusionProofImporter {
     tokenId: string,
   ): Promise<InvalidEntry | null> {
     const prefix = `${addr}.invalid.${tokenId}.`;
-    const keys = await this.opts.dispositionStorage.listKeysWithPrefix(prefix);
+    const keys = await this.opts.dispositionStorage.listKeysWithPrefix(
+      prefix,
+      { maxResults: FIND_INVALID_ENTRY_MAX_RESULTS },
+    );
     if (keys.length === 0) return null;
+    // Round 3 — cap surfacing. If the storage returned exactly the cap,
+    // a hostile peer (or upstream defect) may be saturating the prefix
+    // namespace. Surface to operators so they can investigate; we still
+    // proceed with the best record we can find within the cap so the
+    // override path remains usable.
+    if (keys.length >= FIND_INVALID_ENTRY_MAX_RESULTS) {
+      try {
+        // eslint-disable-next-line no-console
+        console.warn(
+          '[import-inclusion-proof] _findInvalidEntry: prefix-scan cap hit — ' +
+            'storage returned at least the maxResults cap. Investigate possible ' +
+            'forensic-storage saturation or an upstream writer bug.',
+          {
+            prefix,
+            cap: FIND_INVALID_ENTRY_MAX_RESULTS,
+          },
+        );
+      } catch {
+        /* logging best-effort */
+      }
+      try {
+        this.opts.emit('transfer:operator-alert', {
+          code: 'oracle-rejected', // closest existing reason for "needs operator triage"
+          tokenId,
+          message:
+            `_findInvalidEntry: prefix-scan cap of ${FIND_INVALID_ENTRY_MAX_RESULTS} hit ` +
+            `for prefix "${prefix}". Storage may be saturated by a hostile peer or an ` +
+            `upstream writer bug — investigate.`,
+        });
+      } catch {
+        /* emit best-effort */
+      }
+    }
+    // Round 3 — validate `observedAt` per-read. Records with
+    // NaN/Infinity/MAX_VALUE/negative/post-tolerance-future timestamps
+    // are skipped entirely. If ALL records have invalid observedAt, the
+    // importer treats the prefix as having no record (returns null).
+    const now = this.defaultNow();
     let best: InvalidEntry | null = null;
+    let bestObserved: number = -1;
     for (const k of keys) {
       const rec = await this.opts.dispositionStorage.readRecord<InvalidEntry>(k);
       if (rec === undefined) continue;
-      if (best === null || rec.observedAt > best.observedAt) {
+      if (!isValidObservedAt(rec.observedAt, now)) {
+        // Record's observedAt is corrupt or attacker-shaped. Skip it
+        // entirely so a NaN baseline cannot dominate ranking and a
+        // MAX_VALUE forgery cannot win the freshest selection.
+        try {
+          // eslint-disable-next-line no-console
+          console.warn(
+            '[import-inclusion-proof] _findInvalidEntry: skipping record with invalid observedAt',
+            {
+              key: k,
+              observedAt: rec.observedAt,
+              now,
+              tolerance: CLOCK_SKEW_TOLERANCE_MS,
+            },
+          );
+        } catch {
+          /* logging best-effort */
+        }
+        continue;
+      }
+      if (best === null || rec.observedAt > bestObserved) {
         best = rec;
+        bestObserved = rec.observedAt;
       }
     }
     return best;
@@ -1105,7 +1230,13 @@ export class InclusionProofImporter {
     tokenId: string,
   ): Promise<boolean> {
     const prefix = `${addr}.audit.${tokenId}.`;
-    const keys = await this.opts.dispositionStorage.listKeysWithPrefix(prefix);
+    // Round 3 — cap at 1 since the consumer only needs existence. The
+    // adapter can short-circuit once a single live record is found,
+    // avoiding any prefix-saturation amplification.
+    const keys = await this.opts.dispositionStorage.listKeysWithPrefix(
+      prefix,
+      { maxResults: 1 },
+    );
     return keys.length > 0;
   }
 
