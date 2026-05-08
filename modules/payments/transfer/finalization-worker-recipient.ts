@@ -856,7 +856,26 @@ export class FinalizationWorkerRecipient {
       // Otherwise the §5.5 step 6 hard safety net (2 ×
       // POLLING_WINDOW_MS) restarts on every worker re-entry, letting
       // a token poll indefinitely across crash/restart cycles.
-      pollStartedAt: entry.submittedAt,
+      //
+      // Steelman fix (CRIT #8): the queue's writer contract initializes
+      // `submittedAt = createdAt` and updates it on the FIRST successful
+      // submit; until that update lands, the field carries the queue's
+      // creation timestamp. If a queue entry is enqueued and then sits
+      // for ≥ 2 × POLLING_WINDOW_MS before pickup (e.g. a worker that
+      // restarts after a long outage, or a queue that accumulates entries
+      // before the worker starts), using `entry.submittedAt` as the
+      // deadline anchor would hard-fail oracle-rejected on the first
+      // poll attempt — BEFORE we've even submitted. The fix:
+      // `submittedAt === createdAt` is the sentinel "no submit yet" — in
+      // that case anchor the deadline at `now()` (this cycle's start)
+      // so the polling window measures from when the worker actually
+      // begins polling. Once a submit succeeds the queue writer should
+      // CAS-update submittedAt; on subsequent passes the persisted value
+      // wins and W26 cross-restart termination is preserved.
+      pollStartedAt:
+        entry.submittedAt > entry.createdAt
+          ? entry.submittedAt
+          : this.options.now(),
       emit: this.options.emit,
       now: this.options.now,
       sleep: this.options.sleep,

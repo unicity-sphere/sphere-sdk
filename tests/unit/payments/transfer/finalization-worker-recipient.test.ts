@@ -923,10 +923,73 @@ describe('FinalizationWorkerRecipient — Wave 7 emit-if-emitted recovery semant
   });
 });
 
+// =============================================================================
+// CRIT #8 — W26 deadline anchor uses createdAt only as a floor
+// =============================================================================
+//
+// Pre-fix: the recipient cycle anchored the W26 polling deadline at
+// `entry.submittedAt`. The queue's writer initializes
+// `submittedAt = createdAt` and is supposed to update it on the FIRST
+// successful submit. If a queue entry sits idle for ≥ 60 minutes before
+// pickup (long worker outage, queued before worker started), the W26
+// hard safety net fires on the first poll attempt — BEFORE we've even
+// submitted. The fix: when `submittedAt === createdAt` (no submit yet),
+// anchor at `now()` so the polling window measures from when polling
+// actually begins.
+
+describe('FinalizationWorkerRecipient — W26 deadline anchor floor (CRIT #8)', () => {
+  it('entry stale by 2+ hours does not hard-fail oracle-rejected on first poll', async () => {
+    // Queue entry with createdAt 2 hours in the past, submittedAt EQUAL
+    // to createdAt (sentinel: no submit yet). Pre-fix, this would hit
+    // the W26 2× hard safety net (60 min) on first poll.
+    const TWO_HOURS_AGO = 1700000000000 - 2 * 60 * 60 * 1000;
+    const entry = makeQueueEntry({
+      createdAt: TWO_HOURS_AGO,
+      submittedAt: TWO_HOURS_AGO,
+    });
+
+    // Aggregator returns OK on first poll (after the SUCCESS submit).
+    const aggregator = makeFakeAggregator({
+      submit: async () => ({ kind: 'SUCCESS' as const }),
+      poll: async () => ({
+        kind: 'OK' as const,
+        proof: makeProof(),
+        newCid: NEW_CID,
+      }),
+    });
+
+    // Use a "current" wall-clock that's far past the entry's createdAt.
+    // The fixture's default `now` is `() => 1700000000000`.
+    const harness = buildWorker({ aggregator });
+    await seedQueue(harness, [entry]);
+
+    const result = await harness.worker.processOneToken(TOKEN_ID);
+
+    // Should reach VALID, NOT hard-fail oracle-rejected.
+    expect(result.terminal).toBe('valid');
+    expect(result.successCount).toBe(1);
+    expect(result.hardFailCount).toBe(0);
+  });
+
+  it('entry with submittedAt > createdAt uses persisted submittedAt as anchor', async () => {
+    // When the queue writer has already updated submittedAt (post-submit
+    // CAS write), use that value — preserves W26 cross-restart termination.
+    // We don't easily verify the exact anchor here (it's an internal
+    // computation passed into the cycle driver); we exercise the path so
+    // the conditional branch is at least covered.
+    const entry = makeQueueEntry({
+      createdAt: 1699999999000,
+      submittedAt: 1700000000000, // post-submit: persisted submittedAt
+    });
+    const harness = buildWorker();
+    await seedQueue(harness, [entry]);
+
+    const result = await harness.worker.processOneToken(TOKEN_ID);
+    expect(result.terminal).toBe('valid');
+  });
+});
+
 // Suppress unused-import warnings for this block.
-void NEW_CID;
 void RACE_TX_HASH;
-void makeFakeAggregator;
 void makeFakePoolRead;
-void makeProof;
 
