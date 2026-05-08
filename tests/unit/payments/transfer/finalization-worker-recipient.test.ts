@@ -327,13 +327,14 @@ describe('FinalizationWorkerRecipient — merge-path graft (§5.6)', () => {
   });
 
   it('proof already attached + DIFFERENT value → security-alert + hard-fail', async () => {
+    const RAW_ATTACHED_AUTH = 'ee'.repeat(32);
     const poolRead = makeFakePoolRead([
       {
         tokenId: TOKEN_ID,
         requestId: 'req-0',
         proof: makeProof({
           transactionHash: RACE_TX_HASH,
-          authenticator: 'ee'.repeat(32),
+          authenticator: RAW_ATTACHED_AUTH,
         }),
       },
     ]);
@@ -351,6 +352,19 @@ describe('FinalizationWorkerRecipient — merge-path graft (§5.6)', () => {
       (e) => e.type === 'transfer:security-alert',
     );
     expect(alerts.length).toBeGreaterThanOrEqual(1);
+    // W40 / steelman warning — authenticator strings in event payloads
+    // MUST be 16-char hashed, NOT the raw 64-char hex authenticator.
+    const alert = alerts[0]!.data as {
+      attachedAuthenticator?: string;
+      observedAuthenticator?: string;
+    };
+    expect(typeof alert.attachedAuthenticator).toBe('string');
+    expect(alert.attachedAuthenticator).toHaveLength(16);
+    // Must NOT contain the raw 64-char authenticator hex.
+    expect(alert.attachedAuthenticator).not.toBe(RAW_ATTACHED_AUTH);
+    expect(alert.attachedAuthenticator).not.toContain(RAW_ATTACHED_AUTH);
+    expect(typeof alert.observedAuthenticator).toBe('string');
+    expect(alert.observedAuthenticator).toHaveLength(16);
   });
 });
 

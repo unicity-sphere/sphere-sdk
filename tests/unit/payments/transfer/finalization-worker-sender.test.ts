@@ -38,6 +38,7 @@ import {
   type SubmitOutcome,
   type PollOutcome,
 } from '../../../../modules/payments/transfer/finalization-worker-sender';
+import { hashAuthenticatorForLog } from '../../../../modules/payments/transfer/finalization-worker-base';
 import {
   type FinalizationQueueAdapter,
   type PoolWriteAdapter,
@@ -2113,5 +2114,48 @@ describe('FinalizationWorkerSender — perAggregatorSemaphore covers submit phas
     // The W14 invariant: peak concurrent submits never exceeded the cap.
     expect(peakInFlightSubmits).toBeLessThanOrEqual(CAP);
     expect(peakInFlightSubmits).toBeGreaterThan(0);
+  });
+});
+
+// =============================================================================
+// W40 / steelman warning — `hashAuthenticatorForLog` privacy helper.
+//
+// Authenticator strings are listed under W40's `rawAuthenticator` sensitive
+// field bucket. The `transfer:security-alert` event payload was previously
+// emitting raw authenticator hex (~130+ chars). The helper hashes it to a
+// 16-char prefix of SHA-256 — enough for forensic correlation, not enough
+// to recover the source.
+// =============================================================================
+
+describe('hashAuthenticatorForLog — W40 privacy helper', () => {
+  it('returns 16 hex chars for a non-empty authenticator', () => {
+    const out = hashAuthenticatorForLog('a'.repeat(130));
+    expect(out).toHaveLength(16);
+    expect(out).toMatch(/^[0-9a-f]{16}$/);
+  });
+
+  it('does NOT contain the raw authenticator', () => {
+    const raw = 'deadbeef'.repeat(16); // 128 chars
+    const out = hashAuthenticatorForLog(raw);
+    expect(out).not.toBe(raw);
+    expect(out).not.toContain('deadbeef');
+  });
+
+  it('is deterministic (same input → same hash)', () => {
+    const a = hashAuthenticatorForLog('xyz123');
+    const b = hashAuthenticatorForLog('xyz123');
+    expect(a).toBe(b);
+  });
+
+  it('returns empty string for empty / undefined / null', () => {
+    expect(hashAuthenticatorForLog('')).toBe('');
+    expect(hashAuthenticatorForLog(undefined)).toBe('');
+    expect(hashAuthenticatorForLog(null)).toBe('');
+  });
+
+  it('produces different hashes for different inputs', () => {
+    const a = hashAuthenticatorForLog('aa');
+    const b = hashAuthenticatorForLog('bb');
+    expect(a).not.toBe(b);
   });
 });

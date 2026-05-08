@@ -76,6 +76,36 @@ import type {
 } from '../../../types';
 import { SphereError } from '../../../core/errors';
 import type { TrustBaseStaleness } from './trustbase-staleness';
+import { sha256 } from '@noble/hashes/sha2.js';
+import { bytesToHex } from '@noble/hashes/utils.js';
+
+// =============================================================================
+// 0. Authenticator hashing — W40 / steelman warning closure.
+// =============================================================================
+
+/**
+ * Truncated SHA-256 of an authenticator string for use in EVENT PAYLOADS.
+ *
+ * The W40 doc lists `rawAuthenticator` as sensitive — emitting the raw
+ * 130+ char authenticator hex inside `transfer:security-alert` events
+ * leaks the same material the redaction layer protects in `cause`
+ * payloads. Operators forensically need *something* to correlate two
+ * conflicting proofs; the first 8 bytes (16 hex chars) of SHA-256 give
+ * enough entropy for forensic correlation while not preserving enough
+ * to reconstruct the authenticator.
+ *
+ * The unhashed authenticator string IS still retained in durable
+ * manifest-store entries (operator deep-forensics path); only the event
+ * payload is hashed.
+ *
+ * Empty / unset authenticators map to the empty string so callers can
+ * unconditionally pass the source field without branching.
+ */
+export function hashAuthenticatorForLog(auth: string | undefined | null): string {
+  if (!auth) return '';
+  const digest = sha256(new TextEncoder().encode(auth));
+  return bytesToHex(digest).slice(0, 16);
+}
 
 // =============================================================================
 // 1. Aggregator response shapes — narrow, framework-neutral
@@ -1050,8 +1080,11 @@ export async function runPollPhase(
               ...(ctx.outboxId !== undefined ? { outboxId: ctx.outboxId } : {}),
               attachedTransactionHash: '',
               observedTransactionHash: ctxResolved.transactionHash,
-              attachedAuthenticator: '',
-              observedAuthenticator: ctxResolved.authenticator,
+              // W40 / steelman warning: emit hashed (truncated SHA-256)
+              // authenticators in event payloads. Raw authenticator hex
+              // is still retained in durable manifest-store entries.
+              attachedAuthenticator: hashAuthenticatorForLog(''),
+              observedAuthenticator: hashAuthenticatorForLog(ctxResolved.authenticator),
               message,
             });
             return {
@@ -1198,8 +1231,11 @@ export async function checkProofConflict(
       ...(ctx.outboxId !== undefined ? { outboxId: ctx.outboxId } : {}),
       attachedTransactionHash: attached.transactionHash,
       observedTransactionHash: anchored.transactionHash,
-      attachedAuthenticator: attached.authenticator,
-      observedAuthenticator: anchored.authenticator,
+      // W40 / steelman warning: emit hashed (truncated SHA-256)
+      // authenticators in event payloads. Raw authenticator hex is
+      // still retained in durable manifest-store entries.
+      attachedAuthenticator: hashAuthenticatorForLog(attached.authenticator),
+      observedAuthenticator: hashAuthenticatorForLog(anchored.authenticator),
       message,
     });
     void ctxResolved; // ctxResolved unused here; kept for symmetry / future use

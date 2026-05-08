@@ -100,6 +100,7 @@ import {
 import {
   attachProofUnderMutex,
   combineAbortSignals,
+  hashAuthenticatorForLog,
   runFinalizationCycle,
   sameProofValue,
   type AnchoredProofDescriptor,
@@ -1056,8 +1057,11 @@ export class FinalizationWorkerRecipient {
       requestId: entry.commitmentRequestId,
       attachedTransactionHash: attachedProof.transactionHash,
       observedTransactionHash: ctxResolved.transactionHash,
-      attachedAuthenticator: attachedProof.authenticator,
-      observedAuthenticator: ctxResolved.authenticator,
+      // W40 / steelman warning: emit hashed (truncated SHA-256)
+      // authenticators in event payloads. Raw authenticator hex is
+      // still retained in durable manifest-store entries.
+      attachedAuthenticator: hashAuthenticatorForLog(attachedProof.authenticator),
+      observedAuthenticator: hashAuthenticatorForLog(ctxResolved.authenticator),
       message: `transfer:security-alert: pre-existing proof for queue entry ${entry.entryId} disagrees with our (transactionHash, authenticator)`,
     });
     return {

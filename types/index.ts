@@ -873,6 +873,16 @@ export interface SphereEventMap {
    * `transfer:trustbase-warning` first.
    *
    * Spec refs: §6.3 (most-recent-proof rule + forbidden case).
+   *
+   * Authenticator field privacy (W40 / steelman warning):
+   *   `attachedAuthenticator` / `observedAuthenticator` are emitted as
+   *   the FIRST 16 HEX CHARS of `SHA-256(authenticator)` — NOT the raw
+   *   authenticator. This gives operators enough entropy to correlate
+   *   two conflicting proofs in dashboards/logs without leaking the
+   *   ~130-char authenticator string into log sinks or telemetry. The
+   *   raw authenticator is still retained in durable manifest-store
+   *   entries for deep forensics. An empty string in either field
+   *   means the source authenticator was empty.
    */
   'transfer:security-alert': {
     readonly tokenId: string;
@@ -880,7 +890,9 @@ export interface SphereEventMap {
     readonly outboxId?: string;
     readonly attachedTransactionHash: string;
     readonly observedTransactionHash: string;
+    /** SHA-256(rawAuthenticator).slice(0,16) — see jsdoc above. */
     readonly attachedAuthenticator?: string;
+    /** SHA-256(rawAuthenticator).slice(0,16) — see jsdoc above. */
     readonly observedAuthenticator?: string;
     readonly message: string;
   };
