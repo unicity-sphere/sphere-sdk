@@ -68,6 +68,7 @@
  */
 
 import { MAX_CHAIN_DEPTH } from './limits';
+import { safeErrorMessage } from '../../../core/error-sanitize';
 import {
   ManifestCas,
   type ManifestCasResult,
@@ -593,11 +594,15 @@ export class CascadeWalker {
         error: err,
       });
       try {
+        // Round 5 fix: pass redacted error string instead of raw err object.
+        // Node's util.inspect surfaces enumerable own-properties — a
+        // hostile sender could attach `signedTransferTxBytes` to an
+        // injected error and watch it print to logs. Pass only the
+        // sanitized message string.
         // eslint-disable-next-line no-console
         console.warn(
           '[cascade-walker] findChildren failed for',
-          { addr, tokenId: currentTokenId },
-          err,
+          { addr, tokenId: currentTokenId, error: safeErrorMessage(err) },
         );
       } catch {
         // ignore logging failures
@@ -971,11 +976,11 @@ export class CascadeWalker {
         error: err,
       });
       try {
+        // Round 5 fix: pass redacted error string instead of raw err object.
         // eslint-disable-next-line no-console
         console.warn(
           '[cascade-walker] findEntriesByTokenId failed for',
-          { tokenId },
-          err,
+          { tokenId, error: safeErrorMessage(err) },
         );
       } catch {
         // ignore logging failures

@@ -84,6 +84,7 @@ import {
   type PerTokenMutexStrategy,
 } from '../../../profile/per-token-mutex';
 import type { ProofVerifyStatus } from './proof-verifier';
+import { safeErrorMessage } from '../../../core/error-sanitize';
 
 // =============================================================================
 // 1. Public types — proof shape + queue-entry abstractions
@@ -1083,10 +1084,10 @@ export class InclusionProofImporter {
     } catch (err) {
       // eslint-disable-next-line no-console
       try {
+        // Round 5 fix: pass redacted error string instead of raw err object.
         console.warn(
           '[import-inclusion-proof] transfer:override-applied emit failed',
-          { tokenId, transition },
-          err,
+          { tokenId, transition, error: safeErrorMessage(err) },
         );
       } catch {
         // ignore logging failures
