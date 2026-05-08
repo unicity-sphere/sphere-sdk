@@ -339,60 +339,62 @@ describe('SendingRecoveryWorker', () => {
   // Wave 3 steelman regression — concurrency races
   // ===========================================================================
   //
-  // The recovery worker's previous `recoverOne` impl called `republish()`
-  // BEFORE checking the entry was still in `'sending'`, then unconditionally
-  // emitted `transfer:recovery-republished` even when the post-republish
-  // CAS no-op'd. A concurrent process advancing the entry to
-  // `delivered-instant` between the scan snapshot and `recoverOne()` would:
-  //   (a) trigger a duplicate Nostr publish (wasted relay traffic), and
-  //   (b) emit a false-success event that downstream subscribers
-  //       interpret as proof of recovery.
+  // FIX 5 (steelman warning) update: the previous Wave 3 fix did a
+  // per-entry pre-republish `readAllNew()` to detect the race. That made
+  // every recoverOne O(N) on a healthy outbox and the cycle O(N²) under
+  // load. The current contract is:
+  //   - Snapshot once per scan in `runScanCycle`. The snapshot is
+  //     authoritative for "status@scan-time".
+  //   - Pass the snapshot entry into `recoverOne`.
+  //   - `republish` IS called even if the entry has since advanced.
+  //     One wasted Nostr publish in the racing window is harmless —
+  //     the recipient's replay-LRU short-circuits duplicates by
+  //     `bundleCid`.
+  //   - The CAS guard inside `transitionToDelivered`'s `update()`
+  //     closure detects the advance: the mutator returns `prev`
+  //     unchanged, `didTransition` stays false, and NO false-success
+  //     event is emitted.
   //
-  // The fix re-reads the entry under the writer's CAS path BEFORE calling
-  // republish (skip if status changed), AND moves `emitRepublished` inside
-  // the mutator's success branch (gate emit on actual transition).
+  // The "no false-success emit on race" invariant is preserved; the
+  // "no duplicate publish on race" invariant is intentionally relaxed
+  // for O(N) scan performance.
   describe('Wave 3 — concurrency race against in-flight status change', () => {
-    it('skips republish if entry advanced to delivered-instant before scan handles it', async () => {
+    it('FIX 5: snapshot is authoritative; republish fires when entry advances DURING republish, but no false-success emit', async () => {
+      // The racing concurrent process advances the entry DURING the
+      // republish() call. With FIX 5's snapshot-authoritative contract:
+      // - The snapshot taken at runScanCycle() saw the entry as 'sending'.
+      // - recoverOne is invoked with the snapshot entry (no pre-flight
+      //   readAllNew).
+      // - republish is called and SUCCEEDS.
+      // - The racing concurrent advance flips status to 'delivered-instant'.
+      // - The post-republish CAS inside transitionToDelivered observes
+      //   `prev.status !== 'sending'` and returns prev unchanged.
+      // - didTransition stays false → NO false-success emit.
       const stuckEntry = makeEntry({
-        id: 'race-advance-instant',
+        id: 'race-advance-during-republish',
         mode: 'instant',
         status: 'sending',
         updatedAt: 1_000,
       });
       const outboxFixture = makeFakeOutbox([stuckEntry]);
 
-      // Simulate a concurrent process: between the worker's first
-      // `readAllNew()` (snapshot) and its second `readAllNew()` (pre-
-      // republish CAS check), advance the entry to `delivered-instant`.
-      let snapshotReadCount = 0;
-      const baseReadAll = outboxFixture.outbox.readAllNew;
-      const racingOutbox: Pick<typeof outboxFixture.outbox, 'readAllNew' | 'update'> = {
-        async readAllNew() {
-          snapshotReadCount += 1;
-          // First read = scan snapshot (returns the stuck entry).
-          // Subsequent reads (pre-republish CAS) see advanced status.
-          if (snapshotReadCount === 1) {
-            return baseReadAll();
-          }
-          const entries = outboxFixture.entries();
-          // Mutate the live store to reflect the concurrent advance.
-          const live = entries.get('race-advance-instant');
-          if (live !== undefined && live.status === 'sending') {
-            entries.set('race-advance-instant', {
-              ...live,
-              status: 'delivered-instant',
-            });
-          }
-          return baseReadAll();
-        },
-        update: outboxFixture.outbox.update,
-      };
+      // Hand-rolled republish: when called, mutates the live outbox to
+      // simulate a concurrent advance HAPPENING during the publish.
+      const republish: RepublishFn = vi.fn(async (): Promise<void> => {
+        const entries = outboxFixture.entries();
+        const live = entries.get('race-advance-during-republish');
+        if (live !== undefined && live.status === 'sending') {
+          entries.set('race-advance-during-republish', {
+            ...live,
+            status: 'delivered-instant',
+          });
+        }
+      });
 
-      const republish = vi.fn<RepublishFn>().mockResolvedValue(undefined);
       const recorder = makeEventRecorder();
 
       const worker = new SendingRecoveryWorker({
-        outbox: racingOutbox,
+        outbox: outboxFixture.outbox,
         republish,
         emit: recorder.emit,
         logger: { warn: () => undefined, info: () => undefined },
@@ -401,17 +403,16 @@ describe('SendingRecoveryWorker', () => {
 
       const attempted = await worker.runScanCycle();
 
-      // The scan saw 1 stuck entry, but the pre-republish CAS check
-      // discovered the entry had already advanced — republish MUST NOT
-      // have fired, and no recovery event MUST have been emitted.
+      // FIX 5: snapshot-authoritative contract.
       expect(attempted).toBe(1);
-      expect(republish).not.toHaveBeenCalled();
+      expect(republish).toHaveBeenCalledTimes(1);
+      // The post-republish CAS detected the advance — no false-success
+      // emit fires.
       const recoveryEvents = recorder.events.filter(
         (e) => e.type === 'transfer:recovery-republished',
       );
       expect(recoveryEvents).toHaveLength(0);
-      // The state-machine transition recorder should be empty — no
-      // false self-loop write either.
+      // The mutator's CAS branch returned prev unchanged.
       expect(outboxFixture.transitions()).toEqual([]);
     });
 

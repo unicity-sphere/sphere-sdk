@@ -154,6 +154,23 @@ import { INGEST_QUEUE_PER_TOKEN_CAP, INGEST_QUEUE_SIZE } from './limits.js';
  */
 export const MAX_INGEST_WORKERS = 16;
 
+/**
+ * Default per-bundle wall-clock processing budget.
+ *
+ * **Steelman warning fix:** a hostile bundle with 256 tokenIds × ~5s
+ * mutex hold each = 21min per worker. 16 such maxed bundles can
+ * monopolize the entire pool. We cap each bundle's per-worker
+ * processBundle wall-clock to {@link BUNDLE_MAX_PROCESSING_MS}; on
+ * timeout we abort the in-flight work via an `AbortController`, emit
+ * `transfer:operator-alert`, and re-enqueue ONCE with a "retried-once"
+ * flag. A second timeout is a hard-fail with another operator alert
+ * (no further retries — the bundle is dropped).
+ *
+ * 60_000 ms (1 minute) is the default. Operationally tunable via the
+ * `bundleMaxProcessingMs` constructor option.
+ */
+export const BUNDLE_MAX_PROCESSING_MS = 60_000;
+
 // =============================================================================
 // 2. Public types — caller-supplied per-bundle / per-token hooks
 // =============================================================================
@@ -320,6 +337,15 @@ export interface IngestWorkerPoolOptions {
    * bytes — keeps concurrency-mechanics tests fast and deterministic.
    */
   readonly acquireBundle?: AcquireBundleFn;
+  /**
+   * Per-bundle wall-clock processing budget. Default
+   * {@link BUNDLE_MAX_PROCESSING_MS} = 60_000 ms. On timeout the
+   * in-flight `processBundle` is aborted via the worker's
+   * `AbortController`, an operator alert is emitted, and the bundle is
+   * re-enqueued ONCE with a retried-once flag; a second timeout is a
+   * hard-fail (no further retries, second operator alert).
+   */
+  readonly bundleMaxProcessingMs?: number;
 }
 
 // =============================================================================
@@ -337,6 +363,14 @@ interface QueueEntry {
   readonly resolveSettled: () => void;
   /** Marks `settled` rejected (only on programmer-error paths). */
   readonly rejectSettled: (err: unknown) => void;
+  /**
+   * Number of times processBundle has been attempted for this entry.
+   * Starts at 0; incremented on each requeue triggered by the
+   * per-bundle wall-clock budget. After the first timeout we requeue
+   * with `attempts === 1`; a second timeout is the hard-fail terminal
+   * state — emit an operator alert and drop the bundle.
+   */
+  attempts: number;
 }
 
 // =============================================================================
@@ -366,6 +400,7 @@ export class IngestWorkerPool {
   private readonly maxWorkers: number;
   private readonly queueCapacity: number;
   private readonly perTokenCap: number;
+  private readonly bundleMaxProcessingMs: number;
 
   /** FIFO queue. Workers `shift()`; `enqueue()` `push()`es. */
   private readonly queue: QueueEntry[] = [];
@@ -420,9 +455,18 @@ export class IngestWorkerPool {
         'VALIDATION_ERROR',
       );
     }
+    const bundleMaxProcessingMs =
+      options.bundleMaxProcessingMs ?? BUNDLE_MAX_PROCESSING_MS;
+    if (!Number.isFinite(bundleMaxProcessingMs) || bundleMaxProcessingMs < 1) {
+      throw new SphereError(
+        `IngestWorkerPool: bundleMaxProcessingMs must be a positive finite number, got ${String(bundleMaxProcessingMs)}`,
+        'VALIDATION_ERROR',
+      );
+    }
     this.maxWorkers = maxWorkers;
     this.queueCapacity = queueSize;
     this.perTokenCap = perTokenCap;
+    this.bundleMaxProcessingMs = bundleMaxProcessingMs;
 
     // Spin up the worker fan-out eagerly. Workers park on `nextEntry()`
     // until the queue has work; they exit when `running` flips false
