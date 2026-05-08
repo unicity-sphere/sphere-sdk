@@ -76,6 +76,25 @@
  *  flips to `false`). Callers awaiting `destroy()`'s returned promise
  *  see all worker promises settle.
  *
+ * **Abort propagation contract** (Round 3 fix):
+ *  Each `processBundle` invocation owns an `AbortController` whose
+ *  signal fires when the bundle's wall-clock budget elapses. The signal
+ *  is propagated to:
+ *
+ *    1. `acquireBundle` via `cidOptions.signal` — composed with any
+ *       caller-supplied signal so either source cancels the in-flight
+ *       gateway fetch / CAR streaming.
+ *    2. `processToken` via `ctx.signal` — consumer hooks SHOULD observe
+ *       it to cancel network calls / aggregator submits / disposition
+ *       writes promptly.
+ *    3. The per-token loop checks `signal.aborted` BEFORE acquiring the
+ *       next per-token mutex, so the late worker cannot race the retry
+ *       attempt on a fresh tokenId after timeout.
+ *
+ *  Without this propagation, `abortController.abort()` would cancel
+ *  nothing — the in-flight bundle keeps running while the retry attempt
+ *  also runs, racing on the same per-token mutex / disposition writes.
+ *
  * **No module-level state**:
  *  All queues / counters / mutex slots live on the instance. A single
  *  `Sphere` constructs exactly one pool; tests construct ad-hoc pools
@@ -131,6 +150,14 @@ import type { ReplayLRU } from './replay-lru.js';
  * {@link acquireBundleDefault} export. Exposed as an injection seam so
  * unit tests can drive the pool without standing up a real CAR
  * verification path.
+ *
+ * **Round 3 fix — abort propagation.** The pool's per-bundle wall-clock
+ * budget creates an `AbortController` per attempt. The signal is plumbed
+ * through to the acquirer so that the acquirer (and downstream
+ * cid-fetcher) can cancel in-flight network reads when the worker is
+ * abandoning the bundle. Without this propagation, `abortController.abort()`
+ * cancels nothing — the in-flight `processBundle` keeps running and races
+ * against the retry attempt on the same bundle's per-token mutex.
  */
 export type AcquireBundleFn = (
   payload: UxfV1Payload,
@@ -170,6 +197,19 @@ export const MAX_INGEST_WORKERS = 16;
  * `bundleMaxProcessingMs` constructor option.
  */
 export const BUNDLE_MAX_PROCESSING_MS = 60_000;
+
+/**
+ * Default per-sender operator-alert rate limit window (ms).
+ *
+ * Round 3 fix — a malicious sender shipping always-timeout bundles can
+ * produce 2 alerts per bundle × MAX_INGEST_WORKERS (16) = 32 alerts/min/
+ * sender; with multiple hostile senders the alert channel floods. We cap
+ * emission to 1 alert per sender per
+ * {@link OPERATOR_ALERT_RATE_LIMIT_WINDOW_MS} window (default 1 min).
+ * Suppressed counts are surfaced as a single summary alert at the next
+ * window boundary so visibility is preserved.
+ */
+export const OPERATOR_ALERT_RATE_LIMIT_WINDOW_MS = 60_000;
 
 // =============================================================================
 // 2. Public types — caller-supplied per-bundle / per-token hooks
@@ -228,6 +268,23 @@ export interface ProcessTokenContext {
   readonly senderTransportPubkey: string;
   /** The bundleCid the acquirer extracted (and confirmed). */
   readonly bundleCid: string;
+  /**
+   * Per-bundle wall-clock budget abort signal. Aborted by the worker
+   * loop when the bundle's wall-clock budget elapses. `processToken`
+   * implementations SHOULD propagate it to any downstream network /
+   * mutex / aggregator calls so the in-flight work is cancelled
+   * promptly. Without observing the signal, the implementation may
+   * still do useful work — but the worker that timed out has already
+   * moved on to retry, and any state writes from the late call risk
+   * racing the retry's writes on the same per-token mutex.
+   *
+   * Round 3 fix: previously the pool allocated this signal but did not
+   * propagate it. Calling `abortController.abort()` cancelled nothing,
+   * which amplified DoS impact: two workers could race on the same
+   * bundle's per-token disposition writes after a timeout-triggered
+   * retry.
+   */
+  readonly signal?: AbortSignal;
   /**
    * Discriminator: which list did this `tokenRoot` come from?
    *
@@ -346,6 +403,15 @@ export interface IngestWorkerPoolOptions {
    * retries; second `transfer:operator-alert` emitted; bundle dropped).
    */
   readonly bundleMaxProcessingMs?: number;
+  /**
+   * Round 3 fix — per-sender operator-alert rate limit window (ms).
+   * Default {@link OPERATOR_ALERT_RATE_LIMIT_WINDOW_MS} = 60_000 ms.
+   * Within each window, at most ONE `transfer:operator-alert` is
+   * emitted per `senderTransportPubkey`. Suppressed alerts increment
+   * a counter; at the next window boundary a single summary alert is
+   * emitted carrying the suppressed count.
+   */
+  readonly operatorAlertRateLimitMs?: number;
 }
 
 // =============================================================================
@@ -401,6 +467,19 @@ export class IngestWorkerPool {
   private readonly queueCapacity: number;
   private readonly perTokenCap: number;
   private readonly bundleMaxProcessingMs: number;
+  private readonly operatorAlertRateLimitMs: number;
+
+  /**
+   * Round 3 fix — per-sender operator-alert rate limit ledger.
+   * Maps `senderTransportPubkey` → window state. Entries are
+   * lazily expired on access. Bounded by the number of distinct
+   * timed-out senders; each entry is ~64 bytes so even a 10k-sender
+   * flood costs <1 MiB until the window rolls.
+   */
+  private readonly operatorAlertWindows = new Map<
+    string,
+    { windowStart: number; suppressed: number }
+  >();
 
   /** FIFO queue. Workers `shift()`; `enqueue()` `push()`es. */
   private readonly queue: QueueEntry[] = [];
@@ -463,10 +542,22 @@ export class IngestWorkerPool {
         'VALIDATION_ERROR',
       );
     }
+    const operatorAlertRateLimitMs =
+      options.operatorAlertRateLimitMs ?? OPERATOR_ALERT_RATE_LIMIT_WINDOW_MS;
+    if (
+      !Number.isFinite(operatorAlertRateLimitMs) ||
+      operatorAlertRateLimitMs < 1
+    ) {
+      throw new SphereError(
+        `IngestWorkerPool: operatorAlertRateLimitMs must be a positive finite number, got ${String(operatorAlertRateLimitMs)}`,
+        'VALIDATION_ERROR',
+      );
+    }
     this.maxWorkers = maxWorkers;
     this.queueCapacity = queueSize;
     this.perTokenCap = perTokenCap;
     this.bundleMaxProcessingMs = bundleMaxProcessingMs;
+    this.operatorAlertRateLimitMs = operatorAlertRateLimitMs;
 
     // Spin up the worker fan-out eagerly. Workers park on `nextEntry()`
     // until the queue has work; they exit when `running` flips false
@@ -784,13 +875,91 @@ export class IngestWorkerPool {
    * - Second-attempt timeout: emit final operator alert, drop the
    *   bundle (caller's enqueue promise resolves cleanly per pool
    *   contract — "we tried"; no disposition record written).
+   *
+   * **Round 3 regression fixes:**
+   *
+   * 1. **Queue capacity cap on retry** — under sustained timeout
+   *    pressure, the previous implementation re-pushed without checking
+   *    `queueCapacity`. The queue grew unboundedly. Now: if the queue
+   *    is already at capacity, we hard-fail the entry with
+   *    `BUNDLE_REJECTED_QUEUE_CAP_EXCEEDED` and emit a final operator
+   *    alert. Memory footprint is bounded.
+   *
+   * 2. **Destroy serialization** — if the pool has been asked to shut
+   *    down (`!this.running`) we also hard-fail rather than re-enqueue.
+   *    Without this guard, a worker that times out AFTER `destroy()`'s
+   *    drain step could re-push, the worker loop's outer
+   *    `while (this.running || this.queue.length > 0)` then dequeues
+   *    and runs another full processBundle, making destroy's wall-clock
+   *    latency unbounded.
+   *
+   * 3. **Per-sender alert rate limit** — alerts are gated by
+   *    {@link shouldEmitOperatorAlert} so a malicious sender shipping
+   *    always-timeout bundles cannot flood the operator alert channel
+   *    (cap: 1 alert per sender per minute by default; suppressed
+   *    counts surface in a summary alert at the next window
+   *    boundary).
    */
   private handleBundleTimeout(entry: QueueEntry, workerIndex: number): void {
     if (entry.attempts === 0) {
-      this.emit('transfer:operator-alert', {
+      // Round 3 fix #2 — destroy serialization. If the pool is shutting
+      // down, do NOT re-enqueue. A second processBundle invocation
+      // would unboundedly extend destroy() latency, since the worker
+      // loop's outer `while (this.running || this.queue.length > 0)`
+      // would dequeue and run it.
+      if (!this.running) {
+        this.maybeEmitOperatorAlert(entry, {
+          code: 'structural',
+          message:
+            `IngestWorkerPool.processBundle wall-clock budget ` +
+            `(${this.bundleMaxProcessingMs} ms) exceeded during shutdown; ` +
+            `bundle dropped (destroy() in progress, no retry)`,
+        });
+        this.logEmit(
+          'warn',
+          'IngestWorkerPool: bundle processing timeout — shutting down, no retry',
+          {
+            workerIndex,
+            bundleCidPrefix: redactBundleCid(entry.payload.bundleCid),
+            senderPubkeyPrefix: redactSenderPubkey(entry.senderTransportPubkey),
+            attempts: entry.attempts,
+            budgetMs: this.bundleMaxProcessingMs,
+          },
+        );
+        entry.resolveSettled();
+        return;
+      }
+      // Round 3 fix #1 — queue capacity check on retry. Under sustained
+      // timeout pressure, the previous code re-pushed without checking
+      // `queueCapacity`, so the queue grew unboundedly. Hard-fail
+      // instead when at cap.
+      if (this.queue.length >= this.queueCapacity) {
+        this.maybeEmitOperatorAlert(entry, {
+          code: 'structural',
+          message:
+            `IngestWorkerPool.processBundle wall-clock budget ` +
+            `(${this.bundleMaxProcessingMs} ms) exceeded; queue at capacity ` +
+            `(${this.queueCapacity}), retry would breach cap; bundle dropped ` +
+            `(BUNDLE_REJECTED_QUEUE_CAP_EXCEEDED)`,
+        });
+        this.logEmit(
+          'error',
+          'IngestWorkerPool: bundle processing timeout — queue cap exceeded, no retry',
+          {
+            workerIndex,
+            bundleCidPrefix: redactBundleCid(entry.payload.bundleCid),
+            senderPubkeyPrefix: redactSenderPubkey(entry.senderTransportPubkey),
+            attempts: entry.attempts,
+            budgetMs: this.bundleMaxProcessingMs,
+            queueCapacity: this.queueCapacity,
+          },
+        );
+        entry.resolveSettled();
+        return;
+      }
+      // Normal retry path.
+      this.maybeEmitOperatorAlert(entry, {
         code: 'structural',
-        bundleCid: entry.payload.bundleCid,
-        senderTransportPubkey: entry.senderTransportPubkey,
         message:
           `IngestWorkerPool.processBundle wall-clock budget ` +
           `(${this.bundleMaxProcessingMs} ms) exceeded; bundle re-enqueued ` +
@@ -811,10 +980,8 @@ export class IngestWorkerPool {
       return;
     }
     // Second timeout — hard-fail.
-    this.emit('transfer:operator-alert', {
+    this.maybeEmitOperatorAlert(entry, {
       code: 'structural',
-      bundleCid: entry.payload.bundleCid,
-      senderTransportPubkey: entry.senderTransportPubkey,
       message:
         `IngestWorkerPool.processBundle wall-clock budget ` +
         `(${this.bundleMaxProcessingMs} ms) exceeded a SECOND time; ` +
@@ -828,6 +995,53 @@ export class IngestWorkerPool {
       budgetMs: this.bundleMaxProcessingMs,
     });
     entry.resolveSettled();
+  }
+
+  /**
+   * Round 3 fix — per-sender operator-alert rate-limited emit.
+   *
+   * If the sender is within an active suppression window, the alert is
+   * dropped and `suppressed` is incremented. If the sender's window has
+   * elapsed (or the sender is unknown), we open a new window and emit
+   * the alert immediately. If a window had accumulated suppressed
+   * alerts and is now expired, we emit a single summary alert with the
+   * suppressed count alongside the new "fresh" alert.
+   */
+  private maybeEmitOperatorAlert(
+    entry: QueueEntry,
+    body: { code: 'structural'; message: string },
+  ): void {
+    const now = Date.now();
+    const sender = entry.senderTransportPubkey;
+    const window = this.operatorAlertWindows.get(sender);
+    if (!window || now - window.windowStart >= this.operatorAlertRateLimitMs) {
+      // Window expired (or never opened). If the previous window had
+      // suppressed alerts, emit a summary BEFORE the new fresh alert
+      // so operators see "X suppressed in the last window" alongside
+      // the next live event.
+      if (window && window.suppressed > 0) {
+        this.emit('transfer:operator-alert', {
+          code: 'structural',
+          bundleCid: entry.payload.bundleCid,
+          senderTransportPubkey: sender,
+          message:
+            `IngestWorkerPool: ${window.suppressed} operator-alert(s) ` +
+            `suppressed during the previous ${this.operatorAlertRateLimitMs} ms ` +
+            `rate-limit window for sender (Round 3 per-sender cap)`,
+        });
+      }
+      // Open a fresh window and emit the live alert.
+      this.operatorAlertWindows.set(sender, { windowStart: now, suppressed: 0 });
+      this.emit('transfer:operator-alert', {
+        code: body.code,
+        bundleCid: entry.payload.bundleCid,
+        senderTransportPubkey: sender,
+        message: body.message,
+      });
+      return;
+    }
+    // Inside an active window — suppress.
+    window.suppressed += 1;
   }
 
   /**
@@ -879,15 +1093,31 @@ export class IngestWorkerPool {
     // hooks that observe it can cancel in-flight async work; ones
     // that don't will eventually resolve and have their late result
     // suppressed by the runWorker's `timedOut` flag.
-    _abortSignal?: AbortSignal,
+    //
+    // **Round 3 fix — abort propagation contract.** The signal MUST be
+    // propagated to:
+    //   1. `acquireBundle` via `cidOptions.signal` (composes with any
+    //      caller-supplied signal so either source aborts the in-flight
+    //      gateway fetch / streaming download).
+    //   2. `processToken` via `ctx.signal` so consumer hooks can cancel
+    //      mutex acquires, aggregator calls, and disposition writes.
+    // Without this propagation, `abortController.abort()` cancels
+    // nothing; the in-flight bundle keeps running while the retry
+    // attempt also runs, racing on the same per-token mutex.
+    abortSignal?: AbortSignal,
   ): Promise<void> {
     let verified: VerifiedBundle | null = null;
     try {
+      // Compose `abortSignal` with any caller-supplied
+      // `cidOptions.signal`. AbortSignal.any (Node 20+) covers the
+      // common case; for older runtimes we fall back to a manual
+      // controller that aborts when EITHER source aborts.
+      const composedCidOptions = this.composeCidOptionsWithSignal(abortSignal);
       const acquired = await this.acquireBundleFn(
         entry.payload,
         entry.senderTransportPubkey,
         this.lru,
-        this.cidOptions,
+        composedCidOptions,
       );
       if (isReplayOutcome(acquired)) {
         // §5.1 / §5.6 — replay re-arrival is a no-op.
@@ -929,6 +1159,17 @@ export class IngestWorkerPool {
     ];
 
     for (const { root: tokenRoot, isClaimed } of allTokens) {
+      // Round 3 fix — bail out early if the wall-clock budget already
+      // elapsed. We MUST NOT start a fresh per-token mutex acquire after
+      // the bundle has been abandoned, otherwise the late worker races
+      // the retry attempt on the same id.
+      if (abortSignal?.aborted) {
+        this.logEmit('debug', 'IngestWorkerPool: abort observed — skipping remaining tokens', {
+          workerIndex,
+          bundleCid: verified.bundleCid,
+        });
+        return;
+      }
       try {
         await this.perTokenMutex.acquire(
           tokenRoot.tokenId,
@@ -938,6 +1179,7 @@ export class IngestWorkerPool {
               senderTransportPubkey: entry.senderTransportPubkey,
               bundleCid: verified!.bundleCid,
               isClaimed,
+              signal: abortSignal,
             }),
           { strategy: this.mutexStrategy },
         );
@@ -1032,6 +1274,53 @@ export class IngestWorkerPool {
       isSphereError(err) &&
       err.code === 'BUNDLE_REJECTED_INSTANT_MODE_NOT_YET_SUPPORTED'
     );
+  }
+
+  /**
+   * Round 3 fix — compose the configured `cidOptions.signal` with the
+   * per-bundle wall-clock budget abort signal so EITHER source cancels
+   * the in-flight gateway fetch / CAR streaming.
+   *
+   * - No bundle signal supplied → return cidOptions unchanged.
+   * - cidOptions undefined → return `{ signal: bundleSignal }`.
+   * - Both supplied → return cidOptions with a composed signal that
+   *   aborts when either source aborts. Uses {@link AbortSignal.any}
+   *   when available (Node 20+), falls back to a manual controller
+   *   listener pattern otherwise.
+   */
+  private composeCidOptionsWithSignal(
+    bundleSignal: AbortSignal | undefined,
+  ): AcquireBundleCidOptions | undefined {
+    if (!bundleSignal) return this.cidOptions;
+    const callerSignal = this.cidOptions?.signal;
+    if (!callerSignal) {
+      return { ...(this.cidOptions ?? {}), signal: bundleSignal };
+    }
+    // Both present — compose. Prefer AbortSignal.any if available.
+    type AnyCtor = { any?: (signals: ReadonlyArray<AbortSignal>) => AbortSignal };
+    const anyFn = (AbortSignal as unknown as AnyCtor).any;
+    if (typeof anyFn === 'function') {
+      try {
+        return {
+          ...this.cidOptions!,
+          signal: anyFn([callerSignal, bundleSignal]),
+        };
+      } catch {
+        // Fall through to manual composition.
+      }
+    }
+    // Manual fallback: build a controller that aborts when either
+    // upstream signal aborts. Aborts immediately if either source is
+    // already aborted.
+    const composed = new AbortController();
+    if (callerSignal.aborted || bundleSignal.aborted) {
+      composed.abort();
+    } else {
+      const onAbort = (): void => composed.abort();
+      callerSignal.addEventListener('abort', onAbort, { once: true });
+      bundleSignal.addEventListener('abort', onAbort, { once: true });
+    }
+    return { ...this.cidOptions!, signal: composed.signal };
   }
 
   // ===========================================================================

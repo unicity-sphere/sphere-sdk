@@ -1339,6 +1339,11 @@ describe('IngestWorkerPool — per-bundle wall-clock budget (steelman warning)',
       acquireBundle: makeAcquirer(fixtures),
       mutexStrategy: 'rpc-release',
       bundleMaxProcessingMs: 50,
+      // Round 3 fix #4 introduced per-sender alert rate limiting (default
+      // 1 alert / 60s). For this test we want to observe BOTH alerts
+      // back-to-back, so set the window to 1ms (effectively disabling
+      // rate limiting).
+      operatorAlertRateLimitMs: 1,
     });
 
     await pool.enqueue(buildPayload({ bundleCid: cid, tokenIds: [tokenId] }), SENDER);
@@ -1481,6 +1486,649 @@ describe('IngestWorkerPool — per-bundle wall-clock budget (steelman warning)',
           processToken: vi.fn(),
           emit: () => undefined,
           bundleMaxProcessingMs: -10,
+        }),
+    ).toThrow(SphereError);
+  });
+});
+
+// =============================================================================
+// 13. Round 3 fix #1 — _abortSignal propagation through to acquireBundle and processToken
+// =============================================================================
+//
+// The Round 2 wall-clock budget allocated an AbortController per
+// processBundle attempt but never propagated the signal to downstream
+// calls. abortController.abort() cancelled nothing, so the in-flight
+// processBundle continued running while the retry attempt also ran —
+// two workers raced on the same per-token mutex / disposition writes.
+//
+// Round 3 fix: signal is plumbed to (a) acquireBundle via cidOptions.signal
+// (composed with any caller-supplied signal) and (b) processToken via
+// ctx.signal. The per-token loop also bails BEFORE the next mutex
+// acquire when signal.aborted observed, so a late worker cannot race
+// the retry.
+
+describe('IngestWorkerPool — Round 3 fix #1: abort signal propagation', () => {
+  let pool: IngestWorkerPool | null = null;
+
+  afterEach(async () => {
+    if (pool) {
+      await pool.destroy();
+      pool = null;
+    }
+  });
+
+  it('on timeout, the abort signal is propagated to processToken via ctx.signal', async () => {
+    // Build a slow processToken that never resolves on its own; it
+    // resolves IFF the abort signal fires. Without propagation the
+    // signal never fires inside processToken — the test would time
+    // out the suite. With Round 3 propagation, the timeout aborts
+    // immediately.
+    const cid = syntheticBundleCid('absignal');
+    const tokenId = syntheticTokenId('a');
+    const fixtures = new Map<string, { spec: BundleSpec; type: 'verified' }>([
+      [cid, { spec: { bundleCid: cid, tokenIds: [tokenId] }, type: 'verified' }],
+    ]);
+
+    const observedSignals: AbortSignal[] = [];
+    const abortFiredAt = new Map<AbortSignal, number>();
+
+    const processToken: ProcessTokenFn = async (_root, _verified, ctx) => {
+      // CRITICAL invariant: the context MUST carry the signal field.
+      // Round 2: undefined. Round 3: defined (the per-bundle signal).
+      expect(ctx.signal).toBeDefined();
+      observedSignals.push(ctx.signal!);
+      // Wait until abort fires; if it never fires, this throws on
+      // suite-level timeout. With Round 3 the signal fires when the
+      // wall-clock budget elapses.
+      await new Promise<void>((resolve) => {
+        if (ctx.signal!.aborted) {
+          abortFiredAt.set(ctx.signal!, Date.now());
+          resolve();
+          return;
+        }
+        ctx.signal!.addEventListener(
+          'abort',
+          () => {
+            abortFiredAt.set(ctx.signal!, Date.now());
+            resolve();
+          },
+          { once: true },
+        );
+      });
+    };
+
+    pool = new IngestWorkerPool({
+      lru: new ReplayLRU(),
+      perTokenMutex: new PerTokenMutex(),
+      processToken,
+      emit: () => undefined,
+      acquireBundle: makeAcquirer(fixtures),
+      mutexStrategy: 'rpc-release',
+      bundleMaxProcessingMs: 30,
+      // Disable rate limiting for clear assertions.
+      operatorAlertRateLimitMs: 1,
+    });
+
+    const startTs = Date.now();
+    await pool.enqueue(buildPayload({ bundleCid: cid, tokenIds: [tokenId] }), SENDER);
+    const elapsed = Date.now() - startTs;
+
+    // Both attempts (first + retry) should have observed a signal.
+    expect(observedSignals.length).toBeGreaterThanOrEqual(1);
+    for (const sig of observedSignals) {
+      expect(abortFiredAt.has(sig)).toBe(true);
+    }
+    // Wall-clock should be on the order of 2 × budget (one timeout +
+    // one retry that also times out), NOT a long suite-level timeout.
+    expect(elapsed).toBeLessThan(500);
+  });
+
+  it('on timeout, the per-token loop bails BEFORE acquiring a fresh tokenId mutex', async () => {
+    // Build a verified bundle with TWO tokenIds. The first processToken
+    // call sleeps long enough to exceed the budget. The Round 3 abort
+    // check at the start of each iteration MUST short-circuit so the
+    // SECOND tokenId is never processed. Without the bail, the late
+    // worker would continue past the timeout and race the retry.
+    const cid = syntheticBundleCid('twotok');
+    const t1 = syntheticTokenId('t1');
+    const t2 = syntheticTokenId('t2');
+    const fixtures = new Map<string, { spec: BundleSpec; type: 'verified' }>([
+      [cid, { spec: { bundleCid: cid, tokenIds: [t1, t2] }, type: 'verified' }],
+    ]);
+
+    const calls: string[] = [];
+    const processToken: ProcessTokenFn = async (root, _v, ctx) => {
+      calls.push(root.tokenId);
+      // Slow path for the first token only.
+      if (root.tokenId === t1) {
+        await new Promise<void>((resolve) => {
+          if (ctx.signal?.aborted) {
+            resolve();
+            return;
+          }
+          ctx.signal?.addEventListener('abort', () => resolve(), { once: true });
+        });
+      }
+    };
+
+    pool = new IngestWorkerPool({
+      lru: new ReplayLRU(),
+      perTokenMutex: new PerTokenMutex(),
+      processToken,
+      emit: () => undefined,
+      acquireBundle: makeAcquirer(fixtures),
+      mutexStrategy: 'rpc-release',
+      bundleMaxProcessingMs: 30,
+      operatorAlertRateLimitMs: 1,
+    });
+
+    await pool.enqueue(buildPayload({ bundleCid: cid, tokenIds: [t1, t2] }), SENDER);
+
+    // After timeout, processToken for t1 returns (signal fired). The
+    // per-token loop's `signal.aborted` check then fires BEFORE
+    // acquiring the mutex for t2 — so t2 is never processed by THIS
+    // attempt. We may see t2 in the retry attempt though, so we
+    // assert that t1 was processed AT LEAST as many times as t2 (the
+    // first attempt only processed t1; the retry processes both).
+    const t1Calls = calls.filter((id) => id === t1).length;
+    const t2Calls = calls.filter((id) => id === t2).length;
+    expect(t1Calls).toBeGreaterThan(t2Calls);
+  });
+
+  it('cidOptions.signal is plumbed: gateway fetch sees the per-bundle abort', async () => {
+    // Verify Round 3 plumbing: the acquirer is called with cidOptions.signal
+    // composed from the per-bundle abort. We instrument a stub acquirer
+    // and assert ctx.signal is reflected as cidOptions.signal aborting.
+    const cid = syntheticBundleCid('cidsig');
+    const tokenId = syntheticTokenId('cs');
+
+    const observedCidSignal: { signal?: AbortSignal } = {};
+    const customAcquirer: AcquireBundleFn = async (payload, _sender, _lru, cidOptions) => {
+      observedCidSignal.signal = cidOptions?.signal;
+      // Park on the supplied signal so we know it actually fires.
+      await new Promise<void>((resolve) => {
+        if (cidOptions?.signal?.aborted) {
+          resolve();
+          return;
+        }
+        cidOptions?.signal?.addEventListener('abort', () => resolve(), {
+          once: true,
+        });
+      });
+      // Return a verified bundle so the test can complete cleanly on retry.
+      return buildVerifiedBundle({ bundleCid: payload.bundleCid, tokenIds: [tokenId] });
+    };
+
+    let processedOnce = false;
+    const processToken: ProcessTokenFn = async () => {
+      processedOnce = true;
+    };
+
+    pool = new IngestWorkerPool({
+      lru: new ReplayLRU(),
+      perTokenMutex: new PerTokenMutex(),
+      processToken,
+      emit: () => undefined,
+      acquireBundle: customAcquirer,
+      mutexStrategy: 'rpc-release',
+      bundleMaxProcessingMs: 30,
+      operatorAlertRateLimitMs: 1,
+    });
+
+    await pool.enqueue(buildPayload({ bundleCid: cid, tokenIds: [tokenId] }), SENDER);
+    // Round 3 plumbing: cidOptions.signal MUST have been supplied (so
+    // the acquirer received the abort and could observe it).
+    expect(observedCidSignal.signal).toBeDefined();
+    // The signal MUST be (eventually) aborted — fired by the wall-clock
+    // budget timer.
+    expect(observedCidSignal.signal!.aborted).toBe(true);
+    // We never reached processToken on the first attempt; the retry
+    // path may complete, so we don't assert processedOnce here.
+    void processedOnce;
+  });
+});
+
+// =============================================================================
+// 14. Round 3 fix #2 — re-enqueue respects queue capacity cap
+// =============================================================================
+//
+// The wall-clock-budget retry path called this.queue.push without checking
+// queueCapacity. Under sustained timeout pressure this grew the queue
+// unboundedly. Round 3 fix: at-cap retries hard-fail with
+// BUNDLE_REJECTED_QUEUE_CAP_EXCEEDED and emit a final alert.
+
+describe('IngestWorkerPool — Round 3 fix #2: re-enqueue respects queue cap', () => {
+  let pool: IngestWorkerPool | null = null;
+
+  afterEach(async () => {
+    if (pool) {
+      await pool.destroy();
+      pool = null;
+    }
+  });
+
+  it('timeout-retry that would exceed queueCapacity hard-fails instead of pushing', async () => {
+    // Setup: queueSize = 1 (the smallest possible bound). One slow
+    // bundle that times out → retry. With queueSize=1, the retry-push
+    // must check the queue length: if there's another bundle queued,
+    // re-pushing would exceed cap. We arrange for the queue to be full
+    // when the retry would fire.
+    const slowCid = syntheticBundleCid('slow-cap');
+    const slowTok = syntheticTokenId('slowcap');
+    const fillerCid = syntheticBundleCid('filler');
+    const fillerTok = syntheticTokenId('fill');
+
+    const fixtures = new Map<string, { spec: BundleSpec; type: 'verified' }>();
+    fixtures.set(slowCid, {
+      spec: { bundleCid: slowCid, tokenIds: [slowTok] },
+      type: 'verified',
+    });
+    fixtures.set(fillerCid, {
+      spec: { bundleCid: fillerCid, tokenIds: [fillerTok] },
+      type: 'verified',
+    });
+
+    let release: () => void = () => undefined;
+    const block = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    const processToken: ProcessTokenFn = async (root, _v, ctx) => {
+      if (root.tokenId === slowTok) {
+        // Slow + interruptible by abort.
+        await new Promise<void>((resolve) => {
+          if (ctx.signal?.aborted) {
+            resolve();
+            return;
+          }
+          ctx.signal?.addEventListener('abort', () => resolve(), { once: true });
+        });
+      } else {
+        // Filler parks on the external block so it occupies the queue.
+        await block;
+      }
+    };
+
+    const events: Array<{ event: SphereEventType; payload: unknown }> = [];
+    pool = new IngestWorkerPool({
+      lru: new ReplayLRU(),
+      perTokenMutex: new PerTokenMutex(),
+      processToken,
+      emit: (event, payload) => {
+        events.push({ event, payload: payload as unknown });
+      },
+      acquireBundle: makeAcquirer(fixtures),
+      mutexStrategy: 'rpc-release',
+      maxWorkers: 1,
+      queueSize: 1,
+      bundleMaxProcessingMs: 30,
+      operatorAlertRateLimitMs: 1,
+    });
+
+    // Enqueue slow first → goes to in-flight. Then enqueue filler → goes
+    // to the (size=1) queue. When slow times out and retry-handler runs,
+    // queue.length === 1 === queueCapacity → retry MUST hard-fail.
+    const slowPromise = pool.enqueue(
+      buildPayload({ bundleCid: slowCid, tokenIds: [slowTok] }),
+      SENDER,
+    );
+    // Yield so the worker picks up slow.
+    await Promise.resolve();
+    const fillerPromise = pool.enqueue(
+      buildPayload({ bundleCid: fillerCid, tokenIds: [fillerTok] }),
+      SENDER,
+    );
+
+    // Wait for the slow timeout to be processed. The retry path must
+    // hard-fail; slow's enqueue promise should resolve cleanly.
+    await slowPromise;
+
+    // The queue must NEVER have exceeded queueCapacity.
+    expect(pool.queueDepth).toBeLessThanOrEqual(1);
+
+    // The hard-fail message must mention the cap-exceeded path.
+    const alerts = events.filter((e) => e.event === 'transfer:operator-alert');
+    expect(alerts.length).toBeGreaterThanOrEqual(1);
+    const capAlert = alerts.find((a) =>
+      ((a.payload as { message?: string }).message ?? '').includes(
+        'BUNDLE_REJECTED_QUEUE_CAP_EXCEEDED',
+      ),
+    );
+    expect(capAlert).toBeDefined();
+
+    // Cleanup.
+    release();
+    await fillerPromise;
+  });
+});
+
+// =============================================================================
+// 15. Round 3 fix #3 — destroy serializes with timeout retry
+// =============================================================================
+//
+// Without the destroy guard in handleBundleTimeout, a worker that times
+// out AFTER destroy() drained the queue would re-push, then the worker
+// loop's outer `while (this.running || this.queue.length > 0)` would
+// dequeue and run another full processBundle, making destroy latency
+// unbounded. Round 3 fix: timeout handler checks `this.running` and
+// hard-fails instead of re-enqueueing during shutdown.
+
+describe('IngestWorkerPool — Round 3 fix #3: destroy serializes with timeout retry', () => {
+  it('destroy() during in-flight bundle: timeout fires, no second processBundle runs', async () => {
+    // Setup: a slow bundle that we time out. We call destroy()
+    // concurrently while the bundle is in-flight. The timeout handler
+    // MUST detect `!this.running` and hard-fail instead of re-pushing.
+    // Otherwise destroy() would have to wait for a second wall-clock
+    // budget elapse.
+    const cid = syntheticBundleCid('destroy-race');
+    const tokenId = syntheticTokenId('drc');
+    const fixtures = new Map<string, { spec: BundleSpec; type: 'verified' }>([
+      [cid, { spec: { bundleCid: cid, tokenIds: [tokenId] }, type: 'verified' }],
+    ]);
+
+    let processCalls = 0;
+    const processToken: ProcessTokenFn = async (_r, _v, ctx) => {
+      processCalls++;
+      // Park on the abort signal — the wall-clock timer fires it.
+      await new Promise<void>((resolve) => {
+        if (ctx.signal?.aborted) {
+          resolve();
+          return;
+        }
+        ctx.signal?.addEventListener('abort', () => resolve(), { once: true });
+      });
+    };
+
+    const pool = new IngestWorkerPool({
+      lru: new ReplayLRU(),
+      perTokenMutex: new PerTokenMutex(),
+      processToken,
+      emit: () => undefined,
+      acquireBundle: makeAcquirer(fixtures),
+      mutexStrategy: 'rpc-release',
+      maxWorkers: 1,
+      bundleMaxProcessingMs: 30,
+      operatorAlertRateLimitMs: 1,
+    });
+
+    const enqueuePromise = pool.enqueue(
+      buildPayload({ bundleCid: cid, tokenIds: [tokenId] }),
+      SENDER,
+    );
+
+    // Yield so the worker picks up the bundle and parks on the abort.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Trigger destroy. The wall-clock timer is still running; it will
+    // fire soon. The Round 3 guard means handleBundleTimeout sees
+    // !this.running and hard-fails.
+    const destroyStart = Date.now();
+    const destroyPromise = pool.destroy();
+    await destroyPromise;
+    const destroyElapsed = Date.now() - destroyStart;
+
+    await enqueuePromise;
+
+    // Bounded latency: destroy() returns within ~budget+overhead, NOT
+    // within 2× budget (which would be the case if the retry runs).
+    expect(destroyElapsed).toBeLessThan(200);
+    // processBundle ran exactly ONCE — no retry post-destroy.
+    expect(processCalls).toBe(1);
+  });
+});
+
+// =============================================================================
+// 16. Round 3 fix #4 — operator-alert rate limit per sender
+// =============================================================================
+//
+// Without rate limiting, a malicious sender shipping always-timeout
+// bundles can produce 2 alerts/bundle × MAX_INGEST_WORKERS (16) = 32
+// alerts/min/sender. Round 3 fix: per-sender rate ledger with a
+// configurable window (default 60s, 1 alert/window).
+
+describe('IngestWorkerPool — Round 3 fix #4: operator-alert rate limit', () => {
+  let pool: IngestWorkerPool | null = null;
+
+  afterEach(async () => {
+    if (pool) {
+      await pool.destroy();
+      pool = null;
+    }
+  });
+
+  it('many timeouts from one sender produce <= 1 alert per window', async () => {
+    // Setup: a 10-bundle sequence that all time out from the same
+    // sender. Use a long rate-limit window to ensure all alerts fall
+    // inside it. Without rate limiting, we'd see 2 alerts × 10 bundles
+    // = 20 alerts. With Round 3 rate limiting, we see exactly 1 alert
+    // (the first one in the window).
+    const fixtures = new Map<string, { spec: BundleSpec; type: 'verified' }>();
+    const cids: string[] = [];
+    for (let i = 0; i < 10; i++) {
+      const cid = syntheticBundleCid(`rl${i}`);
+      const tok = syntheticTokenId(`r${i}`);
+      cids.push(cid);
+      fixtures.set(cid, {
+        spec: { bundleCid: cid, tokenIds: [tok] },
+        type: 'verified',
+      });
+    }
+
+    const processToken: ProcessTokenFn = async (_r, _v, ctx) => {
+      // All bundles time out.
+      await new Promise<void>((resolve) => {
+        if (ctx.signal?.aborted) {
+          resolve();
+          return;
+        }
+        ctx.signal?.addEventListener('abort', () => resolve(), { once: true });
+      });
+    };
+
+    const events: Array<{ event: SphereEventType; payload: unknown }> = [];
+    pool = new IngestWorkerPool({
+      lru: new ReplayLRU(),
+      perTokenMutex: new PerTokenMutex(),
+      processToken,
+      emit: (event, payload) => {
+        events.push({ event, payload: payload as unknown });
+      },
+      acquireBundle: makeAcquirer(fixtures),
+      mutexStrategy: 'rpc-release',
+      maxWorkers: 4,
+      bundleMaxProcessingMs: 20,
+      // Long enough to cover entire test run; 1 alert per window.
+      operatorAlertRateLimitMs: 10_000,
+    });
+
+    // Enqueue all 10 bundles. They all time out (twice each: first +
+    // retry). Without rate limiting that's ~20 alerts; with Round 3
+    // rate limit we expect 1.
+    await Promise.all(
+      cids.map((cid, i) =>
+        pool!.enqueue(
+          buildPayload({ bundleCid: cid, tokenIds: [syntheticTokenId(`r${i}`)] }),
+          SENDER,
+        ),
+      ),
+    );
+
+    const alerts = events.filter((e) => e.event === 'transfer:operator-alert');
+    // Exactly 1 — the first timeout in the window, all others
+    // suppressed.
+    expect(alerts.length).toBe(1);
+  });
+
+  it('different senders each get their own window (no cross-pollution)', async () => {
+    // Same as above, but with 3 distinct senders. Each sender should
+    // be allowed exactly one alert in the window — 3 alerts total.
+    const SENDER_B = 'b'.repeat(64);
+    const SENDER_C = 'c'.repeat(64);
+
+    const fixtures = new Map<string, { spec: BundleSpec; type: 'verified' }>();
+    for (const tag of ['a', 'b', 'c']) {
+      const cid = syntheticBundleCid(`${tag}-multi`);
+      const tok = syntheticTokenId(`${tag}m`);
+      fixtures.set(cid, {
+        spec: { bundleCid: cid, tokenIds: [tok] },
+        type: 'verified',
+      });
+    }
+
+    const processToken: ProcessTokenFn = async (_r, _v, ctx) => {
+      await new Promise<void>((resolve) => {
+        if (ctx.signal?.aborted) {
+          resolve();
+          return;
+        }
+        ctx.signal?.addEventListener('abort', () => resolve(), { once: true });
+      });
+    };
+
+    const events: Array<{ event: SphereEventType; payload: unknown }> = [];
+    pool = new IngestWorkerPool({
+      lru: new ReplayLRU(),
+      perTokenMutex: new PerTokenMutex(),
+      processToken,
+      emit: (event, payload) => {
+        events.push({ event, payload: payload as unknown });
+      },
+      acquireBundle: makeAcquirer(fixtures),
+      mutexStrategy: 'rpc-release',
+      maxWorkers: 4,
+      bundleMaxProcessingMs: 20,
+      operatorAlertRateLimitMs: 10_000,
+    });
+
+    await Promise.all([
+      pool.enqueue(
+        buildPayload({
+          bundleCid: syntheticBundleCid('a-multi'),
+          tokenIds: [syntheticTokenId('am')],
+        }),
+        SENDER,
+      ),
+      pool.enqueue(
+        buildPayload({
+          bundleCid: syntheticBundleCid('b-multi'),
+          tokenIds: [syntheticTokenId('bm')],
+        }),
+        SENDER_B,
+      ),
+      pool.enqueue(
+        buildPayload({
+          bundleCid: syntheticBundleCid('c-multi'),
+          tokenIds: [syntheticTokenId('cm')],
+        }),
+        SENDER_C,
+      ),
+    ]);
+
+    const alerts = events.filter((e) => e.event === 'transfer:operator-alert');
+    expect(alerts.length).toBe(3);
+    const senders = new Set(
+      alerts.map((a) => (a.payload as { senderTransportPubkey: string }).senderTransportPubkey),
+    );
+    expect(senders.has(SENDER)).toBe(true);
+    expect(senders.has(SENDER_B)).toBe(true);
+    expect(senders.has(SENDER_C)).toBe(true);
+  });
+
+  it('after window expiry, a fresh alert is emitted with a suppressed-summary', async () => {
+    // Setup: very short window (10 ms) so we can roll it during the
+    // test. Send N bundles that all time out. Wait for the window to
+    // expire. Send one more bundle. Expect: first bundle's first
+    // timeout triggers the only "live" alert; subsequent timeouts in
+    // the window are suppressed; after window expiry, the next alert
+    // emission is preceded by a "X suppressed" summary.
+    const fixtures = new Map<string, { spec: BundleSpec; type: 'verified' }>();
+    for (let i = 0; i < 5; i++) {
+      const cid = syntheticBundleCid(`win${i}`);
+      const tok = syntheticTokenId(`w${i}`);
+      fixtures.set(cid, {
+        spec: { bundleCid: cid, tokenIds: [tok] },
+        type: 'verified',
+      });
+    }
+
+    const processToken: ProcessTokenFn = async (_r, _v, ctx) => {
+      await new Promise<void>((resolve) => {
+        if (ctx.signal?.aborted) {
+          resolve();
+          return;
+        }
+        ctx.signal?.addEventListener('abort', () => resolve(), { once: true });
+      });
+    };
+
+    const events: Array<{ event: SphereEventType; payload: unknown }> = [];
+    pool = new IngestWorkerPool({
+      lru: new ReplayLRU(),
+      perTokenMutex: new PerTokenMutex(),
+      processToken,
+      emit: (event, payload) => {
+        events.push({ event, payload: payload as unknown });
+      },
+      acquireBundle: makeAcquirer(fixtures),
+      mutexStrategy: 'rpc-release',
+      maxWorkers: 1,
+      bundleMaxProcessingMs: 20,
+      // Tight window so it expires between bundle batches.
+      operatorAlertRateLimitMs: 50,
+    });
+
+    // First batch — all time out, all share the rate-limit window.
+    for (let i = 0; i < 3; i++) {
+      await pool.enqueue(
+        buildPayload({
+          bundleCid: syntheticBundleCid(`win${i}`),
+          tokenIds: [syntheticTokenId(`w${i}`)],
+        }),
+        SENDER,
+      );
+    }
+
+    // Wait long enough for the window to roll (50ms).
+    await new Promise((r) => setTimeout(r, 80));
+
+    // One more bundle — expect a SUMMARY alert (mentioning suppressed
+    // count) PLUS a fresh live alert.
+    await pool.enqueue(
+      buildPayload({
+        bundleCid: syntheticBundleCid('win4'),
+        tokenIds: [syntheticTokenId('w4')],
+      }),
+      SENDER,
+    );
+
+    const alerts = events.filter((e) => e.event === 'transfer:operator-alert');
+    const summaries = alerts.filter((a) =>
+      ((a.payload as { message?: string }).message ?? '').includes('suppressed'),
+    );
+    // We expect at least one summary alert mentioning 'suppressed'.
+    expect(summaries.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('rejects invalid operatorAlertRateLimitMs at construction', () => {
+    expect(
+      () =>
+        new IngestWorkerPool({
+          lru: new ReplayLRU(),
+          perTokenMutex: new PerTokenMutex(),
+          processToken: vi.fn(),
+          emit: () => undefined,
+          operatorAlertRateLimitMs: 0,
+        }),
+    ).toThrow(SphereError);
+    expect(
+      () =>
+        new IngestWorkerPool({
+          lru: new ReplayLRU(),
+          perTokenMutex: new PerTokenMutex(),
+          processToken: vi.fn(),
+          emit: () => undefined,
+          operatorAlertRateLimitMs: -1,
         }),
     ).toThrow(SphereError);
   });

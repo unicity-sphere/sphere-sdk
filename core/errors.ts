@@ -469,6 +469,19 @@ export type SphereErrorCode =
    */
   | 'INGEST_QUEUE_FULL_PER_TOKEN'
   /**
+   * UXF Inter-Wallet Transfer T.3.E (Round 3 regression fix) — re-enqueue
+   * after wall-clock timeout would have exceeded the queue capacity cap.
+   *
+   * The per-bundle wall-clock budget triggers a one-shot retry: on
+   * timeout we re-push the entry to the queue. Round 2 did this without
+   * checking against the queue-capacity cap, so under sustained timeout
+   * pressure the queue could grow unboundedly. Round 3: if a re-enqueue
+   * would exceed `queueCapacity`, we hard-fail the entry instead and
+   * emit a final `transfer:operator-alert`. The bundle is dropped; no
+   * disposition record is written.
+   */
+  | 'BUNDLE_REJECTED_QUEUE_CAP_EXCEEDED'
+  /**
    * UXF Inter-Wallet Transfer T.5.D — operator escape-hatch wiring missing.
    *
    * `PaymentsModule.importInclusionProof()` and
