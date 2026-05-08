@@ -119,6 +119,7 @@ export type UxfV1Payload = UxfTransferPayloadCar | UxfTransferPayloadCid;
 import {
   acquireBundle as acquireBundleDefault,
   isReplayOutcome,
+  RECIPIENT_MAX_INLINE_CARBASE64_LENGTH,
   type AcquireBundleCidOptions,
   type AcquireBundleResult,
 } from './bundle-acquirer.js';
