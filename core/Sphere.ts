@@ -133,6 +133,7 @@ import type {
   LegacyFileType,
   DecryptionProgressCallback,
 } from '../serialization/types';
+import { safeErrorMessage } from './error-sanitize';
 
 // =============================================================================
 // Progress Callback
@@ -2577,30 +2578,89 @@ export class Sphere {
       }
     }
 
-    // Round 7 (FIX 1) — Wire production OrbitDb-backed disposition
-    // storage into the operator escape-hatch importer. Mirrors the
-    // wiring in `initializeModules()` for the default-address path. See
-    // there for full rationale + KNOWN LIMITATION docstring.
+    // Round 7 (FIX 1) / Round 8 (FIX 1) — Wire production OrbitDb-backed
+    // disposition storage AND oracle.verifyInclusionProof into the
+    // operator escape-hatch importer. Mirrors the wiring in
+    // `initializeModules()` for the default-address path. See there
+    // for full rationale + KNOWN LIMITATION docstring.
+    //
+    // Round 8 (FIX 2) — Without this hop, every non-default address
+    // would silently retain the Round 7 fail-closed verifier stub even
+    // when the wallet has a real oracle wired. That asymmetry meant a
+    // multi-address wallet could pass operator probes on its primary
+    // address but fail them on derived addresses.
     try {
       const storageWithBuilder = this._storage as unknown as {
         buildDispositionStorageAdapter?: () =>
           | import('../profile/disposition-storage-adapters').OrbitDbDispositionStorageAdapter
           | null;
       };
-      if (typeof storageWithBuilder.buildDispositionStorageAdapter === 'function') {
-        const adapter = storageWithBuilder.buildDispositionStorageAdapter();
-        if (adapter !== null && adapter !== undefined) {
-          payments.configureOperatorEscapeHatchStorage(adapter);
-          logger.debug(
-            'Sphere',
-            `Wired OrbitDb-backed disposition storage for address ${index}`,
-          );
-        }
+      const builderAvailable =
+        typeof storageWithBuilder.buildDispositionStorageAdapter === 'function';
+      const adapter = builderAvailable
+        ? storageWithBuilder.buildDispositionStorageAdapter!()
+        : null;
+
+      // Round 8 (FIX 1) — verifyProof adapter (same shape as the
+      // default-address path).
+      const oracleForVerify = this._oracle as unknown as {
+        verifyInclusionProof?: (input: {
+          readonly proofJson: unknown;
+          readonly transactionHash: string;
+          readonly proofHash?: string;
+        }) => Promise<boolean>;
+      };
+      const oracleHasVerify =
+        typeof oracleForVerify.verifyInclusionProof === 'function';
+      const verifyProofAdapter:
+        | import('../modules/payments/transfer/import-inclusion-proof').ProofVerifier
+        | undefined = oracleHasVerify
+        ? async (
+            proof: import('../modules/payments/transfer/import-inclusion-proof').ImportableInclusionProof,
+          ): Promise<import('../modules/payments/transfer/proof-verifier').ProofVerifyStatus> => {
+            try {
+              const ok = await oracleForVerify.verifyInclusionProof!({
+                proofJson: proof.proof,
+                transactionHash: proof.transactionHash,
+              });
+              return ok ? 'OK' : 'NOT_AUTHENTICATED';
+            } catch {
+              return 'NOT_AUTHENTICATED';
+            }
+          }
+        : undefined;
+
+      if (adapter !== null && adapter !== undefined) {
+        payments.configureOperatorEscapeHatchStorage(
+          adapter,
+          verifyProofAdapter !== undefined
+            ? { verifyProof: verifyProofAdapter }
+            : undefined,
+        );
+        logger.debug(
+          'Sphere',
+          `Wired OrbitDb-backed disposition storage + verifyProof for address ${index}`,
+        );
+      } else if (verifyProofAdapter !== undefined) {
+        // No OrbitDb adapter, but we still have a real oracle —
+        // upgrade just the verifier so multi-address wallets also
+        // benefit from the Round 8 verifier wiring.
+        const { InMemoryDispositionStorageAdapter } = await import(
+          '../profile/disposition-storage-adapters'
+        );
+        payments.configureOperatorEscapeHatchStorage(
+          new InMemoryDispositionStorageAdapter(),
+          { verifyProof: verifyProofAdapter },
+        );
+        logger.debug(
+          'Sphere',
+          `Wired oracle.verifyInclusionProof for address ${index} (in-memory disposition storage)`,
+        );
       }
     } catch (err) {
       logger.warn(
         'Sphere',
-        `Failed to wire OrbitDb-backed disposition storage for address ${index}: ${err instanceof Error ? err.message : String(err)}`,
+        `Failed to wire operator-escape-hatch importer overrides for address ${index}: ${safeErrorMessage(err)}`,
       );
     }
 
@@ -4740,10 +4800,16 @@ export class Sphere {
     } catch (err) {
       // Non-fatal: bootstrap continues with the auto-installed default.
       // The operator escape-hatch still works (just with the Round 7
-      // fail-closed verifier stub).
+      // fail-closed verifier stub). Round 8 (FIX 2) — use
+      // `safeErrorMessage` so a hostile Proxy on `err` (throwing
+      // getPrototypeOf / Symbol.hasInstance / .message getter) cannot
+      // crash the bootstrap path. The previous pattern
+      // (`err instanceof Error ? err.message : String(err)`) goes
+      // through `instanceof` which calls Symbol.hasInstance — a
+      // throwing trap escapes here.
       logger.warn(
         'Sphere',
-        `Failed to wire operator-escape-hatch importer overrides — falling back to in-memory default: ${err instanceof Error ? err.message : String(err)}`,
+        `Failed to wire operator-escape-hatch importer overrides — falling back to in-memory default: ${safeErrorMessage(err)}`,
       );
     }
 
