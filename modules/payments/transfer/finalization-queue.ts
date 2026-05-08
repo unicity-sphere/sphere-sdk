@@ -261,6 +261,19 @@ export const TOMBSTONE_RETENTION_MS =
   TOMBSTONE_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 
 /**
+ * Round 5 fix (CRIT NEW): clock-skew tolerance for
+ * {@link FinalizationQueue#setPollStartedAt}. Matches
+ * `import-inclusion-proof.ts`'s identical-named constant. A 5-minute
+ * window covers normal NTP drift between replicating peers without
+ * letting attacker-controlled timestamps push the §5.5 step 6 "2 ×
+ * POLLING_WINDOW_MS hard safety net" anchor arbitrarily far into the
+ * past or future.
+ *
+ * @internal
+ */
+export const CLOCK_SKEW_TOLERANCE_MS = 5 * 60 * 1000;
+
+/**
  * Telemetry callback invoked when {@link FinalizationQueue} encounters
  * a corrupt slot — a key whose JSON parses to neither a valid live
  * entry nor a valid tombstone. The default behavior in addition to
@@ -434,6 +447,36 @@ export class FinalizationQueue {
    * successful submit time" semantics (used by other code paths) and
    * makes the W26 contract explicit + self-documenting.
    */
+  /**
+   * Round 5 fix (CRIT NEW + HIGH NEW — CRDT race semantics):
+   *
+   * **Bounds validation.** `when` MUST satisfy
+   * `entry.createdAt - CLOCK_SKEW_TOLERANCE_MS <= when <= now +
+   * CLOCK_SKEW_TOLERANCE_MS`. Pre-fix, only `Number.isFinite(when)`
+   * was checked — negative values, zero, MIN_VALUE, and far-future
+   * values all silently passed and persisted, breaking the §5.5
+   * step 6 "2 × POLLING_WINDOW_MS hard safety net" anchor.
+   *
+   * Out-of-range values throw `VALIDATION_ERROR` instead of being
+   * silently clamped — fail-loud so caller bugs are visible. The
+   * 5-minute tolerance matches `import-inclusion-proof.ts`'s
+   * `CLOCK_SKEW_TOLERANCE_MS`.
+   *
+   * **CRDT race semantics (last-writer-wins).** The read-modify-write
+   * is NOT atomic at the storage layer. Two concurrent calls (e.g.,
+   * across replicating devices) may both observe `pollStartedAt ===
+   * undefined`, both compute distinct `when` values, and both write
+   * — the last writer (by physical write order) wins. The impact is
+   * bounded by clock skew: in normal operation the two values
+   * differ by at most a few hundred ms, well within the
+   * POLLING_WINDOW_MS budget; only a malicious actor with a
+   * deliberately skewed clock could push the anchor far enough to
+   * matter, and the bounds check above caps that drift. The
+   * underlying `FinalizationQueueStorage` interface does NOT
+   * currently expose a CAS primitive (writeKeyIfNotPresent or
+   * similar) — this is a documented limitation, not a silent
+   * regression.
+   */
   async setPollStartedAt(
     addr: string,
     entryId: string,
@@ -450,6 +493,22 @@ export class FinalizationQueue {
     const existing = await this.get(addr, entryId);
     if (existing === undefined) return 'absent';
     if (existing.pollStartedAt !== undefined) return 'already-set';
+    // Round 5 fix — clock-skew-tolerance bounds. The lower bound is
+    // anchored at `createdAt - CLOCK_SKEW_TOLERANCE_MS` (a poll
+    // cannot legitimately start meaningfully before the entry was
+    // created); the upper bound is `now + CLOCK_SKEW_TOLERANCE_MS`
+    // (allow modest forward skew for replicating peers).
+    const now = this.now();
+    const lowerBound = existing.createdAt - CLOCK_SKEW_TOLERANCE_MS;
+    const upperBound = now + CLOCK_SKEW_TOLERANCE_MS;
+    if (when < lowerBound || when > upperBound) {
+      throw new SphereError(
+        `FinalizationQueue.setPollStartedAt: when (${when}) is outside the ` +
+          `clock-skew tolerance window [${lowerBound}, ${upperBound}] ` +
+          `(createdAt=${existing.createdAt}, now=${now}, tolerance=${CLOCK_SKEW_TOLERANCE_MS}ms)`,
+        'VALIDATION_ERROR',
+      );
+    }
     const updated: FinalizationQueueEntry = {
       ...existing,
       pollStartedAt: when,
@@ -849,8 +908,25 @@ function deserializeEntry(
     // has happened yet (or this is a legacy entry written before the
     // field was introduced — both cases handled identically by the
     // worker's "stamp on first poll" code path).
+    //
+    // Round 5 fix — mirror the write-side bounds validation. A
+    // persisted value outside `[createdAt - CLOCK_SKEW_TOLERANCE_MS,
+    // SAFE_FUTURE_BOUND]` is corrupt (e.g., a pre-Round-5 caller
+    // wrote a negative or far-future value before the bounds were
+    // enforced). Drop it on read so the worker's "stamp on first
+    // poll" path runs cleanly. We CANNOT enforce the upper-bound at
+    // exactly `now + CLOCK_SKEW_TOLERANCE_MS` here because the
+    // deserializer is called from contexts (e.g., GC sweeps) where
+    // wall-clock may have advanced significantly since the legitimate
+    // stamp; we use a generous absolute upper bound (year 2100) and
+    // rely on the write-side to be the strict gatekeeper.
     ...(typeof obj.pollStartedAt === 'number' &&
-    Number.isFinite(obj.pollStartedAt)
+    Number.isFinite(obj.pollStartedAt) &&
+    obj.pollStartedAt >=
+      (typeof createdAt === 'number'
+        ? createdAt - CLOCK_SKEW_TOLERANCE_MS
+        : 0) &&
+    obj.pollStartedAt <= 4_102_444_800_000 // 2100-01-01 UTC
       ? { pollStartedAt: obj.pollStartedAt }
       : {}),
   };

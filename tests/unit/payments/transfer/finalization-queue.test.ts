@@ -533,3 +533,190 @@ describe('FinalizationQueue — pollStartedAt (Round 3 regression)', () => {
     await expect(q.setPollStartedAt(ADDR, e.entryId, Infinity)).rejects.toThrow();
   });
 });
+
+// =============================================================================
+// Round 5 FIX 2 — setPollStartedAt clock-skew bounds enforcement
+// =============================================================================
+//
+// Pre-Round-5 setPollStartedAt accepted any finite number for `when`,
+// including negative values, zero, MIN_VALUE, MAX_SAFE_INTEGER, and
+// timestamps far in the future. Hostile or buggy callers could push
+// the §5.5 step 6 "2 × POLLING_WINDOW_MS hard safety net" anchor
+// arbitrarily, defeating the deadline.
+//
+// Fix: bound `when` to `[entry.createdAt - CLOCK_SKEW_TOLERANCE_MS,
+// now + CLOCK_SKEW_TOLERANCE_MS]`, fail loudly with VALIDATION_ERROR
+// on out-of-range values.
+
+describe('FinalizationQueue — Round 5 FIX 2: setPollStartedAt bounds', () => {
+  // Use a deterministic clock so the upper-bound `now + tolerance` is
+  // predictable.
+  const FAKE_NOW = 1700000300000; // 5 minutes after createdAt
+  const TOLERANCE = 5 * 60 * 1000;
+
+  it('rejects when = 0', async () => {
+    const storage = makeFakeStorage();
+    const q = new FinalizationQueue({ storage, now: () => FAKE_NOW });
+    const e = makeEntry(); // createdAt = 1700000000000
+    await q.add(ADDR, e);
+    await expect(q.setPollStartedAt(ADDR, e.entryId, 0)).rejects.toThrow();
+  });
+
+  it('rejects when = -1', async () => {
+    const storage = makeFakeStorage();
+    const q = new FinalizationQueue({ storage, now: () => FAKE_NOW });
+    const e = makeEntry();
+    await q.add(ADDR, e);
+    await expect(q.setPollStartedAt(ADDR, e.entryId, -1)).rejects.toThrow();
+  });
+
+  it('rejects when = Number.MAX_VALUE (far future)', async () => {
+    const storage = makeFakeStorage();
+    const q = new FinalizationQueue({ storage, now: () => FAKE_NOW });
+    const e = makeEntry();
+    await q.add(ADDR, e);
+    await expect(
+      q.setPollStartedAt(ADDR, e.entryId, Number.MAX_VALUE),
+    ).rejects.toThrow();
+  });
+
+  it('rejects when = Number.MAX_SAFE_INTEGER', async () => {
+    const storage = makeFakeStorage();
+    const q = new FinalizationQueue({ storage, now: () => FAKE_NOW });
+    const e = makeEntry();
+    await q.add(ADDR, e);
+    await expect(
+      q.setPollStartedAt(ADDR, e.entryId, Number.MAX_SAFE_INTEGER),
+    ).rejects.toThrow();
+  });
+
+  it('rejects when = now + tolerance + 1ms (just over upper bound)', async () => {
+    const storage = makeFakeStorage();
+    const q = new FinalizationQueue({ storage, now: () => FAKE_NOW });
+    const e = makeEntry();
+    await q.add(ADDR, e);
+    await expect(
+      q.setPollStartedAt(ADDR, e.entryId, FAKE_NOW + TOLERANCE + 1),
+    ).rejects.toThrow();
+  });
+
+  it('rejects when = createdAt - tolerance - 1ms (just under lower bound)', async () => {
+    const storage = makeFakeStorage();
+    const q = new FinalizationQueue({ storage, now: () => FAKE_NOW });
+    const e = makeEntry();
+    await q.add(ADDR, e);
+    await expect(
+      q.setPollStartedAt(ADDR, e.entryId, e.createdAt - TOLERANCE - 1),
+    ).rejects.toThrow();
+  });
+
+  it('accepts createdAt + 1ms (legitimate first-poll-after-create)', async () => {
+    const storage = makeFakeStorage();
+    const q = new FinalizationQueue({ storage, now: () => FAKE_NOW });
+    const e = makeEntry();
+    await q.add(ADDR, e);
+    const result = await q.setPollStartedAt(ADDR, e.entryId, e.createdAt + 1);
+    expect(result).toBe('set');
+    const got = await q.get(ADDR, e.entryId);
+    expect(got?.pollStartedAt).toBe(e.createdAt + 1);
+  });
+
+  it('accepts when = now (poll started exactly at the wall-clock instant)', async () => {
+    const storage = makeFakeStorage();
+    const q = new FinalizationQueue({ storage, now: () => FAKE_NOW });
+    const e = makeEntry();
+    await q.add(ADDR, e);
+    const result = await q.setPollStartedAt(ADDR, e.entryId, FAKE_NOW);
+    expect(result).toBe('set');
+  });
+
+  it('accepts when at exact lower bound (createdAt - tolerance)', async () => {
+    const storage = makeFakeStorage();
+    const q = new FinalizationQueue({ storage, now: () => FAKE_NOW });
+    const e = makeEntry();
+    await q.add(ADDR, e);
+    const result = await q.setPollStartedAt(
+      ADDR,
+      e.entryId,
+      e.createdAt - TOLERANCE,
+    );
+    expect(result).toBe('set');
+  });
+
+  it('accepts when at exact upper bound (now + tolerance)', async () => {
+    const storage = makeFakeStorage();
+    const q = new FinalizationQueue({ storage, now: () => FAKE_NOW });
+    const e = makeEntry();
+    await q.add(ADDR, e);
+    const result = await q.setPollStartedAt(
+      ADDR,
+      e.entryId,
+      FAKE_NOW + TOLERANCE,
+    );
+    expect(result).toBe('set');
+  });
+
+  it('deserializeEntry drops persisted pollStartedAt below lower bound (corrupt-write recovery)', async () => {
+    // Simulate a pre-fix corruption: an entry persisted with a
+    // far-out-of-bounds pollStartedAt (e.g., -1). The read side must
+    // silently drop the field so the worker stamps a fresh one on
+    // next poll.
+    const storage = makeFakeStorage();
+    const q = new FinalizationQueue({ storage });
+    const e = makeEntry();
+    await q.add(ADDR, e);
+    // Tamper the persisted JSON to inject a corrupt pollStartedAt.
+    const key = `${ADDR}.finalizationQueue.${e.entryId}`;
+    const raw = storage.map.get(key);
+    expect(raw).toBeDefined();
+    const obj = JSON.parse(raw as string) as Record<string, unknown>;
+    obj.pollStartedAt = -1;
+    storage.map.set(key, JSON.stringify(obj));
+
+    const got = await q.get(ADDR, e.entryId);
+    expect(got).toBeDefined();
+    // The corrupt pollStartedAt is dropped on read.
+    expect(got?.pollStartedAt).toBeUndefined();
+  });
+});
+
+// =============================================================================
+// Round 5 FIX 5 — CRDT race documentation (last-writer-wins)
+// =============================================================================
+//
+// The read-modify-write in setPollStartedAt is NOT atomic at the
+// storage layer. Two concurrent calls can both observe undefined and
+// both write distinct values; last-writer-wins. The persisted result
+// is one of the two values (not a torn write). This test documents
+// the semantic.
+
+describe('FinalizationQueue — Round 5 FIX 5: setPollStartedAt CRDT LWW semantics', () => {
+  it('two concurrent setPollStartedAt calls converge on a single persisted value', async () => {
+    const storage = makeFakeStorage();
+    const q = new FinalizationQueue({
+      storage,
+      now: () => 1700000300000,
+    });
+    const e = makeEntry();
+    await q.add(ADDR, e);
+
+    // Two concurrent stamps. Both observe undefined; both write.
+    const t1 = e.createdAt + 100;
+    const t2 = e.createdAt + 200;
+    const [r1, r2] = await Promise.all([
+      q.setPollStartedAt(ADDR, e.entryId, t1),
+      q.setPollStartedAt(ADDR, e.entryId, t2),
+    ]);
+
+    // At least one returns 'set' (the actual race winner is
+    // implementation-defined under last-writer-wins semantics).
+    const setCount = [r1, r2].filter((r) => r === 'set').length;
+    expect(setCount).toBeGreaterThanOrEqual(1);
+
+    // The persisted value MUST be one of the two candidates — never
+    // a torn or arbitrary write.
+    const got = await q.get(ADDR, e.entryId);
+    expect(got).toBeDefined();
+    expect(got?.pollStartedAt === t1 || got?.pollStartedAt === t2).toBe(true);
+  });
+});
