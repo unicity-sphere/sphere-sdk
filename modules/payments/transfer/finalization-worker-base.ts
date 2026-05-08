@@ -75,7 +75,7 @@ import type {
   SphereEventType,
 } from '../../../types';
 import { SphereError } from '../../../core/errors';
-import { sanitizeReasonString } from '../../../core/error-sanitize';
+import { sanitizeReasonString, safeErrorMessage } from '../../../core/error-sanitize';
 import type { TrustBaseStaleness } from './trustbase-staleness';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
@@ -794,7 +794,7 @@ export async function runSubmitPhase(
     } catch (err) {
       outcome = {
         kind: 'TRANSIENT',
-        error: err instanceof Error ? err.message : String(err),
+        error: safeErrorMessage(err),
       };
     }
 
@@ -960,7 +960,7 @@ export async function runPollPhase(
         // Treat as TRANSIENT — does NOT advance attempt counter.
         // Loop continues; safety net + max-iter caps eventually
         // converge.
-        const message = err instanceof Error ? err.message : String(err);
+        const message = safeErrorMessage(err);
         pollOutcome = {
           kind: 'TRANSIENT',
           error: `poll threw: ${message}`,
@@ -1214,7 +1214,9 @@ export async function checkProofConflict(
       ctx.emit('transfer:operator-alert', {
         code: 'structural',
         tokenId: ctx.tokenId,
-        message: `getAttachedProof read failed and worker aborted before retry — §6.3 conflict check skipped for ${ctx.subjectPhrase}: ${firstErr instanceof Error ? firstErr.message : String(firstErr)}`,
+        message: sanitizeReasonString(
+          `getAttachedProof read failed and worker aborted before retry — §6.3 conflict check skipped for ${ctx.subjectPhrase}: ${safeErrorMessage(firstErr)}`,
+        ),
       });
       return { kind: 'fresh' };
     }
@@ -1235,7 +1237,9 @@ export async function checkProofConflict(
       ctx.emit('transfer:operator-alert', {
         code: 'structural',
         tokenId: ctx.tokenId,
-        message: `getAttachedProof read failed twice for ${ctx.subjectPhrase} — §6.3 conflict check could not run; falling back to attach-as-fresh. first=${firstErr instanceof Error ? firstErr.message : String(firstErr)} second=${secondErr instanceof Error ? secondErr.message : String(secondErr)}`,
+        message: sanitizeReasonString(
+          `getAttachedProof read failed twice for ${ctx.subjectPhrase} — §6.3 conflict check could not run; falling back to attach-as-fresh. first=${safeErrorMessage(firstErr)} second=${safeErrorMessage(secondErr)}`,
+        ),
       });
       return { kind: 'fresh' };
     }
