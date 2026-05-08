@@ -877,6 +877,138 @@ describe('steelman crit #12 — sticky everFinalizing override revival', () => {
     const r = mergeOutboxEntries(a, b);
     expect(r.everFinalizing).toBe(true);
   });
+
+  // ---------------------------------------------------------------------------
+  // Round 3 regression — override revival arc must also defeat `expired`
+  // ---------------------------------------------------------------------------
+
+  describe('Round 3 — override revival vs expired (associativity)', () => {
+    it('merge(merge(A=packaging, B=failed-permanent+ovr+ever), C=expired) === merge(A, merge(B, C))', () => {
+      // Round 2 reproducer:
+      //   A = packaging         (no flag, no everFinalizing)
+      //   B = failed-permanent  (overrideApplied: true, everFinalizing: true)
+      //   C = expired           (no flag, no everFinalizing)
+      // Pre-Round-3:
+      //   merge(A, B) → finalizing+ovr+ever       (revival fires)
+      //   merge(prev, C=expired) → expired        (BUG: hard-terminal beats
+      //     active; revival short-circuit excluded the `finalizing` case)
+      //   merge(B, C) → finalizing+ovr+ever       (revival fires)
+      //   merge(A, prev) → finalizing             (active lattice)
+      // ⇒ left=expired, right=finalizing — NON-ASSOCIATIVE.
+      //
+      // Round 3 fix extends the override revival arc to also fire when one
+      // side is `finalizing` (or `everFinalizing` is sticky-true) and the
+      // other is `expired` while `overrideApplied=true` is set. Both fold
+      // orders now converge on `finalizing`.
+      const a = makeEntry({
+        id: 'round-3-expired-test',
+        status: 'packaging',
+        lamport: 5,
+        overrideApplied: false,
+      });
+      const b = makeEntry({
+        id: 'round-3-expired-test',
+        status: 'failed-permanent',
+        lamport: 5,
+        overrideApplied: true,
+        everFinalizing: true,
+      });
+      const c = makeEntry({
+        id: 'round-3-expired-test',
+        status: 'expired',
+        lamport: 5,
+        overrideApplied: false,
+      });
+
+      const left = mergeOutboxEntries(mergeOutboxEntries(a, b), c);
+      const right = mergeOutboxEntries(a, mergeOutboxEntries(b, c));
+
+      expect(left.status).toBe('finalizing');
+      expect(right.status).toBe('finalizing');
+      expect(left.status).toBe(right.status);
+      expect(left.overrideApplied).toBe(true);
+      expect(right.overrideApplied).toBe(true);
+      expect(left.everFinalizing).toBe(true);
+      expect(right.everFinalizing).toBe(true);
+    });
+
+    it('mergeStatus revives finalizing from (finalizing+ovr+ever, expired)', () => {
+      // Direct unit-level verification of the new revival arc.
+      const a = makeEntry({
+        status: 'finalizing',
+        lamport: 5,
+        overrideApplied: true,
+        everFinalizing: true,
+      });
+      const b = makeEntry({
+        status: 'expired',
+        lamport: 5,
+      });
+      const r = mergeStatus(a, b);
+      expect(r.status).toBe('finalizing');
+      expect(r.winner).toBe('override');
+      expect(r.overrideApplied).toBe(true);
+      expect(r.everFinalizing).toBe(true);
+    });
+
+    it('mergeStatus revives finalizing from (failed-permanent+ovr+ever, expired)', () => {
+      // Both sides hard-terminal, but the multiset has historically
+      // contained `finalizing` (everFinalizing) and the override flag is
+      // set — Round 3 revival arc fires.
+      const a = makeEntry({
+        status: 'failed-permanent',
+        lamport: 5,
+        overrideApplied: true,
+        everFinalizing: true,
+      });
+      const b = makeEntry({
+        status: 'expired',
+        lamport: 5,
+      });
+      const r = mergeStatus(a, b);
+      expect(r.status).toBe('finalizing');
+      expect(r.winner).toBe('override');
+      expect(r.overrideApplied).toBe(true);
+      expect(r.everFinalizing).toBe(true);
+    });
+
+    it('finalized still beats expired+ovr+ever (revival does NOT roll back finalized)', () => {
+      // Negative control: the `finalized` exclusion in the revival arc
+      // ensures the strictly-better terminal state is never replaced by
+      // a revived `finalizing`.
+      const a = makeEntry({
+        status: 'finalized',
+        lamport: 5,
+        overrideApplied: true,
+      });
+      const b = makeEntry({
+        status: 'expired',
+        lamport: 5,
+        overrideApplied: true,
+        everFinalizing: true,
+      });
+      const r = mergeStatus(a, b);
+      expect(r.status).toBe('finalized');
+    });
+
+    it('without everFinalizing, expired+ovr does NOT revive', () => {
+      // Negative control: the revival arc requires the historical
+      // `finalizing` observation. Without `everFinalizing: true` and no
+      // current `finalizing` side, the multiset is just two
+      // hard-terminals — `failed-permanent` wins by hardTerminalRank.
+      const a = makeEntry({
+        status: 'failed-permanent',
+        lamport: 5,
+        overrideApplied: true,
+      });
+      const b = makeEntry({
+        status: 'expired',
+        lamport: 5,
+      });
+      const r = mergeStatus(a, b);
+      expect(r.status).toBe('failed-permanent');
+    });
+  });
 });
 
 // -----------------------------------------------------------------------------

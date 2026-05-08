@@ -166,29 +166,56 @@ function detectOverrideStickiness(
 }
 
 /**
- * Detect the Rule 2 override REVIVAL arc (steelman crit #12). Fires when
- * BOTH sides carry `failed-permanent` (or one is `failed-permanent` and
- * the other has been folded down to that hard-terminal status) but the
- * sticky `everFinalizing` flag is true on either side AND the merged
- * `overrideApplied` is also true. In that case the lifecycle multiset
- * has at some point contained `finalizing` + `failed-permanent` + override
- * — Rule 2's override-stickiness intent is to revive `finalizing` for any
- * such multiset, regardless of whether the intermediate fold has hidden
- * the `finalizing` status.
+ * Detect the Rule 2 override REVIVAL arc (steelman crit #12, extended in
+ * Round 3 to cover `expired` as well as `failed-permanent`).
  *
- * This sibling helper to `detectOverrideStickiness` is what closes the
- * non-associativity hole: in the formerly-broken multiset
+ * Fires when the merged multiset has historically contained a `finalizing`
+ * status (sticky `everFinalizing` true on either side) AND the merged
+ * `overrideApplied` is true AND at least one side is still in a
+ * non-`finalized` hard-terminal state (`failed-permanent` or `expired`).
+ * In that case Rule 2's override-stickiness intent is to revive
+ * `finalizing` for any such multiset, regardless of whether intermediate
+ * folds have hidden the `finalizing` status behind a hard-terminal one.
+ *
+ * **Two reachable hard-terminals on the override path** (per §6.3 / §7.0):
+ *
+ *  1. `failed-permanent` — direct: a second hard-fail after override
+ *     fired, or an inner fold that already collapsed
+ *     `(finalizing, failed-permanent)` to `failed-permanent`. The original
+ *     crit #12 reproducer.
+ *
+ *  2. `expired` — indirect: the entry went `failed-permanent →
+ *     finalizing[override] → finalized → expired`, OR a separate replica
+ *     that never saw the override aged out from `delivered → expired`
+ *     while another replica was riding the override path. Either way the
+ *     merged multiset contains `expired` + `overrideApplied=true` +
+ *     `everFinalizing=true`.
+ *
+ * Without this Round 3 extension the multiset
  *   a = finalizing,        overrideApplied: false, everFinalizing: true
- *   b = failed-permanent,  overrideApplied: false
- *   c = failed-permanent,  overrideApplied: true
- * the inner fold `merge(a, b)` produces `failed-permanent` (hard beats
- * active) but with `everFinalizing: true` carried forward; the outer
- * `merge(that, c)` then sees `failed-permanent` + `failed-permanent` +
- * override + everFinalizing → the revival arc fires and the merged status
- * is `finalizing`. Both fold orders converge.
+ *   b = failed-permanent,  overrideApplied: true,  everFinalizing: true
+ *   c = expired,           overrideApplied: false, everFinalizing: false
+ * was non-associative: the left fold `merge(merge(a,b), c)` produced
+ * `expired` (the inner fold revived to `finalizing+ovr+ever` via the
+ * crit #12 arc, then the outer fold's hard-terminal rule made `expired`
+ * beat `finalizing` because the revival short-circuit excluded the
+ * `finalizing` side). The right fold produced `finalizing` as expected.
  *
- * Returns 'override' if the arc fires (status becomes `finalizing` from
- * neither concrete side); `null` otherwise.
+ * Round 3 fix: the revival arc now ALSO fires when one side is
+ * `finalizing` and the other is `expired` while `overrideApplied=true` is
+ * set — exactly mirroring the failed-permanent arc but extended to
+ * `expired`. This pulls `expired` out of the "hard-terminal beats active"
+ * default whenever the override-revival lifecycle history is present.
+ *
+ * **`finalized` exclusion**. `finalized` is the strictly-better terminal —
+ * Rule 1's hard-terminal preference puts it above the others and any
+ * revived `finalizing` would be a regression. If either side has reached
+ * `finalized`, the revival arc does NOT fire (standard hard-terminal rule
+ * applies; `finalized` wins). This preserves associativity: any 3-way
+ * merge containing `finalized` produces `finalized` in every fold order.
+ *
+ * Returns 'override' if the arc fires (status becomes `finalizing`);
+ * `null` otherwise.
  */
 function detectOverrideRevival(
   a: UxfTransferOutboxEntry,
@@ -196,26 +223,29 @@ function detectOverrideRevival(
 ): 'override' | null {
   const overrideMerged = a.overrideApplied === true || b.overrideApplied === true;
   if (!overrideMerged) return null;
-  // The standard `detectOverrideStickiness` already covers the case where
-  // one current side is `finalizing` — this revival arc handles ONLY the
-  // case where neither current side is `finalizing` but `everFinalizing`
-  // is true on at least one side.
-  if (a.status === 'finalizing' || b.status === 'finalizing') return null;
+  // Both sides are `finalizing` — falls through to standard active-vs-active
+  // (no revival needed; status is already `finalizing`).
+  if (a.status === 'finalizing' && b.status === 'finalizing') return null;
   const everFinalizing =
-    a.everFinalizing === true || b.everFinalizing === true;
+    a.everFinalizing === true ||
+    b.everFinalizing === true ||
+    a.status === 'finalizing' ||
+    b.status === 'finalizing';
   if (!everFinalizing) return null;
-  // `finalized` is the strictly-better terminal state — Rule 1's
-  // hard-terminal preference puts it above `failed-permanent` and beats
-  // any active state. The override revival arc must NOT roll a `finalized`
-  // entry back to `finalizing`. If either side has reached `finalized`,
-  // the standard hard-terminal rule applies and `finalized` wins. This
-  // also preserves associativity: if any constituent of a 3-way merge has
-  // `finalized`, every fold order produces `finalized`.
+  // `finalized` is the strictly-better terminal state. The revival arc
+  // must NOT roll `finalized` back to `finalizing`.
   if (a.status === 'finalized' || b.status === 'finalized') return null;
-  // Revival fires only when at least one side is still `failed-permanent`.
-  const hasFailedPermanent =
-    a.status === 'failed-permanent' || b.status === 'failed-permanent';
-  if (!hasFailedPermanent) return null;
+  // The arc fires when the multiset has historically contained
+  // `finalizing` AND the override flag is set AND at least one side is
+  // currently in a non-`finalized` hard-terminal state (or `finalizing`
+  // itself, which the original Rule 2 stickiness arc already handles —
+  // but extending revival to that case keeps the arc shape uniform).
+  const hasNonFinalizedHardTerminal =
+    a.status === 'failed-permanent' ||
+    b.status === 'failed-permanent' ||
+    a.status === 'expired' ||
+    b.status === 'expired';
+  if (!hasNonFinalizedHardTerminal) return null;
   return 'override';
 }
 

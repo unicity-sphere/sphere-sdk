@@ -65,9 +65,16 @@ const arbReqIdSet = fc.array(arbReqId, { minLength: 0, maxLength: 8 });
  * Statuses on which `overrideApplied: true` is reachable per §7.0 / §6.3:
  * the writer sets the flag during `failed-permanent → finalizing` via
  * `importInclusionProof()`. Subsequent transitions are `finalizing →
- * finalized` (flag stays sticky) or `finalizing → failed-permanent` (flag
- * stays sticky on a second failure). Therefore the only reachable
- * `(status, overrideApplied=true)` pairs are exactly these three statuses.
+ * finalized` (flag stays sticky), `finalizing → failed-permanent` (flag
+ * stays sticky on a second failure), and `finalized → expired`
+ * (retention-window aging keeps the flag set per Rule 2 stickiness).
+ * Therefore the reachable `(status, overrideApplied=true)` pairs are
+ * exactly these four statuses.
+ *
+ * `expired` was added in Round 3 — the previous list omitted it, but
+ * `finalized → expired` is in the §7.0 table and the merge layer's
+ * override-revival arc must remain associative across the full reachable
+ * space (including a single-replica `expired+ovr=true` entry).
  *
  * Restricting the arbitrary to reachable shapes keeps the property tests
  * sharp on real-world inputs without exercising states that the writer
@@ -77,6 +84,7 @@ const OVERRIDE_REACHABLE_STATUSES: ReadonlyArray<UxfOutboxStatus> = [
   'finalizing',
   'finalized',
   'failed-permanent',
+  'expired',
 ];
 
 /**
@@ -338,16 +346,6 @@ describe('outbox-merger property tests (W9)', () => {
 
   describe('associativity', () => {
     it('merge(merge(a, b), c) projection === merge(a, merge(b, c)) projection', () => {
-      // Realistic-multiset constraint #1: per §6.3 / §7.0 the override
-      // flag is ONLY set during the `failed-permanent → finalizing`
-      // transition. `expired` is reachable from `delivered`/`finalized`
-      // lineages, NOT from override-bearing lineages. A 3-way merge
-      // that mixes `expired` with an override-flagged replica is
-      // therefore not physically reachable across two real-world
-      // devices on the same entry. We exclude that combination via
-      // fc.pre() so the property tests stay focused on realistic
-      // cross-replica states.
-      //
       // **Steelman crit #12 fix landed.** The previous "known limitation"
       // multiset {finalizing-no-flag, failed-permanent-no-flag,
       // failed-permanent-w-flag} is now associative thanks to the sticky
@@ -355,19 +353,28 @@ describe('outbox-merger property tests (W9)', () => {
       // folds. The override revival arc fires whenever the multiset has
       // historically contained `finalizing` AND any side carries the
       // override flag — restoring CRDT associativity in the gossip-fold
-      // model. The previously-required `fc.pre()` exclusion for that
-      // multiset has been removed.
+      // model.
+      //
+      // **Round 3 extension** — the revival arc now also covers `expired`
+      // (reachable on the override path via `failed-permanent →
+      // finalizing[ovr] → finalized → expired`, or via merging an
+      // override-bearing replica with one that aged out from
+      // `delivered → expired`). The previously-excluded
+      // `(hasExpired && hasOverride)` multiset is now associative. The
+      // fc.pre() guard for that combination has been removed; the full
+      // generator space — including `expired + overrideApplied=true` —
+      // is exercised here.
       fc.assert(
         fc.property(arbEntry(), arbEntry(), arbEntry(), (a, b, c) => {
-          const entries = [a, b, c];
-          const hasExpired = entries.some((e) => e.status === 'expired');
-          const hasOverride = entries.some((e) => e.overrideApplied === true);
-          fc.pre(!(hasExpired && hasOverride));
           const left = mergeOutboxEntries(mergeOutboxEntries(a, b), c);
           const right = mergeOutboxEntries(a, mergeOutboxEntries(b, c));
           expect(projection(left)).toEqual(projection(right));
         }),
-        { numRuns: 500 },
+        // Round 3: bumped from 500 → 2000 after dropping the
+        // `(hasExpired && hasOverride)` fc.pre() guard. The expanded
+        // generator space needs more runs to exercise the new revival
+        // arc combinations.
+        { numRuns: 2000 },
       );
     });
 
