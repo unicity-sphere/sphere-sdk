@@ -2652,9 +2652,24 @@ export class PaymentsModule {
         'OPERATOR_ESCAPE_HATCH_NOT_CONFIGURED',
       );
     }
+    // Round 3 — lowercase-normalize the tokenId at the public entry,
+    // BEFORE the importer's strict-lowercase shape regex would otherwise
+    // reject uppercase input. SDK callers (operator scripts, CLI tools,
+    // wallet UIs that paste raw hex from the state-transition SDK) often
+    // produce uppercase or mixed-case tokenIds; rejecting them at the
+    // public surface would force every caller to remember to normalize.
+    // Round 1 doc claimed "Wallet code lowercases SDK tokenIds before
+    // passing them to the importer" — this is the wrapper-level
+    // normalization that delivers on that claim.
+    //
+    // The importer's internal lowercase-normalize (defense-in-depth at
+    // `_importInclusionProofUnderMutex`) remains in place for any code
+    // path that bypasses this wrapper.
+    const normalizedTokenId =
+      typeof tokenId === 'string' ? tokenId.toLowerCase() : tokenId;
     return this.inclusionProofImporter.importInclusionProof(
       addr,
-      tokenId,
+      normalizedTokenId,
       proof,
       options,
     );
