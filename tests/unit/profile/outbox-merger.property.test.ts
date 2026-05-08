@@ -229,7 +229,10 @@ describe('outbox-merger property tests (W9)', () => {
           const ba = mergeOutboxEntries(b, a);
           expect(shapeProjection(ab)).toEqual(shapeProjection(ba));
         }),
-        { numRuns: 300 },
+        // Round 3: bumped from 300 → 2000 to catch the
+        // pickWinnerEntryForShape revival regression and any future
+        // similar bugs in the expanded generator space.
+        { numRuns: 2000 },
       );
     });
 
@@ -277,6 +280,100 @@ describe('outbox-merger property tests (W9)', () => {
         }),
         { numRuns: 200 },
       );
+    });
+  });
+
+  describe('shape — override revival arc (Round 3)', () => {
+    it('revival arc with neither side finalizing: shape converges via swap-stable tiebreak', () => {
+      // Round 2 reproducer for the FIX 2 regression: when the override
+      // revival arc fires and NEITHER side has status='finalizing' (both
+      // are failed-permanent+overrideApplied+everFinalizing), the
+      // pickWinnerEntryForShape fallthrough `a.status === 'finalizing' ?
+      // a : b` evaluates to `b` always — position-based, breaking
+      // commutativity.
+      //
+      // Build A and B both as failed-permanent+ovr+ever with DIFFERENT
+      // recipients; assert merge(A, B).recipient === merge(B, A).recipient.
+      const A: UxfTransferOutboxEntry = {
+        _schemaVersion: 'uxf-1' as const,
+        id: 'round-3-shape-revival',
+        bundleCid: 'bafy-A',
+        tokenIds: ['tok-A'],
+        deliveryMethod: 'car-over-nostr' as const,
+        recipient: 'DIRECT://a',
+        recipientTransportPubkey: 'pub-A',
+        mode: 'instant' as const,
+        status: 'failed-permanent',
+        outstandingRequestIds: [],
+        completedRequestIds: [],
+        createdAt: 1,
+        updatedAt: 100,
+        lamport: 5,
+        overrideApplied: true,
+        everFinalizing: true,
+        submitRetryCount: 0,
+        proofErrorCount: 0,
+      };
+      const B: UxfTransferOutboxEntry = {
+        ...A,
+        bundleCid: 'bafy-B',
+        recipient: 'DIRECT://b',
+        recipientTransportPubkey: 'pub-B',
+      };
+      const ab = mergeOutboxEntries(A, B);
+      const ba = mergeOutboxEntries(B, A);
+      // Status revives to `finalizing` via the override revival arc.
+      expect(ab.status).toBe('finalizing');
+      expect(ba.status).toBe('finalizing');
+      // Shape MUST converge under input swap. The swap-stable tiebreak
+      // picks lex-min `bundleCid` first, so both fold orders pick A.
+      expect(ab.recipient).toBe(ba.recipient);
+      expect(ab.bundleCid).toBe(ba.bundleCid);
+      expect(ab.recipient).toBe('DIRECT://a');
+      expect(ab.bundleCid).toBe('bafy-A');
+    });
+
+    it('revival arc with ONE side finalizing: shape comes from the finalizing side', () => {
+      // Mixed reproducer: one side `finalizing+ovr+ever`, the other
+      // `failed-permanent+ovr+ever`. The override stickiness arc
+      // (Rule 2 original — not the revival arc) fires; one side IS
+      // `finalizing` so pickWinnerEntryForShape picks that side
+      // unambiguously.
+      const finalSide: UxfTransferOutboxEntry = {
+        _schemaVersion: 'uxf-1' as const,
+        id: 'round-3-shape-mixed',
+        bundleCid: 'bafy-FIN',
+        tokenIds: ['tok-FIN'],
+        deliveryMethod: 'car-over-nostr' as const,
+        recipient: 'DIRECT://fin',
+        recipientTransportPubkey: 'pub-FIN',
+        mode: 'instant' as const,
+        status: 'finalizing',
+        outstandingRequestIds: [],
+        completedRequestIds: [],
+        createdAt: 1,
+        updatedAt: 100,
+        lamport: 5,
+        overrideApplied: true,
+        everFinalizing: true,
+        submitRetryCount: 0,
+        proofErrorCount: 0,
+      };
+      const failSide: UxfTransferOutboxEntry = {
+        ...finalSide,
+        bundleCid: 'bafy-FAIL',
+        recipient: 'DIRECT://fail',
+        recipientTransportPubkey: 'pub-FAIL',
+        status: 'failed-permanent',
+      };
+      const ab = mergeOutboxEntries(finalSide, failSide);
+      const ba = mergeOutboxEntries(failSide, finalSide);
+      expect(ab.status).toBe('finalizing');
+      expect(ba.status).toBe('finalizing');
+      expect(ab.recipient).toBe('DIRECT://fin');
+      expect(ba.recipient).toBe('DIRECT://fin');
+      expect(ab.bundleCid).toBe('bafy-FIN');
+      expect(ba.bundleCid).toBe('bafy-FIN');
     });
   });
 

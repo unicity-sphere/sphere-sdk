@@ -265,10 +265,44 @@ function pickWinnerEntryForShape(
   winner: 'a' | 'b' | 'override',
 ): UxfTransferOutboxEntry {
   if (winner === 'override') {
-    // The override arc fires on `(failed-permanent, finalizing)` w/
-    // set-OR-true override flag. Pick the `finalizing` side regardless
-    // of where the flag stamped.
-    return a.status === 'finalizing' ? a : b;
+    // Two sub-arcs of the override winner now exist (post-Round-3):
+    //
+    //  1. **Original Rule 2 stickiness arc** —
+    //     `(failed-permanent, finalizing)` with set-OR override flag.
+    //     Exactly one side is `finalizing`; pick that side. This branch
+    //     was the only override case before Round 3.
+    //
+    //  2. **Revival arc** (steelman crit #12 + Round 3 expired
+    //     extension) — neither current side is `finalizing` (both are
+    //     `failed-permanent`, both are `expired`, or one of each), but
+    //     the multiset has historically contained `finalizing` (sticky
+    //     `everFinalizing` flag) AND the override flag is set. The
+    //     merged status is revived to `finalizing` even though no input
+    //     side carries that status currently.
+    //
+    // For sub-arc 1, picking the `finalizing` side is canonical and
+    // commutative (whichever side is `finalizing` is the same regardless
+    // of input order). The original implementation
+    // `a.status === 'finalizing' ? a : b` works for that sub-arc.
+    //
+    // For sub-arc 2, NEITHER side is `finalizing`, so the original
+    // `? a : b` fallthrough returns `b` always — a position-based pick
+    // that is NOT commutative across input swap. Round 2 reproducer:
+    //   merge(A=failed-permanent+ovr+ever, B=failed-permanent+ovr+ever)
+    //   .recipient = 'DIRECT://b' but
+    //   merge(B, A).recipient = 'DIRECT://a' — non-commutative!
+    //
+    // Round 3 fix: detect sub-arc 2 explicitly. When the override winner
+    // fired but neither current side is `finalizing`, fall back to the
+    // swap-stable content tiebreak (the same one used for same-status
+    // sibling cases) so the shape pick is invariant under input order.
+    if (a.status === 'finalizing' && b.status !== 'finalizing') return a;
+    if (b.status === 'finalizing' && a.status !== 'finalizing') return b;
+    // Sub-arc 2 OR a hypothetical dual-`finalizing` (which today falls
+    // through to the standard active-vs-active rule and would not produce
+    // `winner === 'override'`, but the symmetric tiebreak handles it
+    // safely if a future spec revision routes it here).
+    return pickShapeBySwapStableTiebreak(a, b);
   }
   // For 'a' / 'b' winner: ONLY when the two sides have different statuses
   // is the winner content-determined (the partition lattice and hard-
