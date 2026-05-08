@@ -103,42 +103,23 @@ import {
   type CidFetcherEmit,
   type CidFetcherFetch,
 } from './cid-fetcher.js';
-import { RELAY_SAFE_CAP_BYTES } from './limits.js';
+import {
+  RECIPIENT_MAX_INLINE_CARBASE64_LENGTH,
+  RELAY_SAFE_CAP_BYTES,
+} from './limits.js';
 import type { ReplayLRU } from './replay-lru.js';
 
 // =============================================================================
 // 1.5. Steelman fix #170 — recipient-side inline-CAR size cap
 // =============================================================================
 
-/**
- * Maximum size (in characters) of the `carBase64` string in a `kind: 'uxf-car'`
- * payload that the recipient will accept.
- *
- * **Why a recipient-side cap exists:** the sender enforces
- * `clampInlineCap` against `RELAY_SAFE_CAP_BYTES = 96 KiB` before
- * inlining a CAR. But the cap is only authoritative if the RECIPIENT
- * also enforces it. Without recipient-side enforcement, a hostile
- * sender (or a mis-configured one) can ship a 6 MiB base64 payload
- * (~4.5 MiB CAR) inline, bypassing the relay-safe cap entirely. The
- * recipient then base64-decodes the entire blob and runs CAR parse on
- * it — both expensive operations the cap was supposed to prevent.
- *
- * **Authoritative bound:** the recipient's check here is the canonical
- * enforcement point. The sender's clamp is a politeness layer for the
- * relay; the recipient's check is a defense.
- *
- * **Computation:** base64 inflates 4 bytes → 3 bytes (ratio 4/3). For a
- * raw byte cap of `RELAY_SAFE_CAP_BYTES` (96 KiB = 98304 bytes), the
- * base64 string is at most `ceil(98304 * 4 / 3) = 131072` characters
- * (with possible trailing `=` padding adding up to 2 bytes more). We
- * add a small slack (16 bytes) to absorb whitespace / padding without
- * false-positives on legitimately-sized bundles.
- *
- * Effective cap: `ceil(RELAY_SAFE_CAP_BYTES * 4/3) + slack`.
- */
-const INLINE_BASE64_SLACK_BYTES = 16;
-export const RECIPIENT_MAX_INLINE_CARBASE64_LENGTH =
-  Math.ceil((RELAY_SAFE_CAP_BYTES * 4) / 3) + INLINE_BASE64_SLACK_BYTES;
+// `RECIPIENT_MAX_INLINE_CARBASE64_LENGTH` is the canonical
+// recipient-side cap on `carBase64` string length in a
+// `kind: 'uxf-car'` payload. Hoisted to `./limits.js` so the ingest
+// worker pool can apply the same authoritative bound at enqueue time
+// (BEFORE allocating the multi-megabyte payload buffer in the queue).
+// Re-exported here for backward-compat with existing imports.
+export { RECIPIENT_MAX_INLINE_CARBASE64_LENGTH };
 
 // =============================================================================
 // 1. Public types — discriminated outcome
