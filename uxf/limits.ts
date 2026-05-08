@@ -108,3 +108,23 @@ export const CAR_IMPORT_MAX_TOTAL_BYTES = 64 * 1024 * 1024;
  * batches) while rejecting bloat-DoS at the parse boundary.
  */
 export const MANIFEST_MAX_SIZE = 100_000;
+
+/**
+ * Maximum elements (pool entries) accepted by the JSON deserializer
+ * BEFORE iterating the elements map.
+ *
+ * Steelman³ remediation (FIX 1, Round 3): the JSON path was a
+ * symmetric gap on the CAR path. CAR import caps blocks via
+ * `CAR_IMPORT_MAX_BLOCK_COUNT = 10_000` BEFORE pool insertion; the
+ * JSON path iterated `Object.entries(raw.elements)` unbounded and
+ * paid `contentHash` + `computeElementHash` cost on every entry
+ * before `WRAP_POOL_MAX_SIZE = 1M` (UxfPackage.ts) finally fired —
+ * i.e. 10M elements would burn 10M SHA-256 evaluations + 10M Map
+ * inserts before structural rejection. Cap upfront at the parse
+ * boundary so the hot loop never starts.
+ *
+ * 100_000 matches MANIFEST_MAX_SIZE — well above any realistic UXF
+ * packaging shape but below the per-block-count CAR cap multiplied
+ * by reasonable DAG depth, keeping the two layers consistent.
+ */
+export const ELEMENTS_MAX_SIZE = 100_000;
