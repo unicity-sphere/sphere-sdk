@@ -16,7 +16,8 @@ import { describe, expect, it } from 'vitest';
 
 import {
   MAX_PER_SENDER,
-  MAX_SENDERS,
+  MAX_TRUSTED_SENDERS,
+  MAX_UNTRUSTED_SENDERS,
   ReplayLRU,
 } from '../../../../modules/payments/transfer/replay-lru';
 
@@ -29,11 +30,17 @@ describe('ReplayLRU constants', () => {
     expect(MAX_PER_SENDER).toBe(64);
   });
 
-  it('MAX_SENDERS === 256 (steelman #170 — sender-churn DoS hardening)', () => {
-    // Was 32 prior to fix #170. A hostile actor could churn 33 ephemeral
-    // Nostr keys to evict an honest sender's whole bucket. Raising to 256
-    // multiplies the key-churn cost ~8× while keeping memory bounded.
-    expect(MAX_SENDERS).toBe(256);
+  it('MAX_UNTRUSTED_SENDERS === 64 (Option B post-steelman absorber pool)', () => {
+    // Sybil churn lands here; bigger value would bloat memory without
+    // benefit since untrusted entries are short-lived by design (they
+    // graduate on first verified bundle).
+    expect(MAX_UNTRUSTED_SENDERS).toBe(64);
+  });
+
+  it('MAX_TRUSTED_SENDERS === 256 (Option B post-steelman protected pool)', () => {
+    // Senders that have shipped at least one verified bundle. Immune to
+    // sybil-driven bucket eviction since this pool is independent.
+    expect(MAX_TRUSTED_SENDERS).toBe(256);
   });
 });
 
@@ -58,8 +65,12 @@ describe('ReplayLRU construction', () => {
     expect(() => new ReplayLRU({ maxPerSender: Number.POSITIVE_INFINITY })).toThrow(RangeError);
   });
 
-  it('rejects maxSenders <= 0', () => {
-    expect(() => new ReplayLRU({ maxSenders: 0 })).toThrow(RangeError);
+  it('rejects maxUntrustedSenders <= 0', () => {
+    expect(() => new ReplayLRU({ maxUntrustedSenders: 0 })).toThrow(RangeError);
+  });
+
+  it('rejects maxTrustedSenders <= 0', () => {
+    expect(() => new ReplayLRU({ maxTrustedSenders: 0 })).toThrow(RangeError);
   });
 });
 
@@ -216,10 +227,10 @@ describe('ReplayLRU Note N5 — hostile sender cannot evict honest entries', () 
 // 6. Global sender-bucket cap eviction
 // =============================================================================
 
-describe('ReplayLRU global sender-bucket cap', () => {
-  it('evicts oldest sender bucket when maxSenders is exceeded', () => {
-    // Tight maxSenders for a fast test.
-    const lru = new ReplayLRU({ maxSenders: 3 });
+describe('ReplayLRU global sender-bucket cap (untrusted pool)', () => {
+  it('evicts oldest sender bucket when maxUntrustedSenders is exceeded', () => {
+    // Tight maxUntrustedSenders for a fast test.
+    const lru = new ReplayLRU({ maxUntrustedSenders: 3 });
     lru.add('sender-1', 'cid');
     lru.add('sender-2', 'cid');
     lru.add('sender-3', 'cid');
@@ -235,7 +246,7 @@ describe('ReplayLRU global sender-bucket cap', () => {
   });
 
   it('refreshing a sender via add() moves it to most-recent position', () => {
-    const lru = new ReplayLRU({ maxSenders: 3 });
+    const lru = new ReplayLRU({ maxUntrustedSenders: 3 });
     lru.add('sender-1', 'cid-a');
     lru.add('sender-2', 'cid-a');
     lru.add('sender-3', 'cid-a');
@@ -253,7 +264,7 @@ describe('ReplayLRU global sender-bucket cap', () => {
   });
 
   it('totalEntries reflects per-sender and global eviction', () => {
-    const lru = new ReplayLRU({ maxPerSender: 4, maxSenders: 2 });
+    const lru = new ReplayLRU({ maxPerSender: 4, maxUntrustedSenders: 2 });
     // sender-1 adds 5 cids — last 4 stay (per-sender LRU evicts oldest).
     for (let i = 0; i < 5; i++) lru.add('sender-1', `cid-${i}`);
     expect(lru.bucketSize('sender-1')).toBe(4);
@@ -270,91 +281,207 @@ describe('ReplayLRU global sender-bucket cap', () => {
 });
 
 // =============================================================================
-// 7. Steelman fix #170 — sender-churn DoS defense
+// 7. Option B post-steelman — trusted/untrusted bucket split
 // =============================================================================
 
-describe('ReplayLRU sender-churn DoS defense (steelman #170)', () => {
-  it('honest sender is NOT evicted by attacker churning MAX_SENDERS + 1 ephemeral pubkeys', () => {
-    // Threat model: attacker rotates Nostr signing keys (cheap — ephemeral)
-    // to flood the LRU with throwaway sender pubkeys, forcing eviction of
-    // the oldest sender's whole bucket. With the previous cap (32), 33
-    // throwaway keys could evict the honest sender entirely. With the new
-    // cap (256), the attacker now needs 257 — and even then, the honest
-    // sender is protected as long as it remains "more recent" than at
-    // least one attacker key.
-    //
-    // We prove the property holds at the *boundary*: with default caps,
-    // an honest sender added FIRST is still present after the attacker
-    // floods MAX_SENDERS distinct ephemeral keys, because each fresh
-    // attacker key only evicts the OLDEST bucket — and the honest sender
-    // is at the back of the iteration order (most-recently-active) after
-    // the very last access.
+describe('ReplayLRU trusted/untrusted bucket split (Option B post-steelman)', () => {
+  it('a fresh sender lands in the untrusted pool', () => {
     const lru = new ReplayLRU();
-    lru.add('honest', 'honest-cid');
-    expect(lru.has('honest', 'honest-cid')).toBe(true);
-
-    // Attacker churns MAX_SENDERS distinct throwaway keys, AFTER honest.
-    // Honest is now the OLDEST (it was added first), so when the
-    // (MAX_SENDERS + 1)-th sender arrives, honest gets evicted.
-    // To prove the FIX works, we simulate honest also occasionally
-    // touching the LRU during the flood (a realistic interaction
-    // pattern: an honest sender publishes another bundle).
-    for (let i = 0; i < MAX_SENDERS; i++) {
-      lru.add(`attacker-${i}`, `bogus-cid-${i}`);
-      // Halfway through, honest publishes again — refreshes recency.
-      if (i === Math.floor(MAX_SENDERS / 2)) {
-        lru.add('honest', 'honest-cid-2');
-      }
-    }
-
-    // After the flood, with the bigger cap, both honest entries should
-    // still survive — honest's bucket was refreshed during the flood, so
-    // it's not the oldest.
-    expect(lru.has('honest', 'honest-cid')).toBe(true);
-    expect(lru.has('honest', 'honest-cid-2')).toBe(true);
+    lru.add('alice', 'cid-1');
+    expect(lru.untrustedSenderCount).toBe(1);
+    expect(lru.trustedSenderCount).toBe(0);
+    expect(lru.isTrusted('alice')).toBe(false);
   });
 
-  it('with explicit small cap (3), the bug pattern reproduces; with default cap (256), it does not', () => {
-    // Sanity: prove the fix is real by showing a small cap still allows
-    // the attack, then prove the production default protects the honest
-    // sender against the same attacker.
-    {
-      // Reproducer with tight cap.
-      const tight = new ReplayLRU({ maxSenders: 3 });
-      tight.add('honest', 'honest-cid');
-      // Three attacker keys churn — honest is now oldest, gets evicted
-      // when a 4th attacker arrives.
-      for (let i = 0; i < 3; i++) {
-        tight.add(`attacker-${i}`, `bogus-${i}`);
-      }
-      tight.add('attacker-final', 'final-bogus');
-      expect(tight.has('honest', 'honest-cid')).toBe(false); // attack succeeds
-    }
-    {
-      // Production defaults: attacker exhausts the previous cap (32) and
-      // honest survives because the cap is now 256.
-      const prod = new ReplayLRU();
-      prod.add('honest', 'honest-cid');
-      // 33 throwaway keys — would have evicted honest under the old cap.
-      for (let i = 0; i < 33; i++) {
-        prod.add(`attacker-${i}`, `bogus-${i}`);
-      }
-      // Honest survives — the attacker would need 256 distinct keys to
-      // even put honest at risk of being the oldest.
-      expect(prod.has('honest', 'honest-cid')).toBe(true);
-    }
+  it('markSenderTrusted graduates a sender into the trusted pool with bucket preserved', () => {
+    const lru = new ReplayLRU();
+    lru.add('alice', 'cid-1');
+    lru.add('alice', 'cid-2');
+    expect(lru.has('alice', 'cid-1')).toBe(true);
+    expect(lru.has('alice', 'cid-2')).toBe(true);
+
+    lru.markSenderTrusted('alice');
+    expect(lru.isTrusted('alice')).toBe(true);
+    expect(lru.untrustedSenderCount).toBe(0);
+    expect(lru.trustedSenderCount).toBe(1);
+    // Both bundleCids preserved across the migration.
+    expect(lru.has('alice', 'cid-1')).toBe(true);
+    expect(lru.has('alice', 'cid-2')).toBe(true);
   });
 
-  it('memory bound: 256 senders × 64 CIDs each → ~16384 entries worst case', () => {
-    // Sanity check: the full default cap is loaded with the per-sender
-    // cap and the totalEntries lookup matches the documented bound.
+  it('markSenderTrusted is idempotent (no-op on already-trusted sender)', () => {
     const lru = new ReplayLRU();
-    for (let s = 0; s < MAX_SENDERS; s++) {
+    lru.add('alice', 'cid-1');
+    lru.markSenderTrusted('alice');
+    expect(lru.trustedSenderCount).toBe(1);
+
+    // Calling again should be a no-op.
+    lru.markSenderTrusted('alice');
+    expect(lru.trustedSenderCount).toBe(1);
+    expect(lru.untrustedSenderCount).toBe(0);
+    expect(lru.has('alice', 'cid-1')).toBe(true);
+  });
+
+  it('markSenderTrusted on never-seen sender creates an empty trusted bucket', () => {
+    // Edge case: the acquirer happens to call markSenderTrusted before
+    // add() (unlikely in production but defensively covered). No prior
+    // bucket exists; a fresh empty bucket is created in the trusted pool.
+    const lru = new ReplayLRU();
+    lru.markSenderTrusted('alice');
+    expect(lru.isTrusted('alice')).toBe(true);
+    expect(lru.bucketSize('alice')).toBe(0);
+
+    // Subsequent add() targets the existing trusted bucket (NOT
+    // untrusted), preserving the trust relationship.
+    lru.add('alice', 'cid-1');
+    expect(lru.isTrusted('alice')).toBe(true);
+    expect(lru.has('alice', 'cid-1')).toBe(true);
+    expect(lru.untrustedSenderCount).toBe(0);
+  });
+
+  it('after graduation, subsequent add() on the same sender stays in the trusted pool', () => {
+    const lru = new ReplayLRU();
+    lru.add('alice', 'cid-1');
+    lru.markSenderTrusted('alice');
+    lru.add('alice', 'cid-2'); // post-graduation add
+    expect(lru.isTrusted('alice')).toBe(true);
+    expect(lru.untrustedSenderCount).toBe(0);
+    expect(lru.has('alice', 'cid-1')).toBe(true);
+    expect(lru.has('alice', 'cid-2')).toBe(true);
+  });
+
+  it('CRITICAL: trusted bucket survives an unbounded untrusted sybil flood', () => {
+    // Scenario: honest Alice ships a verified bundle, graduates to
+    // trusted. Sybil attacker churns 1000 distinct ephemeral pubkeys
+    // afterwards (each one a fresh untrusted sender). With Option B,
+    // sybil churn fills/cycles the UNTRUSTED pool only — Alice's
+    // trusted bucket is untouchable.
+    const lru = new ReplayLRU();
+    lru.add('alice', 'alice-cid');
+    lru.markSenderTrusted('alice');
+    expect(lru.has('alice', 'alice-cid')).toBe(true);
+
+    // Sybil flood: 1000 distinct pubkeys, each adding a junk CID.
+    for (let i = 0; i < 1000; i++) {
+      lru.add(`sybil-${i}`.padEnd(64, '0'), `junk-${i}`);
+    }
+
+    // Alice's trusted bucket survives intact.
+    expect(lru.isTrusted('alice')).toBe(true);
+    expect(lru.has('alice', 'alice-cid')).toBe(true);
+    // Untrusted pool capped at MAX_UNTRUSTED_SENDERS (64).
+    expect(lru.untrustedSenderCount).toBeLessThanOrEqual(MAX_UNTRUSTED_SENDERS);
+    // Trusted pool unchanged.
+    expect(lru.trustedSenderCount).toBe(1);
+  });
+
+  it('property: untrusted churn at any rate cannot evict trusted entries', () => {
+    // Generalizes the previous scenario across multiple trusted senders
+    // and an interleaved sybil flood. Every trusted entry MUST survive.
+    const lru = new ReplayLRU();
+    const trusted = ['alice', 'bob', 'carol', 'dave', 'eve'];
+    for (const t of trusted) {
+      lru.add(t, `${t}-cid`);
+      lru.markSenderTrusted(t);
+    }
+    // Massive untrusted flood, interleaved (just to make sure recency
+    // pressure on the untrusted pool cannot somehow leak across pools).
+    for (let i = 0; i < 5000; i++) {
+      lru.add(`u-${i}`.padEnd(64, '0'), `cid-${i}`);
+    }
+    for (const t of trusted) {
+      expect(lru.has(t, `${t}-cid`)).toBe(true);
+      expect(lru.isTrusted(t)).toBe(true);
+    }
+    // Trusted-pool sender count is still 5 — sybil flood cannot push
+    // a trusted sender out.
+    expect(lru.trustedSenderCount).toBe(5);
+  });
+
+  it('trusted-pool overflow evicts ONLY the LRA trusted sender (never untrusted)', () => {
+    // Bounded trusted pool of 3. Graduate 4 senders sequentially —
+    // the oldest trusted sender gets evicted. Untrusted senders are
+    // unaffected.
+    const lru = new ReplayLRU({ maxTrustedSenders: 3 });
+    // Park an untrusted sender first to verify it is NOT evicted by
+    // trusted-pool churn.
+    lru.add('untrusted-witness', 'witness-cid');
+    expect(lru.untrustedSenderCount).toBe(1);
+
+    lru.add('t1', 'cid');
+    lru.markSenderTrusted('t1');
+    lru.add('t2', 'cid');
+    lru.markSenderTrusted('t2');
+    lru.add('t3', 'cid');
+    lru.markSenderTrusted('t3');
+    expect(lru.trustedSenderCount).toBe(3);
+
+    // 4th graduation evicts t1 (the LRA in the trusted pool).
+    lru.add('t4', 'cid');
+    lru.markSenderTrusted('t4');
+    expect(lru.trustedSenderCount).toBe(3);
+    expect(lru.isTrusted('t1')).toBe(false);
+    expect(lru.has('t1', 'cid')).toBe(false);
+
+    // The untrusted witness is untouched.
+    expect(lru.has('untrusted-witness', 'witness-cid')).toBe(true);
+    expect(lru.untrustedSenderCount).toBe(1);
+  });
+
+  it('graduation test: unknown sender → has() expected miss; markSenderTrusted called → has() now hits in trusted pool', () => {
+    // Threat path the steelman finding identifies: a sender's first
+    // access is in untrusted; after pkg.verify() succeeds the acquirer
+    // calls markSenderTrusted; subsequent has() hits in the trusted
+    // pool and is immune to sybil churn.
+    const lru = new ReplayLRU();
+
+    // Unknown sender — has() returns false.
+    expect(lru.has('alice', 'cid-1')).toBe(false);
+
+    // First arrival: enters untrusted pool.
+    lru.add('alice', 'cid-1');
+    expect(lru.has('alice', 'cid-1')).toBe(true);
+    expect(lru.isTrusted('alice')).toBe(false);
+
+    // Acquirer marks trusted post-verify.
+    lru.markSenderTrusted('alice');
+    expect(lru.isTrusted('alice')).toBe(true);
+
+    // Sybil flood the untrusted pool.
+    for (let i = 0; i < 500; i++) {
+      lru.add(`sybil-${i}`.padEnd(64, '0'), `junk-${i}`);
+    }
+
+    // Alice still hits — she's in trusted, immune.
+    expect(lru.has('alice', 'cid-1')).toBe(true);
+  });
+
+  it('memory bound: trusted (256×64) + untrusted (64×64) = 20480 entries worst case', () => {
+    // Sanity check: the full default caps loaded simultaneously yield
+    // the documented bound. Use distinct (collision-free) sender ids;
+    // pad-then-prefix avoids collisions between e.g. "u-1" + 61 zeros
+    // and "u-10" + 60 zeros, which produce the same string.
+    const lru = new ReplayLRU();
+    // Fill trusted pool to capacity.
+    for (let s = 0; s < MAX_TRUSTED_SENDERS; s++) {
       for (let c = 0; c < 64; c++) {
-        lru.add(`sender-${s}`, `cid-${s}-${c}`);
+        lru.add(`t-${s}`, `cid-${s}-${c}`);
+      }
+      lru.markSenderTrusted(`t-${s}`);
+    }
+    // Fill untrusted pool to capacity (with senders that never
+    // graduate). Use a numeric suffix as the LAST chars so distinct
+    // `s` values always produce distinct strings regardless of length.
+    for (let s = 0; s < MAX_UNTRUSTED_SENDERS; s++) {
+      const senderId = `u-${String(s).padStart(60, '0')}`;
+      for (let c = 0; c < 64; c++) {
+        lru.add(senderId, `cid-${s}-${c}`);
       }
     }
-    expect(lru.senderCount).toBe(MAX_SENDERS); // 256
-    expect(lru.totalEntries).toBe(MAX_SENDERS * 64); // 16384
+    expect(lru.trustedSenderCount).toBe(MAX_TRUSTED_SENDERS);
+    expect(lru.untrustedSenderCount).toBe(MAX_UNTRUSTED_SENDERS);
+    expect(lru.totalEntries).toBe(
+      (MAX_TRUSTED_SENDERS + MAX_UNTRUSTED_SENDERS) * 64,
+    );
   });
 });

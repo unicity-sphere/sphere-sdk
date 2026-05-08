@@ -546,5 +546,15 @@ async function doAcquireBundle(
   // suppress retries).
   lru.add(senderPubkey, extractedCid);
 
+  // ---- Step 8: Graduate sender into the trusted pool ----
+  // Option B post-steelman: senders that have shipped at least one
+  // successfully verified bundle live in the trusted pool, immune to
+  // sybil-driven bucket-level eviction in the untrusted pool. Calling
+  // markSenderTrusted ONLY after a successful verifyBundleStructure
+  // ensures attackers cannot trivially graduate their throwaway
+  // pubkeys — they would need to ship a real CAR, with a real
+  // pkg.verify() success, every time.
+  lru.markSenderTrusted(senderPubkey);
+
   return verified;
 }

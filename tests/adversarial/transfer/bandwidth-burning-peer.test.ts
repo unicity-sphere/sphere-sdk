@@ -41,7 +41,8 @@ import { describe, expect, it } from 'vitest';
 
 import {
   MAX_PER_SENDER,
-  MAX_SENDERS,
+  MAX_TRUSTED_SENDERS,
+  MAX_UNTRUSTED_SENDERS,
   ReplayLRU,
 } from '../../../modules/payments/transfer/replay-lru';
 
@@ -85,48 +86,69 @@ describe('§5.1 Note N5 — bandwidth-burning peer cannot evict honest senders',
     expect(lru.totalEntries).toBeLessThanOrEqual(MAX_PER_SENDER);
   });
 
-  it('sybil flood (many ephemeral pubkeys) capped by maxSenders', async () => {
+  it('sybil flood (many ephemeral pubkeys) capped by maxUntrustedSenders', async () => {
     // Sophisticated adversarial vector: instead of spamming one
     // pubkey, the attacker generates thousands of distinct ephemeral
     // pubkeys (cheap on Nostr — anyone can mint a transport pubkey).
-    // Without the maxSenders cap, the bucket Map would grow
-    // unboundedly.
+    // Untrusted-pool cap bounds the bucket Map's untrusted growth.
     const lru = new ReplayLRU();
     for (let i = 0; i < 1000; i++) {
       lru.add(`sybil-${i}`.padEnd(64, '0'), `cid-${i}`);
     }
-    // Sender count is capped by maxSenders.
-    expect(lru.senderCount).toBeLessThanOrEqual(MAX_SENDERS);
+    // Sender count across BOTH pools is capped by trusted + untrusted.
+    expect(lru.senderCount).toBeLessThanOrEqual(
+      MAX_TRUSTED_SENDERS + MAX_UNTRUSTED_SENDERS,
+    );
+    // None of the sybil senders graduated, so they are all in
+    // the untrusted pool — capped by MAX_UNTRUSTED_SENDERS.
+    expect(lru.untrustedSenderCount).toBeLessThanOrEqual(MAX_UNTRUSTED_SENDERS);
   });
 
   it('honest sender publishing during flood is NEVER evicted by sender-bucket cap', async () => {
     // This is the deep N5 defense: the SENDER-LEVEL eviction tier
-    // (when the bucket Map exceeds maxSenders) MUST evict the
-    // LEAST-RECENTLY-ACTIVE sender, NOT a recently-active honest
-    // sender. We simulate honest activity interleaved with sybil
+    // MUST evict the LEAST-RECENTLY-ACTIVE sender, NOT a recently-active
+    // honest sender. We simulate honest activity interleaved with sybil
     // floods and assert the honest sender's bucket is preserved.
     //
-    // For the honest sender to survive, they need to keep refreshing
-    // recency at least as fast as the sybil pubkey count exceeds the
-    // global cap. Here we have Alice publish every 3 sybil entries,
-    // so she's never the oldest sender at any point.
-    const lru = new ReplayLRU({ maxPerSender: 4, maxSenders: 4 });
+    // Pre-Option-B: this required the honest sender to keep refreshing
+    // recency. Post-Option-B: graduating the honest sender to trusted
+    // makes their bucket truly immune to sybil churn — no refresh
+    // needed.
+    const lru = new ReplayLRU({ maxPerSender: 4, maxUntrustedSenders: 4 });
 
-    // Honest Alice publishes once.
+    // Honest Alice publishes once and graduates (the bundle-acquirer
+    // would mark her trusted on first verified bundle).
     lru.add(HONEST_ALICE, 'alice-1');
+    lru.markSenderTrusted(HONEST_ALICE);
 
-    // Sybil flood: 99 distinct sybil pubkeys interleaved with Alice
-    // refreshing her sender-recency every 3 iterations.
+    // Sybil flood: 99 distinct sybil pubkeys. Alice need not refresh —
+    // she's in the trusted pool and immune.
     for (let i = 0; i < 99; i++) {
       lru.add(`sybil-${i}`.padEnd(64, '0'), `cid-${i}`);
-      if (i % 3 === 0) {
-        lru.add(HONEST_ALICE, `alice-refresh-${i}`);
-      }
     }
 
-    // Alice's bucket survives the flood because she remained active.
-    // Her latest refresh-CID must still be present.
-    expect(lru.has(HONEST_ALICE, 'alice-refresh-96')).toBe(true);
+    // Alice's first entry survives because trusted is immune to
+    // untrusted-pool churn.
+    expect(lru.has(HONEST_ALICE, 'alice-1')).toBe(true);
+    expect(lru.isTrusted(HONEST_ALICE)).toBe(true);
+  });
+
+  it('honest sender publishes once, sits idle while sybil floods 1000 unknown senders → trusted bucket survives', async () => {
+    // Steelman scenario: an honest sender ships a single verified
+    // bundle (graduates to trusted), then sits IDLE. Meanwhile, a
+    // sustained sybil flood burns through 1000+ throwaway pubkeys.
+    // The honest trusted bucket MUST survive — Option B's whole point.
+    const lru = new ReplayLRU();
+    lru.add(HONEST_ALICE, 'cid-alice-1');
+    lru.markSenderTrusted(HONEST_ALICE);
+
+    // Alice goes idle. Sybil floods.
+    for (let i = 0; i < 1000; i++) {
+      lru.add(`sybil-${i}`.padEnd(64, '0'), `junk-${i}`);
+    }
+
+    expect(lru.has(HONEST_ALICE, 'cid-alice-1')).toBe(true);
+    expect(lru.isTrusted(HONEST_ALICE)).toBe(true);
   });
 
   it('hostile cannot evict by reusing an honest CID — buckets are private', async () => {
