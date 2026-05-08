@@ -199,6 +199,172 @@ describe('mergeManifestEntry — §5.4 metadata-preservation rules', () => {
     expect(merged.rootHash).toBe(ch('b'.repeat(64)));
   });
 
+  // ---------------------------------------------------------------------------
+  // Steelman crit #13 — equal-rootHash branch symmetric tie-break
+  // ---------------------------------------------------------------------------
+
+  describe('equal-rootHash branch symmetric tie-break (steelman crit #13)', () => {
+    const SAME_ROOT = ch('aa'.repeat(32));
+
+    it('status: prefers stronger observation symmetrically (valid > pending)', () => {
+      const prev = makeEntry({
+        rootHash: SAME_ROOT,
+        status: 'pending' as TokenManifestStatus,
+      });
+      const next = makeEntry({
+        rootHash: SAME_ROOT,
+        status: 'valid' as TokenManifestStatus,
+      });
+      const ab = mergeManifestEntry(prev, next);
+      const ba = mergeManifestEntry(next, prev);
+      expect(ab.status).toBe('valid');
+      expect(ba.status).toBe('valid');
+      expect(ab).toEqual(ba);
+    });
+
+    it('status: prefers stronger observation symmetrically (pending > conflicting)', () => {
+      const prev = makeEntry({
+        rootHash: SAME_ROOT,
+        status: 'conflicting' as TokenManifestStatus,
+      });
+      const next = makeEntry({
+        rootHash: SAME_ROOT,
+        status: 'pending' as TokenManifestStatus,
+      });
+      const ab = mergeManifestEntry(prev, next);
+      const ba = mergeManifestEntry(next, prev);
+      expect(ab.status).toBe('pending');
+      expect(ba.status).toBe('pending');
+    });
+
+    it('status: prefers stronger observation symmetrically (conflicting > invalid)', () => {
+      const prev = makeEntry({
+        rootHash: SAME_ROOT,
+        status: 'invalid' as TokenManifestStatus,
+      });
+      const next = makeEntry({
+        rootHash: SAME_ROOT,
+        status: 'conflicting' as TokenManifestStatus,
+      });
+      const ab = mergeManifestEntry(prev, next);
+      const ba = mergeManifestEntry(next, prev);
+      expect(ab.status).toBe('conflicting');
+      expect(ba.status).toBe('conflicting');
+    });
+
+    it('invalidReason: non-null wins symmetrically', () => {
+      const prev = makeEntry({
+        rootHash: SAME_ROOT,
+        status: 'invalid' as TokenManifestStatus,
+        invalidReason: 'auth-invalid',
+      });
+      const next = makeEntry({
+        rootHash: SAME_ROOT,
+        status: 'invalid' as TokenManifestStatus,
+        invalidReason: undefined,
+      });
+      const ab = mergeManifestEntry(prev, next);
+      const ba = mergeManifestEntry(next, prev);
+      expect(ab.invalidReason).toBe('auth-invalid');
+      expect(ba.invalidReason).toBe('auth-invalid');
+    });
+
+    it('invalidReason: lex-min on both-set tie symmetrically', () => {
+      const prev = makeEntry({
+        rootHash: SAME_ROOT,
+        status: 'invalid' as TokenManifestStatus,
+        invalidReason: 'zoo-reason',
+      });
+      const next = makeEntry({
+        rootHash: SAME_ROOT,
+        status: 'invalid' as TokenManifestStatus,
+        invalidReason: 'apple-reason',
+      });
+      const ab = mergeManifestEntry(prev, next);
+      const ba = mergeManifestEntry(next, prev);
+      expect(ab.invalidReason).toBe('apple-reason');
+      expect(ba.invalidReason).toBe('apple-reason');
+    });
+
+    it('bundleCid: non-null wins symmetrically when rootHash matches', () => {
+      const prev = makeEntry({
+        rootHash: SAME_ROOT,
+        bundleCid: 'bafy-prev',
+      });
+      const next = makeEntry({
+        rootHash: SAME_ROOT,
+        bundleCid: undefined,
+      });
+      const ab = mergeManifestEntry(prev, next);
+      const ba = mergeManifestEntry(next, prev);
+      expect(ab.bundleCid).toBe('bafy-prev');
+      expect(ba.bundleCid).toBe('bafy-prev');
+    });
+
+    it('bundleCid: lex-min on both-set tie symmetrically when rootHash matches', () => {
+      const prev = makeEntry({ rootHash: SAME_ROOT, bundleCid: 'bafy-z' });
+      const next = makeEntry({ rootHash: SAME_ROOT, bundleCid: 'bafy-a' });
+      const ab = mergeManifestEntry(prev, next);
+      const ba = mergeManifestEntry(next, prev);
+      expect(ab.bundleCid).toBe('bafy-a');
+      expect(ba.bundleCid).toBe('bafy-a');
+    });
+
+    it('senderTransportPubkey: non-null wins symmetrically when rootHash matches', () => {
+      const prev = makeEntry({
+        rootHash: SAME_ROOT,
+        senderTransportPubkey: 'pub-prev',
+      });
+      const next = makeEntry({
+        rootHash: SAME_ROOT,
+        senderTransportPubkey: undefined,
+      });
+      const ab = mergeManifestEntry(prev, next);
+      const ba = mergeManifestEntry(next, prev);
+      expect(ab.senderTransportPubkey).toBe('pub-prev');
+      expect(ba.senderTransportPubkey).toBe('pub-prev');
+    });
+
+    it('senderTransportPubkey: lex-min on both-set tie symmetrically when rootHash matches', () => {
+      const prev = makeEntry({
+        rootHash: SAME_ROOT,
+        senderTransportPubkey: 'zzz',
+      });
+      const next = makeEntry({
+        rootHash: SAME_ROOT,
+        senderTransportPubkey: 'aaa',
+      });
+      const ab = mergeManifestEntry(prev, next);
+      const ba = mergeManifestEntry(next, prev);
+      expect(ab.senderTransportPubkey).toBe('aaa');
+      expect(ba.senderTransportPubkey).toBe('aaa');
+    });
+
+    it('full divergence on every aux field — all four collapse to the same symmetric output', () => {
+      const prev = makeEntry({
+        rootHash: SAME_ROOT,
+        status: 'pending' as TokenManifestStatus,
+        invalidReason: 'zoo-reason',
+        bundleCid: 'bafy-z',
+        senderTransportPubkey: 'pub-z',
+      });
+      const next = makeEntry({
+        rootHash: SAME_ROOT,
+        status: 'valid' as TokenManifestStatus,
+        invalidReason: 'apple-reason',
+        bundleCid: 'bafy-a',
+        senderTransportPubkey: 'pub-a',
+      });
+      const ab = mergeManifestEntry(prev, next);
+      const ba = mergeManifestEntry(next, prev);
+      expect(ab).toEqual(ba);
+      expect(ab.status).toBe('valid'); // strongest
+      expect(ab.invalidReason).toBe('apple-reason'); // lex-min
+      expect(ab.bundleCid).toBe('bafy-a'); // lex-min
+      expect(ab.senderTransportPubkey).toBe('pub-a'); // lex-min
+    });
+  });
+
   it('mergeManifestEntry(A, B).rootHash === mergeManifestEntry(B, A).rootHash on divergent rootHash inputs', () => {
     // Symmetry property — the steelman defense. Without the symmetric
     // fallback, the persisted rootHash would flip-flop between replicas
