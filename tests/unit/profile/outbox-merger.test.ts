@@ -659,6 +659,117 @@ describe('C12 race-lost CRDT acceptance', () => {
 });
 
 // -----------------------------------------------------------------------------
+// Steelman crit #14 — pickShapeBySwapStableTiebreak full chain extension
+// -----------------------------------------------------------------------------
+
+describe('steelman crit #14 — pickShapeBySwapStableTiebreak full chain', () => {
+  // Shape divergence on the trailing three fields (recipientTransportPubkey,
+  // deliveryMethod, mode) is observable as a swap-stability failure if the
+  // tiebreak chain only covers bundleCid/recipient/tokenIds. The fix extends
+  // the chain to cover every shape field the orchestrator reads from the
+  // winner side. We exercise each newly-covered link below.
+
+  function commonBase(): Partial<UxfTransferOutboxEntry> {
+    return {
+      id: 'shape-tie',
+      bundleCid: 'bafy-shared',
+      tokenIds: ['tok-1'],
+      recipient: 'DIRECT://shared',
+      status: 'sending',
+      lamport: 5,
+    };
+  }
+
+  it('chain breaks on recipientTransportPubkey when bundleCid/recipient/tokenIds tie', () => {
+    const a = makeEntry({
+      ...commonBase(),
+      recipientTransportPubkey: 'pub-zzz',
+      deliveryMethod: 'car-over-nostr',
+      mode: 'instant',
+    });
+    const b = makeEntry({
+      ...commonBase(),
+      recipientTransportPubkey: 'pub-aaa',
+      deliveryMethod: 'car-over-nostr',
+      mode: 'instant',
+    });
+    const ab = mergeOutboxEntries(a, b);
+    const ba = mergeOutboxEntries(b, a);
+    // Lex-min recipientTransportPubkey wins; both orderings agree.
+    expect(ab.recipientTransportPubkey).toBe('pub-aaa');
+    expect(ba.recipientTransportPubkey).toBe('pub-aaa');
+    expect(ab).toEqual(ba);
+  });
+
+  it('chain breaks on deliveryMethod when prior fields and recipientTransportPubkey tie', () => {
+    const a = makeEntry({
+      ...commonBase(),
+      recipientTransportPubkey: 'pub-shared',
+      deliveryMethod: 'cid-over-nostr', // > 'car-over-nostr' lex-wise
+      mode: 'instant',
+    });
+    const b = makeEntry({
+      ...commonBase(),
+      recipientTransportPubkey: 'pub-shared',
+      deliveryMethod: 'car-over-nostr',
+      mode: 'instant',
+    });
+    const ab = mergeOutboxEntries(a, b);
+    const ba = mergeOutboxEntries(b, a);
+    expect(ab.deliveryMethod).toBe('car-over-nostr'); // lex-min wins
+    expect(ba.deliveryMethod).toBe('car-over-nostr');
+    expect(ab).toEqual(ba);
+  });
+
+  it('chain breaks on mode when prior fields tie', () => {
+    const a = makeEntry({
+      ...commonBase(),
+      recipientTransportPubkey: 'pub-shared',
+      deliveryMethod: 'car-over-nostr',
+      mode: 'instant', // < 'txf' lex-wise; > 'conservative' lex-wise
+    });
+    const b = makeEntry({
+      ...commonBase(),
+      recipientTransportPubkey: 'pub-shared',
+      deliveryMethod: 'car-over-nostr',
+      mode: 'conservative',
+    });
+    const ab = mergeOutboxEntries(a, b);
+    const ba = mergeOutboxEntries(b, a);
+    expect(ab.mode).toBe('conservative'); // lex-min
+    expect(ba.mode).toBe('conservative');
+    expect(ab).toEqual(ba);
+  });
+
+  it('full divergence on the trailing chain — every field commutes', () => {
+    const a = makeEntry({
+      ...commonBase(),
+      recipientTransportPubkey: 'pub-z',
+      deliveryMethod: 'cid-over-nostr',
+      mode: 'instant',
+    });
+    const b = makeEntry({
+      ...commonBase(),
+      recipientTransportPubkey: 'pub-a',
+      deliveryMethod: 'car-over-nostr',
+      mode: 'conservative',
+    });
+    const ab = mergeOutboxEntries(a, b);
+    const ba = mergeOutboxEntries(b, a);
+    // Per the chain order, the FIRST differing field decides the entire
+    // winner — recipientTransportPubkey lex-min ('pub-a') wins, so the
+    // winner-side's deliveryMethod and mode flow from b.
+    expect(ab.recipientTransportPubkey).toBe('pub-a');
+    expect(ba.recipientTransportPubkey).toBe('pub-a');
+    expect(ab.deliveryMethod).toBe('car-over-nostr');
+    expect(ba.deliveryMethod).toBe('car-over-nostr');
+    expect(ab.mode).toBe('conservative');
+    expect(ba.mode).toBe('conservative');
+    expect(ab).toEqual(ba);
+  });
+});
+
+// -----------------------------------------------------------------------------
 // Steelman crit #12 — sticky everFinalizing for override revival
 // -----------------------------------------------------------------------------
 

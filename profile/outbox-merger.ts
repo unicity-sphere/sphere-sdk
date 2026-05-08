@@ -294,15 +294,35 @@ function pickWinnerEntryForShape(
 }
 
 /**
- * Content-stable shape tiebreak: lex-min `bundleCid` → lex-min
- * `recipient` → lex-min over `JSON.stringify(tokenIds)`. Returns whichever
- * input — `a` or `b` — is "smaller" by the chain. The chain is total
- * (every input has a defined `bundleCid` per `UxfTransferOutboxEntry`'s
- * required-field schema) and order-independent (`min(x, y)` is the same
- * function regardless of which arg is first), so the resulting shape is
- * invariant under input swap. The only fully-tied case is when every
- * field on the chain is identical, in which case `a` and `b` produce the
- * same shape and the choice is irrelevant.
+ * Content-stable shape tiebreak (steelman crit #14 — full chain extension):
+ *
+ *   lex-min `bundleCid` → lex-min `recipient` → lex-min canonical-join of
+ *   `tokenIds` → lex-min `recipientTransportPubkey` → lex-min
+ *   `deliveryMethod` → lex-min `mode`.
+ *
+ * Returns whichever input — `a` or `b` — is "smaller" by the full chain.
+ * The chain is total (every field is required per
+ * `UxfTransferOutboxEntry`'s schema) and order-independent (`min(x, y)`
+ * is the same function regardless of which arg is first), so the
+ * resulting shape is invariant under input swap.
+ *
+ * **Why the full chain.** The orchestrator (this module) reads `recipient`,
+ * `recipientTransportPubkey`, `tokenIds`, `bundleCid`, `deliveryMethod`,
+ * AND `mode` from the chosen `winnerEntry`. If the tiebreak chain stopped
+ * at `bundleCid → recipient → tokenIds`, two same-status entries that
+ * agree on those three fields but disagree on the trailing three would
+ * have been picked position-based by the previous implementation —
+ * non-commutative. The extension here covers every shape field the
+ * orchestrator reads from the winner side, restoring full swap-stability.
+ *
+ * **Canonical join for tokenIds**: sort then JSON-stringify. The sort makes
+ * the comparison invariant under the original list ordering; the JSON
+ * encoding is a deterministic stable encoding of the array shape.
+ *
+ * **"Fully tied"** means every field in the extended chain is identical
+ * across both inputs. In that case `a` and `b` project the same content
+ * for every shape field the orchestrator reads, so the choice between
+ * returning `a` or `b` is observationally irrelevant.
  */
 function pickShapeBySwapStableTiebreak(
   a: UxfTransferOutboxEntry,
@@ -313,6 +333,15 @@ function pickShapeBySwapStableTiebreak(
   const aTokenIds = JSON.stringify([...a.tokenIds].sort());
   const bTokenIds = JSON.stringify([...b.tokenIds].sort());
   if (aTokenIds !== bTokenIds) return aTokenIds < bTokenIds ? a : b;
+  if (a.recipientTransportPubkey !== b.recipientTransportPubkey) {
+    return a.recipientTransportPubkey < b.recipientTransportPubkey ? a : b;
+  }
+  if (a.deliveryMethod !== b.deliveryMethod) {
+    return a.deliveryMethod < b.deliveryMethod ? a : b;
+  }
+  if (a.mode !== b.mode) {
+    return a.mode < b.mode ? a : b;
+  }
   return a;
 }
 
