@@ -644,15 +644,127 @@ describe('C12 race-lost CRDT acceptance', () => {
       'updatedAt',
       'lamport',
       'overrideApplied',
+      'everFinalizing',
       'error',
       'submitRetryCount',
       'proofErrorCount',
       'retryDeadline',
       'pollingDeadline',
+      'pollStartedAt',
     ]);
     for (const k of Object.keys(r)) {
       expect(allowedKeys.has(k)).toBe(true);
     }
+  });
+});
+
+// -----------------------------------------------------------------------------
+// Steelman crit #12 — sticky everFinalizing for override revival
+// -----------------------------------------------------------------------------
+
+describe('steelman crit #12 — sticky everFinalizing override revival', () => {
+  it('mergeStatus stamps everFinalizing when either side has status=finalizing', () => {
+    const a = makeEntry({ status: 'finalizing', lamport: 5 });
+    const b = makeEntry({ status: 'failed-permanent', lamport: 7 });
+    const r = mergeStatus(a, b);
+    expect(r.everFinalizing).toBe(true);
+  });
+
+  it('mergeStatus carries everFinalizing forward (set-OR) when neither current status is finalizing', () => {
+    const a = makeEntry({
+      status: 'failed-permanent',
+      lamport: 5,
+      everFinalizing: true,
+    });
+    const b = makeEntry({ status: 'failed-permanent', lamport: 7 });
+    const r = mergeStatus(a, b);
+    expect(r.everFinalizing).toBe(true);
+  });
+
+  it('override revival arc fires when everFinalizing=true + failed-permanent + overrideApplied', () => {
+    // Inner-fold output: failed-permanent + everFinalizing carried over.
+    // Outer fold: failed-permanent + overrideApplied.
+    const innerFoldOutput = makeEntry({
+      status: 'failed-permanent',
+      lamport: 5,
+      everFinalizing: true,
+      overrideApplied: false,
+    });
+    const overrideSide = makeEntry({
+      status: 'failed-permanent',
+      lamport: 5,
+      overrideApplied: true,
+    });
+    const r = mergeStatus(innerFoldOutput, overrideSide);
+    expect(r.status).toBe('finalizing'); // revived
+    expect(r.winner).toBe('override');
+    expect(r.overrideApplied).toBe(true);
+    expect(r.everFinalizing).toBe(true);
+  });
+
+  it('without everFinalizing, two failed-permanent + override remain failed-permanent', () => {
+    // Negative control: revival arc requires the historical `finalizing`
+    // observation. Without `everFinalizing: true` the multiset is just
+    // {failed-permanent, failed-permanent} and Rule 2 cannot revive.
+    const a = makeEntry({
+      status: 'failed-permanent',
+      lamport: 5,
+      overrideApplied: false,
+    });
+    const b = makeEntry({
+      status: 'failed-permanent',
+      lamport: 5,
+      overrideApplied: true,
+    });
+    const r = mergeStatus(a, b);
+    expect(r.status).toBe('failed-permanent');
+  });
+
+  it('formerly-broken multiset: both fold orders converge to finalizing', () => {
+    // The exact reproducer from the steelman crit #12 doc-comment.
+    //   a = finalizing,        overrideApplied: false
+    //   b = failed-permanent,  overrideApplied: false
+    //   c = failed-permanent,  overrideApplied: true
+    // Pre-fix:
+    //   merge(merge(a, b), c) -> failed-permanent (a's finalizing lost)
+    //   merge(a, merge(b, c)) -> finalizing       (override arc fires)
+    // Post-fix: BOTH converge to `finalizing` thanks to `everFinalizing`.
+    const a = makeEntry({
+      id: 'crit-12',
+      status: 'finalizing',
+      lamport: 5,
+      overrideApplied: false,
+    });
+    const b = makeEntry({
+      id: 'crit-12',
+      status: 'failed-permanent',
+      lamport: 5,
+      overrideApplied: false,
+    });
+    const c = makeEntry({
+      id: 'crit-12',
+      status: 'failed-permanent',
+      lamport: 5,
+      overrideApplied: true,
+    });
+
+    const left = mergeOutboxEntries(mergeOutboxEntries(a, b), c);
+    const right = mergeOutboxEntries(a, mergeOutboxEntries(b, c));
+
+    expect(left.status).toBe('finalizing');
+    expect(right.status).toBe('finalizing');
+    expect(left.status).toBe(right.status);
+    expect(left.overrideApplied).toBe(true);
+    expect(right.overrideApplied).toBe(true);
+    expect(left.everFinalizing).toBe(true);
+    expect(right.everFinalizing).toBe(true);
+  });
+
+  it('mergeOutboxEntries persists everFinalizing flag in output', () => {
+    const a = makeEntry({ status: 'finalizing', lamport: 5 });
+    const b = makeEntry({ status: 'sending', lamport: 3 });
+    const r = mergeOutboxEntries(a, b);
+    expect(r.everFinalizing).toBe(true);
   });
 });
 

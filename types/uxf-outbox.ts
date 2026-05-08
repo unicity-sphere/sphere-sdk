@@ -241,6 +241,28 @@ export interface UxfTransferOutboxEntry {
    */
   readonly overrideApplied?: boolean;
 
+  /**
+   * Sticky "ever observed `finalizing` status" flag (§7.1, steelman crit
+   * #12). Set-OR semantics across merges — `true` on any replica whose
+   * lifecycle has at one point passed through the `finalizing` status, OR
+   * on any replica whose merger absorbed an entry that carried this flag,
+   * OR on any merger output whose inputs carried `status === 'finalizing'`.
+   *
+   * **Why this exists.** Without the flag, `mergeStatus` is non-associative
+   * for the multiset {`finalizing` (no override), `failed-permanent` (no
+   * override), `failed-permanent` (overrideApplied: true)}: the inner fold
+   * may erase `finalizing` (hard-terminal beats active per Rule 1) so the
+   * Rule 2 override arc cannot revive it in the outer merge. With this
+   * flag, the override arc can fire whenever ANY replica has ever observed
+   * `finalizing`, even after it has been hidden by an intermediate
+   * hard-terminal fold — restoring associativity for the gossip-fold model.
+   *
+   * **Sticky CRDT-stable boolean.** Once `true` on any replica, every
+   * future merge output is `true`. Persisted on writes (the writer never
+   * clears it). Optional with `false` semantics on `undefined`.
+   */
+  readonly everFinalizing?: boolean;
+
   /** Last error message, if any. */
   readonly error?: string;
 

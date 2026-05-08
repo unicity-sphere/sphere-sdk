@@ -106,6 +106,10 @@ export function hardTerminalRank(status: UxfOutboxStatus): number {
  * - `status`            — the merged status (winner's status).
  * - `lamport`           — `max(a.lamport, b.lamport)` (Rule 6).
  * - `overrideApplied`   — set-OR of both replicas' flags (Rule 2 stickiness).
+ * - `everFinalizing`    — sticky set-OR boolean: `true` if either replica
+ *                         carries the flag OR has `status === 'finalizing'`
+ *                         (steelman crit #12). Powers the over-arc
+ *                         associativity fix.
  * - `winner`            — which replica's status was selected, or
  *                         `'override'` when Rule 2 fired.
  */
@@ -113,6 +117,7 @@ export interface StatusMergeResult {
   readonly status: UxfOutboxStatus;
   readonly lamport: number;
   readonly overrideApplied: boolean;
+  readonly everFinalizing: boolean;
   readonly winner: 'a' | 'b' | 'override';
 }
 
@@ -158,6 +163,60 @@ function detectOverrideStickiness(
   if (a.status === 'finalizing' && b.status === 'failed-permanent') return 'a';
   if (b.status === 'finalizing' && a.status === 'failed-permanent') return 'b';
   return null;
+}
+
+/**
+ * Detect the Rule 2 override REVIVAL arc (steelman crit #12). Fires when
+ * BOTH sides carry `failed-permanent` (or one is `failed-permanent` and
+ * the other has been folded down to that hard-terminal status) but the
+ * sticky `everFinalizing` flag is true on either side AND the merged
+ * `overrideApplied` is also true. In that case the lifecycle multiset
+ * has at some point contained `finalizing` + `failed-permanent` + override
+ * — Rule 2's override-stickiness intent is to revive `finalizing` for any
+ * such multiset, regardless of whether the intermediate fold has hidden
+ * the `finalizing` status.
+ *
+ * This sibling helper to `detectOverrideStickiness` is what closes the
+ * non-associativity hole: in the formerly-broken multiset
+ *   a = finalizing,        overrideApplied: false, everFinalizing: true
+ *   b = failed-permanent,  overrideApplied: false
+ *   c = failed-permanent,  overrideApplied: true
+ * the inner fold `merge(a, b)` produces `failed-permanent` (hard beats
+ * active) but with `everFinalizing: true` carried forward; the outer
+ * `merge(that, c)` then sees `failed-permanent` + `failed-permanent` +
+ * override + everFinalizing → the revival arc fires and the merged status
+ * is `finalizing`. Both fold orders converge.
+ *
+ * Returns 'override' if the arc fires (status becomes `finalizing` from
+ * neither concrete side); `null` otherwise.
+ */
+function detectOverrideRevival(
+  a: UxfTransferOutboxEntry,
+  b: UxfTransferOutboxEntry,
+): 'override' | null {
+  const overrideMerged = a.overrideApplied === true || b.overrideApplied === true;
+  if (!overrideMerged) return null;
+  // The standard `detectOverrideStickiness` already covers the case where
+  // one current side is `finalizing` — this revival arc handles ONLY the
+  // case where neither current side is `finalizing` but `everFinalizing`
+  // is true on at least one side.
+  if (a.status === 'finalizing' || b.status === 'finalizing') return null;
+  const everFinalizing =
+    a.everFinalizing === true || b.everFinalizing === true;
+  if (!everFinalizing) return null;
+  // `finalized` is the strictly-better terminal state — Rule 1's
+  // hard-terminal preference puts it above `failed-permanent` and beats
+  // any active state. The override revival arc must NOT roll a `finalized`
+  // entry back to `finalizing`. If either side has reached `finalized`,
+  // the standard hard-terminal rule applies and `finalized` wins. This
+  // also preserves associativity: if any constituent of a 3-way merge has
+  // `finalized`, every fold order produces `finalized`.
+  if (a.status === 'finalized' || b.status === 'finalized') return null;
+  // Revival fires only when at least one side is still `failed-permanent`.
+  const hasFailedPermanent =
+    a.status === 'failed-permanent' || b.status === 'failed-permanent';
+  if (!hasFailedPermanent) return null;
+  return 'override';
 }
 
 // =============================================================================
@@ -251,6 +310,18 @@ export function mergeStatus(
   // does NOT fire — both sides may carry the flag for unrelated reasons.
   const overrideApplied = a.overrideApplied === true || b.overrideApplied === true;
 
+  // `everFinalizing` is sticky set-OR (steelman crit #12). True iff either
+  // side has the flag set OR either side currently carries `status ===
+  // 'finalizing'`. The boolean's strict CRDT-stable semantics mean every
+  // fold output that ever observed `finalizing` (directly or via an
+  // already-flagged input) re-emits it — so the override revival arc can
+  // fire after intermediate hard-terminal folds.
+  const everFinalizing =
+    a.everFinalizing === true ||
+    b.everFinalizing === true ||
+    a.status === 'finalizing' ||
+    b.status === 'finalizing';
+
   // Rule 2 override arc: `failed-permanent` vs `finalizing` w/ override.
   const overrideSide = detectOverrideStickiness(a, b);
   if (overrideSide !== null) {
@@ -259,6 +330,23 @@ export function mergeStatus(
       status: winnerEntry.status,
       lamport,
       overrideApplied: true, // override fired ⇒ flag is necessarily true
+      everFinalizing: true,  // arc winner has status === 'finalizing'
+      winner: 'override',
+    };
+  }
+
+  // Rule 2 override REVIVAL arc (steelman crit #12). When neither current
+  // side is `finalizing` but the multiset has historically contained one
+  // (everFinalizing=true) AND the override flag is set, revive `finalizing`
+  // — closes the non-associativity hole in the formerly-excluded multiset
+  // {finalizing-no-flag, failed-permanent-no-flag, failed-permanent+flag}.
+  const revivalSide = detectOverrideRevival(a, b);
+  if (revivalSide !== null) {
+    return {
+      status: 'finalizing',
+      lamport,
+      overrideApplied: true, // arc fires only when overrideApplied is set
+      everFinalizing: true,  // we just revived to finalizing
       winner: 'override',
     };
   }
@@ -295,6 +383,7 @@ export function mergeStatus(
     status: winnerEntry.status,
     lamport,
     overrideApplied,
+    everFinalizing,
     winner,
   };
 }

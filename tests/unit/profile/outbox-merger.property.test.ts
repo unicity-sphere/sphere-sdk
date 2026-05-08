@@ -156,6 +156,7 @@ function projection(e: UxfTransferOutboxEntry): {
   completed: ReadonlyArray<string>;
   error: string | undefined;
   overrideApplied: boolean;
+  everFinalizing: boolean;
 } {
   return {
     status: e.status,
@@ -166,6 +167,7 @@ function projection(e: UxfTransferOutboxEntry): {
     completed: [...(e.completedRequestIds ?? [])],
     error: e.error,
     overrideApplied: e.overrideApplied === true,
+    everFinalizing: e.everFinalizing === true,
   };
 }
 
@@ -346,61 +348,76 @@ describe('outbox-merger property tests (W9)', () => {
       // fc.pre() so the property tests stay focused on realistic
       // cross-replica states.
       //
-      // KNOWN LIMITATION (W3.4 follow-up — non-fix-deferral):
-      // `mergeStatus` (in `outbox-merger-status.ts`) is non-associative
-      // for the multiset {finalizing-no-flag, failed-permanent-no-flag,
-      // failed-permanent-w-flag} when all three share the same Lamport.
-      // Reproducer:
-      //   a = finalizing,        overrideApplied: false
-      //   b = failed-permanent,  overrideApplied: false
-      //   c = failed-permanent,  overrideApplied: true
-      //   merge(merge(a,b), c) -> failed-permanent  (a's `finalizing`
-      //                          status is lost in the intermediate
-      //                          merge, so the override arc cannot
-      //                          revive it in step 2)
-      //   merge(a, merge(b,c)) -> finalizing        (the override arc
-      //                          fires in the outer merge and revives
-      //                          `finalizing`)
-      // Fixing this requires a sticky `everFinalizing` bit propagated
-      // through intermediate hard-terminal states — invasive, and the
-      // §7.1 spec text describes only pairwise rules. Filed as a
-      // §7.1 follow-up; gossip-level convergence is preserved in
-      // practice because the OR-set flag still gossips and every
-      // replica eventually pairs with a `finalizing`-status one.
-      // We exclude this multiset via fc.pre() until the spec/impl
-      // resolves it.
+      // **Steelman crit #12 fix landed.** The previous "known limitation"
+      // multiset {finalizing-no-flag, failed-permanent-no-flag,
+      // failed-permanent-w-flag} is now associative thanks to the sticky
+      // `everFinalizing` flag carried through intermediate hard-terminal
+      // folds. The override revival arc fires whenever the multiset has
+      // historically contained `finalizing` AND any side carries the
+      // override flag — restoring CRDT associativity in the gossip-fold
+      // model. The previously-required `fc.pre()` exclusion for that
+      // multiset has been removed.
       fc.assert(
         fc.property(arbEntry(), arbEntry(), arbEntry(), (a, b, c) => {
           const entries = [a, b, c];
           const hasExpired = entries.some((e) => e.status === 'expired');
           const hasOverride = entries.some((e) => e.overrideApplied === true);
           fc.pre(!(hasExpired && hasOverride));
-          // Exclude the (finalizing, failed-permanent, failed-permanent
-          // + override) multiset described above (W3.4 limitation).
-          const hasFinalizingNoFlag = entries.some(
-            (e) => e.status === 'finalizing' && e.overrideApplied !== true,
-          );
-          const hasFailedPermNoFlag = entries.some(
-            (e) =>
-              e.status === 'failed-permanent' && e.overrideApplied !== true,
-          );
-          const hasFailedPermWithFlag = entries.some(
-            (e) =>
-              e.status === 'failed-permanent' && e.overrideApplied === true,
-          );
-          fc.pre(
-            !(
-              hasFinalizingNoFlag &&
-              hasFailedPermNoFlag &&
-              hasFailedPermWithFlag
-            ),
-          );
           const left = mergeOutboxEntries(mergeOutboxEntries(a, b), c);
           const right = mergeOutboxEntries(a, mergeOutboxEntries(b, c));
           expect(projection(left)).toEqual(projection(right));
         }),
-        { numRuns: 300 },
+        { numRuns: 500 },
       );
+    });
+
+    it('formerly-excluded multiset is now associative (steelman crit #12)', () => {
+      // The exact reproducer that the previous `fc.pre()` excluded.
+      const a: UxfTransferOutboxEntry = {
+        _schemaVersion: 'uxf-1' as const,
+        id: 'crit-12-test',
+        bundleCid: 'bafy-A',
+        tokenIds: ['tok-1'],
+        deliveryMethod: 'car-over-nostr' as const,
+        recipient: 'DIRECT://A',
+        recipientTransportPubkey: 'pub-A',
+        mode: 'instant' as const,
+        status: 'finalizing',
+        createdAt: 1,
+        updatedAt: 100,
+        lamport: 5,
+        overrideApplied: false,
+        submitRetryCount: 0,
+        proofErrorCount: 0,
+      };
+      const b: UxfTransferOutboxEntry = {
+        ...a,
+        bundleCid: 'bafy-B',
+        recipient: 'DIRECT://B',
+        recipientTransportPubkey: 'pub-B',
+        status: 'failed-permanent',
+        overrideApplied: false,
+        lamport: 5,
+      };
+      const c: UxfTransferOutboxEntry = {
+        ...a,
+        bundleCid: 'bafy-C',
+        recipient: 'DIRECT://C',
+        recipientTransportPubkey: 'pub-C',
+        status: 'failed-permanent',
+        overrideApplied: true,
+        lamport: 5,
+      };
+
+      const left = mergeOutboxEntries(mergeOutboxEntries(a, b), c);
+      const right = mergeOutboxEntries(a, mergeOutboxEntries(b, c));
+
+      // Both fold orders MUST converge on `finalizing` (the override
+      // revival arc fires once the multiset contains finalizing +
+      // failed-permanent + overrideApplied).
+      expect(left.status).toBe('finalizing');
+      expect(right.status).toBe('finalizing');
+      expect(projection(left)).toEqual(projection(right));
     });
   });
 

@@ -178,6 +178,11 @@ export function mergeOutboxEntries(
     updatedAt: Math.max(a.updatedAt, b.updatedAt),
     lamport: statusMerge.lamport,
     ...(statusMerge.overrideApplied ? { overrideApplied: true } : {}),
+    // `everFinalizing` is a sticky CRDT-stable boolean (steelman crit #12).
+    // Persisted on every merger output so subsequent folds can revive
+    // `finalizing` via the override arc even when intermediate hard-terminal
+    // folds have hidden the `finalizing` status.
+    ...(statusMerge.everFinalizing ? { everFinalizing: true } : {}),
     ...(errorMerge.error !== undefined ? { error: errorMerge.error } : {}),
     submitRetryCount: errorMerge.submitRetryCount,
     proofErrorCount: errorMerge.proofErrorCount,

@@ -177,11 +177,21 @@ export class OutboxWriter {
     const next = this.lamport.bumpFor(observedLamports);
 
     const updatedAt = input.updatedAt ?? Date.now();
+    // Sticky `everFinalizing` (steelman crit #12). Writers may pass through
+    // an existing `everFinalizing: true` flag (set-OR persistence). We
+    // additionally stamp it whenever the current write transitions the
+    // entry into the `finalizing` status — that observation is what the
+    // CRDT merger depends on across the gossip-fold for override revival.
+    const everFinalizing =
+      input.everFinalizing === true || input.status === 'finalizing'
+        ? true
+        : undefined;
     const stamped: UxfTransferOutboxEntry = {
       ...input,
       _schemaVersion: 'uxf-1',
       lamport: next,
       updatedAt,
+      ...(everFinalizing === true ? { everFinalizing: true } : {}),
     };
 
     await this.writeRaw(stamped.id, JSON.stringify(stamped));
