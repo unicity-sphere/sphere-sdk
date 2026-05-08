@@ -394,6 +394,16 @@ export interface ImportInclusionProofOptions {
    * recipient/sender finalization workers so all paths that touch a
    * tokenId serialize against the same mutex (matches the T.5.B / T.5.C
    * wiring).
+   *
+   * Round 7 (FIX 3) — `PaymentsModule` now constructs ONE
+   * {@link PerTokenMutex} per `initialize()` call (`_sharedPerTokenMutex`)
+   * and plumbs it into the auto-installed sender + recipient
+   * finalization workers AND this importer via the default builders'
+   * `perTokenMutex` knob. Bootstrap layers that override the importer
+   * via `installInclusionProofImporter()` SHOULD pass the same shared
+   * mutex (read it back via private getter or accept it as a constructor
+   * arg) so all three paths converge on the same per-tokenId
+   * read-decide-write window.
    */
   readonly perTokenMutex?: PerTokenMutex;
   /**

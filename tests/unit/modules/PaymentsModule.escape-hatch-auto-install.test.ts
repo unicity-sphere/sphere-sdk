@@ -279,4 +279,214 @@ describe('Round 5 (FIX 1): operator escape-hatch auto-install', () => {
 
     module.destroy();
   });
+
+  // ===========================================================================
+  // Round 7 (FIX 2) — destroy() releases importer + runner references
+  // ===========================================================================
+
+  describe('FIX 2: destroy() clears importer/runner state', () => {
+    it('destroy() sets inclusionProofImporter to null', () => {
+      const module = createPaymentsModule();
+      module.initialize({
+        identity: makeIdentity(),
+        storage: makeStorage(),
+        transport: makeTransport(),
+        oracle: makeOracle(),
+        emitEvent: vi.fn(),
+      });
+
+      const beforeDestroy = (
+        module as unknown as { inclusionProofImporter: unknown }
+      ).inclusionProofImporter;
+      expect(beforeDestroy).not.toBeNull();
+
+      module.destroy();
+
+      const afterDestroy = (
+        module as unknown as { inclusionProofImporter: unknown }
+      ).inclusionProofImporter;
+      expect(afterDestroy).toBeNull();
+    });
+
+    it('destroy() sets revalidateCascadedRunner to null', () => {
+      const module = createPaymentsModule();
+      module.initialize({
+        identity: makeIdentity(),
+        storage: makeStorage(),
+        transport: makeTransport(),
+        oracle: makeOracle(),
+        emitEvent: vi.fn(),
+      });
+
+      const beforeDestroy = (
+        module as unknown as { revalidateCascadedRunner: unknown }
+      ).revalidateCascadedRunner;
+      expect(beforeDestroy).not.toBeNull();
+
+      module.destroy();
+
+      const afterDestroy = (
+        module as unknown as { revalidateCascadedRunner: unknown }
+      ).revalidateCascadedRunner;
+      expect(afterDestroy).toBeNull();
+    });
+
+    it('destroy() clears the shared per-tokenId mutex', () => {
+      const module = createPaymentsModule();
+      module.initialize({
+        identity: makeIdentity(),
+        storage: makeStorage(),
+        transport: makeTransport(),
+        oracle: makeOracle(),
+        emitEvent: vi.fn(),
+      });
+
+      const mutexBefore = (
+        module as unknown as { _sharedPerTokenMutex: unknown }
+      )._sharedPerTokenMutex;
+      expect(mutexBefore).not.toBeNull();
+
+      module.destroy();
+
+      const mutexAfter = (
+        module as unknown as { _sharedPerTokenMutex: unknown }
+      )._sharedPerTokenMutex;
+      expect(mutexAfter).toBeNull();
+    });
+
+    it('destroy() then re-initialize() wires fresh importer/runner instances (no shared state)', () => {
+      const module = createPaymentsModule();
+      module.initialize({
+        identity: makeIdentity(),
+        storage: makeStorage(),
+        transport: makeTransport(),
+        oracle: makeOracle(),
+        emitEvent: vi.fn(),
+      });
+
+      const importer1 = (
+        module as unknown as { inclusionProofImporter: unknown }
+      ).inclusionProofImporter;
+      const runner1 = (
+        module as unknown as { revalidateCascadedRunner: unknown }
+      ).revalidateCascadedRunner;
+      const mutex1 = (
+        module as unknown as { _sharedPerTokenMutex: unknown }
+      )._sharedPerTokenMutex;
+
+      module.destroy();
+
+      // Re-initialize the same module instance — fresh defaults must
+      // be wired (the destroy/initialize cycle doesn't share state).
+      module.initialize({
+        identity: makeIdentity(),
+        storage: makeStorage(),
+        transport: makeTransport(),
+        oracle: makeOracle(),
+        emitEvent: vi.fn(),
+      });
+
+      const importer2 = (
+        module as unknown as { inclusionProofImporter: unknown }
+      ).inclusionProofImporter;
+      const runner2 = (
+        module as unknown as { revalidateCascadedRunner: unknown }
+      ).revalidateCascadedRunner;
+      const mutex2 = (
+        module as unknown as { _sharedPerTokenMutex: unknown }
+      )._sharedPerTokenMutex;
+
+      expect(importer2).not.toBe(importer1);
+      expect(runner2).not.toBe(runner1);
+      expect(mutex2).not.toBe(mutex1);
+      expect(importer2).toBeInstanceOf(InclusionProofImporter);
+      expect(runner2).toBeInstanceOf(RevalidateCascadedRunner);
+
+      module.destroy();
+    });
+  });
+
+  // ===========================================================================
+  // Round 7 (FIX 3) — shared per-tokenId mutex across workers + importer
+  // ===========================================================================
+
+  describe('FIX 3: shared PerTokenMutex across workers + importer', () => {
+    it('initialize() constructs a single PerTokenMutex shared across importer/workers', () => {
+      const module = createPaymentsModule();
+      module.initialize({
+        identity: makeIdentity(),
+        storage: makeStorage(),
+        transport: makeTransport(),
+        oracle: makeOracle(),
+        emitEvent: vi.fn(),
+      });
+
+      // The shared mutex must be set after initialize().
+      const sharedMutex = (
+        module as unknown as { _sharedPerTokenMutex: unknown }
+      )._sharedPerTokenMutex;
+      expect(sharedMutex).not.toBeNull();
+
+      // The importer must hold a reference to the SAME mutex instance.
+      // The default builder threads opts.perTokenMutex through to the
+      // InclusionProofImporter constructor.
+      const importer = (
+        module as unknown as {
+          inclusionProofImporter: { perTokenMutex: unknown } | null;
+        }
+      ).inclusionProofImporter;
+      expect(importer).not.toBeNull();
+      // Reach through the importer's private perTokenMutex field.
+      const importerMutex = (importer as unknown as {
+        perTokenMutex: unknown;
+      }).perTokenMutex;
+      expect(importerMutex).toBe(sharedMutex);
+
+      module.destroy();
+    });
+  });
+
+  // ===========================================================================
+  // Round 7 (FIX 5) — MinimalManifestStorage lowercases tokenId keys
+  // ===========================================================================
+
+  describe('FIX 5: MinimalManifestStorage lowercases tokenId keys', () => {
+    it('writeEntry with mixed-case tokenId is read back via lowercase tokenId', async () => {
+      const { buildDefaultInclusionProofImporter } = await import(
+        '../../../modules/payments/PaymentsModule'
+      );
+      const importer = buildDefaultInclusionProofImporter({
+        emit: vi.fn(),
+      });
+
+      // Reach through the importer → manifestStore → underlying
+      // MinimalManifestStorage. The store wraps the in-memory storage
+      // adapter that's the target of FIX 5's lowercasing.
+      const manifestStore = (importer as unknown as {
+        opts: { manifestStore: unknown };
+      }).opts.manifestStore;
+      const minimalStorage = (manifestStore as unknown as {
+        storage: { writeEntry: (addr: string, tokenId: string, entry: unknown) => Promise<void>; readEntry: (addr: string, tokenId: string) => Promise<unknown> };
+      }).storage;
+
+      const addr = 'DIRECT://test';
+      const mixedCase = 'AbCd' + 'ab'.repeat(30);
+      const lowerCase = mixedCase.toLowerCase();
+
+      // Write with mixed-case tokenId — internal keying must lowercase
+      // so the same entry is readable via either case form.
+      await minimalStorage.writeEntry(addr, mixedCase, {
+        rootHash: 'ab'.repeat(32),
+        status: 'pending',
+      });
+
+      const readMixed = await minimalStorage.readEntry(addr, mixedCase);
+      const readLower = await minimalStorage.readEntry(addr, lowerCase);
+
+      expect(readMixed).toBeDefined();
+      expect(readLower).toBeDefined();
+      // Both forms read back the SAME entry (not split across two keys).
+      expect(readMixed).toBe(readLower);
+    });
+  });
 });

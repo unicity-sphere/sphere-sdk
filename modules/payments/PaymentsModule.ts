@@ -2082,6 +2082,17 @@ export class PaymentsModule {
     // signals cannot be reset.
     this._workerAbortController = new AbortController();
 
+    // Round 7 (FIX 3) — Shared per-tokenId mutex. Constructed once per
+    // initialize() and plumbed into the sender + recipient finalization
+    // workers AND the operator escape-hatch InclusionProofImporter so
+    // all three paths serialize against the same read-decide-write
+    // window when they touch the same tokenId. Without this, a
+    // concurrent `finalizeTransferToken(X)` and `importInclusionProof(X)`
+    // race in their respective per-tokenId guards (each builder
+    // previously created its own fresh PerTokenMutex), corrupting the
+    // manifest's audit trail or re-queuing duplicate K-1 entries.
+    this._sharedPerTokenMutex = new PerTokenMutex();
+
     // Phase 9.6.D — auto-install the sender-side finalization worker when
     // `senderUxf` is on AND `finalizationWorker` is on AND no consumer has
     // already installed one via `installFinalizationWorkerSender()`.
@@ -2124,6 +2135,10 @@ export class PaymentsModule {
           // through to the worker so destroy() can cancel in-flight
           // submit/poll cycles + sleep timers.
           signal: this._workerAbortController.signal,
+          // Round 7 (FIX 3) — share per-tokenId mutex with recipient
+          // worker + operator importer so all three paths serialize
+          // against the same read-decide-write window.
+          perTokenMutex: this._sharedPerTokenMutex,
         });
         this.finalizationWorkerSender.start();
         logger.debug(
@@ -2191,6 +2206,10 @@ export class PaymentsModule {
           save: () => this.save(),
           emit: (type, data) => this.deps!.emitEvent(type, data),
           signal: this._workerAbortController.signal,
+          // Round 7 (FIX 3) — share per-tokenId mutex with sender worker
+          // + operator importer so all three paths serialize against the
+          // same read-decide-write window.
+          perTokenMutex: this._sharedPerTokenMutex,
         });
         this._recipientFinalizationQueue = built.queue;
         this.finalizationWorkerRecipient = built.worker;
@@ -2237,6 +2256,10 @@ export class PaymentsModule {
     if (this.inclusionProofImporter === null) {
       this.inclusionProofImporter = buildDefaultInclusionProofImporter({
         emit: (type, data) => this.deps!.emitEvent(type, data),
+        // Round 7 (FIX 3) — share per-tokenId mutex with finalization
+        // workers so concurrent finalize + operator import on the same
+        // tokenId serialize against the read-decide-write window.
+        perTokenMutex: this._sharedPerTokenMutex ?? undefined,
       });
       logger.debug(
         'Payments',
@@ -2550,6 +2573,25 @@ export class PaymentsModule {
   private _recipientSaveFailureStreakClear: (() => void) | null = null;
 
   /**
+   * Round 7 (FIX 3) — shared per-tokenId mutex for all paths that touch
+   * the same `tokenId` within this PaymentsModule instance: the
+   * sender-side FinalizationWorkerSender, the recipient-side
+   * FinalizationWorkerRecipient, AND the operator escape-hatch
+   * InclusionProofImporter. Sharing one mutex per instance ensures
+   * that a concurrent finalize and operator import on the same tokenId
+   * serialize against the read-decide-write window, matching the
+   * `ImportInclusionProofOptions.perTokenMutex` JSDoc contract that
+   * callers SHOULD share with the workers.
+   *
+   * Recreated in `initialize()` (per the same lifecycle as
+   * `_workerAbortController`) and cleared in {@link destroy} so a
+   * destroy()/initialize() cycle starts with a fresh mutex.
+   *
+   * @internal
+   */
+  private _sharedPerTokenMutex: PerTokenMutex | null = null;
+
+  /**
    * Install the operator inclusion-proof importer (T.5.D, §6.3 escape
    * hatch). Idempotent — a second call replaces the previous importer.
    *
@@ -2560,6 +2602,46 @@ export class PaymentsModule {
    */
   installInclusionProofImporter(importer: InclusionProofImporter): void {
     this.inclusionProofImporter = importer;
+  }
+
+  /**
+   * Round 7 (FIX 1) — Reconfigure the auto-installed
+   * {@link InclusionProofImporter} with a production-wired
+   * `dispositionStorage` adapter (typically
+   * {@link OrbitDbDispositionStorageAdapter} bound to the wallet's
+   * ProfileDatabase). Idempotent: rebuilds and replaces the current
+   * importer using the same shared per-tokenId mutex (`_sharedPerTokenMutex`)
+   * so the new importer continues to serialize with the finalization
+   * workers.
+   *
+   * Bootstrap layers (Sphere) call this after `initialize()` once the
+   * profile stack is ready to hand them an OrbitDb-backed adapter. When
+   * called BEFORE `initialize()`, it has the same effect as
+   * `installInclusionProofImporter()` — the auto-install gate
+   * (`inclusionProofImporter === null`) skips because we just installed
+   * one.
+   *
+   * Callable only after `initialize()` (the importer needs `this.deps`
+   * to wire `emit`).
+   *
+   * KNOWN LIMITATION: this method does NOT yet wire `verifyProof` /
+   * `graftCallback` / `overrideCallback` to production-grade
+   * implementations — those still default to the in-memory stubs
+   * (NOT_AUTHENTICATED + no-op). The full production wiring is deferred
+   * to a follow-up wave once the trust-base lifecycle on this module's
+   * oracle is stable. The dispositionStorage swap alone delivers
+   * cross-restart persistence of `_invalid` records — the highest-value
+   * gap surfaced by Round 6.
+   */
+  configureOperatorEscapeHatchStorage(
+    dispositionStorage: import('../../profile/disposition-writer').DispositionPerEntryStorage,
+  ): void {
+    this.ensureInitialized();
+    this.inclusionProofImporter = buildDefaultInclusionProofImporter({
+      emit: (type, data) => this.deps!.emitEvent(type, data),
+      perTokenMutex: this._sharedPerTokenMutex ?? undefined,
+      dispositionStorage,
+    });
   }
 
   /**
@@ -2904,6 +2986,25 @@ export class PaymentsModule {
       }
       this._recipientSaveFailureStreakClear = null;
     }
+
+    // Round 7 (FIX 2) — release the operator escape-hatch importer and
+    // revalidate-cascaded runner. The default in-memory builders capture
+    // their own Maps (manifestEntries / dispositionStorage / queueScanner
+    // closures); without clearing the references here, those Maps
+    // outlive the destroy() call and leak permanently for the lifetime
+    // of the process even though the rest of PaymentsModule is gone.
+    // A subsequent initialize() call will recreate fresh defaults via
+    // the `=== null` gate, so a destroy()/initialize() cycle now starts
+    // with a clean state instead of stale closures.
+    this.inclusionProofImporter = null;
+    this.revalidateCascadedRunner = null;
+
+    // Round 7 (FIX 3) — release the shared per-tokenId mutex. The mutex
+    // captures inflight Promises in its instance-scoped Map; clearing
+    // the reference here lets the GC collect both the mutex and any
+    // dangling per-tokenId state. A subsequent initialize() rebuilds a
+    // fresh mutex (matches the `_workerAbortController` lifecycle).
+    this._sharedPerTokenMutex = null;
   }
 
   // ===========================================================================
@@ -9875,6 +9976,15 @@ export function buildDefaultFinalizationWorkerSender(opts: {
    * deterministically rather than running orphaned to completion.
    */
   readonly signal?: AbortSignal;
+  /**
+   * Round 7 (FIX 3) — Optional shared {@link PerTokenMutex} so the
+   * sender worker, recipient worker, and operator escape-hatch
+   * InclusionProofImporter serialize against the same read-decide-write
+   * window when they touch the same tokenId. When omitted, a fresh
+   * per-builder mutex is used (the previous default — preserves
+   * backward compatibility for callers that don't share).
+   */
+  readonly perTokenMutex?: PerTokenMutex | null;
 }): FinalizationWorkerSender {
   const { addressId, oracle, senderOutboxMap, senderRequestContextMap, emit, signal } = opts;
 
@@ -10060,7 +10170,12 @@ export function buildDefaultFinalizationWorkerSender(opts: {
   };
 
   // Per-token mutex — shared for all requestIds within the same address.
-  const perTokenMutex = new PerTokenMutex();
+  // Round 7 (FIX 3) — accept a shared instance from the caller so the
+  // sender worker, recipient worker, and operator escape-hatch importer
+  // serialize against the same per-tokenId mutex within the
+  // PaymentsModule lifecycle. Falls back to a fresh per-builder mutex
+  // if the caller doesn't pass one.
+  const perTokenMutex = opts.perTokenMutex ?? new PerTokenMutex();
 
   return new FinalizationWorkerSender({
     addressId,
@@ -10146,6 +10261,14 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
     data: import('../../types').SphereEventMap[T],
   ) => void;
   readonly signal?: AbortSignal;
+  /**
+   * Round 7 (FIX 3) — Optional shared {@link PerTokenMutex} so the
+   * recipient worker, sender worker, and operator escape-hatch
+   * InclusionProofImporter serialize against the same read-decide-write
+   * window when they touch the same tokenId. When omitted, a fresh
+   * per-builder mutex is used.
+   */
+  readonly perTokenMutex?: PerTokenMutex | null;
 }): {
   worker: FinalizationWorkerRecipient;
   queue: FinalizationQueue;
@@ -10345,7 +10468,11 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
     }
     return sem;
   };
-  const perTokenMutex = new PerTokenMutex();
+  // Round 7 (FIX 3) — share with sender worker + operator importer so
+  // concurrent paths on the same tokenId serialize against the same
+  // read-decide-write window. Falls back to a fresh per-builder mutex
+  // if the caller doesn't pass one.
+  const perTokenMutex = opts.perTokenMutex ?? new PerTokenMutex();
 
   // ---- Stub CascadeWalker (no children scan, no NFT routing) ---------
   const cascadeManifestScanner: CascadeManifestScanner = {
@@ -10694,22 +10821,49 @@ export function buildDefaultInclusionProofImporter(opts: {
     type: T,
     data: SphereEventMap[T],
   ) => void;
+  /**
+   * Round 7 (FIX 3) — Optional shared {@link PerTokenMutex} so the
+   * operator importer serializes with the sender + recipient
+   * finalization workers when they touch the same tokenId. Without
+   * sharing, a concurrent `finalizeTransferToken(X)` and
+   * `importInclusionProof(X)` race in their respective per-tokenId
+   * guards (each builder previously created its own fresh mutex),
+   * corrupting the manifest's audit trail or re-queuing duplicate K-1
+   * entries. JSDoc on `ImportInclusionProofOptions.perTokenMutex` says
+   * production callers SHOULD share — this knob fulfills that contract.
+   */
+  readonly perTokenMutex?: PerTokenMutex | null;
+  /**
+   * Round 7 (FIX 1) — Optional production-grade
+   * `DispositionPerEntryStorage` adapter. When passed (e.g. an
+   * {@link OrbitDbDispositionStorageAdapter} bound to the wallet's
+   * ProfileDatabase), the importer's `_invalid` / `_audit` per-entry
+   * records persist across restarts. When omitted, an
+   * {@link InMemoryDispositionStorageAdapter} is used (the previous
+   * default — preserves backward compatibility for tests + dev-mode
+   * wallets without a profile stack).
+   */
+  readonly dispositionStorage?: import('../../profile/disposition-writer').DispositionPerEntryStorage;
 }): InclusionProofImporter {
   const { emit } = opts;
 
   // In-memory disposition storage — `_invalid` / `_audit` per-entry
-  // records.
-  const dispositionStorage = new InMemoryDispositionStorageAdapter();
+  // records. Round 7 (FIX 1) — caller may pass an OrbitDb-backed
+  // adapter for cross-restart persistence.
+  const dispositionStorage = opts.dispositionStorage ?? new InMemoryDispositionStorageAdapter();
 
   // In-memory manifest storage — the operator escape-hatch reads
   // manifest entries to decide pending-vs-invalid routing.
+  // Round 7 (FIX 5) — lowercase tokenId keys so mixed-case input from
+  // operator scripts doesn't split the keyspace. The canonical-tokenId
+  // regex contract says lowercase hex; storage keys must follow.
   const manifestEntries = new Map<string, TokenManifestEntry>();
   const manifestStorage: MinimalManifestStorage = {
     async readEntry(addr: string, tokenId: string) {
-      return manifestEntries.get(`${addr}:${tokenId}`);
+      return manifestEntries.get(`${addr}:${tokenId.toLowerCase()}`);
     },
     async writeEntry(addr: string, tokenId: string, entry: TokenManifestEntry) {
-      manifestEntries.set(`${addr}:${tokenId}`, entry);
+      manifestEntries.set(`${addr}:${tokenId.toLowerCase()}`, entry);
     },
   };
   const manifestStore = new ManifestStore({
@@ -10758,6 +10912,13 @@ export function buildDefaultInclusionProofImporter(opts: {
     graftCallback,
     overrideCallback,
     emit,
+    // Round 7 (FIX 3) — when caller provides a shared mutex, plumb it
+    // through so this importer instance serializes against the
+    // PaymentsModule's finalization workers. Default (undefined) leaves
+    // the importer's own internal fallback in place.
+    ...(opts.perTokenMutex !== null && opts.perTokenMutex !== undefined
+      ? { perTokenMutex: opts.perTokenMutex }
+      : {}),
   });
 }
 
@@ -10784,10 +10945,13 @@ export function buildDefaultRevalidateCascadedRunner(): RevalidateCascadedRunner
   // manifestStore returns undefined for every readEntry, so the
   // pre-loop parent-validity check classifies every cascaded subtree
   // as "still invalid". The runner returns zero counts.
+  // Round 7 (FIX 5) — lowercase tokenId keys to match the canonical-
+  // tokenId regex contract; mixed-case input must not split the
+  // keyspace.
   const manifestEntries = new Map<string, TokenManifestEntry>();
   const manifestScanner: CascadeManifestScannerForRevalidate = {
     async readEntry(addr: string, tokenId: string) {
-      return manifestEntries.get(`${addr}:${tokenId}`);
+      return manifestEntries.get(`${addr}:${tokenId.toLowerCase()}`);
     },
     async findChildren() {
       return [];
@@ -10795,10 +10959,10 @@ export function buildDefaultRevalidateCascadedRunner(): RevalidateCascadedRunner
   };
   const manifestStorage: MinimalManifestStorage = {
     async readEntry(addr: string, tokenId: string) {
-      return manifestEntries.get(`${addr}:${tokenId}`);
+      return manifestEntries.get(`${addr}:${tokenId.toLowerCase()}`);
     },
     async writeEntry(addr: string, tokenId: string, entry: TokenManifestEntry) {
-      manifestEntries.set(`${addr}:${tokenId}`, entry);
+      manifestEntries.set(`${addr}:${tokenId.toLowerCase()}`, entry);
     },
   };
   const manifestStore = new ManifestStore({
