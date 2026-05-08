@@ -75,3 +75,36 @@ export const VERIFY_MAX_ELEMENT_BYTES = 64 * 1024;
  * iteration is O(N) on hostile padding.
  */
 export const EXTRACT_CAR_ROOT_HEADER_PROBE_BYTES = 4 * 1024;
+
+/**
+ * Maximum total bytes accepted by `importFromCar` BEFORE invoking
+ * `CarReader.fromBytes`.
+ *
+ * `CarReader.fromBytes(car)` parses the entire CAR up-front, building
+ * an internal block index over `car.byteLength` bytes. That happens
+ * before the per-block count/byte caps fire — a 1 GiB hostile CAR
+ * forces a 1 GiB allocation + parse pass through the cborg decoder
+ * even if every block is rejected on the next loop iteration.
+ *
+ * 64 MiB is comfortably above any legitimate UXF package shape (the
+ * existing per-block × per-block-count product budget is 64 KiB ×
+ * 10_000 = 640 MiB, but real packages are orders of magnitude
+ * smaller) while bounding the worst-case pre-parse memory burst.
+ */
+export const CAR_IMPORT_MAX_TOTAL_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Maximum manifest entries (token bindings) accepted by JSON or CAR
+ * deserializers BEFORE iterating the manifest map.
+ *
+ * Without an explicit cap, a hostile package whose manifest carries
+ * 10M entries forces a 10M-iteration loop through `Object.entries`
+ * /`tokens.set` plus 10M `contentHash`/`tokenId` validations. The
+ * existing per-element-count cap (`WRAP_POOL_MAX_SIZE`) does not
+ * fire on the manifest object — it only fires on the element pool.
+ *
+ * 100k entries is well above any realistic UXF packaging shape (a
+ * single bundle with 100k tokens already dwarfs the largest production
+ * batches) while rejecting bloat-DoS at the parse boundary.
+ */
+export const MANIFEST_MAX_SIZE = 100_000;

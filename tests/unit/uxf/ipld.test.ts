@@ -12,7 +12,9 @@ import { ElementPool } from '../../../uxf/element-pool.js';
 import { deconstructToken } from '../../../uxf/deconstruct.js';
 import { computeElementHash } from '../../../uxf/hash.js';
 import { CID } from 'multiformats';
-import { decode as dagCborDecode } from '@ipld/dag-cbor';
+import { encode as dagCborEncode, decode as dagCborDecode } from '@ipld/dag-cbor';
+import { CarWriter } from '@ipld/car/writer';
+import { sha256 as nobleSha256 } from '@noble/hashes/sha2.js';
 import type {
   ContentHash,
   UxfElement,
@@ -284,5 +286,471 @@ describe('exportToCar / importFromCar', () => {
     tampered[idx] = tampered[idx] ^ 0xff;
 
     await expect(importFromCar(tampered)).rejects.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests -- steelman regression: importFromCar hardening (FIX 1, 2, 3, 5, 6, 12)
+// ---------------------------------------------------------------------------
+
+const DAG_CBOR_CODE_TEST = 0x71;
+
+function makeSha256Digest(hash: Uint8Array): { code: 0x12; size: number; digest: Uint8Array; bytes: Uint8Array } {
+  const code = 0x12 as const;
+  const size = hash.length;
+  const bytes = new Uint8Array(2 + size);
+  bytes[0] = code;
+  bytes[1] = size;
+  bytes.set(hash, 2);
+  return { code, size, digest: hash, bytes };
+}
+
+async function collectCar(writer: { close(): Promise<void> }, out: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  const collect = (async () => {
+    for await (const c of out) chunks.push(c);
+  })();
+  await writer.close();
+  await collect;
+  let total = 0;
+  for (const c of chunks) total += c.byteLength;
+  const bytes = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    bytes.set(c, off);
+    off += c.byteLength;
+  }
+  return bytes;
+}
+
+describe('importFromCar — multi-root rejection (FIX 1, spec §5.2 #1)', () => {
+  it('CAR with 2 roots → INVALID_PACKAGE', async () => {
+    // Two minimal arbitrary CIDs as roots.
+    const bytesA = dagCborEncode({ a: 1 });
+    const bytesB = dagCborEncode({ b: 2 });
+    const cidA = CID.createV1(DAG_CBOR_CODE_TEST, makeSha256Digest(nobleSha256(bytesA)));
+    const cidB = CID.createV1(DAG_CBOR_CODE_TEST, makeSha256Digest(nobleSha256(bytesB)));
+
+    const { writer, out } = CarWriter.create([cidA, cidB]);
+    const collectPromise = (async () => {
+      const chunks: Uint8Array[] = [];
+      for await (const c of out) chunks.push(c);
+      return chunks;
+    })();
+    await writer.put({ cid: cidA, bytes: bytesA });
+    await writer.put({ cid: cidB, bytes: bytesB });
+    await writer.close();
+    const chunks = await collectPromise;
+    let total = 0;
+    for (const c of chunks) total += c.byteLength;
+    const car = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) {
+      car.set(c, off);
+      off += c.byteLength;
+    }
+
+    let err: any;
+    try {
+      await importFromCar(car);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('INVALID_PACKAGE');
+    expect(String(err.message)).toMatch(/Multi-root CAR rejected/);
+  });
+
+  it('UxfPackage.fromCar rejects multi-root CAR with INVALID_PACKAGE', async () => {
+    const { UxfPackage } = await import('../../../uxf/UxfPackage.js');
+    const bytesA = dagCborEncode({ a: 1 });
+    const bytesB = dagCborEncode({ b: 2 });
+    const cidA = CID.createV1(DAG_CBOR_CODE_TEST, makeSha256Digest(nobleSha256(bytesA)));
+    const cidB = CID.createV1(DAG_CBOR_CODE_TEST, makeSha256Digest(nobleSha256(bytesB)));
+    const { writer, out } = CarWriter.create([cidA, cidB]);
+    const collectPromise = (async () => {
+      const chunks: Uint8Array[] = [];
+      for await (const c of out) chunks.push(c);
+      return chunks;
+    })();
+    await writer.put({ cid: cidA, bytes: bytesA });
+    await writer.put({ cid: cidB, bytes: bytesB });
+    await writer.close();
+    const chunks = await collectPromise;
+    let total = 0;
+    for (const c of chunks) total += c.byteLength;
+    const car = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) {
+      car.set(c, off);
+      off += c.byteLength;
+    }
+    let err: any;
+    try {
+      await UxfPackage.fromCar(car);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('INVALID_PACKAGE');
+  });
+});
+
+describe('importFromCar — envelope+manifest block hash verification (FIX 2)', () => {
+  it('envelope CID with mismatching bytes throws VERIFICATION_FAILED', async () => {
+    // Build a CAR where envelope CID claims one digest but the bytes
+    // we actually write hash to a different value.
+    const realEnvelopeBytes = dagCborEncode({
+      version: '1.0.0',
+      createdAt: 1,
+      updatedAt: 1,
+      manifest: CID.createV1(DAG_CBOR_CODE_TEST, makeSha256Digest(nobleSha256(dagCborEncode({ tokens: {} })))),
+    });
+    // Use a CID derived from DIFFERENT bytes
+    const fakeBytes = dagCborEncode({ different: 'content' });
+    const fakeCid = CID.createV1(DAG_CBOR_CODE_TEST, makeSha256Digest(nobleSha256(fakeBytes)));
+
+    const { writer, out } = CarWriter.create([fakeCid]);
+    const collectPromise = (async () => {
+      const chunks: Uint8Array[] = [];
+      for await (const c of out) chunks.push(c);
+      return chunks;
+    })();
+    // Write envelope under the FAKE cid but with REAL bytes (mismatch).
+    await writer.put({ cid: fakeCid, bytes: realEnvelopeBytes });
+    await writer.close();
+    const chunks = await collectPromise;
+    let total = 0;
+    for (const c of chunks) total += c.byteLength;
+    const car = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) {
+      car.set(c, off);
+      off += c.byteLength;
+    }
+
+    let err: any;
+    try {
+      await importFromCar(car);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('VERIFICATION_FAILED');
+    expect(String(err.message)).toMatch(/Envelope block hash does not match its CID/);
+  });
+
+  it('manifest CID with mismatching bytes throws VERIFICATION_FAILED', async () => {
+    // The manifest CID is referenced from the envelope, but the bytes
+    // we put under that CID hash to something else.
+    const fakeManifestBytes = dagCborEncode({ tokens: {} });
+    const fakeManifestCid = CID.createV1(DAG_CBOR_CODE_TEST, makeSha256Digest(nobleSha256(dagCborEncode({ different: 1 }))));
+
+    const envelopeNode = {
+      version: '1.0.0',
+      createdAt: 1,
+      updatedAt: 1,
+      manifest: fakeManifestCid,
+    };
+    const envelopeBytes = dagCborEncode(envelopeNode);
+    const envelopeCid = CID.createV1(DAG_CBOR_CODE_TEST, makeSha256Digest(nobleSha256(envelopeBytes)));
+
+    const { writer, out } = CarWriter.create([envelopeCid]);
+    const collectPromise = (async () => {
+      const chunks: Uint8Array[] = [];
+      for await (const c of out) chunks.push(c);
+      return chunks;
+    })();
+    await writer.put({ cid: envelopeCid, bytes: envelopeBytes });
+    // Manifest bytes don't hash to fakeManifestCid
+    await writer.put({ cid: fakeManifestCid, bytes: fakeManifestBytes });
+    await writer.close();
+    const chunks = await collectPromise;
+    let total = 0;
+    for (const c of chunks) total += c.byteLength;
+    const car = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) {
+      car.set(c, off);
+      off += c.byteLength;
+    }
+
+    let err: any;
+    try {
+      await importFromCar(car);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('VERIFICATION_FAILED');
+    expect(String(err.message)).toMatch(/Manifest block hash does not match its CID/);
+  });
+});
+
+describe('exportToCar / importFromCar — predecessor BFS walk (FIX 3)', () => {
+  it('predecessor element survives CAR round-trip', async () => {
+    // Build a token, then construct an instance chain by adding a
+    // synthetic successor element whose `header.predecessor` points at
+    // the original root hash. The package's manifest references the
+    // SUCCESSOR root (head), so the BFS walk MUST follow predecessor
+    // back to include the original.
+    const pkg = buildPackageFromToken(makeValidToken('a1'));
+    const origRootHash = Array.from(pkg.manifest.tokens.values())[0]!;
+    const origRootEl = pkg.pool.get(origRootHash)!;
+
+    // Synthesize a successor TokenRoot element that links to origRoot
+    // via predecessor. Hash & insert into pool.
+    const successor: UxfElement = {
+      header: {
+        representation: origRootEl.header.representation,
+        semantics: origRootEl.header.semantics,
+        kind: origRootEl.header.kind,
+        predecessor: origRootHash,
+      },
+      type: origRootEl.type,
+      content: origRootEl.content,
+      children: origRootEl.children,
+    };
+    const successorHash = computeElementHash(successor);
+    pkg.pool.set(successorHash, successor);
+
+    // Repoint manifest at the successor — this is the head.
+    const tokenId = Array.from(pkg.manifest.tokens.keys())[0]!;
+    pkg.manifest.tokens.set(tokenId, successorHash);
+
+    const car = await exportToCar(pkg);
+    const restored = await importFromCar(car);
+
+    // The predecessor (original root) MUST be present in the restored
+    // pool for instance-chain materialisation to work.
+    expect(restored.pool.has(origRootHash)).toBe(true);
+    expect(restored.pool.has(successorHash)).toBe(true);
+  });
+});
+
+describe('importFromCar — pre-parse byte cap (FIX 5)', () => {
+  it('CAR larger than CAR_IMPORT_MAX_TOTAL_BYTES (64 MiB) is rejected before parse', async () => {
+    // Allocating a 64 MiB Uint8Array filled with zeros — the cap MUST
+    // fire purely on byteLength, not on parse success.
+    const oversize = new Uint8Array(64 * 1024 * 1024 + 1);
+    let err: any;
+    try {
+      await importFromCar(oversize);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('LIMIT_EXCEEDED');
+    expect(String(err.message)).toMatch(/CAR exceeds max bytes/);
+  });
+});
+
+describe('importFromCar — manifest tokenId validation (FIX 6)', () => {
+  async function buildCarWithManifest(manifestTokens: Record<string, CID>): Promise<Uint8Array> {
+    const manifestNode = { tokens: manifestTokens };
+    const manifestBytes = dagCborEncode(manifestNode);
+    const manifestCid = CID.createV1(DAG_CBOR_CODE_TEST, makeSha256Digest(nobleSha256(manifestBytes)));
+    const envelopeNode = {
+      version: '1.0.0',
+      createdAt: 1,
+      updatedAt: 1,
+      manifest: manifestCid,
+    };
+    const envelopeBytes = dagCborEncode(envelopeNode);
+    const envelopeCid = CID.createV1(DAG_CBOR_CODE_TEST, makeSha256Digest(nobleSha256(envelopeBytes)));
+    const { writer, out } = CarWriter.create([envelopeCid]);
+    const collectPromise = (async () => {
+      const chunks: Uint8Array[] = [];
+      for await (const c of out) chunks.push(c);
+      return chunks;
+    })();
+    await writer.put({ cid: envelopeCid, bytes: envelopeBytes });
+    await writer.put({ cid: manifestCid, bytes: manifestBytes });
+    await writer.close();
+    const chunks = await collectPromise;
+    let total = 0;
+    for (const c of chunks) total += c.byteLength;
+    const car = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) {
+      car.set(c, off);
+      off += c.byteLength;
+    }
+    return car;
+  }
+
+  it('manifest with __proto__ key is rejected', async () => {
+    const fakeCid = CID.createV1(DAG_CBOR_CODE_TEST, makeSha256Digest(new Uint8Array(32)));
+    const car = await buildCarWithManifest({ __proto__: fakeCid } as any);
+    let err: any;
+    try {
+      await importFromCar(car);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('SERIALIZATION_ERROR');
+    expect(String(err.message)).toMatch(/Invalid manifest tokenId/);
+  });
+
+  it('manifest with empty-string key is rejected', async () => {
+    const fakeCid = CID.createV1(DAG_CBOR_CODE_TEST, makeSha256Digest(new Uint8Array(32)));
+    const car = await buildCarWithManifest({ '': fakeCid });
+    let err: any;
+    try {
+      await importFromCar(car);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('SERIALIZATION_ERROR');
+  });
+
+  it('manifest with 63-char hex key is rejected', async () => {
+    const fakeCid = CID.createV1(DAG_CBOR_CODE_TEST, makeSha256Digest(new Uint8Array(32)));
+    const car = await buildCarWithManifest({ ['ab'.repeat(31) + 'a']: fakeCid });
+    let err: any;
+    try {
+      await importFromCar(car);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('SERIALIZATION_ERROR');
+  });
+
+  it('manifest with 65-char hex key is rejected', async () => {
+    const fakeCid = CID.createV1(DAG_CBOR_CODE_TEST, makeSha256Digest(new Uint8Array(32)));
+    const car = await buildCarWithManifest({ ['ab'.repeat(32) + 'cd']: fakeCid });
+    let err: any;
+    try {
+      await importFromCar(car);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('SERIALIZATION_ERROR');
+  });
+
+  it('manifest with non-hex unicode key is rejected', async () => {
+    const fakeCid = CID.createV1(DAG_CBOR_CODE_TEST, makeSha256Digest(new Uint8Array(32)));
+    const key = 'zz'.repeat(32);
+    const car = await buildCarWithManifest({ [key]: fakeCid });
+    let err: any;
+    try {
+      await importFromCar(car);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('SERIALIZATION_ERROR');
+  });
+});
+
+describe('importFromCar — runtime envelope type guards (FIX 12)', () => {
+  async function buildCarWithEnvelope(envelopeNode: Record<string, unknown>): Promise<Uint8Array> {
+    const manifestNode = { tokens: {} };
+    const manifestBytes = dagCborEncode(manifestNode);
+    const manifestCid = CID.createV1(DAG_CBOR_CODE_TEST, makeSha256Digest(nobleSha256(manifestBytes)));
+    const fullEnvelope = { ...envelopeNode, manifest: manifestCid };
+    const envelopeBytes = dagCborEncode(fullEnvelope);
+    const envelopeCid = CID.createV1(DAG_CBOR_CODE_TEST, makeSha256Digest(nobleSha256(envelopeBytes)));
+    const { writer, out } = CarWriter.create([envelopeCid]);
+    const collectPromise = (async () => {
+      const chunks: Uint8Array[] = [];
+      for await (const c of out) chunks.push(c);
+      return chunks;
+    })();
+    await writer.put({ cid: envelopeCid, bytes: envelopeBytes });
+    await writer.put({ cid: manifestCid, bytes: manifestBytes });
+    await writer.close();
+    const chunks = await collectPromise;
+    let total = 0;
+    for (const c of chunks) total += c.byteLength;
+    const car = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) {
+      car.set(c, off);
+      off += c.byteLength;
+    }
+    return car;
+  }
+
+  it('envelope.version: 42 (number not string) → SERIALIZATION_ERROR', async () => {
+    const car = await buildCarWithEnvelope({
+      version: 42,
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    let err: any;
+    try {
+      await importFromCar(car);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('SERIALIZATION_ERROR');
+    expect(String(err.message)).toMatch(/Envelope\.version must be a string/);
+  });
+
+  it('envelope.createdAt: "abc" (string not number) → SERIALIZATION_ERROR', async () => {
+    const car = await buildCarWithEnvelope({
+      version: '1.0.0',
+      createdAt: 'abc',
+      updatedAt: 1,
+    });
+    let err: any;
+    try {
+      await importFromCar(car);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('SERIALIZATION_ERROR');
+    expect(String(err.message)).toMatch(/Envelope\.createdAt must be a finite number/);
+  });
+
+  it('manifest value not a CID → SERIALIZATION_ERROR', async () => {
+    // Build a manifest whose token entry is a string instead of a CID.
+    // Place the malformed manifest bytes under the correct hash so the
+    // hash-check passes and we exercise the cidToContentHash guard.
+    const manifestNode = { tokens: { ['ab'.repeat(32)]: 'not-a-cid' as any } };
+    const manifestBytes = dagCborEncode(manifestNode);
+    const manifestCid = CID.createV1(DAG_CBOR_CODE_TEST, makeSha256Digest(nobleSha256(manifestBytes)));
+    const envelopeNode = {
+      version: '1.0.0',
+      createdAt: 1,
+      updatedAt: 1,
+      manifest: manifestCid,
+    };
+    const envelopeBytes = dagCborEncode(envelopeNode);
+    const envelopeCid = CID.createV1(DAG_CBOR_CODE_TEST, makeSha256Digest(nobleSha256(envelopeBytes)));
+    const { writer, out } = CarWriter.create([envelopeCid]);
+    const collectPromise = (async () => {
+      const chunks: Uint8Array[] = [];
+      for await (const c of out) chunks.push(c);
+      return chunks;
+    })();
+    await writer.put({ cid: envelopeCid, bytes: envelopeBytes });
+    await writer.put({ cid: manifestCid, bytes: manifestBytes });
+    await writer.close();
+    const chunks = await collectPromise;
+    let total = 0;
+    for (const c of chunks) total += c.byteLength;
+    const car = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) {
+      car.set(c, off);
+      off += c.byteLength;
+    }
+    let err: any;
+    try {
+      await importFromCar(car);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('SERIALIZATION_ERROR');
+    expect(String(err.message)).toMatch(/is not a CID/);
   });
 });

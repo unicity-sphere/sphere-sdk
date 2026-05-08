@@ -48,6 +48,8 @@ import { create as createDigest } from 'multiformats/hashes/digest';
 
 import { SphereError } from '../../../core/errors';
 import { extractCarRootCid } from '../../../uxf/transfer-payload';
+import { UxfPackage } from '../../../uxf/UxfPackage';
+import { importFromCar } from '../../../uxf/ipld';
 
 // =============================================================================
 // Adversarial CAR construction
@@ -205,4 +207,47 @@ describe('§5.2 #1 — multi-root CAR smuggling is rejected', () => {
 
   // Suppress unused-variable warning for the helper.
   void buildCid;
+});
+
+// =============================================================================
+// FIX 1 — UxfPackage.fromCar / importFromCar must mirror the multi-root gate.
+// Without this, a hostile sender that bypasses extractCarRootCid (e.g. a
+// caller that goes directly to UxfPackage.fromCar) would land the smuggled
+// roots in pool. The receiver-side gate is independent of the bundleCid
+// pre-flight check and must hold on its own.
+// =============================================================================
+
+describe('§5.2 #1 — UxfPackage.fromCar / importFromCar reject multi-root CARs', () => {
+  it('importFromCar with 2 roots → INVALID_PACKAGE (Multi-root CAR rejected)', async () => {
+    const carBytes = await buildAdversarialMultiRootCar([
+      new Uint8Array([0xde, 0xad]),
+      new Uint8Array([0xbe, 0xef]),
+    ]);
+    let err: any;
+    try {
+      await importFromCar(carBytes);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('INVALID_PACKAGE');
+    expect(String(err.message)).toMatch(/Multi-root CAR rejected/);
+  });
+
+  it('UxfPackage.fromCar with 3 roots → INVALID_PACKAGE', async () => {
+    const carBytes = await buildAdversarialMultiRootCar([
+      new Uint8Array([0x01]),
+      new Uint8Array([0x02]),
+      new Uint8Array([0x03]),
+    ]);
+    let err: any;
+    try {
+      await UxfPackage.fromCar(carBytes);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect(err.code).toBe('INVALID_PACKAGE');
+    expect(String(err.message)).toMatch(/Multi-root CAR rejected/);
+  });
 });

@@ -13,6 +13,8 @@ export type UxfErrorCode =
   | 'VERIFICATION_FAILED'
   | 'CYCLE_DETECTED'
   | 'INVALID_PACKAGE'
+  | 'INVALID_INPUT'
+  | 'LIMIT_EXCEEDED'
   | 'NOT_IMPLEMENTED';
 
 /**

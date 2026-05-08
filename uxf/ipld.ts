@@ -45,6 +45,8 @@ import {
 import {
   CAR_IMPORT_MAX_BLOCK_COUNT,
   CAR_IMPORT_MAX_BLOCK_BYTES,
+  CAR_IMPORT_MAX_TOTAL_BYTES,
+  MANIFEST_MAX_SIZE,
 } from './limits.js';
 
 // ---------------------------------------------------------------------------
@@ -330,6 +332,16 @@ async function writeBfs(
         queue.push(childRef as ContentHash);
       }
     }
+
+    // Steelman remediation: also enqueue the predecessor link (instance
+    // chain). `rebuildInstanceChains` (importFromCar) walks
+    // `element.header.predecessor` to materialise instance chains;
+    // without enqueuing it here, the predecessor block can be missing
+    // from the CAR and the chain breaks on the receiver. The `written`
+    // set keeps shared elements (and chain prefixes) deduped.
+    if (element.header.predecessor !== null) {
+      queue.push(element.header.predecessor);
+    }
   }
 }
 
@@ -349,11 +361,33 @@ async function writeBfs(
  * @throws UxfError on invalid CAR structure.
  */
 export async function importFromCar(car: Uint8Array): Promise<UxfPackageData> {
+  // Steelman remediation: pre-parse byte cap. `CarReader.fromBytes(car)`
+  // parses the entire CAR up-front (allocates an internal block index
+  // over `car.byteLength` bytes) BEFORE the per-block cap loop fires.
+  // A multi-GiB hostile CAR would otherwise burn memory + CPU on the
+  // initial parse pass even if every individual block were tiny.
+  if (car.byteLength > CAR_IMPORT_MAX_TOTAL_BYTES) {
+    throw new UxfError(
+      'LIMIT_EXCEEDED',
+      `CAR exceeds max bytes: ${car.byteLength} > ${CAR_IMPORT_MAX_TOTAL_BYTES}`,
+    );
+  }
+
   const reader = await CarReader.fromBytes(car);
 
   const roots = await reader.getRoots();
   if (roots.length === 0) {
     throw new UxfError('INVALID_PACKAGE', 'CAR file has no root CID');
+  }
+  // Steelman remediation: per SPEC §5.2 #1, multi-root CARs MUST be
+  // rejected at every entry point. The previous implementation
+  // silently kept `roots[0]` and discarded the rest, allowing a
+  // hostile sender to smuggle extra DAGs alongside the manifest root.
+  if (roots.length !== 1) {
+    throw new UxfError(
+      'INVALID_PACKAGE',
+      `Multi-root CAR rejected (received ${roots.length} roots)`,
+    );
   }
 
   const envelopeCid = roots[0];
@@ -366,6 +400,12 @@ export async function importFromCar(car: Uint8Array): Promise<UxfPackageData> {
       'Envelope block not found in CAR',
     );
   }
+  // Steelman remediation: verify the envelope block bytes hash to the
+  // digest claimed by the envelope CID. CarReader.get returns blocks
+  // keyed by CID without re-hashing — a hostile CAR can place arbitrary
+  // bytes under a chosen CID. Pool elements ARE re-hashed below; the
+  // envelope and manifest blocks were the gap.
+  assertBlockHashMatchesCid(envelopeBlock.bytes, envelopeCid, 'Envelope');
   const envelopeNode = dagCborDecode(envelopeBlock.bytes) as Record<
     string,
     unknown
@@ -380,11 +420,52 @@ export async function importFromCar(car: Uint8Array): Promise<UxfPackageData> {
     );
   }
 
+  // Steelman remediation: explicit runtime type guards on envelope
+  // fields. The `as string` / `as number` casts are compile-time only
+  // and silently lie when CBOR-decoded bytes are anything other than
+  // their nominal type (e.g. `version: 42`, `createdAt: "abc"`).
+  const envVersion = envelopeNode.version;
+  if (typeof envVersion !== 'string') {
+    throw new UxfError(
+      'SERIALIZATION_ERROR',
+      `Envelope.version must be a string, got ${typeof envVersion}`,
+    );
+  }
+  const envCreatedAt = envelopeNode.createdAt;
+  if (typeof envCreatedAt !== 'number' || !Number.isFinite(envCreatedAt)) {
+    throw new UxfError(
+      'SERIALIZATION_ERROR',
+      `Envelope.createdAt must be a finite number, got ${typeof envCreatedAt}`,
+    );
+  }
+  const envUpdatedAt = envelopeNode.updatedAt;
+  if (typeof envUpdatedAt !== 'number' || !Number.isFinite(envUpdatedAt)) {
+    throw new UxfError(
+      'SERIALIZATION_ERROR',
+      `Envelope.updatedAt must be a finite number, got ${typeof envUpdatedAt}`,
+    );
+  }
+  if (envelopeNode.creator !== undefined && typeof envelopeNode.creator !== 'string') {
+    throw new UxfError(
+      'SERIALIZATION_ERROR',
+      `Envelope.creator must be a string or undefined, got ${typeof envelopeNode.creator}`,
+    );
+  }
+  if (
+    envelopeNode.description !== undefined &&
+    typeof envelopeNode.description !== 'string'
+  ) {
+    throw new UxfError(
+      'SERIALIZATION_ERROR',
+      `Envelope.description must be a string or undefined, got ${typeof envelopeNode.description}`,
+    );
+  }
+
   // Build envelope
   const envelope: UxfEnvelope = {
-    version: envelopeNode.version as string,
-    createdAt: envelopeNode.createdAt as number,
-    updatedAt: envelopeNode.updatedAt as number,
+    version: envVersion,
+    createdAt: envCreatedAt,
+    updatedAt: envUpdatedAt,
     ...(envelopeNode.creator !== undefined
       ? { creator: envelopeNode.creator as string }
       : {}),
@@ -401,14 +482,40 @@ export async function importFromCar(car: Uint8Array): Promise<UxfPackageData> {
       'Manifest block not found in CAR',
     );
   }
+  // Steelman remediation: verify manifest block bytes match the
+  // claimed CID digest (same threat model as envelope above).
+  assertBlockHashMatchesCid(manifestBlock.bytes, manifestCid, 'Manifest');
   const manifestNode = dagCborDecode(manifestBlock.bytes) as {
     tokens: Record<string, CID>;
   };
 
-  // Build manifest: CID values -> ContentHash
+  // Build manifest: CID values -> ContentHash. Validate each tokenId
+  // against the canonical 64-char-hex regex BEFORE inserting; reject
+  // hostile keys (`__proto__`, empty, non-hex unicode, wrong length).
+  // The deconstruct.ts ingest path (line 213) already enforces this
+  // shape; deserializers must mirror that gate.
+  const manifestEntries = Object.entries(manifestNode.tokens);
+  if (manifestEntries.length > MANIFEST_MAX_SIZE) {
+    throw new UxfError(
+      'LIMIT_EXCEEDED',
+      `Manifest entry count exceeds MANIFEST_MAX_SIZE=${MANIFEST_MAX_SIZE}: ${manifestEntries.length}`,
+    );
+  }
   const tokens = new Map<string, ContentHash>();
-  for (const [tokenId, cid] of Object.entries(manifestNode.tokens)) {
-    tokens.set(tokenId, cidToContentHash(cid as CID));
+  for (const [tokenId, cid] of manifestEntries) {
+    if (!/^[0-9a-f]{64}$/.test(tokenId)) {
+      throw new UxfError(
+        'SERIALIZATION_ERROR',
+        `Invalid manifest tokenId: ${tokenId.slice(0, 32)}…`,
+      );
+    }
+    if (!(cid instanceof CID)) {
+      throw new UxfError(
+        'SERIALIZATION_ERROR',
+        `Manifest value for tokenId ${tokenId} is not a CID`,
+      );
+    }
+    tokens.set(tokenId, cidToContentHash(cid));
   }
   const manifest: UxfManifest = { tokens };
 
@@ -867,6 +974,40 @@ function createSha256Digest(
  */
 function sha256Sync(data: Uint8Array): Uint8Array {
   return nobleSha256(data);
+}
+
+/**
+ * Verify that the SHA-256 of `bytes` equals the digest claimed by `cid`.
+ *
+ * Steelman remediation: CarReader stores blocks keyed by CID but does
+ * NOT re-hash on read. A hostile CAR can place arbitrary bytes under
+ * any chosen CID — without re-hash verification, the envelope and
+ * manifest blocks are trusted blindly while every pool element IS
+ * re-hashed (importFromCar:482).
+ *
+ * Throws `VERIFICATION_FAILED` on mismatch.
+ */
+function assertBlockHashMatchesCid(
+  bytes: Uint8Array,
+  cid: CID,
+  label: string,
+): void {
+  const computed = sha256Sync(bytes);
+  const claimed = cid.multihash.digest;
+  if (computed.length !== claimed.length) {
+    throw new UxfError(
+      'VERIFICATION_FAILED',
+      `${label} block hash does not match its CID (length mismatch: ${computed.length} vs ${claimed.length})`,
+    );
+  }
+  for (let i = 0; i < computed.length; i++) {
+    if (computed[i] !== claimed[i]) {
+      throw new UxfError(
+        'VERIFICATION_FAILED',
+        `${label} block hash does not match its CID`,
+      );
+    }
+  }
 }
 
 /** Convert Uint8Array to lowercase hex string. */
