@@ -1473,6 +1473,186 @@ describe('FinalizationWorkerRecipient — cascadeTombstones bounded LRU (Round 3
   });
 });
 
+// =============================================================================
+// Round 5 FIX 4 — start()/stop()/start() race elimination via state machine
+// =============================================================================
+//
+// Pre-Round-5 the lifecycle was tracked by two booleans (`running` +
+// `stopRequested`). A tight `start() → stop() → start()` sequence
+// could observe `running === true` (because `stop()` had set
+// `stopRequested = true` but had not yet cleared `running`) and
+// silently no-op the second `start()`, leaving the worker dead.
+//
+// Fix: explicit four-state machine `'idle' | 'starting' | 'running'
+// | 'stopping'`. start() during 'stopping' awaits the in-flight stop
+// and proceeds.
+
+describe('FinalizationWorkerRecipient — Round 5 FIX 4: start/stop/start lifecycle', () => {
+  it('start → stop → start in tight succession resumes the worker', async () => {
+    const harness = buildWorker({ sleepFn: async () => undefined });
+    expect(harness.worker.isRunning()).toBe(false);
+
+    // Cycle 1.
+    harness.worker.start();
+    expect(harness.worker.isRunning()).toBe(true);
+    await harness.worker.stop();
+    expect(harness.worker.isRunning()).toBe(false);
+
+    // Cycle 2 — the second start() MUST actually run, not silently
+    // no-op.
+    harness.worker.start();
+    expect(harness.worker.isRunning()).toBe(true);
+
+    // Cleanup.
+    await harness.worker.stop();
+    expect(harness.worker.isRunning()).toBe(false);
+  });
+
+  it('start() called during in-flight stop() awaits the stop and resumes', async () => {
+    const harness = buildWorker({ sleepFn: async () => undefined });
+    harness.worker.start();
+    expect(harness.worker.isRunning()).toBe(true);
+
+    // Kick stop() WITHOUT awaiting — its inflight async task is now
+    // pending. Immediately call start(). The state machine must
+    // observe 'stopping' and chain a deferred re-start.
+    const stopPromise = harness.worker.stop();
+    harness.worker.start();
+    await stopPromise;
+
+    // After the stop completes, the deferred re-start should run.
+    // Yield enough microtasks for the .then() chain to fire.
+    for (let i = 0; i < 16; i++) await Promise.resolve();
+
+    expect(harness.worker.isRunning()).toBe(true);
+    await harness.worker.stop();
+  });
+
+  it('two concurrent stop() calls coalesce onto a single in-flight stop', async () => {
+    const harness = buildWorker({ sleepFn: async () => undefined });
+    harness.worker.start();
+
+    const a = harness.worker.stop();
+    const b = harness.worker.stop();
+    await Promise.all([a, b]);
+
+    expect(harness.worker.isRunning()).toBe(false);
+  });
+
+  it('stop() from idle is a no-op (does not throw)', async () => {
+    const harness = buildWorker({ sleepFn: async () => undefined });
+    expect(harness.worker.isRunning()).toBe(false);
+    await expect(harness.worker.stop()).resolves.toBeUndefined();
+  });
+});
+
+// =============================================================================
+// Round 5 FIX 6 — cascade tombstone steady-state eviction periodic alert
+// =============================================================================
+//
+// Pre-Round-5 the high-watermark alert fired ONCE on initial crossing
+// (debounced). Once at the hard cap, every new insert evicted the
+// oldest entry — but no operator-alert fired, so operators had no
+// signal that proofs may now leak into evicted-tombstone tokens.
+//
+// Fix: emit a "steady-state eviction" alert at most once per
+// CASCADE_TOMBSTONE_EVICTION_ALERT_INTERVAL_MS (1 hour) when eviction
+// occurs.
+
+describe('FinalizationWorkerRecipient — Round 5 FIX 6: cascade-tombstone steady-state eviction alert', () => {
+  it('first eviction past hard cap fires CASCADE_TOMBSTONE_STEADY_STATE_EVICTION alert', async () => {
+    const harness = buildWorker();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const w = harness.worker as any;
+
+    const HARD_CAP = 10000;
+    // Fill exactly to the cap — no eviction yet.
+    for (let i = 0; i < HARD_CAP; i++) {
+      w.insertCascadeTombstone(`tok-${i}`);
+    }
+    let evictionAlerts = harness.events.events.filter((e) => {
+      if (e.type !== 'transfer:operator-alert') return false;
+      const data = e.data as { message?: string };
+      return (
+        typeof data.message === 'string' &&
+        data.message.includes('CASCADE_TOMBSTONE_STEADY_STATE_EVICTION')
+      );
+    });
+    expect(evictionAlerts.length).toBe(0);
+
+    // Push past the cap — this triggers eviction, which must fire
+    // the steady-state alert.
+    w.insertCascadeTombstone(`tok-overflow-1`);
+    evictionAlerts = harness.events.events.filter((e) => {
+      if (e.type !== 'transfer:operator-alert') return false;
+      const data = e.data as { message?: string };
+      return (
+        typeof data.message === 'string' &&
+        data.message.includes('CASCADE_TOMBSTONE_STEADY_STATE_EVICTION')
+      );
+    });
+    expect(evictionAlerts.length).toBe(1);
+  });
+
+  it('subsequent evictions within the rate-limit interval do NOT re-emit', async () => {
+    const harness = buildWorker();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const w = harness.worker as any;
+
+    const HARD_CAP = 10000;
+    // Push past the cap by 1000 — should produce many evictions but
+    // only one alert (rate-limited).
+    for (let i = 0; i < HARD_CAP + 1000; i++) {
+      w.insertCascadeTombstone(`tok-${i}`);
+    }
+    const evictionAlerts = harness.events.events.filter((e) => {
+      if (e.type !== 'transfer:operator-alert') return false;
+      const data = e.data as { message?: string };
+      return (
+        typeof data.message === 'string' &&
+        data.message.includes('CASCADE_TOMBSTONE_STEADY_STATE_EVICTION')
+      );
+    });
+    expect(evictionAlerts.length).toBe(1);
+  });
+
+  it('after rate-limit interval elapses, a fresh eviction re-fires the alert', async () => {
+    const harness = buildWorker();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const w = harness.worker as any;
+
+    const HARD_CAP = 10000;
+    for (let i = 0; i < HARD_CAP + 1; i++) {
+      w.insertCascadeTombstone(`tok-${i}`);
+    }
+    let evictionAlerts = harness.events.events.filter((e) => {
+      if (e.type !== 'transfer:operator-alert') return false;
+      const data = e.data as { message?: string };
+      return (
+        typeof data.message === 'string' &&
+        data.message.includes('CASCADE_TOMBSTONE_STEADY_STATE_EVICTION')
+      );
+    });
+    expect(evictionAlerts.length).toBe(1);
+
+    // Simulate 2 hours passing (interval is 1 hour) by manipulating
+    // the private last-alert timestamp.
+    w.cascadeTombstoneLastEvictionAlertAt = Date.now() - 2 * 60 * 60 * 1000;
+
+    // Trigger another eviction.
+    w.insertCascadeTombstone(`tok-fresh-${HARD_CAP + 100}`);
+    evictionAlerts = harness.events.events.filter((e) => {
+      if (e.type !== 'transfer:operator-alert') return false;
+      const data = e.data as { message?: string };
+      return (
+        typeof data.message === 'string' &&
+        data.message.includes('CASCADE_TOMBSTONE_STEADY_STATE_EVICTION')
+      );
+    });
+    expect(evictionAlerts.length).toBe(2);
+  });
+});
+
 // Suppress unused-import warnings for this block.
 void RACE_TX_HASH;
 void makeFakePoolRead;

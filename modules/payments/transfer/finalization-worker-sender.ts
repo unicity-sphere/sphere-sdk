@@ -89,6 +89,7 @@ import type {
   UxfOutboxStatus,
 } from '../../../types/uxf-outbox';
 import { SphereError } from '../../../core/errors';
+import { sanitizeReasonString, safeErrorMessage } from '../../../core/error-sanitize';
 import type { TrustBaseStaleness } from './trustbase-staleness';
 import {
   attachProofUnderMutex,
@@ -456,6 +457,27 @@ export class FinalizationWorkerSender {
   private stopRequested = false;
   private loopPromise: Promise<void> | null = null;
   /**
+   * Round 5 fix (HIGH NEW) — explicit lifecycle state field. See
+   * recipient-side {@link FinalizationWorkerRecipient#lifecycleState}
+   * for full rationale. The four reachable states are
+   * `'idle' | 'starting' | 'running' | 'stopping'`. Pre-fix a tight
+   * `start() → stop() → start()` sequence could silently no-op the
+   * second `start()` because `running` was true and `stopRequested`
+   * was set but not yet cleared.
+   *
+   * @internal
+   */
+  private lifecycleState: 'idle' | 'starting' | 'running' | 'stopping' =
+    'idle';
+  /**
+   * Round 5 fix (HIGH NEW) — promise resolved when the in-flight
+   * `stop()` has fully cleared. Lets a concurrent `start()` await
+   * the stop and proceed without busy-wait.
+   *
+   * @internal
+   */
+  private stopInFlight: Promise<void> | null = null;
+  /**
    * Steelman fix (CRIT #10): internal AbortController so `stop()` can
    * IMMEDIATELY abort an in-flight cycle (long aggregator hang, sleep
    * loop) without waiting for the natural completion. Pre-fix, `stop()`
@@ -617,7 +639,28 @@ export class FinalizationWorkerSender {
    * with `worker aborted before submit` on the first iteration.
    */
   start(): void {
-    if (this.running) return;
+    // Round 5 fix (HIGH NEW) — lifecycle state machine. Mirror of
+    // recipient-worker logic. A tight `start() → stop() → start()`
+    // sequence pre-fix could have the second `start()` observe
+    // `running === true` (because `stop()` had set `stopRequested`
+    // but not yet cleared `running`) and silently no-op.
+    if (this.lifecycleState === 'running' || this.lifecycleState === 'starting') {
+      return;
+    }
+    if (this.lifecycleState === 'stopping') {
+      const inflight = this.stopInFlight;
+      if (inflight !== null) {
+        this.lifecycleState = 'starting';
+        void inflight.then(() => {
+          if (this.lifecycleState !== 'starting') return;
+          this.lifecycleState = 'idle';
+          this.start();
+        });
+        return;
+      }
+      this.lifecycleState = 'idle';
+    }
+    this.lifecycleState = 'running';
     this.running = true;
     this.stopRequested = false;
     // Round 3 regression fix: rebuild the internal controller so
@@ -638,17 +681,46 @@ export class FinalizationWorkerSender {
    * `stop()` returns within ~tens of ms instead of waiting for the
    * natural cycle completion (which could be the full polling window
    * for a hung aggregator).
+   *
+   * Round 5 fix (HIGH NEW) — concurrent stop() calls coalesce onto
+   * the in-flight stop's promise instead of double-stopping. Note:
+   * `stop()` ALWAYS aborts the internalController (even from `'idle'`)
+   * because callers may invoke `processOne()` directly without
+   * `start()` — those in-flight calls observe the abort signal via
+   * the same internalController and need stop() to interrupt them.
    */
   async stop(): Promise<void> {
+    if (this.lifecycleState === 'stopping' && this.stopInFlight !== null) {
+      await this.stopInFlight;
+      return;
+    }
+    // Always abort the internalController — even when state is
+    // 'idle' there may be in-flight processOne() callers observing
+    // this signal.
     this.stopRequested = true;
     if (!this.internalController.signal.aborted) {
       this.internalController.abort();
     }
-    if (this.loopPromise !== null) {
-      await this.loopPromise.catch(() => undefined);
-      this.loopPromise = null;
+    if (this.lifecycleState === 'idle') {
+      return;
     }
-    this.running = false;
+    this.lifecycleState = 'stopping';
+    const inflight = (async (): Promise<void> => {
+      try {
+        if (this.loopPromise !== null) {
+          await this.loopPromise.catch(() => undefined);
+          this.loopPromise = null;
+        }
+        this.running = false;
+      } finally {
+        if (this.lifecycleState === 'stopping') {
+          this.lifecycleState = 'idle';
+        }
+        this.stopInFlight = null;
+      }
+    })();
+    this.stopInFlight = inflight;
+    await inflight;
   }
 
   /**
@@ -1234,10 +1306,12 @@ export class FinalizationWorkerSender {
             // inside). A throw here is genuinely unexpected; emit a
             // forensic alert and continue with the next entry — the
             // loop is the safety net for crashes, not a perpetuator.
-            const msg = err instanceof Error ? err.message : String(err);
+            const msg = safeErrorMessage(err);
             this.options.emit('transfer:operator-alert', {
               code: 'structural',
-              message: `FinalizationWorkerSender.scanLoop: processOne threw for outbox=${entry.id}: ${msg}`,
+              message: sanitizeReasonString(
+                `FinalizationWorkerSender.scanLoop: processOne threw for outbox=${entry.id}: ${msg}`,
+              ),
             });
           }
         }
@@ -1247,12 +1321,13 @@ export class FinalizationWorkerSender {
         // at power-of-two boundaries. Reset on next success.
         this.scanReadFailureStreak += 1;
         if (isPowerOfTwo(this.scanReadFailureStreak)) {
-          const msg = err instanceof Error ? err.message : String(err);
+          const msg = safeErrorMessage(err);
           this.options.emit('transfer:operator-alert', {
             code: 'structural',
-            message:
+            message: sanitizeReasonString(
               `FinalizationWorkerSender.scanLoop: readAllNew threw ` +
-              `(consecutive failures: ${this.scanReadFailureStreak}): ${msg}`,
+                `(consecutive failures: ${this.scanReadFailureStreak}): ${msg}`,
+            ),
           });
           // Wave 7 emit-if-emitted watermark.
           this.scanReadFailureEmittedAtStreak = this.scanReadFailureStreak;

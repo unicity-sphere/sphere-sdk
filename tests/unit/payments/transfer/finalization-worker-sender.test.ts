@@ -768,6 +768,67 @@ describe('FinalizationWorkerSender — start/stop lifecycle', () => {
 });
 
 // =============================================================================
+// Round 5 FIX 4 — start()/stop()/start() race elimination
+// =============================================================================
+//
+// Pre-Round-5 a tight `start() → stop() → start()` could observe
+// running === true (because stop() set stopRequested but had not yet
+// cleared running) and silently no-op the second start(), leaving
+// the worker dead.
+
+describe('FinalizationWorkerSender — Round 5 FIX 4: start/stop/start lifecycle', () => {
+  // No fake timers here — we want real microtask scheduling for the
+  // deferred-restart path.
+  it('start → stop → start in tight succession resumes the worker', async () => {
+    const h = buildWorker();
+    expect(h.worker.isRunning()).toBe(false);
+
+    // Cycle 1.
+    h.worker.start();
+    expect(h.worker.isRunning()).toBe(true);
+    await h.worker.stop();
+    expect(h.worker.isRunning()).toBe(false);
+
+    // Cycle 2 — the second start() MUST actually run, not silently
+    // no-op.
+    h.worker.start();
+    expect(h.worker.isRunning()).toBe(true);
+
+    await h.worker.stop();
+    expect(h.worker.isRunning()).toBe(false);
+  });
+
+  it('start() called during in-flight stop() awaits the stop and resumes', async () => {
+    const h = buildWorker();
+    h.worker.start();
+    expect(h.worker.isRunning()).toBe(true);
+
+    const stopPromise = h.worker.stop();
+    h.worker.start();
+    await stopPromise;
+    for (let i = 0; i < 16; i++) await Promise.resolve();
+
+    expect(h.worker.isRunning()).toBe(true);
+    await h.worker.stop();
+  });
+
+  it('two concurrent stop() calls coalesce', async () => {
+    const h = buildWorker();
+    h.worker.start();
+    const a = h.worker.stop();
+    const b = h.worker.stop();
+    await Promise.all([a, b]);
+    expect(h.worker.isRunning()).toBe(false);
+  });
+
+  it('stop() from idle is a no-op', async () => {
+    const h = buildWorker();
+    expect(h.worker.isRunning()).toBe(false);
+    await expect(h.worker.stop()).resolves.toBeUndefined();
+  });
+});
+
+// =============================================================================
 // 12. Already-terminal entries
 // =============================================================================
 

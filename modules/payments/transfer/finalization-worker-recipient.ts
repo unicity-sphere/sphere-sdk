@@ -129,6 +129,7 @@ import type {
   SphereEventType,
 } from '../../../types';
 import { SphereError } from '../../../core/errors';
+import { sanitizeReasonString, safeErrorMessage } from '../../../core/error-sanitize';
 import type { TrustBaseStaleness } from './trustbase-staleness';
 
 // Re-export the shared adapter types for caller convenience. The
@@ -195,6 +196,20 @@ export const CASCADE_TOMBSTONE_HARD_CAP = 10000;
  * @internal
  */
 export const CASCADE_TOMBSTONE_HIGH_WATERMARK = 8000;
+
+/**
+ * Round 5 fix (HIGH GAP) — minimum interval between consecutive
+ * "steady-state eviction" operator alerts. Once the cascade-tombstone
+ * set is at the hard cap, every new insert evicts the oldest entry —
+ * we emit an alert at most once per this interval so operators see a
+ * continuous signal of the saturated state without flooding.
+ *
+ * Default 1 hour. The high-watermark alert is a one-shot signal
+ * fired on initial crossing; this is the steady-state companion.
+ *
+ * @internal
+ */
+export const CASCADE_TOMBSTONE_EVICTION_ALERT_INTERVAL_MS = 60 * 60 * 1000;
 
 /**
  * Power-of-two helper for the exponential alert backoff.
@@ -495,6 +510,39 @@ export class FinalizationWorkerRecipient {
   private stopRequested = false;
   private loopPromise: Promise<void> | null = null;
   /**
+   * Round 5 fix (HIGH NEW) — explicit lifecycle state field. Pre-fix
+   * the lifecycle was tracked by two booleans (`running` +
+   * `stopRequested`); a tight `start() → stop() → start()` sequence
+   * could have the second `start()` observe `running === true`
+   * (because `stop()` had set `stopRequested = true` but had not yet
+   * cleared `running`) and silently no-op, leaving the worker
+   * permanently dead. The state field makes the four reachable
+   * lifecycle states explicit:
+   *
+   *   - `'idle'`     — never started, or fully stopped.
+   *   - `'starting'` — `start()` in flight (rare; field is set
+   *                    synchronously, but reserved for future async-
+   *                    start refactors).
+   *   - `'running'`  — `scanLoop()` is the active task.
+   *   - `'stopping'` — `stop()` aborted the controller and is
+   *                    awaiting `loopPromise`. A concurrent `start()`
+   *                    in this state MUST await the in-flight stop
+   *                    and then proceed.
+   *
+   * @internal
+   */
+  private lifecycleState: 'idle' | 'starting' | 'running' | 'stopping' =
+    'idle';
+  /**
+   * Round 5 fix (HIGH NEW) — promise resolved when the in-flight
+   * `stop()` has fully cleared. Lets a concurrent `start()` await
+   * the stop and proceed without busy-wait. Cleared back to `null`
+   * once the stop completes.
+   *
+   * @internal
+   */
+  private stopInFlight: Promise<void> | null = null;
+  /**
    * Steelman fix (CRIT #10): internal AbortController so `stop()` can
    * IMMEDIATELY abort an in-flight cycle (long aggregator hang, sleep
    * loop) without waiting for the natural completion. Pre-fix, `stop()`
@@ -574,6 +622,24 @@ export class FinalizationWorkerRecipient {
    * @internal
    */
   private cascadeTombstoneHighWatermarkAlerted = false;
+  /**
+   * Round 5 fix (HIGH GAP) — last wall-clock time the steady-state
+   * eviction alert fired. Once the cascade-tombstone set is at the
+   * hard cap and steady-state eviction kicks in, operators get NO
+   * signal that proofs may now leak into evicted-tombstone tokens
+   * (the high-watermark alert only fires once on initial crossing).
+   *
+   * We emit a periodic "steady-state eviction" alert at most once
+   * per {@link CASCADE_TOMBSTONE_EVICTION_ALERT_INTERVAL_MS} (default
+   * 1 hour) so operators see the eviction signal continuously while
+   * the set remains saturated, without flooding the channel.
+   *
+   * `0` means "never emitted" (so the first eviction fires the alert
+   * immediately).
+   *
+   * @internal
+   */
+  private cascadeTombstoneLastEvictionAlertAt = 0;
   /**
    * Wave 4 steelman: consecutive `queueStore.list()` failure counter
    * for exponential alert backoff. Same rationale as the sender
@@ -688,7 +754,38 @@ export class FinalizationWorkerRecipient {
    * rationale.
    */
   start(): void {
-    if (this.running) return;
+    // Round 5 fix (HIGH NEW) — lifecycle state machine. Pre-fix, a
+    // tight `start() → stop() → start()` sequence could have the
+    // second `start()` observe `running === true` (because `stop()`
+    // had set `stopRequested = true` but had not yet cleared
+    // `running`) and silently no-op, leaving the worker dead.
+    if (this.lifecycleState === 'running' || this.lifecycleState === 'starting') {
+      return; // already started — preserve idempotent semantics
+    }
+    if (this.lifecycleState === 'stopping') {
+      // Concurrent stop in flight — chain a deferred restart that
+      // awaits the in-flight stop, then re-enters start(). This
+      // preserves the synchronous `start(): void` signature for
+      // existing callers while guaranteeing the worker resumes.
+      const inflight = this.stopInFlight;
+      if (inflight !== null) {
+        // Mark as starting so a second concurrent start() coalesces
+        // onto the same continuation (no double-start).
+        this.lifecycleState = 'starting';
+        void inflight.then(() => {
+          // The stop has fully completed. If a stop() arrived while
+          // we were waiting, the latest desire wins — bail out.
+          if (this.lifecycleState !== 'starting') return;
+          this.lifecycleState = 'idle';
+          this.start();
+        });
+        return;
+      }
+      // Fallback: stopping flag set but no promise — clear and fall
+      // through to the start path.
+      this.lifecycleState = 'idle';
+    }
+    this.lifecycleState = 'running';
     this.running = true;
     this.stopRequested = false;
     // Round 3 regression fix: rebuild the internal controller so
@@ -706,17 +803,51 @@ export class FinalizationWorkerRecipient {
    * `aggregator.submit()` / sleep returns immediately (or rejects) and
    * `stop()` returns within ~tens of ms instead of waiting for the
    * natural cycle completion.
+   *
+   * Round 5 fix (HIGH NEW) — concurrent stop() calls coalesce onto
+   * the in-flight stop's promise instead of double-stopping. Note:
+   * `stop()` ALWAYS aborts the internalController (even from `'idle'`)
+   * because callers may invoke `processOneToken()` directly without
+   * `start()` — those in-flight calls observe the abort signal via
+   * the same internalController and need stop() to interrupt them.
    */
   async stop(): Promise<void> {
+    if (this.lifecycleState === 'stopping' && this.stopInFlight !== null) {
+      // Coalesce onto in-flight stop.
+      await this.stopInFlight;
+      return;
+    }
+    // Always abort the internalController — even when state is
+    // 'idle' there may be in-flight processOneToken() callers
+    // observing this signal.
     this.stopRequested = true;
     if (!this.internalController.signal.aborted) {
       this.internalController.abort();
     }
-    if (this.loopPromise !== null) {
-      await this.loopPromise.catch(() => undefined);
-      this.loopPromise = null;
+    if (this.lifecycleState === 'idle') {
+      // No scan loop; nothing further to await.
+      return;
     }
-    this.running = false;
+    this.lifecycleState = 'stopping';
+    const inflight = (async (): Promise<void> => {
+      try {
+        if (this.loopPromise !== null) {
+          await this.loopPromise.catch(() => undefined);
+          this.loopPromise = null;
+        }
+        this.running = false;
+      } finally {
+        // Only transition to idle if we're still in stopping —
+        // a deferred-restart from start() may have re-entered and
+        // moved us to 'running' or 'starting' already.
+        if (this.lifecycleState === 'stopping') {
+          this.lifecycleState = 'idle';
+        }
+        this.stopInFlight = null;
+      }
+    })();
+    this.stopInFlight = inflight;
+    await inflight;
   }
 
   /** Diagnostic — is the scan loop currently running? */
@@ -1251,7 +1382,9 @@ export class FinalizationWorkerRecipient {
           this.options.emit('transfer:operator-alert', {
             code: 'structural',
             tokenId,
-            message: `dispositionWriter.write failed during §5.5 step 9 re-evaluation: ${err instanceof Error ? err.message : String(err)}`,
+            message: sanitizeReasonString(
+              `dispositionWriter.write failed during §5.5 step 9 re-evaluation: ${safeErrorMessage(err)}`,
+            ),
           });
           return null;
         }
@@ -1346,10 +1479,41 @@ export class FinalizationWorkerRecipient {
     // Hard-cap eviction — drop the oldest (least-recently-inserted) entries
     // until we're back under the cap. In practice only one eviction per
     // insertion is needed once steady-state is reached.
+    let evicted = false;
     while (this.cascadeTombstones.size > CASCADE_TOMBSTONE_HARD_CAP) {
       const oldest = this.cascadeTombstones.keys().next();
       if (oldest.done === true || oldest.value === undefined) break;
       this.cascadeTombstones.delete(oldest.value);
+      evicted = true;
+    }
+
+    // Round 5 fix (HIGH GAP) — periodic steady-state eviction alert.
+    // Without this, once the set is saturated the high-watermark
+    // alert (fired once on initial crossing) is the only signal —
+    // operators get no continuous indication that proofs may now leak
+    // into evicted-tombstone tokens. Rate-limited to one alert per
+    // {@link CASCADE_TOMBSTONE_EVICTION_ALERT_INTERVAL_MS} (1 hour).
+    if (evicted) {
+      const now = Date.now();
+      if (
+        this.cascadeTombstoneLastEvictionAlertAt === 0 ||
+        now - this.cascadeTombstoneLastEvictionAlertAt >=
+          CASCADE_TOMBSTONE_EVICTION_ALERT_INTERVAL_MS
+      ) {
+        this.cascadeTombstoneLastEvictionAlertAt = now;
+        this.options.emit('transfer:operator-alert', {
+          code: 'structural',
+          message:
+            `CASCADE_TOMBSTONE_STEADY_STATE_EVICTION: in-memory ` +
+            `cascade-tombstone set is at the hard cap ` +
+            `(${CASCADE_TOMBSTONE_HARD_CAP}); oldest entries are being ` +
+            `evicted on every insert. Cross-restart safety is delivered ` +
+            `by the on-disk INVALID disposition records, but in-process ` +
+            `sibling cycles arriving AFTER eviction may briefly leak a ` +
+            `proof into an evicted-tombstone token before the disposition ` +
+            `lookup catches it. Investigate cascade source.`,
+        });
+      }
     }
 
     // Reset the high-watermark debounce when the set drops back below
@@ -1408,7 +1572,9 @@ export class FinalizationWorkerRecipient {
       this.options.emit('transfer:operator-alert', {
         code: args.reason,
         tokenId: args.tokenId,
-        message: `dispositionWriter.write failed during §5.5 step 7 self-invalidation: ${err instanceof Error ? err.message : String(err)}`,
+        message: sanitizeReasonString(
+          `dispositionWriter.write failed during §5.5 step 7 self-invalidation: ${safeErrorMessage(err)}`,
+        ),
       });
     }
 
@@ -1451,7 +1617,9 @@ export class FinalizationWorkerRecipient {
       this.options.emit('transfer:operator-alert', {
         code: args.reason,
         tokenId: args.tokenId,
-        message: `cascadeWalker.cascade threw: ${err instanceof Error ? err.message : String(err)}`,
+        message: sanitizeReasonString(
+          `cascadeWalker.cascade threw: ${safeErrorMessage(err)}`,
+        ),
       });
     }
     return true;
@@ -1626,11 +1794,13 @@ export class FinalizationWorkerRecipient {
           } catch (err) {
             // processOneToken should be total (allSettled inside) but
             // a throw here is forensic-only; emit and continue.
-            const msg = err instanceof Error ? err.message : String(err);
+            const msg = safeErrorMessage(err);
             this.options.emit('transfer:operator-alert', {
               code: 'structural',
               tokenId,
-              message: `FinalizationWorkerRecipient.scanLoop: processOneToken threw for tokenId=${tokenId}: ${msg}`,
+              message: sanitizeReasonString(
+                `FinalizationWorkerRecipient.scanLoop: processOneToken threw for tokenId=${tokenId}: ${msg}`,
+              ),
             });
           }
         }
@@ -1640,12 +1810,13 @@ export class FinalizationWorkerRecipient {
         // Reset on next success.
         this.scanReadFailureStreak += 1;
         if (isPowerOfTwoRecipient(this.scanReadFailureStreak)) {
-          const msg = err instanceof Error ? err.message : String(err);
+          const msg = safeErrorMessage(err);
           this.options.emit('transfer:operator-alert', {
             code: 'structural',
-            message:
+            message: sanitizeReasonString(
               `FinalizationWorkerRecipient.scanLoop: queueStore.list threw ` +
-              `(consecutive failures: ${this.scanReadFailureStreak}): ${msg}`,
+                `(consecutive failures: ${this.scanReadFailureStreak}): ${msg}`,
+            ),
           });
           // Wave 7 emit-if-emitted watermark.
           this.scanReadFailureEmittedAtStreak = this.scanReadFailureStreak;
