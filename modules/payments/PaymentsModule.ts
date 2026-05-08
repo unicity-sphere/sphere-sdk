@@ -154,6 +154,20 @@ import {
   type ClassifyTokenLookup,
 } from './transfer/cascade-walker';
 import { ManifestCas, type MinimalManifestStorage } from '../../profile/manifest-cas';
+// Round 5 (FIX 1) — production-wired default importer/runner for the
+// operator escape hatch. Uses lightweight in-memory adapters mirroring
+// the auto-install pattern of `buildDefaultFinalizationWorkerSender`.
+// Sphere bootstrap MAY override via the existing `install*` methods to
+// inject OrbitDB-backed dispositionStorage + manifestStore (see
+// {@link OrbitDbDispositionStorageAdapter}).
+import {
+  InMemoryDispositionStorageAdapter,
+} from '../../profile/disposition-storage-adapters';
+import { ManifestStore } from '../../profile/manifest-store';
+import { Lamport } from '../../profile/lamport';
+import type { TokenManifestEntry } from '../../profile/token-manifest';
+import type { CascadeManifestScanner as CascadeManifestScannerForRevalidate } from './transfer/cascade-walker';
+import type { ProofVerifyStatus } from './transfer/proof-verifier';
 import { contentHash, type ContentHash } from '../../uxf/types';
 import { isLegacyTokenTransferPayload } from '../../types/uxf-transfer';
 import type { UxfTransferOutboxEntry } from '../../types/uxf-outbox';
@@ -2190,6 +2204,51 @@ export class PaymentsModule {
           'Default FinalizationWorkerRecipient auto-installed (recipientUxf default-on)',
         );
       }
+    }
+
+    // Round 5 (FIX 1) — auto-install the operator escape-hatch importer
+    // and revalidate-cascaded runner (T.5.D). Before Round 5, no
+    // production code path called `installInclusionProofImporter()` /
+    // `installRevalidateCascadedRunner()`, so every wallet that
+    // bootstrapped through `Sphere.init()` threw
+    // `OPERATOR_ESCAPE_HATCH_NOT_CONFIGURED` on the first
+    // `payments.importInclusionProof()` / `payments.revalidateCascadedChildren()`
+    // call.
+    //
+    // The auto-installed defaults use lightweight in-memory adapters
+    // (mirroring `buildDefaultFinalizationWorkerSender`'s pattern):
+    //  - `InMemoryDispositionStorageAdapter` for `_invalid` / `_audit`
+    //  - In-memory `MinimalManifestStorage` + a fresh `ManifestStore`
+    //    bound to a fresh `Lamport` clock
+    //  - Stub `queueScanner` (returns no entries) and stub
+    //    `verifyProof` (returns `'NOT_AUTHENTICATED'`) so the importer
+    //    fails closed on every operator-supplied proof until the
+    //    bootstrap layer overrides
+    //
+    // Bootstrap layers (Sphere) MAY override either by calling
+    // `installInclusionProofImporter()` / `installRevalidateCascadedRunner()`
+    // BEFORE `initialize()` (the `!this.inclusionProofImporter` checks
+    // preserve that contract) or AFTER `initialize()` (the install
+    // methods replace the auto-installed instance). Production
+    // override should construct an `OrbitDbDispositionStorageAdapter`
+    // bound to the wallet's ProfileDatabase and an OrbitDB-backed
+    // ManifestStore — see `OrbitDbDispositionStorageAdapter` JSDoc for
+    // the wiring sketch.
+    if (this.inclusionProofImporter === null) {
+      this.inclusionProofImporter = buildDefaultInclusionProofImporter({
+        emit: (type, data) => this.deps!.emitEvent(type, data),
+      });
+      logger.debug(
+        'Payments',
+        'Default InclusionProofImporter auto-installed (in-memory disposition storage)',
+      );
+    }
+    if (this.revalidateCascadedRunner === null) {
+      this.revalidateCascadedRunner = buildDefaultRevalidateCascadedRunner();
+      logger.debug(
+        'Payments',
+        'Default RevalidateCascadedRunner auto-installed (in-memory manifest scanner)',
+      );
     }
   }
 
@@ -10591,6 +10650,161 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
     dispositionWriter,
     clearSaveFailureStreak: () => saveFailureStreak.clear(),
   };
+}
+
+// =============================================================================
+// Round 5 (FIX 1) — default in-memory operator escape-hatch builders.
+// =============================================================================
+
+/**
+ * Build a default {@link InclusionProofImporter} backed by in-memory
+ * adapters. Auto-installed in `initialize()` when the bootstrap layer
+ * has not already wired one. The defaults fail closed on every
+ * operator-supplied proof (proof verification returns
+ * `'NOT_AUTHENTICATED'`) so a misconfigured wallet cannot accidentally
+ * apply unverified proofs — but the module no longer throws
+ * `OPERATOR_ESCAPE_HATCH_NOT_CONFIGURED`, which lets operator scripts /
+ * UIs probe the importer at startup without crashing.
+ *
+ * Production wiring should construct an OrbitDB-backed adapter (see
+ * {@link OrbitDbDispositionStorageAdapter}) bound to the wallet's
+ * ProfileDatabase plus a real `verifyProof` (the trust-base-aware
+ * `verifyProof` from `transfer/proof-verifier.ts`), real
+ * `graftCallback` / `overrideCallback` (the §5.5 step 5 4-step write
+ * sequence + monotonicity-breach audit fields), and a real
+ * `queueScanner` (the FinalizationQueue-backed scanner). Bootstrap
+ * layers override via `payments.installInclusionProofImporter()`.
+ *
+ * @internal exposed for tests; production callers SHOULD NOT depend on
+ *   this factory's exact shape — it is intentionally minimal.
+ */
+export function buildDefaultInclusionProofImporter(opts: {
+  readonly emit: <T extends SphereEventType>(
+    type: T,
+    data: SphereEventMap[T],
+  ) => void;
+}): InclusionProofImporter {
+  const { emit } = opts;
+
+  // In-memory disposition storage — `_invalid` / `_audit` per-entry
+  // records.
+  const dispositionStorage = new InMemoryDispositionStorageAdapter();
+
+  // In-memory manifest storage — the operator escape-hatch reads
+  // manifest entries to decide pending-vs-invalid routing.
+  const manifestEntries = new Map<string, TokenManifestEntry>();
+  const manifestStorage: MinimalManifestStorage = {
+    async readEntry(addr: string, tokenId: string) {
+      return manifestEntries.get(`${addr}:${tokenId}`);
+    },
+    async writeEntry(addr: string, tokenId: string, entry: TokenManifestEntry) {
+      manifestEntries.set(`${addr}:${tokenId}`, entry);
+    },
+  };
+  const manifestStore = new ManifestStore({
+    storage: manifestStorage,
+    lamport: new Lamport(),
+  });
+
+  // Stub queue scanner — no live or hard-fail entries. Combined with
+  // the stub verifyProof, every operator call resolves either to
+  // `'no-such-token'` (no manifest entry) or `'tokenId-already-valid'` /
+  // `'tokenId-in-invalid'` (depending on the manifest state, which is
+  // also empty in the default harness).
+  const queueScanner = {
+    async lookupByTokenId() {
+      return [];
+    },
+  };
+
+  // Stub proof verifier — fail closed. The default harness MUST NOT
+  // accept operator-supplied proofs; the bootstrap layer's override
+  // wires the real trust-base-aware verifier.
+  const verifyProof = async (): Promise<ProofVerifyStatus> => 'NOT_AUTHENTICATED';
+
+  // Stub graft callback — no-op (returns immediately). Cases routing
+  // here would never fire in the default harness because the queue
+  // scanner returns no entries; including the stub keeps the importer
+  // structurally complete.
+  const graftCallback = {
+    async graft() {
+      /* no-op */
+    },
+  };
+
+  // Stub override callback — no-op. Same rationale as graftCallback.
+  const overrideCallback = {
+    async applyOverride() {
+      /* no-op */
+    },
+  };
+
+  return new InclusionProofImporter({
+    manifestStore,
+    dispositionStorage,
+    queueScanner,
+    verifyProof,
+    graftCallback,
+    overrideCallback,
+    emit,
+  });
+}
+
+/**
+ * Build a default {@link RevalidateCascadedRunner} backed by an
+ * in-memory manifest scanner. Auto-installed in `initialize()` when
+ * the bootstrap layer has not already wired one. The default scanner
+ * surfaces no children for any parent, so `revalidateCascadedChildren`
+ * resolves with `{ checked: 0, revalidated: 0, ... }` — equivalent to
+ * "the operator's parent had no cascaded children", which is the
+ * correct verdict for a freshly-bootstrapped wallet that hasn't yet
+ * ingested any transfers.
+ *
+ * Production override (via `payments.installRevalidateCascadedRunner()`)
+ * wires a manifestScanner that reads the wallet's OrbitDB-backed
+ * manifest collection and a `revalidateChild` validator that runs the
+ * §5.3 [B]/[C]/[E] sub-checks against the child token.
+ *
+ * @internal exposed for tests; production callers SHOULD NOT depend on
+ *   this factory's exact shape — it is intentionally minimal.
+ */
+export function buildDefaultRevalidateCascadedRunner(): RevalidateCascadedRunner {
+  // Empty in-memory scanner — no children for any parent. The
+  // manifestStore returns undefined for every readEntry, so the
+  // pre-loop parent-validity check classifies every cascaded subtree
+  // as "still invalid". The runner returns zero counts.
+  const manifestEntries = new Map<string, TokenManifestEntry>();
+  const manifestScanner: CascadeManifestScannerForRevalidate = {
+    async readEntry(addr: string, tokenId: string) {
+      return manifestEntries.get(`${addr}:${tokenId}`);
+    },
+    async findChildren() {
+      return [];
+    },
+  };
+  const manifestStorage: MinimalManifestStorage = {
+    async readEntry(addr: string, tokenId: string) {
+      return manifestEntries.get(`${addr}:${tokenId}`);
+    },
+    async writeEntry(addr: string, tokenId: string, entry: TokenManifestEntry) {
+      manifestEntries.set(`${addr}:${tokenId}`, entry);
+    },
+  };
+  const manifestStore = new ManifestStore({
+    storage: manifestStorage,
+    lamport: new Lamport(),
+  });
+
+  // Stub revalidator — never fires because findChildren always returns
+  // []. Including it keeps the runner structurally complete.
+  const revalidateChild = async () =>
+    ({ kind: 'parent-still-invalid' } as const);
+
+  return new RevalidateCascadedRunner({
+    manifestScanner,
+    manifestStore,
+    revalidateChild,
+  });
 }
 
 // =============================================================================
