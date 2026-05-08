@@ -170,3 +170,90 @@ describe('Round 3: PaymentsModule.importInclusionProof normalizes tokenId case',
     expect(args[1]).toBe(lower);
   });
 });
+
+// =============================================================================
+// Round 5 (FIX 5) — revalidateCascadedChildren tokenId case-normalization
+// =============================================================================
+
+import { RevalidateCascadedRunner } from '../../../modules/payments/transfer/revalidate-cascaded';
+
+describe('Round 5 (FIX 5): PaymentsModule.revalidateCascadedChildren normalizes tokenId case', () => {
+  it('uppercase parentTokenId → lowercased before reaching runner (no zero-children false positive)', async () => {
+    const payments = makeMinimalPayments();
+    const upper = 'AB'.repeat(32);
+    const lower = upper.toLowerCase();
+
+    const runner = Object.create(RevalidateCascadedRunner.prototype);
+    const runSpy = vi
+      .fn()
+      .mockResolvedValue({
+        checked: 0,
+        revalidated: 0,
+        stillInvalid: 0,
+        cycleDefenseFired: 0,
+        scannerErrors: 0,
+      });
+    Object.defineProperty(runner, 'run', { value: runSpy });
+    payments.installRevalidateCascadedRunner(
+      runner as RevalidateCascadedRunner,
+    );
+
+    await payments.revalidateCascadedChildren('DIRECT://addr', upper);
+
+    expect(runSpy).toHaveBeenCalledTimes(1);
+    const args = runSpy.mock.calls[0]!;
+    expect(args[0]).toBe('DIRECT://addr');
+    expect(args[1]).toBe(lower); // FIX 5: parentTokenId normalized
+  });
+
+  it('mixed-case parentTokenId → lowercased before reaching runner', async () => {
+    const payments = makeMinimalPayments();
+    const mixed = 'aB'.repeat(16) + 'Cd'.repeat(16);
+    const lower = mixed.toLowerCase();
+
+    const runner = Object.create(RevalidateCascadedRunner.prototype);
+    const runSpy = vi
+      .fn()
+      .mockResolvedValue({
+        checked: 0,
+        revalidated: 0,
+        stillInvalid: 0,
+        cycleDefenseFired: 0,
+        scannerErrors: 0,
+      });
+    Object.defineProperty(runner, 'run', { value: runSpy });
+    payments.installRevalidateCascadedRunner(
+      runner as RevalidateCascadedRunner,
+    );
+
+    await payments.revalidateCascadedChildren('DIRECT://addr', mixed);
+
+    const args = runSpy.mock.calls[0]!;
+    expect(args[1]).toBe(lower);
+  });
+
+  it('already-lowercase parentTokenId → passed through unchanged', async () => {
+    const payments = makeMinimalPayments();
+    const lower = 'ab'.repeat(32);
+
+    const runner = Object.create(RevalidateCascadedRunner.prototype);
+    const runSpy = vi
+      .fn()
+      .mockResolvedValue({
+        checked: 0,
+        revalidated: 0,
+        stillInvalid: 0,
+        cycleDefenseFired: 0,
+        scannerErrors: 0,
+      });
+    Object.defineProperty(runner, 'run', { value: runSpy });
+    payments.installRevalidateCascadedRunner(
+      runner as RevalidateCascadedRunner,
+    );
+
+    await payments.revalidateCascadedChildren('DIRECT://addr', lower);
+
+    const args = runSpy.mock.calls[0]!;
+    expect(args[1]).toBe(lower);
+  });
+});

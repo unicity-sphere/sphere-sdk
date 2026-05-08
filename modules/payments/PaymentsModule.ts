@@ -2763,7 +2763,18 @@ export class PaymentsModule {
         'OPERATOR_ESCAPE_HATCH_NOT_CONFIGURED',
       );
     }
-    return this.revalidateCascadedRunner.run(addr, parentTokenId);
+    // Round 5 (FIX 5) — lowercase-normalize the parentTokenId at the
+    // public entry, mirroring the Round 3 `importInclusionProof` fix.
+    // Operator-supplied uppercase tokenIds would otherwise silently find
+    // zero children in the prefix-scan path, masking real cascades.
+    // Manifest entries are written under canonical lowercase keys (see
+    // FIX 4); without this normalization the runner queries the wrong
+    // keyspace and the operator sees a misleadingly-clean result.
+    const normalizedParentTokenId =
+      typeof parentTokenId === 'string'
+        ? parentTokenId.toLowerCase()
+        : parentTokenId;
+    return this.revalidateCascadedRunner.run(addr, normalizedParentTokenId);
   }
 
   /**

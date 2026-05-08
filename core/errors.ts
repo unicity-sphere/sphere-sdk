@@ -540,7 +540,7 @@ export type SphereErrorCode =
  * `cause` (deep walk). Keep in lockstep with §5.5 step 1 and §6.1 forensic
  * payload conventions.
  *
- * Currently:
+ * **Cryptographic-secret fields:**
  *  - `signedTransferTxBytes`  — see §5.5 `FinalizationQueueEntry` and the
  *    finalization-worker-sender `REQUEST_ID_MISMATCH` client-error path
  *    (§6.1, C12/C13). The bytes are the signed transfer transaction body
@@ -551,14 +551,70 @@ export type SphereErrorCode =
  *  - `rawAuthenticator`       — the signed authenticator structure
  *    submitted alongside a commitment; treated as equally-sensitive.
  *
+ * **Round 5 — defensive sister-name additions (W40 redaction).**
+ * These are NOT secret bytes per se; they are aggregator-/peer-supplied
+ * untrusted strings (or sub-structures) that historically leaked into
+ * `err.cause` unchanged. The W40 redaction layer is the choke point we
+ * trust to scrub them; sanitizers (`sanitizeReasonString`) at throw sites
+ * provide a second line of defense for the human-readable `message`
+ * field, but `cause`-attached forensic copies were uncovered. The
+ * sister names below all carry untrusted content with the same threat
+ * model (control-char log injection, HTML XSS, multi-MB log flood) that
+ * defense-in-depth motivated for the cryptographic fields. Listing them
+ * here means a hostile aggregator-/peer-supplied payload at any of these
+ * keys is replaced with an opaque marker the moment it lands on a
+ * SphereError.
+ *
+ *  - `aggregatorError`        — preflight-finalize / finalization-worker
+ *    forensic field carrying the aggregator's verbatim error string.
+ *  - `failureReasons`         — bundle-fetcher + sender-orchestrator
+ *    accumulated remote rejection reasons.
+ *  - `errorMessage`           — generic alias the SDK and downstream
+ *    consumers attach when wrapping native throws.
+ *  - `serverError`            — common HTTP/RPC server-error stash
+ *    (e.g. `{ status, serverError }`).
+ *  - `responseBody` / `responseText` / `body`  — raw HTTP response bodies
+ *    captured for postmortem; can be megabytes and may carry HTML.
+ *  - `requestBody`            — outgoing request body captured on failure
+ *    (may include sensitive request payloads in addition to attacker-
+ *    influenced content if echoed back; redact defensively).
+ *  - `rawError`               — generic catch-all for "the original
+ *    error string we wrapped."
+ *  - `errorBody`              — alternate naming convention some
+ *    libraries use for response bodies.
+ *
+ * **Trade-off documentation.** Redacting sister names sacrifices some
+ * forensic context — operators who currently grep `aggregatorError` to
+ * see verbatim server text will instead see `[REDACTED: aggregatorError]`.
+ * Defense-in-depth wins for the protocol layer: senders are not
+ * authenticated peers w.r.t. their error-string content, and the
+ * narrowest defense (sanitize at throw sites) cannot cover unknown
+ * future call sites. Operators who NEED readable forensics should
+ * arrange for the throw site to splice a sanitized `*Summary` field
+ * (e.g., `aggregatorErrorSummary: sanitizeReasonString(rawText)`)
+ * alongside the redacted raw field — the summary survives W40 because
+ * its name is not in the list.
+ *
  * Adding a name here is a deliberate API decision — drift between throw
  * sites defeats the defense. New names land here AND in
  * `tests/unit/payments/transfer/sphere-error-redaction.test.ts`.
  */
 export const REDACTED_FIELDS: ReadonlyArray<string> = Object.freeze([
+  // Cryptographic-secret fields (W40 original set).
   'signedTransferTxBytes',
   'signedCommitmentBytes',
   'rawAuthenticator',
+  // Round 5 — defensive sister names (untrusted strings/payloads).
+  'aggregatorError',
+  'failureReasons',
+  'errorMessage',
+  'serverError',
+  'responseBody',
+  'requestBody',
+  'responseText',
+  'body',
+  'rawError',
+  'errorBody',
 ]);
 
 const REDACTED_FIELDS_SET: ReadonlySet<string> = new Set(REDACTED_FIELDS);
@@ -627,13 +683,38 @@ function redactValue(
   // `signedTransferTxBytes`). Now we CLONE the Error: same prototype
   // (so `err instanceof CustomError` still works), but enumerable own
   // properties are walked through the redactor.
-  if (value instanceof Error) {
-    const errObj = value;
+  //
+  // **Round 5 fix — hostile Proxy / throwing protocol traps.** A `Proxy`
+  // can install a `getPrototypeOf` trap (or a `Symbol.hasInstance` trap
+  // on its target's constructor) that throws. Both `value instanceof
+  // Error` and `Object.getPrototypeOf(value)` invoke those traps and
+  // propagate the throw out of `redactValue` itself, crashing the
+  // SphereError constructor. Wrap each in try/catch so the redactor
+  // fails closed: on throw, treat the value as non-Error (fall through
+  // to the plain-object branch) and use `Error.prototype` as a safe
+  // fallback prototype for clone construction.
+  let isError = false;
+  try {
+    isError = value instanceof Error;
+  } catch {
+    // Hostile `Symbol.hasInstance` / `getPrototypeOf` trap threw.
+    // Treat as non-Error and fall through to plain-object handling.
+    isError = false;
+  }
+  if (isError) {
+    const errObj = value as Error;
     const memoExisting = visited.get(errObj);
     if (memoExisting !== undefined) return memoExisting;
     // Preserve prototype identity. Object.create avoids re-running
     // a (potentially throwing) Error constructor.
-    const proto = Object.getPrototypeOf(errObj) as object | null;
+    let proto: object | null;
+    try {
+      proto = Object.getPrototypeOf(errObj) as object | null;
+    } catch {
+      // Hostile `getPrototypeOf` trap threw. Fall back to the plain
+      // Error.prototype so the clone retains base-class semantics.
+      proto = Error.prototype;
+    }
     const clone = Object.create(proto) as Record<string, unknown>;
     visited.set(errObj, clone);
     // Copy core Error properties verbatim — they are NOT walked through
@@ -706,18 +787,48 @@ function redactValue(
   // bare buffers occasionally appear in tests of generic SphereError
   // shapes — leaving them alone keeps existing forensic-cause shapes
   // intact unless the caller embeds them under a redacted-name key.
-  if (value instanceof Uint8Array) return value;
+  //
+  // Round 5 fix — `value instanceof Uint8Array` also walks the prototype
+  // chain via `Symbol.hasInstance` / `getPrototypeOf` and can be made to
+  // throw by a hostile Proxy. Same try/catch closure as the Error check
+  // above.
+  let isU8 = false;
+  try {
+    isU8 = value instanceof Uint8Array;
+  } catch {
+    isU8 = false;
+  }
+  if (isU8) return value;
+  let isArray = false;
+  try {
+    isArray = Array.isArray(value);
+  } catch {
+    isArray = false;
+  }
 
   if (typeof value === 'object') {
     const obj = value as object;
     const memo = visited.get(obj);
     if (memo !== undefined) return memo;
 
-    if (Array.isArray(obj)) {
+    if (isArray) {
+      const arr = obj as unknown[];
       const out: unknown[] = [];
       visited.set(obj, out);
-      for (let i = 0; i < obj.length; i++) {
-        out.push(redactValue(obj[i], visited, depth + 1));
+      let len = 0;
+      try {
+        len = arr.length;
+      } catch {
+        len = 0;
+      }
+      for (let i = 0; i < len; i++) {
+        let item: unknown;
+        try {
+          item = arr[i];
+        } catch {
+          item = '[REDACTED: getter-threw]';
+        }
+        out.push(redactValue(item, visited, depth + 1));
       }
       return out;
     }
