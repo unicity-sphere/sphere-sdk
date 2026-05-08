@@ -988,14 +988,16 @@ export class FinalizationWorkerRecipient {
         // — the token is now `_invalid` and the proof must NOT land in
         // its pool entry. Emit a benign cascade-skip-stale alert so
         // the no-op is observable.
-        if (this.cascadeTombstones.has(entry.tokenId)) {
-          this.options.emit('transfer:operator-alert', {
-            code: 'structural',
-            tokenId: entry.tokenId,
-            message: `transfer:cascade-skip-stale: aborting proof attach for tokenId=${entry.tokenId} requestId=${entry.commitmentRequestId} — token was hard-failed by sibling cascade; pool write skipped`,
-          });
-          return;
-        }
+        //
+        // Round 3 regression fix (CRIT #4): the tombstone check is
+        // performed INSIDE the per-token mutex (see
+        // `attachProofUnderMutex` `tombstoneCheck` parameter). Pre-
+        // Round-3 the check ran HERE — outside the mutex — leaving a
+        // race window: a sibling's applyHardFailCascade could mark
+        // the tombstone AFTER this outside check observed `false` but
+        // BEFORE this closure acquired the mutex, causing the proof
+        // to land in the now-invalidated token's pool entry. Inlining
+        // the check inside the mutex closes that window.
         await attachProofUnderMutex({
           addressId: this.options.addressId,
           tokenId: entry.tokenId,
@@ -1015,6 +1017,18 @@ export class FinalizationWorkerRecipient {
           perTokenMutex: this.options.perTokenMutex,
           perTokenMutexStrategy: this.perTokenMutexStrategy,
           now: this.options.now,
+          // Round 3 regression fix: closure observes the cascade
+          // tombstone state at the moment the mutex is held — closes
+          // the race window described above.
+          tombstoneCheck: () =>
+            this.cascadeTombstones.has(entry.tokenId),
+          onTombstoneSkip: () => {
+            this.options.emit('transfer:operator-alert', {
+              code: 'structural',
+              tokenId: entry.tokenId,
+              message: `transfer:cascade-skip-stale: aborting proof attach for tokenId=${entry.tokenId} requestId=${entry.commitmentRequestId} — token was hard-failed by sibling cascade; pool write skipped`,
+            });
+          },
         });
       },
     });

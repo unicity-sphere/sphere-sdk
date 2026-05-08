@@ -1340,6 +1340,57 @@ describe('FinalizationWorkerRecipient — idle-loop stop wakes immediately (Roun
   });
 });
 
+// =============================================================================
+// Round 3 regression — cascade tombstone check INSIDE per-token mutex (FIX 4)
+// =============================================================================
+
+describe('FinalizationWorkerRecipient — cascade tombstone check inside mutex (Round 3 regression)', () => {
+  it('cascade tombstone marked AFTER poll OK but BEFORE mutex acquire → proof NOT written', async () => {
+    const harness = buildWorker();
+    const entry = makeQueueEntry();
+    await seedQueue(harness, [entry]);
+
+    // Hook the per-token mutex's acquire to mark the cascade tombstone
+    // BEFORE the fn runs, simulating a sibling cycle that fired
+    // applyHardFailCascade between the outside-the-mutex check (pre-
+    // Round-3 location) and the mutex acquire. With the fix, the
+    // tombstone check runs INSIDE the mutex (after acquire); the
+    // post-acquire check observes the tombstone and skips the rewrite.
+    const realAcquire = harness.mutex.acquire.bind(harness.mutex);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (harness.mutex as any).acquire = async (
+      tokenId: string,
+      fn: () => Promise<void>,
+      opts?: { strategy?: 'cas' | 'rpc-release' | 'bounded-hold' },
+    ): Promise<void> => {
+      // Simulate the sibling cascade firing JUST after the outside
+      // check passed but BEFORE the mutex protects the rewrite.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (harness.worker as any).cascadeTombstones.add(tokenId);
+      return realAcquire(tokenId, fn, opts);
+    };
+
+    const result = await harness.worker.processOneToken(TOKEN_ID);
+    void result;
+
+    // Pool MUST be empty — the post-acquire tombstone check aborted
+    // the rewrite.
+    expect(harness.pool.attached.size).toBe(0);
+
+    // Operator-alert with cascade-skip-stale message MUST have fired
+    // (via the onTombstoneSkip closure inside the mutex).
+    const skipAlerts = harness.events.events.filter((e) => {
+      if (e.type !== 'transfer:operator-alert') return false;
+      const data = e.data as { message?: string };
+      return (
+        typeof data.message === 'string' &&
+        data.message.includes('cascade-skip-stale')
+      );
+    });
+    expect(skipAlerts.length).toBeGreaterThan(0);
+  });
+});
+
 // Suppress unused-import warnings for this block.
 void RACE_TX_HASH;
 void makeFakePoolRead;

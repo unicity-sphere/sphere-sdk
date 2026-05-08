@@ -1300,10 +1300,50 @@ export async function attachProofUnderMutex(args: {
   readonly perTokenMutex: PerTokenMutex;
   readonly perTokenMutexStrategy: 'cas' | 'rpc-release' | 'bounded-hold';
   readonly now: () => number;
+  /**
+   * Round 3 regression fix: optional cascade-tombstone check evaluated
+   * INSIDE the per-token mutex, immediately AFTER acquisition and
+   * BEFORE the manifest-CID-rewrite call. Pre-Round-3 the recipient's
+   * `attachProof` closure ran the check OUTSIDE the mutex (caller-side),
+   * which left a race window: mid-poll, a sibling's
+   * `applyHardFailCascade` could mark the tombstone AFTER the
+   * outside-the-mutex check observed `false`, then the mutex acquired
+   * by the sibling would release, and the original cycle would acquire
+   * the mutex AND write the proof — leaking the proof into the
+   * invalidated token's pool entry.
+   *
+   * Returning `true` from this closure aborts the rewrite cleanly
+   * (no-op). The closure is invoked under the held mutex, so the
+   * tombstone state observed here is consistent with whatever was set
+   * by the most-recently-released sibling.
+   */
+  readonly tombstoneCheck?: () => boolean;
+  /**
+   * Round 3 regression fix: optional emit-when-skipped hook. When
+   * `tombstoneCheck` returns `true`, the helper invokes this callback
+   * before returning so the caller can surface a benign
+   * `transfer:cascade-skip-stale` operator alert with side-specific
+   * formatting (the recipient embeds the queue entry id and the
+   * commitmentRequestId in its alert message).
+   */
+  readonly onTombstoneSkip?: () => void;
 }): Promise<void> {
   await args.perTokenMutex.acquire(
     args.tokenId,
     async () => {
+      // Round 3 regression fix (CRIT #4): cascade-tombstone check
+      // INSIDE the mutex. The pre-Round-3 placement (outside the
+      // mutex, in the recipient's `attachProof` closure) had a race
+      // window where a sibling's `applyHardFailCascade` could mark the
+      // tombstone after the outside check observed `false`, but
+      // BEFORE this cycle acquired the mutex. Moving the check inside
+      // closes the window: while we hold the mutex, no sibling can
+      // run cascade — so `tombstoneCheck()` here is the canonical
+      // "is this tokenId already cascaded" predicate.
+      if (args.tombstoneCheck !== undefined && args.tombstoneCheck()) {
+        if (args.onTombstoneSkip !== undefined) args.onTombstoneSkip();
+        return;
+      }
       const ctx: ManifestCidRewriteContext = {
         addr: args.addressId,
         tokenId: args.tokenId,
