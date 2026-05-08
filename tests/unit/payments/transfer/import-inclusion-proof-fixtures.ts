@@ -29,6 +29,7 @@ import {
   type ChildRevalidator,
   type RevalidateCascadedOptions,
   type RevalidationCycleWarning,
+  type RevalidationScannerError,
 } from '../../../../modules/payments/transfer/revalidate-cascaded';
 import { ManifestStore } from '../../../../profile/manifest-store';
 import { ManifestCas } from '../../../../profile/manifest-cas';
@@ -360,6 +361,7 @@ export interface RevalidatorHarness {
   readonly manifestStore: ManifestStore;
   readonly verdicts: Map<string, ChildRevalidationVerdict>;
   readonly cycleWarnings: RevalidationCycleWarning[];
+  readonly scannerErrors: RevalidationScannerError[];
   readonly callsByChild: string[];
 }
 
@@ -380,6 +382,14 @@ export function buildRevalidatorHarness(args: {
     readonly childTokenId: string;
     readonly manifest: FakeManifestStorage;
   }) => void;
+  /**
+   * Optional override of the manifest scanner. When provided, REPLACES
+   * the default `makeManifestScanner(storage)` — useful for tests that
+   * need `findChildren` to throw deterministically.
+   */
+  readonly manifestScannerOverride?: import(
+    '../../../../modules/payments/transfer/cascade-walker'
+  ).CascadeManifestScanner;
 } = {}): RevalidatorHarness {
   const manifest = makeFakeManifestStorage();
   const manifestStore = new ManifestStore({
@@ -387,9 +397,10 @@ export function buildRevalidatorHarness(args: {
     lamport: new Lamport(),
     cas: new ManifestCas(manifest),
   });
-  const scanner = makeManifestScanner(manifest);
+  const scanner = args.manifestScannerOverride ?? makeManifestScanner(manifest);
   const verdicts = new Map<string, ChildRevalidationVerdict>(args.verdicts);
   const cycleWarnings: RevalidationCycleWarning[] = [];
+  const scannerErrors: RevalidationScannerError[] = [];
   const callsByChild: string[] = [];
 
   const revalidateChild: ChildRevalidator = async (a) => {
@@ -433,6 +444,7 @@ export function buildRevalidatorHarness(args: {
     manifestStore,
     revalidateChild,
     onCycleDetected: (w) => cycleWarnings.push(w),
+    onScannerError: (e) => scannerErrors.push(e),
     maxDepth: args.maxDepth,
   };
 
@@ -442,6 +454,7 @@ export function buildRevalidatorHarness(args: {
     manifestStore,
     verdicts,
     cycleWarnings,
+    scannerErrors,
     callsByChild,
   };
 }

@@ -431,7 +431,43 @@ export class CascadeWalker {
       return EMPTY_RESULT;
     }
 
+    // (Steelman warning) Defense-in-depth class-disjointness assertion.
+    // The cascade walker trusts the injected `classifyToken` lookup with
+    // no cross-check; a buggy lookup that returns 'coin' for an actual
+    // NFT routes through `_cascadeCoin` which scans for splitParent
+    // children — finds none — and silently exits without notifying the
+    // outbox. The lost-NFT signal collapses, leaving the user with a
+    // token they thought succeeded but which had in fact shipped
+    // silently to the recipient who rejected it.
+    //
+    // Cross-check the manifest entry's `splitParent` field against the
+    // classifier's verdict:
+    //   - klass === 'nft' but splitParent is set → impossible per §4.1
+    //     (NFTs preserve `tokenId` and are never split). FAIL LOUD.
+    //
+    // The reverse check (klass === 'coin' but coinData is empty/null) is
+    // not feasible at the cascade walker because the manifest entry does
+    // not carry coinData — only the rootHash and class-derivative fields.
+    // Callers MUST run `normalizeCoinData()` before constructing the
+    // classifier projection (see classify-token.ts file-level invariant).
+    //
+    // Performed only on the NFT path to avoid an extra readEntry on the
+    // coin path's hot loop (the coin path's `_cascadeChildWithParentFlipCheck`
+    // already reads the parent for W27 protection).
     if (klass === 'nft') {
+      const parentEntry = await this.options.manifestScanner.readEntry(
+        addr,
+        parentTokenId,
+      );
+      if (
+        parentEntry !== undefined &&
+        typeof parentEntry.splitParent === 'string' &&
+        parentEntry.splitParent.length > 0
+      ) {
+        throw new Error(
+          `[cascade-walker] class-disjointness violation: classifier returned 'nft' for tokenId ${parentTokenId} but the manifest entry has splitParent=${parentEntry.splitParent}. Per §4.1 NFTs are never split. The classifier or the manifest is corrupted; refusing to cascade.`,
+        );
+      }
       return this._cascadeNft(addr, parentTokenId, reason);
     }
     return this._cascadeCoin(addr, parentTokenId, reason);

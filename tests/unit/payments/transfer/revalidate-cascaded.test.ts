@@ -17,7 +17,7 @@
  *     operator hasn't yet flipped the parent).
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   ADDR,
@@ -514,5 +514,47 @@ describe('§6.1.1 revalidateCascadedChildren', () => {
     // set from the first run MUST NOT bleed into the second run.
     const r2 = await h.runner.run(ADDR, P2);
     expect(r2.checked).toBe(0);
+  });
+
+  // ===========================================================================
+  // Steelman warning — scanner-error symmetry with cascade-walker.
+  // ===========================================================================
+  describe('Steelman warning: scanner-error symmetry with cascade-walker', () => {
+    it('findChildren throws → counter increments + onScannerError fires + console.warn', async () => {
+      const PARENT = 'p-scanner-err';
+      // Build a scanner whose findChildren throws deterministically.
+      const throwingScanner: import('../../../../modules/payments/transfer/cascade-walker').CascadeManifestScanner = {
+        async readEntry() {
+          // The runner calls readEntry only inside the per-child loop;
+          // findChildren is what we want to fail. Return undefined for
+          // any other read (the runner never reaches a per-child branch).
+          return undefined;
+        },
+        async findChildren() {
+          throw new Error('synthetic scanner failure');
+        },
+      };
+      const h = buildRevalidatorHarness({
+        manifestScannerOverride: throwingScanner,
+      });
+      h.manifest.entries.set(`${ADDR}:${PARENT}`, manifestEntryFor({
+        status: 'valid',
+        rootHashHex: 'aa'.repeat(32),
+      }));
+      // Spy console.warn so the test doesn't pollute its output.
+      const warnSpy = vi
+        .spyOn(console, 'warn')
+        .mockImplementation(() => undefined);
+      const r = await h.runner.run(ADDR, PARENT);
+      warnSpy.mockRestore();
+
+      // Counter incremented; onScannerError invoked; the run aborted
+      // gracefully (returns rather than propagating).
+      expect(r.scannerErrors).toBe(1);
+      expect(r.checked).toBe(0);
+      expect(h.scannerErrors.length).toBe(1);
+      expect(h.scannerErrors[0]!.phase).toBe('find-children');
+      expect(h.scannerErrors[0]!.tokenId).toBe(PARENT);
+    });
   });
 });

@@ -924,6 +924,60 @@ describe('FinalizationWorkerRecipient — Wave 7 emit-if-emitted recovery semant
 });
 
 // =============================================================================
+// CRIT #11 — cascade tombstone prevents proof-to-invalid leak
+// =============================================================================
+//
+// Pre-fix: applyHardFailCascade removed sibling queue entries but parallel
+// processQueueEntry cycles for those siblings continued running. On poll
+// OK, the sibling tried to step1Pool / step4 a proof for the now-invalid
+// token — leaking a proof into the pool of an _invalid disposition.
+//
+// Fix: cascade tombstone Set checked by the attachProof closure before
+// the pool write. If the tombstone is set, abort cleanly and emit a
+// transfer:cascade-skip-stale operator-alert.
+
+describe('FinalizationWorkerRecipient — cascade tombstone (CRIT #11)', () => {
+  it('hard-fail cascade prevents sibling proof from landing in pool', async () => {
+    // Construct a multi-entry token. Entry 0 hard-fails (PATH_INVALID
+    // exhausted). Entry 1 succeeds at poll. Without the tombstone fix,
+    // entry 1's proof would land in pool AFTER cascade has marked the
+    // token invalid. With the fix, entry 1's attachProof skips the
+    // pool write.
+    //
+    // Easier construction: simulate via direct cascade-tombstone path.
+    // Drive a single-entry success cycle where the cascade-tombstone is
+    // pre-set on the worker; the pool MUST stay empty.
+    const harness = buildWorker();
+    const entry = makeQueueEntry();
+    await seedQueue(harness, [entry]);
+
+    // Pre-set the cascade tombstone (simulating a sibling cycle's
+    // cascade firing concurrently).
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (harness.worker as any).cascadeTombstones.add(TOKEN_ID);
+
+    // Pre-fix this would attach a proof; with the fix, the attachProof
+    // closure short-circuits.
+    const result = await harness.worker.processOneToken(TOKEN_ID);
+    void result;
+
+    // The pool MUST NOT have received a proof for this tokenId.
+    expect(harness.pool.attached.size).toBe(0);
+
+    // Operator-alert with cascade-skip-stale message MUST have fired.
+    const skipAlerts = harness.events.events.filter((e) => {
+      if (e.type !== 'transfer:operator-alert') return false;
+      const data = e.data as { message?: string };
+      return (
+        typeof data.message === 'string' &&
+        data.message.includes('cascade-skip-stale')
+      );
+    });
+    expect(skipAlerts.length).toBeGreaterThan(0);
+  });
+});
+
+// =============================================================================
 // CRIT #10 — internal AbortController plumbed through stop()
 // =============================================================================
 //

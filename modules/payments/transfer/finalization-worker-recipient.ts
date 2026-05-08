@@ -483,6 +483,28 @@ export class FinalizationWorkerRecipient {
    *  mutex from holding two budgets concurrently for the same key. */
   private readonly inFlightTokens: Set<string> = new Set();
   /**
+   * Steelman fix (CRIT #11): cascade tombstone set. Pre-fix,
+   * `applyHardFailCascade` removed sibling queue entries but parallel
+   * `processQueueEntry` cycles for those siblings continued running
+   * their poll loops. On poll OK, the sibling's `attachProof` closure
+   * tried to step1Pool / step4 a proof for an already `_invalid` token
+   * — proof leaked into the pool of an invalid token.
+   *
+   * The fix: when applyHardFailCascade runs (under the per-tokenId
+   * mutex), mark the tokenId in this Set. Each `attachProof` closure
+   * checks the tombstone BEFORE writing; if set, it aborts cleanly
+   * with a `transfer:cascade-skip-stale` operator-alert.
+   *
+   * In-memory only: cycle-coordinated within a single worker process.
+   * Cross-restart safety is delivered by the disposition writer's
+   * INVALID record (the recipient sees the existing INVALID disposition
+   * on next-pass build-revaluate-input and skips proof attachment via
+   * the existing engine logic).
+   *
+   * @internal
+   */
+  private readonly cascadeTombstones: Set<string> = new Set();
+  /**
    * Wave 4 steelman: consecutive `queueStore.list()` failure counter
    * for exponential alert backoff. Same rationale as the sender
    * worker's {@link FinalizationWorkerSender#scanReadFailureStreak}.
@@ -920,6 +942,20 @@ export class FinalizationWorkerRecipient {
       aggregatorId: this.aggregatorId,
       trustBaseStaleness: this.trustBaseStaleness,
       attachProof: async (attachArgs) => {
+        // Steelman fix (CRIT #11): tombstone short-circuit. If
+        // applyHardFailCascade fired for this tokenId BETWEEN the
+        // sibling's poll OK and this attach call, skip the pool write
+        // — the token is now `_invalid` and the proof must NOT land in
+        // its pool entry. Emit a benign cascade-skip-stale alert so
+        // the no-op is observable.
+        if (this.cascadeTombstones.has(entry.tokenId)) {
+          this.options.emit('transfer:operator-alert', {
+            code: 'structural',
+            tokenId: entry.tokenId,
+            message: `transfer:cascade-skip-stale: aborting proof attach for tokenId=${entry.tokenId} requestId=${entry.commitmentRequestId} — token was hard-failed by sibling cascade; pool write skipped`,
+          });
+          return;
+        }
         await attachProofUnderMutex({
           addressId: this.options.addressId,
           tokenId: entry.tokenId,
@@ -1137,6 +1173,18 @@ export class FinalizationWorkerRecipient {
     readonly bundleCid: string;
   }): Promise<boolean> {
     void args.message;
+    // Steelman fix (CRIT #11): mark the cascade tombstone BEFORE any
+    // queue removals or disposition writes. This signals to any sibling
+    // `processQueueEntry` cycle currently in its poll loop that the
+    // tokenId has been moved to `_invalid` — the sibling's attachProof
+    // closure will see the tombstone and skip the pool write so the
+    // proof is NOT leaked into the invalidated token's pool entry. The
+    // tombstone is a durable in-memory hint for the lifetime of this
+    // worker; cross-restart safety is delivered by the disposition
+    // writer's INVALID record (existing engine logic skips reattach
+    // when an INVALID disposition is observed on rebuild).
+    this.cascadeTombstones.add(args.tokenId);
+
     // (1) Self-invalidation: write INVALID disposition for the
     // recipient's own copy.
     try {

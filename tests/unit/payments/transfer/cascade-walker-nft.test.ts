@@ -443,4 +443,58 @@ describe('§6.1.1 cascade — NFT-class outbox-driven notification', () => {
       (cascadeEvents[0]!.data as { readonly outboxId: string }).outboxId,
     ).toBe('ob-active');
   });
+
+  // ===========================================================================
+  // Steelman warning — class-disjointness assertion at cascade entry.
+  // ===========================================================================
+  it('Steelman: classifier returns "nft" but manifest entry has splitParent → throws', async () => {
+    // Defense-in-depth: a buggy classifier that returns 'nft' for an
+    // actual coin (splitParent set on the manifest entry) would silently
+    // collapse the cascade — `_cascadeNft` doesn't walk children, the
+    // coin's splitParent descendants stay `valid` while the parent is
+    // `_invalid`. Fail loud.
+    const TID = 'misclassified-token';
+    const storage = makeFakeManifestStorage([
+      {
+        addr: ADDR,
+        tokenId: TID,
+        entry: makeManifestEntry({
+          rootHashHex: 'aa'.repeat(32),
+          status: 'invalid',
+          invalidReason: 'oracle-rejected',
+          splitParent: 'parent-of-misclassified', // contradicts klass='nft'
+        }),
+      },
+    ]);
+    const harness = buildWalker({
+      storage,
+      classes: { [TID]: 'nft' }, // buggy classifier
+    });
+    await expect(
+      harness.walker.cascade(ADDR, TID, 'oracle-rejected'),
+    ).rejects.toThrow(/class-disjointness violation/);
+  });
+
+  it('Steelman: legitimate NFT (no splitParent) classifier="nft" → no throw', async () => {
+    // The assertion only fires when splitParent is set; legitimate NFTs
+    // (which always have absent splitParent) pass through.
+    const NFT = 'legitimate-nft';
+    const storage = makeFakeManifestStorage([
+      {
+        addr: ADDR,
+        tokenId: NFT,
+        entry: makeManifestEntry({
+          status: 'invalid',
+          invalidReason: 'oracle-rejected',
+        }),
+      },
+    ]);
+    const harness = buildWalker({
+      storage,
+      classes: { [NFT]: 'nft' },
+    });
+    // Should NOT throw.
+    const result = await harness.walker.cascade(ADDR, NFT, 'oracle-rejected');
+    expect(result.nftNotified).toBe(0);
+  });
 });

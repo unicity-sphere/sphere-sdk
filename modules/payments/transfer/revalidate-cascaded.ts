@@ -144,6 +144,23 @@ export interface RevalidationCycleWarning {
   readonly kind: 'cycle' | 'depth-overrun';
 }
 
+/**
+ * Scanner-error warning shape passed to
+ * {@link RevalidateCascadedOptions.onScannerError} (steelman warning,
+ * mirrored from `cascade-walker.ts`).
+ *
+ * `phase: 'find-children'` — `manifestScanner.findChildren()` threw.
+ * The walker for that branch aborts with no further recursion;
+ * children below that node remain un-revalidated. Operators may
+ * re-invoke `revalidateCascadedChildren()` later.
+ */
+export interface RevalidationScannerError {
+  readonly addr: string;
+  readonly tokenId: string;
+  readonly phase: 'find-children';
+  readonly error: unknown;
+}
+
 // =============================================================================
 // 2. Construction options — RevalidateCascadedRunner
 // =============================================================================
@@ -172,6 +189,16 @@ export interface RevalidateCascadedOptions {
    * Defaults to no-op. Used by tests to assert the W32 invariant fires.
    */
   readonly onCycleDetected?: (warning: RevalidationCycleWarning) => void;
+  /**
+   * Optional callback invoked when the manifest scanner's
+   * `findChildren()` throws (steelman warning — mirror of
+   * cascade-walker's `onScannerError`). Defaults to a no-op; the
+   * runner still increments {@link RevalidationResult.scannerErrors}
+   * and logs to `console.warn`. Operators wire this to push to their
+   * alert pipeline because a swallowed scanner error means a
+   * cascaded subtree was NOT revalidated.
+   */
+  readonly onScannerError?: (error: RevalidationScannerError) => void;
   /**
    * Optional override of the chain-depth bound. Defaults to
    * {@link MAX_CHAIN_DEPTH} (64). Tests use a small value to exercise
@@ -203,6 +230,15 @@ export interface RevalidationResult {
   readonly revalidated: number;
   readonly stillInvalid: number;
   readonly cycleDefenseFired: number;
+  /**
+   * Number of times `manifestScanner.findChildren()` threw and the
+   * runner had to abort that branch (steelman warning — mirror of
+   * cascade-walker's counter). Surface this counter + wire
+   * {@link RevalidateCascadedOptions.onScannerError} to alerting; a
+   * non-zero value is a forensic signal that a cascaded subtree was
+   * NOT revalidated. The operator can re-invoke later.
+   */
+  readonly scannerErrors: number;
 }
 
 // =============================================================================
@@ -307,10 +343,36 @@ export class RevalidateCascadedRunner {
         addr,
         currentTokenId,
       );
-    } catch {
-      // Defensive: if the scanner throws (e.g. transient backend
-      // error), abort this branch rather than aborting the whole
-      // revalidation. The operator can re-invoke later.
+    } catch (err) {
+      // (Steelman warning) Mirror cascade-walker's scanner-error path:
+      // increment the counter, invoke the callback, log to console.warn.
+      // The previous silent `catch { return }` collapsed forensic signal
+      // — a swallowed `findChildren` failure leaves cascaded children
+      // un-revalidated indefinitely (the operator can't tell the run
+      // succeeded vs aborted on a transient backend error).
+      counters.scannerErrors++;
+      if (this.opts.onScannerError !== undefined) {
+        try {
+          this.opts.onScannerError({
+            addr,
+            tokenId: currentTokenId,
+            phase: 'find-children',
+            error: err,
+          });
+        } catch {
+          // ignore callback failures — telemetry is best-effort.
+        }
+      }
+      try {
+        // eslint-disable-next-line no-console
+        console.warn(
+          '[revalidate-cascaded] findChildren failed for',
+          { addr, tokenId: currentTokenId },
+          err,
+        );
+      } catch {
+        // ignore logging failures
+      }
       return;
     }
 
@@ -482,6 +544,7 @@ interface MutableCounters {
   revalidated: number;
   stillInvalid: number;
   cycleDefenseFired: number;
+  scannerErrors: number;
 }
 
 function mutableCounters(): MutableCounters {
@@ -490,6 +553,7 @@ function mutableCounters(): MutableCounters {
     revalidated: 0,
     stillInvalid: 0,
     cycleDefenseFired: 0,
+    scannerErrors: 0,
   };
 }
 
@@ -499,5 +563,6 @@ function freezeCounters(c: MutableCounters): RevalidationResult {
     revalidated: c.revalidated,
     stillInvalid: c.stillInvalid,
     cycleDefenseFired: c.cycleDefenseFired,
+    scannerErrors: c.scannerErrors,
   };
 }
