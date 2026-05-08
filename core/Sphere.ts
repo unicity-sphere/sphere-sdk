@@ -2359,6 +2359,14 @@ export class Sphere {
 
     await this._transport.setIdentity(this._identity);
 
+    // The transport recreates its NostrClient on identity change (the
+    // SDK's client doesn't support runtime key swaps). When the Mux is
+    // sharing that client (#123), it must rebind to the new instance
+    // and re-establish its wallet/chat subscriptions on the new socket.
+    if (this._transportMux && typeof (this._transportMux as { rebindToSharedClient?: () => Promise<void> }).rebindToSharedClient === 'function') {
+      await (this._transportMux as { rebindToSharedClient: () => Promise<void> }).rebindToSharedClient();
+    }
+
     this.emitEvent('identity:changed', {
       l1Address: this._identity.l1Address,
       directAddress: this._identity.directAddress,
@@ -2625,6 +2633,13 @@ export class Sphere {
         relays: nostrTransport.getConfiguredRelays(),
         createWebSocket: nostrTransport.getWebSocketFactory(),
         storage: nostrTransport.getStorageAdapter() ?? undefined,
+        // #123: share the original transport's NostrClient instead of
+        // opening a second WebSocket per relay. Pass a getter so the
+        // Mux resolves it at connect-time (after the transport finishes
+        // its own connect()).
+        sharedNostrClient: typeof nostrTransport.getNostrClient === 'function'
+          ? () => nostrTransport.getNostrClient()
+          : undefined,
       });
 
       // Connect the mux

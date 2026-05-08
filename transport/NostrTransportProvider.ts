@@ -185,6 +185,18 @@ export class NostrTransportProvider implements TransportProvider {
   }
 
   /**
+   * Get the underlying NostrClient (or null if not yet connected).
+   *
+   * Exposed so {@link MultiAddressTransportMux} can share the same
+   * client/socket pair instead of opening a duplicate WebSocket per
+   * relay (#123). The transport owns the client's lifecycle — callers
+   * MUST NOT call {@code disconnect()} on the returned instance.
+   */
+  getNostrClient(): NostrClient | null {
+    return this.nostrClient;
+  }
+
+  /**
    * Suppress event subscriptions — unsubscribe wallet/chat filters
    * but keep the connection alive for resolve/identity-binding operations.
    * Used when MultiAddressTransportMux takes over event handling.

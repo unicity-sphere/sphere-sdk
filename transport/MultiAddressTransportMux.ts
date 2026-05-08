@@ -120,12 +120,26 @@ export interface MultiAddressTransportMuxConfig {
   storage?: TransportStorageAdapter;
   /** Private key for the Mux's NostrClient identity. If provided, the Mux
    *  authenticates as this key — required for relays that filter gift-wrap
-   *  event delivery to the recipient's subscription. */
+   *  event delivery to the recipient's subscription.
+   *  Ignored when {@link sharedNostrClient} is set. */
   identityPrivateKey?: Uint8Array;
+  /**
+   * Optional pre-existing {@link NostrClient} to reuse instead of opening a
+   * fresh WebSocket per relay (#123). When set, the Mux skips both the
+   * {@code new NostrClient(...)} construction and {@code connect()} — it
+   * only registers subscription/connection listeners on the shared
+   * client. The Mux does NOT take ownership: its {@code disconnect()}
+   * leaves the client connected, since the caller (e.g. the original
+   * {@link NostrTransportProvider}) still uses it for resolve calls.
+   *
+   * Use a getter when the client may be created lazily (e.g. before the
+   * provider has connected).
+   */
+  sharedNostrClient?: NostrClient | null | (() => NostrClient | null);
 }
 
 export class MultiAddressTransportMux {
-  private config: Required<Omit<MultiAddressTransportMuxConfig, 'createWebSocket' | 'generateUUID' | 'storage' | 'identityPrivateKey'>> & {
+  private config: Required<Omit<MultiAddressTransportMuxConfig, 'createWebSocket' | 'generateUUID' | 'storage' | 'identityPrivateKey' | 'sharedNostrClient'>> & {
     createWebSocket: WebSocketFactory;
     generateUUID: UUIDGenerator;
   };
@@ -147,9 +161,6 @@ export class MultiAddressTransportMux {
   private chatSubscriptionId: string | null = null;
   private chatEoseFired = false;
   private resubscribeTimer: ReturnType<typeof setTimeout> | null = null;
-  private lastWalletEventAt: number = Date.now();
-  private lastChatEventAt: number = Date.now();
-  private healthCheckTimer: ReturnType<typeof setInterval> | null = null;
   private chatEoseHandlers: Array<() => void> = [];
 
   // Dedup — bounded to prevent memory leak in long-running sessions.
@@ -164,6 +175,14 @@ export class MultiAddressTransportMux {
   // delivery to the recipient's subscription key.
   private readonly identityPrivateKey: Uint8Array | undefined;
 
+  // Resolves the shared NostrClient at use-time (the source provider may
+  // create its client lazily, after the Mux is constructed). null means
+  // "no shared client; create our own."
+  private readonly sharedNostrClientGetter: (() => NostrClient | null) | null;
+  // True when this Mux is using a shared NostrClient and therefore must
+  // not call connect()/disconnect() on it.
+  private usingSharedClient = false;
+
   constructor(config: MultiAddressTransportMuxConfig) {
     this.identityPrivateKey = config.identityPrivateKey;
     this.config = {
@@ -176,6 +195,15 @@ export class MultiAddressTransportMux {
       generateUUID: config.generateUUID ?? defaultUUIDGenerator,
     };
     this.storage = config.storage ?? null;
+
+    if (typeof config.sharedNostrClient === 'function') {
+      this.sharedNostrClientGetter = config.sharedNostrClient;
+    } else if (config.sharedNostrClient) {
+      const c = config.sharedNostrClient;
+      this.sharedNostrClientGetter = () => c;
+    } else {
+      this.sharedNostrClientGetter = null;
+    }
   }
 
   // ===========================================================================
@@ -291,27 +319,42 @@ export class MultiAddressTransportMux {
     this.status = 'connecting';
 
     try {
-      // Use the identity key if provided (avoids relay filtering issues where
-      // gift-wrap events are only pushed to subscriptions from the recipient's key).
-      // Falls back to random key.
-      if (!this.primaryKeyManager) {
-        if (this.identityPrivateKey) {
-          this.primaryKeyManager = NostrKeyManager.fromPrivateKey(
-            Buffer.from(this.identityPrivateKey),
+      // Prefer a shared NostrClient when the host (e.g. NostrTransportProvider)
+      // already has one open against the same relay set (#123). Sharing means
+      // a single WebSocket per relay instead of two.
+      const shared = this.sharedNostrClientGetter ? this.sharedNostrClientGetter() : null;
+      if (shared) {
+        if (!shared.isConnected()) {
+          throw new SphereError(
+            'sharedNostrClient is not connected; the Mux cannot share a closed socket',
+            'TRANSPORT_ERROR',
           );
-        } else {
-          const tempKey = Buffer.alloc(32);
-          crypto.getRandomValues(tempKey);
-          this.primaryKeyManager = NostrKeyManager.fromPrivateKey(tempKey);
         }
-      }
+        this.nostrClient = shared;
+        this.usingSharedClient = true;
+      } else {
+        // Use the identity key if provided (avoids relay filtering issues where
+        // gift-wrap events are only pushed to subscriptions from the recipient's key).
+        // Falls back to random key.
+        if (!this.primaryKeyManager) {
+          if (this.identityPrivateKey) {
+            this.primaryKeyManager = NostrKeyManager.fromPrivateKey(
+              Buffer.from(this.identityPrivateKey),
+            );
+          } else {
+            const tempKey = Buffer.alloc(32);
+            crypto.getRandomValues(tempKey);
+            this.primaryKeyManager = NostrKeyManager.fromPrivateKey(tempKey);
+          }
+        }
 
-      this.nostrClient = new NostrClient(this.primaryKeyManager, {
-        autoReconnect: this.config.autoReconnect,
-        reconnectIntervalMs: this.config.reconnectDelay,
-        maxReconnectIntervalMs: this.config.reconnectDelay * 16,
-        pingIntervalMs: 15000,
-      });
+        this.nostrClient = new NostrClient(this.primaryKeyManager, {
+          autoReconnect: this.config.autoReconnect,
+          reconnectIntervalMs: this.config.reconnectDelay,
+          maxReconnectIntervalMs: this.config.reconnectDelay * 16,
+          pingIntervalMs: 15000,
+        });
+      }
 
       this.nostrClient.addConnectionListener({
         onConnect: (url) => {
@@ -335,17 +378,19 @@ export class MultiAddressTransportMux {
         },
       });
 
-      await Promise.race([
-        this.nostrClient.connect(...this.config.relays),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error(
-            `Transport connection timed out after ${this.config.timeout}ms`
-          )), this.config.timeout)
-        ),
-      ]);
+      if (!this.usingSharedClient) {
+        await Promise.race([
+          this.nostrClient.connect(...this.config.relays),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error(
+              `Transport connection timed out after ${this.config.timeout}ms`
+            )), this.config.timeout)
+          ),
+        ]);
 
-      if (!this.nostrClient.isConnected()) {
-        throw new SphereError('Failed to connect to any relay', 'TRANSPORT_ERROR');
+        if (!this.nostrClient.isConnected()) {
+          throw new SphereError('Failed to connect to any relay', 'TRANSPORT_ERROR');
+        }
       }
 
       this.status = 'connected';
@@ -366,25 +411,92 @@ export class MultiAddressTransportMux {
       clearTimeout(this.resubscribeTimer);
       this.resubscribeTimer = null;
     }
-    if (this.healthCheckTimer) {
-      clearInterval(this.healthCheckTimer);
-      this.healthCheckTimer = null;
-    }
     if (this.nostrClient) {
-      this.nostrClient.disconnect();
+      // When the client is shared with another component (e.g. the
+      // outer NostrTransportProvider), that component owns the
+      // socket lifecycle. Tearing it down here would kill resolve
+      // calls and break #123's whole point — drop just our
+      // subscriptions and our reference.
+      if (this.walletSubscriptionId) {
+        try { this.nostrClient.unsubscribe(this.walletSubscriptionId); } catch { /* ignore */ }
+      }
+      if (this.chatSubscriptionId) {
+        try { this.nostrClient.unsubscribe(this.chatSubscriptionId); } catch { /* ignore */ }
+      }
+      if (!this.usingSharedClient) {
+        this.nostrClient.disconnect();
+      }
       this.nostrClient = null;
     }
+    this.usingSharedClient = false;
     this.walletSubscriptionId = null;
     this.chatSubscriptionId = null;
     this.chatEoseFired = false;
-    this.lastWalletEventAt = Date.now();
-    this.lastChatEventAt = Date.now();
     this.status = 'disconnected';
     this.emitEvent({ type: 'transport:disconnected', timestamp: Date.now() });
   }
 
   isConnected(): boolean {
     return this.status === 'connected' && this.nostrClient?.isConnected() === true;
+  }
+
+  /**
+   * Re-attach to a freshly-created shared NostrClient.
+   *
+   * Call this after the host (e.g. {@link NostrTransportProvider}) has
+   * recreated its NostrClient — typically because the wallet's active
+   * identity changed and the SDK's NostrClient does not support
+   * changing identity at runtime. The previous client has already
+   * been disconnected by the host, so its server-side subscriptions
+   * are gone — we just adopt the new client and re-issue our own.
+   *
+   * No-op when this Mux owns its own client (not sharing) or when the
+   * shared client isn't ready yet.
+   */
+  async rebindToSharedClient(): Promise<void> {
+    if (!this.usingSharedClient) return;
+    if (!this.sharedNostrClientGetter) return;
+
+    const newClient = this.sharedNostrClientGetter();
+    if (!newClient) return;
+    if (this.nostrClient === newClient) return;
+    if (!newClient.isConnected()) {
+      logger.debug('Mux', 'rebindToSharedClient: new shared client not yet connected, skipping');
+      return;
+    }
+
+    // Drop stale state. The relay dropped wallet/chat subs when the
+    // previous client disconnected, so the IDs are dead — don't try
+    // to unsubscribe through the now-disposed client.
+    this.nostrClient = newClient;
+    this.walletSubscriptionId = null;
+    this.chatSubscriptionId = null;
+    this.chatEoseFired = false;
+
+    this.nostrClient.addConnectionListener({
+      onConnect: (url) => {
+        logger.debug('Mux', 'Connected to relay (rebind):', url);
+        this.emitEvent({ type: 'transport:connected', timestamp: Date.now() });
+      },
+      onDisconnect: (url, reason) => {
+        logger.debug('Mux', 'Disconnected from relay (rebind):', url, 'reason:', reason);
+      },
+      onReconnecting: (url, attempt) => {
+        logger.debug('Mux', 'Reconnecting (rebind):', url, 'attempt:', attempt);
+        this.emitEvent({ type: 'transport:reconnecting', timestamp: Date.now() });
+      },
+      onReconnected: (url) => {
+        logger.debug('Mux', 'Reconnected (rebind):', url);
+        this.emitEvent({ type: 'transport:connected', timestamp: Date.now() });
+        this.updateSubscriptions().catch((err) => {
+          logger.error('Mux', 'Failed to re-subscribe after reconnect:', err);
+        });
+      },
+    });
+
+    if (this.addresses.size > 0) {
+      await this.updateSubscriptions();
+    }
   }
 
   /**
@@ -550,10 +662,6 @@ export class MultiAddressTransportMux {
       this.chatSubscriptionId = null;
     }
 
-    // Reset health check timestamps — fresh subscriptions start clean.
-    this.lastWalletEventAt = Date.now();
-    this.lastChatEventAt = Date.now();
-
     // Nothing to subscribe to if no addresses registered
     if (this.addresses.size === 0) return;
 
@@ -656,36 +764,14 @@ export class MultiAddressTransportMux {
 
     logger.debug('Mux', `updateSubscriptions: walletSub=${this.walletSubscriptionId} chatSub=${this.chatSubscriptionId}`);
 
-    // Start subscription health check — if no events arrive for 90s,
-    // the relay may have silently dropped our subscriptions without
-    // sending CLOSED. Force re-subscribe to recover.
-    this.startHealthCheck();
-  }
-
-  private startHealthCheck(): void {
-    if (this.healthCheckTimer) return;
-    this.healthCheckTimer = setInterval(() => {
-      if (!this.isConnected()) return;
-      // Check wallet subscription health separately from chat subscription.
-      // DMs (gift wraps) keep the chat subscription alive, but the wallet
-      // subscription (TOKEN_TRANSFER events) can die silently.
-      // Check BOTH subscriptions independently — chat is more latency-sensitive.
-      const chatElapsed = Date.now() - this.lastChatEventAt;
-      const walletElapsed = Date.now() - this.lastWalletEventAt;
-      const needResubscribe = chatElapsed > 60_000 || walletElapsed > 300_000;
-
-      if (needResubscribe) {
-        const reason = chatElapsed > 60_000
-          ? `No chat events for ${Math.round(chatElapsed / 1000)}s`
-          : `No wallet events for ${Math.round(walletElapsed / 1000)}s`;
-        logger.warn('Mux', `${reason} — re-subscribing`);
-        this.lastChatEventAt = Date.now();
-        this.lastWalletEventAt = Date.now();
-        this.updateSubscriptions().catch((err) => {
-          logger.warn('Mux', 'Health check re-subscription failed:', err);
-        });
-      }
-    }, 30_000);
+    // No application-layer healthcheck (#122). Connection-level
+    // liveness is owned by the SDK's keepalive timer (one per relay
+    // socket — pingIntervalMs: 15000), and relay-initiated CLOSED
+    // frames flow through onError → scheduleResubscribe(). The
+    // previous "no events for 60s" heuristic was prone to false
+    // positives during quiet periods and an EOSE probe at this layer
+    // would just duplicate what the SDK already does on the same
+    // socket (#123 made the Mux share that socket).
   }
 
   /**
@@ -753,14 +839,6 @@ export class MultiAddressTransportMux {
         }
       }
     }
-    // Track wallet and chat events separately for subscription health checks.
-    if (event.kind !== EventKinds.GIFT_WRAP) {
-      this.lastWalletEventAt = Date.now();
-    }
-    if (event.kind === EventKinds.GIFT_WRAP) {
-      this.lastChatEventAt = Date.now();
-    }
-
     try {
       if (event.kind === EventKinds.GIFT_WRAP) {
         // Gift wrap (NIP-17): must try decryption with each address's keyManager
