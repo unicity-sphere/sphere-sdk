@@ -44,8 +44,18 @@ export const DEFAULT_MAX_REASON_LENGTH = 200;
  * inclusion in a log record, a thrown `SphereError` message, or an
  * emitted event payload.
  *
+ * **Code-point-aware truncation (Round 5 fix).** JavaScript strings are
+ * UTF-16. A naive `slice(0, cap-1)` may land inside a surrogate pair —
+ * a hostile aggregator can craft a string padded with emoji (each one
+ * a UTF-16 surrogate pair) so the slice boundary lands on a high
+ * surrogate, leaving an unpaired surrogate that breaks downstream
+ * `JSON.stringify` / `Buffer.from('utf8')` / log shippers. We use
+ * `Array.from(str)` which iterates by Unicode code point, so the cap
+ * is enforced on code points (not UTF-16 code units) and the boundary
+ * never lands mid-pair.
+ *
  * @param raw   The untrusted input string.
- * @param cap   Optional truncation cap; defaults to
+ * @param cap   Optional truncation cap (in CODE POINTS); defaults to
  *              {@link DEFAULT_MAX_REASON_LENGTH}.
  * @returns     The sanitized + (possibly) truncated string.
  */
@@ -62,9 +72,66 @@ export function sanitizeReasonString(
     /[\x00-\x1F\x7F-\x9F<>&]/g,
     '',
   );
-  if (stripped.length <= cap) return stripped;
-  // Reserve 1 char for the truncation marker `…`.
-  return `${stripped.slice(0, cap - 1)}…`;
+  // Iterate by Unicode code point (not UTF-16 code unit) so the cap
+  // boundary never lands inside a surrogate pair. `Array.from(str)`
+  // uses the string iterator, which yields one element per code point.
+  const codePoints = Array.from(stripped);
+  if (codePoints.length <= cap) return stripped;
+  // Reserve 1 code point for the truncation marker `…`.
+  return `${codePoints.slice(0, cap - 1).join('')}…`;
+}
+
+/**
+ * Sentinel emitted when a hostile Error subclass exposes a throwing
+ * getter for `.message` / `.name`. Returned in lieu of letting the throw
+ * propagate out of the sanitizer (which would crash callers that
+ * already caught a child error and only meant to log it).
+ */
+const REDACTED_GETTER_THREW = '[REDACTED: getter-threw]';
+
+/**
+ * Read `err.message` defensively. Round 5 fix: a hostile `Error`
+ * subclass — or a `Proxy` impersonating an Error — can install a
+ * throwing getter on `.message` (or `.name`) so any naïve catch handler
+ * that calls `err.message` re-throws AGAIN, propagating out of the
+ * caller's catch and bypassing sanitization. We wrap the read in
+ * try/catch and substitute a sentinel on throw.
+ *
+ * Centralized helper so every catch site uses the SAME defensive
+ * pattern. Replaces the bare `err instanceof Error ? err.message :
+ * String(err)` idiom across the codebase.
+ *
+ * Note: this returns the RAW (unsanitized) message string. Callers that
+ * splice the result into a thrown `SphereError` message or an emitted
+ * event payload SHOULD additionally pipe through
+ * {@link sanitizeReasonString} so control chars / HTML / oversize
+ * payloads are scrubbed. {@link sanitizeError} below does both in one
+ * call when a sanitized result is needed.
+ */
+export function safeErrorMessage(err: unknown): string {
+  if (err instanceof Error) {
+    let message: unknown;
+    try {
+      message = err.message;
+    } catch {
+      return REDACTED_GETTER_THREW;
+    }
+    if (typeof message === 'string' && message.length > 0) return message;
+    let name: unknown;
+    try {
+      name = err.name;
+    } catch {
+      return REDACTED_GETTER_THREW;
+    }
+    if (typeof name === 'string' && name.length > 0) return name;
+    return REDACTED_GETTER_THREW;
+  }
+  if (typeof err === 'string') return err;
+  try {
+    return String(err);
+  } catch {
+    return REDACTED_GETTER_THREW;
+  }
 }
 
 /**
@@ -73,9 +140,10 @@ export function sanitizeReasonString(
  *
  * Behavior:
  *   - `Error` instances → use `err.message` (or `err.name` if message
- *     is falsy). The Error itself is NOT walked through W40 redaction
- *     here; callers that need redaction should pass the Error through
- *     {@link import('./errors').redactCause} first.
+ *     is falsy), via the {@link safeErrorMessage} helper which guards
+ *     against throwing getters. The Error itself is NOT walked through
+ *     W40 redaction here; callers that need redaction should pass the
+ *     Error through {@link import('./errors').redactCause} first.
  *   - Strings → used verbatim.
  *   - Anything else → `JSON.stringify` (with a `String(err)` fallback
  *     if stringify throws — e.g. a circular structure).
@@ -85,14 +153,18 @@ export function sanitizeReasonString(
 export function sanitizeError(err: unknown, cap?: number): string {
   let raw: string;
   if (err instanceof Error) {
-    raw = err.message || err.name;
+    raw = safeErrorMessage(err);
   } else if (typeof err === 'string') {
     raw = err;
   } else {
     try {
       raw = JSON.stringify(err);
     } catch {
-      raw = String(err);
+      try {
+        raw = String(err);
+      } catch {
+        raw = REDACTED_GETTER_THREW;
+      }
     }
   }
   return sanitizeReasonString(raw, cap);
