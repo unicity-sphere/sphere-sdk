@@ -563,9 +563,13 @@ const REDACTED_FIELDS_SET: ReadonlySet<string> = new Set(REDACTED_FIELDS);
  *    as-is. Redaction is FIELD-NAME-driven; a bare buffer doesn't carry
  *    a name, so we leave it alone. Buffers nested under a redacted-name
  *    field ARE redacted (and reported with byte length).
- *  - `Error` instance → returned as-is (Error chains traverse via the
- *    native `cause` getter, not our walker; we don't deep-clone Error
- *    instances because Sentry/pino want the original prototype).
+ *  - `Error` instance → CLONED into a new object with the same prototype
+ *    (so `instanceof MyCustomError` still works downstream). `name`,
+ *    `message`, `stack` are copied verbatim. `cause` recurses through the
+ *    redactor. Own enumerable string-keyed properties are walked through
+ *    `redactValue` recursively — keys in {@link REDACTED_FIELDS} get the
+ *    marker. Symbol-keyed and non-enumerable properties are dropped (they
+ *    don't appear in `Object.keys(...)`).
  *  - Plain `Array` → mapped element-by-element, preserving array-ness.
  *  - Plain object → property-by-property; keys in {@link REDACTED_FIELDS}
  *    are replaced with a redaction marker. Other keys recurse.
@@ -604,9 +608,85 @@ function redactValue(
   const t = typeof value;
   if (t !== 'object' && t !== 'function') return value; // primitive
 
-  // Errors are passed through untouched (consumers expect prototype
-  // identity preserved); their own .cause walks via the native getter.
-  if (value instanceof Error) return value;
+  // Steelman crit #17: Error instances were previously passed through
+  // identity-untouched. That bypassed the W40 redaction layer entirely
+  // for any sensitive own-property attached to an Error (e.g.
+  // `signedTransferTxBytes`). Now we CLONE the Error: same prototype
+  // (so `err instanceof CustomError` still works), but enumerable own
+  // properties are walked through the redactor.
+  if (value instanceof Error) {
+    const errObj = value;
+    const memoExisting = visited.get(errObj);
+    if (memoExisting !== undefined) return memoExisting;
+    // Preserve prototype identity. Object.create avoids re-running
+    // a (potentially throwing) Error constructor.
+    const proto = Object.getPrototypeOf(errObj) as object | null;
+    const clone = Object.create(proto) as Record<string, unknown>;
+    visited.set(errObj, clone);
+    // Copy core Error properties verbatim — they are NOT walked through
+    // the redactor because their value space is well-known. `name`,
+    // `message`, `stack` are strings; `cause` is recursed.
+    let errName: unknown;
+    try {
+      errName = errObj.name;
+    } catch {
+      errName = '[REDACTED: getter-threw]';
+    }
+    if (errName !== undefined) clone.name = errName;
+    let errMessage: unknown;
+    try {
+      errMessage = errObj.message;
+    } catch {
+      errMessage = '[REDACTED: getter-threw]';
+    }
+    if (errMessage !== undefined) clone.message = errMessage;
+    let errStack: unknown;
+    try {
+      errStack = errObj.stack;
+    } catch {
+      errStack = '[REDACTED: getter-threw]';
+    }
+    if (errStack !== undefined) clone.stack = errStack;
+    let errCause: unknown;
+    try {
+      errCause = (errObj as { cause?: unknown }).cause;
+    } catch {
+      errCause = '[REDACTED: getter-threw]';
+    }
+    if (errCause !== undefined) {
+      clone.cause = redactValue(errCause, visited, depth + 1);
+    }
+    // Walk own enumerable string-keyed properties. Symbol-keyed and
+    // non-enumerable properties are intentionally dropped (they don't
+    // appear in `Object.keys(...)`); this is the same shape as the
+    // plain-object branch below.
+    let keys: string[];
+    try {
+      keys = Object.keys(errObj);
+    } catch {
+      return clone;
+    }
+    for (const key of keys) {
+      // Skip the standard Error trio — we already copied them above
+      // (name/message/stack become own properties when assigned).
+      if (key === 'name' || key === 'message' || key === 'stack' || key === 'cause') {
+        continue;
+      }
+      let v: unknown;
+      try {
+        v = (errObj as unknown as Record<string, unknown>)[key];
+      } catch {
+        clone[key] = '[REDACTED: getter-threw]';
+        continue;
+      }
+      if (REDACTED_FIELDS_SET.has(key)) {
+        clone[key] = redactionMarkerFor(key, v);
+      } else {
+        clone[key] = redactValue(v, visited, depth + 1);
+      }
+    }
+    return clone;
+  }
 
   // Buffers / typed arrays at the top level are passed through; only
   // fields named in REDACTED_FIELDS get the marker treatment. Top-level

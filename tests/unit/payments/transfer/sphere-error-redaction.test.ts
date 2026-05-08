@@ -359,3 +359,105 @@ describe('W40 — isSphereError type guard works after redaction', () => {
     expect(isSphereError(err)).toBe(true);
   });
 });
+
+// =============================================================================
+// 10. Steelman crit #17 — Error-instance bypass closure.
+//
+// Previously `redactValue` returned `Error` instances identity-untouched.
+// That meant a hostile/forensic Error supplied as `cause` (or nested under
+// `cause`) could carry an enumerable own-property like `signedTransferTxBytes`
+// straight through the redaction layer.
+//
+// Fix: clone the Error preserving prototype, but redact own enumerable
+// string-keyed properties.
+// =============================================================================
+
+describe('W40 — steelman crit #17: Error-instance bypass closed', () => {
+  const SECRET_BYTES = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
+
+  it('redacts signedTransferTxBytes attached as own-property on a top-level Error cause', () => {
+    const errCause = new Error('forensic');
+    (errCause as unknown as { signedTransferTxBytes: Uint8Array }).signedTransferTxBytes =
+      SECRET_BYTES;
+    const err = new SphereError('m', 'STRUCTURAL_INVALID', errCause);
+    const redactedCause = err.cause as { signedTransferTxBytes: unknown; message: string };
+    expect(redactedCause.signedTransferTxBytes).toBe(
+      `[REDACTED: signedTransferTxBytes(${SECRET_BYTES.byteLength}-bytes)]`,
+    );
+    // Message is preserved on the clone.
+    expect(redactedCause.message).toBe('forensic');
+  });
+
+  it('redacts signedTransferTxBytes nested under a plain { cause: errorInstance }', () => {
+    const errInner = new Error('inner');
+    (errInner as unknown as { signedTransferTxBytes: Uint8Array }).signedTransferTxBytes =
+      SECRET_BYTES;
+    const err = new SphereError('m', 'STRUCTURAL_INVALID', { cause: errInner });
+    const ctx = err.cause as { cause: { signedTransferTxBytes: unknown; message: string } };
+    expect(ctx.cause.signedTransferTxBytes).toBe(
+      `[REDACTED: signedTransferTxBytes(${SECRET_BYTES.byteLength}-bytes)]`,
+    );
+    expect(ctx.cause.message).toBe('inner');
+  });
+
+  it('preserves prototype identity — clone is still instanceof CustomError', () => {
+    class CustomError extends Error {
+      readonly tag: string;
+      constructor(message: string, tag: string) {
+        super(message);
+        this.name = 'CustomError';
+        this.tag = tag;
+      }
+    }
+    const original = new CustomError('boom', 't1');
+    (original as unknown as { signedTransferTxBytes: Uint8Array }).signedTransferTxBytes =
+      SECRET_BYTES;
+    const err = new SphereError('m', 'STRUCTURAL_INVALID', original);
+    const clone = err.cause as unknown;
+    expect(clone).toBeInstanceOf(CustomError);
+    expect(clone).toBeInstanceOf(Error);
+    expect((clone as CustomError).tag).toBe('t1');
+    expect((clone as { signedTransferTxBytes: unknown }).signedTransferTxBytes).toBe(
+      `[REDACTED: signedTransferTxBytes(${SECRET_BYTES.byteLength}-bytes)]`,
+    );
+  });
+
+  it('drops symbol-keyed sensitive properties (load-bearing: Object.keys does not list symbols)', () => {
+    const SECRET = Symbol('signedTransferTxBytes');
+    const errCause = new Error('forensic');
+    (errCause as unknown as Record<symbol, Uint8Array>)[SECRET] = SECRET_BYTES;
+    const err = new SphereError('m', 'STRUCTURAL_INVALID', errCause);
+    const clone = err.cause as Record<string, unknown>;
+    // Symbol-keyed property is NOT carried over to the clone.
+    expect((clone as Record<symbol, unknown>)[SECRET]).toBeUndefined();
+  });
+
+  it('drops non-enumerable sensitive properties (load-bearing: Object.keys lists only enumerables)', () => {
+    const errCause = new Error('forensic');
+    Object.defineProperty(errCause, 'signedTransferTxBytes', {
+      value: SECRET_BYTES,
+      enumerable: false,
+      writable: true,
+      configurable: true,
+    });
+    const err = new SphereError('m', 'STRUCTURAL_INVALID', errCause);
+    const clone = err.cause as Record<string, unknown>;
+    // Non-enumerable property does not appear on the clone.
+    expect(clone.signedTransferTxBytes).toBeUndefined();
+  });
+
+  it('handles a self-referential Error without infinite loop (WeakMap memo)', () => {
+    const errCause = new Error('forensic');
+    (errCause as unknown as { self?: unknown }).self = errCause;
+    (errCause as unknown as { signedTransferTxBytes: Uint8Array }).signedTransferTxBytes =
+      SECRET_BYTES;
+    const err = new SphereError('m', 'STRUCTURAL_INVALID', errCause);
+    const clone = err.cause as { self: unknown; signedTransferTxBytes: unknown };
+    // The self-reference points at the SAME cloned object.
+    expect(clone.self).toBe(clone);
+    // Sensitive byte field still redacted on the single shared clone.
+    expect(clone.signedTransferTxBytes).toBe(
+      `[REDACTED: signedTransferTxBytes(${SECRET_BYTES.byteLength}-bytes)]`,
+    );
+  });
+});
