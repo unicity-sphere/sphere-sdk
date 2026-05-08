@@ -2133,3 +2133,163 @@ describe('IngestWorkerPool — Round 3 fix #4: operator-alert rate limit', () =>
     ).toThrow(SphereError);
   });
 });
+
+// =============================================================================
+// Round 5 fixes — operatorAlertWindows bounded LRU + NTP backward jump
+// =============================================================================
+
+describe('IngestWorkerPool — Round 5 FIX 1: operatorAlertWindows bounded LRU', () => {
+  it('Map size never exceeds OPERATOR_ALERT_WINDOWS_HARD_CAP under 20k distinct senders', async () => {
+    // Build a pool. We will NOT enqueue real bundles — instead we
+    // poke the private maybeEmitOperatorAlert directly with synthetic
+    // QueueEntry-like objects, which is the path that grows the Map.
+    const pool = new IngestWorkerPool({
+      lru: new ReplayLRU(),
+      perTokenMutex: new PerTokenMutex(),
+      processToken: vi.fn(),
+      emit: () => undefined,
+      operatorAlertRateLimitMs: 60_000, // long window — entries linger
+    });
+    try {
+      // Access the private API for direct ledger pumping.
+      const internal = pool as unknown as {
+        maybeEmitOperatorAlert: (
+          entry: {
+            senderTransportPubkey: string;
+            payload: { bundleCid: string };
+          },
+          body: { code: 'structural'; message: string },
+        ) => void;
+        operatorAlertWindows: Map<string, unknown>;
+      };
+
+      const HARD_CAP = 10000;
+      for (let i = 0; i < 20000; i++) {
+        const sender = `s${i.toString().padStart(63, '0')}`;
+        internal.maybeEmitOperatorAlert(
+          { senderTransportPubkey: sender, payload: { bundleCid: 'b' } },
+          { code: 'structural', message: 'x' },
+        );
+        // Invariant: Map MUST never exceed the hard cap.
+        expect(internal.operatorAlertWindows.size).toBeLessThanOrEqual(HARD_CAP);
+      }
+
+      // Final size at hard cap.
+      expect(internal.operatorAlertWindows.size).toBeLessThanOrEqual(HARD_CAP);
+    } finally {
+      await pool.destroy();
+    }
+  });
+
+  it('LRU evicts the oldest entry first (insertion-order semantics)', async () => {
+    const pool = new IngestWorkerPool({
+      lru: new ReplayLRU(),
+      perTokenMutex: new PerTokenMutex(),
+      processToken: vi.fn(),
+      emit: () => undefined,
+      operatorAlertRateLimitMs: 60_000,
+    });
+    try {
+      const internal = pool as unknown as {
+        maybeEmitOperatorAlert: (
+          entry: {
+            senderTransportPubkey: string;
+            payload: { bundleCid: string };
+          },
+          body: { code: 'structural'; message: string },
+        ) => void;
+        operatorAlertWindows: Map<string, unknown>;
+      };
+
+      // Fill the Map to the cap, then add 3 more — the first 3 inserts
+      // should be evicted.
+      const HARD_CAP = 10000;
+      for (let i = 0; i < HARD_CAP + 3; i++) {
+        const sender = `s${i.toString().padStart(63, '0')}`;
+        internal.maybeEmitOperatorAlert(
+          { senderTransportPubkey: sender, payload: { bundleCid: 'b' } },
+          { code: 'structural', message: 'x' },
+        );
+      }
+      expect(internal.operatorAlertWindows.size).toBe(HARD_CAP);
+      // The oldest 3 are gone; entries 3..HARD_CAP+2 remain.
+      expect(internal.operatorAlertWindows.has(`s${'0'.repeat(63)}`)).toBe(false);
+      expect(internal.operatorAlertWindows.has(`s${'1'.padStart(63, '0')}`)).toBe(false);
+      expect(internal.operatorAlertWindows.has(`s${'2'.padStart(63, '0')}`)).toBe(false);
+      expect(internal.operatorAlertWindows.has(`s${'3'.padStart(63, '0')}`)).toBe(true);
+    } finally {
+      await pool.destroy();
+    }
+  });
+});
+
+describe('IngestWorkerPool — Round 5 FIX 3: rate-limit window resets on backward NTP jump', () => {
+  it('emits a fresh alert after Date.now() steps backward (window resets)', async () => {
+    // Use a fresh pool with a moderate rate-limit window. We will:
+    //   1) emit one alert (window opens)
+    //   2) emit another within the window (suppressed)
+    //   3) manipulate Date.now() to step backward past windowStart
+    //   4) emit another alert (rate limit defeated → must emit)
+    const events: Array<{ event: SphereEventType; payload: unknown }> = [];
+    const pool = new IngestWorkerPool({
+      lru: new ReplayLRU(),
+      perTokenMutex: new PerTokenMutex(),
+      processToken: vi.fn(),
+      emit: (event, payload) => {
+        events.push({ event, payload: payload as unknown });
+      },
+      operatorAlertRateLimitMs: 60_000,
+    });
+    try {
+      const internal = pool as unknown as {
+        maybeEmitOperatorAlert: (
+          entry: {
+            senderTransportPubkey: string;
+            payload: { bundleCid: string };
+          },
+          body: { code: 'structural'; message: string },
+        ) => void;
+        operatorAlertWindows: Map<string, { windowStart: number; suppressed: number }>;
+      };
+      const sender = 'aa'.repeat(32);
+      const synth = {
+        senderTransportPubkey: sender,
+        payload: { bundleCid: 'b' },
+      };
+
+      // Step 1 — initial alert opens a fresh window.
+      internal.maybeEmitOperatorAlert(synth, { code: 'structural', message: 'first' });
+      let alerts = events.filter((e) => e.event === 'transfer:operator-alert');
+      expect(alerts.length).toBe(1);
+
+      // Step 2 — second alert within window is suppressed.
+      internal.maybeEmitOperatorAlert(synth, { code: 'structural', message: 'second' });
+      alerts = events.filter((e) => e.event === 'transfer:operator-alert');
+      expect(alerts.length).toBe(1);
+
+      // Step 3 — manipulate the entry's windowStart far into the
+      // future to simulate Date.now() having stepped backward (i.e.,
+      // windowStart > now). The maybeEmitOperatorAlert path detects
+      // this and resets the window.
+      const win = internal.operatorAlertWindows.get(sender);
+      expect(win).toBeDefined();
+      if (win) {
+        // Place windowStart 10 minutes in the future relative to now.
+        win.windowStart = Date.now() + 10 * 60 * 1000;
+      }
+
+      // Step 4 — emit again. The backward-jump branch must reset the
+      // window and emit a fresh live alert.
+      internal.maybeEmitOperatorAlert(synth, { code: 'structural', message: 'after-jump' });
+      alerts = events.filter((e) => e.event === 'transfer:operator-alert');
+      // Must have grown by at least one (the fresh alert post-reset).
+      expect(alerts.length).toBeGreaterThanOrEqual(2);
+      // The second alert is the fresh live one, not a 'suppressed' summary.
+      const last = alerts[alerts.length - 1];
+      const lastMsg = (last.payload as { message?: string }).message ?? '';
+      expect(lastMsg).toContain('after-jump');
+    } finally {
+      await pool.destroy();
+    }
+  });
+});

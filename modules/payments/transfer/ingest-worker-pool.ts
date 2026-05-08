@@ -211,6 +211,36 @@ export const BUNDLE_MAX_PROCESSING_MS = 60_000;
  */
 export const OPERATOR_ALERT_RATE_LIMIT_WINDOW_MS = 60_000;
 
+/**
+ * Round 5 fix — hard cap on the number of distinct senders the
+ * per-sender rate-limit ledger ({@link
+ * IngestWorkerPool#operatorAlertWindows}) tracks at once.
+ *
+ * Without a cap, a hostile actor rotating ephemeral pubkeys grows the
+ * Map indefinitely (unbounded memory). When the Map crosses this size
+ * we evict in insertion-order (LRU semantics: Map preserves insertion
+ * order; touching an entry deletes-and-reinserts to re-rank to MRU).
+ *
+ * Default 10000 entries × ~64 bytes ≈ 640 KiB hard cap. Combined with
+ * the opportunistic-prune path (1-in-100 calls drops entries whose
+ * window expired more than `2 × operatorAlertRateLimitMs` ago) the
+ * Map is bounded even under adversarial pubkey rotation.
+ *
+ * @internal
+ */
+export const OPERATOR_ALERT_WINDOWS_HARD_CAP = 10000;
+
+/**
+ * Round 5 fix — opportunistic-prune sampling rate. On every Nth call
+ * to {@link IngestWorkerPool#maybeEmitOperatorAlert} (N defined here),
+ * the Map is swept for entries whose window expired more than
+ * `2 × operatorAlertRateLimitMs` ago and they're deleted. Cheap
+ * amortized cost, keeps the Map shrinking under steady-state churn.
+ *
+ * @internal
+ */
+export const OPERATOR_ALERT_PRUNE_SAMPLE_RATE = 100;
+
 // =============================================================================
 // 2. Public types — caller-supplied per-bundle / per-token hooks
 // =============================================================================
@@ -472,14 +502,35 @@ export class IngestWorkerPool {
   /**
    * Round 3 fix — per-sender operator-alert rate limit ledger.
    * Maps `senderTransportPubkey` → window state. Entries are
-   * lazily expired on access. Bounded by the number of distinct
-   * timed-out senders; each entry is ~64 bytes so even a 10k-sender
-   * flood costs <1 MiB until the window rolls.
+   * lazily expired on access.
+   *
+   * Round 5 fix (CRIT NEW): hard-bounded LRU. Without the cap a
+   * hostile actor rotating ephemeral pubkeys grows the Map
+   * indefinitely (unbounded memory). Eviction policy: at
+   * {@link OPERATOR_ALERT_WINDOWS_HARD_CAP} entries the
+   * least-recently-touched (oldest insertion-order) entry is dropped
+   * on every new insert. Touching an existing entry re-ranks it to
+   * MRU via delete + re-insert (Map preserves insertion order).
+   *
+   * Combined with the opportunistic-prune path (every
+   * {@link OPERATOR_ALERT_PRUNE_SAMPLE_RATE}'th call) the Map shrinks
+   * under steady-state churn even when no insertion would otherwise
+   * trigger eviction.
    */
   private readonly operatorAlertWindows = new Map<
     string,
     { windowStart: number; suppressed: number }
   >();
+  /**
+   * Round 5 fix — counter feeding the opportunistic-prune sampling
+   * trigger. Incremented on every {@link maybeEmitOperatorAlert}
+   * call; when `% OPERATOR_ALERT_PRUNE_SAMPLE_RATE === 0` the Map
+   * is swept for entries whose window expired more than `2 ×
+   * operatorAlertRateLimitMs` ago.
+   *
+   * @internal
+   */
+  private operatorAlertPruneCounter = 0;
 
   /** FIFO queue. Workers `shift()`; `enqueue()` `push()`es. */
   private readonly queue: QueueEntry[] = [];
@@ -1006,6 +1057,20 @@ export class IngestWorkerPool {
    * the alert immediately. If a window had accumulated suppressed
    * alerts and is now expired, we emit a single summary alert with the
    * suppressed count alongside the new "fresh" alert.
+   *
+   * Round 5 fix (CRIT NEW): the per-sender Map is bounded via
+   * {@link OPERATOR_ALERT_WINDOWS_HARD_CAP} hard-cap LRU eviction
+   * (oldest insertion-order entry is evicted on overflow) PLUS an
+   * opportunistic-prune path (every
+   * {@link OPERATOR_ALERT_PRUNE_SAMPLE_RATE} calls). Without the
+   * bound, a hostile sender rotating ephemeral pubkeys grew the Map
+   * indefinitely.
+   *
+   * Round 5 fix (HIGH NEW): NTP backward jump defeats the rate-limit
+   * because `now < windowStart` ⇒ `now - windowStart < 0 < rateLimitMs`,
+   * so the window-expiry branch is never taken. We detect `now <
+   * windowStart` and reset the window (treat the new wall-clock as a
+   * fresh window start).
    */
   private maybeEmitOperatorAlert(
     entry: QueueEntry,
@@ -1013,13 +1078,41 @@ export class IngestWorkerPool {
   ): void {
     const now = Date.now();
     const sender = entry.senderTransportPubkey;
+
+    // Round 5 — opportunistic prune. Every Nth call sweep entries
+    // whose window expired more than `2 × rateLimitMs` ago. Cheap
+    // amortized; keeps the Map shrinking under steady-state churn.
+    this.operatorAlertPruneCounter += 1;
+    if (
+      this.operatorAlertPruneCounter % OPERATOR_ALERT_PRUNE_SAMPLE_RATE === 0
+    ) {
+      const cutoff = now - this.operatorAlertRateLimitMs * 2;
+      for (const [k, v] of this.operatorAlertWindows) {
+        // Round 5 — also drop entries with windowStart > now (i.e.,
+        // a clock that jumped backward). Such entries can never be
+        // evaluated correctly until time catches up; drop them so a
+        // fresh window opens cleanly on the next alert.
+        if (v.windowStart > now || v.windowStart < cutoff) {
+          this.operatorAlertWindows.delete(k);
+        }
+      }
+    }
+
     const window = this.operatorAlertWindows.get(sender);
-    if (!window || now - window.windowStart >= this.operatorAlertRateLimitMs) {
-      // Window expired (or never opened). If the previous window had
-      // suppressed alerts, emit a summary BEFORE the new fresh alert
-      // so operators see "X suppressed in the last window" alongside
-      // the next live event.
-      if (window && window.suppressed > 0) {
+    // Round 5 — backward-NTP-jump detection. If `now < windowStart`
+    // the window check below cannot fire (negative elapsed), so treat
+    // it as "window expired" and start fresh.
+    const backwardJump = window !== undefined && now < window.windowStart;
+    if (
+      !window ||
+      backwardJump ||
+      now - window.windowStart >= this.operatorAlertRateLimitMs
+    ) {
+      // Window expired (or never opened, or backward NTP jump). If
+      // the previous window had suppressed alerts, emit a summary
+      // BEFORE the new fresh alert so operators see "X suppressed in
+      // the last window" alongside the next live event.
+      if (window && window.suppressed > 0 && !backwardJump) {
         this.emit('transfer:operator-alert', {
           code: 'structural',
           bundleCid: entry.payload.bundleCid,
@@ -1030,8 +1123,23 @@ export class IngestWorkerPool {
             `rate-limit window for sender (Round 3 per-sender cap)`,
         });
       }
-      // Open a fresh window and emit the live alert.
+      // Round 5 — re-rank to MRU: delete-then-set preserves Map's
+      // insertion-order semantics so the LRU eviction at the hard
+      // cap drops the truly oldest entry.
+      this.operatorAlertWindows.delete(sender);
       this.operatorAlertWindows.set(sender, { windowStart: now, suppressed: 0 });
+
+      // Round 5 — hard-cap LRU eviction. Map iterates in insertion
+      // order, so `keys().next()` returns the oldest. Loop guards
+      // against pathological cases (size > cap by more than 1).
+      while (this.operatorAlertWindows.size > OPERATOR_ALERT_WINDOWS_HARD_CAP) {
+        const oldest = this.operatorAlertWindows.keys().next();
+        if (oldest.done === true || oldest.value === undefined) break;
+        // Defensive: never evict the entry we just inserted.
+        if (oldest.value === sender) break;
+        this.operatorAlertWindows.delete(oldest.value);
+      }
+
       this.emit('transfer:operator-alert', {
         code: body.code,
         bundleCid: entry.payload.bundleCid,
