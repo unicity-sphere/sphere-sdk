@@ -92,16 +92,21 @@ export interface ManifestStoreOptions {
  * rules. Pure / deterministic — no side effects, no clock mutation.
  *
  * **Field merge semantics** (per §5.4):
- *  - `rootHash` — taken from `next` when `prev.rootHash === next.rootHash`
- *    (canonical path: conflict-merger stamped the winner as `next`). On
- *    divergence, defense-in-depth symmetric tie-break: lex-min
- *    `bundleCid` if either side carries it; lex-min `rootHash` otherwise.
- *    Ensures `mergeManifestEntry(A, B) === mergeManifestEntry(B, A)`
- *    even if a future caller bypasses `conflict-merger` (T.3.D).
- *  - `status`   — taken from the chain-content winner (per the rootHash
- *    selection above). When rootHashes match, that's `next`.
- *  - `invalidReason` — preserved if either side has it set; on
- *    divergence, prefer `next` (the latest signal).
+ *  - `rootHash` — same on both sides on the canonical path (the §5.3 [D]
+ *    conflict-merger stamps the winner as `next`); on divergence, the
+ *    symmetric defense-in-depth tie-break {@link pickChainWinnerSymmetric}
+ *    selects a stable winner. Ensures `mergeManifestEntry(A, B) ===
+ *    mergeManifestEntry(B, A)` even if a future caller bypasses the
+ *    conflict-merger.
+ *  - `status` — when rootHashes diverge, taken from the same chain-content
+ *    winner as `rootHash`. When rootHashes match, FIELD-BY-FIELD symmetric
+ *    tie-break: prefer the stronger observation per
+ *    {@link STATUS_STRENGTH_ORDER} (`valid > pending > pending-conflicting
+ *    > conflicting > invalid`); on tie, lex-min. Required because two
+ *    replicas may reach the same rootHash via independent paths and stamp
+ *    different `status` values.
+ *  - `invalidReason` — non-null wins over null; both null → undefined; on
+ *    both-set tie, lex-min.
  *  - `splitParent` — preserved if either side has it set. On
  *    divergence, log warning (defect: a token cannot have two parents)
  *    and use the lex-min value (deterministic across replicas).
@@ -110,9 +115,21 @@ export interface ManifestStoreOptions {
  *  - `lamport` — `max(prev, next)` per §7.1.
  *  - `lastProofRefreshAt` — `max(prev, next)` (most-recent-proof rule
  *    per §6.3; prefer the side with fresher proof material).
- *  - `bundleCid` / `senderTransportPubkey` — taken from the
- *    chain-winning side (i.e., `next`); preserved when `next` lacks
- *    them.
+ *  - `bundleCid` — when rootHashes diverge, taken from the chain winner
+ *    (with carry-through from the loser). When rootHashes match: non-null
+ *    wins over null; on both-set tie, lex-min.
+ *  - `senderTransportPubkey` — when rootHashes diverge, taken from the
+ *    chain winner (with carry-through). When rootHashes match: non-null
+ *    wins over null; on both-set tie, lex-min.
+ *
+ * **Symmetry contract** (steelman crit #13). For ANY two manifest entries
+ * with identical `rootHash` but disagreeing `status` / `invalidReason` /
+ * `bundleCid` / `senderTransportPubkey`, `mergeManifestEntry(A, B)` and
+ * `mergeManifestEntry(B, A)` produce structurally-equal outputs. The
+ * previous implementation took these fields wholesale from `next`, which
+ * broke commutativity when replicas observed the same rootHash but
+ * different metadata. The field-by-field symmetric tie-break above
+ * closes that hole.
  *
  * @param prev The currently-persisted entry, or `undefined` for first write.
  * @param next The new entry to fold in.
@@ -175,7 +192,7 @@ export function mergeManifestEntry(
   }
 
   // ---------------------------------------------------------------------------
-  // Chain-content fields — symmetric defense-in-depth tie-break on divergence.
+  // Chain-content fields — symmetric defense-in-depth tie-break.
   //
   // **Canonical path**: the §5.3 [D-conflict] tie-break (lex-min bundleCid) is
   // performed UPSTREAM by the conflict merger (T.3.D) when picking which side's
@@ -183,33 +200,41 @@ export function mergeManifestEntry(
   // delta direction, etc.) and stamps the winner as `next`. By the time
   // `mergeManifestEntry` sees a stamped `next`, that decision has been made.
   //
-  // **Fallback path** (this block): when `prev.rootHash !== next.rootHash`,
-  // re-merge symmetrically so `mergeManifestEntry(A, B) === mergeManifestEntry(B, A)`
-  // even if a future caller bypasses `conflict-merger`. Without this, replicas
-  // could flip-flop the persisted `rootHash` between two values and never
-  // converge. See steelman post-cutover review of T.3.C / T.3.D contract.
+  // **Equal-rootHash branch (steelman crit #13)**: when `prev.rootHash ===
+  // next.rootHash`, BOTH sides agree on the chain content but may disagree on
+  // the auxiliary fields (`status`, `invalidReason`, `bundleCid`,
+  // `senderTransportPubkey`). Apply field-by-field symmetric tie-breaks via
+  // `pickStatusSymmetric` (status-strength order, then lex-min) and
+  // `pickStringSymmetric` (non-null wins, then lex-min) for invalidReason /
+  // bundleCid / senderTransportPubkey.
   //
-  // The `compareCidsBinary` arg is the SAME comparator §5.3 [D-conflict] uses
-  // (`compareCidV1Binary`); tests inject a deterministic stub. The comparator
-  // is invoked via `safeCompareSymmetric` which falls back to plain string
-  // compare on parse failure (legacy hex rootHash, malformed bundleCid) — still
-  // symmetric, still deterministic across replicas.
+  // **Divergent-rootHash branch**: fall back to `pickChainWinnerSymmetric` to
+  // pick a single chain-side winner, then carry-through aux fields.
   // ---------------------------------------------------------------------------
-  const chainSrc: TokenManifestEntry =
-    prev.rootHash === next.rootHash
-      ? next
-      : pickChainWinnerSymmetric(prev, next, compareCidsBinary);
-  const otherSrc: TokenManifestEntry = chainSrc === next ? prev : next;
-
-  const rootHash: ContentHash = chainSrc.rootHash;
-  const status = chainSrc.status;
-  const invalidReason = chainSrc.invalidReason ?? otherSrc.invalidReason;
-
-  // bundleCid / senderTransportPubkey: take from the chain winner; fall back
-  // to the other side if the winner did not stamp them.
-  const bundleCid = chainSrc.bundleCid ?? otherSrc.bundleCid;
-  const senderTransportPubkey =
-    chainSrc.senderTransportPubkey ?? otherSrc.senderTransportPubkey;
+  let rootHash: ContentHash;
+  let status: TokenManifestEntry['status'];
+  let invalidReason: string | undefined;
+  let bundleCid: string | undefined;
+  let senderTransportPubkey: string | undefined;
+  if (prev.rootHash === next.rootHash) {
+    rootHash = prev.rootHash;
+    status = pickStatusSymmetric(prev.status, next.status);
+    invalidReason = pickStringSymmetric(prev.invalidReason, next.invalidReason);
+    bundleCid = pickStringSymmetric(prev.bundleCid, next.bundleCid);
+    senderTransportPubkey = pickStringSymmetric(
+      prev.senderTransportPubkey,
+      next.senderTransportPubkey,
+    );
+  } else {
+    const chainSrc = pickChainWinnerSymmetric(prev, next, compareCidsBinary);
+    const otherSrc: TokenManifestEntry = chainSrc === next ? prev : next;
+    rootHash = chainSrc.rootHash;
+    status = chainSrc.status;
+    invalidReason = chainSrc.invalidReason ?? otherSrc.invalidReason;
+    bundleCid = chainSrc.bundleCid ?? otherSrc.bundleCid;
+    senderTransportPubkey =
+      chainSrc.senderTransportPubkey ?? otherSrc.senderTransportPubkey;
+  }
 
   // ---------------------------------------------------------------------------
   // Operator-override audit trail (T.5.D — W30 / W31 / N4)
@@ -529,6 +554,66 @@ function stripUndefined<T extends object>(value: T): T {
     if (v !== undefined) out[k] = v;
   }
   return out as T;
+}
+
+// =============================================================================
+// 5. Symmetric tie-break helpers (steelman crit #13)
+// =============================================================================
+
+/**
+ * Total order on {@link TokenManifestEntry.status} for the equal-rootHash
+ * tie-break (steelman crit #13). Stronger observations win:
+ *
+ *   `valid` > `pending` > `pending-conflicting` > `conflicting` > `invalid`
+ *
+ * Higher number wins. Used by {@link pickStatusSymmetric}.
+ */
+const STATUS_STRENGTH_ORDER: Record<string, number> = {
+  valid: 4,
+  pending: 3,
+  'pending-conflicting': 2,
+  conflicting: 1,
+  invalid: 0,
+};
+
+/**
+ * Symmetric tie-break for two {@link TokenManifestEntry.status} values
+ * sharing the same rootHash. Picks by {@link STATUS_STRENGTH_ORDER}
+ * descending, then by lex-min on the strings themselves (deterministic
+ * across replicas regardless of input order).
+ *
+ * `pickStatusSymmetric(a, b) === pickStatusSymmetric(b, a)` for every
+ * pair (a, b).
+ */
+function pickStatusSymmetric(
+  a: TokenManifestEntry['status'],
+  b: TokenManifestEntry['status'],
+): TokenManifestEntry['status'] {
+  if (a === b) return a;
+  const ra = STATUS_STRENGTH_ORDER[a] ?? -1;
+  const rb = STATUS_STRENGTH_ORDER[b] ?? -1;
+  if (ra !== rb) return ra > rb ? a : b;
+  return a < b ? a : b;
+}
+
+/**
+ * Symmetric tie-break for two `string | undefined` fields. Non-null wins
+ * over null (a defined value is more informative than its absence); on
+ * both-defined tie, lex-min wins. On both-undefined, returns `undefined`.
+ *
+ * `pickStringSymmetric(a, b) === pickStringSymmetric(b, a)` for every
+ * pair (a, b). Used by the equal-rootHash branch of
+ * {@link mergeManifestEntry} for `invalidReason`, `bundleCid`,
+ * `senderTransportPubkey`.
+ */
+function pickStringSymmetric(
+  a: string | undefined,
+  b: string | undefined,
+): string | undefined {
+  if (a === undefined) return b;
+  if (b === undefined) return a;
+  if (a === b) return a;
+  return a < b ? a : b;
 }
 
 // =============================================================================
