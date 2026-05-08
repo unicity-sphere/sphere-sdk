@@ -330,10 +330,13 @@ describe('MultiAddressTransportMux shared-NostrClient (#123)', () => {
     expect(events.filter(e => e === 'transport:reconnecting')).toHaveLength(0);
   });
 
-  it('still emits transport:connected from listener callbacks when NOT sharing (owned-client mode)', async () => {
-    // Backwards-compat: in owned-client mode there is no host transport
-    // emitting on this socket's lifecycle, so the Mux's listener must
-    // remain the source for transport:connected on reconnects.
+  it('listener.onConnect does NOT emit transport:connected (avoids double-fire with connect()-bottom)', async () => {
+    // The SDK fires onConnect once per fresh socket connection. In
+    // owned-client mode, connect()'s bottom already emits
+    // transport:connected after that returns. If onConnect also
+    // emitted, every initial connect would fire transport:connected
+    // twice. The fix: onConnect logs but does not emit; the
+    // connect()-bottom is the single canonical source for initial.
     const mux = new MultiAddressTransportMux({
       relays: ['wss://relay1.test'],
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -349,15 +352,60 @@ describe('MultiAddressTransportMux shared-NostrClient (#123)', () => {
     await mux.connect();
 
     const baselineConnected = events.filter(e => e === 'transport:connected').length;
-
-    // The owned-client listener is registered on mockAddConnectionListener.
     const listener = mockAddConnectionListener.mock.calls[0][0];
-    listener.onConnect('wss://relay1.test');
-    listener.onReconnecting('wss://relay1.test', 1);
-    listener.onReconnected('wss://relay1.test');
 
-    expect(events.filter(e => e === 'transport:connected').length).toBeGreaterThan(baselineConnected);
-    expect(events.filter(e => e === 'transport:reconnecting').length).toBeGreaterThan(0);
+    // Drive onConnect — must NOT add a second transport:connected.
+    listener.onConnect('wss://relay1.test');
+    expect(events.filter(e => e === 'transport:connected')).toHaveLength(baselineConnected);
+
+    // onReconnected IS still the source for "we recovered" — it
+    // fires when the SDK reconnects after a disconnect cycle, and
+    // there is no other emit-path covering that case in owned mode.
+    listener.onReconnected('wss://relay1.test');
+    expect(events.filter(e => e === 'transport:connected')).toHaveLength(baselineConnected + 1);
+
+    // onReconnecting still emits transport:reconnecting in owned mode.
+    listener.onReconnecting('wss://relay1.test', 1);
+    expect(events.filter(e => e === 'transport:reconnecting')).toHaveLength(1);
+  });
+
+  it('does not double-emit transport:connected on initial connect when SDK fires onConnect during connect()', async () => {
+    // Realistic regression test: the SDK's connect() actually fires
+    // onConnect on registered listeners synchronously when the socket
+    // opens. The mock for the rest of the file's `mockConnect` is a
+    // bare resolved promise that doesn't fire the listener — too
+    // forgiving for catching this bug. Here we simulate the SDK
+    // behavior precisely.
+    NostrClientCtor.mockClear();
+    mockAddConnectionListener.mockClear();
+
+    let capturedListener: { onConnect?: (url: string) => void } | undefined;
+    mockAddConnectionListener.mockImplementationOnce((l: { onConnect?: (url: string) => void }) => {
+      capturedListener = l;
+    });
+    mockConnect.mockImplementationOnce(async () => {
+      // SDK behavior: callbacks fire while the socket is opening,
+      // before connect() resolves.
+      capturedListener?.onConnect?.('wss://relay1.test');
+    });
+
+    const mux = new MultiAddressTransportMux({
+      relays: ['wss://relay1.test'],
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      createWebSocket: (() => {}) as any,
+      timeout: 100,
+      autoReconnect: false,
+    });
+
+    const events: string[] = [];
+    mux.onTransportEvent((evt) => events.push(evt.type));
+
+    await mux.addAddress(0, TEST_IDENTITY);
+    await mux.connect();
+
+    // The SDK fired onConnect during connect(). Plus connect()-bottom
+    // emits. Without the fix that would be 2; with the fix it's 1.
+    expect(events.filter(e => e === 'transport:connected')).toHaveLength(1);
   });
 
   it('end-to-end: transport + Mux share one NostrClient instance (no second WS)', async () => {

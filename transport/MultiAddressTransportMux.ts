@@ -463,6 +463,12 @@ export class MultiAddressTransportMux {
    *   same socket event. Re-subscribing after a reconnect IS still our
    *   responsibility, since the host has
    *   {@code suppressSubscriptions()}'d its own filters.
+   * - {@code onConnect} does not emit {@code transport:connected}.
+   *   The SDK only fires {@code onConnect} on the initial socket
+   *   connection (subsequent reconnects use {@code onReconnected}),
+   *   and {@link connect()}'s bottom already emits
+   *   {@code transport:connected} once that returns. Emitting here too
+   *   would double-fire on every initial connect.
    * - Each callback bails out early when the Mux is not in an active
    *   state ({@code disconnected} / {@code error}). Listeners are
    *   removed on {@code disconnect()} before the callback can fire,
@@ -479,9 +485,7 @@ export class MultiAddressTransportMux {
       onConnect: (url) => {
         if (isInactive()) return;
         logger.debug('Mux', 'Connected to relay:', url);
-        if (!this.usingSharedClient) {
-          this.emitEvent({ type: 'transport:connected', timestamp: Date.now() });
-        }
+        // Intentionally no emit here — see method-level comment.
       },
       onDisconnect: (url, reason) => {
         // No early-return: a disconnect callback during teardown is
