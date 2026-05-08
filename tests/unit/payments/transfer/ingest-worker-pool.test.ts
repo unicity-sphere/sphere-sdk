@@ -41,6 +41,7 @@ import type {
   RootRef,
   VerifiedBundle,
 } from '../../../../modules/payments/transfer/bundle-verifier';
+import { RECIPIENT_MAX_INLINE_CARBASE64_LENGTH } from '../../../../modules/payments/transfer/bundle-acquirer';
 import type { ContentHash } from '../../../../uxf/types';
 import type { SphereEventMap, SphereEventType } from '../../../../types';
 
@@ -1152,5 +1153,145 @@ describe('IngestWorkerPool — log redaction (steelman #170 / W40)', () => {
     expect(typeof log.details!.bundleCidPrefix).toBe('string');
     expect((log.details!.bundleCidPrefix as string).length).toBe(16);
     expect((log.details!.senderPubkeyPrefix as string).length).toBe(8);
+  });
+});
+
+// =============================================================================
+// 11. Steelman warning fix — enqueue-time inline-CAR size cap
+// =============================================================================
+
+describe('IngestWorkerPool — enqueue-time carBase64 cap (steelman warning)', () => {
+  let pool: IngestWorkerPool | null = null;
+
+  afterEach(async () => {
+    if (pool) {
+      await pool.destroy();
+      pool = null;
+    }
+  });
+
+  it('rejects oversize carBase64 BEFORE the queue is touched', async () => {
+    // Threat: hostile sender ships a 5+ MiB carBase64. Without an
+    // enqueue-time guard, the recipient acquirer's cap fires INSIDE
+    // processBundle — i.e. AFTER the worker has dequeued the entry.
+    // Meanwhile the queue allocates 256 such entries for a sustained
+    // flood, ~1.3 GiB resident. The enqueue-time guard prevents the
+    // queue from holding the payload at all.
+    const acquireBundleSpy = vi.fn<AcquireBundleFn>(async () => {
+      throw new Error('acquirer should never run for an oversize payload');
+    });
+
+    pool = new IngestWorkerPool({
+      lru: new ReplayLRU(),
+      perTokenMutex: new PerTokenMutex(),
+      processToken: vi.fn(),
+      emit: () => undefined,
+      acquireBundle: acquireBundleSpy,
+    });
+
+    const oversize: UxfV1Payload = {
+      kind: 'uxf-car',
+      version: '1.0',
+      mode: 'conservative',
+      bundleCid: syntheticBundleCid('oversize'),
+      tokenIds: [syntheticTokenId('ovs')],
+      carBase64: 'A'.repeat(RECIPIENT_MAX_INLINE_CARBASE64_LENGTH + 1),
+    };
+
+    let caught: unknown;
+    try {
+      await pool.enqueue(oversize, SENDER);
+    } catch (err) {
+      caught = err;
+    }
+    expect(isSphereError(caught)).toBe(true);
+    if (isSphereError(caught)) {
+      expect(caught.code).toBe('BUNDLE_REJECTED_INLINE_CAP_EXCEEDED');
+    }
+
+    // The queue MUST be empty — payload was never enqueued.
+    expect(pool.queueDepth).toBe(0);
+    // No worker was woken (acquirer would throw if invoked).
+    expect(acquireBundleSpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects oversize carBase64 BEFORE per-token counters are touched', async () => {
+    // Defensive ordering check: the enqueue-time cap MUST fire BEFORE
+    // any per-token counter mutation, so a hostile sender cannot perturb
+    // back-pressure accounting via rejected payloads.
+    pool = new IngestWorkerPool({
+      lru: new ReplayLRU(),
+      perTokenMutex: new PerTokenMutex(),
+      processToken: vi.fn(),
+      emit: () => undefined,
+      acquireBundle: makeAcquirer(new Map()),
+    });
+
+    const tokenId = syntheticTokenId('cnt');
+    const oversize: UxfV1Payload = {
+      kind: 'uxf-car',
+      version: '1.0',
+      mode: 'conservative',
+      bundleCid: syntheticBundleCid('cap-counter'),
+      tokenIds: [tokenId],
+      carBase64: 'A'.repeat(RECIPIENT_MAX_INLINE_CARBASE64_LENGTH + 100),
+    };
+
+    await expect(pool.enqueue(oversize, SENDER)).rejects.toThrow();
+
+    // Per-token counter MUST be 0 — no increment ever happened.
+    expect(pool.perTokenCount(tokenId)).toBe(0);
+  });
+
+  it('payload exactly at the cap is NOT rejected by the enqueue guard', async () => {
+    // Boundary check: cap is `>` not `>=`. A payload exactly at the
+    // cap passes the enqueue gate; the worker handles downstream
+    // processing (no fixture for the bundleCid → acquirer rejects, the
+    // worker swallows per pool contract, and enqueue() resolves cleanly).
+    const cid = syntheticBundleCid('atcap');
+    const tokenId = syntheticTokenId('atcap');
+
+    pool = new IngestWorkerPool({
+      lru: new ReplayLRU(),
+      perTokenMutex: new PerTokenMutex(),
+      processToken: vi.fn(),
+      emit: () => undefined,
+      acquireBundle: makeAcquirer(new Map()),
+    });
+
+    const atCap: UxfV1Payload = {
+      kind: 'uxf-car',
+      version: '1.0',
+      mode: 'conservative',
+      bundleCid: cid,
+      tokenIds: [tokenId],
+      carBase64: 'A'.repeat(RECIPIENT_MAX_INLINE_CARBASE64_LENGTH),
+    };
+
+    await expect(pool.enqueue(atCap, SENDER)).resolves.toBeUndefined();
+  });
+
+  it('CID-mode payload (no carBase64) is unaffected by the enqueue cap', async () => {
+    // Sanity: the cap only applies to `kind: 'uxf-car'`. CID payloads
+    // pass through without an inline-cap check (they cap downstream
+    // via MAX_FETCHED_CAR_BYTES).
+    pool = new IngestWorkerPool({
+      lru: new ReplayLRU(),
+      perTokenMutex: new PerTokenMutex(),
+      processToken: vi.fn(),
+      emit: () => undefined,
+      acquireBundle: makeAcquirer(new Map()),
+    });
+
+    const cidPayload: UxfV1Payload = {
+      kind: 'uxf-cid',
+      version: '1.0',
+      mode: 'conservative',
+      bundleCid: syntheticBundleCid('cidmode'),
+      tokenIds: [syntheticTokenId('cm')],
+    };
+
+    // Enqueue succeeds (CID payloads do not hit the inline cap).
+    await expect(pool.enqueue(cidPayload, SENDER)).resolves.toBeUndefined();
   });
 });
