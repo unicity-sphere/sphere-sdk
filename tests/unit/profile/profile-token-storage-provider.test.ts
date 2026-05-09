@@ -388,7 +388,16 @@ function installMockFetch(
   mockFetchHandler = handler;
   globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : (input as Request).url;
-    return handler(url, init);
+    // Production fetchFromIpfs uses Kubo's POST /api/v0/block/get?arg=<cid>
+    // path (with a GET fallback on 405/501). Existing per-test handlers in
+    // this file pattern-match on the legacy `/ipfs/<cid>` URL shape. To
+    // keep handlers stable, normalize the canonical block-get URL into
+    // the legacy shape before dispatching. The handler itself is unchanged.
+    const blockGetMatch = url.match(/\/api\/v0\/block\/get\?arg=([^&]+)/);
+    const normalizedUrl = blockGetMatch
+      ? `${url.split('/api/v0/')[0]}/ipfs/${decodeURIComponent(blockGetMatch[1]!)}`
+      : url;
+    return handler(normalizedUrl, init);
   };
 }
 
