@@ -2060,6 +2060,40 @@ export class ProfileTokenStorageProvider
    * B contributed via Nostr DMs (or any source the originator hadn't
    * captured). The flush body short-circuits if the merged-state CAR
    * matches a known anchor (idempotent).
+   *
+   * # Pointer monotonicity invariant (CRITICAL)
+   *
+   * The published pointer V_n MUST reference a CAR that contains every
+   * token reachable from V_n-1's CARs. Concretely: the CAR pinned by a
+   * no-data flush MUST cover the union of every active bundle in OrbitDB
+   * — otherwise Device C, joining via the aggregator pointer alone, would
+   * see only V_n's CAR and miss tokens that lived in V_n-1's bundles.
+   *
+   * That invariant relies on `lastLoadedData` reflecting the current
+   * bundle union when the flush body runs. Two events fire on every
+   * replication tick:
+   *   - `scheduleFlushNoData()` here (debounced ~ flushDebounceMs).
+   *   - `storage:remote-updated` event → PaymentsModule.sync → load()
+   *     (debounced 500ms, then load() awaits the in-flight flush).
+   *
+   * If the flush timer fires BEFORE load() refreshes `lastLoadedData`,
+   * the flush body builds its CAR from STALE merged state — silently
+   * dropping the newly-discovered remote bundle's tokens from V_n.
+   *
+   * Mode A fix #2: AWAIT a fresh `load()` here before scheduling the
+   * no-data flush. load() reads the active bundle index, fetches all
+   * CARs, merges, and writes the union into `lastLoadedData` — which is
+   * exactly the superset the flush body needs. With this in place the
+   * flush body's `lastLoadedData` snapshot is by-construction a superset
+   * of V_n-1's bundle union, eliminating the race at the source.
+   *
+   * Why fix #2 over fix #1 (defer-with-retry): the retry approach is
+   * brittle (the load could complete just as the flush fires; cap
+   * exhaustion drops the publish silently) and adds an unobservable
+   * timing dependency. Awaiting load() here is structurally clean,
+   * synchronously verifiable, and uses load()'s existing dedup machinery
+   * (it awaits an in-flight flush; the flush awaits the in-flight load
+   * via its debounce timer). No new state, no retry counters.
    */
   private async handleReplication(): Promise<void> {
     try {
@@ -2081,6 +2115,25 @@ export class ProfileTokenStorageProvider
           timestamp: Date.now(),
           data: { source: 'replication' },
         });
+
+        // Mode A fix #2: refresh `lastLoadedData` BEFORE scheduling the
+        // no-data flush. Without this await, the flush body could build
+        // its CAR from stale merged state and publish a pointer V_n
+        // whose CAR is NOT a superset of V_n-1's bundle union — silent
+        // token loss across cross-device sync.
+        //
+        // load() is idempotent and best-effort: a failure here is logged
+        // and we still proceed to scheduleFlushNoData() so that — even
+        // if the load failed — the next remote-update tick gets another
+        // chance to refresh the baseline before publishing.
+        try {
+          await this.load();
+        } catch (err) {
+          this.log(
+            `handleReplication: pre-flush load failed (best-effort): ` +
+              `${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
 
         // Anchor our own pointer at the merged state. The flush body
         // computes the projected CID locally and short-circuits if it
