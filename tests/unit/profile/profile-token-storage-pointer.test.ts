@@ -84,6 +84,7 @@ function createMockDb(): ProfileDatabase & { _store: Map<string, Uint8Array> } {
 function createProvider(opts: {
   db: ProfileDatabase;
   getPointerLayer?: () => ProfilePointerLayer | null;
+  getPointerBuildStatus?: () => 'pending' | 'unavailable' | 'ready';
 }): ProfileTokenStorageProvider {
   const provider = new ProfileTokenStorageProvider(
     opts.db,
@@ -97,6 +98,13 @@ function createProvider(opts: {
       addressId: 'test',
       encrypt: true,
       getPointerLayer: opts.getPointerLayer,
+      // When `getPointerLayer` is wired but the test wants pointer
+      // recovery to bail immediately (closure returns null), pair it
+      // with a `getPointerBuildStatus` accessor reporting 'unavailable'.
+      // Production wires both accessors together (see profile/factory.ts);
+      // tests that only wire `getPointerLayer` would otherwise trip the
+      // 30s "wait for slow Helia bootstrap" loop in lifecycle-manager.
+      getPointerBuildStatus: opts.getPointerBuildStatus,
     },
   );
   provider.setIdentity(TEST_IDENTITY);
@@ -195,9 +203,17 @@ describe('ProfileTokenStorageProvider pointer recovery (T-D6 wiring)', () => {
     // Simulates "pointer layer construction was skipped — storage
     // not durable, no oracle, etc." The closure returning null must
     // not trip the recovery path; initialize proceeds cleanly.
+    //
+    // Pair `getPointerLayer: () => null` with a build-status accessor
+    // reporting 'unavailable' to mirror the production path
+    // (factory.ts wires both together). Without the status accessor,
+    // lifecycle-manager would poll up to 30s waiting for the closure
+    // to flip to non-null — fine in production where 'pending' is
+    // distinguishable, but a hard hang in this fixture.
     const provider = createProvider({
       db,
       getPointerLayer: () => null,
+      getPointerBuildStatus: () => 'unavailable',
     });
 
     await expect(provider.initialize()).resolves.toBe(true);
