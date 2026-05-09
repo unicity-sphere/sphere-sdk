@@ -756,6 +756,16 @@ export interface SwapModuleDependencies {
     getInvoiceStatus(invoiceId: string): unknown;
     /** Send payment referencing an invoice */
     payInvoice(invoiceId: string, params: unknown): Promise<TransferResult>;
+    /**
+     * Reverse-index lookup: which token IDs are linked to this invoice.
+     *
+     * Required by `verifyPayout` to filter the validate-invalid set down to
+     * tokens that actually back this swap's payout invoice. Without this on
+     * the facade, the call site's optional-chain returns undefined → empty
+     * Set → security fail-closed branch fires forever and the swap can
+     * never reach `completed`. Diagnosed in HMA-trade-settlement round 20.
+     */
+    getTokenIdsForInvoice(invoiceId: string): Set<string>;
     /** Subscribe to invoice events (returns unsubscribe function) */
     on<T extends SphereEventType>(type: T, handler: (data: SphereEventMap[T]) => void): () => void;
   };
