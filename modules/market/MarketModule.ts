@@ -12,6 +12,14 @@ import { bytesToHex } from '@noble/hashes/utils.js';
 
 import { SphereError } from '../../core/errors';
 import { logger } from '../../core/logger';
+import {
+  CircuitBreaker,
+  TransientMarketError,
+  isRetryableStatus,
+  isTransientNetworkError,
+  runWithRetry,
+} from './retry';
+import type { RetryConfig } from './retry';
 
 /** Default Market API URL (intent bulletin board) */
 export const DEFAULT_MARKET_API_URL = 'https://market-api.unicity.network';
@@ -161,10 +169,20 @@ export class MarketModule {
   private readonly timeout: number;
   private identity: FullIdentity | null = null;
   private registered = false;
+  /** Shared breaker — once tripped, all operations on this module fail fast. */
+  private readonly breaker: CircuitBreaker;
+  /** Optional retry-policy overrides for tests. */
+  private readonly retryConfig: RetryConfig | undefined;
 
-  constructor(config?: MarketModuleConfig) {
+  constructor(config?: MarketModuleConfig & { retryConfig?: RetryConfig }) {
     this.apiUrl = (config?.apiUrl ?? DEFAULT_MARKET_API_URL).replace(/\/+$/, '');
     this.timeout = config?.timeout ?? 30000;
+    this.retryConfig = config?.retryConfig;
+    this.breaker = new CircuitBreaker({
+      threshold: config?.retryConfig?.breakerThreshold,
+      cooldownMs: config?.retryConfig?.breakerCooldownMs,
+      now: config?.retryConfig?.now,
+    });
   }
 
   /** Called by Sphere after construction */
@@ -221,10 +239,11 @@ export class MarketModule {
 
   /** Fetch the most recent listings via REST (public — no auth required) */
   async getRecentListings(): Promise<FeedListing[]> {
-    const res = await fetch(`${this.apiUrl}/api/feed/recent`, {
-      signal: AbortSignal.timeout(this.timeout),
-    });
-    const data = await this.parseResponse(res);
+    const data = await this.withRetry(() =>
+      this.attemptFetch(`${this.apiUrl}/api/feed/recent`, {
+        signal: AbortSignal.timeout(this.timeout),
+      }),
+    );
     return (data.listings ?? []).map(mapFeedListing);
   }
 
@@ -321,82 +340,161 @@ export class MarketModule {
     const body: Record<string, string> = { public_key: publicKey };
     if (this.identity!.nametag) body.nametag = this.identity!.nametag;
 
-    const res = await fetch(`${this.apiUrl}/api/agent/register`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(this.timeout),
+    await this.withRetry(async () => {
+      let res: Response;
+      try {
+        res = await fetch(`${this.apiUrl}/api/agent/register`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(this.timeout),
+        });
+      } catch (err) {
+        if (isTransientNetworkError(err)) {
+          const message = err instanceof Error ? err.message : String(err);
+          throw new TransientMarketError(
+            new SphereError(`Agent registration failed: ${message}`, 'NETWORK_ERROR'),
+          );
+        }
+        throw err;
+      }
+
+      // 201 = created, 409 = already registered — both are fine
+      if (res.ok || res.status === 409) return;
+
+      const text = await res.text();
+      let data: any; // eslint-disable-line @typescript-eslint/no-explicit-any
+      try { data = JSON.parse(text); } catch { /* ignore */ }
+      const final = new SphereError(
+        data?.error ?? `Agent registration failed: HTTP ${res.status}`,
+        'NETWORK_ERROR',
+      );
+      if (isRetryableStatus(res.status)) throw new TransientMarketError(final, res.status);
+      throw final;
     });
 
-    // 201 = created, 409 = already registered — both are fine
-    if (res.ok || res.status === 409) {
-      this.registered = true;
-      return;
-    }
-
-    const text = await res.text();
-    let data: any; // eslint-disable-line @typescript-eslint/no-explicit-any
-    try { data = JSON.parse(text); } catch { /* ignore */ }
-    throw new SphereError(data?.error ?? `Agent registration failed: HTTP ${res.status}`, 'NETWORK_ERROR');
+    this.registered = true;
   }
 
+  /**
+   * Parse a fetch Response into JSON.
+   *
+   * Throws either:
+   *   - {@link TransientMarketError} for HTTP statuses we want to retry
+   *     (502/503/504/408). The `final` SphereError mirrors the historical
+   *     error shape so callers see the same message after retries exhaust.
+   *   - {@link SphereError} for permanent failures (4xx other than 408).
+   */
   private async parseResponse(res: Response): Promise<any> { // eslint-disable-line @typescript-eslint/no-explicit-any
     const text = await res.text();
     let data: any; // eslint-disable-line @typescript-eslint/no-explicit-any
+    let parseFailed = false;
     try {
       data = JSON.parse(text);
     } catch {
-      throw new SphereError(`Market API error: HTTP ${res.status} — unexpected response (not JSON)`, 'NETWORK_ERROR');
+      parseFailed = true;
     }
-    if (!res.ok) throw new SphereError(data.error ?? `HTTP ${res.status}`, 'NETWORK_ERROR');
+
+    if (parseFailed) {
+      // Non-JSON body — most often an HTML error page from a load balancer
+      // during a 502/503. Treat as transient if the status itself is transient,
+      // otherwise treat as permanent.
+      const final = new SphereError(
+        `Market API error: HTTP ${res.status} — unexpected response (not JSON)`,
+        'NETWORK_ERROR',
+      );
+      if (isRetryableStatus(res.status)) throw new TransientMarketError(final, res.status);
+      throw final;
+    }
+
+    if (!res.ok) {
+      const final = new SphereError(data?.error ?? `HTTP ${res.status}`, 'NETWORK_ERROR');
+      if (isRetryableStatus(res.status)) throw new TransientMarketError(final, res.status);
+      throw final;
+    }
     return data;
+  }
+
+  /**
+   * Execute a single HTTP attempt, translating fetch-level network errors
+   * (timeouts, connection resets) into TransientMarketError so the retry
+   * layer can re-issue the request.
+   */
+  private async attemptFetch(
+    url: string,
+    init: RequestInit,
+  ): Promise<any> { // eslint-disable-line @typescript-eslint/no-explicit-any
+    let res: Response;
+    try {
+      res = await fetch(url, init);
+    } catch (err) {
+      if (isTransientNetworkError(err)) {
+        const message = err instanceof Error ? err.message : String(err);
+        throw new TransientMarketError(
+          new SphereError(`Market API network error: ${message}`, 'NETWORK_ERROR'),
+        );
+      }
+      throw err;
+    }
+    return this.parseResponse(res);
+  }
+
+  /** Run an authenticated request through the retry + breaker layer. */
+  private async withRetry<T>(op: () => Promise<T>): Promise<T> {
+    return runWithRetry(op, this.breaker, this.retryConfig);
   }
 
   private async apiPost(path: string, body: unknown): Promise<any> { // eslint-disable-line @typescript-eslint/no-explicit-any
     this.ensureIdentity();
     await this.ensureRegistered();
-    const signed = signRequest(body, this.identity!.privateKey);
-    const res = await fetch(`${this.apiUrl}${path}`, {
-      method: 'POST',
-      headers: signed.headers,
-      body: signed.body,
-      signal: AbortSignal.timeout(this.timeout),
+    return this.withRetry(() => {
+      // Re-sign on each attempt so the timestamp stays fresh and the server
+      // can't reject a retry as a stale signature.
+      const signed = signRequest(body, this.identity!.privateKey);
+      return this.attemptFetch(`${this.apiUrl}${path}`, {
+        method: 'POST',
+        headers: signed.headers,
+        body: signed.body,
+        signal: AbortSignal.timeout(this.timeout),
+      });
     });
-    return this.parseResponse(res);
   }
 
   private async apiGet(path: string): Promise<any> { // eslint-disable-line @typescript-eslint/no-explicit-any
     this.ensureIdentity();
     await this.ensureRegistered();
-    const signed = signRequest({}, this.identity!.privateKey);
-    const res = await fetch(`${this.apiUrl}${path}`, {
-      method: 'GET',
-      headers: signed.headers,
-      signal: AbortSignal.timeout(this.timeout),
+    return this.withRetry(() => {
+      const signed = signRequest({}, this.identity!.privateKey);
+      return this.attemptFetch(`${this.apiUrl}${path}`, {
+        method: 'GET',
+        headers: signed.headers,
+        signal: AbortSignal.timeout(this.timeout),
+      });
     });
-    return this.parseResponse(res);
   }
 
   private async apiDelete(path: string): Promise<any> { // eslint-disable-line @typescript-eslint/no-explicit-any
     this.ensureIdentity();
     await this.ensureRegistered();
-    const signed = signRequest({}, this.identity!.privateKey);
-    const res = await fetch(`${this.apiUrl}${path}`, {
-      method: 'DELETE',
-      headers: signed.headers,
-      signal: AbortSignal.timeout(this.timeout),
+    return this.withRetry(() => {
+      const signed = signRequest({}, this.identity!.privateKey);
+      return this.attemptFetch(`${this.apiUrl}${path}`, {
+        method: 'DELETE',
+        headers: signed.headers,
+        signal: AbortSignal.timeout(this.timeout),
+      });
     });
-    return this.parseResponse(res);
   }
 
   private async apiPublicPost(path: string, body: unknown): Promise<any> { // eslint-disable-line @typescript-eslint/no-explicit-any
-    const res = await fetch(`${this.apiUrl}${path}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(this.timeout),
-    });
-    return this.parseResponse(res);
+    return this.withRetry(() =>
+      this.attemptFetch(`${this.apiUrl}${path}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(this.timeout),
+      }),
+    );
   }
 
 }
