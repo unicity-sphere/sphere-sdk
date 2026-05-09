@@ -69,7 +69,24 @@ function installFakeIpfsGateway(): { store: Map<string, Uint8Array>; cleanup: ()
       }) as unknown as Response;
     }
 
-    // Fetch (GET /ipfs/<cid>)
+    // Fetch via Kubo block API (POST /api/v0/block/get?arg=<cid>).
+    // Production code uses this path (POST first, GET fallback on 405/501)
+    // — the legacy `/ipfs/<cid>` GET path is no longer used by fetchFromIpfs.
+    const blockGetMatch = url.match(/\/api\/v0\/block\/get\?arg=([^&]+)/);
+    if (blockGetMatch) {
+      const cid = decodeURIComponent(blockGetMatch[1]!);
+      const data = store.get(cid);
+      if (!data) {
+        return new Response('not found', { status: 404 }) as unknown as Response;
+      }
+      return new Response(data, {
+        status: 200,
+        headers: { 'Content-Type': 'application/octet-stream', 'Content-Length': String(data.byteLength) },
+      }) as unknown as Response;
+    }
+
+    // Legacy /ipfs/<cid> GET path — kept for any code path still using it
+    // (e.g., verifyCidAccessible HEAD checks).
     const match = url.match(/\/ipfs\/([A-Za-z0-9]+)/);
     if (match) {
       const cid = match[1]!;
