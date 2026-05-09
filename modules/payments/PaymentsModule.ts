@@ -5360,10 +5360,17 @@ export class PaymentsModule {
       // Get proof from aggregator
       const commitment = await TransferCommitment.fromJSON(commitmentInput);
       if (!this.deps!.oracle.waitForProofSdk) {
-        logger.debug('Payments', 'Cannot finalize - no waitForProofSdk');
-        token.status = 'confirmed'; // Mark as confirmed anyway
-        token.updatedAt = Date.now();
-        await this.save();
+        // R20 fix: do NOT mark confirmed when finalization can't complete.
+        // The token's sdkData still holds the SENDER's state (sender's
+        // predicate). Marking 'confirmed' here would let the spend queue
+        // pick it for outbound transfers; the resulting commitment's
+        // sourceState.predicate would be the sender's pubkey, the
+        // authenticator would be ours — predicate.isOwner() returns false
+        // and the aggregator throws "Authenticator does not match source
+        // state predicate." Leaving status='submitted' makes the spend
+        // queue's `status !== 'confirmed'` filter (SpendQueue.ts:91)
+        // skip this token until proof+finalize complete.
+        logger.warn('Payments', `Cannot finalize - no waitForProofSdk; leaving token ${tokenId.slice(0, 12)}... in 'submitted' status`);
         return;
       }
 
@@ -5380,10 +5387,10 @@ export class PaymentsModule {
       const trustBase = (this.deps!.oracle as any).getTrustBase?.();
 
       if (!stClient || !trustBase) {
-        logger.debug('Payments', 'Cannot finalize - missing state transition client or trust base');
-        token.status = 'confirmed';
-        token.updatedAt = Date.now();
-        await this.save();
+        // R20 fix: same rationale as above — do NOT mark confirmed when
+        // we can't normalize sdkData to OUR predicate. The spend queue
+        // must keep skipping this token.
+        logger.warn('Payments', `Cannot finalize - missing stClient/trustBase; leaving token ${tokenId.slice(0, 12)}... in 'submitted' status`);
         return;
       }
 
@@ -5421,14 +5428,16 @@ export class PaymentsModule {
 
       // History entry was already created in handleCommitmentOnlyTransfer() — no duplicate here
     } catch (error) {
-      logger.error('Payments', 'Failed to finalize received token:', error);
-      // Mark as confirmed anyway (user has the token)
-      const token = this.tokens.get(tokenId);
-      if (token && token.status === 'submitted') {
-        token.status = 'confirmed';
-        token.updatedAt = Date.now();
-        await this.save();
-      }
+      // R20 fix: do NOT mark confirmed when finalize throws. The previous
+      // implementation said "user has the token" and marked confirmed, but
+      // because sdkData was never updated to our finalized state, any
+      // subsequent spend would build a commitment with the SENDER's
+      // sourceState predicate and fail at submitTransferCommitment with
+      // "Authenticator does not match source state predicate." Keep the
+      // token in 'submitted' status so the spend queue skips it; the
+      // periodic resolveUnconfirmed() / next receive({finalize:true})
+      // call will retry finalization.
+      logger.error('Payments', `Failed to finalize received token ${tokenId.slice(0, 12)}... — leaving status='submitted' for retry:`, error);
     }
   }
 
