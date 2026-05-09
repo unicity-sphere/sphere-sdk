@@ -1,7 +1,20 @@
 /**
  * Regression tests for the CLI entry-point gating logic.
  *
- * History:
+ * SKIPPED — POST-EXTRACTION PLACEHOLDER
+ * --------------------------------------
+ * The Sphere CLI was extracted into a separate package (`sphere-cli`,
+ * tracked in the `sphere-cli` repository). The in-tree `cli/index.ts`
+ * that these tests targeted no longer exists in the SDK package; only
+ * `cli/global-flags.ts` and `cli/storage-mode.ts` (shared helpers
+ * still consumed by the SDK itself) remain.
+ *
+ * These tests are skipped pending migration to the `sphere-cli` repo,
+ * where they belong. The SDK repo's job is the SDK; the CLI's
+ * entry-point semantics (F.18/F.19/F.20 history below) are now the
+ * CLI repo's regression surface.
+ *
+ * Original history (preserved for context — re-apply in `sphere-cli`):
  *   F.18 (steelman¹⁵) introduced `isCliEntryPoint` to prevent
  *        library imports of `cli/index.ts` from running `main()`
  *        and calling `process.exit(1)` against the importer's argv.
@@ -46,7 +59,7 @@ function runCli(scriptPath: string, ...args: string[]): { stdout: string; stderr
   };
 }
 
-describe('CLI entry-point gating (F.18 + F.19)', () => {
+describe.skip('CLI entry-point gating (F.18 + F.19) — SKIPPED: CLI extracted to sphere-cli repo', () => {
   let tmpDir: string;
   let symlinkPath: string;
 

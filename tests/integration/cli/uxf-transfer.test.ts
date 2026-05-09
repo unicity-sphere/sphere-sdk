@@ -1,10 +1,25 @@
 /**
  * T.7.C — production call-site migration integration test for CLI.
  *
- * **Goal**: prove the CLI `send` command (and the `invoice-pay` /
- * `invoice-return` commands that delegate through AccountingModule) pass
- * `transferMode` explicitly to `payments.send()`. The migration is a
- * prerequisite for Wave T.1.B.2 (audit shim removal).
+ * SKIPPED — POST-EXTRACTION PLACEHOLDER
+ * --------------------------------------
+ * The Sphere CLI was extracted into a separate package (`sphere-cli`,
+ * tracked in the `sphere-cli` repository). The in-tree `cli/index.ts`
+ * that these tests inspect (both via `--help` subprocess and as a
+ * source-level structural assertion) no longer exists in the SDK
+ * package; only `cli/global-flags.ts` and `cli/storage-mode.ts` (shared
+ * helpers still consumed by the SDK itself) remain.
+ *
+ * These tests are skipped pending migration to the `sphere-cli` repo,
+ * where they belong. The runtime UXF call-site contract for
+ * AccountingModule (`payInvoice` / `returnInvoicePayment`) is still
+ * pinned by `tests/integration/accounting/uxf-transfer.test.ts` in
+ * this repo; the CLI-side delegation pin moves out with the CLI.
+ *
+ * **Original goal**: prove the CLI `send` command (and the `invoice-pay`
+ * / `invoice-return` commands that delegate through AccountingModule)
+ * pass `transferMode` explicitly to `payments.send()`. The migration is
+ * a prerequisite for Wave T.1.B.2 (audit shim removal).
  *
  * **Approach** — two complementary checks:
  *
@@ -85,7 +100,7 @@ async function runCli(args: string[]): Promise<{ stdout: string; stderr: string;
 // 1. Subprocess-driven --help shape check
 // =============================================================================
 
-describe('T.7.C — CLI production call-site UXF migration (--help shape)', () => {
+describe.skip('T.7.C — CLI production call-site UXF migration (--help shape) — SKIPPED: CLI extracted to sphere-cli repo', () => {
   it('IT-CLI-UXF-001: --help still exposes --instant and --conservative mode flags', async () => {
     const { stdout, stderr } = await runCli(['help', 'send']);
     const combined = `${stdout}\n${stderr}`;
@@ -102,7 +117,7 @@ describe('T.7.C — CLI production call-site UXF migration (--help shape)', () =
 // 2. Source-level structural assertions
 // =============================================================================
 
-describe('T.7.C — CLI production call-site UXF migration (source pin)', () => {
+describe.skip('T.7.C — CLI production call-site UXF migration (source pin) — SKIPPED: CLI extracted to sphere-cli repo', () => {
   let cliSource: string;
 
   /** Lazily read the CLI source once per file. */
