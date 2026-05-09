@@ -22,6 +22,30 @@
  *   - flushTimer / flushPromise / pendingData (cancelled / drained on
  *     shutdown via host.flushToIpfs())
  *
+ * # Cross-device sync resilience: dual discovery paths
+ *
+ * The wallet has two cross-device state-discovery paths:
+ *
+ *   - **Path 1 — OrbitDB pubsub (libp2p gossipsub).** Live, peer-to-peer.
+ *     Fires whenever a peer publishes a new bundle ref to the same
+ *     OrbitDB log. This is the only path that delivers updates AFTER
+ *     cold-start in the historical code.
+ *
+ *   - **Path 2 — Aggregator pointer + IPFS.** The pointer layer
+ *     publishes a versioned CID to the aggregator on every flush;
+ *     `recoverLatest()` returns the latest valid CID. This path is
+ *     used at cold-start (`initialize()`) but was never re-polled
+ *     afterwards. Two devices online with the same wallet would
+ *     diverge for hours when libp2p pubsub failed (NAT, firewall,
+ *     peer not discovered).
+ *
+ * `schedulePointerPoll()` arms a periodic poll of `recoverLatest()` at a
+ * randomised interval in [30s, 90s) to provide a fallback when Path 1
+ * stalls. New CIDs discovered via the poll are added to the bundle
+ * index just like cold-start recovery. Already-known CIDs and null
+ * results are no-ops. The randomised jitter avoids synchronised polling
+ * across devices that booted at the same time.
+ *
  * @module profile/profile-token-storage/lifecycle-manager
  */
 
@@ -63,7 +87,28 @@ const PERMANENT_POINTER_ERROR_CODES: ReadonlySet<string> = new Set([
   'AGGREGATOR_POINTER_PROTOCOL_ERROR',
 ]);
 
+/**
+ * Periodic-poll bounds: nominal interval is sampled uniformly from
+ * [30 s, 90 s) on every re-arm. The randomised jitter avoids
+ * synchronised polling across devices that booted simultaneously
+ * (which would create thundering-herd load on the aggregator). On a
+ * permanent failure we re-arm with `* 5` (so [150 s, 450 s)) to back
+ * off — the underlying issue is operator-actionable and won't resolve
+ * via fast retries.
+ */
+const POINTER_POLL_MIN_MS = 30_000;
+const POINTER_POLL_RANGE_MS = 60_000; // → [30s, 90s)
+const POINTER_POLL_BACKOFF_MULTIPLIER = 5;
+
 export class LifecycleManager {
+  /**
+   * Periodic-poll timer for Path 2 (aggregator pointer recovery).
+   * Owned by this module — does NOT live on the host because it is
+   * private to the polling mechanism (no other seam reads or mutates
+   * it). Set by `schedulePointerPoll()`, cleared by `shutdown()`.
+   */
+  private pointerPollTimer: ReturnType<typeof setTimeout> | null = null;
+
   constructor(
     private readonly host: ProfileTokenStorageHost,
     private readonly bundleIndex: BundleIndex,
@@ -148,6 +193,13 @@ export class LifecycleManager {
       this.host.setStatus('connected');
       this.host.setInitialized(true);
       this.host.log(`Initialized with ${this.host.getKnownBundleCids().size} known bundle(s)`);
+
+      // Start periodic Path 2 (aggregator pointer) polling. Acts as a
+      // safety net for OrbitDB pubsub stalls (NAT / firewall / peer
+      // discovery failures). Only fires when a pointer-layer closure
+      // is wired — otherwise the poll is structurally pointless.
+      this.schedulePointerPoll();
+
       return true;
     } catch (err) {
       this.host.setStatus('error');
@@ -159,6 +211,14 @@ export class LifecycleManager {
   async shutdown(): Promise<void> {
     if (this.host.getIsShuttingDown()) return;
     this.host.setIsShuttingDown(true);
+
+    // Cancel periodic pointer-poll timer first — its callback gates on
+    // isShuttingDown but a poll already in flight would otherwise race
+    // shutdown's bundle-index mutations.
+    if (this.pointerPollTimer !== null) {
+      clearTimeout(this.pointerPollTimer);
+      this.pointerPollTimer = null;
+    }
 
     // Cancel debounce timer
     const timer = this.host.getFlushTimer();
@@ -478,5 +538,163 @@ export class LifecycleManager {
         `Legacy IPNS migration threw: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
+  }
+
+  // ===========================================================================
+  // Periodic Path 2 (aggregator-pointer) polling
+  // ===========================================================================
+
+  /**
+   * Sample the next polling interval. Exposed as a private method so
+   * tests can spy on it. Returns ms in [30_000, 90_000).
+   */
+  private samplePointerPollIntervalMs(): number {
+    return POINTER_POLL_MIN_MS + Math.floor(Math.random() * POINTER_POLL_RANGE_MS);
+  }
+
+  /**
+   * Arm (or re-arm) the periodic poll of `recoverLatest()`. Acts as a
+   * safety net when OrbitDB pubsub (Path 1) stalls.
+   *
+   * Behaviour:
+   *   - No pointer-layer closure wired → no-op (polling is structurally
+   *     pointless). Production wires the closure when an oracle is
+   *     configured; tests that omit it skip polling entirely.
+   *   - `recoverLatest()` returns null (no anchor yet) → re-arm.
+   *   - `recoverLatest()` returns a CID already in `knownBundleCids`
+   *     → no-op (Path 1 or our own freshly-published flush already
+   *     delivered it). Re-arm.
+   *   - `recoverLatest()` returns a NEW CID → add to bundle index
+   *     (mirrors cold-start recovery). Re-arm.
+   *   - Transient failure → log + warn, re-arm at the normal interval.
+   *   - Permanent failure → log + emit `storage:error` event, re-arm
+   *     with a 5x back-off so we don't hammer a wallet that needs
+   *     operator intervention.
+   *
+   * The intervals are randomised in [30s, 90s) to avoid synchronised
+   * polling across devices that booted simultaneously.
+   */
+  private schedulePointerPoll(): void {
+    if (this.host.getIsShuttingDown()) return;
+
+    // No pointer wiring → polling can never succeed; skip silently.
+    const getPointerLayer = this.host.options?.getPointerLayer;
+    if (!getPointerLayer) return;
+
+    // Clear any pre-existing timer (defensive — shouldn't normally
+    // happen because the only callers are initialize() at startup
+    // and the timeout callback itself).
+    if (this.pointerPollTimer !== null) {
+      clearTimeout(this.pointerPollTimer);
+      this.pointerPollTimer = null;
+    }
+
+    const intervalMs = this.samplePointerPollIntervalMs();
+    this.pointerPollTimer = setTimeout(() => {
+      this.pointerPollTimer = null;
+      // Detached promise — the callback re-arms in its own try/catch
+      // so a stray rejection here cannot break the cadence.
+      void this.runPointerPollOnce();
+    }, intervalMs);
+  }
+
+  /**
+   * Single iteration of the periodic poll. Always re-arms unless
+   * shutdown is in progress. Permanent failures re-arm with a 5x
+   * back-off applied via the multiplier in the next-tick interval.
+   */
+  private async runPointerPollOnce(): Promise<void> {
+    if (this.host.getIsShuttingDown()) return;
+
+    const getPointerLayer = this.host.options?.getPointerLayer;
+    if (!getPointerLayer) return; // wiring removed mid-flight — defensive
+
+    let nextBackoffMultiplier = 1;
+    const pointer = getPointerLayer() ?? null;
+    if (!pointer) {
+      // Closure exists but the layer isn't constructed yet (e.g.,
+      // build still in flight). Skip this tick and re-arm.
+      this.scheduleNextPointerPoll(nextBackoffMultiplier);
+      return;
+    }
+
+    let recovered: { readonly cid: Uint8Array; readonly version: number } | null = null;
+    try {
+      recovered = await pointer.recoverLatest();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (this.isPermanentPointerError(err)) {
+        const code = (err as { code?: string }).code ?? 'UNKNOWN';
+        this.host.log(`Pointer poll PERMANENT failure (${code}): ${msg}`);
+        this.host.emitEvent(this.host.buildErrorEvent('storage:error', err));
+        nextBackoffMultiplier = POINTER_POLL_BACKOFF_MULTIPLIER;
+      } else {
+        this.host.log(`Pointer poll failed (transient, best-effort): ${msg}`);
+      }
+      this.scheduleNextPointerPoll(nextBackoffMultiplier);
+      return;
+    }
+
+    if (!recovered) {
+      // No anchor published yet — operator hasn't flushed. Re-arm
+      // silently; this is a normal state for a fresh wallet.
+      this.scheduleNextPointerPoll(nextBackoffMultiplier);
+      return;
+    }
+
+    let cidString: string;
+    try {
+      cidString = CID.decode(recovered.cid).toString();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.host.log(`Pointer poll: failed to decode recovered CID bytes: ${msg}`);
+      this.scheduleNextPointerPoll(nextBackoffMultiplier);
+      return;
+    }
+
+    // Idempotency — if we already know this CID, OrbitDB pubsub (or our
+    // own flush) already delivered it. Skip the bundle-index write to
+    // avoid an unnecessary OrbitDB op.
+    if (this.host.getKnownBundleCids().has(cidString)) {
+      this.scheduleNextPointerPoll(nextBackoffMultiplier);
+      return;
+    }
+
+    try {
+      await this.bundleIndex.addBundle(cidString, {
+        cid: cidString,
+        // Mirror the cold-start path's conservative default: CARs are
+        // verified by JOIN walker / decryption on first use; until
+        // then, mark active (Path 1's normal write also does so).
+        // Permanent verify failures will be caught by listBundles
+        // and emit CID_REF_CORRUPT events.
+        status: 'active',
+        createdAt: Math.floor(Date.now() / 1000),
+      });
+      this.host.log(
+        `Pointer poll discovered NEW CID: cid=${cidString} version=${recovered.version}`,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.host.log(`Pointer poll: addBundle failed: ${msg}`);
+    }
+
+    this.scheduleNextPointerPoll(nextBackoffMultiplier);
+  }
+
+  /**
+   * Re-arm the poll with the given back-off multiplier (1 = normal,
+   * `POINTER_POLL_BACKOFF_MULTIPLIER` = permanent-failure back-off).
+   */
+  private scheduleNextPointerPoll(backoffMultiplier: number): void {
+    if (this.host.getIsShuttingDown()) return;
+    if (!this.host.options?.getPointerLayer) return;
+
+    const baseIntervalMs = this.samplePointerPollIntervalMs();
+    const intervalMs = baseIntervalMs * Math.max(1, backoffMultiplier);
+    this.pointerPollTimer = setTimeout(() => {
+      this.pointerPollTimer = null;
+      void this.runPointerPollOnce();
+    }, intervalMs);
   }
 }
