@@ -119,10 +119,23 @@ describe.skipIf(SKIP_INFRA)('Profile Live Concurrent Sync E2E', () => {
   // doesn't leave a transport in a half-closed state.
   let testSpheres: Sphere[] = [];
 
+  // Increased hook timeout — destroying two Profile-mode spheres each
+  // with pointer-monotonicity assertions, in-flight flushes, OrbitDB
+  // shutdown, and IPFS cleanup can take 60s+ combined in real-network
+  // conditions because shutdown awaits in-flight flushes (lifecycle-
+  // manager.ts:238) and each flush includes an IPFS pin + aggregator
+  // submit. Two spheres serially × ~30-45s/flush = 60-90s total. Use
+  // a 180s ceiling so legitimate slow teardowns aren't masked as
+  // "test failures".
   afterEach(async () => {
-    for (const s of testSpheres) {
-      try { await s.destroy(); } catch { /* cleanup */ }
-    }
+    // Destroy in PARALLEL — each sphere awaits its own in-flight flush
+    // independently; running them serially would double the wall-clock
+    // wait (60s + 60s instead of max(60s, 60s) ≈ 60s).
+    await Promise.all(
+      testSpheres.map(async (s) => {
+        try { await s.destroy(); } catch { /* cleanup */ }
+      }),
+    );
     testSpheres = [];
     // Null the singleton slot — same defensive pattern used in
     // provider-disable-sync.test.ts to keep cross-test state clean
@@ -131,7 +144,7 @@ describe.skipIf(SKIP_INFRA)('Profile Live Concurrent Sync E2E', () => {
     // Brief settle so any transport disconnects and pending writes
     // flush before the next test re-establishes connections.
     await new Promise((r) => setTimeout(r, 1_000));
-  });
+  }, 180_000);
 
   afterAll(async () => {
     for (const d of cleanupDirs) {
