@@ -1157,6 +1157,30 @@ export class ProfileTokenStorageProvider
       this.emitEvent(this.buildErrorEvent('storage:error', err));
     }
 
+    // G4 — also persist tombstones to OrbitDB at `${addr}.tombstones`.
+    // Pre-fix: tombstones lived ONLY in the per-device local cache
+    // (`deriver.${addr}.all`). A cold-start (cache wiped by browser
+    // storage purge / re-import / new device) returned empty tombstones,
+    // so a Nostr re-delivery of an archived-token bundle would be
+    // re-ingested as if live — security boundary violation. Writing to
+    // OrbitDB carries the boundary across replication AND survives
+    // cold-start as long as the Profile is recoverable from IPFS.
+    //
+    // Single-blob layout matches `invalidatedNametags` and `history`
+    // (small bounded set per address). Empty arrays are still written
+    // — peers MUST observe an authoritative empty state to converge.
+    try {
+      await this.writeProfileKey(
+        `${addr}.tombstones`,
+        JSON.stringify(opState.tombstones),
+      );
+    } catch (err) {
+      this.log(
+        `Failed to write tombstones: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      this.emitEvent(this.buildErrorEvent('storage:error', err));
+    }
+
     // Migration: if a legacy single-blob exists for any of the lists,
     // delete it now that per-entry data is written. Best-effort.
     // Includes the new audit + finalizationQueue prefixes so a future
@@ -1834,16 +1858,49 @@ export class ProfileTokenStorageProvider
   /**
    * Read the full operational state (synced + local-cached) for use
    * when building a TxfStorageDataBase on load.
+   *
+   * G4 — `tombstones` are read from BOTH the OrbitDB blob
+   * (`${addr}.tombstones`, replicated, survives cold-start) AND the
+   * local cache (`deriver.${addr}.all`, per-device). Both sources are
+   * merged via union by primary-key (`tokenId`+`stateHash`) so a device
+   * that has never written to OrbitDB yet still surfaces locally-known
+   * tombstones, while a freshly-imported wallet pulls the boundary from
+   * the synced source. Writes to OrbitDB happen in
+   * `writeOrbitOperationalStatePerEntry`.
    */
   private async readOperationalState(): Promise<OperationalState> {
-    const [orbit, local] = await Promise.all([
+    const addr = this.getAddressId();
+    const [orbit, local, orbitTombstones] = await Promise.all([
       this.readOrbitOperationalState(),
       this.readLocalDerivedCache(),
+      this.readProfileKeyJson<TxfTombstone[]>(`${addr}.tombstones`),
     ]);
+
+    // Merge OrbitDB-replicated tombstones with the local cache. Dedup
+    // by composite key `${tokenId}:${stateHash}` so a single physical
+    // tombstone observed from both sources does not double-count.
+    const tombstoneMap = new Map<string, TxfTombstone>();
+    for (const t of local.tombstones) {
+      tombstoneMap.set(`${t.tokenId}:${t.stateHash}`, t);
+    }
+    if (orbitTombstones !== null) {
+      for (const t of orbitTombstones) {
+        const k = `${t.tokenId}:${t.stateHash}`;
+        // Prefer the EARLIEST observed timestamp on a tie so cross-
+        // replica merges converge — every replica has a deterministic
+        // pick when the same tombstone is recorded with different
+        // wall-clock timestamps.
+        const prior = tombstoneMap.get(k);
+        if (prior === undefined || t.timestamp < prior.timestamp) {
+          tombstoneMap.set(k, t);
+        }
+      }
+    }
+    const mergedTombstones = Array.from(tombstoneMap.values());
 
     return {
       ...orbit,
-      tombstones: local.tombstones,
+      tombstones: mergedTombstones,
       sent: local.sent,
       history: local.history,
     };
