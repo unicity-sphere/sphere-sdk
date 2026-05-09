@@ -507,6 +507,9 @@ export class DispositionWriter {
         const ref = manifestNow?.rootHash ?? manifestEntry.rootHash;
         const promoted: AuditEntry = stripUndefinedShallow({
           ...existing,
+          // G1 — defensive stamp in case `existing` was loaded from
+          // a pre-discriminator on-disk record.
+          _schemaVersion: 'uxf-1',
           auditStatus: 'audit-promoted',
           promotedToManifestRef: ref,
           promotionPending: undefined,
@@ -523,6 +526,8 @@ export class DispositionWriter {
       // write is recoverable via Branch B.
       const marked: AuditEntry = stripUndefinedShallow({
         ...existing,
+        // G1 — defensive stamp.
+        _schemaVersion: 'uxf-1',
         promotionPending: true,
       });
       await this.storage.writeRecord<AuditEntry>(auditKey, marked);
@@ -543,6 +548,8 @@ export class DispositionWriter {
       try {
         const rolledBack: AuditEntry = stripUndefinedShallow({
           ...existing,
+          // G1 — defensive stamp.
+          _schemaVersion: 'uxf-1',
           promotionPending: undefined,
         });
         await this.storage.writeRecord<AuditEntry>(auditKey, rolledBack);
@@ -560,6 +567,8 @@ export class DispositionWriter {
     // pointer the spec calls `promotedToManifestRef`.
     const promoted: AuditEntry = stripUndefinedShallow({
       ...existing,
+      // G1 — defensive stamp.
+      _schemaVersion: 'uxf-1',
       auditStatus: 'audit-promoted',
       promotedToManifestRef: manifestEntry.rootHash,
       promotionPending: undefined,
@@ -607,6 +616,10 @@ export class DispositionWriter {
       record.observedTokenContentHash,
     );
     const entry: InvalidEntry = {
+      // G2 — schema discriminator preserves this record across legacy
+      // PaymentsModule.save() flushes (provider-side `applyPerEntryDiff`
+      // checks `_schemaVersion === 'uxf-1'` to skip foreign-schema entries).
+      _schemaVersion: 'uxf-1',
       tokenId: record.tokenId,
       observedTokenContentHash: record.observedTokenContentHash,
       reason: record.reason,
@@ -772,6 +785,10 @@ export function mergeAuditEntry(
         : undefined;
 
   const merged: AuditEntry = {
+    // G1 — schema discriminator preserves this record across legacy
+    // PaymentsModule.save() flushes (provider-side `applyPerEntryDiff`
+    // checks `_schemaVersion === 'uxf-1'` to skip foreign-schema entries).
+    _schemaVersion: 'uxf-1',
     tokenId: incoming.tokenId,
     observedTokenContentHash: incoming.observedTokenContentHash,
     auditStatus,

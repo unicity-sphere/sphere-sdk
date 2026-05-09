@@ -1105,6 +1105,13 @@ export class ProfileTokenStorageProvider
       existingInvalidKeys,
       now,
       TOMBSTONE_RETENTION_MS,
+      // G2 — DispositionWriter owns `_invalid` records under the same
+      // prefix and stamps `_schemaVersion: 'uxf-1'` on every write. The
+      // legacy `data._invalid` is a `TxfInvalidEntry[]` (no
+      // `_schemaVersion`) while the DispositionWriter records carry the
+      // discriminator. Without this flag, every legacy save() flush
+      // tombstones the DispositionWriter records (forensic data loss).
+      /* skipForeignSchema */ true,
     );
     await this.applyPerEntryDiff(
       `${addr}.mintOutbox.`,
@@ -1119,6 +1126,10 @@ export class ProfileTokenStorageProvider
       existingAuditKeys,
       now,
       TOMBSTONE_RETENTION_MS,
+      // G1 — DispositionWriter owns `_audit` records under the same
+      // prefix. See the `${addr}.invalid.` call above for full
+      // rationale.
+      /* skipForeignSchema */ true,
     );
     await this.applyPerEntryDiff(
       `${addr}.finalizationQueue.`,
@@ -1126,6 +1137,13 @@ export class ProfileTokenStorageProvider
       existingFinalizationKeys,
       now,
       TOMBSTONE_RETENTION_MS,
+      // G3 — recipient FinalizationQueue records (when persisted via
+      // the OrbitDb-backed adapter) carry `_schemaVersion: 'uxf-1'`.
+      // The legacy `data._finalizationQueue` is a
+      // `TxfFinalizationQueueEntry[]` (no discriminator). Without this
+      // flag every save() flush tombstones in-flight finalization
+      // entries (cross-restart safety net erased).
+      /* skipForeignSchema */ true,
     );
 
     // invalidatedNametags stays as a single key (small Set<string>).
