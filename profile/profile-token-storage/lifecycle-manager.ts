@@ -314,6 +314,11 @@ export class LifecycleManager {
     try {
       const cidBytes = CID.parse(cidString).bytes;
       const result = await pointer.publish(async () => cidBytes);
+      // Successful publish: this CID is now the authoritative pointer
+      // anchor. Track for no-data flush idempotency — a subsequent
+      // remote-update-driven republish that would re-publish the same
+      // bytes can short-circuit.
+      this.host.setLastDiscoveredPointerCid(cidString);
       this.host.log(
         `Pointer publish ok: cid=${cidString} version=${result.version} attempts=${result.attemptsUsed}`,
       );
@@ -483,6 +488,11 @@ export class LifecycleManager {
         status: verifiedActive ? 'active' : 'unverified',
         createdAt: Math.floor(Date.now() / 1000),
       });
+      // Track for the no-data republish idempotency check: if the
+      // merged-state CAR a future no-data flush would build matches
+      // this same CID, skip the publish (the remote pointer is
+      // already authoritative).
+      this.host.setLastDiscoveredPointerCid(cidString);
       this.host.log(
         `Pointer recover ok: cid=${cidString} version=${recovered.version} ` +
           `status=${verifiedActive ? 'active' : 'unverified'}`,
@@ -656,6 +666,12 @@ export class LifecycleManager {
     // own flush) already delivered it. Skip the bundle-index write to
     // avoid an unnecessary OrbitDB op.
     if (this.host.getKnownBundleCids().has(cidString)) {
+      // Still update the discovered-pointer CID — this lets a future
+      // no-data flush short-circuit on idempotent republish. (Even
+      // though we already had this CID locally, the AGGREGATOR may
+      // have anchored a new pointer version pointing to it; tracking
+      // ensures our flush idempotency stays correct.)
+      this.host.setLastDiscoveredPointerCid(cidString);
       this.scheduleNextPointerPoll(nextBackoffMultiplier);
       return;
     }
@@ -671,6 +687,7 @@ export class LifecycleManager {
         status: 'active',
         createdAt: Math.floor(Date.now() / 1000),
       });
+      this.host.setLastDiscoveredPointerCid(cidString);
       this.host.log(
         `Pointer poll discovered NEW CID: cid=${cidString} version=${recovered.version}`,
       );

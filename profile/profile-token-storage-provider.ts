@@ -164,6 +164,14 @@ export class ProfileTokenStorageProvider
   // --- Last pinned CID for flush retry (Fix 8) ---
   private lastPinnedCid: string | null = null;
 
+  // --- Last CID observed via aggregator pointer (Fix 2 of cross-device sync) ---
+  // Set by LifecycleManager on cold-start recoverLatest and on every
+  // periodic poll iteration that returns a CID. Read by FlushScheduler
+  // to short-circuit gratuitous re-publishes when the merged-state CAR
+  // already matches the authoritative pointer (e.g., remote originator
+  // already anchored the state we just merged from their bundle).
+  private lastDiscoveredPointerCid: string | null = null;
+
   // --- Config storage for createForAddress ---
   private readonly _db: ProfileDatabase;
   private readonly _encryptionKeyRaw: Uint8Array | null;
@@ -296,6 +304,10 @@ export class ProfileTokenStorageProvider
       getLastPinnedCid: () => this.lastPinnedCid,
       setLastPinnedCid: (c) => {
         this.lastPinnedCid = c;
+      },
+      getLastDiscoveredPointerCid: () => this.lastDiscoveredPointerCid,
+      setLastDiscoveredPointerCid: (c) => {
+        this.lastDiscoveredPointerCid = c;
       },
       // Bundle index state
       getKnownBundleCids: () => this.knownBundleCids,
@@ -2038,6 +2050,16 @@ export class ProfileTokenStorageProvider
   /**
    * Handle OrbitDB replication events.
    * Checks for new `tokens.bundle.*` keys and emits `storage:remote-updated`.
+   *
+   * Cross-device sync resilience (Fix 2): when new bundle CIDs appear,
+   * schedule a no-data flush so we anchor our OWN aggregator pointer
+   * to the merged state. Without this, if Device A originated a bundle
+   * and goes offline before Device B re-flushes, a future Device C
+   * joining via the aggregator pointer would only see A's CID — which
+   * is fine if A's bundle covered the full state, but loses anything
+   * B contributed via Nostr DMs (or any source the originator hadn't
+   * captured). The flush body short-circuits if the merged-state CAR
+   * matches a known anchor (idempotent).
    */
   private async handleReplication(): Promise<void> {
     try {
@@ -2059,6 +2081,14 @@ export class ProfileTokenStorageProvider
           timestamp: Date.now(),
           data: { source: 'replication' },
         });
+
+        // Anchor our own pointer at the merged state. The flush body
+        // computes the projected CID locally and short-circuits if it
+        // already matches a known anchor (lastDiscoveredPointerCid or
+        // an active OrbitDB bundle ref) — so a single-originator topology
+        // (Device A publishes, Device B silently merges) pays no extra
+        // IPFS pin or aggregator submit cost on the receiver side.
+        this.flushScheduler.scheduleFlushNoData();
       }
     } catch (err) {
       this.log(`Replication check failed: ${err instanceof Error ? err.message : String(err)}`);

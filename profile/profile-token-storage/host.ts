@@ -99,6 +99,16 @@ export interface ProfileTokenStorageHost {
   getLastPinnedCid(): string | null;
   setLastPinnedCid(c: string | null): void;
 
+  /**
+   * The most recent CID observed via the aggregator pointer layer
+   * (cold-start `recoverLatest()` or the periodic poll). Tracked so
+   * `flushToIpfs()` can short-circuit a no-data republish when the
+   * about-to-publish CAR already matches the authoritative pointer
+   * (i.e., another device already anchored the same merged state).
+   */
+  getLastDiscoveredPointerCid(): string | null;
+  setLastDiscoveredPointerCid(c: string | null): void;
+
   // --- Bundle index state ---
   getKnownBundleCids(): Set<string>;
   setKnownBundleCids(s: Set<string>): void;

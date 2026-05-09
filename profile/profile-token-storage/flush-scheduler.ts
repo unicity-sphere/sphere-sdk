@@ -13,6 +13,22 @@
  * writes the bundle ref, and publishes the CID to the aggregator
  * pointer layer.
  *
+ * # No-data flush (cross-device sync resilience)
+ *
+ * `scheduleFlushNoData()` arms the same debounce timer but signals the
+ * flush body to source bytes from `lastLoadedData` (the merged
+ * post-load state) when `pendingData` is null. Use case: when
+ * `handleReplication` detects a NEW remote bundle, the local OrbitDB
+ * log now reflects state our previously-published pointer doesn't.
+ * Anchoring our own pointer at the merged state ensures Device C
+ * joining via the aggregator pointer sees the full union when both
+ * Device A and Device B contributed bundles.
+ *
+ * The flush body short-circuits before pin + publish when the CAR's
+ * CID equals `lastDiscoveredPointerCid` (the authoritative pointer is
+ * already anchored at this exact bytes; B re-publishing version V2
+ * would be gratuitous churn).
+ *
  * Cross-seam dependencies:
  *   - `BundleIndex.listActiveBundles` — sanity-check that the cached
  *     `lastPinnedCid` is still active before reusing it.
@@ -26,9 +42,11 @@
  *     flush body invokes via the host interface.
  *
  * Cross-seam shared state plumbed via the host:
- *   - `pendingData`, `flushTimer`, `flushPromise`, `lastPinnedCid` —
- *     owned by the scheduler but stored on the facade so `load()` and
- *     `shutdown()` can observe / cancel the in-flight flush.
+ *   - `pendingData`, `flushTimer`, `flushPromise`, `lastPinnedCid`,
+ *     `lastDiscoveredPointerCid` — owned by the scheduler but stored
+ *     on the facade so `load()` and `shutdown()` can observe / cancel
+ *     the in-flight flush, and so the lifecycle's pointer recovery /
+ *     poll paths can publish the latest discovered CID.
  *   - `isShuttingDown` — read to skip consolidation + scheduling on
  *     shutdown.
  *
@@ -36,6 +54,10 @@
  */
 
 import { pinToIpfs } from '../ipfs-client.js';
+import { CID } from 'multiformats/cid';
+import * as raw from 'multiformats/codecs/raw';
+import { sha256 } from '@noble/hashes/sha2.js';
+import { create as createMultihash } from 'multiformats/hashes/digest';
 import type { UxfBundleRef } from '../types.js';
 import type { BundleIndex } from './bundle-index.js';
 import type { LifecycleManager } from './lifecycle-manager.js';
@@ -43,6 +65,16 @@ import type { ProfileTokenStorageHost } from './host.js';
 import type { TxfStorageDataBase } from '../../storage/storage-provider.js';
 
 export class FlushScheduler {
+  /**
+   * Set when `scheduleFlushNoData()` arms a flush in the absence of
+   * pending local data. The flush body reads this flag to decide
+   * whether to source the CAR from `lastLoadedData` (merged
+   * post-load state) instead of `pendingData`. The flag is cleared
+   * inside `flushToIpfs()` after the snapshot is captured (analogous
+   * to how `pendingData` is cleared after capture).
+   */
+  private noDataFlushPending = false;
+
   constructor(
     private readonly host: ProfileTokenStorageHost,
     private readonly bundleIndex: BundleIndex,
@@ -103,15 +135,90 @@ export class FlushScheduler {
   }
 
   /**
+   * Arm a flush in the absence of pending local data. Used by
+   * `handleReplication()` to anchor our own pointer at the merged
+   * post-load state when remote bundles arrive via OrbitDB pubsub.
+   *
+   * If a normal `scheduleFlush()` is already armed (or about to be —
+   * the debounce timer is non-null), this just sets the flag and
+   * lets the existing timer fire; the flush body will read the flag
+   * and source from `lastLoadedData`.
+   *
+   * If no timer is armed, this arms one identical to `scheduleFlush()`.
+   */
+  scheduleFlushNoData(): void {
+    if (this.host.getIsShuttingDown()) return;
+
+    this.noDataFlushPending = true;
+
+    // If a timer is already armed (because of a concurrent save()),
+    // don't re-arm — let it fire. The flushToIpfs body will read
+    // both `pendingData` and the no-data flag and merge.
+    if (this.host.getFlushTimer() !== null) return;
+
+    // Otherwise arm a fresh timer. Same plumbing as scheduleFlush so
+    // load() / shutdown() observers see the in-flight flushPromise
+    // identically to a save-driven flush.
+    const timer = setTimeout(() => {
+      this.host.setFlushTimer(null);
+      const flushBox: { ref: Promise<void> | null } = { ref: null };
+      const myFlush: Promise<void> = this.flushToIpfs()
+        .catch((err) => {
+          this.host.log(
+            `Flush (no-data) failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          this.host.emitEvent(this.host.buildErrorEvent('storage:error', err));
+        })
+        .finally(() => {
+          if (this.host.getFlushPromise() === flushBox.ref) {
+            this.host.setFlushPromise(null);
+          }
+        });
+      flushBox.ref = myFlush;
+      this.host.setFlushPromise(myFlush);
+    }, this.host.flushDebounceMs);
+    this.host.setFlushTimer(timer);
+  }
+
+  /**
    * Run a single flush of the pending data: extract tokens and
    * operational state, build a UXF package, pin the CAR, write the
    * bundle ref, persist operational state, and publish the CID to the
    * aggregator pointer layer.
+   *
+   * No-data flush mode (Fix 2 of cross-device sync): if `pendingData`
+   * is null but `noDataFlushPending` is set, source the CAR from
+   * `lastLoadedData` (the merged post-load state). Skip pin + publish
+   * if the resulting CID equals `lastDiscoveredPointerCid` (the
+   * authoritative pointer already anchored this exact bytes — e.g.,
+   * the remote originator already published while we were merging).
    */
   async flushToIpfs(): Promise<void> {
-    const data = this.host.getPendingData();
     const encryptionKey = this.host.getEncryptionKey();
-    if (!data || !encryptionKey) return;
+    if (!encryptionKey) return;
+
+    // Capture and clear the no-data flag immediately so a concurrent
+    // scheduleFlushNoData() doesn't get masked by this flush in flight.
+    const noDataMode = this.noDataFlushPending;
+    this.noDataFlushPending = false;
+
+    let data = this.host.getPendingData();
+
+    // No-data flush: source from lastLoadedData when pendingData is
+    // null. If lastLoadedData is also null, there's nothing to anchor
+    // — silently no-op.
+    if (!data && noDataMode) {
+      const merged = this.host.getLastLoadedData();
+      if (!merged) {
+        this.host.log(
+          'Flush (no-data): no lastLoadedData to anchor, skipping',
+        );
+        return;
+      }
+      data = merged;
+    }
+
+    if (!data) return;
 
     // Snapshot and clear pending to avoid re-flushing the same data.
     //
@@ -141,6 +248,52 @@ export class FlushScheduler {
 
       // 3. Export to CAR (unencrypted — see class doc)
       const carBytes = await pkg.toCar();
+
+      // 3a. No-data flush idempotency: compute the locally-deterministic
+      //     CID for the about-to-pin bytes and short-circuit if either
+      //     (a) the aggregator pointer has already anchored these exact
+      //     bytes (set by lifecycle on cold-start / poll / publish), or
+      //     (b) the OrbitDB bundle index already has this CID active
+      //     (our previous flush already pinned it).
+      //
+      //     The match in (a) is the central defense against gratuitous
+      //     re-publish when Device A originated the bundle and Device B
+      //     receives it, merges, and would otherwise pay the IPFS pin +
+      //     aggregator submit cost just to re-anchor the same bytes
+      //     under a higher version number.
+      //
+      //     A normal save-driven flush keeps publishing because the CAR
+      //     bytes change with every token mutation; this short-circuit
+      //     only fires when the merged-state CAR happens to be byte-
+      //     identical to a known anchor.
+      if (noDataMode) {
+        const projectedCid = CID.createV1(
+          raw.code,
+          createMultihash(0x12, sha256(carBytes)),
+        ).toString();
+        const knownDiscovered = this.host.getLastDiscoveredPointerCid();
+        if (knownDiscovered === projectedCid) {
+          this.host.log(
+            `Flush (no-data) short-circuit: merged-state CID ${projectedCid} ` +
+              `equals authoritative pointer; skipping pin + publish`,
+          );
+          return;
+        }
+        try {
+          const activeBundles = await this.bundleIndex.listActiveBundles();
+          if (activeBundles.has(projectedCid)) {
+            this.host.log(
+              `Flush (no-data) short-circuit: merged-state CID ${projectedCid} ` +
+                `already in OrbitDB bundle index; skipping pin + publish`,
+            );
+            return;
+          }
+        } catch {
+          // listActiveBundles is best-effort here — if it fails, fall
+          // through to the normal pin path. A stale CID in OrbitDB is
+          // self-correcting (next consolidation pass merges it).
+        }
+      }
 
       // 4. Pin to IPFS (reuse last pinned CID on retry to avoid duplicate pins)
       //
