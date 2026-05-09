@@ -64,6 +64,14 @@ import type { LifecycleManager } from './lifecycle-manager.js';
 import type { ProfileTokenStorageHost } from './host.js';
 import type { TxfStorageDataBase } from '../../storage/storage-provider.js';
 
+/**
+ * Error code emitted when the runtime pointer-monotonicity assertion
+ * fires. The flush is aborted before pin + publish; the operator-alert
+ * event is emitted with the missing token IDs so monitoring can surface
+ * the regression. Exported so consumers/tests can reference the literal.
+ */
+export const POINTER_MONOTONICITY_VIOLATION = 'POINTER_MONOTONICITY_VIOLATION';
+
 export class FlushScheduler {
   /**
    * Set when `scheduleFlushNoData()` arms a flush in the absence of
@@ -293,6 +301,131 @@ export class FlushScheduler {
           // through to the normal pin path. A stale CID in OrbitDB is
           // self-correcting (next consolidation pass merges it).
         }
+      }
+
+      // 3b. POINTER MONOTONICITY ASSERTION (defense-in-depth).
+      //
+      //     Invariant: the published pointer V_n MUST reference a CAR
+      //     that contains every token reachable from V_n-1's CARs. A
+      //     violation means a cross-device sync race or a partial save()
+      //     produced a flush that would silently drop tokens on cold-
+      //     start recovery from the aggregator pointer.
+      //
+      //     We check two independent failure surfaces:
+      //
+      //     (i) TOKEN-SET CHECK: the new flush's data MUST contain every
+      //         token id present in `lastLoadedData` (the most recent
+      //         merge across active bundles). Catches a partial save()
+      //         that dropped tokens from the in-memory state. Skipped
+      //         when `lastLoadedData === data` (typical save-driven
+      //         flush, where save() set `lastLoadedData = data`) or when
+      //         `lastLoadedData` is null (no V_n-1 baseline).
+      //
+      //     (ii) BUNDLE-SET CHECK: the OrbitDB active bundle index MUST
+      //          NOT contain any CID that was NOT merged into the
+      //          current `lastLoadedData`. If unknown bundles appeared
+      //          since the last successful load(), the flush's source
+      //          state is stale and the new CAR would silently drop the
+      //          unknown bundles' tokens from V_n. The about-to-pin CID
+      //          is allowed to be missing from the snapshot (the new
+      //          flush is itself V_n's bundle).
+      //
+      //     Mode A fix #2 (handleReplication awaits load() before
+      //     scheduling) keeps the baseline fresh; this assertion is
+      //     defense-in-depth that catches future regressions and edge
+      //     cases (e.g., a partial save() bug from PaymentsModule, or
+      //     a slow load() that doesn't complete before the flush fires).
+      //
+      //     The check is in-memory only — no extra IPFS round-trips
+      //     except the bundleIndex listActiveBundles() which we already
+      //     call below for cached-CID validation.
+      const previousData = this.host.getLastLoadedData();
+
+      // (i) Token-set check.
+      const tokenMissing: string[] = [];
+      if (previousData && previousData !== data) {
+        const previousTokens = this.host.extractTokensFromTxfData(previousData);
+        for (const tokenId of previousTokens.keys()) {
+          if (!tokens.has(tokenId)) tokenMissing.push(tokenId);
+        }
+      }
+
+      // (ii) Bundle-set check. The set of CIDs that load() merged into
+      //      lastLoadedData is captured by `lastLoadedFromBundleCids`.
+      //      Compare against the current active bundle index — any CID
+      //      in the index that's NOT in the loaded snapshot AND NOT the
+      //      about-to-pin CID is a stale-baseline indicator.
+      const loadedBundleCids = this.host.getLastLoadedFromBundleCids();
+      const unknownBundleCids: string[] = [];
+      if (loadedBundleCids !== null) {
+        try {
+          const activeBundles = await this.bundleIndex.listActiveBundles();
+          for (const cid of activeBundles.keys()) {
+            if (!loadedBundleCids.has(cid)) {
+              unknownBundleCids.push(cid);
+            }
+          }
+        } catch (err) {
+          // Best-effort: if listActiveBundles fails we cannot run this
+          // check. Log and proceed — the token-set check still gates
+          // the partial-save() failure mode, and the next flush will
+          // re-attempt the bundle check.
+          this.host.log(
+            `Pointer monotonicity bundle-set check skipped (listActiveBundles failed): ` +
+              `${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+
+      if (tokenMissing.length > 0 || unknownBundleCids.length > 0) {
+        const reasonParts: string[] = [];
+        if (tokenMissing.length > 0) {
+          reasonParts.push(
+            `would drop ${tokenMissing.length} token(s) from baseline ` +
+              `(${tokenMissing.slice(0, 10).join(', ')}${tokenMissing.length > 10 ? ', ...' : ''})`,
+          );
+        }
+        if (unknownBundleCids.length > 0) {
+          reasonParts.push(
+            `${unknownBundleCids.length} unknown bundle(s) in OrbitDB not in baseline ` +
+              `(${unknownBundleCids.slice(0, 5).join(', ')}${unknownBundleCids.length > 5 ? ', ...' : ''})`,
+          );
+        }
+        const violation = new Error(
+          `Pointer monotonicity violation: ${reasonParts.join('; ')}. ` +
+            `Aborting publish to prevent silent token loss across cross-device sync.`,
+        );
+        (violation as Error & { code?: string }).code = POINTER_MONOTONICITY_VIOLATION;
+        this.host.log(`[POINTER_MONOTONICITY_VIOLATION] aborting publish: ${reasonParts.join('; ')}`);
+
+        // The catch block at the bottom of flushToIpfs() re-queues
+        // `data` so the user's writes are not lost; subsequent
+        // flushes will re-evaluate once lastLoadedData refreshes.
+        // Surface to operators via storage:error AND a structured
+        // alert so monitoring dashboards can fire on the literal code.
+        this.host.emitEvent(
+          this.host.buildErrorEvent(
+            'storage:error',
+            violation,
+            POINTER_MONOTONICITY_VIOLATION,
+          ),
+        );
+        this.host.emitEvent({
+          type: 'storage:error',
+          timestamp: Date.now(),
+          code: POINTER_MONOTONICITY_VIOLATION,
+          error: violation.message,
+          data: {
+            alert: 'transfer:operator-alert',
+            missingTokenIds: tokenMissing.slice(0, 100),
+            missingTokenCount: tokenMissing.length,
+            unknownBundleCids: unknownBundleCids.slice(0, 100),
+            unknownBundleCount: unknownBundleCids.length,
+            truncated:
+              tokenMissing.length > 100 || unknownBundleCids.length > 100,
+          },
+        });
+        throw violation;
       }
 
       // 4. Pin to IPFS (reuse last pinned CID on retry to avoid duplicate pins)

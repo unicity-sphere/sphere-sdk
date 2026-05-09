@@ -264,6 +264,7 @@ export class LifecycleManager {
     // retains a reference to this provider doesn't pin the entire
     // token graph forever.  Mirrors what `clear()` does.
     this.host.setLastLoadedData(null);
+    this.host.setLastLoadedFromBundleCids(null);
     this.host.setLastTokenManifest(null);
 
     this.host.setInitialized(false);

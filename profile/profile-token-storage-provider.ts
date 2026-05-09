@@ -172,6 +172,18 @@ export class ProfileTokenStorageProvider
   // already anchored the state we just merged from their bundle).
   private lastDiscoveredPointerCid: string | null = null;
 
+  // --- Bundle CIDs merged into lastLoadedData (pointer monotonicity) ---
+  // Snapshot of the active OrbitDB bundle index at the moment load()
+  // produced lastLoadedData. Used by FlushScheduler's runtime monotonicity
+  // assertion: if a flush would publish a pointer V_n while OrbitDB has
+  // bundles NOT in this set, the flush's source state is stale and
+  // would silently drop tokens from V_n's CAR. The assertion fires
+  // before pin + publish.
+  //
+  // Null when no successful load() has run yet (no V_n-1 baseline → the
+  // assertion has nothing to compare against and trivially passes).
+  private lastLoadedFromBundleCids: Set<string> | null = null;
+
   // --- Config storage for createForAddress ---
   private readonly _db: ProfileDatabase;
   private readonly _encryptionKeyRaw: Uint8Array | null;
@@ -319,6 +331,10 @@ export class ProfileTokenStorageProvider
       setLastLoadedData: (d) => {
         this.lastLoadedData = d;
       },
+      getLastLoadedFromBundleCids: () => this.lastLoadedFromBundleCids,
+      setLastLoadedFromBundleCids: (s) => {
+        this.lastLoadedFromBundleCids = s;
+      },
       getLastTokenManifest: () => this.lastTokenManifest,
       setLastTokenManifest: (m) => {
         this.lastTokenManifest = m;
@@ -465,6 +481,8 @@ export class ProfileTokenStorageProvider
         // No bundles -- return empty data
         const emptyData = this.buildEmptyTxfData();
         this.lastLoadedData = emptyData;
+        // Snapshot the merged-bundle set for the monotonicity assertion.
+        this.lastLoadedFromBundleCids = new Set();
         this.emitEvent({ type: 'storage:loaded', timestamp: Date.now() });
         return {
           success: true,
@@ -549,6 +567,11 @@ export class ProfileTokenStorageProvider
       }
 
       this.lastLoadedData = txfData;
+      // Snapshot the merged-bundle set for the runtime monotonicity
+      // assertion. activeBundles enumerated above is the V_n-1 bundle
+      // union; any future flush whose source state was captured before
+      // an additional bundle replicates in is detectably stale.
+      this.lastLoadedFromBundleCids = new Set(activeBundles.keys());
 
       this.emitEvent({ type: 'storage:loaded', timestamp: Date.now() });
 
@@ -744,6 +767,7 @@ export class ProfileTokenStorageProvider
       this.knownBundleCids.clear();
       this.pendingData = null;
       this.lastLoadedData = null;
+      this.lastLoadedFromBundleCids = null;
 
       return true;
     } catch (err) {
@@ -2123,15 +2147,16 @@ export class ProfileTokenStorageProvider
         // token loss across cross-device sync.
         //
         // load() is idempotent and best-effort: a failure here is logged
-        // and we still proceed to scheduleFlushNoData() so that — even
-        // if the load failed — the next remote-update tick gets another
-        // chance to refresh the baseline before publishing.
+        // (the load() event surface emits storage:error on its own) and
+        // we still proceed to scheduleFlushNoData() so that — even if the
+        // load failed — the runtime invariant assertion in flushToIpfs()
+        // catches a stale snapshot before the publish goes through.
         try {
           await this.load();
         } catch (err) {
           this.log(
-            `handleReplication: pre-flush load failed (best-effort): ` +
-              `${err instanceof Error ? err.message : String(err)}`,
+            `handleReplication: pre-flush load failed (best-effort, ` +
+              `runtime assertion will guard): ${err instanceof Error ? err.message : String(err)}`,
           );
         }
 

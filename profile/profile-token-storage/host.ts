@@ -116,6 +116,20 @@ export interface ProfileTokenStorageHost {
   // --- Last-loaded snapshot (read by load() / shutdown()) ---
   getLastLoadedData(): TxfStorageDataBase | null;
   setLastLoadedData(d: TxfStorageDataBase | null): void;
+
+  /**
+   * Set of bundle CIDs that load() merged into the most recent
+   * `lastLoadedData`. Read by FlushScheduler's runtime monotonicity
+   * assertion to detect a stale baseline (OrbitDB has bundles not
+   * represented in lastLoadedData → flush would silently drop tokens
+   * from the published pointer V_n's CAR).
+   *
+   * Null when no successful load() has run yet (assertion has nothing
+   * to compare against and skips).
+   */
+  getLastLoadedFromBundleCids(): Set<string> | null;
+  setLastLoadedFromBundleCids(s: Set<string> | null): void;
+
   getLastTokenManifest(): TokenManifest | null;
   setLastTokenManifest(m: TokenManifest | null): void;
 
