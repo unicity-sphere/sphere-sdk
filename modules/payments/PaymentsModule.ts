@@ -2099,37 +2099,45 @@ export class PaymentsModule {
                 // G7 — mirror the in-memory context Maps to persisted
                 // storage so a crash between enqueue and finalization
                 // does not erase the lookup keys the dispositionWriter
-                // VALID branch needs. Best-effort: a persistence
-                // failure is non-fatal (the in-memory Maps still drive
-                // a single-process recovery; only cross-restart safety
-                // degrades).
+                // VALID branch needs. Best-effort + fire-and-forget:
+                // the in-memory Maps remain authoritative for the
+                // current process (they were already populated above).
+                // The persisted records exist solely to survive a
+                // crash; awaiting them on the recipient hot path
+                // serializes N OrbitDB writes per token batch under
+                // parallel load and was the dominant source of the
+                // 3× e2e regression in profile-multi-device-sync.
+                // Persistence failure is non-fatal — only cross-
+                // restart safety degrades.
                 if (this._recipientContextStorage !== null) {
-                  try {
-                    await this._recipientContextStorage.writeFinalizationContext(
-                      addrId,
-                      tokenIdForQueue,
-                      {
-                        localTokenId: token.id,
-                        sourceTokenJson: pCtx.sourceTokenJson,
-                        lastTxJson: pCtx.lastTxJson,
-                        requestIdHex: reqId,
-                      },
-                    );
-                    await this._recipientContextStorage.writeRequestContext(
-                      addrId,
-                      reqId,
-                      {
-                        transactionHash: pCtx.transactionHash,
-                        authenticator: pCtx.authenticator,
-                        nextEntryRest: { status: 'valid' as const },
-                      },
-                    );
-                  } catch (persistErr) {
-                    logger.warn(
-                      'Payments',
-                      `G7: failed to persist recipient context for ${tokenIdForQueue.slice(0, 16)}: ${persistErr instanceof Error ? persistErr.message : String(persistErr)}`,
-                    );
-                  }
+                  const ctxStorage = this._recipientContextStorage;
+                  const finalizationCtx = {
+                    localTokenId: token.id,
+                    sourceTokenJson: pCtx.sourceTokenJson,
+                    lastTxJson: pCtx.lastTxJson,
+                    requestIdHex: reqId,
+                  };
+                  const requestCtx = {
+                    transactionHash: pCtx.transactionHash,
+                    authenticator: pCtx.authenticator,
+                    nextEntryRest: { status: 'valid' as const },
+                  };
+                  void ctxStorage
+                    .writeFinalizationContext(addrId, tokenIdForQueue, finalizationCtx)
+                    .catch((persistErr) => {
+                      logger.warn(
+                        'Payments',
+                        `G7: failed to persist finalization context for ${tokenIdForQueue.slice(0, 16)}: ${persistErr instanceof Error ? persistErr.message : String(persistErr)}`,
+                      );
+                    });
+                  void ctxStorage
+                    .writeRequestContext(addrId, reqId, requestCtx)
+                    .catch((persistErr) => {
+                      logger.warn(
+                        'Payments',
+                        `G7: failed to persist request context for ${tokenIdForQueue.slice(0, 16)}: ${persistErr instanceof Error ? persistErr.message : String(persistErr)}`,
+                      );
+                    });
                 }
 
                 // Fire-and-forget drive of the worker. The worker
