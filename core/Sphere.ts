@@ -2486,6 +2486,46 @@ export class Sphere {
     const groupChat = this._groupChatConfig ? createGroupChatModule(this._groupChatConfig) : null;
     const market = this._marketConfig ? createMarketModule(this._marketConfig) : null;
 
+    // G3 + G7 — Wire Profile-backed persisted storage for the recipient
+    // cross-restart safety net BEFORE payments.initialize() so the
+    // auto-installed FinalizationWorkerRecipient picks up the persisted
+    // FinalizationQueueStorage and the in-memory recipient context Maps
+    // re-hydrate from the persisted contexts. The wiring is best-effort:
+    // when the StorageProvider isn't a ProfileStorageProvider (e.g.
+    // legacy IndexedDB), the auto-install falls back to in-memory shims
+    // (legacy behavior — does NOT survive Sphere.destroy() / restart).
+    try {
+      const storageWithBuilders = this._storage as unknown as {
+        buildFinalizationQueueStorageAdapter?: () =>
+          | import('../profile/finalization-queue-storage-adapter').OrbitDbFinalizationQueueStorageAdapter
+          | null;
+        buildRecipientContextStorageAdapter?: () =>
+          | import('../profile/finalization-queue-storage-adapter').OrbitDbRecipientContextStorageAdapter
+          | null;
+      };
+      const queueAdapter =
+        typeof storageWithBuilders.buildFinalizationQueueStorageAdapter === 'function'
+          ? storageWithBuilders.buildFinalizationQueueStorageAdapter()
+          : null;
+      const ctxAdapter =
+        typeof storageWithBuilders.buildRecipientContextStorageAdapter === 'function'
+          ? storageWithBuilders.buildRecipientContextStorageAdapter()
+          : null;
+      if (queueAdapter !== null || ctxAdapter !== null) {
+        payments.configureRecipientPersistedStorage({
+          ...(queueAdapter !== null
+            ? { finalizationQueueStorage: queueAdapter }
+            : {}),
+          ...(ctxAdapter !== null ? { recipientContextStorage: ctxAdapter } : {}),
+        });
+      }
+    } catch (err) {
+      logger.warn(
+        'Sphere',
+        `G3/G7: failed to wire Profile-backed recipient persisted storage (continuing with in-memory shims): ${safeErrorMessage(err)}`,
+      );
+    }
+
     // Initialize with address-specific identity and per-address transport
     payments.initialize({
       identity,
@@ -4553,6 +4593,43 @@ export class Sphere {
     // from the start. The original transport stays connected for resolve operations.
     const adapter = await this.ensureTransportMux(this._currentAddressIndex, this._identity!);
     const moduleTransport: TransportProvider = adapter ?? this._transport;
+
+    // G3 + G7 — Wire Profile-backed persisted storage for the recipient
+    // cross-restart safety net. Mirrors the wiring in
+    // `initializeAddressModules`. Best-effort — when StorageProvider
+    // does not expose the builders, the auto-installed worker falls
+    // back to the legacy in-memory shims.
+    try {
+      const storageWithBuilders = this._storage as unknown as {
+        buildFinalizationQueueStorageAdapter?: () =>
+          | import('../profile/finalization-queue-storage-adapter').OrbitDbFinalizationQueueStorageAdapter
+          | null;
+        buildRecipientContextStorageAdapter?: () =>
+          | import('../profile/finalization-queue-storage-adapter').OrbitDbRecipientContextStorageAdapter
+          | null;
+      };
+      const queueAdapter =
+        typeof storageWithBuilders.buildFinalizationQueueStorageAdapter === 'function'
+          ? storageWithBuilders.buildFinalizationQueueStorageAdapter()
+          : null;
+      const ctxAdapter =
+        typeof storageWithBuilders.buildRecipientContextStorageAdapter === 'function'
+          ? storageWithBuilders.buildRecipientContextStorageAdapter()
+          : null;
+      if (queueAdapter !== null || ctxAdapter !== null) {
+        this._payments.configureRecipientPersistedStorage({
+          ...(queueAdapter !== null
+            ? { finalizationQueueStorage: queueAdapter }
+            : {}),
+          ...(ctxAdapter !== null ? { recipientContextStorage: ctxAdapter } : {}),
+        });
+      }
+    } catch (err) {
+      logger.warn(
+        'Sphere',
+        `G3/G7: failed to wire Profile-backed recipient persisted storage (continuing with in-memory shims): ${safeErrorMessage(err)}`,
+      );
+    }
 
     this._payments.initialize({
       identity: this._identity!,

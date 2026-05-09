@@ -2023,6 +2023,42 @@ export class PaymentsModule {
                 };
                 await this._recipientFinalizationQueue.add(addrId, entry);
 
+                // G7 — mirror the in-memory context Maps to persisted
+                // storage so a crash between enqueue and finalization
+                // does not erase the lookup keys the dispositionWriter
+                // VALID branch needs. Best-effort: a persistence
+                // failure is non-fatal (the in-memory Maps still drive
+                // a single-process recovery; only cross-restart safety
+                // degrades).
+                if (this._recipientContextStorage !== null) {
+                  try {
+                    await this._recipientContextStorage.writeFinalizationContext(
+                      addrId,
+                      tokenIdForQueue,
+                      {
+                        localTokenId: token.id,
+                        sourceTokenJson: pCtx.sourceTokenJson,
+                        lastTxJson: pCtx.lastTxJson,
+                        requestIdHex: reqId,
+                      },
+                    );
+                    await this._recipientContextStorage.writeRequestContext(
+                      addrId,
+                      reqId,
+                      {
+                        transactionHash: pCtx.transactionHash,
+                        authenticator: pCtx.authenticator,
+                        nextEntryRest: { status: 'valid' as const },
+                      },
+                    );
+                  } catch (persistErr) {
+                    logger.warn(
+                      'Payments',
+                      `G7: failed to persist recipient context for ${tokenIdForQueue.slice(0, 16)}: ${persistErr instanceof Error ? persistErr.message : String(persistErr)}`,
+                    );
+                  }
+                }
+
                 // Fire-and-forget drive of the worker. The worker
                 // handles its own concurrency caps + per-token mutex.
                 const worker = this.finalizationWorkerRecipient;
@@ -2191,6 +2227,55 @@ export class PaymentsModule {
           typeof directAddr === 'string' && directAddr.length > 0
             ? computeAddressId(directAddr)
             : this.deps!.identity.chainPubkey;
+
+        // G7 — re-hydrate the recipient context Maps from persisted
+        // storage. Without this, a Sphere that crashed between enqueue
+        // and finalization could not surface the contexts the
+        // dispositionWriter VALID branch needs to flip local Tokens to
+        // `'confirmed'`.
+        //
+        // The hydration is fire-and-forget so initialize() stays
+        // synchronous; the recipient worker has its own retry loop and
+        // is tolerant of a context Map populated mid-cycle. The hydration
+        // promise is exposed via {@link awaitRecipientContextHydration}
+        // for tests that need a deterministic settle point.
+        if (this._recipientContextStorage !== null) {
+          const ctxStorage = this._recipientContextStorage;
+          this._recipientContextHydrationPromise = (async () => {
+            try {
+              const persistedFinalization =
+                await ctxStorage.listAllFinalizationContexts(recipientAddressId);
+              for (const [tokenId, ctx] of persistedFinalization) {
+                if (!this._recipientFinalizationContext.has(tokenId)) {
+                  this._recipientFinalizationContext.set(tokenId, ctx);
+                }
+              }
+              const persistedRequest =
+                await ctxStorage.listAllRequestContexts(recipientAddressId);
+              for (const [reqId, ctx] of persistedRequest) {
+                if (!this._recipientRequestContextMap.has(reqId)) {
+                  // Cast: PersistedRequestContext is the JSON-safe
+                  // mirror of RequestContext (`nextEntryRest` widens to
+                  // Record<string, unknown> at the storage layer).
+                  this._recipientRequestContextMap.set(
+                    reqId,
+                    ctx as unknown as RequestContext,
+                  );
+                }
+              }
+              logger.debug(
+                'Payments',
+                `G7: re-hydrated ${persistedFinalization.size} finalization + ${persistedRequest.size} request contexts from profile`,
+              );
+            } catch (err) {
+              logger.warn(
+                'Payments',
+                `G7: failed to re-hydrate recipient context Maps from profile (continuing with empty maps): ${err instanceof Error ? err.message : String(err)}`,
+              );
+            }
+          })();
+        }
+
         const built = buildDefaultFinalizationWorkerRecipient({
           addressId: recipientAddressId,
           oracle: this.deps!.oracle,
@@ -2210,6 +2295,11 @@ export class PaymentsModule {
           // + operator importer so all three paths serialize against the
           // same read-decide-write window.
           perTokenMutex: this._sharedPerTokenMutex,
+          // G3 — pass the Profile-backed persisted FinalizationQueueStorage
+          // when configured. When null, the helper falls back to the
+          // in-memory shim (legacy behavior).
+          finalizationQueueStorage:
+            this._recipientFinalizationQueueStorage ?? undefined,
         });
         this._recipientFinalizationQueue = built.queue;
         this.finalizationWorkerRecipient = built.worker;
@@ -2590,6 +2680,87 @@ export class PaymentsModule {
    * @internal
    */
   private _sharedPerTokenMutex: PerTokenMutex | null = null;
+
+  /**
+   * G3 — persisted FinalizationQueueStorage for the recipient
+   * finalization worker. Set by Sphere bootstrap before
+   * {@link initialize} when a Profile-backed storage stack is available.
+   * `buildDefaultFinalizationWorkerRecipient` consumes this directly;
+   * when null, it falls back to the legacy in-memory `Map<string,string>`
+   * shim (loss-prone across Sphere.destroy() / restart).
+   *
+   * @internal
+   */
+  private _recipientFinalizationQueueStorage:
+    | import('./transfer/finalization-queue').FinalizationQueueStorage
+    | null = null;
+
+  /**
+   * G7 — persisted recipient-context CRUD adapter for the in-memory
+   * `_recipientRequestContextMap` and `_recipientFinalizationContext`
+   * Maps. Set by Sphere bootstrap when a Profile-backed storage stack
+   * is available; consumed in {@link initialize} to re-hydrate the
+   * Maps before the recipient worker starts and in the processToken
+   * closure to mirror every in-memory write to disk.
+   *
+   * @internal
+   */
+  private _recipientContextStorage:
+    | import('../../profile/finalization-queue-storage-adapter').OrbitDbRecipientContextStorageAdapter
+    | import('../../profile/finalization-queue-storage-adapter').InMemoryRecipientContextStorageAdapter
+    | null = null;
+
+  /**
+   * G7 — Promise tracking the in-flight re-hydration of the recipient
+   * context Maps from persisted storage. Set by {@link initialize}'s
+   * auto-install path when a `_recipientContextStorage` is configured;
+   * `undefined` otherwise. Exposed via
+   * {@link awaitRecipientContextHydration} for tests that need a
+   * deterministic settle point.
+   *
+   * @internal
+   */
+  private _recipientContextHydrationPromise: Promise<void> | undefined =
+    undefined;
+
+  /**
+   * G7 — Test/diagnostic hook: await the in-flight recipient-context
+   * hydration. Returns a resolved promise when no hydration is in
+   * flight. Production code paths SHOULD NOT need to await this —
+   * the recipient worker is tolerant of a Map populated mid-cycle —
+   * but tests that assert post-hydration state need a settle point.
+   */
+  async awaitRecipientContextHydration(): Promise<void> {
+    if (this._recipientContextHydrationPromise === undefined) return;
+    await this._recipientContextHydrationPromise;
+  }
+
+  /**
+   * G3 + G7 — Install Profile-backed persisted storage for the
+   * recipient-side cross-restart safety net. Sphere bootstrap calls
+   * this after `setIdentity()` (so the encryption key is derived) but
+   * BEFORE `initialize()` (so the auto-installed recipient worker picks
+   * up the persisted FinalizationQueueStorage and the in-memory Maps
+   * are re-hydrated from the persisted contexts).
+   *
+   * Idempotent. Tests pass an in-memory adapter; production wires
+   * `OrbitDbFinalizationQueueStorageAdapter` and
+   * `OrbitDbRecipientContextStorageAdapter` against the wallet's
+   * ProfileDatabase.
+   */
+  configureRecipientPersistedStorage(opts: {
+    readonly finalizationQueueStorage?: import('./transfer/finalization-queue').FinalizationQueueStorage;
+    readonly recipientContextStorage?:
+      | import('../../profile/finalization-queue-storage-adapter').OrbitDbRecipientContextStorageAdapter
+      | import('../../profile/finalization-queue-storage-adapter').InMemoryRecipientContextStorageAdapter;
+  }): void {
+    if (opts.finalizationQueueStorage !== undefined) {
+      this._recipientFinalizationQueueStorage = opts.finalizationQueueStorage;
+    }
+    if (opts.recipientContextStorage !== undefined) {
+      this._recipientContextStorage = opts.recipientContextStorage;
+    }
+  }
 
   /**
    * Install the operator inclusion-proof importer (T.5.D, §6.3 escape
@@ -10277,6 +10448,15 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
    * per-builder mutex is used.
    */
   readonly perTokenMutex?: PerTokenMutex | null;
+  /**
+   * G3 — Optional persisted {@link FinalizationQueueStorage} for the
+   * recipient FinalizationQueue. When omitted, an in-memory shim is used
+   * (legacy behavior — does NOT survive Sphere.destroy() / restart). The
+   * Sphere bootstrap layer plugs an `OrbitDbFinalizationQueueStorageAdapter`
+   * here when a Profile-backed storage stack is detected, closing the
+   * cross-restart safety net for the recipient worker.
+   */
+  readonly finalizationQueueStorage?: import('./transfer/finalization-queue').FinalizationQueueStorage;
 }): {
   worker: FinalizationWorkerRecipient;
   queue: FinalizationQueue;
@@ -10303,28 +10483,38 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
     save,
     emit,
     signal,
+    finalizationQueueStorage,
   } = opts;
 
-  // ---- In-memory FinalizationQueue (T.5.C / Wave G.7 stub) -----------
-  const queueMap = new Map<string, string>();
-  const queueStorage = {
-    async readKey(key: string): Promise<string | null> {
-      return queueMap.has(key) ? (queueMap.get(key) ?? null) : null;
-    },
-    async writeKey(key: string, value: string): Promise<void> {
-      queueMap.set(key, value);
-    },
-    async listByPrefix(prefix: string): Promise<Map<string, string>> {
-      const out = new Map<string, string>();
-      for (const [k] of queueMap) {
-        if (k.startsWith(prefix)) out.set(k, k.slice(prefix.length));
-      }
-      return out;
-    },
-    async deleteKey(key: string): Promise<void> {
-      queueMap.delete(key);
-    },
-  };
+  // ---- FinalizationQueue (T.5.C / Wave G.7) --------------------------
+  // G3: prefer the caller-supplied persisted storage (Profile/OrbitDb-
+  // backed) over the in-memory shim. Sphere wires the persisted form
+  // when a ProfileStorageProvider is present; legacy callers fall back
+  // to the in-memory map (loss-prone across Sphere.destroy()/restart).
+  let queueStorage: import('./transfer/finalization-queue').FinalizationQueueStorage;
+  if (finalizationQueueStorage !== undefined) {
+    queueStorage = finalizationQueueStorage;
+  } else {
+    const queueMap = new Map<string, string>();
+    queueStorage = {
+      async readKey(key: string): Promise<string | null> {
+        return queueMap.has(key) ? (queueMap.get(key) ?? null) : null;
+      },
+      async writeKey(key: string, value: string): Promise<void> {
+        queueMap.set(key, value);
+      },
+      async listByPrefix(prefix: string): Promise<Map<string, string>> {
+        const out = new Map<string, string>();
+        for (const [k] of queueMap) {
+          if (k.startsWith(prefix)) out.set(k, k.slice(prefix.length));
+        }
+        return out;
+      },
+      async deleteKey(key: string): Promise<void> {
+        queueMap.delete(key);
+      },
+    };
+  }
   const queue = new FinalizationQueue({ storage: queueStorage });
 
   const queueAdapter = {
