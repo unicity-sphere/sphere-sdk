@@ -115,11 +115,24 @@ describe('Tracked addresses integration', () => {
   let tokenStorage: FileTokenStorageProvider;
   let mintSpy: ReturnType<typeof vi.spyOn>;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    if (Sphere.getInstance()) {
+      try { await Sphere.getInstance()!.destroy(); } catch { /* ignore */ }
+    }
+    (Sphere as unknown as { instance: null }).instance = null;
+    // Wait a microtask tick to let any pending async storage writes
+    // (from a prior test that didn't await its own destroy) flush
+    // before we delete the directory. cleanTestDir is sync rm.
+    await new Promise((r) => setImmediate(r));
     cleanTestDir();
     clearNostrRelay();
-    if (Sphere.getInstance()) {
-      (Sphere as unknown as { instance: null }).instance = null;
+    // Defense against full-suite-only race: a prior test's async
+    // storage write can land in DATA_DIR after cleanTestDir() ran
+    // even with the setImmediate tick. Probe + Sphere.clear if a
+    // stale wallet shows up before re-using DATA_DIR for a fresh init.
+    const probeStorage = new FileStorageProvider({ dataDir: DATA_DIR });
+    if (await Sphere.exists(probeStorage)) {
+      await Sphere.clear({ storage: probeStorage });
     }
     storage = new FileStorageProvider({ dataDir: DATA_DIR });
     tokenStorage = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
@@ -128,8 +141,11 @@ describe('Tracked addresses integration', () => {
       .mockResolvedValue({ success: true, token: null, nametagData: null });
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     mintSpy.mockRestore();
+    if (Sphere.getInstance()) {
+      try { await Sphere.getInstance()!.destroy(); } catch { /* ignore */ }
+    }
     (Sphere as unknown as { instance: null }).instance = null;
     cleanTestDir();
     clearNostrRelay();
