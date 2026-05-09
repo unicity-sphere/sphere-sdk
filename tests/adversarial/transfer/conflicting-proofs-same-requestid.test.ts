@@ -30,6 +30,7 @@
 
 import { describe, expect, it } from 'vitest';
 
+import { hashAuthenticatorForLog } from '../../../modules/payments/transfer/finalization-worker-base';
 import {
   buildWorker,
   makeFakeAggregator,
@@ -190,8 +191,11 @@ describe('§6.3 forbidden: two-different-values proofs (C10 adversarial)', () =>
       attachedAuthenticator?: string;
       observedAuthenticator?: string;
     };
-    expect(data.attachedAuthenticator).toBe(LOCAL_AUTHENTICATOR);
-    expect(data.observedAuthenticator).toBe(FORGED_AUTHENTICATOR);
+    // W40 — security-alert event payload carries hashAuthenticatorForLog(...)
+    // (16-hex SHA-256 prefix), not the raw authenticator string. See
+    // commit eec34bd.
+    expect(data.attachedAuthenticator).toBe(hashAuthenticatorForLog(LOCAL_AUTHENTICATOR));
+    expect(data.observedAuthenticator).toBe(hashAuthenticatorForLog(FORGED_AUTHENTICATOR));
   });
 
   it('security-alert is emitted EXACTLY ONCE per attempted merge (idempotency)', async () => {

@@ -424,7 +424,13 @@ describe('publishEvent retry logic', () => {
 
       expect(error).toBeDefined();
       expect(error.code).toBe('TRANSPORT_ERROR');
-      expect(error.cause).toBe(originalError);
+      // W40 — redactCause now CLONES Error instances (preserves prototype +
+      // name/message/stack; redacts enumerable own-properties matching
+      // REDACTED_FIELDS). Referential equality breaks; structural equality
+      // holds. See commit 392cd31.
+      expect(error.cause).toBeInstanceOf(Error);
+      expect((error.cause as Error).name).toBe(originalError.name);
+      expect((error.cause as Error).message).toBe(originalError.message);
     });
   });
 

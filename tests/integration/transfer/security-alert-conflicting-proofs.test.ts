@@ -28,6 +28,7 @@
 
 import { describe, expect, it } from 'vitest';
 
+import { hashAuthenticatorForLog } from '../../../modules/payments/transfer/finalization-worker-base';
 import {
   ADDR,
   FORGED_AUTHENTICATOR,
@@ -90,8 +91,10 @@ describe('§6.3 / C10 — transfer:security-alert (forbidden two-proofs)', () =>
     // (the local request context).
     expect(a.attachedTransactionHash).toBe(FORGED_TX_HASH);
     expect(a.observedTransactionHash).toBe(LOCAL_TX_HASH);
-    expect(a.attachedAuthenticator).toBe(FORGED_AUTHENTICATOR);
-    expect(a.observedAuthenticator).toBe(LOCAL_AUTHENTICATOR);
+    // W40 — security-alert event payload carries hashAuthenticatorForLog(...)
+    // (16-hex SHA-256 prefix), not the raw authenticator. See commit eec34bd.
+    expect(a.attachedAuthenticator).toBe(hashAuthenticatorForLog(FORGED_AUTHENTICATOR));
+    expect(a.observedAuthenticator).toBe(hashAuthenticatorForLog(LOCAL_AUTHENTICATOR));
     expect(a.message.length).toBeGreaterThan(0);
 
     // §9.4 — trustbase-warning is RESERVED for routine NOT_AUTHENTICATED;
@@ -143,8 +146,10 @@ describe('§6.3 / C10 — transfer:security-alert (forbidden two-proofs)', () =>
       attachedAuthenticator?: string;
       observedAuthenticator?: string;
     };
-    expect(a.attachedAuthenticator).toBe(FORGED_AUTHENTICATOR);
-    expect(a.observedAuthenticator).toBe(LOCAL_AUTHENTICATOR);
+    // W40 — security-alert event payload carries hashAuthenticatorForLog(...)
+    // (16-hex SHA-256 prefix), not the raw authenticator. See commit eec34bd.
+    expect(a.attachedAuthenticator).toBe(hashAuthenticatorForLog(FORGED_AUTHENTICATOR));
+    expect(a.observedAuthenticator).toBe(hashAuthenticatorForLog(LOCAL_AUTHENTICATOR));
   });
 
   it('PATH 2: post-poll concurrent attach DIFFERENT value → security-alert via checkProofConflict', async () => {
