@@ -129,10 +129,20 @@ describe('Provider disable/enable integration', () => {
   let tokenStorageReal: FileTokenStorageProvider;
   let tokenStorageMock: TokenStorageProvider<TxfStorageDataBase>;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     cleanTestDir();
     if (Sphere.getInstance()) {
-      (Sphere as unknown as { instance: null }).instance = null;
+      try { await Sphere.getInstance()!.destroy(); } catch { /* ignore */ }
+    }
+    (Sphere as unknown as { instance: null }).instance = null;
+    // Defense against full-suite-only race: a prior test's async storage
+    // write can land in DATA_DIR after cleanTestDir() ran. If it did,
+    // Sphere.exists(...) returns true and Sphere.init throws "wallet
+    // already exists". Hard-clear via Sphere.clear which removes both
+    // wallet keys and tokenStorage state idempotently.
+    const probeStorage = new FileStorageProvider({ dataDir: DATA_DIR });
+    if (await Sphere.exists(probeStorage)) {
+      await Sphere.clear({ storage: probeStorage });
     }
     storage = new FileStorageProvider({ dataDir: DATA_DIR });
     tokenStorageReal = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
