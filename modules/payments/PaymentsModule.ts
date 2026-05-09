@@ -1450,15 +1450,88 @@ export class PaymentsModule {
     // Subscribe to storage provider events (push-based sync)
     this.subscribeToStorageEvents();
 
-    // Phase 8 steelman post-cutover — start the sending-recovery worker
-    // when both (a) the gate is on AND (b) a worker has been installed
-    // by the bootstrap layer. After T.8.D part 1 of 2 the gate defaults
-    // to `true`; the start is still no-op when no worker is installed
-    // (forensic warning omitted intentionally — the bootstrap is the
-    // single install point and a missing install is a deployment-config
-    // bug, not a hot path). Tests that count timers can opt out via
-    // `features: { recoveryWorker: false }`.
-    if (this.features.recoveryWorker && this.sendingRecoveryWorker !== null) {
+    // G6 — auto-install a default SendingRecoveryWorker when the gate
+    // is on AND no consumer has already wired one. The auto-installed
+    // worker reads from the in-memory `_senderOutboxMap` (same shim
+    // FinalizationWorkerSender uses) and re-publishes via the injected
+    // transport, preserving `bundleCid` for recipient-side replay LRU
+    // (§6.3 / T.3.A idempotency contract).
+    //
+    // Bootstrap layers (Sphere) MAY override by installing a worker
+    // wired against a Profile-backed `OutboxWriter` BEFORE
+    // `initialize()` (the `!this.sendingRecoveryWorker` check preserves
+    // that contract).
+    if (
+      this.features.recoveryWorker &&
+      this.sendingRecoveryWorker === null
+    ) {
+      const senderOutboxMap = this._senderOutboxMap;
+      const transport = this.deps!.transport;
+      const sphereEmit = this.deps!.emitEvent;
+      const recoveryDeps: import('./transfer/sending-recovery-worker').SendingRecoveryWorkerDeps = {
+        outbox: {
+          async readAllNew(): Promise<ReadonlyArray<UxfTransferOutboxEntry>> {
+            return Array.from(senderOutboxMap.values());
+          },
+          async update(
+            id: string,
+            mutator: (prev: UxfTransferOutboxEntry) => UxfTransferOutboxEntry,
+          ): Promise<UxfTransferOutboxEntry> {
+            const existing = senderOutboxMap.get(id);
+            if (existing === undefined) {
+              throw new SphereError(
+                `SendingRecoveryWorker.update: no entry at id "${id}"`,
+                'VALIDATION_ERROR',
+              );
+            }
+            const next = mutator(existing);
+            const bumped: UxfTransferOutboxEntry = {
+              ...next,
+              lamport: (existing.lamport ?? 0) + 1,
+            };
+            senderOutboxMap.set(id, bumped);
+            return bumped;
+          },
+        },
+        republish: async (entry: UxfTransferOutboxEntry): Promise<void> => {
+          // Re-publish via the same transport surface the original
+          // send used. The recipient's replay-LRU short-circuits
+          // duplicates by `bundleCid` (§6.3 / T.3.A) so a wasted publish
+          // in the racing window is harmless.
+          //
+          // CID-by-reference shape: the original CAR is already pinned
+          // to IPFS by the time it lands in the outbox; re-publishing
+          // the CID is sufficient. Implementations that need a richer
+          // payload (inline CAR for bundles below the cap) override
+          // the worker via `installSendingRecoveryWorker`.
+          //
+          // `mode === 'txf'` is a legacy outbox shape that does NOT
+          // belong to UXF. Map it to `'instant'` for the wire payload's
+          // advisory `mode` field — recipients ignore it (§5.6).
+          const payloadMode: 'conservative' | 'instant' =
+            entry.mode === 'txf' ? 'instant' : entry.mode;
+          await transport.sendTokenTransfer(entry.recipientTransportPubkey, {
+            kind: 'uxf-cid',
+            version: '1.0',
+            mode: payloadMode,
+            bundleCid: entry.bundleCid,
+            tokenIds: entry.tokenIds,
+            ...(typeof entry.memo === 'string' ? { memo: entry.memo } : {}),
+          });
+        },
+        emit: sphereEmit,
+      };
+      this.sendingRecoveryWorker = new SendingRecoveryWorker(recoveryDeps);
+      this.sendingRecoveryWorker.start();
+      logger.debug(
+        'Payments',
+        'Default SendingRecoveryWorker auto-installed (recoveryWorker default-on)',
+      );
+    } else if (
+      this.features.recoveryWorker &&
+      this.sendingRecoveryWorker !== null
+    ) {
+      // Pre-installed by the bootstrap layer — start it.
       this.sendingRecoveryWorker.start();
     }
 
