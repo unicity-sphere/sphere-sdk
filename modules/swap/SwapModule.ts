@@ -1982,11 +1982,7 @@ export class SwapModule {
     // tokens linked to THIS invoice and filter the invalid set to that.
     const validationResult = await deps.payments.validate();
     if (validationResult.invalid.length > 0) {
-      const payoutTokenIds = (
-        deps.accounting as unknown as {
-          getTokenIdsForInvoice?: (invoiceId: string) => Set<string>;
-        }
-      ).getTokenIdsForInvoice?.(swap.payoutInvoiceId) ?? new Set<string>();
+      const payoutTokenIds = deps.accounting.getTokenIdsForInvoice(swap.payoutInvoiceId);
 
       // SECURITY: fail-CLOSED when payoutTokenIds is empty AND there are
       // invalid tokens we can't classify. An empty set means the reverse
