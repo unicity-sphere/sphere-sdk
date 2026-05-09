@@ -1692,6 +1692,35 @@ export class AccountingModule {
         this.balanceCache.delete(hashedKey);
         logger.debug(LOG_TAG, `Migrated ${orphanedLedger.size} ledger entries from hash-keyed to real ID: ${tokenId.slice(0, 16)}...`);
       }
+
+      // R20 fix: migrate tokenInvoiceMap entries from the hashed key to the
+      // real invoice id. Without this, _handleIncomingTransfer's orphan-buffer
+      // path leaves tokens pointing at hash(invoiceId), and verifyPayout's
+      // getTokenIdsForInvoice(realInvoiceId) returns an empty Set even after
+      // importInvoice runs — tripping its security fail-closed branch and
+      // hanging swap-payout verification forever.
+      // Diagnosed in HMA-trade-settlement round 20: handleIncomingTransfer ENTRY
+      // probe fired with memo "INV:<hash>" for the swap payout, but the
+      // syntheticLedger / historyEvent probes did not, AND verifyPayout saw
+      // tokenInvoiceMap empty. The orphan-path populates the map under the
+      // hashed key; the migration here moves it to the real key.
+      let migratedTokenMapEntries = 0;
+      for (const [tokId, invoiceSet] of this.tokenInvoiceMap) {
+        if (invoiceSet.has(hashedKey)) {
+          invoiceSet.delete(hashedKey);
+          invoiceSet.add(tokenId);
+          migratedTokenMapEntries++;
+          // If the entry now points at nothing, drop the row to keep the
+          // map tight (parallel to the load-time defensive checks).
+          if (invoiceSet.size === 0) this.tokenInvoiceMap.delete(tokId);
+        }
+      }
+      if (migratedTokenMapEntries > 0) {
+        logger.debug(
+          LOG_TAG,
+          `Migrated ${migratedTokenMapEntries} tokenInvoiceMap entries from hash-keyed to real ID: ${tokenId.slice(0, 16)}...`,
+        );
+      }
     }
 
     if (!this.invoiceLedger.has(tokenId)) {
