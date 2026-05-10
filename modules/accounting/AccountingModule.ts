@@ -2479,6 +2479,10 @@ export class AccountingModule {
         memo,
         invoiceRefundAddress: params.refundAddress,
         invoiceContact: effectiveContact,
+        // R23 fix: forward transferMode so callers can opt into
+        // 'conservative' (proof-on-sender) delivery for forwarding flows
+        // like withdraw. Undefined preserves existing instant-mode default.
+        ...(params.transferMode !== undefined ? { transferMode: params.transferMode } : {}),
       });
 
       let timer: ReturnType<typeof setTimeout> | undefined;
