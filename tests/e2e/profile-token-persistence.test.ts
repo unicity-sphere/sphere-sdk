@@ -104,6 +104,18 @@ describe.skipIf(SKIP_INFRA)('Profile (OrbitDB) Active Token Persistence E2E', ()
     console.log(`  Waiting for all ${TEST_COINS.length} coins...`);
     originalBalances = await waitForAllCoins(sphereA, FAUCET_TOPUP_TIMEOUT_MS);
 
+    // Drain any v5-pending tokens before the CAR flush — see
+    // `profile-multi-device-sync.test.ts` Test 1 for the full
+    // rationale. Short version: `tokenToTxf` drops a token whose
+    // sdkData has no `genesis`/`state`, which is exactly the shape
+    // of a `_pendingFinalization` placeholder. `waitForAllCoins`
+    // returns once balance > 0 (pending counts toward balance), so
+    // without this drain a flush mid-finalization publishes a CAR
+    // missing the still-pending coins. PR #127 follow-up tracks
+    // the architectural fix (sync() draining pending automatically).
+    console.log('  Draining v5-pending finalizations before sync...');
+    await sphereA.payments.receive({ finalize: true, timeout: 60_000 });
+
     originalTokenIds = new Map<string, Set<string>>();
     originalTokenAmounts = new Map<string, Map<string, string>>();
     for (const coin of TEST_COINS) {
