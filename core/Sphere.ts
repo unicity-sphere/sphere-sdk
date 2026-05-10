@@ -3353,32 +3353,17 @@ export class Sphere {
       throw new SphereError(`Unicity ID already registered for address ${this._currentAddressIndex}: @${this._identity.nametag}`, 'ALREADY_INITIALIZED');
     }
 
-    // 1. Mint nametag token on-chain FIRST.
-    //
-    // Required for receiving tokens via @nametag (PROXY address
-    // finalization). Minting before publishing ensures the Nostr binding
-    // we advertise is backed by an actual on-chain token under THIS
-    // wallet's control.
-    //
-    // Consistency guard (NAMETAG_CONFLICT): if the wallet already holds
-    // a different nametag token on-chain, refuse to register a new name.
-    // Without this, the previous `hasNametag()`-only gate would skip the
-    // mint of `cleanNametag` whenever ANY prior nametag existed, then
-    // publish a Nostr binding for `cleanNametag` while the wallet's
-    // on-chain anchor is still the OTHER name — incoming PROXY transfers
-    // to `@cleanNametag` then fail finalization (the wallet derives the
-    // expected PROXY from its stored nametag token's tokenId, which is
-    // `TokenId.fromNameTag(otherName) != TokenId.fromNameTag(cleanNametag)`).
-    //
-    // If the same name is already minted, the mint call is idempotent —
-    // `NametagMinter` uses a deterministic salt derived from the signing
-    // key, so the aggregator returns `REQUEST_ID_EXISTS` with the prior
-    // inclusion proof. Safe to call again.
-    const existingForThisName = this._payments.hasNametagNamed(cleanNametag);
-    if (!existingForThisName) {
+    // 1. Mint nametag token on-chain FIRST — required so the Nostr
+    //    binding we publish is backed by an on-chain token under this
+    //    wallet's control. Skip the mint only when a token for THIS
+    //    EXACT name is already stored (idempotent re-register). If a
+    //    DIFFERENT nametag is stored, throw NAMETAG_CONFLICT: registering
+    //    `B` while the wallet's anchor is `A` would publish `@B → me`
+    //    but finalize incoming PROXY transfers via the `A` token,
+    //    producing the alice-vs-alice-t1 mismatch this guard exists for.
+    if (!this._payments.hasNametagNamed(cleanNametag)) {
       if (this._payments.hasNametag()) {
-        const existing = this._payments.getNametag();
-        const existingName = existing?.name ?? '<unknown>';
+        const existingName = this._payments.getNametag()!.name;
         throw new SphereError(
           `Cannot register Unicity ID "@${cleanNametag}" — this wallet ` +
           `already holds an on-chain nametag token for "@${existingName}". ` +
@@ -3396,20 +3381,20 @@ export class Sphere {
           'AGGREGATOR_ERROR',
         );
       }
-      logger.debug('Sphere', `Nametag token minted successfully`);
+      logger.debug('Sphere', 'Nametag token minted successfully');
     }
 
-    // Verify the wallet now holds a token for exactly `cleanNametag`.
-    // Belt-and-braces: a successful mint MUST have populated the store
-    // (PaymentsModule.mintNametag calls setNametag on success), and the
-    // idempotent-already-minted branch above already required the match.
-    // If we get here without a matching entry, something raced — refuse
-    // to publish rather than advertise an unbacked name.
+    // Belt-and-braces: defense-in-depth against future regressions in
+    // PaymentsModule.mintNametag that report success without persisting
+    // the NametagData. The current implementation can't reach here
+    // legitimately (mint failure throws above; mint success calls
+    // setNametag before returning), so this is a guard for the contract,
+    // not for any observed bug.
     if (!this._payments.hasNametagNamed(cleanNametag)) {
       throw new SphereError(
         `Refusing to publish Nostr binding for "@${cleanNametag}" — mint ` +
-        `reported success but no matching nametag token was found in ` +
-        `local state. Retry after verifying connectivity to the aggregator.`,
+        `reported success but no matching nametag token was persisted to ` +
+        `the local store. Indicates a partial-write bug in the mint pipeline.`,
         'AGGREGATOR_ERROR',
       );
     }

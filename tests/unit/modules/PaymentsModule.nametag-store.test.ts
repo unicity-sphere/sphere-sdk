@@ -18,7 +18,15 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { createPaymentsModule, type PaymentsModuleDependencies } from '../../../modules/payments/PaymentsModule';
-import type { FullIdentity, MutableFullIdentity } from '../../../types';
+import type { FullIdentity } from '../../../types';
+
+// Local mutable view of FullIdentity for tests that need to flip the
+// `nametag` claim at runtime (FullIdentity.nametag is readonly). The SDK
+// internally uses a similar `MutableFullIdentity` shape in core/Sphere.ts
+// — kept as a private alias there, so we redeclare here.
+type MutableFullIdentity = {
+  -readonly [K in keyof FullIdentity]: FullIdentity[K];
+};
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../../storage';
 import type { TransportProvider } from '../../../transport';
 import type { OracleProvider } from '../../../oracle';

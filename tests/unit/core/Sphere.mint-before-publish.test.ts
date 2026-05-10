@@ -456,7 +456,7 @@ describe('Sphere.registerNametag() mint/Nostr-binding consistency guard', () => 
     (transport.publishIdentityBinding as ReturnType<typeof vi.fn>).mockClear();
 
     await expect(sphere.registerNametag('alice')).rejects.toThrow(
-      /mint reported success but no matching nametag token was found/,
+      /mint reported success but no matching nametag token was persisted/,
     );
 
     // Mint was called, but Nostr publish was NOT.

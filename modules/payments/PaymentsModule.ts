@@ -4372,19 +4372,16 @@ export class PaymentsModule {
   }
 
   /**
-   * Get the active nametag data — the one matching the current identity's
-   * `nametag` claim (the name advertised on Nostr). Falls back to
-   * `nametags[0]` if the identity claim is unset or doesn't match any
-   * stored entry.
+   * Get the active nametag entry — the one whose name matches
+   * `identity.nametag` (the name advertised on Nostr). Falls back to
+   * `nametags[0]` when the claim is unset or has no matching entry, so
+   * legacy single-nametag callers see no behavior change.
    *
-   * Why this preference: the wallet's local `nametags` array CAN contain
-   * multiple entries (multi-nametag scenarios, or a legacy entry left over
-   * from a buggy `registerNametag` flow that minted A then re-registered
-   * to claim B). Finalize and PROXY-bundle code paths must use the
-   * nametag token whose name matches what Nostr says, otherwise inbound
-   * transfers to `@B` (computed from `TokenId.fromNameTag('B')`) will be
-   * rejected because the wallet derives the expected PROXY from the
-   * `[0]` entry's tokenId (a different name).
+   * The preference matters for PROXY-mode finalize: it must derive the
+   * recipient address from the token whose name matches Nostr,
+   * otherwise inbound transfers to `@claimed` (PROXY computed from
+   * `TokenId.fromNameTag('claimed')`) are rejected against the
+   * `[0]` entry's tokenId.
    *
    * @returns The active nametag data, or `null` if no nametag is set.
    */
