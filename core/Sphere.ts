@@ -63,6 +63,7 @@ import { MultiAddressTransportMux, AddressTransportAdapter } from '../transport/
 import type { OracleProvider } from '../oracle';
 import type { PriceProvider } from '../price';
 import { PaymentsModule, createPaymentsModule } from '../modules/payments';
+import type { SyncOptions, SyncResult } from '../modules/payments';
 import { CommunicationsModule, createCommunicationsModule } from '../modules/communications';
 import type { CommunicationsModuleConfig } from '../modules/communications';
 import { GroupChatModule, createGroupChatModule } from '../modules/groupchat';
@@ -3382,9 +3383,9 @@ export class Sphere {
   // Public Methods - Sync
   // ===========================================================================
 
-  async sync(): Promise<void> {
+  async sync(options?: SyncOptions): Promise<SyncResult> {
     this.ensureReady();
-    await this._payments.sync();
+    return this._payments.sync(options);
   }
 
   // ===========================================================================

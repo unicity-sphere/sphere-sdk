@@ -367,6 +367,47 @@ export interface ReceiveResult {
 }
 
 // =============================================================================
+// Sync Options & Result
+// =============================================================================
+
+export interface SyncOptions {
+  /** When true (default), drain pending V5 finalizations before flushing to
+   *  token-storage providers. Without draining, any token whose `sdkData`
+   *  still carries `_pendingFinalization` round-trips through `tokenToTxf`
+   *  as null and is silently dropped from the published CAR — a remote
+   *  device joining via `recoverLatest()` then sees a partial inventory.
+   *  Set false to preserve the legacy "publish whatever's confirmed"
+   *  semantics. */
+  drainPending?: boolean;
+  /** Max time in ms to wait for pending V5 tokens to finalize before
+   *  giving up (default: 30000). When `forceFlushOnDrainTimeout` is
+   *  false (default) AND tokens remain pending after this budget, the
+   *  flush is skipped and `drainTimedOut: true` is returned — the caller
+   *  can retry once tokens have confirmed. */
+  drainTimeoutMs?: number;
+  /** Poll interval in ms while draining (default: 2000). */
+  drainPollIntervalMs?: number;
+  /** When true, publish whatever's confirmed even if pending tokens
+   *  remain after `drainTimeoutMs`. Restores legacy behavior — pending
+   *  tokens are silently dropped from the CAR. Default false. */
+  forceFlushOnDrainTimeout?: boolean;
+}
+
+export interface SyncResult {
+  /** Tokens added to local state from remote-merged data. */
+  added: number;
+  /** Tokens removed from local state via remote tombstones. */
+  removed: number;
+  /** Number of V5-pending tokens still unresolved when the flush ran.
+   *  Non-zero only when `drainPending: false` was requested OR
+   *  `forceFlushOnDrainTimeout: true` overrode a timed-out drain. */
+  pendingAtFlush?: number;
+  /** True iff `drainPending` was on, the drain timed out, and the flush
+   *  was skipped (no partial CAR published). */
+  drainTimedOut?: boolean;
+}
+
+// =============================================================================
 // Token Parsing Utilities
 // =============================================================================
 
@@ -1224,8 +1265,10 @@ export class PaymentsModule {
   private syncDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly SYNC_DEBOUNCE_MS = 500;
 
-  /** Sync coalescing: concurrent sync() calls share the same operation */
-  private _syncInProgress: Promise<{ added: number; removed: number }> | null = null;
+  /** Sync coalescing: concurrent sync() calls share the same operation.
+   *  Options from the first in-flight call are used; subsequent callers
+   *  with different options receive the first call's result. */
+  private _syncInProgress: Promise<SyncResult> | null = null;
 
   /** Token change observers — notified when a token is added, updated, or removed */
   private tokenChangeCallbacks: Array<(tokenId: string, sdkData: string) => void> = [];
@@ -5253,35 +5296,91 @@ export class PaymentsModule {
     const result: ReceiveResult = { transfers: received };
 
     if (opts.finalize) {
-      const timeout = opts.timeout ?? 60_000;
-      const pollInterval = opts.pollInterval ?? 2_000;
-      const startTime = Date.now();
-
-      while (Date.now() - startTime < timeout) {
-        const resolution = await this.resolveUnconfirmed();
-        result.finalization = resolution;
-        if (opts.onProgress) opts.onProgress(resolution);
-
-        // Check if any unconfirmed tokens remain
-        const stillUnconfirmed = Array.from(this.tokens.values()).some(
-          t => t.status === 'submitted' || t.status === 'pending'
-        );
-        if (!stillUnconfirmed) break;
-
-        await new Promise(r => setTimeout(r, pollInterval));
-        await this.load();
-      }
-
-      result.finalizationDurationMs = Date.now() - startTime;
-      result.timedOut = Array.from(this.tokens.values()).some(
-        t => t.status === 'submitted' || t.status === 'pending'
-      );
+      const drain = await this.drainPendingFinalizations({
+        timeoutMs: opts.timeout ?? 60_000,
+        pollIntervalMs: opts.pollInterval ?? 2_000,
+        onProgress: opts.onProgress,
+      });
+      result.finalization = drain.finalization;
+      result.finalizationDurationMs = drain.durationMs;
+      result.timedOut = drain.timedOut;
     } else {
       // Non-finalize: submit commitments once (fire-and-forget style)
       result.finalization = await this.resolveUnconfirmed();
     }
 
     return result;
+  }
+
+  /**
+   * Drain pending V5 finalizations until none remain or the timeout
+   * elapses. Shared by `receive({ finalize: true })` and `sync()` — the
+   * latter calls this before flushing to token-storage providers so the
+   * published CAR doesn't drop pending tokens (whose `sdkData` lacks
+   * `genesis`/`state` and round-trips through `tokenToTxf` as null).
+   *
+   * Short-circuits to a no-op when:
+   *  - No tokens are in `'submitted'` or `'pending'` state at entry, OR
+   *  - The oracle has no `getStateTransitionClient()` / `getTrustBase()`
+   *    (a wallet without aggregator wiring can't resolve V5 commitments
+   *    no matter how long it polls — preserves the pre-fix behavior of
+   *    quietly returning rather than blocking for the full timeout).
+   */
+  private async drainPendingFinalizations(opts: {
+    timeoutMs: number;
+    pollIntervalMs: number;
+    onProgress?: (result: UnconfirmedResolutionResult) => void;
+  }): Promise<{
+    finalization?: UnconfirmedResolutionResult;
+    durationMs: number;
+    timedOut: boolean;
+    skipped: boolean;
+  }> {
+    const startTime = Date.now();
+
+    const hasUnconfirmed = (): boolean =>
+      Array.from(this.tokens.values()).some(
+        (t) => t.status === 'submitted' || t.status === 'pending',
+      );
+
+    // Fast path: nothing to drain.
+    if (!hasUnconfirmed()) {
+      return { durationMs: 0, timedOut: false, skipped: true };
+    }
+
+    // No-oracle short-circuit: without stClient + trustBase,
+    // resolveUnconfirmed() early-exits every iteration and the polling
+    // loop would block for the full timeoutMs with zero progress.
+    const stClient = this.deps!.oracle.getStateTransitionClient?.();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const trustBase = (this.deps!.oracle as any).getTrustBase?.();
+    if (!stClient || !trustBase) {
+      logger.debug(
+        'Payments',
+        '[V5-RESOLVE] drainPendingFinalizations: oracle not wired (no stClient/trustBase) — skipping drain',
+      );
+      return { durationMs: 0, timedOut: hasUnconfirmed(), skipped: true };
+    }
+
+    let finalization: UnconfirmedResolutionResult | undefined;
+
+    while (Date.now() - startTime < opts.timeoutMs) {
+      const resolution = await this.resolveUnconfirmed();
+      finalization = resolution;
+      if (opts.onProgress) opts.onProgress(resolution);
+
+      if (!hasUnconfirmed()) break;
+
+      await new Promise((r) => setTimeout(r, opts.pollIntervalMs));
+      await this.load();
+    }
+
+    return {
+      finalization,
+      durationMs: Date.now() - startTime,
+      timedOut: hasUnconfirmed(),
+      skipped: false,
+    };
   }
 
   // ===========================================================================
@@ -7463,19 +7562,32 @@ export class PaymentsModule {
    * to the provider's `sync()` method, and the merged result is applied locally.
    * Emits `sync:started`, `sync:completed`, and `sync:error` events.
    *
-   * @returns Summary with counts of tokens added and removed during sync.
+   * Drain semantics: when at least one token-storage provider is configured,
+   * `sync()` first drains pending V5 finalizations (default-on, capped at
+   * `drainTimeoutMs`) so the published CAR is a complete inventory. Without
+   * draining, `tokenToTxf()` returns null for any token whose `sdkData`
+   * still carries `_pendingFinalization`, and `buildTxfStorageData()`
+   * silently drops it from the CAR — a remote device's `recoverLatest()`
+   * would then walk to the higher pointer and observe a partial inventory.
+   * If the drain times out (some tokens still pending), the flush is
+   * skipped (no partial CAR is published) — set
+   * `forceFlushOnDrainTimeout: true` to override.
+   *
+   * @param options - Optional sync options (drain control, timeouts).
+   * @returns Sync result with added/removed counts plus drain status.
    */
-  async sync(): Promise<{ added: number; removed: number }> {
+  async sync(options?: SyncOptions): Promise<SyncResult> {
     this.ensureInitialized();
 
     // Sync coalescing: if a sync is already in progress, return its promise.
-    // This prevents race conditions when addTokenStorageProvider() fires a
+    // This prevents race conditions when a remote-update event triggers a
     // fire-and-forget sync and the caller also syncs immediately after.
+    // The first call's options win for the in-flight operation.
     if (this._syncInProgress) {
       return this._syncInProgress;
     }
 
-    this._syncInProgress = this._doSync();
+    this._syncInProgress = this._doSync(options);
     try {
       return await this._syncInProgress;
     } finally {
@@ -7483,7 +7595,7 @@ export class PaymentsModule {
     }
   }
 
-  private async _doSync(): Promise<{ added: number; removed: number }> {
+  private async _doSync(options?: SyncOptions): Promise<SyncResult> {
     this.deps!.emitEvent('sync:started', { source: 'payments' });
 
     try {
@@ -7491,13 +7603,49 @@ export class PaymentsModule {
       const providers = this.getTokenStorageProviders();
 
       if (providers.size === 0) {
-        // No providers - just save locally
+        // No providers - just save locally. No draining: save() goes to
+        // the kv StorageProvider which preserves _pendingFinalization
+        // shape, so dropping pending tokens is not an issue here.
         await this.save();
         this.deps!.emitEvent('sync:completed', {
           source: 'payments',
           count: this.tokens.size,
         });
         return { added: 0, removed: 0 };
+      }
+
+      // Drain pending V5 finalizations BEFORE serializing localData via
+      // tokenToTxf. Default-on; opt out via `drainPending: false`.
+      const drainPending = options?.drainPending ?? true;
+      if (drainPending) {
+        const drain = await this.drainPendingFinalizations({
+          timeoutMs: options?.drainTimeoutMs ?? 30_000,
+          pollIntervalMs: options?.drainPollIntervalMs ?? 2_000,
+        });
+        if (drain.timedOut && !drain.skipped) {
+          // Drain ran but didn't finish in time. Count residual pending.
+          const pendingAtFlush = Array.from(this.tokens.values()).filter(
+            (t) => t.status === 'submitted' || t.status === 'pending',
+          ).length;
+          if (!options?.forceFlushOnDrainTimeout) {
+            // Skip the flush — publishing now would produce a partial CAR
+            // that drops the still-pending tokens, which is exactly the
+            // data-loss bug this fix exists to prevent.
+            logger.warn(
+              'Payments',
+              `sync: drain timed out with ${pendingAtFlush} token(s) still pending V5 finalization — skipping flush to avoid partial CAR. Retry sync() once finalization completes, or pass forceFlushOnDrainTimeout:true to publish anyway.`,
+            );
+            this.deps!.emitEvent('sync:completed', {
+              source: 'payments',
+              count: this.tokens.size,
+            });
+            return { added: 0, removed: 0, drainTimedOut: true, pendingAtFlush };
+          }
+          logger.warn(
+            'Payments',
+            `sync: drain timed out with ${pendingAtFlush} token(s) still pending V5 finalization — flushing anyway (forceFlushOnDrainTimeout=true). Pending tokens will be silently dropped from the published CAR.`,
+          );
+        }
       }
 
       // Create local data once
@@ -7618,7 +7766,17 @@ export class PaymentsModule {
         count: this.tokens.size,
       });
 
-      return { added: totalAdded, removed: totalRemoved };
+      // Surface any tokens that rode through the flush in pending-V5 state
+      // so callers can detect partial-CAR risk (relevant when drain was
+      // skipped due to no oracle, OR forceFlushOnDrainTimeout overrode a
+      // timed-out drain). Successful drain → pendingAtFlush = 0 → omit
+      // from the result.
+      const pendingAtFlush = Array.from(this.tokens.values()).filter(
+        (t) => t.status === 'submitted' || t.status === 'pending',
+      ).length;
+      const result: SyncResult = { added: totalAdded, removed: totalRemoved };
+      if (pendingAtFlush > 0) result.pendingAtFlush = pendingAtFlush;
+      return result;
     } catch (error) {
       this.deps!.emitEvent('sync:error', {
         source: 'payments',
