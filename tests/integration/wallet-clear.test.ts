@@ -527,7 +527,10 @@ describe('Sphere.clear() integration', () => {
           autoGenerate: true,
           nametag: 'taken',
         })
-      ).rejects.toThrow('Failed to register Unicity ID');
+      ).rejects.toMatchObject({
+        code: 'NAMETAG_TAKEN',
+        message: expect.stringMatching(/binding event was rejected/),
+      });
 
       // Nametag is still owned by wallet 1's pubkey on Nostr
       expect(nostrRelayNametags.has('taken')).toBe(true);

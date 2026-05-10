@@ -37,6 +37,7 @@ export type SphereErrorCode =
   | 'AGGREGATOR_ERROR'
   | 'VALIDATION_ERROR'
   | 'NAMETAG_CONFLICT'
+  | 'NAMETAG_TAKEN'
   | 'NETWORK_ERROR'
   | 'TIMEOUT'
   | 'DECRYPTION_ERROR'

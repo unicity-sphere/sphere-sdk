@@ -269,7 +269,13 @@ describe('Sphere.registerNametag() mint-before-publish ordering', () => {
     // publishIdentityBinding returns false (nametag taken by another pubkey)
     (transport.publishIdentityBinding as ReturnType<typeof vi.fn>).mockResolvedValue(false);
 
-    await expect(sphere.registerNametag('taken')).rejects.toThrow('may already be taken');
+    // Publish failure now throws NAMETAG_TAKEN (split from the generic
+    // VALIDATION_ERROR "may already be taken") so callers can distinguish
+    // relay-name-collision from aggregator-mint failure.
+    await expect(sphere.registerNametag('taken')).rejects.toMatchObject({
+      code: 'NAMETAG_TAKEN',
+      message: expect.stringMatching(/the binding event was rejected/),
+    });
 
     // Local state should NOT have the nametag (identity claim)
     expect(sphere.identity!.nametag).toBeUndefined();
@@ -465,6 +471,126 @@ describe('Sphere.registerNametag() mint/Nostr-binding consistency guard', () => 
 
     // Identity claim NOT updated.
     expect(sphere.identity!.nametag).toBeUndefined();
+
+    await sphere.destroy();
+  });
+});
+
+describe('Sphere.registerNametag() failure-mode error split + rollback (Bug B+C)', () => {
+  let storage: FileStorageProvider;
+  let tokenStorage: FileTokenStorageProvider;
+  let mintSpy: ReturnType<typeof vi.spyOn> | undefined;
+
+  beforeEach(() => {
+    cleanTestDir();
+    callOrder.length = 0;
+    if (Sphere.getInstance()) {
+      (Sphere as unknown as { instance: null }).instance = null;
+    }
+    storage = new FileStorageProvider({ dataDir: DATA_DIR });
+    tokenStorage = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
+  });
+
+  afterEach(() => {
+    mintSpy?.mockRestore();
+    mintSpy = undefined;
+    (Sphere as unknown as { instance: null }).instance = null;
+    cleanTestDir();
+  });
+
+  it('NAMETAG_TAKEN: publish failure throws the typed code with binding-rejected message', async () => {
+    const transport = createMockTransport();
+    const oracle = createMockOracle();
+
+    const { sphere } = await Sphere.init({
+      storage,
+      transport,
+      oracle,
+      tokenStorage,
+      autoGenerate: true,
+    });
+
+    mintSpy = installMintMock(sphere, { success: true });
+    (transport.publishIdentityBinding as ReturnType<typeof vi.fn>).mockResolvedValue(false);
+
+    try {
+      await sphere.registerNametag('taken');
+      throw new Error('Expected NAMETAG_TAKEN');
+    } catch (err) {
+      expect(err).toMatchObject({
+        code: 'NAMETAG_TAKEN',
+        message: expect.stringMatching(/binding event was rejected/),
+      });
+    }
+
+    await sphere.destroy();
+  });
+
+  it('rollback: when THIS call minted the nametag and publish fails, the local entry is removed', async () => {
+    const transport = createMockTransport();
+    const oracle = createMockOracle();
+
+    const { sphere } = await Sphere.init({
+      storage,
+      transport,
+      oracle,
+      tokenStorage,
+      autoGenerate: true,
+    });
+
+    mintSpy = installMintMock(sphere, { success: true });
+    (transport.publishIdentityBinding as ReturnType<typeof vi.fn>).mockResolvedValue(false);
+
+    const payments = (sphere as unknown as { _payments: PaymentsModule })._payments;
+
+    // Pre-conditions: wallet has no nametag entries.
+    expect(payments.hasNametag()).toBe(false);
+
+    await expect(sphere.registerNametag('alice')).rejects.toMatchObject({
+      code: 'NAMETAG_TAKEN',
+    });
+
+    // After publish failure, the just-minted nametag entry MUST be rolled
+    // back so a subsequent registerNametag with a different name doesn't
+    // trip NAMETAG_CONFLICT.
+    expect(payments.hasNametagNamed('alice')).toBe(false);
+    expect(payments.hasNametag()).toBe(false);
+
+    await sphere.destroy();
+  });
+
+  it('rollback: does NOT remove a pre-existing nametag that was already minted', async () => {
+    const transport = createMockTransport();
+    const oracle = createMockOracle();
+
+    const { sphere } = await Sphere.init({
+      storage,
+      transport,
+      oracle,
+      tokenStorage,
+      autoGenerate: true,
+    });
+
+    const payments = (sphere as unknown as { _payments: PaymentsModule })._payments;
+
+    // Pre-seed: wallet already holds "alice" from a prior successful
+    // registerNametag (so registerNametag('alice') here is an
+    // idempotent re-publish — mint is skipped, no `mintedFresh`).
+    await seedExistingNametag(sphere, 'alice');
+
+    mintSpy = installMintMock(sphere, { success: true });
+    (transport.publishIdentityBinding as ReturnType<typeof vi.fn>).mockResolvedValue(false);
+
+    await expect(sphere.registerNametag('alice')).rejects.toMatchObject({
+      code: 'NAMETAG_TAKEN',
+    });
+
+    // The pre-existing alice entry MUST still be there — rollback only
+    // applies to mints that happened in THIS call, not to any prior
+    // legitimate mint.
+    expect(payments.hasNametagNamed('alice')).toBe(true);
+    // Mint mock was NOT called (idempotent skip).
+    expect(mintSpy).not.toHaveBeenCalled();
 
     await sphere.destroy();
   });

@@ -4451,6 +4451,31 @@ export class PaymentsModule {
   }
 
   /**
+   * Remove a single nametag entry (by exact name) from local state. The
+   * on-chain token IS NOT burned — this only forgets the local pointer.
+   *
+   * Used by `Sphere.registerNametag` to roll back an orphaned mint when
+   * the subsequent Nostr-binding publish fails: the mint succeeded
+   * (on-chain anchor exists under this wallet's pubkey), but the public
+   * claim couldn't be made, so we drop the local reference rather than
+   * leaving a dangling token that confuses subsequent `registerNametag`
+   * attempts (they would otherwise hit `NAMETAG_CONFLICT`).
+   *
+   * @param name - Normalized nametag name (e.g. result of `normalizeNametag`).
+   * @returns `true` if an entry was removed, `false` if no matching entry existed.
+   */
+  async clearNametagByName(name: string): Promise<boolean> {
+    this.ensureInitialized();
+    const before = this.nametags.length;
+    this.nametags = this.nametags.filter((n) => n.name !== name);
+    const removed = this.nametags.length < before;
+    if (removed) {
+      await this.save();
+    }
+    return removed;
+  }
+
+  /**
    * Reload nametag data from storage providers into memory.
    *
    * Used as a recovery mechanism when `this.nametags` is unexpectedly empty

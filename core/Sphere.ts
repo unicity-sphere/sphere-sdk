@@ -660,6 +660,40 @@ export class Sphere {
       if (options.dmSince != null) {
         sphere._dmSince = options.dmSince;
       }
+
+      // Honor `options.nametag` on the loaded-wallet path. Prior behavior:
+      // `Sphere.load` silently ignored it, so `sphere init --nametag X` on
+      // an existing profile printed "Wallet initialized successfully!"
+      // without actually registering X — a silent failure that left the
+      // wallet in whatever nametag state it had before.
+      if (options.nametag) {
+        const stripped = options.nametag.startsWith('@')
+          ? options.nametag.slice(1)
+          : options.nametag;
+        const requested = normalizeNametag(stripped);
+        const current = sphere._identity?.nametag;
+        if (!current) {
+          // No active claim on the loaded wallet — register the requested
+          // nametag now. May throw (NAMETAG_CONFLICT / NAMETAG_TAKEN /
+          // AGGREGATOR_ERROR) per the same invariants as a fresh-create
+          // `registerNametag` call.
+          await sphere.registerNametag(options.nametag);
+        } else if (current !== requested) {
+          // Refuse to silently switch the active nametag of an already-
+          // claimed wallet. (Multi-nametag selection is a deliberate
+          // future feature — for now, force the operator to clear or
+          // switchToAddress explicitly.)
+          throw new SphereError(
+            `Wallet already claims Unicity ID "@${current}" — cannot re-init ` +
+            `with "@${requested}". Use sphere.clear() and re-init to switch ` +
+            `nametags, or switchToAddress to register a different name on ` +
+            `another HD address.`,
+            'ALREADY_INITIALIZED',
+          );
+        }
+        // else: current === requested — no-op, idempotent re-init
+      }
+
       return { sphere, created: false };
     }
 
@@ -3361,6 +3395,7 @@ export class Sphere {
     //    `B` while the wallet's anchor is `A` would publish `@B → me`
     //    but finalize incoming PROXY transfers via the `A` token,
     //    producing the alice-vs-alice-t1 mismatch this guard exists for.
+    let mintedFresh = false;
     if (!this._payments.hasNametagNamed(cleanNametag)) {
       if (this._payments.hasNametag()) {
         const existingName = this._payments.getNametag()!.name;
@@ -3381,6 +3416,7 @@ export class Sphere {
           'AGGREGATOR_ERROR',
         );
       }
+      mintedFresh = true;
       logger.debug('Sphere', 'Nametag token minted successfully');
     }
 
@@ -3399,7 +3435,13 @@ export class Sphere {
       );
     }
 
-    // 2. Publish identity binding with nametag to Nostr AFTER minting succeeds
+    // 2. Publish identity binding with nametag to Nostr AFTER minting
+    //    succeeds. The publish step is a relay write — failures are
+    //    DISTINCT from aggregator-mint failures and need a separate
+    //    error code so operators can act correctly:
+    //      - AGGREGATOR_ERROR (above): bad oracle, retry-later
+    //      - NAMETAG_TAKEN (here): the name is owned on the relay by a
+    //        different pubkey, no amount of retry will fix it
     if (this._transport.publishIdentityBinding) {
       const success = await this._transport.publishIdentityBinding(
         this._identity!.chainPubkey,
@@ -3408,7 +3450,39 @@ export class Sphere {
         cleanNametag,
       );
       if (!success) {
-        throw new SphereError('Failed to register Unicity ID. It may already be taken.', 'VALIDATION_ERROR');
+        // Rollback an orphaned mint: if THIS call minted the nametag and
+        // the public claim then failed, the local store has a token we
+        // can't legitimately advertise. Leaving it would trip
+        // NAMETAG_CONFLICT on every subsequent registerNametag attempt
+        // with a different name. The on-chain token itself is permanent
+        // — minting is irreversible — but we drop the local pointer so
+        // the wallet's state is consistent. (If the conflict on the
+        // relay ever clears, the deterministic-salt mint will recover
+        // the same token via REQUEST_ID_EXISTS.)
+        if (mintedFresh) {
+          try {
+            await this._payments.clearNametagByName(cleanNametag);
+            logger.debug(
+              'Sphere',
+              `Rolled back orphan local nametag entry for "@${cleanNametag}" after publish failure`,
+            );
+          } catch (rollbackErr) {
+            logger.warn(
+              'Sphere',
+              `Failed to roll back nametag "@${cleanNametag}" after publish failure (continuing):`,
+              rollbackErr,
+            );
+          }
+        }
+        throw new SphereError(
+          `Cannot claim Unicity ID "@${cleanNametag}" on the relay — the binding ` +
+          `event was rejected. Most commonly this means another wallet already ` +
+          `owns "@${cleanNametag}" on this relay (the relay enforces uniqueness ` +
+          `independently of the aggregator). The wallet's local state has been ` +
+          `restored — re-init with a different --nametag or contact relay ops if ` +
+          `you expected to own this name.`,
+          'NAMETAG_TAKEN',
+        );
       }
     }
 
