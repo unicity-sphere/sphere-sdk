@@ -12,6 +12,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Sphere } from '../../core/Sphere';
+import { mockMintNametagSuccess } from '../helpers/mockMintNametag';
 import { FileStorageProvider } from '../../impl/nodejs/storage/FileStorageProvider';
 import { FileTokenStorageProvider } from '../../impl/nodejs/storage/FileTokenStorageProvider';
 import type { TransportProvider, OracleProvider } from '../../index';
@@ -116,9 +117,12 @@ describe('Nametag normalization integration', () => {
     }
     storage = new FileStorageProvider({ dataDir: DATA_DIR });
     tokenStorage = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
-    // Mock minting so registerNametag (mint-before-publish) succeeds without a real aggregator
-    mintSpy = vi.spyOn(Sphere.prototype as unknown as { mintNametag: () => Promise<unknown> }, 'mintNametag')
-      .mockResolvedValue({ success: true, token: null, nametagData: null });
+    // Mock minting so registerNametag (mint-before-publish) succeeds without a
+    // real aggregator. Uses the shared helper that ALSO persists the nametag
+    // to PaymentsModule.setNametag (required by the post-mint consistency
+    // guard in registerNametag — without persistence the guard would refuse
+    // to publish).
+    mintSpy = mockMintNametagSuccess();
   });
 
   afterEach(() => {

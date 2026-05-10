@@ -7229,12 +7229,40 @@ export class PaymentsModule {
   }
 
   /**
-   * Get the current (first) nametag data.
+   * Get the active nametag entry — the one whose name matches
+   * `identity.nametag` (the name advertised on Nostr). Falls back to
+   * `nametags[0]` when the claim is unset or has no matching entry, so
+   * legacy single-nametag callers see no behavior change.
    *
-   * @returns The nametag data, or `null` if no nametag is set.
+   * The preference matters for PROXY-mode finalize: it must derive the
+   * recipient address from the token whose name matches Nostr,
+   * otherwise inbound transfers to `@claimed` (PROXY computed from
+   * `TokenId.fromNameTag('claimed')`) are rejected against the
+   * `[0]` entry's tokenId.
+   *
+   * @returns The active nametag data, or `null` if no nametag is set.
    */
   getNametag(): NametagData | null {
+    const claimedName = this.deps?.identity.nametag;
+    if (claimedName) {
+      const match = this.nametags.find((n) => n.name === claimedName);
+      if (match) return match;
+    }
     return this.nametags[0] ?? null;
+  }
+
+  /**
+   * Look up a stored nametag entry by exact name. Returns `null` if the
+   * wallet hasn't minted (or hasn't loaded a token for) this name.
+   *
+   * Used by `Sphere.registerNametag` to detect the "mint already done for
+   * THIS specific name" idempotency case (vs. "some OTHER nametag is
+   * minted") so the consistency guard fires correctly.
+   *
+   * @param name - Normalized nametag name (e.g. result of `normalizeNametag`).
+   */
+  getNametagByName(name: string): NametagData | null {
+    return this.nametags.find((n) => n.name === name) ?? null;
   }
 
   /**
@@ -7247,12 +7275,27 @@ export class PaymentsModule {
   }
 
   /**
-   * Check whether a nametag is currently set.
+   * Check whether ANY nametag is currently set.
+   *
+   * Prefer {@link hasNametagNamed} when the caller cares about a specific
+   * name (e.g. the `registerNametag` consistency guard) — `hasNametag()`
+   * alone returns true for any stored entry regardless of name, which was
+   * the source of the alice-vs-alice-t1 Nostr-vs-on-chain inconsistency
+   * bug.
    *
    * @returns `true` if nametag data is present.
    */
   hasNametag(): boolean {
     return this.nametags.length > 0;
+  }
+
+  /**
+   * Check whether a nametag with this exact name is stored.
+   *
+   * @param name - Normalized nametag name.
+   */
+  hasNametagNamed(name: string): boolean {
+    return this.nametags.some((n) => n.name === name);
   }
 
   /**
@@ -7262,6 +7305,31 @@ export class PaymentsModule {
     this.ensureInitialized();
     this.nametags = [];
     await this.save();
+  }
+
+  /**
+   * Remove a single nametag entry (by exact name) from local state. The
+   * on-chain token IS NOT burned — this only forgets the local pointer.
+   *
+   * Used by `Sphere.registerNametag` to roll back an orphaned mint when
+   * the subsequent Nostr-binding publish fails: the mint succeeded
+   * (on-chain anchor exists under this wallet's pubkey), but the public
+   * claim couldn't be made, so we drop the local reference rather than
+   * leaving a dangling token that confuses subsequent `registerNametag`
+   * attempts (they would otherwise hit `NAMETAG_CONFLICT`).
+   *
+   * @param name - Normalized nametag name (e.g. result of `normalizeNametag`).
+   * @returns `true` if an entry was removed, `false` if no matching entry existed.
+   */
+  async clearNametagByName(name: string): Promise<boolean> {
+    this.ensureInitialized();
+    const before = this.nametags.length;
+    this.nametags = this.nametags.filter((n) => n.name !== name);
+    const removed = this.nametags.length < before;
+    if (removed) {
+      await this.save();
+    }
+    return removed;
   }
 
   /**

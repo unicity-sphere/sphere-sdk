@@ -13,6 +13,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Sphere } from '../../core/Sphere';
+import { mockMintNametagSuccess } from '../helpers/mockMintNametag';
 import { STORAGE_KEYS_GLOBAL, STORAGE_KEYS_ADDRESS } from '../../constants';
 import { FileStorageProvider } from '../../impl/nodejs/storage/FileStorageProvider';
 import { FileTokenStorageProvider } from '../../impl/nodejs/storage/FileTokenStorageProvider';
@@ -153,9 +154,10 @@ describe('Sphere.clear() integration', () => {
     }
     storage = new FileStorageProvider({ dataDir: DATA_DIR });
     tokenStorage = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
-    // Mock minting so registerNametag (mint-before-publish) succeeds without a real aggregator
-    mintSpy = vi.spyOn(Sphere.prototype as unknown as { mintNametag: () => Promise<unknown> }, 'mintNametag')
-      .mockResolvedValue({ success: true, token: null, nametagData: null });
+    // Mock minting so registerNametag (mint-before-publish) succeeds without
+    // a real aggregator. The shared helper also persists the nametag — see
+    // the comment in nametag-normalization.test.ts for rationale.
+    mintSpy = mockMintNametagSuccess();
   });
 
   afterEach(() => {
@@ -525,7 +527,10 @@ describe('Sphere.clear() integration', () => {
           autoGenerate: true,
           nametag: 'taken',
         })
-      ).rejects.toThrow('Failed to register Unicity ID');
+      ).rejects.toMatchObject({
+        code: 'NAMETAG_TAKEN',
+        message: expect.stringMatching(/binding event was rejected/),
+      });
 
       // Nametag is still owned by wallet 1's pubkey on Nostr
       expect(nostrRelayNametags.has('taken')).toBe(true);
