@@ -471,6 +471,20 @@ export class FlushScheduler {
       };
       await this.bundleIndex.addBundle(cid, bundleRef);
 
+      // 6a. Pointer-monotonicity invariant maintenance: a bundle this
+      //     flush just added is, by construction, "loaded" — its tokens
+      //     are precisely what we built the CAR from. Including it in
+      //     `lastLoadedFromBundleCids` prevents the next save-driven
+      //     flush from flagging it as an unknown remote bundle (which
+      //     would block publish with POINTER_MONOTONICITY_VIOLATION
+      //     even though the bundle is the originator's own state).
+      //     Without this maintenance, every save→flush after the
+      //     first establishes a false-positive baseline drift.
+      const loadedBundleCidsForUpdate = this.host.getLastLoadedFromBundleCids();
+      if (loadedBundleCidsForUpdate !== null) {
+        loadedBundleCidsForUpdate.add(cid);
+      }
+
       // 7. Write operational state:
       //    - synced portion to OrbitDB (outbox, mintOutbox, etc.)
       //    - derived portion to local cache (tombstones, sent, history)
