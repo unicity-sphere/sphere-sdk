@@ -254,6 +254,35 @@ export class FlushScheduler {
         pkg.ingestAll(tokenValues);
       }
 
+      // Diagnostic at debug-level: token count + per-coinId histogram +
+      // flush mode. Useful for investigating cross-device-sync issues
+      // where the flush captures partial state (e.g., the known issue
+      // tracked as a PR #127 follow-up: no-data flushes publishing ×1
+      // entries from lastLoadedData while save flushes publish ×2 from
+      // pendingData, leading to intermediate pointer versions that
+      // reference incomplete CARs). Run with DEBUG=Profile-TokenStorage
+      // or equivalent to surface.
+      const tokenCoinIds = tokenValues
+        .map((t) => {
+          const tok = t as {
+            genesis?: { data?: { coinData?: ReadonlyArray<readonly [string, string]> } };
+            coinData?: ReadonlyArray<readonly [string, string]>;
+          };
+          const c = tok.genesis?.data?.coinData ?? tok.coinData;
+          if (!c || c.length === 0) return '∅';
+          return String(c[0]?.[0] ?? '').slice(-6);
+        })
+        .sort();
+      const counts: Record<string, number> = {};
+      for (const id of tokenCoinIds) counts[id] = (counts[id] ?? 0) + 1;
+      const histogram = Object.entries(counts)
+        .map(([id, n]) => `${id}×${n}`)
+        .sort()
+        .join(' ');
+      this.host.log(
+        `flushToIpfs: ${tokenValues.length} tokens {${histogram}} noDataMode=${noDataMode}`,
+      );
+
       // 3. Export to CAR (unencrypted — see class doc)
       const carBytes = await pkg.toCar();
 
