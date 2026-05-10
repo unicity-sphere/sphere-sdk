@@ -105,39 +105,7 @@ export class FlushScheduler {
     // Set new debounced timer
     const timer = setTimeout(() => {
       this.host.setFlushTimer(null);
-      // Steelman³⁸ warning: identity-check the finally clear so an older
-      // flush settling AFTER a newer one was scheduled doesn't clobber
-      // the in-flight `flushPromise`. Without the identity check, a
-      // subsequent load() reading `if (this.flushPromise)` would see
-      // null while the new flush is still running, and read a stale
-      // snapshot.
-      //
-      // Steelman⁴⁶ ordering note: `this.flushPromise = myFlush` MUST
-      // be observable before the `.finally` runs, otherwise the
-      // identity check would compare against an out-of-date reference.
-      // JS semantics guarantee this (sync code in this setTimeout
-      // callback completes before any microtask), but the previous
-      // arrangement built the .finally chain before the assignment
-      // — making the dependency implicit. We now use an outer Promise
-      // box that the .finally consults, which makes the invariant
-      // explicit and immune to future refactors that might reorder
-      // the chain build.
-      const flushBox: { ref: Promise<void> | null } = { ref: null };
-      const myFlush: Promise<void> = this.flushToIpfs()
-        .catch((err) => {
-          this.host.log(`Flush failed: ${err instanceof Error ? err.message : String(err)}`);
-          this.host.emitEvent(this.host.buildErrorEvent('storage:error', err));
-        })
-        .finally(() => {
-          // Compare against the boxed reference assigned after the
-          // chain is built — this fires AFTER the assignment below
-          // because .finally is microtask-deferred.
-          if (this.host.getFlushPromise() === flushBox.ref) {
-            this.host.setFlushPromise(null);
-          }
-        });
-      flushBox.ref = myFlush;
-      this.host.setFlushPromise(myFlush);
+      this.startSerializedFlush('save');
     }, this.host.flushDebounceMs);
     this.host.setFlushTimer(timer);
   }
@@ -169,23 +137,82 @@ export class FlushScheduler {
     // identically to a save-driven flush.
     const timer = setTimeout(() => {
       this.host.setFlushTimer(null);
-      const flushBox: { ref: Promise<void> | null } = { ref: null };
-      const myFlush: Promise<void> = this.flushToIpfs()
-        .catch((err) => {
-          this.host.log(
-            `Flush (no-data) failed: ${err instanceof Error ? err.message : String(err)}`,
-          );
-          this.host.emitEvent(this.host.buildErrorEvent('storage:error', err));
-        })
-        .finally(() => {
-          if (this.host.getFlushPromise() === flushBox.ref) {
-            this.host.setFlushPromise(null);
-          }
-        });
-      flushBox.ref = myFlush;
-      this.host.setFlushPromise(myFlush);
+      this.startSerializedFlush('no-data');
     }, this.host.flushDebounceMs);
     this.host.setFlushTimer(timer);
+  }
+
+  /**
+   * Wrap a `flushToIpfs()` call in the chain barrier + identity-checked
+   * finally clear that scheduleFlush() and scheduleFlushNoData() both
+   * need.
+   *
+   * # Why serialize flushes (PR #127 follow-up — partial-CAR race fix)
+   *
+   * Without serialization, two `flushToIpfs()` calls can run in parallel
+   * — the older one captures `pendingData_1`, the newer captures
+   * `pendingData_2`, and both proceed to pinning + publish. The
+   * aggregator's per-wallet publish mutex serializes the publishes in
+   * mutex-acquisition order, NOT capture order. A slower-pinning OLDER
+   * flush can publish AFTER a faster-pinning NEWER flush, putting the
+   * older (partial) CAR behind the higher pointer version. A remote
+   * device joining via `recoverLatest()` then walks to that higher
+   * version, fetches the partial CAR, and silently misses tokens that
+   * lived only in the newer save.
+   *
+   * Mode-A's monotonicity assertion (b5d347e) is defense-in-depth, but
+   * does NOT cover the inversion: it reads `lastLoadedData` BEFORE pin
+   * + publish, so at check-time the older flush's view of
+   * `lastLoadedData` is still the older state — the check passes — and
+   * by the time the older flush actually publishes, the newer flush
+   * has already overtaken it on the aggregator.
+   *
+   * Serializing flushes guarantees publish order matches save order:
+   * older save → older flush → older publish → smaller version. Newer
+   * save → newer flush → newer publish → larger version with a CAR
+   * that is byte-for-byte at-least-as-recent as anything below. The
+   * latest pointer is always the freshest CAR; intermediate versions
+   * remain partial by design (each save → snapshot of that point in
+   * time), which is fine — `recoverLatest()` always walks to the top.
+   *
+   * # Mechanics
+   *
+   * - `previous = getFlushPromise() ?? Promise.resolve()` reads the
+   *   current in-flight flush as the chain anchor. If no flush is in
+   *   flight, the chain starts immediately.
+   * - `previous.catch(() => {})` swallows the prior flush's rejection
+   *   so a single failure does not stall every queued flush. Errors
+   *   are still surfaced — each flush has its own catch arm below.
+   * - `.then(() => this.flushToIpfs())` is what enforces ordering: the
+   *   new flush only starts after the previous chain settles.
+   * - The boxed `.finally` identity check prevents an older flush's
+   *   completion handler from clobbering the host's `flushPromise`
+   *   when a newer flush has already replaced it (Steelman³⁸).
+   *   Steelman⁴⁶ is preserved: `flushBox.ref` is assigned synchronously
+   *   after the chain is built and BEFORE the `.finally` microtask can
+   *   run.
+   */
+  private startSerializedFlush(mode: 'save' | 'no-data'): void {
+    const previous = this.host.getFlushPromise() ?? Promise.resolve();
+    const flushBox: { ref: Promise<void> | null } = { ref: null };
+    const myFlush: Promise<void> = previous
+      .catch(() => {
+        // Prior flush already surfaced its error via its own catch arm.
+        // Don't propagate — we want our flush to run regardless.
+      })
+      .then(() => this.flushToIpfs())
+      .catch((err) => {
+        const prefix = mode === 'no-data' ? 'Flush (no-data) failed' : 'Flush failed';
+        this.host.log(`${prefix}: ${err instanceof Error ? err.message : String(err)}`);
+        this.host.emitEvent(this.host.buildErrorEvent('storage:error', err));
+      })
+      .finally(() => {
+        if (this.host.getFlushPromise() === flushBox.ref) {
+          this.host.setFlushPromise(null);
+        }
+      });
+    flushBox.ref = myFlush;
+    this.host.setFlushPromise(myFlush);
   }
 
   /**
@@ -256,12 +283,14 @@ export class FlushScheduler {
 
       // Diagnostic at debug-level: token count + per-coinId histogram +
       // flush mode. Useful for investigating cross-device-sync issues
-      // where the flush captures partial state (e.g., the known issue
-      // tracked as a PR #127 follow-up: no-data flushes publishing ×1
-      // entries from lastLoadedData while save flushes publish ×2 from
-      // pendingData, leading to intermediate pointer versions that
-      // reference incomplete CARs). Run with DEBUG=Profile-TokenStorage
-      // or equivalent to surface.
+      // where a flush captures partial state. The original PR #127
+      // partial-CAR cause (concurrent flushToIpfs() calls publishing
+      // their CARs out of capture order, putting an older partial CAR
+      // behind a higher pointer version) is now closed by the
+      // serialization in startSerializedFlush(). The diagnostic stays
+      // in as a permanent debug tool — useful for catching any future
+      // regression where save and no-data sources diverge. Run with
+      // DEBUG=Profile-TokenStorage or equivalent to surface.
       const tokenCoinIds = tokenValues
         .map((t) => {
           const tok = t as {
