@@ -21,23 +21,27 @@
  *         the pointer and assembles the new CAR. HTTPS, robust against
  *         libp2p connectivity failures.
  *
- *   This single-process test exercises only Path (b) reliably. Two
- *   libp2p hosts inside the SAME Node process do not consistently
- *   establish gossipsub (libp2p assumes inter-process boundaries),
- *   so Path (a) requires `child_process.fork` to test honestly.
  *   We assert the aggregator-pointer path because that's the production
  *   durability guarantee — pubsub is the latency optimization on top.
+ *   Test 1 spawns each Sphere in its OWN Node process (forked worker)
+ *   so libp2p has the inter-process boundary it expects in production.
+ *   Two libp2p hosts inside the SAME Node process do not consistently
+ *   establish gossipsub, which is why the in-process variant of this
+ *   scenario was unreliable before the multi-process harness landed.
  *
  *   Two scenarios:
  *
- *     Test 1 — CROSS-DEVICE SYNC via aggregator pointer:
+ *     Test 1 — CROSS-DEVICE SYNC via aggregator pointer (forked workers):
  *       A on real Nostr; B on no-op transport (no Nostr) so any state
  *       B observes MUST have come through OrbitDB+IPFS. A receives a
  *       faucet token and explicitly flushes (`sync()`). B explicitly
  *       calls `sync()` in a polling loop. Within budget, B's
  *       `getBalance()` reflects the new token — proving the aggregator-
  *       pointer + IPFS-CAR path delivers cross-device sync correctly
- *       while both spheres are alive simultaneously.
+ *       while both spheres are alive simultaneously. Each Sphere runs
+ *       inside its own Node process via `child_process.spawn` with an
+ *       IPC channel; see `lib/profile-sync-worker.ts` for the worker
+ *       protocol.
  *
  *     Test 2 — BIDIRECTIONAL CONVERGENCE:
  *       Both A and B on real Nostr. Both receive the same faucet DM and
@@ -67,17 +71,24 @@
 
 import { describe, it, expect, afterAll, afterEach } from 'vitest';
 import { rmSync } from 'node:fs';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Sphere } from '../../core/Sphere';
 import {
   rand,
   makeTempDirs,
   ensureTrustbase,
-  createNoopTransport,
   requestFaucet,
   getBalance,
 } from './helpers';
 import { makeProfileProviders } from './profile-helpers';
 import { preflightSkip } from './lib/preflight';
+import type {
+  ParentRequest,
+  WorkerInitConfig,
+  WorkerResponse,
+} from './lib/profile-sync-worker';
 
 const SKIP_INFRA = preflightSkip(
   ['nostr', 'ipfs', 'faucet', 'aggregator'],
@@ -113,11 +124,175 @@ const TEST_COIN = {
 };
 const FAUCET_AMOUNT_RAW = 1_000_000_000_000_000_000n; // 1 UCT in raw 18-decimal units
 
+// ---------------------------------------------------------------------------
+// Fork harness — Test 1 spawns each Sphere in its own Node process so
+// libp2p has the inter-process boundary it expects. The worker speaks
+// a tiny request/response IPC protocol (see lib/profile-sync-worker.ts).
+// ---------------------------------------------------------------------------
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const WORKER_PATH = join(HERE, 'lib', 'profile-sync-worker.ts');
+
+interface PendingRequest {
+  resolve: (msg: WorkerResponse) => void;
+  reject: (err: Error) => void;
+  timer: NodeJS.Timeout;
+}
+
+class WorkerHandle {
+  private readonly child: ChildProcess;
+  private readonly pending = new Map<string, PendingRequest>();
+  private exited = false;
+  private exitError: Error | null = null;
+  private nextId = 0;
+
+  constructor(label: string) {
+    // Use `spawn` with an explicit `ipc` slot so the child gets a
+    // `process.send`/`process.on('message')` channel. We could call
+    // `child_process.fork` directly, but `fork` requires a JS module —
+    // the worker is TypeScript, so we route through `tsx` via the
+    // `--import tsx/esm` Node CLI flag (Node 22+).
+    this.child = spawn(
+      process.execPath,
+      ['--import', 'tsx/esm', WORKER_PATH],
+      {
+        stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
+        env: { ...process.env, WORKER_LABEL: label },
+      },
+    );
+    this.child.on('message', (raw) => this.onMessage(raw as WorkerResponse));
+    this.child.on('exit', (code, signal) => {
+      this.exited = true;
+      this.exitError = new Error(
+        `worker[${label}] exited prematurely (code=${code}, signal=${signal})`,
+      );
+      // Reject all pending — parent shouldn't deadlock if the worker
+      // crashes mid-flight.
+      for (const [, p] of this.pending) {
+        clearTimeout(p.timer);
+        p.reject(this.exitError);
+      }
+      this.pending.clear();
+    });
+  }
+
+  private onMessage(msg: WorkerResponse): void {
+    if (msg.type === 'log') {
+      // Print worker logs into the test stdout so a failure trace shows
+      // both A and B's narratives interleaved.
+      console.log(msg.message);
+      return;
+    }
+    const pending = this.pending.get(msg.requestId);
+    if (!pending) {
+      // Late response after timeout — drop quietly.
+      return;
+    }
+    this.pending.delete(msg.requestId);
+    clearTimeout(pending.timer);
+    pending.resolve(msg);
+  }
+
+  request(
+    cmd: Omit<ParentRequest, 'requestId'>,
+    timeoutMs: number,
+  ): Promise<WorkerResponse> {
+    if (this.exited) {
+      return Promise.reject(this.exitError ?? new Error('worker already exited'));
+    }
+    const requestId = `r${this.nextId++}`;
+    const wrapped = { ...cmd, requestId } as ParentRequest;
+    return new Promise<WorkerResponse>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(requestId);
+        reject(new Error(
+          `worker request timeout after ${timeoutMs}ms (cmd=${cmd.type})`,
+        ));
+      }, timeoutMs);
+      this.pending.set(requestId, { resolve, reject, timer });
+      if (!this.child.send(wrapped)) {
+        this.pending.delete(requestId);
+        clearTimeout(timer);
+        reject(new Error(`worker.send() returned false (cmd=${cmd.type})`));
+      }
+    });
+  }
+
+  async destroy(timeoutMs = 60_000): Promise<void> {
+    if (this.exited) return;
+    try {
+      await this.request({ type: 'destroy' }, timeoutMs);
+    } catch {
+      // Worker may already be gone — fall through to kill.
+    }
+    if (!this.exited && !this.child.killed) {
+      this.child.kill('SIGTERM');
+      await new Promise<void>((r) => {
+        const t = setTimeout(() => {
+          this.child.kill('SIGKILL');
+          r();
+        }, 5_000);
+        this.child.once('exit', () => {
+          clearTimeout(t);
+          r();
+        });
+      });
+    }
+  }
+}
+
+async function workerInit(
+  worker: WorkerHandle,
+  config: WorkerInitConfig,
+  timeoutMs: number,
+): Promise<Extract<WorkerResponse, { type: 'init_ok' }>> {
+  const reply = await worker.request({ type: 'init', config }, timeoutMs);
+  if (reply.type === 'error') {
+    throw new Error(`worker init failed: ${reply.message}`);
+  }
+  if (reply.type !== 'init_ok') {
+    throw new Error(`unexpected worker reply: ${reply.type}`);
+  }
+  return reply;
+}
+
+async function workerSync(
+  worker: WorkerHandle,
+  timeoutMs: number,
+): Promise<{ added: number; removed: number }> {
+  const reply = await worker.request({ type: 'sync' }, timeoutMs);
+  if (reply.type === 'error') throw new Error(`worker sync failed: ${reply.message}`);
+  if (reply.type !== 'sync_ok') throw new Error(`unexpected worker reply: ${reply.type}`);
+  return { added: reply.added, removed: reply.removed };
+}
+
+async function workerReceive(
+  worker: WorkerHandle,
+  timeoutMs: number,
+): Promise<void> {
+  const reply = await worker.request({ type: 'receive' }, timeoutMs);
+  if (reply.type === 'error') throw new Error(`worker receive failed: ${reply.message}`);
+  if (reply.type !== 'receive_ok') throw new Error(`unexpected worker reply: ${reply.type}`);
+}
+
+async function workerBalance(
+  worker: WorkerHandle,
+  symbol: string,
+  timeoutMs: number,
+): Promise<{ total: bigint; tokens: number }> {
+  const reply = await worker.request({ type: 'getBalance', symbol }, timeoutMs);
+  if (reply.type === 'error') throw new Error(`worker balance failed: ${reply.message}`);
+  if (reply.type !== 'balance_ok') throw new Error(`unexpected worker reply: ${reply.type}`);
+  return { total: BigInt(reply.total), tokens: reply.tokens };
+}
+
 describe.skipIf(SKIP_INFRA)('Profile Live Concurrent Sync E2E', () => {
   const cleanupDirs: string[] = [];
   // Per-test sphere arrays so the singleton-destroy race between tests
   // doesn't leave a transport in a half-closed state.
   let testSpheres: Sphere[] = [];
+  // Workers spawned by Test 1 — torn down in afterEach.
+  let testWorkers: WorkerHandle[] = [];
 
   // Increased hook timeout — destroying two Profile-mode spheres each
   // with pointer-monotonicity assertions, in-flight flushes, OrbitDB
@@ -128,15 +303,20 @@ describe.skipIf(SKIP_INFRA)('Profile Live Concurrent Sync E2E', () => {
   // a 180s ceiling so legitimate slow teardowns aren't masked as
   // "test failures".
   afterEach(async () => {
-    // Destroy in PARALLEL — each sphere awaits its own in-flight flush
-    // independently; running them serially would double the wall-clock
-    // wait (60s + 60s instead of max(60s, 60s) ≈ 60s).
-    await Promise.all(
-      testSpheres.map(async (s) => {
+    // Destroy spheres + workers in PARALLEL — each subject awaits its
+    // own in-flight flush independently; running them serially would
+    // multiply the wall-clock wait. Sphere.destroy and worker.destroy
+    // both await pending OrbitDB+IPFS shutdown.
+    await Promise.all([
+      ...testSpheres.map(async (s) => {
         try { await s.destroy(); } catch { /* cleanup */ }
       }),
-    );
+      ...testWorkers.map(async (w) => {
+        try { await w.destroy(); } catch { /* cleanup */ }
+      }),
+    ]);
     testSpheres = [];
+    testWorkers = [];
     // Null the singleton slot — same defensive pattern used in
     // provider-disable-sync.test.ts to keep cross-test state clean
     // when re-using the same local-infra relay/faucet.
@@ -157,70 +337,57 @@ describe.skipIf(SKIP_INFRA)('Profile Live Concurrent Sync E2E', () => {
   // Test 1 — LIVE PROPAGATION: A receives, B observes via OrbitDB pubsub
   // ---------------------------------------------------------------------------
 
-  // Skipped — see file-level docstring. This scenario is testable only
-  // with `child_process.fork` so each Sphere has its own Node process
-  // (and thus its own libp2p host). In a single Node process two libp2p
-  // peers do not establish gossipsub correctly, AND `payments.sync()`
-  // on the second sphere does not re-poll the aggregator pointer
-  // (pointer recovery is a one-shot at `Sphere.import` cold-start;
-  // ongoing sync relies on OrbitDB's pubsub replication). The
-  // cold-start cross-device sync IS covered by
-  // `profile-multi-device-sync.test.ts` Test 2 ("Device B recovers
-  // multi-coin tokens ONLY from Profile layer"); the live (concurrent
-  // both-online) variant requires the multi-process harness as a
-  // follow-up. Re-enable once that lands.
-  it.skip(
+  // Multi-process harness: A and B each run in their own forked Node
+  // process so libp2p has the inter-process boundary it expects. The
+  // single-process variant of this scenario was unreliable because two
+  // libp2p hosts in the same Node event loop don't consistently
+  // establish gossipsub. With one process per Sphere, OrbitDB's pubsub
+  // replication AND the aggregator-pointer fallback both behave the
+  // way they do in production. The test asserts on the aggregator-
+  // pointer + IPFS CAR path (B has a no-op Nostr) — that's the durable
+  // contract; pubsub is a latency optimization on top.
+  it(
     'Cross-device sync: A on Nostr receives a token + flushes; B on no-op transport observes via aggregator pointer + IPFS CAR',
     async () => {
       const nametag = `e2e-live1-${rand()}`;
-      console.log(`\n[Test 1] Setting up A and B on shared wallet @${nametag}...`);
+      console.log(`\n[Test 1] Setting up A and B as forked workers @${nametag}...`);
 
-      const dirsA = makeTempDirs('profile-live1-a');
-      const dirsB = makeTempDirs('profile-live1-b');
-      cleanupDirs.push(dirsA.base, dirsB.base);
-      await ensureTrustbase(dirsA.dataDir);
-      await ensureTrustbase(dirsB.dataDir);
+      const REQUEST_TIMEOUT_MS = 120_000;
+      // Init covers wallet creation + identity binding publish + first
+      // OrbitDB connect — slow, especially from cold-start. Allow the
+      // full propagation budget so the test doesn't false-alarm on
+      // transient testnet relay slowdowns.
+      const INIT_TIMEOUT_MS = PROPAGATION_TIMEOUT_MS;
 
-      const providersA = makeProfileProviders(dirsA);
-      const providersB = makeProfileProviders(dirsB);
+      // Fork A first — autoGenerate, real Nostr transport, registers
+      // the nametag. A is the source of truth for the shared mnemonic.
+      const workerA = new WorkerHandle('A');
+      testWorkers.push(workerA);
+      console.log('  A: spawning worker (real Nostr, autoGenerate)...');
+      const aInit = await workerInit(
+        workerA,
+        { label: 'A', nametag, useNoopTransport: false },
+        INIT_TIMEOUT_MS,
+      );
+      console.log(`  A: identity=${aInit.l1Address}`);
 
-      // A: real Nostr — receives faucet DM
-      console.log('  A: creating wallet with real Nostr transport...');
-      const { sphere: sphereA, generatedMnemonic } = await Sphere.init({
-        ...providersA,
-        autoGenerate: true,
-        nametag,
-      });
-      testSpheres.push(sphereA);
-      const mnemonic = generatedMnemonic!;
-      expect(mnemonic).toBeTruthy();
-      console.log(`  A: identity=${sphereA.identity!.l1Address}`);
-
-      // B: same mnemonic, fresh storage dirs, NO-OP transport.
+      // Fork B with A's mnemonic, fresh storage dirs, NO-OP transport.
       // The no-op transport guarantees B cannot receive the faucet DM
-      // via Nostr — any state change observed on B MUST have come from
-      // OrbitDB pubsub.
-      // Sphere is a process-level singleton — `Sphere.import` calls
-      // `Sphere.clear` whenever an existing instance is set, which would
-      // destroy A. Null the singleton slot so import sees no prior
-      // instance; A's instance state is unaffected (it's a different
-      // object). With both spheres' storage dirs disjoint, `Sphere.exists`
-      // returns false on B's fresh storage, so no clear fires.
-      (Sphere as unknown as { instance: null }).instance = null;
-      console.log('  B: importing same mnemonic with NO-OP transport...');
-      const sphereB = await Sphere.import({
-        storage: providersB.storage,
-        tokenStorage: providersB.tokenStorage,
-        transport: createNoopTransport(),
-        oracle: providersB.oracle,
-        mnemonic,
-      });
-      testSpheres.push(sphereB);
-      console.log(`  B: identity=${sphereB.identity!.l1Address}`);
-      expect(sphereB.identity!.l1Address).toBe(sphereA.identity!.l1Address);
+      // via Nostr — any state change observed on B MUST have come
+      // through Profile (OrbitDB+IPFS).
+      const workerB = new WorkerHandle('B');
+      testWorkers.push(workerB);
+      console.log('  B: spawning worker (no-op transport, importing A\'s mnemonic)...');
+      const bInit = await workerInit(
+        workerB,
+        { label: 'B', mnemonic: aInit.mnemonic, useNoopTransport: true },
+        INIT_TIMEOUT_MS,
+      );
+      console.log(`  B: identity=${bInit.l1Address}`);
+      expect(bInit.l1Address).toBe(aInit.l1Address);
 
       // Pre-condition: B starts with zero balance (no prior state).
-      const preBalanceB = getBalance(sphereB, TEST_COIN.symbol);
+      const preBalanceB = await workerBalance(workerB, TEST_COIN.symbol, REQUEST_TIMEOUT_MS);
       expect(preBalanceB.total).toBe(0n);
       console.log(`  B: pre-faucet balance=${preBalanceB.total} ${TEST_COIN.symbol} (expected 0)`);
 
@@ -234,11 +401,11 @@ describe.skipIf(SKIP_INFRA)('Profile Live Concurrent Sync E2E', () => {
       // works). Use a short budget here; the real assertion is on B.
       console.log(`  Waiting for A to receive (${TEST_COIN.symbol})...`);
       const aDeadline = performance.now() + PROPAGATION_TIMEOUT_MS;
-      let aBalance = getBalance(sphereA, TEST_COIN.symbol);
+      let aBalance = await workerBalance(workerA, TEST_COIN.symbol, REQUEST_TIMEOUT_MS);
       while (aBalance.total < FAUCET_AMOUNT_RAW && performance.now() < aDeadline) {
-        try { await sphereA.payments.receive(); } catch { /* receive() may not be supported */ }
+        try { await workerReceive(workerA, REQUEST_TIMEOUT_MS); } catch { /* best-effort */ }
         await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-        aBalance = getBalance(sphereA, TEST_COIN.symbol);
+        aBalance = await workerBalance(workerA, TEST_COIN.symbol, REQUEST_TIMEOUT_MS);
       }
       expect(aBalance.total).toBeGreaterThanOrEqual(FAUCET_AMOUNT_RAW);
       console.log(`  A: received ${aBalance.total} ${TEST_COIN.symbol} (${aBalance.tokens} tokens)`);
@@ -247,7 +414,7 @@ describe.skipIf(SKIP_INFRA)('Profile Live Concurrent Sync E2E', () => {
       // CAR + the signed pointer is written to the aggregator. Without
       // this, A's state lives only locally; B has nothing to pull.
       console.log('  A: flushing to Profile (IPFS CAR + aggregator pointer)...');
-      const aSync = await sphereA.payments.sync();
+      const aSync = await workerSync(workerA, REQUEST_TIMEOUT_MS);
       console.log(`  A: sync done — added=${aSync.added}, removed=${aSync.removed}`);
 
       // B: poll via explicit sync(), which drives the aggregator-
@@ -259,12 +426,12 @@ describe.skipIf(SKIP_INFRA)('Profile Live Concurrent Sync E2E', () => {
       // through Profile (not Nostr DM).
       console.log('  B: polling via aggregator-pointer + IPFS CAR (Profile sync)...');
       const bDeadline = performance.now() + PROPAGATION_TIMEOUT_MS;
-      let bBalance = getBalance(sphereB, TEST_COIN.symbol);
+      let bBalance = await workerBalance(workerB, TEST_COIN.symbol, REQUEST_TIMEOUT_MS);
       while (bBalance.total < FAUCET_AMOUNT_RAW && performance.now() < bDeadline) {
-        try { await sphereB.payments.sync(); } catch (err) {
+        try { await workerSync(workerB, REQUEST_TIMEOUT_MS); } catch (err) {
           console.log(`  B: sync() attempt failed: ${err instanceof Error ? err.message : err}`);
         }
-        bBalance = getBalance(sphereB, TEST_COIN.symbol);
+        bBalance = await workerBalance(workerB, TEST_COIN.symbol, REQUEST_TIMEOUT_MS);
         if (bBalance.total >= FAUCET_AMOUNT_RAW) break;
         await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
       }
