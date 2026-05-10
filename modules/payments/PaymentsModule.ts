@@ -4372,12 +4372,43 @@ export class PaymentsModule {
   }
 
   /**
-   * Get the current (first) nametag data.
+   * Get the active nametag data — the one matching the current identity's
+   * `nametag` claim (the name advertised on Nostr). Falls back to
+   * `nametags[0]` if the identity claim is unset or doesn't match any
+   * stored entry.
    *
-   * @returns The nametag data, or `null` if no nametag is set.
+   * Why this preference: the wallet's local `nametags` array CAN contain
+   * multiple entries (multi-nametag scenarios, or a legacy entry left over
+   * from a buggy `registerNametag` flow that minted A then re-registered
+   * to claim B). Finalize and PROXY-bundle code paths must use the
+   * nametag token whose name matches what Nostr says, otherwise inbound
+   * transfers to `@B` (computed from `TokenId.fromNameTag('B')`) will be
+   * rejected because the wallet derives the expected PROXY from the
+   * `[0]` entry's tokenId (a different name).
+   *
+   * @returns The active nametag data, or `null` if no nametag is set.
    */
   getNametag(): NametagData | null {
+    const claimedName = this.deps?.identity.nametag;
+    if (claimedName) {
+      const match = this.nametags.find((n) => n.name === claimedName);
+      if (match) return match;
+    }
     return this.nametags[0] ?? null;
+  }
+
+  /**
+   * Look up a stored nametag entry by exact name. Returns `null` if the
+   * wallet hasn't minted (or hasn't loaded a token for) this name.
+   *
+   * Used by `Sphere.registerNametag` to detect the "mint already done for
+   * THIS specific name" idempotency case (vs. "some OTHER nametag is
+   * minted") so the consistency guard fires correctly.
+   *
+   * @param name - Normalized nametag name (e.g. result of `normalizeNametag`).
+   */
+  getNametagByName(name: string): NametagData | null {
+    return this.nametags.find((n) => n.name === name) ?? null;
   }
 
   /**
@@ -4390,12 +4421,27 @@ export class PaymentsModule {
   }
 
   /**
-   * Check whether a nametag is currently set.
+   * Check whether ANY nametag is currently set.
+   *
+   * Prefer {@link hasNametagNamed} when the caller cares about a specific
+   * name (e.g. the `registerNametag` consistency guard) — `hasNametag()`
+   * alone returns true for any stored entry regardless of name, which was
+   * the source of the alice-vs-alice-t1 Nostr-vs-on-chain inconsistency
+   * bug.
    *
    * @returns `true` if nametag data is present.
    */
   hasNametag(): boolean {
     return this.nametags.length > 0;
+  }
+
+  /**
+   * Check whether a nametag with this exact name is stored.
+   *
+   * @param name - Normalized nametag name.
+   */
+  hasNametagNamed(name: string): boolean {
+    return this.nametags.some((n) => n.name === name);
   }
 
   /**
