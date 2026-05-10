@@ -3618,13 +3618,15 @@ export class Sphere {
             );
           }
         }
+        const restoredSuffix = mintedFresh
+          ? ` The orphan local nametag entry from THIS attempt has been rolled back.`
+          : ``;
         throw new SphereError(
           `Cannot claim Unicity ID "@${cleanNametag}" on the relay — the binding ` +
           `event was rejected. Most commonly this means another wallet already ` +
           `owns "@${cleanNametag}" on this relay (the relay enforces uniqueness ` +
-          `independently of the aggregator). The wallet's local state has been ` +
-          `restored — re-init with a different --nametag or contact relay ops if ` +
-          `you expected to own this name.`,
+          `independently of the aggregator).${restoredSuffix} Retry with a ` +
+          `different --nametag, or contact relay ops if you expected to own this name.`,
           'NAMETAG_TAKEN',
         );
       }

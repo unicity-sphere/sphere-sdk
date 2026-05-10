@@ -583,6 +583,10 @@ describe('Sphere.registerNametag() failure-mode error split + rollback (Bug B+C)
 
     await expect(sphere.registerNametag('alice')).rejects.toMatchObject({
       code: 'NAMETAG_TAKEN',
+      // Error message MUST NOT claim rollback occurred — nothing was
+      // disturbed on this code path. The "orphan rolled back" wording
+      // is conditional on mintedFresh.
+      message: expect.not.stringMatching(/orphan local nametag entry .* has been rolled back/),
     });
 
     // The pre-existing alice entry MUST still be there — rollback only
@@ -591,6 +595,32 @@ describe('Sphere.registerNametag() failure-mode error split + rollback (Bug B+C)
     expect(payments.hasNametagNamed('alice')).toBe(true);
     // Mint mock was NOT called (idempotent skip).
     expect(mintSpy).not.toHaveBeenCalled();
+
+    await sphere.destroy();
+  });
+
+  it('error message: mintedFresh failure surfaces "rolled back" language', async () => {
+    const transport = createMockTransport();
+    const oracle = createMockOracle();
+
+    const { sphere } = await Sphere.init({
+      storage,
+      transport,
+      oracle,
+      tokenStorage,
+      autoGenerate: true,
+    });
+
+    mintSpy = installMintMock(sphere, { success: true });
+    (transport.publishIdentityBinding as ReturnType<typeof vi.fn>).mockResolvedValue(false);
+
+    // No pre-seed: this call mints from scratch, so mintedFresh=true and
+    // the rollback path fires. Error message should explicitly tell the
+    // operator that local state was restored.
+    await expect(sphere.registerNametag('fresh')).rejects.toMatchObject({
+      code: 'NAMETAG_TAKEN',
+      message: expect.stringMatching(/orphan local nametag entry .* has been rolled back/),
+    });
 
     await sphere.destroy();
   });
