@@ -97,7 +97,14 @@ export interface GatewayHealthResult {
 // Configuration Types
 // =============================================================================
 
-/** IPFS storage provider configuration */
+/**
+ * IPFS storage provider configuration.
+ *
+ * @deprecated The {@link IpfsStorageProvider} class this configures is
+ * deprecated in favor of the Profile token-storage path (OrbitDB +
+ * aggregator pointer + IPFS CAR pin/fetch). See `profile/factory.ts`
+ * and `IpfsStorageProvider`'s JSDoc for the migration rationale.
+ */
 export interface IpfsStorageConfig {
   /** Gateway URLs for HTTP API (defaults to Unicity dedicated nodes) */
   gateways?: string[];

@@ -79,10 +79,16 @@ export type OracleConfig = BaseOracleConfig;
 // =============================================================================
 
 /**
- * IPFS sync backend configuration
+ * IPFS sync backend configuration.
+ *
+ * @deprecated The IPNS-based mutable-pointer flow this config opts into
+ * is superseded by the Profile token-storage path (OrbitDB + aggregator
+ * pointer + IPFS CAR). See `createBrowserProfileProviders` and the
+ * `IpfsStorageProvider` JSDoc. This config remains functional for
+ * backward compatibility.
  */
 export interface IpfsSyncConfig {
-  /** Enable IPFS sync (default: false) */
+  /** Enable IPFS sync (default: false). @deprecated — see {@link IpfsSyncConfig}. */
   enabled?: boolean;
   /** Replace default gateways entirely */
   gateways?: string[];

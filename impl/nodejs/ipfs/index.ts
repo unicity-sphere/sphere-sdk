@@ -19,6 +19,12 @@ export type { IpfsStorageConfig as IpfsStorageProviderConfig } from '../../share
  *
  * @param config - IPFS storage configuration
  * @param storageProvider - StorageProvider for persisting state (e.g., FileStorageProvider)
+ *
+ * @deprecated Use `createNodeProfileProviders` (Profile + aggregator pointer)
+ *   instead. The IPNS-based mutable-pointer flow this factory wires up is
+ *   superseded by the aggregator pointer layer, which handles cross-device
+ *   pointer resolution over HTTP without IPNS DHT propagation. See
+ *   `IpfsStorageProvider` JSDoc for the migration rationale.
  */
 export function createNodeIpfsStorageProvider(
   config?: IpfsStorageConfig,
