@@ -8,6 +8,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { ProfileDatabase, OrbitDbConfig } from '../../../profile/types';
+import { OrbitDbAdapter } from '../../../profile/orbitdb-adapter';
 
 // ---------------------------------------------------------------------------
 // Mock ProfileDatabase (in-memory Map-based implementation)
@@ -196,5 +197,103 @@ describe('ProfileDatabase mock (interface contract)', () => {
 
   it('isConnected returns false before connect', () => {
     expect(db.isConnected()).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// close() teardown budget (#137)
+//
+// libp2p / gossipsub teardown can hang indefinitely under load (and during
+// e2e cleanup the hang propagated up through Sphere.destroy()). Each step
+// of OrbitDbAdapter.close() now has a 10s budget — on timeout we drop the
+// reference and continue rather than awaiting forever.
+// ---------------------------------------------------------------------------
+
+describe('OrbitDbAdapter.close() teardown budget', () => {
+  const STEP_BUDGET_MS = 10_000;
+
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  function newConnectedAdapter(): {
+    adapter: OrbitDbAdapter;
+    handles: { db: { close: ReturnType<typeof vi.fn> }; orbitdb: { stop: ReturnType<typeof vi.fn> }; helia: { stop: ReturnType<typeof vi.fn> } };
+  } {
+    const adapter = new OrbitDbAdapter();
+    const handles = {
+      db: { close: vi.fn(() => new Promise<void>(() => { /* never resolves */ })) },
+      orbitdb: { stop: vi.fn().mockResolvedValue(undefined) },
+      helia: { stop: vi.fn().mockResolvedValue(undefined) },
+    };
+    const internal = adapter as unknown as {
+      connected: boolean;
+      db: unknown;
+      orbitdb: unknown;
+      helia: unknown;
+    };
+    internal.connected = true;
+    internal.db = handles.db;
+    internal.orbitdb = handles.orbitdb;
+    internal.helia = handles.helia;
+    return { adapter, handles };
+  }
+
+  it('returns within budget when db.close() hangs', async () => {
+    const { adapter, handles } = newConnectedAdapter();
+
+    const closePromise = adapter.close();
+    // Advance fake clock past the 10s budget so the race resolves.
+    await vi.advanceTimersByTimeAsync(STEP_BUDGET_MS + 100);
+    await closePromise;
+
+    expect(handles.db.close).toHaveBeenCalled();
+    // Subsequent steps still run after the timeout fires.
+    expect(handles.orbitdb.stop).toHaveBeenCalled();
+    expect(handles.helia.stop).toHaveBeenCalled();
+    expect(adapter.isConnected()).toBe(false);
+  });
+
+  it('proceeds when orbitdb.stop() hangs', async () => {
+    const { adapter, handles } = newConnectedAdapter();
+    handles.db.close.mockResolvedValue(undefined as never);
+    handles.orbitdb.stop.mockImplementation(() => new Promise<void>(() => { /* hang */ }));
+
+    const closePromise = adapter.close();
+    await vi.advanceTimersByTimeAsync(STEP_BUDGET_MS + 100);
+    await closePromise;
+
+    expect(handles.helia.stop).toHaveBeenCalled();
+    expect(adapter.isConnected()).toBe(false);
+  });
+
+  it('proceeds when helia.stop() hangs', async () => {
+    const { adapter, handles } = newConnectedAdapter();
+    handles.db.close.mockResolvedValue(undefined as never);
+    handles.orbitdb.stop.mockResolvedValue(undefined as never);
+    handles.helia.stop.mockImplementation(() => new Promise<void>(() => { /* hang */ }));
+
+    const closePromise = adapter.close();
+    await vi.advanceTimersByTimeAsync(STEP_BUDGET_MS + 100);
+    await closePromise;
+
+    expect(adapter.isConnected()).toBe(false);
+  });
+
+  it('fast-path: all steps resolve immediately', async () => {
+    const { adapter, handles } = newConnectedAdapter();
+    handles.db.close.mockResolvedValue(undefined as never);
+
+    await adapter.close();
+
+    expect(handles.db.close).toHaveBeenCalled();
+    expect(handles.orbitdb.stop).toHaveBeenCalled();
+    expect(handles.helia.stop).toHaveBeenCalled();
+    expect(adapter.isConnected()).toBe(false);
   });
 });
