@@ -23,6 +23,15 @@
 
 import { describe, expect, it, vi } from 'vitest';
 
+// Stub out the SDK's waitInclusionProof so the unit tests don't poll
+// a real aggregator. The new submitCommitmentsImmediate (Loop4 e2e
+// fix) awaits the recipient mint proof to populate the UXF genesis
+// `inclusionProof`. We mock it to return a sentinel proof object;
+// commitment.toTransaction is stubbed on the per-test mock commitments.
+vi.mock('@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils', () => ({
+  waitInclusionProof: vi.fn().mockResolvedValue({ __mockProof: true }),
+}));
+
 import { InstantSplitExecutor } from '../../../modules/payments/InstantSplitExecutor';
 import { isSphereError } from '../../../core/errors';
 
@@ -34,9 +43,22 @@ function makeExecutor(client: any): InstantSplitExecutor {
   });
 }
 
-const fakeSenderMint = { __label: 'senderMint' } as any;
-const fakeRecipientMint = { __label: 'recipientMint' } as any;
-const fakeTransfer = { __label: 'transfer' } as any;
+// Commit mocks now need `toTransaction(proof)` because the
+// submitCommitmentsImmediate flow awaits the recipient mint proof
+// and serializes the proven transaction for the UXF bundle's genesis
+// (Loop4 e2e fix). For unit-level coverage of the SUBMIT logic, we
+// stub it to return a JSON-serializable placeholder.
+const makeMintCommitment = (label: string): unknown => ({
+  __label: label,
+  toTransaction: vi.fn().mockReturnValue({
+    toJSON: () => ({ data: { __label: label }, inclusionProof: { __mock: true } }),
+  }),
+});
+const makeTransferCommitment = (label: string): unknown => ({ __label: label });
+
+const fakeSenderMint = makeMintCommitment('senderMint') as any;
+const fakeRecipientMint = makeMintCommitment('recipientMint') as any;
+const fakeTransfer = makeTransferCommitment('transfer') as any;
 
 describe('InstantSplitExecutor.submitCommitmentsImmediate — serial ordering', () => {
   it('submits in order: senderMint → recipientMint → transfer', async () => {
@@ -62,19 +84,27 @@ describe('InstantSplitExecutor.submitCommitmentsImmediate — serial ordering', 
     expect(calls).toEqual(['senderMint', 'recipientMint', 'transfer']);
   });
 
-  it('completes without throwing when all three return SUCCESS', async () => {
+  it('completes with proven genesis when all three return SUCCESS', async () => {
     const client = {
       submitMintCommitment: vi.fn().mockResolvedValue({ status: 'SUCCESS' }),
       submitTransferCommitment: vi.fn().mockResolvedValue({ status: 'SUCCESS' }),
     };
     const executor = makeExecutor(client);
-    await expect(
-      (executor as any).submitCommitmentsImmediate(
-        fakeSenderMint,
-        fakeRecipientMint,
-        fakeTransfer,
-      ),
-    ).resolves.toBeUndefined();
+    const result = await (executor as any).submitCommitmentsImmediate(
+      fakeSenderMint,
+      fakeRecipientMint,
+      fakeTransfer,
+    );
+    // Loop4 e2e fix — submitCommitmentsImmediate now returns the
+    // proven recipient genesis JSON for the UXF dispatcher to use as
+    // `recipientTokenJson.genesis`.
+    expect(result).toMatchObject({
+      recipientMintProvenGenesisJson: {
+        data: { __label: 'recipientMint' },
+        inclusionProof: { __mock: true },
+      },
+    });
+    expect(fakeRecipientMint.toTransaction).toHaveBeenCalledWith({ __mockProof: true });
   });
 
   it('accepts REQUEST_ID_EXISTS as a non-failure status (idempotent retry)', async () => {
@@ -83,13 +113,14 @@ describe('InstantSplitExecutor.submitCommitmentsImmediate — serial ordering', 
       submitTransferCommitment: vi.fn().mockResolvedValue({ status: 'REQUEST_ID_EXISTS' }),
     };
     const executor = makeExecutor(client);
-    await expect(
-      (executor as any).submitCommitmentsImmediate(
-        fakeSenderMint,
-        fakeRecipientMint,
-        fakeTransfer,
-      ),
-    ).resolves.toBeUndefined();
+    const result = await (executor as any).submitCommitmentsImmediate(
+      fakeSenderMint,
+      fakeRecipientMint,
+      fakeTransfer,
+    );
+    expect(result).toMatchObject({
+      recipientMintProvenGenesisJson: expect.any(Object),
+    });
   });
 });
 

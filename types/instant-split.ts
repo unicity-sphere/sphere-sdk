@@ -537,17 +537,37 @@ export interface BuildSplitBundleResult {
 
   /**
    * Submit the sender mint, recipient mint, and transfer commitments
-   * to the aggregator and await each submit response. Does NOT wait
-   * for inclusion proofs — that work happens in
-   * {@link awaitChangeTokenWithProofs}. Throws SphereError if any
-   * submission fails (status not SUCCESS/REQUEST_ID_EXISTS).
+   * to the aggregator, await the recipient mint inclusion proof,
+   * and return the proven recipient genesis JSON ready for ingestion
+   * as a UXF token genesis. Throws SphereError if any submission
+   * fails (status not SUCCESS/REQUEST_ID_EXISTS) or the proof wait
+   * fails.
+   *
+   * **Why we wait for the recipient mint proof here** (Loop4 e2e fix):
+   * the UXF bundle format requires every token's genesis to carry a
+   * proven `inclusionProof`. Without this wait, `pkg.ingestAll`
+   * throws on the sender side because `deconstructInclusionProof`
+   * can't handle a null inclusionProof on the Genesis shape.
+   *
+   * The change-token recovery (waiting for the SENDER mint proof
+   * and minting the local change token) remains in
+   * {@link awaitChangeTokenWithProofs} so it can run fire-and-forget
+   * post-transport.
    *
    * Optional — set only when buildSplitBundle is invoked with
    * `skipBackground: true`. Legacy V6 callers (PaymentsModule
    * line ~3683) leave this undefined and rely on the
    * `startBackground()` path that submits in the background.
    */
-  readonly submitCommitmentsImmediate?: () => Promise<void>;
+  readonly submitCommitmentsImmediate?: () => Promise<{
+    /**
+     * JSON form of the PROVEN recipient mint transaction —
+     * `{data, inclusionProof}`. Replaces the previous
+     * `recipientMintDataJson` (data-only) shape because the UXF
+     * format requires a non-null `inclusionProof` on every Genesis.
+     */
+    readonly recipientMintProvenGenesisJson: unknown;
+  }>;
 
   /**
    * After submitCommitmentsImmediate, wait for the sender's mint

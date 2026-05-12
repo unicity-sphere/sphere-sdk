@@ -9210,9 +9210,12 @@ export class PaymentsModule {
               }
 
               // Submit the three commitments (sender mint → recipient
-              // mint → transfer; serial per Loop1-S3) to the aggregator.
-              // Fails on any non-SUCCESS — but the burn is already
-              // anchored, so the source is gone regardless.
+              // mint → transfer; serial per Loop1-S3) to the aggregator
+              // AND wait for the recipient mint inclusion proof (Loop4
+              // e2e fix — UXF format requires genesis.inclusionProof
+              // to be non-null). Fails on any non-SUCCESS — but the
+              // burn is already anchored, so the source is gone
+              // regardless.
               if (splitResult.submitCommitmentsImmediate === undefined) {
                 throw new SphereError(
                   'InstantSplitExecutor.buildSplitBundle did not expose submitCommitmentsImmediate ' +
@@ -9220,18 +9223,22 @@ export class PaymentsModule {
                   'INVALID_CONFIG',
                 );
               }
-              await splitResult.submitCommitmentsImmediate();
+              const { recipientMintProvenGenesisJson } = await splitResult.submitCommitmentsImmediate();
 
-              // Assemble recipient SDK Token JSON (genesis = recipient
-              // mint with null proof; state = minted state; one transfer
-              // tx with null proof). The recipient's chain-walker will
-              // resolve both proofs against the aggregator.
+              // Assemble recipient SDK Token JSON. The genesis is the
+              // proven recipient mint transaction (with inclusionProof)
+              // — required by the UXF format. The transfer transaction
+              // ships with `inclusionProof: null`; the recipient's
+              // chain-walker resolves it against the aggregator after
+              // the transfer commit's proof lands.
+              //
+              // `recipientMintProvenGenesisJson` is already the
+              // `{data, inclusionProof}` shape from
+              // `TransferTransaction.toJSON()` — splatted directly into
+              // the genesis slot.
               const recipientTokenJson = {
                 version: '2.0',
-                genesis: {
-                  data: splitResult.recipientMintDataJson,
-                  inclusionProof: null,
-                },
+                genesis: recipientMintProvenGenesisJson,
                 state: splitResult.recipientMintedStateJson,
                 transactions: [
                   {

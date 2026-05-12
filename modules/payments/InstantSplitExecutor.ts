@@ -391,8 +391,21 @@ export class InstantSplitExecutor {
 
   /**
    * #142 — UXF instant-split wiring. Submits the sender mint, recipient
-   * mint, and transfer commitments to the aggregator and awaits each
-   * submit response. Does NOT wait for inclusion proofs.
+   * mint, and transfer commitments to the aggregator, AWAITS the
+   * recipient mint inclusion proof, and returns the proven recipient
+   * mint transaction JSON ready for ingestion as a UXF token genesis.
+   *
+   * **Why we wait for the recipient mint proof here** (Loop4 e2e fix):
+   * the UXF bundle format requires every token's genesis to carry a
+   * proven `inclusionProof` (see uxf/deconstruct.ts:79 —
+   * `GenesisShape.inclusionProof: InclusionProofShape` is non-nullable).
+   * Without the proof the sender's `pkg.ingestAll` throws
+   * `Cannot read properties of null (reading 'authenticator')` when
+   * deconstructing the recipient JSON's genesis. The latency cost is
+   * ~one extra aggregator round-trip (~2s typical), bringing the
+   * instant-split critical path from ~2.3s to ~4.3s — still well
+   * inside the "instant" mode envelope and far below the conservative
+   * mode's ~8s+ floor.
    *
    * **Ordering matters (Loop1-S3 steelman fix).** Submissions are
    * SERIAL, not parallel, and ordered to maximize the user's recovery
@@ -420,14 +433,13 @@ export class InstantSplitExecutor {
    *                            (manual reassignment); change token
    *                            still recoverable via step 1.
    *
-   * The previous Promise.all() implementation would submit all three
-   * in parallel — any partial success on steps 2 or 3 with step 1
-   * failure left orphan recipient-side commitments AND lost the
-   * change-token recovery anchor. Serialization eliminates that worst
-   * case.
+   *   4. Wait for recipient mint inclusion proof. Required by the UXF
+   *                            format to populate the genesis
+   *                            inclusionProof field.
    *
-   * Latency cost: ~3× a single submission round-trip (~150ms vs ~50ms
-   * for the parallel form). Acceptable trade for the recovery property.
+   * @returns object with `recipientMintProvenGenesisJson` — the JSON
+   *          of the proven recipient mint transaction `{data, inclusionProof}`.
+   *          The dispatcher uses this as `recipientTokenJson.genesis`.
    *
    * @internal
    */
@@ -435,7 +447,7 @@ export class InstantSplitExecutor {
     senderMintCommitment: MintCommitment<any>,
     recipientMintCommitment: MintCommitment<any>,
     transferCommitment: TransferCommitment,
-  ): Promise<void> {
+  ): Promise<{ recipientMintProvenGenesisJson: unknown }> {
     logger.debug('InstantSplit', 'submitCommitmentsImmediate: serial submit (senderMint → recipientMint → transfer)');
 
     const submitOne = async (
@@ -469,7 +481,33 @@ export class InstantSplitExecutor {
     await submitOne('recipientMint', () => this.client.submitMintCommitment(recipientMintCommitment));
     await submitOne('transfer', () => this.client.submitTransferCommitment(transferCommitment));
 
-    logger.debug('InstantSplit', 'submitCommitmentsImmediate: all three commitments anchored');
+    logger.debug('InstantSplit', 'submitCommitmentsImmediate: all three commitments anchored; awaiting recipient mint proof');
+
+    // Loop4-e2e — UXF format requires the recipient genesis to be
+    // proven. Without this wait, `pkg.ingestAll` throws on the
+    // sender side because deconstructInclusionProof can't handle a
+    // null inclusionProof on a Genesis shape.
+    let recipientMintProof: unknown;
+    try {
+      recipientMintProof = this.devMode
+        ? await this.waitInclusionProofWithDevBypass(recipientMintCommitment)
+        : await waitInclusionProof(this.trustBase, this.client, recipientMintCommitment);
+    } catch (err) {
+      const raw = err instanceof Error ? err.message : String(err);
+      const msg = raw.replace(/[\r\n\t\0]/g, ' ').slice(0, 200);
+      throw new SphereError(
+        `submitCommitmentsImmediate: recipient mint proof wait failed: ${msg}`,
+        'TRANSFER_FAILED',
+        err,
+      );
+    }
+
+    // Reconstruct the proven recipient mint transaction and serialize
+    // for the UXF bundle's genesis.
+    const recipientMintTransaction = recipientMintCommitment.toTransaction(recipientMintProof as any);
+    const recipientMintProvenGenesisJson = recipientMintTransaction.toJSON();
+    logger.debug('InstantSplit', 'submitCommitmentsImmediate: recipient mint proof anchored, genesis ready');
+    return { recipientMintProvenGenesisJson };
   }
 
   /**
