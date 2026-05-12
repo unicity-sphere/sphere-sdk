@@ -7254,10 +7254,8 @@ export class PaymentsModule {
       let totalAdded = 0;
       let totalRemoved = 0;
 
-      // Preserve nametags — sync providers may not include _nametags in merged data
-      const savedNametags = [...this.nametags];
-
-      // Sync with each provider
+      // Sync with each provider. Nametag preservation when merged data
+      // omits `_nametags` is handled inside `loadFromStorageData` (#136).
       for (const [providerId, provider] of providers) {
         try {
           const result = await provider.sync(localData);
@@ -7316,11 +7314,6 @@ export class PaymentsModule {
             }
             if (restoredCount > 0) {
               logger.debug('Payments', `Sync: restored ${restoredCount} token(s) lost by loadFromStorageData`);
-            }
-
-            // Restore nametags if sync wiped them
-            if (this.nametags.length === 0 && savedNametags.length > 0) {
-              this.nametags = savedNametags;
             }
 
             // Rebuild parsedTokenCache for spend queue (loadFromStorageData bypasses addToken)
@@ -9759,7 +9752,20 @@ export class PaymentsModule {
     // Load other data
     this.archivedTokens = parsed.archivedTokens;
     this.forkedTokens = parsed.forkedTokens;
-    this.nametags = parsed.nametags;
+
+    // Nametag preservation guard (#136). Some sync providers strip
+    // `_nametags` from merged data — overriding would transiently empty
+    // `this.nametags` and any concurrent `finalizeTransferToken` would
+    // throw "no Unicity ID token". Only override when the incoming data
+    // actually carries nametag information. An explicit `_nametags: []`
+    // (or legacy `_nametag`) from a different device still clears, as
+    // expected.
+    const rawData = data as unknown as Record<string, unknown>;
+    const incomingHasNametags =
+      Array.isArray(rawData._nametags) || rawData._nametag != null;
+    if (incomingHasNametags || this.nametags.length === 0) {
+      this.nametags = parsed.nametags;
+    }
   }
 
   // ===========================================================================
