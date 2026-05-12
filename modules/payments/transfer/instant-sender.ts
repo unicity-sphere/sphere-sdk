@@ -93,6 +93,7 @@ import {
   MAX_INLINE_CAR_BYTES,
   RELAY_SAFE_CAP_BYTES,
 } from './limits';
+import { enforceOverTransferGuard } from './over-transfer-guard';
 import { validateTargets, type ValidatedTargets } from './target-validator';
 
 // =============================================================================
@@ -573,96 +574,6 @@ async function acquireSourceLocks(
       release();
     }
   };
-}
-
-/**
- * #142 — OVER_TRANSFER_GUARD assertion. Runs after the commitSources
- * callback returns, before the bundle is packaged for transport. Walks
- * each result's `recipientTokenJson.genesis.data.coinData` and sums the
- * fungible amounts per coinId; rejects if any coin's shipped sum
- * exceeds the request's per-coin total.
- *
- * Why this exists: a buggy commitSources callback may produce a whole-
- * token (direct) transfer for a source that should have been split.
- * The recipient receives more than the requester intended. The on-chain
- * commit is already submitted by the time this runs — too late to
- * un-commit — but throwing here prevents the wire bundle from shipping
- * and surfaces the violation as `transfer:failed` rather than a silent
- * over-send.
- *
- * Skipped for `tokenClass: 'nft'` (no fungible amount). Coin entries
- * with malformed/absent `genesis.data.coinData` are conservatively
- * skipped (the verifier elsewhere catches structural breaks).
- *
- * @internal
- */
-function enforceOverTransferGuard(
-  request: TransferRequest,
-  commitResults: ReadonlyArray<InstantCommitResult>,
-): void {
-  const requested = new Map<string, bigint>();
-  if (
-    typeof request.coinId === 'string' &&
-    request.coinId.length > 0 &&
-    typeof request.amount === 'string' &&
-    request.amount.length > 0
-  ) {
-    try {
-      requested.set(request.coinId, BigInt(request.amount));
-    } catch {
-      // Non-numeric primary amount — leave unset; the guard simply
-      // becomes a "no positive budget on this coin" check below.
-    }
-  }
-  for (const asset of request.additionalAssets ?? []) {
-    if (asset.kind !== 'coin') continue;
-    try {
-      const delta = BigInt(asset.amount);
-      requested.set(asset.coinId, (requested.get(asset.coinId) ?? 0n) + delta);
-    } catch {
-      // Skip — same rationale as above.
-    }
-  }
-
-  const shipped = new Map<string, bigint>();
-  for (const r of commitResults) {
-    if (r.tokenClass !== 'coin') continue;
-    const json = r.recipientTokenJson as
-      | {
-          readonly genesis?: {
-            readonly data?: {
-              readonly coinData?: ReadonlyArray<readonly [string, string]>;
-            };
-          };
-        }
-      | null
-      | undefined;
-    const coinData = json?.genesis?.data?.coinData;
-    if (!Array.isArray(coinData)) continue;
-    for (const entry of coinData) {
-      if (!Array.isArray(entry) || entry.length !== 2) continue;
-      const [cid, amt] = entry;
-      if (typeof cid !== 'string' || typeof amt !== 'string') continue;
-      try {
-        shipped.set(cid, (shipped.get(cid) ?? 0n) + BigInt(amt));
-      } catch {
-        // Malformed amount — skip this entry.
-      }
-    }
-  }
-
-  for (const [cid, sentAmount] of shipped) {
-    const budget = requested.get(cid) ?? 0n;
-    if (sentAmount > budget) {
-      throw new SphereError(
-        `sendInstantUxf: OVER_TRANSFER_GUARD — would ship ${sentAmount.toString()} of ` +
-          `coinId=${cid} but request budget is ${budget.toString()}. ` +
-          'Refusing to publish bundle. The on-chain commit(s) are already ' +
-          'submitted; the recipient will not receive the bundle.',
-        'OVER_TRANSFER_GUARD',
-      );
-    }
-  }
 }
 
 /**

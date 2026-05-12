@@ -149,7 +149,20 @@ export class InstantSplitExecutor {
     logger.debug('InstantSplit', `Building V5 bundle for token ${tokenIdHex.slice(0, 8)}...`);
 
     const coinId = new CoinId(fromHex(coinIdHex));
-    const seedString = `${tokenIdHex}_${splitAmount.toString()}_${remainderAmount.toString()}_${Date.now()}`;
+    // Loop1-S12 — replace Date.now() with a 32-byte cryptographic
+    // nonce. The previous millisecond-resolution Date.now() let a
+    // recipient who knows tokenIdHex brute-force the send time over a
+    // narrow window to derive senderSalt = sha256(seedString +
+    // '_sender_salt') — enabling wallet-graph correlation of the
+    // sender's change tokens across subsequent transfers. The
+    // recipient already learns tokenIdHex from receive flows (it's the
+    // source's public id), so this is reachable. A 32-byte nonce
+    // raises the brute-force cost beyond practical bounds while
+    // keeping all subsequent salt derivations deterministic-from-seed.
+    const nonceBytes = new Uint8Array(32);
+    crypto.getRandomValues(nonceBytes);
+    const nonceHex = toHex(nonceBytes);
+    const seedString = `${tokenIdHex}_${splitAmount.toString()}_${remainderAmount.toString()}_${nonceHex}`;
 
     // Generate IDs and salts (deterministic from seed)
     const recipientTokenId = new TokenId(await sha256(seedString));
@@ -300,13 +313,21 @@ export class InstantSplitExecutor {
       requestId?: unknown;
     };
     const transferTxDataJson = transferCommitmentJson.transactionData;
-    const transferRequestIdBytes = transferCommitment.requestId;
-    const transferRequestIdHex =
-      transferRequestIdBytes instanceof Uint8Array
-        ? toHex(transferRequestIdBytes)
-        : typeof (transferRequestIdBytes as { toJSON?: () => string })?.toJSON === 'function'
-          ? (transferRequestIdBytes as { toJSON: () => string }).toJSON()
-          : String(transferRequestIdBytes);
+
+    // Loop1-S11 — tighten extraction. `RequestId` extends `DataHash`
+    // whose `toJSON()` returns the imprint hex string. The previous
+    // `String(requestId)` fallback would ship "[object Object]" if
+    // the SDK shape ever changes — silently breaking downstream
+    // outbox/finalization joins. Validate hex shape; fail loud on
+    // regression.
+    const transferRequestIdHexRaw = (transferCommitment.requestId as { toJSON?: () => string })?.toJSON?.();
+    if (typeof transferRequestIdHexRaw !== 'string' || !/^[0-9a-f]+$/i.test(transferRequestIdHexRaw)) {
+      throw new SphereError(
+        `InstantSplitExecutor.buildSplitBundle: transferCommitment.requestId.toJSON() returned non-hex (${typeof transferRequestIdHexRaw}); SDK shape regression?`,
+        'TRANSFER_FAILED',
+      );
+    }
+    const transferRequestIdHex = transferRequestIdHexRaw;
 
     return {
       bundle,
@@ -359,19 +380,44 @@ export class InstantSplitExecutor {
   }
 
   /**
-   * #142 — UXF instant-split wiring. Submits the sender mint,
-   * recipient mint, and transfer commitments to the aggregator and
-   * awaits each submit response. Does NOT wait for inclusion proofs.
+   * #142 — UXF instant-split wiring. Submits the sender mint, recipient
+   * mint, and transfer commitments to the aggregator and awaits each
+   * submit response. Does NOT wait for inclusion proofs.
    *
-   * Used by the UXF dispatcher to anchor commitments BEFORE shipping
-   * the recipient-bound bundle. Throws on any submission failure so
-   * the caller can abort with the sources still recoverable (mint
-   * commitments that landed are harmless; the dispatcher's
-   * removeToken will tombstone the source regardless).
+   * **Ordering matters (Loop1-S3 steelman fix).** Submissions are
+   * SERIAL, not parallel, and ordered to maximize the user's recovery
+   * surface on partial failure:
    *
-   * Latency: ~50ms parallel submission, dominated by network
-   * round-trip. Compare to submitBackgroundV5 which adds the ~2s mint
-   * proof wait — too slow for the UXF critical path.
+   *   1. Sender mint  — anchors the change token. If this lands and
+   *                     a later step fails, the user's residual is
+   *                     recoverable via `awaitChangeTokenWithProofs`.
+   *                     If this fails, NOTHING else is submitted —
+   *                     the user lost only the burn (source is gone),
+   *                     no orphan recipient-side commitments pollute
+   *                     the aggregator.
+   *
+   *   2. Recipient mint — mints the recipient slice at the sender's
+   *                       predicate. Required before the transfer
+   *                       commitment can reference it. If this fails,
+   *                       the change token is still recoverable via
+   *                       step 1.
+   *
+   *   3. Transfer commitment — moves the recipient slice from
+   *                            sender's predicate to recipient's
+   *                            address. If this fails, the recipient
+   *                            mint at the sender's predicate is
+   *                            recoverable as a sender-owned token
+   *                            (manual reassignment); change token
+   *                            still recoverable via step 1.
+   *
+   * The previous Promise.all() implementation would submit all three
+   * in parallel — any partial success on steps 2 or 3 with step 1
+   * failure left orphan recipient-side commitments AND lost the
+   * change-token recovery anchor. Serialization eliminates that worst
+   * case.
+   *
+   * Latency cost: ~3× a single submission round-trip (~150ms vs ~50ms
+   * for the parallel form). Acceptable trade for the recovery property.
    *
    * @internal
    */
@@ -380,45 +426,39 @@ export class InstantSplitExecutor {
     recipientMintCommitment: MintCommitment<any>,
     transferCommitment: TransferCommitment,
   ): Promise<void> {
-    logger.debug('InstantSplit', 'submitCommitmentsImmediate: submitting three commitments in parallel');
+    logger.debug('InstantSplit', 'submitCommitmentsImmediate: serial submit (senderMint → recipientMint → transfer)');
 
-    type SubmitOutcome =
-      | { kind: 'ok'; label: string; status: string }
-      | { kind: 'err'; label: string; status: 'ERROR'; error: unknown };
-
-    const labelled = (
+    const submitOne = async (
       label: string,
-      promise: Promise<{ status: string }>,
-    ): Promise<SubmitOutcome> =>
-      promise.then(
-        (res): SubmitOutcome => ({ kind: 'ok', label, status: res.status }),
-        (err): SubmitOutcome => ({ kind: 'err', label, status: 'ERROR', error: err }),
-      );
-
-    const results = await Promise.all([
-      labelled('senderMint', this.client.submitMintCommitment(senderMintCommitment)),
-      labelled('recipientMint', this.client.submitMintCommitment(recipientMintCommitment)),
-      labelled('transfer', this.client.submitTransferCommitment(transferCommitment)),
-    ]);
-
-    // Any non-success / non-already-exists status is fatal — the UXF
-    // bundle would ship referencing aggregator-unknown commitments.
-    for (const r of results) {
-      if (r.kind === 'err') {
-        const msg = r.error instanceof Error ? r.error.message : String(r.error);
+      submit: () => Promise<{ status: string }>,
+    ): Promise<void> => {
+      let res: { status: string };
+      try {
+        res = await submit();
+      } catch (err) {
+        // Sanitize the error message before interpolating into the
+        // outgoing SphereError — aggregator-supplied strings are not
+        // trusted (Loop1 sanitization gap).
+        const raw = err instanceof Error ? err.message : String(err);
+        const msg = raw.replace(/[\r\n\t\0]/g, ' ').slice(0, 200);
         throw new SphereError(
-          `submitCommitmentsImmediate: ${r.label} submission threw: ${msg}`,
+          `submitCommitmentsImmediate: ${label} submission threw: ${msg}`,
           'TRANSFER_FAILED',
-          r.error,
+          err,
         );
       }
-      if (r.status !== 'SUCCESS' && r.status !== 'REQUEST_ID_EXISTS') {
+      if (res.status !== 'SUCCESS' && res.status !== 'REQUEST_ID_EXISTS') {
         throw new SphereError(
-          `submitCommitmentsImmediate: ${r.label} submission rejected with status=${r.status}`,
+          `submitCommitmentsImmediate: ${label} submission rejected with status=${res.status}`,
           'TRANSFER_FAILED',
         );
       }
-    }
+    };
+
+    await submitOne('senderMint', () => this.client.submitMintCommitment(senderMintCommitment));
+    await submitOne('recipientMint', () => this.client.submitMintCommitment(recipientMintCommitment));
+    await submitOne('transfer', () => this.client.submitTransferCommitment(transferCommitment));
+
     logger.debug('InstantSplit', 'submitCommitmentsImmediate: all three commitments anchored');
   }
 

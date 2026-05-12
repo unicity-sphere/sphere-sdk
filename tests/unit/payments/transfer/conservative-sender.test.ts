@@ -570,7 +570,13 @@ describe('sendConservativeUxf — CAR-inline fallback when publishToIpfs absent'
     let caught: unknown;
     try {
       await sendConservativeUxf(
-        basicRequest({ delivery: { kind: 'auto' } }),
+        // Loop1-S6 — request budget must cover the summed shipped
+        // amount across all 120 sources (each ships 1_000_000 UCT)
+        // so the new OVER_TRANSFER_GUARD doesn't trip first. The
+        // test's purpose is to assert the IPFS_PUBLISHER_REQUIRED
+        // pre-flight; we set the request amount to the total
+        // shipped to keep the guard a no-op for this scenario.
+        basicRequest({ delivery: { kind: 'auto' }, amount: (1_000_000 * N).toString() }),
         makePeerInfo(),
         deps,
       );

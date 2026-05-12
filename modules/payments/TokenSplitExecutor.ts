@@ -33,6 +33,18 @@ export interface SplitResult {
   tokenForRecipient: any;
   tokenForSender: any;
   recipientTransferTx: any;
+  /**
+   * Hex-encoded `requestId` of the recipient-side transfer commitment.
+   * Captured from `transferCommitment.requestId.toJSON()` BEFORE
+   * `toTransaction()` is called, because `TransferTransaction` itself
+   * has no `requestId` field (only `data: TransferTransactionData` and
+   * `inclusionProof`). Without this, conservative-split callers cannot
+   * populate `ConservativeCommitResult.requestIdHex` — they would have
+   * to walk the `recipientTransferTx` looking for a field that does
+   * not exist and silently fall through to an empty string, breaking
+   * downstream finalization / outbox `outstandingRequestIds` joins.
+   */
+  recipientTransferRequestIdHex: string;
 }
 
 export interface TokenSplitExecutorConfig {
@@ -185,6 +197,19 @@ export class TokenSplitExecutor {
       this.signingService
     );
 
+    // Capture the recipient transfer commitment's requestId BEFORE
+    // `toTransaction()` collapses it into a Transaction (which has no
+    // requestId field). RequestId extends DataHash → toJSON() returns
+    // the imprint hex string. Validating via regex below catches any
+    // future SDK shape regression that returns a non-hex value.
+    const recipientTransferRequestIdHex = transferCommitment.requestId.toJSON();
+    if (typeof recipientTransferRequestIdHex !== 'string' || !/^[0-9a-f]+$/i.test(recipientTransferRequestIdHex)) {
+      throw new SphereError(
+        `TokenSplitExecutor: transferCommitment.requestId.toJSON() returned non-hex value (${typeof recipientTransferRequestIdHex}); SDK shape regression?`,
+        'TRANSFER_FAILED',
+      );
+    }
+
     const transferRes = await this.client.submitTransferCommitment(transferCommitment);
     if (transferRes.status !== 'SUCCESS' && transferRes.status !== 'REQUEST_ID_EXISTS') {
       throw new SphereError(`Transfer failed: ${transferRes.status}`, 'TRANSFER_FAILED');
@@ -199,6 +224,7 @@ export class TokenSplitExecutor {
       tokenForRecipient: recipientTokenBeforeTransfer,
       tokenForSender: senderToken,
       recipientTransferTx: transferTx,
+      recipientTransferRequestIdHex,
     };
   }
 }

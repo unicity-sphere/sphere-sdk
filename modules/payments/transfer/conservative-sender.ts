@@ -105,6 +105,7 @@ import { extractCarRootCid } from '../../../uxf/transfer-payload';
 import type { TokenLike } from './classify-token';
 import type { PublishToIpfsCallback } from './delivery-resolver';
 import { resolveDelivery } from './delivery-resolver';
+import { enforceOverTransferGuard } from './over-transfer-guard';
 import {
   MAX_INLINE_CAR_BYTES,
   RELAY_SAFE_CAP_BYTES,
@@ -694,6 +695,17 @@ export async function sendConservativeUxf(
         'TRANSFER_FAILED',
       );
     }
+
+    // Loop1-S6 — OVER_TRANSFER_GUARD. The same defense-in-depth that
+    // sendInstantUxf applies. A buggy commitSources that whole-token-
+    // transfers a source that should have been split silently
+    // over-sends — the wire bundle has more coin amount than the
+    // request asked for. The conservative path has the same risk
+    // class as the instant path (FIX 3 wires TokenSplitExecutor into
+    // dispatchUxfConservativeSend.commitSources; a regression here
+    // would not be caught without this guard). Throws fire-closed
+    // (Loop1-S5) on any structural break in coinData too.
+    enforceOverTransferGuard(request, commitResults);
 
     // Acceptance: deterministic bundle order — lex-ascending by tokenId.
     const orderedResults = sortByTokenIdAsc(commitResults);
