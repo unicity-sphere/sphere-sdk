@@ -4074,6 +4074,53 @@ export class Sphere {
       // Note: no need to re-publish here — callers follow up with
       // syncIdentityWithTransport() which will publish WITH the recovered nametag.
 
+      // Re-mint the on-chain nametag TOKEN. Without this, the wallet's
+      // identity claim (set above) advertises @recoveredNametag on Nostr,
+      // but `_payments.nametags` is empty — so the wallet has no
+      // `nametagToken.id` to derive the expected PROXY against, and every
+      // inbound PROXY-mode transfer fails `finalizeTransferToken` with
+      // "Cannot finalize PROXY transfer - no Unicity ID token".
+      //
+      // Recovery is one deterministic-salt mint call. The aggregator
+      // returns `REQUEST_ID_EXISTS` with the original inclusion proof
+      // (because the salt is `SHA256(this.signingKey || name)` — same
+      // wallet, same name → same commitment ID), and the wallet
+      // reconstructs the token locally. No extra round-trip beyond what
+      // a fresh mint would cost.
+      //
+      // If the mint fails (network hiccup, aggregator down, or — in the
+      // hypothetical Nostr-binding-forged scenario — the salt doesn't
+      // match a prior commitment under this pubkey), we keep the
+      // identity claim but warn. PROXY-mode transfers will fail until a
+      // subsequent successful `sphere.mintNametag()` call; the operator
+      // can retry manually.
+      if (!this._payments.hasNametagNamed(recoveredNametag)) {
+        try {
+          const mintResult = await this.mintNametag(recoveredNametag);
+          if (mintResult.success) {
+            logger.debug(
+              'Sphere',
+              `Re-minted on-chain nametag token for recovered "@${recoveredNametag}"`,
+            );
+          } else {
+            logger.warn(
+              'Sphere',
+              `Recovered Unicity ID "@${recoveredNametag}" from transport but ` +
+              `on-chain token mint-recovery failed: ${mintResult.error}. ` +
+              `PROXY-mode inbound transfers will fail until a subsequent ` +
+              `sphere.mintNametag("${recoveredNametag}") call succeeds.`,
+            );
+          }
+        } catch (mintErr) {
+          logger.warn(
+            'Sphere',
+            `Recovered Unicity ID "@${recoveredNametag}" from transport but ` +
+            `on-chain token mint-recovery threw (continuing without token):`,
+            mintErr,
+          );
+        }
+      }
+
       this.emitEvent('nametag:recovered', { nametag: recoveredNametag });
     } catch {
       // Don't fail wallet import on nametag recovery errors
