@@ -79,7 +79,9 @@ describe('TokenSplitExecutor', () => {
 
       // Verify method exists with correct signature
       expect(typeof executor.executeSplit).toBe('function');
-      expect(executor.executeSplit.length).toBe(6); // 6 required-position parameters (message is optional)
+      // Loop2-C2 — added optional `onBurnSubmitted` callback (7th param).
+      // The required-position count remains 5; positions 6+7 are optional.
+      expect(executor.executeSplit.length).toBe(7);
 
       // Type check: these should be valid parameter types
       type ExpectedParams = Parameters<typeof executor.executeSplit>;

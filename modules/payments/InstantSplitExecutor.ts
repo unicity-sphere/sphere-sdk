@@ -217,6 +217,16 @@ export class InstantSplitExecutor {
     if (burnResponse.status !== 'SUCCESS' && burnResponse.status !== 'REQUEST_ID_EXISTS') {
       throw new SphereError(`Burn submission failed: ${burnResponse.status}`, 'TRANSFER_FAILED');
     }
+    // Loop2-C2 — signal that the burn is durable on-chain. The
+    // dispatcher uses this to mark `committedOnChainTokenIds` BEFORE
+    // the proof wait, so a timeout/throw downstream still tombstones
+    // the source. Wrap in try/catch — caller errors must not break
+    // the executor.
+    try {
+      options?.onBurnSubmitted?.();
+    } catch (cbErr) {
+      logger.warn('InstantSplit', 'onBurnSubmitted callback threw (swallowed):', cbErr);
+    }
 
     // === STEP 2: WAIT FOR BURN PROOF (~2s) ===
     logger.debug('InstantSplit', 'Step 2: Waiting for burn proof...');

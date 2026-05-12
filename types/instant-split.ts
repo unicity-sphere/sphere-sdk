@@ -315,6 +315,17 @@ export interface InstantSplitOptions {
   /** Callback when burn is completed */
   onBurnCompleted?: (burnTxJson: string) => void;
 
+  /**
+   * Loop2-C2 — fired AFTER the burn commitment's submit response is
+   * SUCCESS/REQUEST_ID_EXISTS but BEFORE the proof wait. Signals the
+   * caller that the burn IS durable on-chain regardless of any
+   * subsequent throw (proof wait timeout, mint submit failure, etc.).
+   * The dispatcher uses this to mark `committedOnChainTokenIds`
+   * exactly when the source becomes on-chain spent — so the outer
+   * catch's restoration logic does NOT restore a burnt source.
+   */
+  onBurnSubmitted?: () => void;
+
   /** Callback when Nostr delivery is completed */
   onNostrDelivered?: (eventId: string) => void;
 

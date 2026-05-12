@@ -8353,10 +8353,14 @@ export class PaymentsModule {
     // dispatcher pattern).
     const dispatcherSelectedTokenIds: string[] = [];
 
-    // Loop1-S7 — track every reservation id (primary + per-additional-
-    // asset queue id) so we can commit/cancel each one at the end.
-    // Without this, multi-coin sends leak per-coin ledger entries.
-    const reservationIds: string[] = [transferId];
+    // Loop1-S7 + Loop2-W3 — track every reservation id (primary +
+    // per-additional-asset queue id) so we can commit/cancel each
+    // one at the end. Without this, multi-coin sends leak per-coin
+    // ledger entries. Initialize empty — the conservative dispatcher
+    // does NOT pass `transferId` itself to planSend (it uses
+    // `${transferId}:${coinId}[:${i}]` keys); committing the bare
+    // transferId was a silent no-op against ReservationLedger.
+    const reservationIds: string[] = [];
 
     const deps: ConservativeSenderDeps = {
       aggregator: this.deps!.oracle,
@@ -8553,71 +8557,96 @@ export class PaymentsModule {
               trustBase,
               signingService,
             });
-            const splitResult = await splitExecutor.executeSplit(
-              sdkSourceToken,
-              splitSource.splitAmount,
-              splitSource.remainderAmount,
-              splitSource.coinIdHex,
-              recipientAddress,
-              onChainMessage,
-            );
-            // The burn was already submitted by executeSplit. From here
-            // forward the source is on-chain spent. Restoring it on
-            // any later failure would create a phantom token.
-            committedOnChainTokenIds.add(token.id);
 
-            // Persist the change token (remainderAmount, sender-keyed).
-            const changeTokenData = splitResult.tokenForSender.toJSON();
-            const changeUiToken: Token = {
-              id: crypto.randomUUID(),
-              coinId: request.coinId,
-              symbol: this.getCoinSymbol(request.coinId),
-              name: this.getCoinName(request.coinId),
-              decimals: this.getCoinDecimals(request.coinId),
-              iconUrl: this.getCoinIconUrl(request.coinId),
-              amount: splitSource.remainderAmount.toString(),
-              status: 'confirmed',
-              createdAt: Date.now(),
-              updatedAt: Date.now(),
-              sdkData: JSON.stringify(changeTokenData),
-            };
-            await this.addToken(changeUiToken);
-            logger.debug(
-              'Payments',
-              `dispatchUxfConservativeSend: change token persisted (${changeUiToken.amount})`,
-            );
+            // Loop2-C2 — burn-then-tombstone via try/finally. The
+            // onBurnSubmitted callback fires from inside executeSplit
+            // the moment the burn is durable on-chain (after submit
+            // response, before proof wait). Any subsequent throw
+            // (waitInclusionProof timeout, mint submit failure, etc.)
+            // still leaves the source on-chain spent → must be
+            // tombstoned locally regardless. The finally fires
+            // removeToken if `burnDone` is true.
+            let burnDone = false;
+            try {
+              const splitResult = await splitExecutor.executeSplit(
+                sdkSourceToken,
+                splitSource.splitAmount,
+                splitSource.remainderAmount,
+                splitSource.coinIdHex,
+                recipientAddress,
+                onChainMessage,
+                () => {
+                  burnDone = true;
+                  committedOnChainTokenIds.add(token.id);
+                },
+              );
 
-            // Assemble the recipient SDK Token JSON: mint genesis + the
-            // mint-time state, plus the post-mint transfer transaction
-            // (both with proofs because conservative).
-            const recipientTokenJson = splitResult.tokenForRecipient.toJSON() as Record<string, unknown>;
-            const transferTxJson = splitResult.recipientTransferTx.toJSON();
-            const composedRecipientJson = {
-              ...recipientTokenJson,
-              transactions: [
-                ...(((recipientTokenJson as { transactions?: unknown[] }).transactions) ?? []),
-                transferTxJson,
-              ],
-            };
+              // Persist the change token (remainderAmount, sender-keyed).
+              const changeTokenData = splitResult.tokenForSender.toJSON();
+              const changeUiToken: Token = {
+                id: crypto.randomUUID(),
+                coinId: request.coinId,
+                symbol: this.getCoinSymbol(request.coinId),
+                name: this.getCoinName(request.coinId),
+                decimals: this.getCoinDecimals(request.coinId),
+                iconUrl: this.getCoinIconUrl(request.coinId),
+                amount: splitSource.remainderAmount.toString(),
+                status: 'confirmed',
+                createdAt: Date.now(),
+                updatedAt: Date.now(),
+                sdkData: JSON.stringify(changeTokenData),
+              };
+              await this.addToken(changeUiToken);
+              logger.debug(
+                'Payments',
+                `dispatchUxfConservativeSend: change token persisted (${changeUiToken.amount})`,
+              );
 
-            // Loop1-S1 — capture requestIdHex from the SplitResult's
-            // pre-computed field. TransferTransaction has NO requestId;
-            // SplitResult.recipientTransferRequestIdHex is captured from
-            // the underlying TransferCommitment BEFORE toTransaction().
-            const transferRequestIdHex = splitResult.recipientTransferRequestIdHex;
+              // Assemble the recipient SDK Token JSON: mint genesis + the
+              // mint-time state, plus the post-mint transfer transaction
+              // (both with proofs because conservative).
+              const recipientTokenJson = splitResult.tokenForRecipient.toJSON() as Record<string, unknown>;
+              const transferTxJson = splitResult.recipientTransferTx.toJSON();
+              const composedRecipientJson = {
+                ...recipientTokenJson,
+                transactions: [
+                  ...(((recipientTokenJson as { transactions?: unknown[] }).transactions) ?? []),
+                  transferTxJson,
+                ],
+              };
 
-            out.push({
-              sourceTokenId: token.id,
-              method: 'split',
-              requestIdHex: transferRequestIdHex,
-              recipientTokenJson: composedRecipientJson,
-              splitGroupId: crypto.randomUUID(),
-            });
-            await this.removeToken(token.id, transferId);
+              // Loop1-S1 — capture requestIdHex from the SplitResult's
+              // pre-computed field. TransferTransaction has NO requestId;
+              // SplitResult.recipientTransferRequestIdHex is captured from
+              // the underlying TransferCommitment BEFORE toTransaction().
+              const transferRequestIdHex = splitResult.recipientTransferRequestIdHex;
+
+              out.push({
+                sourceTokenId: token.id,
+                method: 'split',
+                requestIdHex: transferRequestIdHex,
+                recipientTokenJson: composedRecipientJson,
+                splitGroupId: crypto.randomUUID(),
+              });
+            } finally {
+              if (burnDone) {
+                try {
+                  await this.removeToken(token.id, transferId);
+                } catch (rmErr) {
+                  logger.warn(
+                    'Payments',
+                    `dispatchUxfConservativeSend: removeToken(${token.id}) failed after burn — manual cleanup may be needed: ${rmErr instanceof Error ? rmErr.message : String(rmErr)}`,
+                  );
+                }
+              }
+            }
             continue;
           }
 
-          // Direct (whole-token) path — unchanged.
+          // Direct (whole-token) path — Loop2-C2 try/finally so
+          // removeToken always fires once the on-chain commit is
+          // durable, even if waitInclusionProof times out / throws or
+          // the JSON construction breaks.
           const commitment = await this.createSdkCommitment(
             token,
             recipientAddress,
@@ -8634,41 +8663,61 @@ export class PaymentsModule {
               'TRANSFER_FAILED',
             );
           }
-          committedOnChainTokenIds.add(token.id);
-          const inclusionProof = await waitInclusionProof(trustBase, stClient, commitment);
-          const transferTx = commitment.toTransaction(inclusionProof);
-          // Reconstruct the recipient-token JSON shape (sourceToken +
-          // post-transfer transition) for ingestion into the bundle.
-          const tokenJson = token.sdkData
-            ? (typeof token.sdkData === 'string' ? JSON.parse(token.sdkData) : token.sdkData)
-            : null;
-          if (!tokenJson || typeof tokenJson !== 'object') {
-            throw new SphereError(
-              `Token ${token.id} missing sdkData; cannot ingest into UXF bundle`,
-              'TRANSFER_FAILED',
-            );
+          let consDirectCommitted = false;
+          try {
+            consDirectCommitted = true;
+            committedOnChainTokenIds.add(token.id);
+            const inclusionProof = await waitInclusionProof(trustBase, stClient, commitment);
+            const transferTx = commitment.toTransaction(inclusionProof);
+            // Reconstruct the recipient-token JSON shape (sourceToken +
+            // post-transfer transition) for ingestion into the bundle.
+            const tokenJson = token.sdkData
+              ? (typeof token.sdkData === 'string' ? JSON.parse(token.sdkData) : token.sdkData)
+              : null;
+            if (!tokenJson || typeof tokenJson !== 'object') {
+              throw new SphereError(
+                `Token ${token.id} missing sdkData; cannot ingest into UXF bundle`,
+                'TRANSFER_FAILED',
+              );
+            }
+            const recipientTokenJson = {
+              ...(tokenJson as Record<string, unknown>),
+              transactions: [
+                ...(((tokenJson as { transactions?: unknown[] }).transactions) ?? []),
+                transferTx.toJSON(),
+              ],
+            };
+            // Loop2-C3 — tighten requestIdHex extraction. RequestId
+            // extends DataHash whose toJSON() returns a hex imprint.
+            // Validate the shape; throw on SDK shape regression
+            // instead of silently shipping garbage like
+            // "[object Object]".
+            const requestIdHexRaw = (commitment.requestId as { toJSON?: () => string })?.toJSON?.();
+            if (typeof requestIdHexRaw !== 'string' || !/^[0-9a-f]+$/i.test(requestIdHexRaw)) {
+              throw new SphereError(
+                `dispatchUxfConservativeSend: commitment.requestId.toJSON() returned non-hex (${typeof requestIdHexRaw}); SDK shape regression?`,
+                'TRANSFER_FAILED',
+              );
+            }
+            const requestIdHex = requestIdHexRaw;
+            out.push({
+              sourceTokenId: token.id,
+              method: 'direct',
+              requestIdHex,
+              recipientTokenJson,
+            });
+          } finally {
+            if (consDirectCommitted) {
+              try {
+                await this.removeToken(token.id, transferId);
+              } catch (rmErr) {
+                logger.warn(
+                  'Payments',
+                  `dispatchUxfConservativeSend: removeToken(${token.id}) failed after on-chain commit — manual cleanup may be needed: ${rmErr instanceof Error ? rmErr.message : String(rmErr)}`,
+                );
+              }
+            }
           }
-          const recipientTokenJson = {
-            ...(tokenJson as Record<string, unknown>),
-            transactions: [
-              ...(((tokenJson as { transactions?: unknown[] }).transactions) ?? []),
-              transferTx.toJSON(),
-            ],
-          };
-          const requestIdBytes = commitment.requestId;
-          const requestIdHex =
-            requestIdBytes instanceof Uint8Array
-              ? Array.from(requestIdBytes)
-                  .map((b) => b.toString(16).padStart(2, '0'))
-                  .join('')
-              : (typeof (requestIdBytes as { toJSON?: () => string }).toJSON === "function" ? (requestIdBytes as { toJSON: () => string }).toJSON() : String(requestIdBytes));
-          out.push({
-            sourceTokenId: token.id,
-            method: 'direct',
-            requestIdHex,
-            recipientTokenJson,
-          });
-          await this.removeToken(token.id, transferId);
         }
         return out;
       },
@@ -8720,8 +8769,10 @@ export class PaymentsModule {
         this.reservationLedger.cancel(rid);
       }
 
-      // Loop1-S9 — restore non-committed selected sources. Same
-      // semantics as the instant dispatcher.
+      // Loop1-S9 + Loop2-W1 — restore non-committed selected sources
+      // AND rebuild parsedTokenCache. Same semantics as the instant
+      // dispatcher.
+      const restoredCoinIds = new Set<string>();
       for (const tokId of dispatcherSelectedTokenIds) {
         if (committedOnChainTokenIds.has(tokId)) continue;
         const tok = this.tokens.get(tokId);
@@ -8729,6 +8780,19 @@ export class PaymentsModule {
           tok.status = 'confirmed';
           tok.updatedAt = Date.now();
           this.tokens.set(tokId, tok);
+          restoredCoinIds.add(tok.coinId);
+          if (tok.sdkData) {
+            try {
+              const parsed = JSON.parse(tok.sdkData);
+              const sdkToken = await SdkToken.fromJSON(parsed);
+              const amount = this.extractCoinAmountForCache(sdkToken, tok.coinId);
+              if (amount > 0n) {
+                this.parsedTokenCache.set(tok.id, { token: tok, sdkToken, amount });
+              }
+            } catch {
+              // Parse failure — skip cache rebuild.
+            }
+          }
         }
       }
       try {
@@ -8736,7 +8800,18 @@ export class PaymentsModule {
       } catch {
         // Non-fatal — in-memory state still reflects restoration.
       }
-      this.spendQueue.notifyChange(request.coinId);
+      // Loop2-W2 — notify every restored coinId, wrapped per coin.
+      restoredCoinIds.add(request.coinId);
+      for (const cid of restoredCoinIds) {
+        try {
+          this.spendQueue.notifyChange(cid);
+        } catch (notifyErr) {
+          logger.warn(
+            'Payments',
+            `dispatchUxfConservativeSend: spendQueue.notifyChange(${cid}) threw (swallowed): ${notifyErr instanceof Error ? notifyErr.message : String(notifyErr)}`,
+          );
+        }
+      }
       throw err;
     }
 
@@ -9008,14 +9083,17 @@ export class PaymentsModule {
               devMode,
             });
 
-            // Loop1-S4 — burn-then-removeToken via try/finally. The
-            // burn is submitted by buildSplitBundle step 1; once it
-            // lands (proof received), the source is on-chain spent
-            // PERMANENTLY. Whatever happens after (submitCommitments
-            // throw, OVER_TRANSFER_GUARD violation, anything else),
-            // the local source MUST be tombstoned to avoid a zombie
-            // `transferring` row that the spend planner ignores
-            // forever.
+            // Loop1-S4 + Loop2-C2 — burn-then-removeToken via
+            // try/finally with `onBurnSubmitted` callback. The
+            // executor invokes `onBurnSubmitted` AFTER its step-1
+            // burn submit response is SUCCESS (durable on-chain) and
+            // BEFORE the step-2 proof wait. From that moment on, any
+            // throw — proof wait timeout, mint submit failure,
+            // anything — leaves the source on-chain spent, so the
+            // local source MUST be tombstoned. Pre-Loop2-C2 only
+            // tracked `burnDone=true` AFTER buildSplitBundle returned
+            // (= proof received) — proof-wait throws left the source
+            // on-chain spent but not tombstoned.
             let burnDone = false;
             try {
               const splitResult = await executor.buildSplitBundle(
@@ -9031,6 +9109,10 @@ export class PaymentsModule {
                   // submitCommitmentsImmediate; suppress the legacy
                   // background path so commitments aren't double-submitted.
                   skipBackground: true,
+                  onBurnSubmitted: () => {
+                    burnDone = true;
+                    dispatcherCommittedOnChainTokenIds.add(token.id);
+                  },
                   onChangeTokenCreated: async (changeToken) => {
                     // Persist the change token via the standard addToken
                     // pipeline. Fires after awaitChangeTokenWithProofs
@@ -9061,11 +9143,19 @@ export class PaymentsModule {
                   },
                 },
               );
-              // buildSplitBundle returned → step 1 burn proof landed →
-              // source is on-chain spent. Tombstone in finally below
-              // regardless of any later throw.
-              burnDone = true;
-              dispatcherCommittedOnChainTokenIds.add(token.id);
+              // Loop2-C2 — burnDone is already true if onBurnSubmitted
+              // fired (which happens at step-1 submit response, BEFORE
+              // step-2 proof wait). If buildSplitBundle returned
+              // successfully without invoking onBurnSubmitted (i.e.
+              // step-1 submit response check rejected before the
+              // callback fires), the source is NOT on-chain spent —
+              // burnDone stays false. The set-add below is a no-op in
+              // the happy path (already set by callback) but kept for
+              // defense-in-depth if a future executor revision moves
+              // the callback firing point.
+              if (burnDone) {
+                dispatcherCommittedOnChainTokenIds.add(token.id);
+              }
 
               // Loop1-S4 — queue awaitChangeTokenWithProofs BEFORE
               // submitCommitmentsImmediate so a partial-failure path
@@ -9163,9 +9253,18 @@ export class PaymentsModule {
               'TRANSFER_FAILED',
             );
           }
-          // Loop1-S4 — commit is on-chain from here forward. Track for
-          // outer-catch restoration logic.
-          dispatcherCommittedOnChainTokenIds.add(token.id);
+          // Loop2-C1 — commit is on-chain from this point. Track AND
+          // wrap the entire post-submit block in try/finally so
+          // removeToken always fires, even if any of the JSON
+          // construction / hash / classification steps throws.
+          // Previous Loop1-S4 placement (add outside the try, try only
+          // around the out.push) left a wide window where a throw
+          // would leave the source committed-but-not-removed → zombie
+          // `transferring` row after outer catch skipped restoration.
+          let directCommitted = false;
+          try {
+            directCommitted = true;
+            dispatcherCommittedOnChainTokenIds.add(token.id);
           // The transfer transaction goes on the bundle WITHOUT a
           // proof — the recipient's reader walks the chain when
           // proofs land.
@@ -9226,13 +9325,19 @@ export class PaymentsModule {
               transferTxJson,
             ],
           };
-          const requestIdBytes = commitment.requestId;
-          const requestIdHex =
-            requestIdBytes instanceof Uint8Array
-              ? Array.from(requestIdBytes)
-                  .map((b) => b.toString(16).padStart(2, '0'))
-                  .join('')
-              : (typeof (requestIdBytes as { toJSON?: () => string }).toJSON === "function" ? (requestIdBytes as { toJSON: () => string }).toJSON() : String(requestIdBytes));
+          // Loop2-C3 — tighten requestIdHex extraction. RequestId
+          // extends DataHash whose toJSON() returns a hex imprint.
+          // The previous fallback `String(requestIdBytes)` would ship
+          // `"[object Object]"` if the SDK shape ever changed. Validate
+          // explicitly and throw on SDK shape regression.
+          const requestIdHexRawDirect = (commitment.requestId as { toJSON?: () => string })?.toJSON?.();
+          if (typeof requestIdHexRawDirect !== 'string' || !/^[0-9a-f]+$/i.test(requestIdHexRawDirect)) {
+            throw new SphereError(
+              `dispatchUxfInstantSend: commitment.requestId.toJSON() returned non-hex (${typeof requestIdHexRawDirect}); SDK shape regression?`,
+              'TRANSFER_FAILED',
+            );
+          }
+          const requestIdHex = requestIdHexRawDirect;
 
           // Task #152 — store per-requestId context for the finalization
           // worker resolver. The §6.1 race-lost detection compares the LOCAL
@@ -9324,7 +9429,6 @@ export class PaymentsModule {
           };
           const tokenClass = classifyTokenLike(sourceTokenLike);
 
-          try {
             if (tokenClass === 'coin') {
               out.push({
                 sourceTokenId: token.id,
@@ -9344,18 +9448,20 @@ export class PaymentsModule {
               });
             }
           } finally {
-            // Loop1-S4 — removeToken always fires after on-chain commit,
-            // even if a downstream sync step throws. Mirrors the
-            // conservative dispatcher pattern. The on-chain commitment
-            // is in flight; from here forward the source state is spent
-            // regardless of transport outcome.
-            try {
-              await this.removeToken(token.id, transferId);
-            } catch (rmErr) {
-              logger.warn(
-                'Payments',
-                `dispatchUxfInstantSend: removeToken(${token.id}) failed after on-chain commit — manual cleanup may be needed: ${rmErr instanceof Error ? rmErr.message : String(rmErr)}`,
-              );
+            // Loop2-C1 — removeToken always fires when the on-chain
+            // commit is durable, regardless of any throw in the
+            // post-submit JSON construction or classification path.
+            // The try block starts immediately after submit-success
+            // so this finally catches the widest possible window.
+            if (directCommitted) {
+              try {
+                await this.removeToken(token.id, transferId);
+              } catch (rmErr) {
+                logger.warn(
+                  'Payments',
+                  `dispatchUxfInstantSend: removeToken(${token.id}) failed after on-chain commit — manual cleanup may be needed: ${rmErr instanceof Error ? rmErr.message : String(rmErr)}`,
+                );
+              }
             }
           }
         }
@@ -9420,12 +9526,19 @@ export class PaymentsModule {
       // send() catch at PaymentsModule.ts:3877).
       this.reservationLedger.cancel(transferId);
 
-      // Loop1-S9 — restore any selected source NOT yet on-chain
-      // committed. Without this, a multi-source send that throws
-      // mid-commitSources (e.g. source-2's submit fails after
+      // Loop1-S9 + Loop2-W1 — restore any selected source NOT yet
+      // on-chain committed. Without this, a multi-source send that
+      // throws mid-commitSources (e.g. source-2's submit fails after
       // source-1 succeeded) leaves the still-`transferring` sources
-      // stuck forever — the spend planner ignores them, the wallet
-      // shows them invisible, no recovery worker un-sticks them.
+      // stuck forever — the spend planner ignores them.
+      //
+      // Loop2-W1 — rebuild parsedTokenCache for the restored token so
+      // the spend planner sees it again. Mirrors the legacy send()
+      // catch path (PaymentsModule.ts:3900-3908). Without this, the
+      // restored token is in `this.tokens` as `confirmed` but
+      // invisible to spend planning until the next save/sync
+      // rebuilds the cache.
+      const restoredCoinIds = new Set<string>();
       for (const tokId of dispatcherSelectedTokenIds) {
         if (dispatcherCommittedOnChainTokenIds.has(tokId)) continue;
         const tok = this.tokens.get(tokId);
@@ -9433,6 +9546,21 @@ export class PaymentsModule {
           tok.status = 'confirmed';
           tok.updatedAt = Date.now();
           this.tokens.set(tokId, tok);
+          restoredCoinIds.add(tok.coinId);
+          if (tok.sdkData) {
+            try {
+              const parsed = JSON.parse(tok.sdkData);
+              const sdkToken = await SdkToken.fromJSON(parsed);
+              const amount = this.extractCoinAmountForCache(sdkToken, tok.coinId);
+              if (amount > 0n) {
+                this.parsedTokenCache.set(tok.id, { token: tok, sdkToken, amount });
+              }
+            } catch {
+              // Parse failure — skip cache rebuild. Token still
+              // marked confirmed; planner will re-parse on next
+              // buildParsedPool.
+            }
+          }
         }
       }
       try {
@@ -9442,9 +9570,22 @@ export class PaymentsModule {
         // applies for the rest of this session and the next load will
         // see the persistent state.
       }
-      // Notify the spend queue so any queued sends waiting on the
-      // restored capacity can wake.
-      this.spendQueue.notifyChange(request.coinId);
+      // Loop2-W2 — notify the spend queue for EVERY restored coinId
+      // (not just request.coinId). Multi-coin sends would otherwise
+      // leave waiters on additional coins parked indefinitely. Wrap
+      // each notify in try/catch so a listener error doesn't mask
+      // the original throw.
+      restoredCoinIds.add(request.coinId);
+      for (const cid of restoredCoinIds) {
+        try {
+          this.spendQueue.notifyChange(cid);
+        } catch (notifyErr) {
+          logger.warn(
+            'Payments',
+            `dispatchUxfInstantSend: spendQueue.notifyChange(${cid}) threw (swallowed): ${notifyErr instanceof Error ? notifyErr.message : String(notifyErr)}`,
+          );
+        }
+      }
 
       // Loop1-S4 — fire post-transport bg tasks on failure too. The
       // change-token recovery task (awaitChangeTokenWithProofs) is

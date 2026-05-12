@@ -94,7 +94,18 @@ export class TokenSplitExecutor {
     remainderAmount: bigint,
     coinIdHex: string,
     recipientAddress: any,
-    message?: Uint8Array | null
+    message?: Uint8Array | null,
+    /**
+     * Loop2-C2 — fired AFTER the burn commitment's submit response
+     * is SUCCESS (or REQUEST_ID_EXISTS), which means the burn IS
+     * durable on-chain. The dispatcher uses this to mark
+     * `committedOnChainTokenIds.add(...)` at the precise moment the
+     * source becomes on-chain spent. Any subsequent throw (mint
+     * submit / mint proof / transfer / transfer proof) leaves the
+     * source spent, so the dispatcher's outer catch MUST NOT
+     * restore it.
+     */
+    onBurnSubmitted?: () => void
   ): Promise<SplitResult> {
     const tokenIdHex = toHex(tokenToSplit.id.bytes);
     logger.debug('TokenSplit', `Splitting token ${tokenIdHex.slice(0, 8)}...`);
@@ -136,6 +147,16 @@ export class TokenSplitExecutor {
     const burnResponse = await this.client.submitTransferCommitment(burnCommitment);
     if (burnResponse.status !== 'SUCCESS' && burnResponse.status !== 'REQUEST_ID_EXISTS') {
       throw new SphereError(`Burn failed: ${burnResponse.status}`, 'TRANSFER_FAILED');
+    }
+    // Loop2-C2 — signal to the caller that the burn is durable on-chain.
+    // Caller's dispatcher uses this to mark `committedOnChainTokenIds`
+    // BEFORE the proof wait, so a timeout/throw downstream still
+    // tombstones the source. Wrap in try/catch — caller errors must
+    // not break the executor.
+    try {
+      onBurnSubmitted?.();
+    } catch (cbErr) {
+      logger.warn('TokenSplit', 'onBurnSubmitted callback threw (swallowed):', cbErr);
     }
 
     const burnInclusionProof = await waitInclusionProof(this.trustBase, this.client, burnCommitment);

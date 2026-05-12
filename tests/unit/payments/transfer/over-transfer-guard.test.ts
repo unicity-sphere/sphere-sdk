@@ -258,6 +258,52 @@ describe('enforceOverTransferGuard — skip semantics', () => {
   });
 });
 
+describe('enforceOverTransferGuard — Loop2-C4 negative amount rejection', () => {
+  it('throws on NEGATIVE shipped amount (regression — earlier silent fail-OPEN)', () => {
+    // Pre-Loop2-C4: BigInt('-100')=-100n; shipped=-100n is always
+    // <= any positive budget → guard PASSED. A buggy commitSources
+    // producing `coinData: [['UCT', '-100']]` evaded the guard.
+    // Fix: throw on negative shipped.
+    let caught: unknown;
+    try {
+      enforceOverTransferGuard(req({ amount: '1000' }), [
+        coinResult('t1', [['UCT', '-100']]),
+      ]);
+    } catch (err) {
+      caught = err;
+    }
+    if (!isSphereError(caught)) throw new Error('expected SphereError');
+    expect(caught.code).toBe('OVER_TRANSFER_GUARD');
+    expect(caught.message).toContain('negative');
+  });
+
+  it('clamps NEGATIVE request budget to 0n (no false-positive throws)', () => {
+    // A negative request budget would otherwise cause shipped=0n
+    // checks to fail: 0n > -100n is true → false-positive throw.
+    // Loop2-C4 clamps negative budgets to 0n so the arithmetic is
+    // monotonic. Shipping exactly 0 should not trip the guard.
+    expect(() =>
+      enforceOverTransferGuard(req({ amount: '-100' }), [
+        coinResult('t1', []),
+      ]),
+    ).not.toThrow();
+  });
+
+  it('clamped budget still trips on positive shipped (fail-closed)', () => {
+    // Negative budget clamped to 0n; any shipped > 0 must trip.
+    let caught: unknown;
+    try {
+      enforceOverTransferGuard(req({ amount: '-100' }), [
+        coinResult('t1', [['UCT', '50']]),
+      ]);
+    } catch (err) {
+      caught = err;
+    }
+    if (!isSphereError(caught)) throw new Error('expected SphereError');
+    expect(caught.code).toBe('OVER_TRANSFER_GUARD');
+  });
+});
+
 describe('enforceOverTransferGuard — multiple sources contributing to one coin', () => {
   it('sums shipped amounts across sources before comparing to budget', () => {
     // Two coin sources each shipping 600 UCT → total 1200 UCT.

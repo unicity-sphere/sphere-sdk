@@ -70,7 +70,13 @@ export function enforceOverTransferGuard(
     request.amount.length > 0
   ) {
     try {
-      requested.set(request.coinId, BigInt(request.amount));
+      const parsed = BigInt(request.amount);
+      // Loop2-C4 — clamp negative budgets to 0n. A negative request
+      // budget would otherwise cause false-positive guard throws on
+      // any shipped > -X. The user-facing request should never have a
+      // negative amount (request-validation rejects upstream), but
+      // defense-in-depth here keeps the guard's arithmetic monotonic.
+      requested.set(request.coinId, parsed < 0n ? 0n : parsed);
     } catch {
       // Malformed primary amount — treat the coin's budget as
       // 0n. Any shipped amount > 0 trips the guard (still fail-closed).
@@ -80,7 +86,8 @@ export function enforceOverTransferGuard(
     if (asset.kind !== 'coin') continue;
     try {
       const delta = BigInt(asset.amount);
-      requested.set(asset.coinId, (requested.get(asset.coinId) ?? 0n) + delta);
+      const clamped = delta < 0n ? 0n : delta;
+      requested.set(asset.coinId, (requested.get(asset.coinId) ?? 0n) + clamped);
     } catch {
       // Same rationale — malformed budget means 0n for that coin.
     }
@@ -134,6 +141,18 @@ export function enforceOverTransferGuard(
         throw new SphereError(
           `OVER_TRANSFER_GUARD: shipped coin amount is not a valid BigInt for source ${r.sourceTokenId} coinId=${cid} value="${amt.slice(0, 64)}". ` +
             'Refusing to publish bundle with unparseable amount.',
+          'OVER_TRANSFER_GUARD',
+        );
+      }
+      // Loop2-C4 — reject negative shipped amounts. Without this,
+      // shipped=-100n + budget=anything passes the `sentAmount >
+      // budget` check (since -100n is always less than any positive
+      // budget) → fail-OPEN. A negative shipped value can't represent
+      // a real on-chain coin amount; treat as a structural break.
+      if (parsed < 0n) {
+        throw new SphereError(
+          `OVER_TRANSFER_GUARD: negative shipped coin amount for source ${r.sourceTokenId} coinId=${cid} value="${amt.slice(0, 64)}". ` +
+            'Refusing to publish bundle with negative amount.',
           'OVER_TRANSFER_GUARD',
         );
       }
