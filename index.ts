@@ -491,7 +491,7 @@ export type {
 
 // Address parsing
 export { parseAddress, isValidAddress, isValidDirectAddress, normalizeAddress, addressesMatch } from './core/address';
-export { computeDirectAddressFromChainPubkey } from './core/Sphere';
+export { computeDirectAddressFromChainPubkey } from './core/address-derivation';
 export { verifySphereAuth, AuthVerificationError } from './core/auth';
 export type { SphereAuthInput, SphereAuthResult, AuthVerificationErrorCode } from './core/auth';
 export type { AddressType, ParsedAddress } from './core/address';

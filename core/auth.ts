@@ -16,7 +16,7 @@
  *   // Safe to use either as the user identifier.
  */
 import { verifySignedMessage } from './crypto';
-import { computeDirectAddressFromChainPubkey } from './Sphere';
+import { computeDirectAddressFromChainPubkey } from './address-derivation';
 
 export type AuthVerificationErrorCode = 'SIGNATURE_INVALID' | 'PUBKEY_MALFORMED';
 
