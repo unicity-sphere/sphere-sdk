@@ -161,8 +161,28 @@ export interface ConservativeCommitResult {
  * returned in any order — the orchestrator sorts by lex-min `tokenId`
  * before {@link UxfPackage.ingestAll}.
  */
+/**
+ * #142 contract widening — source selection carries `splitSource`
+ * intent. Mirrors {@link
+ * import('./instant-sender').InstantSourceSelection} for the
+ * conservative path. The split executor differs
+ * (`TokenSplitExecutor` instead of `InstantSplitExecutor`) but the
+ * contract shape is identical.
+ */
+export interface ConservativeSourceSelection {
+  readonly directSources: ReadonlyArray<Token>;
+  readonly splitSource?: {
+    readonly token: Token;
+    readonly splitAmount: bigint;
+    readonly remainderAmount: bigint;
+    readonly coinIdHex: string;
+  };
+}
+
 export type CommitSourcesFn = (params: {
   readonly sources: ReadonlyArray<Token>;
+  /** #142 — split intent. See InstantCommitSourcesFn for rationale. */
+  readonly splitSource?: ConservativeSourceSelection['splitSource'];
   readonly recipient: PeerInfo;
   readonly memo: string | undefined;
 }) => Promise<ReadonlyArray<ConservativeCommitResult>>;
@@ -173,12 +193,15 @@ export type CommitSourcesFn = (params: {
  * pre-chosen sources (unit). Receives the validated target list so
  * future revisions can do per-target routing (e.g., NFT-direct + coin-
  * split mixes).
+ *
+ * #142 widening: backwards-compatible — return either the legacy array
+ * shape or the new {@link ConservativeSourceSelection}.
  */
 export type SelectSourcesFn = (params: {
   readonly request: TransferRequest;
   readonly validated: ValidatedTargets;
   readonly available: ReadonlyArray<Token>;
-}) => Promise<ReadonlyArray<Token>>;
+}) => Promise<ReadonlyArray<Token> | ConservativeSourceSelection>;
 
 /**
  * Per-source preflight resolver injection — preserves the option grid
@@ -614,11 +637,25 @@ export async function sendConservativeUxf(
     // -----------------------------------------------------------------
     // Step 2: source selection (caller-supplied; wraps SpendPlanner).
     // -----------------------------------------------------------------
-    const selected = await deps.selectSources({
+    const selectedRaw = await deps.selectSources({
       request,
       validated,
       available,
     });
+
+    // #142 contract widening — normalize legacy array-shape into the
+    // structured {directSources, splitSource} form for partial-amount
+    // sends. Backwards-compatible with existing array callers.
+    const normalizedSelection: ConservativeSourceSelection = Array.isArray(selectedRaw)
+      ? { directSources: selectedRaw as ReadonlyArray<Token>, splitSource: undefined }
+      : (selectedRaw as ConservativeSourceSelection);
+    const selected: ReadonlyArray<Token> = [
+      ...normalizedSelection.directSources,
+      ...(normalizedSelection.splitSource
+        ? [normalizedSelection.splitSource.token]
+        : []),
+    ];
+
     if (selected.length === 0) {
       throw new SphereError(
         'sendConservativeUxf: source selection returned no tokens; ' +
@@ -642,9 +679,12 @@ export async function sendConservativeUxf(
 
     // -----------------------------------------------------------------
     // Step 4: commitments + proofs (caller-supplied; wraps SDK).
+    // #142: forward `splitSource` so commitSources can drive the
+    // appropriate split executor for partial-amount sends.
     // -----------------------------------------------------------------
     const commitResults = await deps.commitSources({
       sources: selected,
+      splitSource: normalizedSelection.splitSource,
       recipient,
       memo: request.memo,
     });

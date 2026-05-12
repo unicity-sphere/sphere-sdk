@@ -144,6 +144,45 @@ export interface InstantCommitResult {
 }
 
 /**
+ * #142 contract widening — source selection carries `splitSource` intent
+ * so the partial-amount-send case can drive
+ * `InstantSplitExecutor.buildSplitBundle` instead of silently
+ * transferring the whole source token. Backwards-compatible with the
+ * legacy `Promise<ReadonlyArray<Token>>` shape: callers that don't need
+ * to split a source return the array directly; new partial-amount
+ * callers return this structured form.
+ *
+ * Invariant: every token in the selection appears in EITHER
+ * `directSources` (transferred as-is) XOR `splitSource.token` (burnt
+ * and re-minted into recipient + change). The orchestrator computes the
+ * union as the source-lock set.
+ */
+export interface InstantSourceSelection {
+  /** Sources transferred as whole tokens (the legacy `direct` method). */
+  readonly directSources: ReadonlyArray<Token>;
+  /**
+   * Optional source to split. When present, the orchestrator passes
+   * `splitSource` to {@link InstantCommitSourcesFn} which MUST drive
+   * `InstantSplitExecutor.buildSplitBundle(token, splitAmount,
+   * remainderAmount, coinIdHex, ...)`. Producing the recipient mint
+   * (sent in the bundle) and the change mint (kept locally).
+   *
+   * `splitAmount + remainderAmount` MUST equal the token's coin balance
+   * for `coinIdHex`. `splitAmount` is what the recipient receives;
+   * `remainderAmount` is the sender's change.
+   *
+   * Only ONE source can be split per send (the legacy partial-amount
+   * model). Multi-source splits require future contract revisions.
+   */
+  readonly splitSource?: {
+    readonly token: Token;
+    readonly splitAmount: bigint;
+    readonly remainderAmount: bigint;
+    readonly coinIdHex: string;
+  };
+}
+
+/**
  * Caller-supplied callback that submits transfer commitments for the
  * supplied sources WITHOUT awaiting their inclusion proofs, and returns
  * the post-submit JSON shape (with `inclusionProof: null` on the new
@@ -158,9 +197,18 @@ export interface InstantCommitResult {
  * Failure modes flow as `SphereError`s — typically `TRANSFER_FAILED`
  * (commit submission rejected) or any aggregator-side rejection per
  * §6.1's error model.
+ *
+ * #142 widening: `splitSource` carries the split intent through to
+ * `commitSources`. Implementations that ignore it silently fall back
+ * to whole-token transfer of `splitSource.token` (the pre-fix bug).
  */
 export type InstantCommitSourcesFn = (params: {
   readonly sources: ReadonlyArray<Token>;
+  /** #142 — split intent. When set, `splitSource.token` is also in
+   *  `sources` AND must be split-minted rather than whole-transferred.
+   *  Legacy callsites pass `undefined` and the orchestrator treats
+   *  every source in `sources` as whole-token. */
+  readonly splitSource?: InstantSourceSelection['splitSource'];
   readonly recipient: PeerInfo;
   readonly memo: string | undefined;
 }) => Promise<ReadonlyArray<InstantCommitResult>>;
@@ -175,12 +223,17 @@ export type InstantCommitSourcesFn = (params: {
  * constraint here — the planner does — but it surfaces a
  * `cascade-risk-warning` event on publish to flag the recipient-side
  * cascade exposure.
+ *
+ * #142 widening: callers may return EITHER the legacy
+ * `ReadonlyArray<Token>` (all whole-token) OR an {@link InstantSourceSelection}
+ * with a structured `splitSource` for partial-amount sends. The
+ * orchestrator normalizes both shapes internally.
  */
 export type InstantSelectSourcesFn = (params: {
   readonly request: TransferRequest;
   readonly validated: ValidatedTargets;
   readonly available: ReadonlyArray<Token>;
-}) => Promise<ReadonlyArray<Token>>;
+}) => Promise<ReadonlyArray<Token> | InstantSourceSelection>;
 
 /**
  * Trigger callback to the sender-side finalization worker (T.5.B).
@@ -762,11 +815,26 @@ export async function sendInstantUxf(
     // -----------------------------------------------------------------
     // Step 2: source selection.
     // -----------------------------------------------------------------
-    const selected = await deps.selectSources({
+    const selectedRaw = await deps.selectSources({
       request,
       validated,
       available,
     });
+
+    // #142 contract widening — normalize legacy array-shape into the
+    // structured {directSources, splitSource} form. Existing tests/
+    // callers that return plain Token[] continue to work; new partial-
+    // amount callers return the structured form to trigger split.
+    const normalizedSelection: InstantSourceSelection = Array.isArray(selectedRaw)
+      ? { directSources: selectedRaw as ReadonlyArray<Token>, splitSource: undefined }
+      : (selectedRaw as InstantSourceSelection);
+    const selected: ReadonlyArray<Token> = [
+      ...normalizedSelection.directSources,
+      ...(normalizedSelection.splitSource
+        ? [normalizedSelection.splitSource.token]
+        : []),
+    ];
+
     if (selected.length === 0) {
       throw new SphereError(
         'sendInstantUxf: source selection returned no tokens; ' +
@@ -797,9 +865,12 @@ export async function sendInstantUxf(
     // -----------------------------------------------------------------
     // Step 4: commit + DO NOT await proofs. The callback returns the
     // recipient-shape JSON with `inclusionProof: null` on the new tx.
+    // #142: `splitSource` (if any) drives `InstantSplitExecutor` in the
+    // production wiring; the orchestrator only forwards the metadata.
     // -----------------------------------------------------------------
     const commitResults = await deps.commitSources({
       sources: selected,
+      splitSource: normalizedSelection.splitSource,
       recipient,
       memo: request.memo,
     });
