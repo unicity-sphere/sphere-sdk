@@ -1106,11 +1106,37 @@ export interface ProofPollingJob {
   tokenId: string;
   requestIdHex: string;
   commitmentJson: string;
+  /**
+   * Source token TXF JSON (the `sourceTokenInput` passed to
+   * `finalizeReceivedToken`). Required for V6-direct receive jobs so they
+   * can survive process restarts (#144) — `finalizeReceivedToken` needs
+   * both the source token and the commitment to derive the recipient
+   * predicate and call `stClient.finalizeTransaction`. May be omitted for
+   * legacy callsites that don't participate in persistence.
+   */
+  sourceTokenJson?: string;
   startedAt: number;
   attemptCount: number;
   lastAttemptAt: number;
   /** Callback when proof is received */
   onProofReceived?: (tokenId: string) => void;
+}
+
+/**
+ * Persisted (KV-storage) shape of a proof-polling job. Keyed by genesis
+ * tokenId + state hash because the in-memory `Token.id` is a UUID at
+ * receive time but becomes the genesis tokenId after save→load (see
+ * `txfToToken` in `serialization/txf-serializer.ts`).
+ */
+interface PersistedProofPollingJob {
+  genesisTokenId: string;
+  stateHash: string;
+  requestIdHex: string;
+  commitmentJson: string;
+  sourceTokenJson: string;
+  startedAt: number;
+  attemptCount: number;
+  lastAttemptAt: number;
 }
 
 // =============================================================================
@@ -2587,6 +2613,34 @@ export class PaymentsModule {
 
       // Restore pending V5 tokens
       await this.loadPendingV5Tokens();
+
+      // Restore proof-polling jobs (#144 L1). Must run AFTER the active
+      // token map is populated so we can resolve persisted
+      // (genesisTokenId, stateHash) pairs to in-memory `Token.id`s — and
+      // BEFORE `resolveUnconfirmed` fires so newly-restored jobs are part
+      // of the same accounting.
+      try {
+        await this.restoreProofPollingJobs();
+      } catch (err) {
+        logger.error('Payments', '[V6-RESTORE] Failed to restore proof-polling jobs:', err);
+      }
+
+      // Recover stranded V6-direct receives (#144 L3 migration). Walks
+      // status='pending' tokens that look like received-but-not-finalized
+      // targets for us, and registers proof-polling jobs by deriving the
+      // requestIdHex from each token's last-tx data. Idempotent: skips
+      // tokens already covered by `restoreProofPollingJobs` above.
+      try {
+        const recovered = await this.recoverStrandedReceivedTokens();
+        if (recovered > 0) {
+          logger.debug(
+            'Payments',
+            `[V6-RECOVER] Registered ${recovered} recovery job(s) for stranded V6-direct receives`,
+          );
+        }
+      } catch (err) {
+        logger.error('Payments', '[V6-RECOVER] Failed to scan for stranded receives:', err);
+      }
 
       // Restore processed split group IDs for dedup across reloads
       await this.loadProcessedSplitGroupIds();
@@ -4396,6 +4450,10 @@ export class PaymentsModule {
         tokenId: token.id,
         requestIdHex,
         commitmentJson: JSON.stringify(commitmentInput),
+        // Persist the source token JSON so that on process restart we can
+        // restore the job (#144 layer 1). `sdkData` is the raw source TXF
+        // string — same value that was passed in as `sourceTokenInput`.
+        sourceTokenJson: sdkData,
         startedAt: Date.now(),
         attemptCount: 0,
         lastAttemptAt: 0,
@@ -5966,22 +6024,21 @@ export class PaymentsModule {
 
     const signingService = await this.createSigningService();
 
-    const submittedCount = Array.from(this.tokens.values()).filter(t => t.status === 'submitted').length;
-    logger.debug('Payments', `[V5-RESOLVE] resolveUnconfirmed: ${submittedCount} submitted token(s) to process`);
+    const submittedCount = Array.from(this.tokens.values()).filter(
+      t => t.status === 'submitted' || t.status === 'pending'
+    ).length;
+    logger.debug('Payments', `[V5-RESOLVE] resolveUnconfirmed: ${submittedCount} submitted/pending token(s) to process`);
 
     for (const [tokenId, token] of this.tokens) {
-      if (token.status !== 'submitted') continue;
+      // #144 L2: accept both 'submitted' (in-process V5/V6-direct) and
+      // 'pending' (V6-direct after save→load round-trip — txfToToken flips
+      // the status when the latest tx has `inclusionProof: null`).
+      if (token.status !== 'submitted' && token.status !== 'pending') continue;
 
-      // Check for pending finalization metadata
+      // Check for pending finalization metadata (V5 split bundles).
       const pending = this.parsePendingFinalization(token.sdkData);
-      if (!pending) {
-        // Legacy commitment-only token (existing proof polling handles these)
-        logger.debug('Payments', `[V5-RESOLVE] ${tokenId.slice(0, 16)}: no pending finalization metadata, skipping`);
-        result.stillPending++;
-        continue;
-      }
 
-      if (pending.type === 'v5_bundle') {
+      if (pending?.type === 'v5_bundle') {
         logger.debug('Payments', `[V5-RESOLVE] Processing ${tokenId.slice(0, 16)}... stage=${pending.stage} attempt=${pending.attemptCount}`);
         const progress = await this.resolveV5Token(tokenId, token, pending, stClient, trustBase, signingService);
         logger.debug('Payments', `[V5-RESOLVE] Result for ${tokenId.slice(0, 16)}...: ${progress} (stage now: ${pending.stage})`);
@@ -5989,7 +6046,31 @@ export class PaymentsModule {
         if (progress === 'resolved') result.resolved++;
         else if (progress === 'failed') result.failed++;
         else result.stillPending++;
+        continue;
       }
+
+      // #144 L2: V6-direct legacy entries (no `_pendingFinalization`).
+      // If a persisted proof-polling job is tracking this token, attempt
+      // finalization in our own cadence (defense-in-depth alongside the
+      // ~2s background queue). If no job is registered, the token is
+      // stranded — `recoverStrandedReceivedTokens` (L3 migration) handles
+      // it on first load() after upgrade.
+      if (this.isReceivedLegacyPending(token)) {
+        const progress = await this.resolveLegacyReceivedToken(tokenId, token);
+        const detailStatus: 'resolved' | 'pending' | 'failed' =
+          progress === 'resolved' ? 'resolved'
+          : progress === 'failed' ? 'failed'
+          : 'pending';
+        result.details.push({ tokenId, stage: 'v6_direct', status: detailStatus });
+        if (progress === 'resolved') result.resolved++;
+        else if (progress === 'failed') result.failed++;
+        else result.stillPending++;
+        continue;
+      }
+
+      // Some other shape we don't know about — count as still-pending.
+      logger.debug('Payments', `[V5-RESOLVE] ${tokenId.slice(0, 16)}: no pending finalization metadata, no recipient match — skipping`);
+      result.stillPending++;
     }
 
     // Always save when any token was processed — this persists intermediate
@@ -6011,12 +6092,15 @@ export class PaymentsModule {
     // Don't stack intervals
     if (this.resolveUnconfirmedTimer) return;
 
-    // Only start if there are actually submitted tokens to resolve
+    // Only start if there are unconfirmed tokens to resolve.
+    // #144: include 'pending' status too — V6-direct receives flip from
+    // 'submitted' to 'pending' after save→load and would never re-engage
+    // the periodic retry otherwise.
     const hasUnconfirmed = Array.from(this.tokens.values()).some(
-      (t) => t.status === 'submitted',
+      (t) => t.status === 'submitted' || t.status === 'pending',
     );
     if (!hasUnconfirmed) {
-      logger.debug('Payments', '[V5-RESOLVE] scheduleResolveUnconfirmed: no submitted tokens, not starting timer');
+      logger.debug('Payments', '[V5-RESOLVE] scheduleResolveUnconfirmed: no submitted/pending tokens, not starting timer');
       return;
     }
 
@@ -6287,6 +6371,416 @@ export class PaymentsModule {
 
     // Finalize
     return stClient.finalizeTransaction(trustBase, mintedToken, recipientState, transferTransaction, nametagTokens);
+  }
+
+  /**
+   * #144 L2/L3 — does this token look like a V6-direct received-but-
+   * not-finalized token? Conditions:
+   *   1. sdkData parses as TXF with transactions
+   *   2. last tx has `inclusionProof === null`
+   *   3. last tx's `data.recipient.address` resolves to our wallet
+   *      (DIRECT://<our> or PROXY://<our-nametag>)
+   *
+   * Used by `resolveUnconfirmed` and `recoverStrandedReceivedTokens` to
+   * distinguish stranded receives from sends and from other shapes.
+   */
+  private isReceivedLegacyPending(token: Token): boolean {
+    if (!token.sdkData) return false;
+    let parsed: { transactions?: unknown };
+    try {
+      parsed = JSON.parse(token.sdkData);
+    } catch {
+      return false;
+    }
+    if (!parsed || typeof parsed !== 'object') return false;
+    const txs = (parsed as { transactions?: unknown[] }).transactions;
+    if (!Array.isArray(txs) || txs.length === 0) return false;
+    const lastTx = txs[txs.length - 1] as {
+      inclusionProof?: unknown;
+      data?: { recipient?: { address?: string } };
+    };
+    if (lastTx.inclusionProof !== null) return false;
+    const recipientAddr = lastTx.data?.recipient?.address;
+    if (typeof recipientAddr !== 'string') return false;
+
+    // DIRECT match — `identity.directAddress` is normalized to
+    // `DIRECT://...`; tx recipient should match exactly.
+    const directAddr = this.deps!.identity.directAddress;
+    if (directAddr && recipientAddr === directAddr) return true;
+
+    // PROXY match: check if we hold the nametag whose PROXY address
+    // matches. This is best-effort — `getNametag()` returns the in-memory
+    // nametag for the current address. A token addressed via a different
+    // address's nametag won't be recognized here, which matches the
+    // existing finalize path's behavior.
+    if (recipientAddr.startsWith('PROXY://')) {
+      const proxyHash = recipientAddr.slice('PROXY://'.length);
+      // Lazy check: deep PROXY validation requires async ProxyAddress
+      // import + nametag token id derivation. Cheaper synchronous proxy:
+      // if the wallet currently has any nametag, treat as candidate (the
+      // finalize step will reject if the actual proxy doesn't match).
+      const localNametag = this.getNametag();
+      if (localNametag?.token && proxyHash.length > 0) return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * #144 L3 — does this token have an in-flight finalization plan?
+   * A "plan" is one of:
+   *   1. `_pendingFinalization` marker on sdkData (V5 split bundles)
+   *   2. A live proof-polling job in `this.proofPollingJobs`
+   *   3. The token "looks like a V6-direct received-but-not-finalized"
+   *      target for us (eligible for `recoverStrandedReceivedTokens`)
+   *
+   * Used by `loadFromStorageData`'s balance-model invariant check: tokens
+   * whose latest state isn't ours AND have no plan are moved to the
+   * archive map per the canonical model (see #144 spec §3 and #143's
+   * balance-model state-machine refinement).
+   */
+  private hasFinalizationPlan(token: Token): boolean {
+    if (this.parsePendingFinalization(token.sdkData)) return true;
+    if (this.proofPollingJobs.has(token.id)) return true;
+    if (this.isReceivedLegacyPending(token)) return true;
+    return false;
+  }
+
+  /**
+   * #144 L3 — does the token's latest STATE predicate resolve to this
+   * wallet? Distinct from "is the latest tx's recipient us": this asks
+   * whether the SDK considers us the current owner.
+   *
+   * Conservative implementation: if we can't determine ownership with
+   * confidence, return `true` (keep the token visible). Only return
+   * `false` for the unambiguous case where the latest state's encoded
+   * publicKey differs from our wallet's chainPubkey.
+   */
+  private latestStatePredicateMatchesWallet(token: Token): boolean {
+    if (!token.sdkData) return true;
+    let parsed: { state?: { predicate?: string | { publicKey?: string } } };
+    try {
+      parsed = JSON.parse(token.sdkData);
+    } catch {
+      return true;
+    }
+    const predicate = parsed?.state?.predicate;
+    if (!predicate) return true;
+
+    // Predicate encoding may be CBOR-hex (UnmaskedPredicate) or a JSON
+    // object. We can't reliably hash-compare without spinning up the SDK
+    // — instead, look for our chainPubkey as a substring within a hex-
+    // encoded predicate. False positives would only happen if our pubkey
+    // appears coincidentally in someone else's predicate; for production
+    // wallets this is acceptable for the load-time invariant.
+    const ourPubkey = this.deps!.identity.chainPubkey?.toLowerCase();
+    if (!ourPubkey) return true;
+
+    if (typeof predicate === 'string') {
+      return predicate.toLowerCase().includes(ourPubkey);
+    }
+    if (typeof predicate === 'object' && typeof predicate.publicKey === 'string') {
+      return predicate.publicKey.toLowerCase() === ourPubkey;
+    }
+    return true;
+  }
+
+  /**
+   * #144 L3 migration — recover stranded V6-direct received tokens that
+   * exist in the active map with `status === 'pending'` but have no
+   * persisted proof-polling job (e.g. wallets upgraded from a pre-#144
+   * SDK build). For each, derive `requestIdHex` from the source TXF's
+   * last transaction data and register a fresh proof-polling job.
+   *
+   * The reconstructed job uses an empty `commitmentJson` and is finalized
+   * via `finalizeStrandedReceivedToken` instead of the standard
+   * `finalizeReceivedToken` — the migration path patches the source TXF's
+   * last-tx inclusionProof in place rather than constructing a
+   * `TransferCommitment` (we don't have the sender's authenticator).
+   *
+   * Idempotent: tokens that already have a proof-polling job are skipped.
+   * Tokens that fail to derive requestIdHex (e.g. malformed sdkData) are
+   * left in the active map with a debug log.
+   *
+   * Returns the count of jobs registered.
+   */
+  private async recoverStrandedReceivedTokens(): Promise<number> {
+    let recovered = 0;
+    for (const [tokenId, token] of this.tokens) {
+      if (token.status !== 'pending') continue;
+      if (this.proofPollingJobs.has(tokenId)) continue;
+      if (this.parsePendingFinalization(token.sdkData)) continue;
+      if (!this.isReceivedLegacyPending(token)) continue;
+
+      // Parse sdkData to reach the last tx + source state.
+      if (!token.sdkData) continue;
+      let parsed: {
+        transactions?: Array<{ data?: unknown; inclusionProof?: unknown }>;
+      };
+      try {
+        parsed = JSON.parse(token.sdkData);
+      } catch (err) {
+        logger.debug(
+          'Payments',
+          `[V6-RECOVER] ${tokenId.slice(0, 12)}: sdkData parse failed: ${(err as Error).message}`,
+        );
+        continue;
+      }
+      const txs = parsed.transactions;
+      if (!Array.isArray(txs) || txs.length === 0) continue;
+      const lastTxJson = txs[txs.length - 1];
+      if (!lastTxJson || lastTxJson.data == null) continue;
+
+      try {
+        // Derive requestIdHex from source state's predicate publicKey +
+        // sourceStateHash (mirrors the recipient UXF worker recipe at
+        // line ~1876 — same canonical derivation aggregator uses).
+        const txData = await TransferTransactionData.fromJSON(lastTxJson.data);
+        const senderPredicate = await PredicateEngineService.createPredicate(
+          txData.sourceState.predicate,
+        );
+        const senderPubkey = (senderPredicate as unknown as { publicKey?: Uint8Array }).publicKey;
+        if (!(senderPubkey instanceof Uint8Array) || senderPubkey.length === 0) {
+          logger.debug(
+            'Payments',
+            `[V6-RECOVER] ${tokenId.slice(0, 12)}: sender predicate has no publicKey, skipping`,
+          );
+          continue;
+        }
+        const sourceStateHash = await txData.sourceState.calculateHash();
+        const requestId = await RequestId.create(senderPubkey, sourceStateHash);
+        const requestIdHex = requestId.toJSON();
+
+        // Build the source-at-state-N-1 by stripping the last tx. This is
+        // the same shape `assembleAtState(tokenId, txCount - 1)` produces
+        // for the UXF path. `SdkToken.fromJSON` only accepts source tokens
+        // whose transactions all have inclusionProofs.
+        const sourceTokenJsonObj = {
+          ...parsed,
+          transactions: txs.slice(0, -1),
+        };
+        const sourceTokenJson = JSON.stringify(sourceTokenJsonObj);
+
+        // Register a proof-polling job. `commitmentJson` is empty — the
+        // polling queue's fallback uses `getProof(requestIdHex)` when no
+        // commitment is available (see #144 L3 patch to
+        // `processProofPollingQueue`).
+        const lastTxJsonSnapshot = JSON.parse(JSON.stringify(lastTxJson));
+        this.proofPollingJobs.set(tokenId, {
+          tokenId,
+          requestIdHex,
+          commitmentJson: '',
+          sourceTokenJson,
+          startedAt: Date.now(),
+          attemptCount: 0,
+          lastAttemptAt: 0,
+          onProofReceived: async (tid) => {
+            await this.finalizeStrandedReceivedToken(
+              tid,
+              sourceTokenJson,
+              lastTxJsonSnapshot,
+            );
+          },
+        });
+        recovered++;
+        logger.debug(
+          'Payments',
+          `[V6-RECOVER] Registered recovery job for stranded token ${tokenId.slice(0, 12)} (requestId=${requestIdHex.slice(0, 16)}...)`,
+        );
+      } catch (err) {
+        logger.debug(
+          'Payments',
+          `[V6-RECOVER] ${tokenId.slice(0, 12)}: requestIdHex derivation failed: ${(err as Error)?.message ?? err}`,
+        );
+      }
+    }
+
+    if (recovered > 0) {
+      this.startProofPolling();
+      this.saveProofPollingJobs().catch((err) =>
+        logger.debug('Payments', '[V6-PERSIST] saveProofPollingJobs after recover failed:', err),
+      );
+    }
+    return recovered;
+  }
+
+  /**
+   * #144 L3 migration — finalize a stranded V6-direct received token
+   * once its inclusion proof arrives. Unlike `finalizeReceivedToken`
+   * (which uses a real `TransferCommitment`), this path patches the
+   * lastTx's `inclusionProof` field in place and calls
+   * `TransferTransaction.fromJSON` directly. The patched JSON is then
+   * fed to `finalizeTransferToken` which produces the recipient's
+   * finalized SDK token.
+   */
+  private async finalizeStrandedReceivedToken(
+    tokenId: string,
+    sourceTokenJson: string,
+    lastTxJson: Record<string, unknown>,
+  ): Promise<void> {
+    try {
+      const job = this.proofPollingJobs.get(tokenId);
+      const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const trustBase = (this.deps!.oracle as any).getTrustBase?.();
+      if (!stClient || !trustBase || !job) {
+        logger.debug('Payments', `[V6-RECOVER] Cannot finalize ${tokenId.slice(0, 12)} — missing client/trustBase/job`);
+        return;
+      }
+
+      // Fetch the proof one more time (the queue already saw it, but it
+      // doesn't pass the proof through to the callback).
+      let proofJson: unknown = null;
+      const proof = await this.deps!.oracle.getProof(job.requestIdHex);
+      if (proof) {
+        // proof may be an InclusionProof instance or a plain JSON object —
+        // `TransferTransaction.fromJSON` expects the JSON shape, so
+        // normalize via `toJSON()` when available.
+        const proofWithToJson = proof as { toJSON?: () => unknown };
+        proofJson = typeof proofWithToJson.toJSON === 'function'
+          ? proofWithToJson.toJSON()
+          : proof;
+      }
+      if (!proofJson) {
+        logger.debug('Payments', `[V6-RECOVER] Proof for ${tokenId.slice(0, 12)} unavailable on re-fetch — leaving for next tick`);
+        return;
+      }
+
+      // Patch the lastTxJson with the now-available inclusionProof and
+      // reconstruct the SDK transfer transaction.
+      const finalizedTxJson = { ...lastTxJson, inclusionProof: proofJson };
+      const transferTx = await TransferTransaction.fromJSON(finalizedTxJson);
+
+      // Source token at state N-1 (last tx stripped — see
+      // `recoverStrandedReceivedTokens`).
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const sourceToken = await SdkToken.fromJSON(JSON.parse(sourceTokenJson)) as SdkToken<any>;
+
+      const finalizedSdkToken = await this.finalizeTransferToken(
+        sourceToken,
+        transferTx,
+        stClient,
+        trustBase,
+      );
+
+      const token = this.tokens.get(tokenId);
+      if (!token) {
+        logger.debug('Payments', `[V6-RECOVER] Token ${tokenId.slice(0, 12)} disappeared before finalize completed`);
+        return;
+      }
+      const finalizedToken: Token = {
+        ...token,
+        status: 'confirmed',
+        updatedAt: Date.now(),
+        sdkData: JSON.stringify(finalizedSdkToken.toJSON()),
+      };
+      this.tokens.set(tokenId, finalizedToken);
+      await this.save();
+
+      // Update spend-queue cache with newly-confirmed token.
+      const amount = this.extractCoinAmountForCache(finalizedSdkToken, finalizedToken.coinId);
+      if (amount > 0n) {
+        this.parsedTokenCache.set(tokenId, { token: finalizedToken, sdkToken: finalizedSdkToken, amount });
+        this.spendQueue.notifyChange(finalizedToken.coinId);
+      }
+
+      this.deps!.emitEvent('transfer:confirmed', {
+        id: crypto.randomUUID(),
+        status: 'completed',
+        tokens: [finalizedToken],
+        tokenTransfers: [],
+      });
+
+      logger.debug('Payments', `[V6-RECOVER] Finalized stranded receive ${tokenId.slice(0, 12)} → confirmed`);
+    } catch (err) {
+      logger.error('Payments', `[V6-RECOVER] Failed to finalize stranded receive ${tokenId.slice(0, 12)}:`, err);
+    }
+  }
+
+  /**
+   * #144 L2 — attempt to finalize a V6-direct legacy token (no
+   * `_pendingFinalization` marker) using a persisted proof-polling job.
+   * Runs from `resolveUnconfirmed`'s slower cadence as defense-in-depth
+   * alongside the ~2s background queue.
+   *
+   * Returns:
+   *   - 'resolved' when proof arrives and finalize succeeds
+   *   - 'stillPending' when proof not ready yet (or no persisted job)
+   *   - 'failed' on hard finalize errors
+   */
+  private async resolveLegacyReceivedToken(
+    tokenId: string,
+    _token: Token,
+  ): Promise<'resolved' | 'stillPending' | 'failed'> {
+    const job = this.proofPollingJobs.get(tokenId);
+    if (!job || !job.sourceTokenJson) {
+      // No job: stranded (#144 L3 migration handles via
+      // recoverStrandedReceivedTokens at load time). Don't fail here —
+      // just report stillPending so the periodic retry stays calm.
+      return 'stillPending';
+    }
+
+    try {
+      const commitmentInput = JSON.parse(job.commitmentJson);
+      const commitment = await TransferCommitment.fromJSON(commitmentInput);
+
+      if (!this.deps!.oracle.waitForProofSdk) {
+        // Can't poll for proof; rely on the background queue and any
+        // explicit finalize callers (already handled in finalizeReceivedToken).
+        return 'stillPending';
+      }
+
+      // Short timeout — resolveUnconfirmed is called every 10s; we don't
+      // want to block other tokens in the loop.
+      const abortController = new AbortController();
+      const timeoutId = setTimeout(() => abortController.abort(), 500);
+      let inclusionProof: unknown = null;
+      try {
+        inclusionProof = await Promise.race([
+          this.deps!.oracle.waitForProofSdk(commitment, abortController.signal),
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 500)),
+        ]);
+      } catch {
+        // Aggregator timeout / no proof yet — let the next tick try again.
+        clearTimeout(timeoutId);
+        return 'stillPending';
+      }
+      clearTimeout(timeoutId);
+
+      if (!inclusionProof) return 'stillPending';
+
+      // Proof landed — finalize. `finalizeReceivedToken` writes through to
+      // `this.tokens` and persists via `save()`. It also emits the
+      // `transfer:confirmed` event.
+      let sourceTokenInput: unknown;
+      try {
+        sourceTokenInput = JSON.parse(job.sourceTokenJson);
+      } catch (err) {
+        logger.error(
+          'Payments',
+          `[V6-RESOLVE] Failed to parse stored sourceTokenJson for ${tokenId.slice(0, 12)}:`,
+          err,
+        );
+        return 'failed';
+      }
+      await this.finalizeReceivedToken(tokenId, sourceTokenInput, commitmentInput);
+
+      // Clean up the proof-polling job — finalizeReceivedToken doesn't
+      // remove it (the background queue normally does). Persist the
+      // updated map.
+      this.proofPollingJobs.delete(tokenId);
+      this.saveProofPollingJobs().catch((err) =>
+        logger.debug('Payments', '[V6-PERSIST] saveProofPollingJobs after resolve failed:', err),
+      );
+
+      return 'resolved';
+    } catch (err) {
+      logger.debug(
+        'Payments',
+        `[V6-RESOLVE] Error resolving legacy receive ${tokenId.slice(0, 12)}: ${(err as Error)?.message ?? err}`,
+      );
+      return 'stillPending';
+    }
   }
 
   /**
@@ -10218,6 +10712,13 @@ export class PaymentsModule {
       this.tokens.set(id, token);
     }
 
+    // Load other data EARLY so archive-move (below) can write into the
+    // up-to-date archive map.
+    this.archivedTokens = parsed.archivedTokens;
+    this.forkedTokens = parsed.forkedTokens;
+    this.nametags = parsed.nametags;
+
+    let archiveMoved = 0;
     for (const token of parsed.tokens) {
       // Don't overwrite in-flight tokens preserved above
       if (preservedTransferring.has(token.id)) continue;
@@ -10231,13 +10732,38 @@ export class PaymentsModule {
         continue;
       }
 
+      // #144 L3 — balance-model invariant: if the latest state's
+      // predicate isn't ours AND no finalization plan exists, the token
+      // has no place in the active map per #143's mutual-exclusivity
+      // refinement. Move it to archive. Bob's stranded V6-direct receive
+      // (the #144 reproduction case) is preserved because
+      // `isReceivedLegacyPending → hasFinalizationPlan: true`.
+      if (
+        !this.latestStatePredicateMatchesWallet(token) &&
+        !this.hasFinalizationPlan(token)
+      ) {
+        const txf = tokenToTxf(token);
+        if (txf?.genesis?.data?.tokenId) {
+          this.archivedTokens.set(txf.genesis.data.tokenId, txf);
+          archiveMoved++;
+          logger.debug(
+            'Payments',
+            `[BALANCE-INVARIANT] Moved token ${token.id.slice(0, 12)} to archive — ` +
+              `latest state predicate not ours, no finalization plan`,
+          );
+          continue;
+        }
+        // Couldn't convert to TXF — keep in active to avoid data loss.
+      }
+
       this.tokens.set(token.id, token);
     }
-
-    // Load other data
-    this.archivedTokens = parsed.archivedTokens;
-    this.forkedTokens = parsed.forkedTokens;
-    this.nametags = parsed.nametags;
+    if (archiveMoved > 0) {
+      logger.debug(
+        'Payments',
+        `[BALANCE-INVARIANT] loadFromStorageData moved ${archiveMoved} token(s) to archive`,
+      );
+    }
   }
 
   // ===========================================================================
@@ -10298,6 +10824,192 @@ export class PaymentsModule {
     this.proofPollingJobs.set(job.tokenId, job);
     logger.debug('Payments', `Added proof polling job for token ${job.tokenId.slice(0, 8)}...`);
     this.startProofPolling();
+    // Persist for restart recovery (#144 L1). Fire-and-forget — the job is
+    // already in-memory, so a persist failure only affects restart recovery.
+    if (job.sourceTokenJson) {
+      this.saveProofPollingJobs().catch((err) =>
+        logger.debug('Payments', '[V6-PERSIST] saveProofPollingJobs after add failed:', err)
+      );
+    }
+  }
+
+  /**
+   * Persist the current set of proof-polling jobs to KV storage. Only jobs
+   * that have a `sourceTokenJson` (i.e. V6-direct receive jobs) are
+   * eligible for restart recovery — others are skipped. See #144.
+   *
+   * Keyed by genesis tokenId + state hash, not in-memory UUID, because
+   * after save→load the in-memory id is replaced by the genesis tokenId
+   * (see `txfToToken` in `serialization/txf-serializer.ts`).
+   */
+  private async saveProofPollingJobs(): Promise<void> {
+    const persisted: PersistedProofPollingJob[] = [];
+    for (const [tokenId, job] of this.proofPollingJobs) {
+      if (!job.sourceTokenJson) continue;
+      const token = this.tokens.get(tokenId);
+      // Token may be absent if the job was just added in this tick and the
+      // map mutated concurrently. Use the job's stored sdkData as the
+      // canonical source of genesis+state info — it's the same value that
+      // was written to `Token.sdkData` at create time.
+      const sourceTokenJson = job.sourceTokenJson;
+      const genesisTokenId = token
+        ? extractTokenIdFromSdkData(token.sdkData)
+        : extractTokenIdFromSdkData(sourceTokenJson);
+      const stateHash = token
+        ? extractStateHashFromSdkData(token.sdkData)
+        : extractStateHashFromSdkData(sourceTokenJson);
+      if (!genesisTokenId || !stateHash) {
+        logger.debug(
+          'Payments',
+          `[V6-PERSIST] Skipping job for ${tokenId.slice(0, 12)} — missing genesisTokenId or stateHash`
+        );
+        continue;
+      }
+      persisted.push({
+        genesisTokenId,
+        stateHash,
+        requestIdHex: job.requestIdHex,
+        commitmentJson: job.commitmentJson,
+        sourceTokenJson,
+        startedAt: job.startedAt,
+        attemptCount: job.attemptCount,
+        lastAttemptAt: job.lastAttemptAt,
+      });
+    }
+
+    if (persisted.length === 0) {
+      // Clear the KV entry when no eligible jobs remain. Use storage.remove
+      // when available so a stale list doesn't survive.
+      const storage = this.deps!.storage;
+      const removeFn = (storage as { remove?: (k: string) => Promise<void> }).remove;
+      if (typeof removeFn === 'function') {
+        await removeFn.call(storage, STORAGE_KEYS_ADDRESS.PROOF_POLLING_JOBS);
+      } else {
+        await this.setStorageEntry(
+          STORAGE_KEYS_ADDRESS.PROOF_POLLING_JOBS,
+          '[]',
+          'cache_index'
+        );
+      }
+      return;
+    }
+
+    await this.setStorageEntry(
+      STORAGE_KEYS_ADDRESS.PROOF_POLLING_JOBS,
+      JSON.stringify(persisted),
+      'cache_index'
+    );
+  }
+
+  /**
+   * Restore proof-polling jobs from KV storage. Called from `load()` AFTER
+   * `loadFromStorageData` populates `this.tokens`, so we can resolve a
+   * persisted `(genesisTokenId, stateHash)` pair to the post-load in-memory
+   * `Token.id` (which is the genesis tokenId itself, courtesy of
+   * `txfToToken`).
+   *
+   * Each restored job runs with `attemptCount: 0` — the prior process's
+   * attempts don't carry over, so a job that nearly timed out gets a fresh
+   * 60s budget instead of being immediately discarded.
+   */
+  private async restoreProofPollingJobs(): Promise<void> {
+    const data = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.PROOF_POLLING_JOBS);
+    if (!data) return;
+
+    let persisted: PersistedProofPollingJob[];
+    try {
+      const parsed = JSON.parse(data);
+      if (!Array.isArray(parsed)) {
+        logger.error('Payments', '[V6-RESTORE] Persisted jobs is not an array; clearing');
+        return;
+      }
+      persisted = parsed as PersistedProofPollingJob[];
+    } catch (err) {
+      logger.error('Payments', '[V6-RESTORE] Failed to parse persisted jobs:', err);
+      return;
+    }
+
+    if (persisted.length === 0) return;
+
+    let restored = 0;
+    for (const p of persisted) {
+      if (
+        !p.genesisTokenId ||
+        !p.stateHash ||
+        !p.requestIdHex ||
+        !p.commitmentJson ||
+        !p.sourceTokenJson
+      ) {
+        logger.debug('Payments', '[V6-RESTORE] Skipping malformed persisted job');
+        continue;
+      }
+
+      // Find matching in-memory token by genesis tokenId + state hash.
+      let memoryTokenId: string | null = null;
+      for (const [id, token] of this.tokens) {
+        const tid = extractTokenIdFromSdkData(token.sdkData);
+        const sh = extractStateHashFromSdkData(token.sdkData);
+        if (tid === p.genesisTokenId && sh === p.stateHash) {
+          memoryTokenId = id;
+          break;
+        }
+      }
+      if (!memoryTokenId) {
+        logger.debug(
+          'Payments',
+          `[V6-RESTORE] No matching token for job ` +
+            `(genesisTokenId=${p.genesisTokenId.slice(0, 12)}, ` +
+            `stateHash=${p.stateHash.slice(0, 12)}), dropping`
+        );
+        continue;
+      }
+
+      // Already finalized in a prior session? Skip.
+      const existingToken = this.tokens.get(memoryTokenId);
+      if (existingToken && existingToken.status === 'confirmed') {
+        logger.debug(
+          'Payments',
+          `[V6-RESTORE] Token ${memoryTokenId.slice(0, 12)} already confirmed, skipping job`
+        );
+        continue;
+      }
+
+      let sourceTokenInput: unknown;
+      let commitmentInput: unknown;
+      try {
+        sourceTokenInput = JSON.parse(p.sourceTokenJson);
+        commitmentInput = JSON.parse(p.commitmentJson);
+      } catch (err) {
+        logger.error(
+          'Payments',
+          `[V6-RESTORE] Failed to parse source/commitment for ${p.genesisTokenId.slice(0, 12)}:`,
+          err
+        );
+        continue;
+      }
+
+      this.proofPollingJobs.set(memoryTokenId, {
+        tokenId: memoryTokenId,
+        requestIdHex: p.requestIdHex,
+        commitmentJson: p.commitmentJson,
+        sourceTokenJson: p.sourceTokenJson,
+        startedAt: p.startedAt,
+        attemptCount: 0, // reset; prior process's attempts don't count
+        lastAttemptAt: 0,
+        onProofReceived: async (tid) => {
+          await this.finalizeReceivedToken(tid, sourceTokenInput, commitmentInput);
+        },
+      });
+      restored++;
+    }
+
+    if (restored > 0) {
+      logger.debug(
+        'Payments',
+        `[V6-RESTORE] Restored ${restored} proof-polling job(s) from storage`
+      );
+      this.startProofPolling();
+    }
   }
 
   /**
@@ -10355,23 +11067,26 @@ export class PaymentsModule {
           continue;
         }
 
-        // Try to get proof from aggregator using a short timeout
-        const commitment = await TransferCommitment.fromJSON(JSON.parse(job.commitmentJson));
-
-        // Try to get proof with a quick timeout (non-blocking check)
+        // Try to get proof with a quick timeout (non-blocking check).
+        //
+        // #144 L3: jobs registered via `recoverStrandedReceivedTokens`
+        // have an empty `commitmentJson` (we can't reconstruct the
+        // sender's authenticator). For those, fall back to the
+        // `getProof(requestIdHex)` path directly — no commitment needed.
         let inclusionProof: unknown = null;
         try {
-          // Create abort controller for quick timeout
           const abortController = new AbortController();
           const timeoutId = setTimeout(() => abortController.abort(), 500);
 
-          if (this.deps!.oracle.waitForProofSdk) {
+          if (job.commitmentJson && this.deps!.oracle.waitForProofSdk) {
+            const commitment = await TransferCommitment.fromJSON(JSON.parse(job.commitmentJson));
             inclusionProof = await Promise.race([
               this.deps!.oracle.waitForProofSdk(commitment, abortController.signal),
               new Promise<null>((resolve) => setTimeout(() => resolve(null), 500)),
             ]);
           } else {
-            // Fallback: use getProof with request ID hex
+            // Fallback: use getProof with request ID hex (also the only
+            // path for #144 L3 migration jobs).
             const proof = await this.deps!.oracle.getProof(job.requestIdHex);
             if (proof) {
               inclusionProof = proof;
@@ -10417,6 +11132,12 @@ export class PaymentsModule {
     if (this.proofPollingJobs.size === 0) {
       this.stopProofPolling();
     }
+
+    // Persist updated queue (attempt counts changed; some jobs removed).
+    // Fire-and-forget — in-memory state is authoritative for this process.
+    this.saveProofPollingJobs().catch((err) =>
+      logger.debug('Payments', '[V6-PERSIST] saveProofPollingJobs after tick failed:', err)
+    );
   }
 
   // ===========================================================================

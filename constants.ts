@@ -108,6 +108,15 @@ export const STORAGE_KEYS_ADDRESS = {
   INV_LEDGER_INDEX: 'inv_ledger_index',
   /** Token scan state watermarks (JSON: Record<tokenId, txCount>) */
   TOKEN_SCAN_STATE: 'token_scan_state',
+  /**
+   * Persisted NOSTR-FIRST proof-polling jobs. Issue #144: the in-memory
+   * `proofPollingJobs` Map dies with the process; on CLI usage every
+   * `sphere <cmd>` is a fresh Node.js process, so V6-direct receives
+   * whose proof arrives later never finalize. We persist enough state
+   * (genesisTokenId, stateHash, requestIdHex, commitmentJson,
+   * sourceTokenJson) to re-fire `finalizeReceivedToken` on next load().
+   */
+  PROOF_POLLING_JOBS: 'proof_polling_jobs',
   // Swap storage keys
   /** Per-swap key: swap:{swapId} */
   SWAP_RECORD_PREFIX: 'swap:',
