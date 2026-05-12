@@ -31,7 +31,7 @@ import { FileStorageProvider } from '../../../impl/nodejs/storage/FileStoragePro
 import { FileTokenStorageProvider } from '../../../impl/nodejs/storage/FileTokenStorageProvider';
 import type { TransportProvider, OracleProvider } from '../../../index';
 import type { ProviderStatus } from '../../../types';
-import type { PaymentsModule, MintNametagResult } from '../../../modules/payments';
+import { PaymentsModule, type MintNametagResult } from '../../../modules/payments';
 import type { NametagData } from '../../../types/txf';
 
 const TEST_DIR = path.join(__dirname, '.test-recover-nametag-mint');
@@ -124,13 +124,17 @@ describe('Sphere.recoverNametagFromTransport — on-chain token re-mint', () => 
 
     // Mint mock simulates the REAL `mintNametag` flow: aggregator
     // returns proof, setNametag stores the NametagData.
+    //
+    // Spy on PaymentsModule.prototype (NOT Sphere.prototype): the
+    // production code in recoverNametagFromTransport calls
+    // `this._payments.mintNametag(name)` directly, bypassing the
+    // public Sphere.mintNametag wrapper (which would otherwise throw
+    // "Sphere not initialized" because _initialized is false at this
+    // point in Sphere.create).
     mintSpy = vi
-      .spyOn(
-        Sphere.prototype as unknown as { mintNametag: (n: string) => Promise<unknown> },
-        'mintNametag',
-      )
+      .spyOn(PaymentsModule.prototype, 'mintNametag')
       .mockImplementation(async function (
-        this: SphereInternals,
+        this: PaymentsModule,
         name: string,
       ): Promise<MintNametagResult> {
         const data: NametagData = {
@@ -140,7 +144,7 @@ describe('Sphere.recoverNametagFromTransport — on-chain token re-mint', () => 
           format: 'txf',
           version: '2.0',
         };
-        await this._payments.setNametag(data);
+        await this.setNametag(data);
         return { success: true, token: null, nametagData: data } as MintNametagResult;
       });
 
@@ -173,10 +177,7 @@ describe('Sphere.recoverNametagFromTransport — on-chain token re-mint', () => 
     // identity claim, and the operator can retry mintNametag manually
     // later.
     mintSpy = vi
-      .spyOn(
-        Sphere.prototype as unknown as { mintNametag: (n: string) => Promise<unknown> },
-        'mintNametag',
-      )
+      .spyOn(PaymentsModule.prototype, 'mintNametag')
       .mockResolvedValue({
         success: false,
         error: 'Aggregator unreachable (simulated)',
@@ -207,10 +208,7 @@ describe('Sphere.recoverNametagFromTransport — on-chain token re-mint', () => 
     const transport = createMockTransport();
 
     mintSpy = vi
-      .spyOn(
-        Sphere.prototype as unknown as { mintNametag: (n: string) => Promise<unknown> },
-        'mintNametag',
-      )
+      .spyOn(PaymentsModule.prototype, 'mintNametag')
       .mockRejectedValue(new Error('Network down (simulated)'));
 
     const { sphere } = await Sphere.init({
@@ -234,10 +232,7 @@ describe('Sphere.recoverNametagFromTransport — on-chain token re-mint', () => 
     (transport.recoverNametag as ReturnType<typeof vi.fn>).mockResolvedValue(null);
 
     mintSpy = vi
-      .spyOn(
-        Sphere.prototype as unknown as { mintNametag: (n: string) => Promise<unknown> },
-        'mintNametag',
-      )
+      .spyOn(PaymentsModule.prototype, 'mintNametag')
       .mockResolvedValue({ success: true, token: null, nametagData: null } as MintNametagResult);
 
     const { sphere } = await Sphere.init({

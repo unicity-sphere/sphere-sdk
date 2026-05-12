@@ -4096,7 +4096,14 @@ export class Sphere {
       // can retry manually.
       if (!this._payments.hasNametagNamed(recoveredNametag)) {
         try {
-          const mintResult = await this.mintNametag(recoveredNametag);
+          // Call PaymentsModule.mintNametag directly, NOT this.mintNametag.
+          // The public Sphere.mintNametag wrapper invokes ensureReady() —
+          // which throws "Sphere not initialized" because Sphere.create
+          // calls recoverNametagFromTransport BEFORE setting
+          // `_initialized = true`. The PaymentsModule's own
+          // ensureInitialized() check is satisfied at this point
+          // (initializeModules ran earlier in the create flow).
+          const mintResult = await this._payments.mintNametag(recoveredNametag);
           if (mintResult.success) {
             logger.debug(
               'Sphere',
