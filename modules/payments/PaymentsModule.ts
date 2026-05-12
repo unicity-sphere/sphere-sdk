@@ -8575,6 +8575,11 @@ export class PaymentsModule {
                 splitSource.coinIdHex,
                 recipientAddress,
                 onChainMessage,
+                // CONTRACT (Loop3-W3): this callback MUST NOT THROW.
+                // The executor swallows any throw, but a throw here
+                // would desync `burnDone` from the on-chain reality
+                // → phantom token. Keep this Set.add + primitive
+                // assignment only.
                 () => {
                   burnDone = true;
                   committedOnChainTokenIds.add(token.id);
@@ -8758,15 +8763,33 @@ export class PaymentsModule {
     let result: TransferResult;
     try {
       result = await sendConservativeUxf(originalRequest, recipient, deps);
-      // Loop1-S7 — commit every reservation id allocated by
-      // selectSources (primary + per-additional-asset queue ids).
+      // Loop1-S7 + Loop3-W2 — commit every reservation id allocated
+      // by selectSources (primary + per-additional-asset queue ids).
+      // Wrap each in try/catch: ReservationLedger.commit is
+      // currently non-throwing, but a future invariant assert
+      // shouldn't leak the remaining commits.
       for (const rid of reservationIds) {
-        this.reservationLedger.commit(rid);
+        try {
+          this.reservationLedger.commit(rid);
+        } catch (commitErr) {
+          logger.warn(
+            'Payments',
+            `dispatchUxfConservativeSend: reservationLedger.commit(${rid}) threw (swallowed): ${commitErr instanceof Error ? commitErr.message : String(commitErr)}`,
+          );
+        }
       }
     } catch (err) {
-      // Loop1-S7 — cancel every reservation id on failure.
+      // Loop1-S7 + Loop3-W2 — cancel every reservation id on failure,
+      // wrapped per-id so one throw doesn't leak the rest.
       for (const rid of reservationIds) {
-        this.reservationLedger.cancel(rid);
+        try {
+          this.reservationLedger.cancel(rid);
+        } catch (cancelErr) {
+          logger.warn(
+            'Payments',
+            `dispatchUxfConservativeSend: reservationLedger.cancel(${rid}) threw (swallowed): ${cancelErr instanceof Error ? cancelErr.message : String(cancelErr)}`,
+          );
+        }
       }
 
       // Loop1-S9 + Loop2-W1 — restore non-committed selected sources
@@ -8800,8 +8823,15 @@ export class PaymentsModule {
       } catch {
         // Non-fatal — in-memory state still reflects restoration.
       }
-      // Loop2-W2 — notify every restored coinId, wrapped per coin.
+      // Loop2-W2 + Loop3-W1 — notify every coinId the send touched
+      // (primary + every additional-asset coin), not just the ones
+      // whose tokens we actually restored. Wrapped per coin.
       restoredCoinIds.add(request.coinId);
+      for (const asset of originalRequest.additionalAssets ?? []) {
+        if (asset.kind === 'coin') {
+          restoredCoinIds.add(asset.coinId);
+        }
+      }
       for (const cid of restoredCoinIds) {
         try {
           this.spendQueue.notifyChange(cid);
@@ -9109,6 +9139,15 @@ export class PaymentsModule {
                   // submitCommitmentsImmediate; suppress the legacy
                   // background path so commitments aren't double-submitted.
                   skipBackground: true,
+                  // CONTRACT (Loop3-W3): this callback MUST NOT
+                  // THROW. The executor catches and swallows any
+                  // throw, but a throw here would leave `burnDone`
+                  // false while the burn IS on-chain spent —
+                  // recreating the phantom-token regression
+                  // Loop2-C2 was designed to close. Keep this
+                  // callback simple: `Set.add` + primitive
+                  // assignment ONLY. Do NOT add any async / I/O /
+                  // throwing operation here.
                   onBurnSubmitted: () => {
                     burnDone = true;
                     dispatcherCommittedOnChainTokenIds.add(token.id);
@@ -9143,19 +9182,19 @@ export class PaymentsModule {
                   },
                 },
               );
-              // Loop2-C2 — burnDone is already true if onBurnSubmitted
-              // fired (which happens at step-1 submit response, BEFORE
-              // step-2 proof wait). If buildSplitBundle returned
-              // successfully without invoking onBurnSubmitted (i.e.
-              // step-1 submit response check rejected before the
-              // callback fires), the source is NOT on-chain spent —
-              // burnDone stays false. The set-add below is a no-op in
-              // the happy path (already set by callback) but kept for
-              // defense-in-depth if a future executor revision moves
-              // the callback firing point.
-              if (burnDone) {
-                dispatcherCommittedOnChainTokenIds.add(token.id);
-              }
+              // Loop2-C2 — `burnDone` is set by the onBurnSubmitted
+              // callback inside buildSplitBundle, which fires AFTER the
+              // burn submit response is SUCCESS and BEFORE the proof
+              // wait. The callback already added `token.id` to
+              // `dispatcherCommittedOnChainTokenIds`; nothing more to
+              // do here. The contract is single-path:
+              //
+              //   callback fires ⇔ burn is on-chain ⇔ source tombstoned
+              //
+              // If buildSplitBundle returns without invoking the
+              // callback (which would require an executor regression),
+              // burnDone stays false and the source is restored by the
+              // outer catch.
 
               // Loop1-S4 — queue awaitChangeTokenWithProofs BEFORE
               // submitCommitmentsImmediate so a partial-failure path
@@ -9517,14 +9556,29 @@ export class PaymentsModule {
     let result: TransferResult;
     try {
       result = await sendInstantUxf(originalRequest, recipient, deps);
-      // Loop1-S7 — commit the reservation on success. Matches the
-      // legacy send() arm (PaymentsModule.ts:3871). Without this the
-      // ledger leaks an active reservation entry per send.
-      this.reservationLedger.commit(transferId);
+      // Loop1-S7 + Loop3-W2 — commit the reservation on success.
+      // Matches the legacy send() arm (PaymentsModule.ts:3871).
+      // Wrapped in try/catch: commit is currently non-throwing, but
+      // a future invariant assert shouldn't break the success path.
+      try {
+        this.reservationLedger.commit(transferId);
+      } catch (commitErr) {
+        logger.warn(
+          'Payments',
+          `dispatchUxfInstantSend: reservationLedger.commit(${transferId}) threw (swallowed): ${commitErr instanceof Error ? commitErr.message : String(commitErr)}`,
+        );
+      }
     } catch (err) {
-      // Loop1-S7 — cancel the reservation on failure (mirrors legacy
-      // send() catch at PaymentsModule.ts:3877).
-      this.reservationLedger.cancel(transferId);
+      // Loop1-S7 + Loop3-W2 — cancel the reservation on failure,
+      // wrapped to avoid masking the original throw.
+      try {
+        this.reservationLedger.cancel(transferId);
+      } catch (cancelErr) {
+        logger.warn(
+          'Payments',
+          `dispatchUxfInstantSend: reservationLedger.cancel(${transferId}) threw (swallowed): ${cancelErr instanceof Error ? cancelErr.message : String(cancelErr)}`,
+        );
+      }
 
       // Loop1-S9 + Loop2-W1 — restore any selected source NOT yet
       // on-chain committed. Without this, a multi-source send that
@@ -9570,12 +9624,19 @@ export class PaymentsModule {
         // applies for the rest of this session and the next load will
         // see the persistent state.
       }
-      // Loop2-W2 — notify the spend queue for EVERY restored coinId
-      // (not just request.coinId). Multi-coin sends would otherwise
-      // leave waiters on additional coins parked indefinitely. Wrap
-      // each notify in try/catch so a listener error doesn't mask
-      // the original throw.
+      // Loop2-W2 + Loop3-W1 — notify the spend queue for EVERY
+      // coinId the send touched, not just the ones whose tokens we
+      // actually restored. A planSend failure on coin USDU before
+      // ANY USDU token got marked `transferring` would otherwise
+      // leave USDU's queue waiters parked indefinitely. Wrap each
+      // notify in try/catch so a listener error doesn't mask the
+      // original throw.
       restoredCoinIds.add(request.coinId);
+      for (const asset of originalRequest.additionalAssets ?? []) {
+        if (asset.kind === 'coin') {
+          restoredCoinIds.add(asset.coinId);
+        }
+      }
       for (const cid of restoredCoinIds) {
         try {
           this.spendQueue.notifyChange(cid);
