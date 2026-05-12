@@ -9560,6 +9560,16 @@ export class PaymentsModule {
       // Matches the legacy send() arm (PaymentsModule.ts:3871).
       // Wrapped in try/catch: commit is currently non-throwing, but
       // a future invariant assert shouldn't break the success path.
+      //
+      // FOOTGUN (Loop4 review): instant dispatcher uses a single
+      // `transferId` as its reservation id because today it does
+      // not fan out per-additional-asset planSend calls (only the
+      // primary coin gets reserved). If you ADD additional-asset
+      // planSend calls in `selectSources` above, you MUST track
+      // their queue ids in an array and migrate this single
+      // commit/cancel to a loop — mirror the conservative
+      // dispatcher's `reservationIds` array pattern. Otherwise the
+      // new per-coin reservations leak silently.
       try {
         this.reservationLedger.commit(transferId);
       } catch (commitErr) {
@@ -9570,7 +9580,8 @@ export class PaymentsModule {
       }
     } catch (err) {
       // Loop1-S7 + Loop3-W2 — cancel the reservation on failure,
-      // wrapped to avoid masking the original throw.
+      // wrapped to avoid masking the original throw. Same FOOTGUN
+      // applies (see comment above).
       try {
         this.reservationLedger.cancel(transferId);
       } catch (cancelErr) {
