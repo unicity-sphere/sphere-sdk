@@ -1330,3 +1330,208 @@ describe('__resetSourceLocksForTesting — Wave 7 fail-closed guard', () => {
     expect(() => __resetSourceLocksForTesting()).not.toThrow();
   });
 });
+
+// =============================================================================
+// #142 — InstantSourceSelection forwarding (split intent)
+// =============================================================================
+//
+// FIX 1 widened `InstantSelectSourcesFn` to return either the legacy array
+// shape or the new structured `InstantSourceSelection`. The orchestrator
+// normalizes both shapes and forwards `splitSource` to `commitSources`.
+// These tests lock down the normalization + forwarding contract so the
+// production wiring in dispatchUxfInstantSend (FIX 2) can depend on it.
+
+describe('sendInstantUxf — splitSource forwarding (#142 FIX 1)', () => {
+  it('forwards splitSource metadata from selectSources to commitSources', async () => {
+    const splitSourceTok = makeToken('split-tok', TOKEN_A, {
+      amount: '1000000',
+    });
+    const commitResult = makeCommitResult({
+      sourceTokenId: 'split-tok',
+      fixture: TOKEN_A,
+    });
+    let observedSplitSource: unknown = 'NOT_CALLED';
+    const { deps } = makeDeps({
+      availableSources: () => [splitSourceTok],
+      selectSources: async () => ({
+        directSources: [],
+        splitSource: {
+          token: splitSourceTok,
+          splitAmount: 300_000n,
+          remainderAmount: 700_000n,
+          coinIdHex: 'UCT',
+        },
+      }),
+      commitSources: async ({ splitSource }) => {
+        observedSplitSource = splitSource;
+        return [commitResult];
+      },
+    });
+
+    // Make the request budget cover the slice (300_000) so the guard
+    // doesn't fire (TOKEN_A's recipient fixture has coinData 1_000_000 —
+    // for this contract test we set the budget high to focus on the
+    // forwarding invariant alone).
+    await sendInstantUxf(
+      basicRequest({ amount: '1000000' }),
+      makePeerInfo(),
+      deps,
+    );
+
+    expect(observedSplitSource).toMatchObject({
+      token: splitSourceTok,
+      splitAmount: 300_000n,
+      remainderAmount: 700_000n,
+      coinIdHex: 'UCT',
+    });
+  });
+
+  it('legacy array-shape selectSources still works (no splitSource)', async () => {
+    const source = makeToken('tok-1', TOKEN_A);
+    const commitResult = makeCommitResult({
+      sourceTokenId: 'tok-1',
+      fixture: TOKEN_A,
+    });
+    let observedSplitSource: unknown = 'NOT_CALLED';
+    const { deps } = makeDeps({
+      availableSources: () => [source],
+      // LEGACY return shape — flat array. No splitSource.
+      selectSources: async () => [source],
+      commitSources: async ({ splitSource }) => {
+        observedSplitSource = splitSource;
+        return [commitResult];
+      },
+    });
+
+    await sendInstantUxf(
+      basicRequest({ amount: '1000000' }),
+      makePeerInfo(),
+      deps,
+    );
+
+    expect(observedSplitSource).toBeUndefined();
+  });
+});
+
+// =============================================================================
+// #142 — OVER_TRANSFER_GUARD post-commit assertion
+// =============================================================================
+//
+// The guard runs AFTER commitSources returns. It walks the recipient token
+// JSONs and sums the per-coin `genesis.data.coinData` amounts; rejects if any
+// coin's shipped sum exceeds the request's per-coin total. This block locks
+// down the over-send invariant — the exact failure mode from issue #142
+// where a partial-amount send silently shipped the entire source token.
+
+describe('sendInstantUxf — OVER_TRANSFER_GUARD (#142)', () => {
+  it('rejects when whole-token coinData exceeds request amount', async () => {
+    // TOKEN_A's coinData is [['UCT', '1000000']]. If the request asks for
+    // only 500000 UCT but the commitSources callback whole-token-transfers
+    // the source, the recipient receives 1000000 — the silent over-send
+    // bug. The guard must throw OVER_TRANSFER_GUARD.
+    const source = makeToken('tok-1', TOKEN_A);
+    const overSendResult = makeCommitResult({
+      sourceTokenId: 'tok-1',
+      fixture: TOKEN_A, // recipientTokenJson.genesis.data.coinData = [['UCT', '1000000']]
+    });
+    const { deps, transport } = makeDeps({
+      availableSources: () => [source],
+      selectSources: async () => [source],
+      commitSources: async () => [overSendResult],
+    });
+
+    let caught: unknown;
+    try {
+      await sendInstantUxf(
+        basicRequest({ amount: '500000' }),
+        makePeerInfo(),
+        deps,
+      );
+    } catch (err) {
+      caught = err;
+    }
+    if (!isSphereError(caught)) {
+      throw new Error(`expected SphereError; got ${String(caught)}`);
+    }
+    expect(caught.code).toBe('OVER_TRANSFER_GUARD');
+    // CRITICAL — the guard fires BEFORE transport publish. Bob must
+    // never see the over-send.
+    expect(transport._calls).toEqual([]);
+  });
+
+  it('passes when shipped coin amount equals request amount', async () => {
+    // Whole-token request of the full 1000000 — coinData equals request,
+    // no over-send. Bundle must ship.
+    const source = makeToken('tok-1', TOKEN_A);
+    const wholeResult = makeCommitResult({
+      sourceTokenId: 'tok-1',
+      fixture: TOKEN_A,
+    });
+    const { deps, transport } = makeDeps({
+      availableSources: () => [source],
+      selectSources: async () => [source],
+      commitSources: async () => [wholeResult],
+    });
+
+    await sendInstantUxf(
+      basicRequest({ amount: '1000000' }),
+      makePeerInfo(),
+      deps,
+    );
+
+    expect(transport._calls).toHaveLength(1);
+  });
+
+  it('skips NFT commit results (no fungible amount counted)', async () => {
+    // NFT-class result has no coinData → guard MUST NOT compare against
+    // the request's primary coin budget for it. A mixed coin + NFT
+    // send with the coin amount exactly matching the budget should pass
+    // even though the NFT entry exists alongside.
+    const NFT_TOKEN_ID =
+      'fa11000000000000000000000000000000000000000000000000000000000001';
+    const NFT_FIXTURE: Record<string, unknown> = {
+      ...TOKEN_A,
+      genesis: {
+        ...((TOKEN_A as { genesis: Record<string, unknown> }).genesis),
+        data: {
+          ...(
+            (TOKEN_A as { genesis: { data: Record<string, unknown> } })
+              .genesis.data
+          ),
+          tokenId: NFT_TOKEN_ID,
+          coinData: [],
+        },
+      },
+    };
+    const coinSource = makeToken('tok-1', TOKEN_A);
+    const nftSource = makeToken(NFT_TOKEN_ID, NFT_FIXTURE);
+    const coinResult = makeCommitResult({
+      sourceTokenId: 'tok-1',
+      fixture: TOKEN_A,
+    });
+    const nftResult = makeCommitResult({
+      sourceTokenId: NFT_TOKEN_ID,
+      fixture: NFT_FIXTURE,
+      tokenClass: 'nft',
+    });
+    const { deps, transport } = makeDeps({
+      availableSources: () => [coinSource, nftSource],
+      selectSources: async () => [coinSource, nftSource],
+      commitSources: async () => [coinResult, nftResult],
+      // Treat the NFT source as NFT-class for the validator path.
+      toTokenLike: (t) =>
+        t.id === NFT_TOKEN_ID
+          ? { id: t.id, coins: null }
+          : { id: t.id, coins: [{ coinId: t.coinId, amount: BigInt(t.amount) }] },
+    });
+
+    // Coin budget exactly matches the coin entry; NFT entry must not
+    // trip the guard.
+    await sendInstantUxf(
+      basicRequest({ amount: '1000000' }),
+      makePeerInfo(),
+      deps,
+    );
+    expect(transport._calls).toHaveLength(1);
+  });
+});

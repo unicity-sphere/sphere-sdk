@@ -289,9 +289,32 @@ export class InstantSplitExecutor {
       nametagTokenJson,
     };
 
+    // #142 — pre-compute the artifacts the UXF dispatcher needs to
+    // assemble a recipient SDK Token JSON. JSON.stringify/JSON.parse
+    // round-trip ensures the data is plain-object (no Uint8Array refs)
+    // and matches the shape the UXF bundle ingest expects.
+    const recipientMintDataJson = recipientMintCommitment.transactionData.toJSON();
+    const recipientMintedStateJson = mintedState.toJSON();
+    const transferCommitmentJson = transferCommitment.toJSON() as {
+      transactionData?: unknown;
+      requestId?: unknown;
+    };
+    const transferTxDataJson = transferCommitmentJson.transactionData;
+    const transferRequestIdBytes = transferCommitment.requestId;
+    const transferRequestIdHex =
+      transferRequestIdBytes instanceof Uint8Array
+        ? toHex(transferRequestIdBytes)
+        : typeof (transferRequestIdBytes as { toJSON?: () => string })?.toJSON === 'function'
+          ? (transferRequestIdBytes as { toJSON: () => string }).toJSON()
+          : String(transferRequestIdBytes);
+
     return {
       bundle,
       splitGroupId,
+      // Legacy V6 path: submits all three commitments + waits for sender
+      // mint proof + constructs change token, all in the background.
+      // The UXF path uses submitCommitmentsImmediate +
+      // awaitChangeTokenWithProofs instead.
       startBackground: async () => {
         if (!options?.skipBackground) {
           await this.submitBackgroundV5(senderMintCommitment, recipientMintCommitment, transferCommitment, {
@@ -306,7 +329,168 @@ export class InstantSplitExecutor {
           });
         }
       },
+      // UXF path: submit-only (no proof waits). Throws on any submission
+      // failure so the dispatcher can abort before shipping the bundle.
+      submitCommitmentsImmediate: () =>
+        this.submitCommitmentsImmediate(
+          senderMintCommitment,
+          recipientMintCommitment,
+          transferCommitment,
+        ),
+      // UXF path: post-transport background work. Waits for the
+      // sender's mint proof, constructs the change token, calls
+      // onChangeTokenCreated. Errors are logged inside, never thrown.
+      awaitChangeTokenWithProofs: () =>
+        this.awaitChangeTokenWithProofs(senderMintCommitment, {
+          signingService: this.signingService,
+          tokenType: tokenToSplit.type,
+          coinId,
+          senderTokenId,
+          senderSalt,
+          onProgress: options?.onBackgroundProgress,
+          onChangeTokenCreated: options?.onChangeTokenCreated,
+          onStorageSync: options?.onStorageSync,
+        }),
+      transferRequestIdHex,
+      recipientMintDataJson,
+      recipientMintedStateJson,
+      transferTxDataJson,
     };
+  }
+
+  /**
+   * #142 — UXF instant-split wiring. Submits the sender mint,
+   * recipient mint, and transfer commitments to the aggregator and
+   * awaits each submit response. Does NOT wait for inclusion proofs.
+   *
+   * Used by the UXF dispatcher to anchor commitments BEFORE shipping
+   * the recipient-bound bundle. Throws on any submission failure so
+   * the caller can abort with the sources still recoverable (mint
+   * commitments that landed are harmless; the dispatcher's
+   * removeToken will tombstone the source regardless).
+   *
+   * Latency: ~50ms parallel submission, dominated by network
+   * round-trip. Compare to submitBackgroundV5 which adds the ~2s mint
+   * proof wait — too slow for the UXF critical path.
+   *
+   * @internal
+   */
+  private async submitCommitmentsImmediate(
+    senderMintCommitment: MintCommitment<any>,
+    recipientMintCommitment: MintCommitment<any>,
+    transferCommitment: TransferCommitment,
+  ): Promise<void> {
+    logger.debug('InstantSplit', 'submitCommitmentsImmediate: submitting three commitments in parallel');
+
+    type SubmitOutcome =
+      | { kind: 'ok'; label: string; status: string }
+      | { kind: 'err'; label: string; status: 'ERROR'; error: unknown };
+
+    const labelled = (
+      label: string,
+      promise: Promise<{ status: string }>,
+    ): Promise<SubmitOutcome> =>
+      promise.then(
+        (res): SubmitOutcome => ({ kind: 'ok', label, status: res.status }),
+        (err): SubmitOutcome => ({ kind: 'err', label, status: 'ERROR', error: err }),
+      );
+
+    const results = await Promise.all([
+      labelled('senderMint', this.client.submitMintCommitment(senderMintCommitment)),
+      labelled('recipientMint', this.client.submitMintCommitment(recipientMintCommitment)),
+      labelled('transfer', this.client.submitTransferCommitment(transferCommitment)),
+    ]);
+
+    // Any non-success / non-already-exists status is fatal — the UXF
+    // bundle would ship referencing aggregator-unknown commitments.
+    for (const r of results) {
+      if (r.kind === 'err') {
+        const msg = r.error instanceof Error ? r.error.message : String(r.error);
+        throw new SphereError(
+          `submitCommitmentsImmediate: ${r.label} submission threw: ${msg}`,
+          'TRANSFER_FAILED',
+          r.error,
+        );
+      }
+      if (r.status !== 'SUCCESS' && r.status !== 'REQUEST_ID_EXISTS') {
+        throw new SphereError(
+          `submitCommitmentsImmediate: ${r.label} submission rejected with status=${r.status}`,
+          'TRANSFER_FAILED',
+        );
+      }
+    }
+    logger.debug('InstantSplit', 'submitCommitmentsImmediate: all three commitments anchored');
+  }
+
+  /**
+   * #142 — UXF instant-split wiring. After commitments are anchored
+   * via submitCommitmentsImmediate, this method waits for the sender's
+   * mint proof, reconstructs the change token, and invokes
+   * onChangeTokenCreated.
+   *
+   * Errors are caught and logged (NOT re-thrown). The UXF bundle has
+   * already shipped by the time this runs; throwing would propagate
+   * into a fire-and-forget context with no observer.
+   *
+   * @internal
+   */
+  private async awaitChangeTokenWithProofs(
+    senderMintCommitment: MintCommitment<any>,
+    context: BackgroundContext,
+  ): Promise<void> {
+    try {
+      logger.debug('InstantSplit', 'awaitChangeTokenWithProofs: waiting for sender mint proof');
+      const senderMintProof = this.devMode
+        ? await this.waitInclusionProofWithDevBypass(senderMintCommitment)
+        : await waitInclusionProof(this.trustBase, this.client, senderMintCommitment);
+
+      const mintTransaction = senderMintCommitment.toTransaction(senderMintProof);
+      const predicate = await UnmaskedPredicate.create(
+        context.senderTokenId,
+        context.tokenType,
+        context.signingService,
+        HashAlgorithm.SHA256,
+        context.senderSalt,
+      );
+      const state = new TokenState(predicate, null);
+      const changeToken = await Token.mint(this.trustBase, state, mintTransaction);
+
+      if (!this.devMode) {
+        const verification = await changeToken.verify(this.trustBase);
+        if (!verification.isSuccessful) {
+          throw new SphereError('Change token verification failed', 'TRANSFER_FAILED');
+        }
+      }
+
+      context.onProgress?.({
+        stage: 'CHANGE_TOKEN_SAVED',
+        message: 'Change token created and verified',
+      });
+
+      if (context.onChangeTokenCreated) {
+        await context.onChangeTokenCreated(changeToken);
+      }
+
+      if (context.onStorageSync) {
+        try {
+          await context.onStorageSync();
+        } catch (syncError) {
+          logger.warn('InstantSplit', 'awaitChangeTokenWithProofs: storage sync error:', syncError);
+        }
+      }
+
+      context.onProgress?.({
+        stage: 'COMPLETED',
+        message: 'Change token persisted',
+      });
+    } catch (err) {
+      logger.error('InstantSplit', 'awaitChangeTokenWithProofs: failed', err);
+      context.onProgress?.({
+        stage: 'FAILED',
+        message: 'Change token construction failed',
+        error: String(err),
+      });
+    }
   }
 
   /**

@@ -499,4 +499,94 @@ export interface BuildSplitBundleResult {
   splitGroupId: string;
   /** Call this after transport delivery to start background mint proof + change token creation */
   startBackground: () => Promise<void>;
+
+  // ---------------------------------------------------------------
+  // #142 UXF instant-split wiring — exposed artifacts for the UXF
+  // dispatcher (dispatchUxfInstantSend) to assemble a recipient-shaped
+  // SDK Token JSON for ingestion into the UXF bundle.
+  //
+  // The legacy V6 path (CombinedTransferBundleV6) embeds the full V5
+  // bundle on the wire and reconstructs on the recipient side. The
+  // UXF path instead ships standard SDK Token JSON ({genesis, state,
+  // transactions}) with `inclusionProof: null` on every transition —
+  // the recipient's chain-walker resolves proofs when the aggregator
+  // has them. For that to work, the recipient mint and transfer
+  // commitments MUST be submitted to the aggregator BEFORE the UXF
+  // bundle ships (otherwise the chain-walker sees them as unknown
+  // forever).
+  //
+  // The legacy `startBackground()` callback batches all three
+  // commitment submissions into the background — too late for the
+  // UXF path. {@link submitCommitmentsImmediate} factors out the
+  // commit submissions (no proof waits, ~50ms) so the UXF dispatcher
+  // can run them before transport. The slow part — waiting for the
+  // sender's mint proof and constructing the change token — stays in
+  // {@link awaitChangeTokenWithProofs} and runs after transport ack.
+  // ---------------------------------------------------------------
+
+  /**
+   * Submit the sender mint, recipient mint, and transfer commitments
+   * to the aggregator and await each submit response. Does NOT wait
+   * for inclusion proofs — that work happens in
+   * {@link awaitChangeTokenWithProofs}. Throws SphereError if any
+   * submission fails (status not SUCCESS/REQUEST_ID_EXISTS).
+   *
+   * Optional — set only when buildSplitBundle is invoked with
+   * `skipBackground: true`. Legacy V6 callers (PaymentsModule
+   * line ~3683) leave this undefined and rely on the
+   * `startBackground()` path that submits in the background.
+   */
+  readonly submitCommitmentsImmediate?: () => Promise<void>;
+
+  /**
+   * After submitCommitmentsImmediate, wait for the sender's mint
+   * proof, construct the change token via Token.mint, and invoke
+   * `onChangeTokenCreated`. Fire-and-forget from the UXF dispatcher
+   * (failure is logged, not propagated — the bundle has already
+   * shipped).
+   *
+   * Optional — see submitCommitmentsImmediate.
+   */
+  readonly awaitChangeTokenWithProofs?: () => Promise<void>;
+
+  /**
+   * Hex-encoded requestId of the transfer commitment (the new
+   * transition that ships in the recipient token JSON's transactions
+   * array). Used by the UXF dispatcher to populate
+   * {@link InstantCommitResult.requestIdHex} for the split path.
+   *
+   * Optional — see submitCommitmentsImmediate.
+   */
+  readonly transferRequestIdHex?: string;
+
+  /**
+   * JSON form of the recipient's mint transaction data. Goes into
+   * the recipient token JSON's `genesis.data` field with
+   * `inclusionProof: null`. The recipient's chain-walker resolves
+   * the proof when the aggregator returns it.
+   *
+   * Optional — see submitCommitmentsImmediate.
+   */
+  readonly recipientMintDataJson?: unknown;
+
+  /**
+   * JSON form of the recipient's minted state (after the mint, before
+   * the transfer). Goes into the recipient token JSON's `state` field.
+   * The recipient needs this to reconstruct the predicate before
+   * applying the transfer (the recipient cannot derive sender-keyed
+   * predicates from their own signing service).
+   *
+   * Optional — see submitCommitmentsImmediate.
+   */
+  readonly recipientMintedStateJson?: unknown;
+
+  /**
+   * JSON form of the transfer transaction's `transactionData`
+   * (recipient address + salt + nametags). Goes into the recipient
+   * token JSON's `transactions[0].data` field with
+   * `inclusionProof: null`.
+   *
+   * Optional — see submitCommitmentsImmediate.
+   */
+  readonly transferTxDataJson?: unknown;
 }
