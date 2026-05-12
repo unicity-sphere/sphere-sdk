@@ -1118,6 +1118,11 @@ export interface ProofPollingJob {
   startedAt: number;
   attemptCount: number;
   lastAttemptAt: number;
+  /** Cumulative attempts across all process lifetimes (steelman FIX G
+   *  #144). Sum of every `attemptCount` value the job ever held before
+   *  being persisted. Used to enforce a hard cap so a permanently-stuck
+   *  receive doesn't poll the aggregator forever. */
+  cumulativeAttempts?: number;
   /** Callback when proof is received */
   onProofReceived?: (tokenId: string) => void;
 }
@@ -1127,6 +1132,13 @@ export interface ProofPollingJob {
  * tokenId + state hash because the in-memory `Token.id` is a UUID at
  * receive time but becomes the genesis tokenId after save→load (see
  * `txfToToken` in `serialization/txf-serializer.ts`).
+ *
+ * `cumulativeAttempts` is preserved across restarts so a token that has
+ * already burned through several `MAX_ATTEMPTS` budgets in prior process
+ * lifetimes can be definitively marked invalid (steelman FIX G #144).
+ * Without this, every restart hands the same stuck token a fresh 60s
+ * budget — an unbounded zombie loop if the aggregator never produces the
+ * proof.
  */
 interface PersistedProofPollingJob {
   genesisTokenId: string;
@@ -1137,6 +1149,9 @@ interface PersistedProofPollingJob {
   startedAt: number;
   attemptCount: number;
   lastAttemptAt: number;
+  /** Cumulative attempts across all process lifetimes. Optional for
+   *  backward compat with older KV payloads (treated as 0). */
+  cumulativeAttempts?: number;
 }
 
 // =============================================================================
@@ -1269,6 +1284,12 @@ export class PaymentsModule {
   private proofPollingInterval: ReturnType<typeof setInterval> | null = null;
   private static readonly PROOF_POLLING_INTERVAL_MS = 2000;  // Poll every 2s
   private static readonly PROOF_POLLING_MAX_ATTEMPTS = 30;   // Max 30 attempts (~60s)
+  /** Steelman FIX G (#144): hard cap on cumulative attempts across
+   *  process lifetimes. Each restart re-resolves a `pending` token via
+   *  `recoverStrandedReceivedTokens`, which would otherwise allow
+   *  unbounded retries (60s × restarts). At 5× MAX_ATTEMPTS (~5min of
+   *  cumulative polling) we mark the token invalid and emit an alert. */
+  private static readonly PROOF_POLLING_MAX_CUMULATIVE_ATTEMPTS = 30 * 5;
 
   // Periodic retry for resolveUnconfirmed (V5 lazy finalization)
   private resolveUnconfirmedTimer: ReturnType<typeof setInterval> | null = null;
@@ -1285,6 +1306,18 @@ export class PaymentsModule {
 
   // Persistent dedup: tracks V6 combined transfer IDs that have been processed.
   private processedCombinedTransferIds: Set<string> = new Set();
+
+  /**
+   * Steelman FIX F (#144): cached PROXY addresses for our held nametags.
+   * Populated lazily by `primeProxyAddressCache()`, consumed
+   * synchronously by `isReceivedLegacyPending` to avoid the pre-FIX-F
+   * "any nametag + any proxyHash => candidate" loose match that opened
+   * a load-time DoS amplification surface (any peer could craft a
+   * PROXY://<garbage> TXF and force recovery polling). Stored as the
+   * full `PROXY://...` address string so we can do exact-equality match.
+   * Cleared on initialize() / destroy().
+   */
+  private proxyAddressCache: Set<string> = new Set();
 
   // Storage event subscriptions (push-based sync)
   private storageEventUnsubscribers: (() => void)[] = [];
@@ -1472,6 +1505,8 @@ export class PaymentsModule {
     this.forkedTokens.clear();
     this._historyCache = [];
     this.nametags = [];
+    // #144 FIX F: clear PROXY-address cache; re-primed in next load().
+    this.proxyAddressCache.clear();
 
     // Reset spend queue state
     this.reservationLedger.clear();
@@ -2614,6 +2649,18 @@ export class PaymentsModule {
       // Restore pending V5 tokens
       await this.loadPendingV5Tokens();
 
+      // Prime the PROXY-address cache so `isReceivedLegacyPending`'s
+      // exact-match (#144 FIX F) recognizes tokens addressed to our
+      // held nametags. Must run BEFORE `restoreProofPollingJobs` and
+      // `recoverStrandedReceivedTokens` because both rely on
+      // `isReceivedLegacyPending` / `hasFinalizationPlan` to decide
+      // which tokens are eligible.
+      try {
+        await this.primeProxyAddressCache();
+      } catch (err) {
+        logger.debug('Payments', '[PROXY-CACHE] primeProxyAddressCache failed:', err);
+      }
+
       // Restore proof-polling jobs (#144 L1). Must run AFTER the active
       // token map is populated so we can resolve persisted
       // (genesisTokenId, stateHash) pairs to in-memory `Token.id`s — and
@@ -3255,6 +3302,8 @@ export class PaymentsModule {
     // Stop proof polling (NOSTR-FIRST)
     this.stopProofPolling();
     this.proofPollingJobs.clear();
+    // #144 FIX F: clear PROXY-address cache (per-address state).
+    this.proxyAddressCache.clear();
 
     // Stop V5 resolve-unconfirmed retry polling
     this.stopResolveUnconfirmedPolling();
@@ -6408,22 +6457,49 @@ export class PaymentsModule {
     const directAddr = this.deps!.identity.directAddress;
     if (directAddr && recipientAddr === directAddr) return true;
 
-    // PROXY match: check if we hold the nametag whose PROXY address
-    // matches. This is best-effort — `getNametag()` returns the in-memory
-    // nametag for the current address. A token addressed via a different
-    // address's nametag won't be recognized here, which matches the
-    // existing finalize path's behavior.
+    // PROXY exact match — steelman FIX F (#144). Requires the
+    // `proxyAddressCache` to have been primed via
+    // `primeProxyAddressCache` (called from `load()`). Tokens addressed
+    // to a PROXY we don't hold are rejected, preventing recover-load
+    // amplification by malicious peers crafting PROXY://<garbage> TXFs.
     if (recipientAddr.startsWith('PROXY://')) {
-      const proxyHash = recipientAddr.slice('PROXY://'.length);
-      // Lazy check: deep PROXY validation requires async ProxyAddress
-      // import + nametag token id derivation. Cheaper synchronous proxy:
-      // if the wallet currently has any nametag, treat as candidate (the
-      // finalize step will reject if the actual proxy doesn't match).
-      const localNametag = this.getNametag();
-      if (localNametag?.token && proxyHash.length > 0) return true;
+      return this.proxyAddressCache.has(recipientAddr);
     }
 
     return false;
+  }
+
+  /**
+   * Steelman FIX F (#144): populate `proxyAddressCache` with the full
+   * PROXY:// address(es) for our held nametag(s). Called from `load()`
+   * after nametags are loaded but BEFORE `recoverStrandedReceivedTokens`
+   * runs, so the recovery scan sees an accurate cache.
+   *
+   * Best-effort: errors are logged and the relevant entry omitted. An
+   * empty cache means PROXY-mode receives can't be recovered, but the
+   * DIRECT-mode path (the common case) is unaffected.
+   */
+  private async primeProxyAddressCache(): Promise<void> {
+    this.proxyAddressCache.clear();
+    for (const nametagRecord of this.nametags) {
+      const tokenJson = nametagRecord?.token as unknown;
+      if (!tokenJson) continue;
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const nametagToken = await SdkToken.fromJSON(tokenJson as any) as SdkToken<any>;
+        const { ProxyAddress } = await import(
+          '@unicitylabs/state-transition-sdk/lib/address/ProxyAddress'
+        );
+        const proxy = await ProxyAddress.fromTokenId(nametagToken.id);
+        this.proxyAddressCache.add(proxy.address);
+      } catch (err) {
+        logger.debug(
+          'Payments',
+          `[PROXY-CACHE] Failed to derive PROXY for nametag ${nametagRecord?.name ?? '?'}:`,
+          err,
+        );
+      }
+    }
   }
 
   /**
@@ -6720,6 +6796,17 @@ export class PaymentsModule {
       return 'stillPending';
     }
 
+    // Steelman FIX D (#144): recovery jobs (registered by
+    // `recoverStrandedReceivedTokens`) carry `commitmentJson: ''` — we
+    // can't reconstruct the sender's authenticator, so the polling queue
+    // uses the `getProof(requestIdHex)` fallback for them. Mirror that
+    // here. Pre-FIX-D, `JSON.parse('')` threw, the outer catch swallowed
+    // it, and this 10s defense-in-depth retry was a silent no-op for the
+    // exact migration scenario it was meant to cover.
+    if (!job.commitmentJson) {
+      return await this.resolveLegacyReceivedTokenViaGetProof(tokenId, job);
+    }
+
     try {
       const commitmentInput = JSON.parse(job.commitmentJson);
       const commitment = await TransferCommitment.fromJSON(commitmentInput);
@@ -6778,6 +6865,56 @@ export class PaymentsModule {
       logger.debug(
         'Payments',
         `[V6-RESOLVE] Error resolving legacy receive ${tokenId.slice(0, 12)}: ${(err as Error)?.message ?? err}`,
+      );
+      return 'stillPending';
+    }
+  }
+
+  /**
+   * #144 L3 + steelman FIX D — defense-in-depth retry for recovery jobs
+   * (registered by `recoverStrandedReceivedTokens`). Uses
+   * `getProof(requestIdHex)` since we don't have a `TransferCommitment`
+   * for reconstructed jobs. On success, hands off to
+   * `finalizeStrandedReceivedToken` which patches the inclusion proof
+   * into the source TXF and finalizes.
+   */
+  private async resolveLegacyReceivedTokenViaGetProof(
+    tokenId: string,
+    job: ProofPollingJob,
+  ): Promise<'resolved' | 'stillPending' | 'failed'> {
+    try {
+      const abortController = new AbortController();
+      const timeoutId = setTimeout(() => abortController.abort(), 500);
+      let proofResult: unknown = null;
+      try {
+        proofResult = await Promise.race([
+          this.deps!.oracle.getProof(job.requestIdHex),
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 500)),
+        ]);
+      } catch {
+        clearTimeout(timeoutId);
+        return 'stillPending';
+      }
+      clearTimeout(timeoutId);
+      if (!proofResult) return 'stillPending';
+
+      // The recovery callback (`finalizeStrandedReceivedToken`) does the
+      // actual patch+finalize using `sourceTokenJson` + the cached
+      // lastTxJson it closed over at registration time. Don't reimplement
+      // that here — just invoke the callback.
+      if (!job.onProofReceived) return 'failed';
+      await job.onProofReceived(tokenId);
+
+      // Clean up; `finalizeStrandedReceivedToken` doesn't remove the job.
+      this.proofPollingJobs.delete(tokenId);
+      this.saveProofPollingJobs().catch((err) =>
+        logger.debug('Payments', '[V6-PERSIST] saveProofPollingJobs after recovery resolve failed:', err),
+      );
+      return 'resolved';
+    } catch (err) {
+      logger.debug(
+        'Payments',
+        `[V6-RESOLVE] Error resolving recovery job ${tokenId.slice(0, 12)}: ${(err as Error)?.message ?? err}`,
       );
       return 'stillPending';
     }
@@ -10038,14 +10175,35 @@ export class PaymentsModule {
 
       // History entry was already created in handleCommitmentOnlyTransfer() — no duplicate here
     } catch (error) {
+      // Steelman FIX H (#144): pre-FIX, this catch unconditionally
+      // flipped status to 'confirmed' on ANY finalize failure — "user
+      // has the token" — but that swallows real integrity failures
+      // (trustBase mismatch, predicate validation, invalid proof) and
+      // leaves a token-shaped placeholder in the active map that fails
+      // every subsequent verification while counting toward balance.
+      // The restart-recovery path (#144 L1 restoreProofPollingJobs)
+      // widens this catch's reach, making the bug user-visible.
+      //
+      // Fixed behavior: leave the token at its current status (typically
+      // 'submitted'/'pending' so the polling queue retries) and emit a
+      // typed operator-alert so the UI / support has a signal.
       logger.error('Payments', 'Failed to finalize received token:', error);
-      // Mark as confirmed anyway (user has the token)
-      const token = this.tokens.get(tokenId);
-      if (token && token.status === 'submitted') {
-        token.status = 'confirmed';
-        token.updatedAt = Date.now();
-        await this.save();
+      try {
+        this.deps!.emitEvent('transfer:operator-alert', {
+          // `proof-throw` matches §5.4's "proof verify threw" — closest
+          // canonical DispositionReason for a finalize-side failure that
+          // we can't cleanly attribute to one of the structural codes.
+          code: 'proof-throw',
+          tokenId,
+          message:
+            `finalizeReceivedToken threw for ${tokenId.slice(0, 12)}...: ` +
+            `${(error as Error)?.message ?? String(error)}. ` +
+            `Token left at current status for retry by the polling queue.`,
+        });
+      } catch {
+        // Event emitter not wired — log only.
       }
+      // Intentionally do NOT mutate token.status here.
     }
   }
 
@@ -10744,13 +10902,32 @@ export class PaymentsModule {
       ) {
         const txf = tokenToTxf(token);
         if (txf?.genesis?.data?.tokenId) {
-          this.archivedTokens.set(txf.genesis.data.tokenId, txf);
+          const archiveTokenId = txf.genesis.data.tokenId;
+          // Steelman FIX E (#144): the archive map can already contain a
+          // record for this tokenId — either from prior archiving (legit
+          // history) or from a FORK (different state of same tokenId).
+          // Pre-FIX-E we silently overwrote, destroying fork-detection
+          // evidence. Now: if archive already has it, skip — the prior
+          // record wins. The active-map removal still happens (we don't
+          // re-add the token to `this.tokens`). Fork resolution should
+          // happen via the explicit `archiveToken()`/`storeForkedToken`
+          // flow, not via load-time invariant enforcement.
+          if (this.archivedTokens.has(archiveTokenId)) {
+            logger.debug(
+              'Payments',
+              `[BALANCE-INVARIANT] Token ${token.id.slice(0, 12)} ` +
+                `already in archive — leaving existing record intact ` +
+                `(possible fork or prior archive). Dropping active copy.`,
+            );
+          } else {
+            this.archivedTokens.set(archiveTokenId, txf);
+            logger.debug(
+              'Payments',
+              `[BALANCE-INVARIANT] Moved token ${token.id.slice(0, 12)} to archive — ` +
+                `latest state predicate not ours, no finalization plan`,
+            );
+          }
           archiveMoved++;
-          logger.debug(
-            'Payments',
-            `[BALANCE-INVARIANT] Moved token ${token.id.slice(0, 12)} to archive — ` +
-              `latest state predicate not ours, no finalization plan`,
-          );
           continue;
         }
         // Couldn't convert to TXF — keep in active to avoid data loss.
@@ -10874,6 +11051,11 @@ export class PaymentsModule {
         startedAt: job.startedAt,
         attemptCount: job.attemptCount,
         lastAttemptAt: job.lastAttemptAt,
+        // Steelman FIX G (#144): persist cumulative attempts across
+        // process lifetimes. The session's current `attemptCount` is
+        // ADDED to the previously-persisted total at restore time, so
+        // we save the running total here (= prior + current).
+        cumulativeAttempts: (job.cumulativeAttempts ?? 0) + job.attemptCount,
       });
     }
 
@@ -10974,6 +11156,39 @@ export class PaymentsModule {
         continue;
       }
 
+      // Steelman FIX G (#144): cumulative-attempts cap. If this token
+      // has already burned through MAX_CUMULATIVE_ATTEMPTS across
+      // prior process lifetimes, mark it invalid and skip restoration.
+      // Without this cap, every restart hands the same stuck token a
+      // fresh 60s budget — an unbounded zombie loop.
+      const cumulativeSoFar = p.cumulativeAttempts ?? 0;
+      if (cumulativeSoFar >= PaymentsModule.PROOF_POLLING_MAX_CUMULATIVE_ATTEMPTS) {
+        logger.debug(
+          'Payments',
+          `[V6-RESTORE] Token ${memoryTokenId.slice(0, 12)} ` +
+            `exceeded cumulative attempt cap (${cumulativeSoFar} >= ` +
+            `${PaymentsModule.PROOF_POLLING_MAX_CUMULATIVE_ATTEMPTS}) — marking invalid`,
+        );
+        if (existingToken && (existingToken.status === 'submitted' || existingToken.status === 'pending')) {
+          existingToken.status = 'invalid';
+          existingToken.updatedAt = Date.now();
+          this.tokens.set(memoryTokenId, existingToken);
+        }
+        try {
+          this.deps!.emitEvent('transfer:operator-alert', {
+            // Same canonical reason as per-process timeout — the
+            // proof never anchored after multiple polling windows.
+            code: 'oracle-rejected',
+            tokenId: memoryTokenId,
+            message:
+              `Token ${memoryTokenId.slice(0, 12)}... exceeded cumulative ` +
+              `proof-polling attempts (${cumulativeSoFar}). Marked invalid; ` +
+              `no further automatic recovery attempts will run for this token.`,
+          });
+        } catch { /* event emitter not wired */ }
+        continue;
+      }
+
       let sourceTokenInput: unknown;
       let commitmentInput: unknown;
       try {
@@ -10994,8 +11209,9 @@ export class PaymentsModule {
         commitmentJson: p.commitmentJson,
         sourceTokenJson: p.sourceTokenJson,
         startedAt: p.startedAt,
-        attemptCount: 0, // reset; prior process's attempts don't count
+        attemptCount: 0, // reset for the current session
         lastAttemptAt: 0,
+        cumulativeAttempts: cumulativeSoFar, // preserve cross-session total
         onProofReceived: async (tid) => {
           await this.finalizeReceivedToken(tid, sourceTokenInput, commitmentInput);
         },
@@ -11056,12 +11272,37 @@ export class PaymentsModule {
         // Check for timeout
         if (job.attemptCount >= PaymentsModule.PROOF_POLLING_MAX_ATTEMPTS) {
           logger.debug('Payments', `Proof polling timeout for token ${tokenId.slice(0, 8)}...`);
-          // Mark token as invalid due to timeout
+          // Mark token as invalid due to timeout.
+          // Steelman FIX C (#144): widen to include 'pending' — RECEIVE
+          // jobs target status='pending' tokens, and pre-fix the timeout
+          // never marked them invalid, leaving them at 'pending' forever
+          // and re-triggering `recoverStrandedReceivedTokens` on every
+          // load (zombie loop).
           const token = this.tokens.get(tokenId);
-          if (token && token.status === 'submitted') {
+          if (token && (token.status === 'submitted' || token.status === 'pending')) {
             token.status = 'invalid';
             token.updatedAt = Date.now();
             this.tokens.set(tokenId, token);
+            // Surface to operator/UI: the token's proof never arrived.
+            // Without this, the only signal is a debug-level log line.
+            try {
+              this.deps!.emitEvent('transfer:operator-alert', {
+                // `oracle-rejected` per §6.1: "sustained PATH_NOT_INCLUDED
+                // past the polling window — the commitment was never
+                // anchored". Closest canonical reason for proof-polling
+                // timeout exhaustion.
+                code: 'oracle-rejected',
+                tokenId,
+                message:
+                  `Proof polling for token ${tokenId.slice(0, 12)}... ` +
+                  `exhausted ${PaymentsModule.PROOF_POLLING_MAX_ATTEMPTS} attempts ` +
+                  `(~${(PaymentsModule.PROOF_POLLING_MAX_ATTEMPTS * PaymentsModule.PROOF_POLLING_INTERVAL_MS) / 1000}s). ` +
+                  `Marked invalid; the aggregator never returned an inclusion proof. ` +
+                  `Manual retry via sphere.payments.sync() may help if the proof becomes available later.`,
+              });
+            } catch {
+              // Event emitter not wired or threw — log only.
+            }
           }
           completedJobs.push(tokenId);
           continue;
@@ -11104,9 +11345,23 @@ export class PaymentsModule {
           continue;
         }
 
-        // Proof received! Update token status
+        // Proof received! Steelman FIX B (#144): distinguish SEND vs
+        // RECEIVE jobs.
+        //   - SEND jobs (no `sourceTokenJson`): the sender's outbound
+        //     commitment was confirmed → flip token to 'spent' here.
+        //   - RECEIVE jobs (`sourceTokenJson` set — V6-direct or L3
+        //     migration): leave status='pending' and let
+        //     `onProofReceived` (`finalizeReceivedToken` /
+        //     `finalizeStrandedReceivedToken`) be the SOLE status
+        //     writer. If `onProofReceived` throws, the token stays
+        //     'pending' so the next tick (or next process's
+        //     recoverStrandedReceivedTokens) can retry. Without this
+        //     guard, a finalize throw would permanently freeze the token
+        //     at 'spent' — un-recoverable, because
+        //     `recoverStrandedReceivedTokens` requires status='pending'.
         const token = this.tokens.get(tokenId);
-        if (token) {
+        const isReceiveJob = !!job.sourceTokenJson;
+        if (token && !isReceiveJob) {
           token.status = 'spent';
           token.updatedAt = Date.now();
           this.tokens.set(tokenId, token);
@@ -11114,9 +11369,25 @@ export class PaymentsModule {
           logger.debug('Payments', `Proof received for token ${tokenId.slice(0, 8)}..., status: spent`);
         }
 
-        // Call callback if provided
-        job.onProofReceived?.(tokenId);
-        completedJobs.push(tokenId);
+        // Await the finalize callback so a throw is observable; on
+        // success the queue removes the job, on failure the job stays
+        // for retry. (Pre-FIX-B: callback was fire-and-forget AND the
+        // job was unconditionally removed via completedJobs.push — both
+        // bugs, both fixed here.)
+        let callbackOk = true;
+        try {
+          await job.onProofReceived?.(tokenId);
+        } catch (cbErr) {
+          callbackOk = false;
+          logger.error(
+            'Payments',
+            `onProofReceived for ${tokenId.slice(0, 8)}... threw — keeping job for retry:`,
+            cbErr,
+          );
+        }
+        if (callbackOk) {
+          completedJobs.push(tokenId);
+        }
       } catch (error) {
         // Most errors mean proof is not ready yet, continue polling
         logger.debug('Payments', `Proof polling attempt ${job.attemptCount} for ${tokenId.slice(0, 8)}...: ${error}`);

@@ -16,7 +16,7 @@
  * in txf-serializer.ts) and `resolveUnconfirmed` silently skipped it.
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   createPaymentsModule,
   type PaymentsModuleDependencies,
@@ -293,6 +293,13 @@ describe('#144 L1 — proofPollingJobs persist across process restarts', () => {
     module.initialize(setup.deps);
   });
 
+  afterEach(() => {
+    // Tear down setInterval timers (proofPolling, resolveUnconfirmed)
+    // that initialize/addProofPollingJob may have started. Without this,
+    // intervals leak across files and cause CI flakes (steelman FIX A).
+    try { module.destroy(); } catch { /* ignore */ }
+  });
+
   it('persists a job with sourceTokenJson to KV storage', async () => {
     const sdkData = makeV6DirectReceiveSdkData();
     const token: Token = {
@@ -449,6 +456,13 @@ describe('#144 L2 — resolveUnconfirmed accepts status=pending', () => {
     module.initialize(setup.deps);
   });
 
+  afterEach(() => {
+    // Tear down setInterval timers (proofPolling, resolveUnconfirmed)
+    // that initialize/addProofPollingJob may have started. Without this,
+    // intervals leak across files and cause CI flakes (steelman FIX A).
+    try { module.destroy(); } catch { /* ignore */ }
+  });
+
   it('routes a status=pending V6-direct receive through resolveLegacyReceivedToken', async () => {
     const sdkData = makeV6DirectReceiveSdkData();
     const token: Token = {
@@ -509,6 +523,13 @@ describe('#144 L3 — balance-model invariant + stranded recovery', () => {
     module = createPaymentsModule();
     setup = createDeps();
     module.initialize(setup.deps);
+  });
+
+  afterEach(() => {
+    // Tear down setInterval timers (proofPolling, resolveUnconfirmed)
+    // that initialize/addProofPollingJob may have started. Without this,
+    // intervals leak across files and cause CI flakes (steelman FIX A).
+    try { module.destroy(); } catch { /* ignore */ }
   });
 
   it('hasFinalizationPlan returns true for a V6-direct receive even without a polling job', () => {
@@ -655,6 +676,140 @@ describe('#144 L3 — balance-model invariant + stranded recovery', () => {
     const recovered = await internals(module).recoverStrandedReceivedTokens();
     expect(recovered).toBe(0);
     expect(internals(module).proofPollingJobs.get(GENESIS_TOKEN_ID)?.requestIdHex).toBe('pre-existing');
+  });
+
+  it('processProofPollingQueue does NOT flip RECEIVE jobs to spent (steelman FIX B)', async () => {
+    // Regression for the steelman finding: pre-FIX-B the queue
+    // unconditionally set token.status='spent' on proof receipt,
+    // including for receive jobs. If the onProofReceived callback
+    // then threw, the token was stuck at 'spent' forever.
+    const sdkData = makeV6DirectReceiveSdkData();
+    const token: Token = {
+      id: GENESIS_TOKEN_ID,
+      coinId: 'UCT_HEX',
+      symbol: 'UCT',
+      amount: '100',
+      status: 'pending',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      sdkData,
+    };
+    internals(module).tokens.set(token.id, token);
+
+    // Mock oracle to return a (fake) proof on the next poll tick.
+    const fakeProof = { toJSON: () => 'fake-proof-json' };
+    (setup.deps.oracle as { waitForProofSdk: ReturnType<typeof vi.fn> }).waitForProofSdk =
+      vi.fn().mockResolvedValue(fakeProof);
+
+    // The onProofReceived callback will THROW — simulating a finalize
+    // failure. After FIX B, the token MUST remain at 'pending' so the
+    // queue retries on the next tick.
+    let callbackInvoked = false;
+    internals(module).proofPollingJobs.set(GENESIS_TOKEN_ID, {
+      tokenId: GENESIS_TOKEN_ID,
+      requestIdHex: '00deadbeef',
+      commitmentJson: '{"requestId":"x","transactionData":{},"authenticator":{}}',
+      sourceTokenJson: sdkData, // ← marks this as a RECEIVE job
+      startedAt: Date.now(),
+      attemptCount: 0,
+      lastAttemptAt: 0,
+      onProofReceived: async () => {
+        callbackInvoked = true;
+        throw new Error('Simulated finalize failure');
+      },
+    });
+
+    // Trigger one polling tick directly.
+    await (module as unknown as { processProofPollingQueue: () => Promise<void> }).processProofPollingQueue();
+
+    expect(callbackInvoked).toBe(true);
+    // Pre-FIX-B would be 'spent'; post-FIX-B remains 'pending' for retry.
+    expect(internals(module).tokens.get(GENESIS_TOKEN_ID)?.status).toBe('pending');
+    // Job stays in queue for retry (callbackOk=false → not added to completedJobs).
+    expect(internals(module).proofPollingJobs.has(GENESIS_TOKEN_ID)).toBe(true);
+  });
+
+  it('processProofPollingQueue marks pending tokens invalid on timeout (steelman FIX C)', async () => {
+    // Regression for the steelman finding: pre-FIX-C the timeout
+    // branch only marked status='submitted' tokens invalid. Recovery
+    // jobs target status='pending' tokens; pre-FIX-C they stayed
+    // 'pending' forever, creating a zombie loop on every restart.
+    const sdkData = makeV6DirectReceiveSdkData();
+    const token: Token = {
+      id: GENESIS_TOKEN_ID,
+      coinId: 'UCT_HEX',
+      symbol: 'UCT',
+      amount: '100',
+      status: 'pending',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      sdkData,
+    };
+    internals(module).tokens.set(token.id, token);
+
+    // Register a job with attemptCount already at the max — the next
+    // tick should hit the timeout branch.
+    internals(module).proofPollingJobs.set(GENESIS_TOKEN_ID, {
+      tokenId: GENESIS_TOKEN_ID,
+      requestIdHex: '00deadbeef',
+      commitmentJson: '',
+      sourceTokenJson: sdkData,
+      startedAt: Date.now() - 60_000,
+      attemptCount: 29, // ← bumps to 30 on the tick → hits MAX_ATTEMPTS branch
+      lastAttemptAt: Date.now() - 2000,
+    });
+
+    await (module as unknown as { processProofPollingQueue: () => Promise<void> }).processProofPollingQueue();
+
+    // Post-FIX-C: pending → invalid on timeout.
+    expect(internals(module).tokens.get(GENESIS_TOKEN_ID)?.status).toBe('invalid');
+    // Operator alert emitted for visibility.
+    const alerts = setup.emittedEvents.filter((e) => e.type === 'transfer:operator-alert');
+    expect(alerts.length).toBeGreaterThan(0);
+  });
+
+  it('restoreProofPollingJobs honors cumulative-attempts cap (steelman FIX G)', async () => {
+    // Regression: if a token has burned through its cumulative budget
+    // across prior process lifetimes, restore must mark it invalid
+    // instead of granting another fresh 60s polling budget.
+    const sdkData = makeV6DirectReceiveSdkData();
+    setup.storageState.set(
+      STORAGE_KEYS_ADDRESS.PROOF_POLLING_JOBS,
+      JSON.stringify([
+        {
+          genesisTokenId: GENESIS_TOKEN_ID,
+          stateHash: STATE_HASH,
+          requestIdHex: '00restored',
+          commitmentJson: '{}',
+          sourceTokenJson: sdkData,
+          startedAt: Date.now() - 600_000,
+          attemptCount: 30,
+          lastAttemptAt: Date.now() - 2000,
+          cumulativeAttempts: 200, // > MAX_CUMULATIVE (150)
+        },
+      ]),
+    );
+    const tokenAfterLoad: Token = {
+      id: GENESIS_TOKEN_ID,
+      coinId: 'UCT_HEX',
+      symbol: 'UCT',
+      amount: '100',
+      status: 'pending',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      sdkData,
+    };
+    internals(module).tokens.set(tokenAfterLoad.id, tokenAfterLoad);
+
+    await internals(module).restoreProofPollingJobs();
+
+    // Job NOT restored (skipped due to cap).
+    expect(internals(module).proofPollingJobs.has(GENESIS_TOKEN_ID)).toBe(false);
+    // Token marked invalid.
+    expect(internals(module).tokens.get(GENESIS_TOKEN_ID)?.status).toBe('invalid');
+    // Operator alert emitted.
+    const alerts = setup.emittedEvents.filter((e) => e.type === 'transfer:operator-alert');
+    expect(alerts.length).toBeGreaterThan(0);
   });
 
   it('recoverStrandedReceivedTokens skips tokens that are not V6-direct receives', async () => {
