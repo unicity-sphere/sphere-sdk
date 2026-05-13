@@ -4448,9 +4448,107 @@ export class PaymentsModule {
   ): Promise<Token | null> {
     const tokenInfo = await parseTokenInfo(sourceTokenInput);
 
-    const sdkData = typeof sourceTokenInput === 'string'
-      ? sourceTokenInput
-      : JSON.stringify(sourceTokenInput);
+    // V6-RECV / faucet-flow fix (post PR #146 regression).
+    //
+    // Pre-fix, this method persisted the raw source TXF as-is. The
+    // bundle's source token carries only the mint transaction (with its
+    // own inclusionProof). The transfer commitment that flips ownership
+    // to us is tracked separately as a proof-polling job in
+    // `this.proofPollingJobs`. After a CLI invocation exits and a new
+    // one runs:
+    //
+    //  - `determineTokenStatus` sees "1 tx with proof" → 'confirmed'
+    //    (the original in-memory 'submitted' status is lost).
+    //  - The proof-polling job persistence is fire-and-forget and may
+    //    not complete before process exit; even when it does,
+    //    `restoreProofPollingJobs` runs AFTER `loadFromStorageData`.
+    //  - PR #146's `#144 L3 balance-model invariant` then moves the
+    //    token to archive because the state.predicate is the sender's,
+    //    not ours, AND `hasFinalizationPlan()` returns false.
+    //
+    // Net effect: faucet (and any V6 direct) receives become invisible
+    // after the first CLI exit. The user sees "No tokens found" even
+    // though tokens are on disk and history records the inbound.
+    //
+    // Fix: synthesize a pending transfer transaction in the persisted
+    // sdkData using the commitment's transactionData with
+    // `inclusionProof: null`. After this, the on-disk shape correctly
+    // expresses "received but transfer not yet finalized" via the
+    // standard pending-tx convention that V5 splits and other paths
+    // already use:
+    //
+    //   - `determineTokenStatus` sees last tx with null proof → 'pending'.
+    //   - `isReceivedLegacyPending(token)` returns true (recipient is us).
+    //   - `hasFinalizationPlan(token)` returns true.
+    //   - The balance-model invariant correctly skips archive.
+    //   - `recoverStrandedReceivedTokens` recovers a fresh proof-polling
+    //     job on next load.
+    //
+    // When `finalizeReceivedToken` runs (now or after restart), it
+    // calls `finalizeTransferToken` which rebuilds the transactions
+    // array from the SDK — the synthetic pending tx is replaced by the
+    // proven one in finalizeTransferToken's output.
+    let sdkData: string;
+    {
+      const rawSource: unknown =
+        typeof sourceTokenInput === 'string'
+          ? JSON.parse(sourceTokenInput)
+          : sourceTokenInput;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const rawSourceObj = rawSource as any;
+      const existingTxs: unknown[] = Array.isArray(rawSourceObj?.transactions)
+        ? rawSourceObj.transactions
+        : [];
+
+      // Extract the commitment's transactionData. The commitment is
+      // either a parsed object or a JSON-ish object; the `transactionData`
+      // sub-object is what goes on-chain. We use it to synthesize a
+      // pending tx with `inclusionProof: null` so subsequent loads see
+      // a properly-shaped "transfer pending" token.
+      let pendingTxData: unknown = null;
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const ci = commitmentInput as any;
+        if (ci && typeof ci === 'object') {
+          if (ci.transactionData !== undefined) {
+            pendingTxData = ci.transactionData;
+          } else if (ci.data !== undefined) {
+            pendingTxData = ci.data;
+          }
+        }
+      } catch {
+        // Best-effort — fall through. The token will still be saved
+        // (without the synthetic pending tx) and finalization will
+        // recover the state when the proof arrives in this session.
+        pendingTxData = null;
+      }
+
+      // Defensive: avoid double-appending. If the last existing tx already
+      // has `inclusionProof: null` (or missing — see the parser tweaks in
+      // `determineTokenStatus` / `isReceivedLegacyPending` which treat
+      // missing as null per the canonical V5/V6 protocol), the source TXF
+      // already encodes a pending transfer. Don't append a second one.
+      const lastExistingTx = existingTxs[existingTxs.length - 1] as
+        | { inclusionProof?: unknown }
+        | undefined;
+      const lastExistingHasNullProof =
+        lastExistingTx !== undefined &&
+        (lastExistingTx.inclusionProof === null ||
+          lastExistingTx.inclusionProof === undefined);
+
+      const augmentedSource =
+        pendingTxData !== null && !lastExistingHasNullProof
+          ? {
+              ...rawSourceObj,
+              transactions: [
+                ...existingTxs,
+                { data: pendingTxData, inclusionProof: null },
+              ],
+            }
+          : rawSourceObj;
+
+      sdkData = JSON.stringify(augmentedSource);
+    }
 
     // Check tombstones BEFORE creating the token
     const nostrTokenId = extractTokenIdFromSdkData(sdkData);
@@ -6479,7 +6577,15 @@ export class PaymentsModule {
       inclusionProof?: unknown;
       data?: { recipient?: { address?: string } };
     };
-    if (lastTx.inclusionProof !== null) return false;
+    // Canonical default: missing inclusionProof === null (the V5/V6 protocol
+    // treats both `inclusionProof: null` and the absence of the field as
+    // "transaction is pending"). Without this default, a producer that
+    // omits the field would see `lastTx.inclusionProof === undefined`,
+    // fail this `!== null` check, and incorrectly be classified as
+    // not-pending — leaving the token stranded by the balance-model
+    // invariant in `loadFromStorageData`.
+    const proof = lastTx.inclusionProof === undefined ? null : lastTx.inclusionProof;
+    if (proof !== null) return false;
     const recipientAddr = lastTx.data?.recipient?.address;
     if (typeof recipientAddr !== 'string') return false;
 
