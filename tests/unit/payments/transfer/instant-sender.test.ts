@@ -1540,3 +1540,115 @@ describe('sendInstantUxf — OVER_TRANSFER_GUARD (#142)', () => {
     expect(transport._calls).toHaveLength(1);
   });
 });
+
+// =============================================================================
+// L5-C1/C2 — tokenIds extraction fail-closed semantics
+// =============================================================================
+//
+// The orchestrator extracts `recipientTokenJson.genesis.data.tokenId`
+// for the wire `payload.tokenIds` advertisement (Loop4 r2). Previously
+// a missing/non-string/non-hex tokenId silently fell back to
+// `sourceTokenId` — which IS the alice-local UI id, NOT the
+// recipient-visible tokenId. The fallback reintroduced the silent
+// mis-routing bug Loop4-r2 was designed to fix. L5-C1/C2 hardening:
+// throw SphereError instead, AND lowercase-normalize valid values.
+
+describe('sendInstantUxf — tokenIds extraction fail-closed (L5-C1/C2)', () => {
+  it('throws INVALID_CONFIG when recipientTokenJson.genesis.data.tokenId is missing', async () => {
+    const source = makeToken('tok-1', TOKEN_A);
+    // Construct a commit result with NO tokenId in the genesis.
+    const broken: InstantCommitResult = {
+      sourceTokenId: 'tok-1',
+      method: 'direct',
+      requestIdHex: 'req-tok-1',
+      // Recipient JSON without genesis.data.tokenId.
+      recipientTokenJson: {
+        version: '2.0',
+        genesis: { data: {} /* tokenId missing */, inclusionProof: {} },
+        state: {},
+        transactions: [],
+        nametags: [],
+      },
+      tokenClass: 'coin',
+      splitParentTokenId: 'tok-1',
+    };
+    const { deps, transport } = makeDeps({
+      availableSources: () => [source],
+      selectSources: async () => [source],
+      commitSources: async () => [broken],
+    });
+
+    let caught: unknown;
+    try {
+      await sendInstantUxf(basicRequest(), makePeerInfo(), deps);
+    } catch (err) {
+      caught = err;
+    }
+    if (!isSphereError(caught)) throw new Error('expected SphereError');
+    expect(caught.code).toBe('INVALID_CONFIG');
+    expect(caught.message).toContain('genesis.data.tokenId');
+    // No transport publish on throw — bundle never shipped.
+    expect(transport._calls).toEqual([]);
+  });
+
+  it('throws INVALID_CONFIG when tokenId is not 64-char hex (too short)', async () => {
+    const source = makeToken('tok-1', TOKEN_A);
+    const broken: InstantCommitResult = {
+      sourceTokenId: 'tok-1',
+      method: 'direct',
+      requestIdHex: 'req-tok-1',
+      recipientTokenJson: {
+        version: '2.0',
+        genesis: { data: { tokenId: 'aabb' /* 4 chars, not 64 */ }, inclusionProof: {} },
+        state: {},
+        transactions: [],
+        nametags: [],
+      },
+      tokenClass: 'coin',
+      splitParentTokenId: 'tok-1',
+    };
+    const { deps } = makeDeps({
+      availableSources: () => [source],
+      selectSources: async () => [source],
+      commitSources: async () => [broken],
+    });
+
+    let caught: unknown;
+    try {
+      await sendInstantUxf(basicRequest(), makePeerInfo(), deps);
+    } catch (err) {
+      caught = err;
+    }
+    if (!isSphereError(caught)) throw new Error('expected SphereError');
+    expect(caught.code).toBe('INVALID_CONFIG');
+  });
+
+  it('lowercase-normalizes uppercase hex tokenId in payload.tokenIds', async () => {
+    // Recipient deconstruct pool elements are lowercase. If the
+    // sender shipped uppercase, the case-sensitive Set lookup would
+    // miss → all roots advisory → recipient drops bundle.
+    //
+    // Use makeCommitResult with rewriteTokenId so the TOKEN_A
+    // fixture's valid genesis shape is preserved; only the tokenId
+    // field is rewritten to uppercase. This way pkg.ingestAll can
+    // still deconstruct the bundle while my L5-C2 normalization
+    // is exercised on the outgoing payload.tokenIds.
+    const uppercaseTokenId = 'AA' + '00'.repeat(31); // 64-char, uppercase first 2 chars
+    const source = makeToken('tok-1', TOKEN_A);
+    const result = makeCommitResult({
+      sourceTokenId: 'tok-1',
+      fixture: TOKEN_A,
+      rewriteTokenId: uppercaseTokenId,
+    });
+    const { deps, transport } = makeDeps({
+      availableSources: () => [source],
+      selectSources: async () => [source],
+      commitSources: async () => [result],
+    });
+    await sendInstantUxf(basicRequest({ amount: '1000000' }), makePeerInfo(), deps);
+
+    expect(transport._calls).toHaveLength(1);
+    const payload = transport._calls[0].payload as UxfTransferPayloadCar;
+    expect(payload.tokenIds).toEqual([uppercaseTokenId.toLowerCase()]);
+  });
+});

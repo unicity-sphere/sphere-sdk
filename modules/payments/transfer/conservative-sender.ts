@@ -710,6 +710,28 @@ export async function sendConservativeUxf(
     // Acceptance: deterministic bundle order — lex-ascending by tokenId.
     const orderedResults = sortByTokenIdAsc(commitResults);
 
+    // Loop4-e2e (round 2) + L5-C1/C2 — validate AND extract the
+    // recipient tokenIds for payload.tokenIds BEFORE pkg.ingestAll
+    // so misshapen commit results surface as clean SphereErrors
+    // rather than vague UXF deconstruct errors. Fail-closed on
+    // missing/non-hex; lowercase-normalize. See instant-sender.ts
+    // for the full rationale.
+    const tokenIds = orderedResults.map((r): string => {
+      const j = r.recipientTokenJson as {
+        readonly genesis?: { readonly data?: { readonly tokenId?: unknown } };
+      } | null | undefined;
+      const tid = j?.genesis?.data?.tokenId;
+      if (typeof tid !== 'string' || !/^[0-9a-f]{64}$/i.test(tid)) {
+        throw new SphereError(
+          `sendConservativeUxf: recipientTokenJson.genesis.data.tokenId for source ${r.sourceTokenId} ` +
+            `is missing or not 64-char hex (got ${typeof tid === 'string' ? `"${tid.slice(0, 32)}…"` : typeof tid}). ` +
+            'The recipient bundle verifier would silently drop the transfer as an advisory unclaimed root.',
+          'INVALID_CONFIG',
+        );
+      }
+      return tid.toLowerCase();
+    });
+
     // -----------------------------------------------------------------
     // Step 5: build UxfPackage and ingest tokens.
     // -----------------------------------------------------------------
@@ -794,18 +816,9 @@ export async function sendConservativeUxf(
     // identifies the recipient + bundleCid + token list before any
     // transport / IPFS work so a crash here leaves a forensic record.
     // -----------------------------------------------------------------
-    // Loop4-e2e (round 2): advertise the RECIPIENT'S tokenIds, not the
-    // sender's source tokenIds. See instant-sender.ts for the full
-    // rationale — split transfers produce a new recipient tokenId,
-    // and advertising the burned source's id mis-routes the bundle's
-    // disposition (Bob gets nothing).
-    const tokenIds = orderedResults.map((r): string => {
-      const j = r.recipientTokenJson as {
-        readonly genesis?: { readonly data?: { readonly tokenId?: unknown } };
-      } | null | undefined;
-      const tid = j?.genesis?.data?.tokenId;
-      return typeof tid === 'string' && tid.length > 0 ? tid : r.sourceTokenId;
-    });
+    // `tokenIds` was computed above (right after sortByTokenIdAsc),
+    // BEFORE pkg.ingestAll, with L5-C1/C2 fail-closed validation +
+    // lowercase normalization. Reuse it here.
 
     // Decide the delivery method up-front using the SAME predicate as
     // resolveDelivery's CID-branch decision (`wantsCidBranch` above).

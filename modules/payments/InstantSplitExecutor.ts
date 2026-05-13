@@ -230,9 +230,25 @@ export class InstantSplitExecutor {
 
     // === STEP 2: WAIT FOR BURN PROOF (~2s) ===
     logger.debug('InstantSplit', 'Step 2: Waiting for burn proof...');
-    const burnProof = this.devMode
-      ? await this.waitInclusionProofWithDevBypass(burnCommitment, options?.burnProofTimeoutMs)
-      : await waitInclusionProof(this.trustBase, this.client, burnCommitment);
+    // L5-W1 — wrap with SphereError mirroring the
+    // submitCommitmentsImmediate proof-wait wrapping. Without this,
+    // a SleepError (10s timeout) or JsonRpcNetworkError propagates
+    // raw to the dispatcher's catch as a non-SphereError, breaking
+    // the consistent error-shape contract callers expect.
+    let burnProof;
+    try {
+      burnProof = this.devMode
+        ? await this.waitInclusionProofWithDevBypass(burnCommitment, options?.burnProofTimeoutMs)
+        : await waitInclusionProof(this.trustBase, this.client, burnCommitment);
+    } catch (err) {
+      const raw = err instanceof Error ? err.message : String(err);
+      const msg = raw.replace(/[\r\n\t\0]/g, ' ').slice(0, 200);
+      throw new SphereError(
+        `buildSplitBundle: burn proof wait failed: ${msg}`,
+        'TRANSFER_FAILED',
+        err,
+      );
+    }
     const burnTransaction = burnCommitment.toTransaction(burnProof);
 
     logger.debug('InstantSplit', 'Burn proof received');
@@ -518,27 +534,61 @@ export class InstantSplitExecutor {
     // and the worker aborts with hard-fail 'structural' — meaning
     // `transfer:confirmed` never fires and the outbox entry stays
     // at `delivered-instant` forever.
+    //
+    // L5-C3 hardening — FAIL CLOSED on hash derivation failure.
+    // The previous fallback (`requestId.toJSON?.() ?? ''`) could
+    // produce an empty string in pathological cases. Stored in
+    // `_senderRequestContextMap.transactionHash` as `''`, this
+    // crashes `parseTransactionHashImprint`'s 68-char guard inside
+    // the §6.1 worker → mapped to `oracle-rejected` hard-fail →
+    // outbox transitions to `failed-permanent` → cascade-walker
+    // fires falsely → source token marked invalid even though the
+    // recipient already received the bundle. A `calculateHash`
+    // throw means the commitment is corrupt — better to fail the
+    // send loud than to ship a bundle that produces a false-
+    // cascade on confirm.
     let transferTransactionHashHex: string;
     try {
       const txDataHash = await transferCommitment.transactionData.calculateHash();
       transferTransactionHashHex = txDataHash.toJSON();
     } catch (err) {
-      logger.warn(
-        'InstantSplit',
-        `submitCommitmentsImmediate: failed to derive transferCommitment transactionHash; race-lost detection degraded. err=${err instanceof Error ? err.message : String(err)}`,
+      const raw = err instanceof Error ? err.message : String(err);
+      const msg = raw.replace(/[\r\n\t\0]/g, ' ').slice(0, 200);
+      throw new SphereError(
+        `submitCommitmentsImmediate: transferCommitment.transactionData.calculateHash() failed: ${msg}. ` +
+          'Race-lost detection cannot proceed with a degraded hash; refusing to publish.',
+        'TRANSFER_FAILED',
+        err,
       );
-      // Fall back to the requestId. Mirrors the legacy Task #152
-      // fallback in PaymentsModule's direct-path commitSources.
-      const requestIdBytes = transferCommitment.requestId as { toJSON?: () => string } | Uint8Array;
-      transferTransactionHashHex = requestIdBytes instanceof Uint8Array
-        ? toHex(requestIdBytes)
-        : (requestIdBytes as { toJSON?: () => string }).toJSON?.() ?? '';
+    }
+    if (typeof transferTransactionHashHex !== 'string' || transferTransactionHashHex.length < 64) {
+      // DataHash imprint hex is a fixed-length canonical string. A
+      // missing/short value indicates an SDK regression — surface it
+      // before the §6.1 worker hard-fails on the malformed value.
+      throw new SphereError(
+        `submitCommitmentsImmediate: derived transferTransactionHashHex is not a valid hex imprint (got ${
+          typeof transferTransactionHashHex === 'string' ? `length=${transferTransactionHashHex.length}` : typeof transferTransactionHashHex
+        }).`,
+        'TRANSFER_FAILED',
+      );
     }
     const transferCommitJson = (transferCommitment as { toJSON?: () => { authenticator?: unknown } }).toJSON?.();
-    const transferAuthenticatorJsonStr =
-      transferCommitJson?.authenticator !== undefined && transferCommitJson.authenticator !== null
-        ? JSON.stringify(transferCommitJson.authenticator)
-        : '';
+    if (
+      transferCommitJson === undefined ||
+      transferCommitJson.authenticator === undefined ||
+      transferCommitJson.authenticator === null
+    ) {
+      // SDK contract: TransferCommitment.toJSON() always exposes the
+      // authenticator. A missing field is an SDK shape regression
+      // that would cause the §6.3 same-value-vs-different-value
+      // compare to false-positive into security-alert territory.
+      throw new SphereError(
+        'submitCommitmentsImmediate: transferCommitment.toJSON() has no authenticator field. ' +
+          'SDK shape regression?',
+        'TRANSFER_FAILED',
+      );
+    }
+    const transferAuthenticatorJsonStr = JSON.stringify(transferCommitJson.authenticator);
 
     logger.debug('InstantSplit', 'submitCommitmentsImmediate: recipient mint proof anchored, genesis ready');
     return {

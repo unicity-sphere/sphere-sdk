@@ -423,3 +423,103 @@ describe('InstantSplitExecutor.submitCommitmentsImmediate — input sanitization
     expect((aRun?.[0] ?? '').length).toBeLessThanOrEqual(200);
   });
 });
+
+describe('InstantSplitExecutor.submitCommitmentsImmediate — L5 fail-closed paths', () => {
+  // L5-C3 lock-downs: prior revisions silently fell back to weak
+  // values when the SDK's hash/authenticator derivation failed.
+  // Those silent fallbacks crashed the §6.1 finalization worker's
+  // 68-char imprint guard → false oracle-rejected cascade-failure.
+  // The fixed code throws so operators see the regression.
+
+  it('throws TRANSFER_FAILED when transactionData.calculateHash() rejects', async () => {
+    const senderMint = makeMintCommitment('senderMint') as any;
+    const recipientMint = makeMintCommitment('recipientMint') as any;
+    const failingTransfer: any = {
+      __label: 'transfer',
+      transactionData: {
+        calculateHash: vi.fn().mockRejectedValue(new Error('sdk hash corrupt')),
+      },
+      requestId: { toJSON: () => 'cafe' + '00'.repeat(30) },
+      toJSON: () => ({ authenticator: { algorithm: 'secp256k1', publicKey: 'x', signature: 'x', stateHash: 'x' } }),
+    };
+    const client = {
+      submitMintCommitment: vi.fn().mockResolvedValue({ status: 'SUCCESS' }),
+      submitTransferCommitment: vi.fn().mockResolvedValue({ status: 'SUCCESS' }),
+    };
+    const executor = makeExecutor(client);
+    let caught: unknown;
+    try {
+      await (executor as any).submitCommitmentsImmediate(senderMint, recipientMint, failingTransfer);
+    } catch (err) {
+      caught = err;
+    }
+    if (!isSphereError(caught)) throw new Error('expected SphereError');
+    expect(caught.code).toBe('TRANSFER_FAILED');
+    expect(caught.message).toContain('calculateHash() failed');
+    expect(caught.message).toContain('sdk hash corrupt');
+    // The original Error is preserved as cause.
+    expect((caught as Error).cause).toBeDefined();
+  });
+
+  it('throws TRANSFER_FAILED when transferCommitment.toJSON() has no authenticator', async () => {
+    const senderMint = makeMintCommitment('senderMint') as any;
+    const recipientMint = makeMintCommitment('recipientMint') as any;
+    const malformedTransfer: any = {
+      __label: 'transfer',
+      transactionData: {
+        calculateHash: vi.fn().mockResolvedValue({ toJSON: () => 'cafe' + '00'.repeat(30) }),
+      },
+      requestId: { toJSON: () => 'feed' + '00'.repeat(30) },
+      // SDK shape regression: toJSON returns an object missing
+      // the `authenticator` field. Previously this would silently
+      // produce an empty-string authenticator stored in the
+      // request context map; the §6.3 conflict check would then
+      // misfire `transfer:security-alert` on every confirm.
+      toJSON: () => ({ /* no authenticator field */ }),
+    };
+    const client = {
+      submitMintCommitment: vi.fn().mockResolvedValue({ status: 'SUCCESS' }),
+      submitTransferCommitment: vi.fn().mockResolvedValue({ status: 'SUCCESS' }),
+    };
+    const executor = makeExecutor(client);
+    let caught: unknown;
+    try {
+      await (executor as any).submitCommitmentsImmediate(senderMint, recipientMint, malformedTransfer);
+    } catch (err) {
+      caught = err;
+    }
+    if (!isSphereError(caught)) throw new Error('expected SphereError');
+    expect(caught.code).toBe('TRANSFER_FAILED');
+    expect(caught.message).toContain('no authenticator field');
+  });
+
+  it('throws TRANSFER_FAILED when calculateHash returns a too-short imprint', async () => {
+    // The contract: DataHash imprint hex is canonical 64+ chars.
+    // A short value passing as a string is rejected by the L5-C3
+    // length guard.
+    const senderMint = makeMintCommitment('senderMint') as any;
+    const recipientMint = makeMintCommitment('recipientMint') as any;
+    const shortHashTransfer: any = {
+      __label: 'transfer',
+      transactionData: {
+        calculateHash: vi.fn().mockResolvedValue({ toJSON: () => 'deadbeef' /* 8 chars */ }),
+      },
+      requestId: { toJSON: () => 'feed' + '00'.repeat(30) },
+      toJSON: () => ({ authenticator: { algorithm: 'secp256k1', publicKey: 'x', signature: 'x', stateHash: 'x' } }),
+    };
+    const client = {
+      submitMintCommitment: vi.fn().mockResolvedValue({ status: 'SUCCESS' }),
+      submitTransferCommitment: vi.fn().mockResolvedValue({ status: 'SUCCESS' }),
+    };
+    const executor = makeExecutor(client);
+    let caught: unknown;
+    try {
+      await (executor as any).submitCommitmentsImmediate(senderMint, recipientMint, shortHashTransfer);
+    } catch (err) {
+      caught = err;
+    }
+    if (!isSphereError(caught)) throw new Error('expected SphereError');
+    expect(caught.code).toBe('TRANSFER_FAILED');
+    expect(caught.message).toContain('not a valid hex imprint');
+  });
+});
