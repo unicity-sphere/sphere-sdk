@@ -447,7 +447,11 @@ export class InstantSplitExecutor {
     senderMintCommitment: MintCommitment<any>,
     recipientMintCommitment: MintCommitment<any>,
     transferCommitment: TransferCommitment,
-  ): Promise<{ recipientMintProvenGenesisJson: unknown }> {
+  ): Promise<{
+    recipientMintProvenGenesisJson: unknown;
+    transferTransactionHashHex: string;
+    transferAuthenticatorJsonStr: string;
+  }> {
     logger.debug('InstantSplit', 'submitCommitmentsImmediate: serial submit (senderMint → recipientMint → transfer)');
 
     const submitOne = async (
@@ -506,8 +510,42 @@ export class InstantSplitExecutor {
     // for the UXF bundle's genesis.
     const recipientMintTransaction = recipientMintCommitment.toTransaction(recipientMintProof as any);
     const recipientMintProvenGenesisJson = recipientMintTransaction.toJSON();
+
+    // Loop4-S2 — extract the transfer commitment's transactionHash +
+    // authenticator so the dispatcher can populate the sender-side
+    // request context map. Without these, the §6.1 finalization
+    // worker's resolver returns null on the split-path requestId
+    // and the worker aborts with hard-fail 'structural' — meaning
+    // `transfer:confirmed` never fires and the outbox entry stays
+    // at `delivered-instant` forever.
+    let transferTransactionHashHex: string;
+    try {
+      const txDataHash = await transferCommitment.transactionData.calculateHash();
+      transferTransactionHashHex = txDataHash.toJSON();
+    } catch (err) {
+      logger.warn(
+        'InstantSplit',
+        `submitCommitmentsImmediate: failed to derive transferCommitment transactionHash; race-lost detection degraded. err=${err instanceof Error ? err.message : String(err)}`,
+      );
+      // Fall back to the requestId. Mirrors the legacy Task #152
+      // fallback in PaymentsModule's direct-path commitSources.
+      const requestIdBytes = transferCommitment.requestId as { toJSON?: () => string } | Uint8Array;
+      transferTransactionHashHex = requestIdBytes instanceof Uint8Array
+        ? toHex(requestIdBytes)
+        : (requestIdBytes as { toJSON?: () => string }).toJSON?.() ?? '';
+    }
+    const transferCommitJson = (transferCommitment as { toJSON?: () => { authenticator?: unknown } }).toJSON?.();
+    const transferAuthenticatorJsonStr =
+      transferCommitJson?.authenticator !== undefined && transferCommitJson.authenticator !== null
+        ? JSON.stringify(transferCommitJson.authenticator)
+        : '';
+
     logger.debug('InstantSplit', 'submitCommitmentsImmediate: recipient mint proof anchored, genesis ready');
-    return { recipientMintProvenGenesisJson };
+    return {
+      recipientMintProvenGenesisJson,
+      transferTransactionHashHex,
+      transferAuthenticatorJsonStr,
+    };
   }
 
   /**

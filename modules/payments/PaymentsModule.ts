@@ -9223,7 +9223,30 @@ export class PaymentsModule {
                   'INVALID_CONFIG',
                 );
               }
-              const { recipientMintProvenGenesisJson } = await splitResult.submitCommitmentsImmediate();
+              const {
+                recipientMintProvenGenesisJson,
+                transferTransactionHashHex,
+                transferAuthenticatorJsonStr,
+              } = await splitResult.submitCommitmentsImmediate();
+
+              // Loop4-S2 — populate per-requestId context for the
+              // sender-side §6.1 finalization worker. Mirrors the
+              // direct-path block at line ~9435 (Task #152 wiring).
+              // Without this, the worker's resolver returns null on
+              // the split-path requestId, hard-fails 'structural',
+              // and `transfer:confirmed` never fires — the outbox
+              // entry stays stuck at `delivered-instant` forever.
+              if (
+                this.finalizationWorkerSender !== null &&
+                splitResult.transferRequestIdHex !== undefined &&
+                splitResult.transferRequestIdHex.length > 0
+              ) {
+                this._senderRequestContextMap.set(splitResult.transferRequestIdHex, {
+                  transactionHash: transferTransactionHashHex,
+                  authenticator: transferAuthenticatorJsonStr,
+                  nextEntryRest: { status: 'valid' as const },
+                });
+              }
 
               // Assemble recipient SDK Token JSON. The genesis is the
               // proven recipient mint transaction (with inclusionProof)

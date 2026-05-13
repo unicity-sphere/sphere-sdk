@@ -54,7 +54,20 @@ const makeMintCommitment = (label: string): unknown => ({
     toJSON: () => ({ data: { __label: label }, inclusionProof: { __mock: true } }),
   }),
 });
-const makeTransferCommitment = (label: string): unknown => ({ __label: label });
+const makeTransferCommitment = (label: string): unknown => ({
+  __label: label,
+  // Loop4-S2 — submitCommitmentsImmediate now derives the transfer
+  // commitment's transactionHash + authenticator to populate the
+  // sender-side request-context map. Mock these so the unit tests
+  // exercise the new return-shape path.
+  transactionData: {
+    calculateHash: vi.fn().mockResolvedValue({
+      toJSON: () => 'cafebabe' + '00'.repeat(28),
+    }),
+  },
+  requestId: { toJSON: () => 'deadbeef' + '00'.repeat(28) },
+  toJSON: () => ({ authenticator: { algorithm: 'secp256k1', publicKey: 'mock', signature: 'mock', stateHash: 'mock' } }),
+});
 
 const fakeSenderMint = makeMintCommitment('senderMint') as any;
 const fakeRecipientMint = makeMintCommitment('recipientMint') as any;

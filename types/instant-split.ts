@@ -567,6 +567,25 @@ export interface BuildSplitBundleResult {
      * format requires a non-null `inclusionProof` on every Genesis.
      */
     readonly recipientMintProvenGenesisJson: unknown;
+    /**
+     * Loop4-S2 — DataHash imprint hex of the transfer commitment's
+     * `transactionData.calculateHash()`. The dispatcher writes it
+     * into `_senderRequestContextMap` so the sender-side §6.1
+     * finalization worker can resolve the per-requestId context
+     * and detect race-lost outcomes. Without this, the worker's
+     * resolver returns null → hard-fail 'structural' → cascade
+     * abort → `transfer:confirmed` never emits.
+     */
+    readonly transferTransactionHashHex: string;
+    /**
+     * Loop4-S2 — Stable canonical JSON of the transfer commitment's
+     * authenticator. Same purpose as `transferTransactionHashHex`
+     * (per-requestId context for race-lost detection). Aggregator
+     * proofs carry the same shape; byte-equality between this and
+     * `proof.authenticator` JSON resolves the §6.3 same-value vs
+     * different-value branch.
+     */
+    readonly transferAuthenticatorJsonStr: string;
   }>;
 
   /**
