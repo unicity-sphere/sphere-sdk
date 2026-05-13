@@ -4400,10 +4400,20 @@ export class Sphere {
       }
     }
 
-    // Load modules in parallel — they are independent of each other.
-    // allSettled so one failing module doesn't block the rest.
+    // payments.load() is critical — must succeed for wallet to be usable
+    // AND must complete BEFORE accounting/swap load. AccountingModule.load()
+    // populates its `invoiceTermsCache` by iterating `payments.getTokens()`
+    // (filter by `tokenType === INVOICE_TOKEN_TYPE_HEX`); running it in
+    // parallel with `payments.load()` reads from an empty `this.tokens`
+    // map and leaves the cache empty until a later manual `accounting.load()`
+    // — which the CLI never issues. Result: invoice-list / invoice-status /
+    // invoice-pay all returned "not found" even though the invoice token
+    // was persisted on disk. Mirrors the ordering in
+    // `initializeAddressModules()` (line ~2566).
+    await this._payments.load();
+
+    // Non-critical modules load in parallel — failures are non-fatal
     const results = await Promise.allSettled([
-      this._payments.load(),
       this._communications.load(),
       this._groupChat?.load(),
       this._market?.load(),
