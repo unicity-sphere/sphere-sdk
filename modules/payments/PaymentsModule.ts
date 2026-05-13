@@ -1775,7 +1775,21 @@ export class PaymentsModule {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const trustBase = (this.deps!.oracle as any).getTrustBase?.();
             const lastTxJson = txArray.at(-1) as Record<string, unknown> | undefined;
-            const hasNullProof = lastTxJson?.inclusionProof === null;
+            // Canonical default: missing `inclusionProof` field === null. The
+            // V5/V6 protocol treats absence and explicit-null as the same
+            // pending signal; the strict `=== null` check below misclassifies
+            // bundles where the sender omits the field rather than setting
+            // it explicitly to null, sending those through the 2a (finalize)
+            // path that needs a real proof and falls through to the
+            // "confirmed + sender's predicate" fallback — which the
+            // balance-model invariant in `loadFromStorageData` then archives.
+            const lastTxProof =
+              lastTxJson === undefined
+                ? null
+                : lastTxJson.inclusionProof === undefined
+                  ? null
+                  : lastTxJson.inclusionProof;
+            const hasNullProof = lastTxProof === null;
 
             if (stClient && trustBase && lastTxJson?.data != null) {
               try {
@@ -2016,16 +2030,30 @@ export class PaymentsModule {
                 }
               } catch (finalizeErr) {
                 // If recipient-side finalization fails unexpectedly, fall
-                // back to submitting the assembled JSON directly to the
-                // oracle for a best-effort RPC validation.  This preserves
-                // the previous behaviour and keeps the pipeline running.
+                // back to the assembled JSON. Pre-fix this kept
+                // `tokenStatus = 'confirmed'` to preserve previous
+                // behavior — but after PR #146 landed the #144 L3
+                // balance-model invariant, a token with the SENDER's
+                // state.predicate persisted at `'confirmed'` gets
+                // immediately archived by `loadFromStorageData`. The
+                // user-visible effect is faucet-received tokens
+                // disappearing from `payments balance` despite the
+                // history entry showing the inbound. Fix: if the
+                // assembled token's last tx has a null/missing
+                // inclusionProof, classify as `'pending'` so the
+                // recovery flow can reattempt finalization on a
+                // subsequent load.
                 logger.warn(
                   'Payments',
                   'UXF recipient-side finalization failed, falling back to assembled JSON',
                   { tokenId: tokenRoot.tokenId.slice(0, 16), err: finalizeErr },
                 );
                 tokenData = assembledJson;
-                // tokenStatus remains 'confirmed'
+                // Re-derive proof status of the assembled fallback —
+                // missing field treated as null per canonical default.
+                if (hasNullProof) {
+                  tokenStatus = 'pending';
+                }
               }
             }
             // If stClient/trustBase are absent (e.g., in tests with mocked
