@@ -48,9 +48,25 @@ function hexToBytes(hex: string): Uint8Array {
   return bytes;
 }
 
+/**
+ * Tight retry config for tests that exercise transient-failure error shapes.
+ * Zero delays, zero jitter, two attempts → fail fast without flaking the suite.
+ */
+const FAST_RETRY = {
+  maxAttempts: 2,
+  delaysMs: [0],
+  totalBudgetMs: 1000,
+  sleep: () => Promise.resolve(),
+  random: () => 0,
+};
+
 /** Create a module that's already "registered" so tests don't trigger registration fetches */
-function createRegisteredModule(config?: Parameters<typeof createMarketModule>[0]): MarketModule {
-  const mod = createMarketModule(config);
+function createRegisteredModule(
+  config?: Parameters<typeof createMarketModule>[0] & { retryConfig?: unknown },
+): MarketModule {
+  // The constructor accepts an optional retryConfig (test-only escape hatch);
+  // the public factory signature doesn't expose it, so we cast through new directly.
+  const mod = new MarketModule(config as any);
   mod.initialize(mockDeps());
   // Skip auto-registration in unit tests — registration is tested separately
   (mod as any).registered = true;
@@ -285,8 +301,10 @@ describe('MarketModule', () => {
     });
 
     it('should throw generic HTTP error when no error field', async () => {
-      fetchSpy.mockResolvedValue(jsonResponse({}, 503));
-      const mod = createRegisteredModule();
+      // Fresh Response per attempt — 503 is retryable, so retries consume bodies.
+      // Use a tight retry config to keep the test fast.
+      fetchSpy.mockImplementation(async () => jsonResponse({}, 503));
+      const mod = createRegisteredModule({ retryConfig: FAST_RETRY } as any);
 
       await expect(mod.postIntent({ description: 'test', intentType: 'buy' })).rejects.toThrow('HTTP 503');
     });
@@ -1015,15 +1033,17 @@ describe('MarketModule', () => {
     });
 
     it('should fallback to HTTP status code when no error field', async () => {
-      fetchSpy.mockResolvedValue(jsonResponse({}, 503));
-      const mod = createRegisteredModule();
+      // Fresh Response per attempt — 503 is retryable.
+      fetchSpy.mockImplementation(async () => jsonResponse({}, 503));
+      const mod = createRegisteredModule({ retryConfig: FAST_RETRY } as any);
 
       await expect(mod.postIntent({ description: 'test', intentType: 'buy' })).rejects.toThrow('HTTP 503');
     });
 
     it('should throw descriptive error on non-JSON response', async () => {
-      fetchSpy.mockResolvedValue(new Response('Bad Gateway', { status: 502 }));
-      const mod = createRegisteredModule();
+      // Fresh Response per attempt — 502 is retryable.
+      fetchSpy.mockImplementation(async () => new Response('Bad Gateway', { status: 502 }));
+      const mod = createRegisteredModule({ retryConfig: FAST_RETRY } as any);
 
       await expect(mod.postIntent({ description: 'test', intentType: 'buy' })).rejects.toThrow('unexpected response (not JSON)');
     });
