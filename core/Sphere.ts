@@ -63,6 +63,7 @@ import { MultiAddressTransportMux, AddressTransportAdapter } from '../transport/
 import type { OracleProvider } from '../oracle';
 import type { PriceProvider } from '../price';
 import { PaymentsModule, createPaymentsModule } from '../modules/payments';
+import type { SyncOptions, SyncResult } from '../modules/payments';
 import { CommunicationsModule, createCommunicationsModule } from '../modules/communications';
 import type { CommunicationsModuleConfig } from '../modules/communications';
 import { GroupChatModule, createGroupChatModule } from '../modules/groupchat';
@@ -664,6 +665,40 @@ export class Sphere {
       if (options.dmSince != null) {
         sphere._dmSince = options.dmSince;
       }
+
+      // Honor `options.nametag` on the loaded-wallet path. Prior behavior:
+      // `Sphere.load` silently ignored it, so `sphere init --nametag X` on
+      // an existing profile printed "Wallet initialized successfully!"
+      // without actually registering X — a silent failure that left the
+      // wallet in whatever nametag state it had before.
+      if (options.nametag) {
+        const stripped = options.nametag.startsWith('@')
+          ? options.nametag.slice(1)
+          : options.nametag;
+        const requested = normalizeNametag(stripped);
+        const current = sphere._identity?.nametag;
+        if (!current) {
+          // No active claim on the loaded wallet — register the requested
+          // nametag now. May throw (NAMETAG_CONFLICT / NAMETAG_TAKEN /
+          // AGGREGATOR_ERROR) per the same invariants as a fresh-create
+          // `registerNametag` call.
+          await sphere.registerNametag(options.nametag);
+        } else if (current !== requested) {
+          // Refuse to silently switch the active nametag of an already-
+          // claimed wallet. (Multi-nametag selection is a deliberate
+          // future feature — for now, force the operator to clear or
+          // switchToAddress explicitly.)
+          throw new SphereError(
+            `Wallet already claims Unicity ID "@${current}" — cannot re-init ` +
+            `with "@${requested}". Use sphere.clear() and re-init to switch ` +
+            `nametags, or switchToAddress to register a different name on ` +
+            `another HD address.`,
+            'ALREADY_INITIALIZED',
+          );
+        }
+        // else: current === requested — no-op, idempotent re-init
+      }
+
       return { sphere, created: false };
     }
 
@@ -2494,6 +2529,46 @@ export class Sphere {
     const groupChat = this._groupChatConfig ? createGroupChatModule(this._groupChatConfig) : null;
     const market = this._marketConfig ? createMarketModule(this._marketConfig) : null;
 
+    // G3 + G7 — Wire Profile-backed persisted storage for the recipient
+    // cross-restart safety net BEFORE payments.initialize() so the
+    // auto-installed FinalizationWorkerRecipient picks up the persisted
+    // FinalizationQueueStorage and the in-memory recipient context Maps
+    // re-hydrate from the persisted contexts. The wiring is best-effort:
+    // when the StorageProvider isn't a ProfileStorageProvider (e.g.
+    // legacy IndexedDB), the auto-install falls back to in-memory shims
+    // (legacy behavior — does NOT survive Sphere.destroy() / restart).
+    try {
+      const storageWithBuilders = this._storage as unknown as {
+        buildFinalizationQueueStorageAdapter?: () =>
+          | import('../profile/finalization-queue-storage-adapter').OrbitDbFinalizationQueueStorageAdapter
+          | null;
+        buildRecipientContextStorageAdapter?: () =>
+          | import('../profile/finalization-queue-storage-adapter').OrbitDbRecipientContextStorageAdapter
+          | null;
+      };
+      const queueAdapter =
+        typeof storageWithBuilders.buildFinalizationQueueStorageAdapter === 'function'
+          ? storageWithBuilders.buildFinalizationQueueStorageAdapter()
+          : null;
+      const ctxAdapter =
+        typeof storageWithBuilders.buildRecipientContextStorageAdapter === 'function'
+          ? storageWithBuilders.buildRecipientContextStorageAdapter()
+          : null;
+      if (queueAdapter !== null || ctxAdapter !== null) {
+        payments.configureRecipientPersistedStorage({
+          ...(queueAdapter !== null
+            ? { finalizationQueueStorage: queueAdapter }
+            : {}),
+          ...(ctxAdapter !== null ? { recipientContextStorage: ctxAdapter } : {}),
+        });
+      }
+    } catch (err) {
+      logger.warn(
+        'Sphere',
+        `G3/G7: failed to wire Profile-backed recipient persisted storage (continuing with in-memory shims): ${safeErrorMessage(err)}`,
+      );
+    }
+
     // Initialize with address-specific identity and per-address transport
     payments.initialize({
       identity,
@@ -3358,9 +3433,9 @@ export class Sphere {
   // Public Methods - Sync
   // ===========================================================================
 
-  async sync(): Promise<void> {
+  async sync(options?: SyncOptions): Promise<SyncResult> {
     this.ensureReady();
-    await this._payments.sync();
+    return this._payments.sync(options);
   }
 
   // ===========================================================================
@@ -3472,10 +3547,27 @@ export class Sphere {
       throw new SphereError(`Unicity ID already registered for address ${this._currentAddressIndex}: @${this._identity.nametag}`, 'ALREADY_INITIALIZED');
     }
 
-    // 1. Mint nametag token on-chain FIRST
-    // Required for receiving tokens via @nametag (PROXY address finalization).
-    // Minting before publishing ensures the nametag is backed by an on-chain token.
-    if (!this._payments.hasNametag()) {
+    // 1. Mint nametag token on-chain FIRST — required so the Nostr
+    //    binding we publish is backed by an on-chain token under this
+    //    wallet's control. Skip the mint only when a token for THIS
+    //    EXACT name is already stored (idempotent re-register). If a
+    //    DIFFERENT nametag is stored, throw NAMETAG_CONFLICT: registering
+    //    `B` while the wallet's anchor is `A` would publish `@B → me`
+    //    but finalize incoming PROXY transfers via the `A` token,
+    //    producing the alice-vs-alice-t1 mismatch this guard exists for.
+    let mintedFresh = false;
+    if (!this._payments.hasNametagNamed(cleanNametag)) {
+      if (this._payments.hasNametag()) {
+        const existingName = this._payments.getNametag()!.name;
+        throw new SphereError(
+          `Cannot register Unicity ID "@${cleanNametag}" — this wallet ` +
+          `already holds an on-chain nametag token for "@${existingName}". ` +
+          `A single address binds to a single nametag on-chain; switch to ` +
+          `a different HD address (sphere.switchToAddress) and register ` +
+          `"@${cleanNametag}" there, or clear the wallet to start fresh.`,
+          'NAMETAG_CONFLICT',
+        );
+      }
       logger.debug('Sphere', `Minting nametag token for @${cleanNametag}...`);
       const result = await this.mintNametag(cleanNametag);
       if (!result.success) {
@@ -3484,10 +3576,32 @@ export class Sphere {
           'AGGREGATOR_ERROR',
         );
       }
-      logger.debug('Sphere', `Nametag token minted successfully`);
+      mintedFresh = true;
+      logger.debug('Sphere', 'Nametag token minted successfully');
     }
 
-    // 2. Publish identity binding with nametag to Nostr AFTER minting succeeds
+    // Belt-and-braces: defense-in-depth against future regressions in
+    // PaymentsModule.mintNametag that report success without persisting
+    // the NametagData. The current implementation can't reach here
+    // legitimately (mint failure throws above; mint success calls
+    // setNametag before returning), so this is a guard for the contract,
+    // not for any observed bug.
+    if (!this._payments.hasNametagNamed(cleanNametag)) {
+      throw new SphereError(
+        `Refusing to publish Nostr binding for "@${cleanNametag}" — mint ` +
+        `reported success but no matching nametag token was persisted to ` +
+        `the local store. Indicates a partial-write bug in the mint pipeline.`,
+        'AGGREGATOR_ERROR',
+      );
+    }
+
+    // 2. Publish identity binding with nametag to Nostr AFTER minting
+    //    succeeds. The publish step is a relay write — failures are
+    //    DISTINCT from aggregator-mint failures and need a separate
+    //    error code so operators can act correctly:
+    //      - AGGREGATOR_ERROR (above): bad oracle, retry-later
+    //      - NAMETAG_TAKEN (here): the name is owned on the relay by a
+    //        different pubkey, no amount of retry will fix it
     if (this._transport.publishIdentityBinding) {
       const success = await this._transport.publishIdentityBinding(
         this._identity!.chainPubkey,
@@ -3496,7 +3610,41 @@ export class Sphere {
         cleanNametag,
       );
       if (!success) {
-        throw new SphereError('Failed to register Unicity ID. It may already be taken.', 'VALIDATION_ERROR');
+        // Rollback an orphaned mint: if THIS call minted the nametag and
+        // the public claim then failed, the local store has a token we
+        // can't legitimately advertise. Leaving it would trip
+        // NAMETAG_CONFLICT on every subsequent registerNametag attempt
+        // with a different name. The on-chain token itself is permanent
+        // — minting is irreversible — but we drop the local pointer so
+        // the wallet's state is consistent. (If the conflict on the
+        // relay ever clears, the deterministic-salt mint will recover
+        // the same token via REQUEST_ID_EXISTS.)
+        if (mintedFresh) {
+          try {
+            await this._payments.clearNametagByName(cleanNametag);
+            logger.debug(
+              'Sphere',
+              `Rolled back orphan local nametag entry for "@${cleanNametag}" after publish failure`,
+            );
+          } catch (rollbackErr) {
+            logger.warn(
+              'Sphere',
+              `Failed to roll back nametag "@${cleanNametag}" after publish failure (continuing):`,
+              rollbackErr,
+            );
+          }
+        }
+        const restoredSuffix = mintedFresh
+          ? ` The orphan local nametag entry from THIS attempt has been rolled back.`
+          : ``;
+        throw new SphereError(
+          `Cannot claim Unicity ID "@${cleanNametag}" on the relay — the binding ` +
+          `event was rejected. Most commonly this means another wallet already ` +
+          `owns "@${cleanNametag}" on this relay (the relay enforces uniqueness ` +
+          `independently of the aggregator).${restoredSuffix} Retry with a ` +
+          `different --nametag, or contact relay ops if you expected to own this name.`,
+          'NAMETAG_TAKEN',
+        );
       }
     }
 
@@ -3941,6 +4089,60 @@ export class Sphere {
 
       // Note: no need to re-publish here — callers follow up with
       // syncIdentityWithTransport() which will publish WITH the recovered nametag.
+
+      // Re-mint the on-chain nametag TOKEN. Without this, the wallet's
+      // identity claim (set above) advertises @recoveredNametag on Nostr,
+      // but `_payments.nametags` is empty — so the wallet has no
+      // `nametagToken.id` to derive the expected PROXY against, and every
+      // inbound PROXY-mode transfer fails `finalizeTransferToken` with
+      // "Cannot finalize PROXY transfer - no Unicity ID token".
+      //
+      // Recovery is one deterministic-salt mint call. The aggregator
+      // returns `REQUEST_ID_EXISTS` with the original inclusion proof
+      // (because the salt is `SHA256(this.signingKey || name)` — same
+      // wallet, same name → same commitment ID), and the wallet
+      // reconstructs the token locally. No extra round-trip beyond what
+      // a fresh mint would cost.
+      //
+      // If the mint fails (network hiccup, aggregator down, or — in the
+      // hypothetical Nostr-binding-forged scenario — the salt doesn't
+      // match a prior commitment under this pubkey), we keep the
+      // identity claim but warn. PROXY-mode transfers will fail until a
+      // subsequent successful `sphere.mintNametag()` call; the operator
+      // can retry manually.
+      if (!this._payments.hasNametagNamed(recoveredNametag)) {
+        try {
+          // Call PaymentsModule.mintNametag directly, NOT this.mintNametag.
+          // The public Sphere.mintNametag wrapper invokes ensureReady() —
+          // which throws "Sphere not initialized" because Sphere.create
+          // calls recoverNametagFromTransport BEFORE setting
+          // `_initialized = true`. The PaymentsModule's own
+          // ensureInitialized() check is satisfied at this point
+          // (initializeModules ran earlier in the create flow).
+          const mintResult = await this._payments.mintNametag(recoveredNametag);
+          if (mintResult.success) {
+            logger.debug(
+              'Sphere',
+              `Re-minted on-chain nametag token for recovered "@${recoveredNametag}"`,
+            );
+          } else {
+            logger.warn(
+              'Sphere',
+              `Recovered Unicity ID "@${recoveredNametag}" from transport but ` +
+              `on-chain token mint-recovery failed: ${mintResult.error}. ` +
+              `PROXY-mode inbound transfers will fail until a subsequent ` +
+              `sphere.mintNametag("${recoveredNametag}") call succeeds.`,
+            );
+          }
+        } catch (mintErr) {
+          logger.warn(
+            'Sphere',
+            `Recovered Unicity ID "@${recoveredNametag}" from transport but ` +
+            `on-chain token mint-recovery threw (continuing without token):`,
+            mintErr,
+          );
+        }
+      }
 
       this.emitEvent('nametag:recovered', { nametag: recoveredNametag });
     } catch {
@@ -4569,6 +4771,43 @@ export class Sphere {
     // from the start. The original transport stays connected for resolve operations.
     const adapter = await this.ensureTransportMux(this._currentAddressIndex, this._identity!);
     const moduleTransport: TransportProvider = adapter ?? this._transport;
+
+    // G3 + G7 — Wire Profile-backed persisted storage for the recipient
+    // cross-restart safety net. Mirrors the wiring in
+    // `initializeAddressModules`. Best-effort — when StorageProvider
+    // does not expose the builders, the auto-installed worker falls
+    // back to the legacy in-memory shims.
+    try {
+      const storageWithBuilders = this._storage as unknown as {
+        buildFinalizationQueueStorageAdapter?: () =>
+          | import('../profile/finalization-queue-storage-adapter').OrbitDbFinalizationQueueStorageAdapter
+          | null;
+        buildRecipientContextStorageAdapter?: () =>
+          | import('../profile/finalization-queue-storage-adapter').OrbitDbRecipientContextStorageAdapter
+          | null;
+      };
+      const queueAdapter =
+        typeof storageWithBuilders.buildFinalizationQueueStorageAdapter === 'function'
+          ? storageWithBuilders.buildFinalizationQueueStorageAdapter()
+          : null;
+      const ctxAdapter =
+        typeof storageWithBuilders.buildRecipientContextStorageAdapter === 'function'
+          ? storageWithBuilders.buildRecipientContextStorageAdapter()
+          : null;
+      if (queueAdapter !== null || ctxAdapter !== null) {
+        this._payments.configureRecipientPersistedStorage({
+          ...(queueAdapter !== null
+            ? { finalizationQueueStorage: queueAdapter }
+            : {}),
+          ...(ctxAdapter !== null ? { recipientContextStorage: ctxAdapter } : {}),
+        });
+      }
+    } catch (err) {
+      logger.warn(
+        'Sphere',
+        `G3/G7: failed to wire Profile-backed recipient persisted storage (continuing with in-memory shims): ${safeErrorMessage(err)}`,
+      );
+    }
 
     this._payments.initialize({
       identity: this._identity!,

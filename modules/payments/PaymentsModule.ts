@@ -367,6 +367,47 @@ export interface ReceiveResult {
 }
 
 // =============================================================================
+// Sync Options & Result
+// =============================================================================
+
+export interface SyncOptions {
+  /** When true (default), drain pending V5 finalizations before flushing to
+   *  token-storage providers. Without draining, any token whose `sdkData`
+   *  still carries `_pendingFinalization` round-trips through `tokenToTxf`
+   *  as null and is silently dropped from the published CAR — a remote
+   *  device joining via `recoverLatest()` then sees a partial inventory.
+   *  Set false to preserve the legacy "publish whatever's confirmed"
+   *  semantics. */
+  drainPending?: boolean;
+  /** Max time in ms to wait for pending V5 tokens to finalize before
+   *  giving up (default: 30000). When `forceFlushOnDrainTimeout` is
+   *  false (default) AND tokens remain pending after this budget, the
+   *  flush is skipped and `drainTimedOut: true` is returned — the caller
+   *  can retry once tokens have confirmed. */
+  drainTimeoutMs?: number;
+  /** Poll interval in ms while draining (default: 2000). */
+  drainPollIntervalMs?: number;
+  /** When true, publish whatever's confirmed even if pending tokens
+   *  remain after `drainTimeoutMs`. Restores legacy behavior — pending
+   *  tokens are silently dropped from the CAR. Default false. */
+  forceFlushOnDrainTimeout?: boolean;
+}
+
+export interface SyncResult {
+  /** Tokens added to local state from remote-merged data. */
+  added: number;
+  /** Tokens removed from local state via remote tombstones. */
+  removed: number;
+  /** Number of V5-pending tokens still unresolved when the flush ran.
+   *  Non-zero only when `drainPending: false` was requested OR
+   *  `forceFlushOnDrainTimeout: true` overrode a timed-out drain. */
+  pendingAtFlush?: number;
+  /** True iff `drainPending` was on, the drain timed out, and the flush
+   *  was skipped (no partial CAR published). */
+  drainTimedOut?: boolean;
+}
+
+// =============================================================================
 // Token Parsing Utilities
 // =============================================================================
 
@@ -1224,8 +1265,10 @@ export class PaymentsModule {
   private syncDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly SYNC_DEBOUNCE_MS = 500;
 
-  /** Sync coalescing: concurrent sync() calls share the same operation */
-  private _syncInProgress: Promise<{ added: number; removed: number }> | null = null;
+  /** Sync coalescing: concurrent sync() calls share the same operation.
+   *  Options from the first in-flight call are used; subsequent callers
+   *  with different options receive the first call's result. */
+  private _syncInProgress: Promise<SyncResult> | null = null;
 
   /** Token change observers — notified when a token is added, updated, or removed */
   private tokenChangeCallbacks: Array<(tokenId: string, sdkData: string) => void> = [];
@@ -1450,15 +1493,88 @@ export class PaymentsModule {
     // Subscribe to storage provider events (push-based sync)
     this.subscribeToStorageEvents();
 
-    // Phase 8 steelman post-cutover — start the sending-recovery worker
-    // when both (a) the gate is on AND (b) a worker has been installed
-    // by the bootstrap layer. After T.8.D part 1 of 2 the gate defaults
-    // to `true`; the start is still no-op when no worker is installed
-    // (forensic warning omitted intentionally — the bootstrap is the
-    // single install point and a missing install is a deployment-config
-    // bug, not a hot path). Tests that count timers can opt out via
-    // `features: { recoveryWorker: false }`.
-    if (this.features.recoveryWorker && this.sendingRecoveryWorker !== null) {
+    // G6 — auto-install a default SendingRecoveryWorker when the gate
+    // is on AND no consumer has already wired one. The auto-installed
+    // worker reads from the in-memory `_senderOutboxMap` (same shim
+    // FinalizationWorkerSender uses) and re-publishes via the injected
+    // transport, preserving `bundleCid` for recipient-side replay LRU
+    // (§6.3 / T.3.A idempotency contract).
+    //
+    // Bootstrap layers (Sphere) MAY override by installing a worker
+    // wired against a Profile-backed `OutboxWriter` BEFORE
+    // `initialize()` (the `!this.sendingRecoveryWorker` check preserves
+    // that contract).
+    if (
+      this.features.recoveryWorker &&
+      this.sendingRecoveryWorker === null
+    ) {
+      const senderOutboxMap = this._senderOutboxMap;
+      const transport = this.deps!.transport;
+      const sphereEmit = this.deps!.emitEvent;
+      const recoveryDeps: import('./transfer/sending-recovery-worker').SendingRecoveryWorkerDeps = {
+        outbox: {
+          async readAllNew(): Promise<ReadonlyArray<UxfTransferOutboxEntry>> {
+            return Array.from(senderOutboxMap.values());
+          },
+          async update(
+            id: string,
+            mutator: (prev: UxfTransferOutboxEntry) => UxfTransferOutboxEntry,
+          ): Promise<UxfTransferOutboxEntry> {
+            const existing = senderOutboxMap.get(id);
+            if (existing === undefined) {
+              throw new SphereError(
+                `SendingRecoveryWorker.update: no entry at id "${id}"`,
+                'VALIDATION_ERROR',
+              );
+            }
+            const next = mutator(existing);
+            const bumped: UxfTransferOutboxEntry = {
+              ...next,
+              lamport: (existing.lamport ?? 0) + 1,
+            };
+            senderOutboxMap.set(id, bumped);
+            return bumped;
+          },
+        },
+        republish: async (entry: UxfTransferOutboxEntry): Promise<void> => {
+          // Re-publish via the same transport surface the original
+          // send used. The recipient's replay-LRU short-circuits
+          // duplicates by `bundleCid` (§6.3 / T.3.A) so a wasted publish
+          // in the racing window is harmless.
+          //
+          // CID-by-reference shape: the original CAR is already pinned
+          // to IPFS by the time it lands in the outbox; re-publishing
+          // the CID is sufficient. Implementations that need a richer
+          // payload (inline CAR for bundles below the cap) override
+          // the worker via `installSendingRecoveryWorker`.
+          //
+          // `mode === 'txf'` is a legacy outbox shape that does NOT
+          // belong to UXF. Map it to `'instant'` for the wire payload's
+          // advisory `mode` field — recipients ignore it (§5.6).
+          const payloadMode: 'conservative' | 'instant' =
+            entry.mode === 'txf' ? 'instant' : entry.mode;
+          await transport.sendTokenTransfer(entry.recipientTransportPubkey, {
+            kind: 'uxf-cid',
+            version: '1.0',
+            mode: payloadMode,
+            bundleCid: entry.bundleCid,
+            tokenIds: entry.tokenIds,
+            ...(typeof entry.memo === 'string' ? { memo: entry.memo } : {}),
+          });
+        },
+        emit: sphereEmit,
+      };
+      this.sendingRecoveryWorker = new SendingRecoveryWorker(recoveryDeps);
+      this.sendingRecoveryWorker.start();
+      logger.debug(
+        'Payments',
+        'Default SendingRecoveryWorker auto-installed (recoveryWorker default-on)',
+      );
+    } else if (
+      this.features.recoveryWorker &&
+      this.sendingRecoveryWorker !== null
+    ) {
+      // Pre-installed by the bootstrap layer — start it.
       this.sendingRecoveryWorker.start();
     }
 
@@ -2023,6 +2139,50 @@ export class PaymentsModule {
                 };
                 await this._recipientFinalizationQueue.add(addrId, entry);
 
+                // G7 — mirror the in-memory context Maps to persisted
+                // storage so a crash between enqueue and finalization
+                // does not erase the lookup keys the dispositionWriter
+                // VALID branch needs. Best-effort + fire-and-forget:
+                // the in-memory Maps remain authoritative for the
+                // current process (they were already populated above).
+                // The persisted records exist solely to survive a
+                // crash; awaiting them on the recipient hot path
+                // serializes N OrbitDB writes per token batch under
+                // parallel load and was the dominant source of the
+                // 3× e2e regression in profile-multi-device-sync.
+                // Persistence failure is non-fatal — only cross-
+                // restart safety degrades.
+                if (this._recipientContextStorage !== null) {
+                  const ctxStorage = this._recipientContextStorage;
+                  const finalizationCtx = {
+                    localTokenId: token.id,
+                    sourceTokenJson: pCtx.sourceTokenJson,
+                    lastTxJson: pCtx.lastTxJson,
+                    requestIdHex: reqId,
+                  };
+                  const requestCtx = {
+                    transactionHash: pCtx.transactionHash,
+                    authenticator: pCtx.authenticator,
+                    nextEntryRest: { status: 'valid' as const },
+                  };
+                  void ctxStorage
+                    .writeFinalizationContext(addrId, tokenIdForQueue, finalizationCtx)
+                    .catch((persistErr) => {
+                      logger.warn(
+                        'Payments',
+                        `G7: failed to persist finalization context for ${tokenIdForQueue.slice(0, 16)}: ${persistErr instanceof Error ? persistErr.message : String(persistErr)}`,
+                      );
+                    });
+                  void ctxStorage
+                    .writeRequestContext(addrId, reqId, requestCtx)
+                    .catch((persistErr) => {
+                      logger.warn(
+                        'Payments',
+                        `G7: failed to persist request context for ${tokenIdForQueue.slice(0, 16)}: ${persistErr instanceof Error ? persistErr.message : String(persistErr)}`,
+                      );
+                    });
+                }
+
                 // Fire-and-forget drive of the worker. The worker
                 // handles its own concurrency caps + per-token mutex.
                 const worker = this.finalizationWorkerRecipient;
@@ -2191,6 +2351,55 @@ export class PaymentsModule {
           typeof directAddr === 'string' && directAddr.length > 0
             ? computeAddressId(directAddr)
             : this.deps!.identity.chainPubkey;
+
+        // G7 — re-hydrate the recipient context Maps from persisted
+        // storage. Without this, a Sphere that crashed between enqueue
+        // and finalization could not surface the contexts the
+        // dispositionWriter VALID branch needs to flip local Tokens to
+        // `'confirmed'`.
+        //
+        // The hydration is fire-and-forget so initialize() stays
+        // synchronous; the recipient worker has its own retry loop and
+        // is tolerant of a context Map populated mid-cycle. The hydration
+        // promise is exposed via {@link awaitRecipientContextHydration}
+        // for tests that need a deterministic settle point.
+        if (this._recipientContextStorage !== null) {
+          const ctxStorage = this._recipientContextStorage;
+          this._recipientContextHydrationPromise = (async () => {
+            try {
+              const persistedFinalization =
+                await ctxStorage.listAllFinalizationContexts(recipientAddressId);
+              for (const [tokenId, ctx] of persistedFinalization) {
+                if (!this._recipientFinalizationContext.has(tokenId)) {
+                  this._recipientFinalizationContext.set(tokenId, ctx);
+                }
+              }
+              const persistedRequest =
+                await ctxStorage.listAllRequestContexts(recipientAddressId);
+              for (const [reqId, ctx] of persistedRequest) {
+                if (!this._recipientRequestContextMap.has(reqId)) {
+                  // Cast: PersistedRequestContext is the JSON-safe
+                  // mirror of RequestContext (`nextEntryRest` widens to
+                  // Record<string, unknown> at the storage layer).
+                  this._recipientRequestContextMap.set(
+                    reqId,
+                    ctx as unknown as RequestContext,
+                  );
+                }
+              }
+              logger.debug(
+                'Payments',
+                `G7: re-hydrated ${persistedFinalization.size} finalization + ${persistedRequest.size} request contexts from profile`,
+              );
+            } catch (err) {
+              logger.warn(
+                'Payments',
+                `G7: failed to re-hydrate recipient context Maps from profile (continuing with empty maps): ${err instanceof Error ? err.message : String(err)}`,
+              );
+            }
+          })();
+        }
+
         const built = buildDefaultFinalizationWorkerRecipient({
           addressId: recipientAddressId,
           oracle: this.deps!.oracle,
@@ -2210,6 +2419,11 @@ export class PaymentsModule {
           // + operator importer so all three paths serialize against the
           // same read-decide-write window.
           perTokenMutex: this._sharedPerTokenMutex,
+          // G3 — pass the Profile-backed persisted FinalizationQueueStorage
+          // when configured. When null, the helper falls back to the
+          // in-memory shim (legacy behavior).
+          finalizationQueueStorage:
+            this._recipientFinalizationQueueStorage ?? undefined,
         });
         this._recipientFinalizationQueue = built.queue;
         this.finalizationWorkerRecipient = built.worker;
@@ -2590,6 +2804,87 @@ export class PaymentsModule {
    * @internal
    */
   private _sharedPerTokenMutex: PerTokenMutex | null = null;
+
+  /**
+   * G3 — persisted FinalizationQueueStorage for the recipient
+   * finalization worker. Set by Sphere bootstrap before
+   * {@link initialize} when a Profile-backed storage stack is available.
+   * `buildDefaultFinalizationWorkerRecipient` consumes this directly;
+   * when null, it falls back to the legacy in-memory `Map<string,string>`
+   * shim (loss-prone across Sphere.destroy() / restart).
+   *
+   * @internal
+   */
+  private _recipientFinalizationQueueStorage:
+    | import('./transfer/finalization-queue').FinalizationQueueStorage
+    | null = null;
+
+  /**
+   * G7 — persisted recipient-context CRUD adapter for the in-memory
+   * `_recipientRequestContextMap` and `_recipientFinalizationContext`
+   * Maps. Set by Sphere bootstrap when a Profile-backed storage stack
+   * is available; consumed in {@link initialize} to re-hydrate the
+   * Maps before the recipient worker starts and in the processToken
+   * closure to mirror every in-memory write to disk.
+   *
+   * @internal
+   */
+  private _recipientContextStorage:
+    | import('../../profile/finalization-queue-storage-adapter').OrbitDbRecipientContextStorageAdapter
+    | import('../../profile/finalization-queue-storage-adapter').InMemoryRecipientContextStorageAdapter
+    | null = null;
+
+  /**
+   * G7 — Promise tracking the in-flight re-hydration of the recipient
+   * context Maps from persisted storage. Set by {@link initialize}'s
+   * auto-install path when a `_recipientContextStorage` is configured;
+   * `undefined` otherwise. Exposed via
+   * {@link awaitRecipientContextHydration} for tests that need a
+   * deterministic settle point.
+   *
+   * @internal
+   */
+  private _recipientContextHydrationPromise: Promise<void> | undefined =
+    undefined;
+
+  /**
+   * G7 — Test/diagnostic hook: await the in-flight recipient-context
+   * hydration. Returns a resolved promise when no hydration is in
+   * flight. Production code paths SHOULD NOT need to await this —
+   * the recipient worker is tolerant of a Map populated mid-cycle —
+   * but tests that assert post-hydration state need a settle point.
+   */
+  async awaitRecipientContextHydration(): Promise<void> {
+    if (this._recipientContextHydrationPromise === undefined) return;
+    await this._recipientContextHydrationPromise;
+  }
+
+  /**
+   * G3 + G7 — Install Profile-backed persisted storage for the
+   * recipient-side cross-restart safety net. Sphere bootstrap calls
+   * this after `setIdentity()` (so the encryption key is derived) but
+   * BEFORE `initialize()` (so the auto-installed recipient worker picks
+   * up the persisted FinalizationQueueStorage and the in-memory Maps
+   * are re-hydrated from the persisted contexts).
+   *
+   * Idempotent. Tests pass an in-memory adapter; production wires
+   * `OrbitDbFinalizationQueueStorageAdapter` and
+   * `OrbitDbRecipientContextStorageAdapter` against the wallet's
+   * ProfileDatabase.
+   */
+  configureRecipientPersistedStorage(opts: {
+    readonly finalizationQueueStorage?: import('./transfer/finalization-queue').FinalizationQueueStorage;
+    readonly recipientContextStorage?:
+      | import('../../profile/finalization-queue-storage-adapter').OrbitDbRecipientContextStorageAdapter
+      | import('../../profile/finalization-queue-storage-adapter').InMemoryRecipientContextStorageAdapter;
+  }): void {
+    if (opts.finalizationQueueStorage !== undefined) {
+      this._recipientFinalizationQueueStorage = opts.finalizationQueueStorage;
+    }
+    if (opts.recipientContextStorage !== undefined) {
+      this._recipientContextStorage = opts.recipientContextStorage;
+    }
+  }
 
   /**
    * Install the operator inclusion-proof importer (T.5.D, §6.3 escape
@@ -5001,35 +5296,91 @@ export class PaymentsModule {
     const result: ReceiveResult = { transfers: received };
 
     if (opts.finalize) {
-      const timeout = opts.timeout ?? 60_000;
-      const pollInterval = opts.pollInterval ?? 2_000;
-      const startTime = Date.now();
-
-      while (Date.now() - startTime < timeout) {
-        const resolution = await this.resolveUnconfirmed();
-        result.finalization = resolution;
-        if (opts.onProgress) opts.onProgress(resolution);
-
-        // Check if any unconfirmed tokens remain
-        const stillUnconfirmed = Array.from(this.tokens.values()).some(
-          t => t.status === 'submitted' || t.status === 'pending'
-        );
-        if (!stillUnconfirmed) break;
-
-        await new Promise(r => setTimeout(r, pollInterval));
-        await this.load();
-      }
-
-      result.finalizationDurationMs = Date.now() - startTime;
-      result.timedOut = Array.from(this.tokens.values()).some(
-        t => t.status === 'submitted' || t.status === 'pending'
-      );
+      const drain = await this.drainPendingFinalizations({
+        timeoutMs: opts.timeout ?? 60_000,
+        pollIntervalMs: opts.pollInterval ?? 2_000,
+        onProgress: opts.onProgress,
+      });
+      result.finalization = drain.finalization;
+      result.finalizationDurationMs = drain.durationMs;
+      result.timedOut = drain.timedOut;
     } else {
       // Non-finalize: submit commitments once (fire-and-forget style)
       result.finalization = await this.resolveUnconfirmed();
     }
 
     return result;
+  }
+
+  /**
+   * Drain pending V5 finalizations until none remain or the timeout
+   * elapses. Shared by `receive({ finalize: true })` and `sync()` — the
+   * latter calls this before flushing to token-storage providers so the
+   * published CAR doesn't drop pending tokens (whose `sdkData` lacks
+   * `genesis`/`state` and round-trips through `tokenToTxf` as null).
+   *
+   * Short-circuits to a no-op when:
+   *  - No tokens are in `'submitted'` or `'pending'` state at entry, OR
+   *  - The oracle has no `getStateTransitionClient()` / `getTrustBase()`
+   *    (a wallet without aggregator wiring can't resolve V5 commitments
+   *    no matter how long it polls — preserves the pre-fix behavior of
+   *    quietly returning rather than blocking for the full timeout).
+   */
+  private async drainPendingFinalizations(opts: {
+    timeoutMs: number;
+    pollIntervalMs: number;
+    onProgress?: (result: UnconfirmedResolutionResult) => void;
+  }): Promise<{
+    finalization?: UnconfirmedResolutionResult;
+    durationMs: number;
+    timedOut: boolean;
+    skipped: boolean;
+  }> {
+    const startTime = Date.now();
+
+    const hasUnconfirmed = (): boolean =>
+      Array.from(this.tokens.values()).some(
+        (t) => t.status === 'submitted' || t.status === 'pending',
+      );
+
+    // Fast path: nothing to drain.
+    if (!hasUnconfirmed()) {
+      return { durationMs: 0, timedOut: false, skipped: true };
+    }
+
+    // No-oracle short-circuit: without stClient + trustBase,
+    // resolveUnconfirmed() early-exits every iteration and the polling
+    // loop would block for the full timeoutMs with zero progress.
+    const stClient = this.deps!.oracle.getStateTransitionClient?.();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const trustBase = (this.deps!.oracle as any).getTrustBase?.();
+    if (!stClient || !trustBase) {
+      logger.debug(
+        'Payments',
+        '[V5-RESOLVE] drainPendingFinalizations: oracle not wired (no stClient/trustBase) — skipping drain',
+      );
+      return { durationMs: 0, timedOut: hasUnconfirmed(), skipped: true };
+    }
+
+    let finalization: UnconfirmedResolutionResult | undefined;
+
+    while (Date.now() - startTime < opts.timeoutMs) {
+      const resolution = await this.resolveUnconfirmed();
+      finalization = resolution;
+      if (opts.onProgress) opts.onProgress(resolution);
+
+      if (!hasUnconfirmed()) break;
+
+      await new Promise((r) => setTimeout(r, opts.pollIntervalMs));
+      await this.load();
+    }
+
+    return {
+      finalization,
+      durationMs: Date.now() - startTime,
+      timedOut: hasUnconfirmed(),
+      skipped: false,
+    };
   }
 
   // ===========================================================================
@@ -6878,12 +7229,40 @@ export class PaymentsModule {
   }
 
   /**
-   * Get the current (first) nametag data.
+   * Get the active nametag entry — the one whose name matches
+   * `identity.nametag` (the name advertised on Nostr). Falls back to
+   * `nametags[0]` when the claim is unset or has no matching entry, so
+   * legacy single-nametag callers see no behavior change.
    *
-   * @returns The nametag data, or `null` if no nametag is set.
+   * The preference matters for PROXY-mode finalize: it must derive the
+   * recipient address from the token whose name matches Nostr,
+   * otherwise inbound transfers to `@claimed` (PROXY computed from
+   * `TokenId.fromNameTag('claimed')`) are rejected against the
+   * `[0]` entry's tokenId.
+   *
+   * @returns The active nametag data, or `null` if no nametag is set.
    */
   getNametag(): NametagData | null {
+    const claimedName = this.deps?.identity.nametag;
+    if (claimedName) {
+      const match = this.nametags.find((n) => n.name === claimedName);
+      if (match) return match;
+    }
     return this.nametags[0] ?? null;
+  }
+
+  /**
+   * Look up a stored nametag entry by exact name. Returns `null` if the
+   * wallet hasn't minted (or hasn't loaded a token for) this name.
+   *
+   * Used by `Sphere.registerNametag` to detect the "mint already done for
+   * THIS specific name" idempotency case (vs. "some OTHER nametag is
+   * minted") so the consistency guard fires correctly.
+   *
+   * @param name - Normalized nametag name (e.g. result of `normalizeNametag`).
+   */
+  getNametagByName(name: string): NametagData | null {
+    return this.nametags.find((n) => n.name === name) ?? null;
   }
 
   /**
@@ -6896,12 +7275,27 @@ export class PaymentsModule {
   }
 
   /**
-   * Check whether a nametag is currently set.
+   * Check whether ANY nametag is currently set.
+   *
+   * Prefer {@link hasNametagNamed} when the caller cares about a specific
+   * name (e.g. the `registerNametag` consistency guard) — `hasNametag()`
+   * alone returns true for any stored entry regardless of name, which was
+   * the source of the alice-vs-alice-t1 Nostr-vs-on-chain inconsistency
+   * bug.
    *
    * @returns `true` if nametag data is present.
    */
   hasNametag(): boolean {
     return this.nametags.length > 0;
+  }
+
+  /**
+   * Check whether a nametag with this exact name is stored.
+   *
+   * @param name - Normalized nametag name.
+   */
+  hasNametagNamed(name: string): boolean {
+    return this.nametags.some((n) => n.name === name);
   }
 
   /**
@@ -6911,6 +7305,31 @@ export class PaymentsModule {
     this.ensureInitialized();
     this.nametags = [];
     await this.save();
+  }
+
+  /**
+   * Remove a single nametag entry (by exact name) from local state. The
+   * on-chain token IS NOT burned — this only forgets the local pointer.
+   *
+   * Used by `Sphere.registerNametag` to roll back an orphaned mint when
+   * the subsequent Nostr-binding publish fails: the mint succeeded
+   * (on-chain anchor exists under this wallet's pubkey), but the public
+   * claim couldn't be made, so we drop the local reference rather than
+   * leaving a dangling token that confuses subsequent `registerNametag`
+   * attempts (they would otherwise hit `NAMETAG_CONFLICT`).
+   *
+   * @param name - Normalized nametag name (e.g. result of `normalizeNametag`).
+   * @returns `true` if an entry was removed, `false` if no matching entry existed.
+   */
+  async clearNametagByName(name: string): Promise<boolean> {
+    this.ensureInitialized();
+    const before = this.nametags.length;
+    this.nametags = this.nametags.filter((n) => n.name !== name);
+    const removed = this.nametags.length < before;
+    if (removed) {
+      await this.save();
+    }
+    return removed;
   }
 
   /**
@@ -7211,19 +7630,32 @@ export class PaymentsModule {
    * to the provider's `sync()` method, and the merged result is applied locally.
    * Emits `sync:started`, `sync:completed`, and `sync:error` events.
    *
-   * @returns Summary with counts of tokens added and removed during sync.
+   * Drain semantics: when at least one token-storage provider is configured,
+   * `sync()` first drains pending V5 finalizations (default-on, capped at
+   * `drainTimeoutMs`) so the published CAR is a complete inventory. Without
+   * draining, `tokenToTxf()` returns null for any token whose `sdkData`
+   * still carries `_pendingFinalization`, and `buildTxfStorageData()`
+   * silently drops it from the CAR — a remote device's `recoverLatest()`
+   * would then walk to the higher pointer and observe a partial inventory.
+   * If the drain times out (some tokens still pending), the flush is
+   * skipped (no partial CAR is published) — set
+   * `forceFlushOnDrainTimeout: true` to override.
+   *
+   * @param options - Optional sync options (drain control, timeouts).
+   * @returns Sync result with added/removed counts plus drain status.
    */
-  async sync(): Promise<{ added: number; removed: number }> {
+  async sync(options?: SyncOptions): Promise<SyncResult> {
     this.ensureInitialized();
 
     // Sync coalescing: if a sync is already in progress, return its promise.
-    // This prevents race conditions when addTokenStorageProvider() fires a
+    // This prevents race conditions when a remote-update event triggers a
     // fire-and-forget sync and the caller also syncs immediately after.
+    // The first call's options win for the in-flight operation.
     if (this._syncInProgress) {
       return this._syncInProgress;
     }
 
-    this._syncInProgress = this._doSync();
+    this._syncInProgress = this._doSync(options);
     try {
       return await this._syncInProgress;
     } finally {
@@ -7231,7 +7663,7 @@ export class PaymentsModule {
     }
   }
 
-  private async _doSync(): Promise<{ added: number; removed: number }> {
+  private async _doSync(options?: SyncOptions): Promise<SyncResult> {
     this.deps!.emitEvent('sync:started', { source: 'payments' });
 
     try {
@@ -7239,13 +7671,49 @@ export class PaymentsModule {
       const providers = this.getTokenStorageProviders();
 
       if (providers.size === 0) {
-        // No providers - just save locally
+        // No providers - just save locally. No draining: save() goes to
+        // the kv StorageProvider which preserves _pendingFinalization
+        // shape, so dropping pending tokens is not an issue here.
         await this.save();
         this.deps!.emitEvent('sync:completed', {
           source: 'payments',
           count: this.tokens.size,
         });
         return { added: 0, removed: 0 };
+      }
+
+      // Drain pending V5 finalizations BEFORE serializing localData via
+      // tokenToTxf. Default-on; opt out via `drainPending: false`.
+      const drainPending = options?.drainPending ?? true;
+      if (drainPending) {
+        const drain = await this.drainPendingFinalizations({
+          timeoutMs: options?.drainTimeoutMs ?? 30_000,
+          pollIntervalMs: options?.drainPollIntervalMs ?? 2_000,
+        });
+        if (drain.timedOut && !drain.skipped) {
+          // Drain ran but didn't finish in time. Count residual pending.
+          const pendingAtFlush = Array.from(this.tokens.values()).filter(
+            (t) => t.status === 'submitted' || t.status === 'pending',
+          ).length;
+          if (!options?.forceFlushOnDrainTimeout) {
+            // Skip the flush — publishing now would produce a partial CAR
+            // that drops the still-pending tokens, which is exactly the
+            // data-loss bug this fix exists to prevent.
+            logger.warn(
+              'Payments',
+              `sync: drain timed out with ${pendingAtFlush} token(s) still pending V5 finalization — skipping flush to avoid partial CAR. Retry sync() once finalization completes, or pass forceFlushOnDrainTimeout:true to publish anyway.`,
+            );
+            this.deps!.emitEvent('sync:completed', {
+              source: 'payments',
+              count: this.tokens.size,
+            });
+            return { added: 0, removed: 0, drainTimedOut: true, pendingAtFlush };
+          }
+          logger.warn(
+            'Payments',
+            `sync: drain timed out with ${pendingAtFlush} token(s) still pending V5 finalization — flushing anyway (forceFlushOnDrainTimeout=true). Pending tokens will be silently dropped from the published CAR.`,
+          );
+        }
       }
 
       // Create local data once
@@ -7366,7 +7834,17 @@ export class PaymentsModule {
         count: this.tokens.size,
       });
 
-      return { added: totalAdded, removed: totalRemoved };
+      // Surface any tokens that rode through the flush in pending-V5 state
+      // so callers can detect partial-CAR risk (relevant when drain was
+      // skipped due to no oracle, OR forceFlushOnDrainTimeout overrode a
+      // timed-out drain). Successful drain → pendingAtFlush = 0 → omit
+      // from the result.
+      const pendingAtFlush = Array.from(this.tokens.values()).filter(
+        (t) => t.status === 'submitted' || t.status === 'pending',
+      ).length;
+      const result: SyncResult = { added: totalAdded, removed: totalRemoved };
+      if (pendingAtFlush > 0) result.pendingAtFlush = pendingAtFlush;
+      return result;
     } catch (error) {
       this.deps!.emitEvent('sync:error', {
         source: 'payments',
@@ -10286,6 +10764,15 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
    * per-builder mutex is used.
    */
   readonly perTokenMutex?: PerTokenMutex | null;
+  /**
+   * G3 — Optional persisted {@link FinalizationQueueStorage} for the
+   * recipient FinalizationQueue. When omitted, an in-memory shim is used
+   * (legacy behavior — does NOT survive Sphere.destroy() / restart). The
+   * Sphere bootstrap layer plugs an `OrbitDbFinalizationQueueStorageAdapter`
+   * here when a Profile-backed storage stack is detected, closing the
+   * cross-restart safety net for the recipient worker.
+   */
+  readonly finalizationQueueStorage?: import('./transfer/finalization-queue').FinalizationQueueStorage;
 }): {
   worker: FinalizationWorkerRecipient;
   queue: FinalizationQueue;
@@ -10312,28 +10799,38 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
     save,
     emit,
     signal,
+    finalizationQueueStorage,
   } = opts;
 
-  // ---- In-memory FinalizationQueue (T.5.C / Wave G.7 stub) -----------
-  const queueMap = new Map<string, string>();
-  const queueStorage = {
-    async readKey(key: string): Promise<string | null> {
-      return queueMap.has(key) ? (queueMap.get(key) ?? null) : null;
-    },
-    async writeKey(key: string, value: string): Promise<void> {
-      queueMap.set(key, value);
-    },
-    async listByPrefix(prefix: string): Promise<Map<string, string>> {
-      const out = new Map<string, string>();
-      for (const [k] of queueMap) {
-        if (k.startsWith(prefix)) out.set(k, k.slice(prefix.length));
-      }
-      return out;
-    },
-    async deleteKey(key: string): Promise<void> {
-      queueMap.delete(key);
-    },
-  };
+  // ---- FinalizationQueue (T.5.C / Wave G.7) --------------------------
+  // G3: prefer the caller-supplied persisted storage (Profile/OrbitDb-
+  // backed) over the in-memory shim. Sphere wires the persisted form
+  // when a ProfileStorageProvider is present; legacy callers fall back
+  // to the in-memory map (loss-prone across Sphere.destroy()/restart).
+  let queueStorage: import('./transfer/finalization-queue').FinalizationQueueStorage;
+  if (finalizationQueueStorage !== undefined) {
+    queueStorage = finalizationQueueStorage;
+  } else {
+    const queueMap = new Map<string, string>();
+    queueStorage = {
+      async readKey(key: string): Promise<string | null> {
+        return queueMap.has(key) ? (queueMap.get(key) ?? null) : null;
+      },
+      async writeKey(key: string, value: string): Promise<void> {
+        queueMap.set(key, value);
+      },
+      async listByPrefix(prefix: string): Promise<Map<string, string>> {
+        const out = new Map<string, string>();
+        for (const [k] of queueMap) {
+          if (k.startsWith(prefix)) out.set(k, k.slice(prefix.length));
+        }
+        return out;
+      },
+      async deleteKey(key: string): Promise<void> {
+        queueMap.delete(key);
+      },
+    };
+  }
   const queue = new FinalizationQueue({ storage: queueStorage });
 
   const queueAdapter = {

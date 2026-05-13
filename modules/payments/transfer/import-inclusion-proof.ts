@@ -1267,6 +1267,10 @@ export class InclusionProofImporter {
       this._coerceDispositionReason(manifestEntry.invalidReason) ??
       'oracle-rejected';
     return {
+      // G2 — schema discriminator preserves this record across legacy
+      // PaymentsModule.save() flushes (provider-side `applyPerEntryDiff`
+      // checks `_schemaVersion === 'uxf-1'` to skip foreign-schema entries).
+      _schemaVersion: 'uxf-1',
       tokenId,
       observedTokenContentHash: manifestEntry.rootHash,
       reason,

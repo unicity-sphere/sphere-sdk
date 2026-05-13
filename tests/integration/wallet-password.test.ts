@@ -131,11 +131,23 @@ async function createAndDestroy(options: {
 // =============================================================================
 
 describe('Wallet password encryption', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    if (Sphere.getInstance()) {
+      try { await Sphere.getInstance()!.destroy(); } catch { /* ignore */ }
+    }
+    (Sphere as unknown as { instance: null }).instance = null;
+    // Wait a microtask tick to let any pending async storage writes
+    // (from a prior test that didn't await its own destroy) flush
+    // before we delete the directory. cleanTestDir is sync rm.
+    await new Promise((r) => setImmediate(r));
     cleanTestDir();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    if (Sphere.getInstance()) {
+      try { await Sphere.getInstance()!.destroy(); } catch { /* ignore */ }
+    }
+    (Sphere as unknown as { instance: null }).instance = null;
     cleanTestDir();
   });
 

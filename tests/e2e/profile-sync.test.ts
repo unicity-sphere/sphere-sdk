@@ -235,7 +235,8 @@ describe.skipIf(SKIP_INFRA)('Profile (OrbitDB + IPFS) Sync E2E', () => {
   // -------------------------------------------------------------------------
 
   it('ProfileTokenStorageProvider pins real tokens to a CAR and recovers them on a fresh load', async () => {
-    const nametag = `e2e-prof-sync-car-${rand()}`;
+    // Nametag regex caps at 20 chars; `e2e-pscar-` (10) + rand() (6) = 16.
+    const nametag = `e2e-pscar-${rand()}`;
     let dirs = makeTempDirs('profile-sync-car');
     cleanupDirs.push(dirs.base);
     await ensureTrustbase(dirs.dataDir);

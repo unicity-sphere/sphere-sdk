@@ -26,6 +26,10 @@ import { ProfileError } from './errors';
 import { deriveProfileEncryptionKey, encryptString, decryptString } from './encryption';
 import { OrbitDbDispositionStorageAdapter } from './disposition-storage-adapters';
 import {
+  OrbitDbFinalizationQueueStorageAdapter,
+  OrbitDbRecipientContextStorageAdapter,
+} from './finalization-queue-storage-adapter';
+import {
   buildLocalEntry,
   type OpLogEntryEnvelope,
 } from './oplog-entry';
@@ -835,6 +839,44 @@ export class ProfileStorageProvider implements StorageProvider {
       return null;
     }
     return new OrbitDbDispositionStorageAdapter({
+      db: this.db,
+      encryptionKey: this.profileEncryptionKey,
+    });
+  }
+
+  /**
+   * G3 — Build an {@link OrbitDbFinalizationQueueStorageAdapter} bound
+   * to this provider's OrbitDB instance and profile encryption key.
+   * Lifecycle and null semantics mirror
+   * {@link buildDispositionStorageAdapter}.
+   *
+   * The returned adapter persists recipient-side finalization queue
+   * entries under `${addr}.finalizationQueue.${entryId}` keys. Each
+   * record carries `_schemaVersion: 'uxf-1'` so the legacy
+   * PaymentsModule.save() flush path leaves them alone.
+   */
+  buildFinalizationQueueStorageAdapter(): OrbitDbFinalizationQueueStorageAdapter | null {
+    if (!this.encryptionEnabled) return null;
+    if (this.profileEncryptionKey === null) return null;
+    return new OrbitDbFinalizationQueueStorageAdapter({
+      db: this.db,
+      encryptionKey: this.profileEncryptionKey,
+    });
+  }
+
+  /**
+   * G7 — Build an {@link OrbitDbRecipientContextStorageAdapter} bound
+   * to this provider's OrbitDB instance and profile encryption key.
+   * Persists `_recipientRequestContextMap` and
+   * `_recipientFinalizationContext` records under
+   * `${addr}.recipientContext.{request,finalization}.${id}` keys.
+   * Lifecycle and null semantics mirror
+   * {@link buildDispositionStorageAdapter}.
+   */
+  buildRecipientContextStorageAdapter(): OrbitDbRecipientContextStorageAdapter | null {
+    if (!this.encryptionEnabled) return null;
+    if (this.profileEncryptionKey === null) return null;
+    return new OrbitDbRecipientContextStorageAdapter({
       db: this.db,
       encryptionKey: this.profileEncryptionKey,
     });

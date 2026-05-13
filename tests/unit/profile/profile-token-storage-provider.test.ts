@@ -860,8 +860,12 @@ describe('ProfileTokenStorageProvider', () => {
         k.startsWith(`${EXPECTED_ADDRESS_ID}.outbox.`),
       );
       expect(outboxKeys.length).toBeGreaterThanOrEqual(1);
-      // Synced keys must NOT contain the derived caches — those stay local
-      expect(db._store.has(`${EXPECTED_ADDRESS_ID}.tombstones`)).toBe(false);
+      // G4 — tombstones ARE now also persisted to OrbitDB (security
+      // boundary: cross-device replication + cold-start recovery). The
+      // local derived cache still mirrors them for O(1) reads, but
+      // OrbitDB is authoritative for replay protection.
+      expect(db._store.has(`${EXPECTED_ADDRESS_ID}.tombstones`)).toBe(true);
+      // sent + transactionHistory remain local-only (per-device).
       expect(db._store.has(`${EXPECTED_ADDRESS_ID}.sent`)).toBe(false);
       expect(db._store.has(`${EXPECTED_ADDRESS_ID}.transactionHistory`)).toBe(false);
 
@@ -1392,8 +1396,10 @@ describe('ProfileTokenStorageProvider', () => {
       await provider.save(txfData);
       await new Promise((r) => setTimeout(r, 200));
 
-      // Nothing derived in OrbitDB
-      expect(db._store.has(`${EXPECTED_ADDRESS_ID}.tombstones`)).toBe(false);
+      // G4 — tombstones ARE now also persisted to OrbitDB (security
+      // boundary). The local derived cache still mirrors them.
+      expect(db._store.has(`${EXPECTED_ADDRESS_ID}.tombstones`)).toBe(true);
+      // sent + transactionHistory remain local-only (per-device).
       expect(db._store.has(`${EXPECTED_ADDRESS_ID}.sent`)).toBe(false);
       expect(db._store.has(`${EXPECTED_ADDRESS_ID}.transactionHistory`)).toBe(false);
 
