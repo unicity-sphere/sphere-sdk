@@ -38,6 +38,10 @@ export type SphereErrorCode =
   // does not exceed the request's per-coin totals. Catches over-send bugs
   // where a partial-amount request silently ships a full source token.
   | 'OVER_TRANSFER_GUARD'
+  // PR #152 defense-in-depth — pre-validate that the wallet's signing key
+  // owns every source token planned for spending. Catches the same bug
+  // class PR #130 fixes at the root, on the send-side as a backstop.
+  | 'OWNERSHIP_VERIFICATION_FAILED'
   | 'STORAGE_ERROR'
   | 'STORAGE_CORRUPTED'
   | 'TRANSPORT_ERROR'
