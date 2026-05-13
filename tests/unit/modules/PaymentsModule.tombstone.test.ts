@@ -69,7 +69,11 @@ vi.mock('../../../registry', () => ({
     getInstance: () => ({
       getDefinition: () => null,
       getIconUrl: () => null,
+      getSymbol: () => 'UCT',
+      getName: () => 'Unicity Token',
+      getDecimals: () => 8,
     }),
+    waitForReady: vi.fn().mockResolvedValue(undefined),
   },
 }));
 
@@ -500,6 +504,89 @@ describe('PaymentsModule - Tombstone Enforcement', () => {
 
       expect(result).toBe(false);
       expect(module.getTokens().length).toBe(0);
+    });
+  });
+
+  // ===========================================================================
+  // 5. #143 FIX D — loadFromStorageData tombstone union-merge
+  // ===========================================================================
+  //
+  // The pre-fix behaviour replaced the local tombstone list wholesale with the
+  // parsed snapshot's tombstones. When a sync delivered a stale snapshot —
+  // e.g. one captured BEFORE the local wallet tombstoned a freshly-spent
+  // source — the local tombstone disappeared and the just-spent token would
+  // re-materialize on the next load. This block locks down the union-merge
+  // semantics.
+
+  describe('loadFromStorageData() — tombstone union-merge (#143 FIX D)', () => {
+    it('preserves local tombstones when a stale snapshot omits them', async () => {
+      // Step 1: create a local tombstone for TOKEN_ID_A via add → remove.
+      const token = createMockToken({ tokenId: TOKEN_ID_A, stateHash: STATE_HASH_1 });
+      await module.addToken(token);
+      await module.removeToken(token.id);
+      expect(module.isStateTombstoned(TOKEN_ID_A, STATE_HASH_1)).toBe(true);
+
+      // Step 2: simulate a sync that returns a snapshot WITHOUT TOKEN_ID_A's
+      // tombstone (snapshot was taken before the local removal).
+      const staleSnapshot: TxfStorageDataBase = {
+        _meta: {
+          version: 1,
+          address: 'alpha1testaddress',
+          formatVersion: '1.0',
+          updatedAt: Date.now() - 60_000,
+        },
+        _tombstones: [],
+      };
+      const tokenStorage = deps.tokenStorageProviders.get('mock');
+      expect(tokenStorage).toBeDefined();
+      (tokenStorage!.load as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        success: true,
+        source: 'local' as const,
+        data: staleSnapshot,
+        timestamp: Date.now(),
+      });
+
+      // Step 3: re-load. The stale snapshot has zero tombstones; the union
+      // merge must preserve our local one.
+      await module.load();
+
+      expect(module.isStateTombstoned(TOKEN_ID_A, STATE_HASH_1)).toBe(true);
+      expect(module.getTombstones().length).toBe(1);
+    });
+
+    it('unions local + remote tombstones (no duplicates, both survive)', async () => {
+      // Local tombstone: TOKEN_ID_A / STATE_HASH_1
+      const tokenA = createMockToken({ tokenId: TOKEN_ID_A, stateHash: STATE_HASH_1 });
+      await module.addToken(tokenA);
+      await module.removeToken(tokenA.id);
+
+      // Snapshot carries: TOKEN_ID_A / STATE_HASH_1 (duplicate of local) +
+      // TOKEN_ID_B / STATE_HASH_2 (new).
+      const snapshot: TxfStorageDataBase = {
+        _meta: {
+          version: 1,
+          address: 'alpha1testaddress',
+          formatVersion: '1.0',
+          updatedAt: Date.now(),
+        },
+        _tombstones: [
+          { tokenId: TOKEN_ID_A, stateHash: STATE_HASH_1, timestamp: Date.now() },
+          { tokenId: TOKEN_ID_B, stateHash: STATE_HASH_2, timestamp: Date.now() },
+        ],
+      };
+      const tokenStorage = deps.tokenStorageProviders.get('mock');
+      (tokenStorage!.load as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        success: true,
+        source: 'local' as const,
+        data: snapshot,
+        timestamp: Date.now(),
+      });
+      await module.load();
+
+      const all = module.getTombstones();
+      expect(all.length).toBe(2);
+      expect(module.isStateTombstoned(TOKEN_ID_A, STATE_HASH_1)).toBe(true);
+      expect(module.isStateTombstoned(TOKEN_ID_B, STATE_HASH_2)).toBe(true);
     });
   });
 });

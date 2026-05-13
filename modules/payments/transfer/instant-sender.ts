@@ -93,6 +93,7 @@ import {
   MAX_INLINE_CAR_BYTES,
   RELAY_SAFE_CAP_BYTES,
 } from './limits';
+import { enforceOverTransferGuard } from './over-transfer-guard';
 import { validateTargets, type ValidatedTargets } from './target-validator';
 
 // =============================================================================
@@ -144,6 +145,59 @@ export interface InstantCommitResult {
 }
 
 /**
+ * #142 contract widening — source selection carries `splitSources`
+ * intent so partial-amount sends drive `InstantSplitExecutor.buildSplitBundle`
+ * instead of silently transferring the whole source token. Backwards-
+ * compatible with the legacy `Promise<ReadonlyArray<Token>>` shape:
+ * callers that don't need to split a source return the array directly;
+ * new partial-amount callers return this structured form.
+ *
+ * #149 multi-asset widening — `splitSources` is an array so multi-coin
+ * sends where N coins each need their own split can drive N independent
+ * `buildSplitBundle` invocations (one per source). Each entry carries
+ * its own `coinIdHex` because the split executor mints recipient + change
+ * tokens for a specific coin class.
+ *
+ * Invariant: every token in the selection appears in EITHER
+ * `directSources` (transferred as-is) XOR exactly one entry in
+ * `splitSources` (burnt and re-minted into recipient + change). All
+ * `splitSources[i].token.id` MUST be distinct from each other and from
+ * `directSources`. The orchestrator computes the union as the source-
+ * lock set.
+ */
+export interface InstantSourceSelection {
+  /** Sources transferred as whole tokens (the legacy `direct` method). */
+  readonly directSources: ReadonlyArray<Token>;
+  /**
+   * Zero or more sources to split. When non-empty, the orchestrator
+   * forwards each entry to {@link InstantCommitSourcesFn} via
+   * `splitSources` (the param name); each entry MUST drive its own
+   * `InstantSplitExecutor.buildSplitBundle(token, splitAmount,
+   * remainderAmount, coinIdHex, ...)` call. Each invocation produces
+   * a recipient mint (shipped in the bundle) and a change mint (kept
+   * locally).
+   *
+   * Per-entry invariants:
+   *   - `splitAmount + remainderAmount` MUST equal the token's coin
+   *     balance for `coinIdHex`.
+   *   - `splitAmount` is what the recipient receives; `remainderAmount`
+   *     is the sender's change.
+   *   - `coinIdHex` MUST be unique across entries (one split per coin
+   *     class — primary coin + each additional-asset coin).
+   *
+   * Multiple entries enable #149: multi-coin partial-amount sends
+   * (e.g., send 200 USDU + 100 USDC where each coin holding requires
+   * splitting). NFTs are whole-token by definition and never appear here.
+   */
+  readonly splitSources?: ReadonlyArray<{
+    readonly token: Token;
+    readonly splitAmount: bigint;
+    readonly remainderAmount: bigint;
+    readonly coinIdHex: string;
+  }>;
+}
+
+/**
  * Caller-supplied callback that submits transfer commitments for the
  * supplied sources WITHOUT awaiting their inclusion proofs, and returns
  * the post-submit JSON shape (with `inclusionProof: null` on the new
@@ -158,9 +212,23 @@ export interface InstantCommitResult {
  * Failure modes flow as `SphereError`s — typically `TRANSFER_FAILED`
  * (commit submission rejected) or any aggregator-side rejection per
  * §6.1's error model.
+ *
+ * #142 widening: `splitSources` carries split intents through to
+ * `commitSources`. Implementations that ignore it silently fall back
+ * to whole-token transfer of each split source (the pre-fix bug).
+ *
+ * #149 multi-asset widening: `splitSources` is an array. Implementations
+ * MUST iterate it and run one `buildSplitBundle` per entry. Each entry's
+ * `token.id` also appears in `sources` so the legacy whole-token path
+ * MUST skip those ids (lookup by `token.id` set).
  */
 export type InstantCommitSourcesFn = (params: {
   readonly sources: ReadonlyArray<Token>;
+  /** #142/#149 — split intents. Each entry's `token` is also in `sources`
+   *  AND MUST be split-minted rather than whole-transferred. Legacy
+   *  callsites pass `undefined` (or an empty array) and the orchestrator
+   *  treats every source in `sources` as whole-token. */
+  readonly splitSources?: InstantSourceSelection['splitSources'];
   readonly recipient: PeerInfo;
   readonly memo: string | undefined;
 }) => Promise<ReadonlyArray<InstantCommitResult>>;
@@ -175,12 +243,17 @@ export type InstantCommitSourcesFn = (params: {
  * constraint here — the planner does — but it surfaces a
  * `cascade-risk-warning` event on publish to flag the recipient-side
  * cascade exposure.
+ *
+ * #142/#149 widening: callers may return EITHER the legacy
+ * `ReadonlyArray<Token>` (all whole-token) OR an {@link InstantSourceSelection}
+ * with a structured `splitSources` array for multi-coin partial-amount
+ * sends. The orchestrator normalizes both shapes internally.
  */
 export type InstantSelectSourcesFn = (params: {
   readonly request: TransferRequest;
   readonly validated: ValidatedTargets;
   readonly available: ReadonlyArray<Token>;
-}) => Promise<ReadonlyArray<Token>>;
+}) => Promise<ReadonlyArray<Token> | InstantSourceSelection>;
 
 /**
  * Trigger callback to the sender-side finalization worker (T.5.B).
@@ -762,11 +835,63 @@ export async function sendInstantUxf(
     // -----------------------------------------------------------------
     // Step 2: source selection.
     // -----------------------------------------------------------------
-    const selected = await deps.selectSources({
+    const selectedRaw = await deps.selectSources({
       request,
       validated,
       available,
     });
+
+    // #142 / #149 contract widening — normalize legacy array-shape into
+    // the structured {directSources, splitSources} form. Existing
+    // tests/callers that return plain Token[] continue to work; new
+    // partial-amount callers return the structured form (singular
+    // splitSource is gone; pass [splitEntry] as splitSources).
+    const normalizedSelection: InstantSourceSelection = Array.isArray(selectedRaw)
+      ? { directSources: selectedRaw as ReadonlyArray<Token>, splitSources: [] }
+      : (selectedRaw as InstantSourceSelection);
+    const splitSources = normalizedSelection.splitSources ?? [];
+
+    // Loop-149 defense-in-depth — fail-closed on:
+    //   (a) duplicate split coinIdHex (would silently over-mint into the
+    //       same coin class twice — the recipient bundle would still
+    //       satisfy OVER_TRANSFER_GUARD if each amount alone fit, but
+    //       the planner can never legitimately produce this).
+    //   (b) duplicate split token.id across splitSources (a planner bug
+    //       that re-selected the same source twice).
+    //   (c) overlap between split token.id and directSources (same).
+    const seenSplitCoinIds = new Set<string>();
+    const seenSplitTokenIds = new Set<string>();
+    for (const entry of splitSources) {
+      if (seenSplitCoinIds.has(entry.coinIdHex)) {
+        throw new SphereError(
+          `sendInstantUxf: splitSources contains duplicate coinIdHex=${entry.coinIdHex.slice(0, 32)}; ` +
+            'multi-asset planner must produce at most one split entry per coin class',
+          'INVALID_CONFIG',
+        );
+      }
+      seenSplitCoinIds.add(entry.coinIdHex);
+      if (seenSplitTokenIds.has(entry.token.id)) {
+        throw new SphereError(
+          `sendInstantUxf: splitSources contains duplicate token.id=${entry.token.id} (planner bug)`,
+          'INVALID_CONFIG',
+        );
+      }
+      seenSplitTokenIds.add(entry.token.id);
+    }
+    for (const direct of normalizedSelection.directSources) {
+      if (seenSplitTokenIds.has(direct.id)) {
+        throw new SphereError(
+          `sendInstantUxf: token.id=${direct.id} appears in BOTH directSources and splitSources (planner bug)`,
+          'INVALID_CONFIG',
+        );
+      }
+    }
+
+    const selected: ReadonlyArray<Token> = [
+      ...normalizedSelection.directSources,
+      ...splitSources.map((s) => s.token),
+    ];
+
     if (selected.length === 0) {
       throw new SphereError(
         'sendInstantUxf: source selection returned no tokens; ' +
@@ -797,9 +922,13 @@ export async function sendInstantUxf(
     // -----------------------------------------------------------------
     // Step 4: commit + DO NOT await proofs. The callback returns the
     // recipient-shape JSON with `inclusionProof: null` on the new tx.
+    // #142/#149: `splitSources` (if any) drive `InstantSplitExecutor`
+    // in the production wiring — one split per entry; the orchestrator
+    // only forwards the metadata.
     // -----------------------------------------------------------------
     const commitResults = await deps.commitSources({
       sources: selected,
+      splitSources,
       recipient,
       memo: request.memo,
     });
@@ -835,7 +964,63 @@ export async function sendInstantUxf(
       }
     }
 
+    // -----------------------------------------------------------------
+    // #142 — OVER_TRANSFER_GUARD. Defense-in-depth assertion that the
+    // sum of fungible amounts encoded in the recipient token JSONs does
+    // not exceed the request's per-coin totals.
+    //
+    // The bug this catches: a partial-amount send (e.g. 10 UCT from a
+    // 100 UCT source) where the commitSources callback silently ships
+    // the whole source as a direct (whole-token) transfer instead of
+    // burning-and-minting a 10 UCT recipient slice. Without the guard,
+    // the recipient receives 100 UCT and the sender's spend planner
+    // discovers the over-send only after the bundle has landed on the
+    // wire.
+    //
+    // The guard runs AFTER on-chain commits are submitted but BEFORE
+    // the UXF bundle is published. A violation throws into the outer
+    // catch — the source tokens are spent on-chain, but the recipient
+    // never sees the bundle and the wallet records `transfer:failed`.
+    // Better than a silent over-send. Operators can recover the
+    // committed source via cascade-walker on the next sync.
+    //
+    // NFT entries are skipped (no fungible amount). Multi-asset
+    // requests sum the primary slot + each additionalAssets coin entry.
+    enforceOverTransferGuard(request, commitResults);
+
     const orderedResults = sortByTokenIdAsc(commitResults);
+
+    // Loop4-e2e (round 2) + L5-C1/C2 hardening: validate AND extract
+    // the recipient's tokenId for payload.tokenIds advertisement,
+    // BEFORE `pkg.ingestAll` (so a missing/malformed tokenId surfaces
+    // as a clean SphereError instead of a UXF deconstruct error
+    // deeper in the stack).
+    //   - Advertise the RECIPIENT's tokenId (genesis.data.tokenId),
+    //     NOT the sender's sourceTokenId. Direct transfers coincide;
+    //     split transfers produce a new recipient tokenId.
+    //   - FAIL CLOSED on missing/non-string/non-hex tokenId — the
+    //     previous silent fallback to `sourceTokenId` reintroduced
+    //     the exact bug Loop4-r2 was written to fix.
+    //   - Normalize to lowercase. The UXF deconstruct pool encodes
+    //     hex lowercase (via @noble/hashes `bytesToHex`); the
+    //     recipient's claimed-tokenId Set lookup is case-sensitive.
+    //   - Assert canonical 64-char hex shape so SDK shape regressions
+    //     surface immediately.
+    const tokenIds = orderedResults.map((r): string => {
+      const j = r.recipientTokenJson as {
+        readonly genesis?: { readonly data?: { readonly tokenId?: unknown } };
+      } | null | undefined;
+      const tid = j?.genesis?.data?.tokenId;
+      if (typeof tid !== 'string' || !/^[0-9a-f]{64}$/i.test(tid)) {
+        throw new SphereError(
+          `sendInstantUxf: recipientTokenJson.genesis.data.tokenId for source ${r.sourceTokenId} ` +
+            `is missing or not 64-char hex (got ${typeof tid === 'string' ? `"${tid.slice(0, 32)}…"` : typeof tid}). ` +
+            'The recipient bundle verifier would silently drop the transfer as an advisory unclaimed root.',
+          'INVALID_CONFIG',
+        );
+      }
+      return tid.toLowerCase();
+    });
 
     // -----------------------------------------------------------------
     // Step 5: build UxfPackage and ingest tokens. Each ingested JSON
@@ -861,7 +1046,6 @@ export async function sendInstantUxf(
     // Pre-compute the outstanding requestIds set so the outbox writer
     // sees the same value across every persistence step.
     const outstandingRequestIds = collectOutstandingRequestIds(orderedResults);
-    const tokenIds = orderedResults.map((r) => r.sourceTokenId);
 
     // -----------------------------------------------------------------
     // Step 8: resolve delivery (T.2.C).

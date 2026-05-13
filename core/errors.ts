@@ -33,6 +33,11 @@ export type SphereErrorCode =
   | 'INVALID_RECIPIENT'
   | 'TRANSFER_FAILED'
   | 'UNSUPPORTED_TRANSFER_MODE'
+  // #142 defense-in-depth — the sender orchestrator's post-commit assertion
+  // that the sum of fungible amounts encoded in the recipient token JSONs
+  // does not exceed the request's per-coin totals. Catches over-send bugs
+  // where a partial-amount request silently ships a full source token.
+  | 'OVER_TRANSFER_GUARD'
   | 'STORAGE_ERROR'
   | 'STORAGE_CORRUPTED'
   | 'TRANSPORT_ERROR'

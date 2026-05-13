@@ -105,6 +105,7 @@ import { extractCarRootCid } from '../../../uxf/transfer-payload';
 import type { TokenLike } from './classify-token';
 import type { PublishToIpfsCallback } from './delivery-resolver';
 import { resolveDelivery } from './delivery-resolver';
+import { enforceOverTransferGuard } from './over-transfer-guard';
 import {
   MAX_INLINE_CAR_BYTES,
   RELAY_SAFE_CAP_BYTES,
@@ -161,8 +162,35 @@ export interface ConservativeCommitResult {
  * returned in any order — the orchestrator sorts by lex-min `tokenId`
  * before {@link UxfPackage.ingestAll}.
  */
+/**
+ * #142/#149 contract widening — source selection carries `splitSources`
+ * intent. Mirrors {@link
+ * import('./instant-sender').InstantSourceSelection} for the
+ * conservative path. The split executor differs
+ * (`TokenSplitExecutor` instead of `InstantSplitExecutor`) but the
+ * contract shape is identical.
+ */
+export interface ConservativeSourceSelection {
+  readonly directSources: ReadonlyArray<Token>;
+  /**
+   * Zero or more sources to split. See {@link
+   * import('./instant-sender').InstantSourceSelection.splitSources}
+   * for the full invariants (distinct coinIdHex, distinct token.id,
+   * disjoint from directSources, splitAmount + remainderAmount =
+   * coin balance).
+   */
+  readonly splitSources?: ReadonlyArray<{
+    readonly token: Token;
+    readonly splitAmount: bigint;
+    readonly remainderAmount: bigint;
+    readonly coinIdHex: string;
+  }>;
+}
+
 export type CommitSourcesFn = (params: {
   readonly sources: ReadonlyArray<Token>;
+  /** #142/#149 — split intents. See InstantCommitSourcesFn for rationale. */
+  readonly splitSources?: ConservativeSourceSelection['splitSources'];
   readonly recipient: PeerInfo;
   readonly memo: string | undefined;
 }) => Promise<ReadonlyArray<ConservativeCommitResult>>;
@@ -173,12 +201,15 @@ export type CommitSourcesFn = (params: {
  * pre-chosen sources (unit). Receives the validated target list so
  * future revisions can do per-target routing (e.g., NFT-direct + coin-
  * split mixes).
+ *
+ * #142 widening: backwards-compatible — return either the legacy array
+ * shape or the new {@link ConservativeSourceSelection}.
  */
 export type SelectSourcesFn = (params: {
   readonly request: TransferRequest;
   readonly validated: ValidatedTargets;
   readonly available: ReadonlyArray<Token>;
-}) => Promise<ReadonlyArray<Token>>;
+}) => Promise<ReadonlyArray<Token> | ConservativeSourceSelection>;
 
 /**
  * Per-source preflight resolver injection — preserves the option grid
@@ -614,11 +645,55 @@ export async function sendConservativeUxf(
     // -----------------------------------------------------------------
     // Step 2: source selection (caller-supplied; wraps SpendPlanner).
     // -----------------------------------------------------------------
-    const selected = await deps.selectSources({
+    const selectedRaw = await deps.selectSources({
       request,
       validated,
       available,
     });
+
+    // #142/#149 contract widening — normalize legacy array-shape into
+    // the structured {directSources, splitSources} form.
+    // Backwards-compatible with existing array callers.
+    const normalizedSelection: ConservativeSourceSelection = Array.isArray(selectedRaw)
+      ? { directSources: selectedRaw as ReadonlyArray<Token>, splitSources: [] }
+      : (selectedRaw as ConservativeSourceSelection);
+    const splitSources = normalizedSelection.splitSources ?? [];
+
+    // #149 defense-in-depth — same invariants as sendInstantUxf above.
+    // See instant-sender.ts for the full rationale.
+    const seenSplitCoinIds = new Set<string>();
+    const seenSplitTokenIds = new Set<string>();
+    for (const entry of splitSources) {
+      if (seenSplitCoinIds.has(entry.coinIdHex)) {
+        throw new SphereError(
+          `sendConservativeUxf: splitSources contains duplicate coinIdHex=${entry.coinIdHex.slice(0, 32)}; ` +
+            'multi-asset planner must produce at most one split entry per coin class',
+          'INVALID_CONFIG',
+        );
+      }
+      seenSplitCoinIds.add(entry.coinIdHex);
+      if (seenSplitTokenIds.has(entry.token.id)) {
+        throw new SphereError(
+          `sendConservativeUxf: splitSources contains duplicate token.id=${entry.token.id} (planner bug)`,
+          'INVALID_CONFIG',
+        );
+      }
+      seenSplitTokenIds.add(entry.token.id);
+    }
+    for (const direct of normalizedSelection.directSources) {
+      if (seenSplitTokenIds.has(direct.id)) {
+        throw new SphereError(
+          `sendConservativeUxf: token.id=${direct.id} appears in BOTH directSources and splitSources (planner bug)`,
+          'INVALID_CONFIG',
+        );
+      }
+    }
+
+    const selected: ReadonlyArray<Token> = [
+      ...normalizedSelection.directSources,
+      ...splitSources.map((s) => s.token),
+    ];
+
     if (selected.length === 0) {
       throw new SphereError(
         'sendConservativeUxf: source selection returned no tokens; ' +
@@ -642,9 +717,13 @@ export async function sendConservativeUxf(
 
     // -----------------------------------------------------------------
     // Step 4: commitments + proofs (caller-supplied; wraps SDK).
+    // #142/#149: forward `splitSources` so commitSources can drive the
+    // appropriate split executor — one invocation per entry for
+    // multi-coin partial-amount sends.
     // -----------------------------------------------------------------
     const commitResults = await deps.commitSources({
       sources: selected,
+      splitSources,
       recipient,
       memo: request.memo,
     });
@@ -655,8 +734,41 @@ export async function sendConservativeUxf(
       );
     }
 
+    // Loop1-S6 — OVER_TRANSFER_GUARD. The same defense-in-depth that
+    // sendInstantUxf applies. A buggy commitSources that whole-token-
+    // transfers a source that should have been split silently
+    // over-sends — the wire bundle has more coin amount than the
+    // request asked for. The conservative path has the same risk
+    // class as the instant path (FIX 3 wires TokenSplitExecutor into
+    // dispatchUxfConservativeSend.commitSources; a regression here
+    // would not be caught without this guard). Throws fire-closed
+    // (Loop1-S5) on any structural break in coinData too.
+    enforceOverTransferGuard(request, commitResults);
+
     // Acceptance: deterministic bundle order — lex-ascending by tokenId.
     const orderedResults = sortByTokenIdAsc(commitResults);
+
+    // Loop4-e2e (round 2) + L5-C1/C2 — validate AND extract the
+    // recipient tokenIds for payload.tokenIds BEFORE pkg.ingestAll
+    // so misshapen commit results surface as clean SphereErrors
+    // rather than vague UXF deconstruct errors. Fail-closed on
+    // missing/non-hex; lowercase-normalize. See instant-sender.ts
+    // for the full rationale.
+    const tokenIds = orderedResults.map((r): string => {
+      const j = r.recipientTokenJson as {
+        readonly genesis?: { readonly data?: { readonly tokenId?: unknown } };
+      } | null | undefined;
+      const tid = j?.genesis?.data?.tokenId;
+      if (typeof tid !== 'string' || !/^[0-9a-f]{64}$/i.test(tid)) {
+        throw new SphereError(
+          `sendConservativeUxf: recipientTokenJson.genesis.data.tokenId for source ${r.sourceTokenId} ` +
+            `is missing or not 64-char hex (got ${typeof tid === 'string' ? `"${tid.slice(0, 32)}…"` : typeof tid}). ` +
+            'The recipient bundle verifier would silently drop the transfer as an advisory unclaimed root.',
+          'INVALID_CONFIG',
+        );
+      }
+      return tid.toLowerCase();
+    });
 
     // -----------------------------------------------------------------
     // Step 5: build UxfPackage and ingest tokens.
@@ -742,7 +854,9 @@ export async function sendConservativeUxf(
     // identifies the recipient + bundleCid + token list before any
     // transport / IPFS work so a crash here leaves a forensic record.
     // -----------------------------------------------------------------
-    const tokenIds = orderedResults.map((r) => r.sourceTokenId);
+    // `tokenIds` was computed above (right after sortByTokenIdAsc),
+    // BEFORE pkg.ingestAll, with L5-C1/C2 fail-closed validation +
+    // lowercase normalization. Reuse it here.
 
     // Decide the delivery method up-front using the SAME predicate as
     // resolveDelivery's CID-branch decision (`wantsCidBranch` above).

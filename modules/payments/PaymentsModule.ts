@@ -78,11 +78,13 @@ import {
   sendConservativeUxf,
   type ConservativeCommitResult,
   type ConservativeSenderDeps,
+  type ConservativeSourceSelection,
 } from './transfer/conservative-sender';
 import {
   sendInstantUxf,
   type InstantCommitResult,
   type InstantSenderDeps,
+  type InstantSourceSelection,
 } from './transfer/instant-sender';
 import {
   sendTxfUxf,
@@ -8969,6 +8971,21 @@ export class PaymentsModule {
     const transferId = crypto.randomUUID();
     const committedOnChainTokenIds = new Set<string>();
 
+    // Loop1-S9 — every token selectSources marked `transferring` is
+    // pushed here so the outer catch can restore non-committed
+    // sources back to `confirmed` on failure (mirrors the instant
+    // dispatcher pattern).
+    const dispatcherSelectedTokenIds: string[] = [];
+
+    // Loop1-S7 + Loop2-W3 — track every reservation id (primary +
+    // per-additional-asset queue id) so we can commit/cancel each
+    // one at the end. Without this, multi-coin sends leak per-coin
+    // ledger entries. Initialize empty — the conservative dispatcher
+    // does NOT pass `transferId` itself to planSend (it uses
+    // `${transferId}:${coinId}[:${i}]` keys); committing the bare
+    // transferId was a silent no-op against ReservationLedger.
+    const reservationIds: string[] = [];
+
     const deps: ConservativeSenderDeps = {
       aggregator: this.deps!.oracle,
       transport: this.deps!.transport,
@@ -8981,7 +8998,13 @@ export class PaymentsModule {
       availableSources: () => Array.from(this.tokens.values()),
       transferId,
       selectSources: async ({ request: req }) => {
-        const out: Token[] = [];
+        // #142/#149 — return the structured ConservativeSourceSelection
+        // shape with `splitSources` (array). Primary coin's split (if
+        // needed) is the first entry; each additional-asset coin that
+        // also needs splitting becomes its own entry. NFT additional
+        // assets and direct-only sources go into `directSources`.
+        const directSources: Token[] = [];
+        const splitSources: Array<NonNullable<ConservativeSourceSelection['splitSources']>[number]> = [];
 
         // ── Primary coin ──────────────────────────────────────────────────────
         const parsedPool = await this.spendPlanner.buildParsedPool(
@@ -8997,6 +9020,7 @@ export class PaymentsModule {
         // Use a per-coin reservation id so additional-coin plans never
         // collide in SpendQueue.promises (which is keyed by entry id).
         const primaryQueueId = `${transferId}:${request.coinId}`;
+        reservationIds.push(primaryQueueId);
         const planResult = this.spendPlanner.planSend(
           { amount: req.amount ?? '0', coinId: request.coinId },
           parsedPool,
@@ -9012,18 +9036,53 @@ export class PaymentsModule {
         } else {
           splitPlan = planResult.splitPlan;
         }
-        out.push(...splitPlan.tokensToTransferDirectly.map((t) => t.uiToken));
-        if (splitPlan.tokenToSplit) out.push(splitPlan.tokenToSplit.uiToken);
+        directSources.push(...splitPlan.tokensToTransferDirectly.map((t) => t.uiToken));
+
+        if (splitPlan.tokenToSplit) {
+          // Loop1-S2 — defensive guard, mirrors the instant dispatcher.
+          // A planner bug that returns tokenToSplit with null/zero
+          // splitAmount would burn the source for nothing.
+          if (
+            splitPlan.splitAmount === null ||
+            splitPlan.remainderAmount === null ||
+            splitPlan.splitAmount <= 0n
+          ) {
+            throw new SphereError(
+              `dispatchUxfConservativeSend: planner returned tokenToSplit with null/zero splitAmount=${String(splitPlan.splitAmount)} / remainderAmount=${String(splitPlan.remainderAmount)} for primary coinId=${request.coinId.slice(0, 16)}; refusing to burn source for zero-coin recipient`,
+              'INVALID_CONFIG',
+            );
+          }
+          splitSources.push({
+            token: splitPlan.tokenToSplit.uiToken,
+            splitAmount: splitPlan.splitAmount,
+            remainderAmount: splitPlan.remainderAmount,
+            coinIdHex: request.coinId,
+          });
+        }
 
         // ── Additional assets (coin entries only) ─────────────────────────────
-        // Each additional coin is planned independently with a unique
-        // queue id (${transferId}:${addCoinId}:${i}) to prevent promise-map
-        // collisions when two entries queue for the same SpendQueue.
+        // #149 — each additional coin that needs splitting becomes its
+        // own `splitSources` entry. Each is planned independently with
+        // a unique queue id (${transferId}:${addCoinId}:${i}) to prevent
+        // promise-map collisions when two entries queue for the same
+        // SpendQueue.
         const additional = req.additionalAssets ?? [];
         for (let i = 0; i < additional.length; i++) {
           const asset = additional[i];
           if (asset.kind !== 'coin') continue; // NFT: whole-token, handled by commitSources
           const addCoinId = asset.coinId;
+          // #149 invariant — duplicate coinIds (primary or earlier
+          // additional) are a user-input bug. The send() validator
+          // upstream should catch this, but defense-in-depth here
+          // protects against the contract violation: orchestrator
+          // would otherwise reject in its splitSources guard.
+          if (addCoinId === request.coinId) {
+            throw new SphereError(
+              `dispatchUxfConservativeSend: additionalAssets[${i}].coinId duplicates primary coinId=${addCoinId.slice(0, 16)}; ` +
+                'combine the amounts into the primary slot instead',
+              'INVALID_CONFIG',
+            );
+          }
           const addParsedPool = await this.spendPlanner.buildParsedPool(
             Array.from(this.tokens.values()),
             addCoinId,
@@ -9035,6 +9094,7 @@ export class PaymentsModule {
             }
           }
           const addQueueId = `${transferId}:${addCoinId}:${i}`;
+          reservationIds.push(addQueueId);
           const addPlanResult = this.spendPlanner.planSend(
             { amount: asset.amount, coinId: addCoinId },
             addParsedPool,
@@ -9050,26 +9110,58 @@ export class PaymentsModule {
           } else {
             addSplitPlan = addPlanResult.splitPlan;
           }
-          out.push(...addSplitPlan.tokensToTransferDirectly.map((t) => t.uiToken));
-          if (addSplitPlan.tokenToSplit) out.push(addSplitPlan.tokenToSplit.uiToken);
+          directSources.push(...addSplitPlan.tokensToTransferDirectly.map((t) => t.uiToken));
+          if (addSplitPlan.tokenToSplit) {
+            // #149 — additional-asset split. Same defensive guard as
+            // the primary coin path: null/zero splitAmount means a
+            // planner bug; refuse to burn for zero-coin recipient.
+            if (
+              addSplitPlan.splitAmount === null ||
+              addSplitPlan.remainderAmount === null ||
+              addSplitPlan.splitAmount <= 0n
+            ) {
+              throw new SphereError(
+                `dispatchUxfConservativeSend: planner returned tokenToSplit with null/zero splitAmount=${String(addSplitPlan.splitAmount)} / remainderAmount=${String(addSplitPlan.remainderAmount)} for additional coinId=${addCoinId.slice(0, 16)}; refusing to burn source for zero-coin recipient`,
+                'INVALID_CONFIG',
+              );
+            }
+            splitSources.push({
+              token: addSplitPlan.tokenToSplit.uiToken,
+              splitAmount: addSplitPlan.splitAmount,
+              remainderAmount: addSplitPlan.remainderAmount,
+              coinIdHex: addCoinId,
+            });
+          }
         }
 
         // [DIAG-UXF-SEND] all sources selected across primary + additionalAssets
         logger.debug('Payments', '[DIAG-UXF-SEND] selectSources result', {
-          totalSelected: out.length,
-          selectedIds: out.map((t) => `${t.id.slice(0, 12)}(${t.coinId.slice(0, 12)})`),
+          totalDirect: directSources.length,
+          splitCount: splitSources.length,
+          directIds: directSources.map((t) => `${t.id.slice(0, 12)}(${t.coinId.slice(0, 12)})`),
+          splitIds: splitSources.map(
+            (s) => `${s.token.id.slice(0, 12)}(${s.coinIdHex.slice(0, 12)}:${s.splitAmount.toString()})`,
+          ),
           primaryCoinId: request.coinId.slice(0, 16),
           additionalCount: (req.additionalAssets ?? []).filter((a) => a.kind === 'coin').length,
         });
+
         // Mark all selected sources as transferring + persist (matches legacy
         // semantics — prevents double-spend within the same session).
-        for (const tok of out) {
+        for (const tok of directSources) {
           tok.status = 'transferring';
           this.tokens.set(tok.id, tok);
           this.parsedTokenCache.delete(tok.id);
+          dispatcherSelectedTokenIds.push(tok.id);
+        }
+        for (const entry of splitSources) {
+          entry.token.status = 'transferring';
+          this.tokens.set(entry.token.id, entry.token);
+          this.parsedTokenCache.delete(entry.token.id);
+          dispatcherSelectedTokenIds.push(entry.token.id);
         }
         await this.save();
-        return out;
+        return { directSources, splitSources };
       },
       preflightOptions: () => ({
         // T.2.A wraps the existing aggregator path; for the dispatcher
@@ -9085,20 +9177,147 @@ export class PaymentsModule {
         },
         extractPendingChain: () => [],
       }),
-      commitSources: async ({ sources }) => {
+      commitSources: async ({ sources, splitSources }) => {
         // [DIAG-UXF-SEND] how many source tokens are being committed?
         logger.debug('Payments', '[DIAG-UXF-SEND] commitSources entry', {
           sourceCount: sources.length,
           sourceIds: sources.map((t) => `${t.id.slice(0, 12)}(${t.coinId.slice(0, 12)})`),
+          splitCount: splitSources?.length ?? 0,
         });
         const out: ConservativeCommitResult[] = [];
+
+        // #149 — build a tokenId → split entry lookup so the source-
+        // iteration loop can branch in O(1). Orchestrator already
+        // validated tokenId uniqueness.
+        const splitEntryByTokenId = new Map<
+          string,
+          NonNullable<ConservativeSourceSelection['splitSources']>[number]
+        >();
+        for (const entry of splitSources ?? []) {
+          splitEntryByTokenId.set(entry.token.id, entry);
+        }
+
         for (const token of sources) {
-          // The legacy arm splits-then-mints for the source-to-be-split,
-          // and direct-transfers for everything else. The orchestrator's
-          // SDK-coupling boundary is THIS callback — we re-implement the
-          // direct-conservative path here verbatim to match existing
-          // behavior. Split-mode is currently unsupported by the
-          // orchestrator (T.2.D.2 widens it via OutboxWriter).
+          // #142/#149 — split path. The previous implementation
+          // discarded the split intent and whole-token-transferred the
+          // source. The fix routes EACH split source through
+          // TokenSplitExecutor (one invocation per entry) which burns
+          // the source, mints two new tokens (splitAmount for recipient,
+          // remainderAmount for sender), and transfers the recipient
+          // slice with full proofs (conservative semantics).
+          const splitEntry = splitEntryByTokenId.get(token.id);
+          if (splitEntry !== undefined) {
+            if (!token.sdkData || typeof token.sdkData !== 'string') {
+              throw new SphereError(
+                `Split source token ${token.id} missing sdkData`,
+                'TRANSFER_FAILED',
+              );
+            }
+            const sdkSourceToken = await SdkToken.fromJSON(JSON.parse(token.sdkData));
+            const splitExecutor = new TokenSplitExecutor({
+              stateTransitionClient: stClient,
+              trustBase,
+              signingService,
+            });
+
+            // Loop2-C2 — burn-then-tombstone via try/finally. The
+            // onBurnSubmitted callback fires from inside executeSplit
+            // the moment the burn is durable on-chain (after submit
+            // response, before proof wait). Any subsequent throw
+            // (waitInclusionProof timeout, mint submit failure, etc.)
+            // still leaves the source on-chain spent → must be
+            // tombstoned locally regardless. The finally fires
+            // removeToken if `burnDone` is true.
+            let burnDone = false;
+            try {
+              const splitResult = await splitExecutor.executeSplit(
+                sdkSourceToken,
+                splitEntry.splitAmount,
+                splitEntry.remainderAmount,
+                splitEntry.coinIdHex,
+                recipientAddress,
+                onChainMessage,
+                // CONTRACT (Loop3-W3): this callback MUST NOT THROW.
+                // The executor swallows any throw, but a throw here
+                // would desync `burnDone` from the on-chain reality
+                // → phantom token. Keep this Set.add + primitive
+                // assignment only.
+                () => {
+                  burnDone = true;
+                  committedOnChainTokenIds.add(token.id);
+                },
+              );
+
+              // Persist the change token (remainderAmount, sender-keyed).
+              // #149 — use splitEntry.coinIdHex (NOT request.coinId)
+              // because additional-asset splits change-mint into the
+              // additional coin's class, not the primary coin's.
+              const changeCoinId = splitEntry.coinIdHex;
+              const changeTokenData = splitResult.tokenForSender.toJSON();
+              const changeUiToken: Token = {
+                id: crypto.randomUUID(),
+                coinId: changeCoinId,
+                symbol: this.getCoinSymbol(changeCoinId),
+                name: this.getCoinName(changeCoinId),
+                decimals: this.getCoinDecimals(changeCoinId),
+                iconUrl: this.getCoinIconUrl(changeCoinId),
+                amount: splitEntry.remainderAmount.toString(),
+                status: 'confirmed',
+                createdAt: Date.now(),
+                updatedAt: Date.now(),
+                sdkData: JSON.stringify(changeTokenData),
+              };
+              await this.addToken(changeUiToken);
+              logger.debug(
+                'Payments',
+                `dispatchUxfConservativeSend: change token persisted (coin=${changeCoinId.slice(0, 16)} amount=${changeUiToken.amount})`,
+              );
+
+              // Assemble the recipient SDK Token JSON: mint genesis + the
+              // mint-time state, plus the post-mint transfer transaction
+              // (both with proofs because conservative).
+              const recipientTokenJson = splitResult.tokenForRecipient.toJSON() as Record<string, unknown>;
+              const transferTxJson = splitResult.recipientTransferTx.toJSON();
+              const composedRecipientJson = {
+                ...recipientTokenJson,
+                transactions: [
+                  ...(((recipientTokenJson as { transactions?: unknown[] }).transactions) ?? []),
+                  transferTxJson,
+                ],
+              };
+
+              // Loop1-S1 — capture requestIdHex from the SplitResult's
+              // pre-computed field. TransferTransaction has NO requestId;
+              // SplitResult.recipientTransferRequestIdHex is captured from
+              // the underlying TransferCommitment BEFORE toTransaction().
+              const transferRequestIdHex = splitResult.recipientTransferRequestIdHex;
+
+              out.push({
+                sourceTokenId: token.id,
+                method: 'split',
+                requestIdHex: transferRequestIdHex,
+                recipientTokenJson: composedRecipientJson,
+                splitGroupId: crypto.randomUUID(),
+              });
+            } finally {
+              if (burnDone) {
+                try {
+                  await this.removeToken(token.id, transferId);
+                } catch (rmErr) {
+                  logger.warn(
+                    'Payments',
+                    `dispatchUxfConservativeSend: removeToken(${token.id}) failed after burn — manual cleanup may be needed: ${rmErr instanceof Error ? rmErr.message : String(rmErr)}`,
+                  );
+                }
+              }
+            }
+            continue;
+          }
+
+          // Direct (whole-token) path — Loop2-C2 try/finally so
+          // removeToken always fires once the on-chain commit is
+          // durable, even if waitInclusionProof times out / throws or
+          // the JSON construction breaks.
           const commitment = await this.createSdkCommitment(
             token,
             recipientAddress,
@@ -9115,41 +9334,61 @@ export class PaymentsModule {
               'TRANSFER_FAILED',
             );
           }
-          committedOnChainTokenIds.add(token.id);
-          const inclusionProof = await waitInclusionProof(trustBase, stClient, commitment);
-          const transferTx = commitment.toTransaction(inclusionProof);
-          // Reconstruct the recipient-token JSON shape (sourceToken +
-          // post-transfer transition) for ingestion into the bundle.
-          const tokenJson = token.sdkData
-            ? (typeof token.sdkData === 'string' ? JSON.parse(token.sdkData) : token.sdkData)
-            : null;
-          if (!tokenJson || typeof tokenJson !== 'object') {
-            throw new SphereError(
-              `Token ${token.id} missing sdkData; cannot ingest into UXF bundle`,
-              'TRANSFER_FAILED',
-            );
+          let consDirectCommitted = false;
+          try {
+            consDirectCommitted = true;
+            committedOnChainTokenIds.add(token.id);
+            const inclusionProof = await waitInclusionProof(trustBase, stClient, commitment);
+            const transferTx = commitment.toTransaction(inclusionProof);
+            // Reconstruct the recipient-token JSON shape (sourceToken +
+            // post-transfer transition) for ingestion into the bundle.
+            const tokenJson = token.sdkData
+              ? (typeof token.sdkData === 'string' ? JSON.parse(token.sdkData) : token.sdkData)
+              : null;
+            if (!tokenJson || typeof tokenJson !== 'object') {
+              throw new SphereError(
+                `Token ${token.id} missing sdkData; cannot ingest into UXF bundle`,
+                'TRANSFER_FAILED',
+              );
+            }
+            const recipientTokenJson = {
+              ...(tokenJson as Record<string, unknown>),
+              transactions: [
+                ...(((tokenJson as { transactions?: unknown[] }).transactions) ?? []),
+                transferTx.toJSON(),
+              ],
+            };
+            // Loop2-C3 — tighten requestIdHex extraction. RequestId
+            // extends DataHash whose toJSON() returns a hex imprint.
+            // Validate the shape; throw on SDK shape regression
+            // instead of silently shipping garbage like
+            // "[object Object]".
+            const requestIdHexRaw = (commitment.requestId as { toJSON?: () => string })?.toJSON?.();
+            if (typeof requestIdHexRaw !== 'string' || !/^[0-9a-f]+$/i.test(requestIdHexRaw)) {
+              throw new SphereError(
+                `dispatchUxfConservativeSend: commitment.requestId.toJSON() returned non-hex (${typeof requestIdHexRaw}); SDK shape regression?`,
+                'TRANSFER_FAILED',
+              );
+            }
+            const requestIdHex = requestIdHexRaw;
+            out.push({
+              sourceTokenId: token.id,
+              method: 'direct',
+              requestIdHex,
+              recipientTokenJson,
+            });
+          } finally {
+            if (consDirectCommitted) {
+              try {
+                await this.removeToken(token.id, transferId);
+              } catch (rmErr) {
+                logger.warn(
+                  'Payments',
+                  `dispatchUxfConservativeSend: removeToken(${token.id}) failed after on-chain commit — manual cleanup may be needed: ${rmErr instanceof Error ? rmErr.message : String(rmErr)}`,
+                );
+              }
+            }
           }
-          const recipientTokenJson = {
-            ...(tokenJson as Record<string, unknown>),
-            transactions: [
-              ...(((tokenJson as { transactions?: unknown[] }).transactions) ?? []),
-              transferTx.toJSON(),
-            ],
-          };
-          const requestIdBytes = commitment.requestId;
-          const requestIdHex =
-            requestIdBytes instanceof Uint8Array
-              ? Array.from(requestIdBytes)
-                  .map((b) => b.toString(16).padStart(2, '0'))
-                  .join('')
-              : (typeof (requestIdBytes as { toJSON?: () => string }).toJSON === "function" ? (requestIdBytes as { toJSON: () => string }).toJSON() : String(requestIdBytes));
-          out.push({
-            sourceTokenId: token.id,
-            method: 'direct',
-            requestIdHex,
-            recipientTokenJson,
-          });
-          await this.removeToken(token.id, transferId);
         }
         return out;
       },
@@ -9184,7 +9423,142 @@ export class PaymentsModule {
       },
     };
 
-    return sendConservativeUxf(originalRequest, recipient, deps);
+    // Loop1-S7/S9 — wrap sendConservativeUxf with reservation
+    // lifecycle + source restoration. The orchestrator does not roll
+    // back source state on failure; the dispatcher owns the cleanup.
+    let result: TransferResult;
+    try {
+      result = await sendConservativeUxf(originalRequest, recipient, deps);
+      // Loop1-S7 + Loop3-W2 — commit every reservation id allocated
+      // by selectSources (primary + per-additional-asset queue ids).
+      // Wrap each in try/catch: ReservationLedger.commit is
+      // currently non-throwing, but a future invariant assert
+      // shouldn't leak the remaining commits.
+      for (const rid of reservationIds) {
+        try {
+          this.reservationLedger.commit(rid);
+        } catch (commitErr) {
+          logger.warn(
+            'Payments',
+            `dispatchUxfConservativeSend: reservationLedger.commit(${rid}) threw (swallowed): ${commitErr instanceof Error ? commitErr.message : String(commitErr)}`,
+          );
+        }
+      }
+    } catch (err) {
+      // Loop1-S7 + Loop3-W2 — cancel every reservation id on failure,
+      // wrapped per-id so one throw doesn't leak the rest.
+      for (const rid of reservationIds) {
+        try {
+          this.reservationLedger.cancel(rid);
+        } catch (cancelErr) {
+          logger.warn(
+            'Payments',
+            `dispatchUxfConservativeSend: reservationLedger.cancel(${rid}) threw (swallowed): ${cancelErr instanceof Error ? cancelErr.message : String(cancelErr)}`,
+          );
+        }
+      }
+
+      // Loop1-S9 + Loop2-W1 — restore non-committed selected sources
+      // AND rebuild parsedTokenCache. Same semantics as the instant
+      // dispatcher.
+      const restoredCoinIds = new Set<string>();
+      for (const tokId of dispatcherSelectedTokenIds) {
+        if (committedOnChainTokenIds.has(tokId)) continue;
+        const tok = this.tokens.get(tokId);
+        if (tok !== undefined && tok.status === 'transferring') {
+          tok.status = 'confirmed';
+          tok.updatedAt = Date.now();
+          this.tokens.set(tokId, tok);
+          restoredCoinIds.add(tok.coinId);
+          if (tok.sdkData) {
+            try {
+              const parsed = JSON.parse(tok.sdkData);
+              const sdkToken = await SdkToken.fromJSON(parsed);
+              const amount = this.extractCoinAmountForCache(sdkToken, tok.coinId);
+              if (amount > 0n) {
+                this.parsedTokenCache.set(tok.id, { token: tok, sdkToken, amount });
+              }
+            } catch {
+              // Parse failure — skip cache rebuild.
+            }
+          }
+        }
+      }
+      try {
+        await this.save();
+      } catch {
+        // Non-fatal — in-memory state still reflects restoration.
+      }
+      // Loop2-W2 + Loop3-W1 — notify every coinId the send touched
+      // (primary + every additional-asset coin), not just the ones
+      // whose tokens we actually restored. Wrapped per coin.
+      restoredCoinIds.add(request.coinId);
+      for (const asset of originalRequest.additionalAssets ?? []) {
+        if (asset.kind === 'coin') {
+          restoredCoinIds.add(asset.coinId);
+        }
+      }
+      for (const cid of restoredCoinIds) {
+        try {
+          this.spendQueue.notifyChange(cid);
+        } catch (notifyErr) {
+          logger.warn(
+            'Payments',
+            `dispatchUxfConservativeSend: spendQueue.notifyChange(${cid}) threw (swallowed): ${notifyErr instanceof Error ? notifyErr.message : String(notifyErr)}`,
+          );
+        }
+      }
+      throw err;
+    }
+
+    // #143 UXF — record SENT history after the bundle is durably published.
+    // Conservative dispatcher already removes source tokens inside
+    // commitSources (line ~8528); only the history entry is missing.
+    // Swallow-and-log on failure so a history I/O hiccup does not flip a
+    // successful send into a thrown error.
+    try {
+      const recipientNametag =
+        peerInfo?.nametag ??
+        (originalRequest.recipient.startsWith('@')
+          ? originalRequest.recipient.slice(1)
+          : undefined);
+      const sentTokenId =
+        result.tokens[0] !== undefined
+          ? extractTokenIdFromSdkData(result.tokens[0].sdkData) ?? undefined
+          : undefined;
+      const tokenMap = new Map(result.tokens.map((t) => [t.id, t]));
+      const sentTokenIds: Array<{
+        id: string;
+        amount: string;
+        source: 'split' | 'direct';
+      }> = result.tokenTransfers.map((tt) => ({
+        id: tt.sourceTokenId,
+        amount: tokenMap.get(tt.sourceTokenId)?.amount ?? '0',
+        source: tt.method === 'split' ? 'split' : 'direct',
+      }));
+      await this.addToHistory({
+        type: 'SENT',
+        amount: request.amount,
+        coinId: request.coinId,
+        symbol: this.getCoinSymbol(request.coinId),
+        timestamp: Date.now(),
+        recipientPubkey,
+        ...(recipientNametag !== undefined ? { recipientNametag } : {}),
+        recipientAddress:
+          peerInfo?.directAddress ?? recipientAddress.toString() ?? recipientPubkey,
+        ...(request.memo !== undefined ? { memo: request.memo } : {}),
+        transferId: result.id,
+        ...(sentTokenId !== undefined ? { tokenId: sentTokenId } : {}),
+        ...(sentTokenIds.length > 0 ? { tokenIds: sentTokenIds } : {}),
+      });
+    } catch (err) {
+      logger.warn(
+        'Payments',
+        `dispatchUxfConservativeSend: failed to record SENT history (send already succeeded): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    return result;
   }
 
   // ===========================================================================
@@ -9240,6 +9614,10 @@ export class PaymentsModule {
         'AGGREGATOR_ERROR',
       );
     }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const trustBase = (this.deps!.oracle as any).getTrustBase?.();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const devMode = (this.deps!.oracle as any).isDevMode?.() ?? false;
 
     const onChainMessage = parseInvoiceMemoForOnChain(
       request.memo,
@@ -9258,6 +9636,36 @@ export class PaymentsModule {
         ? computeAddressId(directForId)
         : this.deps!.identity.chainPubkey;
 
+    // #142 — closure-captured queue of fire-and-forget post-transport
+    // tasks. Currently only used by the split path to invoke
+    // `awaitChangeTokenWithProofs()` after the bundle has shipped
+    // (mirrors the legacy V6 path's `startBackground()` call at
+    // PaymentsModule.ts:3772-3775). Failure inside any callback is
+    // logged but never propagated — the publish has already succeeded.
+    const postTransportBackgroundTasks: Array<() => Promise<void>> = [];
+
+    // Loop1-S9 — every token selectSources marked `transferring` is
+    // pushed here so the outer catch can restore non-committed
+    // sources back to `confirmed` on failure. Without this, a
+    // multi-source send that throws mid-commitSources leaves
+    // already-marked-but-not-yet-committed tokens stuck `transferring`
+    // forever (the spend planner skips them).
+    const dispatcherSelectedTokenIds: string[] = [];
+
+    // Loop1-S4 — tracks tokens whose ON-CHAIN commitment has been
+    // submitted (split: burn proof landed; direct: transfer commit
+    // accepted). The outer catch MUST NOT restore these to `confirmed`
+    // — they're irrecoverable on-chain. Mirrors the legacy `send()`
+    // arm's `committedOnChainTokenIds` (PaymentsModule.ts:3886).
+    const dispatcherCommittedOnChainTokenIds = new Set<string>();
+
+    // #149 — per-coin reservation ids. Mirrors the conservative
+    // dispatcher's `reservationIds` array pattern (line ~8400). With
+    // multi-asset planSend calls in `selectSources` below, each coin
+    // gets its own `${transferId}:${coinId}[:${i}]` queue id so
+    // promise-map collisions can't happen.
+    const reservationIds: string[] = [];
+
     const deps: InstantSenderDeps = {
       aggregator: this.deps!.oracle,
       transport: this.deps!.transport,
@@ -9269,6 +9677,14 @@ export class PaymentsModule {
       availableSources: () => Array.from(this.tokens.values()),
       transferId,
       selectSources: async ({ request: req }) => {
+        // #142/#149 — return the STRUCTURED selection shape with
+        // `splitSources` (array). One entry per coin that needs
+        // splitting (primary + each additional-asset coin). Direct
+        // (whole-token) sources go into directSources.
+        const directSources: Token[] = [];
+        const splitSources: Array<NonNullable<InstantSourceSelection['splitSources']>[number]> = [];
+
+        // ── Primary coin ──────────────────────────────────────────────────────
         const parsedPool = await this.spendPlanner.buildParsedPool(
           Array.from(this.tokens.values()),
           request.coinId,
@@ -9279,38 +9695,380 @@ export class PaymentsModule {
             pendingChangeAmount += BigInt(t.amount || '0');
           }
         }
+        // Per-coin reservation id (mirrors conservative dispatcher).
+        const primaryQueueId = `${transferId}:${request.coinId}`;
+        reservationIds.push(primaryQueueId);
         const planResult = this.spendPlanner.planSend(
           { amount: req.amount ?? '0', coinId: request.coinId },
           parsedPool,
           this.reservationLedger,
           this.spendQueue,
-          transferId,
+          primaryQueueId,
           pendingChangeAmount,
         );
         let splitPlan: SplitPlan;
         if (planResult === 'queued') {
-          const queueResult = await this.spendQueue.waitForEntry(transferId);
+          const queueResult = await this.spendQueue.waitForEntry(primaryQueueId);
           splitPlan = queueResult.splitPlan;
         } else {
           splitPlan = planResult.splitPlan;
         }
-        const out: Token[] = splitPlan.tokensToTransferDirectly.map(
-          (t) => t.uiToken,
-        );
-        if (splitPlan.tokenToSplit) out.push(splitPlan.tokenToSplit.uiToken);
-        for (const tok of out) {
+
+        directSources.push(...splitPlan.tokensToTransferDirectly.map((t) => t.uiToken));
+
+        if (splitPlan.tokenToSplit) {
+          // Loop1-S2 — defensive guard. If the planner emits
+          // `tokenToSplit` but `splitAmount` / `remainderAmount` is
+          // null/zero, the previous code silently called BigInt(0) and
+          // buildSplitBundle would burn the source for nothing
+          // (zero-coin recipient, irrecoverable). Surface as an
+          // INVALID_CONFIG throw — this is a planner bug, not user
+          // input. Source stays `transferring`; outer catch restores
+          // it via Loop1-S9 wiring (below in dispatcher).
+          if (
+            splitPlan.splitAmount === null ||
+            splitPlan.remainderAmount === null ||
+            splitPlan.splitAmount <= 0n
+          ) {
+            throw new SphereError(
+              `dispatchUxfInstantSend: planner returned tokenToSplit with null/zero splitAmount=${String(splitPlan.splitAmount)} / remainderAmount=${String(splitPlan.remainderAmount)} for primary coinId=${request.coinId.slice(0, 16)}; refusing to burn source for zero-coin recipient`,
+              'INVALID_CONFIG',
+            );
+          }
+          splitSources.push({
+            token: splitPlan.tokenToSplit.uiToken,
+            splitAmount: splitPlan.splitAmount,
+            remainderAmount: splitPlan.remainderAmount,
+            coinIdHex: request.coinId,
+          });
+        }
+
+        // ── Additional assets (coin entries only) ─────────────────────────────
+        // #149 — mirror conservative dispatcher; loop additionalAssets
+        // and plan each independently. NFT entries are whole-token
+        // (handled by commitSources, no plan needed).
+        const additional = req.additionalAssets ?? [];
+        for (let i = 0; i < additional.length; i++) {
+          const asset = additional[i];
+          if (asset.kind !== 'coin') continue;
+          const addCoinId = asset.coinId;
+          if (addCoinId === request.coinId) {
+            throw new SphereError(
+              `dispatchUxfInstantSend: additionalAssets[${i}].coinId duplicates primary coinId=${addCoinId.slice(0, 16)}; ` +
+                'combine the amounts into the primary slot instead',
+              'INVALID_CONFIG',
+            );
+          }
+          const addParsedPool = await this.spendPlanner.buildParsedPool(
+            Array.from(this.tokens.values()),
+            addCoinId,
+          );
+          let addPendingChange = 0n;
+          for (const [, t] of this.tokens) {
+            if (t.coinId === addCoinId && t.status === 'transferring') {
+              addPendingChange += BigInt(t.amount || '0');
+            }
+          }
+          const addQueueId = `${transferId}:${addCoinId}:${i}`;
+          reservationIds.push(addQueueId);
+          const addPlanResult = this.spendPlanner.planSend(
+            { amount: asset.amount, coinId: addCoinId },
+            addParsedPool,
+            this.reservationLedger,
+            this.spendQueue,
+            addQueueId,
+            addPendingChange,
+          );
+          let addSplitPlan: SplitPlan;
+          if (addPlanResult === 'queued') {
+            const addQueueResult = await this.spendQueue.waitForEntry(addQueueId);
+            addSplitPlan = addQueueResult.splitPlan;
+          } else {
+            addSplitPlan = addPlanResult.splitPlan;
+          }
+          directSources.push(...addSplitPlan.tokensToTransferDirectly.map((t) => t.uiToken));
+          if (addSplitPlan.tokenToSplit) {
+            if (
+              addSplitPlan.splitAmount === null ||
+              addSplitPlan.remainderAmount === null ||
+              addSplitPlan.splitAmount <= 0n
+            ) {
+              throw new SphereError(
+                `dispatchUxfInstantSend: planner returned tokenToSplit with null/zero splitAmount=${String(addSplitPlan.splitAmount)} / remainderAmount=${String(addSplitPlan.remainderAmount)} for additional coinId=${addCoinId.slice(0, 16)}; refusing to burn source for zero-coin recipient`,
+                'INVALID_CONFIG',
+              );
+            }
+            splitSources.push({
+              token: addSplitPlan.tokenToSplit.uiToken,
+              splitAmount: addSplitPlan.splitAmount,
+              remainderAmount: addSplitPlan.remainderAmount,
+              coinIdHex: addCoinId,
+            });
+          }
+        }
+
+        // Mark every selected source `transferring` + persist.
+        for (const tok of directSources) {
           tok.status = 'transferring';
           this.tokens.set(tok.id, tok);
           this.parsedTokenCache.delete(tok.id);
+          dispatcherSelectedTokenIds.push(tok.id);
+        }
+        for (const entry of splitSources) {
+          entry.token.status = 'transferring';
+          this.tokens.set(entry.token.id, entry.token);
+          this.parsedTokenCache.delete(entry.token.id);
+          dispatcherSelectedTokenIds.push(entry.token.id);
         }
         await this.save();
-        return out;
+        return { directSources, splitSources };
       },
-      commitSources: async ({ sources }) => {
+      commitSources: async ({ sources, splitSources }) => {
         const out: InstantCommitResult[] = [];
+        // #149 — tokenId → splitEntry lookup for O(1) routing.
+        // Orchestrator already validated tokenId uniqueness.
+        const splitEntryByTokenId = new Map<
+          string,
+          NonNullable<InstantSourceSelection['splitSources']>[number]
+        >();
+        for (const entry of splitSources ?? []) {
+          splitEntryByTokenId.set(entry.token.id, entry);
+        }
         for (const token of sources) {
-          // Submit the commitment WITHOUT awaiting the inclusion
-          // proof — the canonical instant-mode pipeline.
+          // #142/#149 — split path. The legacy implementation discarded
+          // the split intent and whole-token-transferred the source.
+          // The fix routes each split source through InstantSplitExecutor
+          // which burns the source and mints two new tokens: a
+          // `splitAmount` slice for the recipient (transferred to
+          // recipientAddress) and a `remainderAmount` change token
+          // (kept by the sender). Coin sources are split via mint —
+          // recipient and change get fresh tokenIds. Multiple split
+          // entries (one per coin) run independent buildSplitBundle
+          // invocations.
+          const splitEntry = splitEntryByTokenId.get(token.id);
+          if (splitEntry !== undefined) {
+            if (trustBase === undefined) {
+              throw new SphereError(
+                'Trust base not available. Oracle provider must implement getTrustBase() for partial-amount sends.',
+                'AGGREGATOR_ERROR',
+              );
+            }
+            if (!token.sdkData || typeof token.sdkData !== 'string') {
+              throw new SphereError(
+                `Split source token ${token.id} missing sdkData`,
+                'TRANSFER_FAILED',
+              );
+            }
+            const sdkSourceToken = await SdkToken.fromJSON(JSON.parse(token.sdkData));
+            const executor = new InstantSplitExecutor({
+              stateTransitionClient: stClient,
+              trustBase,
+              signingService,
+              devMode,
+            });
+
+            // Loop1-S4 + Loop2-C2 — burn-then-removeToken via
+            // try/finally with `onBurnSubmitted` callback. The
+            // executor invokes `onBurnSubmitted` AFTER its step-1
+            // burn submit response is SUCCESS (durable on-chain) and
+            // BEFORE the step-2 proof wait. From that moment on, any
+            // throw — proof wait timeout, mint submit failure,
+            // anything — leaves the source on-chain spent, so the
+            // local source MUST be tombstoned. Pre-Loop2-C2 only
+            // tracked `burnDone=true` AFTER buildSplitBundle returned
+            // (= proof received) — proof-wait throws left the source
+            // on-chain spent but not tombstoned.
+            let burnDone = false;
+            try {
+              // #149 — capture coinId in a local for the change-token
+              // callback closure. Using `splitEntry.coinIdHex` directly
+              // works (the entry is loop-scoped), but a named local is
+              // clearer and matches the conservative dispatcher's
+              // pattern.
+              const changeCoinId = splitEntry.coinIdHex;
+              const splitResult = await executor.buildSplitBundle(
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                sdkSourceToken as any,
+                splitEntry.splitAmount,
+                splitEntry.remainderAmount,
+                splitEntry.coinIdHex,
+                recipientAddress,
+                {
+                  message: onChainMessage,
+                  // UXF dispatcher drives commitment submission via
+                  // submitCommitmentsImmediate; suppress the legacy
+                  // background path so commitments aren't double-submitted.
+                  skipBackground: true,
+                  // CONTRACT (Loop3-W3): this callback MUST NOT
+                  // THROW. The executor catches and swallows any
+                  // throw, but a throw here would leave `burnDone`
+                  // false while the burn IS on-chain spent —
+                  // recreating the phantom-token regression
+                  // Loop2-C2 was designed to close. Keep this
+                  // callback simple: `Set.add` + primitive
+                  // assignment ONLY. Do NOT add any async / I/O /
+                  // throwing operation here.
+                  onBurnSubmitted: () => {
+                    burnDone = true;
+                    dispatcherCommittedOnChainTokenIds.add(token.id);
+                  },
+                  onChangeTokenCreated: async (changeToken) => {
+                    // Persist the change token via the standard addToken
+                    // pipeline. Fires after awaitChangeTokenWithProofs
+                    // gets the sender's mint proof (~2s post-transport).
+                    // #149 — use splitEntry.coinIdHex (NOT request.coinId)
+                    // because additional-asset splits change-mint into
+                    // their own coin class.
+                    const changeTokenData = changeToken.toJSON();
+                    const changeUiToken: Token = {
+                      id: crypto.randomUUID(),
+                      coinId: changeCoinId,
+                      symbol: this.getCoinSymbol(changeCoinId),
+                      name: this.getCoinName(changeCoinId),
+                      decimals: this.getCoinDecimals(changeCoinId),
+                      iconUrl: this.getCoinIconUrl(changeCoinId),
+                      amount: splitEntry.remainderAmount.toString(),
+                      status: 'confirmed',
+                      createdAt: Date.now(),
+                      updatedAt: Date.now(),
+                      sdkData: JSON.stringify(changeTokenData),
+                    };
+                    await this.addToken(changeUiToken);
+                    logger.debug(
+                      'Payments',
+                      `dispatchUxfInstantSend: change token persisted (coin=${changeCoinId.slice(0, 16)} amount=${changeUiToken.amount})`,
+                    );
+                  },
+                  onStorageSync: async () => {
+                    await this.save();
+                    return true;
+                  },
+                },
+              );
+              // Loop2-C2 — `burnDone` is set by the onBurnSubmitted
+              // callback inside buildSplitBundle, which fires AFTER the
+              // burn submit response is SUCCESS and BEFORE the proof
+              // wait. The callback already added `token.id` to
+              // `dispatcherCommittedOnChainTokenIds`; nothing more to
+              // do here. The contract is single-path:
+              //
+              //   callback fires ⇔ burn is on-chain ⇔ source tombstoned
+              //
+              // If buildSplitBundle returns without invoking the
+              // callback (which would require an executor regression),
+              // burnDone stays false and the source is restored by the
+              // outer catch.
+
+              // Loop1-S4 — queue awaitChangeTokenWithProofs BEFORE
+              // submitCommitmentsImmediate so a partial-failure path
+              // (sender mint succeeds, recipient mint or transfer
+              // fails) still runs the change-token recovery. The bg
+              // task is fired in BOTH success and failure paths of
+              // the outer dispatcher catch.
+              if (splitResult.awaitChangeTokenWithProofs !== undefined) {
+                const bgTask = splitResult.awaitChangeTokenWithProofs;
+                postTransportBackgroundTasks.push(async () => {
+                  await bgTask();
+                });
+              }
+
+              // Submit the three commitments (sender mint → recipient
+              // mint → transfer; serial per Loop1-S3) to the aggregator
+              // AND wait for the recipient mint inclusion proof (Loop4
+              // e2e fix — UXF format requires genesis.inclusionProof
+              // to be non-null). Fails on any non-SUCCESS — but the
+              // burn is already anchored, so the source is gone
+              // regardless.
+              if (splitResult.submitCommitmentsImmediate === undefined) {
+                throw new SphereError(
+                  'InstantSplitExecutor.buildSplitBundle did not expose submitCommitmentsImmediate ' +
+                    '— UXF dispatcher requires the #142 wiring',
+                  'INVALID_CONFIG',
+                );
+              }
+              const {
+                recipientMintProvenGenesisJson,
+                transferTransactionHashHex,
+                transferAuthenticatorJsonStr,
+              } = await splitResult.submitCommitmentsImmediate();
+
+              // Loop4-S2 — populate per-requestId context for the
+              // sender-side §6.1 finalization worker. Mirrors the
+              // direct-path block at line ~9435 (Task #152 wiring).
+              // Without this, the worker's resolver returns null on
+              // the split-path requestId, hard-fails 'structural',
+              // and `transfer:confirmed` never fires — the outbox
+              // entry stays stuck at `delivered-instant` forever.
+              if (
+                this.finalizationWorkerSender !== null &&
+                splitResult.transferRequestIdHex !== undefined &&
+                splitResult.transferRequestIdHex.length > 0
+              ) {
+                this._senderRequestContextMap.set(splitResult.transferRequestIdHex, {
+                  transactionHash: transferTransactionHashHex,
+                  authenticator: transferAuthenticatorJsonStr,
+                  nextEntryRest: { status: 'valid' as const },
+                });
+              }
+
+              // Assemble recipient SDK Token JSON. The genesis is the
+              // proven recipient mint transaction (with inclusionProof)
+              // — required by the UXF format. The transfer transaction
+              // ships with `inclusionProof: null`; the recipient's
+              // chain-walker resolves it against the aggregator after
+              // the transfer commit's proof lands.
+              //
+              // `recipientMintProvenGenesisJson` is already the
+              // `{data, inclusionProof}` shape from
+              // `TransferTransaction.toJSON()` — splatted directly into
+              // the genesis slot.
+              const recipientTokenJson = {
+                version: '2.0',
+                genesis: recipientMintProvenGenesisJson,
+                state: splitResult.recipientMintedStateJson,
+                transactions: [
+                  {
+                    data: splitResult.transferTxDataJson,
+                    inclusionProof: null,
+                  },
+                ],
+                nametags: [] as ReadonlyArray<unknown>,
+              };
+
+              out.push({
+                sourceTokenId: token.id,
+                method: 'split',
+                requestIdHex: splitResult.transferRequestIdHex ?? '',
+                recipientTokenJson,
+                tokenClass: 'coin',
+                splitParentTokenId: token.id,
+                splitGroupId: splitResult.splitGroupId,
+              });
+            } finally {
+              if (burnDone) {
+                try {
+                  // #143 UXF — source token is spent on-chain (burn
+                  // submitted by buildSplitBundle step 1). Tombstone
+                  // here in finally so even if submitCommitments or
+                  // any later step threw, the source is removed and
+                  // does not return as `confirmed` on the next load.
+                  await this.removeToken(token.id, transferId);
+                } catch (rmErr) {
+                  logger.warn(
+                    'Payments',
+                    `dispatchUxfInstantSend: removeToken(${token.id}) failed after burn — manual cleanup may be needed: ${rmErr instanceof Error ? rmErr.message : String(rmErr)}`,
+                  );
+                }
+              }
+            }
+            continue;
+          }
+
+          // Direct (whole-token) path — unchanged from pre-#142
+          // behaviour for sources that the spend planner picked WITHOUT
+          // a split. Submits the transfer commitment without awaiting
+          // the inclusion proof; recipient's chain-walker resolves it
+          // when the aggregator returns it.
           const commitment = await this.createSdkCommitment(
             token,
             recipientAddress,
@@ -9327,6 +10085,18 @@ export class PaymentsModule {
               'TRANSFER_FAILED',
             );
           }
+          // Loop2-C1 — commit is on-chain from this point. Track AND
+          // wrap the entire post-submit block in try/finally so
+          // removeToken always fires, even if any of the JSON
+          // construction / hash / classification steps throws.
+          // Previous Loop1-S4 placement (add outside the try, try only
+          // around the out.push) left a wide window where a throw
+          // would leave the source committed-but-not-removed → zombie
+          // `transferring` row after outer catch skipped restoration.
+          let directCommitted = false;
+          try {
+            directCommitted = true;
+            dispatcherCommittedOnChainTokenIds.add(token.id);
           // The transfer transaction goes on the bundle WITHOUT a
           // proof — the recipient's reader walks the chain when
           // proofs land.
@@ -9387,13 +10157,19 @@ export class PaymentsModule {
               transferTxJson,
             ],
           };
-          const requestIdBytes = commitment.requestId;
-          const requestIdHex =
-            requestIdBytes instanceof Uint8Array
-              ? Array.from(requestIdBytes)
-                  .map((b) => b.toString(16).padStart(2, '0'))
-                  .join('')
-              : (typeof (requestIdBytes as { toJSON?: () => string }).toJSON === "function" ? (requestIdBytes as { toJSON: () => string }).toJSON() : String(requestIdBytes));
+          // Loop2-C3 — tighten requestIdHex extraction. RequestId
+          // extends DataHash whose toJSON() returns a hex imprint.
+          // The previous fallback `String(requestIdBytes)` would ship
+          // `"[object Object]"` if the SDK shape ever changed. Validate
+          // explicitly and throw on SDK shape regression.
+          const requestIdHexRawDirect = (commitment.requestId as { toJSON?: () => string })?.toJSON?.();
+          if (typeof requestIdHexRawDirect !== 'string' || !/^[0-9a-f]+$/i.test(requestIdHexRawDirect)) {
+            throw new SphereError(
+              `dispatchUxfInstantSend: commitment.requestId.toJSON() returned non-hex (${typeof requestIdHexRawDirect}); SDK shape regression?`,
+              'TRANSFER_FAILED',
+            );
+          }
+          const requestIdHex = requestIdHexRawDirect;
 
           // Task #152 — store per-requestId context for the finalization
           // worker resolver. The §6.1 race-lost detection compares the LOCAL
@@ -9485,23 +10261,40 @@ export class PaymentsModule {
           };
           const tokenClass = classifyTokenLike(sourceTokenLike);
 
-          if (tokenClass === 'coin') {
-            out.push({
-              sourceTokenId: token.id,
-              method: 'direct',
-              requestIdHex,
-              recipientTokenJson,
-              tokenClass: 'coin',
-              splitParentTokenId: token.id,
-            });
-          } else {
-            out.push({
-              sourceTokenId: token.id,
-              method: 'direct',
-              requestIdHex,
-              recipientTokenJson,
-              tokenClass: 'nft',
-            });
+            if (tokenClass === 'coin') {
+              out.push({
+                sourceTokenId: token.id,
+                method: 'direct',
+                requestIdHex,
+                recipientTokenJson,
+                tokenClass: 'coin',
+                splitParentTokenId: token.id,
+              });
+            } else {
+              out.push({
+                sourceTokenId: token.id,
+                method: 'direct',
+                requestIdHex,
+                recipientTokenJson,
+                tokenClass: 'nft',
+              });
+            }
+          } finally {
+            // Loop2-C1 — removeToken always fires when the on-chain
+            // commit is durable, regardless of any throw in the
+            // post-submit JSON construction or classification path.
+            // The try block starts immediately after submit-success
+            // so this finally catches the widest possible window.
+            if (directCommitted) {
+              try {
+                await this.removeToken(token.id, transferId);
+              } catch (rmErr) {
+                logger.warn(
+                  'Payments',
+                  `dispatchUxfInstantSend: removeToken(${token.id}) failed after on-chain commit — manual cleanup may be needed: ${rmErr instanceof Error ? rmErr.message : String(rmErr)}`,
+                );
+              }
+            }
           }
         }
         return out;
@@ -9549,7 +10342,201 @@ export class PaymentsModule {
         : undefined,
     };
 
-    return sendInstantUxf(originalRequest, recipient, deps);
+    // Loop1-S4/S7/S9 — wrap sendInstantUxf with reservation lifecycle
+    // + source restoration + background-task firing in BOTH success
+    // and failure paths. The orchestrator does not roll back source
+    // state on failure; the dispatcher owns the cleanup.
+    let result: TransferResult;
+    try {
+      result = await sendInstantUxf(originalRequest, recipient, deps);
+      // Loop1-S7 + Loop3-W2 + #149 — commit every reservation id on
+      // success (primary + per-additional-asset queue ids). Wrap each
+      // in try/catch: ReservationLedger.commit is currently non-
+      // throwing, but a future invariant assert shouldn't leak the
+      // remaining commits. Mirrors the conservative dispatcher's
+      // pattern (line ~8815).
+      for (const rid of reservationIds) {
+        try {
+          this.reservationLedger.commit(rid);
+        } catch (commitErr) {
+          logger.warn(
+            'Payments',
+            `dispatchUxfInstantSend: reservationLedger.commit(${rid}) threw (swallowed): ${commitErr instanceof Error ? commitErr.message : String(commitErr)}`,
+          );
+        }
+      }
+    } catch (err) {
+      // Loop1-S7 + Loop3-W2 + #149 — cancel every reservation id on
+      // failure, wrapped per-id so one throw doesn't leak the rest.
+      for (const rid of reservationIds) {
+        try {
+          this.reservationLedger.cancel(rid);
+        } catch (cancelErr) {
+          logger.warn(
+            'Payments',
+            `dispatchUxfInstantSend: reservationLedger.cancel(${rid}) threw (swallowed): ${cancelErr instanceof Error ? cancelErr.message : String(cancelErr)}`,
+          );
+        }
+      }
+
+      // Loop1-S9 + Loop2-W1 — restore any selected source NOT yet
+      // on-chain committed. Without this, a multi-source send that
+      // throws mid-commitSources (e.g. source-2's submit fails after
+      // source-1 succeeded) leaves the still-`transferring` sources
+      // stuck forever — the spend planner ignores them.
+      //
+      // Loop2-W1 — rebuild parsedTokenCache for the restored token so
+      // the spend planner sees it again. Mirrors the legacy send()
+      // catch path (PaymentsModule.ts:3900-3908). Without this, the
+      // restored token is in `this.tokens` as `confirmed` but
+      // invisible to spend planning until the next save/sync
+      // rebuilds the cache.
+      const restoredCoinIds = new Set<string>();
+      for (const tokId of dispatcherSelectedTokenIds) {
+        if (dispatcherCommittedOnChainTokenIds.has(tokId)) continue;
+        const tok = this.tokens.get(tokId);
+        if (tok !== undefined && tok.status === 'transferring') {
+          tok.status = 'confirmed';
+          tok.updatedAt = Date.now();
+          this.tokens.set(tokId, tok);
+          restoredCoinIds.add(tok.coinId);
+          if (tok.sdkData) {
+            try {
+              const parsed = JSON.parse(tok.sdkData);
+              const sdkToken = await SdkToken.fromJSON(parsed);
+              const amount = this.extractCoinAmountForCache(sdkToken, tok.coinId);
+              if (amount > 0n) {
+                this.parsedTokenCache.set(tok.id, { token: tok, sdkToken, amount });
+              }
+            } catch {
+              // Parse failure — skip cache rebuild. Token still
+              // marked confirmed; planner will re-parse on next
+              // buildParsedPool.
+            }
+          }
+        }
+      }
+      try {
+        await this.save();
+      } catch {
+        // save() failure here is non-fatal; the in-memory restoration
+        // applies for the rest of this session and the next load will
+        // see the persistent state.
+      }
+      // Loop2-W2 + Loop3-W1 — notify the spend queue for EVERY
+      // coinId the send touched, not just the ones whose tokens we
+      // actually restored. A planSend failure on coin USDU before
+      // ANY USDU token got marked `transferring` would otherwise
+      // leave USDU's queue waiters parked indefinitely. Wrap each
+      // notify in try/catch so a listener error doesn't mask the
+      // original throw.
+      restoredCoinIds.add(request.coinId);
+      for (const asset of originalRequest.additionalAssets ?? []) {
+        if (asset.kind === 'coin') {
+          restoredCoinIds.add(asset.coinId);
+        }
+      }
+      for (const cid of restoredCoinIds) {
+        try {
+          this.spendQueue.notifyChange(cid);
+        } catch (notifyErr) {
+          logger.warn(
+            'Payments',
+            `dispatchUxfInstantSend: spendQueue.notifyChange(${cid}) threw (swallowed): ${notifyErr instanceof Error ? notifyErr.message : String(notifyErr)}`,
+          );
+        }
+      }
+
+      // Loop1-S4 — fire post-transport bg tasks on failure too. The
+      // change-token recovery task (awaitChangeTokenWithProofs) is
+      // queued BEFORE submitCommitmentsImmediate in the split branch
+      // (see Loop1-S4 in commitSources). If submit threw, the sender
+      // mint may STILL have anchored (it's the first submission), in
+      // which case the change-token recovery is needed even though
+      // the dispatch failed.
+      for (const task of postTransportBackgroundTasks) {
+        const tracked: Promise<void> = task().catch((bgErr) => {
+          logger.debug(
+            'Payments',
+            `dispatchUxfInstantSend: background task threw (post-failure): ${bgErr instanceof Error ? bgErr.message : String(bgErr)}`,
+          );
+        });
+        // Push to module-level pending list so waitForPendingOperations()
+        // drains them and tests can `await sphere.waitForPendingOperations()`.
+        this.pendingBackgroundTasks.push(tracked);
+      }
+      throw err;
+    }
+
+    // SUCCESS PATH: fire post-transport bg tasks.
+    // #142 — each task is `awaitChangeTokenWithProofs()` for a split
+    // source; it waits for the sender's mint proof (~2s) and persists
+    // the change token via the closure-captured `onChangeTokenCreated`
+    // callback. Failure is logged inside `awaitChangeTokenWithProofs`
+    // (never re-thrown), so a `.catch` here is defense-in-depth only.
+    for (const task of postTransportBackgroundTasks) {
+      const tracked: Promise<void> = task().catch((err) => {
+        logger.debug(
+          'Payments',
+          `dispatchUxfInstantSend: background task threw (post-transport): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+      // Loop1-S8 — track at module level so waitForPendingOperations()
+      // can drain them.
+      this.pendingBackgroundTasks.push(tracked);
+    }
+
+    // #143 UXF — record SENT history after the bundle is durably published.
+    // Mirrors the legacy send() arm (PaymentsModule.ts:3855). Without this
+    // entry the user sees no outgoing transaction even after the bundle is
+    // on the wire.
+    //
+    // Failure handling: addToHistory wraps storage I/O. A throw here would
+    // turn a successful send into a thrown error — worse than a missing
+    // history row. Swallow + log so the caller still observes the send.
+    try {
+      const recipientNametag =
+        peerInfo?.nametag ??
+        (originalRequest.recipient.startsWith('@')
+          ? originalRequest.recipient.slice(1)
+          : undefined);
+      const sentTokenId =
+        result.tokens[0] !== undefined
+          ? extractTokenIdFromSdkData(result.tokens[0].sdkData) ?? undefined
+          : undefined;
+      const tokenMap = new Map(result.tokens.map((t) => [t.id, t]));
+      const sentTokenIds: Array<{
+        id: string;
+        amount: string;
+        source: 'split' | 'direct';
+      }> = result.tokenTransfers.map((tt) => ({
+        id: tt.sourceTokenId,
+        amount: tokenMap.get(tt.sourceTokenId)?.amount ?? '0',
+        source: tt.method === 'split' ? 'split' : 'direct',
+      }));
+      await this.addToHistory({
+        type: 'SENT',
+        amount: request.amount,
+        coinId: request.coinId,
+        symbol: this.getCoinSymbol(request.coinId),
+        timestamp: Date.now(),
+        recipientPubkey,
+        ...(recipientNametag !== undefined ? { recipientNametag } : {}),
+        recipientAddress:
+          peerInfo?.directAddress ?? recipientAddress.toString() ?? recipientPubkey,
+        ...(request.memo !== undefined ? { memo: request.memo } : {}),
+        transferId: result.id,
+        ...(sentTokenId !== undefined ? { tokenId: sentTokenId } : {}),
+        ...(sentTokenIds.length > 0 ? { tokenIds: sentTokenIds } : {}),
+      });
+    } catch (err) {
+      logger.warn(
+        'Payments',
+        `dispatchUxfInstantSend: failed to record SENT history (send already succeeded): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    return result;
   }
 
   // ===========================================================================
@@ -10860,9 +11847,49 @@ export class PaymentsModule {
     const parsed = parseTxfStorageData(data);
     logger.debug('Payments', `loadFromStorageData: parsed ${parsed.tokens.length} tokens, ${parsed.tombstones.length} tombstones, errors=[${parsed.validationErrors.join('; ')}]`);
 
-    // Load tombstones FIRST so we can filter tokens
-    this.tombstones = parsed.tombstones;
-    this.rebuildTombstoneKeySet();
+    // #143 FIX D — UNION-MERGE tombstones (do NOT replace).
+    //
+    // Wholesale replacement is unsafe: when a remote/sync snapshot is older
+    // than the local set (e.g. an in-flight send tombstoned a source AFTER
+    // the snapshot was captured), `this.tombstones = parsed.tombstones`
+    // drops the local tombstone. The just-spent source token then re-loads
+    // from the snapshot, status='confirmed', and the spend planner sees a
+    // phantom balance — the failure mode reported in #143.
+    //
+    // Union semantics mirror {@link mergeTombstones} (line ~6806). Local
+    // tombstones survive sync; remote tombstones are added if not already
+    // present. The keySet provides O(1) dedup.
+    //
+    // Loop1-S10 — build the merged ARRAY in a local first, then assign
+    // both `this.tombstones` AND `this.tombstoneKeySet` atomically at
+    // the end. The previous revision mutated `this.tombstones` in-place
+    // during the loop while reassigning the keySet only AFTER the loop
+    // exited; an exception mid-iteration (malformed snapshot, etc.)
+    // would leave the two stores divergent until the next
+    // `rebuildTombstoneKeySet`. Atomic assignment closes that hazard.
+    const mergedKeySet = new Set(this.tombstoneKeySet);
+    const mergedArray = [...this.tombstones];
+    for (const t of parsed.tombstones) {
+      // Defensive: skip malformed entries. A snapshot with a missing
+      // tokenId or stateHash would create a "undefined:undefined" key
+      // that matches any future token whose extract* returns undefined
+      // — silent over-tombstoning.
+      if (
+        t === null ||
+        typeof t !== 'object' ||
+        typeof (t as { tokenId?: unknown }).tokenId !== 'string' ||
+        typeof (t as { stateHash?: unknown }).stateHash !== 'string'
+      ) {
+        continue;
+      }
+      const k = `${t.tokenId}:${t.stateHash}`;
+      if (!mergedKeySet.has(k)) {
+        mergedArray.push(t);
+        mergedKeySet.add(k);
+      }
+    }
+    this.tombstones = mergedArray;
+    this.tombstoneKeySet = mergedKeySet;
     // Load tokens, filtering out tombstoned ones.
     // Preserve tokens with 'transferring' status — they are part of an in-flight send().
     const preservedTransferring = new Map<string, Token>();

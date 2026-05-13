@@ -306,7 +306,14 @@ describe('sendConservativeUxf — 1-token happy path', () => {
     expect(payload.kind).toBe('uxf-car');
     expect(payload.version).toBe('1.0');
     expect(payload.mode).toBe('conservative');
-    expect(payload.tokenIds).toEqual(['tok-1']);
+    // Loop4-e2e (round 2) — payload.tokenIds advertises the
+    // recipient's genesis tokenId (extracted from
+    // recipientTokenJson.genesis.data.tokenId), NOT the sender-side
+    // sourceTokenId. TOKEN_A's genesis tokenId is the canonical
+    // 'aa00...0001' (see tests/fixtures/uxf-mock-tokens.ts).
+    expect(payload.tokenIds).toEqual([
+      'aa00000000000000000000000000000000000000000000000000000000000001',
+    ]);
     expect(typeof payload.bundleCid).toBe('string');
     expect(payload.bundleCid.length).toBeGreaterThan(0);
     expect(typeof payload.carBase64).toBe('string');
@@ -374,13 +381,34 @@ describe('sendConservativeUxf — multi-token deterministic order', () => {
       deps,
     );
 
-    // tokenTransfers preserved in lex-min order.
+    // tokenTransfers preserved in lex-min order (by sourceTokenId).
     const sortedIds = [...ids].sort();
     expect(result.tokenTransfers.map((t) => t.sourceTokenId)).toEqual(sortedIds);
 
-    // Wire envelope's tokenIds also reflect lex-min order.
+    // Loop4-e2e (round 2) — wire envelope's tokenIds reflect the
+    // RECIPIENT'S genesis tokenIds (extracted from
+    // recipientTokenJson.genesis.data.tokenId), in the same lex-min
+    // sourceTokenId order. Each commit result was built with
+    // rewriteTokenId='a'.repeat(63)+i.toString(16) following the
+    // sourceTokenIds=['tok-e','tok-a','tok-c','tok-b','tok-d']
+    // iteration. The expected tokenIds list is therefore the
+    // rewriteTokenId of each commit result, reordered to match the
+    // sorted sourceTokenIds:
+    //   sourceTokenId → rewriteTokenId at original index
+    //   'tok-a' → i=1 → '...a1'
+    //   'tok-b' → i=3 → '...a3'
+    //   'tok-c' → i=2 → '...a2'
+    //   'tok-d' → i=4 → '...a4'
+    //   'tok-e' → i=0 → '...a0'
+    const sortedTokenIdsHex = [
+      'a'.repeat(63) + '1',
+      'a'.repeat(63) + '3',
+      'a'.repeat(63) + '2',
+      'a'.repeat(63) + '4',
+      'a'.repeat(63) + '0',
+    ];
     const payload = transport._calls[0].payload as UxfTransferPayloadCar;
-    expect(payload.tokenIds).toEqual(sortedIds);
+    expect(payload.tokenIds).toEqual(sortedTokenIdsHex);
   });
 });
 
@@ -570,7 +598,13 @@ describe('sendConservativeUxf — CAR-inline fallback when publishToIpfs absent'
     let caught: unknown;
     try {
       await sendConservativeUxf(
-        basicRequest({ delivery: { kind: 'auto' } }),
+        // Loop1-S6 — request budget must cover the summed shipped
+        // amount across all 120 sources (each ships 1_000_000 UCT)
+        // so the new OVER_TRANSFER_GUARD doesn't trip first. The
+        // test's purpose is to assert the IPFS_PUBLISHER_REQUIRED
+        // pre-flight; we set the request amount to the total
+        // shipped to keep the guard a no-op for this scenario.
+        basicRequest({ delivery: { kind: 'auto' }, amount: (1_000_000 * N).toString() }),
         makePeerInfo(),
         deps,
       );

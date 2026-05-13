@@ -324,7 +324,12 @@ describe('sendInstantUxf — 1-token happy path', () => {
     const payload = transport._calls[0].payload as UxfTransferPayloadCar;
     expect(payload.mode).toBe('instant');
     expect(payload.kind).toBe('uxf-car');
-    expect(payload.tokenIds).toEqual(['tok-1']);
+    // Loop4-e2e (round 2) — payload.tokenIds is the recipient genesis
+    // tokenId (extracted from recipientTokenJson.genesis.data.tokenId),
+    // NOT the sender-side sourceTokenId.
+    expect(payload.tokenIds).toEqual([
+      'aa00000000000000000000000000000000000000000000000000000000000001',
+    ]);
 
     // Event: transfer:submitted (NOT transfer:confirmed).
     const submitted = events.filter((e) => e.type === 'transfer:submitted');
@@ -1328,5 +1333,327 @@ describe('__resetSourceLocksForTesting — Wave 7 fail-closed guard', () => {
     process.env.NODE_ENV = 'development';
     process.env.SPHERE_ALLOW_TEST_RESET = '1';
     expect(() => __resetSourceLocksForTesting()).not.toThrow();
+  });
+});
+
+// =============================================================================
+// #142 — InstantSourceSelection forwarding (split intent)
+// =============================================================================
+//
+// FIX 1 widened `InstantSelectSourcesFn` to return either the legacy array
+// shape or the new structured `InstantSourceSelection`. The orchestrator
+// normalizes both shapes and forwards `splitSource` to `commitSources`.
+// These tests lock down the normalization + forwarding contract so the
+// production wiring in dispatchUxfInstantSend (FIX 2) can depend on it.
+
+describe('sendInstantUxf — splitSources forwarding (#142 FIX 1 / #149 multi-asset)', () => {
+  it('forwards a single splitSources entry from selectSources to commitSources', async () => {
+    const splitSourceTok = makeToken('split-tok', TOKEN_A, {
+      amount: '1000000',
+    });
+    const commitResult = makeCommitResult({
+      sourceTokenId: 'split-tok',
+      fixture: TOKEN_A,
+    });
+    let observedSplitSources: unknown = 'NOT_CALLED';
+    const { deps } = makeDeps({
+      availableSources: () => [splitSourceTok],
+      selectSources: async () => ({
+        directSources: [],
+        splitSources: [
+          {
+            token: splitSourceTok,
+            splitAmount: 300_000n,
+            remainderAmount: 700_000n,
+            coinIdHex: 'UCT',
+          },
+        ],
+      }),
+      commitSources: async ({ splitSources }) => {
+        observedSplitSources = splitSources;
+        return [commitResult];
+      },
+    });
+
+    // Make the request budget cover the slice (300_000) so the guard
+    // doesn't fire (TOKEN_A's recipient fixture has coinData 1_000_000 —
+    // for this contract test we set the budget high to focus on the
+    // forwarding invariant alone).
+    await sendInstantUxf(
+      basicRequest({ amount: '1000000' }),
+      makePeerInfo(),
+      deps,
+    );
+
+    expect(observedSplitSources).toEqual([
+      {
+        token: splitSourceTok,
+        splitAmount: 300_000n,
+        remainderAmount: 700_000n,
+        coinIdHex: 'UCT',
+      },
+    ]);
+  });
+
+  it('legacy array-shape selectSources still works (empty splitSources)', async () => {
+    const source = makeToken('tok-1', TOKEN_A);
+    const commitResult = makeCommitResult({
+      sourceTokenId: 'tok-1',
+      fixture: TOKEN_A,
+    });
+    let observedSplitSources: unknown = 'NOT_CALLED';
+    const { deps } = makeDeps({
+      availableSources: () => [source],
+      // LEGACY return shape — flat array. No splitSources entries.
+      selectSources: async () => [source],
+      commitSources: async ({ splitSources }) => {
+        observedSplitSources = splitSources;
+        return [commitResult];
+      },
+    });
+
+    await sendInstantUxf(
+      basicRequest({ amount: '1000000' }),
+      makePeerInfo(),
+      deps,
+    );
+
+    // Orchestrator normalizes legacy array form to splitSources: [].
+    expect(observedSplitSources).toEqual([]);
+  });
+});
+
+// =============================================================================
+// #142 — OVER_TRANSFER_GUARD post-commit assertion
+// =============================================================================
+//
+// The guard runs AFTER commitSources returns. It walks the recipient token
+// JSONs and sums the per-coin `genesis.data.coinData` amounts; rejects if any
+// coin's shipped sum exceeds the request's per-coin total. This block locks
+// down the over-send invariant — the exact failure mode from issue #142
+// where a partial-amount send silently shipped the entire source token.
+
+describe('sendInstantUxf — OVER_TRANSFER_GUARD (#142)', () => {
+  it('rejects when whole-token coinData exceeds request amount', async () => {
+    // TOKEN_A's coinData is [['UCT', '1000000']]. If the request asks for
+    // only 500000 UCT but the commitSources callback whole-token-transfers
+    // the source, the recipient receives 1000000 — the silent over-send
+    // bug. The guard must throw OVER_TRANSFER_GUARD.
+    const source = makeToken('tok-1', TOKEN_A);
+    const overSendResult = makeCommitResult({
+      sourceTokenId: 'tok-1',
+      fixture: TOKEN_A, // recipientTokenJson.genesis.data.coinData = [['UCT', '1000000']]
+    });
+    const { deps, transport } = makeDeps({
+      availableSources: () => [source],
+      selectSources: async () => [source],
+      commitSources: async () => [overSendResult],
+    });
+
+    let caught: unknown;
+    try {
+      await sendInstantUxf(
+        basicRequest({ amount: '500000' }),
+        makePeerInfo(),
+        deps,
+      );
+    } catch (err) {
+      caught = err;
+    }
+    if (!isSphereError(caught)) {
+      throw new Error(`expected SphereError; got ${String(caught)}`);
+    }
+    expect(caught.code).toBe('OVER_TRANSFER_GUARD');
+    // CRITICAL — the guard fires BEFORE transport publish. Bob must
+    // never see the over-send.
+    expect(transport._calls).toEqual([]);
+  });
+
+  it('passes when shipped coin amount equals request amount', async () => {
+    // Whole-token request of the full 1000000 — coinData equals request,
+    // no over-send. Bundle must ship.
+    const source = makeToken('tok-1', TOKEN_A);
+    const wholeResult = makeCommitResult({
+      sourceTokenId: 'tok-1',
+      fixture: TOKEN_A,
+    });
+    const { deps, transport } = makeDeps({
+      availableSources: () => [source],
+      selectSources: async () => [source],
+      commitSources: async () => [wholeResult],
+    });
+
+    await sendInstantUxf(
+      basicRequest({ amount: '1000000' }),
+      makePeerInfo(),
+      deps,
+    );
+
+    expect(transport._calls).toHaveLength(1);
+  });
+
+  it('skips NFT commit results (no fungible amount counted)', async () => {
+    // NFT-class result has no coinData → guard MUST NOT compare against
+    // the request's primary coin budget for it. A mixed coin + NFT
+    // send with the coin amount exactly matching the budget should pass
+    // even though the NFT entry exists alongside.
+    const NFT_TOKEN_ID =
+      'fa11000000000000000000000000000000000000000000000000000000000001';
+    const NFT_FIXTURE: Record<string, unknown> = {
+      ...TOKEN_A,
+      genesis: {
+        ...((TOKEN_A as { genesis: Record<string, unknown> }).genesis),
+        data: {
+          ...(
+            (TOKEN_A as { genesis: { data: Record<string, unknown> } })
+              .genesis.data
+          ),
+          tokenId: NFT_TOKEN_ID,
+          coinData: [],
+        },
+      },
+    };
+    const coinSource = makeToken('tok-1', TOKEN_A);
+    const nftSource = makeToken(NFT_TOKEN_ID, NFT_FIXTURE);
+    const coinResult = makeCommitResult({
+      sourceTokenId: 'tok-1',
+      fixture: TOKEN_A,
+    });
+    const nftResult = makeCommitResult({
+      sourceTokenId: NFT_TOKEN_ID,
+      fixture: NFT_FIXTURE,
+      tokenClass: 'nft',
+    });
+    const { deps, transport } = makeDeps({
+      availableSources: () => [coinSource, nftSource],
+      selectSources: async () => [coinSource, nftSource],
+      commitSources: async () => [coinResult, nftResult],
+      // Treat the NFT source as NFT-class for the validator path.
+      toTokenLike: (t) =>
+        t.id === NFT_TOKEN_ID
+          ? { id: t.id, coins: null }
+          : { id: t.id, coins: [{ coinId: t.coinId, amount: BigInt(t.amount) }] },
+    });
+
+    // Coin budget exactly matches the coin entry; NFT entry must not
+    // trip the guard.
+    await sendInstantUxf(
+      basicRequest({ amount: '1000000' }),
+      makePeerInfo(),
+      deps,
+    );
+    expect(transport._calls).toHaveLength(1);
+  });
+});
+
+// =============================================================================
+// L5-C1/C2 — tokenIds extraction fail-closed semantics
+// =============================================================================
+//
+// The orchestrator extracts `recipientTokenJson.genesis.data.tokenId`
+// for the wire `payload.tokenIds` advertisement (Loop4 r2). Previously
+// a missing/non-string/non-hex tokenId silently fell back to
+// `sourceTokenId` — which IS the alice-local UI id, NOT the
+// recipient-visible tokenId. The fallback reintroduced the silent
+// mis-routing bug Loop4-r2 was designed to fix. L5-C1/C2 hardening:
+// throw SphereError instead, AND lowercase-normalize valid values.
+
+describe('sendInstantUxf — tokenIds extraction fail-closed (L5-C1/C2)', () => {
+  it('throws INVALID_CONFIG when recipientTokenJson.genesis.data.tokenId is missing', async () => {
+    const source = makeToken('tok-1', TOKEN_A);
+    // Construct a commit result with NO tokenId in the genesis.
+    const broken: InstantCommitResult = {
+      sourceTokenId: 'tok-1',
+      method: 'direct',
+      requestIdHex: 'req-tok-1',
+      // Recipient JSON without genesis.data.tokenId.
+      recipientTokenJson: {
+        version: '2.0',
+        genesis: { data: {} /* tokenId missing */, inclusionProof: {} },
+        state: {},
+        transactions: [],
+        nametags: [],
+      },
+      tokenClass: 'coin',
+      splitParentTokenId: 'tok-1',
+    };
+    const { deps, transport } = makeDeps({
+      availableSources: () => [source],
+      selectSources: async () => [source],
+      commitSources: async () => [broken],
+    });
+
+    let caught: unknown;
+    try {
+      await sendInstantUxf(basicRequest(), makePeerInfo(), deps);
+    } catch (err) {
+      caught = err;
+    }
+    if (!isSphereError(caught)) throw new Error('expected SphereError');
+    expect(caught.code).toBe('INVALID_CONFIG');
+    expect(caught.message).toContain('genesis.data.tokenId');
+    // No transport publish on throw — bundle never shipped.
+    expect(transport._calls).toEqual([]);
+  });
+
+  it('throws INVALID_CONFIG when tokenId is not 64-char hex (too short)', async () => {
+    const source = makeToken('tok-1', TOKEN_A);
+    const broken: InstantCommitResult = {
+      sourceTokenId: 'tok-1',
+      method: 'direct',
+      requestIdHex: 'req-tok-1',
+      recipientTokenJson: {
+        version: '2.0',
+        genesis: { data: { tokenId: 'aabb' /* 4 chars, not 64 */ }, inclusionProof: {} },
+        state: {},
+        transactions: [],
+        nametags: [],
+      },
+      tokenClass: 'coin',
+      splitParentTokenId: 'tok-1',
+    };
+    const { deps } = makeDeps({
+      availableSources: () => [source],
+      selectSources: async () => [source],
+      commitSources: async () => [broken],
+    });
+
+    let caught: unknown;
+    try {
+      await sendInstantUxf(basicRequest(), makePeerInfo(), deps);
+    } catch (err) {
+      caught = err;
+    }
+    if (!isSphereError(caught)) throw new Error('expected SphereError');
+    expect(caught.code).toBe('INVALID_CONFIG');
+  });
+
+  it('lowercase-normalizes uppercase hex tokenId in payload.tokenIds', async () => {
+    // Recipient deconstruct pool elements are lowercase. If the
+    // sender shipped uppercase, the case-sensitive Set lookup would
+    // miss → all roots advisory → recipient drops bundle.
+    //
+    // Use makeCommitResult with rewriteTokenId so the TOKEN_A
+    // fixture's valid genesis shape is preserved; only the tokenId
+    // field is rewritten to uppercase. This way pkg.ingestAll can
+    // still deconstruct the bundle while my L5-C2 normalization
+    // is exercised on the outgoing payload.tokenIds.
+    const uppercaseTokenId = 'AA' + '00'.repeat(31); // 64-char, uppercase first 2 chars
+    const source = makeToken('tok-1', TOKEN_A);
+    const result = makeCommitResult({
+      sourceTokenId: 'tok-1',
+      fixture: TOKEN_A,
+      rewriteTokenId: uppercaseTokenId,
+    });
+    const { deps, transport } = makeDeps({
+      availableSources: () => [source],
+      selectSources: async () => [source],
+      commitSources: async () => [result],
+    });
+    await sendInstantUxf(basicRequest({ amount: '1000000' }), makePeerInfo(), deps);
+
+    expect(transport._calls).toHaveLength(1);
+    const payload = transport._calls[0].payload as UxfTransferPayloadCar;
+    expect(payload.tokenIds).toEqual([uppercaseTokenId.toLowerCase()]);
   });
 });
