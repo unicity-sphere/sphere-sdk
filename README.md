@@ -159,64 +159,6 @@ sphere.setPriceProvider(createPriceProvider({
 }));
 ```
 
-## Building a Sphere-authenticated backend
-
-If your service needs to authenticate users via their Sphere wallet, use `verifySphereAuth`. It performs signature verification and identity derivation in one misuse-resistant call.
-
-```typescript
-import { randomBytes } from 'crypto';
-import { verifySphereAuth, AuthVerificationError } from '@unicitylabs/sphere-sdk';
-
-const challenges = new Map<string, { challenge: string; expiresAt: number }>();
-
-// POST /auth/challenge — issue a one-shot nonce challenge
-server.post('/auth/challenge', async (req) => {
-  const { chainPubkey } = req.body;
-  const nonce = randomBytes(16).toString('hex');
-  const challenge = `Sign in to MyApp\nPubkey: ${chainPubkey}\nNonce: ${nonce}\nIssued At: ${new Date().toISOString()}`;
-  challenges.set(chainPubkey, { challenge, expiresAt: Date.now() + 5 * 60_000 });
-  return { challenge };
-});
-
-// POST /auth/verify — turn a signed challenge into a session
-server.post('/auth/verify', async (req, reply) => {
-  const { chainPubkey, signature } = req.body;
-  const stored = challenges.get(chainPubkey);
-  if (!stored || Date.now() > stored.expiresAt) {
-    return reply.status(401).send({ error: 'No valid challenge — request a new one' });
-  }
-  challenges.delete(chainPubkey); // one-shot
-
-  try {
-    const { chainPubkey: pk, directAddress } = await verifySphereAuth({
-      challenge: stored.challenge,
-      signature,
-      chainPubkey,
-    });
-    // pk and directAddress are now safe to use as user identifiers —
-    // neither is a client claim, both are derived from cryptographic proof.
-    const token = server.jwt.sign({ sub: pk, addr: directAddress }, { expiresIn: '24h' });
-    return { token };
-  } catch (err) {
-    if (err instanceof AuthVerificationError) {
-      return reply.status(401).send({ error: err.message, code: err.code });
-    }
-    throw err;
-  }
-});
-```
-
-### Why not accept `directAddress` from the client?
-
-`verifySphereAuth` deliberately does not take a `directAddress` parameter. The signature proves that the client owns the privkey to the pubkey they presented — but it does NOT prove that the pubkey corresponds to any particular `directAddress`. If you accept `directAddress` as a separate body field and use it as the user-identifier key, an attacker can pre-bind any unregistered address to their own pubkey — locking the rightful owner out forever. `verifySphereAuth` derives `directAddress` from `chainPubkey` server-side instead, eliminating the bug class.
-
-If you need just the address derivation in a custom flow, use the primitive directly:
-
-```typescript
-import { computeDirectAddressFromChainPubkey } from '@unicitylabs/sphere-sdk';
-const addr = await computeDirectAddressFromChainPubkey(chainPubkey);
-```
-
 ## Testnet Faucet
 
 To get test tokens on testnet, you **must first register a nametag**:

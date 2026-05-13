@@ -403,22 +403,28 @@ export interface SphereInitResult {
 // L3 Predicate Address Derivation
 // =============================================================================
 
-// Import and re-export the public primitive from its standalone module so
-// callers can reach it via `core/Sphere` without a separate import path, and
-// so `deriveL3PredicateAddress` (below) can call it locally.
-import { computeDirectAddressFromChainPubkey } from './address-derivation';
-export { computeDirectAddressFromChainPubkey } from './address-derivation';
+/** Token type for Unicity network (used for L3 predicate address derivation) */
+const UNICITY_TOKEN_TYPE_HEX = 'f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe397867509';
 
 /**
- * Derive L3 predicate address (DIRECT://...) from private key.
- * Thin wrapper over `computeDirectAddressFromChainPubkey` — the private key
- * is only used to derive the public key. Kept for the wallet's internal use.
+ * Derive L3 predicate address (DIRECT://...) from private key
+ * Uses UnmaskedPredicateReference for stable wallet address
  */
 async function deriveL3PredicateAddress(privateKey: string): Promise<string> {
   const secret = Buffer.from(privateKey, 'hex');
   const signingService = await SigningService.createFromSecret(secret);
-  const pubkeyHex = Buffer.from(signingService.publicKey).toString('hex');
-  return computeDirectAddressFromChainPubkey(pubkeyHex);
+
+  const tokenTypeBytes = Buffer.from(UNICITY_TOKEN_TYPE_HEX, 'hex');
+  const tokenType = new TokenType(tokenTypeBytes);
+
+  const predicateRef = UnmaskedPredicateReference.create(
+    tokenType,
+    signingService.algorithm,
+    signingService.publicKey,
+    HashAlgorithm.SHA256
+  );
+
+  return (await (await predicateRef).toAddress()).toString();
 }
 
 // =============================================================================

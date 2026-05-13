@@ -564,5 +564,44 @@ export function verifySignedMessage(
   }
 }
 
+/**
+ * Recover the compressed secp256k1 public key from a signed message.
+ *
+ * Use this when the server needs to identify the signer (not just verify
+ * a signature against a known pubkey). Combined with `sphere.resolve(pubkey)`
+ * it gives a fully cryptographically-attributable identity for backend auth,
+ * without trusting any client-supplied identifier claim.
+ *
+ * @param message    - The plaintext that was signed
+ * @param signature  - 130-char hex (v + r + s) as produced by `signMessage`
+ * @returns          - Compressed 66-char hex pubkey
+ * @throws           - On malformed signature length or out-of-range recovery byte
+ */
+export function recoverPubkeyFromSignature(message: string, signature: string): string {
+  if (signature.length !== 130) {
+    throw new SphereError(
+      `Invalid signature length: expected 130 hex chars, got ${signature.length}`,
+      'SIGNING_ERROR',
+    );
+  }
+
+  const v = parseInt(signature.slice(0, 2), 16) - 31;
+  const r = signature.slice(2, 66);
+  const s = signature.slice(66, 130);
+
+  if (v < 0 || v > 3) {
+    throw new SphereError(
+      `Invalid recovery byte: v=${v} out of range [0..3]`,
+      'SIGNING_ERROR',
+    );
+  }
+
+  const hashHex = hashSignMessage(message);
+  const hashBytes = Buffer.from(hashHex, 'hex');
+
+  const recovered = ec.recoverPubKey(hashBytes, { r, s }, v);
+  return recovered.encode('hex', true);
+}
+
 // Re-export elliptic instance for advanced use cases
 export { ec };

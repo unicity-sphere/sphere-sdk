@@ -4,6 +4,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { ec as EC } from 'elliptic';
 import {
   generateMnemonic,
   validateMnemonic,
@@ -32,6 +33,7 @@ import {
   hashSignMessage,
   signMessage,
   verifySignedMessage,
+  recoverPubkeyFromSignature,
 } from '../../../core/crypto';
 
 import {
@@ -628,5 +630,47 @@ describe('Message Signing', () => {
       expect(verifySignedMessage(TEST_MESSAGE, sig2, pub2)).toBe(true);
       expect(verifySignedMessage(TEST_MESSAGE, sig2, pub1)).toBe(false);
     });
+  });
+});
+
+// =============================================================================
+// recoverPubkeyFromSignature Tests
+// =============================================================================
+
+describe('recoverPubkeyFromSignature', () => {
+  const ec = new EC('secp256k1');
+  const PRIVKEY_HEX = '0000000000000000000000000000000000000000000000000000000000000001';
+
+  function pubkeyFor(privkeyHex: string): string {
+    return ec.keyFromPrivate(privkeyHex, 'hex').getPublic().encode('hex', true);
+  }
+
+  it('returns compressed pubkey of the signer', () => {
+    const message = 'hello sphere';
+    const signature = signMessage(PRIVKEY_HEX, message);
+    expect(recoverPubkeyFromSignature(message, signature)).toBe(pubkeyFor(PRIVKEY_HEX));
+  });
+
+  it('is deterministic', () => {
+    const message = 'replay-safe';
+    const signature = signMessage(PRIVKEY_HEX, message);
+    expect(recoverPubkeyFromSignature(message, signature))
+      .toBe(recoverPubkeyFromSignature(message, signature));
+  });
+
+  it('different privkeys → different recovered pubkeys', () => {
+    const message = 'identity test';
+    const other = '0000000000000000000000000000000000000000000000000000000000000002';
+    expect(recoverPubkeyFromSignature(message, signMessage(PRIVKEY_HEX, message)))
+      .not.toBe(recoverPubkeyFromSignature(message, signMessage(other, message)));
+  });
+
+  it('throws on wrong-length signature', () => {
+    expect(() => recoverPubkeyFromSignature('msg', '1234')).toThrow(/signature|length/i);
+  });
+
+  it('throws on bad recovery byte', () => {
+    const bogus = '50' + '00'.repeat(64);
+    expect(() => recoverPubkeyFromSignature('msg', bogus)).toThrow(/recovery|range/i);
   });
 });

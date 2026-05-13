@@ -49,7 +49,7 @@
 // =============================================================================
 
 export { Sphere, createSphere, loadSphere, initSphere, getSphere, sphereExists, checkNetworkHealth, logger, SphereError, isSphereError } from './core';
-export { signMessage, verifySignedMessage, hashSignMessage, SIGN_MESSAGE_PREFIX } from './core/crypto';
+export { signMessage, verifySignedMessage, hashSignMessage, recoverPubkeyFromSignature, SIGN_MESSAGE_PREFIX } from './core/crypto';
 export type {
   SphereCreateOptions,
   SphereLoadOptions,
@@ -491,9 +491,6 @@ export type {
 
 // Address parsing
 export { parseAddress, isValidAddress, isValidDirectAddress, normalizeAddress, addressesMatch } from './core/address';
-export { computeDirectAddressFromChainPubkey } from './core/address-derivation';
-export { verifySphereAuth, AuthVerificationError } from './core/auth';
-export type { SphereAuthInput, SphereAuthResult, AuthVerificationErrorCode } from './core/auth';
 export type { AddressType, ParsedAddress } from './core/address';
 
 // =============================================================================
