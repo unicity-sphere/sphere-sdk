@@ -794,7 +794,18 @@ export async function sendConservativeUxf(
     // identifies the recipient + bundleCid + token list before any
     // transport / IPFS work so a crash here leaves a forensic record.
     // -----------------------------------------------------------------
-    const tokenIds = orderedResults.map((r) => r.sourceTokenId);
+    // Loop4-e2e (round 2): advertise the RECIPIENT'S tokenIds, not the
+    // sender's source tokenIds. See instant-sender.ts for the full
+    // rationale — split transfers produce a new recipient tokenId,
+    // and advertising the burned source's id mis-routes the bundle's
+    // disposition (Bob gets nothing).
+    const tokenIds = orderedResults.map((r): string => {
+      const j = r.recipientTokenJson as {
+        readonly genesis?: { readonly data?: { readonly tokenId?: unknown } };
+      } | null | undefined;
+      const tid = j?.genesis?.data?.tokenId;
+      return typeof tid === 'string' && tid.length > 0 ? tid : r.sourceTokenId;
+    });
 
     // Decide the delivery method up-front using the SAME predicate as
     // resolveDelivery's CID-branch decision (`wantsCidBranch` above).

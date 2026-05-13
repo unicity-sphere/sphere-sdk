@@ -957,7 +957,34 @@ export async function sendInstantUxf(
     // Pre-compute the outstanding requestIds set so the outbox writer
     // sees the same value across every persistence step.
     const outstandingRequestIds = collectOutstandingRequestIds(orderedResults);
-    const tokenIds = orderedResults.map((r) => r.sourceTokenId);
+    // Loop4-e2e (round 2): advertise the RECIPIENT'S tokenIds, not the
+    // sender's source tokenIds. For direct (whole-token) transfers the
+    // two coincide (the source token is the recipient token). For
+    // SPLIT transfers, the recipient gets a freshly-minted token with
+    // a NEW tokenId; if we advertise the burned source's id, the
+    // recipient's bundle verifier sees that id missing from the bundle
+    // and the new mint's id as an unclaimed (advisory) root → the
+    // disposition engine treats it as informational-only and never
+    // saves it to the recipient's wallet. Bob receives "no transfers"
+    // even though the bundle contained his token.
+    //
+    // Fix: walk each `recipientTokenJson` and extract its
+    // `genesis.data.tokenId`. That IS the tokenId Bob's chain-walker
+    // will encounter when it deconstructs the bundle.
+    const tokenIds = orderedResults.map((r): string => {
+      const j = r.recipientTokenJson as {
+        readonly genesis?: { readonly data?: { readonly tokenId?: unknown } };
+      } | null | undefined;
+      const tid = j?.genesis?.data?.tokenId;
+      if (typeof tid !== 'string' || tid.length === 0) {
+        // Falls back to sourceTokenId so the orchestrator does NOT
+        // throw on a misshapen commit result — the bundle verifier
+        // will surface the structural break with a clearer error
+        // downstream. Production wiring always populates the field.
+        return r.sourceTokenId;
+      }
+      return tid;
+    });
 
     // -----------------------------------------------------------------
     // Step 8: resolve delivery (T.2.C).

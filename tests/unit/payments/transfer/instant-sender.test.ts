@@ -324,7 +324,12 @@ describe('sendInstantUxf — 1-token happy path', () => {
     const payload = transport._calls[0].payload as UxfTransferPayloadCar;
     expect(payload.mode).toBe('instant');
     expect(payload.kind).toBe('uxf-car');
-    expect(payload.tokenIds).toEqual(['tok-1']);
+    // Loop4-e2e (round 2) — payload.tokenIds is the recipient genesis
+    // tokenId (extracted from recipientTokenJson.genesis.data.tokenId),
+    // NOT the sender-side sourceTokenId.
+    expect(payload.tokenIds).toEqual([
+      'aa00000000000000000000000000000000000000000000000000000000000001',
+    ]);
 
     // Event: transfer:submitted (NOT transfer:confirmed).
     const submitted = events.filter((e) => e.type === 'transfer:submitted');
