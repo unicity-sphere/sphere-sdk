@@ -163,7 +163,7 @@ export interface ConservativeCommitResult {
  * before {@link UxfPackage.ingestAll}.
  */
 /**
- * #142 contract widening — source selection carries `splitSource`
+ * #142/#149 contract widening — source selection carries `splitSources`
  * intent. Mirrors {@link
  * import('./instant-sender').InstantSourceSelection} for the
  * conservative path. The split executor differs
@@ -172,18 +172,25 @@ export interface ConservativeCommitResult {
  */
 export interface ConservativeSourceSelection {
   readonly directSources: ReadonlyArray<Token>;
-  readonly splitSource?: {
+  /**
+   * Zero or more sources to split. See {@link
+   * import('./instant-sender').InstantSourceSelection.splitSources}
+   * for the full invariants (distinct coinIdHex, distinct token.id,
+   * disjoint from directSources, splitAmount + remainderAmount =
+   * coin balance).
+   */
+  readonly splitSources?: ReadonlyArray<{
     readonly token: Token;
     readonly splitAmount: bigint;
     readonly remainderAmount: bigint;
     readonly coinIdHex: string;
-  };
+  }>;
 }
 
 export type CommitSourcesFn = (params: {
   readonly sources: ReadonlyArray<Token>;
-  /** #142 — split intent. See InstantCommitSourcesFn for rationale. */
-  readonly splitSource?: ConservativeSourceSelection['splitSource'];
+  /** #142/#149 — split intents. See InstantCommitSourcesFn for rationale. */
+  readonly splitSources?: ConservativeSourceSelection['splitSources'];
   readonly recipient: PeerInfo;
   readonly memo: string | undefined;
 }) => Promise<ReadonlyArray<ConservativeCommitResult>>;
@@ -644,17 +651,47 @@ export async function sendConservativeUxf(
       available,
     });
 
-    // #142 contract widening — normalize legacy array-shape into the
-    // structured {directSources, splitSource} form for partial-amount
-    // sends. Backwards-compatible with existing array callers.
+    // #142/#149 contract widening — normalize legacy array-shape into
+    // the structured {directSources, splitSources} form.
+    // Backwards-compatible with existing array callers.
     const normalizedSelection: ConservativeSourceSelection = Array.isArray(selectedRaw)
-      ? { directSources: selectedRaw as ReadonlyArray<Token>, splitSource: undefined }
+      ? { directSources: selectedRaw as ReadonlyArray<Token>, splitSources: [] }
       : (selectedRaw as ConservativeSourceSelection);
+    const splitSources = normalizedSelection.splitSources ?? [];
+
+    // #149 defense-in-depth — same invariants as sendInstantUxf above.
+    // See instant-sender.ts for the full rationale.
+    const seenSplitCoinIds = new Set<string>();
+    const seenSplitTokenIds = new Set<string>();
+    for (const entry of splitSources) {
+      if (seenSplitCoinIds.has(entry.coinIdHex)) {
+        throw new SphereError(
+          `sendConservativeUxf: splitSources contains duplicate coinIdHex=${entry.coinIdHex.slice(0, 32)}; ` +
+            'multi-asset planner must produce at most one split entry per coin class',
+          'INVALID_CONFIG',
+        );
+      }
+      seenSplitCoinIds.add(entry.coinIdHex);
+      if (seenSplitTokenIds.has(entry.token.id)) {
+        throw new SphereError(
+          `sendConservativeUxf: splitSources contains duplicate token.id=${entry.token.id} (planner bug)`,
+          'INVALID_CONFIG',
+        );
+      }
+      seenSplitTokenIds.add(entry.token.id);
+    }
+    for (const direct of normalizedSelection.directSources) {
+      if (seenSplitTokenIds.has(direct.id)) {
+        throw new SphereError(
+          `sendConservativeUxf: token.id=${direct.id} appears in BOTH directSources and splitSources (planner bug)`,
+          'INVALID_CONFIG',
+        );
+      }
+    }
+
     const selected: ReadonlyArray<Token> = [
       ...normalizedSelection.directSources,
-      ...(normalizedSelection.splitSource
-        ? [normalizedSelection.splitSource.token]
-        : []),
+      ...splitSources.map((s) => s.token),
     ];
 
     if (selected.length === 0) {
@@ -680,12 +717,13 @@ export async function sendConservativeUxf(
 
     // -----------------------------------------------------------------
     // Step 4: commitments + proofs (caller-supplied; wraps SDK).
-    // #142: forward `splitSource` so commitSources can drive the
-    // appropriate split executor for partial-amount sends.
+    // #142/#149: forward `splitSources` so commitSources can drive the
+    // appropriate split executor — one invocation per entry for
+    // multi-coin partial-amount sends.
     // -----------------------------------------------------------------
     const commitResults = await deps.commitSources({
       sources: selected,
-      splitSource: normalizedSelection.splitSource,
+      splitSources,
       recipient,
       memo: request.memo,
     });

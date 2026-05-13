@@ -145,42 +145,56 @@ export interface InstantCommitResult {
 }
 
 /**
- * #142 contract widening — source selection carries `splitSource` intent
- * so the partial-amount-send case can drive
- * `InstantSplitExecutor.buildSplitBundle` instead of silently
- * transferring the whole source token. Backwards-compatible with the
- * legacy `Promise<ReadonlyArray<Token>>` shape: callers that don't need
- * to split a source return the array directly; new partial-amount
- * callers return this structured form.
+ * #142 contract widening — source selection carries `splitSources`
+ * intent so partial-amount sends drive `InstantSplitExecutor.buildSplitBundle`
+ * instead of silently transferring the whole source token. Backwards-
+ * compatible with the legacy `Promise<ReadonlyArray<Token>>` shape:
+ * callers that don't need to split a source return the array directly;
+ * new partial-amount callers return this structured form.
+ *
+ * #149 multi-asset widening — `splitSources` is an array so multi-coin
+ * sends where N coins each need their own split can drive N independent
+ * `buildSplitBundle` invocations (one per source). Each entry carries
+ * its own `coinIdHex` because the split executor mints recipient + change
+ * tokens for a specific coin class.
  *
  * Invariant: every token in the selection appears in EITHER
- * `directSources` (transferred as-is) XOR `splitSource.token` (burnt
- * and re-minted into recipient + change). The orchestrator computes the
- * union as the source-lock set.
+ * `directSources` (transferred as-is) XOR exactly one entry in
+ * `splitSources` (burnt and re-minted into recipient + change). All
+ * `splitSources[i].token.id` MUST be distinct from each other and from
+ * `directSources`. The orchestrator computes the union as the source-
+ * lock set.
  */
 export interface InstantSourceSelection {
   /** Sources transferred as whole tokens (the legacy `direct` method). */
   readonly directSources: ReadonlyArray<Token>;
   /**
-   * Optional source to split. When present, the orchestrator passes
-   * `splitSource` to {@link InstantCommitSourcesFn} which MUST drive
+   * Zero or more sources to split. When non-empty, the orchestrator
+   * forwards each entry to {@link InstantCommitSourcesFn} via
+   * `splitSources` (the param name); each entry MUST drive its own
    * `InstantSplitExecutor.buildSplitBundle(token, splitAmount,
-   * remainderAmount, coinIdHex, ...)`. Producing the recipient mint
-   * (sent in the bundle) and the change mint (kept locally).
+   * remainderAmount, coinIdHex, ...)` call. Each invocation produces
+   * a recipient mint (shipped in the bundle) and a change mint (kept
+   * locally).
    *
-   * `splitAmount + remainderAmount` MUST equal the token's coin balance
-   * for `coinIdHex`. `splitAmount` is what the recipient receives;
-   * `remainderAmount` is the sender's change.
+   * Per-entry invariants:
+   *   - `splitAmount + remainderAmount` MUST equal the token's coin
+   *     balance for `coinIdHex`.
+   *   - `splitAmount` is what the recipient receives; `remainderAmount`
+   *     is the sender's change.
+   *   - `coinIdHex` MUST be unique across entries (one split per coin
+   *     class — primary coin + each additional-asset coin).
    *
-   * Only ONE source can be split per send (the legacy partial-amount
-   * model). Multi-source splits require future contract revisions.
+   * Multiple entries enable #149: multi-coin partial-amount sends
+   * (e.g., send 200 USDU + 100 USDC where each coin holding requires
+   * splitting). NFTs are whole-token by definition and never appear here.
    */
-  readonly splitSource?: {
+  readonly splitSources?: ReadonlyArray<{
     readonly token: Token;
     readonly splitAmount: bigint;
     readonly remainderAmount: bigint;
     readonly coinIdHex: string;
-  };
+  }>;
 }
 
 /**
@@ -199,17 +213,22 @@ export interface InstantSourceSelection {
  * (commit submission rejected) or any aggregator-side rejection per
  * §6.1's error model.
  *
- * #142 widening: `splitSource` carries the split intent through to
+ * #142 widening: `splitSources` carries split intents through to
  * `commitSources`. Implementations that ignore it silently fall back
- * to whole-token transfer of `splitSource.token` (the pre-fix bug).
+ * to whole-token transfer of each split source (the pre-fix bug).
+ *
+ * #149 multi-asset widening: `splitSources` is an array. Implementations
+ * MUST iterate it and run one `buildSplitBundle` per entry. Each entry's
+ * `token.id` also appears in `sources` so the legacy whole-token path
+ * MUST skip those ids (lookup by `token.id` set).
  */
 export type InstantCommitSourcesFn = (params: {
   readonly sources: ReadonlyArray<Token>;
-  /** #142 — split intent. When set, `splitSource.token` is also in
-   *  `sources` AND must be split-minted rather than whole-transferred.
-   *  Legacy callsites pass `undefined` and the orchestrator treats
-   *  every source in `sources` as whole-token. */
-  readonly splitSource?: InstantSourceSelection['splitSource'];
+  /** #142/#149 — split intents. Each entry's `token` is also in `sources`
+   *  AND MUST be split-minted rather than whole-transferred. Legacy
+   *  callsites pass `undefined` (or an empty array) and the orchestrator
+   *  treats every source in `sources` as whole-token. */
+  readonly splitSources?: InstantSourceSelection['splitSources'];
   readonly recipient: PeerInfo;
   readonly memo: string | undefined;
 }) => Promise<ReadonlyArray<InstantCommitResult>>;
@@ -225,10 +244,10 @@ export type InstantCommitSourcesFn = (params: {
  * `cascade-risk-warning` event on publish to flag the recipient-side
  * cascade exposure.
  *
- * #142 widening: callers may return EITHER the legacy
+ * #142/#149 widening: callers may return EITHER the legacy
  * `ReadonlyArray<Token>` (all whole-token) OR an {@link InstantSourceSelection}
- * with a structured `splitSource` for partial-amount sends. The
- * orchestrator normalizes both shapes internally.
+ * with a structured `splitSources` array for multi-coin partial-amount
+ * sends. The orchestrator normalizes both shapes internally.
  */
 export type InstantSelectSourcesFn = (params: {
   readonly request: TransferRequest;
@@ -822,18 +841,55 @@ export async function sendInstantUxf(
       available,
     });
 
-    // #142 contract widening — normalize legacy array-shape into the
-    // structured {directSources, splitSource} form. Existing tests/
-    // callers that return plain Token[] continue to work; new partial-
-    // amount callers return the structured form to trigger split.
+    // #142 / #149 contract widening — normalize legacy array-shape into
+    // the structured {directSources, splitSources} form. Existing
+    // tests/callers that return plain Token[] continue to work; new
+    // partial-amount callers return the structured form (singular
+    // splitSource is gone; pass [splitEntry] as splitSources).
     const normalizedSelection: InstantSourceSelection = Array.isArray(selectedRaw)
-      ? { directSources: selectedRaw as ReadonlyArray<Token>, splitSource: undefined }
+      ? { directSources: selectedRaw as ReadonlyArray<Token>, splitSources: [] }
       : (selectedRaw as InstantSourceSelection);
+    const splitSources = normalizedSelection.splitSources ?? [];
+
+    // Loop-149 defense-in-depth — fail-closed on:
+    //   (a) duplicate split coinIdHex (would silently over-mint into the
+    //       same coin class twice — the recipient bundle would still
+    //       satisfy OVER_TRANSFER_GUARD if each amount alone fit, but
+    //       the planner can never legitimately produce this).
+    //   (b) duplicate split token.id across splitSources (a planner bug
+    //       that re-selected the same source twice).
+    //   (c) overlap between split token.id and directSources (same).
+    const seenSplitCoinIds = new Set<string>();
+    const seenSplitTokenIds = new Set<string>();
+    for (const entry of splitSources) {
+      if (seenSplitCoinIds.has(entry.coinIdHex)) {
+        throw new SphereError(
+          `sendInstantUxf: splitSources contains duplicate coinIdHex=${entry.coinIdHex.slice(0, 32)}; ` +
+            'multi-asset planner must produce at most one split entry per coin class',
+          'INVALID_CONFIG',
+        );
+      }
+      seenSplitCoinIds.add(entry.coinIdHex);
+      if (seenSplitTokenIds.has(entry.token.id)) {
+        throw new SphereError(
+          `sendInstantUxf: splitSources contains duplicate token.id=${entry.token.id} (planner bug)`,
+          'INVALID_CONFIG',
+        );
+      }
+      seenSplitTokenIds.add(entry.token.id);
+    }
+    for (const direct of normalizedSelection.directSources) {
+      if (seenSplitTokenIds.has(direct.id)) {
+        throw new SphereError(
+          `sendInstantUxf: token.id=${direct.id} appears in BOTH directSources and splitSources (planner bug)`,
+          'INVALID_CONFIG',
+        );
+      }
+    }
+
     const selected: ReadonlyArray<Token> = [
       ...normalizedSelection.directSources,
-      ...(normalizedSelection.splitSource
-        ? [normalizedSelection.splitSource.token]
-        : []),
+      ...splitSources.map((s) => s.token),
     ];
 
     if (selected.length === 0) {
@@ -866,12 +922,13 @@ export async function sendInstantUxf(
     // -----------------------------------------------------------------
     // Step 4: commit + DO NOT await proofs. The callback returns the
     // recipient-shape JSON with `inclusionProof: null` on the new tx.
-    // #142: `splitSource` (if any) drives `InstantSplitExecutor` in the
-    // production wiring; the orchestrator only forwards the metadata.
+    // #142/#149: `splitSources` (if any) drive `InstantSplitExecutor`
+    // in the production wiring — one split per entry; the orchestrator
+    // only forwards the metadata.
     // -----------------------------------------------------------------
     const commitResults = await deps.commitSources({
       sources: selected,
-      splitSource: normalizedSelection.splitSource,
+      splitSources,
       recipient,
       memo: request.memo,
     });

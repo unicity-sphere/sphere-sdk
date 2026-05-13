@@ -261,3 +261,467 @@ describe('§11.2 — additionalAssets happy path (single multi-coin source)', ()
     expect(events.count('transfer:failed')).toBe(1);
   });
 });
+
+// =============================================================================
+// #149 — multi-coin splitSources (one split per coin class)
+// =============================================================================
+//
+// Spec scenario (#149): Alice holds a single 1000-USDU token + a single
+// 1000-USDC token. She sends `200 USDU + 100 USDC`. Both source holdings
+// require partial-amount splitting (each coin has exactly one source
+// token bigger than the requested amount).
+//
+// Pre-fix: the conservative dispatcher's `selectSources` ran one
+// SpendPlanner.planSend per coin, but `ConservativeSourceSelection`
+// only supported a single `splitSource`. The additional-asset
+// `tokenToSplit` fell through to `directSources` → whole-token transfer
+// → OVER_TRANSFER_GUARD throws.
+//
+// Post-fix: `splitSources` is an array. The dispatcher's
+// `commitSources` iterates the array and runs one `TokenSplitExecutor.
+// executeSplit` per entry. Each entry's `coinIdHex` drives the change
+// token's coin class (not `request.coinId` for additional entries).
+
+describe('#149 — multi-coin splitSources (conservative orchestrator)', () => {
+  it('forwards multi-entry splitSources from selectSources to commitSources', async () => {
+    const srcUsduIdHex = `cc${'1'.padStart(2, '0')}${'0'.repeat(60)}`;
+    const srcUsdcIdHex = `cc${'2'.padStart(2, '0')}${'0'.repeat(60)}`;
+    const srcUsdu = makeToken({
+      id: srcUsduIdHex,
+      fixture: rewriteFixtureTokenId(TOKEN_A, srcUsduIdHex),
+    });
+    const srcUsdc = makeToken({
+      id: srcUsdcIdHex,
+      fixture: rewriteFixtureTokenId(TOKEN_A, srcUsdcIdHex),
+    });
+
+    // USDU = 1000 in srcUsdu; USDC = 1000 in srcUsdc.
+    const projection = (token: Token): TokenLike => {
+      if (token.id === srcUsdu.id) {
+        return { id: token.id, coins: [{ coinId: 'USDU', amount: 1000n }] };
+      }
+      return { id: token.id, coins: [{ coinId: 'USDC', amount: 1000n }] };
+    };
+
+    // Recipient gets a fresh child per split — USDU 200 + USDC 100.
+    // Use fixtures with the requested per-coin coinData so the
+    // OVER_TRANSFER_GUARD's per-coin sum lands at the budget.
+    const childUsdu = rewriteFixtureTokenId(
+      {
+        ...TOKEN_A,
+        genesis: {
+          ...TOKEN_A.genesis,
+          data: { ...TOKEN_A.genesis.data, coinData: [['USDU', '200']] },
+        },
+      } as typeof TOKEN_A,
+      `dd${'1'.padStart(2, '0')}${'0'.repeat(60)}`,
+    );
+    const childUsdc = rewriteFixtureTokenId(
+      {
+        ...TOKEN_A,
+        genesis: {
+          ...TOKEN_A.genesis,
+          data: { ...TOKEN_A.genesis.data, coinData: [['USDC', '100']] },
+        },
+      } as typeof TOKEN_A,
+      `dd${'2'.padStart(2, '0')}${'0'.repeat(60)}`,
+    );
+
+    let observedSplitSources: ReadonlyArray<{
+      readonly token: Token;
+      readonly splitAmount: bigint;
+      readonly remainderAmount: bigint;
+      readonly coinIdHex: string;
+    }> | undefined = undefined;
+
+    const commitResults: ConservativeCommitResult[] = [
+      {
+        sourceTokenId: srcUsdu.id,
+        method: 'split',
+        requestIdHex: `req-${srcUsdu.id}`,
+        recipientTokenJson: childUsdu,
+      },
+      {
+        sourceTokenId: srcUsdc.id,
+        method: 'split',
+        requestIdHex: `req-${srcUsdc.id}`,
+        recipientTokenJson: childUsdc,
+      },
+    ];
+
+    const transport = makeRecordingTransport();
+    const events = makeEventRecorder();
+    const deps: ConservativeSenderDeps = {
+      aggregator: makeOracleStub(),
+      transport,
+      identity: makeIdentity(),
+      senderTransportPubkey: BOB_TRANSPORT_PUBKEY,
+      emit: events.emit,
+      availableSources: () => [srcUsdu, srcUsdc],
+      selectSources: async () => ({
+        directSources: [],
+        splitSources: [
+          {
+            token: srcUsdu,
+            splitAmount: 200n,
+            remainderAmount: 800n,
+            coinIdHex: 'USDU',
+          },
+          {
+            token: srcUsdc,
+            splitAmount: 100n,
+            remainderAmount: 900n,
+            coinIdHex: 'USDC',
+          },
+        ],
+      }),
+      preflightOptions: () => ({
+        resolveRequestId: () => {
+          throw new Error('not invoked');
+        },
+        extractPendingChain: () => [],
+      } satisfies Omit<PreflightFinalizeOptions, 'aggregator'>),
+      commitSources: async ({ splitSources }) => {
+        observedSplitSources = splitSources;
+        return commitResults;
+      },
+      toTokenLike: projection,
+    };
+
+    const request: TransferRequest = {
+      recipient: '@bob',
+      coinId: 'USDU',
+      amount: '200',
+      additionalAssets: [{ kind: 'coin', coinId: 'USDC', amount: '100' }],
+      transferMode: 'conservative',
+      delivery: { kind: 'force-inline' },
+    };
+
+    const result = await sendConservativeUxf(request, makePeerInfo(), deps);
+    expect(result.status).toBe('completed');
+
+    // Forwarding invariant — both splits land in commitSources.
+    expect(observedSplitSources).toBeDefined();
+    expect(observedSplitSources).toHaveLength(2);
+    expect(observedSplitSources![0].coinIdHex).toBe('USDU');
+    expect(observedSplitSources![0].splitAmount).toBe(200n);
+    expect(observedSplitSources![0].remainderAmount).toBe(800n);
+    expect(observedSplitSources![1].coinIdHex).toBe('USDC');
+    expect(observedSplitSources![1].splitAmount).toBe(100n);
+    expect(observedSplitSources![1].remainderAmount).toBe(900n);
+
+    // OVER_TRANSFER_GUARD did not fire — both children fit their per-
+    // coin budgets exactly.
+    expect(events.count('transfer:confirmed')).toBe(1);
+    expect(result.tokenTransfers).toHaveLength(2);
+  });
+
+  it('rejects duplicate split coinIdHex (planner bug — INVALID_CONFIG)', async () => {
+    const src1 = makeToken({
+      id: `aa${'9'.padStart(2, '0')}${'0'.repeat(60)}`,
+      fixture: rewriteFixtureTokenId(
+        TOKEN_A,
+        `aa${'9'.padStart(2, '0')}${'0'.repeat(60)}`,
+      ),
+    });
+    const src2 = makeToken({
+      id: `bb${'9'.padStart(2, '0')}${'0'.repeat(60)}`,
+      fixture: rewriteFixtureTokenId(
+        TOKEN_A,
+        `bb${'9'.padStart(2, '0')}${'0'.repeat(60)}`,
+      ),
+    });
+
+    const projection = (token: Token): TokenLike => ({
+      id: token.id,
+      coins: [{ coinId: 'USDU', amount: 1000n }],
+    });
+
+    const transport = makeRecordingTransport();
+    const events = makeEventRecorder();
+    const deps: ConservativeSenderDeps = {
+      aggregator: makeOracleStub(),
+      transport,
+      identity: makeIdentity(),
+      senderTransportPubkey: BOB_TRANSPORT_PUBKEY,
+      emit: events.emit,
+      availableSources: () => [src1, src2],
+      selectSources: async () => ({
+        directSources: [],
+        // Two split entries claiming the same coinIdHex — a planner
+        // bug the orchestrator should fail-closed on.
+        splitSources: [
+          {
+            token: src1,
+            splitAmount: 100n,
+            remainderAmount: 900n,
+            coinIdHex: 'USDU',
+          },
+          {
+            token: src2,
+            splitAmount: 200n,
+            remainderAmount: 800n,
+            coinIdHex: 'USDU',
+          },
+        ],
+      }),
+      preflightOptions: () => ({
+        resolveRequestId: () => {
+          throw new Error('not invoked');
+        },
+        extractPendingChain: () => [],
+      } satisfies Omit<PreflightFinalizeOptions, 'aggregator'>),
+      commitSources: async () => {
+        throw new Error('commitSources must not be reached for duplicate coinId');
+      },
+      toTokenLike: projection,
+    };
+
+    const request: TransferRequest = {
+      recipient: '@bob',
+      coinId: 'USDU',
+      amount: '100',
+      transferMode: 'conservative',
+      delivery: { kind: 'force-inline' },
+    };
+
+    let caughtCode: string | undefined;
+    try {
+      await sendConservativeUxf(request, makePeerInfo(), deps);
+    } catch (err) {
+      caughtCode = (err as { code?: string }).code;
+    }
+    expect(caughtCode).toBe('INVALID_CONFIG');
+    expect(transport._calls).toHaveLength(0);
+    expect(events.count('transfer:failed')).toBe(1);
+  });
+
+  it('rejects splitSources token overlapping directSources (planner bug — INVALID_CONFIG)', async () => {
+    const shared = makeToken({
+      id: `dd${'9'.padStart(2, '0')}${'0'.repeat(60)}`,
+      fixture: rewriteFixtureTokenId(
+        TOKEN_A,
+        `dd${'9'.padStart(2, '0')}${'0'.repeat(60)}`,
+      ),
+    });
+    const projection = (token: Token): TokenLike => ({
+      id: token.id,
+      coins: [{ coinId: 'USDU', amount: 1000n }],
+    });
+
+    const transport = makeRecordingTransport();
+    const events = makeEventRecorder();
+    const deps: ConservativeSenderDeps = {
+      aggregator: makeOracleStub(),
+      transport,
+      identity: makeIdentity(),
+      senderTransportPubkey: BOB_TRANSPORT_PUBKEY,
+      emit: events.emit,
+      availableSources: () => [shared],
+      selectSources: async () => ({
+        // Same token in BOTH directSources and splitSources — a
+        // planner bug the orchestrator should fail-closed on (the
+        // source would be both whole-token-transferred AND split-
+        // minted, double-spending on-chain).
+        directSources: [shared],
+        splitSources: [
+          {
+            token: shared,
+            splitAmount: 100n,
+            remainderAmount: 900n,
+            coinIdHex: 'USDU',
+          },
+        ],
+      }),
+      preflightOptions: () => ({
+        resolveRequestId: () => {
+          throw new Error('not invoked');
+        },
+        extractPendingChain: () => [],
+      } satisfies Omit<PreflightFinalizeOptions, 'aggregator'>),
+      commitSources: async () => {
+        throw new Error('commitSources must not be reached for overlap');
+      },
+      toTokenLike: projection,
+    };
+
+    const request: TransferRequest = {
+      recipient: '@bob',
+      coinId: 'USDU',
+      amount: '100',
+      transferMode: 'conservative',
+      delivery: { kind: 'force-inline' },
+    };
+
+    let caughtCode: string | undefined;
+    try {
+      await sendConservativeUxf(request, makePeerInfo(), deps);
+    } catch (err) {
+      caughtCode = (err as { code?: string }).code;
+    }
+    expect(caughtCode).toBe('INVALID_CONFIG');
+    expect(transport._calls).toHaveLength(0);
+  });
+
+  it('mixed directSources + splitSources: 3-coin send (2 split + 1 direct) ships all three', async () => {
+    // Spec scenario from #149 acceptance: "3-coin send where 2 of 3
+    // need splitting → bundle contains 2 split-mints + 1 direct,
+    // recipient receives all 3." Coin A and Coin B require splitting
+    // (sources are bigger than requested); Coin C is fully consumed
+    // by a whole-token direct transfer.
+    const srcAIdHex = `aa${'a'.padStart(2, 'a')}${'0'.repeat(60)}`;
+    const srcBIdHex = `bb${'a'.padStart(2, 'a')}${'0'.repeat(60)}`;
+    const srcCIdHex = `cc${'a'.padStart(2, 'a')}${'0'.repeat(60)}`;
+    const srcA = makeToken({
+      id: srcAIdHex,
+      fixture: rewriteFixtureTokenId(TOKEN_A, srcAIdHex),
+    });
+    const srcB = makeToken({
+      id: srcBIdHex,
+      fixture: rewriteFixtureTokenId(TOKEN_A, srcBIdHex),
+    });
+    const srcC = makeToken({
+      id: srcCIdHex,
+      fixture: rewriteFixtureTokenId(TOKEN_A, srcCIdHex),
+    });
+
+    const projection = (token: Token): TokenLike => {
+      if (token.id === srcA.id) {
+        return { id: token.id, coins: [{ coinId: 'COINA', amount: 1000n }] };
+      }
+      if (token.id === srcB.id) {
+        return { id: token.id, coins: [{ coinId: 'COINB', amount: 1000n }] };
+      }
+      return { id: token.id, coins: [{ coinId: 'COINC', amount: 100n }] };
+    };
+
+    // Recipient gets fresh tokens for the splits (200 COINA, 300 COINB)
+    // and the whole COINC source.
+    const childA = rewriteFixtureTokenId(
+      {
+        ...TOKEN_A,
+        genesis: {
+          ...TOKEN_A.genesis,
+          data: { ...TOKEN_A.genesis.data, coinData: [['COINA', '200']] },
+        },
+      } as typeof TOKEN_A,
+      `dd${'a'.padStart(2, 'a')}${'0'.repeat(60)}`,
+    );
+    const childB = rewriteFixtureTokenId(
+      {
+        ...TOKEN_A,
+        genesis: {
+          ...TOKEN_A.genesis,
+          data: { ...TOKEN_A.genesis.data, coinData: [['COINB', '300']] },
+        },
+      } as typeof TOKEN_A,
+      `dd${'b'.padStart(2, 'b')}${'0'.repeat(60)}`,
+    );
+    const childC = rewriteFixtureTokenId(
+      {
+        ...TOKEN_A,
+        genesis: {
+          ...TOKEN_A.genesis,
+          data: { ...TOKEN_A.genesis.data, coinData: [['COINC', '100']] },
+        },
+      } as typeof TOKEN_A,
+      `dd${'c'.padStart(2, 'c')}${'0'.repeat(60)}`,
+    );
+
+    const commitResults: ConservativeCommitResult[] = [
+      {
+        sourceTokenId: srcA.id,
+        method: 'split',
+        requestIdHex: `req-${srcA.id}`,
+        recipientTokenJson: childA,
+      },
+      {
+        sourceTokenId: srcB.id,
+        method: 'split',
+        requestIdHex: `req-${srcB.id}`,
+        recipientTokenJson: childB,
+      },
+      {
+        sourceTokenId: srcC.id,
+        method: 'direct',
+        requestIdHex: `req-${srcC.id}`,
+        recipientTokenJson: childC,
+      },
+    ];
+
+    const transport = makeRecordingTransport();
+    const events = makeEventRecorder();
+    const deps: ConservativeSenderDeps = {
+      aggregator: makeOracleStub(),
+      transport,
+      identity: makeIdentity(),
+      senderTransportPubkey: BOB_TRANSPORT_PUBKEY,
+      emit: events.emit,
+      availableSources: () => [srcA, srcB, srcC],
+      selectSources: async () => ({
+        directSources: [srcC],
+        splitSources: [
+          {
+            token: srcA,
+            splitAmount: 200n,
+            remainderAmount: 800n,
+            coinIdHex: 'COINA',
+          },
+          {
+            token: srcB,
+            splitAmount: 300n,
+            remainderAmount: 700n,
+            coinIdHex: 'COINB',
+          },
+        ],
+      }),
+      preflightOptions: () => ({
+        resolveRequestId: () => {
+          throw new Error('not invoked');
+        },
+        extractPendingChain: () => [],
+      } satisfies Omit<PreflightFinalizeOptions, 'aggregator'>),
+      commitSources: async () => commitResults,
+      toTokenLike: projection,
+    };
+
+    const request: TransferRequest = {
+      recipient: '@bob',
+      coinId: 'COINA',
+      amount: '200',
+      additionalAssets: [
+        { kind: 'coin', coinId: 'COINB', amount: '300' },
+        { kind: 'coin', coinId: 'COINC', amount: '100' },
+      ],
+      transferMode: 'conservative',
+      delivery: { kind: 'force-inline' },
+    };
+
+    const result = await sendConservativeUxf(request, makePeerInfo(), deps);
+    expect(result.status).toBe('completed');
+
+    // Bundle's payload.tokenIds carries the RECIPIENT genesis tokenIds
+    // (one per commit result), lex-sorted. The fixture rewriter set
+    // each child's `genesis.data.tokenId` to its `dd*` placeholder id.
+    const childAId = `dd${'a'.padStart(2, 'a')}${'0'.repeat(60)}`;
+    const childBId = `dd${'b'.padStart(2, 'b')}${'0'.repeat(60)}`;
+    const childCId = `dd${'c'.padStart(2, 'c')}${'0'.repeat(60)}`;
+    const payload = transport._calls[0].payload as UxfTransferPayloadCar;
+    expect([...payload.tokenIds].sort()).toEqual(
+      [childAId, childBId, childCId].sort(),
+    );
+    expect(result.tokenTransfers).toHaveLength(3);
+    expect(events.count('transfer:confirmed')).toBe(1);
+    // tokenTransfers carries the per-source method:
+    //   - COINA, COINB: split (the splitSources entries)
+    //   - COINC: direct (the directSources entry)
+    const methodsBySrc = new Map(
+      result.tokenTransfers.map((t) => [t.sourceTokenId, t.method]),
+    );
+    expect(methodsBySrc.get(srcA.id)).toBe('split');
+    expect(methodsBySrc.get(srcB.id)).toBe('split');
+    expect(methodsBySrc.get(srcC.id)).toBe('direct');
+    // The OVER_TRANSFER_GUARD passes per-coin: COINA=200, COINB=300,
+    // COINC=100 — each matches its per-coin budget exactly.
+  });
+});

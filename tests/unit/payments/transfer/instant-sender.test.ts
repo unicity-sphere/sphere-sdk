@@ -1346,8 +1346,8 @@ describe('__resetSourceLocksForTesting — Wave 7 fail-closed guard', () => {
 // These tests lock down the normalization + forwarding contract so the
 // production wiring in dispatchUxfInstantSend (FIX 2) can depend on it.
 
-describe('sendInstantUxf — splitSource forwarding (#142 FIX 1)', () => {
-  it('forwards splitSource metadata from selectSources to commitSources', async () => {
+describe('sendInstantUxf — splitSources forwarding (#142 FIX 1 / #149 multi-asset)', () => {
+  it('forwards a single splitSources entry from selectSources to commitSources', async () => {
     const splitSourceTok = makeToken('split-tok', TOKEN_A, {
       amount: '1000000',
     });
@@ -1355,20 +1355,22 @@ describe('sendInstantUxf — splitSource forwarding (#142 FIX 1)', () => {
       sourceTokenId: 'split-tok',
       fixture: TOKEN_A,
     });
-    let observedSplitSource: unknown = 'NOT_CALLED';
+    let observedSplitSources: unknown = 'NOT_CALLED';
     const { deps } = makeDeps({
       availableSources: () => [splitSourceTok],
       selectSources: async () => ({
         directSources: [],
-        splitSource: {
-          token: splitSourceTok,
-          splitAmount: 300_000n,
-          remainderAmount: 700_000n,
-          coinIdHex: 'UCT',
-        },
+        splitSources: [
+          {
+            token: splitSourceTok,
+            splitAmount: 300_000n,
+            remainderAmount: 700_000n,
+            coinIdHex: 'UCT',
+          },
+        ],
       }),
-      commitSources: async ({ splitSource }) => {
-        observedSplitSource = splitSource;
+      commitSources: async ({ splitSources }) => {
+        observedSplitSources = splitSources;
         return [commitResult];
       },
     });
@@ -1383,27 +1385,29 @@ describe('sendInstantUxf — splitSource forwarding (#142 FIX 1)', () => {
       deps,
     );
 
-    expect(observedSplitSource).toMatchObject({
-      token: splitSourceTok,
-      splitAmount: 300_000n,
-      remainderAmount: 700_000n,
-      coinIdHex: 'UCT',
-    });
+    expect(observedSplitSources).toEqual([
+      {
+        token: splitSourceTok,
+        splitAmount: 300_000n,
+        remainderAmount: 700_000n,
+        coinIdHex: 'UCT',
+      },
+    ]);
   });
 
-  it('legacy array-shape selectSources still works (no splitSource)', async () => {
+  it('legacy array-shape selectSources still works (empty splitSources)', async () => {
     const source = makeToken('tok-1', TOKEN_A);
     const commitResult = makeCommitResult({
       sourceTokenId: 'tok-1',
       fixture: TOKEN_A,
     });
-    let observedSplitSource: unknown = 'NOT_CALLED';
+    let observedSplitSources: unknown = 'NOT_CALLED';
     const { deps } = makeDeps({
       availableSources: () => [source],
-      // LEGACY return shape — flat array. No splitSource.
+      // LEGACY return shape — flat array. No splitSources entries.
       selectSources: async () => [source],
-      commitSources: async ({ splitSource }) => {
-        observedSplitSource = splitSource;
+      commitSources: async ({ splitSources }) => {
+        observedSplitSources = splitSources;
         return [commitResult];
       },
     });
@@ -1414,7 +1418,8 @@ describe('sendInstantUxf — splitSource forwarding (#142 FIX 1)', () => {
       deps,
     );
 
-    expect(observedSplitSource).toBeUndefined();
+    // Orchestrator normalizes legacy array form to splitSources: [].
+    expect(observedSplitSources).toEqual([]);
   });
 });
 
