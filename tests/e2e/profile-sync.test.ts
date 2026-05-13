@@ -268,10 +268,13 @@ describe.skipIf(SKIP_INFRA)('Profile (OrbitDB + IPFS) Sync E2E', () => {
     expect(originalTokens.length).toBeGreaterThan(0);
     const originalIds = new Set(originalTokens.map((t) => t.id));
     const originalAmounts = new Map(originalTokens.map((t) => [t.id, t.amount]));
-    // Sanity check: real testnet tokens have a genesis field — synthetic
-    // stubs don't. This guards against accidental regression to fake shapes.
+    // Sanity check: real testnet tokens carry a TXF genesis inside sdkData
+    // (the public Token type doesn't expose `genesis` directly). Guards
+    // against accidental regression to synthetic stubs.
     for (const t of originalTokens) {
-      expect((t as unknown as { genesis?: unknown }).genesis).toBeTruthy();
+      expect(t.sdkData).toBeTruthy();
+      const parsed = JSON.parse(t.sdkData!) as { genesis?: unknown };
+      expect(parsed.genesis).toBeTruthy();
     }
 
     // Explicit sync flush — drains the debounced write-behind buffer so
@@ -337,10 +340,13 @@ describe.skipIf(SKIP_INFRA)('Profile (OrbitDB + IPFS) Sync E2E', () => {
       expect(recoveredIds.has(id)).toBe(true);
       expect(recoveredAmounts.get(id)).toBe(originalAmounts.get(id));
     }
-    // And every recovered token still carries its real `genesis` —
-    // confirms the CAR encoded the full UXF schema, not a stub.
+    // And every recovered token still carries its real `genesis` (parsed
+    // out of sdkData) — confirms the CAR encoded the full UXF schema, not
+    // a stub.
     for (const t of recoveredTokens) {
-      expect((t as unknown as { genesis?: unknown }).genesis).toBeTruthy();
+      expect(t.sdkData).toBeTruthy();
+      const parsed = JSON.parse(t.sdkData!) as { genesis?: unknown };
+      expect(parsed.genesis).toBeTruthy();
     }
 
     console.log(`[Test 2] PASSED: real testnet tokens round-tripped through CAR pin/reload`);
