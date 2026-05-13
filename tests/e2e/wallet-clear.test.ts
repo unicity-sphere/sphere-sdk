@@ -21,6 +21,7 @@ import { STORAGE_KEYS_GLOBAL } from '../../constants';
 import { mkdirSync, rmSync, existsSync, writeFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { preflightSkip } from './lib/preflight';
 
 const rand = () => Math.random().toString(36).slice(2, 8);
 
@@ -74,7 +75,9 @@ function countTokenFiles(tokensDir: string): number {
   return count;
 }
 
-describe('Wallet clear end-to-end', () => {
+const SKIP_INFRA = preflightSkip(["nostr","aggregator"], 'wallet-clear');
+
+describe.skipIf(SKIP_INFRA)('Wallet clear end-to-end', () => {
   const cleanupDirs: string[] = [];
   const spheres: Sphere[] = [];
 

@@ -1,0 +1,31 @@
+{
+  "_marker": "T.2.D.REFERENCE.SNAPSHOT.v2",
+  "_note": "T.2.D reference snapshot, NOT a v1.0 wire format claim. See README.md.",
+  "tag": "T.2.D.2-reference-snapshot",
+  "generated": {
+    "frozenEpochMs": 1735689600000,
+    "frozenIso": "2025-01-01T00:00:00Z"
+  },
+  "inputs": {
+    "mnemonic": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+    "saltHex": "aa000000000000000000000000000000000000000000000000000000005a1601",
+    "transferId": "00000000-0000-4000-8000-000000000001",
+    "senderChainPubkey": "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "senderTransportPubkey": "02bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "recipientTransportPubkey": "02bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "recipientChainPubkey": "02cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "recipientDirectAddress": "DIRECT://bob-direct",
+    "tokenSourceId": "tok-1",
+    "tokenJsonId": "aa00000000000000000000000000000000000000000000000000000000000001",
+    "primary": {
+      "coinId": "UCT",
+      "amount": "1000000"
+    }
+  },
+  "deliveryMode": "force-inline",
+  "transferMode": "conservative",
+  "expectedCar": {
+    "fileName": "bundle.car",
+    "format": "CARv1 (dag-cbor + sha2-256)"
+  }
+}

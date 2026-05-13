@@ -343,19 +343,113 @@ const confirmed = sphere.payments.getTokens({ status: 'confirmed' });
 
 Get a single token by ID.
 
+#### `exportTokens(options?): Array<{ localId, genesisTokenId, txf }>`
+
+Export owned tokens as TXF wire-format objects — the same shape used by `send` / `receive` and by the legacy TXF serializer. Callers may write the array directly as JSON or wrap it in a UXF CAR (`UxfPackage.ingestAll` + `toCar`) for content-addressable distribution.
+
+```typescript
+interface ExportOptions {
+  readonly ids?: readonly string[];        // Only these local token IDs
+  readonly coinId?: string;                // Only tokens of this coin
+  readonly includeUnconfirmed?: boolean;   // Default false — only 'confirmed'
+}
+
+const entries = sphere.payments.exportTokens({ coinId: 'UCT_HEX' });
+// entries: [{ localId: 'uuid', genesisTokenId: 'hex', txf: TxfToken }, ...]
+```
+
+Unconfirmed tokens are skipped by default — they still have a valid TxfToken structure but the receiving wallet may reject them during finalization.
+
+#### `importTokens(txfTokens): Promise<{ added, skipped, rejected }>`
+
+Import TXF wire-format objects into the wallet. Each token receives a fresh local UUID. Dedup is enforced by the same tombstone + `(tokenId, stateHash)` guard as `addToken`:
+
+- **added** — tokens the wallet now owns, with their assigned local IDs
+- **skipped** — already owned, tombstoned (previously spent), or superseded
+- **rejected** — malformed entries, with a per-token reason
+
+```typescript
+const result = await sphere.payments.importTokens(txfArray);
+// result: {
+//   added: Array<{ localId, genesisTokenId }>,
+//   skipped: Array<{ genesisTokenId, reason }>,
+//   rejected: Array<{ genesisTokenId: string | null, reason }>,
+// }
+```
+
+Used by the `tokens-import` CLI command and by any consumer implementing offline token transfer. Works identically on legacy (file-based) and Profile (OrbitDB) wallets — the wire format is mode-agnostic.
+
 #### `send(request: TransferRequest): Promise<TransferResult>`
 
-Send tokens to a recipient. Automatically splits tokens when the exact amount is not available as a single token.
+Send assets to a recipient. Automatically splits source tokens when the exact amount is not available as a single token. Supports single-coin (legacy API, unchanged), multi-coin, and mixed coin+NFT transfers via the `additionalAssets` extension.
 
 ```typescript
 interface TransferRequest {
-  readonly coinId: string;       // Coin type (hex string)
-  readonly amount: string;       // Amount in smallest units
   readonly recipient: string;    // @nametag, hex pubkey, DIRECT://, PROXY://, or alpha1... address
-  readonly memo?: string;        // Optional message
-  readonly addressMode?: AddressMode;  // 'auto' | 'direct' | 'proxy'
-  readonly transferMode?: TransferMode;  // 'instant' | 'conservative'
+  // --- Primary asset (legacy single-coin slot) ---
+  /**
+   * Primary coin asset. Both `coinId` and `amount` are semantically OPTIONAL
+   * but retain non-optional types in this signature for backward compatibility
+   * with v1.0 callers. The implementation wave will widen the type to
+   * `coinId?: string; amount?: string;` — at that point, NFT-only sends omit
+   * both fields. Until then, single-coin callers MUST provide both; multi-asset
+   * callers using NFT-only entries should still provide a coin slot OR wait
+   * for the type widening.
+   */
+  readonly coinId: string;       // Coin type (hex string)
+  readonly amount: string;       // Amount in smallest units (> 0)
+  // --- Multi-asset extension (optional, additive) ---
+  /**
+   * Additional assets to deliver in the same transfer. Each entry is either
+   * a fungible coin or a whole-token (NFT) reference. The full target list
+   * the SDK will deliver is:
+   *   [{ kind: 'coin', coinId, amount }, ...additionalAssets]
+   * (the primary coinId/amount above is the first 'coin' entry when present.)
+   *
+   * Asset model (per UXF-TRANSFER-PROTOCOL §4.1 canonical):
+   *   - A coin token has non-empty coinData; may be split.
+   *   - An NFT token has empty/null coinData; transferred whole only.
+   *   - No mixed tokens — every source belongs to exactly one class.
+   *
+   * Validation:
+   *   - All 'coin' entries (including primary) MUST have distinct coinId.
+   *     Duplicates → INVALID_REQUEST.
+   *   - All 'nft' entries MUST have distinct tokenId. Duplicates →
+   *     INVALID_REQUEST.
+   *   - Each 'coin' entry's amount MUST be > 0.
+   *   - Forward-compat: receivers REJECT entries with unrecognized `kind`
+   *     (UNKNOWN_ASSET_KIND).
+   *   - Sufficient coverage required for every entry; insufficient any →
+   *     INSUFFICIENT_BALANCE on the WHOLE call. NFT not in pool / not
+   *     owned → INSUFFICIENT_BALANCE reason='nft-not-owned'. NFT target's
+   *     source has non-empty coinData (i.e., it's a coin token, not an NFT)
+   *     → 'nft-not-owned' too.
+   *   - Empty target list → EMPTY_TRANSFER.
+   */
+  readonly additionalAssets?: ReadonlyArray<AdditionalAsset>;
+  // --- Other fields ---
+  readonly memo?: string;
+  readonly addressMode?: AddressMode;
+  readonly transferMode?: TransferMode;
+  readonly allowPendingTokens?: boolean;  // Default false
+  /**
+   * Required = true to send NFT-class targets backed by pending source tokens.
+   * NFT cascades are irrecoverable (non-fungible identity); the flag forces
+   * the caller to acknowledge the risk explicitly. Default false; pending NFT
+   * without confirmation → NFT_PENDING_REQUIRES_CONFIRMATION.
+   */
+  readonly confirmNftPending?: boolean;
 }
+
+/**
+ * Discriminated union — an additional asset is either a fungible coin or a
+ * whole-token (NFT) reference. Future asset kinds extend the union; receivers
+ * reject unrecognized kinds at runtime (UNKNOWN_ASSET_KIND) to preserve
+ * transfer semantics.
+ */
+type AdditionalAsset =
+  | { readonly kind: 'coin'; readonly coinId: string; readonly amount: string }
+  | { readonly kind: 'nft'; readonly tokenId: string };
 
 type AddressMode = 'auto' | 'direct' | 'proxy';
 type TransferMode = 'instant' | 'conservative';

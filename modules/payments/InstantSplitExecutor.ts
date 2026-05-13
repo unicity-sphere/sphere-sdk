@@ -27,6 +27,7 @@
 
 import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
+import { hexToBytes as fromHex } from '../../core/hex';
 import { Token } from '@unicitylabs/state-transition-sdk/lib/token/Token';
 import { TokenId } from '@unicitylabs/state-transition-sdk/lib/token/TokenId';
 import { TokenState } from '@unicitylabs/state-transition-sdk/lib/token/TokenState';
@@ -103,13 +104,7 @@ function toHex(bytes: Uint8Array): string {
     .join('');
 }
 
-function fromHex(hex: string): Uint8Array {
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < hex.length; i += 2) {
-    bytes[i / 2] = parseInt(hex.slice(i, i + 2), 16);
-  }
-  return bytes;
-}
+// Steelman³⁵: fromHex consolidated to core/hex.ts (top-of-file import).
 
 // =============================================================================
 // InstantSplitExecutor Implementation

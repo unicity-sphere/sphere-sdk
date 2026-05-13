@@ -30,6 +30,44 @@ export interface StorageProvider extends BaseProvider {
   set(key: string, value: string): Promise<void>;
 
   /**
+   * Optional: set value with an explicit OpLog entry type for W11
+   * originated-tag discipline. Callers that know the semantic
+   * classification of the write (e.g. `'token_send'` on a transfer,
+   * `'cache_index'` on a dedup table write) SHOULD use this to
+   * stamp the storage-level envelope so peers replicating the
+   * entry see the correct classification after the receiver-
+   * authority downgrade.
+   *
+   * Providers that do not implement an OpLog-envelope storage layer
+   * (plain IndexedDB / file KV) omit this method entirely; callers
+   * fall back to `set()` and lose the stamp but the operation
+   * otherwise behaves identically. See profile/aggregator-pointer/
+   * originated-tag.ts for the `OpLogEntryType` union.
+   *
+   * Only declared here as a loose `string` type to avoid a circular
+   * dependency into profile/aggregator-pointer. Implementations
+   * validate via `assertOriginTagLocal`.
+   */
+  setEntry?(key: string, value: string, entryType: string): Promise<void>;
+
+  /**
+   * Wave G.6: optional atomic multi-key write.
+   *
+   * Implementations that support cross-key transactions (IndexedDB,
+   * proper-lockfile-guarded file storage) commit all entries
+   * atomically — either every key is written or none are. Callers
+   * use this for invariants that span multiple keys (e.g. wallet
+   * metadata: encrypted mnemonic + base path + derivation mode +
+   * source — all four must land together so a partial-write doesn't
+   * derive the wrong identity from defaults).
+   *
+   * If the provider does not implement this, callers fall back to
+   * sequential `set()` calls with best-effort rollback on partial
+   * failure (see core/Sphere.ts storeMnemonic for the pattern).
+   */
+  setMany?(entries: ReadonlyArray<readonly [key: string, value: string]>): Promise<void>;
+
+  /**
    * Remove key
    */
   remove(key: string): Promise<void>;
@@ -219,6 +257,16 @@ export interface StorageEvent {
   timestamp: number;
   data?: unknown;
   error?: string;
+  /**
+   * Steelman³⁸ warning: typed error code preserved across the layer
+   * boundary so consumers can route on it (e.g., `CID_REF_CORRUPT`,
+   * `AGGREGATOR_POINTER_TRUST_BASE_STALE`). Without this, the typed
+   * pointer-layer / profile-layer error taxonomy was flattened to a
+   * `error: string` at this boundary.
+   */
+  code?: string;
+  /** The original error object for cause-chain debugging. */
+  cause?: unknown;
 }
 
 export type StorageEventCallback = (event: StorageEvent) => void;
@@ -234,6 +282,22 @@ export interface TxfStorageDataBase {
   _sent?: TxfSentEntry[];
   _invalid?: TxfInvalidEntry[];
   _history?: HistoryRecord[];
+  /**
+   * Audit collection for structurally-valid-but-unspendable tokens
+   * (NOT_OUR_CURRENT_STATE / UNSPENDABLE_BY_US dispositions). Each
+   * entry is persisted to its own OrbitDB key under the prefix
+   * `${addr}.audit.` per PROFILE-ARCHITECTURE.md §10.10. The
+   * per-entry-key writer treats `id` as opaque, so T.1.E can widen
+   * it to a composite `${tokenId}.${observedTokenContentHash}`
+   * without further plumbing.
+   */
+  _audit?: TxfAuditEntry[];
+  /**
+   * Finalization queue for pending chain-mode transactions, keyed by
+   * `id`. Persisted per UXF-TRANSFER-PROTOCOL §5.5 so a process
+   * restart preserves in-flight finalizations.
+   */
+  _finalizationQueue?: TxfFinalizationQueueEntry[];
   // Dynamic token entries: _<tokenId>
   [key: `_${string}`]: unknown;
 }
@@ -272,6 +336,50 @@ export interface TxfInvalidEntry {
   tokenId: string;
   reason: string;
   detectedAt: number;
+}
+
+/**
+ * Audit collection entry — a structurally valid token that the local
+ * wallet cannot currently spend (NOT_OUR_CURRENT_STATE /
+ * UNSPENDABLE_BY_US dispositions). Persisted under
+ * `${addr}.audit.${id}` keys via the per-entry-key writer.
+ *
+ * `id` is the primary key for the per-entry-key layout. It MUST be
+ * unique within the collection. T.1.E will populate it with the
+ * composite `${tokenId}.${observedTokenContentHash}` shape declared
+ * in PROFILE-ARCHITECTURE.md §10.10; this base interface keeps the
+ * field opaque so writers/readers do not need to be updated when the
+ * composite form lands.
+ */
+export interface TxfAuditEntry {
+  /** Opaque primary key. T.1.E uses `${tokenId}.${observedTokenContentHash}`. */
+  id: string;
+  tokenId: string;
+  /** Disposition tag — e.g. 'NOT_OUR_CURRENT_STATE', 'UNSPENDABLE_BY_US'. */
+  disposition: string;
+  detectedAt: number;
+  /** Optional content hash recorded at detection time. */
+  observedTokenContentHash?: string;
+  /** Optional human-readable note from the validator. */
+  note?: string;
+}
+
+/**
+ * Finalization queue entry — a pending chain-mode finalization that
+ * survives process restarts per UXF-TRANSFER-PROTOCOL §5.5.
+ * Persisted under `${addr}.finalizationQueue.${id}` keys.
+ *
+ * `id` is the request id (e.g. transfer/request id) and is the
+ * primary key for the per-entry-key layout.
+ */
+export interface TxfFinalizationQueueEntry {
+  /** Opaque request id. */
+  id: string;
+  /** Lifecycle status of the finalization request. */
+  status: string;
+  enqueuedAt: number;
+  /** Caller-supplied payload — kept opaque at the storage layer. */
+  payload?: unknown;
 }
 
 // =============================================================================

@@ -1,0 +1,89 @@
+{
+  "address_id": "DIRECT_aabbcc_ddeeff",
+  "encryption": "none",
+  "description": "Legacy pre-T.6.D wallet snapshot — five per-token outbox entries under ${addr}.outbox.* covering the §7.2 migration cases. Used by tests/unit/profile/migration-outbox.test.ts and migration-outbox-backup-ordering.test.ts.",
+  "groups_summary": {
+    "single_token_delivered_with_nametag": "DIRECT_aabbcc_ddeeff.outbox.entry-001 — single token, delivered, recipient @bob — synthesizes bundleCid='txf-tok-001', status='finalized', recipientNametag='bob'",
+    "single_token_pending_no_nametag": "DIRECT_aabbcc_ddeeff.outbox.entry-002 — single token, pending, no nametag — synthesizes bundleCid='txf-tok-002', status='sending', recipient=pubkey",
+    "single_token_failed": "DIRECT_aabbcc_ddeeff.outbox.entry-003 — single token, failed — synthesizes bundleCid='txf-tok-003', status='failed-permanent'",
+    "multi_token_group_within_60s": "DIRECT_aabbcc_ddeeff.outbox.entry-004 + entry-005 — two tokens to recipient2 created 30s apart — single group, bundleCid='legacy-02bbbb...bb-1700000180000' (earliest createdAt), tokenIds=['tok-004','tok-005']"
+  },
+  "entries": [
+    {
+      "key": "DIRECT_aabbcc_ddeeff.outbox.entry-001",
+      "value": {
+        "id": "entry-001",
+        "status": "delivered",
+        "sourceTokenId": "tok-001",
+        "salt": "0011223344556677889900112233445566778899001122334455667788990011",
+        "commitmentJson": "{}",
+        "recipientPubkey": "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "recipientNametag": "bob",
+        "amount": "1000000",
+        "createdAt": 1700000000000,
+        "updatedAt": 1700000000000
+      }
+    },
+    {
+      "key": "DIRECT_aabbcc_ddeeff.outbox.entry-002",
+      "value": {
+        "id": "entry-002",
+        "status": "pending",
+        "sourceTokenId": "tok-002",
+        "salt": "1122334455667788990011223344556677889900112233445566778899001122",
+        "commitmentJson": "{}",
+        "recipientPubkey": "02cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "amount": "500000",
+        "createdAt": 1700000060000,
+        "updatedAt": 1700000060000,
+        "retryCount": 1
+      }
+    },
+    {
+      "key": "DIRECT_aabbcc_ddeeff.outbox.entry-003",
+      "value": {
+        "id": "entry-003",
+        "status": "failed",
+        "sourceTokenId": "tok-003",
+        "salt": "2233445566778899001122334455667788990011223344556677889900112233",
+        "commitmentJson": "{}",
+        "recipientPubkey": "02dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "recipientNametag": "carol",
+        "amount": "250000",
+        "createdAt": 1700000120000,
+        "updatedAt": 1700000120000,
+        "error": "oracle rejected",
+        "retryCount": 3
+      }
+    },
+    {
+      "key": "DIRECT_aabbcc_ddeeff.outbox.entry-004",
+      "value": {
+        "id": "entry-004",
+        "status": "delivered",
+        "sourceTokenId": "tok-004",
+        "salt": "3344556677889900112233445566778899001122334455667788990011223344",
+        "commitmentJson": "{}",
+        "recipientPubkey": "02bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "recipientNametag": "dave",
+        "amount": "750000",
+        "createdAt": 1700000180000,
+        "updatedAt": 1700000180000
+      }
+    },
+    {
+      "key": "DIRECT_aabbcc_ddeeff.outbox.entry-005",
+      "value": {
+        "id": "entry-005",
+        "status": "delivered",
+        "sourceTokenId": "tok-005",
+        "salt": "4455667788990011223344556677889900112233445566778899001122334455",
+        "commitmentJson": "{}",
+        "recipientPubkey": "02bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "amount": "750000",
+        "createdAt": 1700000210000,
+        "updatedAt": 1700000210000
+      }
+    }
+  ]
+}

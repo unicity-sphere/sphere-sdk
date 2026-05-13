@@ -43,12 +43,15 @@ import {
   syncUntilAllCoins,
   type BalanceSnapshot,
 } from './helpers';
+import { preflightSkip } from './lib/preflight';
 
 // =============================================================================
 // Test Suite
 // =============================================================================
 
-describe('IPFS Multi-Device Sync E2E', () => {
+const SKIP_INFRA = preflightSkip(["nostr","ipfs","faucet"], 'ipfs-multi-device-sync');
+
+describe.skipIf(SKIP_INFRA)('IPFS Multi-Device Sync E2E', () => {
   // Shared state across ordered tests
   let savedMnemonic: string;
   let savedNametag: string;

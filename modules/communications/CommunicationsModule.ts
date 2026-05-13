@@ -6,6 +6,7 @@
 import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
 import { createTransportAddressResolver, type TransportAddressResolver } from '../../core/transport-resolver';
+import { CidRefStore, type CidRef } from '../../profile/cid-ref-store';
 import type {
   DirectMessage,
   BroadcastMessage,
@@ -65,6 +66,13 @@ export interface CommunicationsModuleDependencies {
   storage: StorageProvider;
   transport: TransportProvider;
   emitEvent: <T extends SphereEventType>(type: T, data: SphereEventMap[T]) => void;
+  /**
+   * Optional CID-reference store for OpLog fat-data migration
+   * (PROFILE-CID-REFERENCES.md §8.4). When present, DM arrays are pinned
+   * to IPFS and the OpLog holds a small ref envelope instead of the fat
+   * inline JSON. When absent, falls back to legacy inline storage.
+   */
+  cidRefStore?: CidRefStore;
 }
 
 // =============================================================================
@@ -136,7 +144,9 @@ export class CommunicationsModule {
         // Only process if this is our own sent message being read by the recipient
         if (msg && msg.senderPubkey === this.deps!.identity.chainPubkey) {
           msg.isRead = true;
-          this.save();
+          // W11: read-state marker update triggered by peer's read receipt
+          // — state maintenance of an outgoing message, not a user action.
+          this.save('cache_index');
           this.deps!.emitEvent('message:read', {
             messageIds: [receipt.messageEventId],
             peerPubkey: receipt.senderTransportPubkey,
@@ -185,21 +195,36 @@ export class CommunicationsModule {
     // would leave the previous address's messages visible.
     this.messages.clear();
 
-    // Try per-address key first
-    let data = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.MESSAGES);
+    // Try per-address key first — dual-read (CID ref envelope or legacy inline).
+    const data = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.MESSAGES);
 
     if (data) {
-      const messages = JSON.parse(data) as DirectMessage[];
+      const messages = await this.parseMessagesPayload(data, STORAGE_KEYS_ADDRESS.MESSAGES);
       for (const msg of messages) {
         this.messages.set(msg.id, msg);
       }
       return;
     }
 
-    // Migration: fall back to legacy global key, filter for current identity
-    data = await this.deps!.storage.get('direct_messages');
-    if (data) {
-      const allMessages = JSON.parse(data) as DirectMessage[];
+    // Migration: fall back to legacy global key, filter for current identity.
+    // The legacy global key predates CID-refs and is always inline JSON —
+    // no dual-read needed here.
+    const legacy = await this.deps!.storage.get('direct_messages');
+    if (legacy) {
+      let allMessages: DirectMessage[];
+      try {
+        allMessages = JSON.parse(legacy) as DirectMessage[];
+      } catch (err) {
+        if (err instanceof SyntaxError) {
+          logger.error('Communications', '[MESSAGES] Legacy global key JSON parse failed:', err);
+          return;
+        }
+        throw err;
+      }
+      if (!Array.isArray(allMessages)) {
+        logger.error('Communications', `[MESSAGES] Legacy global key is not an array (got ${typeof allMessages}); skipping.`);
+        return;
+      }
       const myPubkey = this.deps!.identity.chainPubkey;
       const myMessages = allMessages.filter(
         (m) => m.senderPubkey === myPubkey || m.recipientPubkey === myPubkey,
@@ -209,11 +234,68 @@ export class CommunicationsModule {
         this.messages.set(msg.id, msg);
       }
 
-      // Persist to new per-address key
+      // Persist to new per-address key (will write via CID ref if available).
       if (myMessages.length > 0) {
-        await this.save();
+        // W11: one-time migration of legacy global → per-address storage.
+        // Not a user action — system-level schema maintenance.
+        await this.save('cache_index');
         logger.debug('Communications', `Migrated ${myMessages.length} messages to per-address storage`);
       }
+    }
+  }
+
+  /**
+   * Parse the raw KV payload for `<addr>.messages`.
+   *
+   * Dual-read per PROFILE-CID-REFERENCES.md §6:
+   *   - If the payload is a CID ref envelope → fetch content from IPFS
+   *     via `cidRefStore`. Errors propagate with typed codes.
+   *   - If no cidRefStore is injected but a ref is found → throw typed
+   *     `ProfileError('CID_REF_UNREADABLE')`. Silent fallback would mean
+   *     silently losing all stored DMs for this address.
+   *   - Otherwise parse as legacy inline JSON with narrow SyntaxError catch.
+   */
+  private async parseMessagesPayload(data: string, keyForDiagnostic: string): Promise<DirectMessage[]> {
+    const ref = CidRefStore.tryParseRef(data);
+    if (ref) {
+      if (!this.deps!.cidRefStore) {
+        const { ProfileError } = await import('../../profile/errors.js');
+        throw new ProfileError(
+          'CID_REF_UNREADABLE',
+          `CommunicationsModule.load: KV at ${keyForDiagnostic} contains a CID ref ` +
+            `(cid=${ref.cid}) but no cidRefStore was injected. DMs cannot be ` +
+            `restored without IPFS access. Check CommunicationsModule init — ` +
+            `is cidRefStore provided?`,
+        );
+      }
+      const fetched = await this.deps!.cidRefStore.fetchJson<DirectMessage[]>(ref);
+      if (!Array.isArray(fetched)) {
+        logger.error(
+          'Communications',
+          `[MESSAGES] CID-ref content at ${ref.cid} is not an array (got ${typeof fetched}); treating as empty.`,
+        );
+        return [];
+      }
+      return fetched;
+    }
+
+    // Legacy inline JSON — narrow catch for corruption.
+    try {
+      const parsed = JSON.parse(data);
+      if (!Array.isArray(parsed)) {
+        logger.error(
+          'Communications',
+          `[MESSAGES] Decoded data is not an array (got ${typeof parsed}); treating as empty.`,
+        );
+        return [];
+      }
+      return parsed;
+    } catch (err) {
+      if (err instanceof SyntaxError) {
+        logger.error('Communications', '[MESSAGES] Legacy JSON parse failed (corrupted inline data):', err);
+        return [];
+      }
+      throw err;
     }
   }
 
@@ -267,7 +349,9 @@ export class CommunicationsModule {
     if (this.config.cacheMessages) {
       this.messages.set(message.id, message);
       if (this.config.autoSave) {
-        await this.save();
+        // W11: user-initiated outbound DM — the canonical 'dm_send' case.
+        // (SPEC §10.2.3.1: outgoing DM → originated='user'.)
+        await this.save('dm_send');
       }
     }
 
@@ -332,7 +416,10 @@ export class CommunicationsModule {
     }
 
     if (this.config.cacheMessages && this.config.autoSave) {
-      await this.save();
+      // W11: read-state marker update — marking messages read is a local
+      // bookkeeping action (displayed as unread-count change, not as a
+      // user-replayable action). Classify as cache_index.
+      await this.save('cache_index');
     }
 
     // Send NIP-17 read receipts for incoming messages
@@ -404,7 +491,12 @@ export class CommunicationsModule {
       }
     }
     if (this.config.autoSave) {
-      await this.save();
+      // W11: conversation deletion is local bookkeeping — the originated-tag
+      // spec (§10.2.3) reserves user-action types for message-lifecycle
+      // operations (dm_send, dm_receive). Bulk local deletion lacks a
+      // dedicated type, so it maps to cache_index (closest semantic
+      // neighbour — a local-state maintenance operation).
+      await this.save('cache_index');
     }
   }
 
@@ -591,7 +683,13 @@ export class CommunicationsModule {
       this.deps!.emitEvent('message:dm', message);
 
       if (this.config.cacheMessages && this.config.autoSave) {
-        this.save();
+        // W11: self-wrap replay recovers an outgoing DM from the relay —
+        // delivered through the transport's onMessage handler, so the SAVE
+        // triggers from passive receipt rather than a fresh user action.
+        // Route through the raw path (same as true incoming DMs) for
+        // uniform treatment of transport-triggered saves; the stored
+        // envelope's origin tag is resolved by receiver-authority on read.
+        this.save('raw');
       }
       return;
     }
@@ -643,7 +741,12 @@ export class CommunicationsModule {
     // Auto-save and prune (only when caching)
     if (this.config.cacheMessages) {
       if (this.config.autoSave) {
-        this.save();
+        // W11: incoming DM from a peer — SPEC §10.2.3.1 ORIGIN-SIDE
+        // 'replicated' case. The local write bypasses setEntry (which
+        // rejects 'replicated' via assertOriginTagLocal); receiver-authority
+        // downgrade in OrbitDbAdapter.getEntry labels peer-replicated
+        // reads as 'replicated' for downstream wallets.
+        this.save('raw');
       }
       this.pruneIfNeeded();
     }
@@ -697,10 +800,206 @@ export class CommunicationsModule {
   // Private: Storage
   // ===========================================================================
 
-  private async save(): Promise<void> {
-    const messages = Array.from(this.messages.values());
-    await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.MESSAGES, JSON.stringify(messages));
+  /**
+   * Memoized plaintext + CID ref for the last messages pin. See
+   * `_lastPinnedV5Json` in PaymentsModule for rationale: AES-GCM uses
+   * random IVs so re-pinning identical plaintext produces a different CID.
+   * We'd rather write the cached ref than thrash the IPFS gateway.
+   */
+  private _lastPinnedMessagesJson: string | null = null;
+  private _lastPinnedMessagesRef: CidRef | null = null;
+
+  /**
+   * Single-flight chain for save() — DMs arrive over the Nostr subscription
+   * and can trigger multiple concurrent save() invocations (one per event).
+   * Without serialization, two concurrent saves both read the same Map
+   * snapshot and the second clobbers the first. The chain mirrors
+   * PaymentsModule._saveChain / _outboxChain discipline.
+   *
+   * Caveat: guarantees ORDERING, not atomicity — a failing save doesn't
+   * roll back state but also doesn't block the next save.
+   */
+  private _saveChain: Promise<void> = Promise.resolve();
+
+  /**
+   * W11 classification sentinel passed through `save()` → `_doSave()`.
+   *
+   * SPEC §10.2.3 requires each OpLog write to carry an originated tag that
+   * matches the intent of the local author at the site of the write. DMs
+   * introduce a directional wrinkle (SPEC §10.2.3.1): outgoing sends are
+   * user actions (`dm_send`, originated='user'), while an incoming receipt
+   * is ORIGIN-SIDE `'replicated'` — the ONE place in the codebase where
+   * `replicated` applies at call time rather than via receiver-authority
+   * downgrade.
+   *
+   * Because `ProfileStorageProvider.setEntry` validates via
+   * `assertOriginTagLocal` (which rejects `replicated`), we route the
+   * incoming-DM save through plain `storage.set` instead (the `'raw'`
+   * sentinel below). The read path in `OrbitDbAdapter.getEntry` forces
+   * replicated-downgrade for keys NOT in `localAuthoredKeys` — i.e., for
+   * peers who see the replicated entry. Locally, the stored envelope
+   * defaults to `cache_index/system`; that classification is benign for
+   * a snapshot that mixes directions, and receiver-authority downgrade
+   * makes it correct for peers either way.
+   *
+   * Cache/metadata writes (read-state markers, legacy migration, etc.)
+   * are passed as `'cache_index'` — system maintenance of the messages
+   * snapshot rather than a user action.
+   */
+  private async save(
+    entryType: 'dm_send' | 'cache_index' | 'raw' = 'cache_index',
+  ): Promise<void> {
+    const chained = this._saveChain
+      .catch(() => {
+        /* isolate prior failure */
+      })
+      .then(() => this._doSave(entryType));
+    this._saveChain = chained.then(
+      () => undefined,
+      () => undefined,
+    );
+    return chained;
   }
+
+  /**
+   * Write the current messages Map — via CID reference when `cidRefStore`
+   * is injected, inline JSON otherwise. PROFILE-CID-REFERENCES.md §8.4.
+   *
+   * Note on pattern choice: §8.4 specifies Pattern B (index of per-message
+   * CIDs). This implementation uses Pattern A (single CID for the whole
+   * array) for parity with PaymentsModule's migration. Pattern B is a
+   * future Phase-2 optimization — both share the same OpLog envelope
+   * shape, so the migration path from A → B is transparent to peers.
+   * Pattern A is adequate for typical wallets (<1000 DMs per address);
+   * Pattern B matters once conversations get very long.
+   *
+   * W11 `entryType` dispatch (see `save()` docstring):
+   *   - 'dm_send'     → setStorageEntry (outgoing user action)
+   *   - 'cache_index' → setStorageEntry (system maintenance)
+   *   - 'raw'         → plain storage.set (incoming DM — read-time
+   *                     downgrade supplies the 'replicated' tag to peers;
+   *                     the locally stored envelope defaults to
+   *                     cache_index/system, which is benign for a snapshot
+   *                     that mixes directions).
+   */
+  private async _doSave(
+    entryType: 'dm_send' | 'cache_index' | 'raw',
+  ): Promise<void> {
+    const messages = Array.from(this.messages.values());
+    const cidRefStore = this.deps!.cidRefStore;
+
+    if (messages.length === 0) {
+      // Empty list: write a truthy JSON sentinel ("[]") rather than the empty
+      // string. Reason: `load()` treats falsy KV values as "no data" and
+      // falls through to the legacy global `direct_messages` key for
+      // migration. If we wrote '' here, a user who deleted every DM would
+      // see those DMs resurrect from the legacy key on the next reload.
+      // Writing "[]" keeps load() on the per-address branch and decodes
+      // cleanly to an empty array.
+      //
+      // Diverges intentionally from outbox/pendingV5 which have no legacy
+      // fallback and can safely use the empty-string sentinel.
+      await this.writeMessagesKey(STORAGE_KEYS_ADDRESS.MESSAGES, '[]', entryType);
+      this._lastPinnedMessagesJson = null;
+      this._lastPinnedMessagesRef = null;
+      return;
+    }
+
+    if (cidRefStore) {
+      const json = JSON.stringify(messages);
+
+      // Skip re-pin if plaintext is byte-identical to the last successful pin.
+      if (this._lastPinnedMessagesRef && this._lastPinnedMessagesJson === json) {
+        const refStr = CidRefStore.stringifyRef(this._lastPinnedMessagesRef);
+        await this.writeMessagesKey(STORAGE_KEYS_ADDRESS.MESSAGES, refStr, entryType);
+        return;
+      }
+
+      const ref = await cidRefStore.pinJson(messages);
+      const refStr = CidRefStore.stringifyRef(ref);
+      await this.writeMessagesKey(STORAGE_KEYS_ADDRESS.MESSAGES, refStr, entryType);
+      // Update memo AFTER storage.set — see PaymentsModule equivalent for
+      // the rationale (a set-failure must not leave us pointing at a CID
+      // the caller thinks is live).
+      this._lastPinnedMessagesJson = json;
+      this._lastPinnedMessagesRef = ref;
+      return;
+    }
+
+    // Legacy path: inline JSON (deprecated for heavy wallets — see §8.4).
+    await this.writeMessagesKey(STORAGE_KEYS_ADDRESS.MESSAGES, JSON.stringify(messages), entryType);
+  }
+
+  /**
+   * Single write funnel for the `<addr>.messages` key. Dispatches between
+   * `setStorageEntry` (classified writes) and plain `storage.set` (raw
+   * writes used for incoming DM receipts — see the `save()` docstring for
+   * the receiver-authority model). Keeping the dispatch on one line of
+   * code avoids four-way duplication in `_doSave()`.
+   */
+  private async writeMessagesKey(
+    key: string,
+    value: string,
+    entryType: 'dm_send' | 'cache_index' | 'raw',
+  ): Promise<void> {
+    if (entryType === 'raw') {
+      // Incoming DM path — SPEC §10.2.3.1. The origin-side tag for a
+      // received peer message is `'replicated'`, which
+      // `ProfileStorageProvider.setEntry → assertOriginTagLocal` rejects
+      // at the local write edge. We bypass the envelope-typed helper here
+      // and write raw bytes; the resulting envelope defaults to
+      // `cache_index/system`, which receiver-authority downgrade in
+      // `OrbitDbAdapter.getEntry` overrides to `'replicated'` for any
+      // peer that replicates this key.
+      await this.deps!.storage.set(key, value);
+      return;
+    }
+    await this.setStorageEntry(key, value, entryType);
+  }
+
+  /**
+   * W11 originated-tag helper (SPEC §10.2.3). Mirrors
+   * `PaymentsModule.setStorageEntry` — routes through
+   * `storage.setEntry(key, value, entryType)` when the provider implements
+   * the envelope-typed API, falls back to plain `set()` otherwise.
+   *
+   * Narrow union: `'dm_send' | 'cache_index'`. The third class of write
+   * for this module — an incoming DM received from a peer — is NOT routed
+   * through this helper (see `writeMessagesKey` and `save()` docstring).
+   *
+   * A once-per-provider-class debug log on fallback surfaces silent loss
+   * of W11 stamping during a mixed-provider migration.
+   */
+  private async setStorageEntry(
+    key: string,
+    value: string,
+    entryType: 'dm_send' | 'cache_index',
+  ): Promise<void> {
+    const storage = this.deps!.storage;
+    const setEntryFn = (storage as { setEntry?: (k: string, v: string, t: string) => Promise<void> })
+      .setEntry;
+    if (typeof setEntryFn === 'function') {
+      await setEntryFn.call(storage, key, value, entryType);
+      return;
+    }
+    // Fallback: provider has no envelope-storage layer (plain IndexedDB
+    // / file KV). Log once per provider-class so a silent loss of W11
+    // stamping during a migration is visible in ops. Subsequent calls
+    // from the same class are silent to avoid log spam.
+    const providerClass = storage.constructor?.name ?? 'UnknownStorage';
+    if (!CommunicationsModule._w11FallbackLogged.has(providerClass)) {
+      CommunicationsModule._w11FallbackLogged.add(providerClass);
+      logger.debug(
+        'Communications',
+        `[W11] storage.setEntry not available on ${providerClass}; originated tags will not be stamped ` +
+          `(this is expected for plain IndexedDB / file storage, unexpected when ProfileStorageProvider is in the chain).`,
+      );
+    }
+    await storage.set(key, value);
+  }
+
+  /** Per-class dedup set for the W11 fallback log (see setStorageEntry). */
+  private static _w11FallbackLogged: Set<string> = new Set();
 
   private pruneIfNeeded(): void {
     // Per-conversation pruning (normalize keys for consistent grouping)

@@ -34,6 +34,7 @@ import { TokenSplitExecutor } from './TokenSplitExecutor';
 import { TokenReservationLedger } from './TokenReservationLedger';
 import { SpendPlanner, SpendQueue, type ParsedTokenEntry, type ParsedTokenPool } from './SpendQueue';
 import { NametagMinter, type MintNametagResult } from './NametagMinter';
+import { CidRefStore, type CidRef } from '../../profile/cid-ref-store';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase, HistoryRecord } from '../../storage';
 import type {
   TransportProvider,
@@ -44,6 +45,7 @@ import type {
   IncomingPaymentRequest as TransportPaymentRequest,
   IncomingPaymentRequestResponse as TransportPaymentRequestResponse,
 } from '../../transport';
+import { DEFAULT_ASSET_KINDS_WHEN_ABSENT } from '../../transport/transport-provider';
 import type { OracleProvider } from '../../oracle';
 import type { PriceProvider } from '../../price';
 import type {
@@ -59,6 +61,7 @@ import type {
 import { STORAGE_KEYS_ADDRESS } from '../../constants';
 import {
   tokenToTxf,
+  txfToToken,
   getCurrentStateHash,
   buildTxfStorageData,
   parseTxfStorageData,
@@ -66,7 +69,132 @@ import {
 import { TokenRegistry } from '../../registry';
 import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
+import {
+  narrowTransferMode,
+  requireLegacyCoinSlot,
+  type LegacyCoinTransferRequest,
+} from './transfer/transfer-mode-shims';
+import {
+  sendConservativeUxf,
+  type ConservativeCommitResult,
+  type ConservativeSenderDeps,
+} from './transfer/conservative-sender';
+import {
+  sendInstantUxf,
+  type InstantCommitResult,
+  type InstantSenderDeps,
+} from './transfer/instant-sender';
+import {
+  sendTxfUxf,
+  type TxfCommitResult,
+  type TxfFinalization,
+  type TxfSenderDeps,
+} from './transfer/txf-sender';
+import { classifyToken as classifyTokenLike } from './transfer/classify-token';
+import {
+  IngestWorkerPool,
+  type IngestWorkerPoolOptions,
+  type UxfV1Payload,
+  type ProcessTokenFn,
+} from './transfer/ingest-worker-pool';
+import { ReplayLRU } from './transfer/replay-lru';
+import { PerTokenMutex } from '../../profile/per-token-mutex';
+// T.5.D — operator escape hatch (`importInclusionProof` +
+// `revalidateCascadedChildren`). Class types only; the wiring layer
+// (Sphere bootstrap) constructs the runtime instances and installs them
+// via the dedicated install* methods below.
+import {
+  InclusionProofImporter,
+  type ImportInclusionProofCallOptions,
+  type ImportProofResult,
+  type ImportableInclusionProof,
+} from './transfer/import-inclusion-proof';
+import {
+  RevalidateCascadedRunner,
+  type RevalidationResult,
+} from './transfer/revalidate-cascaded';
+// Phase 8 steelman post-cutover — sending-recovery worker. The bootstrap
+// layer (Sphere) wires an instance via `installSendingRecoveryWorker()`;
+// the module starts/stops it gated on `features.recoveryWorker`.
+import { SendingRecoveryWorker } from './transfer/sending-recovery-worker';
+// Phase 9.6.D — sender-side §6.1 finalization worker. Auto-installed in
+// `initialize()` when `features.finalizationWorker` is true (default-ON
+// when `senderUxf` is true). Consumer-installed workers (via
+// `installFinalizationWorkerSender()`) win over the auto-installed one.
+import {
+  FinalizationWorkerSender,
+  CountingSemaphore,
+  type FinalizationAggregatorClient,
+  type FinalizationOutboxWriter,
+  type RequestContextResolver,
+  type RequestContext,
+  type SubmitOutcome,
+  type PollOutcome,
+} from './transfer/finalization-worker-sender';
+// Task #151 — wired. The recipient worker is auto-instantiated in
+// initialize() with lightweight in-memory adapters (see
+// `buildDefaultFinalizationWorkerRecipient` at the bottom of this file).
+// processToken enqueues PENDING entries on the instant-mode receive
+// path; the worker drives §6.1 polling and a dispositionWriter that
+// flips local Token status to 'confirmed' once the proof lands.
+import {
+  FinalizationWorkerRecipient,
+  type FinalizationDispositionWriter,
+  type RevaluateHooksProvider,
+} from './transfer/finalization-worker-recipient';
+import {
+  FinalizationQueue,
+  entryIdFor,
+  type FinalizationQueueEntry,
+} from './transfer/finalization-queue';
+import {
+  CascadeWalker,
+  type CascadeManifestScanner,
+  type CascadeOutboxScanner,
+  type ClassifyTokenLookup,
+} from './transfer/cascade-walker';
+import { ManifestCas, type MinimalManifestStorage } from '../../profile/manifest-cas';
+// Round 5 (FIX 1) — production-wired default importer/runner for the
+// operator escape hatch. Uses lightweight in-memory adapters mirroring
+// the auto-install pattern of `buildDefaultFinalizationWorkerSender`.
+// Sphere bootstrap MAY override via the existing `install*` methods to
+// inject OrbitDB-backed dispositionStorage + manifestStore (see
+// {@link OrbitDbDispositionStorageAdapter}).
+import {
+  InMemoryDispositionStorageAdapter,
+} from '../../profile/disposition-storage-adapters';
+import { ManifestStore } from '../../profile/manifest-store';
+import { Lamport } from '../../profile/lamport';
+import type { TokenManifestEntry } from '../../profile/token-manifest';
+import type { CascadeManifestScanner as CascadeManifestScannerForRevalidate } from './transfer/cascade-walker';
+import type { ProofVerifyStatus } from './transfer/proof-verifier';
+import { contentHash, type ContentHash } from '../../uxf/types';
+import { isLegacyTokenTransferPayload } from '../../types/uxf-transfer';
+import type { UxfTransferOutboxEntry } from '../../types/uxf-outbox';
+import {
+  resolveSenderInfoViaBinding,
+  type ReresolvedNametagSource,
+} from './transfer/nametag-reresolver';
+
+/**
+ * Narrow guard for the UXF v1.0 wire shapes accepted by the
+ * {@link IngestWorkerPool}. Legacy shapes have no `kind` field; v1.0
+ * shapes carry `kind: 'uxf-car' | 'uxf-cid'`.
+ */
+function isUxfV1Payload(value: unknown): value is UxfV1Payload {
+  if (value === null || typeof value !== 'object') return false;
+  const kind = (value as { kind?: unknown }).kind;
+  return kind === 'uxf-car' || kind === 'uxf-cid';
+}
 import { parseInvoiceMemoForOnChain } from '../accounting/memo.js';
+import { sha256 } from '@noble/hashes/sha2.js';
+import { hexToBytes as fromHex } from '../../core/hex';
+// `profile/types` is a pure types + constants module with zero runtime
+// dependencies — safe to import statically in every build. The previous
+// dynamic import was motivated by a bundle-size concern that didn't apply
+// here; it silently swallowed import errors in consumer builds lacking
+// matching bundler rules and made Profile-mode data load paths fragile.
+import { computeAddressId } from '../../profile/types.js';
 
 // Instant split imports
 import { InstantSplitExecutor } from './InstantSplitExecutor';
@@ -99,6 +227,9 @@ import { MintCommitment } from '@unicitylabs/state-transition-sdk/lib/transactio
 import { MintTransactionData } from '@unicitylabs/state-transition-sdk/lib/transaction/MintTransactionData';
 import { waitInclusionProof } from '@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils';
 import { InclusionProof } from '@unicitylabs/state-transition-sdk/lib/transaction/InclusionProof';
+import { TransferTransactionData } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferTransactionData';
+import { RequestId } from '@unicitylabs/state-transition-sdk/lib/api/RequestId';
+import { PredicateEngineService } from '@unicitylabs/state-transition-sdk/lib/predicate/PredicateEngineService';
 import type { IAddress } from '@unicitylabs/state-transition-sdk/lib/address/IAddress';
 import type { StateTransitionClient } from '@unicitylabs/state-transition-sdk/lib/StateTransitionClient';
 import type { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/bft/RootTrustBase';
@@ -112,6 +243,85 @@ import type { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/bft/Ro
  * Single source of truth: {@link HistoryRecord} in `storage/storage-provider.ts`.
  */
 export type TransactionHistoryEntry = import('../../storage').HistoryRecord;
+
+// =============================================================================
+// importTokens result types
+// =============================================================================
+
+/**
+ * Outcome of a single token in `importTokens`. Codes are stable enums
+ * suitable for switch-on-code logic in callers (CLI, scripting, UI).
+ */
+export type ImportAddedCode =
+  /** Token was new to the wallet — fresh acquisition. */
+  | 'added'
+  /**
+   * Lenient mode only: an active (confirmed or submitted) state of
+   * the same genesis tokenId existed in the wallet and has been
+   * archived by addToken's state-update path. The imported state is
+   * now authoritative. Distinct from `'stale-record-replaced'` below.
+   */
+  | 'state-replaced'
+  /**
+   * Lenient mode only: the wallet already held a record for the same
+   * genesis tokenId but its status was `'spent'` or `'invalid'` — the
+   * prior entry was a dead bookkeeping record, not an active state.
+   * Import simply resurrected the tokenId. UI should treat this as
+   * effectively fresh ('added'-like) with no warning.
+   */
+  | 'stale-record-replaced';
+
+export type ImportSkipCode =
+  /** Exact (tokenId, stateHash) already in the wallet. */
+  | 'duplicate'
+  /** (tokenId, stateHash) was previously spent from this wallet. */
+  | 'tombstoned'
+  /**
+   * Strict-mode only: tokenId is in the wallet at a DIFFERENT state
+   * and we refuse to clobber that state from an import.
+   */
+  | 'genesis-exists'
+  /** addToken returned false despite the pre-checks (race or unknown). */
+  | 'unknown';
+
+export type ImportRejectCode =
+  /** TxfToken structure is invalid (missing fields, wrong types, etc.). */
+  | 'malformed'
+  /** addToken threw an unexpected error during the write path. */
+  | 'add-failed';
+
+/**
+ * Discriminated union so `note` is structurally required on the
+ * `'state-replaced'` and `'stale-record-replaced'` branches — consumers
+ * don't need `!` assertions after switch-on-code.
+ */
+export type ImportAdded =
+  | {
+      readonly localId: string;
+      readonly genesisTokenId: string;
+      readonly code: 'added';
+    }
+  | {
+      readonly localId: string;
+      readonly genesisTokenId: string;
+      readonly code: 'state-replaced' | 'stale-record-replaced';
+      readonly note: string;
+    };
+export interface ImportSkipped {
+  readonly genesisTokenId: string;
+  readonly code: ImportSkipCode;
+  readonly reason: string;
+}
+export interface ImportRejected {
+  readonly genesisTokenId: string | null;
+  readonly code: ImportRejectCode;
+  readonly reason: string;
+}
+export interface ImportTokensResult {
+  readonly added: ImportAdded[];
+  readonly skipped: ImportSkipped[];
+  readonly rejected: ImportRejected[];
+}
 
 /**
  * Compute a dedup key for a history entry.
@@ -454,15 +664,83 @@ function extractTokenStateKey(token: Token): string | null {
   return createTokenStateKey(tokenId, stateHash);
 }
 
+// Steelman³⁵: fromHex consolidated to core/hex.ts (top-of-file import).
+
 /**
- * Convert hex string to Uint8Array
+ * Compute a deterministic dedup key for a pending-mint (pre-finalization)
+ * token, whose `getCurrentStateHash` is empty because the aggregator
+ * hasn't returned an inclusion proof yet.
+ *
+ * We hash a canonical JSON encoding of the GENESIS DATA so the same
+ * genesis always produces the same key. JSON.stringify (not pipe-
+ * delimiting) ensures that any future field additions, `null` vs
+ * `undefined` vs `''` distinctions, and field-values containing
+ * special characters don't cause cross-genesis collisions.
+ *
+ * The returned key is prefixed `pending-` so it can never collide
+ * with a real state hash (which is always a 64-hex SHA-256).
+ *
+ * @param txf - A TxfToken (typically the incoming import candidate).
+ * @returns `pending-<64 hex>` — deterministic per genesis content.
  */
-function fromHex(hex: string): Uint8Array {
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < hex.length; i += 2) {
-    bytes[i / 2] = parseInt(hex.slice(i, i + 2), 16);
-  }
-  return bytes;
+function pendingMintDedupKey(txf: {
+  genesis?: {
+    data?: {
+      tokenId?: string;
+      tokenType?: string;
+      salt?: string;
+      recipient?: string | null;
+      tokenData?: string | null;
+      recipientDataHash?: string | null;
+    };
+  };
+}): string {
+  const d = txf.genesis?.data ?? {};
+  // Canonical JSON (fixed field order) preserves null-vs-undefined-vs-''
+  // distinctions and is robust against any special characters in field
+  // values. We explicitly list the fields rather than stringifying `d`
+  // to avoid unrelated keys on `d` (e.g., future SDK additions) changing
+  // the key for tokens already minted against the old schema.
+  const canonical = JSON.stringify([
+    d.tokenId ?? null,
+    d.tokenType ?? null,
+    d.salt ?? null,
+    d.recipient ?? null,
+    d.tokenData ?? null,
+    d.recipientDataHash ?? null,
+  ]);
+  const digest = sha256(new TextEncoder().encode(canonical));
+  let hex = '';
+  for (const b of digest) hex += b.toString(16).padStart(2, '0');
+  return 'pending-' + hex;
+}
+
+/**
+ * Given an incoming TxfToken, return the dedup key to use for
+ * duplicate detection in `importTokens`:
+ *   - the token's CURRENT state hash when available (via
+ *     `getCurrentStateHash`, which looks at the last transaction's
+ *     `newStateHash` first, then authenticator, then genesis)
+ *   - the pending-mint fallback otherwise
+ *
+ * Using `getCurrentStateHash` rather than reading only the genesis
+ * path is load-bearing: a token that has been transferred has a
+ * genesis hash that NEVER changes, but a current state hash that
+ * tracks the latest transaction. If we keyed on genesis, two
+ * different live states of the same token would collide as
+ * "duplicate" and valid state updates would be silently dropped
+ * on re-import.
+ *
+ * The return is a non-empty opaque string suitable for equality
+ * comparison. Different shapes (real vs pending) never collide
+ * because the pending variant is prefixed.
+ */
+function effectiveDedupKey(
+  txf: Parameters<typeof pendingMintDedupKey>[0] & Parameters<typeof getCurrentStateHash>[0],
+): string {
+  const stateHash = getCurrentStateHash(txf as TxfToken) ?? '';
+  if (stateHash) return stateHash;
+  return pendingMintDedupKey(txf);
 }
 
 /**
@@ -607,6 +885,156 @@ function findBestTokenVersion(
 // Configuration
 // =============================================================================
 
+/**
+ * UXF Inter-Wallet Transfer feature flags (T.2.D.1).
+ *
+ * Controls staged enablement of the UXF send/receive pipeline. T.8.D
+ * part 1 of 2 (production cutover, this release) flipped every flag's
+ * default from `false` → `true`. Legacy paths remain available by
+ * passing explicit `features: { senderUxf: false, ... }`; legacy code
+ * removal is T.8.D part 2 of 2 (gated on testnet soak).
+ *
+ * Cross-version interop: a sender with `senderUxf: true` emits UXF v1.0
+ * wire shapes (`uxf-cid` / `uxf-car`); a receiver running an older SDK
+ * without UXF ingest can NOT decode them. Pin a shared SDK version
+ * across senders/receivers during the transition, OR set the relevant
+ * flag(s) to `false` explicitly to preserve the legacy path.
+ *
+ * See `docs/uxf/UXF-TRANSFER-IMPL-PLAN.md` §1 "Feature flag config" and
+ * §T.8.D production cutover.
+ */
+export interface UxfTransferFeatures {
+  /** T.2.D.1 / T.5.A — when `true` (default), route conservative-mode
+   *  AND instant-mode (the public default) sends through the UXF
+   *  wire-format orchestrators. Set `false` to fall through to the
+   *  legacy single-token TXF path (rollback escape hatch). */
+  readonly senderUxf?: boolean;
+  /**
+   * Phase 8 steelman post-cutover — when `true` (default), instantiate
+   * and start `SendingRecoveryWorker` in {@link PaymentsModule.initialize};
+   * stop it in {@link PaymentsModule.destroy}. The worker periodically
+   * re-publishes outbox entries left in `'sending'` after a crash
+   * between OrbitDB commit and Nostr publish ack (closes the gap
+   * documented in `conservative-sender.ts` lines 212 / 886 / 903).
+   *
+   * The worker is a no-op until a republish hook is injected by the
+   * bootstrap layer (`installSendingRecoveryRepublishHook`); the flag
+   * does NOT itself drive any send traffic. Set `false` to suppress
+   * worker installation entirely (e.g. for unit tests that count timers).
+   */
+  readonly recoveryWorker?: boolean;
+  /**
+   * Phase 9.6.D — when `true` (default when `senderUxf` is on),
+   * auto-install and start a {@link FinalizationWorkerSender} in
+   * {@link PaymentsModule.initialize} so instant-mode sends drive the
+   * §6.1 finalization cycle and emit `transfer:confirmed` once the
+   * aggregator anchors the commitment. Set `false` to suppress the
+   * auto-install (e.g. for unit tests that mock the aggregator or do
+   * not need `transfer:confirmed`). Consumer-installed workers (via
+   * {@link PaymentsModule.installFinalizationWorkerSender}) win over
+   * the auto-installed one and are unaffected by this flag.
+   */
+  readonly finalizationWorker?: boolean;
+  /**
+   * T.3.E — when `true` (default), route incoming UXF v1.0 bundles
+   * (`kind` of `'uxf-car'` or `'uxf-cid'`) through the
+   * {@link IngestWorkerPool} (§5.0 N parallel workers + W7 per-tokenId
+   * fairness + W23 bundle-internal sequential). Set `false` to fall
+   * back to the legacy single-threaded `handleIncomingTransfer` path.
+   * Legacy V4/V5/V6 shapes (no `kind` field) bypass the pool regardless
+   * of this flag — they remain on the legacy adapter path.
+   */
+  readonly recipientUxf?: boolean;
+  /**
+   * T.7.B — when `true` (default) AND a legacy-shape adapter has been
+   * installed via {@link installLegacyShapeAdapter}, every inbound
+   * legacy event (Sphere TXF, V6 `COMBINED_TRANSFER`, V5/V4
+   * `INSTANT_SPLIT`, SDK legacy `{token, proof}`) is decomposed into N
+   * synthetic disposition records and written through the T.3.C
+   * disposition writer alongside the existing legacy storage path.
+   * Instant-TXF arrivals (any tx with `inclusionProof: null`) are
+   * enqueued on the recipient finalization queue (T.5.C) — same
+   * chain-mode semantics as instant-UXF.
+   *
+   * Default-ON is REQUIRED for cross-version interop with senders that
+   * still emit legacy wire shapes (i.e. anyone who has not yet upgraded
+   * to T.8.D-cutover SDK). Set `false` only if you are confident no
+   * peer can send legacy shapes (legacy storage path still runs as a
+   * fallback regardless). Independent of {@link recipientUxf}: a wallet
+   * MAY enable UXF v1.0 ingest without legacy adaptation, or vice
+   * versa. See §10.2 single-pipeline convergence guarantee.
+   */
+  readonly recipientLegacyAdapter?: boolean;
+}
+
+/**
+ * T.7.B — legacy-shape adapter runner. Owned by the bootstrap layer
+ * (Sphere) and installed via {@link PaymentsModule.installLegacyShapeAdapter}.
+ *
+ * The runner is the single injection point that captures every
+ * dependency `adaptLegacyShape` needs (predicate evaluator,
+ * authenticator verifier, proof verifier, oracle, manifest reader,
+ * finalization-queue enqueuer, disposition writer). Keeping the
+ * dependency graph behind a single interface avoids bloating
+ * `PaymentsModuleDependencies` with seven new fields.
+ *
+ * **Contract**:
+ *  - `processLegacy` MUST NOT throw under normal operation; failures
+ *    are routed into the disposition pipeline as `STRUCTURAL_INVALID`
+ *    records by the adapter itself. A throw out of `processLegacy`
+ *    is logged by the module and treated as a no-op for that event.
+ *  - The runner is responsible for routing every returned
+ *    `DispositionRecord` through the T.3.C disposition writer; the
+ *    module does NOT inspect the records itself.
+ *  - The runner SHOULD enqueue instant-TXF entries on the recipient
+ *    finalization queue (T.5.C) when the adapter detects them.
+ */
+export interface LegacyShapeAdapterRunner {
+  /**
+   * Process one inbound legacy event end-to-end. The implementation
+   * builds a `LegacyShapeAdapterInput`, calls `adaptLegacyShape`, and
+   * routes the resulting `DispositionRecord[]` through the T.3.C
+   * writer.
+   *
+   * @param payload   The decoded legacy payload (one of four shapes).
+   * @param senderTransportPubkey  The AUTHENTICATED Nostr signing
+   *                               pubkey of the event author.
+   */
+  processLegacy(
+    payload: unknown,
+    senderTransportPubkey: string,
+  ): Promise<void>;
+}
+
+/**
+ * Task #151 — per-tokenId finalization context stashed by the default
+ * processToken closure on instant-mode receive. Consumed by the
+ * recipient finalization worker's dispositionWriter callback to
+ * rebuild the locally-stored Token with the attached proof.
+ *
+ * Lifecycle:
+ *  - WRITE: processToken closure (instant path), once per token.
+ *  - READ:  dispositionWriter VALID branch, after the worker has
+ *           polled the aggregator and called the pool's attachProof.
+ *  - DELETE: same dispositionWriter branch on success.
+ *
+ * @internal
+ */
+interface RecipientFinalizationContext {
+  /** Local Token id (from `addToken`); used to find Bob's stored
+   *  pending Token by `this.tokens.get(localTokenId)`. */
+  readonly localTokenId: string;
+  /** SDK source token JSON (state N-1) — needed to re-run
+   *  `finalizeTransferToken` once the proof lands. */
+  readonly sourceTokenJson: unknown;
+  /** Last-tx JSON from the bundle (carries `inclusionProof: null`).
+   *  The dispositionWriter callback patches this to use the actual
+   *  proof returned by the aggregator before re-running finalization. */
+  readonly lastTxJson: Record<string, unknown>;
+  /** Aggregator request id hex used to look up the proof. */
+  readonly requestIdHex: string;
+}
+
 export interface PaymentsModuleConfig {
   /** Auto-sync after operations */
   autoSync?: boolean;
@@ -620,6 +1048,10 @@ export interface PaymentsModuleConfig {
   debug?: boolean;
   /** L1 (ALPHA blockchain) configuration. Set to null to explicitly disable L1. */
   l1?: L1PaymentsModuleConfig | null;
+  /** UXF Inter-Wallet Transfer feature flags. Default: all ON
+   *  (T.8.D part 1 of 2). Pass explicit `false` per-flag to fall back
+   *  to the legacy code path for that surface. */
+  features?: UxfTransferFeatures;
 }
 
 // =============================================================================
@@ -662,6 +1094,13 @@ export interface PaymentsModuleDependencies {
   price?: PriceProvider;
   /** Set of disabled provider IDs — disabled providers are skipped during sync/save */
   disabledProviderIds?: ReadonlySet<string>;
+  /**
+   * Optional CID-reference store for offloading fat KV values (pending V5
+   * tokens, V5 outbox) to IPFS. When absent, those values fall back to
+   * inline JSON in storage.set — acceptable for legacy wallets and tests
+   * but unbounded growth for heavy users. See PROFILE-CID-REFERENCES.md.
+   */
+  cidRefStore?: CidRefStore;
 }
 
 // =============================================================================
@@ -669,8 +1108,59 @@ export interface PaymentsModuleDependencies {
 // =============================================================================
 
 export class PaymentsModule {
-  private readonly moduleConfig: Omit<Required<PaymentsModuleConfig>, 'l1'>;
+  private readonly moduleConfig: Omit<Required<PaymentsModuleConfig>, 'l1' | 'features'>;
+  /**
+   * UXF Inter-Wallet Transfer feature flags (T.2.D.1).
+   * Frozen at construction time. Defaults (T.8.D part 1 of 2): every flag
+   * ON — `senderUxf=true` makes `send({transferMode:'instant'})` route
+   * through the UXF instant-sender; legacy paths remain available by
+   * passing explicit `features: { senderUxf: false, ... }`. Legacy
+   * removal is T.8.D part 2 of 2 (gated on testnet soak).
+   */
+  private readonly features: Required<UxfTransferFeatures>;
   private deps: PaymentsModuleDependencies | null = null;
+
+  /**
+   * Recipient-side ingest worker pool (T.3.E §5.0).
+   *
+   * When `features.recipientUxf === true` AND a pool has been wired via
+   * {@link installIngestWorkerPool}, incoming UXF v1.0 bundles
+   * (`kind: 'uxf-car' | 'uxf-cid'`) are enqueued onto this pool's
+   * bounded queue and dispatched across N=16 parallel workers. Legacy
+   * shapes (V4/V5/V6/`{token,proof}`) bypass the pool regardless of
+   * the feature flag.
+   *
+   * `null` until the caller (Sphere bootstrap) installs a pool — the
+   * pool itself depends on the disposition engine + writer wiring,
+   * which is built one layer up. Default `null` means UXF v1.0 bundles
+   * are dropped with a warning when `recipientUxf` is on but no pool
+   * is installed (graceful degradation — the flag should not silently
+   * route to a stub).
+   */
+  private ingestPool: IngestWorkerPool | null = null;
+
+  /**
+   * Recipient-side legacy-shape adapter runner (T.7.B).
+   *
+   * Invoked by `handleIncomingTransfer` for every event whose payload
+   * matches one of the four §3.4 legacy shapes (Sphere TXF, V6
+   * `COMBINED_TRANSFER`, V5/V4 `INSTANT_SPLIT`, SDK legacy `{token,
+   * proof}`). The runner is responsible for ALL of:
+   *  - decomposing the event into per-token entries,
+   *  - calling `adaptLegacyShape` with all required disposition-engine
+   *    hooks pre-wired,
+   *  - routing each returned `DispositionRecord` through the T.3.C
+   *    {@link DispositionWriter},
+   *  - enqueueing instant-TXF entries on the recipient finalization
+   *    queue (T.5.C).
+   *
+   * `null` until the bootstrap layer (Sphere) installs a runner via
+   * {@link installLegacyShapeAdapter}. When `null` AND
+   * `features.recipientLegacyAdapter === true`, the module logs a
+   * warning per arrival but does NOT route through the adapter (graceful
+   * degradation: the pre-existing legacy storage path still runs).
+   */
+  private legacyShapeAdapterRunner: LegacyShapeAdapterRunner | null = null;
 
   /** L1 (ALPHA blockchain) payments sub-module (null if disabled) */
   readonly l1: L1PaymentsModule | null;
@@ -756,6 +1246,51 @@ export class PaymentsModule {
       debug: config?.debug ?? false,
     };
 
+    // T.8.D part 1 of 2 — UXF feature flags now default ON (production
+    // cutover, no legacy code path removal). The four flags moved from
+    // default-OFF → default-ON in this release; legacy paths remain
+    // available by passing explicit `features: { senderUxf: false, ... }`
+    // and will be removed in T.8.D part 2 of 2 after testnet soak.
+    //
+    // Cross-version interop caveat: a sender with `senderUxf: true` emits
+    // UXF v1.0 wire shapes (`uxf-cid` / `uxf-car`); a receiver running an
+    // older SDK without UXF ingest will not be able to decode them. Pin a
+    // shared SDK version across senders/receivers during the transition,
+    // OR set `senderUxf: false` explicitly to preserve legacy wire-shape
+    // emission. See `docs/uxf/UXF-TRANSFER-IMPL-PLAN.md` §T.8.D.
+    //
+    // Frozen so accidental mutation can't toggle behavior at runtime.
+    this.features = Object.freeze({
+      // T.5.A — instant-mode UXF sender. Default-ON: `payments.send({})`
+      // (or `transferMode: 'instant'`) routes through the new UXF
+      // instant-sender, emitting a `uxf-cid` bundle by default.
+      senderUxf: config?.features?.senderUxf ?? true,
+      // T.3.E — recipient-side ingest worker pool. Default-ON: incoming
+      // UXF v1.0 bundles (`kind: 'uxf-car' | 'uxf-cid'`) enqueue onto the
+      // bounded pool. Legacy V4/V5/V6/`{token,proof}` shapes still
+      // bypass the pool regardless of this flag.
+      recipientUxf: config?.features?.recipientUxf ?? true,
+      // T.7.B — legacy-shape adapter routing flag. Default-ON for
+      // cross-version interop with old senders: inbound legacy events
+      // (Sphere TXF / V6 / V5 / SDK legacy) are decomposed into
+      // `DispositionRecord` synthetic entries and routed through the
+      // T.3.C disposition writer. MUST stay ON if any peer in the
+      // transition window emits legacy wire shapes.
+      recipientLegacyAdapter: config?.features?.recipientLegacyAdapter ?? true,
+      // Phase 8 steelman post-cutover — sending-recovery worker.
+      // Default-ON: catches outbox entries stuck in `'sending'` after a
+      // crash between OrbitDB commit and Nostr publish ack and re-publishes
+      // them idempotently. The worker still no-ops until a republish hook
+      // is wired by the bootstrap layer.
+      recoveryWorker: config?.features?.recoveryWorker ?? true,
+      // Phase 9.6.D — sender-side §6.1 finalization worker. Default-ON
+      // when senderUxf is on: drives instant-mode sends through the full
+      // submit/poll cycle so `transfer:confirmed` fires once the
+      // aggregator anchors the commitment. Flip `false` to suppress the
+      // auto-install (e.g. timer-sensitive unit tests).
+      finalizationWorker: config?.features?.finalizationWorker ?? true,
+    });
+
     // Initialize L1 sub-module by default (L1PaymentsModule has default electrumUrl).
     // Only skip if l1 is explicitly set to null. The module is lazy — it won't
     // open a WebSocket until the first L1 operation is performed.
@@ -775,8 +1310,17 @@ export class PaymentsModule {
    *
    * @returns Resolved configuration with all defaults applied.
    */
-  getConfig(): Omit<Required<PaymentsModuleConfig>, 'l1'> {
+  getConfig(): Omit<Required<PaymentsModuleConfig>, 'l1' | 'features'> {
     return this.moduleConfig;
+  }
+
+  /**
+   * Read-only accessor for the UXF Inter-Wallet Transfer feature flags
+   * (T.2.D.1). Useful for tests and downstream tooling that needs to
+   * verify the configured rollout state.
+   */
+  getFeatures(): Readonly<Required<UxfTransferFeatures>> {
+    return this.features;
   }
 
   /**
@@ -905,6 +1449,830 @@ export class PaymentsModule {
 
     // Subscribe to storage provider events (push-based sync)
     this.subscribeToStorageEvents();
+
+    // Phase 8 steelman post-cutover — start the sending-recovery worker
+    // when both (a) the gate is on AND (b) a worker has been installed
+    // by the bootstrap layer. After T.8.D part 1 of 2 the gate defaults
+    // to `true`; the start is still no-op when no worker is installed
+    // (forensic warning omitted intentionally — the bootstrap is the
+    // single install point and a missing install is a deployment-config
+    // bug, not a hot path). Tests that count timers can opt out via
+    // `features: { recoveryWorker: false }`.
+    if (this.features.recoveryWorker && this.sendingRecoveryWorker !== null) {
+      this.sendingRecoveryWorker.start();
+    }
+
+    // T.3.E — auto-install a default IngestWorkerPool when recipientUxf
+    // is on AND the bootstrap layer has not already wired a custom pool.
+    //
+    // After T.8.D part 1 flipped features.recipientUxf to default-ON,
+    // incoming UXF v1 bundles routed to the gate at handleIncomingTransfer
+    // line 7506 found `this.ingestPool === null` and fell through to the
+    // legacy arm, which does not recognize `kind: 'uxf-car'/'uxf-cid'`
+    // wire shapes — every UXF event was dropped with "Unknown transfer
+    // payload format".
+    //
+    // The default processToken closure mirrors the legacy receive arm
+    // (lines ~7750-7800): assemble → validateToken → parseTokenInfo →
+    // build Token → addToken → addToHistory → emit transfer:incoming.
+    // It captures `this` via closure so it shares all the same per-address
+    // state as the rest of the module.
+    //
+    // Consumer-installed pools (via installIngestWorkerPool()) win: the
+    // check `!this.ingestPool` preserves that contract. Calling
+    // installIngestWorkerPool() AFTER initialize() replaces the
+    // auto-installed pool (existing idempotent replace logic handles it).
+    if (this.features.recipientUxf && !this.ingestPool) {
+      const lru = new ReplayLRU();
+      const mutex = new PerTokenMutex();
+
+      const processToken: ProcessTokenFn = async (tokenRoot, verified, ctx) => {
+        // Guard: only process token-roots that are CLAIMED for this recipient.
+        //
+        // Phase 9.6.A advisory-vs-claimed filter (steelman fix #160).
+        // The pool dispatcher passes BOTH verified.claimedTokens AND
+        // verified.advisoryUnclaimedRoots to every processToken call (by
+        // design — consumer-installed pools may want to inspect advisory roots
+        // for telemetry or §5.4 / §B' replica-merge purposes). The default
+        // wallet-receive closure must NOT attempt pkg.assemble() on advisory
+        // roots — they have no manifest entry in the recipient's view of the
+        // bundle (only the sender's claimed targets are written into the
+        // manifest), so assemble() would throw UxfError TOKEN_NOT_FOUND. The
+        // oracle would also correctly reject them as invalid for this recipient.
+        //
+        // **Why ctx.isClaimed (not a Set lookup)**: previously this gate
+        // re-derived the membership question by building a Set from
+        // verified.claimedTokens and asking `has(tokenRoot.tokenId)`. The
+        // pool already knows which list the root came from — it iterates
+        // claimedTokens and advisoryUnclaimedRoots separately — so the
+        // dispatcher now passes the discriminator directly, and the gate
+        // reduces to a single boolean check. The discriminator approach
+        // is also robust against a hostile sender shipping the SAME
+        // tokenId in BOTH lists (the verifier should reject; defense-in-
+        // depth here is to trust only ctx.isClaimed === true for the
+        // claimed-token write path).
+        //
+        // **Advisory-only contract** (when ctx.isClaimed === false):
+        //   - MUST NOT trigger sender-attribution events
+        //     (`transfer:incoming`) or the `RECEIVED` history entry —
+        //     those would falsely credit the bundle's sender for tokens
+        //     the sender never claimed to deliver.
+        //   - MUST NOT be eligible for cascade source-side write-back
+        //     (no `_sent` / outbox entry, no `transfer:confirmed` for the
+        //     advisory root).
+        //   - MUST NOT count toward the sender's delivery acknowledgement
+        //     ledger.
+        // The default closure satisfies this by returning early below; any
+        // future "found money" credit path that handles advisory roots
+        // MUST be wired in a separate branch with explicit policy.
+        if (!ctx.isClaimed) {
+          logger.debug(
+            'Payments',
+            `UXF processToken: skipping advisoryUnclaimedRoot ${tokenRoot.tokenId.slice(0, 16)} — not claimed for this recipient`,
+            {
+              bundleCid: ctx.bundleCid.slice(0, 16),
+              tokenId: tokenRoot.tokenId.slice(0, 16),
+            },
+          );
+          return;
+        }
+        // [DIAG-UXF-RECV] bundle-level: how many tokens are claimed for this recipient?
+        logger.debug('Payments', '[DIAG-UXF-RECV] processToken entry (claimed)', {
+          bundleCid: ctx.bundleCid.slice(0, 16),
+          claimedCount: verified.claimedTokens.length,
+          claimedTokenIds: verified.claimedTokens.map((r) => r.tokenId.slice(0, 16)),
+          thisTokenId: tokenRoot.tokenId.slice(0, 16),
+          isClaimed: true,
+        });
+
+        try {
+          // 1. Reassemble the sender's token JSON from the verified bundle.
+          //    The sender packages the bundle with the SOURCE token's state
+          //    (the sender's predicate), not the recipient's.  The last
+          //    transaction in the bundle IS the transfer-to-recipient tx,
+          //    but the top-level `state` field still points at the sender.
+          //    SdkToken.verify(trustBase) rejects this because
+          //      state.predicate → sender address
+          //      ≠ transactions[-1].data.recipient → recipient address.
+          //    We must construct the recipient's UnmaskedPredicate + state
+          //    and call finalizeTransferToken() (conservative) or patch
+          //    the state JSON and store as pending (instant).
+          const assembledJson = verified.pkg.assemble(tokenRoot.tokenId) as Record<string, unknown>;
+          // [DIAG-UXF-RECV] assemble succeeded
+          logger.debug('Payments', '[DIAG-UXF-RECV] pkg.assemble succeeded', {
+            tokenId: tokenRoot.tokenId.slice(0, 16),
+            txCount: Array.isArray(assembledJson.transactions) ? (assembledJson.transactions as unknown[]).length : 'n/a',
+          });
+
+          // Decide whether recipient-side finalization is needed.
+          // A token with no transfer transactions cannot be finalized (and
+          // is unlikely in production, but guard for tests / edge cases).
+          const txArray = Array.isArray(assembledJson.transactions)
+            ? (assembledJson.transactions as Record<string, unknown>[])
+            : [];
+
+          // Working variables updated by the finalization block.
+          let tokenData: unknown = assembledJson;
+          let tokenStatus: Token['status'] = 'confirmed';
+          // Task #151 — recipient finalization context, populated when
+          // hasNullProof === true so the recipient worker can rebuild
+          // the SDK Token once the proof lands and flip status →
+          // 'confirmed'.
+          // Wave 4 fix — also stash the canonical transactionHash + authenticator
+          // so the recipient `_recipientRequestContextMap` carries values that
+          // match the aggregator's proof on §6.1 race-lost compare. Wave 2
+          // populated the map with the requestId (wrong) which made every
+          // successful poll fire race-lost.
+          let pendingFinalizationCtx: {
+            sourceTokenJson: unknown;
+            lastTxJson: Record<string, unknown>;
+            requestIdHex: string;
+            transactionHash: string;
+            authenticator: string;
+          } | null = null;
+
+          if (txArray.length > 0) {
+            const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const trustBase = (this.deps!.oracle as any).getTrustBase?.();
+            const lastTxJson = txArray.at(-1) as Record<string, unknown> | undefined;
+            const hasNullProof = lastTxJson?.inclusionProof === null;
+
+            if (stClient && trustBase && lastTxJson?.data != null) {
+              try {
+                // Parse TransferTransactionData to get the salt.
+                // This works for BOTH conservative (proof present) and
+                // instant (inclusionProof: null) because we only parse
+                // the `data` sub-object, not the full TransferTransaction.
+                const txData = await TransferTransactionData.fromJSON(lastTxJson.data);
+                const transferSalt = txData.salt;
+
+                // Assemble the source token at state N-1 (genesis + all
+                // transactions EXCEPT the final transfer-to-us).
+                const txCount = verified.pkg.transactionCount(tokenRoot.tokenId);
+                const sourceTokenJson = verified.pkg.assembleAtState(
+                  tokenRoot.tokenId,
+                  txCount - 1,
+                );
+                const sourceToken = await SdkToken.fromJSON(sourceTokenJson);
+
+                // Construct recipient UnmaskedPredicate and TokenState.
+                const signingService = await this.createSigningService();
+                const recipientPredicate = await UnmaskedPredicate.create(
+                  sourceToken.id,
+                  sourceToken.type,
+                  signingService,
+                  HashAlgorithm.SHA256,
+                  transferSalt,
+                );
+                const recipientState = new TokenState(recipientPredicate, null);
+
+                if (!hasNullProof) {
+                  // 2a. Conservative path: all inclusion proofs are present.
+                  //    Call the shared finalizeTransferToken helper which
+                  //    mirrors the legacy receive arm (line ~7873).
+                  //    This calls stClient.finalizeTransaction() to produce
+                  //    a fully-verified SDK Token with the recipient's state.
+                  const lastTx = await TransferTransaction.fromJSON(lastTxJson);
+                  const finalizedToken = await this.finalizeTransferToken(
+                    sourceToken,
+                    lastTx,
+                    stClient,
+                    trustBase,
+                  );
+                  tokenData = finalizedToken.toJSON();
+                  // tokenStatus remains 'confirmed'
+                } else {
+                  // 2b. Instant path: the last tx has inclusionProof: null.
+                  //    TransferTransaction.fromJSON(null_proof) throws, so
+                  //    we cannot call finalizeTransaction().  Instead:
+                  //    - Patch the assembled JSON's `state` field with the
+                  //      recipient's state (so the stored sdkData records
+                  //      the correct owner predicate).
+                  //    - Store as status='pending'; oracle validation is
+                  //      deferred per spec §5.3 [E] (unfinalizedCount > 0).
+                  //    - Stash a finalization context so the recipient
+                  //      worker (Task #151) can rebuild the SDK Token
+                  //      once the aggregator returns the proof.
+                  tokenData = { ...assembledJson, state: recipientState.toJSON() };
+                  tokenStatus = 'pending';
+
+                  // Wave 5 fix — Task #151 / R1 (dead-code).
+                  //
+                  // Wave 4 R1 attempted to mirror the sender wiring by
+                  // calling `TransferCommitment.fromJSON(lastTxJson)`.
+                  // That ALWAYS throws: `lastTxJson` has the
+                  // TransferTransaction shape `{data, inclusionProof}`
+                  // (see line ~7759 where the SENDER builds the bundle:
+                  // `transferTxJson = { data: commitment.toJSON()
+                  // .transactionData, inclusionProof: null }`), NOT the
+                  // TransferCommitment shape `{requestId,
+                  // transactionData, authenticator}` that `fromJSON`
+                  // requires. `TransferCommitment.isJSON` returns false
+                  // and `fromJSON` raises `InvalidJsonStructureError`.
+                  // The outer try/catch silently swallowed the throw,
+                  // `pendingFinalizationCtx` stayed null, the entire
+                  // downstream wire-up was dead code at runtime, and
+                  // §6.1 race-lost still fired on every successful
+                  // recipient poll (because `_recipientRequestContextMap`
+                  // never received a real entry).
+                  //
+                  // The correct derivation paths:
+                  //
+                  //   1. `transactionHash` — the canonical 68-char SDK
+                  //      DataHash imprint hex of the transfer-tx-data.
+                  //      The aggregator anchors EXACTLY this value in
+                  //      `proof.transactionHash` (see
+                  //      `StateTransitionClient.submitTransferCommitment`:
+                  //      `client.submitCommitment(commitment.requestId,
+                  //      await commitment.transactionData.calculateHash(),
+                  //      commitment.authenticator)`). We compute it
+                  //      directly from `txData.calculateHash().toJSON()`
+                  //      — `txData` was already parsed via
+                  //      `TransferTransactionData.fromJSON(lastTxJson.data)`
+                  //      at line ~1591, so this path is independent of
+                  //      `inclusionProof: null`.
+                  //
+                  //   2. `requestId` — `RequestId.create(senderPublicKey,
+                  //      sourceStateHash)` (matches
+                  //      `TransferCommitment.create`). The recipient
+                  //      derives `senderPublicKey` from the source-state
+                  //      predicate (`PredicateEngineService.createPredicate
+                  //      (state.predicate).publicKey`), and
+                  //      `sourceStateHash = txData.sourceState.calculateHash()`.
+                  //
+                  //   3. `authenticator` — by design EMPTY (`''`) on the
+                  //      queue entry. Wave 6 reverted Wave 5's sender-
+                  //      side embed: the IPLD wire format
+                  //      (deconstructTransferData → assembleTransactionData)
+                  //      does NOT preserve any `data.authenticator` field,
+                  //      so the embed was dead code (the recipient always
+                  //      observed `undefined`). The queue-entry
+                  //      `authenticator` is therefore metadata-only —
+                  //      `canonicalAuthenticatorEquals` (import-inclusion-
+                  //      proof.ts) returns `'match'` when one side is
+                  //      empty, so the §6.3 binding compare degrades to
+                  //      `transactionHash`-only without rejecting valid
+                  //      proofs.
+                  //
+                  //      Defense layout:
+                  //        - §6.1 race-lost: keyed by `transactionHash`
+                  //          alone — fully unaffected by the empty
+                  //          authenticator.
+                  //        - §6.3 most-recent-proof: compares the
+                  //          aggregator-served authenticator on the
+                  //          ATTACHED proof vs the aggregator-served
+                  //          authenticator on the OBSERVED poll — both
+                  //          come from the aggregator, never from the
+                  //          queue entry. Empty queue authenticator is
+                  //          benign.
+                  //        - Forged-authenticator defense is provided by
+                  //          trust-base verification: the proof verifier
+                  //          rejects unauthentic proofs with
+                  //          `PATH_INVALID` / `NOT_AUTHENTICATED` BEFORE
+                  //          the binding compare runs.
+                  try {
+                    // (a) Canonical transactionHash imprint hex (matches
+                    //     the aggregator's stored value).
+                    const txDataHash = await txData.calculateHash();
+                    const txHashImprintHex = txDataHash.toJSON();
+
+                    // (b) Canonical requestId. The source-state predicate
+                    //     was already loaded via `sourceToken.state.predicate`,
+                    //     but we use the SDK's `PredicateEngineService` for
+                    //     symmetry and to extract `publicKey` cleanly.
+                    const senderPredicate = await PredicateEngineService.createPredicate(
+                      txData.sourceState.predicate,
+                    );
+                    // The DefaultPredicate base class exposes a
+                    // `publicKey: Uint8Array` getter (see
+                    // node_modules/@unicitylabs/state-transition-sdk/lib/
+                    // predicate/embedded/DefaultPredicate.d.ts). The
+                    // `IPredicate` interface that `createPredicate`
+                    // returns does NOT declare `publicKey` (it's only on
+                    // `MaskedPredicate`/`UnmaskedPredicate` concrete
+                    // classes), so we narrow via runtime check + cast.
+                    const senderPubkey = (senderPredicate as unknown as { publicKey?: Uint8Array }).publicKey;
+                    if (!(senderPubkey instanceof Uint8Array) || senderPubkey.length === 0) {
+                      const engineStr = String(
+                        (senderPredicate as unknown as { engine?: unknown }).engine ?? 'unknown',
+                      );
+                      throw new Error(
+                        `Sender predicate (engine=${engineStr}) does not expose a publicKey — cannot derive recipient requestId for instant-mode finalization`,
+                      );
+                    }
+                    const sourceStateHash = await txData.sourceState.calculateHash();
+                    const reqIdObj = await RequestId.create(senderPubkey, sourceStateHash);
+                    const reqIdHex = reqIdObj.toJSON();
+
+                    // (c) Authenticator — by design ABSENT at ingest time.
+                    //
+                    // Wave 6: the §6.3 binding compare's queue-entry
+                    // `authenticator` field is metadata-only. The IPLD
+                    // wire format (deconstructTransferData →
+                    // assembleTransactionData) does NOT preserve any
+                    // `data.authenticator` field — only the canonical
+                    // {recipient, salt, recipientDataHash, message,
+                    // nametagRefs} pass through. Wave 5's sender-side
+                    // embed was therefore dead code (the recipient
+                    // always saw `undefined`). We degrade gracefully
+                    // here:
+                    //
+                    //   - `transactionHash` byte equality (§6.1 race-lost
+                    //     and §6.3 forbidden-case binding) is the
+                    //     load-bearing check; we already populate it
+                    //     above.
+                    //   - `authenticator` is best-effort defense-in-
+                    //     depth; the §6.3 most-recent-proof check
+                    //     compares the ATTACHED proof's authenticator
+                    //     vs the OBSERVED poll's authenticator — both
+                    //     come from the AGGREGATOR, not from the queue
+                    //     entry. Leaving the queue entry's authenticator
+                    //     null is therefore safe.
+                    //
+                    // `canonicalAuthenticatorEquals` (import-inclusion-
+                    // proof.ts) returns `'match'` when the queue side
+                    // is empty/null so the importInclusionProof
+                    // operator path remains usable. Production bundles
+                    // never carry `data.authenticator`; what's load-
+                    // bearing is `transactionHash`.
+                    const authenticatorJsonStr = '';
+
+                    pendingFinalizationCtx = {
+                      sourceTokenJson,
+                      lastTxJson,
+                      requestIdHex: reqIdHex,
+                      transactionHash: txHashImprintHex,
+                      authenticator: authenticatorJsonStr,
+                    };
+                  } catch (deriveErr) {
+                    // Hard failure to derive the canonical values. The
+                    // recipient worker cannot finalize this token; we
+                    // surface this as `transfer:operator-alert` (NOT a
+                    // silent log) per Wave 5 R1: silent dead-code is
+                    // exactly the bug we are closing.
+                    const errMsg = deriveErr instanceof Error ? deriveErr.message : String(deriveErr);
+                    logger.warn(
+                      'Payments',
+                      'Wave 5 R1: failed to derive recipient finalization context (transactionHash + requestId)',
+                      {
+                        tokenId: tokenRoot.tokenId.slice(0, 16),
+                        err: errMsg,
+                      },
+                    );
+                    try {
+                      this.deps!.emitEvent('transfer:operator-alert', {
+                        code: 'structural',
+                        tokenId: tokenRoot.tokenId,
+                        message:
+                          `Wave 5 R1 hard-fail: cannot derive recipient ` +
+                          `finalization context for tokenId=${tokenRoot.tokenId.slice(0, 16)} — ` +
+                          `recipient worker will not enqueue this token. ` +
+                          `Cause: ${errMsg}`,
+                      });
+                    } catch {
+                      // emitter unavailable — diagnostic only path
+                    }
+                  }
+                }
+              } catch (finalizeErr) {
+                // If recipient-side finalization fails unexpectedly, fall
+                // back to submitting the assembled JSON directly to the
+                // oracle for a best-effort RPC validation.  This preserves
+                // the previous behaviour and keeps the pipeline running.
+                logger.warn(
+                  'Payments',
+                  'UXF recipient-side finalization failed, falling back to assembled JSON',
+                  { tokenId: tokenRoot.tokenId.slice(0, 16), err: finalizeErr },
+                );
+                tokenData = assembledJson;
+                // tokenStatus remains 'confirmed'
+              }
+            }
+            // If stClient/trustBase are absent (e.g., in tests with mocked
+            // oracle), fall through with tokenData = assembledJson and
+            // tokenStatus = 'confirmed' (pre-existing behaviour).
+          }
+
+          // 2. Validate via oracle — skipped for pending instant-mode tokens
+          //    (spec §5.3 [E]: unfinalizedCount > 0 → PENDING, isSpent
+          //    check deferred until allFinalized).
+          if (tokenStatus !== 'pending') {
+            const validation = await this.deps!.oracle.validateToken(tokenData);
+            // [DIAG-UXF-RECV] oracle validation outcome
+            logger.debug('Payments', '[DIAG-UXF-RECV] oracle.validateToken result', {
+              tokenId: tokenRoot.tokenId.slice(0, 16),
+              valid: validation.valid,
+            });
+            if (!validation.valid) {
+              logger.warn('Payments', 'Received invalid UXF token', {
+                tokenId: tokenRoot.tokenId.slice(0, 16),
+              });
+              return;
+            }
+          }
+
+          // 3. Parse + build wallet Token — mirrors legacy arm lines ~7751-7768.
+          const tokenInfo = await parseTokenInfo(tokenData);
+          const sdkDataStr = typeof tokenData === 'string'
+            ? tokenData
+            : JSON.stringify(tokenData);
+          const token: Token = {
+            id: tokenInfo.tokenId ?? crypto.randomUUID(),
+            coinId: tokenInfo.coinId,
+            symbol: tokenInfo.symbol,
+            name: tokenInfo.name,
+            decimals: tokenInfo.decimals,
+            iconUrl: tokenInfo.iconUrl,
+            amount: tokenInfo.amount,
+            status: tokenStatus,
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            sdkData: sdkDataStr,
+          };
+
+          // 4. addToken() deduplicates (tombstone check + stateHash check)
+          //    and persists via save() — mirrors legacy arm line ~7772.
+          const added = await this.addToken(token);
+          // [DIAG-UXF-RECV] addToken outcome
+          logger.debug('Payments', '[DIAG-UXF-RECV] addToken result', {
+            tokenId: tokenRoot.tokenId.slice(0, 16),
+            added,
+            coinId: token.coinId.slice(0, 16),
+            amount: token.amount,
+          });
+          const senderInfo = await this.resolveSenderInfo(ctx.senderTransportPubkey);
+
+          if (added) {
+            // 5. Record history entry — mirrors legacy arm lines ~7776-7787.
+            const incomingTokenId = extractTokenIdFromSdkData(token.sdkData);
+            await this.addToHistory({
+              type: 'RECEIVED',
+              amount: token.amount,
+              coinId: token.coinId,
+              symbol: token.symbol,
+              timestamp: Date.now(),
+              senderPubkey: ctx.senderTransportPubkey,
+              ...senderInfo,
+              memo: ctx.payload.memo,
+              tokenId: incomingTokenId || token.id,
+            });
+
+            // 6. Emit transfer:incoming — mirrors legacy arm lines ~7789-7798.
+            const incomingTransfer: IncomingTransfer = {
+              id: ctx.bundleCid,
+              senderPubkey: ctx.senderTransportPubkey,
+              senderNametag: senderInfo.senderNametag,
+              tokens: [token],
+              memo: ctx.payload.memo,
+              receivedAt: Date.now(),
+            };
+            this.deps!.emitEvent('transfer:incoming', incomingTransfer);
+            logger.debug(
+              'Payments',
+              `UXF token received: ${token.id}, ${token.amount} ${token.symbol}`,
+            );
+
+            // Task #151 — Enqueue PENDING entries for the recipient
+            // finalization worker. This is the "missing wire" fixed
+            // by #151: previously the instant-mode receive path stored
+            // the token as `'pending'` but never enqueued it for
+            // proof-attachment, so the token stayed in `'pending'`
+            // forever and re-spend phases failed with
+            // SEND_INSUFFICIENT_BALANCE.
+            //
+            // The enqueue is a best-effort fire-and-forget: a missing
+            // queue (no recipientUxf or test stub without oracle) is
+            // a no-op. The worker's processOneToken is also fire-and-
+            // forget — errors propagate through `transfer:operator-
+            // alert` events, never throw out of processToken.
+            if (
+              tokenStatus === 'pending' &&
+              pendingFinalizationCtx !== null &&
+              this._recipientFinalizationQueue !== null &&
+              this.finalizationWorkerRecipient !== null
+            ) {
+              try {
+                const tokenIdForQueue = incomingTokenId ?? token.id;
+                const pCtx = pendingFinalizationCtx;
+                const reqId = pCtx.requestIdHex;
+
+                // Stash the finalization context for the dispositionWriter
+                // VALID branch.
+                this._recipientFinalizationContext.set(tokenIdForQueue, {
+                  localTokenId: token.id,
+                  sourceTokenJson: pCtx.sourceTokenJson,
+                  lastTxJson: pCtx.lastTxJson,
+                  requestIdHex: reqId,
+                });
+
+                // Stash the resolver context so the worker's
+                // RequestContextResolver can find the (transactionHash,
+                // authenticator) pair on the §6.1 race-lost compare.
+                // The recipient never re-submits (the aggregator
+                // already has the commitment from the sender), but the
+                // resolver still needs to surface a non-null
+                // RequestContext.
+                //
+                // Wave 4 fix — populate with the REAL canonical
+                // transactionHash + authenticator derived from the
+                // SDK commitment in pendingFinalizationCtx. Previously
+                // both fields were filled with the requestId / empty
+                // string, which made §6.1 fire race-lost on every
+                // successful aggregator poll (because the proof's
+                // transactionHash is the tx-data-hash imprint, not the
+                // requestId).
+                if (!this._recipientRequestContextMap.has(reqId)) {
+                  this._recipientRequestContextMap.set(reqId, {
+                    transactionHash: pCtx.transactionHash,
+                    authenticator: pCtx.authenticator,
+                    nextEntryRest: { status: 'valid' as const },
+                  });
+                }
+
+                const addrId = (() => {
+                  const directAddr = this.deps!.identity.directAddress;
+                  return typeof directAddr === 'string' && directAddr.length > 0
+                    ? computeAddressId(directAddr)
+                    : this.deps!.identity.chainPubkey;
+                })();
+
+                // Enqueue one entry per unfinalized tx. Today the
+                // default closure handles only the LAST tx (instant
+                // mode is K=1). Chain-mode (K>1) instant tokens are
+                // not yet exercised by this default; the entry-id
+                // composite (`${tokenId}:${txIndex}`) reserves the
+                // shape for future K>1 wiring.
+                // Wave 4 fix — populate with canonical transactionHash +
+                // authenticator from pendingFinalizationCtx (real values
+                // derived from the SDK commitment), NOT requestId / empty.
+                const entry: FinalizationQueueEntry = {
+                  entryId: entryIdFor(tokenIdForQueue, txArray.length - 1),
+                  tokenId: tokenIdForQueue,
+                  bundleCid: ctx.bundleCid, // outer ctx = ProcessTokenContext
+                  txIndex: txArray.length - 1,
+                  commitmentRequestId: reqId,
+                  transactionHash: pCtx.transactionHash,
+                  authenticator: pCtx.authenticator,
+                  submittedAt: Date.now(),
+                  createdAt: Date.now(),
+                  submitRetryCount: 0,
+                  proofErrorCount: 0,
+                  status: 'pending',
+                  source: 'received',
+                };
+                await this._recipientFinalizationQueue.add(addrId, entry);
+
+                // Fire-and-forget drive of the worker. The worker
+                // handles its own concurrency caps + per-token mutex.
+                const worker = this.finalizationWorkerRecipient;
+                void worker
+                  .processOneToken(tokenIdForQueue)
+                  .catch((werr) => {
+                    logger.debug(
+                      'Payments',
+                      `Task #151: recipient worker.processOneToken threw for ${tokenIdForQueue.slice(0, 16)}: ${werr instanceof Error ? werr.message : String(werr)}`,
+                    );
+                  });
+              } catch (enqErr) {
+                // Enqueue failure is non-fatal — the token is still
+                // stored as 'pending' and the user can re-trigger via
+                // payments.receive({ finalize: true }) on the legacy
+                // path.
+                logger.warn(
+                  'Payments',
+                  `Task #151: failed to enqueue PENDING finalization entry for ${tokenRoot.tokenId.slice(0, 16)}`,
+                  { err: enqErr instanceof Error ? enqErr.message : String(enqErr) },
+                );
+              }
+            }
+          } else {
+            logger.debug(
+              'Payments',
+              `UXF duplicate token ignored: ${token.id}, ${token.amount} ${token.symbol}`,
+            );
+          }
+        } catch (err) {
+          logger.error('Payments', 'Default UXF processToken failed', {
+            tokenId: tokenRoot.tokenId.slice(0, 16),
+            err,
+          });
+          // Re-throw so the pool aborts this token only (per-token error
+          // isolation is the pool's responsibility per §5.0 W23).
+          throw err;
+        }
+      };
+
+      this.ingestPool = new IngestWorkerPool({
+        lru,
+        perTokenMutex: mutex,
+        processToken,
+        emit: (event, payload) => this.deps!.emitEvent(event, payload),
+      });
+      logger.debug(
+        'Payments',
+        'Default IngestWorkerPool auto-installed (recipientUxf default-on)',
+      );
+    }
+
+    // Task #169 — Per-initialize AbortController. Aborted in destroy()
+    // BEFORE awaiting worker.stop() so in-flight runFinalizationCycle
+    // invocations + their pending sleep(...) timers terminate
+    // deterministically. Recreated each initialize() because aborted
+    // signals cannot be reset.
+    this._workerAbortController = new AbortController();
+
+    // Round 7 (FIX 3) — Shared per-tokenId mutex. Constructed once per
+    // initialize() and plumbed into the sender + recipient finalization
+    // workers AND the operator escape-hatch InclusionProofImporter so
+    // all three paths serialize against the same read-decide-write
+    // window when they touch the same tokenId. Without this, a
+    // concurrent `finalizeTransferToken(X)` and `importInclusionProof(X)`
+    // race in their respective per-tokenId guards (each builder
+    // previously created its own fresh PerTokenMutex), corrupting the
+    // manifest's audit trail or re-queuing duplicate K-1 entries.
+    this._sharedPerTokenMutex = new PerTokenMutex();
+
+    // Phase 9.6.D — auto-install the sender-side finalization worker when
+    // `senderUxf` is on AND `finalizationWorker` is on AND no consumer has
+    // already installed one via `installFinalizationWorkerSender()`.
+    //
+    // The auto-installed worker uses lightweight in-memory adapters for the
+    // pool/manifest/tombstone/queue 4-step write order (no OrbitDB required).
+    // These in-memory writes are sufficient to drive the §6.1 cycle to
+    // completion and emit `transfer:confirmed`. The full OrbitDB-backed
+    // adapters can be injected by the bootstrap layer (Sphere) via
+    // `installFinalizationWorkerSender()` when it has the full profile stack.
+    //
+    // Consumer-installed workers (installFinalizationWorkerSender()) win:
+    // the `!this.finalizationWorkerSender` check preserves that contract.
+    if (
+      this.features.senderUxf &&
+      this.features.finalizationWorker &&
+      !this.finalizationWorkerSender
+    ) {
+      const aggregatorClient = this.deps!.oracle.getAggregatorClient?.();
+      if (aggregatorClient === null || aggregatorClient === undefined) {
+        // Oracle stub does not expose an aggregator client; skip auto-install.
+        // Tests with mocked oracles (no getAggregatorClient) take this path.
+        logger.debug(
+          'Payments',
+          'FinalizationWorkerSender auto-install skipped: oracle has no getAggregatorClient()',
+        );
+      } else {
+        const directAddr = this.deps!.identity.directAddress;
+        const workerAddressId =
+          typeof directAddr === 'string' && directAddr.length > 0
+            ? computeAddressId(directAddr)
+            : this.deps!.identity.chainPubkey;
+        this.finalizationWorkerSender = buildDefaultFinalizationWorkerSender({
+          addressId: workerAddressId,
+          oracle: this.deps!.oracle,
+          senderOutboxMap: this._senderOutboxMap,
+          senderRequestContextMap: this._senderRequestContextMap,
+          emit: (type, data) => this.deps!.emitEvent(type, data),
+          // Task #169 — wire the per-initialize AbortController's signal
+          // through to the worker so destroy() can cancel in-flight
+          // submit/poll cycles + sleep timers.
+          signal: this._workerAbortController.signal,
+          // Round 7 (FIX 3) — share per-tokenId mutex with recipient
+          // worker + operator importer so all three paths serialize
+          // against the same read-decide-write window.
+          perTokenMutex: this._sharedPerTokenMutex,
+        });
+        this.finalizationWorkerSender.start();
+        logger.debug(
+          'Payments',
+          'Default FinalizationWorkerSender auto-installed (senderUxf default-on)',
+        );
+      }
+    }
+
+    // Task #151 — auto-install the recipient-side finalization worker
+    // when `recipientUxf` is on AND `finalizationWorker` is on AND no
+    // consumer has already installed one via
+    // `installFinalizationWorkerRecipient()`.
+    //
+    // The auto-installed worker uses lightweight in-memory adapters
+    // (FinalizationQueue + manifestCas + tombstones + pool + queue +
+    // stub revaluateHooks/cascadeWalker). Its dispositionWriter is
+    // wired back to PaymentsModule via the
+    // `_recipientFinalizationContext` map: when the worker writes a
+    // VALID disposition for a tokenId, PaymentsModule rebuilds the SDK
+    // Token via `finalizeTransferToken` and overwrites the locally-
+    // stored Token's sdkData + flips status to 'confirmed'.
+    //
+    // This is the minimum production-ready harness that closes the
+    // S2 e2e loop (Bob receives instant tokens → re-spends them).
+    // Bootstrap layers (Sphere) MAY override via
+    // `installFinalizationWorkerRecipient()` for a full §5.5 / §6.2
+    // implementation backed by Profile + OrbitDB.
+    //
+    // FIXME(#151): the in-memory queue + finalization context map are
+    // NOT persisted across `Sphere.destroy()` and process restart.
+    // Recovery on next launch requires either a manifest scan or an
+    // external re-trigger (operator escape-hatch). The Profile-backed
+    // FinalizationQueue (T.5.C / Wave G.7) deferred to a future wave
+    // closes this gap.
+    if (
+      this.features.recipientUxf &&
+      this.features.finalizationWorker &&
+      !this.finalizationWorkerRecipient
+    ) {
+      const aggregatorClient = this.deps!.oracle.getAggregatorClient?.();
+      if (aggregatorClient === null || aggregatorClient === undefined) {
+        logger.debug(
+          'Payments',
+          'FinalizationWorkerRecipient auto-install skipped: oracle has no getAggregatorClient()',
+        );
+      } else {
+        const directAddr = this.deps!.identity.directAddress;
+        const recipientAddressId =
+          typeof directAddr === 'string' && directAddr.length > 0
+            ? computeAddressId(directAddr)
+            : this.deps!.identity.chainPubkey;
+        const built = buildDefaultFinalizationWorkerRecipient({
+          addressId: recipientAddressId,
+          oracle: this.deps!.oracle,
+          recipientRequestContextMap: this._recipientRequestContextMap,
+          recipientFinalizationContext: this._recipientFinalizationContext,
+          tokens: this.tokens,
+          finalizeTransferToken: (sourceToken, lastTx, stClient, trustBase) =>
+            this.finalizeTransferToken(sourceToken, lastTx, stClient, trustBase),
+          getStateTransitionClient: () =>
+            this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          getTrustBase: () => (this.deps!.oracle as any).getTrustBase?.(),
+          save: () => this.save(),
+          emit: (type, data) => this.deps!.emitEvent(type, data),
+          signal: this._workerAbortController.signal,
+          // Round 7 (FIX 3) — share per-tokenId mutex with sender worker
+          // + operator importer so all three paths serialize against the
+          // same read-decide-write window.
+          perTokenMutex: this._sharedPerTokenMutex,
+        });
+        this._recipientFinalizationQueue = built.queue;
+        this.finalizationWorkerRecipient = built.worker;
+        // Wave 7 hygiene: retain the streak-cleanup callback so destroy()
+        // can wipe the closure-local `saveFailureStreak` Map alongside
+        // the other context maps.
+        this._recipientSaveFailureStreakClear = built.clearSaveFailureStreak;
+        this.finalizationWorkerRecipient.start();
+        logger.debug(
+          'Payments',
+          'Default FinalizationWorkerRecipient auto-installed (recipientUxf default-on)',
+        );
+      }
+    }
+
+    // Round 5 (FIX 1) — auto-install the operator escape-hatch importer
+    // and revalidate-cascaded runner (T.5.D). Before Round 5, no
+    // production code path called `installInclusionProofImporter()` /
+    // `installRevalidateCascadedRunner()`, so every wallet that
+    // bootstrapped through `Sphere.init()` threw
+    // `OPERATOR_ESCAPE_HATCH_NOT_CONFIGURED` on the first
+    // `payments.importInclusionProof()` / `payments.revalidateCascadedChildren()`
+    // call.
+    //
+    // The auto-installed defaults use lightweight in-memory adapters
+    // (mirroring `buildDefaultFinalizationWorkerSender`'s pattern):
+    //  - `InMemoryDispositionStorageAdapter` for `_invalid` / `_audit`
+    //  - In-memory `MinimalManifestStorage` + a fresh `ManifestStore`
+    //    bound to a fresh `Lamport` clock
+    //  - Stub `queueScanner` (returns no entries) and stub
+    //    `verifyProof` (returns `'NOT_AUTHENTICATED'`) so the importer
+    //    fails closed on every operator-supplied proof until the
+    //    bootstrap layer overrides
+    //
+    // Bootstrap layers (Sphere) MAY override either by calling
+    // `installInclusionProofImporter()` / `installRevalidateCascadedRunner()`
+    // BEFORE `initialize()` (the `!this.inclusionProofImporter` checks
+    // preserve that contract) or AFTER `initialize()` (the install
+    // methods replace the auto-installed instance). Production
+    // override should construct an `OrbitDbDispositionStorageAdapter`
+    // bound to the wallet's ProfileDatabase and an OrbitDB-backed
+    // ManifestStore — see `OrbitDbDispositionStorageAdapter` JSDoc for
+    // the wiring sketch.
+    if (this.inclusionProofImporter === null) {
+      this.inclusionProofImporter = buildDefaultInclusionProofImporter({
+        emit: (type, data) => this.deps!.emitEvent(type, data),
+        // Round 7 (FIX 3) — share per-tokenId mutex with finalization
+        // workers so concurrent finalize + operator import on the same
+        // tokenId serialize against the read-decide-write window.
+        perTokenMutex: this._sharedPerTokenMutex ?? undefined,
+      });
+      logger.debug(
+        'Payments',
+        'Default InclusionProofImporter auto-installed (in-memory disposition storage)',
+      );
+    }
+    if (this.revalidateCascadedRunner === null) {
+      this.revalidateCascadedRunner = buildDefaultRevalidateCascadedRunner();
+      logger.debug(
+        'Payments',
+        'Default RevalidateCascadedRunner auto-installed (in-memory manifest scanner)',
+      );
+    }
   }
 
   /**
@@ -926,17 +2294,43 @@ export class PaymentsModule {
 
       // Load metadata from TokenStorageProviders (archived, tombstones, forked)
       // Active tokens are NOT stored in TXF - they are loaded from token-xxx files
+      //
+      // Address guard: reject data whose `_meta.address` doesn't match the
+      // current identity. Accept three representations (one per writer):
+      //   - L1 bech32 (legacy file storage writes this)
+      //   - chain pubkey (some providers record the pubkey)
+      //   - Profile short ID (`DIRECT_{first6}_{last6}` — written by
+      //     ProfileTokenStorageProvider, derived via `computeAddressId`)
+      //
+      // NOTE: This guard is an integrity check (catch misrouted or
+      // corrupted data), not a security boundary. A writer with storage
+      // access can forge `_meta.address` trivially.
+      const currentL1 = this.deps!.identity.l1Address;
+      const currentChain = this.deps!.identity.chainPubkey;
+      const currentDirect = this.deps!.identity.directAddress;
+      const currentProfileShortId = currentDirect ? computeAddressId(currentDirect) : null;
+
       const providers = this.getTokenStorageProviders();
       for (const [id, provider] of providers) {
         try {
           const result = await provider.load();
           if (result.success && result.data) {
-            // Address guard: reject data from a different address
             const loadedMeta = (result.data as TxfStorageDataBase)?._meta;
-            const currentL1 = this.deps!.identity.l1Address;
-            const currentChain = this.deps!.identity.chainPubkey;
-            if (loadedMeta?.address && currentL1 && loadedMeta.address !== currentL1 && loadedMeta.address !== currentChain) {
-              logger.warn('Payments', `Load: rejecting data from provider ${id} — address mismatch (got=${loadedMeta.address.slice(0, 20)}... expected=${currentL1.slice(0, 20)}...)`);
+            if (
+              loadedMeta?.address &&
+              loadedMeta.address !== currentL1 &&
+              loadedMeta.address !== currentChain &&
+              loadedMeta.address !== currentProfileShortId
+            ) {
+              const accepted = [
+                currentL1 ? `L1=${currentL1.slice(0, 16)}…` : null,
+                currentChain ? `chain=${currentChain.slice(0, 16)}…` : null,
+                currentProfileShortId ? `profile=${currentProfileShortId}` : null,
+              ].filter(Boolean).join(', ');
+              logger.warn(
+                'Payments',
+                `Load: rejecting data from provider ${id} — address mismatch (got=${loadedMeta.address.slice(0, 24)} accepted=[${accepted}])`,
+              );
               continue;
             }
 
@@ -1009,6 +2403,491 @@ export class PaymentsModule {
   }
 
   /**
+   * Install the recipient-side ingest worker pool (T.3.E §5.0).
+   *
+   * Idempotent: a second call replaces the previous pool, destroying it
+   * first. The bootstrap layer (Sphere) calls this once after wiring up
+   * the disposition engine + writer; subsequent calls are reserved for
+   * test harnesses.
+   *
+   * **No-op when `features.recipientUxf === false`** — the pool sits
+   * unused and the legacy `handleIncomingTransfer` path runs for every
+   * arrival. Installing a pool is cheap (no workers spin up until
+   * `IngestWorkerPool`'s constructor runs); the gate is the flag.
+   *
+   * @param pool A pre-constructed {@link IngestWorkerPool} OR a
+   *             {@link IngestWorkerPoolOptions} object (the module
+   *             constructs the pool itself in the latter case).
+   */
+  installIngestWorkerPool(pool: IngestWorkerPool | IngestWorkerPoolOptions): void {
+    if (this.ingestPool) {
+      // Fire-and-forget destroy — caller is replacing the pool, so
+      // they don't care about prior worker drainage timing.
+      void this.ingestPool.destroy().catch(() => undefined);
+    }
+    this.ingestPool =
+      pool instanceof IngestWorkerPool ? pool : new IngestWorkerPool(pool);
+  }
+
+  // ===========================================================================
+  // T.5.D — Operator escape-hatch (`importInclusionProof` +
+  // `revalidateCascadedChildren`). The wiring layer (Sphere bootstrap)
+  // installs the importer + runner via the two `install*` methods below;
+  // the public API methods then delegate to whichever is installed.
+  //
+  // Both are NULL until installed — the public methods throw
+  // `OPERATOR_ESCAPE_HATCH_NOT_CONFIGURED` if invoked before installation,
+  // which surfaces a clear error in environments where the legacy code
+  // paths run without the UXF-aware infrastructure.
+  // ===========================================================================
+
+  /** @internal — set by `installInclusionProofImporter()`. */
+  private inclusionProofImporter: InclusionProofImporter | null = null;
+  /** @internal — set by `installRevalidateCascadedRunner()`. */
+  private revalidateCascadedRunner: RevalidateCascadedRunner | null = null;
+  /** @internal — set by `installSendingRecoveryWorker()`. Phase 8 steelman. */
+  private sendingRecoveryWorker: SendingRecoveryWorker | null = null;
+  /** @internal — auto-installed or set by `installFinalizationWorkerSender()`. Phase 9.6.D. */
+  private finalizationWorkerSender: FinalizationWorkerSender | null = null;
+  /**
+   * @internal — auto-installed FinalizationWorkerRecipient. Task #151.
+   *
+   * Auto-instantiated in `initialize()` when `recipientUxf` is on AND
+   * `finalizationWorker` is on AND no consumer-installed worker is
+   * present. The default harness uses lightweight in-memory adapters
+   * (FinalizationQueue, manifestCas, tombstones, pool, queue) plus a
+   * stub revaluateHooks that always says VALID and a custom
+   * dispositionWriter that flips the local Token's status from
+   * `'pending'` to `'confirmed'` once the proof is attached.
+   *
+   * The default harness IS NOT a complete §5.5 / §6.2 implementation:
+   *  - revaluateHooks short-circuits the [B]/[D]/[E] re-run.
+   *  - cascadeWalker is a no-op (no children scan, no NFT routing).
+   *  - manifestCas/tombstones/pool are in-memory with no replication.
+   *
+   * It IS sufficient to drive the end-to-end e2e instant-mode receive
+   * cycle: Bob's pending tokens transition to confirmed when the
+   * aggregator returns proofs, unblocking the re-spend phase.
+   *
+   * Bootstrap layers (Sphere) MAY override this default by calling
+   * `installFinalizationWorkerRecipient()` BEFORE `initialize()` (the
+   * `!this.finalizationWorkerRecipient` check preserves that contract)
+   * or AFTER `initialize()` (the install method stops the previous
+   * worker and starts the new one).
+   *
+   * TODO(#151-followup): persist the recipient queue + finalization
+   * context across restarts via ProfileTokenStorageProvider's per-
+   * entry-key layout. Today, on `Sphere.destroy()` and process restart,
+   * pending tokens stay in `_recipientFinalizationContext` only until
+   * the process exits; recovery requires a manifest scan or external
+   * re-trigger.
+   *
+   * See `tests/unit/payments/transfer/finalization-worker-recipient-fixtures.ts`
+   * for the full production surface this worker requires.
+   */
+  private finalizationWorkerRecipient: FinalizationWorkerRecipient | null = null;
+  /**
+   * @internal — Task #169. AbortController whose signal is wired into
+   * the sender (and future recipient) finalization workers' `signal`
+   * option AND their `sleep` adapters. Aborted in `destroy()` BEFORE
+   * awaiting `worker.stop()` so in-flight `runFinalizationCycle`
+   * invocations + their pending `sleep(...)` timers terminate
+   * deterministically rather than running orphaned to completion.
+   *
+   * The controller is recreated on every `initialize()` — once
+   * aborted, an AbortSignal cannot be reset, so a destroy()/initialize()
+   * cycle needs a fresh controller for the next worker generation.
+   */
+  private _workerAbortController: AbortController | null = null;
+
+  /**
+   * In-memory outbox for the sender-side finalization worker.
+   * Stores `UxfTransferOutboxEntry` objects by outbox id.
+   * The instant-sender writes here at `delivered-instant` stage;
+   * the worker reads + updates via the injected `FinalizationOutboxWriter`.
+   *
+   * @internal
+   */
+  private readonly _senderOutboxMap: Map<string, UxfTransferOutboxEntry> = new Map();
+
+  /**
+   * Per-requestId context map for the sender-side finalization worker resolver.
+   * Populated by `dispatchUxfInstantSend`'s `commitSources` callback
+   * with `(requestIdHex → RequestContext)`.
+   *
+   * @internal
+   */
+  private readonly _senderRequestContextMap: Map<string, RequestContext> = new Map();
+
+  /**
+   * Task #151 — Per-requestId context map for the recipient-side
+   * finalization worker resolver. Populated by the default processToken
+   * closure on instant-mode receive (where the bundle's last tx has
+   * `inclusionProof: null`). Mirrors {@link _senderRequestContextMap}
+   * but keyed on the bundle's commitmentRequestId.
+   *
+   * @internal
+   */
+  private readonly _recipientRequestContextMap: Map<string, RequestContext> = new Map();
+
+  /**
+   * Task #151 — Per-tokenId finalization context for the recipient
+   * worker. When processToken sees an instant-mode token (last tx has
+   * `inclusionProof: null`), it stores the source-token JSON, the last
+   * transferred-tx JSON, and the recipient predicate / state so that
+   * once the proof lands the worker can rebuild a fully-finalized SDK
+   * Token via {@link finalizeTransferToken} and overwrite the locally-
+   * stored Token with `status: 'confirmed'` so subsequent re-spend
+   * paths can pick it up.
+   *
+   * **In-memory only** — TODO(#151-followup): persist across restarts
+   * by wiring through ProfileTokenStorageProvider's per-entry-key layout
+   * so a wallet that crashes mid-finalization recovers the queue +
+   * context on next launch.
+   *
+   * @internal
+   */
+  private readonly _recipientFinalizationContext: Map<
+    string,
+    RecipientFinalizationContext
+  > = new Map();
+
+  /**
+   * Task #151 — In-memory FinalizationQueue used by the auto-installed
+   * recipient worker. Wired through `buildDefaultFinalizationWorkerRecipient`
+   * to a Map-backed storage adapter. See `_recipientFinalizationContext`
+   * for the persistence caveat (in-memory only).
+   *
+   * @internal
+   */
+  private _recipientFinalizationQueue: FinalizationQueue | null = null;
+
+  /**
+   * Wave 7 hygiene — callback returned by
+   * `buildDefaultFinalizationWorkerRecipient` that clears the closure-
+   * local `saveFailureStreak` Map. Invoked from {@link destroy} so the
+   * streak doesn't outlive the recipient finalization context.
+   *
+   * @internal
+   */
+  private _recipientSaveFailureStreakClear: (() => void) | null = null;
+
+  /**
+   * Round 7 (FIX 3) — shared per-tokenId mutex for all paths that touch
+   * the same `tokenId` within this PaymentsModule instance: the
+   * sender-side FinalizationWorkerSender, the recipient-side
+   * FinalizationWorkerRecipient, AND the operator escape-hatch
+   * InclusionProofImporter. Sharing one mutex per instance ensures
+   * that a concurrent finalize and operator import on the same tokenId
+   * serialize against the read-decide-write window, matching the
+   * `ImportInclusionProofOptions.perTokenMutex` JSDoc contract that
+   * callers SHOULD share with the workers.
+   *
+   * Recreated in `initialize()` (per the same lifecycle as
+   * `_workerAbortController`) and cleared in {@link destroy} so a
+   * destroy()/initialize() cycle starts with a fresh mutex.
+   *
+   * @internal
+   */
+  private _sharedPerTokenMutex: PerTokenMutex | null = null;
+
+  /**
+   * Install the operator inclusion-proof importer (T.5.D, §6.3 escape
+   * hatch). Idempotent — a second call replaces the previous importer.
+   *
+   * The Sphere bootstrap layer constructs the importer with the
+   * production-wired manifest store, disposition storage, finalization
+   * queue scanner, proof verifier, graft callback, override callback,
+   * and event emitter. Tests inject a fully-mocked importer.
+   */
+  installInclusionProofImporter(importer: InclusionProofImporter): void {
+    this.inclusionProofImporter = importer;
+  }
+
+  /**
+   * Round 7 (FIX 1) / Round 8 (FIX 1) — Reconfigure the auto-installed
+   * {@link InclusionProofImporter} with a production-wired
+   * `dispositionStorage` adapter (typically
+   * {@link OrbitDbDispositionStorageAdapter} bound to the wallet's
+   * ProfileDatabase) AND the trust-base-aware proof verifier +
+   * graft/override callbacks. Idempotent: rebuilds and replaces the
+   * current importer using the same shared per-tokenId mutex
+   * (`_sharedPerTokenMutex`) so the new importer continues to serialize
+   * with the finalization workers.
+   *
+   * Bootstrap layers (Sphere) call this after `initialize()` once the
+   * profile stack + oracle are ready to hand them an OrbitDb-backed
+   * adapter and a wired `verifyProof`. When called BEFORE
+   * `initialize()`, it throws `NOT_INITIALIZED` (the importer needs
+   * `this.deps` to wire `emit`).
+   *
+   * Round 8 (FIX 1) — `verifyProof` is now wired through to
+   * `oracle.verifyInclusionProof()` via the bootstrap layer. The
+   * importer's case 8 / 9 short-circuits run against a real
+   * trust-base-aware verifier instead of the Round 7 fail-closed stub.
+   * `graftCallback` / `overrideCallback` accept production callbacks
+   * (the bootstrap layer wires them when the OrbitDB pool/manifest/
+   * tombstone/queue adapters are available); when omitted, the
+   * defaults remain no-ops (unreachable in the default harness because
+   * the stub `queueScanner` returns no entries — bootstrap layers that
+   * wire a real `queueScanner` alongside these callbacks close the
+   * remaining case 3 / 5 / 6 gap).
+   */
+  configureOperatorEscapeHatchStorage(
+    dispositionStorage: import('../../profile/disposition-writer').DispositionPerEntryStorage,
+    options?: {
+      readonly verifyProof?: import('./transfer/import-inclusion-proof').ProofVerifier;
+      readonly graftCallback?: import('./transfer/import-inclusion-proof').ImportProofGraftCallback;
+      readonly overrideCallback?: import('./transfer/import-inclusion-proof').ImportProofOverrideCallback;
+    },
+  ): void {
+    this.ensureInitialized();
+    this.inclusionProofImporter = buildDefaultInclusionProofImporter({
+      emit: (type, data) => this.deps!.emitEvent(type, data),
+      perTokenMutex: this._sharedPerTokenMutex ?? undefined,
+      dispositionStorage,
+      ...(options?.verifyProof !== undefined ? { verifyProof: options.verifyProof } : {}),
+      ...(options?.graftCallback !== undefined ? { graftCallback: options.graftCallback } : {}),
+      ...(options?.overrideCallback !== undefined ? { overrideCallback: options.overrideCallback } : {}),
+    });
+  }
+
+  /**
+   * Install the operator cascade-revalidation runner (T.5.D consumer of
+   * T.5.B.5 cascade walker). Idempotent — a second call replaces the
+   * previous runner.
+   */
+  installRevalidateCascadedRunner(runner: RevalidateCascadedRunner): void {
+    this.revalidateCascadedRunner = runner;
+  }
+
+  /**
+   * Phase 8 steelman post-cutover — install the sending-recovery
+   * worker. Idempotent: a second call stops the previous worker
+   * (await its in-flight scan) and swaps in the new instance. If
+   * `features.recoveryWorker` is `true`, the next `initialize()` call
+   * starts the new worker; if the module is already initialized, the
+   * worker is started immediately.
+   *
+   * The bootstrap layer (Sphere) constructs the worker with a closure
+   * over the production transport + outbox + republish payload
+   * builder. Tests inject a fully-mocked worker.
+   *
+   * **No-op when `features.recoveryWorker === false`** — installing is
+   * cheap (no scan loop runs until `start()`); the gate is the flag.
+   */
+  installSendingRecoveryWorker(worker: SendingRecoveryWorker): void {
+    // Stop the previous worker without blocking the install. We
+    // intentionally do not await here — callers may be hot-swapping
+    // workers under test, and the worker's stop() is documented as
+    // "best-effort, never throws". Errors are swallowed.
+    if (this.sendingRecoveryWorker !== null) {
+      void this.sendingRecoveryWorker.stop().catch(() => undefined);
+    }
+    this.sendingRecoveryWorker = worker;
+    // If the module is already initialized AND the gate is on, start
+    // the new worker immediately. Otherwise, the next initialize()
+    // call will start it (see initialize() body).
+    if (this.deps !== null && this.features.recoveryWorker) {
+      worker.start();
+    }
+  }
+
+  /**
+   * Phase 9.6.D — install the sender-side finalization worker.
+   *
+   * Idempotent: a second call stops the previous worker (fire-and-
+   * forget) and swaps in the new instance. If the module is already
+   * initialized AND `features.senderUxf` is true, the new worker is
+   * started immediately.
+   *
+   * Consumer-installed workers WIN over the auto-installed default:
+   * call this BEFORE `initialize()` to prevent the auto-install, OR
+   * call it AFTER `initialize()` to replace the auto-installed instance
+   * (the latter triggers an immediate start if the gate is open).
+   *
+   * The bootstrap layer (Sphere) can inject a fully production-wired
+   * worker backed by the OrbitDB pool/manifest/tombstone/queue adapters.
+   * Tests inject a fully-mocked worker.
+   */
+  installFinalizationWorkerSender(worker: FinalizationWorkerSender): void {
+    if (this.finalizationWorkerSender !== null) {
+      void this.finalizationWorkerSender.stop().catch(() => undefined);
+    }
+    this.finalizationWorkerSender = worker;
+    if (this.deps !== null && this.features.senderUxf) {
+      worker.start();
+    }
+  }
+
+  /**
+   * Task #151 — install the recipient-side finalization worker.
+   *
+   * Idempotent: a second call stops the previous worker (fire-and-
+   * forget) and swaps in the new instance. If the module is already
+   * initialized AND `features.recipientUxf` is true, the new worker
+   * is started immediately.
+   *
+   * The recipient worker has NO auto-install path today because the
+   * default `IngestWorkerPool.processToken` closure (lines ~1422-1662)
+   * does NOT enqueue pending tokens into a `FinalizationQueue`, and
+   * the worker requires (a) the per-address FinalizationQueue store,
+   * (b) dispositionWriter (T.3.C), (c) revaluateHooks
+   * (RevaluateHooksProvider), (d) cascadeWalker, (e) per-tokenId
+   * mutex, (f) manifest CAS / tombstones / pool adapters — all of
+   * which are bootstrap-layer concerns (Sphere builds them with the
+   * full Profile + OrbitDB stack). When the bootstrap layer ships
+   * the harness, callers wire it via this method; the worker's
+   * AbortSignal can be sourced from `getWorkerAbortSignal()` below.
+   */
+  installFinalizationWorkerRecipient(worker: FinalizationWorkerRecipient): void {
+    if (this.finalizationWorkerRecipient !== null) {
+      void this.finalizationWorkerRecipient.stop().catch(() => undefined);
+    }
+    this.finalizationWorkerRecipient = worker;
+    if (this.deps !== null && this.features.recipientUxf) {
+      worker.start();
+    }
+  }
+
+  /**
+   * Task #169 — Expose the per-initialize worker AbortSignal so the
+   * bootstrap layer's recipient-worker harness can plumb it into
+   * the constructed `FinalizationWorkerRecipient`. Returns `undefined`
+   * when the module has not yet been initialized.
+   *
+   * The signal is aborted in `destroy()` BEFORE awaiting `worker.stop()`
+   * so in-flight `runFinalizationCycle` invocations + their pending
+   * `sleep(...)` timers terminate deterministically.
+   */
+  getWorkerAbortSignal(): AbortSignal | undefined {
+    return this._workerAbortController?.signal;
+  }
+
+  /**
+   * §6.3 stuck-PENDING escape hatch — accept an inclusion proof from
+   * outside the normal aggregator path and apply it to local state.
+   *
+   * The caller MUST set `allowInvalidOverride: true` to flip a token
+   * from `_invalid` back to the active pool — silent default would
+   * breach the §5.6 monotonicity invariant. The override is sticky
+   * across CRDT merges (`overrideApplied: true` survives every future
+   * merge) and emits `transfer:override-applied` for the operator
+   * console's audit trail.
+   *
+   * The 10 sub-cases of §6.3 are implemented in
+   * `transfer/import-inclusion-proof.ts` (T.5.D).
+   *
+   * @param addr     Address scope.
+   * @param tokenId  Canonical token id.
+   * @param proof    Operator-supplied inclusion proof descriptor.
+   * @param options  Optional `{ allowInvalidOverride, operatorPubkey,
+   *                  currentTime }`.
+   *
+   * @throws SphereError `OPERATOR_ESCAPE_HATCH_NOT_CONFIGURED` if the
+   *   importer has not been installed. Callers SHOULD NOT silently
+   *   no-op on this — surface it to the operator console.
+   */
+  async importInclusionProof(
+    addr: string,
+    tokenId: string,
+    proof: ImportableInclusionProof,
+    options?: ImportInclusionProofCallOptions,
+  ): Promise<ImportProofResult> {
+    if (this.inclusionProofImporter === null) {
+      throw new SphereError(
+        'PaymentsModule.importInclusionProof: inclusion-proof importer not installed. ' +
+          'Call installInclusionProofImporter() during bootstrap.',
+        'OPERATOR_ESCAPE_HATCH_NOT_CONFIGURED',
+      );
+    }
+    // Round 3 — lowercase-normalize the tokenId at the public entry,
+    // BEFORE the importer's strict-lowercase shape regex would otherwise
+    // reject uppercase input. SDK callers (operator scripts, CLI tools,
+    // wallet UIs that paste raw hex from the state-transition SDK) often
+    // produce uppercase or mixed-case tokenIds; rejecting them at the
+    // public surface would force every caller to remember to normalize.
+    // Round 1 doc claimed "Wallet code lowercases SDK tokenIds before
+    // passing them to the importer" — this is the wrapper-level
+    // normalization that delivers on that claim.
+    //
+    // The importer's internal lowercase-normalize (defense-in-depth at
+    // `_importInclusionProofUnderMutex`) remains in place for any code
+    // path that bypasses this wrapper.
+    const normalizedTokenId =
+      typeof tokenId === 'string' ? tokenId.toLowerCase() : tokenId;
+    return this.inclusionProofImporter.importInclusionProof(
+      addr,
+      normalizedTokenId,
+      proof,
+      options,
+    );
+  }
+
+  /**
+   * §6.1.1 operator-explicit cascade reversal — re-validate every
+   * cascaded child of `parentTokenId` after the operator has flipped
+   * the parent via {@link importInclusionProof}.
+   *
+   * Transitive: when a child re-validates, the runner recurses into
+   * the child's children. Bounded depth (`MAX_CHAIN_DEPTH` = 64) and
+   * per-call-stack visited-set defend against corrupted-manifest
+   * cycles (W32).
+   *
+   * The actual cascade walk semantics live in T.5.B.5
+   * (`transfer/cascade-walker.ts`); this method delegates to a
+   * dedicated runner (`transfer/revalidate-cascaded.ts`) that consumes
+   * the cascade walker's manifest-scanner contract.
+   *
+   * @throws SphereError `OPERATOR_ESCAPE_HATCH_NOT_CONFIGURED` if the
+   *   runner has not been installed.
+   */
+  async revalidateCascadedChildren(
+    addr: string,
+    parentTokenId: string,
+  ): Promise<RevalidationResult> {
+    if (this.revalidateCascadedRunner === null) {
+      throw new SphereError(
+        'PaymentsModule.revalidateCascadedChildren: revalidate-cascaded runner not installed. ' +
+          'Call installRevalidateCascadedRunner() during bootstrap.',
+        'OPERATOR_ESCAPE_HATCH_NOT_CONFIGURED',
+      );
+    }
+    // Round 5 (FIX 5) — lowercase-normalize the parentTokenId at the
+    // public entry, mirroring the Round 3 `importInclusionProof` fix.
+    // Operator-supplied uppercase tokenIds would otherwise silently find
+    // zero children in the prefix-scan path, masking real cascades.
+    // Manifest entries are written under canonical lowercase keys (see
+    // FIX 4); without this normalization the runner queries the wrong
+    // keyspace and the operator sees a misleadingly-clean result.
+    const normalizedParentTokenId =
+      typeof parentTokenId === 'string'
+        ? parentTokenId.toLowerCase()
+        : parentTokenId;
+    return this.revalidateCascadedRunner.run(addr, normalizedParentTokenId);
+  }
+
+  /**
+   * Install the recipient-side legacy-shape adapter runner (T.7.B).
+   *
+   * When `features.recipientLegacyAdapter === true` AND a runner is
+   * installed, every inbound legacy event is routed through the runner
+   * BEFORE the existing legacy storage path runs. The two paths are
+   * additive: the runner produces dispositions for the OrbitDB profile
+   * (T.3.C); the existing path continues to populate the legacy token
+   * storage. Both observe the same event from the same transport
+   * subscription.
+   *
+   * Idempotent: a second call replaces the previous runner.
+   *
+   * **No-op when `features.recipientLegacyAdapter === false`** — the
+   * runner is dormant and the legacy path runs alone.
+   */
+  installLegacyShapeAdapter(runner: LegacyShapeAdapterRunner): void {
+    this.legacyShapeAdapterRunner = runner;
+  }
+
+  /**
    * Cleanup all subscriptions, polling jobs, and pending resolvers.
    *
    * Should be called when the wallet is being shut down or the module is
@@ -1049,6 +2928,91 @@ export class PaymentsModule {
     if (this.l1) {
       this.l1.destroy();
     }
+
+    // T.3.E — destroy the ingest worker pool. Fire-and-forget per the
+    // module's destroy() contract (synchronous return). Workers drain
+    // in the background; queued bundles reject with `MODULE_DESTROYED`.
+    if (this.ingestPool) {
+      void this.ingestPool.destroy().catch(() => undefined);
+      this.ingestPool = null;
+    }
+
+    // Phase 8 steelman post-cutover — stop the sending-recovery worker.
+    // Fire-and-forget for consistency with the rest of `destroy()`'s
+    // synchronous contract; the worker's `stop()` awaits its in-flight
+    // scan internally and never throws.
+    if (this.sendingRecoveryWorker) {
+      void this.sendingRecoveryWorker.stop().catch(() => undefined);
+      this.sendingRecoveryWorker = null;
+    }
+
+    // Task #169 — abort the worker AbortController BEFORE stopping the
+    // workers. The signal is wired into both the worker's
+    // `runFinalizationCycle` (which short-circuits between aggregator
+    // calls) AND the `sleep` adapter (which rejects pending timers).
+    // Aborting first ensures `worker.stop()`'s drain phase converges
+    // promptly instead of waiting for the next 30s+ poll backoff.
+    if (this._workerAbortController !== null) {
+      try {
+        this._workerAbortController.abort();
+      } catch {
+        // AbortController.abort() never throws on modern runtimes; the
+        // try/catch is defense-in-depth for older shims.
+      }
+      this._workerAbortController = null;
+    }
+
+    // Phase 9.6.D — stop the sender-side finalization worker.
+    // Fire-and-forget; `stop()` drains in-flight polls and never throws.
+    if (this.finalizationWorkerSender) {
+      void this.finalizationWorkerSender.stop().catch(() => undefined);
+      this.finalizationWorkerSender = null;
+    }
+    // Task #151 — stop the recipient-side finalization worker.
+    // Fire-and-forget; mirrors the sender path.
+    if (this.finalizationWorkerRecipient) {
+      void this.finalizationWorkerRecipient.stop().catch(() => undefined);
+      this.finalizationWorkerRecipient = null;
+    }
+    this._recipientFinalizationQueue = null;
+    // Clear in-memory outbox and context maps (no persistent side-effects).
+    this._senderOutboxMap.clear();
+    this._senderRequestContextMap.clear();
+    this._recipientRequestContextMap.clear();
+    this._recipientFinalizationContext.clear();
+    // Wave 7 hygiene — wipe the recipient worker's save-failure streak
+    // so per-tokenId entries don't outlive the context map. Otherwise a
+    // long-running wallet that fails save() and then loses the token
+    // (tombstone, address switch, manual delete) would accumulate dead
+    // streak entries indefinitely.
+    if (this._recipientSaveFailureStreakClear !== null) {
+      try {
+        this._recipientSaveFailureStreakClear();
+      } catch {
+        // The clearer is `Map.clear()` — non-throwing in practice — but
+        // swallow defensively so destroy() stays total.
+      }
+      this._recipientSaveFailureStreakClear = null;
+    }
+
+    // Round 7 (FIX 2) — release the operator escape-hatch importer and
+    // revalidate-cascaded runner. The default in-memory builders capture
+    // their own Maps (manifestEntries / dispositionStorage / queueScanner
+    // closures); without clearing the references here, those Maps
+    // outlive the destroy() call and leak permanently for the lifetime
+    // of the process even though the rest of PaymentsModule is gone.
+    // A subsequent initialize() call will recreate fresh defaults via
+    // the `=== null` gate, so a destroy()/initialize() cycle now starts
+    // with a clean state instead of stale closures.
+    this.inclusionProofImporter = null;
+    this.revalidateCascadedRunner = null;
+
+    // Round 7 (FIX 3) — release the shared per-tokenId mutex. The mutex
+    // captures inflight Promises in its instance-scoped Map; clearing
+    // the reference here lets the GC collect both the mutex and any
+    // dangling per-tokenId state. A subsequent initialize() rebuilds a
+    // fresh mutex (matches the `_workerAbortController` lifecycle).
+    this._sharedPerTokenMutex = null;
   }
 
   // ===========================================================================
@@ -1065,10 +3029,112 @@ export class PaymentsModule {
    *   to pass an already-acquired reservation, skipping the planSend() critical section.
    */
   async send(
-    request: TransferRequest,
+    originalRequest: TransferRequest,
     internal?: { existingReservationId?: string; existingSplitPlan?: SplitPlan },
   ): Promise<TransferResult> {
     this.ensureInitialized();
+
+    // T.1.B.1 — narrow public TransferMode to InternalTransferMode and reject
+    // any future-protocol value (notably `'txf'`) with the typed
+    // `UNSUPPORTED_TRANSFER_MODE` error BEFORE we mutate any state. The
+    // shim is the SDK's only runtime narrow; routing the legacy TXF arm
+    // is owned by T.7.A. New TransferRequest fields (`additionalAssets`,
+    // `delivery`, `allowPendingTokens`, `confirmNftPending`,
+    // `txfFinalization`) are accepted but UNUSED at this wave — the
+    // legacy code path below remains the only routing branch.
+    // TODO(T.2.B/T.2.C/T.5.B/T.7.A): consume the new TransferRequest
+    // fields once the multi-asset validator and delivery resolver land.
+    //
+    // T.1.B.2 — call `narrowTransferMode` directly; the per-call-site
+    // alias `coercePartialTransferRequestMode` was removed once T.7.C
+    // migrated production callers to pass `transferMode` explicitly.
+    //
+    // T.7.E (default-mode flip) — when `originalRequest.transferMode` is
+    // `undefined`, the shim returns `'instant'` per §2.5 ("Default:
+    // `transferMode: 'instant'` over UXF"). The string value is the same
+    // as the historical default; the SEMANTIC flip is in the dispatcher
+    // below: with `features.senderUxf === true` the default routes to
+    // `dispatchUxfInstantSend` (UXF instant). Pre-T.7.E the equivalent
+    // default was "instant over legacy TXF" (the staged-rollout fall-
+    // through that T.8.D removes). Callers who need the legacy single-
+    // token TXF wire format MUST pass `transferMode: 'txf'` explicitly
+    // (and have `features.senderUxf` ON — see T.7.A's typed reject).
+    const internalTransferMode = narrowTransferMode(originalRequest.transferMode);
+
+    // T.8.B — Capability hint surface check (§10.4, W20).
+    // BEFORE any dispatcher, consult the resolved peer's capability hints.
+    // Mismatches emit `transfer:capability-warning` and proceed unchanged —
+    // we DO NOT auto-strip NFT entries, DO NOT downgrade the wire format,
+    // and DO NOT block the send. The actual interop guarantee comes from
+    // the receiver's T.2.B `UNKNOWN_ASSET_KIND` reject rule. Failure to
+    // resolve the peer here is non-fatal (the dispatcher will resolve
+    // again and surface its own typed error).
+    await this.maybeEmitCapabilityWarning(originalRequest, internalTransferMode).catch((err) => {
+      logger.warn('PaymentsModule', 'Capability warning check failed (informational, ignoring):', err);
+    });
+
+    // T.2.D.1 — UXF conservative dispatcher (feature-flag-gated).
+    // When `features.senderUxf === true` AND the request is conservative-mode,
+    // route through the new UXF wire-format orchestrator. Otherwise fall
+    // through unchanged. Keep this BEFORE any state mutation so the legacy
+    // arm sees identical pre-conditions when the flag is off.
+    if (this.features.senderUxf && internalTransferMode === 'conservative') {
+      return this.dispatchUxfConservativeSend(originalRequest);
+    }
+    // T.5.A — UXF instant dispatcher (same feature flag).
+    // When `features.senderUxf === true` AND the request is instant-mode,
+    // route through the new UXF instant orchestrator. Falls through to
+    // the legacy single-token TXF path otherwise.
+    //
+    // T.7.E — this is the post-flip "default" arm: when the caller omitted
+    // `transferMode`, `narrowTransferMode(undefined)` returned `'instant'`,
+    // which lands here when `senderUxf` is ON. So `payments.send({
+    // recipient, coinId, amount })` with the flag on is now routed
+    // through `instant-sender` → emits a UXF bundle (`uxf-cid` wire
+    // shape per §3.1). The fall-through to the legacy single-token path
+    // when `senderUxf` is OFF is the staged-rollout escape hatch removed
+    // by T.8.D.
+    if (this.features.senderUxf && internalTransferMode === 'instant') {
+      return this.dispatchUxfInstantSend(originalRequest);
+    }
+    // T.7.A — legacy TXF dispatcher (same feature flag).
+    // When `features.senderUxf === true` AND the request explicitly opted
+    // into `transferMode: 'txf'` (only reachable via `as TransferMode`
+    // cast — the public type still excludes `'txf'`), route through the
+    // legacy TXF orchestrator. The orchestrator branches internally on
+    // `txfFinalization` (default `'conservative'` per §10.1) to pick the
+    // §4.4.1 vs §4.4.2 sequence. The narrowing shim (`narrowTransferMode`)
+    // passes `'txf'` through post-T.7.A — the dispatcher is the routing
+    // point.
+    if (this.features.senderUxf && internalTransferMode === 'txf') {
+      const txfFinalization: 'conservative' | 'instant' =
+        originalRequest.txfFinalization === 'instant' ? 'instant' : 'conservative';
+      return this.dispatchTxfSend(originalRequest, txfFinalization);
+    }
+    // T.7.A — feature-flag-OFF guard. When the UXF flag is off but the
+    // caller passed `transferMode: 'txf'`, the legacy single-token path
+    // (which always emits TXF wire shape for both 'instant' and
+    // 'conservative' under the V6 / Sphere-TXF detection) is not yet
+    // wired to honour the explicit TXF opt-in. Reject with the typed
+    // `UNSUPPORTED_TRANSFER_MODE` error so callers know they need to
+    // flip `features.senderUxf = true` to use the TXF orchestrator.
+    if (!this.features.senderUxf && internalTransferMode === 'txf') {
+      throw new SphereError(
+        "transferMode: 'txf' requires features.senderUxf = true. " +
+          'Either set the flag or omit the field to use the default mode.',
+        'UNSUPPORTED_TRANSFER_MODE',
+      );
+    }
+    // T.1.B.1 — `coinId` and `amount` are now optional on the public
+    // `TransferRequest`. The legacy single-coin code path below
+    // dereferences both fields ubiquitously; until T.2.B lands the §4.1
+    // step 1 multi-asset validator that picks the right routing arm,
+    // this shim verifies the primary coin slot is present and rebinds
+    // `request` to a narrowed `LegacyCoinTransferRequest` (a branded
+    // alias with `coinId: string; amount: string;`). NFT-only and
+    // multi-asset shapes are accepted by the public type but rejected
+    // here — they will become routable once T.2.B lands.
+    let request: LegacyCoinTransferRequest = requireLegacyCoinSlot(originalRequest);
 
     // Track this send() so switchToAddress() waits for it via waitForPendingOperations().
     // Without this, the user can switch addresses while send() is still running,
@@ -1117,20 +3183,8 @@ export class PaymentsModule {
         splitPlan = internal.existingSplitPlan;
       } else {
         // ── Coin symbol → coinId resolution ────────────────────────────────────
-        // Swap manifests store currencies as short symbols (e.g. "ETH", "BTC")
-        // while token storage uses 64/68-char hex coinIds. If no tokens match
-        // the literal coinId, attempt to resolve via the token registry.
-        const resolvedCoinId = (() => {
-          const literalMatch = Array.from(this.tokens.values()).some(t => t.coinId === request.coinId);
-          if (!literalMatch && request.coinId.length <= 20) {
-            const def = TokenRegistry.getInstance().getDefinitionBySymbol(request.coinId);
-            if (def?.id) return def.id;
-          }
-          return request.coinId;
-        })();
-        if (resolvedCoinId !== request.coinId) {
-          request = { ...request, coinId: resolvedCoinId };
-        }
+        // Delegate to the shared helper (see `resolveCoinIdSymbol`).
+        request = requireLegacyCoinSlot(this.resolveCoinIdSymbol(request));
 
         // ── Spend Queue: Pre-parse token pool (async, before critical section) ──
         const parsedPool = await this.spendPlanner.buildParsedPool(
@@ -1191,7 +3245,13 @@ export class PaymentsModule {
       const recipientNametag = peerInfo?.nametag
         || (request.recipient.startsWith('@') ? request.recipient.slice(1) : undefined);
 
-      const transferMode = request.transferMode ?? 'instant';
+      // T.1.B.1 — `internalTransferMode` was narrowed at entry (line ~1273)
+      // by the per-call-site shim. By the time we reach this branch the
+      // value is one of `'instant' | 'conservative'` (the `'txf'` arm
+      // throws synchronously in the shim until T.7.A wires it). Keep the
+      // local `transferMode` name for minimal diff against the legacy
+      // routing logic below.
+      const transferMode: 'instant' | 'conservative' = internalTransferMode === 'conservative' ? 'conservative' : 'instant';
 
       const onChainMessage = parseInvoiceMemoForOnChain(
         request.memo,
@@ -1292,7 +3352,7 @@ export class PaymentsModule {
           const requestIdBytes = commitment.requestId;
           const requestIdHex = requestIdBytes instanceof Uint8Array
             ? Array.from(requestIdBytes).map(b => b.toString(16).padStart(2, '0')).join('')
-            : String(requestIdBytes);
+            : (typeof (requestIdBytes as { toJSON?: () => string }).toJSON === "function" ? (requestIdBytes as { toJSON: () => string }).toJSON() : String(requestIdBytes));
 
           result.tokenTransfers.push({
             sourceTokenId: token.id,
@@ -1464,7 +3524,7 @@ export class PaymentsModule {
           const requestIdBytes = commitment.requestId;
           const requestIdHex = requestIdBytes instanceof Uint8Array
             ? Array.from(requestIdBytes).map(b => b.toString(16).padStart(2, '0')).join('')
-            : String(requestIdBytes);
+            : (typeof (requestIdBytes as { toJSON?: () => string }).toJSON === "function" ? (requestIdBytes as { toJSON: () => string }).toJSON() : String(requestIdBytes));
 
           result.tokenTransfers.push({
             sourceTokenId: token.id,
@@ -1644,10 +3704,19 @@ export class PaymentsModule {
    * @returns InstantSplitResult with timing info
    */
   async sendInstant(
-    request: TransferRequest,
+    originalRequest: TransferRequest,
     options?: InstantSplitOptions
   ): Promise<InstantSplitResult> {
     this.ensureInitialized();
+
+    // T.1.B.1 — narrow the optional-on-public-API `coinId` / `amount` to a
+    // required-string `LegacyCoinTransferRequest`. NFT-only and
+    // multi-asset shapes are accepted by the public type but not yet
+    // routable on this entry point (awaits T.2.B). The narrow runs
+    // BEFORE any state mutation. Mode narrowing is skipped here because
+    // `sendInstant()` is itself a routing target of `'instant'` mode and
+    // the public-mode → internal-mode shim has run upstream.
+    let request: LegacyCoinTransferRequest = requireLegacyCoinSlot(originalRequest);
 
     const startTime = performance.now();
 
@@ -1676,18 +3745,8 @@ export class PaymentsModule {
 
       // ── Spend Queue: reserve tokens (same path as send()) ──
       reservationId = crypto.randomUUID();
-      // Symbol → coinId resolution (same logic as send())
-      const resolvedCoinIdForSplit = (() => {
-        const literalMatch = Array.from(this.tokens.values()).some(t => t.coinId === request.coinId);
-        if (!literalMatch && request.coinId.length <= 20) {
-          const def = TokenRegistry.getInstance().getDefinitionBySymbol(request.coinId);
-          if (def?.id) return def.id;
-        }
-        return request.coinId;
-      })();
-      if (resolvedCoinIdForSplit !== request.coinId) {
-        request = { ...request, coinId: resolvedCoinIdForSplit };
-      }
+      // Symbol → coinId resolution — delegate to shared helper.
+      request = requireLegacyCoinSlot(this.resolveCoinIdSymbol(request));
       const parsedPool = await this.spendPlanner.buildParsedPool(
         Array.from(this.tokens.values()),
         request.coinId
@@ -2027,7 +4086,7 @@ export class PaymentsModule {
       const requestIdBytes = commitment.requestId;
       const requestIdHex = requestIdBytes instanceof Uint8Array
         ? Array.from(requestIdBytes).map(b => b.toString(16).padStart(2, '0')).join('')
-        : String(requestIdBytes);
+        : (typeof (requestIdBytes as { toJSON?: () => string }).toJSON === "function" ? (requestIdBytes as { toJSON: () => string }).toJSON() : String(requestIdBytes));
 
       if (!deferPersistence) {
         // Submit commitment to aggregator immediately (standalone path)
@@ -2200,9 +4259,11 @@ export class PaymentsModule {
   private async saveProcessedCombinedTransferIds(): Promise<void> {
     const ids = Array.from(this.processedCombinedTransferIds);
     if (ids.length > 0) {
-      await this.deps!.storage.set(
+      // Dedup ledger — pure operational state, not a user action.
+      await this.setStorageEntry(
         STORAGE_KEYS_ADDRESS.PROCESSED_COMBINED_TRANSFER_IDS,
-        JSON.stringify(ids)
+        JSON.stringify(ids),
+        'cache_index',
       );
     }
   }
@@ -2604,11 +4665,20 @@ export class PaymentsModule {
 
     try {
       // Send the payment
+      // T.7.C — explicit `transferMode: 'instant'` per §10.1 (production call-site
+      // migration). This recursive call into `this.send()` is the
+      // PaymentsModule-internal recursion site listed in the T.7.C task spec
+      // (along with the AccountingModule + CLI sites). The outer
+      // `payPaymentRequest()` API does not currently expose a transferMode knob
+      // to callers, so the wire shape is fixed at `'instant'` (the default for
+      // unflagged production today). If `payPaymentRequest()` ever gains a
+      // mode parameter, plumb it through here.
       const result = await this.send({
         coinId: request.coinId,
         amount: request.amount,
         recipient: request.senderPubkey,
         memo: memo || request.message,
+        transferMode: 'instant',
       });
 
       // Mark as paid and send response with transfer ID
@@ -3206,6 +5276,308 @@ export class PaymentsModule {
   }
 
   // ===========================================================================
+  // Public API - Token Import / Export
+  // ===========================================================================
+
+  /**
+   * Export owned tokens as TXF wire-format objects.
+   *
+   * The returned TxfToken array is the canonical inter-wallet wire
+   * format used by {@link send} / {@link receive} and by the legacy
+   * TXF serializer. Callers may write it to a file (as JSON) or wrap
+   * it into a UXF CAR (via `UxfPackage.ingestAll` + `toCar`) for
+   * content-addressable distribution.
+   *
+   * @param options.ids - Export only these local token IDs.
+   * @param options.coinId - Export only tokens of this coin.
+   * @param options.includeUnconfirmed - Include tokens whose status is
+   *   not 'confirmed'. Default false. Unconfirmed tokens still carry
+   *   valid TxfToken structure but the receiving wallet may reject
+   *   them during finalization.
+   * @returns Array of `{ localId, genesisTokenId, txf }` triples. A
+   *   token is skipped if its `sdkData` does not parse to a valid TXF
+   *   shape (should not happen for healthy tokens).
+   */
+  exportTokens(options?: {
+    ids?: readonly string[];
+    coinId?: string;
+    includeUnconfirmed?: boolean;
+  }): Array<{ localId: string; genesisTokenId: string; txf: TxfToken }> {
+    this.ensureInitialized();
+
+    let candidates = Array.from(this.tokens.values());
+    if (options?.ids) {
+      const idSet = new Set(options.ids);
+      candidates = candidates.filter((t) => idSet.has(t.id));
+    }
+    if (options?.coinId) {
+      candidates = candidates.filter((t) => t.coinId === options.coinId);
+    }
+    if (!options?.includeUnconfirmed) {
+      candidates = candidates.filter((t) => t.status === 'confirmed');
+    }
+
+    const out: Array<{ localId: string; genesisTokenId: string; txf: TxfToken }> = [];
+    for (const token of candidates) {
+      const txf = tokenToTxf(token);
+      if (!txf) continue;
+      const genesisTokenId = txf.genesis?.data?.tokenId;
+      if (!genesisTokenId) continue;
+      out.push({ localId: token.id, genesisTokenId, txf });
+    }
+    return out;
+  }
+
+  // (See ImportTokensResult and friends defined at module scope.)
+  /**
+   * Import tokens from TXF wire-format objects.
+   *
+   * Each token receives a fresh local UUID. Dedup is performed in-line
+   * (not just via addToken) so that the per-token outcome includes a
+   * specific reason code instead of an opaque "skipped" flag:
+   *
+   *   - **'duplicate'**       — exact (tokenId, stateHash) match already owned.
+   *   - **'tombstoned'**      — (tokenId, stateHash) was previously spent
+   *                            from this wallet; refusing avoids re-accepting
+   *                            a state we have already transitioned past.
+   *   - **'genesis-exists'**  — strict-mode only: tokenId is owned in a
+   *                            DIFFERENT state. Importing would otherwise
+   *                            regress the wallet via {@link addToken}'s
+   *                            CASE 2 state-update path.
+   *   - **'state-replaced'**  — lenient-mode only: the imported token's
+   *                            state is taken as authoritative; the
+   *                            previously held state of the same tokenId
+   *                            is archived. Reported in `added` (with a
+   *                            note) rather than `skipped`, because the
+   *                            wallet now owns the new state.
+   *
+   * **Strict mode (`skipExistingGenesis: true`)** disables the
+   * state-update behaviour of {@link addToken}: any imported token
+   * whose genesis tokenId already exists in the wallet is skipped
+   * outright, regardless of stateHash. Use this when the import is
+   * intended as an additive UNION (legacy migration, multi-source
+   * file import) — without it, an imported older state would archive
+   * the wallet's current state, regressing the wallet's view of that
+   * token. Forked / reissued token entries (`_forked_*`) are never
+   * promoted to active under strict mode for the same reason.
+   *
+   * @param txfTokens - Array of TxfToken objects (as produced by
+   *   {@link exportTokens}, a legacy TXF file, or a UXF CAR that has
+   *   been reassembled).
+   * @param options.skipExistingGenesis - Default false (lenient).
+   * @returns Counts and identifiers for each outcome category.
+   */
+  async importTokens(
+    txfTokens: readonly TxfToken[],
+    options?: { skipExistingGenesis?: boolean },
+  ): Promise<ImportTokensResult> {
+    this.ensureInitialized();
+
+    const added: ImportAdded[] = [];
+    const skipped: ImportSkipped[] = [];
+    const rejected: ImportRejected[] = [];
+
+    for (const txf of txfTokens) {
+      const genesisTokenId = txf?.genesis?.data?.tokenId ?? null;
+      if (!genesisTokenId) {
+        rejected.push({
+          genesisTokenId: null,
+          code: 'malformed',
+          reason: 'Missing genesis.data.tokenId',
+        });
+        continue;
+      }
+      if (!txf.state || !txf.genesis) {
+        rejected.push({
+          genesisTokenId,
+          code: 'malformed',
+          reason: 'Missing state or genesis section',
+        });
+        continue;
+      }
+
+      // Effective dedup key combines current-state hash (for
+      // finalized tokens) and a genesis-content hash (for pending-
+      // mint tokens). See `effectiveDedupKey`.
+      const incomingDedupKey = effectiveDedupKey(txf);
+
+      // Real stateHash for the tombstone check — via the canonical
+      // `parseSdkDataCached` path. Tombstones are only keyed on
+      // concrete post-spend hashes, so pending tokens can never
+      // match one (by definition their first state transition
+      // hasn't happened yet).
+      const incomingStateHash = extractStateHashFromSdkData(
+        JSON.stringify(txf),
+      );
+
+      // -- Pre-check 1: tombstoned (previously spent).
+      if (incomingStateHash && this.isStateTombstoned(genesisTokenId, incomingStateHash)) {
+        skipped.push({
+          genesisTokenId,
+          code: 'tombstoned',
+          reason: `(tokenId, stateHash) previously spent from this wallet`,
+        });
+        continue;
+      }
+
+      // Scan in-memory wallet for matching genesis / state. Track
+      // the matched token's status so we can distinguish a true
+      // "state replaced a live state" from "stale bookkeeping record
+      // (spent/invalid) was overwritten" downstream.
+      //
+      // For the dedup-key comparison we reuse `parseSdkDataCached`
+      // via extractStateHashFromSdkData rather than re-parsing each
+      // existing token's sdkData in the loop (was O(N×M) JSON.parse
+      // on large wallets). For pending existing tokens with empty
+      // stateHash, we fall through to the one-off JSON.parse — rare
+      // path.
+      let exactDuplicateLocalId: string | null = null;
+      let genesisMatchLocalId: string | null = null;
+      let genesisMatchStatus: TokenStatus | null = null;
+      let genesisMatchIsPending = false;
+      for (const [existingId, existing] of this.tokens) {
+        const existingTokenId = extractTokenIdFromSdkData(existing.sdkData);
+        if (existingTokenId !== genesisTokenId) continue;
+
+        const existingStateHash = extractStateHashFromSdkData(existing.sdkData);
+        let existingDedupKey: string;
+        let existingIsPending = false;
+        if (existingStateHash) {
+          // Fast path: both via the cached parser — no re-parse.
+          existingDedupKey = existingStateHash;
+        } else if (existing.sdkData) {
+          // Pending existing (empty stateHash). Compute the fallback
+          // the same way we did for the incoming token.
+          try {
+            const existingTxf = JSON.parse(existing.sdkData) as Parameters<typeof effectiveDedupKey>[0];
+            existingDedupKey = effectiveDedupKey(existingTxf);
+            existingIsPending = true;
+          } catch {
+            // Malformed sdkData — treat as genesis-only match with
+            // no identifiable current state.
+            genesisMatchLocalId = existingId;
+            genesisMatchStatus = existing.status;
+            continue;
+          }
+        } else {
+          genesisMatchLocalId = existingId;
+          genesisMatchStatus = existing.status;
+          continue;
+        }
+
+        if (existingDedupKey === incomingDedupKey) {
+          exactDuplicateLocalId = existingId;
+          break;
+        }
+        genesisMatchLocalId = existingId;
+        genesisMatchStatus = existing.status;
+        genesisMatchIsPending = existingIsPending;
+      }
+
+      // -- Pre-check 2: exact duplicate.
+      if (exactDuplicateLocalId) {
+        skipped.push({
+          genesisTokenId,
+          code: 'duplicate',
+          reason: 'Exact (tokenId, stateHash) already owned',
+        });
+        continue;
+      }
+
+      // -- Pre-check 3: strict-mode genesis collision.
+      // Exception: if the wallet's existing copy is a pending-mint
+      // (empty current stateHash) and the incoming is finalized
+      // (has a real stateHash), allow the upgrade — the incoming
+      // carries strictly more information than what we already have,
+      // and refusing would leave the wallet stuck on the pending
+      // record. This is the common "migrated legacy while mint was
+      // in flight, now rerun after finalization" pattern.
+      if (options?.skipExistingGenesis && genesisMatchLocalId) {
+        const incomingIsPending = incomingDedupKey.startsWith('pending-');
+        const upgradingPendingToFinalized = genesisMatchIsPending && !incomingIsPending;
+        if (!upgradingPendingToFinalized) {
+          skipped.push({
+            genesisTokenId,
+            code: 'genesis-exists',
+            reason: 'Genesis tokenId owned at a different state; strict mode preserves current state',
+          });
+          continue;
+        }
+        // Fall through — the incoming finalized state will replace
+        // the prior pending record via addToken's state-update path.
+      }
+
+      // Build the UI token. Failures here are malformed-input
+      // rejections, not skips.
+      const localId = crypto.randomUUID();
+      let uiToken: Token;
+      try {
+        uiToken = txfToToken(localId, txf);
+      } catch (err) {
+        rejected.push({
+          genesisTokenId,
+          code: 'malformed',
+          reason: `txfToToken failed: ${err instanceof Error ? err.message : String(err)}`,
+        });
+        continue;
+      }
+
+      // Hand off to addToken. Pre-checks above mean addToken should
+      // not return false here — but defend against it just in case.
+      try {
+        const addedOk = await this.addToken(uiToken);
+        if (addedOk) {
+          if (genesisMatchLocalId) {
+            // Differentiate:
+            //   - Replacing a LIVE state (confirmed/submitted/...):
+            //     the user previously held this state of the token;
+            //     UI should highlight the overwrite.
+            //   - Replacing a DEAD record (spent/invalid): the prior
+            //     entry was bookkeeping for a token we no longer
+            //     controlled; no user-visible state was lost.
+            const isStaleRecord =
+              genesisMatchStatus === 'spent' || genesisMatchStatus === 'invalid';
+            added.push({
+              localId,
+              genesisTokenId,
+              code: isStaleRecord ? 'stale-record-replaced' : 'state-replaced',
+              note: isStaleRecord
+                ? 'Overwrote a stale spent/invalid record of the same tokenId'
+                : 'Replaced an existing state of the same tokenId (lenient mode)',
+            });
+          } else {
+            added.push({ localId, genesisTokenId, code: 'added' });
+          }
+        } else {
+          // Defensive — addToken returned false despite our pre-checks.
+          // This indicates a race (the wallet mutated between our
+          // pre-check scan and addToken's own guard) or a guard
+          // pattern we didn't enumerate. Log at warn level so field
+          // operators can correlate it with transport activity.
+          logger.warn(
+            'Payments',
+            `importTokens: addToken unexpectedly refused token ${genesisTokenId.slice(0, 16)}... ` +
+              `after pre-checks (possible race with incoming transfer). Marking as skipped/unknown.`,
+          );
+          skipped.push({
+            genesisTokenId,
+            code: 'unknown',
+            reason: 'addToken returned false after pre-checks (race or unrecognised guard)',
+          });
+        }
+      } catch (err) {
+        rejected.push({
+          genesisTokenId,
+          code: 'add-failed',
+          reason: `addToken failed: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+    }
+
+    return { added, skipped, rejected };
+  }
+
+  // ===========================================================================
   // Public API - Unconfirmed Token Resolution
   // ===========================================================================
 
@@ -3608,6 +5980,17 @@ export class PaymentsModule {
    * These tokens can't be serialized to TXF format (no genesis/state),
    * so we persist them separately and restore on load().
    */
+  /**
+   * Memoized (plaintext JSON → CID ref) pair. If successive saves produce
+   * identical pendingTokens, we skip the IPFS pin and reuse the last CID.
+   * Prevents per-tick CID churn from the 10s resolver when no state has
+   * changed (steelman fix #7).
+   *
+   * Scoped to this module instance; cleared on reset/reconnect via init.
+   */
+  private _lastPinnedV5Json: string | null = null;
+  private _lastPinnedV5Ref: CidRef | null = null;
+
   private async savePendingV5Tokens(): Promise<void> {
     const pendingTokens: Token[] = [];
     for (const token of this.tokens.values()) {
@@ -3615,50 +5998,145 @@ export class PaymentsModule {
         pendingTokens.push(token);
       }
     }
-    if (pendingTokens.length > 0) {
-      const json = JSON.stringify(pendingTokens);
-      logger.debug('Payments', `[V5-PERSIST] Saving ${pendingTokens.length} pending V5 token(s): ${pendingTokens.map(t => t.id.slice(0, 16)).join(', ')} (${json.length} bytes)`);
-      await this.deps!.storage.set(
-        STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS,
-        json
-      );
-      // Verify write
-      const verify = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS);
-      if (!verify) {
-        logger.error('Payments', '[V5-PERSIST] CRITICAL: KV write succeeded but read-back is empty!');
-      } else {
-        logger.debug('Payments', `[V5-PERSIST] Verified: read-back ${verify.length} bytes`);
-      }
-    } else {
+    if (pendingTokens.length === 0) {
       logger.debug('Payments', `[V5-PERSIST] No pending V5 tokens to save (total tokens: ${this.tokens.size}), clearing KV`);
-      // Clean up when no pending tokens remain
-      await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS, '');
+      // Clearing the pending set is operational cleanup after the
+      // inbound transfer(s) finalized; not itself a user action.
+      await this.setStorageEntry(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS, '', 'cache_index');
+      this._lastPinnedV5Json = null;
+      this._lastPinnedV5Ref = null;
+      return;
     }
+
+    // PROFILE-CID-REFERENCES.md §8.1 — pendingV5 tokens are fat (sdkData
+    // can be 5-20 KB per token). When a CidRefStore is available, write
+    // a small CID reference to OpLog and pin the content to IPFS. Falls
+    // back to legacy inline JSON when CidRefStore is absent.
+    const cidRefStore = this.deps!.cidRefStore;
+    if (cidRefStore) {
+      // Sort keys for deterministic JSON — two consecutive saves with the
+      // same token set produce identical JSON regardless of Map insertion order.
+      const json = JSON.stringify(pendingTokens);
+
+      // Memoization: skip pin if plaintext is unchanged since last save.
+      // AES-GCM uses random IVs so re-pinning identical plaintext would
+      // produce a different CID anyway, but we'd rather write the same
+      // ref than thrash the gateway.
+      if (this._lastPinnedV5Ref && this._lastPinnedV5Json === json) {
+        const refStr = CidRefStore.stringifyRef(this._lastPinnedV5Ref);
+        logger.debug(
+          'Payments',
+          `[V5-PERSIST] Pending set unchanged, reusing cached CID ref (cid=${this._lastPinnedV5Ref.cid})`,
+        );
+        await this.setStorageEntry(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS, refStr, 'token_receive');
+        return;
+      }
+
+      const ref = await cidRefStore.pinJson(pendingTokens);
+      const refStr = CidRefStore.stringifyRef(ref);
+      logger.debug(
+        'Payments',
+        `[V5-PERSIST] Saving ${pendingTokens.length} pending V5 token(s) via CID ref (cid=${ref.cid}, encryptedSize=${ref.size} bytes, OpLog value=${refStr.length} bytes)`,
+      );
+      await this.setStorageEntry(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS, refStr, 'token_receive');
+      // Update memo AFTER successful storage.set so a set-failure does
+      // not leave us thinking the CID is live.
+      this._lastPinnedV5Json = json;
+      this._lastPinnedV5Ref = ref;
+      return;
+    }
+
+    // Legacy path: inline JSON (deprecated for heavy wallets — see CID-refs doc).
+    const json = JSON.stringify(pendingTokens);
+    logger.debug(
+      'Payments',
+      `[V5-PERSIST] Saving ${pendingTokens.length} pending V5 token(s) inline (${json.length} bytes — consider providing cidRefStore)`,
+    );
+    await this.setStorageEntry(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS, json, 'token_receive');
   }
 
   /**
    * Load pending V5 tokens from key-value storage and merge into tokens map.
    * Called during load() to restore tokens that TXF format can't represent.
+   *
+   * PROFILE-CID-REFERENCES.md §6 — dual-read: detect CID-ref via
+   * tryParseRef; fall back to legacy inline JSON otherwise.
+   *
+   * Error handling (steelman-hardened):
+   *   - CID ref present but no cidRefStore injected → throws a typed
+   *     `ProfileError('CID_REF_UNREADABLE')` so callers can surface a
+   *     configuration error rather than silently losing pending transfers.
+   *   - IPFS fetch / verify / decrypt errors propagate from the CidRefStore
+   *     with their own typed codes — NOT swallowed as "parse failure".
+   *   - Legacy-JSON parse failures are caught narrowly (SyntaxError only).
    */
   private async loadPendingV5Tokens(): Promise<void> {
     const data = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS);
     logger.debug('Payments', `[V5-PERSIST] loadPendingV5Tokens: KV data = ${data ? `${data.length} bytes` : 'null/empty'}`);
     if (!data) return;
 
-    try {
-      const pendingTokens = JSON.parse(data) as Token[];
-      logger.debug('Payments', `[V5-PERSIST] Parsed ${pendingTokens.length} pending V5 token(s): ${pendingTokens.map(t => t.id.slice(0, 16)).join(', ')}`);
-      for (const token of pendingTokens) {
-        // Only restore if not already in the map (e.g., already resolved)
-        if (!this.tokens.has(token.id)) {
-          this.tokens.set(token.id, token);
-          logger.debug('Payments', `[V5-PERSIST] Restored token ${token.id.slice(0, 16)} (status=${token.status})`);
-        } else {
-          logger.debug('Payments', `[V5-PERSIST] Token ${token.id.slice(0, 16)} already in map, skipping`);
-        }
+    const ref = CidRefStore.tryParseRef(data);
+    let pendingTokens: Token[];
+
+    if (ref) {
+      // CID reference path.
+      if (!this.deps!.cidRefStore) {
+        // Configuration error: a prior session wrote CID refs, this session
+        // doesn't have the store needed to resolve them. Throw typed error
+        // so the caller can surface to the user rather than silently
+        // dropping pending transfers.
+        const { ProfileError } = await import('../../profile/errors.js');
+        throw new ProfileError(
+          'CID_REF_UNREADABLE',
+          `PaymentsModule.loadPendingV5Tokens: KV at ${STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS} ` +
+            `contains a CID ref (cid=${ref.cid}) but no cidRefStore was injected. ` +
+            `Pending V5 transfers cannot be restored without IPFS access. ` +
+            `Check PaymentsModule init — is cidRefStore provided?`,
+        );
       }
-    } catch (err) {
-      logger.error('Payments', '[V5-PERSIST] Failed to parse pending V5 tokens:', err);
+      logger.debug(
+        'Payments',
+        `[V5-PERSIST] Reading via CID ref (cid=${ref.cid}, encryptedSize=${ref.size})`,
+      );
+      // Errors from fetchJson (IPFS timeout, CID_REF_SIZE_MISMATCH,
+      // DECRYPTION_FAILED) propagate — NOT caught below.
+      pendingTokens = await this.deps!.cidRefStore.fetchJson<Token[]>(ref);
+    } else {
+      // Legacy path: inline JSON (pre-CID-refs wallet). Narrow catch:
+      // ONLY swallow SyntaxError from malformed legacy JSON. All other
+      // errors propagate with their typed codes.
+      try {
+        pendingTokens = JSON.parse(data) as Token[];
+      } catch (err) {
+        if (err instanceof SyntaxError) {
+          logger.error('Payments', '[V5-PERSIST] Legacy JSON parse failed (corrupted inline data):', err);
+          return;
+        }
+        throw err;
+      }
+    }
+
+    if (!Array.isArray(pendingTokens)) {
+      // Defensive: a legacy wallet's JSON was the wrong shape.
+      logger.error(
+        'Payments',
+        `[V5-PERSIST] Decoded pendingTokens is not an array (got ${typeof pendingTokens}); skipping load.`,
+      );
+      return;
+    }
+
+    logger.debug(
+      'Payments',
+      `[V5-PERSIST] Parsed ${pendingTokens.length} pending V5 token(s): ${pendingTokens.map((t) => t.id.slice(0, 16)).join(', ')}`,
+    );
+    for (const token of pendingTokens) {
+      // Only restore if not already in the map (e.g., already resolved)
+      if (!this.tokens.has(token.id)) {
+        this.tokens.set(token.id, token);
+        logger.debug('Payments', `[V5-PERSIST] Restored token ${token.id.slice(0, 16)} (status=${token.status})`);
+      } else {
+        logger.debug('Payments', `[V5-PERSIST] Token ${token.id.slice(0, 16)} already in map, skipping`);
+      }
     }
   }
 
@@ -3670,9 +6148,12 @@ export class PaymentsModule {
   private async saveProcessedSplitGroupIds(): Promise<void> {
     const ids = Array.from(this.processedSplitGroupIds);
     if (ids.length > 0) {
-      await this.deps!.storage.set(
+      // Dedup ledger — operational state protecting against duplicate
+      // Nostr re-deliveries; not itself a user action.
+      await this.setStorageEntry(
         STORAGE_KEYS_ADDRESS.PROCESSED_SPLIT_GROUP_IDS,
-        JSON.stringify(ids)
+        JSON.stringify(ids),
+        'cache_index',
       );
     }
   }
@@ -4199,26 +6680,51 @@ export class PaymentsModule {
 
   /**
    * Best-effort resolve sender's DIRECT address and nametag from their transport pubkey.
-   * Returns empty object if transport doesn't support resolution or lookup fails.
+   *
+   * **C9 nametag re-resolution defense (T.7.B.5).** Per UXF transfer
+   * protocol §3.1, §5.6, §9.3, the unauthenticated `payload.sender.nametag`
+   * MUST NOT be displayed in UI without re-resolving against the
+   * AUTHENTICATED Nostr signing pubkey via the identity-binding registry.
+   * This method is a thin wrapper over
+   * {@link resolveSenderInfoViaBinding} (in `./transfer/nametag-reresolver`)
+   * which centralizes that policy. The optional `payloadSenderNametag`
+   * parameter is accepted for forward-compat with the UXF outer envelope
+   * but is NEVER trusted directly — it is logged for forensic correlation
+   * with the binding-attested result.
+   *
+   * Returns:
+   *   - `senderAddress` — the binding event's `directAddress`, or
+   *     `undefined` if no binding event exists.
+   *   - `senderNametag` — the BINDING-ATTESTED nametag, or `undefined`
+   *     if no binding event exists OR the binding event registers
+   *     pubkey-only (no nametag). NEVER returns the payload claim.
+   *   - `senderNametagSource` — `'binding-event'` when a binding was
+   *     found (regardless of whether it had a nametag),
+   *     `'untrusted-payload'` when the lookup failed. Used by callers
+   *     that want to differentiate "known peer (no nametag)" from
+   *     "unknown sender" in the UI.
+   *
+   * @param senderTransportPubkey - The AUTHENTICATED Nostr signing
+   *                                pubkey of the sender. Verified by
+   *                                the relay; safe to use as the
+   *                                lookup key.
+   * @param payloadSenderNametag - The unauthenticated nametag claim
+   *                               from `payload.sender.nametag` (if
+   *                               any). Accepted but never trusted.
    */
-  private async resolveSenderInfo(senderTransportPubkey: string): Promise<{
+  private async resolveSenderInfo(
+    senderTransportPubkey: string,
+    payloadSenderNametag?: string,
+  ): Promise<{
     senderAddress?: string;
     senderNametag?: string;
+    senderNametagSource: ReresolvedNametagSource;
   }> {
-    try {
-      if (this.deps?.transport?.resolveTransportPubkeyInfo) {
-        const peerInfo = await this.deps.transport.resolveTransportPubkeyInfo(senderTransportPubkey);
-        if (peerInfo) {
-          return {
-            senderAddress: peerInfo.directAddress || undefined,
-            senderNametag: peerInfo.nametag || undefined,
-          };
-        }
-      }
-    } catch {
-      // Best-effort: ignore resolution failures
-    }
-    return {};
+    return resolveSenderInfoViaBinding(
+      senderTransportPubkey,
+      payloadSenderNametag,
+      this.deps?.transport,
+    );
   }
 
   /**
@@ -5072,6 +7578,1142 @@ export class PaymentsModule {
     );
   }
 
+  // ===========================================================================
+  // T.8.B — Capability hint surfacing (UXF §10.4 + W20)
+  // ===========================================================================
+
+  /**
+   * Compute the outbound asset kinds carried by a `TransferRequest`.
+   *
+   * Folds the primary `(coinId, amount)` slot (when present) and every
+   * `additionalAssets` entry into the deduplicated set of `'coin' | 'nft' | …`
+   * tokens that will ride in the outbound bundle. Future asset kinds (added
+   * post-v1.0) are passed through verbatim — the receiver's T.2.B
+   * `UNKNOWN_ASSET_KIND` rule polices what's actually accepted.
+   */
+  private computeOutboundAssetKinds(request: TransferRequest): ReadonlyArray<string> {
+    const kinds = new Set<string>();
+    if (request.coinId && request.amount) {
+      kinds.add('coin');
+    }
+    if (request.additionalAssets && request.additionalAssets.length > 0) {
+      for (const asset of request.additionalAssets) {
+        if (asset && typeof asset === 'object' && typeof asset.kind === 'string') {
+          kinds.add(asset.kind);
+        }
+      }
+    }
+    return Array.from(kinds);
+  }
+
+  /**
+   * Map the resolved transfer mode to the canonical wire-protocol label
+   * advertised in identity binding events (per §10.4 / T.8.B).
+   *
+   * Mapping (mirrors the dispatcher routing in `send()`):
+   *   - UXF conservative + features.senderUxf  → `'uxf-car'`  (CAR-embed)
+   *   - UXF instant       + features.senderUxf  → `'uxf-cid'`  (CID-by-ref)
+   *   - explicit `'txf'`  + features.senderUxf  → `'txf'`     (legacy TXF)
+   *   - any mode          + !features.senderUxf → `'txf'`     (legacy single-token)
+   */
+  private resolveOutboundWireProtocol(mode: 'instant' | 'conservative' | 'txf'): string {
+    if (!this.features.senderUxf) return 'txf';
+    if (mode === 'conservative') return 'uxf-car';
+    if (mode === 'instant') return 'uxf-cid';
+    return 'txf';
+  }
+
+  /**
+   * T.8.B — Pre-send capability hint check.
+   *
+   * Resolves the recipient via the transport, inspects the binding event's
+   * capability hints, and emits `transfer:capability-warning` when the
+   * outbound bundle's asset kinds or wire protocol are not advertised by
+   * the peer. **DOES NOT** auto-strip, auto-coerce, or block the send —
+   * the warning is informational and the actual interop guarantee comes
+   * from the receiver's T.2.B `UNKNOWN_ASSET_KIND` reject rule and the
+   * §10.4 forward-compat behaviour.
+   *
+   * W20: if the peer's binding event is silent about `assetKinds`, treat
+   * the peer as `['coin']` (older v1.0 wallet pre-dating NFTs). Any
+   * outbound NFT entry will then trigger a warning.
+   *
+   * Failure modes (all silent — capability hints are best-effort):
+   *  - Resolve returns null (unknown peer): skip the check entirely.
+   *  - Both `wireProtocols` and `assetKinds` absent: skip emission unless
+   *    an outbound asset kind is OUTSIDE the W20 default `['coin']`.
+   *  - Resolve throws: caller logs and continues (see `send()`).
+   */
+  private async maybeEmitCapabilityWarning(
+    request: TransferRequest,
+    mode: 'instant' | 'conservative' | 'txf',
+  ): Promise<void> {
+    const transport = this.deps?.transport;
+    if (!transport?.resolve) return;
+
+    let peerInfo: PeerInfo | null;
+    try {
+      peerInfo = (await transport.resolve(request.recipient)) ?? null;
+    } catch {
+      // Resolve failures aren't capability concerns — let the dispatcher
+      // surface its own typed error.
+      return;
+    }
+    if (!peerInfo) return;
+
+    const outboundAssetKinds = this.computeOutboundAssetKinds(request);
+    const outboundWireProtocol = this.resolveOutboundWireProtocol(mode);
+
+    // W20: assetKinds absent on the wire ⇒ assume ['coin']. We preserve
+    // the empty-array case (peer present but explicitly empty) as-is so
+    // diagnostics distinguish "older peer" from "explicitly empty".
+    const recipientAssetKinds: ReadonlyArray<string> = peerInfo.assetKinds
+      ?? DEFAULT_ASSET_KINDS_WHEN_ABSENT;
+    const recipientWireProtocols = peerInfo.wireProtocols;
+
+    const advertisedKinds = new Set(recipientAssetKinds);
+    const mismatchedAssetKinds = outboundAssetKinds.filter(k => !advertisedKinds.has(k));
+
+    // wireProtocolMismatch fires only when hints were PRESENT and the
+    // outbound protocol is not in the set. Absent hints make NO claim.
+    let wireProtocolMismatch = false;
+    if (recipientWireProtocols !== undefined) {
+      const advertisedWP = new Set(recipientWireProtocols);
+      wireProtocolMismatch = !advertisedWP.has(outboundWireProtocol);
+    }
+
+    if (mismatchedAssetKinds.length === 0 && !wireProtocolMismatch) {
+      return; // Everything advertised — nothing to warn about.
+    }
+
+    this.deps!.emitEvent('transfer:capability-warning', {
+      recipientTransportPubkey: peerInfo.transportPubkey,
+      recipientAssetKinds,
+      recipientWireProtocols,
+      outboundAssetKinds,
+      outboundWireProtocol,
+      mismatchedAssetKinds,
+      wireProtocolMismatch,
+    });
+  }
+
+  // ===========================================================================
+  // Symbol → canonical hex coinId resolution (shared by all dispatchers)
+  // ===========================================================================
+
+  /**
+   * Resolve a short ticker symbol (e.g. `'UCT'`) to the canonical 64/68-char
+   * hex `coinId` used by token storage and `validateTargets`.
+   *
+   * Background: swap manifests and public callers may pass a human-readable
+   * symbol such as `'UCT'` or `'USDU'` in `request.coinId`, whereas the
+   * internal token map stores tokens under the hex coin identifier produced
+   * by the aggregator.  When the literal value finds no match in the in-
+   * memory token pool, and the value is short enough to be a symbol (≤ 20
+   * characters), the method falls back to the {@link TokenRegistry} singleton
+   * to attempt a symbol → id lookup.  If that also fails the original value
+   * is returned unchanged (the downstream validator will produce an
+   * informative error).
+   *
+   * Multi-asset awareness: the primary `coinId` field AND each `kind: 'coin'`
+   * entry inside `additionalAssets` are resolved independently.  NFT entries
+   * (`kind: 'nft'`) carry a `tokenId`, not a `coinId`, and are left untouched.
+   *
+   * **Must be called BEFORE {@link requireLegacyCoinSlot}** so the narrowing
+   * shim sees the canonical hex value and does not re-widen it.
+   *
+   * This is the single canonical implementation of the pattern that the legacy
+   * `instantSplitSend` arm previously inlined at two call-sites (lines
+   * ~1868 and ~2440).  Those sites now delegate here so the logic lives in one
+   * place.
+   */
+  private resolveCoinIdSymbol(request: TransferRequest): TransferRequest {
+    // ── Primary coinId slot ───────────────────────────────────────────────────
+    const rawCoinId = request.coinId;
+    let resolvedCoinId = rawCoinId;
+    if (rawCoinId !== undefined && rawCoinId !== null) {
+      const literalMatch = Array.from(this.tokens.values()).some(
+        (t) => t.coinId === rawCoinId,
+      );
+      if (!literalMatch && rawCoinId.length <= 20) {
+        const def = TokenRegistry.getInstance().getDefinitionBySymbol(rawCoinId);
+        if (def?.id) {
+          resolvedCoinId = def.id;
+        }
+      }
+    }
+
+    // ── additionalAssets coin entries ─────────────────────────────────────────
+    let resolvedAdditional: TransferRequest['additionalAssets'] =
+      request.additionalAssets;
+    if (request.additionalAssets && request.additionalAssets.length > 0) {
+      const mapped = request.additionalAssets.map((asset) => {
+        if (asset.kind !== 'coin') return asset; // NFT entries: untouched
+        const raw = asset.coinId;
+        const litMatch = Array.from(this.tokens.values()).some(
+          (t) => t.coinId === raw,
+        );
+        if (!litMatch && raw.length <= 20) {
+          const def = TokenRegistry.getInstance().getDefinitionBySymbol(raw);
+          if (def?.id) {
+            return { ...asset, coinId: def.id };
+          }
+        }
+        return asset;
+      });
+      // Only allocate a new array if something actually changed.
+      const changed = mapped.some(
+        (a, i) => a !== request.additionalAssets![i],
+      );
+      if (changed) {
+        resolvedAdditional = mapped as TransferRequest['additionalAssets'];
+      }
+    }
+
+    // Return the original object when nothing changed (avoids spurious spread).
+    if (resolvedCoinId === rawCoinId && resolvedAdditional === request.additionalAssets) {
+      return request;
+    }
+    return {
+      ...request,
+      ...(resolvedCoinId !== rawCoinId ? { coinId: resolvedCoinId } : {}),
+      ...(resolvedAdditional !== request.additionalAssets
+        ? { additionalAssets: resolvedAdditional }
+        : {}),
+    };
+  }
+
+  // ===========================================================================
+  // T.2.D.1 — UXF conservative-mode dispatcher
+  // ===========================================================================
+
+  /**
+   * UXF conservative-mode send dispatcher (T.2.D.1, flag-gated).
+   *
+   * Reached only when `features.senderUxf === true` AND
+   * `transferMode === 'conservative'`. Builds the {@link
+   * ConservativeSenderDeps} surface from the module's existing private
+   * state (oracle, transport, identity, spend planner, SDK helpers) and
+   * delegates the §4.2 sender pipeline to {@link sendConservativeUxf}.
+   *
+   * **Stub outbox writer**: this dispatcher uses the existing legacy
+   * `saveToOutbox`/`removeFromOutbox` chain so existing tests keep
+   * their invariants. T.2.D.2 replaces this with the per-entry-key
+   * UXF outbox writer.
+   *
+   * Restrictions inherited from T.1.B.1's `requireLegacyCoinSlot`:
+   *  - The request MUST carry a primary `(coinId, amount)` slot. NFT-only
+   *    and multi-asset shapes are accepted by the public type but
+   *    rejected here until T.2.B's source-selection extension lands.
+   */
+  private async dispatchUxfConservativeSend(
+    originalRequest: TransferRequest,
+  ): Promise<TransferResult> {
+    // ── Symbol → hex coinId resolution (must run BEFORE requireLegacyCoinSlot) ─
+    const request: LegacyCoinTransferRequest = requireLegacyCoinSlot(
+      this.resolveCoinIdSymbol(originalRequest),
+    );
+
+    // Resolve recipient + recipient address up front so the orchestrator
+    // gets a fully-typed PeerInfo. This also serves the same identity-
+    // binding/UI affordance the legacy arm provides.
+    const peerInfo: PeerInfo | null =
+      (await this.deps!.transport.resolve?.(request.recipient)) ?? null;
+    const recipientPubkey = this.resolveTransportPubkey(request.recipient, peerInfo);
+    const recipientAddress = await this.resolveRecipientAddress(
+      request.recipient,
+      request.addressMode,
+      peerInfo,
+    );
+
+    // Synthesize a PeerInfo if `transport.resolve` returned null — the
+    // orchestrator only needs `transportPubkey` and (optional) `nametag`.
+    const recipient: PeerInfo = peerInfo ?? {
+      transportPubkey: recipientPubkey,
+      chainPubkey: '',
+      l1Address: '',
+      directAddress: '',
+      timestamp: Date.now(),
+    };
+
+    // Pre-build SDK helpers reused across all commitments. (Identical
+    // to the legacy conservative arm — single signing service +
+    // single state-transition client.)
+    const signingService = await this.createSigningService();
+    const stClient = this.deps!.oracle.getStateTransitionClient?.() as
+      | StateTransitionClient
+      | undefined;
+    if (!stClient) {
+      throw new SphereError(
+        'State transition client not available. Oracle provider must implement getStateTransitionClient()',
+        'AGGREGATOR_ERROR',
+      );
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const trustBase = (this.deps!.oracle as any).getTrustBase?.();
+    if (!trustBase) {
+      throw new SphereError(
+        'Trust base not available. Oracle provider must implement getTrustBase()',
+        'AGGREGATOR_ERROR',
+      );
+    }
+
+    const onChainMessage = parseInvoiceMemoForOnChain(
+      request.memo,
+      request.invoiceRefundAddress,
+      request.invoiceContact,
+    );
+
+    const transferId = crypto.randomUUID();
+    const committedOnChainTokenIds = new Set<string>();
+
+    const deps: ConservativeSenderDeps = {
+      aggregator: this.deps!.oracle,
+      transport: this.deps!.transport,
+      tokenStorage: null,
+      identity: this.deps!.identity,
+      senderTransportPubkey: this.deps!.identity.chainPubkey,
+      emit: (type, data) => this.deps!.emitEvent(type, data),
+      // T.2.D.1 keeps publishToIpfs unwired; CID-bound delivery is
+      // T.4.A's responsibility. Tests inject a real publisher.
+      availableSources: () => Array.from(this.tokens.values()),
+      transferId,
+      selectSources: async ({ request: req }) => {
+        const out: Token[] = [];
+
+        // ── Primary coin ──────────────────────────────────────────────────────
+        const parsedPool = await this.spendPlanner.buildParsedPool(
+          Array.from(this.tokens.values()),
+          request.coinId,
+        );
+        let pendingChangeAmount = 0n;
+        for (const [, t] of this.tokens) {
+          if (t.coinId === request.coinId && t.status === 'transferring') {
+            pendingChangeAmount += BigInt(t.amount || '0');
+          }
+        }
+        // Use a per-coin reservation id so additional-coin plans never
+        // collide in SpendQueue.promises (which is keyed by entry id).
+        const primaryQueueId = `${transferId}:${request.coinId}`;
+        const planResult = this.spendPlanner.planSend(
+          { amount: req.amount ?? '0', coinId: request.coinId },
+          parsedPool,
+          this.reservationLedger,
+          this.spendQueue,
+          primaryQueueId,
+          pendingChangeAmount,
+        );
+        let splitPlan: SplitPlan;
+        if (planResult === 'queued') {
+          const queueResult = await this.spendQueue.waitForEntry(primaryQueueId);
+          splitPlan = queueResult.splitPlan;
+        } else {
+          splitPlan = planResult.splitPlan;
+        }
+        out.push(...splitPlan.tokensToTransferDirectly.map((t) => t.uiToken));
+        if (splitPlan.tokenToSplit) out.push(splitPlan.tokenToSplit.uiToken);
+
+        // ── Additional assets (coin entries only) ─────────────────────────────
+        // Each additional coin is planned independently with a unique
+        // queue id (${transferId}:${addCoinId}:${i}) to prevent promise-map
+        // collisions when two entries queue for the same SpendQueue.
+        const additional = req.additionalAssets ?? [];
+        for (let i = 0; i < additional.length; i++) {
+          const asset = additional[i];
+          if (asset.kind !== 'coin') continue; // NFT: whole-token, handled by commitSources
+          const addCoinId = asset.coinId;
+          const addParsedPool = await this.spendPlanner.buildParsedPool(
+            Array.from(this.tokens.values()),
+            addCoinId,
+          );
+          let addPendingChange = 0n;
+          for (const [, t] of this.tokens) {
+            if (t.coinId === addCoinId && t.status === 'transferring') {
+              addPendingChange += BigInt(t.amount || '0');
+            }
+          }
+          const addQueueId = `${transferId}:${addCoinId}:${i}`;
+          const addPlanResult = this.spendPlanner.planSend(
+            { amount: asset.amount, coinId: addCoinId },
+            addParsedPool,
+            this.reservationLedger,
+            this.spendQueue,
+            addQueueId,
+            addPendingChange,
+          );
+          let addSplitPlan: SplitPlan;
+          if (addPlanResult === 'queued') {
+            const addQueueResult = await this.spendQueue.waitForEntry(addQueueId);
+            addSplitPlan = addQueueResult.splitPlan;
+          } else {
+            addSplitPlan = addPlanResult.splitPlan;
+          }
+          out.push(...addSplitPlan.tokensToTransferDirectly.map((t) => t.uiToken));
+          if (addSplitPlan.tokenToSplit) out.push(addSplitPlan.tokenToSplit.uiToken);
+        }
+
+        // [DIAG-UXF-SEND] all sources selected across primary + additionalAssets
+        logger.debug('Payments', '[DIAG-UXF-SEND] selectSources result', {
+          totalSelected: out.length,
+          selectedIds: out.map((t) => `${t.id.slice(0, 12)}(${t.coinId.slice(0, 12)})`),
+          primaryCoinId: request.coinId.slice(0, 16),
+          additionalCount: (req.additionalAssets ?? []).filter((a) => a.kind === 'coin').length,
+        });
+        // Mark all selected sources as transferring + persist (matches legacy
+        // semantics — prevents double-spend within the same session).
+        for (const tok of out) {
+          tok.status = 'transferring';
+          this.tokens.set(tok.id, tok);
+          this.parsedTokenCache.delete(tok.id);
+        }
+        await this.save();
+        return out;
+      },
+      preflightOptions: () => ({
+        // T.2.A wraps the existing aggregator path; for the dispatcher
+        // we fall through with a noop extractor since the legacy
+        // single-coin path's tokens are always finalized at selection.
+        // T.2.D.2 + T.5 wires the real chain extractor. The orchestrator
+        // accepts an empty chain → no-op preflight.
+        resolveRequestId: () => {
+          throw new SphereError(
+            'preflight resolveRequestId invoked unexpectedly in T.2.D.1 dispatcher',
+            'INVALID_CONFIG',
+          );
+        },
+        extractPendingChain: () => [],
+      }),
+      commitSources: async ({ sources }) => {
+        // [DIAG-UXF-SEND] how many source tokens are being committed?
+        logger.debug('Payments', '[DIAG-UXF-SEND] commitSources entry', {
+          sourceCount: sources.length,
+          sourceIds: sources.map((t) => `${t.id.slice(0, 12)}(${t.coinId.slice(0, 12)})`),
+        });
+        const out: ConservativeCommitResult[] = [];
+        for (const token of sources) {
+          // The legacy arm splits-then-mints for the source-to-be-split,
+          // and direct-transfers for everything else. The orchestrator's
+          // SDK-coupling boundary is THIS callback — we re-implement the
+          // direct-conservative path here verbatim to match existing
+          // behavior. Split-mode is currently unsupported by the
+          // orchestrator (T.2.D.2 widens it via OutboxWriter).
+          const commitment = await this.createSdkCommitment(
+            token,
+            recipientAddress,
+            signingService,
+            onChainMessage,
+          );
+          const submitResponse = await stClient.submitTransferCommitment(commitment);
+          if (
+            submitResponse.status !== 'SUCCESS' &&
+            submitResponse.status !== 'REQUEST_ID_EXISTS'
+          ) {
+            throw new SphereError(
+              `Transfer commitment failed: ${submitResponse.status}`,
+              'TRANSFER_FAILED',
+            );
+          }
+          committedOnChainTokenIds.add(token.id);
+          const inclusionProof = await waitInclusionProof(trustBase, stClient, commitment);
+          const transferTx = commitment.toTransaction(inclusionProof);
+          // Reconstruct the recipient-token JSON shape (sourceToken +
+          // post-transfer transition) for ingestion into the bundle.
+          const tokenJson = token.sdkData
+            ? (typeof token.sdkData === 'string' ? JSON.parse(token.sdkData) : token.sdkData)
+            : null;
+          if (!tokenJson || typeof tokenJson !== 'object') {
+            throw new SphereError(
+              `Token ${token.id} missing sdkData; cannot ingest into UXF bundle`,
+              'TRANSFER_FAILED',
+            );
+          }
+          const recipientTokenJson = {
+            ...(tokenJson as Record<string, unknown>),
+            transactions: [
+              ...(((tokenJson as { transactions?: unknown[] }).transactions) ?? []),
+              transferTx.toJSON(),
+            ],
+          };
+          const requestIdBytes = commitment.requestId;
+          const requestIdHex =
+            requestIdBytes instanceof Uint8Array
+              ? Array.from(requestIdBytes)
+                  .map((b) => b.toString(16).padStart(2, '0'))
+                  .join('')
+              : (typeof (requestIdBytes as { toJSON?: () => string }).toJSON === "function" ? (requestIdBytes as { toJSON: () => string }).toJSON() : String(requestIdBytes));
+          out.push({
+            sourceTokenId: token.id,
+            method: 'direct',
+            requestIdHex,
+            recipientTokenJson,
+          });
+          await this.removeToken(token.id, transferId);
+        }
+        return out;
+      },
+      outbox: {
+        // T.2.D.2 — orchestrator drives §7.0 via create/transition.
+        // Until the per-entry-key OutboxWriter (T.6.A) is fully wired
+        // to a ProfileDatabase in PaymentsModule (T.6.D, follow-up),
+        // this adapter folds the new hooks onto the legacy
+        // saveToOutbox / removeFromOutbox chain so existing tests keep
+        // their invariants:
+        //   - create (status=packaging): persist legacy synthetic entry.
+        //   - transition (status=delivered): drop legacy entry.
+        //   - transition (other states): no-op (legacy outbox is
+        //     bundle-grained-on-create, terminal-on-removal only).
+        create: async (entry) => {
+          const synthResult: TransferResult = {
+            id: entry.id,
+            status: 'submitted',
+            tokens: [],
+            tokenTransfers: [],
+          };
+          await this.saveToOutbox(synthResult, entry.recipientTransportPubkey);
+        },
+        transition: async (id, patch) => {
+          if (patch.status === 'delivered') {
+            await this.removeFromOutbox(id);
+          }
+          // 'pinned' / 'sending' / 'failed-transient' carry no legacy
+          // state mutation — the new schema's intermediate states are
+          // tracked exclusively by the (forthcoming) OutboxWriter.
+        },
+      },
+    };
+
+    return sendConservativeUxf(originalRequest, recipient, deps);
+  }
+
+  // ===========================================================================
+  // T.5.A — UXF instant-mode dispatcher
+  // ===========================================================================
+
+  /**
+   * UXF instant-mode send dispatcher (T.5.A, flag-gated).
+   *
+   * Reached only when `features.senderUxf === true` AND
+   * `transferMode === 'instant'`. Mirrors {@link
+   * dispatchUxfConservativeSend} structurally, but delegates to {@link
+   * sendInstantUxf} which DOES NOT await inclusion proofs before
+   * publishing — proofs are filled in by T.5.B's sender-side
+   * finalization worker (deferred to a future wave).
+   *
+   * Restrictions inherited from {@link requireLegacyCoinSlot}:
+   *  - The request MUST carry a primary `(coinId, amount)` slot until
+   *    the multi-asset source-selection extension lands.
+   */
+  private async dispatchUxfInstantSend(
+    originalRequest: TransferRequest,
+  ): Promise<TransferResult> {
+    // ── Symbol → hex coinId resolution (must run BEFORE requireLegacyCoinSlot) ─
+    const request: LegacyCoinTransferRequest = requireLegacyCoinSlot(
+      this.resolveCoinIdSymbol(originalRequest),
+    );
+
+    const peerInfo: PeerInfo | null =
+      (await this.deps!.transport.resolve?.(request.recipient)) ?? null;
+    const recipientPubkey = this.resolveTransportPubkey(request.recipient, peerInfo);
+    const recipientAddress = await this.resolveRecipientAddress(
+      request.recipient,
+      request.addressMode,
+      peerInfo,
+    );
+
+    const recipient: PeerInfo = peerInfo ?? {
+      transportPubkey: recipientPubkey,
+      chainPubkey: '',
+      l1Address: '',
+      directAddress: '',
+      timestamp: Date.now(),
+    };
+
+    const signingService = await this.createSigningService();
+    const stClient = this.deps!.oracle.getStateTransitionClient?.() as
+      | StateTransitionClient
+      | undefined;
+    if (!stClient) {
+      throw new SphereError(
+        'State transition client not available. Oracle provider must implement getStateTransitionClient()',
+        'AGGREGATOR_ERROR',
+      );
+    }
+
+    const onChainMessage = parseInvoiceMemoForOnChain(
+      request.memo,
+      request.invoiceRefundAddress,
+      request.invoiceContact,
+    );
+
+    const transferId = crypto.randomUUID();
+
+    // Derive the address-scoped outbox key prefix per
+    // PROFILE-ARCHITECTURE §10.12. Falls back to the chainPubkey itself
+    // when the wallet has no DIRECT address (test paths).
+    const directForId = this.deps!.identity.directAddress;
+    const addressId =
+      typeof directForId === 'string' && directForId.length > 0
+        ? computeAddressId(directForId)
+        : this.deps!.identity.chainPubkey;
+
+    const deps: InstantSenderDeps = {
+      aggregator: this.deps!.oracle,
+      transport: this.deps!.transport,
+      tokenStorage: null,
+      identity: this.deps!.identity,
+      addressId,
+      senderTransportPubkey: this.deps!.identity.chainPubkey,
+      emit: (type, data) => this.deps!.emitEvent(type, data),
+      availableSources: () => Array.from(this.tokens.values()),
+      transferId,
+      selectSources: async ({ request: req }) => {
+        const parsedPool = await this.spendPlanner.buildParsedPool(
+          Array.from(this.tokens.values()),
+          request.coinId,
+        );
+        let pendingChangeAmount = 0n;
+        for (const [, t] of this.tokens) {
+          if (t.coinId === request.coinId && t.status === 'transferring') {
+            pendingChangeAmount += BigInt(t.amount || '0');
+          }
+        }
+        const planResult = this.spendPlanner.planSend(
+          { amount: req.amount ?? '0', coinId: request.coinId },
+          parsedPool,
+          this.reservationLedger,
+          this.spendQueue,
+          transferId,
+          pendingChangeAmount,
+        );
+        let splitPlan: SplitPlan;
+        if (planResult === 'queued') {
+          const queueResult = await this.spendQueue.waitForEntry(transferId);
+          splitPlan = queueResult.splitPlan;
+        } else {
+          splitPlan = planResult.splitPlan;
+        }
+        const out: Token[] = splitPlan.tokensToTransferDirectly.map(
+          (t) => t.uiToken,
+        );
+        if (splitPlan.tokenToSplit) out.push(splitPlan.tokenToSplit.uiToken);
+        for (const tok of out) {
+          tok.status = 'transferring';
+          this.tokens.set(tok.id, tok);
+          this.parsedTokenCache.delete(tok.id);
+        }
+        await this.save();
+        return out;
+      },
+      commitSources: async ({ sources }) => {
+        const out: InstantCommitResult[] = [];
+        for (const token of sources) {
+          // Submit the commitment WITHOUT awaiting the inclusion
+          // proof — the canonical instant-mode pipeline.
+          const commitment = await this.createSdkCommitment(
+            token,
+            recipientAddress,
+            signingService,
+            onChainMessage,
+          );
+          const submitResponse = await stClient.submitTransferCommitment(commitment);
+          if (
+            submitResponse.status !== 'SUCCESS' &&
+            submitResponse.status !== 'REQUEST_ID_EXISTS'
+          ) {
+            throw new SphereError(
+              `Transfer commitment failed: ${submitResponse.status}`,
+              'TRANSFER_FAILED',
+            );
+          }
+          // The transfer transaction goes on the bundle WITHOUT a
+          // proof — the recipient's reader walks the chain when
+          // proofs land.
+          //
+          // Use commitment.toJSON().transactionData (NOT commitment.toJSON())
+          // because TransferCommitment.toJSON() returns
+          // { authenticator, requestId, transactionData } — a Commitment
+          // envelope — whereas the UXF deconstruct code expects `tx.data`
+          // to be the flat TransferTransactionData shape
+          // { sourceState, recipient, salt, recipientDataHash, message, nametags }.
+          // Passing the commitment envelope causes every scalar field to be
+          // `undefined`, which @ipld/dag-cbor rejects at encode time with
+          // "undefined is not supported by the IPLD Data Model".
+          //
+          // Wave 6 — DO NOT embed `data.authenticator`. The Wave 5 attempt
+          // to add `authenticator` under `data` was dead code in production:
+          // the bundle is handed to `pkg.ingestAll(...)` which calls
+          // `deconstructTransferData` (uxf/deconstruct.ts:486-512). That
+          // function only deconstructs the explicit fields {recipient, salt,
+          // recipientDataHash, message, nametagRefs} — `authenticator` is
+          // silently dropped from the IPLD pool. On the recipient side,
+          // `pkg.assemble(tokenId)` calls `assembleTransactionData`
+          // (uxf/assemble.ts:361-398) which returns ONLY {sourceState,
+          // recipient, salt, recipientDataHash, message, nametags}, so
+          // `lastTxJson.data.authenticator` is undefined for EVERY round-
+          // tripped bundle.
+          //
+          // The Wave 5 byte-pattern + synthetic test passed because it
+          // never round-tripped through `pkg.ingestAll → pkg.toCar →
+          // UxfPackage.fromCar → pkg.assemble`. We degrade gracefully
+          // instead of extending the IPLD wire format: §6.1 race-lost
+          // only depends on `transactionHash` (load-bearing), and §6.3
+          // most-recent-proof compare uses the AGGREGATOR-returned
+          // authenticator on both sides — the queue entry's authenticator
+          // is metadata only. The recipient sets `authenticator = null`
+          // and `canonicalAuthenticatorEquals` degrades to
+          // transactionHash-only binding (the load-bearing check).
+          const commitmentJson = commitment.toJSON();
+          const transferTxJson = {
+            data: commitmentJson.transactionData,
+            inclusionProof: null,
+          };
+          const tokenJson = token.sdkData
+            ? typeof token.sdkData === 'string'
+              ? JSON.parse(token.sdkData)
+              : token.sdkData
+            : null;
+          if (!tokenJson || typeof tokenJson !== 'object') {
+            throw new SphereError(
+              `Token ${token.id} missing sdkData; cannot ingest into UXF bundle`,
+              'TRANSFER_FAILED',
+            );
+          }
+          const recipientTokenJson = {
+            ...(tokenJson as Record<string, unknown>),
+            transactions: [
+              ...(((tokenJson as { transactions?: unknown[] }).transactions) ?? []),
+              transferTxJson,
+            ],
+          };
+          const requestIdBytes = commitment.requestId;
+          const requestIdHex =
+            requestIdBytes instanceof Uint8Array
+              ? Array.from(requestIdBytes)
+                  .map((b) => b.toString(16).padStart(2, '0'))
+                  .join('')
+              : (typeof (requestIdBytes as { toJSON?: () => string }).toJSON === "function" ? (requestIdBytes as { toJSON: () => string }).toJSON() : String(requestIdBytes));
+
+          // Task #152 — store per-requestId context for the finalization
+          // worker resolver. The §6.1 race-lost detection compares the LOCAL
+          // `transactionHash` against the proof's `transactionHash` byte-for-
+          // byte; both sides MUST be the actual SDK-encoded DataHash imprint
+          // hex of the transaction-data hash (NOT the requestId).
+          //
+          //   - `transactionHash`: derived from `commitment.transactionData
+          //     .calculateHash()` — same value the aggregator returns in
+          //     `proof.transactionHash` once the commitment lands on chain.
+          //   - `authenticator`: the canonical JSON serialization of the
+          //     commitment's authenticator (publicKey + algorithm + signature
+          //     + stateHash). Stored as a stable string so §6.3 byte-equality
+          //     compares against the aggregator-returned authenticator JSON.
+          //
+          // Race-lost detection (finalization-worker-base.ts §6.1) compares
+          // `pollOutcome.proof.transactionHash !== ctxResolved.transactionHash`.
+          // Before this fix both sides used the requestId, making the compare
+          // trivially equal and the detector silently dead in production.
+          if (this.finalizationWorkerSender !== null) {
+            // Compute the actual transactionHash imprint hex. `calculateHash`
+            // returns a DataHash; `.toJSON()` returns the imprint hex.
+            let txHashImprintHex: string;
+            try {
+              const txDataHash = await commitment.transactionData.calculateHash();
+              txHashImprintHex = txDataHash.toJSON();
+            } catch (err) {
+              // Hard failure here would mean we cannot detect race-lost for
+              // this commitment. Surface a clear runtime warning rather than
+              // silently fall back to the requestId (which would re-introduce
+              // the bug). Use the requestId hex as a non-fatal degraded value
+              // and log so operators see the diagnostic.
+              logger.warn(
+                'Payments',
+                `Task #152: failed to derive transactionHash for requestId ${requestIdHex.slice(0, 16)} — race-lost detection degraded (falling back to requestId). err=${err instanceof Error ? err.message : String(err)}`,
+              );
+              txHashImprintHex = requestIdHex;
+            }
+            // Stable canonical JSON of the authenticator. The aggregator-
+            // returned proof carries the same shape (IAuthenticatorJson) in
+            // `proof.proof.authenticator`; the adapter at line ~9026 strings
+            // its copy with the same JSON.stringify() so byte-equality holds
+            // for §6.3 same-value vs different-value resolution.
+            const commitJson = (commitment as { toJSON?: () => { authenticator?: unknown } }).toJSON?.();
+            const authenticatorJsonStr =
+              commitJson?.authenticator !== undefined && commitJson.authenticator !== null
+                ? JSON.stringify(commitJson.authenticator)
+                : '';
+            this._senderRequestContextMap.set(requestIdHex, {
+              transactionHash: txHashImprintHex,
+              authenticator: authenticatorJsonStr,
+              nextEntryRest: { status: 'valid' as const },
+            });
+          }
+
+          // Class discrimination per C11. Read sdkData's coinData to
+          // route NFTs (whole-token transfer; no splitParent) vs
+          // coins (splitParent set on the child).
+          const sourceTokenLike = {
+            id: token.id,
+            coins: (() => {
+              try {
+                const parsed = JSON.parse(
+                  typeof token.sdkData === 'string'
+                    ? token.sdkData
+                    : JSON.stringify(token.sdkData ?? {}),
+                ) as {
+                  genesis?: {
+                    data?: {
+                      coinData?: ReadonlyArray<readonly [string, string]> | null;
+                    };
+                  };
+                };
+                const cd = parsed?.genesis?.data?.coinData;
+                if (!Array.isArray(cd) || cd.length === 0) return null;
+                const coins = cd
+                  .filter(
+                    (e): e is readonly [string, string] =>
+                      Array.isArray(e) && e.length === 2 &&
+                      typeof e[0] === 'string' && typeof e[1] === 'string',
+                  )
+                  .map(([cid, amt]) => ({ coinId: cid, amount: BigInt(amt) }))
+                  .filter((c) => c.amount > 0n);
+                return coins.length > 0 ? coins : null;
+              } catch {
+                return [{ coinId: token.coinId, amount: BigInt(token.amount || '0') }];
+              }
+            })(),
+          };
+          const tokenClass = classifyTokenLike(sourceTokenLike);
+
+          if (tokenClass === 'coin') {
+            out.push({
+              sourceTokenId: token.id,
+              method: 'direct',
+              requestIdHex,
+              recipientTokenJson,
+              tokenClass: 'coin',
+              splitParentTokenId: token.id,
+            });
+          } else {
+            out.push({
+              sourceTokenId: token.id,
+              method: 'direct',
+              requestIdHex,
+              recipientTokenJson,
+              tokenClass: 'nft',
+            });
+          }
+        }
+        return out;
+      },
+      // markSourcePending — production wiring would mark sources
+      // 'pending' here. The existing legacy path's spendPlanner
+      // already sets `status='transferring'`; T.5.B will pivot the
+      // status to the canonical 'pending' enum once the worker lands.
+      markSourcePending: async () => {
+        // No-op for T.5.A — selectSources above already marks sources
+        // `transferring` in the local cache.
+      },
+      // Phase 9.6.D — wire the in-memory outbox so the instant-sender
+      // persists `delivered-instant` entries the finalization worker can
+      // read via its injected FinalizationOutboxWriter. When no worker is
+      // installed, fall through to `undefined` (original T.5.A behaviour).
+      outbox: this.finalizationWorkerSender !== null
+        ? {
+            write: async (entry) => {
+              const existing = this._senderOutboxMap.get(entry.id);
+              this._senderOutboxMap.set(entry.id, {
+                ...entry,
+                _schemaVersion: 'uxf-1' as const,
+                lamport: (existing?.lamport ?? 0) + 1,
+              });
+            },
+          }
+        : undefined,
+      // Phase 9.6.D — trigger finalization after `delivered-instant`.
+      // Fire-and-forget: any throw from processOne is logged, not
+      // propagated — the publish has already completed and the outbox
+      // entry holds the canonical state.
+      onTriggerFinalization: this.finalizationWorkerSender !== null
+        ? async ({ outboxId }) => {
+            const entry = this._senderOutboxMap.get(outboxId);
+            if (entry !== undefined && this.finalizationWorkerSender !== null) {
+              void this.finalizationWorkerSender.processOne(entry).catch((err) => {
+                logger.debug(
+                  'Payments',
+                  `FinalizationWorkerSender.processOne error for outbox ${outboxId}: ${err}`,
+                );
+              });
+            }
+          }
+        : undefined,
+    };
+
+    return sendInstantUxf(originalRequest, recipient, deps);
+  }
+
+  // ===========================================================================
+  // T.7.A — UXF TXF-mode dispatcher
+  // ===========================================================================
+
+  /**
+   * Legacy TXF send dispatcher (T.7.A, flag-gated).
+   *
+   * Reached only when `features.senderUxf === true` AND
+   * `transferMode === 'txf'`. Delegates the §4.4.1 / §4.4.2 sequence
+   * to {@link sendTxfUxf}. The orchestrator emits ONE Nostr event per
+   * token (no UXF bundle) and persists per-token outbox entries with
+   * synthetic `bundleCid='txf-' + sourceTokenId` and
+   * `deliveryMethod='txf-legacy'`.
+   *
+   * Restrictions inherited from {@link requireLegacyCoinSlot}:
+   *  - The request MUST carry a primary `(coinId, amount)` slot until
+   *    the multi-asset source-selection extension lands. NFT-only TXF
+   *    is out of scope for v1.0.
+   *
+   * @param originalRequest  the public TransferRequest.
+   * @param txfFinalization  `'conservative'` (default per §10.1) or
+   *                         `'instant'` (instant-TXF per §4.4.2).
+   */
+  private async dispatchTxfSend(
+    originalRequest: TransferRequest,
+    txfFinalization: TxfFinalization,
+  ): Promise<TransferResult> {
+    // ── Symbol → hex coinId resolution (must run BEFORE requireLegacyCoinSlot) ─
+    const request: LegacyCoinTransferRequest = requireLegacyCoinSlot(
+      this.resolveCoinIdSymbol(originalRequest),
+    );
+
+    // Resolve recipient up front so the orchestrator gets a fully-typed
+    // PeerInfo. Identical pattern to the UXF dispatchers.
+    const peerInfo: PeerInfo | null =
+      (await this.deps!.transport.resolve?.(request.recipient)) ?? null;
+    const recipientPubkey = this.resolveTransportPubkey(request.recipient, peerInfo);
+    const recipientAddress = await this.resolveRecipientAddress(
+      request.recipient,
+      request.addressMode,
+      peerInfo,
+    );
+
+    const recipient: PeerInfo = peerInfo ?? {
+      transportPubkey: recipientPubkey,
+      chainPubkey: '',
+      l1Address: '',
+      directAddress: '',
+      timestamp: Date.now(),
+    };
+
+    const signingService = await this.createSigningService();
+    const stClient = this.deps!.oracle.getStateTransitionClient?.() as
+      | StateTransitionClient
+      | undefined;
+    if (!stClient) {
+      throw new SphereError(
+        'State transition client not available. Oracle provider must implement getStateTransitionClient()',
+        'AGGREGATOR_ERROR',
+      );
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const trustBase = (this.deps!.oracle as any).getTrustBase?.();
+    if (!trustBase && txfFinalization === 'conservative') {
+      // Trust base is only required for conservative (await proof) —
+      // instant variant skips waitInclusionProof entirely.
+      throw new SphereError(
+        'Trust base not available. Oracle provider must implement getTrustBase()',
+        'AGGREGATOR_ERROR',
+      );
+    }
+
+    const onChainMessage = parseInvoiceMemoForOnChain(
+      request.memo,
+      request.invoiceRefundAddress,
+      request.invoiceContact,
+    );
+
+    const transferId = crypto.randomUUID();
+
+    // Address id derivation — same rule as the instant dispatcher.
+    const directForId = this.deps!.identity.directAddress;
+    const addressId =
+      typeof directForId === 'string' && directForId.length > 0
+        ? computeAddressId(directForId)
+        : this.deps!.identity.chainPubkey;
+
+    const deps: TxfSenderDeps = {
+      aggregator: this.deps!.oracle,
+      transport: this.deps!.transport,
+      tokenStorage: null,
+      identity: this.deps!.identity,
+      addressId,
+      senderTransportPubkey: this.deps!.identity.chainPubkey,
+      emit: (type, data) => this.deps!.emitEvent(type, data),
+      availableSources: () => Array.from(this.tokens.values()),
+      transferId,
+      selectSources: async ({ request: req }) => {
+        const parsedPool = await this.spendPlanner.buildParsedPool(
+          Array.from(this.tokens.values()),
+          request.coinId,
+        );
+        let pendingChangeAmount = 0n;
+        for (const [, t] of this.tokens) {
+          if (t.coinId === request.coinId && t.status === 'transferring') {
+            pendingChangeAmount += BigInt(t.amount || '0');
+          }
+        }
+        const planResult = this.spendPlanner.planSend(
+          { amount: req.amount ?? '0', coinId: request.coinId },
+          parsedPool,
+          this.reservationLedger,
+          this.spendQueue,
+          transferId,
+          pendingChangeAmount,
+        );
+        let splitPlan: SplitPlan;
+        if (planResult === 'queued') {
+          const queueResult = await this.spendQueue.waitForEntry(transferId);
+          splitPlan = queueResult.splitPlan;
+        } else {
+          splitPlan = planResult.splitPlan;
+        }
+        const out: Token[] = splitPlan.tokensToTransferDirectly.map(
+          (t) => t.uiToken,
+        );
+        if (splitPlan.tokenToSplit) out.push(splitPlan.tokenToSplit.uiToken);
+        for (const tok of out) {
+          tok.status = 'transferring';
+          this.tokens.set(tok.id, tok);
+          this.parsedTokenCache.delete(tok.id);
+        }
+        await this.save();
+        return out;
+      },
+      commitSources: async ({ sources }) => {
+        const out: TxfCommitResult[] = [];
+        for (const token of sources) {
+          // Build commitment. Same SDK call for both finalization
+          // variants — the difference is whether we await the
+          // inclusion proof inline (conservative) or attach `null`
+          // and let the worker poll later (instant).
+          const commitment = await this.createSdkCommitment(
+            token,
+            recipientAddress,
+            signingService,
+            onChainMessage,
+          );
+          const submitResponse = await stClient.submitTransferCommitment(commitment);
+          if (
+            submitResponse.status !== 'SUCCESS' &&
+            submitResponse.status !== 'REQUEST_ID_EXISTS'
+          ) {
+            throw new SphereError(
+              `Transfer commitment failed: ${submitResponse.status}`,
+              'TRANSFER_FAILED',
+            );
+          }
+
+          const sourceTokenJson = token.sdkData
+            ? typeof token.sdkData === 'string'
+              ? token.sdkData
+              : JSON.stringify(token.sdkData)
+            : null;
+          if (sourceTokenJson === null) {
+            throw new SphereError(
+              `Token ${token.id} missing sdkData; cannot ship via TXF`,
+              'TRANSFER_FAILED',
+            );
+          }
+
+          let transferTxJson: string;
+          if (txfFinalization === 'conservative') {
+            // Await the inclusion proof and attach to the transferTx.
+            const inclusionProof = await waitInclusionProof(trustBase, stClient, commitment);
+            const transferTx = commitment.toTransaction(inclusionProof);
+            transferTxJson = JSON.stringify(transferTx.toJSON());
+          } else {
+            // Instant: ship the commitment with `inclusionProof: null`.
+            transferTxJson = JSON.stringify({
+              data: commitment.toJSON(),
+              inclusionProof: null,
+            });
+          }
+
+          const requestIdBytes = commitment.requestId;
+          const requestIdHex =
+            requestIdBytes instanceof Uint8Array
+              ? Array.from(requestIdBytes)
+                  .map((b) => b.toString(16).padStart(2, '0'))
+                  .join('')
+              : (typeof (requestIdBytes as { toJSON?: () => string }).toJSON === "function" ? (requestIdBytes as { toJSON: () => string }).toJSON() : String(requestIdBytes));
+
+          // Class discrimination per C11 — read sdkData's coinData.
+          const sourceTokenLike = {
+            id: token.id,
+            coins: (() => {
+              try {
+                const parsed = JSON.parse(sourceTokenJson) as {
+                  genesis?: {
+                    data?: {
+                      coinData?: ReadonlyArray<readonly [string, string]> | null;
+                    };
+                  };
+                };
+                const cd = parsed?.genesis?.data?.coinData;
+                if (!Array.isArray(cd) || cd.length === 0) return null;
+                const coins = cd
+                  .filter(
+                    (e): e is readonly [string, string] =>
+                      Array.isArray(e) && e.length === 2 &&
+                      typeof e[0] === 'string' && typeof e[1] === 'string',
+                  )
+                  .map(([cid, amt]) => ({ coinId: cid, amount: BigInt(amt) }))
+                  .filter((c) => c.amount > 0n);
+                return coins.length > 0 ? coins : null;
+              } catch {
+                return [{ coinId: token.coinId, amount: BigInt(token.amount || '0') }];
+              }
+            })(),
+          };
+          const tokenClass = classifyTokenLike(sourceTokenLike);
+
+          out.push({
+            sourceTokenId: token.id,
+            method: 'direct',
+            requestIdHex,
+            sourceTokenJson,
+            transferTxJson,
+            tokenClass,
+          });
+
+          // Conservative: archive the source immediately (proof is
+          // attached, the recipient can finalize on their own).
+          // Instant: leave the source as `transferring` — T.5.B's
+          // worker handles the source-side bookkeeping after proof.
+          if (txfFinalization === 'conservative') {
+            await this.removeToken(token.id, transferId);
+          }
+        }
+        return out;
+      },
+      // markSourcePending — instant variant: spendPlanner already
+      // marked sources `transferring`. Production wiring will pivot
+      // these to the canonical 'pending' enum in T.5.B.
+      markSourcePending: async () => {
+        // No-op — selectSources marks sources `transferring`.
+      },
+      // outbox — T.7.A leaves the writer unwired in the dispatcher.
+      // The legacy synthetic-entry chain (saveToOutbox /
+      // removeFromOutbox) is preserved by way of the spend planner /
+      // remove-token paths above; the per-entry-key OutboxWriter
+      // integration ships in a follow-up wave. Tests inject a recorder.
+      outbox: undefined,
+      // onTriggerFinalization — instant-TXF only; conservative skips.
+      // Production wiring would register the per-token outbox entry
+      // with the worker registry; T.5.B's worker picks up orphan
+      // delivered-instant entries on boot regardless.
+      onTriggerFinalization: undefined,
+    };
+
+    return sendTxfUxf(originalRequest, recipient, deps, txfFinalization);
+  }
+
   /**
    * Create SDK TransferCommitment for a token transfer
    */
@@ -5105,13 +8747,17 @@ export class PaymentsModule {
   }
 
   /**
-   * Create SigningService from identity private key
+   * Create SigningService from identity private key.
+   *
+   * Steelman³² critical: previously decoded the privateKey hex via
+   * `match(/.{1,2}/g)` + parseInt — silent-truncation on odd-length
+   * inputs and silent NaN-coercion on non-hex chars. Used for the
+   * wallet's signing key on every transaction. Now uses the strict
+   * fromHex defined at line 554 of this file.
    */
   private async createSigningService(): Promise<SigningService> {
     const privateKeyHex = this.deps!.identity.privateKey;
-    const privateKeyBytes = new Uint8Array(
-      privateKeyHex.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16))
-    );
+    const privateKeyBytes = fromHex(privateKeyHex);
     return SigningService.createFromSecret(privateKeyBytes);
   }
 
@@ -5136,10 +8782,9 @@ export class PaymentsModule {
     const UNICITY_TOKEN_TYPE_HEX = 'f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe397867509';
     const tokenType = new TokenType(Buffer.from(UNICITY_TOKEN_TYPE_HEX, 'hex'));
 
-    // Convert hex pubkey to bytes
-    const pubkeyBytes = new Uint8Array(
-      pubkeyHex.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16))
-    );
+    // Convert hex pubkey to bytes — Steelman³² critical: use strict
+    // fromHex. Pubkey is attacker-controlled (peer input).
+    const pubkeyBytes = fromHex(pubkeyHex);
 
     // Create predicate reference with secp256k1 algorithm
     const addressRef = await UnmaskedPredicateReference.create(
@@ -5447,6 +9092,60 @@ export class PaymentsModule {
       await this.loadedPromise;
     }
 
+    // T.3.E — UXF v1.0 routing gate. Bundles with an explicit `kind`
+    // discriminator (`'uxf-car'` or `'uxf-cid'`) are first-class UXF
+    // arrivals; route them to the ingest worker pool when the flag is
+    // on AND a pool has been installed. Legacy shapes (no `kind` field)
+    // fall through to the legacy adapter path below regardless of the
+    // flag — they never enter the pool.
+    if (this.features.recipientUxf && this.ingestPool && isUxfV1Payload(transfer.payload)) {
+      try {
+        await this.ingestPool.enqueue(transfer.payload, transfer.senderTransportPubkey);
+      } catch (err) {
+        // INGEST_QUEUE_FULL / INGEST_QUEUE_FULL_PER_TOKEN — already
+        // emitted via the typed event bus inside the pool. We log here
+        // for traceability; the sender's outbox will time out.
+        logger.warn('Payments', 'handleIncomingTransfer: ingest pool rejected bundle', err);
+      }
+      return;
+    }
+
+    // T.7.B — legacy-shape adapter routing. When the flag is on AND a
+    // runner has been installed, route the legacy event through the
+    // adapter BEFORE the legacy storage path runs. The two paths are
+    // additive: the adapter produces dispositions for the OrbitDB
+    // profile (T.3.C disposition writer); the legacy path below
+    // continues to populate the legacy token storage. Failures inside
+    // the runner are logged but do NOT abort the legacy path — both
+    // pipelines must converge to the same outcome per §10.2.
+    if (
+      this.features.recipientLegacyAdapter &&
+      this.legacyShapeAdapterRunner !== null &&
+      isLegacyTokenTransferPayload(transfer.payload)
+    ) {
+      try {
+        await this.legacyShapeAdapterRunner.processLegacy(
+          transfer.payload,
+          transfer.senderTransportPubkey,
+        );
+      } catch (err) {
+        // The runner's contract specifies "MUST NOT throw under normal
+        // operation" — a throw indicates a wiring bug. We log and
+        // continue to the legacy path so the receiver still records
+        // the token in its legacy storage.
+        logger.warn(
+          'Payments',
+          'handleIncomingTransfer: legacy-shape adapter runner threw',
+          err,
+        );
+      }
+      // Note: deliberately falling through to the legacy storage path
+      // below. The adapter writes to the OrbitDB profile; the legacy
+      // path writes to the per-address token storage. Both must run
+      // for §10.2 single-pipeline convergence to hold across the
+      // transition window.
+    }
+
     try {
       // Check payload format - Sphere wallet sends { sourceToken, transferTx }
       // SDK format is { token, proof }
@@ -5734,7 +9433,92 @@ export class PaymentsModule {
   // Private: Storage
   // ===========================================================================
 
+  /**
+   * Save-chain single-flight (steelman fix #3 — concurrent-save race).
+   *
+   * Many call sites invoke save() (incoming-transfer handlers, 10-s resolver
+   * tick, manual sync, addToken, removeToken, etc.). Without serialization,
+   * concurrent saves read different snapshots of this.tokens, pin different
+   * CIDs (each with a random IV → different content-address), and race on
+   * OrbitDB LWW. If save A reads `{T1}` and save B reads `{T1,T2}`, but
+   * A's storage.set lands LAST, the OpLog points at A's CID `{T1}`. T2 is
+   * lost forever because V5 tokens are not in TXF storage.
+   *
+   * The single-flight pattern serializes saves through a promise chain:
+   * each save() awaits the previous save's completion before reading
+   * this.tokens. This eliminates the torn-snapshot race.
+   *
+   * Caveat: saves are still independent units — a failure in save N does
+   * not abort save N+1 (we catch to clear the chain state). The chain
+   * guarantees ORDERING, not atomicity.
+   */
+  private _saveChain: Promise<void> = Promise.resolve();
+
+  /**
+   * W11 originated-tag helper (SPEC §10.2.3). Writes through
+   * `storage.setEntry` when the provider supports it so the
+   * OpLog envelope carries an explicit `originated` tag matching
+   * the semantic class of the write. Providers without
+   * envelope-storage (plain IndexedDB / file KV) fall through to
+   * the plain `set()` — semantics are identical, only the
+   * peer-replicated classification differs.
+   *
+   * Classification (see profile/aggregator-pointer/originated-tag.ts):
+   *   - `token_send`      — user-initiated outbound transfer
+   *   - `token_receive`   — user-initiated inbound pending transfer
+   *   - `cache_index`     — dedup / state-empty / operational state
+   *
+   * Callers MUST choose the classification at the call site — the
+   * helper does NOT infer. Mis-classification is caught by
+   * `assertOriginTagLocal` inside the storage layer and surfaced as
+   * SECURITY_ORIGIN_MISMATCH.
+   */
+  private async setStorageEntry(
+    key: string,
+    value: string,
+    entryType: 'token_send' | 'token_receive' | 'cache_index',
+  ): Promise<void> {
+    const storage = this.deps!.storage;
+    const setEntryFn = (storage as { setEntry?: (k: string, v: string, t: string) => Promise<void> })
+      .setEntry;
+    if (typeof setEntryFn === 'function') {
+      await setEntryFn.call(storage, key, value, entryType);
+      return;
+    }
+    // Fallback: provider has no envelope-storage layer (plain IndexedDB
+    // / file KV). Log once per provider-class so a silent loss of W11
+    // stamping during a migration is visible in ops. Subsequent calls
+    // from the same class are silent to avoid log spam.
+    const providerClass = storage.constructor?.name ?? 'UnknownStorage';
+    if (!PaymentsModule._w11FallbackLogged.has(providerClass)) {
+      PaymentsModule._w11FallbackLogged.add(providerClass);
+      logger.debug(
+        'Payments',
+        `[W11] storage.setEntry not available on ${providerClass}; originated tags will not be stamped ` +
+          `(this is expected for plain IndexedDB / file storage, unexpected when ProfileStorageProvider is in the chain).`,
+      );
+    }
+    await storage.set(key, value);
+  }
+
+  /** Per-class dedup set for the W11 fallback log (see setStorageEntry). */
+  private static _w11FallbackLogged: Set<string> = new Set();
+
   private async save(): Promise<void> {
+    // Chain onto the previous save. Failure in prior save is isolated via
+    // .catch() so it does not block subsequent saves — each save is
+    // independently attempted and reported via logger.
+    const mySave = this._saveChain
+      .catch(() => {
+        // Previous save failed; don't let the error propagate to block us.
+        // The previous save's caller already received the rejection.
+      })
+      .then(() => this._doSave());
+    this._saveChain = mySave;
+    return mySave;
+  }
+
+  private async _doSave(): Promise<void> {
     // Save to TokenStorageProviders (IndexedDB/files)
     const providers = this.getTokenStorageProviders();
     // Debug: log token serialization status
@@ -5765,21 +9549,164 @@ export class PaymentsModule {
     await this.savePendingV5Tokens();
   }
 
+  /**
+   * Memoized plaintext + CID ref for the last outbox pin. See the V5-tokens
+   * equivalent (`_lastPinnedV5Json` / `_lastPinnedV5Ref`) for rationale: AES-GCM
+   * uses random IVs, so re-pinning identical plaintext produces a different
+   * CID; we'd rather write the cached ref than thrash the IPFS gateway.
+   */
+  private _lastPinnedOutboxJson: string | null = null;
+  private _lastPinnedOutboxRef: CidRef | null = null;
+
+  /**
+   * Single-flight chain for outbox mutations. `saveToOutbox` and
+   * `removeFromOutbox` do a load → mutate → write sequence, which races
+   * without serialization: two concurrent `send()` calls (or a `send()`
+   * racing a `finalize()`) can both read the same snapshot and the second
+   * writer silently clobbers the first. Chaining ops through a promise
+   * guarantees ordering. Mirrors `_saveChain` for pendingV5 tokens.
+   *
+   * Caveat: guarantees ORDERING, not atomicity — a failing op doesn't roll
+   * back but also doesn't block the next op (prior failure is isolated
+   * via .catch() so it doesn't propagate).
+   */
+  private _outboxChain: Promise<void> = Promise.resolve();
+
+  private enqueueOutboxOp<T>(op: () => Promise<T>): Promise<T> {
+    const chained = this._outboxChain
+      .catch(() => {
+        /* isolate prior failure — the caller of the failing op already
+           received the rejection; subsequent ops should not be blocked. */
+      })
+      .then(op);
+    // Keep the chain alive across failures so ordering holds for the next op.
+    this._outboxChain = chained.then(
+      () => undefined,
+      () => undefined,
+    );
+    return chained;
+  }
+
   private async saveToOutbox(transfer: TransferResult, recipient: string): Promise<void> {
-    const outbox = await this.loadOutbox();
-    outbox.push({ transfer, recipient, createdAt: Date.now() });
-    await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.OUTBOX, JSON.stringify(outbox));
+    return this.enqueueOutboxOp(async () => {
+      const outbox = await this.loadOutbox();
+      outbox.push({ transfer, recipient, createdAt: Date.now() });
+      await this.writeOutbox(outbox);
+    });
   }
 
   private async removeFromOutbox(transferId: string): Promise<void> {
-    const outbox = await this.loadOutbox();
-    const filtered = outbox.filter((e) => e.transfer.id !== transferId);
-    await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.OUTBOX, JSON.stringify(filtered));
+    return this.enqueueOutboxOp(async () => {
+      const outbox = await this.loadOutbox();
+      const filtered = outbox.filter((e) => e.transfer.id !== transferId);
+      await this.writeOutbox(filtered);
+    });
   }
 
+  /**
+   * Write the outbox list — via CID reference when `cidRefStore` is injected,
+   * inline JSON otherwise. PROFILE-CID-REFERENCES.md §8.2 (Pattern A).
+   *
+   * Outbox entries wrap `TransferResult`, which contains `Token[]` with fat
+   * `sdkData` (5–20 KB/token). Even modest wallets routinely push the inline
+   * blob past 100 KB — hence the migration to an IPFS-pinned envelope that
+   * shows up in the OpLog as a ~150-byte reference.
+   */
+  private async writeOutbox(
+    list: Array<{ transfer: TransferResult; recipient: string; createdAt: number }>,
+  ): Promise<void> {
+    const cidRefStore = this.deps!.cidRefStore;
+
+    if (list.length === 0) {
+      // Empty outbox: write empty string to match legacy behaviour and clear
+      // the memo so the next non-empty save re-pins (can't reuse a stale ref).
+      // Classification: `cache_index` — the user action (token_send) has
+      // already completed; this write is operational cleanup.
+      await this.setStorageEntry(STORAGE_KEYS_ADDRESS.OUTBOX, '', 'cache_index');
+      this._lastPinnedOutboxJson = null;
+      this._lastPinnedOutboxRef = null;
+      return;
+    }
+
+    if (cidRefStore) {
+      const json = JSON.stringify(list);
+
+      // Skip pin if plaintext is byte-identical to the last pin. Common on
+      // concurrent writers that observe the same snapshot.
+      if (this._lastPinnedOutboxRef && this._lastPinnedOutboxJson === json) {
+        const refStr = CidRefStore.stringifyRef(this._lastPinnedOutboxRef);
+        await this.setStorageEntry(STORAGE_KEYS_ADDRESS.OUTBOX, refStr, 'token_send');
+        return;
+      }
+
+      const ref = await cidRefStore.pinJson(list);
+      const refStr = CidRefStore.stringifyRef(ref);
+      await this.setStorageEntry(STORAGE_KEYS_ADDRESS.OUTBOX, refStr, 'token_send');
+      // Update memo AFTER a successful storage.set — see pendingV5 equivalent.
+      this._lastPinnedOutboxJson = json;
+      this._lastPinnedOutboxRef = ref;
+      return;
+    }
+
+    // Legacy path: inline JSON (deprecated — see PROFILE-CID-REFERENCES.md).
+    await this.setStorageEntry(STORAGE_KEYS_ADDRESS.OUTBOX, JSON.stringify(list), 'token_send');
+  }
+
+  /**
+   * Load the outbox — dual-read per PROFILE-CID-REFERENCES.md §6. Detects
+   * CID-ref envelope via `tryParseRef`; falls back to legacy inline JSON.
+   *
+   * Error handling (matches `loadPendingV5Tokens`):
+   *   - CID ref present but no cidRefStore injected → throws a typed
+   *     `ProfileError('CID_REF_UNREADABLE')`. The caller surfaces a
+   *     configuration error rather than silently dropping outgoing transfers
+   *     (which would leak user funds in the pending state).
+   *   - IPFS fetch / verify / decrypt errors propagate with their typed codes.
+   *   - Legacy-JSON parse failures are caught narrowly (SyntaxError only).
+   */
   private async loadOutbox(): Promise<Array<{ transfer: TransferResult; recipient: string; createdAt: number }>> {
     const data = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.OUTBOX);
-    return data ? JSON.parse(data) : [];
+    if (!data) return [];
+
+    const ref = CidRefStore.tryParseRef(data);
+    if (ref) {
+      if (!this.deps!.cidRefStore) {
+        const { ProfileError } = await import('../../profile/errors.js');
+        throw new ProfileError(
+          'CID_REF_UNREADABLE',
+          `PaymentsModule.loadOutbox: KV at ${STORAGE_KEYS_ADDRESS.OUTBOX} ` +
+            `contains a CID ref (cid=${ref.cid}) but no cidRefStore was injected. ` +
+            `Outbox cannot be restored without IPFS access. ` +
+            `Check PaymentsModule init — is cidRefStore provided?`,
+        );
+      }
+      return await this.deps!.cidRefStore.fetchJson<
+        Array<{ transfer: TransferResult; recipient: string; createdAt: number }>
+      >(ref);
+    }
+
+    // Legacy inline JSON. Narrow catch: only swallow SyntaxError from a
+    // corrupted legacy blob; unknown errors propagate.
+    try {
+      const parsed = JSON.parse(data);
+      if (!Array.isArray(parsed)) {
+        // Matches pendingV5 defensive path — log so corruption is visible
+        // rather than silently returning [] (which would mask data loss and
+        // allow a subsequent saveToOutbox to overwrite the forensic evidence).
+        logger.error(
+          'Payments',
+          `[OUTBOX] Decoded data is not an array (got ${typeof parsed}); treating as empty.`,
+        );
+        return [];
+      }
+      return parsed;
+    } catch (err) {
+      if (err instanceof SyntaxError) {
+        logger.error('Payments', '[OUTBOX] Legacy JSON parse failed (corrupted inline data):', err);
+        return [];
+      }
+      throw err;
+    }
   }
 
   private async createStorageData(): Promise<TxfStorageDataBase> {
@@ -6032,6 +9959,1078 @@ export class PaymentsModule {
       throw new SphereError('PaymentsModule not initialized', 'NOT_INITIALIZED');
     }
   }
+}
+
+// =============================================================================
+// Phase 9.6.D — Default FinalizationWorkerSender factory
+// =============================================================================
+
+/**
+ * Build the default auto-installed {@link FinalizationWorkerSender} for
+ * {@link PaymentsModule.initialize}. Uses lightweight in-memory adapters
+ * for the pool/manifest/tombstone/queue 4-step write order (no OrbitDB
+ * required). Sufficient for §6.1 cycle completion and `transfer:confirmed`
+ * emission.
+ *
+ * @internal — exported only for unit-test access.
+ */
+export function buildDefaultFinalizationWorkerSender(opts: {
+  readonly addressId: string;
+  readonly oracle: import('../../oracle').OracleProvider;
+  readonly senderOutboxMap: Map<string, UxfTransferOutboxEntry>;
+  readonly senderRequestContextMap: Map<string, RequestContext>;
+  readonly emit: <T extends import('../../types').SphereEventType>(
+    type: T,
+    data: import('../../types').SphereEventMap[T],
+  ) => void;
+  /**
+   * Task #169 — Optional cancellation signal. Wired to the
+   * FinalizationWorkerSender's `signal` option AND through to the
+   * `sleep` adapter. The worker honors `signal.aborted` between
+   * aggregator calls and the sleep adapter rejects pending timers
+   * on abort. PaymentsModule.destroy() aborts the parent controller
+   * BEFORE awaiting `worker.stop()` so in-flight cycles terminate
+   * deterministically rather than running orphaned to completion.
+   */
+  readonly signal?: AbortSignal;
+  /**
+   * Round 7 (FIX 3) — Optional shared {@link PerTokenMutex} so the
+   * sender worker, recipient worker, and operator escape-hatch
+   * InclusionProofImporter serialize against the same read-decide-write
+   * window when they touch the same tokenId. When omitted, a fresh
+   * per-builder mutex is used (the previous default — preserves
+   * backward compatibility for callers that don't share).
+   */
+  readonly perTokenMutex?: PerTokenMutex | null;
+}): FinalizationWorkerSender {
+  const { addressId, oracle, senderOutboxMap, senderRequestContextMap, emit, signal } = opts;
+
+  // In-memory outbox writer — thin wrapper over the module's _senderOutboxMap.
+  const outbox: FinalizationOutboxWriter = {
+    async readOne(id: string): Promise<UxfTransferOutboxEntry | null> {
+      return senderOutboxMap.get(id) ?? null;
+    },
+    async update(
+      id: string,
+      mutator: (prev: UxfTransferOutboxEntry) => UxfTransferOutboxEntry,
+    ): Promise<UxfTransferOutboxEntry> {
+      const existing = senderOutboxMap.get(id);
+      if (existing === null || existing === undefined) {
+        throw new SphereError(
+          `FinalizationOutboxWriter.update: no entry at id "${id}"`,
+          'VALIDATION_ERROR',
+        );
+      }
+      const next = mutator(existing);
+      // Bump Lamport on every write so the worker's W26 state is consistent.
+      const bumped: UxfTransferOutboxEntry = { ...next, lamport: (existing.lamport ?? 0) + 1 };
+      senderOutboxMap.set(id, bumped);
+      return bumped;
+    },
+  };
+
+  // In-memory resolver — returns per-requestId context stored at commit time.
+  const resolver: RequestContextResolver = {
+    async resolve(input) {
+      return senderRequestContextMap.get(input.requestId) ?? null;
+    },
+  };
+
+  // In-memory pool adapter — no-op writes; sufficient for transfer:confirmed.
+  const proofAttached = new Set<string>();
+  const pool = {
+    async isProofAttached(tokenId: string, reqId: string): Promise<boolean> {
+      return proofAttached.has(`${tokenId}:${reqId}`);
+    },
+    async attachProof(tokenId: string, reqId: string): Promise<void> {
+      proofAttached.add(`${tokenId}:${reqId}`);
+    },
+  };
+
+  // In-memory pool read adapter.
+  const poolProofs = new Map<string, import('./transfer/finalization-worker-base').AnchoredProofDescriptor>();
+  const poolRead = {
+    async getAttachedProof(
+      tokenId: string,
+      reqId: string,
+    ): Promise<import('./transfer/finalization-worker-base').AnchoredProofDescriptor | null> {
+      return poolProofs.get(`${tokenId}:${reqId}`) ?? null;
+    },
+  };
+
+  // In-memory manifest storage — needed by ManifestCas.
+  const manifestEntries = new Map<string, import('../../profile/token-manifest').TokenManifestEntry>();
+  const manifestStorage: MinimalManifestStorage = {
+    async readEntry(addr: string, tokenId: string) {
+      return manifestEntries.get(`${addr}:${tokenId}`);
+    },
+    async writeEntry(addr: string, tokenId: string, entry: import('../../profile/token-manifest').TokenManifestEntry) {
+      manifestEntries.set(`${addr}:${tokenId}`, entry);
+    },
+  };
+  const manifestCas = new ManifestCas(manifestStorage);
+
+  // In-memory tombstone adapter.
+  const tombstoneSet = new Set<string>();
+  const tombstones = {
+    async hasTombstone(tokenId: string, cid: ContentHash): Promise<boolean> {
+      return tombstoneSet.has(`${tokenId}:${cid}`);
+    },
+    async insertTombstone(tokenId: string, cid: ContentHash): Promise<void> {
+      tombstoneSet.add(`${tokenId}:${cid}`);
+    },
+  };
+
+  // In-memory finalization queue adapter.
+  const queueEntries = new Set<string>();
+  const queue = {
+    async hasEntry(addr: string, reqId: string): Promise<boolean> {
+      return queueEntries.has(`${addr}:${reqId}`);
+    },
+    async removeEntry(addr: string, reqId: string): Promise<void> {
+      queueEntries.delete(`${addr}:${reqId}`);
+    },
+  };
+
+  // Aggregator adapter — submit returns REQUEST_ID_EXISTS (already submitted
+  // by commitSources); poll delegates to oracle.getProof(requestId).
+  const aggregatorClient: FinalizationAggregatorClient = {
+    async submit(_input): Promise<SubmitOutcome> {
+      // The commitment was already submitted in commitSources. Return
+      // REQUEST_ID_EXISTS so the cycle proceeds straight to polling.
+      return { kind: 'REQUEST_ID_EXISTS' };
+    },
+    async poll(input): Promise<PollOutcome> {
+      try {
+        const proof = await oracle.getProof(input.requestId);
+        if (proof === null || proof === undefined) {
+          // Proof not yet available — retry next poll iteration.
+          return { kind: 'TRANSIENT' };
+        }
+        // Task #152 — Build AnchoredProofDescriptor from the oracle's
+        // InclusionProof. The aggregator's `proof.proof` field carries
+        // the canonical IInclusionProofJson shape:
+        //   { merkleTreePath, authenticator, transactionHash, unicityCertificate }
+        // where `transactionHash` is the SDK-encoded DataHash imprint hex
+        // (68 chars for sha2-256) or null for path-non-inclusion proofs,
+        // and `authenticator` is an IAuthenticatorJson object or null.
+        //
+        // Race-lost detection (§6.1) compares the proof's transactionHash
+        // against the locally-stored `_senderRequestContextMap` value
+        // populated by `commitSources` from `commitment.transactionData
+        // .calculateHash()`. Both sides MUST use the same imprint hex —
+        // before this fix both sides used the requestId, which always
+        // matched, making the detector dead in production.
+        const proofJson = proof.proof as
+          | {
+              transactionHash?: string | null;
+              authenticator?: unknown;
+            }
+          | null
+          | undefined;
+        // Wave 4 fix — classify path-non-inclusion (transactionHash === null)
+        // BEFORE constructing the OK descriptor. Per SDK semantics a proof
+        // with `transactionHash: null` is a cryptographic proof of NON-
+        // inclusion at this SMT snapshot, not a successful proof. Treat as
+        // PATH_NOT_INCLUDED so the worker continues polling within the
+        // window (§6.1) instead of triggering race-lost when the OK
+        // descriptor's transactionHash falls back to the requestId
+        // (different from the local 68-char imprint by construction).
+        if (proofJson !== null && proofJson !== undefined && proofJson.transactionHash === null) {
+          return { kind: 'PATH_NOT_INCLUDED' };
+        }
+        const proofTxHash =
+          proofJson !== null && proofJson !== undefined && typeof proofJson.transactionHash === 'string'
+            ? proofJson.transactionHash
+            : null;
+        const proofAuthenticator =
+          proofJson !== null && proofJson !== undefined && proofJson.authenticator !== undefined && proofJson.authenticator !== null
+            ? JSON.stringify(proofJson.authenticator)
+            : '';
+        // Fallback for path-non-inclusion proofs (transactionHash is null
+        // by spec). The Wave 4 early-return above already classifies
+        // those as PATH_NOT_INCLUDED, so this fallback handles only the
+        // degenerate case where proofJson is null/undefined entirely
+        // (which should not happen given the upstream shape validation,
+        // but keeps the descriptor a valid string for type safety).
+        const descriptor: import('./transfer/finalization-worker-base').AnchoredProofDescriptor = {
+          transactionHash: proofTxHash ?? proof.requestId,
+          authenticator: proofAuthenticator,
+          roundNumber: proof.roundNumber,
+          proof: proof.proof,
+        };
+        // Store in poolRead so §6.3 most-recent-proof check can compare.
+        poolProofs.set(`${input.tokenId}:${input.requestId}`, descriptor);
+        // newCid: use a stable placeholder derived from requestId.
+        // The in-memory manifest/tombstone/queue adapters don't care about the
+        // actual CID content; they just key on (addr, tokenId).
+        const newCid = contentHash(
+          (input.requestId.replace(/[^0-9a-f]/gi, '').padStart(64, '0')).slice(0, 64),
+        );
+        return { kind: 'OK', proof: descriptor, newCid };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return { kind: 'TRANSIENT', error: `oracle.getProof threw: ${message}` };
+      }
+    },
+  };
+
+  // Per-token semaphore factory — each tokenId gets its own semaphore.
+  const perTokenSemaphores = new Map<string, CountingSemaphore>();
+  const getPerTokenSemaphore = (tokenId: string): CountingSemaphore => {
+    let sem = perTokenSemaphores.get(tokenId);
+    if (sem === undefined) {
+      sem = new CountingSemaphore(4); // MAX_CONCURRENT_POLLS_PER_TOKEN
+      perTokenSemaphores.set(tokenId, sem);
+    }
+    return sem;
+  };
+
+  // Per-token mutex — shared for all requestIds within the same address.
+  // Round 7 (FIX 3) — accept a shared instance from the caller so the
+  // sender worker, recipient worker, and operator escape-hatch importer
+  // serialize against the same per-tokenId mutex within the
+  // PaymentsModule lifecycle. Falls back to a fresh per-builder mutex
+  // if the caller doesn't pass one.
+  const perTokenMutex = opts.perTokenMutex ?? new PerTokenMutex();
+
+  return new FinalizationWorkerSender({
+    addressId,
+    outbox,
+    aggregator: aggregatorClient,
+    resolver,
+    pool,
+    poolRead,
+    manifestCas,
+    tombstones,
+    queue,
+    getPerTokenSemaphore,
+    perTokenMutex,
+    emit,
+    now: () => Date.now(),
+    sleep: (ms: number, abortSignal?: AbortSignal) =>
+      new Promise<void>((resolve, reject) => {
+        if (abortSignal?.aborted) {
+          reject(new Error('aborted'));
+          return;
+        }
+        const timer = setTimeout(resolve, ms);
+        abortSignal?.addEventListener('abort', () => {
+          clearTimeout(timer);
+          reject(new Error('aborted'));
+        });
+      }),
+    // Task #169 — wire the parent AbortController's signal so destroy()
+    // can cancel in-flight runFinalizationCycle invocations + sleep
+    // timers. The worker's runFinalizationCycle inspects
+    // `ctx.signal?.aborted` between aggregator calls; the sleep adapter
+    // above also respects the signal for pending timers.
+    ...(signal !== undefined ? { signal } : {}),
+  });
+}
+
+// =============================================================================
+// Task #151 — Default FinalizationWorkerRecipient factory
+// =============================================================================
+
+/**
+ * Build the default auto-installed {@link FinalizationWorkerRecipient}
+ * for {@link PaymentsModule.initialize}.
+ *
+ * Uses lightweight in-memory adapters for the
+ * pool/manifest/tombstone/queue 4-step write order (no OrbitDB
+ * required). Sufficient to drive the §6.1 cycle to completion and
+ * flip Bob's pending tokens to confirmed once the proof lands.
+ *
+ * Bypasses the full §5.5 step 9 [B]/[D]/[E] re-evaluation: the
+ * stub revaluateHooks build always says VALID. The real production
+ * harness (bootstrap-injected) plugs in proper hydrateChain /
+ * evaluatePredicate / oracleIsSpent against the local manifest.
+ *
+ * The dispositionWriter callback is the load-bearing path: when the
+ * worker writes a VALID disposition (which our stub revaluator
+ * always does on success), the callback rebuilds the SDK Token via
+ * `finalizeTransferToken`, overwrites the locally-stored Token's
+ * sdkData, and flips status to `'confirmed'`.
+ *
+ * @internal — exported only for unit-test access.
+ */
+export function buildDefaultFinalizationWorkerRecipient(opts: {
+  readonly addressId: string;
+  readonly oracle: import('../../oracle').OracleProvider;
+  readonly recipientRequestContextMap: Map<string, RequestContext>;
+  readonly recipientFinalizationContext: Map<string, RecipientFinalizationContext>;
+  readonly tokens: Map<string, Token>;
+  readonly finalizeTransferToken: (
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    sourceToken: SdkToken<any>,
+    transferTx: TransferTransaction,
+    stClient: StateTransitionClient,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    trustBase: any,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ) => Promise<SdkToken<any>>;
+  readonly getStateTransitionClient: () => StateTransitionClient | undefined;
+  readonly getTrustBase: () => unknown;
+  readonly save: () => Promise<void>;
+  readonly emit: <T extends import('../../types').SphereEventType>(
+    type: T,
+    data: import('../../types').SphereEventMap[T],
+  ) => void;
+  readonly signal?: AbortSignal;
+  /**
+   * Round 7 (FIX 3) — Optional shared {@link PerTokenMutex} so the
+   * recipient worker, sender worker, and operator escape-hatch
+   * InclusionProofImporter serialize against the same read-decide-write
+   * window when they touch the same tokenId. When omitted, a fresh
+   * per-builder mutex is used.
+   */
+  readonly perTokenMutex?: PerTokenMutex | null;
+}): {
+  worker: FinalizationWorkerRecipient;
+  queue: FinalizationQueue;
+  dispositionWriter: FinalizationDispositionWriter;
+  /**
+   * Wave 7 hygiene: clears the closure-local `saveFailureStreak` Map.
+   * The streak entries are otherwise per-tokenId and only cleaned on
+   * save success — so a token that fails save then leaves the wallet
+   * (tombstone, deletion, address switch) leaves a dead streak entry.
+   * destroy() and similar instance-cleanup paths invoke this to keep
+   * the closure's memory bounded.
+   */
+  clearSaveFailureStreak: () => void;
+} {
+  const {
+    addressId,
+    oracle,
+    recipientRequestContextMap,
+    recipientFinalizationContext,
+    tokens,
+    finalizeTransferToken,
+    getStateTransitionClient,
+    getTrustBase,
+    save,
+    emit,
+    signal,
+  } = opts;
+
+  // ---- In-memory FinalizationQueue (T.5.C / Wave G.7 stub) -----------
+  const queueMap = new Map<string, string>();
+  const queueStorage = {
+    async readKey(key: string): Promise<string | null> {
+      return queueMap.has(key) ? (queueMap.get(key) ?? null) : null;
+    },
+    async writeKey(key: string, value: string): Promise<void> {
+      queueMap.set(key, value);
+    },
+    async listByPrefix(prefix: string): Promise<Map<string, string>> {
+      const out = new Map<string, string>();
+      for (const [k] of queueMap) {
+        if (k.startsWith(prefix)) out.set(k, k.slice(prefix.length));
+      }
+      return out;
+    },
+    async deleteKey(key: string): Promise<void> {
+      queueMap.delete(key);
+    },
+  };
+  const queue = new FinalizationQueue({ storage: queueStorage });
+
+  const queueAdapter = {
+    async hasEntry(addr: string, requestId: string): Promise<boolean> {
+      return queue.hasEntry(addr, requestId);
+    },
+    async removeEntry(addr: string, requestId: string): Promise<void> {
+      await queue.remove(addr, requestId);
+    },
+  };
+
+  // ---- Resolver: pulls per-requestId context populated at enqueue ----
+  const resolver: RequestContextResolver = {
+    async resolve(input) {
+      return recipientRequestContextMap.get(input.requestId) ?? null;
+    },
+  };
+
+  // ---- Pool / poolRead — track attached proofs per (tokenId, reqId) --
+  const proofAttached = new Set<string>();
+  const poolProofs = new Map<
+    string,
+    import('./transfer/finalization-worker-base').AnchoredProofDescriptor
+  >();
+  const pool = {
+    async isProofAttached(tokenId: string, reqId: string): Promise<boolean> {
+      return proofAttached.has(`${tokenId}:${reqId}`);
+    },
+    async attachProof(tokenId: string, reqId: string): Promise<void> {
+      proofAttached.add(`${tokenId}:${reqId}`);
+    },
+  };
+  const poolRead = {
+    async getAttachedProof(
+      tokenId: string,
+      reqId: string,
+    ): Promise<
+      import('./transfer/finalization-worker-base').AnchoredProofDescriptor | null
+    > {
+      return poolProofs.get(`${tokenId}:${reqId}`) ?? null;
+    },
+  };
+
+  // ---- ManifestCas + tombstones — in-memory ---------------------------
+  const manifestEntries = new Map<
+    string,
+    import('../../profile/token-manifest').TokenManifestEntry
+  >();
+  const manifestStorage: MinimalManifestStorage = {
+    async readEntry(addr, tokenId) {
+      return manifestEntries.get(`${addr}:${tokenId}`);
+    },
+    async writeEntry(addr, tokenId, entry) {
+      manifestEntries.set(`${addr}:${tokenId}`, entry);
+    },
+  };
+  const manifestCas = new ManifestCas(manifestStorage);
+  const placeholderRootHash = contentHash('00'.repeat(32));
+
+  const tombstoneSet = new Set<string>();
+  const tombstones = {
+    async hasTombstone(tokenId: string, cid: ContentHash): Promise<boolean> {
+      return tombstoneSet.has(`${tokenId}:${cid}`);
+    },
+    async insertTombstone(tokenId: string, cid: ContentHash): Promise<void> {
+      tombstoneSet.add(`${tokenId}:${cid}`);
+    },
+  };
+
+  // ---- Aggregator client ---------------------------------------------
+  const aggregatorClient = {
+    async submit(_input: {
+      readonly addressId: string;
+      readonly tokenId: string;
+      readonly requestId: string;
+      readonly signedTx: unknown;
+    }): Promise<SubmitOutcome> {
+      return { kind: 'REQUEST_ID_EXISTS' };
+    },
+    async poll(input: {
+      readonly addressId: string;
+      readonly tokenId: string;
+      readonly requestId: string;
+      readonly signedTx: unknown;
+    }): Promise<PollOutcome> {
+      try {
+        const proof = await oracle.getProof(input.requestId);
+        if (proof === null || proof === undefined) {
+          return { kind: 'TRANSIENT' };
+        }
+        const proofJson = proof.proof as
+          | { transactionHash?: string | null; authenticator?: unknown }
+          | null
+          | undefined;
+        // Wave 4 fix — if the aggregator returned an inclusion-proof shape
+        // with `transactionHash === null`, that is the SDK's canonical
+        // path-non-inclusion proof (a cryptographic proof that the
+        // requestId is NOT in the SMT at this snapshot). Treat as
+        // PATH_NOT_INCLUDED so the worker keeps polling within the
+        // window instead of taking the OK branch — which would then
+        // (a) descriptor.transactionHash falls back to requestId and
+        // (b) §6.1 race-lost fires because the local context has the
+        // canonical 68-char imprint, not the requestId. This was the
+        // regression introduced by Wave 1 #157 (shape validation
+        // accepting null transactionHash) combined with Wave 2 #151
+        // (recipient worker bootstrap).
+        if (proofJson !== null && proofJson !== undefined && proofJson.transactionHash === null) {
+          return { kind: 'PATH_NOT_INCLUDED' };
+        }
+        const proofTxHash =
+          proofJson !== null && proofJson !== undefined && typeof proofJson.transactionHash === 'string'
+            ? proofJson.transactionHash
+            : null;
+        const proofAuthenticator =
+          proofJson !== null && proofJson !== undefined && proofJson.authenticator !== undefined && proofJson.authenticator !== null
+            ? JSON.stringify(proofJson.authenticator)
+            : '';
+        const descriptor: import('./transfer/finalization-worker-base').AnchoredProofDescriptor = {
+          transactionHash: proofTxHash ?? proof.requestId,
+          authenticator: proofAuthenticator,
+          roundNumber: proof.roundNumber,
+          proof: proof.proof,
+        };
+        poolProofs.set(`${input.tokenId}:${input.requestId}`, descriptor);
+        if (!manifestEntries.has(`${addressId}:${input.tokenId}`)) {
+          manifestEntries.set(`${addressId}:${input.tokenId}`, {
+            rootHash: placeholderRootHash,
+            status: 'pending',
+          });
+        }
+        const newCid = contentHash(
+          input.requestId.replace(/[^0-9a-f]/gi, '').padStart(64, '0').slice(0, 64),
+        );
+        return { kind: 'OK', proof: descriptor, newCid };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return { kind: 'TRANSIENT', error: `oracle.getProof threw: ${message}` };
+      }
+    },
+  };
+
+  // ---- Per-token semaphores + per-token mutex ------------------------
+  const perTokenSemaphores = new Map<string, CountingSemaphore>();
+  const getPerTokenSemaphore = (tokenId: string): CountingSemaphore => {
+    let sem = perTokenSemaphores.get(tokenId);
+    if (sem === undefined) {
+      sem = new CountingSemaphore(4);
+      perTokenSemaphores.set(tokenId, sem);
+    }
+    return sem;
+  };
+  // Round 7 (FIX 3) — share with sender worker + operator importer so
+  // concurrent paths on the same tokenId serialize against the same
+  // read-decide-write window. Falls back to a fresh per-builder mutex
+  // if the caller doesn't pass one.
+  const perTokenMutex = opts.perTokenMutex ?? new PerTokenMutex();
+
+  // ---- Stub CascadeWalker (no children scan, no NFT routing) ---------
+  const cascadeManifestScanner: CascadeManifestScanner = {
+    async readEntry(addr, tokenId) {
+      return manifestEntries.get(`${addr}:${tokenId}`);
+    },
+    async findChildren(_addr, _parentTokenId) {
+      return [];
+    },
+  };
+  const cascadeOutboxScanner: CascadeOutboxScanner = {
+    async findEntriesByTokenId() {
+      return [];
+    },
+  };
+  const classifyTokenLookup: ClassifyTokenLookup = async () => null;
+  const cascadeWalker = new CascadeWalker({
+    manifestScanner: cascadeManifestScanner,
+    manifestCas,
+    outboxScanner: cascadeOutboxScanner,
+    classifyToken: classifyTokenLookup,
+    emit,
+  });
+
+  // ---- Stub revaluateHooks (always VALID) ----------------------------
+  const ourPubkey = new Uint8Array(33);
+  ourPubkey[0] = 0x02;
+  const revaluateHooks: RevaluateHooksProvider = {
+    async buildRevaluateInput(_addr, tokenId) {
+      const newHead = contentHash(('11'.repeat(32)).slice(0, 64));
+      return {
+        tokenRootHash: newHead,
+        pool: new Map(),
+        bundleCidForProvenance: 'task-151-stub',
+        senderTransportPubkeyForProvenance: '',
+        ourPubkey,
+        async hydrateChain() {
+          return {
+            tokenId,
+            tokenRootHash: newHead,
+            chain: [
+              {
+                sourceState: 's0',
+                destinationState: 's1',
+                authenticator: { stub: true },
+                transactionHash: { stub: true },
+                inclusionProof: { stub: true },
+                requestId: { stub: true },
+              },
+            ],
+            currentStatePredicate: { stub: true },
+            currentDestinationStateHash: 'stub-state-head',
+          };
+        },
+        async readLocalManifest() {
+          return undefined;
+        },
+        async evaluatePredicate() {
+          return { ok: true, bindsToUs: true };
+        },
+        async oracleIsSpent() {
+          return false;
+        },
+      };
+    },
+  };
+
+  // ---- DispositionWriter — load-bearing finalization callback --------
+  //
+  // Wave 4 fix — every error path emits `transfer:operator-alert` so the
+  // local Token doesn't silently stay 'pending' forever when the
+  // recipient finalization fails. The previous Wave 2 implementation
+  // swallowed errors in the catch block, which combined with the
+  // race-lost regression made stuck tokens invisible to operators.
+  //
+  // Design choice: ctx is intentionally NOT removed on failure — that
+  // way a subsequent retry (e.g. via payments.receive({finalize:true})
+  // or a manual disposition replay) can pick up the same context. The
+  // leak is bounded because `recipientFinalizationContext` is a
+  // per-instance Map cleared on `destroy()` and on successful
+  // finalization.
+  //
+  // Wave 6 steelman fix — alert flood backoff for save() failures.
+  // If save() persistently fails (disk-full, quota), emitting an alert
+  // on every retry would flood operators. Track a per-tokenId streak
+  // and emit only at power-of-two boundaries (1, 2, 4, 8, …); reset
+  // on save success. Per-token keying ensures distinct tokens have
+  // independent counters. This Map is local to the builder — one
+  // counter per `buildDefaultFinalizationWorkerRecipient` invocation,
+  // matching the lifecycle of the `recipientFinalizationContext` Map.
+  const saveFailureStreak = new Map<string, number>();
+  const isPowerOfTwoBackoff = (n: number): boolean =>
+    n > 0 && (n & (n - 1)) === 0;
+  const dispositionWriter: FinalizationDispositionWriter = {
+    async write(_addr, record) {
+      if (record.disposition !== 'VALID') {
+        return;
+      }
+      const tokenId = record.tokenId;
+      const ctx = recipientFinalizationContext.get(tokenId);
+      if (ctx === undefined) {
+        logger.debug(
+          'Payments',
+          `Task #151: VALID disposition for ${tokenId.slice(0, 16)} but no finalization context`,
+        );
+        return;
+      }
+      try {
+        const proof = await oracle.getProof(ctx.requestIdHex);
+        if (proof === null || proof === undefined) {
+          const msg = `Task #151: dispositionWriter VALID but oracle.getProof returned null for ${tokenId.slice(0, 16)} (requestId=${ctx.requestIdHex.slice(0, 16)})`;
+          logger.warn('Payments', msg);
+          // Wave 4 fix — surface to operators. proof-throw is the
+          // closest existing DispositionReason for "we expected a proof
+          // and the aggregator gave us nothing".
+          emit('transfer:operator-alert', {
+            code: 'proof-throw',
+            tokenId: ctx.localTokenId,
+            message: msg,
+          });
+          return;
+        }
+        const patchedLastTxJson = {
+          ...ctx.lastTxJson,
+          inclusionProof: proof.proof,
+        };
+        const stClient = getStateTransitionClient();
+        const trustBase = getTrustBase();
+        if (stClient === undefined || trustBase === null || trustBase === undefined) {
+          logger.warn(
+            'Payments',
+            `Task #151: dispositionWriter VALID but stClient/trustBase missing for ${tokenId.slice(0, 16)} — falling back to status flip without re-finalization`,
+          );
+          const stored = tokens.get(ctx.localTokenId);
+          if (stored !== undefined && stored.status === 'pending') {
+            const updatedFallback: Token = {
+              ...stored,
+              status: 'confirmed',
+              updatedAt: Date.now(),
+            };
+            tokens.set(ctx.localTokenId, updatedFallback);
+            try {
+              await save();
+              // Wave 6 critical fix — only delete ctx after persistence
+              // succeeds. The previous (Wave 2/4) ordering deleted
+              // before save(), so a save() throw left ctx removed (no
+              // retry possible) AND in-memory token flipped to
+              // 'confirmed' while storage still showed 'pending'. On
+              // reload the in-memory mutation is lost → token stuck
+              // forever. Now mirrors the main success path below.
+              recipientFinalizationContext.delete(tokenId);
+              saveFailureStreak.delete(ctx.localTokenId);
+            } catch (saveErr) {
+              // Wave 6 critical fix — roll back the in-memory mutation
+              // so retries can re-enter the `status === 'pending'`
+              // guard above. Without this rollback, after the first
+              // save() throw the in-memory token shows 'confirmed' and
+              // the second retry skips the entire fallback block —
+              // never re-attempting save() and never emitting an
+              // alert. The retry path needs a clean 'pending' slate to
+              // re-flip and retry persistence.
+              //
+              // Wave 7 steelman fix — compare-and-set rollback. While
+              // we awaited save(), a concurrent path (another finalize,
+              // a tombstone, a manual edit) may have replaced our
+              // `updatedFallback` value with a different mutation. If
+              // we blindly write `stored` back we clobber that work.
+              // CAS: only restore if our update is still the current
+              // value; otherwise leave the concurrent mutation alone.
+              if (tokens.get(ctx.localTokenId) === updatedFallback) {
+                tokens.set(ctx.localTokenId, stored);
+              }
+              const saveMsg = `Task #151: save() after status flip threw: ${saveErr instanceof Error ? saveErr.message : String(saveErr)}`;
+              logger.warn('Payments', saveMsg);
+              // Wave 4 fix — emit operator-alert when persistence fails.
+              // Local Token state was mutated in-memory but didn't
+              // round-trip to disk; operators need to know.
+              // Wave 6 fix — power-of-two backoff so a permanent
+              // disk-full failure doesn't flood operators with one
+              // alert per retry. Streak keyed by tokenId so distinct
+              // tokens accumulate independently.
+              const prev = saveFailureStreak.get(ctx.localTokenId) ?? 0;
+              const next = prev + 1;
+              saveFailureStreak.set(ctx.localTokenId, next);
+              if (isPowerOfTwoBackoff(next)) {
+                emit('transfer:operator-alert', {
+                  code: 'structural',
+                  tokenId: ctx.localTokenId,
+                  message: `${saveMsg} (consecutive save failures: ${next})`,
+                });
+              }
+            }
+          }
+          return;
+        }
+        const lastTx = await TransferTransaction.fromJSON(patchedLastTxJson);
+        const sourceToken = await SdkToken.fromJSON(ctx.sourceTokenJson);
+        const finalizedToken = await finalizeTransferToken(
+          sourceToken,
+          lastTx,
+          stClient,
+          trustBase,
+        );
+        const stored = tokens.get(ctx.localTokenId);
+        if (stored === undefined) {
+          logger.debug(
+            'Payments',
+            `Task #151: local Token ${ctx.localTokenId.slice(0, 16)} disappeared before finalization`,
+          );
+          return;
+        }
+        const updated: Token = {
+          ...stored,
+          sdkData: JSON.stringify(finalizedToken.toJSON()),
+          status: 'confirmed',
+          updatedAt: Date.now(),
+        };
+        tokens.set(ctx.localTokenId, updated);
+        try {
+          await save();
+          // Wave 5 fix — only delete ctx after persistence succeeds.
+          // If save() threw, the in-memory mutation is lost on next
+          // reload AND the ctx must be retained so an external retry
+          // path (e.g. another disposition write or
+          // payments.receive({finalize:true})) can re-attempt. This
+          // matches the outer-catch retention promise below.
+          recipientFinalizationContext.delete(tokenId);
+          // Wave 6 fix — reset save-failure backoff on success.
+          saveFailureStreak.delete(ctx.localTokenId);
+          logger.debug(
+            'Payments',
+            `Task #151: token ${ctx.localTokenId.slice(0, 16)} finalized via recipient worker`,
+          );
+        } catch (saveErr) {
+          const saveMsg = `Task #151: save() after finalization threw: ${saveErr instanceof Error ? saveErr.message : String(saveErr)}`;
+          logger.warn('Payments', saveMsg);
+          // Wave 4 fix — emit operator-alert. The Token was finalized
+          // and flipped to 'confirmed' in-memory, but persistence
+          // failed; on the next reload the in-memory mutation is lost.
+          // Wave 5 fix — ctx is intentionally NOT deleted here so a
+          // retry path can pick it back up; consistent with the
+          // outer-catch retention promise.
+          // Wave 6 fix — power-of-two backoff so a permanent disk-full
+          // failure doesn't flood operators. Streak keyed by tokenId.
+          const prev = saveFailureStreak.get(ctx.localTokenId) ?? 0;
+          const next = prev + 1;
+          saveFailureStreak.set(ctx.localTokenId, next);
+          if (isPowerOfTwoBackoff(next)) {
+            emit('transfer:operator-alert', {
+              code: 'structural',
+              tokenId: ctx.localTokenId,
+              message: `${saveMsg} (consecutive save failures: ${next})`,
+            });
+          }
+        }
+      } catch (err) {
+        const errMsg = `Task #151: dispositionWriter finalization failed for ${tokenId.slice(0, 16)} — ${err instanceof Error ? err.message : String(err)}`;
+        logger.warn(
+          'Payments',
+          errMsg,
+          { err: err instanceof Error ? err.message : String(err) },
+        );
+        // Wave 4 fix — operator-alert on any unhandled finalization
+        // error. Without this the local Token stays 'pending' forever
+        // and the leak (`recipientFinalizationContext` entry retained
+        // for retry) is invisible. We deliberately keep the ctx in
+        // the Map so an external retry path (e.g. another disposition
+        // write) can re-attempt.
+        emit('transfer:operator-alert', {
+          code: 'proof-throw',
+          tokenId: ctx.localTokenId,
+          message: errMsg,
+        });
+      }
+    },
+  };
+
+  const worker = new FinalizationWorkerRecipient({
+    addressId,
+    queueStore: queue,
+    queueAdapter,
+    aggregator: aggregatorClient,
+    resolver,
+    pool,
+    poolRead,
+    manifestCas,
+    tombstones,
+    getPerTokenSemaphore,
+    perTokenMutex,
+    cascadeWalker,
+    dispositionWriter,
+    revaluateHooks,
+    emit,
+    now: () => Date.now(),
+    sleep: (ms: number, abortSignal?: AbortSignal) =>
+      new Promise<void>((resolve, reject) => {
+        if (abortSignal?.aborted) {
+          reject(new Error('aborted'));
+          return;
+        }
+        const timer = setTimeout(resolve, ms);
+        abortSignal?.addEventListener('abort', () => {
+          clearTimeout(timer);
+          reject(new Error('aborted'));
+        });
+      }),
+    ...(signal !== undefined ? { signal } : {}),
+  });
+
+  return {
+    worker,
+    queue,
+    dispositionWriter,
+    clearSaveFailureStreak: () => saveFailureStreak.clear(),
+  };
+}
+
+// =============================================================================
+// Round 5 (FIX 1) — default in-memory operator escape-hatch builders.
+// =============================================================================
+
+/**
+ * Build a default {@link InclusionProofImporter} backed by in-memory
+ * adapters. Auto-installed in `initialize()` when the bootstrap layer
+ * has not already wired one. The defaults fail closed on every
+ * operator-supplied proof (proof verification returns
+ * `'NOT_AUTHENTICATED'`) so a misconfigured wallet cannot accidentally
+ * apply unverified proofs — but the module no longer throws
+ * `OPERATOR_ESCAPE_HATCH_NOT_CONFIGURED`, which lets operator scripts /
+ * UIs probe the importer at startup without crashing.
+ *
+ * Production wiring should construct an OrbitDB-backed adapter (see
+ * {@link OrbitDbDispositionStorageAdapter}) bound to the wallet's
+ * ProfileDatabase plus a real `verifyProof` (the trust-base-aware
+ * `verifyProof` from `transfer/proof-verifier.ts`), real
+ * `graftCallback` / `overrideCallback` (the §5.5 step 5 4-step write
+ * sequence + monotonicity-breach audit fields), and a real
+ * `queueScanner` (the FinalizationQueue-backed scanner). Bootstrap
+ * layers override via `payments.installInclusionProofImporter()`.
+ *
+ * @internal exposed for tests; production callers SHOULD NOT depend on
+ *   this factory's exact shape — it is intentionally minimal.
+ */
+export function buildDefaultInclusionProofImporter(opts: {
+  readonly emit: <T extends SphereEventType>(
+    type: T,
+    data: SphereEventMap[T],
+  ) => void;
+  /**
+   * Round 7 (FIX 3) — Optional shared {@link PerTokenMutex} so the
+   * operator importer serializes with the sender + recipient
+   * finalization workers when they touch the same tokenId. Without
+   * sharing, a concurrent `finalizeTransferToken(X)` and
+   * `importInclusionProof(X)` race in their respective per-tokenId
+   * guards (each builder previously created its own fresh mutex),
+   * corrupting the manifest's audit trail or re-queuing duplicate K-1
+   * entries. JSDoc on `ImportInclusionProofOptions.perTokenMutex` says
+   * production callers SHOULD share — this knob fulfills that contract.
+   */
+  readonly perTokenMutex?: PerTokenMutex | null;
+  /**
+   * Round 7 (FIX 1) — Optional production-grade
+   * `DispositionPerEntryStorage` adapter. When passed (e.g. an
+   * {@link OrbitDbDispositionStorageAdapter} bound to the wallet's
+   * ProfileDatabase), the importer's `_invalid` / `_audit` per-entry
+   * records persist across restarts. When omitted, an
+   * {@link InMemoryDispositionStorageAdapter} is used (the previous
+   * default — preserves backward compatibility for tests + dev-mode
+   * wallets without a profile stack).
+   */
+  readonly dispositionStorage?: import('../../profile/disposition-writer').DispositionPerEntryStorage;
+  /**
+   * Round 8 (FIX 1) — Optional production-grade
+   * {@link ProofVerifier}. When passed (the Sphere bootstrap layer
+   * builds an adapter over `oracle.verifyInclusionProof()`), the
+   * importer's case 8 / 9 verification short-circuits run against the
+   * trust-base-aware verifier so a real operator-supplied proof can
+   * actually pass. When omitted, the default `'NOT_AUTHENTICATED'`
+   * stub stays in place — the importer fails closed on every proof
+   * (preserves the Round 7 default-safe semantics for callers without
+   * a wired oracle).
+   */
+  readonly verifyProof?: import('./transfer/import-inclusion-proof').ProofVerifier;
+  /**
+   * Round 8 (FIX 1) — Optional production-grade graft callback. When
+   * passed, case 3 (pending-graft) drives the §5.5 step 5 4-step write
+   * sequence into the wallet's manifest store. When omitted, the
+   * default no-op stub stays in place. The default harness's stub
+   * `queueScanner` returns no entries, so this callback is unreachable
+   * in the auto-installed default; bootstrap layers that wire a real
+   * `queueScanner` (alongside this callback) close the production gap.
+   */
+  readonly graftCallback?: import('./transfer/import-inclusion-proof').ImportProofGraftCallback;
+  /**
+   * Round 8 (FIX 1) — Optional production-grade override callback.
+   * When passed, cases 5 / 6 (operator override of `_invalid`) drive
+   * the manifest stamp + audit-trail writes. When omitted, the default
+   * no-op stub stays in place — same reachability caveat as
+   * `graftCallback` above.
+   */
+  readonly overrideCallback?: import('./transfer/import-inclusion-proof').ImportProofOverrideCallback;
+}): InclusionProofImporter {
+  const { emit } = opts;
+
+  // In-memory disposition storage — `_invalid` / `_audit` per-entry
+  // records. Round 7 (FIX 1) — caller may pass an OrbitDb-backed
+  // adapter for cross-restart persistence.
+  const dispositionStorage = opts.dispositionStorage ?? new InMemoryDispositionStorageAdapter();
+
+  // In-memory manifest storage — the operator escape-hatch reads
+  // manifest entries to decide pending-vs-invalid routing.
+  // Round 7 (FIX 5) — lowercase tokenId keys so mixed-case input from
+  // operator scripts doesn't split the keyspace. The canonical-tokenId
+  // regex contract says lowercase hex; storage keys must follow.
+  const manifestEntries = new Map<string, TokenManifestEntry>();
+  const manifestStorage: MinimalManifestStorage = {
+    async readEntry(addr: string, tokenId: string) {
+      return manifestEntries.get(`${addr}:${tokenId.toLowerCase()}`);
+    },
+    async writeEntry(addr: string, tokenId: string, entry: TokenManifestEntry) {
+      manifestEntries.set(`${addr}:${tokenId.toLowerCase()}`, entry);
+    },
+  };
+  const manifestStore = new ManifestStore({
+    storage: manifestStorage,
+    lamport: new Lamport(),
+  });
+
+  // Stub queue scanner — no live or hard-fail entries. Combined with
+  // the stub verifyProof, every operator call resolves either to
+  // `'no-such-token'` (no manifest entry) or `'tokenId-already-valid'` /
+  // `'tokenId-in-invalid'` (depending on the manifest state, which is
+  // also empty in the default harness).
+  const queueScanner = {
+    async lookupByTokenId() {
+      return [];
+    },
+  };
+
+  // Round 8 (FIX 1) — caller-supplied verifier wins. Default harness
+  // fails closed (`NOT_AUTHENTICATED`) so the importer NEVER applies
+  // an unverified proof; bootstrap layers that wire `oracle.
+  // verifyInclusionProof()` swap in a real trust-base-aware verifier.
+  const verifyProof = opts.verifyProof
+    ?? (async (): Promise<ProofVerifyStatus> => 'NOT_AUTHENTICATED');
+
+  // Round 8 (FIX 1) — caller-supplied graft callback wins. Default is
+  // a no-op (case 3 unreachable in default harness because the stub
+  // queueScanner returns no entries; the stub keeps the importer
+  // structurally complete). When the bootstrap layer wires a real
+  // queueScanner alongside this callback, case 3 becomes reachable.
+  const graftCallback = opts.graftCallback ?? {
+    async graft() {
+      /* no-op */
+    },
+  };
+
+  // Round 8 (FIX 1) — caller-supplied override callback wins. Default
+  // is a no-op for the same reachability reason as `graftCallback`.
+  const overrideCallback = opts.overrideCallback ?? {
+    async applyOverride() {
+      /* no-op */
+    },
+  };
+
+  return new InclusionProofImporter({
+    manifestStore,
+    dispositionStorage,
+    queueScanner,
+    verifyProof,
+    graftCallback,
+    overrideCallback,
+    emit,
+    // Round 7 (FIX 3) — when caller provides a shared mutex, plumb it
+    // through so this importer instance serializes against the
+    // PaymentsModule's finalization workers. Default (undefined) leaves
+    // the importer's own internal fallback in place.
+    ...(opts.perTokenMutex !== null && opts.perTokenMutex !== undefined
+      ? { perTokenMutex: opts.perTokenMutex }
+      : {}),
+  });
+}
+
+/**
+ * Build a default {@link RevalidateCascadedRunner} backed by an
+ * in-memory manifest scanner. Auto-installed in `initialize()` when
+ * the bootstrap layer has not already wired one. The default scanner
+ * surfaces no children for any parent, so `revalidateCascadedChildren`
+ * resolves with `{ checked: 0, revalidated: 0, ... }` — equivalent to
+ * "the operator's parent had no cascaded children", which is the
+ * correct verdict for a freshly-bootstrapped wallet that hasn't yet
+ * ingested any transfers.
+ *
+ * Production override (via `payments.installRevalidateCascadedRunner()`)
+ * wires a manifestScanner that reads the wallet's OrbitDB-backed
+ * manifest collection and a `revalidateChild` validator that runs the
+ * §5.3 [B]/[C]/[E] sub-checks against the child token.
+ *
+ * @internal exposed for tests; production callers SHOULD NOT depend on
+ *   this factory's exact shape — it is intentionally minimal.
+ */
+export function buildDefaultRevalidateCascadedRunner(): RevalidateCascadedRunner {
+  // Empty in-memory scanner — no children for any parent. The
+  // manifestStore returns undefined for every readEntry, so the
+  // pre-loop parent-validity check classifies every cascaded subtree
+  // as "still invalid". The runner returns zero counts.
+  // Round 7 (FIX 5) — lowercase tokenId keys to match the canonical-
+  // tokenId regex contract; mixed-case input must not split the
+  // keyspace.
+  const manifestEntries = new Map<string, TokenManifestEntry>();
+  const manifestScanner: CascadeManifestScannerForRevalidate = {
+    async readEntry(addr: string, tokenId: string) {
+      return manifestEntries.get(`${addr}:${tokenId.toLowerCase()}`);
+    },
+    async findChildren() {
+      return [];
+    },
+  };
+  const manifestStorage: MinimalManifestStorage = {
+    async readEntry(addr: string, tokenId: string) {
+      return manifestEntries.get(`${addr}:${tokenId.toLowerCase()}`);
+    },
+    async writeEntry(addr: string, tokenId: string, entry: TokenManifestEntry) {
+      manifestEntries.set(`${addr}:${tokenId.toLowerCase()}`, entry);
+    },
+  };
+  const manifestStore = new ManifestStore({
+    storage: manifestStorage,
+    lamport: new Lamport(),
+  });
+
+  // Stub revalidator — never fires because findChildren always returns
+  // []. Including it keeps the runner structurally complete.
+  const revalidateChild = async () =>
+    ({ kind: 'parent-still-invalid' } as const);
+
+  return new RevalidateCascadedRunner({
+    manifestScanner,
+    manifestStore,
+    revalidateChild,
+  });
 }
 
 // =============================================================================

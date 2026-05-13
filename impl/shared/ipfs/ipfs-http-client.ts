@@ -285,7 +285,11 @@ export class IpfsHttpClient {
       }
 
       const text = await response.text();
-      const parsed = await parseRoutingApiResponse(text);
+      // Pass ipnsName so parseRoutingApiResponse verifies the
+      // record's Ed25519 signature against the pubkey embedded in
+      // the peer ID — protects against a hostile gateway returning
+      // forged records pointing to attacker-chosen CIDs.
+      const parsed = await parseRoutingApiResponse(text, ipnsName);
 
       if (!parsed) return null;
 
@@ -368,12 +372,27 @@ export class IpfsHttpClient {
       return result;
     });
 
-    // Wait for all to complete (with overall timeout)
-    await Promise.race([
-      Promise.allSettled(promises),
-      new Promise<void>((resolve) =>
-        setTimeout(resolve, this.resolveTimeoutMs + 1000)),
-    ]);
+    // Wait for all to complete (with overall timeout). Wave L:
+    // capture the timer handle so we can clear it when allSettled
+    // wins the race — otherwise the timer keeps the Node event
+    // loop alive for `resolveTimeoutMs + 1000` ms after every call,
+    // making CLI single-shot resolves hang ~11s before exit. unref
+    // is a defense-in-depth so the timer can't keep an idle process
+    // alive on its own.
+    let racerTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        Promise.allSettled(promises),
+        new Promise<void>((resolve) => {
+          racerTimer = setTimeout(resolve, this.resolveTimeoutMs + 1000);
+          if (typeof racerTimer === 'object' && racerTimer !== null && 'unref' in racerTimer) {
+            (racerTimer as { unref: () => void }).unref();
+          }
+        }),
+      ]);
+    } finally {
+      if (racerTimer !== undefined) clearTimeout(racerTimer);
+    }
 
     // Find best result (highest sequence)
     let best: IpnsGatewayResult | null = null;

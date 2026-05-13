@@ -24,6 +24,32 @@ set -euo pipefail
 
 SDK_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 
+# CLI availability check — fail-fast BEFORE the 30s preflight probe.
+# Centralized resolver in lib/resolve-cli.sh handles the sphere-sdk →
+# @unicity-sphere/cli post-split fallback chain.
+# shellcheck source=./lib/resolve-cli.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/resolve-cli.sh"
+if ! resolve_sphere_cli "${SDK_ROOT}" CLI; then
+  print_resolve_failure_help "${SDK_ROOT}"
+  exit 0
+fi
+
+# Infra-probe preflight — swap CLI flow needs nostr (proposal/announce
+# DMs + gift wraps) and aggregator (commitment submission + inclusion
+# proofs). Skip cleanly if any are unreachable.
+TEST_NAME="${TEST_NAME:-swap-cli-e2e}"
+# shellcheck source=./preflight-infra.sh
+source "$(dirname "${BASH_SOURCE[0]}")/preflight-infra.sh"
+
+# Local-infra harness — see local-infra/local-infra.sh. Boots a local
+# relay + faucet when E2E_LOCAL_INFRA=1; no-op otherwise.
+# shellcheck source=./local-infra/local-infra.sh
+source "$(dirname "${BASH_SOURCE[0]}")/local-infra/local-infra.sh"
+
+if [[ "${E2E_NO_AUTO_PREFLIGHT:-0}" != "1" ]]; then
+  preflight_infra "${E2E_PREFLIGHT_ONLY:-nostr,aggregator}"
+fi
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
@@ -77,7 +103,8 @@ WANT_AMOUNT="10"          # Alice wants 10 ETH
 ALICE_FAUCET_AMOUNT="10"  # Topup alice with 10 BTC
 BOB_FAUCET_AMOUNT="100"   # Topup bob with 100 ETH
 SWAP_TIMEOUT=3600
-CLI="npm run cli --"
+# CLI is resolved at the top of this script via the same fallback logic
+# used by e2e-helpers.sh / pointer-N0-prologue.sh. Do NOT shadow it here.
 DEPOSIT_WAIT=120   # seconds to wait for swap:announced after deposit
 ESCROW_WAIT=300    # seconds to wait for escrow to complete swap
 

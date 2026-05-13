@@ -8,6 +8,7 @@ import * as path from 'path';
 import type { StorageProvider } from '../../../storage';
 import type { FullIdentity, ProviderStatus, TrackedAddressEntry } from '../../../types';
 import { STORAGE_KEYS_ADDRESS, STORAGE_KEYS_GLOBAL, getAddressId } from '../../../constants';
+import { DURABLE_STORAGE } from '../../../profile/aggregator-pointer';
 
 export interface FileStorageProviderConfig {
   /** Directory to store wallet data */
@@ -20,6 +21,16 @@ export class FileStorageProvider implements StorageProvider {
   readonly id = 'file-storage';
   readonly name = 'File Storage';
   readonly type = 'local' as const;
+
+  /**
+   * Durability marker consumed by the aggregator-pointer FlagStore
+   * (SPEC §7.1.3). Writes go through `fs.fsyncSync()` on a temp file
+   * followed by an atomic rename, which is a POSIX-durable write. Any
+   * re-ordering by the OS page cache is flushed by fsync before the
+   * rename commits the new inode — readers observe either the prior
+   * or new state, never a torn write.
+   */
+  readonly [DURABLE_STORAGE] = true as const;
 
   private dataDir: string;
   private filePath: string;
@@ -128,12 +139,107 @@ export class FileStorageProvider implements StorageProvider {
   async set(key: string, value: string): Promise<void> {
     const fullKey = this.getFullKey(key);
     this.data[fullKey] = value;
+    // Steelman⁴³: track which keys this process actually mutated, so
+    // save()'s merge step doesn't clobber unrelated keys written by
+    // another process.
+    this.mutatedKeys.add(fullKey);
+    this.removedKeys.delete(fullKey);
     await this.save();
+  }
+
+  /**
+   * Wave G.6: atomic multi-key write — staged into in-memory state,
+   * then flushed once via the existing save() path which holds the
+   * cross-process file lock for the entire snapshot rewrite. This
+   * gives true all-or-nothing semantics across keys: either the file
+   * rewrite succeeds and ALL entries are visible on next read, or
+   * the rewrite fails and the on-disk file is unchanged (atomic
+   * temp+rename).
+   *
+   * On in-memory error (rare; allocator), restores the previous
+   * values for any keys we'd already mutated and re-throws.
+   */
+  /**
+   * Wave J: per-instance setMany serialization. Without this, two
+   * concurrent setMany calls on the same instance could interleave
+   * snapshot/mutate/save in a way that A's rollback leaves B's
+   * pending mutations exposed (or vice versa). Serializing the
+   * entire snapshot+mutate+save+rollback critical section gives a
+   * single-mutator invariant within the process.
+   */
+  private setManyChain: Promise<void> = Promise.resolve();
+
+  async setMany(entries: ReadonlyArray<readonly [string, string]>): Promise<void> {
+    if (entries.length === 0) return;
+    // Chain onto the previous setMany so its rollback (if any)
+    // completes before we snapshot. .catch swallows so a previous
+    // rejection doesn't poison the chain for unrelated callers.
+    const prev = this.setManyChain;
+    let resolveSelf: () => void;
+    let rejectSelf: (err: unknown) => void;
+    const self = new Promise<void>((res, rej) => {
+      resolveSelf = res;
+      rejectSelf = rej;
+    });
+    this.setManyChain = self.catch(() => undefined);
+    await prev.catch(() => undefined);
+    try {
+      await this.setManyInner(entries);
+      resolveSelf!();
+    } catch (err) {
+      rejectSelf!(err);
+      throw err;
+    }
+  }
+
+  private async setManyInner(entries: ReadonlyArray<readonly [string, string]>): Promise<void> {
+    if (entries.length === 0) return;
+    const previous = new Map<string, string | undefined>();
+    const fullEntries: Array<[string, string]> = [];
+    // Wave I.4 CRITICAL: snapshot the mutatedKeys / removedKeys sets
+    // BEFORE mutating so rollback can restore the EXACT pre-call
+    // state, not just delete-on-prev-undefined. Pre-existing keys
+    // that we mutated and then rolled back must NOT linger in
+    // mutatedKeys — otherwise the next save()'s merge step sees
+    // them as "locally mutated" and clobbers a sibling process's
+    // newer write (the F.43 multi-process race).
+    const prevMutated = new Set(this.mutatedKeys);
+    const prevRemoved = new Set(this.removedKeys);
+    for (const [key, value] of entries) {
+      const fullKey = this.getFullKey(key);
+      fullEntries.push([fullKey, value]);
+      previous.set(fullKey, this.data[fullKey]);
+    }
+    try {
+      for (const [fullKey, value] of fullEntries) {
+        this.data[fullKey] = value;
+        this.mutatedKeys.add(fullKey);
+        this.removedKeys.delete(fullKey);
+      }
+      await this.save();
+    } catch (err) {
+      // Wave I.4: full state rollback — data, mutatedKeys, removedKeys.
+      // Anything we ADDED to mutatedKeys (and wasn't there before)
+      // must be removed; anything we DELETED from removedKeys (because
+      // it was prev-removed) must be restored.
+      for (const [fullKey, prev] of previous) {
+        if (prev === undefined) {
+          delete this.data[fullKey];
+        } else {
+          this.data[fullKey] = prev;
+        }
+      }
+      this.mutatedKeys = prevMutated;
+      this.removedKeys = prevRemoved;
+      throw err;
+    }
   }
 
   async remove(key: string): Promise<void> {
     const fullKey = this.getFullKey(key);
     delete this.data[fullKey];
+    this.removedKeys.add(fullKey);
+    this.mutatedKeys.delete(fullKey);
     await this.save();
   }
 
@@ -155,8 +261,22 @@ export class FileStorageProvider implements StorageProvider {
       const keysToDelete = Object.keys(this.data).filter((k) => k.startsWith(prefix));
       for (const key of keysToDelete) {
         delete this.data[key];
+        // Steelman⁴³: track removals so save() merges them against the
+        // re-read disk snapshot. Without this, save's merge would
+        // re-introduce keys that were on disk but cleared from memory.
+        this.removedKeys.add(key);
+        this.mutatedKeys.delete(key);
       }
     } else {
+      // Full clear: also fold the on-disk keys into removedKeys.
+      try {
+        if (fs.existsSync(this.filePath)) {
+          const onDisk = JSON.parse(fs.readFileSync(this.filePath, 'utf8')) as Record<string, string>;
+          for (const k of Object.keys(onDisk)) this.removedKeys.add(k);
+        }
+      } catch { /* best-effort */ }
+      for (const k of Object.keys(this.data)) this.removedKeys.add(k);
+      this.mutatedKeys.clear();
       this.data = {};
     }
     await this.save();
@@ -196,11 +316,121 @@ export class FileStorageProvider implements StorageProvider {
     return key;
   }
 
+  /**
+   * Steelman⁴³ critical: track which keys this process has mutated
+   * since connect(), so save() can merge them ON TOP of the current
+   * on-disk snapshot. Without this, two processes each holding their
+   * own private snapshot would mutually overwrite the other's writes
+   * (last-save-wins, intermediate keys lost).
+   */
+  private mutatedKeys: Set<string> = new Set();
+  private removedKeys: Set<string> = new Set();
+  private saveInFlight: Promise<void> | null = null;
+
   private async save(): Promise<void> {
+    // Serialize concurrent saves WITHIN this process: queue them so
+    // each one re-reads the latest on-disk snapshot before writing.
+    if (this.saveInFlight) {
+      await this.saveInFlight;
+    }
+    this.saveInFlight = this.saveInner().finally(() => {
+      this.saveInFlight = null;
+    });
+    return this.saveInFlight;
+  }
+
+  private async saveInner(): Promise<void> {
     // Ensure directory exists before writing
     if (!fs.existsSync(this.dataDir)) {
       fs.mkdirSync(this.dataDir, { recursive: true });
     }
+
+    // Steelman⁴⁴ critical: cross-process file lock around the
+    // read-merge-write critical section. Without this, two processes'
+    // saveInner runs can interleave: A reads disk → B reads disk →
+    // A renames → B renames clobbering A's write. proper-lockfile
+    // gives us cross-process mutual exclusion via O_EXCL on a sibling
+    // .lock directory; stale=10s reaps locks from crashed writers.
+    let releaseFileLock: (() => Promise<void>) | null = null;
+    let lockfileModule: typeof import('proper-lockfile') | null = null;
+    try {
+      lockfileModule = await import('proper-lockfile');
+    } catch (err) {
+      // Module truly missing (peer-dep not installed). Steelman⁴⁶: this
+      // is the ONE case where we tolerate proceeding without the lock,
+      // because in-process saveInFlight still serializes within a
+      // single Node process; cross-process callers in setups that
+      // don't include the optional dep accept that risk by omission.
+      // eslint-disable-next-line no-console
+      console.warn(
+        '[FileStorageProvider] proper-lockfile module unavailable; saving without cross-process lock:',
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+    if (lockfileModule) {
+      // The file may not exist yet (first save); proper-lockfile needs
+      // the target to exist. Touch it first if absent.
+      if (!fs.existsSync(this.filePath)) {
+        try { fs.writeFileSync(this.filePath, this.isTxtMode ? '' : '{}', { flag: 'a' }); }
+        catch { /* best-effort */ }
+      }
+      // Steelman⁴⁶ WARNING: previously, lock-acquisition failure (after
+      // 50 retries × ≤500ms) silently downgraded to lockless save —
+      // re-introducing the very race the lock was added to fix. Now
+      // we distinguish: module-not-installed (above, warn-and-proceed)
+      // vs lock-contended (here, throw). Contention beyond ~25s of
+      // retries is a real anomaly: either a sibling process has
+      // wedged its write or our stale-detection (10s) failed to reap
+      // a crashed lock. Throwing surfaces this to the caller (who can
+      // emit a typed StorageEvent and let the user retry) instead of
+      // proceeding with broken cross-process semantics.
+      try {
+        releaseFileLock = await lockfileModule.lock(this.filePath, {
+          stale: 10_000,
+          retries: { retries: 50, minTimeout: 50, maxTimeout: 500 },
+          realpath: false,
+        });
+      } catch (err) {
+        // Steelman⁴⁷: tag with a stable code so operator tooling can
+        // distinguish lock contention from generic save failures and
+        // implement targeted retry/backoff at higher layers.
+        const wrapped = new Error(
+          `FileStorageProvider: failed to acquire cross-process lock after retries: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        (wrapped as Error & { code?: string }).code = 'STORAGE_LOCK_CONTENDED';
+        throw wrapped;
+      }
+    }
+
+    try {
+      // Steelman⁴³/⁴⁴: re-read on-disk snapshot UNDER THE LOCK and merge
+      // our mutations on top. Other processes' writes since our last
+      // save survive; our writes overwrite only the keys we actually
+      // touched. With the file lock, the read-merge-write section is
+      // truly atomic across processes.
+      if (!this.isTxtMode && fs.existsSync(this.filePath)) {
+        try {
+          const raw = fs.readFileSync(this.filePath, 'utf8');
+          if (raw.length > 0) {
+            const onDisk = JSON.parse(raw) as Record<string, string>;
+            const merged: Record<string, string> = { ...onDisk };
+            for (const key of this.mutatedKeys) {
+              if (key in this.data) merged[key] = this.data[key];
+            }
+            for (const key of this.removedKeys) {
+              delete merged[key];
+            }
+            this.data = merged;
+          }
+        } catch {
+          // Disk read or JSON parse failed — proceed with in-memory
+          // data only.  (Existing behavior; the corruption-rename
+          // path at L96 handles fatal cases.)
+        }
+      }
+      // Reset mutation tracking after merge.
+      this.mutatedKeys = new Set();
+      this.removedKeys = new Set();
 
     let content: string;
     if (this.isTxtMode) {
@@ -209,10 +439,14 @@ export class FileStorageProvider implements StorageProvider {
       content = JSON.stringify(this.data);
     }
 
-    // Atomic write: write to temp file, fsync, then rename.
-    // This prevents wallet.json corruption on kill/crash — the rename
-    // is atomic on POSIX filesystems, so the file is either fully old
-    // or fully new, never partially written.
+    // Atomic write: write to temp file, fsync, rename, then fsync
+    // the parent directory. This prevents wallet.json corruption on
+    // kill/crash — the rename is atomic on POSIX filesystems, so the
+    // file is either fully old or fully new, never partially written.
+    // The parent-dir fsync ensures the rename itself is durable; on
+    // ext4/xfs a power-loss after rename but before dir flush can
+    // lose the new inode, leaving only the stale (now unreachable)
+    // file. Required by the DURABLE_STORAGE contract (SPEC §7.1.3).
     const tmpPath = this.filePath + '.tmp';
     const fd = fs.openSync(tmpPath, 'w', 0o600);
     try {
@@ -222,6 +456,31 @@ export class FileStorageProvider implements StorageProvider {
       fs.closeSync(fd);
     }
     fs.renameSync(tmpPath, this.filePath);
+
+    // Parent-directory fsync. Best-effort in environments where
+    // openSync on a directory is not supported (Windows) — we
+    // swallow the error there. On POSIX this is the load-bearing
+    // step for rename durability.
+    try {
+      const dirFd = fs.openSync(this.dataDir, 'r');
+      try {
+        fs.fsyncSync(dirFd);
+      } finally {
+        fs.closeSync(dirFd);
+      }
+    } catch {
+      // Non-POSIX fallback — rename-durability on these filesystems
+      // is a platform concern, not a correctness regression.
+    }
+    } finally {
+      // Steelman⁴⁴ critical: always release the file lock, even on
+      // error paths. proper-lockfile is robust against process exit
+      // (it tracks PIDs), but explicit release minimizes the stale-
+      // lock window for the next save.
+      if (releaseFileLock !== null) {
+        try { await releaseFileLock(); } catch { /* best-effort */ }
+      }
+    }
   }
 }
 

@@ -9,7 +9,7 @@
 import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
 import type { SphereEventType, SphereEventHandler } from '../../types';
-import type { ConnectTransport, ConnectSession, ConnectHostConfig } from '../types';
+import type { ConnectTransport, ConnectSession, ConnectHostConfig, IntentSchemaVersion } from '../types';
 import type {
   SphereConnectMessage,
   SphereRpcRequest,
@@ -82,6 +82,38 @@ interface ConnectDirectMessage {
 const DEFAULT_SESSION_TTL_MS = 86400000; // 24 hours
 const DEFAULT_MAX_RPS = 20;
 
+/**
+ * Detect the schema version of an intent payload (T.7.C.5).
+ *
+ * Returns `'uxf-1'` when the payload exhibits any signal of the UXF-1
+ * packaging format:
+ *   - explicit `schemaVersion: 'uxf-1'` field on params
+ *   - a non-empty `additionalAssets` array (multi-asset extension)
+ *   - a `bundle` / `uxfBundle` / `uxf` field carrying a UXF envelope
+ *
+ * Otherwise returns `'legacy'`. Pure, never throws, never mutates
+ * input — safe for any unknown dApp-supplied params shape.
+ */
+export function detectIntentSchemaVersion(
+  params: Record<string, unknown> | undefined | null,
+): IntentSchemaVersion {
+  if (!params || typeof params !== 'object') return 'legacy';
+
+  // 1. Explicit schemaVersion declared by the dApp.
+  if (params.schemaVersion === 'uxf-1') return 'uxf-1';
+
+  // 2. Multi-asset extension — UXF-1 introduces additionalAssets[].
+  const extras = params.additionalAssets;
+  if (Array.isArray(extras) && extras.length > 0) return 'uxf-1';
+
+  // 3. Top-level UXF bundle envelope.
+  if (params.bundle !== undefined && params.bundle !== null) return 'uxf-1';
+  if (params.uxfBundle !== undefined && params.uxfBundle !== null) return 'uxf-1';
+  if (params.uxf !== undefined && params.uxf !== null) return 'uxf-1';
+
+  return 'legacy';
+}
+
 export class ConnectHost {
   private sphere: SphereInstance;
   private readonly transport: ConnectTransport;
@@ -96,7 +128,12 @@ export class ConnectHost {
   // Intent auto-approve: action → handler that bypasses wallet UI
   private autoApprovedIntents = new Map<
     string,
-    (action: string, params: Record<string, unknown>, session: ConnectSession) => Promise<{ result?: unknown; error?: { code: number; message: string } }>
+    (
+      action: string,
+      params: Record<string, unknown>,
+      session: ConnectSession,
+      schemaVersion?: IntentSchemaVersion,
+    ) => Promise<{ result?: unknown; error?: { code: number; message: string } }>
   >();
 
   // Rate limiting
@@ -118,13 +155,21 @@ export class ConnectHost {
     return this.session;
   }
 
-  /** Register an auto-approve handler for an intent action (session-scoped). */
+  /**
+   * Register an auto-approve handler for an intent action (session-scoped).
+   *
+   * The handler receives the same `schemaVersion` 4th argument that
+   * {@link ConnectHostConfig.onIntent} does: `'uxf-1'` when the host
+   * detects a UXF-1 shape, otherwise `'legacy'`. The argument is
+   * optional, so existing 3-arg handlers continue to work unchanged.
+   */
   setIntentAutoApprove(
     action: string,
     handler: (
       action: string,
       params: Record<string, unknown>,
       session: ConnectSession,
+      schemaVersion?: IntentSchemaVersion,
     ) => Promise<{ result?: unknown; error?: { code: number; message: string } }>,
   ): void {
     this.autoApprovedIntents.set(action, handler);
@@ -363,10 +408,15 @@ export class ConnectHost {
       return;
     }
 
+    // Detect intent payload schema version (T.7.C.5).
+    // Defaults to 'legacy' when nothing about the params matches the
+    // UXF-1 shape — never throws, never mutates msg.params.
+    const schemaVersion = detectIntentSchemaVersion(msg.params);
+
     // Check auto-approve before delegating to wallet UI
     const autoHandler = this.autoApprovedIntents.get(msg.action);
     if (autoHandler) {
-      const autoResponse = await autoHandler(msg.action, msg.params, this.session);
+      const autoResponse = await autoHandler(msg.action, msg.params, this.session, schemaVersion);
       if (autoResponse.error) {
         this.sendIntentError(msg.id, autoResponse.error.code, autoResponse.error.message);
       } else {
@@ -376,7 +426,7 @@ export class ConnectHost {
     }
 
     // Delegate to wallet app
-    const response = await this.config.onIntent(msg.action, msg.params, this.session);
+    const response = await this.config.onIntent(msg.action, msg.params, this.session, schemaVersion);
 
     if (response.error) {
       this.sendIntentError(msg.id, response.error.code, response.error.message);

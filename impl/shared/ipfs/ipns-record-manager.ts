@@ -32,6 +32,30 @@ async function loadIpnsModule() {
   return ipnsModule;
 }
 
+let ipnsValidatorModule: {
+  validate: typeof import('ipns/validator')['validate'];
+} | null = null;
+
+async function loadIpnsValidator() {
+  if (!ipnsValidatorModule) {
+    const mod = await import('ipns/validator');
+    ipnsValidatorModule = { validate: mod.validate };
+  }
+  return ipnsValidatorModule;
+}
+
+let peerIdModule: {
+  peerIdFromString: typeof import('@libp2p/peer-id')['peerIdFromString'];
+} | null = null;
+
+async function loadPeerIdModule() {
+  if (!peerIdModule) {
+    const mod = await import('@libp2p/peer-id');
+    peerIdModule = { peerIdFromString: mod.peerIdFromString };
+  }
+  return peerIdModule;
+}
+
 // =============================================================================
 // Record Creation
 // =============================================================================
@@ -73,13 +97,52 @@ export async function createSignedRecord(
  * The routing API returns newline-delimited JSON with an "Extra" field
  * containing a base64-encoded marshalled IPNS record.
  *
+ * Authenticity: when `ipnsName` is provided, the record's Ed25519
+ * signature is verified against the pubkey embedded in the IPNS name
+ * via `ipns/validator.validate`. Records that fail verification are
+ * rejected silently (skipped in the NDJSON loop) — a hostile gateway
+ * cannot forge a record for an IPNS name it does not hold the
+ * private key for. Callers that pass no `ipnsName` accept the record
+ * without verification; this path is retained only for callers that
+ * have their own out-of-band trust anchor.
+ *
  * @param responseText - Raw text from the routing API response
+ * @param ipnsName - The IPNS name the response is a resolution for
+ *   (the peer-ID string from the `/ipns/<name>` URL). Required for
+ *   signature verification; pass `null` to explicitly opt out.
  * @returns Parsed result with cid, sequence, and recordData, or null
  */
 export async function parseRoutingApiResponse(
   responseText: string,
+  ipnsName: string | null = null,
 ): Promise<{ cid: string; sequence: bigint; recordData: Uint8Array } | null> {
   const { unmarshalIPNSRecord } = await loadIpnsModule();
+
+  // Resolve the public key once before the loop — peer-id parsing is
+  // cheap but the dynamic import is not.
+  let publicKey: import('@libp2p/interface').PublicKey | null = null;
+  if (ipnsName !== null) {
+    try {
+      const { peerIdFromString } = await loadPeerIdModule();
+      const peerId = peerIdFromString(ipnsName);
+      // Only Ed25519 / Secp256k1 peer IDs embed a public key inline;
+      // RSA IDs do not. IPNS records produced by the Profile stack
+      // (and by legacy IPFS-storage) are Ed25519, so a missing pubkey
+      // is a misuse / unexpected key type — reject rather than
+      // silently accept unverifiable records.
+      const maybePubkey = (peerId as { publicKey?: import('@libp2p/interface').PublicKey }).publicKey;
+      if (!maybePubkey) {
+        return null;
+      }
+      publicKey = maybePubkey;
+    } catch {
+      // Malformed IPNS name — treat as unresolvable rather than
+      // accepting an unverified record.
+      return null;
+    }
+  }
+
+  const { validate } = publicKey !== null ? await loadIpnsValidator() : { validate: null };
 
   const lines = responseText.trim().split('\n');
 
@@ -91,6 +154,20 @@ export async function parseRoutingApiResponse(
 
       if (obj.Extra) {
         const recordData = base64ToUint8Array(obj.Extra);
+
+        // Signature verification: if an ipnsName was supplied, the
+        // marshalled record must verify against the pubkey embedded
+        // in the peer ID. `validate` throws on signature mismatch,
+        // expired record, or malformed fields — treat any throw as
+        // "this line is unverifiable, skip it".
+        if (publicKey !== null && validate !== null) {
+          try {
+            await validate(publicKey, recordData);
+          } catch {
+            continue;
+          }
+        }
+
         const record = unmarshalIPNSRecord(recordData);
 
         // Extract CID from the value field

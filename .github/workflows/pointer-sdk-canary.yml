@@ -1,0 +1,175 @@
+name: Pointer SDK Canary
+
+# Triggers only when pointer-layer surface changes. The goal of this
+# workflow is to catch silent drift in:
+#   (1) the KAT test vectors (SPEC §14)
+#   (2) the pinned @unicitylabs/state-transition-sdk version range
+#   (3) the package-major / pointer-layer-major alignment
+#
+# It does NOT replace the main `CI` workflow; it runs in parallel on
+# pointer-touching PRs and fails closed if any of the invariants drift.
+#
+# See docs/uxf/PROFILE-AGGREGATOR-POINTER-TEST-SPEC.md §4 (W8 "SDK
+# version pinning + CI canary") for the normative requirement.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'profile/aggregator-pointer/**'
+      - 'profile/pointer-wiring.ts'
+      - 'profile/profile-token-storage-provider.ts'
+      - 'tests/fixtures/pointer-kat-vectors.json'
+      - 'tests/fixtures/pointer-kat-vectors.sha256'
+      - 'tests/conformance/pointer/**'
+      - 'docs/uxf/PROFILE-AGGREGATOR-POINTER-TEST-SPEC.md'
+      - 'docs/uxf/PROFILE-AGGREGATOR-POINTER-SPEC.md'
+      - '.github/workflows/pointer-sdk-canary.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    name: pointer-layer canary
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: |
+          npm install --include=optional --ignore-scripts
+          npm rebuild
+
+      # ---- Invariant 1: KAT vectors checksum has not drifted --------
+      # The `.sha256` file is the checked-in source of truth. If a dev
+      # changes the KAT vectors intentionally (e.g. after a SPEC bump),
+      # they MUST regenerate the checksum and commit both files in the
+      # same PR. Silent drift is caught here.
+      - name: Verify KAT vectors checksum
+        run: |
+          set -euo pipefail
+          VECTORS="tests/fixtures/pointer-kat-vectors.json"
+          CHECKSUM="tests/fixtures/pointer-kat-vectors.sha256"
+          if [ ! -f "$VECTORS" ]; then
+            echo "ERROR: $VECTORS not found"
+            exit 1
+          fi
+          if [ ! -f "$CHECKSUM" ]; then
+            echo "ERROR: $CHECKSUM not found — regenerate via:"
+            echo "  sha256sum $VECTORS | awk '{print \$1}' > $CHECKSUM"
+            exit 1
+          fi
+          EXPECTED=$(awk 'NR==1 {print $1}' "$CHECKSUM")
+          ACTUAL=$(sha256sum "$VECTORS" | awk '{print $1}')
+          if [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "ERROR: KAT vectors drift detected!"
+            echo "  file:     $VECTORS"
+            echo "  expected: $EXPECTED"
+            echo "  actual:   $ACTUAL"
+            echo ""
+            echo "If this change is intentional (SPEC bump), regenerate:"
+            echo "  sha256sum $VECTORS | awk '{print \$1}' > $CHECKSUM"
+            echo "and commit both files in the same PR."
+            exit 1
+          fi
+          echo "OK: KAT vectors checksum matches ($EXPECTED)"
+
+      # ---- Invariant 2: state-transition-sdk version is strictly pinned
+      # The pointer layer depends on AggregatorClient / RootTrustBase /
+      # InclusionProof types from @unicitylabs/state-transition-sdk.
+      # A floating range (^, ~, *) would allow silent ABI shifts under
+      # us. Enforce an exact pin (no range operator).
+      - name: Verify state-transition-sdk version is pinned exactly
+        run: |
+          set -euo pipefail
+          RAW=$(node -p "require('./package.json').dependencies['@unicitylabs/state-transition-sdk'] || ''")
+          echo "state-transition-sdk pin: '$RAW'"
+          if [ -z "$RAW" ]; then
+            echo "ERROR: @unicitylabs/state-transition-sdk missing from dependencies"
+            exit 1
+          fi
+          case "$RAW" in
+            ^*|~*|*x*|*\**|\>*|\<*)
+              echo "ERROR: @unicitylabs/state-transition-sdk version '$RAW' is a range."
+              echo "Pointer layer requires an exact pin (e.g. '1.6.1-rc.f37cb85')."
+              exit 1
+              ;;
+          esac
+          echo "OK: state-transition-sdk is exact-pinned"
+
+      # ---- Invariant 3: package-major ↔ pointer-layer-major alignment
+      # The pointer layer's HKDF info string embeds "v1" and the SPEC
+      # contract promises backwards-compat within a single major.
+      # If `package.json` version major bumps (0.x → 1.x etc.) without
+      # a corresponding pointer-layer-major bump (HKDF info rename +
+      # SPEC version), downstream wallets will silently re-derive
+      # different keys. Guard against that.
+      - name: Verify package-major aligns with pointer-layer-major
+        run: |
+          set -euo pipefail
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          PKG_MAJOR=$(echo "$PKG_VERSION" | cut -d. -f1)
+          echo "package.json version: $PKG_VERSION (major=$PKG_MAJOR)"
+
+          # Expected pointer-layer major encoded in HKDF info constant.
+          # Parse profile/aggregator-pointer/constants.ts for the
+          # PROFILE_POINTER_HKDF_INFO literal and extract the trailing
+          # vN segment.
+          INFO_LINE=$(grep -E "PROFILE_POINTER_HKDF_INFO\s*=\s*utf8ToBytes\(" profile/aggregator-pointer/constants.ts | head -n1)
+          if [ -z "$INFO_LINE" ]; then
+            echo "ERROR: could not locate PROFILE_POINTER_HKDF_INFO in constants.ts"
+            exit 1
+          fi
+          POINTER_MAJOR=$(echo "$INFO_LINE" | sed -n 's/.*-v\([0-9][0-9]*\).*/\1/p')
+          if [ -z "$POINTER_MAJOR" ]; then
+            echo "ERROR: could not parse pointer-layer major from HKDF info"
+            echo "  line: $INFO_LINE"
+            exit 1
+          fi
+          echo "pointer-layer major (from HKDF info): v$POINTER_MAJOR"
+
+          # Alignment rule (v1 phase): while package.json is on 0.x,
+          # the pointer layer is v1. When package.json bumps to 1.x,
+          # pointer-layer v1 must still be the live protocol until a
+          # SPEC v4.x bump ships v2. This guard fires if someone
+          # publishes a package with major >= 2 while the HKDF info
+          # still says v1 — a strong signal of silent skew.
+          if [ "$PKG_MAJOR" -ge 2 ] && [ "$POINTER_MAJOR" = "1" ]; then
+            echo "ERROR: package major=$PKG_MAJOR but pointer-layer is still v1."
+            echo "Either bump pointer-layer to v2 (rename HKDF info + SPEC §14) or"
+            echo "downgrade package major."
+            exit 1
+          fi
+          echo "OK: package-major=$PKG_MAJOR aligns with pointer-layer-v$POINTER_MAJOR"
+
+      # ---- Invariant 4: TEST-SPEC §4 coverage matrix audit ----------
+      # Fails CI if any H/W finding lacks PRIMARY or SECONDARY coverage.
+      # The parser + assertions live in the test file; this step is a
+      # thin shim that invokes them.
+      - name: Coverage matrix audit
+        run: npx vitest run tests/conformance/pointer/
+
+      # ---- Invariant 5: typecheck + lint of the pointer layer -------
+      - name: Typecheck
+        run: npm run typecheck
+
+      # Scope: only lint the conformance audit files — the pointer
+      # layer itself is linted by the main `CI` workflow. Keeping
+      # this scope tight avoids double-reporting pre-existing
+      # warnings in pointer-layer source.
+      - name: Lint coverage-audit scaffold
+        run: npx eslint tests/conformance/pointer/
+
+      # ---- Invariant 6: pointer-layer unit tests still pass ---------
+      - name: Run pointer-layer unit tests
+        run: npx vitest run tests/unit/profile/pointer/

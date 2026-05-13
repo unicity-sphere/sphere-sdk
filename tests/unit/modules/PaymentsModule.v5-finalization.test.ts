@@ -379,6 +379,204 @@ describe('PaymentsModule - V5 Token Finalization', () => {
   });
 
   // ===========================================================================
+  // 1a. V5 pending token persistence via CID reference (PROFILE-CID-REFERENCES.md)
+  // ===========================================================================
+
+  describe('V5 pending token CID-ref persistence', () => {
+    /**
+     * Minimal fake CidRefStore that pins into an in-memory map. Uses real
+     * CID-like strings (valid base32 multibase encoding) so tryParseRef's
+     * CID.parse validation passes.
+     */
+    function makeFakeCidRefStore() {
+      const ipfsStore = new Map<string, unknown>();
+      // Pre-computed valid CIDv1 raw strings (base32-encoded, 'bafkre' prefix
+      // matches CIDv1 raw codec + sha2-256 multihash). Generated once; reused.
+      const FAKE_CIDS = [
+        'bafkreieyqvmjr6zq5adijx2kzlcfmdvexmy2i6knyj4w2pybmzxmvg6bze',
+        'bafkreif4jkpxy2j7hezb2kjfb2mk23wsq5s7vzlqfkwnofkcfxsikiznna',
+        'bafkreihjkz4shxhcbw2dsvsplsx5bwjv4uibkivyu3vzmhcuhaibcmxpau',
+        'bafkreibnx2xlk3nv6r5tmsdtp3kvo5j2zh5y3qhqnvp7z4z5yblcvchyqu',
+        'bafkreigc7s4sqhn7y7qdmkshxswfucacvalvb7r6i57sxa3gngkxm7pwdq',
+      ];
+      let nextCid = 0;
+      const fakeStore = {
+        pinJson: vi.fn(async (value: unknown) => {
+          const cid = FAKE_CIDS[nextCid % FAKE_CIDS.length]!;
+          nextCid += 1;
+          ipfsStore.set(cid, value);
+          const json = JSON.stringify(value);
+          return {
+            v: 1 as const,
+            cid,
+            size: new TextEncoder().encode(json).byteLength + 28, // + IV+tag
+            ts: Date.now(),
+          };
+        }),
+        fetchJson: vi.fn(async (ref: { cid: string }) => {
+          const data = ipfsStore.get(ref.cid);
+          if (data === undefined) throw new Error(`CID not found: ${ref.cid}`);
+          return data;
+        }),
+      };
+      return { fakeStore, ipfsStore };
+    }
+
+    it('writes CID reference to OpLog when cidRefStore is provided', async () => {
+      const { fakeStore } = makeFakeCidRefStore();
+      (deps as unknown as { cidRefStore: unknown }).cidRefStore = fakeStore;
+
+      const token = createV5PendingToken(SPLIT_GROUP_ID_1);
+      await module.addToken(token);
+
+      // OpLog value is now a CID ref JSON (~100-200 bytes), NOT the full token.
+      const kvData = storageMap.get(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS);
+      expect(kvData).toBeDefined();
+      // Should NOT contain the token ID directly (that's in IPFS now).
+      expect(kvData).not.toContain(`v5split_${SPLIT_GROUP_ID_1}`);
+      // Should be a parseable CID-ref envelope.
+      const parsed = JSON.parse(kvData!);
+      expect(parsed.v).toBe(1);
+      expect(parsed.cid).toMatch(/^baf/);  // CIDv1 prefix (bafk/bafy etc.)
+      expect(parsed.size).toBeGreaterThan(0);
+      expect(parsed.ts).toBeGreaterThan(0);
+      expect(fakeStore.pinJson).toHaveBeenCalledTimes(1);
+    });
+
+    it('reads CID reference from OpLog and fetches content from IPFS', async () => {
+      const { fakeStore, ipfsStore } = makeFakeCidRefStore();
+      (deps as unknown as { cidRefStore: unknown }).cidRefStore = fakeStore;
+
+      // Pre-populate: emulate a prior write.
+      const token = createV5PendingToken(SPLIT_GROUP_ID_1);
+      const prePinCid = 'bafkreieyqvmjr6zq5adijx2kzlcfmdvexmy2i6knyj4w2pybmzxmvg6bze';
+      ipfsStore.set(prePinCid, [token]);
+      storageMap.set(
+        STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS,
+        JSON.stringify({ v: 1, cid: prePinCid, size: 1000, ts: 1700000000000 }),
+      );
+
+      await module.load();
+      const tokens = module.getTokens();
+      expect(tokens.some((t) => t.id === `v5split_${SPLIT_GROUP_ID_1}`)).toBe(true);
+      expect(fakeStore.fetchJson).toHaveBeenCalledTimes(1);
+    });
+
+    it('legacy inline JSON still reads correctly when cidRefStore is provided (migration)', async () => {
+      const { fakeStore } = makeFakeCidRefStore();
+      (deps as unknown as { cidRefStore: unknown }).cidRefStore = fakeStore;
+
+      // Pre-populate KV with LEGACY inline JSON (pre-CID-refs wallet format).
+      const token = createV5PendingToken(SPLIT_GROUP_ID_1);
+      storageMap.set(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS, JSON.stringify([token]));
+
+      await module.load();
+      const tokens = module.getTokens();
+      expect(tokens.some((t) => t.id === `v5split_${SPLIT_GROUP_ID_1}`)).toBe(true);
+      // fetchJson NOT called — tryParseRef returned null, legacy path taken.
+      expect(fakeStore.fetchJson).not.toHaveBeenCalled();
+    });
+
+    it('inline JSON fallback still works when cidRefStore is absent (backward compat)', async () => {
+      // cidRefStore deliberately not set — legacy path.
+      const token = createV5PendingToken(SPLIT_GROUP_ID_1);
+      await module.addToken(token);
+
+      const kvData = storageMap.get(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS);
+      expect(kvData).toBeDefined();
+      // Without cidRefStore, writes fall back to inline JSON.
+      const parsed = JSON.parse(kvData!);
+      expect(Array.isArray(parsed)).toBe(true);
+      expect(parsed[0].id).toBe(`v5split_${SPLIT_GROUP_ID_1}`);
+    });
+
+    it('concurrent saves serialize via save-chain (no torn-snapshot race)', async () => {
+      // Steelman fix #3: concurrent save() calls must not race on stale
+      // this.tokens snapshots. The save-chain single-flight guarantees
+      // each save awaits the previous one before reading state.
+      const REAL_CIDS = [
+        'bafkreieyqvmjr6zq5adijx2kzlcfmdvexmy2i6knyj4w2pybmzxmvg6bze',
+        'bafkreif4jkpxy2j7hezb2kjfb2mk23wsq5s7vzlqfkwnofkcfxsikiznna',
+        'bafkreihjkz4shxhcbw2dsvsplsx5bwjv4uibkivyu3vzmhcuhaibcmxpau',
+        'bafkreibnx2xlk3nv6r5tmsdtp3kvo5j2zh5y3qhqnvp7z4z5yblcvchyqu',
+      ];
+      const ipfsStore = new Map<string, unknown>();
+      const observedSnapshots: unknown[][] = [];
+      let pinResolve: (() => void) | null = null;
+      const pinGate = new Promise<void>((resolve) => {
+        pinResolve = resolve;
+      });
+
+      const slowFakeStore = {
+        pinJson: vi.fn(async (value: unknown) => {
+          const idx = observedSnapshots.length;
+          observedSnapshots.push([...(value as unknown[])]);
+          // First call blocks until pinGate fires, simulating slow IPFS.
+          if (idx === 0) {
+            await pinGate;
+          }
+          const cid = REAL_CIDS[idx % REAL_CIDS.length]!;
+          ipfsStore.set(cid, value);
+          return {
+            v: 1 as const,
+            cid,
+            size: JSON.stringify(value).length + 28,
+            ts: Date.now() + idx,
+          };
+        }),
+        fetchJson: vi.fn(async (ref: { cid: string }) => ipfsStore.get(ref.cid)),
+      };
+      (deps as unknown as { cidRefStore: unknown }).cidRefStore = slowFakeStore;
+
+      // Kick off two saves concurrently: addToken triggers save().
+      const t1 = createV5PendingToken('g1');
+      const t2 = createV5PendingToken('g2');
+
+      const save1 = module.addToken(t1);
+      // Microtask so addToken can start + acquire the chain.
+      await Promise.resolve();
+      const save2 = module.addToken(t2);
+
+      // Release the slow pin so save1 can complete.
+      pinResolve!();
+      await Promise.all([save1, save2]);
+
+      // The key property: the SECOND pin call sees a superset of the FIRST.
+      // Without serialization, save2 could race and pin a snapshot that
+      // excludes t1 (if it read state before save1 completed the addToken
+      // mutation). With the chain, save2 runs after save1 and observes both.
+      expect(observedSnapshots.length).toBeGreaterThanOrEqual(1);
+      const finalSnapshot = observedSnapshots[observedSnapshots.length - 1] as Array<{ id: string }>;
+      expect(finalSnapshot.some((t) => t.id.includes('g1'))).toBe(true);
+      expect(finalSnapshot.some((t) => t.id.includes('g2'))).toBe(true);
+    });
+
+    it('OpLog value shrinks dramatically when CidRefStore is used', async () => {
+      // Write LEGACY first to measure fat-size.
+      const tokens = Array.from({ length: 10 }, (_, i) =>
+        createV5PendingToken(`group${i}`),
+      );
+      for (const t of tokens) await module.addToken(t);
+
+      const legacySize = storageMap.get(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS)!.length;
+
+      // Now rewrite via CidRefStore.
+      const { fakeStore } = makeFakeCidRefStore();
+      (deps as unknown as { cidRefStore: unknown }).cidRefStore = fakeStore;
+
+      // Trigger a re-save: add another token to dirty state, then save.
+      const newToken = createV5PendingToken('group_new');
+      await module.addToken(newToken);
+
+      const refSize = storageMap.get(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS)!.length;
+
+      // Legacy blob scales with token count; ref is small constant.
+      expect(refSize).toBeLessThan(300);
+      expect(refSize).toBeLessThan(legacySize);
+    });
+  });
+
+  // ===========================================================================
   // 2. Processed splitGroupId Dedup Persistence
   // ===========================================================================
 

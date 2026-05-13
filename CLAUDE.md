@@ -58,7 +58,7 @@ const totalUsd = await sphere.payments.getFiatBalance(); // number | null (null 
 const tokens = sphere.payments.getTokens();           // individual Token[]
 const uctOnly = sphere.payments.getTokens({ coinId: 'UCT' }); // filter by coin
 
-// 5. Send tokens (L3)
+// 5. Send tokens (L3) — single-coin
 const result = await sphere.payments.send({
   recipient: '@bob',           // @nametag, DIRECT://..., chain pubkey (02...), or alpha1...
   amount: '1000000',           // in smallest unit (string)
@@ -66,9 +66,47 @@ const result = await sphere.payments.send({
   memo: 'Payment for coffee', // optional
   // transferMode: 'instant',      // default — fast, receiver resolves proofs
   // transferMode: 'conservative', // slower — sender collects all proofs first
+  // allowPendingTokens: false,    // default — only finalized tokens; true enables chain mode
 });
 // result: { id, status, tokens, tokenTransfers, error? }
 // status: 'pending' | 'submitted' | 'delivered' | 'completed' | 'failed'
+
+// 5a. Multi-coin send — deliver UCT + USDU in one call
+const multiResult = await sphere.payments.send({
+  recipient: '@bob',
+  coinId: 'UCT', amount: '1000000',           // primary coin asset
+  additionalAssets: [                          // multi-asset extension
+    { kind: 'coin', coinId: 'USDU', amount: '500000' },
+  ],
+  memo: 'Multi-coin payment',
+});
+
+// 5b. Mixed coin + NFT send — deliver UCT and a specific NFT in one call
+const mixedResult = await sphere.payments.send({
+  recipient: '@bob',
+  coinId: 'UCT', amount: '1000000',
+  additionalAssets: [
+    { kind: 'nft', tokenId: '0xabc123...' },   // whole-token (NFT) transfer
+  ],
+  memo: 'Coin + NFT bundle',
+});
+
+// 5c. NFT-only send — once the implementation wave widens coinId/amount to
+//     optional, this becomes:
+//
+//     const nftResult = await sphere.payments.send({
+//       recipient: '@bob',
+//       additionalAssets: [{ kind: 'nft', tokenId: '0xabc123...' }],
+//     });
+//
+//     Until then, NFT-only sends require a small primary coin slice or wait
+//     for the widening release.
+
+// All assets ride in a single UXF bundle. Coin sources are split via mint
+// (recipient + change get fresh tokenIds); NFT sources are transferred
+// whole-token (recipient gets the original tokenId preserved). Coin and NFT
+// source tokens are class-disjoint per the canonical model — no single token
+// carries both.
 
 // 6. Receive tokens (explicit one-shot query + optional finalization)
 const { transfers } = await sphere.payments.receive();
@@ -367,10 +405,35 @@ interface FullIdentity extends Identity {
 
 interface TransferRequest {
   recipient: string;        // @nametag, DIRECT://..., chain pubkey, alpha1...
-  amount: string;           // Amount in smallest unit
-  coinId: string;           // Token coin ID (e.g., 'UCT')
+  // Primary coin slot — type retains required for v1.0 backward compat;
+  // implementation wave widens to optional (coinId?, amount?).
+  coinId: string;           // Primary coin ID (e.g., 'UCT')
+  amount: string;           // Primary amount in smallest unit (> 0)
+  // Multi-asset extension (optional):
+  additionalAssets?: ReadonlyArray<AdditionalAsset>;
+                            // Each entry is either a coin or an NFT.
+                            // All coinIds (including primary) MUST be distinct.
+                            // All NFT tokenIds MUST be distinct.
+                            // Receivers REJECT unrecognized `kind` values
+                            // (forward-compat).
   memo?: string;            // Optional message
+  transferMode?: 'instant' | 'conservative';  // Default 'instant'
+  allowPendingTokens?: boolean;  // Default false; chain-mode source selection
+  confirmNftPending?: boolean;   // Default false; required true if any NFT
+                                 // target is backed by a pending source token
+                                 // (NFT cascades are irrecoverable).
 }
+
+type AdditionalAsset =
+  | { kind: 'coin'; coinId: string; amount: string }   // fungible
+  | { kind: 'nft';  tokenId: string };                 // whole-token / NFT
+
+// Canonical asset model:
+//   - Coin token: non-empty coinData; may be split via burn-then-mint
+//     (each output gets a fresh tokenId).
+//   - NFT token:  empty/null coinData; transferred whole-token only
+//     (preserves tokenId, tokenType, identity data).
+// Coin and NFT tokens are class-disjoint — no mixed-asset tokens.
 
 interface TransferResult {
   readonly id: string;
@@ -617,6 +680,14 @@ RELAY_URL=wss://sphere-relay.unicity.network npm run test:relay
 - `@libp2p/crypto` - Ed25519 key generation for IPNS
 - `@libp2p/peer-id` - PeerId derivation for IPNS names
 - `ipns` - IPNS record creation and marshalling
+- `multiformats` - CID parsing and content-address verification
+
+**Profile (OrbitDB) storage (built-in):**
+- `@orbitdb/core` - OrbitDB key-value database for per-wallet Profile
+- `helia` - IPFS node runtime (dynamically imported by Profile backend)
+- `@libp2p/bootstrap` - Peer discovery for Helia
+- `@chainsafe/libp2p-gossipsub` - PubSub required by OrbitDB v3
+- `@ipld/car`, `@ipld/dag-cbor` - CAR file serialization for UXF bundles
 
 ## File Size Reference
 

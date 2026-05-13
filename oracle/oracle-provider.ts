@@ -49,7 +49,20 @@ export interface OracleProvider extends BaseProvider {
   validateToken(tokenData: unknown): Promise<ValidationResult>;
 
   /**
-   * Check if token state is spent
+   * Check if token state is spent.
+   *
+   * **Throws on RPC failure** — implementations MUST NOT fail-open
+   * (returning `false` on a network/transport error opens a double-
+   * spend window). On any RPC / network failure the call MUST throw
+   * (typically a `SphereError` with code `'AGGREGATOR_ERROR'`). The
+   * boolean return value carries cryptographically-verified state
+   * only:
+   *   - `true`  — aggregator confirmed the state has been spent.
+   *   - `false` — aggregator confirmed the state is unspent.
+   *
+   * Callers (notably the disposition-engine `[E]` hook) treat a
+   * throw as STRUCTURAL_INVALID per §5.3 [A] and re-evaluate when a
+   * later bundle arrives.
    */
   isSpent(stateHash: string): Promise<boolean>;
 
@@ -81,10 +94,79 @@ export interface OracleProvider extends BaseProvider {
   getAggregatorClient?(): unknown;
 
   /**
+   * Get the bundled RootTrustBase (if available).
+   *
+   * Pointer-layer (H6, SPEC §8.4.2) requires the shared trust base consumed
+   * by L4/PaymentsModule to be reused rather than a parallel trust-base
+   * provider — see PROFILE-AGGREGATOR-POINTER-SPEC.md §8.4.
+   */
+  getRootTrustBase?(): unknown;
+
+  /**
    * Wait for inclusion proof using SDK commitment (if available)
    * Used for transfer flows with SDK TransferCommitment
    */
   waitForProofSdk?(commitment: unknown, signal?: AbortSignal): Promise<unknown>;
+
+  /**
+   * Wave G.3: cryptographic verification of an inclusion proof.
+   *
+   * Used by `uxf/token-join.ts` Rule 4 enrichment to gate the
+   * `tryEnrichLongestWithProofs` path: an attacker-supplied proof
+   * element that's structurally well-formed but cryptographically
+   * invalid (forged authenticator signature, unknown SMT root)
+   * would otherwise be lifted into a synthetic token-root and
+   * propagated as if it were genuine. The gate calls this method
+   * once per candidate proof in the merge pool and only adopts a
+   * proof element whose `(authenticator, smtPath, transactionHash,
+   * unicityCertificate)` tuple verifies against the bundled
+   * `RootTrustBase`.
+   *
+   * Implementations construct the SDK `InclusionProof` from the
+   * supplied JSON shape via `InclusionProof.fromJSON()`, then call
+   * `proof.verify(trustBase, requestId)`. Returns true iff the
+   * status is `OK`. Returns false on PATH_NOT_INCLUDED, PATH_INVALID,
+   * NOT_AUTHENTICATED, or any thrown error during reconstruction —
+   * fail-closed so a buggy proof can never be accepted.
+   *
+   * `requestId` is the SHA-256(signingPubKey || stateHashImprint)
+   * tuple expected by the aggregator; for proof elements where the
+   * caller cannot reconstruct it (because state-hash isn't carried
+   * in the proof element itself), pass `null` and the implementation
+   * falls back to deriving it from the proof's authenticator if
+   * possible — or returns false if it can't be safely derived.
+   */
+  verifyInclusionProof?(input: {
+    /**
+     * The SDK-shaped JSON for the inclusion proof. Built via
+     * `assembleInclusionProof()` from the UXF pool, so the shape is
+     * already what `InclusionProof.fromJSON()` accepts.
+     */
+    proofJson: unknown;
+    /**
+     * Wave I.6: the SDK-encoded DataHash IMPRINT hex (68 chars =
+     * 2-byte algorithm prefix + 32-byte digest, as emitted by
+     * `DataHash.toJSON()` and stored verbatim in the UXF pool's
+     * `inclusion-proof.content.transactionHash`). NOT the bare 64-
+     * char content-hash digest. Implementations compare this byte-
+     * exactly against the inclusion-proof's own internal
+     * `transactionHash.imprint`; mismatch returns false (replay-
+     * grafting defense). Length must equal 68; values of other
+     * lengths are rejected as malformed input.
+     */
+    transactionHash: string;
+    /**
+     * Wave I.7: optional canonical proof identifier — typically the
+     * UXF pool ContentHash of the inclusion-proof element (64-char
+     * hex). When supplied, the implementation MAY include this in
+     * its result-cache key alongside `transactionHash` so two
+     * different proofs that happen to attest the same tx hash do
+     * not collide in the cache (forged-then-genuine denial-of-
+     * verification scenario). When omitted, callers accept the
+     * coarser cache keying.
+     */
+    proofHash?: string;
+  }): Promise<boolean>;
 }
 
 // =============================================================================

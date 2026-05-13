@@ -31,6 +31,7 @@ import { STORAGE_KEYS_GLOBAL, getIpfsGatewayUrls } from '../../constants';
 import { mkdirSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { preflightSkip } from './lib/preflight';
 
 // =============================================================================
 // Constants
@@ -141,7 +142,9 @@ function getUctBalance(sphere: Sphere): BalanceSnapshot | null {
 // Test
 // =============================================================================
 
-describe('Wallet lifecycle: create → topup → send → destroy → import → IPFS recover', () => {
+const SKIP_INFRA = preflightSkip(["nostr","aggregator","ipfs","faucet"], 'wallet-lifecycle');
+
+describe.skipIf(SKIP_INFRA)('Wallet lifecycle: create → topup → send → destroy → import → IPFS recover', () => {
   const cleanupDirs: string[] = [];
   const spheres: Sphere[] = [];
 

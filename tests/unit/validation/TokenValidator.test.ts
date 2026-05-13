@@ -173,9 +173,14 @@ describe('TokenValidator', () => {
       expect(mockRequestIdCreate).toHaveBeenCalledTimes(1);
       const [pubKeyArg] = mockRequestIdCreate.mock.calls[0];
 
-      // Must be wallet pubkey, not the sender's pubkey from the token
-      expect(Buffer.isBuffer(pubKeyArg)).toBe(true);
-      expect(pubKeyArg.toString('hex')).toBe(WALLET_PUBKEY);
+      // Must be wallet pubkey, not the sender's pubkey from the token.
+      // Steelman³⁴: pubKeyArg is now a Uint8Array (was Buffer pre-F.38)
+      // since strict hex decoding moved to core/hex.ts. Test the bytes
+      // directly via hex round-trip, avoiding the Buffer-instanceof
+      // implementation detail.
+      expect(pubKeyArg).toBeInstanceOf(Uint8Array);
+      const hex = Array.from(pubKeyArg as Uint8Array, (b: number) => b.toString(16).padStart(2, '0')).join('');
+      expect(hex).toBe(WALLET_PUBKEY);
     });
 
     it('should use SDK-calculated state hash from sdkToken.state.calculateHash()', async () => {

@@ -4,6 +4,7 @@
  */
 
 import type { BaseProvider, FullIdentity, ComposingIndicator } from '../types';
+import type { UxfTransferPayload } from '../types/uxf-transfer';
 
 // =============================================================================
 // Transport Provider Interface
@@ -364,20 +365,30 @@ export type MessageHandler = (message: IncomingMessage) => void;
 // Token Transfer Types
 // =============================================================================
 
-export interface TokenTransferPayload {
-  /** Serialized token data */
-  token: string;
-  /** Inclusion proof */
-  proof: unknown;
-  /** Optional memo */
-  memo?: string;
-  /** Sender info */
-  sender?: {
-    /** Transport-specific pubkey */
-    transportPubkey: string;
-    nametag?: string;
-  };
-}
+/**
+ * Wire payload for the Nostr `TOKEN_TRANSFER` event (kind 31113).
+ *
+ * Shape-agnostic at the transport layer — this is a tagged union of:
+ *
+ *  - {@link UxfTransferPayloadCar} (`kind: 'uxf-car'`) — inline CAR via base64
+ *  - {@link UxfTransferPayloadCid} (`kind: 'uxf-cid'`) — CID-by-reference
+ *  - {@link LegacyTokenTransferPayload} — one of four pre-UXF shapes
+ *    (Sphere TXF `{sourceToken, transferTx}`, V6 `COMBINED_TRANSFER`,
+ *    V5/V4 `INSTANT_SPLIT`, SDK `{token, proof}`).
+ *
+ * The transport layer SERIALIZES whichever shape it is handed (UXF via
+ * the canonical encoder from {@link "../uxf/transfer-payload"}, legacy via
+ * pass-through `JSON.stringify`), and DELIVERS whichever shape arrives over
+ * the wire to {@link TokenTransferHandler}. Shape discrimination is the
+ * receiver/handler's responsibility — see `PaymentsModule` (T.7.A).
+ *
+ * Re-exported from `types/uxf-transfer` (T.1.A) so all transport callers
+ * share one source of truth for the union.
+ *
+ * @see UxfTransferPayload
+ * @see LegacyTokenTransferPayload
+ */
+export type TokenTransferPayload = UxfTransferPayload;
 
 export interface IncomingTokenTransfer {
   id: string;
@@ -535,7 +546,57 @@ export interface PeerInfo {
   proxyAddress?: string;
   /** Event timestamp */
   timestamp: number;
+
+  // ───────────────────────────────────────────────────────────────────────
+  // T.8.B — Capability hints (informational, per UXF §10.4).
+  //
+  // Fields are OPTIONAL on the type but a publishing peer SHOULD set both
+  // when its identity binding event is constructed; absence at the wire
+  // level encodes "older peer with unknown capability". Receivers MUST
+  // NOT auto-coerce or auto-strip based on these hints — they are
+  // ADVISORY ONLY. The actual interop guarantee comes from the receiver's
+  // T.2.B `UNKNOWN_ASSET_KIND` reject rule and the bundle wire-format
+  // negotiation in §3.3.
+  // ───────────────────────────────────────────────────────────────────────
+
+  /**
+   * Wire protocols the peer advertises support for. Canonical v1.0 set is
+   * `['uxf-car', 'uxf-cid', 'txf']`. Empty/absent means "unknown".
+   */
+  wireProtocols?: ReadonlyArray<string>;
+  /**
+   * Asset kinds the peer advertises support for. Canonical v1.0 set is
+   * `['coin', 'nft']`. Per §10.4 / W20: ABSENT ⇒ assume `['coin']`
+   * (forward-compatibility default for older peers that pre-date NFTs).
+   */
+  assetKinds?: ReadonlyArray<string>;
 }
+
+// =============================================================================
+// T.8.B — Canonical capability values (UXF §10.4)
+// =============================================================================
+
+/**
+ * Wire protocols supported by this SDK build. Published in identity binding
+ * events so peers can detect mismatches before sending.
+ */
+export const SUPPORTED_WIRE_PROTOCOLS: ReadonlyArray<string> = [
+  'uxf-car',
+  'uxf-cid',
+  'txf',
+];
+
+/**
+ * Asset kinds supported by this SDK build. Published in identity binding
+ * events so peers can detect mismatches before sending.
+ */
+export const SUPPORTED_ASSET_KINDS: ReadonlyArray<string> = ['coin', 'nft'];
+
+/**
+ * W20 forward-compat default: when an identity binding event is silent
+ * about `assetKinds`, treat the peer as a v1.0 coin-only wallet.
+ */
+export const DEFAULT_ASSET_KINDS_WHEN_ABSENT: ReadonlyArray<string> = ['coin'];
 
 /** @deprecated Use PeerInfo instead */
 export type NametagInfo = PeerInfo;

@@ -15,6 +15,19 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
+# Infra-probe preflight, run ONCE for the whole suite. Each individual
+# test will also call it via its own e2e-helpers.sh source — but doing
+# it here too means we fail-fast (under 30 s) if the testnet is dark,
+# instead of spawning N parallel test scripts each repeating the same
+# probe+exit dance. Bypass with E2E_NO_AUTO_PREFLIGHT=1 or
+# E2E_SKIP_PREFLIGHT=1.
+TEST_NAME="${TEST_NAME:-run-all}"
+# shellcheck source=./preflight-infra.sh
+source "$SCRIPT_DIR/preflight-infra.sh"
+if [[ "${E2E_NO_AUTO_PREFLIGHT:-0}" != "1" ]]; then
+  preflight_infra "${E2E_PREFLIGHT_ONLY:-nostr,aggregator}"
+fi
+
 # Parse our args vs passthrough args
 SEQUENTIAL=false
 TEST_FILTER=""

@@ -494,6 +494,46 @@ export { parseAddress, isValidAddress, isValidDirectAddress, normalizeAddress, a
 export type { AddressType, ParsedAddress } from './core/address';
 
 // =============================================================================
+// UXF Types (type-only -- runtime available via @unicitylabs/sphere-sdk/uxf)
+// =============================================================================
+
+export type {
+  ContentHash,
+  UxfElementHeader,
+  UxfElementType,
+  UxfInstanceKind,
+  UxfElement,
+  UxfElementContent,
+  UxfManifest,
+  UxfEnvelope,
+  UxfPackageData,
+  UxfIndexes,
+  InstanceChainEntry,
+  InstanceChainIndex,
+  InstanceSelectionStrategy,
+  UxfStorageAdapter,
+  UxfVerificationResult,
+  UxfVerificationIssue,
+  UxfDelta,
+} from './uxf';
+
+export type { UxfErrorCode } from './uxf';
+
+// =============================================================================
+// Profile Types (type-only -- runtime available via @unicitylabs/sphere-sdk/profile)
+// =============================================================================
+
+export type {
+  ProfileConfig,
+  UxfBundleRef,
+  MigrationPhase,
+  MigrationResult,
+  ProfileEncryptionConfig,
+  ConsolidationPendingState,
+  ProfileErrorCode,
+} from './profile';
+
+// =============================================================================
 // Exports added for @unicity-sphere/cli consumption (phase 2 extraction).
 // These were previously only reachable via relative paths from sphere-sdk/cli/.
 // Added to public surface so the external CLI can import them without depending

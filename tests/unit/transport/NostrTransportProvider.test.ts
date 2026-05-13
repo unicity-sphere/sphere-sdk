@@ -22,6 +22,11 @@ const mockDisconnect = vi.fn();
 const mockIsConnected = vi.fn().mockReturnValue(true);
 const mockGetConnectedRelays = vi.fn().mockReturnValue(new Set(['wss://relay1.test', 'wss://relay2.test']));
 const mockAddConnectionListener = vi.fn();
+// Mirrors the private `relays` Map and `stopPingTimer(url)` in NostrClient.
+// suppressSubscriptions() reaches into these to stop application-level
+// keepalive pings on the bare connection (see NostrTransportProvider doc).
+const mockRelaysMap = new Map<string, unknown>();
+const mockStopPingTimer = vi.fn();
 
 vi.mock('@unicitylabs/nostr-js-sdk', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@unicitylabs/nostr-js-sdk')>();
@@ -36,6 +41,8 @@ vi.mock('@unicitylabs/nostr-js-sdk', async (importOriginal) => {
       unsubscribe: mockUnsubscribe,
       publishEvent: mockPublishEvent,
       addConnectionListener: mockAddConnectionListener,
+      relays: mockRelaysMap,
+      stopPingTimer: mockStopPingTimer,
     })),
   };
 });
@@ -227,6 +234,41 @@ describe('NostrTransportProvider', () => {
       expect(provider.getRelays()).toEqual([]);
       expect(provider.getConnectedRelays()).toEqual([]);
       expect(provider.getStatus()).toBe('error'); // No relays remaining
+    });
+  });
+
+  describe('suppressSubscriptions()', () => {
+    beforeEach(() => {
+      mockStopPingTimer.mockClear();
+      mockRelaysMap.clear();
+      mockRelaysMap.set('wss://relay1.test', { connected: true });
+      mockRelaysMap.set('wss://relay2.test', { connected: true });
+    });
+
+    it('stops application-level ping timers on every relay', async () => {
+      const provider = createProvider(['wss://relay1.test', 'wss://relay2.test']);
+      await provider.connect();
+      // Pre-flight: provider should not have called stopPingTimer at connect time.
+      expect(mockStopPingTimer).not.toHaveBeenCalled();
+
+      // The cast mirrors the production call site — suppressSubscriptions is
+      // declared on the provider but only activated by Sphere when the mux
+      // takes over event routing.
+      (provider as unknown as { suppressSubscriptions(): void }).suppressSubscriptions();
+
+      expect(mockStopPingTimer).toHaveBeenCalledTimes(2);
+      expect(mockStopPingTimer).toHaveBeenCalledWith('wss://relay1.test');
+      expect(mockStopPingTimer).toHaveBeenCalledWith('wss://relay2.test');
+    });
+
+    it('is a no-op when nostrClient is not yet constructed', () => {
+      const provider = createProvider(['wss://relay1.test']);
+      // Pre-connect — nostrClient is null. suppressSubscriptions returns
+      // early without throwing.
+      expect(() =>
+        (provider as unknown as { suppressSubscriptions(): void }).suppressSubscriptions(),
+      ).not.toThrow();
+      expect(mockStopPingTimer).not.toHaveBeenCalled();
     });
   });
 });

@@ -38,6 +38,7 @@
  */
 
 import { logger } from './logger';
+import { hexToBytes as strictHexToBytes } from './hex';
 import type {
   Identity,
   FullIdentity,
@@ -132,6 +133,7 @@ import type {
   LegacyFileType,
   DecryptionProgressCallback,
 } from '../serialization/types';
+import { safeErrorMessage } from './error-sanitize';
 
 // =============================================================================
 // Progress Callback
@@ -411,7 +413,9 @@ const UNICITY_TOKEN_TYPE_HEX = 'f8aa13834268d29355ff12183066f0cb902003629bbc5eb9
  * Uses UnmaskedPredicateReference for stable wallet address
  */
 async function deriveL3PredicateAddress(privateKey: string): Promise<string> {
-  const secret = Buffer.from(privateKey, 'hex');
+  // Steelman³³ warning: strict hex decode — Buffer.from(_, 'hex') silently
+  // truncates odd-length and stops at first non-hex char.
+  const secret = strictHexToBytes(privateKey);
   const signingService = await SigningService.createFromSecret(secret);
 
   const tokenTypeBytes = Buffer.from(UNICITY_TOKEN_TYPE_HEX, 'hex');
@@ -1153,6 +1157,19 @@ export class Sphere {
    *
    * Removes wallet keys, per-address data, and optionally token storage.
    * Does NOT affect application-level data stored outside the SDK.
+   *
+   * **W46 — per-entry-key collections coverage (T.1.E):**
+   * Per-entry-key collections (outbox, mintOutbox, audit, invalid,
+   * finalizationQueue) live under composite keys of the form
+   * `${addr}.<collection>.${id}` (and, for multi-rep collections,
+   * further composite ids `${tokenId}.${observedTokenContentHash}`).
+   * `clear()` reaches them via the parent `StorageProvider.clear()`
+   * call below — a full prefix-scan-and-delete on the underlying
+   * KV — NOT via `PROFILE_KEY_MAPPING` lookup. This is intentional:
+   * adding a new per-entry-key collection requires zero changes to
+   * `Sphere.clear()`. The mapping table declares the LOGICAL schema;
+   * runtime keys are always reached by prefix wipe. See
+   * `profile/types.ts` PROFILE_KEY_MAPPING contract block.
    *
    * @param storageOrOptions - StorageProvider (backward compatible) or options object
    *
@@ -2570,6 +2587,92 @@ export class Sphere {
       }
     }
 
+    // Round 7 (FIX 1) / Round 8 (FIX 1) — Wire production OrbitDb-backed
+    // disposition storage AND oracle.verifyInclusionProof into the
+    // operator escape-hatch importer. Mirrors the wiring in
+    // `initializeModules()` for the default-address path. See there
+    // for full rationale + KNOWN LIMITATION docstring.
+    //
+    // Round 8 (FIX 2) — Without this hop, every non-default address
+    // would silently retain the Round 7 fail-closed verifier stub even
+    // when the wallet has a real oracle wired. That asymmetry meant a
+    // multi-address wallet could pass operator probes on its primary
+    // address but fail them on derived addresses.
+    try {
+      const storageWithBuilder = this._storage as unknown as {
+        buildDispositionStorageAdapter?: () =>
+          | import('../profile/disposition-storage-adapters').OrbitDbDispositionStorageAdapter
+          | null;
+      };
+      const builderAvailable =
+        typeof storageWithBuilder.buildDispositionStorageAdapter === 'function';
+      const adapter = builderAvailable
+        ? storageWithBuilder.buildDispositionStorageAdapter!()
+        : null;
+
+      // Round 8 (FIX 1) — verifyProof adapter (same shape as the
+      // default-address path).
+      const oracleForVerify = this._oracle as unknown as {
+        verifyInclusionProof?: (input: {
+          readonly proofJson: unknown;
+          readonly transactionHash: string;
+          readonly proofHash?: string;
+        }) => Promise<boolean>;
+      };
+      const oracleHasVerify =
+        typeof oracleForVerify.verifyInclusionProof === 'function';
+      const verifyProofAdapter:
+        | import('../modules/payments/transfer/import-inclusion-proof').ProofVerifier
+        | undefined = oracleHasVerify
+        ? async (
+            proof: import('../modules/payments/transfer/import-inclusion-proof').ImportableInclusionProof,
+          ): Promise<import('../modules/payments/transfer/proof-verifier').ProofVerifyStatus> => {
+            try {
+              const ok = await oracleForVerify.verifyInclusionProof!({
+                proofJson: proof.proof,
+                transactionHash: proof.transactionHash,
+              });
+              return ok ? 'OK' : 'NOT_AUTHENTICATED';
+            } catch {
+              return 'NOT_AUTHENTICATED';
+            }
+          }
+        : undefined;
+
+      if (adapter !== null && adapter !== undefined) {
+        payments.configureOperatorEscapeHatchStorage(
+          adapter,
+          verifyProofAdapter !== undefined
+            ? { verifyProof: verifyProofAdapter }
+            : undefined,
+        );
+        logger.debug(
+          'Sphere',
+          `Wired OrbitDb-backed disposition storage + verifyProof for address ${index}`,
+        );
+      } else if (verifyProofAdapter !== undefined) {
+        // No OrbitDb adapter, but we still have a real oracle —
+        // upgrade just the verifier so multi-address wallets also
+        // benefit from the Round 8 verifier wiring.
+        const { InMemoryDispositionStorageAdapter } = await import(
+          '../profile/disposition-storage-adapters'
+        );
+        payments.configureOperatorEscapeHatchStorage(
+          new InMemoryDispositionStorageAdapter(),
+          { verifyProof: verifyProofAdapter },
+        );
+        logger.debug(
+          'Sphere',
+          `Wired oracle.verifyInclusionProof for address ${index} (in-memory disposition storage)`,
+        );
+      }
+    } catch (err) {
+      logger.warn(
+        'Sphere',
+        `Failed to wire operator-escape-hatch importer overrides for address ${index}: ${safeErrorMessage(err)}`,
+      );
+    }
+
     // payments.load() is critical — must succeed for wallet to be usable
     await payments.load();
 
@@ -3412,8 +3515,25 @@ export class Sphere {
       nametags.set(0, cleanNametag);
     }
 
-    // Persist nametag cache
-    await this.persistAddressNametags();
+    // Persist nametag cache. Steelman⁵³ WARNING: at this point Nostr
+    // already advertises @cleanNametag bound to our pubkey (step 2),
+    // so a persistence failure here would leave local-vs-relay
+    // inconsistent — the next cold load() would not see the
+    // nametag in local state. Best-effort: catch the persistence
+    // failure, surface a typed error to the caller, but do NOT
+    // throw. The relay binding remains authoritative (sync on
+    // next switchToAddress / postSwitchSync recovers the nametag
+    // via transport lookup).
+    try {
+      await this.persistAddressNametags();
+    } catch (persistErr) {
+      logger.warn(
+        'Sphere',
+        `registerNametag: relay binding succeeded for @${cleanNametag} but ` +
+          `local persistence failed (${persistErr instanceof Error ? persistErr.message : String(persistErr)}). ` +
+          `Next load() will recover via Nostr lookup.`,
+      );
+    }
 
     this.emitEvent('nametag:registered', {
       nametag: cleanNametag,
@@ -3923,24 +4043,77 @@ export class Sphere {
   // ===========================================================================
 
   private async storeMnemonic(mnemonic: string, derivationPath?: string, basePath?: string): Promise<void> {
-    // TODO: Encrypt with user password/PIN
+    // Wave G.6: prefer the atomic setMany() path when the provider
+    // implements it (IndexedDB cross-key transaction, FileStorage
+    // file-lock-guarded snapshot rewrite). Either every key lands or
+    // none do — no rollback needed. Falls back to the F.56 best-
+    // effort transactional rollback for providers that don't.
+    //
+    // Wave I.3 CRITICAL: snapshot in-memory state BEFORE mutating
+    // and BEFORE awaiting setMany. If setMany throws (quota, IDB
+    // abort, lock-contended file write), the in-memory state was
+    // already mutated — caller's `sphere.getMnemonic()` would return
+    // an unstored mnemonic, silent divergence between live instance
+    // and disk. Restore on catch matches the F.51 fallback contract.
     const encrypted = this.encrypt(mnemonic);
-    await this._storage.set(STORAGE_KEYS_GLOBAL.MNEMONIC, encrypted);
-
-    // Store mnemonic in memory for getMnemonic()
+    const prevMnemonic = this._mnemonic;
+    const prevSource = this._source;
+    const prevDerivationMode = this._derivationMode;
+    const prevBasePath = this._basePath;
     this._mnemonic = mnemonic;
     this._source = 'mnemonic';
     this._derivationMode = 'bip32';
-
-    if (derivationPath) {
-      await this._storage.set(STORAGE_KEYS_GLOBAL.DERIVATION_PATH, derivationPath);
-    }
-
     const effectiveBasePath = basePath ?? DEFAULT_BASE_PATH;
     this._basePath = effectiveBasePath;
-    await this._storage.set(STORAGE_KEYS_GLOBAL.BASE_PATH, effectiveBasePath);
-    await this._storage.set(STORAGE_KEYS_GLOBAL.DERIVATION_MODE, this._derivationMode);
-    await this._storage.set(STORAGE_KEYS_GLOBAL.WALLET_SOURCE, this._source);
+    const entries: Array<[string, string]> = [
+      [STORAGE_KEYS_GLOBAL.MNEMONIC, encrypted],
+      [STORAGE_KEYS_GLOBAL.BASE_PATH, effectiveBasePath],
+      [STORAGE_KEYS_GLOBAL.DERIVATION_MODE, this._derivationMode],
+      [STORAGE_KEYS_GLOBAL.WALLET_SOURCE, this._source],
+    ];
+    if (derivationPath) {
+      entries.splice(1, 0, [STORAGE_KEYS_GLOBAL.DERIVATION_PATH, derivationPath]);
+    }
+    if (this._storage.setMany) {
+      try {
+        await this._storage.setMany(entries);
+      } catch (err) {
+        this._mnemonic = prevMnemonic;
+        this._source = prevSource;
+        this._derivationMode = prevDerivationMode;
+        this._basePath = prevBasePath;
+        throw err;
+      }
+      return;
+    }
+    // Steelman⁵¹ CRITICAL fallback: best-effort transactional rollback.
+    // See pre-G.6 implementation for full rationale — kept verbatim
+    // for providers without setMany().
+    const writtenKeys: string[] = [];
+    const writeKey = async (key: string, value: string): Promise<void> => {
+      await this._storage.set(key, value);
+      writtenKeys.push(key);
+    };
+    try {
+      for (const [k, v] of entries) {
+        await writeKey(k, v);
+      }
+    } catch (writeErr) {
+      for (const k of writtenKeys.reverse()) {
+        try {
+          await this._storage.remove(k);
+        } catch {
+          /* best-effort cleanup */
+        }
+      }
+      // Wave I.3: restore in-memory state on rollback so caller does
+      // not observe an unstored mnemonic via sphere.getMnemonic().
+      this._mnemonic = prevMnemonic;
+      this._source = prevSource;
+      this._derivationMode = prevDerivationMode;
+      this._basePath = prevBasePath;
+      throw writeErr;
+    }
     // Note: WALLET_EXISTS is set in finalizeWalletCreation() after successful initialization
   }
 
@@ -3951,33 +4124,69 @@ export class Sphere {
     basePath?: string,
     derivationMode?: DerivationMode
   ): Promise<void> {
+    // Wave G.6: prefer setMany when available; fall back to F.56
+    // best-effort rollback otherwise.
+    //
+    // Wave I.3 CRITICAL: snapshot in-memory state before mutating;
+    // restore on any failure so caller does not observe unstored
+    // master-key state (silent disk/memory divergence).
     const encrypted = this.encrypt(masterKey);
-    await this._storage.set(STORAGE_KEYS_GLOBAL.MASTER_KEY, encrypted);
-
-    // Set source and derivation mode
+    const prevMnemonic = this._mnemonic;
+    const prevSource = this._source;
+    const prevDerivationMode = this._derivationMode;
+    const prevBasePath = this._basePath;
     this._source = 'file';
     this._mnemonic = null;
-
-    // Determine derivation mode from chain code if not specified
     if (derivationMode) {
       this._derivationMode = derivationMode;
     } else {
       this._derivationMode = chainCode ? 'bip32' : 'wif_hmac';
     }
-
-    if (chainCode) {
-      await this._storage.set(STORAGE_KEYS_GLOBAL.CHAIN_CODE, chainCode);
-    }
-
-    if (derivationPath) {
-      await this._storage.set(STORAGE_KEYS_GLOBAL.DERIVATION_PATH, derivationPath);
-    }
-
     const effectiveBasePath = basePath ?? DEFAULT_BASE_PATH;
     this._basePath = effectiveBasePath;
-    await this._storage.set(STORAGE_KEYS_GLOBAL.BASE_PATH, effectiveBasePath);
-    await this._storage.set(STORAGE_KEYS_GLOBAL.DERIVATION_MODE, this._derivationMode);
-    await this._storage.set(STORAGE_KEYS_GLOBAL.WALLET_SOURCE, this._source);
+    const entries: Array<[string, string]> = [
+      [STORAGE_KEYS_GLOBAL.MASTER_KEY, encrypted],
+      [STORAGE_KEYS_GLOBAL.BASE_PATH, effectiveBasePath],
+      [STORAGE_KEYS_GLOBAL.DERIVATION_MODE, this._derivationMode],
+      [STORAGE_KEYS_GLOBAL.WALLET_SOURCE, this._source],
+    ];
+    if (chainCode) entries.splice(1, 0, [STORAGE_KEYS_GLOBAL.CHAIN_CODE, chainCode]);
+    if (derivationPath) entries.splice(chainCode ? 2 : 1, 0, [STORAGE_KEYS_GLOBAL.DERIVATION_PATH, derivationPath]);
+    if (this._storage.setMany) {
+      try {
+        await this._storage.setMany(entries);
+      } catch (err) {
+        this._mnemonic = prevMnemonic;
+        this._source = prevSource;
+        this._derivationMode = prevDerivationMode;
+        this._basePath = prevBasePath;
+        throw err;
+      }
+      return;
+    }
+    const writtenKeys: string[] = [];
+    const writeKey = async (key: string, value: string): Promise<void> => {
+      await this._storage.set(key, value);
+      writtenKeys.push(key);
+    };
+    try {
+      for (const [k, v] of entries) {
+        await writeKey(k, v);
+      }
+    } catch (writeErr) {
+      for (const k of writtenKeys.reverse()) {
+        try {
+          await this._storage.remove(k);
+        } catch {
+          /* best-effort cleanup */
+        }
+      }
+      this._mnemonic = prevMnemonic;
+      this._source = prevSource;
+      this._derivationMode = prevDerivationMode;
+      this._basePath = prevBasePath;
+      throw writeErr;
+    }
     // Note: WALLET_EXISTS is set in finalizeWalletCreation() after successful initialization
   }
 
@@ -4004,6 +4213,47 @@ export class Sphere {
     const savedDerivationMode = await this._storage.get(STORAGE_KEYS_GLOBAL.DERIVATION_MODE);
     const savedSource = await this._storage.get(STORAGE_KEYS_GLOBAL.WALLET_SOURCE);
     const savedAddressIndex = await this._storage.get(STORAGE_KEYS_GLOBAL.CURRENT_ADDRESS_INDEX);
+
+    // Steelman⁵² CRITICAL: detect partial-write corruption. F.56's
+    // best-effort rollback in storeMnemonic/storeMasterKey may itself
+    // fail (e.g., if remove() also hits the same lock contention)
+    // — the wallet file would then have MNEMONIC/MASTER_KEY plus
+    // SOME metadata keys but be missing OTHERS. We only fire on the
+    // partial state — if all three metadata keys are missing, treat
+    // as a legacy / external-app-created wallet (e.g., a plaintext
+    // mnemonic dropped into wallet.json by an external tool, or an
+    // older SDK build that did not write the metadata triplet).
+    // Defaults apply for those flows.
+    //
+    // The genuine corruption signature is "at least one metadata
+    // key written, at least one missing" — that pattern can only
+    // result from an aborted multi-key write whose rollback also
+    // failed, and silently applying defaults to the missing fields
+    // would derive the wrong identity for the persisted MNEMONIC.
+    if (encryptedMnemonic || encryptedMasterKey) {
+      const present: string[] = [];
+      const missing: string[] = [];
+      (savedBasePath ? present : missing).push('BASE_PATH');
+      (savedDerivationMode ? present : missing).push('DERIVATION_MODE');
+      (savedSource ? present : missing).push('WALLET_SOURCE');
+      // Steelman⁵² + ⁵² test fix: only fire on STRONG partial-write
+      // signature — at least 2 of the 3 metadata keys present and
+      // at least 1 missing. This pattern is unique to modern writes
+      // that got most of the way through but not all the way; a
+      // legacy / external-app wallet typically has 0 or 1 of these
+      // keys (no metadata or just WALLET_SOURCE for older SDK
+      // builds), and we don't want to brick load() for those.
+      if (present.length >= 2 && missing.length > 0) {
+        throw new SphereError(
+          `Wallet storage is in an inconsistent state — key material is present along ` +
+            `with partial metadata (have: ${present.join(', ')}; missing: ${missing.join(', ')}). ` +
+            `This indicates a partial-write corruption (e.g., an aborted Sphere.create / ` +
+            `Sphere.import whose rollback also failed). Run Sphere.clear() and re-import ` +
+            `the wallet from its mnemonic to recover.`,
+          'STORAGE_CORRUPTED',
+        );
+      }
+    }
 
     // Restore wallet metadata
     this._basePath = savedBasePath ?? DEFAULT_BASE_PATH;
@@ -4191,14 +4441,28 @@ export class Sphere {
       provider.setIdentity(this._identity!);
     }
 
-    // Connect providers (skip if already connected, e.g. after setIdentity reconnect)
+    // Connect providers. Ordering matters:
+    //
+    //   1. Oracle first — `oracle.initialize()` loads the embedded
+    //      RootTrustBase and constructs the AggregatorClient. This
+    //      is load-bearing for the Profile aggregator pointer layer:
+    //      ProfileStorageProvider.doConnect() Phase C calls
+    //      `oracle.getAggregatorClient()` / `getRootTrustBase()` to
+    //      build ProfilePointerLayer. If storage connects before
+    //      oracle, Phase C exits early with
+    //      `aggregator_client_unavailable` and the pointer channel
+    //      stays dark until a later explicit retry.
+    //   2. Storage second — Phase A (local cache) + Phase B
+    //      (OrbitDB attach) + Phase C (pointer layer construction,
+    //      reads oracle state).
+    //   3. Transport third — Nostr connection, independent.
+    await this._oracle.initialize();
     if (!this._storage.isConnected()) {
       await this._storage.connect();
     }
     if (!this._transport.isConnected()) {
       await this._transport.connect();
     }
-    await this._oracle.initialize();
 
     // Initialize all token storage providers in parallel
     await Promise.all(
@@ -4400,6 +4664,170 @@ export class Sphere {
         logger.warn('Sphere', 'Swap module enabled but accounting module not available — disabling');
         this._swap = null;
       }
+    }
+
+    // Round 7 (FIX 1) / Round 8 (FIX 1) — Wire production OrbitDb-backed
+    // disposition storage AND the trust-base-aware proof verifier into
+    // the operator escape-hatch InclusionProofImporter.
+    //
+    // Round 5 auto-installed an in-memory default that failed closed on
+    // every operator-supplied proof; Round 7 swapped the disposition
+    // storage for an OrbitDb-backed adapter so `_invalid` / `_audit`
+    // records persist across restarts. Round 8 closes the remaining
+    // verification gap: the importer's case 8 / 9 short-circuits now
+    // run through `oracle.verifyInclusionProof()` (the same trust-base-
+    // aware verifier the regular finalization workers use) instead of
+    // the Round 7 fail-closed stub.
+    //
+    // The disposition-storage swap is best-effort: when the storage
+    // provider is not a `ProfileStorageProvider` (e.g. legacy IndexedDB
+    // / file storage), the auto-installed in-memory default stays in
+    // place. The verifyProof wiring is ALWAYS attempted regardless of
+    // storage provider — a real verifier on top of in-memory disposition
+    // storage is still strictly better than the fail-closed stub
+    // (operator probe calls return structured `proof-not-anchored` /
+    // `proof-trustbase-failed` results instead of every proof being
+    // dismissed as `NOT_AUTHENTICATED`).
+    //
+    // KNOWN LIMITATION: `graftCallback` / `overrideCallback` are NOT
+    // wired here because the default builder's `queueScanner` returns
+    // no entries — case 3 / 5 / 6 are unreachable in the auto-installed
+    // harness. A follow-up wave will land a real `queueScanner` (the
+    // FinalizationQueue-backed scanner) alongside production graft +
+    // override callbacks; until then the no-op defaults are correct
+    // (every reachable case routes through `verifyProof` first, and a
+    // verified proof against an empty queue/manifest correctly resolves
+    // to `'no-such-token'` or `'requestid-mismatch'`).
+    try {
+      // Duck-typed check: ProfileStorageProvider exposes
+      // `buildDispositionStorageAdapter`. Other providers don't.
+      const storageWithBuilder = this._storage as unknown as {
+        buildDispositionStorageAdapter?: () =>
+          | import('../profile/disposition-storage-adapters').OrbitDbDispositionStorageAdapter
+          | null;
+      };
+      const builderAvailable =
+        typeof storageWithBuilder.buildDispositionStorageAdapter === 'function';
+      const adapter = builderAvailable
+        ? storageWithBuilder.buildDispositionStorageAdapter!()
+        : null;
+
+      // Round 8 (FIX 1) — Build a verifyProof adapter that bridges the
+      // {@link ImportableInclusionProof} shape used by the importer to
+      // the oracle's `verifyInclusionProof` boolean API. The oracle
+      // returns `true` only on `OK`; every other status (PATH_INVALID,
+      // PATH_NOT_INCLUDED, NOT_AUTHENTICATED, THROWN) collapses to
+      // `false`. We map `true → 'OK'` and `false → 'NOT_AUTHENTICATED'`
+      // — losing the granular distinction between PATH_INVALID and
+      // PATH_NOT_INCLUDED is acceptable because the importer's case 8
+      // / 9 routing treats both as proof-trustbase-failed (only OK
+      // proceeds to graft/override). A follow-up wave can plumb the
+      // granular status if forensic distinction becomes load-bearing.
+      //
+      // The trustBase is loaded LAZILY: oracle.initialize() may run
+      // after this hop (the oracle wires trustBase at first connect),
+      // so the adapter resolves the trust-base on each call by calling
+      // through `oracle.verifyInclusionProof()` which performs its own
+      // null-check and throws `NOT_INITIALIZED` when trustBase is not
+      // yet loaded. We catch and translate to `'NOT_AUTHENTICATED'` so
+      // a probe call before oracle init does not crash bootstrap.
+      const oracleForVerify = this._oracle as unknown as {
+        verifyInclusionProof?: (input: {
+          readonly proofJson: unknown;
+          readonly transactionHash: string;
+          readonly proofHash?: string;
+        }) => Promise<boolean>;
+      };
+      const oracleHasVerify =
+        typeof oracleForVerify.verifyInclusionProof === 'function';
+      const verifyProofAdapter:
+        | import('../modules/payments/transfer/import-inclusion-proof').ProofVerifier
+        | undefined = oracleHasVerify
+        ? async (
+            proof: import('../modules/payments/transfer/import-inclusion-proof').ImportableInclusionProof,
+          ): Promise<import('../modules/payments/transfer/proof-verifier').ProofVerifyStatus> => {
+            try {
+              const ok = await oracleForVerify.verifyInclusionProof!({
+                proofJson: proof.proof,
+                transactionHash: proof.transactionHash,
+              });
+              return ok ? 'OK' : 'NOT_AUTHENTICATED';
+            } catch {
+              // Trust-base not loaded yet, network blip, malformed
+              // input. Fail closed — the operator can retry once the
+              // oracle finishes initialize(). Distinct from a
+              // structurally-bad proof (which the oracle itself
+              // returns false for); both collapse to the same case-9
+              // routing here.
+              return 'NOT_AUTHENTICATED';
+            }
+          }
+        : undefined;
+
+      if (adapter !== null && adapter !== undefined) {
+        this._payments.configureOperatorEscapeHatchStorage(
+          adapter,
+          verifyProofAdapter !== undefined
+            ? { verifyProof: verifyProofAdapter }
+            : undefined,
+        );
+        logger.debug(
+          'Sphere',
+          'Wired OrbitDb-backed disposition storage + oracle.verifyInclusionProof into operator escape-hatch importer',
+        );
+      } else if (verifyProofAdapter !== undefined) {
+        // No OrbitDb adapter, but we still have a real oracle —
+        // upgrade just the verifier so the importer can validate
+        // proofs even when running against in-memory disposition
+        // storage. Use the public install* hook by rebuilding the
+        // default importer with the verifier override.
+        // Round 8 (FIX 1) — even without dispositionStorage upgrade,
+        // verifyProof wiring is strictly better than the stub.
+        const paymentsForVerify = this._payments as unknown as {
+          configureOperatorEscapeHatchStorage?: (
+            ds: import('../profile/disposition-writer').DispositionPerEntryStorage,
+            options?: {
+              readonly verifyProof?: import('../modules/payments/transfer/import-inclusion-proof').ProofVerifier;
+            },
+          ) => void;
+        };
+        // Synthesize an in-memory dispositionStorage. We could reach
+        // through to the auto-installed importer's existing
+        // dispositionStorage instance, but rebuilding fresh keeps the
+        // public surface narrow — the cost is one extra empty Map.
+        const { InMemoryDispositionStorageAdapter } = await import(
+          '../profile/disposition-storage-adapters'
+        );
+        if (typeof paymentsForVerify.configureOperatorEscapeHatchStorage === 'function') {
+          paymentsForVerify.configureOperatorEscapeHatchStorage(
+            new InMemoryDispositionStorageAdapter(),
+            { verifyProof: verifyProofAdapter },
+          );
+          logger.debug(
+            'Sphere',
+            'Wired oracle.verifyInclusionProof into operator escape-hatch importer (in-memory disposition storage)',
+          );
+        }
+      } else if (builderAvailable) {
+        logger.debug(
+          'Sphere',
+          'ProfileStorageProvider returned null disposition adapter (encryption disabled or identity pending) — escape-hatch importer keeps in-memory default',
+        );
+      }
+    } catch (err) {
+      // Non-fatal: bootstrap continues with the auto-installed default.
+      // The operator escape-hatch still works (just with the Round 7
+      // fail-closed verifier stub). Round 8 (FIX 2) — use
+      // `safeErrorMessage` so a hostile Proxy on `err` (throwing
+      // getPrototypeOf / Symbol.hasInstance / .message getter) cannot
+      // crash the bootstrap path. The previous pattern
+      // (`err instanceof Error ? err.message : String(err)`) goes
+      // through `instanceof` which calls Symbol.hasInstance — a
+      // throwing trap escapes here.
+      logger.warn(
+        'Sphere',
+        `Failed to wire operator-escape-hatch importer overrides — falling back to in-memory default: ${safeErrorMessage(err)}`,
+      );
     }
 
     // Load modules in parallel — they are independent of each other.

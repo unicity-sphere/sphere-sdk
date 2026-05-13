@@ -217,8 +217,36 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
   if (config?.oracle?.debug) sdkLogger.setTagDebug('Aggregator', true);
   if (config?.price?.debug) sdkLogger.setTagDebug('Price', true);
 
+  // Local-infra override: if SPHERE_NOSTR_RELAYS is set in the
+  // environment AND the caller did not explicitly pass relays/
+  // additionalRelays, splice the env value into the transport config so
+  // the resolver picks it up as a hard override. Use cases:
+  //   - Local Docker Nostr relay (tests/e2e/local-infra) without
+  //     touching every test's makeProviders call site.
+  //   - Operator override on a shared deployment (e.g. running against
+  //     a staging relay while keeping the network preset for everything
+  //     else: aggregator, IPFS, group-chat).
+  //
+  // Format: comma-separated WebSocket URLs ("ws://localhost:7777,
+  // wss://backup.example.com"). Whitespace + empty entries trimmed.
+  // Only applies in Node — the browser factory has its own resolver.
+  const transportOverride = (() => {
+    const raw = process.env['SPHERE_NOSTR_RELAYS'];
+    if (!raw) return config?.transport;
+    if (config?.transport?.relays || config?.transport?.additionalRelays) {
+      // Caller is in charge — don't second-guess explicit wiring.
+      return config.transport;
+    }
+    const relays = raw
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+    if (relays.length === 0) return config?.transport;
+    return { ...config?.transport, relays };
+  })();
+
   // Resolve configurations using shared utilities
-  const transportConfig = resolveTransportConfig(network, config?.transport);
+  const transportConfig = resolveTransportConfig(network, transportOverride);
   const oracleConfig = resolveOracleConfig(network, config?.oracle);
   const l1Config = resolveL1Config(network, config?.l1);
 

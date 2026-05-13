@@ -42,11 +42,23 @@ async function ensureTrustbase(dataDir: string): Promise<void> {
   writeFileSync(trustbasePath, data);
 }
 
+/**
+ * Wait for an INCOMING DM. CommunicationsModule.onDirectMessage replays
+ * the existing message store to new handlers (so handlers registered
+ * late don't miss DMs); we filter out own outbound + pre-horizon
+ * messages so the helper resolves on a genuinely-new inbound DM.
+ */
 function waitForDM(sphere: Sphere, timeoutMs: number): Promise<DirectMessage> {
+  const horizon = Date.now();
+  const selfPubkey = sphere.identity?.chainPubkey;
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`Timeout: DM not received within ${timeoutMs}ms`)), timeoutMs);
-    sphere.communications.onDirectMessage((msg) => {
+    let unsub: (() => void) | null = null;
+    unsub = sphere.communications.onDirectMessage((msg) => {
+      if (selfPubkey && msg.senderPubkey === selfPubkey) return;
+      if (typeof msg.timestamp === 'number' && msg.timestamp < horizon) return;
       clearTimeout(timer);
+      if (unsub) unsub();
       resolve(msg);
     });
   });

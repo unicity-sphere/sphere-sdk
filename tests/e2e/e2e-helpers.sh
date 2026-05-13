@@ -7,11 +7,45 @@
 # =============================================================================
 
 SDK_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
-# Run CLI via npx tsx from the SDK root so it works from any directory.
-# The --cwd flag ensures wallet profiles are created in CLI_DIR (the workspace).
-CLI_BASE="npx --prefix ${SDK_ROOT} tsx ${SDK_ROOT}/cli/index.ts"
+
+# CLI invocation — centralized resolver in lib/resolve-cli.sh.
+# Honors $SPHERE_CLI / $SDK_CLI_BIN, then walks the in-tree / sibling
+# / globally-installed fallback chain.
+# shellcheck source=./lib/resolve-cli.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/resolve-cli.sh"
+if ! resolve_sphere_cli "${SDK_ROOT}" CLI_BASE; then
+  print_resolve_failure_help "${SDK_ROOT}"
+  exit 0
+fi
 ESCROW_REPO="${ESCROW_REPO:-https://github.com/unicity-sphere/escrow-service.git}"
 ESCROW_STARTUP_TIMEOUT=120
+
+# ---------------------------------------------------------------------------
+# Infra-probe preflight gate.
+#
+# Swap e2e tests need `nostr` (proposal / announce DMs + NIP-17 gift
+# wraps) and `aggregator` (commitment submission + inclusion proofs).
+# We run the @unicitylabs/infra-probe once on source so a degraded /
+# unreachable testnet skips the test cleanly rather than producing a
+# 5-minute false-negative inside escrow setup or faucet polling.
+#
+# Override the default service set for a script with E2E_PREFLIGHT_ONLY
+# (comma-separated, see preflight-infra.sh). Bypass with
+# E2E_SKIP_PREFLIGHT=1 or E2E_NO_AUTO_PREFLIGHT=1.
+# ---------------------------------------------------------------------------
+# shellcheck source=./preflight-infra.sh
+source "$(dirname "${BASH_SOURCE[0]}")/preflight-infra.sh"
+
+# Local-infra harness — boots a local Nostr relay + faucet via Docker
+# when E2E_LOCAL_INFRA=1. No-op otherwise. Sourced BEFORE the public
+# preflight so SPHERE_NOSTR_RELAYS / E2E_LOCAL_FAUCET_PUBKEY are
+# already in env when the preflight checks them.
+# shellcheck source=./local-infra/local-infra.sh
+source "$(dirname "${BASH_SOURCE[0]}")/local-infra/local-infra.sh"
+
+if [[ "${E2E_NO_AUTO_PREFLIGHT:-0}" != "1" ]]; then
+  preflight_infra "${E2E_PREFLIGHT_ONLY:-nostr,aggregator}"
+fi
 
 # ---------------------------------------------------------------------------
 # State
