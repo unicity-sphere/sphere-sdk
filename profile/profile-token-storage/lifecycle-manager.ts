@@ -297,9 +297,29 @@ export class LifecycleManager {
     // (no oracle, sticky skip, structurally unavailable), bail
     // immediately so the caller can take the legacy path with full
     // knowledge that no future build will reconcile.
+    //
+    // Wave G.7+ refinement: if no `getPointerLayer` closure is wired at
+    // all, polling is structurally pointless — there is no codepath
+    // that could ever flip the result from null to non-null. Bail
+    // immediately. The previous code waited a full 30s in that case,
+    // which manifested as test-suite hangs on every test fixture that
+    // omitted the pointer wiring (the ProfileTokenStorageProvider unit
+    // tests, the wave-g7-prereq fixtures, etc.). Production wallets
+    // always wire `getPointerLayer` when an oracle is configured, so
+    // this short-circuit only affects test fixtures and degenerate
+    // setups; the slow-build-on-CI scenario is preserved when the
+    // closure IS wired but returns null transiently.
+    const getPointerLayer = this.host.options?.getPointerLayer;
+    if (!getPointerLayer) {
+      this.host.log(
+        'Pointer recover: no getPointerLayer closure wired; ' +
+          'skipping pointer-layer wait, falling through to legacy IPNS migration',
+      );
+      return false;
+    }
     const getStatus = this.host.options?.getPointerBuildStatus;
     const pollDeadline = Date.now() + 30_000;
-    let pointer = this.host.options?.getPointerLayer?.() ?? null;
+    let pointer = getPointerLayer() ?? null;
     while (!pointer && Date.now() < pollDeadline) {
       // If the build status accessor reports a deterministic
       // 'unavailable', skip the wait entirely — polling won't help.
@@ -311,7 +331,7 @@ export class LifecycleManager {
         return false;
       }
       await new Promise((r) => setTimeout(r, 100));
-      pointer = this.host.options?.getPointerLayer?.() ?? null;
+      pointer = getPointerLayer() ?? null;
     }
     if (!pointer) {
       const status = getStatus ? getStatus() : 'unknown';

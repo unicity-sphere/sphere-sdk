@@ -153,10 +153,19 @@ vi.mock('../../../serialization/txf-serializer', () => ({
 // Stub the acquireBundle export so the auto-installed pool's workers
 // return a synthetic VerifiedBundle without touching real CAR bytes.
 // The stub is updated per-test via `mockAcquireBundle.mockResolvedValue(...)`.
+//
+// Must also re-export `RECIPIENT_MAX_INLINE_CARBASE64_LENGTH` because
+// IngestWorkerPool.enqueue() reads it on the queue admission path
+// (synchronous bound on inline carBase64 length). With the mock missing
+// that export, every enqueue() throws a "No export defined" error and
+// the bundle is rejected before the worker runs.
 const mockAcquireBundle = vi.fn();
 vi.mock('../../../modules/payments/transfer/bundle-acquirer', () => ({
   acquireBundle: (...args: unknown[]) => mockAcquireBundle(...args),
   isReplayOutcome: () => false,
+  // 8 MiB — well above any synthetic carBase64 used in this test file
+  // (the longest is 'AAAA' = 4 chars). Mirrors production-order-of-magnitude.
+  RECIPIENT_MAX_INLINE_CARBASE64_LENGTH: 8 * 1024 * 1024,
 }));
 
 // =============================================================================
