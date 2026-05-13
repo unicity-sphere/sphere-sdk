@@ -12048,10 +12048,11 @@ export class PaymentsModule {
     }
 
     // Load other data EARLY so archive-move (below) can write into the
-    // up-to-date archive map.
+    // up-to-date archive map. Note: `this.nametags` is set further down
+    // via the preservation guard so a sync provider that strips _nametags
+    // doesn't transiently empty the in-memory nametag set (#136 / PR #140).
     this.archivedTokens = parsed.archivedTokens;
     this.forkedTokens = parsed.forkedTokens;
-    this.nametags = parsed.nametags;
 
     let archiveMoved = 0;
     for (const token of parsed.tokens) {
@@ -12118,10 +12119,6 @@ export class PaymentsModule {
         `[BALANCE-INVARIANT] loadFromStorageData moved ${archiveMoved} token(s) to archive`,
       );
     }
-
-    // Load other data
-    this.archivedTokens = parsed.archivedTokens;
-    this.forkedTokens = parsed.forkedTokens;
 
     // Nametag preservation guard (#136). Some sync providers strip
     // `_nametags` from merged data — overriding would transiently empty
