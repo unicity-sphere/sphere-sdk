@@ -22,6 +22,12 @@ function createBrowserWebSocket(url: string): IWebSocket {
 /**
  * Create a browser IPFS storage provider with localStorage-based state persistence.
  * Automatically injects the browser WebSocket factory for IPNS push subscriptions.
+ *
+ * @deprecated Use `createBrowserProfileProviders` (Profile + aggregator pointer)
+ *   instead. The IPNS-based mutable-pointer flow this factory wires up is
+ *   superseded by the aggregator pointer layer, which handles cross-device
+ *   pointer resolution over HTTP without IPNS DHT propagation. See
+ *   `IpfsStorageProvider` JSDoc for the migration rationale.
  */
 export function createBrowserIpfsStorageProvider(config?: IpfsStorageConfig): IpfsStorageProvider {
   return new IpfsStorageProvider(
