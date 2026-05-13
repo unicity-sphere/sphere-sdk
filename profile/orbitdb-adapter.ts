@@ -689,32 +689,19 @@ export class OrbitDbAdapter implements ProfileDatabase {
     // overwritten them).
     this.localAuthoredKeys.clear();
 
-    try {
-      if (this.db) {
-        await this.db.close();
-        this.db = null;
-      }
-    } catch {
-      // Best-effort close -- log but do not throw
-    }
-
-    try {
-      if (this.orbitdb) {
-        await this.orbitdb.stop();
-        this.orbitdb = null;
-      }
-    } catch {
-      // Best-effort close
-    }
-
-    try {
-      if (this.helia) {
-        await this.helia.stop();
-        this.helia = null;
-      }
-    } catch {
-      // Best-effort close
-    }
+    // Bounded teardown (#137). Each step gets a budget — a hung
+    // libp2p / pubsub / DAG-sync layer must not pin `Sphere.destroy()`
+    // for minutes. Best-effort: on timeout we log, drop the reference,
+    // and proceed; any leaked resources are reclaimed at process exit.
+    await closeWithBudget('db.close', () => this.db?.close(), () => {
+      this.db = null;
+    });
+    await closeWithBudget('orbitdb.stop', () => this.orbitdb?.stop(), () => {
+      this.orbitdb = null;
+    });
+    await closeWithBudget('helia.stop', () => this.helia?.stop(), () => {
+      this.helia = null;
+    });
 
     this.connected = false;
   }
@@ -831,6 +818,40 @@ async function derivePublicKeyShort(privateKeyHex: string): Promise<string> {
     'ORBITDB_CONNECTION_FAILED',
     'Cannot derive public key: @noble/curves and @noble/hashes are required',
   );
+}
+
+/**
+ * Per-step budget for graceful teardown of OrbitDB / Helia layers (#137).
+ * On timeout we DROP the reference instead of awaiting forever — `destroy()`
+ * is a terminal call and the process or test runner will reclaim the rest.
+ */
+const TEARDOWN_STEP_TIMEOUT_MS = 10_000;
+
+async function closeWithBudget(
+  label: string,
+  invoke: () => Promise<void> | undefined,
+  onSettle: () => void,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const op = invoke();
+    if (!op) return; // ref was null
+    const timeout = new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), TEARDOWN_STEP_TIMEOUT_MS);
+    });
+    const outcome = await Promise.race([op.then(() => 'ok' as const), timeout]);
+    if (outcome === 'timeout') {
+      logger.warn(
+        'OrbitDB',
+        `${label} exceeded ${TEARDOWN_STEP_TIMEOUT_MS}ms — dropping reference and continuing`,
+      );
+    }
+  } catch {
+    // Best-effort close; swallow underlying errors.
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    onSettle();
+  }
 }
 
 /**
