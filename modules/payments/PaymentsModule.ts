@@ -85,6 +85,7 @@ import type {
 import { isInstantSplitBundle, isInstantSplitBundleV5, isCombinedTransferBundleV6 } from '../../types/instant-split';
 
 // SDK imports for token parsing and transfers
+import { PredicateEngineService } from '@unicitylabs/state-transition-sdk/lib/predicate/PredicateEngineService';
 import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token';
 import { CoinId } from '@unicitylabs/state-transition-sdk/lib/token/fungible/CoinId';
 import { TransferCommitment } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferCommitment';
@@ -1198,6 +1199,35 @@ export class PaymentsModule {
         request.invoiceRefundAddress,
         request.invoiceContact,
       );
+
+      // Pre-validate ownership of every source token BEFORE any on-chain
+      // work. See {@link validateSourceOwnership} for full rationale; the
+      // short version is: in instant mode, the V6 bundle is shipped to the
+      // recipient via Nostr BEFORE the per-direct-token commitments are
+      // submitted to the aggregator. The split source's burn ALREADY runs
+      // synchronously inside `buildSplitBundle`. If a direct token's
+      // predicate-ownership check fails INSIDE the aggregator client
+      // (state-transition-sdk's `submitTransferCommitment` line ~41), the
+      // background submit silently logs an error but the foreground send()
+      // still returns `status: 'completed'`. Meanwhile the split's burn is
+      // on-chain, the change-token mint commitment may have already been
+      // submitted in parallel — and the wallet's accounting loses track of
+      // the change. Net effect: the sender's UCT balance can drop to 0 while
+      // the recipient receives only the split slice (not the direct slice),
+      // and the change token never materializes locally because the
+      // change-token-creation callback is gated on the recipient mint proof
+      // resolving (which never happens for the never-submitted commitment).
+      // The repro is the pay-invoice manual test: Bob has 1000 + 10 UCT,
+      // pays an 11 UCT invoice, loses 999 UCT change. By validating BEFORE
+      // any on-chain work, the throw lands in the outer catch (line ~1520)
+      // which restores source tokens to `confirmed` — no value lost.
+      const ownershipCheckList: Array<{ uiToken: Token; sdkToken: SdkToken<any> } | Token> = [
+        ...splitPlan.tokensToTransferDirectly,
+      ];
+      if (splitPlan.requiresSplit && splitPlan.tokenToSplit) {
+        ownershipCheckList.push(splitPlan.tokenToSplit);
+      }
+      await this.validateSourceOwnership(ownershipCheckList, signingService);
 
       if (transferMode === 'conservative') {
         // =================================================================
@@ -5075,6 +5105,120 @@ export class PaymentsModule {
   /**
    * Create SDK TransferCommitment for a token transfer
    */
+  /**
+   * Pre-validate that the wallet's signing key owns every source token planned
+   * for spending. Each source token's current-state predicate is reconstructed
+   * via `PredicateEngineService.createPredicate(...)` and checked with
+   * `predicate.isOwner(signingService.publicKey)`. Throws
+   * `OWNERSHIP_VERIFICATION_FAILED` immediately on any mismatch.
+   *
+   * Why this exists. Both the conservative and the instant (V6) send paths
+   * submit transfer commitments to the aggregator's
+   * `submitTransferCommitment(...)`, which itself runs an identical predicate-
+   * ownership check (state-transition-sdk
+   * `StateTransitionClient.submitTransferCommitment` line ~41). In conservative
+   * mode the throw is awaited and propagated, the outer catch restores the
+   * source tokens, no value is lost. In instant mode, however, the bundle is
+   * shipped to the recipient FIRST, and the per-direct-token submissions run
+   * fire-and-forget on a background task (see line ~1444 — the
+   * "Background commitment submit failed" log). When the background submit
+   * fails:
+   *
+   *  1. The Nostr bundle has already been delivered, so the recipient has
+   *     seen the tokens.
+   *  2. The on-chain commitment never landed, so the recipient cannot
+   *     finalize.
+   *  3. If a split was part of the same bundle, the burn of the split
+   *     source has ALREADY happened (`buildSplitBundle` submits the burn
+   *     synchronously); the change token mint is also in-flight in the
+   *     background queue.
+   *  4. The sender's send() returns `status: 'completed'` (because the
+   *     foreground transport completed), but the source tokens that were
+   *     intended to be spent end up in a damaged state — the failed direct
+   *     transfer can't be retried (the bundle already shipped), and the
+   *     burned split source has lost its change to the in-flight queue.
+   *
+   * The repro is the pay-invoice test for the manual-test session: Bob holds
+   * 1000 UCT + 10 UCT (the 10 UCT was received from Alice via the same instant
+   * path with the same predicate-state staleness symptom), tries to pay an
+   * 11-UCT invoice; the split picks the 1000-UCT token as the splittable, the
+   * 10-UCT token as the direct. The direct commitment's predicate check
+   * against Bob's signing key fails because the 10-UCT token's local
+   * current-state predicate is still set to the PRE-transfer state (Alice's
+   * predicate) rather than the POST-transfer state (Bob's predicate).
+   *
+   * The deeper fix — make the receive flow always finalize the state to the
+   * post-transfer predicate before persisting — is out of scope here.
+   * Pre-validation converts the silent damage into a loud fail-fast: the
+   * outer send() catch block (line ~1520) cancels the reservation and
+   * restores the source tokens to `confirmed`. No on-chain work has happened
+   * yet because we check BEFORE the split-bundle build and BEFORE the direct
+   * commitments are submitted.
+   *
+   * @throws {SphereError} `OWNERSHIP_VERIFICATION_FAILED` — at least one
+   *         source token's current-state predicate does not match the
+   *         wallet's signing key.
+   */
+  private async validateSourceOwnership(
+    sourceTokens: ReadonlyArray<{ uiToken: Token; sdkToken: SdkToken<any> } | Token>,
+    signingService: SigningService,
+  ): Promise<void> {
+    const publicKey = signingService.publicKey;
+    for (const entry of sourceTokens) {
+      // Accept both UI Token (with sdkData) and TokenWithAmount-shaped objects
+      // {uiToken, sdkToken}. The latter is what splitPlan.tokensToTransferDirectly
+      // already has parsed; the former is the splitPlan.tokenToSplit.uiToken
+      // before we parse it.
+      let sdkToken: SdkToken<any> | null = null;
+      let uiTokenId: string;
+      if ('sdkToken' in entry) {
+        sdkToken = entry.sdkToken;
+        uiTokenId = entry.uiToken.id;
+      } else {
+        const sdkData = entry.sdkData;
+        uiTokenId = entry.id;
+        if (!sdkData) continue; // not an on-chain spendable token — skip
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          sdkToken = await SdkToken.fromJSON(JSON.parse(sdkData) as any) as SdkToken<any>;
+        } catch {
+          // Unparseable sdkData — let downstream code handle (will throw on
+          // commitment construction). Don't fail the pre-check here.
+          continue;
+        }
+      }
+      // Defensive: if any of the SDK shape is missing (e.g. mocked-out test
+      // doubles), skip — we cannot validate without a real predicate, and
+      // letting downstream code run is the existing behaviour for these
+      // cases. Production tokens always carry a real predicate.
+      if (!sdkToken || !sdkToken.state || !sdkToken.state.predicate) continue;
+      let predicate;
+      try {
+        predicate = await PredicateEngineService.createPredicate(sdkToken.state.predicate);
+      } catch {
+        // Predicate engine couldn't materialise the predicate — same logic
+        // as above; let downstream handle it rather than fail-closing here
+        // on a shape we can't reason about.
+        continue;
+      }
+      let owned: boolean;
+      try {
+        owned = await predicate.isOwner(publicKey);
+      } catch {
+        // isOwner threw — defer to downstream. We only fail-fast on the
+        // EXPLICIT non-ownership case where every SDK call succeeded.
+        continue;
+      }
+      if (!owned) {
+        throw new SphereError(
+          `Cannot spend token ${uiTokenId.slice(0, 16)}: source state predicate does not match wallet's signing key. ` +
+            `The token may be in a stale post-receive state — try sync + receive --finalize, or re-import.`,
+          'OWNERSHIP_VERIFICATION_FAILED',
+        );
+      }
+    }
+  }
+
   private async createSdkCommitment(
     token: Token,
     recipientAddress: IAddress,
