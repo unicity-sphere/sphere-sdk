@@ -200,9 +200,28 @@ function determineTokenStatus(txf: TxfToken): TokenStatus {
 
 /**
  * Convert TXF token to Token interface
+ *
+ * Handles three token shapes:
+ *   - Coin tokens:    non-empty `coinData`, balance computed from
+ *                     the sum of per-coin amounts; primary `coinId` is
+ *                     the first non-zero entry.
+ *   - NFT tokens:     `coinData` may be `[]` (no coin amounts), but the
+ *                     tokenType discriminates via `isNft` below.
+ *   - Invoice tokens: `coinData` is `null` (invoice tokens carry no coin
+ *                     amounts; the InvoiceTerms live in `tokenData`).
+ *
+ * The null-guard on `coinData` is load-bearing: invoice tokens persist
+ * via the standard token storage path (recognized later by the
+ * AccountingModule's `tokenType === INVOICE_TOKEN_TYPE_HEX` filter
+ * against `payments.getTokens()`), and the legacy unconditional
+ * `coinData.reduce(...)` threw `TypeError` on `null`. That throw was
+ * silently caught by `parseTxfStorageData`'s per-token try/catch, which
+ * dropped the invoice token from the loaded map — making
+ * `invoice-list / invoice-status / invoice-pay` all return "not found"
+ * for any persisted invoice.
  */
 export function txfToToken(tokenId: string, txf: TxfToken): Token {
-  const coinData = txf.genesis.data.coinData;
+  const coinData = txf.genesis.data.coinData ?? [];
   const totalAmount = coinData.reduce((sum, [, amt]) => {
     return sum + BigInt(amt || '0');
   }, BigInt(0));
