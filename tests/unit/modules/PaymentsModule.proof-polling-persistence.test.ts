@@ -269,6 +269,13 @@ interface ModuleInternals {
   saveProofPollingJobs: () => Promise<void>;
   restoreProofPollingJobs: () => Promise<void>;
   recoverStrandedReceivedTokens: () => Promise<number>;
+  saveCommitmentOnlyToken: (
+    sourceTokenInput: unknown,
+    commitmentInput: unknown,
+    senderPubkey: string,
+    deferPersistence?: boolean,
+    skipGenesisDedup?: boolean,
+  ) => Promise<Token | null>;
   loadFromStorageData: (data: TxfStorageDataBase) => void;
   isReceivedLegacyPending: (token: Token) => boolean;
   hasFinalizationPlan: (token: Token) => boolean;
@@ -833,5 +840,259 @@ describe('#144 L3 — balance-model invariant + stranded recovery', () => {
 
     const recovered = await internals(module).recoverStrandedReceivedTokens();
     expect(recovered).toBe(0);
+  });
+});
+
+// =============================================================================
+// Option B — token-local commitment recovery via embedded authenticator
+// =============================================================================
+//
+// Scenario: Bob sends Alice some UCT. Bob's CLI exits before its
+// fire-and-forget background `submitTransferCommitment` completes (or the
+// aggregator drops the submit). Alice has the bundle on disk. Alice then
+// wipes her profile and re-imports from mnemonic.
+//
+// Pre-fix: proof-polling jobs (kept in a separate KV map, not in the
+// IPFS-published TXF) are lost on profile wipe. `recoverStrandedReceivedTokens`
+// can register a recovery job, but with `commitmentJson: ''` the polling
+// queue can only call `getProof(requestId)` — which returns null because
+// no one ever submitted the commitment. Tokens stuck pending forever.
+//
+// Fix (Option B): on receive, `saveCommitmentOnlyToken` embeds the sender's
+// `authenticator` JSON under a `_wallet` field on the synthetic pending tx.
+// `_wallet` rides along through TXF serialization (structuredClone preserves
+// unknown fields) and IPFS publishing. On recovery, the embedded
+// authenticator lets us reconstruct the full `TransferCommitment` and
+// re-submit it. The authenticator is the SENDER's signature; the aggregator
+// verifies the signature without caring about the submitter's identity.
+
+describe('Option B — embedded authenticator enables receiver-side commitment re-submit', () => {
+  let module: ReturnType<typeof createPaymentsModule>;
+  let setup: ReturnType<typeof createDeps>;
+
+  beforeEach(() => {
+    module = createPaymentsModule();
+    setup = createDeps();
+    module.initialize(setup.deps);
+  });
+
+  afterEach(() => {
+    try { module.destroy(); } catch { /* ignore */ }
+  });
+
+  /**
+   * Build a V6-direct receive shape with an embedded `_wallet.authenticator`
+   * on the last (pending) tx — mirrors what `saveCommitmentOnlyToken` writes
+   * after the Option B fix.
+   */
+  function makeV6DirectReceiveWithEmbeddedAuth(
+    authenticator: unknown = {
+      publicKey: SENDER_PUBKEY,
+      signature: 'd'.repeat(128),
+      stateHash: STATE_HASH,
+    },
+  ): string {
+    return JSON.stringify({
+      version: '2.0',
+      genesis: {
+        data: { tokenId: GENESIS_TOKEN_ID, tokenType: 'coinType', coinData: [['UCT_HEX', '100']] },
+        inclusionProof: { authenticator: { stateHash: 'genesisHash' } },
+      },
+      state: { data: '', predicate: `0000${SENDER_PUBKEY.toLowerCase()}0000` },
+      transactions: [
+        {
+          previousStateHash: 'h0',
+          newStateHash: STATE_HASH,
+          predicate: 'pred1',
+          inclusionProof: { authenticator: { stateHash: STATE_HASH } },
+          data: { recipient: { address: 'PROXY://senderProxy', scheme: 'PROXY' } },
+        },
+        {
+          previousStateHash: STATE_HASH,
+          predicate: 'pred2',
+          inclusionProof: null,
+          data: { recipient: { address: OUR_DIRECT, scheme: 'DIRECT' }, salt: '0x33' },
+          _wallet: { authenticator },
+        },
+      ],
+      _integrity: { genesisDataJSONHash: '0000' + '0'.repeat(60), currentStateHash: STATE_HASH },
+    });
+  }
+
+  it('recovery extracts embedded authenticator, populates commitmentJson, AND re-submits to aggregator', async () => {
+    const sdkData = makeV6DirectReceiveWithEmbeddedAuth();
+    const token: Token = {
+      id: GENESIS_TOKEN_ID,
+      coinId: 'UCT_HEX',
+      symbol: 'UCT',
+      amount: '100',
+      status: 'pending',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      sdkData,
+    };
+    internals(module).tokens.set(token.id, token);
+
+    // Wire up a submitTransferCommitment spy on the mock oracle's
+    // StateTransitionClient — this is what Option B's recovery hits.
+    const submitSpy = vi.fn().mockResolvedValue({ status: 'SUCCESS' });
+    (setup.deps.oracle.getStateTransitionClient as ReturnType<typeof vi.fn>).mockReturnValue({
+      submitTransferCommitment: submitSpy,
+    });
+
+    const recovered = await internals(module).recoverStrandedReceivedTokens();
+    expect(recovered).toBe(1);
+
+    const job = internals(module).proofPollingJobs.get(GENESIS_TOKEN_ID);
+    expect(job).toBeDefined();
+
+    // commitmentJson MUST be populated (not the legacy empty-string path).
+    expect(job?.commitmentJson).not.toBe('');
+    const cmt = JSON.parse(job?.commitmentJson ?? '{}');
+    expect(cmt.requestId).toBe('00deadbeef00recovery00requestid');
+    expect(cmt.authenticator).toBeDefined();
+    expect(cmt.transactionData).toBeDefined();
+
+    // The async fire-and-forget submit may not have completed yet —
+    // wait a microtask tick.
+    await new Promise((r) => setTimeout(r, 10));
+
+    // submitTransferCommitment must have been called on the sender's
+    // behalf. This is the whole point of Option B.
+    expect(submitSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('falls back to empty commitmentJson when embedded authenticator is malformed', async () => {
+    // Make TransferCommitment.fromJSON throw on the embedded-auth path
+    // but succeed for everything else (the recovery flow validates the
+    // reconstructed commitment via fromJSON before storing).
+    const { TransferCommitment } = await import(
+      '@unicitylabs/state-transition-sdk/lib/transaction/TransferCommitment'
+    );
+    const fromJsonSpy = TransferCommitment.fromJSON as ReturnType<typeof vi.fn>;
+    fromJsonSpy.mockRejectedValueOnce(new Error('Invalid authenticator JSON'));
+
+    const sdkData = makeV6DirectReceiveWithEmbeddedAuth({ totally: 'garbage' });
+    const token: Token = {
+      id: GENESIS_TOKEN_ID,
+      coinId: 'UCT_HEX',
+      symbol: 'UCT',
+      amount: '100',
+      status: 'pending',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      sdkData,
+    };
+    internals(module).tokens.set(token.id, token);
+
+    const submitSpy = vi.fn();
+    (setup.deps.oracle.getStateTransitionClient as ReturnType<typeof vi.fn>).mockReturnValue({
+      submitTransferCommitment: submitSpy,
+    });
+
+    const recovered = await internals(module).recoverStrandedReceivedTokens();
+    expect(recovered).toBe(1);
+
+    const job = internals(module).proofPollingJobs.get(GENESIS_TOKEN_ID);
+    expect(job).toBeDefined();
+    // Falls back to the legacy getProof-only path.
+    expect(job?.commitmentJson).toBe('');
+
+    await new Promise((r) => setTimeout(r, 10));
+    // No re-submit when commitmentJson is empty.
+    expect(submitSpy).not.toHaveBeenCalled();
+  });
+
+  it('saveCommitmentOnlyToken embeds _wallet.authenticator in synthetic pending tx', async () => {
+    // Source token with 1 mint tx (proof set). saveCommitmentOnlyToken
+    // should append a synthetic pending tx carrying the commitment's
+    // transactionData AND `_wallet.authenticator`.
+    const sourceTokenObj = {
+      version: '2.0',
+      genesis: {
+        data: { tokenId: GENESIS_TOKEN_ID, tokenType: 'coinType', coinData: [['UCT_HEX', '100']] },
+        inclusionProof: { authenticator: { stateHash: 'genesisHash' } },
+      },
+      state: { data: '', predicate: `0000${SENDER_PUBKEY.toLowerCase()}0000` },
+      transactions: [
+        {
+          previousStateHash: 'h0',
+          newStateHash: STATE_HASH,
+          predicate: 'pred1',
+          inclusionProof: { authenticator: { stateHash: STATE_HASH } },
+          data: { recipient: { address: 'PROXY://intermediate', scheme: 'PROXY' } },
+        },
+      ],
+      _integrity: { genesisDataJSONHash: '0000' + '0'.repeat(60), currentStateHash: STATE_HASH },
+    };
+
+    // Commitment input mimicking what V6 receive paths produce — JSON
+    // with requestId, transactionData, authenticator.
+    const senderSignature = 'e'.repeat(128);
+    const commitmentInput = {
+      requestId: '00deadbeef00recovery00requestid',
+      transactionData: {
+        recipient: { address: OUR_DIRECT, scheme: 'DIRECT' },
+        salt: '0xff',
+        sourceState: { predicate: `0000${SENDER_PUBKEY.toLowerCase()}0000` },
+      },
+      authenticator: {
+        publicKey: SENDER_PUBKEY,
+        signature: senderSignature,
+        stateHash: STATE_HASH,
+      },
+    };
+
+    const savedToken = await internals(module).saveCommitmentOnlyToken(
+      sourceTokenObj,
+      commitmentInput,
+      SENDER_PUBKEY,
+      true, // deferPersistence
+      true, // skipGenesisDedup
+    );
+
+    expect(savedToken).not.toBeNull();
+    expect(savedToken!.sdkData).toBeTruthy();
+
+    const persisted = JSON.parse(savedToken!.sdkData!);
+    // 2 transactions now: original mint + synthetic pending.
+    expect(persisted.transactions).toHaveLength(2);
+    const pendingTx = persisted.transactions[1];
+    expect(pendingTx.inclusionProof).toBeNull();
+    expect(pendingTx.data).toEqual(commitmentInput.transactionData);
+    // The critical assertion: _wallet.authenticator survives onto disk.
+    expect(pendingTx._wallet).toBeDefined();
+    expect(pendingTx._wallet.authenticator).toEqual(commitmentInput.authenticator);
+  });
+
+  it('uses legacy empty-commitmentJson path when _wallet field is absent (backward compat)', async () => {
+    // Plain V6-direct receive WITHOUT _wallet.authenticator — the shape
+    // produced by old wallet versions that haven't been re-saved.
+    const sdkData = makeV6DirectReceiveSdkData();
+    const token: Token = {
+      id: GENESIS_TOKEN_ID,
+      coinId: 'UCT_HEX',
+      symbol: 'UCT',
+      amount: '100',
+      status: 'pending',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      sdkData,
+    };
+    internals(module).tokens.set(token.id, token);
+
+    const submitSpy = vi.fn();
+    (setup.deps.oracle.getStateTransitionClient as ReturnType<typeof vi.fn>).mockReturnValue({
+      submitTransferCommitment: submitSpy,
+    });
+
+    const recovered = await internals(module).recoverStrandedReceivedTokens();
+    expect(recovered).toBe(1);
+
+    const job = internals(module).proofPollingJobs.get(GENESIS_TOKEN_ID);
+    expect(job?.commitmentJson).toBe('');
+
+    await new Promise((r) => setTimeout(r, 10));
+    expect(submitSpy).not.toHaveBeenCalled();
   });
 });

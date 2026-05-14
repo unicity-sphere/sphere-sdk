@@ -4554,12 +4554,30 @@ export class PaymentsModule {
         ? rawSourceObj.transactions
         : [];
 
-      // Extract the commitment's transactionData. The commitment is
-      // either a parsed object or a JSON-ish object; the `transactionData`
-      // sub-object is what goes on-chain. We use it to synthesize a
-      // pending tx with `inclusionProof: null` so subsequent loads see
-      // a properly-shaped "transfer pending" token.
+      // Extract the commitment's transactionData AND authenticator. The
+      // commitment is either a parsed object or a JSON-ish object; the
+      // `transactionData` sub-object is what goes on-chain. We use it to
+      // synthesize a pending tx with `inclusionProof: null` so subsequent
+      // loads see a properly-shaped "transfer pending" token.
+      //
+      // Option B (token-local recovery state): we also embed the sender's
+      // `authenticator` under a wallet-internal `_wallet` field on the
+      // synthetic pending tx. The authenticator is the SENDER's signature
+      // over (transactionHash, sourceStateHash) — the aggregator verifies
+      // it without caring about the submitter's identity. Storing it
+      // alongside the transactionData lets the recipient re-submit the
+      // commitment after a wallet wipe + re-import-from-mnemonic, without
+      // any cooperation from the (possibly offline) sender. This closes
+      // the gap where proof-polling jobs (kept in a separate KV map, not
+      // in the IPFS-published TXF) get lost on profile recreation.
+      //
+      // `_wallet` is a non-SDK field; `normalizeSdkTokenToStorage` uses
+      // structuredClone, which preserves unknown fields. On finalize,
+      // `SdkToken.fromJSON` strips it (typed deserialization), and
+      // `finalizedSdkToken.toJSON()` writes the clean post-transition
+      // shape — so `_wallet` is naturally cleaned up.
       let pendingTxData: unknown = null;
+      let pendingAuthenticator: unknown = null;
       try {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const ci = commitmentInput as any;
@@ -4569,12 +4587,22 @@ export class PaymentsModule {
           } else if (ci.data !== undefined) {
             pendingTxData = ci.data;
           }
+          // Authenticator can come as plain JSON ({publicKey, signature,
+          // stateHash}) or as a class instance with toJSON(). Normalize to
+          // the JSON shape so the recovery path can pass it straight to
+          // `TransferCommitment.fromJSON({...})`.
+          if (ci.authenticator !== undefined && ci.authenticator !== null) {
+            const auth = ci.authenticator as { toJSON?: () => unknown };
+            pendingAuthenticator =
+              typeof auth.toJSON === 'function' ? auth.toJSON() : ci.authenticator;
+          }
         }
       } catch {
         // Best-effort — fall through. The token will still be saved
         // (without the synthetic pending tx) and finalization will
         // recover the state when the proof arrives in this session.
         pendingTxData = null;
+        pendingAuthenticator = null;
       }
 
       // Defensive: avoid double-appending. If the last existing tx already
@@ -4590,14 +4618,20 @@ export class PaymentsModule {
         (lastExistingTx.inclusionProof === null ||
           lastExistingTx.inclusionProof === undefined);
 
+      const syntheticPendingTx: Record<string, unknown> = {
+        data: pendingTxData,
+        inclusionProof: null,
+      };
+      if (pendingAuthenticator !== null) {
+        // Wallet-internal recovery state — Option B (token-local).
+        syntheticPendingTx._wallet = { authenticator: pendingAuthenticator };
+      }
+
       const augmentedSource =
         pendingTxData !== null && !lastExistingHasNullProof
           ? {
               ...rawSourceObj,
-              transactions: [
-                ...existingTxs,
-                { data: pendingTxData, inclusionProof: null },
-              ],
+              transactions: [...existingTxs, syntheticPendingTx],
             }
           : rawSourceObj;
 
@@ -6885,15 +6919,63 @@ export class PaymentsModule {
         };
         const sourceTokenJson = JSON.stringify(sourceTokenJsonObj);
 
-        // Register a proof-polling job. `commitmentJson` is empty — the
-        // polling queue's fallback uses `getProof(requestIdHex)` when no
-        // commitment is available (see #144 L3 patch to
-        // `processProofPollingQueue`).
+        // Option B (token-local recovery): if the synthetic pending tx
+        // carries a `_wallet.authenticator`, we can reconstruct a full
+        // `TransferCommitment` and re-submit it to the aggregator. The
+        // authenticator is the SENDER's signature — the aggregator
+        // verifies it without caring who submits. This closes the
+        // recovery gap where a sender's CLI exits before its
+        // fire-and-forget background submit completes: the recipient,
+        // after a profile wipe + re-import-from-mnemonic, can push the
+        // commitment on the sender's behalf.
+        //
+        // If the embedded authenticator is missing or fails to parse,
+        // fall back to the legacy `commitmentJson: ''` path — the
+        // polling queue's `getProof(requestIdHex)` fallback still works
+        // when the sender DID submit the commitment.
+        let recoveredCommitmentJson = '';
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const walletField = (lastTxJson as any)._wallet;
+        if (
+          walletField &&
+          typeof walletField === 'object' &&
+          walletField !== null &&
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (walletField as any).authenticator
+        ) {
+          try {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const authJson = (walletField as any).authenticator;
+            const commitmentObj = {
+              requestId: requestIdHex,
+              transactionData: lastTxJson.data,
+              authenticator: authJson,
+            };
+            // Validate via fromJSON to catch malformed authenticators
+            // now rather than at submit time.
+            await TransferCommitment.fromJSON(commitmentObj);
+            recoveredCommitmentJson = JSON.stringify(commitmentObj);
+            logger.debug(
+              'Payments',
+              `[V6-RECOVER] ${tokenId.slice(0, 12)}: extracted embedded authenticator — full commitment recovery enabled`,
+            );
+          } catch (cmtErr) {
+            logger.debug(
+              'Payments',
+              `[V6-RECOVER] ${tokenId.slice(0, 12)}: embedded authenticator invalid (${(cmtErr as Error)?.message ?? cmtErr}); falling back to getProof-only path`,
+            );
+          }
+        }
+
+        // Register a proof-polling job. When `commitmentJson` is set,
+        // the polling queue's `waitForProofSdk(commitment)` path is
+        // used; when empty, it falls back to `getProof(requestIdHex)`
+        // (#144 L3 path).
         const lastTxJsonSnapshot = JSON.parse(JSON.stringify(lastTxJson));
         this.proofPollingJobs.set(tokenId, {
           tokenId,
           requestIdHex,
-          commitmentJson: '',
+          commitmentJson: recoveredCommitmentJson,
           sourceTokenJson,
           startedAt: Date.now(),
           attemptCount: 0,
@@ -6906,10 +6988,43 @@ export class PaymentsModule {
             );
           },
         });
+
+        // If we have the full commitment, fire-and-forget submit so the
+        // aggregator processes it even if the original sender never did.
+        // The submit is idempotent on the aggregator side; the polling
+        // queue picks up the proof on its next tick.
+        if (recoveredCommitmentJson) {
+          const commitmentJsonForSubmit = recoveredCommitmentJson;
+          (async () => {
+            try {
+              const stClient = this.deps!.oracle.getStateTransitionClient?.() as
+                | StateTransitionClient
+                | undefined;
+              if (!stClient) return;
+              const commitment = await TransferCommitment.fromJSON(
+                JSON.parse(commitmentJsonForSubmit),
+              );
+              const response = await stClient.submitTransferCommitment(commitment);
+              logger.debug(
+                'Payments',
+                `[V6-RECOVER] ${tokenId.slice(0, 12)}: re-submitted sender's commitment, status=${(response as { status?: unknown })?.status ?? 'unknown'}`,
+              );
+            } catch (submitErr) {
+              // Non-fatal — the polling queue's getProof fallback still
+              // runs. The aggregator may already have the commitment
+              // from the sender's original submit attempt.
+              logger.debug(
+                'Payments',
+                `[V6-RECOVER] ${tokenId.slice(0, 12)}: commitment re-submit failed (${(submitErr as Error)?.message ?? submitErr}); polling queue will retry via getProof`,
+              );
+            }
+          })();
+        }
+
         recovered++;
         logger.debug(
           'Payments',
-          `[V6-RECOVER] Registered recovery job for stranded token ${tokenId.slice(0, 12)} (requestId=${requestIdHex.slice(0, 16)}...)`,
+          `[V6-RECOVER] Registered recovery job for stranded token ${tokenId.slice(0, 12)} (requestId=${requestIdHex.slice(0, 16)}..., commitmentRecovered=${recoveredCommitmentJson !== ''})`,
         );
       } catch (err) {
         logger.debug(
