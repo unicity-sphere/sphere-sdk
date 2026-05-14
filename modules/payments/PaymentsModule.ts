@@ -6300,9 +6300,47 @@ export class PaymentsModule {
         continue;
       }
 
-      // Some other shape we don't know about — count as still-pending.
-      logger.debug('Payments', `[V5-RESOLVE] ${tokenId.slice(0, 16)}: no pending finalization metadata, no recipient match — skipping`);
-      result.stillPending++;
+      // Local-finalize fallback for tokens whose state.predicate doesn't
+      // match our wallet AND whose last tx is a fully-proven transfer
+      // targeting us. These come from two scenarios:
+      //   1. Sender pre-finalized (e.g., faucet shipped `{sourceToken,
+      //      transferTx}` with proof) but our receive path's finalize
+      //      threw — saved as status='pending' by the path C / D fix.
+      //   2. Profile recovery from a CAR published by another device
+      //      that contained un-finalized pending tokens — we now have
+      //      the proven transfer tx on disk but state.predicate is
+      //      still the sender's. We must apply the transition locally
+      //      to update state.predicate to ours.
+      // The transition is offline (the proof is already there). We just
+      // need to call `stClient.finalizeTransaction(sourceToken, ourState,
+      // transferTx, nametagTokens)` to construct the post-transition
+      // token. On success, persist the new sdkData with status='confirmed';
+      // on failure, leave the token unchanged and report stillPending so
+      // the next periodic retry can try again.
+      const localFinalizeResult = await this.tryLocalFinalizeUnconfirmed(
+        tokenId,
+        token,
+        stClient,
+        trustBase,
+      );
+      if (localFinalizeResult === 'resolved') {
+        result.details.push({ tokenId, stage: 'local_finalize', status: 'resolved' });
+        result.resolved++;
+        continue;
+      } else if (localFinalizeResult === 'failed') {
+        result.details.push({ tokenId, stage: 'local_finalize', status: 'failed' });
+        result.failed++;
+        continue;
+      } else if (localFinalizeResult === 'skipped') {
+        // Some other shape we don't know about — count as still-pending.
+        logger.debug('Payments', `[V5-RESOLVE] ${tokenId.slice(0, 16)}: no pending finalization metadata, no recipient match — skipping`);
+        result.stillPending++;
+      } else {
+        // 'stillPending' — local finalize didn't apply (no recipient
+        // match or no proof yet), but the token is legitimately pending.
+        result.details.push({ tokenId, stage: 'local_finalize', status: 'pending' });
+        result.stillPending++;
+      }
     }
 
     // Always save when any token was processed — this persists intermediate
@@ -6994,6 +7032,176 @@ export class PaymentsModule {
    *   - 'stillPending' when proof not ready yet (or no persisted job)
    *   - 'failed' on hard finalize errors
    */
+  /**
+   * Try to apply a pending transfer transition locally. Used by
+   * `resolveUnconfirmed` to recover tokens whose state.predicate is the
+   * sender's (un-finalized) but whose on-disk last transaction is a
+   * fully-proven transfer targeting our wallet.
+   *
+   * Returns:
+   *   - `'resolved'`   — local finalization succeeded; sdkData and status
+   *                      were updated; the token now has our predicate.
+   *   - `'failed'`     — finalization threw a hard error (e.g. PROXY
+   *                      address mismatch); the token is unchanged.
+   *   - `'stillPending'` — last tx has null/missing inclusionProof (a
+   *                      genuine pending state — wait for the proof to
+   *                      arrive). Token unchanged.
+   *   - `'skipped'`    — token shape doesn't qualify for local finalize
+   *                      (no transactions, no sourceState, predicate
+   *                      already matches our signing key, etc.).
+   */
+  private async tryLocalFinalizeUnconfirmed(
+    tokenId: string,
+    token: Token,
+    stClient: StateTransitionClient,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    trustBase: any,
+  ): Promise<'resolved' | 'failed' | 'stillPending' | 'skipped'> {
+    if (!token.sdkData) return 'skipped';
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let tokenJson: any;
+    try {
+      tokenJson = JSON.parse(token.sdkData);
+    } catch {
+      return 'skipped';
+    }
+    const txs: unknown[] = Array.isArray(tokenJson?.transactions)
+      ? tokenJson.transactions
+      : [];
+    if (txs.length === 0) return 'skipped';
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const lastTxJson: any = txs[txs.length - 1];
+    if (!lastTxJson || typeof lastTxJson !== 'object') return 'skipped';
+
+    // Canonical default: missing inclusionProof === null.
+    const lastTxProof =
+      lastTxJson.inclusionProof === undefined ? null : lastTxJson.inclusionProof;
+    if (lastTxProof === null) {
+      // Genuinely pending — wait for proof to land via the proof-polling
+      // queue. Not our case to fix.
+      return 'stillPending';
+    }
+
+    // Source state at N-1 lives inside the last transfer tx's data.
+    const sourceStateJson = lastTxJson.data?.sourceState;
+    if (!sourceStateJson) return 'skipped';
+
+    // Quick check: does the current state.predicate already match our
+    // signing key? If yes, we're already finalized — no work needed.
+    const ourSigningPk = this._signingPublicKeyHex;
+    const currentStatePredicate = tokenJson?.state?.predicate;
+    if (
+      ourSigningPk !== null &&
+      typeof currentStatePredicate === 'string' &&
+      currentStatePredicate.toLowerCase().includes(ourSigningPk)
+    ) {
+      return 'skipped';
+    }
+
+    // **Critical**: predicate mismatch alone is NOT a signal that the
+    // token is "meant for us". A token whose state.predicate doesn't
+    // match our wallet could be:
+    //   (a) meant for us but un-finalized (the case we want to fix), OR
+    //   (b) meant for someone else (in which case applying our predicate
+    //       would corrupt the chain and the SDK would reject it
+    //       downstream, but only after on-chain side-effects).
+    // Distinguish by inspecting the transfer transaction's
+    // `data.recipient.address` — only proceed when it matches one of
+    // OUR destination addresses:
+    //   - identity.directAddress (DIRECT:// scheme), OR
+    //   - any PROXY:// derived from a nametag we hold (handled via
+    //     `proxyAddressCache`, primed at load time from `this.nametags`).
+    const recipientAddr: unknown = lastTxJson.data?.recipient?.address;
+    if (typeof recipientAddr !== 'string' || recipientAddr.length === 0) {
+      return 'skipped';
+    }
+    const ourDirect = this.deps!.identity.directAddress;
+    const isOurDirect =
+      typeof ourDirect === 'string' && recipientAddr === ourDirect;
+    const isOurProxy =
+      recipientAddr.startsWith('PROXY://') &&
+      this.proxyAddressCache.has(recipientAddr);
+    if (!isOurDirect && !isOurProxy) {
+      // Not addressed to us — don't try to finalize it. Could be a
+      // token someone else's bundle smuggled past dedup, or a token we
+      // accidentally retain from a prior identity (unlikely but
+      // defensive). Skip silently.
+      return 'skipped';
+    }
+
+    // Reconstruct sourceToken at state N-1.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let sourceToken: SdkToken<any>;
+    let transferTx: TransferTransaction;
+    try {
+      const sourceTokenJson = {
+        ...tokenJson,
+        state: sourceStateJson,
+        transactions: txs.slice(0, -1),
+      };
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      sourceToken = await SdkToken.fromJSON(sourceTokenJson) as SdkToken<any>;
+      transferTx = await TransferTransaction.fromJSON(lastTxJson);
+    } catch (err) {
+      logger.debug(
+        'Payments',
+        `[LOCAL-FINALIZE] ${tokenId.slice(0, 16)}: parse failed (${err instanceof Error ? err.message : String(err)})`,
+      );
+      return 'skipped';
+    }
+
+    try {
+      const finalizedToken = await this.finalizeTransferToken(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        sourceToken as any,
+        transferTx,
+        stClient,
+        trustBase,
+      );
+      const finalizedSdkData = JSON.stringify(finalizedToken.toJSON());
+      const updatedToken: Token = {
+        ...token,
+        status: 'confirmed',
+        updatedAt: Date.now(),
+        sdkData: finalizedSdkData,
+      };
+      this.tokens.set(tokenId, updatedToken);
+
+      // Rebuild parsed-cache entry so the spend planner sees the new
+      // confirmed balance immediately.
+      try {
+        const amount = this.extractCoinAmountForCache(
+          finalizedToken,
+          token.coinId,
+        );
+        if (amount > 0n) {
+          this.parsedTokenCache.set(tokenId, {
+            token: updatedToken,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            sdkToken: finalizedToken as any,
+            amount,
+          });
+          this.spendQueue.notifyChange(token.coinId);
+        }
+      } catch {
+        // Non-fatal — the next reload rebuilds the cache.
+      }
+
+      logger.debug(
+        'Payments',
+        `[LOCAL-FINALIZE] ${tokenId.slice(0, 16)}: SUCCESS — state.predicate flipped to recipient`,
+      );
+      return 'resolved';
+    } catch (err) {
+      logger.debug(
+        'Payments',
+        `[LOCAL-FINALIZE] ${tokenId.slice(0, 16)}: finalize threw (${err instanceof Error ? err.message : String(err)}) — staying pending for retry`,
+      );
+      return 'failed';
+    }
+  }
+
   private async resolveLegacyReceivedToken(
     tokenId: string,
     _token: Token,
@@ -8536,13 +8744,30 @@ export class PaymentsModule {
           const pendingAtFlush = Array.from(this.tokens.values()).filter(
             (t) => t.status === 'submitted' || t.status === 'pending',
           ).length;
-          if (!options?.forceFlushOnDrainTimeout) {
-            // Skip the flush — publishing now would produce a partial CAR
-            // that drops the still-pending tokens, which is exactly the
-            // data-loss bug this fix exists to prevent.
+          // DEFAULT-FLUSH (per user requirement): we MUST publish
+          // unconfirmed tokens to IPFS so that on profile loss,
+          // recovery picks them up and the load-time
+          // `tryLocalFinalizeUnconfirmed` flow attempts re-finalization.
+          // Previously this defaulted to "skip flush to avoid partial
+          // CAR" — but that left unfinalized tokens un-recoverable
+          // (Nostr-only delivery, so a wipe + re-import after the
+          // sender's outbox aged out lost the funds entirely).
+          //
+          // Opt OUT explicitly via `forceFlushOnDrainTimeout: false`
+          // when the caller wants the pre-existing skip-flush
+          // behaviour (e.g. test scenarios that depend on
+          // determinism). The default is to publish — tokens that
+          // are still pending land in the CAR with their current
+          // sdkData (sender's state.predicate). The recipient device
+          // (or a recovered profile) then runs
+          // `tryLocalFinalizeUnconfirmed` to apply the transition
+          // locally using the on-disk proof, flipping state.predicate
+          // to its own signing key.
+          const forceFlush = options?.forceFlushOnDrainTimeout ?? true;
+          if (!forceFlush) {
             logger.warn(
               'Payments',
-              `sync: drain timed out with ${pendingAtFlush} token(s) still pending V5 finalization — skipping flush to avoid partial CAR. Retry sync() once finalization completes, or pass forceFlushOnDrainTimeout:true to publish anyway.`,
+              `sync: drain timed out with ${pendingAtFlush} token(s) still pending V5 finalization — skipping flush (forceFlushOnDrainTimeout=false) to avoid partial CAR. Retry sync() once finalization completes.`,
             );
             this.deps!.emitEvent('sync:completed', {
               source: 'payments',
@@ -8552,7 +8777,7 @@ export class PaymentsModule {
           }
           logger.warn(
             'Payments',
-            `sync: drain timed out with ${pendingAtFlush} token(s) still pending V5 finalization — flushing anyway (forceFlushOnDrainTimeout=true). Pending tokens will be silently dropped from the published CAR.`,
+            `sync: drain timed out with ${pendingAtFlush} token(s) still pending V5 finalization — flushing anyway (default: publish unfinalized state for recovery). The recipient/recovered profile will re-attempt local finalization on load.`,
           );
         }
       }

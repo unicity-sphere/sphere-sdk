@@ -319,7 +319,13 @@ describe('PaymentsModule.sync() — pre-flush V5-finalization drain', () => {
   });
 
   describe('drain times out', () => {
-    it('skips flush by default when pending tokens remain (no partial CAR)', async () => {
+    // Post-fix: default behavior is to FLUSH unfinalized tokens to IPFS
+    // (forceFlushOnDrainTimeout defaults to true). The previous "skip
+    // flush to avoid partial CAR" behavior left pending tokens un-
+    // recoverable on profile loss — see the load-time
+    // `tryLocalFinalizeUnconfirmed` recovery path which re-applies the
+    // transition locally on the recipient/recovered side.
+    it('flushes by default when pending tokens remain (publishes unfinalized state for recovery)', async () => {
       const setup = createMockDeps({ withOracle: true, withProvider: true });
       module.initialize(setup.deps);
       mocks = setup.mocks;
@@ -340,14 +346,17 @@ describe('PaymentsModule.sync() — pre-flush V5-finalization drain', () => {
         drainTimeoutMs: 25, // tight budget — drain will time out
       });
 
-      expect(mocks.syncSpy).not.toHaveBeenCalled();   // flush skipped
-      expect(result.drainTimedOut).toBe(true);
+      // Flush proceeds by default so the pending token is published.
+      expect(mocks.syncSpy).toHaveBeenCalled();
+      // `drainTimedOut` is NOT set when we proceed with the flush
+      // (matches the legacy `forceFlushOnDrainTimeout=true` shape).
+      expect(result.drainTimedOut).toBeUndefined();
+      // `pendingAtFlush` surfaces so callers can observe the partial-CAR
+      // risk and decide whether to act on it (e.g. for ops dashboards).
       expect(result.pendingAtFlush).toBe(1);
-      expect(result.added).toBe(0);
-      expect(result.removed).toBe(0);
     });
 
-    it('flushes anyway when forceFlushOnDrainTimeout=true (legacy escape hatch)', async () => {
+    it('skips flush when forceFlushOnDrainTimeout=false (opt-in legacy behavior)', async () => {
       const setup = createMockDeps({ withOracle: true, withProvider: true });
       module.initialize(setup.deps);
       mocks = setup.mocks;
@@ -365,12 +374,14 @@ describe('PaymentsModule.sync() — pre-flush V5-finalization drain', () => {
       const result = await module.sync({
         drainPollIntervalMs: 1,
         drainTimeoutMs: 25,
-        forceFlushOnDrainTimeout: true,
+        forceFlushOnDrainTimeout: false, // explicit opt-out of default flush
       });
 
-      expect(mocks.syncSpy).toHaveBeenCalled();      // flush proceeded
-      expect(result.drainTimedOut).toBeUndefined();  // not set when force flushing
-      expect(result.pendingAtFlush).toBe(1);         // partial-CAR risk surfaced
+      expect(mocks.syncSpy).not.toHaveBeenCalled();   // flush skipped
+      expect(result.drainTimedOut).toBe(true);
+      expect(result.pendingAtFlush).toBe(1);
+      expect(result.added).toBe(0);
+      expect(result.removed).toBe(0);
     });
   });
 
