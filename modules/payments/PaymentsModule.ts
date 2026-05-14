@@ -1283,6 +1283,15 @@ export class PaymentsModule {
 
   // NOSTR-FIRST proof polling (background proof verification)
   private proofPollingJobs: Map<string, ProofPollingJob> = new Map();
+  /**
+   * Lowercase hex of the signing-service publicKey used by
+   * `UnmaskedPredicate.create` / `MaskedPredicate.create`. Lazily
+   * populated by `createSigningService()` on first call; consumed
+   * synchronously by `latestStatePredicateMatchesWallet` (PR #146's
+   * balance-model invariant) so the check can run on every reload
+   * without re-deriving the signing service.
+   */
+  private _signingPublicKeyHex: string | null = null;
   private proofPollingInterval: ReturnType<typeof setInterval> | null = null;
   private static readonly PROOF_POLLING_INTERVAL_MS = 2000;  // Poll every 2s
   private static readonly PROOF_POLLING_MAX_ATTEMPTS = 30;   // Max 30 attempts (~60s)
@@ -2049,8 +2058,6 @@ export class PaymentsModule {
                   { tokenId: tokenRoot.tokenId.slice(0, 16), err: finalizeErr },
                 );
                 tokenData = assembledJson;
-                // Re-derive proof status of the assembled fallback —
-                // missing field treated as null per canonical default.
                 if (hasNullProof) {
                   tokenStatus = 'pending';
                 }
@@ -2596,6 +2603,25 @@ export class PaymentsModule {
       // Ensure token registry has loaded metadata (symbol, name, decimals)
       // before parsing tokens — otherwise tokens get fallback truncated coinId values
       await TokenRegistry.waitForReady();
+
+      // Prime the signing-public-key cache BEFORE `loadFromStorageData`
+      // runs PR #146's balance-model invariant via
+      // `latestStatePredicateMatchesWallet`. Without this prime, the
+      // invariant falls back to comparing predicate bytes against
+      // `identity.chainPubkey` — and for wallets whose signing pubkey
+      // differs from chainPubkey (e.g. derivation path or curve
+      // mappings), the comparison always returns false and every
+      // received token gets archived. Best-effort: a throw here only
+      // means the invariant uses the chainPubkey fallback. The cache
+      // is populated as a side-effect of `createSigningService()`.
+      try {
+        await this.createSigningService();
+      } catch (err) {
+        logger.debug(
+          'Payments',
+          `[load] signing-pubkey prime failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
 
       // Load metadata from TokenStorageProviders (archived, tombstones, forked)
       // Active tokens are NOT stored in TXF - they are loaded from token-xxx files
@@ -6695,7 +6721,22 @@ export class PaymentsModule {
    * Conservative implementation: if we can't determine ownership with
    * confidence, return `true` (keep the token visible). Only return
    * `false` for the unambiguous case where the latest state's encoded
-   * publicKey differs from our wallet's chainPubkey.
+   * publicKey differs from our wallet's signing key.
+   *
+   * **Critical**: this check compares against the wallet's SIGNING-SERVICE
+   * publicKey (the key used by `UnmaskedPredicate.create` /
+   * `MaskedPredicate.create` to embed in predicate bytes), NOT the
+   * wallet's chainPubkey. Pre-fix this used `identity.chainPubkey`; for
+   * wallets where those two keys differ (e.g. different HD-derivation
+   * paths or curve mappings), the check always returned false and PR
+   * #146's balance-model invariant archived every received token —
+   * faucet receives became invisible after the first CLI exit despite
+   * the on-disk state.predicate actually encoding our signing pubkey.
+   *
+   * The signing pubkey is cached lazily on first call via
+   * `_signingPublicKeyHex`; subsequent calls are pure-sync. The cache
+   * is invalidated by `clear()` (which sets `this.deps = null`); a new
+   * wallet identity always starts with an empty cache.
    */
   private latestStatePredicateMatchesWallet(token: Token): boolean {
     if (!token.sdkData) return true;
@@ -6708,20 +6749,24 @@ export class PaymentsModule {
     const predicate = parsed?.state?.predicate;
     if (!predicate) return true;
 
-    // Predicate encoding may be CBOR-hex (UnmaskedPredicate) or a JSON
-    // object. We can't reliably hash-compare without spinning up the SDK
-    // — instead, look for our chainPubkey as a substring within a hex-
-    // encoded predicate. False positives would only happen if our pubkey
-    // appears coincidentally in someone else's predicate; for production
-    // wallets this is acceptable for the load-time invariant.
-    const ourPubkey = this.deps!.identity.chainPubkey?.toLowerCase();
-    if (!ourPubkey) return true;
+    // Use the cached signing-service pubkey when available. Fallback to
+    // identity.chainPubkey when the signing pubkey hasn't been resolved
+    // yet (only happens at first load, before any send/receive has run
+    // — in that window we err on the side of "keep visible").
+    const signingPubkey = this._signingPublicKeyHex;
+    const chainPubkey = this.deps!.identity.chainPubkey?.toLowerCase();
+    const candidates = [signingPubkey, chainPubkey].filter(
+      (k): k is string => typeof k === 'string' && k.length > 0,
+    );
+    if (candidates.length === 0) return true;
 
     if (typeof predicate === 'string') {
-      return predicate.toLowerCase().includes(ourPubkey);
+      const predLower = predicate.toLowerCase();
+      return candidates.some((k) => predLower.includes(k));
     }
     if (typeof predicate === 'object' && typeof predicate.publicKey === 'string') {
-      return predicate.publicKey.toLowerCase() === ourPubkey;
+      const pkLower = predicate.publicKey.toLowerCase();
+      return candidates.some((k) => pkLower === k);
     }
     return true;
   }
@@ -11124,7 +11169,27 @@ export class PaymentsModule {
   private async createSigningService(): Promise<SigningService> {
     const privateKeyHex = this.deps!.identity.privateKey;
     const privateKeyBytes = fromHex(privateKeyHex);
-    return SigningService.createFromSecret(privateKeyBytes);
+    const signingService = await SigningService.createFromSecret(privateKeyBytes);
+    // Side-effect: cache `signingService.publicKey` as lowercase hex so
+    // the synchronous `latestStatePredicateMatchesWallet` (called by the
+    // PR #146 balance-model invariant in `loadFromStorageData`) can run
+    // without async work. The cache is invalidated by `clear()` /
+    // identity reset. See `_signingPublicKeyHex` field doc.
+    if (this._signingPublicKeyHex === null) {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const pkBytes = (signingService as any).publicKey;
+        if (pkBytes instanceof Uint8Array) {
+          this._signingPublicKeyHex = Array.from(pkBytes)
+            .map((b) => b.toString(16).padStart(2, '0'))
+            .join('');
+        }
+      } catch {
+        // Best-effort. The fallback in latestStatePredicateMatchesWallet
+        // uses identity.chainPubkey when this cache stays null.
+      }
+    }
+    return signingService;
   }
 
   /**
@@ -11617,6 +11682,12 @@ export class PaymentsModule {
       let tokenData: unknown;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       let finalizedSdkToken: SdkToken<any> | null = null;
+      // D1 — Track the post-receive status. Defaults to 'confirmed'; the
+      // SDK-format path below downgrades to 'pending' when local
+      // finalization isn't possible (no proof yet, or finalize throws),
+      // so the recovery flow can retry and the balance-model invariant
+      // doesn't archive a not-yet-finalized token.
+      let receiveStatus: Token['status'] = 'confirmed';
 
       if (payload.sourceToken && payload.transferTx) {
         // Sphere wallet format - needs finalization for PROXY addresses
@@ -11720,8 +11791,138 @@ export class PaymentsModule {
           return;
         }
       } else if (payload.token) {
-        // SDK format
-        tokenData = payload.token;
+        // SDK format `{ token, proof? }`. The sender shipped a token JSON.
+        //
+        // D1 fix (faucet finalization-plan regression). Pre-fix, this path
+        // took `payload.token` AS-IS and saved with `status: 'confirmed'`.
+        // Producers (faucets and external services) often ship a token
+        // whose `state.predicate` still reflects the SENDER's state — they
+        // never ran the local `Token.update(...)` that flips ownership to
+        // the recipient. Post-PR-#146, such tokens are correctly archived
+        // by the balance-model invariant ("state.predicate isn't ours +
+        // no finalization plan = move to archive"), making faucet-received
+        // tokens invisible to `payments balance`.
+        //
+        // The fix: inspect the token JSON. If the last transaction is a
+        // transfer with an inclusion proof but the local `state.predicate`
+        // doesn't reflect our ownership, reconstruct the source token at
+        // state N-1 and call `finalizeTransferToken(...)` to produce a
+        // token JSON with OUR predicate. Fall back to the as-is path when
+        // local finalization can't run (no last tx, no source state in
+        // the tx data, no stClient/trustBase, or finalize throws); in
+        // that case we additionally classify status='pending' so the
+        // recovery flow (`isReceivedLegacyPending` →
+        // `recoverStrandedReceivedTokens`) can re-attempt later.
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const tokenJson: any =
+            typeof payload.token === 'string'
+              ? JSON.parse(payload.token as string)
+              : payload.token;
+          const txs: unknown[] = Array.isArray(tokenJson?.transactions)
+            ? tokenJson.transactions
+            : [];
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const lastTxJson: any = txs.length > 0 ? txs[txs.length - 1] : null;
+          // Canonical default: missing inclusionProof === null.
+          const lastTxProof =
+            lastTxJson === null
+              ? null
+              : lastTxJson.inclusionProof === undefined
+                ? null
+                : lastTxJson.inclusionProof;
+          const lastTxData = lastTxJson?.data;
+          const sourceStateJson = lastTxData?.sourceState;
+          const stClient = this.deps!.oracle.getStateTransitionClient?.() as
+            | StateTransitionClient
+            | undefined;
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const trustBase = (this.deps!.oracle as any).getTrustBase?.();
+
+          // Heuristic for "needs local finalization": there IS a last
+          // transaction, that tx is a transfer (has `data.sourceState`),
+          // and the proof is set. If the proof is null/missing, fall
+          // through to the as-is path with status='pending' — the
+          // recovery flow will retry once the proof lands.
+          const canTryFinalize =
+            lastTxJson !== null &&
+            lastTxProof !== null &&
+            sourceStateJson !== undefined &&
+            stClient !== undefined &&
+            trustBase !== undefined &&
+            lastTxData !== null &&
+            lastTxData !== undefined;
+
+          if (canTryFinalize) {
+            // Quick check: does the token's current state already match
+            // our predicate? If yes, no finalization is needed.
+            const ourPubkey = this.deps!.identity.chainPubkey?.toLowerCase() ?? '';
+            const currentStatePredicate = tokenJson?.state?.predicate;
+            const predicateAlreadyOurs =
+              typeof currentStatePredicate === 'string' &&
+              ourPubkey.length > 0 &&
+              currentStatePredicate.toLowerCase().includes(ourPubkey);
+
+            if (predicateAlreadyOurs) {
+              tokenData = tokenJson;
+            } else {
+              // Reconstruct source token at state N-1: same genesis +
+              // nametags + version, but `state` is the last-tx
+              // sourceState and `transactions` is all-but-last.
+              const sourceTokenJson = {
+                ...tokenJson,
+                state: sourceStateJson,
+                transactions: txs.slice(0, -1),
+              };
+              try {
+                const sourceToken = await SdkToken.fromJSON(sourceTokenJson);
+                const transferTx = await TransferTransaction.fromJSON(lastTxJson);
+                const finalizedToken = await this.finalizeTransferToken(
+                  sourceToken,
+                  transferTx,
+                  stClient!,
+                  trustBase,
+                );
+                tokenData = finalizedToken.toJSON();
+                logger.debug(
+                  'Payments',
+                  'SDK-format local finalization succeeded — state.predicate flipped to recipient',
+                );
+              } catch (finalizeErr) {
+                // Local finalization failed. Save the token as-is but
+                // mark pending so the balance-model invariant doesn't
+                // archive it and the recovery flow can retry.
+                logger.warn(
+                  'Payments',
+                  `SDK-format local finalization failed (${
+                    finalizeErr instanceof Error ? finalizeErr.message : String(finalizeErr)
+                  }) — saving as-is with status='pending' for recovery`,
+                );
+                tokenData = tokenJson;
+                receiveStatus = 'pending';
+              }
+            }
+          } else {
+            // Either no transactions (fresh mint), no sourceState in last
+            // tx, no stClient/trustBase, or null proof. Save as-is and
+            // mark pending if the proof is null/missing — the recovery
+            // flow needs to know finalization is pending. For fresh mints
+            // (no txs) or missing-sourceState shapes we preserve the
+            // previous status='confirmed' default.
+            tokenData = tokenJson;
+            if (txs.length > 0 && lastTxProof === null) {
+              receiveStatus = 'pending';
+            }
+          }
+        } catch (parseErr) {
+          logger.warn(
+            'Payments',
+            `SDK-format payload.token parse failed (${
+              parseErr instanceof Error ? parseErr.message : String(parseErr)
+            }) — falling back to as-is`,
+          );
+          tokenData = payload.token;
+        }
       } else {
         logger.warn('Payments', 'Unknown transfer payload format');
         return;
@@ -11737,7 +11938,6 @@ export class PaymentsModule {
       // Parse token info from SDK data
       const tokenInfo = await parseTokenInfo(tokenData);
 
-      // Create token entry
       const token: Token = {
         id: tokenInfo.tokenId ?? crypto.randomUUID(),
         coinId: tokenInfo.coinId,
@@ -11746,7 +11946,7 @@ export class PaymentsModule {
         decimals: tokenInfo.decimals,
         iconUrl: tokenInfo.iconUrl,
         amount: tokenInfo.amount,
-        status: 'confirmed',
+        status: receiveStatus,
         createdAt: Date.now(),
         updatedAt: Date.now(),
         sdkData: typeof tokenData === 'string'
