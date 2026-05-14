@@ -327,12 +327,29 @@ export interface ImportTokensResult {
 
 /**
  * Compute a dedup key for a history entry.
- * - SENT + transferId → groups multi-token sends into a single entry
+ * - SENT + transferId + coinId → one entry per coin per transfer (#149 multi-coin follow-up)
+ * - SENT + transferId         → one entry per transfer (legacy / single-coin / coinId unknown)
  * - type + tokenId → one entry per token per direction
  * - fallback → UUID (no dedup possible)
+ *
+ * The coinId discriminator was added so multi-coin UXF sends produce one
+ * SENT row per coin instead of clobbering all but the primary. Existing
+ * single-coin entries in storage keep their legacy dedupKey; new entries
+ * (post-fix) include the coinId suffix. The two formats are orthogonal
+ * — they never collide for the same logical transfer because the
+ * transferId is a fresh UUID per send.
  */
-function computeHistoryDedupKey(type: string, tokenId?: string, transferId?: string): string {
-  if (type === 'SENT' && transferId) return `${type}_transfer_${transferId}`;
+function computeHistoryDedupKey(
+  type: string,
+  tokenId?: string,
+  transferId?: string,
+  coinId?: string,
+): string {
+  if (type === 'SENT' && transferId) {
+    return coinId
+      ? `${type}_transfer_${transferId}_${coinId}`
+      : `${type}_transfer_${transferId}`;
+  }
   if (tokenId) return `${type}_${tokenId}`;
   return `${type}_${crypto.randomUUID()}`;
 }
@@ -8254,7 +8271,12 @@ export class PaymentsModule {
   async addToHistory(entry: Omit<TransactionHistoryEntry, 'id' | 'dedupKey'>): Promise<void> {
     this.ensureInitialized();
 
-    const dedupKey = computeHistoryDedupKey(entry.type, entry.tokenId, entry.transferId);
+    const dedupKey = computeHistoryDedupKey(
+      entry.type,
+      entry.tokenId,
+      entry.transferId,
+      entry.coinId,
+    );
     const historyEntry: TransactionHistoryEntry = {
       id: crypto.randomUUID(),
       dedupKey,
@@ -8296,7 +8318,9 @@ export class PaymentsModule {
           // Ensure legacy entries have dedupKeys for import
           const records = legacyEntries.map(e => ({
             ...e,
-            dedupKey: e.dedupKey || computeHistoryDedupKey(e.type, e.tokenId, e.transferId),
+            dedupKey:
+              e.dedupKey ||
+              computeHistoryDedupKey(e.type, e.tokenId, e.transferId, e.coinId),
           }));
           const imported = await provider.importHistoryEntries?.(records) ?? 0;
           if (imported > 0) {
@@ -9436,6 +9460,125 @@ export class PaymentsModule {
   }
 
   // ===========================================================================
+  // SENT history recording (shared by both UXF dispatchers)
+  // ===========================================================================
+
+  /**
+   * Record SENT history entries for a UXF bundle, one per coin involved.
+   *
+   * #149 multi-coin follow-up: pre-fix, the UXF dispatchers wrote a single
+   * SENT history entry tagged with the primary coin only — any additional
+   * coins shipped in the same bundle silently disappeared from history.
+   * This helper emits one entry per coin (primary + each additionalAssets
+   * coin), each tagged with that coin's id/symbol/amount and the
+   * per-coin tokenIds breakdown.
+   *
+   * `result.tokens` carries the consumed source tokens (with their
+   * pre-burn `coinId`); `result.tokenTransfers` enumerates per-source
+   * commits (`split` or `direct`). We pivot tokenTransfers by source
+   * coinId to populate each entry's `tokenIds` array.
+   *
+   * NFT additional assets are intentionally skipped — they're whole-token
+   * transfers (no fungible amount) and need separate history schema work;
+   * tracked as a follow-up.
+   *
+   * Failure handling: storage I/O hiccup must not turn a successful send
+   * into a thrown error. Each entry is wrapped in its own try/catch so
+   * one bad write can't drop the rest.
+   */
+  private async recordUxfBundleSentHistory(args: {
+    originalRequest: TransferRequest;
+    request: LegacyCoinTransferRequest;
+    result: TransferResult;
+    peerInfo: PeerInfo | null;
+    recipientPubkey: string;
+    recipientAddress: { toString(): string };
+    diagLabel: string;
+  }): Promise<void> {
+    const {
+      originalRequest,
+      request,
+      result,
+      peerInfo,
+      recipientPubkey,
+      recipientAddress,
+      diagLabel,
+    } = args;
+
+    const recipientNametag =
+      peerInfo?.nametag ??
+      (originalRequest.recipient.startsWith('@')
+        ? originalRequest.recipient.slice(1)
+        : undefined);
+
+    // Pivot tokenTransfers by source coinId. result.tokens carries the
+    // consumed source tokens (post-removal from in-memory map, but still
+    // present on the result). For each source, look up its pre-burn
+    // coinId and amount.
+    const tokenMap = new Map(result.tokens.map((t) => [t.id, t]));
+    const perCoinTokenIds = new Map<
+      string,
+      Array<{ id: string; amount: string; source: 'split' | 'direct' }>
+    >();
+    for (const tt of result.tokenTransfers) {
+      const tok = tokenMap.get(tt.sourceTokenId);
+      if (!tok) continue;
+      const list = perCoinTokenIds.get(tok.coinId) ?? [];
+      list.push({
+        id: tt.sourceTokenId,
+        amount: tok.amount,
+        source: tt.method === 'split' ? 'split' : 'direct',
+      });
+      perCoinTokenIds.set(tok.coinId, list);
+    }
+
+    // Build the per-coin summary list. Primary slot first; then each
+    // additionalAssets coin entry preserving caller order. NFT
+    // additionals are excluded (whole-token, no amount slot).
+    type CoinSummary = { coinId: string; amount: string };
+    const summaries: CoinSummary[] = [
+      { coinId: request.coinId, amount: request.amount },
+    ];
+    for (const asset of originalRequest.additionalAssets ?? []) {
+      if (asset.kind !== 'coin') continue;
+      summaries.push({ coinId: asset.coinId, amount: asset.amount });
+    }
+
+    const recipientAddressStr =
+      peerInfo?.directAddress ?? recipientAddress.toString() ?? recipientPubkey;
+
+    const baseTimestamp = Date.now();
+    for (const summary of summaries) {
+      const tokenIds = perCoinTokenIds.get(summary.coinId) ?? [];
+      const firstTokenId = tokenIds[0]?.id;
+      try {
+        await this.addToHistory({
+          type: 'SENT',
+          amount: summary.amount,
+          coinId: summary.coinId,
+          symbol: this.getCoinSymbol(summary.coinId),
+          timestamp: baseTimestamp,
+          recipientPubkey,
+          ...(recipientNametag !== undefined ? { recipientNametag } : {}),
+          recipientAddress: recipientAddressStr,
+          ...(request.memo !== undefined ? { memo: request.memo } : {}),
+          transferId: result.id,
+          ...(firstTokenId !== undefined ? { tokenId: firstTokenId } : {}),
+          ...(tokenIds.length > 0 ? { tokenIds } : {}),
+        });
+      } catch (err) {
+        logger.warn(
+          'Payments',
+          `${diagLabel}: failed to record SENT history for coin=${summary.coinId.slice(
+            0,
+            16,
+          )} (send already succeeded): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+  }
+
+  // ===========================================================================
   // T.2.D.1 — UXF conservative-mode dispatcher
   // ===========================================================================
 
@@ -10059,52 +10202,20 @@ export class PaymentsModule {
       throw err;
     }
 
-    // #143 UXF — record SENT history after the bundle is durably published.
-    // Conservative dispatcher already removes source tokens inside
-    // commitSources (line ~8528); only the history entry is missing.
-    // Swallow-and-log on failure so a history I/O hiccup does not flip a
-    // successful send into a thrown error.
-    try {
-      const recipientNametag =
-        peerInfo?.nametag ??
-        (originalRequest.recipient.startsWith('@')
-          ? originalRequest.recipient.slice(1)
-          : undefined);
-      const sentTokenId =
-        result.tokens[0] !== undefined
-          ? extractTokenIdFromSdkData(result.tokens[0].sdkData) ?? undefined
-          : undefined;
-      const tokenMap = new Map(result.tokens.map((t) => [t.id, t]));
-      const sentTokenIds: Array<{
-        id: string;
-        amount: string;
-        source: 'split' | 'direct';
-      }> = result.tokenTransfers.map((tt) => ({
-        id: tt.sourceTokenId,
-        amount: tokenMap.get(tt.sourceTokenId)?.amount ?? '0',
-        source: tt.method === 'split' ? 'split' : 'direct',
-      }));
-      await this.addToHistory({
-        type: 'SENT',
-        amount: request.amount,
-        coinId: request.coinId,
-        symbol: this.getCoinSymbol(request.coinId),
-        timestamp: Date.now(),
-        recipientPubkey,
-        ...(recipientNametag !== undefined ? { recipientNametag } : {}),
-        recipientAddress:
-          peerInfo?.directAddress ?? recipientAddress.toString() ?? recipientPubkey,
-        ...(request.memo !== undefined ? { memo: request.memo } : {}),
-        transferId: result.id,
-        ...(sentTokenId !== undefined ? { tokenId: sentTokenId } : {}),
-        ...(sentTokenIds.length > 0 ? { tokenIds: sentTokenIds } : {}),
-      });
-    } catch (err) {
-      logger.warn(
-        'Payments',
-        `dispatchUxfConservativeSend: failed to record SENT history (send already succeeded): ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
+    // #143 UXF + #149 multi-coin — record one SENT history entry per coin
+    // shipped in the bundle (primary + each additionalAssets coin). The
+    // helper pivots result.tokenTransfers by source coinId and emits an
+    // entry per coin; each emission is wrapped in its own try/catch so a
+    // history I/O hiccup never flips a successful send into a thrown error.
+    await this.recordUxfBundleSentHistory({
+      originalRequest,
+      request,
+      result,
+      peerInfo,
+      recipientPubkey,
+      recipientAddress,
+      diagLabel: 'dispatchUxfConservativeSend',
+    });
 
     return result;
   }
@@ -11034,55 +11145,20 @@ export class PaymentsModule {
       this.pendingBackgroundTasks.push(tracked);
     }
 
-    // #143 UXF — record SENT history after the bundle is durably published.
-    // Mirrors the legacy send() arm (PaymentsModule.ts:3855). Without this
-    // entry the user sees no outgoing transaction even after the bundle is
-    // on the wire.
-    //
-    // Failure handling: addToHistory wraps storage I/O. A throw here would
-    // turn a successful send into a thrown error — worse than a missing
-    // history row. Swallow + log so the caller still observes the send.
-    try {
-      const recipientNametag =
-        peerInfo?.nametag ??
-        (originalRequest.recipient.startsWith('@')
-          ? originalRequest.recipient.slice(1)
-          : undefined);
-      const sentTokenId =
-        result.tokens[0] !== undefined
-          ? extractTokenIdFromSdkData(result.tokens[0].sdkData) ?? undefined
-          : undefined;
-      const tokenMap = new Map(result.tokens.map((t) => [t.id, t]));
-      const sentTokenIds: Array<{
-        id: string;
-        amount: string;
-        source: 'split' | 'direct';
-      }> = result.tokenTransfers.map((tt) => ({
-        id: tt.sourceTokenId,
-        amount: tokenMap.get(tt.sourceTokenId)?.amount ?? '0',
-        source: tt.method === 'split' ? 'split' : 'direct',
-      }));
-      await this.addToHistory({
-        type: 'SENT',
-        amount: request.amount,
-        coinId: request.coinId,
-        symbol: this.getCoinSymbol(request.coinId),
-        timestamp: Date.now(),
-        recipientPubkey,
-        ...(recipientNametag !== undefined ? { recipientNametag } : {}),
-        recipientAddress:
-          peerInfo?.directAddress ?? recipientAddress.toString() ?? recipientPubkey,
-        ...(request.memo !== undefined ? { memo: request.memo } : {}),
-        transferId: result.id,
-        ...(sentTokenId !== undefined ? { tokenId: sentTokenId } : {}),
-        ...(sentTokenIds.length > 0 ? { tokenIds: sentTokenIds } : {}),
-      });
-    } catch (err) {
-      logger.warn(
-        'Payments',
-        `dispatchUxfInstantSend: failed to record SENT history (send already succeeded): ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
+    // #143 UXF + #149 multi-coin — record one SENT history entry per coin
+    // shipped in the bundle (primary + each additionalAssets coin). The
+    // helper pivots result.tokenTransfers by source coinId and emits an
+    // entry per coin; each emission is wrapped in its own try/catch so a
+    // history I/O hiccup never flips a successful send into a thrown error.
+    await this.recordUxfBundleSentHistory({
+      originalRequest,
+      request,
+      result,
+      peerInfo,
+      recipientPubkey,
+      recipientAddress,
+      diagLabel: 'dispatchUxfInstantSend',
+    });
 
     return result;
   }
