@@ -69,7 +69,7 @@ Per-suite gates are unaffected — they declare their own required services (see
 
 - `preflight-infra.sh` defines a `preflight_infra <services>` function that wraps `npx -y @unicitylabs/infra-probe` and translates the documented exit codes into a skip decision. On `unreachable`, it `exit 0`s the calling script with a clear `SKIP:` line that `run-all.sh` greps as a non-failure.
 - `pointer-N0-prologue.sh` (sourced by every `pointer-N*.sh` test) and `e2e-helpers.sh` (sourced by every `0X-swap-*.sh` test) auto-invoke `preflight_infra` on source.
-- Standalone scripts (`cli-storage-modes.sh`, `swap-cli-e2e.sh`, `run-all.sh`) call it inline near the top.
+- Standalone scripts (`swap-cli-e2e.sh`, `run-all.sh`) call it inline near the top.
 
 ## Per-suite required-services table
 
