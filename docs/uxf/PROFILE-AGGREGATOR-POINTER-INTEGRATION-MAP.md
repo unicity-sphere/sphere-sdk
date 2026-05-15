@@ -200,12 +200,12 @@ New subdirectory. Files:
 Reuse existing mocks: `tests/unit/profile/profile-token-storage-provider.test.ts` already mocks IPFS + OrbitDB — extend with a `mockAggregator` that implements `submitCommitment` / `getInclusionProof` against an in-memory SMT.
 
 ### 7.3 E2E scripts — `tests/e2e/pointer-n*.sh`
-Per TEST-SPEC, 14 scenarios (N1–N14). Pattern mirrors existing `tests/e2e/01-swap-basic.sh`. Use `tests/e2e/e2e-helpers.sh` for shared setup/teardown.
+Per TEST-SPEC, 14 scenarios (N1–N14). The 14 scripts source `tests/e2e/pointer-N0-prologue.sh` for shared setup/teardown (preflight gate, CLI resolution, workspace bootstrap). Pattern: each script declares its `TEST_NAME`, sources the prologue, and runs the scenario.
 
 **Open question:** N3 and N5 require aggregator downtime simulation — do we mock via network-level blocking (iptables) or via a test-harness aggregator that can be paused? Recommend the latter for CI portability.
 
 ### 7.4 Vitest config
-No changes. New `.test.ts` files are picked up by default. Heavy E2E (`.sh`) runs through existing shell-runner pipeline — `run-all.sh` must be extended.
+No changes. New `.test.ts` files are picked up by default. Heavy E2E (`.sh`) runs are invoked individually (e.g. `bash tests/e2e/pointer-N1.sh`); a future batch runner would source the standard pass/fail sentinel lines emitted by `pointer-N0-prologue.sh`.
 
 ### 7.5 CI — `.github/workflows/ci.yml`
 Add a `test-pointer` job or extend `test` with `POINTER_LAYER=1` env. Ensure CI has network egress to a mocked aggregator (testcontainers) — real testnet aggregator is rate-limited and non-deterministic.

@@ -5,11 +5,9 @@
 #
 # The sphere-sdk CLI was extracted to its own package (@unicity-sphere/cli);
 # the in-tree `cli/index.ts` no longer exists on this branch. Shell e2e
-# scripts (pointer-N*.sh, swap-cli-e2e.sh, e2e-helpers.sh) all need a
-# CLI to drive wallets. Centralizing the
+# scripts (pointer-N*.sh) need a CLI to drive wallets. Centralizing the
 # resolver in one place avoids the drift we hit in May 2026 where
-# pointer-N0-prologue.sh and e2e-helpers.sh both shipped subtly different
-# 4-step fallbacks.
+# multiple test scripts shipped subtly different 4-step fallbacks.
 #
 # Sourced (NOT executed). Provides one function:
 #

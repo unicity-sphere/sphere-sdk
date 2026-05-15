@@ -3,7 +3,7 @@
 This directory contains tests that hit the **live Unicity testnet** (or mainnet, when explicitly opted in). Two kinds of test live here:
 
 - **vitest TypeScript tests** (`*.test.ts`) — exercised by `npm run test:e2e`.
-- **shell-script CLI tests** (`*.sh`) — run individually or via `run-all.sh`.
+- **shell-script CLI tests** (`pointer-N*.sh`) — run individually (e.g. `bash tests/e2e/pointer-N1.sh`).
 
 ## Infra-probe preflight gate (read this if a test says "SKIP")
 
@@ -29,13 +29,13 @@ E2E_SKIP_PREFLIGHT=1 npm run test:e2e
 E2E_SKIP_PREFLIGHT=1 bash tests/e2e/pointer-N1.sh
 
 # Shell-only: opt out of automatic preflight invocation but still allow manual calls.
-E2E_NO_AUTO_PREFLIGHT=1 bash tests/e2e/run-all.sh
+E2E_NO_AUTO_PREFLIGHT=1 bash tests/e2e/pointer-N1.sh
 
 # Probe a different network.
 E2E_NETWORK=mainnet npm run test:e2e
 
 # Tighter probe budget for faster iteration.
-E2E_PROBE_TIMEOUT=15000 bash tests/e2e/swap-cli-e2e.sh
+E2E_PROBE_TIMEOUT=15000 bash tests/e2e/pointer-N1.sh
 ```
 
 ### Probing only the services your tests need (UXF-friendly)
@@ -52,7 +52,7 @@ E2E_PREFLIGHT_ONLY=nostr,aggregator,ipfs RUN_UXF_E2E=1 \
   npm run test:e2e -- tests/e2e/pointer-roundtrip.test.ts
 
 # Same env var works for shell scripts (it's the auto-invoke service list there).
-E2E_PREFLIGHT_ONLY=nostr,aggregator bash tests/e2e/swap-cli-e2e.sh
+E2E_PREFLIGHT_ONLY=nostr,aggregator,ipfs bash tests/e2e/pointer-N1.sh
 ```
 
 Per-suite gates are unaffected — they declare their own required services (see the table below) and remain authoritative for "should this suite run?". Filtering the probe just means a service the suite didn't list is also not probed; if the suite *did* list a service that's filtered out, the gate logs a warning and falls through to running anyway (your filter is your responsibility).
@@ -67,9 +67,8 @@ Per-suite gates are unaffected — they declare their own required services (see
 
 ### Shell scripts
 
-- `preflight-infra.sh` defines a `preflight_infra <services>` function that wraps `npx -y @unicitylabs/infra-probe` and translates the documented exit codes into a skip decision. On `unreachable`, it `exit 0`s the calling script with a clear `SKIP:` line that `run-all.sh` greps as a non-failure.
-- `pointer-N0-prologue.sh` (sourced by every `pointer-N*.sh` test) and `e2e-helpers.sh` (sourced by every `0X-swap-*.sh` test) auto-invoke `preflight_infra` on source.
-- Standalone scripts (`swap-cli-e2e.sh`, `run-all.sh`) call it inline near the top.
+- `preflight-infra.sh` defines a `preflight_infra <services>` function that wraps `npx -y @unicitylabs/infra-probe` and translates the documented exit codes into a skip decision. On `unreachable`, it `exit 0`s the calling script with a clear `SKIP:` line that callers can grep as a non-failure.
+- `pointer-N0-prologue.sh` (sourced by every `pointer-N*.sh` test) auto-invokes `preflight_infra` on source. The 14 pointer-N* scripts are the only remaining shell e2e suite in this repo — the swap CLI shell scripts (`01-swap-*.sh` … `04-swap-*.sh`, `swap-cli-e2e.sh`) migrated to `@unicity-sphere/cli` and live there now as `test/integration/cli-swap*.integration.test.ts`.
 
 ## Per-suite required-services table
 
@@ -100,12 +99,12 @@ timing out at 240 s on `Faucet top-up timed out`. Mainnet has no faucet by
 design — the probe layer treats `network=mainnet` as a clean skip-pass for
 the faucet check.
 
-Pointer + swap shell scripts default to `nostr,aggregator,ipfs` and `nostr,aggregator` respectively. Override per-script via `E2E_PREFLIGHT_ONLY`.
+Pointer shell scripts default to `nostr,aggregator,ipfs`. Override per-script via `E2E_PREFLIGHT_ONLY`. (Swap CLI shell scripts migrated to `@unicity-sphere/cli` — see `test/integration/cli-swap*.integration.test.ts` there.)
 
 ## Adding a new test
 
 1. Decide which services your test actually depends on (NOT every service the SDK transitively touches — only the ones whose downtime would invalidate the test's signal).
 2. Add the corresponding gate at the top of the file:
    - **vitest**: `import { preflightSkip } from './lib/preflight';` then `const SKIP_INFRA = preflightSkip(['nostr', '...'], 'my-suite-name');` and use `describe.skipIf(SKIP_INFRA)('my suite', ...)`.
-   - **shell**: source `pointer-N0-prologue.sh` or `e2e-helpers.sh` and the gate fires automatically. To override services use `E2E_PREFLIGHT_ONLY` before sourcing.
+   - **shell**: source `pointer-N0-prologue.sh` and the gate fires automatically. To override services use `E2E_PREFLIGHT_ONLY` before sourcing.
 3. Update the per-suite table above.
