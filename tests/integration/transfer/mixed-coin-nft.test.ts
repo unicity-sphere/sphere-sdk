@@ -47,6 +47,7 @@ import {
   makePeerInfo,
   makeRecordingTransport,
   makeToken,
+  rewriteFixtureCoinData,
   rewriteFixtureTokenId,
 } from './_harness';
 
@@ -76,11 +77,20 @@ describe('§11.2 — mixed coin + NFT send (separate sources)', () => {
       return { id: token.id, coins: null };
     };
 
-    // Coin commit: split → fresh recipient-token id.
-    // NFT commit: direct → preserved tokenId.
-    const coinChild = rewriteFixtureTokenId(
-      TOKEN_A,
-      `cc${'1'.padStart(2, '0')}${'0'.repeat(60)}`,
+    // Coin commit: split → fresh recipient-token id, coinData = the
+    // requested slice (UCT, 30). NFT commit: direct → preserved tokenId,
+    // empty coinData (NFT-shape per §4.1 class-disjointness rule).
+    // OVER_TRANSFER_GUARD inspects each commit's recipient coinData; the
+    // default TOKEN_A placeholder (`[['UCT', '1000000']]`) would trip
+    // the per-coin budget check.
+    const coinChildIdHex = `cc${'1'.padStart(2, '0')}${'0'.repeat(60)}`;
+    const coinChild = rewriteFixtureCoinData(
+      rewriteFixtureTokenId(TOKEN_A, coinChildIdHex),
+      [['UCT', '30']],
+    );
+    const nftChild = rewriteFixtureCoinData(
+      rewriteFixtureTokenId(TOKEN_A, nftIdHex),
+      [],
     );
     const commitResults: ConservativeCommitResult[] = [
       {
@@ -94,7 +104,7 @@ describe('§11.2 — mixed coin + NFT send (separate sources)', () => {
         sourceTokenId: nftIdHex,
         method: 'direct',
         requestIdHex: `req-${nftIdHex}`,
-        recipientTokenJson: rewriteFixtureTokenId(TOKEN_A, nftIdHex),
+        recipientTokenJson: nftChild,
       },
     ];
 
@@ -130,9 +140,12 @@ describe('§11.2 — mixed coin + NFT send (separate sources)', () => {
     const result = await sendConservativeUxf(request, makePeerInfo(), deps);
     expect(result.status).toBe('completed');
 
-    // Bundle carries both source ids on the wire.
+    // Bundle carries the RECIPIENT genesis tokenIds on the wire
+    // (commit 718ab12 / #142 Loop4). Coin source = split → child has
+    // a fresh tokenId. NFT source = direct → child preserves source
+    // tokenId.
     const payload = transport._calls[0].payload as UxfTransferPayloadCar;
-    expect([...payload.tokenIds].sort()).toEqual([coinIdHex, nftIdHex].sort());
+    expect([...payload.tokenIds].sort()).toEqual([coinChildIdHex, nftIdHex].sort());
 
     // Per-token detail: coin = split + splitGroupId; NFT = direct (no
     // splitGroupId).

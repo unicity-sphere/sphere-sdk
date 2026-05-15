@@ -46,6 +46,7 @@ import {
   makePeerInfo,
   makeRecordingTransport,
   makeToken,
+  rewriteFixtureCoinData,
   rewriteFixtureTokenId,
 } from './_harness';
 
@@ -81,9 +82,16 @@ describe('§11.2 — multi-coin source, single-coin send (UCT slice)', () => {
     const source = makeToken({ id: srcIdHex, fixture: sourceFixture });
 
     // Recipient child: a fresh tokenId carrying only UCT(30). The
-    // orchestrator gets exactly this JSON ingested into the bundle.
+    // orchestrator ingests this JSON into the bundle and the
+    // OVER_TRANSFER_GUARD inspects `coinData` per source — overriding
+    // the placeholder's default `[['UCT', '1000000']]` so the per-coin
+    // ship-vs-budget sum lands at the exact requested slice (matches
+    // what production's TokenSplitExecutor would mint).
     const childIdHex = `bb${'1'.padStart(2, '0')}${'0'.repeat(60)}`;
-    const childFixture = rewriteFixtureTokenId(TOKEN_A, childIdHex);
+    const childFixture = rewriteFixtureCoinData(
+      rewriteFixtureTokenId(TOKEN_A, childIdHex),
+      [['UCT', '30']],
+    );
 
     const commitResult: ConservativeCommitResult = {
       sourceTokenId: srcIdHex,
@@ -125,11 +133,14 @@ describe('§11.2 — multi-coin source, single-coin send (UCT slice)', () => {
     const result = await sendConservativeUxf(request, makePeerInfo(), deps);
     expect(result.status).toBe('completed');
 
-    // Wire payload carries exactly ONE tokenId — the source's id.
-    // (The orchestrator surfaces sourceTokenId on the wire, not the
-    // freshly-minted child's tokenId; that's an SDK-side mapping.)
+    // Wire payload carries exactly ONE tokenId — the recipient mint's
+    // freshly-minted child tokenId. Commit 718ab12 (#142 Loop4) fixed
+    // a recipient-side silent loss: advertising sourceTokenId caused
+    // the receiver's bundle-verifier to fall to advisoryUnclaimedRoots
+    // because the source token isn't in the CAR (it was burned). The
+    // child mint IS in the CAR, so it must surface in tokenIds.
     const payload = transport._calls[0].payload as UxfTransferPayloadCar;
-    expect(payload.tokenIds).toEqual([srcIdHex]);
+    expect(payload.tokenIds).toEqual([childIdHex]);
     expect(payload.mode).toBe('conservative');
 
     // method='split' on the per-source TokenTransferDetail (the SDK

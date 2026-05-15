@@ -41,6 +41,7 @@ import {
   makePeerInfo,
   makeRecordingTransport,
   makeToken,
+  rewriteFixtureCoinData,
   rewriteFixtureTokenId,
 } from './_harness';
 
@@ -62,7 +63,14 @@ function nftProjection(token: Token): TokenLike {
 describe('§11.2 — NFT-only send (single NFT, no primary slot)', () => {
   it('omits primary coinId/amount; additionalAssets carries one NFT entry; whole-token transfer', async () => {
     const nftIdHex = `aa${'1'.padStart(2, '0')}${'0'.repeat(60)}`;
-    const nftFixture = rewriteFixtureTokenId(TOKEN_A, nftIdHex);
+    // NFTs carry empty `coinData` per §4.1 (class-disjoint with coin
+    // tokens). The default TOKEN_A placeholder has UCT in coinData
+    // which would trip OVER_TRANSFER_GUARD on a request with no
+    // primary coin slot (budget = 0 for any coin).
+    const nftFixture = rewriteFixtureCoinData(
+      rewriteFixtureTokenId(TOKEN_A, nftIdHex),
+      [],
+    );
     const nftToken = makeToken({
       id: nftIdHex,
       fixture: nftFixture,
@@ -125,27 +133,32 @@ describe('§11.2 — NFT-only send (single NFT, no primary slot)', () => {
   it('multi-NFT send: two distinct NFTs in one bundle — both surface on the wire', async () => {
     const nft1Hex = `aa${'1'.padStart(2, '0')}${'0'.repeat(60)}`;
     const nft2Hex = `aa${'2'.padStart(2, '0')}${'0'.repeat(60)}`;
-    const nft1 = makeToken({
-      id: nft1Hex,
-      fixture: rewriteFixtureTokenId(TOKEN_A, nft1Hex),
-    });
-    const nft2 = makeToken({
-      id: nft2Hex,
-      fixture: rewriteFixtureTokenId(TOKEN_A, nft2Hex),
-    });
+    // Both NFT fixtures carry empty coinData (§4.1 class-disjoint).
+    // OVER_TRANSFER_GUARD treats empty/absent coinData as NFT-shape
+    // and skips the per-coin budget check.
+    const nft1Fixture = rewriteFixtureCoinData(
+      rewriteFixtureTokenId(TOKEN_A, nft1Hex),
+      [],
+    );
+    const nft2Fixture = rewriteFixtureCoinData(
+      rewriteFixtureTokenId(TOKEN_A, nft2Hex),
+      [],
+    );
+    const nft1 = makeToken({ id: nft1Hex, fixture: nft1Fixture });
+    const nft2 = makeToken({ id: nft2Hex, fixture: nft2Fixture });
 
     const commitResults: ConservativeCommitResult[] = [
       {
         sourceTokenId: nft1Hex,
         method: 'direct',
         requestIdHex: `req-${nft1Hex}`,
-        recipientTokenJson: rewriteFixtureTokenId(TOKEN_A, nft1Hex),
+        recipientTokenJson: nft1Fixture,
       },
       {
         sourceTokenId: nft2Hex,
         method: 'direct',
         requestIdHex: `req-${nft2Hex}`,
-        recipientTokenJson: rewriteFixtureTokenId(TOKEN_A, nft2Hex),
+        recipientTokenJson: nft2Fixture,
       },
     ];
 

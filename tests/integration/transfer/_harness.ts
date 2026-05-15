@@ -256,3 +256,39 @@ export function rewriteFixtureTokenId(
     },
   };
 }
+
+/**
+ * Produce a copy of a TOKEN fixture with the genesis `coinData` rewritten.
+ *
+ * Production `TokenSplitExecutor` mints recipient tokens whose `coinData`
+ * is `[[coinId, splitAmount]]` — only the requested slice, not the source's
+ * full balance. NFT-direct transfers preserve the source's empty/null
+ * `coinData`. The OVER_TRANSFER_GUARD (`over-transfer-guard.ts`) inspects
+ * the recipient JSON's `coinData` per source as defense-in-depth against
+ * a buggy commitSources callback silently over-sending.
+ *
+ * Tests that ingest a `TOKEN_A`-shaped placeholder as a recipient JSON
+ * must override `coinData` to match what the production planner would
+ * produce — otherwise the guard fires on `TOKEN_A`'s default
+ * `[['UCT', '1000000']]` against a smaller per-coin request budget.
+ *
+ * Pass `[]` or `null` for NFT-class recipients (empty/absent coinData →
+ * guard treats as NFT and skips the budget check).
+ */
+export function rewriteFixtureCoinData(
+  fixture: Record<string, unknown>,
+  coinData: ReadonlyArray<readonly [string, string]> | null,
+): Record<string, unknown> {
+  const genesis = (fixture as { genesis: Record<string, unknown> }).genesis;
+  const data = genesis.data as Record<string, unknown>;
+  return {
+    ...fixture,
+    genesis: {
+      ...genesis,
+      data: {
+        ...data,
+        coinData,
+      },
+    },
+  };
+}
