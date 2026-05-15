@@ -45,10 +45,23 @@ async function ensureTrustbase(dataDir: string): Promise<void> {
 function waitForDM(sphere: Sphere, timeoutMs = 15000): Promise<DirectMessage> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`Timeout: DM not received within ${timeoutMs}ms`)), timeoutMs);
-    sphere.communications.onDirectMessage((msg) => {
+    // onDirectMessage replays already-stored messages to new handlers
+    // (see CommunicationsModule.onDirectMessage). The replay loop runs
+    // synchronously inside onDirectMessage(), so any handler invocation
+    // that happens before onDirectMessage() returns is a replay — drop
+    // those and only accept live deliveries. Without this guard,
+    // waitForDM would resolve with a stale message on every iteration
+    // after the first.
+    let acceptLive = false;
+    let resolved = false;
+    const unsub: (() => void) = sphere.communications.onDirectMessage((msg) => {
+      if (!acceptLive || resolved) return;
+      resolved = true;
       clearTimeout(timer);
+      try { unsub(); } catch { /* ignore */ }
       resolve(msg);
     });
+    acceptLive = true;
   });
 }
 

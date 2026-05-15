@@ -454,10 +454,26 @@ export class CommunicationsModule {
     // during Sphere.init before SwapModule.load) are not lost.
     // Guard: only replay once per handler reference to prevent duplicate
     // processing when a handler is unsubscribed and re-registered.
+    //
+    // Self-filter (#155): handleIncomingMessage filters out self-sent
+    // messages before calling handlers. The cache (this.messages) holds
+    // BOTH sent and received messages, so a naive replay leaks self-sent
+    // ones to handlers — violating the "incoming only" contract that
+    // CommunicationsModule.selffilter.test.ts asserts. Skip self-sent
+    // here too, using the same key-normalization as getUnreadCount.
     if (!this.replayedHandlers.has(handler)) {
       this.replayedHandlers.add(handler);
+      const ownKey = CommunicationsModule._normalizeKey(
+        this.deps?.identity.chainPubkey ?? ''
+      );
       const snapshot = Array.from(this.messages.values());
       for (const message of snapshot) {
+        if (
+          ownKey &&
+          CommunicationsModule._normalizeKey(message.senderPubkey) === ownKey
+        ) {
+          continue;
+        }
         try {
           handler(message);
         } catch (err) {
