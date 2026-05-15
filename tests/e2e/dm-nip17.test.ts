@@ -44,36 +44,44 @@ async function ensureTrustbase(dataDir: string): Promise<void> {
 }
 
 function waitForDM(sphere: Sphere, timeoutMs = 15000): Promise<DirectMessage> {
-  // CommunicationsModule.onDirectMessage REPLAYS the existing message
-  // store to every newly registered handler (so handlers added late
-  // don't miss DMs that arrived during init). For tests using this
-  // helper to wait for a SPECIFIC incoming DM, we must:
+  // CommunicationsModule.onDirectMessage REPLAYS already-cached messages
+  // to every newly registered handler (so modules loaded late don't miss
+  // DMs that arrived during init). Per the SDK contract, replay is
+  // SYNCHRONOUS — every replay invocation fires before onDirectMessage()
+  // returns. We exploit that to distinguish replays from live deliveries:
+  // any handler call that lands before `acceptLive = true` runs is a
+  // replay, so we drop it and only resolve on a live delivery.
   //
-  //   (1) filter out messages sent by this sphere itself — sendDM
-  //       writes the outgoing DM to `messages` before publishing, so
-  //       the replay would otherwise fire immediately with the
-  //       sphere's last outgoing DM (sender == self).
-  //   (2) treat the registration time as the "horizon": only fire on
-  //       messages whose timestamp is AFTER we subscribed, so a stale
-  //       inbound DM from an earlier exchange in the same test
-  //       doesn't satisfy the next waitForDM call.
-  const horizon = Date.now();
-  const selfPubkey = sphere.identity?.chainPubkey;
+  // Two earlier approaches don't work as well and are intentionally
+  // dropped here:
+  //   - Filtering by `msg.senderPubkey === self` was redundant after the
+  //     #155 SDK fix made replay skip self-sent entries on its own.
+  //   - Filtering by `msg.timestamp < horizon` was fragile: gift-wrap
+  //     event timestamps land at second-level granularity, so a fresh
+  //     live DM whose floored second is the same as `floor(horizon/1000)`
+  //     would be rejected.
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new Error(`Timeout: DM not received within ${timeoutMs}ms`)),
-      timeoutMs,
-    );
+    let acceptLive = false;
+    let resolved = false;
     let unsub: (() => void) | null = null;
+    const cleanup = () => {
+      if (unsub) {
+        try { unsub(); } catch { /* ignore */ }
+        unsub = null;
+      }
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`Timeout: DM not received within ${timeoutMs}ms`));
+    }, timeoutMs);
     unsub = sphere.communications.onDirectMessage((msg) => {
-      // Skip own outbound DMs (replayed from sendDM's local cache).
-      if (selfPubkey && msg.senderPubkey === selfPubkey) return;
-      // Skip messages received before the wait started.
-      if (typeof msg.timestamp === 'number' && msg.timestamp < horizon) return;
+      if (!acceptLive || resolved) return;
+      resolved = true;
       clearTimeout(timer);
-      if (unsub) unsub();
+      cleanup();
       resolve(msg);
     });
+    acceptLive = true;
   });
 }
 
