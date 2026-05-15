@@ -1309,6 +1309,20 @@ export class PaymentsModule {
    * without re-deriving the signing service.
    */
   private _signingPublicKeyHex: string | null = null;
+  /** PR #147 follow-up (W5) — single-flight guard for the init-time
+   *  stale-transferring probe. Two parallel `load()` calls (or a
+   *  `load()` + manual probe trigger) would otherwise race on the same
+   *  stale token set: the per-token re-check inside the loop guards
+   *  `removeToken` but NOT `addToHistory`, so without this guard a
+   *  parallel run would emit duplicate SENT history entries (the
+   *  synthetic `transferId` IS deterministic per (tokenId, stateHash)
+   *  so dedup ultimately collapses them — but a second pass still
+   *  burns aggregator RPC calls and risks racing on `save()`). */
+  private _staleProbeInFlight: Promise<{
+    spent: number;
+    owned: number;
+    unknown: number;
+  }> | null = null;
   private proofPollingInterval: ReturnType<typeof setInterval> | null = null;
   private static readonly PROOF_POLLING_INTERVAL_MS = 2000;  // Poll every 2s
   private static readonly PROOF_POLLING_MAX_ATTEMPTS = 30;   // Max 30 attempts (~60s)
@@ -2788,6 +2802,16 @@ export class PaymentsModule {
     // periodic retries so tokens don't stay stuck as 'submitted'.
     this.resolveUnconfirmed().catch((err) => logger.debug('Payments', 'resolveUnconfirmed failed', err));
     this.scheduleResolveUnconfirmed();
+
+    // PR #147 follow-up (W5) — fire-and-forget probe for stale
+    // 'transferring' tokens left over from a hard crash between burn-on-
+    // wire and dispatcher cleanup. See `recoverStaleTransferring` for the
+    // full invariant. Errors are swallowed: the probe re-runs on the next
+    // load and a transiently unreachable aggregator must NOT block the
+    // user's wallet from coming up.
+    this.recoverStaleTransferring().catch((err) =>
+      logger.debug('Payments', '[STALE-RECOVER] recoverStaleTransferring failed', err),
+    );
   }
 
   /**
@@ -7058,6 +7082,268 @@ export class PaymentsModule {
       );
     }
     return recovered;
+  }
+
+  /**
+   * PR #147 follow-up (W5) — init-time recovery probe for stale
+   * `status='transferring'` source tokens.
+   *
+   * **The crash window.** Both UXF dispatchers
+   * (`dispatchUxfInstantSend` / `dispatchUxfConservativeSend`) mark
+   * source tokens `status='transferring'` and persist them via
+   * `await this.save()` BEFORE submitting the burn commitment to the
+   * aggregator. If the process is hard-killed (SIGKILL/OOM/tab-close)
+   * after the burn `submitTransferCommitment` returns SUCCESS but
+   * before the dispatcher's finally block runs `removeToken()`, the
+   * source is left on disk at `status='transferring'` — visible but
+   * locked out of `planSend` (which only considers
+   * `status='confirmed'`). On next load, `loadFromStorageData`
+   * unconditionally preserves transferring tokens (PaymentsModule.ts
+   * ~line 12787). Without this probe, the user has phantom locked
+   * balance forever.
+   *
+   * **The fix.** Snapshot all stale `transferring` tokens at probe
+   * entry, then ask the aggregator per token whether the burn state is
+   * already spent on-chain (`oracle.isSpent(stateHash)`):
+   *
+   * - **`true` → SPENT.** The burn DID land. Tombstone the token
+   *   (via `removeToken`) and append a synthetic SENT history entry
+   *   so the user sees the outflow. We don't have recipient/transferId
+   *   from the dead dispatcher, so the entry uses an `[unknown]`
+   *   placeholder + a synthesized `transferId` to avoid history
+   *   dedup collisions.
+   *
+   * - **`false` → OWNED.** The burn never made it to the aggregator.
+   *   Revert to `status='confirmed'` so the token re-enters the
+   *   planner.
+   *
+   * - **throws → UNKNOWN.** Aggregator unreachable or returned a
+   *   transport error. Leave token as-is, log warn, retry on next
+   *   load. `oracle.isSpent` is documented fail-closed (it will NOT
+   *   silently return `false` on RPC failure), which is exactly what
+   *   we need: "couldn't check" must NOT be confused with "definitely
+   *   unspent".
+   *
+   * **Race-free with concurrent dispatchers.** A live dispatcher's
+   * `selectSources` filters via `planSend`, which only considers
+   * `status='confirmed'`. A stale-transferring token cannot be picked
+   * up by a new send while the probe is in flight, so there is no
+   * race between probe outcome and a fresh dispatcher claiming the
+   * same source. The per-token re-check at the top of the loop
+   * (`this.tokens.get(id)?.status === 'transferring'`) defends against
+   * any out-of-band resurrection.
+   *
+   * Idempotent: re-runs are safe — once a token is removed via
+   * `removeToken` or reverted to `confirmed`, it's no longer in the
+   * stale-transferring snapshot on subsequent calls.
+   *
+   * Returns the per-outcome counts.
+   */
+  private async recoverStaleTransferring(): Promise<{
+    spent: number;
+    owned: number;
+    unknown: number;
+  }> {
+    // Single-flight guard (Steelman C1). Two callers (e.g. concurrent
+    // `load()` invocations or a manual probe + load race) share the
+    // in-flight promise — preventing duplicate aggregator RPCs and
+    // double history-entry writes.
+    if (this._staleProbeInFlight) {
+      return this._staleProbeInFlight;
+    }
+    const promise = this._recoverStaleTransferringImpl();
+    this._staleProbeInFlight = promise;
+    try {
+      return await promise;
+    } finally {
+      // Clear the guard so the NEXT `load()` (a fresh session) can
+      // re-probe. Within a single session, repeat invocations are
+      // dedup'd by the snapshot — once a token is removed/reverted it's
+      // no longer in `transferring` status to be re-classified.
+      this._staleProbeInFlight = null;
+    }
+  }
+
+  private async _recoverStaleTransferringImpl(): Promise<{
+    spent: number;
+    owned: number;
+    unknown: number;
+  }> {
+    const counters = { spent: 0, owned: 0, unknown: 0 };
+
+    // Snapshot stale transferring tokens at probe entry. The snapshot is
+    // immutable — concurrent code paths that mutate `this.tokens` after
+    // this point are reconciled via the per-token re-check below.
+    const stale = Array.from(this.tokens.values()).filter(
+      (t) => t.status === 'transferring',
+    );
+
+    if (stale.length === 0) {
+      return counters;
+    }
+
+    logger.debug(
+      'Payments',
+      `[STALE-RECOVER] Scanning ${stale.length} stale 'transferring' token(s) against aggregator`,
+    );
+
+    // Track in-memory reverts so we can roll them back if save() fails
+    // (Steelman W1) — leaving in-memory != disk leaves the user able to
+    // spend a token that's still 'transferring' on disk and creates a
+    // confusing window for a potentially long time.
+    const reverted: Array<{ token: Token; previousUpdatedAt: number }> = [];
+
+    for (const candidate of stale) {
+      // Defensive idempotency: re-check the live map. If something else
+      // already cleared or reverted this token, skip.
+      const live = this.tokens.get(candidate.id);
+      if (!live || live.status !== 'transferring') {
+        continue;
+      }
+
+      const stateHash = extractStateHashFromSdkData(live.sdkData);
+      if (!stateHash) {
+        logger.debug(
+          'Payments',
+          `[STALE-RECOVER] ${live.id.slice(0, 12)}: no stateHash in sdkData — skipping`,
+        );
+        continue;
+      }
+
+      let spent: boolean;
+      try {
+        spent = await this.deps!.oracle.isSpent(stateHash);
+      } catch (err) {
+        counters.unknown++;
+        logger.warn(
+          'Payments',
+          `[STALE-RECOVER] ${live.id.slice(0, 12)}: aggregator probe failed (${
+            (err as Error)?.message ?? err
+          }) — leaving as 'transferring' for next load`,
+        );
+        continue;
+      }
+
+      if (spent) {
+        // Burn landed on-chain. Order: HISTORY FIRST, then removeToken
+        // (Steelman C3). Rationale:
+        //   - If history append fails, the token stays in 'transferring'
+        //     and the next probe retries — no silent loss.
+        //   - If removeToken succeeds and history was already written,
+        //     we have a complete record. The transferId is DETERMINISTIC
+        //     per (historicalTokenId, stateHash), so a probe re-run that
+        //     re-attempts the history write naturally REPLACES (not
+        //     appends) via `computeHistoryDedupKey` — no duplicates.
+        const historicalTokenId =
+          extractTokenIdFromSdkData(live.sdkData) ?? live.id;
+        try {
+          await this.addToHistory({
+            type: 'SENT',
+            amount: live.amount,
+            coinId: live.coinId,
+            symbol: live.symbol,
+            timestamp: Date.now(),
+            // Sentinel values flag this entry as a recovery (Steelman W2):
+            //   - `recipientPubkey: '[recovered]'` — UI consumers that
+            //     slice/avatar on this can switch on the prefix.
+            //   - `recipientAddress: '[unknown]'` — same convention.
+            // The memo prefix `[Recovered: ...]` is also detectable.
+            recipientPubkey: '[recovered]',
+            recipientAddress: '[unknown]',
+            memo: '[Recovered: in-flight send completed during a previous crash; recipient details unavailable]',
+            // Deterministic synthetic transferId — replay-safe
+            // (Steelman C1/C3). Re-runs of the probe append the SAME
+            // dedup key (`SENT_transfer_${transferId}_${coinId}`) so
+            // `addToHistory` REPLACES instead of duplicating.
+            transferId: `recovered-${historicalTokenId}-${stateHash.slice(0, 16)}`,
+            tokenId: historicalTokenId,
+            tokenIds: [
+              { id: historicalTokenId, amount: live.amount, source: 'direct' },
+            ],
+          });
+        } catch (histErr) {
+          counters.unknown++;
+          logger.warn(
+            'Payments',
+            `[STALE-RECOVER] ${live.id.slice(0, 12)}: SENT history append failed (${
+              (histErr as Error)?.message ?? histErr
+            }) — leaving as 'transferring' for next load`,
+          );
+          continue;
+        }
+
+        try {
+          await this.removeToken(live.id);
+        } catch (rmErr) {
+          // History is durable; the next probe sees the same stale
+          // token, re-attempts history (replays the same dedup key →
+          // replace, no duplicate), and retries removeToken. Log and
+          // bump unknown so operators see the partial state.
+          counters.unknown++;
+          logger.warn(
+            'Payments',
+            `[STALE-RECOVER] ${live.id.slice(0, 12)}: SENT history written but removeToken failed (${
+              (rmErr as Error)?.message ?? rmErr
+            }) — next load will retry`,
+          );
+          continue;
+        }
+
+        counters.spent++;
+        logger.debug(
+          'Payments',
+          `[STALE-RECOVER] ${live.id.slice(0, 12)}: spent on-chain — tombstoned + SENT history added`,
+        );
+      } else {
+        // Burn never landed. Revert to confirmed.
+        const previousUpdatedAt = live.updatedAt;
+        live.status = 'confirmed';
+        live.updatedAt = Date.now();
+        this.tokens.set(live.id, live);
+        reverted.push({ token: live, previousUpdatedAt });
+        counters.owned++;
+        logger.debug(
+          'Payments',
+          `[STALE-RECOVER] ${live.id.slice(0, 12)}: unspent on aggregator — reverted to 'confirmed'`,
+        );
+      }
+    }
+
+    if (reverted.length > 0) {
+      try {
+        await this.save();
+      } catch (saveErr) {
+        // Persist failure: roll back the in-memory reverts so the user
+        // doesn't transact against an in-memory state that disagrees
+        // with disk (Steelman W1). The next load will re-probe.
+        for (const { token, previousUpdatedAt } of reverted) {
+          // Only roll back if the token still exists at our reverted
+          // status — something else may have legitimately moved it.
+          const live = this.tokens.get(token.id);
+          if (live && live === token && live.status === 'confirmed') {
+            live.status = 'transferring';
+            live.updatedAt = previousUpdatedAt;
+          }
+        }
+        // Reflect the rollback in the counters: the owned reverts that
+        // we just rolled back become unknown (couldn't persist the fix).
+        counters.unknown += reverted.length;
+        counters.owned -= reverted.length;
+        logger.warn(
+          'Payments',
+          `[STALE-RECOVER] save() after revert failed (${
+            (saveErr as Error)?.message ?? saveErr
+          }) — rolled back ${reverted.length} in-memory revert(s); next load will re-probe`,
+        );
+      }
+    }
+
+    logger.debug(
+      'Payments',
+      `[STALE-RECOVER] Complete — spent=${counters.spent}, owned=${counters.owned}, unknown=${counters.unknown}`,
+    );
+
+    return counters;
   }
 
   /**
