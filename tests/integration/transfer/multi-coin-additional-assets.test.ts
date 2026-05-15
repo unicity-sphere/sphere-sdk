@@ -45,6 +45,7 @@ import {
   makePeerInfo,
   makeRecordingTransport,
   makeToken,
+  rewriteFixtureCoinData,
   rewriteFixtureTokenId,
 } from './_harness';
 
@@ -71,10 +72,18 @@ describe('§11.2 — additionalAssets happy path (single multi-coin source)', ()
     });
 
     // Recipient child: one fresh token with the requested slice
-    // {UCT:30, USDU:20}. The orchestrator does NOT inspect the JSON;
-    // we use the fixture's shape as a placeholder.
+    // {UCT:30, USDU:20}. The OVER_TRANSFER_GUARD inspects
+    // `genesis.data.coinData` per source — defense-in-depth against a
+    // buggy commitSources callback that silently over-sends. The
+    // placeholder fixture's default `coinData: [['UCT', '1000000']]`
+    // would trip the guard against the {UCT:30, USDU:20} budget, so
+    // we rewrite coinData to match what production's TokenSplitExecutor
+    // would mint for this slice.
     const childIdHex = `bb${'1'.padStart(2, '0')}${'0'.repeat(60)}`;
-    const childFixture = rewriteFixtureTokenId(TOKEN_A, childIdHex);
+    const childFixture = rewriteFixtureCoinData(
+      rewriteFixtureTokenId(TOKEN_A, childIdHex),
+      [['UCT', '30'], ['USDU', '20']],
+    );
 
     const commitResult: ConservativeCommitResult = {
       sourceTokenId: srcIdHex,
@@ -116,8 +125,12 @@ describe('§11.2 — additionalAssets happy path (single multi-coin source)', ()
     const result = await sendConservativeUxf(request, makePeerInfo(), deps);
     expect(result.status).toBe('completed');
 
+    // Wire `payload.tokenIds` is the RECIPIENT's genesis tokenId
+    // (commit 718ab12 / #142 Loop4 — without this, the recipient's
+    // bundle-verifier falls to advisoryUnclaimedRoots and silently
+    // drops the transfer). For a split the child's tokenId is fresh.
     const payload = transport._calls[0].payload as UxfTransferPayloadCar;
-    expect(payload.tokenIds).toEqual([srcIdHex]);
+    expect(payload.tokenIds).toEqual([childIdHex]);
     expect(events.count('transfer:confirmed')).toBe(1);
     expect(result.tokenTransfers).toHaveLength(1);
     expect(result.tokenTransfers[0].method).toBe('split');
@@ -152,14 +165,20 @@ describe('§11.2 — additionalAssets happy path (single multi-coin source)', ()
       return { id: token.id, coins: [{ coinId: 'USDU', amount: 50n }] };
     };
 
-    // Two children, one per source.
-    const childA = rewriteFixtureTokenId(
-      TOKEN_A,
-      `cc${'1'.padStart(2, '0')}${'0'.repeat(60)}`,
+    // Two children, one per source. Each child's `coinData` reflects
+    // ONLY the slice that source contributes (TokenSplitExecutor mints
+    // recipient coinData = `[[coinId, splitAmount]]`). The
+    // OVER_TRANSFER_GUARD enforces this per-source — sticking with the
+    // default TOKEN_A placeholder coinData would trip it.
+    const childAIdHex = `cc${'1'.padStart(2, '0')}${'0'.repeat(60)}`;
+    const childBIdHex = `cc${'2'.padStart(2, '0')}${'0'.repeat(60)}`;
+    const childA = rewriteFixtureCoinData(
+      rewriteFixtureTokenId(TOKEN_A, childAIdHex),
+      [['UCT', '30']],
     );
-    const childB = rewriteFixtureTokenId(
-      TOKEN_A,
-      `cc${'2'.padStart(2, '0')}${'0'.repeat(60)}`,
+    const childB = rewriteFixtureCoinData(
+      rewriteFixtureTokenId(TOKEN_A, childBIdHex),
+      [['USDU', '20']],
     );
     const commitResults: ConservativeCommitResult[] = [
       {
@@ -209,8 +228,10 @@ describe('§11.2 — additionalAssets happy path (single multi-coin source)', ()
     expect(result.status).toBe('completed');
 
     const payload = transport._calls[0].payload as UxfTransferPayloadCar;
-    // Both source ids surface in tokenIds, lex-sorted.
-    expect([...payload.tokenIds].sort()).toEqual([srcA.id, srcB.id].sort());
+    // `payload.tokenIds` is the per-commit recipient genesis tokenId,
+    // lex-sorted (commit 718ab12 / #142 Loop4). Splits produce fresh
+    // child tokenIds, distinct from each source's id.
+    expect([...payload.tokenIds].sort()).toEqual([childAIdHex, childBIdHex].sort());
     expect(result.tokenTransfers).toHaveLength(2);
     expect(events.count('transfer:confirmed')).toBe(1);
   });

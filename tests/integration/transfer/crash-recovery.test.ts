@@ -420,11 +420,18 @@ describe('T.6.E — conservative crash between outbox commit and Nostr publish',
     expect(events.filter((e) => e.type === 'transfer:failed')).toHaveLength(1);
 
     // Acceptance — the outbox commit IS durable (status='sending').
+    // Persisted `tokenIds` is the per-commit recipient genesis tokenId
+    // (commit 718ab12 / #142 Loop4 — orchestrator advertises the
+    // recipient's mint, not the source). For a direct (whole-token)
+    // transfer of TOKEN_A the recipient preserves the source's tokenId
+    // → TOKEN_A.genesis.data.tokenId.
+    const tokenAGenesisId =
+      'aa00000000000000000000000000000000000000000000000000000000000001';
     const persisted = readPersistedEntry(store, addressId, transferId);
     expect(persisted).not.toBeNull();
     expect(persisted!.status).toBe<UxfOutboxStatus>('sending');
     expect(persisted!.bundleCid.length).toBeGreaterThan(0);
-    expect(persisted!.tokenIds).toEqual(['tok-1']);
+    expect(persisted!.tokenIds).toEqual([tokenAGenesisId]);
 
     // Acceptance — transport recorded ZERO publish attempts.
     expect(transport._calls).toHaveLength(0);
