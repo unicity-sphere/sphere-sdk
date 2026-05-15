@@ -38,9 +38,15 @@ import {
   rand,
 } from './helpers';
 
-const SKIP = !process.env.RUN_CONTINUOUS_TESTS;
 const ESCROW_SRC = process.env.ESCROW_DIR || join(__dirname, '../../../../escrow-service');
 const SDK_ROOT = join(__dirname, '../..');
+const ESCROW_AVAILABLE = existsSync(ESCROW_SRC);
+if (process.env.RUN_CONTINUOUS_TESTS && !ESCROW_AVAILABLE) {
+  console.warn(
+    `[preflight] skipping swap-continuous: escrow source not present at ${ESCROW_SRC}`,
+  );
+}
+const SKIP = !process.env.RUN_CONTINUOUS_TESTS || !ESCROW_AVAILABLE;
 
 // Timeouts
 const ESCROW_STARTUP_TIMEOUT = 60_000;
