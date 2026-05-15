@@ -6085,7 +6085,9 @@ export class AccountingModule {
 
     // §6.2 step 7e: Expiry check — fire informational expired event if dueDate passed
     if (
-      terms.dueDate !== undefined &&
+      // typeof === 'number' rejects both undefined AND the null produced by
+      // canonicalSerialize round-trip (see balance-computer.ts state guard).
+      typeof terms.dueDate === 'number' &&
       Date.now() > terms.dueDate &&
       status.state !== 'COVERED' &&
       status.state !== 'CLOSED' &&
@@ -6332,7 +6334,8 @@ export class AccountingModule {
     }
 
     if (
-      terms.dueDate !== undefined &&
+      // Same null-after-round-trip guard as above and balance-computer.ts.
+      typeof terms.dueDate === 'number' &&
       Date.now() > terms.dueDate &&
       status.state !== 'COVERED' &&
       status.state !== 'CLOSED' &&
