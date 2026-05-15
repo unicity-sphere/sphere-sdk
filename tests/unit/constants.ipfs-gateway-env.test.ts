@@ -27,14 +27,27 @@ async function loadConstants() {
 }
 
 describe('SPHERE_IPFS_GATEWAY env override', () => {
-  it('preserves built-in defaults when env is unset', async () => {
+  it('preserves built-in defaults when env is truly unset', async () => {
+    // Real "unset" path: delete after unstubbing so the env-read sees no key
+    // at all (not just an empty string). Steelman-finding #6: the "empty
+    // stub" case below covers the falsy-string branch; this case covers the
+    // genuinely-absent branch.
+    vi.unstubAllEnvs();
+    delete process.env.SPHERE_IPFS_GATEWAY;
+    const c = await loadConstants();
+    expect([...c.DEFAULT_IPFS_GATEWAYS]).toEqual([BUILTIN]);
+    expect([...c.BUILTIN_IPFS_GATEWAYS]).toEqual([BUILTIN]);
+    expect([...c.NETWORKS.testnet.ipfsGateways]).toEqual([BUILTIN]);
+    expect(c.getIpfsGatewayUrls()).toEqual([BUILTIN]);
+  });
+
+  it('preserves built-in defaults when env is set to empty string', async () => {
     vi.stubEnv('SPHERE_IPFS_GATEWAY', '');
     const c = await loadConstants();
     expect([...c.DEFAULT_IPFS_GATEWAYS]).toEqual([BUILTIN]);
     expect([...c.BUILTIN_IPFS_GATEWAYS]).toEqual([BUILTIN]);
-    // NETWORKS table inherits the same reference.
     expect([...c.NETWORKS.testnet.ipfsGateways]).toEqual([BUILTIN]);
-    expect(c.getIpfsGatewayUrls()).toEqual([`https://${'unicity-ipfs1.dyndns.org'}`]);
+    expect(c.getIpfsGatewayUrls()).toEqual([BUILTIN]);
   });
 
   it('replaces gateways with a single override URL', async () => {
