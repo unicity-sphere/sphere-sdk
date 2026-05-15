@@ -444,23 +444,35 @@ export class CommunicationsModule {
   }
 
   /**
-   * Subscribe to incoming DMs
+   * Subscribe to incoming DMs.
+   *
+   * Replay contract: cached messages that haven't yet been delivered to
+   * `handler` are replayed SYNCHRONOUSLY inside this call, before the
+   * function returns. This is load-bearing for two callers:
+   *   - modules loaded after `Sphere.init` (SwapModule, AccountingModule)
+   *     rely on the replay completing before their `load()` returns so
+   *     they can recover state without losing DMs that arrived while the
+   *     module was being constructed;
+   *   - E2E test helpers distinguish replays from live deliveries by
+   *     ignoring handler invocations that occur before this function
+   *     returns. Changing replay to be asynchronous (deferred via
+   *     queueMicrotask, setImmediate, etc.) would silently break those
+   *     callers — keep it synchronous and update this comment + the
+   *     `synchronous replay` unit test in CommunicationsModule.selffilter
+   *     if the contract ever has to change.
+   *
+   * Self-filter (#155): handleIncomingMessage skips self-sent messages
+   * before calling handlers (`handlers` is the "incoming only" contract,
+   * see CommunicationsModule.selffilter.test.ts). The cache holds BOTH
+   * sent and received messages, so the replay loop must apply the same
+   * filter; otherwise newly registered handlers see their own outbound
+   * messages — exactly the bug that surfaced in #155 dm-nip17 tests.
    */
   onDirectMessage(handler: (message: DirectMessage) => void): () => void {
     this.dmHandlers.add(handler);
 
-    // Replay existing messages to new handler — ensures DMs that arrived
-    // before this handler was registered (e.g., swap proposals arriving
-    // during Sphere.init before SwapModule.load) are not lost.
     // Guard: only replay once per handler reference to prevent duplicate
     // processing when a handler is unsubscribed and re-registered.
-    //
-    // Self-filter (#155): handleIncomingMessage filters out self-sent
-    // messages before calling handlers. The cache (this.messages) holds
-    // BOTH sent and received messages, so a naive replay leaks self-sent
-    // ones to handlers — violating the "incoming only" contract that
-    // CommunicationsModule.selffilter.test.ts asserts. Skip self-sent
-    // here too, using the same key-normalization as getUnreadCount.
     if (!this.replayedHandlers.has(handler)) {
       this.replayedHandlers.add(handler);
       const ownKey = CommunicationsModule._normalizeKey(
@@ -468,9 +480,17 @@ export class CommunicationsModule {
       );
       const snapshot = Array.from(this.messages.values());
       for (const message of snapshot) {
+        // Defensive: malformed cache entries (legacy migration, corrupted
+        // storage) may have a non-string senderPubkey. _normalizeKey reads
+        // .length, so undefined/null would crash the entire replay loop
+        // and propagate out of onDirectMessage. Skip the self-filter for
+        // anything we can't normalize — those messages can't be self-sent
+        // by definition, so delivering them is the safe fallback.
+        const sender = message.senderPubkey;
         if (
           ownKey &&
-          CommunicationsModule._normalizeKey(message.senderPubkey) === ownKey
+          typeof sender === 'string' &&
+          CommunicationsModule._normalizeKey(sender) === ownKey
         ) {
           continue;
         }

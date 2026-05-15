@@ -273,5 +273,144 @@ describe('CommunicationsModule — self-message filtering', () => {
         senderPubkey: PEER_PUBKEY,
       }));
     });
+
+    it('should NOT replay self-sent message stored in x-only form', async () => {
+      // Defensive coverage: legacy cache entries may store senderPubkey
+      // in x-only (64-char) form rather than compressed (66-char). The
+      // current chainPubkey is compressed, so _normalizeKey must canonicalise
+      // both sides to the same x-only lowercase form for the filter to
+      // catch this as self-sent.
+      const storage = createMockStorage();
+      const selfSentXOnly: DirectMessage = {
+        id: 'self-xonly',
+        senderPubkey: MY_XONLY, // 64-char, no 02/03 prefix
+        recipientPubkey: PEER_PUBKEY,
+        content: 'outgoing stored in x-only form',
+        timestamp: Date.now(),
+        isRead: false,
+      };
+      await storage.set('messages', JSON.stringify([selfSentXOnly]));
+
+      mod = new CommunicationsModule();
+      mod.initialize({
+        identity: createMockIdentity(MY_PUBKEY), // compressed form
+        storage,
+        transport: createMockTransport(),
+        emitEvent: vi.fn(),
+      });
+      await mod.load();
+
+      const handler = vi.fn();
+      mod.onDirectMessage(handler);
+
+      expect(handler).not.toHaveBeenCalled();
+    });
+
+    it('should replay everything when identity has no chainPubkey', async () => {
+      // Degenerate case: identity present but chainPubkey is empty. The
+      // self-filter must short-circuit (`if (ownKey && ...)`) so legit
+      // messages still flow rather than being all dropped or crashing.
+      const storage = createMockStorage();
+      const incoming: DirectMessage = {
+        id: 'incoming-1',
+        senderPubkey: PEER_PUBKEY,
+        recipientPubkey: MY_XONLY,
+        content: 'incoming under blank identity',
+        timestamp: Date.now(),
+        isRead: false,
+      };
+      await storage.set('messages', JSON.stringify([incoming]));
+
+      mod = new CommunicationsModule();
+      mod.initialize({
+        identity: createMockIdentity(''), // empty chainPubkey
+        storage,
+        transport: createMockTransport(),
+        emitEvent: vi.fn(),
+      });
+      await mod.load();
+
+      const handler = vi.fn();
+      mod.onDirectMessage(handler);
+
+      expect(handler).toHaveBeenCalledOnce();
+    });
+
+    it('should not crash when cached message has malformed senderPubkey', async () => {
+      // Storage corruption or pre-validation legacy data could produce a
+      // message where senderPubkey is undefined / wrong shape. The replay
+      // loop must not propagate an exception out of onDirectMessage, since
+      // that breaks every subsequent caller (test helpers, SwapModule.load,
+      // AccountingModule.load).
+      const storage = createMockStorage();
+      const malformed = {
+        id: 'malformed-1',
+        // senderPubkey intentionally missing
+        recipientPubkey: MY_PUBKEY,
+        content: 'corrupted entry',
+        timestamp: Date.now(),
+        isRead: false,
+      } as unknown as DirectMessage;
+      const ok: DirectMessage = {
+        id: 'ok-1',
+        senderPubkey: PEER_PUBKEY,
+        recipientPubkey: MY_PUBKEY,
+        content: 'still delivered',
+        timestamp: Date.now(),
+        isRead: false,
+      };
+      await storage.set('messages', JSON.stringify([malformed, ok]));
+
+      mod = new CommunicationsModule();
+      mod.initialize({
+        identity: createMockIdentity(MY_PUBKEY),
+        storage,
+        transport: createMockTransport(),
+        emitEvent: vi.fn(),
+      });
+      await mod.load();
+
+      const handler = vi.fn();
+      // Must not throw — replay must continue past the malformed entry.
+      expect(() => mod.onDirectMessage(handler)).not.toThrow();
+      // The well-formed peer-sent entry still gets delivered. (The
+      // malformed entry is delivered too — non-string senderPubkey can't
+      // be self-sent by definition, so the safe fallback is to surface it.)
+      const deliveredContents = handler.mock.calls.map(([m]) => m.content);
+      expect(deliveredContents).toContain('still delivered');
+    });
+
+    it('contract: onDirectMessage replays synchronously before returning', () => {
+      // The dm-nip17.test.ts waitForDM helper depends on this contract to
+      // distinguish replays from live deliveries. If a future change
+      // defers replay (queueMicrotask, setImmediate, …), this test fails
+      // fast — fix the contract in onDirectMessage and update both the
+      // test helper and the JSDoc above onDirectMessage.
+      const storage = createMockStorage();
+      mod = new CommunicationsModule();
+      let onMsgCallback: ((msg: IncomingMessage) => void) | null = null;
+      const transport = createMockTransport((handler) => {
+        onMsgCallback = handler;
+        return () => {};
+      });
+      mod.initialize({
+        identity: createMockIdentity(MY_PUBKEY),
+        storage,
+        transport,
+        emitEvent: vi.fn(),
+      });
+      // Seed an incoming message before any handler is registered.
+      onMsgCallback!(makeIncomingMessage({
+        senderTransportPubkey: PEER_PUBKEY,
+        content: 'must replay synchronously',
+      }));
+
+      const handler = vi.fn();
+      mod.onDirectMessage(handler);
+      // Critical: by the time onDirectMessage returns, the replay MUST
+      // already have called handler. Any deferred-replay refactor that
+      // schedules handler invocation for a later microtask breaks this.
+      expect(handler).toHaveBeenCalledOnce();
+    });
   });
 });
