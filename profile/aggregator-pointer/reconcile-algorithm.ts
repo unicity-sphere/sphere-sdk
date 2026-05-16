@@ -47,10 +47,36 @@ import type { PointerVersion } from './types.js';
 /**
  * Callback invoked after discovering a new remote version during conflict
  * reconciliation. The pointer layer hands the caller the remote CID; caller
- * is responsible for:
- *   - Fetching the CAR bytes from IPFS (with content-address verification)
- *   - Merging the remote bundle into the local OrbitDB OpLog per §10.4 JOIN rules
- *   - Persisting any derived state updates
+ * is responsible for the FULL conflict-merge sequence:
+ *
+ *   1. Fetch the CAR bytes from IPFS (with content-address verification).
+ *   2. Merge the remote bundle into the local OrbitDB OpLog per §10.4
+ *      JOIN rules (typically: write a bundle ref keyed by CID).
+ *   3. Persist `profile.pointer.version = remoteVersion` (i.e. invoke the
+ *      same `persistLocalVersion` callback the layer was constructed with).
+ *
+ * Step 3 was previously performed by `reconcileAndPublish` after the
+ * callback returned. That created a "double persist" with the in-tree
+ * production wiring (which already persists internally to enforce the
+ * "bundle ref durable BEFORE cursor advance" ordering invariant
+ * introduced in commit 561f551), and split ownership across two layers
+ * for a single logical commit. We now make the callback the SOLE owner
+ * of cursor advancement on the conflict path:
+ *
+ *   - `reconcileAndPublish` does NOT touch `persistLocalVersion` after
+ *     the callback returns; it only advances the in-memory loop variable
+ *     used to compute the next discovery's starting version.
+ *   - The eventual successful publish in the next iteration persists
+ *     `localVersion = nextV` via `publishOnceAtVersion` as before.
+ *
+ * Implementations MUST therefore call their `persistLocalVersion`
+ * adapter (or equivalent storage write) as the LAST step on success,
+ * AFTER the OrbitDB bundle ref has landed. Test harnesses whose fake
+ * callback does not invoke `persistLocalVersion` will see the storage
+ * cursor remain at its previous value across a conflict — that is now
+ * the documented contract; the in-memory loop variable inside reconcile
+ * tracks the advanced version for subsequent discovery so the next
+ * publish still targets the correct `nextV`.
  *
  * The pointer layer does NOT own OrbitDB or IPFS fetch — those stay with
  * the Profile layer. This callback is the integration seam.
@@ -303,9 +329,11 @@ export async function reconcileAndPublish(input: ReconcileInput): Promise<Reconc
     // §9.2 reconciliation:
     //   1. Re-discover V_true (it may have advanced again since step B).
     //   2. recoverLatest (=> validV CID).
-    //   3. fetchAndJoin remote bundle.
-    //   4. Persist localVersion = validV.
-    //   5. sleep(backoff), recurse.
+    //   3. fetchAndJoin remote bundle — callback owns: fetch CAR + write
+    //      bundle ref + persist `localVersion = validV` (in that order;
+    //      see FetchAndJoinCallback doc). Reconcile only updates its
+    //      in-memory loop variable for the next discovery's starting v.
+    //   4. sleep(backoff), recurse.
     // Re-discovery failure during conflict reconciliation — propagate unchanged,
     // except for WALKBACK_FLOOR which retries through the helper (same
     // rationale as Step B: replication lag is transient).
@@ -329,10 +357,18 @@ export async function reconcileAndPublish(input: ReconcileInput): Promise<Reconc
       // Steelman: wrap the remote-fetch + join + persist block with a sleep
       // guard so a caller who immediately re-invokes publish() on throw
       // cannot hot-loop against the aggregator.
+      //
+      // Architect-review 2026-05-17 (PR #165): the callback OWNS the
+      // cursor advance — it persists `localVersion = remoteVersion`
+      // AFTER its bundle-ref write lands (see FetchAndJoinCallback
+      // contract above and pointer-wiring.ts:buildFetchAndJoin). The
+      // earlier double-call from reconcile was idempotent in production
+      // (same value, same key) but split ownership of one logical
+      // commit across two layers and masked the ordering invariant.
+      // We now only update the in-memory loop variable here.
       try {
         const remoteCid = await input.resolveRemoteCid(rediscovery.validV);
         await input.fetchAndJoin(remoteCid, rediscovery.validV);
-        await input.persistLocalVersion(rediscovery.validV);
         currentLocalVersion = rediscovery.validV;
       } catch (err) {
         // Non-transient failures (IPFS unreachable, OrbitDB merge bug,

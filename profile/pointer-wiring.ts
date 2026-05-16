@@ -367,6 +367,14 @@ function buildResolveRemoteCid(deps: {
  *   4. Persist `profile.pointer.version = remoteVersion` so subsequent
  *      reconcile passes start from the advanced cursor.
  *
+ * This callback is the SOLE owner of cursor advancement on the
+ * conflict path (per the FetchAndJoinCallback contract in
+ * reconcile-algorithm.ts). `reconcileAndPublish` does not call
+ * `persistLocalVersion` after we return — it only updates its
+ * in-memory loop variable. The bundle-ref-first / cursor-after ordering
+ * inside this callback is therefore the only place enforcing the
+ * "no orphan cursor without a bundle ref" invariant.
+ *
  * Limitation (T-D0): the multi-bundle JOIN currently runs under
  * last-writer-wins for same-tokenId collisions and does not perform
  * longest-valid-chain resolution or proof enrichment. For the
