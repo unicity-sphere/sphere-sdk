@@ -43,6 +43,7 @@
  */
 
 import { logger } from '../core/logger.js';
+import { SphereError } from '../core/errors.js';
 import type { ProviderStatus, FullIdentity } from '../types/index.js';
 import type {
   TokenStorageProvider,
@@ -398,6 +399,114 @@ export class ProfileTokenStorageProvider
 
   async shutdown(): Promise<void> {
     await this.lifecycleManager.shutdown();
+  }
+
+  /**
+   * TokenStorageProvider.awaitNextFlush — force pending writes to durably
+   * persist (IPFS pin + OrbitDB ref + aggregator pointer) and wait for
+   * completion. Used by PaymentsModule.handleIncomingTransfer to gate
+   * the Nostr `since`-filter advancement on real IPFS durability.
+   *
+   * Pattern mirrors `LifecycleManager.shutdown`'s flush sequence
+   * (cancel debounce → await in-flight → flush remaining pending),
+   * but as a re-callable method that does NOT teardown the provider.
+   *
+   * Loops to handle the case where a concurrent save() lands during
+   * an in-flight flush: that save's data sits in pendingData; we run
+   * another flush to capture it. Bounded by `timeoutMs`.
+   *
+   * Rejects via SphereError('TIMEOUT') if pending writes can't drain
+   * within the budget — caller treats this as "NOT durable" → don't
+   * advance Nostr `since` → re-replay on next reconnect (idempotent
+   * via addToken stateHash dedup).
+   *
+   * @param timeoutMs Max wall-clock time. Default 30s.
+   */
+  async awaitNextFlush(timeoutMs = 30_000): Promise<void> {
+    if (!this.initialized || !this.encryptionKey) return;
+
+    const deadline = Date.now() + timeoutMs;
+    const remainingMs = (): number => Math.max(0, deadline - Date.now());
+
+    // Iterate: there might be saves landing during in-flight flush.
+    // Bound iterations to 4 — each iteration runs one full flush, so
+    // > 4 means save() is faster than flush, which is a runaway
+    // scenario better surfaced as TIMEOUT than looped forever.
+    for (let iteration = 0; iteration < 4; iteration++) {
+      // 1. Cancel debounce timer so we don't wait its full window.
+      const timer = this.flushTimer;
+      if (timer !== null) {
+        clearTimeout(timer);
+        this.flushTimer = null;
+      }
+
+      // 2. Await any in-flight flush BEFORE starting another. Two
+      //    concurrent flushes race lastPinnedCid / bundle-ref writes
+      //    (the same hazard shutdown's Steelman³⁸ note warns about).
+      const inflight = this.flushPromise;
+      if (inflight) {
+        try {
+          await Promise.race([
+            inflight,
+            new Promise<never>((_, reject) =>
+              setTimeout(
+                () =>
+                  reject(
+                    new SphereError(
+                      'awaitNextFlush: timeout awaiting in-flight flush',
+                      'TIMEOUT',
+                    ),
+                  ),
+                remainingMs(),
+              ),
+            ),
+          ]);
+        } catch (err) {
+          if (err instanceof SphereError && err.code === 'TIMEOUT') throw err;
+          // In-flight flush failed (POINTER_MONOTONICITY_VIOLATION,
+          // IPFS pin failure, OrbitDB write timeout, etc.) — propagate
+          // so the caller can refuse to advance the Nostr ack.
+          throw err;
+        }
+      }
+
+      // 3. If pendingData is now drained, we're done.
+      if (this.pendingData === null) return;
+
+      // 4. Otherwise drive a fresh flush directly. This bypasses the
+      //    just-cancelled debounce timer and runs the flush body now.
+      const direct = this.flushScheduler.flushToIpfs();
+      try {
+        await Promise.race([
+          direct,
+          new Promise<never>((_, reject) =>
+            setTimeout(
+              () =>
+                reject(
+                  new SphereError(
+                    'awaitNextFlush: timeout awaiting direct flush',
+                    'TIMEOUT',
+                  ),
+                ),
+              remainingMs(),
+            ),
+          ),
+        ]);
+      } catch (err) {
+        if (err instanceof SphereError && err.code === 'TIMEOUT') throw err;
+        throw err;
+      }
+
+      // 5. After the flush, pendingData was cleared inside flushToIpfs
+      //    unless a concurrent save() landed mid-flush (Steelman⁴³
+      //    identity check). Loop to handle that case.
+      if (this.pendingData === null) return;
+    }
+
+    throw new SphereError(
+      'awaitNextFlush: pendingData kept regenerating across 4 flush iterations',
+      'TIMEOUT',
+    );
   }
 
   // ---------------------------------------------------------------------------

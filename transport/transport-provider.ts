@@ -398,7 +398,26 @@ export interface IncomingTokenTransfer {
   timestamp: number;
 }
 
-export type TokenTransferHandler = (transfer: IncomingTokenTransfer) => void | Promise<void>;
+/**
+ * Token-transfer handler return contract (at-least-once invariant):
+ *  - `true` (or `void`/`undefined` — legacy backward-compat): the inbound
+ *    event has been durably processed (token persisted to all configured
+ *    TokenStorageProviders, including IPFS pin for the Profile provider).
+ *    The transport MAY advance `lastEventTs` past this event.
+ *  - `false`: the event was received but the handler could not durably
+ *    persist its tokens (flush failure, IPFS unreachable, monotonicity
+ *    violation, etc.). The transport MUST NOT advance `lastEventTs` so
+ *    the event is re-replayed on the next reconnect. Re-processing is
+ *    idempotent (addToken stateHash dedup; processedCombinedTransferIds
+ *    dedup; etc.).
+ *
+ * Returning `void`/`undefined` preserves the pre-invariant contract for
+ * external handlers — they default to "durable" so existing code does
+ * not regress to "never ack".
+ */
+export type TokenTransferHandler = (
+  transfer: IncomingTokenTransfer,
+) => void | boolean | Promise<void | boolean>;
 
 // =============================================================================
 // Payment Request Types

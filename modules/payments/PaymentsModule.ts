@@ -12002,13 +12002,75 @@ export class PaymentsModule {
     }
   }
 
-  private async handleIncomingTransfer(transfer: IncomingTokenTransfer): Promise<void> {
+  /**
+   * Await durability on every TokenStorageProvider that supports
+   * `awaitNextFlush()`. Returns `true` iff every provider's flush
+   * completed (or it doesn't expose the method — assumed durable on
+   * save() return for filesystem-style providers). Used by
+   * `handleIncomingTransfer` to gate the Nostr ack on real IPFS pin
+   * completion.
+   *
+   * Failures (POINTER_MONOTONICITY_VIOLATION, IPFS unreachable, OrbitDB
+   * write timeout, awaitNextFlush deadline exceeded) are logged at
+   * `warn` and surface as `false` so the caller refuses to advance the
+   * `since` filter.
+   */
+  private async awaitAllProvidersDurable(timeoutMs = 60_000): Promise<boolean> {
+    const providers = this.getTokenStorageProviders();
+    if (providers.size === 0) return true;
+    let allDurable = true;
+    for (const [providerId, provider] of providers) {
+      if (typeof provider.awaitNextFlush !== 'function') continue;
+      try {
+        await provider.awaitNextFlush(timeoutMs);
+      } catch (err) {
+        logger.warn(
+          'Payments',
+          `[AT-LEAST-ONCE] provider ${providerId} awaitNextFlush failed — Nostr event will NOT be acked, replayed on next reconnect:`,
+          err instanceof Error ? err.message : err,
+        );
+        allDurable = false;
+      }
+    }
+    return allDurable;
+  }
+
+  /**
+   * Process an inbound token-transfer event from the transport layer.
+   *
+   * Returns `true` if the resulting tokens (if any) are now durably
+   * persisted to all configured TokenStorageProviders (specifically:
+   * for the Profile provider, this means the IPFS CAR is pinned, the
+   * OrbitDB bundle ref is written, and the aggregator pointer is
+   * updated). The Nostr transport uses this signal to gate
+   * `lastEventTs` advancement — see SPEC §at-least-once-invariant.
+   *
+   * Returns `false` if:
+   *  - the receive pipeline threw (parse / oracle / validation errors)
+   *  - any provider's `awaitNextFlush()` rejected (timeout, monotonicity
+   *    violation, IPFS unreachable)
+   *
+   * In either failure case, the transport MUST NOT advance the `since`
+   * filter past this event, so the event is re-replayed on the next
+   * reconnect. Re-processing is idempotent (addToken dedupes via
+   * `(tokenId, stateHash)`; processedCombinedTransferIds dedupes V6
+   * bundles).
+   */
+  private async handleIncomingTransfer(transfer: IncomingTokenTransfer): Promise<boolean> {
     // Drain race fix — count every in-flight receive so the pre-flush
     // drain can wait for the async receive→addToken pipeline to settle
     // before snapshotting the wallet. See `inflightReceiveCount` doc.
     // try/finally ensures the counter balances on EVERY exit path
     // (early-return, thrown error, awaited rejection).
     this.inflightReceiveCount++;
+    // At-least-once invariant: track whether the body completed without
+    // error so the finally block can decide whether to await durability.
+    // Default false — only flipped to true on the happy paths that
+    // actually persist a token. Early returns (already-processed dedup,
+    // invalid payload format) leave it false; we still treat those as
+    // durable since there's nothing new to persist (see below).
+    let bodyCompleted = false;
+    let nothingToPerist = false;
     try {
     // Ensure load() has completed so dedup checks see all persisted tokens.
     if (!this.loaded && this.loadedPromise) {
@@ -12029,8 +12091,17 @@ export class PaymentsModule {
         // emitted via the typed event bus inside the pool. We log here
         // for traceability; the sender's outbox will time out.
         logger.warn('Payments', 'handleIncomingTransfer: ingest pool rejected bundle', err);
+        // Pool rejected the bundle — no token persisted. Return false so
+        // the Nostr ack does NOT advance; the event re-replays on the
+        // next reconnect (idempotent via addToken stateHash dedup).
+        return false;
       }
-      return;
+      // Pool's enqueue() awaits the worker `settled` promise, so by the
+      // time we get here the worker has processed the bundle and addToken
+      // ran inside processToken. Now flush to make the token durable in
+      // IPFS+OrbitDB+aggregator-pointer before letting the Nostr ack
+      // advance.
+      return await this.awaitAllProvidersDurable();
     }
 
     // T.7.B — legacy-shape adapter routing. When the flag is on AND a
@@ -12094,13 +12165,17 @@ export class PaymentsModule {
 
       if (combinedBundle) {
         logger.debug('Payments', 'Processing COMBINED_TRANSFER V6 bundle...');
+        let v6Success = true;
         try {
           await this.processCombinedTransferBundle(combinedBundle, transfer.senderTransportPubkey);
           logger.debug('Payments', 'COMBINED_TRANSFER V6 processed successfully');
         } catch (err) {
           logger.error('Payments', 'COMBINED_TRANSFER V6 processing error:', err);
+          v6Success = false;
         }
-        return;
+        if (!v6Success) return false;
+        // V6 path persists via internal save calls — await flush durability.
+        return await this.awaitAllProvidersDurable();
       }
 
       // Check for INSTANT_SPLIT bundle (V4/V5 standalone — backward compat)
@@ -12122,6 +12197,7 @@ export class PaymentsModule {
       if (instantBundle) {
         logger.debug('Payments', 'Processing INSTANT_SPLIT bundle...');
         try {
+          let instantOk = false;
           const result = await this.processInstantSplitBundle(
             instantBundle,
             transfer.senderTransportPubkey,
@@ -12129,20 +12205,25 @@ export class PaymentsModule {
           );
           if (result.success) {
             logger.debug('Payments', 'INSTANT_SPLIT processed successfully');
+            instantOk = true;
           } else {
             logger.warn('Payments', 'INSTANT_SPLIT processing failed:', result.error);
           }
+          if (!instantOk) return false;
         } catch (err) {
           logger.error('Payments', 'INSTANT_SPLIT processing error:', err);
+          return false;
         }
-        return;
+        // INSTANT_SPLIT success — await flush before acking Nostr event.
+        return await this.awaitAllProvidersDurable();
       }
 
       // Check for NOSTR-FIRST commitment-only transfer (whole-token instant send)
       if (payload.sourceToken && payload.commitmentData && !payload.transferTx) {
         logger.debug('Payments', 'NOSTR-FIRST commitment-only transfer detected');
         await this.handleCommitmentOnlyTransfer(transfer, payload);
-        return;
+        // NOSTR-FIRST persists internally — await flush before acking.
+        return await this.awaitAllProvidersDurable();
       }
 
       let tokenData: unknown;
@@ -12168,7 +12249,7 @@ export class PaymentsModule {
 
         if (!sourceTokenInput || !transferTxInput) {
           logger.warn('Payments', 'Invalid Sphere wallet transfer format');
-          return;
+          return false;
         }
 
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -12179,7 +12260,7 @@ export class PaymentsModule {
           sourceToken = await SdkToken.fromJSON(sourceTokenInput);
         } catch (err) {
           logger.error('Payments', 'Failed to parse sourceToken:', err);
-          return;
+          return false;
         }
 
         // Try multiple parsing strategies for transferTx
@@ -12201,18 +12282,18 @@ export class PaymentsModule {
             const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
             if (!stClient) {
               logger.error('Payments', 'Cannot process commitment - no state transition client');
-              return;
+              return false;
             }
 
             const response = await stClient.submitTransferCommitment(commitment);
             if (response.status !== 'SUCCESS' && response.status !== 'REQUEST_ID_EXISTS') {
               logger.error('Payments', 'Transfer commitment submission failed:', response.status);
-              return;
+              return false;
             }
 
             if (!this.deps!.oracle.waitForProofSdk) {
               logger.error('Payments', 'Cannot wait for proof - missing oracle method');
-              return;
+              return false;
             }
             const inclusionProof = await this.deps!.oracle.waitForProofSdk(commitment);
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -12236,7 +12317,7 @@ export class PaymentsModule {
           }
         } catch (err) {
           logger.error('Payments', 'Failed to parse transferTx:', err);
-          return;
+          return false;
         }
 
         // Finalize using shared helper (handles PROXY address validation)
@@ -12246,7 +12327,7 @@ export class PaymentsModule {
           const trustBase = (this.deps!.oracle as any).getTrustBase?.();
           if (!stClient || !trustBase) {
             logger.error('Payments', 'Cannot finalize - missing state transition client or trust base. Token rejected.');
-            return;
+            return false;
           }
           finalizedSdkToken = await this.finalizeTransferToken(sourceToken, transferTx, stClient, trustBase);
           tokenData = finalizedSdkToken.toJSON();
@@ -12254,7 +12335,7 @@ export class PaymentsModule {
           logger.debug('Payments', `${addressScheme === AddressScheme.PROXY ? 'PROXY' : 'DIRECT'} finalization successful`);
         } catch (finalizeError) {
           logger.error('Payments', 'Finalization FAILED - token rejected:', finalizeError);
-          return;
+          return false;
         }
       } else if (payload.token) {
         // SDK format `{ token, proof? }`. The sender shipped a token JSON.
@@ -12391,14 +12472,14 @@ export class PaymentsModule {
         }
       } else {
         logger.warn('Payments', 'Unknown transfer payload format');
-        return;
+        return false;
       }
 
       // Validate token
       const validation = await this.deps!.oracle.validateToken(tokenData);
       if (!validation.valid) {
         logger.warn('Payments', 'Received invalid token');
-        return;
+        return false;
       }
 
       // Parse token info from SDK data
@@ -12452,9 +12533,15 @@ export class PaymentsModule {
         logger.debug('Payments', `Incoming transfer processed: ${token.id}, ${token.amount} ${token.symbol}`);
       } else {
         logger.debug('Payments', `Duplicate transfer ignored: ${token.id}, ${token.amount} ${token.symbol}`);
+        // Duplicate via stateHash dedup — the token was already
+        // persisted on a prior event. Treat as durable so the Nostr
+        // ack can advance.
+        nothingToPerist = true;
       }
+      bodyCompleted = true;
     } catch (error) {
       logger.error('Payments', 'Failed to process incoming transfer:', error);
+      // bodyCompleted stays false → durable=false → ack NOT advanced
     }
     } finally {
       // Drain race fix — counterpart to the entry-side increment. Runs
@@ -12463,6 +12550,14 @@ export class PaymentsModule {
       // pre-flush drain can safely snapshot `this.tokens`.
       this.inflightReceiveCount--;
     }
+
+    // At-least-once invariant: if the body completed and persisted a
+    // token, we MUST await flush completion on every provider that
+    // supports it before returning durable=true. The transport layer
+    // uses our return value to gate `lastEventTs` advancement.
+    if (!bodyCompleted) return false;
+    if (nothingToPerist) return true;
+    return await this.awaitAllProvidersDurable(60_000);
   }
 
   // ===========================================================================

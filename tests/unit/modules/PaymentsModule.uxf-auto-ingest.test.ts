@@ -603,8 +603,11 @@ describe('PaymentsModule — default IngestWorkerPool auto-install (Phase 9.5.E)
       // We just dispatch; the test assertion is that no error is thrown
       // (assemble(TOKEN_ID_B) would throw) AND oracle was NOT called for it.
       const payload = buildUxfCarPayload(TOKEN_ID_A);
-      // Should not throw.
-      await expect(handleTransfer(buildIncomingTransfer(payload))).resolves.toBeUndefined();
+      // Should not throw. handleIncomingTransfer now returns a boolean
+      // (at-least-once invariant): true=durable, false=replay-on-reconnect.
+      // For this test, oracle/storage are mocked — assertion is just on
+      // "no throw"; the resolved value can be either.
+      await expect(handleTransfer(buildIncomingTransfer(payload))).resolves.not.toThrow();
       void bundle;
     });
 

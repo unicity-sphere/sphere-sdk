@@ -196,6 +196,36 @@ export interface TokenStorageProvider<TData = unknown> extends BaseProvider {
   sync(localData: TData): Promise<SyncResult<TData>>;
 
   /**
+   * Force any pending/debounced flush to complete and await durability.
+   *
+   * Optional — providers without write-behind buffers (filesystem,
+   * synchronous IndexedDB) can omit it; callers MUST treat absence as
+   * "already durable on save() return" (i.e., no-op).
+   *
+   * Used to enforce the at-least-once invariant for inbound Nostr-
+   * delivered tokens: `payments.handleIncomingTransfer` calls this on
+   * every provider after `save()` so the Nostr `since` filter is only
+   * advanced when the token has been persisted to a durable store. If
+   * the provider's flush fails (rejects), the caller treats the inbound
+   * event as NOT durable and does NOT advance the `since` filter, so
+   * the event is re-replayed on next reconnect (idempotent because
+   * `addToken` already dedupes by `(tokenId, stateHash)`).
+   *
+   * Implementations MUST:
+   *  - Cancel any armed debounce timer (do not wait its full window).
+   *  - If a flush is already in-flight, await it.
+   *  - If `pendingData` is non-null after that, fire a fresh flush and
+   *    await it. Loop until `pendingData` is null OR timeout elapses.
+   *  - Throw a `SphereError('TIMEOUT')` if `timeoutMs` elapses with
+   *    pendingData still non-null.
+   *  - Surface any flush failure (POINTER_MONOTONICITY_VIOLATION etc.)
+   *    by rejecting — caller decides whether to retry or skip ack.
+   *
+   * @param timeoutMs Max wall-clock time before rejecting. Default 30s.
+   */
+  awaitNextFlush?(timeoutMs?: number): Promise<void>;
+
+  /**
    * Check if data exists
    */
   exists?(identifier?: string): Promise<boolean>;
