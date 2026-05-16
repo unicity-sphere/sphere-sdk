@@ -2166,19 +2166,45 @@ export class ProfileTokenStorageProvider
    * gate calls it explicitly between iterations.
    */
   private async refreshBaselineForMonotonicity(): Promise<boolean> {
+    // Direct OrbitDB read — bypass `this.load()` because that method
+    // has an early-return when `pendingData` is non-null. The
+    // monotonicity violation re-queues `pendingData` in its catch
+    // arm BEFORE this fire-and-forget refresh microtask fires, so a
+    // naive `load()` call would observe non-null pendingData and
+    // return the cached value WITHOUT touching OrbitDB — leaving
+    // `lastLoadedFromBundleCids` stale and the next flush would hit
+    // the same violation indefinitely.
+    //
+    // We don't need the full load() flow here — for the baseline
+    // refresh we only need to update `lastLoadedFromBundleCids` so
+    // the bundle-set check passes on the next flush. The token-set
+    // check is satisfied by the in-memory token map being a superset
+    // of whatever was previously loaded (NEVER-WIPE invariant
+    // guarantees this).
+    if (!this.initialized || !this.encryptionKey) return false;
     try {
-      const result = await this.load();
-      if (!result.success) {
-        this.log(
-          `refreshBaselineForMonotonicity: load() returned ` +
-            `success=false (error=${result.error ?? 'unknown'})`,
-        );
-        return false;
+      // Await any in-flight flush so the bundle-set we read includes
+      // any concurrent addBundle writes. flushPromise observation is
+      // safe here — we are NOT inside the flush body (this is a
+      // microtask scheduled from the violation arm, which fires
+      // AFTER the flush has rejected and the chain has settled).
+      if (this.flushPromise) {
+        try {
+          await this.flushPromise;
+        } catch {
+          // Flush failures don't block the refresh — we still need
+          // the current OrbitDB view.
+        }
       }
+      const activeBundles = await this.bundleIndex.listActiveBundles();
+      this.lastLoadedFromBundleCids = new Set(activeBundles.keys());
+      this.log(
+        `refreshBaselineForMonotonicity: baseline updated to ${this.lastLoadedFromBundleCids.size} bundle(s)`,
+      );
       return true;
     } catch (err) {
       this.log(
-        `refreshBaselineForMonotonicity: load() threw: ` +
+        `refreshBaselineForMonotonicity: listActiveBundles failed: ` +
           `${err instanceof Error ? err.message : String(err)}`,
       );
       return false;
