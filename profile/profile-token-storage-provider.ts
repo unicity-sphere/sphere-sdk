@@ -673,6 +673,11 @@ export class ProfileTokenStorageProvider
 
       // 2. Dynamically import UxfPackage
       const { UxfPackage } = await import('../uxf/UxfPackage.js');
+      // Local type alias for the imported class instance — UxfPackage's
+      // constructor is private, so `InstanceType<typeof UxfPackage>`
+      // fails. Snapshotting via ReturnType<create> sidesteps the
+      // visibility check.
+      type UxfPackageInstance = ReturnType<typeof UxfPackage.create>;
       const mergedPkg = UxfPackage.create();
 
       // 3. JOIN across all active bundles (PROFILE-ARCHITECTURE §10.4).
@@ -684,26 +689,88 @@ export class ProfileTokenStorageProvider
       //    resolve the conflict.
       //
       //    The structural work is delegated to `UxfPackage.merge()` which
-      //    internally calls `mergeInstanceChains()` — that function already
-      //    implements the "longest-chain or sibling-preservation" rules
-      //    (see uxf/instance-chain.ts Decision 6).
-      //
-      //    Oracle-based conflict resolution — turning a structural
-      //    divergence into {valid, conflicting, invalid} status — is
-      //    handled by token-manifest derivation (task #27). This JOIN is
-      //    the structural prerequisite.
+      //    invokes the per-token resolver (`resolveTokenRoot`) at
+      //    `uxf/token-join.ts`. Rules 3 + 4 of §10.4 (longest-valid chain
+      //    + proof enrichment) are implemented there. Rule 4 enrichment
+      //    activates only when the caller supplies a `verifiedProofs` set
+      //    — we compute it below across all loaded bundles when an oracle
+      //    is wired AND there's more than one bundle (a single-bundle
+      //    load has no candidate collisions, so verification would be
+      //    pure overhead).
       //
       //    CARs on IPFS are unencrypted; confidentiality comes from the
       //    OrbitDB KV layer that holds the bundle refs. Unencrypted CARs
       //    enable cross-user content-addressed dedup (see §10.2).
+
+      // Gap 3 wiring: first pass — fetch every bundle CAR into memory so
+      // we can pre-compute verifiedProofs across the full set before
+      // running the resolver. Per-bundle fetch failures are non-fatal
+      // (partial load is better than failure).
+      const loadedBundles: Array<{ cid: string; pkg: UxfPackageInstance }> = [];
       for (const [cid] of activeBundles) {
         try {
           const carBytes = await fetchFromIpfs(this._ipfsGateways, cid);
           const pkg = await UxfPackage.fromCar(carBytes);
-          mergedPkg.merge(pkg);
+          loadedBundles.push({ cid, pkg });
         } catch (err) {
           this.log(`Failed to load bundle ${cid}: ${err instanceof Error ? err.message : String(err)}`);
-          // Continue with remaining bundles -- partial load is better than failure
+        }
+      }
+
+      // Pre-compute verifiedProofs when Rule 4 enrichment is applicable.
+      // Skip the verifier walk entirely on single-bundle loads — the
+      // resolver only fires on per-token collisions which require ≥2
+      // candidate roots; a single-bundle load has none.
+      let verifiedProofs: ReadonlySet<string> | undefined = undefined;
+      const verifyInclusionProof = this.options?.oracle?.verifyInclusionProof;
+      if (verifyInclusionProof && loadedBundles.length >= 2) {
+        try {
+          // Pairwise accumulation via the existing helper. `computeVerifiedProofs`
+          // walks BOTH packages' pools dedup-by-content-hash, so for N
+          // bundles we accumulate the union by walking the previously
+          // merged set against each new bundle. The verifier itself is
+          // deterministic (same input → same output) so cross-device
+          // agreement holds. Each proof is verified at most once because
+          // the helper dedupes by ContentHash inside.
+          const accum = new Set<string>();
+          for (let i = 0; i < loadedBundles.length; i++) {
+            for (let j = i + 1; j < loadedBundles.length; j++) {
+              const pairwise = await loadedBundles[i].pkg.computeVerifiedProofs(
+                loadedBundles[j].pkg,
+                (input: {
+                  proofJson: unknown;
+                  transactionHash: string;
+                  proofHash?: string;
+                }) => verifyInclusionProof.call(this.options!.oracle!, input),
+              );
+              for (const h of pairwise) accum.add(h);
+            }
+          }
+          verifiedProofs = accum;
+          this.log(
+            `JOIN: computed verifiedProofs across ${loadedBundles.length} bundles ` +
+              `(${accum.size} proof element(s) verified)`,
+          );
+        } catch (err) {
+          // Verifier failure must not abort the load — fall back to the
+          // conservative (no-enrichment) resolution. The structural JOIN
+          // still runs and Rule 3 (longest-valid prefix) still applies;
+          // only Rule 4 enrichment is skipped.
+          this.log(
+            `JOIN: computeVerifiedProofs failed (Rule 4 enrichment skipped): ` +
+              `${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+
+      // Second pass: structural merge. Rule 4 enrichment fires when
+      // `verifiedProofs` is non-empty AND the resolver finds a same-core-
+      // different-proof transaction pair.
+      for (const { cid, pkg } of loadedBundles) {
+        try {
+          mergedPkg.merge(pkg, verifiedProofs ? { verifiedProofs } : undefined);
+        } catch (err) {
+          this.log(`Failed to merge bundle ${cid}: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
 
