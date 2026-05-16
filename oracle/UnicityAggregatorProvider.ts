@@ -36,6 +36,11 @@ import { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/bft/RootTru
 import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token';
 import { waitInclusionProof } from '@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils';
 import type { TransferCommitment as SdkTransferCommitment } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferCommitment';
+import {
+  InclusionProof as SdkInclusionProof,
+  InclusionProofVerificationStatus,
+} from '@unicitylabs/state-transition-sdk/lib/transaction/InclusionProof';
+import { RequestId } from '@unicitylabs/state-transition-sdk/lib/api/RequestId';
 
 // SDK MintCommitment type - using interface to avoid generic complexity
 interface SdkMintCommitment {
@@ -70,7 +75,18 @@ interface RpcSubmitResponse {
   requestId?: string;
 }
 
+/**
+ * Response shape from the aggregator's `get_inclusion_proof` RPC.
+ * The aggregator returns `{ inclusionProof: { authenticator, merkleTreePath,
+ * transactionHash, unicityCertificate } }` — the historical Sphere wrapper
+ * incorrectly looked for a top-level `proof` field, so every poll returned
+ * null and instant-mode finalization never converged. Both fields are now
+ * accepted (proof for legacy / mainnet shapes, inclusionProof for testnet).
+ */
 interface RpcProofResponse {
+  /** Canonical aggregator shape (testnet, current). */
+  inclusionProof?: unknown;
+  /** Historical / fallback shape — kept for compatibility. */
   proof?: unknown;
   roundNumber?: number;
 }
@@ -129,6 +145,16 @@ export class UnicityAggregatorProvider implements OracleProvider {
     return this.trustBase;
   }
 
+  /**
+   * Get the bundled RootTrustBase (H6 — SPEC §8.4.2).
+   *
+   * Alias for getTrustBase(), exposed under the spec-canonical name so the
+   * pointer layer can consume the same bundled trust base as L4.
+   */
+  getRootTrustBase(): RootTrustBase | null {
+    return this.trustBase;
+  }
+
   /** Get the state transition client */
   getStateTransitionClient(): StateTransitionClient | null {
     return this.stateTransitionClient;
@@ -139,8 +165,23 @@ export class UnicityAggregatorProvider implements OracleProvider {
     return this.aggregatorClient;
   }
 
-  // Cache for spent states (immutable)
+  // Cache for spent states (immutable). Wave L: capped at 4096 with
+  // delete-oldest LRU eviction to prevent unbounded growth. Spent
+  // states are immutable so caching is safe; the cap protects long-
+  // running wallet processes that observe many unique stateHashes
+  // (transfers, validate() loops, cross-wallet sync) from gradual
+  // memory bloat.
   private spentCache: Map<string, boolean> = new Map();
+  private static SPENT_CACHE_MAX = 4096;
+
+  /** Wave L: bounded cache insert. */
+  private cacheSpent(stateHash: string): void {
+    if (this.spentCache.size >= UnicityAggregatorProvider.SPENT_CACHE_MAX) {
+      const firstKey = this.spentCache.keys().next().value;
+      if (firstKey !== undefined) this.spentCache.delete(firstKey);
+    }
+    this.spentCache.set(stateHash, true);
+  }
 
   constructor(config: UnicityAggregatorProviderConfig) {
     this.config = {
@@ -189,6 +230,10 @@ export class UnicityAggregatorProvider implements OracleProvider {
   // ===========================================================================
 
   async initialize(trustBase?: RootTrustBase): Promise<void> {
+    // Wave G.3: clear the inclusion-proof cache on (re)initialize.
+    // Trust-base rotation invalidates verification results — a proof
+    // that was OK under epoch N may be PATH_INVALID under epoch N+1.
+    this.inclusionProofCache.clear();
     // Initialize SDK clients with optional API key
     this.aggregatorClient = new AggregatorClient(
       this.config.url,
@@ -199,14 +244,45 @@ export class UnicityAggregatorProvider implements OracleProvider {
     if (trustBase) {
       this.trustBase = trustBase;
     } else if (!this.config.skipVerification && this.config.trustBaseLoader) {
-      // Load trust base using injected loader
+      // Steelman finding #156: trust-base load failures MUST NOT be
+      // silently swallowed. The historical implementation logged at
+      // debug level and left `this.trustBase = null`, which then
+      // forced every downstream `verifyInclusionProof` to fail closed
+      // (returning `false` for a verify call is indistinguishable
+      // from "we proved this proof is invalid"). An attacker who
+      // can poison the trust-base loader (DNS hijack, file system
+      // permissions, MITM on the bundled URL) flips the SDK into
+      // a degraded crypto state where every legitimate proof is
+      // refused.
+      //
+      // Fail loudly: surface the underlying failure as a SphereError
+      // so callers can route around or escalate. `Sphere.init` /
+      // adapter wiring catches this and refuses to come up — better
+      // than booting in a state where every verification is silently
+      // wrong.
       try {
         const trustBaseJson = await this.config.trustBaseLoader.load();
         if (trustBaseJson) {
           this.trustBase = RootTrustBase.fromJSON(trustBaseJson);
+        } else {
+          throw new SphereError(
+            'TrustBaseLoader.load() returned null/undefined — cannot verify proofs',
+            'NOT_INITIALIZED',
+          );
         }
       } catch (error) {
-        this.log('Failed to load trust base:', error);
+        // Don't double-wrap an existing SphereError; preserve forensic detail
+        // in `cause` for non-SphereError errors so the caller can drill in.
+        if (error instanceof SphereError) {
+          throw error;
+        }
+        throw new SphereError(
+          `Failed to load trust base — refusing to initialize aggregator: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+          'NOT_INITIALIZED',
+          error,
+        );
       }
     }
 
@@ -228,10 +304,23 @@ export class UnicityAggregatorProvider implements OracleProvider {
       if (this.isSdkTransferCommitment(commitment)) {
         // Use SDK client directly
         const response = await this.stateTransitionClient!.submitTransferCommitment(commitment);
-        requestId = commitment.requestId?.toString() ?? response.status;
+        // Steelman fix (warning 6e): mirror PaymentsModule's 6-site
+        // `toJSON ?? String(...)` pattern. SDK requestIds are objects
+        // with a custom `toJSON` that yields the canonical hex
+        // imprint; bare `toString()` falls back to the object's
+        // default `[object Object]` for objects that don't override
+        // it. Always prefer `toJSON()`, fall back to `String(...)`.
+        requestId =
+          (typeof commitment.requestId === 'object' &&
+            commitment.requestId !== null &&
+            typeof (commitment.requestId as { toJSON?: () => string }).toJSON === 'function'
+            ? (commitment.requestId as { toJSON: () => string }).toJSON()
+            : commitment.requestId !== undefined
+              ? String(commitment.requestId)
+              : response.status);
       } else {
         // Fallback to RPC for simple commitment objects
-        const response = await this.rpcCall<RpcSubmitResponse>('submitCommitment', {
+        const response = await this.rpcCall<RpcSubmitResponse>('submit_commitment', {
           sourceToken: commitment.sourceToken,
           recipient: commitment.recipient,
           salt: Array.from(commitment.salt),
@@ -271,7 +360,16 @@ export class UnicityAggregatorProvider implements OracleProvider {
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const response = await this.stateTransitionClient!.submitMintCommitment(commitment as any);
-      const requestId = commitment.requestId?.toString() ?? response.status;
+      // Steelman fix (warning 6e): mirror PaymentsModule's 6-site pattern.
+      // See submitCommitment above for rationale.
+      const requestId =
+        (typeof commitment.requestId === 'object' &&
+          commitment.requestId !== null &&
+          typeof (commitment.requestId as { toJSON?: () => string }).toJSON === 'function'
+          ? (commitment.requestId as { toJSON: () => string }).toJSON()
+          : commitment.requestId !== undefined
+            ? String(commitment.requestId)
+            : response.status);
 
       this.emitEvent({
         type: 'commitment:submitted',
@@ -307,16 +405,84 @@ export class UnicityAggregatorProvider implements OracleProvider {
     this.ensureConnected();
 
     try {
-      const response = await this.rpcCall<RpcProofResponse>('getInclusionProof', { requestId });
+      const response = await this.rpcCall<RpcProofResponse>('get_inclusion_proof', { requestId });
 
-      if (!response.proof) {
+      // The aggregator returns `inclusionProof` (canonical, current);
+      // some legacy / mock responders use `proof`. Accept either.
+      const proof = response.inclusionProof ?? response.proof;
+      if (!proof) {
+        return null;
+      }
+
+      // Steelman finding #157: shape-validate the aggregator's proof
+      // payload before handing it back to callers. A malicious or
+      // misbehaving aggregator can return arbitrary JSON
+      // (`{inclusionProof: true}`, `{inclusionProof: {}}`,
+      // `{inclusionProof: "string"}`, etc.). Without validation the
+      // historical caller treats every non-null payload as a successful
+      // proof, which silently drives finalization, race-lost detection,
+      // and Rule-4 enrichment off forged shapes.
+      //
+      // Two-layer validation:
+      //   1. Structural pre-check: must be a plain object (not primitive,
+      //      not array) and carry every field required by the SDK's
+      //      `IInclusionProofJson` (`authenticator`, `merkleTreePath`,
+      //      `transactionHash`, `unicityCertificate`).
+      //   2. Cryptographic parse: try `SdkInclusionProof.fromJSON(proof)`.
+      //      The SDK enforces invariants the aggregator wrapper cannot
+      //      (auth+tx pairing, merkle-path well-formedness, etc.). On
+      //      throw, return null (logged at WARN). getProof is allowed
+      //      to return null for "no proof yet" so callers retry; throwing
+      //      here would break poll loops.
+      if (
+        typeof proof !== 'object' ||
+        proof === null ||
+        Array.isArray(proof)
+      ) {
+        logger.warn(
+          'Aggregator',
+          `getProof: rejected non-object inclusion proof shape (got ${
+            Array.isArray(proof) ? 'array' : typeof proof
+          })`,
+        );
+        return null;
+      }
+      const proofObj = proof as Record<string, unknown>;
+      const requiredKeys = [
+        'authenticator',
+        'merkleTreePath',
+        'transactionHash',
+        'unicityCertificate',
+      ] as const;
+      for (const k of requiredKeys) {
+        if (!(k in proofObj)) {
+          logger.warn(
+            'Aggregator',
+            `getProof: rejected inclusion proof missing required field "${k}"`,
+          );
+          return null;
+        }
+      }
+      try {
+        // Cryptographic structure check. The parsed instance is not
+        // retained here — callers consume the JSON shape — but a
+        // throw on fromJSON proves the payload is structurally
+        // SDK-valid. Verification against the trust base happens in
+        // `verifyInclusionProof` at the caller.
+        SdkInclusionProof.fromJSON(proof);
+      } catch (parseErr) {
+        logger.warn(
+          'Aggregator',
+          'getProof: SDK fromJSON rejected inclusion proof shape',
+          parseErr,
+        );
         return null;
       }
 
       return {
         requestId,
         roundNumber: response.roundNumber ?? 0,
-        proof: response.proof,
+        proof,
         timestamp: Date.now(),
       };
     } catch (error) {
@@ -395,9 +561,9 @@ export class UnicityAggregatorProvider implements OracleProvider {
         data: { valid },
       });
 
-      // Cache spent state if spent
+      // Cache spent state if spent (Wave L: bounded with LRU eviction)
       if (response.stateHash && spent) {
-        this.spentCache.set(response.stateHash, true);
+        this.cacheSpent(response.stateHash);
       }
 
       return {
@@ -437,28 +603,204 @@ export class UnicityAggregatorProvider implements OracleProvider {
     );
   }
 
+  /**
+   * Wave G.3: cryptographic verification of an inclusion proof for
+   * the UXF Rule 4 enrichment gate.
+   *
+   * Reconstructs the SDK `InclusionProof` from the supplied JSON
+   * shape, derives the `RequestId` from the proof's authenticator
+   * (publicKey + stateHash imprint), and calls `proof.verify()`
+   * against the bundled `RootTrustBase`. Returns true ONLY on
+   * `OK` — anything else (PATH_NOT_INCLUDED / PATH_INVALID /
+   * NOT_AUTHENTICATED / thrown) returns false so a buggy or
+   * forged proof can never be lifted into a synthetic token-root.
+   *
+   * Cache: results are memoized by transactionHash since proof
+   * verification is deterministic given (proofJson, trustBase,
+   * tx). The cache is bounded; a Profile-level merge typically
+   * runs verifyInclusionProof O(N) times where N = number of
+   * unique tx-proof pairs in the merge candidates, often
+   * single-digit.
+   */
+  private inclusionProofCache: Map<string, boolean> = new Map();
+  private static INCLUSION_PROOF_CACHE_MAX = 1024;
+
+  async verifyInclusionProof(input: {
+    proofJson: unknown;
+    transactionHash: string;
+    proofHash?: string;
+  }): Promise<boolean> {
+    // Steelman finding #156: don't silently return false when the
+    // trust base never loaded — that masks an init-time failure as a
+    // crypto-time invalid proof. Callers who interpret `false` as
+    // "this proof is invalid" make the wrong decision (e.g., dropping
+    // a perfectly valid proof from the merge candidates) when the
+    // real cause is "we never bootstrapped". Throw NOT_INITIALIZED
+    // so callers either (a) escalate, or (b) explicitly catch and
+    // treat it as a soft failure with eyes open.
+    if (this.trustBase === null) {
+      throw new SphereError(
+        'verifyInclusionProof: trustBase not loaded — call initialize() first',
+        'NOT_INITIALIZED',
+      );
+    }
+    // Wave I.6 + Wave J: sanity-check that transactionHash looks
+    // like a DataHash imprint hex (algorithm-prefix + digest). The
+    // SDK currently emits 68 chars (sha2-256 = 2-byte prefix + 32-
+    // byte digest), but other algorithms in HashAlgorithm.js produce
+    // different imprint lengths (sha224 → 60, sha384 → 100, sha512
+    // → 132, ripemd160 → 44). Hardcoding length=68 silently rejected
+    // every non-sha256 imprint. Now check format only — non-empty
+    // even-length lowercase-hex with length >= 4 (smallest possible
+    // imprint = 1-byte multihash code + 1-byte length + 0-byte
+    // digest, fictional but lower bound). The byte-comparison at
+    // line ~545 catches genuine value mismatches.
+    if (
+      typeof input.transactionHash !== 'string' ||
+      input.transactionHash.length < 4 ||
+      input.transactionHash.length % 2 !== 0 ||
+      !/^[0-9a-f]+$/.test(input.transactionHash)
+    ) {
+      logger.debug(
+        'Aggregator',
+        'verifyInclusionProof: transactionHash must be even-length lowercase hex (got=' +
+          (typeof input.transactionHash === 'string' ? input.transactionHash : typeof input.transactionHash) +
+          ')',
+      );
+      return false;
+    }
+    // Wave I.7: cache key composes proofHash (when supplied) with
+    // transactionHash so two distinct proofs attesting the same tx
+    // do not collide. A forged proof returning false → cached →
+    // genuine proof for same tx returns false-from-cache scenario
+    // is closed by including the proof's own ContentHash in the key.
+    const cacheKey = input.proofHash
+      ? `${input.proofHash}:${input.transactionHash}`
+      : input.transactionHash;
+    const cached = this.inclusionProofCache.get(cacheKey);
+    if (cached !== undefined) {
+      // Wave I.4-related: refresh insertion order so the cache
+      // approximates LRU semantics. Map.set on an existing key does
+      // NOT change insertion order; delete-then-set does.
+      this.inclusionProofCache.delete(cacheKey);
+      this.inclusionProofCache.set(cacheKey, cached);
+      return cached;
+    }
+
+    let result = false;
+    try {
+      const proof = SdkInclusionProof.fromJSON(input.proofJson);
+      // Without a bound authenticator, no requestId can be derived;
+      // a non-inclusion proof would lack an authenticator and is
+      // not a candidate for Rule 4 enrichment anyway. Fail-closed.
+      if (!proof.authenticator) {
+        result = false;
+      } else {
+        // Defense: bind the proof to the transactionHash the caller
+        // claims it attests. If the proof's transactionHash field
+        // is null (non-inclusion shape) or doesn't match, refuse.
+        const proofTxHashHex = proof.transactionHash
+          ? Array.from(proof.transactionHash.imprint as Uint8Array)
+              .map((b: number) => b.toString(16).padStart(2, '0'))
+              .join('')
+          : null;
+        if (proofTxHashHex === null) {
+          result = false;
+        } else if (
+          !input.transactionHash ||
+          input.transactionHash.toLowerCase() !== proofTxHashHex.toLowerCase()
+        ) {
+          // The proof attests a DIFFERENT tx than the caller claimed
+          // — replay/grafting attempt. Refuse.
+          //
+          // Wave J.b: log the mismatch at debug level. Surfaces the
+          // common bug of passing a 64-char digest hex instead of a
+          // 68-char DataHash imprint hex (a relaxed format check
+          // accepts both lengths but the byte comparison must
+          // genuinely match, so a digest-only input produces a
+          // length mismatch that's worth diagnosing).
+          logger.debug(
+            'Aggregator',
+            `verifyInclusionProof: transactionHash mismatch (input=${input.transactionHash}, ` +
+              `proof.transactionHash.imprint=${proofTxHashHex}). ` +
+              `Hint: callers must pass the SDK-encoded DataHash imprint ` +
+              `(typically 68 chars for sha2-256), not the 64-char digest.`,
+          );
+          result = false;
+        } else {
+          const requestId = await RequestId.create(
+            proof.authenticator.publicKey,
+            proof.authenticator.stateHash,
+          );
+          const status = await proof.verify(this.trustBase, requestId);
+          result = status === InclusionProofVerificationStatus.OK;
+        }
+      }
+    } catch (err) {
+      logger.debug('Aggregator', 'verifyInclusionProof failed (treated as invalid)', err);
+      result = false;
+    }
+
+    // Bound the cache; evict oldest entries on overflow.
+    if (this.inclusionProofCache.size >= UnicityAggregatorProvider.INCLUSION_PROOF_CACHE_MAX) {
+      const firstKey = this.inclusionProofCache.keys().next().value;
+      if (firstKey !== undefined) this.inclusionProofCache.delete(firstKey);
+    }
+    this.inclusionProofCache.set(cacheKey, result);
+    return result;
+  }
+
   async isSpent(stateHash: string): Promise<boolean> {
-    // Check cache first (spent is immutable)
+    // Check cache first (spent is immutable). Wave L: LRU touch on
+    // hit so frequently-accessed stateHashes survive eviction longer.
     if (this.spentCache.has(stateHash)) {
-      return this.spentCache.get(stateHash)!;
+      const cached = this.spentCache.get(stateHash)!;
+      this.spentCache.delete(stateHash);
+      this.spentCache.set(stateHash, cached);
+      return cached;
     }
 
     this.ensureConnected();
 
+    // Wave 3 / steelman: do NOT fail-open on RPC failure. The previous
+    // behaviour (`return false`) opened a double-spend window when the
+    // aggregator was network-partitioned or a relay-MitM dropped the
+    // isSpent request: the recipient would treat an unverifiable state
+    // as "confirmed unspent" and accept the proof. We now PROPAGATE the
+    // failure as a typed `AGGREGATOR_ERROR` so callers can distinguish
+    // "verified unspent (aggregator said no)" from "couldn't check".
+    //
+    // Important caching contract: we still cache only `spent: true`
+    // (immutable). Confirmed `false` is NOT cached because the answer
+    // can change at any moment when the owner spends the state. A
+    // throw here is NEVER cached — the next call retries the RPC.
+    //
+    // The disposition-engine's [E] hook (`oracleIsSpent`) already wraps
+    // the call in try/catch and routes throws to STRUCTURAL_INVALID per
+    // §5.3 [A] (see modules/payments/transfer/disposition-engine.ts:786
+    // and :1020), so this change is non-breaking for the production
+    // path and turns a silent fail-open into a deterministic
+    // structural rejection that a later bundle can recover from.
+    let response: RpcSpentResponse;
     try {
-      const response = await this.rpcCall<RpcSpentResponse>('isSpent', { stateHash });
-      const spent = response.spent ?? false;
-
-      // Cache result
-      if (spent) {
-        this.spentCache.set(stateHash, true);
-      }
-
-      return spent;
+      response = await this.rpcCall<RpcSpentResponse>('isSpent', { stateHash });
     } catch (error) {
-      logger.warn('Aggregator', 'isSpent check failed, assuming unspent', error);
-      return false;
+      const cause = error instanceof Error ? error.message : String(error);
+      logger.warn('Aggregator', 'isSpent RPC failed; refusing to fail-open', error);
+      throw new SphereError(
+        `isSpent: aggregator RPC failed (${cause})`,
+        'AGGREGATOR_ERROR',
+        error,
+      );
     }
+    const spent = response.spent ?? false;
+
+    // Cache result (Wave L: bounded with LRU eviction)
+    if (spent) {
+      this.cacheSpent(stateHash);
+    }
+
+    return spent;
   }
 
   async getTokenState(tokenId: string): Promise<TokenState | null> {

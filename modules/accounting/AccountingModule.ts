@@ -11,7 +11,12 @@
 
 import { logger } from '../../core/logger.js';
 import { SphereError } from '../../core/errors.js';
+import {
+  hexToBytes as strictHexToBytes,
+  hexToBytesAllowEmpty as strictHexToBytesAllowEmpty,
+} from '../../core/hex.js';
 import { AsyncGateMap } from '../../core/async-gate.js';
+import { CidRefStore, type CidRef } from '../../profile/cid-ref-store.js';
 import { STORAGE_KEYS_ADDRESS, INVOICE_TOKEN_TYPE_HEX, getAddressStorageKey, getAddressId } from '../../constants.js';
 import type {
   IncomingTransfer,
@@ -60,7 +65,7 @@ import { canonicalSerialize } from './serialization.js';
 import { hexToBytes } from '@noble/hashes/utils.js';
 import { computeInvoiceStatus, freezeBalances } from './balance-computer.js';
 import { TokenRegistry } from '../../registry/index.js';
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
+ 
 import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token.js';
 import { txfToToken } from '../../serialization/txf-serializer.js';
 
@@ -162,6 +167,29 @@ export class AccountingModule {
   private frozenBalances: Map<string, FrozenInvoiceBalances> = new Map();
 
   // ---------------------------------------------------------------------------
+  // T.7.D / W21: Forced-conservative coercion for escrow-bridged invoices
+  // ---------------------------------------------------------------------------
+  //
+  // When a higher-level orchestrator (e.g. SwapModule) routes a payInvoice()
+  // through a deposit invoice owned by an external escrow, the orchestrator
+  // marks the invoice via `markInvoiceEscrowBridged(invoiceId)`. Subsequent
+  // `payInvoice(invoiceId, …)` calls then silently coerce
+  // `allowPendingTokens` to `false` (§2.5 last paragraph) regardless of the
+  // caller's value, surfacing the override via TransferResult.overrides.
+  //
+  // Not persisted: the set is rebuilt on each session by the orchestrator
+  // when it rehydrates its own state (e.g. SwapModule.load() repopulates
+  // invoiceToSwapIndex). This avoids cross-module storage coupling.
+  private escrowBridgedInvoices: Set<string> = new Set();
+
+  /**
+   * Override marker emitted in TransferResult.overrides whenever
+   * `payInvoice()` silently coerces `allowPendingTokens=true` to `false`
+   * because the invoice is bridged to escrow.
+   */
+  static readonly OVERRIDE_FORCED_CONSERVATIVE = 'allowPendingTokens-coerced-to-false';
+
+  // ---------------------------------------------------------------------------
   // Auto-return settings (in-memory, persisted via storage)
   // ---------------------------------------------------------------------------
 
@@ -232,6 +260,18 @@ export class AccountingModule {
 
   /** W2 fix: Serialization guard for _flushDirtyLedgerEntries. */
   private _flushPromise: Promise<void> | null = null;
+
+  /**
+   * Memoization of the last successful CID pin per invoice
+   * (PROFILE-CID-REFERENCES.md §8.3). AES-GCM uses random IVs so re-pinning
+   * identical plaintext produces a different CID; the memo skips re-pinning
+   * when the entries-for-invoice JSON is byte-identical to the last pin.
+   *
+   * Keyed by invoiceId — each invoice has its own KV key and therefore its
+   * own pin lifecycle. Memo entries are cleared when an invoice is
+   * terminated (closed/cancelled) since no further writes should occur.
+   */
+  private _lastPinnedLedgerByInvoice = new Map<string, { json: string; ref: CidRef }>();
 
   // ---------------------------------------------------------------------------
   // Per-invoice concurrency gate (promise chain)
@@ -563,9 +603,13 @@ export class AccountingModule {
     // C5 fix: Await the save — fire-and-forget risks losing reconstructed
     // frozen balances on crash, leaving recovery in a loop.
     if (anyReconstructed) {
+      // W11 (T-D8): reconciliation snapshot of derived state —
+      // housekeeping, not a user action (the original close/cancel
+      // that generated this terminal state happened in a prior session).
       await this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.FROZEN_BALANCES,
         Object.fromEntries(this.frozenBalances),
+        'cache_index',
       );
     }
 
@@ -986,13 +1030,18 @@ export class AccountingModule {
     if (!privateKeyHex) {
       throw new SphereError('Private key required for invoice creation', 'NOT_INITIALIZED');
     }
-    const hexMatches = privateKeyHex.match(/.{1,2}/g);
-    if (!hexMatches) {
-      throw new SphereError('Invalid private key format', 'NOT_INITIALIZED');
+    // Steelman³⁶: consolidated to core/hex.ts:hexToBytes via the shared
+    // import. RangeError → SphereError remap so the contract stays the
+    // same for callers (NOT_INITIALIZED on malformed identity input).
+    let signingKeyBytes: Uint8Array;
+    try {
+      signingKeyBytes = strictHexToBytes(privateKeyHex);
+    } catch (err) {
+      throw new SphereError(
+        `Invalid private key format: ${err instanceof Error ? err.message : String(err)}`,
+        'NOT_INITIALIZED',
+      );
     }
-    const signingKeyBytes = new Uint8Array(
-      hexMatches.map((byte) => parseInt(byte, 16)),
-    );
     const saltInput = new Uint8Array(signingKeyBytes.length + invoiceBytesEncoded.length);
     saltInput.set(signingKeyBytes, 0);
     saltInput.set(invoiceBytesEncoded, signingKeyBytes.length);
@@ -1046,7 +1095,7 @@ export class AccountingModule {
       const { TokenState } = await import(
         '@unicitylabs/state-transition-sdk/lib/token/TokenState.js'
       );
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+       
       const { Token: SdkToken } = await import(
         '@unicitylabs/state-transition-sdk/lib/token/Token.js'
       );
@@ -1359,7 +1408,7 @@ export class AccountingModule {
     // tokenData may be plain JSON or hex-encoded UTF-8 JSON
     // (state-transition-sdk stores it as hex via HexConverter.encode).
     let jsonString = tokenData;
-    if (!/^\s*[\[{"]/.test(tokenData)) {
+    if (!/^\s*[[{"]/.test(tokenData)) {
       // Doesn't look like JSON — attempt hex decode
       try {
         const bytes = hexToBytes(tokenData);
@@ -2198,14 +2247,19 @@ export class AccountingModule {
       // The terminal set write is the commit point — if we crash between writes,
       // the invoice is NOT terminal on recovery (safe to re-close).
       this.frozenBalances.set(invoiceId, frozen);
+      // W11 (T-D8): frozen balances snapshot is derived-state housekeeping;
+      // the CLOSED-set write below is the commit point that carries the
+      // `invoice_close` user-action tag.
       await this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.FROZEN_BALANCES,
         Object.fromEntries(this.frozenBalances),
+        'cache_index',
       );
       this.closedInvoices.add(invoiceId);
       await this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.CLOSED_INVOICES,
         Array.from(this.closedInvoices),
+        'invoice_close',
       );
 
       if (this.config.debug) {
@@ -2298,14 +2352,19 @@ export class AccountingModule {
       // The terminal set write is the commit point — if we crash between writes,
       // the invoice is NOT terminal on recovery (safe to re-cancel).
       this.frozenBalances.set(invoiceId, frozen);
+      // W11 (T-D8): frozen balances snapshot is derived-state housekeeping;
+      // the CANCELLED-set write below is the commit point that carries the
+      // `invoice_cancel` user-action tag.
       await this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.FROZEN_BALANCES,
         Object.fromEntries(this.frozenBalances),
+        'cache_index',
       );
       this.cancelledInvoices.add(invoiceId);
       await this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.CANCELLED_INVOICES,
         Array.from(this.cancelledInvoices),
+        'invoice_cancel',
       );
 
       if (this.config.debug) {
@@ -2328,6 +2387,51 @@ export class AccountingModule {
     });
   }
 
+  // ===========================================================================
+  // T.7.D / W21: Escrow-bridged invoice registry (public API for orchestrators)
+  // ===========================================================================
+
+  /**
+   * Mark an invoice as bridged to an external escrow flow.
+   *
+   * Higher-level orchestrators (SwapModule, future P2P trading flows) call
+   * this when they receive a deposit invoice from an escrow service. From
+   * that moment on, any caller-supplied `allowPendingTokens=true` on
+   * `payInvoice(invoiceId, …)` is silently coerced to `false` per §2.5 last
+   * paragraph, and `TransferResult.overrides` carries the
+   * `'allowPendingTokens-coerced-to-false'` marker so callers can audit the
+   * coercion.
+   *
+   * Idempotent: re-marking an already-marked invoice is a no-op.
+   *
+   * @param invoiceId - The invoice token ID to mark as escrow-bridged.
+   */
+  markInvoiceEscrowBridged(invoiceId: string): void {
+    this.escrowBridgedInvoices.add(invoiceId);
+  }
+
+  /**
+   * Remove the escrow-bridged marker for an invoice (e.g., after the swap
+   * reaches a terminal state and no further payInvoice() calls should be
+   * coerced). Idempotent.
+   *
+   * @param invoiceId - The invoice token ID to unmark.
+   */
+  unmarkInvoiceEscrowBridged(invoiceId: string): void {
+    this.escrowBridgedInvoices.delete(invoiceId);
+  }
+
+  /**
+   * Whether the given invoice is currently registered as bridged to an
+   * external escrow flow. Exposed primarily for tests and audit tooling.
+   *
+   * @param invoiceId - The invoice token ID to check.
+   * @returns `true` if the invoice is escrow-bridged.
+   */
+  isInvoiceEscrowBridged(invoiceId: string): boolean {
+    return this.escrowBridgedInvoices.has(invoiceId);
+  }
+
   /**
    * Pay an invoice — send tokens referencing the given invoice (§2.1, §8.5).
    *
@@ -2337,10 +2441,20 @@ export class AccountingModule {
    * 3. Auto-populates contact info from identity.directAddress if not provided.
    * 4. Calls PaymentsModule.send().
    *
+   * §2.5 forced-conservative coercion (T.7.D / W21):
+   *   When the invoice has been marked escrow-bridged (see
+   *   `markInvoiceEscrowBridged()`), a caller-supplied
+   *   `params.allowPendingTokens = true` is silently coerced to `false`
+   *   before being forwarded to `payments.send()`. The returned
+   *   `TransferResult` carries `overrides: ['allowPendingTokens-coerced-to-false']`
+   *   so callers can audit the coercion. Non-escrow invoice flows pass the
+   *   flag through verbatim and surface no override marker.
+   *
    * @param invoiceId - The invoice token ID.
    * @param params    - Pay parameters: targetIndex, assetIndex?, amount?, freeText?,
-   *                    refundAddress?, contact?.
-   * @returns TransferResult from PaymentsModule.send().
+   *                    refundAddress?, contact?, allowPendingTokens?.
+   * @returns TransferResult from PaymentsModule.send(), with `overrides`
+   *          augmented when forced-conservative coercion was applied.
    *
    * @throws {SphereError} `INVOICE_NOT_FOUND` — invoice token not found locally.
    * @throws {SphereError} `INVOICE_TERMINATED` — invoice is CLOSED or CANCELLED.
@@ -2493,25 +2607,45 @@ export class AccountingModule {
       // §4.4: Build transport memo
       const memo = buildInvoiceMemo(invoiceId, 'F', params.freeText);
 
+      // §2.5 (T.7.D / W21): forced-conservative coercion when the invoice
+      // bridges to an external escrow. We compute `effectiveAllowPending`
+      // and a `coerced` flag here — the flag drives the override marker
+      // appended to the eventual TransferResult below. Coercion is silent:
+      // we do NOT throw, we do NOT log a warning by default (debug mode
+      // logs at info level so audit traces still capture it).
+      const requestedAllowPending = params.allowPendingTokens === true;
+      const isEscrowBridged = this.escrowBridgedInvoices.has(invoiceId);
+      const coerced = requestedAllowPending && isEscrowBridged;
+      const effectiveAllowPending = coerced ? false : requestedAllowPending;
+
       if (this.config.debug) {
         logger.debug(
           LOG_TAG,
-          `payInvoice(${invoiceId}) → target=${target.address} coinId=${coinId} amount=${sendAmount}`,
+          `payInvoice(${invoiceId}) → target=${target.address} coinId=${coinId} amount=${sendAmount}` +
+            (coerced
+              ? ' [forced-conservative: allowPendingTokens coerced from true to false (escrow-bridged invoice)]'
+              : ''),
         );
       }
 
       // §5.9: Apply 60-second timeout to send() within the gate (matches returnInvoicePayment)
+      // T.7.C — pass `transferMode: 'instant'` explicitly per §10.1. The default is already
+      // `'instant'` at the PaymentsModule layer, but every production call-site of
+      // `payments.send()` MUST be explicit so the audit shim removal (T.1.B.2) can prove
+      // there are no implicit-default consumers when the type-level default flips later.
       const sendPromise = deps.payments.send({
         recipient: target.address,
         amount: sendAmount,
         coinId,
         memo,
+        transferMode: 'instant',
         invoiceRefundAddress: params.refundAddress,
         invoiceContact: effectiveContact,
         // R23 fix: forward transferMode so callers can opt into
         // 'conservative' (proof-on-sender) delivery for forwarding flows
         // like withdraw. Undefined preserves existing instant-mode default.
         ...(params.transferMode !== undefined ? { transferMode: params.transferMode } : {}),
+        allowPendingTokens: effectiveAllowPending,
       });
 
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -2557,6 +2691,22 @@ export class AccountingModule {
           // over-coverage on receivers without this — see the audit and the
           // helper docstring for the full rationale and implementation notes.
           await this._persistProvisionalAndVerify(invoiceId, 'payInvoice');
+        }
+
+        // T.7.D / W21: surface the forced-conservative coercion to the caller
+        // by appending the override marker to TransferResult.overrides without
+        // mutating any other field. Preserves backward compatibility with
+        // callers that ignore the field.
+        if (coerced) {
+          const existingOverrides = result.overrides ?? [];
+          const marker = AccountingModule.OVERRIDE_FORCED_CONSERVATIVE;
+          // Idempotent: do not append the marker if a downstream layer already
+          // added it (e.g. a future PaymentsModule that performs its own
+          // coercion). Set semantics — order is informational.
+          const merged = existingOverrides.includes(marker)
+            ? existingOverrides
+            : [...existingOverrides, marker];
+          return { ...result, overrides: merged };
         }
 
         return result;
@@ -2757,11 +2907,14 @@ export class AccountingModule {
       }
 
       // §5.9: Apply 60-second timeout to send() within the gate
+      // T.7.C — explicit `transferMode: 'instant'` per §10.1 (production call-site
+      // migration). Same rationale as the payInvoice site at the top of the gate.
       const sendPromise = deps.payments.send({
         recipient: senderAddress,
         amount: params.amount,
         coinId,
         memo,
+        transferMode: 'instant',
       });
 
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -3583,19 +3736,26 @@ export class AccountingModule {
     // frozen balances FIRST, then terminal set. The terminal set write is the
     // commit point — crash between writes = not terminal on recovery.
     this.frozenBalances.set(invoiceId, frozen);
+    // W11 (T-D8): frozen balances snapshot is derived-state housekeeping;
+    // the terminal-set write below carries the `invoice_close` /
+    // `invoice_cancel` user-action tag matching the implicit termination
+    // direction.
     await this.saveJsonToStorage(
       STORAGE_KEYS_ADDRESS.FROZEN_BALANCES,
       Object.fromEntries(this.frozenBalances),
+      'cache_index',
     );
     if (state === 'CLOSED') {
       await this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.CLOSED_INVOICES,
         Array.from(this.closedInvoices),
+        'invoice_close',
       );
     } else {
       await this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.CANCELLED_INVOICES,
         Array.from(this.cancelledInvoices),
+        'invoice_cancel',
       );
     }
 
@@ -3700,7 +3860,8 @@ export class AccountingModule {
           try {
             // Steelman fix: Wrap send() with 60s timeout, matching Fix 3 pattern in
             // _executeTerminationReturns. Without this, a hung send holds the gate indefinitely.
-            const arSendPromise = deps.payments.send({ recipient, amount, coinId, memo });
+            // T.7.C — explicit `transferMode: 'instant'` per §10.1 (production call-site migration).
+            const arSendPromise = deps.payments.send({ recipient, amount, coinId, memo, transferMode: 'instant' });
             let arSendTimer: ReturnType<typeof setTimeout> | undefined;
             const arSendTimeout = new Promise<never>((_, reject) => {
               arSendTimer = setTimeout(
@@ -3864,7 +4025,8 @@ export class AccountingModule {
             // BUG-002 Fix 3: Wrap send() in Promise.race with 60s timeout, matching
             // returnInvoicePayment() pattern. Without this, a hung send blocks all
             // subsequent returns and holds the invoice gate indefinitely.
-            const sendPromise = deps.payments.send({ recipient, amount, coinId, memo });
+            // T.7.C — explicit `transferMode: 'instant'` per §10.1 (production call-site migration).
+            const sendPromise = deps.payments.send({ recipient, amount, coinId, memo, transferMode: 'instant' });
             let sendTimer: ReturnType<typeof setTimeout> | undefined;
             const sendTimeoutPromise = new Promise<never>((_, reject) => {
               sendTimer = setTimeout(
@@ -4001,39 +4163,76 @@ export class AccountingModule {
   // Internal: Terminal set persistence helpers
   // ===========================================================================
 
-  /** Persist frozen balances map to storage. */
+  /**
+   * Persist frozen balances map to storage.
+   *
+   * W11 (T-D8): frozen balances are derived-state housekeeping — the
+   * user action that triggered the freeze (close / cancel / implicit
+   * terminate) is committed by a separate terminal-set write that
+   * carries the `invoice_close` / `invoice_cancel` tag. Hence
+   * `cache_index` here is correct regardless of caller context.
+   */
   private async _persistFrozenBalances(): Promise<void> {
     const frozenObj: FrozenBalancesStorage = {};
     for (const [invoiceId, frozen] of this.frozenBalances) {
       frozenObj[invoiceId] = frozen;
     }
-    await this.saveJsonToStorage(STORAGE_KEYS_ADDRESS.FROZEN_BALANCES, frozenObj);
+    await this.saveJsonToStorage(
+      STORAGE_KEYS_ADDRESS.FROZEN_BALANCES,
+      frozenObj,
+      'cache_index',
+    );
   }
 
-  /** Persist both terminal sets (CANCELLED and CLOSED) to storage. */
+  /**
+   * Persist both terminal sets (CANCELLED and CLOSED) to storage.
+   *
+   * W11 (T-D8): this helper is a bulk snapshot of BOTH sets — called
+   * from contexts where either set may have changed (load
+   * reconciliation, auto-close on coverage). Classifying as
+   * `cache_index` is a deliberate choice: the caller-side user-action
+   * commit points in `closeInvoice` / `cancelInvoice` / `_terminateInvoice`
+   * already write only the single mutated set with the specific
+   * `invoice_close` / `invoice_cancel` tag; this bulk re-snapshot is
+   * defensive housekeeping (and on the load path the "user action"
+   * already happened in a prior session).
+   */
   private async _persistTerminalSets(): Promise<void> {
     await Promise.all([
       this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.CANCELLED_INVOICES,
         Array.from(this.cancelledInvoices),
+        'cache_index',
       ),
       this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.CLOSED_INVOICES,
         Array.from(this.closedInvoices),
+        'cache_index',
       ),
     ]);
   }
 
-  /** Persist auto-return settings (global flag + per-invoice map) to storage. */
+  /**
+   * Persist auto-return settings (global flag + per-invoice map) to storage.
+   *
+   * W11 (T-D8): auto-return settings are preferences / housekeeping
+   * state (per SPEC §10.2.3 → "auto-return ledger" is `cache_index`).
+   * The user-action triggers (close / cancel) carry their own tag at
+   * the terminal-set commit point; this settings write is ancillary.
+   */
   private async _persistAutoReturnSettings(): Promise<void> {
     const perInvoice: Record<string, boolean> = {};
     for (const [id, enabled] of this.autoReturnPerInvoice.entries()) {
       perInvoice[id] = enabled;
     }
-    await this.saveJsonToStorage(STORAGE_KEYS_ADDRESS.AUTO_RETURN, {
-      global: this.autoReturnGlobal,
-      perInvoice,
-    });
+    await this.saveJsonToStorage(
+      STORAGE_KEYS_ADDRESS.AUTO_RETURN,
+      {
+        global: this.autoReturnGlobal,
+        perInvoice,
+      },
+      'cache_index',
+    );
   }
 
   // ===========================================================================
@@ -4142,11 +4341,16 @@ export class AccountingModule {
       }
 
       try {
+        // T.7.C — explicit `transferMode: 'instant'` per §10.1 (production call-site migration).
+        // Crash-recovery replays a previously-intended auto-return; the original intent's
+        // wire shape was 'instant' (no other mode is selected by AccountingModule today),
+        // so explicit re-statement keeps the replay byte-equivalent post-default-flip.
         const result = await deps.payments.send({
           recipient: entry.recipient,
           amount: entry.amount,
           coinId: entry.coinId,
           memo: entry.memo,
+          transferMode: 'instant',
         });
 
         const returnTransferId = result.id;
@@ -4241,7 +4445,18 @@ export class AccountingModule {
       try {
         const raw = await this.deps!.storage.get(key);
         if (!raw) continue;
-        const entries = JSON.parse(raw) as Record<string, InvoiceTransferRef>;
+        // Dual-read per PROFILE-CID-REFERENCES.md §6: detects CID ref and
+        // fetches from IPFS, or falls through to legacy inline JSON.
+        // `_parseLedgerPayload` returns `null` on corrupt shape (not an
+        // object) — caller treats the same as the existing parse-error path:
+        // reset the inner map and rescan. CID_REF_UNREADABLE (ref present +
+        // no cidRefStore) propagates through the outer try/catch as a
+        // corruption signal (safe — the reset-and-rescan path rebuilds from
+        // on-chain data).
+        const entries = await this._parseLedgerPayload(raw, invoiceId);
+        if (entries === null) {
+          throw new Error(`_parseLedgerPayload returned null for invoice ${invoiceId}`);
+        }
         const innerMap = this.invoiceLedger.get(invoiceId)!;
         const now = Date.now();
         const PROVISIONAL_TTL_MS = 10 * 60 * 1000; // 10 minutes
@@ -4469,15 +4684,15 @@ export class AccountingModule {
       if (!tx?.data?.['message']) continue;
 
       // Decode hex-encoded UTF-8 JSON message to TransferMessagePayload
+      // Steelman³² + ³⁴: use the central strictHexToBytesAllowEmpty
+      // helper — accepts empty (returns empty bytes; decoder falls
+      // through to "no payload"), rejects odd-length and non-hex.
       let payload: TransferMessagePayload | null = null;
       try {
         const hexStr = tx.data['message'] as string;
         if (!hexStr || hexStr.length > 8192) continue;
-        // W10 fix: validate hex chars before parseInt to avoid NaN bytes
-        if (!/^[0-9a-fA-F]*$/.test(hexStr)) continue;
-        const matches = hexStr.match(/.{1,2}/g);
-        if (!matches) continue;
-        const bytes = new Uint8Array(matches.map((b) => parseInt(b, 16)));
+        const bytes = strictHexToBytesAllowEmpty(hexStr);
+        if (bytes.length === 0) continue;
         payload = decodeTransferMessage(bytes);
       } catch {
         continue;
@@ -5870,7 +6085,9 @@ export class AccountingModule {
 
     // §6.2 step 7e: Expiry check — fire informational expired event if dueDate passed
     if (
-      terms.dueDate !== undefined &&
+      // typeof === 'number' rejects both undefined AND the null produced by
+      // canonicalSerialize round-trip (see balance-computer.ts state guard).
+      typeof terms.dueDate === 'number' &&
       Date.now() > terms.dueDate &&
       status.state !== 'COVERED' &&
       status.state !== 'CLOSED' &&
@@ -6117,7 +6334,8 @@ export class AccountingModule {
     }
 
     if (
-      terms.dueDate !== undefined &&
+      // Same null-after-round-trip guard as above and balance-computer.ts.
+      typeof terms.dueDate === 'number' &&
       Date.now() > terms.dueDate &&
       status.state !== 'COVERED' &&
       status.state !== 'CLOSED' &&
@@ -6194,11 +6412,13 @@ export class AccountingModule {
     // (causing duplicate payment on crash recovery).
     try {
       // Steelman fix: Wrap send() with 60s timeout for consistency with all other send paths.
+      // T.7.C — explicit `transferMode: 'instant'` per §10.1 (production call-site migration).
       const evtSendPromise = deps.payments.send({
         recipient: sendParams.returnTo,
         amount: sendParams.amount,
         coinId: sendParams.coinId,
         memo: sendParams.memo,
+        transferMode: 'instant',
       });
       let evtSendTimer: ReturnType<typeof setTimeout> | undefined;
       const evtSendTimeout = new Promise<never>((_, reject) => {
@@ -6525,10 +6745,7 @@ export class AccountingModule {
         entries[k] = v;
       }
       try {
-        await this.deps!.storage.set(
-          this.getStorageKey(`${INV_LEDGER_PREFIX}${invoiceId}`),
-          JSON.stringify(entries),
-        );
+        await this._persistLedgerForInvoice(invoiceId, entries);
         written.add(invoiceId);
       } catch (err) {
         logger.warn(LOG_TAG, `Failed to persist ledger for invoice ${invoiceId} — aborting flush`, err);
@@ -6545,13 +6762,23 @@ export class AccountingModule {
     if (step1Failed) return;
 
     // Step 2: Write token_scan_state
+    // W11 (T-D8): the scan watermark is per-token processing state —
+    // pure bookkeeping, not itself a user action. The user action
+    // (payment attribution) is already persisted by step 1's per-invoice
+    // ledger write which carries the `invoice_pay` tag.
     const scanStateObj: Record<string, number> = {};
     for (const [tokenId, count] of this.tokenScanState.entries()) {
       scanStateObj[tokenId] = count;
     }
-    await this.saveJsonToStorage(STORAGE_KEYS_ADDRESS.TOKEN_SCAN_STATE, scanStateObj);
+    await this.saveJsonToStorage(
+      STORAGE_KEYS_ADDRESS.TOKEN_SCAN_STATE,
+      scanStateObj,
+      'cache_index',
+    );
 
     // Step 3: Write INV_LEDGER_INDEX
+    // W11 (T-D8): the index is a derived-state metadata snapshot of
+    // which invoices exist and their terminal/frozen state — housekeeping.
     const indexMeta: InvLedgerIndex = {};
     for (const invoiceId of this.invoiceLedger.keys()) {
       indexMeta[invoiceId] = {
@@ -6559,7 +6786,11 @@ export class AccountingModule {
         frozenAt: this.frozenBalances.get(invoiceId)?.frozenAt,
       };
     }
-    await this.saveJsonToStorage(STORAGE_KEYS_ADDRESS.INV_LEDGER_INDEX, indexMeta);
+    await this.saveJsonToStorage(
+      STORAGE_KEYS_ADDRESS.INV_LEDGER_INDEX,
+      indexMeta,
+      'cache_index',
+    );
 
     // W9 fix: clear tokenScanDirty AFTER all 3 steps complete, not between steps 2 and 3.
     // If step 3 fails, the dirty flag remains set so the next flush retries.
@@ -6580,6 +6811,111 @@ export class AccountingModule {
       this.tokenInvoiceMap.set(tokenId, set);
     }
     set.add(invoiceId);
+  }
+
+  // ===========================================================================
+  // Internal: Per-invoice ledger CID-ref persistence (PROFILE-CID-REFERENCES.md §8.3)
+  // ===========================================================================
+
+  /**
+   * Persist an invoice's ledger entries — via CID reference when
+   * `cidRefStore` is injected, inline JSON otherwise. Pattern A per-invoice
+   * per spec §8.3. Each invoice has its own KV key and its own memo slot,
+   * so pins/refs for different invoices never collide.
+   *
+   * Memoization: if the serialized entries match the last successful pin
+   * for this invoice, reuse the cached ref rather than re-pinning (AES-GCM
+   * random IVs would otherwise churn a new CID on every unchanged flush).
+   */
+  private async _persistLedgerForInvoice(
+    invoiceId: string,
+    entries: Record<string, InvoiceTransferRef>,
+  ): Promise<void> {
+    const key = this.getStorageKey(`${INV_LEDGER_PREFIX}${invoiceId}`);
+    const cidRefStore = this.deps!.cidRefStore;
+
+    if (cidRefStore) {
+      const json = JSON.stringify(entries);
+
+      // Memo hit — identical plaintext, reuse cached ref.
+      const cached = this._lastPinnedLedgerByInvoice.get(invoiceId);
+      if (cached && cached.json === json) {
+        // W11 (T-D8): per-invoice ledger entries persist payment
+        // attributions for this invoice — user action `invoice_pay`.
+        await this.setStorageEntry(key, CidRefStore.stringifyRef(cached.ref), 'invoice_pay');
+        return;
+      }
+
+      const ref = await cidRefStore.pinJson(entries);
+      await this.setStorageEntry(key, CidRefStore.stringifyRef(ref), 'invoice_pay');
+      // Update memo AFTER successful storage.set — a set-failure must not
+      // leave us pointing at a CID the caller thinks is live.
+      this._lastPinnedLedgerByInvoice.set(invoiceId, { json, ref });
+      return;
+    }
+
+    // Legacy path: inline JSON.
+    await this.setStorageEntry(key, JSON.stringify(entries), 'invoice_pay');
+  }
+
+  /**
+   * Parse a raw ledger KV payload for one invoice — dual-read per §6:
+   *   - CID ref envelope → fetch from IPFS via `cidRefStore`.
+   *   - No cidRefStore but ref present → throw CID_REF_UNREADABLE (silent
+   *     fallback would mean silently losing all tracked payments for this
+   *     invoice, corrupting balance computation).
+   *   - Legacy inline JSON → parse with narrow SyntaxError catch.
+   *
+   * Returns `null` on malformed non-ref data; caller treats that as
+   * "reset this invoice's inner map and force rescan" (same contract as
+   * the pre-refactor try/catch at the load call site).
+   */
+  private async _parseLedgerPayload(
+    raw: string,
+    invoiceId: string,
+  ): Promise<Record<string, InvoiceTransferRef> | null> {
+    const ref = CidRefStore.tryParseRef(raw);
+    if (ref) {
+      if (!this.deps!.cidRefStore) {
+        const { ProfileError } = await import('../../profile/errors.js');
+        throw new ProfileError(
+          'CID_REF_UNREADABLE',
+          `AccountingModule._parseLedgerPayload: ledger for invoice ${invoiceId} ` +
+            `contains a CID ref (cid=${ref.cid}) but no cidRefStore was injected. ` +
+            `Invoice payments cannot be restored without IPFS access. ` +
+            `Check AccountingModule init — is cidRefStore provided?`,
+        );
+      }
+      const fetched = await this.deps!.cidRefStore.fetchJson<Record<string, InvoiceTransferRef>>(ref);
+      // Defensive shape check — IPFS content should be a plain object map.
+      if (fetched === null || typeof fetched !== 'object' || Array.isArray(fetched)) {
+        logger.warn(
+          LOG_TAG,
+          `[LEDGER] CID-ref content at ${ref.cid} for invoice ${invoiceId} is not an object (got ${typeof fetched}); treating as corrupt.`,
+        );
+        return null;
+      }
+      return fetched;
+    }
+
+    // Legacy inline JSON — narrow catch for corruption.
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        logger.warn(
+          LOG_TAG,
+          `[LEDGER] Decoded data for invoice ${invoiceId} is not an object (got ${typeof parsed}); treating as corrupt.`,
+        );
+        return null;
+      }
+      return parsed as Record<string, InvoiceTransferRef>;
+    } catch (err) {
+      if (err instanceof SyntaxError) {
+        logger.warn(LOG_TAG, `[LEDGER] Legacy JSON parse failed for invoice ${invoiceId}:`, err);
+        return null;
+      }
+      throw err;
+    }
   }
 
   // ===========================================================================
@@ -6679,18 +7015,94 @@ export class AccountingModule {
   }
 
   /**
-   * JSON-serialize and save a value to storage.
+   * JSON-serialize and save a value to storage with an explicit W11
+   * originated-tag classification (T-D8, SPEC §10.2.3).
    *
-   * @param key   - Storage key (will be scoped via getStorageKey).
-   * @param value - Value to serialize and store.
+   * Callers MUST choose `entryType` at the call site — the helper does
+   * not infer. Mis-classification is caught at runtime by
+   * `assertOriginTagLocal` inside the storage layer and surfaced as
+   * SECURITY_ORIGIN_MISMATCH. TypeScript catches unknown tags at
+   * compile time via the narrow union.
+   *
+   * @param key       - Storage key (will be scoped via getStorageKey).
+   * @param value     - Value to serialize and store.
+   * @param entryType - W11 classification (see setStorageEntry).
    */
-  private async saveJsonToStorage(key: string, value: unknown): Promise<void> {
+  private async saveJsonToStorage(
+    key: string,
+    value: unknown,
+    entryType: 'invoice_close' | 'invoice_cancel' | 'cache_index',
+  ): Promise<void> {
     try {
-      await this.deps!.storage.set(this.getStorageKey(key), JSON.stringify(value));
+      await this.setStorageEntry(
+        this.getStorageKey(key),
+        JSON.stringify(value),
+        entryType,
+      );
     } catch (err) {
       logger.warn(LOG_TAG, `Failed to save storage key "${key}":`, err);
     }
   }
+
+  /**
+   * W11 originated-tag dispatcher (T-D8, SPEC §10.2.3). Writes through
+   * `storage.setEntry` when the provider supports it so the OpLog
+   * envelope carries an explicit `originated` tag matching the semantic
+   * class of the write. Providers without envelope-storage (plain
+   * IndexedDB / file KV) fall through to the plain `set()` — semantics
+   * are identical, only the peer-replicated classification differs.
+   *
+   * Classification (see profile/aggregator-pointer/originated-tag.ts):
+   *   - `invoice_pay`    — per-invoice ledger entry persists a payment
+   *                         attribution (user action on the target side).
+   *   - `invoice_close`  — explicit or implicit CLOSED-set commit point.
+   *   - `invoice_cancel` — explicit or implicit CANCELLED-set commit point.
+   *   - `cache_index`    — derived-state snapshots (frozen balances,
+   *                         auto-return settings, token scan watermark,
+   *                         INV_LEDGER_INDEX, bulk terminal-set
+   *                         re-writes, load-time reconciliation).
+   *
+   * `invoice_mint` is deliberately NOT in the union: invoice mint
+   * persists the token via `PaymentsModule.addToken` (TokenStorageProvider
+   * — envelope-stamped separately in T-D11) and never reaches this
+   * KV-level helper.
+   *
+   * Callers MUST choose the classification at the call site — the
+   * helper does NOT infer. Mis-classification is caught by
+   * `assertOriginTagLocal` inside the storage layer and surfaced as
+   * SECURITY_ORIGIN_MISMATCH.
+   */
+  private async setStorageEntry(
+    key: string,
+    value: string,
+    entryType: 'invoice_pay' | 'invoice_close' | 'invoice_cancel' | 'cache_index',
+  ): Promise<void> {
+    const storage = this.deps!.storage;
+    const setEntryFn = (storage as { setEntry?: (k: string, v: string, t: string) => Promise<void> })
+      .setEntry;
+    if (typeof setEntryFn === 'function') {
+      await setEntryFn.call(storage, key, value, entryType);
+      return;
+    }
+    // Fallback: provider has no envelope-storage layer (plain IndexedDB
+    // / file KV). Log once per provider-class so a silent loss of W11
+    // stamping during a migration is visible in ops. Subsequent calls
+    // from the same class are silent to avoid log spam.
+    const providerClass = (storage as { constructor?: { name?: string } }).constructor?.name
+      ?? 'UnknownStorage';
+    if (!AccountingModule._w11FallbackLogged.has(providerClass)) {
+      AccountingModule._w11FallbackLogged.add(providerClass);
+      logger.debug(
+        LOG_TAG,
+        `[W11] storage.setEntry not available on ${providerClass}; originated tags will not be stamped ` +
+          `(this is expected for plain IndexedDB / file storage, unexpected when ProfileStorageProvider is in the chain).`,
+      );
+    }
+    await storage.set(key, value);
+  }
+
+  /** Per-class dedup set for the W11 fallback log (see setStorageEntry). */
+  private static _w11FallbackLogged: Set<string> = new Set();
 }
 
 // =============================================================================

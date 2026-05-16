@@ -82,7 +82,13 @@ function findAllCMasterKeys(data: Uint8Array): CMasterKeyData[] {
         if (iterPos + 4 <= data.length) {
           const iterations = data[iterPos] | (data[iterPos + 1] << 8) |
                             (data[iterPos + 2] << 16) | (data[iterPos + 3] << 24);
-          if (iterations >= 1000 && iterations <= 10000000) {
+          // Steelman⁴³ warning: cap iterations at 500K (real-world
+          // wallets — Bitcoin Core uses ~25k typically; even an
+          // aggressive setting is well under 500K). Previous 10M
+          // cap allowed a hostile .dat to spin SHA-512 chained calls
+          // for 30+ sec per CMasterKey per password attempt with no
+          // timeout in the parse-wallet caller.
+          if (iterations >= 1000 && iterations <= 500_000) {
             const encryptedKey = data.slice(pos + 1, pos + 1 + 48);
             const salt = data.slice(saltLenPos + 1, saltLenPos + 1 + 8);
             const derivationMethod = data[saltLenPos + 1 + 8] | (data[saltLenPos + 1 + 8 + 1] << 8) |

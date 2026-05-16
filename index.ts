@@ -276,6 +276,7 @@ export {
   DEFAULT_AGGREGATOR_TIMEOUT,
   // IPFS
   DEFAULT_IPFS_GATEWAYS,
+  BUILTIN_IPFS_GATEWAYS,
   DEFAULT_IPFS_BOOTSTRAP_PEERS,
   // L1 (ALPHA Blockchain)
   DEFAULT_ELECTRUM_URL,
@@ -492,6 +493,46 @@ export type {
 // Address parsing
 export { parseAddress, isValidAddress, isValidDirectAddress, normalizeAddress, addressesMatch } from './core/address';
 export type { AddressType, ParsedAddress } from './core/address';
+
+// =============================================================================
+// UXF Types (type-only -- runtime available via @unicitylabs/sphere-sdk/uxf)
+// =============================================================================
+
+export type {
+  ContentHash,
+  UxfElementHeader,
+  UxfElementType,
+  UxfInstanceKind,
+  UxfElement,
+  UxfElementContent,
+  UxfManifest,
+  UxfEnvelope,
+  UxfPackageData,
+  UxfIndexes,
+  InstanceChainEntry,
+  InstanceChainIndex,
+  InstanceSelectionStrategy,
+  UxfStorageAdapter,
+  UxfVerificationResult,
+  UxfVerificationIssue,
+  UxfDelta,
+} from './uxf';
+
+export type { UxfErrorCode } from './uxf';
+
+// =============================================================================
+// Profile Types (type-only -- runtime available via @unicitylabs/sphere-sdk/profile)
+// =============================================================================
+
+export type {
+  ProfileConfig,
+  UxfBundleRef,
+  MigrationPhase,
+  MigrationResult,
+  ProfileEncryptionConfig,
+  ConsolidationPendingState,
+  ProfileErrorCode,
+} from './profile';
 
 // =============================================================================
 // Exports added for @unicity-sphere/cli consumption (phase 2 extraction).

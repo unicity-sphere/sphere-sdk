@@ -301,7 +301,9 @@ describe('PaymentsModule Transaction History', () => {
       expect(arg.dedupKey).toBe('RECEIVED_my-token');
     });
 
-    it('should compute dedupKey from type + transferId for SENT', async () => {
+    it('should compute dedupKey from type + transferId + coinId for SENT', async () => {
+      // #149 multi-coin follow-up — SENT dedupKey includes coinId so
+      // multi-coin sends don't collide on the same transferId.
       await module.addToHistory({
         type: 'SENT',
         amount: '500',
@@ -312,7 +314,24 @@ describe('PaymentsModule Transaction History', () => {
       });
 
       const arg = historyStore.addHistoryEntry.mock.calls[0][0];
-      expect(arg.dedupKey).toBe('SENT_transfer_transfer-456');
+      expect(arg.dedupKey).toBe('SENT_transfer_transfer-456_UCT');
+    });
+
+    it('should fall back to legacy SENT dedupKey when coinId is missing', async () => {
+      // Backward compat for legacy callers that don't set coinId. The
+      // HistoryRecord type requires coinId, but defensive code at the
+      // helper level should still produce a stable key.
+      await module.addToHistory({
+        type: 'SENT',
+        amount: '500',
+        coinId: '',
+        symbol: '',
+        timestamp: Date.now(),
+        transferId: 'transfer-789',
+      });
+
+      const arg = historyStore.addHistoryEntry.mock.calls[0][0];
+      expect(arg.dedupKey).toBe('SENT_transfer_transfer-789');
     });
 
     it('should deduplicate entries with the same dedupKey', async () => {
@@ -410,6 +429,228 @@ describe('PaymentsModule Transaction History', () => {
 
       expect(historyStore.addHistoryEntry).not.toHaveBeenCalled();
       expect(module.getHistory()).toHaveLength(0);
+    });
+  });
+
+  describe('recordUxfBundleSentHistory — multi-coin (#149 follow-up)', () => {
+    // The helper pivots `TransferResult.tokenTransfers` by source coinId
+    // and emits one SENT history row per coin in the bundle (primary +
+    // each additionalAssets coin). NFT additionals are deliberately
+    // skipped — they have no fungible "amount" slot.
+
+    /**
+     * Build a minimal Token mock for the source-tokens array. Only the
+     * fields the helper reads are populated.
+     */
+    function srcToken(id: string, coinId: string, amount: string): Token {
+      return {
+        id,
+        coinId,
+        symbol: coinId,
+        name: coinId,
+        decimals: 6,
+        amount,
+        status: 'confirmed',
+        createdAt: 0,
+        updatedAt: 0,
+        sdkData: '{}',
+      };
+    }
+
+    it('emits one SENT row per coin with distinct dedupKeys + per-coin tokenIds', async () => {
+      // Sources: 2 UCT tokens + 1 USDU token. Primary slot = UCT(200);
+      // additional = USDU(100). The helper should pivot per coin.
+      const result = {
+        id: 'transfer-multi-1',
+        status: 'completed' as const,
+        tokens: [
+          srcToken('uct-1', 'UCT_HEX', '120'),
+          srcToken('uct-2', 'UCT_HEX', '80'),
+          srcToken('usdu-1', 'USDU_HEX', '100'),
+        ],
+        tokenTransfers: [
+          { sourceTokenId: 'uct-1', method: 'direct' as const, requestIdHex: 'r1' },
+          { sourceTokenId: 'uct-2', method: 'split' as const, splitGroupId: 'g1' },
+          { sourceTokenId: 'usdu-1', method: 'direct' as const, requestIdHex: 'r3' },
+        ],
+      };
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (module as any).recordUxfBundleSentHistory({
+        originalRequest: {
+          recipient: '@bob',
+          coinId: 'UCT_HEX',
+          amount: '200',
+          additionalAssets: [{ kind: 'coin', coinId: 'USDU_HEX', amount: '100' }],
+        },
+        request: {
+          recipient: '@bob',
+          coinId: 'UCT_HEX',
+          amount: '200',
+        },
+        result,
+        peerInfo: { directAddress: 'DIRECT://bob', nametag: 'bob' },
+        recipientPubkey: 'bob-pk',
+        recipientAddress: { toString: () => 'DIRECT://bob' },
+        diagLabel: 'test',
+      });
+
+      // Two entries — one per coin
+      expect(historyStore.addHistoryEntry).toHaveBeenCalledTimes(2);
+      const calls = historyStore.addHistoryEntry.mock.calls.map((c) => c[0]);
+
+      const uctEntry = calls.find((e) => e.coinId === 'UCT_HEX');
+      const usduEntry = calls.find((e) => e.coinId === 'USDU_HEX');
+      expect(uctEntry).toBeDefined();
+      expect(usduEntry).toBeDefined();
+
+      // Primary row — UCT, amount 200, two tokenIds breakdown
+      expect(uctEntry!.type).toBe('SENT');
+      expect(uctEntry!.amount).toBe('200');
+      expect(uctEntry!.transferId).toBe('transfer-multi-1');
+      expect(uctEntry!.dedupKey).toBe('SENT_transfer_transfer-multi-1_UCT_HEX');
+      expect(uctEntry!.tokenIds).toEqual([
+        { id: 'uct-1', amount: '120', source: 'direct' },
+        { id: 'uct-2', amount: '80', source: 'split' },
+      ]);
+      expect(uctEntry!.tokenId).toBe('uct-1');
+      expect(uctEntry!.recipientNametag).toBe('bob');
+      expect(uctEntry!.recipientAddress).toBe('DIRECT://bob');
+
+      // Additional row — USDU, amount 100, one tokenId
+      expect(usduEntry!.amount).toBe('100');
+      expect(usduEntry!.dedupKey).toBe('SENT_transfer_transfer-multi-1_USDU_HEX');
+      expect(usduEntry!.tokenIds).toEqual([
+        { id: 'usdu-1', amount: '100', source: 'direct' },
+      ]);
+      expect(usduEntry!.tokenId).toBe('usdu-1');
+    });
+
+    it('emits only the primary entry when there are no additional coin assets', async () => {
+      const result = {
+        id: 'transfer-single-1',
+        status: 'completed' as const,
+        tokens: [srcToken('uct-1', 'UCT_HEX', '200')],
+        tokenTransfers: [
+          { sourceTokenId: 'uct-1', method: 'direct' as const, requestIdHex: 'r1' },
+        ],
+      };
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (module as any).recordUxfBundleSentHistory({
+        originalRequest: {
+          recipient: '@bob',
+          coinId: 'UCT_HEX',
+          amount: '200',
+        },
+        request: {
+          recipient: '@bob',
+          coinId: 'UCT_HEX',
+          amount: '200',
+        },
+        result,
+        peerInfo: { directAddress: 'DIRECT://bob' },
+        recipientPubkey: 'bob-pk',
+        recipientAddress: { toString: () => 'DIRECT://bob' },
+        diagLabel: 'test',
+      });
+
+      expect(historyStore.addHistoryEntry).toHaveBeenCalledTimes(1);
+      const arg = historyStore.addHistoryEntry.mock.calls[0][0];
+      expect(arg.dedupKey).toBe('SENT_transfer_transfer-single-1_UCT_HEX');
+    });
+
+    it('skips NFT additionals — only coin entries get history rows', async () => {
+      const result = {
+        id: 'transfer-mixed-1',
+        status: 'completed' as const,
+        tokens: [
+          srcToken('uct-1', 'UCT_HEX', '200'),
+          srcToken('nft-1', 'NFT_HEX', '1'),
+        ],
+        tokenTransfers: [
+          { sourceTokenId: 'uct-1', method: 'split' as const, splitGroupId: 'g1' },
+          { sourceTokenId: 'nft-1', method: 'direct' as const, requestIdHex: 'r-nft' },
+        ],
+      };
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (module as any).recordUxfBundleSentHistory({
+        originalRequest: {
+          recipient: '@bob',
+          coinId: 'UCT_HEX',
+          amount: '200',
+          additionalAssets: [{ kind: 'nft', tokenId: 'nft-1' }],
+        },
+        request: {
+          recipient: '@bob',
+          coinId: 'UCT_HEX',
+          amount: '200',
+        },
+        result,
+        peerInfo: null,
+        recipientPubkey: 'bob-pk',
+        recipientAddress: { toString: () => 'DIRECT://bob' },
+        diagLabel: 'test',
+      });
+
+      // Only the primary coin's row — NFT additional is skipped.
+      expect(historyStore.addHistoryEntry).toHaveBeenCalledTimes(1);
+      const arg = historyStore.addHistoryEntry.mock.calls[0][0];
+      expect(arg.coinId).toBe('UCT_HEX');
+    });
+
+    it('swallows per-entry storage errors and continues to the next coin', async () => {
+      // Force the first addHistoryEntry call to throw. Subsequent calls
+      // for other coins must still be attempted — a history I/O hiccup
+      // on one coin must not drop sibling entries.
+      historyStore.addHistoryEntry
+        .mockImplementationOnce(async () => {
+          throw new Error('disk full');
+        })
+        .mockImplementationOnce(async (entry) => {
+          historyStore._entries.set(entry.dedupKey as string, entry);
+        });
+
+      const result = {
+        id: 'transfer-err-1',
+        status: 'completed' as const,
+        tokens: [
+          srcToken('uct-1', 'UCT_HEX', '100'),
+          srcToken('usdu-1', 'USDU_HEX', '50'),
+        ],
+        tokenTransfers: [
+          { sourceTokenId: 'uct-1', method: 'direct' as const, requestIdHex: 'r1' },
+          { sourceTokenId: 'usdu-1', method: 'direct' as const, requestIdHex: 'r2' },
+        ],
+      };
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await expect((module as any).recordUxfBundleSentHistory({
+        originalRequest: {
+          recipient: '@bob',
+          coinId: 'UCT_HEX',
+          amount: '100',
+          additionalAssets: [{ kind: 'coin', coinId: 'USDU_HEX', amount: '50' }],
+        },
+        request: {
+          recipient: '@bob',
+          coinId: 'UCT_HEX',
+          amount: '100',
+        },
+        result,
+        peerInfo: null,
+        recipientPubkey: 'bob-pk',
+        recipientAddress: { toString: () => 'DIRECT://bob' },
+        diagLabel: 'test',
+      })).resolves.toBeUndefined();
+
+      // Both attempts made; the second succeeded.
+      expect(historyStore.addHistoryEntry).toHaveBeenCalledTimes(2);
+      expect(historyStore._entries.size).toBe(1);
+      expect(
+        historyStore._entries.has('SENT_transfer_transfer-err-1_USDU_HEX'),
+      ).toBe(true);
     });
   });
 

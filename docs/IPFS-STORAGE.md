@@ -2,6 +2,8 @@
 
 Cross-platform HTTP-based IPFS/IPNS token storage for the Sphere SDK. Works in both browser and Node.js with no additional dependencies.
 
+> **Status note**: this document describes the **legacy IPFS-IPNS-per-wallet flow** for token-data backup. New deployments use the Profile + bundle-CID model per [PROFILE-ARCHITECTURE.md](uxf/PROFILE-ARCHITECTURE.md) §10.10 and the wire-format definitions in [UXF-TRANSFER-PROTOCOL.md](uxf/UXF-TRANSFER-PROTOCOL.md) §3.3. Bundle CIDs are content-addressed and immutable — IPNS is reserved for the wallet's PROFILE pointer (per [PROFILE-AGGREGATOR-POINTER-ARCHITECTURE.md](uxf/PROFILE-AGGREGATOR-POINTER-ARCHITECTURE.md)), not for individual bundles. Inline UXF delivery (`uxf-car`) does not use IPFS at all (the CAR bytes travel inside the Nostr event); only `uxf-cid` delivery requires an IPFS pin. The TXF merge rules + IPNS-chain logic in this document apply to legacy storage only.
+
 ## Overview
 
 The IPFS Storage Provider backs up wallet token data to IPFS (InterPlanetary File System) using IPNS (InterPlanetary Name System) for mutable references. It uses standard HTTP APIs — no Helia, no libp2p DHT, no extra packages required.
@@ -142,6 +144,27 @@ UNICITY_IPFS_NODES = [
 ```
 
 HTTPS is used by default. Override with `gateways` config for custom nodes.
+
+### `SPHERE_IPFS_GATEWAY` env override
+
+When set, `SPHERE_IPFS_GATEWAY` replaces the default gateway list for ALL
+downstream consumers — `DEFAULT_IPFS_GATEWAYS`, `NETWORKS[*].ipfsGateways`,
+`getIpfsGatewayUrls()`, and the deprecated `IpfsStorageProvider` constructor.
+Accepts a single URL or a comma-separated list:
+
+```bash
+# Single override (e.g. fall back to a public Kubo gateway during a
+# Unicity gateway outage — see issue #154):
+SPHERE_IPFS_GATEWAY=https://ipfs.io npm run test:e2e
+
+# Multiple gateways, tried in order:
+SPHERE_IPFS_GATEWAY="https://gw1.example.org,https://gw2.example.org" \
+  npm run test:e2e
+```
+
+The override is parsed once at module-init, so it must be exported BEFORE
+the SDK is imported (CI runners typically set it on the job env). It has
+no effect in the browser (constants.ts gates the read on `typeof process`).
 
 ## Reliability Features
 

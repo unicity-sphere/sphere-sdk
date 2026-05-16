@@ -288,7 +288,17 @@ describe('TransferResult.tokenTransfers', () => {
       }
     );
 
-    module = createPaymentsModule({ debug: false });
+    // T.8.D part 1 of 2 — UXF flags now default-ON. This suite mocks
+    // the LEGACY V6 single-token / instant-split / conservative-split
+    // pipeline (TokenSplitCalculator, TokenSplitExecutor,
+    // InstantSplitExecutor, mockPlanSend); routing through the new UXF
+    // sender would bypass those mocks and fail on `validateTargets`
+    // against an empty live source pool. Pin the legacy path explicitly
+    // so the assertions about V6 wire shapes still hold.
+    module = createPaymentsModule({
+      debug: false,
+      features: { senderUxf: false },
+    });
     mockTransport = createMockTransport();
     mockOracle = createMockOracle();
 
@@ -749,7 +759,11 @@ describe('TransferResult.tokenTransfers (conservative mode)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
 
-    module = createPaymentsModule({ debug: false });
+    // T.8.D part 1 of 2 — pin legacy path; see suite-1 explanation above.
+    module = createPaymentsModule({
+      debug: false,
+      features: { senderUxf: false },
+    });
     mockTransport = createMockTransport();
     mockOracle = createMockOracle();
 

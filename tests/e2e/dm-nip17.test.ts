@@ -15,6 +15,7 @@ import { mkdirSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { DirectMessage } from '../../types';
+import { preflightSkip } from './lib/preflight';
 
 const rand = () => Math.random().toString(36).slice(2, 8);
 
@@ -43,12 +44,44 @@ async function ensureTrustbase(dataDir: string): Promise<void> {
 }
 
 function waitForDM(sphere: Sphere, timeoutMs = 15000): Promise<DirectMessage> {
+  // CommunicationsModule.onDirectMessage REPLAYS already-cached messages
+  // to every newly registered handler (so modules loaded late don't miss
+  // DMs that arrived during init). Per the SDK contract, replay is
+  // SYNCHRONOUS — every replay invocation fires before onDirectMessage()
+  // returns. We exploit that to distinguish replays from live deliveries:
+  // any handler call that lands before `acceptLive = true` runs is a
+  // replay, so we drop it and only resolve on a live delivery.
+  //
+  // Two earlier approaches don't work as well and are intentionally
+  // dropped here:
+  //   - Filtering by `msg.senderPubkey === self` was redundant after the
+  //     #155 SDK fix made replay skip self-sent entries on its own.
+  //   - Filtering by `msg.timestamp < horizon` was fragile: gift-wrap
+  //     event timestamps land at second-level granularity, so a fresh
+  //     live DM whose floored second is the same as `floor(horizon/1000)`
+  //     would be rejected.
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`Timeout: DM not received within ${timeoutMs}ms`)), timeoutMs);
-    sphere.communications.onDirectMessage((msg) => {
+    let acceptLive = false;
+    let resolved = false;
+    let unsub: (() => void) | null = null;
+    const cleanup = () => {
+      if (unsub) {
+        try { unsub(); } catch { /* ignore */ }
+        unsub = null;
+      }
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`Timeout: DM not received within ${timeoutMs}ms`));
+    }, timeoutMs);
+    unsub = sphere.communications.onDirectMessage((msg) => {
+      if (!acceptLive || resolved) return;
+      resolved = true;
       clearTimeout(timer);
+      cleanup();
       resolve(msg);
     });
+    acceptLive = true;
   });
 }
 
@@ -69,7 +102,9 @@ async function createSphere(label: string, nametag?: string) {
   return { sphere: result.sphere, dirs };
 }
 
-describe('NIP-17 DM end-to-end', () => {
+const SKIP_INFRA = preflightSkip(["nostr"], 'dm-nip17');
+
+describe.skipIf(SKIP_INFRA)('NIP-17 DM end-to-end', () => {
   const cleanupDirs: string[] = [];
   const spheres: Sphere[] = [];
 

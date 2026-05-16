@@ -1111,10 +1111,10 @@ Under stress (many concurrent sends of the same coin):
 ### 12.4 Change Token Latency
 
 The maximum queue wait time for a request blocked by a concurrent split is bounded by the split's change token arrival time:
-- Instant mode (V6 bundle): ~2.3s (aggregator burn proof + background mint).
-- Conservative mode: ~42s (full sequential proof collection).
+- Instant mode (UXF bundle, default per [UXF-TRANSFER-PROTOCOL §2.1](uxf/UXF-TRANSFER-PROTOCOL.md)): ~2.3s (aggregator commitment + background finalization). Legacy V6 `COMBINED_TRANSFER` (TXF wire) instant flow is also supported via `transferMode: 'txf'` + `txfFinalization: 'instant'` per UXF-TRANSFER-PROTOCOL §2.4.
+- Conservative mode (UXF bundle, finalizes the entire transaction history before send per UXF-TRANSFER-PROTOCOL §2.2): ~42s (full sequential proof collection).
 
-Queued sends set their timeout at 30s. If the conflicting send uses conservative mode, the queued send may timeout. This is by design: conservative mode is not optimized for concurrent operation. Users or callers should use instant mode for concurrent send scenarios.
+Queued sends set their timeout at 30s. If the conflicting send uses conservative mode, the queued send may timeout. This is by design: conservative mode is not optimized for concurrent operation. Default mode is now `'instant'` over UXF (per UXF-TRANSFER-PROTOCOL §2.5), so the typical concurrent-send latency is the instant-mode ~2.3s path. Reservations also need to honor `allowPendingTokens: false` (default) — only finalized tokens are picked unless the caller opts into chain mode.
 
 ### 12.5 Queue Cleanup
 

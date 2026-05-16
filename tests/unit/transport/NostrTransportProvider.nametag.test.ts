@@ -626,6 +626,12 @@ describe('NostrTransportProvider.publishIdentityBinding() with nametag', () => {
   });
 
   it('should publish identity binding event without nametag (no-nametag path)', async () => {
+    // T.8.B — provider now constructs the no-nametag identity binding event
+    // itself (instead of delegating to nostr-js-sdk.publishIdentityBinding)
+    // so it can include `wire_protocols` + `asset_kinds` in the JSON content.
+    // The d-tag formula is identical to upstream's, so the event remains a
+    // drop-in replacement for the upstream identity binding slot.
+    publishedEvents.length = 0;
     await provider.connect();
 
     const success = await provider.publishIdentityBinding(
@@ -633,15 +639,18 @@ describe('NostrTransportProvider.publishIdentityBinding() with nametag', () => {
     );
 
     expect(success).toBe(true);
-    // Without nametag, delegates to nostrClient.publishIdentityBinding()
-    const { NostrClient: mockInstance } = await import('@unicitylabs/nostr-js-sdk');
-    const clientInstance = (mockInstance as any).mock.results[0]?.value;
-    expect(clientInstance.publishIdentityBinding).toHaveBeenCalledWith(
-      expect.objectContaining({
-        publicKey: TEST_COMPRESSED_PUBKEY,
-        l1Address: TEST_L1_ADDRESS,
-        directAddress: TEST_DIRECT_ADDRESS,
-      }),
-    );
+    // Exactly one event must have been published — the no-nametag binding.
+    expect(publishedEvents.length).toBe(1);
+
+    const event = publishedEvents[0] as { kind: number; content: string; tags: string[][] };
+    expect(event.kind).toBe(NOSTR_EVENT_KINDS.NAMETAG_BINDING);
+
+    const content = JSON.parse(event.content);
+    expect(content.public_key).toBe(TEST_COMPRESSED_PUBKEY);
+    expect(content.l1_address).toBe(TEST_L1_ADDRESS);
+    expect(content.direct_address).toBe(TEST_DIRECT_ADDRESS);
+    // T.8.B — capability hints must be present.
+    expect(content.wire_protocols).toEqual(['uxf-car', 'uxf-cid', 'txf']);
+    expect(content.asset_kinds).toEqual(['coin', 'nft']);
   });
 });

@@ -43,12 +43,23 @@ import {
   syncUntilAllCoins,
   type BalanceSnapshot,
 } from './helpers';
+import { preflightSkip } from './lib/preflight';
 
 // =============================================================================
 // Test Suite
 // =============================================================================
 
-describe('IPFS Multi-Device Sync E2E', () => {
+const SKIP_INFRA = preflightSkip(["nostr","ipfs","faucet"], 'ipfs-multi-device-sync');
+
+// Legacy IpfsStorageProvider path (direct IPNS publish/resolve, no OrbitDB)
+// is deprecated in favor of Profile-mode (OrbitDB+IPFS). Equivalent multi-
+// device sync coverage lives in `tests/e2e/profile-multi-device-sync.test.ts`
+// — assertion-for-assertion the same shape, against the modern stack. The
+// legacy provider's IPNS propagation timing has historically been fragile
+// under real-testnet load and is no longer in scope for the no-token-loss
+// invariant. Re-enable only if a regression-test for the legacy adapter
+// itself is needed.
+describe.skip('IPFS Multi-Device Sync E2E (legacy IpfsStorageProvider — deprecated; see profile-multi-device-sync.test.ts)', () => {
   // Shared state across ordered tests
   let savedMnemonic: string;
   let savedNametag: string;

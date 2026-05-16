@@ -1,0 +1,99 @@
+# External Acks Gate (T.8.D production cutover)
+#
+# Why this exists (W6 / W2 plan rationale):
+#   The UXF Inter-Wallet Transfer Protocol v1 widens the `onIntent` callback
+#   shape across consumers. Three downstream repositories must update their
+#   integrations BEFORE we cut over production (T.8.D), or live wallets will
+#   silently drop incoming intents. We cannot land the cutover PR until each
+#   maintainer has signed off in their own repo.
+#
+# How acks are recorded:
+#   Each downstream repo opens a tracking issue with the label
+#   `uxf-transfer-v1-ack`. The maintainer closes the issue once their repo
+#   has shipped the widened callback. This workflow asserts all 3 are closed.
+#
+# Tracking issues (corrected from plan after repo audit at PR-prep time —
+# `agentsphere` doesn't yet exist as a real GitHub repo so it's not in the
+# active gate; if/when it lands, follow the "Adding a 4th external repo"
+# instructions below):
+#   - unicity-sphere/sphere            (label: uxf-transfer-v1-ack) — issue #302
+#   - unicitynetwork/openclaw-unicity  (label: uxf-transfer-v1-ack) — issue #8
+#
+# Triggering model (label-gated):
+#   The job runs only when the PR carries the `t8d-cutover` label. This keeps
+#   the gate scoped to the cutover PR; ordinary PRs are unaffected. We
+#   re-evaluate on label add/remove and on every push to the PR head, so the
+#   check stays green/red in lockstep with the upstream issue state.
+#
+# Required secret:
+#   EXTERNAL_ACKS_TOKEN — a fine-grained PAT (or GitHub App token) with
+#   `Issues: Read` scope on the upstream repos listed above. The default
+#   `GITHUB_TOKEN` is scoped to THIS repo only and cannot read issues in other
+#   repos; passing it would surface as a 404, not an auth error, which is hard
+#   to debug. Configure under: Settings → Secrets and variables → Actions.
+#
+# Adding another external repo:
+#   1. Add the new tracking issue (label `uxf-transfer-v1-ack`) in that repo.
+#   2. Append `<owner>/<repo>` to the `REPOS` list in the gate step.
+#   3. Ensure EXTERNAL_ACKS_TOKEN has `Issues: Read` on the new repo.
+#   4. Update the T.8.D PR description to reference the new tracking issue.
+
+name: External Acks Gate
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+jobs:
+  external-acks-gate:
+    name: Verify external maintainer acks (T.8.D)
+    # Only run on the cutover PR — gated by the `t8d-cutover` label.
+    if: contains(github.event.pull_request.labels.*.name, 't8d-cutover')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Verify EXTERNAL_ACKS_TOKEN is configured
+        env:
+          EXTERNAL_ACKS_TOKEN: ${{ secrets.EXTERNAL_ACKS_TOKEN }}
+        run: |
+          if [ -z "${EXTERNAL_ACKS_TOKEN:-}" ]; then
+            echo "::error::EXTERNAL_ACKS_TOKEN secret is not set."
+            echo "::error::This gate queries closed issues in the configured external repos."
+            echo "::error::Configure a fine-grained PAT with 'Issues: Read' on those repos."
+            echo "::error::Settings → Secrets and variables → Actions → New repository secret"
+            exit 1
+          fi
+
+      - name: Check external repos have a closed uxf-transfer-v1-ack issue
+        env:
+          GH_TOKEN: ${{ secrets.EXTERNAL_ACKS_TOKEN }}
+        run: |
+          set -euo pipefail
+          REPOS=(
+            "unicity-sphere/sphere"
+            "unicitynetwork/openclaw-unicity"
+          )
+          missing=()
+          for repo in "${REPOS[@]}"; do
+            # `gh issue list` honours --label and --state; --json id keeps output stable.
+            count=$(gh issue list \
+              --repo "$repo" \
+              --state closed \
+              --label uxf-transfer-v1-ack \
+              --json id \
+              --jq 'length')
+            if [ "$count" -lt 1 ]; then
+              echo "❌ $repo has no closed issue with label uxf-transfer-v1-ack — maintainer ack required before T.8.D merges"
+              missing+=("$repo")
+            else
+              echo "✅ $repo: $count closed uxf-transfer-v1-ack issue(s) found"
+            fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::T.8.D cutover blocked — ${#missing[@]} external repo(s) missing acks: ${missing[*]}"
+            exit 1
+          fi
+          echo "All ${#REPOS[@]} external repos have signed off — T.8.D cutover gate passed."

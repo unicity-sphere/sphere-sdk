@@ -6,6 +6,7 @@
  */
 
 import { logger } from '../core/logger';
+import { hexToBytes as strictHexToBytes } from '../core/hex';
 import type { Token } from '../types';
 import type { TxfTransaction, ValidationIssue, TokenValidationResult } from '../types/txf';
 import { tokenToTxf } from '../serialization/txf-serializer';
@@ -263,7 +264,7 @@ export class TokenValidator {
         '@unicitylabs/state-transition-sdk/lib/hash/DataHash'
       );
 
-      const pubKeyBytes = Buffer.from(publicKey, 'hex');
+      const pubKeyBytes = strictHexToBytes(publicKey);
       const stateHashObj = DataHash.fromJSON(stateHash);
       const requestId = await RequestId.create(pubKeyBytes, stateHashObj);
 
@@ -332,7 +333,7 @@ export class TokenValidator {
       '@unicitylabs/state-transition-sdk/lib/api/RequestId'
     );
 
-    const pubKeyBytes = Buffer.from(publicKey, 'hex');
+    const pubKeyBytes = strictHexToBytes(publicKey);
 
     for (let i = 0; i < tokens.length; i += batchSize) {
       const batch = tokens.slice(i, i + batchSize);

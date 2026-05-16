@@ -14,6 +14,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Sphere } from '../../core/Sphere';
+import { mockMintNametagSuccess } from '../helpers/mockMintNametag';
 import { STORAGE_KEYS_GLOBAL } from '../../constants';
 import { FileStorageProvider } from '../../impl/nodejs/storage/FileStorageProvider';
 import { FileTokenStorageProvider } from '../../impl/nodejs/storage/FileTokenStorageProvider';
@@ -115,21 +116,38 @@ describe('Tracked addresses integration', () => {
   let tokenStorage: FileTokenStorageProvider;
   let mintSpy: ReturnType<typeof vi.spyOn>;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    if (Sphere.getInstance()) {
+      try { await Sphere.getInstance()!.destroy(); } catch { /* ignore */ }
+    }
+    (Sphere as unknown as { instance: null }).instance = null;
+    // Wait a microtask tick to let any pending async storage writes
+    // (from a prior test that didn't await its own destroy) flush
+    // before we delete the directory. cleanTestDir is sync rm.
+    await new Promise((r) => setImmediate(r));
     cleanTestDir();
     clearNostrRelay();
-    if (Sphere.getInstance()) {
-      (Sphere as unknown as { instance: null }).instance = null;
+    // Defense against full-suite-only race: a prior test's async
+    // storage write can land in DATA_DIR after cleanTestDir() ran
+    // even with the setImmediate tick. Probe + Sphere.clear if a
+    // stale wallet shows up before re-using DATA_DIR for a fresh init.
+    const probeStorage = new FileStorageProvider({ dataDir: DATA_DIR });
+    if (await Sphere.exists(probeStorage)) {
+      await Sphere.clear({ storage: probeStorage });
     }
     storage = new FileStorageProvider({ dataDir: DATA_DIR });
     tokenStorage = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
-    // Mock minting so registerNametag (mint-before-publish) succeeds without a real aggregator
-    mintSpy = vi.spyOn(Sphere.prototype as unknown as { mintNametag: () => Promise<unknown> }, 'mintNametag')
-      .mockResolvedValue({ success: true, token: null, nametagData: null });
+    // Mock minting so registerNametag (mint-before-publish) succeeds without
+    // a real aggregator. The shared helper also persists the nametag — see
+    // the comment in nametag-normalization.test.ts for rationale.
+    mintSpy = mockMintNametagSuccess();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     mintSpy.mockRestore();
+    if (Sphere.getInstance()) {
+      try { await Sphere.getInstance()!.destroy(); } catch { /* ignore */ }
+    }
     (Sphere as unknown as { instance: null }).instance = null;
     cleanTestDir();
     clearNostrRelay();

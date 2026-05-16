@@ -12,14 +12,15 @@
 1. [Setup](#setup)
 2. [Wallet Operations](#wallet-operations)
 3. [L3 Payments](#l3-payments)
-4. [Payment Requests](#payment-requests)
-5. [L1 Payments](#l1-payments)
-6. [Communications](#communications)
-7. [Invoicing / Accounting](#invoicing--accounting)
-8. [Custom Providers](#custom-providers)
-9. [Events](#events)
-10. [Error Handling](#error-handling)
-11. [Testing](#testing)
+4. [Operator Escape Hatches (UXF)](#operator-escape-hatches-uxf)
+5. [Payment Requests](#payment-requests)
+6. [L1 Payments](#l1-payments)
+7. [Communications](#communications)
+8. [Invoicing / Accounting](#invoicing--accounting)
+9. [Custom Providers](#custom-providers)
+10. [Events](#events)
+11. [Error Handling](#error-handling)
+12. [Testing](#testing)
 
 ---
 
@@ -335,9 +336,74 @@ if (result.error) {
 | Field | Required | Description |
 |-------|----------|-------------|
 | `recipient` | Yes | `@nametag`, `DIRECT://...`, chain pubkey, or `alpha1...` address |
-| `amount` | Yes | Amount in smallest unit (string) |
-| `coinId` | Yes | Token coin ID (e.g., `'UCT'`) |
+| `amount` | Yes | Primary asset amount, in smallest unit (string) |
+| `coinId` | Yes | Primary asset coin ID (e.g., `'UCT'`) |
+| `additionalAssets` | No | Multi-asset extension. Array of additional assets — each entry is either a fungible coin (`{kind:'coin', coinId, amount}`) or a whole-token / NFT reference (`{kind:'nft', tokenId}`). All `coinId`s (including the primary) must be distinct; all `tokenId`s in NFT entries must be distinct. See examples below. |
 | `memo` | No | Optional message to recipient |
+| `transferMode` | No | `'instant'` (default) or `'conservative'` — see Transfer Modes section |
+| `allowPendingTokens` | No | Default `false`. When `true`, the source-token selector may pick `pending` tokens after exhausting `valid` ones (chain mode) |
+| `confirmNftPending` | Conditionally | Default `false`. Required `true` when sending NFT entries with `allowPendingTokens: true` AND any NFT source has unfinalized predecessor txs. Without it, the call rejects with `NFT_PENDING_REQUIRES_CONFIRMATION`. NFT cascades are irrecoverable (no fungible replacement) — see "Pending NFT cascade caveat" below. |
+
+**Multi-coin transfer example** (deliver UCT + USDU + ALPHA in one call):
+
+```typescript
+const result = await sphere.payments.send({
+  recipient: '@bob',
+  // Primary asset (legacy single-coin fields remain required):
+  coinId: 'UCT',
+  amount: '1000000',
+  // Additional assets — multi-coin via discriminated union:
+  additionalAssets: [
+    { kind: 'coin', coinId: 'USDU', amount: '500000' },
+    { kind: 'coin', coinId: 'ALPHA', amount: '250000' },
+  ],
+  memo: 'Multi-asset payment',
+});
+// All three asset deliveries are bundled in a single UXF transfer; the
+// recipient receives one or more child tokens carrying exactly
+// (UCT,1000000), (USDU,500000), (ALPHA,250000). All other coin balances
+// in the sender's source tokens stay with the sender as change.
+```
+
+**Mixed coin + NFT transfer example** (deliver UCT + a specific NFT):
+
+```typescript
+const result = await sphere.payments.send({
+  recipient: '@bob',
+  // Primary asset is always a coin (backward-compat slot):
+  coinId: 'UCT',
+  amount: '1000000',
+  // Additional assets can mix coins and NFTs:
+  additionalAssets: [
+    { kind: 'nft', tokenId: '0xabc123...the-nft-token-id...' },
+  ],
+  memo: 'Coin + NFT bundle',
+});
+// The recipient receives:
+//   - One or more child tokens carrying (UCT, 1000000) (split from sender's
+//     coin tokens as usual);
+//   - The NFT token transferred whole — its tokenId stays the same; only its
+//     current state's predicate changes to bind to @bob.
+```
+
+**NFT-only transfer** (no coin component): the type signature retains `coinId`/`amount` as required for v1.0 backward compatibility; the implementation wave widens them to optional. **Until the widening releases, NFT-only sends are not expressible against the v1.0 type signature** — defer to the widening release. Do NOT fabricate a placeholder coin slice (any non-zero amount would silently transfer real coin value; the spec abolishes the placeholder convention per UXF-TRANSFER-PROTOCOL §4.1 — coin amounts MUST be > 0 with no exceptions). Once optional, NFT-only sends omit the primary slot entirely:
+
+```typescript
+// Post-widening (NFT-only):
+await sphere.payments.send({
+  recipient: '@bob',
+  // coinId / amount omitted — NFT-only:
+  additionalAssets: [
+    { kind: 'nft', tokenId: '0xabc123...' },
+  ],
+});
+```
+
+**NFT model** (canonical, per UXF-TRANSFER-PROTOCOL §4.1): an NFT is a token with empty/null `coinData`, transferred whole-token. NFT and coin tokens are class-disjoint — no single token carries both. NFT transfers preserve the source `tokenId`; coin transfers split via mint, producing fresh `tokenId`s for recipient and change.
+
+**Pending NFT cascade caveat**: when `allowPendingTokens: true` is set AND any NFT target's source has unfinalized predecessor txs in its history, you MUST pass `confirmNftPending: true` to acknowledge the cascade-asymmetry risk (otherwise the call rejects with `NFT_PENDING_REQUIRES_CONFIRMATION`). Finalized (valid) NFT sources do NOT require the confirmation even with `allowPendingTokens: true` — the requirement is gated on the NFT source actually being pending. A cascaded coin can be recovered with fungible value from elsewhere; a cascaded NFT identity is irrecoverable.
+
+Single-coin callers omitting `additionalAssets` behave identically to prior versions of the SDK — the field is purely additive.
 
 ### Receive Tokens
 
@@ -562,6 +628,99 @@ To reload tokens from storage (e.g., after external changes):
 ```typescript
 await sphere.payments.load();
 ```
+
+---
+
+## Operator Escape Hatches (UXF)
+
+The UXF transfer protocol pins state into one of three buckets — active pool (`valid` / `pending`), `_invalid` (failed validation), or `_audit` (forensic). Per §5.6, the active state cannot regress to `_invalid` once it has reached `valid`; per §6.1.1, a child token whose source parent is invalid is `parent-rejected` and stays in `_invalid` until the parent is unblocked. These two rules are intentionally one-way to keep merge semantics deterministic across CRDT replicas.
+
+The escape hatches are the **only** legal breach of those rules. Operators use them when:
+
+- A token is stuck in `_invalid` because the recipient's local view never received an inclusion proof, but the operator can produce the proof out-of-band (a relay re-publish, a manual fetch from the aggregator, a recovery dump).
+- After flipping a parent token back to the active pool, the operator wants to revisit each `parent-rejected` child and re-run §5.3 [B]/[C]/[E] now that the parent is once again `valid`.
+
+Both methods are off the hot path — they are **operator-driven**, not auto-fired by the wallet. They emit `transfer:override-applied` (audit trail) on success of cases 5/6 and stamp `overrideApplied: true` / `overrideAppliedAt` / `overrideAppliedBy` onto the manifest entry so the override survives every future CRDT merge.
+
+### `payments.importInclusionProof()`
+
+Accept an inclusion proof from outside the normal aggregator path and apply it to local state. Routes through ten sub-cases per UXF-TRANSFER-PROTOCOL §6.3.
+
+```typescript
+const result = await sphere.payments.importInclusionProof(
+  addr,             // address scope (DIRECT://...)
+  tokenId,          // canonical token id
+  {
+    requestId: '...',         // hex aggregator commitment requestId
+    transactionHash: '...',   // 68-char imprint hex
+    authenticator: '...',     // authenticator hex
+    proof: rawProofBytes,     // opaque — handed to trustBase verifier
+  },
+  {
+    allowInvalidOverride: true,    // REQUIRED to flip from `_invalid` (cases 5/6)
+    operatorPubkey: '02ab...',     // optional — stamped into audit trail
+    // currentTime: 1714000000000  // optional — tests use deterministic clocks
+  },
+);
+
+if (result.ok) {
+  console.log('transition:', result.transition);
+  // 'pending-still' | 'pending→valid' | 'pending→unspendable'
+  // | 'invalid→valid' | 'invalid→pending'
+} else {
+  console.error('reason:', result.reason);
+  // 'no-such-token' | 'tokenId-already-valid' | 'tokenId-in-invalid'
+  // | 'proof-trustbase-failed' | 'proof-not-anchored' | 'requestid-mismatch'
+}
+```
+
+**§6.3 case decision table.** The 10 sub-cases the importer routes through:
+
+| # | Token state | Override flag | Proof verify | Queue match | Outcome | Result |
+|---|-------------|---------------|--------------|-------------|---------|--------|
+| 1 | not in pool / not in `_invalid` / not in `_audit` | n/a | not run | n/a | reject — nothing to apply against | `{ok: false, reason: 'no-such-token'}` |
+| 2 | already `valid` | n/a | not run | n/a | idempotent no-op | `{ok: true, transition: 'pending-still'}` |
+| 3 | `pending`, proof matches OUTSTANDING `requestId` | n/a | OK | live entry | graft proof; pending → valid if last outstanding | `{ok: true, transition: 'pending→valid'}` or `'pending-still'` |
+| 4a | `pending`, proof matches a `completedRequestIds` entry | n/a | OK | completed/`attached` | already-attached | `{ok: true, transition: 'pending-still'}` |
+| 4b | `pending`, proof matches NO outstanding OR completed entry | n/a | OK | none | reject — proof is for a different requestId | `{ok: false, reason: 'requestid-mismatch'}` |
+| 5 | `_invalid`, EXACTLY ONE hard-failed queue entry matches | `true` | OK | one hard-fail | move to active pool with `manifest.status='valid'` | `{ok: true, transition: 'invalid→valid'}` |
+| 6 | `_invalid`, MULTIPLE hard-failed entries (chain mode) | `true` | OK | one of K hard-fails | move to active pool with `status='pending'`; re-queue K-1 entries | `{ok: true, transition: 'invalid→pending'}` |
+| 7 | `_invalid`, override flag missing | `false` (default) | OK | n/a | reject — silent default would breach §5.6 monotonicity | `{ok: false, reason: 'tokenId-in-invalid'}` |
+| 8 | any | n/a | `PATH_NOT_INCLUDED` | n/a | proof was not anchored on the aggregator | `{ok: false, reason: 'proof-not-anchored'}` |
+| 9 | any | n/a | `PATH_INVALID` / `NOT_AUTHENTICATED` / `THROWN` | n/a | trustBase did not accept the proof (most likely stale local trustBase) | `{ok: false, reason: 'proof-trustbase-failed'}` |
+
+Cases 5 and 6 are the only paths that mutate the §5.6 monotonicity invariant. They emit `transfer:override-applied` exactly once per success, with the previous `DispositionReason` and the transition kind, so an operator console can render an audit row.
+
+### `payments.revalidateCascadedChildren()`
+
+Operator-explicit cascade reversal. After `importInclusionProof()` flips a parent token back to the active pool, cascaded children that were previously `parent-rejected` do **not** auto-revalidate — `revalidateCascadedChildren()` is the next step.
+
+```typescript
+// 1. Operator imported a fresh proof and the parent is now `valid`.
+const importResult = await sphere.payments.importInclusionProof(
+  addr,
+  parentTokenId,
+  proof,
+  { allowInvalidOverride: true, operatorPubkey: opPubkey },
+);
+
+if (importResult.ok && importResult.transition === 'invalid→valid') {
+  // 2. Walk every cascaded child and re-run §5.3 [B]/[C]/[E].
+  const result = await sphere.payments.revalidateCascadedChildren(
+    addr,
+    parentTokenId,
+  );
+
+  console.log('checked:', result.checked);              // children inspected
+  console.log('revalidated:', result.revalidated);      // moved back to active pool
+  console.log('stillInvalid:', result.stillInvalid);    // failed for an unrelated reason
+  console.log('cycleDefenseFired:', result.cycleDefenseFired); // depth/visited-set hits
+}
+```
+
+**Behavior.** The runner walks every child whose manifest entry has `splitParent === parentTokenId` AND `invalidReason === 'parent-rejected'`, asks the injected validator to re-run §5.3, and recurses transitively into successfully-revalidated children's children. Bounded depth (`MAX_CHAIN_DEPTH` = 64) and a per-call-stack visited set defend against corrupted-manifest cycles (W32). Two concurrent revalidations for different parents do not share state.
+
+**Errors.** Both methods throw `SphereError` with code `OPERATOR_ESCAPE_HATCH_NOT_CONFIGURED` if the bootstrap layer has not installed the importer / runner. The Sphere bootstrap installs them automatically when the UXF features are wired; in legacy environments, the methods surface a clear error rather than silently no-oping.
 
 ---
 
@@ -1493,6 +1652,89 @@ sphere.on('address:activated', ({ address }) => { });  // New address tracked
 sphere.on('address:hidden', ({ index, addressId }) => { });
 sphere.on('address:unhidden', ({ index, addressId }) => { });
 ```
+
+### UXF Transfer Events
+
+The UXF inter-wallet transfer protocol introduces a richer event surface than the legacy `transfer:incoming` / `transfer:confirmed` / `transfer:failed` triple. The 13 events below split into four bands — **lifecycle**, **failure-class**, **advisory**, and **ops** — each with a distinct integrator-side intent.
+
+**Lifecycle** events fire on the happy path and the normal failure path. Most consumers wire these and ignore the rest.
+
+| Event | Payload | When fired | Typical handler intent |
+|-------|---------|------------|------------------------|
+| `transfer:incoming` | `IncomingTransfer` (`{senderPubkey, senderNametag?, tokens, receivedAt}`) | A UXF bundle was received and the recipient's `T.2.B` ingest accepted it. | Update the wallet UI's inbox, emit a notification, refresh balances. |
+| `transfer:submitted` | `TransferResult` | T.5.A — instant-mode UXF send acked by the relay; the bundle reached the recipient but source-token proofs are still being polled. | Update the outbox UI from `'pending'` to `'submitted'`. Sender-side worker takes over for proofs. |
+| `transfer:confirmed` | `TransferResult` | Outgoing transfer's source-token inclusion proofs have all landed locally — the transfer is finalized end-to-end. (Mapped from spec language `transfer:finalized`.) | Mark the transfer "complete" in UI, remove from "in-flight" list. |
+| `transfer:failed` | `TransferResult` | Outgoing transfer reached a terminal failure that does NOT need operator escalation (e.g. recipient rejected, transient delivery exhaustion past retry limit). | Surface the failure reason; offer retry / cancel UX. |
+
+**Failure-class** events fire when the wallet detects a condition that warrants operator attention. None of these auto-resolve — every one needs a human (or an automated operator console) to react.
+
+| Event | Payload | When fired | Typical handler intent |
+|-------|---------|------------|------------------------|
+| `transfer:cascade-failed` | `{outboxId, tokenId, bundleCid, recipientTransportPubkey, reason}` | T.5.B — sender-side finalization worker hard-failed a queue entry whose token had outgoing instant-mode bundles; the cascade walker (T.5.B.5) will mark dependent children `parent-rejected`. The `reason: 'race-lost'` short-circuit is excluded by spec — that path does NOT emit. | Page the operator if `reason ∉ {'oracle-rejected'}`; surface to the audit log. |
+| `transfer:operator-alert` | `{code, tokenId?, bundleCid?, observedTokenContentHash?, senderTransportPubkey?, message}` | T.3.C / §6.1 — disposition path surfaces a condition needing human attention but is not a normal `transfer:failed` (e.g. C13: `client-error` from `REQUEST_ID_MISMATCH` — wallet computed an inconsistent tuple, indicating a CLIENT BUG). | Forward to monitoring, file a ticket. |
+| `transfer:security-alert` | `{tokenId, requestId, outboxId?, attachedTransactionHash, observedTransactionHash, attachedAuthenticator?, observedAuthenticator?, message}` | T.5.B / T.5.C — §6.3 forbidden case: TWO distinct proofs for the SAME `requestId` with DIFFERENT `(transactionHash, authenticator)`. The single-spend invariant guarantees this never happens in a non-faulty deployment. | Halt — investigate trust boundary. The protocol does NOT auto-recover. |
+
+**Advisory** events are informational warnings — the wallet keeps working, but a downstream issue is hinted at. Consumers usually log these and surface them to a "system health" panel.
+
+| Event | Payload | When fired | Typical handler intent |
+|-------|---------|------------|------------------------|
+| `transfer:cascade-risk-warning` | `{transferId, bundleCid, recipientTransportPubkey, pendingSourceTokenIds, freshlyMintedChildTokenIds}` | T.5.A — instant-mode sender about to ship a freshly-minted child whose source token is still pending (§6.1.1 cascade rule). Recipient may have to wait for source-token proofs. | Surface a "delivery may be delayed" hint in the sender UI. |
+| `transfer:trustbase-warning` | `{tokenId, requestId, outboxId?, bundleCid?, attempt, message}` | T.5.B / T.5.C / T.5.F — proof verifier returned `NOT_AUTHENTICATED`. Likely cause: stale local trustBase. The worker retries up to `MAX_PROOF_ERROR_RETRIES`; on overrun, hard-fails with `'proof-invalid'`. | Trigger a trustBase refresh; fall back to `transfer:security-alert` semantics if the warning persists across refresh. |
+| `transfer:capability-warning` | `{recipientTransportPubkey, recipientAssetKinds, recipientWireProtocols?, outboundAssetKinds, outboundWireProtocol, mismatchedAssetKinds, wireProtocolMismatch}` | T.8.B (§10.4 W20) — sender BEFORE a UXF send: resolved recipient's identity-binding-event capability hints suggest the recipient may not understand the bundle. **Informational only** — sender does NOT auto-strip. The actual interop guarantee comes from the receiver's `UNKNOWN_ASSET_KIND` reject rule. | Optionally surface a "recipient may not support X" hint in the send UI. |
+
+**Ops** events fire on edge-case operational paths — gateway exhaustion, queue back-pressure, proof maintenance, operator overrides, recovery worker re-publishes.
+
+| Event | Payload | When fired | Typical handler intent |
+|-------|---------|------------|------------------------|
+| `transfer:fetch-failed` | `{bundleCid, senderTransportPubkey, gatewaysAttempted, failureReasons}` | T.4.B — recipient's CID-by-reference fetch (`kind: 'uxf-cid'`) exhausted EVERY configured gateway. Per W13 NO disposition record is written (failure is transient by definition). | Forward to operator dashboard for gateway-health monitoring; do NOT mark the transfer failed. |
+| `transfer:ingest-queue-full` | `{cause, senderTransportPubkey, bundleCid, queueSize, capacity, tokenIds?}` | T.3.E / W7 — recipient's ingest pool back-pressure cap fires (`'queue-full'` for global cap, `'queue-full-per-token'` for per-token cap). Recipient does NOT acknowledge the sender. | Alert on sustained pressure; consider raising `INGEST_QUEUE_SIZE` / `INGEST_QUEUE_PER_TOKEN_CAP`. |
+| `transfer:proof-superseded` | `{tokenId, requestId, outboxId?, previousCid, newCid}` | T.5.B / T.5.C / W16 — fresh poll returned a NEWER proof for an already-attached `requestId` (same value, newer round). Worker replaces the old proof and tombstones the previous CID per §6.3 most-recent-proof canonicalization. | Log; consider exposing a "proof refresh" metric. Distinct from `transfer:security-alert` — superseded means SAME value, newer snapshot. |
+| `transfer:override-applied` | `{tokenId, overrideAppliedAt, overrideAppliedBy?, previousReason, transition}` | T.5.D — successful `payments.importInclusionProof({allowInvalidOverride: true})` flipped a token from `_invalid` back to active pool. The pair stamped on the manifest entry survives every future CRDT merge. | Render an "operator override" row in the audit log. The event represents an explicit breach of §5.6 monotonicity — surface prominently. |
+| `transfer:recovery-republished` | `{outboxId, bundleCid, tokenIds, mode, targetStatus, recoveredAt}` | Phase 8 — sending-recovery worker (gated behind `features.recoveryWorker`) re-published a stuck-in-`'sending'` outbox entry and successfully advanced it forward (§7.0 transition). | Update outbox UI to the new `targetStatus` (`'delivered'` / `'delivered-instant'`); log for recovery-rate metrics. |
+
+#### Subscribing to UXF events
+
+```typescript
+// Lifecycle — most apps wire only these:
+sphere.on('transfer:incoming', (t) => updateInbox(t));
+sphere.on('transfer:submitted', (t) => updateOutbox(t.id, 'submitted'));
+sphere.on('transfer:confirmed', (t) => updateOutbox(t.id, 'confirmed'));
+sphere.on('transfer:failed', (t) => surfaceFailure(t.id, t.error));
+
+// Operator console — wire the failure-class + ops events:
+sphere.on('transfer:cascade-failed', ({ outboxId, tokenId, reason }) => {
+  if (reason !== 'race-lost') page(`cascade-failed: ${tokenId} (${reason})`);
+});
+sphere.on('transfer:security-alert', (data) => {
+  // §6.3 forbidden case — investigate trust boundary
+  haltAndAlert('security-alert', data);
+});
+sphere.on('transfer:override-applied', ({ tokenId, transition, previousReason, overrideAppliedBy }) => {
+  auditLog.append({
+    kind: 'operator-override',
+    tokenId,
+    transition,             // 'invalid→valid' | 'invalid→pending'
+    previousReason,
+    operator: overrideAppliedBy,
+  });
+});
+sphere.on('transfer:recovery-republished', ({ outboxId, targetStatus }) => {
+  metrics.increment('recovery_worker.republished_total');
+  outboxUi.update(outboxId, targetStatus);
+});
+
+// Advisory — usually log + dashboard:
+sphere.on('transfer:trustbase-warning', ({ requestId, attempt }) => {
+  if (attempt > 1) refreshTrustBase();
+});
+sphere.on('transfer:capability-warning', ({ mismatchedAssetKinds }) => {
+  if (mismatchedAssetKinds.length > 0) {
+    showHint('Recipient may not support: ' + mismatchedAssetKinds.join(', '));
+  }
+});
+```
+
+All payload shapes are exported from `types/index.ts` (`SphereEventMap`); see the JSDoc on each entry for canonical field semantics and spec back-references.
 
 ### Unsubscribe
 

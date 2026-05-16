@@ -35,6 +35,28 @@ export interface ConnectSession {
 }
 
 // =============================================================================
+// Intent schema version (T.7.C.5)
+// =============================================================================
+
+/**
+ * Schema version of the intent payload as observed by `onIntent`.
+ *
+ * - `'uxf-1'`  — params are shaped per the UXF-1 packaging format
+ *               (e.g. multi-asset `additionalAssets[]`, or a top-level
+ *               `bundle`/`uxfBundle` field carrying a UXF envelope).
+ * - `'legacy'` — params are the pre-UXF intent shape (single coin slot,
+ *                no multi-asset extension). This is the default for any
+ *                payload that is not detected as UXF-1, preserving full
+ *                backward compatibility with existing wallet UIs.
+ *
+ * External integrators (sphere app, agentsphere, …) that branch on this
+ * field should widen their `onIntent` callback type to include the
+ * `schemaVersion` parameter; callbacks ignoring it continue to work
+ * unchanged because the parameter is optional.
+ */
+export type IntentSchemaVersion = 'uxf-1' | 'legacy';
+
+// =============================================================================
 // ConnectHost Config
 // =============================================================================
 
@@ -53,11 +75,21 @@ export interface ConnectHostConfig {
     silent?: boolean,
   ) => Promise<{ approved: boolean; grantedPermissions: PermissionScope[] }>;
 
-  /** Called when dApp sends an intent. Wallet opens corresponding UI. */
+  /**
+   * Called when dApp sends an intent. Wallet opens corresponding UI.
+   *
+   * The 4th argument, `schemaVersion`, signals whether the wallet should
+   * treat `params` as UXF-1 (`'uxf-1'`) or pre-UXF (`'legacy'`). It is
+   * always provided by the host; the optional marker preserves
+   * source-level backward compatibility for callbacks declared with
+   * three parameters. Defaults to `'legacy'` whenever the host cannot
+   * detect a UXF-1 shape — never throws on detection failure.
+   */
   onIntent: (
     action: string,
     params: Record<string, unknown>,
     session: ConnectSession,
+    schemaVersion?: IntentSchemaVersion,
   ) => Promise<{ result?: unknown; error?: { code: number; message: string } }>;
 
   /** Called when dApp explicitly disconnects. Wallet can revoke persisted permissions. */

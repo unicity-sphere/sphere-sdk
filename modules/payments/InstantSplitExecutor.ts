@@ -27,6 +27,7 @@
 
 import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
+import { hexToBytes as fromHex } from '../../core/hex';
 import { Token } from '@unicitylabs/state-transition-sdk/lib/token/Token';
 import { TokenId } from '@unicitylabs/state-transition-sdk/lib/token/TokenId';
 import { TokenState } from '@unicitylabs/state-transition-sdk/lib/token/TokenState';
@@ -103,13 +104,7 @@ function toHex(bytes: Uint8Array): string {
     .join('');
 }
 
-function fromHex(hex: string): Uint8Array {
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < hex.length; i += 2) {
-    bytes[i / 2] = parseInt(hex.slice(i, i + 2), 16);
-  }
-  return bytes;
-}
+// Steelman³⁵: fromHex consolidated to core/hex.ts (top-of-file import).
 
 // =============================================================================
 // InstantSplitExecutor Implementation
@@ -154,7 +149,20 @@ export class InstantSplitExecutor {
     logger.debug('InstantSplit', `Building V5 bundle for token ${tokenIdHex.slice(0, 8)}...`);
 
     const coinId = new CoinId(fromHex(coinIdHex));
-    const seedString = `${tokenIdHex}_${splitAmount.toString()}_${remainderAmount.toString()}_${Date.now()}`;
+    // Loop1-S12 — replace Date.now() with a 32-byte cryptographic
+    // nonce. The previous millisecond-resolution Date.now() let a
+    // recipient who knows tokenIdHex brute-force the send time over a
+    // narrow window to derive senderSalt = sha256(seedString +
+    // '_sender_salt') — enabling wallet-graph correlation of the
+    // sender's change tokens across subsequent transfers. The
+    // recipient already learns tokenIdHex from receive flows (it's the
+    // source's public id), so this is reachable. A 32-byte nonce
+    // raises the brute-force cost beyond practical bounds while
+    // keeping all subsequent salt derivations deterministic-from-seed.
+    const nonceBytes = new Uint8Array(32);
+    crypto.getRandomValues(nonceBytes);
+    const nonceHex = toHex(nonceBytes);
+    const seedString = `${tokenIdHex}_${splitAmount.toString()}_${remainderAmount.toString()}_${nonceHex}`;
 
     // Generate IDs and salts (deterministic from seed)
     const recipientTokenId = new TokenId(await sha256(seedString));
@@ -209,12 +217,38 @@ export class InstantSplitExecutor {
     if (burnResponse.status !== 'SUCCESS' && burnResponse.status !== 'REQUEST_ID_EXISTS') {
       throw new SphereError(`Burn submission failed: ${burnResponse.status}`, 'TRANSFER_FAILED');
     }
+    // Loop2-C2 — signal that the burn is durable on-chain. The
+    // dispatcher uses this to mark `committedOnChainTokenIds` BEFORE
+    // the proof wait, so a timeout/throw downstream still tombstones
+    // the source. Wrap in try/catch — caller errors must not break
+    // the executor.
+    try {
+      options?.onBurnSubmitted?.();
+    } catch (cbErr) {
+      logger.warn('InstantSplit', 'onBurnSubmitted callback threw (swallowed):', cbErr);
+    }
 
     // === STEP 2: WAIT FOR BURN PROOF (~2s) ===
     logger.debug('InstantSplit', 'Step 2: Waiting for burn proof...');
-    const burnProof = this.devMode
-      ? await this.waitInclusionProofWithDevBypass(burnCommitment, options?.burnProofTimeoutMs)
-      : await waitInclusionProof(this.trustBase, this.client, burnCommitment);
+    // L5-W1 — wrap with SphereError mirroring the
+    // submitCommitmentsImmediate proof-wait wrapping. Without this,
+    // a SleepError (10s timeout) or JsonRpcNetworkError propagates
+    // raw to the dispatcher's catch as a non-SphereError, breaking
+    // the consistent error-shape contract callers expect.
+    let burnProof;
+    try {
+      burnProof = this.devMode
+        ? await this.waitInclusionProofWithDevBypass(burnCommitment, options?.burnProofTimeoutMs)
+        : await waitInclusionProof(this.trustBase, this.client, burnCommitment);
+    } catch (err) {
+      const raw = err instanceof Error ? err.message : String(err);
+      const msg = raw.replace(/[\r\n\t\0]/g, ' ').slice(0, 200);
+      throw new SphereError(
+        `buildSplitBundle: burn proof wait failed: ${msg}`,
+        'TRANSFER_FAILED',
+        err,
+      );
+    }
     const burnTransaction = burnCommitment.toTransaction(burnProof);
 
     logger.debug('InstantSplit', 'Burn proof received');
@@ -294,9 +328,40 @@ export class InstantSplitExecutor {
       nametagTokenJson,
     };
 
+    // #142 — pre-compute the artifacts the UXF dispatcher needs to
+    // assemble a recipient SDK Token JSON. JSON.stringify/JSON.parse
+    // round-trip ensures the data is plain-object (no Uint8Array refs)
+    // and matches the shape the UXF bundle ingest expects.
+    const recipientMintDataJson = recipientMintCommitment.transactionData.toJSON();
+    const recipientMintedStateJson = mintedState.toJSON();
+    const transferCommitmentJson = transferCommitment.toJSON() as {
+      transactionData?: unknown;
+      requestId?: unknown;
+    };
+    const transferTxDataJson = transferCommitmentJson.transactionData;
+
+    // Loop1-S11 — tighten extraction. `RequestId` extends `DataHash`
+    // whose `toJSON()` returns the imprint hex string. The previous
+    // `String(requestId)` fallback would ship "[object Object]" if
+    // the SDK shape ever changes — silently breaking downstream
+    // outbox/finalization joins. Validate hex shape; fail loud on
+    // regression.
+    const transferRequestIdHexRaw = (transferCommitment.requestId as { toJSON?: () => string })?.toJSON?.();
+    if (typeof transferRequestIdHexRaw !== 'string' || !/^[0-9a-f]+$/i.test(transferRequestIdHexRaw)) {
+      throw new SphereError(
+        `InstantSplitExecutor.buildSplitBundle: transferCommitment.requestId.toJSON() returned non-hex (${typeof transferRequestIdHexRaw}); SDK shape regression?`,
+        'TRANSFER_FAILED',
+      );
+    }
+    const transferRequestIdHex = transferRequestIdHexRaw;
+
     return {
       bundle,
       splitGroupId,
+      // Legacy V6 path: submits all three commitments + waits for sender
+      // mint proof + constructs change token, all in the background.
+      // The UXF path uses submitCommitmentsImmediate +
+      // awaitChangeTokenWithProofs instead.
       startBackground: async () => {
         if (!options?.skipBackground) {
           await this.submitBackgroundV5(senderMintCommitment, recipientMintCommitment, transferCommitment, {
@@ -311,7 +376,297 @@ export class InstantSplitExecutor {
           });
         }
       },
+      // UXF path: submit-only (no proof waits). Throws on any submission
+      // failure so the dispatcher can abort before shipping the bundle.
+      submitCommitmentsImmediate: () =>
+        this.submitCommitmentsImmediate(
+          senderMintCommitment,
+          recipientMintCommitment,
+          transferCommitment,
+        ),
+      // UXF path: post-transport background work. Waits for the
+      // sender's mint proof, constructs the change token, calls
+      // onChangeTokenCreated. Errors are logged inside, never thrown.
+      awaitChangeTokenWithProofs: () =>
+        this.awaitChangeTokenWithProofs(senderMintCommitment, {
+          signingService: this.signingService,
+          tokenType: tokenToSplit.type,
+          coinId,
+          senderTokenId,
+          senderSalt,
+          onProgress: options?.onBackgroundProgress,
+          onChangeTokenCreated: options?.onChangeTokenCreated,
+          onStorageSync: options?.onStorageSync,
+        }),
+      transferRequestIdHex,
+      recipientMintDataJson,
+      recipientMintedStateJson,
+      transferTxDataJson,
     };
+  }
+
+  /**
+   * #142 — UXF instant-split wiring. Submits the sender mint, recipient
+   * mint, and transfer commitments to the aggregator, AWAITS the
+   * recipient mint inclusion proof, and returns the proven recipient
+   * mint transaction JSON ready for ingestion as a UXF token genesis.
+   *
+   * **Why we wait for the recipient mint proof here** (Loop4 e2e fix):
+   * the UXF bundle format requires every token's genesis to carry a
+   * proven `inclusionProof` (see uxf/deconstruct.ts:79 —
+   * `GenesisShape.inclusionProof: InclusionProofShape` is non-nullable).
+   * Without the proof the sender's `pkg.ingestAll` throws
+   * `Cannot read properties of null (reading 'authenticator')` when
+   * deconstructing the recipient JSON's genesis. The latency cost is
+   * ~one extra aggregator round-trip (~2s typical), bringing the
+   * instant-split critical path from ~2.3s to ~4.3s — still well
+   * inside the "instant" mode envelope and far below the conservative
+   * mode's ~8s+ floor.
+   *
+   * **Ordering matters (Loop1-S3 steelman fix).** Submissions are
+   * SERIAL, not parallel, and ordered to maximize the user's recovery
+   * surface on partial failure:
+   *
+   *   1. Sender mint  — anchors the change token. If this lands and
+   *                     a later step fails, the user's residual is
+   *                     recoverable via `awaitChangeTokenWithProofs`.
+   *                     If this fails, NOTHING else is submitted —
+   *                     the user lost only the burn (source is gone),
+   *                     no orphan recipient-side commitments pollute
+   *                     the aggregator.
+   *
+   *   2. Recipient mint — mints the recipient slice at the sender's
+   *                       predicate. Required before the transfer
+   *                       commitment can reference it. If this fails,
+   *                       the change token is still recoverable via
+   *                       step 1.
+   *
+   *   3. Transfer commitment — moves the recipient slice from
+   *                            sender's predicate to recipient's
+   *                            address. If this fails, the recipient
+   *                            mint at the sender's predicate is
+   *                            recoverable as a sender-owned token
+   *                            (manual reassignment); change token
+   *                            still recoverable via step 1.
+   *
+   *   4. Wait for recipient mint inclusion proof. Required by the UXF
+   *                            format to populate the genesis
+   *                            inclusionProof field.
+   *
+   * @returns object with `recipientMintProvenGenesisJson` — the JSON
+   *          of the proven recipient mint transaction `{data, inclusionProof}`.
+   *          The dispatcher uses this as `recipientTokenJson.genesis`.
+   *
+   * @internal
+   */
+  private async submitCommitmentsImmediate(
+    senderMintCommitment: MintCommitment<any>,
+    recipientMintCommitment: MintCommitment<any>,
+    transferCommitment: TransferCommitment,
+  ): Promise<{
+    recipientMintProvenGenesisJson: unknown;
+    transferTransactionHashHex: string;
+    transferAuthenticatorJsonStr: string;
+  }> {
+    logger.debug('InstantSplit', 'submitCommitmentsImmediate: serial submit (senderMint → recipientMint → transfer)');
+
+    const submitOne = async (
+      label: string,
+      submit: () => Promise<{ status: string }>,
+    ): Promise<void> => {
+      let res: { status: string };
+      try {
+        res = await submit();
+      } catch (err) {
+        // Sanitize the error message before interpolating into the
+        // outgoing SphereError — aggregator-supplied strings are not
+        // trusted (Loop1 sanitization gap).
+        const raw = err instanceof Error ? err.message : String(err);
+        const msg = raw.replace(/[\r\n\t\0]/g, ' ').slice(0, 200);
+        throw new SphereError(
+          `submitCommitmentsImmediate: ${label} submission threw: ${msg}`,
+          'TRANSFER_FAILED',
+          err,
+        );
+      }
+      if (res.status !== 'SUCCESS' && res.status !== 'REQUEST_ID_EXISTS') {
+        throw new SphereError(
+          `submitCommitmentsImmediate: ${label} submission rejected with status=${res.status}`,
+          'TRANSFER_FAILED',
+        );
+      }
+    };
+
+    await submitOne('senderMint', () => this.client.submitMintCommitment(senderMintCommitment));
+    await submitOne('recipientMint', () => this.client.submitMintCommitment(recipientMintCommitment));
+    await submitOne('transfer', () => this.client.submitTransferCommitment(transferCommitment));
+
+    logger.debug('InstantSplit', 'submitCommitmentsImmediate: all three commitments anchored; awaiting recipient mint proof');
+
+    // Loop4-e2e — UXF format requires the recipient genesis to be
+    // proven. Without this wait, `pkg.ingestAll` throws on the
+    // sender side because deconstructInclusionProof can't handle a
+    // null inclusionProof on a Genesis shape.
+    let recipientMintProof: unknown;
+    try {
+      recipientMintProof = this.devMode
+        ? await this.waitInclusionProofWithDevBypass(recipientMintCommitment)
+        : await waitInclusionProof(this.trustBase, this.client, recipientMintCommitment);
+    } catch (err) {
+      const raw = err instanceof Error ? err.message : String(err);
+      const msg = raw.replace(/[\r\n\t\0]/g, ' ').slice(0, 200);
+      throw new SphereError(
+        `submitCommitmentsImmediate: recipient mint proof wait failed: ${msg}`,
+        'TRANSFER_FAILED',
+        err,
+      );
+    }
+
+    // Reconstruct the proven recipient mint transaction and serialize
+    // for the UXF bundle's genesis.
+    const recipientMintTransaction = recipientMintCommitment.toTransaction(recipientMintProof as any);
+    const recipientMintProvenGenesisJson = recipientMintTransaction.toJSON();
+
+    // Loop4-S2 — extract the transfer commitment's transactionHash +
+    // authenticator so the dispatcher can populate the sender-side
+    // request context map. Without these, the §6.1 finalization
+    // worker's resolver returns null on the split-path requestId
+    // and the worker aborts with hard-fail 'structural' — meaning
+    // `transfer:confirmed` never fires and the outbox entry stays
+    // at `delivered-instant` forever.
+    //
+    // L5-C3 hardening — FAIL CLOSED on hash derivation failure.
+    // The previous fallback (`requestId.toJSON?.() ?? ''`) could
+    // produce an empty string in pathological cases. Stored in
+    // `_senderRequestContextMap.transactionHash` as `''`, this
+    // crashes `parseTransactionHashImprint`'s 68-char guard inside
+    // the §6.1 worker → mapped to `oracle-rejected` hard-fail →
+    // outbox transitions to `failed-permanent` → cascade-walker
+    // fires falsely → source token marked invalid even though the
+    // recipient already received the bundle. A `calculateHash`
+    // throw means the commitment is corrupt — better to fail the
+    // send loud than to ship a bundle that produces a false-
+    // cascade on confirm.
+    let transferTransactionHashHex: string;
+    try {
+      const txDataHash = await transferCommitment.transactionData.calculateHash();
+      transferTransactionHashHex = txDataHash.toJSON();
+    } catch (err) {
+      const raw = err instanceof Error ? err.message : String(err);
+      const msg = raw.replace(/[\r\n\t\0]/g, ' ').slice(0, 200);
+      throw new SphereError(
+        `submitCommitmentsImmediate: transferCommitment.transactionData.calculateHash() failed: ${msg}. ` +
+          'Race-lost detection cannot proceed with a degraded hash; refusing to publish.',
+        'TRANSFER_FAILED',
+        err,
+      );
+    }
+    if (typeof transferTransactionHashHex !== 'string' || transferTransactionHashHex.length < 64) {
+      // DataHash imprint hex is a fixed-length canonical string. A
+      // missing/short value indicates an SDK regression — surface it
+      // before the §6.1 worker hard-fails on the malformed value.
+      throw new SphereError(
+        `submitCommitmentsImmediate: derived transferTransactionHashHex is not a valid hex imprint (got ${
+          typeof transferTransactionHashHex === 'string' ? `length=${transferTransactionHashHex.length}` : typeof transferTransactionHashHex
+        }).`,
+        'TRANSFER_FAILED',
+      );
+    }
+    const transferCommitJson = (transferCommitment as { toJSON?: () => { authenticator?: unknown } }).toJSON?.();
+    if (
+      transferCommitJson === undefined ||
+      transferCommitJson.authenticator === undefined ||
+      transferCommitJson.authenticator === null
+    ) {
+      // SDK contract: TransferCommitment.toJSON() always exposes the
+      // authenticator. A missing field is an SDK shape regression
+      // that would cause the §6.3 same-value-vs-different-value
+      // compare to false-positive into security-alert territory.
+      throw new SphereError(
+        'submitCommitmentsImmediate: transferCommitment.toJSON() has no authenticator field. ' +
+          'SDK shape regression?',
+        'TRANSFER_FAILED',
+      );
+    }
+    const transferAuthenticatorJsonStr = JSON.stringify(transferCommitJson.authenticator);
+
+    logger.debug('InstantSplit', 'submitCommitmentsImmediate: recipient mint proof anchored, genesis ready');
+    return {
+      recipientMintProvenGenesisJson,
+      transferTransactionHashHex,
+      transferAuthenticatorJsonStr,
+    };
+  }
+
+  /**
+   * #142 — UXF instant-split wiring. After commitments are anchored
+   * via submitCommitmentsImmediate, this method waits for the sender's
+   * mint proof, reconstructs the change token, and invokes
+   * onChangeTokenCreated.
+   *
+   * Errors are caught and logged (NOT re-thrown). The UXF bundle has
+   * already shipped by the time this runs; throwing would propagate
+   * into a fire-and-forget context with no observer.
+   *
+   * @internal
+   */
+  private async awaitChangeTokenWithProofs(
+    senderMintCommitment: MintCommitment<any>,
+    context: BackgroundContext,
+  ): Promise<void> {
+    try {
+      logger.debug('InstantSplit', 'awaitChangeTokenWithProofs: waiting for sender mint proof');
+      const senderMintProof = this.devMode
+        ? await this.waitInclusionProofWithDevBypass(senderMintCommitment)
+        : await waitInclusionProof(this.trustBase, this.client, senderMintCommitment);
+
+      const mintTransaction = senderMintCommitment.toTransaction(senderMintProof);
+      const predicate = await UnmaskedPredicate.create(
+        context.senderTokenId,
+        context.tokenType,
+        context.signingService,
+        HashAlgorithm.SHA256,
+        context.senderSalt,
+      );
+      const state = new TokenState(predicate, null);
+      const changeToken = await Token.mint(this.trustBase, state, mintTransaction);
+
+      if (!this.devMode) {
+        const verification = await changeToken.verify(this.trustBase);
+        if (!verification.isSuccessful) {
+          throw new SphereError('Change token verification failed', 'TRANSFER_FAILED');
+        }
+      }
+
+      context.onProgress?.({
+        stage: 'CHANGE_TOKEN_SAVED',
+        message: 'Change token created and verified',
+      });
+
+      if (context.onChangeTokenCreated) {
+        await context.onChangeTokenCreated(changeToken);
+      }
+
+      if (context.onStorageSync) {
+        try {
+          await context.onStorageSync();
+        } catch (syncError) {
+          logger.warn('InstantSplit', 'awaitChangeTokenWithProofs: storage sync error:', syncError);
+        }
+      }
+
+      context.onProgress?.({
+        stage: 'COMPLETED',
+        message: 'Change token persisted',
+      });
+    } catch (err) {
+      logger.error('InstantSplit', 'awaitChangeTokenWithProofs: failed', err);
+      context.onProgress?.({
+        stage: 'FAILED',
+        message: 'Change token construction failed',
+        error: String(err),
+      });
+    }
   }
 
   /**

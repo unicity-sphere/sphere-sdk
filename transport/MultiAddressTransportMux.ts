@@ -27,6 +27,7 @@ import {
 import type { ConnectionEventListener } from '@unicitylabs/nostr-js-sdk';
 import { logger } from '../core/logger';
 import { SphereError } from '../core/errors';
+import { hexToBytes as strictHexToBytes } from '../core/hex';
 
 import type { ProviderStatus, FullIdentity } from '../types';
 import type {
@@ -227,7 +228,7 @@ export class MultiAddressTransportMux {
     const existing = this.addresses.get(index);
     if (existing) {
       existing.identity = identity;
-      existing.keyManager = NostrKeyManager.fromPrivateKey(Buffer.from(identity.privateKey, 'hex'));
+      existing.keyManager = NostrKeyManager.fromPrivateKey(strictHexToBytes(identity.privateKey));
       existing.nostrPubkey = existing.keyManager.getPublicKeyHex();
       // Update pubkey mapping
       for (const [pk, idx] of this.pubkeyToIndex) {
@@ -239,7 +240,7 @@ export class MultiAddressTransportMux {
       return existing.adapter;
     }
 
-    const keyManager = NostrKeyManager.fromPrivateKey(Buffer.from(identity.privateKey, 'hex'));
+    const keyManager = NostrKeyManager.fromPrivateKey(strictHexToBytes(identity.privateKey));
     const nostrPubkey = keyManager.getPublicKeyHex();
 
     const adapter = new AddressTransportAdapter(this, index, identity, resolveDelegate);
@@ -359,7 +360,18 @@ export class MultiAddressTransportMux {
           autoReconnect: this.config.autoReconnect,
           reconnectIntervalMs: this.config.reconnectDelay,
           maxReconnectIntervalMs: this.config.reconnectDelay * 16,
-          pingIntervalMs: 15000,
+          // pingIntervalMs intentionally raised. The 15 s interval combined with
+          // the SDK's no-filter `['REQ','ping',{limit:1}]` keepalive trick has
+          // been observed to false-positive on real testnet under uneven relay
+          // response timing — the relay floods events to a no-filter sub but
+          // occasional 30+ s gaps in that flood (rate-limit / backend hiccup)
+          // race the 30 s stale threshold. The Mux already runs its own
+          // application-layer chat-event health check (see
+          // `[Mux] No chat events for X — re-subscribing` in this file), so
+          // we don't rely on NostrClient's stale-detect for liveness — we
+          // raise the interval to push the false-positive past any realistic
+          // run, while keeping the timer in place as a defense-in-depth signal.
+          pingIntervalMs: 60000,
         });
       }
 

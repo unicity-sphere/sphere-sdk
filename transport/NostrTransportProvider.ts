@@ -27,8 +27,13 @@ import {
   isReadReceipt,
 } from '@unicitylabs/nostr-js-sdk';
 import type { BindingInfo } from '@unicitylabs/nostr-js-sdk';
+import {
+  SUPPORTED_WIRE_PROTOCOLS,
+  SUPPORTED_ASSET_KINDS,
+} from './transport-provider';
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
 import { logger } from '../core/logger';
+import { hexToBytes as strictHexToBytes } from '../core/hex';
 import type { ProviderStatus, FullIdentity } from '../types';
 import { SphereError } from '../core/errors';
 import type {
@@ -63,6 +68,8 @@ import {
   STORAGE_KEYS_GLOBAL,
   TIMEOUTS,
 } from '../constants';
+import { isUxfTransferPayload } from '../types/uxf-transfer';
+import { encodeTransferPayload, decodeTransferPayload } from '../uxf/transfer-payload';
 
 // =============================================================================
 // Configuration
@@ -200,6 +207,14 @@ export class NostrTransportProvider implements TransportProvider {
    * Suppress event subscriptions — unsubscribe wallet/chat filters
    * but keep the connection alive for resolve/identity-binding operations.
    * Used when MultiAddressTransportMux takes over event handling.
+   *
+   * Stops application-level keepalive ping timers on the bare connection.
+   * After suppression this NostrClient has zero active subscriptions; the
+   * connection is retained only as an outbound resolve()/identity-binding
+   * channel. Application pings on a subscription-free connection have been
+   * empirically observed to elicit no relay response, causing
+   * `appears stale` flapping every ~45 s. OS-level TCP keepalive maintains
+   * connection liveness; we don't need application-level pings here.
    */
   suppressSubscriptions(): void {
     if (!this.nostrClient) return;
@@ -217,9 +232,34 @@ export class NostrTransportProvider implements TransportProvider {
       this.mainSubscriptionId = null;
     }
 
+    this.stopApplicationPingsOnBareClient();
+
     // Prevent re-subscription on reconnect by marking subscriptions as suppressed
     this._subscriptionsSuppressed = true;
     logger.debug('Nostr', 'Subscriptions suppressed — mux handles event routing');
+  }
+
+  /**
+   * Stop the bare NostrClient's per-relay application-level keepalive
+   * ping timers. Reaches into NostrClient internals via a structural cast
+   * because `stopPingTimer(url)` and `relays` are declared `private` in
+   * @unicitylabs/nostr-js-sdk. An upstream PR adding a public
+   * `stopAllPingTimers()` would let us drop this cast.
+   *
+   * Called from `suppressSubscriptions()` and from the post-reconnect path
+   * in `setIdentity` when suppression is active — every fresh NostrClient
+   * starts its own ping timers on connect, so we must re-stop them after
+   * each replacement.
+   */
+  private stopApplicationPingsOnBareClient(): void {
+    if (!this.nostrClient) return;
+    const internals = this.nostrClient as unknown as {
+      relays: Map<string, unknown>;
+      stopPingTimer(url: string): void;
+    };
+    for (const url of internals.relays.keys()) {
+      internals.stopPingTimer(url);
+    }
   }
 
   // Flag to prevent re-subscription after suppressSubscriptions()
@@ -251,7 +291,13 @@ export class NostrTransportProvider implements TransportProvider {
         autoReconnect: this.config.autoReconnect,
         reconnectIntervalMs: this.config.reconnectDelay,
         maxReconnectIntervalMs: this.config.reconnectDelay * 16, // exponential backoff cap
-        pingIntervalMs: 15000, // 15 second keepalive pings (more aggressive to prevent drops)
+        // 60 s keepalive — the SDK's no-filter `['REQ','ping',{limit:1}]`
+        // trick false-positives at 15 s on real testnet under uneven relay
+        // timing. After Mux takeover suppressSubscriptions stops these
+        // timers entirely (see `stopApplicationPingsOnBareClient`); 60 s
+        // covers the brief pre-suppress window AND any reconnect that
+        // re-establishes the timer before suppression re-runs.
+        pingIntervalMs: 60000,
         // Bump query timeout from the SDK default of 5s to 20s.
         // Real-world testnet observation (2026-05-01): under transient
         // relay overload, kind:30078 (nametag binding) queries take 5-7s
@@ -284,6 +330,11 @@ export class NostrTransportProvider implements TransportProvider {
           this.subscribeToEvents().catch((err) => {
             logger.error('Nostr', 'Failed to re-subscribe after reconnect:', err);
           });
+          // The reconnected socket starts a fresh ping timer; under
+          // suppression we don't want it (see suppressSubscriptions()).
+          if (this._subscriptionsSuppressed) {
+            this.stopApplicationPingsOnBareClient();
+          }
         },
       });
 
@@ -466,8 +517,10 @@ export class NostrTransportProvider implements TransportProvider {
     this.lastDmEventTs = 0;
     this.fallbackDmSince = null;
 
-    // Create NostrKeyManager from private key
-    const secretKey = Buffer.from(identity.privateKey, 'hex');
+    // Create NostrKeyManager from private key.
+    // Steelman³³ warning: strict hex decode — Buffer.from(_, 'hex')
+    // silently truncates malformed inputs.
+    const secretKey = strictHexToBytes(identity.privateKey);
     this.keyManager = NostrKeyManager.fromPrivateKey(secretKey);
 
     // Use Nostr-format pubkey (32 bytes / 64 hex chars) from keyManager
@@ -502,6 +555,11 @@ export class NostrTransportProvider implements TransportProvider {
         },
         onReconnected: (url) => {
           logger.debug('Nostr', 'NostrClient reconnected to relay:', url);
+          // Mirror the primary listener: under suppression, the
+          // reconnected socket's fresh ping timer is unwanted.
+          if (this._subscriptionsSuppressed) {
+            this.stopApplicationPingsOnBareClient();
+          }
         },
       });
 
@@ -515,6 +573,12 @@ export class NostrTransportProvider implements TransportProvider {
         ),
       ]);
       await this.subscribeToEvents();
+      // The fresh NostrClient started its own ping timers on connect.
+      // If subscriptions were suppressed (mux owns event routing), the
+      // bare client should not ping — see suppressSubscriptions() docstring.
+      if (this._subscriptionsSuppressed) {
+        this.stopApplicationPingsOnBareClient();
+      }
       oldClient.disconnect();
     } else if (this.isConnected()) {
       // Already connected with right key, just subscribe
@@ -610,9 +674,32 @@ export class NostrTransportProvider implements TransportProvider {
   ): Promise<string> {
     this.ensureReady();
 
-    // Create encrypted token transfer event
-    // Content must have "token_transfer:" prefix for nostr-js-sdk compatibility
-    const content = 'token_transfer:' + JSON.stringify(payload);
+    // T.2.E — shape-agnostic outbound serialization.
+    //
+    // Two valid serialization paths exist for the `TokenTransferPayload`
+    // tagged union (`types/uxf-transfer`):
+    //
+    //   1. UXF v1.0 envelopes (`kind === 'uxf-car' | 'uxf-cid'`) and the
+    //      four legacy shapes recognized by `isLegacyTokenTransferPayload`:
+    //      use the canonical, byte-deterministic encoder from T.1.D so that
+    //      every legitimate envelope on the wire is identical across
+    //      sender runs (important for content-addressed audit and replay
+    //      detection — §5.6).
+    //   2. Anything else (custom test payloads, callers that bypass the
+    //      `as unknown as TokenTransferPayload` cast already used by
+    //      `PaymentsModule` for partially-built shapes): fall through to
+    //      `JSON.stringify`. This preserves backward compatibility with
+    //      the pre-T.2.E behavior — no caller currently exercises this
+    //      path, but the safety valve is critical to avoid breaking the
+    //      legacy chain split during the migration wave.
+    //
+    // Content must have "token_transfer:" prefix for nostr-js-sdk
+    // compatibility — preserved verbatim from the pre-T.2.E implementation
+    // and matched by `stripContentPrefix()` on the receive side.
+    const serialized = isUxfTransferPayload(payload)
+      ? encodeTransferPayload(payload)
+      : JSON.stringify(payload);
+    const content = 'token_transfer:' + serialized;
 
     // IMPORTANT: kind 31113 is a Parameterized Replaceable Event (NIP-01).
     // The relay keeps only the LATEST event per (pubkey, kind, d-tag).
@@ -888,6 +975,11 @@ export class NostrTransportProvider implements TransportProvider {
   /**
    * Convert a BindingInfo (from nostr-js-sdk) to PeerInfo (sphere-sdk type).
    * Computes PROXY address from nametag if available.
+   *
+   * T.8.B — When a nametag is resolved we additionally do a best-effort
+   * query for the peer's capability-bearing identity binding event (lives
+   * on a different d-tag than the nametag binding). Capability hints are
+   * informational only and the lookup never throws on failure.
    */
   private async bindingInfoToPeerInfo(binding: BindingInfo, nametag?: string): Promise<PeerInfo> {
     const nametagValue = nametag || binding.nametag;
@@ -904,6 +996,11 @@ export class NostrTransportProvider implements TransportProvider {
       }
     }
 
+    // T.8.B — Best-effort capability hint enrichment. Upstream BindingInfo
+    // is lossy w.r.t. wireProtocols / assetKinds; query the predictable
+    // per-pubkey identity binding event to recover them. Failure is silent.
+    const capabilities = await this.fetchCapabilityHints(binding.transportPubkey);
+
     return {
       nametag: nametagValue,
       transportPubkey: binding.transportPubkey,
@@ -912,7 +1009,81 @@ export class NostrTransportProvider implements TransportProvider {
       directAddress: binding.directAddress || '',
       proxyAddress,
       timestamp: binding.timestamp,
+      ...capabilities,
     };
+  }
+
+  /**
+   * T.8.B — Extract capability hints (`wireProtocols`, `assetKinds`) from
+   * a binding event's raw JSON content.
+   *
+   * Returns an object whose keys are present ONLY when the corresponding
+   * field appeared in the parsed content. This preserves the W20 absent vs
+   * empty distinction at the type level: a missing key on the returned
+   * object means "field absent on the wire" (for `assetKinds` callers
+   * default to `['coin']` per W20); an EMPTY array means "field present
+   * but empty" (informational quirk, no W20 default).
+   */
+  private extractCapabilityHints(rawContent: unknown): {
+    wireProtocols?: ReadonlyArray<string>;
+    assetKinds?: ReadonlyArray<string>;
+  } {
+    if (!rawContent || typeof rawContent !== 'object') return {};
+    const content = rawContent as Record<string, unknown>;
+    const out: {
+      wireProtocols?: ReadonlyArray<string>;
+      assetKinds?: ReadonlyArray<string>;
+    } = {};
+    const wp = content.wire_protocols;
+    if (Array.isArray(wp)) {
+      out.wireProtocols = wp.filter((v): v is string => typeof v === 'string');
+    }
+    const ak = content.asset_kinds;
+    if (Array.isArray(ak)) {
+      out.assetKinds = ak.filter((v): v is string => typeof v === 'string');
+    }
+    return out;
+  }
+
+  /**
+   * T.8.B — Best-effort fetch of capability hints for a peer.
+   *
+   * Queries the predictable per-pubkey identity binding event (the one
+   * `publishIdentityBindingWithCapabilities` writes) and returns the hints
+   * extracted from its content. Returns an empty object on any failure
+   * (relay error, no event, parse error). Capability hints are
+   * informational and MUST NOT block resolution.
+   */
+  private async fetchCapabilityHints(transportPubkey: string): Promise<{
+    wireProtocols?: ReadonlyArray<string>;
+    assetKinds?: ReadonlyArray<string>;
+  }> {
+    try {
+      const events = await this.queryEvents({
+        kinds: [EVENT_KINDS.NAMETAG_BINDING],
+        authors: [transportPubkey],
+        limit: 5,
+      });
+      if (events.length === 0) return {};
+      // Newest-first; pick the first event whose content carries either
+      // capability field. Older entries authored by the same pubkey may
+      // pre-date T.8.B and lack the fields entirely.
+      const sorted = [...events].sort((a, b) => b.created_at - a.created_at);
+      for (const event of sorted) {
+        try {
+          const content = JSON.parse(event.content) as Record<string, unknown>;
+          const hints = this.extractCapabilityHints(content);
+          if (hints.wireProtocols !== undefined || hints.assetKinds !== undefined) {
+            return hints;
+          }
+        } catch {
+          // Skip unparseable events.
+        }
+      }
+      return {};
+    } catch {
+      return {};
+    }
   }
 
   /**
@@ -936,6 +1107,8 @@ export class NostrTransportProvider implements TransportProvider {
 
     try {
       const content = JSON.parse(bindingEvent.content);
+      // T.8.B — Capability hints from the same content blob (when present).
+      const capabilities = this.extractCapabilityHints(content);
 
       return {
         nametag: content.nametag || undefined,
@@ -945,6 +1118,7 @@ export class NostrTransportProvider implements TransportProvider {
         directAddress: content.direct_address || '',
         proxyAddress: content.proxy_address || undefined,
         timestamp: bindingEvent.created_at * 1000,
+        ...capabilities,
       };
     } catch {
       return {
@@ -987,6 +1161,8 @@ export class NostrTransportProvider implements TransportProvider {
     for (const [pubkey, event] of byAuthor) {
       try {
         const content = JSON.parse(event.content);
+        // T.8.B — Capability hints from the same event content (when present).
+        const capabilities = this.extractCapabilityHints(content);
         results.push({
           nametag: content.nametag || undefined,
           transportPubkey: pubkey,
@@ -995,6 +1171,7 @@ export class NostrTransportProvider implements TransportProvider {
           directAddress: content.direct_address || '',
           proxyAddress: content.proxy_address || undefined,
           timestamp: event.created_at * 1000,
+          ...capabilities,
         });
       } catch {
         // Skip unparseable events
@@ -1103,6 +1280,20 @@ export class NostrTransportProvider implements TransportProvider {
 
         if (success) {
           logger.debug('Nostr', 'Published identity binding with Unicity ID:', nametag, 'for pubkey:', nostrPubkey.slice(0, 16) + '...');
+
+          // T.8.B — Additionally publish a no-nametag identity binding event
+          // carrying capability hints (wireProtocols + assetKinds, §10.4).
+          // The nametag binding above uses a different d-tag (hashedNametag)
+          // so the two events coexist; capability hints live on the
+          // predictable per-pubkey d-tag and remain queryable via
+          // resolveTransportPubkeyInfo() even when the nametag is unknown
+          // to the caller. We pass the nametag through so the per-pubkey
+          // event also carries the plaintext nametag — without this,
+          // `resolveTransportPubkeyInfo` (most-recent-author wins) would
+          // return `nametag: undefined` after this event lands.
+          await this.publishIdentityBindingWithCapabilities(
+            chainPubkey, l1Address, directAddress, nametag, proxyAddr.toString(),
+          );
         }
         return success;
       } catch (error) {
@@ -1115,17 +1306,91 @@ export class NostrTransportProvider implements TransportProvider {
       }
     }
 
-    // No nametag — delegate to nostr-js-sdk for base identity binding
-    const success = await this.nostrClient!.publishIdentityBinding({
-      publicKey: chainPubkey,
-      l1Address,
-      directAddress,
-    });
+    // No nametag — publish our own identity binding event so we can include
+    // T.8.B capability hints (the upstream SDK's IdentityBindingParams type
+    // does not surface wireProtocols / assetKinds, so we construct the event
+    // ourselves; the d-tag formula is identical so this is wire-compatible
+    // with older consumers that ignore the extra fields).
+    const success = await this.publishIdentityBindingWithCapabilities(
+      chainPubkey, l1Address, directAddress,
+    );
 
     if (success) {
       logger.debug('Nostr', 'Published identity binding (no Unicity ID) for pubkey:', nostrPubkey.slice(0, 16) + '...');
     }
     return success;
+  }
+
+  /**
+   * T.8.B — Publish a base identity binding event (no nametag) carrying
+   * capability hints in the JSON content.
+   *
+   * Uses the same d-tag formula as the upstream nostr-js-sdk
+   * createIdentityBindingEvent (`SHA256('unicity:identity:' + nostrPubkey)`)
+   * so this event participates in the same parameterized-replaceable slot
+   * (kind 30078 — APP_DATA). Older readers that parse only the four
+   * canonical fields (`public_key`, `l1_address`, `direct_address`,
+   * `proxy_address`) ignore the additional `wire_protocols` and
+   * `asset_kinds` arrays — forward-compatible by construction.
+   *
+   * Spec refs: §10.4 (capability hints), W20 (assetKinds default).
+   */
+  private async publishIdentityBindingWithCapabilities(
+    chainPubkey: string,
+    l1Address: string,
+    directAddress: string,
+    nametag?: string,
+    proxyAddress?: string,
+  ): Promise<boolean> {
+    const nostrPubkey = this.getNostrPubkey();
+    const dTag = bytesToHex(
+      sha256Noble(new TextEncoder().encode('unicity:identity:' + nostrPubkey)),
+    );
+
+    const content: Record<string, unknown> = {
+      public_key: chainPubkey,
+      l1_address: l1Address,
+      direct_address: directAddress,
+      // T.8.B — capability hints (§10.4). Snake_case to match the upstream
+      // content schema convention.
+      wire_protocols: [...SUPPORTED_WIRE_PROTOCOLS],
+      asset_kinds: [...SUPPORTED_ASSET_KINDS],
+    };
+    // T.8.B — preserve the nametag-bearing identity's `nametag` /
+    // `proxy_address` fields on the per-pubkey binding so `resolveTransportPubkeyInfo`
+    // (most-recent-by-author) does not return `nametag: undefined` after
+    // this event lands. Without this, the no-nametag binding would shadow
+    // the nametag-binding's metadata for pubkey-based reverse lookups.
+    if (nametag) content.nametag = nametag;
+    if (proxyAddress) content.proxy_address = proxyAddress;
+
+    // Mirror the upstream's `t` tag indexing so reverse-lookup by address
+    // continues to work. We hash with the same upstream helper to stay in
+    // lock-step with NametagUtils.hashAddressForTag().
+    const { NametagUtils } = await import('@unicitylabs/nostr-js-sdk');
+    const tags: string[][] = [['d', dTag]];
+    if (chainPubkey) {
+      tags.push(['t', NametagUtils.hashAddressForTag(chainPubkey)]);
+    }
+    if (l1Address) {
+      tags.push(['t', NametagUtils.hashAddressForTag(l1Address)]);
+    }
+    if (directAddress) {
+      tags.push(['t', NametagUtils.hashAddressForTag(directAddress)]);
+    }
+
+    const event = await this.createEvent(
+      EVENT_KINDS.NAMETAG_BINDING,
+      JSON.stringify(content),
+      tags,
+    );
+    try {
+      await this.publishEvent(event);
+      return true;
+    } catch (err) {
+      logger.warn('Nostr', 'Failed to publish identity binding with capabilities:', err);
+      return false;
+    }
   }
 
   // Track broadcast subscriptions
@@ -1193,6 +1458,20 @@ export class NostrTransportProvider implements TransportProvider {
 
     logger.debug('Nostr', 'Processing event kind:', event.kind, 'id:', event.id?.slice(0, 12));
     try {
+      // At-least-once invariant: TOKEN_TRANSFER events are gated on
+      // durability — `handleTokenTransfer` returns `true` only when
+      // every registered handler reported the inbound token(s)
+      // durably persisted (IPFS pin + OrbitDB ref + aggregator
+      // pointer for the Profile provider). When `false`, we do NOT
+      // advance `lastEventTs`, so the event is re-replayed on the
+      // next reconnect (idempotent via addToken stateHash dedup).
+      //
+      // Other wallet kinds (DM, payment-request, payment-request-
+      // response) retain the legacy "advance on completion"
+      // semantics — their persistence model is in-memory + KV save
+      // which is synchronous on save() return, so the gap that
+      // motivated the invariant (debounced IPFS pin) does not apply.
+      let tokenTransferDurable = true;
       switch (event.kind) {
         case EVENT_KINDS.DIRECT_MESSAGE:
           await this.handleDirectMessage(event);
@@ -1202,7 +1481,7 @@ export class NostrTransportProvider implements TransportProvider {
           await this.handleGiftWrap(event);
           break;
         case EVENT_KINDS.TOKEN_TRANSFER:
-          await this.handleTokenTransfer(event);
+          tokenTransferDurable = await this.handleTokenTransfer(event);
           break;
         case EVENT_KINDS.PAYMENT_REQUEST:
           await this.handlePaymentRequest(event);
@@ -1217,15 +1496,26 @@ export class NostrTransportProvider implements TransportProvider {
 
       // Persist the latest event timestamp for resumption on reconnect.
       // Only update for wallet event kinds (not chat/broadcast).
+      // Skip for TOKEN_TRANSFER when the handler reported non-durable —
+      // re-replay on next reconnect protects against silent loss when
+      // IPFS pin / OrbitDB write / aggregator publish fails.
       if (event.created_at && this.storage && this.keyManager) {
         const kind = event.kind;
         if (
           kind === EVENT_KINDS.DIRECT_MESSAGE ||
-          kind === EVENT_KINDS.TOKEN_TRANSFER ||
           kind === EVENT_KINDS.PAYMENT_REQUEST ||
           kind === EVENT_KINDS.PAYMENT_REQUEST_RESPONSE
         ) {
           this.updateLastEventTimestamp(event.created_at);
+        } else if (kind === EVENT_KINDS.TOKEN_TRANSFER) {
+          if (tokenTransferDurable) {
+            this.updateLastEventTimestamp(event.created_at);
+          } else {
+            logger.warn(
+              'Nostr',
+              `[AT-LEAST-ONCE] TOKEN_TRANSFER ${event.id?.slice(0, 12)} not durable — leaving 'since' at ${this.lastEventTs}; event will replay on next reconnect`,
+            );
+          }
         }
       }
     } catch (error) {
@@ -1428,12 +1718,35 @@ export class NostrTransportProvider implements TransportProvider {
     }
   }
 
-  private async handleTokenTransfer(event: NostrEvent): Promise<void> {
-    if (!this.identity) return;
+  private async handleTokenTransfer(event: NostrEvent): Promise<boolean> {
+    if (!this.identity) return true;
 
-    // Decrypt content
+    // Decrypt content (the `token_transfer:` prefix is stripped inside
+    // `decryptContent` → `stripContentPrefix`, so by the time we get
+    // `content` it's a plain JSON document — no extra trimming required
+    // here).
     const content = await this.decryptContent(event.content, event.pubkey);
-    const payload = JSON.parse(content) as TokenTransferPayload;
+
+    // T.2.E — shape-agnostic inbound parsing.
+    //
+    // `decodeTransferPayload` (T.1.D) is structurally paranoid: it parses
+    // the JSON, runs `isUxfTransferPayload`, and either returns a typed
+    // union value or throws `BUNDLE_REJECTED_MALFORMED_ENVELOPE`. The
+    // outer `handleEvent` switch catches this error and logs at debug
+    // level — same fail-soft behavior as the pre-T.2.E `JSON.parse` path,
+    // which would have thrown `SyntaxError` on bad bytes.
+    //
+    // The handler downstream (PaymentsModule) discriminates by shape:
+    // `kind === 'uxf-car' | 'uxf-cid'` routes to the new UXF receive
+    // path (T.7.A), absence of `kind` routes to the legacy adapter
+    // (existing four-shape `processTokenTransfer` flow).
+    //
+    // Note that `decodeTransferPayload` deliberately collapses every
+    // failure mode (non-JSON, wrong type, missing fields, unknown
+    // discriminator) to a single error code so we don't have to fan-out
+    // here — the receiver's idempotency layer (§5.6) treats every kind
+    // of malformed envelope the same way: drop and move on.
+    const payload = decodeTransferPayload(content);
 
     const transfer: IncomingTokenTransfer = {
       id: event.id,
@@ -1444,13 +1757,24 @@ export class NostrTransportProvider implements TransportProvider {
 
     this.emitEvent({ type: 'transfer:received', timestamp: Date.now() });
 
+    // At-least-once invariant: collect durability signal from every
+    // registered handler. If ANY handler returns `false` (could not
+    // persist), or throws, we treat the whole event as non-durable so
+    // the transport refuses to advance `lastEventTs`. The legacy
+    // contract (handlers returning `void` / `undefined`) maps to
+    // `true` (durable) so existing wrappers do not regress to
+    // "never ack".
+    let allDurable = true;
     for (const handler of this.transferHandlers) {
       try {
-        await handler(transfer);
+        const result = await handler(transfer);
+        if (result === false) allDurable = false;
       } catch (error) {
         logger.debug('Nostr', 'Transfer handler error:', error);
+        allDurable = false;
       }
     }
+    return allDurable;
   }
 
   private async handlePaymentRequest(event: NostrEvent): Promise<void> {
@@ -1829,7 +2153,20 @@ export class NostrTransportProvider implements TransportProvider {
     }
   }
 
-  private async queryEvents(filterObj: NostrFilter): Promise<NostrEvent[]> {
+  /**
+   * Default upper bound for `queryEvents` REQ→EOSE wait. Was 15 s historically
+   * but real-network testnet runs (Phase 9 e2e) repeatedly observed the relay
+   * fluctuating between healthy (<200 ms EOSE) and degraded (10-25 s EOSE,
+   * sometimes never EOSE). 60 s pushes the timeout past every degraded
+   * sample we've captured while still failing fast on real "no such event"
+   * queries. Override per call via the second argument.
+   */
+  private static readonly DEFAULT_QUERY_TIMEOUT_MS = 60000;
+
+  private async queryEvents(
+    filterObj: NostrFilter,
+    timeoutMs: number = NostrTransportProvider.DEFAULT_QUERY_TIMEOUT_MS,
+  ): Promise<NostrEvent[]> {
     if (!this.nostrClient || !this.nostrClient.isConnected()) {
       throw new SphereError('No connected relays', 'TRANSPORT_ERROR');
     }
@@ -1851,9 +2188,9 @@ export class NostrTransportProvider implements TransportProvider {
         if (subId) {
           try { client.unsubscribe(subId); } catch { /* disconnected */ }
         }
-        logger.warn('Nostr', `queryEvents timed out after 15s, returning ${events.length} event(s)`, { kinds: filterObj.kinds, limit: filterObj.limit });
+        logger.warn('Nostr', `queryEvents timed out after ${timeoutMs}ms, returning ${events.length} event(s)`, { kinds: filterObj.kinds, limit: filterObj.limit });
         resolve(events);
-      }, 15000);
+      }, timeoutMs);
 
       const settle = () => {
         if (settled) return;

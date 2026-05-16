@@ -303,9 +303,25 @@ export function doubleSha256(data: string, inputEncoding: 'hex' | 'utf8' = 'hex'
 export const computeHash160 = hash160;
 
 /**
- * Convert hex string to Uint8Array for witness program
+ * Convert hex string to Uint8Array for witness program.
+ *
+ * Steelman³² warning: strict — reject odd-length and non-hex.
+ * `match(/../g)` silently drops a trailing odd char; `parseInt('zz',16)
+ * === NaN` silently coerces to 0. Used in publicKeyToAddress / L1
+ * address derivation; a malformed hash silently produced a wrong
+ * address with the previous behavior.
  */
 export function hash160ToBytes(hash160Hex: string): Uint8Array {
+  if (typeof hash160Hex !== 'string') {
+    throw new TypeError(`hash160ToBytes: expected string, got ${typeof hash160Hex}`);
+  }
+  if (hash160Hex.length === 0) return new Uint8Array(0);
+  if (hash160Hex.length % 2 !== 0) {
+    throw new RangeError(`hash160ToBytes: odd-length hex string (${hash160Hex.length} chars)`);
+  }
+  if (!/^[0-9a-fA-F]+$/.test(hash160Hex)) {
+    throw new RangeError('hash160ToBytes: contains non-hex characters');
+  }
   const matches = hash160Hex.match(/../g);
   if (!matches) return new Uint8Array(0);
   return Uint8Array.from(matches.map((x) => parseInt(x, 16)));
@@ -345,14 +361,44 @@ export function privateKeyToAddressInfo(
 // =============================================================================
 
 /**
- * Convert hex string to Uint8Array
+ * Convert hex string to Uint8Array.
+ *
+ * Steelman³⁵ note: this function permits empty input (returns 0-byte
+ * Uint8Array). For new code that should fail closed on empty inputs,
+ * prefer `core/hex.ts:hexToBytes` (strict, rejects empty). Both
+ * functions reject odd-length and non-hex chars; only the empty-input
+ * behavior differs. The dual export persists for backward compat with
+ * existing public-API consumers and internal IPNS / migration callers
+ * that legitimately accept empty hex (e.g., as a "no value" marker).
+ *
+ * Rejects invalid inputs rather than silently coercing to zero bytes:
+ * odd-length strings throw `RangeError`, and non-hex characters
+ * throw — previously a single bad character coerced to a zero byte
+ * via `parseInt('xy', 16) → NaN → 0` in Uint8Array.from, silently
+ * corrupting derived bytes. In key-derivation paths (IPNS Ed25519
+ * seed, pointer master key) a handful of zeros produces a weak,
+ * predictable key. We now fail closed on any malformation.
+ *
+ * Does NOT auto-strip a leading `0x` prefix. Every internal caller
+ * passes raw un-prefixed hex (HD-derived private keys, chain pubkeys,
+ * request IDs), so prefix-stripping would silently change the bytes
+ * for any future caller that intends `0x` as literal data. External
+ * code that needs prefix-stripping should do it explicitly at the
+ * call site, where the semantic choice is visible.
  */
 export function hexToBytes(hex: string): Uint8Array {
-  const matches = hex.match(/../g);
-  if (!matches) {
-    return new Uint8Array(0);
+  if (hex.length === 0) return new Uint8Array(0);
+  if ((hex.length & 1) !== 0) {
+    throw new RangeError(`hexToBytes: odd-length hex string (length=${hex.length})`);
   }
-  return Uint8Array.from(matches.map((x) => parseInt(x, 16)));
+  if (!/^[0-9a-fA-F]+$/.test(hex)) {
+    throw new RangeError('hexToBytes: non-hex character in input');
+  }
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    out[i / 2] = parseInt(hex.slice(i, i + 2), 16);
+  }
+  return out;
 }
 
 /**

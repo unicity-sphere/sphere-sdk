@@ -131,6 +131,29 @@ Published by `syncIdentityWithTransport()` when no nametag is set.
 }
 ```
 
+### Capability hints (optional, forward-compat)
+
+Identity binding events (both nametag and base) MAY carry capability hints under `content` describing which wire shapes and asset kinds the wallet supports:
+
+```json
+{
+  "content": {
+    "public_key": "02abc...",
+    "l1_address": "alpha1...",
+    "direct_address": "DIRECT://...",
+    "wireProtocols": ["uxf-car", "uxf-cid", "txf"],
+    "assetKinds": ["coin", "nft"]
+  }
+}
+```
+
+- `wireProtocols: string[]` — supported transfer wire shapes (e.g., UXF inline CAR, UXF pinned CID, legacy TXF). Absent → assume `['txf']` for v1.0 wallets that pre-date the hint.
+- `assetKinds: string[]` — supported `additionalAssets` discriminator values (e.g., `'coin'`, `'nft'`, future kinds). Absent → assume `['coin']` for v1.0 wallets.
+
+**Hints are informational only.** Receivers MUST still apply the strict `UNKNOWN_ASSET_KIND` reject rule per [UXF-TRANSFER-PROTOCOL §10.4](uxf/UXF-TRANSFER-PROTOCOL.md) regardless of whether a hint is present, missing, or stale. Senders SHOULD consult the hint to pre-empt likely receiver rejections, but a missing/stale hint never overrides the receiver-side reject behavior.
+
+Publishing capability hints is an SDK option (planned in implementation wave T.8 per UXF-TRANSFER-PROTOCOL §13). v1.0 wallets that omit the hint are correctly handled by the receiver defaults above.
+
 ## d-tag Strategy
 
 The `d` tag determines which event gets replaced (NIP-78: same kind + pubkey + d-tag = replacement).

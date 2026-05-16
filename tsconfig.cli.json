@@ -1,0 +1,29 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "."
+  },
+  "include": [
+    "cli/**/*.ts",
+    "constants.ts",
+    "types/**/*.ts",
+    "core/**/*.ts",
+    "modules/**/*.ts",
+    "storage/**/*.ts",
+    "transport/**/*.ts",
+    "oracle/**/*.ts",
+    "serialization/**/*.ts",
+    "validation/**/*.ts",
+    "impl/**/*.ts",
+    "l1/**/*.ts",
+    "registry/**/*.ts",
+    "uxf/**/*.ts",
+    "profile/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "**/*.test.ts"
+  ]
+}

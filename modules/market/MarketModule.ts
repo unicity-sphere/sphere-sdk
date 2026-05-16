@@ -20,6 +20,7 @@ import {
   runWithRetry,
 } from './retry';
 import type { RetryConfig } from './retry';
+import { hexToBytes } from '../../core/hex';
 
 /** Default Market API URL (intent bulletin board) */
 export const DEFAULT_MARKET_API_URL = 'https://market-api.unicity.network';
@@ -42,14 +43,7 @@ import type { FullIdentity } from '../../types';
 // Helpers
 // =============================================================================
 
-function hexToBytes(hex: string): Uint8Array {
-  const len = hex.length >> 1;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
-    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-  }
-  return bytes;
-}
+// Steelman³⁵: hexToBytes consolidated to core/hex.ts (top-of-file import).
 
 interface SignedRequest {
   body: string;

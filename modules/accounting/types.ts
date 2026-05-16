@@ -13,6 +13,7 @@ import type { StorageProvider, TokenStorageProvider } from '../../storage/storag
 import type { OracleProvider } from '../../oracle/oracle-provider';
 import type { PaymentsModule } from '../payments/PaymentsModule';
 import type { CommunicationsModule } from '../communications/CommunicationsModule';
+import type { CidRefStore } from '../../profile/cid-ref-store';
 
 // =============================================================================
 // §1.1 Shared Asset Types (reused from TXF genesis coinData format)
@@ -671,6 +672,14 @@ export interface AccountingModuleDependencies {
    * - Payer-side receipt and cancellation notice detection is disabled (no subscription)
    */
   communications?: CommunicationsModule;
+  /**
+   * Optional CID-reference store for OpLog fat-data migration
+   * (PROFILE-CID-REFERENCES.md §8.3). When present, invoice ledger entries
+   * are pinned to IPFS per-invoice and the OpLog stores a small ref envelope
+   * instead of the fat inline JSON. When absent, falls back to legacy inline
+   * storage.
+   */
+  cidRefStore?: CidRefStore;
 }
 
 // =============================================================================
@@ -768,6 +777,26 @@ export interface PayInvoiceParams {
    * for low-latency UX where the recipient won't immediately re-spend.
    */
   readonly transferMode?: 'instant' | 'conservative';
+  /**
+   * When true, request source-token selection that MAY include unconfirmed
+   * tokens (chain-mode). Forwarded verbatim to PaymentsModule.send() for
+   * non-escrow invoice flows.
+   *
+   * §2.5 forced-conservative coercion (T.7.D / W21): when the invoice is
+   * bridged to an external escrow (registered via
+   * `markInvoiceEscrowBridged()`), this flag is silently coerced to `false`
+   * regardless of the caller's value. The coercion is surfaced via
+   * `TransferResult.overrides = ['allowPendingTokens-coerced-to-false']`.
+   *
+   * Rationale: escrow flows depend on payout verifiability and dispute-safe
+   * settlement. Pending source tokens introduce a finalization race window
+   * that can leave the escrow holding tokens whose ancestry is contested.
+   * Forcing conservative source selection guarantees every deposit-bearing
+   * token is fully finalized before the escrow takes custody.
+   *
+   * Defaults to `false` when omitted.
+   */
+  readonly allowPendingTokens?: boolean;
 }
 
 /**

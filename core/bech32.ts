@@ -4,6 +4,7 @@
  */
 
 import { SphereError } from './errors';
+import { hexToBytes as strictHexToBytes } from './hex';
 
 // =============================================================================
 // Constants
@@ -194,8 +195,11 @@ export function decodeBech32(
  * ```
  */
 export function createAddress(hrp: string, pubkeyHash: Uint8Array | string): string {
+  // Steelman³⁴ warning: strict hex decode — Buffer.from(_, 'hex')
+  // silently truncated odd-length and stopped at first non-hex char,
+  // producing a degenerate alpha1 address.
   const hashBytes = typeof pubkeyHash === 'string'
-    ? Uint8Array.from(Buffer.from(pubkeyHash, 'hex'))
+    ? strictHexToBytes(pubkeyHash)
     : pubkeyHash;
 
   return encodeBech32(hrp, 1, hashBytes);
