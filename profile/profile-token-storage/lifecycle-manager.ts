@@ -331,41 +331,103 @@ export class LifecycleManager {
   /**
    * Publish the just-flushed CID to the aggregator pointer layer.
    *
-   * TRANSIENT failures are silently logged — the CAR is already
-   * pinned and the OrbitDB bundle ref is already written, so the
-   * next flush can retry the publish.
+   * Returns a structured result instead of swallowing failures so the
+   * caller (FlushScheduler) can propagate transient errors up to the
+   * at-least-once gate. The persistence of the retry marker
+   * (`pendingPublishCid`) is handled here:
    *
-   * PERMANENT failures (UNREACHABLE_RECOVERY_BLOCKED, REJECTED,
-   * UNTRUSTED_PROOF, TRUST_BASE_STALE, MARKER_CORRUPT, CORRUPT_STREAK,
-   * SECURITY_ORIGIN_MISMATCH, CAPABILITY_DENIED, UNSUPPORTED_RUNTIME,
-   * PROTOCOL_ERROR, AGGREGATOR_REJECTED) are surfaced via a
-   * `storage:error` event with the error code in the payload.
+   *   - SUCCESS — clears `pendingPublishCid`, anchors
+   *     `lastDiscoveredPointerCid`, returns `{ ok: true }`.
+   *   - TRANSIENT failure — sets `pendingPublishCid = cidString` (with
+   *     localCache persistence for crash safety), returns
+   *     `{ ok: false, transient: true }`. Caller MUST treat this as
+   *     "not durable" — the at-least-once gate refuses the Nostr ack
+   *     so the inbound event replays on next reconnect (idempotent
+   *     via addToken stateHash dedup and processedCombinedTransferIds).
+   *     The pending marker is retried at start of every subsequent
+   *     `flushToIpfs` and `runPointerPollOnce`.
+   *   - PERMANENT failure (UNREACHABLE_RECOVERY_BLOCKED, REJECTED,
+   *     UNTRUSTED_PROOF, TRUST_BASE_STALE, MARKER_CORRUPT, CORRUPT_STREAK,
+   *     SECURITY_ORIGIN_MISMATCH, CAPABILITY_DENIED, UNSUPPORTED_RUNTIME,
+   *     PROTOCOL_ERROR, AGGREGATOR_REJECTED) — emits `storage:error`
+   *     event with the error code, clears `pendingPublishCid` (no
+   *     retry would help; surfacing is the action), returns
+   *     `{ ok: false, transient: false, code }`. Callers ack the event
+   *     so the wallet does not deadlock on a permanently-failing
+   *     publish — operator intervention is required and is surfaced
+   *     via the emitted event.
+   *
+   * Returns `{ ok: false, transient: false }` (treated as permanent)
+   * if no pointer-layer closure is wired — the wallet is not
+   * configured for aggregator anchoring, so there's nothing to do.
    */
-  async publishAggregatorPointerBestEffort(cidString: string): Promise<void> {
+  async publishAggregatorPointerBestEffort(
+    cidString: string,
+  ): Promise<{ readonly ok: boolean; readonly transient: boolean; readonly code?: string }> {
     const pointer = this.host.options?.getPointerLayer?.() ?? null;
-    if (!pointer) return;
+    if (!pointer) {
+      // No pointer wiring — nothing to retry, no transient classification.
+      this.host.setPendingPublishCid(null);
+      return { ok: false, transient: false };
+    }
 
     try {
       const cidBytes = CID.parse(cidString).bytes;
       const result = await pointer.publish(async () => cidBytes);
-      // Successful publish: this CID is now the authoritative pointer
-      // anchor. Track for no-data flush idempotency — a subsequent
-      // remote-update-driven republish that would re-publish the same
-      // bytes can short-circuit.
       this.host.setLastDiscoveredPointerCid(cidString);
+      // Clear any previously-pending marker — this publish succeeded,
+      // so the cross-device recovery path can now reach the bundle.
+      this.host.setPendingPublishCid(null);
       this.host.log(
         `Pointer publish ok: cid=${cidString} version=${result.version} attempts=${result.attemptsUsed}`,
       );
+      return { ok: true, transient: false };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (this.isPermanentPointerError(err)) {
         const code = (err as { code?: string }).code ?? 'UNKNOWN';
         this.host.log(`Pointer publish PERMANENT failure (${code}): ${msg}`);
         this.host.emitEvent(this.host.buildErrorEvent('storage:error', err));
-      } else {
-        this.host.log(`Pointer publish failed (transient, best-effort): ${msg}`);
+        // Permanent failures: drop the retry marker. The operator
+        // alert event is the call to action; auto-retry would just
+        // hammer a wallet that needs human intervention.
+        this.host.setPendingPublishCid(null);
+        return { ok: false, transient: false, code };
       }
+      this.host.log(`Pointer publish failed (transient): ${msg}`);
+      // Transient: stamp the retry marker (with localCache persistence
+      // for crash safety) so subsequent flushes / polls re-attempt
+      // before any new save-driven work.
+      this.host.setPendingPublishCid(cidString);
+      return { ok: false, transient: true };
     }
+  }
+
+  /**
+   * If a previous publish left `pendingPublishCid` non-null, try
+   * again. Called at the start of every `flushToIpfs` and every
+   * `runPointerPollOnce` so the retry is gated on the normal flush
+   * cadence rather than a dedicated timer.
+   *
+   * Returns the same result shape as `publishAggregatorPointerBestEffort`
+   * with an additional `attempted` flag:
+   *   - `attempted: false` when no marker is set (caller proceeds).
+   *   - `attempted: true` when a retry was made (result indicates
+   *     whether the marker was cleared).
+   */
+  async retryPendingPublishIfAny(): Promise<{
+    readonly attempted: boolean;
+    readonly ok: boolean;
+    readonly transient: boolean;
+    readonly code?: string;
+  }> {
+    const pending = this.host.getPendingPublishCid();
+    if (!pending) {
+      return { attempted: false, ok: true, transient: false };
+    }
+    this.host.log(`Retrying pending pointer publish: cid=${pending}`);
+    const result = await this.publishAggregatorPointerBestEffort(pending);
+    return { attempted: true, ok: result.ok, transient: result.transient, code: result.code };
   }
 
   /**
@@ -689,6 +751,22 @@ export class LifecycleManager {
       // build still in flight). Skip this tick and re-arm.
       this.scheduleNextPointerPoll(nextBackoffMultiplier);
       return;
+    }
+
+    // Retry any pending publish from a previous transient failure
+    // BEFORE polling for new pointer state. If the retry succeeds the
+    // marker is cleared; if it stays transient the next periodic tick
+    // or save-driven flush retries again. Failures here are non-fatal
+    // to the poll itself — we still proceed to recoverLatest so this
+    // tick is not wasted.
+    try {
+      await this.retryPendingPublishIfAny();
+    } catch (err) {
+      this.host.log(
+        `Pointer poll: pending-publish retry threw (best-effort): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
     }
 
     let recovered: { readonly cid: Uint8Array; readonly version: number } | null = null;

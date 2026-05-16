@@ -44,6 +44,7 @@
 
 import { logger } from '../core/logger.js';
 import { SphereError } from '../core/errors.js';
+import { STORAGE_KEYS_GLOBAL } from '../constants.js';
 import type { ProviderStatus, FullIdentity } from '../types/index.js';
 import type {
   TokenStorageProvider,
@@ -172,6 +173,21 @@ export class ProfileTokenStorageProvider
   // already matches the authoritative pointer (e.g., remote originator
   // already anchored the state we just merged from their bundle).
   private lastDiscoveredPointerCid: string | null = null;
+
+  /**
+   * CID whose CAR is durably pinned + OrbitDB bundle ref written but
+   * whose aggregator pointer publish is outstanding due to a transient
+   * failure. The next `flushToIpfs` and the periodic pointer poll
+   * retry the publish at start. While non-null, downstream callers
+   * that await durability via `awaitNextFlush` MUST see the chain
+   * reject so the at-least-once gate keeps the Nostr ack held.
+   *
+   * Persisted to `localCache` under
+   * `<STORAGE_KEYS_GLOBAL.PROFILE_PENDING_PUBLISH_CID>_<addressId>`
+   * so a process restart resumes the retry. Loaded lazily on
+   * `initialize()`; written via `setPendingPublishCidPersisted`.
+   */
+  private pendingPublishCid: string | null = null;
 
   // --- Bundle CIDs merged into lastLoadedData (pointer monotonicity) ---
   // Snapshot of the active OrbitDB bundle index at the moment load()
@@ -322,6 +338,22 @@ export class ProfileTokenStorageProvider
       setLastDiscoveredPointerCid: (c) => {
         this.lastDiscoveredPointerCid = c;
       },
+      getPendingPublishCid: () => this.pendingPublishCid,
+      setPendingPublishCid: (c) => {
+        this.pendingPublishCid = c;
+        // Fire-and-forget persistence — failures are logged but don't
+        // block the caller. On crash, an unwritten retry marker means
+        // the next process boot won't re-attempt; this is acceptable
+        // because a subsequent save-driven flush still re-derives the
+        // need to publish (lastDiscoveredPointerCid stays stale).
+        this.persistPendingPublishCid(c).catch((err) => {
+          this.log(
+            `persistPendingPublishCid failed (best-effort): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        });
+      },
       // Bundle index state
       getKnownBundleCids: () => this.knownBundleCids,
       setKnownBundleCids: (s) => {
@@ -394,6 +426,10 @@ export class ProfileTokenStorageProvider
   // ---------------------------------------------------------------------------
 
   async initialize(): Promise<boolean> {
+    // Restore any persisted pending-publish marker from a prior
+    // process run BEFORE lifecycle wires up — this lets the very
+    // first periodic poll / save-driven flush retry the publish.
+    await this.restorePendingPublishCidFromCache();
     return this.lifecycleManager.initialize(
       () => this.handleReplication(),
       () => this.onPollDiscoveredNewCid(),
@@ -1936,6 +1972,68 @@ export class ProfileTokenStorageProvider
       this.log(`Failed to read local cache "${key}": ${msg}`);
       this.emitEvent(this.buildErrorEvent('storage:error', err, 'LOCAL_CACHE_READ_FAILED'));
       return null;
+    }
+  }
+
+  /**
+   * Compose the per-address storage key for the pending-publish CID
+   * marker. Per-address scoping is required because two derived
+   * addresses on the same wallet have independent token pools and
+   * independent pointer chains; sharing a single marker would let one
+   * address's transient failure pollute another's retry state.
+   */
+  private getPendingPublishCidKey(): string | null {
+    // Use the same resolver as every other per-address key: derive from
+    // direct address when identity is set; otherwise fall back to the
+    // explicit `options.addressId` or the literal 'default'. This
+    // matches `getAddressId()` so the marker is scoped consistently
+    // with the rest of the provider's persistence.
+    const addr = this.getAddressId();
+    return `${STORAGE_KEYS_GLOBAL.PROFILE_PENDING_PUBLISH_CID}_${addr}`;
+  }
+
+  /**
+   * Persist the pending-publish CID marker to local cache. Called on
+   * every mutation via `host.setPendingPublishCid`. Best-effort: a
+   * failure leaves the in-memory state correct and the next mutation
+   * retries. Crash-safety degrades to "best-effort"; an unwritten
+   * marker means a process restart won't auto-retry, but the next
+   * save-driven flush will re-derive the need to publish via the
+   * baseline-staleness check.
+   */
+  private async persistPendingPublishCid(cid: string | null): Promise<void> {
+    if (!this.localCache) return;
+    const key = this.getPendingPublishCidKey();
+    if (!key) return;
+    if (cid === null) {
+      await this.localCache.remove(key);
+    } else {
+      await this.localCache.set(key, cid);
+    }
+  }
+
+  /**
+   * Load any previously-persisted pending-publish CID marker into the
+   * in-memory field on initialize. Called by lifecycle-manager during
+   * `initialize()` so the next flush / poll can re-attempt the
+   * pending publish without waiting for a fresh save.
+   */
+  private async restorePendingPublishCidFromCache(): Promise<void> {
+    if (!this.localCache) return;
+    const key = this.getPendingPublishCidKey();
+    if (!key) return;
+    try {
+      const raw = await this.localCache.get(key);
+      if (raw && raw.length > 0) {
+        this.pendingPublishCid = raw;
+        this.log(`Restored pending publish CID from cache: ${raw}`);
+      }
+    } catch (err) {
+      this.log(
+        `restorePendingPublishCidFromCache failed (best-effort): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
     }
   }
 

@@ -58,6 +58,15 @@ export const STORAGE_KEYS_GLOBAL = {
   PRICE_CACHE: 'price_cache',
   /** Timestamp of last price cache update (ms since epoch) */
   PRICE_CACHE_TS: 'price_cache_ts',
+  /**
+   * CID whose CAR is pinned + OrbitDB ref written but whose aggregator
+   * pointer publish is pending due to a transient failure. Persisted
+   * so a process restart resumes the retry rather than abandoning the
+   * publish (which would leave cross-device peers unable to discover
+   * the bundle via the aggregator path). Per-address suffix appended
+   * by the Profile provider (`<key>_<addressId>`).
+   */
+  PROFILE_PENDING_PUBLISH_CID: 'profile_pending_publish_cid',
 } as const;
 
 /**

@@ -268,6 +268,21 @@ export class FlushScheduler {
     const encryptionKey = this.host.getEncryptionKey();
     if (!encryptionKey) return;
 
+    // Retry any pending publish from a previous transient failure
+    // BEFORE doing fresh flush work. A transient publish failure left
+    // the bundle ref durably in OrbitDB but the aggregator pointer is
+    // not anchored — cross-device recovery still can't see the bundle.
+    // Retrying here piggybacks on the next flush cadence rather than
+    // requiring a dedicated timer. On transient retry failure, throw
+    // so the chained `forceFlushSerialized` rejection propagates to
+    // `awaitNextFlush` → the at-least-once gate refuses the Nostr ack.
+    const pendingRetry = await this.lifecycle.retryPendingPublishIfAny();
+    if (pendingRetry.attempted && !pendingRetry.ok && pendingRetry.transient) {
+      throw new Error(
+        'Aggregator pointer publish still transient — pending retry held; refusing to ack',
+      );
+    }
+
     // Capture and clear the no-data flag immediately so a concurrent
     // scheduleFlushNoData() doesn't get masked by this flush in flight.
     const noDataMode = this.noDataFlushPending;
@@ -642,19 +657,32 @@ export class FlushScheduler {
       }
 
       // 9. Publish to the pointer layer for cold-start recovery.
-      //    Best-effort: the CAR is already pinned and the OrbitDB
-      //    bundle ref is already written, so a failed publish only
-      //    delays cold-start recovery for this flush — subsequent
-      //    flushes retry. IPNS is no longer published (T-D6c) —
-      //    the one-shot migration reader is the only remaining
-      //    legacy touchpoint and it's read-only.
-      await this.lifecycle.publishAggregatorPointerBestEffort(cid);
+      //    The CAR is already pinned and the OrbitDB bundle ref is
+      //    already written. On a TRANSIENT publish failure, the
+      //    pointer-layer wiring stamps `pendingPublishCid = cid` so
+      //    the next flush / pointer-poll retries — and we THROW here
+      //    so the chained `forceFlushSerialized` rejection propagates
+      //    to `awaitNextFlush` and the at-least-once gate refuses the
+      //    Nostr ack (event replays on next reconnect; addToken
+      //    stateHash dedup is idempotent). On PERMANENT failure the
+      //    pointer-layer emits a `storage:error` event with the code
+      //    and clears the retry marker; we still emit `storage:saved`
+      //    because the wallet's local state is durable — only the
+      //    cross-device anchor is missing, and no retry would help.
+      const publishResult = await this.lifecycle.publishAggregatorPointerBestEffort(cid);
 
       this.host.emitEvent({
         type: 'storage:saved',
         timestamp: Date.now(),
         data: { cid, tokenCount: tokens.size },
       });
+
+      if (!publishResult.ok && publishResult.transient) {
+        throw new Error(
+          `Aggregator pointer publish transient failure for cid=${cid}; ` +
+            `retry marker stored. Refusing to advance the at-least-once ack.`,
+        );
+      }
     } catch (err) {
       // On failure, re-queue the data so it is not lost
       if (!this.host.getPendingData()) {
