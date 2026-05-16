@@ -268,20 +268,27 @@ export class FlushScheduler {
     const encryptionKey = this.host.getEncryptionKey();
     if (!encryptionKey) return;
 
-    // Retry any pending publish from a previous transient failure
-    // BEFORE doing fresh flush work. A transient publish failure left
-    // the bundle ref durably in OrbitDB but the aggregator pointer is
-    // not anchored — cross-device recovery still can't see the bundle.
-    // Retrying here piggybacks on the next flush cadence rather than
-    // requiring a dedicated timer. On transient retry failure, throw
-    // so the chained `forceFlushSerialized` rejection propagates to
-    // `awaitNextFlush` → the at-least-once gate refuses the Nostr ack.
-    const pendingRetry = await this.lifecycle.retryPendingPublishIfAny();
-    if (pendingRetry.attempted && !pendingRetry.ok && pendingRetry.transient) {
-      throw new Error(
-        'Aggregator pointer publish still transient — pending retry held; refusing to ack',
-      );
-    }
+    // Note on pending-publish retry: we deliberately do NOT throw at
+    // the START of flushToIpfs when a previous publish was transient.
+    // An early throw here would prevent pin + ref-write for the
+    // current data, leaving OrbitDB stuck at whatever the last
+    // successful flush wrote. A subsequent `PaymentsModule.receive()`
+    // calls `load()` to rebuild the in-memory token map from storage;
+    // if storage is stale, that load wipes every token added since
+    // the last successful flush — silent token loss in the steady
+    // state, even though PaymentsModule originally accepted the
+    // tokens.
+    //
+    // Instead we always run the full pin + ref-write path. The
+    // publish step at the END of the flush body publishes the LATEST
+    // CID, which by virtue of CAR-content monotonicity covers every
+    // earlier CID's tokens (the latest CAR is a superset of all
+    // prior states this device authored). A successful new publish
+    // therefore implicitly anchors any prior pending publish — the
+    // latest pointer is the freshest CAR. The periodic pointer poll
+    // (`runPointerPollOnce`) handles the idle case where no new
+    // flush is triggered and the pending publish needs an out-of-
+    // band retry.
 
     // Capture and clear the no-data flag immediately so a concurrent
     // scheduleFlushNoData() doesn't get masked by this flush in flight.

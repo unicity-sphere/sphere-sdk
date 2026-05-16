@@ -56,6 +56,7 @@ import {
   deriveProfileEncryptionKey,
 } from '../encryption.js';
 import { computeAddressId } from '../types.js';
+import { logger } from '../../core/logger.js';
 import type { BundleIndex } from './bundle-index.js';
 import type { ProfileTokenStorageHost } from './host.js';
 import { fetchFromIpfs } from '../ipfs-client.js';
@@ -394,7 +395,20 @@ export class LifecycleManager {
         this.host.setPendingPublishCid(null);
         return { ok: false, transient: false, code };
       }
-      this.host.log(`Pointer publish failed (transient): ${msg}`);
+      // Elevate the transient publish failure to warn-level so the
+      // operator sees the underlying cause without enabling debug —
+      // pointer publish failures hold the at-least-once gate closed
+      // and the user cannot diagnose the stall otherwise. Includes
+      // any typed AggregatorPointerError code so monitoring can
+      // filter on transient classes (NETWORK_ERROR vs unclassified).
+      const transientCode =
+        typeof (err as { code?: unknown }).code === 'string'
+          ? (err as { code: string }).code
+          : 'UNCLASSIFIED';
+      logger.warn(
+        'Profile-TokenStorage',
+        `Pointer publish failed (transient, code=${transientCode}, cid=${cidString}): ${msg}`,
+      );
       // Transient: stamp the retry marker (with localCache persistence
       // for crash safety) so subsequent flushes / polls re-attempt
       // before any new save-driven work.
