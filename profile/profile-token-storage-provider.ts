@@ -851,19 +851,6 @@ export class ProfileTokenStorageProvider
     this.emitEvent({ type: 'sync:started', timestamp: Date.now() });
 
     try {
-      // Cross-device sync: trigger an immediate aggregator pointer
-      // poll BEFORE refreshing OrbitDB. The periodic [30s, 90s)
-      // poll is the safety net for cross-device discovery, but a
-      // caller that explicitly invokes `sync()` is signalling "I
-      // want the freshest state NOW" — waiting up to 90s for the
-      // next periodic tick (or for libp2p replication that may
-      // never connect through restrictive NATs) leaves cross-device
-      // sync e2e tests timing out at PROPAGATION_TIMEOUT_MS.
-      //
-      // The poll is best-effort: failures (transient aggregator
-      // unreachability, WALKBACK_FLOOR retries exhausted) are
-      // logged and ignored. The downstream OrbitDB refresh and
-      // bundle-set comparison still run.
       // Snapshot the pre-sync bundle set BEFORE triggering the
       // aggregator poll so any CID the poll discovers counts as a
       // "new" bundle in the diff below. Capturing AFTER the poll
