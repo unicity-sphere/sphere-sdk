@@ -507,9 +507,32 @@ export class FlushScheduler {
         (violation as Error & { code?: string }).code = POINTER_MONOTONICITY_VIOLATION;
         this.host.log(`[POINTER_MONOTONICITY_VIOLATION] aborting publish: ${reasonParts.join('; ')}`);
 
+        // Gap 4 recovery: kick off a fire-and-forget baseline refresh
+        // so subsequent save-driven flushes (which DON'T retry via
+        // awaitNextFlush) get a fresh `lastLoadedFromBundleCids` and
+        // can pass the check. Called via a microtask schedule so the
+        // in-flight flush settles BEFORE load() tries to await
+        // `flushPromise` (otherwise the refresh would deadlock on
+        // ourselves).
+        //
+        // The at-least-once gate's `awaitNextFlush` loop does its own
+        // synchronous retry — that path bypasses this fire-and-forget
+        // since it has tighter latency requirements. This fire-and-
+        // forget covers the save-driven timer path, the periodic
+        // poll's no-data flush path, and any other call site that
+        // doesn't loop on violation.
+        queueMicrotask(() => {
+          this.host.refreshBaselineForMonotonicity().catch((err) => {
+            this.host.log(
+              `Baseline-refresh recovery threw (best-effort): ` +
+                `${err instanceof Error ? err.message : String(err)}`,
+            );
+          });
+        });
+
         // The catch block at the bottom of flushToIpfs() re-queues
         // `data` so the user's writes are not lost; subsequent
-        // flushes will re-evaluate once lastLoadedData refreshes.
+        // flushes will re-evaluate once the refresh above completes.
         // Surface to operators via storage:error AND a structured
         // alert so monitoring dashboards can fire on the literal code.
         this.host.emitEvent(

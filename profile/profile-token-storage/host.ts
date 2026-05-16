@@ -171,6 +171,23 @@ export interface ProfileTokenStorageHost {
   /** Snapshot pendingData and run a single IPFS pin + OrbitDB write. */
   flushToIpfs(): Promise<void>;
 
+  /**
+   * Refresh `lastLoadedFromBundleCids` (and `lastLoadedData`) by
+   * running a fresh `load()` against the current OrbitDB bundle
+   * index. Called by FlushScheduler on a `POINTER_MONOTONICITY_VIOLATION`
+   * to repair a stale baseline before the next flush attempt.
+   *
+   * MUST be a no-op when a flush is already in flight (load() awaits
+   * `flushPromise`, so calling from inside flushToIpfs would deadlock).
+   * The facade implementation handles this by skipping the refresh
+   * when invoked synchronously from within the current flush body.
+   *
+   * Returns true on successful refresh; false on internal load failure
+   * (caller proceeds to the next strategy — typically throw the
+   * original violation so the at-least-once gate refuses the ack).
+   */
+  refreshBaselineForMonotonicity(): Promise<boolean>;
+
   // --- TXF adapter helpers (stay on the facade for now) ---
   extractTokensFromTxfData(data: TxfStorageDataBase): Map<string, unknown>;
   extractOperationalState(data: TxfStorageDataBase): OperationalState;

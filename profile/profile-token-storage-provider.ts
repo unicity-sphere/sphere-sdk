@@ -384,6 +384,7 @@ export class ProfileTokenStorageProvider
       readProfileKeyJson: (key) => this.readProfileKeyJson(key),
       // Flush coordination
       flushToIpfs: () => this.flushScheduler.flushToIpfs(),
+      refreshBaselineForMonotonicity: () => this.refreshBaselineForMonotonicity(),
       // TXF adapter helpers
       extractTokensFromTxfData: (data) => this.extractTokensFromTxfData(data),
       extractOperationalState: (data) => this.extractOperationalState(data),
@@ -467,6 +468,21 @@ export class ProfileTokenStorageProvider
     const deadline = Date.now() + timeoutMs;
     const remainingMs = (): number => Math.max(0, deadline - Date.now());
 
+    // Gap 4 (POINTER_MONOTONICITY_VIOLATION recovery): once per
+    // `awaitNextFlush` invocation we permit a single in-loop baseline
+    // refresh + flush retry. The check fires when OrbitDB has bundle
+    // CIDs that aren't in `lastLoadedFromBundleCids` — typically a
+    // stale baseline produced by a concurrent peer write that
+    // replicated mid-flush. Refreshing via `load()` re-seeds the
+    // baseline; the next flush iteration then passes the check.
+    // Without this recovery, the at-least-once gate would refuse the
+    // Nostr ack on every replay (the bundle is already in OrbitDB so
+    // addToken is a no-op; awaitNextFlush sees nothing to flush and
+    // returns true — masking the persistent violation). The one-shot
+    // budget prevents an infinite recovery loop when the violation
+    // is genuinely permanent.
+    let monotonicityRetried = false;
+
     // Iterate: there might be saves landing during in-flight flush.
     // Bound iterations to 4 — each iteration runs one full flush, so
     // > 4 means save() is faster than flush, which is a runaway
@@ -518,6 +534,33 @@ export class ProfileTokenStorageProvider
         ]);
       } catch (err) {
         if (err instanceof SphereError && err.code === 'TIMEOUT') throw err;
+
+        // Gap 4: monotonicity-violation recovery (one shot per call).
+        // Refresh the baseline via load() and retry the flush. If the
+        // refresh itself fails or the SECOND attempt also violates,
+        // surface the original rejection so the at-least-once gate
+        // refuses the Nostr ack — replay on next reconnect is the
+        // safe fallback.
+        const code = (err as { code?: unknown }).code;
+        if (code === 'POINTER_MONOTONICITY_VIOLATION' && !monotonicityRetried) {
+          monotonicityRetried = true;
+          this.log(
+            `awaitNextFlush: POINTER_MONOTONICITY_VIOLATION — ` +
+              `refreshing baseline and retrying flush once`,
+          );
+          const refreshed = await this.refreshBaselineForMonotonicity();
+          if (!refreshed) {
+            this.log(
+              `awaitNextFlush: baseline refresh failed — propagating violation`,
+            );
+            throw err;
+          }
+          // Retry the same flush iteration. The continue() restarts
+          // the loop body which will re-call forceFlushSerialized
+          // with the refreshed `lastLoadedFromBundleCids`.
+          continue;
+        }
+
         // Surface flush errors so caller (handleIncomingTransfer)
         // refuses to advance the Nostr ack — event re-replays on
         // next reconnect; addToken stateHash dedup is idempotent.
@@ -2034,6 +2077,44 @@ export class ProfileTokenStorageProvider
           err instanceof Error ? err.message : String(err)
         }`,
       );
+    }
+  }
+
+  /**
+   * Refresh the merged-bundle baseline (`lastLoadedFromBundleCids`)
+   * and the cached `lastLoadedData` by running a fresh `load()`.
+   * Called by FlushScheduler when the runtime
+   * `POINTER_MONOTONICITY_VIOLATION` check fires — repairing a stale
+   * baseline so the next flush attempt passes the check.
+   *
+   * Returns true on success; false on internal load failure. The
+   * caller (FlushScheduler / awaitNextFlush retry path) decides
+   * whether to retry the flush or surface the original violation.
+   *
+   * IMPORTANT: this MUST NOT be called from inside `flushToIpfs`
+   * directly because `load()` awaits the in-flight `flushPromise`,
+   * which would deadlock. FlushScheduler invokes this via a
+   * fire-and-forget pattern from the catch arm (which fires AFTER
+   * the flush has already resolved/rejected), or the at-least-once
+   * gate calls it explicitly between iterations.
+   */
+  private async refreshBaselineForMonotonicity(): Promise<boolean> {
+    try {
+      const result = await this.load();
+      if (!result.success) {
+        this.log(
+          `refreshBaselineForMonotonicity: load() returned ` +
+            `success=false (error=${result.error ?? 'unknown'})`,
+        );
+        return false;
+      }
+      return true;
+    } catch (err) {
+      this.log(
+        `refreshBaselineForMonotonicity: load() threw: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
     }
   }
 
