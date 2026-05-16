@@ -124,6 +124,73 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * WALKBACK_FLOOR retry budget for `findLatestValidVersion` inside the
+ * reconcile loop. The error fires when Phase 3 walkback would cross
+ * below the wallet's `currentLocalVersion` — i.e., the aggregator's
+ * currently-visible highest committed version is BELOW a version the
+ * wallet has already confirmed as its own. The cause is eventual
+ * consistency: the aggregator confirmed v=N at publish time, but a
+ * fresh discovery query lands on a replica whose view hasn't caught
+ * up yet. The condition is transient — once replication completes,
+ * discovery sees v=N again.
+ *
+ * Retry with exponential backoff (reuses the existing PUBLISH_BACKOFF_*
+ * schedule for consistency with the rest of the publish flow). Five
+ * attempts with the default schedule sum to ~9–15s of total backoff
+ * before we propagate the error to the caller — enough to ride out
+ * routine replication-lag windows on testnet without holding the
+ * publish mutex indefinitely. Past this budget the error propagates,
+ * the caller's retry-marker logic stamps `pendingPublishCid`, and the
+ * outer flush cadence (or periodic pointer poll) re-attempts later.
+ */
+const WALKBACK_FLOOR_RETRY_BUDGET = 5;
+
+/**
+ * Wrap `findLatestValidVersion` with a bounded retry loop specifically
+ * for `AGGREGATOR_POINTER_WALKBACK_FLOOR`. All other discovery errors
+ * (DISCOVERY_OVERFLOW, CAR_UNAVAILABLE, CORRUPT_STREAK, TRUST_BASE_STALE,
+ * UNTRUSTED_PROOF, NETWORK_ERROR, abort, etc.) propagate UNCHANGED on
+ * the first throw — they are NOT walkback-lag, so retrying them here
+ * would just delay surfacing the real fault.
+ *
+ * Abort-aware: between retries we re-check the input's `abortSignal`
+ * so a caller cancellation unwinds promptly instead of riding out the
+ * full retry schedule.
+ */
+async function findLatestValidVersionWithWalkbackFloorRetry(
+  callInput: Parameters<typeof findLatestValidVersion>[0],
+  abortSignal: AbortSignal | undefined,
+): Promise<DiscoverResult> {
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < WALKBACK_FLOOR_RETRY_BUDGET; attempt++) {
+    if (abortSignal?.aborted) {
+      const err = new Error('findLatestValidVersion aborted by caller');
+      err.name = 'AbortError';
+      throw err;
+    }
+    try {
+      return await findLatestValidVersion(callInput);
+    } catch (err) {
+      lastError = err;
+      const code =
+        err instanceof AggregatorPointerError ? err.code : undefined;
+      if (code !== AggregatorPointerErrorCode.WALKBACK_FLOOR) {
+        // Not walkback-lag: surface immediately. Retrying these would
+        // mask a real fault (overflow, corrupt streak, untrusted proof).
+        throw err;
+      }
+      // Last attempt — don't sleep, just propagate.
+      if (attempt === WALKBACK_FLOOR_RETRY_BUDGET - 1) break;
+      await sleep(computeBackoffMs(attempt));
+    }
+  }
+  // Budget exhausted — propagate the last WALKBACK_FLOOR so the
+  // caller's outer retry path (Profile-TokenStorage's pending-publish
+  // marker, or the periodic pointer poll) can take over.
+  throw lastError;
+}
+
 // ── reconcileAndPublish ────────────────────────────────────────────────────
 
 /**
@@ -179,17 +246,29 @@ export async function reconcileAndPublish(input: ReconcileInput): Promise<Reconc
     // Discovery errors propagate unchanged (DISCOVERY_OVERFLOW, CAR_UNAVAILABLE,
     // CORRUPT_STREAK, TRUST_BASE_STALE, UNTRUSTED_PROOF). Reconcile cannot
     // make progress without a valid V_true.
-    const discovery: DiscoverResult = await findLatestValidVersion({
-      currentLocalVersion,
-      keyMaterial: input.keyMaterial,
-      signer: input.signer,
-      aggregatorClient: input.aggregatorClient,
-      trustBase: input.trustBase,
-      decodeCid: input.decodeCid,
-      fetchCar: input.fetchCar,
-      discoveryDeadlineMs: reconcileDeadlineMs,
-      abortSignal: input.abortSignal,
-    });
+    //
+    // EXCEPTION (2026-05-16): `AGGREGATOR_POINTER_WALKBACK_FLOOR` is
+    // wrapped in a bounded retry loop. It fires when Phase 3 walkback
+    // would cross below `currentLocalVersion` — meaning the aggregator
+    // currently can't reach a version the wallet has already confirmed.
+    // This is replication lag (a successful publish at v=N becoming
+    // briefly invisible on a stale replica), not a real consistency
+    // fault. Retrying with backoff lets the lag settle before
+    // propagating up to the caller's retry-marker logic.
+    const discovery: DiscoverResult = await findLatestValidVersionWithWalkbackFloorRetry(
+      {
+        currentLocalVersion,
+        keyMaterial: input.keyMaterial,
+        signer: input.signer,
+        aggregatorClient: input.aggregatorClient,
+        trustBase: input.trustBase,
+        decodeCid: input.decodeCid,
+        fetchCar: input.fetchCar,
+        discoveryDeadlineMs: reconcileDeadlineMs,
+        abortSignal: input.abortSignal,
+      },
+      input.abortSignal,
+    );
     probeHistory.push(...discovery.probeVersions);
     const nextV = (Math.max(discovery.validV, discovery.includedV) + 1) as PointerVersion;
 
@@ -227,18 +306,23 @@ export async function reconcileAndPublish(input: ReconcileInput): Promise<Reconc
     //   3. fetchAndJoin remote bundle.
     //   4. Persist localVersion = validV.
     //   5. sleep(backoff), recurse.
-    // Re-discovery failure during conflict reconciliation — propagate unchanged.
-    const rediscovery: DiscoverResult = await findLatestValidVersion({
-      currentLocalVersion,
-      keyMaterial: input.keyMaterial,
-      signer: input.signer,
-      aggregatorClient: input.aggregatorClient,
-      trustBase: input.trustBase,
-      decodeCid: input.decodeCid,
-      fetchCar: input.fetchCar,
-      discoveryDeadlineMs: reconcileDeadlineMs,
-      abortSignal: input.abortSignal,
-    });
+    // Re-discovery failure during conflict reconciliation — propagate unchanged,
+    // except for WALKBACK_FLOOR which retries through the helper (same
+    // rationale as Step B: replication lag is transient).
+    const rediscovery: DiscoverResult = await findLatestValidVersionWithWalkbackFloorRetry(
+      {
+        currentLocalVersion,
+        keyMaterial: input.keyMaterial,
+        signer: input.signer,
+        aggregatorClient: input.aggregatorClient,
+        trustBase: input.trustBase,
+        decodeCid: input.decodeCid,
+        fetchCar: input.fetchCar,
+        discoveryDeadlineMs: reconcileDeadlineMs,
+        abortSignal: input.abortSignal,
+      },
+      input.abortSignal,
+    );
     probeHistory.push(...rediscovery.probeVersions);
 
     if (rediscovery.validV > 0) {
@@ -289,4 +373,6 @@ export async function reconcileAndPublish(input: ReconcileInput): Promise<Reconc
 export const __internal = {
   computeBackoffMs,
   sleep,
+  findLatestValidVersionWithWalkbackFloorRetry,
+  WALKBACK_FLOOR_RETRY_BUDGET,
 };
