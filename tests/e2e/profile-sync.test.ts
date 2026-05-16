@@ -56,7 +56,12 @@ const PRIMARY_FAUCET_AMOUNT = 1000;
 const MIN_CONFIRMED = 1_000n; // smallest-unit threshold (1 USDU)
 
 const FAUCET_TOPUP_MS = 240_000;
-const RECOVERY_SYNC_MS = 120_000;
+// 100s covers the worst-case aggregator pointer poll cycle
+// ([30s, 90s) + margin). The aggregator is the authoritative source
+// for the latest pointer version; even if pubsub between devices fails
+// (Helia peer discovery, NAT, etc.), the periodic poll guarantees
+// eventual sync within this window. Early-exit on first success.
+const RECOVERY_SYNC_MS = 100_000;
 
 // Faucet HTTP retries (the faucet's nametag-resolve relay flaps under load).
 const FAUCET_HTTP_RETRIES = 3;
@@ -318,7 +323,7 @@ describe.skipIf(SKIP_INFRA)('Profile (OrbitDB + IPFS) Sync E2E', () => {
       }
       const bal = getBalance(sphere2, PRIMARY_SYMBOL);
       if (bal.total >= MIN_CONFIRMED) break;
-      await new Promise((r) => setTimeout(r, 5000));
+      await new Promise((r) => setTimeout(r, 10_000));
     }
 
     // syncAdded > 0 proves the Profile layer actually delivered tokens

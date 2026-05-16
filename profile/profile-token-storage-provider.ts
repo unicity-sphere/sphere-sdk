@@ -2217,6 +2217,34 @@ export class ProfileTokenStorageProvider
    * via its debounce timer). No new state, no retry counters.
    */
   private async handleReplication(): Promise<void> {
+    // Pubsub wake-up signal. The OrbitDB CRDT delivered a replication
+    // event from a peer, but pubsub between devices is unreliable (NAT,
+    // firewall, peer-discovery failures) — and the OrbitDB ref itself
+    // is NOT the source of truth for the latest pointer version.
+    //
+    // Per the at-least-once design: the aggregator is the authoritative
+    // source for the latest pointer version. Treat pubsub as a hint to
+    // poll the aggregator NOW rather than waiting for the next periodic
+    // [30s, 90s) cycle. This collapses the worst-case cross-device sync
+    // latency from ~90s to the aggregator round-trip time (~1–2s on
+    // healthy infra).
+    //
+    // Failure of the aggregator poll is non-fatal: the periodic poll
+    // (worst case 90s) is still running as the safety net. We then
+    // fall through to the OrbitDB-direct refresh below for the
+    // opportunistic case where the aggregator poll hasn't caught up
+    // yet (e.g. between the publisher's IPFS pin and aggregator
+    // submit) but the OrbitDB ref already replicated.
+    try {
+      await this.lifecycleManager.triggerPointerPollNow();
+    } catch (err) {
+      this.log(
+        `handleReplication: aggregator pointer poll failed (best-effort): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+
     try {
       const previousCids = new Set(this.knownBundleCids);
       await this.bundleIndex.refreshKnownBundles();

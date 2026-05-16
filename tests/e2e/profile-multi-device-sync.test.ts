@@ -176,7 +176,12 @@ describe.skipIf(SKIP_INFRA)('Profile Multi-Device Sync E2E', () => {
       // pointer layer happened to walk an older CID and a fresher OpLog
       // entry replicates after import.
       console.log('  Verifying post-import recovery (Profile is the only source)...');
-      const deadline = performance.now() + 60_000;
+      // 100s deadline covers worst-case aggregator pointer poll cycle
+      // ([30s, 90s) + margin). Poll every 10s — early-exit on first
+      // success. When pubsub between Helia nodes works, this completes
+      // in seconds; the long deadline only matters when pubsub fails
+      // and the aggregator-poll safety net is doing the work.
+      const deadline = performance.now() + 100_000;
       while (performance.now() < deadline) {
         let allReady = true;
         for (const coin of TEST_COINS) {
@@ -191,7 +196,7 @@ describe.skipIf(SKIP_INFRA)('Profile Multi-Device Sync E2E', () => {
         } catch (err) {
           console.log(`  sync() attempt failed: ${err instanceof Error ? err.message : err}`);
         }
-        await new Promise((r) => setTimeout(r, 2000));
+        await new Promise((r) => setTimeout(r, 10_000));
       }
 
       // Full inventory match
@@ -248,9 +253,10 @@ describe.skipIf(SKIP_INFRA)('Profile Multi-Device Sync E2E', () => {
       spheres.push(sphereC);
 
       // Sync — both paths (Profile and Nostr) should converge to the
-      // same inventory.
+      // same inventory. 100s deadline covers worst-case aggregator
+      // pointer poll cycle ([30s, 90s) + margin). Poll every 10s.
       console.log('  Syncing...');
-      const deadline = performance.now() + 150_000;
+      const deadline = performance.now() + 100_000;
       while (performance.now() < deadline) {
         await sphereC.payments.sync();
         let allReady = true;
@@ -261,7 +267,7 @@ describe.skipIf(SKIP_INFRA)('Profile Multi-Device Sync E2E', () => {
           }
         }
         if (allReady) break;
-        await new Promise((r) => setTimeout(r, 5000));
+        await new Promise((r) => setTimeout(r, 10_000));
       }
 
       // Inventory match

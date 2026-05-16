@@ -188,9 +188,12 @@ describe.skipIf(SKIP_INFRA)('Profile (OrbitDB) Active Token Persistence E2E', ()
     // main assertion is the post-import balance.
     console.log('  Verifying post-import recovery (Profile is the only source)...');
 
-    // Allow brief retry for libp2p peer discovery if the pointer layer
-    // happened to walk an older CID and a fresher OpLog entry replicates.
-    const recoveryDeadline = performance.now() + 60_000;
+    // 100s deadline covers worst-case aggregator pointer poll cycle
+    // ([30s, 90s) + margin). Poll every 10s — early-exit on first
+    // success. The aggregator is the authoritative source for the
+    // latest pointer version; even if pubsub between devices fails,
+    // the periodic poll guarantees eventual sync within this window.
+    const recoveryDeadline = performance.now() + 100_000;
     while (performance.now() < recoveryDeadline) {
       let allReady = true;
       for (const coin of TEST_COINS) {
@@ -206,7 +209,7 @@ describe.skipIf(SKIP_INFRA)('Profile (OrbitDB) Active Token Persistence E2E', ()
       } catch (err) {
         console.log(`  sync() attempt failed: ${err instanceof Error ? err.message : err}`);
       }
-      await new Promise((r) => setTimeout(r, 2000));
+      await new Promise((r) => setTimeout(r, 10_000));
     }
 
     // Verify per-coin balance and tokens match original exactly

@@ -585,6 +585,35 @@ export class LifecycleManager {
    * The intervals are randomised in [30s, 90s) to avoid synchronised
    * polling across devices that booted simultaneously.
    */
+  /**
+   * Public wake-up API: trigger an IMMEDIATE aggregator pointer poll
+   * without waiting for the periodic [30s, 90s) cycle.
+   *
+   * Called by `ProfileTokenStorageProvider.handleReplication` when an
+   * OrbitDB-pubsub replication event arrives. The aggregator is the
+   * authoritative source of truth for the latest pointer version —
+   * pubsub between two devices is unreliable (NAT, firewall, peer
+   * discovery), so we treat the pubsub signal as a hint to consult
+   * the aggregator NOW rather than waiting for the next periodic poll.
+   *
+   * When pubsub fails entirely, the periodic poll (worst case 90s)
+   * still guarantees eventual sync — the aggregator is the ultimate
+   * fallback channel.
+   *
+   * Idempotent: if no aggregator update is found, no-op. If a new CID
+   * is found, adds it to the bundle index (same path as the periodic
+   * poll). Re-arms the periodic timer so the next scheduled poll is
+   * a fresh [30s, 90s) window from this call.
+   *
+   * Returns a promise that resolves when the poll completes (success
+   * or transient failure). Rejection only on programmer error — all
+   * transient/permanent failures are logged + swallowed (matching the
+   * periodic-poll contract).
+   */
+  async triggerPointerPollNow(): Promise<void> {
+    return this.runPointerPollOnce();
+  }
+
   private schedulePointerPoll(): void {
     if (this.host.getIsShuttingDown()) return;
 
