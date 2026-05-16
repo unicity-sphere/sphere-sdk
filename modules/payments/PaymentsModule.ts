@@ -8980,11 +8980,39 @@ export class PaymentsModule {
             // Address guard: reject data from a different address.
             // Stale IPFS records may contain tokens from a previously active
             // address if a write-behind flush raced with an address switch.
+            //
+            // Accept three representations (one per writer):
+            //   - L1 bech32 (`alpha1...`) — legacy file storage writes this
+            //   - chain pubkey — some providers record the pubkey
+            //   - Profile short ID (`DIRECT_{first6}_{last6}`) — written by
+            //     ProfileTokenStorageProvider via `computeAddressId`
+            //
+            // The third format was added to `load()`'s guard but missed
+            // here, causing sync() to silently discard Profile-provider
+            // data on cross-device recovery — Device B reads Device A's
+            // CAR via the aggregator pointer, the parsed `_meta.address`
+            // is the DIRECT_* short-id, and `currentL1` is the bech32
+            // form. Mismatch → reject → recovery returns empty.
             const mergedMeta = (result.merged as TxfStorageDataBase)?._meta;
             const currentL1 = this.deps!.identity.l1Address;
             const currentChain = this.deps!.identity.chainPubkey;
-            if (mergedMeta?.address && currentL1 && mergedMeta.address !== currentL1 && mergedMeta.address !== currentChain) {
-              logger.warn('Payments', `Sync: rejecting data from provider ${providerId} — address mismatch (got=${mergedMeta.address.slice(0, 20)}... expected=${currentL1.slice(0, 20)}...)`);
+            const currentDirect = this.deps!.identity.directAddress;
+            const currentProfileShortId = currentDirect ? computeAddressId(currentDirect) : null;
+            if (
+              mergedMeta?.address &&
+              mergedMeta.address !== currentL1 &&
+              mergedMeta.address !== currentChain &&
+              mergedMeta.address !== currentProfileShortId
+            ) {
+              const accepted = [
+                currentL1 ? `L1=${currentL1.slice(0, 16)}…` : null,
+                currentChain ? `chain=${currentChain.slice(0, 16)}…` : null,
+                currentProfileShortId ? `profile=${currentProfileShortId}` : null,
+              ].filter(Boolean).join(', ');
+              logger.warn(
+                'Payments',
+                `Sync: rejecting data from provider ${providerId} — address mismatch (got=${mergedMeta.address.slice(0, 24)} accepted=[${accepted}])`,
+              );
               continue;
             }
 
