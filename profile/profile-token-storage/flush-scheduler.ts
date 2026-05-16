@@ -193,6 +193,36 @@ export class FlushScheduler {
    *   run.
    */
   private startSerializedFlush(mode: 'save' | 'no-data'): void {
+    this.startSerializedFlushInternal(mode, /* propagateError */ false);
+  }
+
+  /**
+   * Public wrapper around the same serialized-flush chain. Returns the
+   * chained flush promise so a caller (e.g. PaymentsModule's at-least-
+   * once gate) can `await` it AND see any error thrown by the underlying
+   * flush body (POINTER_MONOTONICITY_VIOLATION, IPFS pin failure, etc.).
+   *
+   * Differs from the timer-driven `startSerializedFlush` callsite only in
+   * that:
+   *   - the returned promise rejects on flush error rather than just
+   *     logging — letting the caller decide whether to retry or refuse
+   *     to ack;
+   *   - the per-flush `storage:error` event is still emitted (same
+   *     side effects).
+   *
+   * Serializes through `host.flushPromise` so concurrent callers
+   * compose into the same chain — preventing the BUNDLE-SET-CHECK
+   * race where parallel flushes both pass the monotonicity check (each
+   * sees the OTHER's about-to-pin CID as unknown).
+   */
+  forceFlushSerialized(): Promise<void> {
+    return this.startSerializedFlushInternal('save', /* propagateError */ true);
+  }
+
+  private startSerializedFlushInternal(
+    mode: 'save' | 'no-data',
+    propagateError: boolean,
+  ): Promise<void> {
     const previous = this.host.getFlushPromise() ?? Promise.resolve();
     const flushBox: { ref: Promise<void> | null } = { ref: null };
     const myFlush: Promise<void> = previous
@@ -205,6 +235,11 @@ export class FlushScheduler {
         const prefix = mode === 'no-data' ? 'Flush (no-data) failed' : 'Flush failed';
         this.host.log(`${prefix}: ${err instanceof Error ? err.message : String(err)}`);
         this.host.emitEvent(this.host.buildErrorEvent('storage:error', err));
+        if (propagateError) {
+          // Caller asked to see the error — re-throw so the awaited
+          // promise rejects (caller decides retry / ack semantics).
+          throw err;
+        }
       })
       .finally(() => {
         if (this.host.getFlushPromise() === flushBox.ref) {
@@ -213,6 +248,7 @@ export class FlushScheduler {
       });
     flushBox.ref = myFlush;
     this.host.setFlushPromise(myFlush);
+    return myFlush;
   }
 
   /**

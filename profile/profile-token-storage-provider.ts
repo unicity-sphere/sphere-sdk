@@ -431,60 +431,45 @@ export class ProfileTokenStorageProvider
     // Iterate: there might be saves landing during in-flight flush.
     // Bound iterations to 4 — each iteration runs one full flush, so
     // > 4 means save() is faster than flush, which is a runaway
-    // scenario better surfaced as TIMEOUT than looped forever.
+    // scenario better surfaced as TIMEOUT.
+    //
+    // Uses `flushScheduler.forceFlushSerialized()` (NOT `flushToIpfs()`
+    // directly) so we compose into the host's shared `flushPromise`
+    // chain. Concurrent callers (multiple receives racing to ack their
+    // events) thus get serialized through one chain — preventing the
+    // BUNDLE-SET-CHECK race where parallel `flushToIpfs()` invocations
+    // each pass the monotonicity check, then THE SECOND one sees the
+    // FIRST's just-pinned CID as "unknown" because the first hadn't
+    // yet updated `lastLoadedFromBundleCids`.
     for (let iteration = 0; iteration < 4; iteration++) {
-      // 1. Cancel debounce timer so we don't wait its full window.
+      // Cancel pending debounce timer — we don't want to wait its full
+      // window; we'll drive a flush right now via the serialized path.
       const timer = this.flushTimer;
       if (timer !== null) {
         clearTimeout(timer);
         this.flushTimer = null;
       }
 
-      // 2. Await any in-flight flush BEFORE starting another. Two
-      //    concurrent flushes race lastPinnedCid / bundle-ref writes
-      //    (the same hazard shutdown's Steelman³⁸ note warns about).
-      const inflight = this.flushPromise;
-      if (inflight) {
-        try {
-          await Promise.race([
-            inflight,
-            new Promise<never>((_, reject) =>
-              setTimeout(
-                () =>
-                  reject(
-                    new SphereError(
-                      'awaitNextFlush: timeout awaiting in-flight flush',
-                      'TIMEOUT',
-                    ),
-                  ),
-                remainingMs(),
-              ),
-            ),
-          ]);
-        } catch (err) {
-          if (err instanceof SphereError && err.code === 'TIMEOUT') throw err;
-          // In-flight flush failed (POINTER_MONOTONICITY_VIOLATION,
-          // IPFS pin failure, OrbitDB write timeout, etc.) — propagate
-          // so the caller can refuse to advance the Nostr ack.
-          throw err;
-        }
-      }
+      // If pendingData is null AND no flush is in flight, nothing to
+      // do — every prior save() must have already settled.
+      if (this.pendingData === null && this.flushPromise === null) return;
 
-      // 3. If pendingData is now drained, we're done.
-      if (this.pendingData === null) return;
-
-      // 4. Otherwise drive a fresh flush directly. This bypasses the
-      //    just-cancelled debounce timer and runs the flush body now.
-      const direct = this.flushScheduler.flushToIpfs();
+      // Force a serialized flush — composes into the host flushPromise
+      // chain. If a flush is already in flight, this one runs AFTER it
+      // (via the chain's `previous.then(flushToIpfs)` step). If we're
+      // the first caller after a save(), this drives the first flush.
+      // Errors from the chain (POINTER_MONOTONICITY_VIOLATION, etc.)
+      // propagate as a rejection — caller decides ack behavior.
+      const chained = this.flushScheduler.forceFlushSerialized();
       try {
         await Promise.race([
-          direct,
+          chained,
           new Promise<never>((_, reject) =>
             setTimeout(
               () =>
                 reject(
                   new SphereError(
-                    'awaitNextFlush: timeout awaiting direct flush',
+                    'awaitNextFlush: timeout awaiting serialized flush',
                     'TIMEOUT',
                   ),
                 ),
@@ -494,12 +479,15 @@ export class ProfileTokenStorageProvider
         ]);
       } catch (err) {
         if (err instanceof SphereError && err.code === 'TIMEOUT') throw err;
+        // Surface flush errors so caller (handleIncomingTransfer)
+        // refuses to advance the Nostr ack — event re-replays on
+        // next reconnect; addToken stateHash dedup is idempotent.
         throw err;
       }
 
-      // 5. After the flush, pendingData was cleared inside flushToIpfs
-      //    unless a concurrent save() landed mid-flush (Steelman⁴³
-      //    identity check). Loop to handle that case.
+      // After the flush, pendingData was cleared inside flushToIpfs
+      // unless a concurrent save() landed mid-flush (Steelman⁴³
+      // identity check). Loop to handle that case.
       if (this.pendingData === null) return;
     }
 
