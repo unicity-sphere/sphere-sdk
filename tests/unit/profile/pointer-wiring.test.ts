@@ -428,10 +428,16 @@ describe('fetchAndJoin (T-D3c)', () => {
     });
   });
 
-  it('persists the local version BEFORE writing the OrbitDB bundle ref', async () => {
-    // Critical ordering: persistLocalVersion must run first so a
-    // db.put failure does not leave the cursor advanced past a
-    // bundle ref that was never written. Steelman finding #3.
+  it('writes the OrbitDB bundle ref BEFORE persisting the local version', async () => {
+    // Critical ordering: the OrbitDB bundle ref must land first so a
+    // persistLocalVersion failure does not leave the cursor advanced
+    // past a bundle that was never written. The original ordering
+    // (persistLocalVersion → put) was unsafe: any put-side error
+    // (OrbitDB sync timeout, replication-layer hang) would strand the
+    // bundle while the cursor moved on, causing silent token loss on
+    // cross-device recovery. Reversing the order makes a put failure
+    // recoverable — the cursor stays behind OrbitDB and the next
+    // reconcile re-attempts the same `(cidBytes, version)` pair.
     const order: string[] = [];
     const db = createMockDb();
     const originalPut = db.put.bind(db);
@@ -458,7 +464,40 @@ describe('fetchAndJoin (T-D3c)', () => {
     });
 
     await callback(CID.parse(TEST_CID_STRING).bytes, 11);
-    expect(order).toEqual(['persistLocalVersion', 'db.put']);
+    expect(order).toEqual(['db.put', 'persistLocalVersion']);
+  });
+
+  it('does NOT advance the local version when the OrbitDB write fails', async () => {
+    // Recoverability invariant for Gap 1: when the put-path errors,
+    // persistLocalVersion must never run — otherwise the cursor would
+    // advance past a bundle that the next reconcile won't re-fetch.
+    let persistCalled = false;
+    const db = createMockDb();
+    db.put = async () => {
+      throw new Error('simulated OrbitDB write failure');
+    };
+
+    const { fetchFromIpfs } = await import('../../../profile/ipfs-client');
+    const fetchMock = fetchFromIpfs as ReturnType<typeof vi.fn>;
+    fetchMock.mockReset();
+    fetchMock.mockImplementation(async () => new Uint8Array([0xbe, 0xef]));
+
+    const { __internal } = await import('../../../profile/pointer-wiring');
+    const { CID } = await import('multiformats/cid');
+
+    const callback = __internal.buildFetchAndJoin({
+      db,
+      gateways: ['https://ipfs.example'],
+      persistLocalVersion: async () => {
+        persistCalled = true;
+      },
+      bundleEncryptionKey: new Uint8Array(32),
+    });
+
+    await expect(callback(CID.parse(TEST_CID_STRING).bytes, 99)).rejects.toMatchObject({
+      code: 'AGGREGATOR_POINTER_PROTOCOL_ERROR',
+    });
+    expect(persistCalled).toBe(false);
   });
 
   it('written bundle ref round-trips through decryptProfileValue', async () => {
