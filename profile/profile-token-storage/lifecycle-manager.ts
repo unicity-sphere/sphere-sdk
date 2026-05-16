@@ -109,6 +109,26 @@ export class LifecycleManager {
    */
   private pointerPollTimer: ReturnType<typeof setTimeout> | null = null;
 
+  /**
+   * Poll-discovery handler captured from `initialize()`. Invoked by
+   * {@link runPointerPollOnce} after it adds a poll-discovered CID to
+   * the bundle index — drives the necessary load() + scheduleFlushNoData
+   * to keep `lastLoadedFromBundleCids` in sync with OrbitDB. Without it,
+   * the periodic poll adds CIDs to OrbitDB but never loads them, and
+   * subsequent save-driven flushes abort with
+   * POINTER_MONOTONICITY_VIOLATION (correctly preventing silent token
+   * loss, but causing the at-least-once gate to refuse every Nostr ack).
+   *
+   * Distinct from the pubsub-driven `replicationHandler` (closure
+   * captured at line ~186) because the pubsub handler has its own
+   * "did we observe anything new" diff check and snapshot ordering
+   * that aren't applicable here (the poll already confirmed the CID
+   * is new before invoking this callback).
+   *
+   * Set in `initialize()`; cleared (set to null) in `shutdown()`.
+   */
+  private onPollDiscoveredNewCid: (() => Promise<void>) | null = null;
+
   constructor(
     private readonly host: ProfileTokenStorageHost,
     private readonly bundleIndex: BundleIndex,
@@ -135,7 +155,16 @@ export class LifecycleManager {
     }
   }
 
-  async initialize(replicationHandler: () => Promise<void>): Promise<boolean> {
+  async initialize(
+    replicationHandler: () => Promise<void>,
+    onPollDiscoveredNewCid?: () => Promise<void>,
+  ): Promise<boolean> {
+    // Capture the poll-discovery callback so `runPointerPollOnce` can
+    // trigger a load+flush after discovering and adding a new CID.
+    // Optional — when omitted (legacy callers), the periodic-poll's
+    // addBundle leaves loadedBundleCids stale and the next save-driven
+    // flush may abort with POINTER_MONOTONICITY_VIOLATION.
+    this.onPollDiscoveredNewCid = onPollDiscoveredNewCid ?? null;
     if (this.host.getInitialized()) return true;
 
     if (!this.host.getIdentity()) {
@@ -266,6 +295,10 @@ export class LifecycleManager {
     this.host.setLastLoadedData(null);
     this.host.setLastLoadedFromBundleCids(null);
     this.host.setLastTokenManifest(null);
+    // Release the poll-discovery callback so a delayed `runPointerPollOnce`
+    // tick that fires after shutdown doesn't reach back into the (now
+    // torn-down) provider.
+    this.onPollDiscoveredNewCid = null;
 
     this.host.setInitialized(false);
     this.host.setStatus('disconnected');
@@ -721,6 +754,38 @@ export class LifecycleManager {
       this.host.log(
         `Pointer poll discovered NEW CID: cid=${cidString} version=${recovered.version}`,
       );
+
+      // Invoke the poll-discovery handler so the new CID gets loaded
+      // into `lastLoadedData` and the pointer is re-anchored at the
+      // merged state. Without this, subsequent save-driven flushes
+      // would see the new CID as "unknown" relative to
+      // `lastLoadedFromBundleCids` and abort with
+      // POINTER_MONOTONICITY_VIOLATION — silently refusing to publish
+      // (which the at-least-once gate correctly surfaces as a Nostr-
+      // ack refusal, but causes spurious replays).
+      //
+      // This is a DIFFERENT callback from `replicationHandler` —
+      // replicationHandler does its own diff check (previousCids vs
+      // current knownBundleCids) which would skip the load if it
+      // runs AFTER our addBundle (the diff is no-op once addBundle
+      // already updated knownBundleCids). `onPollDiscoveredNewCid`
+      // unconditionally loads + schedules a no-data flush; the caller
+      // (this method) already confirmed it's a new CID via the
+      // knownBundleCids.has(cidString) guard above.
+      //
+      // Best-effort: failures here are logged but do not abort the
+      // poll-loop re-arm at the end.
+      if (this.onPollDiscoveredNewCid) {
+        try {
+          await this.onPollDiscoveredNewCid();
+        } catch (err2) {
+          this.host.log(
+            `Pointer poll: onPollDiscoveredNewCid failed (best-effort): ${
+              err2 instanceof Error ? err2.message : String(err2)
+            }`,
+          );
+        }
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.host.log(`Pointer poll: addBundle failed: ${msg}`);

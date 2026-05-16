@@ -394,7 +394,10 @@ export class ProfileTokenStorageProvider
   // ---------------------------------------------------------------------------
 
   async initialize(): Promise<boolean> {
-    return this.lifecycleManager.initialize(() => this.handleReplication());
+    return this.lifecycleManager.initialize(
+      () => this.handleReplication(),
+      () => this.onPollDiscoveredNewCid(),
+    );
   }
 
   async shutdown(): Promise<void> {
@@ -2216,7 +2219,62 @@ export class ProfileTokenStorageProvider
    * (it awaits an in-flight flush; the flush awaits the in-flight load
    * via its debounce timer). No new state, no retry counters.
    */
+  /**
+   * Called by `LifecycleManager.runPointerPollOnce` after the periodic
+   * aggregator-pointer poll discovers a NEW CID (one not in
+   * `knownBundleCids`) and adds it via `bundleIndex.addBundle`.
+   *
+   * Distinct from `handleReplication` in two ways:
+   *   1. The poll already confirmed novelty via the `knownBundleCids`
+   *      check — no diff against `previousCids` is needed (and any
+   *      diff would be a no-op since `addBundle` updated
+   *      `knownBundleCids` BEFORE this callback fires).
+   *   2. No recursive aggregator-poll trigger — we're already inside
+   *      the poll loop.
+   *
+   * Responsibilities:
+   *   - `load()` to merge the new CID's content into `lastLoadedData`
+   *     (this updates `lastLoadedFromBundleCids` as a side effect,
+   *     restoring the pointer-monotonicity invariant).
+   *   - Schedule a no-data flush to re-anchor our pointer at the
+   *     merged state. The flush body short-circuits if the projected
+   *     CID equals the just-discovered pointer CID (no duplicate
+   *     pin / aggregator submit cost on the receiver side).
+   *
+   * Failures here are best-effort — load failures are surfaced via
+   * `storage:error` events independently; we proceed to schedule the
+   * flush so the next save-driven flush gets a fresh baseline check.
+   */
+  private async onPollDiscoveredNewCid(): Promise<void> {
+    // Fire-and-forget load — don't block the periodic poll loop on a
+    // potentially-slow IPFS CAR fetch. The scheduleFlushNoData below
+    // arms a 2 s debounce; by the time the flush body runs, load()
+    // will typically have completed and the merged state will be
+    // visible. If load is still in-flight when flush fires, the
+    // flush body's BUNDLE-SET-CHECK will detect the stale baseline
+    // and abort — surfacing as a retry on the next save-driven flush,
+    // not silent data loss.
+    this.load().catch((err) => {
+      this.log(
+        `onPollDiscoveredNewCid: load failed (best-effort): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    });
+    this.flushScheduler.scheduleFlushNoData();
+  }
+
   private async handleReplication(): Promise<void> {
+    // Snapshot the bundle set BEFORE triggering the aggregator poll
+    // and refreshing from OrbitDB. The poll may addBundle (which
+    // mutates `knownBundleCids` synchronously); without taking the
+    // snapshot first, the diff check at the bottom would falsely
+    // report "no new bundles" and skip the load+flush — causing
+    // POINTER_MONOTONICITY_VIOLATION on the next save-driven flush
+    // when its BUNDLE-SET-CHECK sees the poll-added CID as unknown
+    // (because we never loaded it).
+    const previousCids = new Set(this.knownBundleCids);
+
     // Pubsub wake-up signal. The OrbitDB CRDT delivered a replication
     // event from a peer, but pubsub between devices is unreliable (NAT,
     // firewall, peer-discovery failures) — and the OrbitDB ref itself
@@ -2246,7 +2304,6 @@ export class ProfileTokenStorageProvider
     }
 
     try {
-      const previousCids = new Set(this.knownBundleCids);
       await this.bundleIndex.refreshKnownBundles();
 
       // Check if any new bundle CIDs appeared
