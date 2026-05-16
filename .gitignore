@@ -39,3 +39,6 @@ tests/integration/.test-*/
 
 # E2e preflight infra-probe result (regenerated each run)
 tests/e2e/.preflight-result.json
+
+# Community / Discord report drafts (agent-authored, not source)
+community-reports/

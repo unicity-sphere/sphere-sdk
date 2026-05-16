@@ -43,9 +43,9 @@ const log = (msg: string): void => {
 };
 
 /**
- * Did a parent process (e.g., the bash smoke-test driver, run-all.sh
- * fanning out per-test scripts, or a CI orchestrator) already boot
- * the local stack and export its env? When SPHERE_NOSTR_RELAYS and
+ * Did a parent process (e.g., the bash smoke-test driver fanning out
+ * per-test scripts, or a CI orchestrator) already boot the local
+ * stack and export its env? When SPHERE_NOSTR_RELAYS and
  * E2E_LOCAL_FAUCET_PUBKEY are both set on entry, we trust the parent's
  * boot and skip our own — otherwise we'd race the parent's faucet
  * container (`docker rm -f` pre-clean would yank the running parent

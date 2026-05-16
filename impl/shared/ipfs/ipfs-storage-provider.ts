@@ -5,6 +5,18 @@
  *
  * Uses a write-behind buffer for non-blocking save() operations.
  * Writes are accepted immediately and flushed to IPFS asynchronously.
+ *
+ * @deprecated Use the Profile token-storage path (OrbitDB + aggregator
+ * pointer + IPFS CAR pin/fetch) instead. The IPNS-based mutable-pointer
+ * flow that this provider implements is superseded by the aggregator's
+ * pointer layer, which handles cross-device mutable-pointer resolution
+ * over the HTTP API without depending on IPNS DHT propagation or
+ * libp2p-pubsub between wallet instances. See `profile/factory.ts`,
+ * `createNodeProfileProviders`, and `createBrowserProfileProviders`.
+ *
+ * The class remains functional for backward compatibility with consumers
+ * who explicitly opt in via `tokenSync.ipfs.enabled: true`. New code
+ * should use Profile.
  */
 
 import { logger } from '../../../core/logger';
@@ -95,10 +107,24 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
   private readonly _config: IpfsStorageConfig | undefined;
   private readonly _statePersistenceCtor: IpfsStatePersistence | undefined;
 
+  /** Process-wide flag to emit the deprecation warning at most once. */
+  private static _deprecationWarned = false;
+
   constructor(
     config?: IpfsStorageConfig,
     statePersistence?: IpfsStatePersistence,
   ) {
+    if (!IpfsStorageProvider._deprecationWarned) {
+      IpfsStorageProvider._deprecationWarned = true;
+      console.warn(
+        '[sphere-sdk] IpfsStorageProvider is DEPRECATED. The IPNS-based ' +
+        'mutable-pointer flow it implements is superseded by the Profile ' +
+        'token-storage path (OrbitDB + aggregator pointer + IPFS CAR). ' +
+        'Migrate via createNodeProfileProviders / createBrowserProfileProviders. ' +
+        'This provider remains functional for backward compatibility but is no ' +
+        'longer the recommended path for new code.',
+      );
+    }
     this._config = config;
     this._statePersistenceCtor = statePersistence;
     const gateways = config?.gateways ?? getIpfsGatewayUrls();

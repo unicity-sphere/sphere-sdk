@@ -3,8 +3,8 @@
 # local-infra.sh — Bash-side wrapper for the local Nostr+faucet stack.
 #
 # Companion to tests/e2e/local-infra/global-setup.ts (the vitest entry
-# point). Shell-driven e2e tests (pointer-N*.sh, swap-cli-e2e.sh,
-# cli-storage-modes.sh) can `source` this file and call:
+# point). Shell-driven e2e tests (pointer-N*.sh) can
+# `source` this file and call:
 #
 #   local_infra_up
 #   local_infra_down
@@ -29,8 +29,8 @@
 #   /tmp/uxf-e2e-local-infra/state.env  — `KEY=value` lines, sourceable
 #                                         by sub-shells that run after
 #                                         the parent already booted the
-#                                         stack (e.g. run-all.sh fanning
-#                                         out per-test scripts).
+#                                         stack (e.g. a batched harness
+#                                         fanning out per-test scripts).
 # =============================================================================
 
 # Idempotent source guard

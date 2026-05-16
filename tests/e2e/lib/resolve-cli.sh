@@ -5,11 +5,9 @@
 #
 # The sphere-sdk CLI was extracted to its own package (@unicity-sphere/cli);
 # the in-tree `cli/index.ts` no longer exists on this branch. Shell e2e
-# scripts (pointer-N*.sh, swap-cli-e2e.sh, cli-storage-modes.sh,
-# e2e-helpers.sh) all need a CLI to drive wallets. Centralizing the
+# scripts (pointer-N*.sh) need a CLI to drive wallets. Centralizing the
 # resolver in one place avoids the drift we hit in May 2026 where
-# pointer-N0-prologue.sh and e2e-helpers.sh both shipped subtly different
-# 4-step fallbacks.
+# multiple test scripts shipped subtly different 4-step fallbacks.
 #
 # Sourced (NOT executed). Provides one function:
 #
@@ -143,12 +141,26 @@ cli_supports_command() {
   # with "Usage: <bin> [options] [command]" — i.e., NOT naming the
   # subcommand. Combine: zero exit AND subcommand name appearing in
   # the Usage line.
+  #
+  # Help-line shape varies across CLIs we support:
+  #   * sphere-cli `pointer --help` → "Usage: sphere pointer [options]
+  #     [command]"  — Usage at column 0.
+  #   * sphere-cli `init --help`    → first non-empty line is "init",
+  #     followed by "  Usage: npm run cli -- init [--network <net>] …"
+  #     — Usage indented by 2 spaces because the legacy bridge prints
+  #     a manually-formatted help block instead of Commander's default.
+  # Allow optional leading whitespace before "Usage:" so both shapes
+  # match. The subcommand must still appear in the Usage line itself
+  # (not just anywhere in the help) to defeat top-level-help false
+  # positives like `sphere unknown-thing --help` (sphere-cli exits 0
+  # and prints the root help; root Usage line names neither
+  # `unknown-thing` nor any installed subcommand).
   local out
   # shellcheck disable=SC2086
   if ! out=$($cli_cmd "$subcommand" --help 2>&1); then
     return 1
   fi
-  if echo "$out" | grep -qE "^Usage:.*[ /]${subcommand}([ ]|$)"; then
+  if echo "$out" | grep -qE "^[[:space:]]*Usage:.*[ /]${subcommand}([ ]|$)"; then
     return 0
   fi
   if echo "$out" | grep -qiE "unknown (command|option)"; then

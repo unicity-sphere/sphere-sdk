@@ -15,7 +15,7 @@
 #     T-E19/T-E20 real-infra script set that runs per-PR.
 #
 # Next step: once N3's faucet helper exists, wire a `SOAK_MINUTES=${N:-10}`
-# loop and run this as a standalone nightly job, NOT via run-all.sh.
+# loop and run this as a standalone nightly job (not in the per-PR set).
 # =============================================================================
 set -Eeuo pipefail
 TEST_NAME="pointer-N10"

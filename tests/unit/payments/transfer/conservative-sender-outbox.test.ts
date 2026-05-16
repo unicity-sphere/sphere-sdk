@@ -333,7 +333,12 @@ describe('sendConservativeUxf outbox integration — inline delivery', () => {
     expect(created.deliveryMethod).toBe('car-over-nostr');
     expect(typeof created.bundleCid).toBe('string');
     expect(created.bundleCid.length).toBeGreaterThan(0);
-    expect(created.tokenIds).toEqual(['tok-1']);
+    // Loop4-e2e (round 2) — tokenIds is the recipient's genesis
+    // tokenId (TOKEN_A's canonical 'aa00...0001'), NOT the
+    // sender-local sourceTokenId.
+    expect(created.tokenIds).toEqual([
+      'aa00000000000000000000000000000000000000000000000000000000000001',
+    ]);
     expect(created.recipient).toBe('@bob');
     expect(created.recipientTransportPubkey).toBe(makePeerInfo().transportPubkey);
     expect(created.recipientNametag).toBe('bob');  // W18 — preserved from PeerInfo
@@ -633,7 +638,11 @@ describe('sendConservativeUxf outbox integration — real OutboxWriter (T.6.A) w
     expect(entry.deliveryMethod).toBe('car-over-nostr');
     expect(entry.recipientNametag).toBe('bob');
     expect(entry.recipient).toBe('@bob');
-    expect(entry.tokenIds).toEqual(['tok-1']);
+    // Loop4-e2e (round 2) — tokenIds is the recipient's genesis
+    // tokenId (TOKEN_A's canonical 'aa00...0001').
+    expect(entry.tokenIds).toEqual([
+      'aa00000000000000000000000000000000000000000000000000000000000001',
+    ]);
     expect(entry.bundleCid.length).toBeGreaterThan(0);
     expect(entry.memo).toBe('invoice 123');
     // Lamport bumped through the lifecycle: create + 3 updates (sending,

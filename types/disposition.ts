@@ -213,6 +213,20 @@ export function isAuditStatus(value: unknown): value is AuditStatus {
  * @see UXF-TRANSFER-PROTOCOL §5.4 — `_invalid` key shape and record schema.
  */
 export interface InvalidEntry {
+  /**
+   * Schema discriminator (G2 — no-token-loss). The legacy
+   * PaymentsModule.save() flush owns the same `${addr}.invalid.` key
+   * prefix and runs a per-entry diff that tombstones any on-disk key
+   * not present in `data._invalid` (which is a `TxfInvalidEntry[]`,
+   * NOT this DispositionWriter-owned shape). Stamping
+   * `_schemaVersion: 'uxf-1'` on every write of this shape lets the
+   * provider's `applyPerEntryDiff` recognize the foreign-schema entry
+   * via `skipForeignSchema:true` and skip it during the live-vs-disk
+   * diff — preserving the record across PaymentsModule.save() cycles.
+   *
+   * Stable on-disk; renaming this is a profile-format migration.
+   */
+  readonly _schemaVersion: 'uxf-1';
   /** Canonical token identifier (lowercase hex `byte_fields` form). */
   readonly tokenId: string;
   /**
@@ -248,6 +262,21 @@ export interface InvalidEntry {
  * promotion semantics.
  */
 export interface AuditEntry {
+  /**
+   * Schema discriminator (G1 — no-token-loss). Mirrors
+   * {@link InvalidEntry._schemaVersion}: the legacy PaymentsModule.save()
+   * flush owns the same `${addr}.audit.` key prefix and runs a per-entry
+   * diff that tombstones any on-disk key not present in `data._audit`
+   * (which is a `TxfAuditEntry[]`, NOT this DispositionWriter-owned
+   * shape). Stamping `_schemaVersion: 'uxf-1'` on every write of this
+   * shape lets the provider's `applyPerEntryDiff` recognize the
+   * foreign-schema entry via `skipForeignSchema:true` and skip it
+   * during the live-vs-disk diff — preserving the record across
+   * PaymentsModule.save() cycles.
+   *
+   * Stable on-disk; renaming this is a profile-format migration.
+   */
+  readonly _schemaVersion: 'uxf-1';
   /** Canonical token identifier (lowercase hex `byte_fields` form). */
   readonly tokenId: string;
   /** SHA-256 of the as-observed token-root element (disambiguator). */

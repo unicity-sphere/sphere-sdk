@@ -108,6 +108,15 @@ export const STORAGE_KEYS_ADDRESS = {
   INV_LEDGER_INDEX: 'inv_ledger_index',
   /** Token scan state watermarks (JSON: Record<tokenId, txCount>) */
   TOKEN_SCAN_STATE: 'token_scan_state',
+  /**
+   * Persisted NOSTR-FIRST proof-polling jobs. Issue #144: the in-memory
+   * `proofPollingJobs` Map dies with the process; on CLI usage every
+   * `sphere <cmd>` is a fresh Node.js process, so V6-direct receives
+   * whose proof arrives later never finalize. We persist enough state
+   * (genesisTokenId, stateHash, requestIdHex, commitmentJson,
+   * sourceTokenJson) to re-fire `finalizeReceivedToken` on next load().
+   */
+  PROOF_POLLING_JOBS: 'proof_polling_jobs',
   // Swap storage keys
   /** Per-swap key: swap:{swapId} */
   SWAP_RECORD_PREFIX: 'swap:',
@@ -261,10 +270,57 @@ export const DEFAULT_AGGREGATOR_API_KEY = 'sk_06365a9c44654841a366068bcfc68986' 
 // IPFS Defaults
 // =============================================================================
 
-/** Default IPFS gateways */
-export const DEFAULT_IPFS_GATEWAYS = [
+/**
+ * Built-in (compiled-in) IPFS gateway list. Kept as a separate constant so
+ * tests and consumers that need to compare against the static defaults can do
+ * so without going through {@link DEFAULT_IPFS_GATEWAYS} (which honors the
+ * `SPHERE_IPFS_GATEWAY` env override).
+ */
+export const BUILTIN_IPFS_GATEWAYS = [
   'https://unicity-ipfs1.dyndns.org',
 ] as const;
+
+/**
+ * Parse the `SPHERE_IPFS_GATEWAY` env override into a non-empty URL list,
+ * or `null` when the env var is unset/empty.
+ *
+ * Accepts a single URL or a comma-separated list. Whitespace around entries
+ * is trimmed; empty entries are dropped. The Node-only guard (`typeof
+ * process !== 'undefined'`) keeps this safe under the browser bundle, where
+ * `process` is undefined.
+ *
+ * Why it lives here: the override targets the testnet IPFS gateway outage
+ * (issue #154) so e2e suites can point at an alternate gateway without
+ * patching factories. Reading at module init means every downstream consumer
+ * (`NETWORKS[*].ipfsGateways`, `getIpfsGatewayUrls()`, the deprecated
+ * `IpfsStorageProvider` ctor) inherits the override automatically.
+ */
+function readIpfsGatewayEnvOverride(): readonly string[] | null {
+  if (typeof process === 'undefined' || typeof process.env === 'undefined') {
+    return null;
+  }
+  const raw = process.env.SPHERE_IPFS_GATEWAY;
+  if (!raw) return null;
+  const parts = raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  return parts.length > 0 ? parts : null;
+}
+
+const ENV_IPFS_GATEWAYS = readIpfsGatewayEnvOverride();
+
+/**
+ * Default IPFS gateways.
+ *
+ * Honors the `SPHERE_IPFS_GATEWAY` env override (single URL or comma-separated
+ * list) when present, falling back to {@link BUILTIN_IPFS_GATEWAYS}. The
+ * override is evaluated once at module load, so it must be set BEFORE
+ * `@unicitylabs/sphere-sdk` is imported (e2e runners and CI set this in the
+ * shell or vitest globalSetup).
+ */
+export const DEFAULT_IPFS_GATEWAYS: readonly string[] =
+  ENV_IPFS_GATEWAYS ?? BUILTIN_IPFS_GATEWAYS;
 
 /** Unicity IPFS bootstrap peers */
 export const DEFAULT_IPFS_BOOTSTRAP_PEERS = [
@@ -286,9 +342,16 @@ export const UNICITY_IPFS_NODES = [
 
 /**
  * Get IPFS gateway URLs for HTTP API access.
+ *
+ * If `SPHERE_IPFS_GATEWAY` is set, returns the override list verbatim — the
+ * caller is responsible for using a scheme/port compatible with their needs.
+ * Otherwise derives URLs from {@link UNICITY_IPFS_NODES}.
+ *
  * @param isSecure - Use HTTPS (default: true). Set false for development.
+ *                   Ignored when the env override is in effect.
  */
 export function getIpfsGatewayUrls(isSecure?: boolean): string[] {
+  if (ENV_IPFS_GATEWAYS) return [...ENV_IPFS_GATEWAYS];
   return UNICITY_IPFS_NODES.map((node) =>
     isSecure !== false
       ? `https://${node.host}`

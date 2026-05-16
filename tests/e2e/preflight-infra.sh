@@ -2,9 +2,8 @@
 # =============================================================================
 # preflight-infra.sh — shared infra-probe gate for shell-script e2e tests
 #
-# Sourced by tests/e2e/e2e-helpers.sh and tests/e2e/pointer-N0-prologue.sh,
-# so every shell-driven e2e test inherits the same gate without each
-# script having to know about it.
+# Sourced by tests/e2e/pointer-N0-prologue.sh, so every pointer-N*.sh
+# test inherits the same gate without having to know about it.
 #
 # Usage from a sourcing script:
 #
@@ -146,9 +145,9 @@ preflight_infra() {
       ;;
     2)
       echo "  [preflight] ✗ infra UNREACHABLE — skipping ${TEST_NAME:-test} cleanly"
-      # Output the canonical "PASS" / "SKIP" sentinel that run-all.sh
-      # greps for. We use SKIP, not FAIL — this is an intentional
-      # absence, not a regression.
+      # Output the canonical "PASS" / "SKIP" sentinel that batched
+      # callers can grep for. We use SKIP, not FAIL — this is an
+      # intentional absence, not a regression.
       echo "SKIP: ${TEST_NAME:-unknown} — required infra unreachable"
       exit 0
       ;;

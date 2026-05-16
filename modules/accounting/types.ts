@@ -758,6 +758,26 @@ export interface PayInvoiceParams {
    */
   readonly contact?: { address: string; url?: string };
   /**
+   * Optional transfer-delivery mode forwarded to PaymentsModule.send.
+   *
+   * `'instant'` (default): ships a V6 combined-transfer bundle. The
+   * recipient saves the token at status='submitted' with the SENDER's
+   * sdkData and finalizes via background proof-polling. Lower latency,
+   * but the recipient cannot spend the token until finalization
+   * completes.
+   *
+   * `'conservative'`: collects the inclusion proof on the SENDER's
+   * side before delivering. The recipient receives a fully-finalized
+   * {sourceToken, transferTx} bundle and produces a 'confirmed' Token
+   * immediately bound to the recipient's predicate. Higher latency,
+   * but enables chained spends without racing background proof-polls.
+   *
+   * Use `'conservative'` for forwarding flows (faucet → trader →
+   * deposit, escrow payouts, withdraws). Default `'instant'` is fine
+   * for low-latency UX where the recipient won't immediately re-spend.
+   */
+  readonly transferMode?: 'instant' | 'conservative';
+  /**
    * When true, request source-token selection that MAY include unconfirmed
    * tokens (chain-mode). Forwarded verbatim to PaymentsModule.send() for
    * non-escrow invoice flows.

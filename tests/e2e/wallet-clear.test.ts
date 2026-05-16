@@ -228,13 +228,20 @@ describe.skipIf(SKIP_INFRA)('Wallet clear end-to-end', () => {
     const providers2 = makeProviders(dirs2);
 
     console.log(`Wallet 2: attempting to register @${nametag}...`);
+    // PR #127 split the generic VALIDATION_ERROR "Failed to register Unicity
+    // ID" into the specific NAMETAG_TAKEN code with a clearer message
+    // ("binding event was rejected") so operators can distinguish
+    // Nostr-relay collision from aggregator-mint failure.
     await expect(
       Sphere.init({
         ...providers2,
         autoGenerate: true,
         nametag,
       })
-    ).rejects.toThrow('Failed to register Unicity ID');
+    ).rejects.toMatchObject({
+      code: 'NAMETAG_TAKEN',
+      message: expect.stringMatching(/binding event was rejected/),
+    });
 
     console.log('Wallet 2 correctly rejected — nametag is taken on Nostr.');
   }, 90000);

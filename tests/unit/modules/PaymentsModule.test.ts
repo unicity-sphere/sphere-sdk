@@ -1116,6 +1116,48 @@ describe('Nametag preservation during sync', () => {
     expect(module.getNametag()?.name).toBe('updateduser');
   });
 
+  it('should clear nametags when sync provider returns explicit empty _nametags array', async () => {
+    // Intentional cross-device removal: another device cleared its nametag
+    // and synced. The merged payload carries `_nametags: []` (explicit,
+    // not absent). We MUST clear locally — preservation only kicks in
+    // when the field is absent. (#136 boundary case)
+    const mockProvider = {
+      id: 'test-provider',
+      name: 'Test Provider',
+      type: 'local' as const,
+      setIdentity: vi.fn(),
+      initialize: vi.fn().mockResolvedValue(true),
+      shutdown: vi.fn().mockResolvedValue(undefined),
+      connect: vi.fn().mockResolvedValue(undefined),
+      disconnect: vi.fn().mockResolvedValue(undefined),
+      isConnected: vi.fn().mockReturnValue(true),
+      getStatus: vi.fn().mockReturnValue('connected' as const),
+      save: vi.fn().mockResolvedValue({ success: true, timestamp: Date.now() }),
+      load: vi.fn().mockResolvedValue({ success: true, data: { _meta: { version: 1, address: '', formatVersion: '2.0', updatedAt: Date.now() } }, source: 'local', timestamp: Date.now() }),
+      sync: vi.fn().mockResolvedValue({
+        success: true,
+        merged: {
+          _meta: { version: 2, address: '', formatVersion: '2.0', updatedAt: Date.now() },
+          _nametags: [],
+        },
+        added: 0,
+        removed: 0,
+        conflicts: 0,
+      }),
+    };
+
+    const providers = new Map([['test', mockProvider]]);
+    const module = createInitializedModule(providers);
+
+    await module.setNametag(TEST_NAMETAG);
+    expect(module.hasNametag()).toBe(true);
+
+    await module.sync();
+
+    // Explicit empty array → cleared.
+    expect(module.hasNametag()).toBe(false);
+  });
+
   it('should recover nametags from storage via reloadNametagsFromStorage', async () => {
     const mockProvider = {
       id: 'test-provider',

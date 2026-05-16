@@ -16,7 +16,7 @@
 #   * set -Eeuo pipefail in every script.
 #   * NO_TESTNET=1 → scripts print "SKIP: no testnet" and exit 0.
 #   * Each script ends with a literal "PASS: <name>" or "FAIL: <name>" line
-#     that run-all.sh greps for.
+#     that batched callers (CI runners) grep for.
 # =============================================================================
 
 # Strict mode applies to the prologue itself. We expect to be sourced, so do
@@ -120,8 +120,8 @@ log()  { echo "[$(date '+%H:%M:%S')] [${TEST_NAME}] $*"; }
 ok()   { echo "  ok   $*"; PASS_COUNT=$((PASS_COUNT + 1)); }
 bad()  { echo "  FAIL $*" >&2; FAIL_COUNT=$((FAIL_COUNT + 1)); }
 
-# Uniform pass/fail lines for run-all.sh. Scripts MUST call exactly one of
-# these at the end; run-all.sh / CI greps for the leading "PASS:" / "FAIL:".
+# Uniform pass/fail lines. Scripts MUST call exactly one of these at the
+# end; CI / batched callers grep for the leading "PASS:" / "FAIL:".
 pass() {
   local name="${1:-${TEST_NAME}}"
   echo "PASS: ${name}"
@@ -138,7 +138,7 @@ fail() {
 
 # Hard-exit helper for setup failures that can't be attributed to a specific
 # assertion (e.g., faucet unreachable, mnemonic extraction blank). Prints a
-# FAIL line so run-all.sh still reports the test correctly.
+# FAIL line so the calling harness still reports the test correctly.
 die() {
   local msg="${1:-fatal}"
   fail "${TEST_NAME}" "${msg}"
@@ -148,8 +148,8 @@ die() {
 # ---------------------------------------------------------------------------
 # NO_TESTNET skip sentinel.
 # Every script calls this before attempting any CLI invocation so CI boxes
-# without testnet access get a clean PASS with a "SKIP" marker. run-all.sh
-# treats exit 0 as pass; the leading "SKIP:" line is documentary.
+# without testnet access get a clean PASS with a "SKIP" marker. Batched
+# callers treat exit 0 as pass; the leading "SKIP:" line is documentary.
 # ---------------------------------------------------------------------------
 maybe_skip_no_testnet() {
   if [[ "${NO_TESTNET:-0}" == "1" ]]; then
@@ -212,7 +212,6 @@ cleanup_workspace() {
 # _cd_cli <datadir> <cli-args...>
 # Runs the CLI inside the given dataDir. The CLI resolves config/profiles
 # relative to CWD (.sphere-cli/), so each sub-wallet lives in its own dir.
-# This mirrors the pattern in e2e-helpers.sh `_cli()`.
 # ---------------------------------------------------------------------------
 _cd_cli() {
   local datadir="$1"; shift

@@ -115,9 +115,13 @@ describe.skipIf(SKIP_INFRA)('Profile (OrbitDB) Active Token Persistence E2E', ()
     }
 
     // Explicit sync flush — forces Profile's write-behind buffer to
-    // pin the latest CAR bundle to the live IPFS gateway.
+    // pin the latest CAR bundle to the live IPFS gateway. sync()
+    // drains pending V5 finalizations internally first so any token
+    // still in `_pendingFinalization` shape (which tokenToTxf would
+    // drop) is finalized before being serialized into the CAR. 60s
+    // budget matches the prior explicit drain.
     console.log('  Flushing Profile state to IPFS+OrbitDB...');
-    await sphereA.payments.sync();
+    await sphereA.payments.sync({ drainTimeoutMs: 60_000 });
 
     console.log('[Test 1] PASSED: multi-coin wallet + Profile state published');
   }, 240_000);

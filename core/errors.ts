@@ -33,11 +33,22 @@ export type SphereErrorCode =
   | 'INVALID_RECIPIENT'
   | 'TRANSFER_FAILED'
   | 'UNSUPPORTED_TRANSFER_MODE'
+  // #142 defense-in-depth — the sender orchestrator's post-commit assertion
+  // that the sum of fungible amounts encoded in the recipient token JSONs
+  // does not exceed the request's per-coin totals. Catches over-send bugs
+  // where a partial-amount request silently ships a full source token.
+  | 'OVER_TRANSFER_GUARD'
+  // PR #152 defense-in-depth — pre-validate that the wallet's signing key
+  // owns every source token planned for spending. Catches the same bug
+  // class PR #130 fixes at the root, on the send-side as a backstop.
+  | 'OWNERSHIP_VERIFICATION_FAILED'
   | 'STORAGE_ERROR'
   | 'STORAGE_CORRUPTED'
   | 'TRANSPORT_ERROR'
   | 'AGGREGATOR_ERROR'
   | 'VALIDATION_ERROR'
+  | 'NAMETAG_CONFLICT'
+  | 'NAMETAG_TAKEN'
   | 'NETWORK_ERROR'
   | 'TIMEOUT'
   | 'DECRYPTION_ERROR'

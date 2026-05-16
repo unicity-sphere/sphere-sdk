@@ -49,7 +49,7 @@
 // =============================================================================
 
 export { Sphere, createSphere, loadSphere, initSphere, getSphere, sphereExists, checkNetworkHealth, logger, SphereError, isSphereError } from './core';
-export { signMessage, verifySignedMessage, hashSignMessage, SIGN_MESSAGE_PREFIX } from './core/crypto';
+export { signMessage, verifySignedMessage, hashSignMessage, recoverPubkeyFromSignature, SIGN_MESSAGE_PREFIX } from './core/crypto';
 export type {
   SphereCreateOptions,
   SphereLoadOptions,
@@ -276,6 +276,7 @@ export {
   DEFAULT_AGGREGATOR_TIMEOUT,
   // IPFS
   DEFAULT_IPFS_GATEWAYS,
+  BUILTIN_IPFS_GATEWAYS,
   DEFAULT_IPFS_BOOTSTRAP_PEERS,
   // L1 (ALPHA Blockchain)
   DEFAULT_ELECTRUM_URL,

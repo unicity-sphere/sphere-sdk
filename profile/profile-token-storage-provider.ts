@@ -164,6 +164,26 @@ export class ProfileTokenStorageProvider
   // --- Last pinned CID for flush retry (Fix 8) ---
   private lastPinnedCid: string | null = null;
 
+  // --- Last CID observed via aggregator pointer (Fix 2 of cross-device sync) ---
+  // Set by LifecycleManager on cold-start recoverLatest and on every
+  // periodic poll iteration that returns a CID. Read by FlushScheduler
+  // to short-circuit gratuitous re-publishes when the merged-state CAR
+  // already matches the authoritative pointer (e.g., remote originator
+  // already anchored the state we just merged from their bundle).
+  private lastDiscoveredPointerCid: string | null = null;
+
+  // --- Bundle CIDs merged into lastLoadedData (pointer monotonicity) ---
+  // Snapshot of the active OrbitDB bundle index at the moment load()
+  // produced lastLoadedData. Used by FlushScheduler's runtime monotonicity
+  // assertion: if a flush would publish a pointer V_n while OrbitDB has
+  // bundles NOT in this set, the flush's source state is stale and
+  // would silently drop tokens from V_n's CAR. The assertion fires
+  // before pin + publish.
+  //
+  // Null when no successful load() has run yet (no V_n-1 baseline → the
+  // assertion has nothing to compare against and trivially passes).
+  private lastLoadedFromBundleCids: Set<string> | null = null;
+
   // --- Config storage for createForAddress ---
   private readonly _db: ProfileDatabase;
   private readonly _encryptionKeyRaw: Uint8Array | null;
@@ -297,6 +317,10 @@ export class ProfileTokenStorageProvider
       setLastPinnedCid: (c) => {
         this.lastPinnedCid = c;
       },
+      getLastDiscoveredPointerCid: () => this.lastDiscoveredPointerCid,
+      setLastDiscoveredPointerCid: (c) => {
+        this.lastDiscoveredPointerCid = c;
+      },
       // Bundle index state
       getKnownBundleCids: () => this.knownBundleCids,
       setKnownBundleCids: (s) => {
@@ -306,6 +330,10 @@ export class ProfileTokenStorageProvider
       getLastLoadedData: () => this.lastLoadedData,
       setLastLoadedData: (d) => {
         this.lastLoadedData = d;
+      },
+      getLastLoadedFromBundleCids: () => this.lastLoadedFromBundleCids,
+      setLastLoadedFromBundleCids: (s) => {
+        this.lastLoadedFromBundleCids = s;
       },
       getLastTokenManifest: () => this.lastTokenManifest,
       setLastTokenManifest: (m) => {
@@ -453,6 +481,8 @@ export class ProfileTokenStorageProvider
         // No bundles -- return empty data
         const emptyData = this.buildEmptyTxfData();
         this.lastLoadedData = emptyData;
+        // Snapshot the merged-bundle set for the monotonicity assertion.
+        this.lastLoadedFromBundleCids = new Set();
         this.emitEvent({ type: 'storage:loaded', timestamp: Date.now() });
         return {
           success: true,
@@ -537,6 +567,11 @@ export class ProfileTokenStorageProvider
       }
 
       this.lastLoadedData = txfData;
+      // Snapshot the merged-bundle set for the runtime monotonicity
+      // assertion. activeBundles enumerated above is the V_n-1 bundle
+      // union; any future flush whose source state was captured before
+      // an additional bundle replicates in is detectably stale.
+      this.lastLoadedFromBundleCids = new Set(activeBundles.keys());
 
       this.emitEvent({ type: 'storage:loaded', timestamp: Date.now() });
 
@@ -732,6 +767,7 @@ export class ProfileTokenStorageProvider
       this.knownBundleCids.clear();
       this.pendingData = null;
       this.lastLoadedData = null;
+      this.lastLoadedFromBundleCids = null;
 
       return true;
     } catch (err) {
@@ -1105,6 +1141,13 @@ export class ProfileTokenStorageProvider
       existingInvalidKeys,
       now,
       TOMBSTONE_RETENTION_MS,
+      // G2 — DispositionWriter owns `_invalid` records under the same
+      // prefix and stamps `_schemaVersion: 'uxf-1'` on every write. The
+      // legacy `data._invalid` is a `TxfInvalidEntry[]` (no
+      // `_schemaVersion`) while the DispositionWriter records carry the
+      // discriminator. Without this flag, every legacy save() flush
+      // tombstones the DispositionWriter records (forensic data loss).
+      /* skipForeignSchema */ true,
     );
     await this.applyPerEntryDiff(
       `${addr}.mintOutbox.`,
@@ -1119,6 +1162,10 @@ export class ProfileTokenStorageProvider
       existingAuditKeys,
       now,
       TOMBSTONE_RETENTION_MS,
+      // G1 — DispositionWriter owns `_audit` records under the same
+      // prefix. See the `${addr}.invalid.` call above for full
+      // rationale.
+      /* skipForeignSchema */ true,
     );
     await this.applyPerEntryDiff(
       `${addr}.finalizationQueue.`,
@@ -1126,6 +1173,13 @@ export class ProfileTokenStorageProvider
       existingFinalizationKeys,
       now,
       TOMBSTONE_RETENTION_MS,
+      // G3 — recipient FinalizationQueue records (when persisted via
+      // the OrbitDb-backed adapter) carry `_schemaVersion: 'uxf-1'`.
+      // The legacy `data._finalizationQueue` is a
+      // `TxfFinalizationQueueEntry[]` (no discriminator). Without this
+      // flag every save() flush tombstones in-flight finalization
+      // entries (cross-restart safety net erased).
+      /* skipForeignSchema */ true,
     );
 
     // invalidatedNametags stays as a single key (small Set<string>).
@@ -1136,6 +1190,30 @@ export class ProfileTokenStorageProvider
       );
     } catch (err) {
       this.log(`Failed to write invalidatedNametags: ${err instanceof Error ? err.message : String(err)}`);
+      this.emitEvent(this.buildErrorEvent('storage:error', err));
+    }
+
+    // G4 — also persist tombstones to OrbitDB at `${addr}.tombstones`.
+    // Pre-fix: tombstones lived ONLY in the per-device local cache
+    // (`deriver.${addr}.all`). A cold-start (cache wiped by browser
+    // storage purge / re-import / new device) returned empty tombstones,
+    // so a Nostr re-delivery of an archived-token bundle would be
+    // re-ingested as if live — security boundary violation. Writing to
+    // OrbitDB carries the boundary across replication AND survives
+    // cold-start as long as the Profile is recoverable from IPFS.
+    //
+    // Single-blob layout matches `invalidatedNametags` and `history`
+    // (small bounded set per address). Empty arrays are still written
+    // — peers MUST observe an authoritative empty state to converge.
+    try {
+      await this.writeProfileKey(
+        `${addr}.tombstones`,
+        JSON.stringify(opState.tombstones),
+      );
+    } catch (err) {
+      this.log(
+        `Failed to write tombstones: ${err instanceof Error ? err.message : String(err)}`,
+      );
       this.emitEvent(this.buildErrorEvent('storage:error', err));
     }
 
@@ -1816,16 +1894,49 @@ export class ProfileTokenStorageProvider
   /**
    * Read the full operational state (synced + local-cached) for use
    * when building a TxfStorageDataBase on load.
+   *
+   * G4 — `tombstones` are read from BOTH the OrbitDB blob
+   * (`${addr}.tombstones`, replicated, survives cold-start) AND the
+   * local cache (`deriver.${addr}.all`, per-device). Both sources are
+   * merged via union by primary-key (`tokenId`+`stateHash`) so a device
+   * that has never written to OrbitDB yet still surfaces locally-known
+   * tombstones, while a freshly-imported wallet pulls the boundary from
+   * the synced source. Writes to OrbitDB happen in
+   * `writeOrbitOperationalStatePerEntry`.
    */
   private async readOperationalState(): Promise<OperationalState> {
-    const [orbit, local] = await Promise.all([
+    const addr = this.getAddressId();
+    const [orbit, local, orbitTombstones] = await Promise.all([
       this.readOrbitOperationalState(),
       this.readLocalDerivedCache(),
+      this.readProfileKeyJson<TxfTombstone[]>(`${addr}.tombstones`),
     ]);
+
+    // Merge OrbitDB-replicated tombstones with the local cache. Dedup
+    // by composite key `${tokenId}:${stateHash}` so a single physical
+    // tombstone observed from both sources does not double-count.
+    const tombstoneMap = new Map<string, TxfTombstone>();
+    for (const t of local.tombstones) {
+      tombstoneMap.set(`${t.tokenId}:${t.stateHash}`, t);
+    }
+    if (orbitTombstones !== null) {
+      for (const t of orbitTombstones) {
+        const k = `${t.tokenId}:${t.stateHash}`;
+        // Prefer the EARLIEST observed timestamp on a tie so cross-
+        // replica merges converge — every replica has a deterministic
+        // pick when the same tombstone is recorded with different
+        // wall-clock timestamps.
+        const prior = tombstoneMap.get(k);
+        if (prior === undefined || t.timestamp < prior.timestamp) {
+          tombstoneMap.set(k, t);
+        }
+      }
+    }
+    const mergedTombstones = Array.from(tombstoneMap.values());
 
     return {
       ...orbit,
-      tombstones: local.tombstones,
+      tombstones: mergedTombstones,
       sent: local.sent,
       history: local.history,
     };
@@ -1963,6 +2074,50 @@ export class ProfileTokenStorageProvider
   /**
    * Handle OrbitDB replication events.
    * Checks for new `tokens.bundle.*` keys and emits `storage:remote-updated`.
+   *
+   * Cross-device sync resilience (Fix 2): when new bundle CIDs appear,
+   * schedule a no-data flush so we anchor our OWN aggregator pointer
+   * to the merged state. Without this, if Device A originated a bundle
+   * and goes offline before Device B re-flushes, a future Device C
+   * joining via the aggregator pointer would only see A's CID — which
+   * is fine if A's bundle covered the full state, but loses anything
+   * B contributed via Nostr DMs (or any source the originator hadn't
+   * captured). The flush body short-circuits if the merged-state CAR
+   * matches a known anchor (idempotent).
+   *
+   * # Pointer monotonicity invariant (CRITICAL)
+   *
+   * The published pointer V_n MUST reference a CAR that contains every
+   * token reachable from V_n-1's CARs. Concretely: the CAR pinned by a
+   * no-data flush MUST cover the union of every active bundle in OrbitDB
+   * — otherwise Device C, joining via the aggregator pointer alone, would
+   * see only V_n's CAR and miss tokens that lived in V_n-1's bundles.
+   *
+   * That invariant relies on `lastLoadedData` reflecting the current
+   * bundle union when the flush body runs. Two events fire on every
+   * replication tick:
+   *   - `scheduleFlushNoData()` here (debounced ~ flushDebounceMs).
+   *   - `storage:remote-updated` event → PaymentsModule.sync → load()
+   *     (debounced 500ms, then load() awaits the in-flight flush).
+   *
+   * If the flush timer fires BEFORE load() refreshes `lastLoadedData`,
+   * the flush body builds its CAR from STALE merged state — silently
+   * dropping the newly-discovered remote bundle's tokens from V_n.
+   *
+   * Mode A fix #2: AWAIT a fresh `load()` here before scheduling the
+   * no-data flush. load() reads the active bundle index, fetches all
+   * CARs, merges, and writes the union into `lastLoadedData` — which is
+   * exactly the superset the flush body needs. With this in place the
+   * flush body's `lastLoadedData` snapshot is by-construction a superset
+   * of V_n-1's bundle union, eliminating the race at the source.
+   *
+   * Why fix #2 over fix #1 (defer-with-retry): the retry approach is
+   * brittle (the load could complete just as the flush fires; cap
+   * exhaustion drops the publish silently) and adds an unobservable
+   * timing dependency. Awaiting load() here is structurally clean,
+   * synchronously verifiable, and uses load()'s existing dedup machinery
+   * (it awaits an in-flight flush; the flush awaits the in-flight load
+   * via its debounce timer). No new state, no retry counters.
    */
   private async handleReplication(): Promise<void> {
     try {
@@ -1984,6 +2139,34 @@ export class ProfileTokenStorageProvider
           timestamp: Date.now(),
           data: { source: 'replication' },
         });
+
+        // Mode A fix #2: refresh `lastLoadedData` BEFORE scheduling the
+        // no-data flush. Without this await, the flush body could build
+        // its CAR from stale merged state and publish a pointer V_n
+        // whose CAR is NOT a superset of V_n-1's bundle union — silent
+        // token loss across cross-device sync.
+        //
+        // load() is idempotent and best-effort: a failure here is logged
+        // (the load() event surface emits storage:error on its own) and
+        // we still proceed to scheduleFlushNoData() so that — even if the
+        // load failed — the runtime invariant assertion in flushToIpfs()
+        // catches a stale snapshot before the publish goes through.
+        try {
+          await this.load();
+        } catch (err) {
+          this.log(
+            `handleReplication: pre-flush load failed (best-effort, ` +
+              `runtime assertion will guard): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+
+        // Anchor our own pointer at the merged state. The flush body
+        // computes the projected CID locally and short-circuits if it
+        // already matches a known anchor (lastDiscoveredPointerCid or
+        // an active OrbitDB bundle ref) — so a single-originator topology
+        // (Device A publishes, Device B silently merges) pays no extra
+        // IPFS pin or aggregator submit cost on the receiver side.
+        this.flushScheduler.scheduleFlushNoData();
       }
     } catch (err) {
       this.log(`Replication check failed: ${err instanceof Error ? err.message : String(err)}`);

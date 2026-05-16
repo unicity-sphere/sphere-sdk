@@ -108,9 +108,17 @@ describe.skipIf(SKIP_INFRA)('Profile Multi-Device Sync E2E', () => {
       }
 
       // Explicit sync flush — pushes CAR bundle to IPFS, updates
-      // OrbitDB OpLog with the latest bundle CID.
+      // OrbitDB OpLog with the latest bundle CID. sync() drains pending
+      // V5 finalizations internally before the flush so any token whose
+      // sdkData still carries `_pendingFinalization` (and would round-
+      // trip through tokenToTxf as null) is finalized first. Without
+      // this, `waitForAllCoins` exits as soon as balance > 0 (pending
+      // v5 counts toward balance) and a mid-finalization flush would
+      // publish a partial CAR — Device B's cold-start recovery then
+      // sees a partial inventory ("USDC missing" symptom). 60s drain
+      // budget matches the prior explicit drain.
       console.log('  Publishing state to Profile (IPFS CAR + OrbitDB)...');
-      const syncResult = await sphere.payments.sync();
+      const syncResult = await sphere.payments.sync({ drainTimeoutMs: 60_000 });
       console.log(`  Sync: added=${syncResult.added}, removed=${syncResult.removed}`);
 
       await sphere.destroy();

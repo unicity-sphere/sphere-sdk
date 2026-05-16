@@ -145,6 +145,27 @@ UNICITY_IPFS_NODES = [
 
 HTTPS is used by default. Override with `gateways` config for custom nodes.
 
+### `SPHERE_IPFS_GATEWAY` env override
+
+When set, `SPHERE_IPFS_GATEWAY` replaces the default gateway list for ALL
+downstream consumers — `DEFAULT_IPFS_GATEWAYS`, `NETWORKS[*].ipfsGateways`,
+`getIpfsGatewayUrls()`, and the deprecated `IpfsStorageProvider` constructor.
+Accepts a single URL or a comma-separated list:
+
+```bash
+# Single override (e.g. fall back to a public Kubo gateway during a
+# Unicity gateway outage — see issue #154):
+SPHERE_IPFS_GATEWAY=https://ipfs.io npm run test:e2e
+
+# Multiple gateways, tried in order:
+SPHERE_IPFS_GATEWAY="https://gw1.example.org,https://gw2.example.org" \
+  npm run test:e2e
+```
+
+The override is parsed once at module-init, so it must be exported BEFORE
+the SDK is imported (CI runners typically set it on the job env). It has
+no effect in the browser (constants.ts gates the read on `typeof process`).
+
 ## Reliability Features
 
 ### Multi-Tier Caching

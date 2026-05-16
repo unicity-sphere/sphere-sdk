@@ -443,6 +443,48 @@ describe('AccountingModule.getInvoiceStatus()', () => {
   });
 
   // -------------------------------------------------------------------------
+  // UT-STATUS-013b: regression — round-trip-deserialized terms with `dueDate:
+  // null` MUST NOT be treated as EXPIRED. canonicalSerialize normalizes
+  // undefined → null on the write side (so the JSON shape is stable), and
+  // the parser at AccountingModule._parseInvoiceTerms preserves null as the
+  // "no dueDate" sentinel. The state-derivation guard in balance-computer
+  // and the informational-expiry emitters in AccountingModule used to write
+  // `dueDate !== undefined && dueDate < Date.now()`, which is true for null
+  // (null !== undefined, and null < timestamp coerces null → 0). That meant
+  // every invoice created without a due date was reported as EXPIRED after a
+  // round-trip through token serialization — a bug not caught by the rest
+  // of this suite because the other tests construct InvoiceTerms in memory
+  // with `dueDate: undefined`, skipping the canonical form. The integration
+  // path (sphere-cli `invoice create` → `invoice status`) surfaced this.
+  // -------------------------------------------------------------------------
+  it('UT-STATUS-013b: returns OPEN (not EXPIRED) when dueDate is null (canonicalSerialize round-trip)', async () => {
+    const invoiceId = 'a7b8'.repeat(16);
+    // Build terms in the post-canonicalSerialize-roundtrip shape:
+    //   { ..., dueDate: null }
+    // The InvoiceTerms type declares dueDate as `number | undefined`, but the
+    // real read path (JSON.parse of the canonical form) produces null. The
+    // cast through `unknown` is the minimal annotation needed to match that
+    // wire reality without weakening the public type.
+    const terms = {
+      createdAt: Date.now() - 10000,
+      dueDate: null,
+      targets: [
+        {
+          address: DEFAULT_TEST_IDENTITY.directAddress!,
+          assets: [{ coin: ['UCT', '10000000'] }],
+        },
+      ],
+    } as unknown as InvoiceTerms;
+    seedInvoice(module, invoiceId, terms);
+
+    const status = await module.getInvoiceStatus(invoiceId);
+
+    // Before the fix this returned 'EXPIRED'. After the typeof === 'number'
+    // guard it correctly returns 'OPEN'.
+    expect(status.state).toBe('OPEN');
+  });
+
+  // -------------------------------------------------------------------------
   // UT-STATUS-014: EXPIRED does not prevent explicit close
   // -------------------------------------------------------------------------
   it('UT-STATUS-014: an EXPIRED invoice can still be explicitly closed', async () => {

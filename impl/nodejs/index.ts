@@ -81,9 +81,17 @@ export type NodeL1Config = L1Config;
 // Node.js Providers Configuration
 // =============================================================================
 
-/** Node.js IPFS sync configuration */
+/**
+ * Node.js IPFS sync configuration.
+ *
+ * @deprecated The IPNS-based mutable-pointer flow this config opts into
+ * is superseded by the Profile token-storage path (OrbitDB + aggregator
+ * pointer + IPFS CAR). See `createNodeProfileProviders` and the
+ * `IpfsStorageProvider` JSDoc. This config remains functional for
+ * backward compatibility.
+ */
 export interface NodeIpfsSyncConfig {
-  /** Enable IPFS sync (default: false) */
+  /** Enable IPFS sync (default: false). @deprecated — see {@link NodeIpfsSyncConfig}. */
   enabled?: boolean;
   /** IPFS storage provider configuration */
   config?: IpfsStorageConfig;
