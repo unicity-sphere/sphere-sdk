@@ -1241,6 +1241,26 @@ export class PaymentsModule {
   private ingestPool: IngestWorkerPool | null = null;
 
   /**
+   * Count of `handleIncomingTransfer` invocations currently in flight
+   * (incremented at entry, decremented in finally). Lets
+   * {@link drainPendingFinalizations} know there are receives mid-pipeline
+   * whose tokens have not yet reached `this.tokens` — so the pre-flush
+   * drain MUST wait for them.
+   *
+   * Why this exists: every inbound transfer (UXF v1, COMBINED_TRANSFER V6,
+   * INSTANT_SPLIT, Sphere `{transferTx, sourceToken}`, SDK `{token, proof}`,
+   * NOSTR-FIRST commitment-only) takes 100–500 ms of network/oracle work
+   * BEFORE the resulting Token is `addToken()`-ed into `this.tokens`. The
+   * legacy `hasUnconfirmed()` predicate scanned `this.tokens.values()`
+   * only; a flush triggered between event arrival and addToken would
+   * silently miss the in-flight token. Multi-coin faucet drops surfaced
+   * this as a "USDU dropped on cross-device recovery" symptom — the
+   * 7th coin's pipeline was still mid-finalization when sync()'s drain
+   * took the fast path and skipped.
+   */
+  private inflightReceiveCount = 0;
+
+  /**
    * Recipient-side legacy-shape adapter runner (T.7.B).
    *
    * Invoked by `handleIncomingTransfer` for every event whose payload
@@ -5679,13 +5699,36 @@ export class PaymentsModule {
   }> {
     const startTime = Date.now();
 
-    const hasUnconfirmed = (): boolean =>
+    // Drain race fix — must also wait for any inbound transfer pipelines
+    // that haven't yet reached `addToken` (their tokens are not in
+    // `this.tokens` yet, so the status scan below would miss them).
+    // See `inflightReceiveCount` doc for why.
+    const hasUnconfirmedOrInflight = (): boolean =>
+      this.inflightReceiveCount > 0 ||
       Array.from(this.tokens.values()).some(
         (t) => t.status === 'submitted' || t.status === 'pending',
       );
 
+    // Drain ingest worker pool first (UXF v1 path, defense in depth).
+    // The pool's queue may hold accepted-but-not-yet-processed bundles;
+    // waiting here serializes the drain against in-flight worker
+    // processing so the post-drain wallet snapshot includes their
+    // resulting tokens. Best-effort: any failure (timeout, pool not
+    // installed) falls through to the legacy in-flight wait below.
+    if (this.ingestPool) {
+      try {
+        await this.ingestPool.drainQueue(opts.timeoutMs);
+      } catch (err) {
+        logger.debug(
+          'Payments',
+          '[DRAIN] ingestPool.drainQueue threw or timed out (continuing):',
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }
+
     // Fast path: nothing to drain.
-    if (!hasUnconfirmed()) {
+    if (!hasUnconfirmedOrInflight()) {
       return { durationMs: 0, timedOut: false, skipped: true };
     }
 
@@ -5700,7 +5743,7 @@ export class PaymentsModule {
         'Payments',
         '[V5-RESOLVE] drainPendingFinalizations: oracle not wired (no stClient/trustBase) — skipping drain',
       );
-      return { durationMs: 0, timedOut: hasUnconfirmed(), skipped: true };
+      return { durationMs: 0, timedOut: hasUnconfirmedOrInflight(), skipped: true };
     }
 
     let finalization: UnconfirmedResolutionResult | undefined;
@@ -5710,7 +5753,7 @@ export class PaymentsModule {
       finalization = resolution;
       if (opts.onProgress) opts.onProgress(resolution);
 
-      if (!hasUnconfirmed()) break;
+      if (!hasUnconfirmedOrInflight()) break;
 
       await new Promise((r) => setTimeout(r, opts.pollIntervalMs));
       await this.load();
@@ -5719,7 +5762,7 @@ export class PaymentsModule {
     return {
       finalization,
       durationMs: Date.now() - startTime,
-      timedOut: hasUnconfirmed(),
+      timedOut: hasUnconfirmedOrInflight(),
       skipped: false,
     };
   }
@@ -11960,6 +12003,13 @@ export class PaymentsModule {
   }
 
   private async handleIncomingTransfer(transfer: IncomingTokenTransfer): Promise<void> {
+    // Drain race fix — count every in-flight receive so the pre-flush
+    // drain can wait for the async receive→addToken pipeline to settle
+    // before snapshotting the wallet. See `inflightReceiveCount` doc.
+    // try/finally ensures the counter balances on EVERY exit path
+    // (early-return, thrown error, awaited rejection).
+    this.inflightReceiveCount++;
+    try {
     // Ensure load() has completed so dedup checks see all persisted tokens.
     if (!this.loaded && this.loadedPromise) {
       await this.loadedPromise;
@@ -12405,6 +12455,13 @@ export class PaymentsModule {
       }
     } catch (error) {
       logger.error('Payments', 'Failed to process incoming transfer:', error);
+    }
+    } finally {
+      // Drain race fix — counterpart to the entry-side increment. Runs
+      // on every exit path (return, throw, normal completion). When
+      // this reaches 0, no inbound transfer is mid-pipeline and a
+      // pre-flush drain can safely snapshot `this.tokens`.
+      this.inflightReceiveCount--;
     }
   }
 

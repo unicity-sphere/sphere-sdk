@@ -545,6 +545,16 @@ export class IngestWorkerPool {
   private readonly wakers: Array<() => void> = [];
   /** Promises returned by each `runWorker()` invocation. */
   private readonly workerPromises: Promise<void>[] = [];
+  /**
+   * Number of bundles currently being processed (dequeued but worker
+   * has not yet released them). Used by {@link drainQueue} to wait
+   * for in-flight work to complete before the caller proceeds.
+   *
+   * Incremented immediately after `nextEntry()` returns a non-undefined
+   * entry; decremented in the worker's outer `finally`, which fires
+   * regardless of completion / timeout / thrown error.
+   */
+  private inflightProcessing = 0;
 
   private running = true;
   private destroyPromise: Promise<void> | null = null;
@@ -817,7 +827,49 @@ export class IngestWorkerPool {
   }
 
   // ===========================================================================
-  // 5.3 Diagnostic / test-only accessors
+  // 5.3 Public API — drainQueue
+  // ===========================================================================
+
+  /**
+   * Wait until all queued AND in-flight bundles have been fully processed.
+   *
+   * Resolves when `queue.length === 0 && inflightProcessing === 0`,
+   * i.e. no worker is currently holding an entry. Rejects with a
+   * `DRAIN_TIMEOUT` `SphereError` if the deadline elapses first.
+   *
+   * Intended caller: `PaymentsModule.drainPendingFinalizations` — so the
+   * pre-flush snapshot includes tokens whose receive pipeline (acquire
+   * → verify → processToken → addToken) was still in flight when sync()
+   * was invoked. Without this, a hostile / fast-arriving multi-bundle
+   * receive can race the drain and a flush will silently miss the
+   * still-in-flight tokens (the "USDU dropped on cross-device recovery"
+   * symptom in profile-multi-device-sync.test.ts).
+   *
+   * Does NOT change pool state — pure observer. Safe to call concurrently
+   * with `enqueue()`, `destroy()`, or other `drainQueue()` calls.
+   *
+   * @param timeoutMs Max wall-clock time before rejecting; default 30s.
+   * @param pollIntervalMs Idle poll interval; default 50ms.
+   */
+  async drainQueue(
+    timeoutMs: number = 30_000,
+    pollIntervalMs: number = 50,
+  ): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.queue.length > 0 || this.inflightProcessing > 0) {
+      if (Date.now() >= deadline) {
+        throw new SphereError(
+          `IngestWorkerPool.drainQueue: timeout after ${timeoutMs} ms ` +
+            `(queue=${this.queue.length}, inflight=${this.inflightProcessing})`,
+          'TIMEOUT',
+        );
+      }
+      await new Promise((r) => setTimeout(r, pollIntervalMs));
+    }
+  }
+
+  // ===========================================================================
+  // 5.4 Diagnostic / test-only accessors
   // ===========================================================================
 
   /** Current queue depth (test-only). NOT a synchronization primitive. */
@@ -852,6 +904,9 @@ export class IngestWorkerPool {
         // and the queue is empty. Exit cleanly.
         return;
       }
+      // Drain race fix — count this worker as in-flight for drainQueue()
+      // purposes. Decremented in the outer finally below.
+      this.inflightProcessing++;
       // Steelman warning fix — per-bundle wall-clock budget. Wrap
       // processBundle in a Promise.race against a setTimeout sentinel.
       // On timeout: emit operator alert, abort processBundle's signal,
@@ -909,6 +964,10 @@ export class IngestWorkerPool {
         // re-increments the per-token counter — the pair (decrement +
         // re-increment) nets to zero, preserving cap accounting.
         this.decrementPerTokenCounters(entry.claimedTokenIds);
+        // Drain race fix — counterpart to the post-dequeue increment.
+        // Worker is no longer holding this entry; drainQueue() can
+        // observe the completion.
+        this.inflightProcessing--;
       }
     }
   }
