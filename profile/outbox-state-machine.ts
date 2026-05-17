@@ -229,9 +229,27 @@ export const ALLOWED_TRANSITIONS: ReadonlyArray<AllowedTransition> = [
 
   // delivered → expired (retention window)
   { from: 'delivered', to: 'expired', condition: { kind: 'unconditional' } },
+  // delivered → sending (OUTBOX-SEND-FOLLOWUPS item #2 — retention re-publish)
+  //
+  // The NostrPersistenceVerifier observes that a previously-delivered
+  // bundle is no longer retained on the relay. To re-arm the
+  // SendingRecoveryWorker for a re-publish without inventing a new
+  // status, the verifier transitions the live OUTBOX entry back to
+  // `'sending'`. The original SENT-ledger entry remains the durable
+  // record of the historical delivery; the recipient's replay-LRU
+  // dedupes any extra publish by `bundleCid`.
+  { from: 'delivered', to: 'sending', condition: { kind: 'unconditional' } },
 
   // delivered-instant → finalizing (worker starts)
   { from: 'delivered-instant', to: 'finalizing', condition: { kind: 'unconditional' } },
+  // delivered-instant → sending (OUTBOX-SEND-FOLLOWUPS item #2 — retention re-publish)
+  //
+  // Symmetric to `delivered → sending`, applied when the verifier
+  // observes a retention drop on an instant-mode entry that has not
+  // yet finalized. The recovery worker republishes; on success the
+  // entry returns to `'delivered-instant'` and the finalization flow
+  // resumes from there.
+  { from: 'delivered-instant', to: 'sending', condition: { kind: 'unconditional' } },
 
   // finalizing → ...
   { from: 'finalizing', to: 'finalized', condition: { kind: 'unconditional' } },

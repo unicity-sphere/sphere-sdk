@@ -577,6 +577,8 @@ export type SphereEventType =
   | 'transfer:sent-reconciliation-recovered'
   | 'transfer:sent-reconciliation-failed'
   | 'transfer:retention-warning'
+  | 'transfer:retention-republish-rearmed'
+  | 'transfer:retention-republish-skipped'
   | 'payment_request:incoming'
   | 'payment_request:accepted'
   | 'payment_request:rejected'
@@ -1199,6 +1201,70 @@ export interface SphereEventMap {
     readonly bundleCid: string;
     readonly tokenIds: ReadonlyArray<string>;
     readonly recipientTransportPubkey: string;
+    readonly detectedAt: number;
+  };
+  /**
+   * OUTBOX-SEND-FOLLOWUPS item #2 — emitted by `NostrPersistenceVerifier`
+   * when a retention-drop ('missing' outcome) was successfully turned
+   * into a re-publish attempt: the live OUTBOX entry at `sentId`
+   * transitioned `delivered`/`delivered-instant` → `sending`, and the
+   * SendingRecoveryWorker will pick it up on its next cycle.
+   *
+   * Recipient idempotency: the replay-LRU dedupes by `bundleCid`, so
+   * an extra publish in the racing window is harmless (§6.3 / T.3.A).
+   *
+   * Operator semantics: this is informational. The retention-warning
+   * event has already fired for the same `sentId`; this is the "we're
+   * trying to recover" companion.
+   */
+  'transfer:retention-republish-rearmed': {
+    readonly sentId: string;
+    readonly nostrEventId: string;
+    readonly bundleCid: string;
+    readonly tokenIds: ReadonlyArray<string>;
+    readonly recipientTransportPubkey: string;
+    /** Status the OUTBOX entry held when we transitioned it back. */
+    readonly fromStatus: 'delivered' | 'delivered-instant';
+    /** Always `'sending'` today — kept explicit for forward-compat. */
+    readonly toStatus: 'sending';
+    readonly rearmedAt: number;
+  };
+  /**
+   * OUTBOX-SEND-FOLLOWUPS item #2 — emitted by `NostrPersistenceVerifier`
+   * when the retention-driven re-publish could NOT be initiated. The
+   * verifier emits `transfer:retention-warning` first for operator
+   * visibility; this companion event explains WHY no re-publish will
+   * happen, so a downstream consumer can route to a different recovery
+   * surface or escalate.
+   *
+   * `reason` values:
+   *  - `'no-outbox-writer'` — feature wired but no OutboxWriter is
+   *    currently installed (e.g. legacy wallet).
+   *  - `'entry-tombstoned-or-missing'` — the SENT-ledger id has no
+   *    live OUTBOX counterpart. Most common in conservative-mode
+   *    wallets where successful SENT writes tombstone the OUTBOX
+   *    entry; bundle bytes are not retained, so this code path cannot
+   *    reconstruct. Requires the bundle-retention work tracked as the
+   *    cross-cutting "Re-publish from where?" item in OUTBOX-SEND-
+   *    FOLLOWUPS.
+   *  - `'wrong-status'` — the OUTBOX entry exists but is NOT at
+   *    `delivered`/`delivered-instant` (e.g. already in `'finalizing'`,
+   *    `'expired'`, or post-cancellation). Out of scope for retention
+   *    re-publish; another recovery path owns this case.
+   *  - `'transition-failed'` — the state-machine transition itself
+   *    rejected the update (e.g. terminal-state validator) or threw.
+   */
+  'transfer:retention-republish-skipped': {
+    readonly sentId: string;
+    readonly nostrEventId: string;
+    readonly bundleCid: string;
+    readonly reason:
+      | 'no-outbox-writer'
+      | 'entry-tombstoned-or-missing'
+      | 'wrong-status'
+      | 'transition-failed';
+    readonly observedStatus?: string;
+    readonly errorMessage?: string;
     readonly detectedAt: number;
   };
   'payment_request:incoming': IncomingPaymentRequest;

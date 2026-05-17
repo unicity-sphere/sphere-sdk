@@ -21,12 +21,16 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import {
   NostrPersistenceVerifier,
   type NostrPersistenceVerifierDeps,
+  type OutboxWriterProvider,
   type VerifyOutcome,
   type VerifySentEntryFn,
 } from '../../../../modules/payments/transfer/nostr-persistence-verifier';
+import type { OutboxWriter } from '../../../../profile/outbox-writer';
 import type { SentLedgerWriter } from '../../../../profile/sent-ledger-writer';
 import type { SphereEventMap, SphereEventType } from '../../../../types';
 import type { UxfSentLedgerEntry } from '../../../../types/uxf-sent';
+import type { UxfTransferOutboxEntry } from '../../../../types/uxf-outbox';
+import { SphereError } from '../../../../core/errors';
 
 // =============================================================================
 // 1. Fixtures
@@ -103,13 +107,84 @@ function makeDeps(args: {
   readonly verify: VerifySentEntryFn;
   readonly nowMs?: number;
   readonly emit?: NostrPersistenceVerifierDeps['emit'];
+  readonly outboxProvider?: OutboxWriterProvider;
 }): NostrPersistenceVerifierDeps {
-  return {
+  const deps: NostrPersistenceVerifierDeps = {
     sentProvider: () => (args.sentFixture === null ? null : args.sentFixture.sent),
     verify: args.verify,
     emit: args.emit ?? ((): void => undefined),
     logger: { warn: () => undefined, info: () => undefined },
     now: args.nowMs !== undefined ? (): number => args.nowMs! : Date.now,
+    ...(args.outboxProvider !== undefined
+      ? { outboxProvider: args.outboxProvider }
+      : {}),
+  };
+  return deps;
+}
+
+// ---------------------------------------------------------------------------
+// OUTBOX-SEND-FOLLOWUPS item #2 — OUTBOX fixture (minimal `update`-only impl)
+// ---------------------------------------------------------------------------
+
+interface FakeOutbox {
+  readonly writer: Pick<OutboxWriter, 'update'>;
+  readonly entries: Map<string, UxfTransferOutboxEntry>;
+}
+
+function makeFakeOutbox(
+  initial: ReadonlyArray<UxfTransferOutboxEntry> = [],
+): FakeOutbox {
+  const entries = new Map<string, UxfTransferOutboxEntry>();
+  for (const e of initial) entries.set(e.id, e);
+  return {
+    entries,
+    writer: {
+      async update(
+        id: string,
+        mutator: (prev: UxfTransferOutboxEntry) => UxfTransferOutboxEntry,
+      ): Promise<UxfTransferOutboxEntry> {
+        const prev = entries.get(id);
+        if (prev === undefined) {
+          throw new SphereError(
+            `FakeOutbox.update: no entry at id "${id}"`,
+            'OUTBOX_ENTRY_NOT_FOUND',
+          );
+        }
+        const next = mutator(prev);
+        // Defense-in-depth: a state-machine validator would normally
+        // gate the transition. The verifier's update mutator may throw
+        // on the wrong-status branch; reproduce that here by letting
+        // the mutator's throw propagate (the suite drives both arms).
+        const stamped: UxfTransferOutboxEntry = {
+          ...next,
+          lamport: prev.lamport + 1,
+        };
+        entries.set(id, stamped);
+        return stamped;
+      },
+    },
+  };
+}
+
+function makeOutboxEntry(
+  overrides: Partial<UxfTransferOutboxEntry> = {},
+): UxfTransferOutboxEntry {
+  return {
+    _schemaVersion: 'uxf-1',
+    id: overrides.id ?? 'sent-1',
+    bundleCid: 'bafy-bundle',
+    tokenIds: ['token-1'],
+    deliveryMethod: 'cid-over-nostr',
+    recipient: '@bob',
+    recipientTransportPubkey: 'recipient-pk',
+    mode: 'conservative',
+    status: 'delivered',
+    submitRetryCount: 0,
+    proofErrorCount: 0,
+    createdAt: 1_700_000_000_000,
+    updatedAt: 1_700_000_000_000,
+    lamport: 5,
+    ...overrides,
   };
 }
 
@@ -487,6 +562,327 @@ describe('NostrPersistenceVerifier (Issue #166 P2 #3)', () => {
     await stopP;
     expect(stopped).toBe(true);
     expect(worker.isRunning()).toBe(false);
+  });
+});
+
+// =============================================================================
+// 2b. Retention re-publish (OUTBOX-SEND-FOLLOWUPS item #2)
+// =============================================================================
+//
+// On 'missing', the verifier emits `transfer:retention-warning` (covered
+// above) AND, when an outboxProvider is wired, attempts to transition
+// the matching OUTBOX entry `delivered`/`delivered-instant` → `sending`
+// so the SendingRecoveryWorker republishes via its existing scan loop.
+//
+// Four skip branches MUST emit `transfer:retention-republish-skipped`
+// with the right reason; the success branch emits
+// `transfer:retention-republish-rearmed`.
+
+describe('NostrPersistenceVerifier — retention re-publish (OUTBOX-SEND-FOLLOWUPS item #2)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("on 'missing' with no outboxProvider → emits skipped with reason 'no-outbox-writer'", async () => {
+    const entry = makeSentEntry({ id: 's-1' });
+    const sentFixture = makeFakeSent([entry]);
+    const verify = vi.fn<VerifySentEntryFn>().mockResolvedValue('missing');
+    const recorder = makeEventRecorder();
+    const worker = new NostrPersistenceVerifier(
+      makeDeps({
+        sentFixture,
+        verify,
+        nowMs: entry.sentAt + 10 * 60 * 1000,
+        emit: recorder.emit,
+        // No outboxProvider — preserves Phase-1 detect-only.
+      }),
+    );
+
+    await worker.runScanCycle();
+
+    const skipped = recorder.events.filter(
+      (e) => e.type === 'transfer:retention-republish-skipped',
+    );
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0].data).toMatchObject({
+      sentId: 's-1',
+      reason: 'no-outbox-writer',
+    });
+    // Warning still fires.
+    expect(
+      recorder.events.filter((e) => e.type === 'transfer:retention-warning'),
+    ).toHaveLength(1);
+    // No rearmed event.
+    expect(
+      recorder.events.filter(
+        (e) => e.type === 'transfer:retention-republish-rearmed',
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("outboxProvider returns null → skipped with 'no-outbox-writer'", async () => {
+    const entry = makeSentEntry({ id: 's-null' });
+    const sentFixture = makeFakeSent([entry]);
+    const verify = vi.fn<VerifySentEntryFn>().mockResolvedValue('missing');
+    const recorder = makeEventRecorder();
+    const worker = new NostrPersistenceVerifier(
+      makeDeps({
+        sentFixture,
+        verify,
+        nowMs: entry.sentAt + 10 * 60 * 1000,
+        emit: recorder.emit,
+        outboxProvider: () => null,
+      }),
+    );
+
+    await worker.runScanCycle();
+
+    const skipped = recorder.events.filter(
+      (e) => e.type === 'transfer:retention-republish-skipped',
+    );
+    expect(skipped).toHaveLength(1);
+    expect((skipped[0].data as { reason: string }).reason).toBe(
+      'no-outbox-writer',
+    );
+  });
+
+  it("live 'delivered' entry → transitions to 'sending', emits rearmed", async () => {
+    const entry = makeSentEntry({
+      id: 's-live-delivered',
+      bundleCid: 'bafy-live-delivered',
+      tokenIds: ['t-x'],
+    });
+    const sentFixture = makeFakeSent([entry]);
+    const outbox = makeFakeOutbox([
+      makeOutboxEntry({ id: 's-live-delivered', status: 'delivered' }),
+    ]);
+    const verify = vi.fn<VerifySentEntryFn>().mockResolvedValue('missing');
+    const recorder = makeEventRecorder();
+    const worker = new NostrPersistenceVerifier(
+      makeDeps({
+        sentFixture,
+        verify,
+        nowMs: entry.sentAt + 10 * 60 * 1000,
+        emit: recorder.emit,
+        outboxProvider: () => outbox.writer,
+      }),
+    );
+
+    await worker.runScanCycle();
+
+    // OUTBOX entry was transitioned to 'sending'.
+    expect(outbox.entries.get('s-live-delivered')?.status).toBe('sending');
+
+    const rearmed = recorder.events.filter(
+      (e) => e.type === 'transfer:retention-republish-rearmed',
+    );
+    expect(rearmed).toHaveLength(1);
+    expect(rearmed[0].data).toMatchObject({
+      sentId: 's-live-delivered',
+      bundleCid: 'bafy-live-delivered',
+      fromStatus: 'delivered',
+      toStatus: 'sending',
+    });
+    // No 'skipped' event for the success path.
+    expect(
+      recorder.events.filter(
+        (e) => e.type === 'transfer:retention-republish-skipped',
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("live 'delivered-instant' entry → transitions to 'sending', emits rearmed with fromStatus='delivered-instant'", async () => {
+    const entry = makeSentEntry({ id: 's-live-instant', mode: 'instant' });
+    const sentFixture = makeFakeSent([entry]);
+    const outbox = makeFakeOutbox([
+      makeOutboxEntry({
+        id: 's-live-instant',
+        status: 'delivered-instant',
+        mode: 'instant',
+      }),
+    ]);
+    const verify = vi.fn<VerifySentEntryFn>().mockResolvedValue('missing');
+    const recorder = makeEventRecorder();
+    const worker = new NostrPersistenceVerifier(
+      makeDeps({
+        sentFixture,
+        verify,
+        nowMs: entry.sentAt + 10 * 60 * 1000,
+        emit: recorder.emit,
+        outboxProvider: () => outbox.writer,
+      }),
+    );
+
+    await worker.runScanCycle();
+
+    expect(outbox.entries.get('s-live-instant')?.status).toBe('sending');
+    const rearmed = recorder.events.filter(
+      (e) => e.type === 'transfer:retention-republish-rearmed',
+    );
+    expect(rearmed).toHaveLength(1);
+    expect((rearmed[0].data as { fromStatus: string }).fromStatus).toBe(
+      'delivered-instant',
+    );
+  });
+
+  it("OUTBOX entry missing/tombstoned → skipped with 'entry-tombstoned-or-missing'", async () => {
+    const entry = makeSentEntry({ id: 's-tombstoned' });
+    const sentFixture = makeFakeSent([entry]);
+    // No matching outbox entry → update() throws OUTBOX_ENTRY_NOT_FOUND.
+    const outbox = makeFakeOutbox([]);
+    const verify = vi.fn<VerifySentEntryFn>().mockResolvedValue('missing');
+    const recorder = makeEventRecorder();
+    const worker = new NostrPersistenceVerifier(
+      makeDeps({
+        sentFixture,
+        verify,
+        nowMs: entry.sentAt + 10 * 60 * 1000,
+        emit: recorder.emit,
+        outboxProvider: () => outbox.writer,
+      }),
+    );
+
+    await worker.runScanCycle();
+
+    const skipped = recorder.events.filter(
+      (e) => e.type === 'transfer:retention-republish-skipped',
+    );
+    expect(skipped).toHaveLength(1);
+    expect((skipped[0].data as { reason: string }).reason).toBe(
+      'entry-tombstoned-or-missing',
+    );
+  });
+
+  it("OUTBOX entry at wrong status (e.g. 'finalizing') → skipped with 'wrong-status'", async () => {
+    const entry = makeSentEntry({ id: 's-finalizing' });
+    const sentFixture = makeFakeSent([entry]);
+    const outbox = makeFakeOutbox([
+      makeOutboxEntry({ id: 's-finalizing', status: 'finalizing' }),
+    ]);
+    const verify = vi.fn<VerifySentEntryFn>().mockResolvedValue('missing');
+    const recorder = makeEventRecorder();
+    const worker = new NostrPersistenceVerifier(
+      makeDeps({
+        sentFixture,
+        verify,
+        nowMs: entry.sentAt + 10 * 60 * 1000,
+        emit: recorder.emit,
+        outboxProvider: () => outbox.writer,
+      }),
+    );
+
+    await worker.runScanCycle();
+
+    // The OUTBOX entry was NOT mutated by the verifier (the mutator
+    // threw before the writer could persist the change).
+    expect(outbox.entries.get('s-finalizing')?.status).toBe('finalizing');
+
+    const skipped = recorder.events.filter(
+      (e) => e.type === 'transfer:retention-republish-skipped',
+    );
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0].data).toMatchObject({
+      reason: 'wrong-status',
+      observedStatus: 'finalizing',
+    });
+  });
+
+  it("OUTBOX_ENTRY_TOMBSTONED is also recognised as 'entry-tombstoned-or-missing'", async () => {
+    const entry = makeSentEntry({ id: 's-tomb-explicit' });
+    const sentFixture = makeFakeSent([entry]);
+    // Custom outbox that throws OUTBOX_ENTRY_TOMBSTONED.
+    const outboxWriter: Pick<OutboxWriter, 'update'> = {
+      async update(): Promise<UxfTransferOutboxEntry> {
+        throw new SphereError(
+          'OutboxWriter.write: refusing to resurrect tombstoned slot "s-tomb-explicit"',
+          'OUTBOX_ENTRY_TOMBSTONED',
+        );
+      },
+    };
+    const verify = vi.fn<VerifySentEntryFn>().mockResolvedValue('missing');
+    const recorder = makeEventRecorder();
+    const worker = new NostrPersistenceVerifier(
+      makeDeps({
+        sentFixture,
+        verify,
+        nowMs: entry.sentAt + 10 * 60 * 1000,
+        emit: recorder.emit,
+        outboxProvider: () => outboxWriter,
+      }),
+    );
+
+    await worker.runScanCycle();
+
+    const skipped = recorder.events.filter(
+      (e) => e.type === 'transfer:retention-republish-skipped',
+    );
+    expect(skipped).toHaveLength(1);
+    expect((skipped[0].data as { reason: string }).reason).toBe(
+      'entry-tombstoned-or-missing',
+    );
+  });
+
+  it("update() throws an unrelated error → skipped with 'transition-failed'", async () => {
+    const entry = makeSentEntry({ id: 's-flaky' });
+    const sentFixture = makeFakeSent([entry]);
+    const outboxWriter: Pick<OutboxWriter, 'update'> = {
+      async update(): Promise<UxfTransferOutboxEntry> {
+        throw new Error('orbitdb flake');
+      },
+    };
+    const verify = vi.fn<VerifySentEntryFn>().mockResolvedValue('missing');
+    const recorder = makeEventRecorder();
+    const worker = new NostrPersistenceVerifier(
+      makeDeps({
+        sentFixture,
+        verify,
+        nowMs: entry.sentAt + 10 * 60 * 1000,
+        emit: recorder.emit,
+        outboxProvider: () => outboxWriter,
+      }),
+    );
+
+    await worker.runScanCycle();
+
+    const skipped = recorder.events.filter(
+      (e) => e.type === 'transfer:retention-republish-skipped',
+    );
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0].data).toMatchObject({
+      reason: 'transition-failed',
+      errorMessage: 'orbitdb flake',
+    });
+  });
+
+  it("'retained' outcome → no rearm attempt, no skipped event", async () => {
+    const entry = makeSentEntry({ id: 's-retained' });
+    const sentFixture = makeFakeSent([entry]);
+    const outbox = makeFakeOutbox([
+      makeOutboxEntry({ id: 's-retained', status: 'delivered' }),
+    ]);
+    const verify = vi.fn<VerifySentEntryFn>().mockResolvedValue('retained');
+    const recorder = makeEventRecorder();
+    const worker = new NostrPersistenceVerifier(
+      makeDeps({
+        sentFixture,
+        verify,
+        nowMs: entry.sentAt + 10 * 60 * 1000,
+        emit: recorder.emit,
+        outboxProvider: () => outbox.writer,
+      }),
+    );
+
+    await worker.runScanCycle();
+
+    expect(outbox.entries.get('s-retained')?.status).toBe('delivered');
+    expect(
+      recorder.events.filter((e) =>
+        e.type.startsWith('transfer:retention-republish'),
+      ),
+    ).toHaveLength(0);
   });
 });
 

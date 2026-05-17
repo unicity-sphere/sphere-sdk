@@ -28,12 +28,36 @@
  *      query failure must not produce false `retention-warning`
  *      events.
  *
+ * **What this worker does conditionally (OUTBOX-SEND-FOLLOWUPS item #2):**
+ *   - When an `outboxProvider` is wired AND the SENT entry's
+ *     companion OUTBOX entry is STILL LIVE at status
+ *     `'delivered'`/`'delivered-instant'`, the verifier transitions
+ *     that OUTBOX entry back to `'sending'` so the
+ *     `SendingRecoveryWorker` picks it up and republishes. The
+ *     ORIGINAL SENT entry is untouched (durable historical record).
+ *     The recipient's replay-LRU dedupes by `bundleCid` so multiple
+ *     publishes are harmless (§6.3 / T.3.A).
+ *   - The `delivered → sending` and `delivered-instant → sending`
+ *     state-machine arcs were added for exactly this purpose; see
+ *     `profile/outbox-state-machine.ts`.
+ *   - Emits `transfer:retention-republish-rearmed` on success or
+ *     `transfer:retention-republish-skipped` (with a `reason`) when
+ *     a re-publish cannot be initiated. The legacy
+ *     `transfer:retention-warning` still fires regardless.
+ *
  * **What this worker deliberately does NOT do (Phase 1):**
- *   - Does not re-publish missing events. Re-publication requires
- *     preserving the bundle payload, recipient identity binding, and
- *     handling key rotation since the original publish — a large
- *     surface gated to a follow-up wave. Operator triage on detection
- *     is the safer first step.
+ *   - Does not re-publish for entries whose OUTBOX counterpart is
+ *     tombstoned/missing. Conservative-mode wallets tombstone the
+ *     OUTBOX on successful SENT-write; the inline CAR bytes are not
+ *     retained anywhere. Reconstructing the publish would require the
+ *     "bundle retention" architectural work tracked in OUTBOX-SEND-
+ *     FOLLOWUPS cross-cutting concerns. For now we emit
+ *     `transfer:retention-republish-skipped` with
+ *     `reason='entry-tombstoned-or-missing'` so operators see the case.
+ *   - Does not re-resolve the recipient pubkey. If the recipient has
+ *     rotated keys since the original publish, the re-publish fails
+ *     silently at the transport layer. Documented surface concern;
+ *     out of scope for this PR.
  *   - Does not touch entries lacking `nostrEventId` (pre-#166 SENT
  *     entries, or paths that haven't wired the dispatcher capture).
  *     Without an event id there is nothing to query.
@@ -60,7 +84,9 @@
 import type { SphereEventMap, SphereEventType } from '../../../types';
 import type { UxfSentLedgerEntry } from '../../../types/uxf-sent';
 import type { SentLedgerWriter } from '../../../profile/sent-ledger-writer';
-import { redactCause } from '../../../core/errors';
+import type { OutboxWriter } from '../../../profile/outbox-writer';
+import type { UxfTransferOutboxEntry } from '../../../types/uxf-outbox';
+import { redactCause, SphereError } from '../../../core/errors';
 
 // =============================================================================
 // 1. Public types — dependency surface + options
@@ -100,6 +126,21 @@ export type SentLedgerWriterProvider = () => Pick<
 > | null;
 
 /**
+ * OUTBOX-SEND-FOLLOWUPS item #2 — provider of the currently-installed
+ * {@link OutboxWriter}. Optional: when omitted, the verifier preserves
+ * its Phase-1 detect-only contract (warning event only, no re-publish
+ * attempt). When wired, the verifier transitions live OUTBOX entries
+ * back to `'sending'` on `'missing'` outcomes.
+ *
+ * Threaded as a closure (same rationale as
+ * {@link SentLedgerWriterProvider}).
+ */
+export type OutboxWriterProvider = () => Pick<
+  OutboxWriter,
+  'update'
+> | null;
+
+/**
  * Logger surface — narrow on purpose so any caller-supplied logger
  * plugs in cleanly. Mirrors the other workers' Logger types.
  */
@@ -114,6 +155,13 @@ export interface NostrPersistenceVerifierLogger {
 export interface NostrPersistenceVerifierDeps {
   /** SENT writer provider — see {@link SentLedgerWriterProvider}. */
   readonly sentProvider: SentLedgerWriterProvider;
+  /**
+   * OUTBOX-SEND-FOLLOWUPS item #2 — OUTBOX writer provider. Optional;
+   * when undefined the verifier reverts to detect-only behaviour and
+   * emits `transfer:retention-republish-skipped` with
+   * `reason='no-outbox-writer'` for every `'missing'` outcome.
+   */
+  readonly outboxProvider?: OutboxWriterProvider;
   /** Verify closure — see {@link VerifySentEntryFn}. */
   readonly verify: VerifySentEntryFn;
   /**
@@ -330,10 +378,173 @@ export class NostrPersistenceVerifier {
     if (outcome === 'missing') {
       this.checkedIds.add(entry.id);
       await this.emitRetentionWarning(entry);
+      // OUTBOX-SEND-FOLLOWUPS item #2 — opportunistic re-publish.
+      // Fires regardless of whether the warning emit raised (the
+      // warning's catch absorbed it). The re-publish attempt is best-
+      // effort: it emits its own `rearmed` / `skipped` event for
+      // operator visibility and never throws.
+      await this.attemptRetentionRepublish(entry);
       return 'missing';
     }
     // unverifiable — do NOT add to checkedIds (retry next cycle).
     return 'unverifiable';
+  }
+
+  /**
+   * OUTBOX-SEND-FOLLOWUPS item #2 — opportunistic retention re-publish.
+   *
+   * Tries to flip the OUTBOX entry at `entry.id` from `'delivered'` or
+   * `'delivered-instant'` back to `'sending'` so the
+   * SendingRecoveryWorker republishes via its existing scan-and-
+   * publish loop. The original SENT entry is left untouched (durable
+   * historical record); the recipient's replay-LRU dedupes by
+   * `bundleCid` so racing/duplicate publishes are harmless (§6.3 /
+   * T.3.A).
+   *
+   * Never throws. Each failure / skip path emits
+   * `transfer:retention-republish-skipped` with a structured reason
+   * for operator visibility; success emits
+   * `transfer:retention-republish-rearmed`. Catches any emit failure
+   * defensively — the warn-log preserves the forensic context.
+   */
+  private async attemptRetentionRepublish(
+    entry: UxfSentLedgerEntry,
+  ): Promise<void> {
+    if (typeof entry.nostrEventId !== 'string') return;
+
+    if (this.deps.outboxProvider === undefined) {
+      await this.emitRepublishSkipped(entry, 'no-outbox-writer');
+      return;
+    }
+    const writer = this.deps.outboxProvider();
+    if (writer === null) {
+      await this.emitRepublishSkipped(entry, 'no-outbox-writer');
+      return;
+    }
+
+    // The OUTBOX writer's `update()` reads the live entry, applies a
+    // mutator, and writes with state-machine validation. If the slot
+    // has been tombstoned (conservative-mode successful send) OR was
+    // never present (corrupted SENT id), `update()` throws
+    // `OUTBOX_ENTRY_NOT_FOUND`. If the entry exists but holds a non-
+    // `delivered{,-instant}` status (already advanced to `'finalizing'`,
+    // `'expired'`, etc.), the state-machine validator throws
+    // `INVALID_OUTBOX_TRANSITION` — we treat that as `'wrong-status'`.
+    let observedStatus: UxfTransferOutboxEntry['status'] | null = null;
+    let updated: UxfTransferOutboxEntry | null = null;
+    try {
+      updated = await writer.update(entry.id, (prev) => {
+        observedStatus = prev.status;
+        if (prev.status !== 'delivered' && prev.status !== 'delivered-instant') {
+          // Signal the wrong-status case to the catch via a tagged
+          // error; we don't issue a self-loop write because the
+          // validator would reject the no-op anyway.
+          throw new SphereError(
+            `NostrPersistenceVerifier: cannot re-arm retention re-publish — ` +
+              `outbox entry "${entry.id}" is at status="${prev.status}", expected ` +
+              `"delivered" or "delivered-instant"`,
+            'VALIDATION_ERROR',
+          );
+        }
+        return { ...prev, status: 'sending' };
+      });
+    } catch (err) {
+      const message = errMessage(err);
+      // Distinguish the three skip reasons by SphereError code when
+      // possible. Order matters: check OUTBOX_ENTRY_NOT_FOUND /
+      // OUTBOX_ENTRY_TOMBSTONED before the wrong-status branch.
+      const code =
+        err instanceof SphereError ? err.code : undefined;
+      if (
+        code === 'OUTBOX_ENTRY_NOT_FOUND' ||
+        code === 'OUTBOX_ENTRY_TOMBSTONED'
+      ) {
+        await this.emitRepublishSkipped(
+          entry,
+          'entry-tombstoned-or-missing',
+          { errorMessage: message },
+        );
+        return;
+      }
+      if (observedStatus !== null) {
+        await this.emitRepublishSkipped(entry, 'wrong-status', {
+          observedStatus: String(observedStatus),
+          errorMessage: message,
+        });
+        return;
+      }
+      await this.emitRepublishSkipped(entry, 'transition-failed', {
+        errorMessage: message,
+      });
+      return;
+    }
+
+    // Updated entry now at 'sending'. Pull the original status from
+    // the closure variable observed inside the mutator — that reflects
+    // the pre-transition state, not the just-written one.
+    const fromStatus: 'delivered' | 'delivered-instant' =
+      observedStatus === 'delivered-instant'
+        ? 'delivered-instant'
+        : 'delivered';
+    try {
+      await this.deps.emit('transfer:retention-republish-rearmed', {
+        sentId: entry.id,
+        nostrEventId: entry.nostrEventId,
+        bundleCid: entry.bundleCid,
+        tokenIds: entry.tokenIds,
+        recipientTransportPubkey: entry.recipientTransportPubkey,
+        fromStatus,
+        toStatus: 'sending',
+        rearmedAt: this.now(),
+      });
+    } catch (emitErr) {
+      this.warn('emit transfer:retention-republish-rearmed failed', {
+        sentId: entry.id,
+        err: errMessage(emitErr),
+      });
+    }
+    // Touch the updated reference so TypeScript doesn't strip it.
+    if (updated !== null) {
+      this.warn('retention re-publish armed', {
+        sentId: entry.id,
+        bundleCid: entry.bundleCid,
+        fromStatus,
+        newLamport: updated.lamport,
+      });
+    }
+  }
+
+  private async emitRepublishSkipped(
+    entry: UxfSentLedgerEntry,
+    reason:
+      | 'no-outbox-writer'
+      | 'entry-tombstoned-or-missing'
+      | 'wrong-status'
+      | 'transition-failed',
+    extras: { readonly observedStatus?: string; readonly errorMessage?: string } = {},
+  ): Promise<void> {
+    if (typeof entry.nostrEventId !== 'string') return;
+    try {
+      await this.deps.emit('transfer:retention-republish-skipped', {
+        sentId: entry.id,
+        nostrEventId: entry.nostrEventId,
+        bundleCid: entry.bundleCid,
+        reason,
+        ...(extras.observedStatus !== undefined
+          ? { observedStatus: extras.observedStatus }
+          : {}),
+        ...(extras.errorMessage !== undefined
+          ? { errorMessage: extras.errorMessage }
+          : {}),
+        detectedAt: this.now(),
+      });
+    } catch (emitErr) {
+      this.warn('emit transfer:retention-republish-skipped failed', {
+        sentId: entry.id,
+        reason,
+        err: errMessage(emitErr),
+      });
+    }
   }
 
   private async emitRetentionWarning(entry: UxfSentLedgerEntry): Promise<void> {

@@ -1975,6 +1975,14 @@ export class PaymentsModule {
       const verifierDeps: NostrPersistenceVerifierDeps = {
         sentProvider: (): Pick<SentLedgerWriter, 'readAll'> | null =>
           this._sentLedgerWriter,
+        // OUTBOX-SEND-FOLLOWUPS item #2 — thread the OUTBOX writer so
+        // the verifier can transition live `delivered`/`delivered-
+        // instant` entries back to `'sending'` on retention drops.
+        // The SendingRecoveryWorker then republishes via its existing
+        // scan loop (item #6's deliveryMethod-aware closure handles
+        // CAR/TXF entries safely).
+        outboxProvider: (): Pick<OutboxWriter, 'update'> | null =>
+          this._outboxWriter,
         verify: async (entry: UxfSentLedgerEntry): Promise<VerifyOutcome> => {
           if (
             typeof entry.nostrEventId !== 'string' ||
