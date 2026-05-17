@@ -90,6 +90,21 @@ export interface OrphanSweeperDeps {
     type: T,
     data: SphereEventMap[T],
   ) => void;
+  /**
+   * Steelman item 2 — count of send dispatchers currently in flight.
+   * When `> 0`, the sweep self-skips: a token is legitimately in
+   * `'transferring'` status WITHOUT yet appearing in OUTBOX during
+   * the window between `selectSources` marking it and the
+   * orchestrator's `outbox.create` call (which only fires after
+   * `commitSources` returns — that can take seconds).
+   *
+   * Defaults to `0` (no in-flight gate, original Phase 1 behavior).
+   * The PaymentsModule wrapper threads its
+   * `_dispatcherInFlightCount` field here so the public
+   * `detectOrphanSpendingTokens()` API is race-safe against
+   * concurrent sends.
+   */
+  readonly dispatcherInFlightCount?: number;
 }
 
 // =============================================================================
@@ -112,11 +127,13 @@ export interface OrphanSweeperDeps {
  * identical findings. The function does NOT mutate any persistent
  * state — it only detects and emits.
  *
- * **Concurrency:** safe to invoke concurrently with sends. The union
- * set is a snapshot at scan time; a token that transitions OUT of
- * `'transferring'` between scan and emit produces a benign stale-but-
- * structurally-valid event. Operators triaging are expected to verify
- * by re-checking current state.
+ * **Concurrency:** safe to invoke concurrently with sends ONLY when
+ * the caller supplies a correct `dispatcherInFlightCount`. The sweep
+ * self-skips when that count is non-zero (steelman item 2). Without
+ * the gate, the sweep would race against in-flight sends and emit
+ * false-positive orphan events for tokens that are legitimately
+ * `'transferring'` but have not yet reached the orchestrator's
+ * `outbox.create` write.
  *
  * @param deps  See {@link OrphanSweeperDeps}.
  * @returns A {@link OrphanSweepResult} summary.
@@ -125,6 +142,23 @@ export async function sweepOrphanSpendingTokens(
   deps: OrphanSweeperDeps,
 ): Promise<OrphanSweepResult> {
   const { tokens, outboxWriter, sentLedgerWriter, emit } = deps;
+  const dispatcherInFlightCount = deps.dispatcherInFlightCount ?? 0;
+
+  // Steelman item 2 — skip when ANY send dispatcher is in flight.
+  // Between `selectSources` (which marks tokens `'transferring'`) and
+  // the orchestrator's `outbox.create` hook (which only fires after
+  // `commitSources` returns — that can take seconds in conservative
+  // mode), the token legitimately exists in `'transferring'` status
+  // WITHOUT yet appearing in OUTBOX. Sweeping in that window emits
+  // false-positive `transfer:orphan-spending-detected` events.
+  if (dispatcherInFlightCount > 0) {
+    return {
+      orphans: [],
+      scannedTransferringCount: 0,
+      knownTokenIdsCount: 0,
+      skipped: true,
+    };
+  }
 
   // Skip when either writer is missing. The "skip silently" choice is
   // deliberate: legacy-only wallets (no profile persistence) cannot

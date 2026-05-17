@@ -2701,6 +2701,23 @@ export class PaymentsModule {
   async load(): Promise<void> {
     this.ensureInitialized();
 
+    // Steelman item 3 — coalesce concurrent load() calls. Without this
+    // guard, two concurrent invocations both reassign `loadedPromise`,
+    // await their own promise, AND fire the post-load side effects
+    // (resolveUnconfirmed scheduling, orphan sweep emission) twice —
+    // producing duplicate `transfer:orphan-spending-detected` events
+    // for the same orphans.
+    //
+    // Idempotency contract: load() is allowed to be called multiple
+    // times sequentially to refresh in-memory state (each call re-
+    // populates `this.tokens` from storage). What we forbid is
+    // CONCURRENT invocations — those coalesce onto the in-flight
+    // promise and skip the post-load side effects.
+    if (this.loadedPromise !== null && !this.loaded) {
+      await this.loadedPromise;
+      return;
+    }
+
     // Expose a promise that incoming transfer handlers can await to ensure
     // the token map is populated before running dedup checks.
     const doLoad = async () => {
@@ -3007,22 +3024,25 @@ export class PaymentsModule {
    *     must call this helper to keep the SENT ledger in sync with
    *     recovered sends.
    *
-   * No-op when `_sentLedgerWriter` is null (legacy mode). Errors are
-   * caught and logged at ERROR; the caller is responsible for any
-   * downstream signaling (e.g. the dispatcher continues to tombstone
-   * even on SENT-write failure — the bundle is already on the relay).
+   * **Return semantics** (steelman item 4 — silent-record-loss fix):
+   *  - `'success'` — writer installed AND write completed. Caller MAY
+   *    proceed to tombstone the outbox entry.
+   *  - `'failed'`  — writer installed BUT write threw. Caller MUST
+   *    NOT tombstone — the outbox entry is the only forensic record
+   *    that the delivery happened. Operator triage required.
+   *  - `'skipped'` — no writer installed (legacy mode). Caller
+   *    proceeds with legacy KV-only behavior (tombstones the legacy
+   *    outbox; no profile-resident SENT to write).
    *
    * @param entry    Outbox entry whose post-transition state to record.
    * @param opLabel  Short context tag for the error log (e.g.
    *                 'dispatchUxfConservativeSend', 'recoveryWorker').
-   * @returns `true` if a write was attempted (regardless of success);
-   *          `false` if skipped because no writer was installed.
    */
   private async writeSentEntryFromOutbox(
     entry: UxfTransferOutboxEntry,
     opLabel: string,
-  ): Promise<boolean> {
-    if (this._sentLedgerWriter === null) return false;
+  ): Promise<'success' | 'failed' | 'skipped'> {
+    if (this._sentLedgerWriter === null) return 'skipped';
     try {
       await this._sentLedgerWriter.write({
         id: entry.id,
@@ -3037,16 +3057,17 @@ export class PaymentsModule {
         mode: entry.mode,
         sentAt: Date.now(),
       });
+      return 'success';
     } catch (sentErr) {
       logger.error(
         'Payments',
         `${opLabel}: SENT ledger write failed for outbox id ${entry.id} ` +
-          `(bundle is already on the wire; operator triage required — the ` +
-          `delivery is permanent but the ledger record is missing): ` +
+          `(bundle is already on the wire; OUTBOX entry kept live at status='delivered' as forensic record; ` +
+          `operator triage required): ` +
           `${sentErr instanceof Error ? sentErr.message : String(sentErr)}`,
       );
+      return 'failed';
     }
-    return true;
   }
 
   /**
@@ -3071,6 +3092,16 @@ export class PaymentsModule {
    *
    * **No-op return** — when either writer is missing, the sweep is
    * skipped and `skipped: true` is returned (no orphans, no events).
+   *
+   * **Steelman item 2** — when ANY dispatch is in flight
+   * (`_dispatcherInFlightCount > 0`), the sweep also self-skips.
+   * Between `selectSources` marking tokens `'transferring'` and the
+   * orchestrator's `outbox.create` hook, the token legitimately
+   * exists in `'transferring'` status WITHOUT yet appearing in OUTBOX
+   * — a sweep in that window would produce a false-positive orphan
+   * event. The gate closes the race for the public API; the auto-
+   * invocation at `load()` tail is unaffected (no sends in flight
+   * at boot).
    */
   async detectOrphanSpendingTokens(): Promise<OrphanSweepResult> {
     return sweepOrphanSpendingTokens({
@@ -3078,12 +3109,26 @@ export class PaymentsModule {
       outboxWriter: this._outboxWriter,
       sentLedgerWriter: this._sentLedgerWriter,
       emit: this.deps!.emitEvent,
+      // Steelman item 2 — thread the dispatcher-in-flight counter so
+      // the sweeper self-skips during in-flight sends. The auto-
+      // invocation at load() tail is unaffected (count is 0 at boot);
+      // public-API callers and tests now see the gate.
+      dispatcherInFlightCount: this._dispatcherInFlightCount,
     });
   }
 
   installOutboxWriter(writer: OutboxWriter | null): void {
     this._outboxWriter = writer;
     if (writer !== null) {
+      // Capture the writer reference in the closure so the hydration's
+      // .then() callback can detect that the writer has been replaced
+      // (or uninstalled via installOutboxWriter(null) — e.g. on
+      // Sphere.destroy). If `this._outboxWriter !== writer` when the
+      // callback fires, bail without mutating the mirror map — that
+      // ensures a destroyed PaymentsModule never gets its cleared
+      // `_senderOutboxMap` repopulated by a late hydration. Closes
+      // steelman item 5 (hydration promise leaks past destroy).
+      const writerRef = writer;
       // Fire-and-forget hydration of the in-memory mirror. The
       // FinalizationWorkerSender (Phase 9.6.D) reads via `readOne(id)`
       // against `_senderOutboxMap`, so post-restart instant-mode
@@ -3092,9 +3137,20 @@ export class PaymentsModule {
       // from the writer (post-#97), so a failed hydration degrades to
       // "FinalizationWorkerSender takes a moment longer to see
       // post-restart entries" — never a data-loss path.
-      void writer
+      void writerRef
         .readAllNew()
         .then((entries) => {
+          // Steelman item 5 — writer-identity guard. The hydration
+          // Promise can resolve AFTER destroy()/uninstall has cleared
+          // `_outboxWriter` and `_senderOutboxMap`. Without this check,
+          // the callback would repopulate the cleared map.
+          if (this._outboxWriter !== writerRef) {
+            logger.debug(
+              'Payments',
+              'installOutboxWriter: hydration aborted (writer replaced or uninstalled during readAllNew)',
+            );
+            return;
+          }
           // Issue #97 (steelman W2) — race protection. The hydration
           // is fire-and-forget; a concurrent send may have already
           // mutated the mirror to a newer state by the time these
@@ -3105,6 +3161,10 @@ export class PaymentsModule {
           let hydratedCount = 0;
           let skippedCount = 0;
           for (const e of entries) {
+            // Re-check writer identity inside the loop — if another
+            // installOutboxWriter(null) racing with this loop fires,
+            // bail mid-loop rather than partial-populate.
+            if (this._outboxWriter !== writerRef) return;
             const existing = this._senderOutboxMap.get(e.id);
             if (existing !== undefined && existing.lamport >= e.lamport) {
               skippedCount += 1;
@@ -3119,6 +3179,9 @@ export class PaymentsModule {
           );
         })
         .catch((err) => {
+          // Same identity guard — if the writer is gone, suppress the
+          // warning to avoid spam during destroy().
+          if (this._outboxWriter !== writerRef) return;
           logger.warn(
             'Payments',
             `installOutboxWriter: failed to hydrate _senderOutboxMap from writer (recovery worker still reads via writer.readAllNew): ${err instanceof Error ? err.message : String(err)}`,
@@ -3259,6 +3322,23 @@ export class PaymentsModule {
    * @internal
    */
   private _sentLedgerWriter: SentLedgerWriter | null = null;
+
+  /**
+   * Issue #97 (steelman item 2) — dispatcher-in-flight reference
+   * counter. Incremented at the entry of each `dispatchUxf*Send` /
+   * `dispatchTxfSend` call, decremented in the `finally` of each.
+   * The orphan-spending sweeper reads this counter: when it is
+   * non-zero, the sweep self-skips (returns `skipped: true`) because
+   * a send is mid-flight — tokens are legitimately in `'transferring'`
+   * status WITHOUT yet appearing in OUTBOX (the orchestrator's
+   * `outbox.create` runs AFTER `commitSources` which can take
+   * seconds). Without this gate, the public-API sweeper races with
+   * in-flight sends and emits false-positive
+   * `transfer:orphan-spending-detected` events.
+   *
+   * @internal
+   */
+  private _dispatcherInFlightCount: number = 0;
 
   /**
    * Per-requestId context map for the sender-side finalization worker resolver.
@@ -3912,7 +3992,13 @@ export class PaymentsModule {
     // through unchanged. Keep this BEFORE any state mutation so the legacy
     // arm sees identical pre-conditions when the flag is off.
     if (this.features.senderUxf && internalTransferMode === 'conservative') {
-      return this.dispatchUxfConservativeSend(originalRequest);
+      // Steelman item 2 — orphan-sweep race gate. See _dispatcherInFlightCount.
+      this._dispatcherInFlightCount += 1;
+      try {
+        return await this.dispatchUxfConservativeSend(originalRequest);
+      } finally {
+        this._dispatcherInFlightCount -= 1;
+      }
     }
     // T.5.A — UXF instant dispatcher (same feature flag).
     // When `features.senderUxf === true` AND the request is instant-mode,
@@ -3928,7 +4014,12 @@ export class PaymentsModule {
     // when `senderUxf` is OFF is the staged-rollout escape hatch removed
     // by T.8.D.
     if (this.features.senderUxf && internalTransferMode === 'instant') {
-      return this.dispatchUxfInstantSend(originalRequest);
+      this._dispatcherInFlightCount += 1;
+      try {
+        return await this.dispatchUxfInstantSend(originalRequest);
+      } finally {
+        this._dispatcherInFlightCount -= 1;
+      }
     }
     // T.7.A — legacy TXF dispatcher (same feature flag).
     // When `features.senderUxf === true` AND the request explicitly opted
@@ -3942,7 +4033,12 @@ export class PaymentsModule {
     if (this.features.senderUxf && internalTransferMode === 'txf') {
       const txfFinalization: 'conservative' | 'instant' =
         originalRequest.txfFinalization === 'instant' ? 'instant' : 'conservative';
-      return this.dispatchTxfSend(originalRequest, txfFinalization);
+      this._dispatcherInFlightCount += 1;
+      try {
+        return await this.dispatchTxfSend(originalRequest, txfFinalization);
+      } finally {
+        this._dispatcherInFlightCount -= 1;
+      }
     }
     // T.7.A — feature-flag-OFF guard. When the UXF flag is off but the
     // caller passed `transferMode: 'txf'`, the legacy single-token path
@@ -10547,52 +10643,69 @@ export class PaymentsModule {
           }
           if (patch.status === 'delivered') {
             // Issue #97 — write the permanent SENT record BEFORE
-            // tombstoning the outbox entry. Order matters: if we
-            // tombstoned first and then crashed before the SENT write,
-            // the load-time orphan sweeper would only see a token in
-            // 'transferring' status if the source still exists — but
-            // the conservative path may have already removed the
-            // source via `removeToken` (at the commitSources arm).
-            // So a SENT-write failure here is a SILENT delivery-
-            // record loss; the helper logs at ERROR for operator
-            // triage. Bundle is already on the wire — recipient gets
-            // the tokens regardless.
+            // tombstoning the outbox entry. Order matters: if SENT
+            // write fails we MUST NOT tombstone, otherwise the
+            // delivery becomes invisible to all forensic paths
+            // (`removeToken` has already cleared the source token's
+            // `'transferring'` status earlier in the conservative
+            // pipeline, so the orphan-spending sweeper cannot help).
             //
             // Source of truth for the SENT shape is the in-memory
             // mirror entry (which was just updated above).
             const mirror = this._senderOutboxMap.get(id) ?? updated;
-            if (mirror !== null) {
-              await this.writeSentEntryFromOutbox(
-                mirror,
-                'dispatchUxfConservativeSend',
-              );
-            }
-            // Drop the legacy KV entry AND tombstone the profile
-            // entry. Wrapped so that a removeFromOutbox throw doesn't
-            // skip the profile tombstone (steelman W1: previously a
-            // throw here left the profile entry live as 'delivered'
-            // forever).
-            try {
-              await this.removeFromOutbox(id);
-            } catch (legacyErr) {
+            const sentResult: 'success' | 'failed' | 'skipped' =
+              mirror !== null
+                ? await this.writeSentEntryFromOutbox(
+                    mirror,
+                    'dispatchUxfConservativeSend',
+                  )
+                : 'skipped';
+
+            if (sentResult === 'failed') {
+              // Steelman item 4 — keep the OUTBOX entry live at
+              // status='delivered' as the forensic record so an
+              // operator (or a future profile-level reconciliation
+              // job) can re-attempt the SENT write. DO NOT tombstone
+              // the profile entry. The legacy KV entry IS removed
+              // (legacy outbox doesn't track 'delivered'), but the
+              // profile entry persists — that's the load-bearing
+              // signal.
               logger.warn(
                 'Payments',
-                `dispatchUxfConservativeSend: legacy removeFromOutbox(${id}) threw (proceeding to profile tombstone): ${legacyErr instanceof Error ? legacyErr.message : String(legacyErr)}`,
+                `dispatchUxfConservativeSend: SENT write failed for ${id} — leaving profile OUTBOX entry live at status='delivered' for operator triage`,
               );
-            }
-            // Tombstone the profile entry so a subsequent readAllNew
-            // doesn't resurrect it. The recovery worker treats
-            // tombstoned ids as absent (OutboxWriter.readAllNew
-            // skips them).
-            if (writer !== null) {
               try {
-                await writer.delete(id);
-                this._senderOutboxMap.delete(id);
-              } catch (delErr) {
+                await this.removeFromOutbox(id);
+              } catch (legacyErr) {
                 logger.warn(
                   'Payments',
-                  `dispatchUxfConservativeSend: outboxWriter.delete(${id}) failed (profile entry left live at status='delivered'; operator-recoverable): ${delErr instanceof Error ? delErr.message : String(delErr)}`,
+                  `dispatchUxfConservativeSend: legacy removeFromOutbox(${id}) threw (non-fatal): ${legacyErr instanceof Error ? legacyErr.message : String(legacyErr)}`,
                 );
+              }
+              // Intentionally NOT calling writer.delete here.
+            } else {
+              // 'success' OR 'skipped' (legacy mode) — proceed to
+              // tombstone the profile entry AND drop the legacy KV
+              // entry. The two drops are independently wrapped so a
+              // throw in one doesn't skip the other.
+              try {
+                await this.removeFromOutbox(id);
+              } catch (legacyErr) {
+                logger.warn(
+                  'Payments',
+                  `dispatchUxfConservativeSend: legacy removeFromOutbox(${id}) threw (proceeding to profile tombstone): ${legacyErr instanceof Error ? legacyErr.message : String(legacyErr)}`,
+                );
+              }
+              if (writer !== null) {
+                try {
+                  await writer.delete(id);
+                  this._senderOutboxMap.delete(id);
+                } catch (delErr) {
+                  logger.warn(
+                    'Payments',
+                    `dispatchUxfConservativeSend: outboxWriter.delete(${id}) failed (profile entry left live at status='delivered'; operator-recoverable): ${delErr instanceof Error ? delErr.message : String(delErr)}`,
+                  );
+                }
               }
             }
           }

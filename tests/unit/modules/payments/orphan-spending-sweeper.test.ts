@@ -357,4 +357,69 @@ describe('sweepOrphanSpendingTokens (Issue #97)', () => {
     expect(result.orphans).toHaveLength(0);
     expect(r.events).toHaveLength(0);
   });
+
+  // -------------------------------------------------------------------------
+  // Steelman item 2 — dispatcher-in-flight gate
+  // -------------------------------------------------------------------------
+  it('skips the sweep when dispatcherInFlightCount > 0 (legitimate in-flight send)', async () => {
+    // Scenario: a send is mid-flight. selectSources has marked the
+    // token 'transferring' but the orchestrator's outbox.create
+    // hasn't run yet (commitSources is still going). Without the
+    // gate, the sweep would flag this as an orphan — false positive
+    // that pages an operator over a normal send in progress.
+    const r = makeRecordingEmit();
+    const result = await sweepOrphanSpendingTokens({
+      tokens: [
+        tok('mid-flight-1', 'transferring'),
+        tok('mid-flight-2', 'transferring'),
+      ],
+      outboxWriter,
+      sentLedgerWriter,
+      emit: r.emit,
+      dispatcherInFlightCount: 1,
+    });
+    expect(result.skipped).toBe(true);
+    expect(result.orphans).toHaveLength(0);
+    expect(result.scannedTransferringCount).toBe(0);
+    expect(r.events).toHaveLength(0);
+  });
+
+  it('skips the sweep when dispatcherInFlightCount is large (multiple concurrent sends)', async () => {
+    const r = makeRecordingEmit();
+    const result = await sweepOrphanSpendingTokens({
+      tokens: [tok('mid-flight-1', 'transferring')],
+      outboxWriter,
+      sentLedgerWriter,
+      emit: r.emit,
+      dispatcherInFlightCount: 7,
+    });
+    expect(result.skipped).toBe(true);
+    expect(r.events).toHaveLength(0);
+  });
+
+  it('runs the sweep normally when dispatcherInFlightCount is 0 (explicit)', async () => {
+    const r = makeRecordingEmit();
+    const result = await sweepOrphanSpendingTokens({
+      tokens: [tok('orphan-1', 'transferring')],
+      outboxWriter,
+      sentLedgerWriter,
+      emit: r.emit,
+      dispatcherInFlightCount: 0,
+    });
+    expect(result.skipped).toBe(false);
+    expect(result.orphans).toHaveLength(1);
+    expect(r.events).toHaveLength(1);
+  });
+
+  it('runs the sweep normally when dispatcherInFlightCount is omitted (defaults to 0, backward-compat)', async () => {
+    const r = makeRecordingEmit();
+    const result = await sweepOrphanSpendingTokens({
+      tokens: [tok('orphan-1', 'transferring')],
+      outboxWriter,
+      sentLedgerWriter,
+      emit: r.emit,
+    });
+    expect(result.skipped).toBe(false);
+    expect(result.orphans).toHaveLength(1);
+  });
 });
