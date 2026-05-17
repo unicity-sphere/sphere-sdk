@@ -2748,6 +2748,14 @@ export class Sphere {
       );
     }
 
+    // Issue #97 (steelman C1) — wire profile-resident outbox + SENT
+    // ledger BEFORE payments.load() so the load-tail orphan sweeper
+    // sees the writers. Mirrors the wiring in `initializeModules`
+    // (primary address). Without this, multi-address wallets'
+    // non-primary addresses silently fall back to the legacy KV
+    // outbox — losing crash-safety guarantees.
+    this.wireProfilePersistedSendStorage(payments, identity);
+
     // payments.load() is critical — must succeed for wallet to be usable
     await payments.load();
 
@@ -2786,6 +2794,86 @@ export class Sphere {
     });
 
     return moduleSet;
+  }
+
+  /**
+   * Issue #97 — Wire the profile-resident OutboxWriter + SentLedgerWriter
+   * onto a PaymentsModule. Used by BOTH `initializeModules` (primary
+   * address bootstrap) and `initializeAddressModules` (per-address
+   * bootstrap on `switchToAddress`).
+   *
+   * **Atomicity (steelman C5 partial fix):** the OutboxWriter and
+   * SentLedgerWriter MUST be installed together. PaymentsModule's
+   * dispatcher hooks dual-write through both — installing OutboxWriter
+   * alone would tombstone outbox entries on `delivered` with no
+   * permanent SENT backup. To enforce this:
+   *   - If either build returns null, install NEITHER. Falls back to
+   *     legacy KV outbox.
+   *   - Pre-check both before either install fires.
+   *
+   * **Best-effort:** when the storage provider is not a
+   * `ProfileStorageProvider` (e.g. legacy IndexedDB), this is a no-op.
+   *
+   * @param payments  The PaymentsModule instance to wire.
+   * @param identity  The full identity carrying the directAddress (used
+   *                  to derive the addressId scope for both writers).
+   */
+  private wireProfilePersistedSendStorage(
+    payments: PaymentsModule,
+    identity: FullIdentity | null,
+  ): void {
+    if (identity === null) return;
+    try {
+      const storageForOutbox = this._storage as unknown as {
+        buildOutboxWriter?: (
+          addressId: string,
+        ) => import('../profile/outbox-writer').OutboxWriter | null;
+        buildSentLedgerWriter?: (
+          addressId: string,
+        ) => import('../profile/sent-ledger-writer').SentLedgerWriter | null;
+      };
+      if (
+        typeof storageForOutbox.buildOutboxWriter !== 'function' ||
+        typeof storageForOutbox.buildSentLedgerWriter !== 'function'
+      ) {
+        return;
+      }
+      const directAddress = identity.directAddress;
+      if (typeof directAddress !== 'string' || directAddress.length === 0) {
+        return;
+      }
+      const addressId = getAddressId(directAddress);
+
+      // Pre-check both before installing either (atomicity).
+      const outboxWriter = storageForOutbox.buildOutboxWriter(addressId);
+      const sentWriter = storageForOutbox.buildSentLedgerWriter(addressId);
+      if (outboxWriter === null || sentWriter === null) {
+        if (outboxWriter !== null || sentWriter !== null) {
+          logger.warn(
+            'Sphere',
+            `wireProfilePersistedSendStorage(${addressId}): partial build (outbox=${outboxWriter !== null} sent=${sentWriter !== null}) — refusing to install either (atomicity invariant); PaymentsModule will use legacy KV outbox`,
+          );
+        } else {
+          logger.debug(
+            'Sphere',
+            `wireProfilePersistedSendStorage(${addressId}): builds returned null (encryption disabled or identity pending) — PaymentsModule uses legacy KV outbox`,
+          );
+        }
+        return;
+      }
+
+      payments.installOutboxWriter(outboxWriter);
+      payments.installSentLedgerWriter(sentWriter);
+      logger.debug(
+        'Sphere',
+        `Wired profile-resident OutboxWriter + SentLedgerWriter for address ${addressId}`,
+      );
+    } catch (err) {
+      logger.warn(
+        'Sphere',
+        `wireProfilePersistedSendStorage threw — PaymentsModule falls back to legacy KV outbox: ${safeErrorMessage(err)}`,
+      );
+    }
   }
 
   /**
@@ -4180,6 +4268,28 @@ export class Sphere {
       logger.warn('Sphere', 'Accounting module destroy failed:', err);
     }
 
+    // Issue #97 (steelman C6) — null out per-address profile writers
+    // BEFORE the storage provider disconnects. The writers hold a
+    // reference to the underlying ProfileDatabase; in-flight fire-
+    // and-forget hydration Promises (kicked off by installOutboxWriter)
+    // would otherwise dispatch reads against a closing/closed DB and
+    // log spurious errors on the way out.
+    for (const moduleSet of this._addressModules.values()) {
+      try {
+        moduleSet.payments.installOutboxWriter(null);
+        moduleSet.payments.installSentLedgerWriter(null);
+      } catch {
+        // Non-fatal — installer is a 1-line setter, but defensive
+        // wrap protects future-stricter contracts.
+      }
+    }
+    try {
+      this._payments.installOutboxWriter(null);
+      this._payments.installSentLedgerWriter(null);
+    } catch {
+      // Non-fatal.
+    }
+
     // Destroy all per-address module sets
     for (const [idx, moduleSet] of this._addressModules.entries()) {
       try {
@@ -5068,6 +5178,21 @@ export class Sphere {
         `Failed to wire operator-escape-hatch importer overrides — falling back to in-memory default: ${safeErrorMessage(err)}`,
       );
     }
+
+    // Issue #97 — Build and install the profile-resident OutboxWriter
+    // when the StorageProvider exposes `buildOutboxWriter`. The writer
+    // persists per-entry-key UXF outbox entries under
+    // `${addressId}.outbox.${id}` so they survive total local profile
+    // loss (recovered on next sync via aggregator pointer / IPNS
+    // snapshot). PaymentsModule's dispatcher hooks dual-write to this
+    // writer plus the legacy KV chain; the SendingRecoveryWorker reads
+    // from this writer on restart.
+    //
+    // Best-effort: when the storage provider is not a
+    // `ProfileStorageProvider`, or encryption is disabled / key not yet
+    // derived, the install is skipped and PaymentsModule falls back to
+    // the legacy KV-only outbox path (pre-#97 behaviour).
+    this.wireProfilePersistedSendStorage(this._payments, this._identity);
 
     // PR #151 — payments.load() is critical and MUST complete BEFORE
     // accounting/swap load. `AccountingModule.load()` populates its

@@ -116,6 +116,62 @@ describe('Lamport', () => {
     });
   });
 
+  describe('rehydrate() — cold-restart trusted-observation absorption', () => {
+    it('sets current to max(current, ...observed) without bounds checking', () => {
+      const l = new Lamport(0);
+      // bumpFor([1000]) would throw LAMPORT_BOUND_VIOLATION (1000 > 2).
+      // rehydrate must accept the same input as trusted.
+      l.rehydrate([1000]);
+      expect(l.getCurrent()).toBe(1000);
+    });
+
+    it('takes the max across multiple observations', () => {
+      const l = new Lamport(5);
+      l.rehydrate([10, 100, 50, 25]);
+      expect(l.getCurrent()).toBe(100);
+    });
+
+    it('does not lower the clock when observations are smaller', () => {
+      const l = new Lamport(50);
+      l.rehydrate([1, 2, 3]);
+      expect(l.getCurrent()).toBe(50);
+    });
+
+    it('is a no-op on empty observations', () => {
+      const l = new Lamport(7);
+      l.rehydrate([]);
+      expect(l.getCurrent()).toBe(7);
+    });
+
+    it('rejects non-integer / negative values', () => {
+      const l = new Lamport(0);
+      expect(() => l.rehydrate([-1])).toThrow(SphereError);
+      expect(() => l.rehydrate([1.5])).toThrow(SphereError);
+      expect(() => l.rehydrate([Number.NaN])).toThrow(SphereError);
+      expect(() => l.rehydrate([Number.POSITIVE_INFINITY])).toThrow(SphereError);
+    });
+
+    it('post-rehydrate, bumpFor produces the expected next value', () => {
+      const l = new Lamport(0);
+      // Simulate cold-restart: 100 prior writes exist in storage.
+      l.rehydrate([100]);
+      // First write after restart: bumpFor with empty (we absorbed
+      // all observations into rehydrate) → next = current + 1.
+      const next = l.bumpFor([]);
+      expect(next).toBe(101);
+      expect(l.getCurrent()).toBe(101);
+    });
+
+    it('post-rehydrate, bumpFor still applies W39 bounds defense', () => {
+      const l = new Lamport(0);
+      l.rehydrate([10]); // current = 10, bound = 20
+      // bumpFor with a remote observation that exceeds bound should still throw.
+      expect(() => l.bumpFor([100])).toThrow(SphereError);
+      // current is unchanged after throw.
+      expect(l.getCurrent()).toBe(10);
+    });
+  });
+
   describe('per-instance scoping (no module-level globals)', () => {
     it('two instances are independent', () => {
       const a = new Lamport(0);

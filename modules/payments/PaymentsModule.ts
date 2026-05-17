@@ -173,6 +173,12 @@ import type { ProofVerifyStatus } from './transfer/proof-verifier';
 import { contentHash, type ContentHash } from '../../uxf/types';
 import { isLegacyTokenTransferPayload } from '../../types/uxf-transfer';
 import type { UxfTransferOutboxEntry } from '../../types/uxf-outbox';
+import type { OutboxWriter } from '../../profile/outbox-writer';
+import type { SentLedgerWriter } from '../../profile/sent-ledger-writer';
+import {
+  sweepOrphanSpendingTokens,
+  type OrphanSweepResult,
+} from './transfer/orphan-spending-sweeper';
 import {
   resolveSenderInfoViaBinding,
   type ReresolvedNametagSource,
@@ -1241,6 +1247,26 @@ export class PaymentsModule {
   private ingestPool: IngestWorkerPool | null = null;
 
   /**
+   * Count of `handleIncomingTransfer` invocations currently in flight
+   * (incremented at entry, decremented in finally). Lets
+   * {@link drainPendingFinalizations} know there are receives mid-pipeline
+   * whose tokens have not yet reached `this.tokens` — so the pre-flush
+   * drain MUST wait for them.
+   *
+   * Why this exists: every inbound transfer (UXF v1, COMBINED_TRANSFER V6,
+   * INSTANT_SPLIT, Sphere `{transferTx, sourceToken}`, SDK `{token, proof}`,
+   * NOSTR-FIRST commitment-only) takes 100–500 ms of network/oracle work
+   * BEFORE the resulting Token is `addToken()`-ed into `this.tokens`. The
+   * legacy `hasUnconfirmed()` predicate scanned `this.tokens.values()`
+   * only; a flush triggered between event arrival and addToken would
+   * silently miss the in-flight token. Multi-coin faucet drops surfaced
+   * this as a "USDU dropped on cross-device recovery" symptom — the
+   * 7th coin's pipeline was still mid-finalization when sync()'s drain
+   * took the fast path and skipped.
+   */
+  private inflightReceiveCount = 0;
+
+  /**
    * Recipient-side legacy-shape adapter runner (T.7.B).
    *
    * Invoked by `handleIncomingTransfer` for every event whose payload
@@ -1600,29 +1626,90 @@ export class PaymentsModule {
       const senderOutboxMap = this._senderOutboxMap;
       const transport = this.deps!.transport;
       const sphereEmit = this.deps!.emitEvent;
+      // Issue #97 — capture by closure so reads route through the
+      // profile-resident writer when installed. The writer is the
+      // source of truth across restarts; falling back to the in-memory
+      // map preserves pre-#97 behaviour for callers that haven't wired
+      // the profile-backed path yet.
+      const getOutboxWriter = (): OutboxWriter | null => this._outboxWriter;
+      // Issue #97 (steelman C3) — bind the SENT-write helper for the
+      // recovery worker's `update` closure. The object-method-shorthand
+      // inside `recoveryDeps.outbox` rebinds `this` to the outbox
+      // surface itself, so we can't reach `this.writeSentEntryFromOutbox`
+      // from there. Pre-bind at closure construction time.
+      const writeSentEntryFromOutbox = this.writeSentEntryFromOutbox.bind(this);
       const recoveryDeps: import('./transfer/sending-recovery-worker').SendingRecoveryWorkerDeps = {
         outbox: {
           async readAllNew(): Promise<ReadonlyArray<UxfTransferOutboxEntry>> {
+            const writer = getOutboxWriter();
+            if (writer !== null) {
+              // Durable source-of-truth read. Tombstoned ids are skipped
+              // by readAllNew per OutboxWriter contract.
+              return await writer.readAllNew();
+            }
             return Array.from(senderOutboxMap.values());
           },
           async update(
             id: string,
             mutator: (prev: UxfTransferOutboxEntry) => UxfTransferOutboxEntry,
           ): Promise<UxfTransferOutboxEntry> {
-            const existing = senderOutboxMap.get(id);
-            if (existing === undefined) {
-              throw new SphereError(
-                `SendingRecoveryWorker.update: no entry at id "${id}"`,
-                'VALIDATION_ERROR',
+            const writer = getOutboxWriter();
+            let prevStatus: UxfTransferOutboxEntry['status'] | null = null;
+            let updated: UxfTransferOutboxEntry;
+            if (writer !== null) {
+              // Route through the writer so the §7.0 state-machine
+              // validator fires AND the Lamport bump rule (§7.1) is
+              // honored. Mirror the result into the in-memory map so
+              // FinalizationOutboxWriter consumers stay coherent.
+              //
+              // Issue #97 (steelman C3 fix) — capture the pre-state so
+              // we can detect a `'sending' → 'delivered'/'delivered-
+              // instant'` arc and fire the SENT-write helper. The
+              // dispatcher's transition hook is not involved on the
+              // recovery-worker code path, so SENT must be written
+              // here or recovered sends silently bypass the ledger.
+              updated = await writer.update(id, (prev) => {
+                prevStatus = prev.status;
+                return mutator(prev);
+              });
+              senderOutboxMap.set(id, updated);
+            } else {
+              const existing = senderOutboxMap.get(id);
+              if (existing === undefined) {
+                throw new SphereError(
+                  `SendingRecoveryWorker.update: no entry at id "${id}"`,
+                  'VALIDATION_ERROR',
+                );
+              }
+              prevStatus = existing.status;
+              const next = mutator(existing);
+              const bumped: UxfTransferOutboxEntry = {
+                ...next,
+                lamport: (existing.lamport ?? 0) + 1,
+              };
+              senderOutboxMap.set(id, bumped);
+              updated = bumped;
+            }
+
+            // Issue #97 (C3) — detect terminal-success arc and write
+            // SENT inline. CAS guard: only fire when the status
+            // ACTUALLY transitioned (mutator may return prev unchanged
+            // for self-loop no-ops; see sending-recovery-worker.ts
+            // `transitionToDelivered`'s CAS pattern). Self-loop =
+            // updated.status === prevStatus → skip.
+            const terminalSuccess =
+              (updated.status === 'delivered' || updated.status === 'delivered-instant') &&
+              prevStatus !== updated.status;
+            if (terminalSuccess) {
+              // Use the pre-bound helper — the object-method-shorthand
+              // here doesn't expose PaymentsModule.this.
+              await writeSentEntryFromOutbox(
+                updated,
+                'sendingRecoveryWorker',
               );
             }
-            const next = mutator(existing);
-            const bumped: UxfTransferOutboxEntry = {
-              ...next,
-              lamport: (existing.lamport ?? 0) + 1,
-            };
-            senderOutboxMap.set(id, bumped);
-            return bumped;
+
+            return updated;
           },
         },
         republish: async (entry: UxfTransferOutboxEntry): Promise<void> => {
@@ -2788,6 +2875,41 @@ export class PaymentsModule {
     // periodic retries so tokens don't stay stuck as 'submitted'.
     this.resolveUnconfirmed().catch((err) => logger.debug('Payments', 'resolveUnconfirmed failed', err));
     this.scheduleResolveUnconfirmed();
+
+    // Issue #97 — fire-and-forget orphan sweep. Only runs when BOTH
+    // the OutboxWriter and SentLedgerWriter are installed (the sweeper
+    // self-skips otherwise — see sweepOrphanSpendingTokens for the
+    // rationale). Errors are caught here so a sweep failure cannot
+    // break load() for downstream callers.
+    if (this._outboxWriter !== null && this._sentLedgerWriter !== null) {
+      void this.detectOrphanSpendingTokens()
+        .then((result) => {
+          if (result.skipped) {
+            logger.debug('Payments', 'Orphan-spending sweep skipped on load');
+            return;
+          }
+          if (result.orphans.length > 0) {
+            logger.warn(
+              'Payments',
+              `Orphan-spending sweep on load detected ${result.orphans.length} ` +
+                `orphan token(s) out of ${result.scannedTransferringCount} 'transferring' ` +
+                `(known via OUTBOX/SENT: ${result.knownTokenIdsCount}). ` +
+                `transfer:orphan-spending-detected events were emitted; operator intervention required.`,
+            );
+          } else {
+            logger.debug(
+              'Payments',
+              `Orphan-spending sweep on load: clean (${result.scannedTransferringCount} 'transferring' scanned, ${result.knownTokenIdsCount} known)`,
+            );
+          }
+        })
+        .catch((err) => {
+          logger.warn(
+            'Payments',
+            `Orphan-spending sweep on load failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+    }
   }
 
   /**
@@ -2815,6 +2937,194 @@ export class PaymentsModule {
     }
     this.ingestPool =
       pool instanceof IngestWorkerPool ? pool : new IngestWorkerPool(pool);
+  }
+
+  /**
+   * Issue #97 — Install a profile-resident {@link OutboxWriter}.
+   *
+   * Once installed, every send-side outbox mutation (the
+   * conservative/instant dispatcher's `create`/`transition`/`write`
+   * hooks AND the recovery worker's `readAllNew`/`update` callbacks)
+   * dual-writes: the durable per-entry-key profile store first, then
+   * the in-memory {@link _senderOutboxMap} mirror. The legacy KV-only
+   * `saveToOutbox`/`removeFromOutbox` chain is preserved during the
+   * transition window so consumers that haven't migrated still observe
+   * the legacy snapshot.
+   *
+   * **When to install:** the bootstrap layer (Sphere) calls this after
+   * its {@link ProfileStorageProvider} reaches the "encryption key
+   * derived" state — same gate that arms
+   * `buildDispositionStorageAdapter()`. Calling with `null` removes the
+   * writer (used on address switch / destroy).
+   *
+   * **Address scope:** the writer is bound to a single address at
+   * construction. The caller MUST swap the writer (install null + new)
+   * when switching addresses.
+   *
+   * **Hydration:** the next `initialize()` call rebuilds
+   * {@link _senderOutboxMap} from `writer.readAllNew()` so post-restart
+   * entries are visible to the recovery worker.
+   *
+   * @param writer  The writer to install, or `null` to uninstall.
+   */
+  /**
+   * Issue #97 — Install a profile-resident {@link SentLedgerWriter}.
+   *
+   * Once installed, every successful send terminates with a write to
+   * the SENT ledger:
+   *  - Conservative mode: after the outbox transitions to `'delivered'`
+   *  - Instant mode: after the outbox transitions to `'delivered-instant'`
+   *
+   * **When to install:** alongside {@link installOutboxWriter}, in the
+   * bootstrap layer (Sphere). The two writers are tightly coupled —
+   * installing one without the other leaves the system in an
+   * inconsistent state where outbox tombstones can erase delivery
+   * records with no permanent backup. The bootstrap MUST install both
+   * or neither.
+   *
+   * @param writer  The writer to install, or `null` to uninstall.
+   */
+  installSentLedgerWriter(writer: SentLedgerWriter | null): void {
+    this._sentLedgerWriter = writer;
+  }
+
+  /**
+   * Issue #97 — Write a SENT ledger entry derived from an outbox entry
+   * that just reached terminal-success status. Called from THREE sites:
+   *
+   *  1. Conservative dispatcher's `transition('delivered')` hook
+   *     (PaymentsModule.ts ~line 10400) — write SENT before tombstoning
+   *     the outbox.
+   *  2. Instant dispatcher's `write('delivered-instant')` hook
+   *     (PaymentsModule.ts ~line 11400) — write SENT at first entry
+   *     into the terminal-success status.
+   *  3. SendingRecoveryWorker's `outbox.update` closure
+   *     (PaymentsModule.ts ~line 1670) — when the worker re-publishes
+   *     a stuck `'sending'` entry, it transitions to `'delivered'` /
+   *     `'delivered-instant'` via this.deps.outbox.update. The
+   *     dispatcher's SENT-write logic does NOT fire for this path
+   *     (dispatcher hooks aren't involved) — so the update closure
+   *     must call this helper to keep the SENT ledger in sync with
+   *     recovered sends.
+   *
+   * No-op when `_sentLedgerWriter` is null (legacy mode). Errors are
+   * caught and logged at ERROR; the caller is responsible for any
+   * downstream signaling (e.g. the dispatcher continues to tombstone
+   * even on SENT-write failure — the bundle is already on the relay).
+   *
+   * @param entry    Outbox entry whose post-transition state to record.
+   * @param opLabel  Short context tag for the error log (e.g.
+   *                 'dispatchUxfConservativeSend', 'recoveryWorker').
+   * @returns `true` if a write was attempted (regardless of success);
+   *          `false` if skipped because no writer was installed.
+   */
+  private async writeSentEntryFromOutbox(
+    entry: UxfTransferOutboxEntry,
+    opLabel: string,
+  ): Promise<boolean> {
+    if (this._sentLedgerWriter === null) return false;
+    try {
+      await this._sentLedgerWriter.write({
+        id: entry.id,
+        tokenIds: entry.tokenIds,
+        bundleCid: entry.bundleCid,
+        recipientTransportPubkey: entry.recipientTransportPubkey,
+        recipient: entry.recipient,
+        ...(typeof entry.recipientNametag === 'string'
+          ? { recipientNametag: entry.recipientNametag }
+          : {}),
+        deliveryMethod: entry.deliveryMethod,
+        mode: entry.mode,
+        sentAt: Date.now(),
+      });
+    } catch (sentErr) {
+      logger.error(
+        'Payments',
+        `${opLabel}: SENT ledger write failed for outbox id ${entry.id} ` +
+          `(bundle is already on the wire; operator triage required — the ` +
+          `delivery is permanent but the ledger record is missing): ` +
+          `${sentErr instanceof Error ? sentErr.message : String(sentErr)}`,
+      );
+    }
+    return true;
+  }
+
+  /**
+   * Issue #97 — Run the orphan-spending-tx sweeper once. Detects
+   * tokens with an in-flight spending transaction (status
+   * `'transferring'`) that are NOT referenced by any live OUTBOX
+   * entry AND NOT recorded in the SENT ledger. Such tokens indicate
+   * a crash between commit (Step 1) and outbox-persist (Step 2) of
+   * the canonical send flow.
+   *
+   * **Phase 1 (this release)** — detection + diagnostic event only.
+   * Auto-recovery (re-package + re-pin + re-queue) is gated to a
+   * follow-up wave because the safety surface for silent miss-routing
+   * is too large to ship without dedicated tests. Operators triaging
+   * a `transfer:orphan-spending-detected` event can manually re-send
+   * the affected token once they confirm the recipient.
+   *
+   * **Auto-invocation** — this method runs once at the tail of
+   * `load()` when BOTH the OutboxWriter AND the SentLedgerWriter are
+   * installed (fire-and-forget; errors are logged but never break
+   * load).
+   *
+   * **No-op return** — when either writer is missing, the sweep is
+   * skipped and `skipped: true` is returned (no orphans, no events).
+   */
+  async detectOrphanSpendingTokens(): Promise<OrphanSweepResult> {
+    return sweepOrphanSpendingTokens({
+      tokens: this.tokens.values(),
+      outboxWriter: this._outboxWriter,
+      sentLedgerWriter: this._sentLedgerWriter,
+      emit: this.deps!.emitEvent,
+    });
+  }
+
+  installOutboxWriter(writer: OutboxWriter | null): void {
+    this._outboxWriter = writer;
+    if (writer !== null) {
+      // Fire-and-forget hydration of the in-memory mirror. The
+      // FinalizationWorkerSender (Phase 9.6.D) reads via `readOne(id)`
+      // against `_senderOutboxMap`, so post-restart instant-mode
+      // entries become visible to the worker after this resolves.
+      // Errors are warned-only: the recovery worker reads directly
+      // from the writer (post-#97), so a failed hydration degrades to
+      // "FinalizationWorkerSender takes a moment longer to see
+      // post-restart entries" — never a data-loss path.
+      void writer
+        .readAllNew()
+        .then((entries) => {
+          // Issue #97 (steelman W2) — race protection. The hydration
+          // is fire-and-forget; a concurrent send may have already
+          // mutated the mirror to a newer state by the time these
+          // snapshot entries arrive. Only overwrite when the snapshot
+          // entry has a HIGHER lamport than what's currently in the
+          // mirror — otherwise we'd silently clobber post-restart
+          // writes that the dispatcher just made.
+          let hydratedCount = 0;
+          let skippedCount = 0;
+          for (const e of entries) {
+            const existing = this._senderOutboxMap.get(e.id);
+            if (existing !== undefined && existing.lamport >= e.lamport) {
+              skippedCount += 1;
+              continue;
+            }
+            this._senderOutboxMap.set(e.id, e);
+            hydratedCount += 1;
+          }
+          logger.debug(
+            'Payments',
+            `installOutboxWriter: hydrated ${hydratedCount} outbox entries (${skippedCount} skipped — concurrent writer already advanced lamport)`,
+          );
+        })
+        .catch((err) => {
+          logger.warn(
+            'Payments',
+            `installOutboxWriter: failed to hydrate _senderOutboxMap from writer (recovery worker still reads via writer.readAllNew): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+    }
   }
 
   // ===========================================================================
@@ -2894,9 +3204,61 @@ export class PaymentsModule {
    * The instant-sender writes here at `delivered-instant` stage;
    * the worker reads + updates via the injected `FinalizationOutboxWriter`.
    *
+   * When a profile-resident {@link _outboxWriter} is installed via
+   * {@link installOutboxWriter}, this map functions as a write-through
+   * cache on top of the durable per-entry-key store — the writer is the
+   * source of truth across restarts; this map is hydrated from it in
+   * `initialize()` and updated in lock-step on every dispatcher hook
+   * call.
+   *
    * @internal
    */
   private readonly _senderOutboxMap: Map<string, UxfTransferOutboxEntry> = new Map();
+
+  /**
+   * Issue #97 — Profile-resident outbox writer, when wired by the
+   * bootstrap layer. The writer persists per-entry-key UXF outbox
+   * entries under `${addressId}.outbox.${id}` in the profile's OrbitDB
+   * key-value store, IPFS-synced. Survives total local profile loss
+   * (recovered on next sync from the aggregator pointer / IPNS
+   * snapshot).
+   *
+   * When `null`, the dispatcher hooks fall back to the legacy KV-only
+   * outbox path (`saveToOutbox`/`removeFromOutbox`) and the in-memory
+   * `_senderOutboxMap`. When non-null, every dispatcher hook performs
+   * a dual-write: durable profile write first, then the in-memory map
+   * mirror is updated to match.
+   *
+   * Lifecycle: installed by the bootstrap layer (Sphere) AFTER the
+   * profile encryption key is derived but BEFORE `initialize()` so the
+   * Lamport rehydration runs against the live writer. Address-switch
+   * MUST call `installOutboxWriter(null)` then `installOutboxWriter(new)`
+   * with the new address scope.
+   *
+   * @internal
+   */
+  private _outboxWriter: OutboxWriter | null = null;
+
+  /**
+   * Issue #97 — Profile-resident SENT ledger writer, when wired by the
+   * bootstrap layer. Companion to {@link _outboxWriter}.
+   *
+   * Written after the outbox transitions to a terminal-success status:
+   *  - Conservative mode → after `'delivered'`
+   *  - Instant mode → after `'delivered-instant'`
+   *
+   * The SENT ledger is the permanent counterpart to the operational
+   * outbox: outbox entries are tombstoned after delivery, SENT entries
+   * persist forever. Consulted by the crash-recovery sweeper (Issue
+   * #97 step 6) and the duplicate-bundle guard (step 7).
+   *
+   * When `null`, SENT records are NOT written — falls back to the
+   * legacy in-memory `addToHistory()` path. The crash-recovery sweeper
+   * is a no-op without it.
+   *
+   * @internal
+   */
+  private _sentLedgerWriter: SentLedgerWriter | null = null;
 
   /**
    * Per-requestId context map for the sender-side finalization worker resolver.
@@ -5679,13 +6041,36 @@ export class PaymentsModule {
   }> {
     const startTime = Date.now();
 
-    const hasUnconfirmed = (): boolean =>
+    // Drain race fix — must also wait for any inbound transfer pipelines
+    // that haven't yet reached `addToken` (their tokens are not in
+    // `this.tokens` yet, so the status scan below would miss them).
+    // See `inflightReceiveCount` doc for why.
+    const hasUnconfirmedOrInflight = (): boolean =>
+      this.inflightReceiveCount > 0 ||
       Array.from(this.tokens.values()).some(
         (t) => t.status === 'submitted' || t.status === 'pending',
       );
 
+    // Drain ingest worker pool first (UXF v1 path, defense in depth).
+    // The pool's queue may hold accepted-but-not-yet-processed bundles;
+    // waiting here serializes the drain against in-flight worker
+    // processing so the post-drain wallet snapshot includes their
+    // resulting tokens. Best-effort: any failure (timeout, pool not
+    // installed) falls through to the legacy in-flight wait below.
+    if (this.ingestPool) {
+      try {
+        await this.ingestPool.drainQueue(opts.timeoutMs);
+      } catch (err) {
+        logger.debug(
+          'Payments',
+          '[DRAIN] ingestPool.drainQueue threw or timed out (continuing):',
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }
+
     // Fast path: nothing to drain.
-    if (!hasUnconfirmed()) {
+    if (!hasUnconfirmedOrInflight()) {
       return { durationMs: 0, timedOut: false, skipped: true };
     }
 
@@ -5700,7 +6085,7 @@ export class PaymentsModule {
         'Payments',
         '[V5-RESOLVE] drainPendingFinalizations: oracle not wired (no stClient/trustBase) — skipping drain',
       );
-      return { durationMs: 0, timedOut: hasUnconfirmed(), skipped: true };
+      return { durationMs: 0, timedOut: hasUnconfirmedOrInflight(), skipped: true };
     }
 
     let finalization: UnconfirmedResolutionResult | undefined;
@@ -5710,7 +6095,7 @@ export class PaymentsModule {
       finalization = resolution;
       if (opts.onProgress) opts.onProgress(resolution);
 
-      if (!hasUnconfirmed()) break;
+      if (!hasUnconfirmedOrInflight()) break;
 
       await new Promise((r) => setTimeout(r, opts.pollIntervalMs));
       await this.load();
@@ -5719,7 +6104,7 @@ export class PaymentsModule {
     return {
       finalization,
       durationMs: Date.now() - startTime,
-      timedOut: hasUnconfirmed(),
+      timedOut: hasUnconfirmedOrInflight(),
       skipped: false,
     };
   }
@@ -8937,11 +9322,39 @@ export class PaymentsModule {
             // Address guard: reject data from a different address.
             // Stale IPFS records may contain tokens from a previously active
             // address if a write-behind flush raced with an address switch.
+            //
+            // Accept three representations (one per writer):
+            //   - L1 bech32 (`alpha1...`) — legacy file storage writes this
+            //   - chain pubkey — some providers record the pubkey
+            //   - Profile short ID (`DIRECT_{first6}_{last6}`) — written by
+            //     ProfileTokenStorageProvider via `computeAddressId`
+            //
+            // The third format was added to `load()`'s guard but missed
+            // here, causing sync() to silently discard Profile-provider
+            // data on cross-device recovery — Device B reads Device A's
+            // CAR via the aggregator pointer, the parsed `_meta.address`
+            // is the DIRECT_* short-id, and `currentL1` is the bech32
+            // form. Mismatch → reject → recovery returns empty.
             const mergedMeta = (result.merged as TxfStorageDataBase)?._meta;
             const currentL1 = this.deps!.identity.l1Address;
             const currentChain = this.deps!.identity.chainPubkey;
-            if (mergedMeta?.address && currentL1 && mergedMeta.address !== currentL1 && mergedMeta.address !== currentChain) {
-              logger.warn('Payments', `Sync: rejecting data from provider ${providerId} — address mismatch (got=${mergedMeta.address.slice(0, 20)}... expected=${currentL1.slice(0, 20)}...)`);
+            const currentDirect = this.deps!.identity.directAddress;
+            const currentProfileShortId = currentDirect ? computeAddressId(currentDirect) : null;
+            if (
+              mergedMeta?.address &&
+              mergedMeta.address !== currentL1 &&
+              mergedMeta.address !== currentChain &&
+              mergedMeta.address !== currentProfileShortId
+            ) {
+              const accepted = [
+                currentL1 ? `L1=${currentL1.slice(0, 16)}…` : null,
+                currentChain ? `chain=${currentChain.slice(0, 16)}…` : null,
+                currentProfileShortId ? `profile=${currentProfileShortId}` : null,
+              ].filter(Boolean).join(', ');
+              logger.warn(
+                'Payments',
+                `Sync: rejecting data from provider ${providerId} — address mismatch (got=${mergedMeta.address.slice(0, 24)} accepted=[${accepted}])`,
+              );
               continue;
             }
 
@@ -10084,17 +10497,29 @@ export class PaymentsModule {
         return out;
       },
       outbox: {
-        // T.2.D.2 — orchestrator drives §7.0 via create/transition.
-        // Until the per-entry-key OutboxWriter (T.6.A) is fully wired
-        // to a ProfileDatabase in PaymentsModule (T.6.D, follow-up),
-        // this adapter folds the new hooks onto the legacy
-        // saveToOutbox / removeFromOutbox chain so existing tests keep
-        // their invariants:
-        //   - create (status=packaging): persist legacy synthetic entry.
-        //   - transition (status=delivered): drop legacy entry.
-        //   - transition (other states): no-op (legacy outbox is
-        //     bundle-grained-on-create, terminal-on-removal only).
+        // T.2.D.2 + Issue #97 — orchestrator drives §7.0 via create/
+        // transition. Production wiring threads a profile-resident
+        // OutboxWriter via {@link installOutboxWriter}. When installed:
+        //   - create:      writer.write(entry); _senderOutboxMap mirror
+        //                  is set in lock-step; legacy saveToOutbox is
+        //                  also called so consumers reading the legacy
+        //                  snapshot still observe the entry.
+        //   - transition:  writer.update(...) gates the arc via the
+        //                  §7.0 validator; mirror updates in lock-step;
+        //                  on `'delivered'` the legacy entry is dropped
+        //                  via removeFromOutbox AND the profile entry
+        //                  is tombstoned via writer.delete.
+        // When the writer is NULL (legacy mode / tests without profile
+        // wiring), the hooks fold onto the legacy KV chain alone — the
+        // pre-#97 behaviour is preserved.
         create: async (entry) => {
+          const writer = this._outboxWriter;
+          if (writer !== null) {
+            // Durable profile write first — the in-memory mirror is
+            // hydrated from this on next restart.
+            const written = await writer.write(entry);
+            this._senderOutboxMap.set(entry.id, written);
+          }
           const synthResult: TransferResult = {
             id: entry.id,
             status: 'submitted',
@@ -10104,12 +10529,73 @@ export class PaymentsModule {
           await this.saveToOutbox(synthResult, entry.recipientTransportPubkey);
         },
         transition: async (id, patch) => {
-          if (patch.status === 'delivered') {
-            await this.removeFromOutbox(id);
+          const writer = this._outboxWriter;
+          let updated: UxfTransferOutboxEntry | null = null;
+          if (writer !== null) {
+            // Route through the writer so the §7.0 validator gates the
+            // arc. The mutator folds the patch onto the previous entry.
+            updated = await writer.update(id, (prev) => ({
+              ...prev,
+              status: patch.status,
+              ...(typeof patch.error === 'string' ? { error: patch.error } : {}),
+              ...(typeof patch.submitRetryCount === 'number'
+                ? { submitRetryCount: patch.submitRetryCount }
+                : {}),
+              updatedAt: Date.now(),
+            }));
+            this._senderOutboxMap.set(id, updated);
           }
-          // 'pinned' / 'sending' / 'failed-transient' carry no legacy
-          // state mutation — the new schema's intermediate states are
-          // tracked exclusively by the (forthcoming) OutboxWriter.
+          if (patch.status === 'delivered') {
+            // Issue #97 — write the permanent SENT record BEFORE
+            // tombstoning the outbox entry. Order matters: if we
+            // tombstoned first and then crashed before the SENT write,
+            // the load-time orphan sweeper would only see a token in
+            // 'transferring' status if the source still exists — but
+            // the conservative path may have already removed the
+            // source via `removeToken` (at the commitSources arm).
+            // So a SENT-write failure here is a SILENT delivery-
+            // record loss; the helper logs at ERROR for operator
+            // triage. Bundle is already on the wire — recipient gets
+            // the tokens regardless.
+            //
+            // Source of truth for the SENT shape is the in-memory
+            // mirror entry (which was just updated above).
+            const mirror = this._senderOutboxMap.get(id) ?? updated;
+            if (mirror !== null) {
+              await this.writeSentEntryFromOutbox(
+                mirror,
+                'dispatchUxfConservativeSend',
+              );
+            }
+            // Drop the legacy KV entry AND tombstone the profile
+            // entry. Wrapped so that a removeFromOutbox throw doesn't
+            // skip the profile tombstone (steelman W1: previously a
+            // throw here left the profile entry live as 'delivered'
+            // forever).
+            try {
+              await this.removeFromOutbox(id);
+            } catch (legacyErr) {
+              logger.warn(
+                'Payments',
+                `dispatchUxfConservativeSend: legacy removeFromOutbox(${id}) threw (proceeding to profile tombstone): ${legacyErr instanceof Error ? legacyErr.message : String(legacyErr)}`,
+              );
+            }
+            // Tombstone the profile entry so a subsequent readAllNew
+            // doesn't resurrect it. The recovery worker treats
+            // tombstoned ids as absent (OutboxWriter.readAllNew
+            // skips them).
+            if (writer !== null) {
+              try {
+                await writer.delete(id);
+                this._senderOutboxMap.delete(id);
+              } catch (delErr) {
+                logger.warn(
+                  'Payments',
+                  `dispatchUxfConservativeSend: outboxWriter.delete(${id}) failed (profile entry left live at status='delivered'; operator-recoverable): ${delErr instanceof Error ? delErr.message : String(delErr)}`,
+                );
+              }
+            }
+          }
         },
       },
     };
@@ -10966,19 +11452,69 @@ export class PaymentsModule {
         // No-op for T.5.A — selectSources above already marks sources
         // `transferring` in the local cache.
       },
-      // Phase 9.6.D — wire the in-memory outbox so the instant-sender
-      // persists `delivered-instant` entries the finalization worker can
-      // read via its injected FinalizationOutboxWriter. When no worker is
-      // installed, fall through to `undefined` (original T.5.A behaviour).
-      outbox: this.finalizationWorkerSender !== null
+      // Phase 9.6.D + Issue #97 — wire the outbox-write hook so the
+      // instant-sender persists every `packaging`/`pinned`/`sending`/
+      // `delivered-instant` entry. The hook fires whenever EITHER:
+      //  - a profile-resident OutboxWriter is installed (#97 crash
+      //    safety — survives total local profile loss), OR
+      //  - a finalization worker is installed (Phase 9.6.D — worker
+      //    reads the in-memory map via FinalizationOutboxWriter).
+      // When neither is wired, the hook is undefined (original T.5.A
+      // behaviour — bare orchestrator path used by some unit tests).
+      outbox: (this._outboxWriter !== null || this.finalizationWorkerSender !== null)
         ? {
             write: async (entry) => {
-              const existing = this._senderOutboxMap.get(entry.id);
-              this._senderOutboxMap.set(entry.id, {
-                ...entry,
-                _schemaVersion: 'uxf-1' as const,
-                lamport: (existing?.lamport ?? 0) + 1,
-              });
+              const writer = this._outboxWriter;
+              if (writer !== null) {
+                // Durable profile write first — _senderOutboxMap is
+                // mirrored from the returned stamped value so the
+                // Lamport matches the writer's CRDT bump rule (§7.1).
+                const written = await writer.write(entry);
+                this._senderOutboxMap.set(entry.id, written);
+              } else {
+                // Legacy in-memory path — finalization worker only.
+                const existing = this._senderOutboxMap.get(entry.id);
+                this._senderOutboxMap.set(entry.id, {
+                  ...entry,
+                  _schemaVersion: 'uxf-1' as const,
+                  lamport: (existing?.lamport ?? 0) + 1,
+                });
+              }
+
+              // Issue #97 — write the SENT ledger entry on first
+              // entry into the terminal-success status. In instant
+              // mode the outbox entry stays live (the finalization
+              // worker continues writing through it), so SENT and
+              // OUTBOX coexist until the worker reaches `'finalized'`.
+              // The `_schemaVersion: 'uxf-1'` discriminator on SENT
+              // entries keeps them disjoint from the outbox keyspace.
+              //
+              // Idempotency: SentLedgerWriter.write is second-write-
+              // wins. Repeated transitions into `delivered-instant`
+              // (e.g. the recovery worker re-entering the same status
+              // after a republish) re-stamp the SENT entry with a
+              // fresh lamport but produce no duplicate record.
+              //
+              // SENT-write failure: error is logged at ERROR; the
+              // bundle is already on the wire. No automatic recovery
+              // — operator triage required (the sweeper cannot help
+              // here because the source token is already cleared).
+              if (entry.status === 'delivered-instant') {
+                // Synthesise a UxfTransferOutboxEntry shape for the
+                // helper (orchestrator passes an OutboxCreateInput
+                // which is structurally a UxfTransferOutboxEntry
+                // minus _schemaVersion + lamport — both unused by
+                // the SENT helper).
+                const synthetic: UxfTransferOutboxEntry = {
+                  ...entry,
+                  _schemaVersion: 'uxf-1' as const,
+                  lamport: 0,
+                };
+                await this.writeSentEntryFromOutbox(
+                  synthetic,
+                  'dispatchUxfInstantSend',
+                );
+              }
             },
           }
         : undefined,
@@ -11959,7 +12495,76 @@ export class PaymentsModule {
     }
   }
 
-  private async handleIncomingTransfer(transfer: IncomingTokenTransfer): Promise<void> {
+  /**
+   * Await durability on every TokenStorageProvider that supports
+   * `awaitNextFlush()`. Returns `true` iff every provider's flush
+   * completed (or it doesn't expose the method — assumed durable on
+   * save() return for filesystem-style providers). Used by
+   * `handleIncomingTransfer` to gate the Nostr ack on real IPFS pin
+   * completion.
+   *
+   * Failures (POINTER_MONOTONICITY_VIOLATION, IPFS unreachable, OrbitDB
+   * write timeout, awaitNextFlush deadline exceeded) are logged at
+   * `warn` and surface as `false` so the caller refuses to advance the
+   * `since` filter.
+   */
+  private async awaitAllProvidersDurable(timeoutMs = 60_000): Promise<boolean> {
+    const providers = this.getTokenStorageProviders();
+    if (providers.size === 0) return true;
+    let allDurable = true;
+    for (const [providerId, provider] of providers) {
+      if (typeof provider.awaitNextFlush !== 'function') continue;
+      try {
+        await provider.awaitNextFlush(timeoutMs);
+      } catch (err) {
+        logger.warn(
+          'Payments',
+          `[AT-LEAST-ONCE] provider ${providerId} awaitNextFlush failed — Nostr event will NOT be acked, replayed on next reconnect:`,
+          err instanceof Error ? err.message : err,
+        );
+        allDurable = false;
+      }
+    }
+    return allDurable;
+  }
+
+  /**
+   * Process an inbound token-transfer event from the transport layer.
+   *
+   * Returns `true` if the resulting tokens (if any) are now durably
+   * persisted to all configured TokenStorageProviders (specifically:
+   * for the Profile provider, this means the IPFS CAR is pinned, the
+   * OrbitDB bundle ref is written, and the aggregator pointer is
+   * updated). The Nostr transport uses this signal to gate
+   * `lastEventTs` advancement — see SPEC §at-least-once-invariant.
+   *
+   * Returns `false` if:
+   *  - the receive pipeline threw (parse / oracle / validation errors)
+   *  - any provider's `awaitNextFlush()` rejected (timeout, monotonicity
+   *    violation, IPFS unreachable)
+   *
+   * In either failure case, the transport MUST NOT advance the `since`
+   * filter past this event, so the event is re-replayed on the next
+   * reconnect. Re-processing is idempotent (addToken dedupes via
+   * `(tokenId, stateHash)`; processedCombinedTransferIds dedupes V6
+   * bundles).
+   */
+  private async handleIncomingTransfer(transfer: IncomingTokenTransfer): Promise<boolean> {
+    // Drain race fix — count every in-flight receive so the pre-flush
+    // drain can wait for the async receive→addToken pipeline to settle
+    // before snapshotting the wallet. See `inflightReceiveCount` doc.
+    // try/finally ensures the counter balances on EVERY exit path
+    // (early-return, thrown error, awaited rejection).
+    this.inflightReceiveCount++;
+    // At-least-once invariant: track whether the body completed without
+    // error so the finally block can decide whether to await durability.
+    // Default false — only flipped to true on the happy paths that
+    // actually persist a token. Early returns (already-processed dedup,
+    // invalid payload format) leave it false; we still treat those as
+    // durable since there's nothing new to persist (see below).
+    let bodyCompleted = false;
+    let nothingToPerist = false;
+    try {
     // Ensure load() has completed so dedup checks see all persisted tokens.
     if (!this.loaded && this.loadedPromise) {
       await this.loadedPromise;
@@ -11979,8 +12584,17 @@ export class PaymentsModule {
         // emitted via the typed event bus inside the pool. We log here
         // for traceability; the sender's outbox will time out.
         logger.warn('Payments', 'handleIncomingTransfer: ingest pool rejected bundle', err);
+        // Pool rejected the bundle — no token persisted. Return false so
+        // the Nostr ack does NOT advance; the event re-replays on the
+        // next reconnect (idempotent via addToken stateHash dedup).
+        return false;
       }
-      return;
+      // Pool's enqueue() awaits the worker `settled` promise, so by the
+      // time we get here the worker has processed the bundle and addToken
+      // ran inside processToken. Now flush to make the token durable in
+      // IPFS+OrbitDB+aggregator-pointer before letting the Nostr ack
+      // advance.
+      return await this.awaitAllProvidersDurable();
     }
 
     // T.7.B — legacy-shape adapter routing. When the flag is on AND a
@@ -12044,13 +12658,17 @@ export class PaymentsModule {
 
       if (combinedBundle) {
         logger.debug('Payments', 'Processing COMBINED_TRANSFER V6 bundle...');
+        let v6Success = true;
         try {
           await this.processCombinedTransferBundle(combinedBundle, transfer.senderTransportPubkey);
           logger.debug('Payments', 'COMBINED_TRANSFER V6 processed successfully');
         } catch (err) {
           logger.error('Payments', 'COMBINED_TRANSFER V6 processing error:', err);
+          v6Success = false;
         }
-        return;
+        if (!v6Success) return false;
+        // V6 path persists via internal save calls — await flush durability.
+        return await this.awaitAllProvidersDurable();
       }
 
       // Check for INSTANT_SPLIT bundle (V4/V5 standalone — backward compat)
@@ -12072,6 +12690,7 @@ export class PaymentsModule {
       if (instantBundle) {
         logger.debug('Payments', 'Processing INSTANT_SPLIT bundle...');
         try {
+          let instantOk = false;
           const result = await this.processInstantSplitBundle(
             instantBundle,
             transfer.senderTransportPubkey,
@@ -12079,20 +12698,25 @@ export class PaymentsModule {
           );
           if (result.success) {
             logger.debug('Payments', 'INSTANT_SPLIT processed successfully');
+            instantOk = true;
           } else {
             logger.warn('Payments', 'INSTANT_SPLIT processing failed:', result.error);
           }
+          if (!instantOk) return false;
         } catch (err) {
           logger.error('Payments', 'INSTANT_SPLIT processing error:', err);
+          return false;
         }
-        return;
+        // INSTANT_SPLIT success — await flush before acking Nostr event.
+        return await this.awaitAllProvidersDurable();
       }
 
       // Check for NOSTR-FIRST commitment-only transfer (whole-token instant send)
       if (payload.sourceToken && payload.commitmentData && !payload.transferTx) {
         logger.debug('Payments', 'NOSTR-FIRST commitment-only transfer detected');
         await this.handleCommitmentOnlyTransfer(transfer, payload);
-        return;
+        // NOSTR-FIRST persists internally — await flush before acking.
+        return await this.awaitAllProvidersDurable();
       }
 
       let tokenData: unknown;
@@ -12118,7 +12742,7 @@ export class PaymentsModule {
 
         if (!sourceTokenInput || !transferTxInput) {
           logger.warn('Payments', 'Invalid Sphere wallet transfer format');
-          return;
+          return false;
         }
 
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -12129,7 +12753,7 @@ export class PaymentsModule {
           sourceToken = await SdkToken.fromJSON(sourceTokenInput);
         } catch (err) {
           logger.error('Payments', 'Failed to parse sourceToken:', err);
-          return;
+          return false;
         }
 
         // Try multiple parsing strategies for transferTx
@@ -12151,18 +12775,18 @@ export class PaymentsModule {
             const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
             if (!stClient) {
               logger.error('Payments', 'Cannot process commitment - no state transition client');
-              return;
+              return false;
             }
 
             const response = await stClient.submitTransferCommitment(commitment);
             if (response.status !== 'SUCCESS' && response.status !== 'REQUEST_ID_EXISTS') {
               logger.error('Payments', 'Transfer commitment submission failed:', response.status);
-              return;
+              return false;
             }
 
             if (!this.deps!.oracle.waitForProofSdk) {
               logger.error('Payments', 'Cannot wait for proof - missing oracle method');
-              return;
+              return false;
             }
             const inclusionProof = await this.deps!.oracle.waitForProofSdk(commitment);
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -12186,7 +12810,7 @@ export class PaymentsModule {
           }
         } catch (err) {
           logger.error('Payments', 'Failed to parse transferTx:', err);
-          return;
+          return false;
         }
 
         // Finalize using shared helper (handles PROXY address validation)
@@ -12196,7 +12820,7 @@ export class PaymentsModule {
           const trustBase = (this.deps!.oracle as any).getTrustBase?.();
           if (!stClient || !trustBase) {
             logger.error('Payments', 'Cannot finalize - missing state transition client or trust base. Token rejected.');
-            return;
+            return false;
           }
           finalizedSdkToken = await this.finalizeTransferToken(sourceToken, transferTx, stClient, trustBase);
           tokenData = finalizedSdkToken.toJSON();
@@ -12204,7 +12828,7 @@ export class PaymentsModule {
           logger.debug('Payments', `${addressScheme === AddressScheme.PROXY ? 'PROXY' : 'DIRECT'} finalization successful`);
         } catch (finalizeError) {
           logger.error('Payments', 'Finalization FAILED - token rejected:', finalizeError);
-          return;
+          return false;
         }
       } else if (payload.token) {
         // SDK format `{ token, proof? }`. The sender shipped a token JSON.
@@ -12341,14 +12965,14 @@ export class PaymentsModule {
         }
       } else {
         logger.warn('Payments', 'Unknown transfer payload format');
-        return;
+        return false;
       }
 
       // Validate token
       const validation = await this.deps!.oracle.validateToken(tokenData);
       if (!validation.valid) {
         logger.warn('Payments', 'Received invalid token');
-        return;
+        return false;
       }
 
       // Parse token info from SDK data
@@ -12402,10 +13026,31 @@ export class PaymentsModule {
         logger.debug('Payments', `Incoming transfer processed: ${token.id}, ${token.amount} ${token.symbol}`);
       } else {
         logger.debug('Payments', `Duplicate transfer ignored: ${token.id}, ${token.amount} ${token.symbol}`);
+        // Duplicate via stateHash dedup — the token was already
+        // persisted on a prior event. Treat as durable so the Nostr
+        // ack can advance.
+        nothingToPerist = true;
       }
+      bodyCompleted = true;
     } catch (error) {
       logger.error('Payments', 'Failed to process incoming transfer:', error);
+      // bodyCompleted stays false → durable=false → ack NOT advanced
     }
+    } finally {
+      // Drain race fix — counterpart to the entry-side increment. Runs
+      // on every exit path (return, throw, normal completion). When
+      // this reaches 0, no inbound transfer is mid-pipeline and a
+      // pre-flush drain can safely snapshot `this.tokens`.
+      this.inflightReceiveCount--;
+    }
+
+    // At-least-once invariant: if the body completed and persisted a
+    // token, we MUST await flush completion on every provider that
+    // supports it before returning durable=true. The transport layer
+    // uses our return value to gate `lastEventTs` advancement.
+    if (!bodyCompleted) return false;
+    if (nothingToPerist) return true;
+    return await this.awaitAllProvidersDurable(60_000);
   }
 
   // ===========================================================================
@@ -12784,18 +13429,38 @@ export class PaymentsModule {
     this.tombstones = mergedArray;
     this.tombstoneKeySet = mergedKeySet;
     // Load tokens, filtering out tombstoned ones.
-    // Preserve tokens with 'transferring' status — they are part of an in-flight send().
-    const preservedTransferring = new Map<string, Token>();
-    for (const [id, token] of this.tokens) {
-      if (token.status === 'transferring') {
-        preservedTransferring.set(id, token);
-      }
-    }
+    //
+    // INVARIANT (2026-05-16): load() MUST NEVER drop tokens that exist
+    // only in memory. Storage can lag (debounced flush, transient
+    // pointer publish failures holding the at-least-once gate closed)
+    // while addToken has already committed to `this.tokens`. A
+    // wholesale `tokens.clear()` followed by "rebuild from storage"
+    // silently wipes any token whose flush hasn't durably completed —
+    // even though PaymentsModule originally accepted it. That is the
+    // exact failure mode that caused profile-multi-device-sync to lose
+    // 4 of 7 faucet drops when transient AGGREGATOR_POINTER_WALKBACK_FLOOR
+    // errors held the publish gate closed.
+    //
+    // Policy:
+    //   - Snapshot every in-memory token before clearing.
+    //   - Storage data wins for tokens whose (tokenId, stateHash)
+    //     identity matches a storage entry. The storage version is
+    //     the most-recently-loaded definitive shape (proofs, etc.).
+    //   - For every snapshot token that has NO matching storage
+    //     entry: re-insert it after the storage load. These are
+    //     tokens still in flight from in-memory to storage; dropping
+    //     them would lose user state.
+    //   - Tombstoned tokens (matching the tombstone set after the
+    //     UNION-MERGE above) are dropped from the snapshot —
+    //     consistent with the storage-side filter below.
+    //
+    // The pre-existing 'transferring' preservation guard is now
+    // redundant (covered by the broader policy) but kept for clarity
+    // at the call site. The newer `preservedFromMemory` map covers
+    // every other status — confirmed, unconfirmed, pending, etc.
+    const preservedFromMemory = new Map<string, Token>(this.tokens);
 
     this.tokens.clear();
-    for (const [id, token] of preservedTransferring) {
-      this.tokens.set(id, token);
-    }
 
     // Load other data EARLY so archive-move (below) can write into the
     // up-to-date archive map. Note: `this.nametags` is set further down
@@ -12806,8 +13471,13 @@ export class PaymentsModule {
 
     let archiveMoved = 0;
     for (const token of parsed.tokens) {
-      // Don't overwrite in-flight tokens preserved above
-      if (preservedTransferring.has(token.id)) continue;
+      // Don't overwrite in-flight 'transferring' tokens from the
+      // pre-clear snapshot. The broader NEVER-WIPE restore loop
+      // below handles every OTHER status, but at the in-loop set
+      // stage we still skip storage entries that would clobber a
+      // 'transferring' in-flight send (the original guard).
+      const existingTransferring = preservedFromMemory.get(token.id);
+      if (existingTransferring?.status === 'transferring') continue;
 
       const sdkTokenId = extractTokenIdFromSdkData(token.sdkData);
       const stateHash = extractStateHashFromSdkData(token.sdkData);
@@ -12867,6 +13537,96 @@ export class PaymentsModule {
       logger.debug(
         'Payments',
         `[BALANCE-INVARIANT] loadFromStorageData moved ${archiveMoved} token(s) to archive`,
+      );
+    }
+
+    // NEVER-WIPE INVARIANT (2026-05-16): re-insert any token from the
+    // pre-clear snapshot that storage did NOT supersede. Storage wins
+    // when the same (tokenId, stateHash) identity already loaded —
+    // those tokens are NOT restored from the snapshot (the storage
+    // version is the canonical one). All other snapshot tokens (those
+    // still in flight to storage, or those whose flush failed for any
+    // reason) are restored. Tombstoned (tokenId, stateHash) pairs are
+    // dropped to stay consistent with the storage-side filter.
+    //
+    // Build a set of the (tokenId, stateHash) identities now in
+    // `this.tokens` from the storage load so the restore loop can
+    // dedup cheaply. `Token.id` is internal and can differ between
+    // a snapshot entry and a storage entry that represent the SAME
+    // logical state — so the comparison MUST go through the SDK-data
+    // extractors.
+    const loadedStateKeys = new Set<string>();
+    for (const t of this.tokens.values()) {
+      const tid = extractTokenIdFromSdkData(t.sdkData);
+      const sh = extractStateHashFromSdkData(t.sdkData);
+      if (tid && sh) loadedStateKeys.add(createTokenStateKey(tid, sh));
+    }
+
+    let restoredFromMemory = 0;
+    for (const [snapshotId, snapshotToken] of preservedFromMemory) {
+      // Skip if storage already loaded a token at this id slot.
+      if (this.tokens.has(snapshotId)) continue;
+
+      const snapTokenId = extractTokenIdFromSdkData(snapshotToken.sdkData);
+      const snapStateHash = extractStateHashFromSdkData(snapshotToken.sdkData);
+
+      // Tombstoned (tokenId, stateHash) pair → drop (storage tombstone wins).
+      if (
+        snapTokenId &&
+        snapStateHash &&
+        this.isStateTombstoned(snapTokenId, snapStateHash)
+      ) {
+        continue;
+      }
+
+      // Storage already has this exact state under a different id slot
+      // (rare — happens when storage's internal id differs from the
+      // in-memory id for the same logical token). Storage wins.
+      if (
+        snapTokenId &&
+        snapStateHash &&
+        loadedStateKeys.has(createTokenStateKey(snapTokenId, snapStateHash))
+      ) {
+        continue;
+      }
+
+      // Snapshot has a NEWER state than what storage loaded for the
+      // same tokenId. The newer state was added to memory after the
+      // last successful flush and storage hasn't caught up. Archive
+      // the older state in `this.tokens` (if present) and restore
+      // the newer snapshot — matches addToken's CASE 2 semantics.
+      if (snapTokenId) {
+        let supersededOlder = false;
+        for (const [existingId, existingToken] of this.tokens) {
+          if (!hasSameGenesisTokenId(existingToken, snapshotToken)) continue;
+          const existingStateHash = extractStateHashFromSdkData(existingToken.sdkData);
+          if (
+            snapStateHash &&
+            existingStateHash &&
+            snapStateHash === existingStateHash
+          ) {
+            // Same exact state — storage's record wins (it was just loaded).
+            supersededOlder = true;
+            break;
+          }
+          // Different state: leave the storage version in place AND
+          // restore the snapshot's version too. PaymentsModule's
+          // downstream logic (manifest derivation, fork detection)
+          // already handles same-tokenId-multiple-states. Dropping
+          // either side would lose information.
+          break;
+        }
+        if (supersededOlder) continue;
+      }
+
+      this.tokens.set(snapshotId, snapshotToken);
+      restoredFromMemory++;
+    }
+    if (restoredFromMemory > 0) {
+      logger.debug(
+        'Payments',
+        `[NEVER-WIPE] loadFromStorageData restored ${restoredFromMemory} in-memory ` +
+          `token(s) not present in storage (likely in-flight or flush-stalled)`,
       );
     }
 

@@ -56,6 +56,7 @@ import {
   deriveProfileEncryptionKey,
 } from '../encryption.js';
 import { computeAddressId } from '../types.js';
+import { logger } from '../../core/logger.js';
 import type { BundleIndex } from './bundle-index.js';
 import type { ProfileTokenStorageHost } from './host.js';
 import { fetchFromIpfs } from '../ipfs-client.js';
@@ -109,6 +110,26 @@ export class LifecycleManager {
    */
   private pointerPollTimer: ReturnType<typeof setTimeout> | null = null;
 
+  /**
+   * Poll-discovery handler captured from `initialize()`. Invoked by
+   * {@link runPointerPollOnce} after it adds a poll-discovered CID to
+   * the bundle index — drives the necessary load() + scheduleFlushNoData
+   * to keep `lastLoadedFromBundleCids` in sync with OrbitDB. Without it,
+   * the periodic poll adds CIDs to OrbitDB but never loads them, and
+   * subsequent save-driven flushes abort with
+   * POINTER_MONOTONICITY_VIOLATION (correctly preventing silent token
+   * loss, but causing the at-least-once gate to refuse every Nostr ack).
+   *
+   * Distinct from the pubsub-driven `replicationHandler` (closure
+   * captured at line ~186) because the pubsub handler has its own
+   * "did we observe anything new" diff check and snapshot ordering
+   * that aren't applicable here (the poll already confirmed the CID
+   * is new before invoking this callback).
+   *
+   * Set in `initialize()`; cleared (set to null) in `shutdown()`.
+   */
+  private onPollDiscoveredNewCid: (() => Promise<void>) | null = null;
+
   constructor(
     private readonly host: ProfileTokenStorageHost,
     private readonly bundleIndex: BundleIndex,
@@ -135,7 +156,16 @@ export class LifecycleManager {
     }
   }
 
-  async initialize(replicationHandler: () => Promise<void>): Promise<boolean> {
+  async initialize(
+    replicationHandler: () => Promise<void>,
+    onPollDiscoveredNewCid?: () => Promise<void>,
+  ): Promise<boolean> {
+    // Capture the poll-discovery callback so `runPointerPollOnce` can
+    // trigger a load+flush after discovering and adding a new CID.
+    // Optional — when omitted (legacy callers), the periodic-poll's
+    // addBundle leaves loadedBundleCids stale and the next save-driven
+    // flush may abort with POINTER_MONOTONICITY_VIOLATION.
+    this.onPollDiscoveredNewCid = onPollDiscoveredNewCid ?? null;
     if (this.host.getInitialized()) return true;
 
     if (!this.host.getIdentity()) {
@@ -266,6 +296,10 @@ export class LifecycleManager {
     this.host.setLastLoadedData(null);
     this.host.setLastLoadedFromBundleCids(null);
     this.host.setLastTokenManifest(null);
+    // Release the poll-discovery callback so a delayed `runPointerPollOnce`
+    // tick that fires after shutdown doesn't reach back into the (now
+    // torn-down) provider.
+    this.onPollDiscoveredNewCid = null;
 
     this.host.setInitialized(false);
     this.host.setStatus('disconnected');
@@ -298,41 +332,116 @@ export class LifecycleManager {
   /**
    * Publish the just-flushed CID to the aggregator pointer layer.
    *
-   * TRANSIENT failures are silently logged — the CAR is already
-   * pinned and the OrbitDB bundle ref is already written, so the
-   * next flush can retry the publish.
+   * Returns a structured result instead of swallowing failures so the
+   * caller (FlushScheduler) can propagate transient errors up to the
+   * at-least-once gate. The persistence of the retry marker
+   * (`pendingPublishCid`) is handled here:
    *
-   * PERMANENT failures (UNREACHABLE_RECOVERY_BLOCKED, REJECTED,
-   * UNTRUSTED_PROOF, TRUST_BASE_STALE, MARKER_CORRUPT, CORRUPT_STREAK,
-   * SECURITY_ORIGIN_MISMATCH, CAPABILITY_DENIED, UNSUPPORTED_RUNTIME,
-   * PROTOCOL_ERROR, AGGREGATOR_REJECTED) are surfaced via a
-   * `storage:error` event with the error code in the payload.
+   *   - SUCCESS — clears `pendingPublishCid`, anchors
+   *     `lastDiscoveredPointerCid`, returns `{ ok: true }`.
+   *   - TRANSIENT failure — sets `pendingPublishCid = cidString` (with
+   *     localCache persistence for crash safety), returns
+   *     `{ ok: false, transient: true }`. Caller MUST treat this as
+   *     "not durable" — the at-least-once gate refuses the Nostr ack
+   *     so the inbound event replays on next reconnect (idempotent
+   *     via addToken stateHash dedup and processedCombinedTransferIds).
+   *     The pending marker is retried at start of every subsequent
+   *     `flushToIpfs` and `runPointerPollOnce`.
+   *   - PERMANENT failure (UNREACHABLE_RECOVERY_BLOCKED, REJECTED,
+   *     UNTRUSTED_PROOF, TRUST_BASE_STALE, MARKER_CORRUPT, CORRUPT_STREAK,
+   *     SECURITY_ORIGIN_MISMATCH, CAPABILITY_DENIED, UNSUPPORTED_RUNTIME,
+   *     PROTOCOL_ERROR, AGGREGATOR_REJECTED) — emits `storage:error`
+   *     event with the error code, clears `pendingPublishCid` (no
+   *     retry would help; surfacing is the action), returns
+   *     `{ ok: false, transient: false, code }`. Callers ack the event
+   *     so the wallet does not deadlock on a permanently-failing
+   *     publish — operator intervention is required and is surfaced
+   *     via the emitted event.
+   *
+   * Returns `{ ok: false, transient: false }` (treated as permanent)
+   * if no pointer-layer closure is wired — the wallet is not
+   * configured for aggregator anchoring, so there's nothing to do.
    */
-  async publishAggregatorPointerBestEffort(cidString: string): Promise<void> {
+  async publishAggregatorPointerBestEffort(
+    cidString: string,
+  ): Promise<{ readonly ok: boolean; readonly transient: boolean; readonly code?: string }> {
     const pointer = this.host.options?.getPointerLayer?.() ?? null;
-    if (!pointer) return;
+    if (!pointer) {
+      // No pointer wiring — nothing to retry, no transient classification.
+      this.host.setPendingPublishCid(null);
+      return { ok: false, transient: false };
+    }
 
     try {
       const cidBytes = CID.parse(cidString).bytes;
       const result = await pointer.publish(async () => cidBytes);
-      // Successful publish: this CID is now the authoritative pointer
-      // anchor. Track for no-data flush idempotency — a subsequent
-      // remote-update-driven republish that would re-publish the same
-      // bytes can short-circuit.
       this.host.setLastDiscoveredPointerCid(cidString);
+      // Clear any previously-pending marker — this publish succeeded,
+      // so the cross-device recovery path can now reach the bundle.
+      this.host.setPendingPublishCid(null);
       this.host.log(
         `Pointer publish ok: cid=${cidString} version=${result.version} attempts=${result.attemptsUsed}`,
       );
+      return { ok: true, transient: false };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (this.isPermanentPointerError(err)) {
         const code = (err as { code?: string }).code ?? 'UNKNOWN';
         this.host.log(`Pointer publish PERMANENT failure (${code}): ${msg}`);
         this.host.emitEvent(this.host.buildErrorEvent('storage:error', err));
-      } else {
-        this.host.log(`Pointer publish failed (transient, best-effort): ${msg}`);
+        // Permanent failures: drop the retry marker. The operator
+        // alert event is the call to action; auto-retry would just
+        // hammer a wallet that needs human intervention.
+        this.host.setPendingPublishCid(null);
+        return { ok: false, transient: false, code };
       }
+      // Elevate the transient publish failure to warn-level so the
+      // operator sees the underlying cause without enabling debug —
+      // pointer publish failures hold the at-least-once gate closed
+      // and the user cannot diagnose the stall otherwise. Includes
+      // any typed AggregatorPointerError code so monitoring can
+      // filter on transient classes (NETWORK_ERROR vs unclassified).
+      const transientCode =
+        typeof (err as { code?: unknown }).code === 'string'
+          ? (err as { code: string }).code
+          : 'UNCLASSIFIED';
+      logger.warn(
+        'Profile-TokenStorage',
+        `Pointer publish failed (transient, code=${transientCode}, cid=${cidString}): ${msg}`,
+      );
+      // Transient: stamp the retry marker (with localCache persistence
+      // for crash safety) so subsequent flushes / polls re-attempt
+      // before any new save-driven work.
+      this.host.setPendingPublishCid(cidString);
+      return { ok: false, transient: true };
     }
+  }
+
+  /**
+   * If a previous publish left `pendingPublishCid` non-null, try
+   * again. Called at the start of every `flushToIpfs` and every
+   * `runPointerPollOnce` so the retry is gated on the normal flush
+   * cadence rather than a dedicated timer.
+   *
+   * Returns the same result shape as `publishAggregatorPointerBestEffort`
+   * with an additional `attempted` flag:
+   *   - `attempted: false` when no marker is set (caller proceeds).
+   *   - `attempted: true` when a retry was made (result indicates
+   *     whether the marker was cleared).
+   */
+  async retryPendingPublishIfAny(): Promise<{
+    readonly attempted: boolean;
+    readonly ok: boolean;
+    readonly transient: boolean;
+    readonly code?: string;
+  }> {
+    const pending = this.host.getPendingPublishCid();
+    if (!pending) {
+      return { attempted: false, ok: true, transient: false };
+    }
+    this.host.log(`Retrying pending pointer publish: cid=${pending}`);
+    const result = await this.publishAggregatorPointerBestEffort(pending);
+    return { attempted: true, ok: result.ok, transient: result.transient, code: result.code };
   }
 
   /**
@@ -585,6 +694,35 @@ export class LifecycleManager {
    * The intervals are randomised in [30s, 90s) to avoid synchronised
    * polling across devices that booted simultaneously.
    */
+  /**
+   * Public wake-up API: trigger an IMMEDIATE aggregator pointer poll
+   * without waiting for the periodic [30s, 90s) cycle.
+   *
+   * Called by `ProfileTokenStorageProvider.handleReplication` when an
+   * OrbitDB-pubsub replication event arrives. The aggregator is the
+   * authoritative source of truth for the latest pointer version —
+   * pubsub between two devices is unreliable (NAT, firewall, peer
+   * discovery), so we treat the pubsub signal as a hint to consult
+   * the aggregator NOW rather than waiting for the next periodic poll.
+   *
+   * When pubsub fails entirely, the periodic poll (worst case 90s)
+   * still guarantees eventual sync — the aggregator is the ultimate
+   * fallback channel.
+   *
+   * Idempotent: if no aggregator update is found, no-op. If a new CID
+   * is found, adds it to the bundle index (same path as the periodic
+   * poll). Re-arms the periodic timer so the next scheduled poll is
+   * a fresh [30s, 90s) window from this call.
+   *
+   * Returns a promise that resolves when the poll completes (success
+   * or transient failure). Rejection only on programmer error — all
+   * transient/permanent failures are logged + swallowed (matching the
+   * periodic-poll contract).
+   */
+  async triggerPointerPollNow(): Promise<void> {
+    return this.runPointerPollOnce();
+  }
+
   private schedulePointerPoll(): void {
     if (this.host.getIsShuttingDown()) return;
 
@@ -627,6 +765,22 @@ export class LifecycleManager {
       // build still in flight). Skip this tick and re-arm.
       this.scheduleNextPointerPoll(nextBackoffMultiplier);
       return;
+    }
+
+    // Retry any pending publish from a previous transient failure
+    // BEFORE polling for new pointer state. If the retry succeeds the
+    // marker is cleared; if it stays transient the next periodic tick
+    // or save-driven flush retries again. Failures here are non-fatal
+    // to the poll itself — we still proceed to recoverLatest so this
+    // tick is not wasted.
+    try {
+      await this.retryPendingPublishIfAny();
+    } catch (err) {
+      this.host.log(
+        `Pointer poll: pending-publish retry threw (best-effort): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
     }
 
     let recovered: { readonly cid: Uint8Array; readonly version: number } | null = null;
@@ -692,6 +846,38 @@ export class LifecycleManager {
       this.host.log(
         `Pointer poll discovered NEW CID: cid=${cidString} version=${recovered.version}`,
       );
+
+      // Invoke the poll-discovery handler so the new CID gets loaded
+      // into `lastLoadedData` and the pointer is re-anchored at the
+      // merged state. Without this, subsequent save-driven flushes
+      // would see the new CID as "unknown" relative to
+      // `lastLoadedFromBundleCids` and abort with
+      // POINTER_MONOTONICITY_VIOLATION — silently refusing to publish
+      // (which the at-least-once gate correctly surfaces as a Nostr-
+      // ack refusal, but causes spurious replays).
+      //
+      // This is a DIFFERENT callback from `replicationHandler` —
+      // replicationHandler does its own diff check (previousCids vs
+      // current knownBundleCids) which would skip the load if it
+      // runs AFTER our addBundle (the diff is no-op once addBundle
+      // already updated knownBundleCids). `onPollDiscoveredNewCid`
+      // unconditionally loads + schedules a no-data flush; the caller
+      // (this method) already confirmed it's a new CID via the
+      // knownBundleCids.has(cidString) guard above.
+      //
+      // Best-effort: failures here are logged but do not abort the
+      // poll-loop re-arm at the end.
+      if (this.onPollDiscoveredNewCid) {
+        try {
+          await this.onPollDiscoveredNewCid();
+        } catch (err2) {
+          this.host.log(
+            `Pointer poll: onPollDiscoveredNewCid failed (best-effort): ${
+              err2 instanceof Error ? err2.message : String(err2)
+            }`,
+          );
+        }
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.host.log(`Pointer poll: addBundle failed: ${msg}`);

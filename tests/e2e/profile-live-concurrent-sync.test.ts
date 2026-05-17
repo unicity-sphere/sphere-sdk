@@ -100,8 +100,16 @@ const SKIP_INFRA = preflightSkip(
 const TEST1_BUDGET_MS = 240_000;
 const TEST2_BUDGET_MS = 240_000;
 // Within each test, how long to poll for the observable state change.
-const PROPAGATION_TIMEOUT_MS = 120_000;
-const POLL_INTERVAL_MS = 2_000;
+// Cross-device sync deadline: 100s covers the worst-case periodic
+// aggregator-pointer poll cycle (max [30s, 90s) randomization + small
+// margin). When pubsub between devices fails (which it does in many
+// CI / NAT-bound environments), the periodic poll is the safety-net
+// channel; 100s guarantees at least one full poll cycle.
+const PROPAGATION_TIMEOUT_MS = 100_000;
+// Poll every 10s — early-exit on first success. Most tests complete
+// well under 100s when pubsub works; the long deadline is just to
+// cover the worst case.
+const POLL_INTERVAL_MS = 10_000;
 // Settle window for Test 2 — give CRDT pubsub time to converge after
 // both devices independently write to OrbitDB.
 const CONVERGENCE_SETTLE_MS = 30_000;

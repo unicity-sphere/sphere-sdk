@@ -22,10 +22,16 @@
  *     1+2 of `classifyVersion` (inclusion proofs + XOR-decode) to
  *     return the CID bytes for an already-VALID version
  *   - Wire `fetchAndJoin` — fetches the CAR from IPFS with content-
- *     address verify, then records the remote CID as a bundle ref in
- *     OrbitDB (`tokens.bundle.{cid}`) so the next client-side JOIN
- *     pass (inside ProfileTokenStorageProvider.load()) incorporates
- *     it. This relies on the existing multi-bundle union path —
+ *     address verify, records the remote CID as a bundle ref in
+ *     OrbitDB (`tokens.bundle.{cid}`), and ONLY THEN advances the
+ *     per-device cursor by calling `persistLocalVersion`. The bundle-
+ *     ref-first ordering is load-bearing: if OrbitDB writes fail
+ *     (timeout, sync error), the cursor stays behind OrbitDB and the
+ *     next reconcile re-attempts the same `(cidBytes, version)` pair
+ *     — recoverable. Reversing the order would silently strand the
+ *     bundle on cross-device recovery. The next JOIN pass (inside
+ *     ProfileTokenStorageProvider.load()) merges the new ref into the
+ *     joined view. This relies on the existing multi-bundle union —
  *     which today runs under the last-writer-wins semantics flagged
  *     by T-D0 (PROFILE-AGGREGATOR-POINTER-D0-JOIN-AUDIT.md): until
  *     the per-token JOIN resolver lands (Rules 3 + 4 in that
@@ -361,6 +367,14 @@ function buildResolveRemoteCid(deps: {
  *   4. Persist `profile.pointer.version = remoteVersion` so subsequent
  *      reconcile passes start from the advanced cursor.
  *
+ * This callback is the SOLE owner of cursor advancement on the
+ * conflict path (per the FetchAndJoinCallback contract in
+ * reconcile-algorithm.ts). `reconcileAndPublish` does not call
+ * `persistLocalVersion` after we return — it only updates its
+ * in-memory loop variable. The bundle-ref-first / cursor-after ordering
+ * inside this callback is therefore the only place enforcing the
+ * "no orphan cursor without a bundle ref" invariant.
+ *
  * Limitation (T-D0): the multi-bundle JOIN currently runs under
  * last-writer-wins for same-tokenId collisions and does not perform
  * longest-valid-chain resolution or proof enrichment. For the
@@ -441,19 +455,33 @@ function buildFetchAndJoin(deps: {
       );
     }
 
-    // Step 4 runs BEFORE step 5 to avoid the "cursor advanced past a
-    // bundle that isn't in OrbitDB yet" failure mode: if the
-    // bundle-ref write below throws but persistLocalVersion has
-    // already committed `version = remoteVersion`, the next
-    // reconcile/discover round starts from a version whose bundle
-    // ref was never written. The OrbitDB ref is the authoritative
-    // state; local version is derived. Persisting the version first
-    // means the write either both succeed (happy path) or the
-    // cursor stays behind OrbitDB (recoverable — next reconcile
-    // re-fetches the same cidBytes, and the ref is idempotent by
-    // key). Wrap the write with a hard timeout: @orbitdb/core queues
-    // writes against OpLog heads and can hang indefinitely if the
-    // replication layer is stuck.
+    // Write the OrbitDB bundle ref FIRST, persistLocalVersion AFTER.
+    //
+    // The original ordering (persistLocalVersion → put) is unsafe under
+    // any failure of the OrbitDB write: the local cursor advances to
+    // `version = remoteVersion` but no bundle ref ever lands. The next
+    // reconcile round queries the aggregator for versions > remoteVersion
+    // and never re-fetches the bundle for `remoteVersion` — its tokens
+    // are permanently invisible to JOIN. The OrbitDB write can fail
+    // through any of: a 15s hard-timeout (see `ORBITDB_WRITE_TIMEOUT_MS`)
+    // because @orbitdb/core queues writes against OpLog heads and can
+    // hang when the replication layer is stuck; a thrown sync error from
+    // the OrbitDB peer; or a `put`-path encryption/envelope failure.
+    //
+    // Correct ordering: write the bundle ref first. If it fails,
+    // persistLocalVersion never runs — the cursor stays at its previous
+    // value, and the next reconcile re-fetches the same `(remoteCid,
+    // remoteVersion)` pair. The OrbitDB write is idempotent (same key
+    // = `BUNDLE_KEY_PREFIX + cidString`, deterministically encrypted
+    // payload — encryptProfileValue uses random nonces, but the ref
+    // semantics are key-scoped so a duplicate put is a harmless
+    // overwrite). The IPFS fetch above is content-addressed and also
+    // idempotent.
+    //
+    // If persistLocalVersion fails AFTER the bundle ref lands, the
+    // cursor stays behind OrbitDB on the next reconcile but the JOIN
+    // walker still sees the ref (knownBundleCids picks it up), so
+    // tokens remain visible. Reconcile re-attempts the same version.
     //
     // T-D11 W11: stamp the write with originated='system'.
     // fetchAndJoin's bundle-ref writes mirror addBundle — both are
@@ -461,7 +489,6 @@ function buildFetchAndJoin(deps: {
     // the envelope tag matches ProfileTokenStorageProvider.addBundle.
     // This keeps the peer's replication view consistent regardless
     // of which local path produced the ref.
-    await deps.persistLocalVersion(remoteVersion);
     const bundleKey = BUNDLE_KEY_PREFIX + cidString;
     try {
       if (typeof deps.db.putEntry === 'function') {
@@ -498,6 +525,11 @@ function buildFetchAndJoin(deps: {
         { cause: err },
       );
     }
+
+    // Cursor advance AFTER bundle ref is durable. A failure here leaves
+    // the bundle ref in OrbitDB (JOIN still sees it) but the cursor at
+    // its previous value — recoverable via re-reconcile.
+    await deps.persistLocalVersion(remoteVersion);
   };
 }
 

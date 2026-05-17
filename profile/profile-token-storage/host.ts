@@ -109,6 +109,23 @@ export interface ProfileTokenStorageHost {
   getLastDiscoveredPointerCid(): string | null;
   setLastDiscoveredPointerCid(c: string | null): void;
 
+  /**
+   * A CID whose CAR is pinned to IPFS and whose OrbitDB bundle ref is
+   * written, but whose pointer publish (aggregator anchor) is still
+   * outstanding due to a transient failure. The next flush AND the
+   * periodic pointer-poll re-attempt the publish at start; on success
+   * the field is cleared. While non-null, the at-least-once gate in
+   * `PaymentsModule.handleIncomingTransfer` is held closed because the
+   * cross-device recovery path cannot reach this bundle yet.
+   *
+   * Persisted to `localCache` under the key
+   * `STORAGE_KEYS_GLOBAL.PROFILE_PENDING_PUBLISH_CID_PREFIX + addressId`
+   * for crash-safety so a process restart resumes the retry rather
+   * than abandoning the publish silently.
+   */
+  getPendingPublishCid(): string | null;
+  setPendingPublishCid(c: string | null): void;
+
   // --- Bundle index state ---
   getKnownBundleCids(): Set<string>;
   setKnownBundleCids(s: Set<string>): void;
@@ -153,6 +170,23 @@ export interface ProfileTokenStorageHost {
   // --- Flush coordination (FlushScheduler entry point) ---
   /** Snapshot pendingData and run a single IPFS pin + OrbitDB write. */
   flushToIpfs(): Promise<void>;
+
+  /**
+   * Refresh `lastLoadedFromBundleCids` (and `lastLoadedData`) by
+   * running a fresh `load()` against the current OrbitDB bundle
+   * index. Called by FlushScheduler on a `POINTER_MONOTONICITY_VIOLATION`
+   * to repair a stale baseline before the next flush attempt.
+   *
+   * MUST be a no-op when a flush is already in flight (load() awaits
+   * `flushPromise`, so calling from inside flushToIpfs would deadlock).
+   * The facade implementation handles this by skipping the refresh
+   * when invoked synchronously from within the current flush body.
+   *
+   * Returns true on successful refresh; false on internal load failure
+   * (caller proceeds to the next strategy — typically throw the
+   * original violation so the at-least-once gate refuses the ack).
+   */
+  refreshBaselineForMonotonicity(): Promise<boolean>;
 
   // --- TXF adapter helpers (stay on the facade for now) ---
   extractTokensFromTxfData(data: TxfStorageDataBase): Map<string, unknown>;

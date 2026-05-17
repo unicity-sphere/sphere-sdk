@@ -547,6 +547,7 @@ export type SphereEventType =
   | 'transfer:override-applied'
   | 'transfer:capability-warning'
   | 'transfer:recovery-republished'
+  | 'transfer:orphan-spending-detected'
   | 'payment_request:incoming'
   | 'payment_request:accepted'
   | 'payment_request:rejected'
@@ -1042,6 +1043,28 @@ export interface SphereEventMap {
     readonly mode: 'conservative' | 'instant' | 'txf';
     readonly targetStatus: 'delivered' | 'delivered-instant';
     readonly recoveredAt: number;
+  };
+  /**
+   * Issue #97 — A token in `'transferring'` status (= has an
+   * in-flight spending tx) was found in neither the OUTBOX nor the
+   * SENT ledger. This indicates a crash between Step 1 (append
+   * spending tx) and Step 2 (persist outbox entry) of the canonical
+   * send flow; the spending tx is on-chain but the delivery never
+   * persisted. Operators must intervene — auto-recovery requires
+   * bundle reconstruction (re-package + re-pin) which is gated to a
+   * follow-up wave. See `payments.detectOrphanSpendingTokens()`.
+   *
+   * Payload fields:
+   *  - `tokenId`     — the orphan token id
+   *  - `detectedAt`  — wall-clock ms timestamp of detection
+   *  - `coinId`      — coin id for operator triage
+   *  - `amount`      — token amount (smallest units) for operator triage
+   */
+  'transfer:orphan-spending-detected': {
+    readonly tokenId: string;
+    readonly detectedAt: number;
+    readonly coinId: string;
+    readonly amount: string;
   };
   'payment_request:incoming': IncomingPaymentRequest;
   'payment_request:accepted': IncomingPaymentRequest;

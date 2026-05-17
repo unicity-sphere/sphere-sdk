@@ -43,6 +43,8 @@
  */
 
 import { logger } from '../core/logger.js';
+import { SphereError } from '../core/errors.js';
+import { STORAGE_KEYS_GLOBAL } from '../constants.js';
 import type { ProviderStatus, FullIdentity } from '../types/index.js';
 import type {
   TokenStorageProvider,
@@ -171,6 +173,21 @@ export class ProfileTokenStorageProvider
   // already matches the authoritative pointer (e.g., remote originator
   // already anchored the state we just merged from their bundle).
   private lastDiscoveredPointerCid: string | null = null;
+
+  /**
+   * CID whose CAR is durably pinned + OrbitDB bundle ref written but
+   * whose aggregator pointer publish is outstanding due to a transient
+   * failure. The next `flushToIpfs` and the periodic pointer poll
+   * retry the publish at start. While non-null, downstream callers
+   * that await durability via `awaitNextFlush` MUST see the chain
+   * reject so the at-least-once gate keeps the Nostr ack held.
+   *
+   * Persisted to `localCache` under
+   * `<STORAGE_KEYS_GLOBAL.PROFILE_PENDING_PUBLISH_CID>_<addressId>`
+   * so a process restart resumes the retry. Loaded lazily on
+   * `initialize()`; written via `setPendingPublishCidPersisted`.
+   */
+  private pendingPublishCid: string | null = null;
 
   // --- Bundle CIDs merged into lastLoadedData (pointer monotonicity) ---
   // Snapshot of the active OrbitDB bundle index at the moment load()
@@ -321,6 +338,22 @@ export class ProfileTokenStorageProvider
       setLastDiscoveredPointerCid: (c) => {
         this.lastDiscoveredPointerCid = c;
       },
+      getPendingPublishCid: () => this.pendingPublishCid,
+      setPendingPublishCid: (c) => {
+        this.pendingPublishCid = c;
+        // Fire-and-forget persistence — failures are logged but don't
+        // block the caller. On crash, an unwritten retry marker means
+        // the next process boot won't re-attempt; this is acceptable
+        // because a subsequent save-driven flush still re-derives the
+        // need to publish (lastDiscoveredPointerCid stays stale).
+        this.persistPendingPublishCid(c).catch((err) => {
+          this.log(
+            `persistPendingPublishCid failed (best-effort): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        });
+      },
       // Bundle index state
       getKnownBundleCids: () => this.knownBundleCids,
       setKnownBundleCids: (s) => {
@@ -351,6 +384,7 @@ export class ProfileTokenStorageProvider
       readProfileKeyJson: (key) => this.readProfileKeyJson(key),
       // Flush coordination
       flushToIpfs: () => this.flushScheduler.flushToIpfs(),
+      refreshBaselineForMonotonicity: () => this.refreshBaselineForMonotonicity(),
       // TXF adapter helpers
       extractTokensFromTxfData: (data) => this.extractTokensFromTxfData(data),
       extractOperationalState: (data) => this.extractOperationalState(data),
@@ -393,11 +427,156 @@ export class ProfileTokenStorageProvider
   // ---------------------------------------------------------------------------
 
   async initialize(): Promise<boolean> {
-    return this.lifecycleManager.initialize(() => this.handleReplication());
+    // Restore any persisted pending-publish marker from a prior
+    // process run BEFORE lifecycle wires up — this lets the very
+    // first periodic poll / save-driven flush retry the publish.
+    await this.restorePendingPublishCidFromCache();
+    return this.lifecycleManager.initialize(
+      () => this.handleReplication(),
+      () => this.onPollDiscoveredNewCid(),
+    );
   }
 
   async shutdown(): Promise<void> {
     await this.lifecycleManager.shutdown();
+  }
+
+  /**
+   * TokenStorageProvider.awaitNextFlush — force pending writes to durably
+   * persist (IPFS pin + OrbitDB ref + aggregator pointer) and wait for
+   * completion. Used by PaymentsModule.handleIncomingTransfer to gate
+   * the Nostr `since`-filter advancement on real IPFS durability.
+   *
+   * Pattern mirrors `LifecycleManager.shutdown`'s flush sequence
+   * (cancel debounce → await in-flight → flush remaining pending),
+   * but as a re-callable method that does NOT teardown the provider.
+   *
+   * Loops to handle the case where a concurrent save() lands during
+   * an in-flight flush: that save's data sits in pendingData; we run
+   * another flush to capture it. Bounded by `timeoutMs`.
+   *
+   * Rejects via SphereError('TIMEOUT') if pending writes can't drain
+   * within the budget — caller treats this as "NOT durable" → don't
+   * advance Nostr `since` → re-replay on next reconnect (idempotent
+   * via addToken stateHash dedup).
+   *
+   * @param timeoutMs Max wall-clock time. Default 30s.
+   */
+  async awaitNextFlush(timeoutMs = 30_000): Promise<void> {
+    if (!this.initialized || !this.encryptionKey) return;
+
+    const deadline = Date.now() + timeoutMs;
+    const remainingMs = (): number => Math.max(0, deadline - Date.now());
+
+    // Gap 4 (POINTER_MONOTONICITY_VIOLATION recovery): once per
+    // `awaitNextFlush` invocation we permit a single in-loop baseline
+    // refresh + flush retry. The check fires when OrbitDB has bundle
+    // CIDs that aren't in `lastLoadedFromBundleCids` — typically a
+    // stale baseline produced by a concurrent peer write that
+    // replicated mid-flush. Refreshing via `load()` re-seeds the
+    // baseline; the next flush iteration then passes the check.
+    // Without this recovery, the at-least-once gate would refuse the
+    // Nostr ack on every replay (the bundle is already in OrbitDB so
+    // addToken is a no-op; awaitNextFlush sees nothing to flush and
+    // returns true — masking the persistent violation). The one-shot
+    // budget prevents an infinite recovery loop when the violation
+    // is genuinely permanent.
+    let monotonicityRetried = false;
+
+    // Iterate: there might be saves landing during in-flight flush.
+    // Bound iterations to 4 — each iteration runs one full flush, so
+    // > 4 means save() is faster than flush, which is a runaway
+    // scenario better surfaced as TIMEOUT.
+    //
+    // Uses `flushScheduler.forceFlushSerialized()` (NOT `flushToIpfs()`
+    // directly) so we compose into the host's shared `flushPromise`
+    // chain. Concurrent callers (multiple receives racing to ack their
+    // events) thus get serialized through one chain — preventing the
+    // BUNDLE-SET-CHECK race where parallel `flushToIpfs()` invocations
+    // each pass the monotonicity check, then THE SECOND one sees the
+    // FIRST's just-pinned CID as "unknown" because the first hadn't
+    // yet updated `lastLoadedFromBundleCids`.
+    for (let iteration = 0; iteration < 4; iteration++) {
+      // Cancel pending debounce timer — we don't want to wait its full
+      // window; we'll drive a flush right now via the serialized path.
+      const timer = this.flushTimer;
+      if (timer !== null) {
+        clearTimeout(timer);
+        this.flushTimer = null;
+      }
+
+      // If pendingData is null AND no flush is in flight, nothing to
+      // do — every prior save() must have already settled.
+      if (this.pendingData === null && this.flushPromise === null) return;
+
+      // Force a serialized flush — composes into the host flushPromise
+      // chain. If a flush is already in flight, this one runs AFTER it
+      // (via the chain's `previous.then(flushToIpfs)` step). If we're
+      // the first caller after a save(), this drives the first flush.
+      // Errors from the chain (POINTER_MONOTONICITY_VIOLATION, etc.)
+      // propagate as a rejection — caller decides ack behavior.
+      const chained = this.flushScheduler.forceFlushSerialized();
+      try {
+        await Promise.race([
+          chained,
+          new Promise<never>((_, reject) =>
+            setTimeout(
+              () =>
+                reject(
+                  new SphereError(
+                    'awaitNextFlush: timeout awaiting serialized flush',
+                    'TIMEOUT',
+                  ),
+                ),
+              remainingMs(),
+            ),
+          ),
+        ]);
+      } catch (err) {
+        if (err instanceof SphereError && err.code === 'TIMEOUT') throw err;
+
+        // Gap 4: monotonicity-violation recovery (one shot per call).
+        // Refresh the baseline via load() and retry the flush. If the
+        // refresh itself fails or the SECOND attempt also violates,
+        // surface the original rejection so the at-least-once gate
+        // refuses the Nostr ack — replay on next reconnect is the
+        // safe fallback.
+        const code = (err as { code?: unknown }).code;
+        if (code === 'POINTER_MONOTONICITY_VIOLATION' && !monotonicityRetried) {
+          monotonicityRetried = true;
+          this.log(
+            `awaitNextFlush: POINTER_MONOTONICITY_VIOLATION — ` +
+              `refreshing baseline and retrying flush once`,
+          );
+          const refreshed = await this.refreshBaselineForMonotonicity();
+          if (!refreshed) {
+            this.log(
+              `awaitNextFlush: baseline refresh failed — propagating violation`,
+            );
+            throw err;
+          }
+          // Retry the same flush iteration. The continue() restarts
+          // the loop body which will re-call forceFlushSerialized
+          // with the refreshed `lastLoadedFromBundleCids`.
+          continue;
+        }
+
+        // Surface flush errors so caller (handleIncomingTransfer)
+        // refuses to advance the Nostr ack — event re-replays on
+        // next reconnect; addToken stateHash dedup is idempotent.
+        throw err;
+      }
+
+      // After the flush, pendingData was cleared inside flushToIpfs
+      // unless a concurrent save() landed mid-flush (Steelman⁴³
+      // identity check). Loop to handle that case.
+      if (this.pendingData === null) return;
+    }
+
+    throw new SphereError(
+      'awaitNextFlush: pendingData kept regenerating across 4 flush iterations',
+      'TIMEOUT',
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -494,6 +673,11 @@ export class ProfileTokenStorageProvider
 
       // 2. Dynamically import UxfPackage
       const { UxfPackage } = await import('../uxf/UxfPackage.js');
+      // Local type alias for the imported class instance — UxfPackage's
+      // constructor is private, so `InstanceType<typeof UxfPackage>`
+      // fails. Snapshotting via ReturnType<create> sidesteps the
+      // visibility check.
+      type UxfPackageInstance = ReturnType<typeof UxfPackage.create>;
       const mergedPkg = UxfPackage.create();
 
       // 3. JOIN across all active bundles (PROFILE-ARCHITECTURE §10.4).
@@ -505,26 +689,88 @@ export class ProfileTokenStorageProvider
       //    resolve the conflict.
       //
       //    The structural work is delegated to `UxfPackage.merge()` which
-      //    internally calls `mergeInstanceChains()` — that function already
-      //    implements the "longest-chain or sibling-preservation" rules
-      //    (see uxf/instance-chain.ts Decision 6).
-      //
-      //    Oracle-based conflict resolution — turning a structural
-      //    divergence into {valid, conflicting, invalid} status — is
-      //    handled by token-manifest derivation (task #27). This JOIN is
-      //    the structural prerequisite.
+      //    invokes the per-token resolver (`resolveTokenRoot`) at
+      //    `uxf/token-join.ts`. Rules 3 + 4 of §10.4 (longest-valid chain
+      //    + proof enrichment) are implemented there. Rule 4 enrichment
+      //    activates only when the caller supplies a `verifiedProofs` set
+      //    — we compute it below across all loaded bundles when an oracle
+      //    is wired AND there's more than one bundle (a single-bundle
+      //    load has no candidate collisions, so verification would be
+      //    pure overhead).
       //
       //    CARs on IPFS are unencrypted; confidentiality comes from the
       //    OrbitDB KV layer that holds the bundle refs. Unencrypted CARs
       //    enable cross-user content-addressed dedup (see §10.2).
+
+      // Gap 3 wiring: first pass — fetch every bundle CAR into memory so
+      // we can pre-compute verifiedProofs across the full set before
+      // running the resolver. Per-bundle fetch failures are non-fatal
+      // (partial load is better than failure).
+      const loadedBundles: Array<{ cid: string; pkg: UxfPackageInstance }> = [];
       for (const [cid] of activeBundles) {
         try {
           const carBytes = await fetchFromIpfs(this._ipfsGateways, cid);
           const pkg = await UxfPackage.fromCar(carBytes);
-          mergedPkg.merge(pkg);
+          loadedBundles.push({ cid, pkg });
         } catch (err) {
           this.log(`Failed to load bundle ${cid}: ${err instanceof Error ? err.message : String(err)}`);
-          // Continue with remaining bundles -- partial load is better than failure
+        }
+      }
+
+      // Pre-compute verifiedProofs when Rule 4 enrichment is applicable.
+      // Skip the verifier walk entirely on single-bundle loads — the
+      // resolver only fires on per-token collisions which require ≥2
+      // candidate roots; a single-bundle load has none.
+      let verifiedProofs: ReadonlySet<string> | undefined = undefined;
+      const verifyInclusionProof = this.options?.oracle?.verifyInclusionProof;
+      if (verifyInclusionProof && loadedBundles.length >= 2) {
+        try {
+          // Pairwise accumulation via the existing helper. `computeVerifiedProofs`
+          // walks BOTH packages' pools dedup-by-content-hash, so for N
+          // bundles we accumulate the union by walking the previously
+          // merged set against each new bundle. The verifier itself is
+          // deterministic (same input → same output) so cross-device
+          // agreement holds. Each proof is verified at most once because
+          // the helper dedupes by ContentHash inside.
+          const accum = new Set<string>();
+          for (let i = 0; i < loadedBundles.length; i++) {
+            for (let j = i + 1; j < loadedBundles.length; j++) {
+              const pairwise = await loadedBundles[i].pkg.computeVerifiedProofs(
+                loadedBundles[j].pkg,
+                (input: {
+                  proofJson: unknown;
+                  transactionHash: string;
+                  proofHash?: string;
+                }) => verifyInclusionProof.call(this.options!.oracle!, input),
+              );
+              for (const h of pairwise) accum.add(h);
+            }
+          }
+          verifiedProofs = accum;
+          this.log(
+            `JOIN: computed verifiedProofs across ${loadedBundles.length} bundles ` +
+              `(${accum.size} proof element(s) verified)`,
+          );
+        } catch (err) {
+          // Verifier failure must not abort the load — fall back to the
+          // conservative (no-enrichment) resolution. The structural JOIN
+          // still runs and Rule 3 (longest-valid prefix) still applies;
+          // only Rule 4 enrichment is skipped.
+          this.log(
+            `JOIN: computeVerifiedProofs failed (Rule 4 enrichment skipped): ` +
+              `${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+
+      // Second pass: structural merge. Rule 4 enrichment fires when
+      // `verifiedProofs` is non-empty AND the resolver finds a same-core-
+      // different-proof transaction pair.
+      for (const { cid, pkg } of loadedBundles) {
+        try {
+          mergedPkg.merge(pkg, verifiedProofs ? { verifiedProofs } : undefined);
+        } catch (err) {
+          this.log(`Failed to merge bundle ${cid}: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
 
@@ -605,8 +851,41 @@ export class ProfileTokenStorageProvider
     this.emitEvent({ type: 'sync:started', timestamp: Date.now() });
 
     try {
-      // Refresh bundle list from OrbitDB
+      // Snapshot the pre-sync bundle set BEFORE triggering the
+      // aggregator poll so any CID the poll discovers counts as a
+      // "new" bundle in the diff below. Capturing AFTER the poll
+      // would hide poll-discovered CIDs from the newCids computation
+      // (the very state-change that should drive cold-start load).
       const previousCids = new Set(this.knownBundleCids);
+
+      // Cross-device sync: trigger an immediate aggregator pointer
+      // poll BEFORE refreshing OrbitDB. The periodic [30s, 90s)
+      // poll is the safety net for cross-device discovery, but a
+      // caller that explicitly invokes `sync()` is signalling "I
+      // want the freshest state NOW" — waiting up to 90s for the
+      // next periodic tick (or for libp2p replication that may
+      // never connect through restrictive NATs) leaves cross-device
+      // sync e2e tests timing out at PROPAGATION_TIMEOUT_MS. The
+      // poll's onPollDiscoveredNewCid handler runs `addBundle` which
+      // updates `knownBundleCids` in-place — that mutation is what
+      // newCids picks up after the refresh below.
+      //
+      // The poll is best-effort: failures (transient aggregator
+      // unreachability, WALKBACK_FLOOR retries exhausted) are
+      // logged and ignored. The downstream OrbitDB refresh and
+      // bundle-set comparison still run.
+      try {
+        await this.lifecycleManager.triggerPointerPollNow();
+      } catch (err) {
+        this.log(
+          `sync: aggregator pointer poll failed (best-effort): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+
+      // Refresh bundle list from OrbitDB (picks up libp2p-replicated
+      // bundles AND poll-added bundles from the trigger above).
       await this.bundleIndex.refreshKnownBundles();
 
       // Determine new and removed bundles
@@ -1840,6 +2119,132 @@ export class ProfileTokenStorageProvider
   }
 
   /**
+   * Compose the per-address storage key for the pending-publish CID
+   * marker. Per-address scoping is required because two derived
+   * addresses on the same wallet have independent token pools and
+   * independent pointer chains; sharing a single marker would let one
+   * address's transient failure pollute another's retry state.
+   */
+  private getPendingPublishCidKey(): string | null {
+    // Use the same resolver as every other per-address key: derive from
+    // direct address when identity is set; otherwise fall back to the
+    // explicit `options.addressId` or the literal 'default'. This
+    // matches `getAddressId()` so the marker is scoped consistently
+    // with the rest of the provider's persistence.
+    const addr = this.getAddressId();
+    return `${STORAGE_KEYS_GLOBAL.PROFILE_PENDING_PUBLISH_CID}_${addr}`;
+  }
+
+  /**
+   * Persist the pending-publish CID marker to local cache. Called on
+   * every mutation via `host.setPendingPublishCid`. Best-effort: a
+   * failure leaves the in-memory state correct and the next mutation
+   * retries. Crash-safety degrades to "best-effort"; an unwritten
+   * marker means a process restart won't auto-retry, but the next
+   * save-driven flush will re-derive the need to publish via the
+   * baseline-staleness check.
+   */
+  private async persistPendingPublishCid(cid: string | null): Promise<void> {
+    if (!this.localCache) return;
+    const key = this.getPendingPublishCidKey();
+    if (!key) return;
+    if (cid === null) {
+      await this.localCache.remove(key);
+    } else {
+      await this.localCache.set(key, cid);
+    }
+  }
+
+  /**
+   * Load any previously-persisted pending-publish CID marker into the
+   * in-memory field on initialize. Called by lifecycle-manager during
+   * `initialize()` so the next flush / poll can re-attempt the
+   * pending publish without waiting for a fresh save.
+   */
+  private async restorePendingPublishCidFromCache(): Promise<void> {
+    if (!this.localCache) return;
+    const key = this.getPendingPublishCidKey();
+    if (!key) return;
+    try {
+      const raw = await this.localCache.get(key);
+      if (raw && raw.length > 0) {
+        this.pendingPublishCid = raw;
+        this.log(`Restored pending publish CID from cache: ${raw}`);
+      }
+    } catch (err) {
+      this.log(
+        `restorePendingPublishCidFromCache failed (best-effort): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * Refresh the merged-bundle baseline (`lastLoadedFromBundleCids`)
+   * and the cached `lastLoadedData` by running a fresh `load()`.
+   * Called by FlushScheduler when the runtime
+   * `POINTER_MONOTONICITY_VIOLATION` check fires — repairing a stale
+   * baseline so the next flush attempt passes the check.
+   *
+   * Returns true on success; false on internal load failure. The
+   * caller (FlushScheduler / awaitNextFlush retry path) decides
+   * whether to retry the flush or surface the original violation.
+   *
+   * IMPORTANT: this MUST NOT be called from inside `flushToIpfs`
+   * directly because `load()` awaits the in-flight `flushPromise`,
+   * which would deadlock. FlushScheduler invokes this via a
+   * fire-and-forget pattern from the catch arm (which fires AFTER
+   * the flush has already resolved/rejected), or the at-least-once
+   * gate calls it explicitly between iterations.
+   */
+  private async refreshBaselineForMonotonicity(): Promise<boolean> {
+    // Direct OrbitDB read — bypass `this.load()` because that method
+    // has an early-return when `pendingData` is non-null. The
+    // monotonicity violation re-queues `pendingData` in its catch
+    // arm BEFORE this fire-and-forget refresh microtask fires, so a
+    // naive `load()` call would observe non-null pendingData and
+    // return the cached value WITHOUT touching OrbitDB — leaving
+    // `lastLoadedFromBundleCids` stale and the next flush would hit
+    // the same violation indefinitely.
+    //
+    // We don't need the full load() flow here — for the baseline
+    // refresh we only need to update `lastLoadedFromBundleCids` so
+    // the bundle-set check passes on the next flush. The token-set
+    // check is satisfied by the in-memory token map being a superset
+    // of whatever was previously loaded (NEVER-WIPE invariant
+    // guarantees this).
+    if (!this.initialized || !this.encryptionKey) return false;
+    try {
+      // Await any in-flight flush so the bundle-set we read includes
+      // any concurrent addBundle writes. flushPromise observation is
+      // safe here — we are NOT inside the flush body (this is a
+      // microtask scheduled from the violation arm, which fires
+      // AFTER the flush has rejected and the chain has settled).
+      if (this.flushPromise) {
+        try {
+          await this.flushPromise;
+        } catch {
+          // Flush failures don't block the refresh — we still need
+          // the current OrbitDB view.
+        }
+      }
+      const activeBundles = await this.bundleIndex.listActiveBundles();
+      this.lastLoadedFromBundleCids = new Set(activeBundles.keys());
+      this.log(
+        `refreshBaselineForMonotonicity: baseline updated to ${this.lastLoadedFromBundleCids.size} bundle(s)`,
+      );
+      return true;
+    } catch (err) {
+      this.log(
+        `refreshBaselineForMonotonicity: listActiveBundles failed: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    }
+  }
+
+  /**
    * Rebuild the local derived cache from the token pool. Used when the
    * cache is empty on a fresh device or after corruption. Oracle-based
    * tombstone validation is deferred — this best-effort rebuild uses
@@ -2119,9 +2524,91 @@ export class ProfileTokenStorageProvider
    * (it awaits an in-flight flush; the flush awaits the in-flight load
    * via its debounce timer). No new state, no retry counters.
    */
+  /**
+   * Called by `LifecycleManager.runPointerPollOnce` after the periodic
+   * aggregator-pointer poll discovers a NEW CID (one not in
+   * `knownBundleCids`) and adds it via `bundleIndex.addBundle`.
+   *
+   * Distinct from `handleReplication` in two ways:
+   *   1. The poll already confirmed novelty via the `knownBundleCids`
+   *      check — no diff against `previousCids` is needed (and any
+   *      diff would be a no-op since `addBundle` updated
+   *      `knownBundleCids` BEFORE this callback fires).
+   *   2. No recursive aggregator-poll trigger — we're already inside
+   *      the poll loop.
+   *
+   * Responsibilities:
+   *   - `load()` to merge the new CID's content into `lastLoadedData`
+   *     (this updates `lastLoadedFromBundleCids` as a side effect,
+   *     restoring the pointer-monotonicity invariant).
+   *   - Schedule a no-data flush to re-anchor our pointer at the
+   *     merged state. The flush body short-circuits if the projected
+   *     CID equals the just-discovered pointer CID (no duplicate
+   *     pin / aggregator submit cost on the receiver side).
+   *
+   * Failures here are best-effort — load failures are surfaced via
+   * `storage:error` events independently; we proceed to schedule the
+   * flush so the next save-driven flush gets a fresh baseline check.
+   */
+  private async onPollDiscoveredNewCid(): Promise<void> {
+    // Fire-and-forget load — don't block the periodic poll loop on a
+    // potentially-slow IPFS CAR fetch. The scheduleFlushNoData below
+    // arms a 2 s debounce; by the time the flush body runs, load()
+    // will typically have completed and the merged state will be
+    // visible. If load is still in-flight when flush fires, the
+    // flush body's BUNDLE-SET-CHECK will detect the stale baseline
+    // and abort — surfacing as a retry on the next save-driven flush,
+    // not silent data loss.
+    this.load().catch((err) => {
+      this.log(
+        `onPollDiscoveredNewCid: load failed (best-effort): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    });
+    this.flushScheduler.scheduleFlushNoData();
+  }
+
   private async handleReplication(): Promise<void> {
+    // Snapshot the bundle set BEFORE triggering the aggregator poll
+    // and refreshing from OrbitDB. The poll may addBundle (which
+    // mutates `knownBundleCids` synchronously); without taking the
+    // snapshot first, the diff check at the bottom would falsely
+    // report "no new bundles" and skip the load+flush — causing
+    // POINTER_MONOTONICITY_VIOLATION on the next save-driven flush
+    // when its BUNDLE-SET-CHECK sees the poll-added CID as unknown
+    // (because we never loaded it).
+    const previousCids = new Set(this.knownBundleCids);
+
+    // Pubsub wake-up signal. The OrbitDB CRDT delivered a replication
+    // event from a peer, but pubsub between devices is unreliable (NAT,
+    // firewall, peer-discovery failures) — and the OrbitDB ref itself
+    // is NOT the source of truth for the latest pointer version.
+    //
+    // Per the at-least-once design: the aggregator is the authoritative
+    // source for the latest pointer version. Treat pubsub as a hint to
+    // poll the aggregator NOW rather than waiting for the next periodic
+    // [30s, 90s) cycle. This collapses the worst-case cross-device sync
+    // latency from ~90s to the aggregator round-trip time (~1–2s on
+    // healthy infra).
+    //
+    // Failure of the aggregator poll is non-fatal: the periodic poll
+    // (worst case 90s) is still running as the safety net. We then
+    // fall through to the OrbitDB-direct refresh below for the
+    // opportunistic case where the aggregator poll hasn't caught up
+    // yet (e.g. between the publisher's IPFS pin and aggregator
+    // submit) but the OrbitDB ref already replicated.
     try {
-      const previousCids = new Set(this.knownBundleCids);
+      await this.lifecycleManager.triggerPointerPollNow();
+    } catch (err) {
+      this.log(
+        `handleReplication: aggregator pointer poll failed (best-effort): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+
+    try {
       await this.bundleIndex.refreshKnownBundles();
 
       // Check if any new bundle CIDs appeared

@@ -1458,6 +1458,20 @@ export class NostrTransportProvider implements TransportProvider {
 
     logger.debug('Nostr', 'Processing event kind:', event.kind, 'id:', event.id?.slice(0, 12));
     try {
+      // At-least-once invariant: TOKEN_TRANSFER events are gated on
+      // durability — `handleTokenTransfer` returns `true` only when
+      // every registered handler reported the inbound token(s)
+      // durably persisted (IPFS pin + OrbitDB ref + aggregator
+      // pointer for the Profile provider). When `false`, we do NOT
+      // advance `lastEventTs`, so the event is re-replayed on the
+      // next reconnect (idempotent via addToken stateHash dedup).
+      //
+      // Other wallet kinds (DM, payment-request, payment-request-
+      // response) retain the legacy "advance on completion"
+      // semantics — their persistence model is in-memory + KV save
+      // which is synchronous on save() return, so the gap that
+      // motivated the invariant (debounced IPFS pin) does not apply.
+      let tokenTransferDurable = true;
       switch (event.kind) {
         case EVENT_KINDS.DIRECT_MESSAGE:
           await this.handleDirectMessage(event);
@@ -1467,7 +1481,7 @@ export class NostrTransportProvider implements TransportProvider {
           await this.handleGiftWrap(event);
           break;
         case EVENT_KINDS.TOKEN_TRANSFER:
-          await this.handleTokenTransfer(event);
+          tokenTransferDurable = await this.handleTokenTransfer(event);
           break;
         case EVENT_KINDS.PAYMENT_REQUEST:
           await this.handlePaymentRequest(event);
@@ -1482,15 +1496,26 @@ export class NostrTransportProvider implements TransportProvider {
 
       // Persist the latest event timestamp for resumption on reconnect.
       // Only update for wallet event kinds (not chat/broadcast).
+      // Skip for TOKEN_TRANSFER when the handler reported non-durable —
+      // re-replay on next reconnect protects against silent loss when
+      // IPFS pin / OrbitDB write / aggregator publish fails.
       if (event.created_at && this.storage && this.keyManager) {
         const kind = event.kind;
         if (
           kind === EVENT_KINDS.DIRECT_MESSAGE ||
-          kind === EVENT_KINDS.TOKEN_TRANSFER ||
           kind === EVENT_KINDS.PAYMENT_REQUEST ||
           kind === EVENT_KINDS.PAYMENT_REQUEST_RESPONSE
         ) {
           this.updateLastEventTimestamp(event.created_at);
+        } else if (kind === EVENT_KINDS.TOKEN_TRANSFER) {
+          if (tokenTransferDurable) {
+            this.updateLastEventTimestamp(event.created_at);
+          } else {
+            logger.warn(
+              'Nostr',
+              `[AT-LEAST-ONCE] TOKEN_TRANSFER ${event.id?.slice(0, 12)} not durable — leaving 'since' at ${this.lastEventTs}; event will replay on next reconnect`,
+            );
+          }
         }
       }
     } catch (error) {
@@ -1693,8 +1718,8 @@ export class NostrTransportProvider implements TransportProvider {
     }
   }
 
-  private async handleTokenTransfer(event: NostrEvent): Promise<void> {
-    if (!this.identity) return;
+  private async handleTokenTransfer(event: NostrEvent): Promise<boolean> {
+    if (!this.identity) return true;
 
     // Decrypt content (the `token_transfer:` prefix is stripped inside
     // `decryptContent` → `stripContentPrefix`, so by the time we get
@@ -1732,13 +1757,24 @@ export class NostrTransportProvider implements TransportProvider {
 
     this.emitEvent({ type: 'transfer:received', timestamp: Date.now() });
 
+    // At-least-once invariant: collect durability signal from every
+    // registered handler. If ANY handler returns `false` (could not
+    // persist), or throws, we treat the whole event as non-durable so
+    // the transport refuses to advance `lastEventTs`. The legacy
+    // contract (handlers returning `void` / `undefined`) maps to
+    // `true` (durable) so existing wrappers do not regress to
+    // "never ack".
+    let allDurable = true;
     for (const handler of this.transferHandlers) {
       try {
-        await handler(transfer);
+        const result = await handler(transfer);
+        if (result === false) allDurable = false;
       } catch (error) {
         logger.debug('Nostr', 'Transfer handler error:', error);
+        allDurable = false;
       }
     }
+    return allDurable;
   }
 
   private async handlePaymentRequest(event: NostrEvent): Promise<void> {

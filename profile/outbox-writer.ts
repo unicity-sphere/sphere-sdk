@@ -173,8 +173,17 @@ export class OutboxWriter {
     // current entry's own previous Lamport (if any) — that's correct
     // per §7.1: max(local, observedRemotes) where the local view of the
     // entry counts as "observed".
+    //
+    // Cold-restart correctness: on first write after restart the clock's
+    // `current` resets to 0; if N prior writes exist the observed max is
+    // N, and Lamport.bumpFor's W39 bounds defense would reject any N>2
+    // (`2 × max(0, 1) = 2`). Rehydrate first — the observations come
+    // from our own durable store, not an untrusted remote — then bumpFor
+    // with an empty array so the bounds defense doesn't fire against
+    // values we just trusted.
     const observedLamports = await this.collectObservedLamports();
-    const next = this.lamport.bumpFor(observedLamports);
+    this.lamport.rehydrate(observedLamports);
+    const next = this.lamport.bumpFor([]);
 
     const updatedAt = input.updatedAt ?? Date.now();
     // Sticky `everFinalizing` (steelman crit #12). Writers may pass through

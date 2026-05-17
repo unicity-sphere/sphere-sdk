@@ -42,10 +42,29 @@ import type { NametagData } from '../../../types/txf';
 // =============================================================================
 // Test directories
 // =============================================================================
+//
+// Per-test unique directory (Date.now() + random suffix). The previous
+// shared `path.join(__dirname, '.test-mint-before-publish')` triggered
+// intermittent "Wallet already exists" failures (~40% in full-suite
+// runs) because under high parallel-worker CPU load, the FS race
+// between cleanTestDir() and the next test's `Sphere.init` →
+// `Sphere.exists` could see a partially-saved wallet.json from the
+// FileStorageProvider's proper-lockfile path. Issuing each test its
+// own tmpdir eliminates that interference at the FS level.
+//
+// `os.tmpdir()` is typically on a tmpfs in test environments — no
+// fsync, no real cross-process lock contention.
+import * as os from 'os';
 
-const TEST_DIR = path.join(__dirname, '.test-mint-before-publish');
-const DATA_DIR = path.join(TEST_DIR, 'data');
-const TOKENS_DIR = path.join(TEST_DIR, 'tokens');
+let TEST_DIR: string = '';
+let DATA_DIR: string = '';
+let TOKENS_DIR: string = '';
+
+function freshTestDirs(): void {
+  TEST_DIR = path.join(os.tmpdir(), `sphere-mint-before-publish-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
+  DATA_DIR = path.join(TEST_DIR, 'data');
+  TOKENS_DIR = path.join(TEST_DIR, 'tokens');
+}
 
 // =============================================================================
 // Call order tracker
@@ -181,7 +200,7 @@ describe('Sphere.registerNametag() mint-before-publish ordering', () => {
   let mintSpy: ReturnType<typeof vi.spyOn> | undefined;
 
   beforeEach(() => {
-    cleanTestDir();
+    freshTestDirs();
     callOrder.length = 0;
     if (Sphere.getInstance()) {
       (Sphere as unknown as { instance: null }).instance = null;
@@ -314,7 +333,7 @@ describe('Sphere.registerNametag() mint/Nostr-binding consistency guard', () => 
   let mintSpy: ReturnType<typeof vi.spyOn> | undefined;
 
   beforeEach(() => {
-    cleanTestDir();
+    freshTestDirs();
     callOrder.length = 0;
     if (Sphere.getInstance()) {
       (Sphere as unknown as { instance: null }).instance = null;
@@ -482,7 +501,7 @@ describe('Sphere.registerNametag() failure-mode error split + rollback (Bug B+C)
   let mintSpy: ReturnType<typeof vi.spyOn> | undefined;
 
   beforeEach(() => {
-    cleanTestDir();
+    freshTestDirs();
     callOrder.length = 0;
     if (Sphere.getInstance()) {
       (Sphere as unknown as { instance: null }).instance = null;
