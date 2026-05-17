@@ -5087,6 +5087,9 @@ export class Sphere {
         buildOutboxWriter?: (
           addressId: string,
         ) => import('../profile/outbox-writer').OutboxWriter | null;
+        buildSentLedgerWriter?: (
+          addressId: string,
+        ) => import('../profile/sent-ledger-writer').SentLedgerWriter | null;
       };
       if (typeof storageForOutbox.buildOutboxWriter === 'function') {
         const directAddress = this._identity?.directAddress;
@@ -5099,6 +5102,27 @@ export class Sphere {
               'Sphere',
               `Wired profile-resident OutboxWriter for address ${addressId}`,
             );
+
+            // Issue #97 — wire the SENT ledger writer alongside.
+            // Coupling rationale (see PaymentsModule docs): the SENT
+            // ledger and the outbox MUST be installed together or
+            // neither, otherwise outbox tombstones can erase delivery
+            // records with no permanent backup.
+            if (typeof storageForOutbox.buildSentLedgerWriter === 'function') {
+              const sentWriter = storageForOutbox.buildSentLedgerWriter(addressId);
+              if (sentWriter !== null) {
+                this._payments.installSentLedgerWriter(sentWriter);
+                logger.debug(
+                  'Sphere',
+                  `Wired profile-resident SentLedgerWriter for address ${addressId}`,
+                );
+              } else {
+                logger.warn(
+                  'Sphere',
+                  `OutboxWriter installed but SentLedgerWriter is null for address ${addressId} — crash-recovery sweeper will see partial state; investigate ProfileStorageProvider readiness`,
+                );
+              }
+            }
           } else {
             logger.debug(
               'Sphere',
@@ -5111,7 +5135,7 @@ export class Sphere {
       // Non-fatal: PaymentsModule falls back to legacy KV outbox.
       logger.warn(
         'Sphere',
-        `Failed to wire profile OutboxWriter — falling back to legacy KV outbox: ${safeErrorMessage(err)}`,
+        `Failed to wire profile OutboxWriter / SentLedgerWriter — falling back to legacy KV outbox: ${safeErrorMessage(err)}`,
       );
     }
 

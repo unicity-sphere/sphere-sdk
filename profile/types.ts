@@ -566,6 +566,13 @@ export const PROFILE_KEY_MAPPING: ProfileKeyMap = {
   'audit': { profileKey: '{addr}.audit', dynamic: true },
   'invalid': { profileKey: '{addr}.invalid', dynamic: true },
   'finalizationQueue': { profileKey: '{addr}.finalizationQueue', dynamic: true },
+
+  // Issue #97 — SENT ledger. Per-entry-key records of successfully
+  // delivered bundles, keyed `${addr}.sent.${id}` (one entry per
+  // delivery; id matches the outbox transferId). Used by the crash-
+  // recovery sweeper to distinguish "already delivered" from "needs
+  // re-queue to OUTBOX". See profile/sent-ledger-writer.ts.
+  'sent': { profileKey: '{addr}.sent', dynamic: true },
 } as const;
 
 /**

@@ -30,6 +30,7 @@ import {
   OrbitDbRecipientContextStorageAdapter,
 } from './finalization-queue-storage-adapter';
 import { OutboxWriter } from './outbox-writer';
+import { SentLedgerWriter } from './sent-ledger-writer';
 import { Lamport } from './lamport';
 import {
   buildLocalEntry,
@@ -919,6 +920,40 @@ export class ProfileStorageProvider implements StorageProvider {
       return null;
     }
     return new OutboxWriter({
+      db: this.db,
+      encryptionKey: this.profileEncryptionKey,
+      addressId,
+      lamport: lamport ?? new Lamport(),
+    });
+  }
+
+  /**
+   * Issue #97 — Build a {@link SentLedgerWriter} bound to this
+   * provider's OrbitDB instance and profile encryption key, scoped to
+   * the given address. The writer persists per-entry-key SENT ledger
+   * entries under `${addressId}.sent.${id}` (PROFILE-ARCHITECTURE
+   * §10.12). Lifecycle and null semantics mirror
+   * {@link buildOutboxWriter}.
+   *
+   * The SENT ledger and the outbox use distinct Lamport instances by
+   * design — see profile/sent-ledger-writer.ts module docs. The
+   * default `new Lamport()` is correct because the writer's first
+   * `write()` rehydrates the max via `collectObservedLamports()`.
+   */
+  buildSentLedgerWriter(addressId: string, lamport?: Lamport): SentLedgerWriter | null {
+    if (!this.encryptionEnabled) {
+      this.log('buildSentLedgerWriter: encryption disabled — returning null');
+      return null;
+    }
+    if (this.profileEncryptionKey === null) {
+      this.log('buildSentLedgerWriter: encryption key not yet derived (setIdentity pending) — returning null');
+      return null;
+    }
+    if (typeof addressId !== 'string' || addressId.length === 0) {
+      this.log('buildSentLedgerWriter: addressId must be a non-empty string — returning null');
+      return null;
+    }
+    return new SentLedgerWriter({
       db: this.db,
       encryptionKey: this.profileEncryptionKey,
       addressId,

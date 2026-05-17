@@ -174,6 +174,8 @@ import { contentHash, type ContentHash } from '../../uxf/types';
 import { isLegacyTokenTransferPayload } from '../../types/uxf-transfer';
 import type { UxfTransferOutboxEntry } from '../../types/uxf-outbox';
 import type { OutboxWriter } from '../../profile/outbox-writer';
+import type { SentLedgerWriter } from '../../profile/sent-ledger-writer';
+import type { UxfSentLedgerEntry } from '../../types/uxf-sent';
 import {
   resolveSenderInfoViaBinding,
   type ReresolvedNametagSource,
@@ -2888,6 +2890,27 @@ export class PaymentsModule {
    *
    * @param writer  The writer to install, or `null` to uninstall.
    */
+  /**
+   * Issue #97 — Install a profile-resident {@link SentLedgerWriter}.
+   *
+   * Once installed, every successful send terminates with a write to
+   * the SENT ledger:
+   *  - Conservative mode: after the outbox transitions to `'delivered'`
+   *  - Instant mode: after the outbox transitions to `'delivered-instant'`
+   *
+   * **When to install:** alongside {@link installOutboxWriter}, in the
+   * bootstrap layer (Sphere). The two writers are tightly coupled —
+   * installing one without the other leaves the system in an
+   * inconsistent state where outbox tombstones can erase delivery
+   * records with no permanent backup. The bootstrap MUST install both
+   * or neither.
+   *
+   * @param writer  The writer to install, or `null` to uninstall.
+   */
+  installSentLedgerWriter(writer: SentLedgerWriter | null): void {
+    this._sentLedgerWriter = writer;
+  }
+
   installOutboxWriter(writer: OutboxWriter | null): void {
     this._outboxWriter = writer;
     if (writer !== null) {
@@ -3030,6 +3053,27 @@ export class PaymentsModule {
    * @internal
    */
   private _outboxWriter: OutboxWriter | null = null;
+
+  /**
+   * Issue #97 — Profile-resident SENT ledger writer, when wired by the
+   * bootstrap layer. Companion to {@link _outboxWriter}.
+   *
+   * Written after the outbox transitions to a terminal-success status:
+   *  - Conservative mode → after `'delivered'`
+   *  - Instant mode → after `'delivered-instant'`
+   *
+   * The SENT ledger is the permanent counterpart to the operational
+   * outbox: outbox entries are tombstoned after delivery, SENT entries
+   * persist forever. Consulted by the crash-recovery sweeper (Issue
+   * #97 step 6) and the duplicate-bundle guard (step 7).
+   *
+   * When `null`, SENT records are NOT written — falls back to the
+   * legacy in-memory `addToHistory()` path. The crash-recovery sweeper
+   * is a no-op without it.
+   *
+   * @internal
+   */
+  private _sentLedgerWriter: SentLedgerWriter | null = null;
 
   /**
    * Per-requestId context map for the sender-side finalization worker resolver.
@@ -10301,10 +10345,11 @@ export class PaymentsModule {
         },
         transition: async (id, patch) => {
           const writer = this._outboxWriter;
+          let updated: UxfTransferOutboxEntry | null = null;
           if (writer !== null) {
             // Route through the writer so the §7.0 validator gates the
             // arc. The mutator folds the patch onto the previous entry.
-            const updated = await writer.update(id, (prev) => ({
+            updated = await writer.update(id, (prev) => ({
               ...prev,
               status: patch.status,
               ...(typeof patch.error === 'string' ? { error: patch.error } : {}),
@@ -10316,6 +10361,46 @@ export class PaymentsModule {
             this._senderOutboxMap.set(id, updated);
           }
           if (patch.status === 'delivered') {
+            // Issue #97 — write the permanent SENT record BEFORE
+            // tombstoning the outbox entry. Order matters: if we
+            // tombstoned first and then crashed before the SENT write,
+            // the recovery sweeper would see a token with a spending tx
+            // but no OUTBOX/SENT entry and incorrectly re-queue it,
+            // triggering a duplicate publish.
+            //
+            // Source of truth for the SENT shape is the in-memory
+            // mirror entry (which was just updated above). If the
+            // writer is null, we fall back to the legacy history-only
+            // path and skip the SENT write.
+            const mirror = this._senderOutboxMap.get(id) ?? updated;
+            if (this._sentLedgerWriter !== null && mirror !== null) {
+              try {
+                await this._sentLedgerWriter.write({
+                  id: mirror.id,
+                  tokenIds: mirror.tokenIds,
+                  bundleCid: mirror.bundleCid,
+                  recipientTransportPubkey: mirror.recipientTransportPubkey,
+                  recipient: mirror.recipient,
+                  ...(typeof mirror.recipientNametag === 'string'
+                    ? { recipientNametag: mirror.recipientNametag }
+                    : {}),
+                  deliveryMethod: mirror.deliveryMethod,
+                  mode: mirror.mode,
+                  sentAt: Date.now(),
+                });
+              } catch (sentErr) {
+                // SENT write failure is alarming but NOT a publish
+                // failure — the bundle is already on the relay. Log
+                // loudly so operators investigate; the recovery
+                // sweeper will surface the gap by re-queuing the
+                // token on next restart (which is harmless — replay
+                // LRU on the recipient side dedups by bundleCid).
+                logger.error(
+                  'Payments',
+                  `dispatchUxfConservativeSend: SENT ledger write failed for outbox id ${id} — recovery sweeper will re-queue on restart: ${sentErr instanceof Error ? sentErr.message : String(sentErr)}`,
+                );
+              }
+            }
             await this.removeFromOutbox(id);
             // Tombstone the profile entry so a subsequent readAllNew
             // doesn't resurrect it. The recovery worker treats tombstoned
@@ -11215,6 +11300,46 @@ export class PaymentsModule {
                   _schemaVersion: 'uxf-1' as const,
                   lamport: (existing?.lamport ?? 0) + 1,
                 });
+              }
+
+              // Issue #97 — write the SENT ledger entry on first
+              // entry into the terminal-success status. In instant
+              // mode the outbox entry stays live (the finalization
+              // worker continues writing through it), so SENT and
+              // OUTBOX coexist until the worker reaches `'finalized'`.
+              // The `_schemaVersion: 'uxf-1'` discriminator on SENT
+              // entries keeps them disjoint from the outbox keyspace.
+              //
+              // Idempotency: SentLedgerWriter.write is
+              // second-write-wins. Repeated transitions to
+              // `delivered-instant` (e.g. the recovery worker re-
+              // entering the same status after a republish) re-stamp
+              // the SENT entry with a fresh lamport but produce no
+              // duplicate record.
+              if (
+                entry.status === 'delivered-instant' &&
+                this._sentLedgerWriter !== null
+              ) {
+                try {
+                  await this._sentLedgerWriter.write({
+                    id: entry.id,
+                    tokenIds: entry.tokenIds,
+                    bundleCid: entry.bundleCid,
+                    recipientTransportPubkey: entry.recipientTransportPubkey,
+                    recipient: entry.recipient,
+                    ...(typeof entry.recipientNametag === 'string'
+                      ? { recipientNametag: entry.recipientNametag }
+                      : {}),
+                    deliveryMethod: entry.deliveryMethod,
+                    mode: entry.mode,
+                    sentAt: Date.now(),
+                  });
+                } catch (sentErr) {
+                  logger.error(
+                    'Payments',
+                    `dispatchUxfInstantSend: SENT ledger write failed for outbox id ${entry.id} — recovery sweeper will re-queue on restart: ${sentErr instanceof Error ? sentErr.message : String(sentErr)}`,
+                  );
+                }
               }
             },
           }
