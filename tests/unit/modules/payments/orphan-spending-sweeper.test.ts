@@ -15,7 +15,7 @@
  *      positives).
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { sweepOrphanSpendingTokens } from '../../../../modules/payments/transfer/orphan-spending-sweeper.js';
 import { OutboxWriter } from '../../../../profile/outbox-writer.js';
 import { SentLedgerWriter } from '../../../../profile/sent-ledger-writer.js';
@@ -496,6 +496,161 @@ describe('sweepOrphanSpendingTokens (Issue #97)', () => {
       });
       expect(result.orphans).toHaveLength(1);
       expect(r.events).toHaveLength(1);
+    });
+  });
+
+  // ===========================================================================
+  // Issue #166 P2 #1 — attemptRecovery hook
+  // ===========================================================================
+
+  describe('attemptRecovery hook (Issue #166 P2 #1)', () => {
+    it('preserves Phase-1 behavior when attemptRecovery is not supplied', async () => {
+      const r = makeRecordingEmit();
+      const result = await sweepOrphanSpendingTokens({
+        tokens: [tok('orphan-1', 'transferring')],
+        outboxWriter,
+        sentLedgerWriter,
+        emit: r.emit,
+      });
+      expect(result.orphans).toHaveLength(1);
+      expect(result.recoveredCount).toBe(0);
+      expect(result.manualCount).toBe(1);
+      // Phase-1 event: detected, not recovered.
+      const detected = r.events.filter(
+        (e) => e.type === 'transfer:orphan-spending-detected',
+      );
+      const recovered = r.events.filter(
+        (e) => e.type === 'transfer:orphan-recovered',
+      );
+      expect(detected).toHaveLength(1);
+      expect(recovered).toHaveLength(0);
+    });
+
+    it("emits transfer:orphan-recovered (NOT detected) when hook returns 'recovered'", async () => {
+      const r = makeRecordingEmit();
+      const attemptRecovery = vi
+        .fn()
+        .mockResolvedValue('recovered' as 'recovered' | 'manual');
+      const result = await sweepOrphanSpendingTokens({
+        tokens: [tok('orphan-good', 'transferring', { coinId: 'CUSTOM', amount: '777' })],
+        outboxWriter,
+        sentLedgerWriter,
+        emit: r.emit,
+        attemptRecovery,
+      });
+
+      expect(result.orphans).toHaveLength(1);
+      expect(result.recoveredCount).toBe(1);
+      expect(result.manualCount).toBe(0);
+      expect(attemptRecovery).toHaveBeenCalledTimes(1);
+
+      const detected = r.events.filter(
+        (e) => e.type === 'transfer:orphan-spending-detected',
+      );
+      expect(detected).toHaveLength(0);
+      const recovered = r.events.filter(
+        (e) => e.type === 'transfer:orphan-recovered',
+      );
+      expect(recovered).toHaveLength(1);
+      const payload = recovered[0].data as {
+        tokenId: string;
+        coinId: string;
+        amount: string;
+        fromStatus: string;
+        toStatus: string;
+        strategy: string;
+        recoveredAt: number;
+      };
+      expect(payload.tokenId).toBe('orphan-good');
+      expect(payload.coinId).toBe('CUSTOM');
+      expect(payload.amount).toBe('777');
+      expect(payload.fromStatus).toBe('transferring');
+      expect(payload.toStatus).toBe('confirmed');
+      expect(payload.strategy).toBe('restore-to-confirmed');
+      expect(payload.recoveredAt).toBeGreaterThan(0);
+    });
+
+    it("falls back to Phase-1 detected event when hook returns 'manual'", async () => {
+      const r = makeRecordingEmit();
+      const attemptRecovery = vi
+        .fn()
+        .mockResolvedValue('manual' as 'recovered' | 'manual');
+      const result = await sweepOrphanSpendingTokens({
+        tokens: [tok('orphan-unsafe', 'transferring')],
+        outboxWriter,
+        sentLedgerWriter,
+        emit: r.emit,
+        attemptRecovery,
+      });
+
+      expect(result.recoveredCount).toBe(0);
+      expect(result.manualCount).toBe(1);
+      expect(attemptRecovery).toHaveBeenCalledTimes(1);
+
+      const detected = r.events.filter(
+        (e) => e.type === 'transfer:orphan-spending-detected',
+      );
+      expect(detected).toHaveLength(1);
+      const recovered = r.events.filter(
+        (e) => e.type === 'transfer:orphan-recovered',
+      );
+      expect(recovered).toHaveLength(0);
+    });
+
+    it("treats hook throws as 'manual' (defense-in-depth, never silently drops an orphan)", async () => {
+      const r = makeRecordingEmit();
+      const attemptRecovery = vi
+        .fn()
+        .mockRejectedValue(new Error('hook bug'));
+      const result = await sweepOrphanSpendingTokens({
+        tokens: [tok('orphan-throws', 'transferring')],
+        outboxWriter,
+        sentLedgerWriter,
+        emit: r.emit,
+        attemptRecovery,
+      });
+
+      expect(result.recoveredCount).toBe(0);
+      expect(result.manualCount).toBe(1);
+      // The throw was caught; Phase-1 event still fired.
+      const detected = r.events.filter(
+        (e) => e.type === 'transfer:orphan-spending-detected',
+      );
+      expect(detected).toHaveLength(1);
+    });
+
+    it('mixed cycle — some recovered, some manual; counters sum to orphans.length', async () => {
+      const r = makeRecordingEmit();
+      const attemptRecovery = vi
+        .fn<(f: { tokenId: string }) => Promise<'recovered' | 'manual'>>()
+        .mockImplementation(async (finding) =>
+          finding.tokenId === 'orphan-A' ? 'recovered' : 'manual',
+        );
+      const result = await sweepOrphanSpendingTokens({
+        tokens: [
+          tok('orphan-A', 'transferring'),
+          tok('orphan-B', 'transferring'),
+          tok('orphan-C', 'transferring'),
+        ],
+        outboxWriter,
+        sentLedgerWriter,
+        emit: r.emit,
+        attemptRecovery,
+      });
+
+      expect(result.orphans).toHaveLength(3);
+      expect(result.recoveredCount).toBe(1);
+      expect(result.manualCount).toBe(2);
+      expect(result.recoveredCount + result.manualCount).toBe(
+        result.orphans.length,
+      );
+
+      expect(
+        r.events.filter((e) => e.type === 'transfer:orphan-recovered'),
+      ).toHaveLength(1);
+      expect(
+        r.events.filter((e) => e.type === 'transfer:orphan-spending-detected'),
+      ).toHaveLength(2);
     });
   });
 });
