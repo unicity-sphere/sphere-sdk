@@ -272,6 +272,15 @@ export class SentLedgerWriter {
       if (shape === null) continue;
       if (shape.kind !== 'tombstone') continue;
       scanned += 1;
+      // Defensive: same `deletedAt === 0` guard as
+      // `OutboxWriter.gcExpiredTombstones`. See that method for the
+      // full rationale — a malformed tombstone still functions as a
+      // refuse-write guard, and purging without a real timestamp
+      // risks resurrection by a pre-sync replica.
+      if (shape.deletedAt === 0) {
+        kept += 1;
+        continue;
+      }
       if (nowMs - shape.deletedAt <= opts.retentionMs) {
         kept += 1;
         continue;

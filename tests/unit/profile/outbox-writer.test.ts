@@ -604,6 +604,40 @@ describe('OutboxWriter — gcExpiredTombstones (OUTBOX-SEND-FOLLOWUPS item #4)',
     ).rejects.toThrow(/retentionMs/);
   });
 
+  it('defensive: tombstone with deletedAt=0 (corrupt / missing field) is kept regardless of retention', async () => {
+    const writer = buildWriter(db);
+    await writer.write(buildBaseInput('a'));
+    await writer.delete('a');
+
+    // Patch the on-disk tombstone to remove the deletedAt field so
+    // readSlotShape's fallback returns deletedAt=0. This simulates a
+    // corrupt or pre-format-evolution marker that lacks a real
+    // timestamp.
+    const aKey = [...db._store.keys()].find((k) => k.endsWith('.a'))!;
+    const stored = JSON.parse(
+      new TextDecoder().decode(db._store.get(aKey)!),
+    ) as Record<string, unknown>;
+    delete stored.deletedAt;
+    db._store.set(aKey, new TextEncoder().encode(JSON.stringify(stored)));
+
+    // Sweep with retention=0 and now=epoch+huge so that anything with
+    // a non-zero deletedAt would be purged. The defensive guard must
+    // keep the malformed tombstone.
+    const result = await writer.gcExpiredTombstones({
+      retentionMs: 0,
+      now: Date.now() + 60_000,
+    });
+    expect(result.scanned).toBe(1);
+    expect(result.purged).toBe(0);
+    expect(result.kept).toBe(1);
+    // The tombstone bytes are still in the underlying db — the
+    // refuse-write guard still fires.
+    expect(db._store.has(aKey)).toBe(true);
+    await expect(writer.write(buildBaseInput('a'))).rejects.toThrow(
+      /tombstoned slot/,
+    );
+  });
+
   it("after purge, the slot is fresh — a new write at the same id is NOT refused by the resurrection guard", async () => {
     const writer = buildWriter(db);
     await writer.write(buildBaseInput('reused'));

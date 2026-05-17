@@ -445,11 +445,19 @@ export class OutboxWriter {
       if (shape === null) continue;
       if (shape.kind !== 'tombstone') continue;
       scanned += 1;
-      // Legacy tombstones (no `deletedAt`) report deletedAt=0; treat
-      // them as expired (epoch is far past) so the sweep reclaims
-      // legacy litter too. This is safe because legacy tombstones
-      // pre-date #166 by definition; any pre-sync replica concern
-      // about them would have surfaced long ago.
+      // Defensive: `deletedAt === 0` means the field was missing or
+      // non-numeric at parse time (see `readSlotShape`'s fallback).
+      // Without a real timestamp we cannot compute a true retention
+      // age, and purging based on the Unix-epoch fallback could free
+      // a slot whose concurrent pre-sync replica still holds the
+      // live value. Keep these tombstones; an operator can clean
+      // them up via direct DB access if needed. Pre-#166 tombstones
+      // (which lacked `lamport` but DID carry a real `deletedAt`)
+      // are unaffected — they age out normally via this code path.
+      if (shape.deletedAt === 0) {
+        kept += 1;
+        continue;
+      }
       if (nowMs - shape.deletedAt <= opts.retentionMs) {
         kept += 1;
         continue;
