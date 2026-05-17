@@ -175,7 +175,6 @@ import { isLegacyTokenTransferPayload } from '../../types/uxf-transfer';
 import type { UxfTransferOutboxEntry } from '../../types/uxf-outbox';
 import type { OutboxWriter } from '../../profile/outbox-writer';
 import type { SentLedgerWriter } from '../../profile/sent-ledger-writer';
-import type { UxfSentLedgerEntry } from '../../types/uxf-sent';
 import {
   sweepOrphanSpendingTokens,
   type OrphanSweepResult,
