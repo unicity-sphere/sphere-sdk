@@ -97,9 +97,11 @@ export interface UxfSentLedgerEntry {
   /**
    * Lamport logical clock for CRDT tie-breaking — same rule as
    * `UxfTransferOutboxEntry.lamport`. The SentLedgerWriter bumps via
-   * the address-scoped Lamport instance (typically shared with the
-   * OutboxWriter; see profile/sent-ledger-writer.ts for the
-   * construction contract).
+   * a DISTINCT address-scoped Lamport instance — intentionally NOT
+   * shared with the OutboxWriter's Lamport (see
+   * `profile/sent-ledger-writer.ts` module docs for the rationale:
+   * SENT forms its own CRDT namespace; sharing a clock would over-
+   * bump on unrelated outbox writes).
    */
   readonly lamport: number;
 

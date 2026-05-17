@@ -251,7 +251,70 @@ describe('SentLedgerWriter (Issue #97)', () => {
   });
 
   // -------------------------------------------------------------------------
-  // 9. Confined keyspace — does not cross into outbox or other addresses
+  // 9. Cold-restart Lamport rehydration (regression test for steelman C2)
+  // -------------------------------------------------------------------------
+  it('cold-restart: a fresh writer with N≥3 prior entries does NOT throw LAMPORT_BOUND_VIOLATION on next write', async () => {
+    // Plant 5 prior SENT entries by writing them through writer #1.
+    for (let i = 0; i < 5; i += 1) {
+      await writer.write(buildBaseInput(`prior-${i}`));
+    }
+    // Verify final lamport reached 5 — beyond the W39 bound for a fresh
+    // clock (2 × max(0, 1) = 2).
+    const all = await writer.readAll();
+    expect(Math.max(...all.map((e) => e.lamport))).toBe(5);
+
+    // Cold restart: a fresh writer with a brand-new Lamport(0).
+    const writer2 = new SentLedgerWriter({
+      db,
+      encryptionKey: null,
+      addressId: ADDR,
+      lamport: new Lamport(), // current=0, would reject observations >2 in bumpFor
+    });
+
+    // The next write MUST succeed and bump beyond the prior max.
+    const next = await writer2.write(buildBaseInput('post-restart'));
+    expect(next.lamport).toBeGreaterThan(5);
+    expect(next.lamport).toBe(6);
+  });
+
+  // -------------------------------------------------------------------------
+  // 10. Encrypted-path round-trip (regression test for steelman test-coverage gap)
+  // -------------------------------------------------------------------------
+  it('round-trips through real AES-256-GCM encryption when an encryptionKey is supplied', async () => {
+    // Production path uses ~32-byte AES keys derived via HKDF from the
+    // wallet master key. The other tests pass null and exercise the
+    // unencrypted branch — this test pins the encrypted branch.
+    const key = new Uint8Array(32);
+    for (let i = 0; i < 32; i += 1) key[i] = (i * 7 + 3) & 0xff;
+
+    const encDb = createMockDb();
+    const encWriter = new SentLedgerWriter({
+      db: encDb,
+      encryptionKey: key,
+      addressId: ADDR,
+      lamport: new Lamport(),
+    });
+
+    const input = buildBaseInput('xfer-secret', { tokenIds: ['0xsecret-token-a'] });
+    const written = await encWriter.write(input);
+
+    // The on-disk bytes MUST NOT be the plaintext JSON.
+    const rawBytes = encDb._store.get(encWriter.keyFor('xfer-secret'));
+    expect(rawBytes).toBeDefined();
+    const plaintext = JSON.stringify(input);
+    const rawAsText = new TextDecoder('utf-8', { fatal: false }).decode(rawBytes!);
+    expect(rawAsText.includes('0xsecret-token-a')).toBe(false);
+    expect(rawAsText.includes('xfer-secret')).toBe(false);
+    expect(rawAsText.includes(plaintext)).toBe(false);
+
+    // Round-trip through readOne MUST recover the entry.
+    const read = await encWriter.readOne('xfer-secret');
+    expect(read).toEqual(written);
+    expect(read?.tokenIds).toEqual(['0xsecret-token-a']);
+  });
+
+  // -------------------------------------------------------------------------
+  // 11. Confined keyspace — does not cross into outbox or other addresses
   // -------------------------------------------------------------------------
   it('does not read from other prefixes (outbox/audit/sent-of-other-address)', async () => {
     // Plant entries at adjacent prefixes — none should appear in readAll.

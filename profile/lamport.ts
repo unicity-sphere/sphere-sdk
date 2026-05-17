@@ -115,4 +115,47 @@ export class Lamport {
   getCurrent(): number {
     return this.current;
   }
+
+  /**
+   * Rehydrate the clock from a set of TRUSTED local-store observations
+   * (e.g. values read from our own previously-persisted entries on cold
+   * restart). Sets `this.current = max(this.current, ...observed)`.
+   *
+   * **Distinction from {@link bumpFor}:** `bumpFor` treats inputs as
+   * concurrent remote replicas subject to the W39 bounds defense
+   * (`> 2 × max(this.current, 1)` rejects). That defense applies when
+   * an OrbitDB replication channel could deliver values from untrusted
+   * peers. It does NOT apply when a writer reads its OWN prior local
+   * writes from durable storage on restart — those values are trusted
+   * (they had to pass `bumpFor` when written) and may legitimately
+   * exceed `2 × current=0`.
+   *
+   * **Why this method exists:** writers (e.g. {@link OutboxWriter},
+   * {@link SentLedgerWriter}) prefix-scan their keyspace at write
+   * time and feed every observed entry's `lamport` to `bumpFor`. On
+   * cold restart with N≥3 prior writes the clock's `current` resets
+   * to 0; the bounds defense then rejects every observation `> 2`.
+   * Call `rehydrate(observed)` BEFORE the first `bumpFor` of each
+   * write so the clock absorbs the prior state without bounds-checking
+   * it.
+   *
+   * **Trust requirement:** caller MUST be passing values from a
+   * locally-controlled store (the same OrbitDB the writer owns, AFTER
+   * tombstone filtering / discriminator filtering). Do NOT call this
+   * with values from a foreign-replica gossip channel — that's
+   * `bumpFor`'s job.
+   *
+   * No-op when `observed` is empty.
+   */
+  rehydrate(observed: ReadonlyArray<number>): void {
+    for (const v of observed) {
+      if (!Number.isFinite(v) || !Number.isInteger(v) || v < 0) {
+        throw new SphereError(
+          `Lamport.rehydrate: observed must be non-negative finite integers; got ${String(v)}`,
+          'VALIDATION_ERROR',
+        );
+      }
+      if (v > this.current) this.current = v;
+    }
+  }
 }

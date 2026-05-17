@@ -135,8 +135,13 @@ export class SentLedgerWriter {
       );
     }
 
+    // Cold-restart correctness: same rationale as OutboxWriter — see
+    // profile/outbox-writer.ts for the W39 bounds-defense explanation.
+    // Rehydrate from trusted local observations BEFORE bumpFor so the
+    // bounds defense doesn't reject our own prior writes on restart.
     const observedLamports = await this.collectObservedLamports();
-    const next = this.lamport.bumpFor(observedLamports);
+    this.lamport.rehydrate(observedLamports);
+    const next = this.lamport.bumpFor([]);
 
     const stamped: UxfSentLedgerEntry = {
       ...input,

@@ -1632,6 +1632,12 @@ export class PaymentsModule {
       // map preserves pre-#97 behaviour for callers that haven't wired
       // the profile-backed path yet.
       const getOutboxWriter = (): OutboxWriter | null => this._outboxWriter;
+      // Issue #97 (steelman C3) — bind the SENT-write helper for the
+      // recovery worker's `update` closure. The object-method-shorthand
+      // inside `recoveryDeps.outbox` rebinds `this` to the outbox
+      // surface itself, so we can't reach `this.writeSentEntryFromOutbox`
+      // from there. Pre-bind at closure construction time.
+      const writeSentEntryFromOutbox = this.writeSentEntryFromOutbox.bind(this);
       const recoveryDeps: import('./transfer/sending-recovery-worker').SendingRecoveryWorkerDeps = {
         outbox: {
           async readAllNew(): Promise<ReadonlyArray<UxfTransferOutboxEntry>> {
@@ -1648,29 +1654,62 @@ export class PaymentsModule {
             mutator: (prev: UxfTransferOutboxEntry) => UxfTransferOutboxEntry,
           ): Promise<UxfTransferOutboxEntry> {
             const writer = getOutboxWriter();
+            let prevStatus: UxfTransferOutboxEntry['status'] | null = null;
+            let updated: UxfTransferOutboxEntry;
             if (writer !== null) {
               // Route through the writer so the §7.0 state-machine
               // validator fires AND the Lamport bump rule (§7.1) is
               // honored. Mirror the result into the in-memory map so
               // FinalizationOutboxWriter consumers stay coherent.
-              const updated = await writer.update(id, mutator);
+              //
+              // Issue #97 (steelman C3 fix) — capture the pre-state so
+              // we can detect a `'sending' → 'delivered'/'delivered-
+              // instant'` arc and fire the SENT-write helper. The
+              // dispatcher's transition hook is not involved on the
+              // recovery-worker code path, so SENT must be written
+              // here or recovered sends silently bypass the ledger.
+              updated = await writer.update(id, (prev) => {
+                prevStatus = prev.status;
+                return mutator(prev);
+              });
               senderOutboxMap.set(id, updated);
-              return updated;
+            } else {
+              const existing = senderOutboxMap.get(id);
+              if (existing === undefined) {
+                throw new SphereError(
+                  `SendingRecoveryWorker.update: no entry at id "${id}"`,
+                  'VALIDATION_ERROR',
+                );
+              }
+              prevStatus = existing.status;
+              const next = mutator(existing);
+              const bumped: UxfTransferOutboxEntry = {
+                ...next,
+                lamport: (existing.lamport ?? 0) + 1,
+              };
+              senderOutboxMap.set(id, bumped);
+              updated = bumped;
             }
-            const existing = senderOutboxMap.get(id);
-            if (existing === undefined) {
-              throw new SphereError(
-                `SendingRecoveryWorker.update: no entry at id "${id}"`,
-                'VALIDATION_ERROR',
+
+            // Issue #97 (C3) — detect terminal-success arc and write
+            // SENT inline. CAS guard: only fire when the status
+            // ACTUALLY transitioned (mutator may return prev unchanged
+            // for self-loop no-ops; see sending-recovery-worker.ts
+            // `transitionToDelivered`'s CAS pattern). Self-loop =
+            // updated.status === prevStatus → skip.
+            const terminalSuccess =
+              (updated.status === 'delivered' || updated.status === 'delivered-instant') &&
+              prevStatus !== updated.status;
+            if (terminalSuccess) {
+              // Use the pre-bound helper — the object-method-shorthand
+              // here doesn't expose PaymentsModule.this.
+              await writeSentEntryFromOutbox(
+                updated,
+                'sendingRecoveryWorker',
               );
             }
-            const next = mutator(existing);
-            const bumped: UxfTransferOutboxEntry = {
-              ...next,
-              lamport: (existing.lamport ?? 0) + 1,
-            };
-            senderOutboxMap.set(id, bumped);
-            return bumped;
+
+            return updated;
           },
         },
         republish: async (entry: UxfTransferOutboxEntry): Promise<void> => {
@@ -2950,6 +2989,67 @@ export class PaymentsModule {
   }
 
   /**
+   * Issue #97 — Write a SENT ledger entry derived from an outbox entry
+   * that just reached terminal-success status. Called from THREE sites:
+   *
+   *  1. Conservative dispatcher's `transition('delivered')` hook
+   *     (PaymentsModule.ts ~line 10400) — write SENT before tombstoning
+   *     the outbox.
+   *  2. Instant dispatcher's `write('delivered-instant')` hook
+   *     (PaymentsModule.ts ~line 11400) — write SENT at first entry
+   *     into the terminal-success status.
+   *  3. SendingRecoveryWorker's `outbox.update` closure
+   *     (PaymentsModule.ts ~line 1670) — when the worker re-publishes
+   *     a stuck `'sending'` entry, it transitions to `'delivered'` /
+   *     `'delivered-instant'` via this.deps.outbox.update. The
+   *     dispatcher's SENT-write logic does NOT fire for this path
+   *     (dispatcher hooks aren't involved) — so the update closure
+   *     must call this helper to keep the SENT ledger in sync with
+   *     recovered sends.
+   *
+   * No-op when `_sentLedgerWriter` is null (legacy mode). Errors are
+   * caught and logged at ERROR; the caller is responsible for any
+   * downstream signaling (e.g. the dispatcher continues to tombstone
+   * even on SENT-write failure — the bundle is already on the relay).
+   *
+   * @param entry    Outbox entry whose post-transition state to record.
+   * @param opLabel  Short context tag for the error log (e.g.
+   *                 'dispatchUxfConservativeSend', 'recoveryWorker').
+   * @returns `true` if a write was attempted (regardless of success);
+   *          `false` if skipped because no writer was installed.
+   */
+  private async writeSentEntryFromOutbox(
+    entry: UxfTransferOutboxEntry,
+    opLabel: string,
+  ): Promise<boolean> {
+    if (this._sentLedgerWriter === null) return false;
+    try {
+      await this._sentLedgerWriter.write({
+        id: entry.id,
+        tokenIds: entry.tokenIds,
+        bundleCid: entry.bundleCid,
+        recipientTransportPubkey: entry.recipientTransportPubkey,
+        recipient: entry.recipient,
+        ...(typeof entry.recipientNametag === 'string'
+          ? { recipientNametag: entry.recipientNametag }
+          : {}),
+        deliveryMethod: entry.deliveryMethod,
+        mode: entry.mode,
+        sentAt: Date.now(),
+      });
+    } catch (sentErr) {
+      logger.error(
+        'Payments',
+        `${opLabel}: SENT ledger write failed for outbox id ${entry.id} ` +
+          `(bundle is already on the wire; operator triage required — the ` +
+          `delivery is permanent but the ledger record is missing): ` +
+          `${sentErr instanceof Error ? sentErr.message : String(sentErr)}`,
+      );
+    }
+    return true;
+  }
+
+  /**
    * Issue #97 — Run the orphan-spending-tx sweeper once. Detects
    * tokens with an in-flight spending transaction (status
    * `'transferring'`) that are NOT referenced by any live OUTBOX
@@ -2995,12 +3095,27 @@ export class PaymentsModule {
       void writer
         .readAllNew()
         .then((entries) => {
+          // Issue #97 (steelman W2) — race protection. The hydration
+          // is fire-and-forget; a concurrent send may have already
+          // mutated the mirror to a newer state by the time these
+          // snapshot entries arrive. Only overwrite when the snapshot
+          // entry has a HIGHER lamport than what's currently in the
+          // mirror — otherwise we'd silently clobber post-restart
+          // writes that the dispatcher just made.
+          let hydratedCount = 0;
+          let skippedCount = 0;
           for (const e of entries) {
+            const existing = this._senderOutboxMap.get(e.id);
+            if (existing !== undefined && existing.lamport >= e.lamport) {
+              skippedCount += 1;
+              continue;
+            }
             this._senderOutboxMap.set(e.id, e);
+            hydratedCount += 1;
           }
           logger.debug(
             'Payments',
-            `installOutboxWriter: hydrated ${entries.length} outbox entries into in-memory mirror`,
+            `installOutboxWriter: hydrated ${hydratedCount} outbox entries (${skippedCount} skipped — concurrent writer already advanced lamport)`,
           );
         })
         .catch((err) => {
@@ -10434,47 +10549,41 @@ export class PaymentsModule {
             // Issue #97 — write the permanent SENT record BEFORE
             // tombstoning the outbox entry. Order matters: if we
             // tombstoned first and then crashed before the SENT write,
-            // the recovery sweeper would see a token with a spending tx
-            // but no OUTBOX/SENT entry and incorrectly re-queue it,
-            // triggering a duplicate publish.
+            // the load-time orphan sweeper would only see a token in
+            // 'transferring' status if the source still exists — but
+            // the conservative path may have already removed the
+            // source via `removeToken` (at the commitSources arm).
+            // So a SENT-write failure here is a SILENT delivery-
+            // record loss; the helper logs at ERROR for operator
+            // triage. Bundle is already on the wire — recipient gets
+            // the tokens regardless.
             //
             // Source of truth for the SENT shape is the in-memory
-            // mirror entry (which was just updated above). If the
-            // writer is null, we fall back to the legacy history-only
-            // path and skip the SENT write.
+            // mirror entry (which was just updated above).
             const mirror = this._senderOutboxMap.get(id) ?? updated;
-            if (this._sentLedgerWriter !== null && mirror !== null) {
-              try {
-                await this._sentLedgerWriter.write({
-                  id: mirror.id,
-                  tokenIds: mirror.tokenIds,
-                  bundleCid: mirror.bundleCid,
-                  recipientTransportPubkey: mirror.recipientTransportPubkey,
-                  recipient: mirror.recipient,
-                  ...(typeof mirror.recipientNametag === 'string'
-                    ? { recipientNametag: mirror.recipientNametag }
-                    : {}),
-                  deliveryMethod: mirror.deliveryMethod,
-                  mode: mirror.mode,
-                  sentAt: Date.now(),
-                });
-              } catch (sentErr) {
-                // SENT write failure is alarming but NOT a publish
-                // failure — the bundle is already on the relay. Log
-                // loudly so operators investigate; the recovery
-                // sweeper will surface the gap by re-queuing the
-                // token on next restart (which is harmless — replay
-                // LRU on the recipient side dedups by bundleCid).
-                logger.error(
-                  'Payments',
-                  `dispatchUxfConservativeSend: SENT ledger write failed for outbox id ${id} — recovery sweeper will re-queue on restart: ${sentErr instanceof Error ? sentErr.message : String(sentErr)}`,
-                );
-              }
+            if (mirror !== null) {
+              await this.writeSentEntryFromOutbox(
+                mirror,
+                'dispatchUxfConservativeSend',
+              );
             }
-            await this.removeFromOutbox(id);
+            // Drop the legacy KV entry AND tombstone the profile
+            // entry. Wrapped so that a removeFromOutbox throw doesn't
+            // skip the profile tombstone (steelman W1: previously a
+            // throw here left the profile entry live as 'delivered'
+            // forever).
+            try {
+              await this.removeFromOutbox(id);
+            } catch (legacyErr) {
+              logger.warn(
+                'Payments',
+                `dispatchUxfConservativeSend: legacy removeFromOutbox(${id}) threw (proceeding to profile tombstone): ${legacyErr instanceof Error ? legacyErr.message : String(legacyErr)}`,
+              );
+            }
             // Tombstone the profile entry so a subsequent readAllNew
-            // doesn't resurrect it. The recovery worker treats tombstoned
-            // ids as absent (OutboxWriter.readAllNew skips them).
+            // doesn't resurrect it. The recovery worker treats
+            // tombstoned ids as absent (OutboxWriter.readAllNew
+            // skips them).
             if (writer !== null) {
               try {
                 await writer.delete(id);
@@ -10482,7 +10591,7 @@ export class PaymentsModule {
               } catch (delErr) {
                 logger.warn(
                   'Payments',
-                  `dispatchUxfConservativeSend: outboxWriter.delete(${id}) failed (entry left tombstoned at next write): ${delErr instanceof Error ? delErr.message : String(delErr)}`,
+                  `dispatchUxfConservativeSend: outboxWriter.delete(${id}) failed (profile entry left live at status='delivered'; operator-recoverable): ${delErr instanceof Error ? delErr.message : String(delErr)}`,
                 );
               }
             }
@@ -11380,36 +11489,31 @@ export class PaymentsModule {
               // The `_schemaVersion: 'uxf-1'` discriminator on SENT
               // entries keeps them disjoint from the outbox keyspace.
               //
-              // Idempotency: SentLedgerWriter.write is
-              // second-write-wins. Repeated transitions to
-              // `delivered-instant` (e.g. the recovery worker re-
-              // entering the same status after a republish) re-stamp
-              // the SENT entry with a fresh lamport but produce no
-              // duplicate record.
-              if (
-                entry.status === 'delivered-instant' &&
-                this._sentLedgerWriter !== null
-              ) {
-                try {
-                  await this._sentLedgerWriter.write({
-                    id: entry.id,
-                    tokenIds: entry.tokenIds,
-                    bundleCid: entry.bundleCid,
-                    recipientTransportPubkey: entry.recipientTransportPubkey,
-                    recipient: entry.recipient,
-                    ...(typeof entry.recipientNametag === 'string'
-                      ? { recipientNametag: entry.recipientNametag }
-                      : {}),
-                    deliveryMethod: entry.deliveryMethod,
-                    mode: entry.mode,
-                    sentAt: Date.now(),
-                  });
-                } catch (sentErr) {
-                  logger.error(
-                    'Payments',
-                    `dispatchUxfInstantSend: SENT ledger write failed for outbox id ${entry.id} — recovery sweeper will re-queue on restart: ${sentErr instanceof Error ? sentErr.message : String(sentErr)}`,
-                  );
-                }
+              // Idempotency: SentLedgerWriter.write is second-write-
+              // wins. Repeated transitions into `delivered-instant`
+              // (e.g. the recovery worker re-entering the same status
+              // after a republish) re-stamp the SENT entry with a
+              // fresh lamport but produce no duplicate record.
+              //
+              // SENT-write failure: error is logged at ERROR; the
+              // bundle is already on the wire. No automatic recovery
+              // — operator triage required (the sweeper cannot help
+              // here because the source token is already cleared).
+              if (entry.status === 'delivered-instant') {
+                // Synthesise a UxfTransferOutboxEntry shape for the
+                // helper (orchestrator passes an OutboxCreateInput
+                // which is structurally a UxfTransferOutboxEntry
+                // minus _schemaVersion + lamport — both unused by
+                // the SENT helper).
+                const synthetic: UxfTransferOutboxEntry = {
+                  ...entry,
+                  _schemaVersion: 'uxf-1' as const,
+                  lamport: 0,
+                };
+                await this.writeSentEntryFromOutbox(
+                  synthetic,
+                  'dispatchUxfInstantSend',
+                );
               }
             },
           }
