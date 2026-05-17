@@ -1823,25 +1823,86 @@ export class PaymentsModule {
           // duplicates by `bundleCid` (§6.3 / T.3.A) so a wasted publish
           // in the racing window is harmless.
           //
-          // CID-by-reference shape: the original CAR is already pinned
-          // to IPFS by the time it lands in the outbox; re-publishing
-          // the CID is sufficient. Implementations that need a richer
-          // payload (inline CAR for bundles below the cap) override
-          // the worker via `installSendingRecoveryWorker`.
+          // OUTBOX-SEND-FOLLOWUPS item #6 — switch on the entry's
+          // original `deliveryMethod` rather than blindly emitting a
+          // `'uxf-cid'` payload. Sending a CID-by-reference shape for
+          // an entry originally delivered as inline CAR would hand the
+          // recipient a CID with no IPFS pin behind it (the CAR bytes
+          // were inlined on the wire, never pinned). They'd fail the
+          // fetch and the bundle would be invisible — worse than
+          // never re-publishing at all.
           //
-          // `mode === 'txf'` is a legacy outbox shape that does NOT
-          // belong to UXF. Map it to `'instant'` for the wire payload's
-          // advisory `mode` field — recipients ignore it (§5.6).
-          const payloadMode: 'conservative' | 'instant' =
-            entry.mode === 'txf' ? 'instant' : entry.mode;
-          await transport.sendTokenTransfer(entry.recipientTransportPubkey, {
-            kind: 'uxf-cid',
-            version: '1.0',
-            mode: payloadMode,
-            bundleCid: entry.bundleCid,
-            tokenIds: entry.tokenIds,
-            ...(typeof entry.memo === 'string' ? { memo: entry.memo } : {}),
-          });
+          // Bundle-bytes problem: the inline CAR payload is NOT
+          // stored on the outbox entry (see types/uxf-outbox.ts:168);
+          // the bytes only exist in the original wire publish that
+          // we're trying to recover from. The default worker has no
+          // way to reconstruct them. We therefore fail-fast on the
+          // CAR path with a clear error — the SendingRecoveryWorker
+          // counts the throw toward `maxRetries` and transitions the
+          // entry to `'failed-transient'` for operator triage, which
+          // is exactly the §7.0 escape valve item #6 prescribes for
+          // "CAR bytes unavailable AND re-pin fails."
+          //
+          // Custom workers that wire local CAR retention or IPFS re-
+          // pin can install their own republish via
+          // `installSendingRecoveryWorker()` and skip this fallback.
+          switch (entry.deliveryMethod) {
+            case 'cid-over-nostr': {
+              // The original CAR is pinned to IPFS by the time it
+              // lands in the outbox; re-publishing the CID is
+              // sufficient. `mode === 'txf'` is a legacy outbox-mode
+              // discriminator that does NOT belong to UXF wire
+              // payloads — map it to `'instant'` for the advisory
+              // `mode` field; recipients ignore it (§5.6).
+              const payloadMode: 'conservative' | 'instant' =
+                entry.mode === 'txf' ? 'instant' : entry.mode;
+              await transport.sendTokenTransfer(
+                entry.recipientTransportPubkey,
+                {
+                  kind: 'uxf-cid',
+                  version: '1.0',
+                  mode: payloadMode,
+                  bundleCid: entry.bundleCid,
+                  tokenIds: entry.tokenIds,
+                  ...(typeof entry.memo === 'string'
+                    ? { memo: entry.memo }
+                    : {}),
+                },
+              );
+              return;
+            }
+            case 'car-over-nostr': {
+              throw new SphereError(
+                `SendingRecoveryWorker default republish cannot recover entry ${entry.id}: ` +
+                  `deliveryMethod='car-over-nostr' inlined the CAR bytes on the wire and they are ` +
+                  `not retained on the outbox entry. Install a custom worker via ` +
+                  `installSendingRecoveryWorker() that stores or re-pins CAR bytes to recover ` +
+                  `from CAR-mode entries.`,
+                'VALIDATION_ERROR',
+              );
+            }
+            case 'txf-legacy': {
+              throw new SphereError(
+                `SendingRecoveryWorker default republish cannot recover entry ${entry.id}: ` +
+                  `deliveryMethod='txf-legacy' is a single-token legacy wire shape that does ` +
+                  `not round-trip through the UXF payload union. Operator triage required.`,
+                'VALIDATION_ERROR',
+              );
+            }
+            default: {
+              // Defense-in-depth: refuse to publish an unknown
+              // delivery method as `'uxf-cid'` blindly. This branch
+              // is unreachable today; if a new arm is added to
+              // `UxfTransferOutboxEntry.deliveryMethod` and lands in
+              // the outbox before this switch is updated, fail-closed.
+              const _exhaustive: never = entry.deliveryMethod;
+              throw new SphereError(
+                `SendingRecoveryWorker default republish: unsupported ` +
+                  `deliveryMethod=${String(_exhaustive)} on entry ${entry.id}`,
+                'VALIDATION_ERROR',
+              );
+            }
+          }
         },
         emit: sphereEmit,
       };
