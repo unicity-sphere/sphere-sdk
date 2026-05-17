@@ -85,11 +85,16 @@ export interface OrphanSweeperDeps {
    *  skipped for the same reason as `outboxWriter`. */
   readonly sentLedgerWriter: SentLedgerWriter | null;
   /** Event emitter — invoked once per detected orphan with
-   *  `'transfer:orphan-spending-detected'`. */
+   *  `'transfer:orphan-spending-detected'`.
+   *
+   *  Issue #166 P4 #4 — return type widened to `void | Promise<void>`
+   *  so a future async emitter implementation slots in without
+   *  becoming an unhandled-rejection source. The sweeper's try/catch
+   *  awaits the return value (no-op when sync; safe when async). */
   readonly emit: <T extends SphereEventType>(
     type: T,
     data: SphereEventMap[T],
-  ) => void;
+  ) => void | Promise<void>;
   /**
    * Steelman item 2 — count of send dispatchers currently in flight.
    * When `> 0`, the sweep self-skips: a token is legitimately in
@@ -240,7 +245,12 @@ export async function sweepOrphanSpendingTokens(
     );
 
     try {
-      emit('transfer:orphan-spending-detected', {
+      // Issue #166 P4 #4 — await the emit return value so future
+      // async emitter implementations (returning Promise<void>) don't
+      // surface as unhandled-rejection warnings. Sync emitters return
+      // `void` which `await` no-ops on. The catch covers both sync
+      // throws and async rejections.
+      await emit('transfer:orphan-spending-detected', {
         tokenId: token.id,
         detectedAt,
         coinId: token.coinId,

@@ -15,7 +15,7 @@
  *      are ignored on read.
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { Lamport } from '../../../profile/lamport.js';
 import {
   SentLedgerWriter,
@@ -340,5 +340,150 @@ describe('SentLedgerWriter (Issue #97)', () => {
 
     const all = await writer.readAll();
     expect(all.map((e) => e.id)).toEqual(['xfer-1']);
+  });
+
+  // -------------------------------------------------------------------------
+  // Issue #166 P4 #3 — contains() cost contract pinning
+  // -------------------------------------------------------------------------
+  describe('contains() cost contract (Issue #166 P4 #3)', () => {
+    it('scans every live entry per call — no in-memory index (pin current behavior)', async () => {
+      // Pin the cost contract documented in contains()'s JSDoc: each
+      // call decrypts every entry under the prefix. A regression that
+      // accidentally introduces an in-memory index (without the
+      // durability surface) OR a regression that amplifies the call
+      // count (extra reads per entry) is caught here. When the
+      // duplicate-bundle guard work lands (Issue #166 P2), this test
+      // can be flipped to assert the index-backed path.
+      for (let i = 0; i < 5; i += 1) {
+        await writer.write(buildBaseInput(`xfer-${i}`));
+      }
+
+      const getSpy = vi.spyOn(db, 'get');
+
+      // Look up a token that doesn't exist (forces full scan, no
+      // early termination). Each entry decryption is one db.get
+      // call (the prefix-scan `all()` returns the keys but each
+      // `readDecoded(key)` calls `get(key)` again).
+      const hit = await writer.contains('not-a-real-token');
+      expect(hit).toBe(false);
+      // 5 entries → 5 db.get calls. If a future index were
+      // installed, this would drop to 0 (the index lookup avoids
+      // decryption). If a regression amplified the scan, this
+      // would be > 5.
+      expect(getSpy).toHaveBeenCalledTimes(5);
+
+      // Second call repeats the scan (no caching across calls).
+      getSpy.mockClear();
+      await writer.contains('still-no-such-token');
+      expect(getSpy).toHaveBeenCalledTimes(5);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Issue #166 P4 #1 — addressId shape validation
+  // -------------------------------------------------------------------------
+  describe('addressId shape validation (Issue #166 P4 #1)', () => {
+    it('accepts the canonical DIRECT_[0-9a-f]{6}_[0-9a-f]{6} shape', () => {
+      expect(
+        () =>
+          new SentLedgerWriter({
+            db,
+            encryptionKey: null,
+            addressId: 'DIRECT_aabbcc_ddeeff',
+            lamport,
+          }),
+      ).not.toThrow();
+    });
+
+    it.each([
+      ['DIRECT_a.b_cd', 'dot in first segment'],
+      ['DIRECT_aabbcc_d.eeff', 'dot in last segment'],
+      ['DIRECT_aabbc_ddeeff', 'first segment 5 chars'],
+      ['direct_aabbcc_ddeeff', 'lowercase DIRECT'],
+      ['DIRECT_aabbcZ_ddeeff', 'non-hex char'],
+      ['DIRECT_AABBCC_DDEEFF', 'uppercase hex'],
+      ['DIRECT_aabbcc_ddeeff/', 'trailing slash'],
+      ['addr-alice', 'non-canonical alias'],
+      ['test', 'short ad-hoc id'],
+    ])('rejects %s (%s)', (badId, _label) => {
+      expect(
+        () =>
+          new SentLedgerWriter({
+            db,
+            encryptionKey: null,
+            addressId: badId,
+            lamport,
+          }),
+      ).toThrow(SphereError);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Issue #166 P4 #2 — type-guard range tightening
+  // -------------------------------------------------------------------------
+  describe('isUxfSentLedgerEntry — P4 #2 range tightening', () => {
+    function makeValid(): unknown {
+      return {
+        _schemaVersion: 'uxf-1',
+        id: 'x',
+        tokenIds: ['t'],
+        bundleCid: 'b',
+        recipientTransportPubkey: 'r'.repeat(64),
+        deliveryMethod: 'car-over-nostr',
+        mode: 'conservative',
+        sentAt: 1_700_000_000_000,
+        lamport: 1,
+      };
+    }
+
+    // Wire up isUxfSentLedgerEntry via dynamic import so we don't
+    // pollute the existing top-of-file imports.
+    let isUxfSentLedgerEntry: (v: unknown) => boolean;
+    beforeEach(async () => {
+      const mod = await import('../../../types/uxf-sent.js');
+      isUxfSentLedgerEntry = mod.isUxfSentLedgerEntry;
+    });
+
+    it('accepts 0 for sentAt/lamport (boundary)', () => {
+      expect(
+        isUxfSentLedgerEntry({ ...(makeValid() as object), sentAt: 0, lamport: 0 }),
+      ).toBe(true);
+    });
+
+    it('rejects negative sentAt', () => {
+      expect(
+        isUxfSentLedgerEntry({ ...(makeValid() as object), sentAt: -1 }),
+      ).toBe(false);
+    });
+
+    it('rejects non-integer sentAt (0.5)', () => {
+      expect(
+        isUxfSentLedgerEntry({ ...(makeValid() as object), sentAt: 0.5 }),
+      ).toBe(false);
+    });
+
+    it('rejects negative lamport', () => {
+      expect(
+        isUxfSentLedgerEntry({ ...(makeValid() as object), lamport: -1 }),
+      ).toBe(false);
+    });
+
+    it('rejects non-integer lamport (1.5)', () => {
+      expect(
+        isUxfSentLedgerEntry({ ...(makeValid() as object), lamport: 1.5 }),
+      ).toBe(false);
+    });
+
+    it('rejects NaN lamport', () => {
+      expect(
+        isUxfSentLedgerEntry({ ...(makeValid() as object), lamport: NaN }),
+      ).toBe(false);
+    });
+
+    it('rejects Infinity sentAt', () => {
+      expect(
+        isUxfSentLedgerEntry({ ...(makeValid() as object), sentAt: Infinity }),
+      ).toBe(false);
+    });
   });
 });

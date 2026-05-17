@@ -562,7 +562,7 @@ describe('sendConservativeUxf CID — pin failure path (T.4.A invariant)', () =>
       .fn<PublishToIpfsCallback>()
       .mockRejectedValue(pinError);
 
-    const { hooks, writer } = makeWriterBackedHooks('addr-alice');
+    const { hooks, writer } = makeWriterBackedHooks('DIRECT_aabbcc_ddeeff');
 
     const { deps, transport } = makeDeps({
       availableSources: () => [source],
