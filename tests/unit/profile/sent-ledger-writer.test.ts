@@ -158,9 +158,29 @@ describe('SentLedgerWriter (Issue #97)', () => {
 
     await writer.delete('xfer-1');
     expect(await writer.readOne('xfer-1')).toBeNull();
+  });
 
-    // Re-writing after tombstone restores the entry.
-    const restored = await writer.write(buildBaseInput('xfer-1'));
+  it('Issue #166 P1 #2 — re-writing a tombstoned slot is REFUSED by default', async () => {
+    await writer.write(buildBaseInput('xfer-1'));
+    await writer.delete('xfer-1');
+
+    // Default behavior: tombstone resurrection rejected with
+    // OUTBOX_ENTRY_TOMBSTONED. Prevents silent loss of the deletion
+    // signal under concurrent-replica sync races.
+    await expect(writer.write(buildBaseInput('xfer-1'))).rejects.toMatchObject({
+      code: 'OUTBOX_ENTRY_TOMBSTONED',
+    });
+    // Slot still reads as absent.
+    expect(await writer.readOne('xfer-1')).toBeNull();
+  });
+
+  it('Issue #166 P1 #2 — allowResurrection:true permits explicit resurrection (operator escape-hatch)', async () => {
+    await writer.write(buildBaseInput('xfer-1'));
+    await writer.delete('xfer-1');
+
+    const restored = await writer.write(buildBaseInput('xfer-1'), {
+      allowResurrection: true,
+    });
     expect(restored.id).toBe('xfer-1');
     expect(await writer.readOne('xfer-1')).toEqual(restored);
   });
@@ -484,6 +504,171 @@ describe('SentLedgerWriter (Issue #97)', () => {
       expect(
         isUxfSentLedgerEntry({ ...(makeValid() as object), sentAt: Infinity }),
       ).toBe(false);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Issue #166 P1 #3 — DoS bounds-defense at the type-guard gate.
+  // -------------------------------------------------------------------------
+  describe('isUxfSentLedgerEntry — P1 #3 size caps', () => {
+    function makeValid(): unknown {
+      return {
+        _schemaVersion: 'uxf-1',
+        id: 'x',
+        tokenIds: ['t'],
+        bundleCid: 'b',
+        recipientTransportPubkey: 'r'.repeat(64),
+        deliveryMethod: 'car-over-nostr',
+        mode: 'conservative',
+        sentAt: 1_700_000_000_000,
+        lamport: 1,
+      };
+    }
+
+    let isUxfSentLedgerEntry: (v: unknown) => boolean;
+    beforeEach(async () => {
+      const mod = await import('../../../types/uxf-sent.js');
+      isUxfSentLedgerEntry = mod.isUxfSentLedgerEntry;
+    });
+
+    it('accepts tokenIds.length at the cap (4096) — boundary', () => {
+      const tokenIds = Array.from({ length: 4096 }, (_, i) => `t${i}`);
+      expect(
+        isUxfSentLedgerEntry({ ...(makeValid() as object), tokenIds }),
+      ).toBe(true);
+    });
+
+    it('rejects tokenIds.length > MAX_TOKEN_IDS_PER_ENTRY (4097)', () => {
+      const tokenIds = Array.from({ length: 4097 }, (_, i) => `t${i}`);
+      expect(
+        isUxfSentLedgerEntry({ ...(makeValid() as object), tokenIds }),
+      ).toBe(false);
+    });
+
+    it('rejects a single tokenId longer than MAX_TOKEN_ID_LENGTH (256+1)', () => {
+      const longId = 'a'.repeat(257);
+      expect(
+        isUxfSentLedgerEntry({ ...(makeValid() as object), tokenIds: [longId] }),
+      ).toBe(false);
+    });
+
+    it('rejects empty-string tokenId', () => {
+      expect(
+        isUxfSentLedgerEntry({ ...(makeValid() as object), tokenIds: [''] }),
+      ).toBe(false);
+    });
+
+    it('rejects bundleCid longer than MAX_BUNDLE_CID_LENGTH (256+1)', () => {
+      const bundleCid = 'a'.repeat(257);
+      expect(
+        isUxfSentLedgerEntry({ ...(makeValid() as object), bundleCid }),
+      ).toBe(false);
+    });
+
+    it('rejects recipient longer than MAX_RECIPIENT_LENGTH (1024+1) when present', () => {
+      const recipient = 'a'.repeat(1025);
+      expect(
+        isUxfSentLedgerEntry({ ...(makeValid() as object), recipient }),
+      ).toBe(false);
+    });
+
+    it('rejects recipientNametag longer than MAX_NAMETAG_LENGTH (256+1) when present', () => {
+      const recipientNametag = 'a'.repeat(257);
+      expect(
+        isUxfSentLedgerEntry({ ...(makeValid() as object), recipientNametag }),
+      ).toBe(false);
+    });
+
+    it('rejects recipientTransportPubkey longer than MAX_TRANSPORT_PUBKEY_LENGTH (128+1)', () => {
+      const recipientTransportPubkey = 'a'.repeat(129);
+      expect(
+        isUxfSentLedgerEntry({
+          ...(makeValid() as object),
+          recipientTransportPubkey,
+        }),
+      ).toBe(false);
+    });
+
+    it('rejects nostrEventId longer than MAX_NOSTR_EVENT_ID_LENGTH (128+1)', () => {
+      const nostrEventId = 'a'.repeat(129);
+      expect(
+        isUxfSentLedgerEntry({ ...(makeValid() as object), nostrEventId }),
+      ).toBe(false);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Issue #166 P1 #2 — tombstone Lamport + refuse-write guard.
+  // -------------------------------------------------------------------------
+  describe('SentLedgerWriter — P1 #2 tombstone Lamport + refuse-write', () => {
+    let db: MockProfileDb;
+    let writer: SentLedgerWriter;
+
+    beforeEach(() => {
+      db = createMockDb();
+      writer = new SentLedgerWriter({
+        db,
+        encryptionKey: null,
+        addressId: 'DIRECT_aabbcc_ddeeff',
+        lamport: new Lamport(),
+      });
+    });
+
+    it('delete() stamps tombstone with Lamport > prior write Lamport', async () => {
+      const written = await writer.write(buildBaseInput('a'));
+      await writer.delete('a');
+
+      const raw = db._store.get(`DIRECT_aabbcc_ddeeff.sent.a`);
+      expect(raw).toBeDefined();
+      const parsed = JSON.parse(new TextDecoder().decode(raw!)) as {
+        tombstoned: boolean;
+        deletedAt: number;
+        lamport: number;
+      };
+      expect(parsed.tombstoned).toBe(true);
+      expect(parsed.lamport).toBeGreaterThan(written.lamport);
+    });
+
+    it('write() refuses to resurrect tombstoned slot by default', async () => {
+      await writer.write(buildBaseInput('zombie'));
+      await writer.delete('zombie');
+
+      await expect(writer.write(buildBaseInput('zombie'))).rejects.toMatchObject(
+        { code: 'OUTBOX_ENTRY_TOMBSTONED' },
+      );
+    });
+
+    it('write({ allowResurrection: true }) permits explicit resurrection', async () => {
+      await writer.write(buildBaseInput('zombie'));
+      await writer.delete('zombie');
+
+      const restored = await writer.write(buildBaseInput('zombie'), {
+        allowResurrection: true,
+      });
+      expect(restored.id).toBe('zombie');
+      expect(await writer.readOne('zombie')).not.toBeNull();
+    });
+
+    it('legacy tombstone (no lamport field) is still refused', async () => {
+      // Plant a legacy tombstone directly.
+      const legacy = JSON.stringify({ tombstoned: true, deletedAt: 1 });
+      db._store.set(
+        `DIRECT_aabbcc_ddeeff.sent.old`,
+        new TextEncoder().encode(legacy),
+      );
+
+      await expect(writer.write(buildBaseInput('old'))).rejects.toMatchObject({
+        code: 'OUTBOX_ENTRY_TOMBSTONED',
+      });
+    });
+
+    it('pre-decrypt size cap (1MB) rejects oversized blobs', async () => {
+      const big = new Uint8Array(2 * 1024 * 1024);
+      big.fill(0xff);
+      db._store.set(`DIRECT_aabbcc_ddeeff.sent.toobig`, big);
+
+      expect(await writer.readOne('toobig')).toBeNull();
+      expect(await writer.readAll()).toHaveLength(0);
     });
   });
 });

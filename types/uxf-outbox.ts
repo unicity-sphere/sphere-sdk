@@ -39,6 +39,18 @@
  */
 
 import type { OutboxEntry } from './txf.js';
+import {
+  MAX_TOKEN_IDS_PER_ENTRY,
+  MAX_TOKEN_ID_LENGTH,
+  MAX_RECIPIENT_LENGTH,
+  MAX_NAMETAG_LENGTH,
+  MAX_BUNDLE_CID_LENGTH,
+  MAX_MEMO_LENGTH,
+  MAX_NOSTR_EVENT_ID_LENGTH,
+  MAX_TRANSPORT_PUBKEY_LENGTH,
+  MAX_ERROR_LENGTH,
+  isWithinOptionalStringLength,
+} from './uxf-bounds.js';
 
 // =============================================================================
 // 1. Status enumeration — §7 lifecycle states
@@ -394,6 +406,48 @@ export function isUxfTransferOutboxEntry(
   if (obj.nostrEventId !== undefined) {
     if (typeof obj.nostrEventId !== 'string' || obj.nostrEventId.length === 0) {
       return false;
+    }
+  }
+  // Issue #166 P1 #3 — DoS bounds. A hostile peer replicating an
+  // entry with 1M tokenIds (or a single 100MB tokenId) would cost
+  // seconds of CPU + GB of RAM inside readAll()/contains() before
+  // the application could reject it. Cap at the type-guard gate so
+  // oversized entries are skipped silently — they never enter the
+  // result set returned to callers.
+  if (obj.tokenIds.length > MAX_TOKEN_IDS_PER_ENTRY) return false;
+  for (const t of obj.tokenIds) {
+    if (typeof t !== 'string') return false;
+    if (t.length === 0 || t.length > MAX_TOKEN_ID_LENGTH) return false;
+  }
+  if (obj.bundleCid.length > MAX_BUNDLE_CID_LENGTH) return false;
+  if (obj.recipient.length > MAX_RECIPIENT_LENGTH) return false;
+  if (obj.recipientTransportPubkey.length > MAX_TRANSPORT_PUBKEY_LENGTH) return false;
+  if (!isWithinOptionalStringLength(obj.recipientNametag, MAX_NAMETAG_LENGTH)) return false;
+  if (!isWithinOptionalStringLength(obj.memo, MAX_MEMO_LENGTH)) return false;
+  if (!isWithinOptionalStringLength(obj.error, MAX_ERROR_LENGTH)) return false;
+  if (
+    obj.nostrEventId !== undefined &&
+    typeof obj.nostrEventId === 'string' &&
+    obj.nostrEventId.length > MAX_NOSTR_EVENT_ID_LENGTH
+  ) {
+    return false;
+  }
+  // outstandingRequestIds / completedRequestIds are also tokenId-shaped
+  // hex digests; bound them with the same MAX_TOKEN_ID_LENGTH cap.
+  if (obj.outstandingRequestIds !== undefined) {
+    if (!Array.isArray(obj.outstandingRequestIds)) return false;
+    if (obj.outstandingRequestIds.length > MAX_TOKEN_IDS_PER_ENTRY) return false;
+    for (const r of obj.outstandingRequestIds) {
+      if (typeof r !== 'string') return false;
+      if (r.length === 0 || r.length > MAX_TOKEN_ID_LENGTH) return false;
+    }
+  }
+  if (obj.completedRequestIds !== undefined) {
+    if (!Array.isArray(obj.completedRequestIds)) return false;
+    if (obj.completedRequestIds.length > MAX_TOKEN_IDS_PER_ENTRY) return false;
+    for (const r of obj.completedRequestIds) {
+      if (typeof r !== 'string') return false;
+      if (r.length === 0 || r.length > MAX_TOKEN_ID_LENGTH) return false;
     }
   }
   return true;

@@ -1,3 +1,14 @@
+import {
+  MAX_TOKEN_IDS_PER_ENTRY,
+  MAX_TOKEN_ID_LENGTH,
+  MAX_RECIPIENT_LENGTH,
+  MAX_NAMETAG_LENGTH,
+  MAX_BUNDLE_CID_LENGTH,
+  MAX_NOSTR_EVENT_ID_LENGTH,
+  MAX_TRANSPORT_PUBKEY_LENGTH,
+  isWithinOptionalStringLength,
+} from './uxf-bounds.js';
+
 /**
  * UXF Inter-Wallet Transfer — SENT ledger type (Issue #97)
  *
@@ -174,6 +185,23 @@ export function isUxfSentLedgerEntry(value: unknown): value is UxfSentLedgerEntr
     if (typeof v.nostrEventId !== 'string' || (v.nostrEventId as string).length === 0) {
       return false;
     }
+  }
+  // Issue #166 P1 #3 — DoS bounds (mirror OUTBOX guard's caps).
+  if (v.tokenIds.length > MAX_TOKEN_IDS_PER_ENTRY) return false;
+  for (const t of v.tokenIds) {
+    // Already typeof-checked above; bounds-check the length too.
+    if ((t as string).length === 0 || (t as string).length > MAX_TOKEN_ID_LENGTH) return false;
+  }
+  if (v.bundleCid.length > MAX_BUNDLE_CID_LENGTH) return false;
+  if (v.recipientTransportPubkey.length > MAX_TRANSPORT_PUBKEY_LENGTH) return false;
+  if (!isWithinOptionalStringLength(v.recipient, MAX_RECIPIENT_LENGTH)) return false;
+  if (!isWithinOptionalStringLength(v.recipientNametag, MAX_NAMETAG_LENGTH)) return false;
+  if (
+    v.nostrEventId !== undefined &&
+    typeof v.nostrEventId === 'string' &&
+    v.nostrEventId.length > MAX_NOSTR_EVENT_ID_LENGTH
+  ) {
+    return false;
   }
   return true;
 }
