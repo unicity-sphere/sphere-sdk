@@ -49,6 +49,7 @@ import {
 import { decryptProfileValue, encryptProfileValue } from './encryption.js';
 import { Lamport } from './lamport.js';
 import type { ProfileDatabase } from './types.js';
+import { MAX_ENTRY_BYTES_RAW } from '../types/uxf-bounds.js';
 
 // =============================================================================
 // 1. Public option / input types
@@ -79,6 +80,20 @@ export type SentLedgerWriteInput = Omit<
   UxfSentLedgerEntry,
   '_schemaVersion' | 'lamport'
 >;
+
+/**
+ * Optional second argument to {@link SentLedgerWriter.write}. Mirrors
+ * the OutboxWriter shape — see {@link OutboxWriter.WriteOptions}.
+ * Issue #166 P1 #2.
+ */
+export interface SentWriteOptions {
+  /**
+   * By default, calling `write()` on an id whose slot is currently a
+   * tombstone is REFUSED with `OUTBOX_ENTRY_TOMBSTONED`. Pass `true`
+   * ONLY for operator escape-hatch resurrections / test fixtures.
+   */
+  readonly allowResurrection?: boolean;
+}
 
 // =============================================================================
 // 2. SentLedgerWriter
@@ -135,12 +150,31 @@ export class SentLedgerWriter {
    * second-write-wins behaviour gives the recovery sweeper room to
    * safely re-stamp without checking existence first.
    */
-  async write(input: SentLedgerWriteInput): Promise<UxfSentLedgerEntry> {
+  async write(
+    input: SentLedgerWriteInput,
+    options?: SentWriteOptions,
+  ): Promise<UxfSentLedgerEntry> {
     if (typeof input.id !== 'string' || input.id.length === 0) {
       throw new SphereError(
         'SentLedgerWriter.write: input.id must be a non-empty string',
         'VALIDATION_ERROR',
       );
+    }
+
+    // Issue #166 P1 #2 — refuse-write guard against tombstone
+    // resurrection. SENT tombstones are rare (the ledger is meant to
+    // be permanent), but the operator escape-hatch path exists; once
+    // tombstoned a SENT entry must not silently come back.
+    if (options?.allowResurrection !== true) {
+      const existing = await this.readTombstoneAt(input.id);
+      if (existing !== null) {
+        throw new SphereError(
+          `SentLedgerWriter.write: refusing to resurrect tombstoned slot "${input.id}" ` +
+            `(tombstone lamport=${existing.lamport}, deletedAt=${existing.deletedAt}). ` +
+            `If this is intentional (operator escape-hatch / test fixture), pass { allowResurrection: true }.`,
+          'OUTBOX_ENTRY_TOMBSTONED',
+        );
+      }
     }
 
     // Cold-restart correctness: same rationale as OutboxWriter — see
@@ -177,7 +211,16 @@ export class SentLedgerWriter {
         'VALIDATION_ERROR',
       );
     }
-    const tombstone = JSON.stringify({ tombstoned: true, deletedAt: Date.now() });
+    // Issue #166 P1 #2 — Lamport-stamp the tombstone. Same rationale
+    // as OutboxWriter.delete.
+    const observedLamports = await this.collectObservedLamports();
+    this.lamport.rehydrate(observedLamports);
+    const lamport = this.lamport.bumpFor([]);
+    const tombstone = JSON.stringify({
+      tombstoned: true,
+      deletedAt: Date.now(),
+      lamport,
+    });
     await this.writeRaw(id, tombstone);
   }
 
@@ -294,11 +337,81 @@ export class SentLedgerWriter {
     const out: number[] = [];
     for (const key of entries.keys()) {
       if (!key.startsWith(this.keyPrefix)) continue;
-      const decoded = await this.readDecoded(key);
-      if (decoded === null) continue;
-      if (isUxfSentLedgerEntry(decoded)) out.push(decoded.lamport);
+      // Issue #166 P1 #2 — observe live AND tombstone Lamports.
+      const shape = await this.readSlotShape(key);
+      if (shape === null) continue;
+      if (shape.kind === 'value') {
+        if (isUxfSentLedgerEntry(shape.value)) out.push(shape.value.lamport);
+      } else if (shape.kind === 'tombstone') {
+        out.push(shape.lamport);
+      }
     }
     return out;
+  }
+
+  /**
+   * Issue #166 P1 #2 — check whether the slot at `id` is currently a
+   * tombstone. Returns the tombstone metadata (lamport, deletedAt) or
+   * null. Mirrors OutboxWriter.readTombstoneAt.
+   */
+  private async readTombstoneAt(
+    id: string,
+  ): Promise<{ readonly lamport: number; readonly deletedAt: number } | null> {
+    const shape = await this.readSlotShape(this.keyFor(id));
+    if (shape === null) return null;
+    if (shape.kind !== 'tombstone') return null;
+    return { lamport: shape.lamport, deletedAt: shape.deletedAt };
+  }
+
+  /**
+   * Issue #166 P1 #2 — discriminated-union slot reader. Mirrors
+   * OutboxWriter.readSlotShape.
+   */
+  private async readSlotShape(
+    key: string,
+  ): Promise<
+    | null
+    | { readonly kind: 'tombstone'; readonly lamport: number; readonly deletedAt: number }
+    | { readonly kind: 'value'; readonly value: unknown }
+  > {
+    let raw: Uint8Array | null;
+    try {
+      raw = await this.db.get(key);
+    } catch {
+      return null;
+    }
+    if (!raw) return null;
+    // Issue #166 P1 #3 — pre-decrypt size cap; see readDecoded().
+    if (raw.byteLength > MAX_ENTRY_BYTES_RAW) return null;
+    let plaintextBytes: Uint8Array;
+    try {
+      plaintextBytes = this.encryptionKey
+        ? await decryptProfileValue(this.encryptionKey, raw)
+        : raw;
+    } catch {
+      return null;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(new TextDecoder().decode(plaintextBytes));
+    } catch {
+      return null;
+    }
+    if (
+      parsed !== null &&
+      typeof parsed === 'object' &&
+      'tombstoned' in (parsed as Record<string, unknown>) &&
+      (parsed as Record<string, unknown>).tombstoned === true
+    ) {
+      const p = parsed as Record<string, unknown>;
+      const lamport =
+        typeof p.lamport === 'number' && Number.isInteger(p.lamport) && p.lamport >= 0
+          ? p.lamport
+          : 0;
+      const deletedAt = typeof p.deletedAt === 'number' ? p.deletedAt : 0;
+      return { kind: 'tombstone', lamport, deletedAt };
+    }
+    return { kind: 'value', value: parsed };
   }
 
   private async writeRaw(id: string, value: string): Promise<void> {
@@ -317,6 +430,8 @@ export class SentLedgerWriter {
       return null;
     }
     if (!raw) return null;
+    // Issue #166 P1 #3 — pre-decrypt size cap.
+    if (raw.byteLength > MAX_ENTRY_BYTES_RAW) return null;
     let plaintextBytes: Uint8Array;
     try {
       plaintextBytes = this.encryptionKey

@@ -47,6 +47,12 @@ export type SphereErrorCode =
   // live OUTBOX entry OR in the SENT ledger. Override via
   // `TransferRequest.allowDuplicateBundleMembership = true`.
   | 'DUPLICATE_BUNDLE_MEMBERSHIP'
+  // Issue #166 P1 #2 — tombstone resurrection guard.
+  // `OutboxWriter.write()` and `SentLedgerWriter.write()` refuse to
+  // overwrite a slot that currently holds a tombstone marker. Pass
+  // `{ allowResurrection: true }` as the second argument for
+  // operator escape-hatch / test-fixture resurrections.
+  | 'OUTBOX_ENTRY_TOMBSTONED'
   | 'STORAGE_ERROR'
   | 'STORAGE_CORRUPTED'
   | 'TRANSPORT_ERROR'

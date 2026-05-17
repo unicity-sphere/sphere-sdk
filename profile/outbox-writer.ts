@@ -60,6 +60,7 @@ import { decryptProfileValue, encryptProfileValue } from './encryption.js';
 import { Lamport } from './lamport.js';
 import { assertTransition } from './outbox-state-machine.js';
 import type { ProfileDatabase } from './types.js';
+import { MAX_ENTRY_BYTES_RAW } from '../types/uxf-bounds.js';
 
 // =============================================================================
 // 1. Public option / classification types
@@ -103,6 +104,27 @@ export type OutboxWriteInput = Omit<
   /** Optional: explicit timestamp for the write. Defaults to `Date.now()`. */
   readonly updatedAt?: number;
 };
+
+/**
+ * Optional second argument to {@link OutboxWriter.write}. Issue #166
+ * P1 #2 adds the {@link WriteOptions.allowResurrection} escape hatch.
+ */
+export interface WriteOptions {
+  /**
+   * Issue #166 P1 #2 — by default, calling `write()` on an id whose
+   * slot is currently a tombstone is REFUSED with
+   * `OUTBOX_ENTRY_TOMBSTONED`. The tombstone represents a completed
+   * delivery (the matching SENT entry is the durable record); writing
+   * a new entry over it would silently resurrect a key that should
+   * stay dead, defeating the whole point of the OUTBOX drain.
+   *
+   * Pass `true` ONLY for legitimate escape-hatch resurrections —
+   * operator triage of a poisoned key, test fixtures, or explicit
+   * spec-defined "rewind" operations. The writer emits no log on
+   * `true` so the caller takes responsibility for the audit trail.
+   */
+  readonly allowResurrection?: boolean;
+}
 
 // =============================================================================
 // 2. OutboxWriter
@@ -175,12 +197,37 @@ export class OutboxWriter {
    * produces two distinct Lamport stamps but the same `id` slot is
    * overwritten — second write wins.
    */
-  async write(input: OutboxWriteInput): Promise<UxfTransferOutboxEntry> {
+  async write(
+    input: OutboxWriteInput,
+    options?: WriteOptions,
+  ): Promise<UxfTransferOutboxEntry> {
     if (typeof input.id !== 'string' || input.id.length === 0) {
       throw new SphereError(
         'OutboxWriter.write: input.id must be a non-empty string',
         'VALIDATION_ERROR',
       );
+    }
+
+    // Issue #166 P1 #2 — refuse-write guard against tombstone
+    // resurrection. After sync, the slot at `input.id` may be a
+    // tombstone from another replica that completed delivery + SENT
+    // write. Resurrecting it would erase that completion signal.
+    // Callers that genuinely need to resurrect (e.g. test fixtures,
+    // operator escape-hatch) pass `{ allowResurrection: true }`.
+    //
+    // Legacy tombstones (pre-#166, no `lamport` field) are still
+    // refused — the resurrection risk is the same regardless of
+    // whether the tombstone carries a Lamport stamp.
+    if (options?.allowResurrection !== true) {
+      const existing = await this.readTombstoneAt(input.id);
+      if (existing !== null) {
+        throw new SphereError(
+          `OutboxWriter.write: refusing to resurrect tombstoned slot "${input.id}" ` +
+            `(tombstone lamport=${existing.lamport}, deletedAt=${existing.deletedAt}). ` +
+            `If this is intentional (operator escape-hatch / test fixture), pass { allowResurrection: true }.`,
+          'OUTBOX_ENTRY_TOMBSTONED',
+        );
+      }
     }
 
     // Read all observed Lamports for the bump rule. Includes the
@@ -304,7 +351,22 @@ export class OutboxWriter {
         'VALIDATION_ERROR',
       );
     }
-    const tombstone = JSON.stringify({ tombstoned: true, deletedAt: Date.now() });
+    // Issue #166 P1 #2 — stamp the tombstone with a Lamport via the
+    // same §7.1 bump rule used by live writes. The Lamport lets the
+    // refuse-write guard in write() identify "previously deleted"
+    // slots after sync and lets collectObservedLamports() count
+    // tombstones toward the clock so subsequent writes don't reuse a
+    // stale Lamport. Cold-restart rehydrate happens for the same
+    // reason as in write() — observations come from our durable
+    // store so the W39 bounds defense must not fire.
+    const observedLamports = await this.collectObservedLamports();
+    this.lamport.rehydrate(observedLamports);
+    const lamport = this.lamport.bumpFor([]);
+    const tombstone = JSON.stringify({
+      tombstoned: true,
+      deletedAt: Date.now(),
+      lamport,
+    });
     await this.writeRaw(id, tombstone);
   }
 
@@ -394,11 +456,97 @@ export class OutboxWriter {
     const out: number[] = [];
     for (const key of entries.keys()) {
       if (!key.startsWith(this.keyPrefix)) continue;
-      const decoded = await this.readDecoded(key);
-      if (decoded === null) continue;
-      if (isUxfTransferOutboxEntry(decoded)) out.push(decoded.lamport);
+      // Issue #166 P1 #2 — observe live AND tombstone Lamports.
+      // Without including tombstones, a fresh write after deletion
+      // could stamp a Lamport equal to or below the tombstone's,
+      // violating the §7.1 monotonic invariant.
+      const shape = await this.readSlotShape(key);
+      if (shape === null) continue;
+      if (shape.kind === 'value') {
+        if (isUxfTransferOutboxEntry(shape.value)) out.push(shape.value.lamport);
+      } else if (shape.kind === 'tombstone') {
+        out.push(shape.lamport);
+      }
     }
     return out;
+  }
+
+  /**
+   * Issue #166 P1 #2 — check whether the slot at `id` is currently a
+   * tombstone, and if so return its Lamport + deletedAt for the
+   * refuse-write guard. Returns `null` for absent slots, live values,
+   * and any decode/decrypt failures.
+   *
+   * Legacy tombstones (pre-#166, no `lamport` field) report
+   * `lamport: 0` so the refusal still fires. The lamport field is
+   * forensic for the error message; the refusal itself is unconditional
+   * on the presence of the tombstone marker.
+   */
+  private async readTombstoneAt(
+    id: string,
+  ): Promise<{ readonly lamport: number; readonly deletedAt: number } | null> {
+    const shape = await this.readSlotShape(this.keyFor(id));
+    if (shape === null) return null;
+    if (shape.kind !== 'tombstone') return null;
+    return { lamport: shape.lamport, deletedAt: shape.deletedAt };
+  }
+
+  /**
+   * Issue #166 P1 #2 — read raw bytes at `key`, decrypt + parse, and
+   * classify the slot. Returns a discriminated union so callers can
+   * distinguish absent / tombstone / live value without re-decoding.
+   *
+   * `readDecoded()` remains the backward-compat surface (returns
+   * `null` for absent + tombstone, the parsed value otherwise) — most
+   * consumers want that semantics.
+   */
+  private async readSlotShape(
+    key: string,
+  ): Promise<
+    | null
+    | { readonly kind: 'tombstone'; readonly lamport: number; readonly deletedAt: number }
+    | { readonly kind: 'value'; readonly value: unknown }
+  > {
+    let raw: Uint8Array | null;
+    try {
+      raw = await this.db.get(key);
+    } catch {
+      return null;
+    }
+    if (!raw) return null;
+    // Issue #166 P1 #3 — pre-decrypt size cap; see readDecoded().
+    if (raw.byteLength > MAX_ENTRY_BYTES_RAW) return null;
+    let plaintextBytes: Uint8Array;
+    try {
+      plaintextBytes = this.encryptionKey
+        ? await decryptProfileValue(this.encryptionKey, raw)
+        : raw;
+    } catch {
+      return null;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(new TextDecoder().decode(plaintextBytes));
+    } catch {
+      return null;
+    }
+    if (
+      parsed !== null &&
+      typeof parsed === 'object' &&
+      'tombstoned' in (parsed as Record<string, unknown>) &&
+      (parsed as Record<string, unknown>).tombstoned === true
+    ) {
+      const p = parsed as Record<string, unknown>;
+      // Legacy tombstones lack `lamport`; coerce to 0 so callers can
+      // still identify the slot as tombstoned. Same for missing
+      // `deletedAt` — purely forensic.
+      const lamport = typeof p.lamport === 'number' && Number.isInteger(p.lamport) && p.lamport >= 0
+        ? p.lamport
+        : 0;
+      const deletedAt = typeof p.deletedAt === 'number' ? p.deletedAt : 0;
+      return { kind: 'tombstone', lamport, deletedAt };
+    }
+    return { kind: 'value', value: parsed };
   }
 
   /**
@@ -425,6 +573,11 @@ export class OutboxWriter {
       return null;
     }
     if (!raw) return null;
+    // Issue #166 P1 #3 — pre-decrypt size cap. A hostile peer
+    // replicating a 100MB blob would otherwise cost RAM + CPU at the
+    // decrypt step before we could reject. Cap BEFORE decrypt so the
+    // cost stays bounded.
+    if (raw.byteLength > MAX_ENTRY_BYTES_RAW) return null;
     let plaintextBytes: Uint8Array;
     try {
       plaintextBytes = this.encryptionKey

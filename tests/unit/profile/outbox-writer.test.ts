@@ -814,4 +814,218 @@ describe('isUxfTransferOutboxEntry / isLegacyOutboxEntry', () => {
       ).toBe(false);
     });
   });
+
+  // -------------------------------------------------------------------------
+  // Issue #166 P1 #3 — DoS bounds-defense at the type-guard gate.
+  // -------------------------------------------------------------------------
+  describe('isUxfTransferOutboxEntry — P1 #3 size caps', () => {
+    function makeValid(): UxfTransferOutboxEntry {
+      return {
+        _schemaVersion: 'uxf-1',
+        id: 'x',
+        bundleCid: 'b',
+        tokenIds: ['t1'],
+        deliveryMethod: 'car-over-nostr',
+        recipient: '@a',
+        recipientTransportPubkey: 'a'.repeat(64),
+        mode: 'instant',
+        status: 'packaging',
+        submitRetryCount: 0,
+        proofErrorCount: 0,
+        createdAt: 1,
+        updatedAt: 1,
+        lamport: 1,
+      };
+    }
+
+    it('accepts tokenIds.length at the cap (4096) — boundary', () => {
+      const tokenIds = Array.from({ length: 4096 }, (_, i) => `t${i}`);
+      expect(isUxfTransferOutboxEntry({ ...makeValid(), tokenIds })).toBe(true);
+    });
+
+    it('rejects tokenIds.length > MAX_TOKEN_IDS_PER_ENTRY (4097)', () => {
+      const tokenIds = Array.from({ length: 4097 }, (_, i) => `t${i}`);
+      expect(isUxfTransferOutboxEntry({ ...makeValid(), tokenIds })).toBe(false);
+    });
+
+    it('rejects a single tokenId longer than MAX_TOKEN_ID_LENGTH (256+1)', () => {
+      const longId = 'a'.repeat(257);
+      expect(
+        isUxfTransferOutboxEntry({ ...makeValid(), tokenIds: [longId] }),
+      ).toBe(false);
+    });
+
+    it('accepts tokenId at the cap (256 chars) — boundary', () => {
+      const id = 'a'.repeat(256);
+      expect(
+        isUxfTransferOutboxEntry({ ...makeValid(), tokenIds: [id] }),
+      ).toBe(true);
+    });
+
+    it('rejects empty-string tokenId', () => {
+      expect(
+        isUxfTransferOutboxEntry({ ...makeValid(), tokenIds: [''] }),
+      ).toBe(false);
+    });
+
+    it('rejects recipient longer than MAX_RECIPIENT_LENGTH (1024+1)', () => {
+      const recipient = 'a'.repeat(1025);
+      expect(isUxfTransferOutboxEntry({ ...makeValid(), recipient })).toBe(false);
+    });
+
+    it('rejects bundleCid longer than MAX_BUNDLE_CID_LENGTH (256+1)', () => {
+      const bundleCid = 'a'.repeat(257);
+      expect(isUxfTransferOutboxEntry({ ...makeValid(), bundleCid })).toBe(false);
+    });
+
+    it('rejects recipientNametag longer than MAX_NAMETAG_LENGTH (256+1) when present', () => {
+      const recipientNametag = 'a'.repeat(257);
+      expect(
+        isUxfTransferOutboxEntry({ ...makeValid(), recipientNametag }),
+      ).toBe(false);
+    });
+
+    it('rejects memo longer than MAX_MEMO_LENGTH (8192+1) when present', () => {
+      const memo = 'a'.repeat(8193);
+      expect(isUxfTransferOutboxEntry({ ...makeValid(), memo })).toBe(false);
+    });
+
+    it('rejects error longer than MAX_ERROR_LENGTH (4096+1) when present', () => {
+      const error = 'a'.repeat(4097);
+      expect(isUxfTransferOutboxEntry({ ...makeValid(), error })).toBe(false);
+    });
+
+    it('rejects nostrEventId longer than MAX_NOSTR_EVENT_ID_LENGTH (128+1)', () => {
+      const nostrEventId = 'a'.repeat(129);
+      expect(
+        isUxfTransferOutboxEntry({ ...makeValid(), nostrEventId }),
+      ).toBe(false);
+    });
+
+    it('rejects recipientTransportPubkey longer than MAX_TRANSPORT_PUBKEY_LENGTH (128+1)', () => {
+      const recipientTransportPubkey = 'a'.repeat(129);
+      expect(
+        isUxfTransferOutboxEntry({ ...makeValid(), recipientTransportPubkey }),
+      ).toBe(false);
+    });
+
+    it('rejects outstandingRequestIds.length over cap', () => {
+      const outstandingRequestIds = Array.from({ length: 4097 }, (_, i) => `r${i}`);
+      expect(
+        isUxfTransferOutboxEntry({ ...makeValid(), outstandingRequestIds }),
+      ).toBe(false);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Issue #166 P1 #2 — tombstone Lamport + write-refuse guard.
+  // -------------------------------------------------------------------------
+  describe('OutboxWriter — P1 #2 tombstone Lamport + refuse-write', () => {
+    let db: MockProfileDb;
+
+    beforeEach(() => {
+      db = createMockDb();
+    });
+
+    it('delete() writes a tombstone carrying a Lamport stamp', async () => {
+      const writer = buildWriter(db);
+      const written = await writer.write(buildBaseInput('a'));
+      await writer.delete('a');
+
+      // Inspect the raw stored value: should be a tombstone with lamport > written.lamport
+      const raw = db._store.get(`${KEY_PREFIX}a`);
+      expect(raw).toBeDefined();
+      const parsed = JSON.parse(new TextDecoder().decode(raw!)) as {
+        tombstoned: boolean;
+        deletedAt: number;
+        lamport: number;
+      };
+      expect(parsed.tombstoned).toBe(true);
+      expect(typeof parsed.deletedAt).toBe('number');
+      expect(typeof parsed.lamport).toBe('number');
+      expect(parsed.lamport).toBeGreaterThan(written.lamport);
+    });
+
+    it('write() refuses to resurrect a tombstoned slot by default', async () => {
+      const writer = buildWriter(db);
+      await writer.write(buildBaseInput('rip'));
+      await writer.delete('rip');
+
+      await expect(writer.write(buildBaseInput('rip'))).rejects.toMatchObject({
+        code: 'OUTBOX_ENTRY_TOMBSTONED',
+      });
+      // Slot remains tombstoned (read returns null).
+      expect(await writer.readOne('rip')).toBeNull();
+    });
+
+    it('write({ allowResurrection: true }) permits explicit resurrection', async () => {
+      const writer = buildWriter(db);
+      await writer.write(buildBaseInput('phoenix'));
+      await writer.delete('phoenix');
+
+      const restored = await writer.write(buildBaseInput('phoenix'), {
+        allowResurrection: true,
+      });
+      expect(restored.id).toBe('phoenix');
+      const readBack = await writer.readOne('phoenix');
+      expect(readBack).not.toBeNull();
+      expect(readBack?.shape).toBe('uxf-1');
+    });
+
+    it('resurrected entry has a Lamport > tombstone Lamport (clock observed tombstone)', async () => {
+      const writer = buildWriter(db);
+      const v1 = await writer.write(buildBaseInput('p'));
+      await writer.delete('p');
+      // Read tombstone lamport from raw store
+      const tombstoneRaw = db._store.get(`${KEY_PREFIX}p`)!;
+      const tombstone = JSON.parse(new TextDecoder().decode(tombstoneRaw));
+      const tombLamport = tombstone.lamport;
+
+      const v2 = await writer.write(buildBaseInput('p'), { allowResurrection: true });
+      expect(v2.lamport).toBeGreaterThan(tombLamport);
+      expect(v2.lamport).toBeGreaterThan(v1.lamport);
+    });
+
+    it('legacy tombstones (no lamport field) are also refused (backward-compat)', async () => {
+      const writer = buildWriter(db);
+      // Plant a legacy tombstone directly bypassing delete().
+      const legacy = JSON.stringify({ tombstoned: true, deletedAt: 1 });
+      db._store.set(`${KEY_PREFIX}old`, new TextEncoder().encode(legacy));
+
+      await expect(writer.write(buildBaseInput('old'))).rejects.toMatchObject({
+        code: 'OUTBOX_ENTRY_TOMBSTONED',
+      });
+    });
+
+    it('subsequent writes after delete advance the clock past the tombstone (write to a DIFFERENT id)', async () => {
+      const writer = buildWriter(db);
+      const v1 = await writer.write(buildBaseInput('alpha'));
+      await writer.delete('alpha');
+      // Read the tombstone Lamport.
+      const tombstoneRaw = db._store.get(`${KEY_PREFIX}alpha`)!;
+      const tombstone = JSON.parse(new TextDecoder().decode(tombstoneRaw));
+
+      // Now write a DIFFERENT id. collectObservedLamports must include
+      // the tombstone's Lamport so the new write's Lamport is strictly
+      // greater than the tombstone's.
+      const v2 = await writer.write(buildBaseInput('beta'));
+      expect(v2.lamport).toBeGreaterThan(tombstone.lamport);
+      expect(v2.lamport).toBeGreaterThan(v1.lamport);
+    });
+
+    it('pre-decrypt size cap rejects oversized blobs without decryption', async () => {
+      const writer = buildWriter(db);
+      // Inject a 2MB blob at a key (encrypted or plaintext — irrelevant
+      // since the cap kicks in before decrypt).
+      const big = new Uint8Array(2 * 1024 * 1024);
+      big.fill(0xff);
+      db._store.set(`${KEY_PREFIX}toobig`, big);
+
+      // Reader returns null without throwing — the blob is dropped at
+      // the size-cap gate.
+      expect(await writer.readOne('toobig')).toBeNull();
+      // readAll() also skips the oversized blob silently.
+      expect(await writer.readAll()).toHaveLength(0);
+    });
+  });
 });
