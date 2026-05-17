@@ -548,6 +548,8 @@ export type SphereEventType =
   | 'transfer:capability-warning'
   | 'transfer:recovery-republished'
   | 'transfer:orphan-spending-detected'
+  | 'transfer:sent-reconciliation-recovered'
+  | 'transfer:sent-reconciliation-failed'
   | 'payment_request:incoming'
   | 'payment_request:accepted'
   | 'payment_request:rejected'
@@ -1065,6 +1067,49 @@ export interface SphereEventMap {
     readonly detectedAt: number;
     readonly coinId: string;
     readonly amount: string;
+  };
+  /**
+   * Issue #166 P2 #4 — A SENT-ledger write that was missed at the
+   * dispatcher's delivered/delivered-instant transition (because the
+   * SENT writer threw) was successfully retried by the
+   * SentReconciliationWorker. The OUTBOX entry is now tombstoned.
+   *
+   * Payload fields:
+   *  - `outboxId`    — the recovered entry's id (matches the SENT id)
+   *  - `tokenIds`    — the bundle's genesis token ids
+   *  - `mode`        — the entry's transfer mode (forensic only)
+   *  - `recoveredAt` — wall-clock ms timestamp of the successful retry
+   *
+   * Companion to the round-2 steelman fix (`fcf1d53`) that keeps the
+   * OUTBOX entry live at `status='delivered'` when SENT write fails so
+   * an operator (or this worker) can complete the recovery.
+   */
+  'transfer:sent-reconciliation-recovered': {
+    readonly outboxId: string;
+    readonly tokenIds: ReadonlyArray<string>;
+    readonly mode: 'conservative' | 'instant' | 'txf';
+    readonly recoveredAt: number;
+  };
+  /**
+   * Issue #166 P2 #4 — A SENT-ledger reconciliation retry exceeded
+   * `maxRetries` consecutive failures. The OUTBOX entry remains live
+   * at `status='delivered'` / `'delivered-instant'` for operator
+   * triage; auto-retry is suspended for this entry until the worker
+   * restarts (the in-memory failure counter is process-local).
+   *
+   * Payload fields:
+   *  - `outboxId`            — the entry that could not be reconciled
+   *  - `consecutiveFailures` — total failure count at the moment of
+   *                            give-up (equals `maxRetries`)
+   *  - `lastError`           — redacted message of the most recent
+   *                            SENT-write throw (for operator triage)
+   *  - `failedAt`            — wall-clock ms timestamp
+   */
+  'transfer:sent-reconciliation-failed': {
+    readonly outboxId: string;
+    readonly consecutiveFailures: number;
+    readonly lastError: string;
+    readonly failedAt: number;
   };
   'payment_request:incoming': IncomingPaymentRequest;
   'payment_request:accepted': IncomingPaymentRequest;

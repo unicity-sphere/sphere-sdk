@@ -119,6 +119,16 @@ import {
 // layer (Sphere) wires an instance via `installSendingRecoveryWorker()`;
 // the module starts/stops it gated on `features.recoveryWorker`.
 import { SendingRecoveryWorker } from './transfer/sending-recovery-worker';
+// Issue #166 P2 #4 — SENT-write reconciliation worker. Auto-installed in
+// `initialize()` when `features.sentReconciliationWorker` is true
+// (default-ON). Retries SENT-ledger writes that failed at the
+// dispatcher's delivered-transition (per round-2 steelman fix in PR #97
+// commit `fcf1d53`, which keeps OUTBOX entries live at `status='delivered'`
+// when SENT write fails so an operator can complete the recovery).
+import {
+  SentReconciliationWorker,
+  type SentReconciliationWorkerDeps,
+} from './transfer/sent-reconciliation-worker';
 // Phase 9.6.D — sender-side §6.1 finalization worker. Auto-installed in
 // `initialize()` when `features.finalizationWorker` is true (default-ON
 // when `senderUxf` is true). Consumer-installed workers (via
@@ -990,6 +1000,18 @@ export interface UxfTransferFeatures {
    */
   readonly recoveryWorker?: boolean;
   /**
+   * Issue #166 P2 #4 — when `true` (default), auto-install and start a
+   * {@link SentReconciliationWorker} in {@link PaymentsModule.initialize}
+   * so SENT-ledger writes that failed at the dispatcher's
+   * `delivered` / `delivered-instant` transition are automatically
+   * retried. The worker walks the OUTBOX for entries stuck at terminal
+   * statuses (the round-2 steelman fix in PR #97 keeps them live for
+   * forensic record), re-runs `writeSentEntryFromOutbox`, and on
+   * success tombstones the OUTBOX entry. Set `false` to suppress (e.g.
+   * for timer-sensitive unit tests).
+   */
+  readonly sentReconciliationWorker?: boolean;
+  /**
    * Phase 9.6.D — when `true` (default when `senderUxf` is on),
    * auto-install and start a {@link FinalizationWorkerSender} in
    * {@link PaymentsModule.initialize} so instant-mode sends drive the
@@ -1439,6 +1461,13 @@ export class PaymentsModule {
       // them idempotently. The worker still no-ops until a republish hook
       // is wired by the bootstrap layer.
       recoveryWorker: config?.features?.recoveryWorker ?? true,
+      // Issue #166 P2 #4 — SENT-write reconciliation worker. Default-ON:
+      // retries SENT writes that failed at the dispatcher's delivered-
+      // transition. The worker itself self-skips when either OUTBOX or
+      // SENT writer is uninstalled, so default-ON is safe even on
+      // legacy-only wallets (it just no-ops every cycle).
+      sentReconciliationWorker:
+        config?.features?.sentReconciliationWorker ?? true,
       // Phase 9.6.D — sender-side §6.1 finalization worker. Default-ON
       // when senderUxf is on: drives instant-mode sends through the full
       // submit/poll cycle so `transfer:confirmed` fires once the
@@ -1752,6 +1781,44 @@ export class PaymentsModule {
     ) {
       // Pre-installed by the bootstrap layer — start it.
       this.sendingRecoveryWorker.start();
+    }
+
+    // Issue #166 P2 #4 — auto-install the SENT-write reconciliation
+    // worker. Mirrors the SendingRecoveryWorker pattern above but with
+    // closures over the OUTBOX/SENT writer providers so the worker
+    // observes hot-swaps and the writer-uninstall arc at destroy. The
+    // worker itself self-skips when either writer is null, so the
+    // start() call is safe even before the bootstrap layer (Sphere)
+    // installs the writers.
+    if (
+      this.features.sentReconciliationWorker &&
+      this.sentReconciliationWorker === null
+    ) {
+      // Pre-bind the SENT-write helper so the closure in
+      // `recDeps.writeSentEntry` doesn't lose `this` — same rationale
+      // as the SendingRecoveryWorker's C3 fix above.
+      const writeSentEntryFromOutbox =
+        this.writeSentEntryFromOutbox.bind(this);
+      const recDeps: SentReconciliationWorkerDeps = {
+        outboxProvider: (): Pick<OutboxWriter, 'readAllNew' | 'delete'> | null =>
+          this._outboxWriter,
+        sentProvider: (): Pick<SentLedgerWriter, 'readOne'> | null =>
+          this._sentLedgerWriter,
+        writeSentEntry: writeSentEntryFromOutbox,
+        emit: this.deps!.emitEvent,
+      };
+      this.sentReconciliationWorker = new SentReconciliationWorker(recDeps);
+      this.sentReconciliationWorker.start();
+      logger.debug(
+        'Payments',
+        'Default SentReconciliationWorker auto-installed (sentReconciliationWorker default-on)',
+      );
+    } else if (
+      this.features.sentReconciliationWorker &&
+      this.sentReconciliationWorker !== null
+    ) {
+      // Pre-installed by the bootstrap layer — start it.
+      this.sentReconciliationWorker.start();
     }
 
     // T.3.E — auto-install a default IngestWorkerPool when recipientUxf
@@ -3208,6 +3275,8 @@ export class PaymentsModule {
   private revalidateCascadedRunner: RevalidateCascadedRunner | null = null;
   /** @internal — set by `installSendingRecoveryWorker()`. Phase 8 steelman. */
   private sendingRecoveryWorker: SendingRecoveryWorker | null = null;
+  /** @internal — auto-installed or set by `installSentReconciliationWorker()`. Issue #166 P2 #4. */
+  private sentReconciliationWorker: SentReconciliationWorker | null = null;
   /** @internal — auto-installed or set by `installFinalizationWorkerSender()`. Phase 9.6.D. */
   private finalizationWorkerSender: FinalizationWorkerSender | null = null;
   /**
@@ -3605,6 +3674,38 @@ export class PaymentsModule {
   }
 
   /**
+   * Issue #166 P2 #4 — install the SENT-write reconciliation worker.
+   * Idempotent: a second call stops the previous worker (await its
+   * in-flight scan) and swaps in the new instance. If
+   * `features.sentReconciliationWorker` is `true`, the next
+   * `initialize()` call starts the new worker; if the module is
+   * already initialized, the worker is started immediately.
+   *
+   * The bootstrap layer (Sphere) ordinarily does NOT need to call this
+   * — the auto-install path in `initialize()` already wires a default
+   * worker with closures over the production writers. This hook exists
+   * for tests that need a fully-mocked worker AND for future bootstrap
+   * layers that want to inject a custom failure-event consumer.
+   *
+   * **No-op when `features.sentReconciliationWorker === false`** —
+   * installing is cheap (no scan loop runs until `start()`); the gate
+   * is the flag.
+   */
+  installSentReconciliationWorker(worker: SentReconciliationWorker): void {
+    // Stop the previous worker without blocking the install. We
+    // intentionally do not await here — callers may be hot-swapping
+    // workers under test, and the worker's stop() is documented as
+    // "best-effort, never throws". Errors are swallowed.
+    if (this.sentReconciliationWorker !== null) {
+      void this.sentReconciliationWorker.stop().catch(() => undefined);
+    }
+    this.sentReconciliationWorker = worker;
+    if (this.deps !== null && this.features.sentReconciliationWorker) {
+      worker.start();
+    }
+  }
+
+  /**
    * Phase 9.6.D — install the sender-side finalization worker.
    *
    * Idempotent: a second call stops the previous worker (fire-and-
@@ -3857,6 +3958,15 @@ export class PaymentsModule {
     if (this.sendingRecoveryWorker) {
       void this.sendingRecoveryWorker.stop().catch(() => undefined);
       this.sendingRecoveryWorker = null;
+    }
+
+    // Issue #166 P2 #4 — stop the SENT-write reconciliation worker.
+    // Same fire-and-forget contract as the sending-recovery worker
+    // above. The worker's `stop()` drains the in-flight scan and never
+    // throws on graceful shutdown.
+    if (this.sentReconciliationWorker) {
+      void this.sentReconciliationWorker.stop().catch(() => undefined);
+      this.sentReconciliationWorker = null;
     }
 
     // Task #169 — abort the worker AbortController BEFORE stopping the
