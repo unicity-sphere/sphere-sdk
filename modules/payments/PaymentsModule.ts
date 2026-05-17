@@ -3434,30 +3434,38 @@ export class PaymentsModule {
    * `'confirmed'` and persists the change. The token's value becomes
    * spendable again.
    *
-   * **Safety contract.** The strategy is SAFE when the spending
-   * commit never reached the aggregator (the common crash window
-   * between source-token mark-as-transferring and OUTBOX-entry
-   * write). It is UNSAFE when the commit DID reach the aggregator
-   * but the OUTBOX write crashed afterward — in that rare case, the
-   * aggregator's view differs from the wallet's restored view and
-   * the next operation touching the token will surface a
-   * state-mismatch error from the aggregator (correctness preserved
-   * at the cost of a confusing late error).
+   * **Safety contract.** Before flipping status the recovery hook
+   * cross-checks the aggregator (#166 P2 #1 follow-up — OUTBOX-SEND-
+   * FOLLOWUPS.md item #1). The source-token's pre-commit state hash
+   * is extracted from local `sdkData` and queried via
+   * {@link OracleProvider.isSpent}. The strategy:
+   *  - aggregator reports state UNSPENT → spending commit never
+   *    reached L3; safe to restore (the original Phase-2 happy path).
+   *  - aggregator reports state SPENT → commit landed on-chain; a
+   *    local restore would diverge from the aggregator's view and the
+   *    next operation on the restored token would surface a confusing
+   *    state-mismatch error. Escalate to manual triage.
+   *  - aggregator RPC throws → fail-closed; we cannot rule out the
+   *    spent case, so escalate to manual triage.
+   *  - source state hash unparseable (degenerate `sdkData`) → also
+   *    fail-closed; cannot verify, escalate.
    *
-   * Returns `'manual'` (preserving Phase-1 behavior) when:
+   * Returns `'manual'` when:
    *  - The token id is no longer in the in-memory `this.tokens`
    *    (concurrent removal — let the operator triage); OR
    *  - The token's status is no longer `'transferring'` (race
    *    between detection and recovery — the dispatcher's own
    *    Loop1-S9 restore may already have run); OR
+   *  - The aggregator cross-check escalates per the cases above; OR
    *  - The persistence step (`this.save()`) throws (we left the
    *    in-memory restoration in place, but the durability
    *    guarantee is lost; operator should know).
    *
-   * Throw safety: never throws — defense-in-depth converts the
-   * `this.save()` rejection path to `'manual'` rather than letting
-   * the throw propagate into the sweeper (which would treat it as
-   * `'manual'` anyway — just with a noisier warn-log).
+   * Throw safety: never throws — defense-in-depth converts every
+   * thrown path (oracle RPC failure, `this.save()` rejection) to
+   * `'manual'` rather than letting the throw propagate into the
+   * sweeper (which would treat it as `'manual'` anyway — just with a
+   * noisier warn-log).
    */
   private async defaultOrphanRecovery(
     finding: OrphanSpendingFinding,
@@ -3465,6 +3473,50 @@ export class PaymentsModule {
     const token = this.tokens.get(finding.tokenId);
     if (token === undefined) return 'manual';
     if (token.status !== 'transferring') return 'manual';
+
+    // OUTBOX-SEND-FOLLOWUPS item #1: aggregator cross-check.
+    //
+    // The orphan's `sdkData` still holds the pre-commit serialization
+    // — `commitSources` does not mutate the source token's local
+    // data; the spent state shows up on-chain only. Extract the state
+    // hash and ask the aggregator whether that state is already
+    // recorded as spent. If yes, the spending commit DID land before
+    // the crash, and restoring locally would produce a token whose
+    // local state diverges from the aggregator's view.
+    const sourceStateHash = extractStateHashFromSdkData(token.sdkData);
+    if (sourceStateHash === '') {
+      logger.warn(
+        'Payments',
+        `defaultOrphanRecovery: token ${token.id} has no parseable stateHash on sdkData — ` +
+          `cannot cross-check aggregator; escalating to manual triage.`,
+      );
+      return 'manual';
+    }
+    let aggregatorRecordsSpent: boolean;
+    try {
+      aggregatorRecordsSpent = await this.deps!.oracle.isSpent(sourceStateHash);
+    } catch (oracleErr) {
+      // Per OracleProvider.isSpent contract, an RPC failure throws
+      // (never fail-open). Treat the throw as ambiguous: we cannot
+      // rule out the spent case, so escalate.
+      logger.warn(
+        'Payments',
+        `defaultOrphanRecovery: oracle.isSpent threw for token ${token.id} ` +
+          `(stateHash=${sourceStateHash}) — fail-closed to manual triage: ` +
+          `${oracleErr instanceof Error ? oracleErr.message : String(oracleErr)}`,
+      );
+      return 'manual';
+    }
+    if (aggregatorRecordsSpent) {
+      logger.error(
+        'Payments',
+        `defaultOrphanRecovery: aggregator records source state spent for token ${token.id} ` +
+          `(stateHash=${sourceStateHash}) — spending commit landed on-chain, local restore ` +
+          `would diverge; escalating to manual triage. Operator action: re-package the bundle ` +
+          `from the post-spend recipient context, or accept the value as already-sent.`,
+      );
+      return 'manual';
+    }
 
     // Apply the in-memory restoration. The Token interface has
     // `status` and `updatedAt` as mutable — same pattern used by
