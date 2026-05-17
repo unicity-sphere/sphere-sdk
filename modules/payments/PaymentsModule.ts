@@ -199,6 +199,7 @@ import type { SentLedgerWriter } from '../../profile/sent-ledger-writer';
 import {
   sweepOrphanSpendingTokens,
   type OrphanSweepResult,
+  type OrphanSpendingFinding,
 } from './transfer/orphan-spending-sweeper';
 import {
   resolveSenderInfoViaBinding,
@@ -1043,6 +1044,37 @@ export interface UxfTransferFeatures {
    */
   readonly nostrPersistenceVerifier?: boolean;
   /**
+   * Issue #166 P2 #1 — orphan-spending-tx AUTO-RECOVERY. Default
+   * `false` (opt-in).
+   *
+   * When OFF, the orphan sweeper retains its Phase-1 detection-only
+   * behavior: tokens in `'transferring'` status without an OUTBOX or
+   * SENT entry produce `transfer:orphan-spending-detected` events for
+   * operator triage.
+   *
+   * When ON, the sweeper calls a default recovery hook that flips
+   * the orphan token's status from `'transferring'` back to
+   * `'confirmed'` and persists the change. Recovered orphans produce
+   * `transfer:orphan-recovered` events (with strategy
+   * `'restore-to-confirmed'`) INSTEAD of the detected event.
+   *
+   * **Safety trade-off (documented).** The Phase-2 first-cut default
+   * recovery assumes the spending commit never reached the
+   * aggregator (the common crash window — between source-token
+   * mark-as-transferring and OUTBOX entry write). If that assumption
+   * is wrong (rare race: commit landed on the aggregator but the
+   * OUTBOX write crashed before persist), the recovered token's
+   * state hash will not match the aggregator's view; the next
+   * operation touching the token will see a state-mismatch
+   * rejection. Correctness is preserved at the cost of a confusing
+   * error surfaced later. Aggregator cross-check before recovery is
+   * a follow-up wave.
+   *
+   * Default-OFF until soak environments confirm the trade-off is
+   * acceptable.
+   */
+  readonly orphanAutoRecovery?: boolean;
+  /**
    * Phase 9.6.D — when `true` (default when `senderUxf` is on),
    * auto-install and start a {@link FinalizationWorkerSender} in
    * {@link PaymentsModule.initialize} so instant-mode sends drive the
@@ -1507,6 +1539,10 @@ export class PaymentsModule {
       // tolerates the load.
       nostrPersistenceVerifier:
         config?.features?.nostrPersistenceVerifier ?? false,
+      // Issue #166 P2 #1 — orphan-spending auto-recovery. Default-OFF:
+      // the safe-restore-to-`confirmed` strategy assumes the spending
+      // commit never reached the aggregator. Flip ON after soak.
+      orphanAutoRecovery: config?.features?.orphanAutoRecovery ?? false,
       // Phase 9.6.D — sender-side §6.1 finalization worker. Default-ON
       // when senderUxf is on: drives instant-mode sends through the full
       // submit/poll cycle so `transfer:confirmed` fires once the
@@ -3380,7 +3416,77 @@ export class PaymentsModule {
       // invocation at load() tail is unaffected (count is 0 at boot);
       // public-API callers and tests now see the gate.
       dispatcherInFlightCount: this._dispatcherInFlightCount,
+      // Issue #166 P2 #1 — wire the default recovery closure only
+      // when the opt-in feature flag is ON. Without the flag, the
+      // sweeper preserves Phase-1 detection-only behavior (no
+      // `attemptRecovery` field → recovery branch in
+      // sweepOrphanSpendingTokens is never taken).
+      ...(this.features.orphanAutoRecovery
+        ? { attemptRecovery: this.defaultOrphanRecovery.bind(this) }
+        : {}),
     });
+  }
+
+  /**
+   * Issue #166 P2 #1 — default orphan-spending recovery strategy.
+   *
+   * Restores an orphan token's status from `'transferring'` to
+   * `'confirmed'` and persists the change. The token's value becomes
+   * spendable again.
+   *
+   * **Safety contract.** The strategy is SAFE when the spending
+   * commit never reached the aggregator (the common crash window
+   * between source-token mark-as-transferring and OUTBOX-entry
+   * write). It is UNSAFE when the commit DID reach the aggregator
+   * but the OUTBOX write crashed afterward — in that rare case, the
+   * aggregator's view differs from the wallet's restored view and
+   * the next operation touching the token will surface a
+   * state-mismatch error from the aggregator (correctness preserved
+   * at the cost of a confusing late error).
+   *
+   * Returns `'manual'` (preserving Phase-1 behavior) when:
+   *  - The token id is no longer in the in-memory `this.tokens`
+   *    (concurrent removal — let the operator triage); OR
+   *  - The token's status is no longer `'transferring'` (race
+   *    between detection and recovery — the dispatcher's own
+   *    Loop1-S9 restore may already have run); OR
+   *  - The persistence step (`this.save()`) throws (we left the
+   *    in-memory restoration in place, but the durability
+   *    guarantee is lost; operator should know).
+   *
+   * Throw safety: never throws — defense-in-depth converts the
+   * `this.save()` rejection path to `'manual'` rather than letting
+   * the throw propagate into the sweeper (which would treat it as
+   * `'manual'` anyway — just with a noisier warn-log).
+   */
+  private async defaultOrphanRecovery(
+    finding: OrphanSpendingFinding,
+  ): Promise<'recovered' | 'manual'> {
+    const token = this.tokens.get(finding.tokenId);
+    if (token === undefined) return 'manual';
+    if (token.status !== 'transferring') return 'manual';
+
+    // Apply the in-memory restoration. The Token interface has
+    // `status` and `updatedAt` as mutable — same pattern used by
+    // dispatchUxfConservativeSend's Loop1-S9 path (~line 11122).
+    token.status = 'confirmed';
+    token.updatedAt = Date.now();
+    this.tokens.set(token.id, token);
+    this.parsedTokenCache.delete(token.id);
+
+    // Persist. If save() throws, the in-memory restoration sticks
+    // but durability is lost — degrade to 'manual' so the operator
+    // sees the detected event.
+    try {
+      await this.save();
+    } catch (saveErr) {
+      logger.warn(
+        'Payments',
+        `defaultOrphanRecovery: save() failed for token ${token.id} (in-memory restoration applied but not persisted): ${saveErr instanceof Error ? saveErr.message : String(saveErr)}`,
+      );
+      return 'manual';
+    }
+    return 'recovered';
   }
 
   installOutboxWriter(writer: OutboxWriter | null): void {

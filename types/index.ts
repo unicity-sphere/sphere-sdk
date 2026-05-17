@@ -573,6 +573,7 @@ export type SphereEventType =
   | 'transfer:capability-warning'
   | 'transfer:recovery-republished'
   | 'transfer:orphan-spending-detected'
+  | 'transfer:orphan-recovered'
   | 'transfer:sent-reconciliation-recovered'
   | 'transfer:sent-reconciliation-failed'
   | 'transfer:retention-warning'
@@ -1093,6 +1094,41 @@ export interface SphereEventMap {
     readonly detectedAt: number;
     readonly coinId: string;
     readonly amount: string;
+  };
+  /**
+   * Issue #166 P2 #1 — An orphan-spending token was successfully
+   * auto-recovered by the orphan sweeper's recovery hook (gated on
+   * `features.orphanAutoRecovery`, default OFF). The token's local
+   * status was restored from `'transferring'` to a recoverable status
+   * (today: `'confirmed'`) so the wallet can re-use the token's value.
+   *
+   * **Strategy-of-record.** The `strategy` field documents WHICH
+   * recovery technique was applied. Future strategies (e.g.
+   * `'restore-with-aggregator-check'`) extend the union additively.
+   * Today only `'restore-to-confirmed'` is implemented — a best-effort
+   * in-memory flip that assumes the spending commit never reached
+   * the aggregator. If that assumption is wrong, the next operation
+   * touching this token will see a state-mismatch rejection from the
+   * aggregator (preserving correctness at the cost of an extra error
+   * surfaced to the user).
+   *
+   * Payload fields:
+   *  - `tokenId`     — the recovered orphan token id
+   *  - `coinId`      — coin id (forensic / operator triage)
+   *  - `amount`      — token amount in smallest units
+   *  - `fromStatus`  — `'transferring'` (the orphan-status precondition)
+   *  - `toStatus`    — the status the token was restored to
+   *  - `strategy`    — recovery technique applied (see above)
+   *  - `recoveredAt` — wall-clock ms timestamp of the recovery
+   */
+  'transfer:orphan-recovered': {
+    readonly tokenId: string;
+    readonly coinId: string;
+    readonly amount: string;
+    readonly fromStatus: 'transferring';
+    readonly toStatus: string;
+    readonly strategy: 'restore-to-confirmed';
+    readonly recoveredAt: number;
   };
   /**
    * Issue #166 P2 #4 — A SENT-ledger write that was missed at the

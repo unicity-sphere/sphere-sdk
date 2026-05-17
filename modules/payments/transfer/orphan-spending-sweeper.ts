@@ -69,7 +69,45 @@ export interface OrphanSweepResult {
   /** Whether the sweep ran. Sweep is skipped when both writers are null
    *  (no profile-resident persistence). */
   readonly skipped: boolean;
+  /**
+   * Issue #166 P2 #1 — count of orphans the recovery hook reclaimed
+   * (status restored, `transfer:orphan-recovered` emitted). Zero when
+   * no `attemptRecovery` hook was supplied — that preserves the
+   * Phase-1 detect-only contract.
+   */
+  readonly recoveredCount: number;
+  /**
+   * Issue #166 P2 #1 — count of orphans left to operator triage
+   * (`transfer:orphan-spending-detected` emitted as in Phase 1).
+   * Equals `orphans.length - recoveredCount`.
+   */
+  readonly manualCount: number;
 }
+
+/**
+ * Issue #166 P2 #1 — Recovery-attempt callback. Supplied by the
+ * orchestrator (PaymentsModule) when `features.orphanAutoRecovery` is
+ * ON. Invoked once per detected orphan BEFORE the legacy
+ * `transfer:orphan-spending-detected` event would fire.
+ *
+ * Return semantics:
+ *  - `'recovered'` — the callback reclaimed the orphan (e.g. restored
+ *    its in-memory status to `'confirmed'` and persisted). The sweeper
+ *    emits `transfer:orphan-recovered` instead of the detected event
+ *    and counts the entry under `recoveredCount`.
+ *  - `'manual'`    — the callback could not safely recover (e.g. the
+ *    orphan's spending commit may already be on-chain). The sweeper
+ *    falls back to Phase-1 behavior: emits `transfer:orphan-spending-detected`
+ *    and counts the entry under `manualCount`.
+ *
+ * Implementations MUST NOT throw — convert internal errors to
+ * `'manual'`. A throw is treated as `'manual'` defensively (and
+ * `warn`-logged) so the sweeper never silently drops an orphan due
+ * to a callback bug.
+ */
+export type AttemptRecoveryFn = (
+  finding: OrphanSpendingFinding,
+) => Promise<'recovered' | 'manual'>;
 
 /**
  * Dependencies bundle for {@link sweepOrphanSpendingTokens}.
@@ -110,6 +148,19 @@ export interface OrphanSweeperDeps {
    * concurrent sends.
    */
   readonly dispatcherInFlightCount?: number;
+  /**
+   * Issue #166 P2 #1 — optional recovery callback. When provided, the
+   * sweeper attempts auto-recovery for each detected orphan via this
+   * hook BEFORE emitting the legacy
+   * `transfer:orphan-spending-detected` event.
+   *
+   * The PaymentsModule wires this from `features.orphanAutoRecovery`.
+   * When the flag is OFF, this field is undefined and the sweeper
+   * preserves Phase-1 detection-only behavior.
+   *
+   * Contract: see {@link AttemptRecoveryFn}.
+   */
+  readonly attemptRecovery?: AttemptRecoveryFn;
 }
 
 // =============================================================================
@@ -162,6 +213,8 @@ export async function sweepOrphanSpendingTokens(
       scannedTransferringCount: 0,
       knownTokenIdsCount: 0,
       skipped: true,
+      recoveredCount: 0,
+      manualCount: 0,
     };
   }
 
@@ -175,6 +228,8 @@ export async function sweepOrphanSpendingTokens(
       scannedTransferringCount: 0,
       knownTokenIdsCount: 0,
       skipped: true,
+      recoveredCount: 0,
+      manualCount: 0,
     };
   }
 
@@ -198,6 +253,8 @@ export async function sweepOrphanSpendingTokens(
       scannedTransferringCount: 0,
       knownTokenIdsCount: 0,
       skipped: true,
+      recoveredCount: 0,
+      manualCount: 0,
     };
   }
   try {
@@ -215,12 +272,17 @@ export async function sweepOrphanSpendingTokens(
       scannedTransferringCount: 0,
       knownTokenIdsCount: knownTokenIds.size,
       skipped: true,
+      recoveredCount: 0,
+      manualCount: 0,
     };
   }
 
   const orphans: OrphanSpendingFinding[] = [];
   let scannedTransferringCount = 0;
+  let recoveredCount = 0;
+  let manualCount = 0;
   const detectedAt = Date.now();
+  const attemptRecovery = deps.attemptRecovery;
 
   for (const token of tokens) {
     if (token.status !== 'transferring') continue;
@@ -236,11 +298,59 @@ export async function sweepOrphanSpendingTokens(
     };
     orphans.push(finding);
 
+    // Issue #166 P2 #1 — auto-recovery attempt (when hook supplied).
+    // The hook's return value gates which event we emit:
+    //  - 'recovered' → `transfer:orphan-recovered`
+    //  - 'manual'    → `transfer:orphan-spending-detected` (Phase-1)
+    //  - throw       → treated as 'manual' (defense-in-depth);
+    //                  the warn-log preserves the failure context.
+    let recoveryOutcome: 'recovered' | 'manual' = 'manual';
+    if (attemptRecovery !== undefined) {
+      try {
+        recoveryOutcome = await attemptRecovery(finding);
+      } catch (recErr) {
+        logger.warn(
+          'Payments',
+          `sweepOrphanSpendingTokens: attemptRecovery threw for token ${token.id} (treating as manual): ${recErr instanceof Error ? recErr.message : String(recErr)}`,
+        );
+        recoveryOutcome = 'manual';
+      }
+    }
+
+    if (recoveryOutcome === 'recovered') {
+      recoveredCount += 1;
+      logger.debug(
+        'Payments',
+        `Orphan spending tx auto-recovered: token ${token.id} (coin=${token.coinId} amount=${token.amount}) — status restored by orphanAutoRecovery hook. lastUpdatedAt=${token.updatedAt}.`,
+      );
+      try {
+        await emit('transfer:orphan-recovered', {
+          tokenId: token.id,
+          coinId: token.coinId,
+          amount: token.amount,
+          fromStatus: 'transferring',
+          toStatus: 'confirmed',
+          strategy: 'restore-to-confirmed',
+          recoveredAt: detectedAt,
+        });
+      } catch (emitErr) {
+        logger.debug(
+          'Payments',
+          `sweepOrphanSpendingTokens: emit transfer:orphan-recovered failed for token ${token.id}: ${emitErr instanceof Error ? emitErr.message : String(emitErr)}`,
+        );
+      }
+      continue;
+    }
+
+    // recoveryOutcome === 'manual' (either no hook supplied, hook
+    // returned 'manual', or hook threw). Emit the Phase-1 detected
+    // event for operator triage.
+    manualCount += 1;
     logger.error(
       'Payments',
       `Orphan spending tx detected: token ${token.id} (coin=${token.coinId} amount=${token.amount}) ` +
         `has status='transferring' but is not in OUTBOX or SENT. Crash between commit and outbox-persist. ` +
-        `Manual recovery required until auto-recovery ships (Issue #97 phase 2). ` +
+        `Manual recovery required (auto-recovery hook ${attemptRecovery === undefined ? 'not wired' : "returned 'manual'"}). ` +
         `lastUpdatedAt=${token.updatedAt}.`,
     );
 
@@ -271,5 +381,7 @@ export async function sweepOrphanSpendingTokens(
     scannedTransferringCount,
     knownTokenIdsCount: knownTokenIds.size,
     skipped: false,
+    recoveredCount,
+    manualCount,
   };
 }

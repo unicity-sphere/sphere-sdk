@@ -233,3 +233,193 @@ describe('PaymentsModule.detectOrphanSpendingTokens (Issue #166 — P3 #8)', () 
     expect(detected.orphans[0].tokenId).toBe('late-orphan');
   });
 });
+
+// ===========================================================================
+// Issue #166 P2 #1 — orphanAutoRecovery feature flag + default closure
+// ===========================================================================
+
+describe('PaymentsModule.detectOrphanSpendingTokens — orphanAutoRecovery (Issue #166 P2 #1)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('default-OFF: features.orphanAutoRecovery omitted → no attemptRecovery wired (Phase-1 behavior preserved)', async () => {
+    const emit = vi.fn();
+    const payments = createPaymentsModule({
+      debug: false,
+      autoSync: false,
+      features: { recoveryWorker: false, finalizationWorker: false },
+    });
+    payments.initialize({ ...createPaymentsDeps(), emitEvent: emit });
+    const { outboxWriter, sentLedgerWriter } = createWriterPair();
+    payments.installOutboxWriter(outboxWriter);
+    payments.installSentLedgerWriter(sentLedgerWriter);
+    asInternals(payments).tokens.set(
+      'orphan-A',
+      makeToken('orphan-A', 'transferring'),
+    );
+
+    const result = await payments.detectOrphanSpendingTokens();
+
+    expect(result.orphans).toHaveLength(1);
+    expect(result.recoveredCount).toBe(0);
+    expect(result.manualCount).toBe(1);
+    // Token status unchanged — Phase-1 behavior is detect-only.
+    expect(asInternals(payments).tokens.get('orphan-A')?.status).toBe(
+      'transferring',
+    );
+    // Phase-1 detected event fired; recovered event did NOT.
+    const types = emit.mock.calls.map((c) => c[0]);
+    expect(types).toContain('transfer:orphan-spending-detected');
+    expect(types).not.toContain('transfer:orphan-recovered');
+  });
+
+  it('flag ON + orphan present → restores status to "confirmed", fires orphan-recovered event', async () => {
+    const emit = vi.fn();
+    const payments = createPaymentsModule({
+      debug: false,
+      autoSync: false,
+      features: {
+        recoveryWorker: false,
+        finalizationWorker: false,
+        orphanAutoRecovery: true,
+      },
+    });
+    payments.initialize({ ...createPaymentsDeps(), emitEvent: emit });
+    const { outboxWriter, sentLedgerWriter } = createWriterPair();
+    payments.installOutboxWriter(outboxWriter);
+    payments.installSentLedgerWriter(sentLedgerWriter);
+    asInternals(payments).tokens.set(
+      'orphan-B',
+      makeToken('orphan-B', 'transferring', {
+        coinId: 'UCT',
+        amount: '500',
+      }),
+    );
+
+    const result = await payments.detectOrphanSpendingTokens();
+
+    expect(result.orphans).toHaveLength(1);
+    expect(result.recoveredCount).toBe(1);
+    expect(result.manualCount).toBe(0);
+    expect(asInternals(payments).tokens.get('orphan-B')?.status).toBe(
+      'confirmed',
+    );
+
+    const recoveredEmits = emit.mock.calls.filter(
+      (c) => c[0] === 'transfer:orphan-recovered',
+    );
+    expect(recoveredEmits).toHaveLength(1);
+    const payload = recoveredEmits[0][1] as {
+      tokenId: string;
+      coinId: string;
+      amount: string;
+      fromStatus: string;
+      toStatus: string;
+      strategy: string;
+    };
+    expect(payload.tokenId).toBe('orphan-B');
+    expect(payload.coinId).toBe('UCT');
+    expect(payload.amount).toBe('500');
+    expect(payload.fromStatus).toBe('transferring');
+    expect(payload.toStatus).toBe('confirmed');
+    expect(payload.strategy).toBe('restore-to-confirmed');
+
+    // The Phase-1 detected event must NOT also fire for the same orphan.
+    const detectedEmits = emit.mock.calls.filter(
+      (c) => c[0] === 'transfer:orphan-spending-detected',
+    );
+    expect(detectedEmits).toHaveLength(0);
+  });
+
+  it("flag ON but token removed from this.tokens between detection and recovery → 'manual'", async () => {
+    // Race scenario: detection finds the orphan, then before the
+    // recovery closure runs, the token is removed (e.g. by a
+    // concurrent split-removal path). The closure must NOT throw
+    // and must fall back to Phase-1 behavior.
+    const emit = vi.fn();
+    const payments = createPaymentsModule({
+      debug: false,
+      autoSync: false,
+      features: {
+        recoveryWorker: false,
+        finalizationWorker: false,
+        orphanAutoRecovery: true,
+      },
+    });
+    payments.initialize({ ...createPaymentsDeps(), emitEvent: emit });
+    const { outboxWriter, sentLedgerWriter } = createWriterPair();
+    payments.installOutboxWriter(outboxWriter);
+    payments.installSentLedgerWriter(sentLedgerWriter);
+
+    // No token in this.tokens, but call the closure directly to
+    // simulate the race. We can't easily race "between detection and
+    // recovery" in a synchronous unit test, so test the defensive
+    // 'manual' path directly via the internal closure.
+    const internals = payments as unknown as {
+      defaultOrphanRecovery: (finding: {
+        tokenId: string;
+        coinId: string;
+        amount: string;
+        lastUpdatedAt: number;
+        detectedAt: number;
+      }) => Promise<'recovered' | 'manual'>;
+    };
+    const outcome = await internals.defaultOrphanRecovery({
+      tokenId: 'ghost',
+      coinId: 'UCT',
+      amount: '100',
+      lastUpdatedAt: 0,
+      detectedAt: 0,
+    });
+    expect(outcome).toBe('manual');
+  });
+
+  it("flag ON + token already in non-'transferring' status → 'manual' (defense against race)", async () => {
+    // Race scenario: by the time the recovery closure runs, the
+    // dispatcher's Loop1-S9 has already restored the token to
+    // 'confirmed'. The closure must NOT double-restore (idempotent)
+    // and must NOT emit recovered (the dispatcher already did the work).
+    const emit = vi.fn();
+    const payments = createPaymentsModule({
+      debug: false,
+      autoSync: false,
+      features: {
+        recoveryWorker: false,
+        finalizationWorker: false,
+        orphanAutoRecovery: true,
+      },
+    });
+    payments.initialize({ ...createPaymentsDeps(), emitEvent: emit });
+    const { outboxWriter, sentLedgerWriter } = createWriterPair();
+    payments.installOutboxWriter(outboxWriter);
+    payments.installSentLedgerWriter(sentLedgerWriter);
+    // Token exists but is already 'confirmed' (not 'transferring').
+    asInternals(payments).tokens.set(
+      'orphan-already-restored',
+      makeToken('orphan-already-restored', 'confirmed'),
+    );
+
+    const internals = payments as unknown as {
+      defaultOrphanRecovery: (finding: {
+        tokenId: string;
+        coinId: string;
+        amount: string;
+        lastUpdatedAt: number;
+        detectedAt: number;
+      }) => Promise<'recovered' | 'manual'>;
+    };
+    const outcome = await internals.defaultOrphanRecovery({
+      tokenId: 'orphan-already-restored',
+      coinId: 'UCT',
+      amount: '100',
+      lastUpdatedAt: 0,
+      detectedAt: 0,
+    });
+    expect(outcome).toBe('manual');
+    // Status unchanged — the dispatcher's restore wins.
+    expect(
+      asInternals(payments).tokens.get('orphan-already-restored')?.status,
+    ).toBe('confirmed');
+  });
+});
