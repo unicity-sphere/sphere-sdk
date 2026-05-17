@@ -8980,11 +8980,39 @@ export class PaymentsModule {
             // Address guard: reject data from a different address.
             // Stale IPFS records may contain tokens from a previously active
             // address if a write-behind flush raced with an address switch.
+            //
+            // Accept three representations (one per writer):
+            //   - L1 bech32 (`alpha1...`) — legacy file storage writes this
+            //   - chain pubkey — some providers record the pubkey
+            //   - Profile short ID (`DIRECT_{first6}_{last6}`) — written by
+            //     ProfileTokenStorageProvider via `computeAddressId`
+            //
+            // The third format was added to `load()`'s guard but missed
+            // here, causing sync() to silently discard Profile-provider
+            // data on cross-device recovery — Device B reads Device A's
+            // CAR via the aggregator pointer, the parsed `_meta.address`
+            // is the DIRECT_* short-id, and `currentL1` is the bech32
+            // form. Mismatch → reject → recovery returns empty.
             const mergedMeta = (result.merged as TxfStorageDataBase)?._meta;
             const currentL1 = this.deps!.identity.l1Address;
             const currentChain = this.deps!.identity.chainPubkey;
-            if (mergedMeta?.address && currentL1 && mergedMeta.address !== currentL1 && mergedMeta.address !== currentChain) {
-              logger.warn('Payments', `Sync: rejecting data from provider ${providerId} — address mismatch (got=${mergedMeta.address.slice(0, 20)}... expected=${currentL1.slice(0, 20)}...)`);
+            const currentDirect = this.deps!.identity.directAddress;
+            const currentProfileShortId = currentDirect ? computeAddressId(currentDirect) : null;
+            if (
+              mergedMeta?.address &&
+              mergedMeta.address !== currentL1 &&
+              mergedMeta.address !== currentChain &&
+              mergedMeta.address !== currentProfileShortId
+            ) {
+              const accepted = [
+                currentL1 ? `L1=${currentL1.slice(0, 16)}…` : null,
+                currentChain ? `chain=${currentChain.slice(0, 16)}…` : null,
+                currentProfileShortId ? `profile=${currentProfileShortId}` : null,
+              ].filter(Boolean).join(', ');
+              logger.warn(
+                'Payments',
+                `Sync: rejecting data from provider ${providerId} — address mismatch (got=${mergedMeta.address.slice(0, 24)} accepted=[${accepted}])`,
+              );
               continue;
             }
 
@@ -12936,18 +12964,38 @@ export class PaymentsModule {
     this.tombstones = mergedArray;
     this.tombstoneKeySet = mergedKeySet;
     // Load tokens, filtering out tombstoned ones.
-    // Preserve tokens with 'transferring' status — they are part of an in-flight send().
-    const preservedTransferring = new Map<string, Token>();
-    for (const [id, token] of this.tokens) {
-      if (token.status === 'transferring') {
-        preservedTransferring.set(id, token);
-      }
-    }
+    //
+    // INVARIANT (2026-05-16): load() MUST NEVER drop tokens that exist
+    // only in memory. Storage can lag (debounced flush, transient
+    // pointer publish failures holding the at-least-once gate closed)
+    // while addToken has already committed to `this.tokens`. A
+    // wholesale `tokens.clear()` followed by "rebuild from storage"
+    // silently wipes any token whose flush hasn't durably completed —
+    // even though PaymentsModule originally accepted it. That is the
+    // exact failure mode that caused profile-multi-device-sync to lose
+    // 4 of 7 faucet drops when transient AGGREGATOR_POINTER_WALKBACK_FLOOR
+    // errors held the publish gate closed.
+    //
+    // Policy:
+    //   - Snapshot every in-memory token before clearing.
+    //   - Storage data wins for tokens whose (tokenId, stateHash)
+    //     identity matches a storage entry. The storage version is
+    //     the most-recently-loaded definitive shape (proofs, etc.).
+    //   - For every snapshot token that has NO matching storage
+    //     entry: re-insert it after the storage load. These are
+    //     tokens still in flight from in-memory to storage; dropping
+    //     them would lose user state.
+    //   - Tombstoned tokens (matching the tombstone set after the
+    //     UNION-MERGE above) are dropped from the snapshot —
+    //     consistent with the storage-side filter below.
+    //
+    // The pre-existing 'transferring' preservation guard is now
+    // redundant (covered by the broader policy) but kept for clarity
+    // at the call site. The newer `preservedFromMemory` map covers
+    // every other status — confirmed, unconfirmed, pending, etc.
+    const preservedFromMemory = new Map<string, Token>(this.tokens);
 
     this.tokens.clear();
-    for (const [id, token] of preservedTransferring) {
-      this.tokens.set(id, token);
-    }
 
     // Load other data EARLY so archive-move (below) can write into the
     // up-to-date archive map. Note: `this.nametags` is set further down
@@ -12958,8 +13006,13 @@ export class PaymentsModule {
 
     let archiveMoved = 0;
     for (const token of parsed.tokens) {
-      // Don't overwrite in-flight tokens preserved above
-      if (preservedTransferring.has(token.id)) continue;
+      // Don't overwrite in-flight 'transferring' tokens from the
+      // pre-clear snapshot. The broader NEVER-WIPE restore loop
+      // below handles every OTHER status, but at the in-loop set
+      // stage we still skip storage entries that would clobber a
+      // 'transferring' in-flight send (the original guard).
+      const existingTransferring = preservedFromMemory.get(token.id);
+      if (existingTransferring?.status === 'transferring') continue;
 
       const sdkTokenId = extractTokenIdFromSdkData(token.sdkData);
       const stateHash = extractStateHashFromSdkData(token.sdkData);
@@ -13019,6 +13072,96 @@ export class PaymentsModule {
       logger.debug(
         'Payments',
         `[BALANCE-INVARIANT] loadFromStorageData moved ${archiveMoved} token(s) to archive`,
+      );
+    }
+
+    // NEVER-WIPE INVARIANT (2026-05-16): re-insert any token from the
+    // pre-clear snapshot that storage did NOT supersede. Storage wins
+    // when the same (tokenId, stateHash) identity already loaded —
+    // those tokens are NOT restored from the snapshot (the storage
+    // version is the canonical one). All other snapshot tokens (those
+    // still in flight to storage, or those whose flush failed for any
+    // reason) are restored. Tombstoned (tokenId, stateHash) pairs are
+    // dropped to stay consistent with the storage-side filter.
+    //
+    // Build a set of the (tokenId, stateHash) identities now in
+    // `this.tokens` from the storage load so the restore loop can
+    // dedup cheaply. `Token.id` is internal and can differ between
+    // a snapshot entry and a storage entry that represent the SAME
+    // logical state — so the comparison MUST go through the SDK-data
+    // extractors.
+    const loadedStateKeys = new Set<string>();
+    for (const t of this.tokens.values()) {
+      const tid = extractTokenIdFromSdkData(t.sdkData);
+      const sh = extractStateHashFromSdkData(t.sdkData);
+      if (tid && sh) loadedStateKeys.add(createTokenStateKey(tid, sh));
+    }
+
+    let restoredFromMemory = 0;
+    for (const [snapshotId, snapshotToken] of preservedFromMemory) {
+      // Skip if storage already loaded a token at this id slot.
+      if (this.tokens.has(snapshotId)) continue;
+
+      const snapTokenId = extractTokenIdFromSdkData(snapshotToken.sdkData);
+      const snapStateHash = extractStateHashFromSdkData(snapshotToken.sdkData);
+
+      // Tombstoned (tokenId, stateHash) pair → drop (storage tombstone wins).
+      if (
+        snapTokenId &&
+        snapStateHash &&
+        this.isStateTombstoned(snapTokenId, snapStateHash)
+      ) {
+        continue;
+      }
+
+      // Storage already has this exact state under a different id slot
+      // (rare — happens when storage's internal id differs from the
+      // in-memory id for the same logical token). Storage wins.
+      if (
+        snapTokenId &&
+        snapStateHash &&
+        loadedStateKeys.has(createTokenStateKey(snapTokenId, snapStateHash))
+      ) {
+        continue;
+      }
+
+      // Snapshot has a NEWER state than what storage loaded for the
+      // same tokenId. The newer state was added to memory after the
+      // last successful flush and storage hasn't caught up. Archive
+      // the older state in `this.tokens` (if present) and restore
+      // the newer snapshot — matches addToken's CASE 2 semantics.
+      if (snapTokenId) {
+        let supersededOlder = false;
+        for (const [existingId, existingToken] of this.tokens) {
+          if (!hasSameGenesisTokenId(existingToken, snapshotToken)) continue;
+          const existingStateHash = extractStateHashFromSdkData(existingToken.sdkData);
+          if (
+            snapStateHash &&
+            existingStateHash &&
+            snapStateHash === existingStateHash
+          ) {
+            // Same exact state — storage's record wins (it was just loaded).
+            supersededOlder = true;
+            break;
+          }
+          // Different state: leave the storage version in place AND
+          // restore the snapshot's version too. PaymentsModule's
+          // downstream logic (manifest derivation, fork detection)
+          // already handles same-tokenId-multiple-states. Dropping
+          // either side would lose information.
+          break;
+        }
+        if (supersededOlder) continue;
+      }
+
+      this.tokens.set(snapshotId, snapshotToken);
+      restoredFromMemory++;
+    }
+    if (restoredFromMemory > 0) {
+      logger.debug(
+        'Payments',
+        `[NEVER-WIPE] loadFromStorageData restored ${restoredFromMemory} in-memory ` +
+          `token(s) not present in storage (likely in-flight or flush-stalled)`,
       );
     }
 

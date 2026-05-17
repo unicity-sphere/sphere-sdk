@@ -34,9 +34,25 @@ import type { ProviderStatus } from '../../../types';
 import { PaymentsModule, type MintNametagResult } from '../../../modules/payments';
 import type { NametagData } from '../../../types/txf';
 
-const TEST_DIR = path.join(__dirname, '.test-recover-nametag-mint');
-const DATA_DIR = path.join(TEST_DIR, 'data');
-const TOKENS_DIR = path.join(TEST_DIR, 'tokens');
+// Per-test unique directory (Date.now() + random suffix). See the
+// matching comment in Sphere.mint-before-publish.test.ts for the
+// rationale — sharing a single TEST_DIR across tests in the same file
+// triggers intermittent "Wallet already exists" failures in
+// full-suite runs because FileStorageProvider's proper-lockfile
+// save() path can leave wallet.json in an unexpected state under
+// parallel-worker CPU load. Issuing each test its own tmpdir
+// eliminates that interference at the FS level.
+import * as os from 'os';
+
+let TEST_DIR: string = '';
+let DATA_DIR: string = '';
+let TOKENS_DIR: string = '';
+
+function freshTestDirs(): void {
+  TEST_DIR = path.join(os.tmpdir(), `sphere-recover-nametag-mint-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
+  DATA_DIR = path.join(TEST_DIR, 'data');
+  TOKENS_DIR = path.join(TEST_DIR, 'tokens');
+}
 
 const RECOVERED_NAME = 'alice';
 
@@ -104,7 +120,7 @@ describe('Sphere.recoverNametagFromTransport — on-chain token re-mint', () => 
   let mintSpy: ReturnType<typeof vi.spyOn> | undefined;
 
   beforeEach(() => {
-    cleanTestDir();
+    freshTestDirs();
     if (Sphere.getInstance()) {
       (Sphere as unknown as { instance: null }).instance = null;
     }

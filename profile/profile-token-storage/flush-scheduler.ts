@@ -268,6 +268,28 @@ export class FlushScheduler {
     const encryptionKey = this.host.getEncryptionKey();
     if (!encryptionKey) return;
 
+    // Note on pending-publish retry: we deliberately do NOT throw at
+    // the START of flushToIpfs when a previous publish was transient.
+    // An early throw here would prevent pin + ref-write for the
+    // current data, leaving OrbitDB stuck at whatever the last
+    // successful flush wrote. A subsequent `PaymentsModule.receive()`
+    // calls `load()` to rebuild the in-memory token map from storage;
+    // if storage is stale, that load wipes every token added since
+    // the last successful flush — silent token loss in the steady
+    // state, even though PaymentsModule originally accepted the
+    // tokens.
+    //
+    // Instead we always run the full pin + ref-write path. The
+    // publish step at the END of the flush body publishes the LATEST
+    // CID, which by virtue of CAR-content monotonicity covers every
+    // earlier CID's tokens (the latest CAR is a superset of all
+    // prior states this device authored). A successful new publish
+    // therefore implicitly anchors any prior pending publish — the
+    // latest pointer is the freshest CAR. The periodic pointer poll
+    // (`runPointerPollOnce`) handles the idle case where no new
+    // flush is triggered and the pending publish needs an out-of-
+    // band retry.
+
     // Capture and clear the no-data flag immediately so a concurrent
     // scheduleFlushNoData() doesn't get masked by this flush in flight.
     const noDataMode = this.noDataFlushPending;
@@ -492,9 +514,32 @@ export class FlushScheduler {
         (violation as Error & { code?: string }).code = POINTER_MONOTONICITY_VIOLATION;
         this.host.log(`[POINTER_MONOTONICITY_VIOLATION] aborting publish: ${reasonParts.join('; ')}`);
 
+        // Gap 4 recovery: kick off a fire-and-forget baseline refresh
+        // so subsequent save-driven flushes (which DON'T retry via
+        // awaitNextFlush) get a fresh `lastLoadedFromBundleCids` and
+        // can pass the check. Called via a microtask schedule so the
+        // in-flight flush settles BEFORE load() tries to await
+        // `flushPromise` (otherwise the refresh would deadlock on
+        // ourselves).
+        //
+        // The at-least-once gate's `awaitNextFlush` loop does its own
+        // synchronous retry — that path bypasses this fire-and-forget
+        // since it has tighter latency requirements. This fire-and-
+        // forget covers the save-driven timer path, the periodic
+        // poll's no-data flush path, and any other call site that
+        // doesn't loop on violation.
+        queueMicrotask(() => {
+          this.host.refreshBaselineForMonotonicity().catch((err) => {
+            this.host.log(
+              `Baseline-refresh recovery threw (best-effort): ` +
+                `${err instanceof Error ? err.message : String(err)}`,
+            );
+          });
+        });
+
         // The catch block at the bottom of flushToIpfs() re-queues
         // `data` so the user's writes are not lost; subsequent
-        // flushes will re-evaluate once lastLoadedData refreshes.
+        // flushes will re-evaluate once the refresh above completes.
         // Surface to operators via storage:error AND a structured
         // alert so monitoring dashboards can fire on the literal code.
         this.host.emitEvent(
@@ -642,19 +687,32 @@ export class FlushScheduler {
       }
 
       // 9. Publish to the pointer layer for cold-start recovery.
-      //    Best-effort: the CAR is already pinned and the OrbitDB
-      //    bundle ref is already written, so a failed publish only
-      //    delays cold-start recovery for this flush — subsequent
-      //    flushes retry. IPNS is no longer published (T-D6c) —
-      //    the one-shot migration reader is the only remaining
-      //    legacy touchpoint and it's read-only.
-      await this.lifecycle.publishAggregatorPointerBestEffort(cid);
+      //    The CAR is already pinned and the OrbitDB bundle ref is
+      //    already written. On a TRANSIENT publish failure, the
+      //    pointer-layer wiring stamps `pendingPublishCid = cid` so
+      //    the next flush / pointer-poll retries — and we THROW here
+      //    so the chained `forceFlushSerialized` rejection propagates
+      //    to `awaitNextFlush` and the at-least-once gate refuses the
+      //    Nostr ack (event replays on next reconnect; addToken
+      //    stateHash dedup is idempotent). On PERMANENT failure the
+      //    pointer-layer emits a `storage:error` event with the code
+      //    and clears the retry marker; we still emit `storage:saved`
+      //    because the wallet's local state is durable — only the
+      //    cross-device anchor is missing, and no retry would help.
+      const publishResult = await this.lifecycle.publishAggregatorPointerBestEffort(cid);
 
       this.host.emitEvent({
         type: 'storage:saved',
         timestamp: Date.now(),
         data: { cid, tokenCount: tokens.size },
       });
+
+      if (!publishResult.ok && publishResult.transient) {
+        throw new Error(
+          `Aggregator pointer publish transient failure for cid=${cid}; ` +
+            `retry marker stored. Refusing to advance the at-least-once ack.`,
+        );
+      }
     } catch (err) {
       // On failure, re-queue the data so it is not lost
       if (!this.host.getPendingData()) {
