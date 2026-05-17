@@ -671,4 +671,67 @@ describe('SentLedgerWriter (Issue #97)', () => {
       expect(await writer.readAll()).toHaveLength(0);
     });
   });
+
+  // -------------------------------------------------------------------------
+  // OUTBOX-SEND-FOLLOWUPS item #4 — gcExpiredTombstones
+  // -------------------------------------------------------------------------
+  //
+  // Mirror of the OutboxWriter GC test suite. SENT tombstones are rare
+  // in production (the ledger is permanent except on operator escape-
+  // hatch paths), but the storage-reclamation contract is the same.
+
+  describe('gcExpiredTombstones (OUTBOX-SEND-FOLLOWUPS item #4)', () => {
+    it('purges tombstones older than retentionMs (db.get returns null AND the key is gone)', async () => {
+      await writer.write(buildBaseInput('xfer-old'));
+      await writer.delete('xfer-old');
+
+      const keys = [...db._store.keys()].filter((k) => k.endsWith('.xfer-old'));
+      expect(keys).toHaveLength(1);
+      const k = keys[0];
+
+      const result = await writer.gcExpiredTombstones({
+        retentionMs: 0,
+        now: Date.now() + 60_000,
+      });
+      expect(result.scanned).toBe(1);
+      expect(result.purged).toBe(1);
+      expect(result.kept).toBe(0);
+      expect(db._store.has(k)).toBe(false);
+      expect(await writer.readOne('xfer-old')).toBeNull();
+    });
+
+    it('keeps tombstones inside the retention window', async () => {
+      await writer.write(buildBaseInput('xfer-fresh'));
+      const t0 = Date.now();
+      await writer.delete('xfer-fresh');
+
+      const result = await writer.gcExpiredTombstones({
+        retentionMs: 30 * 24 * 60 * 60 * 1000,
+        now: t0 + 60_000,
+      });
+      expect(result.kept).toBe(1);
+      expect(result.purged).toBe(0);
+      expect(
+        [...db._store.keys()].filter((k) => k.endsWith('.xfer-fresh')),
+      ).toHaveLength(1);
+    });
+
+    it('rejects malformed retentionMs', async () => {
+      await expect(
+        writer.gcExpiredTombstones({ retentionMs: -1 }),
+      ).rejects.toThrow(/retentionMs/);
+    });
+
+    it('after purge, a fresh write at the same id is NOT refused', async () => {
+      await writer.write(buildBaseInput('reused'));
+      await writer.delete('reused');
+      await writer.gcExpiredTombstones({
+        retentionMs: 0,
+        now: Date.now() + 60_000,
+      });
+      await expect(
+        writer.write(buildBaseInput('reused')),
+      ).resolves.toBeTruthy();
+    });
+  });
 });

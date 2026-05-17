@@ -48,7 +48,7 @@ import {
 } from '../types/uxf-sent.js';
 import { decryptProfileValue, encryptProfileValue } from './encryption.js';
 import { Lamport } from './lamport.js';
-import type { ProfileDatabase } from './types.js';
+import type { ProfileDatabase, TombstoneGcResult } from './types.js';
 import { MAX_ENTRY_BYTES_RAW } from '../types/uxf-bounds.js';
 
 // =============================================================================
@@ -222,6 +222,68 @@ export class SentLedgerWriter {
       lamport,
     });
     await this.writeRaw(id, tombstone);
+  }
+
+  /**
+   * OUTBOX-SEND-FOLLOWUPS item #4 — reclaim storage occupied by SENT-
+   * ledger tombstones older than `opts.retentionMs`.
+   *
+   * SENT-ledger tombstones are rare (the ledger is permanent in
+   * normal operation; tombstones only appear on operator escape-
+   * hatch or test fixture paths), so this sweep is largely a
+   * defensive surface — but the same monotonic-growth concern that
+   * motivates the OUTBOX sweep applies here. See
+   * {@link OutboxWriter.gcExpiredTombstones} for the full safety
+   * contract; the implementation is structurally identical.
+   */
+  async gcExpiredTombstones(opts: {
+    readonly retentionMs: number;
+    readonly now?: number;
+  }): Promise<TombstoneGcResult> {
+    if (
+      typeof opts.retentionMs !== 'number' ||
+      !Number.isFinite(opts.retentionMs) ||
+      opts.retentionMs < 0
+    ) {
+      throw new SphereError(
+        `SentLedgerWriter.gcExpiredTombstones: retentionMs must be a non-negative finite number ` +
+          `(got ${String(opts.retentionMs)})`,
+        'VALIDATION_ERROR',
+      );
+    }
+    const nowMs =
+      typeof opts.now === 'number' && Number.isFinite(opts.now)
+        ? opts.now
+        : Date.now();
+
+    let entries: Map<string, Uint8Array>;
+    try {
+      entries = await this.db.all(this.keyPrefix);
+    } catch {
+      return { scanned: 0, purged: 0, kept: 0, skipped: true };
+    }
+
+    let scanned = 0;
+    let purged = 0;
+    let kept = 0;
+    for (const key of entries.keys()) {
+      if (!key.startsWith(this.keyPrefix)) continue;
+      const shape = await this.readSlotShape(key);
+      if (shape === null) continue;
+      if (shape.kind !== 'tombstone') continue;
+      scanned += 1;
+      if (nowMs - shape.deletedAt <= opts.retentionMs) {
+        kept += 1;
+        continue;
+      }
+      try {
+        await this.db.del(key);
+        purged += 1;
+      } catch {
+        kept += 1;
+      }
+    }
+    return { scanned, purged, kept, skipped: false };
   }
 
   /**

@@ -140,6 +140,14 @@ import {
   type NostrPersistenceVerifierDeps,
   type VerifyOutcome,
 } from './transfer/nostr-persistence-verifier';
+// OUTBOX-SEND-FOLLOWUPS item #4 — tombstone GC worker. Auto-installed in
+// `initialize()` when `features.tombstoneGcWorker` is true. Periodically
+// replaces expired tombstones (older than the configured retention
+// window) with real db.del() calls to reclaim OrbitDB log bytes.
+import {
+  TombstoneGcWorker,
+  type TombstoneGcWorkerDeps,
+} from './transfer/tombstone-gc-worker';
 // Phase 9.6.D — sender-side §6.1 finalization worker. Auto-installed in
 // `initialize()` when `features.finalizationWorker` is true (default-ON
 // when `senderUxf` is true). Consumer-installed workers (via
@@ -1045,6 +1053,29 @@ export interface UxfTransferFeatures {
    */
   readonly nostrPersistenceVerifier?: boolean;
   /**
+   * OUTBOX-SEND-FOLLOWUPS item #4 — tombstone garbage collection.
+   * Default `false` (opt-in for the initial soak window).
+   *
+   * When ON, auto-installs a {@link TombstoneGcWorker} that
+   * periodically sweeps tombstoned OUTBOX and SENT slots whose
+   * `(now - deletedAt) > retentionMs` (default 30 days) and replaces
+   * each marker with a real `db.del(key)` to reclaim OrbitDB log
+   * bytes.
+   *
+   * Tombstones are otherwise permanent (`delete()` writes a marker,
+   * not a `db.del()`) — Issue #166 P1 #2 requires the marker for the
+   * refuse-write guard. After 30 days of clock time elapsed past the
+   * tombstone's `deletedAt`, no concurrent replica can still hold a
+   * pre-sync state that would resurrect the slot, so the marker
+   * itself is safe to drop.
+   *
+   * Default-OFF mirrors `nostrPersistenceVerifier`. Long-lived
+   * wallets accumulating millions of tombstones over years are the
+   * target; for a wallet under a few hundred sends per day, the GC
+   * is an optimisation. Set the flag explicitly to enable.
+   */
+  readonly tombstoneGcWorker?: boolean;
+  /**
    * Issue #166 P2 #1 — orphan-spending-tx AUTO-RECOVERY. Default
    * `false` (opt-in).
    *
@@ -1540,6 +1571,11 @@ export class PaymentsModule {
       // tolerates the load.
       nostrPersistenceVerifier:
         config?.features?.nostrPersistenceVerifier ?? false,
+      // OUTBOX-SEND-FOLLOWUPS item #4 — tombstone GC. Default-OFF:
+      // long-lived high-volume wallets accumulate tombstone bytes; the
+      // sweep is an optimisation, not a correctness path. Flip ON
+      // explicitly when storage growth becomes operationally relevant.
+      tombstoneGcWorker: config?.features?.tombstoneGcWorker ?? false,
       // Issue #166 P2 #1 — orphan-spending auto-recovery. Default-OFF:
       // the safe-restore-to-`confirmed` strategy assumes the spending
       // commit never reached the aggregator. Flip ON after soak.
@@ -2021,6 +2057,39 @@ export class PaymentsModule {
       this.nostrPersistenceVerifier !== null
     ) {
       this.nostrPersistenceVerifier.start();
+    }
+
+    // OUTBOX-SEND-FOLLOWUPS item #4 — auto-install the tombstone GC
+    // worker. Default-OFF feature gate; when ON the worker periodically
+    // reclaims storage occupied by tombstones whose retention window
+    // has elapsed. Both writers self-skip when no writer is installed,
+    // so the start() call is safe even before bootstrap installs them.
+    if (
+      this.features.tombstoneGcWorker &&
+      this.tombstoneGcWorker === null
+    ) {
+      const gcDeps: TombstoneGcWorkerDeps = {
+        outboxProvider: (): Pick<OutboxWriter, 'gcExpiredTombstones'> | null =>
+          this._outboxWriter,
+        sentProvider: (): Pick<SentLedgerWriter, 'gcExpiredTombstones'> | null =>
+          this._sentLedgerWriter,
+        logger: {
+          warn: (message: string, context?: Record<string, unknown>): void => {
+            logger.warn('Payments', `${message}`, context);
+          },
+        },
+      };
+      this.tombstoneGcWorker = new TombstoneGcWorker(gcDeps);
+      this.tombstoneGcWorker.start();
+      logger.debug(
+        'Payments',
+        'Default TombstoneGcWorker auto-installed (tombstoneGcWorker opt-in flag ON)',
+      );
+    } else if (
+      this.features.tombstoneGcWorker &&
+      this.tombstoneGcWorker !== null
+    ) {
+      this.tombstoneGcWorker.start();
     }
 
     // T.3.E — auto-install a default IngestWorkerPool when recipientUxf
@@ -3722,6 +3791,9 @@ export class PaymentsModule {
   private sentReconciliationWorker: SentReconciliationWorker | null = null;
   /** @internal — auto-installed or set by `installNostrPersistenceVerifier()`. Issue #166 P2 #3. */
   private nostrPersistenceVerifier: NostrPersistenceVerifier | null = null;
+  /** @internal — auto-installed when `features.tombstoneGcWorker` is on.
+   *  OUTBOX-SEND-FOLLOWUPS item #4. */
+  private tombstoneGcWorker: TombstoneGcWorker | null = null;
   /** @internal — auto-installed or set by `installFinalizationWorkerSender()`. Phase 9.6.D. */
   private finalizationWorkerSender: FinalizationWorkerSender | null = null;
   /**
@@ -4440,6 +4512,12 @@ export class PaymentsModule {
     if (this.nostrPersistenceVerifier) {
       void this.nostrPersistenceVerifier.stop().catch(() => undefined);
       this.nostrPersistenceVerifier = null;
+    }
+
+    // OUTBOX-SEND-FOLLOWUPS item #4 — stop the tombstone GC worker.
+    if (this.tombstoneGcWorker) {
+      void this.tombstoneGcWorker.stop().catch(() => undefined);
+      this.tombstoneGcWorker = null;
     }
 
     // Task #169 — abort the worker AbortController BEFORE stopping the

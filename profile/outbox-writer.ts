@@ -59,7 +59,7 @@ import {
 import { decryptProfileValue, encryptProfileValue } from './encryption.js';
 import { Lamport } from './lamport.js';
 import { assertTransition } from './outbox-state-machine.js';
-import type { ProfileDatabase } from './types.js';
+import type { ProfileDatabase, TombstoneGcResult } from './types.js';
 import { MAX_ENTRY_BYTES_RAW } from '../types/uxf-bounds.js';
 
 // =============================================================================
@@ -368,6 +368,102 @@ export class OutboxWriter {
       lamport,
     });
     await this.writeRaw(id, tombstone);
+  }
+
+  /**
+   * OUTBOX-SEND-FOLLOWUPS item #4 — reclaim storage occupied by
+   * tombstones older than `opts.retentionMs`.
+   *
+   * Tombstone semantics. `delete(id)` writes a tombstone marker
+   * (`{ tombstoned: true, deletedAt, lamport }`) at the entry's key
+   * rather than calling `db.del()`. This is load-bearing for the
+   * Issue #166 P1 #2 refuse-write guard — without the durable
+   * tombstone marker, a concurrent replica's pre-sync state could
+   * resurrect a completed delivery. But tombstones never go away,
+   * so the OrbitDB log grows monotonically.
+   *
+   * After enough time has passed that no replica can still hold a
+   * pre-sync state for the slot, the marker can be safely replaced
+   * with an actual `db.del()` to reclaim space. 30 days is the
+   * conservative default the doc prescribes; callers tune via
+   * `retentionMs`.
+   *
+   * **What this method does:**
+   *  1. Prefix-scans all keys under the writer's address.
+   *  2. For each key, classifies the slot shape (`value` /
+   *     `tombstone`).
+   *  3. For tombstones where `(now - deletedAt) > retentionMs`,
+   *     calls `db.del(key)`.
+   *  4. Returns counts for diagnostics.
+   *
+   * **Idempotent.** Re-running after a successful sweep is a no-op
+   * (the tombstones are gone). The Lamport monotonicity invariant
+   * is preserved — once the actual key is `del()`'d, future writes
+   * to the same id rehydrate the clock from observed live entries
+   * only, and a fresh slot is born with a Lamport ≥ max(observed) + 1.
+   *
+   * **Safety contract.** Sweeping a tombstone that is still within
+   * any concurrent replica's pre-sync horizon can resurrect the
+   * slot. Callers MUST ensure `retentionMs` exceeds the longest
+   * realistic replica re-sync window. The 30-day default is large
+   * enough that even fortnight-long offline replicas converge before
+   * sweep.
+   */
+  async gcExpiredTombstones(opts: {
+    readonly retentionMs: number;
+    readonly now?: number;
+  }): Promise<TombstoneGcResult> {
+    if (
+      typeof opts.retentionMs !== 'number' ||
+      !Number.isFinite(opts.retentionMs) ||
+      opts.retentionMs < 0
+    ) {
+      throw new SphereError(
+        `OutboxWriter.gcExpiredTombstones: retentionMs must be a non-negative finite number ` +
+          `(got ${String(opts.retentionMs)})`,
+        'VALIDATION_ERROR',
+      );
+    }
+    const nowMs =
+      typeof opts.now === 'number' && Number.isFinite(opts.now)
+        ? opts.now
+        : Date.now();
+
+    let entries: Map<string, Uint8Array>;
+    try {
+      entries = await this.db.all(this.keyPrefix);
+    } catch {
+      return { scanned: 0, purged: 0, kept: 0, skipped: true };
+    }
+
+    let scanned = 0;
+    let purged = 0;
+    let kept = 0;
+    for (const key of entries.keys()) {
+      if (!key.startsWith(this.keyPrefix)) continue;
+      const shape = await this.readSlotShape(key);
+      if (shape === null) continue;
+      if (shape.kind !== 'tombstone') continue;
+      scanned += 1;
+      // Legacy tombstones (no `deletedAt`) report deletedAt=0; treat
+      // them as expired (epoch is far past) so the sweep reclaims
+      // legacy litter too. This is safe because legacy tombstones
+      // pre-date #166 by definition; any pre-sync replica concern
+      // about them would have surfaced long ago.
+      if (nowMs - shape.deletedAt <= opts.retentionMs) {
+        kept += 1;
+        continue;
+      }
+      try {
+        await this.db.del(key);
+        purged += 1;
+      } catch {
+        // del() failure leaves the tombstone in place; next sweep
+        // retries. No throw — gc is best-effort.
+        kept += 1;
+      }
+    }
+    return { scanned, purged, kept, skipped: false };
   }
 
   /**
