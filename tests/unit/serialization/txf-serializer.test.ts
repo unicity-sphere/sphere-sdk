@@ -364,6 +364,30 @@ describe('txfToToken()', () => {
     expect(token.name).toBe('Token');
     expect(token.decimals).toBe(8);
   });
+
+  // Bug A — invoice tokens persist with coinData: null (they carry
+  // InvoiceTerms in tokenData, not coin amounts). The legacy
+  // implementation called coinData.reduce(...) unconditionally and
+  // threw TypeError on null, which parseTxfStorageData's per-token
+  // try/catch silently swallowed. Result: invoice tokens were dropped
+  // from this.tokens at load, making invoice-list / invoice-status /
+  // invoice-pay all return "not found" for any persisted invoice.
+  it('should parse invoice token (coinData: null) without throwing', () => {
+    const txf = createMockTxf();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (txf.genesis.data as any).coinData = null;
+    txf.genesis.data.tokenType =
+      '14676a280bda4275baf865b67cd4c611bcd58c9bf8226d508acaa10a8fcaccc6'; // INVOICE_TOKEN_TYPE_HEX
+    txf.genesis.data.tokenData = '7b226d656d6f223a224d616e75616c2074657374227d'; // {"memo":"Manual test"} hex
+
+    expect(() => txfToToken('inv-token-1', txf)).not.toThrow();
+
+    const token = txfToToken('inv-token-1', txf);
+    expect(token.id).toBe('inv-token-1');
+    expect(token.amount).toBe('0');
+    expect(token.coinId).toBe('');
+    expect(token.sdkData).toBeDefined();
+  });
 });
 
 // =============================================================================
