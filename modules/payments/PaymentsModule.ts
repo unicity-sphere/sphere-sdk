@@ -79,6 +79,7 @@ import {
   type ConservativeCommitResult,
   type ConservativeSenderDeps,
   type ConservativeSourceSelection,
+  type OutboxCreateInput,
 } from './transfer/conservative-sender';
 import {
   sendInstantUxf,
@@ -3237,8 +3238,24 @@ export class PaymentsModule {
    * @param opLabel  Short context tag for the error log (e.g.
    *                 'dispatchUxfConservativeSend', 'recoveryWorker').
    */
+  /**
+   * Parameter type is the structural subset of fields actually read
+   * by this helper — see the inline destructure below. We use
+   * {@link OutboxCreateInput} (= `UxfTransferOutboxEntry` minus
+   * `_schemaVersion` and `lamport`) because:
+   *  - `UxfTransferOutboxEntry` (from `OutboxWriter`-stamped state) is
+   *    assignable to `OutboxCreateInput` structurally — the extra
+   *    `_schemaVersion`/`lamport` fields are ignored.
+   *  - `OutboxCreateInput` (what the instant-send outbox `write` hook
+   *    receives from the orchestrator) is assignable directly, with
+   *    no need for the synthetic-lamport placeholder previously
+   *    required at the instant-send call site (OUTBOX-SEND-FOLLOWUPS
+   *    item #7).
+   * Neither caller's `lamport` is read here; the SENT ledger writer
+   * stamps its own Lamport on `write()`.
+   */
   private async writeSentEntryFromOutbox(
-    entry: UxfTransferOutboxEntry,
+    entry: OutboxCreateInput,
     opLabel: string,
   ): Promise<'success' | 'failed' | 'skipped'> {
     if (this._sentLedgerWriter === null) return 'skipped';
@@ -12149,18 +12166,13 @@ export class PaymentsModule {
               // — operator triage required (the sweeper cannot help
               // here because the source token is already cleared).
               if (entry.status === 'delivered-instant') {
-                // Synthesise a UxfTransferOutboxEntry shape for the
-                // helper (orchestrator passes an OutboxCreateInput
-                // which is structurally a UxfTransferOutboxEntry
-                // minus _schemaVersion + lamport — both unused by
-                // the SENT helper).
-                const synthetic: UxfTransferOutboxEntry = {
-                  ...entry,
-                  _schemaVersion: 'uxf-1' as const,
-                  lamport: 0,
-                };
+                // OUTBOX-SEND-FOLLOWUPS item #7 — the helper's
+                // parameter type is `OutboxCreateInput`, exactly the
+                // shape the orchestrator passes here. No synthetic
+                // `_schemaVersion`/`lamport: 0` placeholder needed:
+                // neither field is read by the SENT-write path.
                 await this.writeSentEntryFromOutbox(
-                  synthetic,
+                  entry,
                   'dispatchUxfInstantSend',
                 );
               }
