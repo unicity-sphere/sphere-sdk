@@ -183,6 +183,7 @@ import type { ProofVerifyStatus } from './transfer/proof-verifier';
 import { contentHash, type ContentHash } from '../../uxf/types';
 import { isLegacyTokenTransferPayload } from '../../types/uxf-transfer';
 import type { UxfTransferOutboxEntry } from '../../types/uxf-outbox';
+import type { UxfSentLedgerEntry } from '../../types/uxf-sent';
 import type { OutboxWriter } from '../../profile/outbox-writer';
 import type { SentLedgerWriter } from '../../profile/sent-ledger-writer';
 import {
@@ -3134,6 +3135,100 @@ export class PaymentsModule {
           `${sentErr instanceof Error ? sentErr.message : String(sentErr)}`,
       );
       return 'failed';
+    }
+  }
+
+  /**
+   * Issue #166 P2 #2 — duplicate-bundle guard.
+   *
+   * Verify that none of `candidateTokenIds` is already referenced by a
+   * live OUTBOX entry OR present in the SENT ledger. Throws
+   * `DUPLICATE_BUNDLE_MEMBERSHIP` on the first overlap found
+   * (OUTBOX checked before SENT — more diagnostic value, "still in
+   * flight" beats "already delivered" for operator triage).
+   *
+   * **Self-skip conditions** (all silent no-ops):
+   *  - `allowOverride === true` — caller explicitly opted out.
+   *  - Either writer is `null` — legacy-only wallet OR the bootstrap
+   *    has not yet installed both writers. The guard cannot
+   *    distinguish "not in any tracked structure" from "writer
+   *    unavailable," so we conservatively skip rather than reject.
+   *  - `candidateTokenIds` is empty.
+   *
+   * **Read-failure semantics** (best-effort safety contract):
+   *  - The guard catches throws from `readAllNew()` / `readAll()` and
+   *    logs a `warn`, then proceeds WITHOUT the check. Rationale: the
+   *    guard's job is to catch races/bugs that would silently
+   *    double-include a token; a transient OrbitDB read failure
+   *    should NOT block a legitimate send. The natural
+   *    `'transferring'`-status filter in `SpendPlanner.buildParsedPool`
+   *    is still in place as the load-bearing line of defense.
+   *
+   * **Cost.** O(o + s + k) where `o` is the total tokenIds across
+   * OUTBOX entries, `s` is the total across SENT, and `k` is
+   * `candidateTokenIds.length`. The OUTBOX/SENT reads are the
+   * dominant cost; the set lookups are O(1).
+   *
+   * @param candidateTokenIds  Token ids the dispatcher is about to mark
+   *                           as `'transferring'`.
+   * @param options.opLabel    Short context tag for the throw message
+   *                           (e.g. 'dispatchUxfConservativeSend').
+   * @param options.allowOverride  When true, the guard is a no-op.
+   *                               Wired from
+   *                               `TransferRequest.allowDuplicateBundleMembership`.
+   */
+  private async assertNoDuplicateBundleMembership(
+    candidateTokenIds: ReadonlyArray<string>,
+    options: { readonly opLabel: string; readonly allowOverride: boolean },
+  ): Promise<void> {
+    if (options.allowOverride) return;
+    if (this._outboxWriter === null || this._sentLedgerWriter === null) return;
+    if (candidateTokenIds.length === 0) return;
+
+    const candidates = new Set<string>(candidateTokenIds);
+
+    // ── OUTBOX check ────────────────────────────────────────────────────
+    let outboxEntries: ReadonlyArray<UxfTransferOutboxEntry>;
+    try {
+      outboxEntries = await this._outboxWriter.readAllNew();
+    } catch (err) {
+      logger.warn(
+        'Payments',
+        `${options.opLabel}: duplicate-bundle guard could not read OUTBOX (proceeding without OUTBOX check, SENT check still attempted): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      outboxEntries = [];
+    }
+    for (const entry of outboxEntries) {
+      for (const tid of entry.tokenIds) {
+        if (candidates.has(tid)) {
+          throw new SphereError(
+            `${options.opLabel}: refusing to include token ${tid} in this bundle — it is already referenced by OUTBOX entry ${entry.id} (status=${entry.status}). Set TransferRequest.allowDuplicateBundleMembership=true to bypass this guard if the re-include is intentional.`,
+            'DUPLICATE_BUNDLE_MEMBERSHIP',
+          );
+        }
+      }
+    }
+
+    // ── SENT check ──────────────────────────────────────────────────────
+    let sentEntries: ReadonlyArray<UxfSentLedgerEntry>;
+    try {
+      sentEntries = await this._sentLedgerWriter.readAll();
+    } catch (err) {
+      logger.warn(
+        'Payments',
+        `${options.opLabel}: duplicate-bundle guard could not read SENT ledger (proceeding without SENT check, OUTBOX check already passed): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return;
+    }
+    for (const entry of sentEntries) {
+      for (const tid of entry.tokenIds) {
+        if (candidates.has(tid)) {
+          throw new SphereError(
+            `${options.opLabel}: refusing to include token ${tid} in this bundle — it is already recorded as delivered in SENT ledger entry ${entry.id}. Set TransferRequest.allowDuplicateBundleMembership=true to bypass this guard if the re-include is intentional.`,
+            'DUPLICATE_BUNDLE_MEMBERSHIP',
+          );
+        }
+      }
     }
   }
 
@@ -10456,6 +10551,25 @@ export class PaymentsModule {
           additionalCount: (req.additionalAssets ?? []).filter((a) => a.kind === 'coin').length,
         });
 
+        // Issue #166 P2 #2 — duplicate-bundle guard. Refuse to mark
+        // sources as transferring if any planned token id is already
+        // referenced by a live OUTBOX entry or recorded in the SENT
+        // ledger. The check is best-effort: read failures degrade to
+        // a warn-log (the natural `'transferring'`-status filter in
+        // SpendPlanner.buildParsedPool stays as the load-bearing
+        // defense). Throws BEFORE the mark loop so a violation leaves
+        // sources in their original status — no rollback needed.
+        await this.assertNoDuplicateBundleMembership(
+          [
+            ...directSources.map((t) => t.id),
+            ...splitSources.map((e) => e.token.id),
+          ],
+          {
+            opLabel: 'dispatchUxfConservativeSend',
+            allowOverride: req.allowDuplicateBundleMembership === true,
+          },
+        );
+
         // Mark all selected sources as transferring + persist (matches legacy
         // semantics — prevents double-spend within the same session).
         for (const tok of directSources) {
@@ -11174,6 +11288,20 @@ export class PaymentsModule {
             });
           }
         }
+
+        // Issue #166 P2 #2 — duplicate-bundle guard. Same contract as
+        // the conservative dispatcher above; see that site for the
+        // rationale + best-effort semantics.
+        await this.assertNoDuplicateBundleMembership(
+          [
+            ...directSources.map((t) => t.id),
+            ...splitSources.map((e) => e.token.id),
+          ],
+          {
+            opLabel: 'dispatchUxfInstantSend',
+            allowOverride: req.allowDuplicateBundleMembership === true,
+          },
+        );
 
         // Mark every selected source `transferring` + persist.
         for (const tok of directSources) {
@@ -12049,6 +12177,17 @@ export class PaymentsModule {
           (t) => t.uiToken,
         );
         if (splitPlan.tokenToSplit) out.push(splitPlan.tokenToSplit.uiToken);
+        // Issue #166 P2 #2 — duplicate-bundle guard for the legacy TXF
+        // path. Same contract as the UXF dispatchers above; guard
+        // throws BEFORE the mark loop so source statuses are
+        // preserved on rejection.
+        await this.assertNoDuplicateBundleMembership(
+          out.map((t) => t.id),
+          {
+            opLabel: 'dispatchUxfTxfLegacySend',
+            allowOverride: req.allowDuplicateBundleMembership === true,
+          },
+        );
         for (const tok of out) {
           tok.status = 'transferring';
           this.tokens.set(tok.id, tok);

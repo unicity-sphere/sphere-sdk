@@ -42,6 +42,11 @@ export type SphereErrorCode =
   // owns every source token planned for spending. Catches the same bug
   // class PR #130 fixes at the root, on the send-side as a backstop.
   | 'OWNERSHIP_VERIFICATION_FAILED'
+  // Issue #166 P2 #2 — duplicate-bundle guard. Rejects sends whose
+  // source token selection includes a tokenId already present in a
+  // live OUTBOX entry OR in the SENT ledger. Override via
+  // `TransferRequest.allowDuplicateBundleMembership = true`.
+  | 'DUPLICATE_BUNDLE_MEMBERSHIP'
   | 'STORAGE_ERROR'
   | 'STORAGE_CORRUPTED'
   | 'TRANSPORT_ERROR'
