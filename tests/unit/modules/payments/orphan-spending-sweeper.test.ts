@@ -422,4 +422,80 @@ describe('sweepOrphanSpendingTokens (Issue #97)', () => {
     expect(result.skipped).toBe(false);
     expect(result.orphans).toHaveLength(1);
   });
+
+  // -------------------------------------------------------------------------
+  // Issue #166 P4 #4 — emit() async-rejection forward-compat
+  // -------------------------------------------------------------------------
+  describe('emit() async-rejection handling (Issue #166 P4 #4)', () => {
+    it('does NOT throw when emit returns a rejecting Promise (sync emitters continue to work)', async () => {
+      const asyncRejectingEmit: <T extends never>(
+        _t: T,
+        _d: unknown,
+      ) => Promise<void> = async () => {
+        throw new Error('emit-failed-async');
+      };
+
+      // No throw must escape — the try/catch awaits the promise.
+      await expect(
+        sweepOrphanSpendingTokens({
+          tokens: [tok('orphan-1', 'transferring')],
+          outboxWriter,
+          sentLedgerWriter,
+          emit: asyncRejectingEmit as never,
+        }),
+      ).resolves.toMatchObject({ skipped: false, orphans: [{ tokenId: 'orphan-1' }] });
+    });
+
+    it('continues processing subsequent orphans after one emit rejects', async () => {
+      // The try/catch is per-orphan inside the for loop. A rejection
+      // for orphan-1 must not stop orphan-2 from being processed.
+      let calls = 0;
+      const partiallyFailingEmit: <T extends never>(
+        _t: T,
+        _d: unknown,
+      ) => Promise<void> | void = (_t, _d) => {
+        calls += 1;
+        // First call rejects; second call resolves.
+        if (calls === 1) {
+          return Promise.reject(new Error('emit-failed-orphan-1'));
+        }
+        return undefined;
+      };
+
+      const result = await sweepOrphanSpendingTokens({
+        tokens: [
+          tok('orphan-1', 'transferring'),
+          tok('orphan-2', 'transferring'),
+        ],
+        outboxWriter,
+        sentLedgerWriter,
+        emit: partiallyFailingEmit as never,
+      });
+
+      // Both orphans should be DETECTED (the rejection only affects
+      // the emit attempt — the finding is already pushed before).
+      expect(result.orphans.map((o) => o.tokenId).sort()).toEqual([
+        'orphan-1',
+        'orphan-2',
+      ]);
+      // Both emit attempts should have fired (the loop didn't bail).
+      expect(calls).toBe(2);
+    });
+
+    it('still works with the synchronous void-returning emit signature (backward-compat)', async () => {
+      // The pre-#166 emitter (void return) must continue to work
+      // — backward-compat is required. The widened type
+      // `void | Promise<void>` is a superset, so this is true by
+      // construction, but pin it here as a regression guard.
+      const r = makeRecordingEmit();
+      const result = await sweepOrphanSpendingTokens({
+        tokens: [tok('orphan-1', 'transferring')],
+        outboxWriter,
+        sentLedgerWriter,
+        emit: r.emit,
+      });
+      expect(result.orphans).toHaveLength(1);
+      expect(r.events).toHaveLength(1);
+    });
+  });
 });

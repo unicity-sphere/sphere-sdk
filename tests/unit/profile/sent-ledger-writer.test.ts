@@ -15,7 +15,7 @@
  *      are ignored on read.
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { Lamport } from '../../../profile/lamport.js';
 import {
   SentLedgerWriter,
@@ -340,6 +340,43 @@ describe('SentLedgerWriter (Issue #97)', () => {
 
     const all = await writer.readAll();
     expect(all.map((e) => e.id)).toEqual(['xfer-1']);
+  });
+
+  // -------------------------------------------------------------------------
+  // Issue #166 P4 #3 — contains() cost contract pinning
+  // -------------------------------------------------------------------------
+  describe('contains() cost contract (Issue #166 P4 #3)', () => {
+    it('scans every live entry per call — no in-memory index (pin current behavior)', async () => {
+      // Pin the cost contract documented in contains()'s JSDoc: each
+      // call decrypts every entry under the prefix. A regression that
+      // accidentally introduces an in-memory index (without the
+      // durability surface) OR a regression that amplifies the call
+      // count (extra reads per entry) is caught here. When the
+      // duplicate-bundle guard work lands (Issue #166 P2), this test
+      // can be flipped to assert the index-backed path.
+      for (let i = 0; i < 5; i += 1) {
+        await writer.write(buildBaseInput(`xfer-${i}`));
+      }
+
+      const getSpy = vi.spyOn(db, 'get');
+
+      // Look up a token that doesn't exist (forces full scan, no
+      // early termination). Each entry decryption is one db.get
+      // call (the prefix-scan `all()` returns the keys but each
+      // `readDecoded(key)` calls `get(key)` again).
+      const hit = await writer.contains('not-a-real-token');
+      expect(hit).toBe(false);
+      // 5 entries → 5 db.get calls. If a future index were
+      // installed, this would drop to 0 (the index lookup avoids
+      // decryption). If a regression amplified the scan, this
+      // would be > 5.
+      expect(getSpy).toHaveBeenCalledTimes(5);
+
+      // Second call repeats the scan (no caching across calls).
+      getSpy.mockClear();
+      await writer.contains('still-no-such-token');
+      expect(getSpy).toHaveBeenCalledTimes(5);
+    });
   });
 
   // -------------------------------------------------------------------------

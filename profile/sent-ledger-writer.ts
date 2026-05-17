@@ -227,12 +227,25 @@ export class SentLedgerWriter {
    * the crash-recovery sweeper (Issue #97 step 6) and the duplicate-
    * bundle guard (Issue #97 step 7).
    *
-   * Implementation note: scans `readAll()` results. For wallets with
-   * tens of thousands of SENT entries this is O(n × m) where m is the
-   * average tokenIds length per entry. Acceptable for current user
-   * volumes; a future optimization could maintain a parallel
-   * tokenId → entryIds index, but that doubles the durability
-   * surface for no immediate benefit.
+   * **Cost contract (Issue #166 P4 #3).** Each call:
+   *  1. Performs a prefix-scan over OrbitDB (`db.all(keyPrefix)`).
+   *  2. Decrypts and JSON-parses EVERY non-tombstoned entry under the
+   *     `${addr}.sent.` prefix.
+   *  3. Linearly scans each entry's `tokenIds` array.
+   *
+   * Total cost is O(n × m) where n is the number of live SENT entries
+   * and m is the average tokenIds length per entry. There is NO
+   * in-memory index — every call repeats the decrypt + scan.
+   *
+   * **When to revisit.** Once the duplicate-bundle guard (Issue #166
+   * Phase 2 — see issue #166 / P2) lands and calls `contains()`
+   * per-token in a hot path, this O(n × m) becomes the
+   * scaling bottleneck. The right fix is a parallel tokenId → entryIds
+   * index, populated lazily on first read. That doubles the durability
+   * surface so it MUST land with its own invariant tests; not in scope
+   * for #166.
+   *
+   * Acceptable today: typical wallets have <1k SENT entries; m ~ 1-4.
    */
   async contains(tokenId: string): Promise<boolean> {
     if (typeof tokenId !== 'string' || tokenId.length === 0) return false;
