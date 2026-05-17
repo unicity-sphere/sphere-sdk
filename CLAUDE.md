@@ -634,6 +634,17 @@ TxfStorageDataBase {
 
 **Deposit via invoice.** Each party deposits by paying an escrow-created invoice. Payout is verified locally via `verifyPayout()`.
 
+## OUTBOX/SEND pipeline follow-ups (post-#166)
+
+Issue #166 closed all in-scope OUTBOX/SEND crash-safety + hardening work (PRs #167–#172 merged into `integration/all-fixes`). Deferred follow-ups are tracked in **[`docs/uxf/OUTBOX-SEND-FOLLOWUPS.md`](docs/uxf/OUTBOX-SEND-FOLLOWUPS.md)** — read that document before starting any work on this pipeline. It covers:
+
+- Aggregator cross-check before orphan auto-recovery (blocks flipping `features.orphanAutoRecovery` default-ON)
+- Automatic re-publication of detected retention drops (blocks flipping `features.nostrPersistenceVerifier` default-ON)
+- `SentLedgerWriter.contains()` in-memory index (perf at high SENT volumes)
+- Tombstone storage GC (true `db.del()` after retention window)
+- Operator runbooks for the new events
+- Architecture decision: vector vs per-entry-key OUTBOX storage model
+
 ## Testing
 
 **Framework:** Vitest
