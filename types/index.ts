@@ -261,6 +261,31 @@ export interface TransferRequest {
   readonly invoiceRefundAddress?: string;
   /** Invoice contact info — embedded in on-chain message for receipt/notice delivery */
   readonly invoiceContact?: { address: string; url?: string };
+  /**
+   * Issue #166 P2 #2 — explicit override for the duplicate-bundle guard.
+   *
+   * Default `false`. The dispatcher rejects sends whose source token
+   * selection includes a `tokenId` already referenced by a LIVE OUTBOX
+   * entry (status not in the hard-terminal partition) OR present in the
+   * SENT ledger. This catches:
+   *  - Concurrent-send races (two windows / tabs both planning against
+   *    the same wallet state).
+   *  - Post-restart state disagreements where the in-memory token
+   *    mirror briefly disagrees with the durable OUTBOX before
+   *    `installOutboxWriter` hydration finishes.
+   *  - Bugs that bypass the natural `'transferring'`-status filter in
+   *    `SpendPlanner.buildParsedPool`.
+   *
+   * Set `true` to bypass the guard for intentional re-sends (e.g. the
+   * recipient lost the bundle and the operator wants to re-deliver with
+   * fresh state evidence). The error code on violation is
+   * `DUPLICATE_BUNDLE_MEMBERSHIP`.
+   *
+   * No-op on legacy-only wallets where either writer is uninstalled —
+   * the guard self-skips because it cannot distinguish "not in any
+   * tracked structure" from "writer unavailable."
+   */
+  readonly allowDuplicateBundleMembership?: boolean;
 }
 
 /**
