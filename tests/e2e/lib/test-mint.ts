@@ -44,7 +44,7 @@ import { MintCommitment } from '@unicitylabs/state-transition-sdk/lib/transactio
 import { UnmaskedPredicate } from '@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicate.js';
 import { UnmaskedPredicateReference } from '@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicateReference.js';
 import { waitInclusionProof } from '@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils.js';
-import type { AggregatorClient } from '@unicitylabs/state-transition-sdk/lib/api/AggregatorClient.js';
+import type { StateTransitionClient } from '@unicitylabs/state-transition-sdk/lib/StateTransitionClient.js';
 import type { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/bft/RootTrustBase.js';
 import type { IMintTransactionReason } from '@unicitylabs/state-transition-sdk/lib/transaction/IMintTransactionReason.js';
 
@@ -150,17 +150,21 @@ export async function mintTestTokenToSelf(
 
   const commitment = await MintCommitment.create(mintData);
 
-  // Pull the aggregator client + trust base from the Sphere's oracle.
-  // The Sphere does not expose these as public getters, but the
-  // OracleProvider on `_payments.deps` does.
+  // Pull the StateTransitionClient + trust base from the Sphere's oracle.
+  // Sphere does not expose these as public getters, but the OracleProvider
+  // on `_payments.deps` does. `submitMintCommitment` lives on the
+  // StateTransitionClient (which wraps the lower-level AggregatorClient);
+  // `waitInclusionProof` also takes the StateTransitionClient.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const oracle = (input.sphere as any)._payments?.deps?.oracle;
   if (!oracle) {
     throw new Error('mintTestTokenToSelf: Sphere has no oracle wired');
   }
-  const client = oracle.getAggregatorClient?.() as AggregatorClient | null;
+  const client = oracle.getStateTransitionClient?.() as StateTransitionClient | null;
   const trustBase = oracle.getRootTrustBase?.() as RootTrustBase | null;
-  if (!client) throw new Error('mintTestTokenToSelf: oracle has no AggregatorClient');
+  if (!client) {
+    throw new Error('mintTestTokenToSelf: oracle has no StateTransitionClient');
+  }
   if (!trustBase) throw new Error('mintTestTokenToSelf: oracle has no RootTrustBase');
 
   // Submit + wait for inclusion proof.
