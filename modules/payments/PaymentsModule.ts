@@ -79,6 +79,7 @@ import {
   type ConservativeCommitResult,
   type ConservativeSenderDeps,
   type ConservativeSourceSelection,
+  type OutboxCreateInput,
 } from './transfer/conservative-sender';
 import {
   sendInstantUxf,
@@ -139,6 +140,14 @@ import {
   type NostrPersistenceVerifierDeps,
   type VerifyOutcome,
 } from './transfer/nostr-persistence-verifier';
+// OUTBOX-SEND-FOLLOWUPS item #4 — tombstone GC worker. Auto-installed in
+// `initialize()` when `features.tombstoneGcWorker` is true. Periodically
+// replaces expired tombstones (older than the configured retention
+// window) with real db.del() calls to reclaim OrbitDB log bytes.
+import {
+  TombstoneGcWorker,
+  type TombstoneGcWorkerDeps,
+} from './transfer/tombstone-gc-worker';
 // Phase 9.6.D — sender-side §6.1 finalization worker. Auto-installed in
 // `initialize()` when `features.finalizationWorker` is true (default-ON
 // when `senderUxf` is true). Consumer-installed workers (via
@@ -1044,6 +1053,29 @@ export interface UxfTransferFeatures {
    */
   readonly nostrPersistenceVerifier?: boolean;
   /**
+   * OUTBOX-SEND-FOLLOWUPS item #4 — tombstone garbage collection.
+   * Default `false` (opt-in for the initial soak window).
+   *
+   * When ON, auto-installs a {@link TombstoneGcWorker} that
+   * periodically sweeps tombstoned OUTBOX and SENT slots whose
+   * `(now - deletedAt) > retentionMs` (default 30 days) and replaces
+   * each marker with a real `db.del(key)` to reclaim OrbitDB log
+   * bytes.
+   *
+   * Tombstones are otherwise permanent (`delete()` writes a marker,
+   * not a `db.del()`) — Issue #166 P1 #2 requires the marker for the
+   * refuse-write guard. After 30 days of clock time elapsed past the
+   * tombstone's `deletedAt`, no concurrent replica can still hold a
+   * pre-sync state that would resurrect the slot, so the marker
+   * itself is safe to drop.
+   *
+   * Default-OFF mirrors `nostrPersistenceVerifier`. Long-lived
+   * wallets accumulating millions of tombstones over years are the
+   * target; for a wallet under a few hundred sends per day, the GC
+   * is an optimisation. Set the flag explicitly to enable.
+   */
+  readonly tombstoneGcWorker?: boolean;
+  /**
    * Issue #166 P2 #1 — orphan-spending-tx AUTO-RECOVERY. Default
    * `false` (opt-in).
    *
@@ -1539,6 +1571,11 @@ export class PaymentsModule {
       // tolerates the load.
       nostrPersistenceVerifier:
         config?.features?.nostrPersistenceVerifier ?? false,
+      // OUTBOX-SEND-FOLLOWUPS item #4 — tombstone GC. Default-OFF:
+      // long-lived high-volume wallets accumulate tombstone bytes; the
+      // sweep is an optimisation, not a correctness path. Flip ON
+      // explicitly when storage growth becomes operationally relevant.
+      tombstoneGcWorker: config?.features?.tombstoneGcWorker ?? false,
       // Issue #166 P2 #1 — orphan-spending auto-recovery. Default-OFF:
       // the safe-restore-to-`confirmed` strategy assumes the spending
       // commit never reached the aggregator. Flip ON after soak.
@@ -1822,25 +1859,86 @@ export class PaymentsModule {
           // duplicates by `bundleCid` (§6.3 / T.3.A) so a wasted publish
           // in the racing window is harmless.
           //
-          // CID-by-reference shape: the original CAR is already pinned
-          // to IPFS by the time it lands in the outbox; re-publishing
-          // the CID is sufficient. Implementations that need a richer
-          // payload (inline CAR for bundles below the cap) override
-          // the worker via `installSendingRecoveryWorker`.
+          // OUTBOX-SEND-FOLLOWUPS item #6 — switch on the entry's
+          // original `deliveryMethod` rather than blindly emitting a
+          // `'uxf-cid'` payload. Sending a CID-by-reference shape for
+          // an entry originally delivered as inline CAR would hand the
+          // recipient a CID with no IPFS pin behind it (the CAR bytes
+          // were inlined on the wire, never pinned). They'd fail the
+          // fetch and the bundle would be invisible — worse than
+          // never re-publishing at all.
           //
-          // `mode === 'txf'` is a legacy outbox shape that does NOT
-          // belong to UXF. Map it to `'instant'` for the wire payload's
-          // advisory `mode` field — recipients ignore it (§5.6).
-          const payloadMode: 'conservative' | 'instant' =
-            entry.mode === 'txf' ? 'instant' : entry.mode;
-          await transport.sendTokenTransfer(entry.recipientTransportPubkey, {
-            kind: 'uxf-cid',
-            version: '1.0',
-            mode: payloadMode,
-            bundleCid: entry.bundleCid,
-            tokenIds: entry.tokenIds,
-            ...(typeof entry.memo === 'string' ? { memo: entry.memo } : {}),
-          });
+          // Bundle-bytes problem: the inline CAR payload is NOT
+          // stored on the outbox entry (see types/uxf-outbox.ts:168);
+          // the bytes only exist in the original wire publish that
+          // we're trying to recover from. The default worker has no
+          // way to reconstruct them. We therefore fail-fast on the
+          // CAR path with a clear error — the SendingRecoveryWorker
+          // counts the throw toward `maxRetries` and transitions the
+          // entry to `'failed-transient'` for operator triage, which
+          // is exactly the §7.0 escape valve item #6 prescribes for
+          // "CAR bytes unavailable AND re-pin fails."
+          //
+          // Custom workers that wire local CAR retention or IPFS re-
+          // pin can install their own republish via
+          // `installSendingRecoveryWorker()` and skip this fallback.
+          switch (entry.deliveryMethod) {
+            case 'cid-over-nostr': {
+              // The original CAR is pinned to IPFS by the time it
+              // lands in the outbox; re-publishing the CID is
+              // sufficient. `mode === 'txf'` is a legacy outbox-mode
+              // discriminator that does NOT belong to UXF wire
+              // payloads — map it to `'instant'` for the advisory
+              // `mode` field; recipients ignore it (§5.6).
+              const payloadMode: 'conservative' | 'instant' =
+                entry.mode === 'txf' ? 'instant' : entry.mode;
+              await transport.sendTokenTransfer(
+                entry.recipientTransportPubkey,
+                {
+                  kind: 'uxf-cid',
+                  version: '1.0',
+                  mode: payloadMode,
+                  bundleCid: entry.bundleCid,
+                  tokenIds: entry.tokenIds,
+                  ...(typeof entry.memo === 'string'
+                    ? { memo: entry.memo }
+                    : {}),
+                },
+              );
+              return;
+            }
+            case 'car-over-nostr': {
+              throw new SphereError(
+                `SendingRecoveryWorker default republish cannot recover entry ${entry.id}: ` +
+                  `deliveryMethod='car-over-nostr' inlined the CAR bytes on the wire and they are ` +
+                  `not retained on the outbox entry. Install a custom worker via ` +
+                  `installSendingRecoveryWorker() that stores or re-pins CAR bytes to recover ` +
+                  `from CAR-mode entries.`,
+                'VALIDATION_ERROR',
+              );
+            }
+            case 'txf-legacy': {
+              throw new SphereError(
+                `SendingRecoveryWorker default republish cannot recover entry ${entry.id}: ` +
+                  `deliveryMethod='txf-legacy' is a single-token legacy wire shape that does ` +
+                  `not round-trip through the UXF payload union. Operator triage required.`,
+                'VALIDATION_ERROR',
+              );
+            }
+            default: {
+              // Defense-in-depth: refuse to publish an unknown
+              // delivery method as `'uxf-cid'` blindly. This branch
+              // is unreachable today; if a new arm is added to
+              // `UxfTransferOutboxEntry.deliveryMethod` and lands in
+              // the outbox before this switch is updated, fail-closed.
+              const _exhaustive: never = entry.deliveryMethod;
+              throw new SphereError(
+                `SendingRecoveryWorker default republish: unsupported ` +
+                  `deliveryMethod=${String(_exhaustive)} on entry ${entry.id}`,
+                'VALIDATION_ERROR',
+              );
+            }
+          }
         },
         emit: sphereEmit,
       };
@@ -1913,6 +2011,14 @@ export class PaymentsModule {
       const verifierDeps: NostrPersistenceVerifierDeps = {
         sentProvider: (): Pick<SentLedgerWriter, 'readAll'> | null =>
           this._sentLedgerWriter,
+        // OUTBOX-SEND-FOLLOWUPS item #2 — thread the OUTBOX writer so
+        // the verifier can transition live `delivered`/`delivered-
+        // instant` entries back to `'sending'` on retention drops.
+        // The SendingRecoveryWorker then republishes via its existing
+        // scan loop (item #6's deliveryMethod-aware closure handles
+        // CAR/TXF entries safely).
+        outboxProvider: (): Pick<OutboxWriter, 'update'> | null =>
+          this._outboxWriter,
         verify: async (entry: UxfSentLedgerEntry): Promise<VerifyOutcome> => {
           if (
             typeof entry.nostrEventId !== 'string' ||
@@ -1951,6 +2057,39 @@ export class PaymentsModule {
       this.nostrPersistenceVerifier !== null
     ) {
       this.nostrPersistenceVerifier.start();
+    }
+
+    // OUTBOX-SEND-FOLLOWUPS item #4 — auto-install the tombstone GC
+    // worker. Default-OFF feature gate; when ON the worker periodically
+    // reclaims storage occupied by tombstones whose retention window
+    // has elapsed. Both writers self-skip when no writer is installed,
+    // so the start() call is safe even before bootstrap installs them.
+    if (
+      this.features.tombstoneGcWorker &&
+      this.tombstoneGcWorker === null
+    ) {
+      const gcDeps: TombstoneGcWorkerDeps = {
+        outboxProvider: (): Pick<OutboxWriter, 'gcExpiredTombstones'> | null =>
+          this._outboxWriter,
+        sentProvider: (): Pick<SentLedgerWriter, 'gcExpiredTombstones'> | null =>
+          this._sentLedgerWriter,
+        logger: {
+          warn: (message: string, context?: Record<string, unknown>): void => {
+            logger.warn('Payments', `${message}`, context);
+          },
+        },
+      };
+      this.tombstoneGcWorker = new TombstoneGcWorker(gcDeps);
+      this.tombstoneGcWorker.start();
+      logger.debug(
+        'Payments',
+        'Default TombstoneGcWorker auto-installed (tombstoneGcWorker opt-in flag ON)',
+      );
+    } else if (
+      this.features.tombstoneGcWorker &&
+      this.tombstoneGcWorker !== null
+    ) {
+      this.tombstoneGcWorker.start();
     }
 
     // T.3.E — auto-install a default IngestWorkerPool when recipientUxf
@@ -3237,8 +3376,24 @@ export class PaymentsModule {
    * @param opLabel  Short context tag for the error log (e.g.
    *                 'dispatchUxfConservativeSend', 'recoveryWorker').
    */
+  /**
+   * Parameter type is the structural subset of fields actually read
+   * by this helper — see the inline destructure below. We use
+   * {@link OutboxCreateInput} (= `UxfTransferOutboxEntry` minus
+   * `_schemaVersion` and `lamport`) because:
+   *  - `UxfTransferOutboxEntry` (from `OutboxWriter`-stamped state) is
+   *    assignable to `OutboxCreateInput` structurally — the extra
+   *    `_schemaVersion`/`lamport` fields are ignored.
+   *  - `OutboxCreateInput` (what the instant-send outbox `write` hook
+   *    receives from the orchestrator) is assignable directly, with
+   *    no need for the synthetic-lamport placeholder previously
+   *    required at the instant-send call site (OUTBOX-SEND-FOLLOWUPS
+   *    item #7).
+   * Neither caller's `lamport` is read here; the SENT ledger writer
+   * stamps its own Lamport on `write()`.
+   */
   private async writeSentEntryFromOutbox(
-    entry: UxfTransferOutboxEntry,
+    entry: OutboxCreateInput,
     opLabel: string,
   ): Promise<'success' | 'failed' | 'skipped'> {
     if (this._sentLedgerWriter === null) return 'skipped';
@@ -3434,30 +3589,38 @@ export class PaymentsModule {
    * `'confirmed'` and persists the change. The token's value becomes
    * spendable again.
    *
-   * **Safety contract.** The strategy is SAFE when the spending
-   * commit never reached the aggregator (the common crash window
-   * between source-token mark-as-transferring and OUTBOX-entry
-   * write). It is UNSAFE when the commit DID reach the aggregator
-   * but the OUTBOX write crashed afterward — in that rare case, the
-   * aggregator's view differs from the wallet's restored view and
-   * the next operation touching the token will surface a
-   * state-mismatch error from the aggregator (correctness preserved
-   * at the cost of a confusing late error).
+   * **Safety contract.** Before flipping status the recovery hook
+   * cross-checks the aggregator (#166 P2 #1 follow-up — OUTBOX-SEND-
+   * FOLLOWUPS.md item #1). The source-token's pre-commit state hash
+   * is extracted from local `sdkData` and queried via
+   * {@link OracleProvider.isSpent}. The strategy:
+   *  - aggregator reports state UNSPENT → spending commit never
+   *    reached L3; safe to restore (the original Phase-2 happy path).
+   *  - aggregator reports state SPENT → commit landed on-chain; a
+   *    local restore would diverge from the aggregator's view and the
+   *    next operation on the restored token would surface a confusing
+   *    state-mismatch error. Escalate to manual triage.
+   *  - aggregator RPC throws → fail-closed; we cannot rule out the
+   *    spent case, so escalate to manual triage.
+   *  - source state hash unparseable (degenerate `sdkData`) → also
+   *    fail-closed; cannot verify, escalate.
    *
-   * Returns `'manual'` (preserving Phase-1 behavior) when:
+   * Returns `'manual'` when:
    *  - The token id is no longer in the in-memory `this.tokens`
    *    (concurrent removal — let the operator triage); OR
    *  - The token's status is no longer `'transferring'` (race
    *    between detection and recovery — the dispatcher's own
    *    Loop1-S9 restore may already have run); OR
+   *  - The aggregator cross-check escalates per the cases above; OR
    *  - The persistence step (`this.save()`) throws (we left the
    *    in-memory restoration in place, but the durability
    *    guarantee is lost; operator should know).
    *
-   * Throw safety: never throws — defense-in-depth converts the
-   * `this.save()` rejection path to `'manual'` rather than letting
-   * the throw propagate into the sweeper (which would treat it as
-   * `'manual'` anyway — just with a noisier warn-log).
+   * Throw safety: never throws — defense-in-depth converts every
+   * thrown path (oracle RPC failure, `this.save()` rejection) to
+   * `'manual'` rather than letting the throw propagate into the
+   * sweeper (which would treat it as `'manual'` anyway — just with a
+   * noisier warn-log).
    */
   private async defaultOrphanRecovery(
     finding: OrphanSpendingFinding,
@@ -3465,6 +3628,50 @@ export class PaymentsModule {
     const token = this.tokens.get(finding.tokenId);
     if (token === undefined) return 'manual';
     if (token.status !== 'transferring') return 'manual';
+
+    // OUTBOX-SEND-FOLLOWUPS item #1: aggregator cross-check.
+    //
+    // The orphan's `sdkData` still holds the pre-commit serialization
+    // — `commitSources` does not mutate the source token's local
+    // data; the spent state shows up on-chain only. Extract the state
+    // hash and ask the aggregator whether that state is already
+    // recorded as spent. If yes, the spending commit DID land before
+    // the crash, and restoring locally would produce a token whose
+    // local state diverges from the aggregator's view.
+    const sourceStateHash = extractStateHashFromSdkData(token.sdkData);
+    if (sourceStateHash === '') {
+      logger.warn(
+        'Payments',
+        `defaultOrphanRecovery: token ${token.id} has no parseable stateHash on sdkData — ` +
+          `cannot cross-check aggregator; escalating to manual triage.`,
+      );
+      return 'manual';
+    }
+    let aggregatorRecordsSpent: boolean;
+    try {
+      aggregatorRecordsSpent = await this.deps!.oracle.isSpent(sourceStateHash);
+    } catch (oracleErr) {
+      // Per OracleProvider.isSpent contract, an RPC failure throws
+      // (never fail-open). Treat the throw as ambiguous: we cannot
+      // rule out the spent case, so escalate.
+      logger.warn(
+        'Payments',
+        `defaultOrphanRecovery: oracle.isSpent threw for token ${token.id} ` +
+          `(stateHash=${sourceStateHash}) — fail-closed to manual triage: ` +
+          `${oracleErr instanceof Error ? oracleErr.message : String(oracleErr)}`,
+      );
+      return 'manual';
+    }
+    if (aggregatorRecordsSpent) {
+      logger.error(
+        'Payments',
+        `defaultOrphanRecovery: aggregator records source state spent for token ${token.id} ` +
+          `(stateHash=${sourceStateHash}) — spending commit landed on-chain, local restore ` +
+          `would diverge; escalating to manual triage. Operator action: re-package the bundle ` +
+          `from the post-spend recipient context, or accept the value as already-sent.`,
+      );
+      return 'manual';
+    }
 
     // Apply the in-memory restoration. The Token interface has
     // `status` and `updatedAt` as mutable — same pattern used by
@@ -3584,6 +3791,9 @@ export class PaymentsModule {
   private sentReconciliationWorker: SentReconciliationWorker | null = null;
   /** @internal — auto-installed or set by `installNostrPersistenceVerifier()`. Issue #166 P2 #3. */
   private nostrPersistenceVerifier: NostrPersistenceVerifier | null = null;
+  /** @internal — auto-installed when `features.tombstoneGcWorker` is on.
+   *  OUTBOX-SEND-FOLLOWUPS item #4. */
+  private tombstoneGcWorker: TombstoneGcWorker | null = null;
   /** @internal — auto-installed or set by `installFinalizationWorkerSender()`. Phase 9.6.D. */
   private finalizationWorkerSender: FinalizationWorkerSender | null = null;
   /**
@@ -4302,6 +4512,12 @@ export class PaymentsModule {
     if (this.nostrPersistenceVerifier) {
       void this.nostrPersistenceVerifier.stop().catch(() => undefined);
       this.nostrPersistenceVerifier = null;
+    }
+
+    // OUTBOX-SEND-FOLLOWUPS item #4 — stop the tombstone GC worker.
+    if (this.tombstoneGcWorker) {
+      void this.tombstoneGcWorker.stop().catch(() => undefined);
+      this.tombstoneGcWorker = null;
     }
 
     // Task #169 — abort the worker AbortController BEFORE stopping the
@@ -12097,18 +12313,13 @@ export class PaymentsModule {
               // — operator triage required (the sweeper cannot help
               // here because the source token is already cleared).
               if (entry.status === 'delivered-instant') {
-                // Synthesise a UxfTransferOutboxEntry shape for the
-                // helper (orchestrator passes an OutboxCreateInput
-                // which is structurally a UxfTransferOutboxEntry
-                // minus _schemaVersion + lamport — both unused by
-                // the SENT helper).
-                const synthetic: UxfTransferOutboxEntry = {
-                  ...entry,
-                  _schemaVersion: 'uxf-1' as const,
-                  lamport: 0,
-                };
+                // OUTBOX-SEND-FOLLOWUPS item #7 — the helper's
+                // parameter type is `OutboxCreateInput`, exactly the
+                // shape the orchestrator passes here. No synthetic
+                // `_schemaVersion`/`lamport: 0` placeholder needed:
+                // neither field is read by the SENT-write path.
                 await this.writeSentEntryFromOutbox(
-                  synthetic,
+                  entry,
                   'dispatchUxfInstantSend',
                 );
               }

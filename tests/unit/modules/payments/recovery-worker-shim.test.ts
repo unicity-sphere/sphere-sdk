@@ -325,3 +325,135 @@ describe('PaymentsModule recovery-worker shim (Issue #166 — P3 #3)', () => {
     expect((await writerB.readAll())[0].id).toBe('late-swap-1');
   });
 });
+
+// ===========================================================================
+// OUTBOX-SEND-FOLLOWUPS item #6 — default republish honours deliveryMethod
+// ===========================================================================
+//
+// PaymentsModule's default `republish` closure used to publish every
+// stuck entry as `kind: 'uxf-cid'`, regardless of the original
+// deliveryMethod. For `'car-over-nostr'` entries that's wrong — the
+// CAR bytes were inlined on the wire and never pinned, so the
+// recipient cannot fetch a CID-by-reference replay. For `'txf-legacy'`
+// the CID itself is synthetic (`'txf-' + tokenId`) and not addressable
+// on IPFS at all.
+//
+// The fix: the default closure switches on `entry.deliveryMethod`.
+// Only `'cid-over-nostr'` round-trips through the UXF payload union;
+// the other two throw a tagged error. The
+// SendingRecoveryWorker counts throws toward `maxRetries` (default 3)
+// then transitions the entry to `'failed-transient'`, surfacing it
+// for operator triage instead of silently flooding the recipient with
+// unfetchable CIDs.
+
+describe('PaymentsModule default republish — deliveryMethod awareness (OUTBOX-SEND-FOLLOWUPS item #6)', () => {
+  let payments: PaymentsModule;
+  let transport: RecoveryTransport;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.clearAllMocks();
+    transport = createRecoveryTransport();
+    payments = createPaymentsModule({
+      debug: false,
+      autoSync: false,
+      features: { recoveryWorker: true, finalizationWorker: false },
+    });
+    payments.initialize(createPaymentsDeps(transport));
+    void asInternals(payments).sendingRecoveryWorker?.stop();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("'cid-over-nostr' entry → republish emits kind: 'uxf-cid' with the right shape", async () => {
+    const { outboxWriter, sentLedgerWriter } = createWriterPair();
+    payments.installOutboxWriter(outboxWriter);
+    payments.installSentLedgerWriter(sentLedgerWriter);
+
+    await seedStuckSendingEntry(outboxWriter, {
+      id: 'cid-1',
+      deliveryMethod: 'cid-over-nostr',
+      mode: 'conservative',
+      updatedAt: Date.now() - 120_000,
+      bundleCid: 'bafy-cid-1',
+      tokenIds: ['tok-a'],
+    });
+
+    await asInternals(payments).sendingRecoveryWorker!.runScanCycle();
+
+    expect(transport.sendTokenTransfer).toHaveBeenCalledTimes(1);
+    const [, payload] = transport.sendTokenTransfer.mock.calls[0];
+    expect(payload).toMatchObject({
+      kind: 'uxf-cid',
+      version: '1.0',
+      mode: 'conservative',
+      bundleCid: 'bafy-cid-1',
+      tokenIds: ['tok-a'],
+    });
+    // SENT-write proves the arc went all the way to delivered.
+    expect(await sentLedgerWriter.readAll()).toHaveLength(1);
+  });
+
+  it("'car-over-nostr' entry → republish throws (transport never called) and worker transitions to 'failed-transient' after maxRetries", async () => {
+    const { outboxWriter, sentLedgerWriter } = createWriterPair();
+    payments.installOutboxWriter(outboxWriter);
+    payments.installSentLedgerWriter(sentLedgerWriter);
+
+    await seedStuckSendingEntry(outboxWriter, {
+      id: 'car-1',
+      deliveryMethod: 'car-over-nostr',
+      mode: 'conservative',
+      updatedAt: Date.now() - 120_000,
+    });
+
+    // maxRetries default is 3 — three failed cycles before transition.
+    await asInternals(payments).sendingRecoveryWorker!.runScanCycle();
+    await asInternals(payments).sendingRecoveryWorker!.runScanCycle();
+    await asInternals(payments).sendingRecoveryWorker!.runScanCycle();
+
+    // The default closure must NEVER hand a synthetic uxf-cid payload
+    // to the transport for a CAR entry. That's the load-bearing
+    // correctness assertion — the recipient is protected from the
+    // unfetchable-CID failure mode.
+    expect(transport.sendTokenTransfer).not.toHaveBeenCalled();
+
+    // The entry transitioned to failed-transient with an error that
+    // mentions the CAR-bytes limitation, so an operator can act.
+    const persisted = await outboxWriter.readAllNew();
+    const carEntry = persisted.find((e) => e.id === 'car-1');
+    expect(carEntry?.status).toBe('failed-transient');
+    expect(carEntry?.error).toMatch(/car-over-nostr/);
+
+    // No SENT entry — the arc never reached 'delivered'.
+    expect(await sentLedgerWriter.readAll()).toHaveLength(0);
+  });
+
+  it("'txf-legacy' entry → republish throws (transport never called) and worker transitions to 'failed-transient' after maxRetries", async () => {
+    const { outboxWriter, sentLedgerWriter } = createWriterPair();
+    payments.installOutboxWriter(outboxWriter);
+    payments.installSentLedgerWriter(sentLedgerWriter);
+
+    await seedStuckSendingEntry(outboxWriter, {
+      id: 'txf-1',
+      deliveryMethod: 'txf-legacy',
+      mode: 'txf',
+      bundleCid: 'txf-tok-a',
+      updatedAt: Date.now() - 120_000,
+    });
+
+    await asInternals(payments).sendingRecoveryWorker!.runScanCycle();
+    await asInternals(payments).sendingRecoveryWorker!.runScanCycle();
+    await asInternals(payments).sendingRecoveryWorker!.runScanCycle();
+
+    expect(transport.sendTokenTransfer).not.toHaveBeenCalled();
+
+    const persisted = await outboxWriter.readAllNew();
+    const txfEntry = persisted.find((e) => e.id === 'txf-1');
+    expect(txfEntry?.status).toBe('failed-transient');
+    expect(txfEntry?.error).toMatch(/txf-legacy/);
+
+    expect(await sentLedgerWriter.readAll()).toHaveLength(0);
+  });
+});

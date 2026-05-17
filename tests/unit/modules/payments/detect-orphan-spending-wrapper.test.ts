@@ -294,6 +294,12 @@ describe('PaymentsModule.detectOrphanSpendingTokens — orphanAutoRecovery (Issu
       makeToken('orphan-B', 'transferring', {
         coinId: 'UCT',
         amount: '500',
+        // OUTBOX-SEND-FOLLOWUPS item #1: defaultOrphanRecovery now
+        // extracts a state hash from sdkData and cross-checks the
+        // aggregator before restoring. The stub oracle defaults to
+        // isSpent=false (see createStubOracle), so providing any
+        // parseable stateHash is sufficient to reach the restore path.
+        sdkData: JSON.stringify({ stateHash: 'abcd1234' }),
       }),
     );
 
@@ -421,5 +427,231 @@ describe('PaymentsModule.detectOrphanSpendingTokens — orphanAutoRecovery (Issu
     expect(
       asInternals(payments).tokens.get('orphan-already-restored')?.status,
     ).toBe('confirmed');
+  });
+});
+
+// ===========================================================================
+// OUTBOX-SEND-FOLLOWUPS item #1 — aggregator cross-check before restore
+// ===========================================================================
+//
+// Before flipping a transferring token's status to 'confirmed',
+// defaultOrphanRecovery must verify with the aggregator that the
+// spending commit never landed. The cross-check has four branches:
+//
+//   1. aggregator.isSpent(stateHash) === false → safe to restore.
+//      Covered by the "flag ON + orphan present" happy-path test above
+//      (which now provides sdkData with a stateHash and relies on the
+//      stub oracle's default isSpent=false).
+//   2. aggregator.isSpent(stateHash) === true → unsafe; the commit
+//      landed and a local restore would diverge from the aggregator.
+//      Escalate to 'manual'.
+//   3. oracle.isSpent throws → fail-closed; we cannot rule out the
+//      spent case. Escalate to 'manual'.
+//   4. token has no parseable stateHash on sdkData → fail-closed; we
+//      cannot perform the cross-check at all. Escalate to 'manual'.
+//
+// All four manual paths must NOT mutate the token's status and must
+// NOT call this.save(). The happy-path test verifies the positive
+// branch; the three below cover (2), (3), and (4).
+
+interface DefaultOrphanRecoveryInternals {
+  defaultOrphanRecovery: (finding: {
+    tokenId: string;
+    coinId: string;
+    amount: string;
+    lastUpdatedAt: number;
+    detectedAt: number;
+  }) => Promise<'recovered' | 'manual'>;
+  save: () => Promise<void>;
+  deps: { oracle: { isSpent: ReturnType<typeof vi.fn> } };
+}
+
+describe('defaultOrphanRecovery — aggregator cross-check (OUTBOX-SEND-FOLLOWUPS item #1)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("aggregator reports source state spent → 'manual', token left in 'transferring', save() NOT called", async () => {
+    const emit = vi.fn();
+    const payments = createPaymentsModule({
+      debug: false,
+      autoSync: false,
+      features: {
+        recoveryWorker: false,
+        finalizationWorker: false,
+        orphanAutoRecovery: true,
+      },
+    });
+    const deps = createPaymentsDeps();
+    // Override the oracle's isSpent to report SPENT — simulates the
+    // unsafe race where the spending commit landed but the OUTBOX
+    // write crashed after.
+    (deps.oracle as unknown as { isSpent: ReturnType<typeof vi.fn> }).isSpent =
+      vi.fn().mockResolvedValue(true);
+    payments.initialize({ ...deps, emitEvent: emit });
+    const { outboxWriter, sentLedgerWriter } = createWriterPair();
+    payments.installOutboxWriter(outboxWriter);
+    payments.installSentLedgerWriter(sentLedgerWriter);
+    asInternals(payments).tokens.set(
+      'orphan-spent-on-agg',
+      makeToken('orphan-spent-on-agg', 'transferring', {
+        sdkData: JSON.stringify({ stateHash: 'aabbccdd' }),
+      }),
+    );
+
+    // Spy save so we can assert it was not called on the manual path.
+    const internals = payments as unknown as DefaultOrphanRecoveryInternals;
+    const saveSpy = vi.spyOn(internals, 'save').mockResolvedValue();
+
+    const outcome = await internals.defaultOrphanRecovery({
+      tokenId: 'orphan-spent-on-agg',
+      coinId: 'UCT',
+      amount: '100',
+      lastUpdatedAt: 0,
+      detectedAt: 0,
+    });
+
+    expect(outcome).toBe('manual');
+    expect(internals.deps.oracle.isSpent).toHaveBeenCalledWith('aabbccdd');
+    expect(saveSpy).not.toHaveBeenCalled();
+    // Token status untouched.
+    expect(
+      asInternals(payments).tokens.get('orphan-spent-on-agg')?.status,
+    ).toBe('transferring');
+  });
+
+  it("oracle.isSpent throws → 'manual' (fail-closed), token left in 'transferring', save() NOT called", async () => {
+    const emit = vi.fn();
+    const payments = createPaymentsModule({
+      debug: false,
+      autoSync: false,
+      features: {
+        recoveryWorker: false,
+        finalizationWorker: false,
+        orphanAutoRecovery: true,
+      },
+    });
+    const deps = createPaymentsDeps();
+    (deps.oracle as unknown as { isSpent: ReturnType<typeof vi.fn> }).isSpent =
+      vi.fn().mockRejectedValue(new Error('aggregator RPC unreachable'));
+    payments.initialize({ ...deps, emitEvent: emit });
+    const { outboxWriter, sentLedgerWriter } = createWriterPair();
+    payments.installOutboxWriter(outboxWriter);
+    payments.installSentLedgerWriter(sentLedgerWriter);
+    asInternals(payments).tokens.set(
+      'orphan-rpc-error',
+      makeToken('orphan-rpc-error', 'transferring', {
+        sdkData: JSON.stringify({ stateHash: '99887766' }),
+      }),
+    );
+
+    const internals = payments as unknown as DefaultOrphanRecoveryInternals;
+    const saveSpy = vi.spyOn(internals, 'save').mockResolvedValue();
+
+    const outcome = await internals.defaultOrphanRecovery({
+      tokenId: 'orphan-rpc-error',
+      coinId: 'UCT',
+      amount: '100',
+      lastUpdatedAt: 0,
+      detectedAt: 0,
+    });
+
+    expect(outcome).toBe('manual');
+    expect(internals.deps.oracle.isSpent).toHaveBeenCalledWith('99887766');
+    expect(saveSpy).not.toHaveBeenCalled();
+    expect(asInternals(payments).tokens.get('orphan-rpc-error')?.status).toBe(
+      'transferring',
+    );
+  });
+
+  it("token has no parseable stateHash → 'manual' (cannot cross-check), save() and oracle NOT called", async () => {
+    const emit = vi.fn();
+    const payments = createPaymentsModule({
+      debug: false,
+      autoSync: false,
+      features: {
+        recoveryWorker: false,
+        finalizationWorker: false,
+        orphanAutoRecovery: true,
+      },
+    });
+    const deps = createPaymentsDeps();
+    payments.initialize({ ...deps, emitEvent: emit });
+    const { outboxWriter, sentLedgerWriter } = createWriterPair();
+    payments.installOutboxWriter(outboxWriter);
+    payments.installSentLedgerWriter(sentLedgerWriter);
+    // Token has no sdkData → extractStateHashFromSdkData returns ''.
+    asInternals(payments).tokens.set(
+      'orphan-no-state-hash',
+      makeToken('orphan-no-state-hash', 'transferring'),
+    );
+
+    const internals = payments as unknown as DefaultOrphanRecoveryInternals;
+    const saveSpy = vi.spyOn(internals, 'save').mockResolvedValue();
+
+    const outcome = await internals.defaultOrphanRecovery({
+      tokenId: 'orphan-no-state-hash',
+      coinId: 'UCT',
+      amount: '100',
+      lastUpdatedAt: 0,
+      detectedAt: 0,
+    });
+
+    expect(outcome).toBe('manual');
+    // Cross-check is skipped entirely — never reaches the aggregator.
+    expect(internals.deps.oracle.isSpent).not.toHaveBeenCalled();
+    expect(saveSpy).not.toHaveBeenCalled();
+    expect(
+      asInternals(payments).tokens.get('orphan-no-state-hash')?.status,
+    ).toBe('transferring');
+  });
+
+  it("aggregator reports unspent + stateHash present → 'recovered', save() called once", async () => {
+    // Mirror of the happy-path test in the wrapper describe block, but
+    // calling defaultOrphanRecovery directly so we can assert the
+    // oracle and save call sites precisely.
+    const emit = vi.fn();
+    const payments = createPaymentsModule({
+      debug: false,
+      autoSync: false,
+      features: {
+        recoveryWorker: false,
+        finalizationWorker: false,
+        orphanAutoRecovery: true,
+      },
+    });
+    const deps = createPaymentsDeps();
+    // Stub default is isSpent → false; make it explicit here so the
+    // assertion below has a stable call-arg expectation.
+    (deps.oracle as unknown as { isSpent: ReturnType<typeof vi.fn> }).isSpent =
+      vi.fn().mockResolvedValue(false);
+    payments.initialize({ ...deps, emitEvent: emit });
+    const { outboxWriter, sentLedgerWriter } = createWriterPair();
+    payments.installOutboxWriter(outboxWriter);
+    payments.installSentLedgerWriter(sentLedgerWriter);
+    asInternals(payments).tokens.set(
+      'orphan-safe',
+      makeToken('orphan-safe', 'transferring', {
+        sdkData: JSON.stringify({ stateHash: '11223344' }),
+      }),
+    );
+
+    const internals = payments as unknown as DefaultOrphanRecoveryInternals;
+    const saveSpy = vi.spyOn(internals, 'save').mockResolvedValue();
+
+    const outcome = await internals.defaultOrphanRecovery({
+      tokenId: 'orphan-safe',
+      coinId: 'UCT',
+      amount: '100',
+      lastUpdatedAt: 0,
+      detectedAt: 0,
+    });
+
+    expect(outcome).toBe('recovered');
+    expect(internals.deps.oracle.isSpent).toHaveBeenCalledWith('11223344');
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+    expect(asInternals(payments).tokens.get('orphan-safe')?.status).toBe(
+      'confirmed',
+    );
   });
 });

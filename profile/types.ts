@@ -26,6 +26,29 @@ import type { ProfilePointerLayer } from './aggregator-pointer';
  * provided; new callers SHOULD pass `dbNameOverride` (computed ONCE
  * from a wipeable Uint8Array, with the bytes zeroized after derivation).
  */
+/**
+ * OUTBOX-SEND-FOLLOWUPS item #4 — result of one
+ * `gcExpiredTombstones()` sweep on a profile writer (OutboxWriter or
+ * SentLedgerWriter). Returned to callers for diagnostics.
+ *
+ *  - `scanned` — total tombstones observed under the writer's prefix.
+ *  - `purged`  — tombstones whose `(now - deletedAt) > retentionMs`
+ *                AND whose `db.del()` succeeded; storage reclaimed.
+ *  - `kept`    — tombstones inside the retention window, OR
+ *                tombstones whose `db.del()` threw (best-effort sweep
+ *                preserves the marker for the next cycle).
+ *  - `skipped` — `true` when the prefix scan itself failed (DB
+ *                unavailable); counters are all zero in that case.
+ *
+ * Invariant: `scanned === purged + kept` when `skipped === false`.
+ */
+export interface TombstoneGcResult {
+  readonly scanned: number;
+  readonly purged: number;
+  readonly kept: number;
+  readonly skipped: boolean;
+}
+
 export interface OrbitDbConfig {
   /**
    * @deprecated — pass `dbNameOverride` instead. JS strings cannot be

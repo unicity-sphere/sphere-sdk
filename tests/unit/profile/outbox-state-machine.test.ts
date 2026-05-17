@@ -50,16 +50,18 @@ describe('outbox-state-machine — §7.0 table size', () => {
     //     pinned→failed-permanent (T.4.A; permanent pin failure),     (3)
     //   sending→delivered, sending→delivered-instant,
     //     sending→failed-transient,                                   (3)
-    //   delivered→expired,                                            (1)
-    //   delivered-instant→finalizing,                                 (1)
+    //   delivered→expired,
+    //     delivered→sending (#166 retention re-publish),              (2)
+    //   delivered-instant→finalizing,
+    //     delivered-instant→sending (#166 retention re-publish),      (2)
     //   finalizing→finalized, finalizing→failed-permanent,
     //     finalizing→failed-transient,                                (3)
     //   failed-transient→sending, failed-transient→failed-permanent,  (2)
     //   failed-permanent→finalizing (override),                       (1)
     //   finalized→expired                                             (1)
     //   ────────────────────────────────────────────────────────────
-    //   17 rows total
-    expect(ALLOWED_TRANSITIONS).toHaveLength(17);
+    //   19 rows total
+    expect(ALLOWED_TRANSITIONS).toHaveLength(19);
   });
 
   it('every row uses canonical UxfOutboxStatus values on both ends', () => {
@@ -130,7 +132,10 @@ describe('outbox-state-machine — illegal arcs', () => {
     // Backward (no path back from delivered/finalized/expired)
     ['delivered', 'packaging'],
     ['delivered', 'pinned'],
-    ['delivered-instant', 'sending'],
+    // Note: `delivered-instant → sending` and `delivered → sending` are
+    // legal arcs as of OUTBOX-SEND-FOLLOWUPS item #2 (retention re-
+    // publish). They are exercised explicitly by the "every legal arc"
+    // suite above; they no longer belong here.
     ['finalized', 'packaging'],
     ['finalized', 'finalizing'],
     ['finalized', 'sending'],

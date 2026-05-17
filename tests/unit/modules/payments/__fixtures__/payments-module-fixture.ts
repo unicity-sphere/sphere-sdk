@@ -283,6 +283,11 @@ export function createStubOracle(): OracleProvider {
     isConnected: vi.fn().mockReturnValue(true),
     getStatus: vi.fn().mockReturnValue('connected'),
     initialize: vi.fn().mockResolvedValue(undefined),
+    // Default to "unspent" so flows that consult the aggregator
+    // (e.g. defaultOrphanRecovery — OUTBOX-SEND-FOLLOWUPS item #1)
+    // can complete the happy path. Tests that exercise the spent
+    // or RPC-failure branches override this on the returned object.
+    isSpent: vi.fn().mockResolvedValue(false),
   } as unknown as OracleProvider;
 }
 
