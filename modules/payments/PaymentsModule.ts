@@ -177,6 +177,10 @@ import type { OutboxWriter } from '../../profile/outbox-writer';
 import type { SentLedgerWriter } from '../../profile/sent-ledger-writer';
 import type { UxfSentLedgerEntry } from '../../types/uxf-sent';
 import {
+  sweepOrphanSpendingTokens,
+  type OrphanSweepResult,
+} from './transfer/orphan-spending-sweeper';
+import {
   resolveSenderInfoViaBinding,
   type ReresolvedNametagSource,
 } from './transfer/nametag-reresolver';
@@ -2833,6 +2837,41 @@ export class PaymentsModule {
     // periodic retries so tokens don't stay stuck as 'submitted'.
     this.resolveUnconfirmed().catch((err) => logger.debug('Payments', 'resolveUnconfirmed failed', err));
     this.scheduleResolveUnconfirmed();
+
+    // Issue #97 — fire-and-forget orphan sweep. Only runs when BOTH
+    // the OutboxWriter and SentLedgerWriter are installed (the sweeper
+    // self-skips otherwise — see sweepOrphanSpendingTokens for the
+    // rationale). Errors are caught here so a sweep failure cannot
+    // break load() for downstream callers.
+    if (this._outboxWriter !== null && this._sentLedgerWriter !== null) {
+      void this.detectOrphanSpendingTokens()
+        .then((result) => {
+          if (result.skipped) {
+            logger.debug('Payments', 'Orphan-spending sweep skipped on load');
+            return;
+          }
+          if (result.orphans.length > 0) {
+            logger.warn(
+              'Payments',
+              `Orphan-spending sweep on load detected ${result.orphans.length} ` +
+                `orphan token(s) out of ${result.scannedTransferringCount} 'transferring' ` +
+                `(known via OUTBOX/SENT: ${result.knownTokenIdsCount}). ` +
+                `transfer:orphan-spending-detected events were emitted; operator intervention required.`,
+            );
+          } else {
+            logger.debug(
+              'Payments',
+              `Orphan-spending sweep on load: clean (${result.scannedTransferringCount} 'transferring' scanned, ${result.knownTokenIdsCount} known)`,
+            );
+          }
+        })
+        .catch((err) => {
+          logger.warn(
+            'Payments',
+            `Orphan-spending sweep on load failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+    }
   }
 
   /**
@@ -2909,6 +2948,38 @@ export class PaymentsModule {
    */
   installSentLedgerWriter(writer: SentLedgerWriter | null): void {
     this._sentLedgerWriter = writer;
+  }
+
+  /**
+   * Issue #97 — Run the orphan-spending-tx sweeper once. Detects
+   * tokens with an in-flight spending transaction (status
+   * `'transferring'`) that are NOT referenced by any live OUTBOX
+   * entry AND NOT recorded in the SENT ledger. Such tokens indicate
+   * a crash between commit (Step 1) and outbox-persist (Step 2) of
+   * the canonical send flow.
+   *
+   * **Phase 1 (this release)** — detection + diagnostic event only.
+   * Auto-recovery (re-package + re-pin + re-queue) is gated to a
+   * follow-up wave because the safety surface for silent miss-routing
+   * is too large to ship without dedicated tests. Operators triaging
+   * a `transfer:orphan-spending-detected` event can manually re-send
+   * the affected token once they confirm the recipient.
+   *
+   * **Auto-invocation** — this method runs once at the tail of
+   * `load()` when BOTH the OutboxWriter AND the SentLedgerWriter are
+   * installed (fire-and-forget; errors are logged but never break
+   * load).
+   *
+   * **No-op return** — when either writer is missing, the sweep is
+   * skipped and `skipped: true` is returned (no orphans, no events).
+   */
+  async detectOrphanSpendingTokens(): Promise<OrphanSweepResult> {
+    return sweepOrphanSpendingTokens({
+      tokens: this.tokens.values(),
+      outboxWriter: this._outboxWriter,
+      sentLedgerWriter: this._sentLedgerWriter,
+      emit: this.deps!.emitEvent,
+    });
   }
 
   installOutboxWriter(writer: OutboxWriter | null): void {
