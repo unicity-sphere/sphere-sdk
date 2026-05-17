@@ -296,6 +296,18 @@ export interface OutboxTransitionPatch {
   readonly error?: string;
   /** Optional — bumped by the worker on submit retries. */
   readonly submitRetryCount?: number;
+  /**
+   * Issue #166 P2 #3 — Nostr event id returned by the relay's OK ack.
+   * Captured at the `sending → delivered{,-instant}` arc and persisted
+   * to the OUTBOX entry. Propagates to SENT via
+   * {@link PaymentsModule.writeSentEntryFromOutbox} so the
+   * `NostrPersistenceVerifier` worker can re-query the relay later to
+   * detect retention drops.
+   *
+   * Optional — pre-#166 entries lacked this field; the SENT type
+   * guard accepts `undefined` here as the legacy default.
+   */
+  readonly nostrEventId?: string;
 }
 
 /**
@@ -1041,10 +1053,15 @@ export async function sendConservativeUxf(
     // 'sending' commit has hit OrbitDB.
     // -----------------------------------------------------------------
     result.status = 'submitted';
+    // Issue #166 P2 #3 — capture the Nostr event id returned by the
+    // relay's OK ack so the post-publish `delivered` transition can
+    // persist it. The verifier worker re-queries by event id later to
+    // detect retention drops.
+    let nostrEventId: string | undefined;
     try {
       // T.2.E widened TokenTransferPayload to UxfTransferPayload; pass
       // the typed payload directly.
-      await deps.transport.sendTokenTransfer(
+      nostrEventId = await deps.transport.sendTokenTransfer(
         recipient.transportPubkey,
         payload,
       );
@@ -1088,7 +1105,16 @@ export async function sendConservativeUxf(
     // -----------------------------------------------------------------
     if (deps.outbox !== undefined) {
       try {
-        await deps.outbox.transition(transferId, { status: 'delivered' });
+        await deps.outbox.transition(transferId, {
+          status: 'delivered',
+          // Issue #166 P2 #3 — propagate the captured event id so the
+          // OUTBOX entry (and via writeSentEntryFromOutbox the SENT
+          // ledger) records the relay's id for later persistence
+          // verification. Omitted when undefined.
+          ...(typeof nostrEventId === 'string' && nostrEventId.length > 0
+            ? { nostrEventId }
+            : {}),
+        });
       } catch {
         // The wire publish succeeded; outbox post-write is best-effort.
         // The merger / retention path repairs lingering 'sending'

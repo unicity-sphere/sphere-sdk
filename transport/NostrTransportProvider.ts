@@ -2074,6 +2074,41 @@ export class NostrTransportProvider implements TransportProvider {
     }
   }
 
+  /**
+   * Issue #166 P2 #3 — Verify a previously published TOKEN_TRANSFER
+   * event is still persisted by querying the relay for its event id.
+   *
+   * Implements the {@link TransportProvider.verifyTokenTransferRetained}
+   * contract: NEVER throws — converts query failures (no connection,
+   * timeout, malformed response) to `'unverifiable'`. The verifier
+   * worker treats `'unverifiable'` as "retry next cycle"; only
+   * `'missing'` triggers a retention-warning event.
+   */
+  async verifyTokenTransferRetained(
+    eventId: string,
+  ): Promise<'retained' | 'missing' | 'unverifiable'> {
+    if (typeof eventId !== 'string' || eventId.length === 0) {
+      // Defense-in-depth: empty id would query every event on the
+      // relay (huge response). Treat as unverifiable.
+      return 'unverifiable';
+    }
+    if (!this.nostrClient?.isConnected()) {
+      return 'unverifiable';
+    }
+    try {
+      const found = await this.queryEvents({
+        ids: [eventId],
+        limit: 1,
+      });
+      return found.length > 0 ? 'retained' : 'missing';
+    } catch {
+      // Any query throw — relay timeout, lost connection mid-query,
+      // unparseable response — degrades to unverifiable so the worker
+      // does not false-positive a retention warning.
+      return 'unverifiable';
+    }
+  }
+
   async fetchPendingEvents(): Promise<void> {
     if (!this.nostrClient?.isConnected() || !this.keyManager) {
       throw new SphereError('Transport not connected', 'TRANSPORT_ERROR');

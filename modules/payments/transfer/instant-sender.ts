@@ -729,6 +729,15 @@ interface OutboxBuildArgs {
   readonly memo: string | undefined;
   readonly outstandingRequestIds: ReadonlyArray<string>;
   readonly createdAt: number;
+  /**
+   * Issue #166 P2 #3 — captured Nostr event id (filled by the
+   * orchestrator AFTER `transport.sendTokenTransfer` returns).
+   * Threaded into the `delivered-instant` outbox record so the
+   * SENT-ledger write picks it up via writeSentEntryFromOutbox.
+   * Undefined for pre-delivery statuses (`packaging`, `pinned`,
+   * `sending`).
+   */
+  readonly nostrEventId?: string;
 }
 
 function buildOutboxRecord(
@@ -751,6 +760,10 @@ function buildOutboxRecord(
     outstandingRequestIds: args.outstandingRequestIds,
     completedRequestIds: [],
     ...(args.memo !== undefined ? { memo: args.memo } : {}),
+    // Issue #166 P2 #3 — Nostr event id (delivered-instant only).
+    ...(typeof args.nostrEventId === 'string' && args.nostrEventId.length > 0
+      ? { nostrEventId: args.nostrEventId }
+      : {}),
     createdAt: args.createdAt,
     updatedAt: now,
     submitRetryCount: 0,
@@ -1216,8 +1229,12 @@ export async function sendInstantUxf(
     // Step 12: publish via transport.
     // -----------------------------------------------------------------
     result.status = 'submitted';
+    // Issue #166 P2 #3 — capture the Nostr event id returned by the
+    // relay's OK ack so the `delivered-instant` outbox commit can
+    // persist it.
+    let nostrEventId: string | undefined;
     try {
-      await deps.transport.sendTokenTransfer(
+      nostrEventId = await deps.transport.sendTokenTransfer(
         recipient.transportPubkey,
         payload,
       );
@@ -1253,8 +1270,18 @@ export async function sendInstantUxf(
     // Step 13: outbox `delivered-instant` AFTER transport ack.
     // -----------------------------------------------------------------
     if (deps.outbox !== undefined) {
+      // Issue #166 P2 #3 — fold the captured event id into the
+      // delivered-instant record. Earlier statuses (`packaging`,
+      // `pinned`, `sending`) do NOT carry it because publish hasn't
+      // happened yet.
+      const argsAtDelivery: OutboxBuildArgs = {
+        ...argsAfterDelivery,
+        ...(typeof nostrEventId === 'string' && nostrEventId.length > 0
+          ? { nostrEventId }
+          : {}),
+      };
       await deps.outbox.write(
-        buildOutboxRecord(argsAfterDelivery, 'delivered-instant', Date.now()),
+        buildOutboxRecord(argsAtDelivery, 'delivered-instant', Date.now()),
       );
     }
 
