@@ -129,6 +129,16 @@ import {
   SentReconciliationWorker,
   type SentReconciliationWorkerDeps,
 } from './transfer/sent-reconciliation-worker';
+// Issue #166 P2 #3 — Nostr persistence verification worker. Auto-installed
+// in `initialize()` when `features.nostrPersistenceVerifier` is true
+// (default-OFF — adds relay query traffic; opt-in until soak-tested).
+// Periodically re-queries the relay for SENT entries' Nostr event ids to
+// detect retention drops (events accepted at publish but later evicted).
+import {
+  NostrPersistenceVerifier,
+  type NostrPersistenceVerifierDeps,
+  type VerifyOutcome,
+} from './transfer/nostr-persistence-verifier';
 // Phase 9.6.D — sender-side §6.1 finalization worker. Auto-installed in
 // `initialize()` when `features.finalizationWorker` is true (default-ON
 // when `senderUxf` is true). Consumer-installed workers (via
@@ -1013,6 +1023,26 @@ export interface UxfTransferFeatures {
    */
   readonly sentReconciliationWorker?: boolean;
   /**
+   * Issue #166 P2 #3 — Nostr persistence verification worker.
+   *
+   * Default `false` (opt-in). When `true`, auto-installs and starts a
+   * {@link NostrPersistenceVerifier} in {@link PaymentsModule.initialize}
+   * that periodically re-queries the relay set for SENT-ledger entries'
+   * Nostr event ids to detect retention drops (events accepted at
+   * publish but later evicted by relay retention policy / restart /
+   * segregation).
+   *
+   * Default-OFF because the worker adds relay query traffic
+   * proportional to SENT volume. Production deployments that want
+   * retention monitoring should flip the flag explicitly after
+   * confirming their relay set tolerates the extra query load.
+   *
+   * The worker self-skips when no SENT entries have `nostrEventId`
+   * set (legacy entries pre-#166 P2 #3 wiring) — so flipping the flag
+   * is safe even on wallets with no eligible entries; it just no-ops.
+   */
+  readonly nostrPersistenceVerifier?: boolean;
+  /**
    * Phase 9.6.D — when `true` (default when `senderUxf` is on),
    * auto-install and start a {@link FinalizationWorkerSender} in
    * {@link PaymentsModule.initialize} so instant-mode sends drive the
@@ -1469,6 +1499,14 @@ export class PaymentsModule {
       // legacy-only wallets (it just no-ops every cycle).
       sentReconciliationWorker:
         config?.features?.sentReconciliationWorker ?? true,
+      // Issue #166 P2 #3 — Nostr persistence verification worker.
+      // Default-OFF (opt-in): the worker periodically re-queries the
+      // relay set for SENT-ledger entries' Nostr event ids to detect
+      // retention drops. Adds relay query traffic proportional to
+      // eligible SENT volume; flip ON after confirming the relay set
+      // tolerates the load.
+      nostrPersistenceVerifier:
+        config?.features?.nostrPersistenceVerifier ?? false,
       // Phase 9.6.D — sender-side §6.1 finalization worker. Default-ON
       // when senderUxf is on: drives instant-mode sends through the full
       // submit/poll cycle so `transfer:confirmed` fires once the
@@ -1820,6 +1858,63 @@ export class PaymentsModule {
     ) {
       // Pre-installed by the bootstrap layer — start it.
       this.sentReconciliationWorker.start();
+    }
+
+    // Issue #166 P2 #3 — auto-install the Nostr persistence
+    // verification worker. Mirrors the recovery / reconciliation
+    // worker patterns above. Default-OFF feature gate; when ON the
+    // worker self-skips entries that lack `nostrEventId` (legacy
+    // SENT entries from before the dispatcher capture wiring), and
+    // routes verify() through transport.verifyTokenTransferRetained
+    // when the transport implements it (else 'unverifiable' which
+    // never produces a false-positive warning).
+    if (
+      this.features.nostrPersistenceVerifier &&
+      this.nostrPersistenceVerifier === null
+    ) {
+      const transport = this.deps!.transport;
+      const sphereEmit = this.deps!.emitEvent;
+      const verifierDeps: NostrPersistenceVerifierDeps = {
+        sentProvider: (): Pick<SentLedgerWriter, 'readAll'> | null =>
+          this._sentLedgerWriter,
+        verify: async (entry: UxfSentLedgerEntry): Promise<VerifyOutcome> => {
+          if (
+            typeof entry.nostrEventId !== 'string' ||
+            entry.nostrEventId.length === 0
+          ) {
+            return 'unverifiable';
+          }
+          if (typeof transport.verifyTokenTransferRetained !== 'function') {
+            // Transport does not implement the optional verify
+            // method — the worker can't make progress here, but
+            // 'unverifiable' means "retry next cycle" so no false
+            // warnings are emitted.
+            return 'unverifiable';
+          }
+          try {
+            return await transport.verifyTokenTransferRetained(
+              entry.nostrEventId,
+            );
+          } catch {
+            // The transport contract says "never throw," but
+            // defense-in-depth: a throw here degrades to
+            // unverifiable rather than missing.
+            return 'unverifiable';
+          }
+        },
+        emit: sphereEmit,
+      };
+      this.nostrPersistenceVerifier = new NostrPersistenceVerifier(verifierDeps);
+      this.nostrPersistenceVerifier.start();
+      logger.debug(
+        'Payments',
+        'Default NostrPersistenceVerifier auto-installed (nostrPersistenceVerifier opt-in flag ON)',
+      );
+    } else if (
+      this.features.nostrPersistenceVerifier &&
+      this.nostrPersistenceVerifier !== null
+    ) {
+      this.nostrPersistenceVerifier.start();
     }
 
     // T.3.E — auto-install a default IngestWorkerPool when recipientUxf
@@ -3124,6 +3219,15 @@ export class PaymentsModule {
         deliveryMethod: entry.deliveryMethod,
         mode: entry.mode,
         sentAt: Date.now(),
+        // Issue #166 P2 #3 — propagate nostrEventId from OUTBOX to
+        // SENT so the NostrPersistenceVerifier worker can re-query
+        // the relay by event id later. Omitted when the OUTBOX entry
+        // lacks the field (pre-P2 #3 entries or paths that haven't
+        // wired the capture yet) so the SENT type guard's
+        // "undefined OR non-empty string" rule holds.
+        ...(typeof entry.nostrEventId === 'string' && entry.nostrEventId.length > 0
+          ? { nostrEventId: entry.nostrEventId }
+          : {}),
       });
       return 'success';
     } catch (sentErr) {
@@ -3372,6 +3476,8 @@ export class PaymentsModule {
   private sendingRecoveryWorker: SendingRecoveryWorker | null = null;
   /** @internal — auto-installed or set by `installSentReconciliationWorker()`. Issue #166 P2 #4. */
   private sentReconciliationWorker: SentReconciliationWorker | null = null;
+  /** @internal — auto-installed or set by `installNostrPersistenceVerifier()`. Issue #166 P2 #3. */
+  private nostrPersistenceVerifier: NostrPersistenceVerifier | null = null;
   /** @internal — auto-installed or set by `installFinalizationWorkerSender()`. Phase 9.6.D. */
   private finalizationWorkerSender: FinalizationWorkerSender | null = null;
   /**
@@ -3801,6 +3907,28 @@ export class PaymentsModule {
   }
 
   /**
+   * Issue #166 P2 #3 — install the Nostr persistence verification
+   * worker. Idempotent: a second call stops the previous worker
+   * (await its in-flight scan) and swaps in the new instance. If
+   * `features.nostrPersistenceVerifier` is `true`, the next
+   * `initialize()` call starts the new worker; if the module is
+   * already initialized, the worker is started immediately.
+   *
+   * **No-op when `features.nostrPersistenceVerifier === false`** —
+   * installing is cheap (no scan loop runs until `start()`); the gate
+   * is the flag.
+   */
+  installNostrPersistenceVerifier(worker: NostrPersistenceVerifier): void {
+    if (this.nostrPersistenceVerifier !== null) {
+      void this.nostrPersistenceVerifier.stop().catch(() => undefined);
+    }
+    this.nostrPersistenceVerifier = worker;
+    if (this.deps !== null && this.features.nostrPersistenceVerifier) {
+      worker.start();
+    }
+  }
+
+  /**
    * Phase 9.6.D — install the sender-side finalization worker.
    *
    * Idempotent: a second call stops the previous worker (fire-and-
@@ -4062,6 +4190,12 @@ export class PaymentsModule {
     if (this.sentReconciliationWorker) {
       void this.sentReconciliationWorker.stop().catch(() => undefined);
       this.sentReconciliationWorker = null;
+    }
+
+    // Issue #166 P2 #3 — stop the Nostr persistence verifier.
+    if (this.nostrPersistenceVerifier) {
+      void this.nostrPersistenceVerifier.stop().catch(() => undefined);
+      this.nostrPersistenceVerifier = null;
     }
 
     // Task #169 — abort the worker AbortController BEFORE stopping the
@@ -10860,6 +10994,12 @@ export class PaymentsModule {
               ...(typeof patch.error === 'string' ? { error: patch.error } : {}),
               ...(typeof patch.submitRetryCount === 'number'
                 ? { submitRetryCount: patch.submitRetryCount }
+                : {}),
+              // Issue #166 P2 #3 — persist the Nostr event id when the
+              // dispatcher supplies it (sending → delivered arc).
+              ...(typeof patch.nostrEventId === 'string' &&
+              patch.nostrEventId.length > 0
+                ? { nostrEventId: patch.nostrEventId }
                 : {}),
               updatedAt: Date.now(),
             }));

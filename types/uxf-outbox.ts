@@ -309,6 +309,24 @@ export interface UxfTransferOutboxEntry {
    * recipient side.
    */
   readonly pollStartedAt?: number;
+
+  /**
+   * Issue #166 P2 #3 — Nostr event id returned by the relay's OK ack
+   * after `transport.sendTokenTransfer()` succeeds. Captured at the
+   * `sending → delivered{,-instant}` arc and propagated to the SENT
+   * ledger via {@link writeSentEntryFromOutbox}.
+   *
+   * Powers the {@link NostrPersistenceVerifier} worker (default OFF
+   * via `features.nostrPersistenceVerifier`), which periodically
+   * re-queries the relay by event id to detect retention drops —
+   * closing the "relay ack ≠ persistence" gap left by the
+   * round-2 steelman fix (PR #97 / `fcf1d53`).
+   *
+   * Backward-compat: optional; entries written before P2 #3 wiring
+   * lacked this field and continue to validate via the type guard
+   * (which accepts missing OR non-empty string).
+   */
+  readonly nostrEventId?: string;
 }
 
 // =============================================================================
@@ -369,6 +387,15 @@ export function isUxfTransferOutboxEntry(
   if (typeof obj.proofErrorCount !== 'number') return false;
   if (!Number.isInteger(obj.createdAt) || (obj.createdAt as number) < 0) return false;
   if (!Number.isInteger(obj.updatedAt) || (obj.updatedAt as number) < 0) return false;
+  // Issue #166 P2 #3 — when nostrEventId is present (optional field),
+  // require a non-empty string. Empty string is invalid because the
+  // verifier worker uses it as a query key; an empty key would query
+  // every event on the relay.
+  if (obj.nostrEventId !== undefined) {
+    if (typeof obj.nostrEventId !== 'string' || obj.nostrEventId.length === 0) {
+      return false;
+    }
+  }
   return true;
 }
 

@@ -166,5 +166,14 @@ export function isUxfSentLedgerEntry(value: unknown): value is UxfSentLedgerEntr
   // installOutboxWriter hydration coalesce).
   if (!Number.isInteger(v.sentAt) || (v.sentAt as number) < 0) return false;
   if (!Number.isInteger(v.lamport) || (v.lamport as number) < 0) return false;
+  // Issue #166 P2 #3 — when nostrEventId is present (optional field),
+  // require a non-empty string. Empty string is invalid because the
+  // verifier worker uses it as a query key; an empty key would query
+  // every event on the relay. Same shape rule as the OUTBOX guard.
+  if (v.nostrEventId !== undefined) {
+    if (typeof v.nostrEventId !== 'string' || (v.nostrEventId as string).length === 0) {
+      return false;
+    }
+  }
   return true;
 }

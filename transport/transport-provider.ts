@@ -293,6 +293,47 @@ export interface TransportProvider extends BaseProvider {
   fetchPendingEvents?(): Promise<void>;
 
   /**
+   * Issue #166 P2 #3 — Re-query the underlying transport (e.g. Nostr
+   * relay set) to verify that a previously published event identified
+   * by `eventId` is still persisted / available for delivery.
+   *
+   * Used by the {@link NostrPersistenceVerifier} worker to detect
+   * relay retention drops AFTER the immediate post-publish
+   * verification window has passed (the `publishWithVerification` path
+   * in NostrTransportProvider catches losses within the first second;
+   * this method catches longer-term eviction or relay-segregation
+   * failures minutes to hours later).
+   *
+   * Return semantics:
+   *  - `'retained'` — the event is present on at least one queried
+   *    relay. Worker marks the SENT entry as verified and skips it on
+   *    subsequent cycles.
+   *  - `'missing'`  — the event is NOT present on any queried relay
+   *    despite a successful past publish. Worker emits
+   *    `transfer:retention-warning`. The bundle is still
+   *    content-addressed via `bundleCid` so the recipient's replay-LRU
+   *    deduplicates on re-publish, but THIS PR does not attempt
+   *    re-publication — that is gated to a follow-up wave because the
+   *    safety surface (preserved bundle data, recipient pubkey, key
+   *    rotation interaction) is too large to ship as a backfill.
+   *  - `'unverifiable'` — the query itself failed (relay timeout,
+   *    connection lost, malformed response). Worker leaves the entry
+   *    untouched and retries next cycle. NOT treated as missing
+   *    because a transient query failure must not produce false
+   *    `retention-warning` events.
+   *
+   * Implementations SHOULD make this method best-effort and never
+   * throw — convert exceptions to `'unverifiable'` internally.
+   *
+   * @param eventId  The relay-assigned event id returned by
+   *                 {@link sendTokenTransfer}.
+   * @returns        See above.
+   */
+  verifyTokenTransferRetained?(
+    eventId: string,
+  ): Promise<'retained' | 'missing' | 'unverifiable'>;
+
+  /**
    * Register a handler to be called when the chat subscription receives EOSE
    * (End Of Stored Events), indicating that historical DMs have been delivered.
    * The handler fires at most once per subscription lifecycle.

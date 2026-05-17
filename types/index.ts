@@ -575,6 +575,7 @@ export type SphereEventType =
   | 'transfer:orphan-spending-detected'
   | 'transfer:sent-reconciliation-recovered'
   | 'transfer:sent-reconciliation-failed'
+  | 'transfer:retention-warning'
   | 'payment_request:incoming'
   | 'payment_request:accepted'
   | 'payment_request:rejected'
@@ -1135,6 +1136,34 @@ export interface SphereEventMap {
     readonly consecutiveFailures: number;
     readonly lastError: string;
     readonly failedAt: number;
+  };
+  /**
+   * Issue #166 P2 #3 — A previously delivered TOKEN_TRANSFER event is
+   * no longer retained on the queried relay set. The recipient may
+   * have already received the bundle (Nostr publish + relay ack
+   * succeeded earlier), but the event is now absent from the relay's
+   * persistent store — likely due to retention policy eviction, relay
+   * restart, or relay-segregation.
+   *
+   * The {@link NostrPersistenceVerifier} worker emits this once per
+   * SENT entry per process lifetime (in-memory tracking; a process
+   * restart re-arms the check).
+   *
+   * Payload fields:
+   *  - `sentId`        — the SENT-ledger entry id (= original OUTBOX id)
+   *  - `nostrEventId`  — the event id that's no longer retained
+   *  - `bundleCid`     — the content-addressed bundle CID
+   *  - `tokenIds`      — the bundle's genesis token ids
+   *  - `recipientTransportPubkey` — recipient pubkey from SENT
+   *  - `detectedAt`    — wall-clock ms timestamp
+   */
+  'transfer:retention-warning': {
+    readonly sentId: string;
+    readonly nostrEventId: string;
+    readonly bundleCid: string;
+    readonly tokenIds: ReadonlyArray<string>;
+    readonly recipientTransportPubkey: string;
+    readonly detectedAt: number;
   };
   'payment_request:incoming': IncomingPaymentRequest;
   'payment_request:accepted': IncomingPaymentRequest;
