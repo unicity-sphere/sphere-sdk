@@ -158,7 +158,13 @@ export function isUxfSentLedgerEntry(value: unknown): value is UxfSentLedgerEntr
   if (v.mode !== 'conservative' && v.mode !== 'instant' && v.mode !== 'txf') {
     return false;
   }
-  if (typeof v.sentAt !== 'number' || !Number.isFinite(v.sentAt)) return false;
-  if (typeof v.lamport !== 'number' || !Number.isFinite(v.lamport)) return false;
+  // Issue #166 P4 #2 — range tightening. Both `sentAt` (epoch ms) and
+  // `lamport` (logical clock) are non-negative integers by construction.
+  // Reject negatives and non-integers (0.5) so corrupted ledger blobs
+  // are filtered at the schema gate rather than poisoning downstream
+  // comparisons (e.g. `existing.lamport >= e.lamport` in the
+  // installOutboxWriter hydration coalesce).
+  if (!Number.isInteger(v.sentAt) || (v.sentAt as number) < 0) return false;
+  if (!Number.isInteger(v.lamport) || (v.lamport as number) < 0) return false;
   return true;
 }

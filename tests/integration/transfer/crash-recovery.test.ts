@@ -372,7 +372,7 @@ class SimulatedCrash extends Error {
 
 describe('T.6.E — conservative crash between outbox commit and Nostr publish', () => {
   it('persists status="sending" before transport, leaves no transport call on crash', async () => {
-    const addressId = 'addr-alice';
+    const addressId = 'DIRECT_aabbcc_ddeeff';
     const store = new Map<string, Uint8Array>();
     const db = makeInMemoryProfileDb(store);
     const transport = makeRecordingTransport();
@@ -523,7 +523,7 @@ describe('T.6.E — conservative crash between outbox commit and Nostr publish',
 
 describe('T.6.E — conservative crash between Nostr ack and outbox commit', () => {
   it('leaves status="sending" (NOT "delivered") after ack-then-crash; replay-LRU dedupes recipient', async () => {
-    const addressId = 'addr-alice';
+    const addressId = 'DIRECT_aabbcc_ddeeff';
     const store = new Map<string, Uint8Array>();
     const db = makeInMemoryProfileDb(store);
     const transport = makeRecordingTransport();
@@ -637,7 +637,7 @@ describe('T.6.E — conservative crash between Nostr ack and outbox commit', () 
 
 describe('T.6.E — instant crash between outbox commit and Nostr publish', () => {
   it('persists status="sending" before transport; resume re-publishes same bundleCid', async () => {
-    const addressId = 'addr-alice';
+    const addressId = 'DIRECT_aabbcc_ddeeff';
     const store = new Map<string, Uint8Array>();
     const db = makeInMemoryProfileDb(store);
     const transport = makeRecordingTransport();
@@ -733,7 +733,7 @@ describe('T.6.E — instant crash between outbox commit and Nostr publish', () =
 
 describe('T.6.E — control: no fault injection produces a clean delivered entry', () => {
   it('conservative happy path: packaging → sending → delivered', async () => {
-    const addressId = 'addr-alice';
+    const addressId = 'DIRECT_aabbcc_ddeeff';
     const store = new Map<string, Uint8Array>();
     const db = makeInMemoryProfileDb(store);
     const transport = makeRecordingTransport();

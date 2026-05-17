@@ -101,6 +101,14 @@ export class SentLedgerWriter {
         'VALIDATION_ERROR',
       );
     }
+    // Issue #166 P4 #1 — same defense-in-depth as OutboxWriter.
+    // See profile/outbox-writer.ts for the prefix-overlap rationale.
+    if (!/^DIRECT_[0-9a-f]{6}_[0-9a-f]{6}$/.test(options.addressId)) {
+      throw new SphereError(
+        `SentLedgerWriter: addressId must match DIRECT_[0-9a-f]{6}_[0-9a-f]{6} (got: ${options.addressId})`,
+        'VALIDATION_ERROR',
+      );
+    }
     this.db = options.db;
     this.encryptionKey = options.encryptionKey;
     this.addressId = options.addressId;

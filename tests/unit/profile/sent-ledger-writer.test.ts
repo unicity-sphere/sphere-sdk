@@ -341,4 +341,112 @@ describe('SentLedgerWriter (Issue #97)', () => {
     const all = await writer.readAll();
     expect(all.map((e) => e.id)).toEqual(['xfer-1']);
   });
+
+  // -------------------------------------------------------------------------
+  // Issue #166 P4 #1 — addressId shape validation
+  // -------------------------------------------------------------------------
+  describe('addressId shape validation (Issue #166 P4 #1)', () => {
+    it('accepts the canonical DIRECT_[0-9a-f]{6}_[0-9a-f]{6} shape', () => {
+      expect(
+        () =>
+          new SentLedgerWriter({
+            db,
+            encryptionKey: null,
+            addressId: 'DIRECT_aabbcc_ddeeff',
+            lamport,
+          }),
+      ).not.toThrow();
+    });
+
+    it.each([
+      ['DIRECT_a.b_cd', 'dot in first segment'],
+      ['DIRECT_aabbcc_d.eeff', 'dot in last segment'],
+      ['DIRECT_aabbc_ddeeff', 'first segment 5 chars'],
+      ['direct_aabbcc_ddeeff', 'lowercase DIRECT'],
+      ['DIRECT_aabbcZ_ddeeff', 'non-hex char'],
+      ['DIRECT_AABBCC_DDEEFF', 'uppercase hex'],
+      ['DIRECT_aabbcc_ddeeff/', 'trailing slash'],
+      ['addr-alice', 'non-canonical alias'],
+      ['test', 'short ad-hoc id'],
+    ])('rejects %s (%s)', (badId, _label) => {
+      expect(
+        () =>
+          new SentLedgerWriter({
+            db,
+            encryptionKey: null,
+            addressId: badId,
+            lamport,
+          }),
+      ).toThrow(SphereError);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Issue #166 P4 #2 — type-guard range tightening
+  // -------------------------------------------------------------------------
+  describe('isUxfSentLedgerEntry — P4 #2 range tightening', () => {
+    function makeValid(): unknown {
+      return {
+        _schemaVersion: 'uxf-1',
+        id: 'x',
+        tokenIds: ['t'],
+        bundleCid: 'b',
+        recipientTransportPubkey: 'r'.repeat(64),
+        deliveryMethod: 'car-over-nostr',
+        mode: 'conservative',
+        sentAt: 1_700_000_000_000,
+        lamport: 1,
+      };
+    }
+
+    // Wire up isUxfSentLedgerEntry via dynamic import so we don't
+    // pollute the existing top-of-file imports.
+    let isUxfSentLedgerEntry: (v: unknown) => boolean;
+    beforeEach(async () => {
+      const mod = await import('../../../types/uxf-sent.js');
+      isUxfSentLedgerEntry = mod.isUxfSentLedgerEntry;
+    });
+
+    it('accepts 0 for sentAt/lamport (boundary)', () => {
+      expect(
+        isUxfSentLedgerEntry({ ...(makeValid() as object), sentAt: 0, lamport: 0 }),
+      ).toBe(true);
+    });
+
+    it('rejects negative sentAt', () => {
+      expect(
+        isUxfSentLedgerEntry({ ...(makeValid() as object), sentAt: -1 }),
+      ).toBe(false);
+    });
+
+    it('rejects non-integer sentAt (0.5)', () => {
+      expect(
+        isUxfSentLedgerEntry({ ...(makeValid() as object), sentAt: 0.5 }),
+      ).toBe(false);
+    });
+
+    it('rejects negative lamport', () => {
+      expect(
+        isUxfSentLedgerEntry({ ...(makeValid() as object), lamport: -1 }),
+      ).toBe(false);
+    });
+
+    it('rejects non-integer lamport (1.5)', () => {
+      expect(
+        isUxfSentLedgerEntry({ ...(makeValid() as object), lamport: 1.5 }),
+      ).toBe(false);
+    });
+
+    it('rejects NaN lamport', () => {
+      expect(
+        isUxfSentLedgerEntry({ ...(makeValid() as object), lamport: NaN }),
+      ).toBe(false);
+    });
+
+    it('rejects Infinity sentAt', () => {
+      expect(
+        isUxfSentLedgerEntry({ ...(makeValid() as object), sentAt: Infinity }),
+      ).toBe(false);
+    });
+  });
 });

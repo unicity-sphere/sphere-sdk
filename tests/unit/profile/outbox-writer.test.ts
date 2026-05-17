@@ -528,6 +528,61 @@ describe('OutboxWriter — update error paths', () => {
         }),
     ).toThrow(SphereError);
   });
+
+  // Issue #166 P4 #1 — addressId shape validation. The constructor
+  // must reject any string that doesn't match
+  // `^DIRECT_[0-9a-f]{6}_[0-9a-f]{6}$` (the canonical shape from
+  // `constants.ts:getAddressId()`). Defense-in-depth against
+  // key-prefix overlap (e.g. `DIRECT_a.b_c` extends prefix into
+  // adjacent collections).
+  describe('addressId shape validation (Issue #166 P4 #1)', () => {
+    it('accepts the canonical DIRECT_[0-9a-f]{6}_[0-9a-f]{6} shape', () => {
+      expect(
+        () =>
+          new OutboxWriter({
+            db: createMockDb(),
+            encryptionKey: null,
+            addressId: 'DIRECT_aabbcc_ddeeff',
+            lamport: new Lamport(),
+          }),
+      ).not.toThrow();
+    });
+
+    it.each([
+      // The load-bearing case from the issue: dot injection.
+      ['DIRECT_a.b_cd', 'dot in first segment'],
+      ['DIRECT_aabbcc_d.eeff', 'dot in last segment'],
+      // Wrong segment length.
+      ['DIRECT_aabbc_ddeeff', 'first segment 5 chars'],
+      ['DIRECT_aabbcc_ddeef', 'last segment 5 chars'],
+      ['DIRECT_aabbccc_ddeeff', 'first segment 7 chars'],
+      // Wrong prefix.
+      ['direct_aabbcc_ddeeff', 'lowercase DIRECT'],
+      ['DIR_aabbcc_ddeeff', 'truncated prefix'],
+      // Non-hex.
+      ['DIRECT_aabbcZ_ddeeff', 'non-hex char'],
+      ['DIRECT_AABBCC_DDEEFF', 'uppercase hex'],
+      // Path traversal patterns.
+      ['DIRECT_aabbcc_ddeeff/', 'trailing slash'],
+      ['DIRECT_aabbcc_ddeeff.outbox', 'extension'],
+      ['../DIRECT_aabbcc_ddeeff', 'path traversal'],
+      // Generic non-shape strings (covers many test-fixture historic
+      // values like 'addr-alice', 'test', etc.).
+      ['addr-alice', 'non-canonical alias'],
+      ['test', 'short ad-hoc id'],
+      ['DIRECT://aabbcc_ddeeff', 'with DIRECT:// prefix'],
+    ])('rejects %s (%s)', (badId, _label) => {
+      expect(
+        () =>
+          new OutboxWriter({
+            db: createMockDb(),
+            encryptionKey: null,
+            addressId: badId,
+            lamport: new Lamport(),
+          }),
+      ).toThrow(SphereError);
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -674,5 +729,89 @@ describe('isUxfTransferOutboxEntry / isLegacyOutboxEntry', () => {
       status: 'packaging', // a NEW-shape status value
     };
     expect(isLegacyOutboxEntry(corrupt)).toBe(false);
+  });
+
+  // Issue #166 P4 #2 — range tightening on lamport, createdAt,
+  // updatedAt. All three must be non-negative integers; non-integers
+  // (0.5) and negatives are rejected at the schema gate so corrupt
+  // blobs don't poison downstream comparisons.
+  describe('isUxfTransferOutboxEntry — P4 #2 range tightening', () => {
+    function makeValid(): UxfTransferOutboxEntry {
+      return {
+        _schemaVersion: 'uxf-1',
+        id: 'x',
+        bundleCid: 'b',
+        tokenIds: [],
+        deliveryMethod: 'car-over-nostr',
+        recipient: '@a',
+        recipientTransportPubkey: 'a'.repeat(64),
+        mode: 'instant',
+        status: 'packaging',
+        submitRetryCount: 0,
+        proofErrorCount: 0,
+        createdAt: 1,
+        updatedAt: 1,
+        lamport: 1,
+      };
+    }
+
+    it('accepts 0 for lamport/createdAt/updatedAt (boundary)', () => {
+      expect(
+        isUxfTransferOutboxEntry({
+          ...makeValid(),
+          lamport: 0,
+          createdAt: 0,
+          updatedAt: 0,
+        }),
+      ).toBe(true);
+    });
+
+    it('rejects negative lamport', () => {
+      expect(
+        isUxfTransferOutboxEntry({ ...makeValid(), lamport: -1 }),
+      ).toBe(false);
+    });
+
+    it('rejects non-integer lamport (0.5)', () => {
+      expect(
+        isUxfTransferOutboxEntry({ ...makeValid(), lamport: 0.5 }),
+      ).toBe(false);
+    });
+
+    it('rejects NaN lamport', () => {
+      expect(
+        isUxfTransferOutboxEntry({ ...makeValid(), lamport: NaN }),
+      ).toBe(false);
+    });
+
+    it('rejects Infinity lamport', () => {
+      expect(
+        isUxfTransferOutboxEntry({ ...makeValid(), lamport: Infinity }),
+      ).toBe(false);
+    });
+
+    it('rejects negative createdAt', () => {
+      expect(
+        isUxfTransferOutboxEntry({ ...makeValid(), createdAt: -1 }),
+      ).toBe(false);
+    });
+
+    it('rejects non-integer createdAt', () => {
+      expect(
+        isUxfTransferOutboxEntry({ ...makeValid(), createdAt: 1.5 }),
+      ).toBe(false);
+    });
+
+    it('rejects negative updatedAt', () => {
+      expect(
+        isUxfTransferOutboxEntry({ ...makeValid(), updatedAt: -1 }),
+      ).toBe(false);
+    });
+
+    it('rejects non-integer updatedAt', () => {
+      expect(
+        isUxfTransferOutboxEntry({ ...makeValid(), updatedAt: 1.5 }),
+      ).toBe(false);
+    });
   });
 });

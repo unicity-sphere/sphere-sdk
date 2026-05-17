@@ -355,11 +355,20 @@ export function isUxfTransferOutboxEntry(
   if (typeof obj.recipientTransportPubkey !== 'string') return false;
   if (typeof obj.mode !== 'string') return false;
   if (!isUxfOutboxStatus(obj.status)) return false;
-  if (typeof obj.lamport !== 'number' || !Number.isFinite(obj.lamport)) return false;
+  // Issue #166 P4 #2 — range tightening on lamport, createdAt,
+  // updatedAt. Lamport is a non-negative integer by construction
+  // (Lamport.bumpFor always yields `next > 0` after a write, and an
+  // unwritten slot decodes as absent — never as a negative). Epoch-ms
+  // timestamps are non-negative. Rejecting these at the schema gate
+  // prevents corrupted blobs from poisoning downstream comparisons.
+  // submitRetryCount and proofErrorCount keep their pre-#166 checks
+  // (typeof === 'number') — they're capped elsewhere by §7.1 G-counter
+  // monotonicity invariants.
+  if (!Number.isInteger(obj.lamport) || (obj.lamport as number) < 0) return false;
   if (typeof obj.submitRetryCount !== 'number') return false;
   if (typeof obj.proofErrorCount !== 'number') return false;
-  if (typeof obj.createdAt !== 'number') return false;
-  if (typeof obj.updatedAt !== 'number') return false;
+  if (!Number.isInteger(obj.createdAt) || (obj.createdAt as number) < 0) return false;
+  if (!Number.isInteger(obj.updatedAt) || (obj.updatedAt as number) < 0) return false;
   return true;
 }
 

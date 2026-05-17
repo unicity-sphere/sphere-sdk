@@ -131,6 +131,20 @@ export class OutboxWriter {
         'VALIDATION_ERROR',
       );
     }
+    // Issue #166 P4 #1 — defense-in-depth against key-prefix overlap.
+    // The keyPrefix is `${addressId}.outbox.`; an addressId containing
+    // `.` would extend the prefix into adjacent collections (e.g.
+    // `DIRECT_a.b_c.outbox.*` overlaps with `DIRECT_a.b_c.sent.*`).
+    // Production callers always pass the canonical shape returned by
+    // `constants.ts:getAddressId()` — `DIRECT_[0-9a-f]{6}_[0-9a-f]{6}`
+    // — so enforcing it here catches misuse without breaking
+    // production traffic.
+    if (!/^DIRECT_[0-9a-f]{6}_[0-9a-f]{6}$/.test(options.addressId)) {
+      throw new SphereError(
+        `OutboxWriter: addressId must match DIRECT_[0-9a-f]{6}_[0-9a-f]{6} (got: ${options.addressId})`,
+        'VALIDATION_ERROR',
+      );
+    }
     this.db = options.db;
     this.encryptionKey = options.encryptionKey;
     this.addressId = options.addressId;

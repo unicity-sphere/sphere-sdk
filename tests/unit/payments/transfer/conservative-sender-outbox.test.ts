@@ -609,7 +609,7 @@ describe('sendConservativeUxf outbox integration — real OutboxWriter (T.6.A) w
     const source = makeToken('tok-1', TOKEN_A);
     const commitResult = makeCommitResult({ sourceTokenId: 'tok-1', fixture: TOKEN_A });
 
-    const { hooks, writer } = makeWriterBackedHooks('addr-alice');
+    const { hooks, writer } = makeWriterBackedHooks('DIRECT_aabbcc_ddeeff');
 
     const { deps } = makeDeps({
       availableSources: () => [source],
@@ -656,7 +656,7 @@ describe('sendConservativeUxf outbox integration — real OutboxWriter (T.6.A) w
     // Writer-backed hooks expose the `update()` validator. We craft a
     // hooks surface that invokes an ILLEGAL transition (delivered →
     // packaging) and confirm the validator throws.
-    const { writer, hooks } = makeWriterBackedHooks('addr-alice');
+    const { writer, hooks } = makeWriterBackedHooks('DIRECT_aabbcc_ddeeff');
 
     // Seed an entry at status='delivered'. We do this via the writer's
     // own write() (no validator on raw write), then attempt an illegal
