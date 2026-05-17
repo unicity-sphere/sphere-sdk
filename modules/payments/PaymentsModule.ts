@@ -173,6 +173,7 @@ import type { ProofVerifyStatus } from './transfer/proof-verifier';
 import { contentHash, type ContentHash } from '../../uxf/types';
 import { isLegacyTokenTransferPayload } from '../../types/uxf-transfer';
 import type { UxfTransferOutboxEntry } from '../../types/uxf-outbox';
+import type { OutboxWriter } from '../../profile/outbox-writer';
 import {
   resolveSenderInfoViaBinding,
   type ReresolvedNametagSource,
@@ -1620,15 +1621,37 @@ export class PaymentsModule {
       const senderOutboxMap = this._senderOutboxMap;
       const transport = this.deps!.transport;
       const sphereEmit = this.deps!.emitEvent;
+      // Issue #97 — capture by closure so reads route through the
+      // profile-resident writer when installed. The writer is the
+      // source of truth across restarts; falling back to the in-memory
+      // map preserves pre-#97 behaviour for callers that haven't wired
+      // the profile-backed path yet.
+      const getOutboxWriter = (): OutboxWriter | null => this._outboxWriter;
       const recoveryDeps: import('./transfer/sending-recovery-worker').SendingRecoveryWorkerDeps = {
         outbox: {
           async readAllNew(): Promise<ReadonlyArray<UxfTransferOutboxEntry>> {
+            const writer = getOutboxWriter();
+            if (writer !== null) {
+              // Durable source-of-truth read. Tombstoned ids are skipped
+              // by readAllNew per OutboxWriter contract.
+              return await writer.readAllNew();
+            }
             return Array.from(senderOutboxMap.values());
           },
           async update(
             id: string,
             mutator: (prev: UxfTransferOutboxEntry) => UxfTransferOutboxEntry,
           ): Promise<UxfTransferOutboxEntry> {
+            const writer = getOutboxWriter();
+            if (writer !== null) {
+              // Route through the writer so the §7.0 state-machine
+              // validator fires AND the Lamport bump rule (§7.1) is
+              // honored. Mirror the result into the in-memory map so
+              // FinalizationOutboxWriter consumers stay coherent.
+              const updated = await writer.update(id, mutator);
+              senderOutboxMap.set(id, updated);
+              return updated;
+            }
             const existing = senderOutboxMap.get(id);
             if (existing === undefined) {
               throw new SphereError(
@@ -2837,6 +2860,65 @@ export class PaymentsModule {
       pool instanceof IngestWorkerPool ? pool : new IngestWorkerPool(pool);
   }
 
+  /**
+   * Issue #97 — Install a profile-resident {@link OutboxWriter}.
+   *
+   * Once installed, every send-side outbox mutation (the
+   * conservative/instant dispatcher's `create`/`transition`/`write`
+   * hooks AND the recovery worker's `readAllNew`/`update` callbacks)
+   * dual-writes: the durable per-entry-key profile store first, then
+   * the in-memory {@link _senderOutboxMap} mirror. The legacy KV-only
+   * `saveToOutbox`/`removeFromOutbox` chain is preserved during the
+   * transition window so consumers that haven't migrated still observe
+   * the legacy snapshot.
+   *
+   * **When to install:** the bootstrap layer (Sphere) calls this after
+   * its {@link ProfileStorageProvider} reaches the "encryption key
+   * derived" state — same gate that arms
+   * `buildDispositionStorageAdapter()`. Calling with `null` removes the
+   * writer (used on address switch / destroy).
+   *
+   * **Address scope:** the writer is bound to a single address at
+   * construction. The caller MUST swap the writer (install null + new)
+   * when switching addresses.
+   *
+   * **Hydration:** the next `initialize()` call rebuilds
+   * {@link _senderOutboxMap} from `writer.readAllNew()` so post-restart
+   * entries are visible to the recovery worker.
+   *
+   * @param writer  The writer to install, or `null` to uninstall.
+   */
+  installOutboxWriter(writer: OutboxWriter | null): void {
+    this._outboxWriter = writer;
+    if (writer !== null) {
+      // Fire-and-forget hydration of the in-memory mirror. The
+      // FinalizationWorkerSender (Phase 9.6.D) reads via `readOne(id)`
+      // against `_senderOutboxMap`, so post-restart instant-mode
+      // entries become visible to the worker after this resolves.
+      // Errors are warned-only: the recovery worker reads directly
+      // from the writer (post-#97), so a failed hydration degrades to
+      // "FinalizationWorkerSender takes a moment longer to see
+      // post-restart entries" — never a data-loss path.
+      void writer
+        .readAllNew()
+        .then((entries) => {
+          for (const e of entries) {
+            this._senderOutboxMap.set(e.id, e);
+          }
+          logger.debug(
+            'Payments',
+            `installOutboxWriter: hydrated ${entries.length} outbox entries into in-memory mirror`,
+          );
+        })
+        .catch((err) => {
+          logger.warn(
+            'Payments',
+            `installOutboxWriter: failed to hydrate _senderOutboxMap from writer (recovery worker still reads via writer.readAllNew): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+    }
+  }
+
   // ===========================================================================
   // T.5.D — Operator escape-hatch (`importInclusionProof` +
   // `revalidateCascadedChildren`). The wiring layer (Sphere bootstrap)
@@ -2914,9 +2996,40 @@ export class PaymentsModule {
    * The instant-sender writes here at `delivered-instant` stage;
    * the worker reads + updates via the injected `FinalizationOutboxWriter`.
    *
+   * When a profile-resident {@link _outboxWriter} is installed via
+   * {@link installOutboxWriter}, this map functions as a write-through
+   * cache on top of the durable per-entry-key store — the writer is the
+   * source of truth across restarts; this map is hydrated from it in
+   * `initialize()` and updated in lock-step on every dispatcher hook
+   * call.
+   *
    * @internal
    */
   private readonly _senderOutboxMap: Map<string, UxfTransferOutboxEntry> = new Map();
+
+  /**
+   * Issue #97 — Profile-resident outbox writer, when wired by the
+   * bootstrap layer. The writer persists per-entry-key UXF outbox
+   * entries under `${addressId}.outbox.${id}` in the profile's OrbitDB
+   * key-value store, IPFS-synced. Survives total local profile loss
+   * (recovered on next sync from the aggregator pointer / IPNS
+   * snapshot).
+   *
+   * When `null`, the dispatcher hooks fall back to the legacy KV-only
+   * outbox path (`saveToOutbox`/`removeFromOutbox`) and the in-memory
+   * `_senderOutboxMap`. When non-null, every dispatcher hook performs
+   * a dual-write: durable profile write first, then the in-memory map
+   * mirror is updated to match.
+   *
+   * Lifecycle: installed by the bootstrap layer (Sphere) AFTER the
+   * profile encryption key is derived but BEFORE `initialize()` so the
+   * Lamport rehydration runs against the live writer. Address-switch
+   * MUST call `installOutboxWriter(null)` then `installOutboxWriter(new)`
+   * with the new address scope.
+   *
+   * @internal
+   */
+  private _outboxWriter: OutboxWriter | null = null;
 
   /**
    * Per-requestId context map for the sender-side finalization worker resolver.
@@ -10155,17 +10268,29 @@ export class PaymentsModule {
         return out;
       },
       outbox: {
-        // T.2.D.2 — orchestrator drives §7.0 via create/transition.
-        // Until the per-entry-key OutboxWriter (T.6.A) is fully wired
-        // to a ProfileDatabase in PaymentsModule (T.6.D, follow-up),
-        // this adapter folds the new hooks onto the legacy
-        // saveToOutbox / removeFromOutbox chain so existing tests keep
-        // their invariants:
-        //   - create (status=packaging): persist legacy synthetic entry.
-        //   - transition (status=delivered): drop legacy entry.
-        //   - transition (other states): no-op (legacy outbox is
-        //     bundle-grained-on-create, terminal-on-removal only).
+        // T.2.D.2 + Issue #97 — orchestrator drives §7.0 via create/
+        // transition. Production wiring threads a profile-resident
+        // OutboxWriter via {@link installOutboxWriter}. When installed:
+        //   - create:      writer.write(entry); _senderOutboxMap mirror
+        //                  is set in lock-step; legacy saveToOutbox is
+        //                  also called so consumers reading the legacy
+        //                  snapshot still observe the entry.
+        //   - transition:  writer.update(...) gates the arc via the
+        //                  §7.0 validator; mirror updates in lock-step;
+        //                  on `'delivered'` the legacy entry is dropped
+        //                  via removeFromOutbox AND the profile entry
+        //                  is tombstoned via writer.delete.
+        // When the writer is NULL (legacy mode / tests without profile
+        // wiring), the hooks fold onto the legacy KV chain alone — the
+        // pre-#97 behaviour is preserved.
         create: async (entry) => {
+          const writer = this._outboxWriter;
+          if (writer !== null) {
+            // Durable profile write first — the in-memory mirror is
+            // hydrated from this on next restart.
+            const written = await writer.write(entry);
+            this._senderOutboxMap.set(entry.id, written);
+          }
           const synthResult: TransferResult = {
             id: entry.id,
             status: 'submitted',
@@ -10175,12 +10300,38 @@ export class PaymentsModule {
           await this.saveToOutbox(synthResult, entry.recipientTransportPubkey);
         },
         transition: async (id, patch) => {
+          const writer = this._outboxWriter;
+          if (writer !== null) {
+            // Route through the writer so the §7.0 validator gates the
+            // arc. The mutator folds the patch onto the previous entry.
+            const updated = await writer.update(id, (prev) => ({
+              ...prev,
+              status: patch.status,
+              ...(typeof patch.error === 'string' ? { error: patch.error } : {}),
+              ...(typeof patch.submitRetryCount === 'number'
+                ? { submitRetryCount: patch.submitRetryCount }
+                : {}),
+              updatedAt: Date.now(),
+            }));
+            this._senderOutboxMap.set(id, updated);
+          }
           if (patch.status === 'delivered') {
             await this.removeFromOutbox(id);
+            // Tombstone the profile entry so a subsequent readAllNew
+            // doesn't resurrect it. The recovery worker treats tombstoned
+            // ids as absent (OutboxWriter.readAllNew skips them).
+            if (writer !== null) {
+              try {
+                await writer.delete(id);
+                this._senderOutboxMap.delete(id);
+              } catch (delErr) {
+                logger.warn(
+                  'Payments',
+                  `dispatchUxfConservativeSend: outboxWriter.delete(${id}) failed (entry left tombstoned at next write): ${delErr instanceof Error ? delErr.message : String(delErr)}`,
+                );
+              }
+            }
           }
-          // 'pinned' / 'sending' / 'failed-transient' carry no legacy
-          // state mutation — the new schema's intermediate states are
-          // tracked exclusively by the (forthcoming) OutboxWriter.
         },
       },
     };
@@ -11037,19 +11188,34 @@ export class PaymentsModule {
         // No-op for T.5.A — selectSources above already marks sources
         // `transferring` in the local cache.
       },
-      // Phase 9.6.D — wire the in-memory outbox so the instant-sender
-      // persists `delivered-instant` entries the finalization worker can
-      // read via its injected FinalizationOutboxWriter. When no worker is
-      // installed, fall through to `undefined` (original T.5.A behaviour).
-      outbox: this.finalizationWorkerSender !== null
+      // Phase 9.6.D + Issue #97 — wire the outbox-write hook so the
+      // instant-sender persists every `packaging`/`pinned`/`sending`/
+      // `delivered-instant` entry. The hook fires whenever EITHER:
+      //  - a profile-resident OutboxWriter is installed (#97 crash
+      //    safety — survives total local profile loss), OR
+      //  - a finalization worker is installed (Phase 9.6.D — worker
+      //    reads the in-memory map via FinalizationOutboxWriter).
+      // When neither is wired, the hook is undefined (original T.5.A
+      // behaviour — bare orchestrator path used by some unit tests).
+      outbox: (this._outboxWriter !== null || this.finalizationWorkerSender !== null)
         ? {
             write: async (entry) => {
-              const existing = this._senderOutboxMap.get(entry.id);
-              this._senderOutboxMap.set(entry.id, {
-                ...entry,
-                _schemaVersion: 'uxf-1' as const,
-                lamport: (existing?.lamport ?? 0) + 1,
-              });
+              const writer = this._outboxWriter;
+              if (writer !== null) {
+                // Durable profile write first — _senderOutboxMap is
+                // mirrored from the returned stamped value so the
+                // Lamport matches the writer's CRDT bump rule (§7.1).
+                const written = await writer.write(entry);
+                this._senderOutboxMap.set(entry.id, written);
+              } else {
+                // Legacy in-memory path — finalization worker only.
+                const existing = this._senderOutboxMap.get(entry.id);
+                this._senderOutboxMap.set(entry.id, {
+                  ...entry,
+                  _schemaVersion: 'uxf-1' as const,
+                  lamport: (existing?.lamport ?? 0) + 1,
+                });
+              }
             },
           }
         : undefined,

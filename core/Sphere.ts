@@ -5069,6 +5069,52 @@ export class Sphere {
       );
     }
 
+    // Issue #97 — Build and install the profile-resident OutboxWriter
+    // when the StorageProvider exposes `buildOutboxWriter`. The writer
+    // persists per-entry-key UXF outbox entries under
+    // `${addressId}.outbox.${id}` so they survive total local profile
+    // loss (recovered on next sync via aggregator pointer / IPNS
+    // snapshot). PaymentsModule's dispatcher hooks dual-write to this
+    // writer plus the legacy KV chain; the SendingRecoveryWorker reads
+    // from this writer on restart.
+    //
+    // Best-effort: when the storage provider is not a
+    // `ProfileStorageProvider`, or encryption is disabled / key not yet
+    // derived, the install is skipped and PaymentsModule falls back to
+    // the legacy KV-only outbox path (pre-#97 behaviour).
+    try {
+      const storageForOutbox = this._storage as unknown as {
+        buildOutboxWriter?: (
+          addressId: string,
+        ) => import('../profile/outbox-writer').OutboxWriter | null;
+      };
+      if (typeof storageForOutbox.buildOutboxWriter === 'function') {
+        const directAddress = this._identity?.directAddress;
+        if (typeof directAddress === 'string' && directAddress.length > 0) {
+          const addressId = getAddressId(directAddress);
+          const writer = storageForOutbox.buildOutboxWriter(addressId);
+          if (writer !== null) {
+            this._payments.installOutboxWriter(writer);
+            logger.debug(
+              'Sphere',
+              `Wired profile-resident OutboxWriter for address ${addressId}`,
+            );
+          } else {
+            logger.debug(
+              'Sphere',
+              'ProfileStorageProvider returned null OutboxWriter (encryption disabled or identity pending) — PaymentsModule uses legacy KV outbox',
+            );
+          }
+        }
+      }
+    } catch (err) {
+      // Non-fatal: PaymentsModule falls back to legacy KV outbox.
+      logger.warn(
+        'Sphere',
+        `Failed to wire profile OutboxWriter — falling back to legacy KV outbox: ${safeErrorMessage(err)}`,
+      );
+    }
+
     // PR #151 — payments.load() is critical and MUST complete BEFORE
     // accounting/swap load. `AccountingModule.load()` populates its
     // `invoiceTermsCache` by iterating `payments.getTokens()` (filter

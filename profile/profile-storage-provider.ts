@@ -29,6 +29,8 @@ import {
   OrbitDbFinalizationQueueStorageAdapter,
   OrbitDbRecipientContextStorageAdapter,
 } from './finalization-queue-storage-adapter';
+import { OutboxWriter } from './outbox-writer';
+import { Lamport } from './lamport';
 import {
   buildLocalEntry,
   type OpLogEntryEnvelope,
@@ -879,6 +881,48 @@ export class ProfileStorageProvider implements StorageProvider {
     return new OrbitDbRecipientContextStorageAdapter({
       db: this.db,
       encryptionKey: this.profileEncryptionKey,
+    });
+  }
+
+  /**
+   * Issue #97 — Build an {@link OutboxWriter} bound to this provider's
+   * OrbitDB instance and profile encryption key, scoped to the given
+   * address. The writer persists per-entry-key UXF outbox entries under
+   * `${addressId}.outbox.${id}` (PROFILE-ARCHITECTURE §10.12) which are
+   * IPFS-synced as part of the profile so they survive total local
+   * profile loss.
+   *
+   * Returns null when:
+   *  - encryption is disabled, OR
+   *  - the encryption key has not been derived yet (setIdentity pending)
+   *
+   * Lifecycle: callers SHOULD cache the returned writer for the current
+   * address. On address switch, callers MUST rebuild via this method —
+   * the writer's `addressId` is captured at construction.
+   *
+   * Lamport clock: the writer takes a fresh {@link Lamport} unless the
+   * caller passes one. The writer's first `write()` calls
+   * `collectObservedLamports()` to rehydrate `max(observed) + 1`, so the
+   * fresh-instance default is correct after restart.
+   */
+  buildOutboxWriter(addressId: string, lamport?: Lamport): OutboxWriter | null {
+    if (!this.encryptionEnabled) {
+      this.log('buildOutboxWriter: encryption disabled — returning null');
+      return null;
+    }
+    if (this.profileEncryptionKey === null) {
+      this.log('buildOutboxWriter: encryption key not yet derived (setIdentity pending) — returning null');
+      return null;
+    }
+    if (typeof addressId !== 'string' || addressId.length === 0) {
+      this.log('buildOutboxWriter: addressId must be a non-empty string — returning null');
+      return null;
+    }
+    return new OutboxWriter({
+      db: this.db,
+      encryptionKey: this.profileEncryptionKey,
+      addressId,
+      lamport: lamport ?? new Lamport(),
     });
   }
 
