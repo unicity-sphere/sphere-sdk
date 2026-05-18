@@ -363,39 +363,154 @@ describe('SentLedgerWriter (Issue #97)', () => {
   });
 
   // -------------------------------------------------------------------------
-  // Issue #166 P4 #3 — contains() cost contract pinning
+  // OUTBOX-SEND-FOLLOWUPS item #3 — contains() backed by O(1) index
   // -------------------------------------------------------------------------
-  describe('contains() cost contract (Issue #166 P4 #3)', () => {
-    it('scans every live entry per call — no in-memory index (pin current behavior)', async () => {
-      // Pin the cost contract documented in contains()'s JSDoc: each
-      // call decrypts every entry under the prefix. A regression that
-      // accidentally introduces an in-memory index (without the
-      // durability surface) OR a regression that amplifies the call
-      // count (extra reads per entry) is caught here. When the
-      // duplicate-bundle guard work lands (Issue #166 P2), this test
-      // can be flipped to assert the index-backed path.
+  //
+  // The original Issue #166 P4 #3 cost contract pinned an O(n × m)
+  // full-decrypt path on every call. Item #3 replaces that with a
+  // lazy in-memory `tokenId → entryId` index: the first lookup builds
+  // the index from `readAll()` (still O(n × m)); subsequent lookups
+  // are O(1) Map.has on the warmed index. Writes and deletes
+  // maintain the index incrementally in O(m).
+
+  describe('contains() cost contract — O(1) miss / O(b) verify-on-hit (OUTBOX-SEND-FOLLOWUPS item #3)', () => {
+    it('first call builds the index (one full decrypt pass); subsequent miss calls perform zero db.get', async () => {
       for (let i = 0; i < 5; i += 1) {
         await writer.write(buildBaseInput(`xfer-${i}`));
       }
 
       const getSpy = vi.spyOn(db, 'get');
 
-      // Look up a token that doesn't exist (forces full scan, no
-      // early termination). Each entry decryption is one db.get
-      // call (the prefix-scan `all()` returns the keys but each
-      // `readDecoded(key)` calls `get(key)` again).
-      const hit = await writer.contains('not-a-real-token');
-      expect(hit).toBe(false);
-      // 5 entries → 5 db.get calls. If a future index were
-      // installed, this would drop to 0 (the index lookup avoids
-      // decryption). If a regression amplified the scan, this
-      // would be > 5.
+      // First contains() — builds the index via readAll(). 5 entries
+      // → 5 db.get calls.
+      const r1 = await writer.contains('not-a-real-token');
+      expect(r1).toBe(false);
       expect(getSpy).toHaveBeenCalledTimes(5);
 
-      // Second call repeats the scan (no caching across calls).
+      // Second contains() (miss) — index is warm; the Map.get fails
+      // fast, no storage I/O.
       getSpy.mockClear();
-      await writer.contains('still-no-such-token');
-      expect(getSpy).toHaveBeenCalledTimes(5);
+      const r2 = await writer.contains('still-no-such-token');
+      expect(r2).toBe(false);
+      expect(getSpy).toHaveBeenCalledTimes(0);
+
+      // Third contains() (hit) — verify-on-hit reads exactly one
+      // entry per bucket member to defend against cross-replica
+      // staleness. Bucket size is 1 → exactly one db.get.
+      getSpy.mockClear();
+      const r3 = await writer.contains(`0xtok-xfer-0-a`);
+      expect(r3).toBe(true);
+      expect(getSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('write() incrementally extends the index (next contains() hit avoids the full readAll rebuild)', async () => {
+      await writer.write(buildBaseInput('xfer-0'));
+      // Warm the index.
+      const r0 = await writer.contains(`0xtok-xfer-0-a`);
+      expect(r0).toBe(true);
+
+      // New entry; the in-line index update means contains() for its
+      // token reads ONE entry (verify-on-hit), not the full prefix.
+      await writer.write(buildBaseInput('xfer-1'));
+      const getSpy = vi.spyOn(db, 'get');
+      const hit = await writer.contains(`0xtok-xfer-1-b`);
+      expect(hit).toBe(true);
+      expect(getSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('delete() removes the entry from the index incrementally', async () => {
+      await writer.write(buildBaseInput('xfer-0'));
+      const r0 = await writer.contains(`0xtok-xfer-0-a`);
+      expect(r0).toBe(true);
+
+      await writer.delete('xfer-0');
+
+      // contains() for the deleted entry's tokenId must now be false
+      // AND must not trigger storage I/O (the index was maintained
+      // in-line by delete(); the Map.get fails fast).
+      const getSpy = vi.spyOn(db, 'get');
+      const stillThere = await writer.contains(`0xtok-xfer-0-a`);
+      expect(stillThere).toBe(false);
+      expect(getSpy).toHaveBeenCalledTimes(0);
+    });
+
+    it('write() of an existing id with different tokenIds drops the old tokenIds from the index', async () => {
+      // Second-write-wins: the same id is re-stamped with a different
+      // tokenIds set. The old tokenIds must no longer report present.
+      await writer.write(
+        buildBaseInput('xfer-stable', { tokenIds: ['tok-A', 'tok-B'] }),
+      );
+      const r0 = await writer.contains('tok-A');
+      expect(r0).toBe(true);
+
+      await writer.write(
+        buildBaseInput('xfer-stable', { tokenIds: ['tok-C', 'tok-D'] }),
+      );
+
+      const getSpy = vi.spyOn(db, 'get');
+      // Old tokenIds removed (miss → 0 db.get):
+      expect(await writer.contains('tok-A')).toBe(false);
+      expect(await writer.contains('tok-B')).toBe(false);
+      // New tokenIds present (hit → 1 verify-on-hit db.get each):
+      expect(await writer.contains('tok-C')).toBe(true);
+      expect(await writer.contains('tok-D')).toBe(true);
+      // 0 + 0 + 1 + 1 = 2 db.get total.
+      expect(getSpy).toHaveBeenCalledTimes(2);
+    });
+
+    it('findByTokenId() round-trips through the index then reads one entry per hit', async () => {
+      // 3 entries with tok-shared in their tokenIds; one with only
+      // a private token.
+      await writer.write(
+        buildBaseInput('e-1', { tokenIds: ['tok-shared', 'tok-1'] }),
+      );
+      await writer.write(
+        buildBaseInput('e-2', { tokenIds: ['tok-shared', 'tok-2'] }),
+      );
+      await writer.write(
+        buildBaseInput('e-3', { tokenIds: ['tok-shared', 'tok-3'] }),
+      );
+      await writer.write(buildBaseInput('e-private', { tokenIds: ['tok-priv'] }));
+
+      // Warm the index.
+      await writer.contains('warmup');
+
+      const getSpy = vi.spyOn(db, 'get');
+      const matches = await writer.findByTokenId('tok-shared');
+      expect(matches.map((e) => e.id).sort()).toEqual(['e-1', 'e-2', 'e-3']);
+      // One db.get per hit (readOne for each matched id). No full scan.
+      expect(getSpy).toHaveBeenCalledTimes(3);
+    });
+
+    it('cross-replica staleness: contains() returns false for a tokenId whose entry was tombstoned by a peer', async () => {
+      // Simulate a peer-driven tombstone: writer A wrote the entry,
+      // then writer B (sharing the same db) tombstones it. A's
+      // in-memory index still references the entry; verify-on-hit
+      // catches the staleness and returns false.
+      await writer.write(buildBaseInput('shared-id'));
+      // Confirm a's index sees the entry.
+      expect(await writer.contains(`0xtok-shared-id-a`)).toBe(true);
+
+      // Build a second writer pointed at the same db, and use it to
+      // tombstone the entry — bypassing writer's local delete().
+      const writerPeer = new SentLedgerWriter({
+        db,
+        encryptionKey: null,
+        addressId: 'DIRECT_aabbcc_ddeeff',
+        lamport: new Lamport(),
+      });
+      await writerPeer.delete('shared-id');
+
+      // writer's in-memory index still has the stale entry, but
+      // verify-on-hit reads from durable storage and sees null →
+      // returns false AND prunes the stale id from the index.
+      expect(await writer.contains(`0xtok-shared-id-a`)).toBe(false);
+
+      // Subsequent calls for the same tokenId are O(1) misses
+      // (the stale id was evicted on the previous call).
+      const getSpy = vi.spyOn(db, 'get');
+      expect(await writer.contains(`0xtok-shared-id-a`)).toBe(false);
+      expect(getSpy).toHaveBeenCalledTimes(0);
     });
   });
 
