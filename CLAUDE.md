@@ -263,8 +263,15 @@ Typed RPC layer for dApp ↔ wallet communication. Full guide: [`docs/CONNECT.md
 | `swap:deposit_confirmed` | `{ swapId, party, amount, coinId }` | Deposit confirmed by escrow |
 | `swap:completed` | `{ swapId, payoutVerified }` | Swap completed (terminal) |
 | `swap:cancelled` | `{ swapId, reason, depositsReturned? }` | Swap cancelled (terminal) |
+| `transfer:orphan-spending-detected` | `{ tokenId, detectedAt, coinId, amount }` | Sweeper found a token stuck `'transferring'` with no matching OUTBOX/SENT entry — operator triage |
+| `transfer:orphan-recovered` | `{ tokenId, coinId, amount, fromStatus, toStatus, strategy, recoveredAt }` | Auto-recovery hook flipped an orphan back to `'confirmed'` (requires `features.orphanAutoRecovery`) |
+| `transfer:sent-reconciliation-recovered` | `{ outboxId, tokenIds, mode, recoveredAt }` | Worker re-ran a missed SENT-write after the dispatcher's transition step threw |
+| `transfer:sent-reconciliation-failed` | `{ outboxId, consecutiveFailures, lastError, failedAt }` | SENT-write retry exhausted `maxRetries`; OUTBOX entry kept live at `'delivered'` for triage |
+| `transfer:retention-warning` | `{ sentId, nostrEventId, bundleCid, tokenIds, recipientTransportPubkey, detectedAt }` | Relay no longer retains the Nostr TOKEN_TRANSFER event for a SENT entry |
+| `transfer:retention-republish-rearmed` | `{ sentId, nostrEventId, bundleCid, tokenIds, recipientTransportPubkey, fromStatus, toStatus, rearmedAt }` | Verifier transitioned a live OUTBOX entry back to `'sending'` so the recovery worker republishes |
+| `transfer:retention-republish-skipped` | `{ sentId, nostrEventId, bundleCid, reason, observedStatus?, errorMessage?, detectedAt }` | Retention re-publish could not be initiated (`reason ∈ no-outbox-writer / entry-tombstoned-or-missing / wrong-status / transition-failed`) |
 
-See [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) and [QUICKSTART-NODEJS.md](docs/QUICKSTART-NODEJS.md) for detailed guides.
+See [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) and [QUICKSTART-NODEJS.md](docs/QUICKSTART-NODEJS.md) for detailed guides. Operator runbooks for the send-pipeline events live at [docs/uxf/RUNBOOK-SEND-PIPELINE.md](docs/uxf/RUNBOOK-SEND-PIPELINE.md).
 
 ---
 
