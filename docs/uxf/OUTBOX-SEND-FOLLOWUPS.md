@@ -68,6 +68,8 @@ The OUTBOX is a working queue that **drains** to SENT as deliveries complete. To
 
 ### 2. Automatic re-publication of detected retention drops (P2 #3 follow-up)
 
+> **Scope after Item #15**: under full-profile-snapshot sync, OUTBOX entries propagate across peers via the pointer mechanism, so the `'entry-tombstoned-or-missing'` skip-reason on `transfer:retention-republish-skipped` becomes rare. Bundles remain pinned on our IPFS by definition (IPFS-pin-only directive); re-publishing always has the bundle bytes available via CID. See Item #15.
+
 **Why it matters**: today `NostrPersistenceVerifier` (default-OFF) detects a relay retention drop and emits `transfer:retention-warning`. That's all. The bundle was successfully delivered earlier (relay ack'd it) but is now gone — the recipient may have already seen it, may not have. Closing the loop means actually re-publishing.
 
 **Acceptance criteria**:
@@ -161,6 +163,8 @@ Until flipped to default-ON, these are dead code for any wallet that doesn't exp
 
 ### 6. Re-publish on CAR vs CID modes — bundle availability
 
+> **Scope after Item #15**: per the IPFS-pin-only architectural directive, every bundle (regardless of original Nostr delivery mode) is pinned on our IPFS node. The CAR-mode re-publish throw added in commit `72879d1` becomes a defensive fallback rather than the common case — `'cid-over-nostr'` re-publish using the SENT entry's `bundleCid` always succeeds when the pin is live. See Item #15.
+
 **Why it matters**: `SendingRecoveryWorker.republish` (the default in PaymentsModule) ships `kind: 'uxf-cid'` for every re-publish, regardless of the original delivery mode. For an entry originally delivered via `kind: 'uxf-car'` (inline CAR), the IPFS pin may not exist — the recipient gets a CID they can't fetch.
 
 **Acceptance criteria**:
@@ -219,6 +223,8 @@ Until flipped to default-ON, these are dead code for any wallet that doesn't exp
 
 ### 9. Concurrent-replica integration tests
 
+> **Scope after Item #15**: the OrbitDB Hash Log layer is no longer the conflict-resolution layer for OUTBOX/SENT — the snapshot pointer + per-writer JOIN takes over. The residual "real-OrbitDB-log lex-sort gap" largely dissolves; the meaningful test surface moves to "two peers concurrently flushing snapshots → JOIN convergence". See Item #15 Phase G for the new test scenarios.
+
 **Status (2026-05-18)**: Writer-layer scope **MERGED** on `integration/all-fixes` (commit `0b169f7`). Real-OrbitDB-log scope **STILL OPEN**.
 
 **Scope clarification.** Originally this item was framed as "OrbitDB Hash Log lex-sort conflict resolution between concurrent profile peers." A subsequent architectural review (see "Pointer-layer vs OrbitDB-log layering" in Cross-cutting concerns below) showed that framing conflated two different layers:
@@ -257,6 +263,8 @@ Real `@orbitdb/core` Hash Log lex-sort under live libp2p replication is not exer
 ---
 
 ### 10. Vector vs per-entry-key design decision
+
+> **Resolved by Item #15 (per-entry-key wins)**: under full-profile-snapshot sync, the per-entry-key Lamport+tombstone machinery becomes the JOIN merge function at snapshot-pull time. The complexity that was "paid for multi-replica CRDT safety" is now load-bearing for snapshot-time JOIN. The vector-model alternative loses its appeal. This item can be marked resolved once Item #15 lands.
 
 **Why it matters**: in our prior conversation we surfaced that the per-entry-key OUTBOX design exists for multi-replica CRDT safety. Tombstones, Lamport bookkeeping, hydration-race handling, and the refuse-write guard are all complexity paid for that safety. If the project commits to "one active writer per wallet at a time" as a constraint, a single-vector approach (whole OUTBOX as one OrbitDB value, rewritten on add/remove) drops ~1000+ lines.
 
@@ -396,22 +404,164 @@ So the JOIN layer already knows the truth. The OUTBOX state machine and the loca
 - Phase 2 (medium): items 3, 5, 7, 8 — proper §7.0 state-machine entry, JOIN→Token wiring, orphan sweeper disambiguation, balance regression test. Closes the unconfirmed-balance gap.
 - Phase 3 (small): item 6 + the CLAUDE.md / runbook updates from work items 4 and 6 — docs cleanup.
 
+> **Note on scope after Item #15**: under the full-profile-snapshot sync (Item #15), OUTBOX entries propagate via the pointer mechanism, so the racing window where two peers can both reach the aggregator with conflicting commits collapses to the pointer poll interval (typically seconds, not the indefinite "until manual sync" of today). Phase 1 of Item #14 (typed throw + new event + `'failed-conflict'` status) still wanted as the operator-visible signal; Phase 2's local-Token correction is largely subsumed by Item #15's JOIN flow.
+
+---
+
+### 15. Full Profile State Snapshot Sync (NEW 2026-05-18)
+
+**Status**: design confirmed; implementation pending. Replaces the current "pointer-points-to-UXF-bundle-CID" model with "pointer-points-to-full-profile-snapshot-CID". **No backward compatibility** — the pointer scheme moves cleanly to the new format; legacy UXF-bundle-only pointers will not be supported.
+
+**Why it matters**: today the aggregator pointer covers ONLY the UXF token bundle. OUTBOX, SENT, dispositions, finalization queue, recipient context, and all other per-writer profile state live in OrbitDB and do NOT propagate via the pointer mechanism. Cross-peer convergence for those writers relies on OrbitDB pubsub, which is wired but explicitly demoted to a hint channel (`profile/orbitdb-adapter.ts:243-246`, `profile/lifecycle-manager.ts:27-49`) — i.e. unreliable across NAT/firewalls and not authoritative.
+
+The architectural impact of that gap: a peer that mutates an OUTBOX entry (e.g. moves an in-flight send to status `'sending'`) and then crashes leaves NO trace another peer running the same profile can observe via the authoritative channel. The orphan-spending sweeper, duplicate-bundle guard, retention re-publish, and multi-device double-spend reconciliation (items #1, #2, #14) all paper over this gap with peer-local heuristics. The clean fix is to make the pointer authoritative for the FULL profile.
+
+**Architecture**:
+
+The pointer-publish payload changes from "UXF bundle CID" to "lean profile snapshot CID". A snapshot is a content-addressed CAR containing:
+- All per-writer encrypted KV entries (OUTBOX, SENT, dispositions, finalization queue, recipient context, etc.). Ciphertext is preserved as stored in OrbitDB — the snapshot layer never decrypts. Security boundary remains the wallet mnemonic.
+- All `tokens.bundle.*` references (CIDs only — the bundle CARs themselves are pinned separately on IPFS, unchanged).
+- Schema-versioned root.
+
+Sync is:
+1. **Mutation**: ANY writer mutation (OUTBOX/SENT/disposition/UXF token state) marks profile dirty.
+2. **Flush**: FlushScheduler debounces, builds lean profile snapshot, pins to IPFS, publishes snapshot CID to aggregator at the next pointer version.
+3. **Crash safety**: aggregator anchoring is irreversible. A peer that crashes immediately after publish leaves a durable record of its profile state at that version.
+4. **Poll**: peers poll the aggregator (existing path). On new version detected, fetch snapshot CAR from IPFS, content-verify CID.
+5. **JOIN per writer**: each writer's `joinSnapshot(remoteEntries)` applies CRDT merge against local OrbitDB state. Local-only entries SURVIVE (set union); overlaps resolved by Lamport+tombstone semantics already proven at the writer layer.
+6. **Re-publish**: if JOIN produced any local change, mark dirty → next flush re-snapshots → next pointer version.
+7. **Convergence**: two peers flushing concurrently race for version V+1; aggregator anchors one; loser re-polls, JOINs winner's snapshot with local, publishes V+2. Bounded by polling interval + aggregator round-trip.
+
+OrbitDB's role degrades to **local encrypted KV cache**. Its CRDT-replication features become unused at the conflict-resolution level. Pubsub stays as a hint channel ("wake up and poll the aggregator now") — already its current role per `lifecycle-manager.ts:27-49`.
+
+**What's already in the tree**:
+
+`profile/profile-export.ts` defines `ProfileSnapshot` v1 — a CAR containing encrypted KV entries + embedded bundle CAR bytes (`profile-export.ts:158-189`). Used today for manual export/import only (operator-facing "back up to file" flow). Hardening already done: schema versioning, size caps (256 MiB / 1 MiB per block / 8 MiB per value / 100k entries / 200k blocks), content-address verification on bundle blocks, deterministic encoding. **The serialization layer is ~70% there.**
+
+Two important deltas needed:
+- **"Lean" snapshot variant** — bundle refs by CID only, no embedded CAR bytes. The fat format stays for the export/import CLI. Schema v2.
+- **Filter reversal** — today's export filter strips `tokens.bundle.*` and `consolidation.*` (operational state for export). For sync these ARE needed; the new lean snapshot includes them.
+
+**Acceptance criteria** (phased; each phase can be a separate PR):
+
+**Phase A — Lean snapshot format + builder**
+
+- A.1 Define `LeanProfileSnapshot` (or `ProfileSnapshot v2`) with `bundles[]: { cid, status, createdAt, tokenCount? }` (CID-only, no embedded bytes). Sibling type to v1 or v2 of the existing type — IMO sibling is cleaner.
+- A.2 Builder `buildLeanProfileSnapshot(deps)` mirroring `exportProfile` but skipping bundle-byte embedding AND including the keys that the export filter drops. Determinism preserved (entries sorted by key, bundles by CID).
+- A.3 Parse / verify `parseLeanProfileSnapshot(carBytes)` with the same content-address re-verification and size caps. Reject `version > 2`.
+- A.4 Unit tests: builder/parser round-trip is byte-identical; size caps enforced; deterministic output.
+
+**Phase B — Per-writer snapshot/JOIN API**
+
+Each writer that lives in OrbitDB gains two methods:
+
+```typescript
+interface ProfileSyncWriter {
+  snapshot(): Promise<ReadonlyArray<{ key: string; encryptedValue: Uint8Array }>>;
+  joinSnapshot(remote: ReadonlyArray<{ key: string; encryptedValue: Uint8Array }>): Promise<JoinResult>;
+}
+```
+
+`snapshot()` is a prefix-scan + read-encrypted-bytes — trivial.
+
+`joinSnapshot()` applies CRDT merge. After decrypt + parse, for each remote key K:
+
+| Local | Remote | Result |
+|-------|--------|--------|
+| absent | live | write remote |
+| absent | tombstone | write remote tombstone |
+| live | live | write the one with higher Lamport |
+| live | tombstone | tombstone wins if `tombstone.lamport >= live.lamport`; else local wins (the **existing refuse-write guard**, applied at JOIN-time) |
+| tombstone | live | live wins ONLY if `live.lamport > tombstone.lamport`; else tombstone preserved |
+| tombstone | tombstone | keep the one with higher Lamport |
+
+Wire this for: `OutboxWriter`, `SentLedgerWriter`, `DispositionWriter`, `FinalizationQueueStorageAdapter`, `RecipientContextStorageAdapter`, and the bundle-ref index. A shared generic helper for the Lamport+tombstone merge avoids re-implementing it five times.
+
+The CRDT primitives that the Lamport+tombstone machinery from Issue #166 P1 #2 provides are **exactly the right merge functions** here. Write-time invariants become JOIN-time merge functions.
+
+Unit tests per writer: every cell of the table above, plus idempotence (re-running JOIN on the same remote is a no-op).
+
+**Phase C — Mutation→flush trigger surface**
+
+- C.1 Add a `notifyProfileDirty()` callback to each writer's construction. On every `write()` / `delete()`, the writer calls the callback.
+- C.2 `FlushScheduler` debounces these notifications. Proposal: 1-2 s debounce window for "soft" mutations (OUTBOX status transitions, SENT writes); flush-immediately for "hard" mutations (token finalization). Tunable via options.
+- C.3 `flushToIpfs` builds a lean snapshot (Phase A.2), pins, returns the CID.
+
+**Phase D — Pointer publish & pull integration**
+
+- D.1 `LifecycleManager.publishAggregatorPointerBestEffort(cid)` receives the SNAPSHOT CID, not the bundle CID. Existing publish-retry / version-monotonicity logic stays.
+- D.2 `buildFetchAndJoin` (`profile/pointer-wiring.ts:387-533`) becomes:
+  1. Fetch snapshot CAR by CID, content-verify.
+  2. Parse via `parseLeanProfileSnapshot`.
+  3. For each writer, dispatch the writer's `joinSnapshot()` over the writer's prefix-filtered entries.
+  4. Write bundle refs to local OrbitDB (existing path; existing `UxfPackage.merge` at `load()` time runs over the merged ref set unchanged).
+  5. Advance version cursor only after all per-writer JOINs persist.
+  6. If JOIN produced any local change → mark profile dirty (next flush re-snapshots and publishes the union).
+
+**Phase E — Removal of UXF-bundle-only pointer publishing**
+
+Per the maintainer call: no backward compat. The UXF-bundle-only pointer code path is removed. Existing callers that produced bundle CIDs to the pointer publisher are routed through the new snapshot builder.
+
+**Phase F — Tombstone GC at snapshot-build time**
+
+Item #4's tombstone GC currently runs against OrbitDB locally. Under #15:
+- Snapshot builder drops tombstones older than `retentionMs` at build time (they're not included in the published snapshot).
+- Local OrbitDB cleanup can run separately or as a same-time hook.
+- Safety contract unchanged: `retentionMs` must exceed the longest realistic concurrent-replica pre-sync window. Existing 30-day default is conservative.
+
+**Phase G — Integration tests + crash-recovery scenario**
+
+- G.1 Two-peer JOIN: A writes OUTBOX entry e_A, snapshots, publishes. B polls, JOINs. Assert e_A is in B's local OUTBOX with A's Lamport.
+- G.2 Tombstone-wins-at-JOIN: A tombstones key K at Lamport L_t. B has live entry at K with Lamport L_h < L_t. JOIN preserves the tombstone in B's local state.
+- G.3 Race: A and B both flush concurrently for V+1. Aggregator anchors one. Loser re-polls, JOINs, publishes V+2.
+- G.4 Crash-recovery (the user-driven scenario): A writes OUTBOX entry then crashes immediately after publish. B detects new version, pulls, JOINs, sees A's OUTBOX entry. B's `SendingRecoveryWorker` can pick it up (same wallet identity = same signing key on both devices).
+- G.5 Non-overlapping union: A and B both have OUTBOX entries (different keys). After bidirectional JOIN, both see the full union.
+
+**Files** (proposed touch list):
+
+- `profile/profile-export.ts` — extend or sibling for lean v2 builder/parser.
+- `profile/outbox-writer.ts`, `profile/sent-ledger-writer.ts`, `profile/disposition-writer.ts` (if exists), `profile/finalization-queue-storage-adapter.ts`, `profile/recipient-context-storage-adapter.ts` (if exists) — add `snapshot()` + `joinSnapshot()`.
+- `profile/profile-token-storage/flush-scheduler.ts` — emit lean snapshot instead of UXF bundle.
+- `profile/lifecycle-manager.ts` — receive snapshot CID from flusher.
+- `profile/pointer-wiring.ts:387-533` — pull-side dispatcher per writer.
+- `profile/profile-token-storage-provider.ts` — wire the `notifyProfileDirty()` callbacks from each writer.
+- New: `profile/profile-snapshot-merge.ts` — shared CRDT merge helper.
+- Tests: `tests/integration/profile/full-profile-sync.test.ts` (new) + per-writer unit tests.
+
+**Complexity**: Large. Multi-phase (A through G). Each phase can ship independently; Phase A is the prerequisite. Estimated 3-5 PRs.
+
+**Blast radius**: Very High while the work is in flight (touches the pointer-publish + pull paths that every wallet relies on). Mitigation: feature-flag (`features.fullProfileSnapshotSync`?) gating the new publish/pull behaviour, default-OFF during development, flip to default-ON after Phase A-G land and soak.
+
+Migration consideration: existing wallets that have published only UXF-bundle pointers need handling — either (a) they re-publish under the new format on first flush after upgrade, OR (b) the cutover is done at a clean release boundary with no in-flight UXF-bundle pointers expected. The maintainer call is (b): no backward compat. Implementation should arrange for the first post-upgrade flush to emit the new format and never read or write the old format.
+
+**Downstream effects** (forward references):
+- Item #2: `'entry-tombstoned-or-missing'` skip becomes rare — OUTBOX entries propagate, so when the verifier needs the entry to transition it's almost always there.
+- Item #4: tombstone GC relocates to snapshot-build time (see Phase F).
+- Item #6: bundle-bytes always reachable on IPFS pin — the CAR-mode throw at the recovery worker becomes a defensive fallback rather than the common case.
+- Item #9: the OrbitDB Hash Log conflict-resolution gap collapses — OrbitDB is no longer the conflict-resolution layer for OUTBOX/SENT.
+- Item #10: per-entry-key with Lamport+tombstone is reinforced as the right primitive (it's also the JOIN merge function); vector model loses its appeal.
+- Item #14: most of Phase 2 (local-Token correction) is subsumed; Phase 1 (typed throw + new event) still wanted for operator-visible classification but the loser's stuck-`'transferring'` symptom resolves naturally at next sync.
+
 ---
 
 ## Cross-cutting concerns
 
-### Pointer-layer vs OrbitDB-log layering (architectural clarification)
+### Pointer-layer vs OrbitDB-log layering (architectural clarification — superseded by Item #15)
 
-The profile layer has TWO distinct distribution mechanisms running in parallel, often confused:
+> **Direction change (2026-05-18)**: Item #15 (Full Profile State Snapshot Sync) collapses the two-layer model into one. Under #15 the aggregator pointer carries the full profile snapshot (including OUTBOX/SENT/dispositions/etc.) — not just the UXF bundle CID. OrbitDB becomes a local encrypted KV cache; its CRDT-replication features are unused for cross-peer convergence. This section describes the **interim state** that holds until Item #15 lands.
+
+The profile layer **currently** has TWO distinct distribution mechanisms running in parallel, often confused:
 
 | Layer | What it carries | Conflict resolution |
 |-------|-----------------|---------------------|
-| **Aggregator pointer** | The CID of the current profile-state CAR (the `tokens.bundle.*` aggregate). One small commitment per flush, anchored to BFT-backed inclusion proofs. | Unicity aggregator's Sparse Merkle Tree provides total ordering and immutability over the sequence of profile-state pointers. Append-only by construction. See `docs/uxf/PROFILE-AGGREGATOR-POINTER-SPEC.md`. |
-| **OrbitDB Hash Log** | Per-entry-key writes for OUTBOX/SENT/dispositions/etc. — direct `db.put` calls at keys like `${addr}.outbox.${id}`. NOT bundled into CARs. NOT pointer-published. | OrbitDB's underlying CRDT: LWW lex-sort on entry hashes for concurrent writes to the same key. Lamport stamps + tombstones + refuse-write guard (Issue #166 P1 #2) provide POST-sync safety. |
+| **Aggregator pointer** (today) | The CID of the current UXF token bundle CAR (the `tokens.bundle.*` aggregate). One small commitment per flush, anchored to BFT-backed inclusion proofs. | Unicity aggregator's Sparse Merkle Tree provides total ordering and immutability over the sequence of bundle pointers. Append-only by construction. See `docs/uxf/PROFILE-AGGREGATOR-POINTER-SPEC.md`. |
+| **OrbitDB Hash Log** (today) | Per-entry-key writes for OUTBOX/SENT/dispositions/etc. — direct `db.put` calls at keys like `${addr}.outbox.${id}`. NOT bundled into CARs. NOT pointer-published. | OrbitDB's underlying CRDT: LWW lex-sort on entry hashes for concurrent writes to the same key. Lamport stamps + tombstones + refuse-write guard (Issue #166 P1 #2) provide POST-sync safety. |
 
-**Implication for the writer-layer concerns in this doc**: items #1–#9 concern OUTBOX/SENT entries that live in the OrbitDB Hash Log layer (not the pointer layer). The pointer mechanism's "Single Irreversible Provable History" guarantee covers WHICH CAR is the current profile state — it does NOT cover which value wins for an OUTBOX/SENT slot under concurrent same-key writes from two peers.
+**Implication for the writer-layer concerns in this doc (pre-#15)**: items #1–#9 concern OUTBOX/SENT entries that live in the OrbitDB Hash Log layer (not the pointer layer). The pointer mechanism's "Single Irreversible Provable History" guarantee covers WHICH bundle CAR is current — it does NOT cover which value wins for an OUTBOX/SENT slot under concurrent same-key writes from two peers.
 
-**Pubsub clarification**: OrbitDB pubsub IS still wired in `profile/orbitdb-adapter.ts:243-246` (gossipsub is a hard requirement for OrbitDB v3). It is explicitly DEMOTED to a hint channel — `lifecycle-manager.ts:27-49` treats pubsub events as a wake-up signal to poll the aggregator NOW, not as authoritative state. The aggregator pointer is the authority; pubsub is a latency optimisation (collapsing worst-case cross-device sync from ~90 s to ~1-2 s).
+**Implication after Item #15 lands**: the aggregator pointer carries the full profile state. OUTBOX/SENT and every other writer's state is content-addressed inside the snapshot CAR. Conflict resolution moves to snapshot-pull JOIN time, using the same Lamport+tombstone primitives. OrbitDB pubsub remains as a hint channel only.
+
+**Pubsub clarification**: OrbitDB pubsub IS still wired in `profile/orbitdb-adapter.ts:243-246` (gossipsub is a hard requirement for OrbitDB v3). It is explicitly DEMOTED to a hint channel — `lifecycle-manager.ts:27-49` treats pubsub events as a wake-up signal to poll the aggregator NOW, not as authoritative state. The aggregator pointer is the authority; pubsub is a latency optimisation (collapsing worst-case cross-device sync from ~90 s to ~1-2 s). This stays true under Item #15.
 
 ### Lamport-on-tombstone is incomplete CRDT semantics
 
