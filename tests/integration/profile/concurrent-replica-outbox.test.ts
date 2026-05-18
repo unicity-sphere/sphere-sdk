@@ -1,38 +1,70 @@
 /**
  * Concurrent-replica OUTBOX invariants — OUTBOX-SEND-FOLLOWUPS item #9.
  *
- * **Scope.** This file simulates two replicas sharing the same
- * underlying `ProfileDatabase` (an in-memory `Map<string, Uint8Array>`)
- * with separate `OutboxWriter` / `SentLedgerWriter` instances. Each
- * writer has its own `Lamport` clock and its own in-memory index
- * state, but all reads/writes flow through one durable map — i.e. a
- * **fully-synced** snapshot of two replicas.
+ * **Layering context** (read this first — see also OUTBOX-SEND-FOLLOWUPS.md
+ * "Pointer-layer vs OrbitDB-log layering"):
+ *
+ * Sphere's Profile has TWO distribution mechanisms running in parallel.
+ * They handle conflicts at different layers:
+ *
+ *  1. **Aggregator pointer layer** (`profile/aggregator-pointer/*`,
+ *     `profile/lifecycle-manager.ts`). On every Profile flush, the
+ *     current CAR's CID is published to the Unicity aggregator as a
+ *     SMT commitment. This is the authoritative source for "which
+ *     CAR is the current profile state?" The aggregator's append-only
+ *     SMT provides total ordering and immutability over the pointer
+ *     sequence. Peer reconciliation is a JOIN of remote (IPFS-fetched
+ *     by CID) and local state — NOT an OrbitDB log-merge.
+ *
+ *  2. **OrbitDB Hash Log layer** (`profile/orbitdb-adapter.ts`).
+ *     Direct per-entry-key writes like `${addr}.outbox.${id}` and
+ *     `${addr}.sent.${id}`. These are NOT bundled into CARs, NOT
+ *     pointer-published. Concurrent writes to the same key are
+ *     resolved by OrbitDB's underlying CRDT: LWW lex-sort on entry
+ *     hashes. OrbitDB pubsub (gossipsub) IS wired in the adapter
+ *     but is explicitly demoted to a hint channel — it triggers an
+ *     aggregator poll, it doesn't carry authoritative state.
+ *
+ * The OUTBOX/SENT writers tested here live at layer 2. The pointer
+ * mechanism's "Single Irreversible Provable History" guarantee
+ * covers WHICH CAR is current; it does NOT cover which value wins
+ * for an OUTBOX/SENT slot under concurrent same-key writes from two
+ * peers. Those invariants are the responsibility of layer 2's CRDT
+ * machinery (Lamport stamps + tombstones + refuse-write guard, all
+ * from Issue #166 P1 #2). THIS FILE tests that machinery.
+ *
+ * **Scope.** Two writers share an in-memory `Map<string, Uint8Array>`
+ * with separate `Lamport` clocks and in-memory index state — i.e. a
+ * **fully-synced** snapshot of two replicas. This exercises every
+ * invariant the WRITER LAYER can guarantee against concurrent peers.
  *
  * What this approach covers:
- *  - The refuse-write guard against tombstone resurrection across
- *    writer instances (Issue #166 P1 #2).
- *  - The Lamport monotonicity invariant: writer B observes writer A's
- *    tombstone Lamport and bumps past it.
- *  - The pre-sync-then-merge case where B holds a stale live value
- *    and A's tombstone arrives later — modelled here by sequencing
- *    "B writes → A tombstones → B's next write observes the
- *    tombstone".
+ *  - Refuse-write guard against tombstone resurrection across writer
+ *    instances (Issue #166 P1 #2).
+ *  - Lamport monotonicity: writer B observes writer A's tombstone
+ *    Lamport (not just live values) and bumps past it.
+ *  - Pre-sync-then-merge: B holds a stale live value and A's
+ *    tombstone arrives later — modelled by sequencing "B writes →
+ *    A tombstones → B's next write observes the tombstone".
  *  - Idempotency: repeated deletes on either side are no-ops.
+ *  - SentLedgerWriter cross-instance index visibility after item #3.
  *
- * What this approach does NOT cover (gap left for a future PR):
- *  - Real `@orbitdb/core` log-merge semantics. OrbitDB's underlying
- *    Hash Log resolves concurrent writes via lex-sort on entry
- *    hashes; this test cannot exercise that conflict-resolution
- *    surface because the shared MockProfileDb is last-write-wins.
+ * What this approach does NOT cover (residual scope on item #9):
+ *  - Real `@orbitdb/core` Hash Log conflict resolution under live
+ *    libp2p replication. OrbitDB's underlying log resolves
+ *    concurrent writes via lex-sort on entry hashes; this test
+ *    cannot exercise that conflict-resolution surface because the
+ *    shared MockProfileDb is last-write-wins.
  *  - libp2p peer-to-peer dial + gossipsub replication in-process.
- *    The current `OrbitDbAdapter` is `bootstrapPeers: []` isolated
- *    mode only; enabling true peer-to-peer in-process replication
- *    requires adapter changes outside this PR's scope (the doc tags
- *    item #9 as "Large" precisely because of this).
+ *    The current `OrbitDbAdapter` is `bootstrapPeers: []` isolated-
+ *    mode only; enabling real two-peer replication requires adapter
+ *    changes outside this PR's scope.
  *  - Pre-sync race where BOTH replicas write the same key at the
- *    exact same Lamport. OrbitDB picks one via lex-sort; this is
- *    inherently a property of the underlying log layer, not of the
- *    writers, and is the next layer down for a future libp2p test.
+ *    EXACT same Lamport. OrbitDB picks one via lex-sort; the loser's
+ *    write is lost. The writer-layer guard catches post-sync
+ *    resurrection, not the pre-sync race. See OUTBOX-SEND-FOLLOWUPS
+ *    "Lamport-on-tombstone is incomplete CRDT semantics" for the
+ *    full closure path.
  *
  * The writer-layer invariants tested here are load-bearing for the
  * CRDT-safety claims in OUTBOX-SEND-FOLLOWUPS; a regression at this
