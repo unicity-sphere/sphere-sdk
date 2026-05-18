@@ -333,6 +333,71 @@ Operators receiving these have no documented "do this" guidance.
 
 ---
 
+### 14. Multi-device concurrent double-spend reconciliation (NEW 2026-05-18)
+
+**Why it matters**: when two peers share the same Profile (e.g. desktop + mobile signed into the same wallet) and concurrently spend the SAME token T to DIFFERENT destination addresses, the L3 aggregator anchors exactly ONE commitment (the source `stateHash` can only be spent once). The other peer's `submitTransferCommitment` throws. The codebase handles the on-chain safety correctly — no double-delivery of value — but the LOSER's local state is left in an inconsistent state that the system has the information to fix automatically but currently doesn't.
+
+**Background evidence** (from the 2026-05-18 code investigation):
+
+- Aggregator-level: only one commit lands. `PaymentsModule.ts:11207-11212` throws on the loser's `submitTransferCommitment` rejection. **The throw is not caught with a state-recovery handler** — the loser's source token stays at `status='transferring'` indefinitely.
+- Balance: `aggregateTokens` (`PaymentsModule.ts:~7001-7048`) correctly excludes `'transferring'` tokens from `confirmedAmount` (spendable balance is conservative). BUT it INCLUDES them in `unconfirmedAmount` and `totalAmount`. **Loser's unconfirmed balance is inflated by the token's value indefinitely.**
+- JOIN at sync: contrary to the stale comment at `profile/pointer-wiring.ts:36-40`, the per-token resolver `resolveTokenRoot` (`uxf/token-join.ts:210-330`) IS implemented and IS wired by `profile-token-storage-provider.ts:683-773`. It ranks chain heads by `(committedCount DESC, length DESC, rootHash ASC)` and surfaces incompatible chains as `kind: 'divergent'`. Rule 4 enrichment fires when an oracle is wired (`verifyInclusionProof`).
+- Orphan sweeper: `defaultOrphanRecovery` (post-item-#1) correctly returns `'manual'` for the loser's stuck token (aggregator says SPENT — but by the winner's commit, not by the loser's). Emits `transfer:orphan-spending-detected`. **This conflates a crash-window orphan with a concurrent-peer double-spend loss.**
+
+So the JOIN layer already knows the truth. The OUTBOX state machine and the local Token status do not learn it.
+
+**What works correctly today**
+
+- No fund double-spend. The L3 aggregator is the conflict authority.
+- No spendable-balance corruption. Both peers correctly exclude `'transferring'` tokens from confirmed/spendable balance.
+- JOIN-time resolution. When both peers' profiles are merged on any device (post-sync), the on-chain winner's chain head is deterministically preferred.
+- Audit trail. Loser's failed OUTBOX entry is preserved.
+
+**Acceptance criteria** (numbered work items; can be split into separate PRs):
+
+1. **Classify the aggregator rejection.** Tag the throw at `PaymentsModule.ts:11207-11212` with a typed `SphereError` code distinguishing `STATE_ALREADY_SPENT_BY_OTHER` from generic commit failure. The aggregator response should carry enough metadata to detect "the state IS spent — but by a commit whose recipient differs from the one we just tried to submit." Where it doesn't, the dispatcher re-queries `oracle.isSpent(sourceStateHash)` to disambiguate.
+
+2. **Dispatcher catch + state transition.** On `STATE_ALREADY_SPENT_BY_OTHER`:
+   - Move the OUTBOX entry to a terminal `'failed-conflict'` status (NEW — see #3 below). The bundle was never delivered; the entry is a forensic record of the lost race.
+   - Restore the source token's `status` from `'transferring'` to a state that reflects "spent by another peer" — proposal: a new `'spent-by-other'` status (or reuse `'spent'` with an `error`-style marker) so balance computation excludes it from `unconfirmedAmount` as well as `confirmedAmount`.
+   - Emit the new `transfer:double-spend-detected` event (see #4).
+
+3. **§7.0 state-machine: add `'failed-conflict'` status + arcs.** New canonical UxfOutboxStatus. Reachable via `sending → failed-conflict` (and possibly `packaging → failed-conflict` if the commit throws very early). Terminal — no outgoing arcs except the operator override (mirrors `'failed-permanent'`). Update `outbox-state-machine.test.ts` snapshot count (19 → 21 rows assuming two new arcs).
+
+4. **New event `transfer:double-spend-detected`.** Payload: `{ tokenId, sourceStateHash, ourIntendedRecipient, winningChainHead?, detectedAt }`. Distinct from `transfer:orphan-spending-detected` (crash-window) so operators / UIs can route them differently. Add to `SphereEventMap` in `types/index.ts` and to the Key Events table in `CLAUDE.md`. Operator action documented in `docs/uxf/RUNBOOK-SEND-PIPELINE.md`.
+
+5. **Wire JOIN divergent outcome → local Token.status.** When `UxfPackage.merge` produces a `divergent` outcome and the winning rootHash is NOT the local belief, update the local Token (`status`, `sdkData`) to reflect the winner's chain head. Today this signal is computed inside the resolver and used to write the merged package, but the consumer (`PaymentsModule`'s token cache) doesn't observe the divergent flag — it just consumes the merged package's tokens. Tests: a JOIN-divergent test that asserts the local `Token.status` flips after merge.
+
+6. **Update the stale comment** at `profile/pointer-wiring.ts:36-40`. It currently claims Rules 3+4 are absent; the resolver landed and is wired. Replace with a forward reference to the resolver and to this item for the residual local-state-update wiring.
+
+7. **Orphan sweeper disambiguation.** When `defaultOrphanRecovery` finds the aggregator says SPENT, today it returns `'manual'` and emits `transfer:orphan-spending-detected`. Once #4's event lands, the sweeper should re-query the aggregator's commit DETAIL (which recipient was anchored?) and, if the anchored recipient ≠ this peer's local outbox entry's recipient, emit `transfer:double-spend-detected` instead. If aggregator returns ambiguous data or no detail, fall back to the legacy detected event.
+
+8. **`getAssets` / balance regression test.** Assert that a `'spent-by-other'` (or equivalent terminal) token is excluded from BOTH `confirmedAmount` and `unconfirmedAmount` — so the loser's UI numbers converge to the truth after reconciliation.
+
+**Files**:
+- `modules/payments/PaymentsModule.ts:~11207-11212` — submit throw classification + dispatcher catch.
+- `core/errors.ts` — new `STATE_ALREADY_SPENT_BY_OTHER` error code.
+- `types/index.ts` — new `'transfer:double-spend-detected'` event + payload; possibly new `TokenStatus = 'spent-by-other'`.
+- `profile/outbox-state-machine.ts` — new `'failed-conflict'` status + arcs.
+- `tests/unit/profile/outbox-state-machine.test.ts` — row-count snapshot bump.
+- `profile/profile-token-storage-provider.ts:~683-773` — wire JOIN divergent outcome to local Token.status.
+- `modules/payments/transfer/orphan-spending-sweeper.ts` — disambiguation with aggregator detail.
+- `modules/payments/PaymentsModule.ts` (`defaultOrphanRecovery` ~3462) — emit `transfer:double-spend-detected` when applicable.
+- `profile/pointer-wiring.ts:36-40` — update stale comment.
+- `CLAUDE.md` — add new event to Key Events table.
+- `docs/uxf/RUNBOOK-SEND-PIPELINE.md` — add new event's operator section.
+
+**Complexity**: Medium. Cuts across the dispatcher, the §7.0 state machine, balance computation, and the JOIN consumer. Each work item (1-8) is small in isolation; the integration is the medium part. Tests must cover the multi-device scenario end-to-end with a deterministic loser/winner setup.
+
+**Blast radius**: Medium. New state-machine arcs require careful release coordination with already-deployed wallets (a wallet that hasn't learned about `'failed-conflict'` would treat it as an unknown status and the type guards would filter it out — same conservative behaviour as today). Local Token-status mutations on JOIN divergence are observable to UIs subscribed to `transfer:*` and `address:*` events; UI changes may be needed downstream.
+
+**Suggested PR split**:
+- Phase 1 (small): items 1, 2, 4 — classify the throw, surface the new event, transition OUTBOX to `'failed-conflict'`. Don't yet update local Token.status — rely on the existing JOIN at next sync for that. Phase 1 alone is enough to stop the "stuck `'transferring'` forever" symptom for the operator-visible surface.
+- Phase 2 (medium): items 3, 5, 7, 8 — proper §7.0 state-machine entry, JOIN→Token wiring, orphan sweeper disambiguation, balance regression test. Closes the unconfirmed-balance gap.
+- Phase 3 (small): item 6 + the CLAUDE.md / runbook updates from work items 4 and 6 — docs cleanup.
+
+---
+
 ## Cross-cutting concerns
 
 ### Pointer-layer vs OrbitDB-log layering (architectural clarification)
