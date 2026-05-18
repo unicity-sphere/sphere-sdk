@@ -109,6 +109,21 @@ export class SentLedgerWriter {
   private readonly lamport: Lamport;
   private readonly keyPrefix: string;
 
+  /**
+   * OUTBOX-SEND-FOLLOWUPS item #3 — lazy in-memory `tokenId → entryId`
+   * index. Populated on the first {@link contains} or
+   * {@link findByTokenId} call via {@link ensureIndex}; maintained
+   * incrementally by {@link write} and {@link delete}. NOT persisted —
+   * each `SentLedgerWriter` instance re-derives the index from
+   * {@link readAll} on first lookup after construction.
+   *
+   * `null` means "not yet built". The companion {@link entryTokenIds}
+   * map is initialised in lockstep so an entry's prior tokenIds can be
+   * looked up at maintenance time without re-reading the entry.
+   */
+  private tokenIndex: Map<string, Set<string>> | null = null;
+  private entryTokenIds: Map<string, ReadonlyArray<string>> | null = null;
+
   constructor(options: SentLedgerWriterOptions) {
     if (!options.addressId || options.addressId.length === 0) {
       throw new SphereError(
@@ -192,6 +207,10 @@ export class SentLedgerWriter {
     };
 
     await this.writeRaw(stamped.id, JSON.stringify(stamped));
+    // OUTBOX-SEND-FOLLOWUPS item #3 — keep the in-memory index in
+    // sync. No-op when the index hasn't been built yet (ensureIndex()
+    // will catch up on first read).
+    this.updateIndexAfterWrite(stamped.id, stamped.tokenIds);
     return stamped;
   }
 
@@ -222,6 +241,8 @@ export class SentLedgerWriter {
       lamport,
     });
     await this.writeRaw(id, tombstone);
+    // OUTBOX-SEND-FOLLOWUPS item #3 — clear the index slot for this id.
+    this.removeFromIndexAfterDelete(id);
   }
 
   /**
@@ -341,35 +362,66 @@ export class SentLedgerWriter {
    * the crash-recovery sweeper (Issue #97 step 6) and the duplicate-
    * bundle guard (Issue #97 step 7).
    *
-   * **Cost contract (Issue #166 P4 #3).** Each call:
-   *  1. Performs a prefix-scan over OrbitDB (`db.all(keyPrefix)`).
-   *  2. Decrypts and JSON-parses EVERY non-tombstoned entry under the
-   *     `${addr}.sent.` prefix.
-   *  3. Linearly scans each entry's `tokenIds` array.
+   * **Cost contract.** Backed by a lazy in-memory index (OUTBOX-SEND-
+   * FOLLOWUPS item #3). The first call after construction is O(n × m)
+   * — it iterates `readAll()` to build the index. Subsequent calls:
    *
-   * Total cost is O(n × m) where n is the number of live SENT entries
-   * and m is the average tokenIds length per entry. There is NO
-   * in-memory index — every call repeats the decrypt + scan.
+   *  - **Miss path** (tokenId not in any bucket): O(1) — single
+   *    `Map.has` returns false, no storage I/O. This is the common
+   *    case for the duplicate-bundle guard (most candidate tokens are
+   *    fresh).
+   *  - **Hit path**: O(b) where `b` is the bucket size (typically 1).
+   *    Each hit reads one entry from storage to verify the index is
+   *    not stale against cross-replica tombstones — see
+   *    "Cross-replica staleness" below.
    *
-   * **When to revisit.** Once the duplicate-bundle guard (Issue #166
-   * Phase 2 — see issue #166 / P2) lands and calls `contains()`
-   * per-token in a hot path, this O(n × m) becomes the
-   * scaling bottleneck. The right fix is a parallel tokenId → entryIds
-   * index, populated lazily on first read. That doubles the durability
-   * surface so it MUST land with its own invariant tests; not in scope
-   * for #166.
+   * **Index maintenance.** `write()` and `delete()` keep the index
+   * consistent with the on-disk state in O(m) per call (the entry's
+   * tokenIds count). The index is purely in-memory; each `SentLedgerWriter`
+   * instance re-derives it on first lookup, so a process restart
+   * naturally rebuilds.
    *
-   * Acceptable today: typical wallets have <1k SENT entries; m ~ 1-4.
+   * **Cross-replica staleness.** If a remote peer tombstones an entry
+   * via a synchronised `ProfileDatabase`, the local in-memory index
+   * does not see the eviction (the local `delete()` was never called).
+   * The verify-on-hit step catches this: when the bucket is non-empty
+   * but every referenced entry returns `null` from `readOne()`, the
+   * stale ids are evicted from the index and the call returns `false`.
+   * Subsequent calls for the same tokenId are O(1) misses.
+   *
+   * **Storage scale.** Typical wallets carry <1k SENT entries; m ~ 1-4.
+   * The duplicate-bundle guard (which calls `contains()` per-token
+   * per-send) is the load-bearing consumer.
    */
   async contains(tokenId: string): Promise<boolean> {
     if (typeof tokenId !== 'string' || tokenId.length === 0) return false;
-    const all = await this.readAll();
-    for (const e of all) {
-      for (const t of e.tokenIds) {
-        if (t === tokenId) return true;
+    await this.ensureIndex();
+    if (this.tokenIndex === null) return false;
+    const bucket = this.tokenIndex.get(tokenId);
+    if (bucket === undefined || bucket.size === 0) return false;
+    // Cross-replica staleness defense: a remote peer may have
+    // tombstoned an entry our in-memory index still references (no
+    // local delete() call → no incremental eviction). Verify the hit
+    // by reading at least one matching entry from durable storage;
+    // if every referenced entry is gone, the bucket is stale —
+    // evict the slot and report absence. The extra cost is bounded
+    // by the bucket size (typically 1) and is paid only on hits;
+    // misses remain O(1).
+    let liveFound = false;
+    const staleIds: string[] = [];
+    for (const entryId of bucket) {
+      const entry = await this.readOne(entryId);
+      if (entry !== null) {
+        liveFound = true;
+        // Don't break — continue collecting stale ids so we evict
+        // them in one pass. Avoids re-paying the verify cost on the
+        // next contains() call for the same tokenId.
+        continue;
       }
+      staleIds.push(entryId);
     }
-    return false;
+    if (staleIds.length > 0) this.evictStaleEntries(staleIds);
+    return liveFound;
   }
 
   /**
@@ -377,20 +429,130 @@ export class SentLedgerWriter {
    * their `tokenIds`. Used by tooling and tests that need the full
    * delivery history of a single token (a token MAY appear in multiple
    * SENT entries when it was re-sent intentionally).
+   *
+   * **Cost contract.** Same lazy-index backing as {@link contains}. The
+   * first call is O(n × m); subsequent calls are O(k) where k is the
+   * number of entries containing `tokenId` (typically 1).
    */
   async findByTokenId(tokenId: string): Promise<ReadonlyArray<UxfSentLedgerEntry>> {
     if (typeof tokenId !== 'string' || tokenId.length === 0) return [];
-    const all = await this.readAll();
+    await this.ensureIndex();
+    if (this.tokenIndex === null) return [];
+    const ids = this.tokenIndex.get(tokenId);
+    if (ids === undefined || ids.size === 0) return [];
     const out: UxfSentLedgerEntry[] = [];
-    for (const e of all) {
-      for (const t of e.tokenIds) {
-        if (t === tokenId) {
-          out.push(e);
-          break;
-        }
-      }
+    for (const id of ids) {
+      const entry = await this.readOne(id);
+      if (entry !== null) out.push(entry);
     }
     return out;
+  }
+
+  /**
+   * OUTBOX-SEND-FOLLOWUPS item #3 — lazy-build the in-memory
+   * `tokenId → entryId` index from the durable SENT-ledger state.
+   *
+   * Cheap re-entry: if the index is already built (`tokenIndex !== null`),
+   * this is a no-op. If a prior maintenance step invalidated the index
+   * by setting it back to `null` (defensive on unexpected throws), the
+   * next lookup rebuilds.
+   *
+   * Cost: O(n) decrypts (mirrors `readAll()`), once per index lifetime.
+   */
+  private async ensureIndex(): Promise<void> {
+    if (this.tokenIndex !== null && this.entryTokenIds !== null) return;
+    const tokenIndex = new Map<string, Set<string>>();
+    const entryTokenIds = new Map<string, ReadonlyArray<string>>();
+    const all = await this.readAll();
+    for (const entry of all) {
+      entryTokenIds.set(entry.id, entry.tokenIds);
+      for (const t of entry.tokenIds) {
+        let bucket = tokenIndex.get(t);
+        if (bucket === undefined) {
+          bucket = new Set();
+          tokenIndex.set(t, bucket);
+        }
+        bucket.add(entry.id);
+      }
+    }
+    this.tokenIndex = tokenIndex;
+    this.entryTokenIds = entryTokenIds;
+  }
+
+  /**
+   * OUTBOX-SEND-FOLLOWUPS item #3 — incremental index maintenance after
+   * a successful {@link write}. No-op when the index hasn't been built
+   * yet ({@link ensureIndex} will catch up on first lookup).
+   *
+   * Handles the second-write-wins case: if a prior entry existed at the
+   * same id with a different tokenIds set, the old tokenIds are
+   * removed from the index before the new ones are added.
+   */
+  private updateIndexAfterWrite(
+    id: string,
+    newTokenIds: ReadonlyArray<string>,
+  ): void {
+    if (this.tokenIndex === null || this.entryTokenIds === null) return;
+    const priorTokenIds = this.entryTokenIds.get(id);
+    if (priorTokenIds !== undefined) {
+      for (const t of priorTokenIds) {
+        const bucket = this.tokenIndex.get(t);
+        if (bucket === undefined) continue;
+        bucket.delete(id);
+        if (bucket.size === 0) this.tokenIndex.delete(t);
+      }
+    }
+    this.entryTokenIds.set(id, newTokenIds);
+    for (const t of newTokenIds) {
+      let bucket = this.tokenIndex.get(t);
+      if (bucket === undefined) {
+        bucket = new Set();
+        this.tokenIndex.set(t, bucket);
+      }
+      bucket.add(id);
+    }
+  }
+
+  /**
+   * OUTBOX-SEND-FOLLOWUPS item #3 — incremental index maintenance after
+   * a successful {@link delete}. Removes the entry's contribution from
+   * every tokenId bucket and drops it from the reverse map. No-op when
+   * the index hasn't been built yet OR when the id is unknown to the
+   * index (idempotent delete-of-absent).
+   */
+  private removeFromIndexAfterDelete(id: string): void {
+    if (this.tokenIndex === null || this.entryTokenIds === null) return;
+    const priorTokenIds = this.entryTokenIds.get(id);
+    if (priorTokenIds === undefined) return;
+    for (const t of priorTokenIds) {
+      const bucket = this.tokenIndex.get(t);
+      if (bucket === undefined) continue;
+      bucket.delete(id);
+      if (bucket.size === 0) this.tokenIndex.delete(t);
+    }
+    this.entryTokenIds.delete(id);
+  }
+
+  /**
+   * Drop entries from the index that {@link contains} discovered to
+   * be stale (tombstoned remotely or otherwise unreadable). Mirrors
+   * {@link removeFromIndexAfterDelete} but acts on multiple ids in
+   * one pass. Safe to call even when the index hasn't been built
+   * (no-op).
+   */
+  private evictStaleEntries(staleIds: ReadonlyArray<string>): void {
+    if (this.tokenIndex === null || this.entryTokenIds === null) return;
+    for (const id of staleIds) {
+      const priorTokenIds = this.entryTokenIds.get(id);
+      if (priorTokenIds === undefined) continue;
+      for (const t of priorTokenIds) {
+        const bucket = this.tokenIndex.get(t);
+        if (bucket === undefined) continue;
+        bucket.delete(id);
+        if (bucket.size === 0) this.tokenIndex.delete(t);
+      }
+      this.entryTokenIds.delete(id);
+    }
   }
 
   // ===========================================================================
