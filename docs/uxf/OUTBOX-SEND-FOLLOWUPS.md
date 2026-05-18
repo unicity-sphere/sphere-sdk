@@ -219,20 +219,40 @@ Until flipped to default-ON, these are dead code for any wallet that doesn't exp
 
 ### 9. Concurrent-replica integration tests
 
-**Why it matters**: the Lamport / tombstone code is unit-tested with mocked OrbitDB. No integration test simulates two OrbitDB peers writing the same key concurrently. The tombstone-resurrection guard added in P1 #2 is unverified in the real CRDT scenario it was designed for.
+**Status (2026-05-18)**: Writer-layer scope **MERGED** on `integration/all-fixes` (commit `0b169f7`). Real-OrbitDB-log scope **STILL OPEN**.
 
-**Acceptance criteria**:
-- New test harness spins up two OrbitDB peers connected via libp2p.
-- Scenario 1: replica A tombstones a key, replica B (stale) attempts to write the same key. After sync, assert the key remains tombstoned (the refuse-write guard fires on B's next access).
-- Scenario 2: concurrent writes from both replicas at adjacent Lamports — assert one wins and the loser observes the winner on next read.
-- Scenario 3: pre-sync concurrent tombstone vs live-write — assert behavior matches the documented contract (one wins via OrbitDB LWW; the loser must observe + bump past on next read).
+**Scope clarification.** Originally this item was framed as "OrbitDB Hash Log lex-sort conflict resolution between concurrent profile peers." A subsequent architectural review (see "Pointer-layer vs OrbitDB-log layering" in Cross-cutting concerns below) showed that framing conflated two different layers:
+
+- **Profile-state convergence** — "which CAR is the current profile?" — is resolved by the **aggregator pointer mechanism**, not by OrbitDB log layer. Each profile flush publishes a CID to the Unicity aggregator (`profile/aggregator-pointer/*`, `profile/lifecycle-manager.ts`); peer reconciliation reads the latest authoritative pointer, fetches its CAR from IPFS, and JOINs into local state via `pointer-wiring.ts:buildFetchAndJoin`. OrbitDB's pubsub is wired but **demoted to a hint channel** that triggers an aggregator poll. OrbitDB's LWW lex-sort only arbitrates which small `tokens.bundle.{cid}` ref survives a concurrent same-key write — and the IPFS-level JOIN then operates over all bundle refs present regardless of which LWW win put each one there. **No correctness gap at this layer.**
+
+- **Per-entry-key OUTBOX/SENT writes** — the `${addr}.outbox.${id}` and `${addr}.sent.${id}` slots written directly by `OutboxWriter` / `SentLedgerWriter`. **These are NOT pointer-published.** They are not bundled into CARs. Their conflict resolution is OrbitDB's Hash Log layer (LWW lex-sort on entry hashes for concurrent writes to the same key). The CRDT machinery shipped under #166 P1 #2 (Lamport stamps + tombstones + refuse-write guard) is the right layer of defense for these — and **this is the layer this item now targets**.
+
+**What MERGED covers (writer-layer)**
+
+`tests/integration/profile/concurrent-replica-outbox.test.ts` exercises every invariant the writer layer can guarantee against concurrent peers via a shared-storage two-writer harness (one `MockProfileDb` shared between two `OutboxWriter` / `SentLedgerWriter` instances with separate Lamport clocks). 11 tests cover:
+- Refuse-write guard across writer instances (post-sync resurrection blocked).
+- Lamport monotonicity across writers, including observing remote *tombstone* Lamports.
+- Pre-sync race resolution (tombstone-arrives-first → guard fires; live-write-arrives-first → tombstone wins on subsequent reads).
+- SentLedgerWriter mirrors the same invariants, including cross-instance `contains()` index visibility after item #3.
+
+**What's STILL OPEN (real-OrbitDB-log layer)**
+
+Real `@orbitdb/core` Hash Log lex-sort under live libp2p replication is not exercised. Specifically: two replicas write the **same** OUTBOX/SENT key at the **same Lamport** before either sees the other. OrbitDB picks one via lex-sort on entry hashes; the loser's write is lost. The writer-layer refuse-write guard catches POST-sync resurrection attempts, but does NOT catch the PRE-sync race where both writes land "first" from their own perspective. See the "Lamport-on-tombstone" cross-cutting concern below for the full closure path.
+
+**Acceptance criteria (residual scope)**:
+- Extend `OrbitDbAdapter` to support a two-peer test mode (currently `bootstrapPeers: []` isolated only). Either a "memory transport" libp2p config or in-process TCP with manual dial-peer wiring.
+- New integration test that spins up two adapters pointing at the same OrbitDB database address, connected via libp2p, and exercises:
+  - Concurrent writes from both replicas at adjacent Lamports — assert one wins via OrbitDB log layer and the loser observes the winner on next read.
+  - Pre-sync concurrent tombstone vs live-write — assert behaviour matches the §7.0 contract (LWW; loser must observe + bump past on next read).
+- Quantify how often the pre-sync race occurs in practice (operational data — separate effort).
 
 **Files**:
-- New: `tests/integration/profile/concurrent-replica-outbox.test.ts`
+- Done: `tests/integration/profile/concurrent-replica-outbox.test.ts` (writer-layer harness).
+- Open: extend `profile/orbitdb-adapter.ts` for two-peer test mode; add a follow-up integration test that uses it.
 
-**Complexity**: Large. Real OrbitDB + libp2p in tests is heavyweight.
+**Complexity (residual)**: Large. Real OrbitDB + libp2p in tests is heavyweight; adapter changes touch the libp2p config path.
 
-**Blast radius**: Low. Test-only addition.
+**Blast radius (residual)**: Low. Test-only addition; adapter test-mode changes are gated behind an opt-in config.
 
 ---
 
@@ -315,6 +335,19 @@ Operators receiving these have no documented "do this" guidance.
 
 ## Cross-cutting concerns
 
+### Pointer-layer vs OrbitDB-log layering (architectural clarification)
+
+The profile layer has TWO distinct distribution mechanisms running in parallel, often confused:
+
+| Layer | What it carries | Conflict resolution |
+|-------|-----------------|---------------------|
+| **Aggregator pointer** | The CID of the current profile-state CAR (the `tokens.bundle.*` aggregate). One small commitment per flush, anchored to BFT-backed inclusion proofs. | Unicity aggregator's Sparse Merkle Tree provides total ordering and immutability over the sequence of profile-state pointers. Append-only by construction. See `docs/uxf/PROFILE-AGGREGATOR-POINTER-SPEC.md`. |
+| **OrbitDB Hash Log** | Per-entry-key writes for OUTBOX/SENT/dispositions/etc. — direct `db.put` calls at keys like `${addr}.outbox.${id}`. NOT bundled into CARs. NOT pointer-published. | OrbitDB's underlying CRDT: LWW lex-sort on entry hashes for concurrent writes to the same key. Lamport stamps + tombstones + refuse-write guard (Issue #166 P1 #2) provide POST-sync safety. |
+
+**Implication for the writer-layer concerns in this doc**: items #1–#9 concern OUTBOX/SENT entries that live in the OrbitDB Hash Log layer (not the pointer layer). The pointer mechanism's "Single Irreversible Provable History" guarantee covers WHICH CAR is the current profile state — it does NOT cover which value wins for an OUTBOX/SENT slot under concurrent same-key writes from two peers.
+
+**Pubsub clarification**: OrbitDB pubsub IS still wired in `profile/orbitdb-adapter.ts:243-246` (gossipsub is a hard requirement for OrbitDB v3). It is explicitly DEMOTED to a hint channel — `lifecycle-manager.ts:27-49` treats pubsub events as a wake-up signal to poll the aggregator NOW, not as authoritative state. The aggregator pointer is the authority; pubsub is a latency optimisation (collapsing worst-case cross-device sync from ~90 s to ~1-2 s).
+
 ### Lamport-on-tombstone is incomplete CRDT semantics
 
 We documented this in the conversation thread that led to Issue #166's close. The refuse-write guard catches the **post-sync** resurrection attempt (replica B observes A's tombstone, attempts write, refused). It does **NOT** catch the pre-sync concurrent race (both replicas write at the same time, OrbitDB picks one via LWW, the loser's signal is lost). Fully closing this requires:
@@ -323,17 +356,36 @@ We documented this in the conversation thread that led to Issue #166's close. Th
 - Reader-side merge that prefers tombstone over live entry when tombstone.lamport >= live.lamport
 - Two-phase tombstone propagation (replicas exchange tombstones before either acts on a key)
 
-That's a real CRDT implementation, well beyond the scope of #166. Item #9 (integration tests) should at least quantify how often the pre-sync race occurs in practice.
+That's a real CRDT implementation, well beyond the scope of #166. Item #9's residual scope (real-OrbitDB-log integration test under live libp2p replication) should at least quantify how often the pre-sync race occurs in practice. **Note**: this concern lives at the OrbitDB Hash Log layer — the aggregator pointer mechanism does NOT address it because OUTBOX/SENT entries are not pointer-published (see "Pointer-layer vs OrbitDB-log layering" above).
+
+### D0 JOIN Rules 3 & 4 — same-tokenId chain resolution (NEW)
+
+Surfaced by the 2026-05-18 architectural review of the pointer mechanism. Documented in `docs/uxf/PROFILE-AGGREGATOR-POINTER-D0-JOIN-AUDIT.md`; called out inline at `profile/pointer-wiring.ts:36-40`.
+
+When two profile flushes from different devices result in CARs that both list the **same `tokenId`** with **different root hashes** (concurrent operations on the same token), the JOIN at `UxfPackage.merge()` resolves the collision by **last-writer-wins on manifest insertion order** rather than by **longest-valid-chain** with proof verification:
+
+- **Rule 3 (longest-valid-chain)**: when two manifests collide on a tokenId, prefer the chain whose head has the most aggregator-verified transitions behind it. Not implemented for the LWW path.
+- **Rule 4 (proof-enrichment)**: lift verified proofs from one merge candidate into the synthesised token-root when only one side carries them. Wired for the proof-verifier path but does not influence Rule 3's gap.
+
+**Why this is a real concern**: the pointer layer correctly resolves "which CAR is current" — both devices' CARs will be discoverable via their respective historical pointers. But when both CARs are JOINed at load time, conflicting tokenIds are resolved by insertion order (and that order is itself a function of OrbitDB LWW lex-sort timing on the `tokens.bundle.*` ref writes). For non-trivial concurrent operations on the same token from two devices, this can silently discard one device's token history.
+
+**Why it's not in the numbered items above**: it sits one layer below the OUTBOX/SENT writer concerns and requires its own design effort. It belongs in this cross-cutting section as a forward reference; the actual closure work is tracked in the D0 audit doc.
+
+**Recommended next action**: open a tracking issue against `pointer-wiring.ts` / `UxfPackage.merge` for the Rules 3 + 4 closure work, with proof-verifier integration to use `OracleProvider.verifyInclusionProof` as the longest-valid-chain arbiter.
 
 ### "Re-publish from where?" — bundle storage
 
-Items #2 (retention re-publish) and #6 (CAR mode re-publish) both run into the same problem: we don't durably store the bundle bytes after the initial publish. A retention-resilient re-publish needs bundle storage. Options:
+Items #2 (retention re-publish) and #6 (CAR mode re-publish) both run into the same question: where does the re-publisher get the bundle bytes after the initial publish?
 
-- **Keep CAR bytes in OUTBOX entry** until SENT-write succeeds + retention window expires. Inflates OUTBOX storage but localizes the data.
-- **Pin to IPFS with long TTL** so re-fetch is possible. Decouples sender from retention but depends on IPFS reliability.
-- **Re-package from source**. The source tokens were burned — local state is post-spend. Reconstructing the original bundle from post-spend state is non-trivial and may not be deterministic.
+**Architectural directive (2026-05-18)**: bundle bytes are **NEVER** stored in OUTBOX, SENT, or tombstones. Only the CID is retained. The IPFS pin on our node is the source of truth for bundle bytes; Nostr carries either inline CAR (sender's choice for small bundles) or the CID-by-reference. This rules out the "keep CAR bytes in OUTBOX entry" option from the earlier draft.
 
-This is the single biggest open architectural question on the send side.
+**Forward path** (not yet implemented; tracked here for the future PR):
+
+- The SENT entry already carries `bundleCid`. The IPFS pin keyed by that CID is the only place the original CAR bytes live.
+- A retention-driven re-publish (item #2, post-MVP) materialises a fresh OUTBOX entry from the SENT entry (`id`, `bundleCid`, `tokenIds`, `recipientTransportPubkey`, etc.), status `'sending'`, and lets the SendingRecoveryWorker republish via its existing path. Item #6's `'cid-over-nostr'` arm handles this trivially.
+- For `'car-over-nostr'` entries the sender can fetch the CAR bytes from our IPFS pin (using the SENT entry's `bundleCid`) and re-emit inline — OR transparently downgrade to `'cid-over-nostr'` if the receiver accepts either. Item #6's current behaviour (throw → `'failed-transient'`) becomes the fallback when the IPFS pin is gone.
+
+This unblocks the `'entry-tombstoned-or-missing'` skip reason on `transfer:retention-republish-skipped` (item #2's most common skip case) for both delivery modes.
 
 ---
 
