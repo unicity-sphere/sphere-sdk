@@ -132,6 +132,38 @@ export class ProfileTokenStorageProvider
   private flushPromise: Promise<void> | null = null;
   private readonly flushDebounceMs: number;
 
+  // --- Item #15 Phase C.2 — dirty-signal debounce ---
+  /**
+   * Debounce timer armed by `notifyProfileDirty()`. Separate from
+   * `flushTimer` because the lean-snapshot publish path is independent
+   * of the token-bundle pin path (each can fire without the other).
+   * Phase E will collapse the two when the bundle-only publish is
+   * removed.
+   */
+  private dirtyFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * In-flight dirty-flush promise. Held to serialize concurrent
+   * dispatches (a second notifyProfileDirty() that arrives mid-flush
+   * gets coalesced into the next debounce window).
+   */
+  private dirtyFlushPromise: Promise<void> | null = null;
+  /**
+   * Latch — set when `notifyProfileDirty()` is called during an
+   * in-flight flush. Re-arms the debounce after the current flush
+   * settles so we don't lose the signal.
+   */
+  private dirtyFlushPending = false;
+  /**
+   * Sticky latch — true once {@link shutdown} has completed at least
+   * once. Distinct from `isShuttingDown` (which is reset to `false`
+   * at the end of shutdown so re-arming-shutdown-on-restart works)
+   * and from `status === 'disconnected'` (which is also the
+   * pre-connect default). Used by `notifyProfileDirty` to ignore
+   * late-arriving signals from writers that outlive the provider.
+   */
+  private hasShutdown = false;
+  private readonly dirtyFlushDebounceMs: number;
+
   // --- Cold-start sync dedup (steelman) ---
   // When two sync() calls race during cold-start, both observe
   // `lastLoadedData === null && knownBundleCids.size > 0` and both fall
@@ -250,6 +282,10 @@ export class ProfileTokenStorageProvider
     this.localCache = localCache ?? null;
     this.flushDebounceMs =
       options?.flushDebounceMs ?? options?.config?.flushDebounceMs ?? DEFAULT_FLUSH_DEBOUNCE_MS;
+    // Item #15 Phase C.2 — dirty-signal debounce. Default matches the
+    // bundle-flush debounce; tunable via options for tests.
+    this.dirtyFlushDebounceMs =
+      options?.dirtyFlushDebounceMs ?? this.flushDebounceMs;
 
     if (encryptionKey) {
       this.encryptionKey = encryptionKey;
@@ -404,10 +440,25 @@ export class ProfileTokenStorageProvider
    * Item #15 Phase C — central handler for "some profile state changed"
    * signals from per-writer mutations and JOIN-applied remote changes.
    *
-   * Today this is a no-op stub. Phase C.2 will route into the
-   * FlushScheduler so the next debounce window builds a lean profile
-   * snapshot and publishes its CID via the aggregator pointer. Phase D
-   * adds the pull-side dispatcher that consumes those snapshots.
+   * Arms (or re-arms) a debounce timer. When the timer fires, the
+   * host-injected `onProfileDirtyFlush` callback runs. Sphere wires
+   * that callback to build a lean profile snapshot, pin it to IPFS,
+   * and publish the CID via the aggregator pointer layer.
+   *
+   * Coalescing semantics:
+   *   - Multiple notifyProfileDirty() calls within `dirtyFlushDebounceMs`
+   *     coalesce into a single fire (last-one-wins on the timer reset).
+   *   - A signal that arrives DURING an in-flight flush sets
+   *     `dirtyFlushPending = true`. When the flush settles, the next
+   *     debounce window is armed automatically so we don't lose the
+   *     signal.
+   *   - When `onProfileDirtyFlush` is absent (default during Phase C
+   *     rollout), the timer still arms but the fire body is a no-op
+   *     beyond the latch handling. This lets tests assert the wiring
+   *     end-to-end without needing the full Sphere closure.
+   *
+   * Cancelled on shutdown — see {@link cancelDirtyFlushTimer} (invoked
+   * by the lifecycle manager's shutdown path).
    *
    * Wired into:
    *   - BundleIndex.addBundle / joinSnapshot (this provider's bundle ref)
@@ -417,7 +468,109 @@ export class ProfileTokenStorageProvider
    *     deleteKey paths
    */
   private notifyProfileDirty(): void {
-    // No-op stub. Phase C.2 will arm a debounced lean-snapshot flush.
+    if (this.isShuttingDown || this.hasShutdown) return;
+
+    // If a flush is in flight, record that another arrived and let
+    // the in-flight one settle. The post-flush hook re-arms the timer.
+    if (this.dirtyFlushPromise !== null) {
+      this.dirtyFlushPending = true;
+      return;
+    }
+
+    // Clear any existing timer — this is a debounce reset.
+    if (this.dirtyFlushTimer !== null) {
+      clearTimeout(this.dirtyFlushTimer);
+    }
+
+    this.dirtyFlushTimer = setTimeout(() => {
+      this.dirtyFlushTimer = null;
+      this.dispatchDirtyFlush();
+    }, this.dirtyFlushDebounceMs);
+  }
+
+  /**
+   * Item #15 Phase C.2 — invoke the host-injected
+   * `onProfileDirtyFlush` callback (if wired). Errors are caught and
+   * surfaced via `storage:error` with a typed code; they never
+   * propagate into the caller's path because the dirty signal is
+   * best-effort by design.
+   *
+   * If another `notifyProfileDirty()` arrived while this flush was
+   * running, re-arm the debounce so the next signal isn't lost.
+   */
+  private dispatchDirtyFlush(): void {
+    if (this.isShuttingDown) return;
+    const callback = this.options?.onProfileDirtyFlush;
+    if (typeof callback !== 'function') {
+      // No-op fire path. This is the default during Phase C rollout —
+      // Phase D wires the actual lean-snapshot build + publish.
+      this.consumePendingDirtyFlag();
+      return;
+    }
+
+    const flush = (async () => {
+      try {
+        await callback();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.log(`onProfileDirtyFlush failed: ${msg}`);
+        this.emitEvent(
+          this.buildErrorEvent(
+            'storage:error',
+            err,
+            'PROFILE_DIRTY_FLUSH_FAILED',
+          ),
+        );
+      }
+    })().finally(() => {
+      // Identity-check — only clear if we are the most recent flush.
+      // A concurrent flush dispatched mid-await would have replaced
+      // `dirtyFlushPromise`; clearing wholesale would clobber it.
+      if (this.dirtyFlushPromise === flush) {
+        this.dirtyFlushPromise = null;
+      }
+      this.consumePendingDirtyFlag();
+    });
+    this.dirtyFlushPromise = flush;
+  }
+
+  /**
+   * Item #15 Phase C.2 — if a notifyProfileDirty() call arrived
+   * during the just-completed flush, re-arm the debounce so we don't
+   * lose the signal. Called from the dispatch path's `.finally`.
+   */
+  private consumePendingDirtyFlag(): void {
+    if (!this.dirtyFlushPending) return;
+    this.dirtyFlushPending = false;
+    // Re-arm — guarded against shutdown.
+    if (this.isShuttingDown) return;
+    this.notifyProfileDirty();
+  }
+
+  /**
+   * Cancel any armed dirty-flush debounce timer. Called by the
+   * lifecycle manager during shutdown to prevent late-firing
+   * callbacks after the provider has been torn down.
+   *
+   * Does NOT abort an in-flight `dirtyFlushPromise` — the lifecycle
+   * manager awaits that separately via the host.
+   */
+  cancelDirtyFlushTimer(): void {
+    if (this.dirtyFlushTimer !== null) {
+      clearTimeout(this.dirtyFlushTimer);
+      this.dirtyFlushTimer = null;
+    }
+    // Clear any pending latch — the shutdown path won't re-arm.
+    this.dirtyFlushPending = false;
+  }
+
+  /**
+   * Item #15 Phase C.2 — await the most recent dirty-flush dispatch
+   * if one is in flight. Returns immediately when no flush is active.
+   * Used by `shutdown()` and tests.
+   */
+  awaitDirtyFlushSettled(): Promise<void> {
+    return this.dirtyFlushPromise ?? Promise.resolve();
   }
 
   // ---------------------------------------------------------------------------
@@ -464,7 +617,23 @@ export class ProfileTokenStorageProvider
   }
 
   async shutdown(): Promise<void> {
+    // Item #15 Phase C.2 — cancel the dirty-flush debounce BEFORE the
+    // lifecycle's shutdown so the lifecycle's `setIsShuttingDown(true)`
+    // doesn't race a late-firing timer that would re-enter the dispatch
+    // path. Then await any in-flight dirty-flush callback so we don't
+    // leave a Sphere-injected flush dangling past provider teardown.
+    this.cancelDirtyFlushTimer();
+    try {
+      await this.awaitDirtyFlushSettled();
+    } catch {
+      // Best-effort — the dispatch path already surfaces errors via
+      // storage:error; shutdown shouldn't fail on a flush error.
+    }
     await this.lifecycleManager.shutdown();
+    // Latch the sticky shutdown flag AFTER the lifecycle finishes so
+    // any late-arriving signal from a writer that outlives the
+    // provider becomes a definite no-op.
+    this.hasShutdown = true;
   }
 
   /**

@@ -328,6 +328,41 @@ export interface ProfileTokenStorageProviderOptions {
    * fork the pointer history. Optional during rollout.
    */
   readonly getPointerBuildStatus?: () => 'pending' | 'unavailable' | 'ready';
+  /**
+   * Item #15 Phase C.2 — host-injected debounced handler for
+   * "profile state changed" signals.
+   *
+   * Every per-writer mutation (OUTBOX, SENT, finalization queue,
+   * recipient context, bundle index) and every JOIN-applied remote
+   * change calls into the provider's `notifyProfileDirty()` method
+   * (also exposed via the host interface). The provider debounces
+   * these notifications over `dirtyFlushDebounceMs` and, when the
+   * timer fires, invokes this callback.
+   *
+   * The natural caller (Sphere / pointer wiring) implements the
+   * callback to:
+   *   1. Build a lean profile snapshot via `buildLeanProfileSnapshot()`.
+   *   2. Pin the snapshot CAR to IPFS.
+   *   3. Publish the snapshot CID via the aggregator pointer layer.
+   *
+   * Optional. When omitted, `notifyProfileDirty()` is a no-op — the
+   * Phase B sync writers stay wired but no aggregator-pointer
+   * publication happens for non-token-bundle state. This is the
+   * default during Phase C rollout; Phase D/E land the full pipeline.
+   *
+   * Errors thrown by the callback are caught and surfaced via a
+   * `storage:error` event with `code: 'PROFILE_DIRTY_FLUSH_FAILED'`.
+   * They do NOT propagate into write paths — dirty signalling is
+   * best-effort by design.
+   */
+  readonly onProfileDirtyFlush?: () => Promise<void>;
+  /**
+   * Item #15 Phase C.2 — debounce window for `notifyProfileDirty`
+   * signals. Defaults to `flushDebounceMs` (2000ms). Set lower for
+   * tests; higher for high-write-volume wallets where the natural
+   * flush cadence is already the throttle.
+   */
+  readonly dirtyFlushDebounceMs?: number;
   /** Enable debug logging */
   readonly debug?: boolean;
 }
