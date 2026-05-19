@@ -58,10 +58,18 @@ describe('outbox-state-machine — §7.0 table size', () => {
     //     finalizing→failed-transient,                                (3)
     //   failed-transient→sending, failed-transient→failed-permanent,  (2)
     //   failed-permanent→finalizing (override),                       (1)
+    //   packaging→failed-conflict, pinned→failed-conflict,
+    //     sending→failed-conflict, delivered→failed-conflict,
+    //     delivered-instant→failed-conflict,                          (5)
+    //   failed-conflict→finalizing (override),                        (1)
     //   finalized→expired                                             (1)
     //   ────────────────────────────────────────────────────────────
-    //   19 rows total
-    expect(ALLOWED_TRANSITIONS).toHaveLength(19);
+    //   25 rows total
+    //
+    // Item #14 Phase 1 row-count bump: +5 entry arcs for the new
+    // `'failed-conflict'` terminal status + 1 override escape-hatch
+    // arc (mirrors `failed-permanent → finalizing`).
+    expect(ALLOWED_TRANSITIONS).toHaveLength(25);
   });
 
   it('every row uses canonical UxfOutboxStatus values on both ends', () => {
@@ -77,13 +85,19 @@ describe('outbox-state-machine — §7.0 table size', () => {
     }
   });
 
-  it('exactly one override-conditioned row exists (the §7.0 escape-hatch)', () => {
+  it('exactly two override-conditioned rows exist (§7.0 escape-hatches)', () => {
+    // Item #14 Phase 1: `failed-conflict → finalizing` joined
+    // `failed-permanent → finalizing` as an operator-override escape
+    // arc. Both terminal-failure statuses follow the same recovery
+    // contract.
     const overrideRows = ALLOWED_TRANSITIONS.filter(
       (r) => r.condition.kind === 'override',
     );
-    expect(overrideRows).toHaveLength(1);
-    expect(overrideRows[0].from).toBe('failed-permanent');
-    expect(overrideRows[0].to).toBe('finalizing');
+    expect(overrideRows).toHaveLength(2);
+    const fromSet = new Set(overrideRows.map((r) => r.from));
+    const toSet = new Set(overrideRows.map((r) => r.to));
+    expect(fromSet).toEqual(new Set(['failed-permanent', 'failed-conflict']));
+    expect(toSet).toEqual(new Set(['finalizing']));
   });
 });
 

@@ -263,11 +263,45 @@ export const ALLOWED_TRANSITIONS: ReadonlyArray<AllowedTransition> = [
   // failed-permanent → finalizing (operator escape-hatch override only)
   { from: 'failed-permanent', to: 'finalizing', condition: { kind: 'override' } },
 
+  // OUTBOX-SEND-FOLLOWUPS Item #14 Phase 1 — failed-conflict (NEW)
+  //
+  // The aggregator rejected our `submitTransferCommitment` because the
+  // source `stateHash` is already spent on-chain. The dispatcher
+  // confirms this via `oracle.isSpent(sourceStateHash)` and routes
+  // the OUTBOX entry to the new `failed-conflict` terminal.
+  //
+  // Reachable from any active state where commit-submission is
+  // possible. In practice for greenfield sends the OUTBOX entry does
+  // NOT yet exist at the submit throw site (it is created AFTER the
+  // commit step in conservative/instant senders); these arcs cover
+  // future recovery paths that detect the spent state on an entry
+  // already past `packaging`/`pinned`/`sending`. The orchestrator
+  // also runs the recovery worker after a retention re-publish drops
+  // the entry back to `'sending'`; if that re-submitted commit hits
+  // the spent state, the entry transitions `sending → failed-conflict`.
+  //
+  // `delivered → failed-conflict` / `delivered-instant → failed-conflict`:
+  // covers the case where the worker re-armed the entry back to
+  // `sending` via retention re-publish and a subsequent classification
+  // detects the spent state mid-arc. Conservative — preserves the
+  // operator-visible signal even when the worker drops the entry
+  // back to `'delivered'` before re-arming.
+  //
+  // failed-conflict is TERMINAL except via the operator-override
+  // escape hatch (mirrors `failed-permanent`).
+  { from: 'packaging', to: 'failed-conflict', condition: { kind: 'unconditional' } },
+  { from: 'pinned', to: 'failed-conflict', condition: { kind: 'unconditional' } },
+  { from: 'sending', to: 'failed-conflict', condition: { kind: 'unconditional' } },
+  { from: 'delivered', to: 'failed-conflict', condition: { kind: 'unconditional' } },
+  { from: 'delivered-instant', to: 'failed-conflict', condition: { kind: 'unconditional' } },
+  { from: 'failed-conflict', to: 'finalizing', condition: { kind: 'override' } },
+
   // finalized → expired (retention window)
   { from: 'finalized', to: 'expired', condition: { kind: 'unconditional' } },
 
   // expired — TERMINAL (no outgoing arcs)
   // failed-permanent — TERMINAL except via the override row above
+  // failed-conflict — TERMINAL except via the override row above
 ];
 
 // =============================================================================

@@ -786,14 +786,21 @@ describe('OutboxWriter — update error paths', () => {
 
 describe('UxfOutboxStatus — stability snapshot (§7)', () => {
   /**
-   * Sorted snapshot of the canonical 10 outbox statuses per
+   * Sorted snapshot of the canonical 11 outbox statuses per
    * UXF-TRANSFER-PROTOCOL §7. Adding/removing/renaming any value
    * breaks this test, forcing an ADR + on-disk migration plan.
+   *
+   * Item #14 Phase 1 (OUTBOX-SEND-FOLLOWUPS): +1 status
+   * `'failed-conflict'` — terminal status for multi-device double-spend
+   * losers (the L3 aggregator anchored a competing commit for the
+   * same source state). Operator-override escape-hatch mirrors
+   * `failed-permanent`.
    */
   const EXPECTED_SORTED_STATUSES: ReadonlyArray<string> = [
     'delivered',
     'delivered-instant',
     'expired',
+    'failed-conflict',
     'failed-permanent',
     'failed-transient',
     'finalized',
@@ -803,8 +810,8 @@ describe('UxfOutboxStatus — stability snapshot (§7)', () => {
     'sending',
   ];
 
-  it('contains exactly 10 values', () => {
-    expect(UXF_OUTBOX_STATUSES).toHaveLength(10);
+  it('contains exactly 11 values', () => {
+    expect(UXF_OUTBOX_STATUSES).toHaveLength(11);
   });
 
   it('matches the canonical sorted snapshot from §7', () => {
@@ -835,10 +842,12 @@ describe('partitionStatus — three-tier partition (§7.1)', () => {
     expect(partitionStatus('failed-transient')).toBe('soft-terminal');
   });
 
-  it('classifies expired/finalized/failed-permanent as hard-terminal', () => {
+  it('classifies expired/finalized/failed-permanent/failed-conflict as hard-terminal', () => {
     expect(partitionStatus('expired')).toBe('hard-terminal');
     expect(partitionStatus('finalized')).toBe('hard-terminal');
     expect(partitionStatus('failed-permanent')).toBe('hard-terminal');
+    // Item #14 Phase 1 — new hard-terminal status.
+    expect(partitionStatus('failed-conflict')).toBe('hard-terminal');
   });
 
   it('exhaustively covers UXF_OUTBOX_STATUSES', () => {
