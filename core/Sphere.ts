@@ -433,6 +433,66 @@ async function deriveL3PredicateAddress(privateKey: string): Promise<string> {
 }
 
 // =============================================================================
+// Issue #174 — spent-state-rescan AUDIT DispositionWriter factory
+// =============================================================================
+
+/**
+ * Build a {@link DispositionWriter} narrowed to the AUDIT collection
+ * (`reason: 'off-record-spend'`, §5.3 [E] / §5.4) for the spent-state
+ * rescan worker.
+ *
+ * The writer's `manifestStore` field is wired to a throw-on-access
+ * stub: the spent-state-rescan default closure only routes through
+ * `writeAudit` (which never touches `manifestStore`), so any
+ * accidental invocation of the VALID / PENDING / CONFLICTING branches
+ * on THIS writer instance fires the stub loudly. Defense-in-depth:
+ * the writer's discriminated-union switch routes by `record.disposition`
+ * — non-AUDIT records reach the manifest path and the stub catches
+ * them, surfacing a clear `INTERNAL_ERROR` instead of silent data
+ * loss.
+ *
+ * Returns a writer immediately ready to be passed to
+ * `PaymentsModule.installSpentStateAuditWriter`. Never throws at
+ * construction time.
+ */
+async function buildSpentStateAuditWriter(
+  adapter: import('../profile/disposition-storage-adapters').OrbitDbDispositionStorageAdapter,
+  emitEvent: <T extends import('../types').SphereEventType>(
+    type: T,
+    data: import('../types').SphereEventMap[T],
+  ) => void,
+): Promise<import('../profile/disposition-writer').DispositionWriter> {
+  const { DispositionWriter } = await import('../profile/disposition-writer');
+  const { ManifestStore } = await import('../profile/manifest-store');
+  const { Lamport } = await import('../profile/lamport');
+  const stubManifestStorage: import('../profile/manifest-cas').MinimalManifestStorage = {
+    async readEntry(): Promise<never> {
+      throw new SphereError(
+        'spent-state-rescan AUDIT-only DispositionWriter: manifestStore.readEntry called — ' +
+          'this writer is wired only for AUDIT records; non-AUDIT records must not be routed through it.',
+        'VALIDATION_ERROR',
+      );
+    },
+    async writeEntry(): Promise<never> {
+      throw new SphereError(
+        'spent-state-rescan AUDIT-only DispositionWriter: manifestStore.writeEntry called — ' +
+          'this writer is wired only for AUDIT records; non-AUDIT records must not be routed through it.',
+        'VALIDATION_ERROR',
+      );
+    },
+  };
+  const stubManifestStore = new ManifestStore({
+    storage: stubManifestStorage,
+    lamport: new Lamport(),
+  });
+  return new DispositionWriter({
+    storage: adapter,
+    manifestStore: stubManifestStore,
+    emit: emitEvent,
+  });
+}
+
+// =============================================================================
 // Mutable Identity (internal use only)
 // =============================================================================
 
@@ -2721,6 +2781,25 @@ export class Sphere {
             ? { verifyProof: verifyProofAdapter }
             : undefined,
         );
+        // Issue #174 (DispositionWriter wiring) — also wire the
+        // spent-state-rescan AUDIT route. Re-uses the same OrbitDb
+        // adapter so the `_audit` records the operator escape-hatch
+        // imports already touch and the records the spent-state-rescan
+        // worker writes both land in the SAME collection — single
+        // source of truth per §5.4.
+        try {
+          const auditWriter = await buildSpentStateAuditWriter(adapter, emitEvent);
+          payments.installSpentStateAuditWriter(auditWriter);
+          logger.debug(
+            'Sphere',
+            `Wired spent-state-rescan AUDIT DispositionWriter for address ${index}`,
+          );
+        } catch (auditErr) {
+          logger.warn(
+            'Sphere',
+            `Failed to wire spent-state-rescan AUDIT DispositionWriter for address ${index}: ${safeErrorMessage(auditErr)}`,
+          );
+        }
         logger.debug(
           'Sphere',
           `Wired OrbitDb-backed disposition storage + verifyProof for address ${index}`,
@@ -5120,6 +5199,25 @@ export class Sphere {
             ? { verifyProof: verifyProofAdapter }
             : undefined,
         );
+        // Issue #174 (DispositionWriter wiring) — primary-address
+        // mirror of the multi-address wiring above. The OrbitDb
+        // adapter backs BOTH the operator escape-hatch importer's
+        // `_audit` writes and the spent-state-rescan worker's
+        // off-record-spend AUDIT writes.
+        try {
+          const sphereEmit = this.emitEvent.bind(this);
+          const auditWriter = await buildSpentStateAuditWriter(adapter, sphereEmit);
+          this._payments.installSpentStateAuditWriter(auditWriter);
+          logger.debug(
+            'Sphere',
+            'Wired spent-state-rescan AUDIT DispositionWriter (primary address)',
+          );
+        } catch (auditErr) {
+          logger.warn(
+            'Sphere',
+            `Failed to wire spent-state-rescan AUDIT DispositionWriter (primary address): ${safeErrorMessage(auditErr)}`,
+          );
+        }
         logger.debug(
           'Sphere',
           'Wired OrbitDb-backed disposition storage + oracle.verifyInclusionProof into operator escape-hatch importer',
