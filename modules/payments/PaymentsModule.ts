@@ -2110,12 +2110,15 @@ export class PaymentsModule {
     // (UXF-TRANSFER-PROTOCOL §12.3.2). Default-OFF; when ON the worker
     // probes oracle.isSpent for each `'confirmed'` token to detect
     // off-record spends from sibling instances of the same wallet.
-    // `transitionToAudit` routes detection through the disposition
-    // writer when one is wired; otherwise the worker stays in
-    // detect-only mode (event-only). The `oracleProvider` closure
-    // reads `this.deps?.oracle` lazily so a future `deps` re-init
-    // (e.g. oracle swap on reconnect) is observed; same closure
-    // pattern as `sentProvider` / `outboxProvider` for consistency.
+    // `transitionToAudit` defaults to {@link defaultSpentStateTransition}
+    // (local Token.status flip + archive + tombstone via removeToken);
+    // callers that need to route through a production-wired
+    // `DispositionWriter.write()` (future, once that wiring lands in
+    // production) override via {@link setSpentStateRescanTransitionToAudit}.
+    // The `oracleProvider` closure reads `this.deps?.oracle` lazily so
+    // a future `deps` re-init (e.g. oracle swap on reconnect) is
+    // observed; same closure pattern as `sentProvider` / `outboxProvider`
+    // for consistency.
     if (
       this.features.spentStateRescan &&
       this.spentStateRescanWorker === null
@@ -2138,7 +2141,8 @@ export class PaymentsModule {
         outboxProvider: (): Pick<OutboxWriter, 'readAll'> | null =>
           this._outboxWriter,
         transitionToAudit:
-          this._spentStateRescanTransitionToAudit ?? undefined,
+          this._spentStateRescanTransitionToAudit ??
+          this.defaultSpentStateTransition.bind(this),
         emit: sphereEmit,
         logger: {
           warn: (message: string, context?: Record<string, unknown>): void => {
@@ -3796,6 +3800,106 @@ export class PaymentsModule {
     return 'recovered';
   }
 
+  /**
+   * Issue #174 — default `transitionToAudit` route for the spent-state
+   * rescan worker (UXF-TRANSFER-PROTOCOL §12.3.2).
+   *
+   * Strategy: the off-record spend is FINAL (the L3 aggregator confirmed
+   * the source state is spent), so the local token's value is gone from
+   * THIS wallet's perspective regardless of who spent it. Apply the same
+   * local-side cleanup that a successful local send applies:
+   *
+   *   1. Archive the token to history.
+   *   2. Write a tombstone for `(tokenId, stateHash)` so a subsequent
+   *      sync (Item #15 profile-pointer rescan, manual restore, etc.)
+   *      cannot resurrect the token.
+   *   3. Remove from the active in-memory map.
+   *   4. Persist via `save()`.
+   *
+   * This is `removeToken()`'s exact contract — we delegate to it. The
+   * archived record + tombstone preserves forensic context (the event
+   * already fired with `tokenId / coinId / amount / suspectedSibling
+   * Instance`, so operators can correlate after the fact).
+   *
+   * **Why not write `_audit` durable record here**: the
+   * `DispositionWriter` route (§5.4 `_audit` collection) is the
+   * canonical durable-record surface. Today `DispositionWriter` is
+   * constructed only in tests — no production bootstrap wires it. When
+   * that wiring lands, callers can override this default via
+   * {@link setSpentStateRescanTransitionToAudit} to additionally
+   * synthesize an AUDIT record. The local Token.status flip is
+   * orthogonal: it removes the spent value from the UI regardless of
+   * the durable-record path.
+   *
+   * **Defensive guards**:
+   *  - Token concurrent-removal: `this.tokens.get(token.id)` may return
+   *    `undefined` if a concurrent path (legitimate send, manual triage,
+   *    another worker cycle) already removed the token. No-op in that
+   *    case — the desired terminal state was reached.
+   *  - Status drift: if the token's status is no longer `'confirmed'`
+   *    (e.g. concurrent send moved it to `'transferring'`), defer to the
+   *    other path — the send pipeline owns the transition.
+   *  - `removeToken` throw: surface in a warn-log; the worker's caller
+   *    contract already swallows throws from `transitionToAudit`. The
+   *    `transfer:off-record-spent` event already fired so operator
+   *    visibility is preserved.
+   *
+   * Never throws — defense-in-depth converts every error path to a
+   * warn-log so the worker's outer `try/catch` in `probeOne` sees the
+   * call as a "best-effort completion" rather than a failure.
+   *
+   * @param params - injected by the SpentStateRescanWorker. Carries the
+   *   snapshot Token reference (NOT a live re-fetch), the derived
+   *   `currentStateHash`, the heuristic `suspectedSiblingInstance` flag,
+   *   and the wall-clock `detectedAt`. The flag is forensic only — both
+   *   true and false produce the same local cleanup.
+   */
+  private async defaultSpentStateTransition(params: {
+    readonly token: Token;
+    readonly currentStateHash: string;
+    readonly suspectedSiblingInstance: boolean;
+    readonly detectedAt: number;
+  }): Promise<void> {
+    const live = this.tokens.get(params.token.id);
+    if (live === undefined) {
+      logger.debug(
+        'Payments',
+        `defaultSpentStateTransition: token ${params.token.id.slice(0, 12)}… already removed; no-op`,
+      );
+      return;
+    }
+    if (live.status !== 'confirmed') {
+      logger.debug(
+        'Payments',
+        `defaultSpentStateTransition: token ${params.token.id.slice(0, 12)}… is now ${live.status} (not 'confirmed'); ` +
+          `deferring to whatever path owns that transition`,
+      );
+      return;
+    }
+    try {
+      // `removeToken` archives, tombstones, removes from the active map,
+      // and persists via `save()`. All four are required for a clean
+      // off-record-spend cleanup — partial application would either
+      // leak forensic context (no archive) or risk re-sync resurrection
+      // (no tombstone) or leave the in-memory map inconsistent.
+      await this.removeToken(params.token.id);
+      logger.debug(
+        'Payments',
+        `defaultSpentStateTransition: token ${params.token.id.slice(0, 12)}… ` +
+          `(coin=${params.token.coinId.slice(0, 12)}, amount=${params.token.amount}, ` +
+          `suspectedSibling=${params.suspectedSiblingInstance}) removed after off-record-spend ` +
+          `(stateHash=${params.currentStateHash.slice(0, 16)}…, detectedAt=${params.detectedAt})`,
+      );
+    } catch (removeErr) {
+      logger.warn(
+        'Payments',
+        `defaultSpentStateTransition: removeToken failed for ${params.token.id.slice(0, 12)}… ` +
+          `(transfer:off-record-spent event already fired; operator triage recommended): ` +
+          `${removeErr instanceof Error ? removeErr.message : String(removeErr)}`,
+      );
+    }
+  }
+
   installOutboxWriter(writer: OutboxWriter | null): void {
     this._outboxWriter = writer;
     if (writer !== null) {
@@ -3895,11 +3999,22 @@ export class PaymentsModule {
   private spentStateRescanWorker: SpentStateRescanWorker | null = null;
   /**
    * @internal — optional override for the spent-state rescan worker's
-   * `transitionToAudit` closure. The bootstrap layer (Sphere) installs
-   * a production wiring (disposition writer route) via
-   * {@link setSpentStateRescanTransitionToAudit}; tests may override.
-   * When unset, the auto-installed worker stays in detect-only mode
-   * (event emission only). Issue #174.
+   * `transitionToAudit` closure. When set via
+   * {@link setSpentStateRescanTransitionToAudit}, the override REPLACES
+   * the default {@link defaultSpentStateTransition} closure that the
+   * auto-install wires in {@link initialize}. The override exists so
+   * future bootstrap-layer work can route detection through a
+   * production-wired `DispositionWriter.write()` (synthesized AUDIT
+   * record per §5.3 [E] / §5.4 — once `DispositionWriter` is
+   * constructed in production; today it lives only in tests).
+   *
+   * Pass `null` (or never call the setter) → the default closure
+   * runs: archive + tombstone + remove from active map via
+   * {@link removeToken}, mirroring `defaultOrphanRecovery`'s pattern.
+   * The token's value leaves the spendable pool and the tombstone
+   * prevents re-sync resurrection.
+   *
+   * Issue #174.
    */
   private _spentStateRescanTransitionToAudit: TransitionToAuditFn | null = null;
   /** @internal — auto-installed when `features.tombstoneGcWorker` is on.
