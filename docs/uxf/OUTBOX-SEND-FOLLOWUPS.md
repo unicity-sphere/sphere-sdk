@@ -460,7 +460,7 @@ to pick up where the work stopped:
 | C.1 (notifyProfileDirty wiring) | ✓ Done | `04e423e` | every writer + host interface + `ProfileStorageProvider.setProfileDirtyNotifier` + `tests/unit/profile/notify-profile-dirty.test.ts` |
 | C.2 (debounce + dispatch surface) | ✓ Done | `a5a2a90` | `ProfileTokenStorageProvider.notifyProfileDirty` + `dirtyFlushTimer`/`dirtyFlushPending`/`hasShutdown` + `onProfileDirtyFlush` option + `tests/unit/profile/profile-token-storage-dirty-flush.test.ts` |
 | C.3 (factory closure wiring) | ✓ Done | `8c241e9` | `profile/factory.ts` (`runProfileDirtyFlush` + `createProfileProviders`), `profile/profile-token-storage-provider.ts` (public `getIdentity()` + `notifyProfileDirty()`) + tests |
-| D.1a (route runProfileDirtyFlush via publishAggregatorPointerBestEffort) | ✓ Done | _pending commit_ | `profile/factory.ts` (`ProfileDirtyFlushDeps.publishCid` slot replaces direct `pointer.publish`), `profile/types.ts` (new `ProfileSnapshotPublishResult`; `onProfileDirtyFlush` return widened), `profile/profile-token-storage-provider.ts` (new `publishLeanSnapshotCid()` public delegate), `tests/unit/profile/factory-dirty-flush.test.ts` (12 tests) |
+| D.1a (route runProfileDirtyFlush via publishAggregatorPointerBestEffort) | ✓ Done | `ccbe3b3` | `profile/factory.ts` (`ProfileDirtyFlushDeps.publishCid` slot replaces direct `pointer.publish`), `profile/types.ts` (new `ProfileSnapshotPublishResult`; `onProfileDirtyFlush` return widened), `profile/profile-token-storage-provider.ts` (new `publishLeanSnapshotCid()` public delegate), `tests/unit/profile/factory-dirty-flush.test.ts` (12 tests) |
 | D.1b (flush-scheduler → snapshot publish) | Pending | — | — |
 | D.2 (pull-side dispatcher) | Pending | — | — |
 | Phase E | Pending | — | — |
