@@ -166,6 +166,18 @@ Until flipped to default-ON, these are dead code for any wallet that doesn't exp
 ### 6. Re-publish on CAR vs CID modes — bundle availability
 
 > **Scope after Item #15**: per the IPFS-pin-only architectural directive, every bundle (regardless of original Nostr delivery mode) is pinned on our IPFS node. The CAR-mode re-publish throw added in commit `72879d1` becomes a defensive fallback rather than the common case — `'cid-over-nostr'` re-publish using the SENT entry's `bundleCid` always succeeds when the pin is live. See Item #15.
+>
+> **Audit verdict (2026-05-19, per ITEM-15-OPERATIONAL-CLOSURE-PROMPT.md gap #4): the throw is NOT YET demotable.** The IPFS-pin-only directive is aspirational; the senders' `modules/payments/transfer/delivery-resolver.ts:resolveDelivery` currently invokes `publishToIpfs` ONLY on the CID branches (`'force-cid'` and `'auto'` over-cap with publisher wired):
+>
+>   - `'force-inline'` → `{ kind: 'inline', carBase64 }` — **NO pin call.**
+>   - `'auto'` ≤ inlineCap → `{ kind: 'inline', carBase64 }` — **NO pin call.**
+>   - `'auto'` over-cap, no publisher, bundle ≤ `RELAY_SAFE_CAP_BYTES` → `carInlineFallback` returns inline — **NO pin call.**
+>   - `'auto'` over-cap with publisher → `{ kind: 'cid', cid, shouldPin: true }` — pin call IS made.
+>   - `'force-cid'` (requires publisher) — pin call IS made.
+>
+> So entries recorded with `deliveryMethod='car-over-nostr'` were inlined on the Nostr wire and **never pinned to the sender's IPFS node**. The default `republish` closure's CAR-mode throw in `PaymentsModule.ts` is therefore still the correct behaviour today for those entries — there is no IPFS pin to fall back to via `'cid-over-nostr'` re-publish. The throw routes the entry to `'failed-transient'` via the recovery worker's `maxRetries` mechanism, which is the §7.0 escape valve for operator triage.
+>
+> **Residual gap (sub-item 6.a — NEW)**: implement the IPFS-pin-only directive at send time by extending `delivery-resolver.ts` so the `'inline'` branches ALSO call `publishToIpfs` (or an equivalent local-pin function) for the same content-addressed CAR bytes. Once that change lands, the sender's IPFS node holds the pin for every bundle regardless of wire delivery mode, the SENT entry's `bundleCid` is reliably fetchable, and the default `republish` closure can downgrade `'car-over-nostr'` re-publishes to `'cid-over-nostr'` shape unconditionally. The current throw then truly becomes the defensive-fallback the doc anticipated. Tracked here as part of Item #6's acceptance criteria; spec-text revision suggested: "Acceptance criteria for 6.a: every successful send (any delivery mode) leaves a live IPFS pin on the sender's local node for `bundleCid`; CAR-mode re-publish closure downgrades to CID-over-Nostr; the throw becomes unreachable in the common case (only reached when the pin TTL has expired AND the bundle bytes are also gone from local storage)."
 
 **Why it matters**: `SendingRecoveryWorker.republish` (the default in PaymentsModule) ships `kind: 'uxf-cid'` for every re-publish, regardless of the original delivery mode. For an entry originally delivered via `kind: 'uxf-car'` (inline CAR), the IPFS pin may not exist — the recipient gets a CID they can't fetch.
 
