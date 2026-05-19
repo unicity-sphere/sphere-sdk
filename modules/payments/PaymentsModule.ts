@@ -4493,11 +4493,24 @@ export class PaymentsModule {
 
   /**
    * Issue #174 — set the closure invoked when the spent-state rescan
-   * worker detects an off-record spend. The bootstrap layer (Sphere)
-   * wires this to a route that calls `dispositionWriter.write()` with
-   * a synthesized AUDIT record (`reason: 'off-record-spend'`). When
-   * unset, the auto-installed worker stays in detect-only mode
-   * (event emission only — no `_audit` transition).
+   * worker detects an off-record spend. When unset (or reset via
+   * `null`), the auto-installed worker uses
+   * {@link defaultSpentStateTransition} — `removeToken()` so the spent
+   * token is archived, tombstoned, and removed from the active map.
+   *
+   * Override use cases:
+   *   - Future bootstrap-layer wiring of `DispositionWriter` (today
+   *     constructed only in tests) — the override can ALSO synthesize
+   *     a durable `_audit` record per §5.3 [E] / §5.4 in addition to
+   *     calling `removeToken()` for the local-state cleanup. The two
+   *     paths are orthogonal.
+   *   - Tests / operator escape-hatch — the override can be an
+   *     explicit no-op (`async () => undefined`) to FORCE detect-only
+   *     mode (event emission only, no local Token.status flip).
+   *
+   * **Important:** passing `null` does NOT give you detect-only mode
+   * — it RESTORES the default closure (`removeToken`). To force
+   * detect-only behavior, pass an explicit no-op closure.
    *
    * The closure takes effect on the NEXT `initialize()` call when the
    * worker is auto-constructed. To replace the route on a running
