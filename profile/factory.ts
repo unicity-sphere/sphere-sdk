@@ -25,10 +25,11 @@ import { ProfileTokenStorageProvider } from './profile-token-storage-provider';
 import { DEFAULT_IPFS_GATEWAYS } from '../constants';
 import {
   buildLeanProfileSnapshot,
+  parseLeanProfileSnapshot,
   type BuildLeanProfileSnapshotResult,
   type LeanProfileSnapshot,
 } from './profile-lean-snapshot';
-import { pinToIpfs } from './ipfs-client';
+import { fetchFromIpfs, pinToIpfs } from './ipfs-client';
 import type { ProfilePointerLayer } from './aggregator-pointer';
 import {
   runProfileSnapshotJoin,
@@ -550,7 +551,9 @@ export function createProfileProviders(
   // hand back null. Calling the build* methods on each apply costs a
   // few object allocations but the result is durable across writer
   // instances (the adapter is a thin handle over `db` + key).
-  storage.setSnapshotApplier((snapshot) =>
+  const dispatchParsedSnapshot = (
+    snapshot: LeanProfileSnapshot,
+  ): Promise<ApplySnapshotResult> =>
     runProfileSnapshotApply(snapshot, {
       writersFor: (addressId) => {
         const writers: SnapshotJoinWriterEntry[] = [];
@@ -584,8 +587,36 @@ export function createProfileProviders(
         return writers;
       },
       getBundleIndex: () => tokenStorage.getBundleIndex(),
-    }),
-  );
+    });
+
+  storage.setSnapshotApplier((snapshot) => dispatchParsedSnapshot(snapshot));
+
+  // Item #15 Phase E follow-up — install the pull-side dispatcher for
+  // the periodic-poll / cold-start recovery paths. Symmetric to
+  // `onProfileDirtyFlush` (which publishes a snapshot CID). This
+  // closure consumes a snapshot CID: fetch the CAR from IPFS,
+  // content-address verified by the fetcher, parse as lean snapshot,
+  // and dispatch through the SAME per-writer JOIN closure used by the
+  // reconcile-loop's `fetchAndJoin`. Avoiding duplication keeps the
+  // two pull paths byte-equivalent at the dispatch layer.
+  //
+  // Cursor advancement is NOT this closure's responsibility — the
+  // pointer's local-version cursor is owned by the reconcile loop's
+  // `fetchAndJoin` callback. The periodic-poll and cold-start
+  // recovery paths originate outside the reconcile loop; they consume
+  // `recoverLatest()` which the pointer layer has already classified.
+  //
+  // We install via `setApplySnapshotCallback` rather than the
+  // construction-time `onApplySnapshot` option because
+  // `dispatchParsedSnapshot` captures the `tokenStorage` reference
+  // (for `getBundleIndex()`), which doesn't exist when the options
+  // object is built. The provider's late-binding setter resolves this
+  // ordering cleanly.
+  tokenStorage.setApplySnapshotCallback(async (cidString) => {
+    const carBytes = await fetchFromIpfs(ipfsGateways, cidString);
+    const snapshot = await parseLeanProfileSnapshot(carBytes);
+    return dispatchParsedSnapshot(snapshot);
+  });
 
   return { storage, tokenStorage };
 }

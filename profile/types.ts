@@ -399,6 +399,40 @@ export interface ProfileTokenStorageProviderOptions {
    */
   readonly onProfileDirtyFlush?: () => Promise<void | ProfileSnapshotPublishResult>;
   /**
+   * Item #15 Phase E follow-up — host-injected pull-side snapshot
+   * applier. Counterpart to `onProfileDirtyFlush` (which publishes a
+   * snapshot CID); this callback consumes a snapshot CID:
+   *
+   *   1. Fetch the CAR for `cidString` from the configured IPFS
+   *      gateways (content-address verified by the fetcher).
+   *   2. Parse it as a {@link LeanProfileSnapshot}.
+   *   3. Dispatch per-writer JOIN over the parsed snapshot via the
+   *      same factory closure that backs
+   *      `ProfileStorageProvider.setSnapshotApplier`.
+   *
+   * Used by `LifecycleManager.runPointerPollOnce` and
+   * `recoverFromAggregatorPointerBestEffort` so the periodic-poll and
+   * cold-start recovery paths consume the pointer's CID as a snapshot
+   * (Item #15) rather than calling `bundleIndex.addBundle()` on the
+   * snapshot CID and corrupting the bundle index. The legacy
+   * `addBundle` path was a latent bug: under Item #15 the pointer's
+   * CID is a snapshot CID, not a UXF bundle CID, so the next `load()`
+   * would try to parse the snapshot CAR as a UXF package and fail.
+   *
+   * Optional. When omitted, lifecycle's pointer paths log and skip
+   * (no legacy fallback per Phase E — silent re-write of the snapshot
+   * CID as a bundle ref is precisely the bug this option fixes).
+   *
+   * Errors thrown by the callback propagate to the lifecycle caller's
+   * outer try/catch and are logged + re-armed on the next periodic
+   * cycle. The pointer cursor is NOT advanced by this path — cursor
+   * advancement remains owned by the reconcile-loop's `fetchAndJoin`
+   * callback in `pointer-wiring.ts`.
+   */
+  readonly onApplySnapshot?: (
+    cidString: string,
+  ) => Promise<import('./profile-snapshot-dispatcher').ApplySnapshotResult>;
+  /**
    * Item #15 Phase C.2 — debounce window for `notifyProfileDirty`
    * signals. Defaults to `flushDebounceMs` (2000ms). Set lower for
    * tests; higher for high-write-volume wallets where the natural

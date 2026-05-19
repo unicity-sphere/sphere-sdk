@@ -440,6 +440,12 @@ export class ProfileTokenStorageProvider
       // publish). Coordinates with the dirty-flush debouncer so we
       // don't double-publish.
       publishSnapshotIfWired: () => this.publishSnapshotIfWired(),
+      // Item #15 Phase E follow-up — pull-side counterpart for the
+      // periodic-poll and cold-start recovery paths in
+      // LifecycleManager. Returns null when no factory closure is wired
+      // (legacy tests); else fetches the CAR, parses as lean snapshot,
+      // and dispatches per-writer JOIN through the host's applier.
+      applySnapshotIfWired: (cid) => this.applySnapshotIfWired(cid),
     };
   }
 
@@ -698,6 +704,69 @@ export class ProfileTokenStorageProvider
         this.notifyProfileDirty();
       }
     }
+  }
+
+  /**
+   * Item #15 Phase E follow-up — late-bound pull-side snapshot applier.
+   * Falls back to `options.onApplySnapshot` (construction-time) if
+   * never set; otherwise the most recent registration wins. Set by
+   * the factory after `tokenStorage` has been constructed so the
+   * closure can reference `tokenStorage.getBundleIndex()` (which would
+   * otherwise be a forward reference at construction time).
+   */
+  private applySnapshotCallback:
+    | ((cidString: string)
+        => Promise<import('./profile-snapshot-dispatcher.js').ApplySnapshotResult>)
+    | null = null;
+
+  /**
+   * Item #15 Phase E follow-up — install / replace the pull-side
+   * snapshot applier. Idempotent: callers MAY re-register; pass `null`
+   * to disable.
+   *
+   * Used by `profile/factory.ts:createProfileProviders` to install the
+   * closure that backs `applySnapshotIfWired()` — the closure
+   * references `tokenStorage.getBundleIndex()` so it must be set AFTER
+   * the provider is constructed (forward-reference at construction
+   * time).
+   */
+  setApplySnapshotCallback(
+    callback:
+      | ((cidString: string)
+          => Promise<import('./profile-snapshot-dispatcher.js').ApplySnapshotResult>)
+      | null,
+  ): void {
+    this.applySnapshotCallback = callback;
+  }
+
+  /**
+   * Item #15 Phase E follow-up — pull-side counterpart to
+   * {@link publishSnapshotIfWired}. Invokes the host-injected applier
+   * (if wired) for the given snapshot CID.
+   *
+   * Returns `null` when no factory closure is wired (legacy tests /
+   * providers without the Phase E follow-up factory closure). On a
+   * wired path the callback fetches the CAR, parses it as a lean
+   * snapshot, and dispatches per-writer JOIN through the same
+   * `runProfileSnapshotApply` closure that backs the pointer-wiring
+   * layer's reconcile path. Errors propagate to the caller so the
+   * periodic-poll / recovery wrapper can log + skip the re-arm.
+   *
+   * The shutdown gate returns `null` so a poll iteration mid-shutdown
+   * skips the apply entirely. The lifecycle's shutdown sequence runs
+   * its own teardown ordering; this method only declines to do new
+   * work after the gate has closed.
+   */
+  async applySnapshotIfWired(
+    cidString: string,
+  ): Promise<import('./profile-snapshot-dispatcher.js').ApplySnapshotResult | null> {
+    if (this.isShuttingDown || this.hasShutdown) return null;
+    // Late-bound setter wins; falls back to construction-time option
+    // for callers that prefer the static-config style.
+    const callback =
+      this.applySnapshotCallback ?? this.options?.onApplySnapshot ?? null;
+    if (typeof callback !== 'function') return null;
+    return callback(cidString);
   }
 
   // ---------------------------------------------------------------------------

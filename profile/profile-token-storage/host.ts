@@ -42,6 +42,7 @@ import type {
 } from '../types.js';
 import type { ProfileDatabase } from '../orbitdb-adapter.js';
 import type { TokenManifest } from '../token-manifest.js';
+import type { ApplySnapshotResult } from '../profile-snapshot-dispatcher.js';
 
 /**
  * Operational state extracted from `TxfStorageDataBase`. Mirrored from
@@ -243,4 +244,37 @@ export interface ProfileTokenStorageHost {
    * fire) — this entry point fires NOW and returns the result.
    */
   publishSnapshotIfWired(): Promise<ProfileSnapshotPublishResult | null>;
+
+  /**
+   * Item #15 Phase E follow-up — pull-side symmetric counterpart to
+   * {@link publishSnapshotIfWired}. Fetches the snapshot CAR for the
+   * given CID, parses it as a {@link LeanProfileSnapshot}, and
+   * dispatches per-writer JOIN through the factory-wired snapshot
+   * applier. Used by `LifecycleManager.runPointerPollOnce` and
+   * `recoverFromAggregatorPointerBestEffort` so the periodic-poll and
+   * cold-start recovery paths consume the pointer's CID as a snapshot
+   * (Item #15) rather than as a UXF bundle CID (the pre-Item-#15
+   * legacy that wrote the snapshot bytes into the bundle index and
+   * blew up on the next load()).
+   *
+   * Semantics:
+   *   - Returns `null` when no `onApplySnapshot` callback is wired
+   *     (legacy tests / providers without the factory closure). Caller
+   *     logs and skips — no legacy bundle-CID fallback per Phase E.
+   *   - On success: returns the dispatcher's
+   *     {@link ApplySnapshotResult} (counters, joinedAny, etc.).
+   *   - On hard failure (CAR fetch, parse, or dispatcher throw):
+   *     re-throws so the caller's outer try/catch can log + skip the
+   *     re-arm round. The pointer cursor is NOT advanced by this path
+   *     (cursor advancement only happens through `fetchAndJoin` on the
+   *     reconcile-loop path); a transient failure on the periodic
+   *     poll is best-effort.
+   *
+   * IMPORTANT: this method does NOT touch the pointer's local-version
+   * cursor — both the poll and recovery paths originate outside the
+   * cursor-advancement protocol (they consume `recoverLatest()` which
+   * the pointer layer already classified). The cursor advance is owned
+   * by the reconcile loop's `fetchAndJoin` callback exclusively.
+   */
+  applySnapshotIfWired(cidString: string): Promise<ApplySnapshotResult | null>;
 }

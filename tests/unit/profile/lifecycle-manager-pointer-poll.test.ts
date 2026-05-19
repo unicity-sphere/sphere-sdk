@@ -4,29 +4,35 @@
  *
  * Path 1 — OrbitDB pubsub (libp2p gossipsub) — is live and peer-to-peer.
  * Path 2 — aggregator pointer + IPFS — is used at cold-start by
- * `recoverFromAggregatorPointerBestEffort()` but historically was never
- * re-polled afterwards. The periodic poll added by this commit closes
- * that gap: when libp2p pubsub fails (NAT, firewall, peer not
- * discovered), two devices online with the same wallet would diverge
- * for hours; the poll re-checks the aggregator pointer at a randomised
- * interval in [30 s, 90 s) and adds any newly-discovered CID to the
- * bundle index.
+ * `recoverFromAggregatorPointerBestEffort()` and also re-polled at a
+ * randomised interval in [30 s, 90 s) so two devices online with the
+ * same wallet converge even when libp2p pubsub stalls (NAT / firewall /
+ * peer not discovered).
  *
- * Coverage targets:
+ * Item #15 Phase E follow-up: the recovered pointer CID is a SNAPSHOT
+ * CID, NOT a UXF bundle CID. The legacy code in this manager called
+ * `bundleIndex.addBundle(cidString, …)` directly — that path wrote the
+ * snapshot bytes into the bundle index and the next `load()` would
+ * fail to parse the snapshot CAR as a UXF package. The fix routes both
+ * the poll and cold-start recovery paths through the host's
+ * `applySnapshotIfWired(cid)` which fetches + parses + dispatches per-
+ * writer JOIN. These tests verify the new contract:
+ *
  *   - Random interval falls within [30s, 90s).
- *   - `recoverLatest()` returns null → re-arms without adding a bundle.
- *   - `recoverLatest()` returns a CID already in `knownBundleCids` →
- *     re-arms without adding a bundle (no redundant OrbitDB write).
- *   - `recoverLatest()` returns a NEW CID → bundleIndex.addBundle is
- *     called with that CID, then re-arms.
- *   - `shutdown()` stops the timer (no further `recoverLatest()` calls
- *     after shutdown completes).
- *   - Permanent-error handling — classified errors trigger a 5x
- *     back-off on the next-tick interval.
+ *   - `recoverLatest()` returns null → re-arms without invoking the
+ *     applier.
+ *   - `recoverLatest()` returns the SAME snapshot CID we last applied
+ *     → re-arms without invoking the applier again (idempotency).
+ *   - `recoverLatest()` returns a NEW snapshot CID → applier is
+ *     called with that CID; `onPollDiscoveredNewCid` fires; re-arms.
+ *   - With NO applier wired (legacy / test default) → poll logs and
+ *     skips (no fallback to `bundleIndex.addBundle` — that's the bug
+ *     this change fixes). `knownBundleCids` stays empty.
+ *   - `shutdown()` stops the timer.
+ *   - Permanent-error handling — classified errors trigger 5x back-off.
  *
  * The pointer is a minimal stub with only `recoverLatest()` because
- * that is the sole method the poll touches. The bundle index is the
- * real `BundleIndex` running over a mock `ProfileDatabase`.
+ * that is the sole method the poll touches.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -106,6 +112,24 @@ function createProvider(opts: {
   db: ProfileDatabase;
   getPointerLayer?: () => ProfilePointerLayer | null;
   getPointerBuildStatus?: () => 'pending' | 'unavailable' | 'ready';
+  /**
+   * Item #15 Phase E follow-up — install a snapshot applier on the
+   * provider. When omitted, the provider runs in the legacy mode
+   * where `applySnapshotIfWired` returns null (tests can then assert
+   * "applier-not-wired ⇒ skip + bundle index untouched").
+   */
+  onApplySnapshot?: (cidString: string) => Promise<{
+    joinedAny: boolean;
+    addressesSeen: number;
+    bundleEntriesSeen: number;
+    counters: {
+      entriesEvaluated: number;
+      liveLanded: number;
+      tombstonesLanded: number;
+      localWon: number;
+      remoteRejectedMalformed: number;
+    };
+  }>;
 }): ProfileTokenStorageProvider {
   const provider = new ProfileTokenStorageProvider(
     opts.db,
@@ -123,6 +147,9 @@ function createProvider(opts: {
     },
   );
   provider.setIdentity(TEST_IDENTITY);
+  if (opts.onApplySnapshot) {
+    provider.setApplySnapshotCallback(opts.onApplySnapshot);
+  }
   return provider;
 }
 
@@ -224,30 +251,55 @@ describe('LifecycleManager periodic pointer poll (Path 2 safety net)', () => {
     await provider.shutdown();
   });
 
-  it('returns SAME CID as already-known → no bundle write, re-arms', async () => {
+  it('returns SAME snapshot CID we last applied → re-arms without re-applying', async () => {
+    // Item #15 Phase E follow-up: idempotency is keyed on
+    // `lastDiscoveredPointerCid` (the last snapshot CID we dispatched
+    // through the applier), NOT on `knownBundleCids` — the snapshot
+    // CID is structurally not a bundle CID under Item #15.
     const knownBytes = new TextEncoder().encode('{"tokens":[]}');
     const cid = cidForBytes(knownBytes);
-    const cidString = cid.toString();
 
-    // Cold-start path: recoverLatest returns the CID; lifecycle adds
-    // it to the index. Subsequent poll iterations must NOT write again.
     const recoverLatest = vi.fn(async () => ({ cid: cid.bytes, version: 1 }));
+    const applyResult = {
+      joinedAny: false,
+      addressesSeen: 0,
+      bundleEntriesSeen: 0,
+      counters: {
+        entriesEvaluated: 0,
+        liveLanded: 0,
+        tombstonesLanded: 0,
+        localWon: 0,
+        remoteRejectedMalformed: 0,
+      },
+    };
+    const onApplySnapshot = vi.fn(async () => applyResult);
     const pointer = stubPointer({ recoverLatest });
-    const provider = createProvider({ db, getPointerLayer: () => pointer });
+    const provider = createProvider({
+      db,
+      getPointerLayer: () => pointer,
+      onApplySnapshot,
+    });
     await provider.initialize();
 
-    // Cold-start added the bundle ref. Snapshot the OrbitDB store so
-    // we can check the periodic poll doesn't churn it.
-    const bundleKey = BUNDLE_KEY_PREFIX + cidString;
-    const bundleBytesAfterColdStart = db._store.get(bundleKey);
-    expect(bundleBytesAfterColdStart).toBeDefined();
+    // Cold-start path invoked the applier exactly once for the
+    // initial CID.
+    const applyCallsAfterColdStart = onApplySnapshot.mock.calls.length;
+    expect(applyCallsAfterColdStart).toBeGreaterThanOrEqual(1);
 
-    // Drain a poll iteration — same CID returned, must short-circuit.
+    // Drain a poll iteration — same CID returned, must short-circuit
+    // via the `lastDiscoveredPointerCid === cidString` check.
     await vi.advanceTimersByTimeAsync(POINTER_POLL_MAX_MS + 1_000);
     expect(recoverLatest.mock.calls.length).toBeGreaterThan(1);
 
-    // Same encrypted bytes — no churn.
-    expect(db._store.get(bundleKey)).toBe(bundleBytesAfterColdStart);
+    // Applier NOT called again — idempotency held.
+    expect(onApplySnapshot.mock.calls.length).toBe(applyCallsAfterColdStart);
+
+    // Bundle index was NEVER directly written by the lifecycle — the
+    // legacy `bundleIndex.addBundle(snapshotCid, …)` path is gone.
+    const bundleCount = [...db._store.keys()].filter((k) =>
+      k.startsWith(BUNDLE_KEY_PREFIX),
+    ).length;
+    expect(bundleCount).toBe(0);
 
     const lifecycle = getLifecycle(provider);
     expect(lifecycle.pointerPollTimer).not.toBeNull();
@@ -255,9 +307,76 @@ describe('LifecycleManager periodic pointer poll (Path 2 safety net)', () => {
     await provider.shutdown();
   });
 
-  it('returns a NEW CID → bundleIndex.addBundle called, re-arms', async () => {
-    // Cold-start: pointer has no anchor yet (returns null). Then on
-    // the first periodic poll a NEW CID becomes available.
+  it('returns a NEW snapshot CID → applier is invoked, re-arms', async () => {
+    // Item #15 Phase E follow-up: a newly-discovered snapshot CID
+    // dispatches through `applySnapshotIfWired` (fetch + parse +
+    // per-writer JOIN). The lifecycle does NOT call
+    // `bundleIndex.addBundle` directly on the snapshot CID.
+    const newBytes = new TextEncoder().encode('{"tokens":["new"]}');
+    const cid = cidForBytes(newBytes);
+    const cidString = cid.toString();
+
+    let nextResult: { cid: Uint8Array; version: number } | null = null;
+    const recoverLatest = vi.fn(async () => nextResult);
+    const applierCalls: string[] = [];
+    const onApplySnapshot = vi.fn(async (cidArg: string) => {
+      applierCalls.push(cidArg);
+      return {
+        joinedAny: true,
+        addressesSeen: 1,
+        bundleEntriesSeen: 0,
+        counters: {
+          entriesEvaluated: 1,
+          liveLanded: 1,
+          tombstonesLanded: 0,
+          localWon: 0,
+          remoteRejectedMalformed: 0,
+        },
+      };
+    });
+    const pointer = stubPointer({ recoverLatest });
+    const provider = createProvider({
+      db,
+      getPointerLayer: () => pointer,
+      onApplySnapshot,
+    });
+    await provider.initialize();
+
+    // Cold-start ran (and recovered nothing — no anchor yet).
+    expect(recoverLatest.mock.calls.length).toBeGreaterThanOrEqual(1);
+    expect(applierCalls).toEqual([]);
+
+    // Now make recoverLatest return the new snapshot CID.
+    nextResult = { cid: cid.bytes, version: 7 };
+
+    // Drain one poll iteration. Microtask flushes drain the async
+    // chain (recoverLatest → applySnapshotIfWired → onPollDiscoveredNewCid).
+    await vi.advanceTimersByTimeAsync(POINTER_POLL_MAX_MS + 1_000);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Applier was invoked with the new snapshot CID.
+    expect(applierCalls).toContain(cidString);
+
+    // Bundle ref was NOT directly written by the lifecycle — the
+    // applier owns whatever it wants to write through the BundleIndex
+    // JOIN writer; the lifecycle no longer short-circuits that path.
+    // The mock applier doesn't write either, so the bundle key is
+    // absent (verifying the legacy direct-write is gone).
+    const bundleKey = BUNDLE_KEY_PREFIX + cidString;
+    expect(db._store.has(bundleKey)).toBe(false);
+
+    const lifecycle = getLifecycle(provider);
+    expect(lifecycle.pointerPollTimer).not.toBeNull();
+
+    await provider.shutdown();
+  });
+
+  it('NEW snapshot CID without applier wired → poll skips, bundle index untouched', async () => {
+    // Item #15 Phase E follow-up: the legacy `bundleIndex.addBundle`
+    // fallback is REMOVED — silently writing a snapshot CID as a
+    // bundle ref is precisely the bug Phase E's pull-side fix
+    // addresses. With no applier wired, the poll logs and skips.
     const newBytes = new TextEncoder().encode('{"tokens":["new"]}');
     const cid = cidForBytes(newBytes);
     const cidString = cid.toString();
@@ -265,31 +384,22 @@ describe('LifecycleManager periodic pointer poll (Path 2 safety net)', () => {
     let nextResult: { cid: Uint8Array; version: number } | null = null;
     const recoverLatest = vi.fn(async () => nextResult);
     const pointer = stubPointer({ recoverLatest });
+    // No onApplySnapshot — provider runs in the legacy mode.
     const provider = createProvider({ db, getPointerLayer: () => pointer });
     await provider.initialize();
 
-    // Confirm cold-start ran (and recovered nothing — no anchor yet).
-    expect(recoverLatest.mock.calls.length).toBeGreaterThanOrEqual(1);
-    const bundleCountBefore = [...db._store.keys()].filter((k) =>
-      k.startsWith(BUNDLE_KEY_PREFIX),
-    ).length;
-    expect(bundleCountBefore).toBe(0);
+    nextResult = { cid: cid.bytes, version: 9 };
 
-    // Now make recoverLatest return the new CID for the next poll.
-    nextResult = { cid: cid.bytes, version: 7 };
-
-    // Drain one poll iteration. The poll's async chain (recoverLatest
-    // → bundleIndex.addBundle which encrypts via subtle crypto) needs
-    // a few microtask flushes after the timer fires; advancing again
-    // by 0ms drains pending promise continuations.
     await vi.advanceTimersByTimeAsync(POINTER_POLL_MAX_MS + 1_000);
     await vi.advanceTimersByTimeAsync(0);
     await vi.advanceTimersByTimeAsync(0);
 
-    // Bundle ref written under the canonical key.
+    // The bundle key must NOT exist — the legacy direct-write path
+    // is gone, and no applier dispatched.
     const bundleKey = BUNDLE_KEY_PREFIX + cidString;
-    expect(db._store.has(bundleKey)).toBe(true);
+    expect(db._store.has(bundleKey)).toBe(false);
 
+    // Timer re-armed despite the skip.
     const lifecycle = getLifecycle(provider);
     expect(lifecycle.pointerPollTimer).not.toBeNull();
 
@@ -365,6 +475,105 @@ describe('LifecycleManager periodic pointer poll (Path 2 safety net)', () => {
     // But advancing past 5 × normal-max DOES fire the next call.
     await vi.advanceTimersByTimeAsync(POINTER_POLL_MAX_MS * 5);
     expect(recoverLatest.mock.calls.length).toBeGreaterThan(callsAfterFirstPoll);
+
+    await provider.shutdown();
+  });
+
+  it('cold-start recovery: applier wired → dispatches snapshot CID through applySnapshotIfWired', async () => {
+    // Item #15 Phase E follow-up: cold-start recoverLatest returning
+    // a CID dispatches through `applySnapshotIfWired` (NOT through
+    // `bundleIndex.addBundle` on the snapshot CID).
+    const newBytes = new TextEncoder().encode('{"tokens":["initial"]}');
+    const cid = cidForBytes(newBytes);
+    const cidString = cid.toString();
+
+    const recoverLatest = vi.fn(async () => ({ cid: cid.bytes, version: 3 }));
+    const applierCalls: string[] = [];
+    const onApplySnapshot = vi.fn(async (cidArg: string) => {
+      applierCalls.push(cidArg);
+      return {
+        joinedAny: true,
+        addressesSeen: 1,
+        bundleEntriesSeen: 0,
+        counters: {
+          entriesEvaluated: 1,
+          liveLanded: 1,
+          tombstonesLanded: 0,
+          localWon: 0,
+          remoteRejectedMalformed: 0,
+        },
+      };
+    });
+    const pointer = stubPointer({ recoverLatest });
+    const provider = createProvider({
+      db,
+      getPointerLayer: () => pointer,
+      onApplySnapshot,
+    });
+    await provider.initialize();
+
+    // Cold-start invoked the applier with the recovered snapshot CID.
+    expect(applierCalls).toContain(cidString);
+
+    // The legacy `addBundle(snapshotCid, …)` path is gone — bundle
+    // index untouched by the lifecycle.
+    const bundleKey = BUNDLE_KEY_PREFIX + cidString;
+    expect(db._store.has(bundleKey)).toBe(false);
+
+    await provider.shutdown();
+  });
+
+  it('cold-start recovery: applier NOT wired → logs and skips (no legacy fallback)', async () => {
+    // Item #15 Phase E follow-up: cold-start MUST NOT fall back to
+    // the legacy `bundleIndex.addBundle(snapshotCid, …)` path — that
+    // was the latent bug. With no applier wired the recovery becomes
+    // a no-op (a subsequent poll will retry).
+    const newBytes = new TextEncoder().encode('{"tokens":["initial"]}');
+    const cid = cidForBytes(newBytes);
+    const cidString = cid.toString();
+
+    const recoverLatest = vi.fn(async () => ({ cid: cid.bytes, version: 3 }));
+    const pointer = stubPointer({ recoverLatest });
+    const provider = createProvider({ db, getPointerLayer: () => pointer });
+    // No onApplySnapshot wired.
+    await provider.initialize();
+
+    // Bundle index NEVER written for the snapshot CID.
+    const bundleKey = BUNDLE_KEY_PREFIX + cidString;
+    expect(db._store.has(bundleKey)).toBe(false);
+
+    await provider.shutdown();
+  });
+
+  it('cold-start recovery: applier throws → returns true (keeps caller off legacy IPNS path)', async () => {
+    // Item #15 Phase E follow-up: a transient applier failure during
+    // cold-start must NOT fall through to the legacy IPNS migration
+    // (which would stamp the migration-done marker before the
+    // snapshot path can retry). The recovery returns `true` so the
+    // caller skips the legacy path; the periodic poll retries.
+    const newBytes = new TextEncoder().encode('{"tokens":["bad"]}');
+    const cid = cidForBytes(newBytes);
+
+    const recoverLatest = vi.fn(async () => ({ cid: cid.bytes, version: 4 }));
+    const applierCalls: number[] = [];
+    const onApplySnapshot = vi.fn(async () => {
+      applierCalls.push(Date.now());
+      throw new Error('IPFS gateway exhausted');
+    });
+    const pointer = stubPointer({ recoverLatest });
+    const provider = createProvider({
+      db,
+      getPointerLayer: () => pointer,
+      onApplySnapshot,
+    });
+    await provider.initialize();
+
+    // Cold-start invoked the applier (and it threw).
+    expect(applierCalls.length).toBeGreaterThanOrEqual(1);
+
+    // Periodic poll re-armed — error did not torpedo the timer.
+    const lifecycle = getLifecycle(provider);
+    expect(lifecycle.pointerPollTimer).not.toBeNull();
 
     await provider.shutdown();
   });

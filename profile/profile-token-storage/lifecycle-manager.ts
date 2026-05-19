@@ -6,11 +6,20 @@
  * helpers (aggregator pointer recover + one-shot IPNS migration).
  *
  * The manager coordinates with `BundleIndex` (for `refreshKnownBundles`
- * and `addBundle` on recovery) and with `FlushScheduler` (to drain
- * pending data on shutdown). It does NOT own any private state of its
- * own — every mutation flows through the host so the facade remains the
- * single source of truth (tests poke `(provider as any).initialized`
- * directly; that field MUST stay on the facade).
+ * and the legacy IPNS migration's `onBundle` callback) and with
+ * `FlushScheduler` (to drain pending data on shutdown). It does NOT
+ * own any private state of its own — every mutation flows through the
+ * host so the facade remains the single source of truth (tests poke
+ * `(provider as any).initialized` directly; that field MUST stay on
+ * the facade).
+ *
+ * Item #15 Phase E follow-up: the periodic-pointer-poll and cold-start
+ * recovery paths dispatch the pointer's CID through the host's
+ * `applySnapshotIfWired()` rather than calling `bundleIndex.addBundle()`
+ * directly. Under Item #15 the pointer carries a SNAPSHOT CID, not a
+ * UXF bundle CID — the legacy `addBundle` path would write the snapshot
+ * bytes into the bundle index and the next `load()` would fail to parse
+ * the snapshot CAR as a UXF package.
  *
  * Cross-seam reads / writes via the host:
  *   - status, initialized, isShuttingDown, identity, encryptionKey
@@ -59,7 +68,6 @@ import { computeAddressId } from '../types.js';
 import { logger } from '../../core/logger.js';
 import type { BundleIndex } from './bundle-index.js';
 import type { ProfileTokenStorageHost } from './host.js';
-import { fetchFromIpfs } from '../ipfs-client.js';
 
 /**
  * Pointer-layer error codes that indicate a permanent integrity /
@@ -556,61 +564,56 @@ export class LifecycleManager {
       return false;
     }
 
-    // Steelman defense — verify the recovered CID is fetchable AND its
-    // bytes match the CID hash BEFORE writing to the durable bundle
-    // index. The pointer layer's verification covers the
-    // pointer→aggregator anchor cryptography; it does NOT prove the
-    // CID points to legitimate CAR bytes that this wallet's encryption
-    // key can decrypt. A compromised aggregator could redirect the
-    // pointer to attacker-controlled CIDs that decrypt as garbage —
-    // surviving in OrbitDB and propagating to peers.
+    // Item #15 Phase E follow-up: under the snapshot-pointer model the
+    // recovered CID is a SNAPSHOT CID, NOT a UXF bundle CID. Routing it
+    // through `applySnapshotIfWired()` fetches the CAR, parses it as a
+    // lean profile snapshot, and dispatches per-writer JOIN through the
+    // factory-wired applier. The BundleIndex JOIN handles
+    // `tokens.bundle.*` entries (and updates `knownBundleCids`); the
+    // per-address writers handle their own slices.
     //
-    // The fetch+verify pre-flight is best-effort: a transient gateway
-    // failure must not POISON the recovery. We fall back to writing
-    // the bundle ref under `status: 'unverified'` so a future sync
-    // can retry the verification before the JOIN walker promotes it
-    // to 'active'.
-    let verifiedActive = false;
+    // The legacy code path here called `bundleIndex.addBundle(cidString, …)`
+    // directly on the snapshot CID — under Item #15 that wrote the
+    // snapshot bytes into the bundle index, and the next `load()`
+    // tried to parse the snapshot CAR as a UXF package and failed.
+    //
+    // `applySnapshotIfWired` returning `null` means no factory closure
+    // was wired (legacy tests / non-Item-#15 providers). Per Phase E
+    // we do NOT fall back to the legacy `addBundle` path — silently
+    // re-writing the snapshot CID as a bundle ref is precisely the bug
+    // this change fixes. Log and bail to the IPNS migration fallback
+    // (which still works for genuinely-legacy wallets).
     try {
-      const carBytes = await fetchFromIpfs(this.host.ipfsGateways, cidString);
-      // fetchFromIpfs already verifies CID-hash binding (sha256 vs
-      // multihash). Reaching here means the CAR bytes are
-      // content-authentic. The encryption key check is delegated to
-      // the JOIN walker (UxfPackage.fromCar throws on malformed bytes;
-      // bundleIndex.listBundles' decryption path drops un-decryptable
-      // entries). Promote to 'active' once we know the bytes resolve.
-      verifiedActive = carBytes.byteLength > 0;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.host.log(
-        `Pointer recover: CAR fetch+verify failed for cid=${cidString} ` +
-          `(treating as unverified, will retry via sync): ${msg}`,
-      );
-    }
-
-    try {
-      await this.bundleIndex.addBundle(cidString, {
-        cid: cidString,
-        // Steelman: only mark 'active' after the fetch+verify step
-        // succeeded. Otherwise the bundle ref persists but is gated
-        // out of the JOIN until a subsequent sync re-fetches and
-        // promotes it. listActiveBundles filters on `status === 'active'`.
-        status: verifiedActive ? 'active' : 'unverified',
-        createdAt: Math.floor(Date.now() / 1000),
-      });
+      const applyResult = await this.host.applySnapshotIfWired(cidString);
+      if (applyResult === null) {
+        this.host.log(
+          `Pointer recover: snapshot applier not wired; ` +
+            `treating as no-op (no legacy bundle-CID fallback per Item #15 Phase E)`,
+        );
+        return false;
+      }
       // Track for the no-data republish idempotency check: if the
       // merged-state CAR a future no-data flush would build matches
-      // this same CID, skip the publish (the remote pointer is
-      // already authoritative).
+      // this same snapshot CID, skip the publish (the remote pointer
+      // is already authoritative).
       this.host.setLastDiscoveredPointerCid(cidString);
       this.host.log(
         `Pointer recover ok: cid=${cidString} version=${recovered.version} ` +
-          `status=${verifiedActive ? 'active' : 'unverified'}`,
+          `joinedAny=${applyResult.joinedAny} addresses=${applyResult.addressesSeen} ` +
+          `bundles=${applyResult.bundleEntriesSeen}`,
       );
       return true;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      this.host.log(`Pointer recover: addBundle failed post-recover: ${msg}`);
+      // Best-effort: a transient fetch / parse failure must not POISON
+      // the recovery. Return true to signal "pointer path was chosen"
+      // so the caller does NOT fall through to legacy IPNS migration
+      // (which would stamp the migration-done marker before the
+      // pointer path could retry). The next sync() will re-attempt
+      // via the periodic poll.
+      this.host.log(
+        `Pointer recover: applySnapshotIfWired failed (best-effort, will retry on next poll): ${msg}`,
+      );
       return true;
     }
   }
@@ -817,53 +820,63 @@ export class LifecycleManager {
       return;
     }
 
-    // Idempotency — if we already know this CID, OrbitDB pubsub (or our
-    // own flush) already delivered it. Skip the bundle-index write to
-    // avoid an unnecessary OrbitDB op.
-    if (this.host.getKnownBundleCids().has(cidString)) {
-      // Still update the discovered-pointer CID — this lets a future
-      // no-data flush short-circuit on idempotent republish. (Even
-      // though we already had this CID locally, the AGGREGATOR may
-      // have anchored a new pointer version pointing to it; tracking
-      // ensures our flush idempotency stays correct.)
-      this.host.setLastDiscoveredPointerCid(cidString);
+    // Idempotency — the recovered CID is the SNAPSHOT CID (Item #15),
+    // not a UXF bundle CID, so the legacy `knownBundleCids` check is
+    // structurally wrong here (the snapshot CID would never appear in
+    // that set). Use `lastDiscoveredPointerCid` instead — that's the
+    // last snapshot CID we successfully applied. Equality means we've
+    // already JOIN-applied this version; skip the redundant fetch +
+    // parse + dispatch.
+    if (this.host.getLastDiscoveredPointerCid() === cidString) {
+      // The aggregator may have re-anchored a new pointer version
+      // pointing to the same CID; tracking is already in place, so
+      // just re-arm and continue. No publish work needed — local
+      // state already reflects this snapshot.
       this.scheduleNextPointerPoll(nextBackoffMultiplier);
       return;
     }
 
+    // Item #15 Phase E follow-up: dispatch the snapshot CID through
+    // the host-wired applier (fetch + parse + per-writer JOIN). The
+    // legacy code path here called `bundleIndex.addBundle(cidString, …)`
+    // directly — under Item #15 that wrote the snapshot bytes into
+    // the bundle index, and the next `load()` tried to parse the
+    // snapshot CAR as a UXF package and failed.
+    //
+    // `applySnapshotIfWired` returning `null` means no factory closure
+    // was wired (legacy tests / non-Item-#15 providers). Per Phase E
+    // we do NOT fall back to `addBundle` — silently re-writing the
+    // snapshot CID as a bundle ref is precisely the bug this change
+    // fixes. Log + re-arm; the next poll cycle will try again.
     try {
-      await this.bundleIndex.addBundle(cidString, {
-        cid: cidString,
-        // Mirror the cold-start path's conservative default: CARs are
-        // verified by JOIN walker / decryption on first use; until
-        // then, mark active (Path 1's normal write also does so).
-        // Permanent verify failures will be caught by listBundles
-        // and emit CID_REF_CORRUPT events.
-        status: 'active',
-        createdAt: Math.floor(Date.now() / 1000),
-      });
+      const applyResult = await this.host.applySnapshotIfWired(cidString);
+      if (applyResult === null) {
+        this.host.log(
+          `Pointer poll: snapshot applier not wired; ` +
+            `skipping CID dispatch (no legacy bundle-CID fallback per Item #15 Phase E)`,
+        );
+        this.scheduleNextPointerPoll(nextBackoffMultiplier);
+        return;
+      }
       this.host.setLastDiscoveredPointerCid(cidString);
       this.host.log(
-        `Pointer poll discovered NEW CID: cid=${cidString} version=${recovered.version}`,
+        `Pointer poll discovered NEW snapshot CID: cid=${cidString} ` +
+          `version=${recovered.version} joinedAny=${applyResult.joinedAny} ` +
+          `addresses=${applyResult.addressesSeen} bundles=${applyResult.bundleEntriesSeen}`,
       );
 
       // Invoke the poll-discovery handler so the new CID gets loaded
       // into `lastLoadedData` and the pointer is re-anchored at the
       // merged state. Without this, subsequent save-driven flushes
-      // would see the new CID as "unknown" relative to
-      // `lastLoadedFromBundleCids` and abort with
-      // POINTER_MONOTONICITY_VIOLATION — silently refusing to publish
-      // (which the at-least-once gate correctly surfaces as a Nostr-
-      // ack refusal, but causes spurious replays).
+      // would see the JOIN-landed bundle refs as "unknown" relative
+      // to `lastLoadedFromBundleCids` and abort with
+      // POINTER_MONOTONICITY_VIOLATION — silently refusing to publish.
       //
-      // This is a DIFFERENT callback from `replicationHandler` —
-      // replicationHandler does its own diff check (previousCids vs
-      // current knownBundleCids) which would skip the load if it
-      // runs AFTER our addBundle (the diff is no-op once addBundle
-      // already updated knownBundleCids). `onPollDiscoveredNewCid`
-      // unconditionally loads + schedules a no-data flush; the caller
-      // (this method) already confirmed it's a new CID via the
-      // knownBundleCids.has(cidString) guard above.
+      // Note: BundleIndex.joinSnapshot already updates
+      // `knownBundleCids` AND fires `notifyProfileDirty` to schedule
+      // a republish at the next debounce window. But `lastLoadedData`
+      // is owned by the `load()` path — only an explicit load can
+      // merge the new bundles into the in-memory snapshot.
       //
       // Best-effort: failures here are logged but do not abort the
       // poll-loop re-arm at the end.
@@ -880,7 +893,7 @@ export class LifecycleManager {
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      this.host.log(`Pointer poll: addBundle failed: ${msg}`);
+      this.host.log(`Pointer poll: applySnapshotIfWired failed: ${msg}`);
     }
 
     this.scheduleNextPointerPoll(nextBackoffMultiplier);
