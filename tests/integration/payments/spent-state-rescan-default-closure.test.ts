@@ -456,3 +456,207 @@ describe('PaymentsModule auto-install wires the default closure (Issue #174 boot
     expect(getTokensMap(module).has(token.id)).toBe(true);
   });
 });
+
+// =============================================================================
+// Tests — durable AUDIT record routing via installSpentStateAuditWriter
+// (Issue #174 — DispositionWriter wiring follow-up)
+// =============================================================================
+
+describe('PaymentsModule.installSpentStateAuditWriter — durable AUDIT record (Issue #174)', () => {
+  interface RecordedWrite {
+    readonly addr: string;
+    readonly record: unknown;
+  }
+
+  function makeFakeDispositionWriter(options?: { readonly shouldThrow?: Error }): {
+    readonly writer: import('../../../profile/disposition-writer').DispositionWriter;
+    readonly writes: ReadonlyArray<RecordedWrite>;
+  } {
+    const writes: RecordedWrite[] = [];
+    const fake = {
+      async write(addr: string, record: unknown): Promise<void> {
+        writes.push({ addr, record });
+        if (options?.shouldThrow) throw options.shouldThrow;
+      },
+    } as unknown as import('../../../profile/disposition-writer').DispositionWriter;
+    return { writer: fake, writes };
+  }
+
+  let module: PaymentsModule;
+
+  beforeEach(() => {
+    module = new PaymentsModule({
+      features: { spentStateRescan: false }, // direct invocation tests
+    });
+    (module as unknown as { deps: unknown }).deps = {
+      transport: makeTransport(),
+      emitEvent: vi.fn(),
+      identity: makeIdentity(),
+    };
+    (module as unknown as { save: () => Promise<void> }).save = vi
+      .fn()
+      .mockResolvedValue(undefined);
+    (module as unknown as { archiveToken: (t: Token) => Promise<void> }).archiveToken = vi
+      .fn()
+      .mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('writes a synthesized AUDIT record to the installed writer after removeToken success', async () => {
+    const token = makeToken({ id: 'tok-audit-1' });
+    getTokensMap(module).set(token.id, token);
+
+    const fake = makeFakeDispositionWriter();
+    module.installSpentStateAuditWriter(fake.writer);
+
+    await invokeDefaultClosure(module, {
+      token,
+      currentStateHash: 'state-tok-audit-1',
+      suspectedSiblingInstance: true,
+      detectedAt: 1_700_000_000_000,
+    });
+
+    // Local cleanup happened.
+    expect(getTokensMap(module).has(token.id)).toBe(false);
+    expect(module.getTombstones().length).toBeGreaterThan(0);
+
+    // Durable AUDIT record written.
+    expect(fake.writes).toHaveLength(1);
+    const wrote = fake.writes[0];
+    expect(typeof wrote.addr).toBe('string');
+    expect(wrote.addr.length).toBeGreaterThan(0);
+
+    const record = wrote.record as {
+      disposition: string;
+      reason: string;
+      auditStatus: string;
+      tokenId: string;
+      observedTokenContentHash: string;
+      bundleCid: string;
+      senderTransportPubkey: string;
+    };
+    expect(record.disposition).toBe('AUDIT');
+    expect(record.reason).toBe('off-record-spend');
+    expect(record.auditStatus).toBe('audit-off-record-spend');
+    expect(record.tokenId).toBe('tok-genesis-id'); // from sdkData genesis
+    // 64-char hex (SHA-256 of sdkData).
+    expect(record.observedTokenContentHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(record.bundleCid).toContain('local-rescan-');
+    expect(record.bundleCid).toContain('1700000000000');
+    expect(record.senderTransportPubkey).toBe('02' + 'a'.repeat(64));
+  });
+
+  it('skips the writer when no writer is installed (local cleanup only)', async () => {
+    const token = makeToken({ id: 'tok-no-writer' });
+    getTokensMap(module).set(token.id, token);
+    // No installSpentStateAuditWriter call.
+
+    await invokeDefaultClosure(module, {
+      token,
+      currentStateHash: 'state-tok-no-writer',
+      suspectedSiblingInstance: false,
+      detectedAt: 1_700_000_000_000,
+    });
+
+    // Local cleanup happened.
+    expect(getTokensMap(module).has(token.id)).toBe(false);
+    // No way to assert "writer not called" without a writer; the
+    // behavior is verified by the no-throw + clean local state.
+  });
+
+  it('skips the writer when removeToken fails (no hybrid state)', async () => {
+    const token = makeToken({ id: 'tok-remove-throws' });
+    getTokensMap(module).set(token.id, token);
+
+    const fake = makeFakeDispositionWriter();
+    module.installSpentStateAuditWriter(fake.writer);
+
+    // Replace removeToken to throw.
+    (module as unknown as { removeToken: (id: string) => Promise<void> })
+      .removeToken = vi.fn().mockRejectedValue(new Error('storage gone'));
+
+    await expect(
+      invokeDefaultClosure(module, {
+        token,
+        currentStateHash: 'state-tok-remove-throws',
+        suspectedSiblingInstance: true,
+        detectedAt: 1_700_000_000_000,
+      }),
+    ).resolves.toBeUndefined();
+
+    // CRITICAL invariant: no AUDIT write when local cleanup failed.
+    // Writing the durable record without the local cleanup would leave
+    // the wallet in a hybrid state (active token + _audit record for
+    // the same tokenId). The next rescan cycle retries both.
+    expect(fake.writes).toHaveLength(0);
+  });
+
+  it('swallows writer.write throws (event already fired, local cleanup applied)', async () => {
+    const token = makeToken({ id: 'tok-writer-throws' });
+    getTokensMap(module).set(token.id, token);
+
+    const fake = makeFakeDispositionWriter({ shouldThrow: new Error('orbitdb flake') });
+    module.installSpentStateAuditWriter(fake.writer);
+
+    await expect(
+      invokeDefaultClosure(module, {
+        token,
+        currentStateHash: 'state-tok-writer-throws',
+        suspectedSiblingInstance: false,
+        detectedAt: 1_700_000_000_000,
+      }),
+    ).resolves.toBeUndefined();
+
+    // Local cleanup still happened.
+    expect(getTokensMap(module).has(token.id)).toBe(false);
+    // Writer was invoked (just threw).
+    expect(fake.writes).toHaveLength(1);
+  });
+
+  it('passing null removes the writer (revert to local-only behaviour)', async () => {
+    const token = makeToken({ id: 'tok-null-writer' });
+    getTokensMap(module).set(token.id, token);
+
+    const fake = makeFakeDispositionWriter();
+    module.installSpentStateAuditWriter(fake.writer);
+    // Then remove.
+    module.installSpentStateAuditWriter(null);
+
+    await invokeDefaultClosure(module, {
+      token,
+      currentStateHash: 'state-tok-null-writer',
+      suspectedSiblingInstance: true,
+      detectedAt: 1_700_000_000_000,
+    });
+
+    expect(getTokensMap(module).has(token.id)).toBe(false);
+    expect(fake.writes).toHaveLength(0); // writer was uninstalled before call
+  });
+
+  it('routes through audit-orphan key when sdkData has no parseable tokenId', async () => {
+    const token = makeToken({
+      id: 'tok-no-genesis',
+      sdkData: '{}', // no genesis.data.tokenId
+    });
+    getTokensMap(module).set(token.id, token);
+
+    const fake = makeFakeDispositionWriter();
+    module.installSpentStateAuditWriter(fake.writer);
+
+    await invokeDefaultClosure(module, {
+      token,
+      currentStateHash: 'state-tok-no-genesis',
+      suspectedSiblingInstance: true,
+      detectedAt: 1_700_000_000_000,
+    });
+
+    expect(fake.writes).toHaveLength(1);
+    const record = fake.writes[0].record as { tokenId: string };
+    // Empty string tokenId routes to the `_audit-orphan` keyspace per
+    // auditKeyFor (the DispositionWriter handles the routing).
+    expect(record.tokenId).toBe('');
+  });
+});
