@@ -715,6 +715,44 @@ Migration consideration: existing wallets that have published only UXF-bundle po
 
 ---
 
+### 16. Per-token spent-state rescan — proactive off-record-spend detection (NEW 2026-05-19)
+
+> **Tracked as [Issue #174](https://github.com/unicity-sphere/sphere-sdk/issues/174)**. Surfaces the §12.3.2 piece of `UXF-TRANSFER-PROTOCOL.md` that the aggregator-pointer wave (which shipped §12.3.1) did NOT cover.
+
+**Why it matters**: when two instances of the SAME wallet (same mnemonic / chain pubkey) coexist — desktop + mobile, primary + recovered backup, etc. — and one spends a token without the other having seen the spend, the second instance keeps the token in `manifest.status === 'valid'` until either (a) the spending device's snapshot propagates via §12.3.1 profile-pointer rescan (typically 30–90s, but indefinite if the spender is offline), OR (b) the local UI triggers a `send()` and `submitTransferCommitment` fails (which since PR #173 / commit `9b4fae7` surfaces as the reactive `STATE_ALREADY_SPENT_BY_OTHER` throw + `transfer:double-spend-detected` event from Item #14 Phase 1).
+
+Item #14 Phase 1 closes the reactive surface. Item #16 closes the proactive surface — a low-rate background sweep over the active pool calling `oracle.isSpent(currentDestinationStateHash)` per token (default `TOKEN_SPENT_RESCAN_INTERVAL = 5 min/token`, capped concurrent ≤ 4) so the UI doesn't continue showing the token as spendable until the user attempts to spend it.
+
+**Acceptance criteria**: see Issue #174 for the full breakdown. Summary:
+1. New background worker `modules/payments/transfer/spent-state-rescan-worker.ts`.
+2. On `isSpent === true` → transition to `_audit` with reason `'off-record-spend'` via the existing disposition writer; emit new `transfer:off-record-spent` event.
+3. `suspectedSiblingInstance` flag: `true` when local OUTBOX + SENT have no record of having spent this state (signals another instance with the same keys is the spender).
+4. Feature flag `features.spentStateRescan` (default-OFF for soak, flip to default-ON after 7-day testnet observation).
+5. Runbook entry in `docs/uxf/RUNBOOK-SEND-PIPELINE.md`.
+
+**Relationship to other items**:
+  - **Item #14 Phase 1** (PR #173): reactive surface — catches the off-record spend WHEN you try to send.
+  - **Item #15 (profile-pointer rescan)**: catches the spend IF the spender device's snapshot has propagated.
+  - **Item #16 (this item)**: catches it independently of either, via the L3 aggregator's authoritative spent-state view.
+
+**Files** (proposed):
+  - New: `modules/payments/transfer/spent-state-rescan-worker.ts`
+  - New: `tests/unit/payments/transfer/spent-state-rescan-worker.test.ts`
+  - New: `tests/integration/payments/spent-state-rescan.test.ts`
+  - Modified: `types/index.ts` — new `'transfer:off-record-spent'` event type + payload
+  - Modified: `modules/payments/PaymentsModule.ts` — worker lifecycle + feature flag
+  - Modified: `docs/uxf/RUNBOOK-SEND-PIPELINE.md` — operator section
+
+**Complexity**: Small to Medium. The disposition engine + writer + LRU cache infrastructure already exist; this is mostly the new worker module (mirroring `nostr-persistence-verifier.ts`'s low-rate background scanner shape), the new event type, and the `suspectedSiblingInstance` detection logic.
+
+**Blast radius**: Low. Gated behind a default-OFF feature flag until soak proves no false-positive surface. Transition to `_audit` uses the disposition engine's existing UNSPENDABLE_BY_US classification — no new disposition machinery needed.
+
+**Doc references**:
+  - `docs/uxf/UXF-TRANSFER-PROTOCOL.md §12.3.2` (now updated 2026-05-19 to flip §12.3.1 to SHIPPED and link this item).
+  - `docs/uxf/UXF-TRANSFER-IMPL-PLAN.md` "Out-of-scope for T.1–T.8 (deferred)" (now updated to flip §12.3.1 to SHIPPED and link this item).
+
+---
+
 ## Cross-cutting concerns
 
 ### Pointer-layer vs OrbitDB-log layering (architectural clarification — superseded by Item #15)

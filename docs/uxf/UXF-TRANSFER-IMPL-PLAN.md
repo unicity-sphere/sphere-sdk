@@ -1417,7 +1417,14 @@ T.8 ships the informational `wireProtocols` field on the identity binding event,
 
 ### Out-of-scope for T.1–T.8 (deferred)
 
-Per canonical §12.3, periodic rescans (profile-pointer + per-token spent-state) are deferred. T.1–T.8 wire up the storage, events, and audit-promotion plumbing so future-wave rescan code can drop in cleanly — but no rescan loop ships in this implementation plan. Coordination point only.
+Per canonical §12.3, periodic rescans (profile-pointer + per-token spent-state) were both deferred at T.1–T.8 plan-time. T.1–T.8 wire up the storage, events, and audit-promotion plumbing so future-wave rescan code can drop in cleanly — but no rescan loop ships in this implementation plan. Coordination point only.
+
+> **Status update (2026-05-19)** — the deferral status has since split:
+>
+>   - **§12.3.1 (profile-pointer rescan) is SHIPPED** outside this plan's T.1–T.8 scope, landed as the core of the **aggregator-pointer wave** (`PROFILE-AGGREGATOR-POINTER-IMPL-PLAN.md` Phases A–E) and consolidated by **Item #15** (Full Profile State Snapshot Sync; PR #173). Implementation: `profile/profile-token-storage/lifecycle-manager.ts:schedulePointerPoll`/`runPointerPollOnce` — randomized [30s, 90s) interval, calls `pointer.recoverLatest()`, dispatches the new CID via `applySnapshotIfWired()`.
+>   - **§12.3.2 (per-token spent-state rescan) is STILL OPEN** as **[Issue #174](https://github.com/unicity-sphere/sphere-sdk/issues/174)**.
+>
+> The original "deferred as a unit" framing is preserved here for historical accuracy of what T.1–T.8 specifically didn't ship; the actual current state is split per the above.
 
 ---
 
