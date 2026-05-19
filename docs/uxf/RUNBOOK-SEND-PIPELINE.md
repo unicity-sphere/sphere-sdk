@@ -206,7 +206,7 @@ The most common cause is **a sibling instance of the same wallet** — desktop +
 - **`true`**  → neither the local OUTBOX nor the SENT ledger holds any record referencing `tokenId`, so the spend cannot have been initiated on THIS device. Almost certainly a sibling-device spend.
 - **`false`** → either OUTBOX or SENT has a record. The local instance is (or was) the spender; the manifest just hasn't been GC'd to reflect the spend yet. Rare edge case — typically only happens if the SENT-write path raced the next rescan cycle.
 
-**Wallet-side state after the event.** If a `transitionToAudit` route is wired (the default for the production `Sphere` wiring), the token is also moved out of the active pool to `_audit` with `reason='off-record-spend'` (§5.3 [E]). Without that route, the worker stays in detect-only mode — the event fires, but the local manifest still shows the token as `'confirmed'`.
+**Wallet-side state after the event.** Out of the box, the auto-installed default closure (`PaymentsModule.defaultSpentStateTransition`) calls `removeToken()` on the off-record-spent token — archive + tombstone + active-map deletion + persist. The token leaves the spendable pool; the tombstone prevents re-sync resurrection. (When `DispositionWriter` becomes wired in production, callers can ALSO synthesize a durable `_audit` record per §5.3 [E] by passing a custom closure to `payments.setSpentStateRescanTransitionToAudit(...)`; the local Token.status flip and the durable `_audit` record are orthogonal.) If you've explicitly overridden the closure with a no-op, the worker stays in detect-only mode — the event fires, but the local manifest still shows the token as `'confirmed'`.
 
 **Diagnostic data to collect.**
 
@@ -231,7 +231,7 @@ The most common cause is **a sibling instance of the same wallet** — desktop +
 **Forward direction.**
 
 - Repeated `transfer:off-record-spent` events firing for many `tokenId`s in a short window typically mean a sibling device recently sent multiple tokens. After the sibling's profile snapshot syncs (§12.3.1), the local view should converge naturally; the audit transitions are correct.
-- If the event fires every cycle for the SAME `tokenId` (5 min cadence by default), check whether the disposition writer is wired. Without the audit route, the worker re-emits the event on every cycle past the per-token interval. Wire `setSpentStateRescanTransitionToAudit(...)` on `PaymentsModule` (or call `Sphere`'s bootstrap setter) to suppress the repeat fires.
+- If the event fires every cycle for the SAME `tokenId` (5 min cadence by default), the local Token.status flip path is NOT firing — either an explicit `setSpentStateRescanTransitionToAudit(...)` override is in place and not removing the token, OR `removeToken()` is throwing internally (check WARN-level `[Payments] defaultSpentStateTransition: removeToken failed` log lines). Out of the box the auto-installed default closure (`defaultSpentStateTransition`) calls `removeToken()` so the spent token is archived + tombstoned + dropped from the active map after the first detection.
 
 **Companion events.** Distinct from `transfer:double-spend-detected` (reactive — fires only when YOU attempt a send) and from `transfer:orphan-spending-detected` (covers `'transferring'` tokens stuck mid-send). All three can fire for related tokens during a sibling-device race; the `tokenId` is the join key.
 

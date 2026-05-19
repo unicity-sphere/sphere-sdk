@@ -733,6 +733,8 @@ Migration consideration: existing wallets that have published only UXF-bundle po
 
 **Soak-gate follow-up**: flip `features.spentStateRescan` to default-ON after the 7-day testnet observation. The flip is a one-line change in `PaymentsModule.ts` (`config?.features?.spentStateRescan ?? true`) plus a status update on this item.
 
+**Bootstrap-layer follow-up (LANDED in PR #N, branch `feat/spent-state-rescan-bootstrap-wiring`)**: `PaymentsModule.defaultSpentStateTransition` is now wired as the default `transitionToAudit` closure. When the worker detects `oracle.isSpent === true`, the closure calls `removeToken()` — archive + tombstone + active-map deletion + persist — so the spent token leaves the spendable pool and the tombstone prevents re-sync resurrection. The token's value is correctly off the wallet's books even without the durable `_audit` record. The setter `payments.setSpentStateRescanTransitionToAudit(...)` remains available for callers that want to ALSO write a `_audit` disposition record (future work — `DispositionWriter` is constructed only in tests today; production bootstrap wiring of `DispositionWriter` is a separate cross-cutting concern).
+
 ---
 
 ## Cross-cutting concerns
