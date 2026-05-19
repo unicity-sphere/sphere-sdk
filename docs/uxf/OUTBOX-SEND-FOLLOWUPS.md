@@ -69,6 +69,8 @@ The OUTBOX is a working queue that **drains** to SENT as deliveries complete. To
 ### 2. Automatic re-publication of detected retention drops (P2 #3 follow-up)
 
 > **Scope after Item #15**: under full-profile-snapshot sync, OUTBOX entries propagate across peers via the pointer mechanism, so the `'entry-tombstoned-or-missing'` skip-reason on `transfer:retention-republish-skipped` becomes rare. Bundles remain pinned on our IPFS by definition (IPFS-pin-only directive); re-publishing always has the bundle bytes available via CID. See Item #15.
+>
+> **Locked by test** (commit `340f65d`): `tests/integration/profile/retention-republish-after-snapshot-join.test.ts` (3 tests) demonstrates the elimination of the `'entry-tombstoned-or-missing'` skip on the cross-device path. The "with snapshot JOIN" scenario asserts that after Peer A's delivered OUTBOX entry propagates to Peer B via the lean-snapshot pull, B's verifier successfully re-arms the retention re-publish (`transfer:retention-republish-rearmed`) instead of skipping. A baseline test without the JOIN step preserves the pre-Item-#15 behaviour as the contrast (the skip DOES fire) so the test scenario actually exercises the contrast. An idempotency test locks the verifier's `checkedIds` semantics.
 
 **Why it matters**: today `NostrPersistenceVerifier` (default-OFF) detects a relay retention drop and emits `transfer:retention-warning`. That's all. The bundle was successfully delivered earlier (relay ack'd it) but is now gone — the recipient may have already seen it, may not have. Closing the loop means actually re-publishing.
 
