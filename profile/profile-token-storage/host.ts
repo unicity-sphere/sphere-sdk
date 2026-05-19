@@ -37,6 +37,7 @@ import type {
   TxfSentEntry,
 } from '../../storage/storage-provider.js';
 import type {
+  ProfileSnapshotPublishResult,
   ProfileTokenStorageProviderOptions,
 } from '../types.js';
 import type { ProfileDatabase } from '../orbitdb-adapter.js';
@@ -212,4 +213,34 @@ export interface ProfileTokenStorageHost {
    * try/catch so a misbehaving host cannot break a mutation path.
    */
   notifyProfileDirty(): void;
+
+  /**
+   * Item #15 Phase D.1b — synchronously invoke the wired
+   * `onProfileDirtyFlush` callback (lean-snapshot build + pin +
+   * publish) coordinated with the dispatch debounce so we don't
+   * double-publish. Used by `FlushScheduler.flushToIpfs()` to publish
+   * a SNAPSHOT CID via the aggregator pointer layer instead of the
+   * legacy BUNDLE CID.
+   *
+   * Semantics:
+   *   - Returns `null` when no `onProfileDirtyFlush` callback is wired
+   *     (legacy tests / providers without the Phase C.3 closure).
+   *     Caller falls back to the legacy bundle-CID publish.
+   *   - Coordinates with the dirty-flush debouncer: cancels any armed
+   *     timer, awaits any in-flight dispatch, clears the pending latch
+   *     before running so a follow-up `notifyProfileDirty()` re-arms
+   *     for the next signal.
+   *   - On success, returns the publisher's structured result.
+   *   - On an unexpected throw from the callback (programmer error or
+   *     transient publish failure surfaced as `runProfileDirtyFlush`'s
+   *     internal throw), emits `storage:error`
+   *     (`PROFILE_DIRTY_FLUSH_FAILED`) and re-throws so the caller
+   *     can decide ack semantics (e.g. flush-scheduler propagates to
+   *     `forceFlushSerialized`'s rejection arm to hold the at-least-
+   *     once gate closed).
+   *
+   * Distinct from `notifyProfileDirty()` (which schedules a debounced
+   * fire) — this entry point fires NOW and returns the result.
+   */
+  publishSnapshotIfWired(): Promise<ProfileSnapshotPublishResult | null>;
 }

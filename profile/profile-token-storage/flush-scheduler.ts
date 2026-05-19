@@ -58,9 +58,11 @@ import { CID } from 'multiformats/cid';
 import * as raw from 'multiformats/codecs/raw';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { create as createMultihash } from 'multiformats/hashes/digest';
-import type { UxfBundleRef } from '../types.js';
+import type {
+  ProfileSnapshotPublishResult,
+  UxfBundleRef,
+} from '../types.js';
 import type { BundleIndex } from './bundle-index.js';
-import type { LifecycleManager } from './lifecycle-manager.js';
 import type { ProfileTokenStorageHost } from './host.js';
 import type { TxfStorageDataBase } from '../../storage/storage-provider.js';
 
@@ -86,7 +88,6 @@ export class FlushScheduler {
   constructor(
     private readonly host: ProfileTokenStorageHost,
     private readonly bundleIndex: BundleIndex,
-    private readonly lifecycle: LifecycleManager,
   ) {}
 
   /**
@@ -686,20 +687,41 @@ export class FlushScheduler {
         }
       }
 
-      // 9. Publish to the pointer layer for cold-start recovery.
-      //    The CAR is already pinned and the OrbitDB bundle ref is
-      //    already written. On a TRANSIENT publish failure, the
-      //    pointer-layer wiring stamps `pendingPublishCid = cid` so
-      //    the next flush / pointer-poll retries — and we THROW here
-      //    so the chained `forceFlushSerialized` rejection propagates
-      //    to `awaitNextFlush` and the at-least-once gate refuses the
-      //    Nostr ack (event replays on next reconnect; addToken
+      // 9. Publish to the aggregator pointer layer for cold-start recovery.
+      //
+      //    Item #15 Phase D.1b: the published CID is the LEAN PROFILE
+      //    SNAPSHOT CID (not the UXF bundle CID). The snapshot covers
+      //    every per-writer encrypted KV entry (OUTBOX / SENT / disposition
+      //    / finalization queue / recipient context) plus the bundle ref
+      //    set including the bundle we just wrote at step 6. The bundle
+      //    CAR is independently pinned to IPFS for content-addressed
+      //    retrieval by `UxfPackage.merge()` at JOIN time.
+      //
+      //    The snapshot build + pin + publish is wired via the
+      //    `onProfileDirtyFlush` callback (Phase C.3 / D.1a) and invoked
+      //    here via the host's synchronous entry point. `null` indicates
+      //    no snapshot publisher is wired — the same effective state as
+      //    "no aggregator pointer layer" — and the publish step is
+      //    skipped silently. Production wires the callback unconditionally
+      //    via `createProfileProviders`; this branch covers tests that
+      //    construct the provider directly without lean-snapshot wiring.
+      //
+      //    On a TRANSIENT publish failure the snapshot publisher's
+      //    internal `runProfileDirtyFlush` throws — caught below — and
+      //    we propagate so the chained `forceFlushSerialized` rejection
+      //    reaches `awaitNextFlush` and the at-least-once gate refuses
+      //    the Nostr ack (event replays on next reconnect; addToken
       //    stateHash dedup is idempotent). On PERMANENT failure the
-      //    pointer-layer emits a `storage:error` event with the code
-      //    and clears the retry marker; we still emit `storage:saved`
-      //    because the wallet's local state is durable — only the
-      //    cross-device anchor is missing, and no retry would help.
-      const publishResult = await this.lifecycle.publishAggregatorPointerBestEffort(cid);
+      //    publisher returns `{ ok: false, transient: false }` and we
+      //    still emit `storage:saved` — local state is durable, only
+      //    the cross-device anchor is missing and no retry would help.
+      let publishResult: ProfileSnapshotPublishResult | null = null;
+      let publishThrew: unknown = undefined;
+      try {
+        publishResult = await this.host.publishSnapshotIfWired();
+      } catch (err) {
+        publishThrew = err;
+      }
 
       this.host.emitEvent({
         type: 'storage:saved',
@@ -707,10 +729,14 @@ export class FlushScheduler {
         data: { cid, tokenCount: tokens.size },
       });
 
-      if (!publishResult.ok && publishResult.transient) {
+      if (publishThrew !== undefined) {
+        throw publishThrew;
+      }
+      if (publishResult && !publishResult.ok && publishResult.transient) {
         throw new Error(
-          `Aggregator pointer publish transient failure for cid=${cid}; ` +
-            `retry marker stored. Refusing to advance the at-least-once ack.`,
+          `Aggregator pointer snapshot publish transient failure (bundle cid=${cid}` +
+            (publishResult.code ? `, code=${publishResult.code}` : '') +
+            `); retry marker stored. Refusing to advance the at-least-once ack.`,
         );
       }
     } catch (err) {

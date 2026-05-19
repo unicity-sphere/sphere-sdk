@@ -299,7 +299,7 @@ export class ProfileTokenStorageProvider
     this.bundleIndex = new BundleIndex(host);
     this.historyStore = new HistoryStore(host);
     this.lifecycleManager = new LifecycleManager(host, this.bundleIndex);
-    this.flushScheduler = new FlushScheduler(host, this.bundleIndex, this.lifecycleManager);
+    this.flushScheduler = new FlushScheduler(host, this.bundleIndex);
   }
 
   // ---------------------------------------------------------------------------
@@ -434,6 +434,12 @@ export class ProfileTokenStorageProvider
       // wires a debounced FlushScheduler trigger here behind the
       // `features.fullProfileSnapshotSync` flag.
       notifyProfileDirty: () => this.notifyProfileDirty(),
+      // Item #15 Phase D.1b — synchronous lean-snapshot publish for
+      // FlushScheduler. Returns `null` when no `onProfileDirtyFlush`
+      // callback is wired (legacy tests fall back to the bundle-CID
+      // publish). Coordinates with the dirty-flush debouncer so we
+      // don't double-publish.
+      publishSnapshotIfWired: () => this.publishSnapshotIfWired(),
     };
   }
 
@@ -578,6 +584,120 @@ export class ProfileTokenStorageProvider
    */
   awaitDirtyFlushSettled(): Promise<void> {
     return this.dirtyFlushPromise ?? Promise.resolve();
+  }
+
+  /**
+   * Item #15 Phase D.1b — synchronously invoke the wired
+   * `onProfileDirtyFlush` callback (lean-snapshot build + pin +
+   * publish) for the FlushScheduler. Replaces the legacy bundle-CID
+   * publish at the end of `flushToIpfs()` when a snapshot publisher
+   * is wired.
+   *
+   * Semantics:
+   *   - Returns `null` when no `onProfileDirtyFlush` callback is
+   *     configured (legacy tests / providers without the Phase C.3
+   *     closure). Caller (FlushScheduler) falls back to legacy
+   *     bundle-CID publish via `LifecycleManager.publishAggregator
+   *     PointerBestEffort()`.
+   *   - Cancels any armed dirty-flush debounce timer so the
+   *     debouncer doesn't separately fire a redundant publish for
+   *     the same writer-side mutations that triggered this flush.
+   *   - Awaits any in-flight `dirtyFlushPromise` so concurrent
+   *     dispatches serialize. The `dirtyFlushPending` latch is
+   *     cleared after our run so a follow-up `notifyProfileDirty()`
+   *     (arriving during this synchronous fire) re-arms cleanly.
+   *   - Tracks our own run as `dirtyFlushPromise` so a concurrent
+   *     `notifyProfileDirty()` observes us as in-flight and latches
+   *     `dirtyFlushPending` instead of starting a parallel fire.
+   *   - On success: returns the publisher's structured
+   *     `ProfileSnapshotPublishResult`. A `void` return from the
+   *     callback (legacy `() => Promise<void>` shape) is normalised
+   *     to `{ ok: true, transient: false }`.
+   *   - On throw (programmer error OR
+   *     `runProfileDirtyFlush`'s transient-failure throw): emits
+   *     `storage:error` with code `PROFILE_DIRTY_FLUSH_FAILED`
+   *     (matching the debouncer's surfacing contract) and re-throws
+   *     so FlushScheduler can propagate to `forceFlushSerialized`'s
+   *     rejection arm — holding the at-least-once gate closed until
+   *     the publish lands.
+   *
+   * The shutdown gate (`isShuttingDown` / `hasShutdown`) returns
+   * `null` so a flush mid-shutdown skips the snapshot publish
+   * entirely (the lifecycle's shutdown sequence drains the existing
+   * dirty-flush promise separately).
+   */
+  async publishSnapshotIfWired(): Promise<ProfileSnapshotPublishResult | null> {
+    if (this.isShuttingDown || this.hasShutdown) return null;
+    const callback = this.options?.onProfileDirtyFlush;
+    if (typeof callback !== 'function') return null;
+
+    // Cancel any armed debounce — we're firing now, so the debouncer's
+    // follow-up fire would be redundant for the same writer mutations.
+    if (this.dirtyFlushTimer !== null) {
+      clearTimeout(this.dirtyFlushTimer);
+      this.dirtyFlushTimer = null;
+    }
+
+    // Drain any in-flight dispatch so we serialize. Bounded by one
+    // hop — the in-flight callback either settles or throws; we
+    // observe whichever and proceed.
+    if (this.dirtyFlushPromise !== null) {
+      try {
+        await this.dirtyFlushPromise;
+      } catch {
+        // Prior dispatch surfaced its error via storage:error in its
+        // own catch arm; we don't propagate it here.
+      }
+    }
+
+    // Clear the pending latch — our synchronous fire covers any
+    // signal that arrived before this call. A signal arriving DURING
+    // our fire will re-set the latch via notifyProfileDirty()'s
+    // `if (dirtyFlushPromise !== null)` branch (because we publish
+    // our own tracked promise below).
+    this.dirtyFlushPending = false;
+
+    const flushBody = (async () => {
+      const result = await callback();
+      return result ?? ({ ok: true, transient: false } as const);
+    })();
+
+    // Track our run so a concurrent `notifyProfileDirty()` observes
+    // us as in-flight and latches `dirtyFlushPending` rather than
+    // starting a parallel fire.
+    const tracked: Promise<void> = flushBody.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.dirtyFlushPromise = tracked;
+
+    try {
+      return await flushBody;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.log(`publishSnapshotIfWired (synchronous fire) failed: ${msg}`);
+      this.emitEvent(
+        this.buildErrorEvent(
+          'storage:error',
+          err,
+          'PROFILE_DIRTY_FLUSH_FAILED',
+        ),
+      );
+      throw err;
+    } finally {
+      // Identity-check so a follow-up `notifyProfileDirty()` that
+      // replaced our tracked promise (extremely unlikely under
+      // serialization, but defensive) is not clobbered.
+      if (this.dirtyFlushPromise === tracked) {
+        this.dirtyFlushPromise = null;
+      }
+      // If a notification arrived during our fire, re-arm the debounce
+      // so the next signal isn't lost. Mirrors `consumePendingDirtyFlag`.
+      if (this.dirtyFlushPending && !this.isShuttingDown && !this.hasShutdown) {
+        this.dirtyFlushPending = false;
+        this.notifyProfileDirty();
+      }
+    }
   }
 
   // ---------------------------------------------------------------------------
