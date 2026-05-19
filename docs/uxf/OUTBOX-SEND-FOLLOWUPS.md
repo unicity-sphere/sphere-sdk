@@ -457,7 +457,9 @@ to pick up where the work stopped:
 | B.4 (DispositionWriter) | ⏸ Deferred | — | See "Deferred — B.4" below |
 | B.5 (Finalization + RecipientContext) | ✓ Done | `7806b93` | `profile/prefix-sync-writer.ts`, `profile/finalization-queue-storage-adapter.ts` + tests |
 | B.6 (BundleIndex) | ✓ Done | `6c3c0ee` | `profile/profile-token-storage/bundle-index.ts` + tests |
-| Phase C | Pending | — | — |
+| C.1 (notifyProfileDirty wiring) | ✓ Done | `04e423e` | every writer + host interface + `ProfileStorageProvider.setProfileDirtyNotifier` + `tests/unit/profile/notify-profile-dirty.test.ts` |
+| C.2 (debounce + dispatch surface) | ✓ Done | `a5a2a90` | `ProfileTokenStorageProvider.notifyProfileDirty` + `dirtyFlushTimer`/`dirtyFlushPending`/`hasShutdown` + `onProfileDirtyFlush` option + `tests/unit/profile/profile-token-storage-dirty-flush.test.ts` |
+| C.3 (Sphere closure wiring) | Pending | — | Sphere's lean-snapshot build → pin → publish closure to plug into `onProfileDirtyFlush` |
 | Phase D | Pending | — | — |
 | Phase E | Pending | — | — |
 | Phase F | Pending | — | — |
@@ -587,9 +589,9 @@ Unit tests per writer: every cell of the table above, plus idempotence (re-runni
 
 **Phase C — Mutation→flush trigger surface**
 
-- C.1 Add a `notifyProfileDirty()` callback to each writer's construction. On every `write()` / `delete()`, the writer calls the callback.
-- C.2 `FlushScheduler` debounces these notifications. Proposal: 1-2 s debounce window for "soft" mutations (OUTBOX status transitions, SENT writes); flush-immediately for "hard" mutations (token finalization). Tunable via options.
-- C.3 `flushToIpfs` builds a lean snapshot (Phase A.2), pins, returns the CID.
+- ✓ C.1 (commit `04e423e`). Every writer's mutation surface invokes a host-provided `notifyProfileDirty()` callback. Plumbed through OutboxWriter, SentLedgerWriter, PrefixSyncWriter, OrbitDb{Finalization,RecipientContext}StorageAdapter, BundleIndex via `host.notifyProfileDirty()`. Centralised wiring lives on `ProfileStorageProvider.setProfileDirtyNotifier(cb)` so all `build*` factories thread the same callback.
+- ✓ C.2 (commit `a5a2a90`). `ProfileTokenStorageProvider` debounces incoming dirty signals over `dirtyFlushDebounceMs` (defaults to `flushDebounceMs`, configurable per-test). On fire, dispatches the host-injected `onProfileDirtyFlush?: () => Promise<void>` callback (new option). Concurrent signals serialize through `dirtyFlushPromise`; mid-flush signals latch via `dirtyFlushPending` and re-arm a fresh debounce. Errors are caught and surfaced via `storage:error` with code `PROFILE_DIRTY_FLUSH_FAILED`. Shutdown cancels the timer and awaits in-flight callbacks.
+- C.3 (pending). Sphere wires the `onProfileDirtyFlush` closure: build a lean snapshot via `buildLeanProfileSnapshot()` → pin CAR to IPFS → publish snapshot CID via the aggregator pointer layer. The producer-side debounce + dispatch surface is in place; only the closure that joins the two providers (`StorageProvider` + `ProfileTokenStorageProvider`) and produces+publishes the snapshot remains.
 
 **Phase D — Pointer publish & pull integration**
 
