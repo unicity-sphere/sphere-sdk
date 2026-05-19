@@ -949,6 +949,10 @@ export class ProfileStorageProvider implements StorageProvider {
     return new OrbitDbDispositionStorageAdapter({
       db: this.db,
       encryptionKey: this.profileEncryptionKey,
+      // Item #15 Phase B.4 — thread the dirty notifier into the adapter
+      // so the four PrefixSyncWriters returned by `syncWritersFor` mark
+      // the profile dirty when JOIN-applied remote records land.
+      notifyProfileDirty: this.profileDirtyNotifier ?? undefined,
     });
   }
 

@@ -40,6 +40,12 @@ import {
   finalizationContextPrefix,
   requestContextPrefix,
 } from './finalization-queue-storage-adapter';
+import {
+  dispositionAuditOrphanPrefix,
+  dispositionAuditPrefix,
+  dispositionInvalidOrphanPrefix,
+  dispositionInvalidPrefix,
+} from './disposition-storage-adapters';
 import { logger } from '../core/logger';
 
 // Re-export so existing callers that imported `ProfileSnapshotPublishResult`
@@ -582,6 +588,34 @@ export function createProfileProviders(
           writers.push({
             keyPrefix: finalizationContextPrefix(addressId),
             writer: pair.finalizationContext,
+          });
+        }
+        // Item #15 Phase B.4 — disposition sync writers (`_invalid`,
+        // `_invalid-orphan`, `_audit`, `_audit-orphan`). The manifest
+        // surface (`${addr}.manifest.`) is intentionally NOT included
+        // here: its production storage today is in-memory only and the
+        // per-field merge in `mergeManifestEntry` is incompatible with
+        // a byte-verbatim PrefixSyncWriter JOIN. Tracked as a deferred
+        // follow-up — see docs/uxf/OUTBOX-SEND-FOLLOWUPS.md item #15
+        // "Deferred — B.4 manifest".
+        const dispositionAdapter = storage.buildDispositionStorageAdapter();
+        if (dispositionAdapter !== null) {
+          const dispoQuad = dispositionAdapter.syncWritersFor(addressId);
+          writers.push({
+            keyPrefix: dispositionInvalidPrefix(addressId),
+            writer: dispoQuad.invalid,
+          });
+          writers.push({
+            keyPrefix: dispositionInvalidOrphanPrefix(addressId),
+            writer: dispoQuad.invalidOrphan,
+          });
+          writers.push({
+            keyPrefix: dispositionAuditPrefix(addressId),
+            writer: dispoQuad.audit,
+          });
+          writers.push({
+            keyPrefix: dispositionAuditOrphanPrefix(addressId),
+            writer: dispoQuad.auditOrphan,
           });
         }
         return writers;
