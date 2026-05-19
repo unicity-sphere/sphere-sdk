@@ -52,6 +52,8 @@ import { logger } from '../core/logger.js';
 import { decryptString, encryptString } from './encryption.js';
 import type { FinalizationQueueStorage } from '../modules/payments/transfer/finalization-queue.js';
 import type { ProfileDatabase } from './types.js';
+import { PrefixSyncWriter } from './prefix-sync-writer.js';
+import type { ProfileSyncWriter } from './profile-snapshot-merge.js';
 
 // =============================================================================
 // 0. Constants — schema discriminator + key shapes
@@ -185,6 +187,32 @@ export class OrbitDbFinalizationQueueStorageAdapter
 
   async deleteKey(key: string): Promise<void> {
     await this.db.del(key);
+  }
+
+  // ===========================================================================
+  // Item #15 Phase B.5 — full-profile-snapshot sync API
+  // ===========================================================================
+
+  /**
+   * Return a {@link ProfileSyncWriter} scoped to
+   * `${addressId}.finalizationQueue.*`. Each finalization-queue entry
+   * is content-immutable per key (the `entryId` disambiguator ensures
+   * two replicas writing the same entry produce equivalent content);
+   * the merge therefore uses constant-Lamport semantics via
+   * {@link PrefixSyncWriter}.
+   *
+   * Sticky-tombstone semantics: once a queue entry is removed on
+   * either replica, the JOIN preserves the tombstone across both
+   * sides. Mirrors {@link FinalizationQueue.remove}'s intent.
+   */
+  syncWriterFor(addressId: string): ProfileSyncWriter {
+    return new PrefixSyncWriter({
+      db: this.db,
+      encryptionKey: this.encryptionKey,
+      keyPrefix: `${addressId}.finalizationQueue.`,
+      validateValue: validateUxf1Schema,
+      label: 'OrbitDbFinalizationQueueStorageAdapter.sync',
+    });
   }
 }
 
@@ -424,6 +452,65 @@ export class OrbitDbRecipientContextStorageAdapter {
       return undefined;
     }
   }
+
+  // ===========================================================================
+  // Item #15 Phase B.5 — full-profile-snapshot sync API
+  // ===========================================================================
+
+  /**
+   * Return the two {@link ProfileSyncWriter}s scoped to this address's
+   * recipient-context state: one for `recipientContext.request.*` (keyed
+   * by requestId) and one for `recipientContext.finalization.*` (keyed
+   * by tokenId).
+   *
+   * Both surfaces are content-immutable per key (PaymentsModule writes
+   * each requestId / tokenId exactly once during the in-flight transfer
+   * lifecycle); the merge uses constant-Lamport semantics via
+   * {@link PrefixSyncWriter}.
+   *
+   * The two sync writers are returned together because they cover the
+   * same logical "recipient-context" namespace under different
+   * sub-prefixes — the Phase D dispatcher invokes both per JOIN cycle.
+   */
+  syncWritersFor(addressId: string): {
+    readonly requestContext: ProfileSyncWriter;
+    readonly finalizationContext: ProfileSyncWriter;
+  } {
+    return {
+      requestContext: new PrefixSyncWriter({
+        db: this.db,
+        encryptionKey: this.encryptionKey,
+        keyPrefix: requestContextPrefix(addressId),
+        validateValue: validateUxf1Schema,
+        label: 'OrbitDbRecipientContextStorageAdapter.sync.request',
+      }),
+      finalizationContext: new PrefixSyncWriter({
+        db: this.db,
+        encryptionKey: this.encryptionKey,
+        keyPrefix: finalizationContextPrefix(addressId),
+        validateValue: validateUxf1Schema,
+        label: 'OrbitDbRecipientContextStorageAdapter.sync.finalization',
+      }),
+    };
+  }
+}
+
+// =============================================================================
+// 2.5 Shared validator for `_schemaVersion: 'uxf-1'` stamped records
+// =============================================================================
+
+/**
+ * Validator used by both adapter sync writers — accepts any decoded
+ * payload that carries the `_schemaVersion: 'uxf-1'` discriminator. This
+ * rejects foreign-schema entries (legacy `OutboxEntry`, raw PaymentsModule
+ * outbox-style records, etc.) that may share the same key prefix during
+ * the §7.2 migration window — those entries don't propagate via the
+ * lean-snapshot path.
+ */
+function validateUxf1Schema(parsed: unknown): boolean {
+  if (parsed === null || typeof parsed !== 'object') return false;
+  if (Array.isArray(parsed)) return false;
+  return (parsed as { _schemaVersion?: unknown })._schemaVersion === SCHEMA_VERSION;
 }
 
 // =============================================================================
