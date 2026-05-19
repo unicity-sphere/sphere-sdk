@@ -29,7 +29,6 @@ vi.mock('../../../profile/ipfs-client', () => ({
 import type { StorageProvider } from '../../../storage/storage-provider';
 import type { FullIdentity, TrackedAddressEntry } from '../../../types';
 import type { OracleProvider } from '../../../oracle';
-import type { ProfileDatabase, OrbitDbConfig } from '../../../profile/types';
 import {
   DURABLE_STORAGE,
   ProfilePointerLayer,
@@ -37,37 +36,23 @@ import {
 import { buildProfilePointerLayer } from '../../../profile/pointer-wiring';
 import { createFileStorageProvider } from '../../../impl/nodejs/storage/FileStorageProvider';
 
-/** Minimal in-memory ProfileDatabase stub for the wiring tests. */
-function createMockDb(): ProfileDatabase & { _store: Map<string, Uint8Array> } {
-  const store = new Map<string, Uint8Array>();
-  return {
-    _store: store,
-    async connect(_config: OrbitDbConfig) {},
-    async put(key: string, value: Uint8Array) {
-      store.set(key, value);
-    },
-    async get(key: string) {
-      return store.get(key) ?? null;
-    },
-    async del(key: string) {
-      store.delete(key);
-    },
-    async all(prefix?: string) {
-      const out = new Map<string, Uint8Array>();
-      for (const [k, v] of store) {
-        if (!prefix || k.startsWith(prefix)) out.set(k, v);
-      }
-      return out;
-    },
-    async close() {},
-    onReplication() {
-      return () => {};
-    },
-    isConnected() {
-      return true;
-    },
-  } as ProfileDatabase & { _store: Map<string, Uint8Array> };
-}
+/**
+ * Item #15 Phase E: the pointer layer now requires an applySnapshot
+ * callback. A no-op stub satisfies the precondition for tests that
+ * cover the OTHER precondition branches.
+ */
+const NO_OP_APPLY_SNAPSHOT = async () => ({
+  joinedAny: false,
+  addressesSeen: 0,
+  bundleEntriesSeen: 0,
+  counters: {
+    entriesEvaluated: 0,
+    liveLanded: 0,
+    tombstonesLanded: 0,
+    localWon: 0,
+    remoteRejectedMalformed: 0,
+  },
+});
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -206,7 +191,7 @@ describe('buildProfilePointerLayer', () => {
     identity: TEST_IDENTITY,
     ipfsGateways: ['https://ipfs.example'],
     lockFilePath: '/tmp/test-publish.lock',
-    db: createMockDb(),
+    applySnapshot: NO_OP_APPLY_SNAPSHOT,
   });
 
   it('skips with oracle_missing when no oracle is provided', async () => {
@@ -286,6 +271,23 @@ describe('buildProfilePointerLayer', () => {
     }
   });
 
+  // Item #15 Phase E: applySnapshot is now REQUIRED for pointer-layer
+  // construction. Wiring without it is a skip rather than a runtime
+  // crash on the first remote pointer.
+  it('skips with snapshot_applier_missing when applySnapshot is omitted', async () => {
+    const result = await buildProfilePointerLayer({
+      ...commonInput(),
+      // Override the common stub with undefined to trigger the skip.
+      applySnapshot: undefined as unknown as typeof NO_OP_APPLY_SNAPSHOT,
+      localCache: createCache({ markDurable: true }),
+      oracle: createOracle({ withAggregatorClient: true, withTrustBase: true }),
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe('snapshot_applier_missing');
+    }
+  });
+
   it('returns a ProfilePointerLayer when all preconditions are met', async () => {
     const result = await buildProfilePointerLayer({
       ...commonInput(),
@@ -320,56 +322,20 @@ describe('buildProfilePointerLayer', () => {
 
 // ---------------------------------------------------------------------------
 // Callback builders — direct unit coverage (T-D3c wiring)
+//
+// Item #15 Phase E: the legacy bundle-CID-only write path was removed
+// from `buildFetchAndJoin`. The pre-flight failure modes (gateway
+// missing, malformed CID, CAR fetch failure) still belong here; the
+// post-fetch contract is now snapshot-only and is covered in the
+// "Item #15 Phase D.2 snapshot apply" block below.
 // ---------------------------------------------------------------------------
 
-describe('fetchAndJoin (T-D3c)', () => {
+describe('fetchAndJoin pre-flight (Item #15 Phase E)', () => {
   // A real CIDv1 raw-codec, SHA-256 hash of the 3-byte string "hi\n".
   // Stable and small — used to avoid hand-crafting varint-prefixed bytes.
   const TEST_CID_STRING = 'bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku';
 
-  it('fetches, verifies, writes an encrypted bundle ref, and persists the version', async () => {
-    const db = createMockDb();
-    const persisted: number[] = [];
-    const persistLocalVersion = async (v: number) => {
-      persisted.push(v);
-    };
-
-    const { fetchFromIpfs } = await import('../../../profile/ipfs-client');
-    const fetchMock = fetchFromIpfs as ReturnType<typeof vi.fn>;
-    fetchMock.mockReset();
-    fetchMock.mockImplementation(async (_gateways: string[], cid: string) => {
-      expect(cid).toBe(TEST_CID_STRING);
-      return new Uint8Array([1, 2, 3]);
-    });
-
-    const { __internal } = await import('../../../profile/pointer-wiring');
-    const { CID } = await import('multiformats/cid');
-    const cidBytes = CID.parse(TEST_CID_STRING).bytes;
-
-    const callback = __internal.buildFetchAndJoin({
-      db,
-      gateways: ['https://ipfs.example'],
-      persistLocalVersion,
-      bundleEncryptionKey: new Uint8Array(32).fill(0x42),
-    });
-
-    await callback(cidBytes, 7);
-
-    // Bundle ref exists at the canonical key.
-    const bundleKey = `tokens.bundle.${TEST_CID_STRING}`;
-    expect(db._store.has(bundleKey)).toBe(true);
-
-    // Payload is NOT plaintext JSON — it's been encrypted.
-    const payload = db._store.get(bundleKey)!;
-    const asText = new TextDecoder().decode(payload);
-    expect(asText.startsWith('{')).toBe(false);
-
-    // Version was advanced.
-    expect(persisted).toEqual([7]);
-  });
-
   it('throws CAR_UNAVAILABLE when the IPFS fetch fails', async () => {
-    const db = createMockDb();
     const { fetchFromIpfs } = await import('../../../profile/ipfs-client');
     const fetchMock = fetchFromIpfs as ReturnType<typeof vi.fn>;
     fetchMock.mockReset();
@@ -377,13 +343,13 @@ describe('fetchAndJoin (T-D3c)', () => {
       throw new Error('all gateways exhausted');
     });
 
+    const applySnapshot = vi.fn();
     const { __internal } = await import('../../../profile/pointer-wiring');
     const { CID } = await import('multiformats/cid');
     const callback = __internal.buildFetchAndJoin({
-      db,
       gateways: ['https://ipfs.example'],
       persistLocalVersion: async () => {},
-      bundleEncryptionKey: new Uint8Array(32),
+      applySnapshot,
     });
 
     await expect(
@@ -391,34 +357,34 @@ describe('fetchAndJoin (T-D3c)', () => {
     ).rejects.toMatchObject({
       code: 'AGGREGATOR_POINTER_CAR_UNAVAILABLE',
     });
-    expect(db._store.size).toBe(0);
+    // Snapshot applier MUST NOT see the CAR — fetch failed before parse.
+    expect(applySnapshot).not.toHaveBeenCalled();
   });
 
   it('throws CAR_UNAVAILABLE when no gateways are configured', async () => {
-    const db = createMockDb();
+    const applySnapshot = vi.fn();
     const { __internal } = await import('../../../profile/pointer-wiring');
     const { CID } = await import('multiformats/cid');
     const callback = __internal.buildFetchAndJoin({
-      db,
       gateways: [],
       persistLocalVersion: async () => {},
-      bundleEncryptionKey: new Uint8Array(32),
+      applySnapshot,
     });
     await expect(
       callback(CID.parse(TEST_CID_STRING).bytes, 2),
     ).rejects.toMatchObject({
       code: 'AGGREGATOR_POINTER_CAR_UNAVAILABLE',
     });
+    expect(applySnapshot).not.toHaveBeenCalled();
   });
 
   it('throws PROTOCOL_ERROR on malformed CID bytes', async () => {
-    const db = createMockDb();
+    const applySnapshot = vi.fn();
     const { __internal } = await import('../../../profile/pointer-wiring');
     const callback = __internal.buildFetchAndJoin({
-      db,
       gateways: ['https://ipfs.example'],
       persistLocalVersion: async () => {},
-      bundleEncryptionKey: new Uint8Array(32),
+      applySnapshot,
     });
     // 64 zero bytes is not a valid CID encoding.
     await expect(
@@ -426,113 +392,7 @@ describe('fetchAndJoin (T-D3c)', () => {
     ).rejects.toMatchObject({
       code: 'AGGREGATOR_POINTER_PROTOCOL_ERROR',
     });
-  });
-
-  it('writes the OrbitDB bundle ref BEFORE persisting the local version', async () => {
-    // Critical ordering: the OrbitDB bundle ref must land first so a
-    // persistLocalVersion failure does not leave the cursor advanced
-    // past a bundle that was never written. The original ordering
-    // (persistLocalVersion → put) was unsafe: any put-side error
-    // (OrbitDB sync timeout, replication-layer hang) would strand the
-    // bundle while the cursor moved on, causing silent token loss on
-    // cross-device recovery. Reversing the order makes a put failure
-    // recoverable — the cursor stays behind OrbitDB and the next
-    // reconcile re-attempts the same `(cidBytes, version)` pair.
-    const order: string[] = [];
-    const db = createMockDb();
-    const originalPut = db.put.bind(db);
-    db.put = async (k, v) => {
-      order.push('db.put');
-      return originalPut(k, v);
-    };
-
-    const { fetchFromIpfs } = await import('../../../profile/ipfs-client');
-    const fetchMock = fetchFromIpfs as ReturnType<typeof vi.fn>;
-    fetchMock.mockReset();
-    fetchMock.mockImplementation(async () => new Uint8Array([0xbe, 0xef]));
-
-    const { __internal } = await import('../../../profile/pointer-wiring');
-    const { CID } = await import('multiformats/cid');
-
-    const callback = __internal.buildFetchAndJoin({
-      db,
-      gateways: ['https://ipfs.example'],
-      persistLocalVersion: async () => {
-        order.push('persistLocalVersion');
-      },
-      bundleEncryptionKey: new Uint8Array(32),
-    });
-
-    await callback(CID.parse(TEST_CID_STRING).bytes, 11);
-    expect(order).toEqual(['db.put', 'persistLocalVersion']);
-  });
-
-  it('does NOT advance the local version when the OrbitDB write fails', async () => {
-    // Recoverability invariant for Gap 1: when the put-path errors,
-    // persistLocalVersion must never run — otherwise the cursor would
-    // advance past a bundle that the next reconcile won't re-fetch.
-    let persistCalled = false;
-    const db = createMockDb();
-    db.put = async () => {
-      throw new Error('simulated OrbitDB write failure');
-    };
-
-    const { fetchFromIpfs } = await import('../../../profile/ipfs-client');
-    const fetchMock = fetchFromIpfs as ReturnType<typeof vi.fn>;
-    fetchMock.mockReset();
-    fetchMock.mockImplementation(async () => new Uint8Array([0xbe, 0xef]));
-
-    const { __internal } = await import('../../../profile/pointer-wiring');
-    const { CID } = await import('multiformats/cid');
-
-    const callback = __internal.buildFetchAndJoin({
-      db,
-      gateways: ['https://ipfs.example'],
-      persistLocalVersion: async () => {
-        persistCalled = true;
-      },
-      bundleEncryptionKey: new Uint8Array(32),
-    });
-
-    await expect(callback(CID.parse(TEST_CID_STRING).bytes, 99)).rejects.toMatchObject({
-      code: 'AGGREGATOR_POINTER_PROTOCOL_ERROR',
-    });
-    expect(persistCalled).toBe(false);
-  });
-
-  it('written bundle ref round-trips through decryptProfileValue', async () => {
-    // Guards against a future regression where fetchAndJoin and
-    // ProfileTokenStorageProvider.listBundles drift on the encryption
-    // key or payload shape — both sides must read/write identically.
-    const db = createMockDb();
-    const { fetchFromIpfs } = await import('../../../profile/ipfs-client');
-    const fetchMock = fetchFromIpfs as ReturnType<typeof vi.fn>;
-    fetchMock.mockReset();
-    fetchMock.mockImplementation(async () => new Uint8Array([0xca, 0xfe]));
-
-    const { __internal } = await import('../../../profile/pointer-wiring');
-    const { CID } = await import('multiformats/cid');
-    const { decryptProfileValue } = await import('../../../profile/encryption');
-
-    const encKey = new Uint8Array(32).fill(0x77);
-    const callback = __internal.buildFetchAndJoin({
-      db,
-      gateways: ['https://ipfs.example'],
-      persistLocalVersion: async () => {},
-      bundleEncryptionKey: encKey,
-    });
-
-    await callback(CID.parse(TEST_CID_STRING).bytes, 42);
-
-    const bundleKey = `tokens.bundle.${TEST_CID_STRING}`;
-    const encrypted = db._store.get(bundleKey)!;
-    const decrypted = await decryptProfileValue(encKey, encrypted);
-    const parsed = JSON.parse(new TextDecoder().decode(decrypted));
-    expect(parsed).toMatchObject({
-      cid: TEST_CID_STRING,
-      status: 'active',
-    });
-    expect(typeof parsed.createdAt).toBe('number');
+    expect(applySnapshot).not.toHaveBeenCalled();
   });
 });
 
@@ -578,7 +438,6 @@ describe('fetchAndJoin — Item #15 Phase D.2 snapshot apply', () => {
   }
 
   it('parses the CAR, calls applySnapshot, and persists the version', async () => {
-    const db = createMockDb();
     const { carBytes, rootCid } = await buildSnapshotCar();
 
     const { fetchFromIpfs } = await import('../../../profile/ipfs-client');
@@ -610,12 +469,10 @@ describe('fetchAndJoin — Item #15 Phase D.2 snapshot apply', () => {
     const { __internal } = await import('../../../profile/pointer-wiring');
     const { CID } = await import('multiformats/cid');
     const callback = __internal.buildFetchAndJoin({
-      db,
       gateways: ['https://ipfs.example'],
       persistLocalVersion: async (v: number) => {
         persisted.push(v);
       },
-      bundleEncryptionKey: new Uint8Array(32),
       applySnapshot,
     });
 
@@ -625,13 +482,52 @@ describe('fetchAndJoin — Item #15 Phase D.2 snapshot apply', () => {
     expect(applyCalls).toHaveLength(1);
     expect(applyCalls[0].entryCount).toBe(1);
     expect(persisted).toEqual([12]);
+  });
 
-    // Legacy bundle-ref write path MUST NOT run when applySnapshot is wired.
-    expect(db._store.size).toBe(0);
+  it('calls applySnapshot BEFORE persisting the local version', async () => {
+    // Ordering invariant for Phase E: per-writer JOIN must land before
+    // the pointer cursor advances. A failure in applySnapshot keeps the
+    // cursor behind the unconsumed remote, so the next reconcile pass
+    // re-fetches + re-applies idempotently. Reversing the order would
+    // strand the cursor past unapplied snapshot state.
+    const { carBytes, rootCid } = await buildSnapshotCar();
+    const { fetchFromIpfs } = await import('../../../profile/ipfs-client');
+    const fetchMock = fetchFromIpfs as ReturnType<typeof vi.fn>;
+    fetchMock.mockReset();
+    fetchMock.mockImplementation(async () => carBytes);
+
+    const order: string[] = [];
+    const applySnapshot = vi.fn(async () => {
+      order.push('applySnapshot');
+      return {
+        joinedAny: true,
+        addressesSeen: 1,
+        bundleEntriesSeen: 0,
+        counters: {
+          entriesEvaluated: 0,
+          liveLanded: 0,
+          tombstonesLanded: 0,
+          localWon: 0,
+          remoteRejectedMalformed: 0,
+        },
+      };
+    });
+
+    const { __internal } = await import('../../../profile/pointer-wiring');
+    const { CID } = await import('multiformats/cid');
+    const callback = __internal.buildFetchAndJoin({
+      gateways: ['https://ipfs.example'],
+      persistLocalVersion: async () => {
+        order.push('persistLocalVersion');
+      },
+      applySnapshot,
+    });
+
+    await callback(CID.parse(rootCid).bytes, 11);
+    expect(order).toEqual(['applySnapshot', 'persistLocalVersion']);
   });
 
   it('does NOT advance the version when applySnapshot throws', async () => {
-    const db = createMockDb();
     const { carBytes, rootCid } = await buildSnapshotCar();
 
     const { fetchFromIpfs } = await import('../../../profile/ipfs-client');
@@ -647,12 +543,10 @@ describe('fetchAndJoin — Item #15 Phase D.2 snapshot apply', () => {
     const { __internal } = await import('../../../profile/pointer-wiring');
     const { CID } = await import('multiformats/cid');
     const callback = __internal.buildFetchAndJoin({
-      db,
       gateways: ['https://ipfs.example'],
       persistLocalVersion: async () => {
         persistCalled = true;
       },
-      bundleEncryptionKey: new Uint8Array(32),
       applySnapshot,
     });
 
@@ -666,12 +560,14 @@ describe('fetchAndJoin — Item #15 Phase D.2 snapshot apply', () => {
   });
 
   it('throws PROTOCOL_ERROR when the CAR is not a valid lean snapshot', async () => {
-    const db = createMockDb();
     const { fetchFromIpfs } = await import('../../../profile/ipfs-client');
     const fetchMock = fetchFromIpfs as ReturnType<typeof vi.fn>;
     fetchMock.mockReset();
     // Return bytes that are not a parseable CAR — definitely not a
-    // lean snapshot.
+    // lean snapshot. Phase E removed the legacy bundle-CID fallback,
+    // so a malformed CAR is a hard error (the next reconcile pass
+    // will re-fetch + re-attempt; operator intervention required if
+    // the remote keeps publishing malformed CARs).
     fetchMock.mockImplementation(async () => new Uint8Array([0, 1, 2, 3, 4]));
 
     let persistCalled = false;
@@ -680,12 +576,10 @@ describe('fetchAndJoin — Item #15 Phase D.2 snapshot apply', () => {
     const { __internal } = await import('../../../profile/pointer-wiring');
     const { CID } = await import('multiformats/cid');
     const callback = __internal.buildFetchAndJoin({
-      db,
       gateways: ['https://ipfs.example'],
       persistLocalVersion: async () => {
         persistCalled = true;
       },
-      bundleEncryptionKey: new Uint8Array(32),
       applySnapshot,
     });
 
@@ -696,35 +590,5 @@ describe('fetchAndJoin — Item #15 Phase D.2 snapshot apply', () => {
     });
     expect(persistCalled).toBe(false);
     expect(applySnapshot).not.toHaveBeenCalled();
-  });
-
-  it('legacy fallback (no applySnapshot wired) still writes bundle ref', async () => {
-    // Regression check: removing the snapshot-aware path should NOT
-    // affect callers that haven't wired the new callback.
-    const db = createMockDb();
-    const { fetchFromIpfs } = await import('../../../profile/ipfs-client');
-    const fetchMock = fetchFromIpfs as ReturnType<typeof vi.fn>;
-    fetchMock.mockReset();
-    fetchMock.mockImplementation(async () => new Uint8Array([0xbe, 0xef]));
-
-    const persisted: number[] = [];
-    const { __internal } = await import('../../../profile/pointer-wiring');
-    const { CID } = await import('multiformats/cid');
-    const callback = __internal.buildFetchAndJoin({
-      db,
-      gateways: ['https://ipfs.example'],
-      persistLocalVersion: async (v: number) => {
-        persisted.push(v);
-      },
-      bundleEncryptionKey: new Uint8Array(32).fill(0x99),
-      // applySnapshot intentionally omitted.
-    });
-
-    await callback(CID.parse(TEST_CID_STRING).bytes, 7);
-
-    // Legacy bundle-ref path ran.
-    const bundleKey = `tokens.bundle.${TEST_CID_STRING}`;
-    expect(db._store.has(bundleKey)).toBe(true);
-    expect(persisted).toEqual([7]);
   });
 });

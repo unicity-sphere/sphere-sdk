@@ -478,12 +478,13 @@ export class ProfileStorageProvider implements StorageProvider {
   private profileDirtyNotifier: (() => void) | null = null;
 
   /**
-   * Item #15 Phase D.2 — host-supplied snapshot-apply callback. When
-   * set, `tryBuildPointerLayer` threads it into the pointer-wiring
-   * layer; on receiving a remote pointer the `fetchAndJoin` callback
-   * parses the CAR as a lean profile snapshot and dispatches per-
-   * writer JOIN through this callback instead of writing a single
-   * `tokens.bundle.{cid}` ref.
+   * Item #15 Phase D.2 / E — host-supplied snapshot-apply callback.
+   * REQUIRED for pointer-layer construction under Phase E: the
+   * `fetchAndJoin` callback parses each remote CAR as a lean profile
+   * snapshot and dispatches per-writer JOIN through this callback.
+   * The legacy bundle-CID-only write path was removed in Phase E, so
+   * `tryBuildPointerLayer` skips with the `snapshot_applier_missing`
+   * reason when this is null.
    *
    * Null until {@link setSnapshotApplier} runs (typically during the
    * Profile factory wiring step alongside the token-storage facade,
@@ -524,9 +525,9 @@ export class ProfileStorageProvider implements StorageProvider {
   }
 
   /**
-   * Item #15 Phase D.2 — register the host's snapshot-apply callback.
-   * Idempotent: callers MAY re-register (the most recent callback
-   * wins). Pass `null` to disable.
+   * Item #15 Phase D.2 / E — register the host's snapshot-apply
+   * callback. Idempotent: callers MAY re-register (the most recent
+   * callback wins). Pass `null` to disable.
    *
    * The applier is threaded into the pointer-wiring layer on the next
    * `tryBuildPointerLayer` run (called from `doConnect`); callers
@@ -534,10 +535,11 @@ export class ProfileStorageProvider implements StorageProvider {
    * the first attach cycle. The factory wires it during provider
    * construction, satisfying this ordering.
    *
-   * Returns `null` callback semantics: the pointer-wiring layer falls
-   * back to the legacy bundle-CID-only write path. Production wiring
-   * (factory.ts) must call this with a non-null applier under
-   * Item #15.
+   * Phase E made the applier REQUIRED for pointer-layer construction.
+   * Passing `null` causes the next `tryBuildPointerLayer` run to skip
+   * with the `snapshot_applier_missing` reason — the wallet runs
+   * without aggregator-pointer recovery rather than silently writing
+   * the wrong CAR shape to the bundle index.
    */
   setSnapshotApplier(
     applier:
@@ -808,10 +810,25 @@ export class ProfileStorageProvider implements StorageProvider {
       ? `${orbitDbDir.replace(/\/+$/, '')}/profile-pointer-publish.lock`
       : undefined;
 
+    // Item #15 Phase E: the pointer layer requires the snapshot applier
+    // — the legacy bundle-CID-only fallback has been removed. Skip the
+    // build with the dedicated `snapshot_applier_missing` reason instead
+    // of constructing a layer whose `fetchAndJoin` would crash on first
+    // remote. (`buildProfilePointerLayer` performs the same check, but
+    // bailing here is cheaper and exposes the contract at the call site.)
+    if (!this.snapshotApplier) {
+      this.pointerLayer = null;
+      this.pointerSkipReason = 'snapshot_applier_missing';
+      logger.warn(
+        'ProfileStorage',
+        'pointer layer skipped: snapshot_applier_missing (factory wiring incomplete)',
+      );
+      return;
+    }
+
     const result = await buildProfilePointerLayer({
       identity,
       localCache: this.localCache,
-      db: this.db,
       oracle,
       ipfsGateways: gateways,
       lockFilePath,
@@ -819,14 +836,13 @@ export class ProfileStorageProvider implements StorageProvider {
       // the pointer layer's master-key construction can reject the
       // canonical 0x01×32 KAT vector outside test-vectors deployments.
       network: this.options?.config?.network,
-      // Item #15 Phase D.2 — thread the host's snapshot applier (set
-      // via `setSnapshotApplier` during factory wiring) into the
-      // pointer-wiring layer. When wired, the `fetchAndJoin` callback
-      // parses the remote CAR as a lean profile snapshot and
-      // dispatches per-writer JOIN through this callback. When
-      // omitted (tests + pre-D.2 wallets), the wiring falls back to
-      // the legacy bundle-CID-only write path.
-      applySnapshot: this.snapshotApplier ?? undefined,
+      // Item #15 Phase D.2 / E — required. Thread the host's snapshot
+      // applier (set via `setSnapshotApplier` during factory wiring)
+      // into the pointer-wiring layer. The pointer layer's
+      // `fetchAndJoin` callback parses each remote CAR as a lean
+      // profile snapshot and dispatches per-writer JOIN through this
+      // callback.
+      applySnapshot: this.snapshotApplier,
       debug: this.debug,
     });
 

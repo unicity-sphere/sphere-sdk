@@ -79,17 +79,11 @@ import { AggregatorPointerError, AggregatorPointerErrorCode } from './aggregator
 
 import { fetchCarFromGateway } from './aggregator-pointer/ipfs-car-fetch';
 import { fetchFromIpfs } from './ipfs-client';
-import { deriveProfileEncryptionKey, encryptProfileValue } from './encryption';
-import { buildLocalEntry } from './oplog-entry';
 import {
   parseLeanProfileSnapshot,
   type LeanProfileSnapshot,
 } from './profile-lean-snapshot';
 import type { ApplySnapshotResult } from './profile-snapshot-dispatcher';
-import type { ProfileDatabase, UxfBundleRef } from './types';
-
-/** OrbitDB key prefix for UXF bundle references — mirrors ProfileTokenStorageProvider. */
-const BUNDLE_KEY_PREFIX = 'tokens.bundle.';
 
 /**
  * Wall-clock cap for the aggregate CAR fetch across all gateways in
@@ -119,6 +113,7 @@ export type PointerWiringSkipReason =
   | 'storage_not_durable'
   | 'identity_missing'
   | 'lock_file_path_missing'
+  | 'snapshot_applier_missing'
   | 'pointer_init_failed';
 
 export type PointerWiringResult =
@@ -145,11 +140,6 @@ export interface PointerWiringInput {
    * skipped with `storage_not_durable`.
    */
   readonly localCache: StorageProvider;
-  /**
-   * OrbitDB adapter. Required so `fetchAndJoin` can persist bundle
-   * refs after a successful remote CAR fetch.
-   */
-  readonly db: ProfileDatabase;
   /** Oracle provider (must expose `getAggregatorClient` + `getRootTrustBase`). */
   readonly oracle: OracleProvider;
   /** IPFS gateway URLs used by the CAR fetcher (rotated in order). */
@@ -171,23 +161,22 @@ export interface PointerWiringInput {
    */
   readonly network?: string;
   /**
-   * Item #15 Phase D.2 — pull-side snapshot applier. When wired, the
-   * `fetchAndJoin` callback parses the remote CAR as a
+   * Item #15 Phase D.2 / E — pull-side snapshot applier. REQUIRED under
+   * Item #15: the `fetchAndJoin` callback parses the remote CAR as a
    * {@link LeanProfileSnapshot} and dispatches per-writer JOIN via
-   * this callback instead of writing a single `tokens.bundle.{cid}`
-   * ref. The legacy bundle-CID-only behaviour is preserved as a
-   * fallback when this is omitted — exclusively for tests + dev
-   * harnesses that don't spin up the full provider stack. Production
-   * wiring (factory.ts) MUST supply this callback under Item #15.
+   * this callback. Phase E removed the legacy bundle-CID-only fallback
+   * (per the maintainer call: no backward compat) — the pointer layer
+   * now ONLY processes lean-snapshot CARs.
    *
    * On parse failure (the remote CAR is not a lean snapshot, or is
    * malformed), the dispatcher throws a typed pointer-layer error so
-   * the reconcile loop surfaces a clear diagnostic instead of
-   * silently falling back to the legacy path. Treating a parse
-   * failure as "legacy bundle CAR" would defeat the lean-snapshot
-   * propagation contract.
+   * the reconcile loop surfaces a clear diagnostic. A wiring without
+   * an applier is rejected by `buildProfilePointerLayer` with the
+   * `snapshot_applier_missing` skip reason — the wallet then runs
+   * without aggregator-pointer recovery rather than silently writing
+   * the wrong CAR shape to the bundle index.
    */
-  readonly applySnapshot?: (
+  readonly applySnapshot: (
     snapshot: LeanProfileSnapshot,
   ) => Promise<ApplySnapshotResult>;
   /** Turn on verbose logging for the wiring helper itself. */
@@ -386,9 +375,16 @@ function buildResolveRemoteCid(deps: {
  *   2. Fetch the CAR from IPFS with content-address verification
  *      (`profile/ipfs-client.ts:fetchFromIpfs` already rejects byte
  *      streams whose hash does not match the CID).
- *   3. Write the remote CID as a bundle ref in OrbitDB — OrbitDB
- *      replication + `ProfileTokenStorageProvider.load()` merge the
- *      new bundle into the joined view on the next read.
+ *   3. Parse the CAR as a {@link LeanProfileSnapshot} (Item #15 D.2)
+ *      and dispatch per-writer JOIN via `applySnapshot`. Each writer
+ *      persists its prefix-filtered slice of the snapshot into its
+ *      own storage; the bundle-ref index is one of those writers
+ *      (BundleIndex), so the merged `tokens.bundle.*` entries land
+ *      through the same path. A malformed CAR — i.e. the remote does
+ *      not publish a lean snapshot — is a hard PROTOCOL_ERROR; Phase
+ *      E removed the legacy bundle-CID-only fallback that used to
+ *      silently absorb the CAR into a single `tokens.bundle.{cid}`
+ *      entry.
  *   4. Persist `profile.pointer.version = remoteVersion` so subsequent
  *      reconcile passes start from the advanced cursor.
  *
@@ -396,43 +392,20 @@ function buildResolveRemoteCid(deps: {
  * conflict path (per the FetchAndJoinCallback contract in
  * reconcile-algorithm.ts). `reconcileAndPublish` does not call
  * `persistLocalVersion` after we return — it only updates its
- * in-memory loop variable. The bundle-ref-first / cursor-after ordering
- * inside this callback is therefore the only place enforcing the
- * "no orphan cursor without a bundle ref" invariant.
- *
- * Limitation (T-D0): the multi-bundle JOIN currently runs under
- * last-writer-wins for same-tokenId collisions and does not perform
- * longest-valid-chain resolution or proof enrichment. For the
- * single-device cold-start and disjoint-token-set cases this is
- * correct; cross-device conflicts on the same tokenId are resolved
- * deterministically but not optimally until the per-token JOIN
- * resolver lands (PROFILE-AGGREGATOR-POINTER-D0-JOIN-AUDIT.md
- * Rules 3 + 4).
+ * in-memory loop variable. The applier-then-cursor ordering inside
+ * this callback is therefore the only place enforcing the
+ * "no orphan cursor without applied snapshot state" invariant.
  */
 function buildFetchAndJoin(deps: {
-  db: ProfileDatabase;
   gateways: readonly string[];
   persistLocalVersion: (v: PointerVersion) => Promise<void>;
   /**
-   * Per-wallet encryption key matching
-   * `ProfileTokenStorageProvider.encryptionKey`. Bundle refs at
-   * `tokens.bundle.{cid}` are encrypted-by-convention on the write
-   * side; mismatched encryption here would make reads fail to
-   * decrypt.
-   *
-   * Only used on the legacy bundle-CID fallback path. When
-   * `applySnapshot` is wired (Item #15 D.2), the receiver writes the
-   * snapshot's KV entries through per-writer JOINs and never
-   * re-encrypts here.
-   */
-  bundleEncryptionKey: Uint8Array;
-  /**
-   * Item #15 Phase D.2 — when wired, the remote CAR is parsed as a
+   * Item #15 Phase D.2 / E — REQUIRED. The remote CAR is parsed as a
    * {@link LeanProfileSnapshot} and dispatched through this callback.
-   * The legacy bundle-CID-only behaviour applies only when this is
-   * absent (test / pre-D.2 wallets during migration).
+   * Phase E removed the legacy bundle-CID-only fallback; this callback
+   * is now the only sink for remote pointer state.
    */
-  applySnapshot?: (
+  applySnapshot: (
     snapshot: LeanProfileSnapshot,
   ) => Promise<ApplySnapshotResult>;
 }): FetchAndJoinCallback {
@@ -471,184 +444,53 @@ function buildFetchAndJoin(deps: {
       );
     }
 
-    // 3a. Item #15 Phase D.2 — if a snapshot applier is wired, parse
-    //     the CAR as a lean snapshot and dispatch per-writer JOIN.
-    //     OrbitDB writes happen inside the writers' `joinSnapshot()`;
-    //     the cursor advance still runs LAST so a JOIN failure does
-    //     not strand the cursor past unconsumed remote state.
-    if (deps.applySnapshot !== undefined) {
-      let snapshot: LeanProfileSnapshot;
-      try {
-        snapshot = await parseLeanProfileSnapshot(carBytes);
-      } catch (err) {
-        // The remote CAR is malformed or not a lean snapshot. Treat
-        // as a hard protocol error — falling back to the legacy
-        // bundle-CID write would silently absorb the wrong CAR
-        // shape and leave the JOIN unconsumed. The next reconcile
-        // pass will re-fetch and re-attempt; if the remote keeps
-        // publishing malformed CARs, an operator must intervene.
-        throw new AggregatorPointerError(
-          AggregatorPointerErrorCode.PROTOCOL_ERROR,
-          `fetchAndJoin: lean-snapshot parse failed for ${cidString} at v=${remoteVersion}: ${err instanceof Error ? err.message : String(err)}`,
-          undefined,
-          { cause: err },
-        );
-      }
-
-      try {
-        await deps.applySnapshot(snapshot);
-      } catch (err) {
-        // Throwing here keeps the cursor behind the unconsumed
-        // remote, so the next reconcile pass re-fetches + re-applies.
-        // Per-writer errors are already swallowed inside the
-        // dispatcher (see profile/profile-snapshot-dispatcher.ts) —
-        // an exception that escapes is a hard failure (e.g. the
-        // dispatcher itself threw before any writer ran).
-        throw new AggregatorPointerError(
-          AggregatorPointerErrorCode.PROTOCOL_ERROR,
-          `fetchAndJoin: applySnapshot threw for ${cidString} at v=${remoteVersion}: ${err instanceof Error ? err.message : String(err)}`,
-          undefined,
-          { cause: err },
-        );
-      }
-
-      // Cursor advance AFTER all per-writer JOINs persist. Mirrors the
-      // legacy-path ordering — a failure here leaves the JOIN-applied
-      // entries durable (the dispatcher's writers persist as they go),
-      // while the cursor stays behind so the next reconcile re-runs the
-      // dispatch idempotently against the same (or newer) remote.
-      await deps.persistLocalVersion(remoteVersion);
-      return;
-    }
-
-    // 3b. Legacy fallback — applySnapshot not wired. Record the remote
-    //    bundle ref so the next JOIN pass picks it up. Mirror
-    //    ProfileTokenStorageProvider.addBundle exactly: same JSON
-    //    shape, same encryption (deterministic per-wallet key — see
-    //    comment at the call site).
-    const ref: UxfBundleRef = {
-      cid: cidString,
-      status: 'active',
-      createdAt: Math.floor(Date.now() / 1000),
-      // tokenCount unknown here — the CAR contents are not parsed.
-      // ProfileTokenStorageProvider re-counts on next flush.
-    };
-    const serialized = new TextEncoder().encode(JSON.stringify(ref));
-    let encrypted: Uint8Array;
+    // 3. Item #15 Phase D.2 / E — parse the CAR as a lean snapshot
+    //    and dispatch per-writer JOIN. OrbitDB writes happen inside
+    //    the writers' `joinSnapshot()`; the cursor advance runs LAST
+    //    so a JOIN failure does not strand the cursor past unconsumed
+    //    remote state. Phase E removed the legacy bundle-CID-only
+    //    fallback — `applySnapshot` is required and a parse failure
+    //    is a hard PROTOCOL_ERROR rather than a silent re-write.
+    let snapshot: LeanProfileSnapshot;
     try {
-      encrypted = await encryptProfileValue(deps.bundleEncryptionKey, serialized);
+      snapshot = await parseLeanProfileSnapshot(carBytes);
     } catch (err) {
+      // The remote CAR is malformed or not a lean snapshot. Treat
+      // as a hard protocol error. The next reconcile pass will
+      // re-fetch and re-attempt; if the remote keeps publishing
+      // malformed CARs, an operator must intervene.
       throw new AggregatorPointerError(
         AggregatorPointerErrorCode.PROTOCOL_ERROR,
-        `fetchAndJoin: bundle-ref encryption failed for ${cidString}: ${err instanceof Error ? err.message : String(err)}`,
+        `fetchAndJoin: lean-snapshot parse failed for ${cidString} at v=${remoteVersion}: ${err instanceof Error ? err.message : String(err)}`,
         undefined,
         { cause: err },
       );
     }
 
-    // Write the OrbitDB bundle ref FIRST, persistLocalVersion AFTER.
-    //
-    // The original ordering (persistLocalVersion → put) is unsafe under
-    // any failure of the OrbitDB write: the local cursor advances to
-    // `version = remoteVersion` but no bundle ref ever lands. The next
-    // reconcile round queries the aggregator for versions > remoteVersion
-    // and never re-fetches the bundle for `remoteVersion` — its tokens
-    // are permanently invisible to JOIN. The OrbitDB write can fail
-    // through any of: a 15s hard-timeout (see `ORBITDB_WRITE_TIMEOUT_MS`)
-    // because @orbitdb/core queues writes against OpLog heads and can
-    // hang when the replication layer is stuck; a thrown sync error from
-    // the OrbitDB peer; or a `put`-path encryption/envelope failure.
-    //
-    // Correct ordering: write the bundle ref first. If it fails,
-    // persistLocalVersion never runs — the cursor stays at its previous
-    // value, and the next reconcile re-fetches the same `(remoteCid,
-    // remoteVersion)` pair. The OrbitDB write is idempotent (same key
-    // = `BUNDLE_KEY_PREFIX + cidString`, deterministically encrypted
-    // payload — encryptProfileValue uses random nonces, but the ref
-    // semantics are key-scoped so a duplicate put is a harmless
-    // overwrite). The IPFS fetch above is content-addressed and also
-    // idempotent.
-    //
-    // If persistLocalVersion fails AFTER the bundle ref lands, the
-    // cursor stays behind OrbitDB on the next reconcile but the JOIN
-    // walker still sees the ref (knownBundleCids picks it up), so
-    // tokens remain visible. Reconcile re-attempts the same version.
-    //
-    // T-D11 W11: stamp the write with originated='system'.
-    // fetchAndJoin's bundle-ref writes mirror addBundle — both are
-    // system-generated cache-index events (not user actions), so
-    // the envelope tag matches ProfileTokenStorageProvider.addBundle.
-    // This keeps the peer's replication view consistent regardless
-    // of which local path produced the ref.
-    const bundleKey = BUNDLE_KEY_PREFIX + cidString;
     try {
-      if (typeof deps.db.putEntry === 'function') {
-        const envelope = buildLocalEntry({
-          type: 'cache_index',
-          originated: 'system',
-          payload: encrypted,
-        });
-        await withTimeout(
-          deps.db.putEntry(bundleKey, envelope),
-          ORBITDB_WRITE_TIMEOUT_MS,
-          `fetchAndJoin: OrbitDB bundle-ref write timed out after ${ORBITDB_WRITE_TIMEOUT_MS}ms for ${cidString}`,
-        );
-      } else {
-        await withTimeout(
-          deps.db.put(bundleKey, encrypted),
-          ORBITDB_WRITE_TIMEOUT_MS,
-          `fetchAndJoin: OrbitDB bundle-ref write timed out after ${ORBITDB_WRITE_TIMEOUT_MS}ms for ${cidString}`,
-        );
-        // Mirror the markLocallyAuthored convention — see the same
-        // fallback in ProfileTokenStorageProvider.addBundle.
-        const markHook = (deps.db as { markLocallyAuthored?: (k: string) => void })
-          .markLocallyAuthored;
-        if (typeof markHook === 'function') {
-          markHook.call(deps.db, bundleKey);
-        }
-      }
+      await deps.applySnapshot(snapshot);
     } catch (err) {
-      if (err instanceof AggregatorPointerError) throw err;
+      // Throwing here keeps the cursor behind the unconsumed
+      // remote, so the next reconcile pass re-fetches + re-applies.
+      // Per-writer errors are already swallowed inside the
+      // dispatcher (see profile/profile-snapshot-dispatcher.ts) —
+      // an exception that escapes is a hard failure (e.g. the
+      // dispatcher itself threw before any writer ran).
       throw new AggregatorPointerError(
         AggregatorPointerErrorCode.PROTOCOL_ERROR,
-        `fetchAndJoin: OrbitDB bundle-ref write failed for ${cidString}: ${err instanceof Error ? err.message : String(err)}`,
+        `fetchAndJoin: applySnapshot threw for ${cidString} at v=${remoteVersion}: ${err instanceof Error ? err.message : String(err)}`,
         undefined,
         { cause: err },
       );
     }
 
-    // Cursor advance AFTER bundle ref is durable. A failure here leaves
-    // the bundle ref in OrbitDB (JOIN still sees it) but the cursor at
-    // its previous value — recoverable via re-reconcile.
+    // Cursor advance AFTER all per-writer JOINs persist. A failure
+    // here leaves the JOIN-applied entries durable (the dispatcher's
+    // writers persist as they go), while the cursor stays behind so
+    // the next reconcile re-runs the dispatch idempotently against
+    // the same (or newer) remote.
     await deps.persistLocalVersion(remoteVersion);
   };
-}
-
-/** Hard cap for an OrbitDB write from inside fetchAndJoin. */
-const ORBITDB_WRITE_TIMEOUT_MS = 15_000;
-
-/** Race a promise against a wall-clock timeout. */
-async function withTimeout<T>(
-  promise: Promise<T>,
-  ms: number,
-  message: string,
-): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeoutPromise = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => {
-      reject(
-        new AggregatorPointerError(
-          AggregatorPointerErrorCode.PROTOCOL_ERROR,
-          message,
-        ),
-      );
-    }, ms);
-  });
-  try {
-    return await Promise.race([promise, timeoutPromise]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
 }
 
 /**
@@ -732,7 +574,15 @@ export async function buildProfilePointerLayer(
     return { ok: false, reason: 'storage_not_durable' };
   }
 
-  // 4. Derive HKDF key material. Any failure inside the crypto stack
+  // 4. Item #15 Phase E: the snapshot applier is the only sink for
+  //    remote pointer state. Skip layer construction with a clean
+  //    diagnostic when wiring is incomplete rather than building a
+  //    layer whose fetchAndJoin would crash on the first remote.
+  if (typeof input.applySnapshot !== 'function') {
+    return { ok: false, reason: 'snapshot_applier_missing' };
+  }
+
+  // 5. Derive HKDF key material. Any failure inside the crypto stack
   //    surfaces as `pointer_init_failed` — we do not leak the
   //    underlying error to avoid seeding stack traces with anything
   //    the log-scrub test would flag.
@@ -745,25 +595,10 @@ export async function buildProfilePointerLayer(
   // the internal copy after derivePointerKeyMaterial returns.
   const rawPrivKeyBytes = hexToBytes(input.identity.privateKey);
   let masterKey: ReturnType<typeof createMasterPrivateKey> | null = null;
-  let bundleEncryptionKey: Uint8Array | null = null;
   try {
     masterKey = createMasterPrivateKey(rawPrivKeyBytes, input.network);
     rawPrivKeyBytes.fill(0);
     const keyMaterial = derivePointerKeyMaterial(masterKey);
-    // Steelman remediation (R-11): derive the bundle AES key from the
-    // SAME masterKey while it is live, using a defensive copy that we
-    // wipe in the finally block below. The previous implementation
-    // called `hexToBytes(input.identity.privateKey)` a SECOND time at
-    // layer-construction, leaking an unwiped plaintext private-key
-    // copy to the heap for the lifetime of the layer.
-    {
-      const masterBytesCopy = masterKey.bytes;
-      try {
-        bundleEncryptionKey = deriveProfileEncryptionKey(masterBytesCopy);
-      } finally {
-        masterBytesCopy.fill(0);
-      }
-    }
     masterKey.zeroize();
     masterKey = null;
     const signer = await buildPointerSigner(keyMaterial.signingSeed);
@@ -804,27 +639,13 @@ export async function buildProfilePointerLayer(
       decodeCid,
     });
 
-    // `bundleEncryptionKey` was derived above from the live masterKey
-    // (steelman R-11 remediation). Guarded against the earlier-throw
-    // path via a non-null assertion: if we reach here the derivation
-    // succeeded. Bundle-ref reads go through `decryptProfileValue` with
-    // this key — writing raw bytes here would cause decrypt failures
-    // on read. Deterministic derivation from the wallet private key
-    // means both sides compute the same key without needing to share
-    // state.
-    if (bundleEncryptionKey === null) {
-      throw new Error('pointer-wiring invariant: bundleEncryptionKey not derived');
-    }
-
+    // Item #15 Phase E: applySnapshot is the only sink for remote
+    // pointer state. The precondition above (skip reason
+    // `snapshot_applier_missing`) guarantees `input.applySnapshot` is
+    // a function here.
     const fetchAndJoin = buildFetchAndJoin({
-      db: input.db,
       gateways: input.ipfsGateways,
       persistLocalVersion,
-      bundleEncryptionKey,
-      // Item #15 Phase D.2 — when the host wired a snapshot applier,
-      // route the fetched CAR through it instead of the legacy
-      // bundle-CID write path. Production wiring (factory.ts) supplies
-      // this; pre-D.2 callers fall through to the legacy fallback.
       applySnapshot: input.applySnapshot,
     });
 
