@@ -1621,12 +1621,18 @@ export class PaymentsModule {
       // commit never reached the aggregator. Flip ON after soak.
       orphanAutoRecovery: config?.features?.orphanAutoRecovery ?? false,
       // Issue #174 — per-token spent-state rescan worker
-      // (UXF-TRANSFER-PROTOCOL §12.3.2). Default-OFF (opt-in during
-      // soak): probes oracle.isSpent for each `'confirmed'` token
-      // every ~5 min per token; flip ON after testnet soak confirms
-      // no false-positive transitions from transient aggregator
-      // availability surface.
-      spentStateRescan: config?.features?.spentStateRescan ?? false,
+      // (UXF-TRANSFER-PROTOCOL §12.3.2). Default-ON after soak: probes
+      // oracle.isSpent for each `'confirmed'` token every ~5 min per
+      // token; on `true`, the auto-installed default closure removes
+      // the token from the active pool (archive + tombstone + map
+      // delete) so the local UI converges with the L3 chain. The
+      // per-token throw-back-off + LRU + concurrency cap protect
+      // against transient aggregator availability false-positives.
+      // Set `false` explicitly to suppress the worker (e.g.
+      // timer-sensitive unit tests, cost-sensitive deployments that
+      // accept the reactive `transfer:double-spend-detected` surface
+      // alone for off-record-spend detection).
+      spentStateRescan: config?.features?.spentStateRescan ?? true,
       // Phase 9.6.D — sender-side §6.1 finalization worker. Default-ON
       // when senderUxf is on: drives instant-mode sends through the full
       // submit/poll cycle so `transfer:confirmed` fires once the

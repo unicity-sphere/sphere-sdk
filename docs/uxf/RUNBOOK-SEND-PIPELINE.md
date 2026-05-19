@@ -267,8 +267,8 @@ features: {
   nostrPersistenceVerifier:      false,  // default-OFF (soak gated)
   orphanAutoRecovery:            false,  // default-OFF (soak gated; safe after item #1)
   tombstoneGcWorker:             false,  // default-OFF (soak gated)
-  spentStateRescan:              false,  // default-OFF (soak gated; Issue #174)
+  spentStateRescan:              true,   // default-ON (Issue #174 — soak gate cleared)
 }
 ```
 
-Per OUTBOX-SEND-FOLLOWUPS item #5, the default-OFF flags will flip to default-ON after a 7-day soak in non-prod. The new `spentStateRescan` flag (Issue #174) follows the same gating — flip after confirming no false-positive `_audit` transitions surface from transient aggregator availability.
+Per OUTBOX-SEND-FOLLOWUPS item #5, the remaining default-OFF flags will flip to default-ON after a 7-day soak in non-prod. The `spentStateRescan` flag (Issue #174) flipped to default-ON after its soak gate cleared — the worker probes `oracle.isSpent` for each `'confirmed'` token and routes detection through the default `removeToken()` cleanup. Wallets that prefer the reactive-only surface (`transfer:double-spend-detected` at next `send()`) can explicitly set `features.spentStateRescan: false`.
