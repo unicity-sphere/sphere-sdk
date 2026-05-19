@@ -830,3 +830,104 @@ describe('profile-lean-snapshot — size caps', () => {
     ).rejects.toThrow(/cap 100000/);
   });
 });
+
+// =============================================================================
+// Phase F — tombstone GC hook
+// =============================================================================
+
+describe('profile-lean-snapshot — Item #15 Phase F tombstone GC hook', () => {
+  it('invokes gcExpiredTombstones BEFORE reading KV entries', async () => {
+    const storage = new InMemoryStorageProvider();
+    await storage.connect();
+    // Seed the storage with an "expired tombstone" key. The hook will
+    // remove it before the builder scans `storage.keys()`.
+    await storage.set('mnemonic', 'm1');
+    await storage.set('DIRECT_aaaaaa_bbbbbb.outbox.expired', 'tomb-old');
+    await storage.set('DIRECT_aaaaaa_bbbbbb.outbox.live', 'live-data');
+
+    const tokenStorage = new FakeTokenStorage();
+
+    const callOrder: string[] = [];
+    const originalKeys = storage.keys.bind(storage);
+    (storage as unknown as { keys: (p?: string) => Promise<string[]> }).keys = async (
+      p?: string,
+    ) => {
+      callOrder.push('keys');
+      return originalKeys(p);
+    };
+
+    const result = await buildLeanProfileSnapshot({
+      storage,
+      tokenStorage: tokenStorage as unknown as ProfileTokenStorageProvider,
+      chainPubkey: TEST_CHAIN_PUBKEY_A,
+      network: 'testnet',
+      gcExpiredTombstones: async () => {
+        callOrder.push('gc');
+        // Simulate per-writer GC db.del() on the expired tombstone key.
+        await storage.remove('DIRECT_aaaaaa_bbbbbb.outbox.expired');
+      },
+    });
+
+    // GC fires before the scan; expired tombstone is absent from the
+    // published entries[].
+    expect(callOrder[0]).toBe('gc');
+    expect(callOrder.indexOf('gc')).toBeLessThan(callOrder.indexOf('keys'));
+    const parsed = await parseLeanProfileSnapshot(result.carBytes);
+    const keys = parsed.entries.map((e) => e.key);
+    expect(keys).not.toContain('DIRECT_aaaaaa_bbbbbb.outbox.expired');
+    expect(keys).toContain('DIRECT_aaaaaa_bbbbbb.outbox.live');
+    expect(keys).toContain('mnemonic');
+  });
+
+  it('swallows hook exceptions and proceeds with snapshot build', async () => {
+    const storage = new InMemoryStorageProvider();
+    await storage.connect();
+    await storage.set('mnemonic', 'm1');
+
+    const tokenStorage = new FakeTokenStorage();
+
+    let hookCalled = false;
+    const result = await buildLeanProfileSnapshot({
+      storage,
+      tokenStorage: tokenStorage as unknown as ProfileTokenStorageProvider,
+      chainPubkey: TEST_CHAIN_PUBKEY_A,
+      network: 'testnet',
+      gcExpiredTombstones: async () => {
+        hookCalled = true;
+        throw new Error('GC pass failure (simulated)');
+      },
+    });
+
+    expect(hookCalled).toBe(true);
+    // Snapshot still produced — failing GC must not block publication.
+    expect(result.entryCount).toBe(1);
+    const parsed = await parseLeanProfileSnapshot(result.carBytes);
+    expect(parsed.entries.map((e) => e.key)).toEqual(['mnemonic']);
+  });
+
+  it('omitting the hook preserves pre-Phase-F behavior (no-op)', async () => {
+    const storage = new InMemoryStorageProvider();
+    await storage.connect();
+    await storage.set('mnemonic', 'm1');
+    await storage.set('DIRECT_aaaaaa_bbbbbb.outbox.expired', 'tomb-old');
+
+    const tokenStorage = new FakeTokenStorage();
+
+    const result = await buildLeanProfileSnapshot({
+      storage,
+      tokenStorage: tokenStorage as unknown as ProfileTokenStorageProvider,
+      chainPubkey: TEST_CHAIN_PUBKEY_A,
+      network: 'testnet',
+    });
+
+    // Without the hook every storage key is propagated — including
+    // tombstones the operator might consider expired. This locks the
+    // backwards-compatible contract.
+    const parsed = await parseLeanProfileSnapshot(result.carBytes);
+    const keys = parsed.entries.map((e) => e.key).sort();
+    expect(keys).toEqual([
+      'DIRECT_aaaaaa_bbbbbb.outbox.expired',
+      'mnemonic',
+    ]);
+  });
+});

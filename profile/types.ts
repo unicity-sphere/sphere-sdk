@@ -123,6 +123,28 @@ export interface ProfileConfig {
   readonly consolidationRetentionMinMs?: number;
   /** Write-behind debounce window in ms (default: 2000) */
   readonly flushDebounceMs?: number;
+  /**
+   * Item #15 Phase F — retention window (in ms) for OUTBOX/SENT
+   * tombstones before they are GC'd at snapshot-build time. Tombstones
+   * older than this threshold are `db.del()`'d by the per-writer
+   * `gcExpiredTombstones()` sweep that runs in the lean-snapshot
+   * builder's pre-read hook, AND consequently dropped from the
+   * published snapshot (so peers do not receive ancient deletes that
+   * have already converged everywhere).
+   *
+   * Default: 30 days. The safety contract — retention must exceed the
+   * longest realistic concurrent-replica pre-sync window — is taken
+   * from the Item #4 default; a fortnight-long offline replica still
+   * converges before its tombstones are reclaimed.
+   *
+   * Set lower for tests that exercise the GC path with simulated
+   * clocks. Setting to `0` makes every tombstone immediately eligible
+   * for purge.
+   *
+   * @see docs/uxf/OUTBOX-SEND-FOLLOWUPS.md — Item #4 (writer GC) and
+   *      Item #15 Phase F (snapshot-build-time hook).
+   */
+  readonly tombstoneRetentionMs?: number;
   /** Custom bootstrap peers for OrbitDB (convenience alias for orbitDb.bootstrapPeers) */
   readonly profileOrbitDbPeers?: string[];
   /**

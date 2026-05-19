@@ -39,12 +39,144 @@ import {
   finalizationContextPrefix,
   requestContextPrefix,
 } from './finalization-queue-storage-adapter';
+import { logger } from '../core/logger';
 
 // Re-export so existing callers that imported `ProfileSnapshotPublishResult`
 // from `profile/factory` still resolve (the canonical declaration moved
 // to `profile/types.ts` to avoid a circular import via
 // `ProfileTokenStorageProviderOptions.onProfileDirtyFlush`).
 export type { ProfileSnapshotPublishResult } from './types';
+
+/**
+ * Item #15 Phase F — default tombstone retention window (30 days).
+ *
+ * Mirrors the value used by the standalone
+ * `modules/payments/transfer/tombstone-gc-worker.ts` rollout — kept as
+ * a profile-local constant so the profile layer does not import from
+ * the higher-level payments layer.
+ *
+ * Safety contract: must exceed the longest realistic concurrent-replica
+ * pre-sync window. 30 days is conservative; a fortnight-long offline
+ * replica still converges before its tombstones are reclaimed.
+ *
+ * @see docs/uxf/OUTBOX-SEND-FOLLOWUPS.md — Item #4 + Item #15 Phase F.
+ */
+export const DEFAULT_PROFILE_TOMBSTONE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * Item #15 Phase F — match keys produced by `getAddressId()` to extract
+ * the per-address prefix. Mirrors the regex used by the pull-side
+ * dispatcher (`profile/profile-snapshot-dispatcher.ts`). Requires a
+ * trailing `.` so we do not match an unrelated key that happens to
+ * start with the pattern.
+ */
+const ADDRESS_ID_KEY_RE = /^(DIRECT_[0-9a-f]{6}_[0-9a-f]{6})\./;
+
+/**
+ * Item #15 Phase F — dependencies for `runProfileTombstoneGc`.
+ *
+ * Extracted so the closure body can be unit-tested with stub writer
+ * builders rather than a live OrbitDB. All slots are evaluated lazily
+ * each call so tombstone GC reflects the live wallet state at the
+ * snapshot-build moment, not the factory-call moment.
+ */
+export interface ProfileTombstoneGcDeps {
+  /**
+   * Returns every wallet-scoped key currently visible to the storage
+   * provider. The closure extracts unique addressIds via the
+   * `DIRECT_xxxxxx_xxxxxx` prefix regex. Failures are treated as "no
+   * addresses" and the GC pass becomes a no-op.
+   */
+  readonly listKeys: () => Promise<ReadonlyArray<string>>;
+  /**
+   * Build an OUTBOX writer for the given addressId. Returns `null`
+   * when encryption is not yet wired (setIdentity pending) — the
+   * closure treats `null` as "skip this address for this cycle".
+   */
+  readonly buildOutboxWriter: (
+    addressId: string,
+  ) => { gcExpiredTombstones: (opts: { readonly retentionMs: number }) => Promise<unknown> } | null;
+  /**
+   * Build a SENT writer for the given addressId. Same null semantics
+   * as `buildOutboxWriter`.
+   */
+  readonly buildSentLedgerWriter: (
+    addressId: string,
+  ) => { gcExpiredTombstones: (opts: { readonly retentionMs: number }) => Promise<unknown> } | null;
+  /** Retention window in ms (tombstones older than this are eligible). */
+  readonly retentionMs: number;
+}
+
+/**
+ * Item #15 Phase F — pre-snapshot tombstone GC pass.
+ *
+ * Iterates every active addressId visible to `listKeys()`, instantiates
+ * the OUTBOX + SENT writers via the injected builders, and invokes
+ * `gcExpiredTombstones({ retentionMs })` on each. Per-writer errors are
+ * caught and logged; one misbehaving writer must not block GC on the
+ * others or block the subsequent snapshot build.
+ *
+ * Best-effort by design: if `listKeys()` itself fails, the closure
+ * returns silently — the GC pass becomes a no-op and the snapshot
+ * builds with whatever tombstones remain. Operators relying on the
+ * standalone `tombstone-gc-worker` (feature-flag gated, separate scan
+ * cadence) cover the same surface independently.
+ *
+ * This closure is wired into the lean-snapshot builder via the new
+ * `gcExpiredTombstones` hook on `BuildLeanProfileSnapshotOptions`. The
+ * builder invokes the hook before its `storage.keys()` scan, so the
+ * subsequent snapshot read naturally excludes any keys this pass
+ * `db.del()`'d.
+ *
+ * @see profile/profile-lean-snapshot.ts — hook invocation point.
+ * @see docs/uxf/OUTBOX-SEND-FOLLOWUPS.md — Item #15 Phase F.
+ */
+export async function runProfileTombstoneGc(
+  deps: ProfileTombstoneGcDeps,
+): Promise<void> {
+  let keys: ReadonlyArray<string>;
+  try {
+    keys = await deps.listKeys();
+  } catch (err) {
+    logger.warn(
+      'ProfileTombstoneGc',
+      `listKeys() threw — skipping tombstone GC pass: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return;
+  }
+
+  const addressIds = new Set<string>();
+  for (const k of keys) {
+    const m = ADDRESS_ID_KEY_RE.exec(k);
+    if (m !== null) addressIds.add(m[1]);
+  }
+  if (addressIds.size === 0) return;
+
+  for (const addressId of addressIds) {
+    const outbox = deps.buildOutboxWriter(addressId);
+    if (outbox !== null) {
+      try {
+        await outbox.gcExpiredTombstones({ retentionMs: deps.retentionMs });
+      } catch (err) {
+        logger.warn(
+          'ProfileTombstoneGc',
+          `OUTBOX gcExpiredTombstones threw for ${addressId} — continuing: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    const sent = deps.buildSentLedgerWriter(addressId);
+    if (sent !== null) {
+      try {
+        await sent.gcExpiredTombstones({ retentionMs: deps.retentionMs });
+      } catch (err) {
+        logger.warn(
+          'ProfileTombstoneGc',
+          `SENT gcExpiredTombstones threw for ${addressId} — continuing: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+  }
+}
 
 /**
  * Item #15 Phase C.3 (extended by D.1a) — dependencies for the
@@ -314,11 +446,27 @@ export function createProfileProviders(
             'onProfileDirtyFlush: tokenStorage holder unexpectedly null',
           );
         }
+        // Item #15 Phase F — tombstone GC at snapshot-build time.
+        // Resolved per call so a `setIdentity` that lands between the
+        // factory construction and the next dirty-flush is observed
+        // by the next GC pass. Retention overrideable via
+        // `ProfileConfig.tombstoneRetentionMs` (defaults to 30 days).
+        const retentionMs =
+          resolvedConfig.tombstoneRetentionMs ?? DEFAULT_PROFILE_TOMBSTONE_RETENTION_MS;
         return buildLeanProfileSnapshot({
           storage,
           tokenStorage,
           chainPubkey,
           network,
+          gcExpiredTombstones: () =>
+            runProfileTombstoneGc({
+              listKeys: () => storage.keys(),
+              buildOutboxWriter: (addressId) =>
+                storage.buildOutboxWriter(addressId),
+              buildSentLedgerWriter: (addressId) =>
+                storage.buildSentLedgerWriter(addressId),
+              retentionMs,
+            }),
         });
       },
       pin: (carBytes) => pinToIpfs(ipfsGateways, carBytes),

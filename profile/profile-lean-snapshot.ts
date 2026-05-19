@@ -186,6 +186,33 @@ export interface BuildLeanProfileSnapshotOptions {
   readonly maxSizeBytes?: number;
   /** Optional override for createdAt — enables byte-deterministic round-tripping for tests. */
   readonly createdAt?: number;
+  /**
+   * Item #15 Phase F — optional pre-read GC hook. When provided, the
+   * builder invokes this callback BEFORE reading any KV entries so that
+   * per-writer `gcExpiredTombstones()` sweeps can `db.del()` expired
+   * tombstone slots, and the subsequent storage scan naturally excludes
+   * those keys from the published snapshot.
+   *
+   * The factory wires this to a closure that iterates active address
+   * IDs and calls `gcExpiredTombstones({ retentionMs })` on every
+   * `OutboxWriter` / `SentLedgerWriter` bound to those addresses.
+   *
+   * Best-effort: errors are swallowed by the callback implementation; a
+   * failed GC sweep leaves the tombstones in place for the next cycle
+   * but does NOT block snapshot publication. The builder treats this
+   * callback as opaque — it does not inspect the result or propagate
+   * thrown errors.
+   *
+   * The split between "GC closure runs here vs in the orchestration
+   * layer" is intentional: lean-snapshot is ciphertext-only and cannot
+   * decrypt tombstone envelopes itself, so the per-writer GC must run
+   * elsewhere. The hook position (before `storage.keys()`) ensures the
+   * scan observes the post-GC state.
+   *
+   * Phase F doc:
+   * @see docs/uxf/OUTBOX-SEND-FOLLOWUPS.md
+   */
+  readonly gcExpiredTombstones?: () => Promise<void>;
 }
 
 /** Diagnostic counters surfaced to callers. */
@@ -425,6 +452,24 @@ export async function buildLeanProfileSnapshot(
   options: BuildLeanProfileSnapshotOptions,
 ): Promise<BuildLeanProfileSnapshotResult> {
   const maxSizeBytes = options.maxSizeBytes ?? LEAN_DEFAULT_MAX_SNAPSHOT_BYTES;
+
+  // Item #15 Phase F — run the GC hook (if wired) before the storage
+  // scan so any tombstones purged by per-writer
+  // `gcExpiredTombstones()` sweeps are already absent from the
+  // subsequent `storage.keys()` enumeration. Failures inside the hook
+  // are swallowed at the hook implementation level; a thrown error
+  // here is logged and ignored so a failing GC pass cannot block
+  // snapshot publication.
+  if (options.gcExpiredTombstones) {
+    try {
+      await options.gcExpiredTombstones();
+    } catch (err) {
+      logger.warn(
+        'ProfileLeanSnapshot',
+        `tombstone GC hook threw: ${err instanceof Error ? err.message : String(err)} — proceeding with snapshot build (expired tombstones may propagate this round)`,
+      );
+    }
+  }
 
   const entries = await readAllKvEntries(options.storage);
   const bundles = await readBundleRefs(options.tokenStorage);
