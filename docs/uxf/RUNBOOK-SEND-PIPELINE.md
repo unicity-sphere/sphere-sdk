@@ -2,7 +2,7 @@
 
 **Audience**: operators and on-call engineers running wallets that emit Sphere SDK events on the send side. Every event in this runbook can fire in normal operation; the runbook describes what each one means, what state the wallet is in when it fires, the diagnostic data to collect, and the recommended actions.
 
-**Scope**: the seven events surfaced by Issue #166 + the OUTBOX-SEND-FOLLOWUPS wave:
+**Scope**: the eight events surfaced by Issue #166 + the OUTBOX-SEND-FOLLOWUPS wave + Issue #174:
 
 - `transfer:orphan-spending-detected`
 - `transfer:orphan-recovered`
@@ -11,6 +11,7 @@
 - `transfer:retention-warning`
 - `transfer:retention-republish-rearmed`
 - `transfer:retention-republish-skipped`
+- `transfer:off-record-spent`
 
 **See also**:
 - [OUTBOX-SEND-FOLLOWUPS.md](./OUTBOX-SEND-FOLLOWUPS.md) — open follow-ups + architecture recap
@@ -31,6 +32,7 @@ Three background workers maintain the pipeline:
 | `SentReconciliationWorker` | Re-runs SENT-writes that failed at the dispatcher's transition. |
 | `NostrPersistenceVerifier` | Detects retention drops on previously-delivered events. Default-OFF. |
 | `TombstoneGcWorker` | Reclaims storage by `db.del()`-ing tombstones past a retention window. Default-OFF. |
+| `SpentStateRescanWorker` | Probes `oracle.isSpent` per active-pool token to detect off-record (sibling-instance) spends. Default-OFF. |
 
 A sweeper (`detectOrphanSpendingTokens()`) catches tokens marked `'transferring'` locally but never persisted to OUTBOX — the crash window between `commitSources` and `outbox.create`.
 
@@ -193,6 +195,48 @@ The original SENT entry is **untouched** — it stays as the historical record o
 
 ---
 
+### `transfer:off-record-spent`
+
+**Payload**: `{ tokenId, detectedAt, suspectedSiblingInstance, coinId, amount }`
+
+**What it means.** The `SpentStateRescanWorker` (Issue #174; UXF-TRANSFER-PROTOCOL §12.3.2) probed `oracle.isSpent(currentDestinationStateHash)` for a token in the local active pool (`status === 'confirmed'`) and the aggregator confirmed the state is SPENT. The local manifest still believed the token was spendable; the L3 chain says otherwise.
+
+The most common cause is **a sibling instance of the same wallet** — desktop + mobile sharing the same mnemonic / chain pubkey, primary + recovered backup, lost-then-found device. One instance spent the token without the other having pulled the spender's profile snapshot via §12.3.1 / Item #15 yet. The `suspectedSiblingInstance` flag is the worker's heuristic verdict on this:
+
+- **`true`**  → neither the local OUTBOX nor the SENT ledger holds any record referencing `tokenId`, so the spend cannot have been initiated on THIS device. Almost certainly a sibling-device spend.
+- **`false`** → either OUTBOX or SENT has a record. The local instance is (or was) the spender; the manifest just hasn't been GC'd to reflect the spend yet. Rare edge case — typically only happens if the SENT-write path raced the next rescan cycle.
+
+**Wallet-side state after the event.** If a `transitionToAudit` route is wired (the default for the production `Sphere` wiring), the token is also moved out of the active pool to `_audit` with `reason='off-record-spend'` (§5.3 [E]). Without that route, the worker stays in detect-only mode — the event fires, but the local manifest still shows the token as `'confirmed'`.
+
+**Diagnostic data to collect.**
+
+- The `tokenId`, `coinId`, `amount` from the payload (forensic triage).
+- The `suspectedSiblingInstance` flag.
+- The wallet's `getTokens({ tokenId })` output — has the disposition writer already transitioned the token to `_audit`?
+- The aggregator's `oracle.isSpent(<currentStateHash>)` answer — confirm the worker's call wasn't a transient false-positive.
+- The wallet's sibling devices (if any) — check whether one of them recently sent this token (look at their `getHistory()`).
+- Recent log lines matching `[Payments] SpentStateRescanWorker: …`.
+
+**Actions.**
+
+1. **Confirm the spend on a sibling device.** Ask the user whether another wallet instance recently spent this token. If yes → no action; the audit transition correctly reflects reality.
+2. **No sibling device matches.** Inspect via direct profile read:
+   - Check OUTBOX (`getOutboxEntries()` or profile dump) for any entry with this `tokenId`.
+   - Check SENT (`getSentEntries()` or profile dump) similarly.
+   - Re-run `oracle.isSpent(<currentStateHash>)` manually — does it still report `true`?
+3. **If the aggregator now reports UNSPENT** (the worker raced a transient cache state):
+   - This is a false-positive transition. The token is in `_audit` but is actually spendable. Operator-override the disposition via the `_audit` → manifest promotion path (`dispositionWriter.promoteAuditEntry`) — escape hatch only after confirming the unspent status from multiple aggregator query attempts.
+4. **If the aggregator confirms SPENT and no sibling can explain it:** the chain has a transition consuming our state that we did NOT author. This is either a key-compromise scenario (someone else holds the private key) or an aggregator-side bug. Escalate. Do NOT operator-override.
+
+**Forward direction.**
+
+- Repeated `transfer:off-record-spent` events firing for many `tokenId`s in a short window typically mean a sibling device recently sent multiple tokens. After the sibling's profile snapshot syncs (§12.3.1), the local view should converge naturally; the audit transitions are correct.
+- If the event fires every cycle for the SAME `tokenId` (5 min cadence by default), check whether the disposition writer is wired. Without the audit route, the worker re-emits the event on every cycle past the per-token interval. Wire `setSpentStateRescanTransitionToAudit(...)` on `PaymentsModule` (or call `Sphere`'s bootstrap setter) to suppress the repeat fires.
+
+**Companion events.** Distinct from `transfer:double-spend-detected` (reactive — fires only when YOU attempt a send) and from `transfer:orphan-spending-detected` (covers `'transferring'` tokens stuck mid-send). All three can fire for related tokens during a sibling-device race; the `tokenId` is the join key.
+
+---
+
 ## Cross-cutting troubleshooting
 
 ### "I see retention warnings for every SENT entry"
@@ -223,7 +267,8 @@ features: {
   nostrPersistenceVerifier:      false,  // default-OFF (soak gated)
   orphanAutoRecovery:            false,  // default-OFF (soak gated; safe after item #1)
   tombstoneGcWorker:             false,  // default-OFF (soak gated)
+  spentStateRescan:              false,  // default-OFF (soak gated; Issue #174)
 }
 ```
 
-Per OUTBOX-SEND-FOLLOWUPS item #5, the three default-OFF flags will flip to default-ON after a 7-day soak in non-prod.
+Per OUTBOX-SEND-FOLLOWUPS item #5, the default-OFF flags will flip to default-ON after a 7-day soak in non-prod. The new `spentStateRescan` flag (Issue #174) follows the same gating — flip after confirming no false-positive `_audit` transitions surface from transient aggregator availability.

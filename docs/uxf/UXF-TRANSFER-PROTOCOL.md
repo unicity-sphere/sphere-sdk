@@ -1709,33 +1709,49 @@ The implementation MUST include:
 - **Conflict-resolution UI/API**: `CONFLICTING` tokens (genuinely-divergent chains) need an explicit `resolveConflict(tokenId, chosenHead)` API and UI surface. Lex-min `bundleCid` provides an automatic primary, but operator override is a planned future addition.
 - **Peer-reputation framework**: §11.4 mentions a 1-hour cooldown on bandwidth-burning peers. The reputation interface itself is out of scope here. Note: peer-reputation rises in operational importance once NFTs are in scope — a peer who delivers a forged or cascade-prone NFT chain can corrupt the recipient's collection in a way coin damage cannot (NFTs are non-fungible / non-replaceable). Reserve a future protocol revision for per-peer trust scores or signed NFT-receipt acknowledgements.
 
-### 12.3 Periodic rescans (two orthogonal scanner types — in-scope; design summary here, implementation deferred)
+### 12.3 Periodic rescans (two orthogonal scanner types — split status)
+
+> **Status update (2026-05-19)**: the original §12.3 framed BOTH rescans as deferred at the time T.1–T.8 were planned. Both have since landed:
+>
+>   - **§12.3.1 (profile-pointer rescan) is SHIPPED** — landed as the core of the **aggregator-pointer wave** (`PROFILE-AGGREGATOR-POINTER-IMPL-PLAN.md` Phases A–E, 75 tasks) and consolidated by **Item #15** (Full Profile State Snapshot Sync; merged via PR #173). Implementation in `profile/profile-token-storage/lifecycle-manager.ts` (`schedulePointerPoll` / `runPointerPollOnce`).
+>   - **§12.3.2 (per-token spent-state rescan) is SHIPPED** — landed via **Issue #174** / branch `feat/spent-state-rescan-worker`. Implementation in `modules/payments/transfer/spent-state-rescan-worker.ts`; wired into `PaymentsModule` behind the `features.spentStateRescan` flag (default-OFF during soak; flip to default-ON after a 7-day testnet observation confirms no false-positive `_audit` transitions surface from transient aggregator availability).
+>
+> The "two rescans deferred as a unit" language in `UXF-TRANSFER-IMPL-PLAN.md`'s "Out-of-scope for T.1–T.8 (deferred)" section is similarly stale (kept for historical accuracy of what shipped in T.1–T.8 specifically; both rescans landed outside the T.1–T.8 wave bucket).
 
 The protocol relies on two periodic rescan loops to maintain consistency between local state and the canonical aggregator/profile views. Both are operator-configurable and run independently:
 
-#### 12.3.1 Profile-pointer rescan
+#### 12.3.1 Profile-pointer rescan — **SHIPPED**
 
-**Purpose**: detect updates to the wallet's UXF profile that landed via another instance of the same wallet (different device, recovered backup, etc.). The profile pointer is registered with the aggregator; periodically, the local instance MUST query the next pointer position to discover whether a remote update has bumped it.
+**Purpose**: detect updates to the wallet's UXF profile that landed via another instance of the same wallet (different device, recovered backup, etc.). The profile pointer is registered with the aggregator; periodically, the local instance queries the latest pointer position to discover whether a remote update has bumped it.
 
 **Mechanism**:
-- Schedule: every `PROFILE_POINTER_RESCAN_INTERVAL` (default 30s).
-- Query: `aggregator.getNextProfilePointer(currentLocalPointerId)` — returns the next pointer in the chain, or `null` if local is the head.
-- On bump: sync the new profile CID locally, run §5.3 disposition matrix on any new tokens, merge per Wave G.3 rules into local pool/manifest. New `_invalid` / `_audit` entries are added per §5.4 keying.
-- Backoff on aggregator unavailability: exponential up to 5 min.
+- Schedule: every `PROFILE_POINTER_RESCAN_INTERVAL` (default 30s, randomized in `[30s, 90s)` in the as-implemented version to avoid synchronized polling herds across devices booting simultaneously).
+- Query: `pointer.recoverLatest()` — returns the latest pointer version anchored to the wallet's chain pubkey, content-verified end-to-end (inclusion proof + trust base + CAR content-address verify).
+- On bump: fetch the new profile CID locally, parse as a `LeanProfileSnapshot` per Item #15, dispatch per-writer JOIN via `applySnapshotIfWired(cid)` (OUTBOX / SENT / disposition / finalization-queue / recipient-context / bundle-refs). Run §5.3 disposition matrix on any new tokens via the existing disposition writer path.
+- Hint channel: `OrbitDbAdapter.onReplication` calls `triggerPointerPollNow()` so a pubsub event collapses worst-case cross-device sync latency from ~90s to ~1-2s on healthy infra. Pubsub is explicitly DEMOTED to a hint channel per Item #15; the aggregator pointer is the authoritative source.
+- Backoff on transient errors: standard interval continues. Permanent classifier (e.g. `AGGREGATOR_POINTER_TRUST_BASE_STALE`) triggers a 5× back-off ([150s, 450s)) AND emits `storage:error` for operator visibility.
 
 This rescan is the primary mechanism by which the audit-collection promotion scanner (formerly listed in §12.2 as deferred) actually fires — when a remote update brings in a new transfer that makes a previously `audit-not-our-state` token ours, the rescan-driven §5.3 pass detects the new ownership and promotes per §5.4.
 
-#### 12.3.2 Per-token spent-state rescan
+**Operator override**: omitting the `getPointerLayer` accessor / not wiring an oracle disables the polling entirely (the lifecycle manager silently skips when no pointer closure is wired). There is no `{ disableProfilePointerRescan: true }` SDK init flag — the wiring presence IS the on-switch.
 
-**Purpose**: detect off-record spends. If another instance of the same wallet (sharing the private keys but not yet synced to us) has spent one of our tokens, the aggregator's SMT will show that token's current state as having a committed transition — but our local manifest still believes the token is `valid`. Without rescan, we'd attempt to spend an already-spent token and learn the truth only at next `send()`.
+#### 12.3.2 Per-token spent-state rescan — **SHIPPED** (Issue #174)
+
+**Purpose**: detect off-record spends. If another instance of the same wallet (sharing the private keys but not yet synced to us) has spent one of our tokens, the aggregator's SMT will show that token's current state as having a committed transition — but our local manifest still believes the token is `valid`. **Without rescan, we'd attempt to spend an already-spent token and learn the truth only at next `send()`** (which surfaces as the typed `STATE_ALREADY_SPENT_BY_OTHER` throw + `transfer:double-spend-detected` event — the REACTIVE surface, Item #14 Phase 1 / commit `9b4fae7`). The PROACTIVE surface catches it earlier so the local UI doesn't continue showing the token as spendable until the user tries to spend it.
 
 **Mechanism**:
-- Schedule: for each token in active pool with `manifest.status === 'valid'`, query `oracle.isSpent(currentDestinationStateHash)` periodically. Default interval `TOKEN_SPENT_RESCAN_INTERVAL = 5 min` per token; cap concurrent in-flight queries at `MAX_CONCURRENT_SPENT_RESCANS` (default 4).
-- On `isSpent === true`: transition the token from active pool to `_audit` with reason='off-record-spend' (UNSPENDABLE_BY_US disposition per §5.3 [E]). Emit `token:off-record-spent` event with `{tokenId, detectedAt, suspectedSiblingInstance: boolean}` — suspected-sibling-instance is set if local outbox has no record of having spent this state, suggesting another instance with the same keys is the spender.
-- On transient errors (aggregator unavailable): backoff; retry.
-- Cache: §8 already references the Wave L LRU cache for `isSpent`. The rescan respects the cache TTL — a recently-cached `isSpent === false` doesn't force a fresh query.
+- Schedule: for each token in the active pool with `manifest.status === 'valid'` (= local `Token.status === 'confirmed'`), query `oracle.isSpent(currentDestinationStateHash)` periodically. Default interval `TOKEN_SPENT_RESCAN_INTERVAL = 5 min` per token; cap concurrent in-flight queries at `MAX_CONCURRENT_SPENT_RESCANS` (default 4).
+- On `isSpent === true`: transition the token from active pool to `_audit` with `reason='off-record-spend'` (UNSPENDABLE_BY_US disposition per §5.3 [E]). Emit `transfer:off-record-spent` event with `{ tokenId, detectedAt, suspectedSiblingInstance, coinId, amount }` — `suspectedSiblingInstance` is `true` when neither the local OUTBOX nor the local SENT ledger holds any record referencing this `tokenId`, indicating the spender is most likely another instance with the same keys.
+- On transient errors (aggregator unavailable / `oracle.isSpent` throw): bump a per-token throw counter. After `consecutiveThrowBackoffThreshold` (default 3) consecutive throws on the SAME token, apply a per-token back-off (`throwBackoffMs`, default 30 min) so a stuck token cannot hammer the aggregator. A successful probe (true OR false) clears the counter.
+- Cache: §8 already references the Wave L LRU cache for `isSpent`. The rescan respects the cache TTL — the per-token interval (5 min) is intentionally aligned with the LRU TTL so the worker piggybacks on the cache instead of bypassing it.
+- Feature flag: `features.spentStateRescan` (default-OFF during soak; flip to default-ON after 7-day testnet observation).
 
-These two rescans are CONFIGURABLE: operators can disable either via SDK init (`{ disableProfilePointerRescan: true }` or `{ disableSpentRescan: true }`) for cost-sensitive deployments. Disabling both leaves the wallet purely event-driven (responsive to incoming bundles only).
+**Relationship to other surfaces**:
+- **Complementary to §12.3.1**: the profile-pointer rescan catches the spend IF the spending device publishes a snapshot to the aggregator before our local poll fires. §12.3.2 catches it independently of whether the spender device's snapshot has propagated.
+- **Complementary to Item #14 Phase 1 (REACTIVE)**: Phase 1's `transfer:double-spend-detected` fires at our next `send()` attempt. §12.3.2 is the PROACTIVE surface — fires from the background sweep before any send attempt.
+- **Distinct from orphan-spending sweeper** (Item #166 P2 #1): that sweeper looks at tokens stuck `'transferring'` with no matching OUTBOX/SENT entry. §12.3.2 looks at tokens at `'confirmed'` AND in the active manifest — disjoint sets by the eligibility filter.
+
+**Operator override**: `{ features: { spentStateRescan: false } }` disables the worker. Disabling leaves the wallet dependent on the reactive surface (Item #14 Phase 1) for off-record-spend detection.
 
 ---
 
