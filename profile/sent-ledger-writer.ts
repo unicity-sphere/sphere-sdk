@@ -78,6 +78,15 @@ export interface SentLedgerWriterOptions {
    *  §7.1. Use a fresh instance per Sphere instantiation; do NOT share
    *  with the OutboxWriter (see module-level rationale). */
   readonly lamport: Lamport;
+  /**
+   * Item #15 Phase C — fired after any local mutation completes
+   * successfully (live write, tombstone delete, JOIN-applied remote
+   * change, GC-purged tombstone). Signals the host's flush scheduler
+   * that the profile has dirty state that should be included in the
+   * next lean-snapshot publish. See {@link OutboxWriter} for the
+   * full semantics.
+   */
+  readonly notifyProfileDirty?: () => void;
 }
 
 /**
@@ -116,6 +125,7 @@ export class SentLedgerWriter implements ProfileSyncWriter {
   private readonly addressId: string;
   private readonly lamport: Lamport;
   private readonly keyPrefix: string;
+  private readonly notifyProfileDirty: (() => void) | null;
 
   /**
    * OUTBOX-SEND-FOLLOWUPS item #3 — lazy in-memory `tokenId → entryId`
@@ -152,6 +162,22 @@ export class SentLedgerWriter implements ProfileSyncWriter {
     this.addressId = options.addressId;
     this.lamport = options.lamport;
     this.keyPrefix = `${this.addressId}.sent.`;
+    this.notifyProfileDirty = options.notifyProfileDirty ?? null;
+  }
+
+  /**
+   * Item #15 Phase C — invoke the host's `notifyProfileDirty` callback
+   * (if wired). Guarded so a misbehaving notifier cannot break a mutation
+   * path; errors are swallowed silently (the dirty signal is best-effort
+   * — the next flush will pick up the state regardless).
+   */
+  private emitProfileDirty(): void {
+    if (this.notifyProfileDirty === null) return;
+    try {
+      this.notifyProfileDirty();
+    } catch {
+      // Best-effort signal — never propagate notifier errors.
+    }
   }
 
   /**
@@ -219,6 +245,7 @@ export class SentLedgerWriter implements ProfileSyncWriter {
     // sync. No-op when the index hasn't been built yet (ensureIndex()
     // will catch up on first read).
     this.updateIndexAfterWrite(stamped.id, stamped.tokenIds);
+    this.emitProfileDirty();
     return stamped;
   }
 
@@ -251,6 +278,7 @@ export class SentLedgerWriter implements ProfileSyncWriter {
     await this.writeRaw(id, tombstone);
     // OUTBOX-SEND-FOLLOWUPS item #3 — clear the index slot for this id.
     this.removeFromIndexAfterDelete(id);
+    this.emitProfileDirty();
   }
 
   /**
@@ -321,6 +349,9 @@ export class SentLedgerWriter implements ProfileSyncWriter {
         kept += 1;
       }
     }
+    // Item #15 Phase C — reclaimed tombstones change snapshot contents,
+    // so signal dirty if anything actually got purged.
+    if (purged > 0) this.emitProfileDirty();
     return { scanned, purged, kept, skipped: false };
   }
 
@@ -396,6 +427,9 @@ export class SentLedgerWriter implements ProfileSyncWriter {
     if (result.liveLanded > 0 || result.tombstonesLanded > 0) {
       this.tokenIndex = null;
       this.entryTokenIds = null;
+      // Item #15 Phase C — landed remote bytes change our local state,
+      // so the next flush should re-snapshot.
+      this.emitProfileDirty();
     }
     return result;
   }

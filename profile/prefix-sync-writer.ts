@@ -96,6 +96,16 @@ export interface PrefixSyncWriterOptions {
    * to `'PrefixSyncWriter'`.
    */
   readonly label?: string;
+  /**
+   * Item #15 Phase C — fired once after a JOIN that lands at least one
+   * live or tombstone remote entry into the local store. The wrapping
+   * adapter (FinalizationQueue / RecipientContext / Disposition) is
+   * what receives this for content-immutable surfaces; the underlying
+   * `writeKey` / `deleteKey` mutations on the adapter itself are
+   * notified separately by the adapter. Optional — when omitted the
+   * wrapper is a pure read+join surface.
+   */
+  readonly notifyProfileDirty?: () => void;
 }
 
 // =============================================================================
@@ -124,6 +134,7 @@ export class PrefixSyncWriter implements ProfileSyncWriter {
   private readonly encryptionKey: Uint8Array | null;
   private readonly keyPrefix: string;
   private readonly validateValue: (decoded: unknown) => boolean;
+  private readonly notifyProfileDirty: (() => void) | null;
 
   constructor(opts: PrefixSyncWriterOptions) {
     if (typeof opts.keyPrefix !== 'string' || opts.keyPrefix.length === 0) {
@@ -135,6 +146,7 @@ export class PrefixSyncWriter implements ProfileSyncWriter {
     this.encryptionKey = opts.encryptionKey;
     this.keyPrefix = opts.keyPrefix;
     this.validateValue = opts.validateValue ?? defaultValidator;
+    this.notifyProfileDirty = opts.notifyProfileDirty ?? null;
   }
 
   async snapshot(): Promise<ReadonlyArray<SnapshotEntry>> {
@@ -158,7 +170,7 @@ export class PrefixSyncWriter implements ProfileSyncWriter {
   async joinSnapshot(
     remote: ReadonlyArray<SnapshotEntry>,
   ): Promise<JoinResult> {
-    return runJoinSnapshot(remote, {
+    const result = await runJoinSnapshot(remote, {
       classifyLocal: async (key) => {
         if (!key.startsWith(this.keyPrefix)) return { kind: 'absent' };
         const raw = await this.safeGet(key);
@@ -174,6 +186,19 @@ export class PrefixSyncWriter implements ProfileSyncWriter {
         await this.db.put(key, bytes);
       },
     });
+    // Item #15 Phase C — fire the host's dirty signal if anything
+    // landed. Guarded against notifier exceptions.
+    if (
+      (result.liveLanded > 0 || result.tombstonesLanded > 0) &&
+      this.notifyProfileDirty !== null
+    ) {
+      try {
+        this.notifyProfileDirty();
+      } catch {
+        // Best-effort signal — never propagate notifier errors.
+      }
+    }
+    return result;
   }
 
   /**

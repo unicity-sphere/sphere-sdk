@@ -129,6 +129,10 @@ function createMockHost(opts: {
       error: err instanceof Error ? err : new Error(String(err)),
       ...(code ? { code } : {}),
     }),
+    // Item #15 Phase C — BundleIndex calls this after every mutation /
+    // JOIN-applied change. Stub as a no-op for tests that only assert
+    // on the bundle-ref surface.
+    notifyProfileDirty: () => {},
   } as unknown as ProfileTokenStorageHost;
 }
 

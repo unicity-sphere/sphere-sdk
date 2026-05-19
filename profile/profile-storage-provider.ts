@@ -460,11 +460,45 @@ export class ProfileStorageProvider implements StorageProvider {
   private pointerBuildPromise: Promise<void> | null = null;
 
   /**
+   * Item #15 Phase C — host-supplied "profile state changed" callback.
+   * When set, every {@link OutboxWriter} / {@link SentLedgerWriter} /
+   * {@link OrbitDbFinalizationQueueStorageAdapter} /
+   * {@link OrbitDbRecipientContextStorageAdapter} produced by the
+   * `build*` factories is wired with this callback. Mutations and
+   * JOIN-applied remote changes invoke it to signal the host's
+   * FlushScheduler.
+   *
+   * Null until {@link setProfileDirtyNotifier} runs (typically during
+   * Sphere's wiring step alongside the token-storage facade). Writers
+   * constructed before the notifier is set treat the callback as
+   * absent — they simply don't emit dirty signals. This matches the
+   * Phase A/B contract (the existing pre-#15 flush path is
+   * functionally complete without the dirty signals).
+   */
+  private profileDirtyNotifier: (() => void) | null = null;
+
+  /**
    * Derived: true iff OrbitDB has been attached.
    * Single source of truth — no separate `dbConnected` field to diverge.
    */
   private get dbConnected(): boolean {
     return this.dbStatus === 'attached';
+  }
+
+  /**
+   * Item #15 Phase C — register the host's "profile dirty" callback.
+   * Idempotent: callers MAY re-register (the most recent callback
+   * wins). Pass `null` to disable.
+   *
+   * The notifier propagates into every writer/adapter built AFTER
+   * this call via the `build*` factories. Writers built BEFORE the
+   * call continue with their construction-time notifier (or with
+   * none if they were built without one). Sphere's wiring sets the
+   * notifier early enough that the typical wallet-build path picks
+   * it up.
+   */
+  setProfileDirtyNotifier(notifier: (() => void) | null): void {
+    this.profileDirtyNotifier = notifier;
   }
 
   constructor(
@@ -864,6 +898,7 @@ export class ProfileStorageProvider implements StorageProvider {
     return new OrbitDbFinalizationQueueStorageAdapter({
       db: this.db,
       encryptionKey: this.profileEncryptionKey,
+      notifyProfileDirty: this.profileDirtyNotifier ?? undefined,
     });
   }
 
@@ -882,6 +917,7 @@ export class ProfileStorageProvider implements StorageProvider {
     return new OrbitDbRecipientContextStorageAdapter({
       db: this.db,
       encryptionKey: this.profileEncryptionKey,
+      notifyProfileDirty: this.profileDirtyNotifier ?? undefined,
     });
   }
 
@@ -924,6 +960,7 @@ export class ProfileStorageProvider implements StorageProvider {
       encryptionKey: this.profileEncryptionKey,
       addressId,
       lamport: lamport ?? new Lamport(),
+      notifyProfileDirty: this.profileDirtyNotifier ?? undefined,
     });
   }
 
@@ -958,6 +995,7 @@ export class ProfileStorageProvider implements StorageProvider {
       encryptionKey: this.profileEncryptionKey,
       addressId,
       lamport: lamport ?? new Lamport(),
+      notifyProfileDirty: this.profileDirtyNotifier ?? undefined,
     });
   }
 

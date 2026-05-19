@@ -90,6 +90,19 @@ export interface OutboxWriterOptions {
    *  §7.1. Per-instance scoped — supply a fresh clock per Sphere instance
    *  to avoid bleed across destroy-recreate cycles. */
   readonly lamport: Lamport;
+  /**
+   * Item #15 Phase C — fired after any local mutation completes
+   * successfully (live write, tombstone delete, JOIN-applied remote
+   * change, GC-purged tombstone). Signals the host's flush scheduler
+   * that the profile has dirty state that should be included in the
+   * next lean-snapshot publish.
+   *
+   * Optional: writers function identically when omitted (the host has
+   * not yet wired full-profile-snapshot sync, or the test is exercising
+   * a pre-#15 path). Errors thrown by the callback are caught and
+   * logged silently so a misbehaving notifier cannot break write paths.
+   */
+  readonly notifyProfileDirty?: () => void;
 }
 
 /**
@@ -153,6 +166,7 @@ export class OutboxWriter implements ProfileSyncWriter {
   private readonly addressId: string;
   private readonly lamport: Lamport;
   private readonly keyPrefix: string;
+  private readonly notifyProfileDirty: (() => void) | null;
 
   constructor(options: OutboxWriterOptions) {
     if (!options.addressId || options.addressId.length === 0) {
@@ -180,6 +194,22 @@ export class OutboxWriter implements ProfileSyncWriter {
     this.addressId = options.addressId;
     this.lamport = options.lamport;
     this.keyPrefix = `${this.addressId}.outbox.`;
+    this.notifyProfileDirty = options.notifyProfileDirty ?? null;
+  }
+
+  /**
+   * Item #15 Phase C — invoke the host's `notifyProfileDirty` callback
+   * (if wired). Guarded so a misbehaving notifier cannot break a mutation
+   * path; errors are swallowed silently (the dirty signal is best-effort
+   * — the next flush will pick up the state regardless).
+   */
+  private emitProfileDirty(): void {
+    if (this.notifyProfileDirty === null) return;
+    try {
+      this.notifyProfileDirty();
+    } catch {
+      // Best-effort signal — never propagate notifier errors.
+    }
   }
 
   /**
@@ -273,6 +303,7 @@ export class OutboxWriter implements ProfileSyncWriter {
     };
 
     await this.writeRaw(stamped.id, JSON.stringify(stamped));
+    this.emitProfileDirty();
     return stamped;
   }
 
@@ -376,6 +407,7 @@ export class OutboxWriter implements ProfileSyncWriter {
       lamport,
     });
     await this.writeRaw(id, tombstone);
+    this.emitProfileDirty();
   }
 
   /**
@@ -479,6 +511,9 @@ export class OutboxWriter implements ProfileSyncWriter {
         kept += 1;
       }
     }
+    // Item #15 Phase C — reclaimed tombstones change snapshot contents,
+    // so signal dirty if anything actually got purged.
+    if (purged > 0) this.emitProfileDirty();
     return { scanned, purged, kept, skipped: false };
   }
 
@@ -551,7 +586,7 @@ export class OutboxWriter implements ProfileSyncWriter {
   async joinSnapshot(
     remote: ReadonlyArray<SnapshotEntry>,
   ): Promise<JoinResult> {
-    return runJoinSnapshot(remote, {
+    const result = await runJoinSnapshot(remote, {
       classifyLocal: async (key) => {
         if (!key.startsWith(this.keyPrefix)) return { kind: 'absent' };
         const shape = await this.readSlotShape(key);
@@ -575,6 +610,13 @@ export class OutboxWriter implements ProfileSyncWriter {
         await this.db.put(key, bytes);
       },
     });
+    // Item #15 Phase C — any landed remote bytes change our local
+    // state, so the next flush should re-snapshot. `liveLanded` and
+    // `tombstonesLanded` capture both surfaces.
+    if (result.liveLanded > 0 || result.tombstonesLanded > 0) {
+      this.emitProfileDirty();
+    }
+    return result;
   }
 
   /**

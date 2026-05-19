@@ -391,7 +391,33 @@ export class ProfileTokenStorageProvider
       // Operational state persistence
       writeOrbitOperationalState: (opState) => this.writeOrbitOperationalState(opState),
       writeLocalDerivedCache: (opState) => this.writeLocalDerivedCache(opState),
+      // Item #15 Phase C — dirty-signal entry point. The bundle index and
+      // (future) lean-snapshot debounce wiring call this on any local
+      // mutation. Today the implementation is a no-op stub: Phase C.2
+      // wires a debounced FlushScheduler trigger here behind the
+      // `features.fullProfileSnapshotSync` flag.
+      notifyProfileDirty: () => this.notifyProfileDirty(),
     };
+  }
+
+  /**
+   * Item #15 Phase C — central handler for "some profile state changed"
+   * signals from per-writer mutations and JOIN-applied remote changes.
+   *
+   * Today this is a no-op stub. Phase C.2 will route into the
+   * FlushScheduler so the next debounce window builds a lean profile
+   * snapshot and publishes its CID via the aggregator pointer. Phase D
+   * adds the pull-side dispatcher that consumes those snapshots.
+   *
+   * Wired into:
+   *   - BundleIndex.addBundle / joinSnapshot (this provider's bundle ref)
+   *   - OutboxWriter / SentLedgerWriter / PrefixSyncWriter (via their own
+   *     notifyProfileDirty callbacks plumbed by ProfileStorageProvider)
+   *   - OrbitDb{Finalization,RecipientContext}StorageAdapter writeKey /
+   *     deleteKey paths
+   */
+  private notifyProfileDirty(): void {
+    // No-op stub. Phase C.2 will arm a debounced lean-snapshot flush.
   }
 
   // ---------------------------------------------------------------------------

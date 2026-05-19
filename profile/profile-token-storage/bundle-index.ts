@@ -191,6 +191,8 @@ export class BundleIndex implements ProfileSyncWriter {
       }
     }
     this.host.getKnownBundleCids().add(cid);
+    // Item #15 Phase C — every bundle-ref add changes our snapshot.
+    this.host.notifyProfileDirty();
   }
 
   /**
@@ -296,6 +298,11 @@ export class BundleIndex implements ProfileSyncWriter {
         }
       },
     });
+    // Item #15 Phase C — any landed remote bytes change our local
+    // state, so the next flush should re-snapshot.
+    if (result.liveLanded > 0 || result.tombstonesLanded > 0) {
+      this.host.notifyProfileDirty();
+    }
     return result;
   }
 

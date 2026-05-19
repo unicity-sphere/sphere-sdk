@@ -199,4 +199,17 @@ export interface ProfileTokenStorageHost {
     sent: TxfSentEntry[];
     history: HistoryRecord[];
   }): Promise<boolean>;
+
+  /**
+   * Item #15 Phase C — signal the host that some local profile state
+   * has changed and should be included in the next lean-snapshot
+   * publish. Called by per-writer mutations (OutboxWriter,
+   * SentLedgerWriter, BundleIndex, etc.) and by JOIN-applied remote
+   * changes. The host's implementation debounces these signals via the
+   * FlushScheduler (Phase C.2/D wires the actual snapshot build).
+   *
+   * MUST be non-throwing — writers invoke this inside guarded
+   * try/catch so a misbehaving host cannot break a mutation path.
+   */
+  notifyProfileDirty(): void;
 }
