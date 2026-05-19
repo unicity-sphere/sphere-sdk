@@ -3942,6 +3942,18 @@ export class PaymentsModule {
     // (writer not wired, identity missing, write rejection) to a
     // warn-log. The event already fired; the local cleanup
     // succeeded; the durable record is observational forensics.
+    // Steelman H3 (PR #179 review): lazy field read — the writer is
+    // looked up AT PROBE TIME, not at closure-bind time. This means
+    // the bootstrap layer (Sphere) can install the writer BEFORE OR
+    // AFTER `payments.initialize()` (which starts the rescan worker);
+    // the closure observes whatever value is in the field when the
+    // probe actually fires. With the default `intervalMs = 5 min`,
+    // any reasonable bootstrap order completes well before the first
+    // probe. If the writer is null at probe time (e.g. legacy
+    // wallets without an OrbitDb adapter, or a race between bootstrap
+    // and an aggressively-tuned `intervalMs` in tests), we degrade
+    // gracefully: local cleanup already happened above; only the
+    // durable forensic record is skipped.
     const writer = this._spentStateAuditWriter;
     if (writer === null) return;
     const identity = this.deps?.identity;
@@ -3968,7 +3980,14 @@ export class PaymentsModule {
         disposition: 'AUDIT',
         tokenId: sdkTokenId,
         observedTokenContentHash: observedTokenContentHash as DispositionRecord['observedTokenContentHash'],
-        bundleCid: `local-rescan-${addr}-${params.detectedAt}`,
+        // Steelman H1 (PR #179 review): include the local token id so
+        // two distinct tokens probed in the SAME millisecond produce
+        // distinct synthetic markers in their respective
+        // `bundleCidsObserved` lists. Storage key is keyed by
+        // (addr, tokenId, observedTokenContentHash) so distinct keys
+        // were guaranteed already; this fix is for forensic fidelity
+        // when an operator replays the bundleCidsObserved accumulator.
+        bundleCid: `local-rescan-${addr}-${params.token.id.slice(0, 12)}-${params.detectedAt}`,
         senderTransportPubkey: identity.chainPubkey,
         auditStatus: 'audit-off-record-spend',
         reason: 'off-record-spend',

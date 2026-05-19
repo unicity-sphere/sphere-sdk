@@ -546,6 +546,11 @@ describe('PaymentsModule.installSpentStateAuditWriter — durable AUDIT record (
     expect(record.observedTokenContentHash).toMatch(/^[0-9a-f]{64}$/);
     expect(record.bundleCid).toContain('local-rescan-');
     expect(record.bundleCid).toContain('1700000000000');
+    // Steelman H1 (PR #179 review): local token id slice MUST be
+    // present so two distinct tokens probed in the same millisecond
+    // produce distinct synthetic bundleCid markers in their
+    // respective AUDIT records.
+    expect(record.bundleCid).toContain('tok-audit-1'); // local token id (under 12-char slice cap)
     expect(record.senderTransportPubkey).toBe('02' + 'a'.repeat(64));
   });
 
