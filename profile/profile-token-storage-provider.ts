@@ -466,8 +466,14 @@ export class ProfileTokenStorageProvider
    *     notifyProfileDirty callbacks plumbed by ProfileStorageProvider)
    *   - OrbitDb{Finalization,RecipientContext}StorageAdapter writeKey /
    *     deleteKey paths
+   *
+   * Public so the factory's bridge from
+   * `ProfileStorageProvider.setProfileDirtyNotifier` can delegate
+   * here. The host's `notifyProfileDirty` (used by internal sub-modules
+   * like BundleIndex) routes through the same body via the host
+   * interface.
    */
-  private notifyProfileDirty(): void {
+  notifyProfileDirty(): void {
     if (this.isShuttingDown || this.hasShutdown) return;
 
     // If a flush is in flight, record that another arrived and let
@@ -599,6 +605,19 @@ export class ProfileTokenStorageProvider
 
   setIdentity(identity: FullIdentity): void {
     this.lifecycleManager.setIdentity(identity);
+  }
+
+  /**
+   * Item #15 Phase C.3 — public read accessor for the bound identity.
+   * Returns `null` until {@link setIdentity} has been called.
+   *
+   * Exposed for host wiring (factory's `onProfileDirtyFlush` closure)
+   * that needs the wallet's `chainPubkey` to build a lean profile
+   * snapshot. The closure must tolerate `null` (snapshot build is
+   * skipped pre-identity).
+   */
+  getIdentity(): FullIdentity | null {
+    return this.identity;
   }
 
   // ---------------------------------------------------------------------------

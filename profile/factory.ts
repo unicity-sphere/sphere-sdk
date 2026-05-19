@@ -19,6 +19,80 @@ import { OrbitDbAdapter } from './orbitdb-adapter';
 import { ProfileStorageProvider } from './profile-storage-provider';
 import { ProfileTokenStorageProvider } from './profile-token-storage-provider';
 import { DEFAULT_IPFS_GATEWAYS } from '../constants';
+import {
+  buildLeanProfileSnapshot,
+  type BuildLeanProfileSnapshotResult,
+} from './profile-lean-snapshot';
+import { pinToIpfs } from './ipfs-client';
+import { CID } from 'multiformats/cid';
+import type { ProfilePointerLayer } from './aggregator-pointer';
+
+/**
+ * Item #15 Phase C.3 — dependencies for the dirty-flush closure.
+ *
+ * Extracted so the closure body can be unit-tested in isolation. All
+ * five accessors are evaluated lazily inside `runProfileDirtyFlush`:
+ * the closure may fire BEFORE identity is bound, BEFORE the pointer
+ * layer has been built, or BEFORE network has been threaded — in any
+ * of those cases the closure must safely no-op.
+ *
+ * The injectable `pin` and `build` slots let tests stub the I/O
+ * surfaces without spinning up real IPFS / OrbitDB.
+ */
+export interface ProfileDirtyFlushDeps {
+  /** Resolves the live `chainPubkey`, or `null` pre-`setIdentity`. */
+  readonly getChainPubkey: () => string | null;
+  /** Returns the active network identifier, or `null` if unconfigured. */
+  readonly getNetwork: () => string | null;
+  /** Returns the constructed pointer layer, or `null` when unavailable. */
+  readonly getPointerLayer: () => ProfilePointerLayer | null;
+  /** Build the lean profile snapshot CAR. */
+  readonly buildSnapshot: (
+    chainPubkey: string,
+    network: string,
+  ) => Promise<BuildLeanProfileSnapshotResult>;
+  /** Pin a CAR to IPFS. Returns the CID string (ignored by the closure). */
+  readonly pin: (carBytes: Uint8Array) => Promise<string>;
+}
+
+/**
+ * Item #15 Phase C.3 — body of the `onProfileDirtyFlush` closure
+ * wired into `ProfileTokenStorageProvider`. The provider's debouncer
+ * (Phase C.2) invokes this after any writer-side mutation settles.
+ *
+ * Sequence:
+ *   1. Read `chainPubkey` and `network`. Bail if either is missing
+ *      (cold-start before `setIdentity()`, or unconfigured `network`).
+ *   2. Read the pointer layer. Bail if not yet ready — the
+ *      pointer-poll path will retry once it attaches.
+ *   3. Build a lean profile snapshot CAR via the injected builder.
+ *   4. Pin the CAR via the injected pinner (multi-gateway IPFS).
+ *   5. Publish the snapshot's root CID through the pointer layer's
+ *      `publish(cidProducer)` API.
+ *
+ * Errors propagate up into `dispatchDirtyFlush`, which catches them
+ * and surfaces them via `storage:error` with
+ * `code: 'PROFILE_DIRTY_FLUSH_FAILED'`. The closure does NOT shape
+ * retries — producer-side debounce decides cadence.
+ */
+export async function runProfileDirtyFlush(
+  deps: ProfileDirtyFlushDeps,
+): Promise<void> {
+  const chainPubkey = deps.getChainPubkey();
+  if (!chainPubkey) return;
+
+  const network = deps.getNetwork();
+  if (!network) return;
+
+  const pointer = deps.getPointerLayer();
+  if (!pointer) return;
+
+  const snapshot = await deps.buildSnapshot(chainPubkey, network);
+  await deps.pin(snapshot.carBytes);
+
+  const cidBytes = CID.parse(snapshot.rootCid).bytes;
+  await pointer.publish(async () => cidBytes);
+}
 
 /**
  * Result of creating Profile-backed providers.
@@ -83,6 +157,48 @@ export function createProfileProviders(
   // Resolve IPFS gateways for CAR pinning/fetching
   const ipfsGateways = resolvedConfig.ipfsGateways ?? [...DEFAULT_IPFS_GATEWAYS];
 
+  // Item #15 Phase C.3 — late-bound holder for the token storage so the
+  // `onProfileDirtyFlush` closure (constructed BEFORE the provider) can
+  // reach back into the running provider at fire time. `null` until the
+  // provider is constructed below; the closure no-ops while null.
+  const tokenStorageHolder: { current: ProfileTokenStorageProvider | null } = {
+    current: null,
+  };
+
+  // Item #15 Phase C.3 — dirty-flush closure. Wired into
+  // `ProfileTokenStorageProvider` via `onProfileDirtyFlush`; the
+  // provider's debounced dispatcher (Phase C.2) invokes this after
+  // any writer-side mutation (OUTBOX/SENT/finalization/recipient
+  // context/bundle index) settles. The closure body lives in
+  // `runProfileDirtyFlush` so it can be unit-tested in isolation
+  // against stub I/O surfaces. See the function-level comment for
+  // sequencing and skip semantics.
+  const onProfileDirtyFlush = (): Promise<void> =>
+    runProfileDirtyFlush({
+      getChainPubkey: () =>
+        tokenStorageHolder.current?.getIdentity()?.chainPubkey ?? null,
+      getNetwork: () => resolvedConfig.network ?? null,
+      getPointerLayer: () => storage.getPointerLayer(),
+      buildSnapshot: async (chainPubkey, network) => {
+        const tokenStorage = tokenStorageHolder.current;
+        if (!tokenStorage) {
+          // Defensive — `runProfileDirtyFlush` checks identity (which
+          // requires the holder anyway) before reaching us, so this is
+          // an unreachable branch in practice.
+          throw new Error(
+            'onProfileDirtyFlush: tokenStorage holder unexpectedly null',
+          );
+        }
+        return buildLeanProfileSnapshot({
+          storage,
+          tokenStorage,
+          chainPubkey,
+          network,
+        });
+      },
+      pin: (carBytes) => pinToIpfs(ipfsGateways, carBytes),
+    });
+
   // Create ProfileTokenStorageProvider
   // The encryption key is null at construction time — it will be derived
   // when setIdentity() is called on the storage provider.
@@ -100,6 +216,8 @@ export function createProfileProviders(
     // until it is actually needed (inside initialize() / flushToIpfs).
     getPointerLayer: () => storage.getPointerLayer(),
     getPointerBuildStatus: () => storage.getPointerBuildStatus(),
+    // Item #15 Phase C.3 — wire the lean-snapshot dirty-flush path.
+    onProfileDirtyFlush,
     debug: resolvedConfig.debug,
   };
 
@@ -113,6 +231,16 @@ export function createProfileProviders(
     tokenStorageOptions,
     cacheStorage,
   );
+  tokenStorageHolder.current = tokenStorage;
+
+  // Item #15 Phase C.3 — bridge writer-side dirty signals to the
+  // token-storage debouncer. `setProfileDirtyNotifier(cb)` propagates
+  // the callback into every per-writer instance produced by the
+  // storage's `build*` factories (OutboxWriter, SentLedgerWriter,
+  // PrefixSyncWriter, OrbitDb{Finalization,RecipientContext}Adapter,
+  // BundleIndex). Without this hop, writer mutations would never
+  // reach the debouncer — Phase C.1 only landed the producer side.
+  storage.setProfileDirtyNotifier(() => tokenStorage.notifyProfileDirty());
 
   return { storage, tokenStorage };
 }

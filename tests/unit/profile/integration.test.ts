@@ -496,5 +496,44 @@ describe('Profile Integration', () => {
       const encEnabled = (providers.storage as any).encryptionEnabled;
       expect(encEnabled).toBe(false);
     });
+
+    // -------------------------------------------------------------------------
+    // Item #15 Phase C.3 wiring assertions
+    //
+    // The factory threads `onProfileDirtyFlush` into the token-storage
+    // provider AND registers a writer-side notifier on the storage
+    // provider that delegates to `tokenStorage.notifyProfileDirty()`.
+    // These tests assert the wiring is present — the closure body's
+    // semantics are covered by tests/unit/profile/factory-dirty-flush.test.ts.
+    // -------------------------------------------------------------------------
+
+    it('wires onProfileDirtyFlush into ProfileTokenStorageProvider options', () => {
+      const cacheStorage = createMockCacheStorage();
+      const config: ProfileConfig = {
+        orbitDb: { privateKey: 'ff'.repeat(32) },
+      };
+
+      const providers = createProfileProviders(config, cacheStorage);
+
+      const opts = (providers.tokenStorage as any)._options;
+      expect(opts).toBeDefined();
+      expect(typeof opts.onProfileDirtyFlush).toBe('function');
+    });
+
+    it('registers a profile-dirty notifier on ProfileStorageProvider that routes to tokenStorage.notifyProfileDirty', () => {
+      const cacheStorage = createMockCacheStorage();
+      const config: ProfileConfig = {
+        orbitDb: { privateKey: 'ff'.repeat(32) },
+      };
+
+      const providers = createProfileProviders(config, cacheStorage);
+
+      const notifier = (providers.storage as any).profileDirtyNotifier;
+      expect(typeof notifier).toBe('function');
+
+      const spy = vi.spyOn(providers.tokenStorage, 'notifyProfileDirty');
+      notifier();
+      expect(spy).toHaveBeenCalledTimes(1);
+    });
   });
 });
