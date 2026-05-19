@@ -49,6 +49,26 @@ export interface TombstoneGcResult {
   readonly skipped: boolean;
 }
 
+/**
+ * Item #15 Phase D.1a — outcome of a lean-snapshot publish attempt.
+ *
+ * Shape mirrors `LifecycleManager.publishAggregatorPointerBestEffort`:
+ *   - `{ ok: true }` — anchored at a new pointer version.
+ *   - `{ ok: false, transient: true }` — network / aggregator timed
+ *     out; pending-publish marker stamped; safe to retry.
+ *   - `{ ok: false, transient: false, code? }` — permanent failure
+ *     (rejected, untrusted proof, trust-base stale, etc.); operator
+ *     intervention required; retrying will not help. The `code` field
+ *     carries the typed `AggregatorPointerErrorCode` when available, or
+ *     a closure-side `NOT_READY_*` sentinel when the closure bailed
+ *     before reaching the publish step.
+ */
+export interface ProfileSnapshotPublishResult {
+  readonly ok: boolean;
+  readonly transient: boolean;
+  readonly code?: string;
+}
+
 export interface OrbitDbConfig {
   /**
    * @deprecated — pass `dbNameOverride` instead. JS strings cannot be
@@ -355,7 +375,7 @@ export interface ProfileTokenStorageProviderOptions {
    * They do NOT propagate into write paths — dirty signalling is
    * best-effort by design.
    */
-  readonly onProfileDirtyFlush?: () => Promise<void>;
+  readonly onProfileDirtyFlush?: () => Promise<void | ProfileSnapshotPublishResult>;
   /**
    * Item #15 Phase C.2 — debounce window for `notifyProfileDirty`
    * signals. Defaults to `flushDebounceMs` (2000ms). Set lower for

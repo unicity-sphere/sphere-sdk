@@ -14,7 +14,11 @@
 
 import type { StorageProvider } from '../storage/storage-provider';
 import type { OracleProvider } from '../oracle';
-import type { ProfileConfig, ProfileTokenStorageProviderOptions } from './types';
+import type {
+  ProfileConfig,
+  ProfileSnapshotPublishResult,
+  ProfileTokenStorageProviderOptions,
+} from './types';
 import { OrbitDbAdapter } from './orbitdb-adapter';
 import { ProfileStorageProvider } from './profile-storage-provider';
 import { ProfileTokenStorageProvider } from './profile-token-storage-provider';
@@ -24,20 +28,36 @@ import {
   type BuildLeanProfileSnapshotResult,
 } from './profile-lean-snapshot';
 import { pinToIpfs } from './ipfs-client';
-import { CID } from 'multiformats/cid';
 import type { ProfilePointerLayer } from './aggregator-pointer';
 
+// Re-export so existing callers that imported `ProfileSnapshotPublishResult`
+// from `profile/factory` still resolve (the canonical declaration moved
+// to `profile/types.ts` to avoid a circular import via
+// `ProfileTokenStorageProviderOptions.onProfileDirtyFlush`).
+export type { ProfileSnapshotPublishResult } from './types';
+
 /**
- * Item #15 Phase C.3 — dependencies for the dirty-flush closure.
+ * Item #15 Phase C.3 (extended by D.1a) — dependencies for the
+ * dirty-flush closure.
  *
  * Extracted so the closure body can be unit-tested in isolation. All
- * five accessors are evaluated lazily inside `runProfileDirtyFlush`:
- * the closure may fire BEFORE identity is bound, BEFORE the pointer
- * layer has been built, or BEFORE network has been threaded — in any
- * of those cases the closure must safely no-op.
+ * accessors are evaluated lazily inside `runProfileDirtyFlush`: the
+ * closure may fire BEFORE identity is bound, BEFORE the pointer layer
+ * has been built, or BEFORE network has been threaded — in any of
+ * those cases the closure must safely no-op.
  *
- * The injectable `pin` and `build` slots let tests stub the I/O
- * surfaces without spinning up real IPFS / OrbitDB.
+ * The injectable `pin`, `buildSnapshot`, and `publishCid` slots let
+ * tests stub the I/O surfaces without spinning up real IPFS / OrbitDB
+ * or the LifecycleManager.
+ *
+ * **Phase D.1a delta**: `getPointerLayer` (readiness probe) is kept
+ * because it lets the closure bail BEFORE doing the build+pin work
+ * when no pointer is wired. The actual publish is delegated to
+ * `publishCid`, which the factory wires to
+ * `tokenStorage.publishLeanSnapshotCid(cid)` →
+ * `lifecycle.publishAggregatorPointerBestEffort(cid)`. This routes
+ * snapshot CID publishes through the same retry / error-classification
+ * machinery as the legacy bundle-CID publish path.
  */
 export interface ProfileDirtyFlushDeps {
   /** Resolves the live `chainPubkey`, or `null` pre-`setIdentity`. */
@@ -53,45 +73,77 @@ export interface ProfileDirtyFlushDeps {
   ) => Promise<BuildLeanProfileSnapshotResult>;
   /** Pin a CAR to IPFS. Returns the CID string (ignored by the closure). */
   readonly pin: (carBytes: Uint8Array) => Promise<string>;
+  /**
+   * Phase D.1a — publish a snapshot CID via
+   * `LifecycleManager.publishAggregatorPointerBestEffort`. The wired
+   * implementation handles retry-marker persistence, permanent-vs-
+   * transient classification, and `storage:error` emission on
+   * permanent failure. The closure throws when the publish came back
+   * with a TRANSIENT failure so the upstream debouncer surfaces the
+   * cause via `storage:error` (code `PROFILE_DIRTY_FLUSH_FAILED`).
+   */
+  readonly publishCid: (cidString: string) => Promise<ProfileSnapshotPublishResult>;
 }
 
 /**
- * Item #15 Phase C.3 — body of the `onProfileDirtyFlush` closure
- * wired into `ProfileTokenStorageProvider`. The provider's debouncer
- * (Phase C.2) invokes this after any writer-side mutation settles.
+ * Item #15 Phase C.3 (extended by D.1a) — body of the
+ * `onProfileDirtyFlush` closure wired into
+ * `ProfileTokenStorageProvider`. The provider's debouncer (Phase C.2)
+ * invokes this after any writer-side mutation settles.
  *
  * Sequence:
  *   1. Read `chainPubkey` and `network`. Bail if either is missing
  *      (cold-start before `setIdentity()`, or unconfigured `network`).
- *   2. Read the pointer layer. Bail if not yet ready — the
- *      pointer-poll path will retry once it attaches.
+ *   2. Read the pointer layer (readiness probe). Bail if not yet
+ *      ready — the pointer-poll path will retry once it attaches.
  *   3. Build a lean profile snapshot CAR via the injected builder.
  *   4. Pin the CAR via the injected pinner (multi-gateway IPFS).
- *   5. Publish the snapshot's root CID through the pointer layer's
- *      `publish(cidProducer)` API.
+ *   5. Publish the snapshot's root CID via `publishCid` (which routes
+ *      through `LifecycleManager.publishAggregatorPointerBestEffort`).
+ *      On TRANSIENT publish failure THROW so the upstream debouncer
+ *      surfaces the cause via `storage:error`. PERMANENT failures are
+ *      reported by the lifecycle layer (it emits its own
+ *      `storage:error`) and are returned as `{ ok: false, transient:
+ *      false }` — we silently swallow them here because retrying would
+ *      not help and the operator-visible alert has already fired.
  *
- * Errors propagate up into `dispatchDirtyFlush`, which catches them
- * and surfaces them via `storage:error` with
- * `code: 'PROFILE_DIRTY_FLUSH_FAILED'`. The closure does NOT shape
- * retries — producer-side debounce decides cadence.
+ * Returns `ProfileSnapshotPublishResult` so synchronous callers
+ * (Phase D.1b's flush-scheduler integration) can inspect the outcome.
+ * The auto-fire debounce path discards the result.
  */
 export async function runProfileDirtyFlush(
   deps: ProfileDirtyFlushDeps,
-): Promise<void> {
+): Promise<ProfileSnapshotPublishResult> {
   const chainPubkey = deps.getChainPubkey();
-  if (!chainPubkey) return;
+  if (!chainPubkey) {
+    return { ok: false, transient: false, code: 'NOT_READY_IDENTITY' };
+  }
 
   const network = deps.getNetwork();
-  if (!network) return;
+  if (!network) {
+    return { ok: false, transient: false, code: 'NOT_READY_NETWORK' };
+  }
 
   const pointer = deps.getPointerLayer();
-  if (!pointer) return;
+  if (!pointer) {
+    return { ok: false, transient: false, code: 'NOT_READY_POINTER' };
+  }
 
   const snapshot = await deps.buildSnapshot(chainPubkey, network);
   await deps.pin(snapshot.carBytes);
 
-  const cidBytes = CID.parse(snapshot.rootCid).bytes;
-  await pointer.publish(async () => cidBytes);
+  const result = await deps.publishCid(snapshot.rootCid);
+  if (!result.ok && result.transient) {
+    // Surface transient publish failures to the upstream debouncer so
+    // `storage:error` fires with PROFILE_DIRTY_FLUSH_FAILED. The
+    // pending-publish marker is already stamped by the lifecycle layer
+    // — subsequent flushes / pointer-polls will retry.
+    throw new Error(
+      `dirty-flush publish transient failure (cid=${snapshot.rootCid})` +
+        (result.code ? `; code=${result.code}` : ''),
+    );
+  }
+  return result;
 }
 
 /**
@@ -173,7 +225,7 @@ export function createProfileProviders(
   // `runProfileDirtyFlush` so it can be unit-tested in isolation
   // against stub I/O surfaces. See the function-level comment for
   // sequencing and skip semantics.
-  const onProfileDirtyFlush = (): Promise<void> =>
+  const onProfileDirtyFlush = (): Promise<ProfileSnapshotPublishResult> =>
     runProfileDirtyFlush({
       getChainPubkey: () =>
         tokenStorageHolder.current?.getIdentity()?.chainPubkey ?? null,
@@ -197,6 +249,25 @@ export function createProfileProviders(
         });
       },
       pin: (carBytes) => pinToIpfs(ipfsGateways, carBytes),
+      // Phase D.1a — route the snapshot CID publish through the
+      // provider's LifecycleManager so it picks up retry / error-
+      // classification / pending-publish-marker machinery. The legacy
+      // bundle-CID publish path (flush-scheduler) uses the same
+      // entrypoint via lifecycle.publishAggregatorPointerBestEffort,
+      // so both publishes share the same retry semantics. (Phase D.1b
+      // will collapse the two paths so only the snapshot publish
+      // runs — see Item #15 Phase E.)
+      publishCid: async (cidString) => {
+        const tokenStorage = tokenStorageHolder.current;
+        if (!tokenStorage) {
+          // Unreachable — runProfileDirtyFlush has already checked the
+          // pointer layer (which requires the holder) before calling
+          // publishCid. Defensive return: classified as permanent
+          // because retrying without a holder cannot succeed.
+          return { ok: false, transient: false, code: 'NOT_READY_HOLDER' };
+        }
+        return tokenStorage.publishLeanSnapshotCid(cidString);
+      },
     });
 
   // Create ProfileTokenStorageProvider

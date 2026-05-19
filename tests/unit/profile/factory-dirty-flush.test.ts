@@ -1,24 +1,28 @@
 /**
- * Tests for Item #15 Phase C.3 — the dirty-flush closure that
- * `profile/factory.ts` wires into `ProfileTokenStorageProvider` via
- * the `onProfileDirtyFlush` option.
+ * Tests for Item #15 Phase C.3 (extended by D.1a) — the dirty-flush
+ * closure that `profile/factory.ts` wires into
+ * `ProfileTokenStorageProvider` via the `onProfileDirtyFlush` option.
  *
  * The closure body is exposed as `runProfileDirtyFlush(deps)` for
- * isolated testing. Production wiring constructs `deps` from the
- * live providers; here we stub every I/O surface so the test
- * focuses on the closure's bail / sequence / propagation semantics:
+ * isolated testing. Production wiring constructs `deps` from the live
+ * providers; here we stub every I/O surface so the test focuses on
+ * the closure's bail / sequence / propagation semantics:
  *
  *   1. Bails (no I/O) when no chainPubkey is bound.
  *   2. Bails when network is null/undefined.
  *   3. Bails when the pointer layer is not yet ready.
- *   4. On the happy path: builds → pins → publishes, in order, once.
+ *   4. On the happy path: builds → pins → publishCid, in order, once.
  *   5. Publishes the snapshot's rootCid (NOT the bundle CID).
  *   6. Build failure → propagates (caller surfaces via storage:error).
  *   7. Pin failure → propagates.
- *   8. Publish failure → propagates.
+ *   8. publishCid throw → propagates.
+ *   9. publishCid transient → throws so the dispatcher emits the
+ *      `storage:error` event.
+ *  10. publishCid permanent (ok:false, transient:false) → swallows
+ *      (the lifecycle layer already emitted its own storage:error).
  *
  * @see profile/factory.ts — runProfileDirtyFlush + createProfileProviders
- * @see docs/uxf/OUTBOX-SEND-FOLLOWUPS.md — Item #15 Phase C.3
+ * @see docs/uxf/OUTBOX-SEND-FOLLOWUPS.md — Item #15 Phase C.3 / D.1a
  */
 
 import { describe, expect, it, vi } from 'vitest';
@@ -26,6 +30,7 @@ import {
   runProfileDirtyFlush,
   type ProfileDirtyFlushDeps,
 } from '../../../profile/factory.js';
+import type { ProfileSnapshotPublishResult } from '../../../profile/types.js';
 import type { BuildLeanProfileSnapshotResult } from '../../../profile/profile-lean-snapshot.js';
 import type { ProfilePointerLayer } from '../../../profile/aggregator-pointer/index.js';
 
@@ -48,11 +53,12 @@ function buildResult(
   };
 }
 
-function makePointer(
-  publish = vi.fn(async () => ({}) as unknown as ReturnType<ProfilePointerLayer['publish']>),
-): { pointer: ProfilePointerLayer; publish: typeof publish } {
-  const pointer = { publish } as unknown as ProfilePointerLayer;
-  return { pointer, publish };
+function makePointer(): { pointer: ProfilePointerLayer } {
+  // Phase D.1a — `runProfileDirtyFlush` no longer calls
+  // `pointer.publish` directly; the pointer reference is used only as
+  // a readiness probe. A bare object stub is enough.
+  const pointer = {} as unknown as ProfilePointerLayer;
+  return { pointer };
 }
 
 function makeDeps(
@@ -64,6 +70,7 @@ function makeDeps(
     getPointerLayer: () => makePointer().pointer,
     buildSnapshot: vi.fn(async () => buildResult()),
     pin: vi.fn(async () => FAKE_CID),
+    publishCid: vi.fn(async () => ({ ok: true, transient: false })),
     ...overrides,
   };
 }
@@ -76,65 +83,89 @@ describe('runProfileDirtyFlush — bail paths', () => {
   it('bails silently when chainPubkey is null', async () => {
     const build = vi.fn();
     const pin = vi.fn();
-    const publish = vi.fn();
-    const pointer = { publish } as unknown as ProfilePointerLayer;
-    await runProfileDirtyFlush(
+    const publishCid = vi.fn(async () => ({ ok: true, transient: false }));
+    const result = await runProfileDirtyFlush(
       makeDeps({
         getChainPubkey: () => null,
         buildSnapshot: build,
         pin,
-        getPointerLayer: () => pointer,
+        publishCid,
       }),
     );
     expect(build).not.toHaveBeenCalled();
     expect(pin).not.toHaveBeenCalled();
-    expect(publish).not.toHaveBeenCalled();
+    expect(publishCid).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      ok: false,
+      transient: false,
+      code: 'NOT_READY_IDENTITY',
+    });
   });
 
   it('bails silently when network is null', async () => {
     const build = vi.fn();
     const pin = vi.fn();
-    const publish = vi.fn();
-    const pointer = { publish } as unknown as ProfilePointerLayer;
-    await runProfileDirtyFlush(
+    const publishCid = vi.fn(async () => ({ ok: true, transient: false }));
+    const result = await runProfileDirtyFlush(
       makeDeps({
         getNetwork: () => null,
         buildSnapshot: build,
         pin,
-        getPointerLayer: () => pointer,
+        publishCid,
       }),
     );
     expect(build).not.toHaveBeenCalled();
     expect(pin).not.toHaveBeenCalled();
-    expect(publish).not.toHaveBeenCalled();
+    expect(publishCid).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      ok: false,
+      transient: false,
+      code: 'NOT_READY_NETWORK',
+    });
   });
 
   it('bails silently when the pointer layer is not ready', async () => {
     const build = vi.fn();
     const pin = vi.fn();
-    await runProfileDirtyFlush(
+    const publishCid = vi.fn(async () => ({ ok: true, transient: false }));
+    const result = await runProfileDirtyFlush(
       makeDeps({
         getPointerLayer: () => null,
         buildSnapshot: build,
         pin,
+        publishCid,
       }),
     );
     expect(build).not.toHaveBeenCalled();
     expect(pin).not.toHaveBeenCalled();
+    expect(publishCid).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      ok: false,
+      transient: false,
+      code: 'NOT_READY_POINTER',
+    });
   });
 
   it('bails silently when chainPubkey is empty string', async () => {
     const build = vi.fn();
     const pin = vi.fn();
-    await runProfileDirtyFlush(
+    const publishCid = vi.fn(async () => ({ ok: true, transient: false }));
+    const result = await runProfileDirtyFlush(
       makeDeps({
         getChainPubkey: () => '',
         buildSnapshot: build,
         pin,
+        publishCid,
       }),
     );
     expect(build).not.toHaveBeenCalled();
     expect(pin).not.toHaveBeenCalled();
+    expect(publishCid).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      ok: false,
+      transient: false,
+      code: 'NOT_READY_IDENTITY',
+    });
   });
 });
 
@@ -143,7 +174,7 @@ describe('runProfileDirtyFlush — bail paths', () => {
 // ---------------------------------------------------------------------------
 
 describe('runProfileDirtyFlush — happy path', () => {
-  it('builds → pins → publishes in order, exactly once', async () => {
+  it('builds → pins → publishCid in order, exactly once', async () => {
     const order: string[] = [];
     const carBytes = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
     const buildSnapshot = vi.fn(async (chainPubkey, network) => {
@@ -157,51 +188,39 @@ describe('runProfileDirtyFlush — happy path', () => {
       order.push('pin');
       return FAKE_CID;
     });
-    const { pointer, publish } = makePointer(
-      vi.fn(async (producer) => {
-        const cidBytes = await producer();
-        // Confirm what we publish IS the snapshot's rootCid.
-        expect(cidBytes).toBeInstanceOf(Uint8Array);
-        order.push('publish');
-        return {} as unknown as ReturnType<ProfilePointerLayer['publish']>;
-      }) as ProfilePointerLayer['publish'],
-    );
+    const publishCid = vi.fn(async (cidString: string) => {
+      // Confirm we publish the snapshot rootCid (not a bundle CID).
+      expect(cidString).toBe(FAKE_CID);
+      order.push('publish');
+      return { ok: true, transient: false };
+    });
 
-    await runProfileDirtyFlush(
-      makeDeps({
-        getPointerLayer: () => pointer,
-        buildSnapshot,
-        pin,
-      }),
+    const result = await runProfileDirtyFlush(
+      makeDeps({ buildSnapshot, pin, publishCid }),
     );
 
     expect(order).toEqual(['build', 'pin', 'publish']);
     expect(buildSnapshot).toHaveBeenCalledTimes(1);
     expect(pin).toHaveBeenCalledTimes(1);
-    expect(publish).toHaveBeenCalledTimes(1);
+    expect(publishCid).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ ok: true, transient: false });
   });
 
   it('publishes the snapshot rootCid (not arbitrary bytes)', async () => {
-    // Use a known CID and inspect what the publish producer hands back.
-    const { CID } = await import('multiformats/cid');
-    const expectedBytes = CID.parse(FAKE_CID).bytes;
-    let observedBytes: Uint8Array | null = null;
-    const { pointer } = makePointer(
-      vi.fn(async (producer) => {
-        observedBytes = await producer();
-        return {} as unknown as ReturnType<ProfilePointerLayer['publish']>;
-      }) as ProfilePointerLayer['publish'],
-    );
+    let observedCid: string | null = null;
+    const publishCid = vi.fn(async (cidString: string) => {
+      observedCid = cidString;
+      return { ok: true, transient: false };
+    });
 
     await runProfileDirtyFlush(
       makeDeps({
-        getPointerLayer: () => pointer,
         buildSnapshot: async () => buildResult(FAKE_CID),
+        publishCid,
       }),
     );
 
-    expect(observedBytes).not.toBeNull();
-    expect(Buffer.from(observedBytes!).equals(Buffer.from(expectedBytes))).toBe(true);
+    expect(observedCid).toBe(FAKE_CID);
   });
 });
 
@@ -215,40 +234,57 @@ describe('runProfileDirtyFlush — error propagation', () => {
       throw new Error('build failed');
     });
     const pin = vi.fn();
-    const publish = vi.fn();
-    const pointer = { publish } as unknown as ProfilePointerLayer;
+    const publishCid = vi.fn();
     await expect(
-      runProfileDirtyFlush(
-        makeDeps({ buildSnapshot, pin, getPointerLayer: () => pointer }),
-      ),
+      runProfileDirtyFlush(makeDeps({ buildSnapshot, pin, publishCid })),
     ).rejects.toThrow('build failed');
     expect(pin).not.toHaveBeenCalled();
-    expect(publish).not.toHaveBeenCalled();
+    expect(publishCid).not.toHaveBeenCalled();
   });
 
   it('propagates pin errors up to the caller', async () => {
     const pin = vi.fn(async () => {
       throw new Error('pin failed');
     });
-    const publish = vi.fn();
-    const pointer = { publish } as unknown as ProfilePointerLayer;
+    const publishCid = vi.fn();
     await expect(
-      runProfileDirtyFlush(
-        makeDeps({ pin, getPointerLayer: () => pointer }),
-      ),
+      runProfileDirtyFlush(makeDeps({ pin, publishCid })),
     ).rejects.toThrow('pin failed');
-    expect(publish).not.toHaveBeenCalled();
+    expect(publishCid).not.toHaveBeenCalled();
   });
 
-  it('propagates publish errors up to the caller', async () => {
-    const { pointer } = makePointer(
-      vi.fn(async () => {
-        throw new Error('publish failed');
-      }) as ProfilePointerLayer['publish'],
-    );
+  it('propagates publishCid throw up to the caller', async () => {
+    const publishCid = vi.fn(async () => {
+      throw new Error('publish failed');
+    }) as unknown as () => Promise<ProfileSnapshotPublishResult>;
     await expect(
-      runProfileDirtyFlush(makeDeps({ getPointerLayer: () => pointer })),
+      runProfileDirtyFlush(makeDeps({ publishCid })),
     ).rejects.toThrow('publish failed');
+  });
+
+  it('throws on transient publishCid failure so the dispatcher surfaces it', async () => {
+    const publishCid = vi.fn(async () => ({
+      ok: false,
+      transient: true,
+      code: 'NETWORK_ERROR',
+    }));
+    await expect(
+      runProfileDirtyFlush(makeDeps({ publishCid })),
+    ).rejects.toThrow(/transient failure.*NETWORK_ERROR/);
+  });
+
+  it('returns permanent publishCid failure without throwing (lifecycle already alerted)', async () => {
+    const publishCid = vi.fn(async () => ({
+      ok: false,
+      transient: false,
+      code: 'AGGREGATOR_POINTER_REJECTED',
+    }));
+    const result = await runProfileDirtyFlush(makeDeps({ publishCid }));
+    expect(result).toEqual({
+      ok: false,
+      transient: false,
+      code: 'AGGREGATOR_POINTER_REJECTED',
+    });
   });
 });
 
@@ -263,30 +299,33 @@ describe('runProfileDirtyFlush — fresh evaluation', () => {
     let pointer: ProfilePointerLayer | null = null;
     const buildSnapshot = vi.fn(async () => buildResult());
     const pin = vi.fn(async () => FAKE_CID);
+    const publishCid = vi.fn(async () => ({ ok: true, transient: false }));
     const deps: ProfileDirtyFlushDeps = {
       getChainPubkey: () => chainPubkey,
       getNetwork: () => network,
       getPointerLayer: () => pointer,
       buildSnapshot,
       pin,
+      publishCid,
     };
 
     // Call 1 — no identity bound; bail.
     await runProfileDirtyFlush(deps);
     expect(buildSnapshot).not.toHaveBeenCalled();
+    expect(publishCid).not.toHaveBeenCalled();
 
     // Call 2 — identity bound, but no pointer; still bail.
     chainPubkey = '02' + 'aa'.repeat(32);
     network = 'testnet';
     await runProfileDirtyFlush(deps);
     expect(buildSnapshot).not.toHaveBeenCalled();
+    expect(publishCid).not.toHaveBeenCalled();
 
     // Call 3 — everything wired; fire.
-    const publish = vi.fn(async () => ({}) as unknown as ReturnType<ProfilePointerLayer['publish']>);
-    pointer = { publish } as unknown as ProfilePointerLayer;
+    pointer = {} as unknown as ProfilePointerLayer;
     await runProfileDirtyFlush(deps);
     expect(buildSnapshot).toHaveBeenCalledTimes(1);
     expect(pin).toHaveBeenCalledTimes(1);
-    expect(publish).toHaveBeenCalledTimes(1);
+    expect(publishCid).toHaveBeenCalledTimes(1);
   });
 });

@@ -65,6 +65,7 @@ import type {
   StorageProvider,
 } from '../storage/storage-provider.js';
 import {
+  type ProfileSnapshotPublishResult,
   type ProfileTokenStorageProviderOptions,
 } from './types.js';
 import type { ProfileDatabase } from './orbitdb-adapter.js';
@@ -618,6 +619,29 @@ export class ProfileTokenStorageProvider
    */
   getIdentity(): FullIdentity | null {
     return this.identity;
+  }
+
+  /**
+   * Item #15 Phase D.1a — public delegate for publishing a lean
+   * snapshot CID via the aggregator pointer layer. Routes through
+   * `LifecycleManager.publishAggregatorPointerBestEffort` so the
+   * publish picks up:
+   *   - pending-publish-marker persistence on transient failure;
+   *   - permanent-vs-transient error classification;
+   *   - `storage:error` emission on permanent failure;
+   *   - automatic retry on the next `flushToIpfs` / pointer-poll cycle.
+   *
+   * Exposed for the factory's `onProfileDirtyFlush` closure (Phase D.1a)
+   * and the flush-scheduler's snapshot-publish call site (Phase D.1b).
+   * Direct callers should treat the result as authoritative — the
+   * publish has either landed, deferred for retry, or surfaced an
+   * operator alert. The `ProfileSnapshotPublishResult` shape matches
+   * the underlying lifecycle method 1:1.
+   */
+  publishLeanSnapshotCid(
+    cidString: string,
+  ): Promise<ProfileSnapshotPublishResult> {
+    return this.lifecycleManager.publishAggregatorPointerBestEffort(cidString);
   }
 
   // ---------------------------------------------------------------------------
