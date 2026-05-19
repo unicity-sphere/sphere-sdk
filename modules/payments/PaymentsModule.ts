@@ -140,6 +140,18 @@ import {
   type NostrPersistenceVerifierDeps,
   type VerifyOutcome,
 } from './transfer/nostr-persistence-verifier';
+// Issue #174 — per-token spent-state rescan worker
+// (UXF-TRANSFER-PROTOCOL §12.3.2). Auto-installed in `initialize()` when
+// `features.spentStateRescan` is true (default-OFF). Proactively probes
+// each `'confirmed'` token's current destination state hash against
+// `oracle.isSpent` to detect off-record spends (typically a sibling
+// device on the same keys). Companion to the reactive
+// `'transfer:double-spend-detected'` surface (Item #14 Phase 1).
+import {
+  SpentStateRescanWorker,
+  type SpentStateRescanWorkerDeps,
+  type TransitionToAuditFn,
+} from './transfer/spent-state-rescan-worker';
 // OUTBOX-SEND-FOLLOWUPS item #4 — tombstone GC worker. Auto-installed in
 // `initialize()` when `features.tombstoneGcWorker` is true. Periodically
 // replaces expired tombstones (older than the configured retention
@@ -1107,6 +1119,34 @@ export interface UxfTransferFeatures {
    */
   readonly orphanAutoRecovery?: boolean;
   /**
+   * Issue #174 — per-token spent-state rescan worker
+   * (UXF-TRANSFER-PROTOCOL §12.3.2). Default `false` (opt-in during
+   * soak).
+   *
+   * When `true`, auto-installs a {@link SpentStateRescanWorker} that
+   * periodically asks `oracle.isSpent(currentDestinationStateHash)`
+   * for each token in the active pool (`status === 'confirmed'`).
+   * Detects off-record spends — e.g. a sibling device with the same
+   * keys spent the token without our local snapshot having caught up
+   * yet. Emits `transfer:off-record-spent` with a
+   * `suspectedSiblingInstance` heuristic flag and routes the token
+   * through the disposition writer (`reason: 'off-record-spend'`,
+   * §5.3 [E]) so the local view converges with the aggregator.
+   *
+   * Default-OFF: adds steady aggregator query load proportional to
+   * active-pool size. Flip ON only after a 7-day testnet soak
+   * confirms no false-positive transitions surface from transient
+   * aggregator availability. The worker's per-token throw-back-off
+   * (default 3 consecutive throws → 30 min cooldown) protects
+   * against runaway probing on stuck tokens.
+   *
+   * Companion to the reactive `transfer:double-spend-detected`
+   * surface (Item #14 Phase 1) and the profile-pointer rescan
+   * (§12.3.1 / Item #15). See `docs/uxf/RUNBOOK-SEND-PIPELINE.md`
+   * for operator response.
+   */
+  readonly spentStateRescan?: boolean;
+  /**
    * Phase 9.6.D — when `true` (default when `senderUxf` is on),
    * auto-install and start a {@link FinalizationWorkerSender} in
    * {@link PaymentsModule.initialize} so instant-mode sends drive the
@@ -1580,6 +1620,13 @@ export class PaymentsModule {
       // the safe-restore-to-`confirmed` strategy assumes the spending
       // commit never reached the aggregator. Flip ON after soak.
       orphanAutoRecovery: config?.features?.orphanAutoRecovery ?? false,
+      // Issue #174 — per-token spent-state rescan worker
+      // (UXF-TRANSFER-PROTOCOL §12.3.2). Default-OFF (opt-in during
+      // soak): probes oracle.isSpent for each `'confirmed'` token
+      // every ~5 min per token; flip ON after testnet soak confirms
+      // no false-positive transitions from transient aggregator
+      // availability surface.
+      spentStateRescan: config?.features?.spentStateRescan ?? false,
       // Phase 9.6.D — sender-side §6.1 finalization worker. Default-ON
       // when senderUxf is on: drives instant-mode sends through the full
       // submit/poll cycle so `transfer:confirmed` fires once the
@@ -2057,6 +2104,59 @@ export class PaymentsModule {
       this.nostrPersistenceVerifier !== null
     ) {
       this.nostrPersistenceVerifier.start();
+    }
+
+    // Issue #174 — auto-install the per-token spent-state rescan worker
+    // (UXF-TRANSFER-PROTOCOL §12.3.2). Default-OFF; when ON the worker
+    // probes oracle.isSpent for each `'confirmed'` token to detect
+    // off-record spends from sibling instances of the same wallet.
+    // `transitionToAudit` routes detection through the disposition
+    // writer when one is wired; otherwise the worker stays in
+    // detect-only mode (event-only). The `oracleProvider` closure
+    // reads `this.deps?.oracle` lazily so a future `deps` re-init
+    // (e.g. oracle swap on reconnect) is observed; same closure
+    // pattern as `sentProvider` / `outboxProvider` for consistency.
+    if (
+      this.features.spentStateRescan &&
+      this.spentStateRescanWorker === null
+    ) {
+      const sphereEmit = this.deps!.emitEvent;
+      const rescanDeps: SpentStateRescanWorkerDeps = {
+        tokensProvider: (): Iterable<Token> => this.tokens.values(),
+        oracleProvider: (): {
+          readonly isSpent: (stateHash: string) => Promise<boolean>;
+        } | null => {
+          const oracle = this.deps?.oracle;
+          return oracle !== undefined && typeof oracle.isSpent === 'function'
+            ? oracle
+            : null;
+        },
+        extractCurrentStateHash: (token: Token): string =>
+          extractStateHashFromSdkData(token.sdkData),
+        sentProvider: (): Pick<SentLedgerWriter, 'contains'> | null =>
+          this._sentLedgerWriter,
+        outboxProvider: (): Pick<OutboxWriter, 'readAll'> | null =>
+          this._outboxWriter,
+        transitionToAudit:
+          this._spentStateRescanTransitionToAudit ?? undefined,
+        emit: sphereEmit,
+        logger: {
+          warn: (message: string, context?: Record<string, unknown>): void => {
+            logger.warn('Payments', `${message}`, context);
+          },
+        },
+      };
+      this.spentStateRescanWorker = new SpentStateRescanWorker(rescanDeps);
+      this.spentStateRescanWorker.start();
+      logger.debug(
+        'Payments',
+        'Default SpentStateRescanWorker auto-installed (spentStateRescan opt-in flag ON)',
+      );
+    } else if (
+      this.features.spentStateRescan &&
+      this.spentStateRescanWorker !== null
+    ) {
+      this.spentStateRescanWorker.start();
     }
 
     // OUTBOX-SEND-FOLLOWUPS item #4 — auto-install the tombstone GC
@@ -3791,6 +3891,17 @@ export class PaymentsModule {
   private sentReconciliationWorker: SentReconciliationWorker | null = null;
   /** @internal — auto-installed or set by `installNostrPersistenceVerifier()`. Issue #166 P2 #3. */
   private nostrPersistenceVerifier: NostrPersistenceVerifier | null = null;
+  /** @internal — auto-installed or set by `installSpentStateRescanWorker()`. Issue #174. */
+  private spentStateRescanWorker: SpentStateRescanWorker | null = null;
+  /**
+   * @internal — optional override for the spent-state rescan worker's
+   * `transitionToAudit` closure. The bootstrap layer (Sphere) installs
+   * a production wiring (disposition writer route) via
+   * {@link setSpentStateRescanTransitionToAudit}; tests may override.
+   * When unset, the auto-installed worker stays in detect-only mode
+   * (event emission only). Issue #174.
+   */
+  private _spentStateRescanTransitionToAudit: TransitionToAuditFn | null = null;
   /** @internal — auto-installed when `features.tombstoneGcWorker` is on.
    *  OUTBOX-SEND-FOLLOWUPS item #4. */
   private tombstoneGcWorker: TombstoneGcWorker | null = null;
@@ -4245,6 +4356,46 @@ export class PaymentsModule {
   }
 
   /**
+   * Issue #174 — install the per-token spent-state rescan worker.
+   * Idempotent: a second call stops the previous worker (await its
+   * in-flight scan) and swaps in the new instance. If
+   * `features.spentStateRescan` is `true`, the next `initialize()`
+   * call starts the new worker; if the module is already initialized,
+   * the worker is started immediately.
+   *
+   * **No-op when `features.spentStateRescan === false`** — installing
+   * is cheap (no scan loop runs until `start()`); the gate is the flag.
+   */
+  installSpentStateRescanWorker(worker: SpentStateRescanWorker): void {
+    if (this.spentStateRescanWorker !== null) {
+      void this.spentStateRescanWorker.stop().catch(() => undefined);
+    }
+    this.spentStateRescanWorker = worker;
+    if (this.deps !== null && this.features.spentStateRescan) {
+      worker.start();
+    }
+  }
+
+  /**
+   * Issue #174 — set the closure invoked when the spent-state rescan
+   * worker detects an off-record spend. The bootstrap layer (Sphere)
+   * wires this to a route that calls `dispositionWriter.write()` with
+   * a synthesized AUDIT record (`reason: 'off-record-spend'`). When
+   * unset, the auto-installed worker stays in detect-only mode
+   * (event emission only — no `_audit` transition).
+   *
+   * The closure takes effect on the NEXT `initialize()` call when the
+   * worker is auto-constructed. To replace the route on a running
+   * worker, install a fresh worker via
+   * {@link installSpentStateRescanWorker}.
+   */
+  setSpentStateRescanTransitionToAudit(
+    transition: TransitionToAuditFn | null,
+  ): void {
+    this._spentStateRescanTransitionToAudit = transition;
+  }
+
+  /**
    * Phase 9.6.D — install the sender-side finalization worker.
    *
    * Idempotent: a second call stops the previous worker (fire-and-
@@ -4512,6 +4663,14 @@ export class PaymentsModule {
     if (this.nostrPersistenceVerifier) {
       void this.nostrPersistenceVerifier.stop().catch(() => undefined);
       this.nostrPersistenceVerifier = null;
+    }
+
+    // Issue #174 — stop the per-token spent-state rescan worker.
+    // Same fire-and-forget contract: the worker's `stop()` drains the
+    // in-flight scan and never throws on graceful shutdown.
+    if (this.spentStateRescanWorker) {
+      void this.spentStateRescanWorker.stop().catch(() => undefined);
+      this.spentStateRescanWorker = null;
     }
 
     // OUTBOX-SEND-FOLLOWUPS item #4 — stop the tombstone GC worker.

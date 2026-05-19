@@ -715,6 +715,26 @@ Migration consideration: existing wallets that have published only UXF-bundle po
 
 ---
 
+### 16. Per-token spent-state rescan (Issue #174 — UXF-TRANSFER-PROTOCOL §12.3.2) — **SHIPPED**
+
+**Status**: SHIPPED. Worker landed via this PR on the `feat/spent-state-rescan-worker` branch. Feature flag `features.spentStateRescan` ships **default-OFF** during soak; flip to default-ON after a 7-day testnet observation confirms no false-positive `_audit` transitions surface from transient aggregator availability.
+
+**What landed**:
+- `modules/payments/transfer/spent-state-rescan-worker.ts` — proactive low-rate sweeper. Structural twin of `nostr-persistence-verifier.ts`. Periodically iterates the active pool (`status === 'confirmed'`), filters out non-eligible candidates (no `sdkData`, OUTBOX-active, per-token interval not yet elapsed, per-token throw-back-off active), calls `oracle.isSpent(currentDestinationStateHash)` with `MAX_CONCURRENT_SPENT_RESCANS = 4` capping concurrent probes. On `isSpent === true`: computes `suspectedSiblingInstance` heuristic by checking the local OUTBOX + SENT ledgers for any record of this `tokenId`, emits `transfer:off-record-spent`, and invokes the injected `transitionToAudit` closure (the disposition-writer route is wired by the bootstrap layer; the worker itself never touches storage directly).
+- `types/index.ts` — new `transfer:off-record-spent` event in `SphereEventType` + `SphereEventMap`. Payload: `{ tokenId, detectedAt, suspectedSiblingInstance, coinId, amount }`.
+- `modules/payments/PaymentsModule.ts` — `features.spentStateRescan` flag (default-OFF), auto-install + start in `initialize()` mirroring the `nostrPersistenceVerifier` block, `installSpentStateRescanWorker()` install method, `setSpentStateRescanTransitionToAudit()` bootstrap setter, fire-and-forget `stop()` in `destroy()`.
+- `docs/uxf/RUNBOOK-SEND-PIPELINE.md` — new "transfer:off-record-spent" operator section + config-reference entry.
+- Tests: 17 unit tests in `tests/unit/payments/transfer/spent-state-rescan-worker.test.ts` covering eligibility filter, outcome routing (`true` / `false` / throw), `suspectedSiblingInstance` heuristic branches, concurrency cap, throw-back-off + counter reset, emit failure isolation, transitionToAudit failure isolation, lifecycle (start/stop idempotent, graceful drain). Integration test in `tests/integration/payments/spent-state-rescan.test.ts` covers the canonical sibling-spend vs local-spend scenarios.
+
+**Relationship to other items**:
+- **Companion to Item #14 Phase 1 (reactive)**: Phase 1 (`9b4fae7` / PR #173) added the typed `STATE_ALREADY_SPENT_BY_OTHER` throw + `transfer:double-spend-detected` event that fires at next `send()` attempt — the REACTIVE surface. This item adds the PROACTIVE surface so the UI doesn't keep showing the token as spendable until the user tries to spend it.
+- **Companion to Item #15 (profile-pointer rescan)**: Item #15 catches the spend IF the spending device publishes a snapshot to the aggregator and our local pointer-poll picks it up. This worker catches it independently of whether the spender's snapshot has propagated.
+- **Distinct from orphan-spending sweeper** (Item #166 P2 #1): that sweeper inspects tokens stuck `'transferring'` with no matching OUTBOX/SENT entry. This worker inspects tokens at `'confirmed'` AND in the active manifest. The two sets are disjoint by the eligibility filter (`'transferring'` tokens are explicitly excluded).
+
+**Soak-gate follow-up**: flip `features.spentStateRescan` to default-ON after the 7-day testnet observation. The flip is a one-line change in `PaymentsModule.ts` (`config?.features?.spentStateRescan ?? true`) plus a status update on this item.
+
+---
+
 ## Cross-cutting concerns
 
 ### Pointer-layer vs OrbitDB-log layering (architectural clarification — superseded by Item #15)
