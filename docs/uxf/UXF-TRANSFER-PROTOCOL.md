@@ -1714,7 +1714,7 @@ The implementation MUST include:
 > **Status update (2026-05-19)**: the original §12.3 framed BOTH rescans as deferred at the time T.1–T.8 were planned. Both have since landed:
 >
 >   - **§12.3.1 (profile-pointer rescan) is SHIPPED** — landed as the core of the **aggregator-pointer wave** (`PROFILE-AGGREGATOR-POINTER-IMPL-PLAN.md` Phases A–E, 75 tasks) and consolidated by **Item #15** (Full Profile State Snapshot Sync; merged via PR #173). Implementation in `profile/profile-token-storage/lifecycle-manager.ts` (`schedulePointerPoll` / `runPointerPollOnce`).
->   - **§12.3.2 (per-token spent-state rescan) is SHIPPED** — landed via **Issue #174** / branch `feat/spent-state-rescan-worker`. Implementation in `modules/payments/transfer/spent-state-rescan-worker.ts`; wired into `PaymentsModule` behind the `features.spentStateRescan` flag (default-OFF during soak; flip to default-ON after a 7-day testnet observation confirms no false-positive `_audit` transitions surface from transient aggregator availability).
+>   - **§12.3.2 (per-token spent-state rescan) is SHIPPED** — landed via **Issue #174** / PR #176 (`feat/spent-state-rescan-worker`), with the default closure in PR #177 and the soak-gate flip in PR #178. Implementation in `modules/payments/transfer/spent-state-rescan-worker.ts`; wired into `PaymentsModule` behind the `features.spentStateRescan` flag (default-ON; explicit `false` opt-out preserves the reactive-only surface).
 >
 > The "two rescans deferred as a unit" language in `UXF-TRANSFER-IMPL-PLAN.md`'s "Out-of-scope for T.1–T.8 (deferred)" section is similarly stale (kept for historical accuracy of what shipped in T.1–T.8 specifically; both rescans landed outside the T.1–T.8 wave bucket).
 
@@ -1744,7 +1744,7 @@ This rescan is the primary mechanism by which the audit-collection promotion sca
 - On `isSpent === true`: transition the token from active pool to `_audit` with `reason='off-record-spend'` (UNSPENDABLE_BY_US disposition per §5.3 [E]). Emit `transfer:off-record-spent` event with `{ tokenId, detectedAt, suspectedSiblingInstance, coinId, amount }` — `suspectedSiblingInstance` is `true` when neither the local OUTBOX nor the local SENT ledger holds any record referencing this `tokenId`, indicating the spender is most likely another instance with the same keys.
 - On transient errors (aggregator unavailable / `oracle.isSpent` throw): bump a per-token throw counter. After `consecutiveThrowBackoffThreshold` (default 3) consecutive throws on the SAME token, apply a per-token back-off (`throwBackoffMs`, default 30 min) so a stuck token cannot hammer the aggregator. A successful probe (true OR false) clears the counter.
 - Cache: §8 already references the Wave L LRU cache for `isSpent`. The rescan respects the cache TTL — the per-token interval (5 min) is intentionally aligned with the LRU TTL so the worker piggybacks on the cache instead of bypassing it.
-- Feature flag: `features.spentStateRescan` (default-OFF during soak; flip to default-ON after 7-day testnet observation).
+- Feature flag: `features.spentStateRescan` (default-ON after soak; explicit `false` opt-out for cost-sensitive deployments that accept the reactive `transfer:double-spend-detected` surface alone).
 
 **Relationship to other surfaces**:
 - **Complementary to §12.3.1**: the profile-pointer rescan catches the spend IF the spending device publishes a snapshot to the aggregator before our local poll fires. §12.3.2 catches it independently of whether the spender device's snapshot has propagated.
