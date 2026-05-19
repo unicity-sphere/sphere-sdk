@@ -2112,22 +2112,25 @@ export class PaymentsModule {
     // off-record spends from sibling instances of the same wallet.
     // `transitionToAudit` routes detection through the disposition
     // writer when one is wired; otherwise the worker stays in
-    // detect-only mode (event-only). The wiring deliberately reads
-    // `oracle` lazily through the closure — a swap during initialize
-    // would otherwise be missed.
+    // detect-only mode (event-only). The `oracleProvider` closure
+    // reads `this.deps?.oracle` lazily so a future `deps` re-init
+    // (e.g. oracle swap on reconnect) is observed; same closure
+    // pattern as `sentProvider` / `outboxProvider` for consistency.
     if (
       this.features.spentStateRescan &&
       this.spentStateRescanWorker === null
     ) {
-      const oracle = this.deps!.oracle;
       const sphereEmit = this.deps!.emitEvent;
       const rescanDeps: SpentStateRescanWorkerDeps = {
         tokensProvider: (): Iterable<Token> => this.tokens.values(),
         oracleProvider: (): {
           readonly isSpent: (stateHash: string) => Promise<boolean>;
-        } | null => (oracle !== undefined && typeof oracle.isSpent === 'function'
-          ? oracle
-          : null),
+        } | null => {
+          const oracle = this.deps?.oracle;
+          return oracle !== undefined && typeof oracle.isSpent === 'function'
+            ? oracle
+            : null;
+        },
         extractCurrentStateHash: (token: Token): string =>
           extractStateHashFromSdkData(token.sdkData),
         sentProvider: (): Pick<SentLedgerWriter, 'contains'> | null =>
