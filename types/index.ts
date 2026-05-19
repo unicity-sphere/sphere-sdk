@@ -580,6 +580,7 @@ export type SphereEventType =
   | 'transfer:retention-republish-rearmed'
   | 'transfer:retention-republish-skipped'
   | 'transfer:double-spend-detected'
+  | 'transfer:off-record-spent'
   | 'payment_request:incoming'
   | 'payment_request:accepted'
   | 'payment_request:rejected'
@@ -1310,6 +1311,50 @@ export interface SphereEventMap {
     readonly sourceStateHash: string;
     readonly ourIntendedRecipient: string;
     readonly detectedAt: number;
+  };
+  /**
+   * Issue #174 — Per-token spent-state rescan worker
+   * ({@link SpentStateRescanWorker}; UXF-TRANSFER-PROTOCOL §12.3.2)
+   * detected that a token sitting in the active pool at
+   * `status === 'confirmed'` has its current destination state recorded
+   * as SPENT by the L3 aggregator. The local manifest still believed
+   * the token was spendable; the aggregator says otherwise.
+   *
+   * The most common producer is **another instance of the same wallet
+   * (sibling-device spend)**: e.g. desktop + mobile share keys, mobile
+   * spent the token, desktop has not yet pulled the spender's snapshot
+   * via the profile-pointer rescan (§12.3.1 / Item #15). The
+   * `suspectedSiblingInstance` flag carries the worker's heuristic
+   * verdict — `true` when neither the local OUTBOX nor SENT ledger
+   * holds any record referencing this `tokenId`, which means the spend
+   * could not have been initiated on THIS device.
+   *
+   * Distinct from `transfer:double-spend-detected` (reactive — fires
+   * only when the local instance attempts a send) and from
+   * `transfer:orphan-spending-detected` (covers `'transferring'` tokens
+   * stuck mid-send, not the active pool).
+   *
+   * Payload fields:
+   *  - `tokenId`                  — the off-record-spent token id
+   *  - `detectedAt`               — wall-clock ms timestamp of detection
+   *  - `suspectedSiblingInstance` — heuristic: `true` when local
+   *                                 OUTBOX+SENT ledgers have no entry
+   *                                 referencing the token, so the
+   *                                 spender is most likely another
+   *                                 instance sharing our keys
+   *  - `coinId`                   — coin id (forensic / operator triage)
+   *  - `amount`                   — token amount in smallest units
+   *                                 (forensic / operator triage)
+   *
+   * Operator action: see `docs/uxf/RUNBOOK-SEND-PIPELINE.md` —
+   * "transfer:off-record-spent" section.
+   */
+  'transfer:off-record-spent': {
+    readonly tokenId: string;
+    readonly detectedAt: number;
+    readonly suspectedSiblingInstance: boolean;
+    readonly coinId: string;
+    readonly amount: string;
   };
   'payment_request:incoming': IncomingPaymentRequest;
   'payment_request:accepted': IncomingPaymentRequest;
