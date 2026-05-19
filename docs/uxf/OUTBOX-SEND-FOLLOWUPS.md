@@ -454,7 +454,7 @@ to pick up where the work stopped:
 | B.1 (shared merge helper) | ✓ Done | `e999727` | `profile/profile-snapshot-merge.ts` + tests |
 | B.2 (OutboxWriter) | ✓ Done | `c56641b` | `profile/outbox-writer.ts` + tests |
 | B.3 (SentLedgerWriter) | ✓ Done | `60b8929` | `profile/sent-ledger-writer.ts` + tests |
-| B.4 (DispositionWriter) | ⏸ Deferred | — | See "Deferred — B.4" below |
+| B.4 (DispositionWriter — `_invalid` + `_audit` only) | ✓ Done | `0486fc2` | `profile/disposition-storage-adapters.ts` (new `syncWritersFor(addressId)` returning four `PrefixSyncWriter`s for `${addr}.invalid.` / `${addr}.invalid-orphan.` / `${addr}.audit.` / `${addr}.audit-orphan.`; new `notifyProfileDirty` constructor option threaded into all four writers; four exported prefix helpers: `dispositionInvalidPrefix` / `dispositionInvalidOrphanPrefix` / `dispositionAuditPrefix` / `dispositionAuditOrphanPrefix`), `profile/profile-storage-provider.ts` (`buildDispositionStorageAdapter` now threads `this.profileDirtyNotifier`), `profile/factory.ts` (extended `dispatchParsedSnapshot`'s `writersFor(addressId)` closure to include the four disposition writers via `storage.buildDispositionStorageAdapter().syncWritersFor(addressId)`), `tests/unit/profile/disposition-sync.test.ts` (new — 14 tests: wiring, snapshot scope isolation invalid↔audit + orphan↔non-orphan + multi-addressId, JOIN round-trip for invalid + audit, idempotency, tombstone stickiness, orphan/non-orphan no cross-pollination, `notifyProfileDirty` propagation: fires on landings, NOT on empty JOIN). The `_manifest` surface remains DEFERRED — see the "Deferred — B.4 manifest" note below. |
 | B.5 (Finalization + RecipientContext) | ✓ Done | `7806b93` | `profile/prefix-sync-writer.ts`, `profile/finalization-queue-storage-adapter.ts` + tests |
 | B.6 (BundleIndex) | ✓ Done | `6c3c0ee` | `profile/profile-token-storage/bundle-index.ts` + tests |
 | C.1 (notifyProfileDirty wiring) | ✓ Done | `04e423e` | every writer + host interface + `ProfileStorageProvider.setProfileDirtyNotifier` + `tests/unit/profile/notify-profile-dirty.test.ts` |
@@ -514,34 +514,50 @@ writers from the registered writer instances, dispatch each writer's
 snapshot's `entries[]`, then handle the wallet-global BundleIndex
 separately.
 
-**Deferred — B.4 (DispositionWriter)**
+**Deferred — B.4 manifest (status: `_invalid` + `_audit` LANDED `0486fc2`; `_manifest` REMAINS deferred)**
 
-Scope call needed before B.4 can be cut. Three layered surfaces:
+Scope call resolved as a hybrid in commit `0486fc2`:
 
   - `_invalid` (`${addr}.invalid.{tokenId}.{contentHash}`) — content-immutable.
-    `PrefixSyncWriter` from B.5 would slot in directly, gated on
-    `validateUxf1Schema`.
+    **PrefixSyncWriter slots in directly.** Default validator (accept any
+    plain non-tombstone object) is correct — disposition records are
+    heterogeneous shapes without a `_schemaVersion` discriminator. The
+    `${addr}.invalid-orphan.` sub-prefix is wired as a separate writer
+    so non-orphan and orphan records cannot cross-pollinate.
   - `_audit` (`${addr}.audit.{tokenId}.{contentHash}`) — same as `_invalid`.
     The `_audit` records DO mutate (`auditStatus: 'audit-promoted'` set
     on promotion) but at the same `lamport=0` semantics they'd converge
     eventually-consistently with operator-visible divergence in the
-    interim.
+    interim. **Accepted as eventual-consistency per the surface's
+    design notes.**
   - `_manifest` (`${addr}.manifest.{tokenId}`) — Lamport-tracked AND CAS-
     guarded via `ManifestStore` with per-field merge rules (set-OR for
     `audit_promoted_from`, max-merge for `lamport`, lex-min for
     `splitParent`, etc.). A snapshot-JOIN that picks ONE side's bytes
     verbatim would lose the per-field merge that `mergeManifestEntry`
-    runs at write time. Either:
+    runs at write time. **Option (c) wins for now**: defer manifest
+    from the lean-snapshot sync path. Two reasons:
+      1. Production manifest storage today is in-memory only — an
+         `MinimalManifestStorage` `Map<string, TokenManifestEntry>`
+         built inside `PaymentsModule` (`PaymentsModule.ts:~15045`).
+         There is no OrbitDB persistence to JOIN against at the
+         snapshot layer.
+      2. Closing this requires BOTH migrating the manifest store to
+         OrbitDB persistence AND extending the JOIN primitive (option
+         a) or building a dedicated `ManifestStore.joinSnapshot()`
+         (option b on this surface). That's a significant follow-up
+         and overlaps with Item #14's conflict-classification work.
 
+When option (a)/(b) eventually lands for `_manifest`:
       (a) extend `runJoinSnapshot`'s `writeRemote` callback to accept a
           per-field merger and have ManifestStore implement it, OR
       (b) handle manifest JOIN outside `runJoinSnapshot` with a dedicated
           `ManifestStore.joinSnapshot()` that runs the existing
-          per-field merger before persisting, OR
-      (c) defer manifest from the lean-snapshot sync path entirely and
-          let it continue to converge via OrbitDB replication only.
+          per-field merger before persisting.
 
-The maintainer call decides which of (a)/(b)/(c) to take.
+The maintainer call between (a) and (b) for `_manifest` is unchanged;
+the work to migrate ManifestStore to OrbitDB persistence is a
+prerequisite for either path.
 
 **Phase G test scope after Item #15 lands**
 
