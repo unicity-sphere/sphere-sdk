@@ -1714,7 +1714,7 @@ The implementation MUST include:
 > **Status update (2026-05-19)**: the original §12.3 framed BOTH rescans as deferred at the time T.1–T.8 were planned. Both have since landed:
 >
 >   - **§12.3.1 (profile-pointer rescan) is SHIPPED** — landed as the core of the **aggregator-pointer wave** (`PROFILE-AGGREGATOR-POINTER-IMPL-PLAN.md` Phases A–E, 75 tasks) and consolidated by **Item #15** (Full Profile State Snapshot Sync; merged via PR #173). Implementation in `profile/profile-token-storage/lifecycle-manager.ts` (`schedulePointerPoll` / `runPointerPollOnce`).
->   - **§12.3.2 (per-token spent-state rescan) is SHIPPED** — landed via **Issue #174** / branch `feat/spent-state-rescan-worker`. Implementation in `modules/payments/transfer/spent-state-rescan-worker.ts`; wired into `PaymentsModule` behind the `features.spentStateRescan` flag (default-OFF during soak; flip to default-ON after a 7-day testnet observation confirms no false-positive `_audit` transitions surface from transient aggregator availability).
+>   - **§12.3.2 (per-token spent-state rescan) is SHIPPED** — landed via **Issue #174** / PR #176 (`feat/spent-state-rescan-worker`), with the default closure in PR #177 and the soak-gate flip in PR #178. Implementation in `modules/payments/transfer/spent-state-rescan-worker.ts`; wired into `PaymentsModule` behind the `features.spentStateRescan` flag (default-ON; explicit `false` opt-out preserves the reactive-only surface).
 >
 > The "two rescans deferred as a unit" language in `UXF-TRANSFER-IMPL-PLAN.md`'s "Out-of-scope for T.1–T.8 (deferred)" section is similarly stale (kept for historical accuracy of what shipped in T.1–T.8 specifically; both rescans landed outside the T.1–T.8 wave bucket).
 
