@@ -85,6 +85,23 @@ function createProvider(opts: {
   db: ProfileDatabase;
   getPointerLayer?: () => ProfilePointerLayer | null;
   getPointerBuildStatus?: () => 'pending' | 'unavailable' | 'ready';
+  /**
+   * Item #15 Phase E follow-up — install a snapshot applier on the
+   * provider. When omitted, the provider runs without an applier and
+   * cold-start recovery becomes a no-op for the pointer-returned CID.
+   */
+  onApplySnapshot?: (cidString: string) => Promise<{
+    joinedAny: boolean;
+    addressesSeen: number;
+    bundleEntriesSeen: number;
+    counters: {
+      entriesEvaluated: number;
+      liveLanded: number;
+      tombstonesLanded: number;
+      localWon: number;
+      remoteRejectedMalformed: number;
+    };
+  }>;
 }): ProfileTokenStorageProvider {
   const provider = new ProfileTokenStorageProvider(
     opts.db,
@@ -108,6 +125,9 @@ function createProvider(opts: {
     },
   );
   provider.setIdentity(TEST_IDENTITY);
+  if (opts.onApplySnapshot) {
+    provider.setApplySnapshotCallback(opts.onApplySnapshot);
+  }
   return provider;
 }
 
@@ -128,24 +148,53 @@ describe('ProfileTokenStorageProvider pointer recovery (T-D6 wiring)', () => {
     db = createMockDb();
   });
 
-  it('records the recovered CID as a bundle ref when the pointer has an anchor', async () => {
+  it('dispatches the recovered snapshot CID through applySnapshotIfWired (Item #15)', async () => {
+    // Item #15 Phase E follow-up: the pointer's CID is a SNAPSHOT
+    // CID, not a UXF bundle CID. Cold-start recovery routes it
+    // through the host-wired applier (fetch + parse + per-writer
+    // JOIN). The legacy `bundleIndex.addBundle(snapshotCid, …)` path
+    // is gone — silently writing the snapshot bytes as a bundle ref
+    // was the latent bug Phase E follow-up fixed.
     const bundleBytes = new TextEncoder().encode('{"tokens":[]}');
     const cid = cidForBytes(bundleBytes);
+    const cidString = cid.toString();
     const recoverLatest = vi.fn(async () => ({ cid: cid.bytes, version: 5 }));
     const pointer = stubPointer({ recoverLatest });
+
+    const applierCalls: string[] = [];
+    const onApplySnapshot = vi.fn(async (cidArg: string) => {
+      applierCalls.push(cidArg);
+      return {
+        joinedAny: true,
+        addressesSeen: 1,
+        bundleEntriesSeen: 0,
+        counters: {
+          entriesEvaluated: 1,
+          liveLanded: 1,
+          tombstonesLanded: 0,
+          localWon: 0,
+          remoteRejectedMalformed: 0,
+        },
+      };
+    });
 
     const provider = createProvider({
       db,
       getPointerLayer: () => pointer,
+      onApplySnapshot,
     });
 
     await provider.initialize();
 
     expect(recoverLatest).toHaveBeenCalledOnce();
-
-    // Bundle ref was written at the canonical key.
-    const bundleKey = BUNDLE_KEY_PREFIX + cid.toString();
-    expect(db._store.has(bundleKey)).toBe(true);
+    // Applier received the snapshot CID — not via direct bundle-index
+    // write.
+    expect(applierCalls).toContain(cidString);
+    // Legacy `addBundle(snapshotCid, …)` path is gone — bundle index
+    // not directly written by the lifecycle. (The applier itself may
+    // write through BundleIndex.joinSnapshot, but our stub doesn't.)
+    const bundleKey = BUNDLE_KEY_PREFIX + cidString;
+    expect(db._store.has(bundleKey)).toBe(false);
   });
 
   it('falls through to IPNS when the pointer returns null (no anchor yet)', async () => {

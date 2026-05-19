@@ -69,6 +69,8 @@ The OUTBOX is a working queue that **drains** to SENT as deliveries complete. To
 ### 2. Automatic re-publication of detected retention drops (P2 #3 follow-up)
 
 > **Scope after Item #15**: under full-profile-snapshot sync, OUTBOX entries propagate across peers via the pointer mechanism, so the `'entry-tombstoned-or-missing'` skip-reason on `transfer:retention-republish-skipped` becomes rare. Bundles remain pinned on our IPFS by definition (IPFS-pin-only directive); re-publishing always has the bundle bytes available via CID. See Item #15.
+>
+> **Locked by test** (commit `340f65d`): `tests/integration/profile/retention-republish-after-snapshot-join.test.ts` (3 tests) demonstrates the elimination of the `'entry-tombstoned-or-missing'` skip on the cross-device path. The "with snapshot JOIN" scenario asserts that after Peer A's delivered OUTBOX entry propagates to Peer B via the lean-snapshot pull, B's verifier successfully re-arms the retention re-publish (`transfer:retention-republish-rearmed`) instead of skipping. A baseline test without the JOIN step preserves the pre-Item-#15 behaviour as the contrast (the skip DOES fire) so the test scenario actually exercises the contrast. An idempotency test locks the verifier's `checkedIds` semantics.
 
 **Why it matters**: today `NostrPersistenceVerifier` (default-OFF) detects a relay retention drop and emits `transfer:retention-warning`. That's all. The bundle was successfully delivered earlier (relay ack'd it) but is now gone — the recipient may have already seen it, may not have. Closing the loop means actually re-publishing.
 
@@ -164,6 +166,18 @@ Until flipped to default-ON, these are dead code for any wallet that doesn't exp
 ### 6. Re-publish on CAR vs CID modes — bundle availability
 
 > **Scope after Item #15**: per the IPFS-pin-only architectural directive, every bundle (regardless of original Nostr delivery mode) is pinned on our IPFS node. The CAR-mode re-publish throw added in commit `72879d1` becomes a defensive fallback rather than the common case — `'cid-over-nostr'` re-publish using the SENT entry's `bundleCid` always succeeds when the pin is live. See Item #15.
+>
+> **Audit verdict (2026-05-19, per ITEM-15-OPERATIONAL-CLOSURE-PROMPT.md gap #4): the throw is NOT YET demotable.** The IPFS-pin-only directive is aspirational; the senders' `modules/payments/transfer/delivery-resolver.ts:resolveDelivery` currently invokes `publishToIpfs` ONLY on the CID branches (`'force-cid'` and `'auto'` over-cap with publisher wired):
+>
+>   - `'force-inline'` → `{ kind: 'inline', carBase64 }` — **NO pin call.**
+>   - `'auto'` ≤ inlineCap → `{ kind: 'inline', carBase64 }` — **NO pin call.**
+>   - `'auto'` over-cap, no publisher, bundle ≤ `RELAY_SAFE_CAP_BYTES` → `carInlineFallback` returns inline — **NO pin call.**
+>   - `'auto'` over-cap with publisher → `{ kind: 'cid', cid, shouldPin: true }` — pin call IS made.
+>   - `'force-cid'` (requires publisher) — pin call IS made.
+>
+> So entries recorded with `deliveryMethod='car-over-nostr'` were inlined on the Nostr wire and **never pinned to the sender's IPFS node**. The default `republish` closure's CAR-mode throw in `PaymentsModule.ts` is therefore still the correct behaviour today for those entries — there is no IPFS pin to fall back to via `'cid-over-nostr'` re-publish. The throw routes the entry to `'failed-transient'` via the recovery worker's `maxRetries` mechanism, which is the §7.0 escape valve for operator triage.
+>
+> **Residual gap (sub-item 6.a — NEW)**: implement the IPFS-pin-only directive at send time by extending `delivery-resolver.ts` so the `'inline'` branches ALSO call `publishToIpfs` (or an equivalent local-pin function) for the same content-addressed CAR bytes. Once that change lands, the sender's IPFS node holds the pin for every bundle regardless of wire delivery mode, the SENT entry's `bundleCid` is reliably fetchable, and the default `republish` closure can downgrade `'car-over-nostr'` re-publishes to `'cid-over-nostr'` shape unconditionally. The current throw then truly becomes the defensive-fallback the doc anticipated. Tracked here as part of Item #6's acceptance criteria; spec-text revision suggested: "Acceptance criteria for 6.a: every successful send (any delivery mode) leaves a live IPFS pin on the sender's local node for `bundleCid`; CAR-mode re-publish closure downgrades to CID-over-Nostr; the throw becomes unreachable in the common case (only reached when the pin TTL has expired AND the bundle bytes are also gone from local storage)."
 
 **Why it matters**: `SendingRecoveryWorker.republish` (the default in PaymentsModule) ships `kind: 'uxf-cid'` for every re-publish, regardless of the original delivery mode. For an entry originally delivered via `kind: 'uxf-car'` (inline CAR), the IPFS pin may not exist — the recipient gets a CID they can't fetch.
 
@@ -404,6 +418,14 @@ So the JOIN layer already knows the truth. The OUTBOX state machine and the loca
 - Phase 2 (medium): items 3, 5, 7, 8 — proper §7.0 state-machine entry, JOIN→Token wiring, orphan sweeper disambiguation, balance regression test. Closes the unconfirmed-balance gap.
 - Phase 3 (small): item 6 + the CLAUDE.md / runbook updates from work items 4 and 6 — docs cleanup.
 
+**Phase 1 implementation status (commit `9b4fae7`)** — DONE.
+  * Item #1 (typed throw): new `SphereErrorCode` `'STATE_ALREADY_SPENT_BY_OTHER'`; new private helper `PaymentsModule.submitCommitmentClassified(stClient, oracle, commitment, classify)` wraps both dispatcher submit-throw sites (`PaymentsModule.ts:~11207` conservative + `:~12036` instant). On non-success/non-idempotent response the helper re-queries `oracle.isSpent(sourceStateHash)` to disambiguate; on confirmed spent it raises the typed code with a structured `cause` payload (`tokenId`, `sourceStateHash`, `ourIntendedRecipient`, `submitStatus`). Probe throws / unspent / no-oracle paths fall back to the legacy `'TRANSFER_FAILED'` so transient and authenticator-failed cases remain unchanged.
+  * Item #3 (state machine): `UxfOutboxStatus` widened 10 → 11 with `'failed-conflict'` (hard-terminal partition). `ALLOWED_TRANSITIONS` widened 19 → 25 with five entry arcs (`packaging`/`pinned`/`sending`/`delivered`/`delivered-instant → failed-conflict`) plus the operator-override escape `failed-conflict → finalizing` (mirrors `failed-permanent`). Snapshot tests updated. Note: for greenfield sends the OUTBOX entry does not yet exist at the submit throw site (the conservative + instant senders create it AFTER `commitSources` returns), so today the operator-visible signal is the emitted event itself; the §7.0 arcs cover future recovery paths that hit the spent state on a previously-created entry.
+  * Item #4 (event): new `'transfer:double-spend-detected'` event + payload (`tokenId`, `sourceStateHash`, `ourIntendedRecipient`, `detectedAt`) wired into both dispatcher outer-catches via `PaymentsModule.emitDoubleSpendDetectedIfApplicable(err)`. Defensive: tolerates missing payload fields (empty-string defaults rather than skipping); emit failures are logged and swallowed.
+  * Tests: `tests/unit/modules/PaymentsModule.double-spend-detection.test.ts` (13 tests covering SphereErrorCode contract, SphereEventMap payload shape, `emitDoubleSpendDetectedIfApplicable`, and `submitCommitmentClassified`).
+
+Phase 2 work items (5 — JOIN→local-Token correction, 7 — orphan sweeper disambiguation, 8 — `getAssets`/balance regression test) and Phase 3 (item 6 — stale comment, runbook + CLAUDE.md additions) remain open per the original split.
+
 > **Note on scope after Item #15**: under the full-profile-snapshot sync (Item #15), OUTBOX entries propagate via the pointer mechanism, so the racing window where two peers can both reach the aggregator with conflicting commits collapses to the pointer poll interval (typically seconds, not the indefinite "until manual sync" of today). Phase 1 of Item #14 (typed throw + new event + `'failed-conflict'` status) still wanted as the operator-visible signal; Phase 2's local-Token correction is largely subsumed by Item #15's JOIN flow.
 
 ---
@@ -441,6 +463,143 @@ OrbitDB's role degrades to **local encrypted KV cache**. Its CRDT-replication fe
 Two important deltas needed:
 - **"Lean" snapshot variant** — bundle refs by CID only, no embedded CAR bytes. The fat format stays for the export/import CLI. Schema v2.
 - **Filter reversal** — today's export filter strips `tokens.bundle.*` and `consolidation.*` (operational state for export). For sync these ARE needed; the new lean snapshot includes them.
+
+**Implementation status** (2026-05-19 — branch `feat/outbox-followups-item15-phase-a`)
+
+Phase A and most of Phase B have landed locally as a sequence of commits on the
+branch above (not yet merged to `integration/all-fixes`). Use this status block
+to pick up where the work stopped:
+
+| Sub-phase | Status | Commit (short) | Files |
+|-----------|--------|----------------|-------|
+| Phase A | ✓ Done | `870fcd3` | `profile/profile-lean-snapshot.ts` + tests |
+| B.1 (shared merge helper) | ✓ Done | `e999727` | `profile/profile-snapshot-merge.ts` + tests |
+| B.2 (OutboxWriter) | ✓ Done | `c56641b` | `profile/outbox-writer.ts` + tests |
+| B.3 (SentLedgerWriter) | ✓ Done | `60b8929` | `profile/sent-ledger-writer.ts` + tests |
+| B.4 (DispositionWriter — `_invalid` + `_audit` only) | ✓ Done | `0486fc2` | `profile/disposition-storage-adapters.ts` (new `syncWritersFor(addressId)` returning four `PrefixSyncWriter`s for `${addr}.invalid.` / `${addr}.invalid-orphan.` / `${addr}.audit.` / `${addr}.audit-orphan.`; new `notifyProfileDirty` constructor option threaded into all four writers; four exported prefix helpers: `dispositionInvalidPrefix` / `dispositionInvalidOrphanPrefix` / `dispositionAuditPrefix` / `dispositionAuditOrphanPrefix`), `profile/profile-storage-provider.ts` (`buildDispositionStorageAdapter` now threads `this.profileDirtyNotifier`), `profile/factory.ts` (extended `dispatchParsedSnapshot`'s `writersFor(addressId)` closure to include the four disposition writers via `storage.buildDispositionStorageAdapter().syncWritersFor(addressId)`), `tests/unit/profile/disposition-sync.test.ts` (new — 14 tests: wiring, snapshot scope isolation invalid↔audit + orphan↔non-orphan + multi-addressId, JOIN round-trip for invalid + audit, idempotency, tombstone stickiness, orphan/non-orphan no cross-pollination, `notifyProfileDirty` propagation: fires on landings, NOT on empty JOIN). The `_manifest` surface remains DEFERRED — see the "Deferred — B.4 manifest" note below. |
+| B.5 (Finalization + RecipientContext) | ✓ Done | `7806b93` | `profile/prefix-sync-writer.ts`, `profile/finalization-queue-storage-adapter.ts` + tests |
+| B.6 (BundleIndex) | ✓ Done | `6c3c0ee` | `profile/profile-token-storage/bundle-index.ts` + tests |
+| C.1 (notifyProfileDirty wiring) | ✓ Done | `04e423e` | every writer + host interface + `ProfileStorageProvider.setProfileDirtyNotifier` + `tests/unit/profile/notify-profile-dirty.test.ts` |
+| C.2 (debounce + dispatch surface) | ✓ Done | `a5a2a90` | `ProfileTokenStorageProvider.notifyProfileDirty` + `dirtyFlushTimer`/`dirtyFlushPending`/`hasShutdown` + `onProfileDirtyFlush` option + `tests/unit/profile/profile-token-storage-dirty-flush.test.ts` |
+| C.3 (factory closure wiring) | ✓ Done | `8c241e9` | `profile/factory.ts` (`runProfileDirtyFlush` + `createProfileProviders`), `profile/profile-token-storage-provider.ts` (public `getIdentity()` + `notifyProfileDirty()`) + tests |
+| D.1a (route runProfileDirtyFlush via publishAggregatorPointerBestEffort) | ✓ Done | `ccbe3b3` | `profile/factory.ts` (`ProfileDirtyFlushDeps.publishCid` slot replaces direct `pointer.publish`), `profile/types.ts` (new `ProfileSnapshotPublishResult`; `onProfileDirtyFlush` return widened), `profile/profile-token-storage-provider.ts` (new `publishLeanSnapshotCid()` public delegate), `tests/unit/profile/factory-dirty-flush.test.ts` (12 tests) |
+| D.1b (flush-scheduler → snapshot publish) | ✓ Done | `49d2894` | `profile/profile-token-storage/flush-scheduler.ts` (publish step rewired to `host.publishSnapshotIfWired()`; legacy `lifecycle.publishAggregatorPointerBestEffort(bundleCid)` call removed — no bundle-CID fallback; `LifecycleManager` import + constructor parameter dropped), `profile/profile-token-storage/host.ts` (new `publishSnapshotIfWired(): Promise<ProfileSnapshotPublishResult \| null>` method on the host interface), `profile/profile-token-storage-provider.ts` (new public `publishSnapshotIfWired()` method coordinating with the dirty-flush debouncer — cancels armed timer, awaits in-flight dispatch, re-arms on signal received during synchronous fire; `FlushScheduler` construction simplified), `tests/unit/profile/flush-scheduler-d1b.test.ts` (10 tests: bail / happy / error / debouncer-coordination paths) |
+| D.2 (pull-side dispatcher) | ✓ Done | `da989f7` | `profile/profile-snapshot-dispatcher.ts` (new — pure per-writer JOIN orchestrator: base64-decodes snapshot entries, extracts unique addressIds via `DIRECT_[0-9a-f]{6}_[0-9a-f]{6}` regex, dispatches each writer's `joinSnapshot()` over its prefix-filtered slice, dispatches wallet-global BundleIndex over `tokens.bundle.*`, aggregates `JoinResult` counters; per-writer errors swallowed so a single misbehaving writer cannot block convergence), `profile/pointer-wiring.ts` (new optional `applySnapshot` field on `PointerWiringInput`; `buildFetchAndJoin` now fetches CAR bytes and — when applier is wired — parses via `parseLeanProfileSnapshot`, calls the applier, THEN advances cursor; legacy bundle-CID write path preserved as fallback for tests / pre-D.2 wallets; parse failure throws PROTOCOL_ERROR to avoid silently absorbing malformed remote CARs), `profile/profile-storage-provider.ts` (new private `snapshotApplier` field + public `setSnapshotApplier()` setter; threaded into `buildProfilePointerLayer` via `tryBuildPointerLayer`), `profile/profile-token-storage-provider.ts` (new public `getBundleIndex(): BundleIndex \| null` accessor), `profile/factory.ts` (new exported `runProfileSnapshotApply(snapshot, deps)` testable closure body wrapping `runProfileSnapshotJoin`; `createProfileProviders` wires `storage.setSnapshotApplier(...)` that lazily builds per-address writers via `storage.buildOutboxWriter(addressId)` + `buildSentLedgerWriter` + `buildFinalizationQueueStorageAdapter().syncWriterFor` + `buildRecipientContextStorageAdapter().syncWritersFor` and reads wallet-global BundleIndex via `tokenStorage.getBundleIndex()`), `tests/unit/profile/profile-snapshot-dispatcher.test.ts` (20 tests: address extraction, per-writer routing, BundleIndex routing, aggregation/joinedAny semantics, error isolation, base64 decoding, internal helpers), `tests/unit/profile/pointer-wiring.test.ts` (4 new D.2 tests: happy path with applier wired, applySnapshot throw → no cursor advance, malformed CAR → PROTOCOL_ERROR, legacy fallback when applier omitted), `tests/unit/profile/factory-snapshot-apply.test.ts` (5 tests: writersFor invocation count, getBundleIndex laziness, dispatcher delegation, result shape), `tests/unit/profile/integration.test.ts` (1 new wiring assertion: factory installs the snapshot applier) |
+| Phase E (remove UXF-bundle-only pointer code path) | ✓ Done | `952c276` | `profile/pointer-wiring.ts` (`applySnapshot` promoted from optional to required field on `PointerWiringInput` and on `buildFetchAndJoin`'s deps; new `snapshot_applier_missing` skip reason added to `PointerWiringSkipReason`; legacy bundle-CID write block — including `bundleEncryptionKey` parameter, `BUNDLE_KEY_PREFIX`, OrbitDB write path, `withTimeout`/`ORBITDB_WRITE_TIMEOUT_MS`, `db` input field — fully removed; `deriveProfileEncryptionKey`/`encryptProfileValue`/`buildLocalEntry`/`UxfBundleRef`/`ProfileDatabase` imports dropped; precondition added in `buildProfilePointerLayer` so a missing applier surfaces as a clean skip rather than a layer that crashes on first remote), `profile/profile-storage-provider.ts` (pre-flight gate added in `tryBuildPointerLayer`: if `snapshotApplier` is null the layer construction is skipped with `snapshot_applier_missing`; `db` no longer threaded into the wiring helper; doc comments updated to remove "legacy fallback" language and reflect that the applier is now required), `tests/unit/profile/pointer-wiring.test.ts` (legacy bundle-ref write tests removed: `'fetches, verifies, writes an encrypted bundle ref…'`, `'writes the OrbitDB bundle ref BEFORE persisting the local version'`, `'does NOT advance the local version when the OrbitDB write fails'`, `'written bundle ref round-trips through decryptProfileValue'`, `'legacy fallback (no applySnapshot wired) still writes bundle ref'`; surviving pre-flight tests rewritten to assert `applySnapshot` is NOT called when the fetch fails; new `'skips with snapshot_applier_missing when applySnapshot is omitted'` test on `buildProfilePointerLayer`; new `'calls applySnapshot BEFORE persisting the local version'` ordering test; `createMockDb` helper removed) |
+| Phase F (tombstone GC at snapshot-build time) | ✓ Done | `0f530eb` | `profile/profile-lean-snapshot.ts` (new optional `gcExpiredTombstones?: () => Promise<void>` field on `BuildLeanProfileSnapshotOptions`; builder invokes the hook BEFORE `readAllKvEntries` so the subsequent `storage.keys()` scan observes the post-GC state; hook exceptions caught + logged, never block snapshot publication), `profile/factory.ts` (new exported `runProfileTombstoneGc(deps)` + `DEFAULT_PROFILE_TOMBSTONE_RETENTION_MS` constant — 30 days; closure extracts active addressIds via the same `DIRECT_[0-9a-f]{6}_[0-9a-f]{6}.` regex as the pull-side dispatcher, instantiates OUTBOX + SENT writers per address, dispatches each writer's `gcExpiredTombstones({ retentionMs })`; per-writer/per-address errors swallowed so one misbehaving writer cannot block GC on the others; `listKeys()` failure → silent return; `createProfileProviders.buildSnapshot` wires the closure into the lean-snapshot builder's new hook with retention resolved per-call from `ProfileConfig.tombstoneRetentionMs` → `DEFAULT_PROFILE_TOMBSTONE_RETENTION_MS`), `profile/types.ts` (new `ProfileConfig.tombstoneRetentionMs?: number` knob), `tests/unit/profile/profile-lean-snapshot.test.ts` (3 new Phase F tests: hook fires BEFORE storage scan, hook exceptions swallowed, omitting hook preserves backwards-compatible behaviour), `tests/unit/profile/factory-tombstone-gc.test.ts` (new — 12 tests on `runProfileTombstoneGc`: addressId extraction, non-prefixed key ignore, empty no-op, dedup across many keys per address, retentionMs threading, null builder skip, per-writer/per-address error isolation, `listKeys()` failure silent return, default retention constant value) |
+| Phase G (integration tests) | ✓ Done | `b99b980` | `tests/integration/profile/full-profile-sync.test.ts` (new — 13 tests across the 5 G.* scenarios: G.1 two-peer JOIN propagation + idempotent re-pull + SENT prefix-routing smoke, G.2 tombstone-wins-at-JOIN incl. tie-break sticky semantics, G.3 concurrent V+1 flush race + convergence to V+2 union + bounded-fix-point bidirectional pull, G.4 crash-recovery cross-device + 'finalizing' status survives JOIN with sticky `everFinalizing`, G.5 non-overlapping union + remote-Lamport preservation + asymmetric mutations). Fixture wires real `OutboxWriter` + `SentLedgerWriter` per peer atop `MockProfileDb`; "publish" goes through `buildLeanProfileSnapshot` against a `WrappedStorage` adapter (surfaces `db` keys via `keys()` + `getEncryptedRaw()`); "pull" parses via `parseLeanProfileSnapshot` and dispatches via `runProfileSnapshotJoin` with `writersFor(ADDR) → [OUTBOX, SENT]` and `bundleIndex: null`. Bundle/finalization/recipient-context writers covered by their own unit tests; the integration suite focuses on the canonical OUTBOX/SENT flow per the spec's Phase G acceptance criteria. |
+| Phase A doc nits (cleanup follow-up) | ⌛ Open | _to-be-filed_ | `profile/profile-lean-snapshot.ts` — (a) `LEAN_DEFAULT_MAX_SNAPSHOT_BYTES` (256 MiB) is exported and quoted in `BuildLeanProfileSnapshotOptions.maxSizeBytes` doc but is dead code today: lean snapshots emit a single root block, so `PROFILE_CAR_IMPORT_MAX_BLOCK_BYTES` (1 MiB) fires first. Rename to `LEAN_DEFAULT_MAX_CAR_BYTES` with a comment, OR drop it once a multi-block / chunked snapshot path lands. (b) `MAX_KV_ENTRIES` / `MAX_KV_VALUE_BYTES` are labeled `Soft cap` in source comments but the build + parse paths throw `ProfileError` on exceedance — they are hard caps. Pure doc / label cleanup; no behaviour change required. Caught by the code-reviewer agent on PR #173; tracked here for the next pass. |
+| Phase E follow-up (`applySnapshotIfWired` host method) | ✓ Done | `93190a6` | `profile/profile-token-storage/host.ts` (new `applySnapshotIfWired(cid)` on the host contract), `profile/types.ts` (new `onApplySnapshot` option on `ProfileTokenStorageProviderOptions`), `profile/profile-token-storage-provider.ts` (implementation + new `setApplySnapshotCallback(cb)` late-binding setter), `profile/profile-token-storage/lifecycle-manager.ts` (`recoverFromAggregatorPointerBestEffort` + `runPointerPollOnce` now dispatch the recovered CID through `applySnapshotIfWired` instead of `bundleIndex.addBundle`; idempotency keyed on `lastDiscoveredPointerCid` instead of `knownBundleCids`; `fetchFromIpfs` import dropped — fetch runs inside the factory's wired closure), `profile/factory.ts` (`dispatchParsedSnapshot` helper extracted and reused by both `setSnapshotApplier` and the new `setApplySnapshotCallback`; the recovery closure does fetch + parse + dispatch), `tests/unit/profile/profile-token-storage-apply-snapshot.test.ts` (new — 8 tests: wrapper contract, null-when-no-callback, delegate-when-wired, shutdown gate, error propagation, late-binding wins, construction-time fallback, setter override), updated `tests/unit/profile/lifecycle-manager-pointer-poll.test.ts` (13 tests; 4 new) + `tests/unit/profile/profile-token-storage-pointer.test.ts` (the recovery-records-bundle-ref test rewritten to assert applier dispatch + absence of legacy direct write). |
+
+**Implementation pattern that emerged during Phase B**
+
+Two flavours of per-writer JOIN exist; either pattern is now baked into
+the codebase and Phase C/D wiring can rely on both being available.
+
+  1. **Lamport-tracked, mutable entries** — OUTBOX, SENT. Each entry's
+     `lamport` field monotonically advances on every local write per §7.1.
+     The full Phase B merge table picks the winner by Lamport comparison.
+     `OutboxWriter` and `SentLedgerWriter` each implement `ProfileSyncWriter`
+     directly with their own decrypt/parse/Lamport-validate classifier.
+
+  2. **Constant-Lamport, content-immutable entries** — Finalization queue,
+     RecipientContext (both sub-prefixes), BundleIndex. Each entry is
+     written once at a key whose unique disambiguator (entryId, requestId,
+     tokenId, CID) ensures two replicas writing the same entry produce
+     byte-equivalent content. No explicit Lamport.
+
+     The shared helper `profile/prefix-sync-writer.ts` (`PrefixSyncWriter
+     implements ProfileSyncWriter`) wraps the constant-Lamport-0 pattern.
+     The merge degenerates to "absent → write; live+live → no-op (first
+     wins); tombstones stay sticky at Lamport=0=0 ties". `BundleIndex`
+     does NOT use `PrefixSyncWriter` (because of the envelope wrapper)
+     but applies the same constant-Lamport-0 semantics via a custom
+     classifier.
+
+**Public surface added by Phase B (for Phase D's dispatcher)**
+
+  - `OutboxWriter implements ProfileSyncWriter` (per-address — constructed
+    with `addressId`).
+  - `SentLedgerWriter implements ProfileSyncWriter` (per-address).
+  - `OrbitDbFinalizationQueueStorageAdapter.syncWriterFor(addressId)`
+    returns one ProfileSyncWriter for `${addr}.finalizationQueue.*`.
+  - `OrbitDbRecipientContextStorageAdapter.syncWritersFor(addressId)`
+    returns `{ requestContext, finalizationContext }` — two
+    ProfileSyncWriters covering `recipientContext.request.*` and
+    `recipientContext.finalization.*`.
+  - `BundleIndex implements ProfileSyncWriter` (singleton — no
+    addressId; the `tokens.bundle.*` namespace is wallet-global).
+
+The Phase D pull-side dispatcher in `profile/pointer-wiring.ts:387-533`
+should iterate active tracked addresses, instantiate per-address sync
+writers from the registered writer instances, dispatch each writer's
+`joinSnapshot()` over the writer's prefix-filtered slice of the remote
+snapshot's `entries[]`, then handle the wallet-global BundleIndex
+separately.
+
+**Deferred — B.4 manifest (status: `_invalid` + `_audit` LANDED `0486fc2`; `_manifest` REMAINS deferred)**
+
+Scope call resolved as a hybrid in commit `0486fc2`:
+
+  - `_invalid` (`${addr}.invalid.{tokenId}.{contentHash}`) — content-immutable.
+    **PrefixSyncWriter slots in directly.** Default validator (accept any
+    plain non-tombstone object) is correct — disposition records are
+    heterogeneous shapes without a `_schemaVersion` discriminator. The
+    `${addr}.invalid-orphan.` sub-prefix is wired as a separate writer
+    so non-orphan and orphan records cannot cross-pollinate.
+  - `_audit` (`${addr}.audit.{tokenId}.{contentHash}`) — content-immutable
+    BY KEY (the SHA-256 disambiguator in the key fixes the content
+    against tampering), but the record itself MUTATES on promotion
+    (`auditStatus: 'audit-promoted'` is set after the promotion path
+    fires). **At constant `lamport=0`, `runJoinSnapshot`'s `live + live`
+    cell resolves to "local wins" sticky** — so a peer that observed
+    `pending` BEFORE the other peer's promotion will NOT receive the
+    `audit-promoted` update via JOIN. The lagging peer stays at
+    `pending` indefinitely unless it runs the promotion locally
+    (typically triggered by the same inclusion-proof arrival that
+    drove the other peer's promotion).
+    **Accepted as a deferred follow-up** — the `_invalid`/`_audit`
+    surfaces JOIN as a baseline today; full convergence on the
+    promotion mutation requires the same Lamport-tracked-audit-writer
+    work that the `_manifest` surface needs (per-field merge with
+    explicit Lamport instead of constant-0). Tracked alongside the
+    "Deferred — B.4 manifest" item below.
+  - `_manifest` (`${addr}.manifest.{tokenId}`) — Lamport-tracked AND CAS-
+    guarded via `ManifestStore` with per-field merge rules (set-OR for
+    `audit_promoted_from`, max-merge for `lamport`, lex-min for
+    `splitParent`, etc.). A snapshot-JOIN that picks ONE side's bytes
+    verbatim would lose the per-field merge that `mergeManifestEntry`
+    runs at write time. **Option (c) wins for now**: defer manifest
+    from the lean-snapshot sync path. Two reasons:
+      1. Production manifest storage today is in-memory only — an
+         `MinimalManifestStorage` `Map<string, TokenManifestEntry>`
+         built inside `PaymentsModule` (`PaymentsModule.ts:~15045`).
+         There is no OrbitDB persistence to JOIN against at the
+         snapshot layer.
+      2. Closing this requires BOTH migrating the manifest store to
+         OrbitDB persistence AND extending the JOIN primitive (option
+         a) or building a dedicated `ManifestStore.joinSnapshot()`
+         (option b on this surface). That's a significant follow-up
+         and overlaps with Item #14's conflict-classification work.
+
+When option (a)/(b) eventually lands for `_manifest`:
+      (a) extend `runJoinSnapshot`'s `writeRemote` callback to accept a
+          per-field merger and have ManifestStore implement it, OR
+      (b) handle manifest JOIN outside `runJoinSnapshot` with a dedicated
+          `ManifestStore.joinSnapshot()` that runs the existing
+          per-field merger before persisting.
+
+The maintainer call between (a) and (b) for `_manifest` is unchanged;
+the work to migrate ManifestStore to OrbitDB persistence is a
+prerequisite for either path.
+
+**Phase G test scope after Item #15 lands**
+
+The G suite needs at minimum the test scenarios from item #9's "scope after
+Item #15" note: two-peer concurrent snapshot flushes where the aggregator
+anchors one and the loser re-polls + JOINs + re-publishes V+2.
+
+---
 
 **Acceptance criteria** (phased; each phase can be a separate PR):
 
@@ -483,9 +642,9 @@ Unit tests per writer: every cell of the table above, plus idempotence (re-runni
 
 **Phase C — Mutation→flush trigger surface**
 
-- C.1 Add a `notifyProfileDirty()` callback to each writer's construction. On every `write()` / `delete()`, the writer calls the callback.
-- C.2 `FlushScheduler` debounces these notifications. Proposal: 1-2 s debounce window for "soft" mutations (OUTBOX status transitions, SENT writes); flush-immediately for "hard" mutations (token finalization). Tunable via options.
-- C.3 `flushToIpfs` builds a lean snapshot (Phase A.2), pins, returns the CID.
+- ✓ C.1 (commit `04e423e`). Every writer's mutation surface invokes a host-provided `notifyProfileDirty()` callback. Plumbed through OutboxWriter, SentLedgerWriter, PrefixSyncWriter, OrbitDb{Finalization,RecipientContext}StorageAdapter, BundleIndex via `host.notifyProfileDirty()`. Centralised wiring lives on `ProfileStorageProvider.setProfileDirtyNotifier(cb)` so all `build*` factories thread the same callback.
+- ✓ C.2 (commit `a5a2a90`). `ProfileTokenStorageProvider` debounces incoming dirty signals over `dirtyFlushDebounceMs` (defaults to `flushDebounceMs`, configurable per-test). On fire, dispatches the host-injected `onProfileDirtyFlush?: () => Promise<void>` callback (new option). Concurrent signals serialize through `dirtyFlushPromise`; mid-flush signals latch via `dirtyFlushPending` and re-arm a fresh debounce. Errors are caught and surfaced via `storage:error` with code `PROFILE_DIRTY_FLUSH_FAILED`. Shutdown cancels the timer and awaits in-flight callbacks.
+- ✓ C.3 (commit `8c241e9`). `profile/factory.ts:createProfileProviders` wires the lean-snapshot dirty-flush closure into `ProfileTokenStorageProviderOptions.onProfileDirtyFlush` and registers a writer-side notifier on the storage provider that delegates to `tokenStorage.notifyProfileDirty()`. The closure body is exported as `runProfileDirtyFlush(deps)` for unit-testing without spinning up real OrbitDB / IPFS — it (1) reads `chainPubkey` / `network` from the live identity + config (bail on either missing), (2) verifies the pointer layer is ready (bail otherwise), (3) builds a lean snapshot via `buildLeanProfileSnapshot()`, (4) pins via `pinToIpfs(ipfsGateways, …)`, (5) publishes via `pointer.publish(cidProducer)`. `ProfileTokenStorageProvider.notifyProfileDirty()` is promoted to public (the factory bridge needs to call it from outside). New `ProfileTokenStorageProvider.getIdentity()` public accessor lets the closure read the live `chainPubkey` lazily without leaking the host adapter. Tests: `tests/unit/profile/factory-dirty-flush.test.ts` (10 tests covering bail paths, build→pin→publish ordering, error propagation, fresh-evaluation across calls) + `tests/unit/profile/integration.test.ts` (2 new wiring assertions).
 
 **Phase D — Pointer publish & pull integration**
 
@@ -498,9 +657,21 @@ Unit tests per writer: every cell of the table above, plus idempotence (re-runni
   5. Advance version cursor only after all per-writer JOINs persist.
   6. If JOIN produced any local change → mark profile dirty (next flush re-snapshots and publishes the union).
 
-**Phase E — Removal of UXF-bundle-only pointer publishing**
+**Phase E — Removal of UXF-bundle-only pointer publishing** ✓ Done (see status table above)
 
 Per the maintainer call: no backward compat. The UXF-bundle-only pointer code path is removed. Existing callers that produced bundle CIDs to the pointer publisher are routed through the new snapshot builder.
+
+Phase E completes the cleanup that Phases D.1b + D.2 left behind. After this phase the pointer layer's `fetchAndJoin` callback has exactly one sink for remote pointer state: the per-writer snapshot dispatcher wired through `applySnapshot`. The push side of this cutover already happened in D.1b (flush-scheduler publishes the lean snapshot CID, not the UXF bundle CID); Phase E removes the matching read-side fallback so a wallet whose factory wiring is broken fails *fast* with a clean diagnostic skip reason rather than constructing a layer that silently writes the wrong CAR shape into the bundle index on first remote.
+
+Concretely Phase E does:
+- Promotes `applySnapshot` from optional to required on both `PointerWiringInput` and `buildFetchAndJoin`'s internal deps. The `db: ProfileDatabase` input field is dropped — the wiring helper no longer touches OrbitDB at all because no writes happen on the pointer-read path. The `bundleEncryptionKey` parameter that the legacy bundle-ref encryption used is gone too.
+- Removes the entire `// 3b. Legacy fallback — applySnapshot not wired` branch from `buildFetchAndJoin`. That branch previously wrote `{ cid, status: 'active', createdAt }` as an encrypted ref at `tokens.bundle.{cid}` and advanced the local-version cursor; under Item #15 that's structurally wrong because the CID is now the snapshot CID, not a UXF bundle CID. Treating a malformed remote CAR as "legacy bundle CAR" would silently absorb the wrong shape and leave per-writer JOIN unconsumed.
+- Adds a new `snapshot_applier_missing` skip reason to `PointerWiringSkipReason`. Both `buildProfilePointerLayer` and `ProfileStorageProvider.tryBuildPointerLayer` check for the applier up front and bail with this reason when wiring is incomplete (typically a test fixture that forgot to set the applier, or a factory bug that constructed the pointer-build before `setSnapshotApplier` ran). The wallet then runs WITHOUT aggregator-pointer recovery — local OrbitDB still works, but cross-device sync via the pointer is paused until the wiring is fixed.
+- Cleans up now-unused imports (`encryptProfileValue`, `deriveProfileEncryptionKey`, `buildLocalEntry`, `UxfBundleRef`, `ProfileDatabase`, `BUNDLE_KEY_PREFIX`, `withTimeout`, `ORBITDB_WRITE_TIMEOUT_MS`).
+
+**Known follow-up (latent bug — RESOLVED in Phase E follow-up):** under D.1b/D.2/E the aggregator pointer now carries a *snapshot* CID, but the lifecycle-manager's periodic-poll path (`runPointerPollOnce`) and cold-start recovery path (`recoverFromAggregatorPointerBestEffort`) previously treated the recovered CID as a UXF *bundle* CID — they called `bundleIndex.addBundle(recoveredCid, …)` directly without first parsing the CAR as a lean snapshot. The result was a stale bundle-index entry pointing at snapshot bytes; the next `load()` would then try to parse the snapshot CAR as a UXF package and fail. The bug was latent because the publish-side reconcile loop (where the `fetchAndJoin` path runs) covered most paths in practice.
+
+The fix landed in the "Phase E follow-up (`applySnapshotIfWired` host method)" row of the status table above. A new host method `applySnapshotIfWired(cid)` was added symmetric to `publishSnapshotIfWired()`; both the poll and cold-start paths now route the recovered CID through it (fetch + parse + per-writer JOIN dispatch). The legacy direct-`addBundle` path is gone — silently re-writing the snapshot CID as a bundle ref is precisely what the fix removes. No legacy fallback per Phase E: when no applier is wired the lifecycle logs and skips rather than corrupting the bundle index.
 
 **Phase F — Tombstone GC at snapshot-build time**
 

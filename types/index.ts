@@ -579,6 +579,7 @@ export type SphereEventType =
   | 'transfer:retention-warning'
   | 'transfer:retention-republish-rearmed'
   | 'transfer:retention-republish-skipped'
+  | 'transfer:double-spend-detected'
   | 'payment_request:incoming'
   | 'payment_request:accepted'
   | 'payment_request:rejected'
@@ -1265,6 +1266,49 @@ export interface SphereEventMap {
       | 'transition-failed';
     readonly observedStatus?: string;
     readonly errorMessage?: string;
+    readonly detectedAt: number;
+  };
+  /**
+   * OUTBOX-SEND-FOLLOWUPS Item #14 Phase 1 — emitted by the dispatch
+   * outer-catch when `submitTransferCommitment` failed AND the
+   * dispatcher's `oracle.isSpent(sourceStateHash)` re-query confirms
+   * the source state is already spent on-chain. Signals a multi-device
+   * double-spend: another peer of the same wallet committed the
+   * SAME source token to a DIFFERENT destination, and our commit
+   * lost the race.
+   *
+   * Distinct from `transfer:orphan-spending-detected` (crash-window
+   * orphan where the local OUTBOX entry is missing): this event
+   * documents an operator-visible decision the L3 aggregator made
+   * against our intended commit. Operators / UIs route the two
+   * differently.
+   *
+   * Payload fields:
+   *  - `tokenId`              — the source token id our commit
+   *                             targeted.
+   *  - `sourceStateHash`      — imprint hex of the source state hash
+   *                             we tried to spend (the same value
+   *                             we re-queried via `oracle.isSpent`).
+   *  - `ourIntendedRecipient` — `directAddress` / `@nametag` /
+   *                             pubkey we were sending to. Plain
+   *                             string carried for forensics — not
+   *                             authenticated against the on-chain
+   *                             winner's recipient (that disambiguation
+   *                             is Phase 2 work — see Item #14 work
+   *                             items 5+7).
+   *  - `detectedAt`           — wall-clock ms timestamp.
+   *
+   * Phase 2 follow-up: enrich the payload with the winning chain
+   * head once the JOIN-time disambiguation lands (`winningChainHead`).
+   *
+   * Operator action: see `docs/uxf/RUNBOOK-SEND-PIPELINE.md` (Phase 2
+   * work item — runbook section to be added alongside the JOIN-time
+   * Token.status correction).
+   */
+  'transfer:double-spend-detected': {
+    readonly tokenId: string;
+    readonly sourceStateHash: string;
+    readonly ourIntendedRecipient: string;
     readonly detectedAt: number;
   };
   'payment_request:incoming': IncomingPaymentRequest;

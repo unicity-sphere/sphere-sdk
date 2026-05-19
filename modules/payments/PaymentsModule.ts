@@ -11204,16 +11204,20 @@ export class PaymentsModule {
             signingService,
             onChainMessage,
           );
-          const submitResponse = await stClient.submitTransferCommitment(commitment);
-          if (
-            submitResponse.status !== 'SUCCESS' &&
-            submitResponse.status !== 'REQUEST_ID_EXISTS'
-          ) {
-            throw new SphereError(
-              `Transfer commitment failed: ${submitResponse.status}`,
-              'TRANSFER_FAILED',
-            );
-          }
+          // Item #14 Phase 1 — route through the classified-submit
+          // helper so a "state already spent by another commit"
+          // outcome surfaces as `STATE_ALREADY_SPENT_BY_OTHER` (the
+          // outer catch emits `transfer:double-spend-detected`)
+          // rather than the legacy generic `TRANSFER_FAILED`.
+          await this.submitCommitmentClassified(
+            stClient,
+            this.deps?.oracle,
+            commitment,
+            {
+              tokenId: token.id,
+              intendedRecipient: originalRequest.recipient,
+            },
+          );
           let consDirectCommitted = false;
           try {
             consDirectCommitted = true;
@@ -11484,6 +11488,16 @@ export class PaymentsModule {
           );
         }
       }
+
+      // Item #14 Phase 1 — emit `transfer:double-spend-detected` when
+      // the classified-submit helper raised
+      // `STATE_ALREADY_SPENT_BY_OTHER`. The diagnostic payload
+      // (`tokenId`, `sourceStateHash`, `ourIntendedRecipient`) was
+      // stashed via `cause` at the throw site so operators / UIs can
+      // route this case differently from `transfer:orphan-spending-detected`
+      // (crash-window orphan vs. on-chain double-spend loss).
+      this.emitDoubleSpendDetectedIfApplicable(err);
+
       throw err;
     }
 
@@ -12033,16 +12047,20 @@ export class PaymentsModule {
             signingService,
             onChainMessage,
           );
-          const submitResponse = await stClient.submitTransferCommitment(commitment);
-          if (
-            submitResponse.status !== 'SUCCESS' &&
-            submitResponse.status !== 'REQUEST_ID_EXISTS'
-          ) {
-            throw new SphereError(
-              `Transfer commitment failed: ${submitResponse.status}`,
-              'TRANSFER_FAILED',
-            );
-          }
+          // Item #14 Phase 1 — route through the classified-submit
+          // helper so a "state already spent by another commit"
+          // outcome surfaces as `STATE_ALREADY_SPENT_BY_OTHER` (the
+          // outer catch emits `transfer:double-spend-detected`)
+          // rather than the legacy generic `TRANSFER_FAILED`.
+          await this.submitCommitmentClassified(
+            stClient,
+            this.deps?.oracle,
+            commitment,
+            {
+              tokenId: token.id,
+              intendedRecipient: originalRequest.recipient,
+            },
+          );
           // Loop2-C1 — commit is on-chain from this point. Track AND
           // wrap the entire post-submit block in try/finally so
           // removeToken always fires, even if any of the JSON
@@ -12468,6 +12486,13 @@ export class PaymentsModule {
         // drains them and tests can `await sphere.waitForPendingOperations()`.
         this.pendingBackgroundTasks.push(tracked);
       }
+
+      // Item #14 Phase 1 — emit `transfer:double-spend-detected` if
+      // the classified-submit helper raised
+      // `STATE_ALREADY_SPENT_BY_OTHER`. Mirrors the conservative
+      // dispatcher's emit; see that catch for the rationale.
+      this.emitDoubleSpendDetectedIfApplicable(err);
+
       throw err;
     }
 
@@ -12896,6 +12921,160 @@ export class PaymentsModule {
           'OWNERSHIP_VERIFICATION_FAILED',
         );
       }
+    }
+  }
+
+  /**
+   * OUTBOX-SEND-FOLLOWUPS Item #14 Phase 1 — submit a transfer
+   * commitment and classify any non-success / non-idempotent-redirect
+   * response. Wraps `stClient.submitTransferCommitment(commitment)`
+   * to centralise the
+   * `'state-already-spent-by-other'`-vs-`'TRANSFER_FAILED'` decision
+   * for the multi-device double-spend scenario.
+   *
+   * Sequencing:
+   *   1. Submit the commitment.
+   *   2. If `status ∈ {SUCCESS, REQUEST_ID_EXISTS}` — success arc;
+   *      return.
+   *   3. Otherwise, before mapping to generic `TRANSFER_FAILED`,
+   *      re-query the aggregator: `oracle.isSpent(sourceStateHash)`.
+   *      If TRUE, the L3 anchored a competing commit for this source
+   *      state — throw `STATE_ALREADY_SPENT_BY_OTHER` with a
+   *      structured payload so the dispatcher's outer catch can
+   *      emit `transfer:double-spend-detected`.
+   *   4. If `isSpent` returns FALSE or throws, fall back to the
+   *      legacy generic `TRANSFER_FAILED` so today's behaviour for
+   *      transient / verification-failed cases is preserved.
+   *
+   * `sourceStateHash` is the imprint hex of the commitment's source
+   * state — matches the format `oracle.isSpent` expects (same shape
+   * the disposition engine threads to `oracleIsSpent` at §5.3 step
+   * 7).
+   *
+   * The caller MUST pass the `tokenId` + `intendedRecipient` strings
+   * so the typed error carries the diagnostic payload the dispatcher
+   * outer-catch needs to emit the event. The recipient string can be
+   * the `directAddress`, `@nametag`, or chain pubkey — whichever
+   * the caller has in scope at the throw site.
+   */
+  private async submitCommitmentClassified(
+    stClient: StateTransitionClient,
+    oracle: OracleProvider | undefined,
+    commitment: TransferCommitment,
+    classify: {
+      readonly tokenId: string;
+      readonly intendedRecipient: string;
+    },
+  ): Promise<void> {
+    const submitResponse = await stClient.submitTransferCommitment(commitment);
+    if (
+      submitResponse.status === 'SUCCESS' ||
+      submitResponse.status === 'REQUEST_ID_EXISTS'
+    ) {
+      return;
+    }
+
+    // Non-success arc — disambiguate "state already spent by another
+    // commit" from generic failures via an authoritative oracle
+    // re-query against the source state hash.
+    let isSpent = false;
+    let sourceStateHashHex: string | null = null;
+    if (oracle !== undefined && typeof oracle.isSpent === 'function') {
+      try {
+        const sourceStateHashObj = await commitment.transactionData.sourceState.calculateHash();
+        sourceStateHashHex = sourceStateHashObj.toJSON();
+        isSpent = await oracle.isSpent(sourceStateHashHex);
+      } catch (probeErr) {
+        // The probe is best-effort. If it throws (e.g. aggregator
+        // offline), we fall through to the generic
+        // `TRANSFER_FAILED` rather than emitting a false-positive
+        // double-spend event. Operators see the original commit
+        // failure in the standard error stream.
+        logger.warn(
+          'Payments',
+          `submitCommitmentClassified: oracle.isSpent probe threw — falling back to generic TRANSFER_FAILED: ${probeErr instanceof Error ? probeErr.message : String(probeErr)}`,
+        );
+      }
+    }
+
+    if (isSpent && sourceStateHashHex !== null) {
+      // The L3 aggregator anchored a competing commit for this source
+      // state. Surface as the typed code so the dispatcher's outer
+      // catch can emit `transfer:double-spend-detected` for operator
+      // visibility. The structured payload travels through
+      // `cause` — read by the outer catch to populate the event
+      // payload's `sourceStateHash` and `ourIntendedRecipient`.
+      throw new SphereError(
+        `Transfer commitment lost race for source state ${sourceStateHashHex.slice(0, 16)}…: ` +
+          `aggregator confirmed source token ${classify.tokenId.slice(0, 16)}… is already spent ` +
+          `by another commit (submit returned ${submitResponse.status}).`,
+        'STATE_ALREADY_SPENT_BY_OTHER',
+        {
+          tokenId: classify.tokenId,
+          sourceStateHash: sourceStateHashHex,
+          ourIntendedRecipient: classify.intendedRecipient,
+          submitStatus: submitResponse.status,
+        },
+      );
+    }
+
+    throw new SphereError(
+      `Transfer commitment failed: ${submitResponse.status}`,
+      'TRANSFER_FAILED',
+    );
+  }
+
+  /**
+   * Item #14 Phase 1 — inspect a thrown error from
+   * `dispatchUxfConservativeSend` / `dispatchUxfInstantSend`'s outer
+   * catch; if it carries the `STATE_ALREADY_SPENT_BY_OTHER` code AND
+   * a structured diagnostic payload, emit `transfer:double-spend-detected`
+   * for operator visibility.
+   *
+   * Side-effect only — does NOT rethrow. The caller's surrounding
+   * `throw err` propagates the original error to the request site
+   * unchanged.
+   *
+   * Defensive: tolerates missing / partial payload fields (synthesised
+   * defaults rather than skipping the emit) so an upstream code-path
+   * regression that drops the `cause` payload still surfaces an
+   * operator-visible event with the available metadata.
+   */
+  private emitDoubleSpendDetectedIfApplicable(err: unknown): void {
+    if (!(err instanceof SphereError)) return;
+    if (err.code !== 'STATE_ALREADY_SPENT_BY_OTHER') return;
+    // The classified-submit helper stashed the structured payload via
+    // `cause` (redacted into `context` by `SphereError`'s constructor).
+    // Read it defensively — a future refactor that drops the cause
+    // payload should still surface an event with the available fields.
+    const ctx = err.context;
+    const payload: SphereEventMap['transfer:double-spend-detected'] = {
+      tokenId:
+        (ctx as { tokenId?: unknown })?.tokenId !== undefined &&
+        typeof (ctx as { tokenId?: unknown }).tokenId === 'string'
+          ? ((ctx as { tokenId: string }).tokenId)
+          : '',
+      sourceStateHash:
+        (ctx as { sourceStateHash?: unknown })?.sourceStateHash !== undefined &&
+        typeof (ctx as { sourceStateHash?: unknown }).sourceStateHash === 'string'
+          ? ((ctx as { sourceStateHash: string }).sourceStateHash)
+          : '',
+      ourIntendedRecipient:
+        (ctx as { ourIntendedRecipient?: unknown })?.ourIntendedRecipient !== undefined &&
+        typeof (ctx as { ourIntendedRecipient?: unknown }).ourIntendedRecipient === 'string'
+          ? ((ctx as { ourIntendedRecipient: string }).ourIntendedRecipient)
+          : '',
+      detectedAt: Date.now(),
+    };
+    try {
+      this.deps?.emitEvent('transfer:double-spend-detected', payload);
+    } catch (emitErr) {
+      // Emitter failures must not mask the original double-spend
+      // throw. Log and move on.
+      logger.warn(
+        'Payments',
+        `emitDoubleSpendDetectedIfApplicable: emit threw (swallowed): ${emitErr instanceof Error ? emitErr.message : String(emitErr)}`,
+      );
     }
   }
 

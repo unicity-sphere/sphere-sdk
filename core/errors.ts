@@ -53,6 +53,24 @@ export type SphereErrorCode =
   // `{ allowResurrection: true }` as the second argument for
   // operator escape-hatch / test-fixture resurrections.
   | 'OUTBOX_ENTRY_TOMBSTONED'
+  // OUTBOX-SEND-FOLLOWUPS Item #14 Phase 1 — typed throw for the
+  // multi-device double-spend case. The aggregator rejected our
+  // `submitTransferCommitment` because the source `stateHash` is
+  // already spent on-chain. The dispatcher re-queries
+  // `oracle.isSpent(sourceStateHash)` to disambiguate from generic
+  // commit failures; on confirmed spent it raises this code with a
+  // structured `details` payload carrying `tokenId`, `sourceStateHash`,
+  // and `ourIntendedRecipient` so the outer dispatch catch can emit
+  // `transfer:double-spend-detected` for operator visibility.
+  //
+  // Distinct from generic `TRANSFER_FAILED`: this code signals a
+  // documented multi-device race (two peers concurrently spent the
+  // SAME source token to DIFFERENT destinations; the loser sees this
+  // code). The winning peer's commit IS on-chain — the loser's
+  // bundle was never delivered.
+  //
+  // See docs/uxf/OUTBOX-SEND-FOLLOWUPS.md Item #14.
+  | 'STATE_ALREADY_SPENT_BY_OTHER'
   | 'STORAGE_ERROR'
   | 'STORAGE_CORRUPTED'
   | 'TRANSPORT_ERROR'

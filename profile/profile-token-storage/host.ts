@@ -37,10 +37,12 @@ import type {
   TxfSentEntry,
 } from '../../storage/storage-provider.js';
 import type {
+  ProfileSnapshotPublishResult,
   ProfileTokenStorageProviderOptions,
 } from '../types.js';
 import type { ProfileDatabase } from '../orbitdb-adapter.js';
 import type { TokenManifest } from '../token-manifest.js';
+import type { ApplySnapshotResult } from '../profile-snapshot-dispatcher.js';
 
 /**
  * Operational state extracted from `TxfStorageDataBase`. Mirrored from
@@ -199,4 +201,80 @@ export interface ProfileTokenStorageHost {
     sent: TxfSentEntry[];
     history: HistoryRecord[];
   }): Promise<boolean>;
+
+  /**
+   * Item #15 Phase C — signal the host that some local profile state
+   * has changed and should be included in the next lean-snapshot
+   * publish. Called by per-writer mutations (OutboxWriter,
+   * SentLedgerWriter, BundleIndex, etc.) and by JOIN-applied remote
+   * changes. The host's implementation debounces these signals via the
+   * FlushScheduler (Phase C.2/D wires the actual snapshot build).
+   *
+   * MUST be non-throwing — writers invoke this inside guarded
+   * try/catch so a misbehaving host cannot break a mutation path.
+   */
+  notifyProfileDirty(): void;
+
+  /**
+   * Item #15 Phase D.1b — synchronously invoke the wired
+   * `onProfileDirtyFlush` callback (lean-snapshot build + pin +
+   * publish) coordinated with the dispatch debounce so we don't
+   * double-publish. Used by `FlushScheduler.flushToIpfs()` to publish
+   * a SNAPSHOT CID via the aggregator pointer layer instead of the
+   * legacy BUNDLE CID.
+   *
+   * Semantics:
+   *   - Returns `null` when no `onProfileDirtyFlush` callback is wired
+   *     (legacy tests / providers without the Phase C.3 closure).
+   *     Caller falls back to the legacy bundle-CID publish.
+   *   - Coordinates with the dirty-flush debouncer: cancels any armed
+   *     timer, awaits any in-flight dispatch, clears the pending latch
+   *     before running so a follow-up `notifyProfileDirty()` re-arms
+   *     for the next signal.
+   *   - On success, returns the publisher's structured result.
+   *   - On an unexpected throw from the callback (programmer error or
+   *     transient publish failure surfaced as `runProfileDirtyFlush`'s
+   *     internal throw), emits `storage:error`
+   *     (`PROFILE_DIRTY_FLUSH_FAILED`) and re-throws so the caller
+   *     can decide ack semantics (e.g. flush-scheduler propagates to
+   *     `forceFlushSerialized`'s rejection arm to hold the at-least-
+   *     once gate closed).
+   *
+   * Distinct from `notifyProfileDirty()` (which schedules a debounced
+   * fire) — this entry point fires NOW and returns the result.
+   */
+  publishSnapshotIfWired(): Promise<ProfileSnapshotPublishResult | null>;
+
+  /**
+   * Item #15 Phase E follow-up — pull-side symmetric counterpart to
+   * {@link publishSnapshotIfWired}. Fetches the snapshot CAR for the
+   * given CID, parses it as a {@link LeanProfileSnapshot}, and
+   * dispatches per-writer JOIN through the factory-wired snapshot
+   * applier. Used by `LifecycleManager.runPointerPollOnce` and
+   * `recoverFromAggregatorPointerBestEffort` so the periodic-poll and
+   * cold-start recovery paths consume the pointer's CID as a snapshot
+   * (Item #15) rather than as a UXF bundle CID (the pre-Item-#15
+   * legacy that wrote the snapshot bytes into the bundle index and
+   * blew up on the next load()).
+   *
+   * Semantics:
+   *   - Returns `null` when no `onApplySnapshot` callback is wired
+   *     (legacy tests / providers without the factory closure). Caller
+   *     logs and skips — no legacy bundle-CID fallback per Phase E.
+   *   - On success: returns the dispatcher's
+   *     {@link ApplySnapshotResult} (counters, joinedAny, etc.).
+   *   - On hard failure (CAR fetch, parse, or dispatcher throw):
+   *     re-throws so the caller's outer try/catch can log + skip the
+   *     re-arm round. The pointer cursor is NOT advanced by this path
+   *     (cursor advancement only happens through `fetchAndJoin` on the
+   *     reconcile-loop path); a transient failure on the periodic
+   *     poll is best-effort.
+   *
+   * IMPORTANT: this method does NOT touch the pointer's local-version
+   * cursor — both the poll and recovery paths originate outside the
+   * cursor-advancement protocol (they consume `recoverLatest()` which
+   * the pointer layer already classified). The cursor advance is owned
+   * by the reconcile loop's `fetchAndJoin` callback exclusively.
+   */
+  applySnapshotIfWired(cidString: string): Promise<ApplySnapshotResult | null>;
 }

@@ -59,7 +59,7 @@ import {
 /**
  * Lifecycle status of a {@link UxfTransferOutboxEntry}.
  *
- * The exact 10 strings are stable on-disk; see {@link UXF_OUTBOX_STATUSES}
+ * The exact 11 strings are stable on-disk; see {@link UXF_OUTBOX_STATUSES}
  * for runtime iteration and the snapshot test for the stability contract.
  *
  * - `packaging`          — building UXF bundle (UXF modes only).
@@ -71,6 +71,12 @@ import {
  * - `finalized`          — proof attached locally; instant mode terminal.
  * - `failed-transient`   — delivery or finalization failed; retry pending.
  * - `failed-permanent`   — unrecoverable (oracle rejection, race-lost, etc.).
+ * - `failed-conflict`    — multi-device double-spend (OUTBOX-SEND-FOLLOWUPS
+ *                          Item #14 Phase 1): the aggregator rejected our
+ *                          commit because the source state was already
+ *                          spent by ANOTHER device's commit. Terminal
+ *                          except via the operator-override escape hatch
+ *                          (same semantics as `failed-permanent`).
  * - `expired`            — retention window elapsed; entry GC'd.
  */
 export type UxfOutboxStatus =
@@ -83,6 +89,7 @@ export type UxfOutboxStatus =
   | 'finalized'
   | 'failed-transient'
   | 'failed-permanent'
+  | 'failed-conflict'
   | 'expired';
 
 /**
@@ -103,6 +110,7 @@ export const UXF_OUTBOX_STATUSES: ReadonlyArray<UxfOutboxStatus> = [
   'finalized',
   'failed-transient',
   'failed-permanent',
+  'failed-conflict',
   'expired',
 ] as const;
 
@@ -123,7 +131,7 @@ export type OutboxStatusPartition = 'active' | 'soft-terminal' | 'hard-terminal'
  *
  * Active set:        packaging, pinned, sending, delivered, delivered-instant, finalizing
  * Soft-terminal set: failed-transient
- * Hard-terminal set: expired, finalized, failed-permanent
+ * Hard-terminal set: expired, finalized, failed-permanent, failed-conflict
  */
 export function partitionStatus(s: UxfOutboxStatus): OutboxStatusPartition {
   switch (s) {
@@ -138,6 +146,7 @@ export function partitionStatus(s: UxfOutboxStatus): OutboxStatusPartition {
       return 'soft-terminal';
     case 'finalized':
     case 'failed-permanent':
+    case 'failed-conflict':
     case 'expired':
       return 'hard-terminal';
   }

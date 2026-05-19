@@ -460,11 +460,94 @@ export class ProfileStorageProvider implements StorageProvider {
   private pointerBuildPromise: Promise<void> | null = null;
 
   /**
+   * Item #15 Phase C — host-supplied "profile state changed" callback.
+   * When set, every {@link OutboxWriter} / {@link SentLedgerWriter} /
+   * {@link OrbitDbFinalizationQueueStorageAdapter} /
+   * {@link OrbitDbRecipientContextStorageAdapter} produced by the
+   * `build*` factories is wired with this callback. Mutations and
+   * JOIN-applied remote changes invoke it to signal the host's
+   * FlushScheduler.
+   *
+   * Null until {@link setProfileDirtyNotifier} runs (typically during
+   * Sphere's wiring step alongside the token-storage facade). Writers
+   * constructed before the notifier is set treat the callback as
+   * absent — they simply don't emit dirty signals. This matches the
+   * Phase A/B contract (the existing pre-#15 flush path is
+   * functionally complete without the dirty signals).
+   */
+  private profileDirtyNotifier: (() => void) | null = null;
+
+  /**
+   * Item #15 Phase D.2 / E — host-supplied snapshot-apply callback.
+   * REQUIRED for pointer-layer construction under Phase E: the
+   * `fetchAndJoin` callback parses each remote CAR as a lean profile
+   * snapshot and dispatches per-writer JOIN through this callback.
+   * The legacy bundle-CID-only write path was removed in Phase E, so
+   * `tryBuildPointerLayer` skips with the `snapshot_applier_missing`
+   * reason when this is null.
+   *
+   * Null until {@link setSnapshotApplier} runs (typically during the
+   * Profile factory wiring step alongside the token-storage facade,
+   * AFTER both providers are constructed so the closure can capture
+   * `storage.buildOutboxWriter(...)` and `tokenStorage.getBundleIndex()`).
+   *
+   * The applier is read each time `tryBuildPointerLayer` runs (i.e.
+   * each attach cycle), so callers may change it across reconnects.
+   * In practice the factory sets it once at construction.
+   */
+  private snapshotApplier:
+    | ((snapshot: import('./profile-lean-snapshot').LeanProfileSnapshot)
+        => Promise<import('./profile-snapshot-dispatcher').ApplySnapshotResult>)
+    | null = null;
+
+  /**
    * Derived: true iff OrbitDB has been attached.
    * Single source of truth — no separate `dbConnected` field to diverge.
    */
   private get dbConnected(): boolean {
     return this.dbStatus === 'attached';
+  }
+
+  /**
+   * Item #15 Phase C — register the host's "profile dirty" callback.
+   * Idempotent: callers MAY re-register (the most recent callback
+   * wins). Pass `null` to disable.
+   *
+   * The notifier propagates into every writer/adapter built AFTER
+   * this call via the `build*` factories. Writers built BEFORE the
+   * call continue with their construction-time notifier (or with
+   * none if they were built without one). Sphere's wiring sets the
+   * notifier early enough that the typical wallet-build path picks
+   * it up.
+   */
+  setProfileDirtyNotifier(notifier: (() => void) | null): void {
+    this.profileDirtyNotifier = notifier;
+  }
+
+  /**
+   * Item #15 Phase D.2 / E — register the host's snapshot-apply
+   * callback. Idempotent: callers MAY re-register (the most recent
+   * callback wins). Pass `null` to disable.
+   *
+   * The applier is threaded into the pointer-wiring layer on the next
+   * `tryBuildPointerLayer` run (called from `doConnect`); callers
+   * should set it BEFORE the first `connect()` call so it lands on
+   * the first attach cycle. The factory wires it during provider
+   * construction, satisfying this ordering.
+   *
+   * Phase E made the applier REQUIRED for pointer-layer construction.
+   * Passing `null` causes the next `tryBuildPointerLayer` run to skip
+   * with the `snapshot_applier_missing` reason — the wallet runs
+   * without aggregator-pointer recovery rather than silently writing
+   * the wrong CAR shape to the bundle index.
+   */
+  setSnapshotApplier(
+    applier:
+      | ((snapshot: import('./profile-lean-snapshot').LeanProfileSnapshot)
+          => Promise<import('./profile-snapshot-dispatcher').ApplySnapshotResult>)
+      | null,
+  ): void {
+    this.snapshotApplier = applier;
   }
 
   constructor(
@@ -727,10 +810,25 @@ export class ProfileStorageProvider implements StorageProvider {
       ? `${orbitDbDir.replace(/\/+$/, '')}/profile-pointer-publish.lock`
       : undefined;
 
+    // Item #15 Phase E: the pointer layer requires the snapshot applier
+    // — the legacy bundle-CID-only fallback has been removed. Skip the
+    // build with the dedicated `snapshot_applier_missing` reason instead
+    // of constructing a layer whose `fetchAndJoin` would crash on first
+    // remote. (`buildProfilePointerLayer` performs the same check, but
+    // bailing here is cheaper and exposes the contract at the call site.)
+    if (!this.snapshotApplier) {
+      this.pointerLayer = null;
+      this.pointerSkipReason = 'snapshot_applier_missing';
+      logger.warn(
+        'ProfileStorage',
+        'pointer layer skipped: snapshot_applier_missing (factory wiring incomplete)',
+      );
+      return;
+    }
+
     const result = await buildProfilePointerLayer({
       identity,
       localCache: this.localCache,
-      db: this.db,
       oracle,
       ipfsGateways: gateways,
       lockFilePath,
@@ -738,6 +836,13 @@ export class ProfileStorageProvider implements StorageProvider {
       // the pointer layer's master-key construction can reject the
       // canonical 0x01×32 KAT vector outside test-vectors deployments.
       network: this.options?.config?.network,
+      // Item #15 Phase D.2 / E — required. Thread the host's snapshot
+      // applier (set via `setSnapshotApplier` during factory wiring)
+      // into the pointer-wiring layer. The pointer layer's
+      // `fetchAndJoin` callback parses each remote CAR as a lean
+      // profile snapshot and dispatches per-writer JOIN through this
+      // callback.
+      applySnapshot: this.snapshotApplier,
       debug: this.debug,
     });
 
@@ -844,6 +949,10 @@ export class ProfileStorageProvider implements StorageProvider {
     return new OrbitDbDispositionStorageAdapter({
       db: this.db,
       encryptionKey: this.profileEncryptionKey,
+      // Item #15 Phase B.4 — thread the dirty notifier into the adapter
+      // so the four PrefixSyncWriters returned by `syncWritersFor` mark
+      // the profile dirty when JOIN-applied remote records land.
+      notifyProfileDirty: this.profileDirtyNotifier ?? undefined,
     });
   }
 
@@ -864,6 +973,7 @@ export class ProfileStorageProvider implements StorageProvider {
     return new OrbitDbFinalizationQueueStorageAdapter({
       db: this.db,
       encryptionKey: this.profileEncryptionKey,
+      notifyProfileDirty: this.profileDirtyNotifier ?? undefined,
     });
   }
 
@@ -882,6 +992,7 @@ export class ProfileStorageProvider implements StorageProvider {
     return new OrbitDbRecipientContextStorageAdapter({
       db: this.db,
       encryptionKey: this.profileEncryptionKey,
+      notifyProfileDirty: this.profileDirtyNotifier ?? undefined,
     });
   }
 
@@ -924,6 +1035,7 @@ export class ProfileStorageProvider implements StorageProvider {
       encryptionKey: this.profileEncryptionKey,
       addressId,
       lamport: lamport ?? new Lamport(),
+      notifyProfileDirty: this.profileDirtyNotifier ?? undefined,
     });
   }
 
@@ -958,6 +1070,7 @@ export class ProfileStorageProvider implements StorageProvider {
       encryptionKey: this.profileEncryptionKey,
       addressId,
       lamport: lamport ?? new Lamport(),
+      notifyProfileDirty: this.profileDirtyNotifier ?? undefined,
     });
   }
 

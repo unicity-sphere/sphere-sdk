@@ -65,6 +65,7 @@ import type {
   StorageProvider,
 } from '../storage/storage-provider.js';
 import {
+  type ProfileSnapshotPublishResult,
   type ProfileTokenStorageProviderOptions,
 } from './types.js';
 import type { ProfileDatabase } from './orbitdb-adapter.js';
@@ -131,6 +132,38 @@ export class ProfileTokenStorageProvider
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private flushPromise: Promise<void> | null = null;
   private readonly flushDebounceMs: number;
+
+  // --- Item #15 Phase C.2 — dirty-signal debounce ---
+  /**
+   * Debounce timer armed by `notifyProfileDirty()`. Separate from
+   * `flushTimer` because the lean-snapshot publish path is independent
+   * of the token-bundle pin path (each can fire without the other).
+   * Phase E will collapse the two when the bundle-only publish is
+   * removed.
+   */
+  private dirtyFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * In-flight dirty-flush promise. Held to serialize concurrent
+   * dispatches (a second notifyProfileDirty() that arrives mid-flush
+   * gets coalesced into the next debounce window).
+   */
+  private dirtyFlushPromise: Promise<void> | null = null;
+  /**
+   * Latch — set when `notifyProfileDirty()` is called during an
+   * in-flight flush. Re-arms the debounce after the current flush
+   * settles so we don't lose the signal.
+   */
+  private dirtyFlushPending = false;
+  /**
+   * Sticky latch — true once {@link shutdown} has completed at least
+   * once. Distinct from `isShuttingDown` (which is reset to `false`
+   * at the end of shutdown so re-arming-shutdown-on-restart works)
+   * and from `status === 'disconnected'` (which is also the
+   * pre-connect default). Used by `notifyProfileDirty` to ignore
+   * late-arriving signals from writers that outlive the provider.
+   */
+  private hasShutdown = false;
+  private readonly dirtyFlushDebounceMs: number;
 
   // --- Cold-start sync dedup (steelman) ---
   // When two sync() calls race during cold-start, both observe
@@ -250,6 +283,10 @@ export class ProfileTokenStorageProvider
     this.localCache = localCache ?? null;
     this.flushDebounceMs =
       options?.flushDebounceMs ?? options?.config?.flushDebounceMs ?? DEFAULT_FLUSH_DEBOUNCE_MS;
+    // Item #15 Phase C.2 — dirty-signal debounce. Default matches the
+    // bundle-flush debounce; tunable via options for tests.
+    this.dirtyFlushDebounceMs =
+      options?.dirtyFlushDebounceMs ?? this.flushDebounceMs;
 
     if (encryptionKey) {
       this.encryptionKey = encryptionKey;
@@ -262,7 +299,7 @@ export class ProfileTokenStorageProvider
     this.bundleIndex = new BundleIndex(host);
     this.historyStore = new HistoryStore(host);
     this.lifecycleManager = new LifecycleManager(host, this.bundleIndex);
-    this.flushScheduler = new FlushScheduler(host, this.bundleIndex, this.lifecycleManager);
+    this.flushScheduler = new FlushScheduler(host, this.bundleIndex);
   }
 
   // ---------------------------------------------------------------------------
@@ -391,7 +428,345 @@ export class ProfileTokenStorageProvider
       // Operational state persistence
       writeOrbitOperationalState: (opState) => this.writeOrbitOperationalState(opState),
       writeLocalDerivedCache: (opState) => this.writeLocalDerivedCache(opState),
+      // Item #15 Phase C — dirty-signal entry point. The bundle index and
+      // (future) lean-snapshot debounce wiring call this on any local
+      // mutation. Today the implementation is a no-op stub: Phase C.2
+      // wires a debounced FlushScheduler trigger here behind the
+      // `features.fullProfileSnapshotSync` flag.
+      notifyProfileDirty: () => this.notifyProfileDirty(),
+      // Item #15 Phase D.1b — synchronous lean-snapshot publish for
+      // FlushScheduler. Returns `null` when no `onProfileDirtyFlush`
+      // callback is wired (legacy tests fall back to the bundle-CID
+      // publish). Coordinates with the dirty-flush debouncer so we
+      // don't double-publish.
+      publishSnapshotIfWired: () => this.publishSnapshotIfWired(),
+      // Item #15 Phase E follow-up — pull-side counterpart for the
+      // periodic-poll and cold-start recovery paths in
+      // LifecycleManager. Returns null when no factory closure is wired
+      // (legacy tests); else fetches the CAR, parses as lean snapshot,
+      // and dispatches per-writer JOIN through the host's applier.
+      applySnapshotIfWired: (cid) => this.applySnapshotIfWired(cid),
     };
+  }
+
+  /**
+   * Item #15 Phase C — central handler for "some profile state changed"
+   * signals from per-writer mutations and JOIN-applied remote changes.
+   *
+   * Arms (or re-arms) a debounce timer. When the timer fires, the
+   * host-injected `onProfileDirtyFlush` callback runs. Sphere wires
+   * that callback to build a lean profile snapshot, pin it to IPFS,
+   * and publish the CID via the aggregator pointer layer.
+   *
+   * Coalescing semantics:
+   *   - Multiple notifyProfileDirty() calls within `dirtyFlushDebounceMs`
+   *     coalesce into a single fire (last-one-wins on the timer reset).
+   *   - A signal that arrives DURING an in-flight flush sets
+   *     `dirtyFlushPending = true`. When the flush settles, the next
+   *     debounce window is armed automatically so we don't lose the
+   *     signal.
+   *   - When `onProfileDirtyFlush` is absent (default during Phase C
+   *     rollout), the timer still arms but the fire body is a no-op
+   *     beyond the latch handling. This lets tests assert the wiring
+   *     end-to-end without needing the full Sphere closure.
+   *
+   * Cancelled on shutdown — see {@link cancelDirtyFlushTimer} (invoked
+   * by the lifecycle manager's shutdown path).
+   *
+   * Wired into:
+   *   - BundleIndex.addBundle / joinSnapshot (this provider's bundle ref)
+   *   - OutboxWriter / SentLedgerWriter / PrefixSyncWriter (via their own
+   *     notifyProfileDirty callbacks plumbed by ProfileStorageProvider)
+   *   - OrbitDb{Finalization,RecipientContext}StorageAdapter writeKey /
+   *     deleteKey paths
+   *
+   * Public so the factory's bridge from
+   * `ProfileStorageProvider.setProfileDirtyNotifier` can delegate
+   * here. The host's `notifyProfileDirty` (used by internal sub-modules
+   * like BundleIndex) routes through the same body via the host
+   * interface.
+   */
+  notifyProfileDirty(): void {
+    if (this.isShuttingDown || this.hasShutdown) return;
+
+    // If a flush is in flight, record that another arrived and let
+    // the in-flight one settle. The post-flush hook re-arms the timer.
+    if (this.dirtyFlushPromise !== null) {
+      this.dirtyFlushPending = true;
+      return;
+    }
+
+    // Clear any existing timer — this is a debounce reset.
+    if (this.dirtyFlushTimer !== null) {
+      clearTimeout(this.dirtyFlushTimer);
+    }
+
+    this.dirtyFlushTimer = setTimeout(() => {
+      this.dirtyFlushTimer = null;
+      this.dispatchDirtyFlush();
+    }, this.dirtyFlushDebounceMs);
+  }
+
+  /**
+   * Item #15 Phase C.2 — invoke the host-injected
+   * `onProfileDirtyFlush` callback (if wired). Errors are caught and
+   * surfaced via `storage:error` with a typed code; they never
+   * propagate into the caller's path because the dirty signal is
+   * best-effort by design.
+   *
+   * If another `notifyProfileDirty()` arrived while this flush was
+   * running, re-arm the debounce so the next signal isn't lost.
+   */
+  private dispatchDirtyFlush(): void {
+    if (this.isShuttingDown) return;
+    const callback = this.options?.onProfileDirtyFlush;
+    if (typeof callback !== 'function') {
+      // No-op fire path. This is the default during Phase C rollout —
+      // Phase D wires the actual lean-snapshot build + publish.
+      this.consumePendingDirtyFlag();
+      return;
+    }
+
+    const flush = (async () => {
+      try {
+        await callback();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.log(`onProfileDirtyFlush failed: ${msg}`);
+        this.emitEvent(
+          this.buildErrorEvent(
+            'storage:error',
+            err,
+            'PROFILE_DIRTY_FLUSH_FAILED',
+          ),
+        );
+      }
+    })().finally(() => {
+      // Identity-check — only clear if we are the most recent flush.
+      // A concurrent flush dispatched mid-await would have replaced
+      // `dirtyFlushPromise`; clearing wholesale would clobber it.
+      if (this.dirtyFlushPromise === flush) {
+        this.dirtyFlushPromise = null;
+      }
+      this.consumePendingDirtyFlag();
+    });
+    this.dirtyFlushPromise = flush;
+  }
+
+  /**
+   * Item #15 Phase C.2 — if a notifyProfileDirty() call arrived
+   * during the just-completed flush, re-arm the debounce so we don't
+   * lose the signal. Called from the dispatch path's `.finally`.
+   */
+  private consumePendingDirtyFlag(): void {
+    if (!this.dirtyFlushPending) return;
+    this.dirtyFlushPending = false;
+    // Re-arm — guarded against shutdown.
+    if (this.isShuttingDown) return;
+    this.notifyProfileDirty();
+  }
+
+  /**
+   * Cancel any armed dirty-flush debounce timer. Called by the
+   * lifecycle manager during shutdown to prevent late-firing
+   * callbacks after the provider has been torn down.
+   *
+   * Does NOT abort an in-flight `dirtyFlushPromise` — the lifecycle
+   * manager awaits that separately via the host.
+   */
+  cancelDirtyFlushTimer(): void {
+    if (this.dirtyFlushTimer !== null) {
+      clearTimeout(this.dirtyFlushTimer);
+      this.dirtyFlushTimer = null;
+    }
+    // Clear any pending latch — the shutdown path won't re-arm.
+    this.dirtyFlushPending = false;
+  }
+
+  /**
+   * Item #15 Phase C.2 — await the most recent dirty-flush dispatch
+   * if one is in flight. Returns immediately when no flush is active.
+   * Used by `shutdown()` and tests.
+   */
+  awaitDirtyFlushSettled(): Promise<void> {
+    return this.dirtyFlushPromise ?? Promise.resolve();
+  }
+
+  /**
+   * Item #15 Phase D.1b — synchronously invoke the wired
+   * `onProfileDirtyFlush` callback (lean-snapshot build + pin +
+   * publish) for the FlushScheduler. Replaces the legacy bundle-CID
+   * publish at the end of `flushToIpfs()` when a snapshot publisher
+   * is wired.
+   *
+   * Semantics:
+   *   - Returns `null` when no `onProfileDirtyFlush` callback is
+   *     configured (legacy tests / providers without the Phase C.3
+   *     closure). Caller (FlushScheduler) falls back to legacy
+   *     bundle-CID publish via `LifecycleManager.publishAggregator
+   *     PointerBestEffort()`.
+   *   - Cancels any armed dirty-flush debounce timer so the
+   *     debouncer doesn't separately fire a redundant publish for
+   *     the same writer-side mutations that triggered this flush.
+   *   - Awaits any in-flight `dirtyFlushPromise` so concurrent
+   *     dispatches serialize. The `dirtyFlushPending` latch is
+   *     cleared after our run so a follow-up `notifyProfileDirty()`
+   *     (arriving during this synchronous fire) re-arms cleanly.
+   *   - Tracks our own run as `dirtyFlushPromise` so a concurrent
+   *     `notifyProfileDirty()` observes us as in-flight and latches
+   *     `dirtyFlushPending` instead of starting a parallel fire.
+   *   - On success: returns the publisher's structured
+   *     `ProfileSnapshotPublishResult`. A `void` return from the
+   *     callback (legacy `() => Promise<void>` shape) is normalised
+   *     to `{ ok: true, transient: false }`.
+   *   - On throw (programmer error OR
+   *     `runProfileDirtyFlush`'s transient-failure throw): emits
+   *     `storage:error` with code `PROFILE_DIRTY_FLUSH_FAILED`
+   *     (matching the debouncer's surfacing contract) and re-throws
+   *     so FlushScheduler can propagate to `forceFlushSerialized`'s
+   *     rejection arm — holding the at-least-once gate closed until
+   *     the publish lands.
+   *
+   * The shutdown gate (`isShuttingDown` / `hasShutdown`) returns
+   * `null` so a flush mid-shutdown skips the snapshot publish
+   * entirely (the lifecycle's shutdown sequence drains the existing
+   * dirty-flush promise separately).
+   */
+  async publishSnapshotIfWired(): Promise<ProfileSnapshotPublishResult | null> {
+    if (this.isShuttingDown || this.hasShutdown) return null;
+    const callback = this.options?.onProfileDirtyFlush;
+    if (typeof callback !== 'function') return null;
+
+    // Cancel any armed debounce — we're firing now, so the debouncer's
+    // follow-up fire would be redundant for the same writer mutations.
+    if (this.dirtyFlushTimer !== null) {
+      clearTimeout(this.dirtyFlushTimer);
+      this.dirtyFlushTimer = null;
+    }
+
+    // Drain any in-flight dispatch so we serialize. Bounded by one
+    // hop — the in-flight callback either settles or throws; we
+    // observe whichever and proceed.
+    if (this.dirtyFlushPromise !== null) {
+      try {
+        await this.dirtyFlushPromise;
+      } catch {
+        // Prior dispatch surfaced its error via storage:error in its
+        // own catch arm; we don't propagate it here.
+      }
+    }
+
+    // Clear the pending latch — our synchronous fire covers any
+    // signal that arrived before this call. A signal arriving DURING
+    // our fire will re-set the latch via notifyProfileDirty()'s
+    // `if (dirtyFlushPromise !== null)` branch (because we publish
+    // our own tracked promise below).
+    this.dirtyFlushPending = false;
+
+    const flushBody = (async () => {
+      const result = await callback();
+      return result ?? ({ ok: true, transient: false } as const);
+    })();
+
+    // Track our run so a concurrent `notifyProfileDirty()` observes
+    // us as in-flight and latches `dirtyFlushPending` rather than
+    // starting a parallel fire.
+    const tracked: Promise<void> = flushBody.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.dirtyFlushPromise = tracked;
+
+    try {
+      return await flushBody;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.log(`publishSnapshotIfWired (synchronous fire) failed: ${msg}`);
+      this.emitEvent(
+        this.buildErrorEvent(
+          'storage:error',
+          err,
+          'PROFILE_DIRTY_FLUSH_FAILED',
+        ),
+      );
+      throw err;
+    } finally {
+      // Identity-check so a follow-up `notifyProfileDirty()` that
+      // replaced our tracked promise (extremely unlikely under
+      // serialization, but defensive) is not clobbered.
+      if (this.dirtyFlushPromise === tracked) {
+        this.dirtyFlushPromise = null;
+      }
+      // If a notification arrived during our fire, re-arm the debounce
+      // so the next signal isn't lost. Mirrors `consumePendingDirtyFlag`.
+      if (this.dirtyFlushPending && !this.isShuttingDown && !this.hasShutdown) {
+        this.dirtyFlushPending = false;
+        this.notifyProfileDirty();
+      }
+    }
+  }
+
+  /**
+   * Item #15 Phase E follow-up — late-bound pull-side snapshot applier.
+   * Falls back to `options.onApplySnapshot` (construction-time) if
+   * never set; otherwise the most recent registration wins. Set by
+   * the factory after `tokenStorage` has been constructed so the
+   * closure can reference `tokenStorage.getBundleIndex()` (which would
+   * otherwise be a forward reference at construction time).
+   */
+  private applySnapshotCallback:
+    | ((cidString: string)
+        => Promise<import('./profile-snapshot-dispatcher.js').ApplySnapshotResult>)
+    | null = null;
+
+  /**
+   * Item #15 Phase E follow-up — install / replace the pull-side
+   * snapshot applier. Idempotent: callers MAY re-register; pass `null`
+   * to disable.
+   *
+   * Used by `profile/factory.ts:createProfileProviders` to install the
+   * closure that backs `applySnapshotIfWired()` — the closure
+   * references `tokenStorage.getBundleIndex()` so it must be set AFTER
+   * the provider is constructed (forward-reference at construction
+   * time).
+   */
+  setApplySnapshotCallback(
+    callback:
+      | ((cidString: string)
+          => Promise<import('./profile-snapshot-dispatcher.js').ApplySnapshotResult>)
+      | null,
+  ): void {
+    this.applySnapshotCallback = callback;
+  }
+
+  /**
+   * Item #15 Phase E follow-up — pull-side counterpart to
+   * {@link publishSnapshotIfWired}. Invokes the host-injected applier
+   * (if wired) for the given snapshot CID.
+   *
+   * Returns `null` when no factory closure is wired (legacy tests /
+   * providers without the Phase E follow-up factory closure). On a
+   * wired path the callback fetches the CAR, parses it as a lean
+   * snapshot, and dispatches per-writer JOIN through the same
+   * `runProfileSnapshotApply` closure that backs the pointer-wiring
+   * layer's reconcile path. Errors propagate to the caller so the
+   * periodic-poll / recovery wrapper can log + skip the re-arm.
+   *
+   * The shutdown gate returns `null` so a poll iteration mid-shutdown
+   * skips the apply entirely. The lifecycle's shutdown sequence runs
+   * its own teardown ordering; this method only declines to do new
+   * work after the gate has closed.
+   */
+  async applySnapshotIfWired(
+    cidString: string,
+  ): Promise<import('./profile-snapshot-dispatcher.js').ApplySnapshotResult | null> {
+    if (this.isShuttingDown || this.hasShutdown) return null;
+    // Late-bound setter wins; falls back to construction-time option
+    // for callers that prefer the static-config style.
+    const callback =
+      this.applySnapshotCallback ?? this.options?.onApplySnapshot ?? null;
+    if (typeof callback !== 'function') return null;
+    return callback(cidString);
   }
 
   // ---------------------------------------------------------------------------
@@ -422,6 +797,59 @@ export class ProfileTokenStorageProvider
     this.lifecycleManager.setIdentity(identity);
   }
 
+  /**
+   * Item #15 Phase C.3 — public read accessor for the bound identity.
+   * Returns `null` until {@link setIdentity} has been called.
+   *
+   * Exposed for host wiring (factory's `onProfileDirtyFlush` closure)
+   * that needs the wallet's `chainPubkey` to build a lean profile
+   * snapshot. The closure must tolerate `null` (snapshot build is
+   * skipped pre-identity).
+   */
+  getIdentity(): FullIdentity | null {
+    return this.identity;
+  }
+
+  /**
+   * Item #15 Phase D.1a — public delegate for publishing a lean
+   * snapshot CID via the aggregator pointer layer. Routes through
+   * `LifecycleManager.publishAggregatorPointerBestEffort` so the
+   * publish picks up:
+   *   - pending-publish-marker persistence on transient failure;
+   *   - permanent-vs-transient error classification;
+   *   - `storage:error` emission on permanent failure;
+   *   - automatic retry on the next `flushToIpfs` / pointer-poll cycle.
+   *
+   * Exposed for the factory's `onProfileDirtyFlush` closure (Phase D.1a)
+   * and the flush-scheduler's snapshot-publish call site (Phase D.1b).
+   * Direct callers should treat the result as authoritative — the
+   * publish has either landed, deferred for retry, or surfaced an
+   * operator alert. The `ProfileSnapshotPublishResult` shape matches
+   * the underlying lifecycle method 1:1.
+   */
+  publishLeanSnapshotCid(
+    cidString: string,
+  ): Promise<ProfileSnapshotPublishResult> {
+    return this.lifecycleManager.publishAggregatorPointerBestEffort(cidString);
+  }
+
+  /**
+   * Item #15 Phase D.2 — public accessor for the wallet-global
+   * {@link BundleIndex}. Exposed so the factory's pull-side dispatcher
+   * (`runProfileSnapshotJoin`) can dispatch JOIN over the
+   * `tokens.bundle.*` slice of a remote lean snapshot. BundleIndex
+   * implements {@link ProfileSyncWriter} and owns the
+   * encrypted-envelope read/write contract for bundle refs.
+   *
+   * The handle remains owned by the provider — callers MUST NOT cache
+   * it across `shutdown()`/`destroy()` cycles. Returns `null` only if
+   * the provider has been torn down (today the field is non-null after
+   * construction).
+   */
+  getBundleIndex(): BundleIndex | null {
+    return this.bundleIndex ?? null;
+  }
+
   // ---------------------------------------------------------------------------
   // Lifecycle
   // ---------------------------------------------------------------------------
@@ -438,7 +866,23 @@ export class ProfileTokenStorageProvider
   }
 
   async shutdown(): Promise<void> {
+    // Item #15 Phase C.2 — cancel the dirty-flush debounce BEFORE the
+    // lifecycle's shutdown so the lifecycle's `setIsShuttingDown(true)`
+    // doesn't race a late-firing timer that would re-enter the dispatch
+    // path. Then await any in-flight dirty-flush callback so we don't
+    // leave a Sphere-injected flush dangling past provider teardown.
+    this.cancelDirtyFlushTimer();
+    try {
+      await this.awaitDirtyFlushSettled();
+    } catch {
+      // Best-effort — the dispatch path already surfaces errors via
+      // storage:error; shutdown shouldn't fail on a flush error.
+    }
     await this.lifecycleManager.shutdown();
+    // Latch the sticky shutdown flag AFTER the lifecycle finishes so
+    // any late-arriving signal from a writer that outlives the
+    // provider becomes a definite no-op.
+    this.hasShutdown = true;
   }
 
   /**

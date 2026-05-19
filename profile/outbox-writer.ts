@@ -61,6 +61,14 @@ import { Lamport } from './lamport.js';
 import { assertTransition } from './outbox-state-machine.js';
 import type { ProfileDatabase, TombstoneGcResult } from './types.js';
 import { MAX_ENTRY_BYTES_RAW } from '../types/uxf-bounds.js';
+import {
+  runJoinSnapshot,
+  validateLamport,
+  type ClassifiedSlot,
+  type JoinResult,
+  type ProfileSyncWriter,
+  type SnapshotEntry,
+} from './profile-snapshot-merge.js';
 
 // =============================================================================
 // 1. Public option / classification types
@@ -82,6 +90,19 @@ export interface OutboxWriterOptions {
    *  §7.1. Per-instance scoped — supply a fresh clock per Sphere instance
    *  to avoid bleed across destroy-recreate cycles. */
   readonly lamport: Lamport;
+  /**
+   * Item #15 Phase C — fired after any local mutation completes
+   * successfully (live write, tombstone delete, JOIN-applied remote
+   * change, GC-purged tombstone). Signals the host's flush scheduler
+   * that the profile has dirty state that should be included in the
+   * next lean-snapshot publish.
+   *
+   * Optional: writers function identically when omitted (the host has
+   * not yet wired full-profile-snapshot sync, or the test is exercising
+   * a pre-#15 path). Errors thrown by the callback are caught and
+   * logged silently so a misbehaving notifier cannot break write paths.
+   */
+  readonly notifyProfileDirty?: () => void;
 }
 
 /**
@@ -139,12 +160,13 @@ export interface WriteOptions {
  * for the same address is harmless — they each serialize their own
  * Lamport, and OrbitDB's key-value semantics absorb the writes.
  */
-export class OutboxWriter {
+export class OutboxWriter implements ProfileSyncWriter {
   private readonly db: ProfileDatabase;
   private readonly encryptionKey: Uint8Array | null;
   private readonly addressId: string;
   private readonly lamport: Lamport;
   private readonly keyPrefix: string;
+  private readonly notifyProfileDirty: (() => void) | null;
 
   constructor(options: OutboxWriterOptions) {
     if (!options.addressId || options.addressId.length === 0) {
@@ -172,6 +194,22 @@ export class OutboxWriter {
     this.addressId = options.addressId;
     this.lamport = options.lamport;
     this.keyPrefix = `${this.addressId}.outbox.`;
+    this.notifyProfileDirty = options.notifyProfileDirty ?? null;
+  }
+
+  /**
+   * Item #15 Phase C — invoke the host's `notifyProfileDirty` callback
+   * (if wired). Guarded so a misbehaving notifier cannot break a mutation
+   * path; errors are swallowed silently (the dirty signal is best-effort
+   * — the next flush will pick up the state regardless).
+   */
+  private emitProfileDirty(): void {
+    if (this.notifyProfileDirty === null) return;
+    try {
+      this.notifyProfileDirty();
+    } catch {
+      // Best-effort signal — never propagate notifier errors.
+    }
   }
 
   /**
@@ -265,6 +303,7 @@ export class OutboxWriter {
     };
 
     await this.writeRaw(stamped.id, JSON.stringify(stamped));
+    this.emitProfileDirty();
     return stamped;
   }
 
@@ -368,6 +407,7 @@ export class OutboxWriter {
       lamport,
     });
     await this.writeRaw(id, tombstone);
+    this.emitProfileDirty();
   }
 
   /**
@@ -471,7 +511,207 @@ export class OutboxWriter {
         kept += 1;
       }
     }
+    // Item #15 Phase C — reclaimed tombstones change snapshot contents,
+    // so signal dirty if anything actually got purged.
+    if (purged > 0) this.emitProfileDirty();
     return { scanned, purged, kept, skipped: false };
+  }
+
+  // ===========================================================================
+  // Item #15 Phase B — full-profile-snapshot sync API
+  // ===========================================================================
+
+  /**
+   * Return every entry under `${addr}.outbox.*` as raw encrypted bytes
+   * for the lean-snapshot builder (Item #15 Phase B). Includes BOTH
+   * live entries AND tombstones — receivers need the tombstone bytes
+   * to converge on deletes.
+   *
+   * The bytes are returned exactly as `db.get(key)` produced them (AES-
+   * 256-GCM ciphertext when constructed with an encryptionKey, or
+   * plaintext JSON when not). The receiving peer's `joinSnapshot()`
+   * decrypts with the same wallet key and applies the merge table.
+   *
+   * Stable order: ascending lexicographic key.
+   */
+  async snapshot(): Promise<ReadonlyArray<SnapshotEntry>> {
+    let entries: Map<string, Uint8Array>;
+    try {
+      entries = await this.db.all(this.keyPrefix);
+    } catch {
+      return [];
+    }
+    const out: SnapshotEntry[] = [];
+    const sortedKeys = [...entries.keys()].sort();
+    for (const key of sortedKeys) {
+      if (!key.startsWith(this.keyPrefix)) continue;
+      const encryptedValue = entries.get(key);
+      if (encryptedValue === undefined) continue;
+      out.push({ key, encryptedValue });
+    }
+    return out;
+  }
+
+  /**
+   * Apply a remote peer's outbox snapshot against this writer's local
+   * OrbitDB state (Item #15 Phase B). For each remote entry, the merge
+   * table decides whether to keep local or persist the remote's bytes
+   * verbatim.
+   *
+   * **Tombstone resurrection invariant** carries over: a tombstone on
+   * either side at lamport ≥ the live counterpart wins, mirroring the
+   * Issue #166 P1 #2 refuse-write guard at JOIN time.
+   *
+   * **Lamport bumping is intentionally bypassed.** Remote bytes already
+   * carry a Lamport stamp from the remote's bump. Re-bumping at JOIN
+   * would inflate this peer's clock past the remote's intent and break
+   * convergence (the next snapshot would forever look "newer" than the
+   * remote's). The local clock observes the freshly-landed Lamports on
+   * the next live write via `collectObservedLamports` + `rehydrate`,
+   * which IS the correct entry point for absorbing remote state into
+   * the clock.
+   *
+   * **Legacy entries** (pre-§7.0, no `_schemaVersion`):
+   *   - Remote legacy → rejected as malformed. Legacy entries do not
+   *     propagate via the lean-snapshot path; the §7.2 migration window
+   *     handles their forward conversion.
+   *   - Local legacy → treated as `live` with `lamport=0`. Any uxf-1
+   *     remote (which always has `lamport ≥ 1`) therefore overwrites
+   *     it, completing the migration as a side effect of sync.
+   *
+   * **Out-of-bounds Lamports** in remote entries are rejected per
+   * `MAX_SAFE_LAMPORT` — the JOIN-time counterpart of the W39 bounds
+   * defence on Lamport.bumpFor.
+   */
+  async joinSnapshot(
+    remote: ReadonlyArray<SnapshotEntry>,
+  ): Promise<JoinResult> {
+    const result = await runJoinSnapshot(remote, {
+      classifyLocal: async (key) => {
+        if (!key.startsWith(this.keyPrefix)) return { kind: 'absent' };
+        const shape = await this.readSlotShape(key);
+        const slot = this.classifyToMergeSlot(shape, /* remote = */ false);
+        // classifyToMergeSlot only returns null on the remote path;
+        // local always resolves to a ClassifiedSlot. Defensive fallthrough
+        // to 'absent' if a future refactor makes this not so.
+        return slot ?? { kind: 'absent' };
+      },
+      classifyRemote: async (entry) => {
+        if (!entry.key.startsWith(this.keyPrefix)) return null;
+        // Decode the remote's raw bytes via the same pipeline used for
+        // local slots, but without going through db.get (the bytes are
+        // already in hand from the snapshot).
+        const shape = await this.classifyRawBytes(entry.encryptedValue);
+        return this.classifyToMergeSlot(shape, /* remote = */ true);
+      },
+      writeRemote: async (key, bytes) => {
+        // Stamp the bytes verbatim — no re-encryption, no Lamport bump.
+        // See method-level doc-comment for the rationale.
+        await this.db.put(key, bytes);
+      },
+    });
+    // Item #15 Phase C — any landed remote bytes change our local
+    // state, so the next flush should re-snapshot. `liveLanded` and
+    // `tombstonesLanded` capture both surfaces.
+    if (result.liveLanded > 0 || result.tombstonesLanded > 0) {
+      this.emitProfileDirty();
+    }
+    return result;
+  }
+
+  /**
+   * Map our private `readSlotShape` discriminated union into the
+   * `ClassifiedSlot` shape consumed by the shared merge primitive.
+   *
+   * @param shape  The output of `readSlotShape` / `classifyRawBytes`.
+   * @param remote `true` for remote bytes (stricter — legacy entries
+   *               are rejected so they cannot propagate); `false` for
+   *               local bytes (legacy is mapped to `live lamport=0`
+   *               so any uxf-1 remote can overwrite it on sync).
+   */
+  private classifyToMergeSlot(
+    shape:
+      | null
+      | { readonly kind: 'tombstone'; readonly lamport: number; readonly deletedAt: number }
+      | { readonly kind: 'value'; readonly value: unknown },
+    remote: boolean,
+  ): ClassifiedSlot | null {
+    if (shape === null) {
+      return remote ? null : { kind: 'absent' };
+    }
+    if (shape.kind === 'tombstone') {
+      const lamport = validateLamport(shape.lamport);
+      if (lamport === null) {
+        // Local: out-of-bounds tombstone Lamport is treated as absent
+        // so a well-formed remote can land. Remote: outright reject.
+        return remote ? null : { kind: 'absent' };
+      }
+      return { kind: 'tombstone', lamport };
+    }
+    // shape.kind === 'value' — uxf-1 OR legacy OR garbage.
+    if (isUxfTransferOutboxEntry(shape.value)) {
+      const lamport = validateLamport(shape.value.lamport);
+      if (lamport === null) return remote ? null : { kind: 'absent' };
+      return { kind: 'live', lamport };
+    }
+    if (isLegacyOutboxEntry(shape.value)) {
+      // Remote legacy → reject (legacy entries don't propagate via the
+      // lean snapshot path).
+      if (remote) return null;
+      // Local legacy → treat as live with lamport=0 so any uxf-1
+      // remote (lamport ≥ 1) overwrites it.
+      return { kind: 'live', lamport: 0 };
+    }
+    // Unknown shape — corrupt JSON or partial schema. Local maps to
+    // absent (let remote land); remote maps to null (don't propagate).
+    return remote ? null : { kind: 'absent' };
+  }
+
+  /**
+   * Decrypt + parse a raw byte buffer using the writer's standard
+   * pipeline (size cap → decrypt → JSON parse → tombstone sniff).
+   * Used by `joinSnapshot` to classify remote bytes without going
+   * through `db.get`. Returns the same discriminated union as
+   * `readSlotShape`.
+   */
+  private async classifyRawBytes(
+    raw: Uint8Array,
+  ): Promise<
+    | null
+    | { readonly kind: 'tombstone'; readonly lamport: number; readonly deletedAt: number }
+    | { readonly kind: 'value'; readonly value: unknown }
+  > {
+    if (!raw || raw.byteLength === 0) return null;
+    if (raw.byteLength > MAX_ENTRY_BYTES_RAW) return null;
+    let plaintextBytes: Uint8Array;
+    try {
+      plaintextBytes = this.encryptionKey
+        ? await decryptProfileValue(this.encryptionKey, raw)
+        : raw;
+    } catch {
+      return null;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(new TextDecoder().decode(plaintextBytes));
+    } catch {
+      return null;
+    }
+    if (
+      parsed !== null &&
+      typeof parsed === 'object' &&
+      'tombstoned' in (parsed as Record<string, unknown>) &&
+      (parsed as Record<string, unknown>).tombstoned === true
+    ) {
+      const p = parsed as Record<string, unknown>;
+      const lamport =
+        typeof p.lamport === 'number' && Number.isInteger(p.lamport) && p.lamport >= 0
+          ? p.lamport
+          : 0;
+      const deletedAt = typeof p.deletedAt === 'number' ? p.deletedAt : 0;
+      return { kind: 'tombstone', lamport, deletedAt };
+    }
+    return { kind: 'value', value: parsed };
   }
 
   /**

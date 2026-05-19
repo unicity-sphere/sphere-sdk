@@ -42,6 +42,8 @@
 import { logger } from '../core/logger.js';
 import { decryptString, encryptString } from './encryption.js';
 import type { DispositionPerEntryStorage } from './disposition-writer.js';
+import { PrefixSyncWriter } from './prefix-sync-writer.js';
+import type { ProfileSyncWriter } from './profile-snapshot-merge.js';
 import type { ProfileDatabase } from './types.js';
 
 // =============================================================================
@@ -164,6 +166,20 @@ export interface OrbitDbDispositionStorageAdapterOptions {
    * to {@link DEFAULT_LIST_KEYS_MAX_RESULTS}.
    */
   readonly defaultMaxResults?: number;
+  /**
+   * Item #15 Phase C — fired after every successful mutation on either
+   * the `_invalid` / `_audit` sub-prefixes. Also threaded into the four
+   * {@link PrefixSyncWriter}s returned by
+   * {@link OrbitDbDispositionStorageAdapter.syncWritersFor} so
+   * JOIN-applied remote changes mark the profile dirty as well.
+   *
+   * The local `writeRecord` / `tombstone` paths on this adapter do NOT
+   * fire the notifier today — they are write-side surfaces that
+   * `DispositionWriter` calls in tandem with manifest mutations that
+   * already drive the dirty-flush. Threading the notifier here would
+   * cause double-fires; leave it as JOIN-only signalling.
+   */
+  readonly notifyProfileDirty?: () => void;
 }
 
 /**
@@ -199,12 +215,14 @@ export class OrbitDbDispositionStorageAdapter
   private readonly db: ProfileDatabase;
   private readonly encryptionKey: Uint8Array;
   private readonly defaultMaxResults: number;
+  private readonly notifyProfileDirty: (() => void) | null;
 
   constructor(opts: OrbitDbDispositionStorageAdapterOptions) {
     this.db = opts.db;
     this.encryptionKey = opts.encryptionKey;
     this.defaultMaxResults =
       opts.defaultMaxResults ?? DEFAULT_LIST_KEYS_MAX_RESULTS;
+    this.notifyProfileDirty = opts.notifyProfileDirty ?? null;
   }
 
   async readRecord<T>(key: string): Promise<T | undefined> {
@@ -305,4 +323,135 @@ export class OrbitDbDispositionStorageAdapter
       return undefined;
     }
   }
+
+  /**
+   * Item #15 Phase B.4 — Return four prefix-scoped
+   * {@link ProfileSyncWriter}s covering the address's disposition
+   * surfaces:
+   *
+   *   - `${addressId}.invalid.`         — `_invalid` records keyed by
+   *                                       (tokenId, observedContentHash).
+   *                                       Content-immutable on the key
+   *                                       disambiguator; constant-Lamport
+   *                                       JOIN via {@link PrefixSyncWriter}
+   *                                       is the correct semantics.
+   *   - `${addressId}.invalid-orphan.`  — `_invalid` records for entries
+   *                                       whose `tokenId` was the empty
+   *                                       sentinel (structural-defect
+   *                                       hydration throws). See
+   *                                       `invalidKeyFor` in
+   *                                       `profile/disposition-writer.ts`
+   *                                       for the orphan-routing
+   *                                       rationale.
+   *   - `${addressId}.audit.`           — `_audit` records keyed by
+   *                                       (tokenId, observedContentHash).
+   *                                       Mostly content-immutable; the
+   *                                       rare `auditStatus:
+   *                                       'audit-promoted'` mutation
+   *                                       causes operator-visible
+   *                                       interim divergence that
+   *                                       converges eventually.
+   *                                       Constant-Lamport semantics
+   *                                       are acceptable per the B.4
+   *                                       scope analysis (see
+   *                                       docs/uxf/OUTBOX-SEND-FOLLOWUPS.md).
+   *   - `${addressId}.audit-orphan.`    — `_audit` orphan records (same
+   *                                       sentinel routing as
+   *                                       `_invalid-orphan`).
+   *
+   * **NOT covered by this method**: the `${addressId}.manifest.` surface.
+   * Manifest entries are Lamport-tracked AND CAS-guarded with per-field
+   * merge rules in `mergeManifestEntry`. A byte-verbatim JOIN would lose
+   * the per-field merge. The production manifest storage is currently
+   * in-memory only (an `MinimalManifestStorage` Map inside `PaymentsModule`),
+   * so there is no OrbitDB persistence to JOIN against today. Treat as
+   * a deferred follow-up; see `docs/uxf/OUTBOX-SEND-FOLLOWUPS.md` item
+   * #15 "Deferred — B.4 manifest" for the path forward.
+   *
+   * Lifecycle and null semantics mirror
+   * {@link OrbitDbRecipientContextStorageAdapter.syncWritersFor}.
+   *
+   * @param addressId  Wallet-address scope (`DIRECT_xxxxxx_yyyyyy`).
+   * @throws TypeError when `addressId` is empty.
+   */
+  syncWritersFor(addressId: string): {
+    readonly invalid: ProfileSyncWriter;
+    readonly invalidOrphan: ProfileSyncWriter;
+    readonly audit: ProfileSyncWriter;
+    readonly auditOrphan: ProfileSyncWriter;
+  } {
+    if (typeof addressId !== 'string' || addressId.length === 0) {
+      throw new TypeError(
+        'OrbitDbDispositionStorageAdapter.syncWritersFor: addressId must be a non-empty string',
+      );
+    }
+    // The four PrefixSyncWriters share the same db + key + notifier;
+    // each is scoped to its own prefix. `validateValue` defaults to
+    // "accept any plain non-tombstone object" — the disposition records
+    // are heterogeneous shapes (InvalidRecord, AuditRecord, etc.) that
+    // do not carry a `_schemaVersion` discriminator, so the default
+    // validator is correct here.
+    const common = {
+      db: this.db,
+      encryptionKey: this.encryptionKey,
+      notifyProfileDirty: this.notifyProfileDirty ?? undefined,
+    } as const;
+    return {
+      invalid: new PrefixSyncWriter({
+        ...common,
+        keyPrefix: dispositionInvalidPrefix(addressId),
+        label: 'OrbitDbDispositionStorageAdapter.invalid',
+      }),
+      invalidOrphan: new PrefixSyncWriter({
+        ...common,
+        keyPrefix: dispositionInvalidOrphanPrefix(addressId),
+        label: 'OrbitDbDispositionStorageAdapter.invalidOrphan',
+      }),
+      audit: new PrefixSyncWriter({
+        ...common,
+        keyPrefix: dispositionAuditPrefix(addressId),
+        label: 'OrbitDbDispositionStorageAdapter.audit',
+      }),
+      auditOrphan: new PrefixSyncWriter({
+        ...common,
+        keyPrefix: dispositionAuditOrphanPrefix(addressId),
+        label: 'OrbitDbDispositionStorageAdapter.auditOrphan',
+      }),
+    };
+  }
+}
+
+// =============================================================================
+// 3. Public prefix helpers — Item #15 Phase B.4
+// =============================================================================
+
+/**
+ * Item #15 Phase B.4 — full prefix for `_invalid` records of an
+ * address. Mirrors `invalidKeyFor`'s non-orphan branch (with trailing
+ * dot for prefix-scan exactness).
+ */
+export function dispositionInvalidPrefix(addressId: string): string {
+  return `${addressId}.invalid.`;
+}
+
+/**
+ * Item #15 Phase B.4 — full prefix for `_invalid-orphan` records
+ * (entries whose `tokenId` was the empty sentinel).
+ */
+export function dispositionInvalidOrphanPrefix(addressId: string): string {
+  return `${addressId}.invalid-orphan.`;
+}
+
+/**
+ * Item #15 Phase B.4 — full prefix for `_audit` records.
+ */
+export function dispositionAuditPrefix(addressId: string): string {
+  return `${addressId}.audit.`;
+}
+
+/**
+ * Item #15 Phase B.4 — full prefix for `_audit-orphan` records.
+ */
+export function dispositionAuditOrphanPrefix(addressId: string): string {
+  return `${addressId}.audit-orphan.`;
 }

@@ -52,6 +52,8 @@ import { logger } from '../core/logger.js';
 import { decryptString, encryptString } from './encryption.js';
 import type { FinalizationQueueStorage } from '../modules/payments/transfer/finalization-queue.js';
 import type { ProfileDatabase } from './types.js';
+import { PrefixSyncWriter } from './prefix-sync-writer.js';
+import type { ProfileSyncWriter } from './profile-snapshot-merge.js';
 
 // =============================================================================
 // 0. Constants — schema discriminator + key shapes
@@ -92,6 +94,14 @@ export interface OrbitDbFinalizationQueueStorageAdapterOptions {
   readonly db: ProfileDatabase;
   /** AES-256 key derived from the wallet master key (see {@link deriveProfileEncryptionKey}). */
   readonly encryptionKey: Uint8Array;
+  /**
+   * Item #15 Phase C — fired after every successful local mutation
+   * (writeKey / deleteKey). Also propagates to the {@link PrefixSyncWriter}
+   * returned from {@link OrbitDbFinalizationQueueStorageAdapter.syncWriterFor}
+   * so JOIN-applied remote changes signal dirty too. See
+   * {@link OutboxWriter} for the broader semantics.
+   */
+  readonly notifyProfileDirty?: () => void;
 }
 
 /**
@@ -114,10 +124,26 @@ export class OrbitDbFinalizationQueueStorageAdapter
 {
   private readonly db: ProfileDatabase;
   private readonly encryptionKey: Uint8Array;
+  private readonly notifyProfileDirty: (() => void) | null;
 
   constructor(opts: OrbitDbFinalizationQueueStorageAdapterOptions) {
     this.db = opts.db;
     this.encryptionKey = opts.encryptionKey;
+    this.notifyProfileDirty = opts.notifyProfileDirty ?? null;
+  }
+
+  /**
+   * Item #15 Phase C — guarded invocation of the host's dirty signal.
+   * Errors are swallowed silently so a misbehaving notifier cannot
+   * propagate into the writer's error path.
+   */
+  private emitProfileDirty(): void {
+    if (this.notifyProfileDirty === null) return;
+    try {
+      this.notifyProfileDirty();
+    } catch {
+      // Best-effort.
+    }
   }
 
   async readKey(key: string): Promise<string | null> {
@@ -160,6 +186,7 @@ export class OrbitDbFinalizationQueueStorageAdapter
     }
     const ciphertext = await encryptString(this.encryptionKey, stamped);
     await this.db.put(key, ciphertext);
+    this.emitProfileDirty();
   }
 
   async listByPrefix(prefix: string): Promise<Map<string, string>> {
@@ -185,6 +212,37 @@ export class OrbitDbFinalizationQueueStorageAdapter
 
   async deleteKey(key: string): Promise<void> {
     await this.db.del(key);
+    this.emitProfileDirty();
+  }
+
+  // ===========================================================================
+  // Item #15 Phase B.5 — full-profile-snapshot sync API
+  // ===========================================================================
+
+  /**
+   * Return a {@link ProfileSyncWriter} scoped to
+   * `${addressId}.finalizationQueue.*`. Each finalization-queue entry
+   * is content-immutable per key (the `entryId` disambiguator ensures
+   * two replicas writing the same entry produce equivalent content);
+   * the merge therefore uses constant-Lamport semantics via
+   * {@link PrefixSyncWriter}.
+   *
+   * Sticky-tombstone semantics: once a queue entry is removed on
+   * either replica, the JOIN preserves the tombstone across both
+   * sides. Mirrors {@link FinalizationQueue.remove}'s intent.
+   */
+  syncWriterFor(addressId: string): ProfileSyncWriter {
+    return new PrefixSyncWriter({
+      db: this.db,
+      encryptionKey: this.encryptionKey,
+      keyPrefix: `${addressId}.finalizationQueue.`,
+      validateValue: validateUxf1Schema,
+      label: 'OrbitDbFinalizationQueueStorageAdapter.sync',
+      // Item #15 Phase C — propagate the adapter's notifier so JOIN-
+      // applied remote changes mark the profile dirty alongside
+      // local writeKey/deleteKey mutations.
+      notifyProfileDirty: this.notifyProfileDirty ?? undefined,
+    });
   }
 }
 
@@ -227,6 +285,14 @@ export interface PersistedFinalizationContext {
 export interface OrbitDbRecipientContextStorageAdapterOptions {
   readonly db: ProfileDatabase;
   readonly encryptionKey: Uint8Array;
+  /**
+   * Item #15 Phase C — fired after every successful mutation on either
+   * the request-context or finalization-context sub-prefix. Also threaded
+   * into the two {@link PrefixSyncWriter}s returned by
+   * {@link OrbitDbRecipientContextStorageAdapter.syncWritersFor} so
+   * JOIN-applied remote changes mark the profile dirty as well.
+   */
+  readonly notifyProfileDirty?: () => void;
 }
 
 /**
@@ -277,10 +343,24 @@ export function requestContextPrefix(addr: string): string {
 export class OrbitDbRecipientContextStorageAdapter {
   private readonly db: ProfileDatabase;
   private readonly encryptionKey: Uint8Array;
+  private readonly notifyProfileDirty: (() => void) | null;
 
   constructor(opts: OrbitDbRecipientContextStorageAdapterOptions) {
     this.db = opts.db;
     this.encryptionKey = opts.encryptionKey;
+    this.notifyProfileDirty = opts.notifyProfileDirty ?? null;
+  }
+
+  /**
+   * Item #15 Phase C — guarded invocation of the host's dirty signal.
+   */
+  private emitProfileDirty(): void {
+    if (this.notifyProfileDirty === null) return;
+    try {
+      this.notifyProfileDirty();
+    } catch {
+      // Best-effort.
+    }
   }
 
   async writeRequestContext(
@@ -293,6 +373,7 @@ export class OrbitDbRecipientContextStorageAdapter {
     const json = JSON.stringify(stamped);
     const ciphertext = await encryptString(this.encryptionKey, json);
     await this.db.put(key, ciphertext);
+    this.emitProfileDirty();
   }
 
   async readRequestContext(
@@ -307,6 +388,7 @@ export class OrbitDbRecipientContextStorageAdapter {
 
   async deleteRequestContext(addr: string, requestId: string): Promise<void> {
     await this.db.del(requestContextKey(addr, requestId));
+    this.emitProfileDirty();
   }
 
   async writeFinalizationContext(
@@ -319,6 +401,7 @@ export class OrbitDbRecipientContextStorageAdapter {
     const json = JSON.stringify(stamped);
     const ciphertext = await encryptString(this.encryptionKey, json);
     await this.db.put(key, ciphertext);
+    this.emitProfileDirty();
   }
 
   async readFinalizationContext(
@@ -333,6 +416,7 @@ export class OrbitDbRecipientContextStorageAdapter {
 
   async deleteFinalizationContext(addr: string, tokenId: string): Promise<void> {
     await this.db.del(finalizationContextKey(addr, tokenId));
+    this.emitProfileDirty();
   }
 
   /**
@@ -424,6 +508,71 @@ export class OrbitDbRecipientContextStorageAdapter {
       return undefined;
     }
   }
+
+  // ===========================================================================
+  // Item #15 Phase B.5 — full-profile-snapshot sync API
+  // ===========================================================================
+
+  /**
+   * Return the two {@link ProfileSyncWriter}s scoped to this address's
+   * recipient-context state: one for `recipientContext.request.*` (keyed
+   * by requestId) and one for `recipientContext.finalization.*` (keyed
+   * by tokenId).
+   *
+   * Both surfaces are content-immutable per key (PaymentsModule writes
+   * each requestId / tokenId exactly once during the in-flight transfer
+   * lifecycle); the merge uses constant-Lamport semantics via
+   * {@link PrefixSyncWriter}.
+   *
+   * The two sync writers are returned together because they cover the
+   * same logical "recipient-context" namespace under different
+   * sub-prefixes — the Phase D dispatcher invokes both per JOIN cycle.
+   */
+  syncWritersFor(addressId: string): {
+    readonly requestContext: ProfileSyncWriter;
+    readonly finalizationContext: ProfileSyncWriter;
+  } {
+    // Item #15 Phase C — propagate the adapter's notifier so JOIN-
+    // applied remote changes mark the profile dirty alongside local
+    // mutations.
+    const notifier = this.notifyProfileDirty ?? undefined;
+    return {
+      requestContext: new PrefixSyncWriter({
+        db: this.db,
+        encryptionKey: this.encryptionKey,
+        keyPrefix: requestContextPrefix(addressId),
+        validateValue: validateUxf1Schema,
+        label: 'OrbitDbRecipientContextStorageAdapter.sync.request',
+        notifyProfileDirty: notifier,
+      }),
+      finalizationContext: new PrefixSyncWriter({
+        db: this.db,
+        encryptionKey: this.encryptionKey,
+        keyPrefix: finalizationContextPrefix(addressId),
+        validateValue: validateUxf1Schema,
+        label: 'OrbitDbRecipientContextStorageAdapter.sync.finalization',
+        notifyProfileDirty: notifier,
+      }),
+    };
+  }
+}
+
+// =============================================================================
+// 2.5 Shared validator for `_schemaVersion: 'uxf-1'` stamped records
+// =============================================================================
+
+/**
+ * Validator used by both adapter sync writers — accepts any decoded
+ * payload that carries the `_schemaVersion: 'uxf-1'` discriminator. This
+ * rejects foreign-schema entries (legacy `OutboxEntry`, raw PaymentsModule
+ * outbox-style records, etc.) that may share the same key prefix during
+ * the §7.2 migration window — those entries don't propagate via the
+ * lean-snapshot path.
+ */
+function validateUxf1Schema(parsed: unknown): boolean {
+  if (parsed === null || typeof parsed !== 'object') return false;
+  if (Array.isArray(parsed)) return false;
+  return (parsed as { _schemaVersion?: unknown })._schemaVersion === SCHEMA_VERSION;
 }
 
 // =============================================================================

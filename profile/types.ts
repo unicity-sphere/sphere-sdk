@@ -49,6 +49,26 @@ export interface TombstoneGcResult {
   readonly skipped: boolean;
 }
 
+/**
+ * Item #15 Phase D.1a — outcome of a lean-snapshot publish attempt.
+ *
+ * Shape mirrors `LifecycleManager.publishAggregatorPointerBestEffort`:
+ *   - `{ ok: true }` — anchored at a new pointer version.
+ *   - `{ ok: false, transient: true }` — network / aggregator timed
+ *     out; pending-publish marker stamped; safe to retry.
+ *   - `{ ok: false, transient: false, code? }` — permanent failure
+ *     (rejected, untrusted proof, trust-base stale, etc.); operator
+ *     intervention required; retrying will not help. The `code` field
+ *     carries the typed `AggregatorPointerErrorCode` when available, or
+ *     a closure-side `NOT_READY_*` sentinel when the closure bailed
+ *     before reaching the publish step.
+ */
+export interface ProfileSnapshotPublishResult {
+  readonly ok: boolean;
+  readonly transient: boolean;
+  readonly code?: string;
+}
+
 export interface OrbitDbConfig {
   /**
    * @deprecated — pass `dbNameOverride` instead. JS strings cannot be
@@ -103,6 +123,28 @@ export interface ProfileConfig {
   readonly consolidationRetentionMinMs?: number;
   /** Write-behind debounce window in ms (default: 2000) */
   readonly flushDebounceMs?: number;
+  /**
+   * Item #15 Phase F — retention window (in ms) for OUTBOX/SENT
+   * tombstones before they are GC'd at snapshot-build time. Tombstones
+   * older than this threshold are `db.del()`'d by the per-writer
+   * `gcExpiredTombstones()` sweep that runs in the lean-snapshot
+   * builder's pre-read hook, AND consequently dropped from the
+   * published snapshot (so peers do not receive ancient deletes that
+   * have already converged everywhere).
+   *
+   * Default: 30 days. The safety contract — retention must exceed the
+   * longest realistic concurrent-replica pre-sync window — is taken
+   * from the Item #4 default; a fortnight-long offline replica still
+   * converges before its tombstones are reclaimed.
+   *
+   * Set lower for tests that exercise the GC path with simulated
+   * clocks. Setting to `0` makes every tombstone immediately eligible
+   * for purge.
+   *
+   * @see docs/uxf/OUTBOX-SEND-FOLLOWUPS.md — Item #4 (writer GC) and
+   *      Item #15 Phase F (snapshot-build-time hook).
+   */
+  readonly tombstoneRetentionMs?: number;
   /** Custom bootstrap peers for OrbitDB (convenience alias for orbitDb.bootstrapPeers) */
   readonly profileOrbitDbPeers?: string[];
   /**
@@ -328,6 +370,75 @@ export interface ProfileTokenStorageProviderOptions {
    * fork the pointer history. Optional during rollout.
    */
   readonly getPointerBuildStatus?: () => 'pending' | 'unavailable' | 'ready';
+  /**
+   * Item #15 Phase C.2 — host-injected debounced handler for
+   * "profile state changed" signals.
+   *
+   * Every per-writer mutation (OUTBOX, SENT, finalization queue,
+   * recipient context, bundle index) and every JOIN-applied remote
+   * change calls into the provider's `notifyProfileDirty()` method
+   * (also exposed via the host interface). The provider debounces
+   * these notifications over `dirtyFlushDebounceMs` and, when the
+   * timer fires, invokes this callback.
+   *
+   * The natural caller (Sphere / pointer wiring) implements the
+   * callback to:
+   *   1. Build a lean profile snapshot via `buildLeanProfileSnapshot()`.
+   *   2. Pin the snapshot CAR to IPFS.
+   *   3. Publish the snapshot CID via the aggregator pointer layer.
+   *
+   * Optional. When omitted, `notifyProfileDirty()` is a no-op — the
+   * Phase B sync writers stay wired but no aggregator-pointer
+   * publication happens for non-token-bundle state. This is the
+   * default during Phase C rollout; Phase D/E land the full pipeline.
+   *
+   * Errors thrown by the callback are caught and surfaced via a
+   * `storage:error` event with `code: 'PROFILE_DIRTY_FLUSH_FAILED'`.
+   * They do NOT propagate into write paths — dirty signalling is
+   * best-effort by design.
+   */
+  readonly onProfileDirtyFlush?: () => Promise<void | ProfileSnapshotPublishResult>;
+  /**
+   * Item #15 Phase E follow-up — host-injected pull-side snapshot
+   * applier. Counterpart to `onProfileDirtyFlush` (which publishes a
+   * snapshot CID); this callback consumes a snapshot CID:
+   *
+   *   1. Fetch the CAR for `cidString` from the configured IPFS
+   *      gateways (content-address verified by the fetcher).
+   *   2. Parse it as a {@link LeanProfileSnapshot}.
+   *   3. Dispatch per-writer JOIN over the parsed snapshot via the
+   *      same factory closure that backs
+   *      `ProfileStorageProvider.setSnapshotApplier`.
+   *
+   * Used by `LifecycleManager.runPointerPollOnce` and
+   * `recoverFromAggregatorPointerBestEffort` so the periodic-poll and
+   * cold-start recovery paths consume the pointer's CID as a snapshot
+   * (Item #15) rather than calling `bundleIndex.addBundle()` on the
+   * snapshot CID and corrupting the bundle index. The legacy
+   * `addBundle` path was a latent bug: under Item #15 the pointer's
+   * CID is a snapshot CID, not a UXF bundle CID, so the next `load()`
+   * would try to parse the snapshot CAR as a UXF package and fail.
+   *
+   * Optional. When omitted, lifecycle's pointer paths log and skip
+   * (no legacy fallback per Phase E — silent re-write of the snapshot
+   * CID as a bundle ref is precisely the bug this option fixes).
+   *
+   * Errors thrown by the callback propagate to the lifecycle caller's
+   * outer try/catch and are logged + re-armed on the next periodic
+   * cycle. The pointer cursor is NOT advanced by this path — cursor
+   * advancement remains owned by the reconcile-loop's `fetchAndJoin`
+   * callback in `pointer-wiring.ts`.
+   */
+  readonly onApplySnapshot?: (
+    cidString: string,
+  ) => Promise<import('./profile-snapshot-dispatcher').ApplySnapshotResult>;
+  /**
+   * Item #15 Phase C.2 — debounce window for `notifyProfileDirty`
+   * signals. Defaults to `flushDebounceMs` (2000ms). Set lower for
+   * tests; higher for high-write-volume wallets where the natural
+   * flush cadence is already the throttle.
+   */
+  readonly dirtyFlushDebounceMs?: number;
   /** Enable debug logging */
   readonly debug?: boolean;
 }
