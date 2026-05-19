@@ -33,6 +33,13 @@ import {
   decryptProfileValue,
 } from '../encryption.js';
 import { buildLocalEntry, decodeEntry } from '../oplog-entry.js';
+import {
+  runJoinSnapshot,
+  type ClassifiedSlot,
+  type JoinResult,
+  type ProfileSyncWriter,
+  type SnapshotEntry,
+} from '../profile-snapshot-merge.js';
 import type { ProfileTokenStorageHost } from './host.js';
 
 /** OrbitDB key prefix for UXF bundle references. */
@@ -48,7 +55,7 @@ export const CONSOLIDATION_WARNING_THRESHOLD = 3;
  */
 const CORRUPT_CIDS_PREVIEW_CAP = 100;
 
-export class BundleIndex {
+export class BundleIndex implements ProfileSyncWriter {
   constructor(private readonly host: ProfileTokenStorageHost) {}
 
   /**
@@ -202,4 +209,176 @@ export class BundleIndex {
     const bundles = await this.listActiveBundles();
     this.host.setKnownBundleCids(new Set(bundles.keys()));
   }
+
+  // ===========================================================================
+  // Item #15 Phase B.6 — full-profile-snapshot sync API
+  // ===========================================================================
+
+  /**
+   * Return every `tokens.bundle.*` entry as raw on-disk bytes for the
+   * lean-snapshot builder. Bytes are returned verbatim — the envelope
+   * wrapper, encrypted payload, and JSON-encoded UxfBundleRef stay
+   * intact so the receiving peer can persist them with a single
+   * `db.put` and let its own `listBundles()` decode them transparently.
+   *
+   * **No tombstones to surface.** Bundle refs do not get tombstoned in
+   * the current architecture — superseded refs transition via the
+   * `status: 'superseded'` field on a fresh `addBundle()` write, not via
+   * a tombstone marker. Phase B's tombstone-sticky rules therefore
+   * never fire here; the merge degenerates to "absent → write, live +
+   * live → no-op (first wins at Lamport=0)".
+   *
+   * Stable order: ascending lexicographic key.
+   */
+  async snapshot(): Promise<ReadonlyArray<SnapshotEntry>> {
+    let entries: Map<string, Uint8Array>;
+    try {
+      entries = await this.host.db.all(BUNDLE_KEY_PREFIX);
+    } catch {
+      return [];
+    }
+    const out: SnapshotEntry[] = [];
+    const sortedKeys = [...entries.keys()].sort();
+    for (const key of sortedKeys) {
+      if (!key.startsWith(BUNDLE_KEY_PREFIX)) continue;
+      const encryptedValue = entries.get(key);
+      if (encryptedValue === undefined) continue;
+      out.push({ key, encryptedValue });
+    }
+    return out;
+  }
+
+  /**
+   * Apply a remote peer's bundle-index snapshot. Each remote entry
+   * carries an envelope-wrapped, encrypted UxfBundleRef; the classifier
+   * decodes + decrypts + parses + validates before the merge primitive
+   * picks a winner.
+   *
+   * **Constant-Lamport semantics.** UxfBundleRef does not carry a
+   * Lamport field, so `live + live` ties always favour local (the
+   * first-wins behaviour matches Issue #166's refuse-write guard
+   * semantics extended to this surface). If two replicas independently
+   * transition the same CID from `active` to `superseded` after a
+   * consolidation, both writes are observationally idempotent (the
+   * resulting state is the same — superseded with the same
+   * `supersededBy`).
+   *
+   * **Side-effect: known-CID refresh.** After a successful JOIN that
+   * lands new bundles, this writer updates `knownBundleCids` so the
+   * consolidation gate and replication handler observe the freshly-
+   * landed refs.
+   */
+  async joinSnapshot(
+    remote: ReadonlyArray<SnapshotEntry>,
+  ): Promise<JoinResult> {
+    const result = await runJoinSnapshot(remote, {
+      classifyLocal: async (key) => {
+        if (!key.startsWith(BUNDLE_KEY_PREFIX)) return { kind: 'absent' };
+        let raw: Uint8Array | null;
+        try {
+          raw = await this.host.db.get(key);
+        } catch {
+          return { kind: 'absent' };
+        }
+        if (raw === null) return { kind: 'absent' };
+        const slot = await this.classifyBundleBytes(raw, /* remote = */ false);
+        return slot ?? { kind: 'absent' };
+      },
+      classifyRemote: async (entry) => {
+        if (!entry.key.startsWith(BUNDLE_KEY_PREFIX)) return null;
+        return this.classifyBundleBytes(entry.encryptedValue, /* remote = */ true);
+      },
+      writeRemote: async (key, bytes) => {
+        await this.host.db.put(key, bytes);
+        const cid = key.slice(BUNDLE_KEY_PREFIX.length);
+        if (cid.length > 0) {
+          this.host.getKnownBundleCids().add(cid);
+        }
+      },
+    });
+    return result;
+  }
+
+  /**
+   * Decode an envelope (if present), decrypt the inner payload, parse
+   * as JSON, and validate the shape is a `UxfBundleRef`. Returns a
+   * {@link ClassifiedSlot} on success or `null` on the remote path
+   * for any failure (the JOIN counts as `remoteRejectedMalformed`).
+   * On the local path, failure maps to `absent` so a well-formed
+   * remote can land.
+   *
+   * UxfBundleRef shape (per `profile/types.ts`):
+   *   - required: cid:string, status: 'active'|'superseded'|'unverified', createdAt:number
+   *   - optional: device, supersededBy, removeFromProfileAfter, tokenCount
+   */
+  private async classifyBundleBytes(
+    raw: Uint8Array,
+    remote: boolean,
+  ): Promise<ClassifiedSlot | null> {
+    if (!raw || raw.byteLength === 0) {
+      return remote ? null : { kind: 'absent' };
+    }
+    // Envelope decode — falls back to raw bytes for legacy (pre-T-D11)
+    // entries. Mirrors `listBundles()`.
+    let encryptedPayload: Uint8Array = raw;
+    try {
+      const envelope = decodeEntry(raw);
+      if (envelope.v === 1) {
+        encryptedPayload = envelope.payload;
+      }
+    } catch {
+      // Legacy raw-bytes write — use the raw payload directly.
+    }
+    const encryptionKey = this.host.getEncryptionKey();
+    let decrypted: Uint8Array;
+    try {
+      decrypted = encryptionKey
+        ? await decryptProfileValue(encryptionKey, encryptedPayload)
+        : encryptedPayload;
+    } catch {
+      return remote ? null : { kind: 'absent' };
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(new TextDecoder().decode(decrypted));
+    } catch {
+      return remote ? null : { kind: 'absent' };
+    }
+    if (!isUxfBundleRef(parsed)) {
+      return remote ? null : { kind: 'absent' };
+    }
+    // No Lamport field on bundle refs — treat as constant Lamport=0
+    // (matches the FinalizationQueue / RecipientContext sync writer
+    // semantics; see profile/prefix-sync-writer.ts).
+    return { kind: 'live', lamport: 0 };
+  }
+}
+
+/**
+ * Runtime guard for {@link UxfBundleRef}. Validates the required
+ * fields and the `status` enum; tolerates optional fields when
+ * present (`device`, `supersededBy`, `removeFromProfileAfter`,
+ * `tokenCount`).
+ */
+function isUxfBundleRef(value: unknown): value is UxfBundleRef {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const obj = value as Record<string, unknown>;
+  if (typeof obj.cid !== 'string' || obj.cid.length === 0) return false;
+  if (obj.status !== 'active' && obj.status !== 'superseded' && obj.status !== 'unverified') {
+    return false;
+  }
+  if (typeof obj.createdAt !== 'number' || !Number.isFinite(obj.createdAt)) return false;
+  // Optional fields: type-check when present.
+  if (obj.device !== undefined && typeof obj.device !== 'string') return false;
+  if (obj.supersededBy !== undefined && typeof obj.supersededBy !== 'string') return false;
+  if (
+    obj.removeFromProfileAfter !== undefined &&
+    typeof obj.removeFromProfileAfter !== 'number'
+  ) {
+    return false;
+  }
+  if (obj.tokenCount !== undefined && typeof obj.tokenCount !== 'number') return false;
+  return true;
 }
