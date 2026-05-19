@@ -442,6 +442,110 @@ Two important deltas needed:
 - **"Lean" snapshot variant** — bundle refs by CID only, no embedded CAR bytes. The fat format stays for the export/import CLI. Schema v2.
 - **Filter reversal** — today's export filter strips `tokens.bundle.*` and `consolidation.*` (operational state for export). For sync these ARE needed; the new lean snapshot includes them.
 
+**Implementation status** (2026-05-19 — branch `feat/outbox-followups-item15-phase-a`)
+
+Phase A and most of Phase B have landed locally as a sequence of commits on the
+branch above (not yet merged to `integration/all-fixes`). Use this status block
+to pick up where the work stopped:
+
+| Sub-phase | Status | Commit (short) | Files |
+|-----------|--------|----------------|-------|
+| Phase A | ✓ Done | `870fcd3` | `profile/profile-lean-snapshot.ts` + tests |
+| B.1 (shared merge helper) | ✓ Done | `e999727` | `profile/profile-snapshot-merge.ts` + tests |
+| B.2 (OutboxWriter) | ✓ Done | `c56641b` | `profile/outbox-writer.ts` + tests |
+| B.3 (SentLedgerWriter) | ✓ Done | `60b8929` | `profile/sent-ledger-writer.ts` + tests |
+| B.4 (DispositionWriter) | ⏸ Deferred | — | See "Deferred — B.4" below |
+| B.5 (Finalization + RecipientContext) | ✓ Done | `7806b93` | `profile/prefix-sync-writer.ts`, `profile/finalization-queue-storage-adapter.ts` + tests |
+| B.6 (BundleIndex) | ✓ Done | `6c3c0ee` | `profile/profile-token-storage/bundle-index.ts` + tests |
+| Phase C | Pending | — | — |
+| Phase D | Pending | — | — |
+| Phase E | Pending | — | — |
+| Phase F | Pending | — | — |
+| Phase G | Pending | — | — |
+
+**Implementation pattern that emerged during Phase B**
+
+Two flavours of per-writer JOIN exist; either pattern is now baked into
+the codebase and Phase C/D wiring can rely on both being available.
+
+  1. **Lamport-tracked, mutable entries** — OUTBOX, SENT. Each entry's
+     `lamport` field monotonically advances on every local write per §7.1.
+     The full Phase B merge table picks the winner by Lamport comparison.
+     `OutboxWriter` and `SentLedgerWriter` each implement `ProfileSyncWriter`
+     directly with their own decrypt/parse/Lamport-validate classifier.
+
+  2. **Constant-Lamport, content-immutable entries** — Finalization queue,
+     RecipientContext (both sub-prefixes), BundleIndex. Each entry is
+     written once at a key whose unique disambiguator (entryId, requestId,
+     tokenId, CID) ensures two replicas writing the same entry produce
+     byte-equivalent content. No explicit Lamport.
+
+     The shared helper `profile/prefix-sync-writer.ts` (`PrefixSyncWriter
+     implements ProfileSyncWriter`) wraps the constant-Lamport-0 pattern.
+     The merge degenerates to "absent → write; live+live → no-op (first
+     wins); tombstones stay sticky at Lamport=0=0 ties". `BundleIndex`
+     does NOT use `PrefixSyncWriter` (because of the envelope wrapper)
+     but applies the same constant-Lamport-0 semantics via a custom
+     classifier.
+
+**Public surface added by Phase B (for Phase D's dispatcher)**
+
+  - `OutboxWriter implements ProfileSyncWriter` (per-address — constructed
+    with `addressId`).
+  - `SentLedgerWriter implements ProfileSyncWriter` (per-address).
+  - `OrbitDbFinalizationQueueStorageAdapter.syncWriterFor(addressId)`
+    returns one ProfileSyncWriter for `${addr}.finalizationQueue.*`.
+  - `OrbitDbRecipientContextStorageAdapter.syncWritersFor(addressId)`
+    returns `{ requestContext, finalizationContext }` — two
+    ProfileSyncWriters covering `recipientContext.request.*` and
+    `recipientContext.finalization.*`.
+  - `BundleIndex implements ProfileSyncWriter` (singleton — no
+    addressId; the `tokens.bundle.*` namespace is wallet-global).
+
+The Phase D pull-side dispatcher in `profile/pointer-wiring.ts:387-533`
+should iterate active tracked addresses, instantiate per-address sync
+writers from the registered writer instances, dispatch each writer's
+`joinSnapshot()` over the writer's prefix-filtered slice of the remote
+snapshot's `entries[]`, then handle the wallet-global BundleIndex
+separately.
+
+**Deferred — B.4 (DispositionWriter)**
+
+Scope call needed before B.4 can be cut. Three layered surfaces:
+
+  - `_invalid` (`${addr}.invalid.{tokenId}.{contentHash}`) — content-immutable.
+    `PrefixSyncWriter` from B.5 would slot in directly, gated on
+    `validateUxf1Schema`.
+  - `_audit` (`${addr}.audit.{tokenId}.{contentHash}`) — same as `_invalid`.
+    The `_audit` records DO mutate (`auditStatus: 'audit-promoted'` set
+    on promotion) but at the same `lamport=0` semantics they'd converge
+    eventually-consistently with operator-visible divergence in the
+    interim.
+  - `_manifest` (`${addr}.manifest.{tokenId}`) — Lamport-tracked AND CAS-
+    guarded via `ManifestStore` with per-field merge rules (set-OR for
+    `audit_promoted_from`, max-merge for `lamport`, lex-min for
+    `splitParent`, etc.). A snapshot-JOIN that picks ONE side's bytes
+    verbatim would lose the per-field merge that `mergeManifestEntry`
+    runs at write time. Either:
+
+      (a) extend `runJoinSnapshot`'s `writeRemote` callback to accept a
+          per-field merger and have ManifestStore implement it, OR
+      (b) handle manifest JOIN outside `runJoinSnapshot` with a dedicated
+          `ManifestStore.joinSnapshot()` that runs the existing
+          per-field merger before persisting, OR
+      (c) defer manifest from the lean-snapshot sync path entirely and
+          let it continue to converge via OrbitDB replication only.
+
+The maintainer call decides which of (a)/(b)/(c) to take.
+
+**Phase G test scope after Item #15 lands**
+
+The G suite needs at minimum the test scenarios from item #9's "scope after
+Item #15" note: two-peer concurrent snapshot flushes where the aggregator
+anchors one and the loser re-polls + JOINs + re-publishes V+2.
+
+---
+
 **Acceptance criteria** (phased; each phase can be a separate PR):
 
 **Phase A — Lean snapshot format + builder**
