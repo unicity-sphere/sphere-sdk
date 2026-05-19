@@ -535,5 +535,30 @@ describe('Profile Integration', () => {
       notifier();
       expect(spy).toHaveBeenCalledTimes(1);
     });
+
+    // -------------------------------------------------------------------------
+    // Item #15 Phase D.2 wiring assertion
+    //
+    // The factory registers a snapshot-apply closure on the storage
+    // provider so that the pointer-wiring layer's `fetchAndJoin` can
+    // dispatch per-writer JOINs over a remote lean snapshot. The
+    // closure body's semantics are covered by
+    // tests/unit/profile/profile-snapshot-dispatcher.test.ts and the
+    // factory-level integration cases in this file (the writers/bundle
+    // index it needs come from the providers' lazy build methods).
+    // This test only asserts the closure was registered.
+    // -------------------------------------------------------------------------
+
+    it('registers a snapshot applier on ProfileStorageProvider', () => {
+      const cacheStorage = createMockCacheStorage();
+      const config: ProfileConfig = {
+        orbitDb: { privateKey: 'ff'.repeat(32) },
+      };
+
+      const providers = createProfileProviders(config, cacheStorage);
+
+      const applier = (providers.storage as any).snapshotApplier;
+      expect(typeof applier).toBe('function');
+    });
   });
 });

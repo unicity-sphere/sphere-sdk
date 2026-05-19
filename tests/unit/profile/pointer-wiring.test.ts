@@ -535,3 +535,196 @@ describe('fetchAndJoin (T-D3c)', () => {
     expect(typeof parsed.createdAt).toBe('number');
   });
 });
+
+// =============================================================================
+// Item #15 Phase D.2 — snapshot-aware fetchAndJoin path
+// =============================================================================
+
+describe('fetchAndJoin — Item #15 Phase D.2 snapshot apply', () => {
+  // Use a real CIDv1 (any). The actual content-address check happens
+  // inside the lean-snapshot parser, not in fetchAndJoin itself.
+  const TEST_CID_STRING = 'bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku';
+
+  /**
+   * Build a CAR that parseLeanProfileSnapshot accepts. The factory
+   * uses the production builder so the format stays in lockstep with
+   * the producer side.
+   */
+  async function buildSnapshotCar(): Promise<{ carBytes: Uint8Array; rootCid: string }> {
+    const { buildLeanProfileSnapshot } = await import('../../../profile/profile-lean-snapshot');
+    // Stub storage with one KV entry under an addressId.
+    const tokenStorageStub = {
+      listBundles: async () => new Map(),
+    };
+    const storageStub = {
+      keys: async () => ['DIRECT_aabbcc_ddeeff.outbox.id1'],
+      getEncryptedRaw: async (key: string) => {
+        if (key === 'DIRECT_aabbcc_ddeeff.outbox.id1') {
+          return Buffer.from(new Uint8Array([1, 2, 3])).toString('base64');
+        }
+        return null;
+      },
+    };
+    const result = await buildLeanProfileSnapshot({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      storage: storageStub as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      tokenStorage: tokenStorageStub as any,
+      chainPubkey: '02' + 'bb'.repeat(32),
+      network: 'testnet',
+      createdAt: 1_700_000_000_000,
+    });
+    return { carBytes: result.carBytes, rootCid: result.rootCid };
+  }
+
+  it('parses the CAR, calls applySnapshot, and persists the version', async () => {
+    const db = createMockDb();
+    const { carBytes, rootCid } = await buildSnapshotCar();
+
+    const { fetchFromIpfs } = await import('../../../profile/ipfs-client');
+    const fetchMock = fetchFromIpfs as ReturnType<typeof vi.fn>;
+    fetchMock.mockReset();
+    fetchMock.mockImplementation(async () => carBytes);
+
+    const persisted: number[] = [];
+    const applyCalls: Array<{ entryCount: number; bundleCount: number }> = [];
+    const applySnapshot = vi.fn(async (snapshot) => {
+      applyCalls.push({
+        entryCount: snapshot.entries.length,
+        bundleCount: snapshot.bundles.length,
+      });
+      return {
+        joinedAny: true,
+        addressesSeen: 1,
+        bundleEntriesSeen: 0,
+        counters: {
+          entriesEvaluated: 1,
+          liveLanded: 1,
+          tombstonesLanded: 0,
+          localWon: 0,
+          remoteRejectedMalformed: 0,
+        },
+      };
+    });
+
+    const { __internal } = await import('../../../profile/pointer-wiring');
+    const { CID } = await import('multiformats/cid');
+    const callback = __internal.buildFetchAndJoin({
+      db,
+      gateways: ['https://ipfs.example'],
+      persistLocalVersion: async (v: number) => {
+        persisted.push(v);
+      },
+      bundleEncryptionKey: new Uint8Array(32),
+      applySnapshot,
+    });
+
+    await callback(CID.parse(rootCid).bytes, 12);
+
+    expect(applySnapshot).toHaveBeenCalledTimes(1);
+    expect(applyCalls).toHaveLength(1);
+    expect(applyCalls[0].entryCount).toBe(1);
+    expect(persisted).toEqual([12]);
+
+    // Legacy bundle-ref write path MUST NOT run when applySnapshot is wired.
+    expect(db._store.size).toBe(0);
+  });
+
+  it('does NOT advance the version when applySnapshot throws', async () => {
+    const db = createMockDb();
+    const { carBytes, rootCid } = await buildSnapshotCar();
+
+    const { fetchFromIpfs } = await import('../../../profile/ipfs-client');
+    const fetchMock = fetchFromIpfs as ReturnType<typeof vi.fn>;
+    fetchMock.mockReset();
+    fetchMock.mockImplementation(async () => carBytes);
+
+    let persistCalled = false;
+    const applySnapshot = vi.fn(async () => {
+      throw new Error('dispatcher exploded');
+    });
+
+    const { __internal } = await import('../../../profile/pointer-wiring');
+    const { CID } = await import('multiformats/cid');
+    const callback = __internal.buildFetchAndJoin({
+      db,
+      gateways: ['https://ipfs.example'],
+      persistLocalVersion: async () => {
+        persistCalled = true;
+      },
+      bundleEncryptionKey: new Uint8Array(32),
+      applySnapshot,
+    });
+
+    await expect(
+      callback(CID.parse(rootCid).bytes, 99),
+    ).rejects.toMatchObject({
+      code: 'AGGREGATOR_POINTER_PROTOCOL_ERROR',
+    });
+    expect(persistCalled).toBe(false);
+    expect(applySnapshot).toHaveBeenCalledTimes(1);
+  });
+
+  it('throws PROTOCOL_ERROR when the CAR is not a valid lean snapshot', async () => {
+    const db = createMockDb();
+    const { fetchFromIpfs } = await import('../../../profile/ipfs-client');
+    const fetchMock = fetchFromIpfs as ReturnType<typeof vi.fn>;
+    fetchMock.mockReset();
+    // Return bytes that are not a parseable CAR — definitely not a
+    // lean snapshot.
+    fetchMock.mockImplementation(async () => new Uint8Array([0, 1, 2, 3, 4]));
+
+    let persistCalled = false;
+    const applySnapshot = vi.fn();
+
+    const { __internal } = await import('../../../profile/pointer-wiring');
+    const { CID } = await import('multiformats/cid');
+    const callback = __internal.buildFetchAndJoin({
+      db,
+      gateways: ['https://ipfs.example'],
+      persistLocalVersion: async () => {
+        persistCalled = true;
+      },
+      bundleEncryptionKey: new Uint8Array(32),
+      applySnapshot,
+    });
+
+    await expect(
+      callback(CID.parse(TEST_CID_STRING).bytes, 33),
+    ).rejects.toMatchObject({
+      code: 'AGGREGATOR_POINTER_PROTOCOL_ERROR',
+    });
+    expect(persistCalled).toBe(false);
+    expect(applySnapshot).not.toHaveBeenCalled();
+  });
+
+  it('legacy fallback (no applySnapshot wired) still writes bundle ref', async () => {
+    // Regression check: removing the snapshot-aware path should NOT
+    // affect callers that haven't wired the new callback.
+    const db = createMockDb();
+    const { fetchFromIpfs } = await import('../../../profile/ipfs-client');
+    const fetchMock = fetchFromIpfs as ReturnType<typeof vi.fn>;
+    fetchMock.mockReset();
+    fetchMock.mockImplementation(async () => new Uint8Array([0xbe, 0xef]));
+
+    const persisted: number[] = [];
+    const { __internal } = await import('../../../profile/pointer-wiring');
+    const { CID } = await import('multiformats/cid');
+    const callback = __internal.buildFetchAndJoin({
+      db,
+      gateways: ['https://ipfs.example'],
+      persistLocalVersion: async (v: number) => {
+        persisted.push(v);
+      },
+      bundleEncryptionKey: new Uint8Array(32).fill(0x99),
+      // applySnapshot intentionally omitted.
+    });
+
+    await callback(CID.parse(TEST_CID_STRING).bytes, 7);
+
+    // Legacy bundle-ref path ran.
+    const bundleKey = `tokens.bundle.${TEST_CID_STRING}`;
+    expect(db._store.has(bundleKey)).toBe(true);
+    expect(persisted).toEqual([7]);
+  });
+});

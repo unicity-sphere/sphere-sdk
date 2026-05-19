@@ -81,6 +81,11 @@ import { fetchCarFromGateway } from './aggregator-pointer/ipfs-car-fetch';
 import { fetchFromIpfs } from './ipfs-client';
 import { deriveProfileEncryptionKey, encryptProfileValue } from './encryption';
 import { buildLocalEntry } from './oplog-entry';
+import {
+  parseLeanProfileSnapshot,
+  type LeanProfileSnapshot,
+} from './profile-lean-snapshot';
+import type { ApplySnapshotResult } from './profile-snapshot-dispatcher';
 import type { ProfileDatabase, UxfBundleRef } from './types';
 
 /** OrbitDB key prefix for UXF bundle references — mirrors ProfileTokenStorageProvider. */
@@ -165,6 +170,26 @@ export interface PointerWiringInput {
    * undefined or set to 'mainnet' / 'testnet' / 'dev'.
    */
   readonly network?: string;
+  /**
+   * Item #15 Phase D.2 — pull-side snapshot applier. When wired, the
+   * `fetchAndJoin` callback parses the remote CAR as a
+   * {@link LeanProfileSnapshot} and dispatches per-writer JOIN via
+   * this callback instead of writing a single `tokens.bundle.{cid}`
+   * ref. The legacy bundle-CID-only behaviour is preserved as a
+   * fallback when this is omitted — exclusively for tests + dev
+   * harnesses that don't spin up the full provider stack. Production
+   * wiring (factory.ts) MUST supply this callback under Item #15.
+   *
+   * On parse failure (the remote CAR is not a lean snapshot, or is
+   * malformed), the dispatcher throws a typed pointer-layer error so
+   * the reconcile loop surfaces a clear diagnostic instead of
+   * silently falling back to the legacy path. Treating a parse
+   * failure as "legacy bundle CAR" would defeat the lean-snapshot
+   * propagation contract.
+   */
+  readonly applySnapshot?: (
+    snapshot: LeanProfileSnapshot,
+  ) => Promise<ApplySnapshotResult>;
   /** Turn on verbose logging for the wiring helper itself. */
   readonly debug?: boolean;
 }
@@ -394,8 +419,22 @@ function buildFetchAndJoin(deps: {
    * `tokens.bundle.{cid}` are encrypted-by-convention on the write
    * side; mismatched encryption here would make reads fail to
    * decrypt.
+   *
+   * Only used on the legacy bundle-CID fallback path. When
+   * `applySnapshot` is wired (Item #15 D.2), the receiver writes the
+   * snapshot's KV entries through per-writer JOINs and never
+   * re-encrypts here.
    */
   bundleEncryptionKey: Uint8Array;
+  /**
+   * Item #15 Phase D.2 — when wired, the remote CAR is parsed as a
+   * {@link LeanProfileSnapshot} and dispatched through this callback.
+   * The legacy bundle-CID-only behaviour applies only when this is
+   * absent (test / pre-D.2 wallets during migration).
+   */
+  applySnapshot?: (
+    snapshot: LeanProfileSnapshot,
+  ) => Promise<ApplySnapshotResult>;
 }): FetchAndJoinCallback {
   return async (remoteCid: Uint8Array, remoteVersion: PointerVersion) => {
     // 1. Decode CID bytes to the canonical string form.
@@ -420,8 +459,9 @@ function buildFetchAndJoin(deps: {
 
     // 2. Fetch CAR via profile/ipfs-client — it already performs the
     //    CID content-address verify internally.
+    let carBytes: Uint8Array;
     try {
-      await fetchFromIpfs([...deps.gateways], cidString);
+      carBytes = await fetchFromIpfs([...deps.gateways], cidString);
     } catch (err) {
       throw new AggregatorPointerError(
         AggregatorPointerErrorCode.CAR_UNAVAILABLE,
@@ -431,10 +471,61 @@ function buildFetchAndJoin(deps: {
       );
     }
 
-    // 3. Record the remote bundle ref so the next JOIN pass picks it
-    //    up. Mirror ProfileTokenStorageProvider.addBundle exactly:
-    //    same JSON shape, same encryption (deterministic per-wallet
-    //    key — see comment at the call site).
+    // 3a. Item #15 Phase D.2 — if a snapshot applier is wired, parse
+    //     the CAR as a lean snapshot and dispatch per-writer JOIN.
+    //     OrbitDB writes happen inside the writers' `joinSnapshot()`;
+    //     the cursor advance still runs LAST so a JOIN failure does
+    //     not strand the cursor past unconsumed remote state.
+    if (deps.applySnapshot !== undefined) {
+      let snapshot: LeanProfileSnapshot;
+      try {
+        snapshot = await parseLeanProfileSnapshot(carBytes);
+      } catch (err) {
+        // The remote CAR is malformed or not a lean snapshot. Treat
+        // as a hard protocol error — falling back to the legacy
+        // bundle-CID write would silently absorb the wrong CAR
+        // shape and leave the JOIN unconsumed. The next reconcile
+        // pass will re-fetch and re-attempt; if the remote keeps
+        // publishing malformed CARs, an operator must intervene.
+        throw new AggregatorPointerError(
+          AggregatorPointerErrorCode.PROTOCOL_ERROR,
+          `fetchAndJoin: lean-snapshot parse failed for ${cidString} at v=${remoteVersion}: ${err instanceof Error ? err.message : String(err)}`,
+          undefined,
+          { cause: err },
+        );
+      }
+
+      try {
+        await deps.applySnapshot(snapshot);
+      } catch (err) {
+        // Throwing here keeps the cursor behind the unconsumed
+        // remote, so the next reconcile pass re-fetches + re-applies.
+        // Per-writer errors are already swallowed inside the
+        // dispatcher (see profile/profile-snapshot-dispatcher.ts) —
+        // an exception that escapes is a hard failure (e.g. the
+        // dispatcher itself threw before any writer ran).
+        throw new AggregatorPointerError(
+          AggregatorPointerErrorCode.PROTOCOL_ERROR,
+          `fetchAndJoin: applySnapshot threw for ${cidString} at v=${remoteVersion}: ${err instanceof Error ? err.message : String(err)}`,
+          undefined,
+          { cause: err },
+        );
+      }
+
+      // Cursor advance AFTER all per-writer JOINs persist. Mirrors the
+      // legacy-path ordering — a failure here leaves the JOIN-applied
+      // entries durable (the dispatcher's writers persist as they go),
+      // while the cursor stays behind so the next reconcile re-runs the
+      // dispatch idempotently against the same (or newer) remote.
+      await deps.persistLocalVersion(remoteVersion);
+      return;
+    }
+
+    // 3b. Legacy fallback — applySnapshot not wired. Record the remote
+    //    bundle ref so the next JOIN pass picks it up. Mirror
+    //    ProfileTokenStorageProvider.addBundle exactly: same JSON
+    //    shape, same encryption (deterministic per-wallet key — see
+    //    comment at the call site).
     const ref: UxfBundleRef = {
       cid: cidString,
       status: 'active',
@@ -730,6 +821,11 @@ export async function buildProfilePointerLayer(
       gateways: input.ipfsGateways,
       persistLocalVersion,
       bundleEncryptionKey,
+      // Item #15 Phase D.2 — when the host wired a snapshot applier,
+      // route the fetched CAR through it instead of the legacy
+      // bundle-CID write path. Production wiring (factory.ts) supplies
+      // this; pre-D.2 callers fall through to the legacy fallback.
+      applySnapshot: input.applySnapshot,
     });
 
     const layer = new ProfilePointerLayer({

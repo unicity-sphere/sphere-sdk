@@ -478,6 +478,28 @@ export class ProfileStorageProvider implements StorageProvider {
   private profileDirtyNotifier: (() => void) | null = null;
 
   /**
+   * Item #15 Phase D.2 — host-supplied snapshot-apply callback. When
+   * set, `tryBuildPointerLayer` threads it into the pointer-wiring
+   * layer; on receiving a remote pointer the `fetchAndJoin` callback
+   * parses the CAR as a lean profile snapshot and dispatches per-
+   * writer JOIN through this callback instead of writing a single
+   * `tokens.bundle.{cid}` ref.
+   *
+   * Null until {@link setSnapshotApplier} runs (typically during the
+   * Profile factory wiring step alongside the token-storage facade,
+   * AFTER both providers are constructed so the closure can capture
+   * `storage.buildOutboxWriter(...)` and `tokenStorage.getBundleIndex()`).
+   *
+   * The applier is read each time `tryBuildPointerLayer` runs (i.e.
+   * each attach cycle), so callers may change it across reconnects.
+   * In practice the factory sets it once at construction.
+   */
+  private snapshotApplier:
+    | ((snapshot: import('./profile-lean-snapshot').LeanProfileSnapshot)
+        => Promise<import('./profile-snapshot-dispatcher').ApplySnapshotResult>)
+    | null = null;
+
+  /**
    * Derived: true iff OrbitDB has been attached.
    * Single source of truth — no separate `dbConnected` field to diverge.
    */
@@ -499,6 +521,31 @@ export class ProfileStorageProvider implements StorageProvider {
    */
   setProfileDirtyNotifier(notifier: (() => void) | null): void {
     this.profileDirtyNotifier = notifier;
+  }
+
+  /**
+   * Item #15 Phase D.2 — register the host's snapshot-apply callback.
+   * Idempotent: callers MAY re-register (the most recent callback
+   * wins). Pass `null` to disable.
+   *
+   * The applier is threaded into the pointer-wiring layer on the next
+   * `tryBuildPointerLayer` run (called from `doConnect`); callers
+   * should set it BEFORE the first `connect()` call so it lands on
+   * the first attach cycle. The factory wires it during provider
+   * construction, satisfying this ordering.
+   *
+   * Returns `null` callback semantics: the pointer-wiring layer falls
+   * back to the legacy bundle-CID-only write path. Production wiring
+   * (factory.ts) must call this with a non-null applier under
+   * Item #15.
+   */
+  setSnapshotApplier(
+    applier:
+      | ((snapshot: import('./profile-lean-snapshot').LeanProfileSnapshot)
+          => Promise<import('./profile-snapshot-dispatcher').ApplySnapshotResult>)
+      | null,
+  ): void {
+    this.snapshotApplier = applier;
   }
 
   constructor(
@@ -772,6 +819,14 @@ export class ProfileStorageProvider implements StorageProvider {
       // the pointer layer's master-key construction can reject the
       // canonical 0x01×32 KAT vector outside test-vectors deployments.
       network: this.options?.config?.network,
+      // Item #15 Phase D.2 — thread the host's snapshot applier (set
+      // via `setSnapshotApplier` during factory wiring) into the
+      // pointer-wiring layer. When wired, the `fetchAndJoin` callback
+      // parses the remote CAR as a lean profile snapshot and
+      // dispatches per-writer JOIN through this callback. When
+      // omitted (tests + pre-D.2 wallets), the wiring falls back to
+      // the legacy bundle-CID-only write path.
+      applySnapshot: this.snapshotApplier ?? undefined,
       debug: this.debug,
     });
 

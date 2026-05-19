@@ -764,6 +764,23 @@ export class ProfileTokenStorageProvider
     return this.lifecycleManager.publishAggregatorPointerBestEffort(cidString);
   }
 
+  /**
+   * Item #15 Phase D.2 — public accessor for the wallet-global
+   * {@link BundleIndex}. Exposed so the factory's pull-side dispatcher
+   * (`runProfileSnapshotJoin`) can dispatch JOIN over the
+   * `tokens.bundle.*` slice of a remote lean snapshot. BundleIndex
+   * implements {@link ProfileSyncWriter} and owns the
+   * encrypted-envelope read/write contract for bundle refs.
+   *
+   * The handle remains owned by the provider — callers MUST NOT cache
+   * it across `shutdown()`/`destroy()` cycles. Returns `null` only if
+   * the provider has been torn down (today the field is non-null after
+   * construction).
+   */
+  getBundleIndex(): BundleIndex | null {
+    return this.bundleIndex ?? null;
+  }
+
   // ---------------------------------------------------------------------------
   // Lifecycle
   // ---------------------------------------------------------------------------

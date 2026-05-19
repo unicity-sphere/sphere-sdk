@@ -26,9 +26,19 @@ import { DEFAULT_IPFS_GATEWAYS } from '../constants';
 import {
   buildLeanProfileSnapshot,
   type BuildLeanProfileSnapshotResult,
+  type LeanProfileSnapshot,
 } from './profile-lean-snapshot';
 import { pinToIpfs } from './ipfs-client';
 import type { ProfilePointerLayer } from './aggregator-pointer';
+import {
+  runProfileSnapshotJoin,
+  type ApplySnapshotResult,
+  type SnapshotJoinWriterEntry,
+} from './profile-snapshot-dispatcher';
+import {
+  finalizationContextPrefix,
+  requestContextPrefix,
+} from './finalization-queue-storage-adapter';
 
 // Re-export so existing callers that imported `ProfileSnapshotPublishResult`
 // from `profile/factory` still resolve (the canonical declaration moved
@@ -144,6 +154,69 @@ export async function runProfileDirtyFlush(
     );
   }
   return result;
+}
+
+/**
+ * Item #15 Phase D.2 — dependencies for the snapshot-apply closure.
+ *
+ * Extracted so the closure body can be unit-tested in isolation
+ * without spinning up real OrbitDB / IPFS. The closure may fire BEFORE
+ * encryption is set up (cold attach), BEFORE identity is bound, or
+ * during shutdown — the `writersFor` and `getBundleIndex` accessors
+ * are lazy and tolerate missing preconditions by returning empty
+ * arrays / null.
+ */
+export interface ProfileSnapshotApplyDeps {
+  /**
+   * Build the per-address sync writers for an `addressId` observed in
+   * the remote snapshot. Production wiring returns the union of:
+   *   - storage.buildOutboxWriter(addressId)        @ `${addressId}.outbox.`
+   *   - storage.buildSentLedgerWriter(addressId)   @ `${addressId}.sent.`
+   *   - finalizationStorage.syncWriterFor(addressId) @ `${addressId}.finalizationQueue.`
+   *   - recipientContextStorage.syncWritersFor(addressId).requestContext
+   *     @ `${addressId}.recipientContext.request.`
+   *   - recipientContextStorage.syncWritersFor(addressId).finalizationContext
+   *     @ `${addressId}.recipientContext.finalization.`
+   *
+   * Returns an empty array when encryption / identity preconditions
+   * are not yet satisfied (writer-builders return null and the
+   * closure filters them out).
+   */
+  readonly writersFor: (addressId: string) => ReadonlyArray<SnapshotJoinWriterEntry>;
+  /**
+   * Wallet-global BundleIndex writer accessor. Returns `null` when
+   * the token storage layer is not yet attached or has been torn
+   * down. The dispatcher logs and skips the bundle-JOIN step on
+   * `null`.
+   */
+  readonly getBundleIndex: () => import('./profile-snapshot-merge').ProfileSyncWriter | null;
+  /** Optional debug logger; falls back to the SDK logger. */
+  readonly log?: (msg: string) => void;
+}
+
+/**
+ * Item #15 Phase D.2 — body of the snapshot-apply closure wired into
+ * `ProfileStorageProvider.setSnapshotApplier`. The pointer-wiring
+ * layer's `fetchAndJoin` callback parses the remote CAR as a
+ * {@link LeanProfileSnapshot} and dispatches into this closure.
+ *
+ * Extracted as an exported function so it can be unit-tested in
+ * isolation against stub `writersFor` / `getBundleIndex` accessors.
+ *
+ * The pure dispatcher in `profile/profile-snapshot-dispatcher.ts` does
+ * the actual per-writer JOIN; this wrapper exists to wire the lazy
+ * accessor pattern (the closure may fire across attach cycles where
+ * the underlying writers come and go).
+ */
+export function runProfileSnapshotApply(
+  snapshot: LeanProfileSnapshot,
+  deps: ProfileSnapshotApplyDeps,
+): Promise<ApplySnapshotResult> {
+  return runProfileSnapshotJoin(snapshot, {
+    writersFor: deps.writersFor,
+    bundleIndex: deps.getBundleIndex(),
+    log: deps.log,
+  });
 }
 
 /**
@@ -312,6 +385,59 @@ export function createProfileProviders(
   // BundleIndex). Without this hop, writer mutations would never
   // reach the debouncer — Phase C.1 only landed the producer side.
   storage.setProfileDirtyNotifier(() => tokenStorage.notifyProfileDirty());
+
+  // Item #15 Phase D.2 — wire the pull-side snapshot applier. When
+  // the pointer-wiring layer's `fetchAndJoin` fetches a remote CAR,
+  // it parses it as a lean profile snapshot and dispatches into this
+  // closure. The closure builds per-address sync writers lazily so a
+  // remote snapshot referencing an HD address the receiver has not
+  // yet activated still converges (the JOIN persists the entries
+  // under the new address prefix; subsequent loads pick them up via
+  // the storage layer's prefix scans).
+  //
+  // The Finalization + RecipientContext adapters are factory-built per
+  // apply call so we capture the most recent encryption key — they
+  // would otherwise be constructed once during this factory call,
+  // before the wallet's `setIdentity` derives the encryption key, and
+  // hand back null. Calling the build* methods on each apply costs a
+  // few object allocations but the result is durable across writer
+  // instances (the adapter is a thin handle over `db` + key).
+  storage.setSnapshotApplier((snapshot) =>
+    runProfileSnapshotApply(snapshot, {
+      writersFor: (addressId) => {
+        const writers: SnapshotJoinWriterEntry[] = [];
+        const outbox = storage.buildOutboxWriter(addressId);
+        if (outbox !== null) {
+          writers.push({ keyPrefix: `${addressId}.outbox.`, writer: outbox });
+        }
+        const sent = storage.buildSentLedgerWriter(addressId);
+        if (sent !== null) {
+          writers.push({ keyPrefix: `${addressId}.sent.`, writer: sent });
+        }
+        const finalizationAdapter = storage.buildFinalizationQueueStorageAdapter();
+        if (finalizationAdapter !== null) {
+          writers.push({
+            keyPrefix: `${addressId}.finalizationQueue.`,
+            writer: finalizationAdapter.syncWriterFor(addressId),
+          });
+        }
+        const recipientContextAdapter = storage.buildRecipientContextStorageAdapter();
+        if (recipientContextAdapter !== null) {
+          const pair = recipientContextAdapter.syncWritersFor(addressId);
+          writers.push({
+            keyPrefix: requestContextPrefix(addressId),
+            writer: pair.requestContext,
+          });
+          writers.push({
+            keyPrefix: finalizationContextPrefix(addressId),
+            writer: pair.finalizationContext,
+          });
+        }
+        return writers;
+      },
+      getBundleIndex: () => tokenStorage.getBundleIndex(),
+    }),
+  );
 
   return { storage, tokenStorage };
 }
