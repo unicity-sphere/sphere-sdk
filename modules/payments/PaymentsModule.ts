@@ -203,6 +203,8 @@ import { ManifestCas, type MinimalManifestStorage } from '../../profile/manifest
 // Sphere bootstrap MAY override via the existing `install*` methods to
 // inject OrbitDB-backed dispositionStorage + manifestStore (see
 // {@link OrbitDbDispositionStorageAdapter}).
+import { DispositionWriter } from '../../profile/disposition-writer';
+import type { DispositionRecord } from '../../types/disposition';
 import {
   InMemoryDispositionStorageAdapter,
 } from '../../profile/disposition-storage-adapters';
@@ -3903,6 +3905,107 @@ export class PaymentsModule {
           `(transfer:off-record-spent event already fired; operator triage recommended): ` +
           `${removeErr instanceof Error ? removeErr.message : String(removeErr)}`,
       );
+      // Return early — without successful local cleanup, writing the
+      // durable AUDIT record below could leave the wallet in a hybrid
+      // state (active-pool token + `_audit` record for the same
+      // tokenId). The next rescan cycle will retry both paths once
+      // the underlying issue clears.
+      return;
+    }
+    // Issue #174 (PR #B) — durable AUDIT record. Best-effort: the
+    // writer is optional (`_spentStateAuditWriter === null` when the
+    // bootstrap layer hasn't installed it, e.g. legacy wallets, no
+    // OrbitDb backing). When wired, synthesize a `DispositionRecord`
+    // with `disposition='AUDIT'`, `reason='off-record-spend'`,
+    // `auditStatus='audit-off-record-spend'`, and route through
+    // `dispositionWriter.write()` — same code path the disposition
+    // engine uses for received off-record-spent bundles (§5.3 [E]).
+    //
+    // Synthesized fields:
+    //   - `tokenId`: SDK genesis tokenId from `sdkData`. Empty
+    //     string when unparseable → routes to the `_audit-orphan`
+    //     keyspace per `auditKeyFor`.
+    //   - `observedTokenContentHash`: SHA-256 of `sdkData` —
+    //     64-char hex, satisfies `assertCanonicalContentHash`.
+    //     Stable: two probes of the same token in the same state
+    //     produce the same hash, so `mergeAuditEntry` correctly
+    //     dedups.
+    //   - `bundleCid`: synthetic `local-rescan-{addr}-{detectedAt}`
+    //     marker since no incoming bundle drove this detection.
+    //     Stamped in `bundleCidsObserved`.
+    //   - `senderTransportPubkey`: our own `chainPubkey` (the entity
+    //     that observed the off-record spend is THIS device).
+    //   - `auditStatus`: `'audit-off-record-spend'` — the canonical
+    //     initial state for §5.3 [E].
+    //
+    // Never throws — defense-in-depth converts every error path
+    // (writer not wired, identity missing, write rejection) to a
+    // warn-log. The event already fired; the local cleanup
+    // succeeded; the durable record is observational forensics.
+    // Steelman H3 (PR #179 review): lazy field read — the writer is
+    // looked up AT PROBE TIME, not at closure-bind time. This means
+    // the bootstrap layer (Sphere) can install the writer BEFORE OR
+    // AFTER `payments.initialize()` (which starts the rescan worker);
+    // the closure observes whatever value is in the field when the
+    // probe actually fires. With the default `intervalMs = 5 min`,
+    // any reasonable bootstrap order completes well before the first
+    // probe. If the writer is null at probe time (e.g. legacy
+    // wallets without an OrbitDb adapter, or a race between bootstrap
+    // and an aggressively-tuned `intervalMs` in tests), we degrade
+    // gracefully: local cleanup already happened above; only the
+    // durable forensic record is skipped.
+    const writer = this._spentStateAuditWriter;
+    if (writer === null) return;
+    const identity = this.deps?.identity;
+    if (identity === undefined) {
+      logger.warn(
+        'Payments',
+        `defaultSpentStateTransition: identity missing — skipping AUDIT record for ${params.token.id.slice(0, 12)}…`,
+      );
+      return;
+    }
+    const directAddr =
+      typeof identity.directAddress === 'string' && identity.directAddress.length > 0
+        ? identity.directAddress
+        : null;
+    const addr = directAddr !== null ? computeAddressId(directAddr) : identity.chainPubkey;
+    try {
+      const sdkTokenId =
+        extractTokenIdFromSdkData(params.token.sdkData) ?? '';
+      const sdkDataBytes = new TextEncoder().encode(params.token.sdkData ?? '');
+      const digest = sha256(sdkDataBytes);
+      let observedTokenContentHash = '';
+      for (const b of digest) observedTokenContentHash += b.toString(16).padStart(2, '0');
+      const auditRecord: DispositionRecord = {
+        disposition: 'AUDIT',
+        tokenId: sdkTokenId,
+        observedTokenContentHash: observedTokenContentHash as DispositionRecord['observedTokenContentHash'],
+        // Steelman H1 (PR #179 review): include the local token id so
+        // two distinct tokens probed in the SAME millisecond produce
+        // distinct synthetic markers in their respective
+        // `bundleCidsObserved` lists. Storage key is keyed by
+        // (addr, tokenId, observedTokenContentHash) so distinct keys
+        // were guaranteed already; this fix is for forensic fidelity
+        // when an operator replays the bundleCidsObserved accumulator.
+        bundleCid: `local-rescan-${addr}-${params.token.id.slice(0, 12)}-${params.detectedAt}`,
+        senderTransportPubkey: identity.chainPubkey,
+        auditStatus: 'audit-off-record-spend',
+        reason: 'off-record-spend',
+      };
+      await writer.write(addr, auditRecord);
+      logger.debug(
+        'Payments',
+        `defaultSpentStateTransition: AUDIT record written for ${params.token.id.slice(0, 12)}… ` +
+          `(addr=${addr.slice(0, 16)}…, tokenId=${sdkTokenId.slice(0, 16)}…, ` +
+          `observedTokenContentHash=${observedTokenContentHash.slice(0, 16)}…)`,
+      );
+    } catch (writerErr) {
+      logger.warn(
+        'Payments',
+        `defaultSpentStateTransition: AUDIT record write failed for ${params.token.id.slice(0, 12)}… ` +
+          `(local cleanup already applied; durable record absent until next rescan or operator replay): ` +
+          `${writerErr instanceof Error ? writerErr.message : String(writerErr)}`,
+      );
     }
   }
 
@@ -4023,6 +4126,25 @@ export class PaymentsModule {
    * Issue #174.
    */
   private _spentStateRescanTransitionToAudit: TransitionToAuditFn | null = null;
+  /**
+   * @internal — installed by the bootstrap layer (Sphere) via
+   * {@link installSpentStateAuditWriter}. When non-null, the default
+   * spent-state-rescan closure ({@link defaultSpentStateTransition})
+   * synthesizes an AUDIT {@link DispositionRecord} (reason
+   * `'off-record-spend'`, §5.3 [E] / §5.4) and calls `writer.write()`
+   * AFTER the local `removeToken()` cleanup. When null, the closure
+   * does the local cleanup only.
+   *
+   * The writer's AUDIT path (`writeAudit`) touches only the per-entry
+   * `_audit` collection — the `manifestStore` field on the writer is
+   * unused for this consumer. Sphere constructs a writer whose
+   * `manifestStore` is a throw-on-access stub; if a non-AUDIT
+   * disposition is ever routed through this writer (it shouldn't), the
+   * stub fires loudly.
+   *
+   * Issue #174 / PR #B (DispositionWriter wiring).
+   */
+  private _spentStateAuditWriter: DispositionWriter | null = null;
   /** @internal — auto-installed when `features.tombstoneGcWorker` is on.
    *  OUTBOX-SEND-FOLLOWUPS item #4. */
   private tombstoneGcWorker: TombstoneGcWorker | null = null;
@@ -4527,6 +4649,34 @@ export class PaymentsModule {
     transition: TransitionToAuditFn | null,
   ): void {
     this._spentStateRescanTransitionToAudit = transition;
+  }
+
+  /**
+   * Issue #174 — install the {@link DispositionWriter} used by the
+   * spent-state rescan worker's default closure to synthesize a
+   * durable `_audit` record (reason `'off-record-spend'`, §5.3 [E] /
+   * §5.4) ALONGSIDE the local `removeToken()` cleanup.
+   *
+   * The bootstrap layer (Sphere) builds the writer from the wallet's
+   * OrbitDb-backed `OrbitDbDispositionStorageAdapter` + a throw-on-
+   * access stub `ManifestStore` (the AUDIT path doesn't touch
+   * `manifestStore`; the stub fails loudly if a non-AUDIT disposition
+   * is ever routed through this writer). Tests inject a fully-mocked
+   * writer.
+   *
+   * Idempotent: a second call replaces the previous writer.
+   *
+   * Passing `null` removes the writer — the default closure reverts to
+   * local-cleanup-only behavior (the same as not having a wired
+   * `DispositionWriter` at all). This is the right surface for a
+   * wallet teardown / hot-swap.
+   *
+   * **No-op when the spent-state-rescan worker isn't running** (i.e.
+   * `features.spentStateRescan === false`) — the writer is just
+   * stashed; nothing invokes it until the next probe fires.
+   */
+  installSpentStateAuditWriter(writer: DispositionWriter | null): void {
+    this._spentStateAuditWriter = writer;
   }
 
   /**
