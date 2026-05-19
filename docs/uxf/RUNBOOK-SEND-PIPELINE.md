@@ -206,7 +206,11 @@ The most common cause is **a sibling instance of the same wallet** — desktop +
 - **`true`**  → neither the local OUTBOX nor the SENT ledger holds any record referencing `tokenId`, so the spend cannot have been initiated on THIS device. Almost certainly a sibling-device spend.
 - **`false`** → either OUTBOX or SENT has a record. The local instance is (or was) the spender; the manifest just hasn't been GC'd to reflect the spend yet. Rare edge case — typically only happens if the SENT-write path raced the next rescan cycle.
 
-**Wallet-side state after the event.** Out of the box, the auto-installed default closure (`PaymentsModule.defaultSpentStateTransition`) calls `removeToken()` on the off-record-spent token — archive + tombstone + active-map deletion + persist. The token leaves the spendable pool; the tombstone prevents re-sync resurrection. (When `DispositionWriter` becomes wired in production, callers can ALSO synthesize a durable `_audit` record per §5.3 [E] by passing a custom closure to `payments.setSpentStateRescanTransitionToAudit(...)`; the local Token.status flip and the durable `_audit` record are orthogonal.) If you've explicitly overridden the closure with a no-op, the worker stays in detect-only mode — the event fires, but the local manifest still shows the token as `'confirmed'`.
+**Wallet-side state after the event.** Out of the box, the auto-installed default closure (`PaymentsModule.defaultSpentStateTransition`) does TWO things:
+1. Calls `removeToken()` on the off-record-spent token — archive + tombstone + active-map deletion + persist. The token leaves the spendable pool; the tombstone prevents re-sync resurrection.
+2. When a `DispositionWriter` is installed via `payments.installSpentStateAuditWriter()` (Sphere wires this from the wallet's `OrbitDbDispositionStorageAdapter` at bootstrap), ALSO writes a durable `_audit` record (reason `'off-record-spend'`, `auditStatus: 'audit-off-record-spend'`, §5.3 [E] / §5.4) for forensic traceability.
+
+If you've explicitly overridden the closure with a no-op via `setSpentStateRescanTransitionToAudit(...)`, the worker stays in detect-only mode — the event fires, but neither cleanup nor audit-record write happens. Legacy wallets without an `OrbitDbDispositionStorageAdapter` get the local cleanup but skip the durable `_audit` record (the writer slot stays null).
 
 **Diagnostic data to collect.**
 
