@@ -151,7 +151,14 @@ The OUTBOX is a working queue that **drains** to SENT as deliveries complete. To
 
 ---
 
-### 5. Soak validation + default-ON flip for the new workers
+### 5. Soak validation + default-ON flip for the new workers — **PARTIAL**
+
+> **Status (2026-05-20)**:
+>
+>   - `features.spentStateRescan` — **FLIPPED default-ON** in PR #178 (Item #16). Default closure does archive + tombstone + map-delete via `removeToken`; durable `_audit` record via PR #179 when DispositionWriter is wired.
+>   - `features.orphanAutoRecovery` — **FLIPPED default-ON** in this PR. Item #1's aggregator cross-check prerequisite is satisfied (`PaymentsModule.defaultOrphanRecovery` queries `oracle.isSpent(sourceStateHash)` before flipping status and escalates to `'manual'` when the aggregator reports the source state spent). Without this flip a crashed send leaves the source token unspendable indefinitely; with it, the load-tail orphan sweep auto-recovers.
+>   - `features.tombstoneGcWorker` — **STILL default-OFF**. Storage-reclamation surface; not a correctness path. The 30-day default retention is conservative and the worker is fully tested (see Item #4). Defer flip until storage growth becomes operationally relevant or an organization-wide soak measurement confirms safety.
+>   - `features.nostrPersistenceVerifier` — **STILL default-OFF**. Adds relay query traffic proportional to SENT volume. Item #2's Item-#15 scope clarification eliminated most of the cross-device retention gap; the remaining surface is the inline-CAR retention case (covered by Item #6.a). Defer flip until relay-load measurement.
 
 **Why it matters**: two new workers landed in default-OFF state pending soak validation:
 - `features.nostrPersistenceVerifier` — adds relay query traffic

@@ -243,12 +243,18 @@ describe('PaymentsModule.detectOrphanSpendingTokens — orphanAutoRecovery (Issu
     vi.clearAllMocks();
   });
 
-  it('default-OFF: features.orphanAutoRecovery omitted → no attemptRecovery wired (Phase-1 behavior preserved)', async () => {
+  it('explicit OFF: features.orphanAutoRecovery=false → no attemptRecovery wired (Phase-1 behavior preserved)', async () => {
     const emit = vi.fn();
     const payments = createPaymentsModule({
       debug: false,
       autoSync: false,
-      features: { recoveryWorker: false, finalizationWorker: false },
+      // OUTBOX-SEND-FOLLOWUPS item #5 flipped this flag default-ON
+      // (PR #N, branch `feat/orphan-auto-recovery-default-on`). To
+      // exercise the legacy Phase-1 detect-only behavior, explicit
+      // `false` is now required. The test name was updated from
+      // "default-OFF" to "explicit OFF" to reflect the post-flip
+      // semantics.
+      features: { recoveryWorker: false, finalizationWorker: false, orphanAutoRecovery: false },
     });
     payments.initialize({ ...createPaymentsDeps(), emitEvent: emit });
     const { outboxWriter, sentLedgerWriter } = createWriterPair();
