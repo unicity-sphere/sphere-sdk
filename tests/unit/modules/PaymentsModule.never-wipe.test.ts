@@ -583,4 +583,91 @@ describe('PaymentsModule.load() — NEVER-WIPE invariant', () => {
     );
     expect(doubleSpendEvents.length).toBe(0);
   });
+
+  // ---------------------------------------------------------------------------
+  // OUTBOX-SEND-FOLLOWUPS Item #14 Phase 2 work item 8 — `getAssets`/balance
+  // regression test for the JOIN-divergent loser path. After PR #182's drop,
+  // the loser token must be absent from BOTH `confirmedAmount` and
+  // `unconfirmedAmount` (and from every count) so the loser device's UI
+  // numbers converge to the truth after reconciliation.
+  //
+  // Pre-PR #182 the loser inflated `unconfirmedAmount` indefinitely because
+  // `aggregateTokens` includes `'transferring'` tokens in the unconfirmed
+  // bucket. PR #182 removes the loser from `this.tokens` entirely; this test
+  // pins that contract end-to-end through `getAssets()`.
+  // ---------------------------------------------------------------------------
+  it('drops the JOIN-divergent loser from every getAssets() balance bucket (Phase 2 work item 8)', async () => {
+    // Loser device's in-flight send at status='transferring' for tokenA.
+    // The amount is the default '1000000' from createMockToken — large
+    // enough that an inflation regression would be visible.
+    const loserInFlight = createMockToken({
+      tokenId: TOKEN_ID_A,
+      stateHash: STATE_HASH_2,
+      id: 'loser-in-flight',
+      status: 'transferring',
+    });
+    await module.addToken(loserInFlight);
+
+    // Winner state of the SAME tokenId at a DIFFERENT stateHash — the
+    // L3 aggregator's anchored choice.
+    const winnerOnChain = createMockToken({
+      tokenId: TOKEN_ID_A,
+      stateHash: STATE_HASH_1,
+      id: 'winner-on-chain',
+    });
+    const txfWinner = JSON.parse(winnerOnChain.sdkData);
+    const tokenStorage = deps.tokenStorageProviders.get('mock');
+    (tokenStorage!.load as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      success: true,
+      source: 'local' as const,
+      data: {
+        _meta: {
+          version: 1,
+          address: 'alpha1testaddress',
+          formatVersion: '1.0',
+          updatedAt: Date.now(),
+        },
+        [`_${winnerOnChain.id}`]: txfWinner,
+      } as unknown as TxfStorageDataBase,
+      timestamp: Date.now(),
+    });
+
+    await module.load();
+
+    // Sanity: loser dropped, winner survives (mirrors PR #182's test).
+    const survivors = module.getTokens();
+    const survivorIds = new Set(survivors.map((t) => t.id));
+    expect(survivorIds.has(loserInFlight.id)).toBe(false);
+    expect(survivorIds.has(winnerOnChain.id)).toBe(true);
+
+    // ── Phase 2 work item 8 contract ──────────────────────────────────────
+    // The dropped loser's amount ('1000000') must NOT appear in any
+    // balance bucket for the UCT_HEX coin. Only the winner's '1000000'
+    // contributes — the post-drop totals are exactly one token's worth.
+    const assets = await module.getAssets('UCT_HEX');
+    expect(assets).toHaveLength(1);
+
+    const uct = assets[0]!;
+    expect(uct.coinId).toBe('UCT_HEX');
+
+    // `confirmedAmount` excludes the dropped loser AND only counts the
+    // winner (a single 'confirmed' token at '1000000').
+    expect(uct.confirmedAmount).toBe('1000000');
+    expect(uct.confirmedTokenCount).toBe(1);
+
+    // `unconfirmedAmount` is zero. Pre-PR #182, this would have been
+    // '1000000' (the 'transferring' loser inflated this bucket); the
+    // bug fix removes the loser from `this.tokens` entirely so the
+    // unconfirmed bucket converges to the truth.
+    expect(uct.unconfirmedAmount).toBe('0');
+    expect(uct.unconfirmedTokenCount).toBe(0);
+
+    // `totalAmount = confirmedAmount + unconfirmedAmount`, so the
+    // dropped loser is excluded here too.
+    expect(uct.totalAmount).toBe('1000000');
+    expect(uct.tokenCount).toBe(1);
+
+    // No `'transferring'` tokens remain — the loser was the only one.
+    expect(uct.transferringTokenCount).toBe(0);
+  });
 });
