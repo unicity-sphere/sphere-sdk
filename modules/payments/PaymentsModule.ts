@@ -15047,6 +15047,23 @@ export class PaymentsModule {
       // the newer snapshot — matches addToken's CASE 2 semantics.
       if (snapTokenId) {
         let supersededOlder = false;
+        // OUTBOX-SEND-FOLLOWUPS Item #14 Phase 2 work item 5 — JOIN-
+        // divergent loser detection. When the preserved-from-memory
+        // snapshot token is at status='transferring' (an in-flight
+        // send) AND the storage load surfaced a DIFFERENT chain head
+        // for the same genesisTokenId, the L3 aggregator has already
+        // arbitrated against the local in-flight send (multi-device
+        // double-spend race). The storage token is the winner; the
+        // snapshot is a stale loser. We drop it (don't restore) and
+        // emit `transfer:double-spend-detected` for operator visibility.
+        //
+        // For non-'transferring' snapshot statuses (e.g. 'confirmed')
+        // we preserve the legacy dual-state restore — the spent-state
+        // rescan worker (Item #16, default-ON post-soak) catches the
+        // off-record spend on its next 5-min probe via
+        // `oracle.isSpent` and routes through `defaultSpentStateTransition`.
+        let supersededByJoinDivergence = false;
+        let winnerStateHash: string | null = null;
         for (const [existingId, existingToken] of this.tokens) {
           if (!hasSameGenesisTokenId(existingToken, snapshotToken)) continue;
           const existingStateHash = extractStateHashFromSdkData(existingToken.sdkData);
@@ -15059,14 +15076,53 @@ export class PaymentsModule {
             supersededOlder = true;
             break;
           }
-          // Different state: leave the storage version in place AND
-          // restore the snapshot's version too. PaymentsModule's
-          // downstream logic (manifest derivation, fork detection)
-          // already handles same-tokenId-multiple-states. Dropping
-          // either side would lose information.
+          // Different state. Branch on the snapshot token's status:
+          if (snapshotToken.status === 'transferring') {
+            // JOIN-divergent loser — drop the snapshot.
+            supersededByJoinDivergence = true;
+            winnerStateHash = existingStateHash ?? null;
+            void existingId; // silence unused-var on the non-debug path
+          }
+          // Either branch ends the per-token loop — we've found the
+          // same-genesisTokenId match.
           break;
         }
         if (supersededOlder) continue;
+        if (supersededByJoinDivergence) {
+          // Don't restore. The token's value is gone (aggregator
+          // anchored the winner's commit; our submit failed at
+          // `STATE_ALREADY_SPENT_BY_OTHER` per Item #14 Phase 1).
+          // The recipient field on the loser's bundle is the local
+          // intended recipient; we don't have authoritative info on
+          // the winning recipient. Emit with empty `ourIntendedRecipient`
+          // and `winnerStateHash` so an operator can correlate to
+          // the relevant SENT entry / OUTBOX archive if needed.
+          //
+          // The event matches the Item #14 Phase 1 reactive surface
+          // (`transfer:double-spend-detected`) — the reactive surface
+          // fires at submit-time, this surface fires at JOIN-time.
+          // Operators expect to see the event from EITHER source.
+          try {
+            this.deps?.emitEvent('transfer:double-spend-detected', {
+              tokenId: snapTokenId ?? '',
+              sourceStateHash: snapStateHash ?? '',
+              ourIntendedRecipient: '',
+              detectedAt: Date.now(),
+            });
+          } catch (emitErr) {
+            logger.warn(
+              'Payments',
+              `loadFromStorageData: emit transfer:double-spend-detected failed for token ${snapshotId.slice(0, 12)}…: ${emitErr instanceof Error ? emitErr.message : String(emitErr)}`,
+            );
+          }
+          logger.debug(
+            'Payments',
+            `loadFromStorageData: JOIN-divergent loser dropped (tokenId=${snapTokenId?.slice(0, 16)}…, ` +
+              `loser-stateHash=${snapStateHash?.slice(0, 16)}…, winner-stateHash=${winnerStateHash?.slice(0, 16) ?? '?'}…, ` +
+              `snapshotId=${snapshotId.slice(0, 12)}…). Item #14 Phase 2 work item 5 — multi-device double-spend race.`,
+          );
+          continue;
+        }
       }
 
       this.tokens.set(snapshotId, snapshotToken);

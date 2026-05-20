@@ -440,4 +440,136 @@ describe('PaymentsModule.load() — NEVER-WIPE invariant', () => {
     expect(survivorIds.has(memoryNewer.id)).toBe(true);
     expect(survivorIds.has(storageOlder.id)).toBe(true);
   });
+
+  // ---------------------------------------------------------------------------
+  // OUTBOX-SEND-FOLLOWUPS Item #14 Phase 2 work item 5 — JOIN-divergent
+  // loser detection. When a preserved-from-memory 'transferring' token
+  // shares a genesisTokenId with a winner-state storage token (different
+  // stateHash), the L3 aggregator has already arbitrated against the
+  // local in-flight send. The loser is dropped (not restored) and the
+  // `transfer:double-spend-detected` event is emitted.
+  // ---------------------------------------------------------------------------
+
+  it('drops a `transferring` snapshot when storage has a divergent state for the same tokenId (JOIN-divergent loser)', async () => {
+    // In-memory has tokenA at STATE_HASH_2 at status='transferring'
+    // (the local in-flight send the loser device attempted). Storage
+    // returns tokenA at STATE_HASH_1 (the winning chain). The loser
+    // must be dropped from the active pool.
+    const loserInFlight = createMockToken({
+      tokenId: TOKEN_ID_A,
+      stateHash: STATE_HASH_2,
+      id: 'loser-in-flight',
+      status: 'transferring',
+    });
+    await module.addToken(loserInFlight);
+
+    const winnerOnChain = createMockToken({
+      tokenId: TOKEN_ID_A,
+      stateHash: STATE_HASH_1,
+      id: 'winner-on-chain',
+    });
+    const txfWinner = JSON.parse(winnerOnChain.sdkData);
+    const tokenStorage = deps.tokenStorageProviders.get('mock');
+    (tokenStorage!.load as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      success: true,
+      source: 'local' as const,
+      data: {
+        _meta: {
+          version: 1,
+          address: 'alpha1testaddress',
+          formatVersion: '1.0',
+          updatedAt: Date.now(),
+        },
+        [`_${winnerOnChain.id}`]: txfWinner,
+      } as unknown as TxfStorageDataBase,
+      timestamp: Date.now(),
+    });
+
+    const emitEvent = deps.emitEvent as ReturnType<typeof vi.fn>;
+    emitEvent.mockClear();
+
+    await module.load();
+
+    // Loser dropped, winner survives.
+    const survivors = module.getTokens();
+    const survivorIds = new Set(survivors.map((t) => t.id));
+    expect(survivorIds.has(loserInFlight.id)).toBe(false); // dropped
+    expect(survivorIds.has(winnerOnChain.id)).toBe(true);
+
+    // Event emitted with the loser's tokenId + stateHash.
+    const doubleSpendEvents = emitEvent.mock.calls.filter(
+      (call) => call[0] === 'transfer:double-spend-detected',
+    );
+    expect(doubleSpendEvents.length).toBe(1);
+    const payload = doubleSpendEvents[0]![1] as {
+      tokenId: string;
+      sourceStateHash: string;
+      ourIntendedRecipient: string;
+      detectedAt: number;
+    };
+    expect(payload.tokenId).toBe(TOKEN_ID_A);
+    expect(payload.sourceStateHash).toBe(STATE_HASH_2);
+    // JOIN-time detection doesn't have access to the original send's
+    // intended recipient (the OUTBOX entry was either never persisted
+    // or has been GC'd by the time the merge runs). The reactive
+    // submit-time path carries the recipient; this path leaves it empty.
+    expect(payload.ourIntendedRecipient).toBe('');
+    expect(typeof payload.detectedAt).toBe('number');
+  });
+
+  it('preserves a `confirmed` snapshot with divergent state (legacy dual-state behavior; spent-state rescan handles it)', async () => {
+    // Same fixture as the JOIN-divergent loser test BUT the in-memory
+    // token is at status='confirmed', NOT 'transferring'. This is the
+    // "stale belief" case (sibling-device spend that hasn't yet flowed
+    // through profile sync). The spent-state-rescan worker (Item #16,
+    // default-ON) catches it on its next 5-min `oracle.isSpent` probe;
+    // load() preserves the dual state.
+    const staleBelief = createMockToken({
+      tokenId: TOKEN_ID_A,
+      stateHash: STATE_HASH_2,
+      id: 'stale-belief',
+      status: 'confirmed',
+    });
+    await module.addToken(staleBelief);
+
+    const winnerOnChain = createMockToken({
+      tokenId: TOKEN_ID_A,
+      stateHash: STATE_HASH_1,
+      id: 'winner-on-chain',
+      status: 'confirmed',
+    });
+    const txfWinner = JSON.parse(winnerOnChain.sdkData);
+    const tokenStorage = deps.tokenStorageProviders.get('mock');
+    (tokenStorage!.load as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      success: true,
+      source: 'local' as const,
+      data: {
+        _meta: {
+          version: 1,
+          address: 'alpha1testaddress',
+          formatVersion: '1.0',
+          updatedAt: Date.now(),
+        },
+        [`_${winnerOnChain.id}`]: txfWinner,
+      } as unknown as TxfStorageDataBase,
+      timestamp: Date.now(),
+    });
+
+    const emitEvent = deps.emitEvent as ReturnType<typeof vi.fn>;
+    emitEvent.mockClear();
+
+    await module.load();
+
+    // Both survive (legacy dual-state).
+    const survivorIds = new Set(module.getTokens().map((t) => t.id));
+    expect(survivorIds.has(staleBelief.id)).toBe(true);
+    expect(survivorIds.has(winnerOnChain.id)).toBe(true);
+
+    // No double-spend event fired (this path is owned by the
+    // spent-state-rescan worker, not by loadFromStorageData).
+    const doubleSpendEvents = emitEvent.mock.calls.filter(
+      (call) => call[0] === 'transfer:double-spend-detected',
+    );
+    expect(doubleSpendEvents.length).toBe(0);
+  });
 });
