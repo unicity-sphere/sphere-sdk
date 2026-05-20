@@ -519,8 +519,14 @@ describe('Wave 5 — dispositionWriter save-failure ctx retention coherence', ()
   it('deletes recipientFinalizationContext only AFTER save() succeeds — the Wave 5 fix', () => {
     // The Wave 5 fix moves the delete INSIDE the try block, immediately
     // after `await save()`. We pin that structural shape.
+    //
+    // Issue #195 follow-up: the post-delete window inside the try was
+    // widened from 400 to 1200 chars to accommodate the new
+    // `transfer:confirmed` emit (plus its comment block) that fires AFTER
+    // the delete inside the try. The structural invariant — delete is
+    // AFTER save(), INSIDE the try — is unchanged.
     const fixPattern =
-      /try\s*\{\s*await\s+save\(\)\s*;[\s\S]{0,600}recipientFinalizationContext\.delete\(tokenId\)\s*;[\s\S]{0,400}\}\s*catch\s*\(\s*saveErr\s*\)/;
+      /try\s*\{\s*await\s+save\(\)\s*;[\s\S]{0,600}recipientFinalizationContext\.delete\(tokenId\)\s*;[\s\S]{0,1200}\}\s*catch\s*\(\s*saveErr\s*\)/;
     expect(src.match(fixPattern)).not.toBeNull();
   });
 

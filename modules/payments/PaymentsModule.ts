@@ -16389,6 +16389,20 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
               // forever. Now mirrors the main success path below.
               recipientFinalizationContext.delete(tokenId);
               saveFailureStreak.delete(ctx.localTokenId);
+              // Issue #195 (follow-up): emit `transfer:confirmed` so
+              // listeners (notably AccountingModule) learn the inbound
+              // deposit token is now aggregator-confirmed. Without this
+              // emission an `invoice:covered` event never re-fires with
+              // `confirmed: true`, leaving downstream consumers
+              // (e.g. escrow swap orchestrator) stuck at PARTIAL_DEPOSIT
+              // even after my CAS-mismatch fix unblocks the dispositionWriter.
+              // Payload shape mirrors the NOSTR-FIRST and V5 emit sites.
+              emit('transfer:confirmed', {
+                id: crypto.randomUUID(),
+                status: 'completed',
+                tokens: [updatedFallback],
+                tokenTransfers: [],
+              });
             } catch (saveErr) {
               // Wave 6 critical fix — roll back the in-memory mutation
               // so retries can re-enter the `status === 'pending'`
@@ -16470,6 +16484,20 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
             'Payments',
             `Task #151: token ${ctx.localTokenId.slice(0, 16)} finalized via recipient worker`,
           );
+          // Issue #195 (follow-up): emit `transfer:confirmed` so
+          // listeners (notably AccountingModule) learn the inbound
+          // deposit token is now aggregator-confirmed. Without this
+          // emission an `invoice:covered` event never re-fires with
+          // `confirmed: true`, leaving downstream consumers (e.g. the
+          // escrow swap orchestrator) stuck at PARTIAL_DEPOSIT even
+          // after the CAS-mismatch fix unblocks the dispositionWriter.
+          // Payload shape mirrors the NOSTR-FIRST and V5 emit sites.
+          emit('transfer:confirmed', {
+            id: crypto.randomUUID(),
+            status: 'completed',
+            tokens: [updated],
+            tokenTransfers: [],
+          });
         } catch (saveErr) {
           const saveMsg = `Task #151: save() after finalization threw: ${saveErr instanceof Error ? saveErr.message : String(saveErr)}`;
           logger.warn('Payments', saveMsg);
