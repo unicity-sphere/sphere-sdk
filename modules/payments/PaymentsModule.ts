@@ -16397,6 +16397,23 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
               // (e.g. escrow swap orchestrator) stuck at PARTIAL_DEPOSIT
               // even after my CAS-mismatch fix unblocks the dispositionWriter.
               // Payload shape mirrors the NOSTR-FIRST and V5 emit sites.
+              //
+              // CAVEAT (steelman finding): `updatedFallback.sdkData` is in
+              // SENDER-PREDICATE form — the recipient never ran
+              // `finalizeTransferToken` on this path (it requires stClient
+              // + trustBase, both missing here). The token is correctly
+              // marked 'confirmed' for accounting purposes (the aggregator
+              // anchored the commitment) but is NOT yet spendable: any
+              // subsequent spend would build the commitment with the
+              // sender's sourceState predicate while the authenticator
+              // carries this wallet's pubkey, and `submitTransferCommitment`
+              // would reject with "Authenticator does not match source
+              // state predicate." The NOSTR-FIRST finalization path
+              // (`handleCommitmentOnlyTransfer` → line ~13900) overwrites
+              // `sdkData` with the properly finalized form once stClient
+              // + trustBase become available. Listeners that read
+              // `sdkData` for spend operations MUST guard against this
+              // intermediate state.
               emit('transfer:confirmed', {
                 id: crypto.randomUUID(),
                 status: 'completed',

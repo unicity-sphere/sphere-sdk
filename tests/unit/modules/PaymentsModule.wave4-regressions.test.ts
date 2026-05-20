@@ -1540,3 +1540,246 @@ describe('Wave 6 — REAL UXF round-trip: pkg.ingestAll → toCar → fromCar �
     expect(graftCalled).toBe(false);
   });
 });
+
+// =============================================================================
+// I. Issue #195 follow-up — dispositionWriter emits `transfer:confirmed`
+// =============================================================================
+//
+// Pins the contract added by commit 360ed22 (`fix(payments)(#195): emit
+// transfer:confirmed from recipient dispositionWriter`): both the main
+// success path AND the stClient/trustBase-missing fallback path MUST emit
+// `transfer:confirmed` after `await save()` succeeds, so listeners
+// (notably AccountingModule) learn the inbound deposit token is now
+// aggregator-confirmed and `invoice:covered` can re-fire with
+// `confirmed: true`.
+//
+// Without this emit, the escrow swap orchestrator hangs at
+// PARTIAL_DEPOSIT even after the CAS-mismatch fix unblocks step 5 —
+// see sphere-sdk issue #195 and sphere-cli PR #16 / issue #163.
+//
+// Reuses the module-level mocks declared at the top of section F.
+
+describe('Issue #195 — dispositionWriter emits transfer:confirmed', () => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let buildDefaultFinalizationWorkerRecipient: any;
+
+  beforeAll(async () => {
+    const mod = await import('../../../modules/payments/PaymentsModule');
+    buildDefaultFinalizationWorkerRecipient = (
+      mod as unknown as { buildDefaultFinalizationWorkerRecipient: unknown }
+    ).buildDefaultFinalizationWorkerRecipient;
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  /**
+   * Build a builder configured for the issue #195 follow-up tests.
+   * Mirrors the section-F `makeBuilder` shape but parameterises whether
+   * `getStateTransitionClient` returns a stub (main path) or undefined
+   * (fallback path).
+   */
+  function makeBuilder(opts: {
+    saveImpl: () => Promise<void>;
+    emit: ReturnType<typeof vi.fn>;
+    tokenId: string;
+    localTokenId: string;
+    stClientAvailable: boolean;
+  }) {
+    const tokens = new Map<string, import('../../../types').Token>();
+    tokens.set(opts.localTokenId, {
+      id: opts.localTokenId,
+      coinId: 'UCT',
+      symbol: 'UCT',
+      name: 'Unicity',
+      decimals: 8,
+      amount: '100',
+      sdkData: '{}',
+      status: 'pending',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+
+    const recipientFinalizationContext = new Map<string, unknown>();
+    recipientFinalizationContext.set(opts.tokenId, {
+      localTokenId: opts.localTokenId,
+      sourceTokenJson: { stub: 'src' },
+      lastTxJson: { stub: 'lastTx' },
+      requestIdHex: '00'.repeat(34),
+    });
+
+    const oracle = {
+      getProof: vi.fn().mockResolvedValue({ proof: { stub: 'proof' } }),
+      validateToken: vi.fn().mockResolvedValue({ valid: true }),
+      getStateTransitionClient: vi.fn().mockReturnValue({}),
+      getAggregatorClient: vi.fn().mockReturnValue({}),
+      waitForProofSdk: vi.fn(),
+    };
+
+    const built = buildDefaultFinalizationWorkerRecipient({
+      addressId: 'addr-test',
+      oracle,
+      recipientRequestContextMap: new Map(),
+      recipientFinalizationContext,
+      tokens,
+      finalizeTransferToken: vi.fn().mockResolvedValue({
+        toJSON: () => ({ stub: 'finalized-token' }),
+      }),
+      // Returning undefined here forces the fallback path; returning a
+      // stub object exercises the main success path. The trustBase
+      // companion getter follows the same toggle.
+      getStateTransitionClient: () => (opts.stClientAvailable ? ({} as unknown) : undefined),
+      getTrustBase: () => (opts.stClientAvailable ? ({}) : undefined),
+      save: opts.saveImpl,
+      emit: opts.emit,
+    });
+
+    return { built, tokens };
+  }
+
+  it('main success path → emits transfer:confirmed with the updated token', async () => {
+    const tokenId = 'tok-issue195-main';
+    const localTokenId = 'local-issue195-main';
+    const emit = vi.fn();
+
+    const { built, tokens } = makeBuilder({
+      saveImpl: vi.fn().mockResolvedValue(undefined),
+      emit,
+      tokenId,
+      localTokenId,
+      stClientAvailable: true,
+    });
+
+    await built.dispositionWriter.write('addr-test', {
+      tokenId,
+      disposition: 'VALID',
+    } as never);
+
+    const confirmedCalls = emit.mock.calls.filter(
+      (call) => call[0] === 'transfer:confirmed',
+    );
+    expect(confirmedCalls).toHaveLength(1);
+
+    const payload = confirmedCalls[0][1];
+    expect(payload).toMatchObject({
+      status: 'completed',
+    });
+    expect(typeof payload.id).toBe('string');
+    expect(payload.id.length).toBeGreaterThan(0);
+    expect(payload.tokens).toHaveLength(1);
+    expect(payload.tokens[0]).toMatchObject({
+      id: localTokenId,
+      status: 'confirmed',
+    });
+    // The main path overwrites sdkData with the finalized form before
+    // emitting — distinct from the fallback path which preserves the
+    // sender-predicate sdkData.
+    expect(payload.tokens[0].sdkData).toBe(
+      JSON.stringify({ stub: 'finalized-token' }),
+    );
+    expect(payload.tokenTransfers).toEqual([]);
+
+    // Local token also reflects the confirmed state.
+    expect(tokens.get(localTokenId)?.status).toBe('confirmed');
+  });
+
+  it('stClient-fallback path (stClient/trustBase missing) → emits transfer:confirmed with sender-predicate sdkData', async () => {
+    const tokenId = 'tok-issue195-fallback';
+    const localTokenId = 'local-issue195-fallback';
+    const emit = vi.fn();
+
+    const { built, tokens } = makeBuilder({
+      saveImpl: vi.fn().mockResolvedValue(undefined),
+      emit,
+      tokenId,
+      localTokenId,
+      stClientAvailable: false,
+    });
+
+    await built.dispositionWriter.write('addr-test', {
+      tokenId,
+      disposition: 'VALID',
+    } as never);
+
+    const confirmedCalls = emit.mock.calls.filter(
+      (call) => call[0] === 'transfer:confirmed',
+    );
+    expect(confirmedCalls).toHaveLength(1);
+
+    const payload = confirmedCalls[0][1];
+    expect(payload.tokens[0]).toMatchObject({
+      id: localTokenId,
+      status: 'confirmed',
+    });
+    // CAVEAT (pinned by the in-source comment): the fallback path does
+    // NOT re-finalize sdkData — it stays in sender-predicate form. The
+    // emit is for accounting attribution only; subsequent spend MUST
+    // wait until the NOSTR-FIRST finalization path overwrites sdkData.
+    expect(payload.tokens[0].sdkData).toBe('{}');
+
+    expect(tokens.get(localTokenId)?.status).toBe('confirmed');
+  });
+
+  it('main path save() throws → no transfer:confirmed emit (emit is INSIDE try, after save)', async () => {
+    const tokenId = 'tok-issue195-save-throws-main';
+    const localTokenId = 'local-issue195-save-throws-main';
+    const emit = vi.fn();
+
+    const { built } = makeBuilder({
+      saveImpl: vi.fn().mockRejectedValue(new Error('disk full')),
+      emit,
+      tokenId,
+      localTokenId,
+      stClientAvailable: true,
+    });
+
+    await built.dispositionWriter.write('addr-test', {
+      tokenId,
+      disposition: 'VALID',
+    } as never);
+
+    // The emit lives inside `try { await save(); ... emit(...); }` so a
+    // save throw skips the emit entirely. Pinning this prevents future
+    // regressions that move the emit before save() or out of the try.
+    const confirmedCalls = emit.mock.calls.filter(
+      (call) => call[0] === 'transfer:confirmed',
+    );
+    expect(confirmedCalls).toHaveLength(0);
+
+    // operator-alert MUST still fire so persistence failures are visible.
+    const alertCalls = emit.mock.calls.filter(
+      (call) => call[0] === 'transfer:operator-alert',
+    );
+    expect(alertCalls.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('fallback path save() throws → no transfer:confirmed emit', async () => {
+    const tokenId = 'tok-issue195-save-throws-fallback';
+    const localTokenId = 'local-issue195-save-throws-fallback';
+    const emit = vi.fn();
+
+    const { built } = makeBuilder({
+      saveImpl: vi.fn().mockRejectedValue(new Error('disk full')),
+      emit,
+      tokenId,
+      localTokenId,
+      stClientAvailable: false,
+    });
+
+    await built.dispositionWriter.write('addr-test', {
+      tokenId,
+      disposition: 'VALID',
+    } as never);
+
+    const confirmedCalls = emit.mock.calls.filter(
+      (call) => call[0] === 'transfer:confirmed',
+    );
+    expect(confirmedCalls).toHaveLength(0);
+
+    const alertCalls = emit.mock.calls.filter(
+      (call) => call[0] === 'transfer:operator-alert',
+    );
+    expect(alertCalls.length).toBeGreaterThanOrEqual(1);
+  });
+});
