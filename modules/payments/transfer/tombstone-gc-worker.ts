@@ -21,9 +21,9 @@
  * `gcExpiredTombstones()` documents the same contract.
  *
  * **Feature-flag gated.** Auto-installed from `PaymentsModule` when
- * `features.tombstoneGcWorker` is `true`. Default-OFF for the
- * initial soak window (mirrors the rollout pattern used for
- * `nostrPersistenceVerifier`).
+ * `features.tombstoneGcWorker` is `true`. Default-ON after the
+ * OUTBOX-SEND-FOLLOWUPS item #5 soak — set the flag explicitly to
+ * `false` to suppress (e.g. timer-sensitive unit tests).
  *
  * @module modules/payments/transfer/tombstone-gc-worker
  */

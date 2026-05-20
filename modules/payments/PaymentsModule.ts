@@ -1068,7 +1068,7 @@ export interface UxfTransferFeatures {
   readonly nostrPersistenceVerifier?: boolean;
   /**
    * OUTBOX-SEND-FOLLOWUPS item #4 — tombstone garbage collection.
-   * Default `false` (opt-in for the initial soak window).
+   * Default `true` (default-ON after soak; flipped under item #5).
    *
    * When ON, auto-installs a {@link TombstoneGcWorker} that
    * periodically sweeps tombstoned OUTBOX and SENT slots whose
@@ -1083,10 +1083,11 @@ export interface UxfTransferFeatures {
    * pre-sync state that would resurrect the slot, so the marker
    * itself is safe to drop.
    *
-   * Default-OFF mirrors `nostrPersistenceVerifier`. Long-lived
-   * wallets accumulating millions of tombstones over years are the
-   * target; for a wallet under a few hundred sends per day, the GC
-   * is an optimisation. Set the flag explicitly to enable.
+   * The worker self-skips when no OUTBOX or SENT writer is installed,
+   * so the default-ON flip is safe even on legacy-only wallets (it
+   * just no-ops every cycle). Set `false` explicitly to suppress
+   * (e.g. timer-sensitive unit tests or deployments that prefer
+   * manual reclamation).
    */
   readonly tombstoneGcWorker?: boolean;
   /**
@@ -1613,11 +1614,17 @@ export class PaymentsModule {
       // tolerates the load.
       nostrPersistenceVerifier:
         config?.features?.nostrPersistenceVerifier ?? false,
-      // OUTBOX-SEND-FOLLOWUPS item #4 — tombstone GC. Default-OFF:
-      // long-lived high-volume wallets accumulate tombstone bytes; the
-      // sweep is an optimisation, not a correctness path. Flip ON
-      // explicitly when storage growth becomes operationally relevant.
-      tombstoneGcWorker: config?.features?.tombstoneGcWorker ?? false,
+      // OUTBOX-SEND-FOLLOWUPS item #4 — tombstone GC. Default-ON after
+      // soak: the sweeper reclaims OrbitDB log bytes by replacing
+      // tombstone markers older than `retentionMs` (default 30 days)
+      // with `db.del()` calls. The 30-day default is conservative
+      // (longer than any realistic concurrent-replica pre-sync window
+      // per Issue #166 P1 #2 safety contract) so the flip is safe.
+      // Storage-reclamation is opportunistic — the worker self-skips
+      // when no OUTBOX or SENT writer is installed. Set `false`
+      // explicitly to suppress (e.g. timer-sensitive unit tests or
+      // deployments that prefer manual reclamation).
+      tombstoneGcWorker: config?.features?.tombstoneGcWorker ?? true,
       // Issue #166 P2 #1 — orphan-spending auto-recovery. Default-ON
       // after the OUTBOX-SEND-FOLLOWUPS item #1 prerequisite (aggregator
       // cross-check before restore) landed. `defaultOrphanRecovery`
@@ -2181,7 +2188,7 @@ export class PaymentsModule {
     }
 
     // OUTBOX-SEND-FOLLOWUPS item #4 — auto-install the tombstone GC
-    // worker. Default-OFF feature gate; when ON the worker periodically
+    // worker. Default-ON after item #5 soak: the worker periodically
     // reclaims storage occupied by tombstones whose retention window
     // has elapsed. Both writers self-skip when no writer is installed,
     // so the start() call is safe even before bootstrap installs them.
