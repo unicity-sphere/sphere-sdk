@@ -45,7 +45,15 @@ The OUTBOX is a working queue that **drains** to SENT as deliveries complete. To
 
 ## Open follow-ups (priority order)
 
-### 1. Aggregator cross-check before orphan recovery (P2 #1 follow-up)
+### 1. Aggregator cross-check before orphan recovery (P2 #1 follow-up) — **SHIPPED**
+
+> **Status (2026-05-20)**: LANDED. `PaymentsModule.defaultOrphanRecovery` (`modules/payments/PaymentsModule.ts:~3725-3800`) now extracts the source state hash from the orphan token's `sdkData` and queries `oracle.isSpent(sourceStateHash)` BEFORE flipping status. The three branches per the original acceptance criteria are all in place:
+>
+>   - aggregator UNSPENT → safe to restore (flips `'transferring'` → `'confirmed'`, persists, returns `'recovered'`).
+>   - aggregator SPENT → escalate to manual triage (returns `'manual'` with a forensic `logger.error` carrying the state hash + operator-action guidance).
+>   - aggregator RPC throws OR state hash unparseable → fail-closed to manual triage (returns `'manual'` with a `logger.warn`).
+>
+> The safety-contract precondition the original criteria listed for the default-ON flip is now satisfied. `features.orphanAutoRecovery` remains default-OFF pending the soak validation tracked under item #5.
 
 **Why it matters**: today `defaultOrphanRecovery` (gated by `features.orphanAutoRecovery`, default-OFF) flips orphan token status from `'transferring'` to `'confirmed'` based purely on "not in OUTBOX or SENT." This assumes the spending commit never reached the aggregator. In the rare race where the commit DID land (crash happened between `commitSources` returning and `outbox.create` writing), the restored token's local state hash drifts from the aggregator's view — the next operation surfaces a confusing state-mismatch error.
 
@@ -97,7 +105,9 @@ The OUTBOX is a working queue that **drains** to SENT as deliveries complete. To
 
 ---
 
-### 3. `SentLedgerWriter.contains()` in-memory index (P4 #3 follow-up)
+### 3. `SentLedgerWriter.contains()` in-memory index (P4 #3 follow-up) — **SHIPPED**
+
+> **Status (2026-05-20)**: LANDED. `SentLedgerWriter` (`profile/sent-ledger-writer.ts:~142`) carries a lazy `tokenIndex: Map<string, Set<string>>` populated on first `contains()` / `findByTokenId()` call via `ensureIndex()`. The companion `entryTokenIds` map lets `write()` / `delete()` maintain the index incrementally without re-decrypting. Cross-replica staleness defense (see the verify-on-hit step in `contains()`) handles the case where a remote peer tombstones an entry our in-memory index still references. Both methods are now O(1) on the miss path and O(b) on the hit path, where b is the bucket size (typically 1). The cost-contract test at `tests/unit/profile/sent-ledger-writer.test.ts` was updated alongside.
 
 **Why it matters**: `contains(tokenId)` is O(n × m) — prefix-scan SENT, decrypt every entry, scan tokenIds. The duplicate-bundle guard (now active by default) calls `contains` per-token per-send. At ~1000 SENT entries × ~4 tokenIds = 4000 decrypts per send. Acceptable today; bad at higher SENT volumes.
 
@@ -118,7 +128,9 @@ The OUTBOX is a working queue that **drains** to SENT as deliveries complete. To
 
 ---
 
-### 4. Storage GC for tombstones
+### 4. Storage GC for tombstones — **SHIPPED**
+
+> **Status (2026-05-20)**: LANDED. `OutboxWriter.gcExpiredTombstones` (`profile/outbox-writer.ts:~452`) and `SentLedgerWriter.gcExpiredTombstones` (`profile/sent-ledger-writer.ts:~296`) sweep tombstoned slots where `now - deletedAt > retentionMs` (default 30 days) and call `db.del()` to reclaim OrbitDB log bytes. The companion `TombstoneGcWorker` (`modules/payments/transfer/tombstone-gc-worker.ts`) drives the periodic sweep when `features.tombstoneGcWorker` is enabled. Under Item #15, the snapshot builder also drops expired tombstones at publish time via the `gcExpiredTombstones` hook on `BuildLeanProfileSnapshotOptions` (commit `0f530eb`). The default-ON flip for `features.tombstoneGcWorker` is tracked under item #5.
 
 **Why it matters**: tombstones are `db.put(marker)` not `db.del()`. The OrbitDB log grows monotonically. Long-running wallets accumulate dead-key bytes forever.
 
@@ -197,7 +209,9 @@ Until flipped to default-ON, these are dead code for any wallet that doesn't exp
 
 ---
 
-### 7. `lamport: 0` synthetic placeholder
+### 7. `lamport: 0` synthetic placeholder — **SHIPPED**
+
+> **Status (2026-05-20)**: LANDED. `writeSentEntryFromOutbox` (`PaymentsModule.ts:~3507`) was refactored to accept `OutboxCreateInput` (the orchestrator's input shape that does NOT include `_schemaVersion` or `lamport`). Both callers (`dispatchUxfInstantSend` at `:~12782` and the conservative dispatcher) pass their existing `OutboxCreateInput` directly — no synthetic placeholder construction. The helper's JSDoc explicitly notes: "neither caller's `lamport` is read here; the SENT ledger writer stamps its own Lamport on `write()`." The misleading-`0` foot-gun is gone; the type system now prevents reintroducing it. Verified via `grep -n "lamport: 0" PaymentsModule.ts` — no remaining occurrences beyond the doc comment at line 12780 that references this resolution.
 
 **Why it matters**: `PaymentsModule.ts:~12108` synthesizes a `UxfTransferOutboxEntry` with `lamport: 0` purely so `writeSentEntryFromOutbox` can read fields off it. The `0` is a placeholder — it doesn't correspond to any real CRDT clock value. If a future code path uses `lamport` from the synthesized entry, it gets a misleading 0.
 
@@ -276,7 +290,9 @@ Real `@orbitdb/core` Hash Log lex-sort under live libp2p replication is not exer
 
 ---
 
-### 10. Vector vs per-entry-key design decision
+### 10. Vector vs per-entry-key design decision — **RESOLVED**
+
+> **Status (2026-05-20)**: RESOLVED. Item #15 (Full Profile State Snapshot Sync) is LANDED — the per-entry-key Lamport+tombstone machinery is now load-bearing as the JOIN merge function at snapshot-pull time. The vector-model alternative loses its appeal. No migration is planned; the per-entry-key design is the canonical choice. The future-ADR pointer below stays for historical context.
 
 > **Resolved by Item #15 (per-entry-key wins)**: under full-profile-snapshot sync, the per-entry-key Lamport+tombstone machinery becomes the JOIN merge function at snapshot-pull time. The complexity that was "paid for multi-replica CRDT safety" is now load-bearing for snapshot-time JOIN. The vector-model alternative loses its appeal. This item can be marked resolved once Item #15 lands.
 
@@ -296,7 +312,9 @@ Real `@orbitdb/core` Hash Log lex-sort under live libp2p replication is not exer
 
 ---
 
-### 11. Operator runbooks for the new events
+### 11. Operator runbooks for the new events — **SHIPPED**
+
+> **Status (2026-05-20)**: LANDED. `docs/uxf/RUNBOOK-SEND-PIPELINE.md` covers all five Issue #166 events (`transfer:orphan-spending-detected`, `transfer:orphan-recovered`, `transfer:sent-reconciliation-recovered`, `transfer:sent-reconciliation-failed`, `transfer:retention-warning`) PLUS the post-#166 additions (`transfer:retention-republish-rearmed`, `transfer:retention-republish-skipped` from Item #2; `transfer:off-record-spent` from Item #16). Each section follows the same template: payload shape, what it means, system state, diagnostic data to collect, action checklist. The runbook is cross-referenced from `CLAUDE.md` ("Operator runbooks for the send-pipeline events live at `docs/uxf/RUNBOOK-SEND-PIPELINE.md`").
 
 **Why it matters**: Issue #166 added five new operator-facing events. None have documented runbooks:
 - `transfer:orphan-spending-detected`
@@ -322,7 +340,9 @@ Operators receiving these have no documented "do this" guidance.
 
 ---
 
-### 12. Consumer-facing API docs for new events
+### 12. Consumer-facing API docs for new events — **SHIPPED**
+
+> **Status (2026-05-20)**: LANDED. `CLAUDE.md`'s "Key Events" table lists all five Issue #166 events plus the post-#166 additions (`transfer:retention-republish-rearmed`, `transfer:retention-republish-skipped`, `transfer:off-record-spent`). Each row carries the canonical payload shape + a one-line "When" description. `SphereEventMap` in `types/index.ts` carries full per-event JSDoc with the same payload semantics.
 
 **Why it matters**: same five events lack public API documentation. Apps consuming `sphere.on('transfer:...')` need to know the payload shapes and when they fire.
 
