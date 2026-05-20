@@ -135,7 +135,12 @@ describe('PaymentsModule.detectOrphanSpendingTokens (Issue #166 — P3 #8)', () 
     payments = createPaymentsModule({
       debug: false,
       autoSync: false,
-      features: { recoveryWorker: false, finalizationWorker: false },
+      features: {
+        recoveryWorker: false,
+        finalizationWorker: false,
+        nostrPersistenceVerifier: false,
+        tombstoneGcWorker: false,
+      },
     });
     payments.initialize(createPaymentsDeps());
   });
@@ -254,7 +259,13 @@ describe('PaymentsModule.detectOrphanSpendingTokens — orphanAutoRecovery (Issu
       // `false` is now required. The test name was updated from
       // "default-OFF" to "explicit OFF" to reflect the post-flip
       // semantics.
-      features: { recoveryWorker: false, finalizationWorker: false, orphanAutoRecovery: false },
+      features: {
+        recoveryWorker: false,
+        finalizationWorker: false,
+        orphanAutoRecovery: false,
+        nostrPersistenceVerifier: false,
+        tombstoneGcWorker: false,
+      },
     });
     payments.initialize({ ...createPaymentsDeps(), emitEvent: emit });
     const { outboxWriter, sentLedgerWriter } = createWriterPair();
@@ -288,6 +299,8 @@ describe('PaymentsModule.detectOrphanSpendingTokens — orphanAutoRecovery (Issu
       features: {
         recoveryWorker: false,
         finalizationWorker: false,
+        nostrPersistenceVerifier: false,
+        tombstoneGcWorker: false,
         orphanAutoRecovery: true,
       },
     });
@@ -356,6 +369,8 @@ describe('PaymentsModule.detectOrphanSpendingTokens — orphanAutoRecovery (Issu
       features: {
         recoveryWorker: false,
         finalizationWorker: false,
+        nostrPersistenceVerifier: false,
+        tombstoneGcWorker: false,
         orphanAutoRecovery: true,
       },
     });
@@ -399,6 +414,8 @@ describe('PaymentsModule.detectOrphanSpendingTokens — orphanAutoRecovery (Issu
       features: {
         recoveryWorker: false,
         finalizationWorker: false,
+        nostrPersistenceVerifier: false,
+        tombstoneGcWorker: false,
         orphanAutoRecovery: true,
       },
     });
@@ -485,6 +502,8 @@ describe('defaultOrphanRecovery — aggregator cross-check (OUTBOX-SEND-FOLLOWUP
       features: {
         recoveryWorker: false,
         finalizationWorker: false,
+        nostrPersistenceVerifier: false,
+        tombstoneGcWorker: false,
         orphanAutoRecovery: true,
       },
     });
@@ -534,6 +553,8 @@ describe('defaultOrphanRecovery — aggregator cross-check (OUTBOX-SEND-FOLLOWUP
       features: {
         recoveryWorker: false,
         finalizationWorker: false,
+        nostrPersistenceVerifier: false,
+        tombstoneGcWorker: false,
         orphanAutoRecovery: true,
       },
     });
@@ -578,6 +599,8 @@ describe('defaultOrphanRecovery — aggregator cross-check (OUTBOX-SEND-FOLLOWUP
       features: {
         recoveryWorker: false,
         finalizationWorker: false,
+        nostrPersistenceVerifier: false,
+        tombstoneGcWorker: false,
         orphanAutoRecovery: true,
       },
     });
@@ -623,6 +646,8 @@ describe('defaultOrphanRecovery — aggregator cross-check (OUTBOX-SEND-FOLLOWUP
       features: {
         recoveryWorker: false,
         finalizationWorker: false,
+        nostrPersistenceVerifier: false,
+        tombstoneGcWorker: false,
         orphanAutoRecovery: true,
       },
     });

@@ -62,9 +62,9 @@ The aggregator's view may or may not include the commit. Locally the token is un
 
 **Actions.**
 
-1. **If `features.orphanAutoRecovery` is OFF (the default):** the wallet emits this event but takes no action. You can:
+1. **If `features.orphanAutoRecovery` is explicitly set to `false` (default-ON since PR #181):** the wallet emits this event but takes no action. You can:
    - Manually flip the token's status back to `'confirmed'` via direct profile edit (test environments only).
-   - Or: enable `features.orphanAutoRecovery` and restart the wallet — the recovery hook runs aggregator cross-check before restoring (see `transfer:orphan-recovered`).
+   - Or: remove the explicit `false` so `features.orphanAutoRecovery` reverts to its default-ON state and restart the wallet — the recovery hook runs aggregator cross-check before restoring (see `transfer:orphan-recovered`).
 2. **If aggregator reports the source state SPENT:** the commit landed on-chain. Local restore would diverge from the aggregator's view. You must either re-package the bundle from the post-spend state (out of scope for the auto-recovery hook today) or accept the value as already-sent.
 3. **If aggregator reports the source state UNSPENT:** safe to restore. Enabling `features.orphanAutoRecovery` performs this restore automatically; `transfer:orphan-recovered` then fires.
 
@@ -76,7 +76,7 @@ The aggregator's view may or may not include the commit. Locally the token is un
 
 **Payload**: `{ tokenId, coinId, amount, fromStatus, toStatus, strategy, recoveredAt }`
 
-**What it means.** The auto-recovery hook (gated on `features.orphanAutoRecovery`, default-OFF) cross-checked the aggregator and confirmed the source state was UNSPENT, then flipped the token from `'transferring'` back to `toStatus` (today: `'confirmed'`). The value is spendable again.
+**What it means.** The auto-recovery hook (gated on `features.orphanAutoRecovery`, default-ON since PR #181) cross-checked the aggregator and confirmed the source state was UNSPENT, then flipped the token from `'transferring'` back to `toStatus` (today: `'confirmed'`). The value is spendable again.
 
 **State of the system.** Token is back in normal circulation. No OUTBOX or SENT entry is created — the recovery is purely local (the send that originally moved the token to `'transferring'` is treated as if it never happened).
 
@@ -268,11 +268,11 @@ Likely cause: the tombstones are within the retention window (default 30 days fr
 features: {
   recoveryWorker:                true,   // default-ON
   sentReconciliationWorker:      true,   // default-ON
-  nostrPersistenceVerifier:      false,  // default-OFF (soak gated)
+  nostrPersistenceVerifier:      true,   // default-ON (item #5 — LRU + cooldown bound the load)
   orphanAutoRecovery:            true,   // default-ON (PR #181 — item #1 aggregator cross-check landed)
   tombstoneGcWorker:             true,   // default-ON (item #5 — 30-day retention is safe)
   spentStateRescan:              true,   // default-ON (Issue #174 — soak gate cleared)
 }
 ```
 
-Per OUTBOX-SEND-FOLLOWUPS item #5, the remaining default-OFF flag (`nostrPersistenceVerifier`) will flip to default-ON after the relay-load measurement clears. `orphanAutoRecovery` flipped to default-ON in PR #181 once item #1's aggregator cross-check landed (`PaymentsModule.defaultOrphanRecovery` queries `oracle.isSpent(sourceStateHash)` before flipping `'transferring'` → `'confirmed'` and escalates to `'manual'` on conflict). `tombstoneGcWorker` flipped to default-ON under item #5 — the 30-day retention default is conservative enough that no concurrent-replica pre-sync state can resurrect a swept slot. `spentStateRescan` (Issue #174) flipped to default-ON after its soak gate cleared — the worker probes `oracle.isSpent` for each `'confirmed'` token and routes detection through the default `removeToken()` cleanup. Wallets that prefer the reactive-only surface (`transfer:double-spend-detected` at next `send()`) can explicitly set `features.spentStateRescan: false`. Set any flag to `false` explicitly to opt out (e.g. timer-sensitive unit tests).
+All soak-gated workers have now flipped to default-ON under OUTBOX-SEND-FOLLOWUPS item #5. `orphanAutoRecovery` flipped in PR #181 once item #1's aggregator cross-check landed (`PaymentsModule.defaultOrphanRecovery` queries `oracle.isSpent(sourceStateHash)` before flipping `'transferring'` → `'confirmed'` and escalates to `'manual'` on conflict). `tombstoneGcWorker` flipped under item #5 — the 30-day retention default is conservative enough that no concurrent-replica pre-sync state can resurrect a swept slot. `nostrPersistenceVerifier` flipped under item #5 — query traffic is proportional to eligible SENT volume with an LRU-bounded cap and per-entry cooldown (default 5 minutes), and the worker self-skips wallets with no `nostrEventId`-tagged SENT entries. `spentStateRescan` (Issue #174) flipped after its soak gate cleared — the worker probes `oracle.isSpent` for each `'confirmed'` token and routes detection through the default `removeToken()` cleanup. Wallets that prefer the reactive-only surface (`transfer:double-spend-detected` at next `send()`) can explicitly set `features.spentStateRescan: false`. Deployments on restrictive relay sets that cannot absorb the verifier's steady load should set `features.nostrPersistenceVerifier: false`. Set any flag to `false` explicitly to opt out (e.g. timer-sensitive unit tests).
