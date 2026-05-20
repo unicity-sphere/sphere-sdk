@@ -496,6 +496,17 @@ describe('PaymentsModule.load() — NEVER-WIPE invariant', () => {
     expect(survivorIds.has(loserInFlight.id)).toBe(false); // dropped
     expect(survivorIds.has(winnerOnChain.id)).toBe(true);
 
+    // Steelman H1 (PR #182 review): the dropped loser must leave a
+    // durable tombstone so (a) a process restart preserves the
+    // audit trail, and (b) a stale remote storage source cannot
+    // re-sync the dead state back into the active pool on a
+    // future load.
+    const tombstones = module.getTombstones();
+    const loserTombstone = tombstones.find(
+      (t) => t.tokenId === TOKEN_ID_A && t.stateHash === STATE_HASH_2,
+    );
+    expect(loserTombstone).toBeDefined();
+
     // Event emitted with the loser's tokenId + stateHash.
     const doubleSpendEvents = emitEvent.mock.calls.filter(
       (call) => call[0] === 'transfer:double-spend-detected',

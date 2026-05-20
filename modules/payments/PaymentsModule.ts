@@ -5271,6 +5271,20 @@ export class PaymentsModule {
       result.tokens = tokensToSend;
 
       // Mark as transferring and persist — UI shows "Pending" badge immediately
+      //
+      // INVARIANT (load-bearing for Item #14 Phase 2 work item 5 / PR #182):
+      // `token.sdkData` MUST NOT be mutated alongside this status flip.
+      // The JOIN-divergent loser detection in `loadFromStorageData`
+      // (~line 15050) relies on `stateHash` staying STABLE across the
+      // 'confirmed' → 'transferring' transition. If a future refactor
+      // appends a synthetic pending-tx to outgoing source tokens'
+      // `sdkData` (as already done for INCOMING tokens in `addToken`),
+      // the in-memory `stateHash` would diverge from storage's
+      // last-flushed `stateHash` — and the JOIN-divergent loser branch
+      // would silently DROP legitimate in-flight sends as false-positive
+      // multi-device race losers. If you need to mutate sdkData here,
+      // update the divergent-state branch to use a more reliable
+      // discriminator (e.g. an OUTBOX entry presence check).
       for (const token of tokensToSend) {
         token.status = 'transferring';
         this.tokens.set(token.id, token);
@@ -15092,6 +15106,24 @@ export class PaymentsModule {
           // Don't restore. The token's value is gone (aggregator
           // anchored the winner's commit; our submit failed at
           // `STATE_ALREADY_SPENT_BY_OTHER` per Item #14 Phase 1).
+          //
+          // Steelman H1 (PR #182 review): create a tombstone for the
+          // dropped loser's (tokenId, stateHash) BEFORE the event
+          // emit so a process restart between drop and event-consume
+          // leaves a durable audit trail. The tombstone also blocks
+          // a stale storage source from re-syncing the dead state
+          // back into the active pool on a future load. Same
+          // pattern as `removeToken` at line ~9512 — see
+          // `createTombstoneFromToken` (line 878).
+          const tombstone = createTombstoneFromToken(snapshotToken);
+          if (tombstone) {
+            const tombKey = `${tombstone.tokenId}:${tombstone.stateHash}`;
+            if (!this.tombstoneKeySet.has(tombKey)) {
+              this.tombstones.push(tombstone);
+              this.tombstoneKeySet.add(tombKey);
+            }
+          }
+
           // The recipient field on the loser's bundle is the local
           // intended recipient; we don't have authoritative info on
           // the winning recipient. Emit with empty `ourIntendedRecipient`
@@ -15119,7 +15151,7 @@ export class PaymentsModule {
             'Payments',
             `loadFromStorageData: JOIN-divergent loser dropped (tokenId=${snapTokenId?.slice(0, 16)}…, ` +
               `loser-stateHash=${snapStateHash?.slice(0, 16)}…, winner-stateHash=${winnerStateHash?.slice(0, 16) ?? '?'}…, ` +
-              `snapshotId=${snapshotId.slice(0, 12)}…). Item #14 Phase 2 work item 5 — multi-device double-spend race.`,
+              `snapshotId=${snapshotId.slice(0, 12)}…, tombstoned=${tombstone !== null}). Item #14 Phase 2 work item 5 — multi-device double-spend race.`,
           );
           continue;
         }
