@@ -97,7 +97,12 @@ export interface ClampInfo {
  * Discriminated union of the resolver's possible outputs.
  *
  *  - `kind: 'inline'` — the sender will populate `carBase64` on the
- *    `uxf-car` payload and ship the bundle inline.
+ *    `uxf-car` payload and ship the bundle inline. When `shouldPin` is
+ *    `true`, the orchestrator SHOULD additionally fire a fire-and-forget
+ *    `publishToIpfs(carBytes)` so the same content-addressed CAR ends up
+ *    pinned on the local IPFS node. The wire delivery mode stays inline
+ *    — the pin is in addition, not a replacement (OUTBOX-SEND-FOLLOWUPS
+ *    Item #6.a).
  *  - `kind: 'cid'`    — the sender will publish a `uxf-cid` payload
  *    referencing the returned CID; `shouldPin` is informational (always
  *    `true` in v1.0 — see field-level docs).
@@ -107,6 +112,27 @@ export type DeliveryDecision =
       readonly kind: 'inline';
       /** Base64-encoded CAR bytes ready to drop on a `uxf-car` payload. */
       readonly carBase64: string;
+      /**
+       * Whether the orchestrator SHOULD additionally pin the inline CAR
+       * to local IPFS (best-effort, fire-and-forget). Set to `true` when
+       * a `publishToIpfs` callback was wired on the resolver call;
+       * omitted (or `false`) when no publisher was supplied, so the
+       * caller knows the inline payload is the ONLY copy.
+       *
+       * Rationale (OUTBOX-SEND-FOLLOWUPS Item #6.a): the inline path
+       * historically left the sender with no local IPFS pin, so Item
+       * #2's retention re-publish closure was forced to throw on
+       * `'car-over-nostr'` re-publishes. With `shouldPin: true`, the
+       * sender's local IPFS node has the CAR bytes available; the
+       * re-publish closure can downgrade to CID-shape re-publish (Item
+       * #2 final closure) regardless of the original wire mode.
+       *
+       * **Best-effort contract.** Failure of the pin call MUST NOT
+       * abort the send — the wire delivery is already an inline
+       * `uxf-car`, so the recipient is not blocked on the pin. The
+       * orchestrator logs a warning on failure and proceeds.
+       */
+      readonly shouldPin?: boolean;
       /**
        * Present iff the inline decision was reached via `auto` mode.
        * `force-inline` decisions carry NO clampInfo because `force-inline`
@@ -299,7 +325,12 @@ export async function resolveDelivery(
           'INLINE_CAR_TOO_LARGE',
         );
       }
-      return { kind: 'inline', carBase64: carBytesToBase64(carBytes) };
+      // OUTBOX-SEND-FOLLOWUPS Item #6.a — flag the inline decision for
+      // an orchestrator-side fire-and-forget pin when a publisher is
+      // wired. The wire delivery stays inline (`uxf-car`); the pin is
+      // additional best-effort durability so Item #2's retention
+      // re-publish can fall back to CID-shape later.
+      return inlineDecision(carBytes, publishToIpfs !== undefined);
     }
 
     case 'auto': {
@@ -312,9 +343,10 @@ export async function resolveDelivery(
 
       // 2. Decide inline vs CID against the effective cap.
       if (carBytes.byteLength <= clampInfo.effectiveCap) {
+        // OUTBOX-SEND-FOLLOWUPS Item #6.a — flag for the orchestrator
+        // fire-and-forget pin path (only when a publisher is wired).
         return {
-          kind: 'inline',
-          carBase64: carBytesToBase64(carBytes),
+          ...inlineDecision(carBytes, publishToIpfs !== undefined),
           clampInfo,
         };
       }
@@ -379,7 +411,20 @@ export async function resolveDelivery(
 function carInlineFallback(carBytes: Uint8Array): DeliveryDecision {
   if (carBytes.byteLength <= RELAY_SAFE_CAP_BYTES) {
     // Bundle fits within the relay-safe ceiling → inline fallback.
-    return { kind: 'inline', carBase64: carBytesToBase64(carBytes) };
+    //
+    // **Load-bearing invariant**: this function is reachable ONLY from
+    // the `auto`-CID branch in `resolveDelivery` when
+    // `publishToIpfs === undefined` (see the guard at the call site).
+    // The literal `false` argument below pins that invariant — if a
+    // future refactor makes this function reachable WITH a publisher
+    // wired, `shouldPin` would remain `undefined` and the orchestrator's
+    // Item #6.a pin path would silently skip (no crash, but no pin
+    // either). Any such refactor MUST either:
+    //   (a) update this call to forward the publisher's presence
+    //       (`inlineDecision(carBytes, publisherWired)`), OR
+    //   (b) document why the no-pin behavior is correct for the new
+    //       reachable path.
+    return inlineDecision(carBytes, false);
   }
   throw new SphereError(
     `resolveDelivery: auto strategy selected CID delivery but no publishToIpfs` +
@@ -388,6 +433,28 @@ function carInlineFallback(carBytes: Uint8Array): DeliveryDecision {
       ' Configure an IPFS provider to send large bundles.',
     'IPFS_PUBLISHER_REQUIRED',
   );
+}
+
+/**
+ * Build an `'inline'` {@link DeliveryDecision} with the
+ * OUTBOX-SEND-FOLLOWUPS Item #6.a pin signal applied.
+ *
+ * When `publisherWired` is `true`, `shouldPin: true` is set so the
+ * orchestrator can fire-and-forget a `publishToIpfs(carBytes)` call
+ * after the inline send is on the wire. When `false`, the field is
+ * omitted — the inline payload is the only copy of the CAR bytes.
+ *
+ * Pure: produces no I/O. The resolver remains a decision function;
+ * the actual pin call lives in the orchestrator's pipeline.
+ *
+ * @internal
+ */
+function inlineDecision(
+  carBytes: Uint8Array,
+  publisherWired: boolean,
+): { kind: 'inline'; carBase64: string; shouldPin?: boolean } {
+  const base = { kind: 'inline' as const, carBase64: carBytesToBase64(carBytes) };
+  return publisherWired ? { ...base, shouldPin: true } : base;
 }
 
 /**
