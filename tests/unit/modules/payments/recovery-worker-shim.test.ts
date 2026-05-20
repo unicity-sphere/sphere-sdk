@@ -396,7 +396,22 @@ describe('PaymentsModule default republish — deliveryMethod awareness (OUTBOX-
     expect(await sentLedgerWriter.readAll()).toHaveLength(1);
   });
 
-  it("'car-over-nostr' entry → republish throws (transport never called) and worker transitions to 'failed-transient' after maxRetries", async () => {
+  it("'car-over-nostr' entry → republish downgrades to kind: 'uxf-cid' (Item #2 final closure post-#6.a)", async () => {
+    // OUTBOX-SEND-FOLLOWUPS Item #2 final closure (PR #189). Before
+    // Item #6.a (PR #188) the default closure threw on 'car-over-nostr'
+    // because the inline CAR was never pinned to local IPFS. Post-#6.a,
+    // inline-CAR sends fire a best-effort local pin via the
+    // orchestrator's Step 8.5 path, so the CID is fetchable by the
+    // recipient. The republish closure therefore unconditionally
+    // emits a 'uxf-cid' payload for both CID-mode and CAR-mode
+    // entries; the recipient's replay-LRU short-circuits duplicates.
+    //
+    // For pre-#6.a legacy entries that lack a local pin, the recipient
+    // surfaces a CID-fetch error — annoying but no worse than the
+    // pre-PR throw arc (entry stuck at failed-transient terminal).
+    // Custom workers with richer pin-availability signals can install
+    // their own republish via `installSendingRecoveryWorker()` to
+    // restore the strict throw behavior.
     const { outboxWriter, sentLedgerWriter } = createWriterPair();
     payments.installOutboxWriter(outboxWriter);
     payments.installSentLedgerWriter(sentLedgerWriter);
@@ -406,28 +421,33 @@ describe('PaymentsModule default republish — deliveryMethod awareness (OUTBOX-
       deliveryMethod: 'car-over-nostr',
       mode: 'conservative',
       updatedAt: Date.now() - 120_000,
+      bundleCid: 'bafy-car-1',
+      tokenIds: ['tok-a'],
     });
 
-    // maxRetries default is 3 — three failed cycles before transition.
-    await asInternals(payments).sendingRecoveryWorker!.runScanCycle();
-    await asInternals(payments).sendingRecoveryWorker!.runScanCycle();
     await asInternals(payments).sendingRecoveryWorker!.runScanCycle();
 
-    // The default closure must NEVER hand a synthetic uxf-cid payload
-    // to the transport for a CAR entry. That's the load-bearing
-    // correctness assertion — the recipient is protected from the
-    // unfetchable-CID failure mode.
-    expect(transport.sendTokenTransfer).not.toHaveBeenCalled();
+    // CAR-mode entries now downgrade to 'uxf-cid' on re-publish.
+    expect(transport.sendTokenTransfer).toHaveBeenCalledTimes(1);
+    const [, payload] = transport.sendTokenTransfer.mock.calls[0];
+    expect(payload).toMatchObject({
+      kind: 'uxf-cid',
+      version: '1.0',
+      mode: 'conservative',
+      bundleCid: 'bafy-car-1',
+      tokenIds: ['tok-a'],
+    });
 
-    // The entry transitioned to failed-transient with an error that
-    // mentions the CAR-bytes limitation, so an operator can act.
+    // Entry transitions to delivered (the publish succeeded at the
+    // transport level), and a SENT entry is written. Whether the
+    // recipient can actually fetch the CID is THEIR concern — the
+    // sender's recovery loop has done its job.
     const persisted = await outboxWriter.readAllNew();
     const carEntry = persisted.find((e) => e.id === 'car-1');
-    expect(carEntry?.status).toBe('failed-transient');
-    expect(carEntry?.error).toMatch(/car-over-nostr/);
+    expect(carEntry?.status).toBe('delivered');
 
-    // No SENT entry — the arc never reached 'delivered'.
-    expect(await sentLedgerWriter.readAll()).toHaveLength(0);
+    // SENT-write fires once the arc reaches delivered.
+    expect(await sentLedgerWriter.readAll()).toHaveLength(1);
   });
 
   it("'txf-legacy' entry → republish throws (transport never called) and worker transitions to 'failed-transient' after maxRetries", async () => {
