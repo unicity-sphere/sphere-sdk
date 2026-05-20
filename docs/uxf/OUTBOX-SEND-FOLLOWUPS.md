@@ -151,14 +151,14 @@ The OUTBOX is a working queue that **drains** to SENT as deliveries complete. To
 
 ---
 
-### 5. Soak validation + default-ON flip for the new workers — **PARTIAL**
+### 5. Soak validation + default-ON flip for the new workers — **SHIPPED**
 
-> **Status (2026-05-20)**:
+> **Status (2026-05-20)**: All four soak-gated flags have flipped to default-ON. Wallets can still opt out explicitly per flag.
 >
 >   - `features.spentStateRescan` — **FLIPPED default-ON** in PR #178 (Item #16). Default closure does archive + tombstone + map-delete via `removeToken`; durable `_audit` record via PR #179 when DispositionWriter is wired.
 >   - `features.orphanAutoRecovery` — **FLIPPED default-ON** in PR #181. Item #1's aggregator cross-check prerequisite is satisfied (`PaymentsModule.defaultOrphanRecovery` queries `oracle.isSpent(sourceStateHash)` before flipping status and escalates to `'manual'` when the aggregator reports the source state spent). Without this flip a crashed send leaves the source token unspendable indefinitely; with it, the load-tail orphan sweep auto-recovers.
->   - `features.tombstoneGcWorker` — **FLIPPED default-ON** in this PR. The 30-day default retention is conservative — longer than any realistic concurrent-replica pre-sync window per Issue #166 P1 #2 safety contract — so swept slots cannot be resurrected by a stale replica. The worker self-skips when no OUTBOX or SENT writer is installed, so the flip is a safe no-op for legacy-only wallets. Tests can opt out with `features.tombstoneGcWorker: false` (timer-sensitive paths).
->   - `features.nostrPersistenceVerifier` — **STILL default-OFF**. Adds relay query traffic proportional to SENT volume. Item #2's Item-#15 scope clarification eliminated most of the cross-device retention gap; the remaining surface is the inline-CAR retention case (covered by Item #6.a). Defer flip until relay-load measurement.
+>   - `features.tombstoneGcWorker` — **FLIPPED default-ON** in PR #184. The 30-day default retention is conservative — longer than any realistic concurrent-replica pre-sync window per Issue #166 P1 #2 safety contract — so swept slots cannot be resurrected by a stale replica. The worker self-skips when no OUTBOX or SENT writer is installed, so the flip is a safe no-op for legacy-only wallets. Tests can opt out with `features.tombstoneGcWorker: false` (timer-sensitive paths).
+>   - `features.nostrPersistenceVerifier` — **FLIPPED default-ON** in this PR. Query traffic is proportional to eligible SENT volume with an LRU-bounded cap and per-entry cooldown (default 5 minutes); the worker self-skips wallets with no `nostrEventId`-tagged SENT entries (legacy pre-#166 P2 #3). On `'missing'` outcome the verifier re-arms the OUTBOX entry to `'sending'` so the recovery worker republishes via Item #2's path. Deployments on restrictive relay sets that cannot absorb the steady load should set `features.nostrPersistenceVerifier: false` explicitly.
 
 **Why it matters**: two new workers landed in default-OFF state pending soak validation:
 - `features.nostrPersistenceVerifier` — adds relay query traffic
@@ -843,7 +843,7 @@ This unblocks the `'entry-tombstoned-or-missing'` skip reason on `transfer:reten
 - Don't open another PR against `main`; the integration branch is `integration/all-fixes`.
 - Don't re-litigate the tombstone vs vector debate (item #10) without first getting a maintainer call. We had this conversation; it's documented but not decided.
 - Don't try to start P1 #1 (AAD) — explicitly deferred. If you think it should be revisited, ping the maintainer first.
-- Don't flip `features.orphanAutoRecovery` or `features.nostrPersistenceVerifier` to default-ON without first landing items #1 and #5 respectively. They're default-OFF for documented reasons.
+- Don't roll back the default-ON flips for `features.orphanAutoRecovery`, `features.tombstoneGcWorker`, `features.nostrPersistenceVerifier`, or `features.spentStateRescan` without first weighing the protocol consequences. Each was flipped under documented soak gates (PRs #178, #181, #184, and the current PR) — the regressions they prevent are listed under item #5.
 
 ## See also
 

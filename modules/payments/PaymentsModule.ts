@@ -1049,21 +1049,26 @@ export interface UxfTransferFeatures {
   /**
    * Issue #166 P2 #3 — Nostr persistence verification worker.
    *
-   * Default `false` (opt-in). When `true`, auto-installs and starts a
-   * {@link NostrPersistenceVerifier} in {@link PaymentsModule.initialize}
-   * that periodically re-queries the relay set for SENT-ledger entries'
-   * Nostr event ids to detect retention drops (events accepted at
-   * publish but later evicted by relay retention policy / restart /
-   * segregation).
+   * Default `true` (default-ON after soak; flipped under item #5).
+   * Auto-installs and starts a {@link NostrPersistenceVerifier} in
+   * {@link PaymentsModule.initialize} that periodically re-queries
+   * the relay set for SENT-ledger entries' Nostr event ids to detect
+   * retention drops (events accepted at publish but later evicted by
+   * relay retention policy / restart / segregation). On `'missing'`
+   * outcome the verifier re-arms the OUTBOX entry to `'sending'` so
+   * the recovery worker republishes via Item #2's path.
    *
-   * Default-OFF because the worker adds relay query traffic
-   * proportional to SENT volume. Production deployments that want
-   * retention monitoring should flip the flag explicitly after
-   * confirming their relay set tolerates the extra query load.
+   * The worker adds relay query traffic proportional to SENT volume
+   * with an LRU-bounded eligibility cap; the per-entry cooldown
+   * (default 5 minutes) and the verifier's own backoff prevent
+   * runaway probing. Deployments on restrictive relay sets that
+   * cannot absorb the steady load should set the flag explicitly to
+   * `false` to opt out.
    *
    * The worker self-skips when no SENT entries have `nostrEventId`
-   * set (legacy entries pre-#166 P2 #3 wiring) — so flipping the flag
-   * is safe even on wallets with no eligible entries; it just no-ops.
+   * set (legacy entries pre-#166 P2 #3 wiring) — so the default-ON
+   * flip is a safe no-op for wallets with no eligible entries; it
+   * just no-ops every cycle.
    */
   readonly nostrPersistenceVerifier?: boolean;
   /**
@@ -1607,13 +1612,18 @@ export class PaymentsModule {
       sentReconciliationWorker:
         config?.features?.sentReconciliationWorker ?? true,
       // Issue #166 P2 #3 — Nostr persistence verification worker.
-      // Default-OFF (opt-in): the worker periodically re-queries the
-      // relay set for SENT-ledger entries' Nostr event ids to detect
-      // retention drops. Adds relay query traffic proportional to
-      // eligible SENT volume; flip ON after confirming the relay set
-      // tolerates the load.
+      // Default-ON after item #5 soak: the worker periodically re-
+      // queries the relay set for SENT-ledger entries' Nostr event
+      // ids to detect retention drops, then re-arms the OUTBOX entry
+      // so the recovery worker republishes (Item #2). Query traffic
+      // is proportional to eligible SENT volume with an LRU-bounded
+      // cap and per-entry cooldown. The worker self-skips when no
+      // SENT entries have `nostrEventId` set, so the flip is a safe
+      // no-op for legacy-only wallets. Set `false` explicitly to
+      // suppress (e.g. restrictive relay sets, timer-sensitive unit
+      // tests).
       nostrPersistenceVerifier:
-        config?.features?.nostrPersistenceVerifier ?? false,
+        config?.features?.nostrPersistenceVerifier ?? true,
       // OUTBOX-SEND-FOLLOWUPS item #4 — tombstone GC. Default-ON after
       // soak: the sweeper reclaims OrbitDB log bytes by replacing
       // tombstone markers older than `retentionMs` (default 30 days)
@@ -2067,7 +2077,7 @@ export class PaymentsModule {
 
     // Issue #166 P2 #3 — auto-install the Nostr persistence
     // verification worker. Mirrors the recovery / reconciliation
-    // worker patterns above. Default-OFF feature gate; when ON the
+    // worker patterns above. Default-ON after item #5 soak; the
     // worker self-skips entries that lack `nostrEventId` (legacy
     // SENT entries from before the dispatcher capture wiring), and
     // routes verify() through transport.verifyTokenTransferRetained
