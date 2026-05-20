@@ -8,7 +8,7 @@
  * 4. mergeTombstones() - remote tombstone merging
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createPaymentsModule, type PaymentsModuleDependencies } from '../../../modules/payments/PaymentsModule';
 import type { Token, FullIdentity } from '../../../types';
 import type { TombstoneEntry } from '../../../types/txf';
@@ -231,9 +231,20 @@ describe('PaymentsModule - Tombstone Enforcement', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    module = createPaymentsModule({ debug: false });
+    // Suppress timer-driven tombstone GC worker: this suite exercises
+    // tombstone read/merge semantics, not the GC scheduler. The
+    // default-ON flip in item #5 would otherwise leave a 24h setTimeout
+    // handle open between tests.
+    module = createPaymentsModule({
+      debug: false,
+      features: { tombstoneGcWorker: false },
+    });
     deps = createMockDeps();
     module.initialize(deps);
+  });
+
+  afterEach(async () => {
+    await module.destroy();
   });
 
   // ===========================================================================

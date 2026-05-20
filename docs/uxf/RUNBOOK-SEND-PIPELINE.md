@@ -269,10 +269,10 @@ features: {
   recoveryWorker:                true,   // default-ON
   sentReconciliationWorker:      true,   // default-ON
   nostrPersistenceVerifier:      false,  // default-OFF (soak gated)
-  orphanAutoRecovery:            false,  // default-OFF (soak gated; safe after item #1)
-  tombstoneGcWorker:             false,  // default-OFF (soak gated)
+  orphanAutoRecovery:            true,   // default-ON (PR #181 — item #1 aggregator cross-check landed)
+  tombstoneGcWorker:             true,   // default-ON (item #5 — 30-day retention is safe)
   spentStateRescan:              true,   // default-ON (Issue #174 — soak gate cleared)
 }
 ```
 
-Per OUTBOX-SEND-FOLLOWUPS item #5, the remaining default-OFF flags will flip to default-ON after a 7-day soak in non-prod. The `spentStateRescan` flag (Issue #174) flipped to default-ON after its soak gate cleared — the worker probes `oracle.isSpent` for each `'confirmed'` token and routes detection through the default `removeToken()` cleanup. Wallets that prefer the reactive-only surface (`transfer:double-spend-detected` at next `send()`) can explicitly set `features.spentStateRescan: false`.
+Per OUTBOX-SEND-FOLLOWUPS item #5, the remaining default-OFF flag (`nostrPersistenceVerifier`) will flip to default-ON after the relay-load measurement clears. `orphanAutoRecovery` flipped to default-ON in PR #181 once item #1's aggregator cross-check landed (`PaymentsModule.defaultOrphanRecovery` queries `oracle.isSpent(sourceStateHash)` before flipping `'transferring'` → `'confirmed'` and escalates to `'manual'` on conflict). `tombstoneGcWorker` flipped to default-ON under item #5 — the 30-day retention default is conservative enough that no concurrent-replica pre-sync state can resurrect a swept slot. `spentStateRescan` (Issue #174) flipped to default-ON after its soak gate cleared — the worker probes `oracle.isSpent` for each `'confirmed'` token and routes detection through the default `removeToken()` cleanup. Wallets that prefer the reactive-only surface (`transfer:double-spend-detected` at next `send()`) can explicitly set `features.spentStateRescan: false`. Set any flag to `false` explicitly to opt out (e.g. timer-sensitive unit tests).
