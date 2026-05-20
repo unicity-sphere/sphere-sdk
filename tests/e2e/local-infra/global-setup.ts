@@ -28,6 +28,20 @@
  *   SPHERE_AGGREGATOR_URL     — http://127.0.0.1:3001 (local
  *                                aggregator). Set only in full-stack
  *                                mode.
+ *   SPHERE_ORACLE_SKIP_VERIFICATION
+ *                             — `"1"`. Tells the SDK to skip trust-
+ *                                base verification on inclusion
+ *                                proofs. Required because the
+ *                                default local aggregator runs in
+ *                                BFT_ENABLED=false standalone mode
+ *                                (real SMT + Merkle proofs, no
+ *                                UnicityCertificate). Set only in
+ *                                full-stack mode. Tests against this
+ *                                stack do NOT exercise the trust-
+ *                                base code path; for that you need
+ *                                the `full-bft` compose profile
+ *                                (currently incomplete — see PR
+ *                                notes).
  *   SPHERE_IPFS_GATEWAY       — http://127.0.0.1:8082 (local kubo
  *                                gateway). Set only in full-stack
  *                                mode.
@@ -143,8 +157,16 @@ export async function setup(): Promise<void> {
       ipfs = ipfsHandle;
       process.env['SPHERE_AGGREGATOR_URL'] = aggregator.url;
       process.env['SPHERE_IPFS_GATEWAY'] = ipfs.gatewayUrl;
+      // The default `full` compose profile runs the aggregator in
+      // BFT_ENABLED=false standalone mode — it produces real Merkle
+      // proofs but no UnicityCertificate. Token.mint trust-base
+      // verification would reject these proofs, so we tell the SDK to
+      // skip verification for the local stack. Tests that need real
+      // trust-base coverage stay on the public testnet path.
+      process.env['SPHERE_ORACLE_SKIP_VERIFICATION'] = '1';
       log(`SPHERE_AGGREGATOR_URL=${aggregator.url}`);
       log(`SPHERE_IPFS_GATEWAY=${ipfs.gatewayUrl}`);
+      log('SPHERE_ORACLE_SKIP_VERIFICATION=1 (BFT-disabled aggregator)');
     } catch (err) {
       // Aggregator OR IPFS failed — tear down anything we got up so
       // the next run starts clean.

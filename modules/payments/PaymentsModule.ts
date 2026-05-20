@@ -10188,10 +10188,19 @@ export class PaymentsModule {
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const trustBase = (this.deps!.oracle as any).getTrustBase?.();
-    if (!trustBase) {
+    // Local-stack escape hatch: when the oracle was constructed with
+    // `skipVerification: true` (e.g. SPHERE_ORACLE_SKIP_VERIFICATION=1
+    // for the hermetic e2e local stack against a BFT-disabled aggregator
+    // that produces no UnicityCertificate), the trust base is
+    // intentionally absent. We propagate the skip into NametagMinter
+    // so it bypasses the trust-base-driven `Token.mint(trustBase, …)`
+    // path and uses `Token.fromJSON` instead.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const skipVerification: boolean = (this.deps!.oracle as any).getSkipVerification?.() === true;
+    if (!trustBase && !skipVerification) {
       return {
         success: false,
-        error: 'Trust base not available. Oracle provider must implement getTrustBase()',
+        error: 'Trust base not available. Oracle provider must implement getTrustBase() (or be configured with skipVerification:true for local-stack tests).',
       };
     }
 
@@ -10215,11 +10224,14 @@ export class PaymentsModule {
       );
       const ownerAddress = await addressRef.toAddress();
 
-      // Create NametagMinter
+      // Create NametagMinter — skipVerification propagated so the
+      // local-stack escape hatch (above) actually takes effect inside
+      // the minter's Token.mint vs Token.fromJSON branch.
       const minter = new NametagMinter({
         stateTransitionClient: stClient,
         trustBase,
         signingService,
+        skipVerification,
         debug: this.moduleConfig.debug,
       });
 

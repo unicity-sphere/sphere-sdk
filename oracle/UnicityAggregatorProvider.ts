@@ -146,6 +146,23 @@ export class UnicityAggregatorProvider implements OracleProvider {
   }
 
   /**
+   * Whether this provider was constructed with `skipVerification: true`.
+   *
+   * Exposed for downstream callers (PaymentsModule, NametagMinter) that
+   * need to make a structurally-different code-path choice when trust-
+   * base verification is disabled — e.g., `NametagMinter` must use
+   * `Token.fromJSON` instead of `Token.mint(trustBase, …)` when the
+   * trust base is intentionally absent (local-stack mode against an
+   * aggregator that produces no UnicityCertificate). Distinct from
+   * `getTrustBase() === null` because trustBase can also be null when
+   * the loader simply failed; we want to ONLY skip the trust-base
+   * code path on explicit operator opt-in.
+   */
+  getSkipVerification(): boolean {
+    return this.config.skipVerification ?? false;
+  }
+
+  /**
    * Get the bundled RootTrustBase (H6 — SPEC §8.4.2).
    *
    * Alias for getTrustBase(), exposed under the spec-canonical name so the

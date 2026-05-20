@@ -19,17 +19,23 @@
 #      when we need full hermetic e2e for CI.
 #
 # Service activation matrix (Compose profiles):
-#   relay      — always (no profile)
-#   mongodb    — profile: full
-#   aggregator — profile: full   (built locally from a pinned
-#                aggregator-go commit; see setup-aggregator-src.sh)
-#   ipfs       — profile: full
+#   relay                       — always (no profile)
+#   mongodb                     — profile: full
+#   aggregator (BFT_ENABLED=false standalone) — profile: full
+#   ipfs                        — profile: full
+#   bft-root                    — profile: full-bft (opt-in foundation,
+#                                 see service comment for status)
+#   bft-aggregator-genesis-gen  — profile: full-bft
+#   upload-shard-conf           — profile: full-bft
 #
 # Usage from the global-setup:
 #   # relay only:
 #   docker compose -f tests/e2e/local-infra/docker-compose.yml up -d
-#   # full stack:
+#   # full stack (relay + mongo + standalone aggregator + ipfs):
 #   docker compose -f tests/e2e/local-infra/docker-compose.yml --profile full up -d
+#   # full stack + experimental BFT services (not yet end-to-end):
+#   docker compose -f tests/e2e/local-infra/docker-compose.yml \
+#     --profile full --profile full-bft up -d
 #   docker compose -f tests/e2e/local-infra/docker-compose.yml --profile full down -v
 #
 # Versions are pinned. Update via the parent global-setup so any change
@@ -69,6 +75,139 @@ services:
       start_period: 5s
 
   # ---------------------------------------------------------------------------
+  # BFT root node — opt-in via the `full-bft` profile. Foundation work
+  # for hermetic e2e against a single-validator BFT aggregator that
+  # produces real UnicityCertificates. **NOT YET FUNCTIONAL** — the
+  # services boot cleanly and bft-root advances rounds, but the
+  # aggregator's BFT client does not yet receive certificates back
+  # (block finalization never happens, every inclusion proof comes
+  # back as a non-inclusion witness with `authenticator: null`).
+  #
+  # Tracked as a follow-up in the PR description. Until that's solved,
+  # the default `full` profile runs the aggregator in BFT_ENABLED=false
+  # standalone mode and tests use `SPHERE_ORACLE_SKIP_VERIFICATION=1`
+  # to bypass trust-base verification.
+  #
+  # To experiment with the BFT services:
+  #   docker compose --profile full --profile full-bft up -d
+  #
+  # The init step (entrypoint script) is the upstream aggregator-go
+  # docker-compose.yml's recipe verbatim:
+  #   - root-node init       — generates ed25519 root keypair
+  #   - trust-base generate  — single-validator trust base
+  #   - trust-base sign      — root signs the trust base
+  # Genesis files land in /genesis (bind-mounted to .bft-data/genesis/
+  # on the host, gitignored). USER_UID/USER_GID env vars (set by
+  # aggregator.ts at compose-up time) keep bind-mounted files owned
+  # by the host user so the host process can read them without sudo.
+  # ---------------------------------------------------------------------------
+  bft-root:
+    image: ghcr.io/unicitynetwork/bft-core:e1316ad51f4ecab1bc5406badec4c285fbdf14c7
+    container_name: uxf-e2e-bft-root
+    platform: linux/amd64
+    user: "${USER_UID:-1000}:${USER_GID:-1000}"
+    restart: unless-stopped
+    profiles: [full-bft]
+    volumes:
+      - ./.bft-data/genesis-root:/genesis/root
+      - ./.bft-data/genesis:/genesis
+    healthcheck:
+      test: ["CMD", "nc", "-zv", "bft-root", "8000"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    entrypoint: ["/busybox/sh", "-c"]
+    command:
+      - |
+        if [ -f /genesis/root/node-info.json ] && [ -f /genesis/trust-base.json ] && [ -f /genesis/root/trust-base-signed.json ]; then
+          echo "Genesis files already exist, skipping initialization."
+        else
+          echo "Creating root genesis..." &&
+          ubft root-node init --home /genesis/root -g &&
+          echo "Creating root trust base..." &&
+          ubft trust-base generate --home /genesis --network-id 3 --node-info /genesis/root/node-info.json &&
+          echo "Signing root trust base..." &&
+          ubft trust-base sign --home /genesis/root --trust-base /genesis/trust-base.json
+        fi
+        echo "Starting root node..." &&
+        exec ubft root-node run --home /genesis/root --address "/ip4/$(hostname -i)/tcp/8000" --trust-base /genesis/trust-base.json --rpc-server-address "$(hostname -i):8002"
+
+  # ---------------------------------------------------------------------------
+  # BFT aggregator genesis generator — init container; creates the
+  # shard config + aggregator keypair + initial state, then exits.
+  # The aggregator service depends on this completing successfully.
+  # ---------------------------------------------------------------------------
+  bft-aggregator-genesis-gen:
+    image: ghcr.io/unicitynetwork/bft-core:e1316ad51f4ecab1bc5406badec4c285fbdf14c7
+    container_name: uxf-e2e-bft-aggregator-genesis-gen
+    platform: linux/amd64
+    user: "${USER_UID:-1000}:${USER_GID:-1000}"
+    profiles: [full-bft]
+    depends_on:
+      bft-root:
+        condition: service_healthy
+    volumes:
+      - ./.bft-data/genesis-root:/genesis/root
+      - ./.bft-data/genesis:/genesis
+    entrypoint: ["/busybox/sh", "-c"]
+    command:
+      - |
+        if [ -f /genesis/aggregator/node-info.json ] && [ -f /genesis/shard-conf-7_0.json ]; then
+          echo "Aggregator genesis and config already exist, skipping initialization."
+        else
+          echo "Creating aggregator genesis..." &&
+          ubft shard-node init --home /genesis/aggregator --generate &&
+          echo "Creating aggregator partition configuration..." &&
+          ubft shard-conf generate --home /genesis --network-id 3 --partition-id 7 --partition-type-id 7 --epoch-start 10 --node-info=/genesis/aggregator/node-info.json &&
+          echo "Creating aggregator partition state..." &&
+          ubft shard-conf genesis --home "/genesis/aggregator" --shard-conf /genesis/shard-conf-7_0.json
+        fi
+        # The aggregator container runs as its own non-root user (uid 1001
+        # baked into the Dockerfile), while the genesis files are owned
+        # by USER_UID (host user, typically 1000). Make every file
+        # world-readable so the aggregator can mount them read-only and
+        # actually read them. Upstream's compose does the same.
+        chmod -R 755 /genesis/aggregator
+        chmod 644 /genesis/shard-conf-7_0.json
+        chmod 644 /genesis/trust-base.json
+        chmod -R 755 /genesis/root
+
+        # NOTE: bft-root's /api/v1/configurations endpoint requires
+        # HTTP PUT — busybox wget can't do PUT, so the upload happens
+        # in the upload-shard-conf service below (curlimages/curl).
+        # We just generate the files here and exit.
+        echo "Final permissions:"
+        ls -l /genesis/aggregator
+        ls -l /genesis/
+
+  # ---------------------------------------------------------------------------
+  # Shard-config uploader — registers the partition with bft-root so it
+  # starts producing UnicityCertificates for the aggregator's shard.
+  # PUT /api/v1/configurations only — busybox wget can't issue PUT,
+  # so this is a separate init container using curl.
+  # ---------------------------------------------------------------------------
+  upload-shard-conf:
+    image: curlimages/curl:8.13.0
+    container_name: uxf-e2e-upload-shard-conf
+    user: "${USER_UID:-1000}:${USER_GID:-1000}"
+    profiles: [full-bft]
+    restart: on-failure
+    depends_on:
+      bft-root:
+        condition: service_healthy
+      bft-aggregator-genesis-gen:
+        condition: service_completed_successfully
+    volumes:
+      - ./.bft-data/genesis:/genesis:ro
+    command:
+      - /bin/sh
+      - -c
+      - |
+        echo "Uploading shard-conf-7_0.json to bft-root via PUT" &&
+        curl -fsS -X PUT -H 'Content-Type: application/json' --data-binary @/genesis/shard-conf-7_0.json http://bft-root:8002/api/v1/configurations
+
+  # ---------------------------------------------------------------------------
   # MongoDB — backing store for the local aggregator.
   #
   # The aggregator-go binary auto-creates the required collections
@@ -105,16 +244,20 @@ services:
   # stage Alpine build (~30s, ~15 MB image). First boot pulls golang
   # base images; subsequent boots reuse the local image cache.
   #
-  # BFT_ENABLED=false routes block production through
-  # `bft.NewBFTClientStub`, which calls roundManager.StartNewRound() +
-  # FinalizeBlock() directly — skipping consensus, certificate
-  # validation, and any external BFT-core node. Real SMT and real
-  # inclusion proofs are still produced; only consensus is stubbed.
-  # See aggregator-go/internal/service/service_test.go for the
-  # exact env-var recipe.
+  # **BFT_ENABLED=false (standalone)** is the default — block production
+  # is driven by an internal 1s timer that calls `roundManager.
+  # StartNewRound()` + `FinalizeBlock()` via `bft.NewBFTClientStub`,
+  # bypassing consensus entirely. Real SMT, real inclusion proofs, but
+  # NO UnicityCertificate is attached to each block.
   #
-  # DISABLE_HIGH_AVAILABILITY=true disables the leader-election path,
-  # which would otherwise try to talk to peer aggregators.
+  # Tests opt out of trust-base verification via
+  # `SPHERE_ORACLE_SKIP_VERIFICATION=1` (threaded through createNode
+  # Providers → PaymentsModule → NametagMinter). The trade-off is
+  # known: tests against this stack do NOT exercise the trust-base
+  # verification path. The follow-up to fix this is the `full-bft`
+  # profile (bft-root + genesis-gen + upload-shard-conf) — those
+  # services are checked in but the cert flow back to the aggregator
+  # doesn't yet complete (see PR notes).
   # ---------------------------------------------------------------------------
   aggregator:
     build:

@@ -245,20 +245,56 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
     return { ...config?.transport, relays };
   })();
 
-  // Local-infra override: SPHERE_AGGREGATOR_URL overrides the network
-  // preset's aggregator URL when the caller didn't explicitly pass an
-  // `oracle.url`. Sibling to SPHERE_NOSTR_RELAYS above. Used by the
-  // E2E_FULL_LOCAL_STACK harness (tests/e2e/local-infra/global-setup.ts)
-  // to point the SDK at the local aggregator container without rewriting
-  // every test's makeProviders call site.
+  // Local-infra overrides for the oracle (aggregator). Siblings to
+  // SPHERE_NOSTR_RELAYS above. Used by the E2E_FULL_LOCAL_STACK
+  // harness (tests/e2e/local-infra/global-setup.ts) to point the SDK
+  // at the local aggregator without rewriting every test's
+  // makeProviders call site.
   //
-  // The env var carries a single URL (the local aggregator only listens
-  // in one place); multi-aggregator setups should configure explicitly.
+  //   SPHERE_AGGREGATOR_URL              — overrides network-preset URL.
+  //                                        Carries a single URL.
+  //   SPHERE_TRUST_BASE_PATH             — overrides the network preset
+  //                                        trust base file (e.g., the
+  //                                        future `full-bft` profile
+  //                                        will produce a local trust
+  //                                        base; the default standalone
+  //                                        profile leaves this unset).
+  //   SPHERE_ORACLE_SKIP_VERIFICATION    — set to "1" to disable trust-
+  //                                        base verification entirely.
+  //                                        Required against the local
+  //                                        BFT-disabled aggregator,
+  //                                        which produces real Merkle
+  //                                        proofs but no Unicity
+  //                                        Certificate — without
+  //                                        skipVerification, Token.mint
+  //                                        throws InvalidJsonStructure
+  //                                        on the missing certificate.
+  //                                        Cost: tests against this
+  //                                        stack do NOT exercise the
+  //                                        trust-base verification
+  //                                        code path. Acceptable for
+  //                                        e2e wiring/integration
+  //                                        tests; not a substitute for
+  //                                        a real-cert run.
+  //
+  // Each override is independent.
   const oracleOverride = (() => {
-    const raw = process.env['SPHERE_AGGREGATOR_URL'];
-    if (!raw) return config?.oracle;
-    if (config?.oracle?.url) return config.oracle;
-    return { ...config?.oracle, url: raw.trim() };
+    const urlEnv = process.env['SPHERE_AGGREGATOR_URL'];
+    const trustPathEnv = process.env['SPHERE_TRUST_BASE_PATH'];
+    const skipEnv = process.env['SPHERE_ORACLE_SKIP_VERIFICATION'];
+    if (!urlEnv && !trustPathEnv && !skipEnv) return config?.oracle;
+    const out: typeof config extends undefined ? object : NonNullable<typeof config>['oracle'] =
+      { ...config?.oracle };
+    if (urlEnv && !config?.oracle?.url) {
+      (out as { url?: string }).url = urlEnv.trim();
+    }
+    if (trustPathEnv && !config?.oracle?.trustBasePath) {
+      (out as { trustBasePath?: string }).trustBasePath = trustPathEnv.trim();
+    }
+    if (skipEnv === '1' && config?.oracle?.skipVerification === undefined) {
+      (out as { skipVerification?: boolean }).skipVerification = true;
+    }
+    return out;
   })();
 
   // Resolve configurations using shared utilities

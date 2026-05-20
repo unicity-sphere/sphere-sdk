@@ -1,46 +1,33 @@
 #!/usr/bin/env node
 /**
- * smoke-full-stack.mjs — Foundation validation of the FULL local stack.
+ * smoke-full-stack.mjs — Foundation validation of the local stack.
  *
  * Boots the docker-compose `--profile full` stack (relay + mongo +
  * aggregator + ipfs) and verifies:
  *
- *   1. All four containers come up healthy.
- *   2. The aggregator accepts `submit_commitment` directly via JSON-RPC
- *      (proves the standalone aggregator round-trips real SMT inclusion
- *      proofs without consensus).
+ *   1. All four services come up healthy.
+ *   2. The aggregator accepts `submit_commitment` directly via
+ *      JSON-RPC and returns real Merkle inclusion proofs (block
+ *      finalization works in BFT_ENABLED=false standalone mode).
  *   3. The SDK env-override path (`SPHERE_AGGREGATOR_URL`,
- *      `SPHERE_NOSTR_RELAYS`, `SPHERE_IPFS_GATEWAY`) wires through
- *      `createNodeProviders` correctly — verified by initializing a
- *      wallet (NO nametag, since trust-base verification fails against
- *      BFT-disabled aggregators — see below) and confirming the
- *      configured endpoints flow through to the oracle provider.
+ *      `SPHERE_NOSTR_RELAYS`, `SPHERE_IPFS_GATEWAY`,
+ *      `SPHERE_ORACLE_SKIP_VERIFICATION`) wires through
+ *      `createNodeProviders` correctly and oracle reports skip=true.
  *
- * **Known limitation — trust-base verification.**
- *   The aggregator runs in `BFT_ENABLED=false` mode for stack
- *   simplicity (1 container vs 4: bft-root + bft-aggregator-genesis-gen +
- *   bft-aggregator + aggregator). That mode produces real Merkle proofs
- *   but **no UnicityCertificate**, so `Token.mint`'s trust-base
- *   verification rejects them with `InvalidJsonStructureError`. The
- *   `Sphere.init({ nametag })` path therefore does NOT work end-to-end
- *   against this stack — only the lower-level JSON-RPC + SDK-wiring
- *   surface is validated here.
- *
- *   Two follow-up paths to close the gap:
- *     (a) Wire the full BFT stack (bft-core + bft-aggregator), keeping
- *         a single-validator configuration so the cert path is real.
- *         Heavier setup but matches testnet exactly.
- *     (b) Add an `oracle.skipVerification` plumb-through from
- *         createNodeProviders → PaymentsModule → NametagMinter so
- *         local-mode tests can opt out of trust-base verification.
- *         Lighter, but loses trust-base coverage in local tests.
+ * **NOT validated here** — `Sphere.init({ nametag })` end-to-end.
+ * The standalone aggregator emits proofs without a UnicityCertificate
+ * field. The SDK's `InclusionProof.fromJSON` deserializer structurally
+ * requires that field, so wallet-level mint paths throw
+ * `InvalidJsonStructureError` against this stack regardless of
+ * `oracle.skipVerification`. Three follow-up paths are tracked in the
+ * PR description (full-bft profile, SDK deserializer patch, or
+ * aggregator-go emitting a stub cert).
  *
  * Usage:
  *   node tests/e2e/local-infra/smoke-full-stack.mjs
  *
  * Exit codes:
- *   0  — stack boots healthy + JSON-RPC submit_commitment works +
- *        SDK provider creation succeeds with env-override URLs
+ *   0  — every assertion in scope passed
  *   1  — anything failed; logs explain
  */
 
@@ -57,6 +44,30 @@ const SETUP_SCRIPT = join(__dirname, 'setup-aggregator-src.sh');
 
 const log = (msg) => console.log(`[smoke-full-stack] ${msg}`);
 
+function ensureBftDataDirs() {
+  // Pre-create the BFT bind-mount directories with the running
+  // user's ownership. Docker would otherwise create them as root on
+  // first compose-up, and the BFT containers (which we drop to the
+  // host user via USER_UID/USER_GID) can't write into root-owned
+  // dirs. mkdirSync from the host process inherits the running
+  // user's ownership.
+  for (const d of [
+    join(__dirname, '.bft-data'),
+    join(__dirname, '.bft-data', 'genesis'),
+    join(__dirname, '.bft-data', 'genesis-root'),
+  ]) {
+    spawnSync('mkdir', ['-p', d], { stdio: 'ignore' });
+  }
+}
+
+function composeEnv() {
+  return {
+    ...process.env,
+    USER_UID: String(process.getuid?.() ?? 1000),
+    USER_GID: String(process.getgid?.() ?? 1000),
+  };
+}
+
 function dockerComposeUp() {
   log('ensuring aggregator-go source…');
   let r = spawnSync('bash', [SETUP_SCRIPT], {
@@ -65,11 +76,13 @@ function dockerComposeUp() {
   });
   if (r.status !== 0) throw new Error(`setup-aggregator-src.sh failed (exit ${r.status})`);
 
-  log('booting docker-compose --profile full (mongo, aggregator, ipfs, relay)…');
+  ensureBftDataDirs();
+
+  log('booting docker-compose --profile full (relay, mongo, aggregator, ipfs)…');
   r = spawnSync(
     'docker',
     ['compose', '-f', COMPOSE_FILE, '--profile', 'full', 'up', '-d'],
-    { stdio: 'inherit', timeout: 600_000 },
+    { stdio: 'inherit', timeout: 600_000, env: composeEnv() },
   );
   if (r.status !== 0) throw new Error('docker compose up failed');
 }
@@ -98,7 +111,23 @@ function dockerComposeDown() {
   spawnSync(
     'docker',
     ['compose', '-f', COMPOSE_FILE, '--profile', 'full', 'down', '-v'],
-    { stdio: 'inherit', timeout: 120_000 },
+    { stdio: 'inherit', timeout: 120_000, env: composeEnv() },
+  );
+  // Bind-mounted BFT genesis tree isn't removed by `down -v` (named
+  // volumes only). Clean via a container so we don't need sudo on
+  // host-side rm of root-owned files. CRITICAL: clear CONTENTS only —
+  // preserving the bind-mount target dirs themselves. If we rm the
+  // dirs, Docker re-creates them as root on next compose-up and the
+  // host-user-owned BFT containers fail with "permission denied".
+  spawnSync(
+    'docker',
+    [
+      'run', '--rm', '-v',
+      `${join(__dirname, '.bft-data')}:/data`,
+      'alpine', 'sh', '-c',
+      'rm -rf /data/genesis/* /data/genesis/.??* /data/genesis-root/* /data/genesis-root/.??* 2>/dev/null; true',
+    ],
+    { stdio: 'ignore', timeout: 30_000 },
   );
 }
 
@@ -202,18 +231,18 @@ async function runDirectAggregatorProbe() {
 
 async function runSdkProviderSmoke() {
   // Verify the SDK env-override path threads through. We do NOT call
-  // Sphere.init({ nametag }) here because the BFT_ENABLED=false
-  // aggregator produces no UnicityCertificate; the SDK's trust-base
-  // verification fails the mint. We DO confirm the wallet bootstrap
-  // wires the configured URLs into the right provider components,
-  // which is the integration point that matters for downstream tests
-  // once the BFT stack lands (or skipVerification gets plumbed).
+  // Sphere.init({ nametag }) here — see file-level docstring for the
+  // SDK deserializer / UnicityCertificate limitation. This smoke
+  // validates everything UP TO the wallet-level mint flow.
   process.env.SPHERE_AGGREGATOR_URL = 'http://127.0.0.1:3001';
+  process.env.SPHERE_ORACLE_SKIP_VERIFICATION = '1';
   process.env.SPHERE_NOSTR_RELAYS = 'ws://127.0.0.1:7777';
   process.env.SPHERE_IPFS_GATEWAY = 'http://127.0.0.1:8082';
 
   const dataDir = mkdtempSync(join(tmpdir(), 'sphere-smoke-'));
   try {
+    log(`wallet data dir: ${dataDir}`);
+
     const implNodePath = join(SDK_ROOT, 'dist', 'impl', 'nodejs', 'index.js');
     const { createNodeProviders } = await import(implNodePath);
 
@@ -223,16 +252,30 @@ async function runSdkProviderSmoke() {
       dataDir,
       tokensDir: join(dataDir, 'tokens'),
     });
-
-    // Provider instances are opaque (config fields are private to
-    // their classes); the env-override code path is unit-tested via
-    // the resolveOracleConfig contract and the SPHERE_NOSTR_RELAYS
-    // override (its prior-art pattern). Here we just confirm the
-    // factory returns all expected providers without throwing.
     if (!providers.transport) throw new Error('createNodeProviders returned no transport');
     if (!providers.oracle) throw new Error('createNodeProviders returned no oracle');
     if (!providers.storage) throw new Error('createNodeProviders returned no storage');
     log('✓ providers instantiated (transport, oracle, storage)');
+
+    // Initialize the oracle so the trust-base loader runs (or is
+    // skipped due to skipVerification:true), then verify the
+    // skipVerification accessor reports the expected state.
+    if (typeof providers.oracle.initialize === 'function') {
+      await providers.oracle.initialize();
+    }
+    const skipsVerification = providers.oracle.getSkipVerification?.() === true;
+    const trustBase = providers.oracle.getTrustBase?.();
+    if (!skipsVerification) {
+      throw new Error(
+        'SPHERE_ORACLE_SKIP_VERIFICATION env override did not flow through to oracle.getSkipVerification()',
+      );
+    }
+    if (trustBase !== null) {
+      throw new Error(
+        'expected oracle.getTrustBase() === null when skipVerification is on, got ' + String(trustBase),
+      );
+    }
+    log('✓ oracle.getSkipVerification() === true, oracle.getTrustBase() === null');
   } finally {
     try { rmSync(dataDir, { recursive: true, force: true }); } catch {}
   }
@@ -260,10 +303,18 @@ try {
   await runDirectAggregatorProbe();
   await runSdkProviderSmoke();
   log('=== SMOKE PASSED ===');
-  log('Note: nametag-mint round-trip is NOT verified — see header comment for the');
-  log('      trust-base limitation in BFT_ENABLED=false mode.');
+  log('NOTE: Sphere.init({ nametag }) is NOT validated here — see file-level');
+  log('      docstring for the UnicityCertificate deserializer limitation.');
 } catch (err) {
   log(`=== SMOKE FAILED: ${err.message} ===`);
+  // Surface the full stack to aid diagnosis of where in the SDK the
+  // failure originates (most "Invalid JSON structure" failures come
+  // from Token.fromJSON deep in the mint path; the stack pinpoints
+  // which call site triggered it).
+  if (err.stack) {
+    log('stack trace:');
+    for (const line of err.stack.split('\n')) log('  ' + line);
+  }
   exitCode = 1;
 } finally {
   if (teardownNeeded) {
