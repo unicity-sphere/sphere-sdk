@@ -1618,10 +1618,19 @@ export class PaymentsModule {
       // sweep is an optimisation, not a correctness path. Flip ON
       // explicitly when storage growth becomes operationally relevant.
       tombstoneGcWorker: config?.features?.tombstoneGcWorker ?? false,
-      // Issue #166 P2 #1 — orphan-spending auto-recovery. Default-OFF:
-      // the safe-restore-to-`confirmed` strategy assumes the spending
-      // commit never reached the aggregator. Flip ON after soak.
-      orphanAutoRecovery: config?.features?.orphanAutoRecovery ?? false,
+      // Issue #166 P2 #1 — orphan-spending auto-recovery. Default-ON
+      // after the OUTBOX-SEND-FOLLOWUPS item #1 prerequisite (aggregator
+      // cross-check before restore) landed. `defaultOrphanRecovery`
+      // queries `oracle.isSpent(sourceStateHash)` before flipping
+      // `'transferring'` → `'confirmed'` and escalates to `'manual'`
+      // when the aggregator reports the source state spent (i.e. the
+      // commit DID land before the crash; local restore would diverge).
+      // Without this flip a crashed send leaves the source token
+      // unspendable indefinitely and the operator must intervene by
+      // hand — with the flip, the cross-checked recovery hook runs
+      // automatically on the load-tail orphan sweep. Set `false`
+      // explicitly to suppress (e.g. timer-sensitive unit tests).
+      orphanAutoRecovery: config?.features?.orphanAutoRecovery ?? true,
       // Issue #174 — per-token spent-state rescan worker
       // (UXF-TRANSFER-PROTOCOL §12.3.2). Default-ON after soak: probes
       // oracle.isSpent for each `'confirmed'` token every ~5 min per
