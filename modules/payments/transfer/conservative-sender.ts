@@ -75,6 +75,7 @@
  */
 
 import { SphereError } from '../../../core/errors';
+import { logger } from '../../../core/logger';
 import type {
   OracleProvider,
 } from '../../../oracle/oracle-provider';
@@ -977,6 +978,64 @@ export async function sendConservativeUxf(
         }
       }
       throw cause;
+    }
+
+    // -----------------------------------------------------------------
+    // Step 8.5: OUTBOX-SEND-FOLLOWUPS Item #6.a — fire-and-forget
+    // local IPFS pin on the inline path.
+    //
+    // When `delivery.kind === 'inline'` AND the resolver flagged the
+    // decision with `shouldPin: true` (which happens iff a publisher
+    // is wired), additionally pin the SAME content-addressed CAR
+    // bytes to the local IPFS node. The wire delivery stays inline
+    // (`uxf-car`); the pin is independent best-effort durability so
+    // Item #2's retention re-publish closure can downgrade
+    // `'car-over-nostr'` re-publishes to CID-shape later (the pin
+    // guarantees the CID is fetchable).
+    //
+    // Strictly fire-and-forget:
+    //  - Pin failure MUST NOT block the send (wire delivery is
+    //    already inline — recipient is not waiting on the pin).
+    //  - The pin runs in parallel with the rest of the wire-envelope
+    //    construction below; we don't await it anywhere.
+    //  - Idempotent: re-running publishToIpfs for the same CAR is a
+    //    no-op at the IPFS layer (content-addressed).
+    //
+    // Defensive: only fires when both signals agree
+    // (`shouldPin === true` from the resolver AND `deps.publishToIpfs`
+    // is present at call time). This double-gate protects against a
+    // future refactor that detaches the publisher between the
+    // resolver call and this point.
+    // -----------------------------------------------------------------
+    if (
+      delivery.kind === 'inline' &&
+      delivery.shouldPin === true &&
+      deps.publishToIpfs !== undefined
+    ) {
+      const publish = deps.publishToIpfs;
+      // Trampoline through `Promise.resolve().then(...)` so a publisher
+      // that throws SYNCHRONOUSLY (before constructing its Promise) is
+      // still caught by `.catch()`. The `PublishToIpfsCallback` type
+      // returns a Promise, which `async` implementations honor by
+      // contract — but a non-async implementation that throws before
+      // `return` would escape `void publish(carBytes).catch(...)`.
+      void Promise.resolve()
+        .then(() => publish(carBytes))
+        .catch((pinErr) => {
+          // Fire-and-forget: log and swallow. The inline wire delivery
+          // is unaffected — the recipient gets the CAR via the Nostr
+          // event regardless. The lost-pin trade-off only matters for
+          // Item #2's CAR-mode retention re-publish, which retains its
+          // defensive throw arc for entries without a live local pin.
+          const message =
+            pinErr instanceof Error ? pinErr.message : String(pinErr);
+          logger.warn(
+            'Payments',
+            `sendUxfConservative: best-effort inline-CAR pin failed (Item #6.a) — wire send unaffected; ` +
+              `Item #2 retention re-publish for this entry will fall back to the defensive arc. ` +
+              `bundleCid=${bundleCid} cause=${message}`,
+          );
+        });
     }
 
     // -----------------------------------------------------------------

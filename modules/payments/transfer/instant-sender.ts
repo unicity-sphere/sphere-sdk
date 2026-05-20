@@ -60,6 +60,7 @@
  */
 
 import { SphereError } from '../../../core/errors';
+import { logger } from '../../../core/logger';
 import type { OracleProvider } from '../../../oracle/oracle-provider';
 import type { TokenStorageProvider } from '../../../storage/storage-provider';
 import type {
@@ -1151,6 +1152,48 @@ export async function sendInstantUxf(
       await deps.outbox.write(
         buildOutboxRecord(argsAfterDelivery, 'pinned', Date.now()),
       );
+    }
+
+    // -----------------------------------------------------------------
+    // OUTBOX-SEND-FOLLOWUPS Item #6.a — fire-and-forget local IPFS
+    // pin on the inline path.
+    //
+    // When `delivery.kind === 'inline'` AND the resolver flagged the
+    // decision with `shouldPin: true` (which happens iff a publisher
+    // is wired), additionally pin the SAME content-addressed CAR
+    // bytes to the local IPFS node. The wire delivery stays inline
+    // (`uxf-car`); the pin is independent best-effort durability so
+    // Item #2's retention re-publish closure can downgrade
+    // `'car-over-nostr'` re-publishes to CID-shape later.
+    //
+    // Strictly fire-and-forget — pin failure MUST NOT block the
+    // send. Idempotent: re-running publishToIpfs for the same CAR
+    // is a no-op at the IPFS layer (content-addressed).
+    // -----------------------------------------------------------------
+    if (
+      delivery.kind === 'inline' &&
+      delivery.shouldPin === true &&
+      deps.publishToIpfs !== undefined
+    ) {
+      const publish = deps.publishToIpfs;
+      // Trampoline through `Promise.resolve().then(...)` so a publisher
+      // that throws SYNCHRONOUSLY (before constructing its Promise) is
+      // still caught by `.catch()`. The `PublishToIpfsCallback` type
+      // returns a Promise, which `async` implementations honor by
+      // contract — but a non-async implementation that throws before
+      // `return` would escape `void publish(carBytes).catch(...)`.
+      void Promise.resolve()
+        .then(() => publish(carBytes))
+        .catch((pinErr) => {
+          const message =
+            pinErr instanceof Error ? pinErr.message : String(pinErr);
+          logger.warn(
+            'Payments',
+            `sendInstantUxf: best-effort inline-CAR pin failed (Item #6.a) — wire send unaffected; ` +
+              `Item #2 retention re-publish for this entry will fall back to the defensive arc. ` +
+              `bundleCid=${bundleCid} cause=${message}`,
+          );
+        });
     }
 
     // -----------------------------------------------------------------
