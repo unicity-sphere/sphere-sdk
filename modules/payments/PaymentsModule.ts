@@ -16125,7 +16125,6 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
     },
   };
   const manifestCas = new ManifestCas(manifestStorage);
-  const placeholderRootHash = contentHash('00'.repeat(32));
 
   const tombstoneSet = new Set<string>();
   const tombstones = {
@@ -16192,12 +16191,26 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
           proof: proof.proof,
         };
         poolProofs.set(`${input.tokenId}:${input.requestId}`, descriptor);
-        if (!manifestEntries.has(`${addressId}:${input.tokenId}`)) {
-          manifestEntries.set(`${addressId}:${input.tokenId}`, {
-            rootHash: placeholderRootHash,
-            status: 'pending',
-          });
-        }
+        // Issue #195: do NOT synthesize a placeholder manifest entry here.
+        // The §5.5 step 5 4-step write order assigns ownership of the
+        // manifest entry to step 2 (`step2ManifestCidRewrite`). The
+        // recipient enqueue path populates `RequestContext` with
+        // `previousCid: undefined` (genesis), which step 2 translates to
+        // `prev = null` (assert "no entry exists"). Writing a placeholder
+        // here before step 2 runs breaks that contract — `manifestCas.update`
+        // observes the placeholder, returns `cas-mismatch` (placeholder
+        // ≠ undefined), and step 2 throws `ManifestCidRewriteCasError`.
+        //
+        // The escrow swap deposit flow surfaces this most visibly: the
+        // CAS error blocks the deposit token from flipping to
+        // `'confirmed'`, leaving the swap stuck at `PARTIAL_DEPOSIT`
+        // with no progression to payout. Real receives are also broken;
+        // they only "work" because the local Token still appears in the
+        // UI and casual flows tolerate the silently stuck pending state.
+        //
+        // Removing this write lets step 2's CAS execute cleanly: it
+        // observes `undefined`, accepts the `prev = null` assertion,
+        // and inserts the canonical first entry via `writeEntry`.
         const newCid = contentHash(
           input.requestId.replace(/[^0-9a-f]/gi, '').padStart(64, '0').slice(0, 64),
         );

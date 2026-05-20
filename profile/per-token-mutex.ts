@@ -148,9 +148,19 @@ export class PerTokenMutex {
       }
 
       let timer: ReturnType<typeof setTimeout> | undefined;
+      // Issue #195: track whether the bounded-hold timer has fired. The
+      // detached-fn `.catch` below originally logged EVERY rejection as
+      // "detached fn rejected after timeout" — including ordinary
+      // pre-timeout rejections that the awaiter is about to surface.
+      // That wording sent operators chasing imaginary hold-time blowups
+      // when the real failure was a synchronous error inside `fn` (e.g.
+      // a `ManifestCidRewriteCasError` returned in microseconds). Gate
+      // the warn-log on the timer actually having fired.
+      let timedOut = false;
       try {
         const timeoutPromise = new Promise<never>((_, reject) => {
           timer = setTimeout(() => {
+            timedOut = true;
             reject(
               new SphereError(
                 `PerTokenMutex 'bounded-hold' fired: tokenId=${tokenId} exceeded ${timeoutMs}ms (W35)`,
@@ -169,8 +179,24 @@ export class PerTokenMutex {
         // / corrupted-state failures that fire on the detached fn after
         // the timeout has already returned. Without this, catastrophic
         // post-timeout failures vanish silently.
+        //
+        // Issue #195 fix: only warn when the rejection genuinely arrives
+        // AFTER the bounded-hold timeout has already fired. If the
+        // rejection arrives FIRST, `Promise.race` propagates it to the
+        // awaiter (the surrounding `await` throws), and the caller
+        // handles it through normal error flow — the `.catch` here is
+        // only needed to prevent post-timeout unhandled-rejection noise.
         const fnPromise = fn();
         fnPromise.catch((err) => {
+          if (!timedOut) {
+            // Pre-timeout rejection — the awaiter surfaces this through
+            // `Promise.race`'s rejection. The `.catch` is here solely
+            // to keep the post-timeout case observable; silence the
+            // pre-timeout case to avoid double-reporting + misleading
+            // "after timeout" wording for failures that arrived in
+            // microseconds.
+            return;
+          }
           logger.warn(
             'PerTokenMutex',
             `bounded-hold tokenId=${tokenId} detached fn rejected after timeout: ${
