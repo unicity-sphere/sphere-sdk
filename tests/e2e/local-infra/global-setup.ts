@@ -1,44 +1,64 @@
 /**
  * vitest globalSetup for local-infra mode.
  *
- * Activated when `E2E_LOCAL_INFRA=1`. Boots a local Nostr relay (Docker)
- * and a local faucet agent (js-faucet image), then exports two env
- * vars that the test helpers and SDK pick up:
+ * Two modes selected by env var (see also docker-compose.yml header):
  *
- *   SPHERE_NOSTR_RELAYS       — read by createNodeProviders to override
- *                                the network preset's default relay
- *                                set. ws://127.0.0.1:7777 here.
+ * 1. RELAY-ONLY (`E2E_LOCAL_INFRA=1`) — Nostr relay (Docker) +
+ *    faucet agent (js-faucet image). Aggregator + IPFS continue to
+ *    point at the public Unicity testnet — they are reliable enough
+ *    that a relay-only override was sufficient when the harness was
+ *    introduced.
+ *
+ * 2. FULL-STACK (`E2E_FULL_LOCAL_STACK=1`) — adds local aggregator
+ *    (BFT_ENABLED=false standalone with a sidecar MongoDB) and a
+ *    local IPFS (kubo) daemon. Hermetic: no testnet dependencies at
+ *    test time. Used when testnet is broken (e.g. aggregator 401
+ *    outage) or when CI needs a self-contained run.
+ *
+ * Env vars exported into the test process:
+ *
+ *   SPHERE_NOSTR_RELAYS       — read by createNodeProviders to
+ *                                override the network preset's
+ *                                default relay set. Always set when
+ *                                E2E_LOCAL_INFRA=1.
  *   E2E_LOCAL_FAUCET_PUBKEY   — the spawned faucet's secp256k1
- *                                chainPubkey (compressed, 66 hex chars).
- *                                Test helpers use this to send
- *                                FAUCET_REQUEST DMs in lieu of the
- *                                public HTTP faucet.
+ *                                chainPubkey. Always set when
+ *                                E2E_LOCAL_INFRA=1 and the faucet
+ *                                wasn't disabled.
+ *   SPHERE_AGGREGATOR_URL     — http://127.0.0.1:3001 (local
+ *                                aggregator). Set only in full-stack
+ *                                mode.
+ *   SPHERE_IPFS_GATEWAY       — http://127.0.0.1:8082 (local kubo
+ *                                gateway). Set only in full-stack
+ *                                mode.
  *
- * Aggregator + IPFS continue to point at the public Unicity testnet —
- * those services are reliable and have no local Docker substitute we
- * trust to round-trip real inclusion proofs.
- *
- * Teardown stops both containers. Persistent state (relay SQLite event
- * log) is preserved unless the developer sets `E2E_LOCAL_INFRA_WIPE=1`,
- * which lets a triage session re-run with a clean slate.
+ * Teardown stops every container WE booted. Persistent state (relay
+ * SQLite event log, mongo data, ipfs repo) is preserved unless the
+ * developer sets `E2E_LOCAL_INFRA_WIPE=1`, which lets a triage
+ * session re-run with a clean slate.
  *
  * Compatibility: when E2E_LOCAL_INFRA is unset, this module's
- * `setup()` is a no-op so the suite continues to run against the public
- * testnet. The infra-probe preflight (tests/e2e/preflight.global-setup.ts)
- * runs separately and gates any real-testnet test on its own.
+ * `setup()` is a no-op so the suite continues to run against the
+ * public testnet. The infra-probe preflight
+ * (tests/e2e/preflight.global-setup.ts) runs separately and gates
+ * any real-testnet test on its own.
  *
  * @module tests/e2e/local-infra/global-setup
  */
 
 import { bootLocalRelay, type RelayHandle } from './relay.js';
 import { bootLocalFaucet, type FaucetHandle } from './faucet.js';
+import { bootLocalAggregator, type AggregatorHandle } from './aggregator.js';
+import { bootLocalIpfs, type IpfsHandle } from './ipfs.js';
 
 let relay: RelayHandle | null = null;
 let faucet: FaucetHandle | null = null;
+let aggregator: AggregatorHandle | null = null;
+let ipfs: IpfsHandle | null = null;
 
 const PREFIX = '[e2e-local-infra] ';
 const log = (msg: string): void => {
-  // eslint-disable-next-line no-console
+   
   console.log(`${PREFIX}${msg}`);
 };
 
@@ -61,7 +81,25 @@ function parentAlreadyBootedStack(): boolean {
   );
 }
 
+/**
+ * Full-local-stack mode (E2E_FULL_LOCAL_STACK=1) — adds local
+ * aggregator + IPFS on top of the relay + faucet. Implies
+ * E2E_LOCAL_INFRA semantics; setting both is harmless (full implies
+ * the relay-only set).
+ */
+function fullStackRequested(): boolean {
+  return process.env['E2E_FULL_LOCAL_STACK'] === '1';
+}
+
 export async function setup(): Promise<void> {
+  // Setting E2E_FULL_LOCAL_STACK=1 implies E2E_LOCAL_INFRA=1 — the
+  // full-stack mode is the relay-only path plus the aggregator + IPFS
+  // services. Normalize early so the remaining gates work.
+  const fullStack = fullStackRequested();
+  if (fullStack && process.env['E2E_LOCAL_INFRA'] !== '1') {
+    process.env['E2E_LOCAL_INFRA'] = '1';
+  }
+
   if (process.env['E2E_LOCAL_INFRA'] !== '1') {
     log('E2E_LOCAL_INFRA != 1 — skipping local infra; tests run against public testnet.');
     return;
@@ -75,7 +113,11 @@ export async function setup(): Promise<void> {
     return;
   }
 
-  log('booting local Nostr relay + faucet (aggregator + IPFS stay public)…');
+  if (fullStack) {
+    log('E2E_FULL_LOCAL_STACK=1 — booting relay + faucet + aggregator + IPFS (hermetic e2e).');
+  } else {
+    log('booting local Nostr relay + faucet (aggregator + IPFS stay public)…');
+  }
 
   // 1. Local Nostr relay.
   const wipe = process.env['E2E_LOCAL_INFRA_WIPE'] === '1';
@@ -83,7 +125,43 @@ export async function setup(): Promise<void> {
   process.env['SPHERE_NOSTR_RELAYS'] = relay.url;
   log(`SPHERE_NOSTR_RELAYS=${relay.url}`);
 
-  // 2. Local faucet (auto-disable via env if a developer wants to
+  // 2. Full-stack only: aggregator (+ mongo) and IPFS. Booted BEFORE
+  //    the faucet because the faucet will resolve nametags via the
+  //    aggregator on startup; if a future faucet revision adds an
+  //    aggregator dependency at boot, having it up first avoids a
+  //    flaky race.
+  if (fullStack) {
+    try {
+      // Aggregator: booted in parallel with IPFS to keep total boot
+      // time bounded. Cold first-run is dominated by the Go build
+      // (~30s); subsequent runs are <5s.
+      const [aggHandle, ipfsHandle] = await Promise.all([
+        bootLocalAggregator({ wipe, logPrefix: PREFIX }),
+        bootLocalIpfs({ wipe, logPrefix: PREFIX }),
+      ]);
+      aggregator = aggHandle;
+      ipfs = ipfsHandle;
+      process.env['SPHERE_AGGREGATOR_URL'] = aggregator.url;
+      process.env['SPHERE_IPFS_GATEWAY'] = ipfs.gatewayUrl;
+      log(`SPHERE_AGGREGATOR_URL=${aggregator.url}`);
+      log(`SPHERE_IPFS_GATEWAY=${ipfs.gatewayUrl}`);
+    } catch (err) {
+      // Aggregator OR IPFS failed — tear down anything we got up so
+      // the next run starts clean.
+      if (relay) {
+        try { await relay.stop(); } catch { /* best effort */ }
+      }
+      if (aggregator) {
+        try { await aggregator.stop(); } catch { /* best effort */ }
+      }
+      if (ipfs) {
+        try { await ipfs.stop(); } catch { /* best effort */ }
+      }
+      throw err;
+    }
+  }
+
+  // 3. Local faucet (auto-disable via env if a developer wants to
   //    stand up the faucet by hand for debugging).
   if (process.env['E2E_LOCAL_INFRA_NO_FAUCET'] === '1') {
     log('E2E_LOCAL_INFRA_NO_FAUCET=1 — skipping faucet boot. Tests using the faucet must be opted out.');
@@ -106,6 +184,12 @@ export async function setup(): Promise<void> {
     if (relay) {
       try { await relay.stop(); } catch { /* best effort */ }
     }
+    if (aggregator) {
+      try { await aggregator.stop(); } catch { /* best effort */ }
+    }
+    if (ipfs) {
+      try { await ipfs.stop(); } catch { /* best effort */ }
+    }
     throw err;
   }
 }
@@ -116,14 +200,17 @@ export async function teardown(): Promise<void> {
   // Symmetric with setup() — only tear down what WE booted. If a
   // parent process owns the stack lifecycle, leaving the containers
   // running is correct (the parent will tear them down at its own
-  // exit). The module-scoped `relay` / `faucet` handles are non-null
-  // ONLY when this module's setup() actually booted them.
-  if (!relay && !faucet) {
+  // exit). The module-scoped `relay` / `faucet` / `aggregator` /
+  // `ipfs` handles are non-null ONLY when this module's setup()
+  // actually booted them.
+  if (!relay && !faucet && !aggregator && !ipfs) {
     log('parent owns stack lifecycle — skipping teardown.');
     return;
   }
 
   log('stopping local infra…');
+  const wipe = process.env['E2E_LOCAL_INFRA_WIPE'] === '1';
+
   // Faucet first so it can shut down its DM subscription cleanly
   // before we kill the relay it talks to.
   if (faucet) {
@@ -131,8 +218,26 @@ export async function teardown(): Promise<void> {
     catch (err) { log(`faucet stop failed: ${err instanceof Error ? err.message : String(err)}`); }
     faucet = null;
   }
+  // Aggregator + IPFS in parallel — independent containers, both
+  // safe to stop concurrently. Mongo is torn down by aggregator.stop().
+  if (aggregator || ipfs) {
+    await Promise.all([
+      aggregator
+        ? aggregator.stop({ wipe }).catch((err) => {
+            log(`aggregator stop failed: ${err instanceof Error ? err.message : String(err)}`);
+          })
+        : Promise.resolve(),
+      ipfs
+        ? ipfs.stop({ wipe }).catch((err) => {
+            log(`ipfs stop failed: ${err instanceof Error ? err.message : String(err)}`);
+          })
+        : Promise.resolve(),
+    ]);
+    aggregator = null;
+    ipfs = null;
+  }
   if (relay) {
-    try { await relay.stop({ wipe: process.env['E2E_LOCAL_INFRA_WIPE'] === '1' }); }
+    try { await relay.stop({ wipe }); }
     catch (err) { log(`relay stop failed: ${err instanceof Error ? err.message : String(err)}`); }
     relay = null;
   }

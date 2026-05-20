@@ -40,5 +40,9 @@ tests/integration/.test-*/
 # E2e preflight infra-probe result (regenerated each run)
 tests/e2e/.preflight-result.json
 
+# Full-local-stack aggregator-go checkout (fetched on demand by
+# tests/e2e/local-infra/setup-aggregator-src.sh; not source code we own)
+tests/e2e/local-infra/.aggregator-go/
+
 # Community / Discord report drafts (agent-authored, not source)
 community-reports/

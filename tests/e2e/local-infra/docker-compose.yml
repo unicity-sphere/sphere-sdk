@@ -1,27 +1,36 @@
 # =============================================================================
 # Local infrastructure for sphere-sdk e2e tests.
 #
-# Boots a local Nostr relay (and optionally a faucet agent) so the e2e
-# suite can run against a deterministic, in-process stack instead of
-# the public testnet relay+faucet — useful when:
-#   - the testnet relay's write path is broken / silently dropping
-#     publishes (the 2026-05-04 outage that motivated this harness);
-#   - CI runs need reproducibility (no shared rate limits, no
-#     nametag collisions across concurrent jobs);
-#   - we are debugging the SDK's interaction with Nostr and want a
-#     SQLite-backed relay we can `docker exec sqlite3 ./events.db`.
+# Two modes selected by the global-setup, both honored here:
 #
-# Aggregator (L3) and IPFS gateway are NOT replaced — the public
-# Unicity testnet aggregator/IPFS are reliable and the sphere-sdk has
-# no aggregator stub that would round-trip real inclusion proofs.
-# E2E tests that need the aggregator continue to talk to:
-#   wss://goggregator-test.unicity.network
-#   https://ipfs.unicity.network
+#   1. RELAY-ONLY mode (E2E_LOCAL_INFRA=1) — the default. Only the
+#      `relay` service boots. Faucet is spawned outside compose by
+#      faucet.ts. Aggregator + IPFS continue to point at the public
+#      Unicity testnet. Use when:
+#        - the testnet relay's write path is broken / silently dropping
+#          publishes (the 2026-05-04 outage that motivated this harness);
+#        - CI runs need relay reproducibility (no shared rate limits,
+#          no nametag collisions across concurrent jobs);
+#        - we are debugging the SDK's interaction with Nostr.
+#
+#   2. FULL-STACK mode (E2E_FULL_LOCAL_STACK=1) — relay + mongodb +
+#      aggregator + ipfs. Use when the public testnet aggregator is
+#      down (HTTP 401 / consensus outage / GHCR image pull failure) or
+#      when we need full hermetic e2e for CI.
+#
+# Service activation matrix (Compose profiles):
+#   relay      — always (no profile)
+#   mongodb    — profile: full
+#   aggregator — profile: full   (built locally from a pinned
+#                aggregator-go commit; see setup-aggregator-src.sh)
+#   ipfs       — profile: full
 #
 # Usage from the global-setup:
+#   # relay only:
 #   docker compose -f tests/e2e/local-infra/docker-compose.yml up -d
-#   …run tests with E2E_LOCAL_RELAY_URL=ws://127.0.0.1:7777 …
-#   docker compose -f tests/e2e/local-infra/docker-compose.yml down -v
+#   # full stack:
+#   docker compose -f tests/e2e/local-infra/docker-compose.yml --profile full up -d
+#   docker compose -f tests/e2e/local-infra/docker-compose.yml --profile full down -v
 #
 # Versions are pinned. Update via the parent global-setup so any change
 # here is paired with a documented test-suite re-validation.
@@ -59,5 +68,122 @@ services:
       retries: 12
       start_period: 5s
 
+  # ---------------------------------------------------------------------------
+  # MongoDB — backing store for the local aggregator.
+  #
+  # The aggregator-go binary auto-creates the required collections
+  # (commitments, aggregator_records, blocks, smt_nodes, block_records)
+  # on first connection — no init scripts needed.
+  #
+  # 27018 picked instead of the default 27017 to avoid collisions with
+  # any host-side mongo a developer might already have running.
+  # ---------------------------------------------------------------------------
+  mongodb:
+    image: mongo:7.0
+    container_name: uxf-e2e-mongo
+    restart: unless-stopped
+    profiles: [full]
+    ports:
+      - "127.0.0.1:27018:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      # `mongosh --eval` returns the ping response when the server is
+      # accepting connections; before the daemon is fully up the command
+      # exits non-zero so this gates `depends_on` cleanly.
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ping:1}).ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 5s
+
+  # ---------------------------------------------------------------------------
+  # Aggregator (L3) — built locally from a pinned aggregator-go checkout.
+  #
+  # The build context lives at .aggregator-go/ — fetched on demand by
+  # setup-aggregator-src.sh. The Dockerfile in that checkout is a two-
+  # stage Alpine build (~30s, ~15 MB image). First boot pulls golang
+  # base images; subsequent boots reuse the local image cache.
+  #
+  # BFT_ENABLED=false routes block production through
+  # `bft.NewBFTClientStub`, which calls roundManager.StartNewRound() +
+  # FinalizeBlock() directly — skipping consensus, certificate
+  # validation, and any external BFT-core node. Real SMT and real
+  # inclusion proofs are still produced; only consensus is stubbed.
+  # See aggregator-go/internal/service/service_test.go for the
+  # exact env-var recipe.
+  #
+  # DISABLE_HIGH_AVAILABILITY=true disables the leader-election path,
+  # which would otherwise try to talk to peer aggregators.
+  # ---------------------------------------------------------------------------
+  aggregator:
+    build:
+      context: ./.aggregator-go
+      dockerfile: Dockerfile
+    image: unicity-aggregator-dev:local
+    container_name: uxf-e2e-aggregator
+    restart: unless-stopped
+    profiles: [full]
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    environment:
+      MONGODB_URI: mongodb://mongodb:27017
+      MONGODB_DATABASE: aggregator
+      BFT_ENABLED: "false"
+      DISABLE_HIGH_AVAILABILITY: "true"
+      PORT: "3000"
+      HOST: "0.0.0.0"
+      LOG_LEVEL: info
+    ports:
+      - "127.0.0.1:3001:3000"
+    healthcheck:
+      # The aggregator's /health returns {"status":"ok",...} in
+      # standalone mode (vs "healthy" in BFT mode). The check passes
+      # if HTTP is 200; status-text discrimination happens in
+      # aggregator.ts so it can give a richer error.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # IPFS gateway + API — vanilla Kubo single-node.
+  #
+  # Wallets publish their own CAR bundles via the API (5001) and read
+  # back via the gateway (8080-mapped-to-8082). The repo state lives
+  # in a named volume so a re-up reuses any pinned CIDs from a prior
+  # session.
+  #
+  # We rely on Kubo's defaults aside from explicit announce/swarm
+  # bindings (so the gateway listens on all interfaces inside the
+  # container, while the published port stays loopback).
+  # ---------------------------------------------------------------------------
+  ipfs:
+    image: ipfs/kubo:latest
+    container_name: uxf-e2e-ipfs
+    restart: unless-stopped
+    profiles: [full]
+    ports:
+      # 5002 -> 5001 API; 8082 -> 8080 gateway. Avoiding 5001/8080 on
+      # the host so a dev's existing IPFS daemon (if any) doesn't
+      # collide.
+      - "127.0.0.1:5002:5001"
+      - "127.0.0.1:8082:8080"
+    volumes:
+      - ipfs-data:/data/ipfs
+    healthcheck:
+      # /api/v0/version is a stable, no-side-effect probe that requires
+      # the API server to be fully initialized (the daemon's bootstrap
+      # finishes before it starts the API listener).
+      test: ["CMD-SHELL", "wget -q -O /dev/null --post-data='' http://127.0.0.1:5001/api/v0/version || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 10s
+
 volumes:
   relay-data:
+  mongo-data:
+  ipfs-data:

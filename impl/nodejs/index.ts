@@ -245,9 +245,25 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
     return { ...config?.transport, relays };
   })();
 
+  // Local-infra override: SPHERE_AGGREGATOR_URL overrides the network
+  // preset's aggregator URL when the caller didn't explicitly pass an
+  // `oracle.url`. Sibling to SPHERE_NOSTR_RELAYS above. Used by the
+  // E2E_FULL_LOCAL_STACK harness (tests/e2e/local-infra/global-setup.ts)
+  // to point the SDK at the local aggregator container without rewriting
+  // every test's makeProviders call site.
+  //
+  // The env var carries a single URL (the local aggregator only listens
+  // in one place); multi-aggregator setups should configure explicitly.
+  const oracleOverride = (() => {
+    const raw = process.env['SPHERE_AGGREGATOR_URL'];
+    if (!raw) return config?.oracle;
+    if (config?.oracle?.url) return config.oracle;
+    return { ...config?.oracle, url: raw.trim() };
+  })();
+
   // Resolve configurations using shared utilities
   const transportConfig = resolveTransportConfig(network, transportOverride);
-  const oracleConfig = resolveOracleConfig(network, config?.oracle);
+  const oracleConfig = resolveOracleConfig(network, oracleOverride);
   const l1Config = resolveL1Config(network, config?.l1);
 
   const storage = createFileStorageProvider({
@@ -256,10 +272,30 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
   });
   const priceConfig = resolvePriceConfig(config?.price, storage);
 
-  // Create IPFS storage provider if enabled
+  // Local-infra override: SPHERE_IPFS_GATEWAY overrides the configured
+  // IPFS gateway list when the caller didn't explicitly pass
+  // `tokenSync.ipfs.config.gateways`. Sibling to SPHERE_NOSTR_RELAYS /
+  // SPHERE_AGGREGATOR_URL above. The env value is treated as a single
+  // gateway URL — the local kubo container exposes one endpoint on
+  // 127.0.0.1:8082 (gateway) + 127.0.0.1:5002 (API). Pass the gateway
+  // URL; the SDK derives the API URL from the same host when needed.
+  //
+  // Multi-gateway setups should configure explicitly via `tokenSync.ipfs
+  // .config.gateways`.
   const ipfsSync = config?.tokenSync?.ipfs;
-  const ipfsTokenStorage = ipfsSync?.enabled
-    ? createNodeIpfsStorageProvider(ipfsSync.config, storage)
+  const ipfsSyncOverride = (() => {
+    const raw = process.env['SPHERE_IPFS_GATEWAY'];
+    if (!raw || !ipfsSync) return ipfsSync;
+    if (ipfsSync.config?.gateways && ipfsSync.config.gateways.length > 0) {
+      return ipfsSync;
+    }
+    return {
+      ...ipfsSync,
+      config: { ...ipfsSync.config, gateways: [raw.trim()] },
+    };
+  })();
+  const ipfsTokenStorage = ipfsSyncOverride?.enabled
+    ? createNodeIpfsStorageProvider(ipfsSyncOverride.config, storage)
     : undefined;
 
   // Resolve group chat config
