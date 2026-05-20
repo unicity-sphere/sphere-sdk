@@ -1,0 +1,128 @@
+diff --git a/node_modules/@unicitylabs/state-transition-sdk/lib/transaction/InclusionProof.d.ts b/node_modules/@unicitylabs/state-transition-sdk/lib/transaction/InclusionProof.d.ts
+index 0065ef6..62b4eb3 100644
+--- a/node_modules/@unicitylabs/state-transition-sdk/lib/transaction/InclusionProof.d.ts
++++ b/node_modules/@unicitylabs/state-transition-sdk/lib/transaction/InclusionProof.d.ts
+@@ -14,8 +14,9 @@ export interface IInclusionProofJson {
+     readonly authenticator: IAuthenticatorJson | null;
+     /** The transaction hash as a string or null. */
+     readonly transactionHash: string | null;
+-    /** The unicity certificate as a hex string. */
+-    readonly unicityCertificate: string;
++    /** The unicity certificate as a hex string, or null when produced
++     *  by a BFT-disabled aggregator (sphere-sdk patch). */
++    readonly unicityCertificate: string | null;
+ }
+ /**
+  * Status codes for verifying an InclusionProof.
+@@ -33,7 +34,9 @@ export declare class InclusionProof {
+     readonly merkleTreePath: SparseMerkleTreePath;
+     readonly authenticator: Authenticator | null;
+     readonly transactionHash: DataHash | null;
+-    readonly unicityCertificate: UnicityCertificate;
++    /** Patched (sphere-sdk): nullable when the producing aggregator
++     *  runs in BFT-disabled mode (no UnicityCertificate). */
++    readonly unicityCertificate: UnicityCertificate | null;
+     /**
+      * Constructs an InclusionProof instance.
+      * @param merkleTreePath Sparse merkle tree path.
+@@ -42,7 +45,7 @@ export declare class InclusionProof {
+      * @param unicityCertificate Unicity certificate.
+      * @throws Error if authenticator and transactionHash are not both set or both null.
+      */
+-    constructor(merkleTreePath: SparseMerkleTreePath, authenticator: Authenticator | null, transactionHash: DataHash | null, unicityCertificate: UnicityCertificate);
++    constructor(merkleTreePath: SparseMerkleTreePath, authenticator: Authenticator | null, transactionHash: DataHash | null, unicityCertificate: UnicityCertificate | null);
+     /**
+      * Type guard to check if data is IInclusionProofJson.
+      * @param data The data to check.
+diff --git a/node_modules/@unicitylabs/state-transition-sdk/lib/transaction/InclusionProof.js b/node_modules/@unicitylabs/state-transition-sdk/lib/transaction/InclusionProof.js
+index e5839e1..4e9da47 100644
+--- a/node_modules/@unicitylabs/state-transition-sdk/lib/transaction/InclusionProof.js
++++ b/node_modules/@unicitylabs/state-transition-sdk/lib/transaction/InclusionProof.js
+@@ -50,7 +50,14 @@ export class InclusionProof {
+      * @returns True if data is IInclusionProofJson, false otherwise.
+      */
+     static isJSON(data) {
+-        return typeof data === 'object' && data !== null && 'merkleTreePath' in data && 'unicityCertificate' in data;
++        // Patched (sphere-sdk patches/@unicitylabs+state-transition-sdk):
++        // `unicityCertificate` is no longer required at the structural
++        // level — restoring the pre-Oct-16 shape that allowed BFT-
++        // disabled local aggregators to round-trip proofs. The cert is
++        // still required for cryptographic verification when present;
++        // see `verify()` below. Consumers that need a cert MUST run
++        // `verify(trustBase, …)` and gate on the result.
++        return typeof data === 'object' && data !== null && 'merkleTreePath' in data;
+     }
+     /**
+      * Creates an InclusionProof from a JSON object.
+@@ -62,7 +69,16 @@ export class InclusionProof {
+         if (!InclusionProof.isJSON(data)) {
+             throw new InvalidJsonStructureError();
+         }
+-        return new InclusionProof(SparseMerkleTreePath.fromJSON(data.merkleTreePath), data.authenticator ? Authenticator.fromJSON(data.authenticator) : null, data.transactionHash ? DataHash.fromJSON(data.transactionHash) : null, UnicityCertificate.fromJSON(data.unicityCertificate));
++        // Patched: `unicityCertificate` falls back to null when absent
++        // (BFT-disabled local aggregator). `verify()` reports
++        // NOT_AUTHENTICATED on null cert; the sphere-sdk skipVerification
++        // path uses Token.fromJSON which doesn't call verify().
++        return new InclusionProof(
++            SparseMerkleTreePath.fromJSON(data.merkleTreePath),
++            data.authenticator ? Authenticator.fromJSON(data.authenticator) : null,
++            data.transactionHash ? DataHash.fromJSON(data.transactionHash) : null,
++            data.unicityCertificate ? UnicityCertificate.fromJSON(data.unicityCertificate) : null,
++        );
+     }
+     /**
+      * Decodes an InclusionProof from CBOR bytes.
+@@ -73,7 +89,10 @@ export class InclusionProof {
+         const data = CborDeserializer.readArray(bytes);
+         const authenticator = CborDeserializer.readOptional(data[1], Authenticator.fromCBOR);
+         const transactionHash = CborDeserializer.readOptional(data[2], DataHash.fromCBOR);
+-        const unicityCertificate = UnicityCertificate.fromCBOR(data[3]);
++        // Patched: cert is optional via readOptional (was: required).
++        const unicityCertificate = data[3] !== undefined
++            ? CborDeserializer.readOptional(data[3], UnicityCertificate.fromCBOR)
++            : null;
+         return new InclusionProof(SparseMerkleTreePath.fromCBOR(data[0]), authenticator, transactionHash, unicityCertificate);
+     }
+     /**
+@@ -85,7 +104,10 @@ export class InclusionProof {
+             authenticator: this.authenticator?.toJSON() ?? null,
+             merkleTreePath: this.merkleTreePath.toJSON(),
+             transactionHash: this.transactionHash?.toJSON() ?? null,
+-            unicityCertificate: this.unicityCertificate.toJSON(),
++            // Patched: nullable. Pre-Oct-16 SDK omitted this field
++            // entirely; for round-trip with the current shape we emit
++            // `null` so older consumers fall through cleanly.
++            unicityCertificate: this.unicityCertificate?.toJSON() ?? null,
+         };
+     }
+     /**
+@@ -93,7 +115,13 @@ export class InclusionProof {
+      * @returns The CBOR-encoded bytes.
+      */
+     toCBOR() {
+-        return CborSerializer.encodeArray(this.merkleTreePath.toCBOR(), this.authenticator?.toCBOR() ?? CborSerializer.encodeNull(), this.transactionHash?.toCBOR() ?? CborSerializer.encodeNull(), this.unicityCertificate.toCBOR());
++        return CborSerializer.encodeArray(
++            this.merkleTreePath.toCBOR(),
++            this.authenticator?.toCBOR() ?? CborSerializer.encodeNull(),
++            this.transactionHash?.toCBOR() ?? CborSerializer.encodeNull(),
++            // Patched: nullable.
++            this.unicityCertificate?.toCBOR() ?? CborSerializer.encodeNull(),
++        );
+     }
+     /**
+      * Verifies the inclusion proof for a given request ID.
+@@ -102,6 +130,14 @@ export class InclusionProof {
+      * @returns A Promise resolving to the verification status.
+      */
+     async verify(trustBase, requestId) {
++        // Patched: when cert OR trustBase is null, treat as
++        // NOT_AUTHENTICATED rather than crashing. The skipVerification
++        // path in sphere-sdk never calls verify() because it uses
++        // Token.fromJSON; this branch is defensive for any caller that
++        // does call verify() against a cert-less proof.
++        if (!this.unicityCertificate || !trustBase) {
++            return InclusionProofVerificationStatus.NOT_AUTHENTICATED;
++        }
+         const unicityCertificateVerificationResult = await new UnicityCertificateVerificationRule().verify(new UnicityCertificateVerificationContext(this.merkleTreePath.root, this.unicityCertificate, trustBase));
+         if (!unicityCertificateVerificationResult.isSuccessful) {
+             return InclusionProofVerificationStatus.NOT_AUTHENTICATED;

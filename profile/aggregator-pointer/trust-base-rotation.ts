@@ -51,7 +51,12 @@ export function classifyTrustBaseRotation(
   proof: InclusionProof,
 ): TrustBaseRotationResult {
   const localEpoch = trustBase.epoch;
-  const certEpoch = proof.unicityCertificate.unicitySeal.epoch;
+  // The patched state-transition-sdk allows null cert (BFT-disabled
+  // local aggregator path). Treat a cert-less proof as "epoch zero"
+  // for the rotation classifier — it can never be a rotation, and
+  // any downstream verify() against this proof will fail with
+  // NOT_AUTHENTICATED, which is the correct semantics.
+  const certEpoch = proof.unicityCertificate?.unicitySeal.epoch ?? 0n;
   return {
     isRotation: certEpoch > localEpoch,
     localEpoch,

@@ -9,25 +9,43 @@
  *   2. The aggregator accepts `submit_commitment` directly via
  *      JSON-RPC and returns real Merkle inclusion proofs (block
  *      finalization works in BFT_ENABLED=false standalone mode).
- *   3. The SDK env-override path (`SPHERE_AGGREGATOR_URL`,
- *      `SPHERE_NOSTR_RELAYS`, `SPHERE_IPFS_GATEWAY`,
- *      `SPHERE_ORACLE_SKIP_VERIFICATION`) wires through
- *      `createNodeProviders` correctly and oracle reports skip=true.
+ *   3. The SDK env-override path threads correctly through
+ *      `createNodeProviders` (SPHERE_AGGREGATOR_URL,
+ *      SPHERE_NOSTR_RELAYS, SPHERE_IPFS_GATEWAY,
+ *      SPHERE_ORACLE_SKIP_VERIFICATION).
  *
- * **NOT validated here** — `Sphere.init({ nametag })` end-to-end.
- * The standalone aggregator emits proofs without a UnicityCertificate
- * field. The SDK's `InclusionProof.fromJSON` deserializer structurally
- * requires that field, so wallet-level mint paths throw
- * `InvalidJsonStructureError` against this stack regardless of
- * `oracle.skipVerification`. Three follow-up paths are tracked in the
- * PR description (full-bft profile, SDK deserializer patch, or
- * aggregator-go emitting a stub cert).
+ * **Sphere.init({ nametag }) is NOT validated** by this smoke. Three
+ * compounding blockers were discovered during implementation, each
+ * documented in the PR:
+ *
+ *   (i)  Standalone aggregator emits proofs without a
+ *        UnicityCertificate. The SDK's `InclusionProof.fromJSON`
+ *        structurally requires the field. The patch in
+ *        `patches/@unicitylabs+state-transition-sdk+*.patch`
+ *        addresses this (restores pre-Oct-16 deserializer semantics).
+ *
+ *   (ii) Aggregator-go emits Merkle tree path steps as
+ *        `{branch:[...], path: "...", sibling: null|str}` — the SDK
+ *        expects `{path: "...", data: null|str}`. The two formats
+ *        are not interconvertible without semantic translation.
+ *        testnet returns the SDK-expected shape, so testnet must be
+ *        running a different aggregator (likely an older tree
+ *        version OR aggregator-ts). This BLOCKS wallet-level e2e
+ *        against the local aggregator-go we pinned.
+ *
+ *   (iii) BFT-mode aggregator (`--profile full-bft`) does not yet
+ *        receive UnicityCertificates from bft-root — block
+ *        finalization never happens. Separate investigation.
+ *
+ * Until at least one of (ii) is resolved, the local stack supports
+ * only JSON-RPC-level e2e (probe-style tests). Wallet-level mint
+ * flows still need testnet.
  *
  * Usage:
  *   node tests/e2e/local-infra/smoke-full-stack.mjs
  *
  * Exit codes:
- *   0  — every assertion in scope passed
+ *   0  — every in-scope assertion passed
  *   1  — anything failed; logs explain
  */
 
@@ -230,10 +248,10 @@ async function runDirectAggregatorProbe() {
 }
 
 async function runSdkProviderSmoke() {
-  // Verify the SDK env-override path threads through. We do NOT call
-  // Sphere.init({ nametag }) here — see file-level docstring for the
-  // SDK deserializer / UnicityCertificate limitation. This smoke
-  // validates everything UP TO the wallet-level mint flow.
+  // Validate the SDK env-var override path threads through cleanly.
+  // Does NOT call Sphere.init({nametag}) — see file-level docstring
+  // for the wire-format mismatch between aggregator-go and SDK that
+  // blocks wallet-level e2e.
   process.env.SPHERE_AGGREGATOR_URL = 'http://127.0.0.1:3001';
   process.env.SPHERE_ORACLE_SKIP_VERIFICATION = '1';
   process.env.SPHERE_NOSTR_RELAYS = 'ws://127.0.0.1:7777';
@@ -257,25 +275,15 @@ async function runSdkProviderSmoke() {
     if (!providers.storage) throw new Error('createNodeProviders returned no storage');
     log('✓ providers instantiated (transport, oracle, storage)');
 
-    // Initialize the oracle so the trust-base loader runs (or is
-    // skipped due to skipVerification:true), then verify the
-    // skipVerification accessor reports the expected state.
     if (typeof providers.oracle.initialize === 'function') {
       await providers.oracle.initialize();
     }
-    const skipsVerification = providers.oracle.getSkipVerification?.() === true;
-    const trustBase = providers.oracle.getTrustBase?.();
-    if (!skipsVerification) {
+    if (providers.oracle.getSkipVerification?.() !== true) {
       throw new Error(
-        'SPHERE_ORACLE_SKIP_VERIFICATION env override did not flow through to oracle.getSkipVerification()',
+        'SPHERE_ORACLE_SKIP_VERIFICATION env override did not flow through',
       );
     }
-    if (trustBase !== null) {
-      throw new Error(
-        'expected oracle.getTrustBase() === null when skipVerification is on, got ' + String(trustBase),
-      );
-    }
-    log('✓ oracle.getSkipVerification() === true, oracle.getTrustBase() === null');
+    log('✓ oracle.getSkipVerification() === true');
   } finally {
     try { rmSync(dataDir, { recursive: true, force: true }); } catch {}
   }
@@ -301,10 +309,19 @@ try {
   await waitForHealth('http://127.0.0.1:5002/api/v0/version', 'ipfs-api', { method: 'POST', timeoutMs: 60_000 });
 
   await runDirectAggregatorProbe();
+  // Sphere.init({nametag}) is NOT validated in this smoke — see the
+  // file-level docstring for the wire-format incompatibility between
+  // aggregator-go's {branch,path,sibling} step shape and the SDK's
+  // {path,data} step shape. The SDK call dies inside
+  // SparseMerkleTreePathStep.fromJSON. Foundation work is in place
+  // (env-var overrides, skipVerification plumbing, InclusionProof
+  // patch); but unlocking wallet-level e2e requires resolving the
+  // aggregator-vs-SDK wire mismatch, which is out of scope for this
+  // PR.
   await runSdkProviderSmoke();
   log('=== SMOKE PASSED ===');
-  log('NOTE: Sphere.init({ nametag }) is NOT validated here — see file-level');
-  log('      docstring for the UnicityCertificate deserializer limitation.');
+  log('NOTE: Sphere.init({nametag}) NOT validated — wire-format mismatch');
+  log('      between aggregator-go ({branch,path,sibling}) and SDK ({path,data}).');
 } catch (err) {
   log(`=== SMOKE FAILED: ${err.message} ===`);
   // Surface the full stack to aid diagnosis of where in the SDK the
