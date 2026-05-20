@@ -31,19 +31,24 @@
  *     — recoverable. Reversing the order would silently strand the
  *     bundle on cross-device recovery. The next JOIN pass (inside
  *     ProfileTokenStorageProvider.load()) merges the new ref into the
- *     joined view. This relies on the existing multi-bundle union —
- *     which today runs under the last-writer-wins semantics flagged
- *     by T-D0 (PROFILE-AGGREGATOR-POINTER-D0-JOIN-AUDIT.md): until
- *     the per-token JOIN resolver lands (Rules 3 + 4 in that
- *     document), overlapping tokenIds across remote + local bundles
- *     are resolved by insertion order rather than longest-valid-chain.
- *     This is acceptable for the single-device cold-start and
- *     disjoint-token-set cases — the pointer anchor itself is
- *     correctly persisted either way.
+ *     joined view. The per-token JOIN resolver (Rules 3 + 4 of the
+ *     D0 audit) is now wired: `resolveTokenRoot` (`uxf/token-join.ts`
+ *     — exported and unit-tested) classifies overlapping tokenIds
+ *     across remote + local bundles using longest-valid-chain
+ *     semantics, with production callers in `UxfPackage.merge()`
+ *     (`uxf/UxfPackage.ts:~785`) and the post-load conflict pass
+ *     (`modules/payments/transfer/conflict-merger.ts:~351`). The
+ *     reactive submit-time arm (`Item #14` Phase 1) emits
+ *     `transfer:double-spend-detected` on aggregator state mismatch,
+ *     and the snapshot-time arm (`PR #182`, JOIN-divergent loser
+ *     detection in `PaymentsModule.loadFromStorageData` ~line 15112)
+ *     drops superseded `'transferring'` tokens with a tombstone.
  *
  * @see PROFILE-AGGREGATOR-POINTER-IMPL-PLAN.md Phase D (T-D4 consumption, T-D3c)
  * @see PROFILE-AGGREGATOR-POINTER-INTEGRATION-MAP.md §3.2
- * @see PROFILE-AGGREGATOR-POINTER-D0-JOIN-AUDIT.md (Rule 1/3/4 caveat)
+ * @see PROFILE-AGGREGATOR-POINTER-D0-JOIN-AUDIT.md (Rules 1/3/4 — now landed)
+ * @see uxf/token-join.ts — resolveTokenRoot implementation
+ * @see modules/payments/PaymentsModule.ts — loadFromStorageData JOIN-divergent loser branch (PR #182)
  * @module profile/pointer-wiring
  */
 
