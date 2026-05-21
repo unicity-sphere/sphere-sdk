@@ -79,6 +79,13 @@ const BYTE_FIELDS: Readonly<Record<UxfElementType, ReadonlySet<string>>> = {
   'token-state': new Set(['data', 'predicate']),
   'token-coin-data': new Set(),
   'smt-path': new Set(['root']),
+  // #202 — Same byte-fields as `authenticator`. The element type tag is
+  // different (pending vs. proven) but the wire content is identical.
+  'pending-authenticator': new Set([
+    'publicKey',
+    'signature',
+    'stateHash',
+  ]),
 };
 
 // ---------------------------------------------------------------------------

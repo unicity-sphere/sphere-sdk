@@ -193,6 +193,31 @@ function assembleAuthenticator(
 }
 
 /**
+ * #202 — Assemble a pending-authenticator element.
+ *
+ * Same wire shape as a proven authenticator (publicKey, algorithm,
+ * signature, stateHash); the distinct element type tag carries the
+ * "submitted-but-not-yet-proven" semantic. The caller decides how to
+ * surface it on the assembled token; `assembleTransaction` puts it under
+ * `tx._wallet.authenticator` to preserve the legacy ad-hoc field name
+ * introduced by V6-direct (saveCommitmentOnlyToken).
+ */
+function assemblePendingAuthenticator(
+  pool: ElementPool,
+  authHash: ContentHash,
+  ctx: AssemblyContext,
+): { algorithm: string; publicKey: string; signature: string; stateHash: string } {
+  const el = resolveAndVerify(pool, authHash, ctx, 'pending-authenticator');
+  const c = el.content as unknown as AuthenticatorContent;
+  return {
+    algorithm: c.algorithm,
+    publicKey: c.publicKey,
+    signature: c.signature,
+    stateHash: c.stateHash,
+  };
+}
+
+/**
  * Assemble an smt-path element into `{ root, steps[] }`.
  */
 function assembleSmtPath(
@@ -336,6 +361,12 @@ function assembleGenesisData(
 
 /**
  * Assemble a genesis element into the IMintTransactionJson shape.
+ *
+ * #202 — `inclusionProof` is nullable; returns `null` when the underlying
+ * `genesis` element has `children.inclusionProof === null` (V5/V4-pending
+ * mint, not yet submitted / not yet proven). Pre-#202 this asserted
+ * non-null via the type system and would have crashed in
+ * `assembleInclusionProof` on the typecast.
  */
 function assembleGenesis(
   pool: ElementPool,
@@ -343,13 +374,16 @@ function assembleGenesis(
   ctx: AssemblyContext,
 ): {
   data: ReturnType<typeof assembleGenesisData>;
-  inclusionProof: ReturnType<typeof assembleInclusionProof>;
+  inclusionProof: ReturnType<typeof assembleInclusionProof> | null;
 } {
   const el = resolveAndVerify(pool, genesisHash, ctx, 'genesis');
   const ch = el.children as unknown as GenesisChildren;
 
   const data = assembleGenesisData(pool, ch.data, ctx);
-  const inclusionProof = assembleInclusionProof(pool, ch.inclusionProof, ctx);
+  const inclusionProof =
+    ch.inclusionProof !== null
+      ? assembleInclusionProof(pool, ch.inclusionProof, ctx)
+      : null;
 
   return { data, inclusionProof };
 }
@@ -399,6 +433,17 @@ function assembleTransactionData(
 
 /**
  * Assemble a transaction element into the ITransferTransactionJson shape.
+ *
+ * #202 — Restores the wallet-internal `_wallet.authenticator` field
+ * (introduced ad-hoc by V6-direct's saveCommitmentOnlyToken) when the
+ * underlying transaction element has a `pendingAuthenticator` child
+ * pointing at a `pending-authenticator` element. Pre-#202 the field was
+ * silently dropped on UXF round-trip; now it survives.
+ *
+ * The returned object's TypeScript shape doesn't formally declare
+ * `_wallet` because it's wallet-internal SDK metadata, not part of
+ * `ITransferTransactionJson`. Callers that care about the field read it
+ * dynamically.
  */
 function assembleTransaction(
   pool: ElementPool,
@@ -414,6 +459,7 @@ function assembleTransaction(
     nametags: unknown[];
   };
   inclusionProof: ReturnType<typeof assembleInclusionProof> | null;
+  _wallet?: { authenticator: ReturnType<typeof assemblePendingAuthenticator> };
 } {
   const el = resolveAndVerify(pool, txHash, ctx, 'transaction');
   const ch = el.children as unknown as TransactionChildren;
@@ -446,7 +492,17 @@ function assembleTransaction(
     nametags: [],
   };
 
-  return { data, inclusionProof };
+  // #202 — Restore wallet-internal pending authenticator if present.
+  // The element schema makes pendingAuthenticator OPTIONAL (only emitted
+  // by deconstruct when the input carried `_wallet.authenticator`), so
+  // the field may be undefined OR null. Treat both as "no pending state".
+  const pendingAuthHash = ch.pendingAuthenticator;
+  const result: ReturnType<typeof assembleTransaction> = { data, inclusionProof };
+  if (pendingAuthHash != null) {
+    const authenticator = assemblePendingAuthenticator(pool, pendingAuthHash, ctx);
+    result._wallet = { authenticator };
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------

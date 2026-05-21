@@ -73,10 +73,17 @@ interface MintDataShape {
   readonly reason: unknown | null;
 }
 
-/** Minimal shape of IMintTransactionJson / genesis. */
+/**
+ * Minimal shape of IMintTransactionJson / genesis.
+ *
+ * #202 — `inclusionProof` is nullable to express pending genesis (mint
+ * commitment not yet submitted / not yet proven). Mirrors the existing
+ * `TransferTxShape.inclusionProof` nullable behavior so genesis and
+ * transactions have symmetric handling.
+ */
 interface GenesisShape {
   readonly data: MintDataShape;
-  readonly inclusionProof: InclusionProofShape;
+  readonly inclusionProof: InclusionProofShape | null;
 }
 
 /** Minimal shape of ITransferTransactionDataJson. */
@@ -168,8 +175,19 @@ function lowerHexNullable(value: string | null | undefined): string | null {
 // ---------------------------------------------------------------------------
 
 /**
- * Validates that the input is a usable token and not a placeholder or pending
- * finalization stub.
+ * Validates that the input is a usable token and not a placeholder stub.
+ *
+ * #202 update — `_pendingFinalization` is NO LONGER rejected. UXF now
+ * supports pending tokens (no proven genesis, no proven transfer) so that
+ * cross-device profile sync and Nostr-shipped self-sufficient bundles can
+ * carry the full lifecycle of a token, not just its post-finalization
+ * form. The `_pendingFinalization` field is a wallet-local hint
+ * (preserved through the SDK's sdkData but DROPPED on UXF deconstruct →
+ * assemble round-trip, like any non-schema top-level field); it doesn't
+ * affect UXF semantics any more.
+ *
+ * `_placeholder` is still rejected because a placeholder is a UI
+ * stand-in with no `genesis` at all — there's nothing to deconstruct.
  */
 function validateToken(token: unknown): asserts token is TokenShape {
   if (!token || typeof token !== 'object') {
@@ -181,14 +199,7 @@ function validateToken(token: unknown): asserts token is TokenShape {
   if (obj._placeholder === true) {
     throw new UxfError(
       'INVALID_PACKAGE',
-      'Cannot ingest placeholder or pending finalization tokens',
-    );
-  }
-
-  if (obj._pendingFinalization) {
-    throw new UxfError(
-      'INVALID_PACKAGE',
-      'Cannot ingest placeholder or pending finalization tokens',
+      'Cannot ingest placeholder tokens (no genesis field)',
     );
   }
 
@@ -456,7 +467,14 @@ function deriveAllStates(token: TokenShape): DerivedStates {
 /**
  * Deconstruct a GenesisTransaction into a `genesis` element.
  *
- * Children: data (genesis-data), inclusionProof, destinationState (token-state).
+ * Children: data (genesis-data), inclusionProof (nullable; #202), destinationState (token-state).
+ *
+ * #202 — `genesis.inclusionProof` is nullable to express V5/V4-pending
+ * tokens whose mint commitment has not yet been submitted or proven.
+ * Symmetric with `deconstructTransaction`'s existing nullable proof
+ * handling. Pre-#202 this asserted a non-null proof, propagating
+ * `Cannot read properties of null (reading 'authenticator')` from
+ * `deconstructInclusionProof` when callers passed a pending genesis.
  */
 export function deconstructGenesis(
   pool: ElementPool,
@@ -464,10 +482,10 @@ export function deconstructGenesis(
   destinationState: StateShape,
 ): ContentHash {
   const dataHash = deconstructGenesisData(pool, genesis.data);
-  const inclusionProofHash = deconstructInclusionProof(
-    pool,
-    genesis.inclusionProof,
-  );
+  let inclusionProofHash: ContentHash | null = null;
+  if (genesis.inclusionProof != null) {
+    inclusionProofHash = deconstructInclusionProof(pool, genesis.inclusionProof);
+  }
   const destinationStateHash = deconstructState(pool, destinationState);
 
   return putElement(pool, 'genesis', {}, {
@@ -475,6 +493,35 @@ export function deconstructGenesis(
     inclusionProof: inclusionProofHash,
     destinationState: destinationStateHash,
   });
+}
+
+/**
+ * #202 — Deconstruct a pending-authenticator into a dedicated element.
+ *
+ * Wire shape matches the standard `AuthenticatorShape` (publicKey,
+ * algorithm, signature, stateHash). Distinct element type ID so the
+ * "submitted-but-not-yet-proven" semantic is explicit in the canonical
+ * DAG rather than overloaded onto `authenticator`.
+ *
+ * On assemble, this element is materialized as `tx._wallet.authenticator
+ * = {...}` so wallet code retains the legacy ad-hoc field name introduced
+ * by saveCommitmentOnlyToken (V6-direct).
+ */
+export function deconstructPendingAuthenticator(
+  pool: ElementPool,
+  auth: AuthenticatorShape,
+): ContentHash {
+  return putElement(
+    pool,
+    'pending-authenticator',
+    {
+      algorithm: auth.algorithm,
+      publicKey: lowerHex(auth.publicKey),
+      signature: lowerHex(auth.signature),
+      stateHash: lowerHex(auth.stateHash),
+    },
+    {},
+  );
 }
 
 /**
@@ -516,9 +563,18 @@ function deconstructTransferData(
  * Deconstruct a TransferTransaction into a `transaction` element.
  *
  * sourceState and destinationState are pre-derived StateShape objects.
- * Children: sourceState, data, inclusionProof, destinationState.
+ * Children: sourceState, data, inclusionProof, destinationState,
+ * pendingAuthenticator (#202).
  *
  * For uncommitted transactions, data and inclusionProof are null.
+ *
+ * #202 — When the input tx carries a `_wallet.authenticator` field (the
+ * sender-signed authenticator for a committed-but-not-yet-proven transfer,
+ * as written by saveCommitmentOnlyToken / saveUnconfirmedV5Token), that
+ * authenticator is deconstructed into a `pending-authenticator` element
+ * referenced by the optional `pendingAuthenticator` child. On assemble,
+ * the field is restored as `tx._wallet = { authenticator: {...} }` so
+ * wallet code retains the legacy naming.
  */
 export function deconstructTransaction(
   pool: ElementPool,
@@ -542,12 +598,36 @@ export function deconstructTransaction(
     inclusionProofHash = deconstructInclusionProof(pool, tx.inclusionProof);
   }
 
-  return putElement(pool, 'transaction', {}, {
+  // #202 — Pending authenticator. Read from the wallet-internal
+  // `_wallet.authenticator` field that saveCommitmentOnlyToken (and now
+  // saveUnconfirmedV5Token) writes onto transactions awaiting proof.
+  // Absence is the normal case (transaction either proven or never
+  // committed); presence means "committed locally, awaiting proof".
+  let pendingAuthenticatorHash: ContentHash | null = null;
+  const txWallet = (tx as TransferTxShape & {
+    readonly _wallet?: { readonly authenticator?: AuthenticatorShape | null };
+  })._wallet;
+  if (txWallet && txWallet.authenticator != null) {
+    pendingAuthenticatorHash = deconstructPendingAuthenticator(
+      pool,
+      txWallet.authenticator,
+    );
+  }
+
+  // Children object: only include pendingAuthenticator when set so the
+  // element hash for tokens without pending state matches the pre-#202
+  // hash (back-compat with on-chain content-addressed bundles).
+  const children: Record<string, ContentHash | ContentHash[] | null> = {
     sourceState: sourceStateHash,
     data: dataHash,
     inclusionProof: inclusionProofHash,
     destinationState: destinationStateHash,
-  });
+  };
+  if (pendingAuthenticatorHash !== null) {
+    children.pendingAuthenticator = pendingAuthenticatorHash;
+  }
+
+  return putElement(pool, 'transaction', {}, children);
 }
 
 // ---------------------------------------------------------------------------
