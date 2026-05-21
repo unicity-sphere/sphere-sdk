@@ -70,32 +70,33 @@ import type { UxfBundleRef } from './types.js';
 // =============================================================================
 
 /**
- * Lean profile snapshot schema version emitted by the builder.
+ * Lean profile snapshot schema version. Both the builder AND the
+ * parser are pinned to this exact version — there is no backward
+ * compatibility with the older v2 single-block layout. The non-goals
+ * of issue #200 explicitly disclaim back-compat with pre-cutover pin
+ * shapes; the same stance carries over to the snapshot schema.
  *
  * **v3 (current)** — hierarchical: root block carries a sorted list of
- *   `entryGroups` (each: `{ groupKey, entriesCid }`) and the bundles[]
- *   list inline. Each `entriesCid` links to a per-group dag-cbor
- *   sub-block holding that group's encrypted KV entries. Grouping key:
- *   the addressId prefix (`DIRECT_[0-9a-f]{6}_[0-9a-f]{6}`) for
- *   per-address keys; `__global__` for wallet-global keys. Two
- *   snapshots whose entries for a given group are byte-identical share
- *   the same `entriesCid` and dedup at the IPFS storage layer; a
- *   partial-recovery client can fetch only the groups it needs (Phase 4
- *   of issue #200).
+ *   `entryGroups` (each: `{ groupKey, entriesCid }`) and the
+ *   `bundles[]` list inline. Each `entriesCid` links to a per-group
+ *   dag-cbor sub-block holding that group's encrypted KV entries.
+ *   Grouping key: the addressId prefix
+ *   (`DIRECT_[0-9a-f]{6}_[0-9a-f]{6}`) for per-address keys;
+ *   `__global__` for wallet-global keys. Two snapshots whose entries
+ *   for a given group are byte-identical share the same `entriesCid`
+ *   and dedup at the IPFS storage layer; a partial-recovery client
+ *   can fetch only the groups it needs (Phase 4 of issue #200).
  *
- * **v2 (legacy)** — single-block: root block carries `entries[]`
- *   inline. The parser still accepts v2 for backward compatibility
- *   with any in-flight snapshots from before the v3 cutover, but the
- *   builder no longer emits v2.
+ * **v2 (removed)** — the original lean snapshot (Item #15 Phase A)
+ *   was single-block with `entries[]` inline. v2 payloads are
+ *   rejected by the parser; wallets re-flush on first publish under
+ *   the new layout.
  *
  * **v1** — the fat back-up format handled by
  *   `profile-export.ts:parseProfileSnapshot`. The lean parser rejects
  *   v1 with an explicit error.
  */
 export const LEAN_PROFILE_SNAPSHOT_VERSION = 3 as const;
-
-/** Earliest snapshot version the lean parser will accept. */
-const LEAN_PROFILE_SNAPSHOT_MIN_READ_VERSION = 2 as const;
 
 /**
  * Group key assigned to KV entries that do not match the addressId
@@ -233,18 +234,15 @@ export interface LeanProfileSnapshotEntryGroupRef {
 /**
  * Decoded lean snapshot root document.
  *
- * In v3 the `entries` field is **logical**: the parser materialises it
- * by walking each `entryGroups[*].entriesCid` link and concatenating
- * the per-group entry slices in sorted key order. Callers that need
- * partial fetch should consume {@link LeanProfileSnapshotPartial}
- * instead.
- *
- * In v2 the `entries` field is direct: the root block carries the
- * entries inline and `entryGroups` is an empty array.
+ * `entries` is the **materialised** flat view of every per-group
+ * sub-block, sorted by key. Parsers that walk the entryGroups[]
+ * sub-blocks (full-fetch path) populate this field directly; parsers
+ * that defer entry loading (root-only path) leave it empty so the
+ * caller can fetch lazily via {@link parseLeanProfileSnapshotPartial}.
  */
 export interface LeanProfileSnapshot {
-  /** Lean snapshot schema version (2 or 3). */
-  readonly version: 2 | 3;
+  /** Lean snapshot schema version. Always 3. */
+  readonly version: 3;
   /** Wallet's chain pubkey at snapshot time (informational). */
   readonly chainPubkey: string;
   /** Network identifier at snapshot time (testnet/mainnet/dev). */
@@ -253,15 +251,14 @@ export interface LeanProfileSnapshot {
   readonly createdAt: number;
   /**
    * All Profile KV entries that should propagate (encrypted form),
-   * fully materialised across all entry groups for v3 snapshots and
-   * carried inline for v2 snapshots. Always sorted by `key`.
+   * fully materialised across every entry group. Sorted by `key`.
    */
   readonly entries: ReadonlyArray<LeanProfileSnapshotKvEntry>;
   /**
-   * v3 entry-group references (sorted by groupKey). Empty for v2
-   * snapshots. Each ref's sub-block is fetched and decoded by the v3
-   * parsers; partial-recovery callers can use the partial parser
-   * variants to fetch only the groups they need.
+   * v3 entry-group references (sorted by groupKey). Each ref's
+   * sub-block is fetched and decoded by the full-fetch parsers;
+   * partial-recovery callers can use the partial parser variant to
+   * fetch only the groups they need.
    */
   readonly entryGroups: ReadonlyArray<LeanProfileSnapshotEntryGroupRef>;
   /** Bundle refs (CID + metadata) — bundle CAR bytes pinned separately. */
@@ -274,13 +271,13 @@ export interface LeanProfileSnapshot {
  * available; `entries` carries ONLY the slices for groups the caller
  * asked to fetch (or all groups, when no filter is supplied).
  *
- * `unfetchedGroupKeys` records the group keys that were skipped because
- * of the address filter — `bundles[]` is always fully present (those
- * are inline CIDs in the root block) so this is purely an entries-side
- * concern.
+ * `unfetchedGroupKeys` records the group keys that were skipped
+ * because of the address filter — `bundles[]` is always fully present
+ * (those are inline CIDs in the root block) so this is purely an
+ * entries-side concern.
  */
 export interface LeanProfileSnapshotPartial {
-  readonly version: 2 | 3;
+  readonly version: 3;
   readonly chainPubkey: string;
   readonly network: string;
   readonly createdAt: number;
@@ -708,18 +705,13 @@ export async function buildLeanProfileSnapshot(
 }
 
 /**
- * Parse a lean snapshot CAR back into its root document.
- *
- * **v2 (legacy)** snapshots are single-block: the root block carries
- *   `entries[]` inline; the parser returns the populated snapshot
- *   directly.
- *
- * **v3 (current)** snapshots are hierarchical: the root block carries
- *   `entryGroups[*]` CID-links. The parser walks every group sub-block
- *   contained in the CAR and materialises the flat `entries[]` view
- *   (sorted by key) for the returned snapshot. Use
- *   {@link parseLeanProfileSnapshotPartial} if you only need a subset
- *   of address groups.
+ * Parse a lean snapshot CAR back into its root document. The CAR
+ * carries the root block + every per-group entries sub-block; the
+ * parser walks each `entryGroups[*].entriesCid` link in the root,
+ * resolves it against the CAR's own block index, and materialises
+ * the flat `entries[]` view (sorted by key) for the returned
+ * snapshot. Use {@link parseLeanProfileSnapshotPartial} if you only
+ * need a subset of address groups.
  *
  * Caps enforced: single CAR root; per-block byte cap on every block;
  * block-count cap; root CID re-verified via content-address (defeats
@@ -748,15 +740,10 @@ export async function parseLeanProfileSnapshot(
 
   const validated = validateLeanSnapshotShape(decoded);
 
-  if (validated.version === 2) {
-    // v2 has all entries inline — no sub-blocks to walk.
-    return validated;
-  }
-
-  // v3: hydrate per-group entries from sub-blocks present in the CAR.
-  // We use an in-CAR-blocks fetcher so the offline parse path stays
-  // self-contained; the IPFS-walking variant is the
-  // `parseLeanProfileSnapshotFromRootBlock` family.
+  // Hydrate per-group entries from sub-blocks present in the CAR. The
+  // in-CAR-blocks fetcher keeps the offline parse path self-contained;
+  // the IPFS-walking variant lives in
+  // `parseLeanProfileSnapshotFromRootBlock`.
   const fetcher: LeanProfileSnapshotBlockFetcher = async (cid) => {
     const bytes = blockMap.get(cid);
     if (bytes === undefined) {
@@ -859,23 +846,22 @@ async function loadCarBlocks(
 
 /**
  * Parse a lean snapshot from the dag-cbor encoded root block bytes
- * alone (no CAR envelope). Used by the recovery path when the snapshot
- * was pinned via per-block `dag/put`: each contained block is stored
- * individually under its dag-cbor CID, so `fetchFromIpfs(rootCid)`
- * returns the root block bytes directly — NOT a CAR. Content-address
- * verification is done by the fetcher
- * (`verifyCidMatchesBytes` against the published CID), so this parser
- * only needs to dag-cbor-decode and validate the resulting shape.
+ * alone (no CAR envelope). Used by the recovery path when the
+ * snapshot was pinned via per-block `dag/put`: each contained block
+ * is stored individually under its dag-cbor CID, so
+ * `fetchFromIpfs(rootCid)` returns the root block bytes directly —
+ * NOT a CAR. Content-address verification is done by the fetcher
+ * (`fetchFromIpfs` sha256-verifies every block against its CID), so
+ * this parser only needs to dag-cbor-decode and validate the
+ * resulting shape.
  *
- * **v2** snapshots are returned with `entries[]` materialised inline
- *   from the root block.
- * **v3** snapshots require fetching the per-group sub-blocks via the
- *   supplied `fetcher` callback. The callback signature mirrors
- *   {@link fetchFromIpfs} for production wiring and an in-memory map
- *   for tests. If the snapshot is v3 and no fetcher is supplied, the
- *   returned snapshot carries the root's `entryGroups` metadata but
- *   `entries` is empty — useful when the caller plans to fetch groups
- *   lazily via {@link parseLeanProfileSnapshotPartial}.
+ * Per-group sub-blocks are fetched via the supplied `fetcher`
+ * callback. The callback signature mirrors {@link fetchFromIpfs} for
+ * production wiring and an in-memory map for tests. If the snapshot
+ * has no entry groups (empty wallet), the fetcher is never called and
+ * may be `undefined`; otherwise omitting the fetcher returns the root
+ * metadata with `entries` empty — useful when the caller plans to
+ * fetch groups lazily via {@link parseLeanProfileSnapshotPartial}.
  *
  * Symmetric with {@link parseLeanProfileSnapshot} (which serves the
  * in-process / integration test path where CAR bytes are handed off
@@ -908,19 +894,15 @@ export async function parseLeanProfileSnapshotFromRootBlock(
 
   const validated = validateLeanSnapshotShape(decoded);
 
-  if (validated.version === 2) {
-    // v2 — entries already inline.
-    return validated;
-  }
-
   if (validated.entryGroups.length === 0) {
-    // v3 with no groups (empty wallet): nothing to fetch.
+    // Empty wallet: no sub-blocks to fetch.
     return validated;
   }
 
   if (fetcher === undefined) {
-    // v3 without a fetcher — return the root metadata; entries left
-    // empty so the caller can decide whether to load lazily.
+    // No fetcher — return the root metadata; entries left empty so
+    // the caller can decide whether to load lazily via the partial
+    // fetch helper.
     return {
       version: validated.version,
       chainPubkey: validated.chainPubkey,
@@ -948,19 +930,16 @@ export async function parseLeanProfileSnapshotFromRootBlock(
 }
 
 /**
- * Partial-fetch parser for v3 snapshots. Reads the root block,
- * validates the envelope, then fetches ONLY the per-group sub-blocks
- * for `addressIds` (plus the global group if `includeGlobal` is true,
- * default) via `fetcher`.
+ * Partial-fetch parser. Reads the root block, validates the envelope,
+ * then fetches ONLY the per-group sub-blocks for `addressIds` (plus
+ * the global group if `includeGlobal` is true, default) via
+ * `fetcher`.
  *
  * Returns the populated entry slice plus `unfetchedGroupKeys` — the
  * list of group keys present in `entryGroups` but skipped by the
  * filter. Callers handling cross-device recovery for a known subset
  * of HD addresses can fetch only the slices they need, leaving the
  * rest as IPFS-resident state.
- *
- * On v2 snapshots `addressIds` is ignored (the root carries all
- * entries inline) and `unfetchedGroupKeys` is empty.
  *
  * @throws ProfileError on dag-cbor decode failure, shape mismatch, or
  *         sub-block fetch / decode failure.
@@ -990,21 +969,6 @@ export async function parseLeanProfileSnapshotPartial(
     );
   }
   const validated = validateLeanSnapshotShape(decoded);
-
-  if (validated.version === 2) {
-    // v2 — caller asked for partial, but the legacy format has no
-    // sub-blocks to skip; return all entries unfiltered.
-    return {
-      version: validated.version,
-      chainPubkey: validated.chainPubkey,
-      network: validated.network,
-      createdAt: validated.createdAt,
-      entries: validated.entries,
-      entryGroups: validated.entryGroups,
-      bundles: validated.bundles,
-      unfetchedGroupKeys: [],
-    };
-  }
 
   const includeGlobal = options.includeGlobal ?? true;
   const wantedAddressSet =
@@ -1162,18 +1126,17 @@ function validateGroupBlockShape(
 
 /**
  * Validate the decoded snapshot's shape + version. Returns a
- * safely-typed `LeanProfileSnapshot` whose `entries[]` is materialised
- * for v2 (inline) or empty for v3 (caller fetches per-group sub-blocks
- * via {@link fetchAndDecodeAllGroupEntries}).
+ * safely-typed `LeanProfileSnapshot` with `entries[]` empty — callers
+ * populate it by fetching per-group sub-blocks via
+ * {@link fetchAndDecodeAllGroupEntries}.
  *
  * Rejects:
  *   - missing / non-numeric / non-integer / negative version
- *   - version < 2 or > LEAN_PROFILE_SNAPSHOT_VERSION (v1 is the fat
- *     back-up format — parse with `profile-export.ts:parseProfileSnapshot`)
+ *   - version != LEAN_PROFILE_SNAPSHOT_VERSION (no back-compat with
+ *     pre-v3 lean snapshots; v1 is the fat back-up format and must be
+ *     parsed via `profile-export.ts:parseProfileSnapshot`)
  *   - missing chainPubkey / network / createdAt
- *   - v2: non-array entries[]; missing bundles[]; duplicate keys;
- *     over-cap entry counts / value lengths
- *   - v3: non-array entryGroups[] or bundles[]; missing per-group
+ *   - non-array entryGroups[] or bundles[]; missing per-group
  *     `entriesCid`; invalid CID; duplicate group keys; entry-count
  *     metadata cap violations
  *   - invalid bundle shape (missing cid, unknown status, etc.)
@@ -1201,19 +1164,19 @@ function validateLeanSnapshotShape(decoded: unknown): LeanProfileSnapshot {
       `Invalid lean snapshot version: ${String(version)}`,
     );
   }
-  if (version > LEAN_PROFILE_SNAPSHOT_VERSION) {
+  if (version !== LEAN_PROFILE_SNAPSHOT_VERSION) {
+    if (version > LEAN_PROFILE_SNAPSHOT_VERSION) {
+      throw new ProfileError(
+        'PROFILE_NOT_INITIALIZED',
+        `Lean snapshot version ${version} is newer than this SDK supports (${LEAN_PROFILE_SNAPSHOT_VERSION}). Update the SDK.`,
+      );
+    }
     throw new ProfileError(
       'PROFILE_NOT_INITIALIZED',
-      `Lean snapshot version ${version} is newer than this SDK supports (${LEAN_PROFILE_SNAPSHOT_VERSION}). Update the SDK.`,
+      `Lean snapshot version ${version} is not accepted by the lean reader (expected ${LEAN_PROFILE_SNAPSHOT_VERSION}). ` +
+        `v1 payloads must be parsed by parseProfileSnapshot; v2 lean payloads predate the Phase 4 cutover and are no longer supported.`,
     );
   }
-  if (version < LEAN_PROFILE_SNAPSHOT_MIN_READ_VERSION) {
-    throw new ProfileError(
-      'PROFILE_NOT_INITIALIZED',
-      `Lean snapshot version ${version} is not accepted by the lean reader (min ${LEAN_PROFILE_SNAPSHOT_MIN_READ_VERSION}). v1 payloads must be parsed by parseProfileSnapshot.`,
-    );
-  }
-  const typedVersion = version as 2 | 3;
 
   const chainPubkey = obj.chainPubkey;
   if (typeof chainPubkey !== 'string' || chainPubkey.length === 0) {
@@ -1239,23 +1202,15 @@ function validateLeanSnapshotShape(decoded: unknown): LeanProfileSnapshot {
     );
   }
 
-  let entries: LeanProfileSnapshotKvEntry[] = [];
-  let entryGroups: LeanProfileSnapshotEntryGroupRef[] = [];
-
-  if (typedVersion === 2) {
-    entries = parseV2Entries(obj.entries);
-  } else {
-    entryGroups = parseV3EntryGroups(obj.entryGroups);
-  }
-
+  const entryGroups = parseV3EntryGroups(obj.entryGroups);
   const bundles = parseBundleEntries(obj.bundles);
 
   const result: LeanProfileSnapshot = {
-    version: typedVersion,
+    version: LEAN_PROFILE_SNAPSHOT_VERSION,
     chainPubkey,
     network,
     createdAt,
-    entries,
+    entries: [],
     entryGroups,
     bundles,
   };
@@ -1263,55 +1218,7 @@ function validateLeanSnapshotShape(decoded: unknown): LeanProfileSnapshot {
 }
 
 /**
- * Parse + validate the v2 inline `entries[]` field. Lifted out of
- * `validateLeanSnapshotShape` so v3 / v2 branches are symmetric.
- */
-function parseV2Entries(entriesRaw: unknown): LeanProfileSnapshotKvEntry[] {
-  if (!Array.isArray(entriesRaw)) {
-    throw new ProfileError(
-      'PROFILE_NOT_INITIALIZED',
-      'Lean snapshot v2 `entries` must be an array.',
-    );
-  }
-  if (entriesRaw.length > MAX_KV_ENTRIES) {
-    throw new ProfileError(
-      'PROFILE_NOT_INITIALIZED',
-      `Lean snapshot has ${entriesRaw.length} entries — exceeds cap ${MAX_KV_ENTRIES}.`,
-    );
-  }
-  const entries: LeanProfileSnapshotKvEntry[] = [];
-  const seenKeys = new Set<string>();
-  for (const e of entriesRaw) {
-    if (!e || typeof e !== 'object' || Array.isArray(e)) {
-      throw new ProfileError('PROFILE_NOT_INITIALIZED', 'Invalid KV entry shape.');
-    }
-    const er = e as Record<string, unknown>;
-    if (typeof er.key !== 'string' || typeof er.value !== 'string') {
-      throw new ProfileError(
-        'PROFILE_NOT_INITIALIZED',
-        'KV entry must have string `key` and `value`.',
-      );
-    }
-    if (seenKeys.has(er.key)) {
-      throw new ProfileError(
-        'PROFILE_NOT_INITIALIZED',
-        `Duplicate entry key in lean snapshot: "${er.key}".`,
-      );
-    }
-    seenKeys.add(er.key);
-    if (Buffer.byteLength(er.value, 'utf8') > MAX_KV_VALUE_BYTES) {
-      throw new ProfileError(
-        'PROFILE_NOT_INITIALIZED',
-        `KV entry "${er.key}" value exceeds ${MAX_KV_VALUE_BYTES} bytes.`,
-      );
-    }
-    entries.push({ key: er.key, value: er.value });
-  }
-  return entries;
-}
-
-/**
- * Parse + validate the v3 `entryGroups[]` root field. Each ref's
+ * Parse + validate the `entryGroups[]` root field. Each ref's
  * `entriesCid` must be a parseable CID (no codec restriction enforced
  * here — production builds always emit dag-cbor, but a hostile root
  * could embed e.g. a raw-codec CID; the sub-block fetcher path will
@@ -1326,13 +1233,13 @@ function parseV3EntryGroups(groupsRaw: unknown): LeanProfileSnapshotEntryGroupRe
   if (!Array.isArray(groupsRaw)) {
     throw new ProfileError(
       'PROFILE_NOT_INITIALIZED',
-      'Lean snapshot v3 `entryGroups` must be an array.',
+      'Lean snapshot `entryGroups` must be an array.',
     );
   }
   if (groupsRaw.length > MAX_KV_ENTRIES) {
     throw new ProfileError(
       'PROFILE_NOT_INITIALIZED',
-      `Lean snapshot v3 has ${groupsRaw.length} entry groups — exceeds cap ${MAX_KV_ENTRIES}.`,
+      `Lean snapshot has ${groupsRaw.length} entry groups — exceeds cap ${MAX_KV_ENTRIES}.`,
     );
   }
   const groups: LeanProfileSnapshotEntryGroupRef[] = [];
@@ -1342,20 +1249,20 @@ function parseV3EntryGroups(groupsRaw: unknown): LeanProfileSnapshotEntryGroupRe
     if (!g || typeof g !== 'object' || Array.isArray(g)) {
       throw new ProfileError(
         'PROFILE_NOT_INITIALIZED',
-        'Lean snapshot v3 entryGroup ref must be an object.',
+        'Lean snapshot entryGroup ref must be an object.',
       );
     }
     const gr = g as Record<string, unknown>;
     if (typeof gr.groupKey !== 'string' || gr.groupKey.length === 0) {
       throw new ProfileError(
         'PROFILE_NOT_INITIALIZED',
-        'Lean snapshot v3 entryGroup ref missing or invalid `groupKey`.',
+        'Lean snapshot entryGroup ref missing or invalid `groupKey`.',
       );
     }
     if (seenGroupKeys.has(gr.groupKey)) {
       throw new ProfileError(
         'PROFILE_NOT_INITIALIZED',
-        `Duplicate entryGroup key in lean snapshot v3: "${gr.groupKey}".`,
+        `Duplicate entryGroup key in lean snapshot: "${gr.groupKey}".`,
       );
     }
     seenGroupKeys.add(gr.groupKey);
@@ -1372,14 +1279,14 @@ function parseV3EntryGroups(groupsRaw: unknown): LeanProfileSnapshotEntryGroupRe
       } catch {
         throw new ProfileError(
           'PROFILE_NOT_INITIALIZED',
-          `Lean snapshot v3 entryGroup "${gr.groupKey}" has unparseable entriesCid: "${cidValue}"`,
+          `Lean snapshot entryGroup "${gr.groupKey}" has unparseable entriesCid: "${cidValue}"`,
         );
       }
       entriesCidStr = cidValue;
     } else {
       throw new ProfileError(
         'PROFILE_NOT_INITIALIZED',
-        `Lean snapshot v3 entryGroup "${gr.groupKey}" missing or invalid \`entriesCid\` ` +
+        `Lean snapshot entryGroup "${gr.groupKey}" missing or invalid \`entriesCid\` ` +
           `(expected CID link or string, got ${typeof cidValue}).`,
       );
     }
@@ -1391,14 +1298,14 @@ function parseV3EntryGroups(groupsRaw: unknown): LeanProfileSnapshotEntryGroupRe
     ) {
       throw new ProfileError(
         'PROFILE_NOT_INITIALIZED',
-        `Lean snapshot v3 entryGroup "${gr.groupKey}" has missing/invalid entryCount.`,
+        `Lean snapshot entryGroup "${gr.groupKey}" has missing/invalid entryCount.`,
       );
     }
     totalEntries += gr.entryCount;
     if (totalEntries > MAX_KV_ENTRIES) {
       throw new ProfileError(
         'PROFILE_NOT_INITIALIZED',
-        `Lean snapshot v3 declares ${totalEntries} total entries across groups — exceeds cap ${MAX_KV_ENTRIES}.`,
+        `Lean snapshot declares ${totalEntries} total entries across groups — exceeds cap ${MAX_KV_ENTRIES}.`,
       );
     }
 

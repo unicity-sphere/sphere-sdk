@@ -479,6 +479,75 @@ describe('lean snapshot v3 — parseLeanProfileSnapshotFromRootBlock', () => {
     expect(snapshot.entryGroups.length).toBeGreaterThan(0);
   });
 
+  it('rejects sub-block whose entry count does not match the ref metadata', async () => {
+    // Equivalent of the v2 "duplicate entry keys / non-array entries"
+    // checks — those used to fire on inline `entries[]`; in v3 they
+    // live in the sub-block parser. This pins one such mismatch
+    // explicitly: a forged sub-block returns 0 entries but the root
+    // ref claims N > 0.
+    const storage = new InMemoryStorageProvider();
+    await storage.connect();
+    await storage.set(`${ADDR_A}.outbox.x`, 'v1');
+    await storage.set(`${ADDR_A}.outbox.y`, 'v2');
+    const tokenStorage = new FakeTokenStorage();
+
+    const result = await buildLeanProfileSnapshot({
+      storage,
+      tokenStorage: tokenStorage as unknown as ProfileTokenStorageProvider,
+      chainPubkey: TEST_CHAIN_PUBKEY,
+      network: 'testnet',
+      createdAt: TEST_TS,
+    });
+
+    const rootBytes = await rootBlockBytesFor(result.carBytes);
+    const { encode } = await import('@ipld/dag-cbor');
+    // Sub-block lies about its entry count vs what the root ref
+    // declares — must trip the metadata cross-check.
+    const forged = encode({ groupKey: ADDR_A, entries: [] });
+    const lyingFetcher: LeanProfileSnapshotBlockFetcher = async (_) => forged;
+
+    await expect(
+      parseLeanProfileSnapshotFromRootBlock(rootBytes, lyingFetcher),
+    ).rejects.toThrow(/entries, but root metadata claims/);
+  });
+
+  it('rejects sub-block whose entries[] contains duplicate keys', async () => {
+    // Forge BOTH root and sub-block by hand so the root ref claims
+    // entryCount=2 (matching the duplicate-key sub-block) and the
+    // dedup check inside `validateGroupBlockShape` is what fires.
+    const { encode } = await import('@ipld/dag-cbor');
+    const forgedTwoEntries = encode({
+      groupKey: ADDR_A,
+      entries: [
+        { key: 'dup', value: 'a' },
+        { key: 'dup', value: 'b' },
+      ],
+    });
+    const subCidBytes = await import('multiformats/cid').then(async (m) => {
+      const { sha256 } = await import('@noble/hashes/sha2.js');
+      const { create: createMultihash } = await import('multiformats/hashes/digest');
+      return m.CID.createV1(0x71, createMultihash(0x12, sha256(forgedTwoEntries)));
+    });
+    const forgedRoot = encode({
+      version: LEAN_PROFILE_SNAPSHOT_VERSION,
+      chainPubkey: TEST_CHAIN_PUBKEY,
+      network: 'testnet',
+      createdAt: TEST_TS,
+      entryGroups: [
+        { groupKey: ADDR_A, entriesCid: subCidBytes, entryCount: 2 },
+      ],
+      bundles: [],
+    });
+
+    const fetcher: LeanProfileSnapshotBlockFetcher = async (_) =>
+      forgedTwoEntries;
+
+    // Re-run via the root-block parser against the forged root.
+    await expect(
+      parseLeanProfileSnapshotFromRootBlock(forgedRoot, fetcher),
+    ).rejects.toThrow(/Duplicate entry key/);
+  });
+
   it('rejects sub-block whose decoded groupKey does not match the ref', async () => {
     const storage = new InMemoryStorageProvider();
     await storage.connect();
@@ -664,13 +733,11 @@ describe('lean snapshot v3 — parseLeanProfileSnapshotPartial', () => {
 });
 
 // =============================================================================
-// 6. v2 backward compatibility
+// 6. No back-compat: v2 single-block payloads are rejected
 // =============================================================================
 
-describe('lean snapshot v3 — v2 read-back compatibility', () => {
-  it('parser still accepts a hand-crafted v2 single-block CAR', async () => {
-    // Construct a v2-shaped CAR by hand. The lean reader must accept it
-    // (we kept v2 in the supported version range for transition compat).
+describe('lean snapshot v3 — no v2 back-compat (issue #200 non-goal)', () => {
+  it('rejects a hand-crafted v2 single-block CAR with an explicit version error', async () => {
     const { CarWriter } = await import('@ipld/car/writer');
     const { encode } = await import('@ipld/dag-cbor');
     const { CID } = await import('multiformats/cid');
@@ -705,14 +772,15 @@ describe('lean snapshot v3 — v2 read-back compatibility', () => {
       off += c.byteLength;
     }
 
-    const snapshot = await parseLeanProfileSnapshot(carBytes);
-    expect(snapshot.version).toBe(2);
-    expect(snapshot.entries).toHaveLength(1);
-    expect(snapshot.entries[0].key).toBe('mnemonic');
-    expect(snapshot.entryGroups).toHaveLength(0);
+    // The lean reader must reject v2 — issue #200 non-goal disclaims
+    // back-compat with pre-v3 lean snapshots. Wallets re-flush on
+    // first publish under the new layout.
+    await expect(parseLeanProfileSnapshot(carBytes)).rejects.toThrow(
+      /version 2 is not accepted/,
+    );
   });
 
-  it('parseLeanProfileSnapshotFromRootBlock(v2 bytes) returns inline entries with no fetcher needed', async () => {
+  it('parseLeanProfileSnapshotFromRootBlock rejects v2 root-block bytes', async () => {
     const { encode } = await import('@ipld/dag-cbor');
     const v2RootBytes = encode({
       version: 2,
@@ -721,17 +789,12 @@ describe('lean snapshot v3 — v2 read-back compatibility', () => {
       createdAt: TEST_TS,
       entries: [
         { key: 'mnemonic', value: Buffer.from('CT(mn)').toString('base64') },
-        { key: 'master_key', value: Buffer.from('CT(mk)').toString('base64') },
       ],
       bundles: [],
     });
 
-    // No fetcher passed — v2 must not need one.
-    const snapshot = await parseLeanProfileSnapshotFromRootBlock(v2RootBytes);
-    expect(snapshot.version).toBe(2);
-    expect(snapshot.entries.map((e) => e.key).sort()).toEqual([
-      'master_key',
-      'mnemonic',
-    ]);
+    await expect(
+      parseLeanProfileSnapshotFromRootBlock(v2RootBytes),
+    ).rejects.toThrow(/version 2 is not accepted/);
   });
 });

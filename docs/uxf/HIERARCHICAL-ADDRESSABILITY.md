@@ -244,26 +244,30 @@ same Profile state produce identical sub-block CIDs.
    surfaces as a clean error scoped to that group's writers; the rest
    of the snapshot still applies.
 
-### v2 read-back compatibility
+### No back-compat with v2
 
-The parser still accepts v2 snapshots (single-block, `entries[]`
-inline) for transition compatibility with any in-flight pre-cutover
-snapshots — but the builder no longer emits v2. The supported version
-range is `[2, 3]`. v1 (the fat `profile-export.ts` back-up format) is
-explicitly rejected by the lean reader.
+Per the issue #200 non-goal disclaimer, the parser does NOT accept the
+pre-cutover v2 single-block layout. Both the builder AND the parser
+are pinned to v3 exactly — a v2 payload reaching the parser triggers
+an explicit `version 2 is not accepted` error. Wallets re-flush on
+first publish under the new layout (the pointer's local-version
+cursor stays behind; the next reconcile pass naturally picks up the
+fresh v3 head). v1 (the fat `profile-export.ts` back-up format)
+remains rejected by the lean reader.
 
 ### Parser API
 
 - `parseLeanProfileSnapshot(carBytes)` — single-shot parser for the
-  in-process CAR path. For v3 inputs it walks the sub-blocks present
-  in the same CAR (no IPFS round-trip). For v2 it returns the inline
-  entries directly.
+  in-process CAR path. Walks every per-group sub-block present in
+  the same CAR (no IPFS round-trip) and materialises the flat
+  `entries[]` view.
 - `parseLeanProfileSnapshotFromRootBlock(rootBytes, fetcher?)` — the
   production path. Pass a `fetcher` (production wiring binds to
   `fetchFromIpfs(gateways, cid)`) to pull each per-group sub-block by
-  CID. Omitting the fetcher on a v3 input returns the root metadata
-  plus an empty `entries[]` (useful when the caller defers entry
-  loading to a partial fetch).
+  CID. Omitting the fetcher returns the root metadata plus an empty
+  `entries[]` (useful when the caller defers entry loading to a
+  partial fetch). On an empty wallet (zero entry groups) the fetcher
+  is never invoked and may be omitted.
 - `parseLeanProfileSnapshotPartial(rootBytes, fetcher, options)` —
   fetches ONLY the requested address groups (and, by default, the
   global group). Returns the materialised entry slice plus
@@ -297,8 +301,12 @@ explicitly rejected by the lean reader.
   — only requested address sub-blocks fetched; `unfetchedGroupKeys`
   reports skipped groups; `includeGlobal: false` skips the global
   sub-block too.
-- **v2 backward compatibility.** `tests/unit/profile/profile-lean-snapshot-v3.test.ts`
-  — hand-crafted v2 single-block CAR still parses; no fetcher needed.
+- **No v2 back-compat.** `tests/unit/profile/profile-lean-snapshot-v3.test.ts`
+  — hand-crafted v2 single-block CAR is rejected with an explicit
+  version error (both via the CAR parser and the root-block parser).
+- **Sub-block validation.** `tests/unit/profile/profile-lean-snapshot-v3.test.ts`
+  — sub-block with wrong internal groupKey, mismatched entry count,
+  or duplicate keys is rejected.
 
 ## Remaining phases
 
