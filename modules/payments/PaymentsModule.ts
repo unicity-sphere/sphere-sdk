@@ -270,6 +270,12 @@ import type {
   DirectTokenEntry,
 } from '../../types/instant-split';
 import { isInstantSplitBundle, isInstantSplitBundleV5, isCombinedTransferBundleV6 } from '../../types/instant-split';
+import {
+  buildSyntheticV5PendingSdkData,
+  readV5FinalizationInputsFromToken,
+  type V5FinalizationInputs,
+  type ITransferCommitmentJson,
+} from './v5-pending-shape';
 
 // SDK imports for token parsing and transfers
 import { PredicateEngineService } from '@unicitylabs/state-transition-sdk/lib/predicate/PredicateEngineService';
@@ -289,6 +295,7 @@ import { waitInclusionProof } from '@unicitylabs/state-transition-sdk/lib/util/I
 import { InclusionProof } from '@unicitylabs/state-transition-sdk/lib/transaction/InclusionProof';
 import { TransferTransactionData } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferTransactionData';
 import { RequestId } from '@unicitylabs/state-transition-sdk/lib/api/RequestId';
+import { Authenticator } from '@unicitylabs/state-transition-sdk/lib/api/Authenticator';
 import type { IAddress } from '@unicitylabs/state-transition-sdk/lib/address/IAddress';
 import type { StateTransitionClient } from '@unicitylabs/state-transition-sdk/lib/StateTransitionClient';
 import type { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/bft/RootTrustBase';
@@ -6223,69 +6230,23 @@ export class PaymentsModule {
     // On any parse failure, fall back to the legacy opaque
     // `{_pendingFinalization: ...}` shape (single-device KV path still
     // recovers the token; bundle CAR omits it as pre-#202).
-    const sdkDataJson = (() => {
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const mintDataJson = JSON.parse(bundle.recipientMintData) as Record<string, any>;
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const transferCommitmentJson = JSON.parse(bundle.transferCommitment) as Record<string, any>;
-        const mintedTokenState = JSON.parse(bundle.mintedTokenStateJson);
-
-        const transferTxData =
-          transferCommitmentJson.transactionData !== undefined
-            ? transferCommitmentJson.transactionData
-            : transferCommitmentJson.data ?? null;
-
-        // Sender-signed authenticator over the transfer commitment.
-        // Carried inside `_wallet.authenticator` so it survives UXF
-        // round-trip via the new `pending-authenticator` element type.
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const transferAuth: any = transferCommitmentJson.authenticator;
-
-        // The transfer commitment's authenticator signs over
-        // (transactionHash, sourceStateHash). The `stateHash` field IS
-        // the source state hash (= hash of `mintedTokenStateJson`).
-        // Carry it as `_integrity.currentStateHash` so the wallet's
-        // (tokenId, stateHash) dedup index produces stable identities
-        // across save/load round-trips for V5-pending tokens.
-        const currentStateHash: string | undefined =
-          transferAuth && typeof transferAuth === 'object' && typeof transferAuth.stateHash === 'string'
-            ? transferAuth.stateHash
-            : undefined;
-
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const syntheticPendingTx: Record<string, any> = {
-          data: transferTxData,
-          inclusionProof: null,
-        };
-        if (transferAuth && typeof transferAuth === 'object') {
-          syntheticPendingTx._wallet = { authenticator: transferAuth };
-        }
-
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const syntheticTxf: Record<string, any> = {
-          version: '2.0',
-          state: mintedTokenState,
-          genesis: {
-            data: mintDataJson,
-            inclusionProof: null,
-          },
-          transactions: transferTxData !== null ? [syntheticPendingTx] : [],
-          nametags: [],
-          _pendingFinalization: pendingData,
-        };
-        if (currentStateHash) {
-          syntheticTxf._integrity = { currentStateHash };
-        }
-        return JSON.stringify(syntheticTxf);
-      } catch (err) {
-        logger.warn(
-          'Payments',
-          `saveUnconfirmedV5Token: failed to synthesize UXF-compatible shape for bundle ${bundle.splitGroupId.slice(0, 12)}, falling back to legacy opaque shape — token will be omitted from bundle CAR but recoverable via PENDING_V5_TOKENS KV: ${(err as Error)?.message ?? err}`,
-        );
-        return JSON.stringify({ _pendingFinalization: pendingData });
-      }
-    })();
+    //
+    // #207 PR-B — helper extracted to `v5-pending-shape.ts` for unit
+    // testability + clear separation of pure shape-construction from
+    // wallet-side bookkeeping. The helper returns a discriminated result
+    // so the fallback log carries the underlying error message — silent
+    // regressions in bundle shape are otherwise undiagnosable.
+    let sdkDataJson: string;
+    const syntheticResult = buildSyntheticV5PendingSdkData(bundle, pendingData);
+    if (syntheticResult.ok) {
+      sdkDataJson = syntheticResult.sdkData;
+    } else {
+      logger.warn(
+        'Payments',
+        `saveUnconfirmedV5Token: failed to synthesize UXF-compatible shape for bundle ${bundle.splitGroupId.slice(0, 12)} (${syntheticResult.error}), falling back to legacy opaque shape — token will be omitted from bundle CAR but recoverable via PENDING_V5_TOKENS KV`,
+      );
+      sdkDataJson = JSON.stringify({ _pendingFinalization: pendingData });
+    }
 
     const uiToken: Token = {
       id: deterministicId,
@@ -8289,6 +8250,17 @@ export class PaymentsModule {
 
   /**
    * Process a single V5 token through its finalization stages with quick-timeout proof checks.
+   *
+   * #207 PR-B — Reads finalization inputs directly from the synthetic
+   * token shape (mint data from `genesis.data`, transfer commitment
+   * fields from `transactions[0].data` + `transactions[0]._wallet.authenticator`)
+   * so a Nostr-shipped UXF bundle is self-sufficient and can drive
+   * cross-device V5 finalization without depending on OrbitDB OpLog
+   * replication of `PENDING_V5_TOKENS`.
+   *
+   * The legacy `pending.bundleJson` is parsed lazily — only if the
+   * synthetic shape is missing fields (e.g. tokens persisted before #207
+   * with the legacy opaque shape `{_pendingFinalization: ...}`).
    */
   private async resolveV5Token(
     tokenId: string,
@@ -8298,15 +8270,60 @@ export class PaymentsModule {
     trustBase: RootTrustBase,
     signingService: SigningService
   ): Promise<'resolved' | 'pending' | 'failed'> {
-    const bundle: InstantSplitBundleV5 = JSON.parse(pending.bundleJson);
     pending.attemptCount++;
     pending.lastAttemptAt = Date.now();
+
+    // Prefer shape-derived inputs; fall back to bundleJson for legacy
+    // entries (pre-#207 opaque shape, or any case where the synthetic
+    // shape is malformed). `inputs` is `let` (not const) so the
+    // SDK-throws-on-shape-derived-input fallback can downgrade to
+    // bundleJson within the same resolve attempt without burning a
+    // full attemptCount cycle.
+    let inputs = readV5FinalizationInputsFromToken(token.sdkData);
+    let cachedBundle: InstantSplitBundleV5 | null = null;
+    const getBundle = (): InstantSplitBundleV5 => {
+      if (cachedBundle === null) {
+        cachedBundle = JSON.parse(pending.bundleJson) as InstantSplitBundleV5;
+      }
+      return cachedBundle;
+    };
+
+    // Helper: produce a canonical `ITransferCommitmentJson` for
+    // `TransferCommitment.fromJSON`. The shape-path derives `requestId`
+    // from the authenticator's `publicKey` + `stateHash`
+    // (deterministic — same as `RequestId.create(publicKey, stateHash)`
+    // at commitment-construction time).
+    //
+    // #207 PR-B steelman — if Authenticator.fromJSON or RequestId.create
+    // throw (shape passed our pre-validation but the SDK still rejects),
+    // we MUST NOT burn an attemptCount for the structural failure.
+    // Downgrade to the legacy bundleJson path inside the same attempt.
+    const getTransferCommitmentJson = async (): Promise<ITransferCommitmentJson> => {
+      if (inputs) {
+        try {
+          const auth = Authenticator.fromJSON(inputs.transferAuthenticatorJson);
+          const requestId = await RequestId.create(auth.publicKey, auth.stateHash);
+          return {
+            requestId: requestId.toJSON(),
+            transactionData: inputs.transferTransactionDataJson,
+            authenticator: inputs.transferAuthenticatorJson,
+          };
+        } catch (err) {
+          logger.warn(
+            'Payments',
+            `[V5-RESOLVE] ${tokenId.slice(0, 12)}: shape-derived transferCommitment construction failed (${(err as Error)?.message ?? err}); downgrading to bundleJson fallback`,
+          );
+          inputs = null;
+        }
+      }
+      return JSON.parse(getBundle().transferCommitment) as ITransferCommitmentJson;
+    };
 
     try {
       // Stage: RECEIVED → MINT_SUBMITTED
       if (pending.stage === 'RECEIVED') {
         logger.debug('Payments', `[V5-RESOLVE] ${tokenId.slice(0, 12)}: RECEIVED → submitting mint commitment...`);
-        const mintDataJson = JSON.parse(bundle.recipientMintData);
+        const mintDataJson = inputs?.mintDataJson ?? JSON.parse(getBundle().recipientMintData);
         const mintData = await MintTransactionData.fromJSON(mintDataJson);
         const mintCommitment = await MintCommitment.create(mintData);
         const mintResponse = await stClient.submitMintCommitment(mintCommitment);
@@ -8321,7 +8338,7 @@ export class PaymentsModule {
       // Stage: MINT_SUBMITTED → MINT_PROVEN
       if (pending.stage === 'MINT_SUBMITTED') {
         logger.debug('Payments', `[V5-RESOLVE] ${tokenId.slice(0, 12)}: MINT_SUBMITTED → checking mint proof...`);
-        const mintDataJson = JSON.parse(bundle.recipientMintData);
+        const mintDataJson = inputs?.mintDataJson ?? JSON.parse(getBundle().recipientMintData);
         const mintData = await MintTransactionData.fromJSON(mintDataJson);
         const mintCommitment = await MintCommitment.create(mintData);
         const proof = await this.quickProofCheck(stClient, trustBase, mintCommitment);
@@ -8339,7 +8356,7 @@ export class PaymentsModule {
       // Stage: MINT_PROVEN → TRANSFER_SUBMITTED
       if (pending.stage === 'MINT_PROVEN') {
         logger.debug('Payments', `[V5-RESOLVE] ${tokenId.slice(0, 12)}: MINT_PROVEN → submitting transfer commitment...`);
-        const transferCommitmentJson = JSON.parse(bundle.transferCommitment);
+        const transferCommitmentJson = await getTransferCommitmentJson();
         const transferCommitment = await TransferCommitment.fromJSON(transferCommitmentJson);
         const transferResponse = await stClient.submitTransferCommitment(transferCommitment);
         logger.debug('Payments', `[V5-RESOLVE] ${tokenId.slice(0, 12)}: transfer response status=${transferResponse.status}`);
@@ -8353,7 +8370,7 @@ export class PaymentsModule {
       // Stage: TRANSFER_SUBMITTED → FINALIZED
       if (pending.stage === 'TRANSFER_SUBMITTED') {
         logger.debug('Payments', `[V5-RESOLVE] ${tokenId.slice(0, 12)}: TRANSFER_SUBMITTED → checking transfer proof...`);
-        const transferCommitmentJson = JSON.parse(bundle.transferCommitment);
+        const transferCommitmentJson = await getTransferCommitmentJson();
         const transferCommitment = await TransferCommitment.fromJSON(transferCommitmentJson);
         const proof = await this.quickProofCheck(stClient, trustBase, transferCommitment);
         if (!proof) {
@@ -8364,7 +8381,14 @@ export class PaymentsModule {
         logger.debug('Payments', `[V5-RESOLVE] ${tokenId.slice(0, 12)}: transfer proof obtained! Finalizing...`);
 
         // Finalize: reconstruct minted token, create recipient state, finalize
-        const finalizedToken = await this.finalizeFromV5Bundle(bundle, pending, signingService, stClient, trustBase);
+        const finalizedToken = await this.finalizeFromV5Inputs(
+          inputs,
+          getBundle,
+          pending,
+          signingService,
+          stClient,
+          trustBase,
+        );
 
         // Replace token with confirmed version containing real SDK data
         const confirmedToken: Token = {
@@ -8381,6 +8405,14 @@ export class PaymentsModule {
           sdkData: JSON.stringify(finalizedToken.toJSON()),
         };
         this.tokens.set(tokenId, confirmedToken);
+
+        // #207 PR-B — Archive GC. If the CAR-loaded archived copy at
+        // archivedTokens[actualTokenId] is still present (cross-device
+        // sync produced a separate token entry under the real on-chain
+        // tokenId, distinct from this resolution token's `v5split_*`
+        // id), drop it: the active in-memory token is now the
+        // confirmed authority.
+        this.gcArchivedV5PendingForFinalized(finalizedToken);
 
         // Spend Queue: cache newly confirmed token and wake queued entries
         const resolvedAmount = this.extractCoinAmountForCache(finalizedToken, confirmedToken.coinId);
@@ -8440,11 +8472,17 @@ export class PaymentsModule {
   }
 
   /**
-   * Perform V5 bundle finalization from stored bundle data and proofs.
-   * Extracted from InstantSplitProcessor.processV5Bundle() steps 4-10.
+   * Perform V5 bundle finalization. Extracted from
+   * InstantSplitProcessor.processV5Bundle() steps 4-10.
+   *
+   * #207 PR-B — Reads inputs from the synthetic token shape (preferred)
+   * with lazy fallback to `pending.bundleJson` for legacy entries OR for
+   * fields not yet carried in the synthetic shape (currently the PROXY
+   * recipient's nametag token JSON).
    */
-  private async finalizeFromV5Bundle(
-    bundle: InstantSplitBundleV5,
+  private async finalizeFromV5Inputs(
+    inputs: V5FinalizationInputs | null,
+    getBundle: () => InstantSplitBundleV5,
     pending: PendingV5Finalization,
     signingService: SigningService,
     stClient: StateTransitionClient,
@@ -8452,15 +8490,17 @@ export class PaymentsModule {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
   ): Promise<SdkToken<any>> {
     // Reconstruct minted token from bundle data
-    const mintDataJson = JSON.parse(bundle.recipientMintData);
+    const mintDataJson = inputs?.mintDataJson ?? JSON.parse(getBundle().recipientMintData);
     const mintData = await MintTransactionData.fromJSON(mintDataJson);
     const mintCommitment = await MintCommitment.create(mintData);
     const mintProofJson = JSON.parse(pending.mintProofJson!);
     const mintProof = InclusionProof.fromJSON(mintProofJson);
     const mintTransaction = mintCommitment.toTransaction(mintProof);
 
-    const tokenType = new TokenType(fromHex(bundle.tokenTypeHex));
-    const senderMintedStateJson = JSON.parse(bundle.mintedTokenStateJson);
+    const tokenTypeHex = inputs?.tokenTypeHex ?? getBundle().tokenTypeHex;
+    const tokenType = new TokenType(fromHex(tokenTypeHex));
+    const senderMintedStateJson = inputs?.mintedTokenStateJson
+      ?? JSON.parse(getBundle().mintedTokenStateJson);
 
     const tokenJson = {
       version: '2.0',
@@ -8472,14 +8512,40 @@ export class PaymentsModule {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const mintedToken = await SdkToken.fromJSON(tokenJson) as SdkToken<any>;
 
-    // Create transfer transaction
-    const transferCommitmentJson = JSON.parse(bundle.transferCommitment);
-    const transferCommitment = await TransferCommitment.fromJSON(transferCommitmentJson);
+    // Create transfer transaction. Same lazy-shape-vs-bundle preference
+    // as in resolveV5Token: derive requestId from the authenticator if
+    // we have shape inputs. SDK-throw → fall back to bundleJson rather
+    // than failing the whole finalize.
+    let transferCommitment: TransferCommitment;
+    if (inputs) {
+      try {
+        const auth = Authenticator.fromJSON(inputs.transferAuthenticatorJson);
+        const requestId = await RequestId.create(auth.publicKey, auth.stateHash);
+        transferCommitment = await TransferCommitment.fromJSON({
+          requestId: requestId.toJSON(),
+          transactionData: inputs.transferTransactionDataJson,
+          authenticator: inputs.transferAuthenticatorJson,
+        });
+      } catch (err) {
+        logger.warn(
+          'Payments',
+          `[V5-RESOLVE] finalize: shape-derived transferCommitment failed (${(err as Error)?.message ?? err}); using bundleJson fallback`,
+        );
+        transferCommitment = await TransferCommitment.fromJSON(
+          JSON.parse(getBundle().transferCommitment),
+        );
+      }
+    } else {
+      transferCommitment = await TransferCommitment.fromJSON(
+        JSON.parse(getBundle().transferCommitment),
+      );
+    }
     const transferProof = await waitInclusionProof(trustBase, stClient, transferCommitment);
     const transferTransaction = transferCommitment.toTransaction(transferProof);
 
     // Create recipient state
-    const transferSalt = fromHex(bundle.transferSaltHex);
+    const transferSaltHex = inputs?.transferSaltHex ?? getBundle().transferSaltHex;
+    const transferSalt = fromHex(transferSaltHex);
     const recipientPredicate = await UnmaskedPredicate.create(
       mintData.tokenId,
       tokenType,
@@ -8492,14 +8558,24 @@ export class PaymentsModule {
     // Handle nametag tokens for PROXY addresses
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let nametagTokens: SdkToken<any>[] = [];
-    const recipientAddressStr = bundle.recipientAddressJson;
+    const recipientAddressStr = inputs?.recipientAddress ?? getBundle().recipientAddressJson;
 
     if (recipientAddressStr.startsWith('PROXY://')) {
-      // Try to get nametag token from bundle first
-      if (bundle.nametagTokenJson) {
+      // Try to get nametag token from bundle first. (#207 PR-B follow-up:
+      // the nametag token isn't yet carried in the synthetic token shape
+      // because UXF doesn't preserve nested wallet-internal Token JSON.
+      // For PROXY recipients we still need the bundleJson — graceful
+      // fallback below to a local nametag covers most real-world cases.)
+      let nametagTokenJson: string | undefined;
+      try {
+        nametagTokenJson = getBundle().nametagTokenJson;
+      } catch {
+        nametagTokenJson = undefined;
+      }
+      if (nametagTokenJson) {
         try {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const nametagToken = await SdkToken.fromJSON(JSON.parse(bundle.nametagTokenJson)) as SdkToken<any>;
+          const nametagToken = await SdkToken.fromJSON(JSON.parse(nametagTokenJson)) as SdkToken<any>;
           const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
           const proxy = await ProxyAddress.fromTokenId(nametagToken.id);
           if (proxy.address === recipientAddressStr) {
@@ -8532,15 +8608,82 @@ export class PaymentsModule {
   }
 
   /**
+   * #207 PR-B — Garbage-collect the CAR-loaded archived V5-pending entry
+   * once the active resolution token finalizes. Cross-device sync
+   * produces a token entry under the real on-chain tokenId (extracted
+   * by `extractTokenIdFromSdkData`), while the in-process resolution
+   * token uses the synthetic `v5split_<groupId>` id. After successful
+   * finalize the archived copy is stale and would otherwise linger
+   * until the next archive sweep.
+   *
+   * Steelman: the archive map's keys come from
+   * `txf.genesis.data.tokenId` (raw string from the persisted JSON;
+   * UXF doesn't normalize hex casing), while `finalized.id.toJSON()`
+   * returns canonical SDK-formatted hex. To survive a case-mismatch
+   * we look up the entry by scanning the map's keys with normalized
+   * comparison — strictly bounded to a single archived entry per
+   * resolve, so the cost is O(archive size) once per finalize.
+   */
+  private gcArchivedV5PendingForFinalized(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    finalized: SdkToken<any>,
+  ): void {
+    try {
+      const tokenIdHex: string | undefined = (finalized as unknown as {
+        id?: { toJSON?: () => string };
+      }).id?.toJSON?.();
+      if (!tokenIdHex) return;
+
+      // Fast path: exact match.
+      if (this.archivedTokens.delete(tokenIdHex)) {
+        logger.debug(
+          'Payments',
+          `[V5-RESOLVE] GC archived V5-pending entry for finalized token ${tokenIdHex.slice(0, 16)}...`,
+        );
+        return;
+      }
+
+      // Slow path: case/prefix-tolerant match. Strip `0x` prefix and
+      // lowercase both sides. Only matches the FIRST entry to avoid
+      // accidentally deleting more than one if the archive somehow
+      // contains case-variant duplicates (defensive — shouldn't happen
+      // since `archiveToken` writes whatever the JSON carried, so any
+      // duplicates are themselves a bug worth surfacing).
+      const norm = (s: string): string => s.replace(/^0x/i, '').toLowerCase();
+      const target = norm(tokenIdHex);
+      for (const key of this.archivedTokens.keys()) {
+        if (norm(key) === target) {
+          this.archivedTokens.delete(key);
+          logger.debug(
+            'Payments',
+            `[V5-RESOLVE] GC archived V5-pending entry (case-tolerant match) for finalized token ${tokenIdHex.slice(0, 16)}...`,
+          );
+          return;
+        }
+      }
+    } catch {
+      // Best-effort — never let GC failure block finalize.
+    }
+  }
+
+  /**
    * #144 L2/L3 — does this token look like a V6-direct received-but-
    * not-finalized token? Conditions:
    *   1. sdkData parses as TXF with transactions
    *   2. last tx has `inclusionProof === null`
-   *   3. last tx's `data.recipient.address` resolves to our wallet
+   *   3. last tx's `data.recipient` resolves to our wallet
    *      (DIRECT://<our> or PROXY://<our-nametag>)
    *
    * Used by `resolveUnconfirmed` and `recoverStrandedReceivedTokens` to
    * distinguish stranded receives from sends and from other shapes.
+   *
+   * #207 PR-B — `data.recipient` is canonically a string in the SDK
+   * (`ITransferTransactionDataJson.recipient: string`), but legacy
+   * wallet-local serializations sometimes wrapped it as `{address:
+   * string}`. Accept both shapes. Without the string-form branch the
+   * check returned false for every CAR-loaded V5-pending token (the
+   * canonical SDK shape) and the balance-model invariant in
+   * `loadFromStorageData` archived them.
    */
   private isReceivedLegacyPending(token: Token): boolean {
     if (!token.sdkData) return false;
@@ -8555,7 +8698,7 @@ export class PaymentsModule {
     if (!Array.isArray(txs) || txs.length === 0) return false;
     const lastTx = txs[txs.length - 1] as {
       inclusionProof?: unknown;
-      data?: { recipient?: { address?: string } };
+      data?: { recipient?: string | { address?: string } };
     };
     // Canonical default: missing inclusionProof === null (the V5/V6 protocol
     // treats both `inclusionProof: null` and the absence of the field as
@@ -8566,7 +8709,13 @@ export class PaymentsModule {
     // invariant in `loadFromStorageData`.
     const proof = lastTx.inclusionProof === undefined ? null : lastTx.inclusionProof;
     if (proof !== null) return false;
-    const recipientAddr = lastTx.data?.recipient?.address;
+    const recipientField = lastTx.data?.recipient;
+    const recipientAddr =
+      typeof recipientField === 'string'
+        ? recipientField
+        : (recipientField && typeof recipientField === 'object'
+            ? recipientField.address
+            : undefined);
     if (typeof recipientAddr !== 'string') return false;
 
     // DIRECT match — `identity.directAddress` is normalized to
@@ -9075,13 +9224,22 @@ export class PaymentsModule {
     //   (b) meant for someone else (in which case applying our predicate
     //       would corrupt the chain and the SDK would reject it
     //       downstream, but only after on-chain side-effects).
-    // Distinguish by inspecting the transfer transaction's
-    // `data.recipient.address` — only proceed when it matches one of
-    // OUR destination addresses:
+    // Distinguish by inspecting the transfer transaction's `data.recipient`
+    // — only proceed when it matches one of OUR destination addresses:
     //   - identity.directAddress (DIRECT:// scheme), OR
     //   - any PROXY:// derived from a nametag we hold (handled via
     //     `proxyAddressCache`, primed at load time from `this.nametags`).
-    const recipientAddr: unknown = lastTxJson.data?.recipient?.address;
+    //
+    // #207 PR-B — `recipient` is canonically a string in the SDK shape;
+    // legacy wallet-local serializations sometimes wrap it as
+    // `{address: string}`. Accept both.
+    const recipientField: unknown = lastTxJson.data?.recipient;
+    const recipientAddr: unknown =
+      typeof recipientField === 'string'
+        ? recipientField
+        : (recipientField && typeof recipientField === 'object'
+            ? (recipientField as { address?: unknown }).address
+            : undefined);
     if (typeof recipientAddr !== 'string' || recipientAddr.length === 0) {
       return 'skipped';
     }
@@ -9326,8 +9484,36 @@ export class PaymentsModule {
   /**
    * Update pending finalization metadata in token's sdkData.
    * Creates a new token object since sdkData is readonly.
+   *
+   * #207 PR-B steelman — Preserve the synthetic V5-pending shape
+   * (genesis.data, state, transactions[0]._wallet.authenticator etc.)
+   * across stage transitions. Pre-fix this method overwrote sdkData
+   * with `{_pendingFinalization: pending}` — wiping the shape after the
+   * RECEIVED → MINT_SUBMITTED transition. Subsequent stages then had to
+   * parse `pending.bundleJson` which fundamentally defeats PR-B's
+   * self-sufficient-UXF goal for CAR-loaded tokens.
+   *
+   * Merge strategy: if existing sdkData is a parseable object, replace
+   * only the `_pendingFinalization` slot. Otherwise emit the legacy
+   * opaque shape (back-compat for any caller that pre-creates the
+   * pending entry without a synthetic shape).
    */
   private updatePendingFinalization(token: Token, pending: PendingV5Finalization): void {
+    let sdkDataJson: string;
+    try {
+      const existing = token.sdkData ? JSON.parse(token.sdkData) : null;
+      if (existing && typeof existing === 'object' && !Array.isArray(existing)) {
+        sdkDataJson = JSON.stringify({ ...existing, _pendingFinalization: pending });
+      } else {
+        sdkDataJson = JSON.stringify({ _pendingFinalization: pending });
+      }
+    } catch {
+      // Corrupted sdkData — fall back to legacy opaque shape (avoids
+      // a hard failure mid-resolve; the bundleJson legacy path can
+      // still finalize the token).
+      sdkDataJson = JSON.stringify({ _pendingFinalization: pending });
+    }
+
     const updated: Token = {
       id: token.id,
       coinId: token.coinId,
@@ -9339,7 +9525,7 @@ export class PaymentsModule {
       status: token.status,
       createdAt: token.createdAt,
       updatedAt: Date.now(),
-      sdkData: JSON.stringify({ _pendingFinalization: pending }),
+      sdkData: sdkDataJson,
     };
     this.tokens.set(token.id, updated);
   }
