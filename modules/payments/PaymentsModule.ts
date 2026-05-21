@@ -11427,6 +11427,15 @@ export class PaymentsModule {
       emit: (type, data) => this.deps!.emitEvent(type, data),
       // T.2.D.1 keeps publishToIpfs unwired; CID-bound delivery is
       // T.4.A's responsibility. Tests inject a real publisher.
+      //
+      // Issue #200 Phase 1: when this wires up for production, use
+      // `createUxfCarPublisher` from
+      // `modules/payments/transfer/ipfs-publisher.ts`. Do NOT roll your
+      // own with `pinToIpfs(carBytes)` — that pins the entire CAR
+      // envelope as a single raw block under a different CID than the
+      // wire's `bundleCid` (dag-cbor root CID), making the recipient's
+      // gateway fetch 404. See `ipfs-publisher.ts` JSDoc for the
+      // CID-correspondence contract.
       availableSources: () => Array.from(this.tokens.values()),
       transferId,
       selectSources: async ({ request: req }) => {
@@ -12261,6 +12270,14 @@ export class PaymentsModule {
       addressId,
       senderTransportPubkey: this.deps!.identity.chainPubkey,
       emit: (type, data) => this.deps!.emitEvent(type, data),
+      // Issue #200 Phase 1: publishToIpfs is intentionally unwired in
+      // production today; CID-bound delivery (T.4.A) is not yet enabled.
+      // When this is wired, MUST use `createUxfCarPublisher` from
+      // `modules/payments/transfer/ipfs-publisher.ts`. Do NOT roll your
+      // own with `pinToIpfs(carBytes)` — that returns a raw-CID over the
+      // CAR envelope while the wire's `bundleCid` is the dag-cbor root
+      // CID, so the recipient's gateway fetch 404s. See
+      // `ipfs-publisher.ts` JSDoc for the CID-correspondence contract.
       availableSources: () => Array.from(this.tokens.values()),
       transferId,
       selectSources: async ({ request: req }) => {
