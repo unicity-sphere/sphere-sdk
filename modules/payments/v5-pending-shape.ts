@@ -84,9 +84,20 @@ export interface SyntheticV5PendingTxf {
 }
 
 /**
+ * Result of {@link buildSyntheticV5PendingSdkData}. Discriminated by `ok`.
+ * On failure the `error` field carries a short reason for the log line —
+ * the caller's fallback warning embeds it so post-hoc diagnosis of
+ * silent regressions is possible.
+ */
+export type BuildSyntheticResult =
+  | { readonly ok: true; readonly sdkData: string }
+  | { readonly ok: false; readonly error: string };
+
+/**
  * Construct the UXF/TXF-valid sdkData for a V5-pending token from a V5
- * bundle. Returns the JSON string, or `null` if the bundle is malformed
- * (caller logs + falls back to the legacy opaque shape).
+ * bundle. Returns `{ok: true, sdkData}` on success, `{ok: false,
+ * error}` if the bundle is malformed (caller logs + falls back to the
+ * legacy opaque shape).
  *
  * The transfer commitment's authenticator rides as
  * `transactions[0]._wallet.authenticator` so it survives UXF round-trip
@@ -100,7 +111,7 @@ export interface SyntheticV5PendingTxf {
 export function buildSyntheticV5PendingSdkData(
   bundle: InstantSplitBundleV5,
   pendingData: PendingV5Finalization,
-): string | null {
+): BuildSyntheticResult {
   try {
     const mintDataJson = JSON.parse(bundle.recipientMintData) as IMintTransactionDataJson;
     const transferCommitmentJson = JSON.parse(bundle.transferCommitment) as ITransferCommitmentJson;
@@ -115,7 +126,7 @@ export function buildSyntheticV5PendingSdkData(
             ?? null);
 
     if (transferTxData === null) {
-      return null;
+      return { ok: false, error: 'transferCommitment missing transactionData (and legacy data)' };
     }
 
     const transferAuth: IAuthenticatorJson | undefined =
@@ -159,9 +170,9 @@ export function buildSyntheticV5PendingSdkData(
       syntheticTxf._integrity = { currentStateHash };
     }
 
-    return JSON.stringify(syntheticTxf);
-  } catch {
-    return null;
+    return { ok: true, sdkData: JSON.stringify(syntheticTxf) };
+  } catch (err) {
+    return { ok: false, error: (err as Error)?.message ?? String(err) };
   }
 }
 
@@ -188,16 +199,37 @@ export function buildTransferCommitmentJson(
   return { requestId, transactionData, authenticator };
 }
 
+/** Length of a compressed secp256k1 pubkey in hex characters (33 bytes × 2). */
+const SECP256K1_PUBKEY_HEX_LEN = 66;
+/** Hex regex (any case, any length ≥ 1). */
+const HEX_RE = /^[0-9a-fA-F]+$/;
+
 /**
  * Read V5 finalization inputs from the synthetic token shape.
  *
- * Returns `null` if:
- *   - sdkData is not parseable as JSON
- *   - genesis / state / transactions[0] are absent or malformed
- *   - transactions[0]._wallet.authenticator is missing (no sender-signed
- *     authenticator means we can't re-submit the transfer commitment)
+ * Returns `null` if any of the following hold:
+ *   - sdkData is not parseable as JSON or is not an object
+ *   - `genesis` is absent OR `genesis.inclusionProof` is non-null
+ *     (defense: if the mint is already proven, the shape-driven
+ *     re-submission path is unsafe — the legacy bundleJson path or a
+ *     normal load-time finalize should handle the token)
+ *   - `genesis.data` is missing or doesn't carry well-formed hex
+ *     `tokenId` / `tokenType`
+ *   - `transactions[0]` is absent OR its inclusionProof is non-null
+ *   - `transactions[0].data` is missing recipient (non-empty string)
+ *     or salt (hex string)
+ *   - `transactions[0]._wallet.authenticator` is missing OR has a
+ *     malformed shape (wrong types, non-hex fields, wrong publicKey
+ *     byte-length for secp256k1)
  *
  * Callers fall back to parsing `pending.bundleJson` on null.
+ *
+ * #207 PR-B steelman — Pre-validation here means the downstream
+ * `Authenticator.fromJSON` / `MintTransactionData.fromJSON` calls in
+ * `resolveV5Token` only ever see well-formed input. A structural
+ * defect (wrong key length, missing field, etc.) returns null here so
+ * the caller falls back to bundleJson instead of crashing inside the
+ * SDK and burning attemptCount budget.
  */
 export function readV5FinalizationInputsFromToken(
   sdkData: string | null | undefined,
@@ -218,9 +250,21 @@ export function readV5FinalizationInputsFromToken(
     transactions?: unknown[];
   };
 
-  const mintDataJson = root.genesis?.data as IMintTransactionDataJson | undefined;
+  // Both inclusion proofs MUST be null. Anything else means the
+  // transition is past the pending stage and resubmission is unsafe.
+  if (root.genesis === undefined || root.genesis === null || typeof root.genesis !== 'object') {
+    return null;
+  }
+  if (root.genesis.inclusionProof !== null) return null;
+
+  const mintDataJson = root.genesis.data as IMintTransactionDataJson | undefined;
   if (!mintDataJson || typeof mintDataJson !== 'object') return null;
-  if (typeof mintDataJson.tokenType !== 'string') return null;
+  if (typeof mintDataJson.tokenType !== 'string' || !HEX_RE.test(mintDataJson.tokenType)) {
+    return null;
+  }
+  if (typeof mintDataJson.tokenId !== 'string' || !HEX_RE.test(mintDataJson.tokenId)) {
+    return null;
+  }
 
   const mintedTokenStateJson = root.state as ITokenStateJson | undefined;
   if (!mintedTokenStateJson || typeof mintedTokenStateJson !== 'object') return null;
@@ -228,9 +272,11 @@ export function readV5FinalizationInputsFromToken(
   if (!Array.isArray(root.transactions) || root.transactions.length === 0) return null;
   const tx0 = root.transactions[0] as {
     data?: ITransferTransactionDataJson;
+    inclusionProof?: unknown;
     _wallet?: { authenticator?: IAuthenticatorJson };
   } | undefined;
   if (!tx0 || typeof tx0 !== 'object') return null;
+  if (tx0.inclusionProof !== null) return null;
 
   const transferTransactionDataJson = tx0.data;
   if (!transferTransactionDataJson || typeof transferTransactionDataJson !== 'object') {
@@ -238,7 +284,9 @@ export function readV5FinalizationInputsFromToken(
   }
   if (
     typeof transferTransactionDataJson.recipient !== 'string'
+    || transferTransactionDataJson.recipient.length === 0
     || typeof transferTransactionDataJson.salt !== 'string'
+    || !HEX_RE.test(transferTransactionDataJson.salt)
   ) {
     return null;
   }
@@ -247,8 +295,14 @@ export function readV5FinalizationInputsFromToken(
   if (
     !transferAuthenticatorJson
     || typeof transferAuthenticatorJson !== 'object'
+    || typeof transferAuthenticatorJson.algorithm !== 'string'
+    || typeof transferAuthenticatorJson.signature !== 'string'
     || typeof transferAuthenticatorJson.publicKey !== 'string'
     || typeof transferAuthenticatorJson.stateHash !== 'string'
+    || !HEX_RE.test(transferAuthenticatorJson.publicKey)
+    || transferAuthenticatorJson.publicKey.length !== SECP256K1_PUBKEY_HEX_LEN
+    || !HEX_RE.test(transferAuthenticatorJson.signature)
+    || !HEX_RE.test(transferAuthenticatorJson.stateHash)
   ) {
     return null;
   }

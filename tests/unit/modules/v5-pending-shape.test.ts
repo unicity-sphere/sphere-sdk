@@ -11,8 +11,10 @@
  *     single-device KV restore path.
  *   - `_integrity.currentStateHash` is set from the authenticator's
  *     `stateHash` (= source state hash).
- *   - The helper returns `null` on malformed bundles (caller falls
- *     back to the legacy opaque shape — pin #207 review nit #5).
+ *   - The helper returns `{ok: false, error}` on malformed bundles —
+ *     caller logs the error context + falls back to the legacy opaque
+ *     shape (pin #207 review nit #5 + steelman diagnostic-visibility
+ *     fix).
  *   - `readV5FinalizationInputsFromToken` round-trips the synthetic
  *     shape back into structured inputs, including derivable fields
  *     (`tokenTypeHex` from `genesis.data.tokenType`, `transferSaltHex`
@@ -20,6 +22,9 @@
  *     `transactions[0].data.recipient`).
  *   - The reader returns `null` for legacy opaque shapes
  *     (`{_pendingFinalization: ...}`) → caller falls back to bundleJson.
+ *   - Steelman strictening: reader rejects non-null inclusionProofs,
+ *     non-hex tokenId/tokenType/salt, malformed authenticator,
+ *     wrong-length publicKey.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -115,18 +120,21 @@ function makePending(): PendingV5Finalization {
   };
 }
 
+function buildOk(bundle: InstantSplitBundleV5, pending: PendingV5Finalization): string {
+  const r = buildSyntheticV5PendingSdkData(bundle, pending);
+  if (!r.ok) {
+    throw new Error(`buildSyntheticV5PendingSdkData unexpectedly failed: ${r.error}`);
+  }
+  return r.sdkData;
+}
+
 // -----------------------------------------------------------------------------
 // buildSyntheticV5PendingSdkData
 // -----------------------------------------------------------------------------
 
 describe('#207 PR-B — buildSyntheticV5PendingSdkData', () => {
   it('produces a UXF/TXF-valid shape with null inclusionProofs', () => {
-    const bundle = makeBundle();
-    const pending = makePending();
-    const sdkDataJson = buildSyntheticV5PendingSdkData(bundle, pending);
-    expect(sdkDataJson).not.toBeNull();
-    const parsed = JSON.parse(sdkDataJson!);
-
+    const parsed = JSON.parse(buildOk(makeBundle(), makePending()));
     expect(parsed.version).toBe('2.0');
     expect(parsed.genesis.inclusionProof).toBeNull();
     expect(parsed.transactions).toHaveLength(1);
@@ -135,70 +143,53 @@ describe('#207 PR-B — buildSyntheticV5PendingSdkData', () => {
   });
 
   it('places mint data in genesis.data and minted state in state', () => {
-    const bundle = makeBundle();
-    const pending = makePending();
-    const parsed = JSON.parse(buildSyntheticV5PendingSdkData(bundle, pending)!);
+    const parsed = JSON.parse(buildOk(makeBundle(), makePending()));
     expect(parsed.genesis.data.tokenId).toBe(TOKEN_ID);
     expect(parsed.genesis.data.tokenType).toBe(TOKEN_TYPE);
     expect(parsed.state.predicate).toBe('bb');
   });
 
   it('carries transfer authenticator at transactions[0]._wallet.authenticator', () => {
-    const bundle = makeBundle();
-    const pending = makePending();
-    const parsed = JSON.parse(buildSyntheticV5PendingSdkData(bundle, pending)!);
+    const parsed = JSON.parse(buildOk(makeBundle(), makePending()));
     expect(parsed.transactions[0]._wallet.authenticator.publicKey).toBe(PUBKEY);
     expect(parsed.transactions[0]._wallet.authenticator.stateHash).toBe(STATE_HASH);
   });
 
   it('places transfer transactionData at transactions[0].data', () => {
-    const bundle = makeBundle();
-    const pending = makePending();
-    const parsed = JSON.parse(buildSyntheticV5PendingSdkData(bundle, pending)!);
+    const parsed = JSON.parse(buildOk(makeBundle(), makePending()));
     expect(parsed.transactions[0].data.recipient).toBe('DIRECT://bob-pending-01');
     expect(parsed.transactions[0].data.salt).toBe(SALT);
   });
 
   it('retains _pendingFinalization at top level for KV restore path', () => {
-    const bundle = makeBundle();
-    const pending = makePending();
-    const parsed = JSON.parse(buildSyntheticV5PendingSdkData(bundle, pending)!);
+    const parsed = JSON.parse(buildOk(makeBundle(), makePending()));
     expect(parsed._pendingFinalization).toBeDefined();
     expect(parsed._pendingFinalization.type).toBe('v5_bundle');
     expect(parsed._pendingFinalization.stage).toBe('RECEIVED');
   });
 
   it('sets _integrity.currentStateHash from authenticator.stateHash', () => {
-    const bundle = makeBundle();
-    const pending = makePending();
-    const parsed = JSON.parse(buildSyntheticV5PendingSdkData(bundle, pending)!);
+    const parsed = JSON.parse(buildOk(makeBundle(), makePending()));
     expect(parsed._integrity.currentStateHash).toBe(STATE_HASH);
   });
 
-  it('returns null when recipientMintData JSON is malformed (fallback path)', () => {
-    const bundle = makeBundle({ recipientMintData: '{not-json' });
-    const pending = makePending();
-    const result = buildSyntheticV5PendingSdkData(bundle, pending);
-    expect(result).toBeNull();
+  it('returns {ok:false, error} when recipientMintData JSON is malformed', () => {
+    const r = buildSyntheticV5PendingSdkData(makeBundle({ recipientMintData: '{not-json' }), makePending());
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/JSON|Unexpected/);
   });
 
-  it('returns null when transferCommitment JSON is malformed', () => {
-    const bundle = makeBundle({ transferCommitment: '{also-not-json' });
-    const pending = makePending();
-    const result = buildSyntheticV5PendingSdkData(bundle, pending);
-    expect(result).toBeNull();
+  it('returns {ok:false, error} when transferCommitment JSON is malformed', () => {
+    const r = buildSyntheticV5PendingSdkData(makeBundle({ transferCommitment: '{also-not-json' }), makePending());
+    expect(r.ok).toBe(false);
   });
 
-  it('returns null when mintedTokenStateJson is malformed', () => {
-    const bundle = makeBundle({ mintedTokenStateJson: 'definitely-not-json' });
-    const pending = makePending();
-    const result = buildSyntheticV5PendingSdkData(bundle, pending);
-    expect(result).toBeNull();
+  it('returns {ok:false, error} when mintedTokenStateJson is malformed', () => {
+    const r = buildSyntheticV5PendingSdkData(makeBundle({ mintedTokenStateJson: 'definitely-not-json' }), makePending());
+    expect(r.ok).toBe(false);
   });
 
   it('tolerates legacy transferCommitment with `data` instead of `transactionData`', () => {
-    // Pre-canonical TransferCommitment.toJSON shape used `data` not
-    // `transactionData`. The helper still extracts the tx data.
     const auth = makeTransferAuthJson();
     const txData = makeTransferTxData();
     const bundle = makeBundle({
@@ -208,8 +199,7 @@ describe('#207 PR-B — buildSyntheticV5PendingSdkData', () => {
         authenticator: auth,
       }),
     });
-    const pending = makePending();
-    const parsed = JSON.parse(buildSyntheticV5PendingSdkData(bundle, pending)!);
+    const parsed = JSON.parse(buildOk(bundle, makePending()));
     expect(parsed.transactions[0].data.recipient).toBe('DIRECT://bob-pending-01');
   });
 });
@@ -220,9 +210,7 @@ describe('#207 PR-B — buildSyntheticV5PendingSdkData', () => {
 
 describe('#207 PR-B — readV5FinalizationInputsFromToken', () => {
   it('round-trips through buildSyntheticV5PendingSdkData', () => {
-    const bundle = makeBundle();
-    const pending = makePending();
-    const sdkDataJson = buildSyntheticV5PendingSdkData(bundle, pending)!;
+    const sdkDataJson = buildOk(makeBundle(), makePending());
     const inputs = readV5FinalizationInputsFromToken(sdkDataJson);
     expect(inputs).not.toBeNull();
     expect(inputs!.tokenTypeHex).toBe(TOKEN_TYPE);
@@ -235,11 +223,8 @@ describe('#207 PR-B — readV5FinalizationInputsFromToken', () => {
   });
 
   it('returns null on legacy opaque shape ({_pendingFinalization: ...})', () => {
-    // Pin: legacy entries must fall back to bundleJson parsing.
-    const pending = makePending();
-    const legacy = JSON.stringify({ _pendingFinalization: pending });
-    const inputs = readV5FinalizationInputsFromToken(legacy);
-    expect(inputs).toBeNull();
+    const legacy = JSON.stringify({ _pendingFinalization: makePending() });
+    expect(readV5FinalizationInputsFromToken(legacy)).toBeNull();
   });
 
   it('returns null when sdkData is empty/undefined', () => {
@@ -253,19 +238,11 @@ describe('#207 PR-B — readV5FinalizationInputsFromToken', () => {
   });
 
   it('returns null when transactions[0]._wallet.authenticator is missing', () => {
-    // Without the sender-signed authenticator we cannot reconstruct the
-    // transfer commitment for re-submission.
     const shape = {
       version: '2.0',
       state: { predicate: 'bb', data: null },
       genesis: { data: makeMintDataJson(), inclusionProof: null },
-      transactions: [
-        {
-          data: makeTransferTxData(),
-          inclusionProof: null,
-          // _wallet is intentionally absent
-        },
-      ],
+      transactions: [{ data: makeTransferTxData(), inclusionProof: null }],
       nametags: [],
     };
     expect(readV5FinalizationInputsFromToken(JSON.stringify(shape))).toBeNull();
@@ -288,6 +265,124 @@ describe('#207 PR-B — readV5FinalizationInputsFromToken', () => {
       state: { predicate: 'bb', data: null },
       genesis: { data: makeMintDataJson(), inclusionProof: null },
       transactions: [],
+      nametags: [],
+    };
+    expect(readV5FinalizationInputsFromToken(JSON.stringify(shape))).toBeNull();
+  });
+
+  // -- steelman strictening --
+
+  it('returns null when genesis.inclusionProof is non-null (post-mint-proven)', () => {
+    const shape = {
+      version: '2.0',
+      state: { predicate: 'bb', data: null },
+      genesis: { data: makeMintDataJson(), inclusionProof: { some: 'proof' } },
+      transactions: [
+        {
+          data: makeTransferTxData(),
+          inclusionProof: null,
+          _wallet: { authenticator: makeTransferAuthJson() },
+        },
+      ],
+      nametags: [],
+    };
+    expect(readV5FinalizationInputsFromToken(JSON.stringify(shape))).toBeNull();
+  });
+
+  it('returns null when transactions[0].inclusionProof is non-null (post-transfer-proven)', () => {
+    const shape = {
+      version: '2.0',
+      state: { predicate: 'bb', data: null },
+      genesis: { data: makeMintDataJson(), inclusionProof: null },
+      transactions: [
+        {
+          data: makeTransferTxData(),
+          inclusionProof: { some: 'proof' },
+          _wallet: { authenticator: makeTransferAuthJson() },
+        },
+      ],
+      nametags: [],
+    };
+    expect(readV5FinalizationInputsFromToken(JSON.stringify(shape))).toBeNull();
+  });
+
+  it('returns null when tokenType is non-hex', () => {
+    const bad = { ...makeMintDataJson(), tokenType: 'not-hex-zzz' };
+    const shape = {
+      version: '2.0',
+      state: { predicate: 'bb', data: null },
+      genesis: { data: bad, inclusionProof: null },
+      transactions: [
+        {
+          data: makeTransferTxData(),
+          inclusionProof: null,
+          _wallet: { authenticator: makeTransferAuthJson() },
+        },
+      ],
+      nametags: [],
+    };
+    expect(readV5FinalizationInputsFromToken(JSON.stringify(shape))).toBeNull();
+  });
+
+  it('returns null when authenticator.publicKey has wrong length', () => {
+    const badAuth = { ...makeTransferAuthJson(), publicKey: 'aabb' };
+    const shape = {
+      version: '2.0',
+      state: { predicate: 'bb', data: null },
+      genesis: { data: makeMintDataJson(), inclusionProof: null },
+      transactions: [
+        {
+          data: makeTransferTxData(),
+          inclusionProof: null,
+          _wallet: { authenticator: badAuth },
+        },
+      ],
+      nametags: [],
+    };
+    expect(readV5FinalizationInputsFromToken(JSON.stringify(shape))).toBeNull();
+  });
+
+  it('returns null when authenticator missing algorithm/signature', () => {
+    const badAuth: Record<string, unknown> = { publicKey: PUBKEY, stateHash: STATE_HASH };
+    const shape = {
+      version: '2.0',
+      state: { predicate: 'bb', data: null },
+      genesis: { data: makeMintDataJson(), inclusionProof: null },
+      transactions: [
+        {
+          data: makeTransferTxData(),
+          inclusionProof: null,
+          _wallet: { authenticator: badAuth },
+        },
+      ],
+      nametags: [],
+    };
+    expect(readV5FinalizationInputsFromToken(JSON.stringify(shape))).toBeNull();
+  });
+
+  it('returns null when transfer recipient is empty string', () => {
+    const badTx = { ...makeTransferTxData(), recipient: '' };
+    const shape = {
+      version: '2.0',
+      state: { predicate: 'bb', data: null },
+      genesis: { data: makeMintDataJson(), inclusionProof: null },
+      transactions: [
+        { data: badTx, inclusionProof: null, _wallet: { authenticator: makeTransferAuthJson() } },
+      ],
+      nametags: [],
+    };
+    expect(readV5FinalizationInputsFromToken(JSON.stringify(shape))).toBeNull();
+  });
+
+  it('returns null when transfer salt is non-hex', () => {
+    const badTx = { ...makeTransferTxData(), salt: 'not-hex' };
+    const shape = {
+      version: '2.0',
+      state: { predicate: 'bb', data: null },
+      genesis: { data: makeMintDataJson(), inclusionProof: null },
+      transactions: [
+        { data: badTx, inclusionProof: null, _wallet: { authenticator: makeTransferAuthJson() } },
+      ],
       nametags: [],
     };
     expect(readV5FinalizationInputsFromToken(JSON.stringify(shape))).toBeNull();

@@ -6233,15 +6233,20 @@ export class PaymentsModule {
     //
     // #207 PR-B — helper extracted to `v5-pending-shape.ts` for unit
     // testability + clear separation of pure shape-construction from
-    // wallet-side bookkeeping.
-    const sdkDataJson = buildSyntheticV5PendingSdkData(bundle, pendingData)
-      ?? (() => {
-        logger.warn(
-          'Payments',
-          `saveUnconfirmedV5Token: failed to synthesize UXF-compatible shape for bundle ${bundle.splitGroupId.slice(0, 12)}, falling back to legacy opaque shape — token will be omitted from bundle CAR but recoverable via PENDING_V5_TOKENS KV`,
-        );
-        return JSON.stringify({ _pendingFinalization: pendingData });
-      })();
+    // wallet-side bookkeeping. The helper returns a discriminated result
+    // so the fallback log carries the underlying error message — silent
+    // regressions in bundle shape are otherwise undiagnosable.
+    let sdkDataJson: string;
+    const syntheticResult = buildSyntheticV5PendingSdkData(bundle, pendingData);
+    if (syntheticResult.ok) {
+      sdkDataJson = syntheticResult.sdkData;
+    } else {
+      logger.warn(
+        'Payments',
+        `saveUnconfirmedV5Token: failed to synthesize UXF-compatible shape for bundle ${bundle.splitGroupId.slice(0, 12)} (${syntheticResult.error}), falling back to legacy opaque shape — token will be omitted from bundle CAR but recoverable via PENDING_V5_TOKENS KV`,
+      );
+      sdkDataJson = JSON.stringify({ _pendingFinalization: pendingData });
+    }
 
     const uiToken: Token = {
       id: deterministicId,
@@ -8270,8 +8275,11 @@ export class PaymentsModule {
 
     // Prefer shape-derived inputs; fall back to bundleJson for legacy
     // entries (pre-#207 opaque shape, or any case where the synthetic
-    // shape is malformed).
-    const inputs = readV5FinalizationInputsFromToken(token.sdkData);
+    // shape is malformed). `inputs` is `let` (not const) so the
+    // SDK-throws-on-shape-derived-input fallback can downgrade to
+    // bundleJson within the same resolve attempt without burning a
+    // full attemptCount cycle.
+    let inputs = readV5FinalizationInputsFromToken(token.sdkData);
     let cachedBundle: InstantSplitBundleV5 | null = null;
     const getBundle = (): InstantSplitBundleV5 => {
       if (cachedBundle === null) {
@@ -8285,15 +8293,28 @@ export class PaymentsModule {
     // from the authenticator's `publicKey` + `stateHash`
     // (deterministic — same as `RequestId.create(publicKey, stateHash)`
     // at commitment-construction time).
+    //
+    // #207 PR-B steelman — if Authenticator.fromJSON or RequestId.create
+    // throw (shape passed our pre-validation but the SDK still rejects),
+    // we MUST NOT burn an attemptCount for the structural failure.
+    // Downgrade to the legacy bundleJson path inside the same attempt.
     const getTransferCommitmentJson = async (): Promise<ITransferCommitmentJson> => {
       if (inputs) {
-        const auth = Authenticator.fromJSON(inputs.transferAuthenticatorJson);
-        const requestId = await RequestId.create(auth.publicKey, auth.stateHash);
-        return {
-          requestId: requestId.toJSON(),
-          transactionData: inputs.transferTransactionDataJson,
-          authenticator: inputs.transferAuthenticatorJson,
-        };
+        try {
+          const auth = Authenticator.fromJSON(inputs.transferAuthenticatorJson);
+          const requestId = await RequestId.create(auth.publicKey, auth.stateHash);
+          return {
+            requestId: requestId.toJSON(),
+            transactionData: inputs.transferTransactionDataJson,
+            authenticator: inputs.transferAuthenticatorJson,
+          };
+        } catch (err) {
+          logger.warn(
+            'Payments',
+            `[V5-RESOLVE] ${tokenId.slice(0, 12)}: shape-derived transferCommitment construction failed (${(err as Error)?.message ?? err}); downgrading to bundleJson fallback`,
+          );
+          inputs = null;
+        }
       }
       return JSON.parse(getBundle().transferCommitment) as ITransferCommitmentJson;
     };
@@ -8493,16 +8514,27 @@ export class PaymentsModule {
 
     // Create transfer transaction. Same lazy-shape-vs-bundle preference
     // as in resolveV5Token: derive requestId from the authenticator if
-    // we have shape inputs.
+    // we have shape inputs. SDK-throw → fall back to bundleJson rather
+    // than failing the whole finalize.
     let transferCommitment: TransferCommitment;
     if (inputs) {
-      const auth = Authenticator.fromJSON(inputs.transferAuthenticatorJson);
-      const requestId = await RequestId.create(auth.publicKey, auth.stateHash);
-      transferCommitment = await TransferCommitment.fromJSON({
-        requestId: requestId.toJSON(),
-        transactionData: inputs.transferTransactionDataJson,
-        authenticator: inputs.transferAuthenticatorJson,
-      });
+      try {
+        const auth = Authenticator.fromJSON(inputs.transferAuthenticatorJson);
+        const requestId = await RequestId.create(auth.publicKey, auth.stateHash);
+        transferCommitment = await TransferCommitment.fromJSON({
+          requestId: requestId.toJSON(),
+          transactionData: inputs.transferTransactionDataJson,
+          authenticator: inputs.transferAuthenticatorJson,
+        });
+      } catch (err) {
+        logger.warn(
+          'Payments',
+          `[V5-RESOLVE] finalize: shape-derived transferCommitment failed (${(err as Error)?.message ?? err}); using bundleJson fallback`,
+        );
+        transferCommitment = await TransferCommitment.fromJSON(
+          JSON.parse(getBundle().transferCommitment),
+        );
+      }
     } else {
       transferCommitment = await TransferCommitment.fromJSON(
         JSON.parse(getBundle().transferCommitment),
@@ -8583,6 +8615,14 @@ export class PaymentsModule {
    * token uses the synthetic `v5split_<groupId>` id. After successful
    * finalize the archived copy is stale and would otherwise linger
    * until the next archive sweep.
+   *
+   * Steelman: the archive map's keys come from
+   * `txf.genesis.data.tokenId` (raw string from the persisted JSON;
+   * UXF doesn't normalize hex casing), while `finalized.id.toJSON()`
+   * returns canonical SDK-formatted hex. To survive a case-mismatch
+   * we look up the entry by scanning the map's keys with normalized
+   * comparison — strictly bounded to a single archived entry per
+   * resolve, so the cost is O(archive size) once per finalize.
    */
   private gcArchivedV5PendingForFinalized(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -8593,13 +8633,34 @@ export class PaymentsModule {
         id?: { toJSON?: () => string };
       }).id?.toJSON?.();
       if (!tokenIdHex) return;
-      const archived = this.archivedTokens.get(tokenIdHex);
-      if (archived === undefined) return;
-      this.archivedTokens.delete(tokenIdHex);
-      logger.debug(
-        'Payments',
-        `[V5-RESOLVE] GC archived V5-pending entry for finalized token ${tokenIdHex.slice(0, 16)}...`,
-      );
+
+      // Fast path: exact match.
+      if (this.archivedTokens.delete(tokenIdHex)) {
+        logger.debug(
+          'Payments',
+          `[V5-RESOLVE] GC archived V5-pending entry for finalized token ${tokenIdHex.slice(0, 16)}...`,
+        );
+        return;
+      }
+
+      // Slow path: case/prefix-tolerant match. Strip `0x` prefix and
+      // lowercase both sides. Only matches the FIRST entry to avoid
+      // accidentally deleting more than one if the archive somehow
+      // contains case-variant duplicates (defensive — shouldn't happen
+      // since `archiveToken` writes whatever the JSON carried, so any
+      // duplicates are themselves a bug worth surfacing).
+      const norm = (s: string): string => s.replace(/^0x/i, '').toLowerCase();
+      const target = norm(tokenIdHex);
+      for (const key of this.archivedTokens.keys()) {
+        if (norm(key) === target) {
+          this.archivedTokens.delete(key);
+          logger.debug(
+            'Payments',
+            `[V5-RESOLVE] GC archived V5-pending entry (case-tolerant match) for finalized token ${tokenIdHex.slice(0, 16)}...`,
+          );
+          return;
+        }
+      }
     } catch {
       // Best-effort — never let GC failure block finalize.
     }
@@ -9423,8 +9484,36 @@ export class PaymentsModule {
   /**
    * Update pending finalization metadata in token's sdkData.
    * Creates a new token object since sdkData is readonly.
+   *
+   * #207 PR-B steelman — Preserve the synthetic V5-pending shape
+   * (genesis.data, state, transactions[0]._wallet.authenticator etc.)
+   * across stage transitions. Pre-fix this method overwrote sdkData
+   * with `{_pendingFinalization: pending}` — wiping the shape after the
+   * RECEIVED → MINT_SUBMITTED transition. Subsequent stages then had to
+   * parse `pending.bundleJson` which fundamentally defeats PR-B's
+   * self-sufficient-UXF goal for CAR-loaded tokens.
+   *
+   * Merge strategy: if existing sdkData is a parseable object, replace
+   * only the `_pendingFinalization` slot. Otherwise emit the legacy
+   * opaque shape (back-compat for any caller that pre-creates the
+   * pending entry without a synthetic shape).
    */
   private updatePendingFinalization(token: Token, pending: PendingV5Finalization): void {
+    let sdkDataJson: string;
+    try {
+      const existing = token.sdkData ? JSON.parse(token.sdkData) : null;
+      if (existing && typeof existing === 'object' && !Array.isArray(existing)) {
+        sdkDataJson = JSON.stringify({ ...existing, _pendingFinalization: pending });
+      } else {
+        sdkDataJson = JSON.stringify({ _pendingFinalization: pending });
+      }
+    } catch {
+      // Corrupted sdkData — fall back to legacy opaque shape (avoids
+      // a hard failure mid-resolve; the bundleJson legacy path can
+      // still finalize the token).
+      sdkDataJson = JSON.stringify({ _pendingFinalization: pending });
+    }
+
     const updated: Token = {
       id: token.id,
       coinId: token.coinId,
@@ -9436,7 +9525,7 @@ export class PaymentsModule {
       status: token.status,
       createdAt: token.createdAt,
       updatedAt: Date.now(),
-      sdkData: JSON.stringify({ _pendingFinalization: pending }),
+      sdkData: sdkDataJson,
     };
     this.tokens.set(token.id, updated);
   }
