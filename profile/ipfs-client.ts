@@ -141,6 +141,176 @@ export async function pinToIpfs(
 }
 
 /**
+ * Map a codec code (the first byte after the CID version in a CIDv1) to
+ * the Kubo `dag/put` `input-codec` / `store-codec` token. Only codecs the
+ * Profile layer actually produces are listed — extend as the hierarchical
+ * model adds new block types.
+ */
+const CODEC_NAMES: Record<number, string> = {
+  0x55: 'raw',        // raw
+  0x71: 'dag-cbor',   // dag-cbor
+  0x70: 'dag-pb',     // dag-pb (legacy IPFS UnixFS — not produced by Profile, listed for completeness)
+};
+
+/**
+ * Pin a single dag-cbor (or other-codec) block to IPFS via Kubo's
+ * `/api/v0/dag/put` endpoint. The block is stored under its canonical
+ * CID, addressable by subsequent `block/get`/`fetchFromIpfs`.
+ *
+ * Internal helper for {@link pinCarBlocksToIpfs}. The codec/hash tokens
+ * are inferred from `expectedCid` — caller does not need to know the
+ * Kubo wire vocabulary.
+ *
+ * @throws {ProfileError} `ORBITDB_WRITE_FAILED` if all gateways fail or
+ *         the gateway returned an unsupported response.
+ */
+async function pinSingleBlock(
+  gateways: string[],
+  blockBytes: Uint8Array,
+  expectedCid: string,
+  timeoutMs: number,
+): Promise<void> {
+  const effectiveGateways = gateways.length > 0 ? gateways : [DEFAULT_IPFS_API_URL];
+  validateGatewayUrls(effectiveGateways);
+
+  // Derive the Kubo codec token from the CID's multicodec prefix.
+  // Unknown codecs fall back to `raw` so we still store the bytes (the
+  // gateway will compute a different CID, but our locally-computed
+  // expected CID is what gets published — the next fetch will fail loud).
+  let codecName = 'raw';
+  try {
+    const parsed = CID.parse(expectedCid);
+    codecName = CODEC_NAMES[parsed.code] ?? 'raw';
+  } catch {
+    // ignore — fall through with `raw`
+  }
+
+  let lastError: Error | null = null;
+  for (const gateway of effectiveGateways) {
+    try {
+      const url =
+        `${gateway.replace(/\/$/, '')}/api/v0/dag/put` +
+        `?input-codec=${codecName}&store-codec=${codecName}&pin=true&hash=sha2-256`;
+      const form = new FormData();
+      form.append('data', new Blob([blockBytes as BlobPart]), 'block');
+      const response = await fetch(url, {
+        method: 'POST',
+        body: form,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!response.ok) {
+        lastError = new Error(`HTTP ${response.status} ${response.statusText} from ${gateway}`);
+        continue;
+      }
+      // Drain so the connection releases. We trust our locally-computed
+      // expectedCid; the gateway-returned CID is intentionally ignored
+      // (same posture as `pinToIpfs` — a malicious gateway pinning under
+      // a different CID would just produce a 404 on the next fetch, not
+      // an anchor redirect).
+      try {
+        await response.json();
+      } catch {
+        // ignore — body parse failure on a 200 doesn't change durability
+      }
+      return;
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+    }
+  }
+
+  throw new ProfileError(
+    'ORBITDB_WRITE_FAILED',
+    `IPFS dag/put failed on all gateways for ${expectedCid}: ${lastError?.message ?? 'unknown error'}`,
+    lastError,
+  );
+}
+
+/**
+ * Pin every block contained in a CAR file to IPFS, each under its
+ * canonical CID. Used in place of `pinToIpfs(carBytes)` when the
+ * published reference is a dag-cbor CID over a block INSIDE the CAR
+ * (rather than a raw CID over the whole CAR envelope).
+ *
+ * Why not `/api/v0/dag/import`: the Unicity IPFS gateway does not expose
+ * that endpoint. `dag/put` is universally available across Kubo deploys,
+ * including hardened gateways that restrict the API surface. The
+ * tradeoff is one HTTP round-trip per block — acceptable for the
+ * single-block lean snapshot today; future hierarchical snapshots
+ * (per-writer / per-bundle / per-token / per-sub-token sub-blocks) will
+ * scale linearly, but each block is small and we can parallelize if
+ * latency becomes a concern.
+ *
+ * Use this for profile lean-snapshot CARs: the published pointer is the
+ * snapshot's dag-cbor `rootCid`, and consumers fetch the root block via
+ * `block/get(rootCid)`. Bundle CARs continue to use {@link pinToIpfs}
+ * (bundle CIDs are raw-CIDs over the whole bundle CAR; the existing
+ * pin-as-one-raw-block semantics still match). Migrating bundles to the
+ * per-block model is a future step that would expose individual tokens /
+ * sub-token components as addressable sub-CIDs in the hierarchical
+ * profile model.
+ *
+ * The function trusts the caller-supplied `expectedRootCid` and returns
+ * it on success — defense-in-depth posture mirroring {@link pinToIpfs}.
+ *
+ * @param gateways          - Array of IPFS gateway base URLs
+ * @param carBytes          - CAR file bytes to import block-by-block
+ * @param expectedRootCid   - The root CID claimed by the CAR header
+ * @param timeoutMs         - Timeout per gateway+block (default: 60 000)
+ * @returns The `expectedRootCid` on success.
+ * @throws {ProfileError} `ORBITDB_WRITE_FAILED` if any block fails on all gateways.
+ */
+export async function pinCarBlocksToIpfs(
+  gateways: string[],
+  carBytes: Uint8Array,
+  expectedRootCid: string,
+  timeoutMs: number = DEFAULT_PIN_TIMEOUT_MS,
+): Promise<string> {
+  // Parse the CAR locally to extract each block. Done up front so a
+  // malformed CAR fails fast before any network round-trips.
+  const { CarReader } = await import('@ipld/car');
+  let reader: InstanceType<typeof CarReader>;
+  try {
+    reader = await CarReader.fromBytes(carBytes);
+  } catch (err) {
+    throw new ProfileError(
+      'ORBITDB_WRITE_FAILED',
+      `Failed to parse CAR for block-by-block pinning: ${err instanceof Error ? err.message : String(err)}`,
+      err,
+    );
+  }
+
+  const blocks: Array<{ cid: string; bytes: Uint8Array }> = [];
+  for await (const block of reader.blocks()) {
+    blocks.push({ cid: block.cid.toString(), bytes: block.bytes });
+  }
+  if (blocks.length === 0) {
+    throw new ProfileError(
+      'ORBITDB_WRITE_FAILED',
+      'CAR contained zero blocks — refusing to publish a phantom rootCid.',
+    );
+  }
+  // Sanity-check: the expected root must be present as one of the blocks.
+  // This is a defense against a builder bug where the published rootCid
+  // doesn't match anything inside the CAR.
+  if (!blocks.some((b) => b.cid === expectedRootCid)) {
+    throw new ProfileError(
+      'ORBITDB_WRITE_FAILED',
+      `expectedRootCid ${expectedRootCid} is not present among CAR blocks (count=${blocks.length}) — builder/publisher mismatch.`,
+    );
+  }
+
+  // Pin each block sequentially. A single block failure aborts the
+  // whole import: callers MUST see "all blocks pinned" or "publish
+  // failed" — never a partial import that would leave the rootCid
+  // pointing into a hole.
+  for (const block of blocks) {
+    await pinSingleBlock(gateways, block.bytes, block.cid, timeoutMs);
+  }
+
+  return expectedRootCid;
+}
+
+/**
  * Fetch content from IPFS by CID.
  * Tries each gateway in order, returns the bytes on first success.
  *

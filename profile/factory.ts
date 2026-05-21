@@ -25,11 +25,11 @@ import { ProfileTokenStorageProvider } from './profile-token-storage-provider';
 import { DEFAULT_IPFS_GATEWAYS } from '../constants';
 import {
   buildLeanProfileSnapshot,
-  parseLeanProfileSnapshot,
+  parseLeanProfileSnapshotFromRootBlock,
   type BuildLeanProfileSnapshotResult,
   type LeanProfileSnapshot,
 } from './profile-lean-snapshot';
-import { fetchFromIpfs, pinToIpfs } from './ipfs-client';
+import { fetchFromIpfs, pinCarBlocksToIpfs } from './ipfs-client';
 import type { ProfilePointerLayer } from './aggregator-pointer';
 import {
   runProfileSnapshotJoin,
@@ -220,8 +220,17 @@ export interface ProfileDirtyFlushDeps {
     chainPubkey: string,
     network: string,
   ) => Promise<BuildLeanProfileSnapshotResult>;
-  /** Pin a CAR to IPFS. Returns the CID string (ignored by the closure). */
-  readonly pin: (carBytes: Uint8Array) => Promise<string>;
+  /**
+   * Import the snapshot CAR to IPFS via Kubo `dag/import`. Each
+   * contained block (root + any future sub-blocks) lands under its
+   * canonical CID, so the published `rootCid` is retrievable via a
+   * subsequent `block/get(rootCid)`. Returns the trusted rootCid on
+   * success.
+   */
+  readonly pin: (
+    carBytes: Uint8Array,
+    expectedRootCid: string,
+  ) => Promise<string>;
   /**
    * Phase D.1a — publish a snapshot CID via
    * `LifecycleManager.publishAggregatorPointerBestEffort`. The wired
@@ -279,7 +288,14 @@ export async function runProfileDirtyFlush(
   }
 
   const snapshot = await deps.buildSnapshot(chainPubkey, network);
-  await deps.pin(snapshot.carBytes);
+  // Import the CAR via Kubo `dag/import` so each contained block
+  // (currently just the root; future hierarchical snapshots will add
+  // per-writer / per-bundle sub-blocks) is stored under its canonical
+  // CID. This makes `snapshot.rootCid` retrievable via `block/get`,
+  // which `pinToIpfs`-style raw pinning did NOT — that wrote the entire
+  // CAR as a single raw block under a different (raw-codec) CID, leaving
+  // the published dag-cbor rootCid unaddressable on the gateway.
+  await deps.pin(snapshot.carBytes, snapshot.rootCid);
 
   const result = await deps.publishCid(snapshot.rootCid);
   if (!result.ok && result.transient) {
@@ -476,7 +492,8 @@ export function createProfileProviders(
             }),
         });
       },
-      pin: (carBytes) => pinToIpfs(ipfsGateways, carBytes),
+      pin: (carBytes, expectedRootCid) =>
+        pinCarBlocksToIpfs(ipfsGateways, carBytes, expectedRootCid),
       // Phase D.1a — route the snapshot CID publish through the
       // provider's LifecycleManager so it picks up retry / error-
       // classification / pending-publish-marker machinery. The legacy
@@ -647,8 +664,13 @@ export function createProfileProviders(
   // object is built. The provider's late-binding setter resolves this
   // ordering cleanly.
   tokenStorage.setApplySnapshotCallback(async (cidString) => {
-    const carBytes = await fetchFromIpfs(ipfsGateways, cidString);
-    const snapshot = await parseLeanProfileSnapshot(carBytes);
+    // `dag/import` stored each CAR block under its canonical CID, so
+    // `block/get(rootCid)` returns the dag-cbor encoded root block
+    // bytes (NOT a CAR envelope). `fetchFromIpfs` already verifies
+    // sha256(bytes) == cidString.multihash, so the dag-cbor decode
+    // below operates on authenticated bytes.
+    const rootBlockBytes = await fetchFromIpfs(ipfsGateways, cidString);
+    const snapshot = parseLeanProfileSnapshotFromRootBlock(rootBlockBytes);
     return dispatchParsedSnapshot(snapshot);
   });
 

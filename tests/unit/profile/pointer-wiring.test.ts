@@ -406,11 +406,18 @@ describe('fetchAndJoin — Item #15 Phase D.2 snapshot apply', () => {
   const TEST_CID_STRING = 'bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku';
 
   /**
-   * Build a CAR that parseLeanProfileSnapshot accepts. The factory
-   * uses the production builder so the format stays in lockstep with
-   * the producer side.
+   * Build a snapshot and return both the full CAR bytes (for tests that
+   * still want to exercise the legacy in-process CAR path) AND the
+   * dag-cbor root block bytes (what `fetchFromIpfs(rootCid)` returns now
+   * that the producer pins via `dag/import`). Phase E follow-up: the
+   * pointer-wiring fetch path consumes the root block bytes directly —
+   * see `profile/factory.ts` for the symmetric production wiring.
    */
-  async function buildSnapshotCar(): Promise<{ carBytes: Uint8Array; rootCid: string }> {
+  async function buildSnapshotCar(): Promise<{
+    carBytes: Uint8Array;
+    rootBlockBytes: Uint8Array;
+    rootCid: string;
+  }> {
     const { buildLeanProfileSnapshot } = await import('../../../profile/profile-lean-snapshot');
     // Stub storage with one KV entry under an addressId.
     const tokenStorageStub = {
@@ -434,16 +441,33 @@ describe('fetchAndJoin — Item #15 Phase D.2 snapshot apply', () => {
       network: 'testnet',
       createdAt: 1_700_000_000_000,
     });
-    return { carBytes: result.carBytes, rootCid: result.rootCid };
+    // Extract the root block bytes from the CAR — what `fetchFromIpfs`
+    // returns under the new `dag/import` pin path.
+    const { CarReader } = await import('@ipld/car');
+    const reader = await CarReader.fromBytes(result.carBytes);
+    const roots = await reader.getRoots();
+    let rootBlockBytes: Uint8Array | undefined;
+    for await (const block of reader.blocks()) {
+      if (block.cid.toString() === roots[0]?.toString()) {
+        rootBlockBytes = block.bytes;
+        break;
+      }
+    }
+    if (!rootBlockBytes) throw new Error('test: root block missing from CAR');
+    return {
+      carBytes: result.carBytes,
+      rootBlockBytes,
+      rootCid: result.rootCid,
+    };
   }
 
-  it('parses the CAR, calls applySnapshot, and persists the version', async () => {
-    const { carBytes, rootCid } = await buildSnapshotCar();
+  it('parses the snapshot root block, calls applySnapshot, and persists the version', async () => {
+    const { rootBlockBytes, rootCid } = await buildSnapshotCar();
 
     const { fetchFromIpfs } = await import('../../../profile/ipfs-client');
     const fetchMock = fetchFromIpfs as ReturnType<typeof vi.fn>;
     fetchMock.mockReset();
-    fetchMock.mockImplementation(async () => carBytes);
+    fetchMock.mockImplementation(async () => rootBlockBytes);
 
     const persisted: number[] = [];
     const applyCalls: Array<{ entryCount: number; bundleCount: number }> = [];
@@ -490,11 +514,11 @@ describe('fetchAndJoin — Item #15 Phase D.2 snapshot apply', () => {
     // cursor behind the unconsumed remote, so the next reconcile pass
     // re-fetches + re-applies idempotently. Reversing the order would
     // strand the cursor past unapplied snapshot state.
-    const { carBytes, rootCid } = await buildSnapshotCar();
+    const { rootBlockBytes, rootCid } = await buildSnapshotCar();
     const { fetchFromIpfs } = await import('../../../profile/ipfs-client');
     const fetchMock = fetchFromIpfs as ReturnType<typeof vi.fn>;
     fetchMock.mockReset();
-    fetchMock.mockImplementation(async () => carBytes);
+    fetchMock.mockImplementation(async () => rootBlockBytes);
 
     const order: string[] = [];
     const applySnapshot = vi.fn(async () => {
@@ -528,12 +552,12 @@ describe('fetchAndJoin — Item #15 Phase D.2 snapshot apply', () => {
   });
 
   it('does NOT advance the version when applySnapshot throws', async () => {
-    const { carBytes, rootCid } = await buildSnapshotCar();
+    const { rootBlockBytes, rootCid } = await buildSnapshotCar();
 
     const { fetchFromIpfs } = await import('../../../profile/ipfs-client');
     const fetchMock = fetchFromIpfs as ReturnType<typeof vi.fn>;
     fetchMock.mockReset();
-    fetchMock.mockImplementation(async () => carBytes);
+    fetchMock.mockImplementation(async () => rootBlockBytes);
 
     let persistCalled = false;
     const applySnapshot = vi.fn(async () => {
@@ -559,15 +583,15 @@ describe('fetchAndJoin — Item #15 Phase D.2 snapshot apply', () => {
     expect(applySnapshot).toHaveBeenCalledTimes(1);
   });
 
-  it('throws PROTOCOL_ERROR when the CAR is not a valid lean snapshot', async () => {
+  it('throws PROTOCOL_ERROR when the snapshot root block is not a valid lean snapshot', async () => {
     const { fetchFromIpfs } = await import('../../../profile/ipfs-client');
     const fetchMock = fetchFromIpfs as ReturnType<typeof vi.fn>;
     fetchMock.mockReset();
-    // Return bytes that are not a parseable CAR — definitely not a
-    // lean snapshot. Phase E removed the legacy bundle-CID fallback,
-    // so a malformed CAR is a hard error (the next reconcile pass
-    // will re-fetch + re-attempt; operator intervention required if
-    // the remote keeps publishing malformed CARs).
+    // Return bytes that are not a parseable dag-cbor block — definitely
+    // not a lean snapshot. Phase E removed the legacy bundle-CID fallback,
+    // so malformed snapshot bytes are a hard error (the next reconcile
+    // pass will re-fetch + re-attempt; operator intervention required if
+    // the remote keeps publishing malformed snapshots).
     fetchMock.mockImplementation(async () => new Uint8Array([0, 1, 2, 3, 4]));
 
     let persistCalled = false;

@@ -246,8 +246,12 @@ describe.skipIf(SKIP_INFRA)('Profile (OrbitDB + IPFS) Sync E2E', () => {
     cleanupDirs.push(dirs.base);
     await ensureTrustbase(dirs.dataDir);
 
-    const providers = makeProfileProviders(dirs);
-    const { storage } = unwrapProfileProviders(providers);
+    // Suppress the auto-debouncer so all faucet / receive activity
+    // coalesces into one pending state, then a single explicit
+    // `awaitNextFlush()` below produces V1 only — deterministic publish,
+    // no race with subsequent debounce ticks.
+    const providers = makeProfileProviders(dirs, { flushDebounceMs: 300_000 });
+    const { storage, tokenStorage } = unwrapProfileProviders(providers);
 
     console.log(`\n[Test 2] Creating Profile-backed wallet @${nametag}...`);
     const { sphere, generatedMnemonic } = await Sphere.init({
@@ -282,11 +286,34 @@ describe.skipIf(SKIP_INFRA)('Profile (OrbitDB + IPFS) Sync E2E', () => {
       expect(parsed.genesis).toBeTruthy();
     }
 
-    // Explicit sync flush — drains the debounced write-behind buffer so
-    // the CAR is actually pinned to IPFS and the bundle ref is in OrbitDB
-    // before we destroy the sphere.
-    console.log(`  Flushing token storage to IPFS+OrbitDB...`);
-    await sphere.payments.sync();
+    // Drain pending V5 finalizations and snapshot local state so any
+    // unfinalized token is included in the upcoming lean-snapshot CAR.
+    console.log(`  Draining pending V5 finalizations + saving local state...`);
+    await sphere.payments.sync({ drainTimeoutMs: 60_000 });
+
+    // Full-profile-sync: force ONE explicit lean-snapshot publish by
+    // calling `awaitNextFlush()` on the token-storage provider. The
+    // raised `flushDebounceMs` (5 min, see makeProfileProviders) means
+    // the auto-debouncer has not fired during reception — all saves
+    // coalesced into one pending state. This serialized flush:
+    //   1. builds the lean profile snapshot CAR from the merged state,
+    //   2. pins it to live IPFS,
+    //   3. publishes the snapshot CID at V1 via the aggregator pointer.
+    // Because V1 is the FIRST version on a fresh wallet, Phase-3
+    // walkback is skipped entirely — no V_n→V_(n-1) CAR fetch is
+    // attempted, so the publish does not race aggregator-gateway CAR
+    // propagation. Successive publishes (V2+) WOULD race; we explicitly
+    // suppress them via the long debounce + single-shot flush pattern
+    // that the full-profile-sync integration test models.
+    console.log(`  Publishing lean profile snapshot to IPFS + aggregator pointer...`);
+    await tokenStorage.awaitNextFlush(120_000);
+
+    // Allow IPFS replication so Device B's `recoverLatest()` finds the
+    // freshly-pinned snapshot CAR via the aggregator's reachable
+    // gateway. 10s mirrors the bootstrap-peer pubsub buffer that
+    // `ipfs-multi-device-sync.test.ts` uses for the same purpose.
+    console.log(`  Waiting 10s for IPFS replication to aggregator gateways...`);
+    await new Promise((r) => setTimeout(r, 10_000));
 
     // ---- Cold-start a fresh wallet from the SAME mnemonic but a NEW
     //      data directory — simulates moving to a different device.

@@ -582,6 +582,47 @@ export async function parseLeanProfileSnapshot(
 }
 
 /**
+ * Parse a lean snapshot from the dag-cbor encoded root block bytes
+ * alone (no CAR envelope). Used by the recovery path when the snapshot
+ * was pinned via Kubo `dag/import`: each contained block (currently
+ * just the root) is stored individually under its dag-cbor CID, so
+ * `fetchFromIpfs(rootCid)` returns the root block bytes directly — NOT
+ * a CAR. Content-address verification is done by the fetcher
+ * (`verifyCidMatchesBytes` against the published CID), so this parser
+ * only needs to dag-cbor-decode and validate the resulting shape.
+ *
+ * Symmetric with {@link parseLeanProfileSnapshot} (which still serves
+ * the legacy in-process path where carBytes are handed off directly,
+ * e.g. integration tests). When the snapshot grows to multiple blocks
+ * (hierarchical model: per-writer or per-bundle sub-blocks), this
+ * function gains a fetcher callback that walks CID links — the
+ * dispatcher will then drive lazy hydration through that fetcher.
+ *
+ * @throws ProfileError on dag-cbor decode failure or shape mismatch.
+ */
+export function parseLeanProfileSnapshotFromRootBlock(
+  rootBlockBytes: Uint8Array,
+): LeanProfileSnapshot {
+  if (rootBlockBytes.byteLength > PROFILE_CAR_IMPORT_MAX_BLOCK_BYTES) {
+    throw new ProfileError(
+      'PROFILE_NOT_INITIALIZED',
+      `Lean snapshot root block is ${rootBlockBytes.byteLength} bytes — exceeds per-block cap ${PROFILE_CAR_IMPORT_MAX_BLOCK_BYTES}.`,
+    );
+  }
+  let decoded: unknown;
+  try {
+    decoded = dagCborDecode(rootBlockBytes);
+  } catch (err) {
+    throw new ProfileError(
+      'PROFILE_NOT_INITIALIZED',
+      `Failed to decode lean snapshot root block as dag-cbor: ${err instanceof Error ? err.message : String(err)}`,
+      err,
+    );
+  }
+  return validateLeanSnapshotShape(decoded);
+}
+
+/**
  * Validate the decoded snapshot's shape + version. Throws on any
  * disagreement; otherwise returns a safely-typed `LeanProfileSnapshot`.
  *
