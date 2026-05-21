@@ -417,9 +417,49 @@ running this SDK version.
   rejected with an explicit version error.
 - **Bundle authentication.** `tests/unit/profile/profile-export.test.ts`
   ("rejects forged-CID bundle CARs") — bundle ref pointing at a CID
-  absent from the snapshot CAR is skipped on parse; the CarReader's
-  CID-binding check rejects any block whose bytes don't hash to its
-  CID.
+  absent from the snapshot CAR is skipped on parse; the snapshot
+  root's CID-binding check rejects a CAR whose framed root does not
+  match the root block content.
+
+## Known follow-up: bundle CAR sub-block CID/bytes mismatch
+
+Surfaced by the PR #201 steelman pass. `uxf/ipld.ts:elementToIpldBlock`
+deliberately computes a sub-block's framed CID from the **hash
+canonical form** of an element (children encoded as raw hash bytes)
+while emitting the sub-block bytes as the **IPLD form** (children
+encoded as CID-link Tag-42 references). The two encodings differ
+byte-for-byte, so for any non-empty bundle:
+
+```
+sha256(block.bytes) != block.cid.multihash.digest
+```
+
+Consequence: a recipient calling `block/get(subBlockCid)` against a
+Kubo gateway that recomputed CIDs at `dag/put` time (as Kubo does by
+default) will 404 on the affected sub-blocks. The gateway stored the
+bytes under `sha256(bytes)` rather than under the framed CID.
+
+Bundle ROOT CIDs (envelope + manifest) match by construction —
+those blocks have no child CID refs and the hash/IPLD forms coincide.
+The current `fetchCarFromIpfs` walk works for envelope + manifest
+but degrades to 404 for the deeper sub-blocks.
+
+This is **pre-existing behavior** (predates issue #200 — the Phase 2
+work migrated to per-block pinning but did not reconcile the codec
+mismatch). Production paths today don't hit the failure mode because
+recipients fetch the bundle by ROOT CID via `fetchCarFromIpfs` and
+decode the bundle locally rather than fetching each sub-block
+individually. The mismatch matters only if someone introduces a
+direct `block/get(subBlockCid)` consumer.
+
+**To fully close the issue:** make `elementToIpldBlock` compute the
+framed CID from the actual emitted bytes (`sha256(dagCborEncode(ipldForm))`)
+and propagate the change through `contentHashToCid` so OrbitDB refs,
+manifest links, and on-wire CID tags all reference the canonical
+post-IPLD CID. This would also re-enable per-block CID-binding
+verification at every receiver site (including
+`parseProfileSnapshot`). Scope is too large for #200; tracked as a
+separate follow-up issue.
 
 ## See also
 
