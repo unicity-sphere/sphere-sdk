@@ -167,6 +167,17 @@ async function isProfileNonEmpty(
  *
  * Identity-class key failures (`mnemonic`, `master_key`, ...) abort
  * the import. Other key failures are logged + skipped.
+ *
+ * **Write ordering (steelman finding):** identity-class keys (mnemonic,
+ * master_key, chain_code, derivation_path, base_path) are written
+ * LAST so that a process crash mid-import leaves a destination
+ * profile that is unbootable (no identity present) rather than one
+ * that boots a freshly-derived identity from defaults and then fails
+ * to decrypt any of the partially-imported encrypted KV entries. The
+ * input `entries` array is sorted alphabetically at export time —
+ * without this partition, the lowercase `master_key` / `mnemonic`
+ * keys would land in the middle of the iteration, after uppercase
+ * `DIRECT_*` tracked-address entries.
  */
 async function replayKvEntries(
   storage: StorageProvider,
@@ -177,8 +188,23 @@ async function replayKvEntries(
   };
   const hasEncryptedRaw = typeof handle.setEncryptedRaw === 'function';
 
+  // Partition: non-identity-class entries write first; identity-class
+  // entries (mnemonic / master_key / chain_code / derivation_path /
+  // base_path) write LAST. A crash mid-non-identity leaves the
+  // destination identity-less → next boot creates a fresh wallet, no
+  // identity ambiguity. A crash mid-identity is the only window where
+  // partial-identity state could exist; that window is now O(#identity
+  // keys) ≈ 5 writes instead of O(#total entries).
+  const dataEntries: Array<{ key: string; value: string }> = [];
+  const identityEntries: Array<{ key: string; value: string }> = [];
+  for (const e of entries) {
+    if (IDENTITY_CLASS_KEYS.has(e.key)) identityEntries.push(e);
+    else dataEntries.push(e);
+  }
+  const ordered = [...dataEntries, ...identityEntries];
+
   let successCount = 0;
-  for (const { key, value } of entries) {
+  for (const { key, value } of ordered) {
     try {
       if (hasEncryptedRaw) {
         await handle.setEncryptedRaw!(key, value);

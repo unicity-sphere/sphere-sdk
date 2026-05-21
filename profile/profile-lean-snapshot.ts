@@ -63,6 +63,7 @@ import type { StorageProvider } from '../storage/storage-provider.js';
 import type { ProfileTokenStorageProvider } from './profile-token-storage-provider.js';
 import { logger } from '../core/logger.js';
 import { ProfileError } from './errors.js';
+import { verifyCidMatchesBytes } from './ipfs-client.js';
 import type { UxfBundleRef } from './types.js';
 
 // =============================================================================
@@ -816,8 +817,26 @@ async function loadCarBlocks(
         `Lean snapshot CAR has a block of ${block.bytes.byteLength} bytes — exceeds per-block cap ${PROFILE_CAR_IMPORT_MAX_BLOCK_BYTES}.`,
       );
     }
-    blockMap.set(block.cid.toString(), block.bytes);
-    if (block.cid.toString() === rootCid.toString()) {
+    // Per-block CID-binding verification (steelman finding): the
+    // `@ipld/car` CarReader does NOT recompute sha256(bytes) against
+    // the framed CID. Without this check, a hostile lean snapshot
+    // could substitute bytes under a legitimate CID and the per-group
+    // sub-block dag-cbor decode would parse attacker-controlled
+    // entries into the destination's KV store.
+    const cidStr = block.cid.toString();
+    try {
+      verifyCidMatchesBytes(cidStr, block.bytes);
+    } catch (err) {
+      throw new ProfileError(
+        'PROFILE_NOT_INITIALIZED',
+        `Lean snapshot CAR block ${cidStr} failed CID-binding verification ` +
+          `(sha256(bytes) does not match the framed CID): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+        err,
+      );
+    }
+    blockMap.set(cidStr, block.bytes);
+    if (cidStr === rootCid.toString()) {
       rootBytes = block.bytes;
     }
   }
@@ -829,10 +848,10 @@ async function loadCarBlocks(
     );
   }
 
-  // Re-verify content address — defeats forged-CID attacks. CarReader
-  // already does this for the standard CID-block binding, but we
-  // recompute explicitly so that a CAR with a forged header root[0]
-  // that points to a different block's payload is rejected.
+  // Codec/root cross-check: the framed root CID must be dag-cbor and
+  // its multihash must match the root bytes. The per-block loop above
+  // already validated the multihash binding; this check guards against
+  // a CAR whose framed root[0] is a raw-codec CID over identical bytes.
   const expectedRootCid = dagCborCid(rootBytes);
   if (expectedRootCid.toString() !== rootCid.toString()) {
     throw new ProfileError(
@@ -1009,10 +1028,18 @@ export async function parseLeanProfileSnapshotPartial(
  * entries list (sorted by key for determinism).
  *
  * Per-group validation: decoded block's `groupKey` must equal the
- * ref's `groupKey`; `entryCount` must equal the entries length; the
- * computed CID of the fetched bytes is NOT re-verified here because
- * production fetchers (`fetchFromIpfs`) already do CID-binding
- * verification. Test fetchers MUST do the same to stay sound.
+ * ref's `groupKey`; `entryCount` must equal the entries length.
+ *
+ * CID-binding contract (must hold for caller-supplied fetchers):
+ * the bytes returned by `fetcher(cid)` MUST satisfy
+ * `sha256(bytes) == cid.multihash.digest`. Production wiring binds
+ * the fetcher to `fetchFromIpfs` which re-verifies CID-binding on
+ * every response (see `profile/ipfs-client.ts` `fetchFromIpfs:472`).
+ * The in-CAR fetcher used by `parseLeanProfileSnapshot(carBytes)`
+ * reads from a block map populated by `loadCarBlocks` which also
+ * verifies CID-binding per block. Test doubles MUST honor this
+ * contract — otherwise the parser will decode attacker-controlled
+ * bytes labelled with a trusted CID.
  */
 async function fetchAndDecodeAllGroupEntries(
   groups: ReadonlyArray<LeanProfileSnapshotEntryGroupRef>,

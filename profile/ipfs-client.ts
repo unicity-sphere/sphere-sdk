@@ -247,37 +247,39 @@ async function pinSingleBlock(
 
 /**
  * Pin every block contained in a CAR file to IPFS, each under its
- * canonical CID. Used in place of `pinToIpfs(carBytes)` when the
- * published reference is a dag-cbor CID over a block INSIDE the CAR
- * (rather than a raw CID over the whole CAR envelope).
+ * canonical CID. The canonical primitive used across the whole SDK
+ * whenever the published reference is a dag-cbor envelope CID over a
+ * block INSIDE the CAR (or a raw CID over a single-block CAR, which
+ * pins identically). Replaces the pre-issue-#199 `pinToIpfs(carBytes)`
+ * pattern across all CAR-producing call sites: bundle CARs (Phase 2
+ * of issue #200), consolidation CARs, manifest CARs, profile snapshot
+ * CARs (lean v3 and fat v2), and the Nostr `uxf-cid` publisher (via
+ * `createUxfCarPublisher`).
  *
  * Why not `/api/v0/dag/import`: the Unicity IPFS gateway does not expose
  * that endpoint. `dag/put` is universally available across Kubo deploys,
  * including hardened gateways that restrict the API surface. The
- * tradeoff is one HTTP round-trip per block — acceptable for the
- * single-block lean snapshot today; future hierarchical snapshots
- * (per-writer / per-bundle / per-token / per-sub-token sub-blocks) will
- * scale linearly, but each block is small and we can parallelize if
- * latency becomes a concern.
+ * tradeoff is one HTTP round-trip per block.
  *
- * Use this for profile lean-snapshot CARs: the published pointer is the
- * snapshot's dag-cbor `rootCid`, and consumers fetch the root block via
- * `block/get(rootCid)`. Bundle CARs continue to use {@link pinToIpfs}
- * (bundle CIDs are raw-CIDs over the whole bundle CAR; the existing
- * pin-as-one-raw-block semantics still match). Migrating bundles to the
- * per-block model is a future step that would expose individual tokens /
- * sub-token components as addressable sub-CIDs in the hierarchical
- * profile model.
- *
- * The function trusts the caller-supplied `expectedRootCid` and returns
- * it on success — defense-in-depth posture mirroring {@link pinToIpfs}.
+ * The function trusts the caller-supplied `expectedRootCid` and the
+ * framed CIDs in the CAR (`@ipld/car`'s `CarReader` does NOT recompute
+ * `sha256(bytes)` against the framed CID — it just slices framed
+ * `{cid, bytes}` pairs from the stream). Per-block content-address
+ * verification is NOT applied here because the SDK's bundle CAR
+ * builder (`uxf/ipld.ts:elementToIpldBlock`) emits sub-block bytes
+ * (IPLD form, with CID-link children) under CIDs computed from a
+ * different canonical form (hash form, with raw hash-bytes children).
+ * A uniform per-block sha256 check would reject every legitimate UXF
+ * bundle. Receiver-side verification is provided by `fetchFromIpfs`
+ * (CID-binding check against gateway-returned bytes).
  *
  * @param gateways          - Array of IPFS gateway base URLs
  * @param carBytes          - CAR file bytes to import block-by-block
  * @param expectedRootCid   - The root CID claimed by the CAR header
  * @param timeoutMs         - Timeout per gateway+block (default: 60 000)
  * @returns The `expectedRootCid` on success.
- * @throws {ProfileError} `ORBITDB_WRITE_FAILED` if any block fails on all gateways.
+ * @throws {ProfileError} `ORBITDB_WRITE_FAILED` if all gateways fail to
+ *         accept a pin or the CAR doesn't contain the expected root.
  */
 export async function pinCarBlocksToIpfs(
   gateways: string[],
@@ -303,6 +305,34 @@ export async function pinCarBlocksToIpfs(
   for await (const block of reader.blocks()) {
     blocks.push({ cid: block.cid.toString(), bytes: block.bytes });
   }
+  // NOTE on producer-side CID-binding verification: an earlier draft
+  // of this function called `verifyCidMatchesBytes` per block here as
+  // defense against a buggy local CAR builder. That check surfaced a
+  // pre-existing design choice in `uxf/ipld.ts:elementToIpldBlock` —
+  // for UXF bundle CARs, sub-block CIDs are computed over the HASH
+  // canonical form of the element (children = raw hash bytes) while
+  // the block bytes serialize the IPLD form (children = CID links).
+  // The two encodings differ, so `sha256(block.bytes) !=
+  // block.cid.multihash.digest` for a subset of bundle sub-blocks by
+  // design. A per-block check would reject every legitimate UXF
+  // bundle.
+  //
+  // The receiver-side verification stays intact:
+  //   - `fetchFromIpfs` re-verifies `sha256(bytes) == cid.multihash`
+  //     before returning bytes to callers (defense against gateway
+  //     tampering).
+  //   - `parseProfileSnapshot` and `loadCarBlocks` re-verify each
+  //     block in a hand-built snapshot CAR.
+  //
+  // The mismatch in the producer path is tracked as a follow-up:
+  // the `block/get(subBlockCid)` round-trip works in practice because
+  // Kubo's `dag/put` honors the caller-supplied codec but returns the
+  // CID it actually computed; the SDK's `pinSingleBlock` keeps the
+  // caller-claimed CID for the response shape but pins under the
+  // sha256(bytes)-derived CID. Bundle root CIDs continue to match by
+  // construction (envelope/manifest blocks use IPLD-form encoding
+  // throughout). See docs/uxf/HIERARCHICAL-ADDRESSABILITY.md for the
+  // full discussion.
   if (blocks.length === 0) {
     throw new ProfileError(
       'ORBITDB_WRITE_FAILED',

@@ -29,11 +29,20 @@
  *      destination wallet must derive the same master key (i.e. share
  *      the same mnemonic) to decrypt them — this is the security
  *      invariant: snapshot privacy reduces to mnemonic privacy.
- *   2. **Bundle CID content-address verification.** Every block in the
- *      snapshot CAR is content-addressed under its own CID; the CAR
- *      reader rejects any block whose bytes do not match its CID. The
- *      importer additionally walks each `bundles[i].cid` and verifies
- *      that block is present in the CAR.
+ *   2. **Bundle CID content-address posture.** The snapshot root CID
+ *      is re-verified against the root block bytes (the envelope is
+ *      a dag-cbor encoding with no child CID refs, so its CID ==
+ *      sha256(bytes) holds unambiguously). Per-block CID-binding
+ *      verification is NOT applied to the embedded bundle sub-blocks
+ *      because the SDK's bundle CAR builder
+ *      (`uxf/ipld.ts:elementToIpldBlock`) emits sub-block bytes
+ *      (IPLD form, with CID-link children) under CIDs computed from
+ *      a different canonical form (hash form, with raw hash-bytes
+ *      children) — a uniform per-block check would reject every
+ *      legitimate bundle. Tracked as a follow-up for issue #200
+ *      closeout: reconcile the bundle CAR codec model with the
+ *      canonical `dag/put`-`block/get` round-trip so per-block
+ *      verification can be reintroduced.
  *   3. **Schema is versioned.** Snapshots carry `version: 2`. v1 was
  *      the pre-Phase-5 flat layout (whole bundle CARs embedded as raw
  *      blocks). v2 is the hierarchical layout. The parser rejects
@@ -775,9 +784,22 @@ function collectCidLinks(value: unknown, visit: (cid: CID) => void): void {
  * SKIPPED (not silently substituted). Callers iterate `snapshot.bundles`
  * to find missing entries.
  *
- * The CarReader implementation rejects any block whose payload does
- * not hash to its CID under the recorded multihash, so every block we
- * return is authenticated; no manual SHA pass is needed.
+ * NOTE on per-block CID-binding verification:
+ *
+ *   The `@ipld/car` `CarReader` does NOT recompute `sha256(bytes)`
+ *   against the framed CID — it just slices `{cid, bytes}` pairs from
+ *   the stream. Defense-in-depth would call `verifyCidMatchesBytes`
+ *   per block, but the SDK's pre-Phase-5 bundle builder
+ *   (`uxf/ipld.ts:elementToIpldBlock`) deliberately emits sub-block
+ *   bytes (IPLD form, with CID-link children) under CIDs computed
+ *   from a different canonical form (hash form, with raw hash-bytes
+ *   children). For UXF sub-blocks, `sha256(block.bytes) !=
+ *   block.cid.multihash.digest` by design; a uniform per-block check
+ *   here would reject every legitimate bundle. Verification of the
+ *   snapshot root + content-address sanity of the snapshot CAR's
+ *   envelope structure stays in force. Tracked as a follow-up to
+ *   reconcile the bundle CAR codec model with the canonical
+ *   `dag/put`-`block/get` round-trip; see issue #200 closeout notes.
  */
 export async function parseProfileSnapshot(carBytes: Uint8Array): Promise<{
   snapshot: ProfileSnapshot;
@@ -805,6 +827,16 @@ export async function parseProfileSnapshot(carBytes: Uint8Array): Promise<{
 
   // Materialise blocks into a map. The same map is the input to the
   // per-bundle DAG walker so we don't re-scan the CAR per bundle.
+  //
+  // Per-block CID-binding verification is NOT applied here: see the
+  // module-level NOTE — bundle sub-blocks emitted by
+  // `uxf/ipld.ts:elementToIpldBlock` carry CIDs computed from the
+  // hash canonical form (children = raw hash bytes) while the block
+  // bytes encode the IPLD form (children = CID links). The two
+  // encodings differ, so a uniform per-block check would reject
+  // every snapshot that embeds a non-empty bundle. The snapshot root
+  // CID (a dag-cbor encoding of the snapshot envelope, no child CID
+  // refs) IS verified explicitly below.
   const allBlocks = new Map<string, Uint8Array>();
   let blockCount = 0;
   for await (const block of reader.blocks()) {
@@ -829,10 +861,11 @@ export async function parseProfileSnapshot(carBytes: Uint8Array): Promise<{
     throw new ProfileError('PROFILE_NOT_INITIALIZED', 'Root block missing from CAR.');
   }
 
-  // Defense-in-depth: recompute the root CID from its content even
-  // though CarReader already does this for the standard CID-block
-  // binding. Catches a CAR with a forged header `roots[0]` that
-  // points to a non-root block's payload.
+  // Verify the root CID against its content: the snapshot envelope is
+  // a dag-cbor encoding of the snapshot doc with NO child CID refs,
+  // so its CID == sha256(bytes) holds unambiguously. Catches a CAR
+  // with a forged header `roots[0]` that points to a different
+  // block's payload (or to bytes with a substituted codec).
   const expectedRootCid = dagCborCid(rootBytes);
   if (expectedRootCid.toString() !== rootCid.toString()) {
     throw new ProfileError(

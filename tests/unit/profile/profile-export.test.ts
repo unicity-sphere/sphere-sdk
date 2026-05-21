@@ -160,7 +160,12 @@ class FakeTokenStorage {
 
 // Mock the IPFS client so export's fetchFromIpfs returns canned bundle
 // CARs and import's pinToIpfs is a no-op (we don't have a real gateway).
-vi.mock('../../../profile/ipfs-client', async () => {
+// `verifyCidMatchesBytes` MUST be wired to the real implementation —
+// the production code path uses it inside `parseProfileSnapshot` and
+// `pinCarBlocksToIpfs` to reject blocks whose CIDs don't bind to their
+// bytes. Mocking it as a no-op would silently mask CID-binding regressions.
+vi.mock('../../../profile/ipfs-client', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../profile/ipfs-client')>();
   const carCache = new Map<string, Uint8Array>();
   // Issue #200 Phase 2: production now uses `fetchCarFromIpfs` and
   // `pinCarBlocksToIpfs`. The fixtures here pre-populate real CARs into
@@ -168,6 +173,7 @@ vi.mock('../../../profile/ipfs-client', async () => {
   // and the mock `pinCarBlocksToIpfs` echoes the expected root CID
   // back (matching the production contract for that helper).
   return {
+    ...actual,
     fetchFromIpfs: vi.fn(async (_gateways: string[], cid: string) => {
       const cached = carCache.get(cid);
       if (!cached) {
@@ -188,6 +194,7 @@ vi.mock('../../../profile/ipfs-client', async () => {
         expectedRootCid,
     ),
     verifyCidAccessible: vi.fn(async () => true),
+    // verifyCidMatchesBytes comes from `...actual` — real implementation.
     // Test-only setter so the test can pre-populate the fake gateway.
     __setBundleCar: (cid: string, bytes: Uint8Array) => {
       carCache.set(cid, bytes);
@@ -642,6 +649,73 @@ describe('parseProfileSnapshot — validation', () => {
     });
     await expect(parseProfileSnapshot(carBytes)).rejects.toThrow(
       /Duplicate entry key/,
+    );
+  });
+
+  /**
+   * Steelman regression: per-block CID-binding verification is NOT
+   * applied in `parseProfileSnapshot` because UXF bundle sub-blocks
+   * intrinsically carry CIDs computed from a different canonical form
+   * than their framed bytes (see `profile/profile-export.ts` module
+   * NOTE and `uxf/ipld.ts:elementToIpldBlock`). The snapshot root CID
+   * is still verified (envelope has no child CID refs, so its
+   * binding is unambiguous); a forged-root attack remains rejected.
+   * This test pins the root-verification posture against a
+   * substituted-roots CAR with a legitimate-looking sub-block.
+   */
+  it('rejects a CAR whose framed root does not match the root block content (root-binding)', async () => {
+    const { CarWriter } = await import('@ipld/car/writer');
+    const { encode } = await import('@ipld/dag-cbor');
+    const { CID } = await import('multiformats/cid');
+    const { sha256 } = await import('@noble/hashes/sha2.js');
+    const { create: createMultihash } = await import('multiformats/hashes/digest');
+
+    // Build a legitimate-looking root doc.
+    const realRoot = encode({
+      version: 2,
+      chainPubkey: TEST_CHAIN_PUBKEY_A,
+      network: 'testnet',
+      createdAt: Date.now(),
+      entries: [],
+      bundles: [],
+    });
+    const realRootCid = CID.createV1(0x71, createMultihash(0x12, sha256(realRoot)));
+
+    // Build a second, different root doc + its real CID.
+    const otherRoot = encode({
+      version: 2,
+      chainPubkey: TEST_CHAIN_PUBKEY_B,
+      network: 'testnet',
+      createdAt: Date.now() + 1,
+      entries: [],
+      bundles: [],
+    });
+    const otherRootCid = CID.createV1(0x71, createMultihash(0x12, sha256(otherRoot)));
+
+    // Forge: claim `realRootCid` is the root[0] of the CAR but actually
+    // include `otherRoot` bytes framed under `otherRootCid`. The parser
+    // looks up `realRootCid` in the block map, finds nothing, and
+    // throws "Root block missing from CAR." (or finds it via header
+    // mismatch). The exact diagnostic differs by CAR-writer behavior,
+    // but the import MUST fail.
+    const { writer, out } = CarWriter.create([realRootCid]);
+    const chunks: Uint8Array[] = [];
+    const collect = (async () => {
+      for await (const c of out) chunks.push(c);
+    })();
+    await writer.put({ cid: otherRootCid, bytes: otherRoot });
+    await writer.close();
+    await collect;
+    const total = chunks.reduce((a, c) => a + c.byteLength, 0);
+    const carBytes = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) {
+      carBytes.set(c, off);
+      off += c.byteLength;
+    }
+
+    await expect(parseProfileSnapshot(carBytes)).rejects.toThrow(
+      /Root block missing from CAR|root CID mismatch/,
     );
   });
 
