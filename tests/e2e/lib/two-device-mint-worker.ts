@@ -53,6 +53,15 @@ import { mintTestTokenToSelf } from './test-mint';
 export type MintWorkerInitConfig = {
   readonly label: string;
   readonly mnemonic?: string;
+  /**
+   * Profile flush debounce override. Tests pass a long debounce so
+   * all per-mint `save()` calls coalesce into one pendingData; the
+   * next `sync()` then drives ONE explicit `awaitNextFlush()` that
+   * publishes the merged state. Mirrors PR #201's pattern. NOTE:
+   * scaffolding parity alone does NOT make this test pass — see
+   * follow-up issues referenced in the parent PR.
+   */
+  readonly flushDebounceMs?: number;
 };
 
 export type MintWorkerRequest =
@@ -113,7 +122,11 @@ async function handleInit(
   const dirs = makeTempDirs(`two-dev-mint-${config.label}`);
   cleanupDir = dirs.base;
   await ensureTrustbase(dirs.dataDir);
-  const providers = makeProfileProviders(dirs);
+  const profileOptions =
+    config.flushDebounceMs !== undefined
+      ? { flushDebounceMs: config.flushDebounceMs }
+      : {};
+  const providers = makeProfileProviders(dirs, profileOptions);
 
   if (config.mnemonic) {
     log('init: importing existing mnemonic...');
@@ -143,7 +156,7 @@ async function handleInit(
     // Reimport with the no-op transport — same dirs, fresh providers
     // since the old ones had their connections torn down.
     log('init: reimporting with no-op transport to lock in noop...');
-    const reimportProviders = makeProfileProviders(dirs);
+    const reimportProviders = makeProfileProviders(dirs, profileOptions);
     sphere = await Sphere.import({
       storage: reimportProviders.storage,
       tokenStorage: reimportProviders.tokenStorage,
@@ -223,18 +236,27 @@ async function handleSync(requestId: string): Promise<void> {
 
   // Force any pending write-behind flushes to land durably BEFORE the
   // pointer-poll inside sync(). Without this, recent addToken() calls
-  // sit in the 2s debounce buffer and the actual IPFS pin +
+  // sit in the debounce buffer and the actual IPFS pin +
   // aggregator-pointer publish hasn't happened yet — so the pointer
   // poll returns the local cursor (no new CIDs) and convergence
   // never fires. awaitNextFlush is the public seam PaymentsModule's
   // own at-least-once gate uses for exactly this purpose.
+  //
+  // The 120 s budget accommodates the per-block dag/put pin path
+  // landed in PR #201 (issue #199): each CAR block is a separate
+  // HTTP round-trip against the gateway and a multi-mint CAR can
+  // contain ~10-20 blocks. The previous 60 s default was tight enough
+  // to deterministically time out under real-testnet gateway latency,
+  // which surfaced as the "awaitNextFlush: timeout awaiting serialized
+  // flush" log noise + the convergence failure called out in the
+  // issue #199 follow-up.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const providers = (sphere.payments as any).getTokenStorageProviders?.()
     ?? new Map<string, { awaitNextFlush?: (ms: number) => Promise<void> }>();
   for (const [pid, provider] of providers as Map<string, { awaitNextFlush?: (ms: number) => Promise<void> }>) {
     if (typeof provider.awaitNextFlush === 'function') {
       try {
-        await provider.awaitNextFlush(60_000);
+        await provider.awaitNextFlush(120_000);
       } catch (err) {
         log(`sync: awaitNextFlush on provider ${pid} failed (best-effort): ${
           err instanceof Error ? err.message : String(err)

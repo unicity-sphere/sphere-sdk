@@ -81,9 +81,19 @@ const CONVERGENCE_POLL_INTERVAL_MS = 5_000;
 // Per-IPC-call timeout buckets.
 const INIT_TIMEOUT_MS = 90_000;
 const MINT_TIMEOUT_MS = 60_000;
-const SYNC_TIMEOUT_MS = 90_000;
+// SYNC_TIMEOUT_MS must exceed the inner `awaitNextFlush(120_000)` so
+// the IPC wrapper doesn't fire before the flush completes. 180 s
+// gives 60 s headroom for sphere.payments.sync()'s pointer-poll
+// round-trip.
+const SYNC_TIMEOUT_MS = 180_000;
 const SHORT_TIMEOUT_MS = 15_000;
 const DESTROY_TIMEOUT_MS = 60_000;
+
+// Long flush debounce: 5 min. All per-mint `save()` calls coalesce
+// into ONE pendingData; the next `sync()` then drives ONE explicit
+// awaitNextFlush() to publish. Mirrors PR #201's pattern applied to
+// `profile-multi-device-sync`.
+const FLUSH_DEBOUNCE_MS = 300_000;
 
 // Test coin hex — distinct from real testnet coin IDs so faucet
 // balances on a shared wallet (if any) don't pollute the assertions.
@@ -296,7 +306,10 @@ describe.skipIf(SKIP_INFRA)('Two-Device Local-Mint Convergence E2E', () => {
       const workerA = new WorkerHandle('A');
       workers.push(workerA);
 
-      const initA = await workerInit(workerA, { label: 'A' });
+      const initA = await workerInit(workerA, {
+        label: 'A',
+        flushDebounceMs: FLUSH_DEBOUNCE_MS,
+      });
       console.log(`[A] initialized: ${initA.l1Address}`);
       const mnemonic = initA.mnemonic;
       expect(mnemonic).toBeTruthy();
@@ -306,7 +319,11 @@ describe.skipIf(SKIP_INFRA)('Two-Device Local-Mint Convergence E2E', () => {
       const workerB = new WorkerHandle('B');
       workers.push(workerB);
 
-      const initB = await workerInit(workerB, { label: 'B', mnemonic });
+      const initB = await workerInit(workerB, {
+        label: 'B',
+        mnemonic,
+        flushDebounceMs: FLUSH_DEBOUNCE_MS,
+      });
       console.log(`[B] initialized: ${initB.l1Address}`);
 
       // Sanity: both devices share identity.

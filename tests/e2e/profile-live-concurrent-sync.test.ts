@@ -360,12 +360,22 @@ describe.skipIf(SKIP_INFRA)('Profile Live Concurrent Sync E2E', () => {
       const nametag = `e2e-live1-${rand()}`;
       console.log(`\n[Test 1] Setting up A and B as forked workers @${nametag}...`);
 
-      const REQUEST_TIMEOUT_MS = 120_000;
+      // IPC budget for `workerSync` — must exceed the inner
+      // `awaitNextFlush(120_000)` plus the aggregator-pointer poll
+      // round-trip. 180 s gives 60 s headroom after the flush
+      // completes for sphere.payments.sync() to run.
+      const REQUEST_TIMEOUT_MS = 180_000;
       // Init covers wallet creation + identity binding publish + first
       // OrbitDB connect — slow, especially from cold-start. Allow the
       // full propagation budget so the test doesn't false-alarm on
       // transient testnet relay slowdowns.
       const INIT_TIMEOUT_MS = PROPAGATION_TIMEOUT_MS;
+
+      // Long flush debounce: 5 min. All per-receive `save()` calls
+      // coalesce into ONE pendingData; `handleSync`'s post-sync
+      // `awaitNextFlush` is the explicit publish trigger. Mirrors
+      // PR #201's pattern applied to `profile-multi-device-sync`.
+      const FLUSH_DEBOUNCE_MS = 300_000;
 
       // Fork A first — autoGenerate, real Nostr transport, registers
       // the nametag. A is the source of truth for the shared mnemonic.
@@ -374,7 +384,12 @@ describe.skipIf(SKIP_INFRA)('Profile Live Concurrent Sync E2E', () => {
       console.log('  A: spawning worker (real Nostr, autoGenerate)...');
       const aInit = await workerInit(
         workerA,
-        { label: 'A', nametag, useNoopTransport: false },
+        {
+          label: 'A',
+          nametag,
+          useNoopTransport: false,
+          flushDebounceMs: FLUSH_DEBOUNCE_MS,
+        },
         INIT_TIMEOUT_MS,
       );
       console.log(`  A: identity=${aInit.l1Address}`);
@@ -388,7 +403,12 @@ describe.skipIf(SKIP_INFRA)('Profile Live Concurrent Sync E2E', () => {
       console.log('  B: spawning worker (no-op transport, importing A\'s mnemonic)...');
       const bInit = await workerInit(
         workerB,
-        { label: 'B', mnemonic: aInit.mnemonic, useNoopTransport: true },
+        {
+          label: 'B',
+          mnemonic: aInit.mnemonic,
+          useNoopTransport: true,
+          flushDebounceMs: FLUSH_DEBOUNCE_MS,
+        },
         INIT_TIMEOUT_MS,
       );
       console.log(`  B: identity=${bInit.l1Address}`);

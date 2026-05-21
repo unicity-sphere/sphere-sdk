@@ -63,6 +63,18 @@ export type WorkerInitConfig = {
   readonly nametag?: string;
   /** When true, swap the real Nostr transport for a no-op stub. */
   readonly useNoopTransport: boolean;
+  /**
+   * Profile flush debounce override. Tests that need deterministic
+   * single-shot publishes pass a long debounce (e.g. 300_000) so all
+   * `save()` calls during a test phase coalesce into one pendingData;
+   * `handleSync()` then drives ONE explicit `awaitNextFlush()` to
+   * publish. Mirrors PR #201's pattern for `profile-multi-device-sync`.
+   * NOTE: scaffolding parity alone does NOT make this test pass — see
+   * the follow-up issues filed in the parent PR for the SDK-level
+   * defects (unconfirmed-token-flush regression, missing pointer-
+   * version walk-through, OrbitDB OpLog CBOR decode failures).
+   */
+  readonly flushDebounceMs?: number;
 };
 
 export type ParentRequest =
@@ -133,7 +145,12 @@ async function handleInit(
   const dirs = makeTempDirs(`profile-live1-${config.label}`);
   cleanupDir = dirs.base;
   await ensureTrustbase(dirs.dataDir);
-  const providers = makeProfileProviders(dirs);
+  const providers = makeProfileProviders(
+    dirs,
+    config.flushDebounceMs !== undefined
+      ? { flushDebounceMs: config.flushDebounceMs }
+      : {},
+  );
 
   if (config.mnemonic) {
     log('init: importing existing mnemonic with no-op transport=' +
@@ -206,7 +223,42 @@ async function handleReceive(requestId: string): Promise<void> {
 
 async function handleSync(requestId: string): Promise<void> {
   if (!sphere) throw new Error('sync: sphere not initialized');
-  const result = await sphere.payments.sync();
+
+  // Mirror PR #201's pattern: drive sphere.payments.sync() (which
+  // drains pending V5 finalizations) THEN call awaitNextFlush on
+  // every TokenStorageProvider that exposes it. The legacy flush
+  // path also drives the new lean-snapshot publish via
+  // `publishSnapshotIfWired` (flush-scheduler.ts), so awaitNextFlush
+  // is the single seam that publishes both the bundle CAR and the
+  // pointer.
+  //
+  // NOTE: with `flushDebounceMs: 300_000` the auto-flush is
+  // effectively disabled; the post-sync awaitNextFlush is the ONLY
+  // publish path. Under the SDK default 2 s debounce the auto-flush
+  // races aggregator-gateway propagation, which is the symptom
+  // called out in issue #199's follow-up.
+  //
+  // This scaffolding parity matches what PR #201 applied to
+  // `profile-multi-device-sync.test.ts`. It is NECESSARY but NOT
+  // SUFFICIENT to make the test pass — see the follow-up issues
+  // referenced in the parent PR.
+  const result = await sphere.payments.sync({ drainTimeoutMs: 60_000 });
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const providers = (sphere.payments as any).getTokenStorageProviders?.()
+    ?? new Map<string, { awaitNextFlush?: (ms: number) => Promise<void> }>();
+  for (const [pid, provider] of providers as Map<string, { awaitNextFlush?: (ms: number) => Promise<void> }>) {
+    if (typeof provider.awaitNextFlush === 'function') {
+      try {
+        await provider.awaitNextFlush(120_000);
+      } catch (err) {
+        log(`sync: awaitNextFlush on provider ${pid} failed (best-effort): ${
+          err instanceof Error ? err.message : String(err)
+        }`);
+      }
+    }
+  }
+
   send({
     type: 'sync_ok',
     requestId,
