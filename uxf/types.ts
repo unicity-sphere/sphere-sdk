@@ -71,7 +71,22 @@ export type UxfElementType =
   | 'predicate'
   | 'token-state'
   | 'token-coin-data'
-  | 'smt-path';
+  | 'smt-path'
+  // #202 — Pending authenticator element. Carries the sender-signed
+  // authenticator for a transaction that has been committed locally but
+  // whose inclusion proof has not yet been retrieved from the aggregator.
+  // This is the wallet-internal "submitted-but-not-proven" recovery state
+  // expressed in the canonical UXF DAG, replacing the ad-hoc
+  // `tx._wallet.authenticator` non-schema field that previously rode along
+  // outside the UXF type system (and was therefore silently dropped on
+  // deconstruct → assemble round-trip).
+  //
+  // Same content shape as `authenticator` (publicKey + signature +
+  // stateHash + algorithm); separate type tag because the semantic is
+  // different (pending vs. proven). On assemble, materializes as
+  // `tx._wallet = { authenticator: {...} }` so consumers retain the
+  // pre-#202 wallet-internal naming convention.
+  | 'pending-authenticator';
 
 /**
  * Steelman¹⁹: canonical UxfElementType string-literal constants.
@@ -90,10 +105,16 @@ export const ELEMENT_TYPE_PREDICATE = 'predicate' as const satisfies UxfElementT
 export const ELEMENT_TYPE_TOKEN_STATE = 'token-state' as const satisfies UxfElementType;
 export const ELEMENT_TYPE_TOKEN_COIN_DATA = 'token-coin-data' as const satisfies UxfElementType;
 export const ELEMENT_TYPE_SMT_PATH = 'smt-path' as const satisfies UxfElementType;
+export const ELEMENT_TYPE_PENDING_AUTHENTICATOR =
+  'pending-authenticator' as const satisfies UxfElementType;
 
 /**
  * Maps UxfElementType string tags to unsigned integer type IDs.
  * Values are taken from SPECIFICATION Section 2.1.
+ *
+ * 0x0b is intentionally absent — it was reserved in earlier drafts and is
+ * not currently allocated. 0x0e is the new (#202) pending-authenticator
+ * type, allocated to the next free slot after smt-path (0x0d).
  */
 export const ELEMENT_TYPE_IDS: Readonly<Record<UxfElementType, number>> = {
   'token-root': 0x01,
@@ -108,6 +129,7 @@ export const ELEMENT_TYPE_IDS: Readonly<Record<UxfElementType, number>> = {
   'unicity-certificate': 0x0a,
   'token-coin-data': 0x0c,
   'smt-path': 0x0d,
+  'pending-authenticator': 0x0e,
 };
 
 // ---------------------------------------------------------------------------
@@ -164,9 +186,17 @@ export interface TokenRootChildren {
 export type GenesisContent = Record<string, never>;
 
 export interface GenesisChildren {
-  readonly data: ContentHash;              // -> genesis-data
-  readonly inclusionProof: ContentHash;    // -> inclusion-proof
-  readonly destinationState: ContentHash;  // -> token-state (post-genesis state)
+  readonly data: ContentHash;                       // -> genesis-data
+  // #202 — `inclusionProof` is nullable to express V5-pending tokens at
+  // the RECEIVED stage (mint commitment created but not yet submitted /
+  // proven). Pre-#202 this was non-nullable, implicitly requiring every
+  // UXF-expressible token to have a proven genesis. The SDK protocol
+  // permits genesis-pending tokens (the SDK token type itself can carry
+  // an unproven genesis); UXF was the only layer enforcing the
+  // "must be proven" constraint, blocking cross-device sync of pending
+  // tokens through the bundle CAR.
+  readonly inclusionProof: ContentHash | null;     // -> inclusion-proof (null when mint is unproven)
+  readonly destinationState: ContentHash;          // -> token-state (post-genesis state)
 }
 
 // ---- Genesis Data ----
@@ -199,6 +229,20 @@ export interface TransactionChildren {
   readonly data: ContentHash | null;             // -> transaction-data (null if uncommitted)
   readonly inclusionProof: ContentHash | null;   // -> inclusion-proof (null if uncommitted)
   readonly destinationState: ContentHash;        // -> token-state (state after transition)
+  // #202 — Optional pending authenticator. Carries the (sender-signed)
+  // authenticator for a transaction whose commitment was submitted but
+  // whose inclusion proof has not yet landed. When `inclusionProof` is
+  // null AND `pendingAuthenticator` is set, the transaction is in the
+  // "submitted, awaiting proof" state and the receiver can re-submit the
+  // commitment idempotently. On assemble, materializes as
+  // `tx._wallet = { authenticator: {...} }` to preserve the legacy
+  // wallet-internal naming convention introduced by saveCommitmentOnlyToken
+  // (V6-direct, commit ff3ee2e).
+  //
+  // Absence (undefined) means "no pending authenticator stored"; this is
+  // the legacy `tx.inclusionProof: null && tx.data: null` "uncommitted"
+  // shape (no submission has happened yet). Both shapes co-exist.
+  readonly pendingAuthenticator?: ContentHash | null;
 }
 
 // ---- Transaction Data ----
@@ -232,6 +276,18 @@ export interface AuthenticatorContent {
   readonly signature: string;
   readonly stateHash: string;
 }
+// No children -- leaf node.
+
+// ---- Pending Authenticator (#202) ----
+
+/**
+ * Pending authenticator -- same wire shape as `AuthenticatorContent` but a
+ * distinct element type to carry "submitted but not yet proven" recovery
+ * state. See the `pending-authenticator` doc on `UxfElementType` above for
+ * the architectural rationale (replaces ad-hoc `tx._wallet.authenticator`
+ * non-schema field).
+ */
+export type PendingAuthenticatorContent = AuthenticatorContent;
 // No children -- leaf node.
 
 // ---- SMT Path ----

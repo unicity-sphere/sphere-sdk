@@ -6157,6 +6157,46 @@ export class PaymentsModule {
    *
    * @param deferPersistence - If true, skip addToken/save calls (caller batches them).
    *   The token is still added to the in-memory map for dedup; caller must call save().
+   *
+   * #202 — V5-pending TXF/UXF expressibility.
+   *
+   * Pre-#202 this saved `sdkData = '{"_pendingFinalization":...}'` — an
+   * opaque wrapper with no `genesis` or `state`. Both serialization
+   * layers then dropped/rejected it:
+   *
+   *   - `serialization/txf-serializer.ts:tokenToTxf` returned null, so
+   *     `buildTxfStorageData` silently dropped the token.
+   *   - `profile/profile-token-storage/flush-scheduler.ts` calls
+   *     `UxfPackage.ingestAll` which calls `deconstructToken` whose
+   *     `validateToken` (pre-#202) threw `INVALID_PACKAGE` on
+   *     `_pendingFinalization`.
+   *
+   * Net effect: A's bundle CAR contained zero tokens after `receive()`;
+   * cross-device profile sync (Device B reading A's CAR) saw an empty
+   * inventory. Reported in #202.
+   *
+   * Fix: synthesize a UXF/TXF-valid sdkData mirroring what
+   * `finalizeFromV5Bundle()` produces post-finalization, but with
+   * `inclusionProof: null` on BOTH the genesis (mint not yet proven) and
+   * the synthetic transfer transaction (transfer commitment not yet
+   * proven). The sender-signed transfer authenticator rides as
+   * `transactions[0]._wallet.authenticator` — preserved across UXF
+   * deconstruct → assemble round-trip via the new `pending-authenticator`
+   * element type (#202 schema extension).
+   *
+   * The `_pendingFinalization` marker is kept at the top level for
+   * backward-compat with single-device KV restore (`PENDING_V5_TOKENS`)
+   * and with `hasFinalizationPlan()` / `parsePendingFinalization()`.
+   * It's a wallet-internal top-level field — UXF deconstruct drops it on
+   * round-trip (UXF only preserves canonical typed elements). The
+   * structural shape (null proofs + `_wallet.authenticator`) carries
+   * enough for `resolveV5Token` to operate without the marker if it ever
+   * needs to (future PR-B will refactor `resolveV5Token` to read from
+   * the token shape directly).
+   *
+   * If parsing fails for any reason (malformed bundle), falls back to
+   * the legacy opaque shape so the token is still recoverable via the
+   * KV path — pre-#202 single-device behavior preserved on bad input.
    */
   private async saveUnconfirmedV5Token(
     bundle: InstantSplitBundleV5,
@@ -6179,6 +6219,74 @@ export class PaymentsModule {
       attemptCount: 0,
     };
 
+    // #202 — Build a UXF/TXF-valid synthetic sdkData. See doc-comment.
+    // On any parse failure, fall back to the legacy opaque
+    // `{_pendingFinalization: ...}` shape (single-device KV path still
+    // recovers the token; bundle CAR omits it as pre-#202).
+    const sdkDataJson = (() => {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const mintDataJson = JSON.parse(bundle.recipientMintData) as Record<string, any>;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const transferCommitmentJson = JSON.parse(bundle.transferCommitment) as Record<string, any>;
+        const mintedTokenState = JSON.parse(bundle.mintedTokenStateJson);
+
+        const transferTxData =
+          transferCommitmentJson.transactionData !== undefined
+            ? transferCommitmentJson.transactionData
+            : transferCommitmentJson.data ?? null;
+
+        // Sender-signed authenticator over the transfer commitment.
+        // Carried inside `_wallet.authenticator` so it survives UXF
+        // round-trip via the new `pending-authenticator` element type.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const transferAuth: any = transferCommitmentJson.authenticator;
+
+        // The transfer commitment's authenticator signs over
+        // (transactionHash, sourceStateHash). The `stateHash` field IS
+        // the source state hash (= hash of `mintedTokenStateJson`).
+        // Carry it as `_integrity.currentStateHash` so the wallet's
+        // (tokenId, stateHash) dedup index produces stable identities
+        // across save/load round-trips for V5-pending tokens.
+        const currentStateHash: string | undefined =
+          transferAuth && typeof transferAuth === 'object' && typeof transferAuth.stateHash === 'string'
+            ? transferAuth.stateHash
+            : undefined;
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const syntheticPendingTx: Record<string, any> = {
+          data: transferTxData,
+          inclusionProof: null,
+        };
+        if (transferAuth && typeof transferAuth === 'object') {
+          syntheticPendingTx._wallet = { authenticator: transferAuth };
+        }
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const syntheticTxf: Record<string, any> = {
+          version: '2.0',
+          state: mintedTokenState,
+          genesis: {
+            data: mintDataJson,
+            inclusionProof: null,
+          },
+          transactions: transferTxData !== null ? [syntheticPendingTx] : [],
+          nametags: [],
+          _pendingFinalization: pendingData,
+        };
+        if (currentStateHash) {
+          syntheticTxf._integrity = { currentStateHash };
+        }
+        return JSON.stringify(syntheticTxf);
+      } catch (err) {
+        logger.warn(
+          'Payments',
+          `saveUnconfirmedV5Token: failed to synthesize UXF-compatible shape for bundle ${bundle.splitGroupId.slice(0, 12)}, falling back to legacy opaque shape — token will be omitted from bundle CAR but recoverable via PENDING_V5_TOKENS KV: ${(err as Error)?.message ?? err}`,
+        );
+        return JSON.stringify({ _pendingFinalization: pendingData });
+      }
+    })();
+
     const uiToken: Token = {
       id: deterministicId,
       coinId: bundle.coinId,
@@ -6189,7 +6297,7 @@ export class PaymentsModule {
       status: 'submitted',  // UNCONFIRMED
       createdAt: Date.now(),
       updatedAt: Date.now(),
-      sdkData: JSON.stringify({ _pendingFinalization: pendingData }),
+      sdkData: sdkDataJson,
     };
 
     // Record splitGroupId for persistent dedup across page reloads

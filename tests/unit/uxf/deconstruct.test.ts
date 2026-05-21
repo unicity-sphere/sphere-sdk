@@ -278,12 +278,22 @@ describe('deconstructToken', () => {
       }
     });
 
-    it('pendingFinalization rejected with INVALID_PACKAGE', () => {
+    // #202 — `_pendingFinalization` is no longer rejected by the validator.
+    // The legacy `EDGE_PENDING_FINALIZATION` fixture is just a `{_pendingFinalization: ...}`
+    // wrapper with NO genesis at all, so it's now rejected for a different
+    // reason (the genesis-required check) — the failure mode shifts but the
+    // error code stays `INVALID_PACKAGE`. A separate positive test below
+    // covers the new "pending token with full structural shape" acceptance.
+    it('pendingFinalization stub WITHOUT genesis still rejected (no genesis)', () => {
       expect(() => deconstructToken(pool, EDGE_PENDING_FINALIZATION)).toThrow(UxfError);
       try {
         deconstructToken(pool, EDGE_PENDING_FINALIZATION);
       } catch (e) {
-        expect((e as UxfError).code).toBe('INVALID_PACKAGE');
+        const err = e as UxfError;
+        expect(err.code).toBe('INVALID_PACKAGE');
+        // Confirm the rejection is now from the "missing genesis" path,
+        // NOT the (removed) "_pendingFinalization" path.
+        expect(err.message).toContain('genesis');
       }
     });
 
@@ -304,6 +314,47 @@ describe('deconstructToken', () => {
       const txEl = pool.get(rootChildren.transactions[0])!;
       const txChildren = txEl.children as unknown as TransactionChildren;
       expect(txChildren.inclusionProof).toBeNull();
+    });
+
+    // #202 — Pending genesis (mint commitment not yet submitted / proven).
+    // Symmetric with the existing "null inclusionProof on transaction" case
+    // above. Pre-#202 this threw TypeError inside deconstructInclusionProof
+    // because deconstructGenesis passed null through unconditionally.
+    it('#202 — null genesis.inclusionProof produces a genesis element with null inclusionProof child', () => {
+      const pendingGenesisToken = {
+        version: '2.0',
+        state: {
+          predicate: 'aa00000000000000000000000000000000000000000000000000000000000001',
+          data: null,
+        },
+        genesis: {
+          data: {
+            tokenId: 'bb00000000000000000000000000000000000000000000000000000000000002',
+            tokenType:
+              '0000000000000000000000000000000000000000000000000000000000000001',
+            coinData: [['UCT', '1000000']],
+            tokenData: '',
+            salt: 'bb000000000000000000000000000000000000000000000000000000005a1602',
+            recipient: 'DIRECT://alice-pending-01',
+            recipientDataHash: null,
+            reason: null,
+          },
+          inclusionProof: null, // mint unproven
+        },
+        transactions: [],
+        nametags: [],
+      };
+
+      const rootHash = deconstructToken(pool, pendingGenesisToken);
+      const rootEl = pool.get(rootHash)!;
+      const rootChildren = rootEl.children as unknown as TokenRootChildren;
+      const genesisEl = pool.get(rootChildren.genesis)!;
+      const genesisChildren =
+        genesisEl.children as unknown as { data: string; inclusionProof: string | null };
+      expect(genesisChildren.inclusionProof).toBeNull();
+      // The genesis data should still be present and addressable.
+      expect(genesisChildren.data).toBeDefined();
+      expect(typeof genesisChildren.data).toBe('string');
     });
   });
 });

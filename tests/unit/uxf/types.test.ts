@@ -97,8 +97,9 @@ describe('contentHash', () => {
 // =============================================================================
 
 describe('ELEMENT_TYPE_IDS', () => {
-  it('has exactly 12 entries', () => {
-    expect(Object.keys(ELEMENT_TYPE_IDS)).toHaveLength(12);
+  // 13 = 12 pre-#202 element types + `pending-authenticator` (0x0e).
+  it('has exactly 13 entries', () => {
+    expect(Object.keys(ELEMENT_TYPE_IDS)).toHaveLength(13);
   });
 
   it('maps token-root to 0x01', () => {
@@ -149,10 +150,15 @@ describe('ELEMENT_TYPE_IDS', () => {
     expect(ELEMENT_TYPE_IDS['smt-path']).toBe(0x0d);
   });
 
+  // #202 — pending-authenticator wire type tag.
+  it('maps pending-authenticator to 0x0e', () => {
+    expect(ELEMENT_TYPE_IDS['pending-authenticator']).toBe(0x0e);
+  });
+
   it('all type IDs are unique', () => {
     const values = Object.values(ELEMENT_TYPE_IDS);
     const uniqueValues = new Set(values);
-    expect(uniqueValues.size).toBe(12);
+    expect(uniqueValues.size).toBe(13);
   });
 });
 
