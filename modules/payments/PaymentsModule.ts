@@ -92,6 +92,7 @@ import {
   type InstantSenderDeps,
   type InstantSourceSelection,
 } from './transfer/instant-sender';
+import type { PublishToIpfsCallback } from './transfer/delivery-resolver';
 import {
   sendTxfUxf,
   type TxfCommitResult,
@@ -1378,6 +1379,21 @@ export interface PaymentsModuleDependencies {
    * but unbounded growth for heavy users. See PROFILE-CID-REFERENCES.md.
    */
   cidRefStore?: CidRefStore;
+  /**
+   * Optional UXF bundle-CAR publisher for the `uxf-cid` delivery branch
+   * (Issue #200 Phase 1 wiring). When absent, CID-bound delivery falls
+   * back to inline delivery (`auto` under cap) or rejects with
+   * `IPFS_PUBLISHER_MISSING` (`force-cid`, over-cap auto).
+   *
+   * MUST satisfy the CID-correspondence contract: returned `cid` equals
+   * `extractCarRootCid(carBytes)`. Use `createUxfCarPublisher` from
+   * `./transfer/ipfs-publisher.ts` — that's the only contract-compliant
+   * publisher. Do NOT roll your own with `pinToIpfs(carBytes)` — that
+   * pins the entire CAR envelope as a single raw block under a CID
+   * different from the wire's `bundleCid`, making recipient
+   * gateway-fetch 404.
+   */
+  publishToIpfs?: PublishToIpfsCallback;
 }
 
 // =============================================================================
@@ -11425,17 +11441,16 @@ export class PaymentsModule {
       identity: this.deps!.identity,
       senderTransportPubkey: this.deps!.identity.chainPubkey,
       emit: (type, data) => this.deps!.emitEvent(type, data),
-      // T.2.D.1 keeps publishToIpfs unwired; CID-bound delivery is
-      // T.4.A's responsibility. Tests inject a real publisher.
-      //
-      // Issue #200 Phase 1: when this wires up for production, use
-      // `createUxfCarPublisher` from
-      // `modules/payments/transfer/ipfs-publisher.ts`. Do NOT roll your
-      // own with `pinToIpfs(carBytes)` — that pins the entire CAR
-      // envelope as a single raw block under a different CID than the
-      // wire's `bundleCid` (dag-cbor root CID), making the recipient's
-      // gateway fetch 404. See `ipfs-publisher.ts` JSDoc for the
-      // CID-correspondence contract.
+      // Issue #200 Phase 1 wiring: when the host injected a
+      // `publishToIpfs` callback into `PaymentsModuleDependencies`,
+      // pass it through to the conservative sender so CID-bound
+      // delivery branches (`force-cid`, over-cap `auto`) actually pin.
+      // When absent, the sender falls back to inline delivery or
+      // throws `IPFS_PUBLISHER_REQUIRED` per the resolver contract.
+      // The callback MUST be obtained from `createUxfCarPublisher`
+      // (see `./transfer/ipfs-publisher.ts`) — any other publisher
+      // breaks the CID-correspondence contract.
+      publishToIpfs: this.deps!.publishToIpfs,
       availableSources: () => Array.from(this.tokens.values()),
       transferId,
       selectSources: async ({ request: req }) => {
@@ -12270,14 +12285,14 @@ export class PaymentsModule {
       addressId,
       senderTransportPubkey: this.deps!.identity.chainPubkey,
       emit: (type, data) => this.deps!.emitEvent(type, data),
-      // Issue #200 Phase 1: publishToIpfs is intentionally unwired in
-      // production today; CID-bound delivery (T.4.A) is not yet enabled.
-      // When this is wired, MUST use `createUxfCarPublisher` from
-      // `modules/payments/transfer/ipfs-publisher.ts`. Do NOT roll your
-      // own with `pinToIpfs(carBytes)` — that returns a raw-CID over the
-      // CAR envelope while the wire's `bundleCid` is the dag-cbor root
-      // CID, so the recipient's gateway fetch 404s. See
-      // `ipfs-publisher.ts` JSDoc for the CID-correspondence contract.
+      // Issue #200 Phase 1 wiring: when the host injected a
+      // `publishToIpfs` callback into `PaymentsModuleDependencies`,
+      // pass it through to the instant sender so CID-bound delivery
+      // branches actually pin. Absent → inline fallback (under cap) or
+      // `IPFS_PUBLISHER_REQUIRED` throw (force-cid / over-cap auto).
+      // MUST come from `createUxfCarPublisher` (see
+      // `./transfer/ipfs-publisher.ts`).
+      publishToIpfs: this.deps!.publishToIpfs,
       availableSources: () => Array.from(this.tokens.values()),
       transferId,
       selectSources: async ({ request: req }) => {

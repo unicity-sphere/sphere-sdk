@@ -64,6 +64,7 @@ import type { OracleProvider } from '../oracle';
 import type { PriceProvider } from '../price';
 import { PaymentsModule, createPaymentsModule } from '../modules/payments';
 import type { SyncOptions, SyncResult } from '../modules/payments';
+import type { PublishToIpfsCallback } from '../modules/payments/transfer/delivery-resolver';
 import { CommunicationsModule, createCommunicationsModule } from '../modules/communications';
 import type { CommunicationsModuleConfig } from '../modules/communications';
 import { GroupChatModule, createGroupChatModule } from '../modules/groupchat';
@@ -217,6 +218,16 @@ export interface SphereCreateOptions {
   debug?: boolean;
   /** Optional callback to report initialization progress steps */
   onProgress?: InitProgressCallback;
+  /**
+   * Optional UXF bundle-CAR publisher for the `uxf-cid` delivery branch
+   * (Issue #200 Phase 1 wiring). When omitted, CID-bound delivery falls
+   * back to inline (under cap) or throws `IPFS_PUBLISHER_REQUIRED`
+   * (force-cid, over-cap auto). The provider factories
+   * (`createBrowserProviders` / `createNodeProviders`) construct this
+   * with `createUxfCarPublisher(gateways)` from `tokenSync.ipfs` and
+   * expose it on their returned object — propagate it here.
+   */
+  publishToIpfs?: PublishToIpfsCallback;
 }
 
 /** Options for loading existing wallet */
@@ -262,6 +273,11 @@ export interface SphereLoadOptions {
   debug?: boolean;
   /** Optional callback to report initialization progress steps */
   onProgress?: InitProgressCallback;
+  /**
+   * Optional UXF bundle-CAR publisher for the `uxf-cid` delivery branch
+   * (Issue #200 Phase 1 wiring). See {@link SphereCreateOptions.publishToIpfs}.
+   */
+  publishToIpfs?: PublishToIpfsCallback;
 }
 
 /** Options for importing a wallet */
@@ -315,6 +331,11 @@ export interface SphereImportOptions {
   debug?: boolean;
   /** Optional callback to report initialization progress steps */
   onProgress?: InitProgressCallback;
+  /**
+   * Optional UXF bundle-CAR publisher for the `uxf-cid` delivery branch
+   * (Issue #200 Phase 1 wiring). See {@link SphereCreateOptions.publishToIpfs}.
+   */
+  publishToIpfs?: PublishToIpfsCallback;
 }
 
 /** L1 (ALPHA blockchain) configuration */
@@ -390,6 +411,11 @@ export interface SphereInitOptions {
   debug?: boolean;
   /** Optional callback to report initialization progress steps */
   onProgress?: InitProgressCallback;
+  /**
+   * Optional UXF bundle-CAR publisher for the `uxf-cid` delivery branch
+   * (Issue #200 Phase 1 wiring). See {@link SphereCreateOptions.publishToIpfs}.
+   */
+  publishToIpfs?: PublishToIpfsCallback;
 }
 
 /** Result of init operation */
@@ -555,6 +581,21 @@ export class Sphere {
   private _transport: TransportProvider;
   private _oracle: OracleProvider;
   private _priceProvider: PriceProvider | null;
+  /**
+   * Optional UXF bundle-CAR publisher for the `uxf-cid` delivery branch
+   * (Issue #200 Phase 1 wiring). Forwarded into every PaymentsModule
+   * instance — including those created per-address by
+   * `initializeAddressModules` — so CID-bound delivery branches actually
+   * pin. When null, CID-bound delivery falls back to inline (under cap)
+   * or throws `IPFS_PUBLISHER_REQUIRED` (force-cid, over-cap auto).
+   *
+   * Set by the caller via `SphereCreateOptions.publishToIpfs` /
+   * `SphereLoadOptions.publishToIpfs` / `SphereInitOptions.publishToIpfs`
+   * / `SphereImportOptions.publishToIpfs`. The provider factories
+   * (`createBrowserProviders`, `createNodeProviders`) build this with
+   * `createUxfCarPublisher(gateways)` when `tokenSync.ipfs` is configured.
+   */
+  private _publishToIpfs: PublishToIpfsCallback | null = null;
 
   // Modules (single-instance — backward compat, delegates to active address)
   private _payments: PaymentsModule;
@@ -720,6 +761,7 @@ export class Sphere {
         password: options.password,
         discoverAddresses: options.discoverAddresses,
         onProgress: options.onProgress,
+        publishToIpfs: options.publishToIpfs,
       });
       // Store dmSince for forwarding to transport/mux when subscriptions are set up
       if (options.dmSince != null) {
@@ -796,6 +838,7 @@ export class Sphere {
       password: options.password,
       discoverAddresses: options.discoverAddresses,
       onProgress: options.onProgress,
+      publishToIpfs: options.publishToIpfs,
     });
 
     if (options.dmSince != null) {
@@ -933,6 +976,10 @@ export class Sphere {
       options.communications,
     );
     sphere._password = options.password ?? null;
+    // Issue #200 Phase 1 wiring — capture optional UXF CAR publisher
+    // before `initializeModules()` runs (which threads it into the
+    // primary PaymentsModule).
+    sphere._publishToIpfs = options.publishToIpfs ?? null;
 
     // Store mnemonic (encrypted if password provided, plaintext otherwise)
     progress?.({ step: 'storing_keys', message: 'Storing wallet keys...' });
@@ -1031,6 +1078,9 @@ export class Sphere {
       options.communications,
     );
     sphere._password = options.password ?? null;
+    // Issue #200 Phase 1 wiring — capture optional UXF CAR publisher
+    // before `initializeModules()` threads it into PaymentsModule.
+    sphere._publishToIpfs = options.publishToIpfs ?? null;
 
     // exists() restores original (disconnected) state — reconnect for reads
     if (!options.storage.isConnected()) {
@@ -1146,6 +1196,9 @@ export class Sphere {
       options.communications,
     );
     sphere._password = options.password ?? null;
+    // Issue #200 Phase 1 wiring — capture optional UXF CAR publisher
+    // before `initializeModules()` threads it into PaymentsModule.
+    sphere._publishToIpfs = options.publishToIpfs ?? null;
 
     progress?.({ step: 'storing_keys', message: 'Storing wallet keys...' });
 
@@ -2441,6 +2494,9 @@ export class Sphere {
           emitEvent: this.emitEvent.bind(this),
           chainCode: this._masterKey?.chainCode || undefined,
           price: this._priceProvider ?? undefined,
+          // Issue #200 Phase 1 wiring — keep CID-by-reference publisher
+          // wired across nametag-driven re-initialization.
+          publishToIpfs: this._publishToIpfs ?? undefined,
         });
       }
     }
@@ -2639,6 +2695,10 @@ export class Sphere {
       emitEvent,
       chainCode: this._masterKey?.chainCode || undefined,
       price: this._priceProvider ?? undefined,
+      // Issue #200 Phase 1 wiring — forward canonical UXF CAR publisher
+      // to every per-address PaymentsModule (one closure shared across
+      // all addresses; the publisher is identity-independent).
+      publishToIpfs: this._publishToIpfs ?? undefined,
     });
 
     communications.initialize({
@@ -5009,6 +5069,11 @@ export class Sphere {
       chainCode: this._masterKey?.chainCode || undefined,
       price: this._priceProvider ?? undefined,
       disabledProviderIds: this._disabledProviders,
+      // Issue #200 Phase 1 wiring — forward the canonical UXF CAR
+      // publisher (built by the providers factory from the wallet's
+      // IPFS gateway list). Absent → CID delivery falls back to inline
+      // (under cap) or rejects (over cap / force-cid).
+      publishToIpfs: this._publishToIpfs ?? undefined,
     });
 
     this._communications.initialize({

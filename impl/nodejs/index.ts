@@ -39,6 +39,9 @@ import type { NetworkType } from '../../constants';
 import type { GroupChatModuleConfig } from '../../modules/groupchat';
 import type { MarketModuleConfig } from '../../modules/market';
 import type { IpfsStorageConfig } from '../shared/ipfs';
+import { createUxfCarPublisher } from '../../modules/payments/transfer/ipfs-publisher';
+import type { PublishToIpfsCallback } from '../../modules/payments/transfer/delivery-resolver';
+import { DEFAULT_IPFS_GATEWAYS } from '../../constants';
 import {
   type BaseTransportConfig,
   type BaseOracleConfig,
@@ -141,6 +144,14 @@ export interface NodeProviders {
   price?: PriceProvider;
   /** IPFS token storage provider (when tokenSync.ipfs.enabled is true) */
   ipfsTokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
+  /**
+   * UXF bundle-CAR publisher for the `uxf-cid` Nostr delivery branch
+   * (Issue #200 Phase 1 wiring). Built from the same IPFS gateway list
+   * used by `ipfsTokenStorage` when `tokenSync.ipfs.enabled` is true.
+   * Forward to `Sphere.init({...providers})` to enable production
+   * CID-by-reference token delivery.
+   */
+  publishToIpfs?: PublishToIpfsCallback;
   /** Group chat config (resolved, for passing to Sphere.init) */
   groupChat?: GroupChatModuleConfig | boolean;
   /** Market module config (resolved, for passing to Sphere.init) */
@@ -262,6 +273,17 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
     ? createNodeIpfsStorageProvider(ipfsSync.config, storage)
     : undefined;
 
+  // Issue #200 Phase 1 wiring — build the canonical UXF CAR publisher
+  // from the same gateway list when IPFS sync is enabled. The Node
+  // IpfsStorageConfig only exposes a `gateways` field on the inner
+  // `config` block; fall back to DEFAULT_IPFS_GATEWAYS (which already
+  // honors the SPHERE_IPFS_GATEWAY env override) when unset.
+  const publishToIpfs: PublishToIpfsCallback | undefined = ipfsSync?.enabled
+    ? createUxfCarPublisher(
+        ipfsSync.config?.gateways ?? [...DEFAULT_IPFS_GATEWAYS],
+      )
+    : undefined;
+
   // Resolve group chat config
   const groupChat = resolveGroupChatConfig(network, config?.groupChat);
 
@@ -298,5 +320,6 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
     l1: l1Config,
     price: priceConfig ? createPriceProvider(priceConfig) : undefined,
     ipfsTokenStorage,
+    publishToIpfs,
   };
 }
