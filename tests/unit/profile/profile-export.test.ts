@@ -1206,4 +1206,173 @@ describe('exportProfile — hierarchical CAR dedup (Issue #200 Phase 5)', () => 
     expect(noBundleResult.uniqueBundleBlocks).toBe(0);
     expect(noBundleResult.bundlesEmbedded).toBe(0);
   });
+
+  /**
+   * Round-trip legacy raw-codec bundle.
+   *
+   * Pre-Phase-2 wallets pinned bundles as a single raw block keyed by
+   * `sha256(bundleCarBytes)` (codec 0x55). When such a wallet exports
+   * a snapshot today, the export path must:
+   *   - fetch the bundle via `fetchCarFromIpfs` (short-circuits raw
+   *     roots to a single `block/get`),
+   *   - re-verify the raw CID matches the returned bytes,
+   *   - embed the raw block under its original CID in the snapshot.
+   *
+   * The import path then reconstructs a single-block CAR for the raw
+   * bundle and pins it via `pinCarBlocksToIpfs` (which accepts raw
+   * codecs as expectedRootCid).
+   */
+  it('round-trips a legacy raw-codec bundle through export → import', async () => {
+    const ipfs = await import('../../../profile/ipfs-client');
+    const setCar = (ipfs as unknown as {
+      __setBundleCar: (cid: string, bytes: Uint8Array) => void;
+      __clearBundleCars: () => void;
+    });
+    setCar.__clearBundleCars();
+
+    const { CID } = await import('multiformats/cid');
+    const { sha256 } = await import('@noble/hashes/sha2.js');
+    const { create: createMultihash } = await import('multiformats/hashes/digest');
+
+    // Build a real bundle CAR (dag-cbor envelope etc.), then pin it
+    // under its legacy RAW CID (= sha256(carBytes) with codec 0x55).
+    const innerCarBytes = await UxfPackage.create({ description: 'legacy-raw' }).toCar();
+    const rawCid = CID.createV1(0x55, createMultihash(0x12, sha256(innerCarBytes))).toString();
+
+    // The mock `fetchCarFromIpfs` short-circuits raw codecs by
+    // returning the bytes as-is — we register the raw CID with the
+    // CAR bytes as the gateway-returned content.
+    setCar.__setBundleCar(rawCid, innerCarBytes);
+
+    const storage = new InMemoryStorageProvider();
+    await storage.connect();
+    await storage.set('mnemonic', 'enc:legacy');
+
+    const tokenStorage = new FakeTokenStorage();
+    tokenStorage.bundleIndex.set(rawCid, {
+      cid: rawCid,
+      status: 'active',
+      createdAt: 1_500,
+    });
+
+    const result = await exportProfile({
+      storage,
+      tokenStorage: tokenStorage as unknown as ProfileTokenStorageProvider,
+      chainPubkey: TEST_CHAIN_PUBKEY_C,
+      network: 'testnet',
+    });
+
+    expect(result.bundlesEmbedded).toBe(1);
+    expect(result.bundlesMissing).toBe(0);
+    // The legacy bundle adds exactly one block (the raw blob itself)
+    // to the union — there is no DAG to walk.
+    expect(result.uniqueBundleBlocks).toBe(1);
+
+    const parsed = await parseProfileSnapshot(result.carBytes);
+    expect(parsed.snapshot.bundles).toHaveLength(1);
+    expect(parsed.snapshot.bundles[0].cid).toBe(rawCid);
+    expect(parsed.bundleCars.has(rawCid)).toBe(true);
+    // The reconstructed "CAR" for a raw-codec bundle is a single-block
+    // CAR whose lone block is the raw bytes under the raw CID. It
+    // must be re-pinnable via pinCarBlocksToIpfs(carBytes, rawCid).
+    const reconstructed = parsed.bundleCars.get(rawCid)!;
+    expect(reconstructed.byteLength).toBeGreaterThan(0);
+
+    // Drive the importer end-to-end against a fresh destination — the
+    // raw-codec bundle ref must land in the destination's bundle
+    // index and `pinCarBlocksToIpfs` must succeed under the raw CID.
+    const destStorage = new InMemoryStorageProvider();
+    await destStorage.connect();
+    const destTokenStorage = new FakeTokenStorage();
+    await importProfile({
+      storage: destStorage,
+      tokenStorage: destTokenStorage as unknown as ProfileTokenStorageProvider,
+      snapshot: parsed.snapshot,
+      bundleCars: parsed.bundleCars,
+      expectedChainPubkey: TEST_CHAIN_PUBKEY_C,
+    });
+    expect(destTokenStorage.bundleIndex.get(rawCid)).toMatchObject({
+      cid: rawCid,
+      status: 'active',
+    });
+  });
+
+  /**
+   * Phase 5 architectural payoff: re-importing a snapshot that shares
+   * bundles with an earlier snapshot is a no-op for the shared blocks.
+   * `pinCarBlocksToIpfs` is idempotent at the gateway because `dag/put`
+   * is keyed by content-address; the importer never re-fails on
+   * already-pinned CIDs.
+   *
+   * The mock IPFS layer is a no-op for `pinCarBlocksToIpfs`, so this
+   * test verifies the importer's contract (no crashes, refs in both
+   * destinations) rather than counting gateway calls — a real
+   * integration test against a live Kubo would count blocks and
+   * confirm zero new pins on the second import.
+   */
+  it('is idempotent under re-import: second pass succeeds with force=true', async () => {
+    const ipfs = await import('../../../profile/ipfs-client');
+    const setCar = (ipfs as unknown as {
+      __setBundleCar: (cid: string, bytes: Uint8Array) => void;
+      __clearBundleCars: () => void;
+    });
+    setCar.__clearBundleCars();
+
+    const storage = new InMemoryStorageProvider();
+    await storage.connect();
+    await storage.set('mnemonic', 'enc:rt');
+
+    const tokenStorage = new FakeTokenStorage();
+    const fixture = await buildSampleBundleCar('idempotent-bundle');
+    setCar.__setBundleCar(fixture.cid, fixture.carBytes);
+    tokenStorage.bundleIndex.set(fixture.cid, {
+      cid: fixture.cid,
+      status: 'active',
+      createdAt: 1_700_000_000,
+    });
+
+    const exportResult = await exportProfile({
+      storage,
+      tokenStorage: tokenStorage as unknown as ProfileTokenStorageProvider,
+      chainPubkey: TEST_CHAIN_PUBKEY_B,
+      network: 'testnet',
+    });
+    const parsed = await parseProfileSnapshot(exportResult.carBytes);
+
+    const destStorage = new InMemoryStorageProvider();
+    await destStorage.connect();
+    const destTokenStorage = new FakeTokenStorage();
+
+    // First import — destination is empty.
+    const firstResult = await importProfile({
+      storage: destStorage,
+      tokenStorage: destTokenStorage as unknown as ProfileTokenStorageProvider,
+      snapshot: parsed.snapshot,
+      bundleCars: parsed.bundleCars,
+      expectedChainPubkey: TEST_CHAIN_PUBKEY_B,
+    });
+    expect(firstResult.bundlesPinned).toBe(1);
+    expect(firstResult.bundleRefsRestored).toBe(1);
+    expect(firstResult.bundlesFailed).toBe(0);
+
+    // Second import — destination is now non-empty. Must `force` to
+    // bypass the clobber check.
+    const secondResult = await importProfile({
+      storage: destStorage,
+      tokenStorage: destTokenStorage as unknown as ProfileTokenStorageProvider,
+      snapshot: parsed.snapshot,
+      bundleCars: parsed.bundleCars,
+      expectedChainPubkey: TEST_CHAIN_PUBKEY_B,
+      force: true,
+    });
+    // Re-pin succeeded (block already in IPFS — idempotent at gateway).
+    expect(secondResult.bundlesPinned).toBe(1);
+    expect(secondResult.bundleRefsRestored).toBe(1);
+    expect(secondResult.bundlesFailed).toBe(0);
+    // Bundle ref still present and unchanged.
+    expect(destTokenStorage.bundleIndex.get(fixture.cid)).toMatchObject({
+      cid: fixture.cid,
+      status: 'active',
+    });
+  });
 });
