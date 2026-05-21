@@ -161,7 +161,16 @@ function createMockDb(): MockProfileDb {
 // Mock UxfPackage
 // ---------------------------------------------------------------------------
 
-vi.mock('../../../uxf/UxfPackage.js', () => {
+vi.mock('../../../uxf/UxfPackage.js', async () => {
+  // Issue #200 Phase 2: production now calls `extractCarRootCid` +
+  // `pinCarBlocksToIpfs` against `toCar()` output, so the mock must
+  // produce a real CAR (not raw JSON bytes). `makeFakeUxfCar` wraps
+  // the JSON-shaped test payload inside a single dag-cbor envelope
+  // block; `decodeFakeUxfCar` recovers the payload symmetrically.
+  const { makeFakeUxfCar, decodeFakeUxfCar } = await import(
+    './_helpers/fake-uxf-car.js'
+  );
+
   let ingestedTokens: unknown[] = [];
   let mergedPackages: Array<{ tokens: unknown[] }> = [];
 
@@ -185,7 +194,7 @@ vi.mock('../../../uxf/UxfPackage.js', () => {
       return result;
     },
     async toCar() {
-      return new TextEncoder().encode(JSON.stringify({ tokens: ingestedTokens }));
+      return makeFakeUxfCar({ tokens: ingestedTokens });
     },
     _tokens: ingestedTokens,
   };
@@ -216,14 +225,23 @@ vi.mock('../../../uxf/UxfPackage.js', () => {
           }
           return result;
         };
-        pkg.toCar = async () => {
-          return new TextEncoder().encode(JSON.stringify({ tokens: ingestedTokens }));
-        };
+        pkg.toCar = async () => makeFakeUxfCar({ tokens: ingestedTokens });
         return pkg;
       },
       async fromCar(carBytes: Uint8Array) {
-        const text = new TextDecoder().decode(carBytes);
-        const parsed = JSON.parse(text);
+        // Dual-shape decode: many tests in this file pre-build "CAR"
+        // bytes as raw JSON (legacy fixture shape) and pass them through
+        // `fetchFromIpfs` mocks. Try the new `makeFakeUxfCar` shape
+        // first; on parse failure fall back to raw JSON so legacy
+        // fixtures still resolve. Both shapes carry a `{ tokens }`
+        // payload at the top level.
+        let parsed: { tokens?: unknown[] };
+        try {
+          parsed = await decodeFakeUxfCar<{ tokens?: unknown[] }>(carBytes);
+        } catch {
+          const text = new TextDecoder().decode(carBytes);
+          parsed = JSON.parse(text) as { tokens?: unknown[] };
+        }
         return {
           _tokens: parsed.tokens ?? [],
           ingestAll(tokens: unknown[]) {
@@ -244,7 +262,7 @@ vi.mock('../../../uxf/UxfPackage.js', () => {
             return result;
           },
           async toCar() {
-            return new TextEncoder().encode(JSON.stringify({ tokens: this._tokens }));
+            return makeFakeUxfCar({ tokens: this._tokens });
           },
         };
       },
@@ -1283,23 +1301,35 @@ describe('ProfileTokenStorageProvider', () => {
 
   describe('encryption', () => {
     it('CAR files are pinned unencrypted (content-addressed dedup)', async () => {
-      let pinnedBytes: Uint8Array | null = null;
+      // Issue #200 Phase 2: switch to real timers — `pinCarBlocksToIpfs`
+      // chains more awaits (dynamic imports + per-block fetch) than the
+      // legacy `pinToIpfs` did, and the fake-timer + `advanceTimersByTime`
+      // path no longer drains the full async chain before assertions
+      // run. The sibling `addBundle writes encrypted ref` test uses the
+      // same pattern.
+      vi.useRealTimers();
+
+      // Capture every block put to IPFS. Post-migration the flush
+      // scheduler calls `pinCarBlocksToIpfs` which issues one
+      // `dag/put` per block in the CAR (envelope + per-token sub-blocks).
+      // Pre-migration there was a single `pinToIpfs(carBytes)` call
+      // that pinned the whole CAR as one raw block. To stay invariant
+      // to that change, this test asserts on the COLLECTION of pinned
+      // blocks: at least one was sent unencrypted (decodes cleanly as
+      // dag-cbor with the payload our fake CAR places in the envelope).
+      const pinnedBlocks: Uint8Array[] = [];
 
       installMockFetch(async (url: string, init?: RequestInit) => {
         if (url.includes('/api/v0/dag/put') && init?.body) {
-          // Capture the bytes sent to IPFS. Production uses
-          // multipart/form-data (Kubo RPC contract); extract the
-          // `data` field. Legacy Uint8Array / ArrayBuffer paths
-          // kept for any test that still passes raw bodies.
           if (init.body instanceof FormData) {
             const entry = init.body.get('data');
             if (entry instanceof Blob) {
-              pinnedBytes = new Uint8Array(await entry.arrayBuffer());
+              pinnedBlocks.push(new Uint8Array(await entry.arrayBuffer()));
             }
           } else if (init.body instanceof Uint8Array) {
-            pinnedBytes = init.body;
+            pinnedBlocks.push(init.body);
           } else if (init.body instanceof ArrayBuffer) {
-            pinnedBytes = new Uint8Array(init.body);
+            pinnedBlocks.push(new Uint8Array(init.body));
           }
           return new Response(JSON.stringify({ Cid: { '/': 'cid-enc' } }), { status: 200 });
         }
@@ -1311,16 +1341,32 @@ describe('ProfileTokenStorageProvider', () => {
 
       const txfData = buildTxfData({ _token1: { id: '_token1' } });
       await provider.save(txfData);
-      await vi.advanceTimersByTimeAsync(100);
+      await new Promise((r) => setTimeout(r, 200));
 
-      // The pinned bytes must be the raw CAR content (unencrypted) so that
-      // identical token pools across wallets produce the same CID.
-      expect(pinnedBytes).not.toBeNull();
-      if (pinnedBytes) {
-        const rawText = new TextDecoder().decode(pinnedBytes);
-        const parsed = JSON.parse(rawText);
-        expect(parsed.tokens).toBeDefined();
+      // The pinned blocks must be the raw CAR content (unencrypted) so
+      // that identical token pools across wallets produce the same CIDs.
+      expect(pinnedBlocks.length).toBeGreaterThan(0);
+
+      // At least one block must dag-cbor decode and carry the `payload`
+      // shape the fake-CAR helper wraps the token list inside. If the
+      // flush had encrypted the CAR before pinning, dag-cbor decode of
+      // ciphertext would fail across every block.
+      const { decode: dagCborDecode } = await import('@ipld/dag-cbor');
+      let foundEnvelope = false;
+      for (const blk of pinnedBlocks) {
+        try {
+          const decoded = dagCborDecode(blk) as { payload?: { tokens?: unknown } };
+          if (decoded && decoded.payload && 'tokens' in decoded.payload) {
+            foundEnvelope = true;
+            break;
+          }
+        } catch {
+          // not the envelope block — continue
+        }
       }
+      expect(foundEnvelope).toBe(true);
+
+      vi.useFakeTimers({ shouldAdvanceTime: true });
     });
 
     it('bundle refs are encrypted in OrbitDB', async () => {

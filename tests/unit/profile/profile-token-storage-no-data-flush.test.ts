@@ -77,6 +77,23 @@ function getEncryptionKey(): Uint8Array {
   return deriveProfileEncryptionKey(hexToBytes(TEST_PRIVATE_KEY));
 }
 
+/**
+ * Issue #200 Phase 2 helper: compute the dag-cbor envelope CID that the
+ * flush scheduler will use for the given token list (matches the
+ * mocked `pkg.toCar()` output which now wraps tokens in a real CAR).
+ *
+ * Replaces the legacy `cidForBytes(JSON.stringify({tokens}))` calls
+ * that produced raw-codec CIDs incompatible with the new pin path.
+ */
+async function projectedFlushCid(tokens: unknown[]): Promise<string> {
+  const { makeFakeUxfCar } = await import('./_helpers/fake-uxf-car.js');
+  const { extractCarRootCid } = await import(
+    '../../../uxf/transfer-payload.js'
+  );
+  const carBytes = await makeFakeUxfCar({ tokens });
+  return extractCarRootCid(carBytes);
+}
+
 function cidForBytes(bytes: Uint8Array): string {
   const digest = createDigest(0x12, sha256(bytes));
   return CID.createV1(raw.code, digest).toString();
@@ -153,7 +170,15 @@ function createMockDb(): MockProfileDb {
 // UxfPackage mock — produces deterministic, content-addressable bytes
 // =============================================================================
 
-vi.mock('../../../uxf/UxfPackage.js', () => {
+vi.mock('../../../uxf/UxfPackage.js', async () => {
+  // Issue #200 Phase 2: `toCar()` must return a real CAR (not JSON bytes)
+  // because the flush scheduler now calls `extractCarRootCid` +
+  // `pinCarBlocksToIpfs`. `makeFakeUxfCar` wraps the payload in a
+  // minimal valid CAR; `decodeFakeUxfCar` recovers it.
+  const { makeFakeUxfCar, decodeFakeUxfCar } = await import(
+    './_helpers/fake-uxf-car.js'
+  );
+
   function makePkg(): {
     _tokens: unknown[];
     ingestAll(tokens: unknown[]): void;
@@ -187,7 +212,7 @@ vi.mock('../../../uxf/UxfPackage.js', () => {
           const bid = (b as Record<string, unknown>).id as string ?? '';
           return aid.localeCompare(bid);
         });
-        return new TextEncoder().encode(JSON.stringify({ tokens: sorted }));
+        return makeFakeUxfCar({ tokens: sorted });
       },
     };
   }
@@ -198,8 +223,15 @@ vi.mock('../../../uxf/UxfPackage.js', () => {
         return makePkg();
       },
       async fromCar(carBytes: Uint8Array) {
-        const text = new TextDecoder().decode(carBytes);
-        const parsed = JSON.parse(text) as { tokens: unknown[] };
+        // Dual-shape decode: prefer the new fake-CAR shape; fall back to
+        // raw JSON so legacy fixture bytes still resolve.
+        let parsed: { tokens?: unknown[] };
+        try {
+          parsed = await decodeFakeUxfCar<{ tokens?: unknown[] }>(carBytes);
+        } catch {
+          const text = new TextDecoder().decode(carBytes);
+          parsed = JSON.parse(text) as { tokens?: unknown[] };
+        }
         const pkg = makePkg();
         pkg.ingestAll(parsed.tokens ?? []);
         return pkg;
@@ -359,12 +391,9 @@ describe('ProfileTokenStorageProvider — no-data flush on remote update', () =>
       merged;
 
     // Compute the deterministic CID the no-data flush will project for
-    // this state. The mocked UxfPackage.toCar serialises sorted tokens
-    // as `{"tokens":[<sorted-by-id>]}`.
-    const projectedCarBytes = new TextEncoder().encode(
-      JSON.stringify({ tokens: [tokenA] }),
-    );
-    const projectedCid = cidForBytes(projectedCarBytes);
+    // this state. Issue #200 Phase 2 changed the convention to the
+    // dag-cbor envelope CID; `projectedFlushCid` mirrors the new shape.
+    const projectedCid = await projectedFlushCid([tokenA]);
 
     // Plant the projected CID as lastDiscoveredPointerCid — this
     // simulates "we already discovered this exact anchor via the
@@ -407,11 +436,9 @@ describe('ProfileTokenStorageProvider — no-data flush on remote update', () =>
     (provider as unknown as { lastLoadedData: TxfStorageDataBase }).lastLoadedData =
       merged;
 
-    // The CAR our flush will project.
-    const projectedCarBytes = new TextEncoder().encode(
-      JSON.stringify({ tokens: [tokenA] }),
-    );
-    const projectedCid = cidForBytes(projectedCarBytes);
+    // The CAR our flush will project. Issue #200 Phase 2: dag-cbor
+    // envelope CID convention.
+    const projectedCid = await projectedFlushCid([tokenA]);
 
     // Plant the same CID as an ACTIVE bundle ref in OrbitDB (the local
     // log already has it — our previous flush, or an incoming remote
@@ -477,10 +504,8 @@ describe('ProfileTokenStorageProvider — no-data flush on remote update', () =>
 
     // lastDiscoveredPointerCid is set to a DIFFERENT CID — A's anchor
     // for A-only state. Our merged state (A+B) won't match.
-    const aOnlyCarBytes = new TextEncoder().encode(
-      JSON.stringify({ tokens: [tokenA] }),
-    );
-    const aOnlyCid = cidForBytes(aOnlyCarBytes);
+    // Issue #200 Phase 2: dag-cbor envelope CID convention.
+    const aOnlyCid = await projectedFlushCid([tokenA]);
     (
       provider as unknown as { lastDiscoveredPointerCid: string | null }
     ).lastDiscoveredPointerCid = aOnlyCid;
@@ -497,11 +522,9 @@ describe('ProfileTokenStorageProvider — no-data flush on remote update', () =>
 
     // A new bundle ref was written to OrbitDB under the projected
     // (merged-state) CID, distinct from aOnlyCid. Tokens are sorted
-    // by id (A < B in lexicographic order).
-    const projectedCarBytes = new TextEncoder().encode(
-      JSON.stringify({ tokens: [tokenA, tokenB] }),
-    );
-    const projectedCid = cidForBytes(projectedCarBytes);
+    // by id (A < B in lexicographic order). Issue #200 Phase 2: the
+    // ref CID is now the dag-cbor envelope CID, not the raw CAR-bytes CID.
+    const projectedCid = await projectedFlushCid([tokenA, tokenB]);
     expect(projectedCid).not.toBe(aOnlyCid);
     expect(db._store.has(`${BUNDLE_KEY_PREFIX}${projectedCid}`)).toBe(true);
 

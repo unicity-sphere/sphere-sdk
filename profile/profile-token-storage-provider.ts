@@ -81,7 +81,7 @@ import {
   encryptProfileValue,
   decryptProfileValue,
 } from './encryption.js';
-import { fetchFromIpfs } from './ipfs-client.js';
+import { fetchCarFromIpfs } from './ipfs-client.js';
 import {
   deriveSentFromArchived,
   deriveHistoryFromArchived,
@@ -1153,7 +1153,13 @@ export class ProfileTokenStorageProvider
       const loadedBundles: Array<{ cid: string; pkg: UxfPackageInstance }> = [];
       for (const [cid] of activeBundles) {
         try {
-          const carBytes = await fetchFromIpfs(this._ipfsGateways, cid);
+          // Issue #200 Phase 2: bundle CIDs are now dag-cbor envelope
+          // CIDs (per-block pinned), not raw-CIDs over the CAR bytes.
+          // `fetchCarFromIpfs` walks the dag-cbor link graph and
+          // reassembles a synthetic CAR so `UxfPackage.fromCar` stays
+          // unchanged. Legacy raw-CIDs (pre-#200) still resolve via the
+          // backward-compat branch inside `fetchCarFromIpfs`.
+          const carBytes = await fetchCarFromIpfs(this._ipfsGateways, cid);
           const pkg = await UxfPackage.fromCar(carBytes);
           loadedBundles.push({ cid, pkg });
         } catch (err) {

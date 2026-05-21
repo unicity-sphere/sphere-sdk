@@ -162,6 +162,11 @@ class FakeTokenStorage {
 // CARs and import's pinToIpfs is a no-op (we don't have a real gateway).
 vi.mock('../../../profile/ipfs-client', async () => {
   const carCache = new Map<string, Uint8Array>();
+  // Issue #200 Phase 2: production now uses `fetchCarFromIpfs` and
+  // `pinCarBlocksToIpfs`. The fixtures here pre-populate real CARs into
+  // `carCache`, so the mock `fetchCarFromIpfs` delegates to the cache
+  // and the mock `pinCarBlocksToIpfs` echoes the expected root CID
+  // back (matching the production contract for that helper).
   return {
     fetchFromIpfs: vi.fn(async (_gateways: string[], cid: string) => {
       const cached = carCache.get(cid);
@@ -170,7 +175,18 @@ vi.mock('../../../profile/ipfs-client', async () => {
       }
       return cached;
     }),
+    fetchCarFromIpfs: vi.fn(async (_gateways: string[], cid: string) => {
+      const cached = carCache.get(cid);
+      if (!cached) {
+        throw new Error(`fake fetchCarFromIpfs: no CAR cached for ${cid}`);
+      }
+      return cached;
+    }),
     pinToIpfs: vi.fn(async () => 'fake-pin-cid'),
+    pinCarBlocksToIpfs: vi.fn(
+      async (_gateways: string[], _bytes: Uint8Array, expectedRootCid: string) =>
+        expectedRootCid,
+    ),
     verifyCidAccessible: vi.fn(async () => true),
     // Test-only setter so the test can pre-populate the fake gateway.
     __setBundleCar: (cid: string, bytes: Uint8Array) => {

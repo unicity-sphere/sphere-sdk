@@ -144,7 +144,15 @@ function createMockDb(): MockProfileDb {
 // window if serialization is broken.
 // =============================================================================
 
-vi.mock('../../../uxf/UxfPackage.js', () => {
+vi.mock('../../../uxf/UxfPackage.js', async () => {
+  // Issue #200 Phase 2: `toCar()` must return a real CAR (not JSON bytes)
+  // because the flush scheduler now calls `extractCarRootCid` +
+  // `pinCarBlocksToIpfs`. `makeFakeUxfCar` wraps the payload in a
+  // minimal valid CAR; `decodeFakeUxfCar` recovers it.
+  const { makeFakeUxfCar, decodeFakeUxfCar } = await import(
+    './_helpers/fake-uxf-car.js'
+  );
+
   function makePkg(): {
     _tokens: unknown[];
     ingestAll(tokens: unknown[]): void;
@@ -180,7 +188,7 @@ vi.mock('../../../uxf/UxfPackage.js', () => {
           const bid = (b as Record<string, unknown>).id as string ?? '';
           return aid.localeCompare(bid);
         });
-        return new TextEncoder().encode(JSON.stringify({ tokens: sorted }));
+        return makeFakeUxfCar({ tokens: sorted });
       },
     };
   }
@@ -191,8 +199,15 @@ vi.mock('../../../uxf/UxfPackage.js', () => {
         return makePkg();
       },
       async fromCar(carBytes: Uint8Array) {
-        const text = new TextDecoder().decode(carBytes);
-        const parsed = JSON.parse(text) as { tokens: unknown[] };
+        // Dual-shape decode: prefer the new fake-CAR shape; fall back to
+        // raw JSON so legacy fixture bytes still resolve.
+        let parsed: { tokens?: unknown[] };
+        try {
+          parsed = await decodeFakeUxfCar<{ tokens?: unknown[] }>(carBytes);
+        } catch {
+          const text = new TextDecoder().decode(carBytes);
+          parsed = JSON.parse(text) as { tokens?: unknown[] };
+        }
         const pkg = makePkg();
         pkg.ingestAll(parsed.tokens ?? []);
         return pkg;

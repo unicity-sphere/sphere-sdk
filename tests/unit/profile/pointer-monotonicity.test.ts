@@ -156,7 +156,15 @@ function createMockDb(): MockProfileDb {
 // UxfPackage mock — produces deterministic, content-addressable bytes
 // =============================================================================
 
-vi.mock('../../../uxf/UxfPackage.js', () => {
+vi.mock('../../../uxf/UxfPackage.js', async () => {
+  // Issue #200 Phase 2: `toCar()` must return a real CAR (not JSON bytes)
+  // because the flush scheduler now calls `extractCarRootCid` +
+  // `pinCarBlocksToIpfs`. `makeFakeUxfCar` wraps the JSON-shaped
+  // payload inside a minimal valid CAR; `decodeFakeUxfCar` recovers it.
+  const { makeFakeUxfCar, decodeFakeUxfCar } = await import(
+    './_helpers/fake-uxf-car.js'
+  );
+
   function makePkg(): {
     _tokens: unknown[];
     ingestAll(tokens: unknown[]): void;
@@ -189,7 +197,7 @@ vi.mock('../../../uxf/UxfPackage.js', () => {
           const bid = (b as Record<string, unknown>).id as string ?? '';
           return aid.localeCompare(bid);
         });
-        return new TextEncoder().encode(JSON.stringify({ tokens: sorted }));
+        return makeFakeUxfCar({ tokens: sorted });
       },
     };
   }
@@ -200,8 +208,15 @@ vi.mock('../../../uxf/UxfPackage.js', () => {
         return makePkg();
       },
       async fromCar(carBytes: Uint8Array) {
-        const text = new TextDecoder().decode(carBytes);
-        const parsed = JSON.parse(text) as { tokens: unknown[] };
+        // Dual-shape decode: prefer the new fake-CAR shape; fall back to
+        // raw JSON so legacy pre-built fixture bytes still resolve.
+        let parsed: { tokens?: unknown[] };
+        try {
+          parsed = await decodeFakeUxfCar<{ tokens?: unknown[] }>(carBytes);
+        } catch {
+          const text = new TextDecoder().decode(carBytes);
+          parsed = JSON.parse(text) as { tokens?: unknown[] };
+        }
         const pkg = makePkg();
         pkg.ingestAll(parsed.tokens ?? []);
         return pkg;
@@ -531,10 +546,16 @@ describe('pointer monotonicity invariant', () => {
 
     const tokenA = { id: '_TA', genesis: { tokenId: 'TA' } };
     const merged = buildTxfData({ _TA: tokenA });
-    const projectedCarBytes = new TextEncoder().encode(
-      JSON.stringify({ tokens: [tokenA] }),
+    // Issue #200 Phase 2: the flush scheduler computes `projectedCid`
+    // via `extractCarRootCid` (dag-cbor envelope CID), not the legacy
+    // raw-CID convention. Mirror the same shape so the short-circuit
+    // comparison fires.
+    const { makeFakeUxfCar } = await import('./_helpers/fake-uxf-car.js');
+    const { extractCarRootCid } = await import(
+      '../../../uxf/transfer-payload.js'
     );
-    const projectedCid = cidForBytes(projectedCarBytes);
+    const projectedCarBytes = await makeFakeUxfCar({ tokens: [tokenA] });
+    const projectedCid = await extractCarRootCid(projectedCarBytes);
 
     // Plant the merged state AND the matching authoritative pointer CID.
     (provider as unknown as {

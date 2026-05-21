@@ -58,7 +58,7 @@ import { CarReader } from '@ipld/car';
 
 import type { StorageProvider } from '../storage/storage-provider.js';
 import type { ProfileTokenStorageProvider } from './profile-token-storage-provider.js';
-import { fetchFromIpfs } from './ipfs-client.js';
+import { fetchCarFromIpfs } from './ipfs-client.js';
 import { logger } from '../core/logger.js';
 import { ProfileError } from './errors.js';
 
@@ -381,7 +381,16 @@ async function readAndFetchBundles(
       continue;
     }
     try {
-      const carBytes = await fetchFromIpfs(
+      // Issue #200 Phase 2: bundle CIDs are now dag-cbor envelope CIDs
+      // (per-block pinned). `fetchCarFromIpfs` walks the DAG and
+      // reassembles a synthetic CAR that's byte-shape-compatible with
+      // the embedded-bundle export format. Legacy raw-CID bundles also
+      // resolve via the backward-compat branch.
+      //
+      // Per-block size cap stays the same (PER_BUNDLE_MAX_BYTES); the
+      // helper applies it to each individual `block/get` round-trip so
+      // a single oversized block aborts before the full DAG is fetched.
+      const carBytes = await fetchCarFromIpfs(
         gateways,
         cid,
         PER_BUNDLE_FETCH_TIMEOUT_MS,

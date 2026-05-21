@@ -95,24 +95,32 @@ function createMockDb(): MockProfileDb {
 }
 
 // Mock UxfPackage so save() does not require a real CAR encoder.
-vi.mock('../../../uxf/UxfPackage.js', () => ({
-  UxfPackage: {
-    create: () => ({
-      ingestAll() {},
-      merge() {},
-      assembleAll: () => new Map(),
-      toCar: async () => new TextEncoder().encode('{}'),
-      _tokens: [],
-    }),
-    fromCar: async () => ({
-      _tokens: [],
-      ingestAll() {},
-      merge() {},
-      assembleAll: () => new Map(),
-      toCar: async () => new TextEncoder().encode('{}'),
-    }),
-  },
-}));
+// Issue #200 Phase 2: `toCar()` must return a real CAR (not JSON bytes)
+// because the flush scheduler now calls `extractCarRootCid` +
+// `pinCarBlocksToIpfs` against the result. `makeFakeUxfCar` produces a
+// minimal valid single-block CAR — enough for the pin path while still
+// allowing this test to bypass the real UxfPackage encoder.
+vi.mock('../../../uxf/UxfPackage.js', async () => {
+  const { makeFakeUxfCar } = await import('./_helpers/fake-uxf-car.js');
+  return {
+    UxfPackage: {
+      create: () => ({
+        ingestAll() {},
+        merge() {},
+        assembleAll: () => new Map(),
+        toCar: async () => makeFakeUxfCar({ tokens: [] }),
+        _tokens: [],
+      }),
+      fromCar: async () => ({
+        _tokens: [],
+        ingestAll() {},
+        merge() {},
+        assembleAll: () => new Map(),
+        toCar: async () => makeFakeUxfCar({ tokens: [] }),
+      }),
+    },
+  };
+});
 
 let originalFetch: typeof globalThis.fetch;
 function installPinMock() {

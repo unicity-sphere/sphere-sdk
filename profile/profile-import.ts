@@ -41,7 +41,8 @@ import type { StorageProvider } from '../storage/storage-provider.js';
 import type { ProfileTokenStorageProvider } from './profile-token-storage-provider.js';
 import type { ProfileSnapshot } from './profile-export.js';
 import { IDENTITY_CLASS_KEYS } from './profile-export.js';
-import { pinToIpfs } from './ipfs-client.js';
+import { pinToIpfs, pinCarBlocksToIpfs } from './ipfs-client.js';
+import { CID } from 'multiformats/cid';
 import { logger } from '../core/logger.js';
 import { ProfileError } from './errors.js';
 
@@ -217,10 +218,37 @@ async function pinAndRegisterBundle(
   const gateways = handle._ipfsGateways ?? [];
 
   // Wave 9 fix #5 — gate `pinned` strictly on a successful gateway pin.
+  //
+  // Issue #200 Phase 2: bundle CIDs from a NEW-scheme source are
+  // dag-cbor envelope CIDs (per-block pinned); legacy sources still
+  // carry raw-CIDs over the whole CAR. Dispatch on the supplied CID's
+  // multicodec so cross-version imports work — the rest of the imported
+  // profile (OrbitDB refs, outbox entries, etc.) references this exact
+  // CID and breaks if we silently change it.
   let pinned = false;
   if (gateways.length > 0) {
     try {
-      await pinToIpfs(gateways, carBytes);
+      let codec = 0;
+      try {
+        codec = CID.parse(cid).code;
+      } catch {
+        // Unparseable CID — treat as legacy and let `pinToIpfs` raise
+        // a typed error if the bytes shape doesn't match expectations.
+      }
+      if (codec === 0x71 /* dag-cbor */) {
+        // New scheme: per-block pin under the envelope CID. Asserts
+        // that `cid` matches `extractCarRootCid(carBytes)` internally —
+        // if a hostile profile substitutes a mismatched CID we want
+        // the pin to fail fast rather than silently store under the
+        // attacker's CID.
+        await pinCarBlocksToIpfs(gateways, carBytes, cid);
+      } else {
+        // Legacy raw-CID scheme. Pin the CAR bytes as one raw block so
+        // the existing ref still resolves through the new-scheme
+        // `fetchCarFromIpfs` (which routes raw roots back to a single
+        // `block/get`).
+        await pinToIpfs(gateways, carBytes);
+      }
       pinned = true;
     } catch (err) {
       logger.warn(
