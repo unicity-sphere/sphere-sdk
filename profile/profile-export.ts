@@ -6,12 +6,19 @@
  *
  *   - Every Profile KV entry that lives in OrbitDB, captured as
  *     ENCRYPTED ciphertext (never decrypted at this layer).
- *   - Every UXF bundle CAR referenced by the Profile, embedded as
- *     nested CAR bytes.
+ *   - Every bundle's full DAG (envelope + manifest + per-token / per-
+ *     element sub-blocks) embedded as individually-addressable dag-cbor
+ *     blocks inside the snapshot CAR. Repeating sub-components (a
+ *     predicate, type, or token shared by two bundles) collapse to a
+ *     single block — the snapshot CAR is the union of every bundle's
+ *     reachable block set, keyed by canonical CID.
  *
- * The resulting CAR has ONE root block whose payload is a dag-cbor
- * `ProfileSnapshot` document; every embedded bundle CAR's bytes are
- * stored as additional raw blocks keyed by `sha256(bytes)` (raw codec).
+ * The resulting CAR has ONE root block (dag-cbor `ProfileSnapshot`
+ * envelope) and N + M additional dag-cbor blocks: N per-bundle root
+ * blocks + M shared/unique sub-blocks. The recorded `bundles[i].cid`
+ * is the bundle's root CID, addressable in isolation.
+ *
+ * Issue #200 Phase 5 — Profile export/import alignment.
  *
  * Wave 9 hardening (security-critical, see steelman closeout):
  *
@@ -22,14 +29,16 @@
  *      destination wallet must derive the same master key (i.e. share
  *      the same mnemonic) to decrypt them — this is the security
  *      invariant: snapshot privacy reduces to mnemonic privacy.
- *   2. **Bundle CID content-address verification.** On parse we
- *      recompute SHA-256(carBytes) for each candidate bundle block and
- *      derive the expected CID under the codec recorded in the
- *      snapshot's bundles[i].cid. Any mismatch is rejected — defeats
- *      a forged-CAR-header attack.
- *   3. **Schema is versioned.** Snapshots carry `version: 1`. Future
- *      versions may extend with new optional fields; importer rejects
- *      `version > 1` so unknown forward-compat data never lands silently.
+ *   2. **Bundle CID content-address verification.** Every block in the
+ *      snapshot CAR is content-addressed under its own CID; the CAR
+ *      reader rejects any block whose bytes do not match its CID. The
+ *      importer additionally walks each `bundles[i].cid` and verifies
+ *      that block is present in the CAR.
+ *   3. **Schema is versioned.** Snapshots carry `version: 2`. v1 was
+ *      the pre-Phase-5 flat layout (whole bundle CARs embedded as raw
+ *      blocks). v2 is the hierarchical layout. The parser rejects
+ *      `version != 2` so unknown forward-compat data never lands
+ *      silently.
  *   4. **Hard size + count caps.** Total CAR size is bounded at 256 MiB
  *      by default; per-block byte cap (1 MiB), block-count cap
  *      (200 000), KV-entry-count cap (100 000), per-value byte cap
@@ -42,8 +51,9 @@
  *      either duplicate state with divergent envelopes or leak the
  *      destination's sync history.
  *   6. **Deterministic encoding.** Entries[] sorted by key; bundles[]
- *      sorted by cid. `createdAt` is option-overridable. Two exports of
- *      the same Profile produce byte-identical roots.
+ *      sorted by cid; sub-blocks emitted in deterministic CID order
+ *      after the root. Two exports of the same Profile produce
+ *      byte-identical roots.
  *
  * @see /home/vrogojin/uxf/profile/profile-import.ts — the receiving side
  * @module profile/profile-export
@@ -66,14 +76,27 @@ import { ProfileError } from './errors.js';
 // Types
 // =============================================================================
 
-/** Current snapshot schema version. Bump only with explicit migration story. */
-export const PROFILE_SNAPSHOT_VERSION = 1 as const;
+/**
+ * Current snapshot schema version. Bump only with explicit migration story.
+ *
+ * **v2 (current)** — hierarchical: every block in every embedded bundle is
+ *   addressable by its own CID. Shared sub-blocks dedup at the block
+ *   level. Issue #200 Phase 5.
+ *
+ * **v1 (removed)** — flat: each embedded bundle was stored as a single
+ *   raw block whose payload was the bundle's entire CAR bytes; the
+ *   bundle's root CID was carried inline in `bundles[i].cid` for the
+ *   importer to re-derive after a SHA pass. No dedup, no per-token
+ *   addressability. The parser rejects v1 with an explicit version
+ *   error.
+ */
+export const PROFILE_SNAPSHOT_VERSION = 2 as const;
 
 /**
  * Hard cap on the assembled snapshot CAR.
  *
  * Reduced from 1 GiB to 256 MiB in Wave 9 — a profile snapshot is
- * dominated by bundle CAR payloads, which themselves cap at 50 MiB
+ * dominated by bundle block payloads, which themselves cap at 50 MiB
  * each via the IPFS client. 256 MiB allows several large bundles
  * plus the KV envelope stream while preventing OOM on a runaway
  * bundle pin set or a hostile snapshot CAR fed via `parseProfileSnapshot`.
@@ -91,34 +114,27 @@ const MAX_KV_ENTRIES = 100_000;
 const MAX_KV_VALUE_BYTES = 8 * 1024 * 1024; // 8 MiB
 
 /**
- * Hard cap on total CAR-import block count. Profile snapshots can have
- * many tiny KV entries, so we allow more than the transfer-bundle's
- * 10 000 cap (Wave 3) — but well below the legitimate ceiling so a
- * runaway hostile CAR is rejected before it forces 1M Map insertions.
+ * Hard cap on total CAR-import block count. v2 snapshots can have many
+ * tiny dag-cbor sub-blocks (one per token element across all bundles),
+ * so the cap is wider than the transfer-bundle's 10 000 ceiling. 200 000
+ * is generous for any plausible wallet today while still cutting off
+ * a hostile CAR that would otherwise drive 1M Map insertions.
  */
 const PROFILE_CAR_IMPORT_MAX_BLOCK_COUNT = 200_000;
 
 /**
- * Hard cap on per-block bytes in CAR import. Profile snapshots embed
- * full bundle CARs as raw blocks, which can legitimately reach a few
- * MiB each — so the cap is wider than the transfer-bundle 64 KiB
- * (which only ever sees small dag-cbor IPLD nodes). 1 MiB is a
- * defensive ceiling: any single block above this is hostile bloat.
- *
- * NOTE on bundle blocks: an embedded bundle CAR is stored as ONE raw
- * block of the whole CAR, so `PER_BUNDLE_MAX_BYTES` (256 MiB above)
- * would naively be the cap. To enforce a tighter aggregate budget we
- * cap individual blocks at 1 MiB and the assembled CAR at 256 MiB.
- * Bundles larger than 1 MiB are split into multiple raw blocks at
- * embed time (see `splitBundleIntoBlocks`).
+ * Hard cap on per-block bytes in CAR import. Bundles now live as a
+ * tree of small dag-cbor blocks rather than one large raw block, so
+ * the per-block cap can stay tight at 1 MiB — any individual block
+ * above this is hostile bloat.
  */
 const PROFILE_CAR_IMPORT_MAX_BLOCK_BYTES = 1024 * 1024; // 1 MiB
 
-/** raw codec id (multicodec). */
-const RAW_CODE = 0x55;
-
 /** dag-cbor codec id (multicodec). */
 const DAG_CBOR_CODE = 0x71;
+
+/** raw codec id (multicodec). Legacy bundle CIDs may still use it. */
+const RAW_CODE = 0x55;
 
 /**
  * Operational / leaky keys filtered out of the export. Bundle refs
@@ -170,12 +186,12 @@ export interface ProfileSnapshotBundleEntry {
 
 /**
  * Decoded snapshot root document. The CAR carries this object as its
- * single root block, plus one or more raw-codec blocks per embedded
- * bundle CAR.
+ * single root block, plus one or more dag-cbor blocks per embedded
+ * bundle DAG (envelope + manifest + per-token / per-element sub-blocks).
  */
 export interface ProfileSnapshot {
   /** Snapshot schema version. */
-  readonly version: 1;
+  readonly version: 2;
   /** Wallet's chain pubkey at export time (informational). */
   readonly chainPubkey: string;
   /** Network identifier at export time (testnet/mainnet/dev). */
@@ -184,7 +200,7 @@ export interface ProfileSnapshot {
   readonly createdAt: number;
   /** All Profile KV entries (encrypted form preserved). */
   readonly entries: ReadonlyArray<ProfileSnapshotKvEntry>;
-  /** All bundle refs whose CARs were successfully embedded. */
+  /** All bundle refs whose root blocks were successfully embedded. */
   readonly bundles: ReadonlyArray<ProfileSnapshotBundleEntry>;
 }
 
@@ -210,10 +226,18 @@ export interface ExportProfileResult {
   readonly carBytes: Uint8Array;
   /** Number of KV entries serialized. */
   readonly entryCount: number;
-  /** Number of bundles whose CARs were successfully embedded. */
+  /** Number of bundles whose DAGs were successfully embedded. */
   readonly bundlesEmbedded: number;
   /** Number of bundles where the CAR fetch failed (skipped from output). */
   readonly bundlesMissing: number;
+  /**
+   * Number of unique bundle blocks embedded across every bundle's DAG.
+   * In v2 this is the count of distinct CIDs — shared sub-blocks
+   * (predicate, token, type) collapse to a single block. Smaller than
+   * the naive sum of per-bundle block counts whenever bundles share
+   * sub-components.
+   */
+  readonly uniqueBundleBlocks: number;
   /** CAR root CID as a base32 string. */
   readonly rootCid: string;
 }
@@ -232,14 +256,6 @@ function sha256(bytes: Uint8Array): Uint8Array {
 function dagCborCid(bytes: Uint8Array): CID {
   const digest = createMultihash(0x12, sha256(bytes));
   return CID.createV1(DAG_CBOR_CODE, digest);
-}
-
-/**
- * Build a CIDv1 with codec=raw for the given opaque bytes.
- */
-function rawCid(bytes: Uint8Array): CID {
-  const digest = createMultihash(0x12, sha256(bytes));
-  return CID.createV1(RAW_CODE, digest);
 }
 
 /**
@@ -329,18 +345,26 @@ async function readAllKvEntries(
 }
 
 /**
- * Read every active+superseded bundle ref from the token storage and
- * fetch each bundle's CAR bytes from the local IPFS gateways.
+ * Read every active+superseded bundle ref from the token storage, fetch
+ * each bundle's full DAG from the local IPFS gateways via the
+ * hierarchical `fetchCarFromIpfs` helper, then extract individual
+ * blocks from each fetched CAR keyed by their canonical CID.
  *
  * Returns the embedded bundles in `bundleEntries` (only those whose
- * CARs were successfully fetched), the raw CAR bytes keyed by CID in
- * `bundleCars`, and the count of bundles where the fetch failed.
+ * DAGs were successfully fetched), the union of all bundle blocks
+ * (deduped by CID) in `blockMap`, and the count of bundles where the
+ * fetch failed.
+ *
+ * The dedup is the heart of Phase 5: if two bundles share a token (or
+ * predicate, or proof), the shared block is fetched separately for
+ * each bundle (the gateway returns a fresh copy each time) but ends
+ * up keyed by the same CID in the union map, so it occupies one slot.
  */
 async function readAndFetchBundles(
   tokenStorage: ProfileTokenStorageProvider,
 ): Promise<{
   bundleEntries: ProfileSnapshotBundleEntry[];
-  bundleCars: Map<string, Uint8Array>;
+  blockMap: Map<string, Uint8Array>;
   missingCount: number;
 }> {
   // Reach the BundleIndex through the token storage's documented
@@ -363,16 +387,13 @@ async function readAndFetchBundles(
   }
 
   const bundleEntries: ProfileSnapshotBundleEntry[] = [];
-  const bundleCars = new Map<string, Uint8Array>();
+  const blockMap = new Map<string, Uint8Array>();
   let missingCount = 0;
 
   for (const [cid, ref] of bundleMap) {
     // Skip bundles still pending verification — they are not yet
     // proven fetchable / decodable and the export snapshot schema
     // (`'active' | 'superseded'`) doesn't carry an unverified state.
-    // A subsequent recovery pass will promote them to 'active' once
-    // verified; until then they cannot be safely embedded in a
-    // portable snapshot.
     if (ref.status === 'unverified') {
       logger.debug(
         'ProfileExport',
@@ -381,22 +402,86 @@ async function readAndFetchBundles(
       continue;
     }
     try {
-      // Issue #200 Phase 2: bundle CIDs are now dag-cbor envelope CIDs
-      // (per-block pinned). `fetchCarFromIpfs` walks the DAG and
-      // reassembles a synthetic CAR that's byte-shape-compatible with
-      // the embedded-bundle export format. Legacy raw-CID bundles also
-      // resolve via the backward-compat branch.
-      //
-      // Per-block size cap stays the same (PER_BUNDLE_MAX_BYTES); the
-      // helper applies it to each individual `block/get` round-trip so
-      // a single oversized block aborts before the full DAG is fetched.
+      // Codec dispatch: dag-cbor (Phase 2 / new) bundles point at a
+      // hierarchical DAG; legacy raw-codec bundles point at a single
+      // raw block whose payload is the whole bundle CAR. The two
+      // cases need different embedding strategies.
+      let parsedBundleCid: CID;
+      try {
+        parsedBundleCid = CID.parse(cid);
+      } catch (err) {
+        missingCount += 1;
+        logger.warn(
+          'ProfileExport',
+          `bundle index entry ${cid} has an unparseable CID — skipping: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        continue;
+      }
+
+      // `fetchCarFromIpfs` walks the bundle DAG (hierarchical Phase 2)
+      // OR short-circuits to a single `block/get` for legacy raw-CID
+      // bundles. For dag-cbor it returns a synthetic CAR containing
+      // every reachable block; for raw it returns the bytes pinned
+      // verbatim (which are the legacy single-raw-block payload).
       const carBytes = await fetchCarFromIpfs(
         gateways,
         cid,
         PER_BUNDLE_FETCH_TIMEOUT_MS,
         PER_BUNDLE_MAX_BYTES,
       );
-      bundleCars.set(cid, carBytes);
+
+      if (parsedBundleCid.code === RAW_CODE) {
+        // Legacy raw-codec bundle: the bundle CID is `sha256(carBytes)`
+        // under the raw codec. Store the whole-CAR bytes as a single
+        // raw block under the bundle's recorded CID. On import the
+        // raw block re-pins under the same CID and the existing
+        // fetch-by-bundle-cid path keeps working.
+        if (!blockMap.has(cid)) {
+          // Re-verify the raw CID matches the bytes — `fetchFromIpfs`
+          // already did this check, but make it explicit so a future
+          // refactor cannot silently embed bytes under a wrong CID.
+          const expected = createMultihash(0x12, sha256(carBytes));
+          const recomputed = CID.createV1(RAW_CODE, expected).toString();
+          if (recomputed !== cid) {
+            missingCount += 1;
+            logger.warn(
+              'ProfileExport',
+              `legacy raw bundle ${cid}: gateway-returned bytes do not hash to the recorded CID — skipping`,
+            );
+            continue;
+          }
+          blockMap.set(cid, carBytes);
+        }
+      } else {
+        // Hierarchical (Phase 2+) bundle: the CAR's roots[0] equals
+        // the bundle CID (a dag-cbor envelope CID). Extract every
+        // block individually into the union map; the CarReader
+        // already verifies each block's CID against its content.
+        const reader = await CarReader.fromBytes(carBytes);
+        let foundRoot = false;
+        for await (const block of reader.blocks()) {
+          const blkCidStr = block.cid.toString();
+          if (blkCidStr === cid) foundRoot = true;
+          // Dedup by CID across bundles. Reuse the first-encountered
+          // bytes; identical CIDs implies identical content (sha256).
+          if (!blockMap.has(blkCidStr)) {
+            blockMap.set(blkCidStr, block.bytes);
+          }
+        }
+        if (!foundRoot) {
+          // Defensive: the fetched DAG must include a block whose CID
+          // equals the recorded bundle CID; otherwise the gateway
+          // delivered a bundle under an unexpected name (likely a
+          // redirect / mismatched-builder bug), refuse to embed.
+          missingCount += 1;
+          logger.warn(
+            'ProfileExport',
+            `bundle ${cid}: fetched DAG did not contain a block matching the recorded bundle CID — skipping`,
+          );
+          continue;
+        }
+      }
+
       bundleEntries.push({
         cid,
         status: ref.status,
@@ -407,7 +492,7 @@ async function readAndFetchBundles(
       missingCount += 1;
       logger.warn(
         'ProfileExport',
-        `failed to fetch bundle CAR ${cid} for embedding: ${err instanceof Error ? err.message : String(err)} — skipping`,
+        `failed to fetch bundle DAG ${cid} for embedding: ${err instanceof Error ? err.message : String(err)} — skipping`,
       );
     }
   }
@@ -415,27 +500,24 @@ async function readAndFetchBundles(
   // Wave 9 fix #8 — sort bundles deterministically for round-trip
   // determinism.
   bundleEntries.sort((a, b) => (a.cid < b.cid ? -1 : a.cid > b.cid ? 1 : 0));
-  return { bundleEntries, bundleCars, missingCount };
+  return { bundleEntries, blockMap, missingCount };
 }
 
 /**
  * Build the snapshot CAR bytes from a fully-populated snapshot doc and
- * a map of bundle CARs to embed as raw blocks.
+ * a deduped map of bundle blocks keyed by canonical CID.
  *
- * Each bundle CAR is keyed by SHA-256(carBytes) under the raw codec.
- * The bundle's recorded ROOT CID is preserved in `bundles[i].cid` for
- * the importer to verify content-address by recomputing the digest
- * over the bundle CAR's first block.
+ * The CAR carries one dag-cbor root (the snapshot envelope) plus every
+ * bundle block from `blockMap` in CID-sorted order. Each bundle block
+ * is addressable by its own CID; the importer walks `bundles[i].cid` →
+ * sub-block links to reconstruct each bundle.
  */
 async function assembleCarBytes(
   snapshot: ProfileSnapshot,
-  bundleCars: ReadonlyMap<string, Uint8Array>,
+  blockMap: ReadonlyMap<string, Uint8Array>,
   maxSizeBytes: number,
 ): Promise<{ carBytes: Uint8Array; rootCid: string }> {
-  // 1. Encode the snapshot root block (dag-cbor). Manifest field
-  //    REMOVED in Wave 9 fix #10 — the previous implementation parsed
-  //    + counted + warned "re-derived on next load", giving the user a
-  //    false impression that the snapshot was carrying useful state.
+  // 1. Encode the snapshot root block (dag-cbor).
   const rootBytes = dagCborEncode({
     version: snapshot.version,
     chainPubkey: snapshot.chainPubkey,
@@ -453,14 +535,21 @@ async function assembleCarBytes(
     }),
   });
 
+  if (rootBytes.byteLength > PROFILE_CAR_IMPORT_MAX_BLOCK_BYTES) {
+    throw new ProfileError(
+      'PROFILE_NOT_INITIALIZED',
+      `Profile snapshot root block is ${rootBytes.byteLength} bytes — exceeds per-block cap ${PROFILE_CAR_IMPORT_MAX_BLOCK_BYTES}.`,
+    );
+  }
+
   const rootCid = dagCborCid(rootBytes);
 
   // 2. Pre-flight size budget: rough estimate before opening the writer.
   let estimatedTotal = rootBytes.byteLength;
-  for (const v of bundleCars.values()) estimatedTotal += v.byteLength;
+  for (const v of blockMap.values()) estimatedTotal += v.byteLength;
   // CAR framing overhead is ~10 bytes per block + 11 byte header — be
   // defensive and add 64 bytes per block.
-  estimatedTotal += (1 + bundleCars.size) * 64;
+  estimatedTotal += (1 + blockMap.size) * 64;
   if (estimatedTotal > maxSizeBytes) {
     throw new ProfileError(
       'PROFILE_NOT_INITIALIZED',
@@ -478,15 +567,27 @@ async function assembleCarBytes(
 
   await writer.put({ cid: rootCid, bytes: rootBytes });
 
-  // Embed each bundle CAR's bytes as a raw block. The embed-block CID
-  // is computed from the embedded bytes themselves (raw codec).
-  // Wave 9 fix: bundles must be embed-sorted for deterministic
-  // assembly.
-  const sortedBundleCidKeys = Array.from(bundleCars.keys()).sort();
-  for (const bundleRootCid of sortedBundleCidKeys) {
-    const carBytes = bundleCars.get(bundleRootCid)!;
-    const embedCid = rawCid(carBytes);
-    await writer.put({ cid: embedCid, bytes: carBytes });
+  // Emit bundle blocks in deterministic CID-sorted order so two
+  // exports of the same Profile state produce byte-identical CARs.
+  const sortedCids = Array.from(blockMap.keys()).sort();
+  for (const cidStr of sortedCids) {
+    let cid: CID;
+    try {
+      cid = CID.parse(cidStr);
+    } catch (err) {
+      throw new ProfileError(
+        'PROFILE_NOT_INITIALIZED',
+        `assembleCarBytes: cannot parse bundle block CID ${cidStr}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    const bytes = blockMap.get(cidStr)!;
+    if (bytes.byteLength > PROFILE_CAR_IMPORT_MAX_BLOCK_BYTES) {
+      throw new ProfileError(
+        'PROFILE_NOT_INITIALIZED',
+        `Profile snapshot bundle block ${cidStr} is ${bytes.byteLength} bytes — exceeds per-block cap ${PROFILE_CAR_IMPORT_MAX_BLOCK_BYTES}.`,
+      );
+    }
+    await writer.put({ cid, bytes });
   }
 
   await writer.close();
@@ -523,8 +624,8 @@ export async function exportProfile(
   // 1. Read all KV entries (encrypted form).
   const entries = await readAllKvEntries(options.storage);
 
-  // 2. Enumerate + fetch bundle CARs.
-  const { bundleEntries, bundleCars, missingCount } = await readAndFetchBundles(
+  // 2. Enumerate + fetch bundle DAGs, deduping shared blocks by CID.
+  const { bundleEntries, blockMap, missingCount } = await readAndFetchBundles(
     options.tokenStorage,
   );
 
@@ -542,7 +643,7 @@ export async function exportProfile(
   // 4. Assemble the CAR.
   const { carBytes, rootCid } = await assembleCarBytes(
     snapshot,
-    bundleCars,
+    blockMap,
     maxSizeBytes,
   );
 
@@ -551,89 +652,132 @@ export async function exportProfile(
     entryCount: entries.length,
     bundlesEmbedded: bundleEntries.length,
     bundlesMissing: missingCount,
+    uniqueBundleBlocks: blockMap.size,
     rootCid,
   };
 }
 
 /**
- * Compute the expected CID for a bundle's first raw block when the
- * recorded `bundle.cid` indicates a particular codec. We support both
- * raw (0x55) and dag-cbor (0x71) recorded CIDs since legitimate
- * bundles may carry either.
+ * Walk the dag-cbor sub-DAG rooted at `rootCidStr`, starting from
+ * `blockMap`, and reassemble a CARv1 over the visited blocks.
  *
- * Returns the recomputed CID under the same codec, with the digest
- * derived from `bytes`. The caller compares its `toString()` to the
- * recorded `bundle.cid` to authenticate.
+ * BFS-walks CID links via dag-cbor's Tag-42 decoding. Raw-codec blocks
+ * are treated as leaves (no further walk). Unknown codecs are rejected
+ * to prevent silent skip of new block types.
+ *
+ * Returns `undefined` if the root block is missing from the CAR (the
+ * caller treats this as "bundle authentication failed"). Returns a
+ * fresh CAR bytes Uint8Array on success.
  */
-function expectedCidUnderCodec(bytes: Uint8Array, codec: number): CID {
-  const digest = createMultihash(0x12, sha256(bytes));
-  return CID.createV1(codec, digest);
+async function reconstructBundleCar(
+  blockMap: ReadonlyMap<string, Uint8Array>,
+  rootCidStr: string,
+): Promise<Uint8Array | undefined> {
+  if (!blockMap.has(rootCidStr)) return undefined;
+
+  let rootCid: CID;
+  try {
+    rootCid = CID.parse(rootCidStr);
+  } catch {
+    return undefined;
+  }
+  if (rootCid.code !== DAG_CBOR_CODE && rootCid.code !== RAW_CODE) {
+    return undefined;
+  }
+
+  const visited = new Set<string>();
+  const collected: Array<{ cid: CID; bytes: Uint8Array }> = [];
+  const queue: string[] = [rootCidStr];
+
+  while (queue.length > 0) {
+    const cidStr = queue.shift()!;
+    if (visited.has(cidStr)) continue;
+    visited.add(cidStr);
+
+    const bytes = blockMap.get(cidStr);
+    if (bytes === undefined) {
+      // The DAG references a block that's not in the snapshot CAR.
+      // The bundle is incomplete — refuse to reconstruct.
+      return undefined;
+    }
+    let cid: CID;
+    try {
+      cid = CID.parse(cidStr);
+    } catch {
+      return undefined;
+    }
+    collected.push({ cid, bytes });
+
+    // Only dag-cbor blocks can carry CID links (Tag 42). raw blocks
+    // and unknown codecs are leaves.
+    if (cid.code === DAG_CBOR_CODE) {
+      let decoded: unknown;
+      try {
+        decoded = dagCborDecode(bytes);
+      } catch {
+        return undefined;
+      }
+      collectCidLinks(decoded, (child) => {
+        const childStr = child.toString();
+        if (!visited.has(childStr)) queue.push(childStr);
+      });
+    }
+  }
+
+  const { writer, out } = CarWriter.create([rootCid]);
+  const chunks: Uint8Array[] = [];
+  const collectPromise = (async () => {
+    for await (const chunk of out) chunks.push(chunk);
+  })();
+  for (const block of collected) {
+    await writer.put(block);
+  }
+  await writer.close();
+  await collectPromise;
+
+  return concatBytes(chunks);
 }
 
 /**
- * Try to find an embedded bundle CAR whose first block, content-
- * addressed under the recorded CID's codec, hashes to the recorded
- * `bundle.cid`. Returns the CAR bytes on success, or undefined.
- *
- * Authenticated path: for each candidate raw block in the snapshot
- * CAR we open it as a bundle CAR, extract its FIRST block's bytes,
- * recompute SHA-256, and rebuild the CID under the recorded codec.
- * Any mismatch fails the candidate. Defeats the Wave 9 critical #2
- * forged-roots[] attack.
+ * Schema-agnostic CID-link collector (dag-cbor Tag 42 decode produces
+ * actual `CID` instances). Mirrors `profile/ipfs-client.ts:collectCidLinks`;
+ * duplicated here so the parser stays self-contained.
  */
-async function authenticateBundleCar(
-  candidateBytes: Uint8Array,
-  recordedCidStr: string,
-): Promise<boolean> {
-  let recordedCid: CID;
-  try {
-    recordedCid = CID.parse(recordedCidStr);
-  } catch {
-    return false;
-  }
-  // Use the recorded codec for re-derivation. We support both 0x55
-  // (raw) and 0x71 (dag-cbor) — the two codecs UXF bundles legitimately
-  // use.
-  const codec = recordedCid.code;
-  if (codec !== RAW_CODE && codec !== DAG_CBOR_CODE) {
-    return false;
+function collectCidLinks(value: unknown, visit: (cid: CID) => void): void {
+  if (value === null || value === undefined) return;
+  if (typeof value !== 'object') return;
+  if (value instanceof Uint8Array) return;
+
+  const asCid = CID.asCID(value as CID);
+  if (asCid !== null) {
+    visit(asCid);
+    return;
   }
 
-  let reader: CarReader;
-  try {
-    reader = await CarReader.fromBytes(candidateBytes);
-  } catch {
-    return false;
+  if (Array.isArray(value)) {
+    for (const item of value) collectCidLinks(item, visit);
+    return;
   }
-  const roots = await reader.getRoots();
-  if (roots.length !== 1) return false;
-
-  // Read the FIRST block (the root block) of this candidate bundle
-  // CAR. We must compare bytes — `roots[0]` may have been forged in
-  // the header, so we recompute from the actual block payload.
-  const rootBlock = await reader.get(roots[0]);
-  if (!rootBlock) return false;
-
-  const expected = expectedCidUnderCodec(rootBlock.bytes, codec);
-  if (expected.toString() !== recordedCid.toString()) return false;
-
-  // Sanity: the header's claimed root must match the content-addressed
-  // root we just verified. (Already implicit since `reader.get(roots[0])`
-  // succeeds, but make it explicit.)
-  if (roots[0].toString() !== recordedCid.toString()) return false;
-
-  return true;
+  for (const v of Object.values(value as Record<string, unknown>)) {
+    collectCidLinks(v, visit);
+  }
 }
 
 /**
- * Parse a snapshot CAR back into its root document + embedded bundle
- * CARs. Single-root validation, schema-version check, basic shape
- * validation, and Wave 9 caps + content-address verification all run
- * here.
+ * Parse a snapshot CAR back into its root document + reconstructed
+ * bundle CARs. Single-root validation, schema-version check, basic
+ * shape validation, and Wave 9 caps + content-address verification all
+ * run here.
  *
- * Returns the decoded snapshot AND the embedded bundle CARs keyed by
- * the bundle's RECORDED root CID. Bundles whose embedded CAR fails
- * content-address verification are SKIPPED (not silently substituted).
+ * Returns the decoded snapshot AND a per-bundle CAR map keyed by the
+ * bundle's root CID. Bundles whose root block is absent from the
+ * snapshot CAR, or whose DAG cannot be reassembled completely, are
+ * SKIPPED (not silently substituted). Callers iterate `snapshot.bundles`
+ * to find missing entries.
+ *
+ * The CarReader implementation rejects any block whose payload does
+ * not hash to its CID under the recorded multihash, so every block we
+ * return is authenticated; no manual SHA pass is needed.
  */
 export async function parseProfileSnapshot(carBytes: Uint8Array): Promise<{
   snapshot: ProfileSnapshot;
@@ -659,10 +803,8 @@ export async function parseProfileSnapshot(carBytes: Uint8Array): Promise<{
   }
   const rootCid = roots[0];
 
-  // Wave 9 fix #3: enforce block-count and per-block byte caps BEFORE
-  // populating any data structure. We materialise blocks once into a
-  // map from cid-string → bytes to avoid the O(N×M) bundle-match loop
-  // (Wave 9 fix #4).
+  // Materialise blocks into a map. The same map is the input to the
+  // per-bundle DAG walker so we don't re-scan the CAR per bundle.
   const allBlocks = new Map<string, Uint8Array>();
   let blockCount = 0;
   for await (const block of reader.blocks()) {
@@ -687,6 +829,18 @@ export async function parseProfileSnapshot(carBytes: Uint8Array): Promise<{
     throw new ProfileError('PROFILE_NOT_INITIALIZED', 'Root block missing from CAR.');
   }
 
+  // Defense-in-depth: recompute the root CID from its content even
+  // though CarReader already does this for the standard CID-block
+  // binding. Catches a CAR with a forged header `roots[0]` that
+  // points to a non-root block's payload.
+  const expectedRootCid = dagCborCid(rootBytes);
+  if (expectedRootCid.toString() !== rootCid.toString()) {
+    throw new ProfileError(
+      'PROFILE_NOT_INITIALIZED',
+      `Snapshot root CID mismatch: header claims ${rootCid.toString()}, content-addressed CID is ${expectedRootCid.toString()}.`,
+    );
+  }
+
   let decoded: unknown;
   try {
     decoded = dagCborDecode(rootBytes);
@@ -700,28 +854,18 @@ export async function parseProfileSnapshot(carBytes: Uint8Array): Promise<{
 
   const snapshot = validateSnapshotShape(decoded);
 
-  // Bundle authentication — Wave 9 critical #2.
-  //
-  // For each `bundles[i].cid`, we try to find an embedded raw block
-  // that, when interpreted as a bundle CAR, has a single root whose
-  // content-addressed CID matches the recorded `bundle.cid` exactly.
-  // Bundles failing authentication are skipped.
+  // Reconstruct each bundle CAR from its sub-DAG in the snapshot block
+  // map. Bundles whose root block is absent or whose DAG cannot be
+  // walked completely are skipped.
   const bundleCars = new Map<string, Uint8Array>();
   for (const bundle of snapshot.bundles) {
-    let found: Uint8Array | undefined;
-    for (const [blkCidStr, blkBytes] of allBlocks) {
-      if (blkCidStr === rootCid.toString()) continue;
-      if (await authenticateBundleCar(blkBytes, bundle.cid)) {
-        found = blkBytes;
-        break;
-      }
-    }
-    if (found) {
-      bundleCars.set(bundle.cid, found);
+    const recovered = await reconstructBundleCar(allBlocks, bundle.cid);
+    if (recovered) {
+      bundleCars.set(bundle.cid, recovered);
     } else {
       logger.warn(
         'ProfileExport',
-        `bundle ${bundle.cid} could not be authenticated against any embedded CAR — skipping`,
+        `bundle ${bundle.cid} could not be reconstructed from snapshot CAR — root block missing, references a missing sub-block, or has an unsupported codec`,
       );
     }
   }
@@ -748,6 +892,13 @@ function validateSnapshotShape(decoded: unknown): ProfileSnapshot {
   }
   if (typeof version !== 'number' || !Number.isInteger(version) || version < 1) {
     throw new ProfileError('PROFILE_NOT_INITIALIZED', `Invalid snapshot version: ${String(version)}`);
+  }
+  if (version < PROFILE_SNAPSHOT_VERSION) {
+    throw new ProfileError(
+      'PROFILE_NOT_INITIALIZED',
+      `Snapshot version ${version} is older than this SDK accepts (${PROFILE_SNAPSHOT_VERSION}). ` +
+        `Pre-Phase-5 snapshots cannot be imported; re-export from a wallet running this SDK version.`,
+    );
   }
   if (version > PROFILE_SNAPSHOT_VERSION) {
     throw new ProfileError(
@@ -861,13 +1012,8 @@ function validateSnapshotShape(decoded: unknown): ProfileSnapshot {
     bundles.push(entry);
   }
 
-  // Wave 9 fix #10: manifest field has been removed from the v1
-  // schema. Any presence of `manifest` in the decoded doc indicates
-  // either a v2+ writer (caught by version check above) or a tampered
-  // v1 doc — silently ignore it. The caller never sees it.
-
   const result: ProfileSnapshot = {
-    version: 1,
+    version: PROFILE_SNAPSHOT_VERSION,
     chainPubkey,
     network,
     createdAt,

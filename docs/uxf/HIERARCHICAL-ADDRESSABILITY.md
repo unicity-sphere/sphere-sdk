@@ -308,14 +308,118 @@ remains rejected by the lean reader.
   — sub-block with wrong internal groupKey, mismatched entry count,
   or duplicate keys is rejected.
 
-## Remaining phases
+## Phase 5 — Hierarchical fat profile snapshot (export/import)
 
-- **Phase 5 — Profile export/import alignment.** Migrate the
-  `.sphere` backup file format to the same hierarchical CAR shape so
-  imports dedup against bundles already on the receiving wallet.
+The operator-facing back-up format (`profile/profile-export.ts`,
+`profile/profile-import.ts`) was the last CAR-producing path still
+embedding bundle bytes as opaque concatenations. Phase 5 migrates it
+to the hierarchical CAR shape so:
 
-Depends on the bundle-CAR shape (Phase 2 + 3) and the lean-snapshot
-shape (Phase 4) — both now stable and verified.
+1. Two bundles sharing a sub-component (the same predicate, the same
+   token, an empty manifest, …) collapse to a single block in the
+   snapshot CAR.
+2. Importing a snapshot into a wallet that already has some bundles
+   pinned is a no-op for the shared blocks — `dag/put` is idempotent
+   under canonical CID.
+3. Backup files shrink in proportion to the bundle-internal
+   redundancy ratio of the source wallet.
+
+### v2 root + bundle DAG layout
+
+```
+Snapshot root (dag-cbor, codec 0x71)
+├─ version: 2
+├─ chainPubkey, network, createdAt
+├─ entries: [{ key, value }, …]                  ← ciphertext KV entries, sorted by key
+└─ bundles: [                                    ← sorted by cid (string)
+     { cid: <bundle root CID>, status, createdAt, tokenCount? },
+     …
+   ]
+
+CAR blocks following the root (one entry per unique CID across all bundles):
+
+  <bundle1RootCid>  (dag-cbor envelope)
+  <manifest1Cid>    (dag-cbor)
+  <token1Cid>       (dag-cbor)
+  <predicateCid>    (dag-cbor)                   ← shared between bundle1 + bundle2 → ONE block
+  <bundle2RootCid>  (dag-cbor envelope — different from bundle1's)
+  …
+```
+
+The `bundles[i].cid` strings are the bundle root CIDs; the importer
+walks each root via dag-cbor link traversal across the snapshot's
+shared block map to reconstruct the bundle's full reachable DAG.
+
+### What v2 buys
+
+1. **Cross-bundle dedup in the snapshot.** A shared sub-component
+   appears once in the CAR regardless of how many bundles reference
+   it. `result.uniqueBundleBlocks` reports the union size.
+2. **Per-block re-pin on import.** `pinCarBlocksToIpfs` re-pins every
+   block in each reconstructed bundle CAR under its canonical CID —
+   the gateway's `dag/put` is idempotent, so an importer hitting a
+   block already pinned by an earlier bundle is a no-op.
+3. **Schema continuity with Phase 2 wire path.** The bundle blocks in
+   the snapshot CAR are byte-for-byte the same dag-cbor sub-blocks
+   that `pinCarBlocksToIpfs` emits on the bundle-publish path; no
+   format translation is needed across export → import → re-pin.
+
+### Legacy raw-codec bundles
+
+Some wallets may carry pre-Phase-2 bundle index entries whose `cid`
+is a raw-codec `sha256(carBytes)` over the whole bundle CAR. The
+export path handles those defensively:
+
+- `fetchCarFromIpfs` short-circuits raw-codec roots to a single
+  `block/get` (the legacy semantics).
+- The export side stores the returned bytes under the original raw
+  CID as a single raw block in the snapshot CAR.
+- The import side walks the raw block as a single-block bundle DAG
+  (raw blocks are dag-cbor-link leaves by definition) and re-pins
+  through `pinCarBlocksToIpfs`, which preserves the raw-codec pin
+  semantics for legacy CIDs.
+
+### No back-compat with v1
+
+Per the issue #200 non-goal disclaimer, the parser does NOT accept
+the pre-Phase-5 v1 flat-CAR layout (each bundle CAR wrapped as a
+single raw block keyed by `sha256(bundleCar)` and authenticated by a
+re-hash pass). Both the builder and the parser are pinned to v2
+exactly — a v1 payload reaching `parseProfileSnapshot` triggers an
+explicit `Snapshot version 1 is older than this SDK accepts` error.
+Operators with pre-cutover backup files must re-export from a wallet
+running this SDK version.
+
+### Implementation map
+
+| Concern                                  | File                                                 | Function                              |
+|------------------------------------------|------------------------------------------------------|---------------------------------------|
+| Bundle DAG fetch + block-union assemble  | `profile/profile-export.ts`                          | `readAndFetchBundles`, `assembleCarBytes` |
+| Snapshot CAR parse + per-bundle DAG walk | `profile/profile-export.ts`                          | `parseProfileSnapshot`, `reconstructBundleCar` |
+| Per-bundle re-pin (block-by-block)       | `profile/profile-import.ts`                          | `pinAndRegisterBundle` (delegates to `pinCarBlocksToIpfs`) |
+| Per-block IPFS pin (producer)            | `profile/ipfs-client.ts`                             | `pinCarBlocksToIpfs`, `pinSingleBlock` |
+
+### Verification
+
+- **Round-trip.** `tests/unit/profile/profile-export.test.ts`
+  — export+parse preserves KV entries; embedded bundles recoverable;
+  byte-deterministic with fixed `createdAt`.
+- **Cross-bundle dedup.** `tests/unit/profile/profile-export.test.ts`
+  ("dedups bundle sub-blocks shared across multiple bundles") — two
+  bundles whose manifest blocks are byte-identical share that block
+  in the snapshot; `uniqueBundleBlocks < sum of per-bundle block
+  counts`.
+- **Diagnostic count.** `tests/unit/profile/profile-export.test.ts`
+  ("reports `uniqueBundleBlocks` count") — surfaces the union size
+  for CLI / operator reporting.
+- **Version cutover.** `tests/unit/profile/profile-export.test.ts`
+  ("rejects pre-Phase-5 v1 snapshots") — hand-crafted v1 doc
+  rejected with an explicit version error.
+- **Bundle authentication.** `tests/unit/profile/profile-export.test.ts`
+  ("rejects forged-CID bundle CARs") — bundle ref pointing at a CID
+  absent from the snapshot CAR is skipped on parse; the CarReader's
+  CID-binding check rejects any block whose bytes don't hash to its
+  CID.
 
 ## See also
 
