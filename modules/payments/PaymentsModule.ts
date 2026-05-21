@@ -69,6 +69,7 @@ import {
 import { TokenRegistry } from '../../registry';
 import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
+import { sanitizeReasonString } from '../../core/error-sanitize';
 import {
   narrowTransferMode,
   requireLegacyCoinSlot,
@@ -81,6 +82,10 @@ import {
   type ConservativeSourceSelection,
   type OutboxCreateInput,
 } from './transfer/conservative-sender';
+import {
+  extractPendingChainFromSdkData,
+  finalizeSourceTokenChain,
+} from './transfer/conservative-source-finalize';
 import {
   sendInstantUxf,
   type InstantCommitResult,
@@ -2389,10 +2394,96 @@ export class PaymentsModule {
                 // Assemble the source token at state N-1 (genesis + all
                 // transactions EXCEPT the final transfer-to-us).
                 const txCount = verified.pkg.transactionCount(tokenRoot.tokenId);
-                const sourceTokenJson = verified.pkg.assembleAtState(
+                let sourceTokenJson = verified.pkg.assembleAtState(
                   tokenRoot.tokenId,
                   txCount - 1,
                 );
+
+                // Issue #197 — proactively REPAIR any proofless
+                // intermediate tx(s) in the source chain BEFORE
+                // SdkToken.fromJSON (which throws on null
+                // inclusionProof and used to be silently swallowed by
+                // the outer try/catch, leaving the token wedged with
+                // status='confirmed' but sdkData in sender-predicate
+                // form — every subsequent Token.verify(trustBase)
+                // would then reject the token).
+                //
+                // Our SDK's `selectSources` now finalizes via the same
+                // `finalizeSourceTokenChain` routine before shipping
+                // (PaymentsModule.ts dispatchUxfConservativeSend), but
+                // this is a SECOND line of defense for bundles
+                // arriving from senders that lack the fix (older SDK
+                // versions, custom integrations). On unrecoverable
+                // failure we surface a structured operator-alert
+                // instead of silently wedging.
+                const sourceTokenJsonStr = JSON.stringify(sourceTokenJson);
+                const prooflessIntermediates =
+                  extractPendingChainFromSdkData(sourceTokenJsonStr);
+                if (prooflessIntermediates.length > 0) {
+                  try {
+                    const syntheticWrap: Token = {
+                      id: tokenRoot.tokenId,
+                      coinId: 'unknown',
+                      symbol: '',
+                      name: '',
+                      decimals: 0,
+                      amount: '0',
+                      status: 'pending',
+                      createdAt: Date.now(),
+                      updatedAt: Date.now(),
+                      sdkData: sourceTokenJsonStr,
+                    };
+                    const repaired = await finalizeSourceTokenChain(
+                      syntheticWrap,
+                      this.deps!.oracle,
+                    );
+                    if (
+                      repaired.sdkData !== undefined &&
+                      repaired.sdkData !== sourceTokenJsonStr
+                    ) {
+                      sourceTokenJson = JSON.parse(repaired.sdkData);
+                    } else {
+                      // finalizeSourceTokenChain returned the same ref —
+                      // either the chain was already finalized (shouldn't
+                      // happen given prooflessIntermediates.length > 0)
+                      // or repair surfaced no proofs. Treat as failure.
+                      throw new Error(
+                        'finalizeSourceTokenChain returned no change despite ' +
+                          `${prooflessIntermediates.length} proofless intermediate(s)`,
+                      );
+                    }
+                  } catch (repairErr) {
+                    const errMsg =
+                      repairErr instanceof Error ? repairErr.message : String(repairErr);
+                    logger.warn(
+                      'Payments',
+                      'Issue #197: received bundle with proofless intermediate tx(s); aggregator repair failed',
+                      {
+                        tokenId: tokenRoot.tokenId.slice(0, 16),
+                        prooflessIndexes: prooflessIntermediates.map((p) => p.txIndex),
+                        err: errMsg,
+                      },
+                    );
+                    try {
+                      this.deps!.emitEvent('transfer:operator-alert', {
+                        code: 'proof-throw',
+                        tokenId: tokenRoot.tokenId,
+                        bundleCid: ctx.bundleCid,
+                        senderTransportPubkey: ctx.senderTransportPubkey,
+                        message:
+                          `Issue #197: received bundle with proofless intermediate tx(s) at ` +
+                          `indexes=[${prooflessIntermediates.map((p) => p.txIndex).join(',')}] ` +
+                          `in source chain of token ${tokenRoot.tokenId.slice(0, 16)}; ` +
+                          `aggregator repair failed: ${sanitizeReasonString(errMsg)}. ` +
+                          'Token will NOT be ingested (would have wedged with sender-predicate sdkData).',
+                      });
+                    } catch {
+                      // emitter unavailable — diagnostic-only path
+                    }
+                    return;
+                  }
+                }
+
                 const sourceToken = await SdkToken.fromJSON(sourceTokenJson);
 
                 // Construct recipient UnmaskedPredicate and TokenState.
@@ -11506,6 +11597,54 @@ export class PaymentsModule {
           },
         );
 
+        // Issue #197 — finalize EVERY pending tx in EVERY selected
+        // source's chain BEFORE marking them transferring and BEFORE
+        // bundle construction. A local `status === 'confirmed'` is
+        // INDEPENDENT of `sdkData.transactions[*].inclusionProof`
+        // completeness — a token can be locally confirmed (e.g. via
+        // the recipient dispositionWriter fallback flip from Issue #195,
+        // or an instant-mode arrival whose deferred worker never ran)
+        // and still carry a proofless tx in its embedded chain. The
+        // recipient's `Token.verify(trustBase)` would then reject the
+        // bundle (because it walks EVERY tx in the chain) and silently
+        // wedge the token after `SdkToken.fromJSON` throws on the null
+        // proof.
+        //
+        // `finalizeSourceTokenChain` is the SOLE SDK routine that walks
+        // an SDK Token chain and attaches aggregator proofs. It is
+        // idempotent (returns the input reference unchanged when the
+        // chain is already fully finalized — no allocation) and throws
+        // `SOURCE_CHAIN_HARD_FAIL` only on irrecoverable failures
+        // (race-lost, sustained PATH_NOT_INCLUDED, etc.) — the
+        // orchestrator's catch path emits `transfer:failed`.
+        //
+        // Run BEFORE marking as transferring so a hard-fail here leaves
+        // no stale `'transferring'` state to clean up. The SpendQueue
+        // reservation remains held; existing throw points (e.g.
+        // commitSources) have the same property.
+        for (let i = 0; i < directSources.length; i++) {
+          const finalized = await finalizeSourceTokenChain(
+            directSources[i],
+            this.deps!.oracle,
+          );
+          if (finalized !== directSources[i]) {
+            directSources[i] = finalized;
+            this.tokens.set(finalized.id, finalized);
+            this.parsedTokenCache.delete(finalized.id);
+          }
+        }
+        for (let i = 0; i < splitSources.length; i++) {
+          const finalized = await finalizeSourceTokenChain(
+            splitSources[i].token,
+            this.deps!.oracle,
+          );
+          if (finalized !== splitSources[i].token) {
+            splitSources[i] = { ...splitSources[i], token: finalized };
+            this.tokens.set(finalized.id, finalized);
+            this.parsedTokenCache.delete(finalized.id);
+          }
+        }
+
         // Mark all selected sources as transferring + persist (matches legacy
         // semantics — prevents double-spend within the same session).
         for (const tok of directSources) {
@@ -11524,14 +11663,24 @@ export class PaymentsModule {
         return { directSources, splitSources };
       },
       preflightOptions: () => ({
-        // T.2.A wraps the existing aggregator path; for the dispatcher
-        // we fall through with a noop extractor since the legacy
-        // single-coin path's tokens are always finalized at selection.
-        // T.2.D.2 + T.5 wires the real chain extractor. The orchestrator
-        // accepts an empty chain → no-op preflight.
+        // Issue #197 — chain finalization happens earlier in
+        // `selectSources` via the standard `finalizeSourceTokenChain`
+        // helper, which returns NEW Token objects that the orchestrator
+        // then passes to commitSources. Doing the work there (rather
+        // than via the preflight callback hooks) avoids fighting the
+        // `Token.sdkData` readonly contract and keeps a single SDK
+        // routine — `finalizeSourceTokenChain` — as the sole place
+        // that walks a chain and attaches aggregator proofs.
+        //
+        // Preflight is therefore a documented no-op here. If
+        // `selectSources` ever regresses (or a future code path skips
+        // it and routes through this orchestrator directly), the
+        // recipient's `Token.verify(trustBase)` will reject the
+        // bundle and the operator alert below catches it.
         resolveRequestId: () => {
           throw new SphereError(
-            'preflight resolveRequestId invoked unexpectedly in T.2.D.1 dispatcher',
+            'preflight resolveRequestId invoked unexpectedly — ' +
+              'selectSources should have already finalized all source chains via finalizeSourceTokenChain',
             'INVALID_CONFIG',
           );
         },
