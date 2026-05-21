@@ -188,17 +188,126 @@ defeats it:
   `publishToIpfs` propagates from provider factory → Sphere →
   PaymentsModule → sender deps.
 
+## Phase 4 — Hierarchical profile snapshots (lean snapshot v3)
+
+The lean profile snapshot — the payload published to the aggregator
+pointer to propagate every per-device write across a wallet's HD
+addresses — followed the bundle-CAR migration in Phase 4. Schema
+**v3** replaces the v2 single-block layout (`entries[]` inline in the
+root block) with a hierarchical DAG: the root block carries a sorted
+list of `entryGroups[*]` CID references, one per group; each ref
+points at a dag-cbor sub-block holding that group's encrypted KV
+entries.
+
+### v3 root + sub-block layout
+
+```
+Snapshot root (dag-cbor, codec 0x71)
+├─ version: 3
+├─ chainPubkey, network, createdAt
+├─ entryGroups: [                                  ← sorted by groupKey
+│    { groupKey: "DIRECT_aabbcc_ddeeff",
+│      entriesCid: CID(...) ───────────────────→ Per-group entries sub-block
+│      entryCount: N }                                ├─ groupKey: "DIRECT_aabbcc_ddeeff"
+│    { groupKey: "DIRECT_112233_445566",              └─ entries: [{ key, value }, …]
+│      entriesCid: CID(...) },                                       (sorted by key)
+│    { groupKey: "__global__",
+│      entriesCid: CID(...) },
+│  ]
+└─ bundles: [{ cid, status, createdAt, tokenCount? }, …]    ← already CIDs, inline
+```
+
+### Group key derivation
+
+A KV key's group is the leading addressId capture of the regex
+`^(DIRECT_[0-9a-f]{6}_[0-9a-f]{6})\.` — mirroring the regex used by
+`profile/profile-snapshot-dispatcher.ts` to partition incoming
+snapshots by writer. Keys that do not match (mnemonic, master_key,
+addresses.tracked, tokens.bundle.*, consolidation.*, etc.) map to
+`__global__`. The grouping is byte-deterministic — two builds of the
+same Profile state produce identical sub-block CIDs.
+
+### What v3 buys
+
+1. **Cross-snapshot dedup.** Two snapshots whose entries for a given
+   address group are byte-identical share the same sub-block CID and
+   dedup at the IPFS storage layer. A wallet whose `__global__` group
+   never changes (no new mnemonic, no new master key, etc.) republishes
+   the same global sub-block CID across every snapshot — only the
+   root and the changed per-address sub-blocks accumulate fresh CIDs.
+2. **Partial-recovery fetch.** A receiver that knows it only needs a
+   specific HD address can fetch the root block plus that single
+   address sub-block, skipping every other group. The wire cost of a
+   targeted apply drops from O(total wallet KV bytes) to O(address
+   KV bytes + root metadata).
+3. **Group-level fault isolation.** A corrupted per-address sub-block
+   surfaces as a clean error scoped to that group's writers; the rest
+   of the snapshot still applies.
+
+### v2 read-back compatibility
+
+The parser still accepts v2 snapshots (single-block, `entries[]`
+inline) for transition compatibility with any in-flight pre-cutover
+snapshots — but the builder no longer emits v2. The supported version
+range is `[2, 3]`. v1 (the fat `profile-export.ts` back-up format) is
+explicitly rejected by the lean reader.
+
+### Parser API
+
+- `parseLeanProfileSnapshot(carBytes)` — single-shot parser for the
+  in-process CAR path. For v3 inputs it walks the sub-blocks present
+  in the same CAR (no IPFS round-trip). For v2 it returns the inline
+  entries directly.
+- `parseLeanProfileSnapshotFromRootBlock(rootBytes, fetcher?)` — the
+  production path. Pass a `fetcher` (production wiring binds to
+  `fetchFromIpfs(gateways, cid)`) to pull each per-group sub-block by
+  CID. Omitting the fetcher on a v3 input returns the root metadata
+  plus an empty `entries[]` (useful when the caller defers entry
+  loading to a partial fetch).
+- `parseLeanProfileSnapshotPartial(rootBytes, fetcher, options)` —
+  fetches ONLY the requested address groups (and, by default, the
+  global group). Returns the materialised entry slice plus
+  `unfetchedGroupKeys` listing every group the filter skipped.
+  `bundles[]` is always populated regardless of the entries-side
+  filter (it lives in the root block).
+
+### Implementation map
+
+| Concern                                  | File                                                 | Function                              |
+|------------------------------------------|------------------------------------------------------|---------------------------------------|
+| v3 builder (groupKey partition + emit)   | `profile/profile-lean-snapshot.ts`                   | `buildEntryGroupBlocks`, `assembleCarBytes` |
+| v3 root-block parser + sub-block walker  | `profile/profile-lean-snapshot.ts`                   | `parseLeanProfileSnapshotFromRootBlock`, `fetchAndDecodeAllGroupEntries` |
+| v3 partial-fetch parser                  | `profile/profile-lean-snapshot.ts`                   | `parseLeanProfileSnapshotPartial`     |
+| Production fetcher wiring (pointer-poll) | `profile/factory.ts`                                 | `setApplySnapshotCallback` (binds fetcher to `fetchFromIpfs`) |
+| Production fetcher wiring (fetchAndJoin) | `profile/pointer-wiring.ts`                          | `buildFetchAndJoin` (binds fetcher to `fetchFromIpfs`) |
+| Per-block IPFS pin (producer)            | `profile/ipfs-client.ts`                             | `pinCarBlocksToIpfs` — already handles multi-block CARs |
+
+### Verification
+
+- **Multi-block emit + determinism.** `tests/unit/profile/profile-lean-snapshot-v3.test.ts`
+  — root + N sub-blocks; two builds of the same state yield identical
+  sub-block CIDs.
+- **Cross-snapshot dedup.** `tests/unit/profile/profile-lean-snapshot-v3.test.ts`
+  — two snapshots sharing an address group share that group's
+  sub-block CID; union of pinned blocks < sum of per-snapshot blocks.
+- **Fetcher walk + group validation.** `tests/unit/profile/profile-lean-snapshot-v3.test.ts`
+  — parser walks per-group sub-blocks via the supplied fetcher;
+  sub-block with wrong internal `groupKey` is rejected.
+- **Partial fetch.** `tests/unit/profile/profile-lean-snapshot-v3.test.ts`
+  — only requested address sub-blocks fetched; `unfetchedGroupKeys`
+  reports skipped groups; `includeGlobal: false` skips the global
+  sub-block too.
+- **v2 backward compatibility.** `tests/unit/profile/profile-lean-snapshot-v3.test.ts`
+  — hand-crafted v2 single-block CAR still parses; no fetcher needed.
+
 ## Remaining phases
 
-- **Phase 4 — Hierarchical profile snapshots.** Migrate
-  `entries[]` (per-address ledger slices) into addressable sub-blocks
-  so partial recovery can fetch only relevant slices.
 - **Phase 5 — Profile export/import alignment.** Migrate the
   `.sphere` backup file format to the same hierarchical CAR shape so
   imports dedup against bundles already on the receiving wallet.
 
-Both depend on the bundle-CAR shape stabilising. With Phase 2 + 3 in
-place that shape is now stable and verified.
+Depends on the bundle-CAR shape (Phase 2 + 3) and the lean-snapshot
+shape (Phase 4) — both now stable and verified.
 
 ## See also
 

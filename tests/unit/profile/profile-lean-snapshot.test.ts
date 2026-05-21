@@ -531,17 +531,19 @@ describe('parseLeanProfileSnapshot — validation', () => {
     );
   });
 
-  it('rejects unknown future version (>2)', async () => {
+  it('rejects unknown future version (>3)', async () => {
+    // Phase 4 (issue #200) — v3 became the current builder version;
+    // v4+ is still ahead of this SDK and must be rejected.
     const carBytes = await buildCarWithDoc({
-      version: 3,
+      version: 4,
       chainPubkey: TEST_CHAIN_PUBKEY_A,
       network: 'testnet',
       createdAt: Date.now(),
-      entries: [],
+      entryGroups: [],
       bundles: [],
     });
     await expect(parseLeanProfileSnapshot(carBytes)).rejects.toThrow(
-      /version 3 is newer/,
+      /version 4 is newer/,
     );
   });
 
@@ -731,7 +733,7 @@ describe('parseLeanProfileSnapshot — validation', () => {
 // =============================================================================
 
 describe('profile-lean-snapshot — cross-version isolation', () => {
-  it('v1 reader (parseProfileSnapshot) rejects lean v2 CARs', async () => {
+  it('v1 reader (parseProfileSnapshot) rejects lean v3 CARs', async () => {
     const { parseProfileSnapshot } = await import('../../../profile/profile-export');
 
     const storage = new InMemoryStorageProvider();
@@ -747,9 +749,10 @@ describe('profile-lean-snapshot — cross-version isolation', () => {
       network: 'testnet',
     });
 
-    // v1 reader caps PROFILE_SNAPSHOT_VERSION=1, sees version=2 and rejects.
+    // Phase 4 (issue #200) — builder now emits v3. The v1 reader still
+    // caps PROFILE_SNAPSHOT_VERSION=1 and rejects anything newer.
     await expect(parseProfileSnapshot(result.carBytes)).rejects.toThrow(
-      /version 2 is newer/,
+      /version 3 is newer/,
     );
   });
 

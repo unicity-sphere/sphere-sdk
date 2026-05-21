@@ -462,7 +462,15 @@ function buildFetchAndJoin(deps: {
     //    is a hard PROTOCOL_ERROR rather than a silent re-write.
     let snapshot: LeanProfileSnapshot;
     try {
-      snapshot = parseLeanProfileSnapshotFromRootBlock(rootBlockBytes);
+      // Phase 4 (issue #200) — v3 snapshots carry KV entries in
+      // per-group sub-blocks; the fetcher closure resolves each
+      // sub-block CID against the same gateway list as the root.
+      // `fetchFromIpfs` content-address-verifies every block so the
+      // dag-cbor decode operates on authenticated bytes.
+      snapshot = await parseLeanProfileSnapshotFromRootBlock(
+        rootBlockBytes,
+        (subBlockCid) => fetchFromIpfs([...deps.gateways], subBlockCid),
+      );
     } catch (err) {
       // The remote CAR is malformed or not a lean snapshot. Treat
       // as a hard protocol error. The next reconcile pass will

@@ -664,13 +664,22 @@ export function createProfileProviders(
   // object is built. The provider's late-binding setter resolves this
   // ordering cleanly.
   tokenStorage.setApplySnapshotCallback(async (cidString) => {
-    // `dag/import` stored each CAR block under its canonical CID, so
-    // `block/get(rootCid)` returns the dag-cbor encoded root block
-    // bytes (NOT a CAR envelope). `fetchFromIpfs` already verifies
-    // sha256(bytes) == cidString.multihash, so the dag-cbor decode
-    // below operates on authenticated bytes.
+    // `dag/put` (used by `pinCarBlocksToIpfs`) stored each CAR block
+    // under its canonical CID, so `block/get(rootCid)` returns the
+    // dag-cbor encoded root block bytes (NOT a CAR envelope).
+    // `fetchFromIpfs` already verifies sha256(bytes) ==
+    // cidString.multihash, so the dag-cbor decode below operates on
+    // authenticated bytes.
+    //
+    // Phase 4 (issue #200) — v3 hierarchical snapshots carry their KV
+    // entries in per-group sub-blocks linked from the root by CID. We
+    // pass a fetcher closure so the parser can pull each sub-block
+    // from IPFS lazily; v2 single-block snapshots ignore the fetcher.
     const rootBlockBytes = await fetchFromIpfs(ipfsGateways, cidString);
-    const snapshot = parseLeanProfileSnapshotFromRootBlock(rootBlockBytes);
+    const snapshot = await parseLeanProfileSnapshotFromRootBlock(
+      rootBlockBytes,
+      (subBlockCid) => fetchFromIpfs(ipfsGateways, subBlockCid),
+    );
     return dispatchParsedSnapshot(snapshot);
   });
 

@@ -417,6 +417,13 @@ describe('fetchAndJoin — Item #15 Phase D.2 snapshot apply', () => {
     carBytes: Uint8Array;
     rootBlockBytes: Uint8Array;
     rootCid: string;
+    /**
+     * Phase 4 (issue #200) — v3 snapshots are multi-block (root + one
+     * sub-block per entry group). Tests that mock `fetchFromIpfs` for
+     * the entire walk now look up by CID via this map; the mock's
+     * `mockImplementation` should dispatch through it.
+     */
+    blockMap: Map<string, Uint8Array>;
   }> {
     const { buildLeanProfileSnapshot } = await import('../../../profile/profile-lean-snapshot');
     // Stub storage with one KV entry under an addressId.
@@ -441,16 +448,19 @@ describe('fetchAndJoin — Item #15 Phase D.2 snapshot apply', () => {
       network: 'testnet',
       createdAt: 1_700_000_000_000,
     });
-    // Extract the root block bytes from the CAR — what `fetchFromIpfs`
-    // returns under the new `dag/import` pin path.
+    // Extract every block from the CAR. The root block is the dag-cbor
+    // envelope; the others are per-group entry sub-blocks linked from
+    // the root. `fetchFromIpfs` returns each block's bytes under its
+    // canonical CID, so mocks must dispatch by CID via blockMap.
     const { CarReader } = await import('@ipld/car');
     const reader = await CarReader.fromBytes(result.carBytes);
     const roots = await reader.getRoots();
+    const blockMap = new Map<string, Uint8Array>();
     let rootBlockBytes: Uint8Array | undefined;
     for await (const block of reader.blocks()) {
+      blockMap.set(block.cid.toString(), block.bytes);
       if (block.cid.toString() === roots[0]?.toString()) {
         rootBlockBytes = block.bytes;
-        break;
       }
     }
     if (!rootBlockBytes) throw new Error('test: root block missing from CAR');
@@ -458,16 +468,21 @@ describe('fetchAndJoin — Item #15 Phase D.2 snapshot apply', () => {
       carBytes: result.carBytes,
       rootBlockBytes,
       rootCid: result.rootCid,
+      blockMap,
     };
   }
 
   it('parses the snapshot root block, calls applySnapshot, and persists the version', async () => {
-    const { rootBlockBytes, rootCid } = await buildSnapshotCar();
+    const { rootCid, blockMap } = await buildSnapshotCar();
 
     const { fetchFromIpfs } = await import('../../../profile/ipfs-client');
     const fetchMock = fetchFromIpfs as ReturnType<typeof vi.fn>;
     fetchMock.mockReset();
-    fetchMock.mockImplementation(async () => rootBlockBytes);
+    fetchMock.mockImplementation(async (_gateways: string[], cid: string) => {
+      const bytes = blockMap.get(cid);
+      if (!bytes) throw new Error(`test mock: no block for ${cid}`);
+      return bytes;
+    });
 
     const persisted: number[] = [];
     const applyCalls: Array<{ entryCount: number; bundleCount: number }> = [];
@@ -514,11 +529,15 @@ describe('fetchAndJoin — Item #15 Phase D.2 snapshot apply', () => {
     // cursor behind the unconsumed remote, so the next reconcile pass
     // re-fetches + re-applies idempotently. Reversing the order would
     // strand the cursor past unapplied snapshot state.
-    const { rootBlockBytes, rootCid } = await buildSnapshotCar();
+    const { rootCid, blockMap } = await buildSnapshotCar();
     const { fetchFromIpfs } = await import('../../../profile/ipfs-client');
     const fetchMock = fetchFromIpfs as ReturnType<typeof vi.fn>;
     fetchMock.mockReset();
-    fetchMock.mockImplementation(async () => rootBlockBytes);
+    fetchMock.mockImplementation(async (_gateways: string[], cid: string) => {
+      const bytes = blockMap.get(cid);
+      if (!bytes) throw new Error(`test mock: no block for ${cid}`);
+      return bytes;
+    });
 
     const order: string[] = [];
     const applySnapshot = vi.fn(async () => {
@@ -552,12 +571,16 @@ describe('fetchAndJoin — Item #15 Phase D.2 snapshot apply', () => {
   });
 
   it('does NOT advance the version when applySnapshot throws', async () => {
-    const { rootBlockBytes, rootCid } = await buildSnapshotCar();
+    const { rootCid, blockMap } = await buildSnapshotCar();
 
     const { fetchFromIpfs } = await import('../../../profile/ipfs-client');
     const fetchMock = fetchFromIpfs as ReturnType<typeof vi.fn>;
     fetchMock.mockReset();
-    fetchMock.mockImplementation(async () => rootBlockBytes);
+    fetchMock.mockImplementation(async (_gateways: string[], cid: string) => {
+      const bytes = blockMap.get(cid);
+      if (!bytes) throw new Error(`test mock: no block for ${cid}`);
+      return bytes;
+    });
 
     let persistCalled = false;
     const applySnapshot = vi.fn(async () => {
