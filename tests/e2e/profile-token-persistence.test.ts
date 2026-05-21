@@ -37,8 +37,9 @@ import {
   waitForAllCoins,
   type BalanceSnapshot,
 } from './helpers';
-import { makeProfileProviders } from './profile-helpers';
+import { makeProfileProviders, unwrapProfileProviders } from './profile-helpers';
 import { preflightSkip } from './lib/preflight';
+import type { ProfileTokenStorageProvider } from '../../profile/profile-token-storage-provider';
 
 // =============================================================================
 // Test Suite
@@ -50,6 +51,7 @@ describe.skipIf(SKIP_INFRA)('Profile (OrbitDB) Active Token Persistence E2E', ()
   // Shared state across ordered tests
   let dirsA: ReturnType<typeof makeTempDirs>;
   let sphereA: Sphere;
+  let tokenStorageA: ProfileTokenStorageProvider;
   let savedMnemonicA: string;
   let savedNametagA: string;
   let originalBalances: Map<string, BalanceSnapshot>;
@@ -80,7 +82,11 @@ describe.skipIf(SKIP_INFRA)('Profile (OrbitDB) Active Token Persistence E2E', ()
     cleanupDirs.push(dirsA.base);
     await ensureTrustbase(dirsA.dataDir);
 
-    const providersA = makeProfileProviders(dirsA);
+    // Suppress the auto-debouncer so all multi-coin faucet activity
+    // coalesces into one pending state; explicit `awaitNextFlush()`
+    // below produces V1 only.
+    const providersA = makeProfileProviders(dirsA, { flushDebounceMs: 300_000 });
+    tokenStorageA = unwrapProfileProviders(providersA).tokenStorage;
 
     console.log(`\n[Test 1] Creating Profile-backed wallet @${savedNametagA}...`);
     const { sphere, created, generatedMnemonic } = await Sphere.init({
@@ -114,14 +120,34 @@ describe.skipIf(SKIP_INFRA)('Profile (OrbitDB) Active Token Persistence E2E', ()
       originalTokenAmounts.set(coin.symbol, getTokenAmounts(sphereA, coin.symbol));
     }
 
-    // Explicit sync flush — forces Profile's write-behind buffer to
-    // pin the latest CAR bundle to the live IPFS gateway. sync()
-    // drains pending V5 finalizations internally first so any token
-    // still in `_pendingFinalization` shape (which tokenToTxf would
-    // drop) is finalized before being serialized into the CAR. 60s
-    // budget matches the prior explicit drain.
-    console.log('  Flushing Profile state to IPFS+OrbitDB...');
+    // Drain pending V5 finalizations and snapshot local state. sync()
+    // drains finalizations internally so any token still in
+    // `_pendingFinalization` shape (which tokenToTxf would drop) is
+    // finalized before being serialized into the CAR.
+    console.log('  Draining pending V5 finalizations + saving local state...');
     await sphereA.payments.sync({ drainTimeoutMs: 60_000 });
+
+    // Full-profile-sync: force ONE explicit lean-snapshot publish via
+    // `awaitNextFlush()`. The raised `flushDebounceMs` (5 min, see
+    // makeProfileProviders) means the auto-debouncer has not fired
+    // during faucet reception — all saves coalesced into one pending
+    // state. This serialized flush builds the lean profile snapshot
+    // CAR, pins it to IPFS, and publishes the snapshot CID at V1 via
+    // the aggregator pointer. Because V1 is the FIRST version on a
+    // fresh wallet, Phase-3 walkback is skipped — no V_n→V_(n-1) CAR
+    // fetch race against aggregator-gateway propagation. Multi-coin
+    // tests are particularly susceptible because the legacy 2s auto-
+    // debounce fires V1…V_N during the long faucet poll, and V≥2 walks
+    // back to V1 before V1's CAR has propagated. Single-shot publish
+    // fixes the race.
+    console.log('  Publishing lean profile snapshot to IPFS + aggregator pointer...');
+    await tokenStorageA.awaitNextFlush(120_000);
+
+    // Allow IPFS replication so Device B's `recoverLatest()` finds the
+    // freshly-pinned snapshot CAR via the aggregator's reachable
+    // gateway.
+    console.log('  Waiting 10s for IPFS replication to aggregator gateways...');
+    await new Promise((r) => setTimeout(r, 10_000));
 
     console.log('[Test 1] PASSED: multi-coin wallet + Profile state published');
   }, 240_000);

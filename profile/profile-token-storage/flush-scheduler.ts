@@ -53,11 +53,8 @@
  * @module profile/profile-token-storage/flush-scheduler
  */
 
-import { pinToIpfs } from '../ipfs-client.js';
-import { CID } from 'multiformats/cid';
-import * as raw from 'multiformats/codecs/raw';
-import { sha256 } from '@noble/hashes/sha2.js';
-import { create as createMultihash } from 'multiformats/hashes/digest';
+import { pinCarBlocksToIpfs } from '../ipfs-client.js';
+import { extractCarRootCid } from '../../uxf/transfer-payload.js';
 import type {
   ProfileSnapshotPublishResult,
   UxfBundleRef,
@@ -392,10 +389,14 @@ export class FlushScheduler {
       //     only fires when the merged-state CAR happens to be byte-
       //     identical to a known anchor.
       if (noDataMode) {
-        const projectedCid = CID.createV1(
-          raw.code,
-          createMultihash(0x12, sha256(carBytes)),
-        ).toString();
+        // Issue #200 Phase 2: bundle CIDs are now the dag-cbor envelope
+        // root of the CAR (matches what `pinCarBlocksToIpfs` publishes
+        // below). The legacy raw-pinning convention computed
+        // `CID.createV1(raw, sha256(carBytes))` here, but every newly
+        // pinned bundle is published under its envelope CID — the
+        // short-circuit comparison must use the same convention or it
+        // would never fire.
+        const projectedCid = await extractCarRootCid(carBytes);
         const knownDiscovered = this.host.getLastDiscoveredPointerCid();
         if (knownDiscovered === projectedCid) {
           this.host.log(
@@ -598,7 +599,19 @@ export class FlushScheduler {
       if (useCachedCid && cachedCidNow) {
         cid = cachedCidNow;
       } else {
-        cid = await pinToIpfs(this.host.ipfsGateways, carBytes);
+        // Issue #200 Phase 2: pin each block in the bundle CAR under
+        // its canonical CID (envelope + manifest + per-token elements)
+        // and publish the dag-cbor envelope CID as the bundle ref.
+        // Individual tokens / sub-token components are now directly
+        // addressable on IPFS, and bundles that share blocks dedup at
+        // the storage layer (paying off most in the hierarchical model
+        // from Phase 3 onward).
+        const expectedRootCid = await extractCarRootCid(carBytes);
+        cid = await pinCarBlocksToIpfs(
+          this.host.ipfsGateways,
+          carBytes,
+          expectedRootCid,
+        );
         this.host.setLastPinnedCid(cid);
       }
 

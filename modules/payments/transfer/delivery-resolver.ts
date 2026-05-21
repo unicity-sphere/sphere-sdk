@@ -176,6 +176,23 @@ export interface PublishToIpfsResult {
  * IPFS failure — that fallback policy belongs to the sender orchestrator
  * (T.2.D.1), which has the relay context to decide whether retry is
  * appropriate.
+ *
+ * **CID-correspondence contract (issue #200, Phase 1).** The returned
+ * `cid` MUST equal `extractCarRootCid(carBytes)` (the dag-cbor CID of
+ * the CAR's single root block). The wire `payload.bundleCid` on
+ * `uxf-cid` envelopes uses `extractCarRootCid(carBytes)`, and the
+ * recipient fetches that CID against the gateway. A publisher whose
+ * returned CID differs from `extractCarRootCid(carBytes)` is buggy:
+ *  - In the obvious failure mode the publisher pinned the bytes under
+ *    a different CID (e.g. a raw CID via `pinToIpfs(carBytes)`), and
+ *    the recipient's gateway fetch for `bundleCid` 404s indefinitely.
+ *  - In the subtle failure mode the publisher pinned the right blocks
+ *    but lied about the CID — the recipient succeeds anyway but the
+ *    publisher's contract is broken.
+ *
+ * Use {@link createUxfCarPublisher} (from `./ipfs-publisher`) to obtain
+ * the canonical, contract-compliant publisher. Rolling your own with
+ * `pinToIpfs(carBytes)` is the documented footgun — do not do that.
  */
 export type PublishToIpfsCallback = (
   carBytes: Uint8Array,

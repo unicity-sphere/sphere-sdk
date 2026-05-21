@@ -30,7 +30,8 @@ import {
   encryptProfileValue,
   decryptProfileValue,
 } from './encryption.js';
-import { pinToIpfs, fetchFromIpfs } from './ipfs-client.js';
+import { pinCarBlocksToIpfs, fetchCarFromIpfs } from './ipfs-client.js';
+import { extractCarRootCid } from '../uxf/transfer-payload.js';
 
 // =============================================================================
 // Constants
@@ -253,7 +254,12 @@ export class ConsolidationEngine {
 
       for (const cid of sourceCids) {
         try {
-          const carBytes = await fetchFromIpfs(this.ipfsGateways, cid);
+          // Issue #200 Phase 2: bundle CIDs are now dag-cbor envelope
+          // CIDs (per-block pinned). `fetchCarFromIpfs` walks the
+          // hierarchical DAG and reassembles a synthetic CAR so the
+          // downstream `UxfPackage.fromCar` consumer stays unchanged.
+          // Legacy raw-CIDs still resolve via the backward-compat branch.
+          const carBytes = await fetchCarFromIpfs(this.ipfsGateways, cid);
           const pkg = await UxfPackage.fromCar(carBytes);
           mergedPkg.merge(pkg);
           successfullyMergedCids.push(cid);
@@ -275,7 +281,18 @@ export class ConsolidationEngine {
 
       // Step 6: export, pin (unencrypted)
       const consolidatedCar = await mergedPkg.toCar();
-      const consolidatedCid = await pinToIpfs(this.ipfsGateways, consolidatedCar);
+      // Issue #200 Phase 2: pin each block in the consolidated CAR
+      // under its canonical CID and publish the dag-cbor envelope CID
+      // as the consolidated bundle ref. Per-block pinning means tokens
+      // shared between the consolidated bundle and unsuperseded sibling
+      // bundles dedup at the IPFS storage layer.
+      const consolidatedExpectedRootCid =
+        await extractCarRootCid(consolidatedCar);
+      const consolidatedCid = await pinCarBlocksToIpfs(
+        this.ipfsGateways,
+        consolidatedCar,
+        consolidatedExpectedRootCid,
+      );
 
       // Count tokens in the merged package
       const tokenCount = mergedPkg.assembleAll().size;

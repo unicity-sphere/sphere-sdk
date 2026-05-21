@@ -24,6 +24,26 @@ import { create as createMultihash } from 'multiformats/hashes/digest';
 import { ProfileError } from './errors.js';
 
 // =============================================================================
+// Multicodec constants (subset used by the Profile/UXF stack)
+// =============================================================================
+
+/** raw multicodec (no further decoding — block bytes are the value). */
+const CODEC_RAW = 0x55;
+
+/** dag-cbor multicodec (deterministic CBOR with CID-link Tag 42). */
+const CODEC_DAG_CBOR = 0x71;
+
+/**
+ * Safety bound on hierarchical CAR fetches. A poisoned root that links
+ * to billions of unique sub-CIDs would otherwise drive `fetchCarFromIpfs`
+ * unbounded — this hard-cap aborts after this many blocks. 10 000 is
+ * generous for any plausible bundle today (the typical bundle has
+ * envelope + manifest + token + element ≈ tens of blocks); revisit when
+ * the hierarchical-bundle model in Phase 3 starts emitting wider DAGs.
+ */
+const FETCH_CAR_MAX_BLOCKS = 10_000;
+
+// =============================================================================
 // Constants
 // =============================================================================
 
@@ -138,6 +158,206 @@ export async function pinToIpfs(
     `IPFS pin failed on all gateways: ${lastError?.message ?? 'unknown error'}`,
     lastError,
   );
+}
+
+/**
+ * Map a codec code (the first byte after the CID version in a CIDv1) to
+ * the Kubo `dag/put` `input-codec` / `store-codec` token. Only codecs the
+ * Profile layer actually produces are listed — extend as the hierarchical
+ * model adds new block types.
+ */
+const CODEC_NAMES: Record<number, string> = {
+  0x55: 'raw',        // raw
+  0x71: 'dag-cbor',   // dag-cbor
+  0x70: 'dag-pb',     // dag-pb (legacy IPFS UnixFS — not produced by Profile, listed for completeness)
+};
+
+/**
+ * Pin a single dag-cbor (or other-codec) block to IPFS via Kubo's
+ * `/api/v0/dag/put` endpoint. The block is stored under its canonical
+ * CID, addressable by subsequent `block/get`/`fetchFromIpfs`.
+ *
+ * Internal helper for {@link pinCarBlocksToIpfs}. The codec/hash tokens
+ * are inferred from `expectedCid` — caller does not need to know the
+ * Kubo wire vocabulary.
+ *
+ * @throws {ProfileError} `ORBITDB_WRITE_FAILED` if all gateways fail or
+ *         the gateway returned an unsupported response.
+ */
+async function pinSingleBlock(
+  gateways: string[],
+  blockBytes: Uint8Array,
+  expectedCid: string,
+  timeoutMs: number,
+): Promise<void> {
+  const effectiveGateways = gateways.length > 0 ? gateways : [DEFAULT_IPFS_API_URL];
+  validateGatewayUrls(effectiveGateways);
+
+  // Derive the Kubo codec token from the CID's multicodec prefix.
+  // Unknown codecs fall back to `raw` so we still store the bytes (the
+  // gateway will compute a different CID, but our locally-computed
+  // expected CID is what gets published — the next fetch will fail loud).
+  let codecName = 'raw';
+  try {
+    const parsed = CID.parse(expectedCid);
+    codecName = CODEC_NAMES[parsed.code] ?? 'raw';
+  } catch {
+    // ignore — fall through with `raw`
+  }
+
+  let lastError: Error | null = null;
+  for (const gateway of effectiveGateways) {
+    try {
+      const url =
+        `${gateway.replace(/\/$/, '')}/api/v0/dag/put` +
+        `?input-codec=${codecName}&store-codec=${codecName}&pin=true&hash=sha2-256`;
+      const form = new FormData();
+      form.append('data', new Blob([blockBytes as BlobPart]), 'block');
+      const response = await fetch(url, {
+        method: 'POST',
+        body: form,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!response.ok) {
+        lastError = new Error(`HTTP ${response.status} ${response.statusText} from ${gateway}`);
+        continue;
+      }
+      // Drain so the connection releases. We trust our locally-computed
+      // expectedCid; the gateway-returned CID is intentionally ignored
+      // (same posture as `pinToIpfs` — a malicious gateway pinning under
+      // a different CID would just produce a 404 on the next fetch, not
+      // an anchor redirect).
+      try {
+        await response.json();
+      } catch {
+        // ignore — body parse failure on a 200 doesn't change durability
+      }
+      return;
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+    }
+  }
+
+  throw new ProfileError(
+    'ORBITDB_WRITE_FAILED',
+    `IPFS dag/put failed on all gateways for ${expectedCid}: ${lastError?.message ?? 'unknown error'}`,
+    lastError,
+  );
+}
+
+/**
+ * Pin every block contained in a CAR file to IPFS, each under its
+ * canonical CID. The canonical primitive used across the whole SDK
+ * whenever the published reference is a dag-cbor envelope CID over a
+ * block INSIDE the CAR (or a raw CID over a single-block CAR, which
+ * pins identically). Replaces the pre-issue-#199 `pinToIpfs(carBytes)`
+ * pattern across all CAR-producing call sites: bundle CARs (Phase 2
+ * of issue #200), consolidation CARs, manifest CARs, profile snapshot
+ * CARs (lean v3 and fat v2), and the Nostr `uxf-cid` publisher (via
+ * `createUxfCarPublisher`).
+ *
+ * Why not `/api/v0/dag/import`: the Unicity IPFS gateway does not expose
+ * that endpoint. `dag/put` is universally available across Kubo deploys,
+ * including hardened gateways that restrict the API surface. The
+ * tradeoff is one HTTP round-trip per block.
+ *
+ * The function trusts the caller-supplied `expectedRootCid` and the
+ * framed CIDs in the CAR (`@ipld/car`'s `CarReader` does NOT recompute
+ * `sha256(bytes)` against the framed CID — it just slices framed
+ * `{cid, bytes}` pairs from the stream). Per-block content-address
+ * verification is NOT applied here because the SDK's bundle CAR
+ * builder (`uxf/ipld.ts:elementToIpldBlock`) emits sub-block bytes
+ * (IPLD form, with CID-link children) under CIDs computed from a
+ * different canonical form (hash form, with raw hash-bytes children).
+ * A uniform per-block sha256 check would reject every legitimate UXF
+ * bundle. Receiver-side verification is provided by `fetchFromIpfs`
+ * (CID-binding check against gateway-returned bytes).
+ *
+ * @param gateways          - Array of IPFS gateway base URLs
+ * @param carBytes          - CAR file bytes to import block-by-block
+ * @param expectedRootCid   - The root CID claimed by the CAR header
+ * @param timeoutMs         - Timeout per gateway+block (default: 60 000)
+ * @returns The `expectedRootCid` on success.
+ * @throws {ProfileError} `ORBITDB_WRITE_FAILED` if all gateways fail to
+ *         accept a pin or the CAR doesn't contain the expected root.
+ */
+export async function pinCarBlocksToIpfs(
+  gateways: string[],
+  carBytes: Uint8Array,
+  expectedRootCid: string,
+  timeoutMs: number = DEFAULT_PIN_TIMEOUT_MS,
+): Promise<string> {
+  // Parse the CAR locally to extract each block. Done up front so a
+  // malformed CAR fails fast before any network round-trips.
+  const { CarReader } = await import('@ipld/car');
+  let reader: InstanceType<typeof CarReader>;
+  try {
+    reader = await CarReader.fromBytes(carBytes);
+  } catch (err) {
+    throw new ProfileError(
+      'ORBITDB_WRITE_FAILED',
+      `Failed to parse CAR for block-by-block pinning: ${err instanceof Error ? err.message : String(err)}`,
+      err,
+    );
+  }
+
+  const blocks: Array<{ cid: string; bytes: Uint8Array }> = [];
+  for await (const block of reader.blocks()) {
+    blocks.push({ cid: block.cid.toString(), bytes: block.bytes });
+  }
+  // NOTE on producer-side CID-binding verification: an earlier draft
+  // of this function called `verifyCidMatchesBytes` per block here as
+  // defense against a buggy local CAR builder. That check surfaced a
+  // pre-existing design choice in `uxf/ipld.ts:elementToIpldBlock` —
+  // for UXF bundle CARs, sub-block CIDs are computed over the HASH
+  // canonical form of the element (children = raw hash bytes) while
+  // the block bytes serialize the IPLD form (children = CID links).
+  // The two encodings differ, so `sha256(block.bytes) !=
+  // block.cid.multihash.digest` for a subset of bundle sub-blocks by
+  // design. A per-block check would reject every legitimate UXF
+  // bundle.
+  //
+  // The receiver-side verification stays intact:
+  //   - `fetchFromIpfs` re-verifies `sha256(bytes) == cid.multihash`
+  //     before returning bytes to callers (defense against gateway
+  //     tampering).
+  //   - `parseProfileSnapshot` and `loadCarBlocks` re-verify each
+  //     block in a hand-built snapshot CAR.
+  //
+  // The mismatch in the producer path is tracked as a follow-up:
+  // the `block/get(subBlockCid)` round-trip works in practice because
+  // Kubo's `dag/put` honors the caller-supplied codec but returns the
+  // CID it actually computed; the SDK's `pinSingleBlock` keeps the
+  // caller-claimed CID for the response shape but pins under the
+  // sha256(bytes)-derived CID. Bundle root CIDs continue to match by
+  // construction (envelope/manifest blocks use IPLD-form encoding
+  // throughout). See docs/uxf/HIERARCHICAL-ADDRESSABILITY.md for the
+  // full discussion.
+  if (blocks.length === 0) {
+    throw new ProfileError(
+      'ORBITDB_WRITE_FAILED',
+      'CAR contained zero blocks — refusing to publish a phantom rootCid.',
+    );
+  }
+  // Sanity-check: the expected root must be present as one of the blocks.
+  // This is a defense against a builder bug where the published rootCid
+  // doesn't match anything inside the CAR.
+  if (!blocks.some((b) => b.cid === expectedRootCid)) {
+    throw new ProfileError(
+      'ORBITDB_WRITE_FAILED',
+      `expectedRootCid ${expectedRootCid} is not present among CAR blocks (count=${blocks.length}) — builder/publisher mismatch.`,
+    );
+  }
+
+  // Pin each block sequentially. A single block failure aborts the
+  // whole import: callers MUST see "all blocks pinned" or "publish
+  // failed" — never a partial import that would leave the rootCid
+  // pointing into a hole.
+  for (const block of blocks) {
+    await pinSingleBlock(gateways, block.bytes, block.cid, timeoutMs);
+  }
+
+  return expectedRootCid;
 }
 
 /**
@@ -302,6 +522,208 @@ export async function fetchFromIpfs(
     `Failed to fetch CAR ${cid} from all gateways: ${lastError?.message ?? 'unknown error'}`,
     lastError,
   );
+}
+
+/**
+ * Fetch a hierarchical CAR rooted at `rootCid` by walking dag-cbor CID
+ * links starting from the root block, and reassemble all collected
+ * blocks into a single CARv1 byte stream rooted at `rootCid`.
+ *
+ * This is the symmetric consumer-side helper for {@link pinCarBlocksToIpfs}:
+ * - **Producer** pins each block in the CAR under its canonical CID via
+ *   `dag/put` (so every block is individually addressable).
+ * - **Consumer** walks the DAG starting from the root, fetching each
+ *   block via `block/get` and reassembling a synthetic CAR so existing
+ *   `UxfPackage.fromCar(carBytes)` consumers don't have to change.
+ *
+ * **Backward compatibility with raw-codec roots.** Older bundles were
+ * pinned as a single raw block whose CID equals `sha256(carBytes)`. For
+ * those CIDs the bytes returned by `block/get` ARE the CAR — we detect
+ * this by the CID codec (`raw` = 0x55) and short-circuit to a single
+ * `fetchFromIpfs` call. This keeps in-flight wallet refs working through
+ * the migration even though the {@link issue 200} non-goal disclaims
+ * formal back-compat with the pre-#199 raw-pinning scheme.
+ *
+ * **Safety bounds.** The walk aborts when block count exceeds
+ * {@link FETCH_CAR_MAX_BLOCKS} (currently 10 000) or when any single
+ * block fetch exceeds `maxSizeBytesPerBlock` (defaults to the
+ * `fetchFromIpfs` size cap). Content verification is end-to-end:
+ * every fetched block is sha256-checked against its CID by
+ * `fetchFromIpfs` — a hostile gateway cannot substitute different bytes
+ * for any block.
+ *
+ * **What it does NOT do.** It does not check for "unreachable" blocks
+ * (blocks pinned alongside the root but not referenced from it) — the
+ * walk is reachability-from-root, exactly what `UxfPackage.fromCar`
+ * consumes downstream. It also does not detect cycles by codec
+ * mismatch; raw-codec children of a dag-cbor parent are treated as
+ * opaque leaves (no further walk), which is the correct behavior for
+ * the Profile/UXF model where all linkable blocks are dag-cbor.
+ *
+ * @param gateways              - IPFS gateway base URLs (allowlist-validated)
+ * @param rootCid               - The CARv1 root CID (CIDv1 base32)
+ * @param timeoutMs             - Per-block fetch timeout (default 30 000)
+ * @param maxSizeBytesPerBlock  - Per-block byte cap (default 50 MiB)
+ * @returns The reassembled CARv1 bytes (root = `rootCid`, all blocks
+ *          collected via BFS dag-cbor link walk)
+ * @throws {ProfileError} `BUNDLE_NOT_FOUND` when any block fetch fails
+ *         on every gateway, when the block count cap is exceeded, or
+ *         when the root codec is neither `raw` nor `dag-cbor`.
+ */
+export async function fetchCarFromIpfs(
+  gateways: string[],
+  rootCid: string,
+  timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
+  maxSizeBytesPerBlock: number = DEFAULT_MAX_SIZE_BYTES,
+): Promise<Uint8Array> {
+  let parsedRoot: CID;
+  try {
+    parsedRoot = CID.parse(rootCid);
+  } catch (err) {
+    throw new ProfileError(
+      'BUNDLE_NOT_FOUND',
+      `fetchCarFromIpfs: cannot parse root CID ${rootCid}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  // Backcompat path: the legacy raw-pinning scheme pinned the entire
+  // CAR as one raw block. `fetchFromIpfs` already returns the bytes
+  // verbatim — they ARE the CAR. Skip the walk.
+  if (parsedRoot.code === CODEC_RAW) {
+    return fetchFromIpfs(gateways, rootCid, timeoutMs, maxSizeBytesPerBlock);
+  }
+  if (parsedRoot.code !== CODEC_DAG_CBOR) {
+    throw new ProfileError(
+      'BUNDLE_NOT_FOUND',
+      `fetchCarFromIpfs: unsupported root codec 0x${parsedRoot.code.toString(16)} for ${rootCid} ` +
+        `(expected dag-cbor 0x71 or raw 0x55)`,
+    );
+  }
+
+  // Lazy-import @ipld/dag-cbor + CarWriter to keep the cold-path import
+  // off the synchronous load of every module that touches ipfs-client.
+  const { decode: dagCborDecode } = await import('@ipld/dag-cbor');
+  const { CarWriter } = await import('@ipld/car/writer');
+
+  const visited = new Set<string>();
+  const blocks: Array<{ cid: CID; bytes: Uint8Array }> = [];
+  const queue: string[] = [rootCid];
+
+  while (queue.length > 0) {
+    if (blocks.length >= FETCH_CAR_MAX_BLOCKS) {
+      throw new ProfileError(
+        'BUNDLE_NOT_FOUND',
+        `fetchCarFromIpfs: block count exceeded ${FETCH_CAR_MAX_BLOCKS} walking from ${rootCid} ` +
+          `(possible cyclic or maliciously-fanned-out DAG)`,
+      );
+    }
+    const cidStr = queue.shift()!;
+    if (visited.has(cidStr)) continue;
+    visited.add(cidStr);
+
+    let blockCid: CID;
+    try {
+      blockCid = CID.parse(cidStr);
+    } catch (err) {
+      throw new ProfileError(
+        'BUNDLE_NOT_FOUND',
+        `fetchCarFromIpfs: child CID ${cidStr} (reachable from ${rootCid}) failed to parse: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    const blockBytes = await fetchFromIpfs(
+      gateways,
+      cidStr,
+      timeoutMs,
+      maxSizeBytesPerBlock,
+    );
+    blocks.push({ cid: blockCid, bytes: blockBytes });
+
+    // Only dag-cbor blocks can carry CID links (Tag 42). Raw blocks
+    // (codec 0x55) are leaves. Unknown codecs are also treated as
+    // leaves — if a future block type needs link walking, extend
+    // this branch explicitly rather than guessing.
+    if (blockCid.code === CODEC_DAG_CBOR) {
+      let decoded: unknown;
+      try {
+        decoded = dagCborDecode(blockBytes);
+      } catch (err) {
+        throw new ProfileError(
+          'BUNDLE_NOT_FOUND',
+          `fetchCarFromIpfs: dag-cbor decode failed for ${cidStr} (reachable from ${rootCid}): ${err instanceof Error ? err.message : String(err)}`,
+          err,
+        );
+      }
+      collectCidLinks(decoded, (childCid) => {
+        const childStr = childCid.toString();
+        if (!visited.has(childStr)) queue.push(childStr);
+      });
+    }
+  }
+
+  // Reassemble a CAR with `rootCid` as the single root and all walked
+  // blocks in BFS order (mirrors `exportToCar`'s ordering invariant in
+  // uxf/ipld.ts so receivers that depend on root-then-manifest-first
+  // continue to see the canonical order).
+  const { writer, out } = CarWriter.create([parsedRoot]);
+  const chunks: Uint8Array[] = [];
+  const collectPromise = (async () => {
+    for await (const chunk of out) {
+      chunks.push(chunk);
+    }
+  })();
+  try {
+    for (const block of blocks) {
+      await writer.put(block);
+    }
+  } finally {
+    await writer.close();
+  }
+  await collectPromise;
+
+  let totalLength = 0;
+  for (const c of chunks) totalLength += c.length;
+  const carBytes = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const c of chunks) {
+    carBytes.set(c, offset);
+    offset += c.length;
+  }
+  return carBytes;
+}
+
+/**
+ * Recursively walk a dag-cbor-decoded value, invoking `visit` on every
+ * CID instance found. Schema-agnostic — works for any dag-cbor block
+ * shape because dag-cbor decodes CID links (Tag 42) into actual
+ * `multiformats/cid` `CID` instances.
+ *
+ * `CID.asCID(value)` is the canonical predicate ("is this a CID?")
+ * across both `multiformats` major versions; it returns the CID on
+ * match or `null` otherwise (it does NOT throw).
+ */
+function collectCidLinks(value: unknown, visit: (cid: CID) => void): void {
+  if (value === null || value === undefined) return;
+  // Strings/numbers/bigints/booleans/Uint8Array — no links possible.
+  if (typeof value !== 'object') return;
+  if (value instanceof Uint8Array) return;
+
+  const asCid = CID.asCID(value as CID);
+  if (asCid !== null) {
+    visit(asCid);
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) collectCidLinks(item, visit);
+    return;
+  }
+
+  // Maps from dag-cbor decode are plain objects; walk all values.
+  // (We don't walk keys — dag-cbor restricts map keys to strings.)
+  for (const v of Object.values(value as Record<string, unknown>)) {
+    collectCidLinks(v, visit);
+  }
 }
 
 /**

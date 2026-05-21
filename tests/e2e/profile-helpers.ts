@@ -29,6 +29,24 @@ import { NETWORK } from './helpers';
 export * from './helpers';
 
 /**
+ * Options for `makeProfileProviders`.
+ *
+ * `flushDebounceMs` defaults to the SDK's own default (2s). Issue #199
+ * was fixed at the SDK layer (`profile/ipfs-client.ts:pinCarBlocksToIpfs`
+ * pins each CAR block under its canonical CID instead of pinning the
+ * whole CAR as a single raw block), so the auto-debounced publish path
+ * no longer races aggregator-gateway propagation. Tests that want
+ * deterministic single-shot publishes can pass `flushDebounceMs:
+ * 300_000` and call `tokenStorage.awaitNextFlush()` explicitly — see
+ * profile-sync.test.ts / profile-token-persistence.test.ts /
+ * profile-multi-device-sync.test.ts for examples.
+ */
+export interface MakeProfileProvidersOptions {
+  /** Profile token-storage flush debounce. Defaults to the SDK default (2 s). */
+  readonly flushDebounceMs?: number;
+}
+
+/**
  * Build Profile-backed providers for a Sphere.init() call.
  *
  * Composes:
@@ -42,10 +60,13 @@ export * from './helpers';
  * to the Unicity IPFS HTTP gateway via the same gateway list the
  * legacy `IpfsStorageProvider` uses.
  */
-export function makeProfileProviders(dirs: {
-  dataDir: string;
-  tokensDir: string;
-}): NodeProviders {
+export function makeProfileProviders(
+  dirs: {
+    dataDir: string;
+    tokensDir: string;
+  },
+  options: MakeProfileProvidersOptions = {},
+): NodeProviders {
   // Build the legacy factory FIRST so we can reuse its oracle for the
   // Profile pointer-layer wiring. Without an oracle the pointer layer
   // never gets constructed and cold-start recovery silently fails.
@@ -69,6 +90,15 @@ export function makeProfileProviders(dirs: {
         bootstrapPeers: [...DEFAULT_IPFS_BOOTSTRAP_PEERS],
       },
       encrypt: true,
+      // Only override the SDK's default when the caller explicitly asks
+      // for a different debounce. Tests that need deterministic publish
+      // (e.g. multi-coin reception followed by an explicit
+      // `awaitNextFlush()`) pass a long debounce; default leaves the SDK
+      // free to auto-flush on the standard cadence.
+      ...(options.flushDebounceMs !== undefined
+        ? { flushDebounceMs: options.flushDebounceMs }
+        : {}),
+      debug: process.env['E2E_PROFILE_DEBUG'] === '1',
     },
   });
 

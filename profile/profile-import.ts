@@ -4,8 +4,16 @@
  * Reads a snapshot produced by {@link exportProfile}, replays every KV
  * entry into the destination StorageProvider as ENCRYPTED bytes (so
  * the destination's master key, which must match the source's, can
- * decrypt them on subsequent reads), and re-pins every embedded
- * bundle CAR to the destination's IPFS gateway.
+ * decrypt them on subsequent reads), and re-pins every reconstructed
+ * bundle DAG to the destination's IPFS gateway block-by-block under
+ * each block's canonical CID.
+ *
+ * Issue #200 Phase 5: the snapshot is now hierarchical — every bundle
+ * block is individually addressable in the snapshot CAR, and the
+ * importer pins them block-by-block via {@link pinCarBlocksToIpfs}.
+ * Bundles that share sub-components dedup naturally at the pin layer
+ * because identical bytes produce identical CIDs and the gateway's
+ * `dag/put` is idempotent (a re-pin of the same CID is a no-op).
  *
  * Wave 9 hardening:
  *
@@ -19,7 +27,7 @@
  *     is rejected unless `acknowledgeOverwriteRisk=true` is also set.
  *     This combination overwrites the destination wallet with the
  *     snapshot's identity — irrecoverable data loss without a backup.
- *   - **IPFS gateway required.** `pinAndRegisterBundle` will refuse to
+ *   - **IPFS gateway required.** `pinCarBlocksToIpfs` will refuse to
  *     mark a bundle as pinned without a configured gateway. Imports
  *     run with no gateway throw `IPFS_GATEWAY_REQUIRED`.
  *   - **Identity-class write failures abort.** Failure to land
@@ -41,7 +49,7 @@ import type { StorageProvider } from '../storage/storage-provider.js';
 import type { ProfileTokenStorageProvider } from './profile-token-storage-provider.js';
 import type { ProfileSnapshot } from './profile-export.js';
 import { IDENTITY_CLASS_KEYS } from './profile-export.js';
-import { pinToIpfs } from './ipfs-client.js';
+import { pinCarBlocksToIpfs } from './ipfs-client.js';
 import { logger } from '../core/logger.js';
 import { ProfileError } from './errors.js';
 
@@ -57,7 +65,12 @@ export interface ImportProfileOptions {
   readonly tokenStorage: ProfileTokenStorageProvider;
   /** Parsed snapshot — `parseProfileSnapshot(carBytes).snapshot`. */
   readonly snapshot: ProfileSnapshot;
-  /** Embedded bundle CARs keyed by their recorded root CID. */
+  /**
+   * Reconstructed bundle CARs keyed by their root CID. Each value is a
+   * CARv1 byte stream containing the bundle's root block plus all
+   * reachable sub-blocks; the importer pins each block individually
+   * via {@link pinCarBlocksToIpfs}.
+   */
   readonly bundleCars: ReadonlyMap<string, Uint8Array>;
   /**
    * REQUIRED. The running wallet's chainPubkey. Must match
@@ -93,9 +106,9 @@ export interface ImportProfileOptions {
 export interface ImportProfileResult {
   /** KV entries replayed to the destination. */
   readonly entriesReplayed: number;
-  /** Bundle CARs successfully re-pinned to local IPFS. */
+  /** Bundle DAGs successfully re-pinned to local IPFS. */
   readonly bundlesPinned: number;
-  /** Bundle CARs whose pin failed (logged and skipped). */
+  /** Bundle DAGs whose pin failed (logged and skipped). */
   readonly bundlesFailed: number;
   /** Bundle refs successfully restored under `tokens.bundle.*`. */
   readonly bundleRefsRestored: number;
@@ -154,6 +167,17 @@ async function isProfileNonEmpty(
  *
  * Identity-class key failures (`mnemonic`, `master_key`, ...) abort
  * the import. Other key failures are logged + skipped.
+ *
+ * **Write ordering (steelman finding):** identity-class keys (mnemonic,
+ * master_key, chain_code, derivation_path, base_path) are written
+ * LAST so that a process crash mid-import leaves a destination
+ * profile that is unbootable (no identity present) rather than one
+ * that boots a freshly-derived identity from defaults and then fails
+ * to decrypt any of the partially-imported encrypted KV entries. The
+ * input `entries` array is sorted alphabetically at export time —
+ * without this partition, the lowercase `master_key` / `mnemonic`
+ * keys would land in the middle of the iteration, after uppercase
+ * `DIRECT_*` tracked-address entries.
  */
 async function replayKvEntries(
   storage: StorageProvider,
@@ -164,8 +188,23 @@ async function replayKvEntries(
   };
   const hasEncryptedRaw = typeof handle.setEncryptedRaw === 'function';
 
+  // Partition: non-identity-class entries write first; identity-class
+  // entries (mnemonic / master_key / chain_code / derivation_path /
+  // base_path) write LAST. A crash mid-non-identity leaves the
+  // destination identity-less → next boot creates a fresh wallet, no
+  // identity ambiguity. A crash mid-identity is the only window where
+  // partial-identity state could exist; that window is now O(#identity
+  // keys) ≈ 5 writes instead of O(#total entries).
+  const dataEntries: Array<{ key: string; value: string }> = [];
+  const identityEntries: Array<{ key: string; value: string }> = [];
+  for (const e of entries) {
+    if (IDENTITY_CLASS_KEYS.has(e.key)) identityEntries.push(e);
+    else dataEntries.push(e);
+  }
+  const ordered = [...dataEntries, ...identityEntries];
+
   let successCount = 0;
-  for (const { key, value } of entries) {
+  for (const { key, value } of ordered) {
     try {
       if (hasEncryptedRaw) {
         await handle.setEncryptedRaw!(key, value);
@@ -196,8 +235,17 @@ async function replayKvEntries(
 }
 
 /**
- * Re-pin a bundle CAR to the destination's IPFS gateway and restore
+ * Re-pin a bundle DAG to the destination's IPFS gateway and restore
  * its `tokens.bundle.{cid}` ref entry.
+ *
+ * Phase 5: the bundle CAR carries every reachable block (envelope +
+ * manifest + per-token / per-element). Each block is pinned under its
+ * canonical CID via {@link pinCarBlocksToIpfs}. Re-pinning a block
+ * that was already pinned (e.g. shared between two bundles, or pinned
+ * from a previous import) is idempotent at the gateway — the resulting
+ * pin count for shared blocks is the count of importing bundles, but
+ * the stored bytes are one copy. The bundle's recorded `cid` is the
+ * dag-cbor root CID, addressable in isolation via `block/get`.
  *
  * Wave 9 fix #5: `pinned: true` is set ONLY after a successful pin
  * call against a configured gateway. With no gateway configured the
@@ -220,7 +268,13 @@ async function pinAndRegisterBundle(
   let pinned = false;
   if (gateways.length > 0) {
     try {
-      await pinToIpfs(gateways, carBytes);
+      // Phase 5: every bundle re-pin uses the per-block pin path. The
+      // helper internally validates that `cid` is present among the
+      // CAR's blocks (defense against snapshot-CAR/manifest mismatch)
+      // and pins each block under its canonical CID — including the
+      // legacy raw-CID single-block backcompat case (a raw-CID bundle
+      // CAR contains exactly one raw block whose CID is the bundle CID).
+      await pinCarBlocksToIpfs(gateways, carBytes, cid);
       pinned = true;
     } catch (err) {
       logger.warn(
@@ -267,7 +321,7 @@ async function pinAndRegisterBundle(
 // =============================================================================
 
 /**
- * Restore a Profile from a parsed snapshot + embedded bundle CARs.
+ * Restore a Profile from a parsed snapshot + reconstructed bundle CARs.
  *
  * @throws ProfileError when:
  *   - `expectedChainPubkey` is missing (`INVALID_OPTIONS`)
@@ -366,7 +420,7 @@ export async function importProfile(
     if (!carBytes) {
       logger.warn(
         'ProfileImport',
-        `snapshot listed bundle ${bundle.cid} but its CAR was not embedded — skipping`,
+        `snapshot listed bundle ${bundle.cid} but its CAR could not be reconstructed — skipping`,
       );
       bundlesFailed += 1;
       continue;

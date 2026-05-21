@@ -109,7 +109,14 @@ function cidForBytes(bytes: Uint8Array): string {
 // Mock UxfPackage — pass-through that preserves token IDs.
 // ---------------------------------------------------------------------------
 
-vi.mock('../../../uxf/UxfPackage.js', () => {
+vi.mock('../../../uxf/UxfPackage.js', async () => {
+  // Issue #200 Phase 2: `toCar()` must return a real CAR (not JSON bytes)
+  // because the flush scheduler now calls `extractCarRootCid` +
+  // `pinCarBlocksToIpfs`. `makeFakeUxfCar` wraps the payload in a
+  // minimal valid CAR; `decodeFakeUxfCar` recovers it.
+  const { makeFakeUxfCar, decodeFakeUxfCar } = await import(
+    './_helpers/fake-uxf-car.js'
+  );
   return {
     UxfPackage: {
       create() {
@@ -136,12 +143,21 @@ vi.mock('../../../uxf/UxfPackage.js', () => {
             return result;
           },
           async toCar() {
-            return new TextEncoder().encode(JSON.stringify({ tokens }));
+            return makeFakeUxfCar({ tokens });
           },
         };
       },
       async fromCar(carBytes: Uint8Array) {
-        const parsed = JSON.parse(new TextDecoder().decode(carBytes));
+        // Dual-shape decode: prefer the new fake-CAR shape; fall back to
+        // raw JSON so legacy fixture bytes still resolve.
+        let parsed: { tokens?: unknown[] };
+        try {
+          parsed = await decodeFakeUxfCar<{ tokens?: unknown[] }>(carBytes);
+        } catch {
+          parsed = JSON.parse(new TextDecoder().decode(carBytes)) as {
+            tokens?: unknown[];
+          };
+        }
         const tokens: unknown[] = parsed.tokens ?? [];
         return {
           _tokens: tokens,
@@ -161,7 +177,7 @@ vi.mock('../../../uxf/UxfPackage.js', () => {
             return result;
           },
           async toCar() {
-            return new TextEncoder().encode(JSON.stringify({ tokens }));
+            return makeFakeUxfCar({ tokens });
           },
         };
       },

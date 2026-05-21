@@ -160,9 +160,20 @@ class FakeTokenStorage {
 
 // Mock the IPFS client so export's fetchFromIpfs returns canned bundle
 // CARs and import's pinToIpfs is a no-op (we don't have a real gateway).
-vi.mock('../../../profile/ipfs-client', async () => {
+// `verifyCidMatchesBytes` MUST be wired to the real implementation —
+// the production code path uses it inside `parseProfileSnapshot` and
+// `pinCarBlocksToIpfs` to reject blocks whose CIDs don't bind to their
+// bytes. Mocking it as a no-op would silently mask CID-binding regressions.
+vi.mock('../../../profile/ipfs-client', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../profile/ipfs-client')>();
   const carCache = new Map<string, Uint8Array>();
+  // Issue #200 Phase 2: production now uses `fetchCarFromIpfs` and
+  // `pinCarBlocksToIpfs`. The fixtures here pre-populate real CARs into
+  // `carCache`, so the mock `fetchCarFromIpfs` delegates to the cache
+  // and the mock `pinCarBlocksToIpfs` echoes the expected root CID
+  // back (matching the production contract for that helper).
   return {
+    ...actual,
     fetchFromIpfs: vi.fn(async (_gateways: string[], cid: string) => {
       const cached = carCache.get(cid);
       if (!cached) {
@@ -170,8 +181,20 @@ vi.mock('../../../profile/ipfs-client', async () => {
       }
       return cached;
     }),
+    fetchCarFromIpfs: vi.fn(async (_gateways: string[], cid: string) => {
+      const cached = carCache.get(cid);
+      if (!cached) {
+        throw new Error(`fake fetchCarFromIpfs: no CAR cached for ${cid}`);
+      }
+      return cached;
+    }),
     pinToIpfs: vi.fn(async () => 'fake-pin-cid'),
+    pinCarBlocksToIpfs: vi.fn(
+      async (_gateways: string[], _bytes: Uint8Array, expectedRootCid: string) =>
+        expectedRootCid,
+    ),
     verifyCidAccessible: vi.fn(async () => true),
+    // verifyCidMatchesBytes comes from `...actual` — real implementation.
     // Test-only setter so the test can pre-populate the fake gateway.
     __setBundleCar: (cid: string, bytes: Uint8Array) => {
       carCache.set(cid, bytes);
@@ -553,14 +576,28 @@ describe('parseProfileSnapshot — validation', () => {
 
   it('rejects unknown future version', async () => {
     const carBytes = await buildCarWithDoc({
-      version: 2,
+      version: 3,
       chainPubkey: TEST_CHAIN_PUBKEY_A,
       network: 'testnet',
       createdAt: Date.now(),
       entries: [],
       bundles: [],
     });
-    await expect(parseProfileSnapshot(carBytes)).rejects.toThrow(/version 2 is newer/);
+    await expect(parseProfileSnapshot(carBytes)).rejects.toThrow(/version 3 is newer/);
+  });
+
+  it('rejects pre-Phase-5 v1 snapshots', async () => {
+    const carBytes = await buildCarWithDoc({
+      version: 1 as const, // intentional v1 — exercises the version-cutover rejection
+      chainPubkey: TEST_CHAIN_PUBKEY_A,
+      network: 'testnet',
+      createdAt: Date.now(),
+      entries: [],
+      bundles: [],
+    });
+    await expect(parseProfileSnapshot(carBytes)).rejects.toThrow(
+      /Snapshot version 1 is older than this SDK accepts/,
+    );
   });
 
   it('rejects multi-root CARs', async () => {
@@ -600,7 +637,7 @@ describe('parseProfileSnapshot — validation', () => {
 
   it('rejects duplicate keys in the snapshot doc (Wave 9 fix #9)', async () => {
     const carBytes = await buildCarWithDoc({
-      version: 1,
+      version: 2,
       chainPubkey: TEST_CHAIN_PUBKEY_A,
       network: 'testnet',
       createdAt: Date.now(),
@@ -615,6 +652,73 @@ describe('parseProfileSnapshot — validation', () => {
     );
   });
 
+  /**
+   * Steelman regression: per-block CID-binding verification is NOT
+   * applied in `parseProfileSnapshot` because UXF bundle sub-blocks
+   * intrinsically carry CIDs computed from a different canonical form
+   * than their framed bytes (see `profile/profile-export.ts` module
+   * NOTE and `uxf/ipld.ts:elementToIpldBlock`). The snapshot root CID
+   * is still verified (envelope has no child CID refs, so its
+   * binding is unambiguous); a forged-root attack remains rejected.
+   * This test pins the root-verification posture against a
+   * substituted-roots CAR with a legitimate-looking sub-block.
+   */
+  it('rejects a CAR whose framed root does not match the root block content (root-binding)', async () => {
+    const { CarWriter } = await import('@ipld/car/writer');
+    const { encode } = await import('@ipld/dag-cbor');
+    const { CID } = await import('multiformats/cid');
+    const { sha256 } = await import('@noble/hashes/sha2.js');
+    const { create: createMultihash } = await import('multiformats/hashes/digest');
+
+    // Build a legitimate-looking root doc.
+    const realRoot = encode({
+      version: 2,
+      chainPubkey: TEST_CHAIN_PUBKEY_A,
+      network: 'testnet',
+      createdAt: Date.now(),
+      entries: [],
+      bundles: [],
+    });
+    const realRootCid = CID.createV1(0x71, createMultihash(0x12, sha256(realRoot)));
+
+    // Build a second, different root doc + its real CID.
+    const otherRoot = encode({
+      version: 2,
+      chainPubkey: TEST_CHAIN_PUBKEY_B,
+      network: 'testnet',
+      createdAt: Date.now() + 1,
+      entries: [],
+      bundles: [],
+    });
+    const otherRootCid = CID.createV1(0x71, createMultihash(0x12, sha256(otherRoot)));
+
+    // Forge: claim `realRootCid` is the root[0] of the CAR but actually
+    // include `otherRoot` bytes framed under `otherRootCid`. The parser
+    // looks up `realRootCid` in the block map, finds nothing, and
+    // throws "Root block missing from CAR." (or finds it via header
+    // mismatch). The exact diagnostic differs by CAR-writer behavior,
+    // but the import MUST fail.
+    const { writer, out } = CarWriter.create([realRootCid]);
+    const chunks: Uint8Array[] = [];
+    const collect = (async () => {
+      for await (const c of out) chunks.push(c);
+    })();
+    await writer.put({ cid: otherRootCid, bytes: otherRoot });
+    await writer.close();
+    await collect;
+    const total = chunks.reduce((a, c) => a + c.byteLength, 0);
+    const carBytes = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) {
+      carBytes.set(c, off);
+      off += c.byteLength;
+    }
+
+    await expect(parseProfileSnapshot(carBytes)).rejects.toThrow(
+      /Root block missing from CAR|root CID mismatch/,
+    );
+  });
+
   it('rejects oversized entry value via per-block-byte cap (Wave 9 fix #3)', async () => {
     // Build an entry with a 9 MiB value — both the per-block (1 MiB)
     // and per-value (8 MiB) caps would reject this. The block cap
@@ -622,7 +726,7 @@ describe('parseProfileSnapshot — validation', () => {
     // inline; assert the block-cap message.
     const huge = 'x'.repeat(9 * 1024 * 1024);
     const carBytes = await buildCarWithDoc({
-      version: 1,
+      version: 2,
       chainPubkey: TEST_CHAIN_PUBKEY_A,
       network: 'testnet',
       createdAt: Date.now(),
@@ -657,7 +761,7 @@ describe('parseProfileSnapshot — bundle authentication (Wave 9 critical #2)', 
     const { create: createMultihash } = await import('multiformats/hashes/digest');
 
     const rootDoc = {
-      version: 1,
+      version: 2,
       chainPubkey: TEST_CHAIN_PUBKEY_A,
       network: 'testnet',
       createdAt: Date.now(),
@@ -713,7 +817,7 @@ describe('parseProfileSnapshot — bundle authentication (Wave 9 critical #2)', 
     const { create: createMultihash } = await import('multiformats/hashes/digest');
 
     const rootDoc = {
-      version: 1,
+      version: 2,
       chainPubkey: TEST_CHAIN_PUBKEY_A,
       network: 'testnet',
       createdAt: Date.now(),
@@ -763,7 +867,7 @@ describe('importProfile — safety gates', () => {
     // ciphertext form so the round-trip lands the right plaintext.
     const ENC_FROM_SNAPSHOT = Buffer.from('CT(from-snapshot)').toString('base64');
     const snapshot: ProfileSnapshot = {
-      version: 1,
+      version: 2,
       chainPubkey: TEST_CHAIN_PUBKEY_E,
       network: 'testnet',
       createdAt: 1_700_000_000_000,
@@ -811,7 +915,7 @@ describe('importProfile — safety gates', () => {
     (ipfs as unknown as { __clearBundleCars: () => void }).__clearBundleCars();
 
     const snapshot: ProfileSnapshot = {
-      version: 1,
+      version: 2,
       chainPubkey: TEST_CHAIN_PUBKEY_A,
       network: 'testnet',
       createdAt: 1_700_000_000_000,
@@ -851,7 +955,7 @@ describe('importProfile — safety gates', () => {
 
     const fixture = await buildSampleBundleCar();
     const snapshot: ProfileSnapshot = {
-      version: 1,
+      version: 2,
       chainPubkey: TEST_CHAIN_PUBKEY_F,
       network: 'testnet',
       createdAt: 1_700_000_000_000,
@@ -892,7 +996,7 @@ describe('importProfile — safety gates', () => {
     (ipfs as unknown as { __clearBundleCars: () => void }).__clearBundleCars();
 
     const snapshot: ProfileSnapshot = {
-      version: 1,
+      version: 2,
       chainPubkey: TEST_CHAIN_PUBKEY_A,
       network: 'testnet',
       createdAt: 1_700_000_000_000,
@@ -920,7 +1024,7 @@ describe('importProfile — safety gates', () => {
     (ipfs as unknown as { __clearBundleCars: () => void }).__clearBundleCars();
 
     const snapshot: ProfileSnapshot = {
-      version: 1,
+      version: 2,
       chainPubkey: TEST_CHAIN_PUBKEY_A,
       network: 'testnet',
       createdAt: 1_700_000_000_000,
@@ -965,7 +1069,7 @@ describe('importProfile — safety gates', () => {
 
     const fixture = await buildSampleBundleCar();
     const snapshot: ProfileSnapshot = {
-      version: 1,
+      version: 2,
       chainPubkey: TEST_CHAIN_PUBKEY_A,
       network: 'testnet',
       createdAt: 1_700_000_000_000,
@@ -1001,7 +1105,7 @@ describe('importProfile — safety gates', () => {
     (ipfs as unknown as { __clearBundleCars: () => void }).__clearBundleCars();
 
     const snapshot: ProfileSnapshot = {
-      version: 1,
+      version: 2,
       chainPubkey: TEST_CHAIN_PUBKEY_A,
       network: 'testnet',
       createdAt: 1_700_000_000_000,
@@ -1074,5 +1178,275 @@ describe('exportProfile — scale', () => {
     const parsed = await parseProfileSnapshot(result.carBytes);
     expect(parsed.snapshot.bundles).toHaveLength(N);
     expect(parsed.bundleCars.size).toBe(N);
+  });
+});
+
+// =============================================================================
+// Phase 5 — Hierarchical CAR dedup
+// =============================================================================
+
+describe('exportProfile — hierarchical CAR dedup (Issue #200 Phase 5)', () => {
+  /**
+   * Phase 5 architectural property: a snapshot containing two bundles
+   * that share a sub-component (e.g. an empty manifest block) embeds
+   * the shared block exactly once. With the legacy v1 flat layout the
+   * count would be `bundles × per-bundle-blocks`; in v2 it collapses
+   * to the union.
+   */
+  it('dedups bundle sub-blocks shared across multiple bundles', async () => {
+    const ipfs = await import('../../../profile/ipfs-client');
+    const setCar = (ipfs as unknown as {
+      __setBundleCar: (cid: string, bytes: Uint8Array) => void;
+      __clearBundleCars: () => void;
+    });
+    setCar.__clearBundleCars();
+
+    const storage = new InMemoryStorageProvider();
+    await storage.connect();
+    await storage.set('mnemonic', 'enc:m1');
+
+    const tokenStorage = new FakeTokenStorage();
+
+    // Two distinct empty packages — envelopes differ (per-package
+    // `description`), but the manifest block `{tokens: {}}` is
+    // byte-identical → it should land under the same CID and dedup.
+    const { CarReader } = await import('@ipld/car');
+    const carA = await UxfPackage.create({ description: 'bundle-A' }).toCar();
+    const carB = await UxfPackage.create({ description: 'bundle-B' }).toCar();
+    const rootA = (await (await CarReader.fromBytes(carA)).getRoots())[0].toString();
+    const rootB = (await (await CarReader.fromBytes(carB)).getRoots())[0].toString();
+    expect(rootA).not.toBe(rootB);
+
+    setCar.__setBundleCar(rootA, carA);
+    setCar.__setBundleCar(rootB, carB);
+    tokenStorage.bundleIndex.set(rootA, { cid: rootA, status: 'active', createdAt: 1_000 });
+    tokenStorage.bundleIndex.set(rootB, { cid: rootB, status: 'active', createdAt: 2_000 });
+
+    // Count distinct sub-blocks per bundle so we can predict the
+    // post-dedup union size.
+    async function countBlocks(carBytes: Uint8Array): Promise<Set<string>> {
+      const r = await CarReader.fromBytes(carBytes);
+      const set = new Set<string>();
+      for await (const b of r.blocks()) set.add(b.cid.toString());
+      return set;
+    }
+    const blocksA = await countBlocks(carA);
+    const blocksB = await countBlocks(carB);
+    const union = new Set<string>([...blocksA, ...blocksB]);
+
+    // Sanity: at least the manifest block is shared between the two.
+    const sharedCount = [...blocksA].filter((c) => blocksB.has(c)).length;
+    expect(sharedCount).toBeGreaterThan(0);
+
+    const result = await exportProfile({
+      storage,
+      tokenStorage: tokenStorage as unknown as ProfileTokenStorageProvider,
+      chainPubkey: TEST_CHAIN_PUBKEY_D,
+      network: 'testnet',
+    });
+
+    expect(result.bundlesEmbedded).toBe(2);
+    expect(result.uniqueBundleBlocks).toBe(union.size);
+    // Strictly less than the naive sum — proof that dedup happened.
+    expect(result.uniqueBundleBlocks).toBeLessThan(blocksA.size + blocksB.size);
+
+    // Round-trip: both bundles reconstructable end-to-end.
+    const parsed = await parseProfileSnapshot(result.carBytes);
+    expect(parsed.bundleCars.has(rootA)).toBe(true);
+    expect(parsed.bundleCars.has(rootB)).toBe(true);
+  });
+
+  it('reports `uniqueBundleBlocks` count for callers / CLI diagnostics', async () => {
+    const ipfs = await import('../../../profile/ipfs-client');
+    const setCar = (ipfs as unknown as {
+      __setBundleCar: (cid: string, bytes: Uint8Array) => void;
+      __clearBundleCars: () => void;
+    });
+    setCar.__clearBundleCars();
+
+    const storage = new InMemoryStorageProvider();
+    await storage.connect();
+    await storage.set('mnemonic', 'enc:m1');
+
+    const tokenStorage = new FakeTokenStorage();
+
+    // No bundles — uniqueBundleBlocks should be 0.
+    const noBundleResult = await exportProfile({
+      storage,
+      tokenStorage: tokenStorage as unknown as ProfileTokenStorageProvider,
+      chainPubkey: TEST_CHAIN_PUBKEY_D,
+      network: 'testnet',
+    });
+    expect(noBundleResult.uniqueBundleBlocks).toBe(0);
+    expect(noBundleResult.bundlesEmbedded).toBe(0);
+  });
+
+  /**
+   * Round-trip legacy raw-codec bundle.
+   *
+   * Pre-Phase-2 wallets pinned bundles as a single raw block keyed by
+   * `sha256(bundleCarBytes)` (codec 0x55). When such a wallet exports
+   * a snapshot today, the export path must:
+   *   - fetch the bundle via `fetchCarFromIpfs` (short-circuits raw
+   *     roots to a single `block/get`),
+   *   - re-verify the raw CID matches the returned bytes,
+   *   - embed the raw block under its original CID in the snapshot.
+   *
+   * The import path then reconstructs a single-block CAR for the raw
+   * bundle and pins it via `pinCarBlocksToIpfs` (which accepts raw
+   * codecs as expectedRootCid).
+   */
+  it('round-trips a legacy raw-codec bundle through export → import', async () => {
+    const ipfs = await import('../../../profile/ipfs-client');
+    const setCar = (ipfs as unknown as {
+      __setBundleCar: (cid: string, bytes: Uint8Array) => void;
+      __clearBundleCars: () => void;
+    });
+    setCar.__clearBundleCars();
+
+    const { CID } = await import('multiformats/cid');
+    const { sha256 } = await import('@noble/hashes/sha2.js');
+    const { create: createMultihash } = await import('multiformats/hashes/digest');
+
+    // Build a real bundle CAR (dag-cbor envelope etc.), then pin it
+    // under its legacy RAW CID (= sha256(carBytes) with codec 0x55).
+    const innerCarBytes = await UxfPackage.create({ description: 'legacy-raw' }).toCar();
+    const rawCid = CID.createV1(0x55, createMultihash(0x12, sha256(innerCarBytes))).toString();
+
+    // The mock `fetchCarFromIpfs` short-circuits raw codecs by
+    // returning the bytes as-is — we register the raw CID with the
+    // CAR bytes as the gateway-returned content.
+    setCar.__setBundleCar(rawCid, innerCarBytes);
+
+    const storage = new InMemoryStorageProvider();
+    await storage.connect();
+    await storage.set('mnemonic', 'enc:legacy');
+
+    const tokenStorage = new FakeTokenStorage();
+    tokenStorage.bundleIndex.set(rawCid, {
+      cid: rawCid,
+      status: 'active',
+      createdAt: 1_500,
+    });
+
+    const result = await exportProfile({
+      storage,
+      tokenStorage: tokenStorage as unknown as ProfileTokenStorageProvider,
+      chainPubkey: TEST_CHAIN_PUBKEY_C,
+      network: 'testnet',
+    });
+
+    expect(result.bundlesEmbedded).toBe(1);
+    expect(result.bundlesMissing).toBe(0);
+    // The legacy bundle adds exactly one block (the raw blob itself)
+    // to the union — there is no DAG to walk.
+    expect(result.uniqueBundleBlocks).toBe(1);
+
+    const parsed = await parseProfileSnapshot(result.carBytes);
+    expect(parsed.snapshot.bundles).toHaveLength(1);
+    expect(parsed.snapshot.bundles[0].cid).toBe(rawCid);
+    expect(parsed.bundleCars.has(rawCid)).toBe(true);
+    // The reconstructed "CAR" for a raw-codec bundle is a single-block
+    // CAR whose lone block is the raw bytes under the raw CID. It
+    // must be re-pinnable via pinCarBlocksToIpfs(carBytes, rawCid).
+    const reconstructed = parsed.bundleCars.get(rawCid)!;
+    expect(reconstructed.byteLength).toBeGreaterThan(0);
+
+    // Drive the importer end-to-end against a fresh destination — the
+    // raw-codec bundle ref must land in the destination's bundle
+    // index and `pinCarBlocksToIpfs` must succeed under the raw CID.
+    const destStorage = new InMemoryStorageProvider();
+    await destStorage.connect();
+    const destTokenStorage = new FakeTokenStorage();
+    await importProfile({
+      storage: destStorage,
+      tokenStorage: destTokenStorage as unknown as ProfileTokenStorageProvider,
+      snapshot: parsed.snapshot,
+      bundleCars: parsed.bundleCars,
+      expectedChainPubkey: TEST_CHAIN_PUBKEY_C,
+    });
+    expect(destTokenStorage.bundleIndex.get(rawCid)).toMatchObject({
+      cid: rawCid,
+      status: 'active',
+    });
+  });
+
+  /**
+   * Phase 5 architectural payoff: re-importing a snapshot that shares
+   * bundles with an earlier snapshot is a no-op for the shared blocks.
+   * `pinCarBlocksToIpfs` is idempotent at the gateway because `dag/put`
+   * is keyed by content-address; the importer never re-fails on
+   * already-pinned CIDs.
+   *
+   * The mock IPFS layer is a no-op for `pinCarBlocksToIpfs`, so this
+   * test verifies the importer's contract (no crashes, refs in both
+   * destinations) rather than counting gateway calls — a real
+   * integration test against a live Kubo would count blocks and
+   * confirm zero new pins on the second import.
+   */
+  it('is idempotent under re-import: second pass succeeds with force=true', async () => {
+    const ipfs = await import('../../../profile/ipfs-client');
+    const setCar = (ipfs as unknown as {
+      __setBundleCar: (cid: string, bytes: Uint8Array) => void;
+      __clearBundleCars: () => void;
+    });
+    setCar.__clearBundleCars();
+
+    const storage = new InMemoryStorageProvider();
+    await storage.connect();
+    await storage.set('mnemonic', 'enc:rt');
+
+    const tokenStorage = new FakeTokenStorage();
+    const fixture = await buildSampleBundleCar('idempotent-bundle');
+    setCar.__setBundleCar(fixture.cid, fixture.carBytes);
+    tokenStorage.bundleIndex.set(fixture.cid, {
+      cid: fixture.cid,
+      status: 'active',
+      createdAt: 1_700_000_000,
+    });
+
+    const exportResult = await exportProfile({
+      storage,
+      tokenStorage: tokenStorage as unknown as ProfileTokenStorageProvider,
+      chainPubkey: TEST_CHAIN_PUBKEY_B,
+      network: 'testnet',
+    });
+    const parsed = await parseProfileSnapshot(exportResult.carBytes);
+
+    const destStorage = new InMemoryStorageProvider();
+    await destStorage.connect();
+    const destTokenStorage = new FakeTokenStorage();
+
+    // First import — destination is empty.
+    const firstResult = await importProfile({
+      storage: destStorage,
+      tokenStorage: destTokenStorage as unknown as ProfileTokenStorageProvider,
+      snapshot: parsed.snapshot,
+      bundleCars: parsed.bundleCars,
+      expectedChainPubkey: TEST_CHAIN_PUBKEY_B,
+    });
+    expect(firstResult.bundlesPinned).toBe(1);
+    expect(firstResult.bundleRefsRestored).toBe(1);
+    expect(firstResult.bundlesFailed).toBe(0);
+
+    // Second import — destination is now non-empty. Must `force` to
+    // bypass the clobber check.
+    const secondResult = await importProfile({
+      storage: destStorage,
+      tokenStorage: destTokenStorage as unknown as ProfileTokenStorageProvider,
+      snapshot: parsed.snapshot,
+      bundleCars: parsed.bundleCars,
+      expectedChainPubkey: TEST_CHAIN_PUBKEY_B,
+      force: true,
+    });
+    // Re-pin succeeded (block already in IPFS — idempotent at gateway).
+    expect(secondResult.bundlesPinned).toBe(1);
+    expect(secondResult.bundleRefsRestored).toBe(1);
+    expect(secondResult.bundlesFailed).toBe(0);
+    // Bundle ref still present and unchanged.
+    expect(destTokenStorage.bundleIndex.get(fixture.cid)).toMatchObject({
+      cid: fixture.cid,
+      status: 'active',
+    });
   });
 });

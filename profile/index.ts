@@ -91,7 +91,13 @@ export { ProfileTokenStorageProvider } from './profile-token-storage-provider';
 // IPFS Client
 // =============================================================================
 
-export { pinToIpfs, fetchFromIpfs, verifyCidAccessible } from './ipfs-client';
+export {
+  pinToIpfs,
+  pinCarBlocksToIpfs,
+  fetchFromIpfs,
+  fetchCarFromIpfs,
+  verifyCidAccessible,
+} from './ipfs-client';
 
 // =============================================================================
 // Consolidation

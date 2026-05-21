@@ -531,17 +531,19 @@ describe('parseLeanProfileSnapshot — validation', () => {
     );
   });
 
-  it('rejects unknown future version (>2)', async () => {
+  it('rejects unknown future version (>3)', async () => {
+    // Phase 4 (issue #200) — v3 became the current builder version;
+    // v4+ is still ahead of this SDK and must be rejected.
     const carBytes = await buildCarWithDoc({
-      version: 3,
+      version: 4,
       chainPubkey: TEST_CHAIN_PUBKEY_A,
       network: 'testnet',
       createdAt: Date.now(),
-      entries: [],
+      entryGroups: [],
       bundles: [],
     });
     await expect(parseLeanProfileSnapshot(carBytes)).rejects.toThrow(
-      /version 3 is newer/,
+      /version 4 is newer/,
     );
   });
 
@@ -570,10 +572,10 @@ describe('parseLeanProfileSnapshot — validation', () => {
 
   it('rejects missing chainPubkey', async () => {
     const carBytes = await buildCarWithDoc({
-      version: 2,
+      version: LEAN_PROFILE_SNAPSHOT_VERSION,
       network: 'testnet',
       createdAt: Date.now(),
-      entries: [],
+      entryGroups: [],
       bundles: [],
     });
     await expect(parseLeanProfileSnapshot(carBytes)).rejects.toThrow(/chainPubkey/);
@@ -586,8 +588,8 @@ describe('parseLeanProfileSnapshot — validation', () => {
     const { sha256 } = await import('@noble/hashes/sha2.js');
     const { create: createMultihash } = await import('multiformats/hashes/digest');
 
-    const a = encode({ version: 2, hello: 'a' });
-    const b = encode({ version: 2, hello: 'b' });
+    const a = encode({ version: LEAN_PROFILE_SNAPSHOT_VERSION, hello: 'a' });
+    const b = encode({ version: LEAN_PROFILE_SNAPSHOT_VERSION, hello: 'b' });
     const cidA = CID.createV1(0x71, createMultihash(0x12, sha256(a)));
     const cidB = CID.createV1(0x71, createMultihash(0x12, sha256(b)));
 
@@ -613,44 +615,13 @@ describe('parseLeanProfileSnapshot — validation', () => {
     );
   });
 
-  it('rejects duplicate entry keys', async () => {
-    const carBytes = await buildCarWithDoc({
-      version: 2,
-      chainPubkey: TEST_CHAIN_PUBKEY_A,
-      network: 'testnet',
-      createdAt: Date.now(),
-      entries: [
-        { key: 'mnemonic', value: 'a' },
-        { key: 'mnemonic', value: 'b' },
-      ],
-      bundles: [],
-    });
-    await expect(parseLeanProfileSnapshot(carBytes)).rejects.toThrow(
-      /Duplicate entry key/,
-    );
-  });
-
-  it('rejects oversized entry value via per-block-byte cap', async () => {
-    // 2 MiB string in a single dag-cbor block exceeds the 1 MiB per-block cap.
-    const huge = 'x'.repeat(2 * 1024 * 1024);
-    const carBytes = await buildCarWithDoc({
-      version: 2,
-      chainPubkey: TEST_CHAIN_PUBKEY_A,
-      network: 'testnet',
-      createdAt: Date.now(),
-      entries: [{ key: 'mnemonic', value: huge }],
-      bundles: [],
-    });
-    await expect(parseLeanProfileSnapshot(carBytes)).rejects.toThrow(/per-block cap/);
-  });
-
   it('rejects bundle entry with invalid status', async () => {
     const carBytes = await buildCarWithDoc({
-      version: 2,
+      version: LEAN_PROFILE_SNAPSHOT_VERSION,
       chainPubkey: TEST_CHAIN_PUBKEY_A,
       network: 'testnet',
       createdAt: Date.now(),
-      entries: [],
+      entryGroups: [],
       bundles: [
         { cid: FAKE_BUNDLE_CID_1, status: 'unverified', createdAt: 1 },
       ],
@@ -660,11 +631,11 @@ describe('parseLeanProfileSnapshot — validation', () => {
 
   it('rejects bundle entry with unparseable cid', async () => {
     const carBytes = await buildCarWithDoc({
-      version: 2,
+      version: LEAN_PROFILE_SNAPSHOT_VERSION,
       chainPubkey: TEST_CHAIN_PUBKEY_A,
       network: 'testnet',
       createdAt: Date.now(),
-      entries: [],
+      entryGroups: [],
       bundles: [{ cid: 'not-a-cid!@#', status: 'active', createdAt: 1 }],
     });
     await expect(parseLeanProfileSnapshot(carBytes)).rejects.toThrow(/unparseable cid/);
@@ -672,11 +643,11 @@ describe('parseLeanProfileSnapshot — validation', () => {
 
   it('rejects duplicate bundle cids', async () => {
     const carBytes = await buildCarWithDoc({
-      version: 2,
+      version: LEAN_PROFILE_SNAPSHOT_VERSION,
       chainPubkey: TEST_CHAIN_PUBKEY_A,
       network: 'testnet',
       createdAt: Date.now(),
-      entries: [],
+      entryGroups: [],
       bundles: [
         { cid: FAKE_BUNDLE_CID_1, status: 'active', createdAt: 1 },
         { cid: FAKE_BUNDLE_CID_1, status: 'superseded', createdAt: 2 },
@@ -687,41 +658,27 @@ describe('parseLeanProfileSnapshot — validation', () => {
 
   it('rejects empty network string', async () => {
     const carBytes = await buildCarWithDoc({
-      version: 2,
+      version: LEAN_PROFILE_SNAPSHOT_VERSION,
       chainPubkey: TEST_CHAIN_PUBKEY_A,
       network: '',
       createdAt: Date.now(),
-      entries: [],
+      entryGroups: [],
       bundles: [],
     });
     await expect(parseLeanProfileSnapshot(carBytes)).rejects.toThrow(/network/);
   });
 
-  it('rejects non-array entries', async () => {
+  it('rejects non-array entryGroups', async () => {
     const carBytes = await buildCarWithDoc({
-      version: 2,
+      version: LEAN_PROFILE_SNAPSHOT_VERSION,
       chainPubkey: TEST_CHAIN_PUBKEY_A,
       network: 'testnet',
       createdAt: Date.now(),
-      entries: 'not-an-array',
+      entryGroups: 'not-an-array',
       bundles: [],
     });
     await expect(parseLeanProfileSnapshot(carBytes)).rejects.toThrow(
-      /`entries` must be an array/,
-    );
-  });
-
-  it('rejects entry with missing key or value', async () => {
-    const carBytes = await buildCarWithDoc({
-      version: 2,
-      chainPubkey: TEST_CHAIN_PUBKEY_A,
-      network: 'testnet',
-      createdAt: Date.now(),
-      entries: [{ key: 'foo' }], // missing value
-      bundles: [],
-    });
-    await expect(parseLeanProfileSnapshot(carBytes)).rejects.toThrow(
-      /KV entry must have string `key` and `value`/,
+      /`entryGroups` must be an array/,
     );
   });
 });
@@ -731,7 +688,7 @@ describe('parseLeanProfileSnapshot — validation', () => {
 // =============================================================================
 
 describe('profile-lean-snapshot — cross-version isolation', () => {
-  it('v1 reader (parseProfileSnapshot) rejects lean v2 CARs', async () => {
+  it('v1 reader (parseProfileSnapshot) rejects lean v3 CARs', async () => {
     const { parseProfileSnapshot } = await import('../../../profile/profile-export');
 
     const storage = new InMemoryStorageProvider();
@@ -747,9 +704,10 @@ describe('profile-lean-snapshot — cross-version isolation', () => {
       network: 'testnet',
     });
 
-    // v1 reader caps PROFILE_SNAPSHOT_VERSION=1, sees version=2 and rejects.
+    // Phase 4 (issue #200) — builder now emits v3. The v1 reader still
+    // caps PROFILE_SNAPSHOT_VERSION=1 and rejects anything newer.
     await expect(parseProfileSnapshot(result.carBytes)).rejects.toThrow(
-      /version 2 is newer/,
+      /version 3 is newer/,
     );
   });
 

@@ -85,7 +85,7 @@ import { AggregatorPointerError, AggregatorPointerErrorCode } from './aggregator
 import { fetchCarFromGateway } from './aggregator-pointer/ipfs-car-fetch';
 import { fetchFromIpfs } from './ipfs-client';
 import {
-  parseLeanProfileSnapshot,
+  parseLeanProfileSnapshotFromRootBlock,
   type LeanProfileSnapshot,
 } from './profile-lean-snapshot';
 import type { ApplySnapshotResult } from './profile-snapshot-dispatcher';
@@ -435,30 +435,42 @@ function buildFetchAndJoin(deps: {
       );
     }
 
-    // 2. Fetch CAR via profile/ipfs-client — it already performs the
-    //    CID content-address verify internally.
-    let carBytes: Uint8Array;
+    // 2. Fetch the dag-cbor root block via profile/ipfs-client. The
+    //    publisher pins via `dag/import`, so each CAR block (currently
+    //    just the root) lands under its canonical CID — `block/get(rootCid)`
+    //    returns the dag-cbor encoded root block bytes directly (NOT a
+    //    CAR envelope). `fetchFromIpfs` already content-address-verifies
+    //    sha256(bytes) == cidString.multihash.
+    let rootBlockBytes: Uint8Array;
     try {
-      carBytes = await fetchFromIpfs([...deps.gateways], cidString);
+      rootBlockBytes = await fetchFromIpfs([...deps.gateways], cidString);
     } catch (err) {
       throw new AggregatorPointerError(
         AggregatorPointerErrorCode.CAR_UNAVAILABLE,
-        `fetchAndJoin: CAR fetch failed for ${cidString}: ${err instanceof Error ? err.message : String(err)}`,
+        `fetchAndJoin: snapshot block fetch failed for ${cidString}: ${err instanceof Error ? err.message : String(err)}`,
         undefined,
         { cause: err },
       );
     }
 
-    // 3. Item #15 Phase D.2 / E — parse the CAR as a lean snapshot
-    //    and dispatch per-writer JOIN. OrbitDB writes happen inside
-    //    the writers' `joinSnapshot()`; the cursor advance runs LAST
-    //    so a JOIN failure does not strand the cursor past unconsumed
-    //    remote state. Phase E removed the legacy bundle-CID-only
-    //    fallback — `applySnapshot` is required and a parse failure
+    // 3. Item #15 Phase D.2 / E — decode the dag-cbor root block as a
+    //    lean snapshot and dispatch per-writer JOIN. OrbitDB writes
+    //    happen inside the writers' `joinSnapshot()`; the cursor advance
+    //    runs LAST so a JOIN failure does not strand the cursor past
+    //    unconsumed remote state. Phase E removed the legacy bundle-CID-
+    //    only fallback — `applySnapshot` is required and a parse failure
     //    is a hard PROTOCOL_ERROR rather than a silent re-write.
     let snapshot: LeanProfileSnapshot;
     try {
-      snapshot = await parseLeanProfileSnapshot(carBytes);
+      // Phase 4 (issue #200) — v3 snapshots carry KV entries in
+      // per-group sub-blocks; the fetcher closure resolves each
+      // sub-block CID against the same gateway list as the root.
+      // `fetchFromIpfs` content-address-verifies every block so the
+      // dag-cbor decode operates on authenticated bytes.
+      snapshot = await parseLeanProfileSnapshotFromRootBlock(
+        rootBlockBytes,
+        (subBlockCid) => fetchFromIpfs([...deps.gateways], subBlockCid),
+      );
     } catch (err) {
       // The remote CAR is malformed or not a lean snapshot. Treat
       // as a hard protocol error. The next reconcile pass will

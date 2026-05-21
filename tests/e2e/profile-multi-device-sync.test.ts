@@ -35,7 +35,7 @@ import {
   waitForAllCoins,
   type BalanceSnapshot,
 } from './helpers';
-import { makeProfileProviders } from './profile-helpers';
+import { makeProfileProviders, unwrapProfileProviders } from './profile-helpers';
 import { preflightSkip } from './lib/preflight';
 
 // =============================================================================
@@ -77,7 +77,11 @@ describe.skipIf(SKIP_INFRA)('Profile Multi-Device Sync E2E', () => {
       cleanupDirs.push(dirsA.base);
       await ensureTrustbase(dirsA.dataDir);
 
-      const providersA = makeProfileProviders(dirsA);
+      // Suppress the auto-debouncer so all multi-coin faucet activity
+      // coalesces into one pending state; explicit `awaitNextFlush()`
+      // below produces V1 only — deterministic cross-device sync.
+      const providersA = makeProfileProviders(dirsA, { flushDebounceMs: 300_000 });
+      const tokenStorageA = unwrapProfileProviders(providersA).tokenStorage;
 
       console.log(`\n[Test 1] Device A creating Profile wallet @${savedNametag}...`);
       const { sphere, created, generatedMnemonic } = await Sphere.init({
@@ -107,19 +111,33 @@ describe.skipIf(SKIP_INFRA)('Profile Multi-Device Sync E2E', () => {
         originalTokenAmounts.set(coin.symbol, getTokenAmounts(sphere, coin.symbol));
       }
 
-      // Explicit sync flush — pushes CAR bundle to IPFS, updates
-      // OrbitDB OpLog with the latest bundle CID. sync() drains pending
-      // V5 finalizations internally before the flush so any token whose
+      // Drain pending V5 finalizations and snapshot local state.
+      // sync() drains finalizations internally so any token whose
       // sdkData still carries `_pendingFinalization` (and would round-
       // trip through tokenToTxf as null) is finalized first. Without
       // this, `waitForAllCoins` exits as soon as balance > 0 (pending
       // v5 counts toward balance) and a mid-finalization flush would
       // publish a partial CAR — Device B's cold-start recovery then
-      // sees a partial inventory ("USDC missing" symptom). 60s drain
-      // budget matches the prior explicit drain.
-      console.log('  Publishing state to Profile (IPFS CAR + OrbitDB)...');
+      // sees a partial inventory ("USDC missing" symptom).
+      console.log('  Draining pending V5 finalizations + saving local state...');
       const syncResult = await sphere.payments.sync({ drainTimeoutMs: 60_000 });
       console.log(`  Sync: added=${syncResult.added}, removed=${syncResult.removed}`);
+
+      // Full-profile-sync: force ONE explicit lean-snapshot publish via
+      // `awaitNextFlush()`. The raised `flushDebounceMs` (5 min, see
+      // makeProfileProviders) suppresses the auto-debouncer during
+      // reception — all saves coalesce into one pending state, and
+      // this serialized flush publishes V1 only. Phase-3 walkback is
+      // skipped (V1 is the first version on a fresh wallet); subsequent
+      // versions would race aggregator-gateway propagation and stall.
+      console.log('  Publishing lean profile snapshot to IPFS + aggregator pointer...');
+      await tokenStorageA.awaitNextFlush(120_000);
+
+      // Allow IPFS replication so Device B's `recoverLatest()` finds
+      // the freshly-pinned snapshot CAR via the aggregator's reachable
+      // gateway.
+      console.log('  Waiting 10s for IPFS replication to aggregator gateways...');
+      await new Promise((r) => setTimeout(r, 10_000));
 
       await sphere.destroy();
       spheres.splice(spheres.indexOf(sphere), 1);
