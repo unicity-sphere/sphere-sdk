@@ -291,7 +291,38 @@ export class BundleIndex implements ProfileSyncWriter {
         return this.classifyBundleBytes(entry.encryptedValue, /* remote = */ true);
       },
       writeRemote: async (key, bytes) => {
-        await this.host.db.put(key, bytes);
+        // #207 E2E fix — wrap the remote encrypted payload in a fresh
+        // OpLog envelope before writing. Pre-fix this used `db.put(key,
+        // bytes)` which stored the encrypted bytes RAW (no envelope
+        // wrapper), causing subsequent `db.getEntry(key)` →
+        // `decodeEntry(bytes)` to throw "tag not supported (X)" on the
+        // ciphertext bytes. The lean-snapshot publisher (which reads
+        // via `getEncryptedRaw` → `readEnvelopePayload` → `db.getEntry`)
+        // then silently skipped the bundle entry, producing an empty
+        // bundle slice in the published snapshot — so any peer (or our
+        // own next pointer-poll cycle) saw no bundles. That's the
+        // proximate cause of the `profile-live-concurrent-sync` failure
+        // (A's published bundle CAR contained zero tokens; B saw
+        // nothing).
+        //
+        // Falling back to raw `db.put` when `putEntry` is unavailable
+        // matches `addBundle()`'s pattern — the adapter's read-time
+        // legacy wrap (v=0 synthetic envelope) handles those bytes.
+        const db = this.host.db;
+        if (typeof db.putEntry === 'function') {
+          const envelope = buildLocalEntry({
+            type: 'cache_index',
+            originated: 'system',
+            payload: bytes,
+          });
+          await db.putEntry(key, envelope);
+        } else {
+          await db.put(key, bytes);
+          const markHook = (db as { markLocallyAuthored?: (k: string) => void }).markLocallyAuthored;
+          if (typeof markHook === 'function') {
+            markHook.call(db, key);
+          }
+        }
         const cid = key.slice(BUNDLE_KEY_PREFIX.length);
         if (cid.length > 0) {
           this.host.getKnownBundleCids().add(cid);

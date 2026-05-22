@@ -86,12 +86,14 @@ function getEncryptionKey(): Uint8Array {
  * that produced raw-codec CIDs incompatible with the new pin path.
  */
 async function projectedFlushCid(tokens: unknown[]): Promise<string> {
+  // #207 E2E fix — bundle CIDs are now raw-codec single-block pins
+  // (see `pinToIpfs` and `computeRawPinCid` in flush-scheduler). The
+  // legacy dag-cbor envelope CID via `extractCarRootCid` no longer
+  // matches what gets pinned. Mirror the actual pin CID computation
+  // here so test assertions see the same identity.
   const { makeFakeUxfCar } = await import('./_helpers/fake-uxf-car.js');
-  const { extractCarRootCid } = await import(
-    '../../../uxf/transfer-payload.js'
-  );
   const carBytes = await makeFakeUxfCar({ tokens });
-  return extractCarRootCid(carBytes);
+  return cidForBytes(carBytes);
 }
 
 function cidForBytes(bytes: Uint8Array): string {
