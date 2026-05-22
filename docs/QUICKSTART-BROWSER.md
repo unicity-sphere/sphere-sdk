@@ -193,7 +193,7 @@ Browser SDK uses two storage mechanisms automatically:
 
 | Data | Storage | Persistence |
 |------|---------|-------------|
-| Wallet (mnemonic, nametag) | `localStorage` | Per-domain, survives refresh |
+| Wallet (mnemonic, Unicity ID) | `localStorage` | Per-domain, survives refresh |
 | Tokens | `IndexedDB` | Per-domain, larger capacity |
 
 **SSR Note:** If `localStorage` is unavailable (SSR), an in-memory fallback is used.
@@ -339,7 +339,7 @@ const { transfers } = await sphere.payments.receive();
 console.log(`Received ${transfers.length} new transfers`);
 ```
 
-### Register Nametag
+### Register Unicity ID
 
 > **Note:** `registerNametag()` mints a token on-chain. This uses the Oracle (Aggregator) provider which is included by default with `createBrowserProviders()`.
 

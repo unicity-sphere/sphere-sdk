@@ -1505,9 +1505,9 @@ unsubscribe();
 
 ---
 
-## Nametags
+## Unicity IDs
 
-Nametags provide human-readable addresses (e.g., `@alice`) for receiving tokens.
+Unicity IDs provide human-readable addresses (e.g., `@alice`) for receiving tokens.
 
 ### Registration Flow
 
@@ -1526,9 +1526,9 @@ await sphere.registerNametag('alice');
 const result = await sphere.mintNametag('alice');
 ```
 
-### Multi-Address Nametags
+### Multi-Address Unicity IDs
 
-Each derived address can have its own nametag:
+Each derived address can have its own Unicity ID:
 
 ```typescript
 // Register @alice for address 0
@@ -1544,7 +1544,7 @@ sphere.getNametagForAddress(1);  // 'bob'
 sphere.getAllAddressNametags();  // Map { 0 => 'alice', 1 => 'bob' }
 ```
 
-### Troubleshooting: "Nametag already taken"
+### Troubleshooting: "Unicity ID already taken"
 
 **Error:**
 ```
@@ -1552,7 +1552,7 @@ Failed to register nametag. It may already be taken.
 [NostrTransportProvider] Nametag already taken: myname - owner: f124f93ae6...
 ```
 
-**Cause:** The nametag is registered to a different public key. This happens when:
+**Cause:** The Unicity ID is registered to a different public key. This happens when:
 
 1. **Storage cleared or inaccessible** → `Sphere.exists()` returns `false` → new wallet created
 2. **Different mnemonic provided** on subsequent runs
@@ -1591,9 +1591,9 @@ logger.setTagDebug('IndexedDB', true);
 logger.setTagDebug('IPFS-Storage', true);
 ```
 
-### Nametag Sync on Load
+### Unicity ID Sync on Load
 
-When loading an existing wallet, the SDK automatically syncs the nametag with Nostr:
+When loading an existing wallet, the SDK automatically syncs the Unicity ID with Nostr:
 
 ```typescript
 // On Sphere.load(), if local nametag exists:
@@ -1602,9 +1602,9 @@ When loading an existing wallet, the SDK automatically syncs the nametag with No
 // 3. Logs warning if owned by different pubkey
 ```
 
-### Nametag Recovery on Import
+### Unicity ID Recovery on Import
 
-When importing a wallet without specifying a nametag, the SDK automatically attempts to recover it from Nostr:
+When importing a wallet without specifying a Unicity ID, the SDK automatically attempts to recover it from Nostr:
 
 ```typescript
 // Import wallet - nametag will be recovered if found on Nostr
@@ -1627,8 +1627,8 @@ if (sphere.identity?.nametag) {
 
 The recovery process:
 1. Derives transport pubkey from wallet keys
-2. Queries Nostr for nametag events owned by this pubkey
-3. If found, sets the nametag locally and emits `nametag:recovered` event
+2. Queries Nostr for Unicity ID events owned by this pubkey
+3. If found, sets the Unicity ID locally and emits `nametag:recovered` event
 
 ---
 
@@ -1835,14 +1835,14 @@ npm test -- --coverage
 | `serialization/wallet-dat` | 18 | SQLite wallet.dat parsing |
 | `modules/TokenSplitCalculator` | 23 | Token split optimization |
 | `modules/TokenSplitExecutor` | 16 | Token split execution |
-| `modules/PaymentsModule` | 36 | Payments, nametag, PROXY |
-| `modules/NametagMinter` | 22 | On-chain nametag minting |
+| `modules/PaymentsModule` | 36 | Payments, Unicity ID, PROXY |
+| `modules/NametagMinter` | 22 | On-chain Unicity ID minting |
 | `modules/CommunicationsModule.storage` | 16 | DM per-address storage, migration, pagination |
 | `price/CoinGeckoPriceProvider` | 29 | Price provider, cache, negative cache |
 | `transport/NostrTransportProvider` | 43 | Nostr P2P messaging, event timestamp persistence |
 | `impl/browser/IndexedDBStorageProvider` | 17 | IndexedDB kv storage, per-address key scoping |
 | `integration/wallet-import-export` | 20 | Wallet import/export |
-| `integration/nametag-roundtrip` | 9 | Nametag serialization |
+| `integration/nametag-roundtrip` | 9 | Unicity ID serialization |
 | `impl/shared/resolvers` | 41 | Config resolution utilities |
 | **Total** | **1613** | All passing (63 test files) |
 

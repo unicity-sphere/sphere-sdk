@@ -148,7 +148,7 @@ Node.js implementation uses **file-based storage**:
 
 | Data | Location | Format |
 |------|----------|--------|
-| Wallet (keys, nametag) | `dataDir/wallet.json` (or custom file name) | JSON (plaintext or password-encrypted mnemonic) |
+| Wallet (keys, Unicity ID) | `dataDir/wallet.json` (or custom file name) | JSON (plaintext or password-encrypted mnemonic) |
 | Tokens | `tokensDir/_<tokenId>.json` | One JSON file per token |
 
 > **Note:** IPFS sync is available for both browser and Node.js. See [IPFS Token Sync](#ipfs-token-sync-optional) below.
@@ -359,7 +359,7 @@ await sphere.payments.receive(undefined, (transfer) => {
 });
 ```
 
-### Register Nametag
+### Register Unicity ID
 
 > **Note:** `registerNametag()` mints a token on-chain. This uses the Oracle (Aggregator) provider which is included by default with `createNodeProviders()`.
 
