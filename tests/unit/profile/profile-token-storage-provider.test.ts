@@ -1347,13 +1347,17 @@ describe('ProfileTokenStorageProvider', () => {
       // that identical token pools across wallets produce the same CIDs.
       expect(pinnedBlocks.length).toBeGreaterThan(0);
 
-      // At least one block must dag-cbor decode and carry the `payload`
-      // shape the fake-CAR helper wraps the token list inside. If the
-      // flush had encrypted the CAR before pinning, dag-cbor decode of
-      // ciphertext would fail across every block.
+      // At least one block must carry the unencrypted payload — either
+      // as a dag-cbor envelope (legacy block-by-block pin produces one
+      // such block per CAR element) OR as a CAR wrapper containing the
+      // envelope (monolithic raw-pin per #207 E2E fix). If the flush
+      // had encrypted the CAR before pinning, neither shape would
+      // surface the `payload.tokens` marker.
       const { decode: dagCborDecode } = await import('@ipld/dag-cbor');
+      const { CarReader } = await import('@ipld/car');
       let foundEnvelope = false;
       for (const blk of pinnedBlocks) {
+        // Try direct dag-cbor decode (block-by-block pin shape).
         try {
           const decoded = dagCborDecode(blk) as { payload?: { tokens?: unknown } };
           if (decoded && decoded.payload && 'tokens' in decoded.payload) {
@@ -1361,7 +1365,23 @@ describe('ProfileTokenStorageProvider', () => {
             break;
           }
         } catch {
-          // not the envelope block — continue
+          // not a dag-cbor block — try CAR-wrapper decode below
+        }
+        // Try CAR-wrapper decode (monolithic raw-pin shape).
+        try {
+          const reader = await CarReader.fromBytes(blk);
+          for await (const inner of reader.blocks()) {
+            try {
+              const decoded = dagCborDecode(inner.bytes) as { payload?: { tokens?: unknown } };
+              if (decoded && decoded.payload && 'tokens' in decoded.payload) {
+                foundEnvelope = true;
+                break;
+              }
+            } catch { /* try next inner block */ }
+          }
+          if (foundEnvelope) break;
+        } catch {
+          // not a CAR either — continue to next pinned block
         }
       }
       expect(foundEnvelope).toBe(true);
