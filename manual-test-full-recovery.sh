@@ -302,21 +302,28 @@ INV="$(grep -Eo '"invoiceId":[[:space:]]*"[^"]+"' "$SNAP/peer1-invoice-create.lo
 [[ -n "$INV" ]] || { echo "FAIL: couldn't extract invoiceId" >&2; exit 1; }
 echo "INV=$INV"
 
+banner "§C.1b Alice delivers the invoice to Bob (#226 — UXF bundle over DM)"
+
+# `sphere invoice create` no longer auto-delivers (#226). Delivery is a
+# separate, explicit step: package the invoice into a UXF bundle and
+# ship it to every non-self target via NIP-17 DM. Without this step,
+# Bob's wallet has no path to discover the invoice — payment-time
+# sync/receive don't pull invoices addressed to him, and `invoice pay`
+# would error with "No invoice found matching prefix: ...".
+sphere invoice deliver "$INV" 2>&1 | tee "$SNAP/peer1-invoice-deliver.log"
+
 banner "§C.2 Bob pays"
 
 sphere wallet use bob
-# Bob must pull alice's just-minted invoice token from the relay /
-# IPFS before he can resolve the invoice id. The script's §B daemons
-# are currently unreliable on testnet (stale PID after detach), so
-# we drive the pull explicitly with `payments sync` here. Without
-# this the next `invoice pay $INV` errors with
-# "No invoice found matching prefix: ..." because bob's local
-# invoice ledger is empty.
+# Give Bob's relay subscription a beat to ingest the just-published
+# `invoice_delivery:` DM. The receive pipeline imports the bundled
+# invoice synchronously on DM arrival, so a short settle suffices.
+sleep 5
 sphere payments sync       2>&1 | tee "$SNAP/peer1-bob-pre-pay-sync.log"
-# Some implementations route the invoice token through `payments
-# receive` rather than `payments sync` (Nostr-delivered vs IPFS-
-# discovered). Drive both with --finalize so any pending V5 tokens
-# also get finalized before bob looks up the invoice.
+# `payments receive --finalize` drains any pending V5 tokens before
+# Bob looks up the invoice. The invoice itself rides through the
+# `invoice_delivery:` DM channel (handled by AccountingModule, not
+# the payments pipeline) — included here purely for hygiene.
 sphere payments receive --finalize 2>&1 | tee "$SNAP/peer1-bob-pre-pay-receive.log"
 sphere invoice pay "$INV"  2>&1 | tee "$SNAP/peer1-invoice-pay.log"
 sphere payments sync       2>&1 | tee "$SNAP/peer1-invoice-pay-sync.log"

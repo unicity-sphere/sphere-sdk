@@ -233,10 +233,27 @@ sphere invoice create --target @$BOB_TAG --asset "11000000 UCT" --memo "Full-rec
 INV=<paste invoiceId>
 ```
 
+### C.1b Alice delivers the invoice to Bob (#226)
+
+`sphere invoice create` does not auto-deliver. Delivery is a separate,
+explicit step that packages the invoice into a UXF bundle and ships it
+to every non-self target via NIP-17 DM. Without this step, Bob's wallet
+has no path to discover the invoice — `payments sync` / `payments
+receive` don't pull invoices addressed to him.
+
+```bash
+sphere invoice deliver $INV
+# Per-recipient outcome is printed as JSON. Successful delivery shows
+# { sent: 1, failed: 0, recipients: [{ ..., success: true, shape: "inline" }] }.
+```
+
 ### C.2 Bob pays (on peer1)
 
 ```bash
 sphere wallet use bob
+# Give Bob's relay subscription a beat to ingest the invoice_delivery: DM.
+sleep 5
+sphere payments sync
 sphere invoice pay $INV
 sphere payments sync
 ```
