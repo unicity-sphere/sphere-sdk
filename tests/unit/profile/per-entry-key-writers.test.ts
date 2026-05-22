@@ -38,6 +38,7 @@ import type {
 } from '../../../storage/storage-provider';
 import { ProfileTokenStorageProvider } from '../../../profile/profile-token-storage-provider';
 import { decryptProfileValue } from '../../../profile/encryption';
+import { waitForFlushSettled } from '../../helpers/profile/waitForFlushSettled';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -221,7 +222,7 @@ describe('Per-entry-key writers — audit + finalizationQueue (T.0.G7-fill-gaps)
       ];
       data._audit = audit;
       await provider.save(data);
-      await new Promise((r) => setTimeout(r, 100));
+      await waitForFlushSettled(provider, 10000);
 
       const keys = [...db._store.keys()].filter((k) => k.startsWith(`${ADDR}.audit.`));
       expect(keys.length).toBe(2);
@@ -259,7 +260,7 @@ describe('Per-entry-key writers — audit + finalizationQueue (T.0.G7-fill-gaps)
         },
       ];
       await provider.save(data);
-      await new Promise((r) => setTimeout(r, 100));
+      await waitForFlushSettled(provider, 10000);
 
       const expectedKey = `${ADDR}.audit.${compositeId}`;
       expect(db._store.has(expectedKey)).toBe(true);
@@ -279,7 +280,7 @@ describe('Per-entry-key writers — audit + finalizationQueue (T.0.G7-fill-gaps)
         { id: 'idDropped', tokenId: 'tD', disposition: 'UNSPENDABLE_BY_US', detectedAt: 2 },
       ];
       await provider.save(data1);
-      await new Promise((r) => setTimeout(r, 100));
+      await waitForFlushSettled(provider, 10000);
       expect(db._store.has(`${ADDR}.audit.idKept`)).toBe(true);
       expect(db._store.has(`${ADDR}.audit.idDropped`)).toBe(true);
 
@@ -289,7 +290,7 @@ describe('Per-entry-key writers — audit + finalizationQueue (T.0.G7-fill-gaps)
         { id: 'idKept', tokenId: 'tK', disposition: 'NOT_OUR_CURRENT_STATE', detectedAt: 1 },
       ];
       await provider.save(data2);
-      await new Promise((r) => setTimeout(r, 100));
+      await waitForFlushSettled(provider, 10000);
 
       // Kept entry: still live (parses as audit entry).
       const kept = (await readEntry(db, `${ADDR}.audit.idKept`)) as TxfAuditEntry;
@@ -327,7 +328,7 @@ describe('Per-entry-key writers — audit + finalizationQueue (T.0.G7-fill-gaps)
       ];
       data._finalizationQueue = queue;
       await provider.save(data);
-      await new Promise((r) => setTimeout(r, 100));
+      await waitForFlushSettled(provider, 10000);
 
       const keys = [...db._store.keys()].filter((k) =>
         k.startsWith(`${ADDR}.finalizationQueue.`),
@@ -362,14 +363,14 @@ describe('Per-entry-key writers — audit + finalizationQueue (T.0.G7-fill-gaps)
         { id: 'reqB', status: 'pending', enqueuedAt: 2 },
       ];
       await provider.save(data1);
-      await new Promise((r) => setTimeout(r, 100));
+      await waitForFlushSettled(provider, 10000);
 
       const data2 = buildEmptyTxfData();
       data2._finalizationQueue = [
         { id: 'reqA', status: 'pending', enqueuedAt: 1 },
       ];
       await provider.save(data2);
-      await new Promise((r) => setTimeout(r, 100));
+      await waitForFlushSettled(provider, 10000);
 
       const tomb = (await readEntry(db, `${ADDR}.finalizationQueue.reqB`)) as {
         tombstoned: true;
@@ -399,7 +400,7 @@ describe('Per-entry-key writers — audit + finalizationQueue (T.0.G7-fill-gaps)
       { id: 'shared-id', status: 'pending', enqueuedAt: 4 },
     ];
     await provider.save(data);
-    await new Promise((r) => setTimeout(r, 100));
+    await waitForFlushSettled(provider, 10000);
 
     // All four collections have a key with the same trailing id but
     // distinct prefixes — they must not overwrite each other.

@@ -45,6 +45,7 @@ import {
   deriveProfileEncryptionKey,
   encryptProfileValue,
 } from '../../../profile/encryption';
+import { waitForFlushSettled } from '../../helpers/profile/waitForFlushSettled';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { CID } from 'multiformats/cid';
 import * as raw from 'multiformats/codecs/raw';
@@ -365,7 +366,7 @@ describe('ProfileTokenStorageProvider — no-data flush on remote update', () =>
     const spy = vi.spyOn(flushScheduler, 'scheduleFlushNoData');
 
     db._triggerReplication();
-    await new Promise((r) => setTimeout(r, 50));
+    await waitForFlushSettled(provider, 10000);
 
     expect(spy).not.toHaveBeenCalled();
 
@@ -418,7 +419,7 @@ describe('ProfileTokenStorageProvider — no-data flush on remote update', () =>
     flushScheduler.scheduleFlushNoData();
 
     // Wait for debounce + flush to complete.
-    await new Promise((r) => setTimeout(r, 100));
+    await waitForFlushSettled(provider, 10000);
 
     // No pin should have been issued — short-circuit fired.
     expect(pinCallCount).toBe(0);
@@ -478,7 +479,7 @@ describe('ProfileTokenStorageProvider — no-data flush on remote update', () =>
     ).flushScheduler;
     flushScheduler.scheduleFlushNoData();
 
-    await new Promise((r) => setTimeout(r, 100));
+    await waitForFlushSettled(provider, 10000);
 
     expect(pinCallCount).toBe(0);
 
@@ -525,7 +526,7 @@ describe('ProfileTokenStorageProvider — no-data flush on remote update', () =>
     ).flushScheduler;
     flushScheduler.scheduleFlushNoData();
 
-    await new Promise((r) => setTimeout(r, 100));
+    await waitForFlushSettled(provider, 10000);
 
     // The flush proceeded — pin was issued.
     expect(pinCallCount).toBe(1);
@@ -568,7 +569,7 @@ describe('ProfileTokenStorageProvider — no-data flush on remote update', () =>
     ).flushScheduler;
     flushScheduler.scheduleFlushNoData();
 
-    await new Promise((r) => setTimeout(r, 100));
+    await waitForFlushSettled(provider, 10000);
 
     expect(pinCallCount).toBe(0);
 

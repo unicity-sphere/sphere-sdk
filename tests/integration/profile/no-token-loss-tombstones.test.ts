@@ -37,6 +37,7 @@ import {
   deriveProfileEncryptionKey,
   encryptProfileValue,
 } from '../../../profile/encryption.js';
+import { waitForFlushSettled } from '../../helpers/profile/waitForFlushSettled.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { CID } from 'multiformats/cid';
 import * as raw from 'multiformats/codecs/raw';
@@ -275,10 +276,12 @@ describe('G4 — tombstones survive cold-start (security boundary)', () => {
     const data = buildTxfData();
     data._tombstones = tombstones;
     await provider.save(data);
-    // Give the debounce + flush + IPFS pin + OrbitDB write the time
-    // to settle. Higher timeout is fine — this test has no realtime
-    // constraint.
-    await new Promise((r) => setTimeout(r, 200));
+    // Issue #219: wait deterministically for the flush body (pin → bundle
+    // write → operational state at `${addr}.tombstones`) to fully settle
+    // instead of polling on a fixed timer. Under full-suite worker
+    // contention the bundle write can land before the tombstone write,
+    // making any fixed budget racy.
+    await waitForFlushSettled(provider, 10000);
 
     // Dump keys for diagnostic clarity if the assertion fails — without
     // this, a flush-scheduler regression here is opaque to triage.
@@ -304,7 +307,7 @@ describe('G4 — tombstones survive cold-start (security boundary)', () => {
     const data1 = buildTxfData();
     data1._tombstones = tombstones;
     await provider1.save(data1);
-    await new Promise((r) => setTimeout(r, 80));
+    await waitForFlushSettled(provider1, 10000);
 
     // Plant a dummy bundle so load() goes through the merge path
     // (zero bundles short-circuits load). Must be done BEFORE wiping
