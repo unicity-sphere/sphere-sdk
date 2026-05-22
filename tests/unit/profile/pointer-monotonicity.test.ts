@@ -322,6 +322,58 @@ async function plantBundleInOrbit(
   );
 }
 
+/**
+ * Issue #215: wait for any debounced flush armed via `scheduleFlush*`
+ * to actually fire AND its in-flight promise to settle.
+ *
+ * The bare `setTimeout(r, flushDebounceMs + epsilon)` pattern is racy
+ * under full-suite worker contention: the debounce timer may not have
+ * fired yet at the wake-up, and the flush body's awaits (mocked
+ * `fetch`, dynamic `import('UxfPackage.js')`) take real time. If the
+ * test asserts before the flush settles, leaked in-flight work bumps
+ * the shared `tracker.pinCalls` counter mid-way through the NEXT test
+ * (which has already swapped in its own tracker via `installMockFetch`),
+ * making that test fail with `pinCalls = 1` when it expected 0.
+ *
+ * Strategy: poll until the host exposes a non-null `flushPromise` (the
+ * timer fired and a flush is now in flight), then `await` it. If no
+ * flush starts within the deadline, return — the caller is then free
+ * to assert "nothing happened" without worrying about a deferred pin.
+ */
+async function waitForFlushSettled(
+  provider: ProfileTokenStorageProvider,
+  deadlineMs = 2000,
+): Promise<void> {
+  const host = provider as unknown as {
+    flushPromise: Promise<void> | null;
+    flushTimer: ReturnType<typeof setTimeout> | null;
+  };
+  const start = Date.now();
+  // Wait for the debounce timer to fire (flushPromise becomes non-null)
+  // OR for both the timer and the promise to be null AND stay null for
+  // a short stability window (= no flush was actually scheduled).
+  while (Date.now() - start < deadlineMs) {
+    if (host.flushPromise) {
+      try {
+        await host.flushPromise;
+      } catch {
+        // Flush body throws on POINTER_MONOTONICITY_VIOLATION etc.;
+        // that's a normal completion path for the tests below.
+      }
+      // After settle, check whether a chained flush re-armed.
+      if (!host.flushTimer && !host.flushPromise) return;
+      continue;
+    }
+    if (!host.flushTimer) {
+      // Stability window — give a late-arming timer a moment to land.
+      await new Promise((r) => setTimeout(r, 5));
+      if (!host.flushTimer && !host.flushPromise) return;
+      continue;
+    }
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -352,18 +404,25 @@ describe('pointer monotonicity invariant', () => {
     const v1 = buildTxfData({ _T1: tokenT1 });
     await provider.save(v1);
 
-    // Wait for V1 flush to complete.
-    await new Promise((r) => setTimeout(r, 80));
-    expect(tracker.pinCalls).toBe(1);
+    // Issue #215: wait for the debounced V1 flush to actually finish
+    // pinning. The original `setTimeout(r, 80)` expired before the
+    // pin under full-suite contention (load() + import('UxfPackage.js')
+    // round-trip), the assertion failed mid-test, AND the in-flight
+    // flush later bumped `tracker.pinCalls` while the NEXT test was
+    // running (cascading into "race-stale flush" failing with
+    // pinCalls=1 vs expected 0).
+    await vi.waitFor(() => {
+      expect(tracker.pinCalls).toBe(1);
+    }, { timeout: 5000, interval: 25 });
 
     // V2: save() with {T1, T2} — strict superset.
     const tokenT2 = { id: '_T2', genesis: { tokenId: 'T2' } };
     const v2 = buildTxfData({ _T1: tokenT1, _T2: tokenT2 });
     await provider.save(v2);
 
-    await new Promise((r) => setTimeout(r, 80));
-    // V2 flush succeeded — assertion did NOT fire.
-    expect(tracker.pinCalls).toBe(2);
+    await vi.waitFor(() => {
+      expect(tracker.pinCalls).toBe(2);
+    }, { timeout: 5000, interval: 25 });
 
     // Both bundles registered in OrbitDB.
     const bundleKeys = [...db._store.keys()].filter((k) =>
@@ -438,7 +497,11 @@ describe('pointer monotonicity invariant', () => {
     ).flushScheduler;
     flushScheduler.scheduleFlushNoData();
 
-    await new Promise((r) => setTimeout(r, 100));
+    // Issue #215: wait for the debounced flush to actually run
+    // (timer → flush body → catch arm) before asserting that no pin
+    // was issued. The original 100 ms fixed wait was insufficient
+    // under full-suite contention.
+    await waitForFlushSettled(provider);
 
     // Assertion fired: no pin, error event emitted with the violation
     // code and the unknown bundle CID listed.
@@ -590,7 +653,12 @@ describe('pointer monotonicity invariant', () => {
     ).flushScheduler;
     flushScheduler.scheduleFlushNoData();
 
-    await new Promise((r) => setTimeout(r, 100));
+    // Issue #215: wait for the flush body to actually run + short-
+    // circuit before asserting nothing happened. Without this the
+    // assertion could pass simply because the debounce timer hadn't
+    // fired yet — and the deferred flush would then leak into the
+    // next test.
+    await waitForFlushSettled(provider);
 
     // Short-circuit fired: no pin, no assertion violation.
     expect(tracker.pinCalls).toBe(0);
