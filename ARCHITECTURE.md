@@ -19,7 +19,7 @@ recovery phrase
                   ├─ used DIRECTLY (key = d):
                   │    ├─ chain public key — 33-byte compressed secp256k1
                   │    │      → messaging/transport identity (x-only: pubkey.slice(2))
-                  │    │      → nametag binding, signMessage / verifySignedMessage
+                  │    │      → Unicity-ID binding, signMessage / verifySignedMessage
                   │    └─ ALPHA address — alpha1… (hash160 of the chain public key)
                   │
                   └─ HASHED FIRST (key = SHA-256(d), via SigningService.createFromSecret):
@@ -28,9 +28,9 @@ recovery phrase
                               → owns and signs tokens on the main network
 ```
 
-> **There are actually two secp256k1 keypairs per address — this trips people up.** The **raw** child key `d` drives the messaging identity (the transport key is the chain public key with its parity prefix stripped, `pubkey.slice(2)`), the nametag binding, message signing, and the ALPHA address. The **token** key is `SHA-256(d)`: `SigningService.createFromSecret(secret)` hashes the secret *before* using it, so the `DIRECT://` token address and all token signatures are a **different elliptic‑curve point** from the chain/messaging key. Code that needs the token key must go through `SigningService.createFromSecret(privKey)` (as `deriveL3PredicateAddress` does). Using `new SigningService(privKey)` (the raw constructor) gives the messaging key instead — it will *not* match the token address. See [docs/IDENTITY-CRYPTO.md](docs/IDENTITY-CRYPTO.md).
+> **There are actually two secp256k1 keypairs per address — this trips people up.** The **raw** child key `d` drives the messaging identity (the transport key is the chain public key with its parity prefix stripped, `pubkey.slice(2)`), the Unicity-ID binding, message signing, and the ALPHA address. The **token** key is `SHA-256(d)`: `SigningService.createFromSecret(secret)` hashes the secret *before* using it, so the `DIRECT://` token address and all token signatures are a **different elliptic‑curve point** from the chain/messaging key. Code that needs the token key must go through `SigningService.createFromSecret(privKey)` (as `deriveL3PredicateAddress` does). Using `new SigningService(privKey)` (the raw constructor) gives the messaging key instead — it will *not* match the token address. See [docs/IDENTITY-CRYPTO.md](docs/IDENTITY-CRYPTO.md).
 
-**One recovery phrase still fully reconstructs everything** — both keypairs derive deterministically from the same child key, and (with help from the relay) so does the user's `@nametag`.
+**One recovery phrase still fully reconstructs everything** — both keypairs derive deterministically from the same child key, and (with help from the relay) so does the user's Unicity ID.
 
 A second key system appears in exactly one place: the optional IPFS/IPNS token backup derives an **Ed25519** key from the wallet secret via HKDF (`info = "ipfs-storage-ed25519-v1"`). Nothing else uses a second curve.
 
@@ -42,7 +42,7 @@ interface Identity {
   directAddress?: string;  // DIRECT://…  — primary wallet address
   l1Address: string;       // alpha1…     — ALPHA base-chain coin only
   ipnsName?: string;       // identifier for IPFS token backup
-  nametag?: string;        // human-readable handle
+  nametag?: string;        // the Unicity ID (human-readable handle, e.g. @alice)
 }
 ```
 
@@ -90,7 +90,7 @@ Token metadata (symbols, decimals, icons) is fetched from a remote registry and 
 Sending a token reduces to: commit, prove, deliver.
 
 ```
-1. Resolve recipient (@nametag / DIRECT:// / pubkey) → an address object
+1. Resolve recipient (Unicity ID / DIRECT:// / pubkey) → an address object
 2. Build a TransferCommitment over the token, recipient, a random 32-byte salt,
    an optional on-chain message, signed with the sender's key
 3. Submit the commitment to the aggregator
@@ -160,7 +160,7 @@ All peer‑to‑peer delivery — token transfers, payment requests, direct mess
 
 - **Direct messages** use NIP‑17 gift wrap: a three‑layer envelope (rumor → seal → gift wrap) encrypted with NIP‑44 under an ephemeral key, with timestamps randomized ±2 days for privacy.
 - **Token transfers** are a custom event kind, NIP‑04 encrypted, tagged to the recipient.
-- **Identity binding** uses a replaceable event (kind 30078) that maps a `@nametag` ↔ transport key ↔ wallet addresses, with first‑seen‑wins anti‑hijacking and an encrypted nametag that can be recovered after import.
+- **Identity binding** uses a replaceable event (kind 30078) that maps a Unicity ID ↔ transport key ↔ wallet addresses, with first‑seen‑wins anti‑hijacking and an encrypted Unicity ID that can be recovered after import. (In the API/transport this is the `nametag`.)
 - **Group chat** uses NIP‑29 on a dedicated relay with its own connection, separate from the wallet transport.
 
 The transport persists a per‑wallet "last seen" timestamp so reconnects resume rather than replay history, and verifies publishes by querying the relay back for the event.

@@ -206,7 +206,7 @@ Returns `PeerInfo`:
 
 ```typescript
 interface PeerInfo {
-  nametag?: string;        // @name if registered
+  nametag?: string;        // Unicity ID (e.g. @alice) if registered
   transportPubkey: string; // 32-byte transport key
   chainPubkey: string;     // 33-byte compressed secp256k1
   l1Address: string;       // alpha1... L1 address
@@ -1235,7 +1235,7 @@ interface Identity {
   directAddress?: string;
   /** IPNS identifier for storage */
   ipnsName?: string;
-  /** Registered @name alias */
+  /** Registered Unicity ID (e.g. @alice) */
   nametag?: string;
 }
 

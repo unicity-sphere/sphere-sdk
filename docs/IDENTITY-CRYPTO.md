@@ -12,7 +12,7 @@ The token engine's `SigningService.createFromSecret(secret)` **SHA‑256‑hashe
 
 | Use the key… | How | Public key | Used for |
 |---|---|---|---|
-| **Raw** | `getPublicKey(privKey)` / `new SigningService(privKey)` | `chainPubkey` | messaging/transport identity, nametag binding, `signMessage`, ALPHA address |
+| **Raw** | `getPublicKey(privKey)` / `new SigningService(privKey)` | `chainPubkey` | messaging/transport identity, Unicity-ID binding, `signMessage`, ALPHA address |
 | **Hashed** | `SigningService.createFromSecret(privKey)` | different point | the `DIRECT://` token address, token ownership, token signatures |
 
 ```typescript
@@ -73,7 +73,7 @@ verifySignedMessage('login: 2026-05-22', sig, expectedChainPubkey);   // boolean
 
 // Identify the signer without knowing them up front, then resolve who they are:
 const pubkey = recoverPubkeyFromSignature('login: 2026-05-22', sig);   // 66-hex compressed
-const peer   = await sphere.resolve(pubkey);                            // → @nametag, addresses
+const peer   = await sphere.resolve(pubkey);                            // → @alice (Unicity ID), addresses
 ```
 
 - The hash is `SHA-256(SHA-256(varint(prefix) + "Sphere Signed Message:\n" + varint(msg) + msg))`.

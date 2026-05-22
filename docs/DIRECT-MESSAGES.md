@@ -3,7 +3,7 @@
 End‑to‑end encrypted one‑to‑one messages (NIP‑17 gift wrap), reached through `sphere.communications`.
 
 ```typescript
-// Send a DM (by @nametag or public key)
+// Send a DM (by @alice or public key)
 await sphere.communications.sendDM('@alice', 'Hello!');
 
 // Listen for incoming DMs

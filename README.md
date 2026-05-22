@@ -8,7 +8,7 @@
 
 ---
 
-The Sphere SDK gives your app a self‑custody wallet: each user holds their own keys, pays others by `@name`, and every transfer is settled on Unicity's network and backed by cryptographic proof. You get the wallet, transfers, encrypted messaging, and invoicing out of the box — without building or operating a payment backend, and without ever holding users' funds. It runs in the browser and in Node.js.
+The Sphere SDK gives your app a self‑custody wallet: each user holds their own keys, pays others by name (like `@alice`), and every transfer is a self‑contained cryptographic object the recipient verifies on its own — no shared ledger in the middle. You get the wallet, transfers, encrypted messaging, and invoicing out of the box — without building or operating a payment backend, and without ever holding users' funds. It runs in the browser and in Node.js.
 
 ## Why Sphere SDK
 
@@ -17,13 +17,13 @@ Most apps that move money put a custodial server in the middle: it holds everyon
 The Sphere SDK splits those jobs apart:
 
 - **Custody moves to the user.** Their wallet holds its own keys; your app never touches their funds.
-- **Settlement moves to Unicity's network** — a shared ledger run across many validator nodes — which records every transfer and lets the recipient verify it cryptographically.
+- **Settlement is cryptographic, not custodial.** Each transfer is a self‑contained cryptographic object the recipient verifies on its own. There is **no shared ledger** of balances or transfer history — Unicity's network only registers an opaque commitment (a hash) so a token can't be spent twice.
 
-There is still infrastructure doing the clearing (a settlement network, messaging relays, and the base chain), but **you don't run it**, and no single company sits on top of users' balances. Your app just creates a wallet and asks it to do things.
+There is still shared infrastructure (the network that registers those commitments, messaging relays, and the base chain), but **you don't run it**, and no company sits on top of users' balances. Your app just creates a wallet and asks it to do things.
 
 ## What you can build
 
-**Send and receive tokens.** Move value between users by `@name` — no account numbers, and no backend of your own to operate.
+**Send and receive tokens.** Move value between users by name — `@alice` pays `@bob` — no account numbers, and no backend of your own to operate.
 
 **Invoices and payment requests.** Ask another user to pay, and track whether they did, automatically.
 
@@ -54,7 +54,7 @@ import { createBrowserProviders } from '@unicitylabs/sphere-sdk/impl/browser';
 const { sphere, created, generatedMnemonic } = await Sphere.init({
   ...createBrowserProviders({ network: 'testnet' }),
   autoGenerate: true,   // make a new wallet if one doesn't exist yet
-  nametag: 'alice',     // claim @alice (receiving via @name also needs an on-chain mint — see docs/NAMETAGS.md)
+  nametag: 'alice',     // claim the Unicity ID @alice (receiving via @alice also needs an on-chain mint — see docs/UNICITY-ID.md)
 });
 
 // 2. First run? Show the user their recovery phrase to back up.
@@ -73,9 +73,9 @@ await sphere.payments.send({
 });
 ```
 
-That is a real transfer between two users — settled on Unicity's network, with no backend of your own required.
+That is a real transfer between two users — verified cryptographically, with no backend of your own required.
 
-> **Getting test tokens.** On testnet you must claim a `@nametag` first, then request from the faucet. See the [Node.js](docs/QUICKSTART-NODEJS.md) and [Browser](docs/QUICKSTART-BROWSER.md) quick‑start guides.
+> **Getting test tokens.** On testnet you must claim a Unicity ID first, then request from the faucet. See the [Node.js](docs/QUICKSTART-NODEJS.md) and [Browser](docs/QUICKSTART-BROWSER.md) quick‑start guides.
 
 ## Core concepts
 
@@ -83,7 +83,7 @@ You only need four ideas to use the Sphere SDK.
 
 - **Token** — a unit of digital value (like `UCT`). A user's wallet can hold many tokens of different kinds.
 - **Wallet** — created from a 12‑word *recovery phrase*. The phrase is the only thing a user needs to back up; lose it and the wallet is gone.
-- **`@nametag`** — a human‑friendly handle (like `@alice`) that people use to pay or message you. Each wallet can claim one.
+- **Unicity ID** — a human‑friendly handle (like `@alice`) that people use to pay or message you. Each wallet can claim one. (In the SDK's API this is the `nametag`.)
 - **Network** — `testnet` for building and experimenting, `mainnet` for real value. Pick one when you create the wallet; everything else is configured for you.
 
 That's enough to send and receive. Everything below is built on top of these.
@@ -139,7 +139,7 @@ The root README stays short on purpose. Deeper guides live alongside it:
 |---|---|
 | Get running in the browser | [docs/QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) |
 | Get running in Node.js | [docs/QUICKSTART-NODEJS.md](docs/QUICKSTART-NODEJS.md) |
-| Use `@nametags` (register, recover, troubleshoot) | [docs/NAMETAGS.md](docs/NAMETAGS.md) |
+| Use Unicity IDs (register, recover, troubleshoot) | [docs/UNICITY-ID.md](docs/UNICITY-ID.md) |
 | Request payments from others | [docs/PAYMENT-REQUESTS.md](docs/PAYMENT-REQUESTS.md) |
 | Send encrypted direct messages | [docs/DIRECT-MESSAGES.md](docs/DIRECT-MESSAGES.md) |
 | Run group chat | [docs/GROUP-CHAT.md](docs/GROUP-CHAT.md) |
@@ -160,8 +160,8 @@ There is also a command‑line tool in a separate package, [`@unicity-sphere/cli
 
 - **Recovery phrase (mnemonic)** — 12 words that *are* the wallet. Back them up; never share them.
 - **Token** — a unit of digital value held in a wallet (e.g. `UCT`).
-- **`@nametag`** — a human‑readable handle for a wallet. Lowercase letters/digits with `-` or `_`, 3–20 characters.
-- **Wallet address** — the machine‑readable address behind a `@nametag`. People rarely type it; they use the `@name`.
+- **Unicity ID** — a human‑readable handle for a wallet (e.g. `@alice`). Lowercase letters/digits with `-` or `_`, 3–20 characters. Called `nametag` in the SDK's API.
+- **Wallet address** — the machine‑readable address behind a Unicity ID. People rarely type it; they use the handle (e.g. `@alice`).
 - **ALPHA coin** — the coin of Unicity's base blockchain. Sent through `sphere.payments.l1`.
 - **Smallest unit** — token amounts are integers in the token's smallest denomination, passed as strings (so `"1000000"`, not `1.0`).
 - **Provider** — a pluggable backend (storage, messaging, etc.). `createBrowserProviders()` / `createNodeProviders()` set these up for you.
