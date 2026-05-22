@@ -1,6 +1,6 @@
 # Sphere SDK — Architecture
 
-This document explains how Sphere works underneath the friendly API. The [README](README.new.md) deliberately avoids this depth; if you are integrating, extending, or debugging the SDK, start here.
+This document explains how Sphere works underneath the friendly API. The [README](README.md) deliberately avoids this depth; if you are integrating, extending, or debugging the SDK, start here.
 
 The whole system rests on one idea, repeated at every layer: **a single key per user, and cryptographic proofs carried peer‑to‑peer instead of stored on a chain.**
 

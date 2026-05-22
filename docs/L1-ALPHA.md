@@ -35,6 +35,7 @@ const result = await sphere.payments.l1!.send({
   to: 'alpha1qxyz...',
   amount: '100000',   // in satoshis
   feeRate: 5,         // optional, sat/byte
+  useVested: true,    // optional — spend vested coins (default behavior depends on config)
 });
 
 if (result.success) {

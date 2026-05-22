@@ -97,9 +97,10 @@ await sphere.payments.send({ recipient: '@bob', coinId: 'UCT', amount: '1000000'
 
 **Check balances and holdings**
 ```typescript
-const assets = await sphere.payments.getAssets();   // grouped by token, with prices if enabled
-const tokens = sphere.payments.getTokens();          // individual tokens
-const usd    = await sphere.payments.getBalance();   // total in USD, or null if prices are off
+const assets  = await sphere.payments.getAssets();      // grouped by token, with prices if enabled
+const tokens  = sphere.payments.getTokens();            // individual tokens
+const balance = sphere.payments.getBalance();           // Asset[] breakdown (synchronous)
+const usd     = await sphere.payments.getFiatBalance(); // total in USD, or null if prices are off
 ```
 
 **Receive tokens**

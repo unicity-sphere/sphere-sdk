@@ -108,6 +108,8 @@ await sphere.registerNametag('alice');      // address 0 → @alice
 await sphere.switchToAddress(1);
 await sphere.registerNametag('bob');         // address 1 → @bob
 
-sphere.getNametagForAddress(0); // 'alice'
-sphere.getNametagForAddress(1); // 'bob'
+// getNametagForAddress takes an addressId (string), not an index:
+const addresses = sphere.getActiveAddresses();             // TrackedAddress[] with addressId + nametag
+sphere.getNametagForAddress(addresses[0].addressId); // 'alice'
+sphere.getNametagForAddress(addresses[1].addressId); // 'bob'
 ```

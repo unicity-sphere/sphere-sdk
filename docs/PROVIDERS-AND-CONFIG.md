@@ -100,8 +100,8 @@ const providers = createBrowserProviders({
   // price: { platform: 'coingecko', apiKey: 'CG-xxx' }, // pro
 });
 
-const usd    = await sphere.payments.getBalance(); // total in USD, or null without prices
-const assets = await sphere.payments.getAssets();  // includes priceUsd / fiatValueUsd / change24h
+const usd    = await sphere.payments.getFiatBalance(); // total in USD, or null without prices
+const assets = await sphere.payments.getAssets();      // includes priceUsd / fiatValueUsd / change24h
 ```
 
 You can also set it after init:
@@ -111,7 +111,7 @@ import { createPriceProvider } from '@unicitylabs/sphere-sdk';
 sphere.setPriceProvider(createPriceProvider({ platform: 'coingecko', apiKey: 'CG-xxx' }));
 ```
 
-Without a price provider, `getBalance()` returns `null` and price fields are `null`; everything else works.
+Without a price provider, `getFiatBalance()` returns `null` and the price fields on `getAssets()` are `null`; everything else works. (`getBalance()` always returns the `Asset[]` breakdown — it's price‑independent.)
 
 ## The extend / override pattern
 

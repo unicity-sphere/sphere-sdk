@@ -365,7 +365,7 @@ const isValid = verifySignedMessage(originalMessage, signature, expectedPubkey);
 | `transfer:confirmed` | transfer confirmed on chain |
 | `transfer:failed` | transfer failed |
 | `balance:updated` | balance changed |
-| `identity:updated` | identity info changed |
+| `identity:changed` | identity info changed |
 | `session:expired` | session TTL reached |
 
 ### Wallet Lock Handling
@@ -388,14 +388,14 @@ client.on('wallet:locked', async () => {
 
 #### Extension / iframe mode (P1, P2)
 
-The wallet's background service worker or parent frame stays alive. Instead of disconnecting, set a `isWalletLocked` flag and wait for the user to unlock. When the wallet is unlocked, the host calls `updateSphere(newSphere)` and fires an `identity:updated` event, which signals the dApp to resume:
+The wallet's background service worker or parent frame stays alive. Instead of disconnecting, set a `isWalletLocked` flag and wait for the user to unlock. When the wallet is unlocked, the host calls `updateSphere(newSphere)` and fires an `identity:changed` event, which signals the dApp to resume:
 
 ```typescript
 client.on('wallet:locked', () => {
   setIsWalletLocked(true);
 });
 
-client.on('identity:updated', (identity) => {
+client.on('identity:changed', (identity) => {
   setIsWalletLocked(false);
   // Refresh UI with new identity if it changed
 });

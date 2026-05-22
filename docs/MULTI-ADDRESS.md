@@ -16,12 +16,12 @@ await sphere.registerNametag('bob');
 // Switch back
 await sphere.switchToAddress(0);
 
-// Look up a nametag for a specific address
-const bobNametag = sphere.getNametagForAddress(1); // 'bob'
+// Look up a nametag for a specific address — by its addressId (a string), not its index
+const addresses = sphere.getActiveAddresses();            // TrackedAddress[] (index, addressId, nametag, …)
+const bobNametag = sphere.getNametagForAddress(addresses[1].addressId); // 'bob'
 
-// All nametags across addresses
-const allNametags = sphere.getAllAddressNametags();
-// Map { 0 => 'alice', 1 => 'bob' }
+// (sphere.getAllAddressNametags() also exists but is @deprecated and returns a
+//  nested Map<addressId, Map<index, nametag>>; prefer getActiveAddresses().)
 
 // Derive an address without switching to it (e.g. just to display or receive)
 const addr2 = sphere.deriveAddress(2);
