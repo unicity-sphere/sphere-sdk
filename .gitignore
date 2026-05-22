@@ -40,5 +40,8 @@ tests/integration/.test-*/
 # E2e preflight infra-probe result (regenerated each run)
 tests/e2e/.preflight-result.json
 
+# Local clone of aggregator-go used by e2e local-infra (not tracked here)
+tests/e2e/local-infra/.aggregator-go/
+
 # Community / Discord report drafts (agent-authored, not source)
 community-reports/
