@@ -810,17 +810,34 @@ describe('acquireBundle — negative LRU skips transient errors (Round 3)', () =
   afterEach(() => __clearInflightForTests());
 
   it('TRANSIENT failure is NOT cached: immediate retry runs the pipeline afresh', async () => {
-    // Setup: a uxf-cid payload whose gateways fail intermittently. First
-    // attempt: every gateway fetch fails (network blip) → fetcher throws
-    // BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT. Second attempt: gateways
-    // recover. The Round 3 fix means the second arrival is NOT
-    // short-circuited by the negative LRU — it runs the full pipeline
-    // and succeeds.
+    // Setup: a uxf-cid payload whose gateway fetches fail intermittently
+    // First attempt: every block/get fails (network blip) →
+    // `fetchCarFromIpfs` throws BUNDLE_NOT_FOUND →
+    // `acquireBundle` re-wraps as BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT.
+    // Second attempt: gateways recover. The Round 3 fix means the
+    // second arrival is NOT short-circuited by the negative LRU — it
+    // runs the full pipeline and succeeds.
+    //
+    // Issue #223 — the receiver path now uses `fetchCarFromIpfs`
+    // (`profile/ipfs-client.ts`), which calls `globalThis.fetch`
+    // directly via `fetchFromIpfs` (no `cidOptions.fetch` override).
+    // We mock `globalThis.fetch` here. First N calls return 503 to
+    // simulate the network blip; subsequent calls serve real per-block
+    // bytes via `/api/v0/block/get?arg=<cid>` (the production endpoint
+    // pattern). Pre-parse the CAR into individual blocks so the
+    // mocked gateway can serve them.
 
     const realPkg = UxfPackage.create();
     realPkg.ingestAll([TOKEN_A]);
     const realCarBytes = await realPkg.toCar();
     const realCid = await extractCarRootCid(realCarBytes);
+
+    const { CarReader } = await import('@ipld/car');
+    const blocks = new Map<string, Uint8Array>();
+    const reader = await CarReader.fromBytes(realCarBytes);
+    for await (const block of reader.blocks()) {
+      blocks.set(block.cid.toString(), block.bytes);
+    }
 
     const payload: UxfTransferPayloadCid = {
       kind: 'uxf-cid',
@@ -831,43 +848,57 @@ describe('acquireBundle — negative LRU skips transient errors (Round 3)', () =
     };
 
     let attempts = 0;
-    const fetchImpl: typeof fetch = vi.fn(async () => {
-      attempts++;
-      // First two calls (one per gateway, both attempts in attempt #1)
-      // simulate a network blip — every gateway returns 503. After
-      // that, gateways recover and serve the real CAR bytes.
-      if (attempts <= 2) {
-        return new Response('upstream blip', { status: 503 });
-      }
-      return new Response(realCarBytes, { status: 200 });
-    });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(
+      async (input: string | URL | Request) => {
+        attempts++;
+        // Network blip on the first 2 attempts — the block-walk's
+        // gateway fallback exhausts both gateways and throws on the
+        // first acquireBundle call.
+        if (attempts <= 2) {
+          return new Response('upstream blip', { status: 503 });
+        }
+        // Recovered: serve per-block via /api/v0/block/get?arg=<cid>.
+        const url = typeof input === 'string' ? input : input.toString();
+        const m = /\/api\/v0\/block\/get\?arg=([^&]+)/.exec(url);
+        if (!m) return new Response('', { status: 404 });
+        const cid = decodeURIComponent(m[1]!);
+        const bytes = blocks.get(cid);
+        if (!bytes) return new Response('', { status: 404 });
+        return new Response(bytes, {
+          status: 200,
+          headers: { 'content-type': 'application/octet-stream' },
+        });
+      },
+    );
 
-    const lru = new ReplayLRU();
-
-    // First arrival — every gateway fails → TRANSIENT.
-    let firstErr: unknown;
     try {
-      await acquireBundle(payload, SENDER, lru, {
-        gateways: ['https://m1.example', 'https://m2.example'],
-        fetch: fetchImpl,
-      });
-    } catch (err) {
-      firstErr = err;
-    }
-    if (!isSphereError(firstErr)) throw new Error('expected SphereError');
-    expect(firstErr.code).toBe('BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT');
+      const lru = new ReplayLRU();
 
-    // Second arrival — gateways have recovered. Round 3 fix: the
-    // negative LRU MUST NOT short-circuit because the prior failure
-    // was TRANSIENT. The pipeline re-runs, the fetcher succeeds, and
-    // verification completes.
-    const result = await acquireBundle(payload, SENDER, lru, {
-      gateways: ['https://m1.example', 'https://m2.example'],
-      fetch: fetchImpl,
-    });
-    if (isReplayOutcome(result)) throw new Error('unreachable');
-    expect(result.verified).toBe(true);
-    expect(result.bundleCid).toBe(realCid);
+      // First arrival — every gateway fails → TRANSIENT.
+      let firstErr: unknown;
+      try {
+        await acquireBundle(payload, SENDER, lru, {
+          gateways: ['https://m1.example', 'https://m2.example'],
+        });
+      } catch (err) {
+        firstErr = err;
+      }
+      if (!isSphereError(firstErr)) throw new Error('expected SphereError');
+      expect(firstErr.code).toBe('BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT');
+
+      // Second arrival — gateways have recovered. Round 3 fix: the
+      // negative LRU MUST NOT short-circuit because the prior failure
+      // was TRANSIENT. The pipeline re-runs, the fetcher succeeds, and
+      // verification completes.
+      const result = await acquireBundle(payload, SENDER, lru, {
+        gateways: ['https://m1.example', 'https://m2.example'],
+      });
+      if (isReplayOutcome(result)) throw new Error('unreachable');
+      expect(result.verified).toBe(true);
+      expect(result.bundleCid).toBe(realCid);
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 
   it('PERMANENT failure IS cached: immediate retry short-circuits via negative LRU', async () => {

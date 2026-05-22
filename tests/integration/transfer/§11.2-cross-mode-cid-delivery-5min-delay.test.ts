@@ -55,6 +55,39 @@ import { TOKEN_A } from '../../fixtures/uxf-mock-tokens';
 import { ALICE_CHAIN_PUBKEY } from './_harness';
 
 // =============================================================================
+// Module mock — Issue #223
+//
+// The receiver now routes uxf-cid through `fetchCarFromIpfs` (per-block
+// walk via /api/v0/block/get) instead of the old gateway `?format=car`
+// endpoint. Under fake timers, `fetchCarFromIpfs`'s internal
+// `AbortSignal.timeout` races our `setTimeout`-modelled 5-minute delay
+// and aborts the fetch before the mock can return.
+//
+// To keep this test focused on the §3.3.2 timing invariant (recipient's
+// queue createdAt MUST be derived from fetch-completion, not Nostr
+// arrival), we mock `fetchCarFromIpfs` at the module level. The mock
+// awaits a single `setTimeout(FIVE_MINUTES_MS)` (test-controlled via
+// `vi.advanceTimersByTimeAsync`) and then returns the prebuilt
+// `carBytes`. This preserves the test's invariant — `acquireBundle`'s
+// promise resolves at T_arrive + 5min — without entangling the test
+// with the block-walk's network mechanics.
+// =============================================================================
+let mockFetchCarFromIpfs: (
+  gateways: readonly string[],
+  rootCid: string,
+) => Promise<Uint8Array> = async () => {
+  throw new Error('mockFetchCarFromIpfs not initialized');
+};
+vi.mock('../../../profile/ipfs-client', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../../../profile/ipfs-client')>();
+  return {
+    ...original,
+    fetchCarFromIpfs: (...args: Parameters<typeof original.fetchCarFromIpfs>) =>
+      mockFetchCarFromIpfs(args[0], args[1]),
+  };
+});
+
+// =============================================================================
 // 1. Constants
 // =============================================================================
 
@@ -72,6 +105,7 @@ describe('§11.2 / W29 — instant-mode CID delivery with 5-minute fetch delay',
   });
   afterEach(() => {
     vi.useRealTimers();
+    vi.restoreAllMocks();
   });
 
   it('queue createdAt derived from IPFS fetch completion (T_arrive + 5min), NOT from Nostr arrival', async () => {
@@ -100,38 +134,26 @@ describe('§11.2 / W29 — instant-mode CID delivery with 5-minute fetch delay',
 
     // -------------------------------------------------------------------
     // 2. Recipient side: capture T_arrive, then start the fetch.
-    //    The gateway fetch is stubbed via `cidOptions.fetch` so we can
-    //    delay its resolution exactly 5 minutes via fake timers.
+    //    `fetchCarFromIpfs` is module-mocked above so we control the
+    //    resolution timing via fake timers without entangling block-
+    //    walk mechanics.
     // -------------------------------------------------------------------
     const T_arrive = Date.now();
     expect(T_arrive).toBe(T_ARRIVE_FIXED);
 
-    // Build a Response-shape mock the cid-fetcher expects. We resolve
-    // it after the fake clock advances 5 minutes — by awaiting an
-    // internal `setTimeout` for FIVE_MINUTES_MS, which the test
-    // controls via `vi.advanceTimersByTimeAsync`.
     let fetchResolveAt: number | null = null;
-    const stubFetch: typeof fetch = vi
-      .fn<typeof fetch>()
-      .mockImplementation(async () => {
-        // Simulate the gateway's 5-minute network-side delay. Under
-        // fake timers, this awaits until the test advances the clock.
-        await new Promise<void>((resolve) => {
-          setTimeout(resolve, FIVE_MINUTES_MS);
-        });
-        fetchResolveAt = Date.now();
-        const headers = new Headers({
-          'content-type': 'application/vnd.ipld.car',
-          'content-length': String(carBytes.byteLength),
-        });
-        return new Response(carBytes, { status: 200, headers });
+    mockFetchCarFromIpfs = async () => {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, FIVE_MINUTES_MS);
       });
+      fetchResolveAt = Date.now();
+      return carBytes;
+    };
 
-    // Kick off the acquire — it will eventually call our stubFetch.
+    // Kick off the acquire — it will eventually call our mock.
     const lru = new ReplayLRU();
     const acquirePromise = acquireBundle(cidPayload, ALICE_CHAIN_PUBKEY, lru, {
       gateways: ['http://gateway-stub.example/'],
-      fetch: stubFetch,
     });
 
     // Advance the deterministic clock by exactly 5 minutes — this
@@ -222,21 +244,14 @@ describe('§11.2 / W29 — instant-mode CID delivery with 5-minute fetch delay',
 
     const T_arrive = Date.now();
     let fetchResolveAt = -1;
-    const stubFetch: typeof fetch = vi
-      .fn<typeof fetch>()
-      .mockImplementation(async () => {
-        fetchResolveAt = Date.now();
-        const headers = new Headers({
-          'content-type': 'application/vnd.ipld.car',
-          'content-length': String(carBytes.byteLength),
-        });
-        return new Response(carBytes, { status: 200, headers });
-      });
+    mockFetchCarFromIpfs = async () => {
+      fetchResolveAt = Date.now();
+      return carBytes;
+    };
 
     const lru = new ReplayLRU();
     const verified = await acquireBundle(cidPayload, ALICE_CHAIN_PUBKEY, lru, {
       gateways: ['http://gateway-stub.example/'],
-      fetch: stubFetch,
     });
     if (isReplayOutcome(verified)) {
       throw new Error('unreachable');

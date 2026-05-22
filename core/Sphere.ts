@@ -228,6 +228,16 @@ export interface SphereCreateOptions {
    * expose it on their returned object — propagate it here.
    */
   publishToIpfs?: PublishToIpfsCallback;
+  /**
+   * Issue #223 — recipient-side gateway list used to stream-fetch
+   * CARs for incoming `kind: 'uxf-cid'` bundles. Same gateways the
+   * `publishToIpfs` callback targets. Without this list the
+   * auto-installed {@link IngestWorkerPool} silently drops every
+   * `uxf-cid` arrival — see PaymentsModule.cidFetchGateways doc.
+   * The provider factories populate this from `tokenSync.ipfs` —
+   * propagate it here.
+   */
+  cidFetchGateways?: ReadonlyArray<string>;
 }
 
 /** Options for loading existing wallet */
@@ -278,6 +288,16 @@ export interface SphereLoadOptions {
    * (Issue #200 Phase 1 wiring). See {@link SphereCreateOptions.publishToIpfs}.
    */
   publishToIpfs?: PublishToIpfsCallback;
+  /**
+   * Issue #223 — recipient-side gateway list used to stream-fetch
+   * CARs for incoming `kind: 'uxf-cid'` bundles. Same gateways the
+   * `publishToIpfs` callback targets. Without this list the
+   * auto-installed {@link IngestWorkerPool} silently drops every
+   * `uxf-cid` arrival — see PaymentsModule.cidFetchGateways doc.
+   * The provider factories populate this from `tokenSync.ipfs` —
+   * propagate it here.
+   */
+  cidFetchGateways?: ReadonlyArray<string>;
 }
 
 /** Options for importing a wallet */
@@ -336,6 +356,16 @@ export interface SphereImportOptions {
    * (Issue #200 Phase 1 wiring). See {@link SphereCreateOptions.publishToIpfs}.
    */
   publishToIpfs?: PublishToIpfsCallback;
+  /**
+   * Issue #223 — recipient-side gateway list used to stream-fetch
+   * CARs for incoming `kind: 'uxf-cid'` bundles. Same gateways the
+   * `publishToIpfs` callback targets. Without this list the
+   * auto-installed {@link IngestWorkerPool} silently drops every
+   * `uxf-cid` arrival — see PaymentsModule.cidFetchGateways doc.
+   * The provider factories populate this from `tokenSync.ipfs` —
+   * propagate it here.
+   */
+  cidFetchGateways?: ReadonlyArray<string>;
 }
 
 /** L1 (ALPHA blockchain) configuration */
@@ -416,6 +446,16 @@ export interface SphereInitOptions {
    * (Issue #200 Phase 1 wiring). See {@link SphereCreateOptions.publishToIpfs}.
    */
   publishToIpfs?: PublishToIpfsCallback;
+  /**
+   * Issue #223 — recipient-side gateway list used to stream-fetch
+   * CARs for incoming `kind: 'uxf-cid'` bundles. Same gateways the
+   * `publishToIpfs` callback targets. Without this list the
+   * auto-installed {@link IngestWorkerPool} silently drops every
+   * `uxf-cid` arrival — see PaymentsModule.cidFetchGateways doc.
+   * The provider factories populate this from `tokenSync.ipfs` —
+   * propagate it here.
+   */
+  cidFetchGateways?: ReadonlyArray<string>;
 }
 
 /** Result of init operation */
@@ -597,6 +637,16 @@ export class Sphere {
    */
   private _publishToIpfs: PublishToIpfsCallback | null = null;
 
+  /**
+   * Issue #223 — gateway list forwarded to every per-address
+   * PaymentsModule's auto-installed IngestWorkerPool so incoming
+   * `kind: 'uxf-cid'` bundles can be stream-fetched. Same value as
+   * the gateways the `publishToIpfs` callback targets — the provider
+   * factories populate both from `tokenSync.ipfs.gateways`. Null /
+   * empty preserves legacy drop-silent behaviour for `uxf-cid` events.
+   */
+  private _cidFetchGateways: ReadonlyArray<string> | null = null;
+
   // Modules (single-instance — backward compat, delegates to active address)
   private _payments: PaymentsModule;
   private _communications: CommunicationsModule;
@@ -762,6 +812,7 @@ export class Sphere {
         discoverAddresses: options.discoverAddresses,
         onProgress: options.onProgress,
         publishToIpfs: options.publishToIpfs,
+        cidFetchGateways: options.cidFetchGateways,
       });
       // Store dmSince for forwarding to transport/mux when subscriptions are set up
       if (options.dmSince != null) {
@@ -839,6 +890,7 @@ export class Sphere {
       discoverAddresses: options.discoverAddresses,
       onProgress: options.onProgress,
       publishToIpfs: options.publishToIpfs,
+      cidFetchGateways: options.cidFetchGateways,
     });
 
     if (options.dmSince != null) {
@@ -980,6 +1032,7 @@ export class Sphere {
     // before `initializeModules()` runs (which threads it into the
     // primary PaymentsModule).
     sphere._publishToIpfs = options.publishToIpfs ?? null;
+    sphere._cidFetchGateways = options.cidFetchGateways ?? null;
 
     // Store mnemonic (encrypted if password provided, plaintext otherwise)
     progress?.({ step: 'storing_keys', message: 'Storing wallet keys...' });
@@ -1081,6 +1134,7 @@ export class Sphere {
     // Issue #200 Phase 1 wiring — capture optional UXF CAR publisher
     // before `initializeModules()` threads it into PaymentsModule.
     sphere._publishToIpfs = options.publishToIpfs ?? null;
+    sphere._cidFetchGateways = options.cidFetchGateways ?? null;
 
     // exists() restores original (disconnected) state — reconnect for reads
     if (!options.storage.isConnected()) {
@@ -1199,6 +1253,7 @@ export class Sphere {
     // Issue #200 Phase 1 wiring — capture optional UXF CAR publisher
     // before `initializeModules()` threads it into PaymentsModule.
     sphere._publishToIpfs = options.publishToIpfs ?? null;
+    sphere._cidFetchGateways = options.cidFetchGateways ?? null;
 
     progress?.({ step: 'storing_keys', message: 'Storing wallet keys...' });
 
@@ -2497,6 +2552,7 @@ export class Sphere {
           // Issue #200 Phase 1 wiring — keep CID-by-reference publisher
           // wired across nametag-driven re-initialization.
           publishToIpfs: this._publishToIpfs ?? undefined,
+          cidFetchGateways: this._cidFetchGateways ?? undefined,
         });
       }
     }
@@ -2699,6 +2755,7 @@ export class Sphere {
       // to every per-address PaymentsModule (one closure shared across
       // all addresses; the publisher is identity-independent).
       publishToIpfs: this._publishToIpfs ?? undefined,
+      cidFetchGateways: this._cidFetchGateways ?? undefined,
     });
 
     communications.initialize({
@@ -5074,6 +5131,7 @@ export class Sphere {
       // IPFS gateway list). Absent → CID delivery falls back to inline
       // (under cap) or rejects (over cap / force-cid).
       publishToIpfs: this._publishToIpfs ?? undefined,
+      cidFetchGateways: this._cidFetchGateways ?? undefined,
     });
 
     this._communications.initialize({
