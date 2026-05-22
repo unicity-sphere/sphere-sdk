@@ -212,6 +212,48 @@ describe('PaymentsModule — cidFetchGateways → IngestWorkerPool cidOptions wi
     module.destroy();
   });
 
+  it('populates cidOptions.emit so the bundle-acquirer can fire transfer:fetch-failed (steelman fix)', () => {
+    // The bundle-acquirer's uxf-cid branch calls
+    // `cidOptions.emit?.('transfer:fetch-failed', ...)` at the W13
+    // telemetry boundary. The initial #223 fix constructed
+    // `cidOptions = { gateways: [...] }` WITHOUT `emit`, so the
+    // production event was silently never fired even though the
+    // bundle-acquirer code claimed to fire it. This test pins the
+    // contract: when gateways are wired, `emit` MUST also be wired,
+    // and the wired emit MUST forward to `deps.emitEvent` so
+    // consumers who subscribe via `sphere.on(...)` see the event.
+    const module = createPaymentsModule();
+    const emitEvent = vi.fn();
+    module.initialize({
+      identity: makeIdentity(),
+      storage: makeStorage(),
+      transport: makeTransport(),
+      oracle: makeOracle(),
+      emitEvent,
+      cidFetchGateways: ['https://gw.example.test'],
+    });
+
+    const cidOptions = readPoolCidOptions(module);
+    expect(cidOptions).toBeDefined();
+    expect(typeof cidOptions?.emit).toBe('function');
+
+    // Drive the emit and assert the deps.emitEvent forward.
+    cidOptions!.emit!('transfer:fetch-failed', {
+      bundleCid: 'bafytest',
+      senderTransportPubkey: 'b'.repeat(64),
+      gatewaysAttempted: ['https://gw.example.test'],
+      failureReasons: ['unit-test'],
+    });
+    expect(emitEvent).toHaveBeenCalledWith(
+      'transfer:fetch-failed',
+      expect.objectContaining({
+        bundleCid: 'bafytest',
+      }),
+    );
+
+    module.destroy();
+  });
+
   it('does NOT install a pool when features.recipientUxf is false (no cidOptions either)', () => {
     // Opt-out via feature flag still wins. cidFetchGateways is
     // irrelevant when no pool is installed at all.

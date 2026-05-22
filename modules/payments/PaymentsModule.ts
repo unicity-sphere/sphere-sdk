@@ -106,6 +106,7 @@ import {
   type UxfV1Payload,
   type ProcessTokenFn,
 } from './transfer/ingest-worker-pool';
+import type { AcquireBundleCidOptions } from './transfer/bundle-acquirer';
 import { ReplayLRU } from './transfer/replay-lru';
 import { PerTokenMutex } from '../../profile/per-token-mutex';
 // T.5.D — operator escape hatch (`importInclusionProof` +
@@ -3044,10 +3045,25 @@ export class PaymentsModule {
       // rejection" — no token persisted, no surface error). Empty /
       // undefined preserves the legacy drop-silent behaviour so opt-out
       // consumers stay unchanged.
+      //
+      // **Critical wiring point (steelman fix on the initial #223 fix):**
+      // `cidOptions.emit` MUST be wired so the bundle-acquirer's
+      // uxf-cid branch can fire `transfer:fetch-failed` at W13 boundary
+      // when `fetchCarFromIpfs` exhausts. Without `emit`, the new code
+      // path's `cidOptions.emit?.(...)` is silently a no-op in
+      // production and operator dashboards see no signal when gateway
+      // fetches fail — exactly the kind of silent drop this PR is
+      // supposed to make observable.
       const cidGateways = this.deps!.cidFetchGateways;
       const cidOptions =
         cidGateways && cidGateways.length > 0
-          ? { gateways: [...cidGateways] }
+          ? {
+              gateways: [...cidGateways],
+              emit: ((event, payload) =>
+                this.deps!.emitEvent(event, payload)) as NonNullable<
+                  AcquireBundleCidOptions['emit']
+                >,
+            }
           : undefined;
 
       this.ingestPool = new IngestWorkerPool({

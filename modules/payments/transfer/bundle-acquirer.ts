@@ -82,6 +82,7 @@
  */
 
 import { SphereError } from '../../../core/errors.js';
+import { sanitizeReasonString } from '../../../core/error-sanitize.js';
 import type { UxfTransferPayload } from '../../../types/uxf-transfer.js';
 import {
   isUxfTransferPayloadCar,
@@ -642,32 +643,58 @@ async function doAcquireBundle(
         payload.bundleCid,
       );
     } catch (cause) {
-      if (cause instanceof ProfileError && cause.code === 'BUNDLE_NOT_FOUND') {
-        // Fire the W13 telemetry event so operator dashboards see the
-        // failed gateway-walk. The bundle-acquirer is the boundary
-        // that owns this signal in the new block-walk path (the old
-        // `fetchCarByCid` emitted from inside).
-        cidOptions.emit?.('transfer:fetch-failed', {
+      // Steelman fix on the initial #223 fix — the narrow
+      // `instanceof ProfileError && code === BUNDLE_NOT_FOUND` catch
+      // let plain `Error` / `TypeError` / dynamic-import failures /
+      // `validateGatewayUrls` throws / `walkUxfElement` errors escape
+      // uncaught into `IngestWorkerPool.classifyAcquireError`. That
+      // path logs at warn and silently drops the bundle — exactly the
+      // failure mode this PR is supposed to make observable.
+      //
+      // Now: ANY throw from `fetchCarFromIpfs` is treated as a
+      // bundle-level acquire failure. We emit the W13
+      // `transfer:fetch-failed` event so operator dashboards see the
+      // gateway-walk failure regardless of root cause, then re-wrap
+      // as `BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT` (the canonical
+      // bundle-acquirer transient — W13: NO disposition record, the
+      // worker pool's `classifyAcquireError` short-circuits via this
+      // code).
+      //
+      // Diagnostic strings are passed through `sanitizeReasonString`
+      // (W40-style alignment): strip control chars + HTML markup,
+      // truncate code-point-aware, drop lone surrogates. The old
+      // `fetchCarByCid` sanitized; the new path was missing this. A
+      // hostile gateway returning `Error("<script>...")` would
+      // otherwise propagate to `transfer:fetch-failed.failureReasons`
+      // and downstream operator dashboards verbatim.
+      const causeMessage =
+        cause instanceof Error
+          ? cause.message
+          : typeof cause === 'string'
+            ? cause
+            : '(unknown error)';
+      const safeReason = sanitizeReasonString(causeMessage);
+      cidOptions.emit?.('transfer:fetch-failed', {
+        bundleCid: payload.bundleCid,
+        senderTransportPubkey: senderPubkey,
+        gatewaysAttempted: [...cidOptions.gateways],
+        failureReasons: [`block-walk-failed: ${safeReason}`],
+      });
+      throw new SphereError(
+        `acquireBundle: fetchCarFromIpfs failed for ${payload.bundleCid}: ${safeReason}`,
+        'BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT',
+        {
           bundleCid: payload.bundleCid,
-          senderTransportPubkey: senderPubkey,
           gatewaysAttempted: [...cidOptions.gateways],
-          failureReasons: [`block-walk-failed: ${cause.message.slice(0, 200)}`],
-        });
-        // Re-wrap as the canonical bundle-acquirer transient. W13:
-        // NO disposition record; the worker pool's
-        // `classifyAcquireError` recognizes this code and short-
-        // circuits the disposition write.
-        throw new SphereError(
-          `acquireBundle: fetchCarFromIpfs failed for ${payload.bundleCid}: ${cause.message}`,
-          'BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT',
-          {
-            bundleCid: payload.bundleCid,
-            gatewaysAttempted: [...cidOptions.gateways],
-            reason: 'block-walk-failed',
-          },
-        );
-      }
-      throw cause;
+          reason: 'block-walk-failed',
+          // Preserve original code/name for telemetry consumers that
+          // care about the upstream classification (e.g., distinguishing
+          // ProfileError BUNDLE_NOT_FOUND from a TypeError).
+          upstreamErrorClass: cause instanceof Error ? cause.constructor.name : typeof cause,
+          upstreamErrorCode:
+            cause instanceof ProfileError ? cause.code : undefined,
+        },
+      );
     }
     // Re-extract from the bytes (NOT trusting the fetcher's claim).
     // `extractCarRootCid` throws BUNDLE_REJECTED_INVALID_CAR /
