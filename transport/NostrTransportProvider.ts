@@ -1764,7 +1764,19 @@ export class NostrTransportProvider implements TransportProvider {
     // contract (handlers returning `void` / `undefined`) maps to
     // `true` (durable) so existing wrappers do not regress to
     // "never ack".
-    let allDurable = true;
+    //
+    // Issue #223 — the pre-Mux window (between `transport.connect()` and
+    // `mux.suppressSubscriptions()` in Sphere.ensureTransportMux) leaves
+    // this provider's own subscription live while PaymentsModule has
+    // registered its handler on the *AddressTransportAdapter*, not on
+    // the outer provider. An empty `transferHandlers` set previously
+    // produced a vacuous `allDurable = true`, which advanced
+    // `lastEventTs` to the event's created_at — poisoning the next
+    // process's `since` filter (the relay would still re-deliver because
+    // NIP-01 `since` is inclusive, but only by accident). Treat an
+    // empty handler set as non-durable so the at-least-once invariant
+    // forces the event to re-replay until somebody actually persists it.
+    let allDurable = this.transferHandlers.size > 0;
     for (const handler of this.transferHandlers) {
       try {
         const result = await handler(transfer);
