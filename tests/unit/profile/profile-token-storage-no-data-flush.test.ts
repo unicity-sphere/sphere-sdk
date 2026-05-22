@@ -78,22 +78,22 @@ function getEncryptionKey(): Uint8Array {
 }
 
 /**
- * Issue #200 Phase 2 helper: compute the dag-cbor envelope CID that the
- * flush scheduler will use for the given token list (matches the
- * mocked `pkg.toCar()` output which now wraps tokens in a real CAR).
+ * Issue #213 Option C helper: compute the dag-cbor envelope CID that
+ * the flush scheduler will publish for a given token list. After
+ * issue #213, bundle pinning returned to hierarchical per-block pin
+ * (`pinCarBlocksToIpfs(carBytes, expectedRootCid)`); the published
+ * CID is the CAR envelope root extracted via `extractCarRootCid`,
+ * which is what `projectedFlushCid` mirrors.
  *
- * Replaces the legacy `cidForBytes(JSON.stringify({tokens}))` calls
- * that produced raw-codec CIDs incompatible with the new pin path.
+ * `makeFakeUxfCar` produces a CAR whose root is the dag-cbor envelope
+ * CID over the payload; `extractCarRootCid` reads that root from the
+ * CAR header.
  */
 async function projectedFlushCid(tokens: unknown[]): Promise<string> {
-  // #207 E2E fix — bundle CIDs are now raw-codec single-block pins
-  // (see `pinToIpfs` and `computeRawPinCid` in flush-scheduler). The
-  // legacy dag-cbor envelope CID via `extractCarRootCid` no longer
-  // matches what gets pinned. Mirror the actual pin CID computation
-  // here so test assertions see the same identity.
   const { makeFakeUxfCar } = await import('./_helpers/fake-uxf-car.js');
+  const { extractCarRootCid } = await import('../../../uxf/transfer-payload.js');
   const carBytes = await makeFakeUxfCar({ tokens });
-  return cidForBytes(carBytes);
+  return extractCarRootCid(carBytes);
 }
 
 function cidForBytes(bytes: Uint8Array): string {

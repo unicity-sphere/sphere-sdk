@@ -92,6 +92,44 @@ Required steps:
 
 ## Bump history
 
+### v3 — Align IPLD element form with hash canonical form (issue #213 Option C)
+
+`uxf/ipld.ts:elementToIpldBlock` used to encode `children` references as
+CBOR Tag 42 CID links. The hash canonical form (used by
+`computeElementHash`) encoded the same children as raw 32-byte
+`Uint8Array` (CBOR bstr). The two encodings differed, so
+`sha256(block.bytes) !== block.cid.multihash.digest` for any element
+with children — Kubo's `dag/put` pinned each sub-block under a
+bytes-derived CID that did NOT match the content-hash-derived CID
+published in the manifest, and the receiver's `block/get(subBlockCid)`
+round-trip resolved against unreachable bytes (`BUNDLE_NOT_FOUND`). The
+interim fix (#212) pinned each bundle CAR as a single raw block to
+sidestep the mismatch, at the cost of per-block IPFS dedup (every
+mutation re-replicated the entire bundle — O(N × M) bandwidth for N
+tokens and M mutations).
+
+Issue #213 Option C reconciles the two forms by emitting IPLD bytes in
+the SAME shape used for hashing: `children` values are raw 32-byte
+`Uint8Array` references, matching `prepareChildrenForHashing`. Now
+`sha256(bytes) === cid.multihash.digest` for every element block;
+per-block pin/fetch round-trips agree on the CID and per-block dedup
+is restored. ContentHash semantics are unchanged (the hash form was
+already canonical; only the IPLD bytes moved to match it) — no
+aggregator break, no on-disk migration. The receiver walker in
+`profile/ipfs-client.ts:walkUxfElement` detects UXF element shape and
+traverses the Uint8Array children as if they were CID links. Legacy
+Tag 42 CID-link children remain readable via `decodeIpldChildren`'s
+dual-form decode.
+
+Bytes shifted: every UXF element block lost ~4 bytes per child link
+(the CBOR Tag 42 prefix + the CID multibase byte). TOKEN_A's bundle
+shrank from 2499 to 2443 bytes (≈56-byte drop across the element
+pool).
+
+`_marker` bumped to `T.2.D.REFERENCE.SNAPSHOT.v3`. ADR documented in
+issue #213 (Option C analysis in #211) and inline in
+`uxf/ipld.ts:elementToIpldBlock`.
+
 ### v2 — SMT path encoding: bigint → 32-byte bstr (fix for 256-bit overflow)
 
 `uxf/hash.ts:prepareSmtSegments` was encoding SMT path values as native

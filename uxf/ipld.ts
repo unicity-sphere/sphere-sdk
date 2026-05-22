@@ -7,7 +7,17 @@
  * Key concepts:
  * - Each UxfElement maps to one IPLD block (dag-cbor encoded, CIDv1)
  * - The CID multihash digest is identical to the UXF content hash (both SHA-256)
- * - Child references use CBOR Tag 42 (CID links) in IPLD form, NOT raw hash bytes
+ * - Child references use raw 32-byte hash bytes (CBOR bstr) in IPLD form —
+ *   the SAME canonical form used for content hashing. This means
+ *   `sha256(elementBytes) === ContentHash digest === CID.multihash.digest`
+ *   for every element block. This self-consistency is the design choice
+ *   that powers issue #213 Option C: per-block IPFS dedup with no
+ *   aggregator break and no on-disk migration. The receiver-side walker
+ *   in `profile/ipfs-client.ts` (`walkUxfElement`) reconstructs CID
+ *   references from Uint8Array children via `contentHashBytesToCid`.
+ * - Legacy bundles encoded children as CBOR Tag 42 CID links;
+ *   `decodeIpldChildren` accepts BOTH forms for backward compatibility
+ *   with in-flight bundles produced before #213.
  * - CAR root is the envelope block CID (which contains a CID link to the manifest)
  *
  * @module uxf/ipld
@@ -134,9 +144,25 @@ export function computeCid(element: UxfElement): CID {
 /**
  * Encode a UXF element as an IPLD block.
  *
- * The block data is dag-cbor encoded with CID links (Tag 42) for child
- * references. This differs from the hash canonical form which uses raw
- * 32-byte hash bytes for children.
+ * Issue #213 (Option C): the IPLD bytes are the SAME canonical form used
+ * for content hashing — children encoded as raw 32-byte hash bytes
+ * (CBOR bstr), not Tag 42 CID links. This makes the block
+ * self-consistent: `sha256(bytes) === cid.multihash.digest`, so Kubo's
+ * `dag/put` re-derives the same CID we publish under and per-block IPFS
+ * dedup works correctly (a future bundle sharing 90% of its sub-elements
+ * shares 90% of its pinned blocks).
+ *
+ * ContentHash semantics are unchanged: the hash canonical form and the
+ * IPLD canonical form are now identical, so `computeElementHash(element)`
+ * remains stable across the #213 transition. No aggregator break, no
+ * on-disk migration.
+ *
+ * Receiver-side: a generic CBOR-Tag-42 walker (`collectCidLinks`) will
+ * NOT discover Uint8Array children. The UXF-aware walker
+ * (`profile/ipfs-client.ts:walkUxfElement`) converts each
+ * Uint8Array child back into a CID via `contentHashBytesToCid` to
+ * traverse the DAG. Generic dag-cbor blocks (envelope, manifest, lean
+ * snapshot blocks) continue to use CID links and the generic walker.
  *
  * @param element - The UXF element.
  * @returns An object with `cid` (CIDv1) and `bytes` (dag-cbor encoded block).
@@ -145,32 +171,14 @@ export function elementToIpldBlock(element: UxfElement): {
   cid: CID;
   bytes: Uint8Array;
 } {
-  // Build the IPLD form: content prepared the same as for hashing,
-  // but children use CID links instead of raw hash bytes.
-  const header = buildCanonicalHeader(element);
-  const typeId = ELEMENT_TYPE_IDS[element.type];
-  const preparedContent = prepareContentForHashing(
-    element.type,
-    element.content as Record<string, unknown>,
-  );
-
-  // Convert children to CID links (dag-cbor encodes CID objects as Tag 42)
-  const childrenWithCids = prepareChildrenAsCidLinks(
-    element.children as Record<string, ContentHash | ContentHash[] | null>,
-  );
-
-  const ipldNode = {
-    header,
-    type: typeId,
-    content: preparedContent,
-    children: childrenWithCids,
-  };
-
-  const bytes = dagCborEncode(ipldNode);
-
-  // The CID must match the content hash (same canonical encoding + SHA-256).
-  // We compute the CID from the hash canonical form, not the IPLD form.
-  const cid = computeCid(element);
+  // Issue #213 Option C: IPLD form === hash canonical form. Encode the
+  // exact same shape `computeElementHash` hashes; the resulting CID
+  // digest equals `sha256(bytes)` by construction.
+  const canonical = buildCanonicalForm(element);
+  const bytes = dagCborEncode(canonical);
+  const hashBytes = sha256Sync(bytes);
+  const digest = createSha256Digest(hashBytes);
+  const cid = CID.createV1(DAG_CBOR_CODE, digest);
 
   return { cid, bytes };
 }
@@ -715,32 +723,10 @@ function buildCanonicalHeader(
 }
 
 /**
- * Convert children to CID links for IPLD encoding.
- * dag-cbor encodes CID objects as CBOR Tag 42.
- */
-function prepareChildrenAsCidLinks(
-  children: Record<string, ContentHash | ContentHash[] | null>,
-): Record<string, CID | CID[] | null> {
-  const result: Record<string, CID | CID[] | null> = {};
-
-  for (const [key, value] of Object.entries(children)) {
-    if (value === null) {
-      result[key] = null;
-    } else if (Array.isArray(value)) {
-      result[key] = (value as ContentHash[]).map((h) =>
-        contentHashToCid(h),
-      );
-    } else {
-      result[key] = contentHashToCid(value as ContentHash);
-    }
-  }
-
-  return result;
-}
-
-/**
  * Decode an IPLD block back to a UxfElement.
- * CID links in children are converted back to ContentHash hex strings.
+ * Issue #213: accepts BOTH raw Uint8Array children (new canonical form)
+ * AND CID-link children (legacy Tag 42 form). Converted to ContentHash
+ * hex strings for pool indexing.
  */
 function decodeIpldElement(node: {
   header: unknown[];
@@ -891,7 +877,17 @@ function decodeIpldContentArray(
 }
 
 /**
- * Decode IPLD children: CID links -> ContentHash hex strings.
+ * Decode IPLD children to ContentHash hex strings.
+ *
+ * Issue #213 (Option C) — accepts two on-the-wire forms:
+ *   - Uint8Array of length 32: new canonical form (matches the hash
+ *     canonical form). Decode as `bytesToHex(value)`.
+ *   - CID with sha2-256 multihash: legacy Tag 42 CID-link form from
+ *     bundles produced before #213. Decode via `cidToContentHash`.
+ *
+ * Mixed-form children are tolerated within the same element (one key
+ * may be Uint8Array, another may still be a CID) — though no producer
+ * emits mixed shapes today; the receiver is liberal in what it accepts.
  */
 function decodeIpldChildren(
   children: Record<string, unknown>,
@@ -901,10 +897,23 @@ function decodeIpldChildren(
   for (const [key, value] of Object.entries(children)) {
     if (value === null) {
       result[key] = null;
+    } else if (value instanceof Uint8Array) {
+      result[key] = decodeChildBytes(value, key);
     } else if (value instanceof CID) {
       result[key] = cidToContentHash(value);
     } else if (Array.isArray(value)) {
-      result[key] = (value as CID[]).map((cid) => cidToContentHash(cid));
+      result[key] = value.map((item, index) => {
+        if (item instanceof Uint8Array) {
+          return decodeChildBytes(item, `${key}[${index}]`);
+        }
+        if (item instanceof CID) {
+          return cidToContentHash(item);
+        }
+        throw new UxfError(
+          'SERIALIZATION_ERROR',
+          `Unexpected child element type at ${key}[${index}]`,
+        );
+      });
     } else {
       throw new UxfError(
         'SERIALIZATION_ERROR',
@@ -914,6 +923,21 @@ function decodeIpldChildren(
   }
 
   return result;
+}
+
+/**
+ * Convert a raw 32-byte child reference (CBOR bstr) into a ContentHash
+ * hex string. Defends against malformed bytes (wrong length) at the
+ * parse boundary — every UXF ContentHash digest is sha2-256 (32 bytes).
+ */
+function decodeChildBytes(bytes: Uint8Array, label: string): ContentHash {
+  if (bytes.byteLength !== 32) {
+    throw new UxfError(
+      'SERIALIZATION_ERROR',
+      `Child reference at "${label}" must be exactly 32 bytes (sha2-256 digest), got ${bytes.byteLength}`,
+    );
+  }
+  return contentHash(bytesToHex(bytes));
 }
 
 /**

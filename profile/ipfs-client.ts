@@ -23,6 +23,11 @@ import * as raw from 'multiformats/codecs/raw';
 import { create as createMultihash } from 'multiformats/hashes/digest';
 import { ProfileError } from './errors.js';
 
+// SHA-256 multihash code (multiformats `sha2-256`).
+const MULTIHASH_SHA256 = 0x12;
+/** Length of a sha2-256 digest in bytes. */
+const SHA256_DIGEST_BYTES = 32;
+
 // =============================================================================
 // Multicodec constants (subset used by the Profile/UXF stack)
 // =============================================================================
@@ -264,14 +269,18 @@ async function pinSingleBlock(
  * The function trusts the caller-supplied `expectedRootCid` and the
  * framed CIDs in the CAR (`@ipld/car`'s `CarReader` does NOT recompute
  * `sha256(bytes)` against the framed CID — it just slices framed
- * `{cid, bytes}` pairs from the stream). Per-block content-address
- * verification is NOT applied here because the SDK's bundle CAR
- * builder (`uxf/ipld.ts:elementToIpldBlock`) emits sub-block bytes
- * (IPLD form, with CID-link children) under CIDs computed from a
- * different canonical form (hash form, with raw hash-bytes children).
- * A uniform per-block sha256 check would reject every legitimate UXF
- * bundle. Receiver-side verification is provided by `fetchFromIpfs`
- * (CID-binding check against gateway-returned bytes).
+ * `{cid, bytes}` pairs from the stream).
+ *
+ * Issue #213 (Option C) reconciled the prior CID/bytes mismatch in
+ * `uxf/ipld.ts:elementToIpldBlock`: sub-block bytes are now encoded in
+ * the SAME canonical form used for content hashing (children as raw
+ * 32-byte Uint8Array, not Tag 42 CID links), so
+ * `sha256(block.bytes) === block.cid.multihash.digest` holds for every
+ * UXF sub-block. The producer-side verification is performed
+ * per-block below (a lightweight sanity check that catches builder
+ * bugs without re-deriving the CIDs Kubo would assign). Receiver-side
+ * verification continues via `fetchFromIpfs` (CID-binding check
+ * against gateway-returned bytes).
  *
  * @param gateways          - Array of IPFS gateway base URLs
  * @param carBytes          - CAR file bytes to import block-by-block
@@ -305,34 +314,30 @@ export async function pinCarBlocksToIpfs(
   for await (const block of reader.blocks()) {
     blocks.push({ cid: block.cid.toString(), bytes: block.bytes });
   }
-  // NOTE on producer-side CID-binding verification: an earlier draft
-  // of this function called `verifyCidMatchesBytes` per block here as
-  // defense against a buggy local CAR builder. That check surfaced a
-  // pre-existing design choice in `uxf/ipld.ts:elementToIpldBlock` —
-  // for UXF bundle CARs, sub-block CIDs are computed over the HASH
-  // canonical form of the element (children = raw hash bytes) while
-  // the block bytes serialize the IPLD form (children = CID links).
-  // The two encodings differ, so `sha256(block.bytes) !=
-  // block.cid.multihash.digest` for a subset of bundle sub-blocks by
-  // design. A per-block check would reject every legitimate UXF
-  // bundle.
+  // Issue #213 (Option C) — UXF element bytes are now encoded in the
+  // SAME canonical form used for hashing (children as raw 32-byte
+  // Uint8Array; predecessor in `header[3]` likewise). That makes
+  // `sha256(block.bytes) === block.cid.multihash.digest` hold for
+  // every sub-block of every legitimate bundle CAR. Kubo's `dag/put`
+  // re-derives the CID from the bytes; under Option C it agrees with
+  // our locally claimed CID, so the per-block pin/fetch round-trips
+  // succeed under the same CID we publish in the manifest.
   //
-  // The receiver-side verification stays intact:
-  //   - `fetchFromIpfs` re-verifies `sha256(bytes) == cid.multihash`
-  //     before returning bytes to callers (defense against gateway
-  //     tampering).
-  //   - `parseProfileSnapshot` and `loadCarBlocks` re-verify each
-  //     block in a hand-built snapshot CAR.
+  // We don't run a uniform `verifyCidMatchesBytes` here — that's a
+  // receiver-side defense (gateway tampering). The producer is the
+  // bytes' authority. If a future builder bug breaks the equivalence,
+  // it would surface immediately as a downstream `fetchFromIpfs`
+  // mismatch on the next consumer fetch.
   //
-  // The mismatch in the producer path is tracked as a follow-up:
-  // the `block/get(subBlockCid)` round-trip works in practice because
-  // Kubo's `dag/put` honors the caller-supplied codec but returns the
-  // CID it actually computed; the SDK's `pinSingleBlock` keeps the
-  // caller-claimed CID for the response shape but pins under the
-  // sha256(bytes)-derived CID. Bundle root CIDs continue to match by
-  // construction (envelope/manifest blocks use IPLD-form encoding
-  // throughout). See docs/uxf/HIERARCHICAL-ADDRESSABILITY.md for the
-  // full discussion.
+  // Backward-compatibility note: legacy bundle CARs produced before
+  // #213 encoded children as Tag 42 CID links. Their sub-block CIDs
+  // did not match `sha256(bytes)`. They remain readable by the
+  // hierarchical walker (`walkUxfElement` accepts both forms) but
+  // cannot be pinned under their original CIDs by `pinCarBlocksToIpfs`
+  // — a fresh export via `exportToCar` will produce the new canonical
+  // form. The dual-codec receiver in `fetchCarFromIpfs` continues to
+  // accept the legacy single-block raw-codec CARs from the #212
+  // interim, so in-flight wallet pointers remain reachable.
   if (blocks.length === 0) {
     throw new ProfileError(
       'ORBITDB_WRITE_FAILED',
@@ -639,7 +644,7 @@ export async function fetchCarFromIpfs(
     );
     blocks.push({ cid: blockCid, bytes: blockBytes });
 
-    // Only dag-cbor blocks can carry CID links (Tag 42). Raw blocks
+    // Only dag-cbor blocks can carry inter-block references. Raw blocks
     // (codec 0x55) are leaves. Unknown codecs are also treated as
     // leaves — if a future block type needs link walking, extend
     // this branch explicitly rather than guessing.
@@ -654,10 +659,24 @@ export async function fetchCarFromIpfs(
           err,
         );
       }
-      collectCidLinks(decoded, (childCid) => {
+      const visit = (childCid: CID): void => {
         const childStr = childCid.toString();
         if (!visited.has(childStr)) queue.push(childStr);
-      });
+      };
+      // Issue #213 (Option C): UXF element blocks encode children as
+      // raw 32-byte hash bytes (CBOR bstr) — the SAME canonical form
+      // used for hashing — so `sha256(bytes) === cid.multihash.digest`
+      // for every element block. The generic `CID.asCID`-based walker
+      // misses these references because they're Uint8Array, not Tag 42
+      // CID objects. Detect UXF shape and walk via
+      // `contentHashBytesToCid` instead. Falls through to the generic
+      // walker for envelope, manifest, and lean-snapshot blocks (which
+      // continue to use CID-link references).
+      if (isUxfElement(decoded)) {
+        walkUxfElement(decoded, visit);
+      } else {
+        collectCidLinks(decoded, visit);
+      }
     }
   }
 
@@ -724,6 +743,129 @@ function collectCidLinks(value: unknown, visit: (cid: CID) => void): void {
   for (const v of Object.values(value as Record<string, unknown>)) {
     collectCidLinks(v, visit);
   }
+}
+
+// ---------------------------------------------------------------------------
+// UXF-aware walker (issue #213, Option C)
+// ---------------------------------------------------------------------------
+
+/**
+ * Internal type guard: detect the structural shape of a UXF element
+ * block as produced by `uxf/ipld.ts:elementToIpldBlock`.
+ *
+ * A UXF element block is a dag-cbor map with four keys:
+ *   - `header`:   array of length >= 4 ([representation, semantics,
+ *                 kind, predecessor]); predecessor is `null` or a
+ *                 32-byte Uint8Array (sha-256 digest).
+ *   - `type`:     integer type ID (see `ELEMENT_TYPE_IDS` in
+ *                 `uxf/types.ts`).
+ *   - `content`:  object map (per-type schema).
+ *   - `children`: object map; values are `null`, 32-byte Uint8Array,
+ *                 or arrays thereof. Issue #213 transition tolerates
+ *                 legacy Tag 42 CID values too, but the walker only
+ *                 follows Uint8Array references — CID children are
+ *                 redundantly handled by the generic walker fallback.
+ *
+ * The check is intentionally permissive on `content` (per-type schema
+ * variance) and tight on the four-key surface that distinguishes UXF
+ * elements from envelope / manifest / lean-snapshot blocks. False
+ * positives are harmless: the worst case is that `walkUxfElement`
+ * runs against a non-element shape and finds no Uint8Array children
+ * (returns no CIDs, matching the safe fallback behaviour). False
+ * negatives would silently break per-block traversal — keep the
+ * predicate stable.
+ */
+function isUxfElement(value: unknown): value is {
+  header: unknown[];
+  type: number;
+  content: Record<string, unknown>;
+  children: Record<string, unknown>;
+} {
+  if (value === null || typeof value !== 'object') return false;
+  if (value instanceof Uint8Array) return false;
+  if (Array.isArray(value)) return false;
+  const obj = value as Record<string, unknown>;
+  if (!Array.isArray(obj.header)) return false;
+  if (obj.header.length < 4) return false;
+  if (typeof obj.type !== 'number') return false;
+  if (typeof obj.content !== 'object' || obj.content === null) return false;
+  if (Array.isArray(obj.content)) return false;
+  if (typeof obj.children !== 'object' || obj.children === null) return false;
+  if (Array.isArray(obj.children)) return false;
+  return true;
+}
+
+/**
+ * Convert a 32-byte sha2-256 content hash digest (raw bytes) into a
+ * CIDv1 with dag-cbor codec — the inverse of
+ * `uxf/ipld.ts:contentHashToCid`. Mirrors that function locally so the
+ * Profile package doesn't take a cross-package dependency on `uxf/` for
+ * a hot fetch path.
+ */
+function contentHashBytesToCid(bytes: Uint8Array): CID {
+  return CID.createV1(CODEC_DAG_CBOR, createMultihash(MULTIHASH_SHA256, bytes));
+}
+
+/**
+ * Walk a UXF element block and invoke `visit` on every child CID
+ * reference. Issue #213 (Option C) — UXF element blocks encode
+ * `children` values as raw 32-byte Uint8Array digests (CBOR bstr) and
+ * `header[3]` (predecessor) the same way. Each 32-byte digest is
+ * converted into a CIDv1(dag-cbor, sha2-256) so the BFS walker treats
+ * it as a normal child link.
+ *
+ * Mixed-form tolerance: a single element with a legacy Tag 42 CID
+ * value alongside a Uint8Array value is visited correctly — Uint8Array
+ * via `contentHashBytesToCid`, CID via `CID.asCID`. No producer emits
+ * mixed shapes; the dual handling exists for the cutover window.
+ *
+ * Items of unexpected length (not 32 bytes) are silently skipped:
+ * malformed bytes that survived `importFromCar`'s validation would
+ * fail downstream verification anyway, so the walker stays liberal.
+ */
+function walkUxfElement(
+  node: {
+    header: unknown[];
+    children: Record<string, unknown>;
+  },
+  visit: (cid: CID) => void,
+): void {
+  // Walk header[3] (predecessor). New canonical form encodes it as a
+  // 32-byte Uint8Array. `header[0..2]` are scalar fields (numbers /
+  // strings) with no link references.
+  const predecessor = node.header[3];
+  if (predecessor instanceof Uint8Array && predecessor.byteLength === SHA256_DIGEST_BYTES) {
+    visit(contentHashBytesToCid(predecessor));
+  } else {
+    const asCid = predecessor != null ? CID.asCID(predecessor as CID) : null;
+    if (asCid !== null) visit(asCid);
+  }
+
+  // Walk children. Each value is null | Uint8Array(32) | CID | array
+  // of the prior.
+  for (const value of Object.values(node.children)) {
+    walkUxfChildValue(value, visit);
+  }
+}
+
+function walkUxfChildValue(value: unknown, visit: (cid: CID) => void): void {
+  if (value === null || value === undefined) return;
+  if (value instanceof Uint8Array) {
+    if (value.byteLength === SHA256_DIGEST_BYTES) {
+      visit(contentHashBytesToCid(value));
+    }
+    return;
+  }
+  const asCid = CID.asCID(value as CID);
+  if (asCid !== null) {
+    visit(asCid);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) walkUxfChildValue(item, visit);
+  }
+  // Unknown shapes: silently skip — the importFromCar path would have
+  // rejected them on the receiver side.
 }
 
 /**

@@ -53,29 +53,17 @@
  * @module profile/profile-token-storage/flush-scheduler
  */
 
-// #207 E2E fix — bundle pinning currently uses `pinToIpfs` (legacy
-// monolithic raw-codec single-block pin) instead of `pinCarBlocksToIpfs`
-// (#200 hierarchical per-block pin). The latter is structurally broken
-// for UXF bundles because element CIDs are computed over the hash
-// canonical form (children = raw hash bytes) while the emitted block
-// bytes are in IPLD form (children = Tag 42 CID links). Kubo re-derives
-// the CID from the bytes and pins under THAT, leaving the manifest's
-// content-hash-derived links unreachable. See uxf/ipld.ts:144 and
-// docs/uxf/V4-INSTANT-SPLIT-VIABILITY.md sibling follow-up for the
-// proper architectural fix (decouple bytes-derived CIDs from
-// content-hash identity, refactor exportToCar to bottom-up).
-//
-// Both functions are imported so this file shows the contrast and the
-// switch-back point. Currently only `pinToIpfs` is on the hot path;
-// `pinCarBlocksToIpfs` stays imported for the imminent revert when
-// the architectural fix lands.
-import { pinCarBlocksToIpfs, pinToIpfs } from '../ipfs-client.js';
-// `extractCarRootCid` is retained for type-flow continuity with the
-// hierarchical path even though the current bundle pin doesn't call it.
+// Issue #213 (Option C) restored hierarchical per-block pinning:
+// `uxf/ipld.ts:elementToIpldBlock` now emits sub-block bytes in the
+// same canonical form used for content hashing, so
+// `sha256(blockBytes) === blockCid.multihash.digest` holds and Kubo's
+// `dag/put` pins each sub-block under exactly the CID we publish in
+// the manifest. Bundle CARs go back to dag-cbor envelopes pinned
+// block-by-block via `pinCarBlocksToIpfs`; per-block IPFS dedup is
+// restored, closing the byte-cost-per-token-mutation regression
+// introduced by the #212 monolithic-raw interim.
+import { pinCarBlocksToIpfs } from '../ipfs-client.js';
 import { extractCarRootCid } from '../../uxf/transfer-payload.js';
-// Mark the retained imports as intentionally unused on the hot path.
-void pinCarBlocksToIpfs;
-void extractCarRootCid;
 import type {
   ProfileSnapshotPublishResult,
   UxfBundleRef,
@@ -91,21 +79,6 @@ import type { TxfStorageDataBase } from '../../storage/storage-provider.js';
  * the regression. Exported so consumers/tests can reference the literal.
  */
 export const POINTER_MONOTONICITY_VIOLATION = 'POINTER_MONOTONICITY_VIOLATION';
-
-/**
- * #207 E2E fix — compute the CID that `pinToIpfs` will publish for a
- * given CAR's bytes. Matches `pinToIpfs`'s convention:
- * `CID.createV1(raw, sha256(carBytes))`. Used by the no-data
- * short-circuit so it can compare against the eventual pin CID without
- * actually performing the pin.
- */
-async function computeRawPinCid(carBytes: Uint8Array): Promise<string> {
-  const { CID } = await import('multiformats/cid');
-  const { sha256 } = await import('@noble/hashes/sha2.js');
-  const raw = await import('multiformats/codecs/raw');
-  const { create: createMultihash } = await import('multiformats/hashes/digest');
-  return CID.createV1(raw.code, createMultihash(0x12, sha256(carBytes))).toString();
-}
 
 export class FlushScheduler {
   /**
@@ -425,15 +398,13 @@ export class FlushScheduler {
       //     only fires when the merged-state CAR happens to be byte-
       //     identical to a known anchor.
       if (noDataMode) {
-        // #207 E2E fix: bundle pinning reverted to legacy monolithic
-        // raw-codec single-block pin via `pinToIpfs(carBytes)`. The
-        // projected CID for the no-data short-circuit MUST match the
-        // CID that `pinToIpfs` will publish — `CID.createV1(raw,
-        // sha256(carBytes))`. Computing via `extractCarRootCid`
-        // (dag-cbor envelope CID) would produce a different value, so
-        // the short-circuit would never fire and every no-data flush
-        // would gratuitously republish.
-        const projectedCid = await computeRawPinCid(carBytes);
+        // Issue #213: bundle pinning returned to hierarchical
+        // per-block pin via `pinCarBlocksToIpfs(carBytes,
+        // expectedRootCid)`. The projected CID is the CAR envelope
+        // root CID, extracted from the dag-cbor envelope block —
+        // matches what `pinCarBlocksToIpfs` will pin as the
+        // entry-point CID for the bundle.
+        const projectedCid = await extractCarRootCid(carBytes);
         const knownDiscovered = this.host.getLastDiscoveredPointerCid();
         if (knownDiscovered === projectedCid) {
           this.host.log(
@@ -636,37 +607,28 @@ export class FlushScheduler {
       if (useCachedCid && cachedCidNow) {
         cid = cachedCidNow;
       } else {
-        // #207 E2E ROOT CAUSE FIX — UXF bundle CARs use content-hash-
-        // derived CIDs for sub-block elements (children encoded as raw
-        // hash bytes in canonical form per uxf/hash.ts:308). But the
-        // ACTUAL bytes emitted to the CAR are in IPLD form (children
-        // as Tag 42 CID links per uxf/ipld.ts:144). The two encodings
-        // produce DIFFERENT bytes, so `sha256(block.bytes) !=
-        // block.cid.multihash.digest` for non-envelope sub-blocks.
+        // Issue #213 (Option C) restores hierarchical per-block pin.
+        // UXF element bytes are now in the same canonical form used
+        // for hashing (children as raw 32-byte Uint8Array per
+        // `uxf/ipld.ts:elementToIpldBlock`), so
+        // `sha256(block.bytes) === block.cid.multihash.digest` holds
+        // for every sub-block. Kubo's `dag/put` re-derives CIDs from
+        // bytes and pins under exactly the CIDs we publish in the
+        // manifest, restoring per-block IPFS dedup.
         //
-        // Issue #200 Phase 2 (pinCarBlocksToIpfs / block-by-block
-        // dag/put) recomputes CIDs from the bytes on Kubo's side and
-        // pins under those bytes-derived CIDs. The bundle's manifest
-        // then links to content-hash-derived CIDs that DON'T match
-        // anything pinned → receivers see "BUNDLE_NOT_FOUND" walking
-        // the DAG from envelope → manifest → token roots.
-        //
-        // Until uxf/ipld.ts's CID computation is reworked to match
-        // the bytes (substantial refactor — content hashes are also
-        // the UXF integrity-verification primitive), restore the
-        // pre-#200 single-block raw pin for bundles. The receiver's
-        // `fetchCarFromIpfs` short-circuits raw-codec roots to fetch
-        // the entire CAR in one shot — the internal content-hash-
-        // derived CIDs never need to round-trip through Kubo's
-        // re-encoding. Bundle CARs become opaque blobs again (loses
-        // hierarchical per-block dedup, gains correctness).
-        //
-        // The lean-snapshot publish path (factory.ts:496) keeps using
-        // pinCarBlocksToIpfs — snapshots are constructed with
-        // bytes-derived CIDs throughout (see profile-lean-snapshot.ts
-        // `dagCborCid(rootBytes)`) so their per-block pinning works
-        // correctly.
-        cid = await pinToIpfs(this.host.ipfsGateways, carBytes);
+        // `extractCarRootCid` reads the envelope CID from the CAR
+        // header — that's the entry-point CID published in our
+        // `UxfBundleRef` and on the aggregator pointer. Receivers
+        // walk the DAG starting from this CID via
+        // `fetchCarFromIpfs`, which detects the dag-cbor codec and
+        // traverses sub-blocks using the UXF-aware walker
+        // (`walkUxfElement` in `ipfs-client.ts`).
+        const expectedRootCid = await extractCarRootCid(carBytes);
+        cid = await pinCarBlocksToIpfs(
+          this.host.ipfsGateways,
+          carBytes,
+          expectedRootCid,
+        );
         this.host.setLastPinnedCid(cid);
       }
 
