@@ -546,20 +546,14 @@ describe('pointer monotonicity invariant', () => {
 
     const tokenA = { id: '_TA', genesis: { tokenId: 'TA' } };
     const merged = buildTxfData({ _TA: tokenA });
-    // #207 E2E fix: the flush scheduler reverted to legacy monolithic
-    // raw-codec single-block pin via `pinToIpfs(carBytes)`. The
-    // `projectedCid` shape is now `CID.createV1(raw, sha256(carBytes))`
-    // — mirror that here so the short-circuit comparison fires.
+    // Issue #213 (Option C): the flush scheduler publishes the
+    // dag-cbor envelope CID via `pinCarBlocksToIpfs(carBytes,
+    // extractCarRootCid(carBytes))`. Mirror that projection here so
+    // the short-circuit comparison fires.
     const { makeFakeUxfCar } = await import('./_helpers/fake-uxf-car.js');
-    const { CID } = await import('multiformats/cid');
-    const { sha256 } = await import('@noble/hashes/sha2.js');
-    const raw = await import('multiformats/codecs/raw');
-    const { create: createMultihash } = await import('multiformats/hashes/digest');
+    const { extractCarRootCid } = await import('../../../uxf/transfer-payload.js');
     const projectedCarBytes = await makeFakeUxfCar({ tokens: [tokenA] });
-    const projectedCid = CID.createV1(
-      raw.code,
-      createMultihash(0x12, sha256(projectedCarBytes)),
-    ).toString();
+    const projectedCid = await extractCarRootCid(projectedCarBytes);
 
     // Plant the merged state AND the matching authoritative pointer CID.
     (provider as unknown as {
