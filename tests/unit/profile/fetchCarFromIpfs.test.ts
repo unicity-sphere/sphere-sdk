@@ -200,4 +200,130 @@ describe('fetchCarFromIpfs (Issue #200 Phase 2)', () => {
     for await (const b of reader.blocks()) cids.add(b.cid.toString());
     expect(cids.size).toBe(4);
   });
+
+  it('#213: walks UXF element blocks via Uint8Array children (Option C walker)', async () => {
+    // Real Option C round-trip: produce a multi-block UXF bundle via
+    // `exportToCar` (envelope + manifest + per-element blocks where
+    // children are encoded as raw 32-byte Uint8Array, not Tag 42 CID
+    // links), plant every block in the gateway, then walk the CAR
+    // from the root via `fetchCarFromIpfs`. The walker MUST detect
+    // UXF element shape (`isUxfElement`) and convert Uint8Array
+    // children into CID references via `contentHashBytesToCid` —
+    // otherwise the BFS terminates after the envelope+manifest and
+    // misses every element block, returning an incomplete CAR that
+    // `UxfPackage.fromCar` rejects with a missing-block error.
+    const { exportToCar } = await import('../../../uxf/ipld.js');
+    const { ElementPool } = await import('../../../uxf/element-pool.js');
+    const { deconstructToken } = await import('../../../uxf/deconstruct.js');
+
+    function hexFill(pattern: string, totalChars: number): string {
+      return pattern
+        .repeat(Math.ceil(totalChars / pattern.length))
+        .slice(0, totalChars);
+    }
+    function makeValidToken(suffix: string): Record<string, unknown> {
+      const tokenId = hexFill(suffix, 64);
+      return {
+        version: '2.0',
+        state: { predicate: 'a0'.repeat(32), data: null },
+        genesis: {
+          data: {
+            tokenId,
+            tokenType: '00'.repeat(32),
+            coinData: [['UCT', '1000000']],
+            tokenData: '',
+            salt: hexFill('ab', 64),
+            recipient: 'DIRECT://test',
+            recipientDataHash: null,
+            reason: null,
+          },
+          inclusionProof: {
+            authenticator: {
+              algorithm: 'secp256k1',
+              publicKey: '02' + 'aa'.repeat(32),
+              signature: '30' + 'bb'.repeat(63),
+              stateHash: 'cc'.repeat(32),
+            },
+            merkleTreePath: {
+              root: 'dd'.repeat(32),
+              steps: [{ data: 'ee'.repeat(32), path: '0' }],
+            },
+            transactionHash: 'ff'.repeat(32),
+            unicityCertificate: '11'.repeat(100),
+          },
+        },
+        transactions: [],
+        nametags: [],
+      };
+    }
+
+    const pool = new ElementPool();
+    const rootHash = deconstructToken(pool, makeValidToken('c1'));
+    const tokenId = (
+      (makeValidToken('c1').genesis as Record<string, unknown>).data as Record<
+        string,
+        unknown
+      >
+    ).tokenId as string;
+    const pkg = {
+      envelope: { version: '1.0.0' as const, createdAt: 1700000000, updatedAt: 1700000001 },
+      manifest: { tokens: new Map([[tokenId.toLowerCase(), rootHash]]) },
+      pool: pool.toMap() as Map<string, never>,
+      instanceChains: new Map(),
+      indexes: {
+        byTokenType: new Map(),
+        byCoinId: new Map(),
+        byStateHash: new Map(),
+      },
+    };
+    // Cast through unknown because the local type is a wider structure
+    // than `exportToCar`'s parameter — the runtime shape matches.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const carBytes = await exportToCar(pkg as any);
+
+    // Extract every block from the source CAR and plant in the gateway.
+    const sourceReader = await CarReader.fromBytes(carBytes);
+    const blocks = new Map<string, Uint8Array>();
+    let dagCborBlockCount = 0;
+    for await (const block of sourceReader.blocks()) {
+      blocks.set(block.cid.toString(), block.bytes);
+      if (block.cid.code === 0x71) dagCborBlockCount += 1;
+    }
+    // Sanity: a real bundle has envelope + manifest + at least one
+    // element block. If this trips, the bundle builder regressed and
+    // the per-block walker test is no longer meaningful.
+    expect(dagCborBlockCount).toBeGreaterThanOrEqual(3);
+
+    const roots = await sourceReader.getRoots();
+    expect(roots).toHaveLength(1);
+    const rootCid = roots[0]!.toString();
+
+    installBlockGateway(blocks);
+
+    // Walk via fetchCarFromIpfs — this is the consumer-side path that
+    // exercises `isUxfElement` + `walkUxfElement` + `contentHashBytesToCid`.
+    const reassembled = await fetchCarFromIpfs(
+      ['https://gateway.test'],
+      rootCid,
+    );
+
+    // The reassembled CAR must contain every source block — the walker
+    // discovered every element block reachable from the root via
+    // Uint8Array children (envelope CID-link to manifest, manifest
+    // CID-links to roots, roots' Uint8Array children to descendants).
+    const reassembledReader = await CarReader.fromBytes(reassembled);
+    const reassembledCids = new Set<string>();
+    for await (const block of reassembledReader.blocks()) {
+      reassembledCids.add(block.cid.toString());
+    }
+    expect(reassembledCids).toEqual(new Set(blocks.keys()));
+
+    // Final check: the reassembled CAR is itself importable through the
+    // UXF receiver, verifying the per-block sha256(bytes) === cid check
+    // in `importFromCar` is satisfied for every walked sub-block.
+    const { importFromCar } = await import('../../../uxf/ipld.js');
+    const restored = await importFromCar(reassembled);
+    expect(restored.manifest.tokens.size).toBe(1);
+    expect(restored.pool.size).toBe(pkg.pool.size);
+  });
 });

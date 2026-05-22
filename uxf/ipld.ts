@@ -750,11 +750,31 @@ function decodeIpldElement(node: {
   assertHeaderVersionField(hdrArray[1], 'IPLD element header[1] (semantics)');
   assertHeaderKindField(hdrArray[2], 'IPLD element header[2] (kind)');
 
+  // Predecessor is the optional 32-byte sha2-256 digest of the previous
+  // instance in the chain (or `null` for chain heads). The producer
+  // (`buildCanonicalHeader`) always emits Uint8Array via `hexToBytes`, so
+  // legacy bundles never used a Tag 42 CID encoding here — only the
+  // Uint8Array / null forms are accepted. Length is validated symmetrically
+  // with `decodeChildBytes` to fail fast on malformed bundles instead of
+  // silently truncating the instance chain when `pool.get(badHash)` misses.
   const predecessor = hdrArray[3];
-  const predecessorHash: ContentHash | null =
-    predecessor instanceof Uint8Array
-      ? contentHash(bytesToHex(predecessor))
-      : null;
+  let predecessorHash: ContentHash | null = null;
+  if (predecessor instanceof Uint8Array) {
+    if (predecessor.byteLength !== 32) {
+      throw new UxfError(
+        'SERIALIZATION_ERROR',
+        `IPLD element header[3] (predecessor) must be exactly 32 bytes ` +
+          `(sha2-256 digest), got ${predecessor.byteLength}`,
+      );
+    }
+    predecessorHash = contentHash(bytesToHex(predecessor));
+  } else if (predecessor !== null && predecessor !== undefined) {
+    throw new UxfError(
+      'SERIALIZATION_ERROR',
+      `IPLD element header[3] (predecessor) must be Uint8Array or null, ` +
+        `got ${typeof predecessor}`,
+    );
+  }
 
   // Type ID -> string tag
   const typeTag = TYPE_ID_TO_TAG.get(node.type);
