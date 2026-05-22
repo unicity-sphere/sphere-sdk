@@ -1,4 +1,4 @@
-# Sphere
+# Sphere SDK
 
 **A TypeScript SDK for apps where users hold their own tokens and pay each other by name — no payment backend to build, no custody of anyone's funds.**
 
@@ -8,13 +8,13 @@
 
 ---
 
-Sphere gives your app a self‑custody wallet: each user holds their own keys, pays others by `@name`, and every transfer is settled on Unicity's network and backed by cryptographic proof. You get the wallet, transfers, encrypted messaging, and invoicing out of the box — without building or operating a payment backend, and without ever holding users' funds. It runs in the browser and in Node.js.
+The Sphere SDK gives your app a self‑custody wallet: each user holds their own keys, pays others by `@name`, and every transfer is settled on Unicity's network and backed by cryptographic proof. You get the wallet, transfers, encrypted messaging, and invoicing out of the box — without building or operating a payment backend, and without ever holding users' funds. It runs in the browser and in Node.js.
 
-## Why Sphere
+## Why Sphere SDK
 
 Most apps that move money put a custodial server in the middle: it holds everyone's balances, clears the payments, and can freeze or lose them — and it's yours to build, secure, and keep online.
 
-Sphere splits those jobs apart:
+The Sphere SDK splits those jobs apart:
 
 - **Custody moves to the user.** Their wallet holds its own keys; your app never touches their funds.
 - **Settlement moves to Unicity's network** — a shared ledger run across many validator nodes — which records every transfer and lets the recipient verify it cryptographically.
@@ -79,7 +79,7 @@ That is a real transfer between two users — settled on Unicity's network, with
 
 ## Core concepts
 
-You only need four ideas to use Sphere.
+You only need four ideas to use the Sphere SDK.
 
 - **Token** — a unit of digital value (like `UCT`). A user's wallet can hold many tokens of different kinds.
 - **Wallet** — created from a 12‑word *recovery phrase*. The phrase is the only thing a user needs to back up; lose it and the wallet is gone.

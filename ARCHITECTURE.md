@@ -1,6 +1,6 @@
 # Sphere SDK — Architecture
 
-This document explains how Sphere works underneath the friendly API. The [README](README.md) deliberately avoids this depth; if you are integrating, extending, or debugging the SDK, start here.
+This document explains how the Sphere SDK works underneath the friendly API. The [README](README.md) deliberately avoids this depth; if you are integrating, extending, or debugging the SDK, start here.
 
 The whole system rests on one idea, repeated at every layer: **a single key per user, and cryptographic proofs carried peer‑to‑peer instead of stored on a chain.**
 
@@ -8,7 +8,7 @@ The whole system rests on one idea, repeated at every layer: **a single key per 
 
 ## 1. One key, many identities
 
-A wallet is created from a BIP‑39 recovery phrase. That phrase derives a single secp256k1 private key (BIP‑32, path `m/44'/0'/0'/0/{index}`), and from that one key Sphere derives every address a user needs:
+A wallet is created from a BIP‑39 recovery phrase. That phrase derives a single secp256k1 private key (BIP‑32, path `m/44'/0'/0'/0/{index}`), and from that one key the SDK derives every address a user needs:
 
 ```
 recovery phrase
@@ -50,11 +50,11 @@ interface Identity {
 
 ## 2. The two networks
 
-Sphere spans two independent networks. The README calls them "tokens" and "the ALPHA coin"; here are their real names and mechanics. (Historically these are referred to as **L3** and **L1**.)
+The Sphere SDK spans two independent networks. The README calls them "tokens" and "the ALPHA coin"; here are their real names and mechanics. (Historically these are referred to as **L3** and **L1**.)
 
 ### 2a. The Unicity token network ("L3") — the core
 
-This is what Sphere is fundamentally for. A **token** is a self‑contained cryptographic object: a genesis (mint) record plus a chain of transfers, each anchored by a Merkle **inclusion proof** signed by a Byzantine‑fault‑tolerant validator set (the *trust base*).
+This is what the Sphere SDK is fundamentally for. A **token** is a self‑contained cryptographic object: a genesis (mint) record plus a chain of transfers, each anchored by a Merkle **inclusion proof** signed by a Byzantine‑fault‑tolerant validator set (the *trust base*).
 
 The defining property: **only a commitment (a hash) is ever published on the network.** The token itself — its full history and proofs — lives off‑chain and travels directly between users (over the messaging transport). This buys three things:
 
@@ -191,7 +191,7 @@ A few notes that explain the design:
 
 ## 7. Providers and storage
 
-Sphere is platform‑agnostic through five injectable interfaces:
+The Sphere SDK is platform‑agnostic through five injectable interfaces:
 
 | Provider | Role | Browser default | Node default |
 |---|---|---|---|
@@ -209,7 +209,7 @@ See [docs/PROVIDERS-AND-CONFIG.md](docs/PROVIDERS-AND-CONFIG.md) for configurati
 
 ## 8. Dependency stack
 
-Sphere is composition on top of Unicity's protocol packages:
+The Sphere SDK is composition on top of Unicity's protocol packages:
 
 ```
 @unicitylabs/sphere-sdk

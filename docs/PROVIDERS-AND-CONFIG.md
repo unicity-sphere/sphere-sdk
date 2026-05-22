@@ -1,6 +1,6 @@
 # Providers & Configuration
 
-Sphere is configured by **providers** — pluggable backends for storage, messaging, proofs, and prices. The factory functions `createBrowserProviders()` and `createNodeProviders()` assemble a complete set from a single network name; everything below is for customizing that.
+The Sphere SDK is configured by **providers** — pluggable backends for storage, messaging, proofs, and prices. The factory functions `createBrowserProviders()` and `createNodeProviders()` assemble a complete set from a single network name; everything below is for customizing that.
 
 ## Network presets
 
