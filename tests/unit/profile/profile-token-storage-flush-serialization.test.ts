@@ -49,6 +49,7 @@ import { ProfileTokenStorageProvider } from '../../../profile/profile-token-stor
 import {
   deriveProfileEncryptionKey,
 } from '../../../profile/encryption';
+import { waitForFlushSettled } from '../../helpers/profile/waitForFlushSettled';
 
 // =============================================================================
 // Test fixtures (mirrors profile-token-storage-no-data-flush.test.ts setup)
@@ -355,7 +356,7 @@ describe('ProfileTokenStorageProvider — flush serialization (PR #127 partial-C
     flushScheduler.scheduleFlush();
 
     // Wait for both flushes to settle.
-    await new Promise((r) => setTimeout(r, 200));
+    await waitForFlushSettled(provider, 10000);
 
     // Critical assertion: serialization held — never two flushes in
     // flight at the same time.
@@ -389,7 +390,7 @@ describe('ProfileTokenStorageProvider — flush serialization (PR #127 partial-C
     // existing one.
     flushScheduler.scheduleFlushNoData();
 
-    await new Promise((r) => setTimeout(r, 200));
+    await waitForFlushSettled(provider, 10000);
 
     expect(tracker.maxInFlight).toBe(1);
     expect(tracker.startCount).toBe(2);
@@ -425,7 +426,7 @@ describe('ProfileTokenStorageProvider — flush serialization (PR #127 partial-C
     (provider as unknown as { pendingData: TxfStorageDataBase | null }).pendingData = data3;
     flushScheduler.scheduleFlush();
 
-    await new Promise((r) => setTimeout(r, 300));
+    await waitForFlushSettled(provider, 10000);
 
     expect(tracker.maxInFlight).toBe(1);
     expect(tracker.startCount).toBe(3);

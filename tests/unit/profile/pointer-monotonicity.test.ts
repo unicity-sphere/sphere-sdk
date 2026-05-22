@@ -48,6 +48,7 @@ import {
   encryptProfileValue,
 } from '../../../profile/encryption';
 import { POINTER_MONOTONICITY_VIOLATION } from '../../../profile/profile-token-storage/flush-scheduler';
+import { waitForFlushSettled } from '../../helpers/profile/waitForFlushSettled';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { CID } from 'multiformats/cid';
 import * as raw from 'multiformats/codecs/raw';
@@ -322,57 +323,8 @@ async function plantBundleInOrbit(
   );
 }
 
-/**
- * Issue #215: wait for any debounced flush armed via `scheduleFlush*`
- * to actually fire AND its in-flight promise to settle.
- *
- * The bare `setTimeout(r, flushDebounceMs + epsilon)` pattern is racy
- * under full-suite worker contention: the debounce timer may not have
- * fired yet at the wake-up, and the flush body's awaits (mocked
- * `fetch`, dynamic `import('UxfPackage.js')`) take real time. If the
- * test asserts before the flush settles, leaked in-flight work bumps
- * the shared `tracker.pinCalls` counter mid-way through the NEXT test
- * (which has already swapped in its own tracker via `installMockFetch`),
- * making that test fail with `pinCalls = 1` when it expected 0.
- *
- * Strategy: poll until the host exposes a non-null `flushPromise` (the
- * timer fired and a flush is now in flight), then `await` it. If no
- * flush starts within the deadline, return — the caller is then free
- * to assert "nothing happened" without worrying about a deferred pin.
- */
-async function waitForFlushSettled(
-  provider: ProfileTokenStorageProvider,
-  deadlineMs = 2000,
-): Promise<void> {
-  const host = provider as unknown as {
-    flushPromise: Promise<void> | null;
-    flushTimer: ReturnType<typeof setTimeout> | null;
-  };
-  const start = Date.now();
-  // Wait for the debounce timer to fire (flushPromise becomes non-null)
-  // OR for both the timer and the promise to be null AND stay null for
-  // a short stability window (= no flush was actually scheduled).
-  while (Date.now() - start < deadlineMs) {
-    if (host.flushPromise) {
-      try {
-        await host.flushPromise;
-      } catch {
-        // Flush body throws on POINTER_MONOTONICITY_VIOLATION etc.;
-        // that's a normal completion path for the tests below.
-      }
-      // After settle, check whether a chained flush re-armed.
-      if (!host.flushTimer && !host.flushPromise) return;
-      continue;
-    }
-    if (!host.flushTimer) {
-      // Stability window — give a late-arming timer a moment to land.
-      await new Promise((r) => setTimeout(r, 5));
-      if (!host.flushTimer && !host.flushPromise) return;
-      continue;
-    }
-    await new Promise((r) => setTimeout(r, 5));
-  }
-}
+// `waitForFlushSettled` lives in `tests/helpers/profile/` and is shared
+// across the profile test suite — see issue #219 for the broader audit.
 
 // =============================================================================
 // Tests

@@ -23,6 +23,7 @@ import {
   encryptString,
   decryptString,
 } from '../../../profile/encryption';
+import { waitForFlushSettled } from '../../helpers/profile/waitForFlushSettled';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { CID } from 'multiformats/cid';
 import * as raw from 'multiformats/codecs/raw';
@@ -538,7 +539,7 @@ describe('ProfileTokenStorageProvider', () => {
       await provider.save(data3);
 
       // Wait for debounce + flush to complete
-      await new Promise((r) => setTimeout(r, 200));
+      await waitForFlushSettled(provider, 10000);
 
       // Only one pin call should have been made
       expect(pinCallCount).toBe(1);
@@ -755,7 +756,7 @@ describe('ProfileTokenStorageProvider', () => {
       await provider.save(txfData);
 
       // Wait for debounce + flush
-      await new Promise((r) => setTimeout(r, 200));
+      await waitForFlushSettled(provider, 10000);
 
       // Check that a bundle ref was written
       const bundleKeys = Array.from(db._store.keys()).filter((k) =>
@@ -869,7 +870,7 @@ describe('ProfileTokenStorageProvider', () => {
       txfData._sent = [{ tokenId: 't1', recipient: 'bob', txHash: 'hash1', sentAt: 2000 }];
 
       await provider.save(txfData);
-      await new Promise((r) => setTimeout(r, 200));
+      await waitForFlushSettled(provider, 10000);
 
       // Synced (OrbitDB): outbox entry exists under per-entry key
       // (Wave G.7 layout — `${addr}.outbox.${id}` instead of single-
@@ -972,7 +973,7 @@ describe('ProfileTokenStorageProvider', () => {
       ];
       txfData._invalid = [{ tokenId: 'tBad', reason: 'r', detectedAt: 999 }];
       await provider.save(txfData);
-      await new Promise((r) => setTimeout(r, 200));
+      await waitForFlushSettled(provider, 10000);
 
       // Each outbox entry stored under its own key.
       expect(db._store.has(`${EXPECTED_ADDRESS_ID}.outbox.oA`)).toBe(true);
@@ -1003,14 +1004,14 @@ describe('ProfileTokenStorageProvider', () => {
         { id: 'oA', status: 'pending', tokenId: 't1', recipient: 'alice', createdAt: 1000, data: {} },
       ];
       await provider.save(txfData);
-      await new Promise((r) => setTimeout(r, 200));
+      await waitForFlushSettled(provider, 10000);
       expect(db._store.has(`${EXPECTED_ADDRESS_ID}.outbox.oA`)).toBe(true);
 
       // Second save with empty outbox — oA should be tombstoned.
       const txfData2 = buildTxfData({ _token1: { id: '_token1' } });
       txfData2._outbox = [];
       await provider.save(txfData2);
-      await new Promise((r) => setTimeout(r, 200));
+      await waitForFlushSettled(provider, 10000);
 
       // The key still exists but its content is a tombstone marker.
       expect(db._store.has(`${EXPECTED_ADDRESS_ID}.outbox.oA`)).toBe(true);
@@ -1341,7 +1342,7 @@ describe('ProfileTokenStorageProvider', () => {
 
       const txfData = buildTxfData({ _token1: { id: '_token1' } });
       await provider.save(txfData);
-      await new Promise((r) => setTimeout(r, 200));
+      await waitForFlushSettled(provider, 10000);
 
       // The pinned blocks must be the raw CAR content (unencrypted) so
       // that identical token pools across wallets produce the same CIDs.
@@ -1404,7 +1405,7 @@ describe('ProfileTokenStorageProvider', () => {
 
       const txfData = buildTxfData({ _t1: { id: '_t1' } });
       await provider.save(txfData);
-      await new Promise((r) => setTimeout(r, 200));
+      await waitForFlushSettled(provider, 10000);
 
       // Find bundle ref key
       const bundleKeys = Array.from(db._store.keys()).filter((k) =>
@@ -1460,7 +1461,7 @@ describe('ProfileTokenStorageProvider', () => {
       txfData._history = history;
 
       await provider.save(txfData);
-      await new Promise((r) => setTimeout(r, 200));
+      await waitForFlushSettled(provider, 10000);
 
       // G4 — tombstones ARE now also persisted to OrbitDB (security
       // boundary). The local derived cache still mirrors them.
@@ -1596,13 +1597,13 @@ describe('ProfileTokenStorageProvider', () => {
 
       const txfData = buildTxfData({ _t1: { id: '_t1' } });
       await provider.save(txfData);
-      await new Promise((r) => setTimeout(r, 200));
+      await waitForFlushSettled(provider, 10000);
 
       // User-initiated retry: second save with same data reference.
       // Under the new invariant, save() clears lastPinnedCid, so this
       // triggers a fresh pin — not a reuse.
       await provider.save(txfData);
-      await new Promise((r) => setTimeout(r, 200));
+      await waitForFlushSettled(provider, 10000);
 
       // Two saves → two pins (fresh-pin invariant).
       expect(pinCallCount).toBe(2);

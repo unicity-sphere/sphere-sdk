@@ -29,6 +29,7 @@ import type { FullIdentity } from '../../../types';
 import type { TxfStorageDataBase } from '../../../storage/storage-provider';
 import { ProfileTokenStorageProvider } from '../../../profile/profile-token-storage-provider';
 import { PROFILE_KEY_MAPPING } from '../../../profile/types';
+import { waitForFlushSettled } from '../../helpers/profile/waitForFlushSettled';
 
 // ---------------------------------------------------------------------------
 // Fixtures (mirrors profile-token-storage-provider.test.ts conventions)
@@ -170,7 +171,7 @@ describe('Wave G.7 prerequisite verification (T.0.G7-verify)', () => {
       { id: 'oB', status: 'pending', tokenId: 't2', recipient: '@bob', createdAt: 2, data: {} },
     ];
     await provider.save(data);
-    await new Promise((r) => setTimeout(r, 100));
+    await waitForFlushSettled(provider, 10000);
 
     const perEntryKeys = [...db._store.keys()].filter((k) => k.startsWith(`${ADDR}.outbox.`));
     expect(
@@ -201,7 +202,7 @@ describe('Wave G.7 prerequisite verification (T.0.G7-verify)', () => {
       { tokenId: 'tBad2', reason: 'continuity-broken', detectedAt: 2 },
     ];
     await provider.save(data);
-    await new Promise((r) => setTimeout(r, 100));
+    await waitForFlushSettled(provider, 10000);
 
     const perEntryKeys = [...db._store.keys()].filter((k) => k.startsWith(`${ADDR}.invalid.`));
     expect(
