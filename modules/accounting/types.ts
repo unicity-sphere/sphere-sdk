@@ -680,6 +680,22 @@ export interface AccountingModuleDependencies {
    * storage.
    */
   cidRefStore?: CidRefStore;
+  /**
+   * Optional CAR publisher used by {@link AccountingModule.deliverInvoice}
+   * when the assembled UXF bundle exceeds the inline CAR ceiling. Same
+   * contract as {@link PaymentsModuleDependencies.publishToIpfs} — returns
+   * a CID that MUST equal `extractCarRootCid(carBytes)`. When absent,
+   * deliverInvoice falls back to inline-only and rejects oversized
+   * bundles with a typed error.
+   */
+  publishToIpfs?: (carBytes: Uint8Array) => Promise<{ cid: string }>;
+  /**
+   * Optional IPFS gateway list forwarded into the `uxf-cid` envelope's
+   * informational `gateways` hint. Same role as
+   * {@link PaymentsModuleDependencies.cidFetchGateways}. Empty/undefined
+   * sends no hint; the receiver's own gateway list is authoritative.
+   */
+  cidFetchGateways?: ReadonlyArray<string>;
 }
 
 // =============================================================================
@@ -1189,4 +1205,108 @@ export interface InvoiceBalanceSnapshot {
    * Key: `${targetAddress}::${effectiveSender}::${coinId}`
    */
   perSender: Map<string, { forwarded: bigint; returned: bigint }>;
+}
+
+// =============================================================================
+// §5.13 Invoice Delivery (UXF bundle over NIP-17 DM) — #226
+// =============================================================================
+
+/**
+ * Options for {@link AccountingModule.deliverInvoice}.
+ */
+export interface DeliverInvoiceOptions {
+  /**
+   * Explicit recipient list. Each entry is any Unicity address resolvable
+   * by the shared transport resolver: `@nametag`, `DIRECT://...`,
+   * compressed/x-only chain pubkey hex.
+   *
+   * When omitted, the helper resolves recipients from the invoice's
+   * `terms.targets[].address` list, dropping any target that matches one
+   * of our own active addresses (multi-HD aware).
+   */
+  readonly recipients?: ReadonlyArray<string>;
+  /**
+   * Optional free-text memo placed on the DM envelope. Display-only;
+   * not authenticated by the UXF bundle hash.
+   */
+  readonly memo?: string;
+}
+
+/**
+ * Per-recipient outcome of a {@link AccountingModule.deliverInvoice} call.
+ */
+export interface DeliverInvoiceRecipientResult {
+  /** The original recipient identifier the caller (or the helper's default)
+   *  passed to `sendDM`. May be a `@nametag`, `DIRECT://`, or hex pubkey. */
+  readonly recipient: string;
+  /** Outcome flag — `true` if the DM was published successfully. */
+  readonly success: boolean;
+  /**
+   * Bundle delivery shape used for this recipient.
+   * - `'inline'` — the UXF CAR fit under the inline ceiling and shipped
+   *   as a base64-encoded CAR inside the DM envelope.
+   * - `'cid'`    — the CAR was pinned to IPFS via the wallet's configured
+   *   publisher and the DM envelope carries the CID + gateway hints.
+   *
+   * Empty string when `success === false` and no delivery shape was chosen.
+   */
+  readonly shape: 'inline' | 'cid' | '';
+  /**
+   * Error message when `success === false`. Examples: resolve failure,
+   * transport throw, CAR too large with no IPFS publisher.
+   */
+  readonly error?: string;
+}
+
+/**
+ * Result of {@link AccountingModule.deliverInvoice}.
+ */
+export interface DeliverInvoiceResult {
+  /** The invoice tokenId that was delivered (echoed for caller convenience). */
+  readonly invoiceId: string;
+  /** Number of recipients that received the DM successfully. */
+  readonly sent: number;
+  /** Number of recipients that failed (resolver miss, transport throw, etc.). */
+  readonly failed: number;
+  /** Number of targets that were skipped because they matched one of our
+   *  own active addresses (multi-HD aware self-skip). */
+  readonly skippedSelf: number;
+  /** Detailed per-recipient outcome — same length as the resolved recipient
+   *  list, in send order. */
+  readonly recipients: ReadonlyArray<DeliverInvoiceRecipientResult>;
+}
+
+/**
+ * Inner JSON envelope carried after the `invoice_delivery:` DM prefix (#226).
+ * Validated by the receiver before any bundle handling.
+ *
+ * The bundle is a UXF CARv1 — the same content-addressed packaging the
+ * payments instant-sender uses for token transfers — either inline as
+ * base64 or by-CID-reference for bundles exceeding the inline ceiling.
+ */
+export interface InvoiceDeliveryEnvelope {
+  readonly type: 'invoice_delivery';
+  readonly version: 1;
+  /** 64-char lowercase hex tokenId of the invoice inside the bundle. */
+  readonly invoiceId: string;
+  /** Bundle wire shape — either inline CAR base64 or CID by reference. */
+  readonly bundle:
+    | {
+        readonly kind: 'uxf-car';
+        /** Base64-encoded CARv1 bytes. */
+        readonly carBase64: string;
+        /** Bundle CID (CIDv1, base32, multibase prefix `b`). Receiver MAY
+         *  re-derive and compare. */
+        readonly bundleCid: string;
+      }
+    | {
+        readonly kind: 'uxf-cid';
+        readonly bundleCid: string;
+        /** Optional gateway URLs the receiver MAY consult for IPFS fetch.
+         *  Informational only — the receiver always re-derives the CID
+         *  from the fetched bytes. */
+        readonly gateways?: ReadonlyArray<string>;
+      };
+  /** Optional memo from the sender. UNAUTHENTICATED (outside the bundle hash). */
+  readonly memo?: string;
 }

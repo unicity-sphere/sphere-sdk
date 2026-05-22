@@ -58,6 +58,10 @@ import type {
   FailedReceiptInfo,
   SentNoticeInfo,
   FailedNoticeInfo,
+  DeliverInvoiceOptions,
+  DeliverInvoiceResult,
+  DeliverInvoiceRecipientResult,
+  InvoiceDeliveryEnvelope,
 } from './types.js';
 import { parseInvoiceMemo, buildInvoiceMemo, decodeTransferMessage, hashInvoiceId } from './memo.js';
 import { AutoReturnManager } from './auto-return.js';
@@ -105,6 +109,41 @@ const LOG_TAG = 'Accounting';
 
 /** Prefix for per-invoice transfer ledger storage keys. */
 const INV_LEDGER_PREFIX = 'inv_ledger:';
+
+/**
+ * DM prefix for per-invoice UXF-bundle delivery (#226).
+ *
+ * `deliverInvoice` packages the invoice token into a real UXF CARv1 (the
+ * same content-addressed packaging the payments instant-sender uses) and
+ * ships it inside a NIP-17 DM. The DM body after this prefix is a JSON
+ * `InvoiceDeliveryEnvelope` carrying either inline CAR base64 (`uxf-car`)
+ * or a CID-by-reference (`uxf-cid`). Receivers decode the bundle,
+ * extract the invoice token via `UxfPackage.assemble`, and call
+ * `importInvoice` to land it in the local ledger.
+ *
+ * Distinct from the swap module's `invoice_delivery` JSON discriminator
+ * (escrow→wallet, raw TXF over DM) — that path predates UXF packaging
+ * and is owned by the swap protocol. This prefix lives at the DM-content
+ * layer; the swap discriminator lives inside the structured swap JSON.
+ */
+const INVOICE_DELIVERY_DM_PREFIX = 'invoice_delivery:';
+
+/**
+ * Maximum byte length of an `invoice_delivery:` DM payload (substring
+ * after the prefix). 128 KB matches the swap-module's `MAX_DM_LENGTH` and
+ * gives roughly 2× headroom over a CAR built from a maxed-out 64 KB terms
+ * blob plus its genesis transaction + inclusion proof.
+ */
+const MAX_INVOICE_DELIVERY_BYTES = 131_072;
+
+/**
+ * Inline CAR ceiling (bytes). Above this size, the helper attempts CID
+ * delivery via the wallet's configured `publishToIpfs` callback. Matches
+ * the payments instant-sender's `MAX_INLINE_CAR_BYTES` (16 KiB) so that
+ * a stack of inline-only relays handles the same cutoff for both
+ * pipelines.
+ */
+const INVOICE_INLINE_CAR_CEILING_BYTES = 16_384;
 
 // =============================================================================
 // AccountingModule
@@ -751,6 +790,7 @@ export class AccountingModule {
     return BigInt(amount);
   }
 
+
   /**
    * Safely defer an event emission via queueMicrotask. Wraps the callback in
    * try/catch so a throwing event handler doesn't become an uncaught exception
@@ -1357,6 +1397,289 @@ export class AccountingModule {
       // Zero private key material on all paths (success, error, or re-throw)
       signingKeyBytes.fill(0);
     }
+  }
+
+  /**
+   * Deliver an existing invoice to one or more recipients (#226).
+   *
+   * Packages the invoice's TXF token into a UXF CARv1 bundle (the same
+   * content-addressed packaging the payments instant-sender uses) and
+   * ships the bundle inside a NIP-17 DM with prefix `invoice_delivery:`.
+   * The DM body is a JSON {@link InvoiceDeliveryEnvelope} carrying either
+   * the CAR inline (`uxf-car`, default for bundles ≤ ~16 KiB) or a CID
+   * reference (`uxf-cid`, requires `publishToIpfs` injection).
+   *
+   * Decoupled from {@link createInvoice}: the mint step records the
+   * invoice locally; callers explicitly trigger delivery when they want
+   * payers to discover the invoice. This separation lets callers mint
+   * once and deliver multiple times (e.g. re-deliver after a relay outage,
+   * deliver to a late-added target).
+   *
+   * Recipients default to every `terms.targets[].address` that is NOT one
+   * of our own active addresses (multi-HD self-skip). Callers can override
+   * via `options.recipients`. Each recipient resolves through the shared
+   * `transportResolver` so `@nametag`, `DIRECT://`, and chain pubkey are
+   * all accepted.
+   *
+   * Delivery is best-effort per recipient — one failure does NOT block
+   * subsequent recipients and does NOT throw. The returned
+   * {@link DeliverInvoiceResult} carries per-recipient outcome so callers
+   * (CLI, UI) can surface partial-failure reports and retry.
+   *
+   * @param invoiceId - 64-char hex tokenId of an invoice the wallet owns.
+   * @param options   - Optional recipient override and memo.
+   * @returns Per-recipient outcome.
+   *
+   * @throws {SphereError} `INVOICE_NOT_FOUND` — invoice token absent locally.
+   * @throws {SphereError} `COMMUNICATIONS_UNAVAILABLE` — no CommunicationsModule.
+   * @throws {SphereError} `INVOICE_DELIVERY_FAILED` — token storage / UXF
+   *   build threw irrecoverably before any recipient was attempted.
+   * @throws {SphereError} `NOT_INITIALIZED` — module not initialized.
+   * @throws {SphereError} `MODULE_DESTROYED` — module has been destroyed.
+   */
+  async deliverInvoice(
+    invoiceId: string,
+    options?: DeliverInvoiceOptions,
+  ): Promise<DeliverInvoiceResult> {
+    this.ensureNotDestroyed();
+    this.ensureInitialized();
+    const deps = this.deps!;
+
+    // ------------------------------------------------------------------
+    // Step 1: Validate invoice exists and is known locally.
+    // ------------------------------------------------------------------
+    const terms = this.invoiceTermsCache.get(invoiceId);
+    if (!terms) {
+      throw new SphereError(`Invoice not found: ${invoiceId}`, 'INVOICE_NOT_FOUND');
+    }
+
+    // ------------------------------------------------------------------
+    // Step 2: Locate the token in the wallet's token store. The token was
+    // added by createInvoice via `payments.addToken`, so it is reachable
+    // through `getTokens()` keyed by tokenId.
+    // ------------------------------------------------------------------
+    const tokens = deps.payments.getTokens();
+    const tokenRecord = tokens.find((t) => t.id === invoiceId);
+    if (!tokenRecord || !tokenRecord.sdkData) {
+      throw new SphereError(
+        `Invoice ${invoiceId}: token data missing from local storage — cannot build UXF bundle`,
+        'INVOICE_NOT_FOUND',
+      );
+    }
+    let tokenJson: unknown;
+    try {
+      tokenJson = JSON.parse(tokenRecord.sdkData);
+    } catch (err) {
+      throw new SphereError(
+        `Invoice ${invoiceId}: stored sdkData is not valid JSON — cannot build UXF bundle`,
+        'INVOICE_DELIVERY_FAILED',
+        err,
+      );
+    }
+
+    // ------------------------------------------------------------------
+    // Step 3: CommunicationsModule required for DM transport.
+    // ------------------------------------------------------------------
+    if (!deps.communications) {
+      throw new SphereError(
+        'CommunicationsModule is required to deliver invoices via DM.',
+        'COMMUNICATIONS_UNAVAILABLE',
+      );
+    }
+
+    // ------------------------------------------------------------------
+    // Step 4: Resolve recipient set.
+    //
+    // Caller-provided list wins. Otherwise default to every target whose
+    // DIRECT:// address is NOT one of our active addresses. Active
+    // addresses are queried fresh (multi-HD wallets may have added a
+    // target after the invoice was minted).
+    // ------------------------------------------------------------------
+    const ownAddresses = new Set<string>();
+    try {
+      for (const addr of deps.getActiveAddresses()) {
+        if (addr.directAddress) ownAddresses.add(addr.directAddress);
+      }
+    } catch (err) {
+      logger.warn(LOG_TAG, 'deliverInvoice: getActiveAddresses() threw — proceeding without self-skip', err);
+    }
+    if (deps.identity?.directAddress) ownAddresses.add(deps.identity.directAddress);
+
+    let recipients: string[];
+    let skippedSelf = 0;
+    if (options?.recipients !== undefined) {
+      recipients = options.recipients.slice();
+    } else {
+      recipients = [];
+      const seen = new Set<string>();
+      for (const target of terms.targets) {
+        const addr = target.address;
+        if (!addr || typeof addr !== 'string') continue;
+        if (ownAddresses.has(addr)) {
+          skippedSelf++;
+          continue;
+        }
+        if (seen.has(addr)) continue;
+        seen.add(addr);
+        recipients.push(addr);
+      }
+    }
+
+    if (recipients.length === 0) {
+      // Nothing to deliver: caller passed empty list, or every target
+      // was self. Not an error — return a clean empty result.
+      return { invoiceId, sent: 0, failed: 0, skippedSelf, recipients: [] };
+    }
+
+    // ------------------------------------------------------------------
+    // Step 5: Assemble the UXF bundle and serialize to CAR bytes.
+    //
+    // Failure here aborts BEFORE any DM is sent — no partial delivery.
+    // The CAR bytes are content-addressed; we re-derive the CID once
+    // and reuse it across all recipients (the bundle contents are
+    // identical for every target).
+    // ------------------------------------------------------------------
+    let carBytes: Uint8Array;
+    let bundleCid: string;
+    try {
+      const { UxfPackage } = await import('../../uxf/UxfPackage.js');
+      const pkg = UxfPackage.create({
+        description: 'invoice-delivery',
+        creator: deps.identity.chainPubkey,
+      });
+      pkg.ingest(tokenJson);
+      carBytes = await pkg.toCar();
+      const { extractCarRootCid } = await import('../../uxf/transfer-payload.js');
+      bundleCid = await extractCarRootCid(carBytes);
+    } catch (err) {
+      throw new SphereError(
+        `Invoice ${invoiceId}: UXF bundle assembly failed — ${err instanceof Error ? err.message : String(err)}`,
+        'INVOICE_DELIVERY_FAILED',
+        err,
+      );
+    }
+
+    // ------------------------------------------------------------------
+    // Step 6: Decide inline vs CID delivery shape based on CAR size.
+    //
+    // ≤ INVOICE_INLINE_CAR_CEILING_BYTES → inline (uxf-car).
+    // > ceiling AND publishToIpfs available → pin and use uxf-cid.
+    // > ceiling AND no publisher           → fail this delivery (typed).
+    // ------------------------------------------------------------------
+    const wantsCidBranch = carBytes.byteLength > INVOICE_INLINE_CAR_CEILING_BYTES;
+    let carBase64Inline: string | null = null;
+    let cidPublishError: string | null = null;
+
+    if (!wantsCidBranch) {
+      // Inline path. Encode once for all recipients using the shared
+      // helper that the payments instant-sender / receiver use for
+      // uxf-car payloads — keeps the wire format identical to the
+      // existing TOKEN_TRANSFER instant-mode pipeline.
+      const { carBytesToBase64 } = await import('../../uxf/transfer-payload.js');
+      carBase64Inline = carBytesToBase64(carBytes);
+      // Defense-in-depth: the encoded length plus envelope overhead must
+      // fit under MAX_INVOICE_DELIVERY_BYTES. If a future ceiling change
+      // pushes inline above the DM cap, we'd silently emit DMs that the
+      // receiver drops. Pre-check and reject with a typed error instead.
+      const envelopeOverhead = 512; // generous for JSON keys + invoiceId + memo
+      if (carBase64Inline.length + envelopeOverhead > MAX_INVOICE_DELIVERY_BYTES) {
+        throw new SphereError(
+          `Invoice ${invoiceId}: encoded CAR (${carBase64Inline.length} bytes) exceeds DM cap (${MAX_INVOICE_DELIVERY_BYTES}); configure publishToIpfs to deliver via CID`,
+          'INVOICE_DELIVERY_FAILED',
+        );
+      }
+    } else if (deps.publishToIpfs) {
+      // CID path. Pin the same CAR bytes; the publisher's contract
+      // requires the returned CID to match `bundleCid`.
+      try {
+        const published = await deps.publishToIpfs(carBytes);
+        if (published?.cid !== bundleCid) {
+          cidPublishError = `publishToIpfs returned mismatched CID (got ${published?.cid ?? 'undefined'}, expected ${bundleCid})`;
+        }
+      } catch (err) {
+        cidPublishError = `publishToIpfs threw: ${err instanceof Error ? err.message : String(err)}`;
+      }
+    } else {
+      // No publisher and bundle exceeds inline ceiling. Surface a
+      // typed error rather than silently inline-shipping an oversized DM.
+      throw new SphereError(
+        `Invoice ${invoiceId}: assembled CAR (${carBytes.byteLength} bytes) exceeds inline ceiling (${INVOICE_INLINE_CAR_CEILING_BYTES}) and no publishToIpfs callback is configured`,
+        'INVOICE_DELIVERY_FAILED',
+      );
+    }
+
+    // ------------------------------------------------------------------
+    // Step 7: Build the envelope JSON once and dispatch per recipient.
+    // ------------------------------------------------------------------
+    const envelopeBundle: InvoiceDeliveryEnvelope['bundle'] =
+      carBase64Inline !== null
+        ? { kind: 'uxf-car', carBase64: carBase64Inline, bundleCid }
+        : {
+            kind: 'uxf-cid',
+            bundleCid,
+            ...(deps.cidFetchGateways && deps.cidFetchGateways.length > 0
+              ? { gateways: deps.cidFetchGateways.slice() }
+              : {}),
+          };
+
+    const envelope: InvoiceDeliveryEnvelope = {
+      type: 'invoice_delivery',
+      version: 1,
+      invoiceId,
+      bundle: envelopeBundle,
+      ...(options?.memo !== undefined ? { memo: options.memo } : {}),
+    };
+
+    const dmContent = INVOICE_DELIVERY_DM_PREFIX + JSON.stringify(envelope);
+
+    const recipientResults: DeliverInvoiceRecipientResult[] = [];
+    let sent = 0;
+    let failed = 0;
+
+    for (const recipient of recipients) {
+      // If CID publication failed earlier, fail every recipient with a
+      // uniform error. We don't fall back to inline silently — a caller
+      // who configured CID delivery may have meant to enforce that path.
+      if (cidPublishError !== null) {
+        recipientResults.push({
+          recipient,
+          success: false,
+          shape: '',
+          error: cidPublishError,
+        });
+        failed++;
+        continue;
+      }
+      try {
+        await deps.communications.sendDM(recipient, dmContent);
+        recipientResults.push({
+          recipient,
+          success: true,
+          shape: carBase64Inline !== null ? 'inline' : 'cid',
+        });
+        sent++;
+      } catch (err) {
+        // Common per-recipient failures: resolver miss (nametag not
+        // registered, no binding event), transport offline, relay
+        // rejection. Surface the message so callers can present it to
+        // the user without leaking SDK internals.
+        recipientResults.push({
+          recipient,
+          success: false,
+          shape: '',
+          error: err instanceof Error ? err.message : String(err),
+        });
+        failed++;
+      }
+    }
+
+    return {
+      invoiceId,
+      sent,
+      failed,
+      skippedSelf,
+      recipients: recipientResults,
+    };
   }
 
   /**
@@ -5530,8 +5853,163 @@ export class AccountingModule {
       this._processReceiptDM(message);
     } else if (content.startsWith('invoice_cancellation:')) {
       this._processCancellationDM(message);
+    } else if (content.startsWith(INVOICE_DELIVERY_DM_PREFIX)) {
+      // #226: per-invoice UXF-bundle delivery. Awaited so concurrent
+      // arrivals for the same invoice serialize on the importInvoice
+      // side-effects (token storage + ledger cache). Errors are swallowed
+      // inside `_processInvoiceDeliveryDM`; the try/catch here is
+      // defense-in-depth against programmer error.
+      try {
+        await this._processInvoiceDeliveryDM(message);
+      } catch (err) {
+        logger.warn(LOG_TAG, '_processInvoiceDeliveryDM threw unexpectedly:', err);
+      }
     }
-    // Neither prefix → regular DM, no action
+    // No recognized prefix → regular DM, no action
+  }
+
+  /**
+   * Parse and import an `invoice_delivery:` UXF-bundle DM (#226).
+   *
+   * Steps:
+   *   1. Apply DM-size guard (`MAX_INVOICE_DELIVERY_BYTES`).
+   *   2. JSON.parse the substring after the prefix.
+   *   3. Validate the {@link InvoiceDeliveryEnvelope} shape (type / version
+   *      / invoiceId / bundle discriminator).
+   *   4. For `uxf-car`: base64-decode the CAR bytes inline.
+   *      For `uxf-cid`: deferred to a follow-up; logs a warning and drops.
+   *   5. `UxfPackage.fromCar(carBytes)` then `pkg.assemble(invoiceId)` to
+   *      rebuild the TxfToken JSON.
+   *   6. Call {@link importInvoice} with the assembled token. The import
+   *      path owns full proof verification + token-type guard + ledger
+   *      insertion — no logic is duplicated here.
+   *   7. `INVOICE_ALREADY_EXISTS` is treated as benign (relay replay,
+   *      prior manual import, parallel deliverInvoice). All other
+   *      `SphereError` codes are logged and dropped — a single malicious
+   *      DM must NOT break the wider receive pipeline.
+   *
+   * @param message - DM whose content starts with `invoice_delivery:`.
+   */
+  private async _processInvoiceDeliveryDM(message: DirectMessage): Promise<void> {
+    const jsonSubstring = message.content.slice(INVOICE_DELIVERY_DM_PREFIX.length);
+
+    // Size guard — drop oversized DMs silently. Matches the swap
+    // module's `MAX_INVOICE_TOKEN_BYTES` philosophy: malformed input is
+    // an attacker concern, not a caller error.
+    if (jsonSubstring.length > MAX_INVOICE_DELIVERY_BYTES) return;
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(jsonSubstring);
+    } catch {
+      return; // malformed envelope JSON — drop, treat as regular DM
+    }
+
+    if (typeof parsed !== 'object' || parsed === null) return;
+    const raw = parsed as Record<string, unknown>;
+
+    if (raw['type'] !== 'invoice_delivery') return;
+
+    const version = raw['version'];
+    if (typeof version !== 'number' || !Number.isInteger(version) || version < 1) return;
+    if (version > 1) return; // forward-compat: silently ignore future versions
+
+    const invoiceId = raw['invoiceId'];
+    if (typeof invoiceId !== 'string' || !/^[0-9a-f]{64,68}$/.test(invoiceId)) return;
+
+    const bundle = raw['bundle'];
+    if (typeof bundle !== 'object' || bundle === null) return;
+    const bundleRecord = bundle as Record<string, unknown>;
+    const bundleKind = bundleRecord['kind'];
+    const bundleCid = bundleRecord['bundleCid'];
+    if (typeof bundleCid !== 'string' || bundleCid.length === 0) return;
+
+    let carBytes: Uint8Array | null = null;
+    if (bundleKind === 'uxf-car') {
+      const carBase64 = bundleRecord['carBase64'];
+      if (typeof carBase64 !== 'string' || carBase64.length === 0) return;
+      try {
+        // Strict-mode decode (rejects characters outside the base64
+        // alphabet) — same helper the payments instant-mode receiver
+        // uses on uxf-car payloads.
+        const { carBase64ToBytes } = await import('../../uxf/transfer-payload.js');
+        carBytes = carBase64ToBytes(carBase64);
+      } catch (err) {
+        logger.warn(
+          LOG_TAG,
+          `Invoice delivery ${invoiceId}: base64 decode failed (sender=${message.senderPubkey.slice(0, 16)})`,
+          err,
+        );
+        return;
+      }
+    } else if (bundleKind === 'uxf-cid') {
+      // CID-by-reference delivery requires an IPFS fetch path. The
+      // primary fetch infrastructure lives in PaymentsModule's
+      // `cidFetchGateways` + `acquireBundle` pipeline (issue #223). A
+      // future follow-up will share that fetch path; for now we log
+      // and drop so callers get visibility instead of silent failure.
+      logger.warn(
+        LOG_TAG,
+        `Invoice delivery ${invoiceId}: kind=uxf-cid not yet supported on the receiver — ` +
+          `caller must pin via deliverInvoice's inline path. bundleCid=${bundleCid.slice(0, 16)} ` +
+          `sender=${message.senderPubkey.slice(0, 16)}`,
+      );
+      return;
+    } else {
+      return; // unknown bundle.kind — silent drop, forward-compat
+    }
+
+    // Decode the UXF CAR and assemble the invoice token.
+    let assembledToken: unknown;
+    try {
+      const { UxfPackage } = await import('../../uxf/UxfPackage.js');
+      const pkg = await UxfPackage.fromCar(carBytes);
+      // Verify the bundle contains the claimed invoiceId. A hostile
+      // sender could ship a different invoice; reject rather than
+      // surprise-import an unrelated token.
+      if (!pkg.hasToken(invoiceId)) {
+        logger.warn(
+          LOG_TAG,
+          `Invoice delivery ${invoiceId}: CAR does not contain the claimed tokenId ` +
+            `(present: ${pkg.tokenIds().slice(0, 5).join(',')} ${pkg.tokenIds().length > 5 ? '…' : ''}) ` +
+            `sender=${message.senderPubkey.slice(0, 16)}`,
+        );
+        return;
+      }
+      assembledToken = pkg.assemble(invoiceId);
+    } catch (err) {
+      logger.warn(
+        LOG_TAG,
+        `Invoice delivery ${invoiceId}: UXF decode/assemble failed (sender=${message.senderPubkey.slice(0, 16)})`,
+        err,
+      );
+      return;
+    }
+
+    // Hand off to importInvoice. Same path swap uses for escrow
+    // deliveries — it owns proof verification, token-type guard, terms
+    // parse, storage, and ledger insertion.
+    try {
+      await this.importInvoice(assembledToken as TxfToken);
+      if (this.config.debug) {
+        logger.debug(
+          LOG_TAG,
+          `Invoice ${invoiceId}: imported from UXF delivery DM (sender=${message.senderPubkey.slice(0, 16)})`,
+        );
+      }
+    } catch (err) {
+      if (err instanceof SphereError && err.code === 'INVOICE_ALREADY_EXISTS') {
+        if (this.config.debug) {
+          logger.debug(LOG_TAG, `Invoice ${invoiceId}: already exists locally — delivery DM ignored`);
+        }
+        return;
+      }
+      logger.warn(
+        LOG_TAG,
+        `Invoice ${invoiceId}: import from UXF delivery DM failed (sender=${message.senderPubkey.slice(0, 16)})`,
+        err,
+      );
+    }
   }
 
   /**
