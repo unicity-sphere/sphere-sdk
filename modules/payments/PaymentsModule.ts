@@ -106,6 +106,7 @@ import {
   type UxfV1Payload,
   type ProcessTokenFn,
 } from './transfer/ingest-worker-pool';
+import type { AcquireBundleCidOptions } from './transfer/bundle-acquirer';
 import { ReplayLRU } from './transfer/replay-lru';
 import { PerTokenMutex } from '../../profile/per-token-mutex';
 // T.5.D — operator escape hatch (`importInclusionProof` +
@@ -1401,6 +1402,29 @@ export interface PaymentsModuleDependencies {
    * gateway-fetch 404.
    */
   publishToIpfs?: PublishToIpfsCallback;
+  /**
+   * Issue #223 — gateway list the auto-installed {@link IngestWorkerPool}
+   * walks (in order) to stream-fetch CARs for `kind: 'uxf-cid'`
+   * bundles. Without this list, an incoming `uxf-cid` payload causes
+   * `acquireBundle` to throw `BUNDLE_REJECTED_CID_MODE_NOT_YET_SUPPORTED`
+   * which the pool's `classifyAcquireError` silently swallows as a
+   * "hard bundle rejection" — no disposition, no token persisted, no
+   * surface error. Provide the SAME gateway list passed to
+   * `createUxfCarPublisher` so the sender's pin and the recipient's
+   * fetch target the same network.
+   *
+   * The default `Sphere.init({ ...providers })` factories
+   * (`createNodeProviders` / `createBrowserProviders`) populate this
+   * automatically from the IPFS sync config's gateway list. Consumers
+   * that install their own {@link IngestWorkerPool} via
+   * `installIngestWorkerPool()` still supply `cidOptions` themselves.
+   *
+   * Empty / undefined → the auto-installed pool runs without a
+   * gateway list and any `uxf-cid` arrival is dropped silently (same
+   * as pre-fix). This preserves backward compatibility for callers
+   * that explicitly opt out.
+   */
+  cidFetchGateways?: ReadonlyArray<string>;
 }
 
 // =============================================================================
@@ -3012,15 +3036,47 @@ export class PaymentsModule {
         }
       };
 
+      // Issue #223 — wire the recipient-side CID-fetch gateway list
+      // when the bootstrapping layer (Sphere / consumers) supplied one
+      // via `deps.cidFetchGateways`. Without this, every `uxf-cid`
+      // arrival was silently rejected with
+      // `BUNDLE_REJECTED_CID_MODE_NOT_YET_SUPPORTED` (logged at warn
+      // and dropped by `classifyAcquireError` as a "hard bundle
+      // rejection" — no token persisted, no surface error). Empty /
+      // undefined preserves the legacy drop-silent behaviour so opt-out
+      // consumers stay unchanged.
+      //
+      // **Critical wiring point (steelman fix on the initial #223 fix):**
+      // `cidOptions.emit` MUST be wired so the bundle-acquirer's
+      // uxf-cid branch can fire `transfer:fetch-failed` at W13 boundary
+      // when `fetchCarFromIpfs` exhausts. Without `emit`, the new code
+      // path's `cidOptions.emit?.(...)` is silently a no-op in
+      // production and operator dashboards see no signal when gateway
+      // fetches fail — exactly the kind of silent drop this PR is
+      // supposed to make observable.
+      const cidGateways = this.deps!.cidFetchGateways;
+      const cidOptions =
+        cidGateways && cidGateways.length > 0
+          ? {
+              gateways: [...cidGateways],
+              emit: ((event, payload) =>
+                this.deps!.emitEvent(event, payload)) as NonNullable<
+                  AcquireBundleCidOptions['emit']
+                >,
+            }
+          : undefined;
+
       this.ingestPool = new IngestWorkerPool({
         lru,
         perTokenMutex: mutex,
         processToken,
         emit: (event, payload) => this.deps!.emitEvent(event, payload),
+        cidOptions,
       });
       logger.debug(
         'Payments',
-        'Default IngestWorkerPool auto-installed (recipientUxf default-on)',
+        `Default IngestWorkerPool auto-installed (recipientUxf default-on, ` +
+        `cid-gateways=${cidGateways?.length ?? 0})`,
       );
     }
 

@@ -152,6 +152,16 @@ export interface NodeProviders {
    * CID-by-reference token delivery.
    */
   publishToIpfs?: PublishToIpfsCallback;
+  /**
+   * Issue #223 — recipient-side gateway list used to stream-fetch CARs
+   * for incoming `kind: 'uxf-cid'` bundles. Same gateways `publishToIpfs`
+   * uses, in the same order, so the sender's pin and the recipient's
+   * fetch target the same network. Forward to
+   * `Sphere.init({...providers})` so the auto-installed
+   * {@link IngestWorkerPool} can ingest `uxf-cid` events; without it,
+   * those events are silently dropped on receive.
+   */
+  cidFetchGateways?: ReadonlyArray<string>;
   /** Group chat config (resolved, for passing to Sphere.init) */
   groupChat?: GroupChatModuleConfig | boolean;
   /** Market module config (resolved, for passing to Sphere.init) */
@@ -278,11 +288,19 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
   // IpfsStorageConfig only exposes a `gateways` field on the inner
   // `config` block; fall back to DEFAULT_IPFS_GATEWAYS (which already
   // honors the SPHERE_IPFS_GATEWAY env override) when unset.
-  const publishToIpfs: PublishToIpfsCallback | undefined = ipfsSync?.enabled
-    ? createUxfCarPublisher(
-        ipfsSync.config?.gateways ?? [...DEFAULT_IPFS_GATEWAYS],
-      )
+  //
+  // Issue #223 — surface the same gateway list as `cidFetchGateways`
+  // so the recipient pipeline can stream-fetch incoming `uxf-cid`
+  // bundles. Without this, every `uxf-cid` event is silently dropped
+  // on receive (see PaymentsModule.cidFetchGateways doc).
+  const resolvedIpfsGateways = ipfsSync?.enabled
+    ? ipfsSync.config?.gateways ?? [...DEFAULT_IPFS_GATEWAYS]
     : undefined;
+  const publishToIpfs: PublishToIpfsCallback | undefined = resolvedIpfsGateways
+    ? createUxfCarPublisher(resolvedIpfsGateways)
+    : undefined;
+  const cidFetchGateways: ReadonlyArray<string> | undefined =
+    resolvedIpfsGateways;
 
   // Resolve group chat config
   const groupChat = resolveGroupChatConfig(network, config?.groupChat);
@@ -321,5 +339,6 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
     price: priceConfig ? createPriceProvider(priceConfig) : undefined,
     ipfsTokenStorage,
     publishToIpfs,
+    cidFetchGateways,
   };
 }

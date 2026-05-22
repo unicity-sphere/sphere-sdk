@@ -1654,6 +1654,15 @@ export class AddressTransportAdapter implements TransportProvider {
   private broadcastHandlers: Map<string, Set<BroadcastHandler>> = new Map();
   private eventCallbacks: Set<TransportEventCallback> = new Set();
   private pendingMessages: IncomingMessage[] = [];
+  // Issue #223 — cross-process Nostr delivery race. The relay's REQ response
+  // can land between `mux.addAddress()` (which subscribes) and
+  // `PaymentsModule.initialize()` (which calls `onTokenTransfer`). Without a
+  // queue, `dispatchTokenTransfer` would iterate an empty handler set and
+  // silently drop the event. Mirror the pre-existing `pendingMessages` pattern
+  // for token transfers and payment-request / payment-response events.
+  private pendingTransfers: IncomingTokenTransfer[] = [];
+  private pendingPaymentRequests: IncomingPaymentRequest[] = [];
+  private pendingPaymentRequestResponses: IncomingPaymentRequestResponse[] = [];
   private chatEoseHandlers: Array<() => void> = [];
 
   constructor(
@@ -1823,16 +1832,40 @@ export class AddressTransportAdapter implements TransportProvider {
 
   onTokenTransfer(handler: TokenTransferHandler): () => void {
     this.transferHandlers.add(handler);
+    // Issue #223 — drain pending transfers queued before any handler existed.
+    if (this.pendingTransfers.length > 0) {
+      const pending = this.pendingTransfers;
+      this.pendingTransfers = [];
+      for (const transfer of pending) {
+        try { handler(transfer); } catch (e) { logger.debug('MuxAdapter', 'Pending transfer drain error:', e); }
+      }
+    }
     return () => this.transferHandlers.delete(handler);
   }
 
   onPaymentRequest(handler: PaymentRequestHandler): () => void {
     this.paymentRequestHandlers.add(handler);
+    // Issue #223 — drain pending payment requests queued before any handler existed.
+    if (this.pendingPaymentRequests.length > 0) {
+      const pending = this.pendingPaymentRequests;
+      this.pendingPaymentRequests = [];
+      for (const request of pending) {
+        try { handler(request); } catch (e) { logger.debug('MuxAdapter', 'Pending payment request drain error:', e); }
+      }
+    }
     return () => this.paymentRequestHandlers.delete(handler);
   }
 
   onPaymentRequestResponse(handler: PaymentRequestResponseHandler): () => void {
     this.paymentRequestResponseHandlers.add(handler);
+    // Issue #223 — drain pending payment responses queued before any handler existed.
+    if (this.pendingPaymentRequestResponses.length > 0) {
+      const pending = this.pendingPaymentRequestResponses;
+      this.pendingPaymentRequestResponses = [];
+      for (const response of pending) {
+        try { handler(response); } catch (e) { logger.debug('MuxAdapter', 'Pending payment response drain error:', e); }
+      }
+    }
     return () => this.paymentRequestResponseHandlers.delete(handler);
   }
 
@@ -1935,8 +1968,13 @@ export class AddressTransportAdapter implements TransportProvider {
   }
 
   async fetchPendingEvents(): Promise<void> {
-    // Fetching is handled by subscription — no-op for mux-based adapters
-    // The mux subscription already includes this address's pubkey
+    // Issue #223 — backstop for cases where the persistent subscription
+    // missed events (e.g. relay disconnect/reconnect, or — in older builds
+    // before the pending-queue fix — race between subscribe and handler
+    // registration). Delegates to the mux's bounded one-shot fetch which
+    // walks the same handleEvent dispatch chain (mux-level dedup prevents
+    // double-processing with the live subscription).
+    await this.mux.fetchPendingEvents();
   }
 
   onChatReady(handler: () => void): () => void {
@@ -1958,18 +1996,35 @@ export class AddressTransportAdapter implements TransportProvider {
   }
 
   dispatchTokenTransfer(transfer: IncomingTokenTransfer): void {
+    // Issue #223 — queue if no handler is registered yet. The relay can push
+    // events between mux.addAddress (which subscribes) and PaymentsModule.
+    // initialize (which calls onTokenTransfer); without the queue this fires
+    // into an empty Set and the event is lost. Mirrors the dispatchMessage /
+    // pendingMessages pattern.
+    if (this.transferHandlers.size === 0) {
+      this.pendingTransfers.push(transfer);
+      return;
+    }
     for (const handler of this.transferHandlers) {
       try { handler(transfer); } catch (e) { logger.debug('MuxAdapter', 'Transfer handler error:', e); }
     }
   }
 
   dispatchPaymentRequest(request: IncomingPaymentRequest): void {
+    if (this.paymentRequestHandlers.size === 0) {
+      this.pendingPaymentRequests.push(request);
+      return;
+    }
     for (const handler of this.paymentRequestHandlers) {
       try { handler(request); } catch (e) { logger.debug('MuxAdapter', 'Payment request handler error:', e); }
     }
   }
 
   dispatchPaymentRequestResponse(response: IncomingPaymentRequestResponse): void {
+    if (this.paymentRequestResponseHandlers.size === 0) {
+      this.pendingPaymentRequestResponses.push(response);
+      return;
+    }
     for (const handler of this.paymentRequestResponseHandlers) {
       try { handler(response); } catch (e) { logger.debug('MuxAdapter', 'Payment response handler error:', e); }
     }

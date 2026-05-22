@@ -67,17 +67,47 @@ interface MockGateway {
 }
 
 async function startMockGateway(): Promise<MockGateway> {
-  const pins = new Map<string, Uint8Array>();
+  // Per-block index — populated automatically when `put()` is called.
+  // The receiver now uses `fetchCarFromIpfs` (per-block walk) instead
+  // of `?format=car` (issue #223), so the gateway MUST serve
+  // `/api/v0/block/get?arg=<cid>` for each block in every pinned CAR.
+  const pins = new Map<string, Uint8Array>(); // root CID → full CAR (legacy ?format=car endpoint)
+  const blocks = new Map<string, Uint8Array>(); // each block CID → block bytes
+  // Lazy import: CarReader is async-iterable and we parse on each
+  // put() call. We cache the readers so put() stays synchronous from
+  // the test's POV (puts that get extracted async).
+  const { CarReader } = await import('@ipld/car');
+  const indexCarBlocks = async (carBytes: Uint8Array): Promise<void> => {
+    const reader = await CarReader.fromBytes(carBytes);
+    for await (const block of reader.blocks()) {
+      blocks.set(block.cid.toString(), block.bytes);
+    }
+  };
   const server: Server = createServer((req, res) => {
     if (!req.url) {
       res.statusCode = 400;
       res.end();
       return;
     }
-    // Match `/ipfs/{cid}` ignoring query string (we accept any
-    // `?format=car` or absence-of-query — the body is always served as
-    // `application/vnd.ipld.car`, matching real Trustless Gateway
-    // behavior).
+    // ---- /api/v0/block/get?arg=<cid> — used by fetchCarFromIpfs ----
+    const blockMatch = /^\/api\/v0\/block\/get\?arg=([^&]+)/.exec(req.url);
+    if (blockMatch) {
+      const cid = decodeURIComponent(blockMatch[1]!);
+      const bytes = blocks.get(cid);
+      if (!bytes) {
+        res.statusCode = 404;
+        res.end();
+        return;
+      }
+      res.statusCode = 200;
+      res.setHeader('content-type', 'application/octet-stream');
+      res.setHeader('content-length', String(bytes.byteLength));
+      res.end(Buffer.from(bytes));
+      return;
+    }
+    // ---- /ipfs/{cid}?format=car — legacy Trustless Gateway path
+    //      (kept for tests that explicitly probe this endpoint;
+    //      production no longer goes through it for uxf-cid). ----
     const m = /^\/ipfs\/([^?/#]+)(?:\?.*)?$/.exec(req.url);
     if (!m) {
       res.statusCode = 404;
@@ -99,15 +129,28 @@ async function startMockGateway(): Promise<MockGateway> {
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const addr = server.address() as AddressInfo;
   const url = `http://127.0.0.1:${addr.port}`;
+
+  // Track pending indexing operations so close() can flush.
+  let pendingIndex: Promise<void> = Promise.resolve();
   return {
     url,
     put: (cid, carBytes) => {
       pins.set(cid, carBytes);
+      // Parse the CAR and index every block under /api/v0/block/get.
+      // Test scenarios that call put() expect the gateway to serve the
+      // pinned content IMMEDIATELY; we chain the index promise so that
+      // a subsequent close() will wait for the parse to finish.
+      pendingIndex = pendingIndex.then(() => indexCarBlocks(carBytes));
     },
     unpin: (cid) => {
+      // Unpinning the CAR root unpins the root block. Other blocks
+      // remain reachable; tests that need to invalidate them must do
+      // so explicitly. This matches real-IPFS unpinning semantics.
       pins.delete(cid);
+      blocks.delete(cid);
     },
     close: async () => {
+      await pendingIndex;
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));
       });

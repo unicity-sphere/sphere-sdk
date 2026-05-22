@@ -82,6 +82,7 @@
  */
 
 import { SphereError } from '../../../core/errors.js';
+import { sanitizeReasonString } from '../../../core/error-sanitize.js';
 import type { UxfTransferPayload } from '../../../types/uxf-transfer.js';
 import {
   isUxfTransferPayloadCar,
@@ -98,11 +99,18 @@ import {
   verifyBundleStructure,
   type VerifiedBundle,
 } from './bundle-verifier.js';
-import {
-  fetchCarByCid,
-  type CidFetcherEmit,
-  type CidFetcherFetch,
+import type {
+  CidFetcherEmit,
+  CidFetcherFetch,
 } from './cid-fetcher.js';
+// NOTE — `fetchCarByCid` is no longer the uxf-cid fetch primitive (see
+// Issue #223 inline comment in the uxf-cid branch below). It remains
+// exported from `./cid-fetcher` for any legacy caller / future
+// streaming-CAR consumer; UXF transfer bundles route through
+// `fetchCarFromIpfs` instead because the gateway's `?format=car`
+// endpoint cannot traverse Option-C raw-bstr child references.
+import { fetchCarFromIpfs } from '../../../profile/ipfs-client.js';
+import { ProfileError } from '../../../profile/errors.js';
 import { RELAY_SAFE_CAP_BYTES } from './limits.js';
 import type { ReplayLRU } from './replay-lru.js';
 
@@ -591,38 +599,103 @@ async function doAcquireBundle(
         'BUNDLE_REJECTED_CID_MODE_NOT_YET_SUPPORTED',
       );
     }
-    // The fetcher emits `transfer:fetch-failed` and throws
-    // BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT on all-gateways-fail. It
-    // ALSO internally verifies the root CID matches `payload.bundleCid`.
+    // Issue #223 — switch the uxf-cid fetch from the trustless-gateway
+    // CAR endpoint (`?format=car`) to the hierarchical block-walking
+    // fetcher (`profile/ipfs-client.ts:fetchCarFromIpfs`).
     //
-    // **Steelman fix (Wave 3) — defense-in-depth re-extract.** Even
-    // though `fetchCarByCid` performs an internal `extractCarRootCid`
-    // equality check, we re-extract the CID here at the bundle-acquirer
-    // boundary so the recipient pipeline does NOT trust the fetcher's
-    // internal verification. Two scenarios this catches:
+    // **Why the switch is necessary.** The sender pins every UXF block
+    // individually via `dag/put` (`profile/ipfs-client.ts:pinCarBlocksToIpfs`).
+    // Under Issue #213's Option-C canonical encoding, child references
+    // inside UXF element blocks are stored as raw 32-byte bstrs — NOT
+    // as standard CBOR Tag 42 CID links — so that
+    // `sha256(block.bytes) === block.cid.multihash.digest` holds for
+    // every sub-block. The gateway's `?format=car` DAG traversal can
+    // only follow Tag 42 CID links, so it returns only the root +
+    // envelope + manifest and stops there. The receiver sees a CAR
+    // missing every UXF element sub-block and `pkg.verify()` throws
+    // `MISSING_ELEMENT` (`uxf/verify.ts:241`), which
+    // `IngestWorkerPool.classifyAcquireError` silently swallows as a
+    // hard bundle rejection — the transfer is invisible.
     //
-    //   1. A future refactor that bypasses or loosens the fetcher's
-    //      CID-equality check (e.g. a debug code path that swallows
-    //      the mismatch outcome and forwards the bytes anyway).
-    //   2. A loose comparison creeping in at the fetcher boundary
-    //      (TS strict mode catches `===` regression but a `String()`
-    //      coercion cast could still hide a real mismatch).
+    // `fetchCarFromIpfs` is the symmetric consumer for the producer's
+    // per-block pin path: it parses the root, walks UXF-aware element
+    // children (`isUxfElement` / `walkUxfElement`), fetches each block
+    // via `block/get`, and reassembles a CAR. The result is a CAR
+    // that `UxfPackage.fromCar` and `pkg.verify` will accept.
     //
-    // The fetcher's per-gateway check stays in place (so we still walk
-    // to the next gateway on a mismatch); the boundary check below is
-    // the canonical authority for "extractedCid actually came from
-    // these bytes". Cost: one extra CARv1 header parse per delivered
-    // bundle — negligible vs the streaming fetch + bundle verification
-    // that follow.
-    const fetched = await fetchCarByCid(payload.bundleCid, {
-      gateways: cidOptions.gateways,
-      senderTransportPubkey: senderPubkey,
-      fetch: cidOptions.fetch,
-      emit: cidOptions.emit,
-      signal: cidOptions.signal,
-      maxBytes: cidOptions.maxBytes,
-    });
-    carBytes = fetched.carBytes;
+    // **Trade-offs vs `fetchCarByCid` (which is still kept for legacy
+    // callers and as the streaming-fetch primitive):**
+    //   - Per-block fetches instead of one streaming gateway hit (more
+    //     round-trips, but each is a small `block/get` and capped by
+    //     `FETCH_CAR_MAX_BLOCKS`).
+    //   - `transfer:fetch-failed` event — fired below from this
+    //     boundary when `fetchCarFromIpfs` throws (mirrors the W13
+    //     telemetry contract that `fetchCarByCid` honored from inside).
+    //   - No caller AbortSignal pass-through — the worker pool's
+    //     per-bundle wall-clock budget still applies via
+    //     `BUNDLE_MAX_PROCESSING_MS` in the dispatcher.
+    //
+    // Defense-in-depth: we still re-extract the root CID from the
+    // reassembled bytes and compare against `payload.bundleCid` below.
+    try {
+      carBytes = await fetchCarFromIpfs(
+        [...cidOptions.gateways],
+        payload.bundleCid,
+      );
+    } catch (cause) {
+      // Steelman fix on the initial #223 fix — the narrow
+      // `instanceof ProfileError && code === BUNDLE_NOT_FOUND` catch
+      // let plain `Error` / `TypeError` / dynamic-import failures /
+      // `validateGatewayUrls` throws / `walkUxfElement` errors escape
+      // uncaught into `IngestWorkerPool.classifyAcquireError`. That
+      // path logs at warn and silently drops the bundle — exactly the
+      // failure mode this PR is supposed to make observable.
+      //
+      // Now: ANY throw from `fetchCarFromIpfs` is treated as a
+      // bundle-level acquire failure. We emit the W13
+      // `transfer:fetch-failed` event so operator dashboards see the
+      // gateway-walk failure regardless of root cause, then re-wrap
+      // as `BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT` (the canonical
+      // bundle-acquirer transient — W13: NO disposition record, the
+      // worker pool's `classifyAcquireError` short-circuits via this
+      // code).
+      //
+      // Diagnostic strings are passed through `sanitizeReasonString`
+      // (W40-style alignment): strip control chars + HTML markup,
+      // truncate code-point-aware, drop lone surrogates. The old
+      // `fetchCarByCid` sanitized; the new path was missing this. A
+      // hostile gateway returning `Error("<script>...")` would
+      // otherwise propagate to `transfer:fetch-failed.failureReasons`
+      // and downstream operator dashboards verbatim.
+      const causeMessage =
+        cause instanceof Error
+          ? cause.message
+          : typeof cause === 'string'
+            ? cause
+            : '(unknown error)';
+      const safeReason = sanitizeReasonString(causeMessage);
+      cidOptions.emit?.('transfer:fetch-failed', {
+        bundleCid: payload.bundleCid,
+        senderTransportPubkey: senderPubkey,
+        gatewaysAttempted: [...cidOptions.gateways],
+        failureReasons: [`block-walk-failed: ${safeReason}`],
+      });
+      throw new SphereError(
+        `acquireBundle: fetchCarFromIpfs failed for ${payload.bundleCid}: ${safeReason}`,
+        'BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT',
+        {
+          bundleCid: payload.bundleCid,
+          gatewaysAttempted: [...cidOptions.gateways],
+          reason: 'block-walk-failed',
+          // Preserve original code/name for telemetry consumers that
+          // care about the upstream classification (e.g., distinguishing
+          // ProfileError BUNDLE_NOT_FOUND from a TypeError).
+          upstreamErrorClass: cause instanceof Error ? cause.constructor.name : typeof cause,
+          upstreamErrorCode:
+            cause instanceof ProfileError ? cause.code : undefined,
+        },
+      );
+    }
     // Re-extract from the bytes (NOT trusting the fetcher's claim).
     // `extractCarRootCid` throws BUNDLE_REJECTED_INVALID_CAR /
     // BUNDLE_REJECTED_MULTI_ROOT — correct surface-level errors at
