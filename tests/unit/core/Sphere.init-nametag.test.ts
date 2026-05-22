@@ -25,6 +25,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { Sphere } from '../../../core/Sphere';
 import { FileStorageProvider } from '../../../impl/nodejs/storage/FileStorageProvider';
@@ -33,9 +34,24 @@ import type { TransportProvider, OracleProvider } from '../../../index';
 import type { ProviderStatus } from '../../../types';
 import { mockMintNametagSuccess } from '../../helpers/mockMintNametag';
 
-const TEST_DIR = path.join(__dirname, '.test-init-nametag');
-const DATA_DIR = path.join(TEST_DIR, 'data');
-const TOKENS_DIR = path.join(TEST_DIR, 'tokens');
+// Per-test unique directory (Date.now() + random suffix). The previous
+// shared `path.join(__dirname, '.test-init-nametag')` triggered
+// intermittent "Wallet already exists" failures under full-suite
+// worker contention (#217), same family as the flake fixed for
+// `Sphere.test.ts` in commit `9bf3e90`. Issuing each test its own
+// tmpdir eliminates FS-level interference between tests in this file.
+let TEST_DIR: string = '';
+let DATA_DIR: string = '';
+let TOKENS_DIR: string = '';
+
+function freshTestDirs(): void {
+  TEST_DIR = path.join(
+    os.tmpdir(),
+    `sphere-init-nametag-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+  );
+  DATA_DIR = path.join(TEST_DIR, 'data');
+  TOKENS_DIR = path.join(TEST_DIR, 'tokens');
+}
 
 function createMockTransport(): TransportProvider {
   return {
@@ -96,7 +112,7 @@ describe('Sphere.init({ nametag }) on existing wallet (Bug A)', () => {
   let mintSpy: ReturnType<typeof vi.spyOn> | undefined;
 
   beforeEach(async () => {
-    cleanTestDir();
+    freshTestDirs();
     if (Sphere.getInstance()) {
       (Sphere as unknown as { instance: null }).instance = null;
     }

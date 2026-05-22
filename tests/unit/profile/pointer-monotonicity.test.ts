@@ -411,18 +411,27 @@ describe('pointer monotonicity invariant', () => {
     // flush later bumped `tracker.pinCalls` while the NEXT test was
     // running (cascading into "race-stale flush" failing with
     // pinCalls=1 vs expected 0).
-    await vi.waitFor(() => {
-      expect(tracker.pinCalls).toBe(1);
-    }, { timeout: 5000, interval: 25 });
+    //
+    // Issue #217: bumping the `vi.waitFor(pinCalls === N)` budget
+    // alone was insufficient because the assertion still races with
+    // the OrbitDB bundle write that happens AFTER the pin (see
+    // `flush-scheduler.ts` step-6: `pinCarBlocksToIpfs` →
+    // `bundleIndex.addBundle`). `pinCalls === N` was observed mid-
+    // flush in run 6/10, then `bundleKeys.length === N` failed because
+    // the addBundle call hadn't landed yet. Switch to
+    // `waitForFlushSettled`, which waits for the whole flush body
+    // (pin + OrbitDB write + IPNS pointer + operational state) to
+    // resolve. The pinCalls equality is preserved as a sanity check.
+    await waitForFlushSettled(provider, 10000);
+    expect(tracker.pinCalls).toBe(1);
 
     // V2: save() with {T1, T2} — strict superset.
     const tokenT2 = { id: '_T2', genesis: { tokenId: 'T2' } };
     const v2 = buildTxfData({ _T1: tokenT1, _T2: tokenT2 });
     await provider.save(v2);
 
-    await vi.waitFor(() => {
-      expect(tracker.pinCalls).toBe(2);
-    }, { timeout: 5000, interval: 25 });
+    await waitForFlushSettled(provider, 10000);
+    expect(tracker.pinCalls).toBe(2);
 
     // Both bundles registered in OrbitDB.
     const bundleKeys = [...db._store.keys()].filter((k) =>
