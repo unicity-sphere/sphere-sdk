@@ -2,6 +2,8 @@
 
 Ask another user to pay you, and track whether they did. A payment request is a message, not a charge — the other side chooses to accept, pay, or reject it.
 
+> This page documents the high‑level `sphere.payments.*` API. A lower‑level path also exists on the transport (`sphere.getTransport().onPaymentRequest()` / `sendPaymentRequestResponse()`) — some integrations use it directly for finer control over sender plumbing and custom response types.
+
 ## Sending a request
 
 ```typescript

@@ -6,11 +6,13 @@ Sphere is configured by **providers** — pluggable backends for storage, messag
 
 A network name configures every service at once.
 
-| Network | Aggregator | Messaging relay | Fulcrum (ALPHA) |
-|---|---|---|---|
-| `mainnet` | aggregator.unicity.network | relay.unicity.network | fulcrum.unicity.network:50004 |
-| `testnet` | goggregator-test.unicity.network | nostr-relay.testnet.unicity.network | fulcrum.unicity.network:50004 |
-| `dev` | dev-aggregator.dyndns.org | nostr-relay.testnet.unicity.network | fulcrum.unicity.network:50004 |
+Values below are from `constants.ts` (the source of truth). Note the `/rpc` suffix on mainnet/dev aggregators but **not** testnet.
+
+| Network | Aggregator | Messaging relay | Fulcrum (ALPHA) | Group‑chat relay |
+|---|---|---|---|---|
+| `mainnet` | aggregator.unicity.network/rpc | relay.unicity.network | fulcrum.unicity.network:50004 | sphere-relay.unicity.network |
+| `testnet` | goggregator-test.unicity.network | nostr-relay.testnet.unicity.network | fulcrum.unicity.network:50004 | sphere-relay.unicity.network |
+| `dev` | dev-aggregator.dyndns.org/rpc | nostr-relay.testnet.unicity.network | fulcrum.unicity.network:50004 | sphere-relay.unicity.network |
 
 ```typescript
 // Use a preset

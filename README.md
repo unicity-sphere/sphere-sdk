@@ -54,7 +54,7 @@ import { createBrowserProviders } from '@unicitylabs/sphere-sdk/impl/browser';
 const { sphere, created, generatedMnemonic } = await Sphere.init({
   ...createBrowserProviders({ network: 'testnet' }),
   autoGenerate: true,   // make a new wallet if one doesn't exist yet
-  nametag: 'alice',     // claim @alice so people can pay you by name
+  nametag: 'alice',     // claim @alice (receiving via @name also needs an on-chain mint — see docs/NAMETAGS.md)
 });
 
 // 2. First run? Show the user their recovery phrase to back up.
@@ -65,7 +65,7 @@ if (created && generatedMnemonic) {
 // 3. Who am I?
 console.log('My handle: @' + sphere.identity?.nametag);
 
-// 4. Send 1 token to @bob
+// 4. Send 1,000,000 base units to @bob (= 1 UCT when the token has 6 decimals)
 await sphere.payments.send({
   recipient: '@bob',
   coinId: 'UCT',       // which token to send
