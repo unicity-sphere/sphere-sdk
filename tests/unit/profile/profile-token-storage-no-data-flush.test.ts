@@ -339,10 +339,18 @@ describe('ProfileTokenStorageProvider — no-data flush on remote update', () =>
     );
 
     db._triggerReplication();
-    // handleReplication is async and detached — wait for microtasks.
-    await new Promise((r) => setTimeout(r, 50));
-
-    expect(spy).toHaveBeenCalledTimes(1);
+    // Issue #215: `handleReplication` is async + detached and awaits
+    // `this.load()` inside, which iterates `fetchCarFromIpfs` calls per
+    // active bundle. Under full-suite contention the chain can take
+    // 150+ ms before `scheduleFlushNoData` is reached — the original
+    // 50 ms fixed wait expired before the call landed, the assertion
+    // failed, and the still-in-flight `handleReplication` leaked async
+    // work into the next test. Poll via `vi.waitFor` so the test
+    // tolerates contention without burning real wall time when the
+    // call lands quickly (the normal case).
+    await vi.waitFor(() => {
+      expect(spy).toHaveBeenCalledTimes(1);
+    }, { timeout: 5000, interval: 25 });
 
     await provider.shutdown();
   });
