@@ -493,7 +493,19 @@ export function createProfileProviders(
         });
       },
       pin: (carBytes, expectedRootCid) =>
-        pinCarBlocksToIpfs(ipfsGateways, carBytes, expectedRootCid),
+        // Issue #236 — write each block to the local Helia blockstore
+        // before the HTTP pin so the snapshot CID is locally readable
+        // by the time `pin()` returns, regardless of gateway
+        // propagation. `db.getHelia?.()` returns `null` for adapters
+        // that predate issue #236, in which case the HTTP-only path
+        // continues to apply.
+        pinCarBlocksToIpfs(
+          ipfsGateways,
+          carBytes,
+          expectedRootCid,
+          undefined,
+          db.getHelia?.(),
+        ),
       // Phase D.1a — route the snapshot CID publish through the
       // provider's LifecycleManager so it picks up retry / error-
       // classification / pending-publish-marker machinery. The legacy
@@ -675,10 +687,24 @@ export function createProfileProviders(
     // entries in per-group sub-blocks linked from the root by CID. We
     // pass a fetcher closure so the parser can pull each sub-block
     // from IPFS lazily; v2 single-block snapshots ignore the fetcher.
-    const rootBlockBytes = await fetchFromIpfs(ipfsGateways, cidString);
+    // Issue #236 — pass the local Helia handle so the snapshot's root
+    // block (and any sub-blocks for hierarchical v3 snapshots) is read
+    // from the local on-disk blockstore first when available. The
+    // periodic-poll and cold-start recovery paths share the same
+    // accessor as the bundle load path: cross-process snapshot apply
+    // becomes deterministic, cross-device apply falls back to HTTP.
+    const helia = db.getHelia?.();
+    const rootBlockBytes = await fetchFromIpfs(
+      ipfsGateways,
+      cidString,
+      undefined,
+      undefined,
+      helia,
+    );
     const snapshot = await parseLeanProfileSnapshotFromRootBlock(
       rootBlockBytes,
-      (subBlockCid) => fetchFromIpfs(ipfsGateways, subBlockCid),
+      (subBlockCid) =>
+        fetchFromIpfs(ipfsGateways, subBlockCid, undefined, undefined, helia),
     );
     return dispatchParsedSnapshot(snapshot);
   });

@@ -21,7 +21,168 @@ import { sha256 } from '@noble/hashes/sha2.js';
 import { CID } from 'multiformats/cid';
 import * as raw from 'multiformats/codecs/raw';
 import { create as createMultihash } from 'multiformats/hashes/digest';
+import { logger } from '../core/logger.js';
 import { ProfileError } from './errors.js';
+
+// =============================================================================
+// Issue #236 — Local-Helia primary blockstore
+// =============================================================================
+
+/**
+ * Minimal structural shape of the Helia blockstore surface used by this
+ * module. Declared locally so this file does not take a direct dependency
+ * on `helia` types — callers pass the value returned by
+ * `ProfileDatabase.getHelia()` (typed as `unknown`) and we cast inside.
+ */
+interface HeliaLike {
+  readonly blockstore: {
+    get(cid: CID, options?: unknown): Promise<Uint8Array>;
+    put(cid: CID, bytes: Uint8Array, options?: unknown): Promise<unknown>;
+    has?(cid: CID, options?: unknown): Promise<boolean>;
+  };
+}
+
+/**
+ * Narrow an `unknown` (the return of `ProfileDatabase.getHelia()`) into a
+ * usable `HeliaLike` handle. Defensive — returns `null` if the value does
+ * not expose the minimal `blockstore.get/put` surface we need so a
+ * misconfigured adapter cannot crash the pin/fetch paths.
+ */
+function asHelia(value: unknown): HeliaLike | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'object') return null;
+  const obj = value as { blockstore?: unknown };
+  if (!obj.blockstore || typeof obj.blockstore !== 'object') return null;
+  const bs = obj.blockstore as { get?: unknown; put?: unknown };
+  if (typeof bs.get !== 'function' || typeof bs.put !== 'function') return null;
+  return value as HeliaLike;
+}
+
+/**
+ * Best-effort write of a single block into the local Helia blockstore.
+ *
+ * Issue #236 — closes the gateway-propagation window. On the same
+ * `dataDir`, the second process re-opens Helia with the same on-disk
+ * blockstore directory and can read the block synchronously via
+ * `blockstore.get` without waiting for HTTP gateway propagation
+ * (~15s on testnet).
+ *
+ * Failures are LOGGED and SWALLOWED — local blockstore I/O issues
+ * (full disk, lock contention, etc.) must not abort an otherwise-
+ * successful HTTP pin. The fallback is the pre-#236 behaviour: the
+ * caller's next-process load() reads via HTTP gateways, which becomes
+ * available once propagation completes.
+ *
+ * @returns `true` if the local write succeeded, `false` on any error
+ *          (logged via `logger.warn`). The return is informational
+ *          (callers use it for tests); pin/fetch flow does not branch
+ *          on the result.
+ */
+async function putBlockToLocalHelia(
+  helia: HeliaLike,
+  cidString: string,
+  blockBytes: Uint8Array,
+): Promise<boolean> {
+  let parsed: CID;
+  try {
+    parsed = CID.parse(cidString);
+  } catch (err) {
+    logger.warn(
+      'ipfs-client',
+      `local-helia put: cannot parse CID ${cidString}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
+  }
+  try {
+    await helia.blockstore.put(parsed, blockBytes);
+    return true;
+  } catch (err) {
+    logger.warn(
+      'ipfs-client',
+      `local-helia put failed for ${cidString} (continuing with HTTP pin): ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
+  }
+}
+
+/**
+ * Try to satisfy a block fetch from the local Helia blockstore.
+ *
+ * Issue #236 — fast-path that skips HTTP gateways entirely when the
+ * block is locally available (same-process cache hit OR cross-process
+ * restart on the same `dataDir` where Helia's on-disk blockstore
+ * persists).
+ *
+ * **Content verification (steelman remediation).** Helia's blockstore
+ * is content-KEYED but NOT content-VERIFIED: `blockstore.put(cid, X)`
+ * stores `X` under `cid` regardless of whether
+ * `sha256(X) === cid.multihash.digest`. A corrupted on-disk store
+ * (filesystem-level bit flip, partial-write crash residue, a malicious
+ * party with disk access) could surface bytes that don't match the
+ * requested CID. Without verification on read, garbage propagates to
+ * downstream parsers and surfaces as an opaque "decode failed" error
+ * far from the root cause. We re-instate the same content-address
+ * check the HTTP path applies to gateway responses: on mismatch we LOG
+ * and return `null` so the caller falls through to the HTTP gateway
+ * loop — which either delivers an honest copy or surfaces a hard
+ * `BUNDLE_NOT_FOUND` with full diagnostics. The cost is a single
+ * `sha256(bytes)` per local read, dwarfed by the eliminated HTTP
+ * round-trip on a clean cache hit.
+ *
+ * @returns the block bytes on a verified local hit, `null` when the
+ *          block is absent, the local read errored, or the bytes
+ *          failed CID-binding verification (caller continues with HTTP).
+ */
+async function tryGetBlockFromLocalHelia(
+  helia: HeliaLike,
+  cidString: string,
+): Promise<Uint8Array | null> {
+  let parsed: CID;
+  try {
+    parsed = CID.parse(cidString);
+  } catch {
+    return null;
+  }
+  let bytes: Uint8Array;
+  try {
+    const got = await helia.blockstore.get(parsed);
+    if (!(got instanceof Uint8Array) || got.byteLength === 0) {
+      // Defensive: helia returned a non-Uint8Array (extreme edge case)
+      // OR an empty-byte block — treat as a miss so the gateway loop
+      // runs. A zero-length block is never legitimate in our schema
+      // (every dag-cbor envelope and raw payload carries non-empty
+      // bytes), so the fall-through is safe.
+      return null;
+    }
+    bytes = got;
+  } catch {
+    // Block not present locally (helia throws ERR_NOT_FOUND) — caller
+    // continues with the HTTP gateway loop. Other internal errors also
+    // route through this miss path so a transient local-store glitch
+    // does not block recovery via HTTP.
+    return null;
+  }
+
+  // Steelman remediation — verify the bytes hash to the requested CID.
+  // Catches: ext4/zfs silent corruption, partial-write crash residue,
+  // disk-side tampering, or a regression in our own writer that lets a
+  // CID/bytes mismatch slip past `pinCarBlocksToIpfs`'s pin-time
+  // verifier. On mismatch: log once, return null, fall through to
+  // gateways (which apply their own verification on gateway-returned
+  // bytes — see `verifyCidMatchesBytes` in `fetchFromIpfs`).
+  try {
+    verifyCidMatchesBytes(cidString, bytes);
+  } catch (err) {
+    logger.warn(
+      'ipfs-client',
+      `local-helia get returned bytes whose sha256 does NOT match ${cidString} ` +
+        `(likely on-disk corruption); falling through to HTTP gateways: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return null;
+  }
+  return bytes;
+}
 
 // SHA-256 multihash code (multiformats `sha2-256`).
 const MULTIHASH_SHA256 = 0x12;
@@ -282,10 +443,23 @@ async function pinSingleBlock(
  * verification continues via `fetchFromIpfs` (CID-binding check
  * against gateway-returned bytes).
  *
+ * Issue #236 — when `helia` is supplied (the local Helia node managed by
+ * the `OrbitDbAdapter`), each block is written to the local on-disk
+ * blockstore BEFORE the HTTP gateway round-trip. This guarantees the
+ * block is locally readable by the time `pinCarBlocksToIpfs` returns,
+ * which closes the cross-process recovery window that previously
+ * depended on HTTP gateway propagation (observed at ~15s on testnet).
+ * Local writes are best-effort: failures are logged and the HTTP pin
+ * proceeds unchanged. Callers without a local Helia (no on-disk
+ * persistence, or test stubs) omit the argument and pay the gateway
+ * propagation lag as before.
+ *
  * @param gateways          - Array of IPFS gateway base URLs
  * @param carBytes          - CAR file bytes to import block-by-block
  * @param expectedRootCid   - The root CID claimed by the CAR header
  * @param timeoutMs         - Timeout per gateway+block (default: 60 000)
+ * @param helia             - Optional local Helia node (see issue #236).
+ *                            Pass the result of `OrbitDbAdapter.getHelia()`.
  * @returns The `expectedRootCid` on success.
  * @throws {ProfileError} `ORBITDB_WRITE_FAILED` if all gateways fail to
  *         accept a pin or the CAR doesn't contain the expected root.
@@ -295,7 +469,9 @@ export async function pinCarBlocksToIpfs(
   carBytes: Uint8Array,
   expectedRootCid: string,
   timeoutMs: number = DEFAULT_PIN_TIMEOUT_MS,
+  helia?: unknown,
 ): Promise<string> {
+  const localHelia = asHelia(helia);
   // Parse the CAR locally to extract each block. Done up front so a
   // malformed CAR fails fast before any network round-trips.
   const { CarReader } = await import('@ipld/car');
@@ -358,7 +534,51 @@ export async function pinCarBlocksToIpfs(
   // whole import: callers MUST see "all blocks pinned" or "publish
   // failed" — never a partial import that would leave the rootCid
   // pointing into a hole.
+  //
+  // Issue #236 — when a local Helia handle is supplied, write each
+  // block to its on-disk blockstore BEFORE the HTTP pin. This makes
+  // the block readable to a subsequent same-`dataDir` process via
+  // `blockstore.get` regardless of HTTP gateway propagation. Local
+  // failures are logged and swallowed (the HTTP path remains the
+  // source of truth for replication and cross-device recovery).
+  //
+  // Steelman remediation (#236 follow-up): Helia's blockstore is
+  // content-KEYED, not content-VERIFIED — `blockstore.put(cid, X)`
+  // stores `X` under `cid` regardless of `sha256(X) ===
+  // cid.multihash.digest`. Pre-#236 a builder bug emitting a CAR with
+  // a framed CID that didn't match its bytes was masked by Kubo's
+  // server-side recompute (the gateway stored under the truthful CID
+  // and the published lie-CID became unreachable, surfacing as a clear
+  // `BUNDLE_NOT_FOUND` at fetch time). The #236 fast-path bypasses
+  // that implicit guard: a lie would silently cache locally and survive
+  // the read path's verification on a future cross-process load.
+  //
+  // We re-instate the guard explicitly: every block is checked against
+  // `sha256(bytes) === cid.multihash.digest` BEFORE the local put.
+  // On mismatch we SKIP the local put for that block (so we never
+  // poison the on-disk store) but PROCEED with the HTTP pin so the
+  // pre-#236 behaviour (Kubo redirects to truthful CID, lie becomes
+  // unreachable) is preserved bit-for-bit. We log loudly so a
+  // regression in our own CAR builder is visible in operator telemetry.
   for (const block of blocks) {
+    if (localHelia !== null) {
+      let cidBindingOk = true;
+      try {
+        verifyCidMatchesBytes(block.cid, block.bytes);
+      } catch (err) {
+        cidBindingOk = false;
+        logger.warn(
+          'ipfs-client',
+          `pinCarBlocksToIpfs: producer-side CID/bytes mismatch for ${block.cid} ` +
+            `— skipping local-helia put to avoid poisoning the on-disk store. ` +
+            `Continuing with HTTP pin (Kubo will redirect to the truthful CID). ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      if (cidBindingOk) {
+        await putBlockToLocalHelia(localHelia, block.cid, block.bytes);
+      }
+    }
     await pinSingleBlock(gateways, block.bytes, block.cid, timeoutMs);
   }
 
@@ -373,10 +593,22 @@ export async function pinCarBlocksToIpfs(
  * `maxSizeBytes`, the request is aborted immediately. Otherwise a
  * streaming reader enforces the size limit while reading the body.
  *
+ * Issue #236 — when `helia` is supplied (the local Helia node managed by
+ * the `OrbitDbAdapter`), the local on-disk blockstore is consulted FIRST.
+ * A local hit returns synchronously without any HTTP round-trip,
+ * eliminating gateway propagation as the bottleneck for cross-process
+ * recovery on the same `dataDir`. Local-blockstore returns are NOT
+ * content-verified (see `tryGetBlockFromLocalHelia` — helia's blockstore
+ * is content-addressed by construction and runs inside our trust
+ * boundary). Misses fall through to the existing HTTP gateway loop
+ * unchanged.
+ *
  * @param gateways     - Array of IPFS gateway base URLs
  * @param cid          - Content identifier to fetch
  * @param timeoutMs    - Timeout per gateway attempt (default: 30 000)
  * @param maxSizeBytes - Maximum response size (default: 50 MB)
+ * @param helia        - Optional local Helia node (see issue #236).
+ *                       Pass the result of `OrbitDbAdapter.getHelia()`.
  * @returns The fetched content as a `Uint8Array`
  * @throws {ProfileError} `BUNDLE_NOT_FOUND` if all gateways fail or
  *         the response exceeds the size limit.
@@ -386,7 +618,27 @@ export async function fetchFromIpfs(
   cid: string,
   timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
   maxSizeBytes: number = DEFAULT_MAX_SIZE_BYTES,
+  helia?: unknown,
 ): Promise<Uint8Array> {
+  // Issue #236 — local Helia blockstore fast-path. When the block was
+  // pinned through this process (or any prior process with the same
+  // `dataDir`), it is already on disk and a synchronous get() avoids
+  // HTTP gateway propagation entirely.
+  const localHelia = asHelia(helia);
+  if (localHelia !== null) {
+    const local = await tryGetBlockFromLocalHelia(localHelia, cid);
+    if (local !== null) {
+      if (local.byteLength > maxSizeBytes) {
+        // Defensive: a local block that exceeds the caller's size cap
+        // is still a miss for the caller's contract. Fall through to
+        // gateways (which apply their own enforcement) rather than
+        // returning oversized bytes.
+      } else {
+        return local;
+      }
+    }
+  }
+
   const effectiveGateways = gateways.length > 0 ? gateways : [DEFAULT_IPFS_API_URL];
   // Steelman²⁸/²⁹ warning: validate gateway URLs via shared helper —
   // applies the same allowlist to fetchFromIpfs / pinToIpfs /
@@ -565,10 +817,18 @@ export async function fetchFromIpfs(
  * opaque leaves (no further walk), which is the correct behavior for
  * the Profile/UXF model where all linkable blocks are dag-cbor.
  *
+ * Issue #236 — forwards an optional `helia` handle to the per-block
+ * `fetchFromIpfs` calls, so every block walked by the BFS is satisfied
+ * from the local Helia blockstore first when available. This makes
+ * cross-process recovery on the same `dataDir` independent of HTTP
+ * gateway propagation lag.
+ *
  * @param gateways              - IPFS gateway base URLs (allowlist-validated)
  * @param rootCid               - The CARv1 root CID (CIDv1 base32)
  * @param timeoutMs             - Per-block fetch timeout (default 30 000)
  * @param maxSizeBytesPerBlock  - Per-block byte cap (default 50 MiB)
+ * @param helia                 - Optional local Helia node (see issue #236).
+ *                                Pass the result of `OrbitDbAdapter.getHelia()`.
  * @returns The reassembled CARv1 bytes (root = `rootCid`, all blocks
  *          collected via BFS dag-cbor link walk)
  * @throws {ProfileError} `BUNDLE_NOT_FOUND` when any block fetch fails
@@ -580,6 +840,7 @@ export async function fetchCarFromIpfs(
   rootCid: string,
   timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
   maxSizeBytesPerBlock: number = DEFAULT_MAX_SIZE_BYTES,
+  helia?: unknown,
 ): Promise<Uint8Array> {
   let parsedRoot: CID;
   try {
@@ -595,7 +856,7 @@ export async function fetchCarFromIpfs(
   // CAR as one raw block. `fetchFromIpfs` already returns the bytes
   // verbatim — they ARE the CAR. Skip the walk.
   if (parsedRoot.code === CODEC_RAW) {
-    return fetchFromIpfs(gateways, rootCid, timeoutMs, maxSizeBytesPerBlock);
+    return fetchFromIpfs(gateways, rootCid, timeoutMs, maxSizeBytesPerBlock, helia);
   }
   if (parsedRoot.code !== CODEC_DAG_CBOR) {
     throw new ProfileError(
@@ -641,6 +902,7 @@ export async function fetchCarFromIpfs(
       cidStr,
       timeoutMs,
       maxSizeBytesPerBlock,
+      helia,
     );
     blocks.push({ cid: blockCid, bytes: blockBytes });
 

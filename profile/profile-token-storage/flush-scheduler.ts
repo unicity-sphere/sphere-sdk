@@ -624,10 +624,19 @@ export class FlushScheduler {
         // traverses sub-blocks using the UXF-aware walker
         // (`walkUxfElement` in `ipfs-client.ts`).
         const expectedRootCid = await extractCarRootCid(carBytes);
+        // Issue #236 — pass the local Helia handle so each block is
+        // written to the on-disk blockstore before the HTTP pin. This
+        // guarantees a subsequent same-`dataDir` process can read the
+        // block via `blockstore.get` without waiting for gateway
+        // propagation. Backward-compatible with adapters predating
+        // issue #236: `getHelia` returns `null` and the HTTP-only path
+        // continues to apply.
         cid = await pinCarBlocksToIpfs(
           this.host.ipfsGateways,
           carBytes,
           expectedRootCid,
+          undefined,
+          this.host.getHelia(),
         );
         this.host.setLastPinnedCid(cid);
       }

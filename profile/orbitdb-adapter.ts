@@ -79,6 +79,18 @@ export class OrbitDbAdapter implements ProfileDatabase {
   private connectInFlight: Promise<void> | null = null;
   private closeInFlight: Promise<void> | null = null;
 
+  /**
+   * Steelman remediation for issue #236 — set TRUE at the entry of
+   * `closeInner()` (BEFORE the bounded teardown begins), cleared after
+   * the close completes (or at the start of the next successful
+   * `connect()`). Read by `getHelia()` to deny new fast-path callers
+   * during the teardown window; pre-#236 the read was guarded only by
+   * `this.connected`, which is cleared at the END of close — wide open
+   * to a concurrent flush capturing a half-stopped Helia between the
+   * `helia.stop()` race and the `onSettle` null-out.
+   */
+  private shuttingDown = false;
+
   // ---------- ProfileDatabase implementation ----------
 
   async connect(config: OrbitDbConfig): Promise<void> {
@@ -107,6 +119,12 @@ export class OrbitDbAdapter implements ProfileDatabase {
   }
 
   private async connectInner(config: OrbitDbConfig): Promise<void> {
+    // Steelman remediation for issue #236 — clear the shutdown gate
+    // defensively. `closeInner()` clears it on its own success path,
+    // but a previous `close()` that threw mid-teardown could leave
+    // `shuttingDown = true` and silently disable the local-helia
+    // fast-path for the lifetime of the next session.
+    this.shuttingDown = false;
 
     // --- Dynamic import of @orbitdb/core ---
     let orbitdbModule: any;
@@ -673,6 +691,15 @@ export class OrbitDbAdapter implements ProfileDatabase {
       return; // idempotent
     }
 
+    // Steelman remediation for issue #236 — flip the shutdown gate
+    // BEFORE the bounded teardown begins. From this point forward,
+    // `getHelia()` returns `null` so any concurrent `pinCarBlocksToIpfs`
+    // call falls back to HTTP-only. Without this gate, the next-process
+    // recovery is unaffected (gateways still have the block) but the
+    // current process avoids dispatching `blockstore.put` against a
+    // helia whose libp2p / blockstore is mid-stop.
+    this.shuttingDown = true;
+
     // Unsubscribe all replication listeners before closing the database
     if (this.db?.events?.off) {
       for (const handler of this.replicationListeners) {
@@ -704,6 +731,9 @@ export class OrbitDbAdapter implements ProfileDatabase {
     });
 
     this.connected = false;
+    // Clear the shutdown gate AFTER `this.connected` flips. A
+    // subsequent connect() resets it again defensively below.
+    this.shuttingDown = false;
   }
 
   onReplication(callback: () => void): () => void {
@@ -731,6 +761,39 @@ export class OrbitDbAdapter implements ProfileDatabase {
 
   isConnected(): boolean {
     return this.connected;
+  }
+
+  /**
+   * Issue #236 — Expose the underlying Helia node so the Profile token-
+   * storage pin/fetch paths can use the local on-disk blockstore as the
+   * primary CAR store. Returns `null` when disconnected, pre-`connect()`,
+   * or DURING `close()` teardown (steelman remediation).
+   *
+   * Why this is safe to expose:
+   *   - The accessor is READ-ONLY (no `setHelia`) — callers cannot swap
+   *     out our IPFS substrate.
+   *   - The returned handle is the SAME instance the adapter uses for
+   *     OrbitDB's own blockstore, so writes via `blockstore.put` share
+   *     the on-disk persistence directory configured at `connect()` time.
+   *   - Typed as `unknown` to keep helia types out of the public Profile
+   *     interface (the rest of the SDK still tree-shakes cleanly when
+   *     helia is absent — the adapter is the single point of contact).
+   *
+   * **Shutdown gating (steelman remediation).** A concurrent flush
+   * firing during `closeInner()` could otherwise capture the helia
+   * handle and call `blockstore.put` on a draining Helia — the
+   * underlying libp2p / blockstore is already mid-teardown and the put
+   * may hang indefinitely (or write to a half-stopped store). We
+   * surface `null` from the moment `closeInner()` begins its teardown
+   * budget so in-flight callers immediately fall back to the HTTP-only
+   * pin path. The destroy-ordering invariant from PR #235 already
+   * ensures the token-storage layer is drained before the adapter
+   * closes; this gate is a defense-in-depth backstop against a future
+   * caller that bypasses the scheduler.
+   */
+  getHelia(): unknown | null {
+    if (this.shuttingDown) return null;
+    return this.helia ?? null;
   }
 
   // ---------- Private helpers ----------
