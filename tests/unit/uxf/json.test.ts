@@ -475,8 +475,11 @@ describe('packageFromJson — manifest tokenId validation (FIX 6)', () => {
     expect(err.code).toBe('SERIALIZATION_ERROR');
   });
 
-  it('rejects 65-char hex tokenId', () => {
-    const json = makeMinimalJson({ ['ab'.repeat(32) + 'cd']: 'a'.repeat(64) });
+  it('rejects 69-char hex tokenId (above the 64-68 valid range, #226)', () => {
+    // #226 relaxed the regex from `{64}` to `{64,68}` so invoice
+    // tokenIds (imprint form, 68 chars) survive round-trip. Anything
+    // strictly outside [64, 68] is still rejected.
+    const json = makeMinimalJson({ ['ab'.repeat(34) + 'a']: 'a'.repeat(64) }); // 69 chars
     let err: any;
     try {
       packageFromJson(json);

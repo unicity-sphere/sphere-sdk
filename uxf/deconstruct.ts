@@ -211,20 +211,29 @@ function validateToken(token: unknown): asserts token is TokenShape {
     throw new UxfError('INVALID_PACKAGE', 'Token must have a state field');
   }
 
-  // Steelman²⁸ note: assert genesis.data.tokenId is a non-empty 64-char
-  // lowercase hex string. Without this, malformed tokens silently coerce
-  // tokenId='' via lowerHex(null), producing manifest entries keyed by
-  // an empty string — hard to remove and prone to collision.
+  // Steelman²⁸ note: assert genesis.data.tokenId is a non-empty hex
+  // string. Without this, malformed tokens silently coerce tokenId=''
+  // via lowerHex(null), producing manifest entries keyed by an empty
+  // string — hard to remove and prone to collision.
+  //
+  // #226: accept BOTH 64-char (plain hash bytes — the historical coin
+  // token form, e.g. `new TokenId(await sha256(...))`) and 68-char
+  // (imprint form — algo marker prefix + hash bytes, e.g. `new TokenId(
+  // hash.imprint)` which the AccountingModule uses for invoice tokens).
+  // The receiver's importInvoice already accepts `/^[0-9a-f]{64,68}$/`;
+  // mirror that here so invoice tokens can ride UXF bundles without a
+  // sender-side normalization step. Coin tokens are unchanged (still
+  // 64-char).
   const genesis = obj.genesis as Record<string, unknown>;
   const data = genesis.data as Record<string, unknown> | undefined;
   if (!data || typeof data !== 'object') {
     throw new UxfError('INVALID_PACKAGE', 'Token genesis must have a data field');
   }
   const tokenId = data.tokenId;
-  if (typeof tokenId !== 'string' || !/^[0-9a-fA-F]{64}$/.test(tokenId)) {
+  if (typeof tokenId !== 'string' || !/^[0-9a-fA-F]{64,68}$/.test(tokenId)) {
     throw new UxfError(
       'INVALID_PACKAGE',
-      `Token genesis.data.tokenId must be 64-char hex, got ${typeof tokenId === 'string' ? `"${tokenId}"` : String(tokenId)}`,
+      `Token genesis.data.tokenId must be 64- or 68-char hex, got ${typeof tokenId === 'string' ? `"${tokenId}"` : String(tokenId)}`,
     );
   }
 }
