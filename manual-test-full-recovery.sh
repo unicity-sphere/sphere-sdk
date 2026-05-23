@@ -217,6 +217,15 @@ sphere faucet            2>&1 | tee "$SNAP/peer1-alice-faucet.log"
 sphere payments sync     2>&1 | tee "$SNAP/peer1-alice-sync.log"
 sphere balance           | tee "$SNAP/peer1-alice-balance.txt"
 
+# Top up bob — needed for §C.2 invoice pay (11 UCT). Without this,
+# bob's balance is 0 and `sphere invoice pay $INV` errors with
+# "Insufficient balance" even though the invoice was successfully
+# discovered via §C.1b deliver (#226).
+sphere wallet use bob
+sphere faucet            2>&1 | tee "$SNAP/peer1-bob-faucet.log"
+sphere payments sync     2>&1 | tee "$SNAP/peer1-bob-sync.log"
+sphere balance           | tee "$SNAP/peer1-bob-balance.txt"
+
 # ---------------------------------------------------------------------------
 # §A — Peer2 setup (same identity, separate DATA_DIR)
 # ---------------------------------------------------------------------------
