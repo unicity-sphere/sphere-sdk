@@ -424,7 +424,10 @@ export function packageFromJson(json: string): UxfPackageData {
     // ingest gate). The regex naturally rejects `__proto__`,
     // `constructor`, `prototype`, empty strings, non-hex unicode,
     // wrong-length keys.
-    if (!/^[0-9a-f]{64}$/.test(tokenId)) {
+    // #226: accept 64-char (coin tokens) and 68-char (invoice tokens —
+    // imprint form). Mirrors deconstruct.ts:226 and ipld.ts manifest
+    // reader. Lowercase-hex preserved.
+    if (!/^[0-9a-f]{64,68}$/.test(tokenId)) {
       throw new UxfError(
         'SERIALIZATION_ERROR',
         `Invalid manifest tokenId: ${tokenId.slice(0, 32)}…`,

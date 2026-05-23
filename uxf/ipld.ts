@@ -548,7 +548,10 @@ export async function importFromCar(car: Uint8Array): Promise<UxfPackageData> {
   }
   const tokens = new Map<string, ContentHash>();
   for (const [tokenId, cid] of manifestEntries) {
-    if (!/^[0-9a-f]{64}$/.test(tokenId)) {
+    // #226: accept 64-char (coin tokens) and 68-char (invoice tokens —
+    // imprint form). Mirrors deconstruct.ts:226 and json.ts manifest
+    // reader.
+    if (!/^[0-9a-f]{64,68}$/.test(tokenId)) {
       throw new UxfError(
         'SERIALIZATION_ERROR',
         `Invalid manifest tokenId: ${tokenId.slice(0, 32)}…`,

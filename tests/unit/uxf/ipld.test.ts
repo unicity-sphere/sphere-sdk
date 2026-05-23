@@ -756,9 +756,13 @@ describe('importFromCar — manifest tokenId validation (FIX 6)', () => {
     expect(err.code).toBe('SERIALIZATION_ERROR');
   });
 
-  it('manifest with 65-char hex key is rejected', async () => {
+  it('manifest with wrong-length hex key is rejected', async () => {
+    // #226: the regex was relaxed from `{64}` to `{64,68}` so invoice
+    // tokenIds (imprint form, 68 chars) survive a round-trip through
+    // the CAR import. A length outside the [64, 68] range still gets
+    // rejected — 70 chars is the smallest unambiguous over-cap value.
     const fakeCid = CID.createV1(DAG_CBOR_CODE_TEST, makeSha256Digest(new Uint8Array(32)));
-    const car = await buildCarWithManifest({ ['ab'.repeat(32) + 'cd']: fakeCid });
+    const car = await buildCarWithManifest({ ['ab'.repeat(35)]: fakeCid }); // 70 chars
     let err: any;
     try {
       await importFromCar(car);

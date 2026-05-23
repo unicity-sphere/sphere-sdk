@@ -169,7 +169,7 @@ export interface UxfElement {
 // ---- Token Root ----
 
 export interface TokenRootContent {
-  readonly tokenId: string;   // 64-char hex
+  readonly tokenId: string;   // 64-char hex (coin tokens) or 68-char hex (invoice tokens — imprint form, #226)
   readonly version: string;   // e.g. "2.0"
 }
 
@@ -338,7 +338,7 @@ export interface TokenCoinDataContent {
  * The manifest is the entry point for reassembly.
  */
 export interface UxfManifest {
-  /** tokenId (64-char hex) -> ContentHash of the token-root element */
+  /** tokenId (64- or 68-char hex; see TokenRootContent.tokenId) -> ContentHash of the token-root element */
   readonly tokens: ReadonlyMap<string, ContentHash>;
 }
 
