@@ -298,16 +298,15 @@ export async function runProfileDirtyFlush(
   await deps.pin(snapshot.carBytes, snapshot.rootCid);
 
   const result = await deps.publishCid(snapshot.rootCid);
-  if (!result.ok && result.transient) {
-    // Surface transient publish failures to the upstream debouncer so
-    // `storage:error` fires with PROFILE_DIRTY_FLUSH_FAILED. The
-    // pending-publish marker is already stamped by the lifecycle layer
-    // — subsequent flushes / pointer-polls will retry.
-    throw new Error(
-      `dirty-flush publish transient failure (cid=${snapshot.rootCid})` +
-        (result.code ? `; code=${result.code}` : ''),
-    );
-  }
+  // Issue #241: transient publish failures (replica lag, network blip)
+  // are no longer surfaced as throws. The lifecycle layer has already
+  // stamped `pendingPublishCid` and emitted `storage:replica-lag` when
+  // applicable; the upstream FlushScheduler emits the soft
+  // `storage:pending-publish` event and lets the flush complete on the
+  // strength of the IPFS pin durability gate (the actual cross-device
+  // recoverability invariant). Throwing here previously closed the
+  // at-least-once Nostr gate, which amplified replica-lag transients
+  // into a sustained retry storm.
   return result;
 }
 

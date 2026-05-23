@@ -233,9 +233,15 @@ export class ProfileTokenStorageProvider
    * CID whose CAR is durably pinned + OrbitDB bundle ref written but
    * whose aggregator pointer publish is outstanding due to a transient
    * failure. The next `flushToIpfs` and the periodic pointer poll
-   * retry the publish at start. While non-null, downstream callers
-   * that await durability via `awaitNextFlush` MUST see the chain
-   * reject so the at-least-once gate keeps the Nostr ack held.
+   * retry the publish at start.
+   *
+   * Issue #241: while non-null, `awaitNextFlush` (and therefore the
+   * at-least-once Nostr gate) NO LONGER rejects on transient publish
+   * failure — pin durability is the cross-device recoverability
+   * invariant, and the aggregator publish is a liveness optimization
+   * for cold-import discovery. A `storage:pending-publish` event is
+   * emitted so operators can monitor the outstanding state without
+   * conflating it with the terminal `storage:error` class.
    *
    * Persisted to `localCache` under
    * `<STORAGE_KEYS_GLOBAL.PROFILE_PENDING_PUBLISH_CID>_<addressId>`
@@ -664,13 +670,17 @@ export class ProfileTokenStorageProvider
    *     `ProfileSnapshotPublishResult`. A `void` return from the
    *     callback (legacy `() => Promise<void>` shape) is normalised
    *     to `{ ok: true, transient: false }`.
-   *   - On throw (programmer error OR
-   *     `runProfileDirtyFlush`'s transient-failure throw): emits
-   *     `storage:error` with code `PROFILE_DIRTY_FLUSH_FAILED`
+   *   - On throw (programmer error, snapshot-build failure, etc.):
+   *     emits `storage:error` with code `PROFILE_DIRTY_FLUSH_FAILED`
    *     (matching the debouncer's surfacing contract) and re-throws
    *     so FlushScheduler can propagate to `forceFlushSerialized`'s
-   *     rejection arm — holding the at-least-once gate closed until
-   *     the publish lands.
+   *     rejection arm. Issue #241: transient publish failures
+   *     (e.g., aggregator replica lag) are NOT surfaced as throws —
+   *     `publishAggregatorPointerBestEffort` returns a structured
+   *     `{ ok: false, transient: true }` result. FlushScheduler emits
+   *     `storage:pending-publish` and lets the flush succeed. Only
+   *     non-publish exceptions (e.g., snapshot construction errors)
+   *     reach this catch arm.
    *
    * The shutdown gate (`isShuttingDown` / `hasShutdown`) returns
    * `null` so a flush mid-shutdown skips the snapshot publish

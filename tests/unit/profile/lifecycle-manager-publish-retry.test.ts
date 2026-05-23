@@ -308,3 +308,80 @@ describe('LifecycleManager.publishAggregatorPointerBestEffort — Gap 2', () => 
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Issue #241 — typed transient event surfaces (replica-lag vs generic)
+// ---------------------------------------------------------------------------
+
+describe('LifecycleManager.publishAggregatorPointerBestEffort — issue #241 events', () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('emits storage:replica-lag with code AGGREGATOR_POINTER_WALKBACK_FLOOR on the walkback-floor transient', async () => {
+    const pointer = stubPointer({
+      publish: vi.fn(async () => {
+        throw new AggregatorPointerError(
+          AggregatorPointerErrorCode.WALKBACK_FLOOR,
+          'Phase 3 walkback reached candidate=10 below localVersion=11',
+        );
+      }),
+    });
+    const handle = await createTestProvider(pointer);
+    const events: { type: string; data?: unknown }[] = [];
+    handle.provider.onEvent((ev) => {
+      if (ev.type === 'storage:replica-lag' || ev.type === 'storage:error') {
+        events.push({ type: ev.type, data: ev.data });
+      }
+    });
+    try {
+      const result = await handle.lifecycle.publishAggregatorPointerBestEffort(FAKE_CID);
+      // Pin durability is the gate; lifecycle stamps marker + returns transient.
+      expect(result.ok).toBe(false);
+      expect(result.transient).toBe(true);
+      expect(result.code).toBe('AGGREGATOR_POINTER_WALKBACK_FLOOR');
+      // Soft `storage:replica-lag` event is emitted (distinct from
+      // terminal `storage:error`) so monitoring can route on it.
+      const replicaLag = events.find((e) => e.type === 'storage:replica-lag');
+      expect(replicaLag).toBeDefined();
+      expect((replicaLag?.data as { code?: string })?.code).toBe(
+        'AGGREGATOR_POINTER_WALKBACK_FLOOR',
+      );
+      // The retry marker is stamped for the next flush / pointer poll.
+      expect(handle.getPendingPublishCid()).toBe(FAKE_CID);
+    } finally {
+      await handle.provider.shutdown();
+    }
+  });
+
+  it('does NOT emit storage:replica-lag for a generic transient (network blip)', async () => {
+    const pointer = stubPointer({
+      publish: vi.fn(async () => {
+        throw new AggregatorPointerError(
+          AggregatorPointerErrorCode.NETWORK_ERROR,
+          'simulated transient network blip',
+        );
+      }),
+    });
+    const handle = await createTestProvider(pointer);
+    const events: { type: string }[] = [];
+    handle.provider.onEvent((ev) => {
+      if (ev.type === 'storage:replica-lag') events.push({ type: ev.type });
+    });
+    try {
+      const result = await handle.lifecycle.publishAggregatorPointerBestEffort(FAKE_CID);
+      expect(result.transient).toBe(true);
+      expect(result.code).toBe('AGGREGATOR_POINTER_NETWORK_ERROR');
+      // Generic transients route through the upstream FlushScheduler's
+      // `storage:pending-publish` event — `storage:replica-lag` is reserved
+      // for the walkback-floor case so operators can distinguish them.
+      expect(events).toHaveLength(0);
+      expect(handle.getPendingPublishCid()).toBe(FAKE_CID);
+    } finally {
+      await handle.provider.shutdown();
+    }
+  });
+});

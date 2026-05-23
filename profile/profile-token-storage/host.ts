@@ -167,9 +167,15 @@ export interface ProfileTokenStorageHost {
    * written, but whose pointer publish (aggregator anchor) is still
    * outstanding due to a transient failure. The next flush AND the
    * periodic pointer-poll re-attempt the publish at start; on success
-   * the field is cleared. While non-null, the at-least-once gate in
-   * `PaymentsModule.handleIncomingTransfer` is held closed because the
-   * cross-device recovery path cannot reach this bundle yet.
+   * the field is cleared.
+   *
+   * Issue #241: while non-null, the at-least-once Nostr gate
+   * (`PaymentsModule.handleIncomingTransfer`) is NO LONGER held
+   * closed — pin durability is the cross-device recoverability
+   * invariant; the aggregator publish is a liveness optimization
+   * for cold-import discovery and is retried in background.
+   * Operators see the outstanding state via `storage:pending-publish`
+   * (and `storage:replica-lag` for the WALKBACK_FLOOR case).
    *
    * Persisted to `localCache` under the key
    * `STORAGE_KEYS_GLOBAL.PROFILE_PENDING_PUBLISH_CID_PREFIX + addressId`

@@ -16,8 +16,10 @@
  *   6. Build failure → propagates (caller surfaces via storage:error).
  *   7. Pin failure → propagates.
  *   8. publishCid throw → propagates.
- *   9. publishCid transient → throws so the dispatcher emits the
- *      `storage:error` event.
+ *   9. publishCid transient (issue #241) → returns intact (no throw)
+ *      so the upstream FlushScheduler emits `storage:pending-publish`
+ *      and the at-least-once Nostr gate advances on IPFS pin
+ *      durability alone.
  *  10. publishCid permanent (ok:false, transient:false) → swallows
  *      (the lifecycle layer already emitted its own storage:error).
  *
@@ -262,15 +264,18 @@ describe('runProfileDirtyFlush — error propagation', () => {
     ).rejects.toThrow('publish failed');
   });
 
-  it('throws on transient publishCid failure so the dispatcher surfaces it', async () => {
+  it('returns transient publishCid result intact (issue #241 — no throw, gate advances on pin durability)', async () => {
     const publishCid = vi.fn(async () => ({
       ok: false,
       transient: true,
       code: 'NETWORK_ERROR',
     }));
-    await expect(
-      runProfileDirtyFlush(makeDeps({ publishCid })),
-    ).rejects.toThrow(/transient failure.*NETWORK_ERROR/);
+    const result = await runProfileDirtyFlush(makeDeps({ publishCid }));
+    expect(result).toEqual({
+      ok: false,
+      transient: true,
+      code: 'NETWORK_ERROR',
+    });
   });
 
   it('returns permanent publishCid failure without throwing (lifecycle already alerted)', async () => {

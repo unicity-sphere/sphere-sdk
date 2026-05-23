@@ -751,7 +751,10 @@ export class LifecycleManager {
    *   2. **Snapshot CID HEAD-accessible** on ≥1 IPFS gateway — needed
    *      because cross-device recovery fetches the snapshot CAR first,
    *      then walks to bundle refs. Skipped when no snapshot was
-   *      published (`snapshotCid === null`, e.g. no pointer wiring).
+   *      published (`snapshotCid === null`) — either because no pointer
+   *      layer is wired OR because the publish returned a transient
+   *      result (issue #241: a stale snapshot CID would be a no-op
+   *      verify; only the bundle leg is checked in that case).
    *
    * NOT verified here:
    *   - **Aggregator `recoverLatest()` read-back of the snapshot CID.**
@@ -775,6 +778,12 @@ export class LifecycleManager {
    * then refuses to advance the Nostr `since` filter, the inbound event
    * replays on next reconnect, and the addToken stateHash dedup ensures
    * idempotency.
+   *
+   * Issue #241: only the IPFS pin legs gate the Nostr ack here. The
+   * aggregator-publish durability (pointer read-back) is intentionally
+   * NOT a per-flush leg — it's a liveness optimization for cold-import
+   * discovery and is retried in background via `pendingPublishCid`.
+   * Pin durability is the cross-device recoverability invariant.
    *
    * @param bundleCid    The UXF bundle CID just pinned via flushToIpfs.
    * @param snapshotCid  The lean-snapshot CID just published via
@@ -1021,20 +1030,29 @@ export class LifecycleManager {
    * Publish the just-flushed CID to the aggregator pointer layer.
    *
    * Returns a structured result instead of swallowing failures so the
-   * caller (FlushScheduler) can propagate transient errors up to the
-   * at-least-once gate. The persistence of the retry marker
-   * (`pendingPublishCid`) is handled here:
+   * caller (FlushScheduler) can route transient failures via a soft
+   * event without closing the at-least-once gate. The persistence of
+   * the retry marker (`pendingPublishCid`) is handled here:
    *
    *   - SUCCESS — clears `pendingPublishCid`, anchors
    *     `lastDiscoveredPointerCid`, returns `{ ok: true }`.
    *   - TRANSIENT failure — sets `pendingPublishCid = cidString` (with
    *     localCache persistence for crash safety), returns
-   *     `{ ok: false, transient: true }`. Caller MUST treat this as
-   *     "not durable" — the at-least-once gate refuses the Nostr ack
-   *     so the inbound event replays on next reconnect (idempotent
-   *     via addToken stateHash dedup and processedCombinedTransferIds).
-   *     The pending marker is retried at start of every subsequent
-   *     `flushToIpfs` and `runPointerPollOnce`.
+   *     `{ ok: false, transient: true, code? }`. Issue #241: callers
+   *     route this to a `storage:pending-publish` event instead of
+   *     throwing — the at-least-once Nostr gate is decoupled from
+   *     aggregator-publish durability and rides on IPFS pin
+   *     durability alone (which is the actual cross-device
+   *     recoverability invariant). The pending marker is retried
+   *     at start of every subsequent `flushToIpfs` and
+   *     `runPointerPollOnce`.
+   *
+   *     A WALKBACK_FLOOR transient (aggregator read-replica lagging
+   *     behind a version this wallet has already confirmed locally)
+   *     additionally emits a typed `storage:replica-lag` event so
+   *     operators can distinguish it from generic network
+   *     transients in monitoring.
+   *
    *   - PERMANENT failure (UNREACHABLE_RECOVERY_BLOCKED, REJECTED,
    *     UNTRUSTED_PROOF, TRUST_BASE_STALE, MARKER_CORRUPT, CORRUPT_STREAK,
    *     SECURITY_ORIGIN_MISMATCH, CAPABILITY_DENIED, UNSUPPORTED_RUNTIME,
@@ -1084,11 +1102,11 @@ export class LifecycleManager {
         return { ok: false, transient: false, code };
       }
       // Elevate the transient publish failure to warn-level so the
-      // operator sees the underlying cause without enabling debug —
-      // pointer publish failures hold the at-least-once gate closed
-      // and the user cannot diagnose the stall otherwise. Includes
-      // any typed AggregatorPointerError code so monitoring can
-      // filter on transient classes (NETWORK_ERROR vs unclassified).
+      // operator sees the underlying cause without enabling debug.
+      // Issue #241: this no longer holds the at-least-once gate
+      // closed (the flush proceeds and stamps a pending-publish
+      // marker), but the underlying cause is still useful for
+      // diagnosis when a wallet stays in pending-publish for long.
       const transientCode =
         typeof (err as { code?: unknown }).code === 'string'
           ? (err as { code: string }).code
@@ -1097,11 +1115,26 @@ export class LifecycleManager {
         'Profile-TokenStorage',
         `Pointer publish failed (transient, code=${transientCode}, cid=${cidString}): ${msg}`,
       );
+      // Issue #241 — a WALKBACK_FLOOR transient is specifically the
+      // aggregator's read replica lagging behind the wallet's locally-
+      // confirmed `localVersion`. Surface this as a typed
+      // `storage:replica-lag` event so monitoring can distinguish
+      // replica-lag stalls from generic transients (network blips,
+      // gateway hiccups). All other transients flow through the
+      // generic `storage:pending-publish` event emitted by the
+      // caller (FlushScheduler).
+      if (transientCode === 'AGGREGATOR_POINTER_WALKBACK_FLOOR') {
+        this.host.emitEvent({
+          type: 'storage:replica-lag',
+          timestamp: Date.now(),
+          data: { cid: cidString, code: transientCode, message: msg },
+        });
+      }
       // Transient: stamp the retry marker (with localCache persistence
       // for crash safety) so subsequent flushes / polls re-attempt
       // before any new save-driven work.
       this.host.setPendingPublishCid(cidString);
-      return { ok: false, transient: true };
+      return { ok: false, transient: true, code: transientCode };
     }
   }
 
