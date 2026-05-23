@@ -3087,20 +3087,36 @@ export class ProfileTokenStorageProvider
    * flush so the next save-driven flush gets a fresh baseline check.
    */
   private async onPollDiscoveredNewCid(): Promise<void> {
-    // Fire-and-forget load — don't block the periodic poll loop on a
-    // potentially-slow IPFS CAR fetch. The scheduleFlushNoData below
-    // arms a 2 s debounce; by the time the flush body runs, load()
-    // will typically have completed and the merged state will be
-    // visible. If load is still in-flight when flush fires, the
-    // flush body's BUNDLE-SET-CHECK will detect the stale baseline
-    // and abort — surfacing as a retry on the next save-driven flush,
-    // not silent data loss.
-    this.load().catch((err) => {
+    // Issue #234/#239 follow-up — symmetric with `handleReplication`,
+    // emit `storage:remote-updated` so the upstream PaymentsModule's
+    // `subscribeToStorageEvents` listener wakes up and re-syncs its
+    // in-memory token cache. Without this, the pointer-poll path
+    // (the cross-device eventual-consistency fallback that fires when
+    // OrbitDB gossipsub didn't deliver the replication event in real
+    // time) refreshes the Profile's internal `lastLoadedData` but
+    // PaymentsModule never learns about the new tokens — and so
+    // AccountingModule never re-scans for new invoice tokens. Cross-
+    // device invoice / self-state propagation depends on this fix.
+    //
+    // We await load() here (not fire-and-forget) so the event we emit
+    // below carries an in-memory state that already reflects the
+    // discovered bundles. `handleReplication` makes the same trade-
+    // off for the same reason (pointer-monotonicity invariant, plus
+    // PaymentsModule's debounced sync would otherwise race a stale
+    // baseline).
+    try {
+      await this.load();
+    } catch (err) {
       this.log(
         `onPollDiscoveredNewCid: load failed (best-effort): ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
+    }
+    this.emitEvent({
+      type: 'storage:remote-updated',
+      timestamp: Date.now(),
+      data: { source: 'pointer-poll' },
     });
     this.flushScheduler.scheduleFlushNoData();
   }
