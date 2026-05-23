@@ -1,39 +1,16 @@
 # Sphere SDK
-
-**A TypeScript SDK for apps where users hold their own tokens and pay each other by name — no payment backend to build, no custody of anyone's funds.**
-
 [![npm](https://img.shields.io/npm/v/@unicitylabs/sphere-sdk.svg)](https://www.npmjs.com/package/@unicitylabs/sphere-sdk)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![node](https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg)](https://nodejs.org)
 
+The SDK for **autonomous economic agents**. Give an agent an identity, a wallet, and the ability to find, negotiate with, and settle with other agents — peer-to-peer, with perfect privacy and ultra-fast finality.
+
+An agent using Sphere can hold value, discover a counterparty, message them, trade with them atomically, and invoice and settle - all over peer-to-peer rails where assets are self-contained bearer objects that move directly between parties, carrying their own proof of validity. No broadcast, no mempool, no gas auction.
+It runs the same way in a browser, in Node.js, and on the command line. 
+
+
 ---
 
-The Sphere SDK gives your app a self‑custody wallet: each user holds their own keys, pays others by name (like `@alice`), and every transfer is a self‑contained cryptographic object the recipient verifies on its own — no shared ledger in the middle. You get the wallet, transfers, encrypted messaging, and invoicing out of the box — without building or operating a payment backend, and without ever holding users' funds. It runs in the browser and in Node.js.
-
-## Why Sphere SDK
-
-Most apps that move money put a custodial server in the middle: it holds everyone's balances, clears the payments, and can freeze or lose them — and it's yours to build, secure, and keep online.
-
-The Sphere SDK splits those jobs apart:
-
-- **Custody moves to the user.** Their wallet holds its own keys; your app never touches their funds.
-- **Settlement is cryptographic, not custodial.** Each transfer is a self‑contained cryptographic object the recipient verifies on its own. There is **no shared ledger** of balances or transfer history — Unicity's network only registers an opaque commitment (a hash) so a token can't be spent twice.
-
-There is still shared infrastructure (the network that registers those commitments, messaging relays, and the base chain), but **you don't run it**, and no company sits on top of users' balances. Your app just creates a wallet and asks it to do things.
-
-## What you can build
-
-**Send and receive tokens.** Move value between users by name — `@alice` pays `@bob` — no account numbers, and no backend of your own to operate.
-
-**Invoices and payment requests.** Ask another user to pay, and track whether they did, automatically.
-
-**Encrypted messaging.** One‑to‑one direct messages and group chat, end‑to‑end encrypted, built in.
-
-**Peer‑to‑peer swaps.** Two users trade one token for another, with an escrow service handling the exchange safely.
-
-**Wallet connections.** Let a web app ask a user's wallet to pay or sign something — without the app ever touching their keys.
-
-> The user holds the keys. The app just asks.
 
 ## Install
 
@@ -42,6 +19,30 @@ npm install @unicitylabs/sphere-sdk
 # Node.js also needs a WebSocket library:
 npm install @unicitylabs/sphere-sdk ws
 ```
+
+## Why it's built this way
+On Unicity, assets aren't rows in a global database that validators take turns updating. They're self-contained cryptographic objects — bearer instruments — that carry their own history and validity proofs and move directly between two parties.
+
+That property is what makes agent-to-agent commerce practical. An autonomous agent can't wait on block space or pay a gas auction for every micro-interaction, and it can't depend on a trusted indexer to know whether it got paid — the proof of the transfer is the payment. Sphere is the client-side toolkit that turns that substrate into the things an agent actually needs: identity, discovery, messaging, trade, and settlement.
+
+## What you can build with it
+
+| Capability | Module | What it gives your agent |
+| --- | --- | --- |
+| **Identity** | `identity` | A cryptographic identity (`@nametag` + secp256k1 keypair)  — HD multi-address, one nametag per address |
+| **Payments** | `payments` | Send and receive bearer tokens  |
+| **Payment requests** | `payments` | Request money from a counterparty and track the response asynchronously |
+| **Invoicing & settlement** | `accounting` | Issue invoices, take payment, and process returns — the bill-and-collect half of commerce |
+| **Discovery** | `market` | Post an intent to transact and search for matching counterparties — how agents *find* each other |
+| **Atomic swaps** | `swap` | Trade peer-to-peer with signed swap manifests and nametag bindings — settle a two-sided deal without a trusted middleman |
+| **Direct messaging** | `communications` | P2P direct messages and broadcasts over Nostr (NIP-04 encryption) |
+| **Group chat** | `groupChat` | NIP-29 relay-based group messaging with roles and moderation |
+| **Token backup** | token sync | Decentralized sync to IPFS/IPNS, browser and Node.js |
+| **dApp ↔ wallet** | Connect | `ConnectClient` / `ConnectHost` for browser-extension integration |
+
+
+
+
 
 ## Quick start
 
