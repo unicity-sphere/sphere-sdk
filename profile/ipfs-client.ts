@@ -113,15 +113,25 @@ async function putBlockToLocalHelia(
  * restart on the same `dataDir` where Helia's on-disk blockstore
  * persists).
  *
- * Local helia returns are NOT subjected to `verifyCidMatchesBytes`:
- * Helia's blockstore is content-addressed by construction (put(cid, X)
- * inserts under CID(X)) and we trust our own on-disk persistence the
- * same way we trust OrbitDB's KV reads — there is no gateway-substitution
- * surface here.
+ * **Content verification (steelman remediation).** Helia's blockstore
+ * is content-KEYED but NOT content-VERIFIED: `blockstore.put(cid, X)`
+ * stores `X` under `cid` regardless of whether
+ * `sha256(X) === cid.multihash.digest`. A corrupted on-disk store
+ * (filesystem-level bit flip, partial-write crash residue, a malicious
+ * party with disk access) could surface bytes that don't match the
+ * requested CID. Without verification on read, garbage propagates to
+ * downstream parsers and surfaces as an opaque "decode failed" error
+ * far from the root cause. We re-instate the same content-address
+ * check the HTTP path applies to gateway responses: on mismatch we LOG
+ * and return `null` so the caller falls through to the HTTP gateway
+ * loop — which either delivers an honest copy or surfaces a hard
+ * `BUNDLE_NOT_FOUND` with full diagnostics. The cost is a single
+ * `sha256(bytes)` per local read, dwarfed by the eliminated HTTP
+ * round-trip on a clean cache hit.
  *
- * @returns the block bytes on a local hit, `null` when the block is
- *          absent or the local read errored (in which case the caller
- *          continues with the HTTP gateway loop).
+ * @returns the block bytes on a verified local hit, `null` when the
+ *          block is absent, the local read errored, or the bytes
+ *          failed CID-binding verification (caller continues with HTTP).
  */
 async function tryGetBlockFromLocalHelia(
   helia: HeliaLike,
@@ -133,14 +143,18 @@ async function tryGetBlockFromLocalHelia(
   } catch {
     return null;
   }
+  let bytes: Uint8Array;
   try {
-    const bytes = await helia.blockstore.get(parsed);
-    if (bytes instanceof Uint8Array && bytes.byteLength > 0) {
-      return bytes;
+    const got = await helia.blockstore.get(parsed);
+    if (!(got instanceof Uint8Array) || got.byteLength === 0) {
+      // Defensive: helia returned a non-Uint8Array (extreme edge case)
+      // OR an empty-byte block — treat as a miss so the gateway loop
+      // runs. A zero-length block is never legitimate in our schema
+      // (every dag-cbor envelope and raw payload carries non-empty
+      // bytes), so the fall-through is safe.
+      return null;
     }
-    // Defensive: helia returned a non-Uint8Array (extreme edge case) —
-    // treat as a miss so the gateway loop runs.
-    return null;
+    bytes = got;
   } catch {
     // Block not present locally (helia throws ERR_NOT_FOUND) — caller
     // continues with the HTTP gateway loop. Other internal errors also
@@ -148,6 +162,26 @@ async function tryGetBlockFromLocalHelia(
     // does not block recovery via HTTP.
     return null;
   }
+
+  // Steelman remediation — verify the bytes hash to the requested CID.
+  // Catches: ext4/zfs silent corruption, partial-write crash residue,
+  // disk-side tampering, or a regression in our own writer that lets a
+  // CID/bytes mismatch slip past `pinCarBlocksToIpfs`'s pin-time
+  // verifier. On mismatch: log once, return null, fall through to
+  // gateways (which apply their own verification on gateway-returned
+  // bytes — see `verifyCidMatchesBytes` in `fetchFromIpfs`).
+  try {
+    verifyCidMatchesBytes(cidString, bytes);
+  } catch (err) {
+    logger.warn(
+      'ipfs-client',
+      `local-helia get returned bytes whose sha256 does NOT match ${cidString} ` +
+        `(likely on-disk corruption); falling through to HTTP gateways: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return null;
+  }
+  return bytes;
 }
 
 // SHA-256 multihash code (multiformats `sha2-256`).
@@ -507,9 +541,43 @@ export async function pinCarBlocksToIpfs(
   // `blockstore.get` regardless of HTTP gateway propagation. Local
   // failures are logged and swallowed (the HTTP path remains the
   // source of truth for replication and cross-device recovery).
+  //
+  // Steelman remediation (#236 follow-up): Helia's blockstore is
+  // content-KEYED, not content-VERIFIED — `blockstore.put(cid, X)`
+  // stores `X` under `cid` regardless of `sha256(X) ===
+  // cid.multihash.digest`. Pre-#236 a builder bug emitting a CAR with
+  // a framed CID that didn't match its bytes was masked by Kubo's
+  // server-side recompute (the gateway stored under the truthful CID
+  // and the published lie-CID became unreachable, surfacing as a clear
+  // `BUNDLE_NOT_FOUND` at fetch time). The #236 fast-path bypasses
+  // that implicit guard: a lie would silently cache locally and survive
+  // the read path's verification on a future cross-process load.
+  //
+  // We re-instate the guard explicitly: every block is checked against
+  // `sha256(bytes) === cid.multihash.digest` BEFORE the local put.
+  // On mismatch we SKIP the local put for that block (so we never
+  // poison the on-disk store) but PROCEED with the HTTP pin so the
+  // pre-#236 behaviour (Kubo redirects to truthful CID, lie becomes
+  // unreachable) is preserved bit-for-bit. We log loudly so a
+  // regression in our own CAR builder is visible in operator telemetry.
   for (const block of blocks) {
     if (localHelia !== null) {
-      await putBlockToLocalHelia(localHelia, block.cid, block.bytes);
+      let cidBindingOk = true;
+      try {
+        verifyCidMatchesBytes(block.cid, block.bytes);
+      } catch (err) {
+        cidBindingOk = false;
+        logger.warn(
+          'ipfs-client',
+          `pinCarBlocksToIpfs: producer-side CID/bytes mismatch for ${block.cid} ` +
+            `— skipping local-helia put to avoid poisoning the on-disk store. ` +
+            `Continuing with HTTP pin (Kubo will redirect to the truthful CID). ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      if (cidBindingOk) {
+        await putBlockToLocalHelia(localHelia, block.cid, block.bytes);
+      }
     }
     await pinSingleBlock(gateways, block.bytes, block.cid, timeoutMs);
   }
