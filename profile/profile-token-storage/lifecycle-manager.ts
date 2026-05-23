@@ -66,6 +66,11 @@ import {
 } from '../encryption.js';
 import { computeAddressId } from '../types.js';
 import { logger } from '../../core/logger.js';
+import {
+  verifyCidAccessibleWithRetry,
+  type VerifyCidAccessibleResult,
+} from '../ipfs-client.js';
+import type { ShutdownOptions } from '../../storage/storage-provider.js';
 import type { BundleIndex } from './bundle-index.js';
 import type { ProfileTokenStorageHost } from './host.js';
 
@@ -108,6 +113,52 @@ const PERMANENT_POINTER_ERROR_CODES: ReadonlySet<string> = new Set([
 const POINTER_POLL_MIN_MS = 30_000;
 const POINTER_POLL_RANGE_MS = 60_000; // → [30s, 90s)
 const POINTER_POLL_BACKOFF_MULTIPLIER = 5;
+
+/**
+ * Issue #239 — default wall-clock budget for the
+ * {@link LifecycleManager.awaitRemoteDurability} gate when the caller
+ * omits `ShutdownOptions.verificationDeadlineMs`.
+ *
+ * The default is `0` (gate disabled) for direct-constructed providers
+ * so legacy tests that don't pass options don't hang on the 30s
+ * verification window. Production wallets go through `Sphere.destroy`,
+ * which injects the production default (`SHUTDOWN_VERIFICATION_DEFAULT_PRODUCTION_MS`)
+ * when no override is supplied.
+ *
+ * `Sphere.destroy({ verificationDeadlineMs: 0 })` explicitly disables
+ * the gate on production wallets; `Sphere.destroy({ force: true })`
+ * skips it AND stamps `pendingPublishCid` for cold-start retry.
+ */
+const SHUTDOWN_VERIFICATION_DEFAULT_DEADLINE_MS = 0;
+
+/**
+ * Issue #239 — pointer `recoverLatest()` poll cadence used by
+ * {@link LifecycleManager.awaitAggregatorPointerReadBack}. The
+ * aggregator's read-after-write is generally fast (single-digit ms in
+ * the happy path) but transient propagation between aggregator
+ * replicas can take a few seconds. 500 ms gives ~60 attempts inside a
+ * 30 s deadline without hammering the aggregator.
+ */
+const POINTER_READBACK_POLL_MS = 500;
+
+/**
+ * Issue #239 — pending-publish retry cadence used by
+ * {@link LifecycleManager.awaitPendingPublishCleared}. Calls back into
+ * `publishAggregatorPointerBestEffort` so each tick exercises the full
+ * retry path (same cadence as the periodic poll's fast retry).
+ */
+const PENDING_PUBLISH_RETRY_INTERVAL_MS = 1_000;
+
+/**
+ * Issue #239 — discriminated identifier for the durability leg that
+ * tripped the shutdown deadline. Surfaced via the
+ * `shutdown:verification-timeout` event so operators see which path
+ * stalled.
+ */
+export type ShutdownVerificationLeg =
+  | 'pin-verify'
+  | 'pointer-read-back'
+  | 'pending-publish-retry';
 
 export class LifecycleManager {
   /**
@@ -246,7 +297,7 @@ export class LifecycleManager {
     }
   }
 
-  async shutdown(): Promise<void> {
+  async shutdown(options?: ShutdownOptions): Promise<void> {
     if (this.host.getIsShuttingDown()) return;
     this.host.setIsShuttingDown(true);
 
@@ -288,6 +339,69 @@ export class LifecycleManager {
       }
     }
 
+    // Issue #239 — remote-durability gate.
+    //
+    // The flush pipeline above only guarantees that:
+    //   (a) the bundle CAR pin POST returned 200 (gateway accepted, but
+    //       may not yet serve to other peers — observed propagation lag
+    //       of ~15 s on testnet);
+    //   (b) the aggregator pointer publish was attempted (transient
+    //       failures leave a `pendingPublishCid` marker for retry; the
+    //       caller already returned 'submitted').
+    //
+    // Neither is sufficient for cross-process recovery on the same
+    // dataDir: the next process's `fetchCarFromIpfs(bundleCid)` may hit
+    // a 404 if propagation hasn't caught up, and the next process's
+    // `recoverLatest()` may miss the just-anchored pointer if a
+    // transient failure stamped only the local marker.
+    //
+    // The gate below blocks `shutdown()` until BOTH legs are remotely
+    // observable OR the deadline expires (in which case a
+    // `shutdown:verification-timeout` event surfaces the stall).
+    // `options.force === true` skips the gate (E2E / ungraceful-crash
+    // simulation) — the cold-start recovery path on next boot retries
+    // any unverified publish via the existing `pendingPublishCid`
+    // machinery.
+    const gateDeadlineMs =
+      options?.verificationDeadlineMs ??
+      SHUTDOWN_VERIFICATION_DEFAULT_DEADLINE_MS;
+    if (!options?.force && gateDeadlineMs > 0) {
+      try {
+        await this.awaitRemoteDurability({
+          deadlineMs: gateDeadlineMs,
+          reason: options?.reason,
+        });
+      } catch (err) {
+        // The gate emits structured events for the expected failure
+        // modes (deadline exceeded, gateway not serving). Anything that
+        // escapes here is a programmer error / unexpected throw — log
+        // and continue with teardown so shutdown still completes.
+        this.host.log(
+          `Shutdown durability gate threw unexpectedly (continuing teardown): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    } else {
+      // Force-quit path: ensure the cold-start retry will fire on next
+      // boot if the most recent publish wasn't confirmed. The
+      // `setPendingPublishCid` setter persists to localCache so the
+      // marker survives the immediate exit.
+      const lastSnapshot = this.host.getLastDiscoveredPointerCid();
+      if (lastSnapshot && !this.host.getPendingPublishCid()) {
+        // We have no way to verify whether the last publish succeeded
+        // here (the publisher clears `lastDiscoveredPointerCid` on
+        // success too), so this is a deliberate over-stamp: cold-start
+        // retry is idempotent — if the publish already landed, the
+        // re-publish is a no-op against the aggregator's version map.
+        this.host.setPendingPublishCid(lastSnapshot);
+        this.host.log(
+          `Shutdown (force): stamped pending-publish marker for cold-start retry: cid=${lastSnapshot}` +
+            (options?.reason ? ` reason=${options.reason}` : ''),
+        );
+      }
+    }
+
     // Steelman³⁸ warning: unsubscribe from replication BEFORE we null
     // out the cache, so any in-flight onReplication handler that was
     // about to read this.lastLoadedData / lastTokenManifest sees its
@@ -312,6 +426,572 @@ export class LifecycleManager {
     this.host.setInitialized(false);
     this.host.setStatus('disconnected');
     this.host.setIsShuttingDown(false);
+  }
+
+  // ===========================================================================
+  // Issue #239 — Remote-durability shutdown gate
+  // ===========================================================================
+
+  /**
+   * Issue #239 — block until the prior process's pins + publishes are
+   * verifiably durable on remote infrastructure, OR the deadline
+   * elapses.
+   *
+   * Three legs run concurrently inside a shared deadline:
+   *   1. **pending-publish retry**: if a previous publish left a
+   *      `pendingPublishCid` marker, retry it until cleared or the
+   *      deadline elapses.
+   *   2. **pin-verify**: HEAD-poll the most-recent UXF bundle CID
+   *      against the configured IPFS gateways until ≥1 gateway serves
+   *      it. Skipped when no bundle has been pinned this process
+   *      lifetime (`lastPinnedBundleCid === null`).
+   *   3. **pointer-read-back**: poll `pointer.recoverLatest()` until it
+   *      returns the most-recent published snapshot CID. Skipped when
+   *      no snapshot has been published (`lastDiscoveredPointerCid ===
+   *      null`) or no pointer layer is wired (the cross-process
+   *      recovery path is structurally absent — nothing to verify).
+   *
+   * On any leg failing within the deadline, a
+   * `shutdown:verification-timeout` event is emitted with structured
+   * detail. Shutdown continues regardless: the event is informational
+   * so operators can investigate cross-process recovery gaps without
+   * blocking the calling thread indefinitely.
+   *
+   * NB: this method MUST NOT throw on the expected failure modes —
+   * callers (`shutdown()` itself) wrap with a defensive try/catch but
+   * we keep the contract clean: gate either completes within the
+   * budget or emits a timeout event and returns.
+   *
+   * @param options.deadlineMs Total wall-clock budget across all legs.
+   * @param options.reason     Free-form context recorded in the
+   *                            timeout event payload.
+   */
+  async awaitRemoteDurability(options: {
+    readonly deadlineMs: number;
+    readonly reason?: string;
+  }): Promise<void> {
+    const deadline = Date.now() + Math.max(0, options.deadlineMs);
+    const remainingMs = (): number => Math.max(0, deadline - Date.now());
+
+    // Shared abort signal so a deadline-exceeded result in one leg
+    // tears down the others promptly. We do NOT abort early on
+    // single-leg success — the other legs still need to finish (or
+    // hit the deadline) to surface their own diagnostics.
+    const controller = new AbortController();
+    const deadlineTimer = setTimeout(() => controller.abort(), remainingMs());
+
+    const bundleCid = this.host.getLastPinnedBundleCid();
+    const snapshotCid = this.host.getLastDiscoveredPointerCid();
+    const pendingCid = this.host.getPendingPublishCid();
+
+    // Issue #239 — per-flush watermark short-circuit. When the per-
+    // flush gate already HEAD-verified the current pin and matched the
+    // aggregator read-back on the current snapshot, the shutdown gate
+    // has nothing new to confirm: re-running the legs would waste
+    // 15-30s on round-trips that already succeeded. Skip the
+    // corresponding leg when its watermark matches.
+    const verifiedBundle = this.host.getLastVerifiedBundleCid();
+    const verifiedSnapshot = this.host.getLastVerifiedSnapshotCid();
+    const bundleNeedsVerify = bundleCid !== null && bundleCid !== verifiedBundle;
+    const snapshotNeedsVerify = snapshotCid !== null && snapshotCid !== verifiedSnapshot;
+
+    const reason = options.reason;
+
+    // Pre-check: every leg is a no-op. Skip the timer + Promise.allSettled
+    // overhead entirely so a shutdown with nothing to verify returns
+    // in microseconds (common for read-only sessions OR steady-state
+    // sessions where per-flush already verified everything).
+    if (!bundleNeedsVerify && !snapshotNeedsVerify && !pendingCid) {
+      clearTimeout(deadlineTimer);
+      this.host.log(
+        `Shutdown durability: nothing to verify (bundle ` +
+          `${bundleCid ? 'already verified per-flush' : 'not pinned'}, ` +
+          `snapshot ${snapshotCid ? 'already verified per-flush' : 'not published'}, ` +
+          `no pending publish)`,
+      );
+      return;
+    }
+
+    this.host.log(
+      `Shutdown durability gate: bundleCid=${bundleCid ?? 'none'} ` +
+        `(verified=${verifiedBundle ?? 'none'}) ` +
+        `snapshotCid=${snapshotCid ?? 'none'} ` +
+        `(verified=${verifiedSnapshot ?? 'none'}) ` +
+        `pendingCid=${pendingCid ?? 'none'} ` +
+        `deadlineMs=${options.deadlineMs}`,
+    );
+
+    const legs: Array<Promise<void>> = [];
+
+    // Leg 1 — pending-publish retry. Always runs (even when pendingCid
+    // is null at gate-entry) because a leg 3 read-back miss may
+    // re-arm the marker if the publish was lost.
+    legs.push(
+      this.awaitPendingPublishCleared(deadline, controller.signal, reason),
+    );
+
+    // Leg 2 — pin verify. Skip when (a) no bundle was pinned this
+    // session (cold-start-only read sessions) OR (b) the per-flush
+    // gate already verified this exact bundle CID.
+    if (bundleNeedsVerify && bundleCid !== null) {
+      legs.push(
+        this.awaitPinVerified(bundleCid, deadline, controller.signal, reason),
+      );
+    }
+
+    // Leg 3 — pointer read-back. Skip when (a) no pointer wired (no
+    // recoverable surface), (b) no snapshot published yet, OR (c) the
+    // per-flush gate already verified this exact snapshot CID is
+    // HEAD-readable. Read-back still runs for the snapshot leg even
+    // when per-flush verified it, because per-flush only checked HEAD
+    // accessibility — the aggregator read-back is an additional check
+    // the shutdown gate uniquely enforces.
+    const pointer = this.host.options?.getPointerLayer?.() ?? null;
+    if (snapshotCid && pointer) {
+      legs.push(
+        this.awaitAggregatorPointerReadBack(snapshotCid, deadline, controller.signal, reason),
+      );
+    }
+
+    await Promise.allSettled(legs);
+    clearTimeout(deadlineTimer);
+  }
+
+  /**
+   * Leg 1 — drive `retryPendingPublishIfAny()` on a fast cadence until
+   * the marker clears OR the deadline elapses. Emits
+   * `shutdown:verification-timeout` (`leg: 'pending-publish-retry'`) on
+   * deadline.
+   */
+  private async awaitPendingPublishCleared(
+    deadline: number,
+    signal: AbortSignal,
+    reason: string | undefined,
+  ): Promise<void> {
+    let lastError: string | undefined;
+    let lastCid: string | null = this.host.getPendingPublishCid();
+
+    while (Date.now() < deadline && !signal.aborted) {
+      const pending = this.host.getPendingPublishCid();
+      if (!pending) return;
+      lastCid = pending;
+
+      try {
+        const result = await this.retryPendingPublishIfAny();
+        if (!result.attempted) {
+          // Marker cleared between the check above and the retry —
+          // we're done.
+          return;
+        }
+        if (result.ok) {
+          // Marker cleared inside the retry.
+          return;
+        }
+        // Transient or permanent failure surface. Permanent leaves
+        // marker cleared too (see `publishAggregatorPointerBestEffort`),
+        // so we re-check at the top of the next loop iteration.
+        lastError = result.code ?? (result.transient ? 'TRANSIENT' : 'PERMANENT');
+      } catch (err) {
+        lastError = err instanceof Error ? err.message : String(err);
+      }
+
+      if (signal.aborted || Date.now() >= deadline) break;
+
+      const remaining = deadline - Date.now();
+      const sleepMs = Math.min(PENDING_PUBLISH_RETRY_INTERVAL_MS, Math.max(0, remaining));
+      if (sleepMs > 0) await this.sleepAbortable(sleepMs, signal);
+    }
+
+    // Marker may have cleared right at the abort/deadline boundary.
+    if (!this.host.getPendingPublishCid()) return;
+
+    this.emitVerificationTimeout({
+      leg: 'pending-publish-retry',
+      cidsInQuestion: lastCid ? [lastCid] : [],
+      lastError,
+      reason,
+    });
+  }
+
+  /**
+   * Leg 2 — wrap `verifyCidAccessibleWithRetry` for the bundle CID.
+   * Emits `shutdown:verification-timeout` (`leg: 'pin-verify'`) on
+   * `failureKind === 'deadline-exceeded'` or
+   * `'gateway-not-serving'`. The `'aborted'` outcome is also surfaced
+   * as a timeout — from the operator's perspective, the deadline (or
+   * an abort) terminated the verification before it succeeded.
+   */
+  private async awaitPinVerified(
+    bundleCid: string,
+    deadline: number,
+    signal: AbortSignal,
+    reason: string | undefined,
+  ): Promise<void> {
+    const result: VerifyCidAccessibleResult = await verifyCidAccessibleWithRetry(
+      this.host.ipfsGateways,
+      bundleCid,
+      {
+        deadlineMs: Math.max(0, deadline - Date.now()),
+        signal,
+      },
+    );
+    if (result.ok) {
+      this.host.log(
+        `Shutdown durability: bundle ${bundleCid} HEAD-verified ` +
+          `(attempts=${result.attempts}, elapsedMs=${result.elapsedMs})`,
+      );
+      return;
+    }
+    this.emitVerificationTimeout({
+      leg: 'pin-verify',
+      cidsInQuestion: [bundleCid],
+      lastError: result.failureKind,
+      reason,
+    });
+  }
+
+  /**
+   * Leg 3 — poll `pointer.recoverLatest()` until it returns
+   * `snapshotCid` OR the deadline elapses. Emits
+   * `shutdown:verification-timeout` (`leg: 'pointer-read-back'`) on
+   * deadline. A transient `recoverLatest()` throw (network error)
+   * is treated as a miss and the loop retries; permanent classification
+   * surfaces as a `storage:error` via the lifecycle's existing
+   * permanent-error path AND a verification-timeout event so the
+   * shutdown record is complete.
+   */
+  private async awaitAggregatorPointerReadBack(
+    snapshotCid: string,
+    deadline: number,
+    signal: AbortSignal,
+    reason: string | undefined,
+  ): Promise<void> {
+    const pointer = this.host.options?.getPointerLayer?.() ?? null;
+    if (!pointer) {
+      // Defensive — the caller already gated on pointer being non-null,
+      // but a teardown race could null it out between checks.
+      this.emitVerificationTimeout({
+        leg: 'pointer-read-back',
+        cidsInQuestion: [snapshotCid],
+        lastError: 'pointer-layer-unavailable',
+        reason,
+      });
+      return;
+    }
+
+    let lastError: string | undefined;
+    while (Date.now() < deadline && !signal.aborted) {
+      let recovered: { readonly cid: Uint8Array; readonly version: number } | null = null;
+      try {
+        recovered = await pointer.recoverLatest();
+      } catch (err) {
+        lastError = err instanceof Error ? err.message : String(err);
+        if (this.isPermanentPointerError(err)) {
+          // Permanent failure — no point in retrying. Surface the
+          // operator alert via the lifecycle's standard path AND the
+          // verification-timeout event so the shutdown record is
+          // complete.
+          this.host.emitEvent(this.host.buildErrorEvent('storage:error', err));
+          this.emitVerificationTimeout({
+            leg: 'pointer-read-back',
+            cidsInQuestion: [snapshotCid],
+            lastError,
+            reason,
+          });
+          return;
+        }
+        // Transient — fall through to sleep + retry.
+      }
+
+      if (recovered) {
+        try {
+          const recoveredCidStr = CID.decode(recovered.cid).toString();
+          if (recoveredCidStr === snapshotCid) {
+            this.host.log(
+              `Shutdown durability: aggregator read-back matched snapshot ` +
+                `${snapshotCid} (version=${recovered.version})`,
+            );
+            return;
+          }
+          lastError = `aggregator returned different cid (${recoveredCidStr})`;
+        } catch (err) {
+          lastError = err instanceof Error ? err.message : String(err);
+        }
+      } else if (!lastError) {
+        lastError = 'aggregator returned null (no anchor yet)';
+      }
+
+      if (signal.aborted || Date.now() >= deadline) break;
+      const remaining = deadline - Date.now();
+      const sleepMs = Math.min(POINTER_READBACK_POLL_MS, Math.max(0, remaining));
+      if (sleepMs > 0) await this.sleepAbortable(sleepMs, signal);
+    }
+
+    this.emitVerificationTimeout({
+      leg: 'pointer-read-back',
+      cidsInQuestion: [snapshotCid],
+      lastError,
+      reason,
+    });
+  }
+
+  /**
+   * Issue #239 — per-flush durability verification.
+   *
+   * Called by `FlushScheduler.flushToIpfs` AFTER pin + publish succeed,
+   * before the flush is considered "done". Verifies that the just-
+   * pinned CIDs are remotely fetchable by other peers (closes the
+   * cross-process invoice-loss path documented in #234 / #239 where
+   * `Sphere.destroy()` could return while the bundle CAR was still
+   * propagating across HTTP gateways).
+   *
+   * Legs:
+   *   1. **Bundle CID HEAD-accessible** on ≥1 IPFS gateway — the
+   *      cross-device fetch path's critical block.
+   *   2. **Snapshot CID HEAD-accessible** on ≥1 IPFS gateway — needed
+   *      because cross-device recovery fetches the snapshot CAR first,
+   *      then walks to bundle refs. Skipped when no snapshot was
+   *      published (`snapshotCid === null`, e.g. no pointer wiring).
+   *
+   * NOT verified here:
+   *   - **Aggregator `recoverLatest()` read-back of the snapshot CID.**
+   *     The aggregator's read replicas can lag the primary by tens of
+   *     seconds on testnet — verifying read-back per-flush would inject
+   *     unacceptable latency into every save (every token receive /
+   *     send / mint). The shutdown gate ({@link awaitRemoteDurability})
+   *     does perform this leg with the configurable shutdown deadline,
+   *     emitting a `shutdown:verification-timeout` event (warn-only,
+   *     non-throwing) if the read-back doesn't catch up before exit.
+   *     A successful `publishAggregatorPointerBestEffort` return already
+   *     guarantees the aggregator COMMITTED the new version; only the
+   *     replica catch-up is gapped, and the cold-start retry on next
+   *     boot covers the small percentage of cases where the next
+   *     process beats replica propagation.
+   *
+   * On ANY leg failing within the deadline, this method **throws** a
+   * structured error so the caller (FlushScheduler) can propagate the
+   * failure to `forceFlushSerialized`'s rejection arm. The at-least-
+   * once gate (`awaitNextFlush` → `PaymentsModule.handleIncomingTransfer`)
+   * then refuses to advance the Nostr `since` filter, the inbound event
+   * replays on next reconnect, and the addToken stateHash dedup ensures
+   * idempotency.
+   *
+   * @param bundleCid    The UXF bundle CID just pinned via flushToIpfs.
+   * @param snapshotCid  The lean-snapshot CID just published via
+   *                      publishSnapshotIfWired. Null when no pointer
+   *                      layer is wired.
+   * @param deadlineMs   Total wall-clock budget across both legs.
+   * @throws Error with code `FLUSH_DURABILITY_TIMEOUT` on any leg
+   *         exhausting the deadline, with structured detail on which
+   *         leg(s) failed.
+   */
+  async verifyFlushDurability(
+    bundleCid: string,
+    snapshotCid: string | null,
+    deadlineMs: number,
+  ): Promise<void> {
+    const deadline = Date.now() + Math.max(0, deadlineMs);
+
+    // No shared abort signal — every leg honors `deadline` directly via
+    // `Math.max(0, deadline - Date.now())`, and we wait for all legs
+    // (Promise.all) regardless of any single leg's outcome. A controller-
+    // based race against the same deadline can flip a happy-path success
+    // into a spurious 'aborted' result when the controller's setTimeout
+    // fires microseconds before the leg's own deadline check.
+    const noAbort = new AbortController(); // never aborted; honored as a no-op signal
+    const signal = noAbort.signal;
+
+    // Always verify the bundle CID — it's the cross-device fetch path's
+    // critical block.
+    const legs: Array<Promise<{ leg: ShutdownVerificationLeg; ok: boolean; lastError?: string; cid: string }>> = [];
+    legs.push(
+      this.verifyPinLeg(bundleCid, deadline, signal),
+    );
+
+    // Verify the snapshot CID HEAD when a snapshot was actually
+    // published. Cross-device recovery fetches the snapshot first, then
+    // walks bundle refs; both layers must be remotely readable.
+    if (snapshotCid) {
+      legs.push(
+        this.verifyPinLeg(snapshotCid, deadline, signal),
+      );
+    }
+
+    const results = await Promise.all(legs);
+
+    const failed = results.filter((r) => !r.ok);
+    if (failed.length === 0) {
+      // Stamp the verified watermark so the shutdown gate can skip its
+      // own redundant verification when these same CIDs are still the
+      // most-recent ones at destroy() time.
+      this.host.setLastVerifiedBundleCid(bundleCid);
+      if (snapshotCid) {
+        this.host.setLastVerifiedSnapshotCid(snapshotCid);
+      }
+      return;
+    }
+
+    const cidsInQuestion = failed.map((f) => f.cid);
+    const legSummary = failed.map((f) => `${f.leg}:${f.cid}=${f.lastError ?? 'fail'}`).join('; ');
+    const err = new Error(
+      `Flush durability verification timed out (${failed.length}/${results.length} legs failed): ` +
+        legSummary,
+    );
+    (err as Error & { code?: string; details?: unknown }).code = 'FLUSH_DURABILITY_TIMEOUT';
+    (err as Error & { code?: string; details?: unknown }).details = {
+      failedLegs: failed.map((f) => ({ leg: f.leg, cid: f.cid, lastError: f.lastError })),
+      cidsInQuestion,
+    };
+    throw err;
+  }
+
+  /**
+   * Single pin-verify leg used by both the shutdown gate and the
+   * per-flush gate. Returns a structured result instead of emitting /
+   * throwing so each caller can compose the legs differently.
+   */
+  private async verifyPinLeg(
+    cid: string,
+    deadline: number,
+    signal: AbortSignal,
+  ): Promise<{ leg: 'pin-verify'; ok: boolean; lastError?: string; cid: string }> {
+    const result = await verifyCidAccessibleWithRetry(
+      this.host.ipfsGateways,
+      cid,
+      { deadlineMs: Math.max(0, deadline - Date.now()), signal },
+    );
+    if (result.ok) {
+      this.host.log(
+        `Profile durability: ${cid} HEAD-verified (attempts=${result.attempts}, elapsedMs=${result.elapsedMs})`,
+      );
+      return { leg: 'pin-verify', ok: true, cid };
+    }
+    return { leg: 'pin-verify', ok: false, lastError: result.failureKind, cid };
+  }
+
+  /**
+   * Single pointer-read-back leg used by both the shutdown gate and
+   * the per-flush gate. Returns a structured result for the same
+   * composition reason as {@link verifyPinLeg}.
+   */
+  private async verifyPointerReadBackLeg(
+    snapshotCid: string,
+    deadline: number,
+    signal: AbortSignal,
+  ): Promise<{ leg: 'pointer-read-back'; ok: boolean; lastError?: string; cid: string }> {
+    const pointer = this.host.options?.getPointerLayer?.() ?? null;
+    if (!pointer) {
+      return {
+        leg: 'pointer-read-back',
+        ok: false,
+        lastError: 'pointer-layer-unavailable',
+        cid: snapshotCid,
+      };
+    }
+
+    let lastError: string | undefined;
+    while (Date.now() < deadline && !signal.aborted) {
+      let recovered: { readonly cid: Uint8Array; readonly version: number } | null = null;
+      try {
+        recovered = await pointer.recoverLatest();
+      } catch (err) {
+        lastError = err instanceof Error ? err.message : String(err);
+        if (this.isPermanentPointerError(err)) {
+          // Permanent failures surface via the lifecycle's standard
+          // `storage:error` path — the per-flush gate also throws
+          // through the caller (it's a verification failure either way).
+          this.host.emitEvent(this.host.buildErrorEvent('storage:error', err));
+          return {
+            leg: 'pointer-read-back',
+            ok: false,
+            lastError,
+            cid: snapshotCid,
+          };
+        }
+      }
+
+      if (recovered) {
+        try {
+          const recoveredStr = CID.decode(recovered.cid).toString();
+          if (recoveredStr === snapshotCid) {
+            this.host.log(
+              `Profile durability: aggregator read-back matched ${snapshotCid} ` +
+                `(version=${recovered.version})`,
+            );
+            return { leg: 'pointer-read-back', ok: true, cid: snapshotCid };
+          }
+          lastError = `aggregator returned different cid (${recoveredStr})`;
+        } catch (err) {
+          lastError = err instanceof Error ? err.message : String(err);
+        }
+      } else if (!lastError) {
+        lastError = 'aggregator returned null (no anchor yet)';
+      }
+
+      if (signal.aborted || Date.now() >= deadline) break;
+      const remaining = deadline - Date.now();
+      const sleepMs = Math.min(POINTER_READBACK_POLL_MS, Math.max(0, remaining));
+      if (sleepMs > 0) await this.sleepAbortable(sleepMs, signal);
+    }
+
+    return {
+      leg: 'pointer-read-back',
+      ok: false,
+      lastError,
+      cid: snapshotCid,
+    };
+  }
+
+  /**
+   * Issue #239 — emit a structured `shutdown:verification-timeout`
+   * event. Centralised so the payload shape is uniform across the
+   * three legs.
+   */
+  private emitVerificationTimeout(payload: {
+    readonly leg: ShutdownVerificationLeg;
+    readonly cidsInQuestion: readonly string[];
+    readonly lastError?: string;
+    readonly reason?: string;
+  }): void {
+    this.host.log(
+      `Shutdown durability TIMEOUT leg=${payload.leg} cids=[${payload.cidsInQuestion.join(',')}] ` +
+        `lastError=${payload.lastError ?? 'unknown'} reason=${payload.reason ?? 'none'}`,
+    );
+    this.host.emitEvent({
+      type: 'shutdown:verification-timeout',
+      timestamp: Date.now(),
+      data: {
+        leg: payload.leg,
+        cidsInQuestion: [...payload.cidsInQuestion],
+        lastError: payload.lastError,
+        reason: payload.reason,
+      },
+    });
+  }
+
+  /**
+   * Resolves after `ms` ms OR when `signal` aborts (whichever first).
+   * Local helper for the verification legs' inter-attempt sleeps so a
+   * shared deadline tears them all down promptly.
+   */
+  private sleepAbortable(ms: number, signal: AbortSignal): Promise<void> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        signal.removeEventListener('abort', onAbort);
+        resolve();
+      }, ms);
+      const onAbort = (): void => {
+        clearTimeout(timer);
+        signal.removeEventListener('abort', onAbort);
+        resolve();
+      };
+      if (signal.aborted) {
+        clearTimeout(timer);
+        resolve();
+        return;
+      }
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
   }
 
   // ===========================================================================

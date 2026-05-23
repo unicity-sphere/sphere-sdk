@@ -176,9 +176,15 @@ export interface TokenStorageProvider<TData = unknown> extends BaseProvider {
   initialize(): Promise<boolean>;
 
   /**
-   * Shutdown provider
+   * Shutdown provider.
+   *
+   * Issue #239 — `options.force` selects between the normal-mode
+   * shutdown contract (must verify remote durability before returning;
+   * see {@link ShutdownOptions}) and the fast-exit contract for tests /
+   * ungraceful-crash simulation. Providers without a remote-durability
+   * boundary (file/IndexedDB) silently ignore the options.
    */
-  shutdown(): Promise<void>;
+  shutdown(options?: ShutdownOptions): Promise<void>;
 
   /**
    * Save token data
@@ -280,7 +286,18 @@ export type StorageEventType =
   | 'sync:started'
   | 'sync:completed'
   | 'sync:conflict'
-  | 'sync:error';
+  | 'sync:error'
+  /**
+   * Issue #239 — emitted by `LifecycleManager.shutdown` when the
+   * remote-durability verification gate exhausts its deadline on at
+   * least one leg. `data` carries `{ leg, cidsInQuestion, lastError?,
+   * reason? }` so operators see which path stalled (`pin-verify` /
+   * `pointer-read-back` / `pending-publish-retry`) and which CIDs are
+   * affected. Shutdown continues to tear down regardless; the event is
+   * informational so operators can investigate cross-process recovery
+   * gaps. Skipped when `Sphere.destroy({ force: true })` is used.
+   */
+  | 'shutdown:verification-timeout';
 
 export interface StorageEvent {
   type: StorageEventType;
@@ -300,6 +317,36 @@ export interface StorageEvent {
 }
 
 export type StorageEventCallback = (event: StorageEvent) => void;
+
+/**
+ * Issue #239 — options for `TokenStorageProvider.shutdown` and
+ * `Sphere.destroy`. Providers with a remote-durability boundary
+ * (Profile/OrbitDB+IPFS) interpret these to gate exit on cross-process
+ * recoverability; simpler providers (file/IndexedDB) ignore them.
+ */
+export interface ShutdownOptions {
+  /**
+   * Skip the remote-durability verification gate and tear down
+   * immediately. The provider stamps a `pendingPublishCid` marker for
+   * any unconfirmed publish so the next process boot retries via the
+   * cold-start recovery path. Used by E2E tests to simulate ungraceful
+   * crash and by operators who need a fast forced exit. Default `false`
+   * — production callers MUST omit this so the normal-mode contract
+   * applies.
+   */
+  readonly force?: boolean;
+  /**
+   * Optional free-form reason recorded in `shutdown:verification-timeout`
+   * payloads. Useful for operator triage when the wallet is being
+   * destroyed in response to a specific event (sign-out, error, etc.).
+   */
+  readonly reason?: string;
+  /**
+   * Override the total verification deadline in ms. Default 30 000.
+   * Applies only when `force !== true`.
+   */
+  readonly verificationDeadlineMs?: number;
+}
 
 // =============================================================================
 // Token Storage Data Format (TXF)

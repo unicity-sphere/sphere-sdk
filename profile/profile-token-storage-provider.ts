@@ -59,6 +59,7 @@ import type {
   SaveResult,
   LoadResult,
   SyncResult,
+  ShutdownOptions,
   StorageEventCallback,
   StorageEvent,
   HistoryRecord,
@@ -198,6 +199,27 @@ export class ProfileTokenStorageProvider
 
   // --- Last pinned CID for flush retry (Fix 8) ---
   private lastPinnedCid: string | null = null;
+
+  /**
+   * Issue #239 — most-recent UXF bundle CID successfully pinned + written
+   * to OrbitDB. Survives across flushes (unlike `lastPinnedCid`, the
+   * pin-retry cache) so `LifecycleManager.shutdown()` can HEAD-verify
+   * the bundle CAR is served by ≥1 IPFS gateway before exiting.
+   * Null until the first successful flush.
+   */
+  private lastPinnedBundleCid: string | null = null;
+
+  /**
+   * Issue #239 — verified-watermark CIDs. Set by
+   * `verifyFlushDurability` after each successful per-flush
+   * verification. Shutdown gate consults these to skip its own
+   * verification when the just-flushed CIDs are already verified
+   * (eliminates ~15-30s of redundant HEAD + aggregator round-trips
+   * per destroy() in the common case where every save was per-flush
+   * verified). Null until the first successful verification.
+   */
+  private lastVerifiedBundleCid: string | null = null;
+  private lastVerifiedSnapshotCid: string | null = null;
 
   // --- Last CID observed via aggregator pointer (Fix 2 of cross-device sync) ---
   // Set by LifecycleManager on cold-start recoverLatest and on every
@@ -376,6 +398,18 @@ export class ProfileTokenStorageProvider
       setLastPinnedCid: (c) => {
         this.lastPinnedCid = c;
       },
+      getLastPinnedBundleCid: () => this.lastPinnedBundleCid,
+      setLastPinnedBundleCid: (c) => {
+        this.lastPinnedBundleCid = c;
+      },
+      getLastVerifiedBundleCid: () => this.lastVerifiedBundleCid,
+      setLastVerifiedBundleCid: (c) => {
+        this.lastVerifiedBundleCid = c;
+      },
+      getLastVerifiedSnapshotCid: () => this.lastVerifiedSnapshotCid,
+      setLastVerifiedSnapshotCid: (c) => {
+        this.lastVerifiedSnapshotCid = c;
+      },
       getLastDiscoveredPointerCid: () => this.lastDiscoveredPointerCid,
       setLastDiscoveredPointerCid: (c) => {
         this.lastDiscoveredPointerCid = c;
@@ -451,6 +485,12 @@ export class ProfileTokenStorageProvider
       // (legacy tests); else fetches the CAR, parses as lean snapshot,
       // and dispatches per-writer JOIN through the host's applier.
       applySnapshotIfWired: (cid) => this.applySnapshotIfWired(cid),
+      // Issue #239 — per-flush remote-durability verification entry
+      // point for FlushScheduler. Delegates to LifecycleManager which
+      // runs HEAD-verify + aggregator read-back legs in parallel and
+      // throws on deadline. See ProfileTokenStorageHost.verifyFlushDurability.
+      verifyFlushDurability: (bundleCid, snapshotCid, deadlineMs) =>
+        this.verifyFlushDurability(bundleCid, snapshotCid, deadlineMs),
     };
   }
 
@@ -839,6 +879,29 @@ export class ProfileTokenStorageProvider
   }
 
   /**
+   * Issue #239 — host-surface entry point for the per-flush remote-
+   * durability verification gate. Delegates to
+   * `LifecycleManager.verifyFlushDurability`. Exposed via the
+   * `ProfileTokenStorageHost` interface so FlushScheduler can call it
+   * AFTER pin + publish complete; throws on verification failure so
+   * `forceFlushSerialized`'s rejection arm propagates the failure to
+   * `awaitNextFlush` and the at-least-once gate refuses the Nostr ack.
+   * See `ProfileTokenStorageHost.verifyFlushDurability` for the
+   * contract.
+   */
+  verifyFlushDurability(
+    bundleCid: string,
+    snapshotCid: string | null,
+    deadlineMs: number,
+  ): Promise<void> {
+    return this.lifecycleManager.verifyFlushDurability(
+      bundleCid,
+      snapshotCid,
+      deadlineMs,
+    );
+  }
+
+  /**
    * Item #15 Phase D.2 — public accessor for the wallet-global
    * {@link BundleIndex}. Exposed so the factory's pull-side dispatcher
    * (`runProfileSnapshotJoin`) can dispatch JOIN over the
@@ -870,7 +933,7 @@ export class ProfileTokenStorageProvider
     );
   }
 
-  async shutdown(): Promise<void> {
+  async shutdown(options?: ShutdownOptions): Promise<void> {
     // Item #15 Phase C.2 — cancel the dirty-flush debounce BEFORE the
     // lifecycle's shutdown so the lifecycle's `setIsShuttingDown(true)`
     // doesn't race a late-firing timer that would re-enter the dispatch
@@ -883,7 +946,10 @@ export class ProfileTokenStorageProvider
       // Best-effort — the dispatch path already surfaces errors via
       // storage:error; shutdown shouldn't fail on a flush error.
     }
-    await this.lifecycleManager.shutdown();
+    // Issue #239 — pass shutdown options through to LifecycleManager
+    // so it can run (or skip, on `force: true`) the remote-durability
+    // gate before the provider tears down.
+    await this.lifecycleManager.shutdown(options);
     // Latch the sticky shutdown flag AFTER the lifecycle finishes so
     // any late-arriving signal from a writer that outlives the
     // provider becomes a definite no-op.

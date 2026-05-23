@@ -537,6 +537,18 @@ export function createProfileProviders(
     addressId: 'default',
     encrypt: resolvedConfig.encrypt !== false,
     flushDebounceMs: resolvedConfig.flushDebounceMs,
+    // Issue #239 — propagate the per-flush remote-durability deadline
+    // from ProfileConfig into the token storage provider. The factory
+    // is the production seam, so the default here is 30 000 ms (the
+    // contracted value from the issue spec). Callers can pass `0` in
+    // `ProfileConfig.flushVerificationDeadlineMs` to opt out.
+    //
+    // The provider's direct-construction default is 0 (off) so legacy
+    // tests that wire stub pointers + mock gateways don't hang on
+    // HEAD retries; the factory override above is what gives real
+    // wallets the verification contract.
+    flushVerificationDeadlineMs:
+      resolvedConfig.flushVerificationDeadlineMs ?? 30_000,
     oracle,
     // Lazy accessor: the pointer layer is built inside
     // `storage.doConnect()` after OrbitDB attach, long after the
