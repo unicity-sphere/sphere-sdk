@@ -325,6 +325,11 @@ export class ProfileTokenStorageProvider
       localCache: this.localCache,
       flushDebounceMs: this.flushDebounceMs,
       eventCallbacks: this.eventCallbacks,
+      // Issue #236 — local Helia accessor, resolved lazily on each call
+      // so connect()/close() lifecycle transitions are observed by the
+      // next pin/fetch operation. Returns `null` for adapters predating
+      // issue #236 (no getHelia method on ProfileDatabase).
+      getHelia: () => this.db.getHelia?.() ?? null,
       // Lifecycle state
       getStatus: () => this.status,
       setStatus: (s) => {
@@ -1159,7 +1164,22 @@ export class ProfileTokenStorageProvider
           // reassembles a synthetic CAR so `UxfPackage.fromCar` stays
           // unchanged. Legacy raw-CIDs (pre-#200) still resolve via the
           // backward-compat branch inside `fetchCarFromIpfs`.
-          const carBytes = await fetchCarFromIpfs(this._ipfsGateways, cid);
+          //
+          // Issue #236 — pass the local Helia handle so the BFS block
+          // walk satisfies each per-block fetch from our on-disk
+          // blockstore first when available. Cross-process recovery on
+          // the same `dataDir` becomes deterministic: blocks pinned by
+          // the prior process are read locally, independent of HTTP
+          // gateway propagation (~15s on testnet). Cross-device
+          // recovery (where the local blockstore is empty) falls back
+          // to the gateway loop as before.
+          const carBytes = await fetchCarFromIpfs(
+            this._ipfsGateways,
+            cid,
+            undefined,
+            undefined,
+            this.db.getHelia?.(),
+          );
           const pkg = await UxfPackage.fromCar(carBytes);
           loadedBundles.push({ cid, pkg });
         } catch (err) {

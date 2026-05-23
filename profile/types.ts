@@ -510,6 +510,25 @@ export interface ProfileDatabase {
   isConnected(): boolean;
 
   /**
+   * Issue #236 — Local Helia accessor (read-only). Exposes the underlying
+   * Helia IPFS node so callers (the Profile token-storage layer's pin and
+   * fetch paths) can use the local on-disk blockstore as the primary CAR
+   * store, treating HTTP IPFS gateways as best-effort replication.
+   *
+   * Returns the Helia handle on a connected adapter, or `null` when the
+   * adapter has not been connected, has been closed, or the implementation
+   * does not run a local Helia node. Typed as `unknown` so the public
+   * interface does not leak `helia` types — consumers cast to a minimal
+   * structural shape (`{ blockstore: { get, put, has } }`).
+   *
+   * Optional in the interface so legacy adapters that pre-date issue #236
+   * (or test stubs) remain compatible — callers MUST treat a missing
+   * accessor as equivalent to `null` and fall back to HTTP gateways for
+   * both pin and fetch.
+   */
+  getHelia?(): unknown | null;
+
+  /**
    * Write a structured OpLog entry envelope (PROFILE-OPLOG-SCHEMA.md §5).
    * Type is imported lazily via `import type` elsewhere; declared as
    * `unknown` here to avoid a circular types dependency.

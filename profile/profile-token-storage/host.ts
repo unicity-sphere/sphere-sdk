@@ -75,6 +75,22 @@ export interface ProfileTokenStorageHost {
   readonly flushDebounceMs: number;
   readonly eventCallbacks: Set<StorageEventCallback>;
 
+  /**
+   * Issue #236 — accessor for the local Helia node so the flush and load
+   * paths can use the local on-disk blockstore as the primary CAR store.
+   *
+   * Resolved lazily on each call so a `connect()` that lands after the
+   * host is wired (or a `close()` that nulls it out before shutdown) is
+   * observed by the next pin/fetch operation. Returns `null` when the
+   * underlying `ProfileDatabase` is disconnected, when the adapter
+   * predates issue #236 (no `getHelia` method), or when the adapter does
+   * not run a local Helia (test stubs).
+   *
+   * Callers cast the returned value to a structural `{ blockstore: ... }`
+   * shape and treat `null` as "no local fast-path; HTTP gateways only".
+   */
+  getHelia(): unknown | null;
+
   // --- Lifecycle state ---
   getStatus(): ProviderStatus;
   setStatus(s: ProviderStatus): void;

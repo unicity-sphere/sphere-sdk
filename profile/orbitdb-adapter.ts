@@ -733,6 +733,25 @@ export class OrbitDbAdapter implements ProfileDatabase {
     return this.connected;
   }
 
+  /**
+   * Issue #236 — Expose the underlying Helia node so the Profile token-
+   * storage pin/fetch paths can use the local on-disk blockstore as the
+   * primary CAR store. Returns `null` when disconnected or pre-`connect()`.
+   *
+   * Why this is safe to expose:
+   *   - The accessor is READ-ONLY (no `setHelia`) — callers cannot swap
+   *     out our IPFS substrate.
+   *   - The returned handle is the SAME instance the adapter uses for
+   *     OrbitDB's own blockstore, so writes via `blockstore.put` share
+   *     the on-disk persistence directory configured at `connect()` time.
+   *   - Typed as `unknown` to keep helia types out of the public Profile
+   *     interface (the rest of the SDK still tree-shakes cleanly when
+   *     helia is absent — the adapter is the single point of contact).
+   */
+  getHelia(): unknown | null {
+    return this.helia ?? null;
+  }
+
   // ---------- Private helpers ----------
 
   /**

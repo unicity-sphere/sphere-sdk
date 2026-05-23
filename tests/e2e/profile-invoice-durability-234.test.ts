@@ -19,15 +19,18 @@
  *     IPFS gateways and the bundle CID is written to the shared
  *     OrbitDbAdapter via bundleIndex.addBundle.
  *   - The bundle CID PERSISTS in OrbitDB across destroy/restart.
- *   - **But** the next process's load() resolves that CID through
- *     IPFS HTTP gateways, and the gateways have not yet propagated the
- *     just-pinned blocks — fetch returns "not found", the bundle merges
- *     0 tokens, and the invoice is silently absent.
+ *   - Pre-#236: the next process's load() resolved that CID through
+ *     IPFS HTTP gateways and depended on ~15s gateway propagation.
  *
- *   The 15-second wait below buffers gateway propagation. Without it
- *   the test fails reliably (Phase 2 sees 0 tokens). With it the test
- *   passes — proving the durability path works once propagation has
- *   caught up.
+ * Issue #236 — cross-process durability without gateway propagation.
+ * `pinCarBlocksToIpfs` now writes every block to the local Helia
+ * blockstore (managed by `OrbitDbAdapter`) before the HTTP pin, and
+ * `fetchCarFromIpfs` consults the same blockstore first on the fetch
+ * path. Both phases of this test share the same `dataDir` and re-open
+ * Helia on the persisted on-disk store, so the post-destroy re-init
+ * reads blocks locally with NO HTTP gateway round-trip — propagation
+ * lag is no longer in the critical path. The 15s wait that PR #235
+ * needed to buffer gateway propagation is now redundant.
  *
  * Required infra: aggregator (L3 mint) + ipfs (Profile CAR pin).
  *
@@ -123,13 +126,13 @@ describe.skipIf(SKIP_INFRA)(
       await sphereA.destroy();
       spheres.splice(spheres.indexOf(sphereA), 1);
 
-      // IPFS propagation buffer. The CAR was just HTTP-pinned to the
-      // configured gateways but block availability lags acceptance —
-      // see header comment. The aggregator pointer publish (also fired
-      // during the flush) needs the same window to become observable.
-      // 15 s tracks the upper bound observed on testnet for both.
-      console.log('  Waiting 15s for IPFS + aggregator propagation...');
-      await new Promise((r) => setTimeout(r, 15_000));
+      // Issue #236 — no propagation buffer required. Helia's on-disk
+      // blockstore persists across the destroy() above and re-opens
+      // when Phase 2's `OrbitDbAdapter.connect()` recreates Helia with
+      // the same `directory`. The next `tokenStorage.load()` reads the
+      // bundle blocks from local Helia synchronously, regardless of
+      // HTTP gateway propagation. Removing this wait is the primary
+      // acceptance signal for issue #236.
 
       // ---------------- Phase 2: re-init on the SAME dirs --------------
       console.log('\n[Issue #234] Phase 2: re-init on SAME dirs...');
