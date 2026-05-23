@@ -4519,10 +4519,22 @@ export class Sphere {
     }
 
     await this._transport.disconnect();
-    await this._storage.disconnect();
-    await this._oracle.disconnect();
 
-    // Shutdown original token storage providers (close IndexedDB connections etc.)
+    // Issue #234 (shutdown ordering): shutdown token storage providers
+    // BEFORE disconnecting the KV storage. ProfileTokenStorageProvider
+    // shares its OrbitDbAdapter instance with ProfileStorageProvider
+    // (see profile/factory.ts:427); the token provider's shutdown-time
+    // flush writes the bundle CID via bundleIndex.addBundle ->
+    // db.putEntry on that shared adapter. If _storage.disconnect()
+    // runs first, the put throws PROFILE_NOT_INITIALIZED, the flush
+    // throws, the aggregator pointer publish is skipped, and the
+    // just-pinned CAR is orphaned. Note: this races a SECOND failure
+    // mode tracked under #234 — IPFS gateway propagation lag, where
+    // even a successful flush leaves the next process's load() unable
+    // to fetch the CAR until the gateways catch up. This reorder is
+    // necessary but NOT sufficient to fix the manual-test failure;
+    // the IPFS propagation fix (e.g., persist CAR blocks to the local
+    // Helia blockstore) is recommended as a follow-up.
     for (const provider of this._tokenStorageProviders.values()) {
       try {
         await provider.shutdown();
@@ -4531,6 +4543,9 @@ export class Sphere {
       }
     }
     this._tokenStorageProviders.clear();
+
+    await this._storage.disconnect();
+    await this._oracle.disconnect();
 
     this._initialized = false;
     this._trackedAddressesLoaded = false;
