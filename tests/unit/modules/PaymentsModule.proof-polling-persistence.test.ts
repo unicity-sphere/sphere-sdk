@@ -841,6 +841,158 @@ describe('#144 L3 — balance-model invariant + stranded recovery', () => {
     const recovered = await internals(module).recoverStrandedReceivedTokens();
     expect(recovered).toBe(0);
   });
+
+  // Issue #231 — finalizeStrandedReceivedToken hit InvalidJsonStructureError
+  // from TransferTransaction.fromJSON every sync cycle without ever
+  // converging or marking the token invalid. Pre-fix the error was caught
+  // and swallowed (returned normally), so the resolveUnconfirmed path
+  // deleted the job, but the token stayed 'pending' — letting the next
+  // load's `recoverStrandedReceivedTokens` re-register the job and produce
+  // the same error indefinitely.
+  it('finalizeStrandedReceivedToken classifies InvalidJsonStructureError as permanent and stops retrying (issue #231)', async () => {
+    // Set up a stranded V6-direct receive in 'pending' status.
+    const sdkData = makeV6DirectReceiveSdkData();
+    const token: Token = {
+      id: GENESIS_TOKEN_ID,
+      coinId: 'UCT_HEX',
+      symbol: 'UCT',
+      amount: '100',
+      status: 'pending',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      sdkData,
+    };
+    internals(module).tokens.set(token.id, token);
+
+    // Oracle returns a (malformed-looking) proof — the value itself
+    // doesn't matter because the SDK mock throws.
+    (setup.deps.oracle as { getProof: ReturnType<typeof vi.fn> }).getProof =
+      vi.fn().mockResolvedValue({ toJSON: () => ({ malformed: 'shape' }) });
+
+    // Make TransferTransaction.fromJSON throw the exact SDK error class
+    // the bug surfaces. The mock is reset after the test.
+    const sdkErrMod = await import(
+      '@unicitylabs/state-transition-sdk/lib/InvalidJsonStructureError'
+    );
+    const InvalidJsonStructureError = sdkErrMod.InvalidJsonStructureError;
+    const ttMod = await import(
+      '@unicitylabs/state-transition-sdk/lib/transaction/TransferTransaction'
+    );
+    const prior = ttMod.TransferTransaction.fromJSON;
+    (ttMod.TransferTransaction.fromJSON as unknown as ReturnType<typeof vi.fn>) = vi
+      .fn()
+      .mockRejectedValue(new InvalidJsonStructureError());
+
+    try {
+      // Register a recovery job and invoke the private finalize directly.
+      const lastTxJson = { previousStateHash: STATE_HASH, predicate: 'pred2', data: {} };
+      const sourceTokenJson = JSON.stringify({ genesis: { data: { tokenId: GENESIS_TOKEN_ID } } });
+      internals(module).proofPollingJobs.set(GENESIS_TOKEN_ID, {
+        tokenId: GENESIS_TOKEN_ID,
+        requestIdHex: '00deadbeef',
+        commitmentJson: '',
+        sourceTokenJson,
+        startedAt: Date.now(),
+        attemptCount: 0,
+        lastAttemptAt: 0,
+      });
+
+      await (module as unknown as {
+        finalizeStrandedReceivedToken: (
+          tokenId: string,
+          sourceTokenJson: string,
+          lastTxJson: Record<string, unknown>,
+        ) => Promise<void>;
+      }).finalizeStrandedReceivedToken(GENESIS_TOKEN_ID, sourceTokenJson, lastTxJson);
+
+      // 1. Token marked invalid — recoverStrandedReceivedTokens (which
+      //    only re-picks tokens at status='pending') will now skip it.
+      expect(internals(module).tokens.get(GENESIS_TOKEN_ID)?.status).toBe('invalid');
+
+      // 2. Job removed — no further polling-tick retries.
+      expect(internals(module).proofPollingJobs.has(GENESIS_TOKEN_ID)).toBe(false);
+
+      // 3. Operator alert fired with the structural disposition reason.
+      const alerts = setup.emittedEvents.filter(
+        (e) => e.type === 'transfer:operator-alert',
+      );
+      expect(alerts.length).toBeGreaterThanOrEqual(1);
+      const alert = alerts[alerts.length - 1].payload as {
+        code: string;
+        tokenId: string;
+        message: string;
+      };
+      expect(alert.code).toBe('structural');
+      expect(alert.tokenId).toBe(GENESIS_TOKEN_ID);
+      expect(alert.message).toContain('cannot be finalized');
+    } finally {
+      (ttMod.TransferTransaction.fromJSON as unknown as ReturnType<typeof vi.fn>) = prior as never;
+    }
+  });
+
+  it('finalizeStrandedReceivedToken keeps non-structural errors transient (existing behaviour)', async () => {
+    // A garden-variety throw (network blip, oracle reject) should NOT
+    // trip the permanent-fail path: the token must remain at 'pending'
+    // and the job stays in the queue for the next poll tick.
+    const sdkData = makeV6DirectReceiveSdkData();
+    const token: Token = {
+      id: GENESIS_TOKEN_ID,
+      coinId: 'UCT_HEX',
+      symbol: 'UCT',
+      amount: '100',
+      status: 'pending',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      sdkData,
+    };
+    internals(module).tokens.set(token.id, token);
+
+    (setup.deps.oracle as { getProof: ReturnType<typeof vi.fn> }).getProof =
+      vi.fn().mockResolvedValue({ toJSON: () => ({ ok: 'shape' }) });
+
+    const ttMod = await import(
+      '@unicitylabs/state-transition-sdk/lib/transaction/TransferTransaction'
+    );
+    const prior = ttMod.TransferTransaction.fromJSON;
+    (ttMod.TransferTransaction.fromJSON as unknown as ReturnType<typeof vi.fn>) = vi
+      .fn()
+      .mockRejectedValue(new Error('Transient network blip'));
+
+    try {
+      const lastTxJson = { previousStateHash: STATE_HASH, predicate: 'pred2', data: {} };
+      const sourceTokenJson = JSON.stringify({ genesis: { data: { tokenId: GENESIS_TOKEN_ID } } });
+      internals(module).proofPollingJobs.set(GENESIS_TOKEN_ID, {
+        tokenId: GENESIS_TOKEN_ID,
+        requestIdHex: '00deadbeef',
+        commitmentJson: '',
+        sourceTokenJson,
+        startedAt: Date.now(),
+        attemptCount: 0,
+        lastAttemptAt: 0,
+      });
+
+      await (module as unknown as {
+        finalizeStrandedReceivedToken: (
+          tokenId: string,
+          sourceTokenJson: string,
+          lastTxJson: Record<string, unknown>,
+        ) => Promise<void>;
+      }).finalizeStrandedReceivedToken(GENESIS_TOKEN_ID, sourceTokenJson, lastTxJson);
+
+      // Status stays pending — caller's polling tick / cumulative-cap
+      // mechanism eventually marks it invalid.
+      expect(internals(module).tokens.get(GENESIS_TOKEN_ID)?.status).toBe('pending');
+      // Job stays for retry — this code path does NOT delete the job.
+      expect(internals(module).proofPollingJobs.has(GENESIS_TOKEN_ID)).toBe(true);
+      // No operator alert from the transient path.
+      const alerts = setup.emittedEvents.filter(
+        (e) => e.type === 'transfer:operator-alert',
+      );
+      expect(alerts.length).toBe(0);
+    } finally {
+      (ttMod.TransferTransaction.fromJSON as unknown as ReturnType<typeof vi.fn>) = prior as never;
+    }
+  });
 });
 
 // =============================================================================

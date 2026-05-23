@@ -294,6 +294,7 @@ import { MintCommitment } from '@unicitylabs/state-transition-sdk/lib/transactio
 import { MintTransactionData } from '@unicitylabs/state-transition-sdk/lib/transaction/MintTransactionData';
 import { waitInclusionProof } from '@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils';
 import { InclusionProof } from '@unicitylabs/state-transition-sdk/lib/transaction/InclusionProof';
+import { InvalidJsonStructureError } from '@unicitylabs/state-transition-sdk/lib/InvalidJsonStructureError';
 import { TransferTransactionData } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferTransactionData';
 import { RequestId } from '@unicitylabs/state-transition-sdk/lib/api/RequestId';
 import { Authenticator } from '@unicitylabs/state-transition-sdk/lib/api/Authenticator';
@@ -9191,6 +9192,113 @@ export class PaymentsModule {
 
       logger.debug('Payments', `[V6-RECOVER] Finalized stranded receive ${tokenId.slice(0, 12)} → confirmed`);
     } catch (err) {
+      // Classify the error: structural / parse-shape failures cannot be
+      // fixed by retry — the on-disk `lastTxJson` or the aggregator
+      // `proofJson` is malformed in a way that no amount of re-polling
+      // changes. Without classification, V6-RECOVER would re-register the
+      // job on every process restart (via `recoverStrandedReceivedTokens`)
+      // and spam the operator with a non-converging error every cycle.
+      //
+      // Permanent failure handling:
+      //   1. Mark the token as 'invalid' so `recoverStrandedReceivedTokens`
+      //      doesn't re-pick it up on next load.
+      //   2. Remove any live proof-polling job for this token.
+      //   3. Emit `transfer:operator-alert` with code `structural`
+      //      (canonical disposition reason for parse-shape failures).
+      //   4. Log the shape of `lastTxJson` and `proofJson` at debug level
+      //      so SDK developers can diagnose the underlying SDK
+      //      `InclusionProof.fromJSON` / `TransferTransaction.fromJSON`
+      //      mismatch. Only top-level keys are logged — full payloads
+      //      may contain large authenticator bytes we don't need to dump.
+      //
+      // Issue: sphere-sdk#231.
+      const isPermanent = err instanceof InvalidJsonStructureError ||
+        (err as { name?: string } | null)?.name === 'InvalidJsonStructureError';
+
+      if (isPermanent) {
+        logger.error(
+          'Payments',
+          `[V6-RECOVER] Stranded receive ${tokenId.slice(0, 12)} hit permanent structural failure (no retry):`,
+          err,
+        );
+
+        // One-shot diagnostic dump so the SDK-level shape can be inspected.
+        // Top-level keys only — full bodies can carry large fields (proofs,
+        // authenticators) that aren't necessary for SDK-error triage.
+        try {
+          const job = this.proofPollingJobs.get(tokenId);
+          let proofShape: string[] | string = 'not-fetched';
+          if (job) {
+            try {
+              const proof = await this.deps!.oracle.getProof(job.requestIdHex);
+              if (proof) {
+                const proofWithToJson = proof as { toJSON?: () => unknown };
+                const pj = typeof proofWithToJson.toJSON === 'function'
+                  ? proofWithToJson.toJSON()
+                  : proof;
+                proofShape = pj && typeof pj === 'object'
+                  ? Object.keys(pj as Record<string, unknown>)
+                  : `non-object:${typeof pj}`;
+              } else {
+                proofShape = 'null';
+              }
+            } catch (fetchErr) {
+              proofShape = `fetch-threw:${(fetchErr as Error)?.message ?? fetchErr}`;
+            }
+          }
+          const lastTxKeys = lastTxJson && typeof lastTxJson === 'object'
+            ? Object.keys(lastTxJson)
+            : `non-object:${typeof lastTxJson}`;
+          logger.debug(
+            'Payments',
+            `[V6-RECOVER] ${tokenId.slice(0, 12)} diagnostic shapes: lastTxJsonKeys=${JSON.stringify(lastTxKeys)} proofKeys=${JSON.stringify(proofShape)}`,
+          );
+        } catch (diagErr) {
+          logger.debug('Payments', `[V6-RECOVER] ${tokenId.slice(0, 12)} diagnostic dump itself threw:`, diagErr);
+        }
+
+        // 1. Mark the token as invalid so subsequent load() runs skip it.
+        const token = this.tokens.get(tokenId);
+        if (token && (token.status === 'pending' || token.status === 'submitted')) {
+          token.status = 'invalid';
+          token.updatedAt = Date.now();
+          this.tokens.set(tokenId, token);
+          try {
+            await this.save();
+          } catch (saveErr) {
+            logger.warn('Payments', `[V6-RECOVER] Failed to persist invalid status for ${tokenId.slice(0, 12)}:`, saveErr);
+          }
+        }
+
+        // 2. Remove the proof-polling job and persist the change.
+        this.proofPollingJobs.delete(tokenId);
+        this.saveProofPollingJobs().catch((persistErr) =>
+          logger.debug('Payments', `[V6-RECOVER] saveProofPollingJobs after permanent-fail mark failed:`, persistErr),
+        );
+
+        // 3. Surface to operator/UI via the canonical `structural`
+        //    disposition reason — parse-shape failure that no retry fixes.
+        try {
+          this.deps!.emitEvent('transfer:operator-alert', {
+            code: 'structural',
+            tokenId,
+            message: sanitizeReasonString(
+              `Token ${tokenId.slice(0, 12)}... cannot be finalized: ` +
+              `${(err as Error)?.message ?? 'InvalidJsonStructureError'}. ` +
+              `The stored last-transaction JSON or the aggregator proof has an unexpected shape. ` +
+              `Marked invalid; no further automatic recovery attempts will run for this token. ` +
+              `Manual diagnosis required — see debug logs for the shape dump.`,
+            ),
+          });
+        } catch { /* event emitter not wired */ }
+
+        return;
+      }
+
+      // Non-structural error — keep current behaviour (log, return,
+      // let the next polling tick retry). The polling tick's
+      // PROOF_POLLING_MAX_ATTEMPTS cap eventually marks the token
+      // invalid if the transient never resolves.
       logger.error('Payments', `[V6-RECOVER] Failed to finalize stranded receive ${tokenId.slice(0, 12)}:`, err);
     }
   }
