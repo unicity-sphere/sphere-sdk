@@ -169,6 +169,31 @@ export class OrbitDbAdapter implements ProfileDatabase {
       const heliaOptions: Record<string, unknown> = {};
       if (config.directory) {
         heliaOptions.directory = config.directory;
+
+        // Issue #234 follow-up — Helia v6 defaults to MemoryBlockstore
+        // (see `helia/dist/src/utils/helia-defaults.js`: `blockstore =
+        // init.blockstore ?? new MemoryBlockstore()`). The `directory`
+        // option ONLY configures the libp2p datastore (peer ID, keychain),
+        // NOT the blockstore. Without an explicit `blockstore` config
+        // every OpLog entry and CAR block is kept in-process memory and
+        // lost on `destroy()`. Phase 2 then reads heads from level (which
+        // IS persisted) but their referenced entry blocks are gone →
+        // `IPFSBlockStorage.get` returns an empty/throwing generator and
+        // OrbitDB fails to decode the OpLog. Use FsBlockstore so blocks
+        // persist across destroys for cross-process / cross-device
+        // recovery on the same dataDir.
+        try {
+          const blockstoreFsModule: any = await import('blockstore-fs' as string);
+          const FsBlockstoreCtor =
+            blockstoreFsModule.FsBlockstore ?? blockstoreFsModule.default?.FsBlockstore;
+          if (typeof FsBlockstoreCtor === 'function') {
+            heliaOptions.blockstore = new FsBlockstoreCtor(`${config.directory}/blocks`);
+          }
+        } catch {
+          // blockstore-fs not installed — fall back to in-memory blockstore
+          // (cross-process recovery will not work). Logged via the host's
+          // event surface elsewhere.
+        }
       }
 
       // Build libp2p config with gossipsub if available
@@ -274,6 +299,56 @@ export class OrbitDbAdapter implements ProfileDatabase {
 
       this.helia = await createHelia(heliaOptions);
 
+      // Issue #234 follow-up — Helia v6 changed `BlockStorage.get` to an
+      // `async *get(cid, options)` (`@helia/utils/dist/src/storage.js`)
+      // that yields Uint8Array chunks. OrbitDB v3 was authored against
+      // Helia v5 where `get` returned `Promise<Uint8Array>` directly, so
+      // its `IPFSBlockStorage.get` does `const block = await
+      // ipfs.blockstore.get(cid, ...)` and treats `block` as the bytes.
+      // In Helia v6 that `await` resolves to the AsyncGenerator OBJECT
+      // (truthy, NOT a Uint8Array), which then fails downstream with
+      // "data to decode must be a Uint8Array" inside cborg.
+      //
+      // Monkey-patch the blockstore's `get` to drain the generator into
+      // a single Uint8Array. This makes OrbitDB v3 ↔ Helia v6 work and
+      // also lets our own `profile/ipfs-client.ts:probeLocalHelia` actually
+      // hit the local fast-path instead of silently falling back to HTTP
+      // gateways via the `!(got instanceof Uint8Array)` miss-handler.
+      //
+      // NotFoundError is swallowed and converted to `undefined`, matching
+      // OrbitDB IPFSBlockStorage's `if (block)` contract for "no entry".
+      const heliaInstance: any = this.helia;
+      if (heliaInstance?.blockstore && typeof heliaInstance.blockstore.get === 'function') {
+        const blockstore = heliaInstance.blockstore;
+        const originalGet = blockstore.get.bind(blockstore);
+        blockstore.get = async (cid: unknown, options?: unknown): Promise<Uint8Array | undefined> => {
+          const chunks: Uint8Array[] = [];
+          let total = 0;
+          try {
+            for await (const chunk of originalGet(cid, options) as AsyncIterable<Uint8Array>) {
+              chunks.push(chunk);
+              total += chunk.length;
+            }
+          } catch (err) {
+            const errName = (err as { name?: string } | null)?.name;
+            const errCode = (err as { code?: string } | null)?.code;
+            if (errName === 'NotFoundError' || errCode === 'ERR_NOT_FOUND') {
+              return undefined;
+            }
+            throw err;
+          }
+          if (chunks.length === 0) return undefined;
+          if (chunks.length === 1) return chunks[0];
+          const combined = new Uint8Array(total);
+          let offset = 0;
+          for (const c of chunks) {
+            combined.set(c, offset);
+            offset += c.length;
+          }
+          return combined;
+        };
+      }
+
       // 2. Create OrbitDB instance
       const createOrbitDB =
         orbitdbModule.createOrbitDB ?? orbitdbModule.default?.createOrbitDB;
@@ -281,17 +356,11 @@ export class OrbitDbAdapter implements ProfileDatabase {
         throw new Error('Could not resolve createOrbitDB from @orbitdb/core');
       }
 
-      const orbitDbOptions: Record<string, unknown> = {
-        ipfs: this.helia,
-      };
-      if (config.directory) {
-        orbitDbOptions.directory = config.directory;
-      }
-
-      this.orbitdb = await createOrbitDB(orbitDbOptions);
-
-      // 3. Derive deterministic database name from wallet pubkey
-      //    Section 4.1: sphere-profile-<first 16 hex chars of pubkey>
+      // Derive deterministic key material from the wallet privateKey (or
+      // caller-supplied dbNameOverride). Both the OrbitDB identity `id`
+      // and the database `name` are bound to these inputs so two
+      // processes / devices with the same wallet open the SAME database
+      // address.
       //
       // Steelman²⁸/²⁹ critical: prefer caller-supplied dbNameOverride
       // (derived from a wipeable Uint8Array). Falling back to
@@ -299,17 +368,46 @@ export class OrbitDbAdapter implements ProfileDatabase {
       // hazard documented on OrbitDbConfig. Now: require one or the
       // other, fail closed if neither.
       let dbName: string;
+      let identityIdSource: string;
       if (config.dbNameOverride) {
         dbName = config.dbNameOverride;
+        identityIdSource = config.dbNameOverride;
       } else if (config.privateKey && config.privateKey.length > 0) {
         const publicKeyShort = await derivePublicKeyShort(config.privateKey);
         dbName = `sphere-profile-${publicKeyShort}`;
+        identityIdSource = publicKeyShort;
       } else {
         throw new ProfileError(
           'ORBITDB_CONNECTION_FAILED',
           'OrbitDbConfig requires either dbNameOverride (preferred) or privateKey (deprecated).',
         );
       }
+
+      // Issue #234 root cause — `createOrbitDB({ipfs, directory})` without
+      // `id` invokes OrbitDB's `createId()` which is `Math.random()` over a
+      // 32-char alphabet (`@orbitdb/core/src/utils/create-id.js`). Each
+      // connect() generates a NEW random identity → new
+      // `accessController.write[0]` → new manifest CID → new database
+      // address. Phase 2 of a destroy/reopen cycle (and every cross-device
+      // peer with the same mnemonic) therefore opens a DIFFERENT empty
+      // OrbitDB database than Phase 1 wrote to, with NO gossipsub
+      // replication possible because the gossipsub topic differs.
+      //
+      // Passing a deterministic `id` derived from the same inputs as the
+      // dbName closes the bug: two processes with the same wallet → same
+      // id → same identity → same database address → same gossipsub topic
+      // → OrbitDB replication actually works.
+      const derivedId = `sphere-orbit-${identityIdSource}`;
+
+      const orbitDbOptions: Record<string, unknown> = {
+        ipfs: this.helia,
+        id: derivedId,
+      };
+      if (config.directory) {
+        orbitDbOptions.directory = config.directory;
+      }
+
+      this.orbitdb = await createOrbitDB(orbitDbOptions);
 
       // 4. Open (or create) the keyvalue database with access control
       //    Only the wallet identity can write.

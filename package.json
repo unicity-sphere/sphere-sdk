@@ -172,6 +172,7 @@
     "@unicitylabs/state-transition-sdk": "1.6.1-rc.f37cb85",
     "async-mutex": "^0.5.0",
     "bip39": "^3.1.0",
+    "blockstore-fs": "^4.0.1",
     "buffer": "^6.0.3",
     "canonicalize": "^3.0.0",
     "crypto-js": "^4.2.0",
