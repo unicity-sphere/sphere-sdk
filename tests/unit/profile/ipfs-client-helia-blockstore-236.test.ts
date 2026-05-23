@@ -54,14 +54,20 @@ function makeFakeHelia(): {
   blocks: Map<string, Uint8Array>;
   puts: string[];
   gets: string[];
+  getOptions: Array<unknown>;
 } {
   const blocks = new Map<string, Uint8Array>();
   const puts: string[] = [];
   const gets: string[] = [];
+  // Issue #236 follow-up — record the options object passed to each
+  // `get` call so tests can assert `{ offline: true }` is forwarded
+  // to Helia (skips the Bitswap network walk on a local miss).
+  const getOptions: Array<unknown> = [];
   const helia = {
     blockstore: {
-      async get(cid: CID): Promise<Uint8Array> {
+      async get(cid: CID, options?: unknown): Promise<Uint8Array> {
         gets.push(cid.toString());
+        getOptions.push(options);
         const bytes = blocks.get(cid.toString());
         if (!bytes) {
           const err = new Error(`block ${cid.toString()} not found`);
@@ -83,7 +89,7 @@ function makeFakeHelia(): {
       },
     },
   };
-  return { helia, blocks, puts, gets };
+  return { helia, blocks, puts, gets, getOptions };
 }
 
 /**
@@ -529,5 +535,223 @@ describe('Issue #236 — fetchCarFromIpfs walks via local-helia (zero HTTP)', ()
     for (const cidStr of expectedBlocks.keys()) {
       expect(fakeHelia.gets).toContain(cidStr);
     }
+  });
+});
+
+describe('Issue #236 follow-up — offline-only local probe', () => {
+  it('passes { offline: true } to helia.blockstore.get on the local-fast-path read', async () => {
+    // Without `offline: true`, Helia's default `blockstore.get`
+    // falls through to a Bitswap network walk on a local miss
+    // (multi-second timeout). The fix is to short-circuit to local-
+    // only so a miss returns synchronously and the HTTP gateway
+    // loop runs without delay.
+    const bytes = new TextEncoder().encode('cached locally');
+    const cid = rawCidFor(bytes);
+
+    const fakeHelia = makeFakeHelia();
+    fakeHelia.blocks.set(cid, bytes);
+
+    installNetworkOffMock();
+    const fetched = await fetchFromIpfs(
+      ['https://gw.test'],
+      cid,
+      1000,
+      undefined,
+      fakeHelia.helia,
+    );
+
+    expect(new TextDecoder().decode(fetched)).toBe('cached locally');
+    // Exactly one local probe, and it forwarded the offline flag.
+    expect(fakeHelia.gets).toEqual([cid]);
+    expect(fakeHelia.getOptions).toHaveLength(1);
+    const opts = fakeHelia.getOptions[0] as { offline?: boolean } | undefined;
+    expect(opts?.offline).toBe(true);
+  });
+
+  it('local miss returns synchronously (no Bitswap network walk)', async () => {
+    // The fake helia throws ERR_NOT_FOUND immediately on miss (same
+    // as Helia with `{ offline: true }`). A real helia without the
+    // flag would block on Bitswap for seconds; the unit test asserts
+    // the synchronous-miss invariant by measuring elapsed time.
+    const bytes = new TextEncoder().encode('only on http');
+    const cid = rawCidFor(bytes);
+
+    const fakeHelia = makeFakeHelia(); // empty blockstore — all misses
+    globalThis.fetch = async (input) => {
+      const url = typeof input === 'string' ? input : (input as Request).url;
+      if (url.includes('/api/v0/block/get')) {
+        return new Response(bytes, {
+          status: 200,
+          headers: { 'Content-Type': 'application/octet-stream' },
+        });
+      }
+      return new Response('not-reached', { status: 599 });
+    };
+
+    const t0 = Date.now();
+    const fetched = await fetchFromIpfs(
+      ['https://gw.test'],
+      cid,
+      1000,
+      undefined,
+      fakeHelia.helia,
+    );
+    const elapsed = Date.now() - t0;
+
+    expect(new TextDecoder().decode(fetched)).toBe('only on http');
+    // Local miss is instant (stub throws synchronously). Together
+    // with `{ offline: true }` in production this asserts the miss
+    // path stays under a few ms even with empty local helia.
+    expect(elapsed).toBeLessThan(100);
+    expect(fakeHelia.getOptions[0]).toEqual({ offline: true });
+  });
+});
+
+describe('Issue #236 follow-up — HTTP-to-local write-back', () => {
+  it('writes HTTP-fetched bytes into local Helia for the next read', async () => {
+    const bytes = new TextEncoder().encode('fetched from gateway');
+    const cid = rawCidFor(bytes);
+
+    const fakeHelia = makeFakeHelia(); // empty — forces HTTP fetch
+
+    let httpHits = 0;
+    globalThis.fetch = async (input) => {
+      const url = typeof input === 'string' ? input : (input as Request).url;
+      if (url.includes('/api/v0/block/get')) {
+        httpHits += 1;
+        return new Response(bytes, {
+          status: 200,
+          headers: { 'Content-Type': 'application/octet-stream' },
+        });
+      }
+      return new Response('not-reached', { status: 599 });
+    };
+
+    // First call: local miss → HTTP fetch → write-back.
+    const first = await fetchFromIpfs(
+      ['https://gw.test'],
+      cid,
+      1000,
+      undefined,
+      fakeHelia.helia,
+    );
+    expect(new TextDecoder().decode(first)).toBe('fetched from gateway');
+    expect(httpHits).toBe(1);
+    // Write-back populated the local blockstore.
+    expect(fakeHelia.puts).toContain(cid);
+    expect(fakeHelia.blocks.get(cid)).toBeInstanceOf(Uint8Array);
+
+    // Second call: should be a local hit, NO HTTP request.
+    installNetworkOffMock();
+    const second = await fetchFromIpfs(
+      ['https://gw.test'],
+      cid,
+      1000,
+      undefined,
+      fakeHelia.helia,
+    );
+    expect(new TextDecoder().decode(second)).toBe('fetched from gateway');
+    // Still only one HTTP hit total (from the first call).
+    expect(httpHits).toBe(1);
+  });
+
+  it('write-back is best-effort: a put failure does NOT fail the read', async () => {
+    const bytes = new TextEncoder().encode('persists on http only');
+    const cid = rawCidFor(bytes);
+
+    const throwingHelia = {
+      blockstore: {
+        async get(): Promise<Uint8Array> {
+          const e = new Error('not found');
+          (e as { code?: string }).code = 'ERR_NOT_FOUND';
+          throw e;
+        },
+        async put(): Promise<unknown> {
+          throw new Error('disk full');
+        },
+      },
+    };
+
+    globalThis.fetch = async (input) => {
+      const url = typeof input === 'string' ? input : (input as Request).url;
+      if (url.includes('/api/v0/block/get')) {
+        return new Response(bytes, {
+          status: 200,
+          headers: { 'Content-Type': 'application/octet-stream' },
+        });
+      }
+      return new Response('not-reached', { status: 599 });
+    };
+
+    // Must succeed even though local write-back throws on every put.
+    const fetched = await fetchFromIpfs(
+      ['https://gw.test'],
+      cid,
+      1000,
+      undefined,
+      throwingHelia,
+    );
+    expect(new TextDecoder().decode(fetched)).toBe('persists on http only');
+  });
+
+  it('warms local cache during fetchCarFromIpfs BFS walk', async () => {
+    // After the first walk, every block touched should be in local
+    // helia. A second walk (with HTTP disabled) must succeed from
+    // cache alone.
+    const payload = { tokens: [{ id: 't1' }, { id: 't2' }] };
+    const carBytes = await makeFakeUxfCar(payload);
+    const reader = await CarReader.fromBytes(carBytes);
+    const expectedBlocks = new Map<string, Uint8Array>();
+    for await (const block of reader.blocks()) {
+      expectedBlocks.set(block.cid.toString(), block.bytes);
+    }
+    const roots = await reader.getRoots();
+    const rootCid = roots[0]!.toString();
+
+    const fakeHelia = makeFakeHelia(); // empty — first walk uses HTTP
+
+    let httpHits = 0;
+    globalThis.fetch = async (input) => {
+      const url = typeof input === 'string' ? input : (input as Request).url;
+      const m = url.match(/\/api\/v0\/block\/get\?arg=([^&]+)/);
+      if (!m) return new Response('not-reached', { status: 599 });
+      const requested = decodeURIComponent(m[1]!);
+      const bytes = expectedBlocks.get(requested);
+      if (!bytes) return new Response('miss', { status: 404 });
+      httpHits += 1;
+      return new Response(bytes, {
+        status: 200,
+        headers: { 'Content-Type': 'application/octet-stream' },
+      });
+    };
+
+    const firstCar = await fetchCarFromIpfs(
+      ['https://gw.test'],
+      rootCid,
+      1000,
+      undefined,
+      fakeHelia.helia,
+    );
+    expect(firstCar.byteLength).toBeGreaterThan(0);
+    expect(httpHits).toBeGreaterThan(0);
+    // Every block walked is now in local helia (write-back fired
+    // per-block inside fetchFromIpfs).
+    for (const cidStr of expectedBlocks.keys()) {
+      expect(fakeHelia.blocks.has(cidStr)).toBe(true);
+    }
+
+    // Second walk: network off, must succeed from local cache alone.
+    const httpHitsAfterFirst = httpHits;
+    installNetworkOffMock();
+    const secondCar = await fetchCarFromIpfs(
+      ['https://gw.test'],
+      rootCid,
+      1000,
+      undefined,
+      fakeHelia.helia,
+    );
+    expect(secondCar.byteLength).toBeGreaterThan(0);
+    // Confirm zero additional HTTP hits.
+    expect(httpHits).toBe(httpHitsAfterFirst);
   });
 });

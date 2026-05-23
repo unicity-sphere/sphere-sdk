@@ -145,7 +145,18 @@ async function tryGetBlockFromLocalHelia(
   }
   let bytes: Uint8Array;
   try {
-    const got = await helia.blockstore.get(parsed);
+    // `{ offline: true }` is critical here. Without it, Helia's
+    // default `blockstore.get` falls through from the local on-disk
+    // store to a Bitswap network walk against connected libp2p peers
+    // before throwing ERR_NOT_FOUND — a multi-second timeout that
+    // would dominate the cross-device fetch path's latency. Our HTTP
+    // gateway loop is the canonical "remote" surface; Bitswap from
+    // arbitrary bootstrap-discovered peers is neither faster nor more
+    // reliable than the gateways for the blocks we publish. Passing
+    // `offline: true` makes a local miss return synchronously so the
+    // caller falls through to HTTP without delay. See
+    // `@helia/interface/dist/src/blocks.d.ts#GetOfflineOptions`.
+    const got = await helia.blockstore.get(parsed, { offline: true });
     if (!(got instanceof Uint8Array) || got.byteLength === 0) {
       // Defensive: helia returned a non-Uint8Array (extreme edge case)
       // OR an empty-byte block — treat as a miss so the gateway loop
@@ -159,7 +170,8 @@ async function tryGetBlockFromLocalHelia(
     // Block not present locally (helia throws ERR_NOT_FOUND) — caller
     // continues with the HTTP gateway loop. Other internal errors also
     // route through this miss path so a transient local-store glitch
-    // does not block recovery via HTTP.
+    // does not block recovery via HTTP. With `offline: true`, this
+    // path is reached IMMEDIATELY on local miss (no Bitswap detour).
     return null;
   }
 
@@ -594,14 +606,28 @@ export async function pinCarBlocksToIpfs(
  * streaming reader enforces the size limit while reading the body.
  *
  * Issue #236 — when `helia` is supplied (the local Helia node managed by
- * the `OrbitDbAdapter`), the local on-disk blockstore is consulted FIRST.
- * A local hit returns synchronously without any HTTP round-trip,
- * eliminating gateway propagation as the bottleneck for cross-process
- * recovery on the same `dataDir`. Local-blockstore returns are NOT
- * content-verified (see `tryGetBlockFromLocalHelia` — helia's blockstore
- * is content-addressed by construction and runs inside our trust
- * boundary). Misses fall through to the existing HTTP gateway loop
- * unchanged.
+ * the `OrbitDbAdapter`), the local on-disk blockstore acts as a
+ * **bidirectional cache** for HTTP IPFS gateway content:
+ *
+ *   1. **Local-first read**: the local blockstore is consulted FIRST
+ *      with `{ offline: true }`. A local hit returns synchronously
+ *      without any HTTP round-trip OR Bitswap detour, eliminating
+ *      gateway propagation as the bottleneck for cross-process
+ *      recovery on the same `dataDir`. Local returns are
+ *      content-verified against the requested CID (defends against
+ *      fs-level corruption — see `tryGetBlockFromLocalHelia`).
+ *   2. **Write-back on HTTP success**: bytes successfully fetched from
+ *      an HTTP gateway (after `verifyCidMatchesBytes` passes) are
+ *      written back to the local blockstore before being returned. So
+ *      the second access to the same CID, from this process or any
+ *      future process on the same `dataDir`, becomes a local hit.
+ *
+ * Together with the pin-time write in `pinCarBlocksToIpfs`, this gives
+ * the **cache invariant**: any CID we have ever pinned or fetched is
+ * present locally for fast subsequent reads. Cross-device recovery
+ * (different machine, empty local helia) still works via the HTTP
+ * gateway fallback exactly as before, and the first fetch warms the
+ * local cache for everything that follows.
  *
  * @param gateways     - Array of IPFS gateway base URLs
  * @param cid          - Content identifier to fetch
@@ -761,6 +787,29 @@ export async function fetchFromIpfs(
         lastError =
           verifyErr instanceof Error ? verifyErr : new Error(String(verifyErr));
         continue;
+      }
+
+      // Issue #236 follow-up — symmetric write-back: populate the
+      // local Helia blockstore with content we just fetched from an
+      // HTTP gateway, so the NEXT read (this process or any future
+      // process on the same `dataDir`) is a local hit. Combined with
+      // the pin-time local-put (`pinCarBlocksToIpfs`), this gives the
+      // bidirectional cache invariant: "if we've ever seen a CID via
+      // local or remote, the next read from either side is a local
+      // hit."
+      //
+      // Safe by construction: the bytes have just passed
+      // `verifyCidMatchesBytes` above, so we never write a CID/bytes
+      // mismatch into the local store. Best-effort: a write failure
+      // (disk full, lock contention) logs and we still return the
+      // bytes to the caller. The pin-time guard in
+      // `pinCarBlocksToIpfs` AND the read-time guard in
+      // `tryGetBlockFromLocalHelia` both re-check on any future
+      // access, so a transient write failure here just means the
+      // next access incurs another HTTP round-trip — never wrong
+      // bytes.
+      if (localHelia !== null) {
+        await putBlockToLocalHelia(localHelia, cid, bytesOrNull);
       }
 
       return bytesOrNull;
