@@ -162,15 +162,28 @@ function sleep(ms: number): Promise<void> {
  * discovery sees v=N again.
  *
  * Retry with exponential backoff (reuses the existing PUBLISH_BACKOFF_*
- * schedule for consistency with the rest of the publish flow). Five
- * attempts with the default schedule sum to ~9–15s of total backoff
- * before we propagate the error to the caller — enough to ride out
- * routine replication-lag windows on testnet without holding the
- * publish mutex indefinitely. Past this budget the error propagates,
- * the caller's retry-marker logic stamps `pendingPublishCid`, and the
- * outer flush cadence (or periodic pointer poll) re-attempts later.
+ * schedule for consistency with the rest of the publish flow). With
+ * BASE=250ms, MAX=4000ms, the schedule per attempt is
+ *   250, 500, 1000, 2000, 4000, 4000, 4000ms
+ * (jittered by [0.5, 1.5]×). Seven attempts sum to ~15.75s of total
+ * backoff — chosen to ride out the routine testnet replication-lag
+ * window (issue #241 reports stalls of several seconds at sustained
+ * write rate; 5 attempts at ~7.75s proved insufficient under load).
+ * Past this budget the error propagates as a typed WALKBACK_FLOOR; the
+ * lifecycle layer catches the transient and emits a typed
+ * `storage:replica-lag` event so operators can distinguish it from
+ * generic transients in monitoring, then stamps `pendingPublishCid`
+ * for the next flush / pointer poll to re-attempt.
+ *
+ * Issue #241 (B): even when this budget is exhausted, the at-least-
+ * once Nostr gate is no longer held closed — pin durability is the
+ * cross-device recoverability invariant; the aggregator publish is a
+ * liveness optimization that retries asynchronously. This budget thus
+ * bounds the latency cost of attempting to ride out lag in-band; the
+ * old correctness pressure that required holding the publish mutex
+ * "as long as it takes" is gone.
  */
-const WALKBACK_FLOOR_RETRY_BUDGET = 5;
+const WALKBACK_FLOOR_RETRY_BUDGET = 7;
 
 /**
  * Wrap `findLatestValidVersion` with a bounded retry loop specifically

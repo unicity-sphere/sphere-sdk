@@ -755,14 +755,42 @@ export class FlushScheduler {
       //    construct the provider directly without lean-snapshot wiring.
       //
       //    On a TRANSIENT publish failure the snapshot publisher's
-      //    internal `runProfileDirtyFlush` throws — caught below — and
-      //    we propagate so the chained `forceFlushSerialized` rejection
-      //    reaches `awaitNextFlush` and the at-least-once gate refuses
-      //    the Nostr ack (event replays on next reconnect; addToken
-      //    stateHash dedup is idempotent). On PERMANENT failure the
-      //    publisher returns `{ ok: false, transient: false }` and we
-      //    still emit `storage:saved` — local state is durable, only
-      //    the cross-device anchor is missing and no retry would help.
+      //    internal `runProfileDirtyFlush` throws — caught below.
+      //
+      //    Issue #241 — the at-least-once Nostr gate is decoupled from
+      //    aggregator-publish transient failures. The cross-device
+      //    recoverability invariant is satisfied by:
+      //      (1) The UXF bundle CAR being pinned + HEAD-verifiable on
+      //          IPFS (step 4 above + the verifyFlushDurability leg
+      //          below); AND
+      //      (2) The OrbitDB bundle ref being written (step 6).
+      //    Together (1)+(2) guarantee that any device sharing this
+      //    wallet's OrbitDB log will see the new bundle on the next
+      //    sync — no aggregator pointer is needed for replica-to-
+      //    replica propagation. The aggregator publish is a LIVENESS
+      //    optimization for COLD-IMPORT discovery (a brand-new device
+      //    with only the master key). A transient publish failure
+      //    (replica lag, network blip) is handled by the existing
+      //    `pendingPublishCid` retry marker — the next flush or
+      //    pointer poll re-attempts before the wallet does any new
+      //    save-driven work.
+      //
+      //    Before #241 a transient publish would throw here, which
+      //    closed the at-least-once gate and forced the inbound
+      //    TOKEN_TRANSFER event to replay on every Nostr reconnect.
+      //    Each replay fired another flush; each flush re-hit the
+      //    same `AGGREGATOR_POINTER_WALKBACK_FLOOR` (read-replica
+      //    lagging behind the wallet's confirmed `localVersion`),
+      //    converting an invisible transient into a sustained retry
+      //    storm. Decoupling the gate from publish durability breaks
+      //    that amplification while preserving the actual recover-
+      //    ability invariant.
+      //
+      //    On PERMANENT failure the publisher returns `{ ok: false,
+      //    transient: false }`, has already emitted `storage:error`
+      //    upstream, and we continue — local state is durable, the
+      //    cross-device anchor is missing, and no auto-retry would
+      //    help (operator intervention required).
       let publishResult: ProfileSnapshotPublishResult | null = null;
       let publishThrew: unknown = undefined;
       try {
@@ -781,11 +809,16 @@ export class FlushScheduler {
         throw publishThrew;
       }
       if (publishResult && !publishResult.ok && publishResult.transient) {
-        throw new Error(
-          `Aggregator pointer snapshot publish transient failure (bundle cid=${cid}` +
-            (publishResult.code ? `, code=${publishResult.code}` : '') +
-            `); retry marker stored. Refusing to advance the at-least-once ack.`,
-        );
+        // Issue #241 — see policy comment above. Emit a soft event so
+        // operators can observe pending publishes without conflating
+        // them with terminal `storage:error` signals. The flush still
+        // proceeds to verifyFlushDurability for the bundle CAR — pin
+        // durability is the gate the at-least-once invariant rides on.
+        this.host.emitEvent({
+          type: 'storage:pending-publish',
+          timestamp: Date.now(),
+          data: { cid, code: publishResult.code },
+        });
       }
 
       // Issue #239 — per-profile-update remote-durability verification.
@@ -836,14 +869,20 @@ export class FlushScheduler {
       if (shouldVerify) {
         // Snapshot CID is set on host by the successful publish path
         // (`LifecycleManager.publishAggregatorPointerBestEffort` →
-        // `setLastDiscoveredPointerCid`). Null when no snapshot was
-        // published in this flush (transient publish failure handled
-        // above already threw before we got here, so a null here means
-        // the publisher wasn't wired — defensive fallback).
-        const snapshotCid =
-          publishResult !== null
-            ? this.host.getLastDiscoveredPointerCid()
-            : null;
+        // `setLastDiscoveredPointerCid`). Issue #241: a transient
+        // publish failure does NOT update this CID — the host still
+        // holds the PREVIOUS successful publish's snapshot CID (or
+        // null if no publish has ever succeeded). Verifying that
+        // stale CID would be both pointless (it's already-pinned
+        // from a prior flush) and misleading (a pass here doesn't
+        // mean THIS flush's state reached the aggregator). Skip the
+        // snapshot leg unless we're sure a fresh snapshot was just
+        // anchored.
+        const freshSnapshotPublished =
+          publishResult !== null && publishResult.ok;
+        const snapshotCid = freshSnapshotPublished
+          ? this.host.getLastDiscoveredPointerCid()
+          : null;
         await this.host.verifyFlushDurability(cid, snapshotCid, verifyDeadlineMs);
       }
     } catch (err) {
