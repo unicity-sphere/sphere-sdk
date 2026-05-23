@@ -223,12 +223,16 @@ This walkthrough uses foreground daemons so you can watch events arrive.
 **Goal:** with peer2 daemons running, drive an invoice round-trip on peer1
 and confirm peer2 reflects the new state with no manual `sync` call.
 
-### C.1 Alice creates a 11 UCT invoice for Bob (on peer1)
+### C.1 Alice creates a 11 UCT invoice (Bob is the payer; on peer1)
+
+`--target` names the RECEIVER of funds — alice, since she's asking Bob
+to pay her. The payer (bob) is supplied to `invoice deliver` in §C.1b
+below, not to `invoice create`.
 
 ```bash
 cd ~/sphere-full-test/peer1
 sphere wallet use alice
-sphere invoice create --target @$BOB_TAG --asset "11000000 UCT" --memo "Full-recovery test invoice"
+sphere invoice create --target @$ALICE_TAG --asset "11000000 UCT" --memo "Full-recovery test invoice"
 # Capture the invoiceId from the JSON output.
 INV=<paste invoiceId>
 ```
@@ -237,12 +241,14 @@ INV=<paste invoiceId>
 
 `sphere invoice create` does not auto-deliver. Delivery is a separate,
 explicit step that packages the invoice into a UXF bundle and ships it
-to every non-self target via NIP-17 DM. Without this step, Bob's wallet
-has no path to discover the invoice — `payments sync` / `payments
-receive` don't pull invoices addressed to him.
+via NIP-17 DM. The invoice's only target is alice herself (self), so
+pass `--to @$BOB_TAG` to explicitly route the invoice DM to Bob.
+Without this step, Bob's wallet has no path to discover the invoice —
+`payments sync` / `payments receive` don't pull invoices addressed to
+him.
 
 ```bash
-sphere invoice deliver $INV
+sphere invoice deliver $INV --to @$BOB_TAG
 # Per-recipient outcome is printed as JSON. Successful delivery shows
 # { sent: 1, failed: 0, recipients: [{ ..., success: true, shape: "inline" }] }.
 ```
@@ -260,14 +266,20 @@ sphere payments sync
 
 ### C.3 Watch the peer2 daemons (terminals 1 & 2)
 
-Within a few seconds you should see lines like the following appear in
-each daemon's terminal:
+Within a few seconds **peer2-alice** (alice's second device) should
+see the following lines — alice's transport pubkey is the kind:31113
+Nostr event's `#p` tag, so her subscription receives it:
 
 ```
 [<ISO timestamp>] EVENT transfer:incoming data={"senderPubkey":"...","tokens":[...],...}
 [<ISO timestamp>] EVENT invoice:payment   data={"invoiceId":"<id>",...}
 [<ISO timestamp>] EVENT invoice:covered   data={"invoiceId":"<id>"}
 ```
+
+**peer2-bob** will NOT see Nostr `transfer:*` events for this scenario
+— the kind:31113 event's `#p` tag is alice's pubkey (she's the
+recipient), not bob's. Bob's second device updates via IPFS
+Profile-pointer sync; the §C.4 balance check below verifies that path.
 
 `./events.log` in each peer2 CWD records the same events as one JSON line
 per dispatch.

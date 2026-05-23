@@ -300,11 +300,14 @@ sphere daemon status
 # §C — Bidirectional invoice flow on peer1
 # ---------------------------------------------------------------------------
 
-banner "§C.1 Alice creates 11 UCT invoice for Bob"
+banner "§C.1 Alice creates 11 UCT invoice (Bob will pay)"
 
 cd "$PEER1"
 sphere wallet use alice
-sphere invoice create --target "@$BOB_TAG" --asset "11000000 UCT" --memo "Full-recovery test invoice" \
+# `--target` is the receiver of funds. Alice is the receiver (Bob pays
+# her), so the target is `@$ALICE_TAG`. `invoice deliver` separately
+# resolves "non-self targets" to compute the DM recipient (Bob).
+sphere invoice create --target "@$ALICE_TAG" --asset "11000000 UCT" --memo "Full-recovery test invoice" \
   2>&1 | tee "$SNAP/peer1-invoice-create.log"
 
 INV="$(grep -Eo '"invoiceId":[[:space:]]*"[^"]+"' "$SNAP/peer1-invoice-create.log" | head -1 | sed 's/.*"\([^"]*\)"$/\1/')"
@@ -315,11 +318,13 @@ banner "§C.1b Alice delivers the invoice to Bob (#226 — UXF bundle over DM)"
 
 # `sphere invoice create` no longer auto-delivers (#226). Delivery is a
 # separate, explicit step: package the invoice into a UXF bundle and
-# ship it to every non-self target via NIP-17 DM. Without this step,
-# Bob's wallet has no path to discover the invoice — payment-time
-# sync/receive don't pull invoices addressed to him, and `invoice pay`
-# would error with "No invoice found matching prefix: ...".
-sphere invoice deliver "$INV" 2>&1 | tee "$SNAP/peer1-invoice-deliver.log"
+# ship it via NIP-17 DM. The invoice's `--target` is the RECEIVER of
+# funds (alice), so the payer (bob) is supplied here as the explicit
+# `--to` recipient. Without this step, Bob's wallet has no path to
+# discover the invoice — payment-time sync/receive don't pull invoices
+# addressed to him, and `invoice pay` would error with "No invoice
+# found matching prefix: ...".
+sphere invoice deliver "$INV" --to "@$BOB_TAG" 2>&1 | tee "$SNAP/peer1-invoice-deliver.log"
 
 banner "§C.2 Bob pays"
 
@@ -339,17 +344,20 @@ sphere payments sync       2>&1 | tee "$SNAP/peer1-invoice-pay-sync.log"
 
 banner "§C.3 Verify peer2 daemons saw events"
 
-# Alice's peer2 daemon should have logged invoice:payment or invoice:covered.
+# Alice's peer2 daemon should have logged invoice:payment or
+# invoice:covered (the kind:31113 Nostr event is tagged with alice's
+# transport pubkey since alice is the payment recipient).
 wait_for_log "$PEER2_ALICE/events.log" "invoice:" 60 \
   || { echo "WARN: no invoice event hit alice peer2 events.log in 60s" >&2; }
 
-# Bob's peer2 daemon should have seen transfer:incoming or transfer:confirmed.
-wait_for_log "$PEER2_BOB/events.log" "transfer:" 60 \
-  || { echo "WARN: no transfer event hit bob peer2 events.log in 60s" >&2; }
+# Bob's peer2 daemon will NOT see a Nostr transfer:* event because the
+# kind:31113 event's #p tag is alice's transport pubkey, not bob's.
+# Bob's view updates via IPFS Profile-pointer sync (live propagation
+# from peer1-bob), surfaced in §C.4's `sphere balance` assertion below.
 
 echo "--- peer2-alice events.log (tail) ---"
 tail -n 20 "$PEER2_ALICE/events.log" 2>/dev/null || true
-echo "--- peer2-bob events.log (tail) ---"
+echo "--- peer2-bob events.log (tail; expected empty for this scenario) ---"
 tail -n 20 "$PEER2_BOB/events.log"   2>/dev/null || true
 
 banner "§C.4 Peer2 view (NO manual sync)"
