@@ -273,7 +273,12 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
     }
   }
 
-  async shutdown(): Promise<void> {
+  // Issue #239 — accept ShutdownOptions for interface conformance.
+  // IpfsStorageProvider already has its own internal best-effort flush
+  // semantics; the new options are intentionally ignored (the IPNS
+  // pinning model predates the per-flush verification gate). Callers
+  // that need verified durability should use the Profile provider.
+  async shutdown(_options?: import('../../../storage/storage-provider.js').ShutdownOptions): Promise<void> {
     this.isShuttingDown = true;
     logger.debug('IPFS-Storage', `shutdown: ipnsName=${this.ipnsName?.slice(0, 20)}..., pendingEmpty=${this.pendingBuffer.isEmpty}, capturedIpns=${this.pendingBuffer.capturedIpnsName?.slice(0, 20) ?? 'none'}`);
 

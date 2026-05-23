@@ -90,7 +90,11 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
     }
   }
 
-  async shutdown(): Promise<void> {
+  // Issue #239 — accept ShutdownOptions for interface conformance.
+  // IndexedDBTokenStorageProvider has no remote-durability boundary
+  // (every save() returns after the IDB transaction commits locally)
+  // so the options are intentionally ignored.
+  async shutdown(_options?: import('../../../storage/storage-provider.js').ShutdownOptions): Promise<void> {
     const cid = this.connId;
     logger.debug('IndexedDBToken', `shutdown: db=${this.dbName} connId=${cid} wasConnected=${!!this.db}`);
     if (this.db) {

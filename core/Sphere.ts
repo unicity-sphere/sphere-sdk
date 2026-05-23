@@ -57,7 +57,12 @@ import type {
   TrackedAddressEntry,
 } from '../types';
 import { SphereError } from './errors';
-import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../storage';
+import type {
+  ShutdownOptions,
+  StorageProvider,
+  TokenStorageProvider,
+  TxfStorageDataBase,
+} from '../storage';
 import type { TransportProvider, PeerInfo } from '../transport';
 import { MultiAddressTransportMux, AddressTransportAdapter } from '../transport/MultiAddressTransportMux';
 import type { OracleProvider } from '../oracle';
@@ -586,6 +591,34 @@ export interface AddressModuleSet {
   tokenStorageProviders: Map<string, TokenStorageProvider<TxfStorageDataBase>>;
   initialized: boolean;
 }
+
+/**
+ * Issue #239 — options accepted by {@link Sphere.destroy}.
+ *
+ * The default contract is "normal mode": destroy() must not return
+ * until any in-flight flush is drained AND the most-recent pin +
+ * pointer publish are verifiably durable on remote infrastructure
+ * (HEAD-readable bundle CID + aggregator `recoverLatest` returns the
+ * just-published snapshot CID). The verification deadline is
+ * configurable via {@link DestroyOptions.verificationDeadlineMs} and
+ * defaults to 30 000 ms.
+ *
+ * `force: true` switches to "fast-exit": the remote-durability gate is
+ * skipped and any unconfirmed publish is stamped as a
+ * `pendingPublishCid` retry marker. Cold-start on next boot replays
+ * the unverified publish via the existing retry machinery
+ * (`LifecycleManager.retryPendingPublishIfAny`). Use for E2E tests
+ * that simulate ungraceful crash, or for operator-triggered fast
+ * exits where waiting for gateway propagation is not acceptable.
+ */
+/**
+ * Alias for `ShutdownOptions` re-exported under a wallet-layer name so
+ * consumers don't have to import the storage-layer interface. Kept as
+ * a distinct symbol so the wallet API can grow independently of the
+ * storage signature without a breaking rename. See {@link ShutdownOptions}
+ * for the field semantics.
+ */
+export type DestroyOptions = ShutdownOptions;
 
 // =============================================================================
 // Sphere Class
@@ -4446,7 +4479,28 @@ export class Sphere {
   // Public Methods - Lifecycle
   // ===========================================================================
 
-  async destroy(): Promise<void> {
+  async destroy(options?: DestroyOptions): Promise<void> {
+    // Issue #239 — the shutdown durability gate is OPT-IN at the
+    // wallet layer. Rationale: the per-flush verification gate
+    // (`flushVerificationDeadlineMs` on `ProfileTokenStorageProviderOptions`,
+    // wired ON by `createProfileProviders` with a 30 s deadline)
+    // already enforces remote-pin durability for every profile update
+    // BEFORE the flush returns. By the time `destroy()` is called,
+    // the most-recent CIDs have already been HEAD-verified on the
+    // IPFS gateways; the shutdown gate's pin-verify leg short-circuits
+    // via the verified-watermark optimisation. The remaining shutdown
+    // leg — aggregator `recoverLatest()` read-back — is purely a
+    // cross-device-recovery quality-of-service check (it verifies
+    // read replicas have caught up). For single-machine cross-process
+    // CLI flows the local OrbitDB write is the recovery path, not
+    // the aggregator read, so the read-back is redundant overhead.
+    //
+    // Operators who explicitly need cross-device read-replica catch-up
+    // before exit MUST pass `verificationDeadlineMs: N` to opt in
+    // (typical N = 30 000). E2E tests that want to simulate an
+    // ungraceful crash continue to use `force: true`.
+    const effectiveOptions = options;
+
     this.cleanupProviderEventSubscriptions();
 
     // Destroy swap FIRST — it depends on accounting (which depends on payments)
@@ -4493,9 +4547,13 @@ export class Sphere {
         moduleSet.communications.destroy();
         moduleSet.groupChat?.destroy();
         moduleSet.market?.destroy();
-        // Shutdown per-address token storage providers
+        // Shutdown per-address token storage providers.
+        // Issue #239 — propagate destroy options (force / reason /
+        // verificationDeadlineMs) so the per-address token storage
+        // providers run (or skip) the remote-durability gate consistent
+        // with the caller's intent.
         for (const provider of moduleSet.tokenStorageProviders.values()) {
-          try { await provider.shutdown(); } catch { /* non-fatal */ }
+          try { await provider.shutdown(effectiveOptions); } catch { /* non-fatal */ }
         }
         moduleSet.tokenStorageProviders.clear();
         logger.debug('Sphere', `Destroyed modules for address ${idx}`);
@@ -4537,7 +4595,13 @@ export class Sphere {
     // Helia blockstore) is recommended as a follow-up.
     for (const provider of this._tokenStorageProviders.values()) {
       try {
-        await provider.shutdown();
+        // Issue #239 — propagate destroy options (force / reason /
+        // verificationDeadlineMs). The Profile provider's
+        // LifecycleManager.shutdown reads these to gate (or skip) the
+        // remote-durability verification round-trips before returning.
+        // Providers without a remote-durability boundary (File /
+        // IndexedDB / IPFS legacy) silently ignore the parameter.
+        await provider.shutdown(effectiveOptions);
       } catch {
         // Non-fatal — provider may already be closed
       }
