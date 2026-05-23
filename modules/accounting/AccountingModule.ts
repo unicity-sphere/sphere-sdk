@@ -463,56 +463,11 @@ export class AccountingModule {
     // from TokenStorageProvider by PaymentsModule.load()). We filter by
     // INVOICE_TOKEN_TYPE_HEX, which is stored in genesis.data.tokenType.
     // ------------------------------------------------------------------
-    try {
-      const allTokens = deps.payments.getTokens();
-      for (const token of allTokens) {
-        if (!token.sdkData) continue;
-        try {
-          const txf = JSON.parse(token.sdkData) as TxfToken;
-          // Filter by invoice token type
-          const tokenType = txf.genesis?.data?.tokenType;
-          if (tokenType !== INVOICE_TOKEN_TYPE_HEX) continue;
-
-          const tokenData = txf.genesis?.data?.tokenData;
-          if (!tokenData) continue;
-
-          const rawTerms = this._parseInvoiceTerms(tokenData);
-          if (rawTerms) {
-            this.invoiceTermsCache.set(token.id, this._normalizeInvoiceTerms(rawTerms));
-          }
-        } catch (err) {
-          logger.warn(LOG_TAG, `Failed to parse invoice token ${token.id}:`, err);
-        }
-      }
-
-      // Also scan archived tokens (spec §5.4 Phase 2 step 5)
-      const archivedTokens = deps.payments.getArchivedTokens();
-      for (const [archivedId, txf] of archivedTokens) {
-        try {
-          const tokenType = txf.genesis?.data?.tokenType;
-          if (tokenType !== INVOICE_TOKEN_TYPE_HEX) continue;
-
-          const tokenData = txf.genesis?.data?.tokenData;
-          if (!tokenData) continue;
-
-          const rawTerms = this._parseInvoiceTerms(tokenData);
-          if (rawTerms) {
-            this.invoiceTermsCache.set(archivedId, this._normalizeInvoiceTerms(rawTerms));
-          }
-        } catch (err) {
-          logger.warn(LOG_TAG, `Failed to parse archived invoice token ${archivedId}:`, err);
-        }
-      }
-
-      // Build hash→ID index for privacy-preserving on-chain lookups
-      this._rebuildHashIndex();
-
-      if (this.config.debug) {
-        logger.debug(LOG_TAG, `Loaded ${this.invoiceTermsCache.size} invoice token(s), hash index: ${this.invoiceIdHashIndex.size}`);
-      }
-    } catch (err) {
-      logger.warn(LOG_TAG, 'Failed to enumerate tokens via PaymentsModule:', err);
-    }
+    // Initial scan: populate from scratch — every invoice token currently
+    // in the wallet's storage. No `invoice:created` is emitted here because
+    // this is post-restart cache rehydration, not new discovery (callers
+    // already saw those events when the invoices first arrived).
+    this._refreshInvoiceTermsCache({ emitForNew: false });
 
     // W16: destroyed check between major steps — prevents partial state population
     // if destroy() was called while _doLoad() is in progress.
@@ -4449,6 +4404,100 @@ export class AccountingModule {
   // ===========================================================================
 
   /**
+   * Scan PaymentsModule's live + archived token sets for INVOICE-typed
+   * tokens and populate `invoiceTermsCache` with any whose terms are
+   * parseable. Idempotent — existing entries are NOT overwritten (the
+   * cache is also a write-through surface for locally-minted /
+   * locally-imported invoices that may have additional state the
+   * on-disk genesis doesn't carry yet).
+   *
+   * Used by:
+   *   - `_doLoad()` to populate the cache at startup (`emitForNew: false`).
+   *   - The `sync:completed` subscriber to pick up invoice tokens that
+   *     a peer published to Profile/IPFS but never delivered via DM-TXF
+   *     (`emitForNew: true`). The §C.4 cross-device flow depends on this.
+   *
+   * Always rebuilds the hash→ID index at the end so the index stays in
+   * sync with the cache.
+   *
+   * @param opts.emitForNew  When true, fire `invoice:created` with
+   *                         `confirmed: false` for any invoiceId that
+   *                         was NOT already in the cache before this
+   *                         call (matches `importInvoice` semantics —
+   *                         externally-sourced invoices are
+   *                         "unconfirmed" until the caller validates).
+   * @returns The list of invoiceIds newly added by this call.
+   */
+  private _refreshInvoiceTermsCache(opts: { emitForNew: boolean }): string[] {
+    if (!this.deps) return [];
+    const deps = this.deps;
+    const newlyAdded: string[] = [];
+
+    const tryAdd = (id: string, tokenData: string): void => {
+      if (this.invoiceTermsCache.has(id)) return;
+      const rawTerms = this._parseInvoiceTerms(tokenData);
+      if (!rawTerms) return;
+      this.invoiceTermsCache.set(id, this._normalizeInvoiceTerms(rawTerms));
+      newlyAdded.push(id);
+    };
+
+    try {
+      const allTokens = deps.payments.getTokens();
+      for (const token of allTokens) {
+        if (!token.sdkData) continue;
+        try {
+          const txf = JSON.parse(token.sdkData) as TxfToken;
+          const tokenType = txf.genesis?.data?.tokenType;
+          if (tokenType !== INVOICE_TOKEN_TYPE_HEX) continue;
+          const tokenData = txf.genesis?.data?.tokenData;
+          if (!tokenData) continue;
+          tryAdd(token.id, tokenData);
+        } catch (err) {
+          logger.warn(LOG_TAG, `Failed to parse invoice token ${token.id}:`, err);
+        }
+      }
+
+      const archivedTokens = deps.payments.getArchivedTokens();
+      for (const [archivedId, txf] of archivedTokens) {
+        try {
+          const tokenType = txf.genesis?.data?.tokenType;
+          if (tokenType !== INVOICE_TOKEN_TYPE_HEX) continue;
+          const tokenData = txf.genesis?.data?.tokenData;
+          if (!tokenData) continue;
+          tryAdd(archivedId, tokenData);
+        } catch (err) {
+          logger.warn(LOG_TAG, `Failed to parse archived invoice token ${archivedId}:`, err);
+        }
+      }
+    } catch (err) {
+      logger.warn(LOG_TAG, 'Failed to enumerate tokens via PaymentsModule:', err);
+    }
+
+    // Always rebuild the hash index so it stays consistent with the cache.
+    this._rebuildHashIndex();
+
+    if (this.config.debug) {
+      logger.debug(
+        LOG_TAG,
+        `_refreshInvoiceTermsCache: cache=${this.invoiceTermsCache.size}, hashIndex=${this.invoiceIdHashIndex.size}, newlyAdded=${newlyAdded.length}`,
+      );
+    }
+
+    if (opts.emitForNew && newlyAdded.length > 0) {
+      for (const invoiceId of newlyAdded) {
+        // confirmed: false — matches `importInvoice` semantics for
+        // externally-sourced invoices. The sync provider's trust chain
+        // is stronger than DM-TXF in practice, but downstream
+        // consumers should still treat this as "needs payment-side
+        // attribution before any UI commits".
+        deps.emitEvent('invoice:created', { invoiceId, confirmed: false });
+      }
+    }
+
+    return newlyAdded;
+  }
+
+  /**
    * Rebuild the hash→invoiceId index from all known invoices.
    * Called after invoiceTermsCache is fully populated during load().
    */
@@ -5263,7 +5312,44 @@ export class AccountingModule {
       }
     });
 
-    this.unsubscribePayments = [unsubIncoming, unsubConfirmed, unsubHistory, unsubTokenChange];
+    // Refresh the invoice terms cache on every sync completion.
+    //
+    // `PaymentsModule.sync()` pulls new tokens from Profile/IPFS providers
+    // via `loadFromStorageData(result.merged)`, which intentionally
+    // BYPASSES `addToken()` — so the `onTokenChange` observer above
+    // never fires for sync-imported invoice tokens. Without this
+    // subscriber, an invoice that another peer minted + published to
+    // Profile (the §C.4 cross-device flow) never lands in
+    // `invoiceTermsCache`, and `getInvoiceStatus(invoiceId)` returns
+    // "No invoice found matching prefix" even though the token IS in
+    // the local store.
+    //
+    // The handler runs the same scan as `load()` but in idempotent
+    // mode: only new IDs are added, existing entries are preserved
+    // (they may carry write-through state from locally-minted invoices
+    // that the on-disk genesis doesn't reflect yet), and
+    // `invoice:created` fires once per newly-discovered ID with
+    // `confirmed: false`. See `_refreshInvoiceTermsCache` for details.
+    //
+    // Companion CLI fix: sphere-cli#24 routes `invoice-status` /
+    // `invoice-list` through `ensureSync(sphere, 'full')` so this
+    // listener actually has data to pick up.
+    const unsubSyncCompleted = deps.on('sync:completed', () => {
+      if (this.destroyed) return;
+      try {
+        this._refreshInvoiceTermsCache({ emitForNew: true });
+      } catch (err) {
+        logger.warn(LOG_TAG, 'Error refreshing invoice terms cache after sync:', err);
+      }
+    });
+
+    this.unsubscribePayments = [
+      unsubIncoming,
+      unsubConfirmed,
+      unsubHistory,
+      unsubTokenChange,
+      unsubSyncCompleted,
+    ];
   }
 
   // ===========================================================================
