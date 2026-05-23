@@ -307,7 +307,10 @@ cd ~/sphere-full-test/peer1
 sphere wallet use bob
 sphere payments send @$ALICE_TAG 1 UCT     # 1 UCT bob → alice
 sphere payments sync
-# Peer2 daemons should log a fresh transfer:incoming / transfer:confirmed pair.
+# peer2-alice's daemon should log a fresh transfer:incoming (the
+# kind:31113 event is tagged with alice's transport pubkey). peer2-bob
+# does NOT see a Nostr event for its own outbound — that view updates
+# via IPFS Profile-pointer sync.
 ```
 
 ---

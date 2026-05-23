@@ -305,8 +305,10 @@ banner "§C.1 Alice creates 11 UCT invoice (Bob will pay)"
 cd "$PEER1"
 sphere wallet use alice
 # `--target` is the receiver of funds. Alice is the receiver (Bob pays
-# her), so the target is `@$ALICE_TAG`. `invoice deliver` separately
-# resolves "non-self targets" to compute the DM recipient (Bob).
+# her), so the target is `@$ALICE_TAG`. Bob (the payer) is supplied to
+# `invoice deliver` in §C.1b via `--to`, because the invoice's only
+# target is self and `deliver`'s default ("every non-self target")
+# would yield zero recipients.
 sphere invoice create --target "@$ALICE_TAG" --asset "11000000 UCT" --memo "Full-recovery test invoice" \
   2>&1 | tee "$SNAP/peer1-invoice-create.log"
 
@@ -344,11 +346,15 @@ sphere payments sync       2>&1 | tee "$SNAP/peer1-invoice-pay-sync.log"
 
 banner "§C.3 Verify peer2 daemons saw events"
 
-# Alice's peer2 daemon should have logged invoice:payment or
-# invoice:covered (the kind:31113 Nostr event is tagged with alice's
-# transport pubkey since alice is the payment recipient).
-wait_for_log "$PEER2_ALICE/events.log" "invoice:" 60 \
-  || { echo "WARN: no invoice event hit alice peer2 events.log in 60s" >&2; }
+# Alice's peer2 daemon should have logged transfer:incoming (the
+# kind:31113 Nostr event is tagged with alice's transport pubkey since
+# alice is the payment recipient). `invoice:payment` / `invoice:
+# covered` MAY also fire if AccountingModule's invoiceTermsCache has
+# the invoice cached — but that path can be blocked by an unrelated
+# bug in cache refresh (#223 follow-up), so we assert on `transfer:`
+# alone to isolate the cross-process Nostr signal.
+wait_for_log "$PEER2_ALICE/events.log" "transfer:" 60 \
+  || { echo "WARN: no transfer event hit alice peer2 events.log in 60s" >&2; }
 
 # Bob's peer2 daemon will NOT see a Nostr transfer:* event because the
 # kind:31113 event's #p tag is alice's transport pubkey, not bob's.
