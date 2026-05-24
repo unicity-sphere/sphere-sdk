@@ -357,7 +357,27 @@ export type StorageEventType =
    * this case (reconciliation removed the floor; the retry has
    * a fresh chance to land).
    */
-  | 'storage:replica-lag-reconciled';
+  | 'storage:replica-lag-reconciled'
+  /**
+   * RFC-251 Approach D / issue #255 Problem B — emitted by the
+   * lifecycle manager IMMEDIATELY after a pointer commit succeeds at
+   * the aggregator. The wiring layer (typically `Sphere`) subscribes
+   * to this event and emits an authenticated `pointer-win` broadcast
+   * over Nostr so sibling same-identity devices can adopt V=N without
+   * waiting for the aggregator's 30-60 s read-replica lag.
+   *
+   * `data` carries `{ cid, version, attemptsUsed }`. The subscriber
+   * MUST build the signed payload via
+   * `signWinBroadcastPayload(pointer.getSignerForWinBroadcast().signer, ...)`
+   * and publish via the wallet's transport with the
+   * `pointer-win:<signingPubKeyHex>` tag.
+   *
+   * Informational only. No-op when the wiring layer doesn't
+   * subscribe — pointer publishes still succeed and siblings still
+   * converge via the existing WALKBACK_FLOOR + reconcile path
+   * (just slower, ~60-90 s vs ~1 s).
+   */
+  | 'storage:pointer-published';
 
 export interface StorageEvent {
   type: StorageEventType;
