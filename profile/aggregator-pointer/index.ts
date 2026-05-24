@@ -100,3 +100,19 @@ export type {
   ReconcileDownwardResult,
   RecoverResult,
 } from './ProfilePointerLayer.js';
+
+// RFC-251 Approach D — pointer-publish win-broadcast (issue #255 Problem B)
+export {
+  buildWinBroadcastHash,
+  buildWinBroadcastTag,
+  MAX_PAYLOAD_AGE_MS,
+  signWinBroadcastPayload,
+  verifyWinBroadcastPayload,
+  WIN_BROADCAST_KIND_MARKER,
+  WIN_BROADCAST_SCHEMA_VERSION,
+  WIN_BROADCAST_TAG_PREFIX,
+} from './win-broadcast.js';
+export type {
+  SignedWinBroadcastPayload,
+  UnsignedWinBroadcastPayload,
+} from './win-broadcast.js';

@@ -708,6 +708,21 @@ export class Sphere {
   private _providerEventCleanups: (() => void)[] = [];
   private _lastProviderConnected: Map<string, boolean> = new Map();
 
+  // RFC-251 Approach D / issue #255 Problem B — pointer-publish win-broadcast.
+  // Tracks whether the per-wallet Nostr subscription for sibling
+  // pointer-win broadcasts has been installed (one per pointer-signing
+  // pubkey ever seen during this Sphere lifetime). Cleared on destroy().
+  private _pointerWinSubscriptions = new Map<string, () => void>();
+  // Bounded dedup of (signingPubKey + version) tuples observed via
+  // sibling broadcasts — bounds within-replay-window duplicate
+  // processing. LRU-evicted at MAX_SIZE entries.
+  private _pointerWinSeen = new Set<string>();
+  // Sentinel: when the pointer layer is built async after OrbitDB attach,
+  // we poll for it once and install the subscription. This flag prevents
+  // multiple parallel install attempts when several pointer events fire
+  // close together.
+  private _pointerWinInstallInFlight = false;
+
   // ===========================================================================
   // Constructor (private)
   // ===========================================================================
@@ -5133,9 +5148,250 @@ export class Sphere {
           if (event.type === 'storage:error' || event.type === 'sync:error') {
             this.emitConnectionChanged(providerId, provider.isConnected(), provider.getStatus(), event.error);
           }
+          // RFC-251 Approach D / issue #255 Problem B — pointer-publish
+          // win-broadcast publisher side. After the lifecycle manager
+          // emits a `storage:pointer-published` event (containing the
+          // already-signed payload + broadcast tag), forward it to
+          // Nostr so sibling devices sharing this wallet's identity
+          // can adopt V=N without waiting for the aggregator's 30-60s
+          // read-replica lag.
+          //
+          // Best-effort: any failure (transport down, relay reject) is
+          // logged and dropped. The aggregator publish has already
+          // succeeded; the wallet's own state is correct without the
+          // broadcast. Siblings just fall back to the existing
+          // WALKBACK_FLOOR + reconcile path (~60-90 s).
+          if (event.type === 'storage:pointer-published') {
+            void this.forwardPointerPublishedToNostr(event);
+            // Also try to install the sibling-subscription side now
+            // that we know a pointer layer is live (signing is what
+            // produced this event). Idempotent — repeat calls no-op
+            // when the subscription is already in place.
+            void this.maybeInstallPointerWinSubscription();
+          }
         });
         if (unsub) this._providerEventCleanups.push(unsub);
       }
+    }
+  }
+
+  /**
+   * RFC-251 Approach D / issue #255 Problem B — publisher side.
+   *
+   * Receives a `storage:pointer-published` event from the lifecycle
+   * manager (which carries an already-signed broadcast payload + its
+   * per-wallet tag) and forwards it over Nostr. Best-effort:
+   * - No publish? Drop silently (transport doesn't support broadcasts
+   *   — falls back to existing WALKBACK_FLOOR convergence).
+   * - Publish throws? Log warn and drop.
+   *
+   * The signing happened upstream (in lifecycle-manager where the
+   * pointer layer is reachable). This method does pure transport I/O.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async forwardPointerPublishedToNostr(event: any): Promise<void> {
+    try {
+      const data = event?.data as
+        | {
+            signedPayloadJson?: unknown;
+            broadcastTag?: unknown;
+            version?: unknown;
+            cid?: unknown;
+          }
+        | undefined;
+      const signedPayloadJson = data?.signedPayloadJson;
+      const broadcastTag = data?.broadcastTag;
+      if (
+        typeof signedPayloadJson !== 'string' ||
+        typeof broadcastTag !== 'string' ||
+        signedPayloadJson.length === 0 ||
+        broadcastTag.length === 0
+      ) {
+        // Event shape didn't include the signed payload (e.g. pointer
+        // layer absent at sign time, or upstream sign failure). Caller
+        // already logged the sign error; nothing useful to publish.
+        return;
+      }
+      if (typeof this._transport.publishBroadcast !== 'function') {
+        // Transport doesn't support broadcasts (e.g., file-only mock).
+        // Silently skip — the existing WALKBACK_FLOOR path still
+        // handles cross-device convergence.
+        return;
+      }
+      await this._transport.publishBroadcast(signedPayloadJson, [broadcastTag]);
+      logger.debug(
+        'Sphere',
+        `pointer-win broadcast published: version=${String(data?.version ?? '?')} ` +
+        `cid=${String(data?.cid ?? '?')} tag=${broadcastTag}`,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn(
+        'Sphere',
+        `pointer-win broadcast publish failed (best-effort, ignored): ${msg}`,
+      );
+    }
+  }
+
+  /**
+   * RFC-251 Approach D / issue #255 Problem B — subscriber side.
+   *
+   * Install the per-wallet Nostr subscription so this device receives
+   * pointer-win broadcasts from sibling devices sharing the same
+   * wallet identity. Idempotent — safe to call repeatedly; once the
+   * subscription is in place for a given signing pubkey, subsequent
+   * invocations short-circuit.
+   *
+   * Pointer layer is built async during OrbitDB attach, so the
+   * subscription cannot be installed at Sphere init time. Two
+   * triggers eventually fire `maybeInstallPointerWinSubscription`:
+   *   - Lazy-on-own-publish: our own first `storage:pointer-published`
+   *     event implies pointer is live. We install then.
+   *   - (Phase 2 expansion) An eager polling loop after init for
+   *     receive-only devices that never publish themselves. NOT
+   *     wired in Phase 1 — those devices currently miss broadcasts
+   *     until they themselves publish at least once. Acceptable for
+   *     prototype; document as known-gap.
+   */
+  private async maybeInstallPointerWinSubscription(): Promise<void> {
+    if (this._pointerWinInstallInFlight) return;
+    this._pointerWinInstallInFlight = true;
+    try {
+      const storageWithPointer = this._storage as unknown as {
+        getPointerLayer?: () =>
+          | import('../profile/aggregator-pointer/ProfilePointerLayer').ProfilePointerLayer
+          | null;
+      };
+      const pointer = storageWithPointer.getPointerLayer?.() ?? null;
+      if (!pointer) {
+        // Pointer layer not yet built; try again on the next event.
+        return;
+      }
+      const signerHandle = pointer.getSignerForWinBroadcast();
+      const signingPubKeyHex = signerHandle.signingPubKeyHex;
+      if (this._pointerWinSubscriptions.has(signingPubKeyHex)) {
+        // Already subscribed for this wallet identity.
+        return;
+      }
+      if (typeof this._transport.subscribeToBroadcast !== 'function') {
+        return;
+      }
+
+      // Late-imported to avoid pulling the win-broadcast module into the
+      // happy path for wallets that disable pointer broadcasts entirely.
+      const {
+        buildWinBroadcastTag,
+        verifyWinBroadcastPayload,
+      } = await import('../profile/aggregator-pointer/win-broadcast');
+      const tag = buildWinBroadcastTag(signingPubKeyHex);
+
+      const unsub = this._transport.subscribeToBroadcast(
+        [tag],
+        (broadcast) => {
+          void this.handleIncomingPointerWinBroadcast(broadcast.content, signingPubKeyHex, pointer, verifyWinBroadcastPayload);
+        },
+      );
+      this._pointerWinSubscriptions.set(signingPubKeyHex, unsub);
+      logger.debug(
+        'Sphere',
+        `pointer-win subscription installed: tag=${tag}`,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn(
+        'Sphere',
+        `pointer-win subscription install failed (will retry on next event): ${msg}`,
+      );
+    } finally {
+      this._pointerWinInstallInFlight = false;
+    }
+  }
+
+  /**
+   * Handle an incoming pointer-win broadcast from a sibling device.
+   *
+   * Flow:
+   *   1. Parse JSON content.
+   *   2. Verify signature against own signingPubKey (signature mismatch
+   *      = spoofed or wrong-wallet event; drop silently).
+   *   3. Dedup by (signingPubKey, version) — bounded LRU.
+   *   4. Trigger early reconcile: `recoverLatest()` + `reconcileLocalVersionDownward()`.
+   *      Same path the WALKBACK_FLOOR catch arm runs (lifecycle-manager.ts
+   *      lines 1311-1331), just collapsed to "now" instead of "60s
+   *      throttle expiry".
+   *
+   * All errors are caught and logged at debug — never propagate to the
+   * transport handler.
+   */
+  private async handleIncomingPointerWinBroadcast(
+    contentJson: string,
+    ownSigningPubKeyHex: string,
+    pointer: import('../profile/aggregator-pointer/ProfilePointerLayer').ProfilePointerLayer,
+    verify: (
+      payload: import('../profile/aggregator-pointer/win-broadcast').SignedWinBroadcastPayload,
+      expectedSigningPubKeyHex: string,
+    ) => Promise<boolean>,
+  ): Promise<void> {
+    try {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(contentJson);
+      } catch {
+        // Not our JSON; relay-noise on the same tag (improbable but
+        // defensive). Drop.
+        return;
+      }
+      const payload = parsed as import('../profile/aggregator-pointer/win-broadcast').SignedWinBroadcastPayload;
+      const ok = await verify(payload, ownSigningPubKeyHex);
+      if (!ok) {
+        logger.debug(
+          'Sphere',
+          'pointer-win broadcast: verification failed (spoof, expired, or wrong-wallet); dropped',
+        );
+        return;
+      }
+      const dedupKey = `${payload.signingPubKey}:${payload.version}`;
+      if (this._pointerWinSeen.has(dedupKey)) {
+        return;
+      }
+      // Bounded LRU — drop oldest insertion when over cap.
+      if (this._pointerWinSeen.size >= 256) {
+        const oldest = this._pointerWinSeen.values().next().value;
+        if (oldest !== undefined) this._pointerWinSeen.delete(oldest);
+      }
+      this._pointerWinSeen.add(dedupKey);
+
+      logger.debug(
+        'Sphere',
+        `pointer-win broadcast received: version=${payload.version} ` +
+        `cid=${payload.cid} — triggering early reconcile`,
+      );
+
+      // Phase 1: trigger an early `recoverLatest` + `reconcileLocalVersionDownward`.
+      // This is the same path the WALKBACK_FLOOR catch arm runs after a
+      // race-loss; here we run it eagerly on the broadcast without
+      // waiting for the throttle to expire. Acknowledged limitation:
+      // when own localVersion is already at broadcast.version (same-
+      // version race), reconcileDownward is a no-op — Phase 2 would add
+      // a `ProfilePointerLayer.adoptBroadcast(payload)` entrypoint that
+      // bypasses the >= comparison. For Phase 1 this still helps the
+      // cross-version case where own localVersion < broadcast.version.
+      const recovered = await pointer.recoverLatest();
+      if (recovered) {
+        const outcome = await pointer.reconcileLocalVersionDownward(recovered);
+        logger.debug(
+          'Sphere',
+          `pointer-win broadcast: post-receipt reconcile ` +
+          `reconciled=${outcome.reconciled} ` +
+          `fromVersion=${outcome.fromVersion} toVersion=${outcome.toVersion}`,
+        );
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.debug(
+        'Sphere',
+        `pointer-win broadcast: handler threw (dropped): ${msg}`,
+      );
     }
   }
 
@@ -5168,6 +5424,22 @@ export class Sphere {
     }
     this._providerEventCleanups = [];
     this._lastProviderConnected.clear();
+    // RFC-251 Approach D — also tear down per-wallet pointer-win
+    // broadcast subscriptions to avoid relay-side subscription leaks
+    // across Sphere reinit cycles. Defensive: legacy test harnesses
+    // construct Sphere via `Object.create(prototype)` which skips
+    // class-field initializers, leaving these fields undefined. Skip
+    // the cleanup cleanly when the state never got installed.
+    if (this._pointerWinSubscriptions !== undefined) {
+      for (const unsub of this._pointerWinSubscriptions.values()) {
+        try { unsub(); } catch { /* ignore */ }
+      }
+      this._pointerWinSubscriptions.clear();
+    }
+    if (this._pointerWinSeen !== undefined) {
+      this._pointerWinSeen.clear();
+    }
+    this._pointerWinInstallInFlight = false;
   }
 
   private async initializeModules(): Promise<void> {

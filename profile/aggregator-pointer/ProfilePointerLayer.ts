@@ -164,6 +164,29 @@ export class ProfilePointerLayer {
   }
 
   /**
+   * RFC-251 Approach D (issue #255 Problem B) — expose the pointer layer's
+   * signing pubkey + signer to the integration wiring layer (Sphere /
+   * ProfileTokenStorageProvider). The win-broadcast publisher needs
+   * the pubkey hex to build the per-wallet broadcast tag, and the
+   * signer to sign the broadcast payload. The signer itself is exposed
+   * read-only — callers can only sign payloads, not mutate the signer's
+   * state.
+   *
+   * Returns a tuple rather than two getters so consumers can destructure
+   * once and cache for the wallet's lifetime; the underlying signer
+   * never rotates within a `ProfilePointerLayer` instance.
+   */
+  getSignerForWinBroadcast(): {
+    readonly signer: import('./signing.js').PointerSigner;
+    readonly signingPubKeyHex: string;
+  } {
+    return {
+      signer: this.#init.signer,
+      signingPubKeyHex: this.#init.signer.signingPubKeyHex,
+    };
+  }
+
+  /**
    * Wrap an async operation so it's tracked in `#inFlight` and removes
    * itself on settle. Used by the public publish/recover/probe entry
    * points so `shutdown()` can drain them.

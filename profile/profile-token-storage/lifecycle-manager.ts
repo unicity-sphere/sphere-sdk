@@ -73,6 +73,14 @@ import {
 import type { ShutdownOptions } from '../../storage/storage-provider.js';
 import type { BundleIndex } from './bundle-index.js';
 import type { ProfileTokenStorageHost } from './host.js';
+// RFC-251 Approach D / issue #255 Problem B — pointer-publish win-broadcast.
+// Imported only for the publish-success path; absent pointer layer ⇒ skipped.
+import {
+  buildWinBroadcastTag,
+  signWinBroadcastPayload,
+  WIN_BROADCAST_KIND_MARKER,
+  WIN_BROADCAST_SCHEMA_VERSION,
+} from '../aggregator-pointer/win-broadcast.js';
 
 /**
  * Pointer-layer error codes that indicate a permanent integrity /
@@ -1235,6 +1243,51 @@ export class LifecycleManager {
         this.host.log(
           `Pointer publish ok: cid=${cidString} version=${result.version} attempts=${result.attemptsUsed}`,
         );
+        // RFC-251 Approach D / issue #255 Problem B — emit the
+        // pointer-published event so the wiring layer (Sphere) can
+        // broadcast the win to sibling devices over Nostr. Siblings
+        // sharing this wallet's identity adopt V=N without waiting for
+        // the aggregator's 30-60 s read-replica lag.
+        //
+        // The crypto (build payload + sign with pointer signer) is done
+        // here because we have the pointer layer ref; the wiring layer
+        // (Sphere) just publishes the resulting wire-ready JSON over
+        // Nostr with the supplied tag. Keeps Sphere stateless w.r.t.
+        // pointer signing keys.
+        //
+        // Best-effort: any failure during sign / emit is logged and
+        // dropped — the publish-success return path is the contract.
+        try {
+          const signerHandle = pointer.getSignerForWinBroadcast();
+          const signed = await signWinBroadcastPayload(signerHandle.signer, {
+            _kind: WIN_BROADCAST_KIND_MARKER,
+            v: WIN_BROADCAST_SCHEMA_VERSION,
+            version: result.version,
+            cid: cidString,
+            signingPubKey: signerHandle.signingPubKeyHex,
+            ts: Date.now(),
+          });
+          this.host.emitEvent({
+            type: 'storage:pointer-published',
+            timestamp: Date.now(),
+            data: {
+              cid: cidString,
+              version: result.version,
+              attemptsUsed: result.attemptsUsed,
+              signedPayloadJson: JSON.stringify(signed),
+              broadcastTag: buildWinBroadcastTag(signerHandle.signingPubKeyHex),
+            },
+          });
+        } catch (broadcastErr) {
+          const errMsg =
+            broadcastErr instanceof Error
+              ? broadcastErr.message
+              : String(broadcastErr);
+          this.host.log(
+            `Pointer publish: win-broadcast build/sign failed (best-effort, ` +
+            `ignored): ${errMsg}`,
+          );
+        }
         return { ok: true, transient: false } as const;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
