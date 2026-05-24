@@ -248,9 +248,19 @@ function buildCarFetcher(gateways: readonly string[]): CarFetcher {
     let cidString: string;
     try {
       cidString = CID.decode(cidBytes).toString();
-    } catch {
+    } catch (decodeErr) {
+      // Issue #255 diagnostic: log the decode failure so we see when
+      // the caller hands us un-decodable CID bytes vs a downstream
+      // CAR parse issue. Both flow into `car_parse_failed` but the
+      // root cause is different.
+      logger.warn(
+        'CarFetcher',
+        `[DIAG] CID.decode(cidBytes) failed (length=${cidBytes.length}): ` +
+        `${decodeErr instanceof Error ? decodeErr.message : String(decodeErr)}`,
+      );
       return { ok: false, kind: 'car_parse_failed' } as const;
     }
+    const cidShort = cidString.slice(0, 16);
 
     const startedAt = Date.now();
     const budgetRemaining = (): number =>
@@ -259,6 +269,11 @@ function buildCarFetcher(gateways: readonly string[]): CarFetcher {
     let lastTransient: string | null = null;
     for (const gateway of gateways) {
       if (budgetRemaining() === 0) {
+        logger.warn(
+          'CarFetcher',
+          `[DIAG] cid=${cidShort} budget exhausted (${CAR_FETCH_TOTAL_BUDGET_MS}ms) ` +
+          `before trying gateway ${gateway} — returning transient_unavailable`,
+        );
         return {
           ok: false,
           kind: 'transient_unavailable',
@@ -273,6 +288,10 @@ function buildCarFetcher(gateways: readonly string[]): CarFetcher {
         outcome = await fetchCarFromGateway(url, { totalMs: budgetRemaining() });
       } catch (err) {
         lastTransient = err instanceof Error ? err.message : String(err);
+        logger.warn(
+          'CarFetcher',
+          `[DIAG] cid=${cidShort} gateway=${gateway} fetchCarFromGateway threw: ${lastTransient}`,
+        );
         continue;
       }
 
@@ -283,8 +302,16 @@ function buildCarFetcher(gateways: readonly string[]): CarFetcher {
         // DAG container, not a raw blob — so `verifyCidMatchesBytes`
         // from profile/ipfs-client does not apply. Use the CAR
         // reader's `getRoots()` instead.
+        const elapsedMs = Date.now() - startedAt;
         const rootCid = await extractCarRootCid(outcome.bytes);
         if (rootCid === null) {
+          logger.warn(
+            'CarFetcher',
+            `[DIAG] cid=${cidShort} gateway=${gateway} ` +
+            `CAR fetched (${outcome.bytes.length}B in ${elapsedMs}ms) but ` +
+            `extractCarRootCid returned null (CarReader.fromBytes threw OR roots.length===0) ` +
+            `— returning car_parse_failed`,
+          );
           return { ok: false, kind: 'car_parse_failed' } as const;
         }
         if (!cidBytesEqual(rootCid, cidBytes)) {
@@ -294,8 +321,25 @@ function buildCarFetcher(gateways: readonly string[]): CarFetcher {
           // wrong content for a requested CID. Per SPEC §8.2 step 3
           // this is SEMANTICALLY_INVALID, so we do NOT retry other
           // gateways; the CID is the authoritative identifier.
+          let returnedCidStr = '<undecodable>';
+          try {
+            returnedCidStr = CID.decode(rootCid).toString();
+          } catch { /* keep placeholder */ }
+          logger.warn(
+            'CarFetcher',
+            `[DIAG] cid=${cidShort} gateway=${gateway} CONTENT MISMATCH ` +
+            `(${outcome.bytes.length}B in ${elapsedMs}ms) — ` +
+            `requested=${cidString} returned=${returnedCidStr} ` +
+            `(requestedBytes[0..8]=${Array.from(cidBytes.slice(0, 8)).map(b => b.toString(16).padStart(2,'0')).join('')} ` +
+            `returnedBytes[0..8]=${Array.from(rootCid.slice(0, 8)).map(b => b.toString(16).padStart(2,'0')).join('')})`,
+          );
           return { ok: false, kind: 'content_mismatch' } as const;
         }
+        logger.debug(
+          'CarFetcher',
+          `[DIAG] cid=${cidShort} gateway=${gateway} OK ` +
+          `(${outcome.bytes.length}B in ${elapsedMs}ms)`,
+        );
         return { ok: true } as const;
       }
 
@@ -305,8 +349,18 @@ function buildCarFetcher(gateways: readonly string[]): CarFetcher {
           // violation — per SPEC §8.5 D6 we do NOT retry other
           // gateways on this class of failure; it's a
           // deterministic rejection.
+          logger.warn(
+            'CarFetcher',
+            `[DIAG] cid=${cidShort} gateway=${gateway} content_encoding_rejected ` +
+            `(detail=${outcome.detail ?? '<none>'}) — returning car_parse_failed`,
+          );
           return { ok: false, kind: 'car_parse_failed' } as const;
         case 'byte_cap_exceeded':
+          logger.warn(
+            'CarFetcher',
+            `[DIAG] cid=${cidShort} gateway=${gateway} byte_cap_exceeded ` +
+            `(detail=${outcome.detail ?? '<none>'}) — returning car_parse_failed`,
+          );
           return { ok: false, kind: 'car_parse_failed' } as const;
         case 'initial_response_timeout':
         case 'stall_timeout':
@@ -315,6 +369,11 @@ function buildCarFetcher(gateways: readonly string[]): CarFetcher {
         case 'network_error':
         default:
           lastTransient = outcome.detail;
+          logger.warn(
+            'CarFetcher',
+            `[DIAG] cid=${cidShort} gateway=${gateway} transient kind=${outcome.kind} ` +
+            `detail=${lastTransient ?? '<none>'}`,
+          );
           continue;
       }
     }
