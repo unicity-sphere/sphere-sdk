@@ -537,7 +537,13 @@ describe('defaultOrphanRecovery — aggregator cross-check (OUTBOX-SEND-FOLLOWUP
     });
 
     expect(outcome).toBe('manual');
-    expect(internals.deps.oracle.isSpent).toHaveBeenCalledWith('aabbccdd');
+    // Issue #243 — isSpent now takes (publicKey, stateHash). The
+    // pubkey comes from the wallet's identity.chainPubkey because
+    // the orphan's source state was guarded by our predicate.
+    expect(internals.deps.oracle.isSpent).toHaveBeenCalledWith(
+      '02' + 'aa'.repeat(32),
+      'aabbccdd',
+    );
     expect(saveSpy).not.toHaveBeenCalled();
     // Token status untouched.
     expect(
@@ -584,7 +590,11 @@ describe('defaultOrphanRecovery — aggregator cross-check (OUTBOX-SEND-FOLLOWUP
     });
 
     expect(outcome).toBe('manual');
-    expect(internals.deps.oracle.isSpent).toHaveBeenCalledWith('99887766');
+    // Issue #243 — (publicKey, stateHash) signature.
+    expect(internals.deps.oracle.isSpent).toHaveBeenCalledWith(
+      '02' + 'aa'.repeat(32),
+      '99887766',
+    );
     expect(saveSpy).not.toHaveBeenCalled();
     expect(asInternals(payments).tokens.get('orphan-rpc-error')?.status).toBe(
       'transferring',
@@ -679,7 +689,11 @@ describe('defaultOrphanRecovery — aggregator cross-check (OUTBOX-SEND-FOLLOWUP
     });
 
     expect(outcome).toBe('recovered');
-    expect(internals.deps.oracle.isSpent).toHaveBeenCalledWith('11223344');
+    // Issue #243 — (publicKey, stateHash) signature.
+    expect(internals.deps.oracle.isSpent).toHaveBeenCalledWith(
+      '02' + 'aa'.repeat(32),
+      '11223344',
+    );
     expect(saveSpy).toHaveBeenCalledTimes(1);
     expect(asInternals(payments).tokens.get('orphan-safe')?.status).toBe(
       'confirmed',
