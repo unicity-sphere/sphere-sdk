@@ -48,6 +48,11 @@ import {
 } from '../types/uxf-sent.js';
 import { decryptProfileValue, encryptProfileValue } from './encryption.js';
 import { Lamport } from './lamport.js';
+import {
+  getEnvelopePayload,
+  putEnvelopePayload,
+  unwrapEnvelopeBytes,
+} from './oplog-envelope-io.js';
 import type { ProfileDatabase, TombstoneGcResult } from './types.js';
 import { MAX_ENTRY_BYTES_RAW } from '../types/uxf-bounds.js';
 import {
@@ -489,11 +494,15 @@ export class SentLedgerWriter implements ProfileSyncWriter {
   > {
     if (!raw || raw.byteLength === 0) return null;
     if (raw.byteLength > MAX_ENTRY_BYTES_RAW) return null;
+    // Issue #247 — `raw` is bytes in hand from db.all() or a remote
+    // snapshot. They may be a CBOR envelope (post-#247) or raw
+    // ciphertext (pre-#247). Unwrap before decrypt.
+    const ciphertext = unwrapEnvelopeBytes(raw);
     let plaintextBytes: Uint8Array;
     try {
       plaintextBytes = this.encryptionKey
-        ? await decryptProfileValue(this.encryptionKey, raw)
-        : raw;
+        ? await decryptProfileValue(this.encryptionKey, ciphertext)
+        : ciphertext;
     } catch {
       return null;
     }
@@ -813,7 +822,9 @@ export class SentLedgerWriter implements ProfileSyncWriter {
   > {
     let raw: Uint8Array | null;
     try {
-      raw = await this.db.get(key);
+      // Issue #247 — dual-format reader for envelope-wrapped (new)
+      // and raw-ciphertext (legacy) entries.
+      raw = await getEnvelopePayload(this.db, key);
     } catch {
       return null;
     }
@@ -856,13 +867,17 @@ export class SentLedgerWriter implements ProfileSyncWriter {
     const toWrite = this.encryptionKey
       ? await encryptProfileValue(this.encryptionKey, encoded)
       : encoded;
-    await this.db.put(this.keyFor(id), toWrite);
+    // Issue #247 — wrap in an OpLog envelope so the lean-snapshot
+    // reader (db.getEntry -> decodeEntry) finds the entry.
+    await putEnvelopePayload(this.db, this.keyFor(id), toWrite);
   }
 
   private async readDecoded(key: string): Promise<unknown | null> {
     let raw: Uint8Array | null;
     try {
-      raw = await this.db.get(key);
+      // Issue #247 — dual-format reader for envelope-wrapped (new)
+      // and raw-ciphertext (legacy) entries.
+      raw = await getEnvelopePayload(this.db, key);
     } catch {
       return null;
     }
