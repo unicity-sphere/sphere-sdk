@@ -317,6 +317,7 @@ describe('LifecycleManager.publishAggregatorPointerBestEffort — issue #241 eve
   beforeEach(() => {
     vi.useRealTimers();
   });
+
   afterEach(() => {
     vi.useRealTimers();
   });
@@ -380,6 +381,150 @@ describe('LifecycleManager.publishAggregatorPointerBestEffort — issue #241 eve
       // for the walkback-floor case so operators can distinguish them.
       expect(events).toHaveLength(0);
       expect(handle.getPendingPublishCid()).toBe(FAKE_CID);
+    } finally {
+      await handle.provider.shutdown();
+    }
+  });
+});
+
+/**
+ * Issue #245 #3 — WALKBACK_FLOOR retry throttle.
+ *
+ * After a `AGGREGATOR_POINTER_WALKBACK_FLOOR` transient failure,
+ * subsequent calls to `publishAggregatorPointerBestEffort` within
+ * the throttle window short-circuit (returning the same transient
+ * code) WITHOUT invoking `pointer.publish` — which prevents burning
+ * the ~9-15s inner retry budget on a deterministic-given-state
+ * failure mode and reduces log noise from "hundreds" to ~one per
+ * minute (per the issue's observed manual-test storm).
+ *
+ * Coverage:
+ *   - First WALKBACK_FLOOR arms the throttle and stamps the CID.
+ *   - Second call within the window short-circuits (publish NOT
+ *     invoked) but still returns transient + keeps the CID stamped.
+ *   - A different transient code (NETWORK_ERROR) CLEARS the
+ *     throttle — fault class change re-enables prompt retry.
+ *   - A successful publish CLEARS the throttle and re-enables
+ *     normal retry on future failures.
+ */
+describe('LifecycleManager.publishAggregatorPointerBestEffort — WALKBACK_FLOOR throttle (#245 #3)', () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function walkbackError(): AggregatorPointerError {
+    return new AggregatorPointerError(
+      AggregatorPointerErrorCode.WALKBACK_FLOOR,
+      'simulated replication lag — Phase 3 walkback below localVersion',
+    );
+  }
+
+  it('first WALKBACK_FLOOR arms the throttle; second call within window short-circuits', async () => {
+    const publish = vi.fn(async () => {
+      throw walkbackError();
+    });
+    const pointer = stubPointer({ publish });
+    const handle = await createTestProvider(pointer);
+    try {
+      // First call — invokes publish, hits WALKBACK_FLOOR, arms throttle.
+      const r1 = await handle.lifecycle.publishAggregatorPointerBestEffort(FAKE_CID);
+      expect(r1.ok).toBe(false);
+      expect(r1.transient).toBe(true);
+      expect(r1.code).toBe('AGGREGATOR_POINTER_WALKBACK_FLOOR');
+      expect(publish).toHaveBeenCalledOnce();
+      expect(handle.getPendingPublishCid()).toBe(FAKE_CID);
+
+      // Second call within the throttle window — short-circuits.
+      const r2 = await handle.lifecycle.publishAggregatorPointerBestEffort(FAKE_CID);
+      expect(r2.ok).toBe(false);
+      expect(r2.transient).toBe(true);
+      expect(r2.code).toBe('AGGREGATOR_POINTER_WALKBACK_FLOOR');
+      // publish was NOT called again — throttle short-circuited.
+      expect(publish).toHaveBeenCalledOnce();
+      // pendingPublishCid still stamped (caller's flush body needs it).
+      expect(handle.getPendingPublishCid()).toBe(FAKE_CID);
+    } finally {
+      await handle.provider.shutdown();
+    }
+  });
+
+  it('a different transient code (NETWORK_ERROR) clears the throttle', async () => {
+    let nextThrow: 'walkback' | 'network' = 'walkback';
+    const publish = vi.fn(async () => {
+      if (nextThrow === 'walkback') throw walkbackError();
+      throw new AggregatorPointerError(
+        AggregatorPointerErrorCode.NETWORK_ERROR,
+        'simulated network blip',
+      );
+    });
+    const pointer = stubPointer({ publish });
+    const handle = await createTestProvider(pointer);
+    try {
+      // Arm the throttle with WALKBACK_FLOOR.
+      await handle.lifecycle.publishAggregatorPointerBestEffort(FAKE_CID);
+      expect(publish).toHaveBeenCalledOnce();
+
+      // Throttled — publish NOT invoked.
+      await handle.lifecycle.publishAggregatorPointerBestEffort(FAKE_CID);
+      expect(publish).toHaveBeenCalledOnce();
+
+      // Manually clear the throttle by simulating the WALKBACK lag
+      // expiring (test-only knob via internals — avoids waiting 60s).
+      (handle.provider as unknown as {
+        lifecycleManager: { walkbackFloorThrottleUntilMs: number };
+      }).lifecycleManager.walkbackFloorThrottleUntilMs = 0;
+
+      // Next call hits the NETWORK_ERROR arm — publish invoked,
+      // and the throttle should NOT re-arm (different code class).
+      nextThrow = 'network';
+      const r = await handle.lifecycle.publishAggregatorPointerBestEffort(FAKE_CID);
+      expect(r.transient).toBe(true);
+      expect(r.code).toBe('AGGREGATOR_POINTER_NETWORK_ERROR');
+      expect(publish).toHaveBeenCalledTimes(2);
+
+      // Subsequent call after NETWORK_ERROR is NOT throttled.
+      await handle.lifecycle.publishAggregatorPointerBestEffort(FAKE_CID);
+      expect(publish).toHaveBeenCalledTimes(3);
+    } finally {
+      await handle.provider.shutdown();
+    }
+  });
+
+  it('successful publish clears the throttle', async () => {
+    let succeedNext = false;
+    const publish = vi.fn(async () => {
+      if (!succeedNext) throw walkbackError();
+      return { cid: new Uint8Array(0), version: 99, attemptsUsed: 1 } as never;
+    });
+    const pointer = stubPointer({ publish });
+    const handle = await createTestProvider(pointer);
+    try {
+      // Arm the throttle.
+      await handle.lifecycle.publishAggregatorPointerBestEffort(FAKE_CID);
+      expect(publish).toHaveBeenCalledOnce();
+      // Throttled.
+      await handle.lifecycle.publishAggregatorPointerBestEffort(FAKE_CID);
+      expect(publish).toHaveBeenCalledOnce();
+
+      // Clear throttle (simulate window expiry), then succeed.
+      (handle.provider as unknown as {
+        lifecycleManager: { walkbackFloorThrottleUntilMs: number };
+      }).lifecycleManager.walkbackFloorThrottleUntilMs = 0;
+      succeedNext = true;
+      const r = await handle.lifecycle.publishAggregatorPointerBestEffort(FAKE_CID);
+      expect(r.ok).toBe(true);
+      expect(publish).toHaveBeenCalledTimes(2);
+      expect(handle.getPendingPublishCid()).toBeNull();
+
+      // Throttle was cleared on success; a future WALKBACK_FLOOR
+      // would re-arm fresh (no carry-over from prior session).
+      succeedNext = false;
+      await handle.lifecycle.publishAggregatorPointerBestEffort(FAKE_CID);
+      expect(publish).toHaveBeenCalledTimes(3);
     } finally {
       await handle.provider.shutdown();
     }

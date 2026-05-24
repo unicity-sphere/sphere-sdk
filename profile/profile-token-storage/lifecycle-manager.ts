@@ -160,6 +160,47 @@ export type ShutdownVerificationLeg =
   | 'pointer-read-back'
   | 'pending-publish-retry';
 
+/**
+ * Issue #245 #3 — outer throttle window applied AFTER a
+ * `AGGREGATOR_POINTER_WALKBACK_FLOOR` transient failure. While this
+ * window is active, subsequent `publishAggregatorPointerBestEffort`
+ * calls short-circuit (returning the same transient outcome) rather
+ * than burning another ~9-15s of inner reconcile-retry budget.
+ *
+ * Rationale: WALKBACK_FLOOR fires when the aggregator's current
+ * highest-visible version is BELOW a version this wallet has already
+ * confirmed (replication lag). It is DETERMINISTIC for a given
+ * `(currentLocalVersion, aggregator state)` — retrying within
+ * milliseconds returns the same answer. The existing inner retry
+ * (5 attempts with exponential backoff up to ~15s total) already
+ * absorbs short lag windows; this outer throttle absorbs the
+ * longer-lag case where lag persists past the inner budget and we'd
+ * otherwise re-burn it on every save-driven flush (debounce ~2s)
+ * and every periodic pointer poll. A 25-min manual-test run with
+ * this scenario emitted hundreds of identical WARN lines per #245.
+ *
+ * The `pendingPublishCid` marker is preserved across throttled
+ * skips — the at-least-once gate (PaymentsModule.handleIncomingTransfer)
+ * stays closed for the entire throttle window, exactly as if the
+ * inner retries kept failing. The user observes a slightly longer
+ * delay before durable publish, in exchange for orders-of-magnitude
+ * less log noise and CPU spent in pointless retries.
+ *
+ * 60s is chosen so a routine ~30s replication lag clears within one
+ * throttle window; at the typical 2s save debounce that reduces WARN
+ * volume by ~30x. Other transient codes (NETWORK_ERROR,
+ * UNCLASSIFIED) are NOT throttled — those are not deterministic given
+ * local state and benefit from prompt retry.
+ *
+ * Note: PR #241 separately raised `WALKBACK_FLOOR_RETRY_BUDGET` from
+ * 5 → 7 (inner reconcile-retry) and decoupled the at-least-once gate
+ * from publish transience. PR #245's outer throttle complements that
+ * by stopping the storm of inner-retries from save-driven flushes
+ * once the lag is known to persist past the inner budget.
+ */
+const WALKBACK_FLOOR_RETRY_THROTTLE_MS = 60_000;
+const WALKBACK_FLOOR_CODE = 'AGGREGATOR_POINTER_WALKBACK_FLOOR';
+
 export class LifecycleManager {
   /**
    * Periodic-poll timer for Path 2 (aggregator pointer recovery).
@@ -168,6 +209,25 @@ export class LifecycleManager {
    * it). Set by `schedulePointerPoll()`, cleared by `shutdown()`.
    */
   private pointerPollTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /**
+   * Issue #245 #3 — wall-clock deadline (ms epoch) until which a
+   * publish attempt should short-circuit because a recent attempt
+   * hit `AGGREGATOR_POINTER_WALKBACK_FLOOR`. Zero when no throttle is
+   * active. Cleared on:
+   *   - any successful publish (lag has cleared)
+   *   - a transient failure with a DIFFERENT code (the prior
+   *     WALKBACK_FLOOR diagnosis no longer applies — different fault
+   *     class, the inner retry budget is the right tool)
+   * See `WALKBACK_FLOOR_RETRY_THROTTLE_MS` for rationale.
+   */
+  private walkbackFloorThrottleUntilMs = 0;
+  /**
+   * Issue #245 #3 — number of throttled-skip events accumulated
+   * during the active throttle window. Logged at the END (next
+   * non-throttled outcome) so a single summary replaces the storm.
+   */
+  private walkbackFloorThrottleSkipCount = 0;
 
   /**
    * Poll-discovery handler captured from `initialize()`. Invoked by
@@ -1078,6 +1138,23 @@ export class LifecycleManager {
       return { ok: false, transient: false };
     }
 
+    // Issue #245 #3 — short-circuit while a WALKBACK_FLOOR throttle is
+    // active. Returns the same shape as the transient-failure arm so
+    // callers (flushToIpfs / retryPendingPublishIfAny) keep the
+    // `pendingPublishCid` marker live and hold the at-least-once gate
+    // closed. No log line per skip — only a summary when the throttle
+    // clears (in the catch arm or the success arm).
+    const nowMs = Date.now();
+    if (nowMs < this.walkbackFloorThrottleUntilMs) {
+      this.walkbackFloorThrottleSkipCount += 1;
+      // Mark the pending CID — caller may have invoked with a fresh
+      // CID (save-driven flush) that we couldn't publish yet. Set
+      // unconditionally so a wakeup retry uses the most recent CID
+      // rather than a stale one.
+      this.host.setPendingPublishCid(cidString);
+      return { ok: false, transient: true, code: WALKBACK_FLOOR_CODE };
+    }
+
     try {
       const cidBytes = CID.parse(cidString).bytes;
       const result = await pointer.publish(async () => cidBytes);
@@ -1085,6 +1162,17 @@ export class LifecycleManager {
       // Clear any previously-pending marker — this publish succeeded,
       // so the cross-device recovery path can now reach the bundle.
       this.host.setPendingPublishCid(null);
+      // Issue #245 #3 — successful publish clears the throttle and
+      // logs the prior skip count (operator visibility on how much
+      // noise was suppressed).
+      if (this.walkbackFloorThrottleSkipCount > 0) {
+        this.host.log(
+          `Pointer publish recovered after ${this.walkbackFloorThrottleSkipCount} ` +
+            `WALKBACK_FLOOR-throttled skip(s).`,
+        );
+      }
+      this.walkbackFloorThrottleUntilMs = 0;
+      this.walkbackFloorThrottleSkipCount = 0;
       this.host.log(
         `Pointer publish ok: cid=${cidString} version=${result.version} attempts=${result.attemptsUsed}`,
       );
@@ -1099,6 +1187,11 @@ export class LifecycleManager {
         // alert event is the call to action; auto-retry would just
         // hammer a wallet that needs human intervention.
         this.host.setPendingPublishCid(null);
+        // Issue #245 #3 — permanent failure also clears the WALKBACK
+        // throttle (it no longer applies — we've decided to stop
+        // retrying entirely).
+        this.walkbackFloorThrottleUntilMs = 0;
+        this.walkbackFloorThrottleSkipCount = 0;
         return { ok: false, transient: false, code };
       }
       // Elevate the transient publish failure to warn-level so the
@@ -1115,20 +1208,36 @@ export class LifecycleManager {
         'Profile-TokenStorage',
         `Pointer publish failed (transient, code=${transientCode}, cid=${cidString}): ${msg}`,
       );
-      // Issue #241 — a WALKBACK_FLOOR transient is specifically the
-      // aggregator's read replica lagging behind the wallet's locally-
-      // confirmed `localVersion`. Surface this as a typed
-      // `storage:replica-lag` event so monitoring can distinguish
-      // replica-lag stalls from generic transients (network blips,
-      // gateway hiccups). All other transients flow through the
-      // generic `storage:pending-publish` event emitted by the
-      // caller (FlushScheduler).
-      if (transientCode === 'AGGREGATOR_POINTER_WALKBACK_FLOOR') {
+      // Issue #241 + #245 #3 — combined handling of WALKBACK_FLOOR
+      // transient:
+      //   - #241: emit a typed `storage:replica-lag` event so monitoring
+      //     can distinguish replica-lag stalls from generic transients
+      //     (network blips, gateway hiccups). All other transients flow
+      //     through the generic `storage:pending-publish` event emitted
+      //     by the caller (FlushScheduler).
+      //   - #245 #3: arm the outer throttle so subsequent flushes
+      //     short-circuit instead of burning another ~9-15s of inner
+      //     reconcile-retry budget. A non-WALKBACK transient AFTER a
+      //     WALKBACK clears the throttle (the prior diagnosis no longer
+      //     applies — different fault class).
+      if (transientCode === WALKBACK_FLOOR_CODE) {
         this.host.emitEvent({
           type: 'storage:replica-lag',
           timestamp: Date.now(),
           data: { cid: cidString, code: transientCode, message: msg },
         });
+        this.walkbackFloorThrottleUntilMs =
+          Date.now() + WALKBACK_FLOOR_RETRY_THROTTLE_MS;
+        this.walkbackFloorThrottleSkipCount = 0;
+      } else {
+        if (this.walkbackFloorThrottleSkipCount > 0) {
+          this.host.log(
+            `Pointer publish: ${this.walkbackFloorThrottleSkipCount} ` +
+              `WALKBACK_FLOOR-throttled skip(s) cleared by new transient code=${transientCode}.`,
+          );
+        }
+        this.walkbackFloorThrottleUntilMs = 0;
+        this.walkbackFloorThrottleSkipCount = 0;
       }
       // Transient: stamp the retry marker (with localCache persistence
       // for crash safety) so subsequent flushes / polls re-attempt
