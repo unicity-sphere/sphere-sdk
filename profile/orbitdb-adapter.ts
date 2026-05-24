@@ -112,10 +112,92 @@ export class OrbitDbAdapter implements ProfileDatabase {
     if (this.connectInFlight) {
       return this.connectInFlight;
     }
-    this.connectInFlight = this.connectInner(config).finally(() => {
+    this.connectInFlight = this.connectWithRetry(config).finally(() => {
       this.connectInFlight = null;
     });
     return this.connectInFlight;
+  }
+
+  /**
+   * Issue #245 #2 — bounded retry wrapper around `connectInner`.
+   *
+   * **Why:** the manual-test-full-recovery.sh §C.4 step reliably
+   * surfaced
+   *   `Failed to attach OrbitDB: ORBITDB_CONNECTION_FAILED: ...
+   *    Failed to connect to OrbitDB: Database is not open`
+   * on the FIRST CLI invocation following a daemon-driven sync
+   * (where the daemon's prior `closeInner()` had hit the
+   * `helia.stop exceeded 10000ms — dropping reference and continuing`
+   * budget timeout, leaving on-disk state in a transient
+   * lock/teardown limbo). The next process couldn't open the same
+   * directory cleanly until ~seconds had passed.
+   *
+   * `cleanupOnError()` (run inside `connectInner` on throw) wipes
+   * adapter-local helia/orbitdb/db handles before re-throwing — so
+   * a retry creates a fresh helia + orbitdb pair from scratch. That
+   * makes the retry both safe (no stale state carry-over) and
+   * meaningful (we get a fresh attempt at acquiring the on-disk
+   * locks / pubsub init / DB open).
+   *
+   * **Retry budget:** 2 attempts × 1.5s linear backoff = ~3-4.5s
+   * worst-case extra latency. Acceptable given the failure mode
+   * (test-script reliability + UX after a daemon restart). We do
+   * NOT retry `ORBITDB_NOT_INSTALLED` — that's a sticky dep error.
+   *
+   * **Multi-process diagnosis:** if all retries exhaust and the
+   * final message matches a lock-contention pattern, we augment the
+   * error with an actionable hint pointing at the most likely cause
+   * (a sphere daemon holding the lock). The base ProfileErrorCode
+   * is preserved so callers' code-based routing keeps working.
+   */
+  private async connectWithRetry(config: OrbitDbConfig): Promise<void> {
+    const RETRY_ATTEMPTS = 2; // 1 initial + 2 retries = 3 total
+    const RETRY_BACKOFF_MS = 1500;
+    let lastErr: unknown;
+    for (let attempt = 0; attempt <= RETRY_ATTEMPTS; attempt++) {
+      try {
+        await this.connectInner(config);
+        return;
+      } catch (err) {
+        lastErr = err;
+        // Sticky errors: no retry. ORBITDB_NOT_INSTALLED is a dep
+        // problem that won't fix itself; retrying just delays the
+        // operator-visible failure.
+        if (
+          err instanceof ProfileError &&
+          err.code === 'ORBITDB_NOT_INSTALLED'
+        ) {
+          throw err;
+        }
+        if (attempt >= RETRY_ATTEMPTS) break;
+        // Linear backoff (≥1s) — absorbs a few seconds of teardown
+        // / file-lock release without overshooting.
+        await new Promise((resolve) => setTimeout(resolve, RETRY_BACKOFF_MS));
+      }
+    }
+    // Augment the final error with multi-process diagnostic hint
+    // when the message matches a likely lock-contention or
+    // teardown-race pattern. Keep the original code so any caller
+    // that branches on `err.code === 'ORBITDB_CONNECTION_FAILED'`
+    // keeps working.
+    if (
+      lastErr instanceof ProfileError &&
+      lastErr.code === 'ORBITDB_CONNECTION_FAILED' &&
+      /Database is not open|LOCK|Resource temporarily unavailable|lockfile|EBUSY/i.test(
+        lastErr.message,
+      )
+    ) {
+      throw new ProfileError(
+        'ORBITDB_CONNECTION_FAILED',
+        `${lastErr.message} (after ${RETRY_ATTEMPTS + 1} attempts). ` +
+          `This is typically caused by another process (e.g. a ` +
+          `\`sphere daemon\`) still holding the OrbitDB / Helia ` +
+          `directory lock. Stop the daemon (\`sphere daemon stop\`) ` +
+          `or wait for its teardown to complete, then retry.`,
+        lastErr,
+      );
+    }
+    throw lastErr;
   }
 
   private async connectInner(config: OrbitDbConfig): Promise<void> {

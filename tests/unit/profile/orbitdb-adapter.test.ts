@@ -297,3 +297,126 @@ describe('OrbitDbAdapter.close() teardown budget', () => {
     expect(adapter.isConnected()).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Issue #245 #2 — connect() retry wrapper for transient init failures.
+//
+// `connectInner` can throw `ORBITDB_CONNECTION_FAILED` with messages
+// matching "Database is not open" / "LOCK" / "EBUSY" patterns when a
+// prior teardown's on-disk lock release hasn't fully landed. The retry
+// wrapper gives 2 extra attempts with 1.5s linear backoff before
+// surfacing the failure (augmented with a multi-process diagnostic
+// hint when the pattern matches).
+// ---------------------------------------------------------------------------
+
+describe('OrbitDbAdapter.connect() — Issue #245 #2 retry on transient init failure', () => {
+  beforeEach(() => {
+    // Real timers — we want the actual backoff sleeps to elapse.
+    vi.useRealTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  // Helper: wrap an OrbitDbAdapter so we can stub `connectInner` (private).
+  function withStubbedConnectInner(
+    impl: (config: OrbitDbConfig) => Promise<void>,
+  ): { adapter: OrbitDbAdapter; spy: ReturnType<typeof vi.fn> } {
+    const adapter = new OrbitDbAdapter();
+    const spy = vi.fn(impl);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (adapter as any).connectInner = spy;
+    return { adapter, spy };
+  }
+
+  it('retries up to 2 times on transient ORBITDB_CONNECTION_FAILED, then succeeds', async () => {
+    const { ProfileError } = await import('../../../profile/errors.js');
+    let attempt = 0;
+    const { adapter, spy } = withStubbedConnectInner(async () => {
+      attempt += 1;
+      if (attempt < 3) {
+        throw new ProfileError(
+          'ORBITDB_CONNECTION_FAILED',
+          'Failed to connect to OrbitDB: Database is not open',
+        );
+      }
+      // Mark connected on the 3rd attempt so isConnected() reports true.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (adapter as any).connected = true;
+    });
+
+    await adapter.connect({ privateKey: 'aa'.repeat(32) });
+    expect(spy).toHaveBeenCalledTimes(3);
+    expect(adapter.isConnected()).toBe(true);
+  });
+
+  it('does NOT retry ORBITDB_NOT_INSTALLED (sticky dep error)', async () => {
+    const { ProfileError } = await import('../../../profile/errors.js');
+    const { adapter, spy } = withStubbedConnectInner(async () => {
+      throw new ProfileError(
+        'ORBITDB_NOT_INSTALLED',
+        '@orbitdb/core is not installed.',
+      );
+    });
+
+    let thrown: unknown = null;
+    try {
+      await adapter.connect({ privateKey: 'aa'.repeat(32) });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(ProfileError);
+    expect((thrown as InstanceType<typeof ProfileError>).code).toBe(
+      'ORBITDB_NOT_INSTALLED',
+    );
+    // No retry — exactly one attempt.
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it('augments the error with multi-process diagnostic hint when retries exhaust', async () => {
+    const { ProfileError } = await import('../../../profile/errors.js');
+    const { adapter, spy } = withStubbedConnectInner(async () => {
+      throw new ProfileError(
+        'ORBITDB_CONNECTION_FAILED',
+        'Failed to connect to OrbitDB: Database is not open',
+      );
+    });
+
+    let thrown: unknown = null;
+    try {
+      await adapter.connect({ privateKey: 'aa'.repeat(32) });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(ProfileError);
+    expect((thrown as InstanceType<typeof ProfileError>).code).toBe(
+      'ORBITDB_CONNECTION_FAILED',
+    );
+    // 1 initial + 2 retries = 3 attempts.
+    expect(spy).toHaveBeenCalledTimes(3);
+    // Augmented message mentions the daemon-lock diagnosis.
+    expect((thrown as Error).message).toMatch(/sphere daemon/i);
+    expect((thrown as Error).message).toMatch(/holding the OrbitDB/i);
+  });
+
+  it('non-matching error message is NOT augmented (preserves original text)', async () => {
+    const { ProfileError } = await import('../../../profile/errors.js');
+    const ORIGINAL = 'Failed to connect to OrbitDB: peer dependency missing';
+    const { adapter, spy } = withStubbedConnectInner(async () => {
+      throw new ProfileError('ORBITDB_CONNECTION_FAILED', ORIGINAL);
+    });
+
+    let thrown: unknown = null;
+    try {
+      await adapter.connect({ privateKey: 'aa'.repeat(32) });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(spy).toHaveBeenCalledTimes(3);
+    // No "sphere daemon" hint — message pattern didn't match.
+    expect((thrown as Error).message).not.toMatch(/sphere daemon/i);
+    expect((thrown as Error).message).toContain('peer dependency missing');
+  });
+});
