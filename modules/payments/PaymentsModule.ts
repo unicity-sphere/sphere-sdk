@@ -9227,16 +9227,36 @@ export class PaymentsModule {
 
       // Fetch the proof one more time (the queue already saw it, but it
       // doesn't pass the proof through to the callback).
+      //
+      // Issue #251 — `OracleProvider.getProof` returns the local wrapper
+      // shape `{ requestId, roundNumber, proof, timestamp }` where the
+      // SDK-shaped `IInclusionProofJson` (carrying `merkleTreePath`,
+      // `authenticator`, `transactionHash`, `unicityCertificate`) lives
+      // under `.proof`. `TransferTransaction.fromJSON` ultimately calls
+      // `InclusionProof.isJSON` which requires `merkleTreePath` AND
+      // `unicityCertificate` at the top level of the patched
+      // `inclusionProof` value. Pre-fix this code passed the wrapper
+      // through (the wrapper has no `toJSON()` method), and every
+      // cross-device finalize tripped `InvalidJsonStructureError` —
+      // surfacing as the §C.4 "Stranded receive hit permanent structural
+      // failure" loop on peer2-alice.
+      //
+      // Order matters:
+      //   1. Wrapper with `.proof` (canonical OracleProvider return).
+      //   2. SDK `InclusionProof` instance carrying `.toJSON()` — kept
+      //      for callers that mock/return an instance directly.
+      //   3. Already-JSON shape — defensive pass-through.
       let proofJson: unknown = null;
       const proof = await this.deps!.oracle.getProof(job.requestIdHex);
       if (proof) {
-        // proof may be an InclusionProof instance or a plain JSON object —
-        // `TransferTransaction.fromJSON` expects the JSON shape, so
-        // normalize via `toJSON()` when available.
-        const proofWithToJson = proof as { toJSON?: () => unknown };
-        proofJson = typeof proofWithToJson.toJSON === 'function'
-          ? proofWithToJson.toJSON()
-          : proof;
+        const wrapper = proof as { proof?: unknown; toJSON?: () => unknown };
+        if (wrapper.proof !== undefined && wrapper.proof !== null) {
+          proofJson = wrapper.proof;
+        } else if (typeof wrapper.toJSON === 'function') {
+          proofJson = wrapper.toJSON();
+        } else {
+          proofJson = proof;
+        }
       }
       if (!proofJson) {
         logger.debug('Payments', `[V6-RECOVER] Proof for ${tokenId.slice(0, 12)} unavailable on re-fetch — leaving for next tick`);
@@ -9330,10 +9350,19 @@ export class PaymentsModule {
             try {
               const proof = await this.deps!.oracle.getProof(job.requestIdHex);
               if (proof) {
-                const proofWithToJson = proof as { toJSON?: () => unknown };
-                const pj = typeof proofWithToJson.toJSON === 'function'
-                  ? proofWithToJson.toJSON()
-                  : proof;
+                // Issue #251 — mirror the unwrap order used in the
+                // finalize path (above) so the diagnostic logs the
+                // canonical SDK keys, not the OracleProvider wrapper
+                // keys. Misleading-but-noisy → useful triage signal.
+                const wrapper = proof as { proof?: unknown; toJSON?: () => unknown };
+                let pj: unknown;
+                if (wrapper.proof !== undefined && wrapper.proof !== null) {
+                  pj = wrapper.proof;
+                } else if (typeof wrapper.toJSON === 'function') {
+                  pj = wrapper.toJSON();
+                } else {
+                  pj = proof;
+                }
                 proofShape = pj && typeof pj === 'object'
                   ? Object.keys(pj as Record<string, unknown>)
                   : `non-object:${typeof pj}`;
