@@ -223,7 +223,12 @@ Same-identity siblings subscribe to `pointer-win:<ownSigningPubKeyHex>` and veri
 - **Backward compatible.** Old clients don't subscribe to the tag; they fall back to the existing path. New clients ignore broadcasts they can't verify (different wallet, expired, malformed) and drop silently.
 
 **Cons.**
-- **Doesn't address same-version race directly.** `reconcileLocalVersionDownward` is a strict downgrade (`candidate.version < localVersion`). In the dominant *same-version* race (both at V=N, A wins), local already equals broadcast.version, so the existing reconcile is a no-op. The broadcast becomes informational in that case — siblings learn about A's win ~1 s faster than the aggregator replica would tell them, but the 60 s WALKBACK_FLOOR throttle is not directly cleared. *Phase 2* adds an `adoptBroadcast(payload)` entrypoint on `ProfilePointerLayer` that bypasses the `>=` comparison and resets the throttle explicitly.
+- **Phase 1 does not improve convergence — it is a measurement + wiring-infrastructure vehicle.** The subscriber's `recoverLatest() + reconcileLocalVersionDownward()` action mirrors the existing WALKBACK_FLOOR catch arm (PR #249) and:
+  - Does NOT clear the WALKBACK_FLOOR throttle (B still waits 60 s after a race-loss before its next publish attempt, regardless of broadcast).
+  - Does NOT call `fetchAndJoin(broadcast.cid)` (B's OpLog merge with A's contribution is still gated on OrbitDB replication).
+  - Returns no-op for the dominant same-version race (`reconcileLocalVersionDownward` requires `candidate < local`; in same-version race local == broadcast.version, so the check skips).
+  - May briefly help a narrow window where B's local was speculatively bumped to V=N and the replica still lags, by triggering the existing downgrade ~1 s earlier than the catch arm — but the throttle remaining armed neutralizes the gain.
+- **Phase 2 is what actually solves convergence.** Adds an `adoptBroadcast(payload)` entrypoint on `ProfilePointerLayer` that: bypasses the `>=` comparison, advances local to `broadcast.version`, calls `fetchAndJoin(broadcast.cid)` to merge A's OpLog into B's local, and resets the WALKBACK_FLOOR throttle so the next publish can immediately target `broadcast.version + 1`. Phase 1's value is to validate the broadcast wire-format end-to-end and produce the fire/receive counts that decide whether Phase 2 is needed.
 - **Lazy subscription install** (Phase 1). Receive-only devices that never publish themselves don't install their sibling subscription until their own first publish. *Phase 2* adds an eager polling loop or a `storage:pointer-ready` event from `ProfileStorageProvider`.
 - **Nostr fanout cost.** Each successful publish ⇒ one signed event per relay subscribed. For a high-frequency wallet (multiple publishes per minute) this adds bandwidth. Bounded by the publish cadence the aggregator already enforces; not a new scaling concern.
 
@@ -276,9 +281,9 @@ Same-identity siblings subscribe to `pointer-win:<ownSigningPubKeyHex>` and veri
 
 **Pursue Approach D (Nostr win-broadcast).** Phased rollout:
 
-**Phase 1 — landed in PR #257 (draft):**
+**Phase 1 — landed in PR #257 (draft). Scope: measurement + wiring. Does NOT improve race convergence; that lands in Phase 2.**
 - Authenticated win-broadcast fires after every successful pointer publish.
-- Sibling devices verify the signature against their own pointer signing pubkey, dedupe (signingPubKey, version) via bounded 256-entry LRU, trigger an early `recoverLatest()` + `reconcileLocalVersionDownward()` on receipt.
+- Sibling devices verify the signature against their own pointer signing pubkey, dedupe (signingPubKey, version) via bounded 256-entry LRU, then trigger `recoverLatest()` + `reconcileLocalVersionDownward()` — mirroring the existing WALKBACK_FLOOR catch arm (PR #249). This is a redundant trigger, not a convergence-accelerator: the throttle stays armed, `fetchAndJoin` is not called, and reconcile no-ops for same-version race. Phase 1's purpose is to validate the wire-format end-to-end and produce broadcast fire/receive counts in the debug log so Stage B.1 has measurement data.
 - Crypto module fully unit-tested (24 tests). Lifecycle-manager emission contract tested (4 tests). Full unit suite: 8132 pass, 0 regressions.
 - Gated as DRAFT until Stage B.1 verdict (5× `manual-test-full-recovery.sh` run after `unicitynetwork/ipfs-storage#7` deploys).
 
@@ -382,12 +387,15 @@ This forecloses Approach A (requires aggregator schema change) and reaffirms App
 
 ### 2026-05-24 — Phase 1 prototype landed
 
-PR #257 (draft) implements Approach D Phase 1:
+PR #257 (draft) implements Approach D Phase 1. **Scope: measurement + wiring; does NOT improve race convergence on its own.**
+
 - `profile/aggregator-pointer/win-broadcast.ts` — standalone signed payload module (24 unit tests).
 - `ProfilePointerLayer.getSignerForWinBroadcast()` accessor.
 - `storage:pointer-published` event variant on `StorageEventType`.
 - Lifecycle-manager emits signed payload + per-wallet tag after successful publish (4 integration tests).
-- Sphere subscribes both directions: forwards `storage:pointer-published` to Nostr; lazy-installs `pointer-win:<signingPubKeyHex>` subscription on first own publish; verified broadcasts trigger early `recoverLatest()` + `reconcileLocalVersionDownward()`.
+- Sphere subscribes both directions: forwards `storage:pointer-published` to Nostr; lazy-installs `pointer-win:<signingPubKeyHex>` subscription on first own publish; verified broadcasts trigger `recoverLatest()` + `reconcileLocalVersionDownward()` (mirroring the existing WALKBACK_FLOOR catch arm — see §2.4 Cons for why this is intentionally redundant for Phase 1).
+
+The race-convergence work is in Phase 2: `adoptBroadcast(payload)` entrypoint that bypasses reconcile's `>=` comparison, calls `fetchAndJoin(broadcast.cid)`, and resets the WALKBACK throttle. Phase 1 exists to (a) validate the broadcast wire-format end-to-end against real Nostr, (b) produce fire/receive counts in the debug log for Stage B.1 to inform whether Phase 2 is needed, and (c) lay the wiring infrastructure Phase 2 will plug into.
 
 Full unit suite: 8132 pass, 0 regressions. Held as DRAFT pending Stage B.1 verdict.
 
@@ -396,9 +404,9 @@ Full unit suite: 8132 pass, 0 regressions. Held as DRAFT pending Stage B.1 verdi
 After `unicitynetwork/ipfs-storage#7` (IPFS instant-pin sidecar) lands and deploys: re-run `manual-test-full-recovery.sh` 5×. Tally WALKBACK_FLOOR per run, §C.2/§C.4 outcomes, broadcast fire/receive rates from PR #257's debug logs.
 
 Decision tree:
-- §C.2 succeeds on all 5 AND WALKBACK_FLOOR ≤ 5/run → Problem B mitigated; PR #257 may merge as defense-in-depth or stay draft (the broadcasts add no harm).
-- §C.2 still flaky AND Phase 1 broadcasts are firing → Phase 2 implementation (adoptBroadcast + eager-subscribe).
-- §C.2 still flaky AND Phase 1 broadcasts are NOT firing → diagnose Phase 1 wiring before adding more surface.
+- **§C.2 succeeds on all 5 AND WALKBACK_FLOOR ≤ 5/run** → Problem B mitigated by `ipfs-storage#7` alone. PR #257 stays draft (Phase 1 alone adds no measurable convergence benefit per §2.4 Cons; merging would be wiring-only with no behavior change visible to users).
+- **§C.2 still flaky AND Phase 1 broadcasts ARE firing/receiving** (debug log shows `[Sphere] pointer-win broadcast published` AND `pointer-win broadcast received` lines) → infrastructure works; proceed to Phase 2 (`adoptBroadcast` + eager-subscribe). PR #257 merges as the foundation for Phase 2.
+- **§C.2 still flaky AND Phase 1 broadcasts are NOT firing/receiving** → diagnose Phase 1 wiring (transport.publishBroadcast missing? subscription tag mismatch? signature verification failing?) before adding more surface. The lifecycle-manager emission test passing in CI doesn't guarantee the end-to-end Nostr path works against real relays.
 
 Per the §3 phased plan, Approach G remains the long-term direction regardless of B.1 outcome — D solves the symptom, G eliminates the race at the architectural source. G is deferred to its own RFC (`RFC-251-G`).
 
