@@ -1121,18 +1121,52 @@ function bytesToHex(bytes: Uint8Array): string {
 const COERCE_OBJECT_VALUE_CAP = 1 << 20;
 
 /**
+ * Canonical decimal form of a non-negative integer: "0", "1", "12", but
+ * NOT "00", "01", "-1", "1.0", "length", "type", "data", etc. Used to
+ * gate `coerceToUint8Array`'s dense-byte-map shape contract — see
+ * Issue #251 Problem 3.
+ */
+const CANONICAL_INDEX_KEY = /^(?:0|[1-9]\d*)$/;
+
+/**
  * Coerce a value returned by OrbitDB into a Uint8Array.
  *
- * Steelman² remediation: validates object shape BEFORE coercing. A
- * peer-crafted LWW write can put any object in the value slot:
- *   - huge `length` → OOM via `new Uint8Array(1e9)`
- *   - non-numeric entries → silently coerced to NaN→0, masking corruption
- *   - strings, nested objects, inherited properties, etc.
- * Reject anything that doesn't look like a dense byte-valued map.
+ * The contract: input MUST be either a Uint8Array/ArrayBuffer (trivial
+ * passthrough) OR a dense byte map keyed by the canonical decimal form
+ * of 0..N-1 with each value an integer in [0, 255]. Anything else is
+ * rejected with `ProfileError('ORBITDB_READ_FAILED')`.
  *
- * Throws ProfileError('ORBITDB_READ_FAILED') on malformed input — same
- * code path the previous in-line validator used. Callers that already
- * wrap in their own try/catch propagate it correctly.
+ * Why the strict contract — Issue #251 Problem 3:
+ *
+ *   Pre-fix the function tolerated any object with byte-valued entries,
+ *   relying on Object.values() to materialise bytes in insertion order.
+ *   That misbehaved silently for two realistic shapes that OrbitDB
+ *   replication and JSON round-tripping can produce:
+ *
+ *     • SPARSE OBJECTS — `{0:1, 2:3}` collapses to `[1, 3]` (length 2
+ *       instead of 3 with the middle index lost). The downstream
+ *       AES-GCM auth tag check then fails with the opaque "invalid key
+ *       or tampered data" message, masking the upstream byte-shape
+ *       corruption. Surfaced as the §C.4 finalization-queue read storm
+ *       in manual-test-full-recovery.sh.
+ *
+ *     • TRAILING NON-NUMERIC KEYS — `{0:1, 1:2, length:2}` or
+ *       `{0:1, 1:2, type:1}` slip a phantom trailing byte into the
+ *       Uint8Array (V8 iterates integer-string keys first, then string
+ *       keys in insertion order). If the trailing value happens to land
+ *       in [0, 255] the per-byte validator passes, then AES-GCM auth
+ *       fails — same opaque downstream symptom.
+ *
+ *   Failing loud here turns those into a clearly-labelled
+ *   ORBITDB_READ_FAILED that names the offending shape, so future
+ *   sightings of this bug surface as triage-able errors instead of
+ *   silent profile corruption.
+ *
+ * Steelman² (still active) — hard cap on key count guards against a
+ * peer-replicated LWW write with a pathological object in the value
+ * slot. The cap fires inside the for-in loop BEFORE any
+ * Object.values()/Object.keys() materialisation so an attacker can't
+ * trigger a 10M-key prepass allocation.
  *
  * Single source of truth shared across `get()`, `getEntry()`, and
  * `all()` so no entry point bypasses the validation.
@@ -1144,50 +1178,94 @@ function coerceToUint8Array(value: unknown): Uint8Array {
   if (value instanceof ArrayBuffer) {
     return new Uint8Array(value);
   }
-  if (typeof value === 'object' && value !== null) {
-    // Steelman³ remediation: count keys via a bounded for-in loop FIRST,
-    // before any Object.values()/Object.keys() allocation. A peer-crafted
-    // object with 10M numeric-keyed entries would otherwise allocate
-    // an 80MB+ string array for the keys before the cap fires. Bounded
-    // counting closes that pre-allocation OOM window.
-    let keyCount = 0;
-    for (const k in value) {
-      if (Object.prototype.hasOwnProperty.call(value, k)) {
-        keyCount += 1;
-        if (keyCount > COERCE_OBJECT_VALUE_CAP) {
-          throw new ProfileError(
-            'ORBITDB_READ_FAILED',
-            `Refusing to coerce object with > ${COERCE_OBJECT_VALUE_CAP} entries to Uint8Array (key-count cap exceeded)`,
-          );
-        }
-      }
-    }
-    // Now safe to materialize values — bounded by the cap.
-    const values = Object.values(value);
-    if (values.length > COERCE_OBJECT_VALUE_CAP) {
-      // Defensive: keyCount above SHOULD have caught this, but the for-in
-      // loop excludes inherited enumerables which Object.values does not.
+  if (typeof value !== 'object' || value === null) {
+    // Primitive or null — preserve historical "empty result" path so
+    // callers checking for `bytes.length === 0` (e.g., absent key
+    // sentinel) still see the same value. Real reads of a missing key
+    // go through `db.get` returning null/undefined upstream of this
+    // function; landing here is the unexpected-primitive fallback.
+    return new Uint8Array(0);
+  }
+  const obj = value as Record<string, unknown>;
+
+  // Walk own enumerable keys ONCE with the cap. Validate each key's
+  // canonical-numeric form, reject accessor descriptors (getters can
+  // run arbitrary code during read; the contract is plain data), and
+  // track the maximum index to gate the sparse-shape check that
+  // follows.
+  let maxIdx = -1;
+  let keyCount = 0;
+  for (const k in obj) {
+    if (!Object.prototype.hasOwnProperty.call(obj, k)) continue;
+    keyCount += 1;
+    if (keyCount > COERCE_OBJECT_VALUE_CAP) {
       throw new ProfileError(
         'ORBITDB_READ_FAILED',
-        `Refusing to coerce object with ${values.length} entries to Uint8Array (post-allocation cap)`,
+        `Refusing to coerce object with > ${COERCE_OBJECT_VALUE_CAP} entries to Uint8Array (key-count cap exceeded)`,
       );
     }
-    const bytes = new Uint8Array(values.length);
-    for (let i = 0; i < values.length; i++) {
-      const v = values[i];
-      if (typeof v !== 'number' || !Number.isInteger(v) || v < 0 || v > 255) {
-        throw new ProfileError(
-          'ORBITDB_READ_FAILED',
-          `Invalid byte value at index ${i}: ${typeof v} (expected integer 0-255)`,
-        );
-      }
-      bytes[i] = v;
+    if (!CANONICAL_INDEX_KEY.test(k)) {
+      // Trailing string-keyed property ("type", "data", "length",
+      // "_$serialised", etc.) — see header docblock for why this
+      // matters. Reject explicitly with the offending key name so the
+      // log line tells operators what to look for in their data path.
+      throw new ProfileError(
+        'ORBITDB_READ_FAILED',
+        `Refusing to coerce object: non-canonical key "${k}" — expected a dense numeric-keyed byte map (Issue #251)`,
+      );
     }
-    return bytes;
+    // PR #253 review: `hasOwnProperty` accepts accessor descriptors
+    // (own getters). The byte-fetch loop below uses plain property
+    // access `obj[String(i)]` which fires the getter — letting an
+    // attacker-controlled object run arbitrary code at read time
+    // while passing the byte-range check by returning a number in
+    // [0, 255]. OrbitDB returns plain CBOR-deserialized data
+    // (data descriptors only) so this is not a production exposure
+    // today, but the contract is "plain byte map" not "any object
+    // that happens to enumerate byte-valued properties." Reject
+    // accessor descriptors explicitly so the contract is enforced.
+    const descriptor = Object.getOwnPropertyDescriptor(obj, k);
+    if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
+      throw new ProfileError(
+        'ORBITDB_READ_FAILED',
+        `Refusing to coerce object: key "${k}" has an accessor descriptor — expected a plain data property (Issue #251)`,
+      );
+    }
+    const idx = Number(k);
+    if (idx > maxIdx) maxIdx = idx;
   }
-  // If the value is something unexpected, return an empty array.
-  return new Uint8Array(0);
+
+  // Sparse-map detection — see header docblock.
+  if (keyCount > 0 && keyCount !== maxIdx + 1) {
+    throw new ProfileError(
+      'ORBITDB_READ_FAILED',
+      `Refusing to coerce sparse object: ${keyCount} keys but maxIdx=${maxIdx} (expected dense 0..${keyCount - 1}, Issue #251)`,
+    );
+  }
+
+  const bytes = new Uint8Array(keyCount);
+  for (let i = 0; i < keyCount; i++) {
+    const v = obj[String(i)];
+    if (typeof v !== 'number' || !Number.isInteger(v) || v < 0 || v > 255) {
+      throw new ProfileError(
+        'ORBITDB_READ_FAILED',
+        `Invalid byte value at index ${i}: ${typeof v} (expected integer 0-255)`,
+      );
+    }
+    bytes[i] = v;
+  }
+  return bytes;
 }
+
+/**
+ * Test-only export of {@link coerceToUint8Array} — kept at the bottom
+ * of the file so production code uses the unprefixed internal name.
+ * Vitest specs import via this name to drive every shape branch
+ * directly without spinning up an OrbitDbAdapter.
+ *
+ * @internal
+ */
+export const __coerceToUint8ArrayForTest = coerceToUint8Array;
 
 /**
  * True when running in a browser-like environment (Window present).
