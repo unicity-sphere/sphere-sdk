@@ -332,7 +332,32 @@ export type StorageEventType =
    * operators distinguish "publish stuck on replica lag" from
    * other transient classes (network errors, etc.).
    */
-  | 'storage:replica-lag';
+  | 'storage:replica-lag'
+  /**
+   * Issue #247 — emitted when the WALKBACK_FLOOR catch arm
+   * successfully reconciled the wallet's local pointer version
+   * DOWNWARD to match the aggregator's currently-visible (same-
+   * author) version. Indicates a same-identity cross-device race
+   * was resolved: two devices sharing one wallet identity each
+   * published pointers ahead of one another, and this device
+   * adopted the lower visible value (authored by this wallet's
+   * own signing key per the W7 author check) as its baseline so
+   * the next publish operates from a non-conflicting floor.
+   *
+   * `data` carries `{ cid, fromVersion, toVersion }`:
+   *   - `cid`         the bundle CID the publish was attempting
+   *   - `fromVersion` the wallet's local version before reconcile
+   *   - `toVersion`   the version the wallet adopted (lower; same
+   *                   author per XOR-decode authentication)
+   *
+   * Informational only — the publish path's `pendingPublishCid`
+   * marker remains stamped so the next flush / pointer poll
+   * re-attempts the publish from the reconciled baseline. The
+   * 60s WALKBACK_FLOOR throttle is INTENTIONALLY NOT armed in
+   * this case (reconciliation removed the floor; the retry has
+   * a fresh chance to land).
+   */
+  | 'storage:replica-lag-reconciled';
 
 export interface StorageEvent {
   type: StorageEventType;

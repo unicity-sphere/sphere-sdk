@@ -1226,9 +1226,77 @@ export class LifecycleManager {
           timestamp: Date.now(),
           data: { cid: cidString, code: transientCode, message: msg },
         });
-        this.walkbackFloorThrottleUntilMs =
-          Date.now() + WALKBACK_FLOOR_RETRY_THROTTLE_MS;
-        this.walkbackFloorThrottleSkipCount = 0;
+        // Issue #247 — same-identity cross-device race recovery.
+        // Two devices sharing one wallet identity each push localVersion
+        // ahead of the aggregator's currently-visible value; both then
+        // hit W7 WALKBACK_FLOOR (per SPEC, deterministic-given-state)
+        // and the inner retry budget exhausts without convergence
+        // because every subsequent publish at this version reproduces
+        // the floor. To break the deadlock, ask the aggregator what's
+        // currently visible (recoverLatest authenticates the candidate
+        // as same-author via XOR-decode of the inclusion proof — only a
+        // commitment authored under this wallet's signing identity can
+        // surface from recoverLatest as a non-null result, so a foreign
+        // commitment is NEVER accepted as a downgrade), and if the
+        // visible version is strictly below our local cursor, adopt it
+        // as the new baseline. The next publish then operates from a
+        // floor the aggregator can see — converging.
+        //
+        // Done OPPORTUNISTICALLY: if recoverLatest fails (network blip,
+        // discovery error, etc.) or the visible version is >= our
+        // local cursor (no same-identity race — genuine replica lag),
+        // fall through to the standard throttle arming as before.
+        let reconciledDownward = false;
+        try {
+          const recovered = await pointer.recoverLatest();
+          if (recovered) {
+            const outcome = await pointer.reconcileLocalVersionDownward(recovered);
+            if (outcome.reconciled) {
+              reconciledDownward = true;
+              this.host.log(
+                `Pointer publish reconciled localVersion downward: ` +
+                  `from=${outcome.fromVersion} to=${outcome.toVersion} ` +
+                  `(same-identity cross-device race; baseline now matches ` +
+                  `aggregator-visible version).`,
+              );
+              this.host.emitEvent({
+                type: 'storage:replica-lag-reconciled',
+                timestamp: Date.now(),
+                data: {
+                  cid: cidString,
+                  fromVersion: outcome.fromVersion,
+                  toVersion: outcome.toVersion,
+                },
+              });
+            }
+          }
+        } catch (reconcileErr) {
+          // Reconciliation is best-effort — log and fall through. The
+          // throttle below still arms, the pendingPublishCid stays
+          // stamped, and the next flush / poll retries normally.
+          const recMsg =
+            reconcileErr instanceof Error
+              ? reconcileErr.message
+              : String(reconcileErr);
+          this.host.log(
+            `Pointer publish: WALKBACK_FLOOR reconcile attempt failed ` +
+              `(${recMsg}); falling through to throttle.`,
+          );
+        }
+        if (reconciledDownward) {
+          // Reconciliation succeeded — DO NOT arm the throttle. The
+          // next publish attempt from the reconciled baseline has a
+          // fresh chance to land; throttling would only delay the
+          // convergence we just unblocked. Clear any prior throttle
+          // skip-count so the next non-throttled outcome doesn't log
+          // a stale summary.
+          this.walkbackFloorThrottleUntilMs = 0;
+          this.walkbackFloorThrottleSkipCount = 0;
+        } else {
+          this.walkbackFloorThrottleUntilMs =
+            Date.now() + WALKBACK_FLOOR_RETRY_THROTTLE_MS;
+          this.walkbackFloorThrottleSkipCount = 0;
+        }
       } else {
         if (this.walkbackFloorThrottleSkipCount > 0) {
           this.host.log(

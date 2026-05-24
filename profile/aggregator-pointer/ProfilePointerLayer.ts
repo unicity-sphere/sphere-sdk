@@ -102,6 +102,24 @@ export interface RecoverResult {
   readonly version: PointerVersion;
 }
 
+/**
+ * Issue #247 — outcome of `reconcileLocalVersionDownward`.
+ *
+ *   - `reconciled` — the candidate.version was strictly less than
+ *     `localVersion` AND the candidate authored under this wallet's
+ *     signing identity (see authoring trust note on the method). Local
+ *     state was rewritten and persisted; the next discovery starts
+ *     from the lower floor.
+ *   - `up-to-date` — candidate.version >= localVersion. Nothing to
+ *     reconcile (a normal forward publish path applies). Local state
+ *     unchanged.
+ */
+export interface ReconcileDownwardResult {
+  readonly reconciled: boolean;
+  readonly fromVersion: PointerVersion;
+  readonly toVersion: PointerVersion;
+}
+
 // ── Class ──────────────────────────────────────────────────────────────────
 
 export class ProfilePointerLayer {
@@ -343,6 +361,76 @@ export class ProfilePointerLayer {
     if (discovery.validV === 0) return null;
     const cid = await this.#init.resolveRemoteCid(discovery.validV);
     return { cid, version: discovery.validV };
+  }
+
+  // ── reconcileLocalVersionDownward ────────────────────────────────────────
+
+  /**
+   * Issue #247 — adopt a strictly-lower aggregator-visible version as
+   * the wallet's local baseline. Solves the same-identity cross-device
+   * race where two devices each push localVersion ahead of the
+   * aggregator's currently-visible value and both subsequently hit
+   * W7 WALKBACK_FLOOR for the SPEC-correct reason (cannot walk past
+   * a version this wallet has already confirmed as its own).
+   *
+   * **Authoring trust note (SAFETY-CRITICAL).** The `candidate` MUST
+   * originate from this wallet's own `recoverLatest()` call. Because
+   * `recoverLatest()` runs `classifyVersion`, which XOR-decodes the
+   * inclusion-proof ciphertext with the wallet's `keyMaterial.xorSeed`
+   * (HKDF-derived from the wallet's private key) and then verifies the
+   * decoded CID via `fetchCar`'s content-address check, a candidate
+   * surfaced by `recoverLatest()` is *implicitly* authenticated as
+   * authored by this wallet. A foreign-author commitment at the same
+   * version V would XOR-decode under our seed to a different 32-byte
+   * pair, the resulting CID would fail content-address verification,
+   * and `classifyVersion` would return SEMANTICALLY_INVALID — never
+   * surfaced through `recoverLatest()` as a non-null result.
+   *
+   * Callers passing a `RecoverResult` from `recoverLatest()` therefore
+   * get same-author-only downgrades by construction. Callers crafting
+   * a candidate from another source MUST guarantee equivalent author
+   * verification themselves (no such caller exists in this SDK).
+   *
+   * **Side effects.** When `candidate.version < currentLocalVersion`,
+   * the method:
+   *   1. Persists `profile.pointer.version = candidate.version` via
+   *      the wired `persistLocalVersion` callback.
+   *   2. Returns `{ reconciled: true, fromVersion, toVersion }`.
+   *
+   * Otherwise (`candidate.version >= currentLocalVersion`), it is a
+   * no-op and returns `{ reconciled: false, ... }`.
+   *
+   * **NOT a CONFLICT path.** This is not §9.2 conflict reconciliation
+   * — there is no `fetchAndJoin` of remote OpLog state, no bundle ref
+   * write. The semantic is "the aggregator's view of our pointer is
+   * BEHIND our local cursor; rewind our cursor so we publish from a
+   * baseline the aggregator can see." Bundle data already published
+   * at versions in `(candidate.version, fromVersion]` remains on IPFS
+   * and is rediscoverable via the standard publish-retry path —
+   * publish at `candidate.version + 1` will conflict against any
+   * still-live version, re-trigger discovery, and converge.
+   */
+  async reconcileLocalVersionDownward(
+    candidate: RecoverResult,
+  ): Promise<ReconcileDownwardResult> {
+    this.#assertNotShuttingDown('reconcileLocalVersionDownward');
+    return this.#tracked(this.#reconcileLocalVersionDownwardInner(candidate));
+  }
+
+  async #reconcileLocalVersionDownwardInner(
+    candidate: RecoverResult,
+  ): Promise<ReconcileDownwardResult> {
+    const fromVersion = await this.#init.readLocalVersion();
+    if (candidate.version >= fromVersion) {
+      // No downgrade possible — caller should fall through to the
+      // normal forward publish path.
+      return { reconciled: false, fromVersion, toVersion: fromVersion };
+    }
+    // The candidate is strictly lower AND (by recoverLatest's classify-
+    // version XOR-decode authentication) authored under this wallet's
+    // signing identity. Adopt it as the new local baseline.
+    await this.#init.persistLocalVersion(candidate.version);
+    return { reconciled: true, fromVersion, toVersion: candidate.version };
   }
 
   // ── discoverLatestVersion ────────────────────────────────────────────────
