@@ -612,13 +612,47 @@ export interface AddressModuleSet {
  * exits where waiting for gateway propagation is not acceptable.
  */
 /**
- * Alias for `ShutdownOptions` re-exported under a wallet-layer name so
- * consumers don't have to import the storage-layer interface. Kept as
- * a distinct symbol so the wallet API can grow independently of the
- * storage signature without a breaking rename. See {@link ShutdownOptions}
- * for the field semantics.
+ * Wallet-layer destroy options. Extends `ShutdownOptions` with
+ * wallet-only knobs the storage layer doesn't see.
+ *
+ * Issue #255 (2026-05-25) — `skipFlush` + `flushTimeoutMs` added so
+ * `Sphere.destroy()` can drive a synchronous pre-shutdown
+ * `awaitNextFlush()` on every TokenStorageProvider. Without that,
+ * fire-and-exit CLI commands (`sphere init`, `sphere faucet`,
+ * `sphere invoice pay`, etc.) trigger `notifyProfileDirty()` but
+ * exit before the debounced flush timer fires — their state
+ * mutations never reach IPFS / the aggregator pointer, leaving
+ * sibling devices unable to discover what just happened. The
+ * default behavior is now "flush then shutdown" so CLI mutations
+ * are durably published before the process exits.
+ *
+ * Use `skipFlush: true` for ungraceful-shutdown simulation in tests
+ * or any caller that explicitly wants the legacy fast-exit
+ * semantics (state stamps `pendingPublishCid` and replays on next
+ * boot).
  */
-export type DestroyOptions = ShutdownOptions;
+export interface DestroyOptions extends ShutdownOptions {
+  /**
+   * If `true`, skip the pre-shutdown
+   * `provider.awaitNextFlush(flushTimeoutMs)` call. Default `false`
+   * — destroy waits for any pending debounced flush to complete
+   * (pin + OrbitDB ref + aggregator pointer publish) before
+   * shutting providers down. Set to `true` for fast-exit
+   * scenarios where the cold-start `pendingPublishCid` retry path
+   * is an acceptable recovery surface.
+   */
+  readonly skipFlush?: boolean;
+  /**
+   * Per-provider timeout for the pre-shutdown
+   * `awaitNextFlush(timeoutMs)` call. Default 30 000 ms (matches
+   * `awaitNextFlush`'s own default, and the `flushVerificationDeadlineMs`
+   * the factory wires by default). On TIMEOUT the provider's
+   * `pendingPublishCid` retry marker is left stamped — destroy()
+   * proceeds to shutdown anyway so the caller doesn't hang
+   * indefinitely on a misbehaving gateway.
+   */
+  readonly flushTimeoutMs?: number;
+}
 
 // =============================================================================
 // Sphere Class
@@ -4515,6 +4549,58 @@ export class Sphere {
   // Public Methods - Lifecycle
   // ===========================================================================
 
+  /**
+   * Issue #255 (2026-05-25) — synchronously drain every pending
+   * debounced flush across all per-address ProfileTokenStorage
+   * providers (pin + OrbitDB ref + aggregator pointer publish +
+   * per-flush remote-durability verification per #239).
+   *
+   * Use this when a CLI command wants to confirm its state mutation
+   * is durably published BEFORE returning a success exit, without
+   * actually tearing the wallet down. Equivalent to the implicit
+   * pre-shutdown sweep `destroy()` now does, but re-callable.
+   *
+   * Returns when all providers report no pending data OR the
+   * `timeoutMs` budget is exhausted (in which case the affected
+   * provider's `pendingPublishCid` retry marker remains stamped for
+   * cold-start recovery and this method resolves normally — never
+   * throws). Errors during individual provider flushes are logged
+   * and swallowed; the caller cannot distinguish per-provider
+   * failures via this API. For that, call
+   * `(provider as { awaitNextFlush?: ... }).awaitNextFlush(timeoutMs)`
+   * directly on the specific provider you care about.
+   *
+   * @param timeoutMs Per-provider deadline. Default 30 000 ms.
+   */
+  async flushPending(timeoutMs: number = 30_000): Promise<void> {
+    if (!this._initialized) return;
+    const allProviders: TokenStorageProvider<TxfStorageDataBase>[] = [];
+    for (const moduleSet of this._addressModules.values()) {
+      for (const provider of moduleSet.tokenStorageProviders.values()) {
+        allProviders.push(provider);
+      }
+    }
+    for (const provider of this._tokenStorageProviders.values()) {
+      if (!allProviders.includes(provider)) {
+        allProviders.push(provider);
+      }
+    }
+    for (const provider of allProviders) {
+      try {
+        await (provider as TokenStorageProvider<TxfStorageDataBase> & {
+          awaitNextFlush?: (timeoutMs?: number) => Promise<void>;
+        }).awaitNextFlush?.(timeoutMs);
+      } catch (err) {
+        logger.warn(
+          'Sphere',
+          `flushPending: provider ${provider.id ?? '<unknown>'} flush failed ` +
+          `(continuing; pendingPublishCid retry will handle): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+  }
+
   async destroy(options?: DestroyOptions): Promise<void> {
     // Issue #239 — the shutdown durability gate is OPT-IN at the
     // wallet layer. Rationale: the per-flush verification gate
@@ -4536,6 +4622,10 @@ export class Sphere {
     // (typical N = 30 000). E2E tests that want to simulate an
     // ungraceful crash continue to use `force: true`.
     const effectiveOptions = options;
+    // Issue #255 (2026-05-25) — opt-out flag for the new pre-shutdown
+    // flush sweep; default false ⇒ flush before shutting down.
+    const skipFlush = options?.skipFlush === true;
+    const flushTimeoutMs = options?.flushTimeoutMs ?? 30_000;
 
     this.cleanupProviderEventSubscriptions();
 
@@ -4552,6 +4642,71 @@ export class Sphere {
       await this._accounting?.destroy();
     } catch (err) {
       logger.warn('Sphere', 'Accounting module destroy failed:', err);
+    }
+
+    // Issue #255 (2026-05-25) — synchronous pre-shutdown flush sweep.
+    //
+    // Fire-and-exit CLI commands (`sphere init`, `sphere faucet`,
+    // `sphere invoice pay`, etc.) call into PaymentsModule which
+    // writes to the per-address ProfileTokenStorage. Those writes
+    // call `notifyProfileDirty()`, which arms a debounced flush
+    // timer (default `flushDebounceMs = 2000`). If the CLI process
+    // exits before the timer fires, the dirty data never gets
+    // pinned to IPFS and never gets a pointer publish — sibling
+    // devices have no way to discover the mutation until some
+    // long-running daemon happens to retry via the
+    // `pendingPublishCid` cold-start path.
+    //
+    // The fix: before shutting providers down, call each
+    // provider's `awaitNextFlush(timeoutMs)`. That cancels the
+    // debounce timer, forces a serialized flush, and waits for
+    // pin + OrbitDB ref + aggregator pointer publish + per-flush
+    // remote-durability verification (per #239) to complete. On
+    // TIMEOUT the `pendingPublishCid` retry marker is left
+    // stamped; destroy() proceeds with shutdown so the caller
+    // doesn't hang on a misbehaving gateway.
+    //
+    // `options.skipFlush = true` opts out for fast-exit / E2E
+    // crash-simulation paths. Swap + accounting destroy run
+    // BEFORE this sweep so their in-flight operations have
+    // already committed to token-storage by flush time.
+    //
+    // Providers that don't implement `awaitNextFlush` (File /
+    // IndexedDB / IPFS-legacy) silently skip via optional chaining
+    // — they don't have a debounced flush surface to drain.
+    if (!skipFlush) {
+      const allProviders: TokenStorageProvider<TxfStorageDataBase>[] = [];
+      for (const moduleSet of this._addressModules.values()) {
+        for (const provider of moduleSet.tokenStorageProviders.values()) {
+          allProviders.push(provider);
+        }
+      }
+      for (const provider of this._tokenStorageProviders.values()) {
+        // De-dupe: per-address modules' providers may also be in the
+        // top-level map (the active-address modules reference is a
+        // pointer to the same Map entry). Identity-compare to avoid
+        // double-flushing.
+        if (!allProviders.includes(provider)) {
+          allProviders.push(provider);
+        }
+      }
+      for (const provider of allProviders) {
+        try {
+          await (provider as TokenStorageProvider<TxfStorageDataBase> & {
+            awaitNextFlush?: (timeoutMs?: number) => Promise<void>;
+          }).awaitNextFlush?.(flushTimeoutMs);
+        } catch (err) {
+          // Don't hang destroy() on a flush failure. The provider's
+          // own `pendingPublishCid` retry marker covers the next-boot
+          // recovery path. Log so the operator sees it.
+          logger.warn(
+            'Sphere',
+            `pre-shutdown awaitNextFlush failed on provider ${provider.id ?? '<unknown>'} ` +
+            `(continuing with shutdown; pendingPublishCid retry will handle): ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
     }
 
     // Issue #97 (steelman C6) — null out per-address profile writers
