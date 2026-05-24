@@ -162,15 +162,98 @@ describe('coerceToUint8Array — primitive fallback', () => {
   });
 });
 
-describe('coerceToUint8Array — DoS guards (Steelman²)', () => {
-  it('enforces the per-key cap before allocating the values array', () => {
-    // Construct an object with two distinct paths into the throw:
-    //   1. for..in cap fires while counting keys.
-    //   2. (post-fix) any non-canonical key throws first.
-    // We use the smaller, fast-path cap test: a million entries triggers
-    // the cap. Skip in CI — the construction itself is O(n) but the cap
-    // throw happens on the first overshoot.
-    // (Construction is slow; trust the implementation here.)
-    expect(true).toBe(true);
+describe('coerceToUint8Array — accessor-descriptor rejection (PR #253 review)', () => {
+  // The byte-fetch loop uses plain property access `obj[String(i)]`
+  // which fires getters. Without the descriptor check an
+  // attacker-controlled object can run arbitrary code at read time
+  // while passing the byte-range check by returning a number in
+  // [0, 255]. Contract is "plain byte map" — accessor descriptors
+  // (get/set) are rejected.
+
+  it('rejects an object with a getter on a canonical numeric key', () => {
+    const obj = {};
+    let getterFired = false;
+    Object.defineProperty(obj, '0', {
+      get() {
+        getterFired = true;
+        return 1;
+      },
+      enumerable: true,
+    });
+    Object.defineProperty(obj, '1', {
+      value: 2,
+      enumerable: true,
+      writable: true,
+    });
+    // Throw before byte-fetch loop runs — the getter MUST NOT fire.
+    expect(() => coerce(obj)).toThrow(/accessor descriptor/);
+    expect(getterFired).toBe(false);
+  });
+
+  it('rejects an object with a setter (write-only accessor)', () => {
+    const obj = {};
+    Object.defineProperty(obj, '0', {
+      set() { /* writes ignored */ },
+      enumerable: true,
+    });
+    expect(() => coerce(obj)).toThrow(/accessor descriptor/);
+  });
+
+  it('accepts plain data descriptors via Object.defineProperty', () => {
+    // Sanity: an object built via defineProperty with `value` and
+    // `enumerable: true` is structurally identical to a literal — the
+    // descriptor check must not reject this legitimate case.
+    const obj = {};
+    Object.defineProperty(obj, '0', { value: 1, enumerable: true });
+    Object.defineProperty(obj, '1', { value: 2, enumerable: true });
+    const out = coerce(obj);
+    expect(Array.from(out)).toEqual([1, 2]);
+  });
+});
+
+describe('coerceToUint8Array — additional rejection coverage (PR #253 review)', () => {
+  it('rejects an object with ONLY a non-canonical key (single-key bad shape)', () => {
+    expect(() => coerce({ type: 'x' })).toThrow(/non-canonical key "type"/);
+  });
+
+  it('rejects {0:1, 1:Infinity} — non-finite value', () => {
+    expect(() => coerce({ 0: 1, 1: Infinity })).toThrow(/Invalid byte value/);
+  });
+
+  it('rejects {0:1, 1:NaN} — non-finite value', () => {
+    expect(() => coerce({ 0: 1, 1: NaN })).toThrow(/Invalid byte value/);
+  });
+
+  it('ignores symbol keys (for..in does not visit symbols)', () => {
+    const sym = Symbol('extra');
+    const obj: Record<string | symbol, unknown> = { 0: 1, 1: 2 };
+    obj[sym] = 99;
+    const out = coerce(obj);
+    expect(Array.from(out)).toEqual([1, 2]);
+  });
+
+  it('does NOT include inherited enumerable properties', () => {
+    // hasOwnProperty filters inherited keys — the contract is own-data
+    // bytes only.
+    const proto = { '0': 99 };
+    const obj = Object.create(proto);
+    Object.defineProperty(obj, '0', { value: 1, enumerable: true });
+    Object.defineProperty(obj, '1', { value: 2, enumerable: true });
+    const out = coerce(obj);
+    expect(Array.from(out)).toEqual([1, 2]);
+  });
+
+  it('accepts a frozen dense object', () => {
+    const out = coerce(Object.freeze({ 0: 1, 1: 2, 2: 3 }));
+    expect(Array.from(out)).toEqual([1, 2, 3]);
+  });
+
+  it('round-trips a 256-byte map correctly', () => {
+    const original = new Uint8Array(256);
+    for (let i = 0; i < 256; i++) original[i] = i;
+    const round = JSON.parse(JSON.stringify(original));
+    const out = coerce(round);
+    expect(out.length).toBe(256);
+    for (let i = 0; i < 256; i++) expect(out[i]).toBe(i);
   });
 });

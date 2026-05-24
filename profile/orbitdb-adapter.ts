@@ -1189,8 +1189,10 @@ function coerceToUint8Array(value: unknown): Uint8Array {
   const obj = value as Record<string, unknown>;
 
   // Walk own enumerable keys ONCE with the cap. Validate each key's
-  // canonical-numeric form and track the maximum index to gate the
-  // sparse-shape check that follows.
+  // canonical-numeric form, reject accessor descriptors (getters can
+  // run arbitrary code during read; the contract is plain data), and
+  // track the maximum index to gate the sparse-shape check that
+  // follows.
   let maxIdx = -1;
   let keyCount = 0;
   for (const k in obj) {
@@ -1210,6 +1212,23 @@ function coerceToUint8Array(value: unknown): Uint8Array {
       throw new ProfileError(
         'ORBITDB_READ_FAILED',
         `Refusing to coerce object: non-canonical key "${k}" — expected a dense numeric-keyed byte map (Issue #251)`,
+      );
+    }
+    // PR #253 review: `hasOwnProperty` accepts accessor descriptors
+    // (own getters). The byte-fetch loop below uses plain property
+    // access `obj[String(i)]` which fires the getter — letting an
+    // attacker-controlled object run arbitrary code at read time
+    // while passing the byte-range check by returning a number in
+    // [0, 255]. OrbitDB returns plain CBOR-deserialized data
+    // (data descriptors only) so this is not a production exposure
+    // today, but the contract is "plain byte map" not "any object
+    // that happens to enumerate byte-valued properties." Reject
+    // accessor descriptors explicitly so the contract is enforced.
+    const descriptor = Object.getOwnPropertyDescriptor(obj, k);
+    if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined) {
+      throw new ProfileError(
+        'ORBITDB_READ_FAILED',
+        `Refusing to coerce object: key "${k}" has an accessor descriptor — expected a plain data property (Issue #251)`,
       );
     }
     const idx = Number(k);
