@@ -124,6 +124,19 @@ export interface ProfileConfig {
   /** Write-behind debounce window in ms (default: 2000) */
   readonly flushDebounceMs?: number;
   /**
+   * Issue #239 — per-flush remote-durability verification deadline (ms)
+   * for the token storage provider's flush body. Forwarded into
+   * `ProfileTokenStorageProviderOptions.flushVerificationDeadlineMs`
+   * when the factory wires up the provider.
+   *
+   * Defaults to 30 000 when undefined (production wants verification
+   * by default). Pass `0` to opt out (tests, dev mode, scenarios
+   * where the shutdown gate alone suffices). See
+   * `ProfileTokenStorageProviderOptions.flushVerificationDeadlineMs`
+   * for full semantics.
+   */
+  readonly flushVerificationDeadlineMs?: number;
+  /**
    * Item #15 Phase F — retention window (in ms) for OUTBOX/SENT
    * tombstones before they are GC'd at snapshot-build time. Tombstones
    * older than this threshold are `db.del()`'d by the per-writer
@@ -439,6 +452,33 @@ export interface ProfileTokenStorageProviderOptions {
    * flush cadence is already the throttle.
    */
   readonly dirtyFlushDebounceMs?: number;
+  /**
+   * Issue #239 — per-flush remote-durability verification deadline (ms).
+   *
+   * After every successful `flushToIpfs` body (pin + bundle ref +
+   * snapshot publish), the provider HEAD-verifies the just-pinned CIDs
+   * against the configured IPFS gateways AND polls the aggregator
+   * `recoverLatest()` until it returns the just-published snapshot CID.
+   * The verification gate gives the at-least-once invariant teeth
+   * across cross-process and cross-device recovery: a Nostr-delivered
+   * token is only ack'd after its containing bundle is **verifiably**
+   * fetchable by other peers (closes the cross-process invoice loss
+   * documented in #234 / #239).
+   *
+   * Default when constructed via `createProfileProviders`: **30 000**
+   * (production contract). Default when the provider is constructed
+   * directly without the factory: **0** (off) — this keeps legacy
+   * tests that wire stub pointers + mock IPFS gateways from hanging
+   * on HEAD retries against bogus URLs. Callers that want the per-
+   * flush contract on a directly-constructed provider must pass an
+   * explicit value here.
+   *
+   * Set to `0` to disable per-flush verification entirely (tests, dev
+   * mode, or operators who prefer the shutdown-only gate). Verification
+   * is also automatically skipped when no pointer layer is wired (no
+   * cross-device recovery surface exists to verify).
+   */
+  readonly flushVerificationDeadlineMs?: number;
   /** Enable debug logging */
   readonly debug?: boolean;
 }

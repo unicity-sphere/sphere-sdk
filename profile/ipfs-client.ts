@@ -753,7 +753,7 @@ export async function fetchFromIpfs(
     try {
       let bytesOrNull: Uint8Array | null = null;
       // First attempt: POST (Kubo's declared method).
-      let attempt = await tryFetchBlock(gateway, 'POST');
+      const attempt = await tryFetchBlock(gateway, 'POST');
       if (attempt.bytes !== null) {
         bytesOrNull = attempt.bytes;
       } else if (attempt.retryAsGet) {
@@ -1259,6 +1259,145 @@ export async function verifyCidAccessible(
   }
 
   return false;
+}
+
+/**
+ * Result of a retrying gateway accessibility check.
+ * Issue #239 — used by `LifecycleManager.shutdown` to gate
+ * `Sphere.destroy()` on remote IPFS pin durability.
+ */
+export interface VerifyCidAccessibleResult {
+  /** True iff at least one gateway served the CID within the deadline. */
+  readonly ok: boolean;
+  /** Number of attempts that ran (1+ even on immediate success). */
+  readonly attempts: number;
+  /** Wall-clock elapsed in ms. */
+  readonly elapsedMs: number;
+  /**
+   * Reason on failure: `gateway-not-serving` (every attempt returned
+   * a non-2xx from every gateway), `deadline-exceeded` (ran out of
+   * time mid-loop), or `aborted` (external abort signal fired). Absent
+   * on success.
+   */
+  readonly failureKind?: 'gateway-not-serving' | 'deadline-exceeded' | 'aborted';
+}
+
+/**
+ * Bounds for the exponential-backoff loop inside
+ * {@link verifyCidAccessibleWithRetry}. Initial delay is doubled every
+ * miss until it reaches `MAX_RETRY_DELAY_MS`; the loop then continues
+ * at the cap until the deadline. The chosen numbers reflect typical
+ * Kubo gateway propagation lag on testnet (~15 s — see issue #234) so a
+ * 30 s deadline accommodates one or two retries past the median lag.
+ */
+const VERIFY_RETRY_INITIAL_DELAY_MS = 500;
+const VERIFY_RETRY_MAX_DELAY_MS = 5_000;
+
+/**
+ * Like {@link verifyCidAccessible}, but with an exponential-backoff
+ * retry loop bounded by `deadlineMs`. Returns as soon as any gateway
+ * serves the CID; otherwise keeps retrying until the deadline elapses.
+ *
+ * Issue #239 — wraps the existing HEAD probe so the shutdown gate has
+ * a single call site for "wait until propagated" semantics without
+ * leaking the loop into the lifecycle manager. Failure semantics are
+ * structured (see {@link VerifyCidAccessibleResult}) so the caller can
+ * emit a typed `shutdown:verification-timeout` event with the correct
+ * `failureKind`.
+ *
+ * `signal` is optional — when provided, an external abort cancels the
+ * loop between attempts (an in-flight HEAD always runs to completion
+ * because the underlying `verifyCidAccessible` does not accept a
+ * signal). The post-attempt check ensures the abort eventually takes
+ * effect without dangling timers.
+ *
+ * @param gateways    - Array of IPFS gateway base URLs
+ * @param cid         - Content identifier to verify
+ * @param options.deadlineMs - Max wall-clock budget across all attempts
+ * @param options.perAttemptTimeoutMs - Per-attempt HEAD timeout (default 10s,
+ *                                       inherited from `verifyCidAccessible`)
+ * @param options.signal - Optional AbortSignal that cancels the retry loop
+ */
+export async function verifyCidAccessibleWithRetry(
+  gateways: string[],
+  cid: string,
+  options: {
+    readonly deadlineMs: number;
+    readonly perAttemptTimeoutMs?: number;
+    readonly signal?: AbortSignal;
+  },
+): Promise<VerifyCidAccessibleResult> {
+  const startedAt = Date.now();
+  const deadline = startedAt + Math.max(0, options.deadlineMs);
+  const perAttemptTimeoutMs = options.perAttemptTimeoutMs ?? DEFAULT_VERIFY_TIMEOUT_MS;
+  let attempts = 0;
+  let delay = VERIFY_RETRY_INITIAL_DELAY_MS;
+
+  for (;;) {
+    if (options.signal?.aborted) {
+      return {
+        ok: false,
+        attempts,
+        elapsedMs: Date.now() - startedAt,
+        failureKind: 'aborted',
+      };
+    }
+
+    // First attempt runs even when the deadline is already 0 so callers
+    // get at least one HEAD round-trip on `deadlineMs: 0`.
+    attempts += 1;
+    const ok = await verifyCidAccessible(gateways, cid, perAttemptTimeoutMs);
+    if (ok) {
+      return { ok: true, attempts, elapsedMs: Date.now() - startedAt };
+    }
+
+    const now = Date.now();
+    if (now >= deadline) {
+      return {
+        ok: false,
+        attempts,
+        elapsedMs: now - startedAt,
+        failureKind: 'deadline-exceeded',
+      };
+    }
+
+    // Sleep up to `delay` ms, but clamp to remaining time so we don't
+    // overshoot the deadline. We also break the sleep early if the
+    // abort signal fires.
+    const remaining = deadline - now;
+    const sleepMs = Math.min(delay, remaining);
+    if (sleepMs > 0) {
+      await sleepInterruptible(sleepMs, options.signal);
+    }
+    delay = Math.min(delay * 2, VERIFY_RETRY_MAX_DELAY_MS);
+  }
+}
+
+/**
+ * Resolves after `ms` or as soon as `signal` aborts (whichever first).
+ * Internal helper for `verifyCidAccessibleWithRetry`'s backoff sleeps.
+ */
+function sleepInterruptible(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) {
+    return new Promise((r) => setTimeout(r, ms));
+  }
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    };
+    if (signal.aborted) {
+      clearTimeout(timer);
+      resolve();
+      return;
+    }
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 // =============================================================================

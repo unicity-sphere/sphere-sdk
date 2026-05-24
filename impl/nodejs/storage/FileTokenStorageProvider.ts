@@ -56,7 +56,11 @@ export class FileTokenStorageProvider implements TokenStorageProvider<TxfStorage
     return true;
   }
 
-  async shutdown(): Promise<void> {
+  // Issue #239 — accept ShutdownOptions for interface conformance.
+  // FileTokenStorageProvider has no remote-durability boundary (every
+  // save() returns after the file is fsync'd locally) so `force` /
+  // `verificationDeadlineMs` / `reason` are intentionally ignored.
+  async shutdown(_options?: import('../../../storage/storage-provider.js').ShutdownOptions): Promise<void> {
     this.status = 'disconnected';
   }
 

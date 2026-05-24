@@ -650,6 +650,15 @@ export class FlushScheduler {
       };
       await this.bundleIndex.addBundle(cid, bundleRef);
 
+      // Issue #239 — record this as the most-recent UXF bundle CID we
+      // pinned + indexed. Survives across flushes for the life of the
+      // provider so `LifecycleManager.shutdown()` can HEAD-verify the
+      // bundle CAR is served by ≥1 IPFS gateway before exiting (closes
+      // the gap where `Sphere.destroy()` returned while the just-pinned
+      // bundle was still propagating across gateways — the dominant
+      // cross-process invoice-loss path documented in #234 / #239).
+      this.host.setLastPinnedBundleCid(cid);
+
       // 6a. Pointer-monotonicity invariant maintenance: a bundle this
       //     flush just added is, by construction, "loaded" — its tokens
       //     are precisely what we built the CAR from. Including it in
@@ -777,6 +786,65 @@ export class FlushScheduler {
             (publishResult.code ? `, code=${publishResult.code}` : '') +
             `); retry marker stored. Refusing to advance the at-least-once ack.`,
         );
+      }
+
+      // Issue #239 — per-profile-update remote-durability verification.
+      //
+      // The flush body above guarantees:
+      //   - bundle CAR pin POST returned 200 (gateway accepted bytes);
+      //   - bundle ref written to OrbitDB;
+      //   - snapshot CAR pin POST returned 200;
+      //   - aggregator pointer publish call returned ok (publishResult).
+      //
+      // None of those guarantee that the just-pinned CIDs are SERVED by
+      // any gateway yet, nor that the aggregator's `recoverLatest()` has
+      // caught up with the just-anchored version. Both gaps are the root
+      // cause of cross-process invoice loss documented in #234 / #239.
+      //
+      // The user-stated contract for this PR: every profile update must
+      // be confirmed durable (pin readable + pointer reflects new CID)
+      // before the flush completes. Verification runs in parallel for
+      // the bundle CID, the snapshot CID, and the aggregator read-back;
+      // a failure throws so `forceFlushSerialized` rejects, which closes
+      // the at-least-once gate's `awaitNextFlush` and prevents the
+      // Nostr ack from advancing on an under-durable bundle.
+      //
+      // Skipped when:
+      //   - shutting down (the shutdown gate handles its own
+      //     verification with the configured deadline);
+      //   - `flushVerificationDeadlineMs === 0` (test / dev opt-out);
+      //   - no pointer layer wired (`getPointerLayer` absent or
+      //     returns null). Without a pointer layer there is no cross-
+      //     device recovery surface to verify against; the bundle is
+      //     locally durable in OrbitDB and that is all this provider
+      //     contract promises in non-pointer mode. Skipping in this
+      //     case also keeps stub-only tests (which don't run real IPFS
+      //     gateways) from hanging on HEAD retries against bogus URLs.
+      // Default OFF for direct-construction callers (legacy tests that
+      // wire stub pointers + mock gateways would otherwise hang on the
+      // verification's HEAD retries). Production callers go through
+      // `createProfileProviders` which injects the production default
+      // (`ProfileConfig.flushVerificationDeadlineMs ?? 30_000`) so the
+      // contract is preserved end-to-end for real wallets.
+      const verifyDeadlineMs =
+        this.host.options?.flushVerificationDeadlineMs ?? 0;
+      const pointerWired = this.host.options?.getPointerLayer?.() ?? null;
+      const shouldVerify =
+        verifyDeadlineMs > 0 &&
+        !this.host.getIsShuttingDown() &&
+        pointerWired !== null;
+      if (shouldVerify) {
+        // Snapshot CID is set on host by the successful publish path
+        // (`LifecycleManager.publishAggregatorPointerBestEffort` →
+        // `setLastDiscoveredPointerCid`). Null when no snapshot was
+        // published in this flush (transient publish failure handled
+        // above already threw before we got here, so a null here means
+        // the publisher wasn't wired — defensive fallback).
+        const snapshotCid =
+          publishResult !== null
+            ? this.host.getLastDiscoveredPointerCid()
+            : null;
+        await this.host.verifyFlushDurability(cid, snapshotCid, verifyDeadlineMs);
       }
     } catch (err) {
       // On failure, re-queue the data so it is not lost

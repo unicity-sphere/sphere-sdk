@@ -118,6 +118,41 @@ export interface ProfileTokenStorageHost {
   setLastPinnedCid(c: string | null): void;
 
   /**
+   * The most recent UXF bundle CID this provider successfully pinned
+   * to IPFS and wrote to the OrbitDB bundle index. Distinct from
+   * `lastPinnedCid` (a retry cache cleared after the post-pin OrbitDB
+   * write succeeds) — this field survives across flushes for the life
+   * of the provider so `LifecycleManager.shutdown()` can HEAD-verify
+   * the bundle CAR is actually served by ≥1 IPFS gateway before
+   * returning. See issue #239.
+   *
+   * Null when no successful flush has run yet (cold-start before any
+   * save), in which case shutdown skips the bundle-leg verification.
+   */
+  getLastPinnedBundleCid(): string | null;
+  setLastPinnedBundleCid(c: string | null): void;
+
+  /**
+   * Issue #239 — most-recent CID pair that successfully passed the
+   * per-flush remote-durability gate ({@link verifyFlushDurability}).
+   * The shutdown gate ({@link awaitRemoteDurability}) consults these
+   * to short-circuit its own verification: if the pin / pointer
+   * watermark already matches what shutdown would verify, the gate
+   * runs as a fast no-op (saves 15-30s of redundant HEAD + aggregator
+   * round-trips per destroy()).
+   *
+   * Null until the first successful per-flush verification. Cleared
+   * implicitly by a fresh flush on different CIDs (the next per-flush
+   * gate either succeeds and updates them, or fails and leaves them
+   * pointing at the previous verified state — shutdown still runs the
+   * legs on the newer CIDs).
+   */
+  getLastVerifiedBundleCid(): string | null;
+  setLastVerifiedBundleCid(c: string | null): void;
+  getLastVerifiedSnapshotCid(): string | null;
+  setLastVerifiedSnapshotCid(c: string | null): void;
+
+  /**
    * The most recent CID observed via the aggregator pointer layer
    * (cold-start `recoverLatest()` or the periodic poll). Tracked so
    * `flushToIpfs()` can short-circuit a no-data republish when the
@@ -260,6 +295,34 @@ export interface ProfileTokenStorageHost {
    * fire) — this entry point fires NOW and returns the result.
    */
   publishSnapshotIfWired(): Promise<ProfileSnapshotPublishResult | null>;
+
+  /**
+   * Issue #239 — per-flush remote-durability verification.
+   *
+   * Delegates to `LifecycleManager.verifyFlushDurability` so the
+   * FlushScheduler can run the same HEAD-verify + aggregator read-back
+   * legs that the shutdown gate uses, but on the CIDs from the
+   * just-completed flush. Throws on verification failure so the at-
+   * least-once gate (`awaitNextFlush` → caller refuses the Nostr ack)
+   * propagates the failure across the pipeline.
+   *
+   * Called by `FlushScheduler.flushToIpfs` AFTER pin + publish succeed.
+   * Returns void on success; throws an error with `code:
+   * 'FLUSH_DURABILITY_TIMEOUT'` on any leg exhausting the deadline.
+   *
+   * @param bundleCid    UXF bundle CID just pinned via flushToIpfs.
+   * @param snapshotCid  Snapshot CID just published (null if no
+   *                      pointer layer is wired).
+   * @param deadlineMs   Wall-clock budget for verification. Tracked
+   *                      independently of any caller deadline; the
+   *                      flush body picks it up from
+   *                      `options.flushVerificationDeadlineMs`.
+   */
+  verifyFlushDurability(
+    bundleCid: string,
+    snapshotCid: string | null,
+    deadlineMs: number,
+  ): Promise<void>;
 
   /**
    * Item #15 Phase E follow-up — pull-side symmetric counterpart to
