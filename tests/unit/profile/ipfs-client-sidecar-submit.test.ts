@@ -135,7 +135,7 @@ const SAMPLE_BYTES = new TextEncoder().encode('hello sidecar — test payload');
 // pinToIpfs sidecar submit
 // ---------------------------------------------------------------------------
 
-describe('pinToIpfs → /sidecar/submit fire-and-forget', () => {
+describe('pinToIpfs — sidecar primary + dag/put fallback', () => {
   let mock: ReturnType<typeof installFetchMock>;
 
   afterEach(() => {
@@ -236,30 +236,97 @@ describe('pinToIpfs → /sidecar/submit fire-and-forget', () => {
     expect(sidecarCalled).toBe(false);
   });
 
-  it('uses the SAME gateway that won the pin race (not the first in the list)', async () => {
-    // First gateway 5xx on pin, second succeeds. Sidecar must hit the second.
+  it('sidecar succeeds on first gateway → dag/put never called', async () => {
     const gw1 = 'https://gw1.test';
     const gw2 = 'https://gw2.test';
+    let pinCalled = false;
     mock = installFetchMock({
-      pinHandler: (req) => {
-        if (req.url.startsWith(gw1)) {
-          return new Response('boom', { status: 503 });
-        }
-        return new Response(
-          JSON.stringify({ Cid: { '/': 'ignored' } }),
-          { status: 200 },
-        );
+      pinHandler: () => {
+        pinCalled = true;
+        return new Response('should not be called', { status: 500 });
       },
-      sidecarHandler: () => new Response('', { status: 200 }),
+      sidecarHandler: () => new Response(
+        JSON.stringify({ ok: true, outcome: 'accepted' }),
+        { status: 200 },
+      ),
+    });
+
+    await pinToIpfs([gw1, gw2], SAMPLE_BYTES);
+
+    // Sidecar primary: succeeded on gw1 → loop exits → gw2 not visited,
+    // dag/put never called.
+    expect(pinCalled).toBe(false);
+    const sidecarCalls = mock.recorded.filter((r) => r.url.includes('/sidecar/submit'));
+    expect(sidecarCalls).toHaveLength(1);
+    expect(sidecarCalls[0].url.startsWith(gw1)).toBe(true);
+  });
+
+  it('sidecar 5xx on gw1 → falls back to dag/put on gw1 (NOT to gw2 sidecar)', async () => {
+    // Per-gateway iteration: sidecar 5xx triggers fallback to dag/put on
+    // the SAME gateway before continuing to the next gateway. This
+    // preserves locality (dag/put has access to the same Kubo as the
+    // sidecar that was supposed to be in front of it).
+    const gw1 = 'https://gw1.test';
+    const gw2 = 'https://gw2.test';
+    const sidecarSeen: string[] = [];
+    const pinSeen: string[] = [];
+    mock = installFetchMock({
+      sidecarHandler: (req) => {
+        sidecarSeen.push(req.url);
+        return new Response('boom', { status: 503 });
+      },
+      pinHandler: (req) => {
+        pinSeen.push(req.url);
+        return new Response(JSON.stringify({ Cid: { '/': 'ignored' } }), { status: 200 });
+      },
     });
 
     await pinToIpfs([gw1, gw2], SAMPLE_BYTES);
     await waitForDetachedFetch();
 
-    const sidecarCalls = mock.recorded.filter((r) => r.url.includes('/sidecar/submit'));
-    expect(sidecarCalls).toHaveLength(1);
-    expect(sidecarCalls[0].url.startsWith(gw2)).toBe(true);
-    expect(sidecarCalls[0].url.startsWith(gw1)).toBe(false);
+    // gw1 sidecar 503 → gw1 dag/put 200 → success.
+    expect(sidecarSeen.length).toBeGreaterThanOrEqual(1);
+    expect(sidecarSeen[0]).toContain('gw1.test');
+    expect(pinSeen.length).toBeGreaterThanOrEqual(1);
+    expect(pinSeen[0]).toContain('gw1.test');
+    // gw2 never visited (gw1 succeeded via fallback).
+    expect(pinSeen.find((u) => u.includes('gw2.test'))).toBeUndefined();
+    // Post-success cache-populator fired on gw1 (best-effort).
+    const submitCalls = mock.recorded.filter((r) => r.url.includes('/sidecar/submit'));
+    expect(submitCalls.length).toBeGreaterThanOrEqual(2); // primary attempt + post-success
+  });
+
+  it('sidecar fails AND dag/put fails on gw1 → continues to gw2', async () => {
+    const gw1 = 'https://gw1.test';
+    const gw2 = 'https://gw2.test';
+    mock = installFetchMock({
+      sidecarHandler: () => new Response('boom', { status: 503 }),
+      pinHandler: (req) => {
+        if (req.url.startsWith(gw1)) {
+          return new Response('upstream blip', { status: 503 });
+        }
+        return new Response(JSON.stringify({ Cid: { '/': 'ignored' } }), { status: 200 });
+      },
+    });
+
+    const cid = await pinToIpfs([gw1, gw2], SAMPLE_BYTES);
+    expect(cid).toBe(cidForBytes(SAMPLE_BYTES));
+
+    // Both gateways visited.
+    const pinCalls = mock.recorded.filter((r) => r.url.includes('/api/v0/dag/put'));
+    expect(pinCalls.some((c) => c.url.startsWith(gw1))).toBe(true);
+    expect(pinCalls.some((c) => c.url.startsWith(gw2))).toBe(true);
+  });
+
+  it('all gateways fail on BOTH sidecar and dag/put → throws ORBITDB_WRITE_FAILED', async () => {
+    mock = installFetchMock({
+      sidecarHandler: () => new Response('boom', { status: 503 }),
+      pinHandler: () => new Response('boom', { status: 503 }),
+    });
+
+    await expect(
+      pinToIpfs([TEST_GATEWAY], SAMPLE_BYTES),
+    ).rejects.toThrow(/IPFS pin failed on all gateways/);
   });
 });
 
