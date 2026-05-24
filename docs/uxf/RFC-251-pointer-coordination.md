@@ -1,12 +1,35 @@
 # RFC-251 — Same-Identity Cross-Device Pointer Coordination
 
-**Status:** Draft — design RFC, no implementation yet
-**Source:** [Issue #251](https://github.com/unicity-sphere/sphere-sdk/issues/251) Problem 1
+**Status:** Phase 1 prototype landed (#257, draft) — Approach D selected. See §3 + Update below.
+**Source:** [Issue #251](https://github.com/unicity-sphere/sphere-sdk/issues/251) Problem 1, [Issue #255](https://github.com/unicity-sphere/sphere-sdk/issues/255) Problem B
 **Companion specs:**
 - [`PROFILE-AGGREGATOR-POINTER-SPEC.md`](./PROFILE-AGGREGATOR-POINTER-SPEC.md) — pointer wire format & W7 walkback floor
 - [`PROFILE-AGGREGATOR-POINTER-ARCHITECTURE.md`](./PROFILE-AGGREGATOR-POINTER-ARCHITECTURE.md) §8.5 — many-device burst publish characterisation
 - PR #246 — WALKBACK_FLOOR throttle (#245 #3)
 - PR #249 — W7 reconcile-downward (#247 short-term fix)
+- PR #257 (draft) — Approach D Phase 1 prototype (this RFC's chosen path)
+- `unicitynetwork/ipfs-storage#7` — IPFS instant-pin sidecar (Stage B.1 prerequisite)
+
+---
+
+## Update — 2026-05-24
+
+**Approach A (aggregator-side CAS) is ruled out by owner directive.** Project owner directed:
+
+> Treat aggregator as one-time KV authenticated storage. Design the pointer protocol around it.
+
+This forecloses any change to `aggregator-go` (new RPC fields, reverse indexes, per-wallet metadata, schema migrations). The aggregator's existing semantics — first-writer-wins per `requestId`, ECDSA-authenticated submits, eventually-consistent read replica — are the contract the SDK must live within.
+
+**Approach C** (server-side anchoring) was already ruled out in §2.3 of this RFC (hard variant requires aggregator to hold per-wallet master key; weak variant has no implementation merit). The directive above doesn't change that.
+
+**Approach B** (Nostr writer election) is still viable in principle but the silent-split-via-asymmetric-Nostr-reachability failure mode (§2.2 Cons) means it's at best a tied alternative to Approach D — same authentication primitive (sibling shares wallet key), same transport (Nostr), but with new election complexity layered on. We **drop B in favor of D**.
+
+**New approaches added** (§§2.4–2.6):
+- **D — Nostr win-broadcast** (chosen). Authenticated optimistic-notify after successful publish; siblings adopt without waiting for replica lag.
+- **E — Aggregator claim-lock** (alternative; doubles aggregator load).
+- **G — Per-device pointer slots** (longer-term architectural fit; large protocol revision).
+
+**Recommendation flipped to D.** See §3. Phase 1 prototype landed in PR #257; Phase 2 (eager-subscribe + direct adopt) is conditional on Stage B.1 verdict.
 
 ---
 
@@ -58,6 +81,8 @@ The dominant residual cost is **time-to-convergence**, not log noise.
 
 ### 2.1 Approach A — Aggregator-side compare-and-swap (CAS)
 
+**STATUS: RULED OUT (2026-05-24 owner directive). Section preserved for the record; see Update at top of RFC.**
+
 **Sketch.** Extend the aggregator's `submit_commitment` RPC with an optional
 `expectedPriorVersion` field. The aggregator atomically rejects with a new
 `VERSION_CONFLICT` status if the slot already holds a commitment at the
@@ -98,6 +123,8 @@ testcontainer-based integration test to exercise the conflict path.
 ---
 
 ### 2.2 Approach B — Single-writer election via Nostr presence
+
+**STATUS: DROPPED in favor of Approach D (2026-05-24). Section preserved for the record; the silent-split-via-asymmetric-Nostr-reachability failure mode in Cons reproduces exactly the race this RFC tries to eliminate.**
 
 **Sketch.** Wallet processes that share an identity participate in a Nostr-based
 "writer election." Only the elected writer publishes pointers; followers poll
@@ -141,6 +168,8 @@ required.
 
 ### 2.3 Approach C — Server-side anchoring
 
+**STATUS: RULED OUT. Hard variant requires the aggregator to hold per-wallet master keys (trust-model hard-no). Weak variant has no implementation merit per the Cons below — also fully blocked by the 2026-05-24 owner directive against any aggregator-side change. Section preserved for the record.**
+
 **Sketch.** The aggregator (or a sidecar service) listens for OpLog updates
 via libp2p and anchors them itself, eliminating client-side pointer publishing
 entirely. Clients only submit bundles; the server publishes pointers.
@@ -171,125 +200,216 @@ spec.
 
 ---
 
-## 3. Recommendation
+### 2.4 Approach D — Nostr win-broadcast (optimistic notify)
 
-**Pursue Approach A (Aggregator CAS).** Rationale:
+**STATUS: SELECTED (2026-05-24). Phase 1 prototype landed in PR #257 (draft).**
 
-1. **Smallest blast radius.** CAS is a one-field, additive change to the
-   `submit_commitment` RPC. Existing clients are unaffected.
-2. **Deterministic per-conflict latency.** Same asymptotic cohort cost
-   (`O(k)` conflicts per the architecture §8.5 analysis), but each
-   conflict costs one extra RPC round trip (~200 ms) instead of a
-   60 – 90 s walkback + reconcile + throttle cycle.
-3. **Layer-clean.** Coordination lives at the layer that owns the SMT — no
-   new transport-layer protocol, no new trust dependencies.
-4. **Testable.** A testcontainer-based aggregator can simulate the race
-   precisely in a unit-of-work that finishes in seconds, not minutes.
+**Sketch.** After a successful `submit_commitment` for pointer `(walletId, v=N)`, the winning device immediately broadcasts an authenticated event over Nostr:
 
-Approach B is a viable Plan B if the aggregator team rejects the schema
-change. Approach C is deferred indefinitely (changes the trust model).
+```
+kind:       1 (NIP-01 short note; tag-discriminated)
+tag:        pointer-win:<signingPubKeyHex>
+content:    JSON { _kind, v=1, version=N, cid, signingPubKey, ts, sig }
+sig:        secp256k1 over SHA-256(uint8 v ‖ uint32be version ‖ uint64be ts ‖ pubkey33 ‖ utf8 cid)
+```
+
+Same-identity siblings subscribe to `pointer-win:<ownSigningPubKeyHex>` and verify the payload signature against their own pointer signingPubKey (sibling = same key ⇒ trivial authentication). On valid receipt: dedupe `(signingPubKey, version)` via bounded LRU, trigger an early `recoverLatest()` + `reconcileLocalVersionDownward()` without waiting for the WALKBACK_FLOOR throttle to expire.
+
+**Pros.**
+- **Pure client-side change.** Aggregator stays as one-time KV authenticated storage; satisfies owner directive. Approach A's server-side reverse-index complexity is not needed.
+- **Strictly no-worse-than-today degradation.** Nostr broken / partitioned / sibling offline ⇒ falls back to existing WALKBACK_FLOOR + reconcileLocalVersionDownward cycle. The aggregator is still authoritative; Nostr is just a convergence-time hint.
+- **Authentication trivial.** Siblings share the wallet's signing key by construction. Spoofing requires possession of the wallet key, in which case the attacker can already publish to the aggregator directly — no new attack surface.
+- **Replay-bounded.** 5-minute `ts` window + dedup LRU bound replay attempts even on a hoarding relay.
+- **Backward compatible.** Old clients don't subscribe to the tag; they fall back to the existing path. New clients ignore broadcasts they can't verify (different wallet, expired, malformed) and drop silently.
+
+**Cons.**
+- **Phase 1 does not improve convergence — it is a measurement + wiring-infrastructure vehicle.** The subscriber's `recoverLatest() + reconcileLocalVersionDownward()` action mirrors the existing WALKBACK_FLOOR catch arm (PR #249) and:
+  - Does NOT clear the WALKBACK_FLOOR throttle (B still waits 60 s after a race-loss before its next publish attempt, regardless of broadcast).
+  - Does NOT call `fetchAndJoin(broadcast.cid)` (B's OpLog merge with A's contribution is still gated on OrbitDB replication).
+  - Returns no-op for the dominant same-version race (`reconcileLocalVersionDownward` requires `candidate < local`; in same-version race local == broadcast.version, so the check skips).
+  - May briefly help a narrow window where B's local was speculatively bumped to V=N and the replica still lags, by triggering the existing downgrade ~1 s earlier than the catch arm — but the throttle remaining armed neutralizes the gain.
+- **Phase 2 is what actually solves convergence.** Adds an `adoptBroadcast(payload)` entrypoint on `ProfilePointerLayer` that: bypasses the `>=` comparison, advances local to `broadcast.version`, calls `fetchAndJoin(broadcast.cid)` to merge A's OpLog into B's local, and resets the WALKBACK_FLOOR throttle so the next publish can immediately target `broadcast.version + 1`. Phase 1's value is to validate the broadcast wire-format end-to-end and produce the fire/receive counts that decide whether Phase 2 is needed.
+- **Lazy subscription install** (Phase 1). Receive-only devices that never publish themselves don't install their sibling subscription until their own first publish. *Phase 2* adds an eager polling loop or a `storage:pointer-ready` event from `ProfileStorageProvider`.
+- **Nostr fanout cost.** Each successful publish ⇒ one signed event per relay subscribed. For a high-frequency wallet (multiple publishes per minute) this adds bandwidth. Bounded by the publish cadence the aggregator already enforces; not a new scaling concern.
+
+**Effort.** Small. Phase 1 (PR #257): 1 standalone crypto module (~233 LOC), 3 plumbing accessors, 1 event type, 1 lifecycle-manager hook, 1 Sphere subscriber + publisher. Phase 2 (conditional on Stage B.1 verdict): add `adoptBroadcast(payload)` entrypoint and eager-subscribe trigger.
 
 ---
 
-## 4. Acceptance Criteria for the Implementation PR
+### 2.5 Approach E — Aggregator claim-lock (explicit lease via second requestId)
 
-Any implementation MUST satisfy:
+**STATUS: ALTERNATIVE / NOT SELECTED. Kept as fallback if Approach D Phase 2 proves insufficient.**
 
-1. **Convergence under simulated replica lag.** A new test (testcontainer-based)
-   simulates two clients sharing one identity, each publishing concurrently
-   against an aggregator with 30 s of read-replica lag. Both clients reach
-   pointer-publish success within 10 s of the first conflict.
+**Sketch.** Before publishing `requestId(walletId, N, "publish")`, write a tiny claim commitment to `requestId(walletId, N, "claim")`. The aggregator's existing one-shot KV semantics atomically pick a claim winner. The loser sees rejection on its own claim submit (~1 RTT) and switches to follower mode without ever attempting the publish.
 
-2. **No regression on the single-writer happy path.** `pointer-roundtrip.test.ts`
-   and `tests/unit/profile/pointer/walkback-floor-retry.test.ts` pass without
-   modification.
+**Pros.**
+- **Aggregator unchanged.** Same RPC, new requestId derivation; satisfies owner directive.
+- **Deterministic per-conflict latency.** 1 extra aggregator round trip (~200 ms) instead of 60–90 s WALKBACK + reconcile + throttle cycle. *Bounded by network RTT, not by replica lag.*
+- **Loser knows immediately.** Doesn't need a broadcast — the aggregator's rejection IS the signal.
 
-3. **Backwards compatibility.** A new-protocol client submitting against an
-   old-protocol aggregator (no `expectedPriorVersion` support) falls back to
-   the current walkback/throttle path without error.
+**Cons.**
+- **Doubles aggregator submit load** per pointer publish (claim + publish). Operationally non-trivial if pointer publishes are frequent.
+- **Stuck-claim failure mode.** Winner crashes between claim and publish ⇒ V=N slot is held but no V=N pointer exists. Other devices can't claim V=N (slot taken) and can't follow (no publish to fetch). Mitigation: encode a claim TTL via an `epoch` field in the requestId derivation (`requestId(walletId, N, "claim", epoch=t)`); after epoch expiry next epoch's claims are accepted. Requires aggregator clock-sync assumption (loose).
+- **State machine more complex than Approach D.** Two new states: "won-claim-but-not-published-yet" (winner) and "lost-claim-waiting-for-winner's-publish" (loser). Both need timeouts + re-attempt logic.
 
-4. **Operator observability.** Emit `pointer:cas-conflict-resolved` (new typed
-   event) with `{fromVersion, toVersion, attemptsUsed}` when CAS resolves a
-   conflict. The implementation MUST decide explicitly whether this event
-   **replaces** the existing `storage:replica-lag-reconciled` event (emitted
-   from `lifecycle-manager.ts:1322-1329` after a successful
-   `reconcileLocalVersionDownward`) on the CAS path, or **supplements** it.
-   Double-emission would force consumers to deduplicate counts; replacement
-   would silently change the semantics of existing dashboards. Either choice
-   is defensible; the PR description MUST name it.
+**Effort.** Medium. New requestId derivation, two new state-machine states, TTL/epoch handling. Smaller than Approach G; larger than D.
 
-5. **Acceptance for §C.4 in `manual-test-full-recovery.sh`.** The script
-   reaches §F (script end) on > 5 consecutive runs. Under CAS the number
-   of `AGGREGATOR_POINTER_WALKBACK_FLOOR` warns per cycle drops from
-   *unbounded* (the issue this RFC addresses) to **at most one per distinct
-   cross-device conflict event**, with each such warn followed within
-   ~1 s by a `pointer:cas-conflict-resolved` event resolving it.
-   "Zero" warns would require CAS to predict conflicts pre-emptively,
-   which is not what this RFC proposes — the first publish per conflict
-   still discovers the race, CAS just resolves it cheaply rather than
-   re-entering the walkback cycle.
+---
+
+### 2.6 Approach G — Per-device pointer slots (eliminate race at the source)
+
+**STATUS: LONG-TERM ARCHITECTURAL DIRECTION. Not for immediate implementation.**
+
+**Sketch.** Each device of the same wallet writes to a slot keyed by `(walletId, deviceId, N_device)` rather than `(walletId, N_wallet)`. No two devices ever race for the same slot. Readers enumerate all known device slots for a walletId, merge OpLogs across them (natural fit for OrbitDB's multi-writer CRDT model).
+
+**Pros.**
+- **Zero conflicts.** Each device only competes with itself for its own monotonic slot. The §1 race vanishes at the source.
+- **Aggregator unchanged.** New slot derivation; no new aggregator features needed.
+- **Architecturally aligned.** Matches OrbitDB's native multi-writer OpLog model — possibly the "right" long-term shape for cross-device coordination, with the pointer layer just publishing per-device heads instead of trying to elect a global winner.
+
+**Cons.**
+- **Large protocol revision.** Slot derivation change, reader logic change, device-list publication, stale-device pruning heuristic (devices that go offline for weeks).
+- **Bootstrap problem.** New device must discover existing siblings before it can enumerate slots. Solvable via existing Nostr identity-binding events but adds boot-time latency.
+- **Migration complexity.** Coexistence of old `(walletId, N)` slots with new `(walletId, deviceId, N_device)` slots during rollout window. Requires read-path fallback ordering.
+- **Cardinality.** Aggregator state size grows linearly in device count × publish count rather than linearly in publish count. For wallets with many devices (rare but possible), this matters.
+
+**Effort.** Large. Slot derivation, reader logic, device discovery via Nostr, stale-device pruning, migration of existing wallets. Needs its own RFC (RFC-251-G).
+
+---
+
+## 3. Recommendation
+
+**Pursue Approach D (Nostr win-broadcast).** Phased rollout:
+
+**Phase 1 — landed in PR #257 (draft). Scope: measurement + wiring. Does NOT improve race convergence; that lands in Phase 2.**
+- Authenticated win-broadcast fires after every successful pointer publish.
+- Sibling devices verify the signature against their own pointer signing pubkey, dedupe (signingPubKey, version) via bounded 256-entry LRU, then trigger `recoverLatest()` + `reconcileLocalVersionDownward()` — mirroring the existing WALKBACK_FLOOR catch arm (PR #249). This is a redundant trigger, not a convergence-accelerator: the throttle stays armed, `fetchAndJoin` is not called, and reconcile no-ops for same-version race. Phase 1's purpose is to validate the wire-format end-to-end and produce broadcast fire/receive counts in the debug log so Stage B.1 has measurement data.
+- Crypto module fully unit-tested (24 tests). Lifecycle-manager emission contract tested (4 tests). Full unit suite: 8132 pass, 0 regressions.
+- Gated as DRAFT until Stage B.1 verdict (5× `manual-test-full-recovery.sh` run after `unicitynetwork/ipfs-storage#7` deploys).
+
+**Phase 2 — conditional on Stage B.1 outcome:**
+- Add `ProfilePointerLayer.adoptBroadcast(payload)` — direct entrypoint that bypasses `reconcileLocalVersionDownward`'s `>=` comparison so same-version races (the dominant remaining failure mode after Phase 1) get resolved.
+- Add eager-subscribe trigger — `storage:pointer-ready` event from `ProfileStorageProvider` so receive-only devices install their sibling subscription before their own first publish.
+- Decision criterion for proceeding to Phase 2: if Stage B.1 shows §C.2 still timing out OR WALKBACK_FLOOR > 5/run AND Phase 1 broadcast logs show ≥ 1 broadcast/conflict reaching siblings (signal Phase 1 is firing but not closing the gap), proceed to Phase 2.
+
+**Phase 3 — long-term architectural direction (separate RFC):**
+- Move toward Approach G (per-device pointer slots). Eliminates the race at the source. Major protocol revision; needs its own RFC for slot derivation, device discovery, migration, stale-pruning. Phase 1 + Phase 2 don't preclude G — D and G compose (per-device slots remove the conflict, broadcasts continue serving as fast OpLog-head propagation).
+
+**Approach E (claim-lock) is held as fallback** if D Phase 1 + Phase 2 prove insufficient AND G is too large a project for the timeline. E's deterministic per-conflict latency is attractive, but the doubled aggregator load and stuck-claim TTL complexity make it second-choice to D + G.
+
+### Rationale for D over the alternatives
+
+| Criterion | D (Phase 1) | E (claim-lock) | G (per-device slots) |
+|---|---|---|---|
+| Aggregator change | None | None (new requestId derivation) | None (new requestId derivation) |
+| Implementation effort | Small (landed) | Medium | Large (own RFC) |
+| Per-conflict latency | ~1 s (Nostr RTT) | ~200 ms (1 extra agg RTT) | 0 (no race) |
+| Strict same-version race | Phase 2 needed | Resolved | Resolved by construction |
+| Degradation on transport failure | Falls back to today | Falls back to today | N/A — no race |
+| Aggregator load delta | None | Doubled | Linear in device count |
+| Operational risk | Low | Medium (stuck claims) | High during migration |
+
+**D is the smallest first step** that yields measurable progress on the convergence-time problem while leaving room for E (fallback) and G (long-term) as Stage B.1's empirical data informs the next decision.
+
+---
+
+## 4. Acceptance Criteria (Approach D)
+
+### Phase 1 (PR #257 — landed, draft)
+
+1. **Crypto correctness.** Sign / verify roundtrip on real secp256k1 with canonical fixed-width hash; tamper rejection per field (`version`, `cid`, `ts`, `signingPubKey`, `sig`); schema-version rejection; replay-window enforcement (5-minute `ts` bound); anti-spoof guard at sign time. ✅ Covered by 24 unit tests in `tests/unit/pointer/win-broadcast.test.ts`.
+
+2. **Lifecycle-manager emission contract.** Successful pointer publish ⇒ emits `storage:pointer-published` event carrying signed payload + per-wallet broadcast tag. Transient/permanent publish failures DO NOT emit. Pointer layer without the `getSignerForWinBroadcast` accessor (legacy stub) gracefully skips with a log; publish-success contract preserved. ✅ Covered by 4 integration tests in `tests/unit/profile/lifecycle-manager-pointer-win-broadcast.test.ts`.
+
+3. **No regression on existing pointer paths.** `tests/unit/pointer/category-*.test.ts`, `tests/unit/profile/pointer/walkback-floor-retry.test.ts`, `tests/unit/profile/lifecycle-manager-reconcile-downward.test.ts`, `tests/unit/profile/lifecycle-manager-publish-retry.test.ts` pass unchanged. ✅ Full unit suite: 8132 pass, 0 regressions.
+
+4. **Operator observability.** New typed event `storage:pointer-published` declared in `StorageEventType` with explicit doc that it is *additive* to the existing `storage:replica-lag-reconciled` (does NOT replace — they fire from different code paths and signal different conditions). Phase 1 broadcast logs (debug-level `[Sphere] pointer-win broadcast {published|received}: ...`) provide the diagnostic surface for Stage B.1 measurement.
+
+5. **Degradation contract.** If `transport.publishBroadcast` is absent or rejects, the publish-success return is unaffected. If the Nostr subscription drops, missed broadcasts simply leave siblings on the existing WALKBACK_FLOOR + reconcile path. ✅ Verified by 4th integration test ("pointer without getSignerForWinBroadcast gracefully skips").
+
+### Phase 2 (conditional)
+
+6. **`adoptBroadcast(payload)` entrypoint** on `ProfilePointerLayer` bypasses the `reconcileLocalVersionDownward`'s `>=` comparison and explicitly resets the WALKBACK_FLOOR throttle when called. Authentication: the payload's `signingPubKey` MUST equal this layer's own `signingPubKey` (caller has already verified the signature; this is a defense-in-depth check at the layer boundary).
+
+7. **Eager-subscribe trigger.** `ProfileStorageProvider` emits `storage:pointer-ready` once `getPointerLayer()` first returns non-null. Sphere subscribes and installs the per-wallet pointer-win subscription on receipt — fixes the Phase 1 lazy-install gap for receive-only devices.
+
+8. **Convergence under simulated replica lag.** A new integration test simulates two same-identity clients each publishing concurrently against an aggregator with 30 s of read-replica lag. Sibling adopts the winner's V=N within `2× Nostr RTT` (~2 s) of the first conflict — empirical proof that Phase 2 closes the convergence-time gap.
+
+### End-to-end (manual-test contract)
+
+9. **`manual-test-full-recovery.sh` §C.4 reaches §F on > 5 consecutive runs** with the IPFS sidecar from `unicitynetwork/ipfs-storage#7` deployed AND Approach D Phase 1 (+ Phase 2 if needed) active. WALKBACK_FLOOR count per run ≤ 5 (matches Approach A's original target). The first conflict per cycle still discovers the race naturally (no pre-emptive prediction); the broadcast just resolves it cheaply within ~1 s instead of re-entering the 60–90 s WALKBACK cycle.
 
 ---
 
 ## 5. Out of Scope for This RFC
 
-- **Aggregator-side implementation details.** The Go service team owns the
-  CAS index and storage decisions. This RFC defines the protocol contract,
-  not the implementation strategy.
-- **Multi-writer fairness.** With > 2 devices the cohort still races, but
-  each conflict is one round trip (vs minutes). The §8.5 `O(k)` analysis
-  still applies — fairness improvements (e.g., backoff jitter) can ride a
-  follow-up PR if they prove necessary.
-- **Cross-device profile-level coordination.** Pointer-layer races are one
-  symptom; OrbitDB OpLog merges across devices have their own race surface
-  documented in `PROFILE-ARCHITECTURE.md §10.4`. That is a separate work
-  stream — fixing pointer races here unblocks observability of those issues
-  but does not solve them.
+- **Aggregator-side changes.** Out by owner directive — see Update at top of RFC. The aggregator stays as one-time KV authenticated storage; this RFC's protocol lives entirely above that layer.
+- **Approach G's slot-derivation + migration spec.** The long-term per-device pointer slot architecture is in scope for `RFC-251-G` (a future RFC). This RFC's §2.6 only sketches G's shape and tradeoffs as a directional pointer.
+- **Multi-writer fairness.** With > 2 devices the cohort still races, but each conflict is bounded by Nostr RTT (Phase 1) or `adoptBroadcast` (Phase 2). Backoff jitter or other fairness improvements can ride a follow-up PR if observed to matter.
+- **Cross-device profile-level coordination.** Pointer-layer races are one symptom; OrbitDB OpLog merges across devices have their own race surface documented in `PROFILE-ARCHITECTURE.md §10.4`. That is a separate work stream — fixing pointer races here unblocks observability of those issues but does not solve them.
+- **IPFS slow-pin amplification.** Tracked separately as `unicitynetwork/ipfs-storage#7` (the instant-pin sidecar). Stage B.1 — re-running the manual test 5× after the sidecar deploys — is the empirical measurement that decides whether D Phase 1 is sufficient or whether D Phase 2 also needs to land.
 
 ---
 
-## 6. Open Questions
+## 6. Open Questions (Approach D)
 
-1. **Aggregator API extension** — coordinate with `aggregator-go` maintainers
-   on the exact field name (`expectedPriorVersion` vs `cas_version` vs
-   `slot_version`) and whether to bundle it under a sub-object for future
-   extensibility. The "additive RPC field" framing in §2.1 holds at the wire
-   level; the underlying server-side reverse index (§2.1 Cons) is the harder
-   part of this conversation.
-2. **Migration window** — for the few weeks where some aggregator instances
-   support CAS and others don't, do we feature-flag the client-side use of
-   CAS (off by default), or trust the graceful-fallback path on
-   `METHOD_NOT_FOUND`?
-3. **Test fixtures** — the existing `goggregator-test.unicity.network` is
-   shared; a CAS-aware aggregator testcontainer needs to be added to
-   `test/integration/` for deterministic CI runs.
-4. **In-flight reader poisoning.** A reader that issued a pointer-poll probe
-   against the replica at `V=N` is awaiting inclusion proofs while a
-   CAS-aware writer's conflict is being resolved server-side. If CAS bumps
-   the authoritative version to `V=N+1` between the reader's probe and its
-   response processing, does the reader receive a stale answer? Today the
-   `storage:replica-lag` / `storage:replica-lag-reconciled` events
-   (`lifecycle-manager.ts:1304-1329`) signal writer-side reconciliation;
-   they are not wired to pointer-poll readers. Does
-   `pointer:cas-conflict-resolved` need to trigger a reader-side re-probe?
-5. **`pendingPublishCid` migration on CAS rollout.** Wallets with an existing
-   `pendingPublishCid` stamped under the old protocol will retry under the
-   new CAS path when CAS lands. If that pending CID corresponds to a
-   version already superseded by a cross-device write, the CAS field
-   triggers an immediate `VERSION_CONFLICT` response. The fallback path
-   (Acceptance Criterion 3 + Open Question 2's feature-flag) handles this
-   correctly only if the fallback is exercised. Should pending-publish
-   retries apply CAS on the first attempt, or skip CAS (use the existing
-   walkback path) to avoid an extra round trip for already-pending publishes?
+1. **Phase 2 trigger — Stage B.1 verdict.** What WALKBACK_FLOOR-per-run + §C.2-success-rate thresholds promote us from "Phase 1 sufficient" to "implement Phase 2 now"? Provisional threshold proposed in §3: §C.2 failing on any of 5 runs OR WALKBACK_FLOOR > 5/run AND Phase 1 broadcast logs show ≥ 1 broadcast/conflict reaching siblings (Phase 1 firing but not closing the gap). To be finalized after Stage B.1 data lands.
+
+2. **Same-version race — adopt-broadcast authentication boundary.** Phase 2 adds `ProfilePointerLayer.adoptBroadcast(payload)`. The Sphere subscriber has already verified the payload signature against own signing pubkey before calling. Does the layer redundantly re-verify (defense-in-depth, ~5 ms cost) or trust the caller (zero cost, smaller blast radius if a future caller forgets the verify step)? Provisional choice: redundant verify — pointer layer is a security boundary, the cost is negligible, and untrusted-caller scenarios become real if `adoptBroadcast` ever leaks beyond Sphere wiring.
+
+3. **Eager-subscribe — Phase 1 vs Phase 2 timing.** Phase 1's lazy-on-own-publish install is acceptable for *measurement* (Stage B.1's 2-device scenario where both devices publish). For PRODUCTION rollout, the receive-only case matters — wallets used only for receiving (cold-storage observers) never publish and would never install the subscription under Phase 1. Should Phase 2's `storage:pointer-ready` event ship sooner regardless of Stage B.1 verdict, just to fix the production gap?
+
+4. **Multi-device fanout cost.** A wallet with N active devices ⇒ each successful publish ⇒ N-1 broadcast deliveries. For N ≤ 3 (the realistic upper bound for personal wallets) this is negligible. If we ever support N > 10 (organizational wallets shared across many devices), the broadcast fanout becomes a real cost. Defer specific mitigation (relay-side TTL, broadcast batching, throttling) until N > 10 is observed.
+
+5. **Replay-window calibration.** Phase 1 uses 5-minute `ts` window. Too short ⇒ legitimate broadcasts dropped under clock skew between devices. Too long ⇒ replay attempts hoarded by malicious relays remain valid longer. 5 min is a reasonable starting bound (NTP-synced devices stay within seconds) but should be calibrated against observed clock skew distributions in production. Add a `pointer-win:replay-rejected` debug log to enable measurement.
+
+6. **Broadcast dedup LRU sizing.** Phase 1 uses 256 entries. Each entry is a `${signingPubKeyHex}:${version}` string (~80 bytes). 256 × 80 = ~20 KB memory — trivial. Sized to comfortably bound replay attempts within the 5-min `ts` window even for a hyperactive wallet publishing every second (300 unique versions/5 min ⇒ 256 entries covers the window). Validate during Stage B.1 — if observed broadcast rates are higher, bump.
+
+7. **Compatibility with future Approach G.** When per-device pointer slots (Approach G) eventually land, do per-device broadcasts continue using the same Nostr event kind and tag scheme, or do they need a parallel namespace to disambiguate per-wallet-aggregate vs per-device-slot broadcasts? Likely the latter (`pointer-win-device:<deviceId>` tag) to avoid receivers conflating the two. Defer the design until G is on the critical path.
 
 ---
 
 ## 7. Decision Record
 
-When this RFC is approved or rejected, add an ADR entry:
+### 2026-05-24 — Initial direction (Approach A, CAS)
 
-```
-docs/uxf/ADR-NNN-pointer-cas.md
-```
+Drafted as design RFC recommending Approach A (aggregator-side compare-and-swap). Open Question 1 (server-side reverse-index data-model) identified as the gating prerequisite. No implementation.
 
-referencing this RFC and the decision rationale.
+### 2026-05-24 — Direction superseded by owner directive
+
+Owner directive: *"Treat aggregator as one-time KV authenticated storage. Design the pointer protocol around it."*
+
+This forecloses Approach A (requires aggregator schema change) and reaffirms Approach C's existing rule-out. Approach B's silent-split failure mode (§2.2 Cons) was already documented as load-bearing — combined with the directive forcing pure-client-side design, B is dropped in favor of Approach D (same authentication primitive, same transport, simpler state machine, no election complexity).
+
+### 2026-05-24 — Recommendation flipped to Approach D
+
+§§2.4–2.6 added (Approaches D, E, G). §3 rewritten to recommend D with phased rollout. §4 acceptance criteria rewritten for D Phase 1 + Phase 2. §6 open questions rewritten for D-specific unknowns.
+
+### 2026-05-24 — Phase 1 prototype landed
+
+PR #257 (draft) implements Approach D Phase 1. **Scope: measurement + wiring; does NOT improve race convergence on its own.**
+
+- `profile/aggregator-pointer/win-broadcast.ts` — standalone signed payload module (24 unit tests).
+- `ProfilePointerLayer.getSignerForWinBroadcast()` accessor.
+- `storage:pointer-published` event variant on `StorageEventType`.
+- Lifecycle-manager emits signed payload + per-wallet tag after successful publish (4 integration tests).
+- Sphere subscribes both directions: forwards `storage:pointer-published` to Nostr; lazy-installs `pointer-win:<signingPubKeyHex>` subscription on first own publish; verified broadcasts trigger `recoverLatest()` + `reconcileLocalVersionDownward()` (mirroring the existing WALKBACK_FLOOR catch arm — see §2.4 Cons for why this is intentionally redundant for Phase 1).
+
+The race-convergence work is in Phase 2: `adoptBroadcast(payload)` entrypoint that bypasses reconcile's `>=` comparison, calls `fetchAndJoin(broadcast.cid)`, and resets the WALKBACK throttle. Phase 1 exists to (a) validate the broadcast wire-format end-to-end against real Nostr, (b) produce fire/receive counts in the debug log for Stage B.1 to inform whether Phase 2 is needed, and (c) lay the wiring infrastructure Phase 2 will plug into.
+
+Full unit suite: 8132 pass, 0 regressions. Held as DRAFT pending Stage B.1 verdict.
+
+### Next decision point — Stage B.1 verdict
+
+After `unicitynetwork/ipfs-storage#7` (IPFS instant-pin sidecar) lands and deploys: re-run `manual-test-full-recovery.sh` 5×. Tally WALKBACK_FLOOR per run, §C.2/§C.4 outcomes, broadcast fire/receive rates from PR #257's debug logs.
+
+Decision tree:
+- **§C.2 succeeds on all 5 AND WALKBACK_FLOOR ≤ 5/run** → Problem B mitigated by `ipfs-storage#7` alone. PR #257 stays draft (Phase 1 alone adds no measurable convergence benefit per §2.4 Cons; merging would be wiring-only with no behavior change visible to users).
+- **§C.2 still flaky AND Phase 1 broadcasts ARE firing/receiving** (debug log shows `[Sphere] pointer-win broadcast published` AND `pointer-win broadcast received` lines) → infrastructure works; proceed to Phase 2 (`adoptBroadcast` + eager-subscribe). PR #257 merges as the foundation for Phase 2.
+- **§C.2 still flaky AND Phase 1 broadcasts are NOT firing/receiving** → diagnose Phase 1 wiring (transport.publishBroadcast missing? subscription tag mismatch? signature verification failing?) before adding more surface. The lifecycle-manager emission test passing in CI doesn't guarantee the end-to-end Nostr path works against real relays.
+
+Per the §3 phased plan, Approach G remains the long-term direction regardless of B.1 outcome — D solves the symptom, G eliminates the race at the architectural source. G is deferred to its own RFC (`RFC-251-G`).
+
+### Optional ADR
+
+If desired post-merge, an ADR can be added at `docs/uxf/ADR-NNN-pointer-coordination.md` referencing this RFC and the 2026-05-24 decision rationale. Lower priority than the Stage B.1 measurement.
