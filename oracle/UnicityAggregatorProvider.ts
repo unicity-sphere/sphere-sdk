@@ -34,6 +34,7 @@ import { StateTransitionClient } from '@unicitylabs/state-transition-sdk/lib/Sta
 import { AggregatorClient } from '@unicitylabs/state-transition-sdk/lib/api/AggregatorClient';
 import { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/bft/RootTrustBase';
 import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token';
+import { PredicateEngineService } from '@unicitylabs/state-transition-sdk/lib/predicate/PredicateEngineService';
 import { waitInclusionProof } from '@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils';
 import type { TransferCommitment as SdkTransferCommitment } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferCommitment';
 import {
@@ -42,7 +43,7 @@ import {
 } from '@unicitylabs/state-transition-sdk/lib/transaction/InclusionProof';
 import { RequestId } from '@unicitylabs/state-transition-sdk/lib/api/RequestId';
 import { DataHash } from '@unicitylabs/state-transition-sdk/lib/hash/DataHash';
-import { hexToBytes } from '../core/hex';
+import { hexToBytes, bytesToHex } from '../core/hex';
 
 // SDK MintCommitment type - using interface to avoid generic complexity
 interface SdkMintCommitment {
@@ -521,11 +522,28 @@ export class UnicityAggregatorProvider implements OracleProvider {
   async validateToken(tokenData: unknown): Promise<ValidationResult> {
     this.ensureConnected();
 
+    // Issue #245 #5 — parse the SDK token ONCE so we can reuse it for
+    // (a) SDK-path verification AND (b) deriving the predicate
+    // publicKey for the spent-cache key. Aligning the cache key with
+    // `isSpent`'s `${publicKey}:${stateHash}` format lets a
+    // validateToken-driven spent decision short-circuit a subsequent
+    // `isSpent(pubkey, sameHash)` call (and vice versa). Pre-parsing
+    // is cheap relative to the RPC fallback and is best-effort —
+    // failure here only prevents the spent-cache key from including
+    // the publicKey (cached under bare stateHash as legacy fallback).
+    let sdkToken: Awaited<ReturnType<typeof SdkToken.fromJSON>> | null = null;
+    try {
+      sdkToken = await SdkToken.fromJSON(tokenData);
+    } catch {
+      // Pre-parse failed; SDK path will detect the same failure and
+      // fall through to RPC. Cache key falls back to legacy bare-
+      // stateHash form below.
+    }
+
     try {
       // Try SDK validation first if we have trust base
-      if (this.trustBase && !this.config.skipVerification) {
+      if (this.trustBase && !this.config.skipVerification && sdkToken !== null) {
         try {
-          const sdkToken = await SdkToken.fromJSON(tokenData);
           const verifyResult = await sdkToken.verify(this.trustBase);
 
           // Calculate state hash
@@ -563,9 +581,17 @@ export class UnicityAggregatorProvider implements OracleProvider {
         data: { valid },
       });
 
-      // Cache spent state if spent (Wave L: bounded with LRU eviction)
+      // Cache spent state if spent (Wave L: bounded with LRU eviction).
+      // Issue #245 #5 — key under `${publicKey}:${stateHash}` when the
+      // predicate publicKey can be derived, matching `isSpent`'s key
+      // namespace so cache hits transfer between the two paths.
       if (response.stateHash && spent) {
-        this.cacheSpent(response.stateHash);
+        const pubkeyHex = await this.derivePredicatePublicKeyHex(sdkToken);
+        const cacheKey =
+          pubkeyHex !== null
+            ? `${pubkeyHex}:${response.stateHash}`
+            : response.stateHash;
+        this.cacheSpent(cacheKey);
       }
 
       return {
@@ -581,6 +607,33 @@ export class UnicityAggregatorProvider implements OracleProvider {
         error: error instanceof Error ? error.message : String(error),
       };
     }
+  }
+
+  /**
+   * Issue #245 #5 — derive the hex-encoded publicKey from a parsed
+   * SDK Token's current state predicate. Best-effort; returns `null`
+   * when the predicate is missing or cannot be materialized.
+   *
+   * Same recipe as PaymentsModule's
+   * `extractCurrentStatePublicKeyHexFromSdkData` but operates on an
+   * already-parsed `SdkToken` (validateToken parses once and shares).
+   */
+  private async derivePredicatePublicKeyHex(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    sdkToken: any,
+  ): Promise<string | null> {
+    if (sdkToken === null || sdkToken === undefined) return null;
+    const statePredicate = sdkToken?.state?.predicate;
+    if (statePredicate === undefined || statePredicate === null) return null;
+    let predicate;
+    try {
+      predicate = await PredicateEngineService.createPredicate(statePredicate);
+    } catch {
+      return null;
+    }
+    const pubkey = (predicate as unknown as { publicKey?: Uint8Array }).publicKey;
+    if (!(pubkey instanceof Uint8Array) || pubkey.length === 0) return null;
+    return bytesToHex(pubkey);
   }
 
   /**
@@ -844,15 +897,23 @@ export class UnicityAggregatorProvider implements OracleProvider {
     // ambiguous — treat as "no proof yet" (unspent) rather than
     // throwing, matching the legacy isSpent's tolerant default but
     // KEEPING the fail-closed throw contract for transport errors.
+    //
+    // Issue #245 #4 — tighten the spent decision. Per the canonical
+    // aggregator contract, `transactionHash` is either a non-empty
+    // string hex (path-inclusion proof → spent) or null/undefined
+    // (path-non-inclusion → unspent). A misbehaving aggregator that
+    // returns `transactionHash: { unexpected: 'shape' }` would slip
+    // past a bare `!== null && !== undefined` check and be classified
+    // as spent. Require the canonical shape: non-empty string.
     const proof = (response.inclusionProof ?? response.proof) as
-      | { transactionHash?: string | null }
+      | { transactionHash?: unknown }
+      | null
       | undefined;
-    const spent =
-      proof !== undefined &&
-      proof !== null &&
-      typeof proof === 'object' &&
-      proof.transactionHash !== null &&
-      proof.transactionHash !== undefined;
+    let spent = false;
+    if (proof !== undefined && proof !== null && typeof proof === 'object') {
+      const txHash = (proof as { transactionHash?: unknown }).transactionHash;
+      spent = typeof txHash === 'string' && txHash.length > 0;
+    }
 
     // Cache result (Wave L: bounded with LRU eviction)
     if (spent) {

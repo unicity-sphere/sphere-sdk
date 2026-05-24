@@ -101,9 +101,16 @@ import { redactCause } from '../../../core/errors';
  * `isSpent`. Threaded as a provider closure (mirrors the verifier's
  * pattern) so the worker observes hot-swaps and uninstalls without
  * holding a dangling reference past `Sphere.destroy()`.
+ *
+ * Issue #245 #1 — the callback receives the full `Token` so the
+ * wrapper at the PaymentsModule boundary can derive the predicate's
+ * actual publicKey from `token.sdkData` (the canonical aggregator
+ * indexes commitments by `RequestId.create(predicatePublicKey, hash)`).
+ * Wrapping the wallet's `chainPubkey` for every token misses spent
+ * states whose predicate was constructed under a different key.
  */
 export type SpentStateOracleProvider = () => {
-  readonly isSpent: (stateHash: string) => Promise<boolean>;
+  readonly isSpent: (token: Token, stateHash: string) => Promise<boolean>;
 } | null;
 
 /**
@@ -474,7 +481,10 @@ export class SpentStateRescanWorker {
   ): Promise<'spent' | 'unspent' | 'threw'> {
     let isSpent: boolean;
     try {
-      isSpent = await oracle.isSpent(stateHash);
+      // Issue #245 #1 — pass the token so the wrapper can derive the
+      // current state's predicate publicKey (canonical aggregator
+      // requestId basis). See SpentStateOracleProvider for rationale.
+      isSpent = await oracle.isSpent(token, stateHash);
     } catch (err) {
       this.recordThrow(token.id);
       this.warn('oracle.isSpent threw; bumping per-token throw counter', {

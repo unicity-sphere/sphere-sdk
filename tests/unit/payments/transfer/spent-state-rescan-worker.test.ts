@@ -79,7 +79,10 @@ function makeToken(overrides: Partial<Token> = {}): Token {
 }
 
 interface FakeOracle {
-  readonly isSpent: (stateHash: string) => Promise<boolean>;
+  // Issue #245 #1 — isSpent receives the token so callers can derive
+  // per-token publicKey from token.sdkData (the PaymentsModule wrapper
+  // does this). Test fakes ignore the token and key on stateHash only.
+  readonly isSpent: (token: Token, stateHash: string) => Promise<boolean>;
   readonly calls: () => ReadonlyArray<string>;
 }
 
@@ -98,7 +101,7 @@ function makeOracle(
       };
   return {
     calls: () => calls,
-    async isSpent(stateHash: string): Promise<boolean> {
+    async isSpent(_token: Token, stateHash: string): Promise<boolean> {
       calls.push(stateHash);
       const o = resolve(stateHash);
       if (o instanceof Error) throw o;
@@ -471,7 +474,7 @@ describe('SpentStateRescanWorker — outcomes (Issue #174)', () => {
     const tokens = [makeToken({ id: 't1' })];
     let throwNext = true;
     const oracle = {
-      isSpent: vi.fn(async (_sh: string) => {
+      isSpent: vi.fn(async (_token: Token, _sh: string) => {
         if (throwNext) throw new Error('flake');
         return false;
       }),
@@ -517,7 +520,7 @@ describe('SpentStateRescanWorker — concurrency cap (Issue #174)', () => {
     let inFlight = 0;
     let peak = 0;
     const oracle = {
-      isSpent: async (_sh: string): Promise<boolean> => {
+      isSpent: async (_token: Token, _sh: string): Promise<boolean> => {
         inFlight += 1;
         if (inFlight > peak) peak = inFlight;
         // Yield so we can observe concurrent in-flights.
@@ -620,7 +623,7 @@ describe('SpentStateRescanWorker — lifecycle (Issue #174)', () => {
   it('stop() awaits in-flight scan cycle', async () => {
     let resolveProbe: ((v: boolean) => void) | null = null;
     const oracle = {
-      isSpent: (_sh: string): Promise<boolean> =>
+      isSpent: (_token: Token, _sh: string): Promise<boolean> =>
         new Promise<boolean>((r) => {
           resolveProbe = r;
         }),

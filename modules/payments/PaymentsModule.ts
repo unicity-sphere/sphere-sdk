@@ -248,7 +248,7 @@ function isUxfV1Payload(value: unknown): value is UxfV1Payload {
 }
 import { parseInvoiceMemoForOnChain } from '../accounting/memo.js';
 import { sha256 } from '@noble/hashes/sha2.js';
-import { hexToBytes as fromHex } from '../../core/hex';
+import { hexToBytes as fromHex, bytesToHex } from '../../core/hex';
 // `profile/types` is a pure types + constants module with zero runtime
 // dependencies — safe to import statically in every build. The previous
 // dynamic import was motivated by a bundle-size concern that didn't apply
@@ -768,6 +768,68 @@ function extractTokenIdFromSdkData(sdkData: string | undefined): string | null {
 function extractStateHashFromSdkData(sdkData: string | undefined): string {
   if (!sdkData) return '';
   return parseSdkDataCached(sdkData).stateHash;
+}
+
+/**
+ * Issue #245 #1 — extract the hex-encoded publicKey of the CURRENT
+ * state's predicate from a token's TXF sdkData.
+ *
+ * Why: the canonical aggregator indexes commitments by
+ * `requestId = SHA256(publicKey || stateHash)` where publicKey is
+ * the OWNER of the source state being consumed. Callers that probe
+ * `oracle.isSpent(publicKey, stateHash)` MUST pass the predicate's
+ * actual publicKey — not the wallet's `chainPubkey` — otherwise the
+ * derived requestId misses for tokens whose state.predicate was
+ * constructed under a foreign or non-current key (sync race,
+ * migration data, multi-address wallets where the worker runs
+ * against address A while the token's predicate was constructed
+ * under address B).
+ *
+ * Returns the hex-encoded publicKey, or `null` if the predicate
+ * cannot be parsed. Callers SHOULD fall back to `chainPubkey` on
+ * `null` so the probe still happens (preserves legacy behaviour for
+ * wallet-owned tokens with non-parseable predicates).
+ *
+ * Best-effort and async — does one SDK Token parse + one
+ * PredicateEngineService.createPredicate. Safe to call on the hot
+ * path: each parse is bounded by a small cache (the SDK's internal
+ * fromJSON caching) and the wrapper falls back to `chainPubkey` on
+ * any throw.
+ */
+async function extractCurrentStatePublicKeyHexFromSdkData(
+  sdkData: string | undefined,
+): Promise<string | null> {
+  if (!sdkData) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(sdkData);
+  } catch {
+    return null;
+  }
+  let sdkTokenInstance;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    sdkTokenInstance = await SdkToken.fromJSON(parsed as any);
+  } catch {
+    return null;
+  }
+  if (!sdkTokenInstance?.state?.predicate) return null;
+  let predicate;
+  try {
+    predicate = await PredicateEngineService.createPredicate(
+      sdkTokenInstance.state.predicate,
+    );
+  } catch {
+    return null;
+  }
+  // DefaultPredicate / MaskedPredicate / UnmaskedPredicate all expose
+  // `publicKey: Uint8Array`. The IPredicate interface doesn't declare
+  // it, so narrow via runtime check + cast (matches the recipe at
+  // `recoverStrandedReceivedTokens`, line ~8979).
+  const pubkey = (predicate as unknown as { publicKey?: Uint8Array })
+    .publicKey;
+  if (!(pubkey instanceof Uint8Array) || pubkey.length === 0) return null;
+  return bytesToHex(pubkey);
 }
 
 /**
@@ -2211,26 +2273,35 @@ export class PaymentsModule {
       const rescanDeps: SpentStateRescanWorkerDeps = {
         tokensProvider: (): Iterable<Token> => this.tokens.values(),
         oracleProvider: (): {
-          readonly isSpent: (stateHash: string) => Promise<boolean>;
+          readonly isSpent: (token: Token, stateHash: string) => Promise<boolean>;
         } | null => {
-          // Issue #243 — wallet-scoped wrapper around oracle.isSpent.
-          // The underlying OracleProvider.isSpent now requires
-          // `(publicKey, stateHash)` (the canonical aggregator API
-          // indexes commitments by `RequestId.create(pubkey, hash)`).
-          // The worker only knows the stateHash, so we bind the
-          // active wallet's `chainPubkey` here — correct for any
-          // token in `this.tokens` because the worker scans the
-          // current address's holdings and our predicate's pubkey
-          // gates spending the current state.
+          // Issue #243 / #245 #1 — wallet-scoped wrapper around
+          // oracle.isSpent. The underlying OracleProvider.isSpent
+          // requires `(publicKey, stateHash)` because the canonical
+          // aggregator indexes commitments by
+          // `RequestId.create(pubkey, hash)`.
+          //
+          // Per-token publicKey extraction: parse the token's CURRENT
+          // state predicate from `sdkData` and use ITS publicKey,
+          // falling back to `chainPubkey` on parse failure. Binding
+          // `chainPubkey` for every token misses spent states whose
+          // predicate was constructed under a different key (sync
+          // race / migration data / multi-address wallets where the
+          // worker scans address A's pool but a token's predicate
+          // was built under address B).
           const oracle = this.deps?.oracle;
           if (oracle === undefined || typeof oracle.isSpent !== 'function') {
             return null;
           }
-          const ownerPubkey = this.deps?.identity?.chainPubkey;
-          if (!ownerPubkey) return null;
+          const fallbackPubkey = this.deps?.identity?.chainPubkey;
+          if (!fallbackPubkey) return null;
           return {
-            isSpent: (stateHash: string): Promise<boolean> =>
-              oracle.isSpent(ownerPubkey, stateHash),
+            isSpent: async (token: Token, stateHash: string): Promise<boolean> => {
+              const ownerPubkey =
+                (await extractCurrentStatePublicKeyHexFromSdkData(token.sdkData)) ??
+                fallbackPubkey;
+              return oracle.isSpent(ownerPubkey, stateHash);
+            },
           };
         },
         extractCurrentStateHash: (token: Token): string =>
@@ -3970,12 +4041,17 @@ export class PaymentsModule {
     }
     let aggregatorRecordsSpent: boolean;
     try {
-      // Issue #243 — pass owner pubkey alongside stateHash. The token
-      // is in this wallet's active set (orphan recovery only fires
-      // for our own locally-stranded tokens), so `chainPubkey` is the
-      // correct predicate owner for the requestId derivation.
+      // Issue #243 / #245 #1 — pass owner pubkey alongside stateHash.
+      // Prefer the publicKey embedded in the token's CURRENT state
+      // predicate (canonical aggregator requestId basis). Fall back
+      // to `chainPubkey` when the predicate cannot be parsed —
+      // matches the legacy assumption that orphan recovery only fires
+      // for our own locally-stranded tokens.
+      const ownerPubkey =
+        (await extractCurrentStatePublicKeyHexFromSdkData(token.sdkData)) ??
+        this.deps!.identity.chainPubkey;
       aggregatorRecordsSpent = await this.deps!.oracle.isSpent(
-        this.deps!.identity.chainPubkey,
+        ownerPubkey,
         sourceStateHash,
       );
     } catch (oracleErr) {
@@ -14119,20 +14195,35 @@ export class PaymentsModule {
     // commit" from generic failures via an authoritative oracle
     // re-query against the source state hash.
     //
-    // Issue #243 — pass owner pubkey alongside stateHash. The source
-    // state we just tried to consume was guarded by OUR predicate
-    // (we constructed the commitment), so the requestId the aggregator
-    // indexed under is derived from `chainPubkey` + the source state.
+    // Issue #243 / #245 #1 — pass owner pubkey alongside stateHash.
+    // Derive the publicKey from the commitment's actual source-state
+    // predicate (the canonical aggregator requestId basis). The
+    // commitment we constructed carries the source-state predicate
+    // directly, so this is more precise than wrapping `chainPubkey`
+    // (which is wrong for multi-address wallets where the source
+    // predicate was built under a different address).
     let isSpent = false;
     let sourceStateHashHex: string | null = null;
     if (oracle !== undefined && typeof oracle.isSpent === 'function') {
       try {
         const sourceStateHashObj = await commitment.transactionData.sourceState.calculateHash();
         sourceStateHashHex = sourceStateHashObj.toJSON();
-        isSpent = await oracle.isSpent(
-          this.deps!.identity.chainPubkey,
-          sourceStateHashHex,
-        );
+        // Best-effort predicate-publicKey extraction. The fallback to
+        // `chainPubkey` preserves the legacy assumption for wallet-
+        // owned source states; a partial / mocked commitment without
+        // a `.predicate` field must NOT skip the isSpent probe.
+        let ownerPubkey: string = this.deps!.identity.chainPubkey;
+        const sourceState = commitment.transactionData.sourceState as
+          | { predicate?: unknown }
+          | undefined;
+        const sourcePredicate = sourceState?.predicate;
+        if (sourcePredicate !== undefined && sourcePredicate !== null) {
+          const pubkeyBytes = (sourcePredicate as { publicKey?: unknown }).publicKey;
+          if (pubkeyBytes instanceof Uint8Array && pubkeyBytes.length > 0) {
+            ownerPubkey = bytesToHex(pubkeyBytes);
+          }
+        }
+        isSpent = await oracle.isSpent(ownerPubkey, sourceStateHashHex);
       } catch (probeErr) {
         // The probe is best-effort. If it throws (e.g. aggregator
         // offline), we fall through to the generic

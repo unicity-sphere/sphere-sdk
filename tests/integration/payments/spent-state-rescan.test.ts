@@ -187,7 +187,10 @@ function makeAuditRecorder(): AuditRecorder {
 function buildWorker(args: {
   readonly peer: Peer;
   readonly tokens: ReadonlyArray<Token>;
-  readonly isSpent: (stateHash: string) => Promise<boolean>;
+  // Issue #245 #1 — isSpent now receives the token (so the
+  // PaymentsModule wrapper can derive per-token publicKey). Tests
+  // ignore the token and key on stateHash only.
+  readonly isSpent: (token: Token, stateHash: string) => Promise<boolean>;
   readonly audit: AuditRecorder;
   readonly emit: SpentStateRescanWorkerDeps['emit'];
 }): SpentStateRescanWorker {
@@ -362,7 +365,7 @@ describe('SpentStateRescanWorker — integration with real OUTBOX/SENT writers (
     const worker = buildWorker({
       peer,
       tokens,
-      isSpent: async (stateHash: string): Promise<boolean> => {
+      isSpent: async (_token: Token, stateHash: string): Promise<boolean> => {
         if (stateHash === 'state-tok-spent') return true;
         if (stateHash === 'state-tok-unspent') return false;
         throw new Error(`unexpected stateHash: ${stateHash}`);
