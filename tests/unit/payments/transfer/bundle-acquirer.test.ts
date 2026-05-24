@@ -850,6 +850,18 @@ describe('acquireBundle — negative LRU skips transient errors (Round 3)', () =
     let attempts = 0;
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(
       async (input: string | URL | Request) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        // Issue #255 Problem B / ipfs-storage#7 — fetchFromIpfs now
+        // probes `/sidecar/blob?cid=<cid>` once per call before the
+        // /api/v0/block/get path. Treat it as an instant miss here
+        // (no sidecar in this test fixture) WITHOUT incrementing the
+        // attempts counter — the test's transient-vs-recovered
+        // simulation depends on a specific number of block/get
+        // attempts, and we don't want the probe to consume a budget
+        // slot.
+        if (url.includes('/sidecar/blob')) {
+          return new Response('not in sidecar cache', { status: 404 });
+        }
         attempts++;
         // Network blip on the first 2 attempts — the block-walk's
         // gateway fallback exhausts both gateways and throws on the
@@ -858,7 +870,6 @@ describe('acquireBundle — negative LRU skips transient errors (Round 3)', () =
           return new Response('upstream blip', { status: 503 });
         }
         // Recovered: serve per-block via /api/v0/block/get?arg=<cid>.
-        const url = typeof input === 'string' ? input : input.toString();
         const m = /\/api\/v0\/block\/get\?arg=([^&]+)/.exec(url);
         if (!m) return new Response('', { status: 404 });
         const cid = decodeURIComponent(m[1]!);
