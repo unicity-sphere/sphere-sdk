@@ -97,5 +97,6 @@ export { ProfilePointerLayer } from './ProfilePointerLayer.js';
 export type {
   ProfilePointerLayerInit,
   PublishResult,
+  ReconcileDownwardResult,
   RecoverResult,
 } from './ProfilePointerLayer.js';
