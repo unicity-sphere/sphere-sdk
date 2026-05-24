@@ -153,6 +153,30 @@ export class NostrTransportProvider implements TransportProvider {
   private typingIndicatorHandlers: Set<TypingIndicatorHandler> = new Set();
   private composingHandlers: Set<ComposingHandler> = new Set();
   private pendingMessages: IncomingMessage[] = [];
+  /**
+   * Issue #247 — buffer for TOKEN_TRANSFER events that arrive on this
+   * outer provider before any handler is registered. The pre-Mux race
+   * (#223 comment in `handleTokenTransfer`) sees relay events landing
+   * here while `PaymentsModule` has registered its handler on the
+   * AddressTransportAdapter, not on this provider. Without a buffer,
+   * the events are dropped (allDurable=false → since-not-advanced) and
+   * the only recovery is replay-on-reconnect — producing the persistent
+   * "TOKEN_TRANSFER ... not durable" storm observed in
+   * manual-test-full-recovery.sh.
+   *
+   * Buffered transfers are drained when a handler registers via
+   * `onTokenTransfer` (in-session catch-up). If the process exits
+   * before any handler registers, `lastEventTs` was not advanced and
+   * the events replay on next reconnect — preserving at-least-once.
+   *
+   * Each entry retains the original event's `created_at` (seconds) so
+   * the drain can advance `lastEventTs` per-event on successful
+   * delivery.
+   */
+  private pendingTransfers: Array<{
+    readonly transfer: IncomingTokenTransfer;
+    readonly createdAtSec: number;
+  }> = [];
   private broadcastHandlers: Map<string, Set<BroadcastHandler>> = new Map();
   private eventCallbacks: Set<TransportEventCallback> = new Set();
 
@@ -731,6 +755,49 @@ export class NostrTransportProvider implements TransportProvider {
 
   onTokenTransfer(handler: TokenTransferHandler): () => void {
     this.transferHandlers.add(handler);
+
+    // Issue #247 — drain any TOKEN_TRANSFER events that arrived BEFORE
+    // this handler was registered (the pre-Mux window race documented
+    // in `handleTokenTransfer`). Buffer is snapshotted and cleared
+    // atomically before the (async) handler calls — events arriving
+    // during the drain take the live path (`transferHandlers.size > 0`
+    // is true now) and won't double-buffer.
+    //
+    // Per-event durability propagation: if the handler returns truthy
+    // (or undefined), advance `lastEventTs` so the event doesn't
+    // re-replay on next reconnect. If the handler returns `false` or
+    // throws, leave `lastEventTs` alone — the event replays normally.
+    //
+    // Fire-and-forget the drain so onTokenTransfer remains synchronous
+    // (its existing contract). Errors are logged at debug; the drain
+    // is best-effort and re-replay covers any losses.
+    if (this.pendingTransfers.length > 0) {
+      const pending = this.pendingTransfers;
+      this.pendingTransfers = [];
+      logger.debug(
+        'Nostr',
+        `Flushing ${pending.length} buffered TOKEN_TRANSFER event(s) to new handler`,
+      );
+      void (async () => {
+        for (const { transfer, createdAtSec } of pending) {
+          try {
+            const result = await handler(transfer);
+            // `undefined` is the legacy "no opinion" contract → durable.
+            if (result !== false) {
+              this.updateLastEventTimestamp(createdAtSec);
+            } else {
+              logger.debug(
+                'Nostr',
+                `Buffered TOKEN_TRANSFER drain handler returned false — leaving since at ${this.lastEventTs}`,
+              );
+            }
+          } catch (error) {
+            logger.debug('Nostr', 'Buffered transfer handler error:', error);
+          }
+        }
+      })();
+    }
+
     return () => this.transferHandlers.delete(handler);
   }
 
@@ -1765,18 +1832,35 @@ export class NostrTransportProvider implements TransportProvider {
     // `true` (durable) so existing wrappers do not regress to
     // "never ack".
     //
-    // Issue #223 — the pre-Mux window (between `transport.connect()` and
-    // `mux.suppressSubscriptions()` in Sphere.ensureTransportMux) leaves
-    // this provider's own subscription live while PaymentsModule has
-    // registered its handler on the *AddressTransportAdapter*, not on
-    // the outer provider. An empty `transferHandlers` set previously
-    // produced a vacuous `allDurable = true`, which advanced
-    // `lastEventTs` to the event's created_at — poisoning the next
-    // process's `since` filter (the relay would still re-deliver because
-    // NIP-01 `since` is inclusive, but only by accident). Treat an
-    // empty handler set as non-durable so the at-least-once invariant
-    // forces the event to re-replay until somebody actually persists it.
-    let allDurable = this.transferHandlers.size > 0;
+    // Issue #223 / #247 — the pre-Mux window (between
+    // `transport.connect()` and `mux.suppressSubscriptions()` in
+    // Sphere.ensureTransportMux) leaves this provider's own subscription
+    // live while PaymentsModule has registered its handler on the
+    // *AddressTransportAdapter*, not on the outer provider. An empty
+    // `transferHandlers` set previously produced a vacuous
+    // `allDurable = true`, which advanced `lastEventTs` and silently
+    // dropped the event; the issue #223 fix flipped it to `false`,
+    // which produced the persistent "TOKEN_TRANSFER ... not durable"
+    // replay storm observed in manual-test-full-recovery.sh.
+    //
+    // Issue #247 fix: buffer the transfer for delivery to the FIRST
+    // handler that registers (`onTokenTransfer` drains the buffer).
+    // Still return `false` to keep `lastEventTs` pinned — if this
+    // process exits before any handler registers, the event must
+    // replay on next reconnect. The drain advances `lastEventTs`
+    // per-event on successful delivery, so a handler that arrives
+    // later in the same session avoids the replay.
+    if (this.transferHandlers.size === 0) {
+      this.pendingTransfers.push({ transfer, createdAtSec: event.created_at });
+      logger.debug(
+        'Nostr',
+        `Buffered TOKEN_TRANSFER ${event.id?.slice(0, 12)} — no handler registered yet ` +
+          `(buffer size=${this.pendingTransfers.length})`,
+      );
+      return false;
+    }
+
+    let allDurable = true;
     for (const handler of this.transferHandlers) {
       try {
         const result = await handler(transfer);
