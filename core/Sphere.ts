@@ -2586,6 +2586,17 @@ export class Sphere {
           // wired across nametag-driven re-initialization.
           publishToIpfs: this._publishToIpfs ?? undefined,
           cidFetchGateways: this._cidFetchGateways ?? undefined,
+          // Issue #255 Problem A — re-thread HD-index recovery hooks on
+          // nametag-driven re-init so per-address PaymentsModule
+          // instances keep the recovery surface alive after identity
+          // updates.
+          ...(this._masterKey
+            ? {
+                deriveAddressInfo: (idx: number) =>
+                  this._deriveAddressInternal(idx, false),
+                getActiveAddresses: () => this._getActiveAddressesInternal(),
+              }
+            : {}),
         });
       }
     }
@@ -2789,6 +2800,16 @@ export class Sphere {
       // all addresses; the publisher is identity-independent).
       publishToIpfs: this._publishToIpfs ?? undefined,
       cidFetchGateways: this._cidFetchGateways ?? undefined,
+      // Issue #255 Problem A — HD-index recovery hooks for
+      // finalizeTransferToken. See initializeModules() above for full
+      // rationale.
+      ...(this._masterKey
+        ? {
+            deriveAddressInfo: (idx: number) =>
+              this._deriveAddressInternal(idx, false),
+            getActiveAddresses: () => this._getActiveAddressesInternal(),
+          }
+        : {}),
     });
 
     communications.initialize({
@@ -5211,6 +5232,17 @@ export class Sphere {
       // (under cap) or rejects (over cap / force-cid).
       publishToIpfs: this._publishToIpfs ?? undefined,
       cidFetchGateways: this._cidFetchGateways ?? undefined,
+      // Issue #255 Problem A — HD-index recovery hooks for
+      // finalizeTransferToken. Only wired when a master key is
+      // available (HD derivation requires it); without it,
+      // finalize keeps single-identity behavior.
+      ...(this._masterKey
+        ? {
+            deriveAddressInfo: (idx: number) =>
+              this._deriveAddressInternal(idx, false),
+            getActiveAddresses: () => this._getActiveAddressesInternal(),
+          }
+        : {}),
     });
 
     this._communications.initialize({
