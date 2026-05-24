@@ -172,6 +172,32 @@ describe('ProfileTokenStorageProvider.publishSnapshotIfWired — happy path', ()
     // Callers (FlushScheduler) treat this as "publish failed but no
     // retry would help" — storage:saved still fires, no throw.
   });
+
+  it('returns a transient failure result intact without throwing (issue #241 — gate rides on pin durability)', async () => {
+    // Issue #241: prior to the decoupling, runProfileDirtyFlush threw on
+    // transient results so the at-least-once gate stayed closed. Now the
+    // factory returns the structured result; the upstream FlushScheduler
+    // emits `storage:pending-publish` and the gate advances based on the
+    // bundle CAR's IPFS pin durability (verifyFlushDurability) — which
+    // IS the cross-device recoverability invariant.
+    const result: ProfileSnapshotPublishResult = {
+      ok: false,
+      transient: true,
+      code: 'AGGREGATOR_POINTER_WALKBACK_FLOOR',
+    };
+    const onProfileDirtyFlush = vi.fn(async () => result);
+    const provider = buildProvider({ onProfileDirtyFlush });
+    const errors: StorageEvent[] = [];
+    provider.onEvent((event) => {
+      if (event.type === 'storage:error') errors.push(event);
+    });
+    const got = await provider.publishSnapshotIfWired();
+    expect(got).toEqual(result);
+    // No terminal error event for a transient publish — the soft
+    // `storage:pending-publish` is emitted at the FlushScheduler layer
+    // (see profile/profile-token-storage/flush-scheduler.ts).
+    expect(errors).toHaveLength(0);
+  });
 });
 
 describe('ProfileTokenStorageProvider.publishSnapshotIfWired — error propagation', () => {
@@ -198,19 +224,22 @@ describe('ProfileTokenStorageProvider.publishSnapshotIfWired — error propagati
     expect(errors[0]?.code).toBe('PROFILE_DIRTY_FLUSH_FAILED');
   });
 
-  it('re-throws a transient publish failure (runProfileDirtyFlush-style throw) intact', async () => {
-    // Mirrors `runProfileDirtyFlush` behaviour when the underlying
-    // `publishCid` returns `{ ok: false, transient: true }` — the
-    // factory closure throws with a "transient failure" message that
-    // FlushScheduler propagates to forceFlushSerialized.
+  it('re-throws when the callback itself throws (programmer error / snapshot build failure)', async () => {
+    // Issue #241: `runProfileDirtyFlush` no longer throws on a
+    // transient publishCid result — it returns the structured result
+    // intact (so FlushScheduler can emit `storage:pending-publish`
+    // instead of closing the at-least-once gate). This test stays as
+    // a contract guard for OTHER throw classes: a callback that
+    // throws (programmer error, snapshot build failure, etc.) MUST
+    // still propagate through `publishSnapshotIfWired` unchanged.
     const onProfileDirtyFlush = vi.fn(async () => {
       throw new Error(
-        'dirty-flush publish transient failure (cid=...); code=NETWORK_ERROR',
+        'snapshot build failed: simulated programmer error',
       );
     });
     const provider = buildProvider({ onProfileDirtyFlush });
     await expect(provider.publishSnapshotIfWired()).rejects.toThrow(
-      /transient failure.*NETWORK_ERROR/,
+      /snapshot build failed/,
     );
   });
 });

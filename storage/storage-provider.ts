@@ -297,7 +297,42 @@ export type StorageEventType =
    * informational so operators can investigate cross-process recovery
    * gaps. Skipped when `Sphere.destroy({ force: true })` is used.
    */
-  | 'shutdown:verification-timeout';
+  | 'shutdown:verification-timeout'
+  /**
+   * Issue #241 — emitted when the aggregator pointer publish path
+   * returns a TRANSIENT failure for a just-flushed bundle. The flush
+   * itself succeeded (CAR pinned + bundle ref written + pin verified
+   * fetchable), but the aggregator publish stamped `pendingPublishCid`
+   * for retry. `data` carries `{ cid, code? }` — `cid` is the bundle
+   * CID and `code` is the pointer-layer error code when classifiable
+   * (e.g., `AGGREGATOR_POINTER_WALKBACK_FLOOR`, `NETWORK_ERROR`).
+   *
+   * Distinct from `storage:error` (which is a fatal-class signal). A
+   * pending-publish event tells the operator that the local state is
+   * durable AND cross-device readers via OrbitDB sync will see the new
+   * state, but COLD-IMPORT discovery (a fresh device with only the
+   * master key) will read the previous pointer version until the
+   * retry succeeds. The retry happens automatically on the next flush
+   * or pointer poll.
+   */
+  | 'storage:pending-publish'
+  /**
+   * Issue #241 — emitted when discovery / publish observes the
+   * aggregator's read replica lagging behind a version the wallet has
+   * already locally confirmed. Concretely: Phase 3 walkback returns
+   * `AGGREGATOR_POINTER_WALKBACK_FLOOR` after the
+   * `WALKBACK_FLOOR_RETRY_BUDGET` exponential-backoff window
+   * (~15s) without the replica catching up. `data` carries
+   * `{ localVersion, cid? }` so operators can correlate with
+   * aggregator-side replication metrics.
+   *
+   * Informational only — the publish path's `pendingPublishCid`
+   * marker is already stamped (treated as transient), and the
+   * next flush / pointer poll continues to retry. This event lets
+   * operators distinguish "publish stuck on replica lag" from
+   * other transient classes (network errors, etc.).
+   */
+  | 'storage:replica-lag';
 
 export interface StorageEvent {
   type: StorageEventType;
