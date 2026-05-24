@@ -530,3 +530,147 @@ describe('LifecycleManager.publishAggregatorPointerBestEffort — WALKBACK_FLOOR
     }
   });
 });
+
+/**
+ * Issue #247 — concurrent-caller coalescing.
+ *
+ * PR #245's throttle (`walkbackFloorThrottleUntilMs`) arms the
+ * throttle window only AFTER `pointer.publish()` resolves. Concurrent
+ * callers (flushScheduler.publishSnapshotIfWired + debounced
+ * dispatchDirtyFlush + retryPendingPublishIfAny from runPointerPollOnce)
+ * all pass the entry check before any catch arm fires — all proceed
+ * to call `pointer.publish()`, all fail, all 6+ print the same WARN
+ * line. The throttle only stops sequential bursts.
+ *
+ * The fix coalesces parallel callers onto an in-flight publish via
+ * `walkbackPublishInFlight`: the first caller's publish runs; every
+ * other caller awaiting in the same window returns the same result
+ * WITHOUT calling `pointer.publish` again. Single publish per window.
+ */
+describe('LifecycleManager.publishAggregatorPointerBestEffort — concurrent-caller coalescing (#247)', () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('coalesces parallel WALKBACK_FLOOR publishes onto a single in-flight call', async () => {
+    // Stub publish that takes a measurable time so concurrent callers
+    // have a real window in which to coalesce. Without the artificial
+    // delay, the in-flight promise might already have settled by the
+    // time the second caller's microtask runs.
+    const publish = vi.fn(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+      throw new AggregatorPointerError(
+        AggregatorPointerErrorCode.WALKBACK_FLOOR,
+        'simulated replication lag — Phase 3 walkback below localVersion',
+      );
+    });
+    const pointer = stubPointer({ publish });
+    const handle = await createTestProvider(pointer);
+    try {
+      // 6 parallel calls — mimics the manual-test §C log shape (6+
+      // identical WARN lines per cycle).
+      const results = await Promise.all([
+        handle.lifecycle.publishAggregatorPointerBestEffort(FAKE_CID),
+        handle.lifecycle.publishAggregatorPointerBestEffort(FAKE_CID),
+        handle.lifecycle.publishAggregatorPointerBestEffort(FAKE_CID),
+        handle.lifecycle.publishAggregatorPointerBestEffort(FAKE_CID),
+        handle.lifecycle.publishAggregatorPointerBestEffort(FAKE_CID),
+        handle.lifecycle.publishAggregatorPointerBestEffort(FAKE_CID),
+      ]);
+
+      // pointer.publish was called EXACTLY ONCE despite 6 parallel
+      // callers — the rest coalesced onto the in-flight promise.
+      expect(publish).toHaveBeenCalledOnce();
+
+      // Every caller observes the same transient WALKBACK_FLOOR result.
+      for (const r of results) {
+        expect(r.ok).toBe(false);
+        expect(r.transient).toBe(true);
+        expect(r.code).toBe('AGGREGATOR_POINTER_WALKBACK_FLOOR');
+      }
+
+      // pendingPublishCid is stamped (the catch arm did its work).
+      expect(handle.getPendingPublishCid()).toBe(FAKE_CID);
+
+      // Throttle is now armed — subsequent (sequential) calls
+      // short-circuit on the entry check without calling publish.
+      const followUp = await handle.lifecycle.publishAggregatorPointerBestEffort(FAKE_CID);
+      expect(followUp.transient).toBe(true);
+      expect(followUp.code).toBe('AGGREGATOR_POINTER_WALKBACK_FLOOR');
+      expect(publish).toHaveBeenCalledOnce(); // still 1
+    } finally {
+      await handle.provider.shutdown();
+    }
+  });
+
+  it('coalesces parallel success-path publishes onto a single in-flight call', async () => {
+    // Same coalescing should apply on the happy path — multiple
+    // callers should not each round-trip to the aggregator when one
+    // call would suffice for the same CID.
+    const publish = vi.fn(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+      return { cid: new Uint8Array(0), version: 42, attemptsUsed: 1 } as never;
+    });
+    const pointer = stubPointer({ publish });
+    const handle = await createTestProvider(pointer);
+    try {
+      const results = await Promise.all([
+        handle.lifecycle.publishAggregatorPointerBestEffort(FAKE_CID),
+        handle.lifecycle.publishAggregatorPointerBestEffort(FAKE_CID),
+        handle.lifecycle.publishAggregatorPointerBestEffort(FAKE_CID),
+      ]);
+      expect(publish).toHaveBeenCalledOnce();
+      for (const r of results) {
+        expect(r.ok).toBe(true);
+        expect(r.transient).toBe(false);
+      }
+      expect(handle.getPendingPublishCid()).toBeNull();
+    } finally {
+      await handle.provider.shutdown();
+    }
+  });
+
+  it('releases the in-flight latch so the next call starts fresh', async () => {
+    let nextOutcome: 'success' | 'walkback' = 'walkback';
+    const publish = vi.fn(async () => {
+      if (nextOutcome === 'success') {
+        return { cid: new Uint8Array(0), version: 1, attemptsUsed: 1 } as never;
+      }
+      throw new AggregatorPointerError(
+        AggregatorPointerErrorCode.WALKBACK_FLOOR,
+        'simulated lag',
+      );
+    });
+    const pointer = stubPointer({ publish });
+    const handle = await createTestProvider(pointer);
+    try {
+      // First call: WALKBACK_FLOOR. Latch is released in the finally.
+      await handle.lifecycle.publishAggregatorPointerBestEffort(FAKE_CID);
+      expect(publish).toHaveBeenCalledOnce();
+
+      // Manually clear the throttle so the second call doesn't hit
+      // the entry-check short-circuit.
+      (handle.provider as unknown as {
+        lifecycleManager: { walkbackFloorThrottleUntilMs: number };
+      }).lifecycleManager.walkbackFloorThrottleUntilMs = 0;
+
+      // Second call: starts a fresh publish (latch was cleared).
+      nextOutcome = 'success';
+      const r = await handle.lifecycle.publishAggregatorPointerBestEffort(FAKE_CID);
+      expect(r.ok).toBe(true);
+      expect(publish).toHaveBeenCalledTimes(2);
+
+      // Latch is clear afterwards.
+      const latch = (handle.provider as unknown as {
+        lifecycleManager: { walkbackPublishInFlight: unknown };
+      }).lifecycleManager.walkbackPublishInFlight;
+      expect(latch).toBeNull();
+    } finally {
+      await handle.provider.shutdown();
+    }
+  });
+});

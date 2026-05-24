@@ -368,12 +368,52 @@ tail -n 20 "$PEER2_BOB/events.log"   2>/dev/null || true
 
 banner "§C.4 Peer2 view (NO manual sync)"
 
+# Issue #247 — short-term: stop the peer2 daemons around the CLI
+# assertion. The daemon holds the OrbitDB / Helia directory lock
+# (POSIX advisory lock on LevelDB LOCK files); a sibling CLI in the
+# same dataDir fails with "Database is not open" after the bounded
+# retry budget. The proper fix is the daemon-broker IPC surface
+# (#247 follow-up) so CLIs can talk to a running daemon instead of
+# opening OrbitDB directly. Until then, stop+start preserves the
+# test's intent (verify peer2 saw the events via Nostr) without
+# the lock contention.
+
+cd "$PEER2_ALICE" && sphere daemon stop || true
+cd "$PEER2_BOB"   && sphere daemon stop || true
+sleep 2
+
 cd "$PEER2_ALICE"
 sphere invoice status "$INV" 2>&1 | tee "$SNAP/peer2-alice-invoice-status.log"
 sphere balance               | tee "$SNAP/peer2-alice-postC-balance.txt"
 
 cd "$PEER2_BOB"
 sphere balance               | tee "$SNAP/peer2-bob-postC-balance.txt"
+
+# Restart the daemons so subsequent sections that depend on them
+# (event replay, Nostr listening) keep working.
+cd "$PEER2_ALICE"
+sphere daemon start \
+  --detach \
+  --event 'transfer:incoming' --action auto-receive \
+  --event 'transfer:incoming' --action 'log:./events.log' \
+  --event 'transfer:confirmed' --action 'log:./events.log' \
+  --event 'invoice:payment'    --action 'log:./events.log' \
+  --event 'invoice:covered'    --action 'log:./events.log' \
+  --verbose
+DAEMON_DIRS+=("$PEER2_ALICE")
+sleep 2
+
+cd "$PEER2_BOB"
+sphere daemon start \
+  --detach \
+  --event 'transfer:incoming' --action auto-receive \
+  --event 'transfer:incoming' --action 'log:./events.log' \
+  --event 'transfer:confirmed' --action 'log:./events.log' \
+  --event 'invoice:payment'    --action 'log:./events.log' \
+  --event 'invoice:covered'    --action 'log:./events.log' \
+  --verbose
+DAEMON_DIRS+=("$PEER2_BOB")
+sleep 2
 
 # ---------------------------------------------------------------------------
 # §D — Pre-clear snapshots + wipe + IPFS-only recovery
