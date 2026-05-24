@@ -993,6 +993,214 @@ describe('#144 L3 — balance-model invariant + stranded recovery', () => {
       (ttMod.TransferTransaction.fromJSON as unknown as ReturnType<typeof vi.fn>) = prior as never;
     }
   });
+
+  // Issue #251 — V6-RECOVER previously passed `oracle.getProof`'s wrapper
+  // shape ({requestId, roundNumber, proof, timestamp}) directly as the
+  // inclusionProof patched into the synthetic lastTxJson. The wrapper has
+  // no top-level `merkleTreePath` / `unicityCertificate`, so the SDK's
+  // `InclusionProof.isJSON` rejected it with `InvalidJsonStructureError`
+  // — surfacing as the cross-device finalize loop on peer2-alice in
+  // manual-test-full-recovery.sh §C.4.
+  //
+  // The bug never fired for live receives (in-memory job has
+  // `commitmentJson` → `finalizeReceivedToken` uses `waitForProofSdk`
+  // which returns an SDK instance directly) or same-device restarts
+  // (`restoreProofPollingJobs` rehydrates with `commitmentJson`). It is
+  // gated to the cross-device-sync scenario where peer2 learns the
+  // token via OrbitDB profile-sync without ever holding the commitment
+  // — V6-RECOVER is the only path forward and the inner `getProof`
+  // call is the only proof source.
+  //
+  // This regression asserts the fix unwraps `.proof` from the
+  // OracleProvider's canonical return shape so the SDK accepts the
+  // patched transaction.
+  it('finalizeStrandedReceivedToken unwraps OracleProvider wrapper to canonical SDK proof shape (issue #251)', async () => {
+    const sdkData = makeV6DirectReceiveSdkData();
+    const token: Token = {
+      id: GENESIS_TOKEN_ID,
+      coinId: 'UCT_HEX',
+      symbol: 'UCT',
+      amount: '100',
+      status: 'pending',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      sdkData,
+    };
+    internals(module).tokens.set(token.id, token);
+
+    // Canonical SDK shape buried under the wrapper's `.proof` field —
+    // mirrors UnicityAggregatorProvider.getProof's real return.
+    const innerSdkProof = {
+      merkleTreePath: { steps: [], rootHash: '00' },
+      authenticator: { publicKey: '02', signature: '00', stateHash: '00' },
+      transactionHash: '00deadbeef',
+      unicityCertificate: { certHash: '00', signers: [] },
+    };
+    (setup.deps.oracle as { getProof: ReturnType<typeof vi.fn> }).getProof =
+      vi.fn().mockResolvedValue({
+        requestId: '00deadbeef',
+        roundNumber: 42,
+        proof: innerSdkProof,
+        timestamp: Date.now(),
+      });
+
+    // Capture what TransferTransaction.fromJSON sees so we can assert
+    // the unwrap happened before the SDK boundary.
+    const ttMod = await import(
+      '@unicitylabs/state-transition-sdk/lib/transaction/TransferTransaction'
+    );
+    const captured: Array<unknown> = [];
+    const prior = ttMod.TransferTransaction.fromJSON;
+    (ttMod.TransferTransaction.fromJSON as unknown as ReturnType<typeof vi.fn>) = vi
+      .fn()
+      .mockImplementation(async (input: unknown) => {
+        captured.push(input);
+        // Returning {} is enough — finalizeStrandedReceivedToken only
+        // needs the value to pass through to finalizeTransferToken,
+        // which is mocked higher up.
+        return {};
+      });
+
+    // Stub the rest of the finalize path so the test isolates the
+    // proof-unwrap behavior. `finalizeTransferToken` is the next call
+    // after fromJSON succeeds; mocking it to return a minimal SDK
+    // token-shaped object lets the code reach the save() boundary.
+    (module as unknown as {
+      finalizeTransferToken: (...args: unknown[]) => Promise<unknown>;
+    }).finalizeTransferToken = vi.fn().mockResolvedValue({
+      toJSON: () => ({ genesis: { data: { tokenId: GENESIS_TOKEN_ID } } }),
+    });
+    // Source-token parse — SdkToken.fromJSON is module-mocked at the top
+    // to return a minimal shape, so we don't need to override it.
+
+    try {
+      const lastTxJson = {
+        previousStateHash: STATE_HASH,
+        predicate: 'pred2',
+        data: { sourceState: {}, recipient: 'DIRECT://x', salt: '00', recipientDataHash: null, message: null, nametags: [] },
+      };
+      const sourceTokenJson = JSON.stringify({ genesis: { data: { tokenId: GENESIS_TOKEN_ID } } });
+      internals(module).proofPollingJobs.set(GENESIS_TOKEN_ID, {
+        tokenId: GENESIS_TOKEN_ID,
+        requestIdHex: '00deadbeef',
+        commitmentJson: '',
+        sourceTokenJson,
+        startedAt: Date.now(),
+        attemptCount: 0,
+        lastAttemptAt: 0,
+      });
+
+      await (module as unknown as {
+        finalizeStrandedReceivedToken: (
+          tokenId: string,
+          sourceTokenJson: string,
+          lastTxJson: Record<string, unknown>,
+        ) => Promise<void>;
+      }).finalizeStrandedReceivedToken(GENESIS_TOKEN_ID, sourceTokenJson, lastTxJson);
+
+      // The SDK call must have received the UNWRAPPED canonical shape
+      // patched into the lastTxJson's inclusionProof slot — NOT the
+      // OracleProvider wrapper.
+      expect(captured.length).toBe(1);
+      const patched = captured[0] as { inclusionProof?: Record<string, unknown> };
+      expect(patched.inclusionProof).toBeDefined();
+      expect(patched.inclusionProof).toEqual(innerSdkProof);
+      // Pre-fix this would have been the wrapper:
+      expect(patched.inclusionProof).not.toHaveProperty('roundNumber');
+      expect(patched.inclusionProof).not.toHaveProperty('requestId');
+      expect(patched.inclusionProof).toHaveProperty('merkleTreePath');
+      expect(patched.inclusionProof).toHaveProperty('unicityCertificate');
+
+      // No structural failure means no operator alert and the token
+      // does NOT get marked invalid on the first try.
+      const alerts = setup.emittedEvents.filter(
+        (e) => e.type === 'transfer:operator-alert',
+      );
+      expect(alerts.length).toBe(0);
+      expect(internals(module).tokens.get(GENESIS_TOKEN_ID)?.status).toBe('confirmed');
+    } finally {
+      (ttMod.TransferTransaction.fromJSON as unknown as ReturnType<typeof vi.fn>) = prior as never;
+    }
+  });
+
+  // Steelman finding (PR #252 review): the OracleProvider interface
+  // declares `proof: unknown`, so a wrapper whose inner proof is null
+  // is structurally permitted even though `UnicityAggregatorProvider`
+  // currently short-circuits the null case at the source. Pre-fix the
+  // null-wrapper would fall through to `proofJson = proof` (the whole
+  // wrapper, a truthy object) and crash `TransferTransaction.fromJSON`
+  // exactly the way Issue #251's primary bug fired. The post-fix wrapper
+  // branch detects the wrapper shape (roundNumber:number + 'proof' in
+  // wrapper) and routes a null proof through the early-return path.
+  it('finalizeStrandedReceivedToken treats wrapper with null proof as not-yet-available (PR #252 review)', async () => {
+    const sdkData = makeV6DirectReceiveSdkData();
+    const token: Token = {
+      id: GENESIS_TOKEN_ID,
+      coinId: 'UCT_HEX',
+      symbol: 'UCT',
+      amount: '100',
+      status: 'pending',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      sdkData,
+    };
+    internals(module).tokens.set(token.id, token);
+
+    // Wrapper with proof:null — what a future provider implementation
+    // might emit if it forgets to filter at the boundary.
+    (setup.deps.oracle as { getProof: ReturnType<typeof vi.fn> }).getProof =
+      vi.fn().mockResolvedValue({
+        requestId: '00deadbeef',
+        roundNumber: 42,
+        proof: null,
+        timestamp: Date.now(),
+      });
+
+    const ttMod = await import(
+      '@unicitylabs/state-transition-sdk/lib/transaction/TransferTransaction'
+    );
+    const fromJsonMock = vi.fn();
+    const prior = ttMod.TransferTransaction.fromJSON;
+    (ttMod.TransferTransaction.fromJSON as unknown as ReturnType<typeof vi.fn>) = fromJsonMock;
+
+    try {
+      const lastTxJson = {
+        previousStateHash: STATE_HASH,
+        predicate: 'pred2',
+        data: { sourceState: {}, recipient: 'DIRECT://x', salt: '00', recipientDataHash: null, message: null, nametags: [] },
+      };
+      const sourceTokenJson = JSON.stringify({ genesis: { data: { tokenId: GENESIS_TOKEN_ID } } });
+      internals(module).proofPollingJobs.set(GENESIS_TOKEN_ID, {
+        tokenId: GENESIS_TOKEN_ID,
+        requestIdHex: '00deadbeef',
+        commitmentJson: '',
+        sourceTokenJson,
+        startedAt: Date.now(),
+        attemptCount: 0,
+        lastAttemptAt: 0,
+      });
+
+      await (module as unknown as {
+        finalizeStrandedReceivedToken: (
+          tokenId: string,
+          sourceTokenJson: string,
+          lastTxJson: Record<string, unknown>,
+        ) => Promise<void>;
+      }).finalizeStrandedReceivedToken(GENESIS_TOKEN_ID, sourceTokenJson, lastTxJson);
+
+      // The early-return must fire — fromJSON should NOT have been called.
+      expect(fromJsonMock).not.toHaveBeenCalled();
+      // Token stays pending — next polling tick may have a real proof.
+      expect(internals(module).tokens.get(GENESIS_TOKEN_ID)?.status).toBe('pending');
+      // No operator alert (this is a transient "wait for next tick").
+      const alerts = setup.emittedEvents.filter(
+        (e) => e.type === 'transfer:operator-alert',
+      );
+      expect(alerts.length).toBe(0);
+    } finally {
+      (ttMod.TransferTransaction.fromJSON as unknown as ReturnType<typeof vi.fn>) = prior as never;
+    }
+  });
 });
 
 // =============================================================================
