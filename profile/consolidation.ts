@@ -25,7 +25,8 @@ import { logger } from '../core/logger.js';
 import type { ProfileDatabase } from './types.js';
 import type { UxfBundleRef, ConsolidationPendingState } from './types.js';
 import { ProfileError } from './errors.js';
-import { buildLocalEntry, decodeEntry } from './oplog-entry.js';
+import { decodeEntry } from './oplog-entry.js';
+import { getEnvelopePayload, putEnvelopePayload } from './oplog-envelope-io.js';
 import {
   encryptProfileValue,
   decryptProfileValue,
@@ -577,21 +578,11 @@ export class ConsolidationEngine {
     const encryptedPayload = await encryptProfileValue(this.encryptionKey, serialized);
 
     const key = BUNDLE_KEY_PREFIX + cid;
-    if (typeof this.db.putEntry === 'function') {
-      const envelope = buildLocalEntry({
-        type: 'cache_index',
-        originated: 'system',
-        payload: encryptedPayload,
-      });
-      await this.db.putEntry(key, envelope);
-    } else {
-      await this.db.put(key, encryptedPayload);
-      const markHook = (this.db as { markLocallyAuthored?: (k: string) => void })
-        .markLocallyAuthored;
-      if (typeof markHook === 'function') {
-        markHook.call(this.db, key);
-      }
-    }
+    // Issue #247 — putEnvelopePayload handles both the putEntry path
+    // (envelope wrap when available) and the legacy raw db.put fallback
+    // (with markLocallyAuthored). Replaces the manual capability probe
+    // that previously duplicated the same logic inline.
+    await putEnvelopePayload(this.db, key, encryptedPayload);
   }
 
   // ---------------------------------------------------------------------------
@@ -603,7 +594,9 @@ export class ConsolidationEngine {
    * Returns null if no pending key exists or if it cannot be deserialized.
    */
   private async readPendingState(): Promise<ConsolidationPendingState | null> {
-    const raw = await this.db.get(CONSOLIDATION_PENDING_KEY);
+    // Issue #247 — dual-format reader for envelope-wrapped (new)
+    // and raw-ciphertext (legacy) entries.
+    const raw = await getEnvelopePayload(this.db, CONSOLIDATION_PENDING_KEY);
     if (!raw) return null;
 
     try {
@@ -624,7 +617,9 @@ export class ConsolidationEngine {
   private async writePendingState(state: ConsolidationPendingState): Promise<void> {
     const serialized = new TextEncoder().encode(JSON.stringify(state));
     const encrypted = await encryptProfileValue(this.encryptionKey, serialized);
-    await this.db.put(CONSOLIDATION_PENDING_KEY, encrypted);
+    // Issue #247 — wrap in an OpLog envelope so the lean-snapshot
+    // reader (db.getEntry -> decodeEntry) finds the entry.
+    await putEnvelopePayload(this.db, CONSOLIDATION_PENDING_KEY, encrypted);
   }
 
   // ---------------------------------------------------------------------------
