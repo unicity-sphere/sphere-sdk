@@ -67,19 +67,32 @@ as its new baseline — single round trip, no walkback needed.
 **Pros:**
 - Eliminates the read-replica race entirely (CAS is anchored at the aggregator's
   authoritative view, not its replica).
-- Backwards-compatible: existing clients omit the field and behave as before.
-- Convergence is O(k) round trips in the cohort, deterministic — same complexity
-  as today's §8.5 analysis, but with one round trip per conflict instead of an
-  exponential probe + walkback + throttle cycle (~2 – 3 minutes per).
+- Designed to be backwards-compatible — existing clients omit the field and
+  behave as before; new clients gracefully fall back when the aggregator
+  returns `METHOD_NOT_FOUND` / ignores the field. **Subject to confirmation
+  by the `aggregator-go` team (Open Question 1).**
+- **Asymptotic complexity unchanged** versus today's §8.5 analysis (both are
+  `O(k)` in the cohort). **The win is the per-conflict constant**: today each
+  publish attempt costs the full walkback + reconcile + throttle cycle
+  (~60 – 90 s); under CAS each conflict costs a single extra round trip
+  (~200 ms). For a 2-device cohort that is the difference between
+  ~minutes-to-converge and ~seconds-to-converge.
 
 **Cons:**
 - Requires an aggregator-side schema change. Coordinated rollout with
   `aggregator-go` (Go service) — touches the L3 layer, not just SDK-side.
 - The "what is the current version of slot X" answer requires the aggregator to
-  index by `(wallet_signing_pubkey, slot)` — a derived index it does not
-  maintain today (commitments are stored by `requestId` only).
+  maintain an auxiliary reverse index by `(wallet_signing_pubkey, slot)`.
+  **This is qualitatively different from "adding an optional field to an
+  RPC."** The aggregator's commitment store is keyed by `requestId` only;
+  the SMT stores blinded leaf values, so the new index cannot be derived
+  on-the-fly from existing storage. Introducing it requires the aggregator
+  to hold per-wallet signing-key metadata it currently never touches —
+  approaching a schema migration with new trust-surface exposure rather
+  than a pure protocol extension.
 
-**Effort.** Medium-high. Bilateral SDK + aggregator change; needs a real
+**Effort.** Medium-high. Bilateral SDK + aggregator change with **server-side
+data-model implications** (not just protocol-level). Needs a real
 testcontainer-based integration test to exercise the conflict path.
 
 ---
@@ -107,8 +120,19 @@ goes silent for `T_failover`, the next-priority follower takes over.
   collected by the elected writer's flush — additional follower → writer
   channel needed, or followers must publish their writes via OrbitDB OpLog
   replication ONLY and rely on the writer's flush to anchor them.
-- Failure modes are subtle: split-brain during failover can produce two
-  pointers at the same version, replaying the same race we want to eliminate.
+- Failure modes are subtle:
+  - **Split-brain during failover** can produce two pointers at the same
+    version, replaying the same race we want to eliminate.
+  - **Silent split via asymmetric Nostr reachability.** Two devices share an
+    identity. The relay is fully operational. Device A reaches the relay
+    fine; device B reaches the relay fine; but B cannot observe A's presence
+    events (e.g., due to relay-side gossip-partition, NIP-29 group-membership
+    drift, or asymmetric NAT). B's Lamport+tiebreak election protocol cannot
+    detect A's prior election — B elects itself as writer while A is already
+    writing. Both write concurrently to the same aggregator slot, exactly
+    the failure mode this approach is meant to eliminate. Detection requires
+    a sentinel signal stronger than "absence of presence events," which adds
+    further protocol complexity.
 
 **Effort.** High. New protocol surface, new failure modes, careful test matrix
 required.
@@ -136,7 +160,11 @@ entirely. Clients only submit bundles; the server publishes pointers.
   trust model.
 - A weaker variant — server witnesses the client's signed update and rebroadcasts
   — sidesteps the key-custody issue but still requires the wallet to sign each
-  version, leaving us where we started for client-side races.
+  version, leaving us where we started for client-side races. Worse, the
+  server's rebroadcast is itself a write at an aggregator slot, so it inherits
+  the same `WALKBACK_FLOOR` problem one layer of indirection later. There is
+  no implementation merit to this variant even if the trust-model objection
+  to the strong variant were relaxed.
 
 **Effort.** Very high. Re-architects the trust boundary; would need a separate
 spec.
@@ -149,8 +177,10 @@ spec.
 
 1. **Smallest blast radius.** CAS is a one-field, additive change to the
    `submit_commitment` RPC. Existing clients are unaffected.
-2. **Deterministic convergence.** Each conflict costs one extra round trip,
-   not 60 – 90 s of walkback + throttle.
+2. **Deterministic per-conflict latency.** Same asymptotic cohort cost
+   (`O(k)` conflicts per the architecture §8.5 analysis), but each
+   conflict costs one extra RPC round trip (~200 ms) instead of a
+   60 – 90 s walkback + reconcile + throttle cycle.
 3. **Layer-clean.** Coordination lives at the layer that owns the SMT — no
    new transport-layer protocol, no new trust dependencies.
 4. **Testable.** A testcontainer-based aggregator can simulate the race
@@ -180,11 +210,24 @@ Any implementation MUST satisfy:
 
 4. **Operator observability.** Emit `pointer:cas-conflict-resolved` (new typed
    event) with `{fromVersion, toVersion, attemptsUsed}` when CAS resolves a
-   conflict.
+   conflict. The implementation MUST decide explicitly whether this event
+   **replaces** the existing `storage:replica-lag-reconciled` event (emitted
+   from `lifecycle-manager.ts:1322-1329` after a successful
+   `reconcileLocalVersionDownward`) on the CAS path, or **supplements** it.
+   Double-emission would force consumers to deduplicate counts; replacement
+   would silently change the semantics of existing dashboards. Either choice
+   is defensible; the PR description MUST name it.
 
 5. **Acceptance for §C.4 in `manual-test-full-recovery.sh`.** The script
-   reaches §F (script end) on > 5 consecutive runs with **zero**
-   `AGGREGATOR_POINTER_WALKBACK_FLOOR` warn lines per cycle.
+   reaches §F (script end) on > 5 consecutive runs. Under CAS the number
+   of `AGGREGATOR_POINTER_WALKBACK_FLOOR` warns per cycle drops from
+   *unbounded* (the issue this RFC addresses) to **at most one per distinct
+   cross-device conflict event**, with each such warn followed within
+   ~1 s by a `pointer:cas-conflict-resolved` event resolving it.
+   "Zero" warns would require CAS to predict conflicts pre-emptively,
+   which is not what this RFC proposes — the first publish per conflict
+   still discovers the race, CAS just resolves it cheaply rather than
+   re-entering the walkback cycle.
 
 ---
 
@@ -210,7 +253,9 @@ Any implementation MUST satisfy:
 1. **Aggregator API extension** — coordinate with `aggregator-go` maintainers
    on the exact field name (`expectedPriorVersion` vs `cas_version` vs
    `slot_version`) and whether to bundle it under a sub-object for future
-   extensibility.
+   extensibility. The "additive RPC field" framing in §2.1 holds at the wire
+   level; the underlying server-side reverse index (§2.1 Cons) is the harder
+   part of this conversation.
 2. **Migration window** — for the few weeks where some aggregator instances
    support CAS and others don't, do we feature-flag the client-side use of
    CAS (off by default), or trust the graceful-fallback path on
@@ -218,6 +263,24 @@ Any implementation MUST satisfy:
 3. **Test fixtures** — the existing `goggregator-test.unicity.network` is
    shared; a CAS-aware aggregator testcontainer needs to be added to
    `test/integration/` for deterministic CI runs.
+4. **In-flight reader poisoning.** A reader that issued a pointer-poll probe
+   against the replica at `V=N` is awaiting inclusion proofs while a
+   CAS-aware writer's conflict is being resolved server-side. If CAS bumps
+   the authoritative version to `V=N+1` between the reader's probe and its
+   response processing, does the reader receive a stale answer? Today the
+   `storage:replica-lag` / `storage:replica-lag-reconciled` events
+   (`lifecycle-manager.ts:1304-1329`) signal writer-side reconciliation;
+   they are not wired to pointer-poll readers. Does
+   `pointer:cas-conflict-resolved` need to trigger a reader-side re-probe?
+5. **`pendingPublishCid` migration on CAS rollout.** Wallets with an existing
+   `pendingPublishCid` stamped under the old protocol will retry under the
+   new CAS path when CAS lands. If that pending CID corresponds to a
+   version already superseded by a cross-device write, the CAS field
+   triggers an immediate `VERSION_CONFLICT` response. The fallback path
+   (Acceptance Criterion 3 + Open Question 2's feature-flag) handles this
+   correctly only if the fallback is exercised. Should pending-publish
+   retries apply CAS on the first attempt, or skip CAS (use the existing
+   walkback path) to avoid an extra round trip for already-pending publishes?
 
 ---
 
