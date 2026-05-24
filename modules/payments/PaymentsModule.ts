@@ -21,6 +21,8 @@ import type {
   FullIdentity,
   SphereEventType,
   SphereEventMap,
+  TrackedAddress,
+  AddressInfo,
 } from '../../types';
 import type {
   TxfToken,
@@ -1488,6 +1490,44 @@ export interface PaymentsModuleDependencies {
    * that explicitly opt out.
    */
   cidFetchGateways?: ReadonlyArray<string>;
+  /**
+   * Issue #255 Problem A — HD-index recovery in `finalizeTransferToken`.
+   *
+   * Derive HD address info at the given index. Used together with
+   * {@link getActiveAddresses} to recover from cross-device
+   * profile-sync drift: a token received at HD index N on the source
+   * device lands in OrbitDB, the recipient device re-imports from
+   * mnemonic with active index M ≠ N, and V6-RECOVER's
+   * `finalizeStrandedReceivedToken` then derives a recipient predicate
+   * from index M's signing service that doesn't match the sender's
+   * stated target — SDK throws `Recipient address mismatch`.
+   *
+   * With this callback wired, finalize iterates tracked addresses
+   * (current active is tried first via the fast path), derives each
+   * candidate's signing service, and picks the one whose derived
+   * recipient address matches `transferTx.data.recipient`. If none
+   * match, finalize still falls through to the SDK error after
+   * emitting a diagnostic `warn` line naming the divergence inputs.
+   *
+   * Wired by `Sphere.initializeModules` /
+   * `Sphere.initializeAddressModules` to
+   * `(idx) => this._deriveAddressInternal(idx, false)`. Absent for
+   * mnemonicless wallets (no `_masterKey`) — fallback is the existing
+   * single-identity behavior.
+   */
+  deriveAddressInfo?: (index: number) => AddressInfo;
+  /**
+   * Issue #255 Problem A — companion to {@link deriveAddressInfo}.
+   *
+   * Enumerate tracked addresses for HD-index recovery in
+   * `finalizeTransferToken`. Iterated in tracked-set order — the
+   * current active address is implicitly skipped (its signer is
+   * tried first via the fast path).
+   *
+   * Wired to `Sphere._getActiveAddressesInternal()`. Absent → no
+   * iteration; finalize falls back to single-identity behavior.
+   */
+  getActiveAddresses?: () => ReadonlyArray<TrackedAddress>;
 }
 
 // =============================================================================
@@ -14606,23 +14646,15 @@ export class PaymentsModule {
   ): Promise<SdkToken<any>> {
     const recipientAddress = transferTx.data.recipient;
     const addressScheme = recipientAddress.scheme;
-    const signingService = await this.createSigningService();
     const transferSalt = transferTx.data.salt;
 
-    const recipientPredicate = await UnmaskedPredicate.create(
-      sourceToken.id,
-      sourceToken.type,
-      signingService,
-      HashAlgorithm.SHA256,
-      transferSalt
-    );
-    const recipientState = new TokenState(recipientPredicate, null);
-
+    // Resolve nametag tokens once — needed both for PROXY validation and
+    // for resolving `transferTx.data.recipient` to its target DIRECT
+    // address (so the HD-index recovery comparison below has the same
+    // shape the SDK's `verifyRecipient` will compute).
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let nametagTokens: SdkToken<any>[] = [];
-
     if (addressScheme === AddressScheme.PROXY) {
-      // PROXY: Validate nametag address match (per reference impl)
       const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
       let proxyNametag = this.getNametag();
 
@@ -14648,7 +14680,80 @@ export class PaymentsModule {
       }
       nametagTokens = [nametagToken];
     }
-    // DIRECT: nametagTokens stays empty []
+
+    // Issue #255 Problem A — HD-index recovery for the post-#251
+    // `Recipient address mismatch` residue. Fast path: try the current
+    // active address's signing service first. If its derived recipient
+    // address doesn't match what the sender wrote (and we have the
+    // recovery deps wired), iterate tracked addresses to find a
+    // signing service whose derived address DOES match. If still no
+    // match, emit a diagnostic `warn` line and fall through to the
+    // SDK error path so callers (V6-RECOVER, live-receive,
+    // LOCAL-FINALIZE, UXF receive) keep their existing error
+    // contract.
+    const signingService = await this.createSigningService();
+    const expectedTransactionAddress = await this.resolveExpectedTransactionAddress(
+      recipientAddress,
+      nametagTokens,
+    );
+    const primaryDerivedAddress = await this.deriveRecipientAddressFor(
+      signingService,
+      sourceToken,
+      transferSalt,
+    );
+
+    let chosenSigner = signingService;
+    let recoveredIndex: number | null = null;
+
+    if (
+      expectedTransactionAddress !== null &&
+      primaryDerivedAddress !== null &&
+      primaryDerivedAddress !== expectedTransactionAddress
+    ) {
+      const recovery = await this.tryRecoverSigningServiceForRecipient(
+        sourceToken,
+        transferSalt,
+        expectedTransactionAddress,
+      );
+      if (recovery) {
+        chosenSigner = recovery.signer;
+        recoveredIndex = recovery.index;
+        logger.warn(
+          'Payments',
+          `[FINALIZE-RECOVER] HD-index drift recovered for token ${this.shortHex(sourceToken.id.toString())}: ` +
+          `currentSigner derived ${primaryDerivedAddress}, ` +
+          `sender targeted ${expectedTransactionAddress}, ` +
+          `matched at tracked HD index ${recoveredIndex}. ` +
+          `Using that index's signing service for finalize.`,
+        );
+      } else {
+        const triedIndices = this.deps?.getActiveAddresses?.()
+          ?.map((a) => a.index)
+          ?.join(',') ?? '<no-recovery-deps>';
+        logger.warn(
+          'Payments',
+          `[FINALIZE-RECOVER] Recipient address mismatch with no recovery candidate ` +
+          `(SDK will throw VerificationError next): ` +
+          `tokenId=${this.shortHex(sourceToken.id.toString())} ` +
+          `tokenType=${this.shortHex(sourceToken.type.toString())} ` +
+          `salt=${this.shortHex(this.bytesToHexSafe(transferSalt))} ` +
+          `addressScheme=${addressScheme} ` +
+          `txRecipient=${recipientAddress.address} ` +
+          `resolvedTxAddress=${expectedTransactionAddress} ` +
+          `currentSignerExpected=${primaryDerivedAddress} ` +
+          `triedIndices=[${triedIndices}]`,
+        );
+      }
+    }
+
+    const recipientPredicate = await UnmaskedPredicate.create(
+      sourceToken.id,
+      sourceToken.type,
+      chosenSigner,
+      HashAlgorithm.SHA256,
+      transferSalt
+    );
+    const recipientState = new TokenState(recipientPredicate, null);
 
     return stClient.finalizeTransaction(
       trustBase,
@@ -14657,6 +14762,169 @@ export class PaymentsModule {
       transferTx,
       nametagTokens
     );
+  }
+
+  /**
+   * Issue #255 Problem A helper — compute the recipient DIRECT address a
+   * given signing service would derive for `(sourceToken, transferSalt)`.
+   * Mirrors the SDK's `verifyRecipient` derivation path (predicate →
+   * reference → address) without involving the trust base. Returns
+   * `null` on any internal error so the caller can still fall back to
+   * the SDK's verification flow.
+   */
+  private async deriveRecipientAddressFor(
+    signingService: SigningService,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    sourceToken: SdkToken<any>,
+    transferSalt: Uint8Array,
+  ): Promise<string | null> {
+    try {
+      const predicate = await UnmaskedPredicate.create(
+        sourceToken.id,
+        sourceToken.type,
+        signingService,
+        HashAlgorithm.SHA256,
+        transferSalt,
+      );
+      const reference = await predicate.getReference();
+      const address = await reference.toAddress();
+      return address.address;
+    } catch (err) {
+      logger.debug(
+        'Payments',
+        `[FINALIZE-RECOVER] deriveRecipientAddressFor threw: ${(err as Error)?.message ?? err}`,
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Issue #255 Problem A helper — resolve `transferTx.data.recipient` to
+   * its DIRECT address (the value the SDK's `verifyRecipient` will
+   * compare against). For DIRECT scheme, returns the address as-is.
+   * For PROXY, resolves through the supplied nametag tokens. Returns
+   * `null` if resolution fails — the caller skips the recovery
+   * iteration in that case.
+   */
+  private async resolveExpectedTransactionAddress(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    recipientAddress: any,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    nametagTokens: SdkToken<any>[],
+  ): Promise<string | null> {
+    try {
+      if (recipientAddress?.scheme === AddressScheme.PROXY) {
+        const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
+        const resolved = await ProxyAddress.resolve(recipientAddress, nametagTokens);
+        return resolved?.address ?? null;
+      }
+      return typeof recipientAddress?.address === 'string'
+        ? recipientAddress.address
+        : null;
+    } catch (err) {
+      logger.debug(
+        'Payments',
+        `[FINALIZE-RECOVER] resolveExpectedTransactionAddress threw: ${(err as Error)?.message ?? err}`,
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Issue #255 Problem A helper — iterate tracked addresses to find a
+   * signing service whose derived recipient address matches
+   * `expectedTransactionAddress`. Skips the current active address
+   * (already tried via the fast path) by chainPubkey comparison.
+   * Returns the matched signer + HD index, or `null` if no match
+   * (including when the recovery deps aren't wired).
+   */
+  private async tryRecoverSigningServiceForRecipient(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    sourceToken: SdkToken<any>,
+    transferSalt: Uint8Array,
+    expectedTransactionAddress: string,
+  ): Promise<{ signer: SigningService; index: number } | null> {
+    const deriveFn = this.deps?.deriveAddressInfo;
+    const getAddressesFn = this.deps?.getActiveAddresses;
+    if (!deriveFn || !getAddressesFn) return null;
+
+    let tracked: ReadonlyArray<TrackedAddress>;
+    try {
+      tracked = getAddressesFn();
+    } catch (err) {
+      logger.debug(
+        'Payments',
+        `[FINALIZE-RECOVER] getActiveAddresses threw: ${(err as Error)?.message ?? err}`,
+      );
+      return null;
+    }
+
+    const currentChainPubkey = this.deps?.identity?.chainPubkey;
+    for (const entry of tracked) {
+      // Skip the current active address — its signer was already tried
+      // and produced the mismatch we're recovering from.
+      if (currentChainPubkey && entry.chainPubkey === currentChainPubkey) {
+        continue;
+      }
+      let addressInfo: AddressInfo;
+      try {
+        addressInfo = deriveFn(entry.index);
+      } catch (err) {
+        logger.debug(
+          'Payments',
+          `[FINALIZE-RECOVER] deriveAddressInfo(${entry.index}) threw: ${(err as Error)?.message ?? err}`,
+        );
+        continue;
+      }
+      let candidateSigner: SigningService;
+      try {
+        candidateSigner = await SigningService.createFromSecret(
+          fromHex(addressInfo.privateKey),
+        );
+      } catch (err) {
+        logger.debug(
+          'Payments',
+          `[FINALIZE-RECOVER] SigningService.createFromSecret(idx=${entry.index}) threw: ${(err as Error)?.message ?? err}`,
+        );
+        continue;
+      }
+      const candidateAddr = await this.deriveRecipientAddressFor(
+        candidateSigner,
+        sourceToken,
+        transferSalt,
+      );
+      if (candidateAddr !== null && candidateAddr === expectedTransactionAddress) {
+        return { signer: candidateSigner, index: entry.index };
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Issue #255 Problem A diagnostic helper — best-effort hex of a
+   * Uint8Array for one-line log diagnostics. Returns the empty string
+   * when input is not bytes (the diagnostic line then prints
+   * `salt=`).
+   */
+  private bytesToHexSafe(bytes: Uint8Array | undefined | null): string {
+    if (!(bytes instanceof Uint8Array)) return '';
+    try {
+      return Array.from(bytes)
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * Issue #255 Problem A diagnostic helper — truncate identifiers for
+   * single-line `warn` output. 16 chars is enough to disambiguate
+   * tokens in operator logs without producing 100-char lines.
+   */
+  private shortHex(value: string | undefined | null): string {
+    if (typeof value !== 'string') return '<unknown>';
+    return value.length > 16 ? value.slice(0, 16) : value;
   }
 
   /**
