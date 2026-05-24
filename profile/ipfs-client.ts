@@ -241,6 +241,177 @@ const DEFAULT_VERIFY_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_SIZE_BYTES = 50 * 1024 * 1024; // 50 MB
 
 // =============================================================================
+// Issue #255 Problem B / ipfs-storage#7 — instant-pin sidecar submit
+// =============================================================================
+
+/**
+ * Per-block upper bound for sidecar submissions. The sidecar's default
+ * `SIDECAR_CACHE_MAX_BLOB_BYTES` is 32 MiB; anything larger gets a 413
+ * back and is just wasted bandwidth. Stays comfortably above the
+ * sphere-sdk Profile snapshot CAR block sizes (well under 256 KiB
+ * for raw leaves, typically a few KiB for dag-cbor envelopes).
+ */
+const SIDECAR_SUBMIT_MAX_BYTES = 32 * 1024 * 1024;
+
+/**
+ * Per-call timeout for the fire-and-forget sidecar submit. Short by
+ * design — the submit is an optimization, not a contract, and a slow
+ * sidecar must not gate the pin-success return.
+ */
+const SIDECAR_SUBMIT_TIMEOUT_MS = 5_000;
+
+/**
+ * Per-attempt timeout for the {@link tryReadFromSidecar} fast-path
+ * probe. Aggressively short — the sidecar is co-located with the
+ * gateway nginx; if it can't answer in this window, the bytes
+ * almost certainly aren't there and the request would be a waste.
+ * Falling through to the normal `/api/v0/block/get` path costs
+ * one ~100 ms RTT in any case.
+ */
+const SIDECAR_READ_TIMEOUT_MS = 500;
+
+/**
+ * Fire-and-forget POST the raw bytes that hash to `cid` to the
+ * gateway's instant-pin sidecar (`/sidecar/submit?cid=<cid>`). Lets
+ * cross-device readers fetch `cid` immediately after pin, before
+ * Kubo's bitswap registration window closes (the dominant cross-
+ * device race amplifier — see issue #255 Problem B, RFC-251).
+ *
+ * Contract:
+ *   - Never throws. Never blocks the caller. Errors are swallowed
+ *     via the trailing `.catch(() => {})`.
+ *   - The bytes MUST hash to `cid` under the codec the sidecar
+ *     reconciler will infer from the CID prefix (raw / dag-cbor /
+ *     dag-pb). For the two call sites in this module (`pinToIpfs`,
+ *     `pinSingleBlock`) this holds by construction; the sidecar's
+ *     `_infer_block_put_params` handles the codec choice server-side.
+ *   - If the gateway doesn't run the sidecar (e.g. `ipfs.io`), the
+ *     POST 404s and is silently dropped — the primary pin already
+ *     succeeded, so the bytes are durable in Kubo regardless.
+ *   - 503 (cache_full back-pressure) and 413 (over 32 MiB) are
+ *     handled identically: drop on the floor. The primary pin is
+ *     the source of truth.
+ */
+function submitToSidecarBestEffort(
+  gateway: string,
+  cid: string,
+  bytes: Uint8Array,
+): void {
+  if (typeof gateway !== 'string' || gateway.length === 0) return;
+  if (typeof cid !== 'string' || cid.length === 0) return;
+  if (!(bytes instanceof Uint8Array) || bytes.length === 0) return;
+  if (bytes.length > SIDECAR_SUBMIT_MAX_BYTES) return;
+  const url =
+    `${gateway.replace(/\/$/, '')}/sidecar/submit?cid=${encodeURIComponent(cid)}`;
+  // Detached fire-and-forget. The .catch swallows any rejection so
+  // an unhandled-rejection doesn't surface; the void operator
+  // discards the dangling promise reference so callers don't have
+  // to ignore a `Promise<void>` they're not allowed to await.
+  void fetch(url, {
+    method: 'POST',
+    body: bytes as BlobPart,
+    headers: { 'Content-Type': 'application/octet-stream' },
+    signal: AbortSignal.timeout(SIDECAR_SUBMIT_TIMEOUT_MS),
+  })
+    .then((response) => {
+      // Drain the body so the connection releases promptly. Logged at
+      // debug level for operator triage — Stage B.1 wants visibility
+      // into how often sphere-sdk publishes actually populate the
+      // cache vs how often they get 503-back-pressured or 4xx-rejected.
+      if (!response.ok) {
+        logger.debug(
+          'IPFS-Sidecar',
+          `submit ${cid.slice(0, 16)} → HTTP ${response.status} ` +
+          `(${response.statusText}) on ${gateway}`,
+        );
+      } else {
+        logger.debug(
+          'IPFS-Sidecar',
+          `submit ${cid.slice(0, 16)} → 200 on ${gateway}`,
+        );
+      }
+      // Best-effort body drain — the sidecar returns small JSON; we
+      // don't actually need its contents (the outcome is just diagnostic).
+      response.body?.cancel?.().catch(() => { /* ignore */ });
+    })
+    .catch(() => {
+      // Network error, timeout, gateway-without-sidecar (404 → ok=false
+      // above), or AbortError. All silently dropped — the primary pin
+      // already succeeded; this is pure optimization.
+    });
+}
+
+/**
+ * Read fast-path counterpart to {@link submitToSidecarBestEffort}.
+ * Attempts `/sidecar/blob?cid=<cid>` against the supplied gateway with
+ * a short timeout. Returns the bytes on a 200, `null` on anything
+ * else (404 cache miss, gateway without sidecar, timeout, network
+ * error). Never throws.
+ *
+ * Used by {@link fetchFromIpfs} to close the cross-device publish-
+ * then-read window for CIDs a sibling device just submitted to the
+ * sidecar. The window is ~5 s (until the reconciler promotes the
+ * block to Kubo and removes it from sidecar disk); outside the
+ * window the sidecar 404s and the caller falls through to the
+ * normal `/api/v0/block/get` path.
+ *
+ * Important: the bytes returned by `/sidecar/blob` are the raw
+ * block bytes (whatever the submitter posted). For single-block
+ * CIDs (raw-leaf or dag-cbor envelope) these are bit-identical
+ * to what `/api/v0/block/get` would return on a cache miss, so
+ * the caller's downstream `verifyCidMatchesBytes` check still
+ * succeeds. Multi-block UnixFS roots cannot round-trip through
+ * the sidecar — but sphere-sdk's pin paths only submit
+ * single-block CIDs, so the sidecar never serves multi-block
+ * bytes for sphere-sdk-published CIDs.
+ */
+async function tryReadFromSidecar(
+  gateway: string,
+  cid: string,
+): Promise<Uint8Array | null> {
+  if (typeof gateway !== 'string' || gateway.length === 0) return null;
+  if (typeof cid !== 'string' || cid.length === 0) return null;
+  try {
+    const url =
+      `${gateway.replace(/\/$/, '')}/sidecar/blob?cid=${encodeURIComponent(cid)}`;
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: { Accept: 'application/octet-stream' },
+      signal: AbortSignal.timeout(SIDECAR_READ_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+      // 404 (cache miss / sidecar disabled) is the common case; drain
+      // and return null so caller falls through to the normal fetch.
+      response.body?.cancel?.().catch(() => { /* ignore */ });
+      return null;
+    }
+    // Sniff content-type — a gateway that doesn't run the sidecar
+    // may have a catch-all returning HTML/JSON for /sidecar/*; we
+    // only trust application/octet-stream-like responses.
+    const ct = (response.headers.get('Content-Type') ?? '').toLowerCase();
+    if (
+      ct &&
+      !ct.startsWith('application/octet-stream') &&
+      !ct.startsWith('application/vnd.ipld')
+    ) {
+      response.body?.cancel?.().catch(() => { /* ignore */ });
+      return null;
+    }
+    const buf = await response.arrayBuffer();
+    if (buf.byteLength === 0) return null;
+    logger.debug(
+      'IPFS-Sidecar',
+      `read hit ${cid.slice(0, 16)} (${buf.byteLength} bytes) on ${gateway}`,
+    );
+    return new Uint8Array(buf);
+  } catch {
+    // Timeout, network error, abort — all treated as a miss. The
+    // caller's normal-path fetch is the source of truth.
+    return null;
+  }
+}
+
+// =============================================================================
 // Public API
 // =============================================================================
 
@@ -325,6 +496,15 @@ export async function pinToIpfs(
       // (404 on next lookup); attacker cannot redirect the wallet's
       // anchor to attacker-chosen content.
       const expectedCid = CID.createV1(raw.code, createMultihash(0x12, sha256(data))).toString();
+      // Issue #255 Problem B / ipfs-storage#7 — fire-and-forget submit
+      // to the sidecar so cross-device readers can fetch the CID
+      // immediately, before Kubo's bitswap registration window closes.
+      // Always eligible here: `pinToIpfs` forces input-codec=raw, so
+      // `expectedCid` is always a raw-leaf v1 (`bafkrei...`) and the
+      // bytes that hash to it are exactly `data`. Gateway-targeted at
+      // the SAME gateway that just succeeded the pin — if that gateway
+      // doesn't run the sidecar, the POST 404s and is dropped silently.
+      submitToSidecarBestEffort(gateway, expectedCid, data);
       return expectedCid;
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err));
@@ -410,6 +590,14 @@ async function pinSingleBlock(
       } catch {
         // ignore — body parse failure on a 200 doesn't change durability
       }
+      // Issue #255 Problem B / ipfs-storage#7 — fire-and-forget submit
+      // to the sidecar (same gateway). The bytes hash to `expectedCid`
+      // by construction here (each block in a CAR satisfies
+      // `sha256(block.bytes) === block.cid.multihash.digest` per Issue
+      // #213 / Option C). The sidecar's `_infer_block_put_params`
+      // handles raw / dag-cbor / dag-pb codecs by CID prefix — no
+      // codec-specific gating needed on this side.
+      submitToSidecarBestEffort(gateway, expectedCid, blockBytes);
       return;
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err));
@@ -748,6 +936,37 @@ export async function fetchFromIpfs(
 
     return { bytes, reason: null, retryAsGet: false };
   };
+
+  // Issue #255 Problem B / ipfs-storage#7 — read fast-path. Probe
+  // the FIRST gateway's `/sidecar/blob?cid=<cid>` ONCE before the
+  // normal multi-gateway loop. On a hit (bytes a sibling device
+  // submitted within the last ~5 s window) the cross-device read
+  // closes in sub-50 ms instead of paying the Kubo bitswap
+  // registration window. On a miss / non-sidecar gateway / timeout
+  // the helper returns null and the normal flow runs unchanged.
+  // 500 ms ceiling per `SIDECAR_READ_TIMEOUT_MS`.
+  if (effectiveGateways.length > 0) {
+    const sidecarBytes = await tryReadFromSidecar(effectiveGateways[0], cid);
+    if (sidecarBytes !== null && sidecarBytes.byteLength <= maxSizeBytes) {
+      try {
+        verifyCidMatchesBytes(cid, sidecarBytes);
+        // Write-back to local Helia so subsequent same-`dataDir`
+        // process loads hit the local-first read path (mirror the
+        // gateway-fetch write-back at line 920 below).
+        if (localHelia !== null) {
+          await putBlockToLocalHelia(localHelia, cid, sidecarBytes);
+        }
+        return sidecarBytes;
+      } catch {
+        // CID mismatch on sidecar bytes is a serious operational
+        // signal (sidecar served wrong bytes for this CID). Treat as
+        // a miss and fall through — the normal gateway path will
+        // re-verify and reject if Kubo also serves bad bytes. Don't
+        // throw here; the normal flow has its own ProfileError
+        // contract callers rely on.
+      }
+    }
+  }
 
   for (const gateway of effectiveGateways) {
     try {
