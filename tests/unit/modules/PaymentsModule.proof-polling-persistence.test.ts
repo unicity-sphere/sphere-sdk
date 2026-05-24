@@ -1122,6 +1122,85 @@ describe('#144 L3 — balance-model invariant + stranded recovery', () => {
       (ttMod.TransferTransaction.fromJSON as unknown as ReturnType<typeof vi.fn>) = prior as never;
     }
   });
+
+  // Steelman finding (PR #252 review): the OracleProvider interface
+  // declares `proof: unknown`, so a wrapper whose inner proof is null
+  // is structurally permitted even though `UnicityAggregatorProvider`
+  // currently short-circuits the null case at the source. Pre-fix the
+  // null-wrapper would fall through to `proofJson = proof` (the whole
+  // wrapper, a truthy object) and crash `TransferTransaction.fromJSON`
+  // exactly the way Issue #251's primary bug fired. The post-fix wrapper
+  // branch detects the wrapper shape (roundNumber:number + 'proof' in
+  // wrapper) and routes a null proof through the early-return path.
+  it('finalizeStrandedReceivedToken treats wrapper with null proof as not-yet-available (PR #252 review)', async () => {
+    const sdkData = makeV6DirectReceiveSdkData();
+    const token: Token = {
+      id: GENESIS_TOKEN_ID,
+      coinId: 'UCT_HEX',
+      symbol: 'UCT',
+      amount: '100',
+      status: 'pending',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      sdkData,
+    };
+    internals(module).tokens.set(token.id, token);
+
+    // Wrapper with proof:null — what a future provider implementation
+    // might emit if it forgets to filter at the boundary.
+    (setup.deps.oracle as { getProof: ReturnType<typeof vi.fn> }).getProof =
+      vi.fn().mockResolvedValue({
+        requestId: '00deadbeef',
+        roundNumber: 42,
+        proof: null,
+        timestamp: Date.now(),
+      });
+
+    const ttMod = await import(
+      '@unicitylabs/state-transition-sdk/lib/transaction/TransferTransaction'
+    );
+    const fromJsonMock = vi.fn();
+    const prior = ttMod.TransferTransaction.fromJSON;
+    (ttMod.TransferTransaction.fromJSON as unknown as ReturnType<typeof vi.fn>) = fromJsonMock;
+
+    try {
+      const lastTxJson = {
+        previousStateHash: STATE_HASH,
+        predicate: 'pred2',
+        data: { sourceState: {}, recipient: 'DIRECT://x', salt: '00', recipientDataHash: null, message: null, nametags: [] },
+      };
+      const sourceTokenJson = JSON.stringify({ genesis: { data: { tokenId: GENESIS_TOKEN_ID } } });
+      internals(module).proofPollingJobs.set(GENESIS_TOKEN_ID, {
+        tokenId: GENESIS_TOKEN_ID,
+        requestIdHex: '00deadbeef',
+        commitmentJson: '',
+        sourceTokenJson,
+        startedAt: Date.now(),
+        attemptCount: 0,
+        lastAttemptAt: 0,
+      });
+
+      await (module as unknown as {
+        finalizeStrandedReceivedToken: (
+          tokenId: string,
+          sourceTokenJson: string,
+          lastTxJson: Record<string, unknown>,
+        ) => Promise<void>;
+      }).finalizeStrandedReceivedToken(GENESIS_TOKEN_ID, sourceTokenJson, lastTxJson);
+
+      // The early-return must fire — fromJSON should NOT have been called.
+      expect(fromJsonMock).not.toHaveBeenCalled();
+      // Token stays pending — next polling tick may have a real proof.
+      expect(internals(module).tokens.get(GENESIS_TOKEN_ID)?.status).toBe('pending');
+      // No operator alert (this is a transient "wait for next tick").
+      const alerts = setup.emittedEvents.filter(
+        (e) => e.type === 'transfer:operator-alert',
+      );
+      expect(alerts.length).toBe(0);
+    } finally {
+      (ttMod.TransferTransaction.fromJSON as unknown as ReturnType<typeof vi.fn>) = prior as never;
+    }
+  });
 });
 
 // =============================================================================

@@ -9252,6 +9252,20 @@ export class PaymentsModule {
         const wrapper = proof as { proof?: unknown; toJSON?: () => unknown };
         if (wrapper.proof !== undefined && wrapper.proof !== null) {
           proofJson = wrapper.proof;
+        } else if (
+          // Steelman finding (PR #252 review): the OracleProvider
+          // interface declares `proof: unknown`, so a wrapper whose
+          // inner proof is null/undefined is structurally valid even
+          // though `UnicityAggregatorProvider` short-circuits this case
+          // to `null` today. If we reached this branch via the wrapper
+          // shape (i.e., the object carries the wrapper's signature
+          // fields) treat it as "proof not yet available" rather than
+          // falling through to pass the wrapper itself — which would
+          // crash `TransferTransaction.fromJSON` exactly the way this
+          // PR fixes for the non-null case.
+          'proof' in wrapper && typeof (wrapper as { roundNumber?: unknown }).roundNumber === 'number'
+        ) {
+          proofJson = null;
         } else if (typeof wrapper.toJSON === 'function') {
           proofJson = wrapper.toJSON();
         } else {
@@ -9358,14 +9372,22 @@ export class PaymentsModule {
                 let pj: unknown;
                 if (wrapper.proof !== undefined && wrapper.proof !== null) {
                   pj = wrapper.proof;
+                } else if (
+                  'proof' in wrapper && typeof (wrapper as { roundNumber?: unknown }).roundNumber === 'number'
+                ) {
+                  // Wrapper-shape but proof payload absent — diagnostic
+                  // logs this as 'null' rather than dumping wrapper keys.
+                  pj = null;
                 } else if (typeof wrapper.toJSON === 'function') {
                   pj = wrapper.toJSON();
                 } else {
                   pj = proof;
                 }
-                proofShape = pj && typeof pj === 'object'
-                  ? Object.keys(pj as Record<string, unknown>)
-                  : `non-object:${typeof pj}`;
+                proofShape = pj === null
+                  ? 'null'
+                  : pj && typeof pj === 'object'
+                    ? Object.keys(pj as Record<string, unknown>)
+                    : `non-object:${typeof pj}`;
               } else {
                 proofShape = 'null';
               }
