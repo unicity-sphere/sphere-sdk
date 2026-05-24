@@ -2213,10 +2213,25 @@ export class PaymentsModule {
         oracleProvider: (): {
           readonly isSpent: (stateHash: string) => Promise<boolean>;
         } | null => {
+          // Issue #243 — wallet-scoped wrapper around oracle.isSpent.
+          // The underlying OracleProvider.isSpent now requires
+          // `(publicKey, stateHash)` (the canonical aggregator API
+          // indexes commitments by `RequestId.create(pubkey, hash)`).
+          // The worker only knows the stateHash, so we bind the
+          // active wallet's `chainPubkey` here — correct for any
+          // token in `this.tokens` because the worker scans the
+          // current address's holdings and our predicate's pubkey
+          // gates spending the current state.
           const oracle = this.deps?.oracle;
-          return oracle !== undefined && typeof oracle.isSpent === 'function'
-            ? oracle
-            : null;
+          if (oracle === undefined || typeof oracle.isSpent !== 'function') {
+            return null;
+          }
+          const ownerPubkey = this.deps?.identity?.chainPubkey;
+          if (!ownerPubkey) return null;
+          return {
+            isSpent: (stateHash: string): Promise<boolean> =>
+              oracle.isSpent(ownerPubkey, stateHash),
+          };
         },
         extractCurrentStateHash: (token: Token): string =>
           extractStateHashFromSdkData(token.sdkData),
@@ -3955,7 +3970,14 @@ export class PaymentsModule {
     }
     let aggregatorRecordsSpent: boolean;
     try {
-      aggregatorRecordsSpent = await this.deps!.oracle.isSpent(sourceStateHash);
+      // Issue #243 — pass owner pubkey alongside stateHash. The token
+      // is in this wallet's active set (orphan recovery only fires
+      // for our own locally-stranded tokens), so `chainPubkey` is the
+      // correct predicate owner for the requestId derivation.
+      aggregatorRecordsSpent = await this.deps!.oracle.isSpent(
+        this.deps!.identity.chainPubkey,
+        sourceStateHash,
+      );
     } catch (oracleErr) {
       // Per OracleProvider.isSpent contract, an RPC failure throws
       // (never fail-open). Treat the throw as ambiguous: we cannot
@@ -14096,13 +14118,21 @@ export class PaymentsModule {
     // Non-success arc — disambiguate "state already spent by another
     // commit" from generic failures via an authoritative oracle
     // re-query against the source state hash.
+    //
+    // Issue #243 — pass owner pubkey alongside stateHash. The source
+    // state we just tried to consume was guarded by OUR predicate
+    // (we constructed the commitment), so the requestId the aggregator
+    // indexed under is derived from `chainPubkey` + the source state.
     let isSpent = false;
     let sourceStateHashHex: string | null = null;
     if (oracle !== undefined && typeof oracle.isSpent === 'function') {
       try {
         const sourceStateHashObj = await commitment.transactionData.sourceState.calculateHash();
         sourceStateHashHex = sourceStateHashObj.toJSON();
-        isSpent = await oracle.isSpent(sourceStateHashHex);
+        isSpent = await oracle.isSpent(
+          this.deps!.identity.chainPubkey,
+          sourceStateHashHex,
+        );
       } catch (probeErr) {
         // The probe is best-effort. If it throws (e.g. aggregator
         // offline), we fall through to the generic

@@ -41,6 +41,8 @@ import {
   InclusionProofVerificationStatus,
 } from '@unicitylabs/state-transition-sdk/lib/transaction/InclusionProof';
 import { RequestId } from '@unicitylabs/state-transition-sdk/lib/api/RequestId';
+import { DataHash } from '@unicitylabs/state-transition-sdk/lib/hash/DataHash';
+import { hexToBytes } from '../core/hex';
 
 // SDK MintCommitment type - using interface to avoid generic complexity
 interface SdkMintCommitment {
@@ -750,27 +752,49 @@ export class UnicityAggregatorProvider implements OracleProvider {
     return result;
   }
 
-  async isSpent(stateHash: string): Promise<boolean> {
-    // Check cache first (spent is immutable). Wave L: LRU touch on
-    // hit so frequently-accessed stateHashes survive eviction longer.
-    if (this.spentCache.has(stateHash)) {
-      const cached = this.spentCache.get(stateHash)!;
-      this.spentCache.delete(stateHash);
-      this.spentCache.set(stateHash, cached);
+  async isSpent(publicKey: string, stateHash: string): Promise<boolean> {
+    // Cache key binds publicKey + stateHash. A given stateHash may
+    // be commit-checked under multiple pubkeys in a multi-address
+    // wallet; we MUST NOT cross-pollinate cache hits between keys.
+    const cacheKey = `${publicKey}:${stateHash}`;
+    if (this.spentCache.has(cacheKey)) {
+      const cached = this.spentCache.get(cacheKey)!;
+      this.spentCache.delete(cacheKey);
+      this.spentCache.set(cacheKey, cached);
       return cached;
     }
 
     this.ensureConnected();
 
-    // Wave 3 / steelman: do NOT fail-open on RPC failure. The previous
-    // behaviour (`return false`) opened a double-spend window when the
-    // aggregator was network-partitioned or a relay-MitM dropped the
-    // isSpent request: the recipient would treat an unverifiable state
-    // as "confirmed unspent" and accept the proof. We now PROPAGATE the
-    // failure as a typed `AGGREGATOR_ERROR` so callers can distinguish
-    // "verified unspent (aggregator said no)" from "couldn't check".
+    // Issue #243 fix — the canonical aggregator (aggregator-go) has no
+    // `isSpent` JSON-RPC method. It indexes commitments by `requestId
+    // = SHA256(publicKey || stateHash)` and exposes only
+    // `submit_commitment`, `get_inclusion_proof`,
+    // `get_no_deletion_proof`, `get_block_height`. The previous
+    // implementation hand-rolled a `{method: 'isSpent', params:
+    // {stateHash}}` JSON-RPC request which the server rejected with
+    // HTTP 400 ("JSON-RPC requests must include either requestId or
+    // shardId") at the request-validation layer — every call failed,
+    // and the spent-state rescan worker bumped per-token throw
+    // counters until per-token backoff kicked in. The noise blocked
+    // `manual-test-full-recovery.sh` at §C.2.
     //
-    // Important caching contract: we still cache only `spent: true`
+    // The canonical check: derive `requestId` from `publicKey` (the
+    // owner of the state) and the `stateHash`, then call
+    // `get_inclusion_proof(requestId)`. The aggregator returns either:
+    //   - A path-inclusion proof (transactionHash !== null) → the
+    //     owner submitted a commit consuming this state → spent.
+    //   - A path-non-inclusion proof (transactionHash === null) → no
+    //     commit exists for this (pubkey, stateHash) pair → unspent.
+    //
+    // Wave 3 / steelman: do NOT fail-open on RPC failure (preserved).
+    // The previous behaviour (`return false`) opened a double-spend
+    // window when the aggregator was network-partitioned or a relay-
+    // MitM dropped the request: the recipient would treat an
+    // unverifiable state as "confirmed unspent" and accept the proof.
+    // We PROPAGATE the failure as a typed `AGGREGATOR_ERROR`.
+    //
+    // Caching contract (unchanged): cache only `spent: true`
     // (immutable). Confirmed `false` is NOT cached because the answer
     // can change at any moment when the owner spends the state. A
     // throw here is NEVER cached — the next call retries the RPC.
@@ -781,9 +805,30 @@ export class UnicityAggregatorProvider implements OracleProvider {
     // and :1020), so this change is non-breaking for the production
     // path and turns a silent fail-open into a deterministic
     // structural rejection that a later bundle can recover from.
-    let response: RpcSpentResponse;
+    let requestIdHex: string;
     try {
-      response = await this.rpcCall<RpcSpentResponse>('isSpent', { stateHash });
+      const pubkeyBytes = hexToBytes(publicKey);
+      const stateHashDataHash = DataHash.fromJSON(stateHash);
+      const requestId = await RequestId.create(pubkeyBytes, stateHashDataHash);
+      requestIdHex = requestId.toJSON();
+    } catch (error) {
+      const cause = error instanceof Error ? error.message : String(error);
+      // Structural failure to build requestId is a caller bug
+      // (bad hex, wrong-length pubkey, malformed stateHash imprint),
+      // not a transient RPC failure. Surface it as AGGREGATOR_ERROR
+      // so the disposition-engine's catch routes it consistently.
+      throw new SphereError(
+        `isSpent: failed to derive requestId from publicKey/stateHash (${cause})`,
+        'AGGREGATOR_ERROR',
+        error,
+      );
+    }
+
+    let response: RpcProofResponse;
+    try {
+      response = await this.rpcCall<RpcProofResponse>('get_inclusion_proof', {
+        requestId: requestIdHex,
+      });
     } catch (error) {
       const cause = error instanceof Error ? error.message : String(error);
       logger.warn('Aggregator', 'isSpent RPC failed; refusing to fail-open', error);
@@ -793,11 +838,25 @@ export class UnicityAggregatorProvider implements OracleProvider {
         error,
       );
     }
-    const spent = response.spent ?? false;
+
+    // Accept canonical (`inclusionProof`) or legacy (`proof`) shape.
+    // Defense in depth: an aggregator that returns neither field is
+    // ambiguous — treat as "no proof yet" (unspent) rather than
+    // throwing, matching the legacy isSpent's tolerant default but
+    // KEEPING the fail-closed throw contract for transport errors.
+    const proof = (response.inclusionProof ?? response.proof) as
+      | { transactionHash?: string | null }
+      | undefined;
+    const spent =
+      proof !== undefined &&
+      proof !== null &&
+      typeof proof === 'object' &&
+      proof.transactionHash !== null &&
+      proof.transactionHash !== undefined;
 
     // Cache result (Wave L: bounded with LRU eviction)
     if (spent) {
-      this.cacheSpent(stateHash);
+      this.cacheSpent(cacheKey);
     }
 
     return spent;

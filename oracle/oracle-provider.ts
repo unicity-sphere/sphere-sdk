@@ -49,7 +49,29 @@ export interface OracleProvider extends BaseProvider {
   validateToken(tokenData: unknown): Promise<ValidationResult>;
 
   /**
-   * Check if token state is spent.
+   * Check if a state has been spent by the owner identified by `publicKey`.
+   *
+   * Implemented via `get_inclusion_proof(requestId)` where
+   * `requestId = RequestId.create(publicKey, stateHash)`. The aggregator
+   * indexes commitments by requestId (= hash of pubkey+stateHash), so we
+   * cannot ask "has anyone spent this state" without knowing whose
+   * predicate guards it — for normal flows this is the wallet's own
+   * `chainPubkey` because the wallet owns the state it's probing.
+   *
+   * Spent iff the returned inclusion proof carries a non-null
+   * `transactionHash` (path-included). A path-non-inclusion proof
+   * (`transactionHash: null`) means no commitment exists → unspent.
+   *
+   * **Issue #243 — historical broken contract**: the prior implementation
+   * called a non-existent `isSpent` JSON-RPC method with a single
+   * `stateHash` parameter. The canonical aggregator (`aggregator-go`)
+   * never exposed that method; it returns HTTP 400 ("requests must
+   * include either requestId or shardId") at the validation layer.
+   * Callers (the spent-state rescan worker, orphan recovery) saw a
+   * cascade of failures, bumped their per-token backoff counters, and
+   * the noise blocked `manual-test-full-recovery.sh` at §C.2. The fix
+   * threads `publicKey` through and uses the canonical inclusion-proof
+   * RPC.
    *
    * **Throws on RPC failure** — implementations MUST NOT fail-open
    * (returning `false` on a network/transport error opens a double-
@@ -57,14 +79,21 @@ export interface OracleProvider extends BaseProvider {
    * (typically a `SphereError` with code `'AGGREGATOR_ERROR'`). The
    * boolean return value carries cryptographically-verified state
    * only:
-   *   - `true`  — aggregator confirmed the state has been spent.
-   *   - `false` — aggregator confirmed the state is unspent.
+   *   - `true`  — aggregator returned a path-inclusion proof.
+   *   - `false` — aggregator returned a path-non-inclusion proof.
    *
    * Callers (notably the disposition-engine `[E]` hook) treat a
    * throw as STRUCTURAL_INVALID per §5.3 [A] and re-evaluate when a
    * later bundle arrives.
+   *
+   * @param publicKey Hex-encoded compressed secp256k1 owner pubkey
+   *                  (66 chars, "02"/"03" prefix). For wallet-local
+   *                  scans this is `Identity.chainPubkey`.
+   * @param stateHash Hex-encoded state hash imprint (typically 68 chars
+   *                  including the algorithm prefix; the SDK accepts the
+   *                  canonical imprint form).
    */
-  isSpent(stateHash: string): Promise<boolean>;
+  isSpent(publicKey: string, stateHash: string): Promise<boolean>;
 
   /**
    * Get token state
