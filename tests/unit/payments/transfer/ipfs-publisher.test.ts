@@ -63,12 +63,6 @@ interface FetchCall {
  * "<cid>" } }`). The stub does NOT verify the CIDs returned — the
  * canonical publisher ignores the gateway-supplied CID and uses its own
  * locally-computed `bundleCid` (defense against malicious gateways).
- *
- * Issue #255 Problem B — the new `pinSingleBlock` tries
- * `/sidecar/submit` first and falls back to `/api/v0/dag/put` on
- * non-2xx. To exercise the dag/put codec-inference path these tests
- * were written for, the stub returns 503 on `/sidecar/submit` so the
- * fallback fires.
  */
 function installFetchStub(): { calls: FetchCall[] } {
   const calls: FetchCall[] = [];
@@ -84,11 +78,6 @@ function installFetchStub(): { calls: FetchCall[] } {
       method: init?.method,
       body: init?.body instanceof FormData ? init.body : undefined,
     });
-    if (url.includes('/sidecar/submit')) {
-      // Force the dag/put fallback path so these tests can keep
-      // asserting on dag/put behavior.
-      return new Response('sidecar disabled for this test', { status: 503 });
-    }
     return new Response(
       JSON.stringify({ Cid: { '/': 'bafkreigatewaysuppliedwhatever' } }),
       {

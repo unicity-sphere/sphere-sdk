@@ -271,98 +271,26 @@ const SIDECAR_SUBMIT_TIMEOUT_MS = 5_000;
 const SIDECAR_READ_TIMEOUT_MS = 500;
 
 /**
- * Synchronously submit `bytes` to the gateway's instant-pin sidecar.
- * Returns `true` on a 2xx response, `false` on any non-2xx / network
- * error / timeout. Never throws.
- *
- * **This is the primary pin write path** (issue #255 Problem B). It
- * sits in front of the legacy `/api/v0/dag/put` flow:
- *   - On success (return true) the bytes are durable on the sidecar's
- *     blobstore within milliseconds. The sidecar's reconciler will
- *     promote to Kubo via internal `block/put` + `pin/add` within
- *     `SIDECAR_CACHE_RECONCILE_INTERVAL` (default 5 s). Caller may
- *     return immediately; readers via `/ipfs/<cid>` will hit the
- *     sidecar's read path or Kubo (whichever's ready first).
- *   - On failure (return false) the caller falls back to the legacy
- *     `/api/v0/dag/put` write path — defense-in-depth for transient
- *     sidecar outages.
- *
- * The bytes MUST hash to `cid` under the codec the sidecar reconciler
- * will infer from the CID prefix (raw / dag-cbor / dag-pb). For the
- * two call sites in this module (`pinToIpfs`, `pinSingleBlock`) this
- * holds by construction; the sidecar's `_infer_block_put_params`
- * handles the codec choice server-side.
- *
- * Status-code handling:
- *   - 200 (`accepted` / `already_present` / `already_confirmed`) → true.
- *   - 400 (bad input) → false. dag/put would also reject; fallback noop.
- *   - 413 (over 32 MiB) → false. dag/put may have a higher limit.
- *   - 503 (cache_full back-pressure) → false. Try dag/put.
- *   - 5xx (other server error) / network error / timeout → false.
- *     Try dag/put.
- *   - 404 (gateway without sidecar — non-Unicity gateway) → false.
- *     Falls through to dag/put. Per project policy (2026-05-25) only
- *     Unicity-specialized gateways are configured for sphere-sdk, so
- *     this branch should not fire in production.
- */
-async function submitToSidecar(
-  gateway: string,
-  cid: string,
-  bytes: Uint8Array,
-): Promise<boolean> {
-  if (typeof gateway !== 'string' || gateway.length === 0) return false;
-  if (typeof cid !== 'string' || cid.length === 0) return false;
-  if (!(bytes instanceof Uint8Array) || bytes.length === 0) return false;
-  if (bytes.length > SIDECAR_SUBMIT_MAX_BYTES) return false;
-  try {
-    const url =
-      `${gateway.replace(/\/$/, '')}/sidecar/submit?cid=${encodeURIComponent(cid)}`;
-    const response = await fetch(url, {
-      method: 'POST',
-      body: bytes as BlobPart,
-      headers: { 'Content-Type': 'application/octet-stream' },
-      signal: AbortSignal.timeout(SIDECAR_SUBMIT_TIMEOUT_MS),
-    });
-    // Drain the body so the connection releases promptly (we don't need
-    // the JSON envelope — outcome is just diagnostic).
-    response.body?.cancel?.().catch(() => { /* ignore */ });
-    if (response.ok) {
-      logger.debug(
-        'IPFS-Sidecar',
-        `submit ${cid.slice(0, 16)} → 200 on ${gateway}`,
-      );
-      return true;
-    }
-    logger.debug(
-      'IPFS-Sidecar',
-      `submit ${cid.slice(0, 16)} → HTTP ${response.status} on ${gateway} ` +
-      `(falling back to /api/v0/dag/put)`,
-    );
-    return false;
-  } catch (err) {
-    logger.debug(
-      'IPFS-Sidecar',
-      `submit ${cid.slice(0, 16)} threw on ${gateway} ` +
-      `(falling back to /api/v0/dag/put): ` +
-      `${err instanceof Error ? err.message : String(err)}`,
-    );
-    return false;
-  }
-}
-
-/**
  * Fire-and-forget POST the raw bytes that hash to `cid` to the
- * gateway's instant-pin sidecar (`/sidecar/submit?cid=<cid>`). Used
- * ONLY by the dag/put fallback path to populate the sidecar's cache
- * after a successful dag/put — so subsequent cross-device readers via
- * `/sidecar/blob` still benefit from the instant-pin window even
- * when the sidecar was temporarily down at primary-submit time.
+ * gateway's instant-pin sidecar (`/sidecar/submit?cid=<cid>`). Lets
+ * cross-device readers fetch `cid` immediately after pin, before
+ * Kubo's bitswap registration window closes (the dominant cross-
+ * device race amplifier — see issue #255 Problem B, RFC-251).
  *
  * Contract:
  *   - Never throws. Never blocks the caller. Errors are swallowed
  *     via the trailing `.catch(() => {})`.
- *   - 200 / 4xx / 5xx all treated identically — primary pin already
- *     succeeded via dag/put, this is pure optimization.
+ *   - The bytes MUST hash to `cid` under the codec the sidecar
+ *     reconciler will infer from the CID prefix (raw / dag-cbor /
+ *     dag-pb). For the two call sites in this module (`pinToIpfs`,
+ *     `pinSingleBlock`) this holds by construction; the sidecar's
+ *     `_infer_block_put_params` handles the codec choice server-side.
+ *   - If the gateway doesn't run the sidecar (e.g. `ipfs.io`), the
+ *     POST 404s and is silently dropped — the primary pin already
+ *     succeeded, so the bytes are durable in Kubo regardless.
+ *   - 503 (cache_full back-pressure) and 413 (over 32 MiB) are
+ *     handled identically: drop on the floor. The primary pin is
+ *     the source of truth.
  */
 function submitToSidecarBestEffort(
   gateway: string,
@@ -509,26 +437,6 @@ export async function pinToIpfs(
 
   for (const gateway of effectiveGateways) {
     try {
-      // Compute the canonical CID locally up-front — both the
-      // primary sidecar path and the legacy dag/put fallback agree
-      // on `CID.createV1(raw.code, sha256(data))` for raw-codec.
-      // Computing here means we can submit to the sidecar with the
-      // CID in the query param without a server round-trip.
-      const expectedCid = CID.createV1(raw.code, createMultihash(0x12, sha256(data))).toString();
-
-      // Issue #255 Problem B — try the instant-pin sidecar first.
-      // On success the bytes are durable on the sidecar within
-      // milliseconds; the reconciler promotes to Kubo within ~5 s.
-      // On failure (gateway-without-sidecar, transient outage,
-      // 4xx/5xx, network error) we fall through to the legacy
-      // `/api/v0/dag/put` path below — defense-in-depth.
-      const sidecarOk = await submitToSidecar(gateway, expectedCid, data);
-      if (sidecarOk) {
-        return expectedCid;
-      }
-
-      // Sidecar miss — legacy /api/v0/dag/put path.
-      //
       // Kubo `/api/v0/dag/put` REQUIRES multipart/form-data with a
       // `data` field name — the raw-body-with-application/octet-stream
       // shape this code used previously returns HTTP 400
@@ -587,12 +495,15 @@ export async function pinToIpfs(
       // DIFFERENT CID reduces to a pin-failure from our perspective
       // (404 on next lookup); attacker cannot redirect the wallet's
       // anchor to attacker-chosen content.
-      //
-      // Cache-population: dag/put succeeded but the sidecar was the
-      // one that just failed at the top of this iteration. Try a
-      // fire-and-forget submit anyway so subsequent cross-device
-      // readers via `/sidecar/blob` get the fast-path. Often the
-      // sidecar's transient outage clears by the time this runs.
+      const expectedCid = CID.createV1(raw.code, createMultihash(0x12, sha256(data))).toString();
+      // Issue #255 Problem B / ipfs-storage#7 — fire-and-forget submit
+      // to the sidecar so cross-device readers can fetch the CID
+      // immediately, before Kubo's bitswap registration window closes.
+      // Always eligible here: `pinToIpfs` forces input-codec=raw, so
+      // `expectedCid` is always a raw-leaf v1 (`bafkrei...`) and the
+      // bytes that hash to it are exactly `data`. Gateway-targeted at
+      // the SAME gateway that just succeeded the pin — if that gateway
+      // doesn't run the sidecar, the POST 404s and is dropped silently.
       submitToSidecarBestEffort(gateway, expectedCid, data);
       return expectedCid;
     } catch (err) {
@@ -655,18 +566,6 @@ async function pinSingleBlock(
   let lastError: Error | null = null;
   for (const gateway of effectiveGateways) {
     try {
-      // Issue #255 Problem B — sidecar primary path. Bytes hash to
-      // `expectedCid` by construction (Issue #213 / Option C ensures
-      // `sha256(block.bytes) === block.cid.multihash.digest` for
-      // every legitimate bundle CAR block). The sidecar's
-      // `_infer_block_put_params` handles raw / dag-cbor / dag-pb
-      // codecs server-side. Fall through to dag/put on miss.
-      const sidecarOk = await submitToSidecar(gateway, expectedCid, blockBytes);
-      if (sidecarOk) {
-        return;
-      }
-
-      // Sidecar miss — legacy /api/v0/dag/put fallback.
       const url =
         `${gateway.replace(/\/$/, '')}/api/v0/dag/put` +
         `?input-codec=${codecName}&store-codec=${codecName}&pin=true&hash=sha2-256`;
@@ -691,11 +590,13 @@ async function pinSingleBlock(
       } catch {
         // ignore — body parse failure on a 200 doesn't change durability
       }
-      // Cache-population: dag/put succeeded but the sidecar failed
-      // moments ago. Fire-and-forget submit so subsequent
-      // cross-device readers via `/sidecar/blob` still get the
-      // instant-pin fast-path when the sidecar's transient outage
-      // clears.
+      // Issue #255 Problem B / ipfs-storage#7 — fire-and-forget submit
+      // to the sidecar (same gateway). The bytes hash to `expectedCid`
+      // by construction here (each block in a CAR satisfies
+      // `sha256(block.bytes) === block.cid.multihash.digest` per Issue
+      // #213 / Option C). The sidecar's `_infer_block_put_params`
+      // handles raw / dag-cbor / dag-pb codecs by CID prefix — no
+      // codec-specific gating needed on this side.
       submitToSidecarBestEffort(gateway, expectedCid, blockBytes);
       return;
     } catch (err) {
