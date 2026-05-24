@@ -957,13 +957,24 @@ export async function fetchFromIpfs(
           await putBlockToLocalHelia(localHelia, cid, sidecarBytes);
         }
         return sidecarBytes;
-      } catch {
+      } catch (verifyErr) {
         // CID mismatch on sidecar bytes is a serious operational
-        // signal (sidecar served wrong bytes for this CID). Treat as
-        // a miss and fall through — the normal gateway path will
-        // re-verify and reject if Kubo also serves bad bytes. Don't
-        // throw here; the normal flow has its own ProfileError
-        // contract callers rely on.
+        // signal: the sidecar's cache served bytes that don't hash
+        // to the CID we asked for. Could be a rogue cache, a
+        // submission-side codec mismatch, or in-flight bit-rot.
+        // Don't throw — fall through to `/api/v0/block/get` so the
+        // normal flow's own CID-verify either confirms (Kubo also
+        // bad → caller surfaces ProfileError) or recovers (Kubo
+        // good → caller gets right bytes). Warn so operators can
+        // see the sidecar misbehavior even though the wallet
+        // self-heals.
+        logger.warn(
+          'IPFS-Sidecar',
+          `read CID mismatch on ${cid.slice(0, 16)} from ` +
+          `${effectiveGateways[0]} (${sidecarBytes.byteLength} bytes); ` +
+          `falling through to /api/v0/block/get. Reason: ` +
+          `${verifyErr instanceof Error ? verifyErr.message : String(verifyErr)}`,
+        );
       }
     }
   }
