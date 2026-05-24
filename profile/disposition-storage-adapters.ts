@@ -42,6 +42,11 @@
 import { logger } from '../core/logger.js';
 import { decryptString, encryptString } from './encryption.js';
 import type { DispositionPerEntryStorage } from './disposition-writer.js';
+import {
+  getEnvelopePayload,
+  putEnvelopePayload,
+  unwrapEnvelopeBytes,
+} from './oplog-envelope-io.js';
 import { PrefixSyncWriter } from './prefix-sync-writer.js';
 import type { ProfileSyncWriter } from './profile-snapshot-merge.js';
 import type { ProfileDatabase } from './types.js';
@@ -226,7 +231,9 @@ export class OrbitDbDispositionStorageAdapter
   }
 
   async readRecord<T>(key: string): Promise<T | undefined> {
-    const raw = await this.db.get(key);
+    // Issue #247 — dual-format reader for envelope-wrapped (new)
+    // and raw-ciphertext (legacy) entries.
+    const raw = await getEnvelopePayload(this.db, key);
     if (raw === null) return undefined;
     const decoded = await this.tryDecode<T | TombstoneMarker>(raw, key);
     if (decoded === undefined) return undefined; // decode failure
@@ -236,7 +243,9 @@ export class OrbitDbDispositionStorageAdapter
 
   async writeRecord<T>(key: string, value: T): Promise<void> {
     const encoded = await this.encodeValue(value);
-    await this.db.put(key, encoded);
+    // Issue #247 — wrap in an OpLog envelope so the lean-snapshot
+    // reader (db.getEntry -> decodeEntry) finds the entry.
+    await putEnvelopePayload(this.db, key, encoded);
   }
 
   /**
@@ -312,8 +321,15 @@ export class OrbitDbDispositionStorageAdapter
     raw: Uint8Array,
     key: string,
   ): Promise<T | undefined> {
+    // Issue #247 — `raw` may be either a CBOR-encoded OpLog envelope
+    // (new writes via putEntry) or legacy raw AES-GCM ciphertext
+    // (pre-#247 writes via raw db.put, OR bytes already unwrapped by
+    // readRecord's getEnvelopePayload call). `unwrapEnvelopeBytes` is
+    // idempotent — if `raw` is already unwrapped ciphertext, the
+    // envelope decode fails and `raw` passes through unchanged.
+    const ciphertext = unwrapEnvelopeBytes(raw);
     try {
-      const json = await decryptString(this.encryptionKey, raw);
+      const json = await decryptString(this.encryptionKey, ciphertext);
       return JSON.parse(json) as T;
     } catch (err) {
       logger.warn(

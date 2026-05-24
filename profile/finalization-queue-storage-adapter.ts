@@ -54,6 +54,11 @@ import type { FinalizationQueueStorage } from '../modules/payments/transfer/fina
 import type { ProfileDatabase } from './types.js';
 import { PrefixSyncWriter } from './prefix-sync-writer.js';
 import type { ProfileSyncWriter } from './profile-snapshot-merge.js';
+import {
+  getEnvelopePayload,
+  putEnvelopePayload,
+  unwrapEnvelopeBytes,
+} from './oplog-envelope-io.js';
 
 // =============================================================================
 // 0. Constants — schema discriminator + key shapes
@@ -147,10 +152,10 @@ export class OrbitDbFinalizationQueueStorageAdapter
   }
 
   async readKey(key: string): Promise<string | null> {
-    const raw = await this.db.get(key);
+    const raw = await getEnvelopePayload(this.db, key);
     if (raw === null) return null;
     try {
-      return await decryptString(this.encryptionKey, raw as Uint8Array);
+      return await decryptString(this.encryptionKey, raw);
     } catch (err) {
       logger.warn(
         'OrbitDbFinalizationQueueStorageAdapter',
@@ -185,7 +190,7 @@ export class OrbitDbFinalizationQueueStorageAdapter
       stamped = value;
     }
     const ciphertext = await encryptString(this.encryptionKey, stamped);
-    await this.db.put(key, ciphertext);
+    await putEnvelopePayload(this.db, key, ciphertext);
     this.emitProfileDirty();
   }
 
@@ -372,7 +377,7 @@ export class OrbitDbRecipientContextStorageAdapter {
     const stamped = { _schemaVersion: SCHEMA_VERSION, ...record };
     const json = JSON.stringify(stamped);
     const ciphertext = await encryptString(this.encryptionKey, json);
-    await this.db.put(key, ciphertext);
+    await putEnvelopePayload(this.db, key, ciphertext);
     this.emitProfileDirty();
   }
 
@@ -381,9 +386,9 @@ export class OrbitDbRecipientContextStorageAdapter {
     requestId: string,
   ): Promise<PersistedRequestContext | undefined> {
     const key = requestContextKey(addr, requestId);
-    const raw = await this.db.get(key);
+    const raw = await getEnvelopePayload(this.db, key);
     if (raw === null) return undefined;
-    return this.tryDecode<PersistedRequestContext>(raw as Uint8Array, key);
+    return this.tryDecode<PersistedRequestContext>(raw, key);
   }
 
   async deleteRequestContext(addr: string, requestId: string): Promise<void> {
@@ -400,7 +405,7 @@ export class OrbitDbRecipientContextStorageAdapter {
     const stamped = { _schemaVersion: SCHEMA_VERSION, ...record };
     const json = JSON.stringify(stamped);
     const ciphertext = await encryptString(this.encryptionKey, json);
-    await this.db.put(key, ciphertext);
+    await putEnvelopePayload(this.db, key, ciphertext);
     this.emitProfileDirty();
   }
 
@@ -409,9 +414,9 @@ export class OrbitDbRecipientContextStorageAdapter {
     tokenId: string,
   ): Promise<PersistedFinalizationContext | undefined> {
     const key = finalizationContextKey(addr, tokenId);
-    const raw = await this.db.get(key);
+    const raw = await getEnvelopePayload(this.db, key);
     if (raw === null) return undefined;
-    return this.tryDecode<PersistedFinalizationContext>(raw as Uint8Array, key);
+    return this.tryDecode<PersistedFinalizationContext>(raw, key);
   }
 
   async deleteFinalizationContext(addr: string, tokenId: string): Promise<void> {
@@ -495,8 +500,14 @@ export class OrbitDbRecipientContextStorageAdapter {
     raw: Uint8Array,
     key: string,
   ): Promise<T | undefined> {
+    // Issue #247 — `raw` may be either a CBOR-encoded OpLog envelope
+    // (new writes via putEntry) or legacy raw AES-GCM ciphertext
+    // (pre-#247 writes via raw db.put). `unwrapEnvelopeBytes` handles
+    // both formats — envelope payloads are extracted, legacy bytes
+    // pass through unchanged.
+    const ciphertext = unwrapEnvelopeBytes(raw);
     try {
-      const json = await decryptString(this.encryptionKey, raw);
+      const json = await decryptString(this.encryptionKey, ciphertext);
       const parsed = JSON.parse(json);
       if (isTombstone(parsed)) return undefined;
       return parsed as T;

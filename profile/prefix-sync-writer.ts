@@ -51,6 +51,7 @@
  */
 
 import { decryptProfileValue } from './encryption.js';
+import { unwrapEnvelopeBytes } from './oplog-envelope-io.js';
 import {
   runJoinSnapshot,
   type ClassifiedSlot,
@@ -232,11 +233,16 @@ export class PrefixSyncWriter implements ProfileSyncWriter {
     if (raw.byteLength > MAX_ENTRY_BYTES_RAW) {
       return remote ? null : { kind: 'absent' };
     }
+    // Issue #247 — `raw` may be either a CBOR-encoded OpLog envelope
+    // (post-#247 writes via putEntry) or legacy raw AES-GCM ciphertext
+    // (pre-#247 writes via raw db.put). Unwrap to the inner ciphertext
+    // before attempting decryption.
+    const ciphertext = unwrapEnvelopeBytes(raw);
     let plaintextBytes: Uint8Array;
     try {
       plaintextBytes = this.encryptionKey
-        ? await decryptProfileValue(this.encryptionKey, raw)
-        : raw;
+        ? await decryptProfileValue(this.encryptionKey, ciphertext)
+        : ciphertext;
     } catch {
       return remote ? null : { kind: 'absent' };
     }
