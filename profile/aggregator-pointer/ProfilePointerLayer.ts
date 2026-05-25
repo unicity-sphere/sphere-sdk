@@ -137,6 +137,19 @@ export class ProfilePointerLayer {
   // enqueued during drain.  Public methods check this flag and reject
   // immediately after shutdown starts.
   #shuttingDown = false;
+  // Issue #263 — in-memory cache of the highest sibling-broadcasted
+  // pointer version observed via `pointer-win` (RFC-251 Approach D)
+  // since this layer instance was constructed. Updated by
+  // `noteSiblingWin`; consumed by `#publishInner` as the fast-path
+  // floor so the reconcile loop can skip the initial discovery
+  // walkback when a sibling has already broadcast "I just landed V=N".
+  //
+  // Persisted: NO. Soft hint scoped to the current process lifetime —
+  // a wrong broadcast at worst pays one wasted ~50 ms submit before
+  // falling back to walkback. Restarting the process resets the cache;
+  // the next publish runs full discovery, then the cache rebuilds from
+  // inbound broadcasts.
+  #siblingHighestV: PointerVersion = 0;
 
   constructor(init: ProfilePointerLayerInit) {
     this.#init = init;
@@ -184,6 +197,37 @@ export class ProfilePointerLayer {
       signer: this.#init.signer,
       signingPubKeyHex: this.#init.signer.signingPubKeyHex,
     };
+  }
+
+  /**
+   * Issue #263 — sibling pointer-win broadcast observer.
+   *
+   * Sphere's `pointer-win` Nostr subscriber (see
+   * `Sphere.handleIncomingPointerWinBroadcast`) calls this AFTER signature
+   * verification and replay/dedup checks. The reconcile loop reads
+   * `#siblingHighestV` to bypass the initial discovery walkback when a
+   * sibling device has already announced "I just landed V=N" — turning a
+   * 30 s+ classifyVersion CAR fetch into a single ~50 ms aggregator RPC
+   * for the common case.
+   *
+   * Monotonic by construction — only versions strictly greater than the
+   * current cache value are stored. Stale broadcasts (lower-V than what
+   * we have already learned, or lower than our own current localVersion)
+   * are kept in the cache but ignored by the reconcile loop's `>= `
+   * comparison.
+   *
+   * Defensive about non-integer / negative inputs (already vetted by
+   * verifyWinBroadcastPayload upstream, but this method is a public API
+   * surface so we don't trust the caller).
+   *
+   * No-op once `shutdown()` has been called.
+   */
+  noteSiblingWin(version: PointerVersion): void {
+    if (this.#shuttingDown) return;
+    if (!Number.isInteger(version) || version < 0) return;
+    if (version > this.#siblingHighestV) {
+      this.#siblingHighestV = version;
+    }
   }
 
   /**
@@ -334,6 +378,11 @@ export class ProfilePointerLayer {
     const result = await reconcileAndPublish({
       cidProducer,
       currentLocalVersion,
+      // Issue #263 — pass the highest sibling-broadcasted version we've
+      // seen since process start. When >= currentLocalVersion, reconcile
+      // adopts it as the fast-path floor and skips the discovery walkback
+      // for attempt 0.
+      siblingHighestV: this.#siblingHighestV,
       keyMaterial: this.#init.keyMaterial,
       signer: this.#init.signer,
       aggregatorClient: this.#init.aggregatorClient,

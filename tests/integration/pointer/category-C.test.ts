@@ -829,12 +829,19 @@ describe('Pointer Category-C — multi-device contention (SPEC §9)', () => {
         ipfs: ipfsB,
       });
 
-      // B publishes once. It starts at localVersion=0, discovery finds
-      // validV=3 includedV=3, target = max(3, 3) + 1 = 4.
+      // B publishes once. It starts at localVersion=0.
+      //
+      // Issue #263 fast-path-miss path (cold-start): attempt 0 targets
+      // v=1 (currentLocalVersion + 1) and gets REQUEST_ID_EXISTS from
+      // the shared aggregator (A already holds v=1). reconcile then
+      // falls back to its existing rediscover + slow-path discovery,
+      // finds validV=3 includedV=3, targets v=4 (H4), and lands —
+      // total 2 attempts. The final version is unchanged from the
+      // pre-fast-path behavior.
       const cidB = cidForBytes(new TextEncoder().encode('C9-vB'));
       const resB = await devB.layer.publish(async () => cidB.bytes);
       expect(resB.version).toBe(4);
-      expect(resB.attemptsUsed).toBe(1); // No conflict — v=4 was vacant.
+      expect(resB.attemptsUsed).toBe(2); // attempt 0 (v=1) conflict + attempt 1 (v=4) success.
       expect(devB.localVersion()).toBe(4);
     });
   });
@@ -868,20 +875,25 @@ describe('Pointer Category-C — multi-device contention (SPEC §9)', () => {
       const rA1 = await devA.layer.publish(async () => cidA1.bytes);
       expect(rA1.version).toBe(1);
 
-      // B publishes: B's localVersion=0 → discovery finds validV=1 → target
-      // v=2 vacant → B publishes at v=2 on the first attempt (no conflict
-      // because A hasn't advanced past v=1). NOTE: no fetchAndJoin fires
-      // here because there was no conflict — discovery just picked up A's
-      // state implicitly via findLatestValidVersion.
+      // B publishes: B's localVersion=0.
+      //
+      // Issue #263 fast-path-miss path: attempt 0 targets v=1 and
+      // conflicts (A already holds v=1). Fall-back rediscovers
+      // validV=1, attempt 1 targets v=2 → success.
+      // NOTE: B doesn't run fetchAndJoin for the file-store CIDs in
+      // this test (resolveRemoteCid stub), but the conflict + walkback
+      // still bumps to v=2 deterministically.
       const rB2 = await devB.layer.publish(async () => cidB2.bytes);
       expect(rB2.version).toBe(2);
-      expect(rB2.attemptsUsed).toBe(1);
+      expect(rB2.attemptsUsed).toBe(2); // attempt 0 (v=1) conflict + attempt 1 (v=2) success.
 
-      // A publishes again: A's localVersion is 1, discovery finds validV=2,
-      // target v=3. Again, no conflict (v=3 is vacant).
+      // A publishes again: A's localVersion is 1 (after own publish).
+      // Issue #263 fast-path-miss: attempt 0 targets v=2 and conflicts
+      // (B just landed v=2). Fall-back to walkback finds validV=2,
+      // attempt 1 targets v=3 → success.
       const rA3 = await devA.layer.publish(async () => cidA3.bytes);
       expect(rA3.version).toBe(3);
-      expect(rA3.attemptsUsed).toBe(1);
+      expect(rA3.attemptsUsed).toBe(2); // attempt 0 (v=2) conflict + attempt 1 (v=3) success.
 
       // Both devices now converge to validV=3 on discover (each discovers
       // independently — they share the aggregator).

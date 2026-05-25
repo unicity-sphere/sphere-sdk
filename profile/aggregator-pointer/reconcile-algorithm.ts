@@ -129,6 +129,23 @@ export interface ReconcileInput {
    * submitPointer → submitOneSide.
    */
   readonly abortSignal?: AbortSignal;
+  /**
+   * Issue #263 — highest sibling-broadcasted pointer version observed
+   * since the layer instance was constructed (sourced from
+   * `ProfilePointerLayer.noteSiblingWin`). When `> currentLocalVersion`,
+   * the loop adopts it as the fast-path floor so attempt 0 targets
+   * `siblingHighestV + 1` instead of `currentLocalVersion + 1`.
+   *
+   * Undefined when the host process never received a verified
+   * `pointer-win` broadcast (transport doesn't support broadcasts,
+   * subscription not yet installed, or no sibling has published).
+   *
+   * Per RFC-251 Approach D, this is a soft hint — the aggregator
+   * remains the source of truth. A wrong broadcast at worst pays the
+   * cost of one wasted submit (~50 ms) before falling back to the
+   * existing walkback path.
+   */
+  readonly siblingHighestV?: PointerVersion;
 }
 
 export interface ReconcileOutcome {
@@ -257,6 +274,23 @@ export async function reconcileAndPublish(input: ReconcileInput): Promise<Reconc
   // Track the EVOLVING localVersion across conflicts (fetchAndJoin updates it).
   let currentLocalVersion = input.currentLocalVersion;
 
+  // Issue #263 — adopt any sibling broadcast as the fast-path floor.
+  // If a `pointer-win` event told us "V=N just landed" via the in-memory
+  // cache in ProfilePointerLayer, and N is at or above our own confirmed
+  // localVersion, we trust the hint for the purpose of choosing attempt
+  // 0's target version. This is a SOFT adoption: we do NOT persist it
+  // (the aggregator remains the source of truth), and a wrong broadcast
+  // at worst converts to a single wasted submit + fall-through to the
+  // existing discovery walkback. See RFC-251 Approach D for the design
+  // rationale; the existing `reconcileLocalVersionDownward` path handles
+  // the orthogonal case where the sibling is BEHIND us.
+  if (
+    input.siblingHighestV !== undefined &&
+    input.siblingHighestV > currentLocalVersion
+  ) {
+    currentLocalVersion = input.siblingHighestV;
+  }
+
   // Steelman⁴⁸ WARNING: compute ONE wall-clock deadline at the top
   // of reconcile and pass it into both findLatestValidVersion calls
   // (initial + rediscovery). Previously, each call derived its own
@@ -281,35 +315,43 @@ export async function reconcileAndPublish(input: ReconcileInput): Promise<Reconc
     // Step A: produce a fresh CID (may include state merged on prior conflict).
     const cidBytes = await input.cidProducer();
 
-    // Step B: discover V_true and target nextV = max(validV, includedV) + 1 (H4).
-    // Discovery errors propagate unchanged (DISCOVERY_OVERFLOW, CAR_UNAVAILABLE,
-    // CORRUPT_STREAK, TRUST_BASE_STALE, UNTRUSTED_PROOF). Reconcile cannot
-    // make progress without a valid V_true.
+    // Step B: determine nextV.
     //
-    // EXCEPTION (2026-05-16): `AGGREGATOR_POINTER_WALKBACK_FLOOR` is
-    // wrapped in a bounded retry loop. It fires when Phase 3 walkback
-    // would cross below `currentLocalVersion` — meaning the aggregator
-    // currently can't reach a version the wallet has already confirmed.
-    // This is replication lag (a successful publish at v=N becoming
-    // briefly invisible on a stale replica), not a real consistency
-    // fault. Retrying with backoff lets the lag settle before
-    // propagating up to the caller's retry-marker logic.
-    const discovery: DiscoverResult = await findLatestValidVersionWithWalkbackFloorRetry(
-      {
-        currentLocalVersion,
-        keyMaterial: input.keyMaterial,
-        signer: input.signer,
-        aggregatorClient: input.aggregatorClient,
-        trustBase: input.trustBase,
-        decodeCid: input.decodeCid,
-        fetchCar: input.fetchCar,
-        discoveryDeadlineMs: reconcileDeadlineMs,
-        abortSignal: input.abortSignal,
-      },
-      input.abortSignal,
-    );
-    probeHistory.push(...discovery.probeVersions);
-    const nextV = (Math.max(discovery.validV, discovery.includedV) + 1) as PointerVersion;
+    // Issue #263 — attempt 0 is the FAST PATH: skip the discovery
+    // walkback (which costs aggregator round-trip + IPFS CAR fetch per
+    // probed version) and target `currentLocalVersion + 1` directly.
+    // For the common no-conflict / sibling-aligned case this saves ~30 s
+    // of wall-clock per publish on a healthy testnet. If the fast-path
+    // submit returns `conflict`, we fall through to the same §9.2
+    // rediscover + fetchAndJoin + retry loop the always-walkback flow
+    // used; attempts >= 1 run the full walkback discovery as before.
+    //
+    // Attempts >= 1 (SLOW PATH) run the standard SPEC §8.2 three-phase
+    // walk. Discovery errors propagate unchanged (DISCOVERY_OVERFLOW,
+    // CAR_UNAVAILABLE, CORRUPT_STREAK, TRUST_BASE_STALE, UNTRUSTED_PROOF),
+    // except `AGGREGATOR_POINTER_WALKBACK_FLOOR` which is wrapped in a
+    // bounded retry loop to ride out replica-lag windows.
+    let nextV: PointerVersion;
+    if (attempts === 0) {
+      nextV = (currentLocalVersion + 1) as PointerVersion;
+    } else {
+      const discovery: DiscoverResult = await findLatestValidVersionWithWalkbackFloorRetry(
+        {
+          currentLocalVersion,
+          keyMaterial: input.keyMaterial,
+          signer: input.signer,
+          aggregatorClient: input.aggregatorClient,
+          trustBase: input.trustBase,
+          decodeCid: input.decodeCid,
+          fetchCar: input.fetchCar,
+          discoveryDeadlineMs: reconcileDeadlineMs,
+          abortSignal: input.abortSignal,
+        },
+        input.abortSignal,
+      );
+      probeHistory.push(...discovery.probeVersions);
+      nextV = (Math.max(discovery.validV, discovery.includedV) + 1) as PointerVersion;
+    }
 
     // Step C: run one publish attempt at nextV.
     const outcome = await publishOnceAtVersion(

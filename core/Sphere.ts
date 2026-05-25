@@ -5522,15 +5522,33 @@ export class Sphere {
         `cid=${payload.cid} — triggering early reconcile`,
       );
 
+      // Issue #263 — cache the broadcast version so our NEXT publish
+      // skips the discovery walkback and submits directly at
+      // `payload.version + 1`. This is the orthogonal complement to the
+      // `reconcileLocalVersionDownward` call below: that path handles
+      // "sibling is behind us, rewind our own cursor down"; this cache
+      // handles "sibling is ahead of us, fast-path our next publish".
+      // Both calls are idempotent / monotonic so order between them is
+      // irrelevant; we cache first to avoid a missed update if the
+      // recoverLatest call below throws.
+      try {
+        pointer.noteSiblingWin(payload.version);
+      } catch (cacheErr) {
+        const cacheMsg = cacheErr instanceof Error ? cacheErr.message : String(cacheErr);
+        logger.debug(
+          'Sphere',
+          `pointer-win broadcast: noteSiblingWin threw (ignored): ${cacheMsg}`,
+        );
+      }
+
       // Phase 1: trigger an early `recoverLatest` + `reconcileLocalVersionDownward`.
       // This is the same path the WALKBACK_FLOOR catch arm runs after a
       // race-loss; here we run it eagerly on the broadcast without
       // waiting for the throttle to expire. Acknowledged limitation:
       // when own localVersion is already at broadcast.version (same-
-      // version race), reconcileDownward is a no-op — Phase 2 would add
-      // a `ProfilePointerLayer.adoptBroadcast(payload)` entrypoint that
-      // bypasses the >= comparison. For Phase 1 this still helps the
-      // cross-version case where own localVersion < broadcast.version.
+      // version race), reconcileDownward is a no-op — issue #263's
+      // `noteSiblingWin` cache above covers the cross-version case where
+      // own localVersion < broadcast.version.
       const recovered = await pointer.recoverLatest();
       if (recovered) {
         const outcome = await pointer.reconcileLocalVersionDownward(recovered);
