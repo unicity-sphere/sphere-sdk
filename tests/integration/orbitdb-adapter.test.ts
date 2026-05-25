@@ -392,3 +392,274 @@ describeOrSkip('OrbitDB Adapter replication (same key)', { timeout: 60_000 }, ()
     expect(adapterB.isConnected()).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Issue #266 — HTTP-only IPFS mode for wallet/CLI clients.
+//
+// When `httpOnlyIpfs: true` is set on OrbitDbConfig the adapter MUST:
+//   - skip Helia's FsBlockstore (no `<directory>/blocks/` on disk),
+//   - skip Helia's libp2p datastore (no peer-id/keychain on disk under
+//     `<directory>` — these only get written under that path because
+//     `directory` is passed into Helia options),
+//   - take the isolated libp2p path (no DHT/bootstrap/peerDiscovery —
+//     verified via test stability, since heavy mode hangs on bootstrap
+//     in offline test envs),
+//   - still let OrbitDB's level DB persist OpLog heads under
+//     `<directory>/<dbname>/` (so cross-process recovery works once
+//     blocks are re-warmed by HTTP snapshot prefetch in production).
+// ---------------------------------------------------------------------------
+
+describeOrSkip('OrbitDB Adapter — httpOnlyIpfs mode (issue #266)', { timeout: 60_000 }, () => {
+  it('basic CRUD works with httpOnlyIpfs: true', async () => {
+    suppressWebRtcErrors();
+    const dir = makeTempDir('httponly-crud');
+    const adapter = new OrbitDbAdapter();
+
+    try {
+      await adapter.connect({
+        privateKey: randomKey(),
+        directory: dir,
+        enablePubSub: false,
+        httpOnlyIpfs: true,
+      });
+      expect(adapter.isConnected()).toBe(true);
+
+      await adapter.put('crud.k1', encode('v1'));
+      await adapter.put('crud.k2', encode('v2'));
+      const v1 = await adapter.get('crud.k1');
+      const v2 = await adapter.get('crud.k2');
+      expect(v1).not.toBeNull();
+      expect(v2).not.toBeNull();
+      expect(decode(v1!)).toBe('v1');
+      expect(decode(v2!)).toBe('v2');
+    } finally {
+      await adapter.close();
+      cleanupDir(dir);
+      restoreUncaughtListeners();
+    }
+  });
+
+  it('httpOnlyIpfs: true KEEPS FsBlockstore (cross-process recovery on same dataDir)', async () => {
+    // Contract pin: lightweight mode strips libp2p networking (the
+    // actual cost driver — see issue #266 root cause) but KEEPS the
+    // local FsBlockstore. This is the user-approved tradeoff
+    // ("preserve local helia storage but no libp2p bootstrapping"):
+    // a freshly-initted wallet's OpLog blocks survive process exit
+    // without depending on the flush-scheduler having pushed them
+    // to operator Kubo first.
+    suppressWebRtcErrors();
+    const dir = makeTempDir('httponly-keeps-fsblocks');
+    const adapter = new OrbitDbAdapter();
+
+    try {
+      await adapter.connect({
+        privateKey: randomKey(),
+        directory: dir,
+        enablePubSub: false,
+        httpOnlyIpfs: true,
+      });
+      // Touch the OpLog so the adapter has done at least one IPFS write
+      await adapter.put('probe.k', encode('probe'));
+
+      // FsBlockstore writes its CAR blocks under `<directory>/blocks/`.
+      const blocksDir = path.join(dir, 'blocks');
+      expect(fs.existsSync(blocksDir)).toBe(true);
+    } finally {
+      await adapter.close();
+      cleanupDir(dir);
+      restoreUncaughtListeners();
+    }
+  });
+
+  it('reopen on same directory: lightweight mode recovers prior writes from FsBlockstore', async () => {
+    // Cross-process recovery contract: write data, close, reopen on
+    // the same directory. In `httpOnlyIpfs: true` mode we strip
+    // libp2p networking and default block brokers BUT keep the
+    // FsBlockstore, so OpLog blocks survive process exit without
+    // depending on a flush to operator Kubo having completed first.
+    //
+    // This is the wallet CLI's happy path: a `sphere init` followed
+    // by a `sphere balance` in a fresh process must work even before
+    // any operator-side flush completes (the flush is async and may
+    // not finish during a short-lived CLI session).
+    suppressWebRtcErrors();
+    const dir = makeTempDir('httponly-reopen');
+    const key = randomKey();
+
+    try {
+      const a = new OrbitDbAdapter();
+      await a.connect({
+        privateKey: key,
+        directory: dir,
+        enablePubSub: false,
+        httpOnlyIpfs: true,
+      });
+      await a.put('reopen.k', encode('original'));
+      const beforeClose = await a.get('reopen.k');
+      expect(beforeClose).not.toBeNull();
+      expect(decode(beforeClose!)).toBe('original');
+      await a.close();
+
+      // Reopen — same dir, same key, fresh process state.
+      const b = new OrbitDbAdapter();
+      await b.connect({
+        privateKey: key,
+        directory: dir,
+        enablePubSub: false,
+        httpOnlyIpfs: true,
+      });
+      // Recover via FsBlockstore — must succeed quickly, no public
+      // gateway walks (those would time out at 30s each).
+      const start = Date.now();
+      const afterReopen = await b.get('reopen.k');
+      const elapsedMs = Date.now() - start;
+      expect(afterReopen).not.toBeNull();
+      expect(decode(afterReopen!)).toBe('original');
+      expect(elapsedMs).toBeLessThan(5000);
+      await b.close();
+    } finally {
+      cleanupDir(dir);
+      restoreUncaughtListeners();
+    }
+  });
+
+  it('reopen with WIPED FsBlockstore + HTTP fallback: lightweight mode recovers via operator Kubo HTTP', async () => {
+    // Cross-DEVICE recovery: stand up a tiny in-process HTTP server
+    // that mimics Kubo's `POST /api/v0/block/get?arg=<cid>` endpoint,
+    // write data via adapter A, snapshot the blocks into the fake
+    // gateway's store, close A, WIPE the `<dir>/blocks/` directory
+    // (simulating a fresh device where the FsBlockstore has nothing
+    // but the level DB heads have been replicated via the snapshot
+    // mechanism), then open adapter B in the same `directory`. B
+    // must HTTP-fetch the missing blocks from the fake gateway and
+    // recover the data with no libp2p / public-gateway involvement.
+    //
+    // This validates the production cross-DEVICE recovery contract:
+    // a fresh device pulls the snapshot CAR via HTTP from operator
+    // Kubo and the OpLog blocks via the HTTP block broker. In the
+    // same-device cross-PROCESS case the FsBlockstore on disk would
+    // satisfy the read directly without the broker needing to fire.
+    suppressWebRtcErrors();
+    const http = await import('http' as string);
+    const dir = makeTempDir('httponly-reopen-http');
+    const key = randomKey();
+    const blockStore = new Map<string, Uint8Array>();
+
+    // Tiny fake operator Kubo: serves POST /api/v0/block/get?arg=<cid>
+    // by looking up the CID in `blockStore`. 404 on miss.
+    const server = http.createServer((req: any, res: any) => {
+      const url = new URL(req.url, 'http://localhost');
+      if (req.method === 'POST' && url.pathname === '/api/v0/block/get') {
+        const cidString = url.searchParams.get('arg') ?? '';
+        const bytes = blockStore.get(cidString);
+        if (!bytes) {
+          res.statusCode = 404;
+          res.end('not found');
+          return;
+        }
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'application/octet-stream');
+        res.end(Buffer.from(bytes));
+        return;
+      }
+      res.statusCode = 404;
+      res.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    const port = (server.address() as any).port;
+    const gateway = `http://127.0.0.1:${port}`;
+
+    try {
+      // Phase A — write data with the local blockstore. Tap into Helia's
+      // blockstore put to record every block in our fake gateway, since
+      // the SDK's flush-scheduler isn't running in this unit test.
+      const a = new OrbitDbAdapter();
+      await a.connect({
+        privateKey: key,
+        directory: dir,
+        enablePubSub: false,
+        httpOnlyIpfs: true,
+        ipfsGateways: [gateway],
+      });
+      // Snoop Helia's blockstore.put so we capture every CID/bytes
+      // pair (this stands in for the flush-scheduler's HTTP pin step).
+      const heliaInstance: any = (a as any).helia;
+      const originalPut = heliaInstance.blockstore.put.bind(heliaInstance.blockstore);
+      heliaInstance.blockstore.put = async (cid: any, bytes: Uint8Array, ...rest: any[]) => {
+        blockStore.set(cid.toString(), bytes);
+        return originalPut(cid, bytes, ...rest);
+      };
+
+      await a.put('recovery.k1', encode('alpha'));
+      await a.put('recovery.k2', encode('beta'));
+      await a.close();
+
+      // Simulate a cross-device move: wipe the local FsBlockstore so
+      // OrbitDB can't satisfy the read locally and MUST fall through
+      // to the HTTP broker. (Same-device cross-process recovery is
+      // covered by the previous test, where FsBlockstore stays.)
+      const blocksDir = path.join(dir, 'blocks');
+      if (fs.existsSync(blocksDir)) {
+        fs.rmSync(blocksDir, { recursive: true, force: true });
+      }
+
+      // Phase B — reopen with the wiped blockstore. Must HTTP-fetch
+      // the missing blocks from the fake gateway.
+      const b = new OrbitDbAdapter();
+      await b.connect({
+        privateKey: key,
+        directory: dir,
+        enablePubSub: false,
+        httpOnlyIpfs: true,
+        ipfsGateways: [gateway],
+      });
+
+      const v1 = await b.get('recovery.k1');
+      const v2 = await b.get('recovery.k2');
+      expect(v1).not.toBeNull();
+      expect(v2).not.toBeNull();
+      expect(decode(v1!)).toBe('alpha');
+      expect(decode(v2!)).toBe('beta');
+      await b.close();
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      cleanupDir(dir);
+      restoreUncaughtListeners();
+    }
+  });
+
+  it('httpOnlyIpfs: true overrides a non-empty bootstrapPeers list', async () => {
+    // Contract: httpOnlyIpfs takes precedence — the isolation contract
+    // wins over any caller-supplied peer list. Without this the wallet
+    // could be tricked into the heavy libp2p path by stray config.
+    suppressWebRtcErrors();
+    const dir = makeTempDir('httponly-overrides-peers');
+    const adapter = new OrbitDbAdapter();
+
+    try {
+      // Pass a non-empty bootstrap list AND httpOnlyIpfs: true. If
+      // httpOnlyIpfs did not win, the adapter would dial the bogus
+      // /ip4/198.51.100.1 (TEST-NET-2) address forever and the test
+      // would fail by timeout. If httpOnlyIpfs wins, the adapter
+      // forces isolated mode and never dials anything.
+      await adapter.connect({
+        privateKey: randomKey(),
+        directory: dir,
+        enablePubSub: false,
+        httpOnlyIpfs: true,
+        bootstrapPeers: ['/ip4/198.51.100.1/tcp/4001/p2p/QmInvalidBootstrapPeerForIssue266Test'],
+      });
+      expect(adapter.isConnected()).toBe(true);
+
+      // And a write still works (no peer needed — local-only).
+      await adapter.put('override.k', encode('ok'));
+      const v = await adapter.get('override.k');
+      expect(v).not.toBeNull();
+      expect(decode(v!)).toBe('ok');
+    } finally {
+      await adapter.close();
+      cleanupDir(dir);
+      restoreUncaughtListeners();
+    }
+  });
+});

@@ -691,6 +691,13 @@ export class ProfileStorageProvider implements StorageProvider {
           ...orbitDbConfig,
           privateKey: dbNameOverride ? undefined : identityAtStart.privateKey,
           dbNameOverride,
+          // Issue #266 — when the adapter is in `httpOnlyIpfs` mode it
+          // needs the operator-controlled Kubo gateway list to install
+          // the HTTP block broker. We carry `ipfsGateways` from the
+          // top-level ProfileConfig (the canonical source) down into
+          // OrbitDbConfig so the raw OrbitDbAdapter doesn't have to
+          // reach back into ProfileConfig itself.
+          ipfsGateways: orbitDbConfig.ipfsGateways ?? this.options?.config?.ipfsGateways,
         });
         this.dbStatus = 'attached';
         this.attachedChainPubkey = identityAtStart.chainPubkey ?? null;

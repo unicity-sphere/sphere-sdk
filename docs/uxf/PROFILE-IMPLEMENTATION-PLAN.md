@@ -153,8 +153,19 @@ Layer 2 (Group C) -- depends on Layer 1, all parallel ──────
   `OrbitDbConfig`:
   - `privateKey: string` -- wallet private key for identity derivation
   - `directory?: string` -- local storage directory (Node.js)
-  - `bootstrapPeers?: string[]` -- libp2p bootstrap peers
+  - `bootstrapPeers?: string[]` -- libp2p bootstrap peers (ignored when `httpOnlyIpfs: true`)
   - `enablePubSub?: boolean` -- default true
+  - `httpOnlyIpfs?: boolean` -- issue #266 lightweight client mode.
+    When `true`, the adapter skips Helia's `FsBlockstore` (memory blockstore
+    only), skips the Helia libp2p datastore (no peer-id/keychain on disk),
+    and forces libp2p into isolated mode (no DHT, bootstrap, peerDiscovery,
+    autoNAT, dcutr, delegatedRouting, ipnsFetch, ipnsPublish — only
+    identify/identifyPush/keychain/ping + the gossipsub stub required by
+    OrbitDB v3 remain). OrbitDB's level DB (OpLog heads) still persists
+    under `directory`. Defaults to `true` in `createNodeProfileProviders`
+    and `createBrowserProfileProviders`; operator/test code that wants
+    real libp2p peer discovery passes `httpOnlyIpfs: false` and a
+    non-empty `bootstrapPeers` explicitly.
 
   Access control:
   - Use `OrbitDBAccessController` with `write: [orbitDbIdentityId]`

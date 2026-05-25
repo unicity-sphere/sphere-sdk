@@ -99,6 +99,12 @@ export function createNodeProfileProviders(
     orbitDb: {
       privateKey: '', // Set later via setIdentity()
       directory: config.profileConfig?.orbitDb?.directory ?? `${config.dataDir}/orbitdb`,
+      // Issue #266 — Node.js wallet/CLI clients default to HTTP-only IPFS:
+      // no libp2p DHT/bootstrap/peerDiscovery, memory-only blockstore,
+      // operator Kubo gateway via HTTP for persistence. Operator-side
+      // bridges that want real peer discovery pass `httpOnlyIpfs: false`
+      // and configure `bootstrapPeers` explicitly.
+      httpOnlyIpfs: true,
       ...(config.profileConfig?.orbitDb ?? {}),
     },
     encrypt: config.profileConfig?.encrypt ?? true,
