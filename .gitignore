@@ -45,3 +45,4 @@ tests/e2e/local-infra/.aggregator-go/
 
 # Community / Discord report drafts (agent-authored, not source)
 community-reports/
+.tmp/

@@ -191,6 +191,16 @@ export class ProfilePointerLayer {
    * treated as flag=false / fail-closed). Implementing only one
    * silently disables broadcasts with no error.
    *
+   * **Accessor contract.** `winBroadcastsEnabled()` MUST be a pure
+   * accessor and MUST NOT throw. The publisher's broad catch arm
+   * would otherwise classify the throw as a TRANSIENT publish
+   * failure and silently disable broadcasts while reporting
+   * `{ ok: true, transient: true }` to the caller; the subscriber
+   * side would log "subscription install failed" and indefinitely
+   * re-arm on every subsequent event. A real `ProfilePointerLayer`
+   * reads its frozen config snapshot and cannot throw; alternative
+   * implementations MUST honor the same contract.
+   *
    * **Init-time-only flag.** The flag is captured in the frozen
    * `#config` snapshot at construction time. Flipping
    * `enablePointerWinBroadcasts` at runtime (e.g., via a hot config
@@ -206,6 +216,18 @@ export class ProfilePointerLayer {
    * arms the subscription automatically. There is no third trigger
    * that would re-arm the subscriber on a flip from false→true
    * without a fresh publish.
+   *
+   * **Receive-only-wallet caveat.** A wallet that has the flag
+   * enabled but never PUBLISHES (e.g., a pure receive endpoint that
+   * only ingests sibling-device payments) will never emit a
+   * `storage:pointer-published` event of its own. Its
+   * `maybeInstallPointerWinSubscription` is therefore not triggered
+   * by its own publish path; the subscription only arms if some
+   * external code path calls `maybeInstallPointerWinSubscription()`
+   * directly. For receive-only wallets that want to consume sibling
+   * broadcasts, the wiring layer (Sphere) must arrange that
+   * trigger explicitly — e.g., on init when the flag is observed
+   * enabled.
    */
   winBroadcastsEnabled(): boolean {
     return this.#config.enablePointerWinBroadcasts === true;

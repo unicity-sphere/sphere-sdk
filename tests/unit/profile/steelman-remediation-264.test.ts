@@ -147,15 +147,26 @@ describe('ProfilePointerLayer — probeHistory preservation (#264)', () => {
     expect(fp2).not.toBe(fp1);
   });
 
-  it('cold-start fingerprint is empty until first non-empty discovery', async () => {
+  it('cold-start fingerprint is empty; survives an empty-probe discovery; flips to non-empty on first real probe (#264)', async () => {
     const layer = await buildLayer();
     const fp0 = await layer.getProbeFingerprint();
     expect(fp0).toBe('');
-    // First discovery with empty probeVersions stays empty.
+    // Empty-probe discovery preserves the empty fingerprint.
     discoverMockState.nextResult = { validV: 0, includedV: 0, probeVersions: [] };
     await layer.discoverLatestVersion();
     const fp1 = await layer.getProbeFingerprint();
     expect(fp1).toBe('');
+    // Tightening (round-4 steelman): a follow-on non-empty discovery
+    // MUST actually flip the fingerprint to non-empty. Without this
+    // assertion the "empty stays empty" test passes under a buggy
+    // variant `if (length === 0) assign` because in that variant
+    // empty preserves empty too — but a real probe-set wouldn't
+    // produce a fingerprint.
+    discoverMockState.nextResult = { validV: 7, includedV: 5, probeVersions: [3, 4, 5] };
+    await layer.discoverLatestVersion();
+    const fp2 = await layer.getProbeFingerprint();
+    expect(fp2.length).toBeGreaterThan(0);
+    expect(fp2).not.toBe(fp0);
   });
 });
 
