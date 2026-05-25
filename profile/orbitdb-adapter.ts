@@ -252,21 +252,32 @@ export class OrbitDbAdapter implements ProfileDatabase {
       //
       // What we strip:
       //   - libp2p networking (DHT, bootstrap peers, peer discovery,
-      //     autoNAT, dcutr, delegatedRouting, ipnsFetch, ipnsPublish)
+      //     autoNAT, dcutr, delegatedRouting, ipnsFetch, ipnsPublish).
+      //     This is the actual cost driver — 80+ TCP connections to
+      //     port 4001, ~3 min wall-clock per CLI invocation.
       //   - Helia's default block brokers (bitswap hangs without peers;
-      //     trustlessGateway walks public gateways with 30s timeouts)
-      //   - Helia's `FsBlockstore` on disk (memory blockstore is the
-      //     local cache; user-direction: "store all its related
-      //     records in memory only")
+      //     trustlessGateway walks public gateways with 30s timeouts).
       //
-      // What replaces them:
+      // What we KEEP:
+      //   - Helia's `FsBlockstore` under `<directory>/blocks/`. The
+      //     on-disk blockstore is essential for cross-process recovery
+      //     on the same `dataDir`: a freshly-initted wallet writes
+      //     OpLog blocks to disk before exit, the next CLI invocation
+      //     reads them back, OrbitDB decodes its OpLog. Disk-resident
+      //     blocks are MB-scale — negligible vs the libp2p costs we
+      //     stripped above. The user accepted this tradeoff:
+      //     "preserving local helia storage (but no libp2p
+      //     bootstraping)" ensures full functionality without a
+      //     separate fix for the flush-on-init timing window.
+      //
+      // What we ADD (cross-device / fresh-`dataDir` recovery):
       //   - A single HTTP `BlockBroker` (profile/http-block-broker.ts)
-      //     that fetches missing blocks via `POST /api/v0/block/get`
-      //     against the operator-controlled Kubo gateways supplied in
-      //     `config.ipfsGateways`. Cross-process AND cross-device
-      //     recovery both work via HTTP — the flush-scheduler's
-      //     per-flush remote-durability gate (default 30s, issue #239)
-      //     ensures blocks reach operator Kubo before the wallet exits.
+      //     installed when `ipfsGateways` is supplied. On a local
+      //     blockstore miss, the broker fetches via
+      //     `POST /api/v0/block/get?arg=<cid>` against the operator-
+      //     controlled Kubo gateways. Helia's `NetworkedStorage`
+      //     consults brokers only on miss, so FsBlockstore hits stay
+      //     fast.
       //
       // The non-httpOnly path is unchanged: `FsBlockstore` on disk,
       // full libp2pDefaults, public trustless gateways available.
@@ -275,7 +286,7 @@ export class OrbitDbAdapter implements ProfileDatabase {
       const httpOnlyIpfs = config.httpOnlyIpfs === true;
 
       const heliaOptions: Record<string, unknown> = {};
-      if (config.directory && !httpOnlyIpfs) {
+      if (config.directory) {
         heliaOptions.directory = config.directory;
 
         // Issue #234 follow-up — Helia v6 defaults to MemoryBlockstore
@@ -291,10 +302,12 @@ export class OrbitDbAdapter implements ProfileDatabase {
         // persist across destroys for cross-process / cross-device
         // recovery on the same dataDir.
         //
-        // Issue #266 — skipped when `httpOnlyIpfs` is set: the HTTP
-        // block broker re-fetches missing blocks from operator Kubo
-        // (which always has the wallet's data because the flush-
-        // scheduler pushes there with a per-flush durability gate).
+        // Issue #266 kept this path even in lightweight mode (the
+        // user-approved tradeoff is "preserve local helia storage
+        // but no libp2p bootstrapping"). FsBlockstore handles
+        // cross-process recovery on the same dataDir without
+        // requiring the flush to have completed before process exit.
+        // Cross-device recovery still uses the HTTP block broker.
         try {
           const blockstoreFsModule: any = await import('blockstore-fs' as string);
           const FsBlockstoreCtor =

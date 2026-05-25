@@ -109,15 +109,13 @@ export interface OrbitDbConfig {
    *     gateways via `POST /api/v0/block/get?arg=<cid>`, configured
    *     by `ipfsGateways` (see below).
    *
-   * Helia's `MemoryBlockstore` is used by default. Cross-process
-   * recovery happens via the HTTP broker (the previous process pushed
-   * its blocks to operator Kubo via the flush-scheduler before exit,
-   * the next process HTTP-fetches them back). If `directory` is set,
-   * we keep `FsBlockstore` as well — disk hits are faster than HTTP
-   * round-trips for hot blocks.
-   *
-   * Cross-DEVICE recovery (different machine, fresh `dataDir`) also
-   * relies on the HTTP fallback plus the snapshot prefetch in
+   * What is NOT stripped: Helia's `FsBlockstore` under
+   * `<directory>/blocks/`. The on-disk blockstore handles cross-PROCESS
+   * recovery on the same `dataDir` without depending on a successful
+   * flush-to-Kubo before process exit. Disk-resident blocks are
+   * MB-scale — negligible vs the libp2p costs we stripped.
+   * Cross-DEVICE recovery (different machine, fresh `dataDir`) is
+   * served by the HTTP block broker + the snapshot prefetch in
    * `profile/ipfs-client.ts`.
    *
    * Recommended default for `createNodeProfileProviders` and
