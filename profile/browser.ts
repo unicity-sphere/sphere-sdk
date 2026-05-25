@@ -93,6 +93,11 @@ export function createBrowserProfileProviders(
   const profileConfig: ProfileConfig = {
     orbitDb: {
       privateKey: '', // Set later via setIdentity()
+      // Issue #266 — browser wallets default to HTTP-only IPFS:
+      // no libp2p DHT/bootstrap/peerDiscovery, memory-only blockstore,
+      // operator Kubo gateway via HTTP for persistence. Avoids
+      // burning the user's browser tab on libp2p protocol handlers.
+      httpOnlyIpfs: true,
       ...(config.profileConfig?.orbitDb ?? {}),
     },
     encrypt: config.profileConfig?.encrypt ?? true,

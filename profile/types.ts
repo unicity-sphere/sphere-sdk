@@ -90,6 +90,42 @@ export interface OrbitDbConfig {
   readonly bootstrapPeers?: string[];
   /** Enable libp2p pubsub for replication (default: true) */
   readonly enablePubSub?: boolean;
+  /**
+   * Issue #266 — HTTP-only IPFS mode for wallet/CLI clients.
+   *
+   * When `true`, the OrbitDB adapter:
+   *   - Forces libp2p into isolated mode (no DHT, bootstrap, autoNAT,
+   *     dcutr, peerDiscovery, delegatedRouting, ipnsFetch, ipnsPublish).
+   *     Only identify, identifyPush, keychain, ping, and the gossipsub
+   *     stub required by OrbitDB v3 remain. No outbound TCP connections
+   *     to port 4001; the global IPFS DHT is not joined.
+   *   - Uses Helia's default `MemoryBlockstore` (skips `FsBlockstore`)
+   *     so CAR blocks live in-process only. Cross-process recovery is
+   *     served by the operator-side Kubo gateway over HTTP via the
+   *     `ipfsGateways` config and the snapshot prefetch mechanism.
+   *   - Skips passing `directory` into Helia (libp2p peer-id and
+   *     keychain are not persisted; a fresh ephemeral peer id is used
+   *     per session — harmless since no peer connects).
+   *
+   * The OrbitDB level DB (OpLog heads) is still persisted via the
+   * top-level `directory` config — only Helia / libp2p artefacts go
+   * memory-only. Aggregator pointer + snapshot prefetch handle
+   * cross-device durability without requiring direct libp2p sync.
+   *
+   * Recommended default for `createNodeProfileProviders` and
+   * `createBrowserProfileProviders` (the wallet client factories).
+   * Tests and operator-side bridges that want real peer discovery
+   * pass `httpOnlyIpfs: false` and configure `bootstrapPeers`
+   * explicitly.
+   *
+   * If `bootstrapPeers` is also supplied as a non-empty array,
+   * `httpOnlyIpfs: true` wins — the explicit isolation contract
+   * takes precedence over any peer list.
+   *
+   * @default false on the raw `OrbitDbConfig` (backward compat).
+   *          The wallet factories override to `true`.
+   */
+  readonly httpOnlyIpfs?: boolean;
 }
 
 // =============================================================================

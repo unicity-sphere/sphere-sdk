@@ -392,3 +392,181 @@ describeOrSkip('OrbitDB Adapter replication (same key)', { timeout: 60_000 }, ()
     expect(adapterB.isConnected()).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Issue #266 — HTTP-only IPFS mode for wallet/CLI clients.
+//
+// When `httpOnlyIpfs: true` is set on OrbitDbConfig the adapter MUST:
+//   - skip Helia's FsBlockstore (no `<directory>/blocks/` on disk),
+//   - skip Helia's libp2p datastore (no peer-id/keychain on disk under
+//     `<directory>` — these only get written under that path because
+//     `directory` is passed into Helia options),
+//   - take the isolated libp2p path (no DHT/bootstrap/peerDiscovery —
+//     verified via test stability, since heavy mode hangs on bootstrap
+//     in offline test envs),
+//   - still let OrbitDB's level DB persist OpLog heads under
+//     `<directory>/<dbname>/` (so cross-process recovery works once
+//     blocks are re-warmed by HTTP snapshot prefetch in production).
+// ---------------------------------------------------------------------------
+
+describeOrSkip('OrbitDB Adapter — httpOnlyIpfs mode (issue #266)', { timeout: 60_000 }, () => {
+  it('basic CRUD works with httpOnlyIpfs: true', async () => {
+    suppressWebRtcErrors();
+    const dir = makeTempDir('httponly-crud');
+    const adapter = new OrbitDbAdapter();
+
+    try {
+      await adapter.connect({
+        privateKey: randomKey(),
+        directory: dir,
+        enablePubSub: false,
+        httpOnlyIpfs: true,
+      });
+      expect(adapter.isConnected()).toBe(true);
+
+      await adapter.put('crud.k1', encode('v1'));
+      await adapter.put('crud.k2', encode('v2'));
+      const v1 = await adapter.get('crud.k1');
+      const v2 = await adapter.get('crud.k2');
+      expect(v1).not.toBeNull();
+      expect(v2).not.toBeNull();
+      expect(decode(v1!)).toBe('v1');
+      expect(decode(v2!)).toBe('v2');
+    } finally {
+      await adapter.close();
+      cleanupDir(dir);
+      restoreUncaughtListeners();
+    }
+  });
+
+  it('httpOnlyIpfs: true skips Helia FsBlockstore on disk', async () => {
+    suppressWebRtcErrors();
+    const dir = makeTempDir('httponly-no-fsblocks');
+    const adapter = new OrbitDbAdapter();
+
+    try {
+      await adapter.connect({
+        privateKey: randomKey(),
+        directory: dir,
+        enablePubSub: false,
+        httpOnlyIpfs: true,
+      });
+      // Touch the OpLog so the adapter has done at least one IPFS write
+      await adapter.put('probe.k', encode('probe'));
+
+      // The FsBlockstore writes its CAR blocks under `<directory>/blocks/`.
+      // In httpOnlyIpfs mode we configure Helia with the default
+      // MemoryBlockstore instead, so this directory must NOT exist.
+      const blocksDir = path.join(dir, 'blocks');
+      expect(fs.existsSync(blocksDir)).toBe(false);
+    } finally {
+      await adapter.close();
+      cleanupDir(dir);
+      restoreUncaughtListeners();
+    }
+  });
+
+  it('reopen on same directory: lightweight mode loses prior writes (fast-fail, not a 30s gateway walk)', async () => {
+    // ADVERSARIAL: write data, close, reopen on the same directory.
+    // In httpOnlyIpfs mode the Helia blockstore is memory-only and we
+    // strip Helia's default block brokers (bitswap + public trustless
+    // gateways), so a missing block returns FAST (not a 30-second
+    // walk over `trustless-gateway.link` and `4everland.io`).
+    //
+    // Contract pinned here:
+    //   - Data written before close() is not recoverable on reopen
+    //     via the bare adapter (no FsBlockstore, no HTTP fallback).
+    //     A read of a missing key returns `null` quickly, NOT a
+    //     thrown error with a 30s gateway timeout chain.
+    //   - Cross-process recovery in production happens at the
+    //     ProfileStorageProvider layer: the snapshot prefetch
+    //     (PROFILE-AGGREGATOR-POINTER-*) fetches the snapshot CAR
+    //     from operator Kubo via HTTP (profile/ipfs-client.ts) and
+    //     re-warms Helia's memory blockstore BEFORE OrbitDB does any
+    //     read.
+    //
+    // This test pins the bare-adapter contract so future changes
+    // don't accidentally regress to disk-backed mode (which would
+    // re-introduce the 80+ TCP connection cost on every CLI
+    // invocation — issue #266) or to the slow public-gateway walk.
+    suppressWebRtcErrors();
+    const dir = makeTempDir('httponly-reopen');
+    const key = randomKey();
+
+    try {
+      const a = new OrbitDbAdapter();
+      await a.connect({
+        privateKey: key,
+        directory: dir,
+        enablePubSub: false,
+        httpOnlyIpfs: true,
+      });
+      await a.put('reopen.k', encode('original'));
+      const beforeClose = await a.get('reopen.k');
+      expect(beforeClose).not.toBeNull();
+      expect(decode(beforeClose!)).toBe('original');
+      await a.close();
+
+      // Reopen — same dir, same key, but a fresh Helia memory blockstore.
+      const b = new OrbitDbAdapter();
+      await b.connect({
+        privateKey: key,
+        directory: dir,
+        enablePubSub: false,
+        httpOnlyIpfs: true,
+      });
+      // The OpLog heads are in level DB on disk, but their referenced
+      // entry blocks live in the previous process's memory and are now
+      // gone. With `blockBrokers: []` AND the monkey-patch that swallows
+      // `InvalidConfigurationError`, `get` returns null quickly.
+      const start = Date.now();
+      const afterReopen = await b.get('reopen.k');
+      const elapsedMs = Date.now() - start;
+      expect(afterReopen).toBeNull();
+      // Fast-fail contract: this MUST be near-instant. If we accidentally
+      // re-enable Helia's default trustless gateways, the test would
+      // hang 30 seconds walking trustless-gateway.link / 4everland.io.
+      // 5 seconds is generous; in practice this should be < 100ms.
+      expect(elapsedMs).toBeLessThan(5000);
+      await b.close();
+    } finally {
+      cleanupDir(dir);
+      restoreUncaughtListeners();
+    }
+  });
+
+  it('httpOnlyIpfs: true overrides a non-empty bootstrapPeers list', async () => {
+    // Contract: httpOnlyIpfs takes precedence — the isolation contract
+    // wins over any caller-supplied peer list. Without this the wallet
+    // could be tricked into the heavy libp2p path by stray config.
+    suppressWebRtcErrors();
+    const dir = makeTempDir('httponly-overrides-peers');
+    const adapter = new OrbitDbAdapter();
+
+    try {
+      // Pass a non-empty bootstrap list AND httpOnlyIpfs: true. If
+      // httpOnlyIpfs did not win, the adapter would dial the bogus
+      // /ip4/198.51.100.1 (TEST-NET-2) address forever and the test
+      // would fail by timeout. If httpOnlyIpfs wins, the adapter
+      // forces isolated mode and never dials anything.
+      await adapter.connect({
+        privateKey: randomKey(),
+        directory: dir,
+        enablePubSub: false,
+        httpOnlyIpfs: true,
+        bootstrapPeers: ['/ip4/198.51.100.1/tcp/4001/p2p/QmInvalidBootstrapPeerForIssue266Test'],
+      });
+      expect(adapter.isConnected()).toBe(true);
+
+      // And a write still works (no peer needed — local-only).
+      await adapter.put('override.k', encode('ok'));
+      const v = await adapter.get('override.k');
+      expect(v).not.toBeNull();
+      expect(decode(v!)).toBe('ok');
+    } finally {
+      await adapter.close();
+      cleanupDir(dir);
+      restoreUncaughtListeners();
+    }
+  });
+});

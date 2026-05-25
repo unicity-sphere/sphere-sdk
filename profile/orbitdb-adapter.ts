@@ -248,8 +248,17 @@ export class OrbitDbAdapter implements ProfileDatabase {
         // gossipsub not installed -- OrbitDB Sync will fail if it tries to use pubsub
       }
 
+      // Issue #266 — HTTP-only IPFS mode for wallet/CLI clients.
+      // When httpOnlyIpfs is set, the local Helia node is a per-process
+      // cache only: memory blockstore, ephemeral peer id, no libp2p
+      // datastore on disk. Cross-process / cross-device recovery is
+      // served by the operator-side Kubo gateway over HTTP (via
+      // `ipfsGateways`) plus the snapshot prefetch mechanism, NOT by
+      // FsBlockstore persistence. See `OrbitDbConfig.httpOnlyIpfs`.
+      const httpOnlyIpfs = config.httpOnlyIpfs === true;
+
       const heliaOptions: Record<string, unknown> = {};
-      if (config.directory) {
+      if (config.directory && !httpOnlyIpfs) {
         heliaOptions.directory = config.directory;
 
         // Issue #234 follow-up — Helia v6 defaults to MemoryBlockstore
@@ -264,6 +273,10 @@ export class OrbitDbAdapter implements ProfileDatabase {
         // OrbitDB fails to decode the OpLog. Use FsBlockstore so blocks
         // persist across destroys for cross-process / cross-device
         // recovery on the same dataDir.
+        //
+        // Issue #266 — skipped when `httpOnlyIpfs` is set: clients
+        // accept the memory-only blockstore and rely on the operator
+        // Kubo gateway via HTTP for cross-process recovery.
         try {
           const blockstoreFsModule: any = await import('blockstore-fs' as string);
           const FsBlockstoreCtor =
@@ -311,8 +324,9 @@ export class OrbitDbAdapter implements ProfileDatabase {
           );
         }
 
-        // **Isolated / test mode** — an explicit empty `bootstrapPeers`
-        // array signals "do not attempt peer discovery."
+        // **Isolated / test mode** — explicit empty `bootstrapPeers`
+        // array OR `httpOnlyIpfs: true` signals "do not attempt peer
+        // discovery."
         //
         // Why: `libp2pDefaults()` unconditionally includes
         // `peerDiscovery: [bootstrap(bootstrapConfig)]` pointing at the
@@ -322,19 +336,28 @@ export class OrbitDbAdapter implements ProfileDatabase {
         // suite timeout (originally tracked in sphere-sdk#105, which
         // led to the test being skipped in CI wholesale).
         //
-        // With `bootstrapPeers: []`, we keep gossipsub (so OrbitDB v3
-        // doesn't fail on missing pubsub) and the local-only services
+        // The same heavyweight bootstrap path also burns wallet CPU and
+        // file descriptors during every CLI invocation (issue #266):
+        // 80+ libp2p TCP connections to port 4001, ~3 min wall-clock
+        // for `sphere wallet use alice`. Wallet clients should never
+        // join the global IPFS DHT — they HTTP-only against operator
+        // Kubo gateways.
+        //
+        // With isolation, we keep gossipsub (so OrbitDB v3 doesn't
+        // fail on missing pubsub) and the local-only services
         // (keychain, identify, ping) but drop every outbound-discovery
         // surface: peerDiscovery, DHT, autoNAT, dcutr, delegated
         // routing. The adapter remains fully functional for single-
-        // process OrbitDB operations — which is all the CI integration
-        // test needs.
+        // process OrbitDB operations.
         //
         // Production callers who want real peer discovery either omit
-        // `bootstrapPeers` (getting libp2pDefaults behaviour) or pass
-        // a non-empty list (wired here).
-        const isIsolated = Array.isArray(config.bootstrapPeers) &&
-          config.bootstrapPeers.length === 0;
+        // `bootstrapPeers` AND `httpOnlyIpfs` (getting libp2pDefaults
+        // behaviour) or pass a non-empty list (wired here). When
+        // `httpOnlyIpfs: true` is set, any non-empty bootstrap list is
+        // ignored — the isolation contract takes precedence.
+        const isIsolated = httpOnlyIpfs ||
+          (Array.isArray(config.bootstrapPeers) &&
+            config.bootstrapPeers.length === 0);
         if (isIsolated) {
           libp2pConfig.peerDiscovery = [];
           if (libp2pConfig.services) {
@@ -370,6 +393,27 @@ export class OrbitDbAdapter implements ProfileDatabase {
           pubsub: gossipsubFactory({ allowPublishToZeroTopicPeers: true }),
         };
         heliaOptions.libp2p = libp2pConfig;
+
+        // Issue #266 — disable Helia's default block brokers in HTTP-only
+        // mode. The defaults are:
+        //   - `bitswap()` — peer-to-peer via libp2p; useless without
+        //     peers and hangs waiting for them.
+        //   - `trustlessGateway()` — HTTP gateway client that discovers
+        //     gateway URLs via routing. The default routing
+        //     (delegatedRouting) returns PUBLIC gateways like
+        //     `trustless-gateway.link` and `4everland.io`. These do
+        //     not host our wallet data and produce 504s + 30-second
+        //     waits before failing.
+        //
+        // In lightweight mode the operator-side Kubo gateway is reached
+        // via `profile/ipfs-client.ts` (the snapshot prefetch + per-flush
+        // pin path) which uses our configured `ipfsGateways` directly.
+        // OrbitDB's IPFSBlockStorage hitting an empty Helia blockstore
+        // should fail FAST (returns undefined via the monkey-patch) so
+        // the snapshot prefetch can re-warm and the wallet can read.
+        if (isIsolated) {
+          heliaOptions.blockBrokers = [];
+        }
       } else if (gossipsubFactory) {
         // libp2pDefaults not available -- pass minimal libp2p with gossipsub
         heliaOptions.libp2p = {
@@ -399,6 +443,14 @@ export class OrbitDbAdapter implements ProfileDatabase {
       //
       // NotFoundError is swallowed and converted to `undefined`, matching
       // OrbitDB IPFSBlockStorage's `if (block)` contract for "no entry".
+      //
+      // Issue #266 — InvalidConfigurationError is ALSO swallowed in HTTP-only
+      // mode. When `blockBrokers: []` is configured (lightweight client),
+      // Helia's NetworkedStorage throws `InvalidConfigurationError` on a
+      // local-blockstore miss instead of `NotFoundError`. Treat it the same
+      // as "block not present" so OrbitDB sees a clean missing entry and
+      // the snapshot prefetch (which uses HTTP via `profile/ipfs-client.ts`)
+      // can re-warm the blockstore before subsequent reads.
       const heliaInstance: any = this.helia;
       if (heliaInstance?.blockstore && typeof heliaInstance.blockstore.get === 'function') {
         const blockstore = heliaInstance.blockstore;
@@ -414,7 +466,19 @@ export class OrbitDbAdapter implements ProfileDatabase {
           } catch (err) {
             const errName = (err as { name?: string } | null)?.name;
             const errCode = (err as { code?: string } | null)?.code;
-            if (errName === 'NotFoundError' || errCode === 'ERR_NOT_FOUND') {
+            if (
+              errName === 'NotFoundError' ||
+              errCode === 'ERR_NOT_FOUND' ||
+              // Issue #266 — Helia throws InvalidConfigurationError when
+              // `blockBrokers: []` and the block isn't in the local
+              // blockstore. We treat this as "missing" so OrbitDB
+              // gracefully sees an unresolved head instead of erroring
+              // out the whole read. The HTTP recovery path
+              // (snapshot prefetch via profile/ipfs-client.ts) handles
+              // re-warming the blockstore from operator Kubo gateways.
+              errName === 'InvalidConfigurationError' ||
+              errCode === 'ERR_NO_BLOCK_BROKERS'
+            ) {
               return undefined;
             }
             throw err;
