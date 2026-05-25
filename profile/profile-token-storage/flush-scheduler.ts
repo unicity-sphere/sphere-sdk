@@ -91,6 +91,22 @@ export class FlushScheduler {
    */
   private noDataFlushPending = false;
 
+  /**
+   * Issue #268 — in-memory dedup for background consolidation tasks.
+   *
+   * `flushToIpfs` triggers consolidation when bundle count exceeds
+   * `CONSOLIDATION_THRESHOLD` (3). Without this flag a burst of N
+   * rapid flushes (e.g. faucet topup delivering 6 tokens in quick
+   * succession) would each spawn its own fire-and-forget consolidate
+   * coroutine. The engine's `isConsolidationInProgress` cross-device
+   * check would catch most of them, but only after each pays the
+   * cost of one OrbitDB read. This in-process flag short-circuits
+   * the spawn entirely, ensuring exactly one consolidation runs at a
+   * time per provider instance. Cleared in the `finally` of the
+   * fire-and-forget IIFE so the next eligible flush can spawn one.
+   */
+  private consolidationInFlight: Promise<void> | null = null;
+
   constructor(
     private readonly host: ProfileTokenStorageHost,
     private readonly bundleIndex: BundleIndex,
@@ -473,11 +489,78 @@ export class FlushScheduler {
       const previousData = this.host.getLastLoadedData();
 
       // (i) Token-set check.
+      //
+      // Issue #268 follow-up — the raw set-difference of storage keys
+      // over-reports violations whenever PaymentsModule retires a
+      // token via the normal lifecycle. Two retirement paths exist:
+      //
+      //   (a) **Tombstone** (spent / burned / invalidated). The token
+      //       is removed from `this.tokens` AND a `{tokenId, stateHash,
+      //       timestamp}` row is appended to `_tombstones`. Storage key
+      //       `_<tokenId>` disappears in the new flush — legitimate.
+      //
+      //   (b) **Archive** (state transition: same genesis tokenId,
+      //       new stateHash). `addToken` archives the prior state
+      //       under the `archived-<tokenId>` key AND deletes the
+      //       wallet-level entry whose old `token.id` no longer
+      //       matches the new state. The active key `_<tokenId>` is
+      //       re-populated by the new state on the next
+      //       `createStorageData()` call — typically same key, no
+      //       set-difference. BUT during the invoice-pay /
+      //       receive-finalize race, the new state may not be in
+      //       `this.tokens` when the flush serializes (e.g., the
+      //       payment removed the source token before the next
+      //       receive replenished any state). In that case the
+      //       archive entry is the canonical record of the token.
+      //
+      // Without this allowance the at-least-once Nostr gate refuses
+      // every ack on every replayed event, the daemon spins at 200 %+
+      // CPU re-running `handleIncomingTransfer`, and the soak hang
+      // documented in issue #268 (receive --finalize → invoice pay
+      // cascade) presents as a 3-minute timeout on `invoice pay`.
+      //
+      // The legitimate-removal set is built from the operational state
+      // extracted alongside `tokens` above so we don't pay an extra
+      // OrbitDB read. Tombstone tokenIds map to `_<tokenId>` keys via
+      // the same `keyFromTokenId` rule the storage layer uses; archive
+      // keys are extracted directly from the current data via
+      // `extractTokensFromTxfData` (which includes `archived-*` keys).
       const tokenMissing: string[] = [];
       if (previousData && previousData !== data) {
         const previousTokens = this.host.extractTokensFromTxfData(previousData);
-        for (const tokenId of previousTokens.keys()) {
-          if (!tokens.has(tokenId)) tokenMissing.push(tokenId);
+        // Build the set of token IDs that have been legitimately
+        // retired in the current flush. Storage keys for active
+        // tokens are `_<id>`; archive keys are `archived-<id>`. We
+        // collapse both prefixes to the underlying id and compare
+        // against the previous-key id to detect a transition.
+        const stripKeyPrefix = (k: string): string => {
+          if (k.startsWith('archived-')) return k.substring('archived-'.length);
+          if (k.startsWith('_forked_')) {
+            const rest = k.substring('_forked_'.length);
+            const sep = rest.indexOf('_');
+            return sep === -1 ? rest : rest.substring(0, sep);
+          }
+          if (k.startsWith('_')) return k.substring(1);
+          return k;
+        };
+        const currentTokenIds = new Set<string>();
+        for (const k of tokens.keys()) currentTokenIds.add(stripKeyPrefix(k));
+        const tombstoneTokenIds = new Set<string>();
+        for (const t of opState.tombstones ?? []) {
+          if (t && typeof (t as { tokenId?: unknown }).tokenId === 'string') {
+            tombstoneTokenIds.add((t as { tokenId: string }).tokenId);
+          }
+        }
+        for (const key of previousTokens.keys()) {
+          if (tokens.has(key)) continue;
+          const id = stripKeyPrefix(key);
+          // (b) Archive transition — current data has the token under
+          // the active OR archive key for the same underlying id.
+          if (currentTokenIds.has(id)) continue;
+          // (a) Tombstoned — current operational state records a
+          // deliberate retirement of this tokenId.
+          if (tombstoneTokenIds.has(id)) continue;
+          tokenMissing.push(key);
         }
       }
 
@@ -796,34 +879,98 @@ export class FlushScheduler {
       // (fetch + pin) which would block shutdown for minutes per N
       // bundles. Without this gate, F.43's shutdown-await-flushPromise
       // could hold up to (N × per-gateway timeout) before completing.
+      // Issue #268 — fire-and-forget consolidation.
+      //
+      // The consolidation engine carries a 30 s TOCTOU sleep
+      // (`consolidation.ts:199`) that fires once `shouldConsolidate()`
+      // is true and `isConsolidationInProgress()` returns false. The
+      // sleep is necessary to let `consolidation.pending` propagate
+      // across OrbitDB peers so a concurrent device can detect our
+      // attempt and abort theirs (the previous 3 s window let two
+      // devices both pin redundant CARs). Inline await of
+      // `engine.consolidate()` therefore blocks the surrounding
+      // `forceFlushSerialized` chain for ≥30 s, which:
+      //   - times out shutdown's `awaitNextFlush(30 s)` →
+      //     at-least-once Nostr replay loop (every CLI session that
+      //     received tokens exits with `pre-shutdown awaitNextFlush
+      //     failed: timeout awaiting serialized flush`);
+      //   - serializes incoming TOKEN_TRANSFER receives at ~30 s
+      //     each (`handleIncomingTransfer → awaitAllProvidersDurable
+      //     → awaitNextFlush`);
+      //   - manifests as the §C.2 soak hang in
+      //     `manual-test-full-recovery.sh` (sphere payments sync
+      //     spins for 14+ minutes at 200 %+ CPU because each of
+      //     the 6 replayed faucet events triggers a 30 s flush).
+      //
+      // Detaching consolidation from the inline path lets the
+      // durability-critical work (pin + bundle ref + publish) commit
+      // in the foreground and return immediately. Consolidation
+      // continues in the background; failure is non-fatal because
+      // every source bundle is already pinned + indexed before
+      // consolidation runs.
+      //
+      // Safety:
+      //   - the in-memory `consolidationInFlight` flag dedupes
+      //     concurrent flushes on this instance so a burst of N
+      //     flushes does not spawn N background tasks;
+      //   - the engine's `isConsolidationInProgress` check still
+      //     handles cross-device concurrency;
+      //   - the engine's 30 s TOCTOU sleep `.unref()`s its timer
+      //     so a process exit while consolidation is sleeping
+      //     simply cancels the sleep — no extra work needed to
+      //     keep the process from staying alive.
       if (this.host.getIsShuttingDown()) {
         this.host.log('Consolidation skipped: shutdown in progress');
+      } else if (this.consolidationInFlight !== null) {
+        this.host.log(
+          'Consolidation skipped: background task already running on this instance',
+        );
       } else if (await this.bundleIndex.shouldConsolidate()) {
-        try {
-          const { ConsolidationEngine } = await import('../consolidation.js');
-          const engine = new ConsolidationEngine(
-            this.host.db,
-            encryptionKey,
-            this.host.ipfsGateways,
-          );
-          if (!(await engine.isConsolidationInProgress())) {
+        // Spawn fire-and-forget consolidation. The IIFE captures the
+        // local `encryptionKey` so it remains valid even after the
+        // outer `flushToIpfs` returns.
+        this.consolidationInFlight = (async (): Promise<void> => {
+          try {
+            const { ConsolidationEngine } = await import('../consolidation.js');
+            const engine = new ConsolidationEngine(
+              this.host.db,
+              encryptionKey,
+              this.host.ipfsGateways,
+            );
+            if (await engine.isConsolidationInProgress()) {
+              this.host.log(
+                'Consolidation skipped: another device is in progress',
+              );
+              return;
+            }
+            // Bail out early if shutdown started between the
+            // outer-arm check and here. Avoids spawning a 30 s
+            // sleeper that the process is about to exit anyway.
+            if (this.host.getIsShuttingDown()) {
+              this.host.log(
+                'Consolidation skipped: shutdown started before background spawn',
+              );
+              return;
+            }
             const result = await engine.consolidate();
             if (result.consolidated) {
               this.host.log(
-                `Consolidation: merged ${result.sourceBundleCount} bundles → ${result.consolidatedCid ?? 'n/a'}`,
+                `Consolidation: merged ${result.sourceBundleCount} bundles → ${result.consolidatedCid ?? 'n/a'} (background)`,
               );
             } else {
               this.host.log('Consolidation skipped (engine no-op)');
             }
-          } else {
-            this.host.log('Consolidation skipped: another device is in progress');
+          } catch (err) {
+            this.host.log(
+              `Consolidation failed (non-fatal, background): ${err instanceof Error ? err.message : String(err)}`,
+            );
+          } finally {
+            this.consolidationInFlight = null;
           }
-        } catch (err) {
-          // Best-effort: do not fail the flush on consolidation error.
-          this.host.log(
-            `Consolidation failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
+        })();
+        // Detach from the active flush chain. The flush body must
+        // not await this promise (that defeats the fix); any failure
+        // is logged inside the IIFE.
       }
 
       // 9. Publish to the aggregator pointer layer for cold-start recovery.
