@@ -273,36 +273,73 @@ describe('Sphere.maybeInstallPointerWinSubscription — symmetric guard (#264)',
     expect(subscribeCalls).toBe(0);
   });
 
-  it('pointer with winBroadcastsEnabled() that THROWS → fail-closed, no subscription, no throw escapes (R5 defensive try/catch)', async () => {
-    // Steelman R5: a misbehaving stub that violates the "MUST NOT
-    // throw" accessor contract must NOT cause the subscriber-install
-    // path to surface a confusing "subscription install failed
-    // (will retry on next event)" log line + arm a permanent retry
-    // loop. The defensive try/catch around the guard expression
-    // treats the throw as flag=false and early-returns cleanly.
-    let subscribeCalls = 0;
-    const sphere = createMinimalSphereForGuardTest({
-      pointer: {
-        winBroadcastsEnabled: () => {
-          throw new Error('synthetic accessor failure');
+  it('pointer with winBroadcastsEnabled() that THROWS → fail-closed via defensive try/catch (NOT outer broad catch) (R5)', async () => {
+    // Steelman R5/R6: a misbehaving stub that violates the
+    // "MUST NOT throw" accessor contract must be handled by the
+    // INNER defensive try/catch, NOT the outer broad catch.
+    // Distinguish the two paths by spying on the logger:
+    //   - INNER (R5) path → `logger.debug('Sphere', 'pointer-win
+    //     subscription: winBroadcastsEnabled() threw (accessor
+    //     contract violation, treating as flag=false): ...')`
+    //   - OUTER (R4) path → `logger.warn('Sphere', 'pointer-win
+    //     subscription install failed (will retry on next event)
+    //     ...')`
+    //
+    // Assert the SPECIFIC debug line + assert no warn was emitted,
+    // so a regression that removes the inner try/catch would route
+    // the throw to the outer catch and trip both assertions.
+    const { logger } = await import('../../../core/logger');
+    const debugSpy = vi.spyOn(logger, 'debug').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    try {
+      let subscribeCalls = 0;
+      const sphere = createMinimalSphereForGuardTest({
+        pointer: {
+          winBroadcastsEnabled: () => {
+            throw new Error('synthetic accessor failure');
+          },
+          getSignerForWinBroadcast: () => ({ signer: {}, signingPubKeyHex: 'abc' }),
         },
-        getSignerForWinBroadcast: () => ({ signer: {}, signingPubKeyHex: 'abc' }),
-      },
-      subscribeToBroadcast: () => {
-        subscribeCalls++;
-        return () => {};
-      },
-    });
-    await expect(
-      (sphere as unknown as {
-        maybeInstallPointerWinSubscription: () => Promise<void>;
-      }).maybeInstallPointerWinSubscription(),
-    ).resolves.toBeUndefined();
-    expect(subscribeCalls).toBe(0);
-    const inFlight = (sphere as unknown as {
-      _pointerWinInstallInFlight: boolean;
-    })._pointerWinInstallInFlight;
-    expect(inFlight).toBe(false);
+        subscribeToBroadcast: () => {
+          subscribeCalls++;
+          return () => {};
+        },
+      });
+      await expect(
+        (sphere as unknown as {
+          maybeInstallPointerWinSubscription: () => Promise<void>;
+        }).maybeInstallPointerWinSubscription(),
+      ).resolves.toBeUndefined();
+      expect(subscribeCalls).toBe(0);
+      const inFlight = (sphere as unknown as {
+        _pointerWinInstallInFlight: boolean;
+      })._pointerWinInstallInFlight;
+      expect(inFlight).toBe(false);
+
+      // INNER defensive path fired: specific debug line emitted.
+      const debugCalls = debugSpy.mock.calls;
+      const accessorViolationLog = debugCalls.find(
+        (call) =>
+          call[0] === 'Sphere' &&
+          typeof call[1] === 'string' &&
+          call[1].includes('accessor contract violation'),
+      );
+      expect(accessorViolationLog).toBeDefined();
+
+      // OUTER broad catch did NOT fire: no "subscription install
+      // failed" warn. A regression that removes the inner try/catch
+      // would route the throw to the outer catch → this would fail.
+      const installFailedWarn = warnSpy.mock.calls.find(
+        (call) =>
+          call[0] === 'Sphere' &&
+          typeof call[1] === 'string' &&
+          call[1].includes('subscription install failed'),
+      );
+      expect(installFailedWarn).toBeUndefined();
+    } finally {
+      debugSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
   });
 
   it('pointer with winBroadcastsEnabled() === true BUT missing getSignerForWinBroadcast → fail-closed, no subscription, no throw', async () => {
