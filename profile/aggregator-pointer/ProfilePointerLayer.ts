@@ -158,9 +158,34 @@ export class ProfilePointerLayer {
     // a normalized frozen snapshot. This drops `allowUnverifiedOverride`
     // post-guard — defense-in-depth, since the field has no behavior
     // effect in v1 and won't be read by any code path.
+    //
+    // Issue #264: `enablePointerWinBroadcasts` is normalized via
+    // `=== true` so accidental truthy non-boolean values (`'true'`,
+    // `1`) fail closed. The flag's default is OFF — the broadcast
+    // pipeline is an optimization layer not load-bearing for
+    // convergence (see PointerLayerConfig.enablePointerWinBroadcasts
+    // for the full design rationale).
     this.#config = Object.freeze({
       allowOperatorOverrides: suppliedConfig.allowOperatorOverrides === true,
+      enablePointerWinBroadcasts:
+        suppliedConfig.enablePointerWinBroadcasts === true,
     });
+  }
+
+  /**
+   * Issue #264 — capability gate for the pointer-win broadcast
+   * pipeline. Consulted by:
+   *   - `LifecycleManager.publishAggregatorPointerBestEffort` before
+   *     signing the broadcast payload and emitting the
+   *     `storage:pointer-published` event (publisher).
+   *   - `Sphere.maybeInstallPointerWinSubscription` before installing
+   *     the per-wallet Nostr subscription (subscriber).
+   *
+   * Default: `false`. See PointerLayerConfig.enablePointerWinBroadcasts
+   * for the full rationale.
+   */
+  winBroadcastsEnabled(): boolean {
+    return this.#config.enablePointerWinBroadcasts === true;
   }
 
   /**

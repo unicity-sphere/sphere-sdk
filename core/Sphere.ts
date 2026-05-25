@@ -5422,6 +5422,16 @@ export class Sphere {
         // Pointer layer not yet built; try again on the next event.
         return;
       }
+      // Issue #264 — gated behind the pointer layer's
+      // `enablePointerWinBroadcasts` capability (default OFF). With
+      // the flag false this subscriber side is dormant: no per-wallet
+      // Nostr subscription is installed, so no sibling broadcasts can
+      // reach `handleIncomingPointerWinBroadcast`. The aggregator
+      // pointer + auto-merge convergence path covers correctness
+      // without the broadcast optimization.
+      if (!pointer.winBroadcastsEnabled()) {
+        return;
+      }
       const signerHandle = pointer.getSignerForWinBroadcast();
       const signingPubKeyHex = signerHandle.signingPubKeyHex;
       if (this._pointerWinSubscriptions.has(signingPubKeyHex)) {

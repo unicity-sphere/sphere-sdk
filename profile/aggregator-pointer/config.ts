@@ -42,6 +42,47 @@ export interface PointerLayerConfig {
    * outside NODE_ENV=development. See SPEC §13 W6.
    */
   readonly allowUnverifiedOverride?: boolean;
+
+  /**
+   * Issue #264 — enables the `pointer-win` Nostr broadcast publisher
+   * (in `LifecycleManager.publishAggregatorPointerBestEffort` after a
+   * successful publish) AND the per-wallet subscriber (in
+   * `Sphere.maybeInstallPointerWinSubscription`).
+   *
+   * OFF BY DEFAULT post-#264: broadcasts were originally introduced
+   * (PR #257, RFC-251 Approach D) as an optimization to short-circuit
+   * the aggregator's 30-60s read-replica lag for sibling devices that
+   * share an HD identity. Issue #264 reframes them as an OPTIONAL
+   * convergence-speed optimization, not a correctness requirement —
+   * convergence is now guaranteed by:
+   *   1. The aggregator pointer versions alone (the load-bearing
+   *      cross-device source of truth); AND
+   *   2. The flush-scheduler's monotonicity-violation auto-merge,
+   *      which reconstructs the missing state in-place rather than
+   *      throwing.
+   *
+   * With auto-merge in place, broadcasts add no correctness signal —
+   * a wrong/stale broadcast at best speeds convergence and at worst
+   * triggers an extra wasted publish cycle. We turn them off so the
+   * system's convergence properties can be tested without the
+   * optimization layer obscuring them.
+   *
+   * When `enablePointerWinBroadcasts !== true`:
+   *   - `LifecycleManager.publishAggregatorPointerBestEffort` skips
+   *     signing the broadcast payload and emitting the
+   *     `storage:pointer-published` event (publisher side OFF).
+   *   - `Sphere.maybeInstallPointerWinSubscription` returns early —
+   *     the per-wallet Nostr subscription is never installed
+   *     (subscriber side OFF).
+   *
+   * Strictly `=== true` to enable — defends against accidental
+   * truthy-but-not-boolean values (`'true'`, `1`) being interpreted
+   * as enabled.
+   *
+   * Flip to `true` to re-enable the optimization layer once auto-merge
+   * convergence is proven without it.
+   */
+  readonly enablePointerWinBroadcasts?: boolean;
 }
 
 // ── Capability gate ───────────────────────────────────────────────────────
