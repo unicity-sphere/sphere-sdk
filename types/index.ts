@@ -603,6 +603,23 @@ export type SphereEventType =
   | 'address:hidden'
   | 'address:unhidden'
   | 'sync:remote-update'
+  /**
+   * Issue #264 — Sphere bridge of the provider-level
+   * `storage:monotonicity-recovered` event. Fires when the
+   * flush-scheduler auto-merges a detected monotonicity gap in
+   * place: tokens re-merged from the previously-loaded baseline,
+   * unknown bundle CIDs inline-fetched + merged, OUTBOX entries
+   * dropped by SENT-wins dedup, or residuals surfaced for
+   * subsequent retries. See `StorageEventType` for the full payload
+   * shape — Sphere forwards the provider event's `data` verbatim
+   * with an added `providerId` field.
+   *
+   * Informational. Distinct from `transfer:operator-alert` /
+   * `storage:error`: auto-merges are routine convergence work, not
+   * alarms. Observability hook for dashboards plotting recovery rates,
+   * not a paging signal.
+   */
+  | 'storage:monotonicity-recovered'
   | 'groupchat:message'
   | 'groupchat:joined'
   | 'groupchat:left'
@@ -1378,6 +1395,20 @@ export interface SphereEventMap {
   'address:hidden': { index: number; addressId: string };
   'address:unhidden': { index: number; addressId: string };
   'sync:remote-update': { providerId: string; name: string; sequence: number; cid: string; added: number; removed: number };
+  'storage:monotonicity-recovered': {
+    providerId: string;
+    recoveredTokenIds: string[];
+    recoveredTokenCount: number;
+    mergedUnknownBundleCids: string[];
+    mergedUnknownBundleCount: number;
+    residualUnknownBundleCids: string[];
+    residualUnknownBundleCount: number;
+    residualTokenMissingIds: string[];
+    residualTokenMissingCount: number;
+    recoveredOutboxIdsDroppedAsSent: string[];
+    recoveredOutboxIdsDroppedAsSentCount: number;
+    truncated: boolean;
+  };
   'groupchat:message': import('../modules/groupchat/types').GroupMessageData;
   'groupchat:joined': { groupId: string; groupName: string };
   'groupchat:left': { groupId: string };

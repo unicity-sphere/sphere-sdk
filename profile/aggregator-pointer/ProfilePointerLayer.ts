@@ -372,7 +372,18 @@ export class ProfilePointerLayer {
       resolveRemoteCid: this.#init.resolveRemoteCid,
       abortSignal,
     });
-    this.#lastProbeVersions = result.probeHistory;
+    // Issue #264 steelman fix: only overwrite the probe history when
+    // the publish actually ran a discovery walkback. The fast-path
+    // (#263, attempts === 0) skips Step B and returns
+    // `probeHistory: []`. Unconditionally assigning would clobber any
+    // fingerprint populated by a prior discovery / recoverLatest /
+    // probe call — destroying the UI same-wallet-clustering signal
+    // surfaced by `getProbeFingerprint()`. The non-empty guard keeps
+    // the last meaningful probe sequence available across fast-path
+    // publishes.
+    if (result.probeHistory.length > 0) {
+      this.#lastProbeVersions = result.probeHistory;
+    }
     return { version: result.v, attemptsUsed: result.attemptsUsed };
   }
 

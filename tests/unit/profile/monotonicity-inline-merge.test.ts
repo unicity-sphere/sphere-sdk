@@ -473,20 +473,26 @@ describe('FlushScheduler — in-place monotonicity recovery (#255)', () => {
     expect(recoveredData.residualUnknownBundleCids).toContain(remoteCid);
     expect(recoveredData.recoveredTokenCount).toBe(0);
 
-    // The legacy storage:error event also fires for dashboards.
+    // The legacy storage:error event also fires for dashboards,
+    // discriminated by `autoMergeResidual: true`. The pre-#264
+    // `alert: 'transfer:operator-alert'` field is INTENTIONALLY no
+    // longer emitted — see the residual-emit comment in
+    // flush-scheduler.ts for the on-call burnout rationale.
     expect(violationEvents.length).toBeGreaterThan(0);
     const alert = violationEvents.find(
-      (e) => (e.data as { alert?: string } | undefined)?.alert === 'transfer:operator-alert',
+      (e) => (e.data as { autoMergeResidual?: boolean } | undefined)?.autoMergeResidual === true,
     );
     expect(alert).toBeDefined();
     const data = alert!.data as {
       unknownBundleCids: string[];
       unknownBundleCount: number;
       autoMergeResidual?: boolean;
+      alert?: string;
     };
     expect(data.unknownBundleCount).toBe(1);
     expect(data.unknownBundleCids).toContain(remoteCid);
     expect(data.autoMergeResidual).toBe(true);
+    expect(data.alert).toBeUndefined();
 
     await provider.shutdown();
   });
@@ -567,19 +573,23 @@ describe('FlushScheduler — in-place monotonicity recovery (#255)', () => {
 
     // The legacy storage:error payload (kept for dashboards keyed on
     // the literal POINTER_MONOTONICITY_VIOLATION) mentions ONLY cidB.
+    // Discriminated by `autoMergeResidual: true`; the pre-#264
+    // `alert: 'transfer:operator-alert'` field is no longer set.
     const alert = violationEvents.find(
-      (e) => (e.data as { alert?: string } | undefined)?.alert === 'transfer:operator-alert',
+      (e) => (e.data as { autoMergeResidual?: boolean } | undefined)?.autoMergeResidual === true,
     );
     expect(alert).toBeDefined();
     const data = alert!.data as {
       unknownBundleCids: string[];
       unknownBundleCount: number;
       autoMergeResidual?: boolean;
+      alert?: string;
     };
     expect(data.unknownBundleCount).toBe(1);
     expect(data.unknownBundleCids).toContain(cidB);
     expect(data.unknownBundleCids).not.toContain(cidA);
     expect(data.autoMergeResidual).toBe(true);
+    expect(data.alert).toBeUndefined();
 
     await provider.shutdown();
   });

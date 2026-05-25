@@ -494,19 +494,27 @@ describe('pointer monotonicity invariant', () => {
     expect(recoveredData.residualUnknownBundleCount).toBe(1);
     expect(recoveredData.residualUnknownBundleCids).toContain(remoteCid);
 
-    // The legacy storage:error event also fires for dashboards.
+    // The legacy storage:error event also fires for dashboards. The
+    // residual emit is discriminated by `autoMergeResidual: true` —
+    // pre-#264 the event also carried `alert: 'transfer:operator-alert'`
+    // which has been DROPPED to prevent on-call burnout on routine
+    // network transients (see the residual-emit comment in flush-
+    // scheduler.ts for the rationale).
     const alertEvent = errors.find(
-      (e) => (e.data as { alert?: string } | undefined)?.alert === 'transfer:operator-alert',
+      (e) => (e.data as { autoMergeResidual?: boolean } | undefined)?.autoMergeResidual === true,
     );
     expect(alertEvent).toBeDefined();
     const alertData = alertEvent!.data as {
       unknownBundleCids: string[];
       unknownBundleCount: number;
       autoMergeResidual?: boolean;
+      alert?: string;
     };
     expect(alertData.unknownBundleCount).toBe(1);
     expect(alertData.unknownBundleCids).toContain(remoteCid);
     expect(alertData.autoMergeResidual).toBe(true);
+    // The legacy paging field is no longer emitted.
+    expect(alertData.alert).toBeUndefined();
 
     await provider.shutdown();
   });
@@ -602,6 +610,85 @@ describe('pointer monotonicity invariant', () => {
 
     // No residual → no legacy `storage:error` should fire.
     expect(errors.length).toBe(0);
+
+    await provider.shutdown();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Test 3b: truncated=true boundary on the storage:monotonicity-recovered event
+  // ---------------------------------------------------------------------------
+  it('large-scale token-loss recovery (101+ tokens): recoveredTokenIds capped at 100 with truncated=true (#264)', async () => {
+    // Stresses the event-payload cap added in flush-scheduler.ts. The
+    // event surfaces up to 100 ids for log-volume control and sets a
+    // `truncated: true` flag when the full set exceeds the cap.
+    // Without this test, a regression flipping the cap or the flag
+    // would silently degrade operator visibility (e.g., a dashboard
+    // claiming "we recovered 100 tokens" when 5000 were actually
+    // re-merged).
+    installMockFetch(tracker, new Map());
+    const provider = createProvider(db, { flushDebounceMs: 20 });
+    await provider.initialize();
+
+    const TOKEN_COUNT = 150; // > 100 cap → triggers truncation.
+    const allTokens: Record<string, unknown> = {};
+    const allTokenIds: string[] = [];
+    for (let i = 0; i < TOKEN_COUNT; i++) {
+      const key = `_T${String(i).padStart(3, '0')}`;
+      allTokens[key] = { id: key, genesis: { tokenId: `T${i}` } };
+      allTokenIds.push(key);
+    }
+    const baseline = buildTxfData(allTokens);
+    (provider as unknown as {
+      lastLoadedData: TxfStorageDataBase;
+      lastLoadedFromBundleCids: Set<string>;
+    }).lastLoadedData = baseline;
+    (provider as unknown as {
+      lastLoadedFromBundleCids: Set<string>;
+    }).lastLoadedFromBundleCids = new Set();
+
+    // The about-to-flush data has only ONE token — all others would be
+    // dropped without the auto-merge.
+    const keptId = allTokenIds[0]!;
+    const partialData = buildTxfData({ [keptId]: allTokens[keptId] });
+
+    const flushScheduler = (
+      provider as unknown as {
+        flushScheduler: { flushToIpfs(): Promise<void> };
+      }
+    ).flushScheduler;
+    (provider as unknown as { pendingData: TxfStorageDataBase }).pendingData =
+      partialData;
+
+    const recovered: Array<{ data?: unknown }> = [];
+    provider.onEvent((evt) => {
+      if (evt.type === 'storage:monotonicity-recovered') {
+        recovered.push({ data: evt.data });
+      }
+    });
+
+    let thrown: unknown = null;
+    try {
+      await flushScheduler.flushToIpfs();
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeNull();
+
+    expect(recovered.length).toBe(1);
+    const data = recovered[0]!.data as {
+      recoveredTokenIds: string[];
+      recoveredTokenCount: number;
+      truncated: boolean;
+    };
+    // Full count surfaced for monitoring totals (TOKEN_COUNT - 1
+    // re-merged; partialData kept 1).
+    expect(data.recoveredTokenCount).toBe(TOKEN_COUNT - 1);
+    // Array slice capped at 100 to bound log-line size.
+    expect(data.recoveredTokenIds.length).toBe(100);
+    // truncated flag MUST be set when count > slice length, otherwise
+    // operators reading "100 ids + count 149" would silently get a
+    // wrong picture.
+    expect(data.truncated).toBe(true);
 
     await provider.shutdown();
   });

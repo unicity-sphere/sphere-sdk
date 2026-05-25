@@ -5324,6 +5324,42 @@ export class Sphere {
             // when the subscription is already in place.
             void this.maybeInstallPointerWinSubscription();
           }
+          // Issue #264 — bridge `storage:monotonicity-recovered` to a
+          // user-visible Sphere event so dashboards / telemetry
+          // pipelines subscribing via `sphere.on(...)` can observe
+          // auto-merge convergence work without dropping to provider-
+          // direct subscriptions. Pure informational forward — the
+          // provider's data payload rides through verbatim with
+          // `providerId` added for fan-out attribution.
+          if (event.type === 'storage:monotonicity-recovered') {
+            const d = (event.data ?? {}) as {
+              recoveredTokenIds?: string[];
+              recoveredTokenCount?: number;
+              mergedUnknownBundleCids?: string[];
+              mergedUnknownBundleCount?: number;
+              residualUnknownBundleCids?: string[];
+              residualUnknownBundleCount?: number;
+              residualTokenMissingIds?: string[];
+              residualTokenMissingCount?: number;
+              recoveredOutboxIdsDroppedAsSent?: string[];
+              recoveredOutboxIdsDroppedAsSentCount?: number;
+              truncated?: boolean;
+            };
+            this.emitEvent('storage:monotonicity-recovered', {
+              providerId,
+              recoveredTokenIds: d.recoveredTokenIds ?? [],
+              recoveredTokenCount: d.recoveredTokenCount ?? 0,
+              mergedUnknownBundleCids: d.mergedUnknownBundleCids ?? [],
+              mergedUnknownBundleCount: d.mergedUnknownBundleCount ?? 0,
+              residualUnknownBundleCids: d.residualUnknownBundleCids ?? [],
+              residualUnknownBundleCount: d.residualUnknownBundleCount ?? 0,
+              residualTokenMissingIds: d.residualTokenMissingIds ?? [],
+              residualTokenMissingCount: d.residualTokenMissingCount ?? 0,
+              recoveredOutboxIdsDroppedAsSent: d.recoveredOutboxIdsDroppedAsSent ?? [],
+              recoveredOutboxIdsDroppedAsSentCount: d.recoveredOutboxIdsDroppedAsSentCount ?? 0,
+              truncated: d.truncated === true,
+            });
+          }
         });
         if (unsub) this._providerEventCleanups.push(unsub);
       }
@@ -5429,7 +5465,19 @@ export class Sphere {
       // reach `handleIncomingPointerWinBroadcast`. The aggregator
       // pointer + auto-merge convergence path covers correctness
       // without the broadcast optimization.
-      if (!pointer.winBroadcastsEnabled()) {
+      //
+      // Tolerant of pointer stubs that predate the
+      // `winBroadcastsEnabled` accessor (mirrors the symmetric guard
+      // in `lifecycle-manager.ts:publishAggregatorPointerBestEffort`):
+      // a missing method is treated as flag=false (fail-closed). The
+      // production code path always builds a real `ProfilePointerLayer`
+      // which implements the method; this defensive check keeps the
+      // contract robust for any future test stub or duck-typed
+      // consumer.
+      if (
+        typeof pointer.winBroadcastsEnabled !== 'function' ||
+        !pointer.winBroadcastsEnabled()
+      ) {
         return;
       }
       const signerHandle = pointer.getSignerForWinBroadcast();

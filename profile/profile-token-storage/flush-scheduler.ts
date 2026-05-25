@@ -150,11 +150,38 @@ export type OpStateArrays = {
  * tombstone live entries that exist in `previousOp` but were not
  * carried in this flush's in-memory `currentOp`.
  *
+ * # Amplification-minimal contract (steelman fix)
+ *
+ * The naive union — "current ∪ previous" — re-emits EVERY previous
+ * entry through the per-entry-key writer. Because `writeProfileKey`
+ * encrypts each value with a fresh random IV (see
+ * `profile/encryption.ts:encryptProfileValue`), every re-emit lands a
+ * NEW OrbitDB OpLog row even when the plaintext is byte-identical to
+ * the on-disk record. Under sustained cross-device replication churn
+ * this would inflate the OpLog by O(previous-size) per recovery cycle.
+ *
+ * The amplification-minimal contract: `merged.outbox` (etc.) MUST
+ * contain every entry from `currentOp` PLUS only those entries from
+ * `previousOp` whose id is NOT in `currentOp`. The diff in
+ * `writeOrbitOperationalStatePerEntry` writes every entry in
+ * `merged`; by minimising the previous-only fill-in to the entries
+ * that current is actually missing, we (a) preserve the original
+ * "current wins on collision" semantic at zero extra cost, and
+ * (b) bound the OpLog amplification to the smallest possible set —
+ * the entries that current would otherwise have the writer tombstone
+ * by omission.
+ *
+ * Steelman-residual: writes for entries that ARE in `currentOp` still
+ * produce fresh ciphertext because the writer does not plaintext-
+ * compare existing values. That amplification exists pre-#264 and is
+ * a writer-layer concern out of scope for this issue (tracked in
+ * follow-ups to the per-entry diff).
+ *
  * Per-collection semantics:
  *   - `outbox`, `sent`, `audit`, `finalizationQueue`: union by
  *     `entry.id` (UxfTransferOutboxEntry / UxfSentLedgerEntry share the
- *     stable transferId as `.id`); on collision the current value wins
- *     because it is the more recent observation of that record.
+ *     stable transferId as `.id`); current wins on id collision (i.e.
+ *     entries from previous with the same id are dropped).
  *   - `outbox` then gets the SENT-wins filter applied: any outbox entry
  *     whose `id` matches a SENT entry's `id` is dropped — the
  *     transition outbox→sent is terminal and the OUTBOX residue should
@@ -190,54 +217,88 @@ export function unionOpStateWithSentWins(
     current: ReadonlyArray<unknown>,
     previous: ReadonlyArray<unknown>,
   ): unknown[] {
-    const byId = new Map<string, unknown>();
-    const noId: unknown[] = [];
-    // Insert previous first so current's value wins on collision.
+    // Amplification-minimal: emit every current entry, then ONLY the
+    // previous entries whose id is not already in current. Entries
+    // shared by both are written once (from current), not twice. This
+    // keeps the per-entry-key write count at `|current| + |previous-only|`
+    // instead of `|current ∪ previous|` doubling for shared ids.
+    const currentIds = new Set<string>();
+    const result: unknown[] = [];
+    const previousNoId: unknown[] = [];
+    for (const e of current) {
+      result.push(e);
+      const id = readId(e);
+      if (id !== undefined) currentIds.add(id);
+    }
     for (const e of previous) {
       const id = readId(e);
-      if (id !== undefined) byId.set(id, e);
-      else noId.push(e);
+      if (id === undefined) {
+        // No id → cannot dedup against current; treat as a separate
+        // record (the writer will JSON-stringify the full opState
+        // collection for non-per-entry stores like history).
+        previousNoId.push(e);
+        continue;
+      }
+      if (!currentIds.has(id)) {
+        // Fill-in: current is missing this id, so the per-entry diff
+        // would otherwise tombstone the on-disk record. Preserve it.
+        result.push(e);
+      }
+      // else: id is in current — current already wrote (or will write)
+      // a value for this id. Skip the previous version (would amplify
+      // OpLog with a redundant write).
     }
-    for (const e of current) {
-      const id = readId(e);
-      if (id !== undefined) byId.set(id, e);
-      else noId.push(e);
-    }
-    return [...byId.values(), ...noId];
+    return [...result, ...previousNoId];
   }
 
   function unionByTokenIdOrJson(
     current: ReadonlyArray<unknown>,
     previous: ReadonlyArray<unknown>,
   ): unknown[] {
-    const byTokenId = new Map<string, unknown>();
-    const byJson = new Map<string, unknown>();
+    // Amplification-minimal variant for collections persisted as a
+    // single JSON blob (tombstones, invalidatedNametags, history): we
+    // still want to dedup by `tokenId` when present, but only ADD
+    // previous's entries that current is missing. Same rationale as
+    // `unionById`: current's values are authoritative; previous is
+    // only used as a fill-in source.
+    const currentTokenIds = new Set<string>();
+    const currentJsonKeys = new Set<string>();
+    const result: unknown[] = [];
+    for (const e of current) {
+      result.push(e);
+      const tid = readTokenId(e);
+      if (tid !== undefined) {
+        currentTokenIds.add(tid);
+      } else {
+        try {
+          currentJsonKeys.add(JSON.stringify(e));
+        } catch {
+          // Non-serializable: cannot dedup, but it's already in result
+          // so the consumer sees it once.
+        }
+      }
+    }
     for (const e of previous) {
       const tid = readTokenId(e);
       if (tid !== undefined) {
-        byTokenId.set(tid, e);
-      } else {
-        try {
-          byJson.set(JSON.stringify(e), e);
-        } catch {
-          // Non-serializable entry — append once, dedup not possible.
-          byJson.set(String(byJson.size) + '_p', e);
+        if (!currentTokenIds.has(tid)) result.push(e);
+        continue;
+      }
+      // No tokenId in previous entry: dedup against current's JSON keys.
+      try {
+        const json = JSON.stringify(e);
+        if (!currentJsonKeys.has(json)) {
+          result.push(e);
+          currentJsonKeys.add(json);
         }
+      } catch {
+        // Non-serializable previous entry: defensive append (can't
+        // dedup against current; better to over-include than to drop
+        // a tombstone or invalid record silently).
+        result.push(e);
       }
     }
-    for (const e of current) {
-      const tid = readTokenId(e);
-      if (tid !== undefined) {
-        byTokenId.set(tid, e);
-      } else {
-        try {
-          byJson.set(JSON.stringify(e), e);
-        } catch {
-          byJson.set(String(byJson.size) + '_c', e);
-        }
-      }
-    }
-    return [...byTokenId.values(), ...byJson.values()];
+    return result;
   }
 
   const mergedSent = unionById(currentOp.sent, previousOp.sent);
@@ -993,13 +1054,23 @@ export class FlushScheduler {
         // dashboards keyed on POINTER_MONOTONICITY_VIOLATION still
         // fire. The richer per-recovery payload is on the separate
         // `storage:monotonicity-recovered` event emitted above.
+        //
+        // Issue #264 steelman fix: the `alert: 'transfer:operator-alert'`
+        // field is INTENTIONALLY NOT set on the residual emit anymore.
+        // Pre-#264 a monotonicity violation was a rare hard-throw and
+        // warranted paging. Post-#264 the residual fires whenever a
+        // foreign bundle's inline fetch fails — a routine network
+        // transient. Pagers keyed on `data.alert === 'transfer:operator-
+        // alert'` would burn out on-call within hours of a flaky IPFS
+        // gateway. Operators who DO want paging on residuals can opt in
+        // explicitly via the new `autoMergeResidual: true` discriminator
+        // (paired with the unchanged `code: POINTER_MONOTONICITY_VIOLATION`).
         this.host.emitEvent({
           type: 'storage:error',
           timestamp: Date.now(),
           code: POINTER_MONOTONICITY_VIOLATION,
           error: violation.message,
           data: {
-            alert: 'transfer:operator-alert',
             missingTokenIds: residualTokenMissing.slice(0, 100),
             missingTokenCount: residualTokenMissing.length,
             unknownBundleCids: residualUnknownBundleCids.slice(0, 100),

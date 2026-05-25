@@ -244,6 +244,81 @@ describe('unionOpStateWithSentWins — SENT-wins dedup (#264)', () => {
     expect(fqById.size).toBe(2);
   });
 
+  it('amplification-minimal: entries shared by both sides appear ONCE in merged output (steelman fix)', () => {
+    // Pre-fix the union re-emitted every `previous` entry through the
+    // per-entry writer, even for ids already present in `current`.
+    // Because `writeProfileKey` encrypts with a fresh random IV, a
+    // redundant re-emit lands a new OrbitDB OpLog row even when the
+    // plaintext is identical — O(previous-size) OpLog amplification
+    // per recovery cycle under sustained cross-device churn.
+    //
+    // The amplification-minimal contract: the merged array MUST
+    // include each shared id exactly ONCE (current's value wins),
+    // not twice.
+    const shared = { id: 'transfer-shared', status: 'submitted' };
+    const sharedPrev = { id: 'transfer-shared', status: 'pending' }; // older state
+    const prev: OpStateArrays = {
+      ...emptyOpState(),
+      outbox: [
+        sharedPrev,
+        { id: 'transfer-prev-only', status: 'pending' },
+      ],
+      audit: [
+        { id: 'audit-shared', op: 'old' },
+        { id: 'audit-prev-only', op: 'prev' },
+      ],
+    };
+    const curr: OpStateArrays = {
+      ...emptyOpState(),
+      outbox: [shared],
+      audit: [{ id: 'audit-shared', op: 'new' }],
+    };
+    const { merged } = unionOpStateWithSentWins(curr, prev);
+    // OUTBOX: shared id appears ONCE; prev-only id appears.
+    expect(merged.outbox).toHaveLength(2);
+    const outboxIds = merged.outbox.map((e) => (e as { id: string }).id).sort();
+    expect(outboxIds).toEqual(['transfer-prev-only', 'transfer-shared']);
+    // current wins for shared id (proves we kept current's value, not previous's).
+    const sharedEntry = merged.outbox.find(
+      (e) => (e as { id: string }).id === 'transfer-shared',
+    ) as { status: string };
+    expect(sharedEntry.status).toBe('submitted');
+    // AUDIT: same contract.
+    expect(merged.audit).toHaveLength(2);
+    const auditShared = merged.audit.find(
+      (e) => (e as { id: string }).id === 'audit-shared',
+    ) as { op: string };
+    expect(auditShared.op).toBe('new');
+  });
+
+  it('amplification-minimal: previous-ONLY entries fill in the gap (steelman fix)', () => {
+    // The fill-in case the auto-merge actually needs: previous has
+    // entries that current is missing. These MUST be added to merged
+    // (otherwise the per-entry diff would tombstone them by omission).
+    const prev: OpStateArrays = {
+      ...emptyOpState(),
+      outbox: [
+        { id: 'transfer-A', status: 'pending' },
+        { id: 'transfer-B', status: 'pending' },
+        { id: 'transfer-C', status: 'pending' },
+      ],
+    };
+    const curr: OpStateArrays = {
+      ...emptyOpState(),
+      // current is missing A and B — perhaps the partial-save bug
+      // that triggered the auto-merge in the first place.
+      outbox: [{ id: 'transfer-C', status: 'submitted' }],
+    };
+    const { merged } = unionOpStateWithSentWins(curr, prev);
+    expect(merged.outbox).toHaveLength(3);
+    const byId = new Map<string, unknown>();
+    for (const e of merged.outbox) byId.set((e as { id: string }).id, e);
+    // A and B filled in from previous; C stays from current (updated state).
+    expect((byId.get('transfer-A') as { status: string }).status).toBe('pending');
+    expect((byId.get('transfer-B') as { status: string }).status).toBe('pending');
+    expect((byId.get('transfer-C') as { status: string }).status).toBe('submitted');
+  });
+
   it('SENT-wins triggers only on string id equality — null/undefined ids are ignored', () => {
     const prev: OpStateArrays = {
       ...emptyOpState(),
