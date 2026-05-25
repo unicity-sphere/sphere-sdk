@@ -528,7 +528,18 @@ export class ProfilePointerLayer {
       walkbackLimit,
       abortSignal,
     });
-    this.#lastProbeVersions = result.probeVersions;
+    // Issue #264 steelman fix (symmetric with `publish`): only overwrite
+    // the probe-fingerprint history when discovery actually produced
+    // probes. A discoverLatestVersion that resolves on the first probe
+    // (no walkback needed) returns an empty `probeVersions` array;
+    // unconditionally assigning would clobber any fingerprint
+    // populated by a prior discovery / publish / probe call. Since
+    // `recoverLatest()` is implemented as
+    // `#recoverLatestInner → #discoverLatestVersionInner → here`, this
+    // fix also covers the recoverLatest path the steelman flagged.
+    if (result.probeVersions.length > 0) {
+      this.#lastProbeVersions = result.probeVersions;
+    }
     return result;
   }
 

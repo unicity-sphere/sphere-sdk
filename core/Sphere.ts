@@ -5476,7 +5476,13 @@ export class Sphere {
       // consumer.
       if (
         typeof pointer.winBroadcastsEnabled !== 'function' ||
-        !pointer.winBroadcastsEnabled()
+        !pointer.winBroadcastsEnabled() ||
+        // Symmetric stub guard: a fake pointer that returns
+        // `winBroadcastsEnabled() === true` but lacks
+        // `getSignerForWinBroadcast` would TypeError at the call
+        // below, surface as a noisy "subscription install failed"
+        // warn, and re-arm on every event. Fail-closed instead.
+        typeof pointer.getSignerForWinBroadcast !== 'function'
       ) {
         return;
       }

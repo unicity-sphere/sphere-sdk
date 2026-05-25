@@ -123,6 +123,23 @@ export const POINTER_MONOTONICITY_VIOLATION = 'POINTER_MONOTONICITY_VIOLATION';
  */
 export const POINTER_MONOTONICITY_RECOVERED = 'POINTER_MONOTONICITY_RECOVERED';
 
+/**
+ * Issue #264 — cap on per-array entries surfaced in the
+ * `storage:monotonicity-recovered` and residual `storage:error`
+ * payloads. Log volume is bounded by truncating the listed
+ * `recoveredTokenIds`, `residualUnknownBundleCids`,
+ * `residualTokenMissingIds`, etc. to this many entries; the
+ * unbounded count is still emitted as a separate field, and a
+ * `truncated: true` flag is set whenever ANY of the arrays
+ * exceeded the cap.
+ *
+ * Exported so tests can pin the boundary atomically with the
+ * implementation — a deliberate cap change updates both sides
+ * together, and a regression flipping the `>` comparator becomes
+ * detectable via the boundary tests in `tests/unit/profile/`.
+ */
+export const MONOTONICITY_RECOVERY_PAYLOAD_CAP = 100;
+
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 /**
@@ -150,38 +167,37 @@ export type OpStateArrays = {
  * tombstone live entries that exist in `previousOp` but were not
  * carried in this flush's in-memory `currentOp`.
  *
- * # Amplification-minimal contract (steelman fix)
+ * # Naive Map-based union — correctness > amplification claims
  *
- * The naive union — "current ∪ previous" — re-emits EVERY previous
- * entry through the per-entry-key writer. Because `writeProfileKey`
- * encrypts each value with a fresh random IV (see
- * `profile/encryption.ts:encryptProfileValue`), every re-emit lands a
- * NEW OrbitDB OpLog row even when the plaintext is byte-identical to
- * the on-disk record. Under sustained cross-device replication churn
- * this would inflate the OpLog by O(previous-size) per recovery cycle.
+ * Earlier remediation attempted an "amplification-minimal" variant
+ * that only added previous entries missing from current. On closer
+ * analysis the resulting set size is identical to the naive union
+ * `|current ∪ previous|` — both implementations dedup shared ids and
+ * preserve previous-only fill-in. The writer's per-entry diff
+ * (`writeOrbitOperationalStatePerEntry` → `applyPerEntryDiff` →
+ * `writeProfileKey`) writes EVERY live entry regardless of source,
+ * so amplification reduction is impossible at this layer.
  *
- * The amplification-minimal contract: `merged.outbox` (etc.) MUST
- * contain every entry from `currentOp` PLUS only those entries from
- * `previousOp` whose id is NOT in `currentOp`. The diff in
- * `writeOrbitOperationalStatePerEntry` writes every entry in
- * `merged`; by minimising the previous-only fill-in to the entries
- * that current is actually missing, we (a) preserve the original
- * "current wins on collision" semantic at zero extra cost, and
- * (b) bound the OpLog amplification to the smallest possible set —
- * the entries that current would otherwise have the writer tombstone
- * by omission.
+ * The amplification concern raised in the prior steelman is REAL but
+ * lives at the WRITER layer: `writeProfileKey` calls
+ * `encryptProfileValue` (`profile/encryption.ts:122`) with a fresh
+ * random IV per call, so re-writing identical plaintext lands a new
+ * OrbitDB OpLog row. Eliminating that requires plaintext-aware diff
+ * in the writer (read existing ciphertext, decrypt, compare, skip on
+ * equality) OR deterministic-IV encryption — both broader refactors
+ * out of scope for #264. Tracked as a writer-layer follow-up.
  *
- * Steelman-residual: writes for entries that ARE in `currentOp` still
- * produce fresh ciphertext because the writer does not plaintext-
- * compare existing values. That amplification exists pre-#264 and is
- * a writer-layer concern out of scope for this issue (tracked in
- * follow-ups to the per-entry diff).
+ * We therefore use the simpler naive union: dedupe by id via
+ * `Map.set` (current wins on collision), and collect no-id entries
+ * into a separate bucket that the consumer appends. This preserves
+ * correct semantics under intra-current duplicates (the variant
+ * silently kept duplicates) and empty-string ids (the variant routed
+ * `id: ''` to the no-id bucket and lost the dedup).
  *
  * Per-collection semantics:
  *   - `outbox`, `sent`, `audit`, `finalizationQueue`: union by
  *     `entry.id` (UxfTransferOutboxEntry / UxfSentLedgerEntry share the
- *     stable transferId as `.id`); current wins on id collision (i.e.
- *     entries from previous with the same id are dropped).
+ *     stable transferId as `.id`); current wins on id collision.
  *   - `outbox` then gets the SENT-wins filter applied: any outbox entry
  *     whose `id` matches a SENT entry's `id` is dropped — the
  *     transition outbox→sent is terminal and the OUTBOX residue should
@@ -205,100 +221,75 @@ export function unionOpStateWithSentWins(
   function readId(entry: unknown): string | undefined {
     if (!entry || typeof entry !== 'object') return undefined;
     const id = (entry as { id?: unknown }).id;
-    return typeof id === 'string' && id.length > 0 ? id : undefined;
+    // Accept any string (including empty) as a real id so the Map
+    // dedup collapses duplicates uniformly. Downstream writers
+    // (writeOrbitOperationalStatePerEntry) gate writes on
+    // `id.length > 0`, so empty-id entries are silently dropped at
+    // write time — but we still want intra-set dedup here.
+    return typeof id === 'string' ? id : undefined;
   }
   function readTokenId(entry: unknown): string | undefined {
     if (!entry || typeof entry !== 'object') return undefined;
     const id = (entry as { tokenId?: unknown }).tokenId;
-    return typeof id === 'string' && id.length > 0 ? id : undefined;
+    return typeof id === 'string' ? id : undefined;
   }
 
   function unionById(
     current: ReadonlyArray<unknown>,
     previous: ReadonlyArray<unknown>,
   ): unknown[] {
-    // Amplification-minimal: emit every current entry, then ONLY the
-    // previous entries whose id is not already in current. Entries
-    // shared by both are written once (from current), not twice. This
-    // keeps the per-entry-key write count at `|current| + |previous-only|`
-    // instead of `|current ∪ previous|` doubling for shared ids.
-    const currentIds = new Set<string>();
-    const result: unknown[] = [];
-    const previousNoId: unknown[] = [];
-    for (const e of current) {
-      result.push(e);
-      const id = readId(e);
-      if (id !== undefined) currentIds.add(id);
-    }
+    // Naive Map dedup: insert previous first so current's value wins
+    // on id collision. No-id entries collect in a separate bucket
+    // appended at the end. Intra-source duplicates with the same id
+    // collapse to one entry per id (the LAST one inserted wins —
+    // current's last for current-vs-current ties, current's
+    // overriding previous's for cross-source ties).
+    const byId = new Map<string, unknown>();
+    const noId: unknown[] = [];
     for (const e of previous) {
       const id = readId(e);
-      if (id === undefined) {
-        // No id → cannot dedup against current; treat as a separate
-        // record (the writer will JSON-stringify the full opState
-        // collection for non-per-entry stores like history).
-        previousNoId.push(e);
-        continue;
-      }
-      if (!currentIds.has(id)) {
-        // Fill-in: current is missing this id, so the per-entry diff
-        // would otherwise tombstone the on-disk record. Preserve it.
-        result.push(e);
-      }
-      // else: id is in current — current already wrote (or will write)
-      // a value for this id. Skip the previous version (would amplify
-      // OpLog with a redundant write).
+      if (id !== undefined) byId.set(id, e);
+      else noId.push(e);
     }
-    return [...result, ...previousNoId];
+    for (const e of current) {
+      const id = readId(e);
+      if (id !== undefined) byId.set(id, e);
+      else noId.push(e);
+    }
+    return [...byId.values(), ...noId];
   }
 
   function unionByTokenIdOrJson(
     current: ReadonlyArray<unknown>,
     previous: ReadonlyArray<unknown>,
   ): unknown[] {
-    // Amplification-minimal variant for collections persisted as a
-    // single JSON blob (tombstones, invalidatedNametags, history): we
-    // still want to dedup by `tokenId` when present, but only ADD
-    // previous's entries that current is missing. Same rationale as
-    // `unionById`: current's values are authoritative; previous is
-    // only used as a fill-in source.
-    const currentTokenIds = new Set<string>();
-    const currentJsonKeys = new Set<string>();
-    const result: unknown[] = [];
-    for (const e of current) {
-      result.push(e);
-      const tid = readTokenId(e);
-      if (tid !== undefined) {
-        currentTokenIds.add(tid);
-      } else {
+    // Dedup by `tokenId` when present (aligns with the writer's
+    // `tokenId`-keyed per-entry stores for `invalid` / `mintOutbox`).
+    // Fall back to JSON-key dedup for entries without tokenId
+    // (tombstones, history, invalidatedNametags). Non-serializable
+    // entries are force-appended (extremely rare in practice; these
+    // collections hold plain `{tokenId, deletedAt}`-shaped values).
+    const byTokenId = new Map<string, unknown>();
+    const byJson = new Map<string, unknown>();
+    const nonSerializable: unknown[] = [];
+    function ingest(arr: ReadonlyArray<unknown>): void {
+      for (const e of arr) {
+        const tid = readTokenId(e);
+        if (tid !== undefined) {
+          byTokenId.set(tid, e);
+          continue;
+        }
         try {
-          currentJsonKeys.add(JSON.stringify(e));
+          byJson.set(JSON.stringify(e), e);
         } catch {
-          // Non-serializable: cannot dedup, but it's already in result
-          // so the consumer sees it once.
+          nonSerializable.push(e);
         }
       }
     }
-    for (const e of previous) {
-      const tid = readTokenId(e);
-      if (tid !== undefined) {
-        if (!currentTokenIds.has(tid)) result.push(e);
-        continue;
-      }
-      // No tokenId in previous entry: dedup against current's JSON keys.
-      try {
-        const json = JSON.stringify(e);
-        if (!currentJsonKeys.has(json)) {
-          result.push(e);
-          currentJsonKeys.add(json);
-        }
-      } catch {
-        // Non-serializable previous entry: defensive append (can't
-        // dedup against current; better to over-include than to drop
-        // a tombstone or invalid record silently).
-        result.push(e);
-      }
-    }
-    return result;
+    // Insert previous first so current wins on key collision.
+    ingest(previous);
+    ingest(current);
+    return [...byTokenId.values(), ...byJson.values(), ...nonSerializable];
   }
 
   const mergedSent = unionById(currentOp.sent, previousOp.sent);
@@ -969,21 +960,21 @@ export class FlushScheduler {
           timestamp: Date.now(),
           code: POINTER_MONOTONICITY_RECOVERED,
           data: {
-            recoveredTokenIds: recoveredTokenIds.slice(0, 100),
+            recoveredTokenIds: recoveredTokenIds.slice(0, MONOTONICITY_RECOVERY_PAYLOAD_CAP),
             recoveredTokenCount: recoveredTokenIds.length,
-            mergedUnknownBundleCids: mergedUnknownBundleCids.slice(0, 100),
+            mergedUnknownBundleCids: mergedUnknownBundleCids.slice(0, MONOTONICITY_RECOVERY_PAYLOAD_CAP),
             mergedUnknownBundleCount: mergedUnknownBundleCids.length,
-            residualUnknownBundleCids: residualUnknownBundleCids.slice(0, 100),
+            residualUnknownBundleCids: residualUnknownBundleCids.slice(0, MONOTONICITY_RECOVERY_PAYLOAD_CAP),
             residualUnknownBundleCount: residualUnknownBundleCids.length,
-            residualTokenMissingIds: residualTokenMissing.slice(0, 100),
+            residualTokenMissingIds: residualTokenMissing.slice(0, MONOTONICITY_RECOVERY_PAYLOAD_CAP),
             residualTokenMissingCount: residualTokenMissing.length,
-            recoveredOutboxIdsDroppedAsSent: droppedOutboxIdsAsSent.slice(0, 100),
+            recoveredOutboxIdsDroppedAsSent: droppedOutboxIdsAsSent.slice(0, MONOTONICITY_RECOVERY_PAYLOAD_CAP),
             recoveredOutboxIdsDroppedAsSentCount: droppedOutboxIdsAsSent.length,
             truncated:
-              recoveredTokenIds.length > 100 ||
-              residualUnknownBundleCids.length > 100 ||
-              residualTokenMissing.length > 100 ||
-              droppedOutboxIdsAsSent.length > 100,
+              recoveredTokenIds.length > MONOTONICITY_RECOVERY_PAYLOAD_CAP ||
+              residualUnknownBundleCids.length > MONOTONICITY_RECOVERY_PAYLOAD_CAP ||
+              residualTokenMissing.length > MONOTONICITY_RECOVERY_PAYLOAD_CAP ||
+              droppedOutboxIdsAsSent.length > MONOTONICITY_RECOVERY_PAYLOAD_CAP,
           },
         });
       }
@@ -1071,14 +1062,14 @@ export class FlushScheduler {
           code: POINTER_MONOTONICITY_VIOLATION,
           error: violation.message,
           data: {
-            missingTokenIds: residualTokenMissing.slice(0, 100),
+            missingTokenIds: residualTokenMissing.slice(0, MONOTONICITY_RECOVERY_PAYLOAD_CAP),
             missingTokenCount: residualTokenMissing.length,
-            unknownBundleCids: residualUnknownBundleCids.slice(0, 100),
+            unknownBundleCids: residualUnknownBundleCids.slice(0, MONOTONICITY_RECOVERY_PAYLOAD_CAP),
             unknownBundleCount: residualUnknownBundleCids.length,
             autoMergeResidual: true,
             truncated:
-              residualTokenMissing.length > 100 ||
-              residualUnknownBundleCids.length > 100,
+              residualTokenMissing.length > MONOTONICITY_RECOVERY_PAYLOAD_CAP ||
+              residualUnknownBundleCids.length > MONOTONICITY_RECOVERY_PAYLOAD_CAP,
           },
         });
         // Intentionally NOT throwing — see comment block above.

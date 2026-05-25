@@ -244,99 +244,82 @@ describe('unionOpStateWithSentWins — SENT-wins dedup (#264)', () => {
     expect(fqById.size).toBe(2);
   });
 
-  it('amplification-minimal: entries shared by both sides appear ONCE in merged output (steelman fix)', () => {
-    // Pre-fix the union re-emitted every `previous` entry through the
-    // per-entry writer, even for ids already present in `current`.
-    // Because `writeProfileKey` encrypts with a fresh random IV, a
-    // redundant re-emit lands a new OrbitDB OpLog row even when the
-    // plaintext is identical — O(previous-size) OpLog amplification
-    // per recovery cycle under sustained cross-device churn.
-    //
-    // The amplification-minimal contract: the merged array MUST
-    // include each shared id exactly ONCE (current's value wins),
-    // not twice.
-    const shared = { id: 'transfer-shared', status: 'submitted' };
-    const sharedPrev = { id: 'transfer-shared', status: 'pending' }; // older state
-    const prev: OpStateArrays = {
-      ...emptyOpState(),
-      outbox: [
-        sharedPrev,
-        { id: 'transfer-prev-only', status: 'pending' },
-      ],
-      audit: [
-        { id: 'audit-shared', op: 'old' },
-        { id: 'audit-prev-only', op: 'prev' },
-      ],
-    };
+  it('intra-current duplicate ids collapse to one entry per id (regression test for prior amplification-minimal variant)', () => {
+    // Steelman finding (round 2): a prior remediation variant lost the
+    // Map-based intra-source dedup, so `currentOp.outbox = [{id:A,v:1},
+    // {id:A,v:2}]` produced TWO entries in merged.outbox. This test
+    // pins the naive-Map contract: duplicate ids within a single
+    // source collapse, with later-inserted winning.
     const curr: OpStateArrays = {
       ...emptyOpState(),
-      outbox: [shared],
-      audit: [{ id: 'audit-shared', op: 'new' }],
+      outbox: [
+        { id: 'A', v: 1 },
+        { id: 'A', v: 2 }, // intra-current dup
+        { id: 'B', v: 1 },
+      ],
     };
+    const prev: OpStateArrays = emptyOpState();
     const { merged } = unionOpStateWithSentWins(curr, prev);
-    // OUTBOX: shared id appears ONCE; prev-only id appears.
+    // 2 ids → 2 entries (NOT 3).
     expect(merged.outbox).toHaveLength(2);
-    const outboxIds = merged.outbox.map((e) => (e as { id: string }).id).sort();
-    expect(outboxIds).toEqual(['transfer-prev-only', 'transfer-shared']);
-    // current wins for shared id (proves we kept current's value, not previous's).
-    const sharedEntry = merged.outbox.find(
-      (e) => (e as { id: string }).id === 'transfer-shared',
-    ) as { status: string };
-    expect(sharedEntry.status).toBe('submitted');
-    // AUDIT: same contract.
-    expect(merged.audit).toHaveLength(2);
-    const auditShared = merged.audit.find(
-      (e) => (e as { id: string }).id === 'audit-shared',
-    ) as { op: string };
-    expect(auditShared.op).toBe('new');
-  });
-
-  it('amplification-minimal: previous-ONLY entries fill in the gap (steelman fix)', () => {
-    // The fill-in case the auto-merge actually needs: previous has
-    // entries that current is missing. These MUST be added to merged
-    // (otherwise the per-entry diff would tombstone them by omission).
-    const prev: OpStateArrays = {
-      ...emptyOpState(),
-      outbox: [
-        { id: 'transfer-A', status: 'pending' },
-        { id: 'transfer-B', status: 'pending' },
-        { id: 'transfer-C', status: 'pending' },
-      ],
-    };
-    const curr: OpStateArrays = {
-      ...emptyOpState(),
-      // current is missing A and B — perhaps the partial-save bug
-      // that triggered the auto-merge in the first place.
-      outbox: [{ id: 'transfer-C', status: 'submitted' }],
-    };
-    const { merged } = unionOpStateWithSentWins(curr, prev);
-    expect(merged.outbox).toHaveLength(3);
     const byId = new Map<string, unknown>();
     for (const e of merged.outbox) byId.set((e as { id: string }).id, e);
-    // A and B filled in from previous; C stays from current (updated state).
-    expect((byId.get('transfer-A') as { status: string }).status).toBe('pending');
-    expect((byId.get('transfer-B') as { status: string }).status).toBe('pending');
-    expect((byId.get('transfer-C') as { status: string }).status).toBe('submitted');
+    expect(byId.size).toBe(2);
+    // Last-inserted wins for the duplicate id.
+    expect((byId.get('A') as { v: number }).v).toBe(2);
+    expect((byId.get('B') as { v: number }).v).toBe(1);
   });
 
-  it('SENT-wins triggers only on string id equality — null/undefined ids are ignored', () => {
+  it('empty-string id is dedup-able (regression test for prior amplification-minimal variant)', () => {
+    // Steelman finding (round 2): the prior variant routed `id: ''`
+    // through the no-id bucket, losing dedup. Naive Map treats empty
+    // strings as valid keys. Two entries with `id: ''` collapse.
+    const curr: OpStateArrays = {
+      ...emptyOpState(),
+      outbox: [{ id: '', x: 'curr' }],
+    };
+    const prev: OpStateArrays = {
+      ...emptyOpState(),
+      outbox: [{ id: '', x: 'prev' }],
+    };
+    const { merged } = unionOpStateWithSentWins(curr, prev);
+    // One entry with id '' (collapsed), current wins.
+    expect(merged.outbox).toHaveLength(1);
+    expect((merged.outbox[0] as { id: string; x: string }).id).toBe('');
+    expect((merged.outbox[0] as { x: string }).x).toBe('curr');
+  });
+
+  it('SENT-wins triggers only on string id equality — non-string ids are ignored', () => {
+    // `readId` accepts ANY string (including empty); SENT-wins fires
+    // for both. But non-string ids (null, undefined, numeric, object)
+    // are NOT treated as valid ids — they fall through to the no-id
+    // bucket and never match SENT entries.
     const prev: OpStateArrays = {
       ...emptyOpState(),
       outbox: [
-        { id: '', status: 'pending' }, // empty id — readId returns undefined
+        { id: null as unknown as string, status: 'pending' },
+        { id: undefined as unknown as string, status: 'pending' },
+        { id: 42 as unknown as string, status: 'pending' },
         { id: 'transfer-A', status: 'pending' },
       ],
     };
     const curr: OpStateArrays = {
       ...emptyOpState(),
       sent: [
-        { _schemaVersion: 'uxf-1', id: '', tokenIds: ['tk'], bundleCid: 'b' }, // empty id
+        { _schemaVersion: 'uxf-1', id: 'transfer-A', tokenIds: ['tk'], bundleCid: 'b' },
       ],
     };
     const { merged, droppedOutboxIds } = unionOpStateWithSentWins(curr, prev);
-    // Empty-id outbox entry stays (no SENT match by valid id).
-    expect(merged.outbox).toHaveLength(2);
-    expect(droppedOutboxIds).toEqual([]);
+    // SENT-wins drops transfer-A from outbox; the 3 non-string-id
+    // entries fall through to the no-id bucket and survive unchanged.
+    expect(merged.outbox).toHaveLength(3);
+    expect(droppedOutboxIds).toEqual(['transfer-A']);
+    // None of the 3 surviving outbox entries should be the dropped 'transfer-A'.
+    const survivingIds = merged.outbox.map((e) => (e as { id: unknown }).id);
+    expect(survivingIds).not.toContain('transfer-A');
+    expect(survivingIds).toContain(null);
+    expect(survivingIds).toContain(undefined);
+    expect(survivingIds).toContain(42);
   });
 });
 

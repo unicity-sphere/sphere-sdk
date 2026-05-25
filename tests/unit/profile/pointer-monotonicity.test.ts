@@ -617,27 +617,26 @@ describe('pointer monotonicity invariant', () => {
   // ---------------------------------------------------------------------------
   // Test 3b: truncated=true boundary on the storage:monotonicity-recovered event
   // ---------------------------------------------------------------------------
-  it('large-scale token-loss recovery (101+ tokens): recoveredTokenIds capped at 100 with truncated=true (#264)', async () => {
-    // Stresses the event-payload cap added in flush-scheduler.ts. The
-    // event surfaces up to 100 ids for log-volume control and sets a
-    // `truncated: true` flag when the full set exceeds the cap.
-    // Without this test, a regression flipping the cap or the flag
-    // would silently degrade operator visibility (e.g., a dashboard
-    // claiming "we recovered 100 tokens" when 5000 were actually
-    // re-merged).
+  // Helper: drive the auto-merge with N tokens missing from current
+  // data, return the storage:monotonicity-recovered event payload.
+  async function runRecoveryWithMissingCount(
+    missingCount: number,
+  ): Promise<{
+    recoveredTokenIds: string[];
+    recoveredTokenCount: number;
+    truncated: boolean;
+  }> {
     installMockFetch(tracker, new Map());
     const provider = createProvider(db, { flushDebounceMs: 20 });
     await provider.initialize();
-
-    const TOKEN_COUNT = 150; // > 100 cap → triggers truncation.
-    const allTokens: Record<string, unknown> = {};
-    const allTokenIds: string[] = [];
-    for (let i = 0; i < TOKEN_COUNT; i++) {
-      const key = `_T${String(i).padStart(3, '0')}`;
-      allTokens[key] = { id: key, genesis: { tokenId: `T${i}` } };
-      allTokenIds.push(key);
+    // missingCount tokens in baseline that aren't in current data.
+    // Plus 1 token that IS in current to keep the data non-empty.
+    const baselineTokens: Record<string, unknown> = {};
+    for (let i = 0; i < missingCount + 1; i++) {
+      const key = `_T${String(i).padStart(4, '0')}`;
+      baselineTokens[key] = { id: key, genesis: { tokenId: `T${i}` } };
     }
-    const baseline = buildTxfData(allTokens);
+    const baseline = buildTxfData(baselineTokens);
     (provider as unknown as {
       lastLoadedData: TxfStorageDataBase;
       lastLoadedFromBundleCids: Set<string>;
@@ -645,52 +644,69 @@ describe('pointer monotonicity invariant', () => {
     (provider as unknown as {
       lastLoadedFromBundleCids: Set<string>;
     }).lastLoadedFromBundleCids = new Set();
-
-    // The about-to-flush data has only ONE token — all others would be
-    // dropped without the auto-merge.
-    const keptId = allTokenIds[0]!;
-    const partialData = buildTxfData({ [keptId]: allTokens[keptId] });
-
-    const flushScheduler = (
-      provider as unknown as {
-        flushScheduler: { flushToIpfs(): Promise<void> };
-      }
-    ).flushScheduler;
+    const partialKey = '_T0000';
+    const partialData = buildTxfData({
+      [partialKey]: baselineTokens[partialKey],
+    });
     (provider as unknown as { pendingData: TxfStorageDataBase }).pendingData =
       partialData;
-
     const recovered: Array<{ data?: unknown }> = [];
     provider.onEvent((evt) => {
       if (evt.type === 'storage:monotonicity-recovered') {
         recovered.push({ data: evt.data });
       }
     });
-
-    let thrown: unknown = null;
-    try {
-      await flushScheduler.flushToIpfs();
-    } catch (err) {
-      thrown = err;
-    }
-    expect(thrown).toBeNull();
-
+    const flushScheduler = (
+      provider as unknown as {
+        flushScheduler: { flushToIpfs(): Promise<void> };
+      }
+    ).flushScheduler;
+    await flushScheduler.flushToIpfs();
+    await provider.shutdown();
     expect(recovered.length).toBe(1);
-    const data = recovered[0]!.data as {
+    return recovered[0]!.data as {
       recoveredTokenIds: string[];
       recoveredTokenCount: number;
       truncated: boolean;
     };
-    // Full count surfaced for monitoring totals (TOKEN_COUNT - 1
-    // re-merged; partialData kept 1).
-    expect(data.recoveredTokenCount).toBe(TOKEN_COUNT - 1);
-    // Array slice capped at 100 to bound log-line size.
-    expect(data.recoveredTokenIds.length).toBe(100);
-    // truncated flag MUST be set when count > slice length, otherwise
-    // operators reading "100 ids + count 149" would silently get a
-    // wrong picture.
-    expect(data.truncated).toBe(true);
+  }
 
-    await provider.shutdown();
+  it('truncated boundary: recoveredCount === MONOTONICITY_RECOVERY_PAYLOAD_CAP (exactly 100) → truncated=false (#264)', async () => {
+    // Pins the `> CAP` comparator vs `>= CAP`. At exactly the cap, the
+    // payload's array length equals the count → no information lost →
+    // truncated MUST be false.
+    const { MONOTONICITY_RECOVERY_PAYLOAD_CAP } = await import(
+      '../../../profile/profile-token-storage/flush-scheduler'
+    );
+    const data = await runRecoveryWithMissingCount(MONOTONICITY_RECOVERY_PAYLOAD_CAP);
+    expect(data.recoveredTokenCount).toBe(MONOTONICITY_RECOVERY_PAYLOAD_CAP);
+    expect(data.recoveredTokenIds.length).toBe(MONOTONICITY_RECOVERY_PAYLOAD_CAP);
+    expect(data.truncated).toBe(false);
+  });
+
+  it('truncated boundary: recoveredCount === CAP + 1 (exactly 101) → truncated=true (#264)', async () => {
+    // The smallest count that exceeds the cap — one more than the
+    // array slice can carry. Operators see 100 ids + count 101 +
+    // truncated=true so they know to query the full set elsewhere.
+    const { MONOTONICITY_RECOVERY_PAYLOAD_CAP } = await import(
+      '../../../profile/profile-token-storage/flush-scheduler'
+    );
+    const data = await runRecoveryWithMissingCount(MONOTONICITY_RECOVERY_PAYLOAD_CAP + 1);
+    expect(data.recoveredTokenCount).toBe(MONOTONICITY_RECOVERY_PAYLOAD_CAP + 1);
+    expect(data.recoveredTokenIds.length).toBe(MONOTONICITY_RECOVERY_PAYLOAD_CAP);
+    expect(data.truncated).toBe(true);
+  });
+
+  it('truncated boundary: recoveredCount > CAP (150 vs 100) → truncated=true with full count surfaced (#264)', async () => {
+    // Original test: stresses well above the cap to verify the count
+    // field surfaces the FULL total even when the array is truncated.
+    const { MONOTONICITY_RECOVERY_PAYLOAD_CAP } = await import(
+      '../../../profile/profile-token-storage/flush-scheduler'
+    );
+    const data = await runRecoveryWithMissingCount(150);
+    expect(data.recoveredTokenCount).toBe(150);
+    expect(data.recoveredTokenIds.length).toBe(MONOTONICITY_RECOVERY_PAYLOAD_CAP);
+    expect(data.truncated).toBe(true);
   });
 
   // ---------------------------------------------------------------------------

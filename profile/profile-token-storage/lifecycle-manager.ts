@@ -1273,7 +1273,15 @@ export class LifecycleManager {
         // which implements the method.
         const winBroadcastsOn =
           typeof pointer.winBroadcastsEnabled === 'function' &&
-          pointer.winBroadcastsEnabled();
+          pointer.winBroadcastsEnabled() &&
+          // Symmetric with the new accessor: stubs lacking the signer
+          // helper fall through cleanly (fail-closed) rather than
+          // surfacing a TypeError caught only by the broad catch arm
+          // below. The two accessors are added together on real
+          // ProfilePointerLayer instances; a stub omitting one but
+          // not the other is a test-harness shape, not a production
+          // path.
+          typeof pointer.getSignerForWinBroadcast === 'function';
         if (winBroadcastsOn) {
           try {
             const signerHandle = pointer.getSignerForWinBroadcast();
