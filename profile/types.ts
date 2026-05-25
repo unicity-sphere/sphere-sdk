@@ -93,24 +93,32 @@ export interface OrbitDbConfig {
   /**
    * Issue #266 — HTTP-only IPFS mode for wallet/CLI clients.
    *
-   * When `true`, the OrbitDB adapter:
+   * When `true`, the OrbitDB adapter strips the libp2p networking
+   * cost that was burning wallet startup time:
    *   - Forces libp2p into isolated mode (no DHT, bootstrap, autoNAT,
    *     dcutr, peerDiscovery, delegatedRouting, ipnsFetch, ipnsPublish).
    *     Only identify, identifyPush, keychain, ping, and the gossipsub
    *     stub required by OrbitDB v3 remain. No outbound TCP connections
    *     to port 4001; the global IPFS DHT is not joined.
-   *   - Uses Helia's default `MemoryBlockstore` (skips `FsBlockstore`)
-   *     so CAR blocks live in-process only. Cross-process recovery is
-   *     served by the operator-side Kubo gateway over HTTP via the
-   *     `ipfsGateways` config and the snapshot prefetch mechanism.
-   *   - Skips passing `directory` into Helia (libp2p peer-id and
-   *     keychain are not persisted; a fresh ephemeral peer id is used
-   *     per session — harmless since no peer connects).
+   *   - Replaces Helia's default block brokers. The defaults are
+   *     `bitswap` (would hang waiting for peers) and `trustlessGateway`
+   *     (walks public gateways like `trustless-gateway.link` /
+   *     `4everland.io` which do not host our wallet data and time out
+   *     ~30s per miss). Instead we install a single broker that
+   *     HTTP-fetches missing blocks from operator-controlled Kubo
+   *     gateways via `POST /api/v0/block/get?arg=<cid>`, configured
+   *     by `ipfsGateways` (see below).
    *
-   * The OrbitDB level DB (OpLog heads) is still persisted via the
-   * top-level `directory` config — only Helia / libp2p artefacts go
-   * memory-only. Aggregator pointer + snapshot prefetch handle
-   * cross-device durability without requiring direct libp2p sync.
+   * Helia's `MemoryBlockstore` is used by default. Cross-process
+   * recovery happens via the HTTP broker (the previous process pushed
+   * its blocks to operator Kubo via the flush-scheduler before exit,
+   * the next process HTTP-fetches them back). If `directory` is set,
+   * we keep `FsBlockstore` as well — disk hits are faster than HTTP
+   * round-trips for hot blocks.
+   *
+   * Cross-DEVICE recovery (different machine, fresh `dataDir`) also
+   * relies on the HTTP fallback plus the snapshot prefetch in
+   * `profile/ipfs-client.ts`.
    *
    * Recommended default for `createNodeProfileProviders` and
    * `createBrowserProfileProviders` (the wallet client factories).
@@ -126,6 +134,16 @@ export interface OrbitDbConfig {
    *          The wallet factories override to `true`.
    */
   readonly httpOnlyIpfs?: boolean;
+  /**
+   * Issue #266 — Operator-controlled Kubo HTTP gateway base URLs
+   * used by the HTTP block broker in `httpOnlyIpfs: true` mode. The
+   * broker races them via `Promise.any`. ProfileStorageProvider
+   * passes through `ProfileConfig.ipfsGateways` automatically; raw
+   * callers can supply this directly.
+   *
+   * Ignored when `httpOnlyIpfs !== true`.
+   */
+  readonly ipfsGateways?: ReadonlyArray<string>;
 }
 
 // =============================================================================

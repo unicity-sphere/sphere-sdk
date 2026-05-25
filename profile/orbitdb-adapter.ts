@@ -249,12 +249,29 @@ export class OrbitDbAdapter implements ProfileDatabase {
       }
 
       // Issue #266 — HTTP-only IPFS mode for wallet/CLI clients.
-      // When httpOnlyIpfs is set, the local Helia node is a per-process
-      // cache only: memory blockstore, ephemeral peer id, no libp2p
-      // datastore on disk. Cross-process / cross-device recovery is
-      // served by the operator-side Kubo gateway over HTTP (via
-      // `ipfsGateways`) plus the snapshot prefetch mechanism, NOT by
-      // FsBlockstore persistence. See `OrbitDbConfig.httpOnlyIpfs`.
+      //
+      // What we strip:
+      //   - libp2p networking (DHT, bootstrap peers, peer discovery,
+      //     autoNAT, dcutr, delegatedRouting, ipnsFetch, ipnsPublish)
+      //   - Helia's default block brokers (bitswap hangs without peers;
+      //     trustlessGateway walks public gateways with 30s timeouts)
+      //   - Helia's `FsBlockstore` on disk (memory blockstore is the
+      //     local cache; user-direction: "store all its related
+      //     records in memory only")
+      //
+      // What replaces them:
+      //   - A single HTTP `BlockBroker` (profile/http-block-broker.ts)
+      //     that fetches missing blocks via `POST /api/v0/block/get`
+      //     against the operator-controlled Kubo gateways supplied in
+      //     `config.ipfsGateways`. Cross-process AND cross-device
+      //     recovery both work via HTTP — the flush-scheduler's
+      //     per-flush remote-durability gate (default 30s, issue #239)
+      //     ensures blocks reach operator Kubo before the wallet exits.
+      //
+      // The non-httpOnly path is unchanged: `FsBlockstore` on disk,
+      // full libp2pDefaults, public trustless gateways available.
+      // That path is for operator-side bridges / e2e tests with real
+      // peer discovery.
       const httpOnlyIpfs = config.httpOnlyIpfs === true;
 
       const heliaOptions: Record<string, unknown> = {};
@@ -274,9 +291,10 @@ export class OrbitDbAdapter implements ProfileDatabase {
         // persist across destroys for cross-process / cross-device
         // recovery on the same dataDir.
         //
-        // Issue #266 — skipped when `httpOnlyIpfs` is set: clients
-        // accept the memory-only blockstore and rely on the operator
-        // Kubo gateway via HTTP for cross-process recovery.
+        // Issue #266 — skipped when `httpOnlyIpfs` is set: the HTTP
+        // block broker re-fetches missing blocks from operator Kubo
+        // (which always has the wallet's data because the flush-
+        // scheduler pushes there with a per-flush durability gate).
         try {
           const blockstoreFsModule: any = await import('blockstore-fs' as string);
           const FsBlockstoreCtor =
@@ -394,7 +412,7 @@ export class OrbitDbAdapter implements ProfileDatabase {
         };
         heliaOptions.libp2p = libp2pConfig;
 
-        // Issue #266 — disable Helia's default block brokers in HTTP-only
+        // Issue #266 — replace Helia's default block brokers in HTTP-only
         // mode. The defaults are:
         //   - `bitswap()` — peer-to-peer via libp2p; useless without
         //     peers and hangs waiting for them.
@@ -405,14 +423,29 @@ export class OrbitDbAdapter implements ProfileDatabase {
         //     not host our wallet data and produce 504s + 30-second
         //     waits before failing.
         //
-        // In lightweight mode the operator-side Kubo gateway is reached
-        // via `profile/ipfs-client.ts` (the snapshot prefetch + per-flush
-        // pin path) which uses our configured `ipfsGateways` directly.
-        // OrbitDB's IPFSBlockStorage hitting an empty Helia blockstore
-        // should fail FAST (returns undefined via the monkey-patch) so
-        // the snapshot prefetch can re-warm and the wallet can read.
+        // When the caller passes `ipfsGateways: [...]`, we install a
+        // single broker that HTTP-fetches missing blocks via
+        // `POST /api/v0/block/get?arg=<cid>` against the operator
+        // Kubo. Cross-process recovery works because the previous
+        // process pushed blocks to operator Kubo via the flush-
+        // scheduler (`profile/ipfs-client.ts`) before exit.
+        //
+        // When no gateways are supplied (raw isolated mode, e.g. CI
+        // tests with `bootstrapPeers: []`), we still drop all default
+        // brokers so a local-blockstore miss fails FAST instead of
+        // walking public gateways. The monkey-patched blockstore.get
+        // swallows the resulting InvalidConfigurationError and
+        // returns `undefined` for the missing block.
         if (isIsolated) {
-          heliaOptions.blockBrokers = [];
+          const gateways = Array.isArray(config.ipfsGateways)
+            ? config.ipfsGateways.filter((g): g is string => typeof g === 'string' && g.length > 0)
+            : [];
+          if (gateways.length > 0) {
+            const { createHttpBlockBroker } = await import('./http-block-broker.js');
+            heliaOptions.blockBrokers = [createHttpBlockBroker({ gateways })];
+          } else {
+            heliaOptions.blockBrokers = [];
+          }
         }
       } else if (gossipsubFactory) {
         // libp2pDefaults not available -- pass minimal libp2p with gossipsub

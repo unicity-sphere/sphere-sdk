@@ -439,7 +439,12 @@ describeOrSkip('OrbitDB Adapter — httpOnlyIpfs mode (issue #266)', { timeout: 
     }
   });
 
-  it('httpOnlyIpfs: true skips Helia FsBlockstore on disk', async () => {
+  it('httpOnlyIpfs: true skips Helia FsBlockstore (memory-only blockstore + HTTP fallback)', async () => {
+    // Contract pin: lightweight mode uses MemoryBlockstore only. The
+    // HTTP block broker (profile/http-block-broker.ts) handles
+    // cross-process / cross-device recovery by fetching missing
+    // blocks from operator Kubo. This matches the user-direction
+    // on issue #266: "store all its related records in memory only".
     suppressWebRtcErrors();
     const dir = makeTempDir('httponly-no-fsblocks');
     const adapter = new OrbitDbAdapter();
@@ -454,9 +459,10 @@ describeOrSkip('OrbitDB Adapter — httpOnlyIpfs mode (issue #266)', { timeout: 
       // Touch the OpLog so the adapter has done at least one IPFS write
       await adapter.put('probe.k', encode('probe'));
 
-      // The FsBlockstore writes its CAR blocks under `<directory>/blocks/`.
-      // In httpOnlyIpfs mode we configure Helia with the default
-      // MemoryBlockstore instead, so this directory must NOT exist.
+      // FsBlockstore would write its CAR blocks under
+      // `<directory>/blocks/`. In httpOnlyIpfs mode Helia uses the
+      // default MemoryBlockstore and we skip the FsBlockstore wiring,
+      // so this directory must NOT exist.
       const blocksDir = path.join(dir, 'blocks');
       expect(fs.existsSync(blocksDir)).toBe(false);
     } finally {
@@ -466,31 +472,18 @@ describeOrSkip('OrbitDB Adapter — httpOnlyIpfs mode (issue #266)', { timeout: 
     }
   });
 
-  it('reopen on same directory: lightweight mode loses prior writes (fast-fail, not a 30s gateway walk)', async () => {
-    // ADVERSARIAL: write data, close, reopen on the same directory.
-    // In httpOnlyIpfs mode the Helia blockstore is memory-only and we
-    // strip Helia's default block brokers (bitswap + public trustless
-    // gateways), so a missing block returns FAST (not a 30-second
-    // walk over `trustless-gateway.link` and `4everland.io`).
-    //
-    // Contract pinned here:
-    //   - Data written before close() is not recoverable on reopen
-    //     via the bare adapter (no FsBlockstore, no HTTP fallback).
-    //     A read of a missing key returns `null` quickly, NOT a
-    //     thrown error with a 30s gateway timeout chain.
-    //   - Cross-process recovery in production happens at the
-    //     ProfileStorageProvider layer: the snapshot prefetch
-    //     (PROFILE-AGGREGATOR-POINTER-*) fetches the snapshot CAR
-    //     from operator Kubo via HTTP (profile/ipfs-client.ts) and
-    //     re-warms Helia's memory blockstore BEFORE OrbitDB does any
-    //     read.
-    //
-    // This test pins the bare-adapter contract so future changes
-    // don't accidentally regress to disk-backed mode (which would
-    // re-introduce the 80+ TCP connection cost on every CLI
-    // invocation — issue #266) or to the slow public-gateway walk.
+  it('reopen on same directory with no HTTP gateways: fast-fail, no 30s public-gateway walk', async () => {
+    // Contract pin: lightweight mode is memory-only at the
+    // blockstore level. With no `ipfsGateways` configured, a missing
+    // block on reopen returns FAST (no public trustless gateway
+    // walks). Real cross-process recovery in production uses the
+    // HTTP block broker against operator-controlled Kubo gateways
+    // (passed via `ipfsGateways`). This test deliberately omits
+    // gateways to verify the fail-fast contract — if we ever
+    // accidentally re-enable Helia's default trustless gateways,
+    // this test would hang 30s per gateway walk.
     suppressWebRtcErrors();
-    const dir = makeTempDir('httponly-reopen');
+    const dir = makeTempDir('httponly-reopen-no-gw');
     const key = randomKey();
 
     try {
@@ -500,6 +493,7 @@ describeOrSkip('OrbitDB Adapter — httpOnlyIpfs mode (issue #266)', { timeout: 
         directory: dir,
         enablePubSub: false,
         httpOnlyIpfs: true,
+        // intentionally no ipfsGateways
       });
       await a.put('reopen.k', encode('original'));
       const beforeClose = await a.get('reopen.k');
@@ -507,7 +501,8 @@ describeOrSkip('OrbitDB Adapter — httpOnlyIpfs mode (issue #266)', { timeout: 
       expect(decode(beforeClose!)).toBe('original');
       await a.close();
 
-      // Reopen — same dir, same key, but a fresh Helia memory blockstore.
+      // Reopen — same dir, same key, fresh process. With memory
+      // blockstore + no HTTP broker, the prior write is unreachable.
       const b = new OrbitDbAdapter();
       await b.connect({
         privateKey: key,
@@ -515,21 +510,108 @@ describeOrSkip('OrbitDB Adapter — httpOnlyIpfs mode (issue #266)', { timeout: 
         enablePubSub: false,
         httpOnlyIpfs: true,
       });
-      // The OpLog heads are in level DB on disk, but their referenced
-      // entry blocks live in the previous process's memory and are now
-      // gone. With `blockBrokers: []` AND the monkey-patch that swallows
-      // `InvalidConfigurationError`, `get` returns null quickly.
       const start = Date.now();
       const afterReopen = await b.get('reopen.k');
       const elapsedMs = Date.now() - start;
       expect(afterReopen).toBeNull();
-      // Fast-fail contract: this MUST be near-instant. If we accidentally
-      // re-enable Helia's default trustless gateways, the test would
-      // hang 30 seconds walking trustless-gateway.link / 4everland.io.
-      // 5 seconds is generous; in practice this should be < 100ms.
+      // 5s is generous; in practice < 100ms.
       expect(elapsedMs).toBeLessThan(5000);
       await b.close();
     } finally {
+      cleanupDir(dir);
+      restoreUncaughtListeners();
+    }
+  });
+
+  it('reopen with HTTP fallback: lightweight mode recovers prior writes via operator Kubo HTTP', async () => {
+    // End-to-end recovery test: stand up a tiny in-process HTTP
+    // server that mimics Kubo's `POST /api/v0/block/get?arg=<cid>`
+    // endpoint, write data via adapter A, snapshot the blocks into
+    // the fake gateway's store, close A, then open adapter B in the
+    // SAME `directory` (so OrbitDB has its OpLog heads on disk) but
+    // with a FRESH Helia memory blockstore. B must HTTP-fetch the
+    // missing blocks from the fake gateway and recover the data
+    // without any libp2p / public-gateway involvement.
+    //
+    // This validates the production cross-process recovery contract:
+    // the flush-scheduler pushes blocks to operator Kubo, the next
+    // process HTTP-fetches them back via the HTTP block broker.
+    suppressWebRtcErrors();
+    const http = await import('http' as string);
+    const dir = makeTempDir('httponly-reopen-http');
+    const key = randomKey();
+    const blockStore = new Map<string, Uint8Array>();
+
+    // Tiny fake operator Kubo: serves POST /api/v0/block/get?arg=<cid>
+    // by looking up the CID in `blockStore`. 404 on miss.
+    const server = http.createServer((req: any, res: any) => {
+      const url = new URL(req.url, 'http://localhost');
+      if (req.method === 'POST' && url.pathname === '/api/v0/block/get') {
+        const cidString = url.searchParams.get('arg') ?? '';
+        const bytes = blockStore.get(cidString);
+        if (!bytes) {
+          res.statusCode = 404;
+          res.end('not found');
+          return;
+        }
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'application/octet-stream');
+        res.end(Buffer.from(bytes));
+        return;
+      }
+      res.statusCode = 404;
+      res.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    const port = (server.address() as any).port;
+    const gateway = `http://127.0.0.1:${port}`;
+
+    try {
+      // Phase A — write data with the local blockstore. Tap into Helia's
+      // blockstore put to record every block in our fake gateway, since
+      // the SDK's flush-scheduler isn't running in this unit test.
+      const a = new OrbitDbAdapter();
+      await a.connect({
+        privateKey: key,
+        directory: dir,
+        enablePubSub: false,
+        httpOnlyIpfs: true,
+        ipfsGateways: [gateway],
+      });
+      // Snoop Helia's blockstore.put so we capture every CID/bytes
+      // pair (this stands in for the flush-scheduler's HTTP pin step).
+      const heliaInstance: any = (a as any).helia;
+      const originalPut = heliaInstance.blockstore.put.bind(heliaInstance.blockstore);
+      heliaInstance.blockstore.put = async (cid: any, bytes: Uint8Array, ...rest: any[]) => {
+        blockStore.set(cid.toString(), bytes);
+        return originalPut(cid, bytes, ...rest);
+      };
+
+      await a.put('recovery.k1', encode('alpha'));
+      await a.put('recovery.k2', encode('beta'));
+      await a.close();
+
+      // Phase B — reopen with a fresh process (fresh Helia memory
+      // blockstore). Must HTTP-fetch the missing blocks from the fake
+      // gateway.
+      const b = new OrbitDbAdapter();
+      await b.connect({
+        privateKey: key,
+        directory: dir,
+        enablePubSub: false,
+        httpOnlyIpfs: true,
+        ipfsGateways: [gateway],
+      });
+
+      const v1 = await b.get('recovery.k1');
+      const v2 = await b.get('recovery.k2');
+      expect(v1).not.toBeNull();
+      expect(v2).not.toBeNull();
+      expect(decode(v1!)).toBe('alpha');
+      expect(decode(v2!)).toBe('beta');
+      await b.close();
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
       cleanupDir(dir);
       restoreUncaughtListeners();
     }
