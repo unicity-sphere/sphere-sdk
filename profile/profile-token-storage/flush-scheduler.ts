@@ -489,11 +489,78 @@ export class FlushScheduler {
       const previousData = this.host.getLastLoadedData();
 
       // (i) Token-set check.
+      //
+      // Issue #268 follow-up — the raw set-difference of storage keys
+      // over-reports violations whenever PaymentsModule retires a
+      // token via the normal lifecycle. Two retirement paths exist:
+      //
+      //   (a) **Tombstone** (spent / burned / invalidated). The token
+      //       is removed from `this.tokens` AND a `{tokenId, stateHash,
+      //       timestamp}` row is appended to `_tombstones`. Storage key
+      //       `_<tokenId>` disappears in the new flush — legitimate.
+      //
+      //   (b) **Archive** (state transition: same genesis tokenId,
+      //       new stateHash). `addToken` archives the prior state
+      //       under the `archived-<tokenId>` key AND deletes the
+      //       wallet-level entry whose old `token.id` no longer
+      //       matches the new state. The active key `_<tokenId>` is
+      //       re-populated by the new state on the next
+      //       `createStorageData()` call — typically same key, no
+      //       set-difference. BUT during the invoice-pay /
+      //       receive-finalize race, the new state may not be in
+      //       `this.tokens` when the flush serializes (e.g., the
+      //       payment removed the source token before the next
+      //       receive replenished any state). In that case the
+      //       archive entry is the canonical record of the token.
+      //
+      // Without this allowance the at-least-once Nostr gate refuses
+      // every ack on every replayed event, the daemon spins at 200 %+
+      // CPU re-running `handleIncomingTransfer`, and the soak hang
+      // documented in issue #268 (receive --finalize → invoice pay
+      // cascade) presents as a 3-minute timeout on `invoice pay`.
+      //
+      // The legitimate-removal set is built from the operational state
+      // extracted alongside `tokens` above so we don't pay an extra
+      // OrbitDB read. Tombstone tokenIds map to `_<tokenId>` keys via
+      // the same `keyFromTokenId` rule the storage layer uses; archive
+      // keys are extracted directly from the current data via
+      // `extractTokensFromTxfData` (which includes `archived-*` keys).
       const tokenMissing: string[] = [];
       if (previousData && previousData !== data) {
         const previousTokens = this.host.extractTokensFromTxfData(previousData);
-        for (const tokenId of previousTokens.keys()) {
-          if (!tokens.has(tokenId)) tokenMissing.push(tokenId);
+        // Build the set of token IDs that have been legitimately
+        // retired in the current flush. Storage keys for active
+        // tokens are `_<id>`; archive keys are `archived-<id>`. We
+        // collapse both prefixes to the underlying id and compare
+        // against the previous-key id to detect a transition.
+        const stripKeyPrefix = (k: string): string => {
+          if (k.startsWith('archived-')) return k.substring('archived-'.length);
+          if (k.startsWith('_forked_')) {
+            const rest = k.substring('_forked_'.length);
+            const sep = rest.indexOf('_');
+            return sep === -1 ? rest : rest.substring(0, sep);
+          }
+          if (k.startsWith('_')) return k.substring(1);
+          return k;
+        };
+        const currentTokenIds = new Set<string>();
+        for (const k of tokens.keys()) currentTokenIds.add(stripKeyPrefix(k));
+        const tombstoneTokenIds = new Set<string>();
+        for (const t of opState.tombstones ?? []) {
+          if (t && typeof (t as { tokenId?: unknown }).tokenId === 'string') {
+            tombstoneTokenIds.add((t as { tokenId: string }).tokenId);
+          }
+        }
+        for (const key of previousTokens.keys()) {
+          if (tokens.has(key)) continue;
+          const id = stripKeyPrefix(key);
+          // (b) Archive transition — current data has the token under
+          // the active OR archive key for the same underlying id.
+          if (currentTokenIds.has(id)) continue;
+          // (a) Tombstoned — current operational state records a
+          // deliberate retirement of this tokenId.
+          if (tombstoneTokenIds.has(id)) continue;
+          tokenMissing.push(key);
         }
       }
 
