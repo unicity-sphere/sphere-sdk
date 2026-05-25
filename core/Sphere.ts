@@ -4690,11 +4690,31 @@ export class Sphere {
           allProviders.push(provider);
         }
       }
+      // [DIAG #255 v8] Confirm the sweep is running and what it sees.
+      const withFlush: string[] = [];
+      const withoutFlush: string[] = [];
+      for (const p of allProviders) {
+        if (typeof (p as unknown as { awaitNextFlush?: unknown }).awaitNextFlush === 'function') {
+          withFlush.push(p.id ?? '<no-id>');
+        } else {
+          withoutFlush.push(p.id ?? '<no-id>');
+        }
+      }
+      logger.warn(
+        'Sphere',
+        `[DIAG] pre-shutdown flush sweep: found ${allProviders.length} provider(s) — ` +
+        `withFlush=[${withFlush.join(',')}] withoutFlush=[${withoutFlush.join(',')}] ` +
+        `timeoutMs=${flushTimeoutMs}`,
+      );
       for (const provider of allProviders) {
         try {
           await (provider as TokenStorageProvider<TxfStorageDataBase> & {
             awaitNextFlush?: (timeoutMs?: number) => Promise<void>;
           }).awaitNextFlush?.(flushTimeoutMs);
+          logger.warn(
+            'Sphere',
+            `[DIAG] pre-shutdown awaitNextFlush succeeded for provider ${provider.id ?? '<unknown>'}`,
+          );
         } catch (err) {
           // Don't hang destroy() on a flush failure. The provider's
           // own `pendingPublishCid` retry marker covers the next-boot
@@ -4707,6 +4727,11 @@ export class Sphere {
           );
         }
       }
+    } else {
+      logger.warn(
+        'Sphere',
+        '[DIAG] pre-shutdown flush sweep SKIPPED (options.skipFlush=true)',
+      );
     }
 
     // Issue #97 (steelman C6) — null out per-address profile writers

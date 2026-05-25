@@ -305,12 +305,36 @@ function buildCarFetcher(gateways: readonly string[]): CarFetcher {
         const elapsedMs = Date.now() - startedAt;
         const rootCid = await extractCarRootCid(outcome.bytes);
         if (rootCid === null) {
+          // Capture first 64 bytes as hex + ASCII for diagnosis: tells
+          // us whether the 339-byte response is a CAR, JSON error
+          // envelope, HTML, or something else. Also re-fetch with
+          // HEAD to capture Content-Type (the fetchCarFromGateway
+          // call drops headers).
+          const previewLen = Math.min(64, outcome.bytes.length);
+          const hexPreview = Array.from(outcome.bytes.slice(0, previewLen))
+            .map((b) => b.toString(16).padStart(2, '0')).join('');
+          const asciiPreview = Array.from(outcome.bytes.slice(0, previewLen))
+            .map((b) => (b >= 0x20 && b < 0x7f ? String.fromCharCode(b) : '.')).join('');
+          let contentType = '<unknown>';
+          let httpStatus = '<unknown>';
+          try {
+            const probe = await fetch(url, {
+              method: 'HEAD',
+              signal: AbortSignal.timeout(2000),
+            });
+            contentType = probe.headers.get('content-type') ?? '<no content-type>';
+            httpStatus = String(probe.status);
+            void probe.body?.cancel?.().catch(() => { /* ignore */ });
+          } catch {
+            // HEAD probe failed; keep placeholders.
+          }
           logger.warn(
             'CarFetcher',
-            `[DIAG] cid=${cidShort} gateway=${gateway} ` +
+            `[DIAG] cid=${cidString} gateway=${gateway} ` +
             `CAR fetched (${outcome.bytes.length}B in ${elapsedMs}ms) but ` +
-            `extractCarRootCid returned null (CarReader.fromBytes threw OR roots.length===0) ` +
-            `— returning car_parse_failed`,
+            `extractCarRootCid returned null — returning car_parse_failed. ` +
+            `HEAD probe: status=${httpStatus} content-type=${contentType}. ` +
+            `first ${previewLen}B hex=${hexPreview} ascii="${asciiPreview}"`,
           );
           return { ok: false, kind: 'car_parse_failed' } as const;
         }

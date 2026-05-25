@@ -15067,12 +15067,35 @@ export class PaymentsModule {
    */
   private async awaitAllProvidersDurable(timeoutMs = 60_000): Promise<boolean> {
     const providers = this.getTokenStorageProviders();
-    if (providers.size === 0) return true;
+    // [DIAG #255 v8] Confirm this gate is reached and what it sees.
+    const withFlush: string[] = [];
+    const withoutFlush: string[] = [];
+    for (const [providerId, provider] of providers) {
+      if (typeof provider.awaitNextFlush === 'function') withFlush.push(providerId);
+      else withoutFlush.push(providerId);
+    }
+    logger.warn(
+      'Payments',
+      `[DIAG] awaitAllProvidersDurable enter: providers=${providers.size} ` +
+      `withFlush=[${withFlush.join(',')}] withoutFlush=[${withoutFlush.join(',')}] ` +
+      `timeoutMs=${timeoutMs}`,
+    );
+    if (providers.size === 0) {
+      logger.warn(
+        'Payments',
+        '[DIAG] awaitAllProvidersDurable exit: durable=true (0 providers — vacuously durable)',
+      );
+      return true;
+    }
     let allDurable = true;
     for (const [providerId, provider] of providers) {
       if (typeof provider.awaitNextFlush !== 'function') continue;
       try {
         await provider.awaitNextFlush(timeoutMs);
+        logger.warn(
+          'Payments',
+          `[DIAG] awaitNextFlush succeeded for provider ${providerId}`,
+        );
       } catch (err) {
         logger.warn(
           'Payments',
@@ -15082,6 +15105,10 @@ export class PaymentsModule {
         allDurable = false;
       }
     }
+    logger.warn(
+      'Payments',
+      `[DIAG] awaitAllProvidersDurable exit: durable=${allDurable}`,
+    );
     return allDurable;
   }
 
