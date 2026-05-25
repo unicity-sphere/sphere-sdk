@@ -62,7 +62,7 @@
 // block-by-block via `pinCarBlocksToIpfs`; per-block IPFS dedup is
 // restored, closing the byte-cost-per-token-mutation regression
 // introduced by the #212 monolithic-raw interim.
-import { pinCarBlocksToIpfs } from '../ipfs-client.js';
+import { fetchCarFromIpfs, pinCarBlocksToIpfs } from '../ipfs-client.js';
 import { extractCarRootCid } from '../../uxf/transfer-payload.js';
 import type {
   ProfileSnapshotPublishResult,
@@ -333,7 +333,7 @@ export class FlushScheduler {
 
     try {
       // 1. Extract tokens and operational state
-      const tokens = this.host.extractTokensFromTxfData(data);
+      let tokens = this.host.extractTokensFromTxfData(data);
       const opState = this.host.extractOperationalState(data);
 
       // 2. Build UXF package
@@ -341,7 +341,7 @@ export class FlushScheduler {
       const pkg = UxfPackage.create();
 
       // Ingest all token objects
-      const tokenValues = [...tokens.values()];
+      let tokenValues = [...tokens.values()];
       if (tokenValues.length > 0) {
         pkg.ingestAll(tokenValues);
       }
@@ -377,8 +377,13 @@ export class FlushScheduler {
         `flushToIpfs: ${tokenValues.length} tokens {${histogram}} noDataMode=${noDataMode}`,
       );
 
-      // 3. Export to CAR (unencrypted — see class doc)
-      const carBytes = await pkg.toCar();
+      // 3. Export to CAR (unencrypted — see class doc).
+      //
+      // Issue #255 — `let` (not `const`) because the bundle-set
+      // monotonicity check below may merge foreign bundles into `pkg`
+      // and re-export. The no-data short-circuit just below uses this
+      // initial export; if it fires, we return before any merge.
+      let carBytes = await pkg.toCar();
 
       // 3a. No-data flush idempotency: compute the locally-deterministic
       //     CID for the about-to-pin bytes and short-circuit if either
@@ -481,8 +486,38 @@ export class FlushScheduler {
       //      Compare against the current active bundle index — any CID
       //      in the index that's NOT in the loaded snapshot AND NOT the
       //      about-to-pin CID is a stale-baseline indicator.
+      //
+      // Issue #255 (post-PR #261) — **in-place recovery on unknown bundle**.
+      //
+      // Previously this arm threw POINTER_MONOTONICITY_VIOLATION and
+      // delegated recovery to either (a) `awaitNextFlush`'s one-shot
+      // Gap 4 retry, or (b) a fire-and-forget `queueMicrotask` baseline
+      // refresh. Both paths only updated `lastLoadedFromBundleCids` —
+      // they did NOT pull the foreign bundle's CONTENT into the local
+      // merged state. Under cross-device replication churn (a peer
+      // continuously writing bundle refs into OrbitDB), the retry race
+      // window between "refresh baseline" and "next flush reads
+      // listActiveBundles" lets a NEW unknown CID land, and the second
+      // flush re-throws the same violation. Worst case: every flush in
+      // a sequence fails, the at-least-once gate refuses every Nostr
+      // ack, and incoming events replay forever without ever durably
+      // landing.
+      //
+      // Structural fix (option #3 from the diagnosis): when an unknown
+      // bundle is detected, fetch its CAR INLINE and merge it into the
+      // in-flight `pkg`. This makes V_n's CAR genuinely a superset of
+      // V_n-1's bundle union, satisfying the monotonicity invariant by
+      // CONSTRUCTION rather than by deferred retry. The recovery is
+      // atomic within the flush body — there is no race window with
+      // concurrent peer writes (they land in the NEXT flush, not this
+      // one).
+      //
+      // Fallback: if the inline fetch+merge fails (network down,
+      // malformed CAR, etc.), we fall through to throwing the original
+      // violation. The legacy Gap 4 retry + fire-and-forget refresh
+      // path still applies as the safety net for this rare case.
       const loadedBundleCids = this.host.getLastLoadedFromBundleCids();
-      const unknownBundleCids: string[] = [];
+      let unknownBundleCids: string[] = [];
       if (loadedBundleCids !== null) {
         try {
           const activeBundles = await this.bundleIndex.listActiveBundles();
@@ -501,6 +536,55 @@ export class FlushScheduler {
               `${err instanceof Error ? err.message : String(err)}`,
           );
         }
+      }
+
+      // In-place recovery for unknown bundles (#255). Try to fetch and
+      // merge each unknown bundle into `pkg`. On any failure, leave the
+      // CIDs in `unknownBundleCids` so the violation throw fires below.
+      if (unknownBundleCids.length > 0) {
+        const mergedCids: string[] = [];
+        const stillUnknown: string[] = [];
+        for (const cid of unknownBundleCids) {
+          try {
+            const foreignCarBytes = await fetchCarFromIpfs(
+              this.host.ipfsGateways,
+              cid,
+              undefined,
+              undefined,
+              this.host.getHelia(),
+            );
+            const foreignPkg = await UxfPackage.fromCar(foreignCarBytes);
+            pkg.merge(foreignPkg);
+            mergedCids.push(cid);
+            if (loadedBundleCids !== null) {
+              loadedBundleCids.add(cid);
+            }
+          } catch (err) {
+            stillUnknown.push(cid);
+            this.host.log(
+              `In-place merge failed for unknown bundle ${cid} ` +
+                `(falling back to violation throw): ` +
+                `${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
+        // Replace token map / values with the merged set so downstream
+        // code (CAR export, bundle ref tokenCount) reflects the union.
+        // Re-export carBytes from the merged pkg so the pin step uses
+        // the superset CAR (the pre-merge carBytes above is now stale).
+        if (mergedCids.length > 0) {
+          tokens = pkg.assembleAll() as Map<string, unknown>;
+          tokenValues = [...tokens.values()];
+          carBytes = await pkg.toCar();
+          this.host.log(
+            `In-place monotonicity recovery: merged ${mergedCids.length} foreign ` +
+              `bundle(s) into in-flight CAR ` +
+              `(${mergedCids.slice(0, 5).join(', ')}${mergedCids.length > 5 ? ', ...' : ''}) — ` +
+              `pkg now has ${tokens.size} token(s)`,
+          );
+        }
+        // Anything we couldn't fetch+merge falls through to the throw.
+        unknownBundleCids = stillUnknown;
       }
 
       if (tokenMissing.length > 0 || unknownBundleCids.length > 0) {
@@ -538,6 +622,13 @@ export class FlushScheduler {
         // forget covers the save-driven timer path, the periodic
         // poll's no-data flush path, and any other call site that
         // doesn't loop on violation.
+        //
+        // Post-#255: this path now only fires when (a) the token-set
+        // check fired (partial-save bug, no merge possible) or (b) the
+        // inline fetch+merge above failed for every unknown bundle
+        // (network down + no local Helia blockstore for those CIDs).
+        // The common cross-device-race case is handled by the inline
+        // recovery without reaching this throw.
         queueMicrotask(() => {
           this.host.refreshBaselineForMonotonicity().catch((err) => {
             this.host.log(
