@@ -131,7 +131,7 @@ export const POINTER_MONOTONICITY_RECOVERED = 'POINTER_MONOTONICITY_RECOVERED';
  * shape via the host facade; this shape is just the loose subset we need
  * to reason about during the merge.
  */
-type OpStateArrays = {
+export type OpStateArrays = {
   tombstones: unknown[];
   outbox: unknown[];
   sent: unknown[];
@@ -171,7 +171,7 @@ type OpStateArrays = {
  * forward-compatible with `T.1.E` composite-key tokenIds and any
  * future per-entry fields.
  */
-function unionOpStateWithSentWins(
+export function unionOpStateWithSentWins(
   currentOp: OpStateArrays,
   previousOp: OpStateArrays,
 ): { merged: OpStateArrays; droppedOutboxIds: string[] } {
@@ -964,20 +964,30 @@ export class FlushScheduler {
           `[POINTER_MONOTONICITY_VIOLATION] residual after auto-merge (continuing): ${reasonParts.join('; ')}`,
         );
 
-        // Gap 4 recovery (legacy): still kick off the baseline refresh
-        // as defense-in-depth. The auto-merge above already handles the
-        // happy path; this microtask covers the rare case where
-        // `previousData` was null and the bundle inline fetch also
-        // failed — a subsequent successful `load()` re-evaluates the
-        // baseline so the NEXT flush sees a clean state.
-        queueMicrotask(() => {
-          this.host.refreshBaselineForMonotonicity().catch((err) => {
-            this.host.log(
-              `Baseline-refresh recovery threw (best-effort): ` +
-                `${err instanceof Error ? err.message : String(err)}`,
-            );
-          });
-        });
+        // Issue #264 — intentionally NOT scheduling the legacy
+        // `refreshBaselineForMonotonicity` microtask anymore.
+        //
+        // Pre-#264 that helper rebuilt `lastLoadedFromBundleCids` from
+        // OrbitDB's `listActiveBundles()` so the throw-then-retry path
+        // could re-flush past a stale baseline. The retry path
+        // (awaitNextFlush) is the only legitimate consumer that still
+        // benefits.
+        //
+        // Post-#264, an unconditional refresh actively BREAKS the
+        // residual-retry contract: the residual CID (the unfetchable
+        // foreign bundle) IS present in `listActiveBundles()` because
+        // it landed in OrbitDB before our flush. A refresh would mark
+        // it as "in baseline", and the next flush's bundle-set check
+        // would no longer treat it as unknown — silently skipping the
+        // inline fetch retry. Subsequent saves would publish CARs
+        // missing the residual's tokens despite OrbitDB still showing
+        // the bundle as active. The auto-merge is precisely the
+        // mechanism that keeps eventual convergence working; the
+        // refresh would sabotage it.
+        //
+        // The `awaitNextFlush` Gap 4 path that DID rely on the throw
+        // continues to work for synthetic-violation tests; for real
+        // workloads it no longer triggers (no throw).
 
         // Surface to operators via the legacy `storage:error` code so
         // dashboards keyed on POINTER_MONOTONICITY_VIOLATION still
