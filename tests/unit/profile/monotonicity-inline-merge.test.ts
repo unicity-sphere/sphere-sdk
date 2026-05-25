@@ -392,7 +392,13 @@ describe('FlushScheduler — in-place monotonicity recovery (#255)', () => {
     await provider.shutdown();
   });
 
-  it('on unknown bundle whose fetch FAILS, falls back to throwing the violation (legacy safety net)', async () => {
+  it('on unknown bundle whose fetch FAILS, auto-merge surfaces the residual via events but flush continues (#264)', async () => {
+    // Issue #264 — the legacy throw is replaced by an auto-merge that
+    // logs warn-level and proceeds. The unfetchable CID is reported on
+    // BOTH `storage:monotonicity-recovered` (as a residual) AND on
+    // legacy `storage:error` with POINTER_MONOTONICITY_VIOLATION (so
+    // dashboards keyed on the literal still fire), but NO throw escapes
+    // the flush body.
     const provider = createProvider(db);
     await provider.initialize();
 
@@ -412,7 +418,7 @@ describe('FlushScheduler — in-place monotonicity recovery (#255)', () => {
     }).lastLoadedFromBundleCids = new Set([localCid]);
 
     // The foreign bundle is in OrbitDB but its CAR is NOT in fetchByCid
-    // → the stub throws → inline merge fails → falls back to violation.
+    // → the stub throws → inline merge fails → residual after auto-merge.
     const tokenRemote = { id: '_TR', genesis: { tokenId: 'TR' } };
     const remoteCarBytes = await makeFakeUxfCar({ tokens: [tokenRemote] });
     const remoteCid = await extractCarRootCid(remoteCarBytes);
@@ -428,9 +434,12 @@ describe('FlushScheduler — in-place monotonicity recovery (#255)', () => {
       pendingData;
 
     const violationEvents: Array<{ code?: string; data?: unknown }> = [];
+    const recoveredEvents: Array<{ data?: unknown }> = [];
     provider.onEvent((evt) => {
       if (evt.type === 'storage:error' && evt.code === POINTER_MONOTONICITY_VIOLATION) {
         violationEvents.push({ code: evt.code, data: evt.data });
+      } else if (evt.type === 'storage:monotonicity-recovered') {
+        recoveredEvents.push({ data: evt.data });
       }
     });
 
@@ -447,13 +456,25 @@ describe('FlushScheduler — in-place monotonicity recovery (#255)', () => {
       thrown = err;
     }
 
-    expect(thrown).toBeDefined();
-    expect((thrown as { code?: string }).code).toBe(POINTER_MONOTONICITY_VIOLATION);
-    expect(fetchCalls).toBe(1); // we tried
-    expect(violationEvents.length).toBeGreaterThan(0);
+    // Issue #264 — no throw escapes the flush body.
+    expect(thrown).toBeNull();
+    expect(fetchCalls).toBe(1); // we tried the inline fetch
 
-    // The CID stays in the alert payload because the inline recovery
-    // failed for it.
+    // The recovered event surfaces the residual unknown bundle.
+    expect(recoveredEvents.length).toBe(1);
+    const recoveredData = recoveredEvents[0]!.data as {
+      mergedUnknownBundleCount: number;
+      residualUnknownBundleCids: string[];
+      residualUnknownBundleCount: number;
+      recoveredTokenCount: number;
+    };
+    expect(recoveredData.mergedUnknownBundleCount).toBe(0);
+    expect(recoveredData.residualUnknownBundleCount).toBe(1);
+    expect(recoveredData.residualUnknownBundleCids).toContain(remoteCid);
+    expect(recoveredData.recoveredTokenCount).toBe(0);
+
+    // The legacy storage:error event also fires for dashboards.
+    expect(violationEvents.length).toBeGreaterThan(0);
     const alert = violationEvents.find(
       (e) => (e.data as { alert?: string } | undefined)?.alert === 'transfer:operator-alert',
     );
@@ -461,14 +482,16 @@ describe('FlushScheduler — in-place monotonicity recovery (#255)', () => {
     const data = alert!.data as {
       unknownBundleCids: string[];
       unknownBundleCount: number;
+      autoMergeResidual?: boolean;
     };
     expect(data.unknownBundleCount).toBe(1);
     expect(data.unknownBundleCids).toContain(remoteCid);
+    expect(data.autoMergeResidual).toBe(true);
 
     await provider.shutdown();
   });
 
-  it('when multiple unknown bundles are present, all fetchable ones are merged; only fetch-failed ones surface in the violation', async () => {
+  it('when multiple unknown bundles are present, all fetchable ones are merged; only fetch-failed ones surface as residual (#264)', async () => {
     const provider = createProvider(db);
     await provider.initialize();
 
@@ -526,18 +549,24 @@ describe('FlushScheduler — in-place monotonicity recovery (#255)', () => {
 
     // Both fetches were attempted.
     expect(fetchCalls).toBe(2);
-    // The throw still fires because cidB couldn't be merged.
-    expect(thrown).toBeDefined();
-    expect((thrown as { code?: string }).code).toBe(POINTER_MONOTONICITY_VIOLATION);
+    // Issue #264 — no throw escapes; flush continues with the
+    // best-effort superset including cidA's tokens.
+    expect(thrown).toBeNull();
 
     // cidA WAS added to the baseline (the inline merge succeeded for it).
+    // cidB stays OUT of the baseline so the NEXT flush re-evaluates the
+    // bundle-set check and re-attempts the inline fetch (per #264 the
+    // legacy refreshBaselineForMonotonicity microtask was intentionally
+    // removed; a refresh would have marked cidB as "in baseline" and
+    // silently skipped the residual retry on subsequent flushes).
     const baseline = (provider as unknown as {
       lastLoadedFromBundleCids: Set<string>;
     }).lastLoadedFromBundleCids;
     expect(baseline.has(cidA)).toBe(true);
     expect(baseline.has(cidB)).toBe(false);
 
-    // The violation payload mentions ONLY cidB.
+    // The legacy storage:error payload (kept for dashboards keyed on
+    // the literal POINTER_MONOTONICITY_VIOLATION) mentions ONLY cidB.
     const alert = violationEvents.find(
       (e) => (e.data as { alert?: string } | undefined)?.alert === 'transfer:operator-alert',
     );
@@ -545,10 +574,12 @@ describe('FlushScheduler — in-place monotonicity recovery (#255)', () => {
     const data = alert!.data as {
       unknownBundleCids: string[];
       unknownBundleCount: number;
+      autoMergeResidual?: boolean;
     };
     expect(data.unknownBundleCount).toBe(1);
     expect(data.unknownBundleCids).toContain(cidB);
     expect(data.unknownBundleCids).not.toContain(cidA);
+    expect(data.autoMergeResidual).toBe(true);
 
     await provider.shutdown();
   });

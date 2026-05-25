@@ -1265,7 +1265,16 @@ export class LifecycleManager {
         // to forward. Convergence still works via the aggregator pointer
         // alone — broadcasts are an optimization, not a correctness
         // requirement.
-        if (pointer.winBroadcastsEnabled()) {
+        //
+        // Tolerant of pointer stubs that predate the
+        // `winBroadcastsEnabled` accessor (e.g. unit-test fakes): a
+        // missing method is treated as flag=false (fail-closed). The
+        // production code path always builds a real `ProfilePointerLayer`
+        // which implements the method.
+        const winBroadcastsOn =
+          typeof pointer.winBroadcastsEnabled === 'function' &&
+          pointer.winBroadcastsEnabled();
+        if (winBroadcastsOn) {
           try {
             const signerHandle = pointer.getSignerForWinBroadcast();
             const signed = await signWinBroadcastPayload(signerHandle.signer, {

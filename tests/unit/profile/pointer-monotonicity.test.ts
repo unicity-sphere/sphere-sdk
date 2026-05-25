@@ -397,14 +397,25 @@ describe('pointer monotonicity invariant', () => {
   // ---------------------------------------------------------------------------
   // Test 2: Race-stale flush (Mode A scenario) — assertion fires
   // ---------------------------------------------------------------------------
-  it('race-stale flush: lastLoadedData missing tokens that are in active OrbitDB bundles → assertion fires, no publish', async () => {
+  it('race-stale flush: unfetchable unknown bundle → auto-merge residual, flush continues + emits both recovered and residual events (#264)', async () => {
     // Simulate the Mode A race: an active bundle B_remote (containing
     // T_remote) lives in OrbitDB but lastLoadedData was captured BEFORE
     // it replicated. A no-data flush built from stale lastLoadedData
-    // would produce a CAR missing T_remote — silent token loss.
+    // would produce a CAR missing T_remote.
     //
     // The bundle-set check fires: B_remote's CID is in the active
-    // bundle index but NOT in lastLoadedFromBundleCids.
+    // bundle index but NOT in lastLoadedFromBundleCids. The inline
+    // fetch fails (empty mock map → 404), so the bundle stays as a
+    // residual after auto-merge.
+    //
+    // Issue #264 behavior change: the flush no longer throws on
+    // residual. It logs warn-level, emits BOTH `storage:monotonicity-
+    // recovered` (with the residual surfaced) AND legacy
+    // `storage:error` with POINTER_MONOTONICITY_VIOLATION (for
+    // dashboards keyed on the literal), and PROCEEDS to pin + publish
+    // the best-effort superset. Subsequent cross-device syncs will
+    // detect the same residual and re-attempt the inline merge,
+    // achieving eventual convergence.
     installMockFetch(tracker, new Map());
     const provider = createProvider(db, { flushDebounceMs: 20 });
     await provider.initialize();
@@ -440,11 +451,15 @@ describe('pointer monotonicity invariant', () => {
       createdAt: 1000,
     });
 
-    // Listen for storage:error events to verify the assertion fires.
+    // Listen for BOTH the residual `storage:error` (for dashboards)
+    // AND the new `storage:monotonicity-recovered` event.
     const errors: Array<{ code?: string; data?: unknown }> = [];
+    const recovered: Array<{ data?: unknown }> = [];
     provider.onEvent((evt) => {
       if (evt.type === 'storage:error' && evt.code === POINTER_MONOTONICITY_VIOLATION) {
         errors.push({ code: evt.code, data: evt.data });
+      } else if (evt.type === 'storage:monotonicity-recovered') {
+        recovered.push({ data: evt.data });
       }
     });
 
@@ -459,15 +474,27 @@ describe('pointer monotonicity invariant', () => {
     flushScheduler.scheduleFlushNoData();
 
     // Issue #215: wait for the debounced flush to actually run
-    // (timer → flush body → catch arm) before asserting that no pin
-    // was issued. The original 100 ms fixed wait was insufficient
-    // under full-suite contention.
+    // (timer → flush body → recovery path) before asserting.
     await waitForFlushSettled(provider);
 
-    // Assertion fired: no pin, error event emitted with the violation
-    // code and the unknown bundle CID listed.
-    expect(tracker.pinCalls).toBe(0);
+    // Issue #264 — the flush now PROCEEDS to pin after the auto-merge
+    // residual emit; pinCalls is non-zero (the no-data flush builds a
+    // CAR from lastLoadedData and pins it best-effort).
+    expect(tracker.pinCalls).toBeGreaterThan(0);
+
+    // Both event surfaces fire.
+    expect(recovered.length).toBeGreaterThan(0);
     expect(errors.length).toBeGreaterThan(0);
+
+    // The recovered event surfaces the residual unknown bundle.
+    const recoveredData = recovered[0]!.data as {
+      residualUnknownBundleCids: string[];
+      residualUnknownBundleCount: number;
+    };
+    expect(recoveredData.residualUnknownBundleCount).toBe(1);
+    expect(recoveredData.residualUnknownBundleCids).toContain(remoteCid);
+
+    // The legacy storage:error event also fires for dashboards.
     const alertEvent = errors.find(
       (e) => (e.data as { alert?: string } | undefined)?.alert === 'transfer:operator-alert',
     );
@@ -475,9 +502,11 @@ describe('pointer monotonicity invariant', () => {
     const alertData = alertEvent!.data as {
       unknownBundleCids: string[];
       unknownBundleCount: number;
+      autoMergeResidual?: boolean;
     };
     expect(alertData.unknownBundleCount).toBe(1);
     expect(alertData.unknownBundleCids).toContain(remoteCid);
+    expect(alertData.autoMergeResidual).toBe(true);
 
     await provider.shutdown();
   });
@@ -485,9 +514,19 @@ describe('pointer monotonicity invariant', () => {
   // ---------------------------------------------------------------------------
   // Test 3: Direct token-loss attempt — assertion fires
   // ---------------------------------------------------------------------------
-  it('token-loss: flush data missing a token from lastLoadedData baseline → assertion fires, no publish', async () => {
+  it('token-loss: flush data missing a token from lastLoadedData baseline → auto-merges in-place + publishes superset, no throw (#264)', async () => {
     // Construct a flush where `data` (set via save()) is missing a
     // token present in lastLoadedData. The token-set check fires.
+    //
+    // Issue #264 behavior change: the flush no longer throws on
+    // monotonicity violation. Instead it extracts the missing TXF
+    // entry from `previousData` and re-merges into the in-flight
+    // `pkg`. Because `previousData` contains every missing entry by
+    // construction (that's the definition of `tokenMissing` in the
+    // check), recovery is total. The flush proceeds to pin + publish
+    // the superset CAR and emits `storage:monotonicity-recovered`
+    // with the recovered token id. NO `storage:error` is emitted
+    // because the residual count is zero.
     installMockFetch(tracker, new Map());
     const provider = createProvider(db, { flushDebounceMs: 20 });
     await provider.initialize();
@@ -501,7 +540,7 @@ describe('pointer monotonicity invariant', () => {
     // check trivially passes (bundle-set check requires a non-null
     // lastLoadedFromBundleCids; we set it to an empty set so the
     // bundle-set check does fire BUT correctly observes "no unknown
-    // bundles" — only the token-set check should produce the violation).
+    // bundles" — only the token-set check produces the recovery).
     const baseline = buildTxfData({ _TA: tokenA, _TB: tokenB });
     (provider as unknown as {
       lastLoadedData: TxfStorageDataBase;
@@ -511,7 +550,8 @@ describe('pointer monotonicity invariant', () => {
       lastLoadedFromBundleCids: Set<string>;
     }).lastLoadedFromBundleCids = new Set();
 
-    // The about-to-flush data has only A — B is being dropped.
+    // The about-to-flush data has only A — B would be dropped without
+    // the auto-merge.
     const partialData = buildTxfData({ _TA: tokenA });
 
     // Drive the flush directly via the internal scheduler (avoids
@@ -525,15 +565,15 @@ describe('pointer monotonicity invariant', () => {
       partialData;
 
     const errors: Array<{ code?: string; data?: unknown }> = [];
+    const recovered: Array<{ data?: unknown }> = [];
     provider.onEvent((evt) => {
       if (evt.type === 'storage:error' && evt.code === POINTER_MONOTONICITY_VIOLATION) {
         errors.push({ code: evt.code, data: evt.data });
+      } else if (evt.type === 'storage:monotonicity-recovered') {
+        recovered.push({ data: evt.data });
       }
     });
 
-    // The flush body throws on violation. The catch in scheduleFlush
-    // would normally swallow it, but we invoke flushToIpfs() directly
-    // to assert the throw, then verify the events.
     let thrown: unknown = null;
     try {
       await flushScheduler.flushToIpfs();
@@ -541,21 +581,27 @@ describe('pointer monotonicity invariant', () => {
       thrown = err;
     }
 
-    expect(thrown).toBeDefined();
-    expect((thrown as { code?: string }).code).toBe(POINTER_MONOTONICITY_VIOLATION);
-    expect(tracker.pinCalls).toBe(0);
+    // No throw — the auto-merge resolves the violation in-place.
+    expect(thrown).toBeNull();
 
-    expect(errors.length).toBeGreaterThan(0);
-    const alertEvent = errors.find(
-      (e) => (e.data as { alert?: string } | undefined)?.alert === 'transfer:operator-alert',
-    );
-    expect(alertEvent).toBeDefined();
-    const alertData = alertEvent!.data as {
-      missingTokenIds: string[];
-      missingTokenCount: number;
+    // The flush proceeded to pin the superset CAR.
+    expect(tracker.pinCalls).toBeGreaterThan(0);
+
+    // The recovered event surfaces the re-merged token id.
+    expect(recovered.length).toBe(1);
+    const recoveredData = recovered[0]!.data as {
+      recoveredTokenIds: string[];
+      recoveredTokenCount: number;
+      residualTokenMissingCount: number;
+      residualUnknownBundleCount: number;
     };
-    expect(alertData.missingTokenCount).toBe(1);
-    expect(alertData.missingTokenIds).toContain('_TB');
+    expect(recoveredData.recoveredTokenCount).toBe(1);
+    expect(recoveredData.recoveredTokenIds).toContain('_TB');
+    expect(recoveredData.residualTokenMissingCount).toBe(0);
+    expect(recoveredData.residualUnknownBundleCount).toBe(0);
+
+    // No residual → no legacy `storage:error` should fire.
+    expect(errors.length).toBe(0);
 
     await provider.shutdown();
   });
