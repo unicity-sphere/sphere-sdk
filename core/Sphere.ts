@@ -5474,21 +5474,43 @@ export class Sphere {
       // which implements the method; this defensive check keeps the
       // contract robust for any future test stub or duck-typed
       // consumer.
-      if (
-        typeof pointer.winBroadcastsEnabled !== 'function' ||
-        // Strict `=== true` mirrors the production normalization in
-        // ProfilePointerLayer's frozen config snapshot. A test stub
-        // returning a truthy non-boolean (`1`, `'yes'`, `{}`) must
-        // be treated as flag=false — same fail-closed policy. Match
-        // the lifecycle-manager guard exactly for symmetry.
-        pointer.winBroadcastsEnabled() !== true ||
-        // Symmetric stub guard: a fake pointer that returns
-        // `winBroadcastsEnabled() === true` but lacks
-        // `getSignerForWinBroadcast` would TypeError at the call
-        // below, surface as a noisy "subscription install failed"
-        // warn, and re-arm on every event. Fail-closed instead.
-        typeof pointer.getSignerForWinBroadcast !== 'function'
-      ) {
+      // Defensive try/catch around the accessor: same rationale as
+      // lifecycle-manager. The accessor contract says
+      // `winBroadcastsEnabled()` MUST NOT throw, but a misbehaving
+      // stub could violate it. Without this catch, an accessor
+      // throw would escape to the outer `try { ... } catch (err)`
+      // and surface as a noisy "subscription install failed (will
+      // retry on next event)" warn — re-arming on every subsequent
+      // `storage:pointer-published` event indefinitely. Treat the
+      // throw as flag=false (fail-closed) so the early-return path
+      // fires cleanly with no noise.
+      let armed = false;
+      try {
+        armed =
+          typeof pointer.winBroadcastsEnabled === 'function' &&
+          // Strict `=== true` mirrors the production normalization
+          // in ProfilePointerLayer's frozen config snapshot. A test
+          // stub returning a truthy non-boolean (`1`, `'yes'`, `{}`)
+          // must be treated as flag=false — same fail-closed policy.
+          pointer.winBroadcastsEnabled() === true &&
+          // Symmetric stub guard: a fake pointer that returns
+          // `winBroadcastsEnabled() === true` but lacks
+          // `getSignerForWinBroadcast` would TypeError at the call
+          // below; fail-closed earlier.
+          typeof pointer.getSignerForWinBroadcast === 'function';
+      } catch (accessorErr) {
+        const msg =
+          accessorErr instanceof Error
+            ? accessorErr.message
+            : String(accessorErr);
+        logger.debug(
+          'Sphere',
+          `pointer-win subscription: winBroadcastsEnabled() threw ` +
+            `(accessor contract violation, treating as flag=false): ${msg}`,
+        );
+        armed = false;
+      }
+      if (!armed) {
         return;
       }
       const signerHandle = pointer.getSignerForWinBroadcast();

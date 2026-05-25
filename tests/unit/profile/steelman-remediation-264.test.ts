@@ -165,8 +165,9 @@ describe('ProfilePointerLayer — probeHistory preservation (#264)', () => {
     discoverMockState.nextResult = { validV: 7, includedV: 5, probeVersions: [3, 4, 5] };
     await layer.discoverLatestVersion();
     const fp2 = await layer.getProbeFingerprint();
+    // `fp2.length > 0` is equivalent to `fp2 !== fp0` here (fp0 ===
+    // ''), so we only assert the stronger condition.
     expect(fp2.length).toBeGreaterThan(0);
-    expect(fp2).not.toBe(fp0);
   });
 });
 
@@ -270,6 +271,38 @@ describe('Sphere.maybeInstallPointerWinSubscription — symmetric guard (#264)',
     }).maybeInstallPointerWinSubscription();
     // Strict-`=== true` policy: truthy non-boolean treated as flag=false.
     expect(subscribeCalls).toBe(0);
+  });
+
+  it('pointer with winBroadcastsEnabled() that THROWS → fail-closed, no subscription, no throw escapes (R5 defensive try/catch)', async () => {
+    // Steelman R5: a misbehaving stub that violates the "MUST NOT
+    // throw" accessor contract must NOT cause the subscriber-install
+    // path to surface a confusing "subscription install failed
+    // (will retry on next event)" log line + arm a permanent retry
+    // loop. The defensive try/catch around the guard expression
+    // treats the throw as flag=false and early-returns cleanly.
+    let subscribeCalls = 0;
+    const sphere = createMinimalSphereForGuardTest({
+      pointer: {
+        winBroadcastsEnabled: () => {
+          throw new Error('synthetic accessor failure');
+        },
+        getSignerForWinBroadcast: () => ({ signer: {}, signingPubKeyHex: 'abc' }),
+      },
+      subscribeToBroadcast: () => {
+        subscribeCalls++;
+        return () => {};
+      },
+    });
+    await expect(
+      (sphere as unknown as {
+        maybeInstallPointerWinSubscription: () => Promise<void>;
+      }).maybeInstallPointerWinSubscription(),
+    ).resolves.toBeUndefined();
+    expect(subscribeCalls).toBe(0);
+    const inFlight = (sphere as unknown as {
+      _pointerWinInstallInFlight: boolean;
+    })._pointerWinInstallInFlight;
+    expect(inFlight).toBe(false);
   });
 
   it('pointer with winBroadcastsEnabled() === true BUT missing getSignerForWinBroadcast → fail-closed, no subscription, no throw', async () => {

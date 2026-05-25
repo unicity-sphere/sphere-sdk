@@ -1271,24 +1271,49 @@ export class LifecycleManager {
         // missing method is treated as flag=false (fail-closed). The
         // production code path always builds a real `ProfilePointerLayer`
         // which implements the method.
-        const winBroadcastsOn =
-          typeof pointer.winBroadcastsEnabled === 'function' &&
-          // Strict `=== true` to mirror the production
-          // ProfilePointerLayer constructor's normalization (which
-          // freezes the snapshot as `=== true`). A test stub that
-          // returns a truthy non-boolean (`1`, `'yes'`, `{}`) MUST be
-          // treated as flag=false — same fail-closed policy as
-          // production config. Symmetric with the Sphere subscriber
-          // guard in `core/Sphere.ts:maybeInstallPointerWinSubscription`.
-          pointer.winBroadcastsEnabled() === true &&
-          // Symmetric with the new accessor: stubs lacking the signer
-          // helper fall through cleanly (fail-closed) rather than
-          // surfacing a TypeError caught only by the broad catch arm
-          // below. The two accessors are added together on real
-          // ProfilePointerLayer instances; a stub omitting one but
-          // not the other is a test-harness shape, not a production
-          // path.
-          typeof pointer.getSignerForWinBroadcast === 'function';
+        // Defensive try/catch around the accessor: the
+        // `winBroadcastsEnabled()` contract is "MUST be a pure
+        // accessor, MUST NOT throw" (see ProfilePointerLayer doc),
+        // but a misbehaving stub could violate it. Without this
+        // catch, an accessor throw would escape to the broad outer
+        // catch (~line 1326) and be misclassified as a TRANSIENT
+        // publish failure returning `{ ok: false, transient: true,
+        // code: 'UNCLASSIFIED' }` — making the entire publish
+        // appear to have failed even though it had already
+        // succeeded. Treat the throw as flag=false (fail-closed
+        // policy), which silently disables broadcasts for this
+        // publish but lets the publish itself report success.
+        let winBroadcastsOn = false;
+        try {
+          winBroadcastsOn =
+            typeof pointer.winBroadcastsEnabled === 'function' &&
+            // Strict `=== true` to mirror the production
+            // ProfilePointerLayer constructor's normalization (which
+            // freezes the snapshot as `=== true`). A test stub that
+            // returns a truthy non-boolean (`1`, `'yes'`, `{}`) MUST be
+            // treated as flag=false — same fail-closed policy as
+            // production config. Symmetric with the Sphere subscriber
+            // guard in `core/Sphere.ts:maybeInstallPointerWinSubscription`.
+            pointer.winBroadcastsEnabled() === true &&
+            // Symmetric with the new accessor: stubs lacking the signer
+            // helper fall through cleanly (fail-closed) rather than
+            // surfacing a TypeError caught only by the broad catch arm
+            // below. The two accessors are added together on real
+            // ProfilePointerLayer instances; a stub omitting one but
+            // not the other is a test-harness shape, not a production
+            // path.
+            typeof pointer.getSignerForWinBroadcast === 'function';
+        } catch (accessorErr) {
+          const msg =
+            accessorErr instanceof Error
+              ? accessorErr.message
+              : String(accessorErr);
+          this.host.log(
+            `Pointer publish: winBroadcastsEnabled() threw (accessor ` +
+              `contract violation, treating as flag=false): ${msg}`,
+          );
+          winBroadcastsOn = false;
+        }
         if (winBroadcastsOn) {
           try {
             const signerHandle = pointer.getSignerForWinBroadcast();

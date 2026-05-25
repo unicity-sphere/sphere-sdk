@@ -192,14 +192,19 @@ export class ProfilePointerLayer {
    * silently disables broadcasts with no error.
    *
    * **Accessor contract.** `winBroadcastsEnabled()` MUST be a pure
-   * accessor and MUST NOT throw. The publisher's broad catch arm
-   * would otherwise classify the throw as a TRANSIENT publish
-   * failure and silently disable broadcasts while reporting
-   * `{ ok: true, transient: true }` to the caller; the subscriber
-   * side would log "subscription install failed" and indefinitely
-   * re-arm on every subsequent event. A real `ProfilePointerLayer`
-   * reads its frozen config snapshot and cannot throw; alternative
-   * implementations MUST honor the same contract.
+   * accessor and MUST NOT throw. Both the publisher (lifecycle-
+   * manager) and subscriber (Sphere) guards wrap the accessor call
+   * in a defensive try/catch that treats a throw as flag=false
+   * (fail-closed). The publish path still reports success; the
+   * subscriber early-returns without registering the per-wallet
+   * Nostr subscription. A single log line is emitted per accessor
+   * throw at debug-level (Sphere) and host-log level
+   * (lifecycle-manager) so operators can correlate. A real
+   * `ProfilePointerLayer` reads its frozen config snapshot and
+   * cannot throw; this defensive treatment exists so a misbehaving
+   * stub or alternative implementation cannot silently corrupt
+   * publish-success classification or trigger noisy
+   * subscription-install retries.
    *
    * **Init-time-only flag.** The flag is captured in the frozen
    * `#config` snapshot at construction time. Flipping
@@ -224,10 +229,14 @@ export class ProfilePointerLayer {
    * `maybeInstallPointerWinSubscription` is therefore not triggered
    * by its own publish path; the subscription only arms if some
    * external code path calls `maybeInstallPointerWinSubscription()`
-   * directly. For receive-only wallets that want to consume sibling
-   * broadcasts, the wiring layer (Sphere) must arrange that
-   * trigger explicitly — e.g., on init when the flag is observed
-   * enabled.
+   * directly. As of #264, `core/Sphere.ts` does NOT arrange an
+   * explicit init-time call — receive-only-wallet support for
+   * pointer-win broadcasts requires a follow-up wiring change (an
+   * init-time invocation gated on the flag's enabled state, OR a
+   * lazy first-incoming-event trigger). Acceptable today because
+   * the flag is default-OFF and the broadcast pipeline is an
+   * optimization layer (the aggregator pointer + auto-merge cover
+   * correctness without it).
    */
   winBroadcastsEnabled(): boolean {
     return this.#config.enablePointerWinBroadcasts === true;
