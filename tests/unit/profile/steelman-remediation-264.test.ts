@@ -1,31 +1,66 @@
 /**
  * Issue #264 — steelman remediation tests.
  *
- * Pins the three observability fixes from the second steelman round:
+ * Pins the observability fixes from the remediation rounds. EVERY
+ * test in this file MUST exercise production code, not re-implement
+ * the predicate it claims to pin (the round-3 steelman caught the
+ * prior version doing exactly that).
  *
- *   1. `ProfilePointerLayer.publish/discoverLatestVersion` — only
- *      overwrite the probe-fingerprint history when the discovery
- *      actually ran probes. The fast-path (#263) returns
- *      `probeHistory: []`; unconditionally assigning would clobber
- *      any fingerprint populated by a prior discovery / probe call.
+ *   1. `ProfilePointerLayer.#discoverLatestVersionInner` — only
+ *      overwrite `#lastProbeVersions` when `result.probeVersions`
+ *      is non-empty. Drives the real `discoverLatestVersion` public
+ *      method with a mocked `findLatestValidVersion` so the
+ *      production conditional at ProfilePointerLayer.ts:541 is on
+ *      the call stack.
  *
- *   2. `core/Sphere.maybeInstallPointerWinSubscription` — symmetric
- *      stub guard. A pointer stub lacking `winBroadcastsEnabled`
- *      OR `getSignerForWinBroadcast` early-returns cleanly without
- *      throwing or installing a subscription.
- *
- *   3. `core/Sphere.bridgeProviderEvents` — the
+ *   2. `core/Sphere.bridgeProviderEvents` — the
  *      `storage:monotonicity-recovered` event from the provider is
- *      forwarded to a Sphere-level event with `providerId` attached,
- *      so consumers subscribing via `sphere.on(...)` see the auto-
- *      merge convergence signal.
+ *      forwarded to a Sphere-level event with `providerId` attached.
+ *      Drives the real `subscribeToProviderEvents` bridge code by
+ *      registering a provider on a real Sphere instance and emitting
+ *      the synthetic provider event.
+ *
+ *   3. `core/Sphere.maybeInstallPointerWinSubscription` — symmetric
+ *      stub guards. Invokes the REAL private method (via cast) with
+ *      stub pointers and asserts no throw + no subscription installed.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-import type { ProfileDatabase, OrbitDbConfig } from '../../../profile/types';
-import type { FullIdentity } from '../../../types';
-import { ProfileTokenStorageProvider } from '../../../profile/profile-token-storage-provider';
+// vi.mock MUST be hoisted above the import that uses the module —
+// vitest hoists vi.mock automatically, but the mocked module's exports
+// must be accessible to the test (we capture the mock instance via the
+// factory's closure variable).
+const discoverMockState: {
+  nextResult: {
+    validV: number;
+    includedV: number;
+    probeVersions: ReadonlyArray<number>;
+  };
+} = {
+  nextResult: { validV: 0, includedV: 0, probeVersions: [] },
+};
+
+vi.mock('../../../profile/aggregator-pointer/discover-algorithm.js', async () => {
+  const actual = await vi.importActual<
+    typeof import('../../../profile/aggregator-pointer/discover-algorithm.js')
+  >('../../../profile/aggregator-pointer/discover-algorithm.js');
+  return {
+    ...actual,
+    findLatestValidVersion: vi.fn(async () => {
+      const r = discoverMockState.nextResult;
+      return {
+        validV: r.validV as unknown as never,
+        includedV: r.includedV as unknown as never,
+        probeVersions: r.probeVersions as unknown as never,
+      };
+    }),
+    // Keep computeProbeFingerprint real so the test can assert
+    // fingerprint-equality semantics end-to-end.
+    computeProbeFingerprint: actual.computeProbeFingerprint,
+  };
+});
+
 import {
   ProfilePointerLayer,
   buildPointerSigner,
@@ -33,35 +68,10 @@ import {
   derivePointerKeyMaterial,
   type PointerSigner,
 } from '../../../profile/aggregator-pointer';
-
-const TEST_PRIVATE_KEY =
-  'aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd';
-
-const TEST_IDENTITY: FullIdentity = {
-  chainPubkey: '02' + 'aa'.repeat(32),
-  l1Address: 'alpha1testaddress',
-  directAddress: 'DIRECT://AABBCCDDEEFF112233445566778899AABBCCDDEEFF',
-  privateKey: TEST_PRIVATE_KEY,
-};
-
-function createMockDb(): ProfileDatabase & { _store: Map<string, Uint8Array> } {
-  const store = new Map<string, Uint8Array>();
-  return {
-    _store: store,
-    async connect(_config: OrbitDbConfig) {},
-    async put(key: string, value: Uint8Array) { store.set(key, value); },
-    async get(key: string) { return store.get(key) ?? null; },
-    async del(key: string) { store.delete(key); },
-    async all(prefix?: string) {
-      const out = new Map<string, Uint8Array>();
-      for (const [k, v] of store) if (!prefix || k.startsWith(prefix)) out.set(k, v);
-      return out;
-    },
-    async close() {},
-    onReplication() { return () => {}; },
-    isConnected() { return true; },
-  } as ProfileDatabase & { _store: Map<string, Uint8Array> };
-}
+import { Sphere } from '../../../core/Sphere';
+import type { ProfileDatabase, OrbitDbConfig } from '../../../profile/types';
+import type { StorageProvider, TokenStorageProvider } from '../../../types';
+import { ProfileTokenStorageProvider } from '../../../profile/profile-token-storage-provider';
 
 async function buildRealSigner(): Promise<PointerSigner> {
   const seed = new Uint8Array(32).fill(0x42);
@@ -70,214 +80,368 @@ async function buildRealSigner(): Promise<PointerSigner> {
   return buildPointerSigner(keyMaterial.signingSeed);
 }
 
+async function buildLayer(): Promise<ProfilePointerLayer> {
+  const signer = await buildRealSigner();
+  return new ProfilePointerLayer({
+    keyMaterial: { signingSeed: new Uint8Array(32), xorSeed: new Uint8Array(32) } as never,
+    signer,
+    aggregatorClient: {} as never,
+    trustBase: {} as never,
+    flagStore: {} as never,
+    mutex: {} as never,
+    decodeCid: (() => ({ bytes: new Uint8Array(0) })) as never,
+    fetchCar: (async () => ({ bytes: new Uint8Array(0) })) as never,
+    fetchAndJoin: async () => {},
+    readLocalVersion: async () => 0 as never,
+    persistLocalVersion: async () => {},
+    resolveRemoteCid: async () => new Uint8Array(0),
+  });
+}
+
 // ---------------------------------------------------------------------------
-// Fix #4: probeHistory preservation across fast-path publish
+// Fix #4: probeHistory preservation across empty-probe discovery
 // ---------------------------------------------------------------------------
+//
+// Drives the REAL `ProfilePointerLayer.discoverLatestVersion()` public
+// method, which calls into `#discoverLatestVersionInner` (where the
+// production guard lives at ProfilePointerLayer.ts:541). The mock for
+// `findLatestValidVersion` controls what `result.probeVersions` looks
+// like; the production conditional decides whether to overwrite
+// `#lastProbeVersions`. We observe via the public `getProbeFingerprint()`.
+// If the production guard were reverted to an unconditional assignment,
+// fp2 would change to the empty-fingerprint output → test fails.
 
 describe('ProfilePointerLayer — probeHistory preservation (#264)', () => {
-  beforeEach(() => { vi.useRealTimers(); });
+  beforeEach(() => {
+    discoverMockState.nextResult = { validV: 0, includedV: 0, probeVersions: [] };
+  });
   afterEach(() => { vi.useRealTimers(); });
 
-  it('publish() with empty probeHistory does NOT clobber a prior fingerprint', async () => {
-    const signer = await buildRealSigner();
-    const layer = new ProfilePointerLayer({
-      keyMaterial: { signingSeed: new Uint8Array(32), xorSeed: new Uint8Array(32) } as never,
-      signer,
-      aggregatorClient: {} as never,
-      trustBase: {} as never,
-      flagStore: {} as never,
-      mutex: {} as never,
-      decodeCid: (() => ({ bytes: new Uint8Array(0) })) as never,
-      fetchCar: (async () => ({ bytes: new Uint8Array(0) })) as never,
-      fetchAndJoin: async () => {},
-      readLocalVersion: async () => 0 as never,
-      persistLocalVersion: async () => {},
-      resolveRemoteCid: async () => new Uint8Array(0),
-    });
+  it('discoverLatestVersion with empty probeVersions does NOT clobber a prior fingerprint', async () => {
+    const layer = await buildLayer();
+    // Round 1: drive discovery with a non-empty probe set → seeds
+    // the real #lastProbeVersions through the production code path.
+    discoverMockState.nextResult = { validV: 7, includedV: 5, probeVersions: [3, 4, 5] };
+    await layer.discoverLatestVersion();
+    const fp1 = await layer.getProbeFingerprint();
+    expect(fp1.length).toBeGreaterThan(0); // sanity: real fingerprint computed
 
-    // Stub the internal #publishInner to return a result with empty
-    // probeHistory — simulating the #263 fast-path success.
-    //
-    // We seed `#lastProbeVersions` by accessing the private field via
-    // a cast; then publish() with empty probeHistory must NOT clear it.
-    const priorVersions = [3, 4, 5];
-    (layer as unknown as { ['#lastProbeVersions']: readonly number[] })['#lastProbeVersions'] = priorVersions;
-    // Access the actual private field by name via Object.assign on the
-    // prototype-bound symbol — JS private fields aren't accessible by
-    // string, so we shadow via the public getter instead:
-    // populate via `discoverLatestVersion` which writes the field.
-    // Replace publish's reconcile call with a stub returning empty.
-    const layerPriv = layer as unknown as {
-      publish: (cidProducer: () => Promise<Uint8Array>) => Promise<unknown>;
-      getProbeFingerprint: () => Promise<string>;
-    };
-
-    // Force a non-empty seed by replacing the internal publishInner
-    // with a controllable double:
-    const stubLayer = Object.create(layer) as ProfilePointerLayer & {
-      __seedFingerprint: () => Promise<void>;
-    };
-    // Use a stub publish that returns empty probeHistory:
-    let returnEmpty = false;
-    (stubLayer as unknown as { publish: (cp: unknown) => Promise<unknown> }).publish = async () => {
-      // First call returns non-empty (seed fingerprint), second returns
-      // empty (fast-path simulation).
-      const result = returnEmpty
-        ? { version: 11, attemptsUsed: 1, probeHistory: [] as number[] }
-        : { version: 10, attemptsUsed: 1, probeHistory: [3, 4, 5] };
-      returnEmpty = true;
-      // Apply the same conditional logic our fix added to publish:
-      if (result.probeHistory.length > 0) {
-        (layer as unknown as { '#lastProbeVersions': readonly number[] })['#lastProbeVersions'] = result.probeHistory;
-      }
-      return result;
-    };
-
-    // Round 1: seed with probeHistory = [3,4,5].
-    await (stubLayer as unknown as { publish: (cp: unknown) => Promise<unknown> }).publish(async () => new Uint8Array(0));
-    const fp1 = await layerPriv.getProbeFingerprint();
-
-    // Round 2: fast-path publish returns empty.
-    await (stubLayer as unknown as { publish: (cp: unknown) => Promise<unknown> }).publish(async () => new Uint8Array(0));
-    const fp2 = await layerPriv.getProbeFingerprint();
-
-    // Fingerprint MUST be unchanged across the empty-probeHistory publish.
-    // (The exact value is implementation-defined; what matters is fp2 === fp1.)
+    // Round 2: drive discovery with EMPTY probeVersions (fast-path /
+    // single-probe scenario). Production conditional MUST skip the
+    // assignment → fingerprint unchanged.
+    discoverMockState.nextResult = { validV: 7, includedV: 5, probeVersions: [] };
+    await layer.discoverLatestVersion();
+    const fp2 = await layer.getProbeFingerprint();
     expect(fp2).toBe(fp1);
+  });
+
+  it('discoverLatestVersion with a non-empty probeVersions OVERWRITES the prior fingerprint (sanity for the conditional)', async () => {
+    const layer = await buildLayer();
+    discoverMockState.nextResult = { validV: 7, includedV: 5, probeVersions: [3, 4, 5] };
+    await layer.discoverLatestVersion();
+    const fp1 = await layer.getProbeFingerprint();
+
+    discoverMockState.nextResult = { validV: 11, includedV: 9, probeVersions: [8, 9, 10, 11] };
+    await layer.discoverLatestVersion();
+    const fp2 = await layer.getProbeFingerprint();
+    expect(fp2).not.toBe(fp1);
+  });
+
+  it('cold-start fingerprint is empty until first non-empty discovery', async () => {
+    const layer = await buildLayer();
+    const fp0 = await layer.getProbeFingerprint();
+    expect(fp0).toBe('');
+    // First discovery with empty probeVersions stays empty.
+    discoverMockState.nextResult = { validV: 0, includedV: 0, probeVersions: [] };
+    await layer.discoverLatestVersion();
+    const fp1 = await layer.getProbeFingerprint();
+    expect(fp1).toBe('');
   });
 });
 
 // ---------------------------------------------------------------------------
-// Fix #6: Sphere event bridge for storage:monotonicity-recovered
+// Fix #3: symmetric subscriber guard
+// (Sphere.maybeInstallPointerWinSubscription)
 // ---------------------------------------------------------------------------
+//
+// Drives the REAL private method via cast. The test stub pointer is
+// returned from a mocked storage provider's `getPointerLayer()`; the
+// method's guard must early-return cleanly without throwing and
+// without registering a transport subscription.
 
-describe('Sphere — storage:monotonicity-recovered event bridge (#264)', () => {
-  it('forwards the provider event to a Sphere-level event with providerId attached', async () => {
-    // Direct provider-level test: instantiate a ProfileTokenStorageProvider,
-    // attach a listener to its onEvent, emit the storage:monotonicity-
-    // recovered event, verify the bridge wiring SHAPE. Full Sphere init
-    // requires more infrastructure than this isolated unit test needs;
-    // bridge behavior is exercised end-to-end via the existing
-    // pointer-monotonicity.test.ts auto-merge tests (which emit the
-    // provider event), and the type contract in types/index.ts pins the
-    // payload shape at compile time.
-    //
-    // Here we verify the PROVIDER side of the bridge: the provider IS
-    // the source of the event, and the payload shape matches what the
-    // Sphere bridge consumes.
-    const db = createMockDb();
-    const provider = new ProfileTokenStorageProvider(
-      db,
-      new Uint8Array(32).fill(0x11),
-      ['https://mock-ipfs.test'],
-      {
-        config: { orbitDb: { privateKey: TEST_PRIVATE_KEY }, ipnsSnapshot: false },
-        addressId: 'test',
-        encrypt: true,
+function createMinimalSphereForGuardTest(opts: {
+  pointer: unknown;
+  subscribeToBroadcast?: (
+    tags: string[],
+    cb: (msg: { content: string }) => void,
+  ) => () => void;
+}): Sphere {
+  // Build the most minimal Sphere we can inject our stub into, by
+  // constructing via prototype and assigning only the fields the
+  // private method touches:
+  //   - this._storage.getPointerLayer()
+  //   - this._transport.subscribeToBroadcast
+  //   - this._pointerWinInstallInFlight
+  //   - this._pointerWinSubscriptions
+  //   - this._pointerWinSeen
+  //
+  // Object.create on the Sphere prototype is the canonical pattern used
+  // elsewhere in this repo's test suite (search for `Object.create(Sphere`
+  // — see Sphere.destroy-flush.test.ts) to test private methods without
+  // running the full init pipeline.
+  const sphere = Object.create(Sphere.prototype) as Sphere;
+  const subscribeStub = opts.subscribeToBroadcast ?? (() => () => {});
+  Object.assign(sphere, {
+    _storage: { getPointerLayer: () => opts.pointer },
+    _transport: { subscribeToBroadcast: subscribeStub },
+    _pointerWinInstallInFlight: false,
+    _pointerWinSubscriptions: new Map<string, () => void>(),
+    _pointerWinSeen: new Set<string>(),
+  });
+  return sphere;
+}
+
+describe('Sphere.maybeInstallPointerWinSubscription — symmetric guard (#264)', () => {
+  it('pointer stub WITHOUT winBroadcastsEnabled → early-return, no subscription, no throw', async () => {
+    let subscribeCalls = 0;
+    const sphere = createMinimalSphereForGuardTest({
+      pointer: {
+        getSignerForWinBroadcast: () => ({ signer: {}, signingPubKeyHex: 'abc' }),
       },
-    );
-    provider.setIdentity(TEST_IDENTITY);
-    await provider.initialize();
-
-    const observed: Array<{ type: string; data?: unknown }> = [];
-    provider.onEvent((evt) => {
-      if (evt.type === 'storage:monotonicity-recovered') {
-        observed.push({ type: evt.type, data: evt.data });
-      }
+      subscribeToBroadcast: () => {
+        subscribeCalls++;
+        return () => {};
+      },
     });
+    // Invoke the REAL private method via cast.
+    await expect(
+      (sphere as unknown as {
+        maybeInstallPointerWinSubscription: () => Promise<void>;
+      }).maybeInstallPointerWinSubscription(),
+    ).resolves.toBeUndefined();
+    expect(subscribeCalls).toBe(0);
+    const subs = (sphere as unknown as { _pointerWinSubscriptions: Map<string, unknown> })._pointerWinSubscriptions;
+    expect(subs.size).toBe(0);
+  });
 
-    // Emit a synthetic recovery event with the canonical payload
-    // shape (matches what flush-scheduler produces).
-    (provider as unknown as { emitEvent: (e: unknown) => void }).emitEvent({
+  it('pointer with winBroadcastsEnabled() === false → early-return, no subscription, no throw', async () => {
+    let subscribeCalls = 0;
+    const sphere = createMinimalSphereForGuardTest({
+      pointer: {
+        winBroadcastsEnabled: () => false,
+        getSignerForWinBroadcast: () => ({ signer: {}, signingPubKeyHex: 'abc' }),
+      },
+      subscribeToBroadcast: () => {
+        subscribeCalls++;
+        return () => {};
+      },
+    });
+    await (sphere as unknown as {
+      maybeInstallPointerWinSubscription: () => Promise<void>;
+    }).maybeInstallPointerWinSubscription();
+    expect(subscribeCalls).toBe(0);
+  });
+
+  it('pointer with winBroadcastsEnabled() returning truthy non-boolean (1) → fail-closed, no subscription (strict === true)', async () => {
+    let subscribeCalls = 0;
+    const sphere = createMinimalSphereForGuardTest({
+      pointer: {
+        winBroadcastsEnabled: () => 1 as unknown as boolean,
+        getSignerForWinBroadcast: () => ({ signer: {}, signingPubKeyHex: 'abc' }),
+      },
+      subscribeToBroadcast: () => {
+        subscribeCalls++;
+        return () => {};
+      },
+    });
+    await (sphere as unknown as {
+      maybeInstallPointerWinSubscription: () => Promise<void>;
+    }).maybeInstallPointerWinSubscription();
+    // Strict-`=== true` policy: truthy non-boolean treated as flag=false.
+    expect(subscribeCalls).toBe(0);
+  });
+
+  it('pointer with winBroadcastsEnabled() === true BUT missing getSignerForWinBroadcast → fail-closed, no subscription, no throw', async () => {
+    let subscribeCalls = 0;
+    const sphere = createMinimalSphereForGuardTest({
+      pointer: {
+        winBroadcastsEnabled: () => true,
+        // No getSignerForWinBroadcast.
+      },
+      subscribeToBroadcast: () => {
+        subscribeCalls++;
+        return () => {};
+      },
+    });
+    await (sphere as unknown as {
+      maybeInstallPointerWinSubscription: () => Promise<void>;
+    }).maybeInstallPointerWinSubscription();
+    expect(subscribeCalls).toBe(0);
+    // _pointerWinInstallInFlight reset in finally.
+    const inFlight = (sphere as unknown as { _pointerWinInstallInFlight: boolean })._pointerWinInstallInFlight;
+    expect(inFlight).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fix #6: Sphere bridge for storage:monotonicity-recovered
+// ---------------------------------------------------------------------------
+//
+// Drives the REAL bridge code in core/Sphere.ts:subscribeToProviderEvents.
+// We construct a minimal Sphere whose `_tokenStorageProviders` contains
+// one provider with `onEvent`, then directly invoke
+// `subscribeToProviderEvents` (via cast), emit a provider event, and
+// assert the bridged Sphere event fires with the providerId-augmented
+// payload.
+
+interface FakeProvider {
+  id: string;
+  listeners: Array<(event: { type: string; timestamp: number; data?: unknown }) => void>;
+  onEvent(cb: (event: { type: string; timestamp: number; data?: unknown }) => void): () => void;
+  emit(event: { type: string; timestamp: number; data?: unknown }): void;
+  isConnected(): boolean;
+  getStatus(): 'connected' | 'disconnected' | 'error';
+}
+
+function createFakeProvider(id: string): FakeProvider {
+  const listeners: FakeProvider['listeners'] = [];
+  return {
+    id,
+    listeners,
+    onEvent(cb) {
+      listeners.push(cb);
+      return () => {
+        const i = listeners.indexOf(cb);
+        if (i >= 0) listeners.splice(i, 1);
+      };
+    },
+    emit(event) {
+      for (const cb of [...listeners]) cb(event);
+    },
+    isConnected() { return true; },
+    getStatus() { return 'connected'; },
+  };
+}
+
+describe('Sphere — storage:monotonicity-recovered bridge (#264)', () => {
+  it('forwards the provider event to a Sphere-level event with providerId attached, applying defaults for missing fields', async () => {
+    const sphere = Object.create(Sphere.prototype) as Sphere;
+    const fake = createFakeProvider('fake-provider-A');
+    Object.assign(sphere, {
+      _oracle: {},
+      _transport: { /* no onEvent method → bridge skips the transport branch */ },
+      _tokenStorageProviders: new Map([[fake.id, fake]]),
+      _providerEventCleanups: [] as Array<() => void>,
+      _lastProviderConnected: new Map<string, boolean>(),
+      _disabledProviders: new Set<string>(),
+      // Sphere routes emitEvent through this.eventHandlers (Map of
+      // event type → Set<handler>). Initialize the Map so the real
+      // emitEvent path can dispatch.
+      eventHandlers: new Map<string, Set<(payload: unknown) => void>>(),
+    });
+    // Drive the REAL private bridge wiring.
+    (sphere as unknown as {
+      subscribeToProviderEvents: () => void;
+    }).subscribeToProviderEvents();
+
+    // Register a real handler via this.eventHandlers (the same Map
+    // Sphere's public `on()` method uses). The bridge will call
+    // `this.emitEvent(...)` which dispatches through this Map.
+    const observed: unknown[] = [];
+    const handlers = (sphere as unknown as {
+      eventHandlers: Map<string, Set<(payload: unknown) => void>>;
+    }).eventHandlers;
+    handlers.set(
+      'storage:monotonicity-recovered',
+      new Set([(payload: unknown) => observed.push(payload)]),
+    );
+
+    // Provider emits the storage:monotonicity-recovered event.
+    fake.emit({
       type: 'storage:monotonicity-recovered',
       timestamp: Date.now(),
       data: {
         recoveredTokenIds: ['_TA'],
         recoveredTokenCount: 1,
-        mergedUnknownBundleCids: [],
-        mergedUnknownBundleCount: 0,
-        residualUnknownBundleCids: [],
-        residualUnknownBundleCount: 0,
-        residualTokenMissingIds: [],
-        residualTokenMissingCount: 0,
-        recoveredOutboxIdsDroppedAsSent: [],
-        recoveredOutboxIdsDroppedAsSentCount: 0,
+        // mergedUnknownBundleCids intentionally omitted → defaults to [].
+        residualUnknownBundleCids: ['cidB'],
+        residualUnknownBundleCount: 1,
+        // residualTokenMissingIds / Count omitted → defaults.
+        recoveredOutboxIdsDroppedAsSent: ['transfer-1'],
+        recoveredOutboxIdsDroppedAsSentCount: 1,
         truncated: false,
       },
     });
 
     expect(observed).toHaveLength(1);
-    expect(observed[0]!.type).toBe('storage:monotonicity-recovered');
-    const data = observed[0]!.data as {
+    const payload = observed[0] as {
+      providerId: string;
       recoveredTokenIds: string[];
       recoveredTokenCount: number;
       mergedUnknownBundleCids: string[];
+      mergedUnknownBundleCount: number;
+      residualUnknownBundleCids: string[];
       residualUnknownBundleCount: number;
+      residualTokenMissingIds: string[];
+      residualTokenMissingCount: number;
+      recoveredOutboxIdsDroppedAsSent: string[];
+      recoveredOutboxIdsDroppedAsSentCount: number;
       truncated: boolean;
     };
-    // Pin every field the Sphere bridge consumes (defaults against
-    // schema drift between provider emit and Sphere forward).
-    expect(data.recoveredTokenIds).toEqual(['_TA']);
-    expect(data.recoveredTokenCount).toBe(1);
-    expect(data.mergedUnknownBundleCids).toEqual([]);
-    expect(data.residualUnknownBundleCount).toBe(0);
-    expect(data.truncated).toBe(false);
 
-    await provider.shutdown();
+    // providerId attached for fan-out attribution.
+    expect(payload.providerId).toBe('fake-provider-A');
+    // Passed-through fields.
+    expect(payload.recoveredTokenIds).toEqual(['_TA']);
+    expect(payload.recoveredTokenCount).toBe(1);
+    expect(payload.residualUnknownBundleCids).toEqual(['cidB']);
+    expect(payload.residualUnknownBundleCount).toBe(1);
+    expect(payload.recoveredOutboxIdsDroppedAsSent).toEqual(['transfer-1']);
+    expect(payload.truncated).toBe(false);
+    // Defaults applied for missing fields.
+    expect(payload.mergedUnknownBundleCids).toEqual([]);
+    expect(payload.mergedUnknownBundleCount).toBe(0);
+    expect(payload.residualTokenMissingIds).toEqual([]);
+    expect(payload.residualTokenMissingCount).toBe(0);
+  });
+
+  it('does NOT forward unrelated storage events as storage:monotonicity-recovered', async () => {
+    const sphere = Object.create(Sphere.prototype) as Sphere;
+    const fake = createFakeProvider('fake-provider-B');
+    Object.assign(sphere, {
+      _oracle: {},
+      _transport: { /* no onEvent method → bridge skips the transport branch */ },
+      _tokenStorageProviders: new Map([[fake.id, fake]]),
+      _providerEventCleanups: [] as Array<() => void>,
+      _lastProviderConnected: new Map<string, boolean>(),
+      _disabledProviders: new Set<string>(),
+      // Sphere routes emitEvent through this.eventHandlers (Map of
+      // event type → Set<handler>). Initialize the Map so the real
+      // emitEvent path can dispatch.
+      eventHandlers: new Map<string, Set<(payload: unknown) => void>>(),
+    });
+    (sphere as unknown as { subscribeToProviderEvents: () => void }).subscribeToProviderEvents();
+    const observed: unknown[] = [];
+    const handlers = (sphere as unknown as {
+      eventHandlers: Map<string, Set<(payload: unknown) => void>>;
+    }).eventHandlers;
+    handlers.set(
+      'storage:monotonicity-recovered',
+      new Set([(payload: unknown) => observed.push(payload)]),
+    );
+    // Emit a different storage event — bridge MUST ignore.
+    fake.emit({
+      type: 'storage:saved',
+      timestamp: Date.now(),
+      data: { cid: 'bafy', tokenCount: 1 },
+    });
+    expect(observed).toHaveLength(0);
   });
 });
 
 // ---------------------------------------------------------------------------
-// Fix #3: symmetric subscriber guard (Sphere.maybeInstallPointerWinSubscription)
+// Defensive: silence unused-import warnings if TS complains.
 // ---------------------------------------------------------------------------
-
-describe('Sphere — pointer-win subscriber symmetric guard (#264)', () => {
-  it('pointer stub without `winBroadcastsEnabled` is treated as flag=false (no subscription, no throw)', () => {
-    // The guard is `typeof pointer.winBroadcastsEnabled !== 'function'`.
-    // A stub lacking the method short-circuits to the early-return.
-    // We test the predicate directly: any object without the method
-    // satisfies the "fail-closed" condition.
-    const stub = {} as unknown as { winBroadcastsEnabled?: () => boolean };
-    const enabled =
-      typeof stub.winBroadcastsEnabled === 'function' &&
-      stub.winBroadcastsEnabled();
-    expect(enabled).toBe(false);
-  });
-
-  it('pointer stub with `winBroadcastsEnabled` returning false also short-circuits', () => {
-    const stub = { winBroadcastsEnabled: () => false } as unknown as {
-      winBroadcastsEnabled: () => boolean;
-    };
-    const enabled =
-      typeof stub.winBroadcastsEnabled === 'function' &&
-      stub.winBroadcastsEnabled();
-    expect(enabled).toBe(false);
-  });
-
-  it('pointer stub with `winBroadcastsEnabled` true BUT no `getSignerForWinBroadcast` is treated as flag=false (symmetric guard)', () => {
-    // Even when winBroadcastsEnabled is true, missing the signer
-    // helper means we'd TypeError mid-install. The symmetric guard
-    // prevents that by failing closed earlier.
-    const stub = { winBroadcastsEnabled: () => true } as unknown as {
-      winBroadcastsEnabled: () => boolean;
-      getSignerForWinBroadcast?: () => unknown;
-    };
-    const fullyArmed =
-      typeof stub.winBroadcastsEnabled === 'function' &&
-      stub.winBroadcastsEnabled() &&
-      typeof stub.getSignerForWinBroadcast === 'function';
-    expect(fullyArmed).toBe(false);
-  });
-
-  it('pointer with BOTH accessors implementing correctly is fully armed', () => {
-    const stub = {
-      winBroadcastsEnabled: () => true,
-      getSignerForWinBroadcast: () => ({ signer: {}, signingPubKeyHex: 'abc' }),
-    };
-    const fullyArmed =
-      typeof stub.winBroadcastsEnabled === 'function' &&
-      stub.winBroadcastsEnabled() &&
-      typeof stub.getSignerForWinBroadcast === 'function';
-    expect(fullyArmed).toBe(true);
-  });
-});
+void ProfileTokenStorageProvider;
+type _t = StorageProvider | TokenStorageProvider | OrbitDbConfig | ProfileDatabase;
+void (null as unknown as _t);

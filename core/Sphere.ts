@@ -5476,7 +5476,12 @@ export class Sphere {
       // consumer.
       if (
         typeof pointer.winBroadcastsEnabled !== 'function' ||
-        !pointer.winBroadcastsEnabled() ||
+        // Strict `=== true` mirrors the production normalization in
+        // ProfilePointerLayer's frozen config snapshot. A test stub
+        // returning a truthy non-boolean (`1`, `'yes'`, `{}`) must
+        // be treated as flag=false — same fail-closed policy. Match
+        // the lifecycle-manager guard exactly for symmetry.
+        pointer.winBroadcastsEnabled() !== true ||
         // Symmetric stub guard: a fake pointer that returns
         // `winBroadcastsEnabled() === true` but lacks
         // `getSignerForWinBroadcast` would TypeError at the call

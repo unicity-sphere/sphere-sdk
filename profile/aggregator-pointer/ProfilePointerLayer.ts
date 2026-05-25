@@ -183,6 +183,29 @@ export class ProfilePointerLayer {
    *
    * Default: `false`. See PointerLayerConfig.enablePointerWinBroadcasts
    * for the full rationale.
+   *
+   * **API pairing contract.** Test stubs / alternative pointer-layer
+   * implementations that expose `winBroadcastsEnabled()` MUST also
+   * expose `getSignerForWinBroadcast()` — the publisher and subscriber
+   * guards treat them as a coupled pair (a partial implementation is
+   * treated as flag=false / fail-closed). Implementing only one
+   * silently disables broadcasts with no error.
+   *
+   * **Init-time-only flag.** The flag is captured in the frozen
+   * `#config` snapshot at construction time. Flipping
+   * `enablePointerWinBroadcasts` at runtime (e.g., via a hot config
+   * reload that constructs a NEW `ProfilePointerLayer`) requires:
+   *   (1) Tearing down the old layer (calling `shutdown()`); AND
+   *   (2) Rebuilding the wiring so the new layer's
+   *       `winBroadcastsEnabled() === true` is observed by both
+   *       publisher and subscriber on next event.
+   * The publisher side picks up the new flag on its next successful
+   * publish. The subscriber side picks it up on the next emitted
+   * `storage:pointer-published` event — which only fires when the
+   * publisher is also enabled, so the first such event after the flip
+   * arms the subscription automatically. There is no third trigger
+   * that would re-arm the subscriber on a flip from false→true
+   * without a fresh publish.
    */
   winBroadcastsEnabled(): boolean {
     return this.#config.enablePointerWinBroadcasts === true;

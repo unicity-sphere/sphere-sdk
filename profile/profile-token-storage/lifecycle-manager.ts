@@ -1273,7 +1273,14 @@ export class LifecycleManager {
         // which implements the method.
         const winBroadcastsOn =
           typeof pointer.winBroadcastsEnabled === 'function' &&
-          pointer.winBroadcastsEnabled() &&
+          // Strict `=== true` to mirror the production
+          // ProfilePointerLayer constructor's normalization (which
+          // freezes the snapshot as `=== true`). A test stub that
+          // returns a truthy non-boolean (`1`, `'yes'`, `{}`) MUST be
+          // treated as flag=false — same fail-closed policy as
+          // production config. Symmetric with the Sphere subscriber
+          // guard in `core/Sphere.ts:maybeInstallPointerWinSubscription`.
+          pointer.winBroadcastsEnabled() === true &&
           // Symmetric with the new accessor: stubs lacking the signer
           // helper fall through cleanly (fail-closed) rather than
           // surfacing a TypeError caught only by the broad catch arm
