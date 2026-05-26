@@ -245,6 +245,16 @@ export class GroupChatModule {
   private _lastPinnedMessagesByGroup = new Map<string, { json: string; ref: CidRef }>();
 
   /**
+   * Issue #285 — `processedEvents` (NIP-29 event ID dedup ledger) memo.
+   * Grows unbounded with relay activity (observed 263 KB after routine
+   * use) and was the second-worst soft-warn offender behind
+   * `groupChatMembers`. Pattern A encrypted pin (per-wallet view —
+   * dedup across wallets has no value).
+   */
+  private _lastPinnedProcessedEventsJson: string | null = null;
+  private _lastPinnedProcessedEventsRef: CidRef | null = null;
+
+  /**
    * Pattern B per-message CID cache — maps a message's serialized JSON
    * to the CID it was pinned under. Lets repeated persists for the same
    * group reuse CIDs for unchanged messages (saves ~N pin round-trips
@@ -333,6 +343,8 @@ export class GroupChatModule {
     this._lastPinnedMembersByGroup.clear();
     this._lastPinnedMessagesByGroup.clear();
     this._pinnedMessageCids.clear();
+    this._lastPinnedProcessedEventsJson = null;
+    this._lastPinnedProcessedEventsRef = null;
 
     // Load groups — dual-read: CID ref envelope → fetch from IPFS
     // (encrypted, requireEncrypted strict); otherwise legacy inline JSON.
@@ -704,14 +716,52 @@ export class GroupChatModule {
       }
     }
 
-    // Load processed event IDs
+    // Load processed event IDs — dual-read (CID ref envelope encrypted →
+    // fetch from IPFS, requireEncrypted strict; OR legacy inline JSON).
+    // Symmetric to the persistProcessedEvents() write path (#285 §8.5).
     const processedJson = await storage.get(STORAGE_KEYS_ADDRESS.GROUP_CHAT_PROCESSED_EVENTS);
     if (processedJson) {
-      try {
-        const parsed: string[] = JSON.parse(processedJson);
+      const ref = CidRefStore.tryParseRef(processedJson);
+      let parsed: string[] | null = null;
+      if (ref) {
+        if (!this.deps!.cidRefStore) {
+          const { ProfileError } = await import('../../profile/errors.js');
+          throw new ProfileError(
+            'CID_REF_UNREADABLE',
+            `GroupChatModule.load: processedEvents key contains a CID ref ` +
+              `(cid=${ref.cid}) but no cidRefStore was injected.`,
+          );
+        }
+        try {
+          parsed = await this.deps!.cidRefStore.fetchJson<string[]>(
+            ref,
+            { requireEncrypted: true },
+          );
+        } catch (err) {
+          // Best-effort: continue with empty set rather than poisoning load.
+          // The ledger is recoverable — relay re-delivery will re-populate
+          // on the next sync (worst case: a few duplicate event-handler
+          // dispatches; the handlers themselves are idempotent).
+          logger.error(
+            'GroupChat',
+            '[GROUP_CHAT_PROCESSED_EVENTS] CID-ref fetch failed; starting fresh',
+            err,
+          );
+        }
+      } else {
+        try {
+          parsed = JSON.parse(processedJson) as string[];
+        } catch {
+          // Start fresh on legacy parse failure (same semantic as pre-#285).
+        }
+      }
+      if (Array.isArray(parsed)) {
         this.processedEventIds = new Set(parsed);
-      } catch {
-        // Start fresh
+      } else if (parsed !== null) {
+        logger.error(
+          'GroupChat',
+          `[GROUP_CHAT_PROCESSED_EVENTS] decoded data is not an array (got ${typeof parsed}); starting fresh.`,
+        );
       }
     }
   }
@@ -2285,10 +2335,56 @@ export class GroupChatModule {
     this._lastWrittenMemberGroupIds = current;
   }
 
+  /**
+   * Persist the NIP-29 event ID dedup ledger. The ledger grows
+   * unbounded with relay activity — observed 263 KB on routine sphere.telco
+   * use, which was the second-worst PAYLOAD-SIZE soft-warn after
+   * `groupChatMembers` (issue #285).
+   *
+   * Encryption policy: ENCRYPTED. The ledger is a per-wallet privacy
+   * footprint (it reveals which NIP-29 events this wallet has
+   * processed — including private/invite-only groups). Dedup across
+   * wallets is not a goal; the canonical-content-addressed property
+   * of plaintext pins would actively leak group-membership signal to
+   * any IPFS observer.
+   */
   private async persistProcessedEvents(): Promise<void> {
     if (!this.deps) return;
     const arr = Array.from(this.processedEventIds);
-    await this.deps.storage.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_PROCESSED_EVENTS, JSON.stringify(arr));
+    const cidRefStore = this.deps.cidRefStore;
+
+    if (cidRefStore) {
+      const json = JSON.stringify(arr);
+      // Memo: identical plaintext (no new processed event since last
+      // persist) reuses the previous ref. AES-GCM uses random IVs so
+      // re-pinning would produce a fresh CID — wasted IPFS churn.
+      if (
+        this._lastPinnedProcessedEventsRef &&
+        this._lastPinnedProcessedEventsJson === json
+      ) {
+        await this.deps.storage.set(
+          STORAGE_KEYS_ADDRESS.GROUP_CHAT_PROCESSED_EVENTS,
+          CidRefStore.stringifyRef(this._lastPinnedProcessedEventsRef),
+        );
+        return;
+      }
+      const ref = await cidRefStore.pinJson(arr);
+      await this.deps.storage.set(
+        STORAGE_KEYS_ADDRESS.GROUP_CHAT_PROCESSED_EVENTS,
+        CidRefStore.stringifyRef(ref),
+      );
+      // Update memo AFTER storage.set lands so a failed set does not
+      // leave us pointing at a CID the caller thinks is live.
+      this._lastPinnedProcessedEventsJson = json;
+      this._lastPinnedProcessedEventsRef = ref;
+      return;
+    }
+
+    // Legacy inline fallback when no cidRefStore is available.
+    await this.deps.storage.set(
+      STORAGE_KEYS_ADDRESS.GROUP_CHAT_PROCESSED_EVENTS,
+      JSON.stringify(arr),
+    );
   }
 
   // ===========================================================================
