@@ -898,6 +898,32 @@ export class LifecycleManager {
     snapshotCid: string | null,
     deadlineMs: number,
   ): Promise<void> {
+    // Issue #272 — short-circuit when both CIDs are already verified
+    // within this provider's lifetime. Under replay storms the same
+    // bundle CID can be presented many times (no save() in between);
+    // each previous call to verifyFlushDurability stamped the watermark
+    // (`setLastVerifiedBundleCid` below), so re-running ~80 HEAD probes
+    // (4 awaitNextFlush iterations × 2 legs × ~10 retries each) is
+    // pure wasted work that adds to the gateway contention this gate
+    // is supposed to recover FROM.
+    //
+    // The watermark is cleared implicitly by a fresh flush on different
+    // CIDs (the next per-flush gate either succeeds and updates it, or
+    // fails and leaves it stale — shutdown still runs the legs on the
+    // newer CIDs anyway). There is no TTL: the watermark is per-
+    // provider-lifetime and a process restart clears it naturally.
+    const verifiedBundle = this.host.getLastVerifiedBundleCid();
+    const verifiedSnapshot = this.host.getLastVerifiedSnapshotCid();
+    const bundleMatches = bundleCid === verifiedBundle;
+    const snapshotMatches =
+      snapshotCid === null || snapshotCid === verifiedSnapshot;
+    if (bundleMatches && snapshotMatches) {
+      this.host.log(
+        `Profile durability: ${bundleCid} HEAD-verify short-circuited (already verified this lifetime)`,
+      );
+      return;
+    }
+
     const deadline = Date.now() + Math.max(0, deadlineMs);
 
     // No shared abort signal — every leg honors `deadline` directly via

@@ -145,6 +145,47 @@ export class NostrTransportProvider implements TransportProvider {
 
   // Event handlers
   private processedEventIds = new Set<string>();
+
+  /**
+   * Issue #272 — per-event failure cooldown ledger for TOKEN_TRANSFER
+   * replays. When `handleIncomingTransfer` returns `false` (the at-
+   * least-once gate refused the ack), we record an exponential cool-
+   * down so the relay-paced replay storm cannot busy-spin the
+   * receive pipeline (parse → crypto verify → flush → HEAD-verify)
+   * for the same event on every reconnect cycle.
+   *
+   * Semantics:
+   *   - `attempts` counts consecutive durability misses. Cleared on
+   *     success (advance happens) or when the bounded budget exhausts.
+   *   - `nextRetryAt` is `Date.now() + min(COOLDOWN_BASE_MS * 2^(n-1),
+   *     COOLDOWN_MAX_MS)`. Events arriving inside the cooldown window
+   *     are skipped without entering the gate.
+   *   - After `MAX_REPLAY_ATTEMPTS` consecutive misses, we ADVANCE the
+   *     cursor anyway and emit an operator alert. This matches the
+   *     acceptance criterion in issue #272: "`[AT-LEAST-ONCE] not
+   *     durable` count per token bounded by a small constant (≤3)
+   *     rather than unbounded replay." Local-durability is intact
+   *     (issue #272 also decoupled the per-flush HEAD-verify from
+   *     the gate, so persistent durability=false now strictly
+   *     indicates an underlying OrbitDB/pin POST/publish failure that
+   *     replay alone won't fix — operator intervention is the right
+   *     escalation).
+   *   - The map is LRU-capped to bound memory under pathological
+   *     replay floods. Eviction is single-victim per insert when at
+   *     capacity (cheap; no full sort).
+   *
+   * Not persisted across process restarts (intentional — a fresh
+   * process gets a fresh chance, and the `processedEventIds` dedup
+   * still prevents double-processing of an already-acked event).
+   */
+  private failedEventCooldowns = new Map<
+    string,
+    { nextRetryAt: number; attempts: number }
+  >();
+  private static readonly DURABILITY_COOLDOWN_BASE_MS = 30_000;
+  private static readonly DURABILITY_COOLDOWN_MAX_MS = 120_000;
+  private static readonly DURABILITY_MAX_REPLAY_ATTEMPTS = 3;
+  private static readonly DURABILITY_COOLDOWN_MAP_CAP = 256;
   private messageHandlers: Set<MessageHandler> = new Set();
   private transferHandlers: Set<TokenTransferHandler> = new Set();
   private paymentRequestHandlers: Set<PaymentRequestHandler> = new Set();
@@ -1548,6 +1589,20 @@ export class NostrTransportProvider implements TransportProvider {
           await this.handleGiftWrap(event);
           break;
         case EVENT_KINDS.TOKEN_TRANSFER:
+          // Issue #272: cooldown gate. Skip processing entirely when a
+          // recent durability miss for this event ID is still within
+          // its cooldown window. Without this, relay reconnect immediately
+          // re-fires the failing event and the receive pipeline (parse +
+          // crypto verify + flush + HEAD-verify) burns CPU on every retry
+          // before refusing the ack again. The cooldown is a memory-only
+          // map (see field doc); a process restart gets a fresh budget.
+          if (event.id && this.isInDurabilityCooldown(event.id)) {
+            logger.debug(
+              'Nostr',
+              `[AT-LEAST-ONCE] TOKEN_TRANSFER ${event.id.slice(0, 12)} in durability cooldown — skipping replay`,
+            );
+            return;
+          }
           tokenTransferDurable = await this.handleTokenTransfer(event);
           break;
         case EVENT_KINDS.PAYMENT_REQUEST:
@@ -1576,11 +1631,39 @@ export class NostrTransportProvider implements TransportProvider {
           this.updateLastEventTimestamp(event.created_at);
         } else if (kind === EVENT_KINDS.TOKEN_TRANSFER) {
           if (tokenTransferDurable) {
+            // Issue #272: success — drop any prior cooldown tracking
+            // so a future event with the same ID (which shouldn't
+            // normally happen, but happens during cold-start replay
+            // floods on Nostr reconnect) gets a fresh budget.
+            if (event.id) this.failedEventCooldowns.delete(event.id);
             this.updateLastEventTimestamp(event.created_at);
+          } else if (event.id) {
+            // Issue #272: bounded replay budget. `recordDurabilityMiss`
+            // increments the per-event attempt counter, arms an
+            // exponential cooldown, and returns `true` once the budget
+            // is exhausted — at which point we advance the cursor to
+            // unstick subsequent events behind this one.
+            const shouldAdvance = this.recordDurabilityMiss(event.id);
+            if (shouldAdvance) {
+              logger.warn(
+                'Nostr',
+                `[AT-LEAST-ONCE] TOKEN_TRANSFER ${event.id.slice(0, 12)} exhausted ${NostrTransportProvider.DURABILITY_MAX_REPLAY_ATTEMPTS} durability replay attempts — advancing cursor; operator should investigate local OrbitDB/IPFS-pin/publish failures.`,
+              );
+              this.updateLastEventTimestamp(event.created_at);
+            } else {
+              const entry = this.failedEventCooldowns.get(event.id);
+              const cooldownMs = entry ? Math.max(0, entry.nextRetryAt - Date.now()) : 0;
+              logger.warn(
+                'Nostr',
+                `[AT-LEAST-ONCE] TOKEN_TRANSFER ${event.id.slice(0, 12)} not durable — leaving 'since' at ${this.lastEventTs}; cooldown ${cooldownMs}ms (attempt ${entry?.attempts ?? '?'}/${NostrTransportProvider.DURABILITY_MAX_REPLAY_ATTEMPTS}).`,
+              );
+            }
           } else {
+            // Defensive: no event.id means we can't track cooldown or
+            // advance idempotently. Preserve legacy behavior.
             logger.warn(
               'Nostr',
-              `[AT-LEAST-ONCE] TOKEN_TRANSFER ${event.id?.slice(0, 12)} not durable — leaving 'since' at ${this.lastEventTs}; event will replay on next reconnect`,
+              `[AT-LEAST-ONCE] TOKEN_TRANSFER (no id) not durable — leaving 'since' at ${this.lastEventTs}; event will replay on next reconnect`,
             );
           }
         }
@@ -1606,6 +1689,69 @@ export class NostrTransportProvider implements TransportProvider {
     this.storage.set(storageKey, createdAt.toString()).catch(err => {
       logger.debug('Nostr', 'Failed to save last event timestamp:', err);
     });
+  }
+
+  /**
+   * Issue #272 — return true iff this event ID has a live durability
+   * cooldown. Cleans up the entry when the cooldown has expired so the
+   * map doesn't accumulate stale entries on the read path.
+   */
+  private isInDurabilityCooldown(eventId: string): boolean {
+    const entry = this.failedEventCooldowns.get(eventId);
+    if (!entry) return false;
+    if (Date.now() >= entry.nextRetryAt) {
+      // Cooldown expired — leave the attempts count INTACT (we still
+      // need it so the next failure increments correctly toward the
+      // MAX_REPLAY_ATTEMPTS budget). The entry will be replaced on
+      // the next miss or deleted on the next success.
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Issue #272 — record a durability miss for this event ID and arm
+   * an exponential cooldown. Returns `true` when the per-event replay
+   * budget (`DURABILITY_MAX_REPLAY_ATTEMPTS`) is exhausted — in that
+   * case the caller should advance the `since` cursor (the entry is
+   * deleted by this method to free the slot) so subsequent events
+   * are not blocked indefinitely behind one persistently-failing one.
+   * Local-durability is decoupled from this gate (issue #272 background-
+   * verify patch in `flush-scheduler.ts`), so a persistent miss after
+   * the budget exhausts indicates a genuine local persistence failure
+   * (OrbitDB write timeout / pin POST != 200 / monotonicity violation)
+   * that re-replay alone cannot resolve.
+   */
+  private recordDurabilityMiss(eventId: string): boolean {
+    const prior = this.failedEventCooldowns.get(eventId);
+    const attempts = (prior?.attempts ?? 0) + 1;
+
+    if (attempts >= NostrTransportProvider.DURABILITY_MAX_REPLAY_ATTEMPTS) {
+      this.failedEventCooldowns.delete(eventId);
+      return true;
+    }
+
+    // LRU-style cap: when at capacity, evict the oldest insertion
+    // (Map preserves insertion order, so the first key IS the oldest).
+    // Single-victim eviction per insert is sufficient under typical
+    // replay-flood pressure (14 unique IDs in the §C.2 forensics; cap
+    // of 256 covers >18x that headroom).
+    if (this.failedEventCooldowns.size >= NostrTransportProvider.DURABILITY_COOLDOWN_MAP_CAP) {
+      const oldestKey = this.failedEventCooldowns.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.failedEventCooldowns.delete(oldestKey);
+      }
+    }
+
+    const delayMs = Math.min(
+      NostrTransportProvider.DURABILITY_COOLDOWN_BASE_MS * Math.pow(2, attempts - 1),
+      NostrTransportProvider.DURABILITY_COOLDOWN_MAX_MS,
+    );
+    this.failedEventCooldowns.set(eventId, {
+      nextRetryAt: Date.now() + delayMs,
+      attempts,
+    });
+    return false;
   }
 
   /** Persist the max DM (gift-wrap) event timestamp for the since filter on next connect. */
