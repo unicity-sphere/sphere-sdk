@@ -1528,7 +1528,42 @@ export class FlushScheduler {
         const snapshotCid = freshSnapshotPublished
           ? this.host.getLastDiscoveredPointerCid()
           : null;
-        await this.host.verifyFlushDurability(cid, snapshotCid, verifyDeadlineMs);
+
+        // Issue #272 — detach the HEAD-verify leg from the synchronous
+        // flush completion path. Local-durability is already guaranteed
+        // by the conditions satisfied above:
+        //   (1) bundle CAR pin POST returned 200 — operator Kubo holds
+        //       the bytes;
+        //   (2) OrbitDB bundle ref written — sibling replicas will sync
+        //       the new bundle in the next OrbitDB exchange;
+        //   (3) snapshot publish call returned ok (when `publishResult`
+        //       is set ok) — the aggregator pointer reflects the new
+        //       version for cold-import discovery.
+        //
+        // The HEAD-verify leg checks whether the operator gateway is
+        // serving the just-pinned CID YET. That is a property of the
+        // OPERATOR'S IPFS PROPAGATION LATENCY, not of the receiver's
+        // local crash-safety. Awaiting it inline coupled per-flush
+        // operations to gateway latency, which under contended testnet
+        // caused the at-least-once gate to refuse Nostr ack on every
+        // flush (`awaitNextFlush` rejects with `FLUSH_DURABILITY_TIMEOUT`
+        // → `awaitAllProvidersDurable` returns false → `since` cursor
+        // never advances → same TOKEN_TRANSFER event replays on every
+        // reconnect → each replay schedules another flush → busy-spin).
+        //
+        // The forensics at `.tmp/soak-postmerge-271/` captured 134
+        // `[AT-LEAST-ONCE] not durable` warnings across only 14 unique
+        // event IDs in 6 minutes with 3 node processes pegged at 90-175%
+        // CPU — purely from this coupling.
+        //
+        // We now run the verification as a background task with full
+        // budget. On failure we emit a typed `storage:durability-
+        // deferred` event for operator triage and update the last-
+        // verified watermarks (or leave them stale) so the shutdown
+        // gate, which has its own deadline and SHOULD still gate on
+        // remote durability before exit, gets the correct view.
+        // The flush itself completes synchronously regardless.
+        this.startBackgroundDurabilityVerify(cid, snapshotCid, verifyDeadlineMs);
       }
     } catch (err) {
       // On failure, re-queue the data so it is not lost
@@ -1545,6 +1580,57 @@ export class FlushScheduler {
    * `lastLoadedData`) bookkeeping happens on the facade so byte-
    * identical fields stay in their original location.
    */
+  /**
+   * Issue #272 — fire-and-forget background HEAD-verify of just-pinned
+   * CIDs against the operator IPFS gateway. Detached from the
+   * synchronous flush completion path so a gateway propagation lag
+   * does NOT close the at-least-once Nostr ack gate. See the long
+   * comment block at the {@link flushToIpfs} verification call site
+   * for the design rationale.
+   *
+   * On failure, emits `storage:durability-deferred` with structured
+   * detail. The shutdown gate's own remote-durability verification
+   * (`LifecycleManager.awaitRemoteDurability`) runs independently
+   * with its own deadline; if THIS background verify is still in
+   * flight at shutdown time, the shutdown gate may run a redundant
+   * HEAD-verify, which is bounded by its own configured deadline
+   * (acceptable cost — shutdown is rare and operator-triggered).
+   *
+   * Never throws; never rejects. The returned Promise is intentionally
+   * unawaited and any error is routed through `emitEvent` only.
+   */
+  private startBackgroundDurabilityVerify(
+    cid: string,
+    snapshotCid: string | null,
+    verifyDeadlineMs: number,
+  ): void {
+    // Use a void IIFE so the floating-promises lint rule sees an
+    // explicit fire-and-forget intent without `void`-prefixing the
+    // call site (which loses the `.catch()` ergonomics).
+    void (async (): Promise<void> => {
+      try {
+        await this.host.verifyFlushDurability(cid, snapshotCid, verifyDeadlineMs);
+      } catch (err) {
+        const code = (err as { code?: string }).code;
+        const details = (err as { details?: unknown }).details;
+        this.host.emitEvent({
+          type: 'storage:durability-deferred',
+          timestamp: Date.now(),
+          data: { cid, snapshotCid, code, details },
+          error: err instanceof Error ? err.message : String(err),
+          code,
+          cause: err,
+        });
+        this.host.log(
+          `Profile durability: background verify deferred for bundle=${cid}` +
+            (snapshotCid ? ` snapshot=${snapshotCid}` : '') +
+            ` — code=${code ?? 'unknown'}. Local state remains durable; ` +
+            `gateway propagation may still be in progress.`,
+        );
+      }
+    })();
+  }
+
   enqueueSave(data: TxfStorageDataBase): void {
     // Any new save() invalidates the lastPinnedCid retry cache
     // unconditionally. A reference-identity check is insufficient: a

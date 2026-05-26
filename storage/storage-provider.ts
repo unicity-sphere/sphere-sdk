@@ -413,7 +413,45 @@ export type StorageEventType =
    * subsequent cross-device syncs detecting the same gap and
    * re-attempting the inline merge.
    */
-  | 'storage:monotonicity-recovered';
+  | 'storage:monotonicity-recovered'
+  /**
+   * Issue #272 — emitted when the per-flush remote-durability
+   * HEAD-verify leg (`verifyFlushDurability`), now run as a background
+   * task detached from the synchronous flush completion path, fails
+   * for a just-pinned bundle CID and/or snapshot CID.
+   *
+   * Local-durability is unaffected: the bundle CAR pin POST returned
+   * 200, the OrbitDB bundle ref is written, and (when wired) the
+   * snapshot publish call returned ok. What this event signals is that
+   * the operator's IPFS gateway has not yet served the just-pinned
+   * CID back via HEAD within the configured deadline (default 30s).
+   * This is a gateway propagation property — not a receiver crash-
+   * safety property — and does NOT close the at-least-once Nostr ack
+   * gate. Distinct from `storage:error` (terminal fatal class).
+   *
+   * `data` carries `{ cid, snapshotCid?, code?, details? }`:
+   *   - `cid`         the bundle CID whose HEAD-verify failed
+   *   - `snapshotCid` the snapshot CID (when also verified)
+   *   - `code`        the structured error code (e.g.,
+   *                   `FLUSH_DURABILITY_TIMEOUT`)
+   *   - `details`     the failed-leg detail array from
+   *                   `verifyFlushDurability`
+   *
+   * Operator action: investigate operator Kubo gateway propagation
+   * lag if this fires repeatedly for distinct CIDs. Single-shot fires
+   * (a CID that eventually does propagate) are expected under normal
+   * testnet contention and require no action.
+   *
+   * Before #272: this same failure threw inline and forced the
+   * at-least-once gate's `awaitNextFlush` to reject, causing the
+   * Nostr `since` cursor to refuse to advance and the inbound
+   * TOKEN_TRANSFER event to replay on every reconnect. Each replay
+   * triggered another flush, each flush re-hit the same HEAD-verify
+   * timeout, producing a sustained busy-spin (134 replays for 14
+   * unique event IDs in the §C.2 soak failure observed at
+   * `integration/all-fixes` HEAD `6102d59`).
+   */
+  | 'storage:durability-deferred';
 
 export interface StorageEvent {
   type: StorageEventType;

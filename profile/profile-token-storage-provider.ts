@@ -1041,11 +1041,19 @@ export class ProfileTokenStorageProvider
       // Errors from the chain (POINTER_MONOTONICITY_VIOLATION, etc.)
       // propagate as a rejection — caller decides ack behavior.
       const chained = this.flushScheduler.forceFlushSerialized();
+      // Issue #272 — explicitly hold the timeout handle so we can
+      // clearTimeout in finally. Without this, when `chained` settles
+      // first, the setTimeout fires later (after the original deadline)
+      // with an unhandled rejection from `Promise.race` (already-
+      // settled, but the timer callback still allocates the
+      // SphereError). Over a replay storm of N iterations × M parallel
+      // awaitNextFlush callers, these timer handles accumulate.
+      let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
       try {
         await Promise.race([
           chained,
-          new Promise<never>((_, reject) =>
-            setTimeout(
+          new Promise<never>((_, reject) => {
+            timeoutHandle = setTimeout(
               () =>
                 reject(
                   new SphereError(
@@ -1054,8 +1062,8 @@ export class ProfileTokenStorageProvider
                   ),
                 ),
               remainingMs(),
-            ),
-          ),
+            );
+          }),
         ]);
       } catch (err) {
         if (err instanceof SphereError && err.code === 'TIMEOUT') throw err;
@@ -1090,6 +1098,13 @@ export class ProfileTokenStorageProvider
         // refuses to advance the Nostr ack — event re-replays on
         // next reconnect; addToken stateHash dedup is idempotent.
         throw err;
+      } finally {
+        // Issue #272 — always clear the race timeout, whether `chained`
+        // settled first (timer would fire late) or the timer fired
+        // first (already cleared by the throw path, but harmless).
+        if (timeoutHandle !== undefined) {
+          clearTimeout(timeoutHandle);
+        }
       }
 
       // After the flush, pendingData was cleared inside flushToIpfs
