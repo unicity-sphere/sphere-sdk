@@ -14,6 +14,7 @@
 import { logger } from '../core/logger.js';
 import { hexToBytes } from '../core/hex.js';
 import { ProfileError } from './errors.js';
+import { installHeliaBlockstoreGetShim } from './helia-blockstore-shim.js';
 import {
   decodeAndDowngradeReplicated,
   decodeEntry,
@@ -471,74 +472,20 @@ export class OrbitDbAdapter implements ProfileDatabase {
 
       this.helia = await createHelia(heliaOptions);
 
-      // Issue #234 follow-up — Helia v6 changed `BlockStorage.get` to an
-      // `async *get(cid, options)` (`@helia/utils/dist/src/storage.js`)
-      // that yields Uint8Array chunks. OrbitDB v3 was authored against
-      // Helia v5 where `get` returned `Promise<Uint8Array>` directly, so
-      // its `IPFSBlockStorage.get` does `const block = await
-      // ipfs.blockstore.get(cid, ...)` and treats `block` as the bytes.
-      // In Helia v6 that `await` resolves to the AsyncGenerator OBJECT
-      // (truthy, NOT a Uint8Array), which then fails downstream with
-      // "data to decode must be a Uint8Array" inside cborg.
+      // Issues #234, #266, #278 — install the blockstore shim that
+      // (1) drains Helia-v6 async-generator `get` into a single Uint8Array
+      //     so OrbitDB-v3's `await ipfs.blockstore.get(cid)` keeps working,
+      // (2) swallows `NotFoundError` / `InvalidConfigurationError` so the
+      //     caller sees `undefined` on a miss (matching the v5 contract),
+      // (3) bounds repeated reads of the SAME CID via a 64-entry LRU +
+      //     in-flight Promise dedup — eliminates the FD-exhaustion wedge
+      //     observed in #278 where 900+ FDs accumulated against TWO
+      //     OpLog blocks under a hot read loop.
       //
-      // Monkey-patch the blockstore's `get` to drain the generator into
-      // a single Uint8Array. This makes OrbitDB v3 ↔ Helia v6 work and
-      // also lets our own `profile/ipfs-client.ts:probeLocalHelia` actually
-      // hit the local fast-path instead of silently falling back to HTTP
-      // gateways via the `!(got instanceof Uint8Array)` miss-handler.
-      //
-      // NotFoundError is swallowed and converted to `undefined`, matching
-      // OrbitDB IPFSBlockStorage's `if (block)` contract for "no entry".
-      //
-      // Issue #266 — InvalidConfigurationError is ALSO swallowed in HTTP-only
-      // mode. When `blockBrokers: []` is configured (lightweight client),
-      // Helia's NetworkedStorage throws `InvalidConfigurationError` on a
-      // local-blockstore miss instead of `NotFoundError`. Treat it the same
-      // as "block not present" so OrbitDB sees a clean missing entry and
-      // the snapshot prefetch (which uses HTTP via `profile/ipfs-client.ts`)
-      // can re-warm the blockstore before subsequent reads.
+      // Implementation + rationale: see `profile/helia-blockstore-shim.ts`.
       const heliaInstance: any = this.helia;
       if (heliaInstance?.blockstore && typeof heliaInstance.blockstore.get === 'function') {
-        const blockstore = heliaInstance.blockstore;
-        const originalGet = blockstore.get.bind(blockstore);
-        blockstore.get = async (cid: unknown, options?: unknown): Promise<Uint8Array | undefined> => {
-          const chunks: Uint8Array[] = [];
-          let total = 0;
-          try {
-            for await (const chunk of originalGet(cid, options) as AsyncIterable<Uint8Array>) {
-              chunks.push(chunk);
-              total += chunk.length;
-            }
-          } catch (err) {
-            const errName = (err as { name?: string } | null)?.name;
-            const errCode = (err as { code?: string } | null)?.code;
-            if (
-              errName === 'NotFoundError' ||
-              errCode === 'ERR_NOT_FOUND' ||
-              // Issue #266 — Helia throws InvalidConfigurationError when
-              // `blockBrokers: []` and the block isn't in the local
-              // blockstore. We treat this as "missing" so OrbitDB
-              // gracefully sees an unresolved head instead of erroring
-              // out the whole read. The HTTP recovery path
-              // (snapshot prefetch via profile/ipfs-client.ts) handles
-              // re-warming the blockstore from operator Kubo gateways.
-              errName === 'InvalidConfigurationError' ||
-              errCode === 'ERR_NO_BLOCK_BROKERS'
-            ) {
-              return undefined;
-            }
-            throw err;
-          }
-          if (chunks.length === 0) return undefined;
-          if (chunks.length === 1) return chunks[0];
-          const combined = new Uint8Array(total);
-          let offset = 0;
-          for (const c of chunks) {
-            combined.set(c, offset);
-            offset += c.length;
-          }
-          return combined;
-        };
+        installHeliaBlockstoreGetShim(heliaInstance.blockstore);
       }
 
       // 2. Create OrbitDB instance
