@@ -425,6 +425,45 @@ describe('helia-blockstore-shim — delete invalidates the cache', () => {
   });
 });
 
+describe('helia-blockstore-shim — degenerate inputs', () => {
+  it('skips the cache when cid yields the default Object.prototype.toString (collision guard)', async () => {
+    const bs = makeBlockstore({ data: new Map() });
+    // Override the inner `get` so it doesn't depend on the data Map
+    // (which is keyed by string). Always yield BYTES_A so we can assert
+    // the wrapper returns it without caching.
+    bs.get = (_cid, _opts): AsyncGenerator<Uint8Array> => {
+      return (async function* () {
+        yield BYTES_A;
+      })();
+    };
+    const handle = installHeliaBlockstoreGetShim(bs as never);
+
+    // Plain object: toString() === '[object Object]'. Two distinct
+    // objects would collide on this key, so the cidKey helper must
+    // reject it.
+    const fakeCid1 = { foo: 'a' };
+    const fakeCid2 = { foo: 'b' };
+    expect(await bs.get(fakeCid1)).toEqual(BYTES_A);
+    expect(await bs.get(fakeCid2)).toEqual(BYTES_A);
+    // Both reads bypassed the cache; the shim observed 2 misses.
+    expect(handle.cacheSize()).toBe(0);
+    expect(handle.misses()).toBe(2);
+  });
+
+  it('disables the cache when lruMax <= 0 (no set-then-evict thrashing)', async () => {
+    const bs = makeBlockstore({ data: new Map([[CID_A, BYTES_A]]) });
+    const handle = installHeliaBlockstoreGetShim(bs, { lruMax: 0 });
+
+    // Every read goes through to the underlying get; the cache never
+    // accumulates entries.
+    await bs.get(CID_A);
+    await bs.get(CID_A);
+    await bs.get(CID_A);
+    expect(handle.cacheSize()).toBe(0);
+    expect(bs.getCallCount()).toBe(3);
+  });
+});
+
 describe('helia-blockstore-shim — uninstall restores originals', () => {
   it('uninstall() restores the original get/put and drops the cache', async () => {
     const bs = makeBlockstore({ data: new Map([[CID_A, BYTES_A]]) });

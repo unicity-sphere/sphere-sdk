@@ -174,21 +174,32 @@ function isMissError(err: unknown): boolean {
 }
 
 /**
- * Compute the LRU key for a CID. Prefers `cid.toString()` (canonical
- * multiformats), falls back to `String(cid)` for shapes that don't
- * expose it. Returns `null` for unusable inputs so the wrapped get
- * skips the cache (defensive: cache miss is still a correct result).
+ * Compute the LRU key for a CID. Calls `cid.toString()` (canonical
+ * multiformats base32 / base58btc) and returns the result when it's
+ * a non-empty string that does NOT match the default
+ * `Object.prototype.toString` sentinel (`[object Object]`).
+ *
+ * Returning `null` for any other shape causes the wrapped get to
+ * skip the cache entirely — a cache miss is still a correct (slower)
+ * result, whereas a colliding key (e.g., the default `[object Object]`
+ * for every non-CID) would serve incorrect bytes across distinct
+ * inputs.
  */
 function cidKey(cid: unknown): string | null {
   if (cid == null) return null;
+  let s: unknown;
   try {
-    const s = (cid as { toString?: () => string }).toString?.();
-    if (typeof s === 'string' && s.length > 0) return s;
-    const fallback = String(cid);
-    return fallback.length > 0 ? fallback : null;
+    s = (cid as { toString?: () => string }).toString?.();
   } catch {
     return null;
   }
+  if (typeof s !== 'string' || s.length === 0) return null;
+  // Reject the default `Object.prototype.toString` output — colliding
+  // on `[object Object]` would conflate distinct unknown shapes into
+  // one cache entry and return wrong bytes. Real CIDs produce a
+  // base-encoded string that never starts with `[object `.
+  if (s.startsWith('[object ')) return null;
+  return s;
 }
 
 /**
@@ -229,7 +240,15 @@ export function installHeliaBlockstoreGetShim(
   let misses = 0;
 
   const touch = (key: string, value: Uint8Array): void => {
-    if (value.byteLength === 0 || value.byteLength > perEntryMax) return;
+    // Skip degenerate inputs:
+    //   - `lruMax <= 0`: cache effectively disabled (treat as "store
+    //     nothing"). Avoids the wasteful set-then-evict cycle.
+    //   - empty block: nothing useful to cache.
+    //   - over per-entry cap: protect against pathological multi-MB
+    //     blocks pinning the cache.
+    if (lruMax <= 0 || value.byteLength === 0 || value.byteLength > perEntryMax) {
+      return;
+    }
     lru.set(key, value);
     while (lru.size > lruMax) {
       const oldest = lru.keys().next().value;
