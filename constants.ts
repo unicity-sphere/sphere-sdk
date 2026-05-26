@@ -69,6 +69,19 @@ export const STORAGE_KEYS_GLOBAL = {
    * invocations rather than resetting per-process.
    */
   FAILED_EVENT_COOLDOWNS: 'failed_event_cooldowns',
+  /**
+   * Issue #275 — persistent dedup set for the MultiAddressTransportMux
+   * level. The Mux maintains its own `processedEventIds` (independent
+   * of NostrTransportProvider's set) and dispatches to per-address
+   * adapters. Without persistence, every fresh CLI invocation
+   * re-walked the relay backlog through the Mux path as well as the
+   * outer-provider path. Bounded by `LIMITS.PROCESSED_EVENT_IDS_CAP`.
+   * Per-wallet storage scope: each Sphere instance has its own
+   * `storage` provider, so a bare global key is sufficient (no
+   * per-pubkey suffix needed because the Mux spans all per-wallet
+   * addresses).
+   */
+  MUX_PROCESSED_EVENT_IDS: 'mux_processed_event_ids',
   /** Group chat: last used relay URL (stale data detection) — global, same relay for all addresses */
   GROUP_CHAT_RELAY_URL: 'group_chat_relay_url',
   /** Cached token registry JSON (fetched from remote) */

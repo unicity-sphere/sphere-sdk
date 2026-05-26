@@ -1157,35 +1157,28 @@ describe('Issue #275 — persistent dedup', () => {
       await provider.connect();
       await new Promise(resolve => setTimeout(resolve, 50));
 
-      // The TOKEN_TRANSFER cooldown gate should now skip the stuck event
-      // without entering handleTokenTransfer. We don't have an easy way
-      // to spy on handleTokenTransfer from outside, but observing that
-      // no `last_wallet_event_ts_` write happens for this event is a
-      // proxy: cooldown skip returns early, no cursor advance.
-      const callbacks = mockSubscribe.mock.calls[0][1];
-      mockStorage.set.mockClear();
-      callbacks.onEvent({
-        id: 'stuck-evt',
-        kind: 31113, // TOKEN_TRANSFER
-        content: '{}',
-        tags: [],
-        pubkey: 'a'.repeat(64),
-        created_at: 1700000700,
-        sig: 'sig',
-      });
-
-      await new Promise(resolve => setTimeout(resolve, 300));
-
-      const tsWrites = mockStorage.set.mock.calls.filter(
-        (c) => typeof c[0] === 'string' && (c[0] as string).startsWith('last_wallet_event_ts_'),
-      );
-      expect(tsWrites.length).toBe(0);
+      // Direct map inspection — the cooldown should have been hydrated
+      // into the in-memory ledger so the next TOKEN_TRANSFER dispatch
+      // for this id short-circuits at the gate. We assert on map state
+      // rather than on side-effects to disambiguate from kind-31113's
+      // handler-throw path (GAP 5 in steelman review).
+      const cooldownsMap = (provider as unknown as {
+        failedEventCooldowns: Map<string, { nextRetryAt: number; attempts: number }>;
+      }).failedEventCooldowns;
+      expect(cooldownsMap.has('stuck-evt')).toBe(true);
+      expect(cooldownsMap.get('stuck-evt')?.attempts).toBe(2);
     });
 
     it('should drop stale cooldown entries on hydrate', async () => {
-      // nextRetryAt far in the past (> 2x COOLDOWN_MAX_MS) — should be dropped.
-      const veryStale = Date.now() - 600_000; // 10 minutes ago
-      const cooldowns = JSON.stringify([['stale-evt', { nextRetryAt: veryStale, attempts: 1 }]]);
+      // Mix a stale entry (drop) and a fresh entry (kept). Inspect the
+      // in-memory map size after hydrate.
+      const now = Date.now();
+      const veryStale = now - 600_000; // 10 minutes ago — should drop
+      const fresh = now + 30_000;       // 30s in future — should keep
+      const cooldowns = JSON.stringify([
+        ['stale-evt', { nextRetryAt: veryStale, attempts: 1 }],
+        ['fresh-evt', { nextRetryAt: fresh, attempts: 2 }],
+      ]);
       const mockStorage = {
         get: vi.fn().mockImplementation((key: string) => {
           if (key.startsWith('failed_event_cooldowns_')) {
@@ -1200,13 +1193,14 @@ describe('Issue #275 — persistent dedup', () => {
       setIdentity(provider);
       await provider.connect();
       await new Promise(resolve => setTimeout(resolve, 50));
-      // No assertion on the count itself — the post-condition is that
-      // a future event with id "stale-evt" is NOT skipped because of a
-      // dropped cooldown. We'd need to send the event and watch for the
-      // cursor advance, but that path requires handleTokenTransfer to
-      // be wired to a real handler. Instead, assert hydrate didn't
-      // throw — coverage of the drop branch.
-      expect(true).toBe(true);
+
+      // Inspect the private field to verify the drop happened.
+      const cooldownsMap = (provider as unknown as {
+        failedEventCooldowns: Map<string, { nextRetryAt: number; attempts: number }>;
+      }).failedEventCooldowns;
+      expect(cooldownsMap.has('stale-evt')).toBe(false);
+      expect(cooldownsMap.has('fresh-evt')).toBe(true);
+      expect(cooldownsMap.size).toBe(1);
     });
   });
 
@@ -1315,6 +1309,76 @@ describe('Issue #275 — persistent dedup', () => {
         (c) => typeof c[0] === 'string' && (c[0] as string).startsWith('processed_wallet_event_ids_'),
       );
       expect(dedupWrites.length).toBe(0);
+    });
+
+    it('should evict oldest entry when exceeding PROCESSED_EVENT_IDS_CAP', async () => {
+      const mockStorage = {
+        get: vi.fn().mockResolvedValue(null),
+        set: vi.fn().mockResolvedValue(undefined),
+      };
+      const provider = createProviderWithStorage(mockStorage);
+      setIdentity(provider);
+      await provider.connect();
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      // Pre-populate the set to exactly the cap by reaching into the
+      // private field. FIFO eviction must keep the set bounded.
+      const internal = provider as unknown as {
+        processedEventIds: Set<string>;
+        markEventProcessed: (id: string) => void;
+      };
+      const { LIMITS } = await import('../../../constants');
+      const cap = LIMITS.PROCESSED_EVENT_IDS_CAP;
+      for (let i = 0; i < cap; i++) {
+        internal.processedEventIds.add(`pre-${i}`);
+      }
+      expect(internal.processedEventIds.size).toBe(cap);
+
+      // Add ONE more via markEventProcessed — should evict the oldest
+      // ('pre-0') and stay at exactly cap.
+      internal.markEventProcessed('overflow-id');
+      expect(internal.processedEventIds.size).toBe(cap);
+      expect(internal.processedEventIds.has('pre-0')).toBe(false); // evicted
+      expect(internal.processedEventIds.has('pre-1')).toBe(true);
+      expect(internal.processedEventIds.has('overflow-id')).toBe(true);
+    });
+
+    it('should flush pending dedup write on disconnect()', async () => {
+      const mockStorage = {
+        get: vi.fn().mockResolvedValue(null),
+        set: vi.fn().mockResolvedValue(undefined),
+      };
+      const provider = createProviderWithStorage(mockStorage);
+      setIdentity(provider);
+      await provider.connect();
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      const callbacks = mockSubscribe.mock.calls[0][1];
+      callbacks.onEvent({
+        id: 'evt-flush-on-disconnect',
+        kind: 4, // DIRECT_MESSAGE
+        content: '{}',
+        tags: [],
+        pubkey: 'a'.repeat(64),
+        created_at: 1700002000,
+        sig: 'sig',
+      });
+
+      // Let handleEvent finish its synchronous portion so the timer is
+      // armed. We do NOT wait the full 200ms debounce window.
+      await new Promise(resolve => setTimeout(resolve, 50));
+      mockStorage.set.mockClear();
+
+      // Disconnect must flush the pending write — without this, the
+      // pending dedup add would be lost on process exit.
+      await provider.disconnect();
+
+      const dedupWrites = mockStorage.set.mock.calls.filter(
+        (c) => typeof c[0] === 'string' && (c[0] as string).startsWith('processed_wallet_event_ids_'),
+      );
+      expect(dedupWrites.length).toBe(1);
+      const payload = JSON.parse(dedupWrites[0][1] as string);
+      expect(payload).toContain('evt-flush-on-disconnect');
     });
 
     it('should cancel the armed debounce timer on setIdentity', async () => {

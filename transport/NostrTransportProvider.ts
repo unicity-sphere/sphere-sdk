@@ -889,6 +889,12 @@ export class NostrTransportProvider implements TransportProvider {
             // `undefined` is the legacy "no opinion" contract → durable.
             if (result !== false) {
               this.updateLastEventTimestamp(createdAtSec);
+              // Issue #275 — mark the buffered event as processed so
+              // cross-process replays short-circuit. Without this, the
+              // pre-Mux buffered events (which never enter handleEvent's
+              // success branches) would not be persisted in the dedup
+              // set, and every fresh CLI invocation would re-walk them.
+              this.markEventProcessed(transfer.id);
             } else {
               logger.debug(
                 'Nostr',
