@@ -1257,36 +1257,95 @@ export class LifecycleManager {
         //
         // Best-effort: any failure during sign / emit is logged and
         // dropped — the publish-success return path is the contract.
+        //
+        // Issue #264 — gated behind the `enablePointerWinBroadcasts`
+        // capability (default OFF). When the flag is false the entire
+        // sign + emit block is skipped: no payload built, no event
+        // emitted, nothing for Sphere's `forwardPointerPublishedToNostr`
+        // to forward. Convergence still works via the aggregator pointer
+        // alone — broadcasts are an optimization, not a correctness
+        // requirement.
+        //
+        // Tolerant of pointer stubs that predate the
+        // `winBroadcastsEnabled` accessor (e.g. unit-test fakes): a
+        // missing method is treated as flag=false (fail-closed). The
+        // production code path always builds a real `ProfilePointerLayer`
+        // which implements the method.
+        // Defensive try/catch around the accessor: the
+        // `winBroadcastsEnabled()` contract is "MUST be a pure
+        // accessor, MUST NOT throw" (see ProfilePointerLayer doc),
+        // but a misbehaving stub could violate it. Without this
+        // catch, an accessor throw would escape to the broad outer
+        // catch (~line 1326) and be misclassified as a TRANSIENT
+        // publish failure returning `{ ok: false, transient: true,
+        // code: 'UNCLASSIFIED' }` — making the entire publish
+        // appear to have failed even though it had already
+        // succeeded. Treat the throw as flag=false (fail-closed
+        // policy), which silently disables broadcasts for this
+        // publish but lets the publish itself report success.
+        let winBroadcastsOn = false;
         try {
-          const signerHandle = pointer.getSignerForWinBroadcast();
-          const signed = await signWinBroadcastPayload(signerHandle.signer, {
-            _kind: WIN_BROADCAST_KIND_MARKER,
-            v: WIN_BROADCAST_SCHEMA_VERSION,
-            version: result.version,
-            cid: cidString,
-            signingPubKey: signerHandle.signingPubKeyHex,
-            ts: Date.now(),
-          });
-          this.host.emitEvent({
-            type: 'storage:pointer-published',
-            timestamp: Date.now(),
-            data: {
-              cid: cidString,
-              version: result.version,
-              attemptsUsed: result.attemptsUsed,
-              signedPayloadJson: JSON.stringify(signed),
-              broadcastTag: buildWinBroadcastTag(signerHandle.signingPubKeyHex),
-            },
-          });
-        } catch (broadcastErr) {
-          const errMsg =
-            broadcastErr instanceof Error
-              ? broadcastErr.message
-              : String(broadcastErr);
+          winBroadcastsOn =
+            typeof pointer.winBroadcastsEnabled === 'function' &&
+            // Strict `=== true` to mirror the production
+            // ProfilePointerLayer constructor's normalization (which
+            // freezes the snapshot as `=== true`). A test stub that
+            // returns a truthy non-boolean (`1`, `'yes'`, `{}`) MUST be
+            // treated as flag=false — same fail-closed policy as
+            // production config. Symmetric with the Sphere subscriber
+            // guard in `core/Sphere.ts:maybeInstallPointerWinSubscription`.
+            pointer.winBroadcastsEnabled() === true &&
+            // Symmetric with the new accessor: stubs lacking the signer
+            // helper fall through cleanly (fail-closed) rather than
+            // surfacing a TypeError caught only by the broad catch arm
+            // below. The two accessors are added together on real
+            // ProfilePointerLayer instances; a stub omitting one but
+            // not the other is a test-harness shape, not a production
+            // path.
+            typeof pointer.getSignerForWinBroadcast === 'function';
+        } catch (accessorErr) {
+          const msg =
+            accessorErr instanceof Error
+              ? accessorErr.message
+              : String(accessorErr);
           this.host.log(
-            `Pointer publish: win-broadcast build/sign failed (best-effort, ` +
-            `ignored): ${errMsg}`,
+            `Pointer publish: winBroadcastsEnabled() threw (accessor ` +
+              `contract violation, treating as flag=false): ${msg}`,
           );
+          winBroadcastsOn = false;
+        }
+        if (winBroadcastsOn) {
+          try {
+            const signerHandle = pointer.getSignerForWinBroadcast();
+            const signed = await signWinBroadcastPayload(signerHandle.signer, {
+              _kind: WIN_BROADCAST_KIND_MARKER,
+              v: WIN_BROADCAST_SCHEMA_VERSION,
+              version: result.version,
+              cid: cidString,
+              signingPubKey: signerHandle.signingPubKeyHex,
+              ts: Date.now(),
+            });
+            this.host.emitEvent({
+              type: 'storage:pointer-published',
+              timestamp: Date.now(),
+              data: {
+                cid: cidString,
+                version: result.version,
+                attemptsUsed: result.attemptsUsed,
+                signedPayloadJson: JSON.stringify(signed),
+                broadcastTag: buildWinBroadcastTag(signerHandle.signingPubKeyHex),
+              },
+            });
+          } catch (broadcastErr) {
+            const errMsg =
+              broadcastErr instanceof Error
+                ? broadcastErr.message
+                : String(broadcastErr);
+            this.host.log(
+              `Pointer publish: win-broadcast build/sign failed (best-effort, ` +
+              `ignored): ${errMsg}`,
+            );
+          }
         }
         return { ok: true, transient: false } as const;
       } catch (err) {

@@ -158,9 +158,88 @@ export class ProfilePointerLayer {
     // a normalized frozen snapshot. This drops `allowUnverifiedOverride`
     // post-guard — defense-in-depth, since the field has no behavior
     // effect in v1 and won't be read by any code path.
+    //
+    // Issue #264: `enablePointerWinBroadcasts` is normalized via
+    // `=== true` so accidental truthy non-boolean values (`'true'`,
+    // `1`) fail closed. The flag's default is OFF — the broadcast
+    // pipeline is an optimization layer not load-bearing for
+    // convergence (see PointerLayerConfig.enablePointerWinBroadcasts
+    // for the full design rationale).
     this.#config = Object.freeze({
       allowOperatorOverrides: suppliedConfig.allowOperatorOverrides === true,
+      enablePointerWinBroadcasts:
+        suppliedConfig.enablePointerWinBroadcasts === true,
     });
+  }
+
+  /**
+   * Issue #264 — capability gate for the pointer-win broadcast
+   * pipeline. Consulted by:
+   *   - `LifecycleManager.publishAggregatorPointerBestEffort` before
+   *     signing the broadcast payload and emitting the
+   *     `storage:pointer-published` event (publisher).
+   *   - `Sphere.maybeInstallPointerWinSubscription` before installing
+   *     the per-wallet Nostr subscription (subscriber).
+   *
+   * Default: `false`. See PointerLayerConfig.enablePointerWinBroadcasts
+   * for the full rationale.
+   *
+   * **API pairing contract.** Test stubs / alternative pointer-layer
+   * implementations that expose `winBroadcastsEnabled()` MUST also
+   * expose `getSignerForWinBroadcast()` — the publisher and subscriber
+   * guards treat them as a coupled pair (a partial implementation is
+   * treated as flag=false / fail-closed). Implementing only one
+   * silently disables broadcasts with no error.
+   *
+   * **Accessor contract.** `winBroadcastsEnabled()` MUST be a pure
+   * accessor and MUST NOT throw. Both the publisher (lifecycle-
+   * manager) and subscriber (Sphere) guards wrap the accessor call
+   * in a defensive try/catch that treats a throw as flag=false
+   * (fail-closed). The publish path still reports success; the
+   * subscriber early-returns without registering the per-wallet
+   * Nostr subscription. A single log line is emitted per accessor
+   * throw at debug-level (Sphere) and host-log level
+   * (lifecycle-manager) so operators can correlate. A real
+   * `ProfilePointerLayer` reads its frozen config snapshot and
+   * cannot throw; this defensive treatment exists so a misbehaving
+   * stub or alternative implementation cannot silently corrupt
+   * publish-success classification or trigger noisy
+   * subscription-install retries.
+   *
+   * **Init-time-only flag.** The flag is captured in the frozen
+   * `#config` snapshot at construction time. Flipping
+   * `enablePointerWinBroadcasts` at runtime (e.g., via a hot config
+   * reload that constructs a NEW `ProfilePointerLayer`) requires:
+   *   (1) Tearing down the old layer (calling `shutdown()`); AND
+   *   (2) Rebuilding the wiring so the new layer's
+   *       `winBroadcastsEnabled() === true` is observed by both
+   *       publisher and subscriber on next event.
+   * The publisher side picks up the new flag on its next successful
+   * publish. The subscriber side picks it up on the next emitted
+   * `storage:pointer-published` event — which only fires when the
+   * publisher is also enabled, so the first such event after the flip
+   * arms the subscription automatically. There is no third trigger
+   * that would re-arm the subscriber on a flip from false→true
+   * without a fresh publish.
+   *
+   * **Receive-only-wallet caveat.** A wallet that has the flag
+   * enabled but never PUBLISHES (e.g., a pure receive endpoint that
+   * only ingests sibling-device payments) will never emit a
+   * `storage:pointer-published` event of its own. Its
+   * `maybeInstallPointerWinSubscription` is therefore not triggered
+   * by its own publish path; the subscription only arms if some
+   * external code path calls `maybeInstallPointerWinSubscription()`
+   * directly. As of #264, `core/Sphere.ts` does NOT arrange an
+   * explicit init-time call — receive-only-wallet support for
+   * pointer-win broadcasts requires a follow-up wiring change (an
+   * init-time invocation gated on the flag's enabled state, OR a
+   * lazy first-incoming-event trigger). Acceptable today because
+   * the flag is default-OFF and the broadcast pipeline is an
+   * optimization layer (the aggregator pointer + auto-merge cover
+   * correctness without it).
+   */
+  winBroadcastsEnabled(): boolean {
+    return this.#config.enablePointerWinBroadcasts === true;
   }
 
   /**
@@ -347,7 +426,18 @@ export class ProfilePointerLayer {
       resolveRemoteCid: this.#init.resolveRemoteCid,
       abortSignal,
     });
-    this.#lastProbeVersions = result.probeHistory;
+    // Issue #264 steelman fix: only overwrite the probe history when
+    // the publish actually ran a discovery walkback. The fast-path
+    // (#263, attempts === 0) skips Step B and returns
+    // `probeHistory: []`. Unconditionally assigning would clobber any
+    // fingerprint populated by a prior discovery / recoverLatest /
+    // probe call — destroying the UI same-wallet-clustering signal
+    // surfaced by `getProbeFingerprint()`. The non-empty guard keeps
+    // the last meaningful probe sequence available across fast-path
+    // publishes.
+    if (result.probeHistory.length > 0) {
+      this.#lastProbeVersions = result.probeHistory;
+    }
     return { version: result.v, attemptsUsed: result.attemptsUsed };
   }
 
@@ -492,7 +582,18 @@ export class ProfilePointerLayer {
       walkbackLimit,
       abortSignal,
     });
-    this.#lastProbeVersions = result.probeVersions;
+    // Issue #264 steelman fix (symmetric with `publish`): only overwrite
+    // the probe-fingerprint history when discovery actually produced
+    // probes. A discoverLatestVersion that resolves on the first probe
+    // (no walkback needed) returns an empty `probeVersions` array;
+    // unconditionally assigning would clobber any fingerprint
+    // populated by a prior discovery / publish / probe call. Since
+    // `recoverLatest()` is implemented as
+    // `#recoverLatestInner → #discoverLatestVersionInner → here`, this
+    // fix also covers the recoverLatest path the steelman flagged.
+    if (result.probeVersions.length > 0) {
+      this.#lastProbeVersions = result.probeVersions;
+    }
     return result;
   }
 

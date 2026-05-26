@@ -108,6 +108,15 @@ async function buildStubPointer(opts: {
         signingPubKeyHex: opts.signer.signingPubKeyHex,
       };
     },
+    // Issue #264 — these tests are pinned to the legacy
+    // broadcasts-enabled wiring (they exist precisely to verify the
+    // sign/emit path works end-to-end). Return true here so the
+    // lifecycle-manager gate doesn't trip and the broadcast event
+    // emits as before. ProfilePointerLayer enforces a default-OFF
+    // policy in production via `PointerLayerConfig.enablePointerWinBroadcasts`;
+    // suppression of the default-OFF path is covered by a separate
+    // test file.
+    winBroadcastsEnabled() { return true; },
   } as unknown as ProfilePointerLayer;
 }
 

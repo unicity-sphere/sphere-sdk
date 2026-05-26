@@ -5324,6 +5324,42 @@ export class Sphere {
             // when the subscription is already in place.
             void this.maybeInstallPointerWinSubscription();
           }
+          // Issue #264 — bridge `storage:monotonicity-recovered` to a
+          // user-visible Sphere event so dashboards / telemetry
+          // pipelines subscribing via `sphere.on(...)` can observe
+          // auto-merge convergence work without dropping to provider-
+          // direct subscriptions. Pure informational forward — the
+          // provider's data payload rides through verbatim with
+          // `providerId` added for fan-out attribution.
+          if (event.type === 'storage:monotonicity-recovered') {
+            const d = (event.data ?? {}) as {
+              recoveredTokenIds?: string[];
+              recoveredTokenCount?: number;
+              mergedUnknownBundleCids?: string[];
+              mergedUnknownBundleCount?: number;
+              residualUnknownBundleCids?: string[];
+              residualUnknownBundleCount?: number;
+              residualTokenMissingIds?: string[];
+              residualTokenMissingCount?: number;
+              recoveredOutboxIdsDroppedAsSent?: string[];
+              recoveredOutboxIdsDroppedAsSentCount?: number;
+              truncated?: boolean;
+            };
+            this.emitEvent('storage:monotonicity-recovered', {
+              providerId,
+              recoveredTokenIds: d.recoveredTokenIds ?? [],
+              recoveredTokenCount: d.recoveredTokenCount ?? 0,
+              mergedUnknownBundleCids: d.mergedUnknownBundleCids ?? [],
+              mergedUnknownBundleCount: d.mergedUnknownBundleCount ?? 0,
+              residualUnknownBundleCids: d.residualUnknownBundleCids ?? [],
+              residualUnknownBundleCount: d.residualUnknownBundleCount ?? 0,
+              residualTokenMissingIds: d.residualTokenMissingIds ?? [],
+              residualTokenMissingCount: d.residualTokenMissingCount ?? 0,
+              recoveredOutboxIdsDroppedAsSent: d.recoveredOutboxIdsDroppedAsSent ?? [],
+              recoveredOutboxIdsDroppedAsSentCount: d.recoveredOutboxIdsDroppedAsSentCount ?? 0,
+              truncated: d.truncated === true,
+            });
+          }
         });
         if (unsub) this._providerEventCleanups.push(unsub);
       }
@@ -5420,6 +5456,61 @@ export class Sphere {
       const pointer = storageWithPointer.getPointerLayer?.() ?? null;
       if (!pointer) {
         // Pointer layer not yet built; try again on the next event.
+        return;
+      }
+      // Issue #264 — gated behind the pointer layer's
+      // `enablePointerWinBroadcasts` capability (default OFF). With
+      // the flag false this subscriber side is dormant: no per-wallet
+      // Nostr subscription is installed, so no sibling broadcasts can
+      // reach `handleIncomingPointerWinBroadcast`. The aggregator
+      // pointer + auto-merge convergence path covers correctness
+      // without the broadcast optimization.
+      //
+      // Tolerant of pointer stubs that predate the
+      // `winBroadcastsEnabled` accessor (mirrors the symmetric guard
+      // in `lifecycle-manager.ts:publishAggregatorPointerBestEffort`):
+      // a missing method is treated as flag=false (fail-closed). The
+      // production code path always builds a real `ProfilePointerLayer`
+      // which implements the method; this defensive check keeps the
+      // contract robust for any future test stub or duck-typed
+      // consumer.
+      // Defensive try/catch around the accessor: same rationale as
+      // lifecycle-manager. The accessor contract says
+      // `winBroadcastsEnabled()` MUST NOT throw, but a misbehaving
+      // stub could violate it. Without this catch, an accessor
+      // throw would escape to the outer `try { ... } catch (err)`
+      // and surface as a noisy "subscription install failed (will
+      // retry on next event)" warn — re-arming on every subsequent
+      // `storage:pointer-published` event indefinitely. Treat the
+      // throw as flag=false (fail-closed) so the early-return path
+      // fires cleanly with no noise.
+      let armed = false;
+      try {
+        armed =
+          typeof pointer.winBroadcastsEnabled === 'function' &&
+          // Strict `=== true` mirrors the production normalization
+          // in ProfilePointerLayer's frozen config snapshot. A test
+          // stub returning a truthy non-boolean (`1`, `'yes'`, `{}`)
+          // must be treated as flag=false — same fail-closed policy.
+          pointer.winBroadcastsEnabled() === true &&
+          // Symmetric stub guard: a fake pointer that returns
+          // `winBroadcastsEnabled() === true` but lacks
+          // `getSignerForWinBroadcast` would TypeError at the call
+          // below; fail-closed earlier.
+          typeof pointer.getSignerForWinBroadcast === 'function';
+      } catch (accessorErr) {
+        const msg =
+          accessorErr instanceof Error
+            ? accessorErr.message
+            : String(accessorErr);
+        logger.debug(
+          'Sphere',
+          `pointer-win subscription: winBroadcastsEnabled() threw ` +
+            `(accessor contract violation, treating as flag=false): ${msg}`,
+        );
+        armed = false;
+      }
+      if (!armed) {
         return;
       }
       const signerHandle = pointer.getSignerForWinBroadcast();

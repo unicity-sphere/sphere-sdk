@@ -126,7 +126,17 @@ function makeFakeAggregator(): {
       transactionHash: { data: Uint8Array },
       _authenticator: unknown,
     ) {
-      commitments.set(requestId.toString(), new Uint8Array(transactionHash.data));
+      // Issue #263 — model the production aggregator's per-requestId
+      // idempotency. A second writer at the same requestId gets
+      // REQUEST_ID_EXISTS (matches the category-C shared aggregator's
+      // contract). Without this, the fast-path's attempt at v=1 would
+      // silently overwrite a prior commitment at the same v rather than
+      // surface a conflict, which is the behavior the SPEC requires.
+      const key = requestId.toString();
+      if (commitments.has(key)) {
+        return new SubmitCommitmentResponse(SubmitCommitmentStatus.REQUEST_ID_EXISTS);
+      }
+      commitments.set(key, new Uint8Array(transactionHash.data));
       return new SubmitCommitmentResponse(SubmitCommitmentStatus.SUCCESS);
     },
     async getInclusionProof(requestId: { toString(): string }) {
@@ -549,16 +559,21 @@ describe('Category-M: Token Conservation across pointer-layer ops', () => {
     await layerA.publish(async () => cidForBytes(remotePayload).bytes);
     expect(versionA).toBe(1);
 
-    // Device B runs with a *different* localVersion state — 0 —
-    // so reconcile will compute nextV=2 (max(validV=1, includedV=1)+1).
-    // Device B has NO conflict here because localVersion=0 means it
-    // will discover v=1 on the aggregator, see that as validV, and
-    // target v=2. No fetchAndJoin needed in this happy path.
+    // Device B runs with localVersion=1 so its first publish targets
+    // v=2 directly — exercising the H4 max(validV, includedV)+1
+    // arithmetic on the happy path (no conflict).
     //
-    // But we want to verify that after publish, the caller's pool is
-    // conserved and the remote tokens can be merged (the merge itself
-    // lives above the pointer layer — we simulate it here).
-    let versionB = 0;
+    // Issue #263 — under the eager-publish optimization, B's fast-path
+    // (attempt 0) targets `currentLocalVersion + 1 = 2`, which is
+    // vacant on the shared aggregator, so the publish lands without
+    // a conflict (and therefore without firing fetchAndJoin). If we
+    // started B at localVersion=0 instead, the fast path would try
+    // v=1, hit REQUEST_ID_EXISTS, and fall through to the slow path
+    // — which would invoke fetchAndJoin and break the "happy-path
+    // conservation" contract this test is asserting. The application
+    // level multi-device-sync test (which DOES drive the fetchAndJoin
+    // path) covers that case separately.
+    let versionB = 1;
     const localPool = new MockTokenPool([tok('local-1', 'USDU', 200n)]);
 
     const beforeJoin = localPool.snapshot('device-B pre-join');

@@ -281,35 +281,54 @@ export async function reconcileAndPublish(input: ReconcileInput): Promise<Reconc
     // Step A: produce a fresh CID (may include state merged on prior conflict).
     const cidBytes = await input.cidProducer();
 
-    // Step B: discover V_true and target nextV = max(validV, includedV) + 1 (H4).
-    // Discovery errors propagate unchanged (DISCOVERY_OVERFLOW, CAR_UNAVAILABLE,
-    // CORRUPT_STREAK, TRUST_BASE_STALE, UNTRUSTED_PROOF). Reconcile cannot
-    // make progress without a valid V_true.
+    // Step B: determine nextV.
     //
-    // EXCEPTION (2026-05-16): `AGGREGATOR_POINTER_WALKBACK_FLOOR` is
-    // wrapped in a bounded retry loop. It fires when Phase 3 walkback
-    // would cross below `currentLocalVersion` — meaning the aggregator
-    // currently can't reach a version the wallet has already confirmed.
-    // This is replication lag (a successful publish at v=N becoming
-    // briefly invisible on a stale replica), not a real consistency
-    // fault. Retrying with backoff lets the lag settle before
-    // propagating up to the caller's retry-marker logic.
-    const discovery: DiscoverResult = await findLatestValidVersionWithWalkbackFloorRetry(
-      {
-        currentLocalVersion,
-        keyMaterial: input.keyMaterial,
-        signer: input.signer,
-        aggregatorClient: input.aggregatorClient,
-        trustBase: input.trustBase,
-        decodeCid: input.decodeCid,
-        fetchCar: input.fetchCar,
-        discoveryDeadlineMs: reconcileDeadlineMs,
-        abortSignal: input.abortSignal,
-      },
-      input.abortSignal,
-    );
-    probeHistory.push(...discovery.probeVersions);
-    const nextV = (Math.max(discovery.validV, discovery.includedV) + 1) as PointerVersion;
+    // Issue #263 fast-path: attempt 0 SKIPS the discovery walkback (which
+    // costs aggregator round-trip + IPFS CAR fetch per probed version)
+    // and targets `currentLocalVersion + 1` directly. For the common
+    // no-conflict case this saves ~30s of wall-clock per publish on a
+    // healthy testnet. If the fast-path submit returns `conflict`, we
+    // fall through to the same §9.2 rediscover + fetchAndJoin + retry
+    // loop the always-walkback flow used; attempts >= 1 run the full
+    // walkback discovery as before — preserving SPEC §8.2 conflict
+    // semantics.
+    //
+    // Issue #264 — the sibling-broadcast plumbing that issue #263
+    // originally added (`siblingHighestV` adoption into
+    // `currentLocalVersion`) is INTENTIONALLY OMITTED. The
+    // pointer-win broadcast pipeline is gated OFF by default and the
+    // aggregator alone is the load-bearing convergence mechanism;
+    // adopting a broadcast-derived version into `currentLocalVersion`
+    // would leak into `publishOnceAtVersion → resolvePublishVersion`
+    // and could silently clear legitimate crash-retry markers whose
+    // H8 v-burn accounting is still load-bearing (SPEC §7.1.4 Case 2).
+    //
+    // Attempts >= 1 (SLOW PATH) run the standard SPEC §8.2 three-phase
+    // walk. Discovery errors propagate unchanged (DISCOVERY_OVERFLOW,
+    // CAR_UNAVAILABLE, CORRUPT_STREAK, TRUST_BASE_STALE, UNTRUSTED_PROOF),
+    // except `AGGREGATOR_POINTER_WALKBACK_FLOOR` which is wrapped in a
+    // bounded retry loop to ride out replica-lag windows.
+    let nextV: PointerVersion;
+    if (attempts === 0) {
+      nextV = (currentLocalVersion + 1) as PointerVersion;
+    } else {
+      const discovery: DiscoverResult = await findLatestValidVersionWithWalkbackFloorRetry(
+        {
+          currentLocalVersion,
+          keyMaterial: input.keyMaterial,
+          signer: input.signer,
+          aggregatorClient: input.aggregatorClient,
+          trustBase: input.trustBase,
+          decodeCid: input.decodeCid,
+          fetchCar: input.fetchCar,
+          discoveryDeadlineMs: reconcileDeadlineMs,
+          abortSignal: input.abortSignal,
+        },
+        input.abortSignal,
+      );
+      probeHistory.push(...discovery.probeVersions);
+      nextV = (Math.max(discovery.validV, discovery.includedV) + 1) as PointerVersion;
+    }
 
     // Step C: run one publish attempt at nextV.
     const outcome = await publishOnceAtVersion(

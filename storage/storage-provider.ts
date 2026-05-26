@@ -377,7 +377,43 @@ export type StorageEventType =
    * converge via the existing WALKBACK_FLOOR + reconcile path
    * (just slower, ~60-90 s vs ~1 s).
    */
-  | 'storage:pointer-published';
+  | 'storage:pointer-published'
+  /**
+   * Issue #264 — emitted by the flush scheduler when it auto-merges
+   * a detected monotonicity gap in place (previously this fired
+   * POINTER_MONOTONICITY_VIOLATION on `storage:error` and aborted
+   * the flush). Distinct from `storage:error` so operators see
+   * auto-merges as routine convergence work, not alarms.
+   *
+   * `data` payload (see flush-scheduler.ts for the canonical shape):
+   *   - `recoveredTokenIds: string[]`   token ids re-merged from
+   *     `previousData` to satisfy the token-set invariant.
+   *   - `recoveredTokenCount: number`
+   *   - `mergedUnknownBundleCids: string[]`   foreign bundle CIDs
+   *     inline-fetched and merged into the in-flight UXF package.
+   *   - `mergedUnknownBundleCount: number`
+   *   - `residualUnknownBundleCids: string[]`   foreign bundle CIDs
+   *     that could not be fetched (network down, malformed CAR,
+   *     etc.) — the flush continued without them; downstream
+   *     convergence retries on the next flush.
+   *   - `residualUnknownBundleCount: number`
+   *   - `residualTokenMissingIds: string[]`   token ids the token-set
+   *     check flagged but `previousData` could not provide (only
+   *     possible when `previousData === null`).
+   *   - `residualTokenMissingCount: number`
+   *   - `recoveredOutboxIdsDroppedAsSent: string[]`   outbox-entry
+   *     ids that the SENT-wins dedup removed during the
+   *     `OperationalState` union — surfaced for operator audit.
+   *   - `recoveredOutboxIdsDroppedAsSentCount: number`
+   *   - `truncated: boolean`   true when any of the listed arrays
+   *     were capped at 100 entries for log-volume control.
+   *
+   * Informational only. The flush continues to publish the
+   * best-effort superset CAR regardless; residuals are addressed by
+   * subsequent cross-device syncs detecting the same gap and
+   * re-attempting the inline merge.
+   */
+  | 'storage:monotonicity-recovered';
 
 export interface StorageEvent {
   type: StorageEventType;

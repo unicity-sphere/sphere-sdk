@@ -73,12 +73,273 @@ import type { ProfileTokenStorageHost } from './host.js';
 import type { TxfStorageDataBase } from '../../storage/storage-provider.js';
 
 /**
- * Error code emitted when the runtime pointer-monotonicity assertion
- * fires. The flush is aborted before pin + publish; the operator-alert
- * event is emitted with the missing token IDs so monitoring can surface
- * the regression. Exported so consumers/tests can reference the literal.
+ * Issue #264 — historical compatibility constant.
+ *
+ * The runtime pointer-monotonicity check originally aborted the flush
+ * and emitted this code on `storage:error` when either the token-set or
+ * bundle-set invariant failed. Post-#264 the same conditions are
+ * auto-recovered in place (see {@link POINTER_MONOTONICITY_RECOVERED}):
+ *   - `tokenMissing` is healed by re-merging the missing TXF entries
+ *     from the last-loaded baseline (`previousData`) back into the
+ *     in-flight UXF package and re-exporting the CAR. Operational state
+ *     is unioned with the SENT-wins-over-OUTBOX rule so the
+ *     per-entry-key OrbitDB write does not tombstone live entries that
+ *     are present in the baseline but absent from this flush's `data`.
+ *   - `unknownBundleCids` is healed inline by fetching each foreign
+ *     CAR and merging it into `pkg` (the #255 / PR #262 behavior). If
+ *     the fetch fails for some subset, this is now logged at warn-level
+ *     and the flush proceeds with whatever superset it managed to
+ *     assemble — eventual convergence happens via subsequent
+ *     cross-device syncs detecting the same residual.
+ *
+ * The constant is still exported so test suites and operator tooling
+ * that pattern-match on the literal continue to compile, but it is no
+ * longer emitted on the auto-merge path. The throw path is preserved
+ * only for the truly-unrecoverable case where `previousData === null`
+ * AND every unknown-bundle inline fetch failed AND the token-set check
+ * had no source to recover from — i.e., no signal at all. Even then the
+ * flush body does NOT throw; it logs warn-level and continues so the
+ * at-least-once gate isn't held closed by metadata-layer transients.
  */
 export const POINTER_MONOTONICITY_VIOLATION = 'POINTER_MONOTONICITY_VIOLATION';
+
+/**
+ * Issue #264 — emitted on `storage:monotonicity-recovered` when the
+ * flush body auto-merges a detected monotonicity gap in place. Distinct
+ * from `storage:error` so operators see auto-merges as routine
+ * convergence work, not alarms.
+ *
+ * Payload (see flush-scheduler emit site):
+ *   - `recoveredTokenIds`: token ids re-merged from `previousData` to
+ *     satisfy the token-set invariant (capped at 100 for log volume).
+ *   - `mergedUnknownBundleCids`: foreign bundle CIDs inline-fetched and
+ *     merged into `pkg` (capped at 100).
+ *   - `residualUnknownBundleCids`: foreign bundle CIDs that could not
+ *     be fetched (network down, malformed CAR, etc.) — the flush
+ *     continued without them; downstream convergence retries on the
+ *     next flush.
+ *   - `recoveredOutboxIdsDroppedAsSent`: outbox-entry ids that the
+ *     SENT-wins dedup removed during the opState union.
+ */
+export const POINTER_MONOTONICITY_RECOVERED = 'POINTER_MONOTONICITY_RECOVERED';
+
+/**
+ * Issue #264 — cap on per-array entries surfaced in the
+ * `storage:monotonicity-recovered` and residual `storage:error`
+ * payloads. Log volume is bounded by truncating the listed
+ * `recoveredTokenIds`, `residualUnknownBundleCids`,
+ * `residualTokenMissingIds`, etc. to this many entries; the
+ * unbounded count is still emitted as a separate field, and a
+ * `truncated: true` flag is set whenever ANY of the arrays
+ * exceeded the cap.
+ *
+ * Exported so tests can pin the boundary atomically with the
+ * implementation — a deliberate cap change updates both sides
+ * together, and a regression flipping the `>` comparator becomes
+ * detectable via the boundary tests in `tests/unit/profile/`.
+ */
+export const MONOTONICITY_RECOVERY_PAYLOAD_CAP = 100;
+
+// ── Helpers ───────────────────────────────────────────────────────────────
+
+/**
+ * Lightweight projection of `OperationalState` arrays for the SENT-wins
+ * union helper. The flush body reads/writes the actual OperationalState
+ * shape via the host facade; this shape is just the loose subset we need
+ * to reason about during the merge.
+ */
+export type OpStateArrays = {
+  tombstones: unknown[];
+  outbox: unknown[];
+  sent: unknown[];
+  invalid: unknown[];
+  history: unknown[];
+  mintOutbox: unknown[];
+  invalidatedNametags: unknown[];
+  audit: unknown[];
+  finalizationQueue: unknown[];
+};
+
+/**
+ * Issue #264 — union two OperationalState array sets with the
+ * SENT-wins-over-OUTBOX dedup rule. Used by the flush-scheduler's
+ * tokenMissing auto-merge so the per-entry-key OrbitDB write does NOT
+ * tombstone live entries that exist in `previousOp` but were not
+ * carried in this flush's in-memory `currentOp`.
+ *
+ * # Naive Map-based union — correctness > amplification claims
+ *
+ * Earlier remediation attempted an "amplification-minimal" variant
+ * that only added previous entries missing from current. On closer
+ * analysis the resulting set size is identical to the naive union
+ * `|current ∪ previous|` — both implementations dedup shared ids and
+ * preserve previous-only fill-in. The writer's per-entry diff
+ * (`writeOrbitOperationalStatePerEntry` → `applyPerEntryDiff` →
+ * `writeProfileKey`) writes EVERY live entry regardless of source,
+ * so amplification reduction is impossible at this layer.
+ *
+ * The amplification concern raised in the prior steelman is REAL but
+ * lives at the WRITER layer: `writeProfileKey` calls
+ * `encryptProfileValue` (`profile/encryption.ts:122`) with a fresh
+ * random IV per call, so re-writing identical plaintext lands a new
+ * OrbitDB OpLog row. Eliminating that requires plaintext-aware diff
+ * in the writer (read existing ciphertext, decrypt, compare, skip on
+ * equality) OR deterministic-IV encryption — both broader refactors
+ * out of scope for #264. Tracked as a writer-layer follow-up.
+ *
+ * We therefore use the simpler naive union: dedupe by id via
+ * `Map.set` (current wins on collision), and collect no-id entries
+ * into a separate bucket that the consumer appends. This preserves
+ * correct semantics under intra-current duplicates (the variant
+ * silently kept duplicates) and empty-string ids (the variant routed
+ * `id: ''` to the no-id bucket and lost the dedup).
+ *
+ * Per-collection semantics:
+ *   - `outbox`, `sent`, `audit`, `finalizationQueue`: union by
+ *     `entry.id` (UxfTransferOutboxEntry / UxfSentLedgerEntry share the
+ *     stable transferId as `.id`); current wins on id collision.
+ *   - `outbox` then gets the SENT-wins filter applied: any outbox entry
+ *     whose `id` matches a SENT entry's `id` is dropped — the
+ *     transition outbox→sent is terminal and the OUTBOX residue should
+ *     not be resurrected when we union with the baseline. The dropped
+ *     outbox ids are returned so the flush body can surface them on
+ *     the `storage:monotonicity-recovered` event for operator audit.
+ *   - `tombstones`, `invalid`, `mintOutbox`, `invalidatedNametags`,
+ *     `history`: union by `entry.tokenId` when present, else dedup by
+ *     JSON serialization (best-effort; these collections are append-
+ *     only by construction so duplicates are rare and tolerable).
+ *
+ * The helper does not parse the inner entry shapes beyond reading
+ * `id` / `tokenId`; richer fields ride through opaquely. This keeps it
+ * forward-compatible with `T.1.E` composite-key tokenIds and any
+ * future per-entry fields.
+ */
+export function unionOpStateWithSentWins(
+  currentOp: OpStateArrays,
+  previousOp: OpStateArrays,
+): { merged: OpStateArrays; droppedOutboxIds: string[] } {
+  function readId(entry: unknown): string | undefined {
+    if (!entry || typeof entry !== 'object') return undefined;
+    const id = (entry as { id?: unknown }).id;
+    // Accept any string (including empty) as a real id so the Map
+    // dedup collapses duplicates uniformly. Downstream writers
+    // (writeOrbitOperationalStatePerEntry) gate writes on
+    // `id.length > 0`, so empty-id entries are silently dropped at
+    // write time — but we still want intra-set dedup here.
+    return typeof id === 'string' ? id : undefined;
+  }
+  function readTokenId(entry: unknown): string | undefined {
+    if (!entry || typeof entry !== 'object') return undefined;
+    const id = (entry as { tokenId?: unknown }).tokenId;
+    return typeof id === 'string' ? id : undefined;
+  }
+
+  function unionById(
+    current: ReadonlyArray<unknown>,
+    previous: ReadonlyArray<unknown>,
+  ): unknown[] {
+    // Naive Map dedup: insert previous first so current's value wins
+    // on id collision. No-id entries collect in a separate bucket
+    // appended at the end. Intra-source duplicates with the same id
+    // collapse to one entry per id (the LAST one inserted wins —
+    // current's last for current-vs-current ties, current's
+    // overriding previous's for cross-source ties).
+    const byId = new Map<string, unknown>();
+    const noId: unknown[] = [];
+    for (const e of previous) {
+      const id = readId(e);
+      if (id !== undefined) byId.set(id, e);
+      else noId.push(e);
+    }
+    for (const e of current) {
+      const id = readId(e);
+      if (id !== undefined) byId.set(id, e);
+      else noId.push(e);
+    }
+    return [...byId.values(), ...noId];
+  }
+
+  function unionByTokenIdOrJson(
+    current: ReadonlyArray<unknown>,
+    previous: ReadonlyArray<unknown>,
+  ): unknown[] {
+    // Dedup by `tokenId` when present (aligns with the writer's
+    // `tokenId`-keyed per-entry stores for `invalid` / `mintOutbox`).
+    // Fall back to JSON-key dedup for entries without tokenId
+    // (tombstones, history, invalidatedNametags). Non-serializable
+    // entries are force-appended (extremely rare in practice; these
+    // collections hold plain `{tokenId, deletedAt}`-shaped values).
+    const byTokenId = new Map<string, unknown>();
+    const byJson = new Map<string, unknown>();
+    const nonSerializable: unknown[] = [];
+    function ingest(arr: ReadonlyArray<unknown>): void {
+      for (const e of arr) {
+        const tid = readTokenId(e);
+        if (tid !== undefined) {
+          byTokenId.set(tid, e);
+          continue;
+        }
+        try {
+          byJson.set(JSON.stringify(e), e);
+        } catch {
+          nonSerializable.push(e);
+        }
+      }
+    }
+    // Insert previous first so current wins on key collision.
+    ingest(previous);
+    ingest(current);
+    return [...byTokenId.values(), ...byJson.values(), ...nonSerializable];
+  }
+
+  const mergedSent = unionById(currentOp.sent, previousOp.sent);
+  const mergedAudit = unionById(currentOp.audit, previousOp.audit);
+  const mergedFinalizationQueue = unionById(
+    currentOp.finalizationQueue,
+    previousOp.finalizationQueue,
+  );
+  let mergedOutbox = unionById(currentOp.outbox, previousOp.outbox);
+
+  // SENT-wins-over-OUTBOX dedup. The id space is shared between
+  // OutboxEntry and UxfSentLedgerEntry (the SENT entry reuses the
+  // outbox transferId as its primary key), so an outbox entry whose id
+  // matches a SENT entry's id is the residue of a transition that has
+  // already moved to terminal success — drop it.
+  const sentIds = new Set<string>();
+  for (const e of mergedSent) {
+    const id = readId(e);
+    if (id !== undefined) sentIds.add(id);
+  }
+  const droppedOutboxIds: string[] = [];
+  if (sentIds.size > 0) {
+    mergedOutbox = mergedOutbox.filter((e) => {
+      const id = readId(e);
+      if (id !== undefined && sentIds.has(id)) {
+        droppedOutboxIds.push(id);
+        return false;
+      }
+      return true;
+    });
+  }
+
+  return {
+    merged: {
+      tombstones: unionByTokenIdOrJson(currentOp.tombstones, previousOp.tombstones),
+      outbox: mergedOutbox,
+      sent: mergedSent,
+      invalid: unionByTokenIdOrJson(currentOp.invalid, previousOp.invalid),
+      history: unionByTokenIdOrJson(currentOp.history, previousOp.history),
+      mintOutbox: unionByTokenIdOrJson(currentOp.mintOutbox, previousOp.mintOutbox),
+      invalidatedNametags: unionByTokenIdOrJson(
+        currentOp.invalidatedNametags,
+        previousOp.invalidatedNametags,
+      ),
+      audit: mergedAudit,
+      finalizationQueue: mergedFinalizationQueue,
+    },
+    droppedOutboxIds,
+  };
+}
 
 export class FlushScheduler {
   /**
@@ -348,9 +609,15 @@ export class FlushScheduler {
     }
 
     try {
-      // 1. Extract tokens and operational state
+      // 1. Extract tokens and operational state.
+      //
+      // Issue #264: both are `let` (was `const opState`) because the
+      // monotonicity auto-merge below may union the in-memory `data`'s
+      // opState with `previousData`'s to satisfy the per-entry-key
+      // OrbitDB write contract — see `unionOpStateWithSentWins` for the
+      // SENT-wins dedup rule.
       let tokens = this.host.extractTokensFromTxfData(data);
-      const opState = this.host.extractOperationalState(data);
+      let opState = this.host.extractOperationalState(data);
 
       // 2. Build UXF package
       const { UxfPackage } = await import('../../uxf/UxfPackage.js');
@@ -622,10 +889,17 @@ export class FlushScheduler {
       }
 
       // In-place recovery for unknown bundles (#255). Try to fetch and
-      // merge each unknown bundle into `pkg`. On any failure, leave the
-      // CIDs in `unknownBundleCids` so the violation throw fires below.
+      // merge each unknown bundle into `pkg`. On any failure the CID
+      // stays in `unknownBundleCids` — issue #264 reframes the fallback
+      // from "throw POINTER_MONOTONICITY_VIOLATION" to "log + continue
+      // with the best-effort superset"; the auto-merge residual block
+      // below emits the operator event and proceeds with the publish.
+      //
+      // `bundlesMergedInline` is hoisted to the outer scope so the
+      // `storage:monotonicity-recovered` event emitted later can surface
+      // both the merged set AND the residual set in a single payload.
+      const bundlesMergedInline: string[] = [];
       if (unknownBundleCids.length > 0) {
-        const mergedCids: string[] = [];
         const stillUnknown: string[] = [];
         for (const cid of unknownBundleCids) {
           try {
@@ -638,7 +912,7 @@ export class FlushScheduler {
             );
             const foreignPkg = await UxfPackage.fromCar(foreignCarBytes);
             pkg.merge(foreignPkg);
-            mergedCids.push(cid);
+            bundlesMergedInline.push(cid);
             if (loadedBundleCids !== null) {
               loadedBundleCids.add(cid);
             }
@@ -646,7 +920,7 @@ export class FlushScheduler {
             stillUnknown.push(cid);
             this.host.log(
               `In-place merge failed for unknown bundle ${cid} ` +
-                `(falling back to violation throw): ` +
+                `(residual after auto-merge — flush continues): ` +
                 `${err instanceof Error ? err.message : String(err)}`,
             );
           }
@@ -655,100 +929,233 @@ export class FlushScheduler {
         // code (CAR export, bundle ref tokenCount) reflects the union.
         // Re-export carBytes from the merged pkg so the pin step uses
         // the superset CAR (the pre-merge carBytes above is now stale).
-        if (mergedCids.length > 0) {
+        if (bundlesMergedInline.length > 0) {
           tokens = pkg.assembleAll() as Map<string, unknown>;
           tokenValues = [...tokens.values()];
           carBytes = await pkg.toCar();
           this.host.log(
-            `In-place monotonicity recovery: merged ${mergedCids.length} foreign ` +
+            `In-place monotonicity recovery: merged ${bundlesMergedInline.length} foreign ` +
               `bundle(s) into in-flight CAR ` +
-              `(${mergedCids.slice(0, 5).join(', ')}${mergedCids.length > 5 ? ', ...' : ''}) — ` +
+              `(${bundlesMergedInline.slice(0, 5).join(', ')}` +
+              `${bundlesMergedInline.length > 5 ? ', ...' : ''}) — ` +
               `pkg now has ${tokens.size} token(s)`,
           );
         }
-        // Anything we couldn't fetch+merge falls through to the throw.
+        // Anything we couldn't fetch+merge stays as a residual; see
+        // the auto-merge residual block below.
         unknownBundleCids = stillUnknown;
       }
 
-      if (tokenMissing.length > 0 || unknownBundleCids.length > 0) {
-        const reasonParts: string[] = [];
-        if (tokenMissing.length > 0) {
-          reasonParts.push(
-            `would drop ${tokenMissing.length} token(s) from baseline ` +
-              `(${tokenMissing.slice(0, 10).join(', ')}${tokenMissing.length > 10 ? ', ...' : ''})`,
+      // Issue #264 — token-set auto-merge.
+      //
+      // When the token-set check found token IDs in `previousData` that
+      // are absent from this flush's `pkg`, the previous behavior threw
+      // POINTER_MONOTONICITY_VIOLATION and relied on a fire-and-forget
+      // baseline refresh + the at-least-once gate's `awaitNextFlush`
+      // one-shot retry to recover. That deferred path:
+      //   (a) was not reliable under cross-device replication churn
+      //       (every retry race-loses to a fresh peer write); and
+      //   (b) held the at-least-once Nostr gate closed for the entire
+      //       retry window, manifesting as inbound TOKEN_TRANSFER events
+      //       replaying forever without ever durably landing.
+      //
+      // Per #264 design principle: convergence MUST be guaranteed by
+      // the aggregator pointer versions alone; profile metadata
+      // convergence is eventually-consistent via auto-merge. So:
+      //
+      //   - For each missing tokenId, extract its TXF entry from
+      //     `previousData` (the last-loaded baseline) and ingest it
+      //     back into `pkg`. By construction `previousData` contains
+      //     every missing entry (that's the definition of tokenMissing
+      //     in the check above), so recovery is total.
+      //   - Union the in-memory `opState` arrays with `previousData`'s
+      //     opState via `unionOpStateWithSentWins` so the per-entry-key
+      //     OrbitDB write does NOT tombstone live OUTBOX / SENT / etc.
+      //     entries that exist in the baseline but were not carried in
+      //     this flush's `data`. SENT-wins dedup drops any OUTBOX entry
+      //     whose id matches a SENT entry's id — that transition is
+      //     terminal and the OUTBOX residue should not survive the
+      //     union.
+      //   - Re-export `carBytes` from the merged `pkg` so the pin step
+      //     writes the superset CAR.
+      const recoveredTokenIds: string[] = [];
+      let droppedOutboxIdsAsSent: string[] = [];
+      if (tokenMissing.length > 0 && previousData) {
+        const previousTokens = this.host.extractTokensFromTxfData(previousData);
+        const toReingest: unknown[] = [];
+        for (const tokenId of tokenMissing) {
+          const txfEntry = previousTokens.get(tokenId);
+          if (txfEntry !== undefined) {
+            toReingest.push(txfEntry);
+            recoveredTokenIds.push(tokenId);
+          }
+        }
+        if (toReingest.length > 0) {
+          pkg.ingestAll(toReingest);
+          tokens = pkg.assembleAll() as Map<string, unknown>;
+          tokenValues = [...tokens.values()];
+
+          const previousOpState = this.host.extractOperationalState(previousData);
+          const { merged: mergedOp, droppedOutboxIds } =
+            unionOpStateWithSentWins(
+              opState as unknown as OpStateArrays,
+              previousOpState as unknown as OpStateArrays,
+            );
+          opState = mergedOp as unknown as typeof opState;
+          droppedOutboxIdsAsSent = droppedOutboxIds;
+
+          carBytes = await pkg.toCar();
+          this.host.log(
+            `In-place monotonicity recovery: re-merged ${recoveredTokenIds.length} ` +
+              `missing token(s) from previous baseline ` +
+              `(${recoveredTokenIds.slice(0, 5).join(', ')}` +
+              `${recoveredTokenIds.length > 5 ? ', ...' : ''}); ` +
+              `opState union dropped ${droppedOutboxIdsAsSent.length} OUTBOX ` +
+              `id(s) superseded by SENT — pkg now has ${tokens.size} token(s)`,
           );
         }
-        if (unknownBundleCids.length > 0) {
+      }
+
+      // Compute residuals: tokens we wanted to recover but couldn't
+      // (e.g., `previousData` was null, or the entry was somehow
+      // missing from `previousTokens`). Unknown bundles that couldn't
+      // be fetched in the inline merge above also stay in
+      // `unknownBundleCids` and become residuals here.
+      const residualTokenMissing = tokenMissing.filter(
+        (id) => !recoveredTokenIds.includes(id),
+      );
+      const residualUnknownBundleCids = unknownBundleCids;
+      const mergedUnknownBundleCids = bundlesMergedInline;
+
+      // Emit the operator-visible recovery event whenever anything was
+      // recovered OR any residual exists. This is a routine convergence
+      // signal — distinct from `storage:error` — so monitoring
+      // dashboards can plot recovery rates without conflating them with
+      // alarms.
+      if (
+        recoveredTokenIds.length > 0 ||
+        droppedOutboxIdsAsSent.length > 0 ||
+        residualTokenMissing.length > 0 ||
+        residualUnknownBundleCids.length > 0
+      ) {
+        this.host.emitEvent({
+          type: 'storage:monotonicity-recovered',
+          timestamp: Date.now(),
+          code: POINTER_MONOTONICITY_RECOVERED,
+          data: {
+            recoveredTokenIds: recoveredTokenIds.slice(0, MONOTONICITY_RECOVERY_PAYLOAD_CAP),
+            recoveredTokenCount: recoveredTokenIds.length,
+            mergedUnknownBundleCids: mergedUnknownBundleCids.slice(0, MONOTONICITY_RECOVERY_PAYLOAD_CAP),
+            mergedUnknownBundleCount: mergedUnknownBundleCids.length,
+            residualUnknownBundleCids: residualUnknownBundleCids.slice(0, MONOTONICITY_RECOVERY_PAYLOAD_CAP),
+            residualUnknownBundleCount: residualUnknownBundleCids.length,
+            residualTokenMissingIds: residualTokenMissing.slice(0, MONOTONICITY_RECOVERY_PAYLOAD_CAP),
+            residualTokenMissingCount: residualTokenMissing.length,
+            recoveredOutboxIdsDroppedAsSent: droppedOutboxIdsAsSent.slice(0, MONOTONICITY_RECOVERY_PAYLOAD_CAP),
+            recoveredOutboxIdsDroppedAsSentCount: droppedOutboxIdsAsSent.length,
+            truncated:
+              recoveredTokenIds.length > MONOTONICITY_RECOVERY_PAYLOAD_CAP ||
+              residualUnknownBundleCids.length > MONOTONICITY_RECOVERY_PAYLOAD_CAP ||
+              residualTokenMissing.length > MONOTONICITY_RECOVERY_PAYLOAD_CAP ||
+              droppedOutboxIdsAsSent.length > MONOTONICITY_RECOVERY_PAYLOAD_CAP,
+          },
+        });
+      }
+
+      // Residuals: log at warn-level + emit `storage:error` with the
+      // legacy POINTER_MONOTONICITY_VIOLATION code (so existing
+      // monitoring dashboards keyed on that literal still fire), but
+      // DO NOT throw. The publish proceeds with the best-effort
+      // superset CAR we managed to assemble — the next cross-device
+      // sync from any peer will detect the same residual and re-attempt
+      // the inline merge, achieving eventual convergence per the
+      // aggregator-pointer-as-source-of-truth design principle in #264.
+      if (
+        residualTokenMissing.length > 0 ||
+        residualUnknownBundleCids.length > 0
+      ) {
+        const reasonParts: string[] = [];
+        if (residualTokenMissing.length > 0) {
           reasonParts.push(
-            `${unknownBundleCids.length} unknown bundle(s) in OrbitDB not in baseline ` +
-              `(${unknownBundleCids.slice(0, 5).join(', ')}${unknownBundleCids.length > 5 ? ', ...' : ''})`,
+            `could not recover ${residualTokenMissing.length} token(s) from baseline ` +
+              `(${residualTokenMissing.slice(0, 10).join(', ')}` +
+              `${residualTokenMissing.length > 10 ? ', ...' : ''})`,
+          );
+        }
+        if (residualUnknownBundleCids.length > 0) {
+          reasonParts.push(
+            `${residualUnknownBundleCids.length} unknown bundle(s) inline fetch failed ` +
+              `(${residualUnknownBundleCids.slice(0, 5).join(', ')}` +
+              `${residualUnknownBundleCids.length > 5 ? ', ...' : ''})`,
           );
         }
         const violation = new Error(
-          `Pointer monotonicity violation: ${reasonParts.join('; ')}. ` +
-            `Aborting publish to prevent silent token loss across cross-device sync.`,
+          `Pointer monotonicity auto-merge residuals: ${reasonParts.join('; ')}. ` +
+            `Publishing best-effort superset; subsequent cross-device syncs will retry.`,
         );
-        (violation as Error & { code?: string }).code = POINTER_MONOTONICITY_VIOLATION;
-        this.host.log(`[POINTER_MONOTONICITY_VIOLATION] aborting publish: ${reasonParts.join('; ')}`);
-
-        // Gap 4 recovery: kick off a fire-and-forget baseline refresh
-        // so subsequent save-driven flushes (which DON'T retry via
-        // awaitNextFlush) get a fresh `lastLoadedFromBundleCids` and
-        // can pass the check. Called via a microtask schedule so the
-        // in-flight flush settles BEFORE load() tries to await
-        // `flushPromise` (otherwise the refresh would deadlock on
-        // ourselves).
-        //
-        // The at-least-once gate's `awaitNextFlush` loop does its own
-        // synchronous retry — that path bypasses this fire-and-forget
-        // since it has tighter latency requirements. This fire-and-
-        // forget covers the save-driven timer path, the periodic
-        // poll's no-data flush path, and any other call site that
-        // doesn't loop on violation.
-        //
-        // Post-#255: this path now only fires when (a) the token-set
-        // check fired (partial-save bug, no merge possible) or (b) the
-        // inline fetch+merge above failed for every unknown bundle
-        // (network down + no local Helia blockstore for those CIDs).
-        // The common cross-device-race case is handled by the inline
-        // recovery without reaching this throw.
-        queueMicrotask(() => {
-          this.host.refreshBaselineForMonotonicity().catch((err) => {
-            this.host.log(
-              `Baseline-refresh recovery threw (best-effort): ` +
-                `${err instanceof Error ? err.message : String(err)}`,
-            );
-          });
-        });
-
-        // The catch block at the bottom of flushToIpfs() re-queues
-        // `data` so the user's writes are not lost; subsequent
-        // flushes will re-evaluate once the refresh above completes.
-        // Surface to operators via storage:error AND a structured
-        // alert so monitoring dashboards can fire on the literal code.
-        this.host.emitEvent(
-          this.host.buildErrorEvent(
-            'storage:error',
-            violation,
-            POINTER_MONOTONICITY_VIOLATION,
-          ),
+        (violation as Error & { code?: string }).code =
+          POINTER_MONOTONICITY_VIOLATION;
+        this.host.log(
+          `[POINTER_MONOTONICITY_VIOLATION] residual after auto-merge (continuing): ${reasonParts.join('; ')}`,
         );
+
+        // Issue #264 — intentionally NOT scheduling the legacy
+        // `refreshBaselineForMonotonicity` microtask anymore.
+        //
+        // Pre-#264 that helper rebuilt `lastLoadedFromBundleCids` from
+        // OrbitDB's `listActiveBundles()` so the throw-then-retry path
+        // could re-flush past a stale baseline. The retry path
+        // (awaitNextFlush) is the only legitimate consumer that still
+        // benefits.
+        //
+        // Post-#264, an unconditional refresh actively BREAKS the
+        // residual-retry contract: the residual CID (the unfetchable
+        // foreign bundle) IS present in `listActiveBundles()` because
+        // it landed in OrbitDB before our flush. A refresh would mark
+        // it as "in baseline", and the next flush's bundle-set check
+        // would no longer treat it as unknown — silently skipping the
+        // inline fetch retry. Subsequent saves would publish CARs
+        // missing the residual's tokens despite OrbitDB still showing
+        // the bundle as active. The auto-merge is precisely the
+        // mechanism that keeps eventual convergence working; the
+        // refresh would sabotage it.
+        //
+        // The `awaitNextFlush` Gap 4 path that DID rely on the throw
+        // continues to work for synthetic-violation tests; for real
+        // workloads it no longer triggers (no throw).
+
+        // Surface to operators via the legacy `storage:error` code so
+        // dashboards keyed on POINTER_MONOTONICITY_VIOLATION still
+        // fire. The richer per-recovery payload is on the separate
+        // `storage:monotonicity-recovered` event emitted above.
+        //
+        // Issue #264 steelman fix: the `alert: 'transfer:operator-alert'`
+        // field is INTENTIONALLY NOT set on the residual emit anymore.
+        // Pre-#264 a monotonicity violation was a rare hard-throw and
+        // warranted paging. Post-#264 the residual fires whenever a
+        // foreign bundle's inline fetch fails — a routine network
+        // transient. Pagers keyed on `data.alert === 'transfer:operator-
+        // alert'` would burn out on-call within hours of a flaky IPFS
+        // gateway. Operators who DO want paging on residuals can opt in
+        // explicitly via the new `autoMergeResidual: true` discriminator
+        // (paired with the unchanged `code: POINTER_MONOTONICITY_VIOLATION`).
         this.host.emitEvent({
           type: 'storage:error',
           timestamp: Date.now(),
           code: POINTER_MONOTONICITY_VIOLATION,
           error: violation.message,
           data: {
-            alert: 'transfer:operator-alert',
-            missingTokenIds: tokenMissing.slice(0, 100),
-            missingTokenCount: tokenMissing.length,
-            unknownBundleCids: unknownBundleCids.slice(0, 100),
-            unknownBundleCount: unknownBundleCids.length,
+            missingTokenIds: residualTokenMissing.slice(0, MONOTONICITY_RECOVERY_PAYLOAD_CAP),
+            missingTokenCount: residualTokenMissing.length,
+            unknownBundleCids: residualUnknownBundleCids.slice(0, MONOTONICITY_RECOVERY_PAYLOAD_CAP),
+            unknownBundleCount: residualUnknownBundleCids.length,
+            autoMergeResidual: true,
             truncated:
-              tokenMissing.length > 100 || unknownBundleCids.length > 100,
+              residualTokenMissing.length > MONOTONICITY_RECOVERY_PAYLOAD_CAP ||
+              residualUnknownBundleCids.length > MONOTONICITY_RECOVERY_PAYLOAD_CAP,
           },
         });
-        throw violation;
+        // Intentionally NOT throwing — see comment block above.
       }
 
       // 4. Pin to IPFS (reuse last pinned CID on retry to avoid duplicate pins)
