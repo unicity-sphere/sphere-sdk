@@ -2747,6 +2747,15 @@ export class AccountingModule {
     this.ensureNotDestroyed();
     this.ensureInitialized();
 
+    // Issue #274 — `payInvoice` invokes payments.send under the hood, which is
+    // the §C.2 hot path. Emitting one entry log here lets operators correlate
+    // an invoice attribution with its corresponding `payments:send` span.
+    logger.debug('accounting:invoice', 'payInvoice enter', {
+      invoiceId: invoiceId?.slice(0, 16),
+      targetIndex: params.targetIndex,
+      assetIndex: params.assetIndex,
+    });
+
     const deps = this.deps!;
 
     // §8.5 step 1: Invoice must exist locally
