@@ -11,6 +11,7 @@
 
 import type { FullIdentity } from '../../types';
 import { SphereError } from '../../core/errors';
+import { logger } from '../../core/logger';
 import type { TransportProvider } from '../../transport';
 import { DEFAULT_ELECTRUM_URL } from '../../constants';
 import {
@@ -288,6 +289,14 @@ export class L1PaymentsModule {
       return { success: false, error: 'No wallet available' };
     }
 
+    // Issue #274 — L1 send fans out to Fulcrum + UTXO selection + tx signing.
+    // Entry log gives operators the recipient + amount needed to correlate
+    // slow L1 sends with Electrum WebSocket health.
+    const __span = logger.time('payments:l1', 'send', {
+      to: request.to?.slice(0, 24),
+      amount: request.amount,
+      feeRate: request.feeRate,
+    });
     try {
       // Resolve recipient to L1 address (supports nametag)
       const recipientAddress = await this.resolveL1Address(request.to);
@@ -306,17 +315,20 @@ export class L1PaymentsModule {
       if (results && results.length > 0) {
         // Calculate total fee from all transactions
         const txids = results.map((r) => r.txid);
+        __span.end({ success: true, txCount: results.length });
         return {
           success: true,
           txHash: txids[0], // Return first txid (usually only one)
         };
       } else {
+        __span.end({ success: false, reason: 'no-results' });
         return {
           success: false,
           error: 'Transaction failed - no results returned',
         };
       }
     } catch (error) {
+      __span.endWithError(error);
       return {
         success: false,
         error: error instanceof Error ? error.message : 'Unknown error',

@@ -2356,6 +2356,11 @@ export class NostrTransportProvider implements TransportProvider {
       throw new SphereError('Transport not connected', 'TRANSPORT_ERROR');
     }
 
+    // Issue #274 — perf instrumentation. Called once per `sphere.payments.receive()`
+    // and once per `ensureSync(sphere, 'full')`. Per perf-engineer, the CLI runs
+    // ensureSync at the start of every command — making this span the cheapest
+    // diagnostic for cross-process replay-storm volume.
+    const __span = logger.time('transport:nostr', 'fetchPendingEvents', {});
     const nostrPubkey = this.keyManager.getPublicKeyHex();
 
     const walletFilter = new Filter();
@@ -2423,11 +2428,17 @@ export class NostrTransportProvider implements TransportProvider {
     // Unsubscribe AFTER the Promise resolves — subId is now the real subscription ID.
     // This also ensures onEvent cannot fire while we iterate events below.
     if (subId) { try { client.unsubscribe(subId); } catch { /* disconnected */ } }
+    __span.mark('eose', { eventCount: events.length });
 
     // Process collected events sequentially (dedup skips already-processed ones)
+    const __dispatchT0 = Date.now();
     for (const event of events) {
       await this.handleEvent(event);
     }
+    __span.end({
+      eventCount: events.length,
+      dispatchDurationMs: Date.now() - __dispatchT0,
+    });
   }
 
   /**

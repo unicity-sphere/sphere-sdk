@@ -5384,6 +5384,20 @@ export class PaymentsModule {
   ): Promise<TransferResult> {
     this.ensureInitialized();
 
+    // Issue #274 — perf instrumentation. Top-level `payments:send` span;
+    // `.end()` / `.endWithError()` are called on EVERY exit path below
+    // (the three UXF dispatcher arms, the `UNSUPPORTED_TRANSFER_MODE`
+    // throw, the legacy fall-through success/catch). The `route` field
+    // distinguishes which dispatcher handled the send so a future
+    // `sphere debug timings` consumer can group by route.
+    const __span = logger.time('payments:send', 'send', {
+      recipient: originalRequest.recipient?.slice(0, 16),
+      coinId: originalRequest.coinId?.slice(0, 16),
+      amount: originalRequest.amount,
+      transferMode: originalRequest.transferMode,
+      hasAdditionalAssets: !!originalRequest.additionalAssets?.length,
+    });
+
     // T.1.B.1 — narrow public TransferMode to InternalTransferMode and reject
     // any future-protocol value (notably `'txf'`) with the typed
     // `UNSUPPORTED_TRANSFER_MODE` error BEFORE we mutate any state. The
@@ -5432,7 +5446,12 @@ export class PaymentsModule {
       // Steelman item 2 — orphan-sweep race gate. See _dispatcherInFlightCount.
       this._dispatcherInFlightCount += 1;
       try {
-        return await this.dispatchUxfConservativeSend(originalRequest);
+        const __r = await this.dispatchUxfConservativeSend(originalRequest);
+        __span.end({ route: 'uxf-conservative', status: __r.status });
+        return __r;
+      } catch (__e) {
+        __span.endWithError(__e, { route: 'uxf-conservative' });
+        throw __e;
       } finally {
         this._dispatcherInFlightCount -= 1;
       }
@@ -5453,7 +5472,12 @@ export class PaymentsModule {
     if (this.features.senderUxf && internalTransferMode === 'instant') {
       this._dispatcherInFlightCount += 1;
       try {
-        return await this.dispatchUxfInstantSend(originalRequest);
+        const __r = await this.dispatchUxfInstantSend(originalRequest);
+        __span.end({ route: 'uxf-instant', status: __r.status });
+        return __r;
+      } catch (__e) {
+        __span.endWithError(__e, { route: 'uxf-instant' });
+        throw __e;
       } finally {
         this._dispatcherInFlightCount -= 1;
       }
@@ -5472,7 +5496,12 @@ export class PaymentsModule {
         originalRequest.txfFinalization === 'instant' ? 'instant' : 'conservative';
       this._dispatcherInFlightCount += 1;
       try {
-        return await this.dispatchTxfSend(originalRequest, txfFinalization);
+        const __r = await this.dispatchTxfSend(originalRequest, txfFinalization);
+        __span.end({ route: 'legacy-txf', status: __r.status, finalization: txfFinalization });
+        return __r;
+      } catch (__e) {
+        __span.endWithError(__e, { route: 'legacy-txf' });
+        throw __e;
       } finally {
         this._dispatcherInFlightCount -= 1;
       }
@@ -5485,11 +5514,13 @@ export class PaymentsModule {
     // `UNSUPPORTED_TRANSFER_MODE` error so callers know they need to
     // flip `features.senderUxf = true` to use the TXF orchestrator.
     if (!this.features.senderUxf && internalTransferMode === 'txf') {
-      throw new SphereError(
+      const __err = new SphereError(
         "transferMode: 'txf' requires features.senderUxf = true. " +
           'Either set the flag or omit the field to use the default mode.',
         'UNSUPPORTED_TRANSFER_MODE',
       );
+      __span.endWithError(__err, { route: 'unsupported-txf-mode' });
+      throw __err;
     }
     // T.1.B.1 — `coinId` and `amount` are now optional on the public
     // `TransferRequest`. The legacy single-coin code path below
@@ -5985,6 +6016,7 @@ export class PaymentsModule {
       this.reservationLedger.commit(result.id);
 
       this.deps!.emitEvent('transfer:confirmed', result);
+      __span.end({ route: 'legacy', status: result.status, tokenCount: result.tokens.length });
       return result;
     } catch (error) {
       // Cancel reservation — free reserved amounts for other sends
@@ -5992,6 +6024,7 @@ export class PaymentsModule {
 
       result.status = 'failed';
       result.error = error instanceof Error ? error.message : String(error);
+      __span.endWithError(error, { route: 'legacy', status: result.status });
 
       // Restore tokens and re-add to spend queue cache.
       // W23-R2/R3 fix: Skip tokens that were already committed on-chain or removed
@@ -7573,6 +7606,16 @@ export class PaymentsModule {
 
     const opts = options ?? {};
 
+    // Issue #274 — perf instrumentation. Span emits one debug line at the
+    // function's natural exit with durations for each phase (fetch, load,
+    // finalization). On unhandled throw the span is GC'd without an exit
+    // record — that's intentional; the throw already propagates to the
+    // caller as an Error which higher-level spans will record.
+    const __span = logger.time('payments:receive', 'receive', {
+      finalize: !!opts.finalize,
+      timeoutMs: opts.timeout,
+    });
+
     // Phase 1: Fetch pending events
     // Snapshot token keys before fetch
     const tokensBefore = new Set(this.tokens.keys());
@@ -7581,13 +7624,17 @@ export class PaymentsModule {
     // fetchPendingEvents() collects events until EOSE, then processes sequentially
     // with await. Event dedup in the transport layer prevents double-processing
     // with the persistent subscription.
+    const __fetchT0 = Date.now();
     await this.deps!.transport.fetchPendingEvents();
+    __span.mark('fetch-done', { durationMs: Date.now() - __fetchT0 });
 
     // Reload from storage to get a clean, consistent state.
     // Handlers save tokens during processing (with potentially different IDs for
     // V5 pending tokens vs finalized tokens). load() clears the in-memory map
     // and reloads from TXF + pending V5 storage, ensuring no duplicates.
+    const __loadT0 = Date.now();
     await this.load();
+    __span.mark('load-done', { durationMs: Date.now() - __loadT0 });
 
     // Identify newly added tokens
     const received: IncomingTransfer[] = [];
@@ -7616,11 +7663,20 @@ export class PaymentsModule {
       result.finalization = drain.finalization;
       result.finalizationDurationMs = drain.durationMs;
       result.timedOut = drain.timedOut;
+      __span.mark('finalize-done', {
+        durationMs: drain.durationMs,
+        timedOut: drain.timedOut,
+      });
     } else {
       // Non-finalize: submit commitments once (fire-and-forget style)
       result.finalization = await this.resolveUnconfirmed();
+      __span.mark('resolve-unconfirmed-done', {});
     }
 
+    __span.end({
+      transferCount: received.length,
+      timedOut: !!result.timedOut,
+    });
     return result;
   }
 
@@ -15125,12 +15181,25 @@ export class PaymentsModule {
   private async awaitAllProvidersDurable(timeoutMs = 60_000): Promise<boolean> {
     const providers = this.getTokenStorageProviders();
     if (providers.size === 0) return true;
+    // Issue #274: dominant §C.2 latency consumer per perf forensics. Span emits
+    // one debug line on exit with per-provider durations + final durable flag.
+    const __span = logger.time('payments:durability', 'awaitAllProvidersDurable', {
+      providers: providers.size,
+      timeoutMs,
+    });
     let allDurable = true;
     for (const [providerId, provider] of providers) {
       if (typeof provider.awaitNextFlush !== 'function') continue;
+      const __t0 = Date.now();
       try {
         await provider.awaitNextFlush(timeoutMs);
+        __span.mark(`provider:${providerId}`, { durationMs: Date.now() - __t0, ok: true });
       } catch (err) {
+        __span.mark(`provider:${providerId}`, {
+          durationMs: Date.now() - __t0,
+          ok: false,
+          err: err instanceof Error ? err.message : String(err),
+        });
         logger.warn(
           'Payments',
           `[AT-LEAST-ONCE] provider ${providerId} awaitNextFlush failed — Nostr event will NOT be acked, replayed on next reconnect:`,
@@ -15139,6 +15208,7 @@ export class PaymentsModule {
         allDurable = false;
       }
     }
+    __span.end({ allDurable });
     return allDurable;
   }
 
@@ -15170,6 +15240,13 @@ export class PaymentsModule {
     // try/finally ensures the counter balances on EVERY exit path
     // (early-return, thrown error, awaited rejection).
     this.inflightReceiveCount++;
+    // Issue #274 — per-event timing. Tracks senderTransportPubkey + outcome;
+    // the durable=false case directly correlates to the [AT-LEAST-ONCE]
+    // replay storm seen in §C.2 forensics.
+    const __span = logger.time('payments:receive:dispatch', 'handleIncomingTransfer', {
+      transferId: transfer.id?.slice(0, 16),
+      sender: transfer.senderTransportPubkey?.slice(0, 16),
+    });
     // At-least-once invariant: track whether the body completed without
     // error so the finally block can decide whether to await durability.
     // Default false — only flipped to true on the happy paths that
@@ -15656,6 +15733,18 @@ export class PaymentsModule {
       // this reaches 0, no inbound transfer is mid-pipeline and a
       // pre-flush drain can safely snapshot `this.tokens`.
       this.inflightReceiveCount--;
+      // Issue #274 — span coverage for the 15+ internal early-return
+      // paths inside the try block above (pool-rejected, payload-parse-
+      // failed, V6-dedup-skip, instant-split-orphan, NOSTR-first
+      // happy path, etc.). Without ending here, every one of those
+      // exits leaked the span. `Span.end()` is idempotent: when the
+      // main post-finally exits below run first they no-op this call.
+      // `outcome` is derived from the bodyCompleted / nothingToPerist
+      // flags the body maintains.
+      if (!bodyCompleted) __span.end({ outcome: 'body-failed-or-early-exit', durable: false });
+      else if (nothingToPerist) __span.end({ outcome: 'nothing-to-persist', durable: true });
+      // else: deferred until the awaitAllProvidersDurable call below,
+      // where we record the actual durable result.
     }
 
     // At-least-once invariant: if the body completed and persisted a
@@ -15664,7 +15753,9 @@ export class PaymentsModule {
     // uses our return value to gate `lastEventTs` advancement.
     if (!bodyCompleted) return false;
     if (nothingToPerist) return true;
-    return await this.awaitAllProvidersDurable(60_000);
+    const __durable = await this.awaitAllProvidersDurable(60_000);
+    __span.end({ outcome: 'awaited-durable', durable: __durable });
+    return __durable;
   }
 
   // ===========================================================================

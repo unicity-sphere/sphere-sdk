@@ -990,6 +990,18 @@ export class ProfileTokenStorageProvider
   async awaitNextFlush(timeoutMs = 30_000): Promise<void> {
     if (!this.initialized || !this.encryptionKey) return;
 
+    // Issue #274 — perf instrumentation. Entry log + duration mark on each
+    // iteration so operators can distinguish "first flush slow" from
+    // "runaway 4-iteration" pathologies. The body keeps its original
+    // structure (multiple returns + throws); the corresponding "exit" log
+    // is in the wrapping `awaitAllProvidersDurable` span's per-provider
+    // mark, which records the duration of this whole call.
+    logger.debug(
+      'profile:flush',
+      'awaitNextFlush enter',
+      { timeoutMs },
+    );
+
     const deadline = Date.now() + timeoutMs;
     const remainingMs = (): number => Math.max(0, deadline - Date.now());
 
