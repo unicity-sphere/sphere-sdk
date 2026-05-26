@@ -361,7 +361,7 @@ export async function migrateTokenStorage(
   if (!opts.force && opts.markerStorage) {
     try {
       const existing = await opts.markerStorage.get(markerKey);
-      if (existing) {
+      if (existing && isHonoredMarkerPayload(existing)) {
         logger.debug(
           'TokenStorageMigration',
           `marker present (${markerKey}); skipping (use force:true to override)`,
@@ -500,8 +500,23 @@ export async function migrateTokenStorage(
             // it; only spend selection / getAssets() will skip it.
             const tokenId = outcome.key.startsWith('_') ? outcome.key.slice(1) : outcome.key;
             const archivedKey = archivedKeyFromTokenId(tokenId);
-            (targetData as unknown as Record<string, unknown>)[archivedKey] = outcome.txf;
-            delete (targetData as unknown as Record<string, unknown>)[outcome.key];
+            const slot = targetData as unknown as Record<string, unknown>;
+            // Steelman fix (collision-safe): if the wallet ALREADY has
+            // an archived entry for this tokenId (legitimate after a
+            // reissue cycle), do NOT overwrite — the existing archived
+            // payload is its own historical record. Leave the active
+            // slot untouched in that case so the next load surfaces
+            // the apparent conflict (the disposition engine will
+            // resolve it via the standard archived/active rules).
+            if (slot[archivedKey] !== undefined) {
+              logger.debug(
+                'TokenStorageMigration',
+                `oracle reported ${outcome.key} spent, but target already has ${archivedKey} — leaving in active slot to avoid clobbering existing archived payload`,
+              );
+              continue;
+            }
+            slot[archivedKey] = outcome.txf;
+            delete slot[outcome.key];
             spentTokensArchived += 1;
           }
         }
@@ -509,17 +524,22 @@ export async function migrateTokenStorage(
     }
   }
 
-  // Refresh the `_meta` slot so the target carries the migration
-  // timestamp (the legacy save() honors whatever `_meta` we hand it;
-  // the Profile save() uses the existing _meta path). Without an
-  // explicit refresh the target inherits the source's `updatedAt`,
-  // which can look stale to operators inspecting the target.
-  if (targetData._meta) {
-    targetData._meta = {
-      ...targetData._meta,
-      updatedAt: Date.now(),
-    };
-  }
+  // Refresh / synthesize the `_meta` slot. The Profile and legacy
+  // providers always populate `_meta` on load(), so the source path
+  // typically already provides it. We defensively synthesize the
+  // four required TxfMeta fields here so a buggy source (or an
+  // imported file with a partial `_meta`) doesn't propagate
+  // malformed metadata to the target. The `updatedAt` is always
+  // refreshed to the migration time so operators can distinguish
+  // the post-migration meta from the source's pre-migration meta.
+  const sourceMeta = targetData._meta ?? ({} as Partial<TxfStorageDataBase['_meta']>);
+  targetData._meta = {
+    version: sourceMeta.version ?? 1,
+    address: sourceMeta.address ?? (opts.identity.l1Address ?? ''),
+    formatVersion: sourceMeta.formatVersion ?? '2.0',
+    ipnsName: sourceMeta.ipnsName,
+    updatedAt: Date.now(),
+  };
 
   // ── Phase 4: dry-run early exit ────────────────────────────────────────
   const finalBuckets = classifyBuckets(targetData);
@@ -777,6 +797,48 @@ export async function clearTokenStorageMigrationMarker(opts: {
  * with `:` so the marker is per-address even when wallets manage
  * multiple HD addresses.
  */
+/**
+ * Decide whether a stored marker value should be HONORED as
+ * "migration complete." Honored markers short-circuit the migration;
+ * non-honored markers cause the helper to re-run.
+ *
+ * The honored set is:
+ *   - any value missing the `v` field (legacy / pre-versioned marker
+ *     — treated as v=1 for backward compat)
+ *   - any value whose `v` is ≤ {@link TOKEN_STORAGE_MIGRATION_MARKER_VERSION}
+ *
+ * Markers from a FUTURE schema version are NOT honored — a v:2
+ * marker from a newer SDK may describe data the older v:1 reader
+ * cannot represent, so the safer behavior is to re-run the
+ * migration (which is data-idempotent) than to assume forward-
+ * compat. Steelman finding 2 (PR #289 review).
+ */
+function isHonoredMarkerPayload(raw: string): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    // Pre-versioned plain-string marker (or corruption). Treat as
+    // honored — preserves backward-compat for any consumer who
+    // wrote a non-JSON marker through an older API surface.
+    return true;
+  }
+  if (parsed === null || typeof parsed !== 'object') {
+    // Same backward-compat reasoning.
+    return true;
+  }
+  const obj = parsed as { v?: unknown };
+  if (obj.v === undefined) {
+    // Pre-versioned JSON marker — honored.
+    return true;
+  }
+  if (typeof obj.v !== 'number' || !Number.isFinite(obj.v) || obj.v < 0) {
+    // Malformed `v` field — re-run is the safe choice.
+    return false;
+  }
+  return obj.v <= TOKEN_STORAGE_MIGRATION_MARKER_VERSION;
+}
+
 function markerKeyFor(direction: MigrationDirection, addressId: string): string {
   const prefix =
     direction === 'legacy-to-profile'

@@ -930,6 +930,163 @@ describe('migrateTokenStorage — edge cases', () => {
   });
 });
 
+describe('migrateTokenStorage — steelman fixes (PR #289 review)', () => {
+  it('spent-token demote does NOT overwrite a pre-existing archived entry', async () => {
+    // Source has BOTH an active token AND an archived entry for the
+    // same tokenId — legitimate after a reissue cycle.
+    const source = createMockProvider({
+      _meta: {
+        version: 1,
+        address: IDENTITY.l1Address,
+        formatVersion: '2.0',
+        updatedAt: 1,
+      },
+      [`_${TOKEN_A}`]: buildTxf(TOKEN_A, STATE_HASH_A),
+      [`archived-${TOKEN_A}`]: buildTxf(TOKEN_A, STATE_HASH_B), // distinct state
+    } as TxfStorageDataBase);
+    const target = createMockProvider(null);
+    const oracle = {
+      isSpent: vi.fn(async () => true), // reports active spent
+    } as unknown as OracleProvider;
+
+    const result = await migrateTokenStorage({
+      source,
+      target,
+      direction: 'legacy-to-profile',
+      identity: IDENTITY,
+      oracle,
+    });
+    expect(result.success).toBe(true);
+    // The demote is REFUSED because target already had archived-<TOKEN_A>.
+    // Token stays in active slot; archived payload preserved.
+    expect(result.spentTokensArchived).toBe(0);
+    const targetData = target._lastSavedData!;
+    expect(targetData[`_${TOKEN_A}`]).toBeDefined();
+    expect(targetData[`archived-${TOKEN_A}`]).toBeDefined();
+    // Original archived payload is preserved (stateHash=STATE_HASH_B).
+    const archivedPayload = targetData[`archived-${TOKEN_A}`] as TxfToken;
+    expect(archivedPayload.genesis.inclusionProof.authenticator.stateHash).toBe(STATE_HASH_B);
+  });
+
+  it('honors v=1 marker', async () => {
+    const source = createMockProvider(buildSourceData({ active: [TOKEN_A] }));
+    const target = createMockProvider(null);
+    const marker = createMockKvStorage();
+    const markerKey = `legacy_migration_v1_complete:${ADDRESS_ID}`;
+    marker._store.set(
+      markerKey,
+      JSON.stringify({
+        v: TOKEN_STORAGE_MIGRATION_MARKER_VERSION,
+        direction: 'legacy-to-profile',
+        addressId: ADDRESS_ID,
+        completedAt: 0,
+      }),
+    );
+    const result = await migrateTokenStorage({
+      source,
+      target,
+      direction: 'legacy-to-profile',
+      identity: IDENTITY,
+      markerStorage: marker,
+    });
+    expect(result.skippedDueToMarker).toBe(true);
+  });
+
+  it('does NOT honor a future-version marker (v=2)', async () => {
+    const source = createMockProvider(buildSourceData({ active: [TOKEN_A] }));
+    const target = createMockProvider(null);
+    const marker = createMockKvStorage();
+    const markerKey = `legacy_migration_v1_complete:${ADDRESS_ID}`;
+    marker._store.set(
+      markerKey,
+      JSON.stringify({ v: 2, direction: 'legacy-to-profile', addressId: ADDRESS_ID }),
+    );
+    const result = await migrateTokenStorage({
+      source,
+      target,
+      direction: 'legacy-to-profile',
+      identity: IDENTITY,
+      markerStorage: marker,
+    });
+    // v=2 marker NOT honored → migration runs.
+    expect(result.skippedDueToMarker).toBe(false);
+    expect(result.tokensMigrated).toBe(1);
+  });
+
+  it('honors pre-versioned (non-JSON or no `v` field) markers for backward compat', async () => {
+    // Case 1: non-JSON marker (plain string)
+    const source1 = createMockProvider(buildSourceData({ active: [TOKEN_A] }));
+    const target1 = createMockProvider(null);
+    const marker1 = createMockKvStorage();
+    marker1._store.set(`legacy_migration_v1_complete:${ADDRESS_ID}`, 'true');
+    const result1 = await migrateTokenStorage({
+      source: source1,
+      target: target1,
+      direction: 'legacy-to-profile',
+      identity: IDENTITY,
+      markerStorage: marker1,
+    });
+    expect(result1.skippedDueToMarker).toBe(true);
+
+    // Case 2: JSON marker without `v` field
+    const source2 = createMockProvider(buildSourceData({ active: [TOKEN_A] }));
+    const target2 = createMockProvider(null);
+    const marker2 = createMockKvStorage();
+    marker2._store.set(
+      `legacy_migration_v1_complete:${ADDRESS_ID}`,
+      JSON.stringify({ direction: 'legacy-to-profile', addressId: ADDRESS_ID }),
+    );
+    const result2 = await migrateTokenStorage({
+      source: source2,
+      target: target2,
+      direction: 'legacy-to-profile',
+      identity: IDENTITY,
+      markerStorage: marker2,
+    });
+    expect(result2.skippedDueToMarker).toBe(true);
+  });
+
+  it('does NOT honor a marker with malformed `v` (e.g., string)', async () => {
+    const source = createMockProvider(buildSourceData({ active: [TOKEN_A] }));
+    const target = createMockProvider(null);
+    const marker = createMockKvStorage();
+    marker._store.set(
+      `legacy_migration_v1_complete:${ADDRESS_ID}`,
+      JSON.stringify({ v: 'one' }),
+    );
+    const result = await migrateTokenStorage({
+      source,
+      target,
+      direction: 'legacy-to-profile',
+      identity: IDENTITY,
+      markerStorage: marker,
+    });
+    expect(result.skippedDueToMarker).toBe(false);
+    expect(result.tokensMigrated).toBe(1);
+  });
+
+  it('synthesizes _meta when source provides none', async () => {
+    // Construct a source with NO _meta field (a malformed source).
+    const source = createMockProvider({
+      [`_${TOKEN_A}`]: buildTxf(TOKEN_A),
+    } as unknown as TxfStorageDataBase);
+    const target = createMockProvider(null);
+    const result = await migrateTokenStorage({
+      source,
+      target,
+      direction: 'legacy-to-profile',
+      identity: IDENTITY,
+    });
+    expect(result.success).toBe(true);
+    const targetData = target._lastSavedData!;
+    expect(targetData._meta).toBeDefined();
+    expect(targetData._meta.version).toBe(1);
+    expect(targetData._meta.address).toBe(IDENTITY.l1Address);
+    expect(targetData._meta.formatVersion).toBe('2.0');
+    expect(typeof targetData._meta.updatedAt).toBe('number');
+  });
+});
+
 describe('migration marker helpers', () => {
   it('isTokenStorageMigrationComplete reflects marker presence', async () => {
     const marker = createMockKvStorage();
