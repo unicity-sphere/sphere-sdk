@@ -2846,6 +2846,11 @@ export class Sphere {
       );
     }
 
+    // Issue #285 — per-address CidRefStore. Same null semantics as the
+    // primary load() path (see buildCidRefStoreOrNull). All modules
+    // sharing this storage provider use the same CidRefStore instance.
+    const cidRefStore = this.buildCidRefStoreOrNull();
+
     // Initialize with address-specific identity and per-address transport
     payments.initialize({
       identity,
@@ -2861,6 +2866,8 @@ export class Sphere {
       // all addresses; the publisher is identity-independent).
       publishToIpfs: this._publishToIpfs ?? undefined,
       cidFetchGateways: this._cidFetchGateways ?? undefined,
+      // Issue #285 — CID-ref store for pending V5 token storage (fat-data).
+      cidRefStore: cidRefStore ?? undefined,
       // Issue #255 Problem A — HD-index recovery hooks for
       // finalizeTransferToken. See initializeModules() above for full
       // rationale.
@@ -2878,12 +2885,16 @@ export class Sphere {
       storage: this._storage,
       transport: addressTransport,
       emitEvent,
+      // Issue #285 — CID-ref store for per-address DM cache.
+      cidRefStore: cidRefStore ?? undefined,
     });
 
     groupChat?.initialize({
       identity,
       storage: this._storage,
       emitEvent,
+      // Issue #285 — CID-ref store for group/member/messages/processedEvents.
+      cidRefStore: cidRefStore ?? undefined,
     });
 
     market?.initialize({
@@ -2914,6 +2925,8 @@ export class Sphere {
           on: this.on.bind(this),
           storage: this._storage,
           communications,
+          // Issue #285 — CID-ref store for invoice ledger.
+          cidRefStore: cidRefStore ?? undefined,
         });
       } else {
         logger.warn('Sphere', 'Accounting module enabled but no token storage available — disabling');
@@ -3184,6 +3197,50 @@ export class Sphere {
         'Sphere',
         `wireProfilePersistedSendStorage threw — PaymentsModule falls back to legacy KV outbox: ${safeErrorMessage(err)}`,
       );
+    }
+  }
+
+  /**
+   * Issue #285 — Construct a {@link CidRefStore} via the storage
+   * provider's `buildCidRefStore()` helper when available.
+   *
+   * The four fat-data OpLog write sites
+   * (`CommunicationsModule._doSave`, `GroupChatModule.persistMembers`,
+   * `GroupChatModule.persistProcessedEvents`,
+   * `GroupChatModule.persistMessages`) — plus `PaymentsModule` pending
+   * V5 tokens and `AccountingModule` invoice ledger — accept an
+   * optional CidRefStore via their `initialize()` deps. Without one,
+   * each falls through to inline JSON storage which routinely exceeds
+   * the 128 KiB Profile OpLog cap (3.98 MB observed for the
+   * `announcements` group's `groupChatMembers` blob).
+   *
+   * Best-effort: when the storage provider is not a
+   * `ProfileStorageProvider`, when encryption is disabled, when the
+   * identity has not been set yet, or when no IPFS gateways are
+   * configured, this returns `null` and the modules retain their
+   * legacy inline behaviour (still bounded by the 128 KiB cap; the
+   * existing PAYLOAD-SIZE soft-warn will fire on offending writes).
+   *
+   * The returned store is cached per-Sphere-instance. Identity
+   * rotation (`load()` switching to a different address) MUST
+   * `_cidRefStore = null` to force a rebuild — the captured
+   * encryption key is the one at construction time.
+   */
+  private buildCidRefStoreOrNull(): import('../profile/cid-ref-store').CidRefStore | null {
+    try {
+      const storageWithBuilder = this._storage as unknown as {
+        buildCidRefStore?: () => import('../profile/cid-ref-store').CidRefStore | null;
+      };
+      if (typeof storageWithBuilder.buildCidRefStore !== 'function') {
+        return null;
+      }
+      return storageWithBuilder.buildCidRefStore();
+    } catch (err) {
+      logger.warn(
+        'Sphere',
+        `buildCidRefStoreOrNull threw — modules fall back to inline JSON storage: ${safeErrorMessage(err)}`,
+      );
+      return null;
     }
   }
 
@@ -5745,6 +5802,12 @@ export class Sphere {
       );
     }
 
+    // Issue #285 — build the per-wallet CidRefStore once (lazy: returns
+    // null if the storage provider is not Profile, encryption is off,
+    // identity is not set yet, or IPFS gateways are not configured).
+    // Pass it into every module that has a fat-data OpLog write site.
+    const cidRefStore = this.buildCidRefStoreOrNull();
+
     this._payments.initialize({
       identity: this._identity!,
       storage: this._storage,
@@ -5762,6 +5825,8 @@ export class Sphere {
       // (under cap) or rejects (over cap / force-cid).
       publishToIpfs: this._publishToIpfs ?? undefined,
       cidFetchGateways: this._cidFetchGateways ?? undefined,
+      // Issue #285 — CID-ref store for pending V5 token storage (fat-data).
+      cidRefStore: cidRefStore ?? undefined,
       // Issue #255 Problem A — HD-index recovery hooks for
       // finalizeTransferToken. Only wired when a master key is
       // available (HD derivation requires it); without it,
@@ -5780,12 +5845,17 @@ export class Sphere {
       storage: this._storage,
       transport: moduleTransport,
       emitEvent,
+      // Issue #285 — CID-ref store for the per-address DM cache.
+      cidRefStore: cidRefStore ?? undefined,
     });
 
     this._groupChat?.initialize({
       identity: this._identity!,
       storage: this._storage,
       emitEvent,
+      // Issue #285 — CID-ref store for group/member/messages/processedEvents
+      // (the four GroupChat fat-data write sites flagged in #285).
+      cidRefStore: cidRefStore ?? undefined,
     });
 
     this._market?.initialize({
@@ -5816,6 +5886,9 @@ export class Sphere {
           on: this.on.bind(this),
           storage: this._storage,
           communications: this._communications,
+          // Issue #285 — CID-ref store for invoice ledger (per-invoice
+          // Pattern A pin via §8.3).
+          cidRefStore: cidRefStore ?? undefined,
         });
       } else {
         logger.warn('Sphere', 'Accounting module enabled but no token storage available — disabling');

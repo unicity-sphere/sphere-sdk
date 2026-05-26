@@ -961,4 +961,174 @@ describe('GroupChatModule — CID-refs persistence (commit 7b.2)', () => {
     expect((mod as any)._lastPinnedMessagesByGroup.has('g2')).toBe(false);
     expect((mod as any)._lastPinnedMessagesByGroup.has('g1')).toBe(true);
   });
+
+  // ---------------------------------------------------------------------------
+  // processedEvents — NIP-29 event-id dedup ledger (#285)
+  //
+  // Production observed 263 KB at this key after routine sphere.telco use
+  // and 660 KB at the 10k-entry size cap — both blow the 128 KiB OpLog
+  // hard limit. The migration uses Pattern A ENCRYPTED (per-wallet view
+  // of which events were processed — a privacy footprint, dedup across
+  // wallets has zero value).
+  // ---------------------------------------------------------------------------
+
+  it('processedEvents: writes ENCRYPTED CID ref (per-wallet, no plaintext dedup)', async () => {
+    const { fakeStore, ipfsStore } = makeFakeCidRefStore();
+    const mod = new GroupChatModule();
+    mod.initialize(createDeps(storage, fakeStore));
+
+    // No groups needed — processedEvents is module-global.
+    await mod.load();
+    (mod as any).processedEventIds = new Set(['evt1', 'evt2', 'evt3']);
+    await (mod as any).persistProcessedEvents();
+
+    const kv = storage._data.get(STORAGE_KEYS_ADDRESS.GROUP_CHAT_PROCESSED_EVENTS)!;
+    const refEnv = JSON.parse(kv);
+    expect(refEnv.v).toBe(1);
+    expect(refEnv.cid).toMatch(/^baf/);
+    // Encrypted mode → no `enc` field serialized (default is encrypted).
+    expect(refEnv.enc).toBeUndefined();
+    expect(getStoredMode(ipfsStore, refEnv.cid)).toBe(true);
+    // Pinned content is the array form of the Set.
+    const content = JSON.parse(new TextDecoder().decode(ipfsStore.get(refEnv.cid)!.bytes));
+    expect(new Set(content)).toEqual(new Set(['evt1', 'evt2', 'evt3']));
+  });
+
+  it('processedEvents: identical Set across persists reuses memoised ref (no extra pin)', async () => {
+    const { fakeStore } = makeFakeCidRefStore();
+    const mod = new GroupChatModule();
+    mod.initialize(createDeps(storage, fakeStore));
+    await mod.load();
+
+    (mod as any).processedEventIds = new Set(['evtA', 'evtB']);
+    await (mod as any).persistProcessedEvents();
+    expect(fakeStore.pinJson).toHaveBeenCalledTimes(1);
+
+    // Persist again — no new event → memo hit, no re-pin.
+    await (mod as any).persistProcessedEvents();
+    expect(fakeStore.pinJson).toHaveBeenCalledTimes(1);
+
+    // Adding an event invalidates the memo → one more pin.
+    (mod as any).processedEventIds.add('evtC');
+    await (mod as any).persistProcessedEvents();
+    expect(fakeStore.pinJson).toHaveBeenCalledTimes(2);
+  });
+
+  it('processedEvents: load reads via CID ref (requireEncrypted strict)', async () => {
+    const { fakeStore } = makeFakeCidRefStore();
+    const mod = new GroupChatModule();
+    mod.initialize(createDeps(storage, fakeStore));
+
+    // Pre-seed: pin events and write the ref to the KV.
+    const events = ['evtX', 'evtY', 'evtZ'];
+    const ref = await fakeStore.pinJson(events);
+    storage._data.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_PROCESSED_EVENTS, JSON.stringify(ref));
+
+    await mod.load();
+
+    expect((mod as any).processedEventIds).toEqual(new Set(events));
+    // Verify strict mode was demanded on the fetch.
+    expect(fakeStore.fetchJson).toHaveBeenCalledWith(
+      expect.any(Object),
+      { requireEncrypted: true },
+    );
+  });
+
+  it('processedEvents: load tolerates legacy inline JSON (dual-read backward compat)', async () => {
+    const { fakeStore } = makeFakeCidRefStore();
+    const mod = new GroupChatModule();
+    mod.initialize(createDeps(storage, fakeStore));
+
+    // Pre-existing wallet — legacy inline array at the key.
+    const events = ['legacy1', 'legacy2'];
+    storage._data.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_PROCESSED_EVENTS, JSON.stringify(events));
+
+    await mod.load();
+
+    expect((mod as any).processedEventIds).toEqual(new Set(events));
+    // CID-ref fetch path NOT taken — legacy values are plain JSON.
+    expect(fakeStore.fetchJson).not.toHaveBeenCalled();
+  });
+
+  it('processedEvents: load CID-ref-without-store throws CID_REF_UNREADABLE', async () => {
+    const { fakeStore } = makeFakeCidRefStore();
+    const ref = await fakeStore.pinJson(['evt']);
+    storage._data.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_PROCESSED_EVENTS, JSON.stringify(ref));
+
+    // Build the module WITHOUT cidRefStore.
+    const mod = new GroupChatModule();
+    mod.initialize(createDeps(storage, undefined));
+
+    await expect(mod.load()).rejects.toMatchObject({ code: 'CID_REF_UNREADABLE' });
+  });
+
+  it('processedEvents: load CID-ref fetch failure starts fresh (best-effort)', async () => {
+    const { fakeStore } = makeFakeCidRefStore();
+    // Build a ref that points at a CID NOT in the fake store — fetch will throw.
+    const orphanRef = {
+      v: 1,
+      cid: 'bafkreieyqvmjr6zq5adijx2kzlcfmdvexmy2i6knyj4w2pybmzxmvg6bze',
+      size: 32,
+      ts: Date.now(),
+    };
+    storage._data.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_PROCESSED_EVENTS, JSON.stringify(orphanRef));
+
+    const mod = new GroupChatModule();
+    mod.initialize(createDeps(storage, fakeStore));
+
+    // load() must NOT throw — falling back to empty ledger is the right
+    // behaviour because relay re-delivery repopulates idempotently.
+    await mod.load();
+    expect((mod as any).processedEventIds).toEqual(new Set());
+  });
+
+  it('processedEvents: legacy fallback when no cidRefStore — inline JSON write (still under cap when small)', async () => {
+    // No cidRefStore → write inline. Verifies the legacy code path still
+    // functions (used by tests/fallback environments without IPFS).
+    const mod = new GroupChatModule();
+    mod.initialize(createDeps(storage, undefined));
+    await mod.load();
+    (mod as any).processedEventIds = new Set(['e1', 'e2']);
+    await (mod as any).persistProcessedEvents();
+
+    const kv = storage._data.get(STORAGE_KEYS_ADDRESS.GROUP_CHAT_PROCESSED_EVENTS)!;
+    // Plain JSON array — NOT a CID-ref envelope.
+    const parsed = JSON.parse(kv);
+    expect(Array.isArray(parsed)).toBe(true);
+    expect(new Set(parsed)).toEqual(new Set(['e1', 'e2']));
+  });
+
+  it('processedEvents: large 10k-entry ledger (~660 KB) round-trips via CID ref under the 128 KiB cap', async () => {
+    // Stress-test the #285 BLOCKING case: at 10k entries the legacy inline
+    // payload was ~660 KB (5× over the 128 KiB OpLog cap). Through the
+    // CID-ref path the OpLog entry shrinks to the ~150-byte ref envelope
+    // while the full payload lives at IPFS. This is the production-realistic
+    // size we needed to migrate.
+    const { fakeStore, ipfsStore } = makeFakeCidRefStore();
+    const mod = new GroupChatModule();
+    mod.initialize(createDeps(storage, fakeStore));
+    await mod.load();
+
+    // 10000 entries × 64-char IDs ≈ 660 KB plaintext.
+    const big = new Set<string>();
+    for (let i = 0; i < 10_000; i++) {
+      big.add(`evt_${i.toString(16).padStart(60, '0')}`);
+    }
+    (mod as any).processedEventIds = big;
+    await (mod as any).persistProcessedEvents();
+
+    const kvRaw = storage._data.get(STORAGE_KEYS_ADDRESS.GROUP_CHAT_PROCESSED_EVENTS)!;
+    // The OpLog entry itself is now a small CID-ref envelope — under 1 KiB.
+    expect(kvRaw.length).toBeLessThan(1024);
+    const refEnv = JSON.parse(kvRaw);
+    expect(refEnv.v).toBe(1);
+    // The big payload now lives at IPFS. Verify size is multiple-MB-scale.
+    const stored = ipfsStore.get(refEnv.cid)!;
+    expect(stored.bytes.byteLength).toBeGreaterThan(500_000);
+
+    // Round-trip — wipe in-memory state and reload from the seeded KV.
+    (mod as any).processedEventIds = new Set();
+    await mod.load();
+    expect((mod as any).processedEventIds.size).toBe(10_000);
+  });
 });

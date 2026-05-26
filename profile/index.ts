@@ -88,6 +88,26 @@ export { ProfileStorageProvider } from './profile-storage-provider';
 export { ProfileTokenStorageProvider } from './profile-token-storage-provider';
 
 // =============================================================================
+// CID Reference Store (PROFILE-CID-REFERENCES.md §2)
+// =============================================================================
+//
+// Public primitive for migrating fat OpLog payloads to IPFS-pinned CID
+// references. The four in-tree write sites (DM cache,
+// `groupChatGroups`/`groupChatMembers`/`groupChatMessages`/
+// `groupChatProcessedEvents`, pending V5 tokens, accounting invoice
+// ledger) wire this through their module dependencies. External
+// consumers (#286 token-storage migration, future per-module migrations)
+// instantiate it via `ProfileStorageProvider.buildCidRefStore()`.
+
+export { CidRefStore, CID_REF_SCHEMA_VERSION } from './cid-ref-store';
+export type {
+  CidRef,
+  CidRefStoreOptions,
+  PinOptions,
+  FetchOptions,
+} from './cid-ref-store';
+
+// =============================================================================
 // IPFS Client
 // =============================================================================
 

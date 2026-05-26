@@ -31,6 +31,7 @@ import {
 } from './finalization-queue-storage-adapter';
 import { OutboxWriter } from './outbox-writer';
 import { SentLedgerWriter } from './sent-ledger-writer';
+import { CidRefStore } from './cid-ref-store';
 import { Lamport } from './lamport';
 import { buildLocalEntry } from './oplog-entry';
 import { getEnvelopePayload } from './oplog-envelope-io';
@@ -94,11 +95,16 @@ import { deriveOriginForType } from './aggregator-pointer/originated-tag';
  * >8 KiB should almost certainly be stored as a CID reference (Pattern A
  * in PROFILE-CID-REFERENCES.md) rather than inline in the OpLog.
  *
- * A correctly-migrated write site produces envelopes of ~200 bytes
- * (encrypted CID ref), so the threshold has a wide margin before it fires.
- * If you see this warning in production logs: either a new write site was
- * added without CID-ref migration, or a legacy wallet is replaying unmigrated
- * inline data — both actionable signals.
+ * **Post-#285:** Every known fat-data write site (CommunicationsModule DM
+ * cache, GroupChatModule groups/members/messages/processedEvents,
+ * PaymentsModule pending V5 tokens, AccountingModule invoice ledger) is
+ * wired through `ProfileStorageProvider.buildCidRefStore()` →
+ * `CidRefStore.pinJson` and produces a ~200-byte CID-reference envelope
+ * regardless of the underlying content's plaintext size. Once a wallet
+ * has been initialized via `Sphere.init({ profile: ... })` after #285
+ * lands, the soft-warn becomes the actionable signal for "you added a
+ * NEW write site that needs CID-ref migration" or "a legacy wallet is
+ * replaying pre-#285 inline data."
  */
 const PAYLOAD_SIZE_WARN_BYTES = 8 * 1024;
 
@@ -1114,6 +1120,56 @@ export class ProfileStorageProvider implements StorageProvider {
       addressId,
       lamport: lamport ?? new Lamport(),
       notifyProfileDirty: this.profileDirtyNotifier ?? undefined,
+    });
+  }
+
+  /**
+   * Issue #285 — Build a {@link CidRefStore} bound to this provider's
+   * IPFS gateway list and profile encryption key. The store pins fat
+   * OpLog payloads (DM caches, group state, processed-event ledgers,
+   * pending V5 token lists) to IPFS and returns a small CID-reference
+   * envelope to embed in the OpLog (PROFILE-CID-REFERENCES.md §2).
+   *
+   * Without this primitive the four module write sites (
+   * `CommunicationsModule._doSave`, `GroupChatModule.persistMembers`,
+   * `GroupChatModule.persistProcessedEvents`,
+   * `GroupChatModule.persistMessages`) inline their full JSON in the
+   * OpLog and routinely exceed the 128 KiB cap (issue #285).
+   *
+   * Returns null when:
+   *  - encryption is disabled (no key to encrypt the IPFS payload), OR
+   *  - the encryption key has not been derived yet (setIdentity
+   *    pending — the caller MUST retry after `setIdentity`), OR
+   *  - no IPFS gateways are configured (CidRefStore mandates at least
+   *    one gateway; without one, pins cannot be persisted).
+   *
+   * Lifecycle: callers SHOULD cache the returned store and rebuild via
+   * this method on identity rotation (the captured encryption key is
+   * the one at construction time).
+   *
+   * Wired into the four module write sites via Sphere's `initialize()`
+   * calls (`Sphere.wireProfileCidRefStore`). External consumers
+   * (e.g., #286 token-storage migration) can call this directly through
+   * the public profile/index export.
+   */
+  buildCidRefStore(): CidRefStore | null {
+    if (!this.encryptionEnabled) {
+      this.log('buildCidRefStore: encryption disabled — returning null');
+      return null;
+    }
+    if (this.profileEncryptionKey === null) {
+      this.log('buildCidRefStore: encryption key not yet derived (setIdentity pending) — returning null');
+      return null;
+    }
+    const gateways = this.options?.config?.ipfsGateways;
+    if (!gateways || gateways.length === 0) {
+      this.log('buildCidRefStore: no IPFS gateways configured — returning null');
+      return null;
+    }
+    return new CidRefStore({
+      gateways: [...gateways],
+      encryptionKey: this.profileEncryptionKey,
+      log: this.debug ? (msg) => this.log(msg) : undefined,
     });
   }
 
