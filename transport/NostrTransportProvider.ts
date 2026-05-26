@@ -64,6 +64,7 @@ import type { WebSocketFactory, UUIDGenerator } from './websocket';
 import { defaultUUIDGenerator } from './websocket';
 import {
   DEFAULT_NOSTR_RELAYS,
+  LIMITS,
   NOSTR_EVENT_KINDS,
   STORAGE_KEYS_GLOBAL,
   TIMEOUTS,
@@ -143,11 +144,43 @@ export class NostrTransportProvider implements TransportProvider {
   private nostrClient: NostrClient | null = null;
   private mainSubscriptionId: string | null = null;
 
-  // Event handlers
+  // Event handlers — two-tier dedup (issue #275).
+  //
+  // `processedEventIds` is the PERSISTED set of event IDs that we have
+  // successfully processed (i.e., the wallet cursor advanced past them).
+  // It is hydrated from KV storage on connect/fetchPendingEvents so
+  // cross-process CLI invocations do not re-walk the relay backlog. The
+  // §C soak forensics in issue #275 showed 169 dispatches across 15
+  // unique event IDs because this set previously lived in-process only
+  // — 71.5% of §C wall-clock was wasted on duplicate dispatch.
+  //
+  // We MUST NOT add to this set before the event handler completes
+  // successfully: doing so would mask the at-least-once retry that
+  // TOKEN_TRANSFER's durability gate depends on (a failed event would
+  // be persisted as "processed" and never re-tried across restarts).
+  //
+  // `inFlightEventIds` is the IN-MEMORY set used for concurrent-arrival
+  // dedup: the same relay event may be delivered via multiple
+  // subscriptions (wallet sub + chat sub) within the same process. It
+  // is never persisted; entries are removed in the `finally` block of
+  // `handleEvent` so the second arrival short-circuits while the first
+  // is still in flight.
   private processedEventIds = new Set<string>();
+  private inFlightEventIds = new Set<string>();
 
   /**
-   * Issue #272 — per-event failure cooldown ledger for TOKEN_TRANSFER
+   * Issue #275 — debounce timer for persisting `processedEventIds` and
+   * `failedEventCooldowns`. Coalesces a burst of EOSE-replay arrivals
+   * into a single storage write. Set to `LIMITS.PROCESSED_EVENT_IDS_FLUSH_MS`.
+   */
+  private persistDedupTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Reentrancy guard so concurrent schedules don't race the in-flight write. */
+  private persistDedupInFlight: Promise<void> | null = null;
+  /** True once dedup state has been hydrated from storage; gates re-hydration. */
+  private dedupHydrated = false;
+
+  /**
+   * Issue #272 + #275 — per-event failure cooldown ledger for TOKEN_TRANSFER
    * replays. When `handleIncomingTransfer` returns `false` (the at-
    * least-once gate refused the ack), we record an exponential cool-
    * down so the relay-paced replay storm cannot busy-spin the
@@ -174,9 +207,12 @@ export class NostrTransportProvider implements TransportProvider {
    *     replay floods. Eviction is single-victim per insert when at
    *     capacity (cheap; no full sort).
    *
-   * Not persisted across process restarts (intentional — a fresh
-   * process gets a fresh chance, and the `processedEventIds` dedup
-   * still prevents double-processing of an already-acked event).
+   * Issue #275: this map is now PERSISTED across process restarts so
+   * the bounded replay budget accumulates across CLI invocations
+   * instead of resetting to zero per-process. Without persistence, a
+   * persistently-failing TOKEN_TRANSFER could replay across CLI
+   * sessions indefinitely because every fresh process saw `attempts=1`
+   * and never reached the budget exhaustion threshold.
    */
   private failedEventCooldowns = new Map<
     string,
@@ -433,6 +469,24 @@ export class NostrTransportProvider implements TransportProvider {
   }
 
   async disconnect(): Promise<void> {
+    // Issue #275 — flush any pending dedup writes before tearing down
+    // the connection. Without this, a process exit that catches the
+    // tail of a 200ms debounce window would lose the latest
+    // `processedEventIds` adds and force the next process to re-walk
+    // the same relay backlog. The flush is best-effort; we swallow
+    // errors so disconnect remains robust.
+    if (this.persistDedupTimer) {
+      clearTimeout(this.persistDedupTimer);
+      this.persistDedupTimer = null;
+    }
+    if (this.storage && this.keyManager) {
+      try {
+        await this.persistDedupNow();
+      } catch (err) {
+        logger.debug('Nostr', 'disconnect: flush of persisted dedup failed:', err);
+      }
+    }
+
     if (this.nostrClient) {
       this.nostrClient.disconnect();
       this.nostrClient = null;
@@ -578,9 +632,18 @@ export class NostrTransportProvider implements TransportProvider {
     // Clear per-address state so stale dedup entries from previous address
     // don't block legitimate events for the new address.
     this.processedEventIds.clear();
+    this.inFlightEventIds.clear();
+    this.failedEventCooldowns.clear();
+    this.dedupHydrated = false;
     this.lastEventTs = 0;
     this.lastDmEventTs = 0;
     this.fallbackDmSince = null;
+    // Cancel any pending debounced persist — the previous identity's
+    // state must not leak into the new identity's storage namespace.
+    if (this.persistDedupTimer) {
+      clearTimeout(this.persistDedupTimer);
+      this.persistDedupTimer = null;
+    }
 
     // Create NostrKeyManager from private key.
     // Steelman³³ warning: strict hex decode — Buffer.from(_, 'hex')
@@ -826,6 +889,12 @@ export class NostrTransportProvider implements TransportProvider {
             // `undefined` is the legacy "no opinion" contract → durable.
             if (result !== false) {
               this.updateLastEventTimestamp(createdAtSec);
+              // Issue #275 — mark the buffered event as processed so
+              // cross-process replays short-circuit. Without this, the
+              // pre-Mux buffered events (which never enter handleEvent's
+              // success branches) would not be persisted in the dedup
+              // set, and every fresh CLI invocation would re-walk them.
+              this.markEventProcessed(transfer.id);
             } else {
               logger.debug(
                 'Nostr',
@@ -1556,12 +1625,20 @@ export class NostrTransportProvider implements TransportProvider {
   // ===========================================================================
 
   private async handleEvent(event: NostrEvent): Promise<void> {
-    // Dedup: skip events already processed by another subscription
+    // Issue #275 — two-tier dedup. The persistent set blocks events that
+    // were already FULLY processed in a prior session (cross-process
+    // dedup). The in-flight set blocks concurrent arrivals via multiple
+    // subscriptions within the same process. Neither set is added to
+    // until we've confirmed processing — at-least-once depends on
+    // failed TOKEN_TRANSFER events being replayable on next reconnect.
     if (event.id && this.processedEventIds.has(event.id)) {
       return;
     }
+    if (event.id && this.inFlightEventIds.has(event.id)) {
+      return;
+    }
     if (event.id) {
-      this.processedEventIds.add(event.id);
+      this.inFlightEventIds.add(event.id);
     }
 
     logger.debug('Nostr', 'Processing event kind:', event.kind, 'id:', event.id?.slice(0, 12));
@@ -1571,8 +1648,9 @@ export class NostrTransportProvider implements TransportProvider {
       // every registered handler reported the inbound token(s)
       // durably persisted (IPFS pin + OrbitDB ref + aggregator
       // pointer for the Profile provider). When `false`, we do NOT
-      // advance `lastEventTs`, so the event is re-replayed on the
-      // next reconnect (idempotent via addToken stateHash dedup).
+      // advance `lastEventTs` AND we do NOT add to `processedEventIds`,
+      // so the event is re-replayed on the next reconnect (idempotent
+      // via addToken stateHash dedup).
       //
       // Other wallet kinds (DM, payment-request, payment-request-
       // response) retain the legacy "advance on completion"
@@ -1594,8 +1672,10 @@ export class NostrTransportProvider implements TransportProvider {
           // its cooldown window. Without this, relay reconnect immediately
           // re-fires the failing event and the receive pipeline (parse +
           // crypto verify + flush + HEAD-verify) burns CPU on every retry
-          // before refusing the ack again. The cooldown is a memory-only
-          // map (see field doc); a process restart gets a fresh budget.
+          // before refusing the ack again. The cooldown map is now
+          // persisted (issue #275) so the bounded replay budget
+          // (`DURABILITY_MAX_REPLAY_ATTEMPTS = 3`) accumulates across
+          // process restarts rather than resetting per-process.
           if (event.id && this.isInDurabilityCooldown(event.id)) {
             logger.debug(
               'Nostr',
@@ -1621,6 +1701,14 @@ export class NostrTransportProvider implements TransportProvider {
       // Skip for TOKEN_TRANSFER when the handler reported non-durable —
       // re-replay on next reconnect protects against silent loss when
       // IPFS pin / OrbitDB write / aggregator publish fails.
+      //
+      // Issue #275: cursor advance and `processedEventIds` add MUST move
+      // together — they're the two halves of "this event is done." If
+      // we mark processed without advancing the cursor, the relay will
+      // re-deliver the event and we'll spin forever in dedup-skip. If
+      // we advance the cursor without marking processed, a process
+      // restart will refetch and reprocess the event (wasteful but
+      // safe). The lockstep below is the at-least-once invariant.
       if (event.created_at && this.storage && this.keyManager) {
         const kind = event.kind;
         if (
@@ -1629,6 +1717,7 @@ export class NostrTransportProvider implements TransportProvider {
           kind === EVENT_KINDS.PAYMENT_REQUEST_RESPONSE
         ) {
           this.updateLastEventTimestamp(event.created_at);
+          this.markEventProcessed(event.id);
         } else if (kind === EVENT_KINDS.TOKEN_TRANSFER) {
           if (tokenTransferDurable) {
             // Issue #272: success — drop any prior cooldown tracking
@@ -1637,6 +1726,7 @@ export class NostrTransportProvider implements TransportProvider {
             // floods on Nostr reconnect) gets a fresh budget.
             if (event.id) this.failedEventCooldowns.delete(event.id);
             this.updateLastEventTimestamp(event.created_at);
+            this.markEventProcessed(event.id);
           } else if (event.id) {
             // Issue #272: bounded replay budget. `recordDurabilityMiss`
             // increments the per-event attempt counter, arms an
@@ -1650,6 +1740,12 @@ export class NostrTransportProvider implements TransportProvider {
                 `[AT-LEAST-ONCE] TOKEN_TRANSFER ${event.id.slice(0, 12)} exhausted ${NostrTransportProvider.DURABILITY_MAX_REPLAY_ATTEMPTS} durability replay attempts — advancing cursor; operator should investigate local OrbitDB/IPFS-pin/publish failures.`,
               );
               this.updateLastEventTimestamp(event.created_at);
+              // Mark processed so subsequent cross-process replays
+              // short-circuit at the top of handleEvent. Without this,
+              // a budget-exhausted event would replay forever after
+              // process restart (its event ID isn't in `processedEventIds`
+              // and the persisted cooldowns may have expired).
+              this.markEventProcessed(event.id);
             } else {
               const entry = this.failedEventCooldowns.get(event.id);
               const cooldownMs = entry ? Math.max(0, entry.nextRetryAt - Date.now()) : 0;
@@ -1657,6 +1753,9 @@ export class NostrTransportProvider implements TransportProvider {
                 'Nostr',
                 `[AT-LEAST-ONCE] TOKEN_TRANSFER ${event.id.slice(0, 12)} not durable — leaving 'since' at ${this.lastEventTs}; cooldown ${cooldownMs}ms (attempt ${entry?.attempts ?? '?'}/${NostrTransportProvider.DURABILITY_MAX_REPLAY_ATTEMPTS}).`,
               );
+              // Persist the cooldown bump so a process restart sees
+              // the accumulated attempt count.
+              this.schedulePersistDedup();
             }
           } else {
             // Defensive: no event.id means we can't track cooldown or
@@ -1666,11 +1765,211 @@ export class NostrTransportProvider implements TransportProvider {
               `[AT-LEAST-ONCE] TOKEN_TRANSFER (no id) not durable — leaving 'since' at ${this.lastEventTs}; event will replay on next reconnect`,
             );
           }
+        } else {
+          // BROADCAST / GIFT_WRAP: no cursor tracking on the wallet
+          // since-filter (GIFT_WRAP uses lastDmEventTs which the DM
+          // handler advances; BROADCAST has no since-resume). Still
+          // mark processed so multi-subscription concurrent arrivals
+          // don't double-emit to handlers.
+          this.markEventProcessed(event.id);
         }
+      } else {
+        // No created_at or no storage — best-effort mark to dedup
+        // within session. Without storage we can't persist anyway.
+        this.markEventProcessed(event.id);
       }
     } catch (error) {
       logger.debug('Nostr', 'Failed to handle event:', error);
+    } finally {
+      // Always release in-flight slot so a retry (next reconnect) can
+      // re-enter handleEvent. Persistent dedup at the top will block
+      // duplicates of fully-processed events.
+      if (event.id) {
+        this.inFlightEventIds.delete(event.id);
+      }
     }
+  }
+
+  /**
+   * Issue #275 — add an event ID to the persistent dedup set and
+   * schedule a debounced write. FIFO-eviction keeps the set bounded
+   * at `LIMITS.PROCESSED_EVENT_IDS_CAP`.
+   */
+  private markEventProcessed(eventId: string | undefined): void {
+    if (!eventId) return;
+    if (this.processedEventIds.has(eventId)) return;
+    this.processedEventIds.add(eventId);
+    // FIFO eviction: Set preserves insertion order, so keys().next().value
+    // is the oldest entry. Evict in a single step (cheap) per insert at
+    // capacity; no full re-sort needed.
+    while (this.processedEventIds.size > LIMITS.PROCESSED_EVENT_IDS_CAP) {
+      const oldest = this.processedEventIds.keys().next().value;
+      if (oldest === undefined) break;
+      this.processedEventIds.delete(oldest);
+    }
+    this.schedulePersistDedup();
+  }
+
+  /**
+   * Issue #275 — schedule a debounced write of the persistent dedup
+   * sets to storage. Coalesces a burst of EOSE-replay arrivals into a
+   * single storage transaction. Subsequent calls within the debounce
+   * window are no-ops (timer already armed).
+   */
+  private schedulePersistDedup(): void {
+    if (!this.storage || !this.keyManager) return;
+    if (this.persistDedupTimer) return;
+    this.persistDedupTimer = setTimeout(() => {
+      this.persistDedupTimer = null;
+      this.persistDedupNow().catch((err) => {
+        logger.debug('Nostr', 'Persisted dedup write failed (will retry on next mark):', err);
+      });
+    }, LIMITS.PROCESSED_EVENT_IDS_FLUSH_MS);
+  }
+
+  /**
+   * Issue #275 — write the persistent dedup sets to storage. Serialized
+   * via `persistDedupInFlight` so concurrent timer fires (debounce + a
+   * forced flush) don't race on the underlying KV write.
+   */
+  private async persistDedupNow(): Promise<void> {
+    if (!this.storage || !this.keyManager) return;
+    // Serialize against any in-flight write — proper-lockfile in
+    // FileStorageProvider would block anyway, but IndexedDB doesn't,
+    // and overlapping writes risk last-writer-wins of a stale snapshot.
+    if (this.persistDedupInFlight) {
+      await this.persistDedupInFlight.catch(() => undefined);
+    }
+    const inFlight = this.doPersistDedup();
+    this.persistDedupInFlight = inFlight;
+    try {
+      await inFlight;
+    } finally {
+      if (this.persistDedupInFlight === inFlight) {
+        this.persistDedupInFlight = null;
+      }
+    }
+  }
+
+  private async doPersistDedup(): Promise<void> {
+    if (!this.storage || !this.keyManager) return;
+    const pubkey = this.keyManager.getPublicKeyHex();
+    const prefix = pubkey.slice(0, 16);
+    const eventsKey = `${STORAGE_KEYS_GLOBAL.PROCESSED_WALLET_EVENT_IDS}_${prefix}`;
+    const cooldownsKey = `${STORAGE_KEYS_GLOBAL.FAILED_EVENT_COOLDOWNS}_${prefix}`;
+
+    // Snapshot under sync — Set/Map iteration is stable but a concurrent
+    // markEventProcessed can mutate the underlying collection. Array.from
+    // captures a stable view for serialization.
+    const ids = Array.from(this.processedEventIds);
+    const cooldownsArr: Array<[string, { nextRetryAt: number; attempts: number }]> = Array.from(
+      this.failedEventCooldowns.entries(),
+    );
+
+    // Write events + cooldowns independently — they target distinct
+    // KV keys so a partial failure on one shouldn't block the other.
+    try {
+      await this.storage.set(eventsKey, JSON.stringify(ids));
+    } catch (err) {
+      logger.debug('Nostr', 'Persisted dedup: events write failed:', err);
+    }
+    try {
+      await this.storage.set(cooldownsKey, JSON.stringify(cooldownsArr));
+    } catch (err) {
+      logger.debug('Nostr', 'Persisted dedup: cooldowns write failed:', err);
+    }
+  }
+
+  /**
+   * Issue #275 — hydrate the persistent dedup sets from storage on the
+   * first connect/fetchPendingEvents per identity. Idempotent: subsequent
+   * calls are no-ops once `dedupHydrated` is true.
+   *
+   * Failure modes (storage read throw, JSON parse error, malformed
+   * data) all degrade to "start fresh" — the wallet still works, just
+   * pays the cross-process re-dispatch tax once until the next write
+   * cycle repopulates the disk.
+   */
+  private async hydrateProcessedDedup(): Promise<void> {
+    if (this.dedupHydrated) return;
+    if (!this.storage || !this.keyManager) {
+      this.dedupHydrated = true;
+      return;
+    }
+    const pubkey = this.keyManager.getPublicKeyHex();
+    const prefix = pubkey.slice(0, 16);
+    const eventsKey = `${STORAGE_KEYS_GLOBAL.PROCESSED_WALLET_EVENT_IDS}_${prefix}`;
+    const cooldownsKey = `${STORAGE_KEYS_GLOBAL.FAILED_EVENT_COOLDOWNS}_${prefix}`;
+
+    try {
+      const raw = await this.storage.get(eventsKey);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          for (const id of parsed) {
+            if (typeof id === 'string' && id.length > 0) {
+              this.processedEventIds.add(id);
+            }
+          }
+        }
+      }
+    } catch (err) {
+      logger.debug('Nostr', 'hydrateProcessedDedup events parse/read failed:', err);
+    }
+
+    try {
+      const raw = await this.storage.get(cooldownsKey);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          const now = Date.now();
+          let dropped = 0;
+          for (const entry of parsed) {
+            if (
+              Array.isArray(entry) &&
+              entry.length === 2 &&
+              typeof entry[0] === 'string' &&
+              entry[1] !== null &&
+              typeof entry[1] === 'object'
+            ) {
+              const [eventId, meta] = entry as [string, unknown];
+              const m = meta as { nextRetryAt?: unknown; attempts?: unknown };
+              const nextRetryAt = typeof m.nextRetryAt === 'number' ? m.nextRetryAt : NaN;
+              const attempts = typeof m.attempts === 'number' ? m.attempts : NaN;
+              if (
+                Number.isFinite(nextRetryAt) &&
+                Number.isFinite(attempts) &&
+                attempts >= 1 &&
+                attempts < NostrTransportProvider.DURABILITY_MAX_REPLAY_ATTEMPTS
+              ) {
+                // Drop entries whose cooldown elapsed more than one
+                // COOLDOWN_MAX_MS ago — the cooldown is meaningless and
+                // we'd just keep stale clutter. Keep recently-expired
+                // ones because the attempt counter still matters for
+                // budget accumulation.
+                const elapsed = now - nextRetryAt;
+                if (elapsed > NostrTransportProvider.DURABILITY_COOLDOWN_MAX_MS * 2) {
+                  dropped++;
+                  continue;
+                }
+                this.failedEventCooldowns.set(eventId, { nextRetryAt, attempts });
+              }
+            }
+          }
+          if (dropped > 0) {
+            logger.debug('Nostr', `hydrateProcessedDedup: dropped ${dropped} stale cooldown entries`);
+          }
+        }
+      }
+    } catch (err) {
+      logger.debug('Nostr', 'hydrateProcessedDedup cooldowns parse/read failed:', err);
+    }
+
+    this.dedupHydrated = true;
+    logger.debug(
+      'Nostr',
+      `[#275] Persisted dedup hydrated: ${this.processedEventIds.size} event IDs, ${this.failedEventCooldowns.size} cooldown entries`,
+    );
   }
 
   /**
@@ -2356,6 +2655,15 @@ export class NostrTransportProvider implements TransportProvider {
       throw new SphereError('Transport not connected', 'TRANSPORT_ERROR');
     }
 
+    // Issue #275 — hydrate persistent dedup BEFORE pulling EOSE backlog.
+    // Without this, the first CLI command of a new process would walk
+    // the full relay backlog once (pre-fix #275 §C soak: 169 dispatches
+    // across 15 unique ids). This is the same hook installed in
+    // `subscribeToEvents` for the long-lived subscription path; CLIs
+    // that only call `fetchPendingEvents` (no persistent subscription)
+    // also need the hydrate to take effect.
+    await this.hydrateProcessedDedup();
+
     // Issue #274 — perf instrumentation. Called once per `sphere.payments.receive()`
     // and once per `ensureSync(sphere, 'full')`. Per perf-engineer, the CLI runs
     // ensureSync at the start of every command — making this span the cheapest
@@ -2552,6 +2860,13 @@ export class NostrTransportProvider implements TransportProvider {
     // Use 32-byte Nostr pubkey (x-coordinate only), not 33-byte compressed key
     const nostrPubkey = this.keyManager.getPublicKeyHex();
     logger.debug('Nostr', 'Subscribing with Nostr pubkey:', nostrPubkey);
+
+    // Issue #275 — hydrate persistent dedup BEFORE the relay since-filter
+    // re-delivers backlog events. Without this, the relay's EOSE burst
+    // would hit the empty in-memory set, re-dispatch every event, and
+    // pay the parse/adapter/addToken cost for events the previous
+    // process already finalized.
+    await this.hydrateProcessedDedup();
 
     // Determine 'since' filter from persisted last event timestamp.
     // - Existing wallet: resume from last processed event (inclusive >=, dedup handles replays)
