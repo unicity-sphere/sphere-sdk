@@ -146,6 +146,28 @@ export type {
   LegacyImportResult,
 } from './import-from-legacy';
 
+// Bidirectional token-storage migration (Issue #286). Operates at the
+// TokenStorageProvider boundary — copies a full TxfStorageDataBase
+// snapshot between any two providers (legacy ↔ Profile) with
+// idempotency, crash-safety, and optional aggregator-spent gating.
+// See profile/token-storage-migration.ts module docstring for the
+// consumer integration pattern (sphere.telco SphereProvider.initialize).
+export {
+  migrateTokenStorage,
+  migrateLegacyToProfile,
+  migrateProfileToLegacy,
+  isTokenStorageMigrationComplete,
+  clearTokenStorageMigrationMarker,
+  TOKEN_STORAGE_MIGRATION_MARKER_VERSION,
+} from './token-storage-migration';
+export type {
+  MigrationDirection,
+  TokenStorageMigrationOptions,
+  TokenStorageMigrationProgress,
+  TokenStorageMigrationCounts,
+  TokenStorageMigrationResult,
+} from './token-storage-migration';
+
 // =============================================================================
 // Deriver (local-cached structural views)
 // =============================================================================
