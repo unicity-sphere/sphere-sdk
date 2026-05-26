@@ -1549,19 +1549,30 @@ export class ProfileStorageProvider implements StorageProvider {
     readonly key: string;
     readonly errorMessage: string;
   }): void {
-    const dedupKey = `${info.key}${info.errorMessage}`;
+    // Delimiter (`\x1f` = ASCII Unit Separator) prevents collisions
+    // between (key="ab", err="cd") and (key="a", err="bcd"). Profile
+    // keys are constrained shape so collisions are unlikely in
+    // practice, but a non-printable separator is correctness-defense
+    // and costs nothing.
+    const dedupKey = `${info.key}\x1f${info.errorMessage}`;
     if (this.envelopeFallbackSeen.has(dedupKey)) return;
+    // Steelman fix: at-cap MUST early-return to preserve the dedup
+    // contract. Pre-fix, an adversarial input that flooded the cache
+    // with 1024 different errors would cause every subsequent NEW
+    // dedupKey to fire log+notifier on every read (since the new key
+    // never got added to the set, the next .has() always returned
+    // false) — a log-flood / notifier-DoS amplifier. Trading "lost
+    // signal beyond cap" for "no unbounded amplification" is the
+    // conservative choice; corruption at this scale already requires
+    // operator triage, and the cap (1024) is well above any legitimate
+    // single-instance corruption surface.
     if (
       this.envelopeFallbackSeen.size >=
       ProfileStorageProvider.ENVELOPE_FALLBACK_DEDUP_CAP
     ) {
-      // Cap reached: stop adding new entries to avoid unbounded growth
-      // under a pathological corrupt-key stream. We still emit (without
-      // dedup) so signal isn't lost — at this scale operator triage is
-      // already required.
-    } else {
-      this.envelopeFallbackSeen.add(dedupKey);
+      return;
     }
+    this.envelopeFallbackSeen.add(dedupKey);
     logger.warn(
       'ProfileStorage',
       `[ENVELOPE-FALLBACK] OpLog envelope decode failed for key="${redactProfileKey(info.key)}" ` +

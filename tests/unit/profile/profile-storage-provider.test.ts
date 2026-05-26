@@ -1432,6 +1432,78 @@ describe('ProfileStorageProvider', () => {
       expect(encryptedRaw).not.toBeNull();
     });
 
+    it('at-cap behavior: new (key, error) pairs early-return (NOT amplify)', async () => {
+      // Steelman regression: pre-fix, when the dedup set hit the 1024
+      // cap, NEW (key, error) pairs would re-fire log+notifier on EVERY
+      // subsequent read because the new key never got added to the set,
+      // so `.has(dedupKey)` returned false on the next read too. That's
+      // a notifier-DoS amplifier under pathological input. Post-fix,
+      // at-cap NEW keys early-return (lost-signal-beyond-cap is the
+      // correct trade-off vs unbounded amplification — at this scale
+      // operator triage is already required and the cap (1024) is well
+      // above any legitimate single-instance corruption surface).
+      const { provider, db } = await buildEnvelopeProvider();
+      await provider.set('mnemonic', 'v');
+      db._store.set('identity.mnemonic', invalidCborBytes());
+
+      // Pre-populate the dedup set to the cap via direct private-state
+      // access. This is the only practical way to exercise the cap
+      // without 1024 distinct corrupt entries in the test.
+      const seen = (provider as unknown as {
+        envelopeFallbackSeen: Set<string>;
+      }).envelopeFallbackSeen;
+      const CAP = (
+        provider as unknown as {
+          constructor: { ENVELOPE_FALLBACK_DEDUP_CAP: number };
+        }
+      ).constructor.ENVELOPE_FALLBACK_DEDUP_CAP;
+      for (let i = 0; i < CAP; i++) {
+        seen.add(`filler-${i}`);
+      }
+      expect(seen.size).toBe(CAP);
+
+      let fired = 0;
+      provider.setEnvelopeFallbackNotifier(() => {
+        fired += 1;
+      });
+
+      // Read multiple times — the (identity.mnemonic, invalid-minor-30)
+      // pair has NOT been added to the set (it's not in the pre-populated
+      // filler entries), so pre-fix this would fire on every read. Post-
+      // fix, at-cap early-return means the notifier fires ZERO times.
+      await provider.getEncryptedRaw('mnemonic');
+      await provider.getEncryptedRaw('mnemonic');
+      await provider.getEncryptedRaw('mnemonic');
+      await provider.getEncryptedRaw('mnemonic');
+
+      expect(fired).toBe(0);
+    });
+
+    it('dedupKey uses ASCII Unit Separator to avoid (key, error) collision', async () => {
+      // Steelman: pre-fix, dedupKey was `${key}${error}` (no separator).
+      // (key="ab", err="cd") and (key="a", err="bcd") both yield "abcd"
+      // — different signals deduped together. Post-fix uses `\x1f`
+      // (Unit Separator) which is a non-printable byte that cannot
+      // appear in either a profile key (constrained shape) or a CBOR
+      // error message text. Verify the dedupKey shape by inspecting
+      // the populated set.
+      const { provider, db } = await buildEnvelopeProvider();
+      await provider.set('mnemonic', 'v');
+      db._store.set('identity.mnemonic', invalidCborBytes());
+
+      await provider.getEncryptedRaw('mnemonic');
+
+      const seen = (provider as unknown as {
+        envelopeFallbackSeen: Set<string>;
+      }).envelopeFallbackSeen;
+      expect(seen.size).toBe(1);
+      const onlyKey = [...seen][0];
+      // The dedup key includes the separator; key bytes precede it,
+      // error text follows.
+      expect(onlyKey).toContain('\x1f');
+      expect(onlyKey.startsWith('identity.mnemonic\x1f')).toBe(true);
+    });
+
     it('clean envelope round-trip does NOT fire the notifier', async () => {
       const { provider } = await buildEnvelopeProvider();
       await provider.set('mnemonic', 'v');
