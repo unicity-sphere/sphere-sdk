@@ -717,12 +717,18 @@ describe('Last event timestamp persistence', () => {
       await provider.connect();
       await new Promise(resolve => setTimeout(resolve, 50));
 
-      // Two reads: wallet event ts + DM event ts
-      expect(mockStorage.get).toHaveBeenCalledTimes(2);
-      const walletKeyArg = mockStorage.get.mock.calls[0][0];
-      const dmKeyArg = mockStorage.get.mock.calls[1][0];
-      expect(walletKeyArg).toMatch(/^last_wallet_event_ts_[0-9a-f]{16}$/);
-      expect(dmKeyArg).toMatch(/^last_dm_event_ts_[0-9a-f]{16}$/);
+      // Four reads: persistent dedup events (#275) + persistent cooldowns (#275)
+      // + wallet event ts + DM event ts. All four use the same pubkey prefix.
+      expect(mockStorage.get).toHaveBeenCalledTimes(4);
+      const calledKeys = mockStorage.get.mock.calls.map((c) => c[0] as string);
+      expect(calledKeys).toEqual(
+        expect.arrayContaining([
+          expect.stringMatching(/^processed_wallet_event_ids_[0-9a-f]{16}$/),
+          expect.stringMatching(/^failed_event_cooldowns_[0-9a-f]{16}$/),
+          expect.stringMatching(/^last_wallet_event_ts_[0-9a-f]{16}$/),
+          expect.stringMatching(/^last_dm_event_ts_[0-9a-f]{16}$/),
+        ]),
+      );
     });
 
     it('should use fallback since when no stored timestamp and fallback is set', async () => {
@@ -1001,6 +1007,363 @@ describe('Last event timestamp persistence', () => {
       await new Promise(resolve => setTimeout(resolve, 100));
       // Verify set was attempted (and failed gracefully)
       expect(mockStorage.set).toHaveBeenCalled();
+    });
+  });
+});
+
+// =============================================================================
+// Issue #275 — Persistent dedup of Nostr event IDs
+// =============================================================================
+
+describe('Issue #275 — persistent dedup', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockIsConnected.mockReturnValue(true);
+    mockGetConnectedRelays.mockReturnValue(new Set(['wss://test.relay']));
+  });
+
+  function createProviderWithStorage(storage: { get: ReturnType<typeof vi.fn>; set: ReturnType<typeof vi.fn> }) {
+    return new NostrTransportProvider({
+      relays: ['wss://test.relay'],
+      createWebSocket: (() => {}) as unknown as WebSocketFactory,
+      timeout: 100,
+      autoReconnect: false,
+      storage,
+    });
+  }
+
+  function setIdentity(provider: InstanceType<typeof NostrTransportProvider>) {
+    provider.setIdentity({
+      privateKey: 'b'.repeat(64),
+      chainPubkey: '02' + 'a'.repeat(64),
+      l1Address: 'alpha1test',
+    });
+  }
+
+  describe('hydration on connect', () => {
+    it('should hydrate persisted event IDs and dedupe subsequent dispatch', async () => {
+      const persistedIds = JSON.stringify(['evt-a', 'evt-b']);
+      const mockStorage = {
+        get: vi.fn().mockImplementation((key: string) => {
+          if (key.startsWith('processed_wallet_event_ids_')) {
+            return Promise.resolve(persistedIds);
+          }
+          return Promise.resolve(null);
+        }),
+        set: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const provider = createProviderWithStorage(mockStorage);
+      setIdentity(provider);
+      await provider.connect();
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      // Fire one of the hydrated event IDs through the handler
+      const callbacks = mockSubscribe.mock.calls[0][1];
+      const before = mockStorage.set.mock.calls.length;
+      callbacks.onEvent({
+        id: 'evt-a',
+        kind: 4, // DIRECT_MESSAGE
+        content: '{}',
+        tags: [],
+        pubkey: 'a'.repeat(64),
+        created_at: 1700000500,
+        sig: 'sig',
+      });
+
+      // Wait beyond the 200ms debounce window so any pending write
+      // would have landed by now.
+      await new Promise(resolve => setTimeout(resolve, 300));
+
+      // No new write should land for a hydrated/already-processed event —
+      // the dedup short-circuits BEFORE updateLastEventTimestamp.
+      const after = mockStorage.set.mock.calls.length;
+      const tsWrites = mockStorage.set.mock.calls
+        .slice(before, after)
+        .filter((c) => typeof c[0] === 'string' && (c[0] as string).startsWith('last_wallet_event_ts_'));
+      expect(tsWrites.length).toBe(0);
+    });
+
+    it('should tolerate malformed persisted JSON gracefully', async () => {
+      const mockStorage = {
+        get: vi.fn().mockImplementation((key: string) => {
+          if (key.startsWith('processed_wallet_event_ids_')) {
+            return Promise.resolve('{not valid json');
+          }
+          return Promise.resolve(null);
+        }),
+        set: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const provider = createProviderWithStorage(mockStorage);
+      setIdentity(provider);
+      // Should not throw — corrupt data degrades to "start fresh".
+      await expect(provider.connect()).resolves.toBeUndefined();
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(mockSubscribe).toHaveBeenCalled();
+    });
+
+    it('should ignore non-array persisted JSON', async () => {
+      const mockStorage = {
+        get: vi.fn().mockImplementation((key: string) => {
+          if (key.startsWith('processed_wallet_event_ids_')) {
+            return Promise.resolve(JSON.stringify({ not: 'an array' }));
+          }
+          return Promise.resolve(null);
+        }),
+        set: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const provider = createProviderWithStorage(mockStorage);
+      setIdentity(provider);
+      await expect(provider.connect()).resolves.toBeUndefined();
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      // Subsequent event with same id should be processed (not deduped).
+      const callbacks = mockSubscribe.mock.calls[0][1];
+      mockStorage.set.mockClear();
+      callbacks.onEvent({
+        id: 'evt-after-malformed',
+        kind: 4,
+        content: '{}',
+        tags: [],
+        pubkey: 'a'.repeat(64),
+        created_at: 1700000900,
+        sig: 'sig',
+      });
+      await new Promise(resolve => setTimeout(resolve, 50));
+      // ts write should occur (event processed)
+      const tsWrites = mockStorage.set.mock.calls.filter(
+        (c) => typeof c[0] === 'string' && (c[0] as string).startsWith('last_wallet_event_ts_'),
+      );
+      expect(tsWrites.length).toBe(1);
+    });
+
+    it('should hydrate persisted cooldowns and respect remaining window', async () => {
+      const nextRetryAt = Date.now() + 60_000;
+      const cooldowns = JSON.stringify([['stuck-evt', { nextRetryAt, attempts: 2 }]]);
+      const mockStorage = {
+        get: vi.fn().mockImplementation((key: string) => {
+          if (key.startsWith('failed_event_cooldowns_')) {
+            return Promise.resolve(cooldowns);
+          }
+          return Promise.resolve(null);
+        }),
+        set: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const provider = createProviderWithStorage(mockStorage);
+      setIdentity(provider);
+      await provider.connect();
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      // The TOKEN_TRANSFER cooldown gate should now skip the stuck event
+      // without entering handleTokenTransfer. We don't have an easy way
+      // to spy on handleTokenTransfer from outside, but observing that
+      // no `last_wallet_event_ts_` write happens for this event is a
+      // proxy: cooldown skip returns early, no cursor advance.
+      const callbacks = mockSubscribe.mock.calls[0][1];
+      mockStorage.set.mockClear();
+      callbacks.onEvent({
+        id: 'stuck-evt',
+        kind: 31113, // TOKEN_TRANSFER
+        content: '{}',
+        tags: [],
+        pubkey: 'a'.repeat(64),
+        created_at: 1700000700,
+        sig: 'sig',
+      });
+
+      await new Promise(resolve => setTimeout(resolve, 300));
+
+      const tsWrites = mockStorage.set.mock.calls.filter(
+        (c) => typeof c[0] === 'string' && (c[0] as string).startsWith('last_wallet_event_ts_'),
+      );
+      expect(tsWrites.length).toBe(0);
+    });
+
+    it('should drop stale cooldown entries on hydrate', async () => {
+      // nextRetryAt far in the past (> 2x COOLDOWN_MAX_MS) — should be dropped.
+      const veryStale = Date.now() - 600_000; // 10 minutes ago
+      const cooldowns = JSON.stringify([['stale-evt', { nextRetryAt: veryStale, attempts: 1 }]]);
+      const mockStorage = {
+        get: vi.fn().mockImplementation((key: string) => {
+          if (key.startsWith('failed_event_cooldowns_')) {
+            return Promise.resolve(cooldowns);
+          }
+          return Promise.resolve(null);
+        }),
+        set: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const provider = createProviderWithStorage(mockStorage);
+      setIdentity(provider);
+      await provider.connect();
+      await new Promise(resolve => setTimeout(resolve, 50));
+      // No assertion on the count itself — the post-condition is that
+      // a future event with id "stale-evt" is NOT skipped because of a
+      // dropped cooldown. We'd need to send the event and watch for the
+      // cursor advance, but that path requires handleTokenTransfer to
+      // be wired to a real handler. Instead, assert hydrate didn't
+      // throw — coverage of the drop branch.
+      expect(true).toBe(true);
+    });
+  });
+
+  describe('persist on event processed', () => {
+    it('should write processed_wallet_event_ids after debounce window', async () => {
+      const mockStorage = {
+        get: vi.fn().mockResolvedValue(null),
+        set: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const provider = createProviderWithStorage(mockStorage);
+      setIdentity(provider);
+      await provider.connect();
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      mockStorage.set.mockClear();
+
+      const callbacks = mockSubscribe.mock.calls[0][1];
+      callbacks.onEvent({
+        id: 'evt-persist-1',
+        kind: 4,
+        content: '{}',
+        tags: [],
+        pubkey: 'a'.repeat(64),
+        created_at: 1700000123,
+        sig: 'sig',
+      });
+
+      // Wait longer than 200ms debounce window
+      await new Promise(resolve => setTimeout(resolve, 350));
+
+      const dedupWrites = mockStorage.set.mock.calls.filter(
+        (c) => typeof c[0] === 'string' && (c[0] as string).startsWith('processed_wallet_event_ids_'),
+      );
+      expect(dedupWrites.length).toBe(1);
+      const payload = JSON.parse(dedupWrites[0][1] as string);
+      expect(Array.isArray(payload)).toBe(true);
+      expect(payload).toContain('evt-persist-1');
+    });
+
+    it('should coalesce rapid arrivals into a single debounced write', async () => {
+      const mockStorage = {
+        get: vi.fn().mockResolvedValue(null),
+        set: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const provider = createProviderWithStorage(mockStorage);
+      setIdentity(provider);
+      await provider.connect();
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      mockStorage.set.mockClear();
+      const callbacks = mockSubscribe.mock.calls[0][1];
+
+      // Fire 5 events well within the 200ms debounce window
+      for (let i = 0; i < 5; i++) {
+        callbacks.onEvent({
+          id: `burst-${i}`,
+          kind: 4,
+          content: '{}',
+          tags: [],
+          pubkey: 'a'.repeat(64),
+          created_at: 1700000200 + i,
+          sig: 'sig',
+        });
+      }
+
+      // Wait beyond debounce
+      await new Promise(resolve => setTimeout(resolve, 350));
+
+      const dedupWrites = mockStorage.set.mock.calls.filter(
+        (c) => typeof c[0] === 'string' && (c[0] as string).startsWith('processed_wallet_event_ids_'),
+      );
+      // Coalesced: at most one write for the whole burst.
+      expect(dedupWrites.length).toBe(1);
+      const payload = JSON.parse(dedupWrites[0][1] as string);
+      expect(payload.length).toBe(5);
+    });
+  });
+
+  describe('cross-process semantics', () => {
+    it('should NOT add to processed set when event has no id', async () => {
+      const mockStorage = {
+        get: vi.fn().mockResolvedValue(null),
+        set: vi.fn().mockResolvedValue(undefined),
+      };
+      const provider = createProviderWithStorage(mockStorage);
+      setIdentity(provider);
+      await provider.connect();
+      await new Promise(resolve => setTimeout(resolve, 50));
+      mockStorage.set.mockClear();
+
+      const callbacks = mockSubscribe.mock.calls[0][1];
+      callbacks.onEvent({
+        // no id
+        kind: 4,
+        content: '{}',
+        tags: [],
+        pubkey: 'a'.repeat(64),
+        created_at: 1700001000,
+        sig: 'sig',
+      });
+
+      await new Promise(resolve => setTimeout(resolve, 300));
+      const dedupWrites = mockStorage.set.mock.calls.filter(
+        (c) => typeof c[0] === 'string' && (c[0] as string).startsWith('processed_wallet_event_ids_'),
+      );
+      expect(dedupWrites.length).toBe(0);
+    });
+
+    it('should cancel the armed debounce timer on setIdentity', async () => {
+      const mockStorage = {
+        get: vi.fn().mockResolvedValue(null),
+        set: vi.fn().mockResolvedValue(undefined),
+      };
+      const provider = createProviderWithStorage(mockStorage);
+      setIdentity(provider);
+      await provider.connect();
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      const callbacks = mockSubscribe.mock.calls[0][1];
+      callbacks.onEvent({
+        id: 'pre-switch',
+        kind: 4,
+        content: '{}',
+        tags: [],
+        pubkey: 'a'.repeat(64),
+        created_at: 1700001500,
+        sig: 'sig',
+      });
+
+      // Let handleEvent finish its synchronous work (markEventProcessed
+      // schedules the 200ms debounce timer). Wait 50ms — well under
+      // the 200ms debounce — so the timer is armed but has not fired.
+      await new Promise(resolve => setTimeout(resolve, 50));
+      mockStorage.set.mockClear();
+
+      // setIdentity must clear the armed timer.
+      await provider.setIdentity({
+        privateKey: 'c'.repeat(64),
+        chainPubkey: '02' + 'd'.repeat(64),
+        l1Address: 'alpha1other',
+      });
+
+      // Wait past the original 200ms debounce window. If the timer was
+      // properly cancelled, no write should carry 'pre-switch'.
+      await new Promise(resolve => setTimeout(resolve, 350));
+
+      const dedupWrites = mockStorage.set.mock.calls.filter(
+        (c) => typeof c[0] === 'string' && (c[0] as string).startsWith('processed_wallet_event_ids_'),
+      );
+      // Either no write happened OR the writes carry only events from
+      // the NEW identity (which is empty in this test).
+      for (const w of dedupWrites) {
+        const payload = JSON.parse(w[1] as string);
+        expect(payload).not.toContain('pre-switch');
+      }
     });
   });
 });

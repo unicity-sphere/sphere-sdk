@@ -15348,6 +15348,30 @@ export class PaymentsModule {
       }
 
       if (combinedBundle) {
+        // Issue #275 P2 — hoisted dedup. When the V6 bundle was already
+        // processed in a prior session (its `transferId` is in the
+        // persisted `processedCombinedTransferIds` set, hydrated in
+        // PaymentsModule.initialize), short-circuit BEFORE entering
+        // `processCombinedTransferBundle` AND skip the trailing
+        // `awaitAllProvidersDurable()`. The bundle's tokens are
+        // already durable on disk from the original processing —
+        // calling `awaitAllProvidersDurable()` for a no-op bundle was
+        // costing 2-3 s per duplicate dispatch in the §C soak (per
+        // OPTIMIZATION-FINDINGS.md in issue #275). The inner dedup
+        // check inside `processCombinedTransferBundle` is retained as
+        // defense-in-depth (e.g., when an upstream caller routes a
+        // bundle directly without going through `handleIncomingTransfer`).
+        if (this.processedCombinedTransferIds.has(combinedBundle.transferId)) {
+          logger.debug(
+            'Payments',
+            `[#275] V6 combined transfer ${combinedBundle.transferId.slice(0, 12)}... already processed — skipping (no awaitAllProvidersDurable)`,
+          );
+          // Return `true` so the Nostr transport advances `lastEventTs`
+          // past this event. Local state is already durable; further
+          // replays would be wasted work.
+          return true;
+        }
+
         logger.debug('Payments', 'Processing COMBINED_TRANSFER V6 bundle...');
         let v6Success = true;
         try {
@@ -15379,6 +15403,27 @@ export class PaymentsModule {
       }
 
       if (instantBundle) {
+        // Issue #275 P2 — symmetric hoist for V5 INSTANT_SPLIT bundles.
+        // V5 bundles carry a `splitGroupId` (persisted in
+        // `processedSplitGroupIds` after first processing). When the
+        // bundle was already processed in a prior session, skip BEFORE
+        // the call into `processInstantSplitBundle` AND BEFORE the
+        // trailing `awaitAllProvidersDurable()`. V4 dev bundles don't
+        // have a splitGroupId; they fall through to the normal sync
+        // path which is unaffected by this change.
+        const v5SplitGroupId = (instantBundle as { splitGroupId?: unknown }).splitGroupId;
+        if (
+          typeof v5SplitGroupId === 'string' &&
+          v5SplitGroupId.length > 0 &&
+          this.processedSplitGroupIds.has(v5SplitGroupId)
+        ) {
+          logger.debug(
+            'Payments',
+            `[#275] V5 instant split ${v5SplitGroupId.slice(0, 12)}... already processed — skipping (no awaitAllProvidersDurable)`,
+          );
+          return true;
+        }
+
         logger.debug('Payments', 'Processing INSTANT_SPLIT bundle...');
         try {
           let instantOk = false;

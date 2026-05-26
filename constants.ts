@@ -48,6 +48,27 @@ export const STORAGE_KEYS_GLOBAL = {
   LAST_WALLET_EVENT_TS: 'last_wallet_event_ts',
   /** Last processed Nostr DM (gift-wrap) event timestamp (unix seconds), keyed per pubkey */
   LAST_DM_EVENT_TS: 'last_dm_event_ts',
+  /**
+   * Issue #275 — persistent dedup for Nostr wallet event IDs that have
+   * been SUCCESSFULLY processed (cursor advanced). Keyed per pubkey;
+   * stored as a JSON string array bounded by
+   * `LIMITS.PROCESSED_EVENT_IDS_CAP` (FIFO eviction).
+   *
+   * Distinct from in-memory `inFlightEventIds`: this set persists across
+   * process restarts so cross-process CLI invocations don't re-walk the
+   * full relay backlog. At-least-once is preserved because we ONLY add
+   * to this set after the event's cursor was advanced (durability ok
+   * or replay budget exhausted), never after a transient failure.
+   */
+  PROCESSED_WALLET_EVENT_IDS: 'processed_wallet_event_ids',
+  /**
+   * Issue #275 — persistent durability-cooldown ledger for
+   * TOKEN_TRANSFER events. Tracks `attempts` and `nextRetryAt` across
+   * process restarts so the bounded replay budget
+   * (`DURABILITY_MAX_REPLAY_ATTEMPTS = 3`) accumulates across CLI
+   * invocations rather than resetting per-process.
+   */
+  FAILED_EVENT_COOLDOWNS: 'failed_event_cooldowns',
   /** Group chat: last used relay URL (stale data detection) — global, same relay for all addresses */
   GROUP_CHAT_RELAY_URL: 'group_chat_relay_url',
   /** Cached token registry JSON (fetched from remote) */
@@ -495,4 +516,19 @@ export const LIMITS = {
   MEMO_MAX_LENGTH: 500,
   /** Max message length */
   MESSAGE_MAX_LENGTH: 10000,
+  /**
+   * Issue #275 — FIFO cap for persisted dedup IDs in
+   * `STORAGE_KEYS_GLOBAL.PROCESSED_WALLET_EVENT_IDS`. Sized for several
+   * days of Nostr relay retention (typical relay holds 1-7 days). A
+   * 10k cap at ~70 bytes per id is ~700KB serialized — well under
+   * IndexedDB / file storage budgets.
+   */
+  PROCESSED_EVENT_IDS_CAP: 10_000,
+  /**
+   * Issue #275 — debounce interval for persisted dedup-set flushes.
+   * Coalesces rapid arrivals (e.g., EOSE replay burst of N events) into
+   * a single storage write rather than N writes. 200ms matches the
+   * proven pattern in `GroupChatModule.persistProcessedEvents`.
+   */
+  PROCESSED_EVENT_IDS_FLUSH_MS: 200,
 } as const;
