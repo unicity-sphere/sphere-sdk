@@ -994,6 +994,188 @@ describe('#144 L3 — balance-model invariant + stranded recovery', () => {
     }
   });
 
+  // Issue #269 — `finalizeStrandedReceivedToken` previously treated SDK
+  // `VerificationError` with `verificationResult.message === 'Recipient
+  // address mismatch'` as transient: the catch logged at error level and
+  // returned, leaving the token in 'pending'. Each `sync()` then ran
+  // `drainPendingFinalizations` for the full timeoutMs window because
+  // `hasUnconfirmedOrInflight()` kept seeing the unresolved token. With
+  // the at-least-once Nostr replay (PR #240) every replay re-triggered
+  // the same drain, stalling §D.1 of `manual-test-full-recovery.sh`.
+  //
+  // By the time this catch fires, `finalizeTransferToken` has already
+  // run `tryRecoverSigningServiceForRecipient` and exhausted every
+  // tracked HD address. The mismatch is therefore permanent w.r.t. the
+  // wallet's current key inventory — retrying with the same inputs
+  // cannot succeed.
+  it('finalizeStrandedReceivedToken classifies VerificationError(Recipient address mismatch) as permanent (issue #269)', async () => {
+    const sdkData = makeV6DirectReceiveSdkData();
+    const token: Token = {
+      id: GENESIS_TOKEN_ID,
+      coinId: 'UCT_HEX',
+      symbol: 'UCT',
+      amount: '100',
+      status: 'pending',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      sdkData,
+    };
+    internals(module).tokens.set(token.id, token);
+
+    // Oracle returns a structurally-valid proof so the unwrap +
+    // `TransferTransaction.fromJSON` path succeeds. The failure must come
+    // from `finalizeTransferToken`'s SDK call, not from the proof shape.
+    (setup.deps.oracle as { getProof: ReturnType<typeof vi.fn> }).getProof =
+      vi.fn().mockResolvedValue({
+        merkleTreePath: { steps: [] },
+        unicityCertificate: { rootHash: '00' },
+        toJSON() { return { merkleTreePath: { steps: [] }, unicityCertificate: { rootHash: '00' } }; },
+      });
+
+    // Construct the SDK error shape the bug surfaces. Outer message
+    // mirrors the issue's stack trace (`token.update` wraps the
+    // `transaction.verify` result).
+    const sdkVerifMod = await import(
+      '@unicitylabs/state-transition-sdk/lib/verification/VerificationError'
+    );
+    const verificationError = new sdkVerifMod.VerificationError(
+      'Transaction verification failed',
+      // Cast: we only need shape fidelity (status + message), not the
+      // full SDK class instance for `instanceof` — the classifier also
+      // accepts the duck-typed shape.
+      { status: 1, message: 'Recipient address mismatch', results: [] } as never,
+    );
+
+    // Bypass `finalizeTransferToken`'s internal HD-index recovery and
+    // jump straight to the throw — that path is covered by other tests;
+    // here we are exercising the catch classifier in
+    // `finalizeStrandedReceivedToken`.
+    const internalsAny = module as unknown as {
+      finalizeTransferToken: (...args: unknown[]) => Promise<unknown>;
+    };
+    const priorFinalize = internalsAny.finalizeTransferToken;
+    internalsAny.finalizeTransferToken = vi
+      .fn()
+      .mockRejectedValue(verificationError);
+
+    try {
+      const lastTxJson = { previousStateHash: STATE_HASH, predicate: 'pred2', data: {} };
+      const sourceTokenJson = JSON.stringify({ genesis: { data: { tokenId: GENESIS_TOKEN_ID } } });
+      internals(module).proofPollingJobs.set(GENESIS_TOKEN_ID, {
+        tokenId: GENESIS_TOKEN_ID,
+        requestIdHex: '00deadbeef',
+        commitmentJson: '',
+        sourceTokenJson,
+        startedAt: Date.now(),
+        attemptCount: 0,
+        lastAttemptAt: 0,
+      });
+
+      await (module as unknown as {
+        finalizeStrandedReceivedToken: (
+          tokenId: string,
+          sourceTokenJson: string,
+          lastTxJson: Record<string, unknown>,
+        ) => Promise<void>;
+      }).finalizeStrandedReceivedToken(GENESIS_TOKEN_ID, sourceTokenJson, lastTxJson);
+
+      // 1. Token marked invalid so `hasUnconfirmedOrInflight()` no longer
+      //    sees it and the drain loop can return early.
+      expect(internals(module).tokens.get(GENESIS_TOKEN_ID)?.status).toBe('invalid');
+
+      // 2. Polling job removed.
+      expect(internals(module).proofPollingJobs.has(GENESIS_TOKEN_ID)).toBe(false);
+
+      // 3. Operator alert fired with `not-our-state` (NOT 'structural'
+      //    — bytes were well-formed; the address just doesn't bind).
+      const alerts = setup.emittedEvents.filter(
+        (e) => e.type === 'transfer:operator-alert',
+      );
+      expect(alerts.length).toBeGreaterThanOrEqual(1);
+      const alert = alerts[alerts.length - 1].payload as {
+        code: string;
+        tokenId: string;
+        message: string;
+      };
+      expect(alert.code).toBe('not-our-state');
+      expect(alert.tokenId).toBe(GENESIS_TOKEN_ID);
+      expect(alert.message).toContain('cannot be finalized');
+      expect(alert.message.toLowerCase()).toContain('mismatch');
+    } finally {
+      internalsAny.finalizeTransferToken = priorFinalize;
+    }
+  });
+
+  // Negative: a VerificationError whose inner message isn't a recipient/
+  // address mismatch (e.g., predicate-verify failure due to malformed
+  // signature bytes) must NOT trip the permanent-fail path — those can
+  // be transient (network blip yielding a bad proof, retried).
+  it('finalizeStrandedReceivedToken keeps non-mismatch VerificationError transient (issue #269 negative case)', async () => {
+    const sdkData = makeV6DirectReceiveSdkData();
+    const token: Token = {
+      id: GENESIS_TOKEN_ID,
+      coinId: 'UCT_HEX',
+      symbol: 'UCT',
+      amount: '100',
+      status: 'pending',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      sdkData,
+    };
+    internals(module).tokens.set(token.id, token);
+
+    (setup.deps.oracle as { getProof: ReturnType<typeof vi.fn> }).getProof =
+      vi.fn().mockResolvedValue({
+        toJSON() { return { merkleTreePath: { steps: [] }, unicityCertificate: { rootHash: '00' } }; },
+      });
+
+    const sdkVerifMod = await import(
+      '@unicitylabs/state-transition-sdk/lib/verification/VerificationError'
+    );
+    const verificationError = new sdkVerifMod.VerificationError(
+      'Predicate verification failed',
+      { status: 1, message: 'Predicate verification failed', results: [] } as never,
+    );
+
+    const internalsAny = module as unknown as {
+      finalizeTransferToken: (...args: unknown[]) => Promise<unknown>;
+    };
+    const priorFinalize = internalsAny.finalizeTransferToken;
+    internalsAny.finalizeTransferToken = vi.fn().mockRejectedValue(verificationError);
+
+    try {
+      const lastTxJson = { previousStateHash: STATE_HASH, predicate: 'pred2', data: {} };
+      const sourceTokenJson = JSON.stringify({ genesis: { data: { tokenId: GENESIS_TOKEN_ID } } });
+      internals(module).proofPollingJobs.set(GENESIS_TOKEN_ID, {
+        tokenId: GENESIS_TOKEN_ID,
+        requestIdHex: '00deadbeef',
+        commitmentJson: '',
+        sourceTokenJson,
+        startedAt: Date.now(),
+        attemptCount: 0,
+        lastAttemptAt: 0,
+      });
+
+      await (module as unknown as {
+        finalizeStrandedReceivedToken: (
+          tokenId: string,
+          sourceTokenJson: string,
+          lastTxJson: Record<string, unknown>,
+        ) => Promise<void>;
+      }).finalizeStrandedReceivedToken(GENESIS_TOKEN_ID, sourceTokenJson, lastTxJson);
+
+      // Stays pending, job retained, no operator alert.
+      expect(internals(module).tokens.get(GENESIS_TOKEN_ID)?.status).toBe('pending');
+      expect(internals(module).proofPollingJobs.has(GENESIS_TOKEN_ID)).toBe(true);
+      const alerts = setup.emittedEvents.filter(
+        (e) => e.type === 'transfer:operator-alert',
+      );
+      expect(alerts.length).toBe(0);
+    } finally {
+      internalsAny.finalizeTransferToken = priorFinalize;
+    }
+  });
+
   // Issue #251 — V6-RECOVER previously passed `oracle.getProof`'s wrapper
   // shape ({requestId, roundNumber, proof, timestamp}) directly as the
   // inclusionProof patched into the synthetic lastTxJson. The wrapper has

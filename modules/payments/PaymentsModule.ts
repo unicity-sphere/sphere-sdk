@@ -297,6 +297,7 @@ import { MintTransactionData } from '@unicitylabs/state-transition-sdk/lib/trans
 import { waitInclusionProof } from '@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils';
 import { InclusionProof } from '@unicitylabs/state-transition-sdk/lib/transaction/InclusionProof';
 import { InvalidJsonStructureError } from '@unicitylabs/state-transition-sdk/lib/InvalidJsonStructureError';
+import { VerificationError } from '@unicitylabs/state-transition-sdk/lib/verification/VerificationError';
 import { TransferTransactionData } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferTransactionData';
 import { RequestId } from '@unicitylabs/state-transition-sdk/lib/api/RequestId';
 import { Authenticator } from '@unicitylabs/state-transition-sdk/lib/api/Authenticator';
@@ -9364,39 +9365,83 @@ export class PaymentsModule {
 
       logger.debug('Payments', `[V6-RECOVER] Finalized stranded receive ${tokenId.slice(0, 12)} → confirmed`);
     } catch (err) {
-      // Classify the error: structural / parse-shape failures cannot be
-      // fixed by retry — the on-disk `lastTxJson` or the aggregator
-      // `proofJson` is malformed in a way that no amount of re-polling
-      // changes. Without classification, V6-RECOVER would re-register the
-      // job on every process restart (via `recoverStrandedReceivedTokens`)
-      // and spam the operator with a non-converging error every cycle.
+      // Classify the error: some failures cannot be fixed by retry. Without
+      // classification, V6-RECOVER would re-register the job on every process
+      // restart (via `recoverStrandedReceivedTokens`) and `drainPendingFinalizations`
+      // would burn its full timeout window every sync, spamming the operator
+      // and stalling §D.1 of the soak harness.
       //
-      // Permanent failure handling:
+      // Two permanent classes are recognised here:
+      //
+      //  (a) Structural / parse-shape failures — `InvalidJsonStructureError`
+      //      from SDK `TransferTransaction.fromJSON` / `InclusionProof.fromJSON`.
+      //      The on-disk `lastTxJson` or the aggregator `proofJson` is malformed;
+      //      no amount of re-polling changes the bytes. Issue: sphere-sdk#231.
+      //
+      //  (b) Recipient address mismatch — SDK `VerificationError` with inner
+      //      `verificationResult.message === 'Recipient address mismatch'` (from
+      //      `Token.verifyRecipient`, surfaced via `transaction.verify` →
+      //      `token.update`'s "Transaction verification failed" wrapper, OR
+      //      directly via "Recipient verification failed" in `token.update`).
+      //      By the time we reach this catch, `finalizeTransferToken` has
+      //      already invoked `tryRecoverSigningServiceForRecipient` and exhausted
+      //      every tracked HD address — none of our signers derive the predicate
+      //      the sender targeted. Retrying with the same inputs cannot succeed.
+      //      Issue: sphere-sdk#269. The reversibility hook (re-trying once a
+      //      previously untracked HD index gets activated) is deferred; for now
+      //      operators see the `not-our-state` alert and can re-scan after
+      //      activating the missing index manually.
+      //
+      // Permanent failure handling (both classes):
       //   1. Mark the token as 'invalid' so `recoverStrandedReceivedTokens`
       //      doesn't re-pick it up on next load.
       //   2. Remove any live proof-polling job for this token.
-      //   3. Emit `transfer:operator-alert` with code `structural`
-      //      (canonical disposition reason for parse-shape failures).
-      //   4. Log the shape of `lastTxJson` and `proofJson` at debug level
-      //      so SDK developers can diagnose the underlying SDK
-      //      `InclusionProof.fromJSON` / `TransferTransaction.fromJSON`
-      //      mismatch. Only top-level keys are logged — full payloads
-      //      may contain large authenticator bytes we don't need to dump.
-      //
-      // Issue: sphere-sdk#231.
-      const isPermanent = err instanceof InvalidJsonStructureError ||
+      //   3. Emit `transfer:operator-alert` with the appropriate canonical
+      //      disposition reason — `structural` for (a), `not-our-state` for (b).
+      //   4. (Structural only) Log the shape of `lastTxJson` / `proofJson` at
+      //      debug level so SDK developers can diagnose the underlying SDK
+      //      mismatch. Only top-level keys are logged — full payloads may
+      //      contain large authenticator bytes we don't need to dump.
+      const isStructural = err instanceof InvalidJsonStructureError ||
         (err as { name?: string } | null)?.name === 'InvalidJsonStructureError';
 
+      // (b) Recipient address mismatch. We accept either an `instanceof
+      // VerificationError` OR a duck-typed shape (`verificationResult.status`
+      // + recognisable message) so the classifier survives bundle-duplication
+      // edge cases where the SDK module loaded by the catch site differs from
+      // the one that constructed the thrown error (tsup multi-entry,
+      // hoisted-vs-nested dep resolution, ESM/CJS interop in tests).
+      const verificationResult = (err as { verificationResult?: { status?: number; message?: string } } | null)
+        ?.verificationResult;
+      const isMismatchMessage = (msg: string | undefined): boolean =>
+        typeof msg === 'string' && (
+          msg === 'Recipient address mismatch' ||
+          msg.includes('address mismatch')
+        );
+      const isPermanentMismatch =
+        (err instanceof VerificationError || (err as { name?: string } | null)?.name === 'VerificationError') &&
+        verificationResult?.status === 1 &&
+        isMismatchMessage(verificationResult.message);
+
+      const isPermanent = isStructural || isPermanentMismatch;
+
       if (isPermanent) {
+        const classLabel = isPermanentMismatch
+          ? 'permanent recipient-address mismatch (HD-index recovery exhausted)'
+          : 'permanent structural failure';
         logger.error(
           'Payments',
-          `[V6-RECOVER] Stranded receive ${tokenId.slice(0, 12)} hit permanent structural failure (no retry):`,
+          `[V6-RECOVER] Stranded receive ${tokenId.slice(0, 12)} hit ${classLabel} (no retry):`,
           err,
         );
 
         // One-shot diagnostic dump so the SDK-level shape can be inspected.
         // Top-level keys only — full bodies can carry large fields (proofs,
         // authenticators) that aren't necessary for SDK-error triage.
+        // Skipped for the not-our-state path — the bytes are well-formed; the
+        // useful diagnostic was already emitted by `tryRecoverSigningServiceForRecipient`
+        // as a `[FINALIZE-RECOVER]` warn line naming the divergent addresses.
+        if (isStructural) {
         try {
           const job = this.proofPollingJobs.get(tokenId);
           let proofShape: string[] | string = 'not-fetched';
@@ -9445,6 +9490,7 @@ export class PaymentsModule {
         } catch (diagErr) {
           logger.debug('Payments', `[V6-RECOVER] ${tokenId.slice(0, 12)} diagnostic dump itself threw:`, diagErr);
         }
+        }
 
         // 1. Mark the token as invalid so subsequent load() runs skip it.
         const token = this.tokens.get(tokenId);
@@ -9465,19 +9511,30 @@ export class PaymentsModule {
           logger.debug('Payments', `[V6-RECOVER] saveProofPollingJobs after permanent-fail mark failed:`, persistErr),
         );
 
-        // 3. Surface to operator/UI via the canonical `structural`
-        //    disposition reason — parse-shape failure that no retry fixes.
+        // 3. Surface to operator/UI via the canonical disposition reason.
+        //    - structural  → parse-shape failure that no retry fixes
+        //    - not-our-state → recipient predicate doesn't bind to any of
+        //      our tracked HD signers; structurally valid, just unspendable
+        //      by us with currently-tracked addresses.
         try {
-          this.deps!.emitEvent('transfer:operator-alert', {
-            code: 'structural',
-            tokenId,
-            message: sanitizeReasonString(
-              `Token ${tokenId.slice(0, 12)}... cannot be finalized: ` +
+          const innerMsg = verificationResult?.message;
+          const alertCode = isPermanentMismatch ? 'not-our-state' : 'structural';
+          const alertMessage = isPermanentMismatch
+            ? `Token ${tokenId.slice(0, 12)}... cannot be finalized: ` +
+              `${(err as Error)?.message ?? 'VerificationError'} (${innerMsg ?? 'recipient address mismatch'}). ` +
+              `The sender targeted a recipient predicate that none of this wallet's currently-tracked ` +
+              `HD addresses derive. Marked invalid; no further automatic recovery attempts will run for ` +
+              `this token. If the sender targeted an HD index you have not yet activated, activate it ` +
+              `and re-import the OrbitDB pointer to retry.`
+            : `Token ${tokenId.slice(0, 12)}... cannot be finalized: ` +
               `${(err as Error)?.message ?? 'InvalidJsonStructureError'}. ` +
               `The stored last-transaction JSON or the aggregator proof has an unexpected shape. ` +
               `Marked invalid; no further automatic recovery attempts will run for this token. ` +
-              `Manual diagnosis required — see debug logs for the shape dump.`,
-            ),
+              `Manual diagnosis required — see debug logs for the shape dump.`;
+          this.deps!.emitEvent('transfer:operator-alert', {
+            code: alertCode,
+            tokenId,
+            message: sanitizeReasonString(alertMessage),
           });
         } catch { /* event emitter not wired */ }
 
