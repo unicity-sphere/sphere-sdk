@@ -2647,6 +2647,15 @@ export class Sphere {
           // wired across nametag-driven re-initialization.
           publishToIpfs: this._publishToIpfs ?? undefined,
           cidFetchGateways: this._cidFetchGateways ?? undefined,
+          // Issue #285 — preserve the CidRefStore across nametag re-init.
+          // The wallet's encryption key has not changed (only the nametag
+          // moved), so the cached store is still valid; we rebuild for
+          // safety because `Sphere.buildCidRefStoreOrNull()` is cheap
+          // (one constructor call). Without this line, the re-init would
+          // drop the deps.cidRefStore field back to undefined and the
+          // PaymentsModule would silently fall back to inline JSON for
+          // pending V5 token persistence.
+          cidRefStore: this.buildCidRefStoreOrNull() ?? undefined,
           // Issue #255 Problem A — re-thread HD-index recovery hooks on
           // nametag-driven re-init so per-address PaymentsModule
           // instances keep the recovery surface alive after identity
