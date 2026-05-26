@@ -32,10 +32,8 @@ import {
 import { OutboxWriter } from './outbox-writer';
 import { SentLedgerWriter } from './sent-ledger-writer';
 import { Lamport } from './lamport';
-import {
-  buildLocalEntry,
-  type OpLogEntryEnvelope,
-} from './oplog-entry';
+import { buildLocalEntry } from './oplog-entry';
+import { getEnvelopePayload } from './oplog-envelope-io';
 import type { OpLogEntryType } from './aggregator-pointer/originated-tag';
 import type { ProfilePointerLayer } from './aggregator-pointer';
 import {
@@ -549,6 +547,44 @@ export class ProfileStorageProvider implements StorageProvider {
   ): void {
     this.snapshotApplier = applier;
   }
+
+  /**
+   * Issue #280 — register an optional observability hook fired when
+   * `readEnvelopePayload()` falls back from the envelope-decode path
+   * (`db.getEntry`) to the raw-bytes path (`db.get`). This signals
+   * that a stored entry's CBOR envelope is unreadable but the raw
+   * ciphertext could still be served via the legacy compat path.
+   *
+   * Two legitimate reasons for fallback exist:
+   *   1. Pre-#247 legacy ciphertext written via `db.put` (expected).
+   *   2. Live envelope corruption (a real defect — see Issue #280).
+   *
+   * The hook lets operators detect (2) by surfacing the key + error
+   * to their telemetry pipeline. Re-registration is idempotent (the
+   * most recent hook wins); pass `null` to disable.
+   *
+   * The provider applies its own per-key+message dedup so a single
+   * persistent corruption does not spam the hook on every read.
+   * The hook contract MUST NOT throw — exceptions are swallowed.
+   */
+  setEnvelopeFallbackNotifier(
+    notifier: ((info: { readonly key: string; readonly errorMessage: string }) => void) | null,
+  ): void {
+    this.envelopeFallbackNotifier = notifier;
+  }
+
+  private envelopeFallbackNotifier:
+    | ((info: { readonly key: string; readonly errorMessage: string }) => void)
+    | null = null;
+
+  /**
+   * Issue #280 — dedup set for {@link envelopeFallbackNotifier}.
+   * Limits a single (key, errorMessage) pair to fire the hook AND log
+   * the warning once per provider instance. Bounded to a sane cap so
+   * an adversarial input cannot grow it without bound.
+   */
+  private envelopeFallbackSeen = new Set<string>();
+  private static readonly ENVELOPE_FALLBACK_DEDUP_CAP = 1024;
 
   constructor(
     private readonly localCache: StorageProvider,
@@ -1458,23 +1494,100 @@ export class ProfileStorageProvider implements StorageProvider {
 
   /**
    * Read an envelope's encrypted payload from OrbitDB. Returns null if
-   * the key is absent. Legacy raw-bytes entries are auto-wrapped by
-   * `getEntry`'s legacy fallback (§7.1), so this helper works on both
-   * pre-schema and post-schema OpLog contents.
+   * the key is absent.
    *
-   * Passes `trustLocalClaim: true` — callers at this layer have already
-   * established that this wallet's OrbitDB instance is its own source of
-   * truth (no cross-wallet sharing). Peer writes reach this path only
-   * through replication events, which clear the locally-authored set.
+   * Issue #280 — uses the dual-format reader from `oplog-envelope-io.ts`
+   * so a `getEntry()` decode failure (e.g., bytes that aren't a valid
+   * CBOR envelope) automatically falls back to `db.get(key)` for the
+   * raw ciphertext. Without this fallback, a corrupted-envelope read at
+   * a SENT/OUTBOX/etc. key would propagate up through
+   * `getEncryptedRaw()` and the lean-snapshot exporter would silently
+   * skip the entry (`profile-lean-snapshot.ts:433` `— skipping` log
+   * line) — producing a profile snapshot that omits the SENT record
+   * for a payment. On the recipient peer that imports the snapshot,
+   * the previously-spent input token then reappears as still-owned
+   * because no tombstone-by-SENT logic fires. End-user symptom: phantom
+   * double-balance after IPFS-only recovery (§D bob).
+   *
+   * The dual-format path also matches the legacy compat behavior of
+   * the per-writer readers (SentLedgerWriter, OutboxWriter, etc.),
+   * which is the canonical contract for "read whatever's at this key,
+   * envelope-wrapped or raw" — both shapes appear in long-lived wallets
+   * because of in-place format migration (Issue #247).
+   *
+   * NOTE: this method is also called via `getEncryptedRaw()` from the
+   * lean-snapshot builder. Even when the envelope is corrupt locally,
+   * we still want the raw ciphertext bytes — they ARE persistable
+   * verbatim into the snapshot and the recipient peer will simply skip
+   * the unparseable entry via the same dual-format reader downstream.
+   * The Layer-2 aggregator-spent recovery check (see
+   * `PaymentsModule.runRecoveryAggregatorSpentSweep`) is the durable
+   * defense regardless of which side hits the corruption first.
    */
   private async readEnvelopePayload(profileKey: string): Promise<Uint8Array | null> {
     if (this.supportsEnvelopes()) {
-      const envelope = (await this.db.getEntry!(profileKey, {
-        trustLocalClaim: true,
-      })) as OpLogEntryEnvelope | null;
-      return envelope ? envelope.payload : null;
+      return getEnvelopePayload(this.db, profileKey, (info) => {
+        this.handleEnvelopeFallback(info);
+      });
     }
     return this.db.get(profileKey);
+  }
+
+  /**
+   * Issue #280 — dispatcher for the envelope-fallback hook. Logs at
+   * warn level on the first sighting of a unique (key, errorMessage)
+   * pair AND invokes the user-supplied notifier (if any) so it can
+   * route the signal into operator telemetry (a typed event such as
+   * `profile:corrupt-oplog-entry-detected`).
+   *
+   * Why both: the warn log is unconditional (always landed by the
+   * structured logger), the notifier is opt-in (lets consumers
+   * choose how to react — e.g. emit a Sphere event, push to a
+   * metrics endpoint, alert on threshold).
+   */
+  private handleEnvelopeFallback(info: {
+    readonly key: string;
+    readonly errorMessage: string;
+  }): void {
+    // Delimiter (`\x1f` = ASCII Unit Separator) prevents collisions
+    // between (key="ab", err="cd") and (key="a", err="bcd"). Profile
+    // keys are constrained shape so collisions are unlikely in
+    // practice, but a non-printable separator is correctness-defense
+    // and costs nothing.
+    const dedupKey = `${info.key}\x1f${info.errorMessage}`;
+    if (this.envelopeFallbackSeen.has(dedupKey)) return;
+    // Steelman fix: at-cap MUST early-return to preserve the dedup
+    // contract. Pre-fix, an adversarial input that flooded the cache
+    // with 1024 different errors would cause every subsequent NEW
+    // dedupKey to fire log+notifier on every read (since the new key
+    // never got added to the set, the next .has() always returned
+    // false) — a log-flood / notifier-DoS amplifier. Trading "lost
+    // signal beyond cap" for "no unbounded amplification" is the
+    // conservative choice; corruption at this scale already requires
+    // operator triage, and the cap (1024) is well above any legitimate
+    // single-instance corruption surface.
+    if (
+      this.envelopeFallbackSeen.size >=
+      ProfileStorageProvider.ENVELOPE_FALLBACK_DEDUP_CAP
+    ) {
+      return;
+    }
+    this.envelopeFallbackSeen.add(dedupKey);
+    logger.warn(
+      'ProfileStorage',
+      `[ENVELOPE-FALLBACK] OpLog envelope decode failed for key="${redactProfileKey(info.key)}" ` +
+        `— served raw bytes via legacy compat path. ` +
+        `This is expected for pre-#247 wallets but indicates live envelope ` +
+        `corruption when seen on freshly-written entries. ` +
+        `error="${info.errorMessage}"`,
+    );
+    if (this.envelopeFallbackNotifier !== null) {
+      try {
+        this.envelopeFallbackNotifier(info);
+      } catch {
+        // Best-effort signal; never propagate notifier errors.
+      }
+    }
   }
 
   /**

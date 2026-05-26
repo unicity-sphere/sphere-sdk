@@ -110,6 +110,30 @@ export function unwrapEnvelopeBytes(bytes: Uint8Array): Uint8Array {
 }
 
 /**
+ * Optional observability hook for {@link getEnvelopePayload}. Invoked
+ * exactly once per call when the envelope path threw and the function
+ * fell back to the raw-bytes `db.get(key)` path.
+ *
+ * Issue #280 — the silent fall-through was load-bearing for backward
+ * compatibility with pre-#247 raw-ciphertext entries, but it also
+ * masked LIVE corruption (e.g. an OUTBOX/SENT/etc. entry whose
+ * envelope CBOR is unreadable on the local OrbitDB store, fed by
+ * a peer-replicated write or a partial-write race). Without a
+ * signal, operators only saw the downstream symptom — missing
+ * snapshot entries → phantom recovered balances. With the hook,
+ * the corruption surfaces as a typed event/metric the caller can
+ * route through their own diagnostics pipeline.
+ *
+ * Implementations MUST NOT throw — `getEnvelopePayload` swallows
+ * any exception escaping the hook so the read path is not gated on
+ * observability quality of service. The hook is best-effort.
+ */
+export type GetEnvelopePayloadFallbackHook = (info: {
+  readonly key: string;
+  readonly errorMessage: string;
+}) => void;
+
+/**
  * Read the encrypted ciphertext at `key`.
  *
  * Dual-format reader for backwards compatibility:
@@ -129,10 +153,18 @@ export function unwrapEnvelopeBytes(bytes: Uint8Array): Uint8Array {
  *
  * NOTE: callers are responsible for decrypting the returned bytes
  * using their own encryption key.
+ *
+ * @param db   The Profile database adapter (OrbitDb-backed in prod).
+ * @param key  The dot-notation profile key to read.
+ * @param onFallback  Optional observability hook fired ONCE when the
+ *                    envelope decode threw and the function fell back
+ *                    to the raw-bytes path. See
+ *                    {@link GetEnvelopePayloadFallbackHook}.
  */
 export async function getEnvelopePayload(
   db: ProfileDatabase,
   key: string,
+  onFallback?: GetEnvelopePayloadFallbackHook,
 ): Promise<Uint8Array | null> {
   if (typeof db.getEntry === 'function') {
     try {
@@ -153,9 +185,20 @@ export async function getEnvelopePayload(
       // catches valid CBOR byte-strings) so we land here. Reading the
       // same key via `db.get` returns the raw ciphertext unchanged.
       //
-      // Suppress the error and try the fallback. Real failures (DB
-      // disconnect, transport error) surface from `db.get` below.
-      void err;
+      // Issue #280 — fire the optional observability hook so callers
+      // can detect live corruption (the silent path also masked
+      // genuine envelope-write damage, not just legacy bytes).
+      if (onFallback !== undefined) {
+        try {
+          onFallback({
+            key,
+            errorMessage: err instanceof Error ? err.message : String(err),
+          });
+        } catch {
+          // Best-effort signal — never propagate hook errors into the
+          // read path. A misbehaving observer cannot break reads.
+        }
+      }
     }
   }
   // Legacy adapter without structured-entry support OR getEntry decode

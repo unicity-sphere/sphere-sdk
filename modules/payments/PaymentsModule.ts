@@ -1235,6 +1235,32 @@ export interface UxfTransferFeatures {
    */
   readonly spentStateRescan?: boolean;
   /**
+   * Issue #280 — when `true` (default ON), trigger an immediate
+   * aggregator-spent rescan cycle synchronously after `load()`
+   * populates the token map. Defense-in-depth: catches tokens whose
+   * SENT/OUTBOX local records were missing (corrupt, lost, or never
+   * present — e.g. on cross-device recovery) by asking the aggregator
+   * whether each `'confirmed'` token's current destination state has
+   * been superseded. Superseded tokens are routed through the same
+   * disposition path as the periodic worker (`reason:
+   * 'off-record-spend'`).
+   *
+   * Without this flag, the SDK's periodic `SpentStateRescanWorker`
+   * eventually catches the divergence (default 5-minute interval) —
+   * but the user can attempt a double-spend in the interim. The
+   * recovery-time trigger closes that window for the high-risk
+   * post-recovery period.
+   *
+   * Requires `features.spentStateRescan === true` (the worker must
+   * be installed). When the worker is absent, this flag is a no-op.
+   * Bounded concurrency (8 by default, matches the worker's
+   * `MAX_CONCURRENT_SPENT_RESCANS`); large wallets do not serialize.
+   *
+   * Set `false` to suppress (e.g. cost-sensitive deployments accepting
+   * the periodic-sweep window, or tests that mock the aggregator).
+   */
+  readonly recoveryAggregatorCheck?: boolean;
+  /**
    * Phase 9.6.D — when `true` (default when `senderUxf` is on),
    * auto-install and start a {@link FinalizationWorkerSender} in
    * {@link PaymentsModule.initialize} so instant-mode sends drive the
@@ -1817,6 +1843,14 @@ export class PaymentsModule {
       // accept the reactive `transfer:double-spend-detected` surface
       // alone for off-record-spend detection).
       spentStateRescan: config?.features?.spentStateRescan ?? true,
+      // Issue #280 — recovery-time aggregator-spent sweep. Default ON.
+      // Triggers a synchronous immediate scan cycle from the installed
+      // SpentStateRescanWorker after `load()` populates the token map,
+      // catching tokens whose local SENT/OUTBOX records are missing
+      // (corrupted, lost, or never present on cross-device recovery)
+      // before the user can attempt a double-spend.
+      recoveryAggregatorCheck:
+        config?.features?.recoveryAggregatorCheck ?? true,
       // Phase 9.6.D — sender-side §6.1 finalization worker. Default-ON
       // when senderUxf is on: drives instant-mode sends through the full
       // submit/poll cycle so `transfer:confirmed` fires once the
@@ -3697,6 +3731,66 @@ export class PaymentsModule {
             `Orphan-spending sweep on load failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
           );
         });
+    }
+
+    // Issue #280 Layer 2 — fire-and-forget recovery-time aggregator-spent
+    // sweep. Defense-in-depth against missing/corrupt local SENT records
+    // (the Layer-1 fix in `oplog-envelope-io.ts` keeps the envelope
+    // reader robust; this sweep catches the residual case where the
+    // local profile genuinely lacks the spend record — typical of
+    // cross-device IPFS-only recovery).
+    //
+    // Drives the same `SpentStateRescanWorker` that runs periodically,
+    // but triggers ONE immediate scan cycle right after the token map
+    // is populated. The worker's own concurrency cap
+    // (MAX_CONCURRENT_SPENT_RESCANS = 4 by default; the issue brief
+    // mentioned 8-16 — the existing default is conservative enough
+    // for the post-recovery burst) bounds aggregator load.
+    //
+    // Self-skips when:
+    //   - features.recoveryAggregatorCheck === false (operator opt-out)
+    //   - features.spentStateRescan === false (worker not installed)
+    //   - this.spentStateRescanWorker === null (worker not constructed)
+    //
+    // Errors are caught and logged — a sweep failure cannot break
+    // load() for downstream callers (mirrors the orphan-sweep pattern).
+    if (
+      this.features.recoveryAggregatorCheck &&
+      this.features.spentStateRescan &&
+      this.spentStateRescanWorker !== null
+    ) {
+      const worker = this.spentStateRescanWorker;
+      void (async (): Promise<void> => {
+        try {
+          const result = await worker.runScanCycle();
+          if (result.skipped) {
+            logger.debug(
+              'Payments',
+              '[RECOVERY-SPENT-CHECK] Skipped (oracle unavailable)',
+            );
+            return;
+          }
+          if (result.spent > 0) {
+            logger.warn(
+              'Payments',
+              `[RECOVERY-SPENT-CHECK] Detected ${result.spent} off-record-spent token(s) ` +
+                `out of ${result.eligibleTotal} eligible candidate(s) on load ` +
+                `(unspent=${result.unspent}, threw=${result.threw}). ` +
+                `transfer:off-record-spent events fired; affected tokens routed to audit.`,
+            );
+          } else {
+            logger.debug(
+              'Payments',
+              `[RECOVERY-SPENT-CHECK] Clean (probed=${result.probed}, eligible=${result.eligibleTotal}, threw=${result.threw})`,
+            );
+          }
+        } catch (err) {
+          logger.warn(
+            'Payments',
+            `[RECOVERY-SPENT-CHECK] Sweep on load failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      })();
     }
   }
 
