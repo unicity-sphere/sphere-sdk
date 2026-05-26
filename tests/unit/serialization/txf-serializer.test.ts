@@ -385,8 +385,32 @@ describe('txfToToken()', () => {
     const token = txfToToken('inv-token-1', txf);
     expect(token.id).toBe('inv-token-1');
     expect(token.amount).toBe('0');
-    expect(token.coinId).toBe('');
     expect(token.sdkData).toBeDefined();
+  });
+
+  // Issue #282 (Residual #3) — phantom `: 0 (1 token)` on IPFS-recovery side.
+  // After clear+recovery the invoice token is reconstructed from storage via
+  // `txfToToken`. The pre-fix code left coinId/symbol empty because there
+  // was no invoice branch (only NFT was special-cased). That empty shape
+  // surfaced in `getAssets()` as confusing zero-value UI noise. Post-fix
+  // the invoice Token mirrors what AccountingModule produces at create
+  // time (`coinId=INVOICE_TOKEN_TYPE_HEX`, `symbol='INVOICE'`).
+  it('should restore symbolic invoice shape on round-trip (#282)', () => {
+    const txf = createMockTxf();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (txf.genesis.data as any).coinData = null;
+    txf.genesis.data.tokenType =
+      '14676a280bda4275baf865b67cd4c611bcd58c9bf8226d508acaa10a8fcaccc6'; // INVOICE_TOKEN_TYPE_HEX
+    txf.genesis.data.tokenData = '7b226d656d6f223a224d616e75616c2074657374227d';
+
+    const token = txfToToken('inv-token-282', txf);
+    expect(token.coinId).toBe(
+      '14676a280bda4275baf865b67cd4c611bcd58c9bf8226d508acaa10a8fcaccc6',
+    );
+    expect(token.symbol).toBe('INVOICE');
+    expect(token.name).toBe('Invoice');
+    expect(token.decimals).toBe(0);
+    expect(token.amount).toBe('0');
   });
 });
 

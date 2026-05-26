@@ -30,6 +30,7 @@ import {
 } from '../types/txf';
 import type { Token, TokenStatus } from '../types';
 import { TokenRegistry } from '../registry/TokenRegistry';
+import { INVOICE_TOKEN_TYPE_HEX } from '../constants';
 
 // =============================================================================
 // SDK Token Normalization
@@ -249,11 +250,38 @@ export function txfToToken(tokenId: string, txf: TxfToken): Token {
 
   const tokenType = txf.genesis.data.tokenType;
   const isNft = tokenType === '455ad8720656b08e8dbd5bac1f3c73eeea5431565f6c1c3af742b1aa12d41d89';
+  const isInvoice = tokenType === INVOICE_TOKEN_TYPE_HEX;
 
   const now = Date.now();
 
   const registry = TokenRegistry.getInstance();
   const def = registry.getDefinition(coinId);
+
+  // Issue #282 (Residual #3) — invoice tokens persist with `coinData: null`
+  // (per AccountingModule.createInvoice / importInvoice), so the coinId
+  // extraction above falls through to `''`. Without an explicit branch the
+  // returned Token surfaces in `getAssets()` as a phantom `: 0 (1 token)`
+  // entry on the IPFS-recovery side — confusing, zero-value UI noise.
+  //
+  // Restore the symbolic shape AccountingModule produces at create/import
+  // time so that downstream callers see the same Token after a round-trip
+  // through storage. `aggregateTokens` additionally filters invoices out
+  // of balance summaries — see PaymentsModule.aggregateTokens for the
+  // belt-and-braces guard.
+  if (isInvoice) {
+    return {
+      id: tokenId,
+      coinId: INVOICE_TOKEN_TYPE_HEX,
+      symbol: 'INVOICE',
+      name: 'Invoice',
+      decimals: 0,
+      amount: '0',
+      status: determineTokenStatus(txf),
+      createdAt: now,
+      updatedAt: now,
+      sdkData: JSON.stringify(txf),
+    };
+  }
 
   return {
     id: tokenId,

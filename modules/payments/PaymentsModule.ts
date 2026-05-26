@@ -60,7 +60,7 @@ import type {
   PaymentRequestResponse,
   PaymentRequestResponseHandler,
 } from '../../types';
-import { STORAGE_KEYS_ADDRESS } from '../../constants';
+import { STORAGE_KEYS_ADDRESS, INVOICE_TOKEN_TYPE_HEX } from '../../constants';
 import {
   tokenToTxf,
   txfToToken,
@@ -7999,8 +7999,25 @@ export class PaymentsModule {
 
   /**
    * Aggregate tokens by coinId with confirmed/unconfirmed breakdown.
-   * Excludes tokens with status 'spent' or 'invalid'.
-   * Tokens with status 'transferring' are counted as unconfirmed (visible in UI as "Sending").
+   *
+   * Excludes:
+   *   - tokens with status `'spent'` or `'invalid'`;
+   *   - invoice tokens (`coinId === INVOICE_TOKEN_TYPE_HEX`) — they carry
+   *     no monetary value and only exist as ledger anchors; surfacing them
+   *     produced the phantom `: 0 (1 token)` entry in #282 on the
+   *     IPFS-recovery side, where `txfToToken` had no invoice branch and
+   *     left coinId/symbol empty;
+   *   - defensive: any residual token with empty `coinId` (catch-all for
+   *     future shapes that slip past `txfToToken`'s typed branches).
+   *
+   * Tokens with status `'transferring'` are counted as unconfirmed
+   * (visible in UI as "Sending").
+   *
+   * The returned array is sorted deterministically by symbol (ASCII
+   * case-insensitive) with coinId as the tie-breaker. Without this sort,
+   * multi-device wallets render the same asset set in different orders
+   * because the underlying `this.tokens` Map iterates in insertion order
+   * — which depends on snapshot replay sequence (#282 Residual #1).
    */
   private aggregateTokens(coinId?: string): Asset[] {
     const assetsMap = new Map<string, {
@@ -8019,6 +8036,13 @@ export class PaymentsModule {
     for (const token of this.tokens.values()) {
       // Skip spent and invalid tokens; transferring tokens remain visible
       if (token.status === 'spent' || token.status === 'invalid') continue;
+      // Issue #282 Residual #3 — skip invoice tokens and any residual
+      // empty-coinId entries. Invoices carry zero amount and have no
+      // place in a balance summary; an empty coinId is a defensive
+      // catch-all for token shapes that fall through `txfToToken`'s
+      // typed branches.
+      if (token.coinId === INVOICE_TOKEN_TYPE_HEX) continue;
+      if (token.coinId === '') continue;
       if (coinId && token.coinId !== coinId) continue;
 
       const key = token.coinId;
@@ -8052,7 +8076,7 @@ export class PaymentsModule {
       }
     }
 
-    return Array.from(assetsMap.values()).map((raw) => {
+    const assets = Array.from(assetsMap.values()).map((raw) => {
       const totalAmount = (raw.confirmedAmount + raw.unconfirmedAmount).toString();
       return {
         coinId: raw.coinId,
@@ -8067,13 +8091,32 @@ export class PaymentsModule {
         confirmedTokenCount: raw.confirmedTokenCount,
         unconfirmedTokenCount: raw.unconfirmedTokenCount,
         transferringTokenCount: raw.transferringTokenCount,
-        priceUsd: null,
-        priceEur: null,
-        change24h: null,
-        fiatValueUsd: null,
-        fiatValueEur: null,
+        priceUsd: null as number | null,
+        priceEur: null as number | null,
+        change24h: null as number | null,
+        fiatValueUsd: null as number | null,
+        fiatValueEur: null as number | null,
       };
     });
+
+    // Issue #282 Residual #1 — deterministic asset order. Identical
+    // wallets on two devices MUST render the same `sphere balance` output
+    // regardless of token-insertion sequence.
+    assets.sort((a, b) => {
+      const sa = (a.symbol ?? '').toLocaleLowerCase('en-US');
+      const sb = (b.symbol ?? '').toLocaleLowerCase('en-US');
+      if (sa < sb) return -1;
+      if (sa > sb) return 1;
+      // Tie-break on coinId for cases where two assets share the same
+      // symbol (rare — registry-aliased coins, malformed metadata, etc.).
+      const ca = a.coinId ?? '';
+      const cb = b.coinId ?? '';
+      if (ca < cb) return -1;
+      if (ca > cb) return 1;
+      return 0;
+    });
+
+    return assets;
   }
 
   /**
