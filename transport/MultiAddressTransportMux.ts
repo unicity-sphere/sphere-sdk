@@ -1645,11 +1645,19 @@ export class MultiAddressTransportMux {
   // ===========================================================================
 
   /**
-   * Clear processed event IDs (e.g., on address change or periodic cleanup).
+   * Clear processed event IDs.
    *
-   * Issue #275: also cancels any pending persist timer and clears the
-   * `dedupHydrated` flag so the next subscribe round re-hydrates from
-   * storage (e.g., after a swap-in of address set).
+   * Currently unused — kept as part of the public surface for future
+   * forced-reset scenarios (e.g., a hypothetical "wipe dedup but keep
+   * connection" path). The Mux's dedup set is shared across all
+   * addresses, so address add/remove does NOT need to clear it — they
+   * legitimately share the same relay event stream. `Sphere.clear()`
+   * handles the full-wipe case via `storage.clear()`, which
+   * implicitly removes the persisted `MUX_PROCESSED_EVENT_IDS` key.
+   *
+   * Issue #275: when called, also cancels any pending persist timer
+   * and resets `dedupHydrated` so a follow-up `updateSubscriptions`
+   * re-hydrates from storage.
    */
   clearProcessedEvents(): void {
     this.processedEventIds.clear();
