@@ -75,8 +75,32 @@ export async function attachIdentityToProfileProviders(
   //
   // connect() is idempotent: a later `Sphere.init`-driven connect re-
   // entry observes `dbStatus==='attached'` and `connectPromise` latch
-  // and returns without a second attach.
-  await providers.storage.connect();
+  // and returns without a second attach. Sphere.init re-calls
+  // `storage.connect()` unconditionally after `oracle.initialize()` so
+  // a deferred Phase C pointer-layer build re-attempts with the now-
+  // available aggregator client (see `initializeProviders` in Sphere.ts).
+  //
+  // Half-state recovery: if connect() partially succeeded (Phase A
+  // local-cache connected; Phase B OrbitDB attach threw) and we just
+  // re-threw, the provider would be left at `status='connected'` +
+  // `dbStatus='error'`. The downstream catch in sphere.telco's
+  // `runProfileMigration` would treat the throw as non-fatal and
+  // spin up a SECOND provider pair, which would collide with this
+  // one's locked OrbitDB/IndexedDB blockstore handles. To prevent
+  // that, we proactively `disconnect()` on failure so the consumer
+  // sees a fully torn-down provider pair. The disconnect itself is
+  // best-effort — if it also throws, we still propagate the original
+  // connect() error verbatim so the operator sees the root cause.
+  try {
+    await providers.storage.connect();
+  } catch (connectErr) {
+    try {
+      await providers.storage.disconnect();
+    } catch {
+      // Best-effort cleanup — surface the original connect error.
+    }
+    throw connectErr;
+  }
 
   // Initialize the token storage so the consumer can immediately read
   // and write — mirrors the manual setIdentity + initialize sequence
