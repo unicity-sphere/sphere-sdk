@@ -172,4 +172,65 @@ describe('LifecycleManager.initialize() — tolerant of corrupt OrbitDB OpLog bl
     expect(known).toBeInstanceOf(Set);
     expect(known.size).toBe(0);
   });
+
+  it('emits storage:error with code BUNDLE_INDEX_REFRESH_FAILED so operators see the degraded state', async () => {
+    // Steelman finding #2 — without an event, the band-aid is invisible
+    // to operators. The downstream flush scheduler swallows its own
+    // listActiveBundles() throws, so a user-triggered migration could
+    // silently publish a bundle pointer reflecting only post-recovery
+    // state (orphaning anything the corrupt walk hid). The event MUST
+    // fire so consumers can refuse destructive writes when the bundle
+    // index baseline is known-stale.
+    const events: Array<{ type: string; code?: string }> = [];
+    provider.onEvent((ev) => {
+      if (ev.type === 'storage:error') {
+        events.push({ type: ev.type, code: (ev as { code?: string }).code });
+      }
+    });
+
+    await provider.initialize();
+
+    const bundleRefreshErrors = events.filter(
+      (e) => e.type === 'storage:error' && e.code === 'BUNDLE_INDEX_REFRESH_FAILED',
+    );
+    expect(bundleRefreshErrors.length).toBe(1);
+  });
+
+  it('does NOT emit storage:error when db.all() succeeds (healthy init)', async () => {
+    // Counter-test: make sure the event only fires on the broken path.
+    const healthyDb = (() => {
+      const store = new Map<string, Uint8Array>();
+      return {
+        async connect(_config: OrbitDbConfig) {},
+        async put(key: string, value: Uint8Array) { store.set(key, value); },
+        async get(key: string) { return store.get(key) ?? null; },
+        async del(key: string) { store.delete(key); },
+        async all(prefix?: string) {
+          const out = new Map<string, Uint8Array>();
+          for (const [k, v] of store) {
+            if (!prefix || k.startsWith(prefix)) out.set(k, v);
+          }
+          return out;
+        },
+        async close() {},
+        onReplication() { return () => {}; },
+        isConnected() { return true; },
+      } as ProfileDatabase;
+    })();
+
+    const healthyProvider = createProvider(healthyDb);
+    const events: Array<{ type: string; code?: string }> = [];
+    healthyProvider.onEvent((ev) => {
+      if (ev.type === 'storage:error') {
+        events.push({ type: ev.type, code: (ev as { code?: string }).code });
+      }
+    });
+
+    await healthyProvider.initialize();
+
+    const bundleRefreshErrors = events.filter(
+      (e) => e.code === 'BUNDLE_INDEX_REFRESH_FAILED',
+    );
+    expect(bundleRefreshErrors.length).toBe(0);
+  });
 });
