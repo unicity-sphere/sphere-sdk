@@ -85,7 +85,7 @@ import { TOKEN_A } from '../fixtures/uxf-mock-tokens';
  * this string (from `v1` to `v2`, etc.) is the W44-mandated knob that
  * forces an ADR alongside any deliberate format change.
  */
-const EXPECTED_MARKER = 'T.2.D.REFERENCE.SNAPSHOT.v3';
+const EXPECTED_MARKER = 'T.2.D.REFERENCE.SNAPSHOT.v5';
 
 /** Env-var seam — when truthy, the test writes a fresh CAR to disk. */
 const REGEN_ENV = 'UXF_T2D_REFERENCE_SNAPSHOT_REGEN';

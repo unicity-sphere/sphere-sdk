@@ -536,7 +536,13 @@ export const TOKEN_F: Record<string, unknown> = {
               },
               merkleTreePath: {
                 root: 'ff5400e0000000000000000000000000000000000000000000000000000000a1',
-                steps: [],
+                // Issue #295 rewrite #2: STS requires at least one step.
+                steps: [
+                  {
+                    data: 'ff5656e500000000000000000000000000000000000000000000000000000099',
+                    path: '0',
+                  },
+                ],
               },
               transactionHash:
                 'ff5694a5400000000000000000000000000000000000000000000000005690a1',
@@ -644,7 +650,18 @@ export const EDGE_NULL_PROOF: Record<string, unknown> = {
       },
       merkleTreePath: {
         root: '25400e0000000000000000000000000000000000000000000000000000000041',
-        steps: [],
+        // Issue #295 rewrite #2: SparseMerkleTreePath.fromJSON requires
+        // at least one step (state-transition-sdk
+        // SparseMerkleTreePath.js#isJSON). EDGE_NULL_PROOF tests the
+        // transaction's null inclusionProof, so the genesis proof
+        // structure is incidental — give it a minimal valid 1-step
+        // path so STS can parse it.
+        steps: [
+          {
+            data: '2556e50000000000000000000000000000000000000000000000000000000099',
+            path: '0',
+          },
+        ],
       },
       transactionHash: '25694a5400000000000000000000000000000000000000000000000000002501',
       unicityCertificate:
@@ -697,7 +714,13 @@ export const EDGE_NULL_COINDATA: Record<string, unknown> = {
       },
       merkleTreePath: {
         root: '2c400e0000000000000000000000000000000000000000000000000000000041',
-        steps: [],
+        // Issue #295 rewrite #2: STS requires at least one step.
+        steps: [
+          {
+            data: '2c56e50000000000000000000000000000000000000000000000000000000099',
+            path: '0',
+          },
+        ],
       },
       transactionHash: '2c694a540000000000000000000000000000000000000000000000000000c601',
       unicityCertificate:

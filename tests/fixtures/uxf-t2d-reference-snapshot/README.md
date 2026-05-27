@@ -92,6 +92,72 @@ Required steps:
 
 ## Bump history
 
+### v5 — Embed SmtPath as opaque STS-canonical CBOR (issue #295 rewrite #2)
+
+The v4 bump still left UXF reaching into STS's encoding by calling
+`BigintConverter.encode` directly inside `prepareSmtSegments`. That
+remained a layer violation: UXF was still touching the bytes layout
+of an aggregator-issued SMT path step, even if via STS's encoder.
+
+The v5 rewrite goes deeper. UXF now treats the InclusionProof's
+`merkleTreePath` as a fully opaque blob:
+
+  - The SmtPath element content changes from `{root, segments[]}` to
+    `{cbor: <opaque-bytes>}`.
+  - The bytes are produced by `SparseMerkleTreePath.toCBOR()` at
+    deconstruct time and consumed by `SparseMerkleTreePath.fromCBOR()`
+    at assemble time.
+  - UXF imports no STS encoding utility (`BigintConverter` etc.) —
+    only the high-level `SparseMerkleTreePath` class.
+  - If a bit-length error is ever to be thrown, it is STS's job to
+    throw it, not UXF's.
+
+This is the architectural separation the user mandated: "The unicity
+proof and its binary representation must not be of UXF concern, it's
+token state transition concern and the error must be thrown by the
+token state transition. We must not mix the concerns between
+different abstraction layers."
+
+Bytes shifted: the v4 fixture's SmtPath element body was a 3-step
+segment array (segment-level CBOR overhead per step). The v5 body
+is a single bstr carrying the STS-canonical CBOR array (no per-UXF
+overhead). TOKEN_A's bundle shrank from 2353 to 2317 bytes (~36-byte
+drop). Dedup granularity is UNCHANGED — the pool always dedups at
+the whole-element level via ContentHash; segments were inline content
+inside a single `putElement` call, never separate pool entries.
+
+`_marker` bumped to `T.2.D.REFERENCE.SNAPSHOT.v5`. SPEC §11 updated
+to match (CDDL: `smt-path = bstr`).
+
+### v4 — Delegate SMT path encoding to state-transition-sdk (issue #295)
+
+The v2 bump introduced a UXF-local SMT path encoder (`bigIntTo32Bytes`)
+that fixed-width-padded every path to 32 bytes. The v2 ADR closed the
+"cborg cannot encode > uint64" problem at the cost of inventing a
+bespoke wire format for what is fundamentally a state-transition-sdk
+concern: the bytes layout of an aggregator-issued SMT path step is
+owned by STS, not by UXF.
+
+Pre-#295, that bespoke encoder additionally capped paths at 256 bits,
+which rejected legitimate proofs whose `BitString(34-byte imprint)`
+walkback produced 257..273-bit step values — blocking Profile-mode
+migration with `[UXF:INVALID_HASH] SMT path exceeds 256 bits`.
+
+Issue #295 (rewrite) replaces the bespoke encoder with delegation to
+`BigintConverter.encode` / `BigintConverter.decode` from STS. Encoding
+is now minimum-byte big-endian (no leading-zero padding); `0n` ↔ empty
+bstr. UXF imposes no bit-length ceiling on the path — the bound is
+whatever STS's `SparseMerkleTreePath` produces today.
+
+Bytes shifted: TOKEN_A's mock paths (`'0'`, `'1'`, `'9999999999999999999'`)
+were previously encoded as 32-byte fixed bstrs; they are now 0, 1, and
+8 bytes respectively. The bundle shrank from 2443 to 2353 bytes
+(≈90-byte drop across the three SmtPath segments).
+
+`_marker` bumped to `T.2.D.REFERENCE.SNAPSHOT.v4`. ADR documented
+inline in `uxf/hash.ts::prepareSmtSegments` (delegation rationale) and
+in issue #295's PR description.
+
 ### v3 — Align IPLD element form with hash canonical form (issue #213 Option C)
 
 `uxf/ipld.ts:elementToIpldBlock` used to encode `children` references as

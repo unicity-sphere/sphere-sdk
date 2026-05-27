@@ -13,6 +13,7 @@
  */
 
 import { decode } from '@ipld/dag-cbor';
+import { SparseMerkleTreePath } from '@unicitylabs/state-transition-sdk/lib/mtree/plain/SparseMerkleTreePath.js';
 
 import type {
   ContentHash,
@@ -218,20 +219,55 @@ function assemblePendingAuthenticator(
 }
 
 /**
- * Assemble an smt-path element into `{ root, steps[] }`.
+ * Assemble an smt-path element back to the SDK's
+ * `ISparseMerkleTreePathJson` shape.
+ *
+ * Issue #295 (rewrite #2): the SmtPath element content is a single
+ * opaque STS-canonical CBOR blob. We reconstruct the SDK object via
+ * `SparseMerkleTreePath.fromCBOR()` and emit its `toJSON()` shape so
+ * downstream verifiers receive exactly the shape they expect. UXF
+ * does NOT inspect the path bytes.
  */
 function assembleSmtPath(
   pool: ElementPool,
   pathHash: ContentHash,
   ctx: AssemblyContext,
-): { root: string; steps: Array<{ data: string; path: string }> } {
+): { root: string; steps: Array<{ data: string | null; path: string }> } {
   const el = resolveAndVerify(pool, pathHash, ctx, 'smt-path');
   const c = el.content as unknown as SmtPathContent;
-  const steps = c.segments.map((seg) => ({
-    data: seg.data,
-    path: seg.path,
-  }));
-  return { root: c.root, steps };
+  // Defensive guard (steelman): a malformed bundle may carry a
+  // missing / null / non-string `cbor` field; the byte-field path in
+  // `prepareContentForHashing` normalizes empty values to null at
+  // hash time (Wave H), so by the assemble boundary the value MAY
+  // legitimately be null. Reject explicitly with a typed UxfError
+  // rather than letting `hexToBytesInline(undefined)` throw a raw
+  // TypeError.
+  if (typeof c.cbor !== 'string' || c.cbor.length === 0) {
+    throw new UxfError(
+      'INVALID_PACKAGE',
+      `SmtPath element has missing or empty cbor field (pathHash=${pathHash})`,
+    );
+  }
+  // Convert hex -> Uint8Array, then hand off to STS for decoding.
+  // UXF does NOT touch the path's binary representation beyond hex<->bytes.
+  const bytes = hexToBytesInline(c.cbor);
+  const sdkPath = SparseMerkleTreePath.fromCBOR(bytes);
+  return sdkPath.toJSON() as { root: string; steps: Array<{ data: string | null; path: string }> };
+}
+
+/**
+ * Convert a lowercase-hex string to a Uint8Array. Local helper to
+ * avoid pulling in core/crypto into the assemble surface.
+ */
+function hexToBytesInline(hex: string): Uint8Array {
+  if (hex.length % 2 !== 0) {
+    throw new UxfError('INVALID_HASH', `Hex string has odd length: ${hex.length}`);
+  }
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    out[i / 2] = parseInt(hex.substring(i, i + 2), 16);
+  }
+  return out;
 }
 
 /**
@@ -283,7 +319,7 @@ function assembleInclusionProof(
   ctx: AssemblyContext,
 ): {
   authenticator: { algorithm: string; publicKey: string; signature: string; stateHash: string } | null;
-  merkleTreePath: { root: string; steps: Array<{ data: string; path: string }> };
+  merkleTreePath: { root: string; steps: Array<{ data: string | null; path: string }> };
   transactionHash: string | null;
   unicityCertificate: string;
 } {

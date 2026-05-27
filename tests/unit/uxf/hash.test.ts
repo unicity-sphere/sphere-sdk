@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { SparseMerkleTreePath } from '@unicitylabs/state-transition-sdk/lib/mtree/plain/SparseMerkleTreePath.js';
 import {
   hexToBytes,
   prepareContentForHashing,
@@ -109,57 +110,34 @@ describe('prepareContentForHashing', () => {
     expect(result.reason).toBe(reason);
   });
 
-  it('converts SmtPath segments data to bytes and path to 32-byte bstr', () => {
+  it('treats smt-path cbor field as an opaque byte-field (hex string -> Uint8Array)', () => {
+    // Issue #295 (rewrite #2): SmtPath content is a single opaque
+    // `cbor` byte-field — UXF does NOT decompose into {root, segments}.
+    // BYTE_FIELDS['smt-path'] = {'cbor'} so the hex value converts to
+    // Uint8Array via the generic byte-field path.
+    const opaqueHex = 'd9f6818220a0' /* arbitrary CBOR bytes */ + '00';
     const result = prepareContentForHashing('smt-path', {
-      segments: [{ data: 'aabb', path: '42' }],
+      cbor: opaqueHex,
     });
-    const segments = result.segments as Array<{ data: Uint8Array | null; path: Uint8Array }>;
-    expect(segments[0].data).toEqual(new Uint8Array([0xaa, 0xbb]));
-    // path=42 encoded as 32-byte big-endian bstr
-    const expectedPath = new Uint8Array(32);
-    expectedPath[31] = 42;
-    expect(segments[0].path).toBeInstanceOf(Uint8Array);
-    expect(segments[0].path).toEqual(expectedPath);
+    expect(result.cbor).toBeInstanceOf(Uint8Array);
+    // Length must match the hex (each byte = 2 hex chars).
+    expect((result.cbor as Uint8Array).length).toBe(opaqueHex.length / 2);
   });
 
-  it('handles SmtPath segments with null data', () => {
-    const result = prepareContentForHashing('smt-path', {
-      segments: [{ data: null, path: '0' }],
-    });
-    const segments = result.segments as Array<{ data: Uint8Array | null; path: Uint8Array }>;
-    expect(segments[0].data).toBeNull();
-    // path=0 encoded as 32 zero bytes
-    expect(segments[0].path).toBeInstanceOf(Uint8Array);
-    expect(segments[0].path).toEqual(new Uint8Array(32));
-  });
-
-  it('encodes a full 256-bit SMT path as 32-byte bstr without throwing', () => {
-    // The maximum 256-bit value: 2^256 - 1
-    const max256 = (2n ** 256n - 1n).toString();
-    const result = prepareContentForHashing('smt-path', {
-      segments: [{ data: null, path: max256 }],
-    });
-    const segments = result.segments as Array<{ data: Uint8Array | null; path: Uint8Array }>;
-    expect(segments[0].path).toBeInstanceOf(Uint8Array);
-    expect(segments[0].path).toHaveLength(32);
-    // All 32 bytes should be 0xff
-    expect(segments[0].path).toEqual(new Uint8Array(32).fill(0xff));
-  });
-
-  it('256-bit SMT path round-trips through dag-cbor encode without throwing', async () => {
-    // Real testnet SMT paths can be 256-bit. dag-cbor must not throw.
+  it('smt-path cbor byte-field is passed through verbatim to dag-cbor', async () => {
     const { encode } = await import('@ipld/dag-cbor');
-    const realTestnetPath = (2n ** 255n + 12345n).toString(); // >2^64-1
+    // Use a fixed hex blob — what STS would produce — and verify
+    // dag-cbor encodes it as a single CBOR bstr unchanged.
+    const opaqueHex = 'a1646372616672' /* fake STS-shaped bytes */;
     const result = prepareContentForHashing('smt-path', {
-      root: 'ab'.repeat(32),
-      segments: [{ data: 'cd'.repeat(32), path: realTestnetPath }],
+      cbor: opaqueHex,
     });
-    // Must not throw "encountered BigInt larger than allowable range"
+    // Must not throw; UXF never touches the payload.
     expect(() => encode(result)).not.toThrow();
-    // Output must be deterministic
-    const encoded1 = encode(result);
-    const encoded2 = encode(result);
-    expect(encoded1).toEqual(encoded2);
+    // Determinism: two calls -> same bytes.
+    const a = encode(result);
+    const b = encode(result);
+    expect(a).toEqual(b);
   });
 
   it('converts transaction-data nametagRefs to byte arrays', () => {
@@ -499,138 +477,69 @@ describe('computeElementHash', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Steelman regression — FIX 11: prepareSmtSegments path field is now
-// validated against /^(0|[1-9][0-9]*)$/ before BigInt() coerces it.
-// BigInt() accepts " 100 ", "00100", "+100", "0xff" — none of which are
-// canonical decimals; a hostile peer could otherwise smuggle a path
-// under a non-canonical representation.
+// Issue #295 (rewrite #2) — UXF embeds InclusionProof's SMT path as an
+// opaque STS-canonical CBOR blob. UXF does NOT decompose, does NOT
+// inspect, and does NOT impose a bit-length limit on the path.
+// Encoding and decoding are owned by state-transition-sdk
+// (`SparseMerkleTreePath.toCBOR()` / `.fromCBOR()`).
 // ---------------------------------------------------------------------------
 
-describe('prepareSmtSegments — strict decimal regex on path (FIX 11)', () => {
-  function attempt(path: string): UxfError | null {
-    try {
-      prepareContentForHashing('smt-path', {
-        segments: [{ data: 'aabb', path }],
-      });
-      return null;
-    } catch (e) {
-      return e as UxfError;
-    }
-  }
+describe('Issue #295 — UXF treats SmtPath as opaque STS-canonical CBOR', () => {
+  it('passes any STS-shaped CBOR blob through unmodified to dag-cbor encode', async () => {
+    const { encode } = await import('@ipld/dag-cbor');
+    // Build a real STS-canonical CBOR blob by deconstructing a
+    // SparseMerkleTreePath. This is the only test in hash.ts that
+    // touches STS — the test exercises the contract that UXF
+    // forwards whatever STS gives it.
+    const sdkPath = SparseMerkleTreePath.fromJSON({
+      root: '00'.repeat(32),
+      steps: [
+        // A small step plus the user-reported 259-bit walkback value.
+        { path: '42', data: null },
+        {
+          path:
+            '463173912653332971197029146511962916219743101902252076413000309295050477951098',
+          data: 'aa'.repeat(32),
+        },
+      ],
+    });
+    const cborBytes = sdkPath.toCBOR();
+    const cborHex = Array.from(cborBytes)
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
 
-  it('rejects whitespace-padded " 100 "', () => {
-    const err = attempt(' 100 ');
-    expect(err).not.toBeNull();
-    expect(err!.code).toBe('INVALID_INPUT');
+    const result = prepareContentForHashing('smt-path', { cbor: cborHex });
+    // UXF converts hex -> Uint8Array via BYTE_FIELDS but otherwise
+    // forwards the bytes verbatim. The bytes are the STS-canonical
+    // form, not anything UXF synthesised.
+    expect(result.cbor).toBeInstanceOf(Uint8Array);
+    expect(Array.from(result.cbor as Uint8Array)).toEqual(Array.from(cborBytes));
+
+    // Round-trip through dag-cbor — must not throw and must be
+    // deterministic.
+    expect(() => encode(result)).not.toThrow();
+    const a = encode(result);
+    const b = encode(result);
+    expect(a).toEqual(b);
   });
 
-  it('rejects leading-zero "00100"', () => {
-    const err = attempt('00100');
-    expect(err).not.toBeNull();
-    expect(err!.code).toBe('INVALID_INPUT');
-  });
-
-  it('rejects positive-sign "+100"', () => {
-    const err = attempt('+100');
-    expect(err).not.toBeNull();
-    expect(err!.code).toBe('INVALID_INPUT');
-  });
-
-  it('rejects hex literal "0xff"', () => {
-    const err = attempt('0xff');
-    expect(err).not.toBeNull();
-    expect(err!.code).toBe('INVALID_INPUT');
-  });
-
-  it('rejects empty string', () => {
-    const err = attempt('');
-    expect(err).not.toBeNull();
-    expect(err!.code).toBe('INVALID_INPUT');
-  });
-
-  it('rejects negative "-1"', () => {
-    const err = attempt('-1');
-    expect(err).not.toBeNull();
-    expect(err!.code).toBe('INVALID_INPUT');
-  });
-
-  it('rejects fractional "1.5"', () => {
-    const err = attempt('1.5');
-    expect(err).not.toBeNull();
-    expect(err!.code).toBe('INVALID_INPUT');
-  });
-
-  it('accepts canonical "0"', () => {
-    const err = attempt('0');
-    expect(err).toBeNull();
-  });
-
-  it('accepts canonical "12345"', () => {
-    const err = attempt('12345');
-    expect(err).toBeNull();
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Steelman³ regression — FIX 4 (Round 3): SMT path decimal length cap.
-// ---------------------------------------------------------------------------
-
-describe('parseSmtPathDecimal — length cap (FIX 4, Round 3)', () => {
-  function attempt(path: string): UxfError | null {
-    try {
-      prepareContentForHashing('smt-path', {
-        segments: [{ data: 'aabb', path }],
-      });
-      return null;
-    } catch (e) {
-      return e as UxfError;
-    }
-  }
-
-  it('rejects 79-digit decimal (uint256 max + 1 digit) with LIMIT_EXCEEDED', () => {
-    // 78-digit max for uint256; 79 digits is one over. The string
-    // passes the regex (no leading zero) but exceeds the length cap.
-    const path = '1' + '0'.repeat(78); // 79 digits total, valid regex
-    const err = attempt(path);
-    expect(err).not.toBeNull();
-    expect(err!.code).toBe('LIMIT_EXCEEDED');
-    expect(String(err!.message)).toMatch(/MAX_SMT_PATH_DECIMAL_LENGTH/);
-  });
-
-  it('rejects 1000-digit decimal with LIMIT_EXCEEDED', () => {
-    const path = '1' + '0'.repeat(999);
-    const err = attempt(path);
-    expect(err).not.toBeNull();
-    expect(err!.code).toBe('LIMIT_EXCEEDED');
-  });
-
-  it('rejects 1-MiB decimal string with LIMIT_EXCEEDED (memory bloat DoS)', () => {
-    // Hostile case: 1-MiB string of `9`s. Cap MUST fire before BigInt()
-    // is invoked.
-    const path = '9'.repeat(1024 * 1024);
-    const err = attempt(path);
-    expect(err).not.toBeNull();
-    expect(err!.code).toBe('LIMIT_EXCEEDED');
-  });
-
-  it('accepts 78-digit decimal (uint256 max boundary)', () => {
-    // 2^256 - 1 ≈ 1.158e77 → 78 digits. Take a value that fits.
-    // Use `9` * 78 — that's actually larger than uint256 max but the
-    // length cap is the only thing under test here; bigIntTo32Bytes
-    // would later reject it. The length boundary IS 78 digits.
-    const path = '9'.repeat(78);
-    const err = attempt(path);
-    // Length cap allows 78 digits; downstream `bigIntTo32Bytes` may
-    // reject because 9*78 > 2^256. That's the next layer's job, not
-    // the length cap. So we expect either null OR an error from a
-    // downstream layer (NOT LIMIT_EXCEEDED from this cap).
-    if (err !== null) {
-      expect(err.code).not.toBe('LIMIT_EXCEEDED');
-    }
-  });
-
-  it('accepts "0" (boundary)', () => {
-    const err = attempt('0');
-    expect(err).toBeNull();
+  it('does not impose any bit-length limit on the path content (UXF layer)', () => {
+    // Build an STS path with a 273-bit step (the BitString(34-byte
+    // imprint) ceiling). UXF must accept the STS-canonical bytes
+    // without throwing.
+    const sdkPath = SparseMerkleTreePath.fromJSON({
+      root: '11'.repeat(32),
+      steps: [
+        { path: (2n ** 273n - 1n).toString(), data: 'bb'.repeat(32) },
+      ],
+    });
+    const cborBytes = sdkPath.toCBOR();
+    const cborHex = Array.from(cborBytes)
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+    // No UXF-level throw.
+    expect(() =>
+      prepareContentForHashing('smt-path', { cbor: cborHex }),
+    ).not.toThrow();
   });
 });

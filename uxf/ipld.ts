@@ -850,32 +850,10 @@ function decodeIpldContentArray(
   key: string,
   value: unknown[],
 ): unknown[] {
-  // smt-path segments: array of { data: Uint8Array|null, path: Uint8Array }
-  // `path` is stored as a fixed-width 32-byte big-endian bstr (see hash.ts
-  // bigIntTo32Bytes). Decode back to a decimal bigint string for the SDK layer.
-  if (type === 'smt-path' && key === 'segments') {
-    return value.map((seg) => {
-      const s = seg as { data: Uint8Array | null; path: Uint8Array | bigint };
-      let pathStr: string;
-      if (s.path instanceof Uint8Array) {
-        // Decode 32-byte big-endian bstr -> decimal bigint string
-        let v = 0n;
-        for (const byte of s.path) {
-          v = (v << 8n) | BigInt(byte);
-        }
-        pathStr = v.toString();
-      } else if (typeof s.path === 'bigint') {
-        // Legacy: path was stored as bigint in earlier builds (pre-fix)
-        pathStr = s.path.toString();
-      } else {
-        pathStr = String(s.path);
-      }
-      return {
-        data: s.data instanceof Uint8Array ? bytesToHex(s.data) : s.data,
-        path: pathStr,
-      };
-    });
-  }
+  // Issue #295 (rewrite #2): the previous `smt-path` segments special
+  // case is gone. SmtPath is now a single opaque STS-canonical CBOR
+  // bstr — the generic byte-field path (decodeIpldContent) handles it
+  // verbatim. UXF does NOT decode the path bytes.
 
   // transaction-data nametagRefs: array of Uint8Array -> array of hex strings
   if (type === 'transaction-data' && key === 'nametagRefs') {

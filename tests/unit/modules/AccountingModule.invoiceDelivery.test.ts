@@ -217,7 +217,8 @@ function _buildMintedJson(): Record<string, unknown> {
           signature: '0'.repeat(128),
           stateHash: '0'.repeat(64),
         },
-        merkleTreePath: { root: '0'.repeat(64), steps: [] },
+        // Issue #295 rewrite #2: STS requires ≥1 step.
+        merkleTreePath: { root: '0'.repeat(64), steps: [{ path: '0', data: '0'.repeat(64) }] },
         transactionHash: '0'.repeat(64),
         unicityCertificate: '0'.repeat(256),
       },
@@ -269,7 +270,8 @@ vi.mock('@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils', () => 
       signature: '0'.repeat(128),
       stateHash: '0'.repeat(64),
     },
-    merkleTreePath: { root: '0'.repeat(64), steps: [] },
+    // Issue #295 rewrite #2: STS requires ≥1 step.
+    merkleTreePath: { root: '0'.repeat(64), steps: [{ path: '0', data: '0'.repeat(64) }] },
     transactionHash: '0'.repeat(64),
     unicityCertificate: '0'.repeat(256),
   }),
@@ -282,7 +284,8 @@ vi.mock('@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils.js', () 
       signature: '0'.repeat(128),
       stateHash: '0'.repeat(64),
     },
-    merkleTreePath: { root: '0'.repeat(64), steps: [] },
+    // Issue #295 rewrite #2: STS requires ≥1 step.
+    merkleTreePath: { root: '0'.repeat(64), steps: [{ path: '0', data: '0'.repeat(64) }] },
     transactionHash: '0'.repeat(64),
     unicityCertificate: '0'.repeat(256),
   }),

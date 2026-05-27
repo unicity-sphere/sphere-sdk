@@ -284,13 +284,20 @@ A BFT-signed aggregator round commitment. The primary deduplication target: all 
 
 #### 2.2.11 SmtPath (0x0D)
 
-A complete Sparse Merkle Tree path from leaf to root.
+A complete Sparse Merkle Tree path from leaf to root, embedded as an
+opaque STS-canonical CBOR blob.
 
 | Field | Type | Required | Reference | Description |
 |-------|------|----------|-----------|-------------|
 | `header` | ElementHeader | yes | -- | Element header |
-| `root` | bytes(32) | yes | leaf | SMT root hash |
-| `segments` | array\<[bytes, bytes]\> | yes | leaf | Array of [data, path] tuples, ordered leaf to root. Each tuple contains the sibling hash and the path direction indicator at that tree level. |
+| `cbor` | bytes | yes | leaf | Opaque STS-canonical CBOR encoding of the `SparseMerkleTreePath`. Produced by `SparseMerkleTreePath.toCBOR()` from `state-transition-sdk` and consumed by `SparseMerkleTreePath.fromCBOR()`. **UXF does not decompose, inspect, or validate this blob.** The binary representation (including any per-step bit-length bounds) is owned entirely by STS; if STS surfaces an error (e.g. a malformed step), UXF propagates it verbatim. |
+
+**Architectural rationale (issue #295):** prior revisions of this
+element decomposed the path into `{root, segments[*]}` and required
+UXF to know how to encode each segment's path bigint. That was a
+layer violation — the Unicity proof's wire format is STS's concern.
+The opaque-embed form keeps the abstraction clean: UXF only ferries
+the blob through the CBOR envelope.
 
 **Mutability:** Instance-chain-eligible (consolidation).
 
@@ -809,10 +816,18 @@ token-coin-data = #6.786444([
 
 smt-path = #6.786445([
   header: element-header,
-  root: bstr .size 32,
-  segments: [* [bstr, bstr]]
+  cbor: bstr
 ])
 ```
+
+**Note (smt-path opaque blob):** the `cbor` bstr carries the
+state-transition-sdk-canonical CBOR encoding of a
+`SparseMerkleTreePath` (produced by `.toCBOR()`, consumed by
+`.fromCBOR()`). UXF does not parse, validate, or impose any
+bit-length constraint on the blob; the entire binary representation —
+including the array-of-steps structure and per-step path encoding —
+is STS's responsibility. If STS adds a validation rule (e.g. a
+bit-length ceiling), UXF surfaces the resulting error verbatim.
 
 #### 6a.3 Deterministic Encoding
 
@@ -941,9 +956,9 @@ Self-contained token in ITokenJson or TxfToken format.
 | `genesis.data.reason` | no (inline) | -- | In MintTransactionData |
 | `genesis.inclusionProof` | yes | InclusionProof | Sub-DAG root |
 | `genesis.inclusionProof.authenticator` | yes | Authenticator | |
-| `genesis.inclusionProof.merkleTreePath` | yes | SmtPath | Contains inline segments |
-| `genesis.inclusionProof.merkleTreePath.root` | no (inline) | -- | In SmtPath |
-| `genesis.inclusionProof.merkleTreePath.steps[]` | no (inline) | -- | Inlined as [data, path] tuples in SmtPath.segments |
+| `genesis.inclusionProof.merkleTreePath` | yes | SmtPath | Opaque STS-canonical CBOR (issue #295 rewrite #2) |
+| `genesis.inclusionProof.merkleTreePath.root` | no (opaque) | -- | Inside `SmtPath.cbor` blob; UXF does not surface it as a separate field |
+| `genesis.inclusionProof.merkleTreePath.steps[]` | no (opaque) | -- | Inside `SmtPath.cbor` blob; entirely owned by STS |
 | `genesis.inclusionProof.transactionHash` | no (inline) | -- | In InclusionProof |
 | `genesis.inclusionProof.unicityCertificate` | yes | UnicityCertificate | Major dedup target |
 | genesis destination state | yes | TokenState | Derived |
@@ -1056,9 +1071,9 @@ A UCT token minted to Alice, transferred to Bob, then to Carol.
 [H_state_1]      TokenState            predicate: <inline bytes>, data: ""
 [H_state_2]      TokenState            predicate: <inline bytes>, data: ""
 [H_mintdata]     MintTransactionData   tokenId, tokenType, coinData: [["UCT","1000000"]], salt, recipient...
-[H_smtpath_gen]  SmtPath               root: ..., segments: [[data0A, path0A], [data1, path1], [data2, path2]]
-[H_smtpath_tx1]  SmtPath               root: ..., segments: [[data0B, path0B], [data1, path1], [data2, path2]]
-[H_smtpath_tx2]  SmtPath               root: ..., segments: [[data0C, path0C], [data1, path1], [data2, path2]]
+[H_smtpath_gen]  SmtPath               cbor: <opaque STS-canonical bytes for the genesis path>
+[H_smtpath_tx1]  SmtPath               cbor: <opaque STS-canonical bytes for tx1 path>
+[H_smtpath_tx2]  SmtPath               cbor: <opaque STS-canonical bytes for tx2 path>
 [H_auth_gen]     Authenticator         algorithm, publicKey: alice, signature, stateHash
 [H_auth_tx1]     Authenticator         algorithm, publicKey: alice, signature, stateHash
 [H_auth_tx2]     Authenticator         algorithm, publicKey: bob, signature, stateHash
@@ -1078,7 +1093,7 @@ A UCT token minted to Alice, transferred to Bob, then to Carol.
 
 **Note:** In the default Phase 1 decomposition, predicates are stored inline within TokenState elements and coinData is stored inline within MintTransactionData. No separate Predicate or TokenCoinData elements are created. The 22 elements break down as: 3 TokenState, 1 MintTransactionData, 3 SmtPath, 3 Authenticator, 3 UnicityCertificate, 3 InclusionProof, 1 GenesisTransaction, 2 TransferTransaction, 2 TransferTransactionData, 1 TokenRoot.
 
-**Deduplication:** SmtPath segments are inlined, so deduplication of shared path data happens at the SmtPath level -- if two proofs have identical paths (same round, same tree), the entire SmtPath element is deduplicated.
+**Deduplication:** the SmtPath element body is a single opaque STS-canonical CBOR blob (issue #295 rewrite #2). Deduplication operates at the whole-SmtPath granularity -- if two proofs carry identical paths (same round, same tree, same step sequence), the entire SmtPath element is deduplicated via ContentHash. Per-segment dedup is not supported (and never fired in practice, since step paths are leaf-unique).
 
 **Manifest:** `{ "aaaa1111...": H_root }`
 
@@ -1097,7 +1112,7 @@ H_smtpath_round200 (SmtPath)    -- if both tokens have identical paths (same rou
   H_proofB_tx1.merkleTreePath = H_smtpath_round200
 ```
 
-Paths that are fully identical (same round, same tree) are deduplicated as whole SmtPath elements. Paths that differ only in lower segments are stored as separate SmtPath elements with their segments inlined.
+Paths that are byte-identical (same round, same tree, same opaque STS-canonical CBOR encoding) are deduplicated as whole SmtPath elements. Paths that differ in any byte (including step structure or any path bigint) are stored as separate SmtPath elements.
 
 Without UXF: 4 certificates, 6 SMT paths. With UXF: 3 certificates, shared SmtPath elements where paths are identical.
 
