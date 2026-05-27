@@ -292,11 +292,15 @@ describe('awaitNextFlush — no-deadline mode (migration bulk-import fix)', () =
     await provider.shutdown();
   });
 
-  it('timer is NOT allocated in no-deadline mode (no late-fire risk)', async () => {
+  it('TIMEOUT-rejection setTimeout is NOT allocated in no-deadline mode', async () => {
     // The pre-fix code unconditionally created a setTimeout(...) racer
-    // even when not needed. With no-deadline mode we skip Promise.race
-    // entirely. We probe this by counting setTimeout invocations
-    // around a single awaitNextFlush call.
+    // whose callback rejected with `new SphereError('awaitNextFlush:
+    // timeout awaiting serialized flush', 'TIMEOUT')`. The no-deadline
+    // mode skips Promise.race entirely. Steelman P2#8: a bare call-
+    // count ceiling (< 8) silently rots as unrelated future code adds
+    // timers; we instead inspect each registered callback's source for
+    // the TIMEOUT-rejection signature so the assertion catches only
+    // the regression we care about.
     const provider = createProvider(db);
     await provider.initialize();
 
@@ -304,23 +308,26 @@ describe('awaitNextFlush — no-deadline mode (migration bulk-import fix)', () =
     (provider as unknown as { pendingData: TxfStorageDataBase | null }).pendingData =
       buildTxfData({ _t: { id: '_t', genesis: { tokenId: 't' } } });
 
-    // Spy on global setTimeout. Existing timers in the flush body
-    // (debounce, internal yields) will still call setTimeout, so we
-    // only assert that the count is bounded — specifically, no per-
-    // iteration TIMEOUT racer was created. A reasonable upper bound:
-    // 1 (flush yield) + a handful of internal helpers ≤ 8. Without the
-    // fix the racer adds one per iteration (≤4 extra in this test).
     const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
     await provider.awaitNextFlush(0);
     setTimeoutSpy.mockRestore();
 
-    // Assertion shape: there exists no allocated timer whose handler
-    // closure includes our TIMEOUT-rejection sentinel. Practical
-    // implementation: assert call count is below a generous ceiling
-    // proving the unconditional racer is not present.
-    // (Strict count would couple to internal flush instrumentation;
-    // ceiling is robust.)
-    expect(setTimeoutSpy.mock.calls.length).toBeLessThan(8);
+    // Walk every registered callback. A regression that re-introduced
+    // the unconditional racer would register a callback whose toString
+    // includes the SphereError 'TIMEOUT' construction. Unrelated
+    // setTimeout calls (debounce, throttle, internal yields) pass.
+    const timeoutRacerCalls = setTimeoutSpy.mock.calls.filter((call) => {
+      const cb = call[0];
+      if (typeof cb !== 'function') return false;
+      const src = String(cb);
+      return (
+        src.includes('awaitNextFlush') ||
+        src.includes("'TIMEOUT'") ||
+        src.includes('"TIMEOUT"') ||
+        src.includes('timeout awaiting serialized flush')
+      );
+    });
+    expect(timeoutRacerCalls).toEqual([]);
 
     await provider.shutdown();
   });

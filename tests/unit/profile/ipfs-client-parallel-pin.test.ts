@@ -72,6 +72,23 @@ function makeBlocks(n: number): Array<{ cid: CID; bytes: Uint8Array }> {
 }
 
 /**
+ * Hash bytes → hex string. Used to build an INDEX lookup so the mock
+ * can attribute each POST back to its producer-side `blocks[i]` index,
+ * not to a re-hashed CID. Steelman P1#2 — the previous version derived
+ * CIDs by re-hashing POST bodies, which could not distinguish "every
+ * block pinned once" from "block X pinned twice + block Y skipped"
+ * because both produce the same set of unique CIDs (when the set check
+ * stays at N, length and dedup would surface the dup). The strict
+ * regression guard is to assert that each producer-side INDEX appears
+ * exactly once across all POSTs.
+ */
+function bytesToHex(bytes: Uint8Array): string {
+  let hex = '';
+  for (const b of bytes) hex += b.toString(16).padStart(2, '0');
+  return hex;
+}
+
+/**
  * Fetch mock that:
  *   - increments `inFlight` on entry to /api/v0/dag/put, decrements on exit
  *   - tracks `maxInFlight`
@@ -79,26 +96,50 @@ function makeBlocks(n: number): Array<{ cid: CID; bytes: Uint8Array }> {
  *     observable — without a delay, the entire worker pool drains
  *     synchronously and `inFlight` may never observe > 1 transiently)
  *   - returns 200 from dag/put; sidecar submit best-effort
- *   - records every CID that was pinned for correctness assertions
+ *   - looks up each POST body's bytes in `indexByHash` to attribute
+ *     the pin to a producer-side `blocks[i]` index — used by the
+ *     correctness invariant assertion
  */
 interface PinTracker {
   inFlight: number;
   maxInFlight: number;
-  pinnedCids: string[];
+  /**
+   * Ordered list of producer-side `blocks[i]` indices observed via
+   * POST body lookup. A correct pool processes each index exactly
+   * once; a duplicate-process bug shows up as a repeated index, a
+   * skip bug as a missing index.
+   */
+  processedIndices: number[];
+  /**
+   * Per-index pin count. Same data as `processedIndices` but indexed
+   * for fast O(1) duplicate detection in assertions.
+   */
+  pinCountByIndex: Map<number, number>;
   startCount: number;
   endCount: number;
   failNthBlock: number | null;
 }
 
-function installConcurrencyMock(delayMs: number): {
+function installConcurrencyMock(
+  delayMs: number,
+  blocks: Array<{ cid: CID; bytes: Uint8Array }>,
+): {
   tracker: PinTracker;
   restore: () => void;
 } {
   const original = globalThis.fetch;
+  // Build hash → producer-index lookup BEFORE any worker runs so the
+  // mock can attribute each POST body back to its source index.
+  const indexByHash = new Map<string, number>();
+  for (let i = 0; i < blocks.length; i++) {
+    indexByHash.set(bytesToHex(blocks[i].bytes), i);
+  }
+
   const tracker: PinTracker = {
     inFlight: 0,
     maxInFlight: 0,
-    pinnedCids: [],
+    processedIndices: [],
+    pinCountByIndex: new Map<number, number>(),
     startCount: 0,
     endCount: 0,
     failNthBlock: null,
@@ -117,35 +158,33 @@ function installConcurrencyMock(delayMs: number): {
     }
 
     if (url.includes('/api/v0/dag/put')) {
-      // Extract CID for tracking — pinSingleBlock POSTs the bytes,
-      // not the CID, but the URL itself encodes the codec and the
-      // sidecar/submit fan-out URL DOES carry the CID query param.
-      // We track via the dag/put body's CID indirectly: trust that
-      // the sidecar/submit will record it, but here we just count
-      // start/end + concurrency.
       const myIdx = tracker.startCount++;
       tracker.inFlight++;
       if (tracker.inFlight > tracker.maxInFlight) {
         tracker.maxInFlight = tracker.inFlight;
       }
       try {
-        await new Promise((r) => setTimeout(r, delayMs));
-        if (tracker.failNthBlock !== null && myIdx === tracker.failNthBlock) {
-          return new Response('forced failure', { status: 500 });
-        }
-        // Pull the CID from the body's binary content (we don't have it
-        // in the URL). Instead, derive from sidecar/submit fan-out
-        // requests below.
-        let cid: string | null = null;
+        // Read POST body BEFORE the artificial delay so we attribute
+        // every observed pin, even on the abort path.
+        let producerIndex: number | undefined;
         if (init?.body instanceof FormData) {
           const file = init.body.get('data') as Blob | null;
           if (file) {
             const bytes = new Uint8Array(await file.arrayBuffer());
-            const c = CID.createV1(raw.code, createDigest(0x12, sha256(bytes)));
-            cid = c.toString();
+            producerIndex = indexByHash.get(bytesToHex(bytes));
           }
         }
-        if (cid) tracker.pinnedCids.push(cid);
+        if (producerIndex !== undefined) {
+          tracker.processedIndices.push(producerIndex);
+          tracker.pinCountByIndex.set(
+            producerIndex,
+            (tracker.pinCountByIndex.get(producerIndex) ?? 0) + 1,
+          );
+        }
+        await new Promise((r) => setTimeout(r, delayMs));
+        if (tracker.failNthBlock !== null && myIdx === tracker.failNthBlock) {
+          return new Response('forced failure', { status: 500 });
+        }
         return new Response(JSON.stringify({ Cid: { '/': 'ignored' } }), {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
@@ -185,7 +224,7 @@ describe('pinCarBlocksToIpfs — bounded-concurrency worker pool', () => {
   it('pins every block exactly once (correctness invariant preserved)', async () => {
     const blocks = makeBlocks(12);
     const carBytes = await buildCarBytes([blocks[0].cid], blocks);
-    mock = installConcurrencyMock(5);
+    mock = installConcurrencyMock(5, blocks);
 
     await pinCarBlocksToIpfs(
       [TEST_GATEWAY],
@@ -196,19 +235,25 @@ describe('pinCarBlocksToIpfs — bounded-concurrency worker pool', () => {
       4,
     );
 
+    // Total pins = block count. Catches under-counting (skipped block)
+    // AND over-counting (duplicate processing) without conflating them.
+    expect(mock.tracker.processedIndices.length).toBe(12);
     expect(mock.tracker.endCount).toBe(12);
-    // Every block CID present in pinned set, no duplicates.
-    const uniquePinned = new Set(mock.tracker.pinnedCids);
-    expect(uniquePinned.size).toBe(12);
-    for (const b of blocks) {
-      expect(uniquePinned.has(b.cid.toString())).toBe(true);
+    // Per-index count must be exactly 1 for every producer index. A
+    // duplicate-processing bug would show up as count >= 2 for some
+    // index; a skip would show up as a missing entry (count === 0).
+    // Asserting both bounds covers the full failure surface that the
+    // CID-set-based check could not distinguish (steelman P1#2).
+    for (let i = 0; i < blocks.length; i++) {
+      expect(mock.tracker.pinCountByIndex.get(i)).toBe(1);
     }
+    expect(mock.tracker.pinCountByIndex.size).toBe(12);
   });
 
   it('respects the concurrency bound — max in-flight ≤ configured', async () => {
     const blocks = makeBlocks(20);
     const carBytes = await buildCarBytes([blocks[0].cid], blocks);
-    mock = installConcurrencyMock(15);
+    mock = installConcurrencyMock(15, blocks);
 
     const CONCURRENCY = 4;
     await pinCarBlocksToIpfs(
@@ -231,7 +276,7 @@ describe('pinCarBlocksToIpfs — bounded-concurrency worker pool', () => {
   it('default concurrency=10 saturates pool for large block counts', async () => {
     const blocks = makeBlocks(40);
     const carBytes = await buildCarBytes([blocks[0].cid], blocks);
-    mock = installConcurrencyMock(15);
+    mock = installConcurrencyMock(15, blocks);
 
     // Omit the concurrency arg — should default to 10.
     await pinCarBlocksToIpfs(
@@ -252,7 +297,7 @@ describe('pinCarBlocksToIpfs — bounded-concurrency worker pool', () => {
     const carBytes = await buildCarBytes([blocks[0].cid], blocks);
 
     for (const badValue of [0, -1, -100, Number.NaN, Number.POSITIVE_INFINITY]) {
-      mock = installConcurrencyMock(5);
+      mock = installConcurrencyMock(5, blocks);
       await pinCarBlocksToIpfs(
         [TEST_GATEWAY],
         carBytes,
@@ -279,7 +324,7 @@ describe('pinCarBlocksToIpfs — bounded-concurrency worker pool', () => {
   it('clamps concurrency DOWN to block count (no spurious idle workers)', async () => {
     const blocks = makeBlocks(3);
     const carBytes = await buildCarBytes([blocks[0].cid], blocks);
-    mock = installConcurrencyMock(5);
+    mock = installConcurrencyMock(5, blocks);
 
     // Ask for concurrency 20, but only 3 blocks — should spawn only 3 workers.
     await pinCarBlocksToIpfs(
@@ -298,7 +343,7 @@ describe('pinCarBlocksToIpfs — bounded-concurrency worker pool', () => {
   it('single-block failure aborts the whole operation', async () => {
     const blocks = makeBlocks(10);
     const carBytes = await buildCarBytes([blocks[0].cid], blocks);
-    mock = installConcurrencyMock(5);
+    mock = installConcurrencyMock(5, blocks);
     // Force the 3rd pin (index 2) to return 500.
     mock.tracker.failNthBlock = 2;
 
@@ -314,13 +359,13 @@ describe('pinCarBlocksToIpfs — bounded-concurrency worker pool', () => {
     ).rejects.toThrow(/ORBITDB_WRITE_FAILED|dag\/put failed|HTTP 500/);
   });
 
-  it('order-independent: pins arrive in any order, all CIDs are pinned', async () => {
+  it('order-independent: pins arrive in any order, every index processed exactly once', async () => {
     // The worker pool draws blocks via shared index — the order pins
     // hit the sidecar depends on worker scheduling. We assert ONLY
-    // that every CID was pinned, not the order.
+    // that every producer index was processed, not the order.
     const blocks = makeBlocks(15);
     const carBytes = await buildCarBytes([blocks[0].cid], blocks);
-    mock = installConcurrencyMock(5);
+    mock = installConcurrencyMock(5, blocks);
 
     await pinCarBlocksToIpfs(
       [TEST_GATEWAY],
@@ -331,12 +376,53 @@ describe('pinCarBlocksToIpfs — bounded-concurrency worker pool', () => {
       5,
     );
 
-    const expectedCids = new Set(blocks.map((b) => b.cid.toString()));
-    const actualCids = new Set(mock.tracker.pinnedCids);
-    expect(actualCids.size).toBe(expectedCids.size);
-    for (const cid of expectedCids) {
-      expect(actualCids.has(cid)).toBe(true);
+    expect(mock.tracker.processedIndices.length).toBe(15);
+    for (let i = 0; i < 15; i++) {
+      expect(mock.tracker.pinCountByIndex.get(i)).toBe(1);
     }
+  });
+
+  // Steelman P1#1 regression guard — when the first failure trips the
+  // shared abort flag, peer workers' late rejections must NOT escape
+  // as UnhandledPromiseRejection. We simulate by failing the first pin
+  // immediately and having the other workers' pins take longer (so
+  // they're in-flight when the abort lands). The mock fetches resolve
+  // 200 for everything except `failNthBlock=0`. After the rethrow we
+  // wait long enough for any in-flight pin to settle and inspect the
+  // Node process's unhandled-rejection signal.
+  it('peer-worker late rejections do NOT surface as UnhandledPromiseRejection', async () => {
+    const blocks = makeBlocks(10);
+    const carBytes = await buildCarBytes([blocks[0].cid], blocks);
+    mock = installConcurrencyMock(50, blocks);
+    // Two workers will fail (index 0 and 1, near-simultaneous since
+    // delayMs=50 means the others are mid-flight when these resolve).
+    // The harness pinSingleBlock retries against gateways before
+    // throwing — for a single gateway, it throws on the first 500.
+    mock.tracker.failNthBlock = 0;
+
+    const unhandledRejections: unknown[] = [];
+    const handler = (reason: unknown): void => {
+      unhandledRejections.push(reason);
+    };
+    process.on('unhandledRejection', handler);
+    try {
+      await expect(
+        pinCarBlocksToIpfs(
+          [TEST_GATEWAY],
+          carBytes,
+          blocks[0].cid.toString(),
+          30_000,
+          undefined,
+          4,
+        ),
+      ).rejects.toThrow(/ORBITDB_WRITE_FAILED|HTTP 500/);
+      // Give the peer workers enough time to finish their in-flight
+      // pin POSTs and any post-throw microtask processing.
+      await new Promise((r) => setTimeout(r, 150));
+    } finally {
+      process.off('unhandledRejection', handler);
+    }
+    expect(unhandledRejections).toEqual([]);
   });
 });
 
@@ -360,7 +446,7 @@ describe('pinCarBlocksToIpfs — wall-clock perf characteristic', () => {
     // regression that re-introduces the serial loop fails this test.
     const blocks = makeBlocks(20);
     const carBytes = await buildCarBytes([blocks[0].cid], blocks);
-    mock = installConcurrencyMock(30);
+    mock = installConcurrencyMock(30, blocks);
 
     const start = Date.now();
     await pinCarBlocksToIpfs(
