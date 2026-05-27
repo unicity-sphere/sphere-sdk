@@ -59,6 +59,7 @@ import {
   MANIFEST_MAX_SIZE,
   MAX_CREATOR_LENGTH,
   MAX_DESCRIPTION_LENGTH,
+  UXF_SMT_PATH_MAX_BYTES,
 } from './limits.js';
 
 // ---------------------------------------------------------------------------
@@ -851,14 +852,50 @@ function decodeIpldContentArray(
   value: unknown[],
 ): unknown[] {
   // smt-path segments: array of { data: Uint8Array|null, path: Uint8Array }
-  // `path` is stored as a fixed-width 32-byte big-endian bstr (see hash.ts
-  // bigIntTo32Bytes). Decode back to a decimal bigint string for the SDK layer.
+  // `path` is stored as a big-endian bstr per UXF SPEC §11. Backward-compat
+  // with pre-#295 bundles: 32-byte fixed encoding still decodes correctly
+  // (it's a special case of variable-length). #295 widens the accepted range
+  // to up to UXF_SMT_PATH_MAX_BYTES (35) bytes to support BitString-derived
+  // paths up to 280 bits. Decode back to a decimal bigint string for the
+  // SDK layer.
   if (type === 'smt-path' && key === 'segments') {
+    // Canonical lower bound: encoder always emits ≥ 32 bytes (see hash.ts).
+    const SMT_PATH_FIXED_REGION_BYTES = 32;
     return value.map((seg) => {
       const s = seg as { data: Uint8Array | null; path: Uint8Array | bigint };
       let pathStr: string;
       if (s.path instanceof Uint8Array) {
-        // Decode 32-byte big-endian bstr -> decimal bigint string
+        // Issue #295: enforce the canonical bstr-length window of
+        // 32..UXF_SMT_PATH_MAX_BYTES (35) bytes per SPEC §11.
+        //
+        // Lower bound (32): the encoder ALWAYS emits 32 bytes for
+        // ≤256-bit values (backward-compat fixed region). If a
+        // non-compliant remote producer emitted, say, a 1-byte bstr
+        // for the bigint 42, the decoded bigint would still be 42 —
+        // but the CONTENT HASH of the SmtPath element would differ
+        // from one we emit for the same logical value (different
+        // bytes on wire). Rejecting bstrs shorter than 32 bytes
+        // makes the canonical encoding mandatory at parse time and
+        // prevents silent hash-divergence-driven JOIN forks.
+        //
+        // Upper bound (35): the BitString(34-byte imprint) ceiling.
+        // Anything wider is either a malformed input or a future
+        // SDK version emitting incompatible widths.
+        if (s.path.length < SMT_PATH_FIXED_REGION_BYTES) {
+          throw new UxfError(
+            'INVALID_HASH',
+            `SMT path bstr below ${SMT_PATH_FIXED_REGION_BYTES}-byte canonical minimum: ${s.path.length}`,
+          );
+        }
+        if (s.path.length > UXF_SMT_PATH_MAX_BYTES) {
+          throw new UxfError(
+            'INVALID_HASH',
+            `SMT path bstr exceeds ${UXF_SMT_PATH_MAX_BYTES} bytes: ${s.path.length}`,
+          );
+        }
+        // Decode big-endian bstr -> decimal bigint string. The loop is
+        // encoding-length-agnostic, so 32-byte (legacy / ≤256-bit) and
+        // 33–35 byte (#295 / 257–280 bit) bstrs decode identically.
         let v = 0n;
         for (const byte of s.path) {
           v = (v << 8n) | BigInt(byte);

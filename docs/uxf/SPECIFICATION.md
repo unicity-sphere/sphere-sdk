@@ -290,7 +290,7 @@ A complete Sparse Merkle Tree path from leaf to root.
 |-------|------|----------|-----------|-------------|
 | `header` | ElementHeader | yes | -- | Element header |
 | `root` | bytes(32) | yes | leaf | SMT root hash |
-| `segments` | array\<[bytes, bytes]\> | yes | leaf | Array of [data, path] tuples, ordered leaf to root. Each tuple contains the sibling hash and the path direction indicator at that tree level. |
+| `segments` | array\<[bytes, bytes]\> | yes | leaf | Array of [data, path] tuples, ordered leaf to root. Each tuple contains the sibling hash and the path direction indicator at that tree level. `path` is a big-endian bstr bounded to 32..35 bytes. For backward-compat with pre-#295 bundles, paths whose bit-length ≤ 256 MUST emit a fixed 32-byte big-endian bstr; paths in the (256, 280] range emit a variable-length `ceil(bit_length / 8)` bytes (33–35 bytes). The 280-bit ceiling matches state-transition-sdk's `BitString(imprint)` output: `1 + 34 = 35` bytes for a 34-byte imprint (`0x01 || algo:2 || hash:32`). Paths > 280 bits MUST be rejected at parse time. |
 
 **Mutability:** Instance-chain-eligible (consolidation).
 
@@ -810,7 +810,7 @@ token-coin-data = #6.786444([
 smt-path = #6.786445([
   header: element-header,
   root: bstr .size 32,
-  segments: [* [bstr, bstr]]
+  segments: [* [bstr, bstr .size (32..35)]]
 ])
 ```
 

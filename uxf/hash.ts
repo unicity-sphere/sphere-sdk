@@ -21,7 +21,11 @@ import {
   ELEMENT_TYPE_IDS,
 } from './types.js';
 import { UxfError } from './errors.js';
-import { MAX_SMT_PATH_DECIMAL_LENGTH } from './limits.js';
+import {
+  MAX_SMT_PATH_DECIMAL_LENGTH,
+  UXF_SMT_PATH_MAX_BITS,
+  UXF_SMT_PATH_MAX_BYTES,
+} from './limits.js';
 
 // ---------------------------------------------------------------------------
 // Hex/Bytes helpers
@@ -102,9 +106,12 @@ const BYTE_FIELDS: Readonly<Record<UxfElementType, ReadonlySet<string>>> = {
  *
  * Special handling:
  * - SmtPath `segments[].data`: hex -> bytes (or null -> null)
- * - SmtPath `segments[].path`: decimal bigint string -> 32-byte big-endian
- *   Uint8Array (CBOR bstr). @ipld/dag-cbor does NOT support CBOR tag 2
- *   bignum; encode as fixed-width bstr per SPEC CDDL `segments [* [bstr, bstr]]`.
+ * - SmtPath `segments[].path`: decimal bigint string -> big-endian
+ *   Uint8Array (CBOR bstr) via `bigIntToSmtPathBytes`. @ipld/dag-cbor does
+ *   NOT support CBOR tag 2 bignum; encode as bstr per SPEC §11 CDDL
+ *   `segments [* [bstr, bstr .size (1..35)]]`. Paths ≤ 256 bits emit a
+ *   fixed 32-byte bstr (backward-compat); paths in the (256, 280] range
+ *   emit 33–35 bytes (issue #295).
  * - `reason` in GenesisDataContent: already Uint8Array | null, pass through
  * - null values: pass through for CBOR null encoding
  */
@@ -212,30 +219,88 @@ export function prepareContentForHashing(
 }
 
 /**
- * Convert a non-negative bigint to a fixed-width 32-byte big-endian Uint8Array.
+ * Constant for backward-compat behaviour: paths whose bit-length fits in
+ * 32 bytes (≤ 256 bits) are encoded as fixed 32-byte big-endian, matching
+ * the historical encoding. Paths above 256 bits extend to variable-length
+ * (33–35 bytes) big-endian, up to the BitString-derived ceiling of 280 bits.
  *
- * SMT path values are 256-bit integers (DOMAIN-CONSTRAINTS §2.3 / SPEC §293).
- * @ipld/dag-cbor encodes CBOR via cborg which does NOT support CBOR tag 2
- * (bignum) — BigInt values larger than uint64 (2^64-1) throw
- * "encountered BigInt larger than allowable range". Encoding as a fixed
- * 32-byte bstr is deterministic, IPLD-native (bytes are first-class in
- * the IPLD data model), and preserves the full 256-bit value range.
+ * The 256-bit boundary is preserved as the "fixed-32 region" so that
+ * every UXF bundle whose paths fit in 256 bits (which today is every
+ * bundle ever produced — the old encoder rejected anything above) hashes
+ * to the same content-addressed CID under the new encoder. New paths
+ * above 256 bits get a strictly-shorter-or-equal byte representation
+ * (33–35 bytes vs the rejected 32-byte overflow).
  *
- * See SPECIFICATION §11 CDDL: `segments: [* [bstr, bstr]]` — both data
- * and path are bstr.
+ * @internal — exported only for cross-module bound checks.
  */
-function bigIntTo32Bytes(b: bigint): Uint8Array {
+const SMT_PATH_FIXED_REGION_BYTES = 32;
+
+/**
+ * Convert a non-negative bigint into a big-endian CBOR bstr for the
+ * SMT path field (UXF SPEC §11, smt-path.segments[].path).
+ *
+ * Encoding rules — issue #295 relaxes UXF §11 from the historical fixed
+ * 32-byte (256-bit) cap to a variable-length encoding capped at 280 bits
+ * (35 bytes) to match the aggregator's `BitString(imprint)` output:
+ *
+ *   - `b` fits in 256 bits → emit fixed 32-byte big-endian (backward-
+ *     compat with all pre-#295 bundles; CIDs unchanged).
+ *   - 256 < bitlen(`b`) ≤ 280 → emit variable-length big-endian
+ *     `ceil(bitlen / 8)` bytes (33, 34, or 35 bytes).
+ *   - bitlen(`b`) > 280 → throw `INVALID_HASH`.
+ *
+ * Rationale for 280-bit ceiling: state-transition-sdk's
+ * `BitString(data) = BigInt('0x01' || hex(data))` over a 34-byte
+ * imprint (`0x01 || algo:2 || hash:32`) produces values up to
+ * `1 byte + 34 bytes = 35 bytes = 280 bits`. The aggregator's walkback
+ * step paths can routinely exceed 256 bits when the wallet's leaf
+ * shares a deep common prefix with another leaf.
+ *
+ * Determinism: identical bigints always emit identical bytes regardless
+ * of caller. The decoder reconstructs the original bigint via
+ * `for (b of buf) v = (v << 8n) | BigInt(b)` which is encoding-length-
+ * agnostic.
+ *
+ * @internal — exported for tests.
+ */
+export function bigIntToSmtPathBytes(b: bigint): Uint8Array {
   if (b < 0n) {
     throw new UxfError('INVALID_HASH', `SMT path must be non-negative: ${b}`);
   }
-  const buf = new Uint8Array(32);
+  const bitLen = b === 0n ? 0 : b.toString(2).length;
+  if (bitLen > UXF_SMT_PATH_MAX_BITS) {
+    throw new UxfError(
+      'INVALID_HASH',
+      `SMT path exceeds ${UXF_SMT_PATH_MAX_BITS} bits: ${b}`,
+    );
+  }
+  // Backward-compat: paths that fit in 32 bytes emit the same 32-byte
+  // big-endian encoding the legacy encoder used. This preserves every
+  // existing bundle's CID.
+  if (bitLen <= 256) {
+    const buf = new Uint8Array(SMT_PATH_FIXED_REGION_BYTES);
+    let v = b;
+    for (let i = SMT_PATH_FIXED_REGION_BYTES - 1; i >= 0; i--) {
+      buf[i] = Number(v & 0xffn);
+      v >>= 8n;
+    }
+    return buf;
+  }
+  // Variable-length region: 33–35 bytes for 257–280 bit values.
+  const byteLen = Math.ceil(bitLen / 8);
+  // Defence-in-depth: ceil(280/8) === 35; ceil(257/8) === 33.
+  // The bit-length check above already enforces byteLen ≤ 35.
+  if (byteLen > UXF_SMT_PATH_MAX_BYTES) {
+    throw new UxfError(
+      'INVALID_HASH',
+      `SMT path byte-length exceeds ${UXF_SMT_PATH_MAX_BYTES}: ${byteLen}`,
+    );
+  }
+  const buf = new Uint8Array(byteLen);
   let v = b;
-  for (let i = 31; i >= 0; i--) {
+  for (let i = byteLen - 1; i >= 0; i--) {
     buf[i] = Number(v & 0xffn);
     v >>= 8n;
-  }
-  if (v !== 0n) {
-    throw new UxfError('INVALID_HASH', `SMT path exceeds 256 bits: ${b}`);
   }
   return buf;
 }
@@ -244,10 +309,11 @@ function bigIntTo32Bytes(b: bigint): Uint8Array {
  * Prepare SmtPath segments for CBOR encoding.
  *
  * - `data`: hex string -> Uint8Array, null -> null
- * - `path`: decimal bigint string -> 32-byte big-endian Uint8Array (CBOR bstr)
- *
- * SMT paths are 256-bit integers; encoding as a fixed 32-byte bstr is
- * deterministic and fully IPLD-compatible (SPEC §11 CDDL: segments [* [bstr, bstr]]).
+ * - `path`: decimal bigint string -> big-endian Uint8Array (CBOR bstr).
+ *   Fixed 32 bytes for paths ≤ 256 bits (backward-compat); variable-
+ *   length 33–35 bytes for paths in the (256, 280] range. See
+ *   `bigIntToSmtPathBytes` and SPEC §11 CDDL: `segments [* [bstr, bstr]]`
+ *   with `.size (1..35)` on the path bstr.
  */
 function prepareSmtSegments(
   segments: ReadonlyArray<{ readonly data: string; readonly path: string }>,
@@ -262,7 +328,7 @@ function prepareSmtSegments(
     // strict decimal regex BEFORE handing the string to BigInt() so a
     // hostile peer cannot smuggle a path under a non-canonical
     // representation that round-trips to a different bigint.
-    path: bigIntTo32Bytes(parseSmtPathDecimal(seg.path)),
+    path: bigIntToSmtPathBytes(parseSmtPathDecimal(seg.path)),
   }));
 }
 
@@ -280,9 +346,9 @@ function parseSmtPathDecimal(s: string): bigint {
   // BEFORE handing the string to BigInt(). The SMT path domain is
   // uint256 (78 decimal digits maximum); a hostile peer can ship a
   // 100 MiB string of `9`s, and BigInt() will allocate the
-  // corresponding mantissa (megabytes) before bigIntTo32Bytes finally
-  // rejects the result. Reject upfront so the BigInt() allocation
-  // never starts.
+  // corresponding mantissa (megabytes) before bigIntToSmtPathBytes
+  // finally rejects the result. Reject upfront so the BigInt()
+  // allocation never starts.
   if (s.length > MAX_SMT_PATH_DECIMAL_LENGTH) {
     throw new UxfError(
       'LIMIT_EXCEEDED',
