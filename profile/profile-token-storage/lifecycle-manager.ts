@@ -342,8 +342,72 @@ export class LifecycleManager {
         return true;
       }
 
-      // Load known bundle CIDs from OrbitDB
-      await this.bundleIndex.refreshKnownBundles();
+      // Load known bundle CIDs from OrbitDB.
+      //
+      // Robustness band-aid (Issue #239 territory): a previous failed
+      // migration may have written an OpLog entry whose IPFS payload
+      // block was never durably pinned (gateway dropped, peer crashed
+      // mid-flush). OrbitDB v3's `db.all()` walks the OpLog and resolves
+      // every entry's block — a single unreachable block throws and
+      // poisons the whole enumeration. Without this guard, the throw
+      // propagates to the outer catch at this method's tail, returns
+      // `false`, and `setInitialized(true)` is NEVER called. Every
+      // subsequent `save()` then rejects with `"Provider not initialized"`,
+      // making the wallet effectively unusable for the session.
+      //
+      // **Scope of this band-aid.** Tolerating the throw here ONLY
+      // unblocks `initialize()`. Subsequent calls to `db.all()` —
+      // notably `provider.load()`, `provider.sync()`, and the flush
+      // scheduler's bundle-monotonicity checks — still throw on the
+      // same corrupt block (those paths have pre-existing try/catch
+      // swallows that may silently degrade further). The structural
+      // fix is to make `OrbitDbAdapter.all()` tolerate per-OpLog-entry
+      // block-load failures the same way it tolerates per-entry
+      // coercion failures (see `tryCoerce` in orbitdb-adapter.ts). That
+      // larger fix is tracked separately — search the issue tracker
+      // for "OrbitDbAdapter.all per-block tolerance".
+      //
+      // **Operator observability.** The catch emits a `storage:error`
+      // event with code `BUNDLE_INDEX_REFRESH_FAILED` so consumers
+      // surface the degraded state instead of silently proceeding —
+      // critical because the downstream `flush-scheduler` swallows its
+      // own `db.all()` throws on `listActiveBundles()`, and a
+      // user-triggered migration would otherwise publish a bundle
+      // pointer that reflects ONLY the post-recovery state (silent
+      // orphaning of any historical bundles the corrupt walk hid).
+      // Consumers SHOULD treat this event as "wallet is operating with
+      // an incomplete view of its remote state — back off destructive
+      // writes (e.g., overwrite-style migrations) until investigated."
+      try {
+        await this.bundleIndex.refreshKnownBundles();
+      } catch (err) {
+        this.host.log(
+          `bundleIndex.refreshKnownBundles failed (proceeding with empty ` +
+            `bundle set; cold-start recovery may repopulate, but cross-` +
+            `device sync and load() will continue to fail until the ` +
+            `corrupt OpLog entry is bypassed): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+        );
+        // Emit the degraded-state event so operator dashboards and the
+        // sphere.telco UI's migration banner can surface the condition
+        // BEFORE the user clicks Migrate and unwittingly publishes a
+        // partial-view bundle pointer.
+        this.host.emitEvent(
+          this.host.buildErrorEvent(
+            'storage:error',
+            err,
+            'BUNDLE_INDEX_REFRESH_FAILED',
+          ),
+        );
+        // Defense-in-depth reset. `refreshKnownBundles` builds its
+        // result locally and only writes to host AFTER `db.all()`
+        // succeeds, so a partial walk does NOT leak state under the
+        // current implementation. We still reset here so a future
+        // refactor that introduces incremental writes cannot silently
+        // bypass the catch.
+        this.host.setKnownBundleCids(new Set());
+      }
 
       // COLD-START RECOVERY: if OrbitDB has no bundles locally, this
       // is likely a fresh device (wallet re-imported from mnemonic
