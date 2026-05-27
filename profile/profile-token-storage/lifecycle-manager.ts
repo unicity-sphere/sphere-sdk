@@ -81,6 +81,7 @@ import {
   WIN_BROADCAST_KIND_MARKER,
   WIN_BROADCAST_SCHEMA_VERSION,
 } from '../aggregator-pointer/win-broadcast.js';
+import type { RecoverResult } from '../aggregator-pointer/ProfilePointerLayer.js';
 
 /**
  * Pointer-layer error codes that indicate a permanent integrity /
@@ -844,7 +845,7 @@ export class LifecycleManager {
 
     let lastError: string | undefined;
     while (Date.now() < deadline && !signal.aborted) {
-      let recovered: { readonly cid: Uint8Array; readonly version: number } | null = null;
+      let recovered: Awaited<ReturnType<typeof pointer.recoverLatest>> = null;
       try {
         recovered = await pointer.recoverLatest();
       } catch (err) {
@@ -866,7 +867,12 @@ export class LifecycleManager {
         // Transient — fall through to sleep + retry.
       }
 
-      if (recovered) {
+      // Treat all-unfetchable as "not yet recovered" — retry on next loop
+      // iteration (within the deadline). The pointer chain exists but all
+      // CARs are unreachable; keep trying until the deadline expires.
+      // `'cid' in recovered` is the positive discriminant: RecoverResult has
+      // `cid`, RecoverAllUnfetchableResult does not — TS narrows correctly.
+      if (recovered && 'cid' in recovered) {
         try {
           const recoveredCidStr = CID.decode(recovered.cid).toString();
           if (recoveredCidStr === snapshotCid) {
@@ -1089,7 +1095,7 @@ export class LifecycleManager {
 
     let lastError: string | undefined;
     while (Date.now() < deadline && !signal.aborted) {
-      let recovered: { readonly cid: Uint8Array; readonly version: number } | null = null;
+      let recovered: Awaited<ReturnType<typeof pointer.recoverLatest>> = null;
       try {
         recovered = await pointer.recoverLatest();
       } catch (err) {
@@ -1108,7 +1114,10 @@ export class LifecycleManager {
         }
       }
 
-      if (recovered) {
+      // All-unfetchable is treated as "not yet matching" — retry within deadline.
+      // `'cid' in recovered` is the positive discriminant: RecoverResult has
+      // `cid`, RecoverAllUnfetchableResult does not — TS narrows correctly.
+      if (recovered && 'cid' in recovered) {
         try {
           const recoveredStr = CID.decode(recovered.cid).toString();
           if (recoveredStr === snapshotCid) {
@@ -1333,6 +1342,25 @@ export class LifecycleManager {
         this.host.log(
           `Pointer publish ok: cid=${cidString} version=${result.version} attempts=${result.attemptsUsed}`,
         );
+        // NEEDS-FIX #2: emit the same typed event on the publish path when
+        // conflict-driven rediscovery skipped past CAR_TRANSIENT versions.
+        // The fast-path (attempt 0, no walkback) always produces an empty
+        // list, so this branch fires only when a conflict forced Phase 3.
+        if (result.walkbackUnfetchableSkipped && result.walkbackUnfetchableSkipped.length > 0) {
+          const publishSkipped = result.walkbackUnfetchableSkipped;
+          this.host.emitEvent(
+            this.host.buildErrorEvent(
+              'storage:pointer-version-skipped-unfetchable',
+              new Error(
+                `Pointer publish (conflict-rediscovery): walkback skipped ` +
+                  `${publishSkipped.length} EXISTS-BUT-UNFETCHABLE version(s): ` +
+                  `[${publishSkipped.join(', ')}]. Published at version=${result.version}; ` +
+                  `the listed slot(s) had authentic proofs but unreachable CARs.`,
+              ),
+              'POINTER_VERSIONS_SKIPPED_UNFETCHABLE',
+            ),
+          );
+        }
         // RFC-251 Approach D / issue #255 Problem B — emit the
         // pointer-published event so the wiring layer (Sphere) can
         // broadcast the win to sibling devices over Nostr. Siblings
@@ -1511,8 +1539,12 @@ export class LifecycleManager {
           let reconciledDownward = false;
           try {
             const recovered = await pointer.recoverLatest();
-            if (recovered) {
-              const outcome = await pointer.reconcileLocalVersionDownward(recovered);
+            // Only attempt downward reconcile when we have a concrete RecoverResult
+            // (cid + version). RecoverAllUnfetchableResult (all-unfetchable) has no
+            // fetchable version to adopt as a new baseline, so skip the downgrade.
+            // `'cid' in recovered` is the positive discriminant — TS narrows to RecoverResult.
+            if (recovered && 'cid' in recovered) {
+              const outcome = await pointer.reconcileLocalVersionDownward(recovered as RecoverResult);
               if (outcome.reconciled) {
                 reconciledDownward = true;
                 this.host.log(
@@ -1700,7 +1732,7 @@ export class LifecycleManager {
       return status === 'pending';
     }
 
-    let recovered: { readonly cid: Uint8Array; readonly version: number } | null;
+    let recovered: Awaited<ReturnType<typeof pointer.recoverLatest>>;
     try {
       recovered = await pointer.recoverLatest();
     } catch (err) {
@@ -1715,14 +1747,73 @@ export class LifecycleManager {
       return false;
     }
 
+    // Distinguish three recovery outcomes:
+    //   1. null                    — fresh wallet, no pointer published → fall through to legacy IPNS.
+    //   2. RecoverAllUnfetchableResult — pointer chain exists but every CAR unreachable →
+    //                                    do NOT fall through to legacy; retry next poll.
+    //   3. RecoverResult           — VALID version found; proceed to applySnapshot.
     if (!recovered) {
       this.host.log('Pointer recover: no anchor published yet');
       return false;
     }
 
+    // Case 2: pointer chain exists but every CAR was CAR_TRANSIENT (no fetchable version).
+    // Refusing legacy IPNS fallback prevents stamping the migration-done marker before
+    // IPFS gateways come back up. Return true (pointer path chosen) so the caller
+    // does not fall through to legacy. The next poll cycle retries.
+    if ('kind' in recovered && recovered.kind === 'all-unfetchable') {
+      const allSkipped = recovered.walkbackUnfetchableSkipped;
+      this.host.emitEvent(
+        this.host.buildErrorEvent(
+          'storage:pointer-version-skipped-unfetchable',
+          new Error(
+            `Pointer recover: all ${allSkipped.length} known anchor version(s) ` +
+              `EXISTS-BUT-UNFETCHABLE: [${allSkipped.join(', ')}]. ` +
+              `No VALID predecessor was found. Refusing legacy IPNS fallback — ` +
+              `the pointer chain is intact; IPFS gateways may be temporarily unreachable. ` +
+              `Recovery will be re-attempted on the next pointer poll cycle.`,
+          ),
+          'POINTER_VERSIONS_SKIPPED_UNFETCHABLE',
+        ),
+      );
+      // Return true: pointer path was chosen (prevents legacy IPNS fork).
+      return true;
+    }
+
+    // Case 3: VALID version found.
+    // At this point `recovered` is narrowed to RecoverResult (null + all-unfetchable
+    // both returned early above). TypeScript's control-flow analysis does not narrow
+    // `RecoverResult | RecoverAllUnfetchableResult` through `'kind' in …` early-return
+    // guards because `RecoverResult` has no `kind` discriminant field declared — the
+    // structural check is ambiguous in TS's view. Explicit cast is safe: both prior
+    // guards exhausted every non-RecoverResult case.
+    const validRecovered = recovered as RecoverResult;
+
+    // Emit skipped-versions event if Phase 3 walkback skipped past
+    // EXISTS-BUT-UNFETCHABLE (CAR_TRANSIENT) versions. host.log is
+    // debug-level and stripped in production; emitEvent goes to the
+    // application event bus and monitoring dashboards.
+    const skipped = validRecovered.walkbackUnfetchableSkipped;
+    if (skipped && skipped.length > 0) {
+      this.host.emitEvent(
+        this.host.buildErrorEvent(
+          'storage:pointer-version-skipped-unfetchable',
+          new Error(
+            `Pointer recover: walkback skipped ${skipped.length} ` +
+              `EXISTS-BUT-UNFETCHABLE version(s): [${skipped.join(', ')}]. ` +
+              `Wallet recovered to older predecessor version=${validRecovered.version}; ` +
+              `the listed slot(s) had authentic proofs but unreachable CARs. ` +
+              `Operator: re-pin the missing CARs from a backup, or invoke ` +
+              `acceptCarLoss(version) to permanently acknowledge the data loss.`,
+          ),
+          'POINTER_VERSIONS_SKIPPED_UNFETCHABLE',
+        ),
+      );
+    }
+
     let cidString: string;
     try {
-      cidString = CID.decode(recovered.cid).toString();
+      cidString = CID.decode(validRecovered.cid).toString();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.host.log(`Pointer recover: failed to decode recovered CID bytes: ${msg}`);
@@ -1763,7 +1854,7 @@ export class LifecycleManager {
       // is already authoritative).
       this.host.setLastDiscoveredPointerCid(cidString);
       this.host.log(
-        `Pointer recover ok: cid=${cidString} version=${recovered.version} ` +
+        `Pointer recover ok: cid=${cidString} version=${validRecovered.version} ` +
           `joinedAny=${applyResult.joinedAny} addresses=${applyResult.addressesSeen} ` +
           `bundles=${applyResult.bundleEntriesSeen}`,
       );
@@ -1951,7 +2042,7 @@ export class LifecycleManager {
       );
     }
 
-    let recovered: { readonly cid: Uint8Array; readonly version: number } | null = null;
+    let recovered: Awaited<ReturnType<typeof pointer.recoverLatest>> = null;
     try {
       recovered = await pointer.recoverLatest();
     } catch (err) {
@@ -1975,9 +2066,52 @@ export class LifecycleManager {
       return;
     }
 
+    // All-unfetchable: pointer chain exists but every CAR is CAR_TRANSIENT.
+    // Emit event and re-arm; do NOT fall through to any legacy path.
+    if ('kind' in recovered && recovered.kind === 'all-unfetchable') {
+      const allSkipped = recovered.walkbackUnfetchableSkipped;
+      this.host.emitEvent(
+        this.host.buildErrorEvent(
+          'storage:pointer-version-skipped-unfetchable',
+          new Error(
+            `Pointer poll: all ${allSkipped.length} known anchor version(s) ` +
+              `EXISTS-BUT-UNFETCHABLE: [${allSkipped.join(', ')}]. ` +
+              `No VALID predecessor found; IPFS gateways may be temporarily unreachable. ` +
+              `Will retry on next poll cycle.`,
+          ),
+          'POINTER_VERSIONS_SKIPPED_UNFETCHABLE',
+        ),
+      );
+      this.scheduleNextPointerPoll(nextBackoffMultiplier);
+      return;
+    }
+
+    // VALID version found. Same skip-past observability as the cold-start
+    // recovery path: emit a typed event for operator monitoring.
+    // Explicit cast: null + all-unfetchable cases both returned early above.
+    // TS does not narrow RecoverResult | RecoverAllUnfetchableResult through
+    // the `'kind' in …` early-return guard because RecoverResult has no `kind`
+    // field — the `in` check is ambiguous at the type level. Cast is safe.
+    const validRecovered = recovered as RecoverResult;
+
+    const skipped = validRecovered.walkbackUnfetchableSkipped;
+    if (skipped && skipped.length > 0) {
+      this.host.emitEvent(
+        this.host.buildErrorEvent(
+          'storage:pointer-version-skipped-unfetchable',
+          new Error(
+            `Pointer poll: walkback skipped ${skipped.length} ` +
+              `EXISTS-BUT-UNFETCHABLE version(s): [${skipped.join(', ')}]. ` +
+              `Recovered to predecessor version=${validRecovered.version}.`,
+          ),
+          'POINTER_VERSIONS_SKIPPED_UNFETCHABLE',
+        ),
+      );
+    }
+
     let cidString: string;
     try {
-      cidString = CID.decode(recovered.cid).toString();
+      cidString = CID.decode(validRecovered.cid).toString();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.host.log(`Pointer poll: failed to decode recovered CID bytes: ${msg}`);
@@ -2026,7 +2160,7 @@ export class LifecycleManager {
       this.host.setLastDiscoveredPointerCid(cidString);
       this.host.log(
         `Pointer poll discovered NEW snapshot CID: cid=${cidString} ` +
-          `version=${recovered.version} joinedAny=${applyResult.joinedAny} ` +
+          `version=${validRecovered.version} joinedAny=${applyResult.joinedAny} ` +
           `addresses=${applyResult.addressesSeen} bundles=${applyResult.bundleEntriesSeen}`,
       );
 

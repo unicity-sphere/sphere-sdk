@@ -136,6 +136,21 @@ export interface ReconcileOutcome {
   readonly v: PointerVersion;
   readonly attemptsUsed: number;
   readonly probeHistory: readonly PointerVersion[];
+  /**
+   * Versions skipped past during any Phase 3 walkback that ran within
+   * this reconcile session (initial discovery on attempts ≥ 1, plus
+   * conflict-driven rediscovery). Aggregated across all reconcile
+   * iterations — a single reconcile with multiple conflicts may
+   * accumulate skipped versions from each iteration's discovery.
+   *
+   * Empty when no CAR_TRANSIENT skip-past occurred or when all
+   * discovery was via the fast-path (attempt 0, no walkback).
+   *
+   * Surfaced so `publishAggregatorPointerBestEffort` can emit a typed
+   * `storage:pointer-version-skipped-unfetchable` event even on the
+   * publish path (not just the recover path).
+   */
+  readonly walkbackUnfetchableSkipped: readonly PointerVersion[];
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -253,6 +268,9 @@ async function findLatestValidVersionWithWalkbackFloorRetry(
 export async function reconcileAndPublish(input: ReconcileInput): Promise<ReconcileOutcome> {
   const maxAttempts = input.maxAttempts ?? PUBLISH_RETRY_BUDGET;
   const probeHistory: PointerVersion[] = [];
+  // Aggregate CAR_TRANSIENT skip-past versions across all discovery iterations
+  // within this reconcile session (slow-path discovery + conflict rediscovery).
+  const walkbackUnfetchableSkipped: PointerVersion[] = [];
 
   // Track the EVOLVING localVersion across conflicts (fetchAndJoin updates it).
   let currentLocalVersion = input.currentLocalVersion;
@@ -327,6 +345,10 @@ export async function reconcileAndPublish(input: ReconcileInput): Promise<Reconc
         input.abortSignal,
       );
       probeHistory.push(...discovery.probeVersions);
+      // Accumulate any CAR_TRANSIENT skip-past versions from this walkback pass.
+      if (discovery.walkbackUnfetchableSkipped.length > 0) {
+        walkbackUnfetchableSkipped.push(...discovery.walkbackUnfetchableSkipped);
+      }
       nextV = (Math.max(discovery.validV, discovery.includedV) + 1) as PointerVersion;
     }
 
@@ -353,6 +375,7 @@ export async function reconcileAndPublish(input: ReconcileInput): Promise<Reconc
         v: outcome.v,
         attemptsUsed: attempts + 1,
         probeHistory,
+        walkbackUnfetchableSkipped,
       };
     }
 
@@ -384,6 +407,10 @@ export async function reconcileAndPublish(input: ReconcileInput): Promise<Reconc
       input.abortSignal,
     );
     probeHistory.push(...rediscovery.probeVersions);
+    // Accumulate any CAR_TRANSIENT skip-past versions from conflict rediscovery.
+    if (rediscovery.walkbackUnfetchableSkipped.length > 0) {
+      walkbackUnfetchableSkipped.push(...rediscovery.walkbackUnfetchableSkipped);
+    }
 
     if (rediscovery.validV > 0) {
       // Steelman: wrap the remote-fetch + join + persist block with a sleep

@@ -298,7 +298,7 @@ describe('Category P — Conformance & Security Invariants (TEST-SPEC §P)', () 
       expect(vi.mocked(proofB.verify)).toHaveBeenCalled();
 
       // Sanity: classifyVersion actually progressed past verification.
-      expect(['VALID', 'SEMANTICALLY_INVALID', 'TRANSIENT_UNAVAILABLE']).toContain(result);
+      expect(['VALID', 'SEMANTICALLY_INVALID', 'PROOF_TRANSIENT', 'CAR_TRANSIENT']).toContain(result);
     });
 
     it('verify counter is non-zero on the SEMANTICALLY_INVALID path too', async () => {

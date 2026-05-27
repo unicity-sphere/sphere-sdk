@@ -95,11 +95,67 @@ export interface ProfilePointerLayerInit {
 export interface PublishResult {
   readonly version: PointerVersion;
   readonly attemptsUsed: number;
+  /**
+   * Versions skipped past during Phase 3 walkback within this publish
+   * session (conflict-driven rediscovery only — the fast-path attempt 0
+   * does no walkback and produces an empty list).
+   *
+   * Mirrors `RecoverResult.walkbackUnfetchableSkipped`. Surfaced so
+   * `publishAggregatorPointerBestEffort` can emit the same
+   * `storage:pointer-version-skipped-unfetchable` event on the publish
+   * path as on the recover path.
+   *
+   * Empty when no CAR_TRANSIENT skip-past occurred or when publish
+   * succeeded on the fast-path (no walkback).
+   */
+  readonly walkbackUnfetchableSkipped: readonly PointerVersion[];
 }
 
 export interface RecoverResult {
   readonly cid: Uint8Array;
   readonly version: PointerVersion;
+  /**
+   * Versions walked past during Phase 3 walkback whose CAR was
+   * EXISTS-BUT-UNFETCHABLE (proof authentic, CID decoded, but no
+   * gateway could serve the bytes). Empty when no such versions were
+   * encountered or when the wallet ran in SPEC-strict
+   * `skipUnfetchableInWalkback: false` mode.
+   *
+   * The wallet's `version` field is the latest VALID predecessor — older
+   * than every entry in this list. Surfaced so the lifecycle layer can
+   * emit a typed `storage:pointer-version-skipped-unfetchable` event for
+   * operator monitoring.
+   *
+   * See `discover-algorithm.ts` for the full design rationale.
+   */
+  readonly walkbackUnfetchableSkipped?: readonly PointerVersion[];
+}
+
+/**
+ * Returned by `recoverLatest()` when the discovery walkback found at
+ * least one anchor (includedV > 0) but EVERY visited slot returned
+ * `CAR_TRANSIENT` — i.e. the pointer history EXISTS on-chain but not
+ * a single CAR is fetchable from any configured gateway.
+ *
+ * This is distinct from `recoverLatest() === null` (fresh wallet — no
+ * pointer ever published). Callers MUST NOT fall through to legacy IPNS
+ * migration on this result: the pointer chain exists; the gateways are
+ * the problem. The wallet should retry on the next poll cycle.
+ *
+ * Lifecycle-layer handling:
+ *   - Do NOT stamp the legacy migration-done marker.
+ *   - Do NOT import IPNS bundles.
+ *   - Emit `storage:pointer-version-skipped-unfetchable` event (carried
+ *     in `walkbackUnfetchableSkipped`) so operators know the outage depth.
+ *   - Return `true` (pointer path was chosen) so the caller skips legacy.
+ */
+export interface RecoverAllUnfetchableResult {
+  readonly kind: 'all-unfetchable';
+  /**
+   * Every version that was walked but whose CAR was unreachable.
+   * Non-empty by definition (at least one slot existed and was skipped).
+   */
+  readonly walkbackUnfetchableSkipped: readonly PointerVersion[];
 }
 
 /**
@@ -438,25 +494,53 @@ export class ProfilePointerLayer {
     if (result.probeHistory.length > 0) {
       this.#lastProbeVersions = result.probeHistory;
     }
-    return { version: result.v, attemptsUsed: result.attemptsUsed };
+    return {
+      version: result.v,
+      attemptsUsed: result.attemptsUsed,
+      walkbackUnfetchableSkipped: result.walkbackUnfetchableSkipped,
+    };
   }
 
   // ── recoverLatest ────────────────────────────────────────────────────────
 
   /**
    * Discover + recover the latest VALID pointer.
-   * Returns null when no pointer has ever been published (validV == 0).
    *
-   * SPEC §13 recoverLatest semantics: returns `{ cid, version }` for the
-   * latest valid version (Phase 3 winner), having classified + fetched the
-   * CAR successfully.
+   * Return value semantics (three distinct cases):
+   *
+   *   `RecoverResult`              — VALID version found; `cid` and `version`
+   *                                  are the latest fetchable snapshot.
+   *                                  `walkbackUnfetchableSkipped` lists any
+   *                                  CAR_TRANSIENT slots walked past.
+   *
+   *   `null`                       — Fresh wallet: no pointer has ever been
+   *                                  published (validV === 0 AND no
+   *                                  walkbackUnfetchableSkipped). The
+   *                                  lifecycle layer may fall through to
+   *                                  legacy IPNS migration or skip it for
+   *                                  a truly new wallet.
+   *
+   *   `RecoverAllUnfetchableResult` — Anchors EXIST on-chain (validV === 0
+   *                                   because every slot returned CAR_TRANSIENT)
+   *                                   but NOT a single CAR is reachable.
+   *                                   Callers MUST NOT fall through to legacy
+   *                                   IPNS migration — the pointer chain is
+   *                                   intact; only the gateways are down.
+   *                                   Retry on the next poll cycle.
+   *
+   * SPEC §13 recoverLatest semantics are extended: the three-case return
+   * disambiguates "no pointer" from "pointer exists but gateways are down".
    */
-  async recoverLatest(opts?: { abortSignal?: AbortSignal }): Promise<RecoverResult | null> {
+  async recoverLatest(opts?: {
+    abortSignal?: AbortSignal;
+  }): Promise<RecoverResult | RecoverAllUnfetchableResult | null> {
     this.#assertNotShuttingDown('recoverLatest');
     return this.#tracked(this.#recoverLatestInner(opts?.abortSignal));
   }
 
-  async #recoverLatestInner(abortSignal?: AbortSignal): Promise<RecoverResult | null> {
+  async #recoverLatestInner(
+    abortSignal?: AbortSignal,
+  ): Promise<RecoverResult | RecoverAllUnfetchableResult | null> {
     // Steelman¹⁹ critical #3: call the INNER discoverLatestVersion helper
     // directly. Going through the public method would re-run
     // #assertNotShuttingDown — if shutdown() fires after recoverLatest's
@@ -471,9 +555,35 @@ export class ProfilePointerLayer {
       throw err;
     }
     const discovery = await this.#discoverLatestVersionInner(undefined, abortSignal);
-    if (discovery.validV === 0) return null;
+
+    if (discovery.validV === 0) {
+      // Disambiguate: did Phase 3 skip-past any CAR_TRANSIENT versions?
+      //   - Yes (walkbackUnfetchableSkipped non-empty): anchors exist on-chain
+      //     but every CAR is unreachable. Return RecoverAllUnfetchableResult so
+      //     the lifecycle layer can refuse legacy IPNS migration and schedule
+      //     a retry.
+      //   - No: genuinely fresh wallet — no pointer ever published. Return null.
+      const skippedOnly = discovery.walkbackUnfetchableSkipped;
+      if (skippedOnly && skippedOnly.length > 0) {
+        return { kind: 'all-unfetchable', walkbackUnfetchableSkipped: skippedOnly };
+      }
+      return null;
+    }
+
     const cid = await this.#init.resolveRemoteCid(discovery.validV);
-    return { cid, version: discovery.validV };
+    // Surface walkback-unfetchable telemetry to the caller. The lifecycle
+    // layer uses this to emit a typed event so operators can detect when
+    // a wallet recovered to an older predecessor because a newer slot
+    // was EXISTS-BUT-UNFETCHABLE. Empty when no skip-past occurred or
+    // when the wallet ran in SPEC-strict mode.
+    const walkbackUnfetchableSkipped = discovery.walkbackUnfetchableSkipped;
+    return {
+      cid,
+      version: discovery.validV,
+      ...(walkbackUnfetchableSkipped && walkbackUnfetchableSkipped.length > 0
+        ? { walkbackUnfetchableSkipped }
+        : {}),
+    };
   }
 
   // ── reconcileLocalVersionDownward ────────────────────────────────────────
@@ -837,7 +947,7 @@ export class ProfilePointerLayer {
   }
 
   /** Low-level classifyVersion. */
-  async classify(v: PointerVersion): Promise<'VALID' | 'SEMANTICALLY_INVALID' | 'TRANSIENT_UNAVAILABLE'> {
+  async classify(v: PointerVersion): Promise<'VALID' | 'SEMANTICALLY_INVALID' | 'PROOF_TRANSIENT' | 'CAR_TRANSIENT'> {
     this.#assertNotShuttingDown('classify');
     return this.#tracked(classifyVersion({
       v,

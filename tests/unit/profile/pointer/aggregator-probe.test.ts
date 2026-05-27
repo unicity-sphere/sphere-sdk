@@ -5,7 +5,7 @@
  *   - probeVersion H2 OR-predicate (either side → true)
  *   - probeVersion raises TRUST_BASE_STALE on rotation (cert.epoch > local)
  *   - probeVersion raises UNTRUSTED_PROOF on forgery (cert.epoch <= local)
- *   - classifyVersion three-way (VALID / SEMANTICALLY_INVALID / TRANSIENT_UNAVAILABLE)
+ *   - classifyVersion four-way (VALID / SEMANTICALLY_INVALID / PROOF_TRANSIENT / CAR_TRANSIENT)
  *   - isReachable returns true on any HTTP response, false on network failure
  */
 
@@ -293,7 +293,7 @@ describe('classifyVersion — H1 three-way (SPEC §8.2)', () => {
     expect(result).toBe('SEMANTICALLY_INVALID');
   });
 
-  it('returns TRANSIENT_UNAVAILABLE when CAR fetch reports transient', async () => {
+  it('returns CAR_TRANSIENT when CAR fetch reports transient (proof OK + CID decoded — slot EXISTS)', async () => {
     const { keyMaterial, signer } = await buildFixtures();
     const proofA = fakeProof(InclusionProofVerificationStatus.OK);
     const proofB = fakeProof(InclusionProofVerificationStatus.OK);
@@ -309,7 +309,9 @@ describe('classifyVersion — H1 three-way (SPEC §8.2)', () => {
       decodeCid: okDecoder,
       fetchCar: transientFetcher,
     });
-    expect(result).toBe('TRANSIENT_UNAVAILABLE');
+    // Proof verified + CID decoded but CAR unreachable → CAR_TRANSIENT (slot EXISTS).
+    // Phase 3 MAY skip past this under skipUnfetchableInWalkback policy.
+    expect(result).toBe('CAR_TRANSIENT');
   });
 
   it('returns SEMANTICALLY_INVALID on CAR content-address mismatch', async () => {
@@ -350,7 +352,7 @@ describe('classifyVersion — H1 three-way (SPEC §8.2)', () => {
     expect(result).toBe('SEMANTICALLY_INVALID');
   });
 
-  it('returns TRANSIENT_UNAVAILABLE when proof fetch fails with network error', async () => {
+  it('returns PROOF_TRANSIENT when proof fetch fails with network error (slot existence UNKNOWN)', async () => {
     const { keyMaterial, signer } = await buildFixtures();
     const client = {
       getInclusionProof: vi.fn(async () => {
@@ -368,7 +370,9 @@ describe('classifyVersion — H1 three-way (SPEC §8.2)', () => {
       decodeCid: okDecoder,
       fetchCar: validFetcher,
     });
-    expect(result).toBe('TRANSIENT_UNAVAILABLE');
+    // Proof RPC failed — slot existence UNKNOWN → PROOF_TRANSIENT.
+    // Phase 3 MUST NOT skip past this (distinct from CAR_TRANSIENT).
+    expect(result).toBe('PROOF_TRANSIENT');
   });
 
   it('raises TRUST_BASE_STALE when proof epoch > local epoch', async () => {

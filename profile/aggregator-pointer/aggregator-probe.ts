@@ -9,10 +9,10 @@
  *     Trust-base rotation is detected on verify failure (§8.4.1).
  *
  *   classifyVersion(v, ...)
- *     H1 three-way classifier. Returns VALID | SEMANTICALLY_INVALID |
- *     TRANSIENT_UNAVAILABLE. Used by Phase-3 walkback. Requires an
- *     injected IPFS/CAR fetcher (the pointer layer does not own IPFS
- *     itself — that stays in profile/ipfs-client.ts).
+ *     H1 four-way classifier. Returns VALID | SEMANTICALLY_INVALID |
+ *     PROOF_TRANSIENT | CAR_TRANSIENT. Used by Phase-3 walkback.
+ *     Requires an injected IPFS/CAR fetcher (the pointer layer does
+ *     not own IPFS itself — that stays in profile/ipfs-client.ts).
  *
  *   isReachable(signingPubKey)
  *     Health check. Issues a getInclusionProof for the wallet's HEALTH_CHECK
@@ -41,11 +41,41 @@ import { SIDE_A_NUM, SIDE_B_NUM, type PointerVersion } from './types.js';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
-/** Three-way version classification per H1 (SPEC §8.2 classifyVersion). */
+/**
+ * Four-way version classification per H1 (SPEC §8.2 classifyVersion).
+ *
+ * The original three-way classification collapsed two distinct failure
+ * modes under `TRANSIENT_UNAVAILABLE`:
+ *
+ *   (a) PROOF_TRANSIENT — the aggregator proof RPC failed (network error,
+ *       timeout, etc.). The slot's existence is UNKNOWN — we cannot tell
+ *       whether the version was ever published. Phase 3 MUST NOT skip past
+ *       this: doing so would silently walk through a slot we haven't
+ *       examined.
+ *
+ *   (b) CAR_TRANSIENT — the proof was verified AND the CID decoded
+ *       successfully (the slot EXISTS), but every IPFS gateway returned
+ *       transient failure (404, 5xx, timeout) for the CAR bytes. The
+ *       slot provably EXISTS on-chain but is unreachable in storage.
+ *       Phase 3 MAY skip past this under the `skipUnfetchableInWalkback`
+ *       policy — skipping an EXISTS-BUT-UNFETCHABLE slot is the intended
+ *       production recovery for IPFS gateway loss.
+ *
+ * Callers that previously pattern-matched `'TRANSIENT_UNAVAILABLE'` MUST
+ * now handle BOTH `'PROOF_TRANSIENT'` and `'CAR_TRANSIENT'`. The two
+ * values intentionally do NOT share a common prefix to prevent accidental
+ * string-equality matches.
+ *
+ * The legacy `TRANSIENT_UNAVAILABLE` value is removed. Any existing code
+ * that compared against it will get a compile-time type error.
+ */
 export type VersionClassification =
   | 'VALID'
   | 'SEMANTICALLY_INVALID'
-  | 'TRANSIENT_UNAVAILABLE';
+  /** Proof RPC failed — slot existence unknown. Do NOT skip-past. */
+  | 'PROOF_TRANSIENT'
+  /** Proof OK + CID decoded but CAR unfetchable — slot EXISTS. May skip-past. */
+  | 'CAR_TRANSIENT';
 
 /**
  * Injected CAR fetch + deserialize callback for classifyVersion.
@@ -392,10 +422,17 @@ async function runDecodePhases(
 }
 
 /**
- * Three-way classify per SPEC §8.2 classifyVersion helper:
- *   VALID                 — both sides verified + CID parseable + CAR fetched
- *   SEMANTICALLY_INVALID  — proof partial, CID corrupt, or CAR fails content-address
- *   TRANSIENT_UNAVAILABLE — all IPFS gateways transient-fail; tokens may still exist
+ * Four-way classify per SPEC §8.2 classifyVersion helper:
+ *   VALID                — both sides verified + CID parseable + CAR fetched
+ *   SEMANTICALLY_INVALID — proof partial, CID corrupt, or CAR fails content-address
+ *   PROOF_TRANSIENT      — aggregator proof RPC failed; slot existence UNKNOWN
+ *   CAR_TRANSIENT        — proof OK + CID decoded but all IPFS gateways unavailable
+ *
+ * The split matters for Phase 3 skip-past policy:
+ *   - PROOF_TRANSIENT must NOT be skipped (we cannot tell whether the slot
+ *     exists — walking past it would silently skip an unexamined version).
+ *   - CAR_TRANSIENT MAY be skipped under `skipUnfetchableInWalkback: true`
+ *     (the slot provably exists on-chain; only its CAR bytes are unavailable).
  *
  * classifyVersion requires BOTH sides included (stricter than probe's OR).
  */
@@ -413,17 +450,23 @@ export async function classifyVersion(input: ClassifyInput): Promise<VersionClas
     timeoutMs,
     input.abortSignal,
   );
-  if (phase12.ok === 'transient') return 'TRANSIENT_UNAVAILABLE';
+  // Case (a): aggregator proof RPC failed — slot existence UNKNOWN.
+  // Return PROOF_TRANSIENT, NOT CAR_TRANSIENT — Phase 3 must not skip past this.
+  if (phase12.ok === 'transient') return 'PROOF_TRANSIENT';
   if (phase12.ok === 'semantic') return 'SEMANTICALLY_INVALID';
 
   // Step 3: fetch + content-address verify (§8.2 step 3).
+  // Reaching here means proof was verified AND CID decoded — the slot EXISTS.
   const carResult = await fetchCar(phase12.cidBytes);
   if (carResult.ok) {
     return 'VALID';
   }
   switch (carResult.kind) {
     case 'transient_unavailable':
-      return 'TRANSIENT_UNAVAILABLE';
+      // Case (b): slot EXISTS (proof ok + CID decoded) but CAR is unreachable.
+      // Return CAR_TRANSIENT — Phase 3 may skip past this under the
+      // skipUnfetchableInWalkback policy.
+      return 'CAR_TRANSIENT';
     case 'content_mismatch':
     case 'car_parse_failed':
     default:

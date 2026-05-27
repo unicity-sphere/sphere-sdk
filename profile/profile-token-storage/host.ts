@@ -216,7 +216,7 @@ export interface ProfileTokenStorageHost {
   log(message: string): void;
   emitEvent(event: StorageEvent): void;
   buildErrorEvent(
-    type: 'storage:error' | 'sync:error',
+    type: 'storage:error' | 'sync:error' | 'storage:pointer-version-skipped-unfetchable',
     err: unknown,
     overrideCode?: string,
   ): StorageEvent;

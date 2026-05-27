@@ -5804,7 +5804,10 @@ export class Sphere {
       // bypasses the >= comparison. For Phase 1 this still helps the
       // cross-version case where own localVersion < broadcast.version.
       const recovered = await pointer.recoverLatest();
-      if (recovered) {
+      // `'cid' in recovered` narrows RecoverResult | RecoverAllUnfetchableResult
+      // to RecoverResult — RecoverAllUnfetchableResult has no `cid` field.
+      // RecoverAllUnfetchableResult has no fetchable version to adopt, so skip.
+      if (recovered && 'cid' in recovered) {
         const outcome = await pointer.reconcileLocalVersionDownward(recovered);
         logger.debug(
           'Sphere',
