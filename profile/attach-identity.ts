@@ -65,11 +65,24 @@ export async function attachIdentityToProfileProviders(
     providers.tokenStorage.setIdentity(identity);
   });
 
+  // Connect the storage provider so its OrbitDB Phase-B attach runs.
+  // Without this, downstream calls to `tokenStorage.save()` →
+  // FlushScheduler → OrbitDB throw `PROFILE_NOT_INITIALIZED` ("OrbitDB
+  // adapter is not connected. Call connect() first"). The factory
+  // contract promises ready-to-use providers; standalone callers (the
+  // migration probe, `migrateTokenStorage`, plain probe `load`s) do not
+  // re-route through `Sphere.init`, so connect MUST happen here.
+  //
+  // connect() is idempotent: a later `Sphere.init`-driven connect re-
+  // entry observes `dbStatus==='attached'` and `connectPromise` latch
+  // and returns without a second attach.
+  await providers.storage.connect();
+
   // Initialize the token storage so the consumer can immediately read
   // and write — mirrors the manual setIdentity + initialize sequence
-  // documented in the existing migration example. Storage provider's
-  // connect() lifecycle is driven by Sphere itself when the providers
-  // are subsequently handed to Sphere.init / Sphere.load; the standalone
-  // probe / migration call sites manage their own lifecycle.
+  // documented in the existing migration example. Runs AFTER storage
+  // connect so `lifecycleManager.initialize`'s `host.db.isConnected()`
+  // check sees the attached OrbitDB and proceeds with the bundle-index
+  // refresh + cold-start recovery path.
   await providers.tokenStorage.initialize();
 }

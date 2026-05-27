@@ -74,18 +74,23 @@ function buildProviderPair(): {
   storage: ProfileStorageProvider;
   tokenStorage: ProfileTokenStorageProvider;
   storageSetId: ReturnType<typeof vi.fn>;
+  storageConnect: ReturnType<typeof vi.fn>;
   tokenStorageSetId: ReturnType<typeof vi.fn>;
   tokenStorageInit: ReturnType<typeof vi.fn>;
 } {
   const storageSetId = vi.fn();
+  const storageConnect = vi.fn(async () => undefined);
   const tokenStorageSetId = vi.fn();
   const tokenStorageInit = vi.fn(async () => true);
-  const storage = { setIdentity: storageSetId } as unknown as ProfileStorageProvider;
+  const storage = {
+    setIdentity: storageSetId,
+    connect: storageConnect,
+  } as unknown as ProfileStorageProvider;
   const tokenStorage = {
     setIdentity: tokenStorageSetId,
     initialize: tokenStorageInit,
   } as unknown as ProfileTokenStorageProvider;
-  return { storage, tokenStorage, storageSetId, tokenStorageSetId, tokenStorageInit };
+  return { storage, tokenStorage, storageSetId, storageConnect, tokenStorageSetId, tokenStorageInit };
 }
 
 // ---------------------------------------------------------------------------
@@ -117,15 +122,70 @@ describe('attachIdentityToProfileProviders', () => {
     const callOrder: string[] = [];
     const storage = {
       setIdentity: vi.fn(() => callOrder.push('storage')),
+      connect: vi.fn(async () => { callOrder.push('storage.connect'); }),
     } as unknown as ProfileStorageProvider;
     const tokenStorage = {
       setIdentity: vi.fn(() => callOrder.push('tokenStorage')),
-      initialize: vi.fn(async () => true),
+      initialize: vi.fn(async () => {
+        callOrder.push('tokenStorage.initialize');
+        return true;
+      }),
     } as unknown as ProfileTokenStorageProvider;
 
     await attachIdentityToProfileProviders(sphere, { storage, tokenStorage });
 
-    expect(callOrder).toEqual(['storage', 'tokenStorage']);
+    // Both setIdentity calls happen synchronously in the
+    // _withFullIdentityForProfileFactory callback, so 'storage' (the
+    // setIdentity invocation) precedes 'tokenStorage'. The async
+    // connect/initialize steps then run in declared order.
+    expect(callOrder).toEqual([
+      'storage',
+      'tokenStorage',
+      'storage.connect',
+      'tokenStorage.initialize',
+    ]);
+  });
+
+  it('awaits storage.connect() between setIdentity and tokenStorage.initialize() — OrbitDB attach', async () => {
+    const sphere = buildSphereStub(REAL_IDENTITY);
+    const { storage, tokenStorage, storageSetId, storageConnect, tokenStorageInit } =
+      buildProviderPair();
+
+    await attachIdentityToProfileProviders(sphere, { storage, tokenStorage });
+
+    expect(storageConnect).toHaveBeenCalledOnce();
+    const setIdOrder = storageSetId.mock.invocationCallOrder[0];
+    const connectOrder = storageConnect.mock.invocationCallOrder[0];
+    const initOrder = tokenStorageInit.mock.invocationCallOrder[0];
+    // setIdentity → storage.connect → tokenStorage.initialize. The
+    // connect MUST happen after setIdentity (Phase B reads identity)
+    // and BEFORE tokenStorage.initialize (which inspects host.db.
+    // isConnected()).
+    expect(connectOrder).toBeGreaterThan(setIdOrder);
+    expect(initOrder).toBeGreaterThan(connectOrder);
+  });
+
+  it('propagates storage.connect() failure (OrbitDB attach error surfaces)', async () => {
+    const sphere = buildSphereStub(REAL_IDENTITY);
+    const storage = {
+      setIdentity: vi.fn(),
+      connect: vi.fn(async () => {
+        throw new Error('OrbitDB attach failed: bootstrap peer unreachable');
+      }),
+    } as unknown as ProfileStorageProvider;
+    const tokenStorageInit = vi.fn(async () => true);
+    const tokenStorage = {
+      setIdentity: vi.fn(),
+      initialize: tokenStorageInit,
+    } as unknown as ProfileTokenStorageProvider;
+
+    await expect(
+      attachIdentityToProfileProviders(sphere, { storage, tokenStorage }),
+    ).rejects.toThrow(/OrbitDB attach failed/);
+    // tokenStorage.initialize must NOT run when storage.connect rejected —
+    // we never want a half-attached state where the bundle index refresh
+    // runs against a disconnected OrbitDB.
+    expect(tokenStorageInit).not.toHaveBeenCalled();
   });
 
   it('awaits tokenStorage.initialize() after both setIdentity calls', async () => {
