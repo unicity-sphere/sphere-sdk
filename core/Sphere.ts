@@ -5409,13 +5409,27 @@ export class Sphere {
       await this._transport.connect();
     }
 
+    // Subscribe to provider events BEFORE token-storage initialize so
+    // any `storage:error` events emitted during initialize (e.g.,
+    // `BUNDLE_INDEX_REFRESH_FAILED` from the Profile band-aid that
+    // tolerates corrupt-OpLog initialization) reach the
+    // `connection:changed` bridge. `provider.onEvent` is a synchronous
+    // listener registry (`ProfileTokenStorageProvider.onEvent` lines
+    // 1662-1667) with no replay buffer — subscribers added after
+    // emission do NOT receive past events. Subscribing first ensures
+    // production consumers see the degraded-state signal that unit
+    // tests already pin.
+    //
+    // Safe to wire pre-initialize: `_tokenStorageProviders` Map is
+    // populated by the constructor / setup phase well before
+    // `initializeProviders` runs, and `onEvent` just appends to the
+    // provider's local Set. No initialization order side effects.
+    this.subscribeToProviderEvents();
+
     // Initialize all token storage providers in parallel
     await Promise.all(
       [...this._tokenStorageProviders.values()].map(p => p.initialize())
     );
-
-    // Subscribe to provider events and bridge to connection:changed
-    this.subscribeToProviderEvents();
   }
 
   /**
