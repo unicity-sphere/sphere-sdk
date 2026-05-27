@@ -5390,9 +5390,21 @@ export class Sphere {
     //      reads oracle state).
     //   3. Transport third — Nostr connection, independent.
     await this._oracle.initialize();
-    if (!this._storage.isConnected()) {
-      await this._storage.connect();
-    }
+    // ALWAYS call connect() after oracle.initialize(), regardless of
+    // current `isConnected()` state. Consumers may have pre-connected
+    // the storage provider (e.g., the Sphere-bound Profile factory
+    // `attachIdentityToProfileProviders` connects so the standalone
+    // migration call sites can use the providers immediately). When
+    // pre-connect happened BEFORE oracle.initialize, Phase C exited
+    // with a retryable `aggregator_client_unavailable` skip reason
+    // and `pointerLayer` is still null. `connect()` is idempotent:
+    // Phase A is gated on `status !== 'connected'`, Phase B on
+    // `dbStatus !== 'attached'`, and Phase C re-attempts when
+    // `pointerLayer === null && !isPointerSkipSticky()`. So a second
+    // call here cheaply finishes Phase C with the now-initialized
+    // oracle and the pointer channel is live for the rest of the
+    // session — instead of staying dark (issue #239 regression risk).
+    await this._storage.connect();
     if (!this._transport.isConnected()) {
       await this._transport.connect();
     }

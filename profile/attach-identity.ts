@@ -65,11 +65,48 @@ export async function attachIdentityToProfileProviders(
     providers.tokenStorage.setIdentity(identity);
   });
 
+  // Connect the storage provider so its OrbitDB Phase-B attach runs.
+  // Without this, downstream calls to `tokenStorage.save()` →
+  // FlushScheduler → OrbitDB throw `PROFILE_NOT_INITIALIZED` ("OrbitDB
+  // adapter is not connected. Call connect() first"). The factory
+  // contract promises ready-to-use providers; standalone callers (the
+  // migration probe, `migrateTokenStorage`, plain probe `load`s) do not
+  // re-route through `Sphere.init`, so connect MUST happen here.
+  //
+  // connect() is idempotent: a later `Sphere.init`-driven connect re-
+  // entry observes `dbStatus==='attached'` and `connectPromise` latch
+  // and returns without a second attach. Sphere.init re-calls
+  // `storage.connect()` unconditionally after `oracle.initialize()` so
+  // a deferred Phase C pointer-layer build re-attempts with the now-
+  // available aggregator client (see `initializeProviders` in Sphere.ts).
+  //
+  // Half-state recovery: if connect() partially succeeded (Phase A
+  // local-cache connected; Phase B OrbitDB attach threw) and we just
+  // re-threw, the provider would be left at `status='connected'` +
+  // `dbStatus='error'`. The downstream catch in sphere.telco's
+  // `runProfileMigration` would treat the throw as non-fatal and
+  // spin up a SECOND provider pair, which would collide with this
+  // one's locked OrbitDB/IndexedDB blockstore handles. To prevent
+  // that, we proactively `disconnect()` on failure so the consumer
+  // sees a fully torn-down provider pair. The disconnect itself is
+  // best-effort — if it also throws, we still propagate the original
+  // connect() error verbatim so the operator sees the root cause.
+  try {
+    await providers.storage.connect();
+  } catch (connectErr) {
+    try {
+      await providers.storage.disconnect();
+    } catch {
+      // Best-effort cleanup — surface the original connect error.
+    }
+    throw connectErr;
+  }
+
   // Initialize the token storage so the consumer can immediately read
   // and write — mirrors the manual setIdentity + initialize sequence
-  // documented in the existing migration example. Storage provider's
-  // connect() lifecycle is driven by Sphere itself when the providers
-  // are subsequently handed to Sphere.init / Sphere.load; the standalone
-  // probe / migration call sites manage their own lifecycle.
+  // documented in the existing migration example. Runs AFTER storage
+  // connect so `lifecycleManager.initialize`'s `host.db.isConnected()`
+  // check sees the attached OrbitDB and proceeds with the bundle-index
+  // refresh + cold-start recovery path.
   await providers.tokenStorage.initialize();
 }
