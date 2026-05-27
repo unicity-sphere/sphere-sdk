@@ -155,40 +155,16 @@ export const MAX_CREATOR_LENGTH = 256;
 export const MAX_DESCRIPTION_LENGTH = 1024;
 
 /**
- * Maximum bit-length of an SMT path bigint accepted by the UXF encoder.
- *
- * Issue #295: the aggregator's walkback algorithm uses
- * `BitString(data) = BigInt('0x01' || hex(data))` over a 34-byte
- * imprint (`0x01 || algo:2 || hash:32`). The resulting bigint can
- * reach 35 bytes = **280 bits**. The historical UXF §11 fixed-32-byte
- * (256-bit) cap rejected legitimate proofs whose step paths exceeded
- * 256 bits, blocking Profile-mode migration for affected wallets.
- *
- * This ceiling matches `1 + 34 = 35` bytes × 8 = 280 bits. Any larger
- * value is REJECTED at parse time with `INVALID_HASH`.
- */
-export const UXF_SMT_PATH_MAX_BITS = 280;
-
-/**
- * Maximum byte-length of an SMT path bstr accepted by the UXF encoder /
- * decoder. ceil(`UXF_SMT_PATH_MAX_BITS` / 8) = ceil(280 / 8) = 35.
- */
-export const UXF_SMT_PATH_MAX_BYTES = 35;
-
-/**
  * Maximum decimal-digit length for an SMT path string.
  *
  * Steelman³ remediation (FIX 4, Round 3): `parseSmtPathDecimal`
  * accepts an arbitrary-length decimal string then hands it to
  * `BigInt()`. A hostile peer can ship a 100 MiB string of decimal
  * digits — `BigInt()` will allocate the corresponding bigint
- * (megabytes of mantissa) before the downstream encoder finally
- * rejects it. Cap upfront to the maximum decimal-digit count that
- * fits into the SMT path domain (`UXF_SMT_PATH_MAX_BITS` bits).
+ * (megabytes of mantissa) before the downstream `bigIntTo32Bytes`
+ * cap rejects it. Cap upfront to the maximum decimal-digit count
+ * that fits into a uint256 (which is the SMT path domain).
  *
- * Issue #295: raised from 78 (uint256 max) to 85 to match the new
- * 280-bit ceiling. ceil(280 * log10(2)) = ceil(84.29...) = 85.
- *
- * 2^280 - 1 has 85 decimal digits.
+ * 2^256 - 1 = 78 decimal digits.
  */
-export const MAX_SMT_PATH_DECIMAL_LENGTH = 85;
+export const MAX_SMT_PATH_DECIMAL_LENGTH = 78;
