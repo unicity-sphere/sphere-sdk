@@ -158,9 +158,12 @@ export interface SphereCryptographer {
 
 **Status:** Only `derivePurposeKey('profile-cache')` is wired through the
 Profile factories in this PR. The remaining methods are sketched so the
-interface shape is stable from the first release. A follow-up issue tracks
-migrating `Sphere.signMessage`, `PaymentsModule` signing, and
-`CommunicationsModule` encryption to delegate via this interface.
+interface shape is stable from the first release.
+
+**Follow-up tracked in [#293](https://github.com/unicity-sphere/sphere-sdk/issues/293)** — migrates
+`Sphere.signMessage`, `PaymentsModule` signing, `CommunicationsModule`
+encryption, and the pre-existing `ProfileTokenStorageProvider.getIdentity()`
+leakage point to delegate via this interface.
 
 ## Internal helper — `attachIdentityToProfileProviders`
 
@@ -244,8 +247,8 @@ const and invokes the callback. It does NOT scrub the snapshot's
      privateKey) and routing the existing internal callers (the lifecycle
      manager's `Phase B` connect, `factory.ts` line 458) through a separate
      internal-only accessor — too large to bundle here.
-   - **Tracked as part of the follow-up SphereCryptographer migration**
-     (see "Strategic foundation" above). The future migration will replace
+   - **Tracked as part of the follow-up SphereCryptographer migration
+     ([#293](https://github.com/unicity-sphere/sphere-sdk/issues/293))**. The future migration will replace
      scattered `getIdentity()` reads with explicit `cryptographer.*` calls
      so the boundary becomes uniform.
 
