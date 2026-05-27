@@ -13,6 +13,7 @@
  */
 
 import { encode } from '@ipld/dag-cbor';
+import { SparseMerkleTreePath } from '@unicitylabs/state-transition-sdk/lib/mtree/plain/SparseMerkleTreePath.js';
 
 import type {
   ContentHash,
@@ -286,26 +287,41 @@ export function deconstructAuthenticator(
 /**
  * Deconstruct a SparseMerkleTreePath into an `smt-path` element.
  *
- * Segments are stored inline (Decision 5). Each segment's `data` is a
- * lowercased hex string (or empty string for null/empty subtrees) and
- * `path` is kept as a decimal bigint string (NOT hex).
+ * Issue #295 (rewrite #2): the SmtPath element content is a single
+ * opaque STS-canonical CBOR blob. UXF MUST NOT touch the path's
+ * binary representation; the bytes are produced by
+ * `SparseMerkleTreePath.toCBOR()` and consumed by
+ * `SparseMerkleTreePath.fromCBOR()`. STS owns the wire format.
+ *
+ * The input is the InclusionProof's `merkleTreePath` JSON shape (the
+ * existing public API of `deconstructToken`). We bridge to the STS
+ * canonical representation here via `SparseMerkleTreePath.fromJSON`
+ * so that callers do not need to be refactored to hold a live STS
+ * object.
  */
 export function deconstructSmtPath(
   pool: ElementPool,
   merkleTreePath: SmtPathShape,
 ): ContentHash {
-  const segments = merkleTreePath.steps.map((step) => ({
-    data: step.data == null ? null : lowerHex(step.data),
-    path: step.path, // decimal bigint string, keep as-is
-  }));
+  // Bridge JSON-shape -> STS object -> canonical CBOR. The fromJSON
+  // call is the right place to surface any future STS-side validation
+  // (e.g. bit-length bounds on step paths) — it throws verbatim and
+  // we let the error propagate.
+  const sdkPath = SparseMerkleTreePath.fromJSON(merkleTreePath);
+  const cborBytes = sdkPath.toCBOR();
+  // Store as hex string in-memory to match the storage pattern of
+  // `UnicityCertificateContent.raw` and `PredicateContent.raw`.
+  // Conversion to Uint8Array happens transiently inside
+  // `prepareContentForHashing` (BYTE_FIELDS['smt-path'] === {'cbor'}).
+  let cborHex = '';
+  for (let i = 0; i < cborBytes.length; i++) {
+    cborHex += cborBytes[i].toString(16).padStart(2, '0');
+  }
 
   return putElement(
     pool,
     'smt-path',
-    {
-      root: lowerHex(merkleTreePath.root),
-      segments,
-    },
+    { cbor: cborHex },
     {},
   );
 }

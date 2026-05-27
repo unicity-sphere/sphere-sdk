@@ -465,7 +465,11 @@ describe('assembleToken', () => {
                 signature: 'aa'.repeat(64),
                 stateHash: 'aa'.repeat(32),
               },
-              merkleTreePath: { root: 'aa'.repeat(32), steps: [] },
+              // Issue #295 rewrite #2: STS requires at least one step.
+              merkleTreePath: {
+                root: 'aa'.repeat(32),
+                steps: [{ path: '0', data: 'aa'.repeat(32) }],
+              },
               transactionHash: 'aa'.repeat(32),
               unicityCertificate: 'aa'.repeat(50),
             },

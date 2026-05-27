@@ -1,6 +1,6 @@
 {
-  "_marker": "T.2.D.REFERENCE.SNAPSHOT.v3",
-  "_note": "T.2.D reference snapshot, NOT a v1.0 wire format claim. See README.md.",
+  "_marker": "T.2.D.REFERENCE.SNAPSHOT.v5",
+  "_note": "T.2.D reference snapshot, NOT a v1.0 wire format claim. See README.md. v5 (issue #295 rewrite #2): SmtPath element content is now a single opaque STS-canonical CBOR blob (`SparseMerkleTreePath.toCBOR()`). UXF no longer decomposes into {root, segments}; STS owns the binary representation entirely. Replaces v4's BigintConverter-delegated segment encoding.",
   "tag": "T.2.D.2-reference-snapshot",
   "generated": {
     "frozenEpochMs": 1735689600000,

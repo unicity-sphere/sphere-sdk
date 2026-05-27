@@ -154,17 +154,10 @@ export const MAX_CREATOR_LENGTH = 256;
  */
 export const MAX_DESCRIPTION_LENGTH = 1024;
 
-/**
- * Maximum decimal-digit length for an SMT path string.
- *
- * Steelman³ remediation (FIX 4, Round 3): `parseSmtPathDecimal`
- * accepts an arbitrary-length decimal string then hands it to
- * `BigInt()`. A hostile peer can ship a 100 MiB string of decimal
- * digits — `BigInt()` will allocate the corresponding bigint
- * (megabytes of mantissa) before the downstream `bigIntTo32Bytes`
- * cap rejects it. Cap upfront to the maximum decimal-digit count
- * that fits into a uint256 (which is the SMT path domain).
- *
- * 2^256 - 1 = 78 decimal digits.
- */
-export const MAX_SMT_PATH_DECIMAL_LENGTH = 78;
+// Issue #295 (rewrite #2): `MAX_SMT_PATH_DECIMAL_LENGTH` was removed
+// when UXF stopped decomposing `merkleTreePath` into individual
+// segments. SmtPath is now stored as a single opaque STS-canonical
+// CBOR blob; UXF does not touch the path's decimal/bigint
+// representation at all. DoS protection at the JSON parse boundary
+// is state-transition-sdk's responsibility (see follow-up filed
+// against STS).

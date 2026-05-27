@@ -292,11 +292,36 @@ export type PendingAuthenticatorContent = AuthenticatorContent;
 
 // ---- SMT Path ----
 
+/**
+ * SmtPath element content (issue #295, rewrite #2).
+ *
+ * **Architectural rule:** UXF treats the InclusionProof's SMT path as
+ * an OPAQUE STS-canonical CBOR blob. UXF does NOT decompose the path
+ * into `{root, segments}` at the element-pool level; UXF does NOT
+ * touch the path's binary representation. The bytes are produced by
+ * `SparseMerkleTreePath.toCBOR()` and consumed by
+ * `SparseMerkleTreePath.fromCBOR()` — STS owns the wire format.
+ *
+ * Storage:
+ *   - In-memory content: `{ cbor: <lowercase-hex string> }` — matches
+ *     the storage pattern of `UnicityCertificateContent.raw` and
+ *     `PredicateContent.raw`. Conversion to a Uint8Array happens
+ *     transiently inside `prepareContentForHashing` and IPLD encode.
+ *   - JSON wire: `{ "cbor": "<lowercase-hex>" }`
+ *   - CBOR wire: a single `bstr` (the opaque STS encoding)
+ *
+ * Dedup granularity: UNCHANGED — UXF's pool dedups at the whole-element
+ * level via ContentHash. Two transactions whose walkback produces
+ * identical SmtPaths share a single SmtPath element. Segments were
+ * always inline content inside a single putElement call (see
+ * pre-#295 uxf/deconstruct.ts), never separate pool entries, so this
+ * rewrite preserves the same dedup behaviour at the same granularity.
+ */
 export interface SmtPathContent {
-  readonly root: string;
-  readonly segments: ReadonlyArray<{ readonly data: string; readonly path: string }>;
+  /** Hex-encoded STS-canonical CBOR blob, stored opaquely. */
+  readonly cbor: string;
 }
-// No children -- segments are inline leaf data, NOT separate elements.
+// No children -- the SMT path is leaf data.
 
 // ---- Unicity Certificate ----
 

@@ -196,8 +196,14 @@ describe('deconstructToken', () => {
       expect((stateEl.content as Record<string, unknown>).data).toBeNull();
     });
 
-    it('null SmtPath step.data preserved as null', () => {
-      // Token A has a step with data: null at index 2
+    it('SmtPath step structure is preserved through STS round-trip (null data, etc.)', async () => {
+      // Issue #295 rewrite #2: SmtPath element content is opaque
+      // STS-canonical CBOR. The step structure (including null data)
+      // round-trips losslessly through fromJSON -> toCBOR -> fromCBOR
+      // -> toJSON. Token A has a step at index 2 with data: null.
+      const { SparseMerkleTreePath } = await import(
+        '@unicitylabs/state-transition-sdk/lib/mtree/plain/SparseMerkleTreePath.js'
+      );
       const rootHash = deconstructToken(pool, TOKEN_A);
       const rootEl = pool.get(rootHash)!;
       const rootChildren = rootEl.children as unknown as TokenRootChildren;
@@ -206,12 +212,15 @@ describe('deconstructToken', () => {
       const ipEl = pool.get(genesisChildren.inclusionProof)!;
       const ipChildren = ipEl.children as Record<string, ContentHash>;
       const smtEl = pool.get(ipChildren.merkleTreePath)!;
-      const segments = (smtEl.content as Record<string, unknown>).segments as Array<{
-        data: string | null;
-        path: string;
-      }>;
-      // The third step has data: null
-      expect(segments[2].data).toBeNull();
+      const cborHex = (smtEl.content as Record<string, unknown>).cbor as string;
+      const cborBytes = new Uint8Array(cborHex.length / 2);
+      for (let i = 0; i < cborHex.length; i += 2) {
+        cborBytes[i / 2] = parseInt(cborHex.substring(i, i + 2), 16);
+      }
+      const sdkPath = SparseMerkleTreePath.fromCBOR(cborBytes);
+      const json = sdkPath.toJSON();
+      // The third step has data: null in TOKEN_A.
+      expect(json.steps[2].data).toBeNull();
     });
   });
 
@@ -220,7 +229,13 @@ describe('deconstructToken', () => {
   // -----------------------------------------------------------------------
 
   describe('special fields', () => {
-    it('SmtPath path stored as string (not hex-decoded)', () => {
+    it('SmtPath path bigint decimal preserved through STS opaque-CBOR round-trip', async () => {
+      // Issue #295 rewrite #2: SmtPath is opaque STS CBOR. Path
+      // bigints round-trip losslessly. Token A's third step has the
+      // decimal '9999999999999999999' (>2^63 — exceeds JS number range).
+      const { SparseMerkleTreePath } = await import(
+        '@unicitylabs/state-transition-sdk/lib/mtree/plain/SparseMerkleTreePath.js'
+      );
       const rootHash = deconstructToken(pool, TOKEN_A);
       const rootEl = pool.get(rootHash)!;
       const rootChildren = rootEl.children as unknown as TokenRootChildren;
@@ -229,13 +244,15 @@ describe('deconstructToken', () => {
       const ipEl = pool.get(genesisChildren.inclusionProof)!;
       const ipChildren = ipEl.children as Record<string, ContentHash>;
       const smtEl = pool.get(ipChildren.merkleTreePath)!;
-      const segments = (smtEl.content as Record<string, unknown>).segments as Array<{
-        data: string | null;
-        path: string;
-      }>;
-      // The third step has the large decimal bigint string
-      expect(segments[2].path).toBe('9999999999999999999');
-      expect(typeof segments[2].path).toBe('string');
+      const cborHex = (smtEl.content as Record<string, unknown>).cbor as string;
+      const cborBytes = new Uint8Array(cborHex.length / 2);
+      for (let i = 0; i < cborHex.length; i += 2) {
+        cborBytes[i / 2] = parseInt(cborHex.substring(i, i + 2), 16);
+      }
+      const sdkPath = SparseMerkleTreePath.fromCBOR(cborBytes);
+      const json = sdkPath.toJSON();
+      expect(json.steps[2].path).toBe('9999999999999999999');
+      expect(typeof json.steps[2].path).toBe('string');
     });
 
     it('UnicityCertificate stored opaquely (raw field)', () => {
