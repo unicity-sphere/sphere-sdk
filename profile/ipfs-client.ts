@@ -231,6 +231,24 @@ const DEFAULT_IPFS_API_URL = 'https://ipfs.unicity.network';
 /** Default timeout for pin operations (ms). */
 const DEFAULT_PIN_TIMEOUT_MS = 60_000;
 
+/**
+ * Default concurrency for `pinCarBlocksToIpfs`. Each in-flight slot is a
+ * single HTTP POST to the sidecar; round-trip is ~80-150 ms regardless of
+ * payload size, so serial = N × RTT and dominates wall-clock for any
+ * non-trivial wallet (a 24-token migration emits ~250 blocks, which at
+ * 100 ms each is ~25 s serial). 10 concurrent in-flight pins reduces the
+ * same workload to ~2.5 s while staying well under typical browser
+ * per-origin connection caps (Chrome's 6 HTTP/1.1 cap is multiplexed by
+ * HTTP/2 on the sidecar). Overridable per-call to support stress tests
+ * or sidecars with explicit per-client rate limits.
+ *
+ * Concurrency is bounded by a worker pool (not Promise.all over all
+ * blocks) so memory stays O(concurrency × block-size) rather than
+ * O(blocks × block-size) — important for migration of large wallets
+ * where the CAR may contain thousands of blocks.
+ */
+const DEFAULT_PIN_CONCURRENCY = 10;
+
 /** Default timeout for fetch operations (ms). */
 const DEFAULT_FETCH_TIMEOUT_MS = 30_000;
 
@@ -660,6 +678,11 @@ async function pinSingleBlock(
  * @param timeoutMs         - Timeout per gateway+block (default: 60 000)
  * @param helia             - Optional local Helia node (see issue #236).
  *                            Pass the result of `OrbitDbAdapter.getHelia()`.
+ * @param concurrency       - Maximum simultaneous in-flight block pins
+ *                            (default: 10). Higher values may saturate
+ *                            slow sidecars; lower values increase serial
+ *                            tail. Non-positive / non-finite values are
+ *                            clamped to 1.
  * @returns The `expectedRootCid` on success.
  * @throws {ProfileError} `ORBITDB_WRITE_FAILED` if all gateways fail to
  *         accept a pin or the CAR doesn't contain the expected root.
@@ -670,6 +693,7 @@ export async function pinCarBlocksToIpfs(
   expectedRootCid: string,
   timeoutMs: number = DEFAULT_PIN_TIMEOUT_MS,
   helia?: unknown,
+  concurrency: number = DEFAULT_PIN_CONCURRENCY,
 ): Promise<string> {
   const localHelia = asHelia(helia);
   // Parse the CAR locally to extract each block. Done up front so a
@@ -730,10 +754,39 @@ export async function pinCarBlocksToIpfs(
     );
   }
 
-  // Pin each block sequentially. A single block failure aborts the
-  // whole import: callers MUST see "all blocks pinned" or "publish
+  // Pin blocks with bounded concurrency. A single block failure aborts
+  // the whole import: callers MUST see "all blocks pinned" or "publish
   // failed" — never a partial import that would leave the rootCid
   // pointing into a hole.
+  //
+  // Concurrency model: a fixed-size worker pool draws from a shared
+  // monotonic index into `blocks`. Each worker iterates until the index
+  // is exhausted, processing one block at a time (local Helia put then
+  // HTTP pin). In-flight HTTP is bounded at exactly `concurrency` —
+  // important for sidecars / browsers with per-origin connection caps.
+  //
+  // Memory: once `CarReader.fromBytes(carBytes)` materialises the block
+  // index, the full `blocks[]` array is held in scope for the entire
+  // pin operation (every worker closes over it). So peak memory is
+  // O(N_blocks × block-size) + O(concurrency) for HTTP buffers —
+  // dominated by the parsed CAR, not the pin parallelism. (A future
+  // optimisation could stream blocks via `reader.blocks()` with a
+  // producer-consumer queue, but the CAR-as-bytes input already
+  // requires the full payload in memory, so this is bounded by the
+  // CAR-build step upstream.)
+  //
+  // Error handling: a worker that fails sets the shared `aborted` flag
+  // so peer workers short-circuit on their next iteration. Each worker
+  // is wrapped via `.catch()` so a late rejection AFTER the first
+  // failure cannot surface as `UnhandledPromiseRejection` (which would
+  // either log spurious warnings or — in strict / `--unhandled-
+  // rejections=strict` mode — terminate the host process). All worker
+  // errors are collected into `workerErrors[]`; we throw the first one
+  // so the caller sees the deterministic root cause rather than a
+  // race-dependent variant. In-flight pin POSTs at the moment of abort
+  // run to completion naturally (sidecar timeout) — no resource leak
+  // because IPFS pins are idempotent at the same CID and the sidecar
+  // bounds its own request lifetime.
   //
   // Issue #236 — when a local Helia handle is supplied, write each
   // block to its on-disk blockstore BEFORE the HTTP pin. This makes
@@ -760,7 +813,17 @@ export async function pinCarBlocksToIpfs(
   // pre-#236 behaviour (Kubo redirects to truthful CID, lie becomes
   // unreachable) is preserved bit-for-bit. We log loudly so a
   // regression in our own CAR builder is visible in operator telemetry.
-  for (const block of blocks) {
+  const effectiveConcurrency = Math.max(
+    1,
+    Number.isFinite(concurrency) ? Math.floor(concurrency) : DEFAULT_PIN_CONCURRENCY,
+  );
+  const workerCount = Math.min(effectiveConcurrency, blocks.length);
+
+  let nextIndex = 0;
+  let aborted = false;
+  const workerErrors: unknown[] = [];
+
+  const processOne = async (block: { cid: string; bytes: Uint8Array }): Promise<void> => {
     if (localHelia !== null) {
       let cidBindingOk = true;
       try {
@@ -780,6 +843,55 @@ export async function pinCarBlocksToIpfs(
       }
     }
     await pinSingleBlock(gateways, block.bytes, block.cid, timeoutMs);
+  };
+
+  const worker = async (): Promise<void> => {
+    while (!aborted) {
+      // Atomic index claim — V8 single-threaded model guarantees no
+      // microtask interleaves between read and write of `nextIndex++`.
+      // (Any future refactor that adds an `await` between read and
+      // write would break this and is caught by the index-tracking
+      // assertion in `tests/unit/profile/ipfs-client-parallel-pin.test.ts`.)
+      const i = nextIndex++;
+      if (i >= blocks.length) return;
+      try {
+        await processOne(blocks[i]);
+      } catch (err) {
+        // First failure tips the shared abort flag so peer workers
+        // exit on their next iteration rather than uselessly pinning
+        // additional blocks that the caller will discard anyway.
+        aborted = true;
+        throw err;
+      }
+    }
+  };
+
+  // Wrap each worker in a `.catch()` so a late rejection (after the
+  // first failure already armed `aborted`) is absorbed locally rather
+  // than escaping as an UnhandledPromiseRejection — operationally
+  // visible (Node logs a warning, strict mode aborts the host process)
+  // even though the original throw is already surfaced via `workerErrors`.
+  // Steelman finding P1#1 — pre-fix `Promise.all(workers)` would short-
+  // circuit on the first reject and leave 9 peer workers' eventual
+  // rejections unattached.
+  const workers: Promise<void>[] = [];
+  for (let i = 0; i < workerCount; i++) {
+    workers.push(
+      worker().catch((err: unknown) => {
+        workerErrors.push(err);
+      }),
+    );
+  }
+  await Promise.all(workers);
+
+  if (workerErrors.length > 0) {
+    // Throw the first observed failure so the caller sees a
+    // deterministic root cause rather than a race-dependent variant.
+    // Subsequent errors (typically the same shape — e.g., all workers
+    // failed against a downed sidecar) are discarded; if operator
+    // diagnostics need them, attach a `storage:error` event before
+    // re-throwing in a future enhancement.
+    throw workerErrors[0];
   }
 
   return expectedRootCid;

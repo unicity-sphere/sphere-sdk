@@ -628,7 +628,18 @@ export async function migrateTokenStorage(
 
   if (typeof opts.target.awaitNextFlush === 'function') {
     try {
-      await opts.target.awaitNextFlush();
+      // Bulk import: the post-save flush has to pin one CAR block per
+      // sub-element across every migrated token, and that scales linearly
+      // with wallet size. The hot-path 30s default is correct for
+      // incoming-transfer ack latency; it is the wrong shape for a
+      // one-shot operation whose duration grows with input. Pass 0 to
+      // disable the wall-clock deadline (the 4-iteration runaway guard
+      // inside awaitNextFlush still trips on a genuine save→flush feedback
+      // loop). Callers that need a cap (e.g., a CLI with its own
+      // user-cancellable progress UI) can wrap the migration in their own
+      // AbortSignal / setTimeout, or set the target's flushScheduler
+      // budgets at provider construction.
+      await opts.target.awaitNextFlush(0);
     } catch (err) {
       // A flush failure means the data is NOT durable. Do NOT stamp
       // the marker — return a failure so the next run retries.
