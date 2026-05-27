@@ -33,11 +33,18 @@ import type { ProfileConfig } from './types';
 import type { ProfileStorageProvider } from './profile-storage-provider';
 import type { ProfileTokenStorageProvider } from './profile-token-storage-provider';
 import type { OracleProvider } from '../oracle';
+import type { Sphere } from '../core/Sphere';
 import { createProfileProviders } from './factory';
 import { createIndexedDBStorageProvider } from '../impl/browser/storage/IndexedDBStorageProvider';
 import { getNetworkConfig } from '../impl/shared';
 import { DEFAULT_IPFS_GATEWAYS } from '../constants';
 import type { NetworkType } from '../constants';
+import { attachIdentityToProfileProviders } from './attach-identity';
+import { migrateLegacyToProfile } from './token-storage-migration';
+import type {
+  MigrateLegacyToProfileFromSphereOptions,
+  MigrateLegacyToProfileFromSphereResult,
+} from './token-storage-migration';
 
 /**
  * Configuration for the browser Profile factory.
@@ -119,4 +126,111 @@ export function createBrowserProfileProviders(
   );
 
   return { storage, tokenStorage };
+}
+
+// =============================================================================
+// Sphere-bound factory (Issue #292)
+// =============================================================================
+
+/**
+ * Configuration for {@link createBrowserProfileProvidersFromSphere}.
+ *
+ * Mirrors {@link BrowserProfileProvidersConfig} but is used with the
+ * Sphere-bound factory below.
+ */
+export interface BrowserProfileProvidersFromSphereConfig {
+  /** Network preset: mainnet, testnet, or dev */
+  readonly network: NetworkType;
+  /** Profile-specific configuration overrides */
+  readonly profileConfig?: Partial<ProfileConfig>;
+  /**
+   * Oracle provider for the aggregator pointer layer. Pass the same
+   * `oracle` instance that the Sphere instance was constructed with so
+   * the embedded `RootTrustBase` is shared (SPEC §8.4.2 H6).
+   */
+  readonly oracle?: OracleProvider;
+}
+
+/**
+ * Construct Profile providers WITH identity already attached, using the
+ * given Sphere instance's internal private key.
+ *
+ * **Preferred over {@link createBrowserProfileProviders} for any consumer
+ * that has a live Sphere** — eliminates the need to pass a synthetic
+ * `FullIdentity` (which would require `privateKey: ''` and crash inside
+ * `hexToBytes`; see Issue #292). Returned providers are ready to use
+ * immediately: no separate `setIdentity` / `tokenStorage.initialize` call
+ * is needed at the consumer site.
+ *
+ * The Sphere's private key NEVER crosses the SDK boundary — the helper
+ * routes the identity through an internal accessor that confines the
+ * `FullIdentity` reference to the SDK's own scope (see
+ * `attach-identity.ts` and `Sphere._withFullIdentityForProfileFactory`).
+ *
+ * @example Probe path (no migration)
+ * ```ts
+ * const { storage, tokenStorage } = await createBrowserProfileProvidersFromSphere(
+ *   sphere,
+ *   { network: 'mainnet' },
+ * );
+ * const snap = await tokenStorage.load();
+ * ```
+ *
+ * @param sphere Live Sphere instance — must be initialized.
+ * @param config Browser profile configuration.
+ * @returns Profile-backed storage and token storage providers, fully
+ *          initialized with identity attached.
+ * @throws {SphereError} `NOT_INITIALIZED` when the Sphere instance has
+ *         no identity bound (uninitialized wallet).
+ * @see https://github.com/unicity-sphere/sphere-sdk/issues/292
+ */
+export async function createBrowserProfileProvidersFromSphere(
+  sphere: Sphere,
+  config: BrowserProfileProvidersFromSphereConfig,
+): Promise<BrowserProfileProviders> {
+  // Reuse the standard factory body — it constructs the IndexedDB local
+  // cache, OrbitDB adapter, and both providers. The Sphere binding is
+  // applied as a separate, well-confined step below.
+  const providers = createBrowserProfileProviders({
+    network: config.network,
+    profileConfig: config.profileConfig,
+    oracle: config.oracle,
+  });
+
+  await attachIdentityToProfileProviders(sphere, providers);
+
+  return providers;
+}
+
+/**
+ * Convenience helper: bind the browser Profile factory to
+ * `migrateLegacyToProfile` so consumers don't have to thread the
+ * `profileFactory` parameter through themselves. Pre-wires the platform-
+ * specific factory; the rest of the options surface is identical to
+ * `MigrateLegacyToProfileFromSphereOptions` minus `profileFactory`.
+ *
+ * Internally re-exports the same `migrateLegacyToProfile` function from
+ * `./token-storage-migration` with `profileFactory` pre-set. Useful for
+ * call sites that want a one-liner.
+ *
+ * @example
+ * ```ts
+ * import { migrateLegacyToProfileBrowser } from '@unicitylabs/sphere-sdk/profile/browser';
+ *
+ * const result = await migrateLegacyToProfileBrowser({
+ *   sphere,
+ *   legacy: legacyProviders.tokenStorage,
+ *   network: 'mainnet',
+ *   oracle: providers.oracle,
+ * });
+ * const { storage, tokenStorage } = result.profileProviders;
+ * ```
+ */
+export async function migrateLegacyToProfileBrowser(
+  opts: Omit<MigrateLegacyToProfileFromSphereOptions, 'profileFactory'>,
+): Promise<MigrateLegacyToProfileFromSphereResult> {
+  return migrateLegacyToProfile({
+    ...opts,
+    profileFactory: createBrowserProfileProvidersFromSphere,
+  });
 }
