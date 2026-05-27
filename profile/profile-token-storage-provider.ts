@@ -985,10 +985,21 @@ export class ProfileTokenStorageProvider
    * advance Nostr `since` → re-replay on next reconnect (idempotent
    * via addToken stateHash dedup).
    *
-   * @param timeoutMs Max wall-clock time. Default 30s.
+   * @param timeoutMs Max wall-clock time. Default 30s. Pass 0 (or any
+   *   non-finite / non-positive value) to disable the wall-clock deadline
+   *   entirely — appropriate for one-shot bulk operations like
+   *   `migrateTokenStorage()` whose duration legitimately scales with
+   *   input size. The 4-iteration runaway guard still applies regardless,
+   *   so a genuinely stuck save-flush feedback loop cannot run forever.
    */
   async awaitNextFlush(timeoutMs = 30_000): Promise<void> {
     if (!this.initialized || !this.encryptionKey) return;
+
+    // Treat 0, negative, NaN, and ±Infinity as "no deadline". The flush
+    // chain still propagates errors and the 4-iteration cap below catches
+    // runaway save→flush races, but we don't impose an arbitrary wall-
+    // clock ceiling on operations whose work scales with input.
+    const noDeadline = !Number.isFinite(timeoutMs) || timeoutMs <= 0;
 
     // Issue #274 — perf instrumentation. Entry log + duration mark on each
     // iteration so operators can distinguish "first flush slow" from
@@ -999,11 +1010,12 @@ export class ProfileTokenStorageProvider
     logger.debug(
       'profile:flush',
       'awaitNextFlush enter',
-      { timeoutMs },
+      { timeoutMs, noDeadline },
     );
 
-    const deadline = Date.now() + timeoutMs;
-    const remainingMs = (): number => Math.max(0, deadline - Date.now());
+    const deadline = noDeadline ? Number.POSITIVE_INFINITY : Date.now() + timeoutMs;
+    const remainingMs = (): number =>
+      noDeadline ? 0 : Math.max(0, deadline - Date.now());
 
     // Gap 4 (POINTER_MONOTONICITY_VIOLATION recovery): once per
     // `awaitNextFlush` invocation we permit a single in-loop baseline
@@ -1062,21 +1074,29 @@ export class ProfileTokenStorageProvider
       // awaitNextFlush callers, these timer handles accumulate.
       let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
       try {
-        await Promise.race([
-          chained,
-          new Promise<never>((_, reject) => {
-            timeoutHandle = setTimeout(
-              () =>
-                reject(
-                  new SphereError(
-                    'awaitNextFlush: timeout awaiting serialized flush',
-                    'TIMEOUT',
+        if (noDeadline) {
+          // Skip Promise.race entirely — no timer to allocate, no spurious
+          // late-fire on settled chains. The 4-iteration cap and the
+          // chain's own error propagation remain the only termination
+          // conditions.
+          await chained;
+        } else {
+          await Promise.race([
+            chained,
+            new Promise<never>((_, reject) => {
+              timeoutHandle = setTimeout(
+                () =>
+                  reject(
+                    new SphereError(
+                      'awaitNextFlush: timeout awaiting serialized flush',
+                      'TIMEOUT',
+                    ),
                   ),
-                ),
-              remainingMs(),
-            );
-          }),
-        ]);
+                remainingMs(),
+              );
+            }),
+          ]);
+        }
       } catch (err) {
         if (err instanceof SphereError && err.code === 'TIMEOUT') throw err;
 

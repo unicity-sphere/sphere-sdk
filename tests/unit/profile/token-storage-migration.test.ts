@@ -190,8 +190,11 @@ function createMockProvider(
   };
 
   if (opts.exposeAwaitNextFlush) {
-    provider.awaitNextFlush = async () => {
-      calls.push('awaitNextFlush');
+    provider.awaitNextFlush = async (timeoutMs?: number) => {
+      // Record the call AND the timeoutMs argument so tests can assert
+      // that bulk operations (migration) pass 0 / no-deadline and
+      // hot-path callers pass a finite budget.
+      calls.push(`awaitNextFlush:${timeoutMs ?? 'undefined'}`);
       if (opts.failFlush) {
         throw new Error('mock flush failure');
       }
@@ -740,7 +743,7 @@ describe('migrateTokenStorage — partial-progress recovery', () => {
     expect(marker._store.has(markerKey)).toBe(false);
   });
 
-  it('awaitNextFlush is called when target exposes it', async () => {
+  it('awaitNextFlush is called when target exposes it, with no-deadline argument', async () => {
     const source = createMockProvider(buildSourceData({ active: [TOKEN_A] }));
     const target = createMockProvider(null, { exposeAwaitNextFlush: true });
 
@@ -751,7 +754,17 @@ describe('migrateTokenStorage — partial-progress recovery', () => {
       identity: IDENTITY,
     });
     expect(result.success).toBe(true);
-    expect(target._calls.includes('awaitNextFlush')).toBe(true);
+    // Migration MUST call awaitNextFlush with timeoutMs=0 — the bulk-
+    // import flush legitimately scales with wallet size and the 30s
+    // default deadline is for hot-path incoming-transfer acks only. A
+    // regression that re-introduced a wall-clock cap here would
+    // re-create the user-visible flush timeout reported in the migration
+    // diagnosis on 2026-05-27.
+    expect(target._calls).toContain('awaitNextFlush:0');
+    // Defensive: no call with the legacy default surfaced.
+    expect(
+      target._calls.filter((c) => c.startsWith('awaitNextFlush:') && c !== 'awaitNextFlush:0'),
+    ).toEqual([]);
   });
 
   it('source.load failure → fast-fail result without target write', async () => {

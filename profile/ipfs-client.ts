@@ -231,6 +231,24 @@ const DEFAULT_IPFS_API_URL = 'https://ipfs.unicity.network';
 /** Default timeout for pin operations (ms). */
 const DEFAULT_PIN_TIMEOUT_MS = 60_000;
 
+/**
+ * Default concurrency for `pinCarBlocksToIpfs`. Each in-flight slot is a
+ * single HTTP POST to the sidecar; round-trip is ~80-150 ms regardless of
+ * payload size, so serial = N × RTT and dominates wall-clock for any
+ * non-trivial wallet (a 24-token migration emits ~250 blocks, which at
+ * 100 ms each is ~25 s serial). 10 concurrent in-flight pins reduces the
+ * same workload to ~2.5 s while staying well under typical browser
+ * per-origin connection caps (Chrome's 6 HTTP/1.1 cap is multiplexed by
+ * HTTP/2 on the sidecar). Overridable per-call to support stress tests
+ * or sidecars with explicit per-client rate limits.
+ *
+ * Concurrency is bounded by a worker pool (not Promise.all over all
+ * blocks) so memory stays O(concurrency × block-size) rather than
+ * O(blocks × block-size) — important for migration of large wallets
+ * where the CAR may contain thousands of blocks.
+ */
+const DEFAULT_PIN_CONCURRENCY = 10;
+
 /** Default timeout for fetch operations (ms). */
 const DEFAULT_FETCH_TIMEOUT_MS = 30_000;
 
@@ -660,6 +678,11 @@ async function pinSingleBlock(
  * @param timeoutMs         - Timeout per gateway+block (default: 60 000)
  * @param helia             - Optional local Helia node (see issue #236).
  *                            Pass the result of `OrbitDbAdapter.getHelia()`.
+ * @param concurrency       - Maximum simultaneous in-flight block pins
+ *                            (default: 10). Higher values may saturate
+ *                            slow sidecars; lower values increase serial
+ *                            tail. Non-positive / non-finite values are
+ *                            clamped to 1.
  * @returns The `expectedRootCid` on success.
  * @throws {ProfileError} `ORBITDB_WRITE_FAILED` if all gateways fail to
  *         accept a pin or the CAR doesn't contain the expected root.
@@ -670,6 +693,7 @@ export async function pinCarBlocksToIpfs(
   expectedRootCid: string,
   timeoutMs: number = DEFAULT_PIN_TIMEOUT_MS,
   helia?: unknown,
+  concurrency: number = DEFAULT_PIN_CONCURRENCY,
 ): Promise<string> {
   const localHelia = asHelia(helia);
   // Parse the CAR locally to extract each block. Done up front so a
@@ -730,10 +754,27 @@ export async function pinCarBlocksToIpfs(
     );
   }
 
-  // Pin each block sequentially. A single block failure aborts the
-  // whole import: callers MUST see "all blocks pinned" or "publish
+  // Pin blocks with bounded concurrency. A single block failure aborts
+  // the whole import: callers MUST see "all blocks pinned" or "publish
   // failed" — never a partial import that would leave the rootCid
   // pointing into a hole.
+  //
+  // Concurrency model: a fixed-size worker pool draws from a shared
+  // monotonic index into `blocks`. Each worker iterates until the index
+  // is exhausted, processing one block at a time (local Helia put then
+  // HTTP pin). This bounds memory at O(concurrency × block-size) and
+  // bounds in-flight HTTP at exactly `concurrency` — important for
+  // sidecars / browsers with per-origin connection caps.
+  //
+  // Error handling: a single worker's throw surfaces via `Promise.all`,
+  // aborting the operation. Other in-flight workers' pin POSTs continue
+  // to completion in the background (the sidecar trims them with its
+  // own timeouts; no orphan state because IPFS pins are idempotent at
+  // the same CID). We do not introduce an `AbortController` here
+  // because the additional plumbing through `pinSingleBlock` →
+  // `fetch(..., {signal})` would couple every worker to a shared
+  // cancellation surface for negligible benefit (the next save-driven
+  // flush would re-pin the same blocks under the same CIDs anyway).
   //
   // Issue #236 — when a local Helia handle is supplied, write each
   // block to its on-disk blockstore BEFORE the HTTP pin. This makes
@@ -760,7 +801,14 @@ export async function pinCarBlocksToIpfs(
   // pre-#236 behaviour (Kubo redirects to truthful CID, lie becomes
   // unreachable) is preserved bit-for-bit. We log loudly so a
   // regression in our own CAR builder is visible in operator telemetry.
-  for (const block of blocks) {
+  const effectiveConcurrency = Math.max(
+    1,
+    Number.isFinite(concurrency) ? Math.floor(concurrency) : DEFAULT_PIN_CONCURRENCY,
+  );
+  const workerCount = Math.min(effectiveConcurrency, blocks.length);
+
+  let nextIndex = 0;
+  const processOne = async (block: { cid: string; bytes: Uint8Array }): Promise<void> => {
     if (localHelia !== null) {
       let cidBindingOk = true;
       try {
@@ -780,7 +828,19 @@ export async function pinCarBlocksToIpfs(
       }
     }
     await pinSingleBlock(gateways, block.bytes, block.cid, timeoutMs);
-  }
+  };
+
+  const worker = async (): Promise<void> => {
+    while (true) {
+      const i = nextIndex++;
+      if (i >= blocks.length) return;
+      await processOne(blocks[i]);
+    }
+  };
+
+  const workers: Promise<void>[] = [];
+  for (let i = 0; i < workerCount; i++) workers.push(worker());
+  await Promise.all(workers);
 
   return expectedRootCid;
 }
