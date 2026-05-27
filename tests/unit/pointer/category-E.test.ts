@@ -12,10 +12,10 @@
  *
  *   - probeVersion's H2 OR-predicate (symmetric over sides A / B) and
  *     its epoch-discrimination behaviour at the trust-base boundary
- *   - classifyVersion's three-way VALID / SEMANTICALLY_INVALID /
- *     TRANSIENT_UNAVAILABLE discriminator (including the E5b partial-
- *     inclusion case that arises from an attacker poisoning exactly
- *     one of the two shares)
+ *   - classifyVersion's four-way VALID / SEMANTICALLY_INVALID /
+ *     PROOF_TRANSIENT / CAR_TRANSIENT discriminator (including the
+ *     E5b partial-inclusion case that arises from an attacker
+ *     poisoning exactly one of the two shares)
  *   - decodeVersionCid's Phase 1+2 standalone semantics — it MUST NOT
  *     touch the CAR fetcher and MUST carry the exact three-way
  *     outcome discrimination as its classify sibling
@@ -424,14 +424,16 @@ describe('E6 — classifyVersion CAR content-mismatch → SEMANTICALLY_INVALID (
 
 // ───────────────────────────────────────────────────────────────────────────
 // E7 — classifyVersion: proofs VALID + CID decodes, but the CAR is
-//      unreachable (all gateways 5xx / timeout) → TRANSIENT_UNAVAILABLE
+//      unreachable (all gateways 5xx / timeout) → CAR_TRANSIENT
+//      (slot EXISTS on-chain; Phase 3 MAY skip past under policy)
 // ───────────────────────────────────────────────────────────────────────────
-describe('E7 — classifyVersion CAR transient_unavailable → TRANSIENT_UNAVAILABLE (SPEC §8.2)', () => {
-  it('CAR fetcher reports transient_unavailable → TRANSIENT_UNAVAILABLE', async () => {
+describe('E7 — classifyVersion CAR transient_unavailable → CAR_TRANSIENT (SPEC §8.2)', () => {
+  it('CAR fetcher reports transient_unavailable → CAR_TRANSIENT (slot EXISTS, proof verified)', async () => {
     // Distinct from E6: here the token pool might still exist; the
     // caller is expected to retry later. Misclassifying this as
     // SEMANTICALLY_INVALID would prematurely abandon a perfectly
-    // valid version.
+    // valid version. Also distinct from PROOF_TRANSIENT: proof was
+    // verified and CID decoded successfully — slot existence is KNOWN.
     const { keyMaterial, signer } = await buildFixtures();
     const proofA = fakeProof(InclusionProofVerificationStatus.OK);
     const proofB = fakeProof(InclusionProofVerificationStatus.OK);
@@ -447,7 +449,7 @@ describe('E7 — classifyVersion CAR transient_unavailable → TRANSIENT_UNAVAIL
       decodeCid: okDecoder,
       fetchCar: transientFetcher,
     });
-    expect(result).toBe('TRANSIENT_UNAVAILABLE');
+    expect(result).toBe('CAR_TRANSIENT');
   });
 });
 

@@ -10,12 +10,16 @@
  * migration.
  *
  * The fix changes Phase 3 walkback's default policy: a
- * `TRANSIENT_UNAVAILABLE` slot (proof authentic, CID decoded, CAR
- * unfetchable) is now SKIPPED-PAST instead of throwing — Phase 3
- * continues looking for an older fetchable VALID predecessor. The
- * skipped versions are recorded in
+ * `CAR_TRANSIENT` slot (proof authentic, CID decoded, CAR unfetchable
+ * — slot EXISTS on-chain) is now SKIPPED-PAST instead of throwing —
+ * Phase 3 continues looking for an older fetchable VALID predecessor.
+ * The skipped versions are recorded in
  * `DiscoverResult.walkbackUnfetchableSkipped` for operator
  * observability.
+ *
+ * `PROOF_TRANSIENT` slots (aggregator proof RPC failed — slot
+ * existence UNKNOWN) are NOT skipped-past; they halt the walkback
+ * with CAR_UNAVAILABLE regardless of `skipUnfetchableInWalkback`.
  *
  * The legacy SPEC-strict behavior is preserved behind the explicit
  * `skipUnfetchableInWalkback: false` opt-in for callers that still want
@@ -155,13 +159,13 @@ function makeFetcherWithBrokenLatestN(brokenCount: number): {
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 describe('Phase 3 walkback — EXISTS-BUT-UNFETCHABLE skip-past (default policy)', () => {
-  it('walkback skips a single TRANSIENT_UNAVAILABLE slot and returns the older fetchable predecessor', async () => {
+  it('walkback skips a single CAR_TRANSIENT slot and returns the older fetchable predecessor', async () => {
     // vTrue = 5: aggregator has proofs at versions 1..5. Phase 1+2 find
     // includedV = 5. Phase 3 walkback starts at candidate=5; classifyVersion(5)
-    // returns TRANSIENT_UNAVAILABLE (CAR unreachable). Under the new default
-    // (`skipUnfetchableInWalkback: true`), the walkback records v=5 in
-    // `walkbackUnfetchableSkipped` and continues to candidate=4. classifyVersion(4)
-    // returns VALID (CAR ok). Returns { validV: 4, includedV: 5 }.
+    // returns CAR_TRANSIENT (proof OK + CID decoded, CAR unreachable). Under
+    // the new default (`skipUnfetchableInWalkback: true`), the walkback records
+    // v=5 in `walkbackUnfetchableSkipped` and continues to candidate=4.
+    // classifyVersion(4) returns VALID (CAR ok). Returns { validV: 4, includedV: 5 }.
     const { keyMaterial, signer } = await buildIdentity();
     const vTrue = 5;
     const { client } = await makeVersionRoutingAggregator(vTrue, 64, keyMaterial, signer);
@@ -308,11 +312,69 @@ describe('Phase 3 walkback — EXISTS-BUT-UNFETCHABLE skip-past (default policy)
   });
 });
 
+describe('Phase 3 walkback — PROOF_TRANSIENT is a hard stop regardless of policy', () => {
+  it('PROOF_TRANSIENT (aggregator proof RPC failed) throws CAR_UNAVAILABLE even with skipUnfetchableInWalkback: true', async () => {
+    // A slot whose proof RPC FAILED (network error, timeout, etc.) has
+    // UNKNOWN existence — we cannot tell whether it was ever published.
+    // Phase 3 MUST NOT skip past it: doing so would silently walk past
+    // an unexamined slot that may be VALID.
+    //
+    // Strategy: use vTrue=1 so Phase 3 classifyVersion(1) triggers the mock throw.
+    // Phase 1+2: lo starts at 0, hi at DISCOVERY_INITIAL_VERSION (1024). Phase 1
+    // probes 1024 (false, 2 calls); Phase 2 binary-searches down to includedV=1
+    // in 10 iterations (20 calls) — 22 total. Phase 3 classifyVersion(1) issues
+    // calls 23+24 which hit the mock-throw path. classifyVersion's runDecodePhases
+    // catches the throw and returns PROOF_TRANSIENT; Phase 3 then emits
+    // AggregatorPointerError(CAR_UNAVAILABLE) regardless of skipUnfetchableInWalkback.
+    const { keyMaterial, signer } = await buildIdentity();
+    const { client: baseClient } = await makeVersionRoutingAggregator(1, 64, keyMaterial, signer);
+
+    let callCount = 0;
+    // Phase 1+2 for vTrue=1 with DISCOVERY_INITIAL_VERSION=1024:
+    //   Phase 1: probe(1024)=false             → 2 getInclusionProof calls
+    //   Phase 2: binary search lo=0→hi=1024    → 10 iterations × 2 calls = 20 calls
+    //   Total Phase 1+2: 22 calls; includedV=1
+    // Set budget to 22 so calls 23+24 are Phase 3's classifyVersion(1) attempt.
+    // classifyVersion wraps getInclusionProof in runDecodePhases try/catch,
+    // which catches the throw and returns PROOF_TRANSIENT → AggregatorPointerError.
+    const PHASE12_BUDGET = 22;
+    const clientWithFailingPhase3 = {
+      getInclusionProof: async (requestId: import('@unicitylabs/state-transition-sdk/lib/api/RequestId.js').RequestId) => {
+        callCount += 1;
+        if (callCount > PHASE12_BUDGET) {
+          throw new Error('aggregator unreachable (PROOF_TRANSIENT simulation)');
+        }
+        return baseClient.getInclusionProof(requestId);
+      },
+    } as unknown as AggregatorClient;
+
+    // Phase 3 classifyVersion(1) → PROOF_TRANSIENT → throws CAR_UNAVAILABLE.
+    // This must throw even though skipUnfetchableInWalkback is true (default),
+    // because PROOF_TRANSIENT means "slot existence UNKNOWN" — not skip-past.
+    await expect(
+      findLatestValidVersion({
+        currentLocalVersion: 0 as PointerVersion,
+        keyMaterial,
+        signer,
+        aggregatorClient: clientWithFailingPhase3,
+        trustBase: fakeTrustBase(),
+        decodeCid: okDecoder,
+        fetchCar: makeFetcherWithBrokenLatestN(0).fetcher,
+        // Default: skipUnfetchableInWalkback: true — but PROOF_TRANSIENT must
+        // still throw regardless (slot existence unknown).
+      }),
+    ).rejects.toMatchObject({
+      code: AggregatorPointerErrorCode.CAR_UNAVAILABLE,
+    });
+  });
+});
+
 describe('Phase 3 walkback — SPEC-strict opt-in (`skipUnfetchableInWalkback: false`)', () => {
-  it('SPEC-strict mode still throws CAR_UNAVAILABLE on TRANSIENT_UNAVAILABLE', async () => {
+  it('SPEC-strict mode still throws CAR_UNAVAILABLE on CAR_TRANSIENT', async () => {
     // The legacy contract is preserved for callers that want the
     // operator-driven acceptCarLoss(version) flow. Passing
-    // `skipUnfetchableInWalkback: false` restores the SPEC §13 throw.
+    // `skipUnfetchableInWalkback: false` restores the SPEC §13 throw
+    // for CAR_TRANSIENT slots (proof verified, CAR unreachable).
     const { keyMaterial, signer } = await buildIdentity();
     const vTrue = 5;
     const { client } = await makeVersionRoutingAggregator(vTrue, 64, keyMaterial, signer);

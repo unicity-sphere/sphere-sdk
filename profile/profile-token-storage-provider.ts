@@ -3300,7 +3300,7 @@ export class ProfileTokenStorageProvider
    * Consumers can switch on `event.code` to drive UI state.
    */
   private buildErrorEvent(
-    type: 'storage:error' | 'sync:error',
+    type: 'storage:error' | 'sync:error' | 'storage:pointer-version-skipped-unfetchable',
     err: unknown,
     overrideCode?: string,
   ): StorageEvent {

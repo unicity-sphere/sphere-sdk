@@ -55,9 +55,11 @@
  *        install, localVersion=0) and runs recoverLatest → gets v=2 CID.
  *
  *   C8   device A publishes; device B IPFS is temporarily unavailable on
- *        classifyVersion → TRANSIENT_UNAVAILABLE → discover throws
- *        CAR_UNAVAILABLE. Device B does NOT advance past a corrupt-only
- *        residue; the tokens may still exist remotely.
+ *        classifyVersion → CAR_TRANSIENT (proof OK, CAR unreachable) →
+ *        recoverLatest returns null (all-unfetchable under default policy;
+ *        see RecoverAllUnfetchableResult). Device B does NOT advance past
+ *        the unfetchable slot; it returns the all-unfetchable sentinel and
+ *        refuses legacy IPNS migration. The tokens may still exist remotely.
  *
  *   C9   device A publishes v=1..3 successfully; device B recovers later
  *        (validV=3) and its SUBSEQUENT publish targets v=4. Asserts
@@ -432,19 +434,23 @@ describe('Pointer Category-C — multi-device contention (SPEC §9)', () => {
       expect(CID.decode(recovered.cid).toString()).toBe(cid.toString());
     });
 
-    it('B without bridged CID → recoverLatest returns null (default skip-past) with no older predecessor', async () => {
+    it('B without bridged CID → recoverLatest returns RecoverAllUnfetchableResult (default skip-past, all CAR_TRANSIENT)', async () => {
       // Negative control for C1: if the winner's CID is NOT in B's IPFS,
-      // classifyVersion returns TRANSIENT_UNAVAILABLE. Under the default
-      // Phase 3 walkback policy (`skipUnfetchableInWalkback: true`), the
-      // wallet skips past the unfetchable v=1 looking for an older
-      // VALID predecessor; here there is none (this was the only
-      // publish), so `recoverLatest()` returns `null`. The wallet stays
-      // live and can begin publishing at v=2 — exactly the
-      // not-bricked-by-broken-prior recovery semantic the user requested
-      // (see discover-algorithm.ts file header for design rationale).
+      // classifyVersion returns CAR_TRANSIENT (proof OK, CAR unreachable).
+      // Under the default Phase 3 walkback policy (`skipUnfetchableInWalkback: true`),
+      // the wallet skips past the unfetchable v=1 looking for an older VALID
+      // predecessor; here there is none (this was the only publish), so
+      // discovery returns validV=0 with walkbackUnfetchableSkipped=[1].
       //
-      // SPEC-strict mode (`skipUnfetchableInWalkback: false`) still
-      // throws CAR_UNAVAILABLE — that path is unit-tested in
+      // ProfilePointerLayer.recoverLatest() distinguishes this from "no pointer
+      // ever published" (null) by returning a RecoverAllUnfetchableResult
+      // { kind: 'all-unfetchable', walkbackUnfetchableSkipped: [1] } instead of null.
+      // The lifecycle layer refuses legacy IPNS migration on this result and
+      // retries on the next poll cycle — the pointer chain exists; IPFS is the
+      // problem.
+      //
+      // SPEC-strict mode (`skipUnfetchableInWalkback: false`) still throws
+      // CAR_UNAVAILABLE — that path is unit-tested in
       // `tests/integration/pointer/walkback-skip-unfetchable.test.ts`.
       const agg = makeSharedAggregator();
       const ipfsA = new InMemoryIpfs();
@@ -459,11 +465,17 @@ describe('Pointer Category-C — multi-device contention (SPEC §9)', () => {
       await devA.layer.publish(async () => cid.bytes);
 
       // ipfsB is DELIBERATELY empty for the CID → CAR fetcher returns
-      // transient_unavailable → classifyVersion returns TRANSIENT_UNAVAILABLE
+      // transient_unavailable → classifyVersion returns CAR_TRANSIENT
       // → walkback skips past v=1 → no older predecessor → recoverLatest
-      // returns null.
+      // returns RecoverAllUnfetchableResult (pointer chain exists, all CARs unreachable).
       const recovered = await devB.layer.recoverLatest();
-      expect(recovered).toBeNull();
+      // Must NOT be null (that would mean "fresh wallet") — must be the
+      // all-unfetchable sentinel.
+      expect(recovered).not.toBeNull();
+      expect(recovered).toMatchObject({
+        kind: 'all-unfetchable',
+        walkbackUnfetchableSkipped: [1],
+      });
     });
   });
 
@@ -775,18 +787,21 @@ describe('Pointer Category-C — multi-device contention (SPEC §9)', () => {
 
   // ── C8: IPFS temporarily unavailable for device B ───────────────────────
 
-  describe('C8 — B\'s IPFS unavailable → recoverLatest skips past and returns null', () => {
-    it('latest valid version\'s CAR transiently missing → discover skips past + returns null (no older predecessor)', async () => {
+  describe('C8 — B\'s IPFS unavailable → recoverLatest returns RecoverAllUnfetchableResult', () => {
+    it('latest version\'s CAR transiently missing → walkback skips + returns all-unfetchable (no older predecessor)', async () => {
       // Under the new default Phase 3 walkback policy
-      // (`skipUnfetchableInWalkback: true`), TRANSIENT_UNAVAILABLE in
-      // Phase 3 is no longer a thrown CAR_UNAVAILABLE — the walkback
-      // looks for an older fetchable VALID predecessor. With only one
-      // published version (v=1) and its CAR unfetchable, the walkback
-      // bottoms out at v=0 → recoverLatest returns null.
+      // (`skipUnfetchableInWalkback: true`), CAR_TRANSIENT in Phase 3 is
+      // no longer a thrown CAR_UNAVAILABLE — the walkback looks for an
+      // older fetchable VALID predecessor. With only one published version
+      // (v=1) and its CAR unfetchable, the walkback bottoms out at v=0
+      // with walkbackUnfetchableSkipped=[1].
       //
-      // The wallet stays live; it can begin publishing at v=2. This is
-      // the user-stated requirement: a single unfetchable slot must not
-      // block the wallet (see discover-algorithm.ts file header).
+      // recoverLatest() returns RecoverAllUnfetchableResult
+      // { kind: 'all-unfetchable', walkbackUnfetchableSkipped: [1] }
+      // instead of null. This distinguishes "anchors exist but gateways
+      // are down" from "fresh wallet with no pointer". The lifecycle layer
+      // refuses legacy IPNS migration on all-unfetchable and retries on
+      // the next poll cycle.
       //
       // SPEC-strict mode (`skipUnfetchableInWalkback: false`) preserves
       // the legacy throw for callers that want the operator-driven
@@ -819,7 +834,13 @@ describe('Pointer Category-C — multi-device contention (SPEC §9)', () => {
       });
 
       const recovered = await devB.layer.recoverLatest();
-      expect(recovered).toBeNull();
+      // Must NOT be null (that would mean "fresh wallet") — must be the
+      // all-unfetchable sentinel so the lifecycle layer can refuse legacy migration.
+      expect(recovered).not.toBeNull();
+      expect(recovered).toMatchObject({
+        kind: 'all-unfetchable',
+        walkbackUnfetchableSkipped: [1],
+      });
     });
   });
 

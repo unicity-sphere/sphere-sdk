@@ -6,10 +6,10 @@
  *   - Phase 2 binary search converges to includedV
  *   - Phase 3 walkback through SEMANTICALLY_INVALID versions
  *   - DISCOVERY_OVERFLOW when probe hits hard ceiling
- *   - TRANSIENT_UNAVAILABLE skip-past (default) — see
+ *   - CAR_TRANSIENT skip-past (default) — see
  *     `tests/integration/pointer/walkback-skip-unfetchable.test.ts`
  *     for the dedicated integration coverage. SPEC-strict CAR_UNAVAILABLE
- *     opt-in path (`skipUnfetchableInWalkback: false`) covered there too.
+ *     opt-in path and PROOF_TRANSIENT hard-stop covered there too.
  *   - CORRUPT_STREAK after exhausted walkback
  *   - validV=0 when localVersion=0 and no pointer exists
  *   - computeProbeFingerprint determinism

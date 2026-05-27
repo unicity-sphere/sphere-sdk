@@ -9,23 +9,31 @@
  *             excluded) → converges to includedV = latest-included version.
  *
  *   Phase 3 — walk back through SEMANTICALLY_INVALID versions via
- *             classifyVersion (H1 three-way). TRANSIENT_UNAVAILABLE
- *             versions are SKIPPED PAST by default (`skipUnfetchableInWalkback`):
+ *             classifyVersion (H1 four-way). CAR_TRANSIENT versions
+ *             (slot EXISTS on-chain but CAR unreachable) are SKIPPED
+ *             PAST by default (`skipUnfetchableInWalkback`):
  *             a slot whose proof is authentic but whose CAR cannot be
  *             fetched (404 / network failure / persistent-unavailable)
  *             is treated as walked-past, indistinguishable from
  *             SEMANTICALLY_INVALID for the purpose of finding the
  *             latest VALID predecessor. The skipped versions are
  *             recorded in `walkbackUnfetchableSkipped` for operator
- *             observability — the lifecycle layer logs them at
- *             info-level when `recoverLatest()` surfaces them, so
- *             monitoring can surface the data-loss window without
- *             requiring the wallet to be blocked.
+ *             observability — the lifecycle layer emits a typed event
+ *             when `recoverLatest()` surfaces them, so monitoring can
+ *             surface the data-loss window without requiring the wallet
+ *             to be blocked.
+ *
+ *             PROOF_TRANSIENT versions (aggregator proof RPC failed —
+ *             slot existence UNKNOWN) are NEVER skipped-past regardless
+ *             of `skipUnfetchableInWalkback`. Walking past a slot whose
+ *             existence we haven't verified would silently corrupt the
+ *             walkback. Phase 3 treats PROOF_TRANSIENT as a hard stop
+ *             and throws CAR_UNAVAILABLE (same as the SPEC-strict path).
  *
  *             SPEC-strict mode (legacy / strict consumers): pass
  *             `skipUnfetchableInWalkback: false` to restore the
- *             SPEC §13 / §10.7 behavior — TRANSIENT_UNAVAILABLE in
- *             Phase 3 throws CAR_UNAVAILABLE so the caller can invoke
+ *             SPEC §13 / §10.7 behavior — CAR_TRANSIENT in Phase 3
+ *             also throws CAR_UNAVAILABLE so the caller can invoke
  *             the operator-driven `acceptCarLoss(version)` flow after
  *             the persistent-retry window.
  *
@@ -65,7 +73,8 @@
  *                                          located includedV above it
  *   - SEMANTICALLY_INVALID (corrupt)     — walked past, counts toward
  *                                          DISCOVERY_CORRUPT_WALKBACK
- *   - EXISTS-BUT-UNFETCHABLE (new)       — walked past (same as
+ *   - CAR_TRANSIENT (EXISTS-BUT-UNFETCHABLE)
+ *                                        — walked past (same as
  *                                          SEMANTICALLY_INVALID for
  *                                          discovery purposes), counts
  *                                          toward walkback budget, AND
@@ -73,6 +82,10 @@
  *                                          walkbackUnfetchableSkipped so
  *                                          the caller emits an event for
  *                                          monitoring
+ *   - PROOF_TRANSIENT (proof RPC failed) — HARD STOP regardless of
+ *                                          skipUnfetchableInWalkback;
+ *                                          slot existence UNKNOWN, must
+ *                                          not be skipped
  *
  * For PUBLISH `nextV` computation:
  * - `includedV` (the highest INCLUDED slot from Phase 2) is unchanged
@@ -159,17 +172,23 @@ export interface DiscoverInput {
    */
   readonly abortSignal?: AbortSignal;
   /**
-   * Phase 3 walkback policy for TRANSIENT_UNAVAILABLE versions.
+   * Phase 3 walkback policy for `CAR_TRANSIENT` versions (slot EXISTS
+   * on-chain — proof verified + CID decoded — but CAR is unreachable).
    *
-   * Defaults to `true` (skip-past): a slot whose proof is authentic but
-   * whose CAR cannot be fetched is treated as walked-past — Phase 3
-   * continues looking for an older VALID predecessor instead of throwing
-   * CAR_UNAVAILABLE. The skipped versions are recorded in
-   * `walkbackUnfetchableSkipped` for operator observability.
+   * Defaults to `true` (skip-past): a CAR_TRANSIENT slot is treated as
+   * walked-past — Phase 3 continues looking for an older VALID predecessor
+   * instead of throwing CAR_UNAVAILABLE. The skipped versions are recorded
+   * in `walkbackUnfetchableSkipped` for operator observability.
+   *
+   * Note: `PROOF_TRANSIENT` versions (aggregator proof RPC failed — slot
+   * existence UNKNOWN) are NEVER skipped-past regardless of this flag.
+   * They always halt Phase 3 with CAR_UNAVAILABLE. The policy only
+   * applies to `CAR_TRANSIENT` (slot provably exists, only bytes
+   * unavailable).
    *
    * Pass `false` to restore SPEC §13 / §10.7 strict behavior:
-   * TRANSIENT_UNAVAILABLE in Phase 3 throws CAR_UNAVAILABLE so the
-   * caller can invoke the operator-driven `acceptCarLoss(version)` flow.
+   * CAR_TRANSIENT in Phase 3 also throws CAR_UNAVAILABLE so the caller
+   * can invoke the operator-driven `acceptCarLoss(version)` flow.
    *
    * Rationale for the default: see the file-header comment block.
    */
@@ -189,10 +208,15 @@ export interface DiscoverResult {
   readonly probeVersions: readonly PointerVersion[];
   /**
    * Versions visited during Phase 3 walkback whose `classifyVersion`
-   * returned `TRANSIENT_UNAVAILABLE` and were skipped past (only when
+   * returned `CAR_TRANSIENT` and were skipped past (only when
    * `skipUnfetchableInWalkback !== false`). Empty when no such versions
    * were walked, when SPEC-strict mode was requested, or when Phase 3
    * never ran.
+   *
+   * Note: `PROOF_TRANSIENT` versions (aggregator proof RPC failed —
+   * slot existence UNKNOWN) are NEVER skipped; they halt the walkback
+   * with CAR_UNAVAILABLE even in default mode. Only `CAR_TRANSIENT`
+   * versions (proof verified, CID decoded, CAR unreachable) appear here.
    *
    * Surfaced to callers so they can emit a typed event
    * (`storage:pointer-version-skipped-unfetchable`) for monitoring,
@@ -487,15 +511,36 @@ async function findLatestValidVersionInner(
       continue;
     }
 
-    // TRANSIENT_UNAVAILABLE: the slot exists (proof is authentic + CID
-    // decodes) but the CAR is not retrievable from any configured gateway.
+    // PROOF_TRANSIENT: the aggregator proof RPC failed — slot existence UNKNOWN.
+    //
+    // This is distinct from CAR_TRANSIENT (proof ok, CAR unreachable). We
+    // cannot tell whether this version was ever published, so we MUST NOT
+    // skip past it regardless of `skipUnfetchableInWalkback`. Walking past
+    // an unexamined slot would silently skip a version that may be VALID.
+    //
+    // Throw CAR_UNAVAILABLE (same code as SPEC-strict CAR_TRANSIENT) so the
+    // caller can surface the error or retry. The code matches the legacy
+    // behavior for an aggregator outage scenario.
+    if (status === 'PROOF_TRANSIENT') {
+      throw new AggregatorPointerError(
+        AggregatorPointerErrorCode.CAR_UNAVAILABLE,
+        `Phase 3 walkback: version=${candidate} is PROOF_TRANSIENT — ` +
+          `aggregator proof RPC failed, slot existence unknown. ` +
+          `Cannot skip past an unexamined slot (retry when aggregator is reachable).`,
+        { version: candidate, includedV },
+      );
+    }
+
+    // CAR_TRANSIENT: the slot EXISTS on-chain (proof verified + CID decoded)
+    // but the CAR is not retrievable from any configured gateway.
     //
     // Default policy (`skipUnfetchableInWalkback !== false`): the slot is
-    // EXISTS-BUT-UNFETCHABLE — distinct from ABSENT (no proof) and from
-    // SEMANTICALLY_INVALID (proof partial / CID corrupt). For the purpose
-    // of finding the latest VALID predecessor, we treat it like
-    // SEMANTICALLY_INVALID: walk back one more, count toward the walkback
-    // budget, and record the skipped version for operator observability.
+    // EXISTS-BUT-UNFETCHABLE — distinct from ABSENT (no proof), from
+    // SEMANTICALLY_INVALID (proof partial / CID corrupt), and from
+    // PROOF_TRANSIENT (aggregator unreachable). For the purpose of finding
+    // the latest VALID predecessor, we treat it like SEMANTICALLY_INVALID:
+    // walk back one more, count toward the walkback budget, and record the
+    // skipped version for operator observability.
     //
     //   - `includedV` from Phase 2 remains the highest INCLUDED slot
     //     regardless of fetchability, so a downstream publish's
@@ -522,8 +567,9 @@ async function findLatestValidVersionInner(
     }
     throw new AggregatorPointerError(
       AggregatorPointerErrorCode.CAR_UNAVAILABLE,
-      `Phase 3 walkback: version=${candidate} is TRANSIENT_UNAVAILABLE. ` +
-        `Tokens may still exist; refusing to skip past.`,
+      `Phase 3 walkback: version=${candidate} is CAR_TRANSIENT — ` +
+        `proof verified but CAR unreachable; refusing to skip past ` +
+        `(use skipUnfetchableInWalkback: true or acceptCarLoss).`,
       { version: candidate, includedV },
     );
   }
