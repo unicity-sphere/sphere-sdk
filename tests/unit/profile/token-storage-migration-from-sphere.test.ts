@@ -324,6 +324,23 @@ describe('migrateLegacyToProfile — original overload is unchanged (backward co
     expect(marker._store.has(markerKey)).toBe(true);
   });
 
+  it('`{ sphere: undefined, legacy, profile, identity }` routes to original overload (discriminator robustness)', async () => {
+    const legacy = makeMockTokenProvider();
+    const profile = makeMockTokenProvider();
+    // Buggy caller passes `sphere: undefined` explicitly. The discriminator
+    // MUST treat this as the original overload, not the Sphere-bound one
+    // (which would crash on missing profileFactory).
+    const result = await migrateLegacyToProfile({
+      sphere: undefined,
+      legacy,
+      profile,
+      identity: FULL_IDENTITY,
+    } as unknown as Parameters<typeof migrateLegacyToProfile>[0]);
+
+    expect(result.success).toBe(true);
+    expect((result as { profileProviders?: unknown }).profileProviders).toBeUndefined();
+  });
+
   it('original overload does NOT route through the Sphere accessor', async () => {
     const legacy = makeMockTokenProvider();
     const profile = makeMockTokenProvider();

@@ -827,9 +827,13 @@ export async function migrateLegacyToProfile(
 export async function migrateLegacyToProfile(
   opts: MigrateLegacyToProfileOptions | MigrateLegacyToProfileFromSphereOptions,
 ): Promise<TokenStorageMigrationResult | MigrateLegacyToProfileFromSphereResult> {
-  // Discriminate via the presence of `sphere` — the original overload
-  // never carries a `sphere` field.
-  if ('sphere' in opts) {
+  // Discriminate via the TRUTHY presence of `sphere` — the original
+  // overload never carries a `sphere` field at all. Checking
+  // `'sphere' in opts` alone would mis-fire on `{ sphere: undefined }`
+  // (the key is present, the value is undefined), routing to the
+  // Sphere path and crashing on missing `profileFactory`. The
+  // truthy guard handles that boundary case cleanly.
+  if (isSphereBoundOptions(opts)) {
     return migrateLegacyToProfileFromSphereImpl(opts);
   }
   return migrateTokenStorage({
@@ -843,6 +847,24 @@ export async function migrateLegacyToProfile(
     dryRun: opts.dryRun,
     force: opts.force,
   });
+}
+
+/**
+ * Type predicate for the Sphere-bound overload. Returns true when `sphere`
+ * is present AND truthy (rules out `{ sphere: undefined }` keys and
+ * `null`). The original `MigrateLegacyToProfileOptions` shape never
+ * carries a `sphere` field at all.
+ *
+ * @internal
+ */
+function isSphereBoundOptions(
+  opts: MigrateLegacyToProfileOptions | MigrateLegacyToProfileFromSphereOptions,
+): opts is MigrateLegacyToProfileFromSphereOptions {
+  return (
+    'sphere' in opts &&
+    (opts as MigrateLegacyToProfileFromSphereOptions).sphere !== undefined &&
+    (opts as MigrateLegacyToProfileFromSphereOptions).sphere !== null
+  );
 }
 
 /**

@@ -227,6 +227,28 @@ const and invokes the callback. It does NOT scrub the snapshot's
      hold only their own internal state (encryption key derived from the
      identity) — they do not hold a back-reference to Sphere.
 
+6. **Pre-existing leakage point — `ProfileTokenStorageProvider.getIdentity()`**
+   - **Caveat — this is OUT OF SCOPE for this PR but worth flagging.**
+     The `ProfileTokenStorageProvider` class exposes a public
+     `getIdentity(): FullIdentity | null` method that returns the stored
+     identity, INCLUDING `privateKey`. A consumer of the providers built
+     by `createBrowserProfileProvidersFromSphere` can therefore extract
+     the wallet's private key after calling the factory.
+   - This leakage existed BEFORE #292 — consumers who manually called
+     `tokenStorage.setIdentity(fullIdentity)` could read back the same
+     identity via `getIdentity()`. The Sphere-bound factories do not
+     introduce a NEW exposure; they remove the consumer-facing path that
+     required synthesizing a `FullIdentity`.
+   - Closing this gap requires migrating
+     `ProfileTokenStorageProvider.getIdentity()` to return `Identity` (no
+     privateKey) and routing the existing internal callers (the lifecycle
+     manager's `Phase B` connect, `factory.ts` line 458) through a separate
+     internal-only accessor — too large to bundle here.
+   - **Tracked as part of the follow-up SphereCryptographer migration**
+     (see "Strategic foundation" above). The future migration will replace
+     scattered `getIdentity()` reads with explicit `cryptographer.*` calls
+     so the boundary becomes uniform.
+
 ## Files changed
 
 | File | What changed |
