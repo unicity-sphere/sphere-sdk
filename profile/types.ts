@@ -69,6 +69,50 @@ export interface ProfileSnapshotPublishResult {
   readonly code?: string;
 }
 
+/**
+ * Permanent marker written after a successful OpLog auto-reset
+ * (see `OrbitDbAdapter.resetCorruptedLog` + the auto-reset path in
+ * `FlushScheduler.flushToIpfs`).
+ *
+ * **Permanence semantics.** Once a Profile is "Recovered" it MUST stay
+ * Recovered for the life of the wallet on this device. The marker is
+ * idempotent under repeated writes (subsequent resets overwrite
+ * `recoveredAt` / `lostHeadCid`) but is never deleted by the SDK except
+ * via `Sphere.clear()` (full wallet wipe). The `walkBackClosed: true`
+ * field encodes the "history before this point is permanently
+ * inaccessible" invariant for downstream readers.
+ *
+ * **Data-loss implication.** Auto-reset wipes the local OrbitDB OpLog,
+ * which holds bundle-index pointers + operational state for the Profile
+ * layer. Token data on local token storage (TXF format under
+ * `sphere-token-storage-<addressId>`) is preserved. Operational state
+ * (outbox / sent / history / tombstones / finalization-queue) that lived
+ * ONLY in the OpLog and had not been published to a UXF bundle CID is
+ * lost. Cross-device peers may still hold some of that state and can
+ * re-replicate it via OrbitDB gossipsub — but on a fresh-`dataDir`
+ * cold start with no peers, the wallet starts from the snapshot/bundle
+ * pin set alone.
+ */
+export interface ProfileRecoveryMarker {
+  /** Schema version. Currently 1. */
+  readonly version: 1;
+  /** UNIX ms timestamp of the recovery operation. */
+  readonly recoveredAt: number;
+  /** CID of the OpLog head that was unreachable; null if pattern didn't capture. */
+  readonly lostHeadCid: string | null;
+  /** Where the recovery was triggered from (e.g. "flush-scheduler.bundle-write"). */
+  readonly context: string;
+  /**
+   * Always true. Encodes the "walk-back past this point is permanently
+   * closed" semantic for downstream readers — once present, callers MUST
+   * treat any state derived from pre-`recoveredAt` OpLog entries as
+   * unrecoverable.
+   */
+  readonly walkBackClosed: true;
+  /** Human-readable note for operator triage. Stored verbatim. */
+  readonly note: string;
+}
+
 export interface OrbitDbConfig {
   /**
    * @deprecated — pass `dbNameOverride` instead. JS strings cannot be

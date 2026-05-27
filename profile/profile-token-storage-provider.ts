@@ -66,6 +66,7 @@ import type {
   StorageProvider,
 } from '../storage/storage-provider.js';
 import {
+  type ProfileRecoveryMarker,
   type ProfileSnapshotPublishResult,
   type ProfileTokenStorageProviderOptions,
 } from './types.js';
@@ -464,6 +465,9 @@ export class ProfileTokenStorageProvider
       writeProfileKey: (key, value) => this.writeProfileKey(key, value),
       readProfileKey: (key) => this.readProfileKey(key),
       readProfileKeyJson: (key) => this.readProfileKeyJson(key),
+      // Profile recovery marker (OpLog auto-reset — Item #157)
+      writeRecoveryMarker: (marker) => this.writeRecoveryMarker(marker),
+      readRecoveryMarker: () => this.readRecoveryMarker(),
       // Flush coordination
       flushToIpfs: () => this.flushScheduler.flushToIpfs(),
       refreshBaselineForMonotonicity: () => this.refreshBaselineForMonotonicity(),
@@ -3070,6 +3074,75 @@ export class ProfileTokenStorageProvider
     } catch {
       return null;
     }
+  }
+
+  // ===========================================================================
+  // Profile recovery marker (OpLog auto-reset — Item #157)
+  // ===========================================================================
+
+  /**
+   * Build the address-scoped OrbitDB key for the recovery marker. Kept
+   * private so a future addressId rename / migration only changes one
+   * call site.
+   */
+  private recoveryMarkerKey(): string {
+    return `_profile_recovered:${this.getAddressId()}`;
+  }
+
+  /**
+   * Persist a {@link ProfileRecoveryMarker} for this Profile.
+   *
+   * Idempotent. Writes through the same encrypted-OrbitDB path as other
+   * profile metadata. Returns successfully if the write completes; on
+   * failure the underlying error is surfaced to the caller — the
+   * FlushScheduler treats marker-write failures as best-effort (the
+   * in-memory recovery still applies for this session).
+   *
+   * Implements `ProfileTokenStorageHost.writeRecoveryMarker`.
+   */
+  async writeRecoveryMarker(marker: ProfileRecoveryMarker): Promise<void> {
+    await this.writeProfileKey(
+      this.recoveryMarkerKey(),
+      JSON.stringify(marker),
+    );
+  }
+
+  /**
+   * Read the {@link ProfileRecoveryMarker} for this Profile, or null
+   * when no recovery has ever happened on this device for this address.
+   *
+   * Implements `ProfileTokenStorageHost.readRecoveryMarker`.
+   */
+  async readRecoveryMarker(): Promise<ProfileRecoveryMarker | null> {
+    const parsed = await this.readProfileKeyJson<ProfileRecoveryMarker>(
+      this.recoveryMarkerKey(),
+    );
+    if (!parsed) return null;
+    // Defensive shape check — JSON.parse of an unknown blob may yield
+    // anything. We accept v=1 markers with walkBackClosed=true; anything
+    // else is treated as absent so a caller's downstream "is the Profile
+    // Recovered?" decision is not driven by a malformed marker.
+    if (
+      typeof parsed !== 'object' ||
+      parsed === null ||
+      parsed.version !== 1 ||
+      parsed.walkBackClosed !== true ||
+      typeof parsed.recoveredAt !== 'number'
+    ) {
+      return null;
+    }
+    return parsed;
+  }
+
+  /**
+   * Public surface for "is this Profile Recovered?". Returns null when
+   * no OpLog auto-reset has happened on this device. Non-null marker
+   * indicates walk-back past `recoveredAt` is permanently impossible —
+   * UI should show a persistent "Recovered" badge. Surface
+   * `lostHeadCid` and `recoveredAt` in diagnostics.
+   */
+  async getRecoveryStatus(): Promise<ProfileRecoveryMarker | null> {
+    return this.readRecoveryMarker();
   }
 
   // ===========================================================================
