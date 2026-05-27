@@ -34,11 +34,18 @@ import type { ProfileConfig } from './types';
 import type { ProfileStorageProvider } from './profile-storage-provider';
 import type { ProfileTokenStorageProvider } from './profile-token-storage-provider';
 import type { OracleProvider } from '../oracle';
+import type { Sphere } from '../core/Sphere';
 import { createProfileProviders } from './factory';
 import { createFileStorageProvider } from '../impl/nodejs/storage/FileStorageProvider';
 import { getNetworkConfig } from '../impl/shared';
 import { DEFAULT_IPFS_GATEWAYS } from '../constants';
 import type { NetworkType } from '../constants';
+import { attachIdentityToProfileProviders } from './attach-identity';
+import { migrateLegacyToProfile } from './token-storage-migration';
+import type {
+  MigrateLegacyToProfileFromSphereOptions,
+  MigrateLegacyToProfileFromSphereResult,
+} from './token-storage-migration';
 
 /**
  * Configuration for the Node.js Profile factory.
@@ -131,4 +138,84 @@ export function createNodeProfileProviders(
   );
 
   return { storage, tokenStorage };
+}
+
+// =============================================================================
+// Sphere-bound factory (Issue #292)
+// =============================================================================
+
+/**
+ * Configuration for {@link createNodeProfileProvidersFromSphere}.
+ *
+ * Mirrors {@link NodeProfileProvidersConfig} but is used with the
+ * Sphere-bound factory below.
+ */
+export interface NodeProfileProvidersFromSphereConfig {
+  /** Network preset: mainnet, testnet, or dev */
+  readonly network: NetworkType;
+  /** Directory for wallet data storage (local cache) */
+  readonly dataDir: string;
+  /** Profile-specific configuration overrides */
+  readonly profileConfig?: Partial<ProfileConfig>;
+  /**
+   * Oracle provider for the aggregator pointer layer. Pass the same
+   * `oracle` instance that the Sphere instance was constructed with so
+   * the embedded `RootTrustBase` is shared (SPEC §8.4.2 H6).
+   */
+  readonly oracle?: OracleProvider;
+}
+
+/**
+ * Construct Node.js Profile providers WITH identity already attached,
+ * using the given Sphere instance's internal private key.
+ *
+ * Node.js mirror of {@link createBrowserProfileProvidersFromSphere}. See
+ * that function's docstring for the architectural invariant and the
+ * Issue #292 motivation.
+ *
+ * @param sphere Live Sphere instance — must be initialized.
+ * @param config Node.js profile configuration.
+ * @returns Profile-backed storage and token storage providers, fully
+ *          initialized with identity attached.
+ * @throws {SphereError} `NOT_INITIALIZED` when the Sphere instance has
+ *         no identity bound.
+ * @see https://github.com/unicity-sphere/sphere-sdk/issues/292
+ */
+export async function createNodeProfileProvidersFromSphere(
+  sphere: Sphere,
+  config: NodeProfileProvidersFromSphereConfig,
+): Promise<NodeProfileProviders> {
+  const providers = createNodeProfileProviders({
+    network: config.network,
+    dataDir: config.dataDir,
+    profileConfig: config.profileConfig,
+    oracle: config.oracle,
+  });
+
+  await attachIdentityToProfileProviders(sphere, providers);
+
+  return providers;
+}
+
+/**
+ * Convenience helper: bind the Node.js Profile factory to
+ * `migrateLegacyToProfile` so consumers don't have to thread the
+ * `profileFactory` parameter through themselves. See
+ * `migrateLegacyToProfileBrowser` for the browser equivalent.
+ */
+export async function migrateLegacyToProfileNode(
+  opts: Omit<MigrateLegacyToProfileFromSphereOptions, 'profileFactory'> & {
+    /** Node.js-specific: directory for wallet data storage (local cache). */
+    readonly dataDir: string;
+  },
+): Promise<MigrateLegacyToProfileFromSphereResult> {
+  const { dataDir, ...rest } = opts;
+  return migrateLegacyToProfile({
+    ...rest,
+    profileFactory: async (sphere, config) =>
+      createNodeProfileProvidersFromSphere(sphere, {
+        ...config,
+        dataDir,
+      }),
+  });
 }

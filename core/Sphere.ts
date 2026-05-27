@@ -1643,6 +1643,83 @@ export class Sphere {
   }
 
   // ===========================================================================
+  // Internal — Issue #292 (SDK-private; do not call from consumer code)
+  // ===========================================================================
+
+  /**
+   * Attach this Sphere's internal {@link FullIdentity} (with privateKey) to
+   * a pair of identity-consuming providers WITHOUT exposing the private key
+   * to the caller. Used exclusively by the Sphere-bound Profile factories
+   * in `profile/browser.ts` / `profile/node.ts` and the
+   * `migrateLegacyToProfile({ sphere, ... })` overload in
+   * `profile/token-storage-migration.ts`.
+   *
+   * The `privateKey` field is read from `this._identity` (a private field),
+   * passed directly into `setIdentity` on each provider, and never escapes
+   * the closure. The callback shape is intentionally narrow — only
+   * `setIdentity(FullIdentity): void` is invoked — so the helper cannot
+   * be subverted into leaking the identity through some other provider
+   * method.
+   *
+   * Honors the architectural invariant from the issue #292 owner comment:
+   *
+   * > "Private key material should never leave Sphere SDK itself. However,
+   * > it should be possible to perform all the relevant cryptographic
+   * > operations within Sphere SDK over external materials by means of
+   * > undisclosed respective private key."
+   *
+   * @param applySetIdentity Synchronous callback that receives the live
+   *        `FullIdentity` and calls `setIdentity` on each provider. The
+   *        identity reference MUST NOT be stored, logged, or returned by
+   *        the callback. The helper invokes it once and discards.
+   * @throws {SphereError} `NOT_INITIALIZED` when no identity is bound
+   *        (call this AFTER `Sphere.init` / `Sphere.create` / `Sphere.load`
+   *        resolves). Distinct from the `hexToBytes: empty hex string`
+   *        crash that would have fired inside `Profile*.setIdentity`
+   *        without this guard.
+   *
+   * @internal — sphere-sdk private. Not part of the public API surface.
+   *           Consumers should use `createBrowserProfileProvidersFromSphere`
+   *           or `migrateLegacyToProfile({ sphere, ... })` instead.
+   */
+  _withFullIdentityForProfileFactory(
+    applySetIdentity: (identity: FullIdentity) => void,
+  ): void {
+    if (!this._identity?.privateKey) {
+      throw new SphereError(
+        'Wallet not initialized — call Sphere.init/create/load before constructing Sphere-bound Profile providers',
+        'NOT_INITIALIZED',
+      );
+    }
+    // Snapshot the identity into a local const so a concurrent
+    // `setIdentity` / re-derive on Sphere can't mutate `_identity`
+    // mid-callback. The snapshot is a fresh plain object that the
+    // callback may pass into provider `setIdentity` methods — those
+    // providers retain the reference for their lifetime (they read
+    // `identity.privateKey` lazily inside `connect()`'s Phase B; see
+    // `profile/profile-storage-provider.ts` `identityAtStart`).
+    //
+    // We intentionally do NOT scrub the snapshot's `privateKey` after
+    // the callback: the providers store the snapshot reference and
+    // continue to read `privateKey` during their own connect()
+    // lifecycle, so a scrub would null out their authoritative source
+    // mid-flight (the original sin caught in steelman round 1 of this
+    // PR — see docs/PROFILE-FROM-SPHERE.md "Security review"). The
+    // provider's encryption-key copy is the long-lived secret; the
+    // wallet's `_identity.privateKey` is the canonical source. Both
+    // live for the wallet's lifetime regardless.
+    const snapshot: FullIdentity = {
+      chainPubkey: this._identity.chainPubkey,
+      l1Address: this._identity.l1Address,
+      directAddress: this._identity.directAddress,
+      ipnsName: this._identity.ipnsName,
+      nametag: this._identity.nametag,
+      privateKey: this._identity.privateKey,
+    };
+    applySetIdentity(snapshot);
+  }
+
+  // ===========================================================================
   // Public Methods - Providers Access
   // ===========================================================================
 

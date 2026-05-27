@@ -140,6 +140,14 @@ import type { OracleProvider } from '../oracle/oracle-provider.js';
 import type { FullIdentity } from '../types';
 import { isTokenKey, isArchivedKey, isForkedKey, archivedKeyFromTokenId } from '../types/txf.js';
 import type { TxfToken } from '../types/txf.js';
+// Issue #292 — Sphere-bound overload of `migrateLegacyToProfile`. Type-only
+// imports keep the dependency direction profile→core (matches browser.ts /
+// node.ts factory imports); the runtime `attachIdentityToProfileProviders`
+// lives in `./attach-identity` to avoid pulling Sphere itself into the
+// runtime graph of this file.
+import type { Sphere } from '../core/Sphere';
+import type { NetworkType } from '../constants';
+import type { ProfileConfig } from './types';
 
 // =============================================================================
 // Public types
@@ -687,14 +695,17 @@ export async function migrateTokenStorage(
 }
 
 /**
- * Convenience wrapper for the common case: migrating from a legacy
- * `IndexedDBTokenStorageProvider` / `FileTokenStorageProvider` to a
- * Profile-backed `ProfileTokenStorageProvider`.
+ * Options shape for the existing legacy→Profile convenience wrapper. Kept
+ * as a named type so the discriminated overload below can reference it.
  *
- * Equivalent to `migrateTokenStorage({ source: legacy, target: profile,
- * direction: 'legacy-to-profile', ... })`.
+ * Consumers passing this shape supply their own `FullIdentity` — typically
+ * because they derived identity outside the SDK (rare) or because they're
+ * exercising the lower-level path. Callers with a live `Sphere` instance
+ * SHOULD prefer the {@link MigrateLegacyToProfileFromSphereOptions} variant
+ * to avoid synthesizing a `FullIdentity` (which can crash inside
+ * `Profile*.setIdentity` if `privateKey === ''`; see Issue #292).
  */
-export async function migrateLegacyToProfile(opts: {
+export interface MigrateLegacyToProfileOptions {
   readonly legacy: TokenStorageProvider<TxfStorageDataBase>;
   readonly profile: TokenStorageProvider<TxfStorageDataBase>;
   readonly identity: FullIdentity;
@@ -703,7 +714,124 @@ export async function migrateLegacyToProfile(opts: {
   readonly onProgress?: (p: TokenStorageMigrationProgress) => void;
   readonly dryRun?: boolean;
   readonly force?: boolean;
-}): Promise<TokenStorageMigrationResult> {
+}
+
+/**
+ * Sphere-bound variant (Issue #292). Consumers pass a live `Sphere` instance
+ * plus the legacy provider; the helper:
+ *
+ *   1. Calls the platform-appropriate
+ *      `create{Browser,Node}ProfileProvidersFromSphere` factory to build
+ *      Profile providers WITH identity already attached (private key never
+ *      crosses the SDK boundary).
+ *   2. Runs the same `migrateTokenStorage` flow.
+ *   3. Returns the constructed Profile providers as part of the result so
+ *      the consumer can immediately hand them to `Sphere.init` /
+ *      `Sphere.load` / store them in app state.
+ *
+ * The `factory` field is INJECTED rather than imported here to keep this
+ * file platform-agnostic. The browser/node entry points wire their own
+ * factory; consumers typically call this through one of the platform
+ * helpers, but the raw entry point lets unit tests stub the factory.
+ *
+ * @see https://github.com/unicity-sphere/sphere-sdk/issues/292
+ */
+export interface MigrateLegacyToProfileFromSphereOptions {
+  /** Live Sphere instance — used as the identity authority. */
+  readonly sphere: Sphere;
+  /**
+   * Legacy token storage provider (already set up with identity +
+   * initialized) — the migration SOURCE.
+   */
+  readonly legacy: TokenStorageProvider<TxfStorageDataBase>;
+  /**
+   * Factory callback that builds the Profile providers with identity
+   * pre-attached. Typically one of:
+   *
+   *   - `createBrowserProfileProvidersFromSphere` (from
+   *     `@unicitylabs/sphere-sdk/profile/browser`)
+   *   - `createNodeProfileProvidersFromSphere` (from
+   *     `@unicitylabs/sphere-sdk/profile/node`)
+   *
+   * Injected (rather than imported here) so `token-storage-migration.ts`
+   * stays platform-agnostic and the IndexedDB / file-system tree is only
+   * pulled into the bundle the consumer is actually building.
+   */
+  readonly profileFactory: (
+    sphere: Sphere,
+    config: {
+      readonly network: NetworkType;
+      readonly profileConfig?: Partial<ProfileConfig>;
+      readonly oracle?: OracleProvider;
+    },
+  ) => Promise<{
+    readonly storage: StorageProvider;
+    readonly tokenStorage: TokenStorageProvider<TxfStorageDataBase>;
+  }>;
+  /** Network preset — forwarded to `profileFactory`. */
+  readonly network: NetworkType;
+  /** Profile-specific configuration overrides — forwarded to `profileFactory`. */
+  readonly profileConfig?: Partial<ProfileConfig>;
+  /** Oracle — forwarded to BOTH the factory AND the migration's spent-probe. */
+  readonly oracle?: OracleProvider;
+  /**
+   * Override marker storage. When omitted, the Profile factory's storage
+   * is used (matches the recommended idiom for legacy→Profile migrations).
+   */
+  readonly markerStorage?: StorageProvider | null;
+  readonly onProgress?: (p: TokenStorageMigrationProgress) => void;
+  readonly dryRun?: boolean;
+  readonly force?: boolean;
+}
+
+/**
+ * Result of the Sphere-bound `migrateLegacyToProfile` overload. Extends
+ * the base {@link TokenStorageMigrationResult} with the constructed
+ * Profile providers so consumers can immediately swap them in (no
+ * separate factory call required).
+ */
+export interface MigrateLegacyToProfileFromSphereResult
+  extends TokenStorageMigrationResult {
+  /** The Profile providers constructed by `profileFactory`. */
+  readonly profileProviders: {
+    readonly storage: StorageProvider;
+    readonly tokenStorage: TokenStorageProvider<TxfStorageDataBase>;
+  };
+}
+
+/**
+ * Convenience wrapper for the common case: migrating from a legacy
+ * `IndexedDBTokenStorageProvider` / `FileTokenStorageProvider` to a
+ * Profile-backed `ProfileTokenStorageProvider`.
+ *
+ * Two overloads:
+ *
+ *   1. **Original** `{ legacy, profile, identity, ... }` — caller supplies
+ *      a `FullIdentity` directly. Unchanged from #286.
+ *   2. **Sphere-bound (Issue #292)** `{ sphere, legacy, profileFactory,
+ *      network, ... }` — caller supplies a live Sphere; the helper builds
+ *      the Profile providers with identity attached internally (private
+ *      key never crosses the SDK boundary) and returns them alongside
+ *      the migration result.
+ *
+ * The overloads are discriminated by the presence of `sphere`. Backward
+ * compatibility: every existing call site supplying `{ legacy, profile,
+ * identity }` continues to work without source changes.
+ */
+export async function migrateLegacyToProfile(
+  opts: MigrateLegacyToProfileOptions,
+): Promise<TokenStorageMigrationResult>;
+export async function migrateLegacyToProfile(
+  opts: MigrateLegacyToProfileFromSphereOptions,
+): Promise<MigrateLegacyToProfileFromSphereResult>;
+export async function migrateLegacyToProfile(
+  opts: MigrateLegacyToProfileOptions | MigrateLegacyToProfileFromSphereOptions,
+): Promise<TokenStorageMigrationResult | MigrateLegacyToProfileFromSphereResult> {
+  // Discriminate via the presence of `sphere` — the original overload
+  // never carries a `sphere` field.
+  if ('sphere' in opts) {
+    return migrateLegacyToProfileFromSphereImpl(opts);
+  }
   return migrateTokenStorage({
     source: opts.legacy,
     target: opts.profile,
@@ -715,6 +843,91 @@ export async function migrateLegacyToProfile(opts: {
     dryRun: opts.dryRun,
     force: opts.force,
   });
+}
+
+/**
+ * Internal — implementation of the Sphere-bound overload. Extracted so the
+ * overload signatures stay readable and unit tests can target it
+ * directly with a stub `profileFactory`.
+ *
+ * The Sphere's `FullIdentity` is reached via the platform-specific
+ * factory's internal call to `Sphere._withFullIdentityForProfileFactory`.
+ * This file never receives the private key — only the factory closure
+ * does, and even there it stays inside the SDK.
+ */
+async function migrateLegacyToProfileFromSphereImpl(
+  opts: MigrateLegacyToProfileFromSphereOptions,
+): Promise<MigrateLegacyToProfileFromSphereResult> {
+  // The factory returns providers with identity already bound. The Sphere
+  // accessor inside it will throw `SphereError('NOT_INITIALIZED')` when the
+  // Sphere instance has no identity — surface that to the caller verbatim.
+  const profileProviders = await opts.profileFactory(opts.sphere, {
+    network: opts.network,
+    profileConfig: opts.profileConfig,
+    oracle: opts.oracle,
+  });
+
+  // Sphere's identity getter is public-info-only, so we can read it to
+  // pass to the migration body. The privateKey field is stamped as `''`
+  // here on purpose — `migrateTokenStorage` does NOT call
+  // `Profile*.setIdentity` (that already happened inside the factory);
+  // it only uses `identity.directAddress` (for the addressId-keyed
+  // marker) and `identity.chainPubkey` (for the oracle probe). The empty
+  // privateKey is never touched.
+  const identityForMigration = identityForMigrationFromSphere(opts.sphere);
+
+  const markerStorage =
+    opts.markerStorage === undefined ? profileProviders.storage : opts.markerStorage;
+
+  const result = await migrateTokenStorage({
+    source: opts.legacy,
+    target: profileProviders.tokenStorage,
+    direction: 'legacy-to-profile',
+    identity: identityForMigration,
+    oracle: opts.oracle,
+    markerStorage,
+    onProgress: opts.onProgress,
+    dryRun: opts.dryRun,
+    force: opts.force,
+  });
+
+  return { ...result, profileProviders };
+}
+
+/**
+ * Reads the PUBLIC identity from a Sphere and synthesizes a `FullIdentity`
+ * with an empty `privateKey` for the migration body. The migration body
+ * never calls `setIdentity` on the providers (the factory already did
+ * that via `_withFullIdentityForProfileFactory`) — it only consults
+ * `directAddress` (marker keyspace) and `chainPubkey` (oracle probe). The
+ * empty `privateKey` is provably never dereferenced on this code path; if
+ * a future change adds a `setIdentity` call inside `migrateTokenStorage`
+ * the existing unit test
+ * `migrateLegacyToProfile_emptyPrivateKey_throwsClearError` will catch it.
+ *
+ * @internal
+ */
+function identityForMigrationFromSphere(sphere: Sphere): FullIdentity {
+  const publicIdentity = sphere.identity;
+  if (!publicIdentity) {
+    // Mirror SphereError shape without coupling to it — keeps this file's
+    // dependency graph narrow (and matches the surrounding fail-fast
+    // returns earlier in this module).
+    throw new Error(
+      'migrateLegacyToProfile({ sphere }): Sphere has no identity — call Sphere.init/create/load first',
+    );
+  }
+  return {
+    chainPubkey: publicIdentity.chainPubkey,
+    l1Address: publicIdentity.l1Address,
+    directAddress: publicIdentity.directAddress,
+    ipnsName: publicIdentity.ipnsName,
+    nametag: publicIdentity.nametag,
+    // INTENTIONAL: privateKey stays inside Sphere. The migration body
+    // does not invoke any code path that reads this field; see the
+    // identityForMigrationFromSphere docstring.
+    privateKey: '',
+  };
 }
 
 /**

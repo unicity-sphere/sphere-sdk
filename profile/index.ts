@@ -166,7 +166,20 @@ export type {
   TokenStorageMigrationProgress,
   TokenStorageMigrationCounts,
   TokenStorageMigrationResult,
+  MigrateLegacyToProfileOptions,
+  MigrateLegacyToProfileFromSphereOptions,
+  MigrateLegacyToProfileFromSphereResult,
 } from './token-storage-migration';
+
+// =============================================================================
+// SphereCryptographer (Issue #292 foundation — sketched, not fully wired)
+// =============================================================================
+
+export { PROFILE_CACHE_PURPOSE } from './cryptographer';
+export type {
+  SphereCryptographer,
+  SphereCryptographerPurpose,
+} from './cryptographer';
 
 // =============================================================================
 // Deriver (local-cached structural views)
@@ -261,5 +274,13 @@ export type { ProfileProviders } from './factory';
 //   import { createBrowserProfileProviders } from '@unicitylabs/sphere-sdk/profile/browser';
 //   import { createNodeProfileProviders } from '@unicitylabs/sphere-sdk/profile/node';
 
-export type { BrowserProfileProvidersConfig, BrowserProfileProviders } from './browser';
-export type { NodeProfileProvidersConfig, NodeProfileProviders } from './node';
+export type {
+  BrowserProfileProvidersConfig,
+  BrowserProfileProviders,
+  BrowserProfileProvidersFromSphereConfig,
+} from './browser';
+export type {
+  NodeProfileProvidersConfig,
+  NodeProfileProviders,
+  NodeProfileProvidersFromSphereConfig,
+} from './node';
