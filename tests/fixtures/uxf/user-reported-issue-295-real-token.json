@@ -1,0 +1,175 @@
+{
+  "_captureContext": {
+    "issue": "https://github.com/unicity-sphere/sphere-sdk/issues/295",
+    "description": "REAL token captured live from a user's browser IndexedDB on testnet (sphere-telco-test.dyndns.org). The wallet failed UXF Profile migration with the [UXF:INVALID_HASH] SMT path exceeds 256 bits error. This fixture is the first OFFENDING token found by walking the wallet's tokens and inspecting every InclusionProof step.path bigint. Used by tests/unit/uxf/hash.real-inclusion-proof.test.ts to exercise the FULL deconstructToken pipeline against real testnet data — not just the path-encoder slice. After issue #295 rewrite #2 (opaque STS-canonical embed), this token must deconstruct without throwing.",
+    "db": "sphere-token-storage-DIRECT_00009f_b7304c",
+    "tokenId": "4c4e3117eb7b94eea20568ff9713bff35af5048c1caf38bdee843335e4d30dbe",
+    "offendingStep": {
+      "where": "genesis.inclusionProof.merkleTreePath.steps[0]",
+      "bitLength": 261,
+      "path": "1852690280314482574199917149589702092760225805929390727897939243198476869907880"
+    },
+    "embeddedNametagOffender": {
+      "where": "nametags[0].genesis.inclusionProof.merkleTreePath.steps[0]",
+      "bitLength": 259,
+      "path": "463173912653332971197029146511962916219743101902252076413000309295050477951098",
+      "note": "This is the exact decimal value originally reported in the issue body — the user's failure surface."
+    },
+    "capturedAt": "2026-05-27T12:10:10.685Z",
+    "_otherOffendersInWallet": 7
+  },
+  "token": {
+    "genesis": {
+      "data": {
+        "coinData": [
+          [
+            "40d25444648418fe7efd433e147187a3a6adf049ac62bc46038bda5b960bf690",
+            "1000000000"
+          ]
+        ],
+        "reason": null,
+        "recipient": "DIRECT://0000da57abe490853ff120f636e42b0eb5846e84a6b4bfad24cc26ca7322f5ef45aeaa0eeb73",
+        "recipientDataHash": null,
+        "salt": "9b145053e44f2872055a9d64492d57c007b71a5e1e7311ae6f8c3e26c99d08fe",
+        "tokenData": null,
+        "tokenId": "4c4e3117eb7b94eea20568ff9713bff35af5048c1caf38bdee843335e4d30dbe",
+        "tokenType": "f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe397867509"
+      },
+      "inclusionProof": {
+        "authenticator": {
+          "algorithm": "secp256k1",
+          "publicKey": "037a25ee3eb91ea6b77335fc968a90d85772507218361e767f1f65630ea755c7fd",
+          "signature": "d4af86529b97642a5d3034b30ce68441e73d62eb7b089a8f4f52ae530578e3003fa3a62e1a755df5da6056834889296fcb6783a1ae03f773cc21346bef16f62301",
+          "stateHash": "0000e8a71bbf55bb9f6c502d7606be47b690e7b0cf786c1ebe918de23f7059953d34"
+        },
+        "merkleTreePath": {
+          "root": "0000ea883a5759d0a0b92affd6b9e452f901ee23d10a61a3a68670bba36322d5be28",
+          "steps": [
+            { "data": "000049adfe477dac80eb5f248c344341298b49cd387baa60fff02ea88e802c0e9e0b", "path": "1852690280314482574199917149589702092760225805929390727897939243198476869907880" },
+            { "data": "274016bc6b5473435eb0e98a78fc1da2f7412cecf6c0f7b8a0cb4c4419eab59a", "path": "3" },
+            { "data": "5492f4127e289f6e5296cbfdf0a962687441793a53eeb402f79ad7a60543134d", "path": "2" },
+            { "data": "8a9585fafa3b68ee6bed655f780fb14e6e1bfe12bea4763840f78f5c3f95a46b", "path": "3" },
+            { "data": "201507177c4a59e9ddea11e648c3867b1d428d25a591fda58be1bff77ea32093", "path": "2" },
+            { "data": "525d44c666b16fe643f9b24597fa2a2e215c3a2fec6ed86f2d38298a02261326", "path": "2" },
+            { "data": "b0a6eaf71b548e2c08dcf4faf2122cfb5516b00ba99162692b699d65feda21e6", "path": "2" },
+            { "data": "432128ec361b3bc4c554c74f15a5f3083a3664d37e55f10a791305126f09b480", "path": "3" },
+            { "data": "535d28d123a8cdcdeffbed06d71e9341f981dd4cdfe27ff1da68c0b7ac3fbb97", "path": "3" },
+            { "data": "a1bd5876b69531dabc757bcff52b2b07e78fe049f3a5961a68759523ecc6dafd", "path": "3" },
+            { "data": "2533dd97739ae5a43799548476352801932d8624962be5b123af8e9444f836f5", "path": "2" },
+            { "data": "4011e0e3d1ea0de9620c9b43a4808485e390c4b0fe817549c9b2aedcd8dd68d5", "path": "2" },
+            { "data": "dce93fee125db64d2546a2864360f9308e80d3674be1fa8520c64428340be527", "path": "2" },
+            { "data": "98b00b38198d32d1114b71749caf0ba248fb53a47f82d4196ff9bcafe6c27f93", "path": "1" }
+          ]
+        },
+        "transactionHash": "00007f4e22d58f95a01d3de6d78287b52323dcafa2ffb105ef2c0630abfcc00be3f3",
+        "unicityCertificate": "d903ef8701d903f08a011a001e5dcb00582200000216d36593be4a062769e81537444fe4b1497ae82c3b9039836a6d7bc5e0717458220000ea883a5759d0a0b92affd6b9e452f901ee23d10a61a3a68670bba36322d5be28401a6993405c58220000ea883a5759d0a0b92affd6b9e452f901ee23d10a61a3a68670bba36322d5be2800f65820488296db1656562abfee92700a0f26493dc175ddb8241cfce89ebc8a6bb038b1582006fb06b1e4a90313b8017f19b5586dbb9e1a6fd50b9701d8f2b3b41efed1c15382418080d903f683010780d903e98801031a0065f4f4011a6993405d582000f678a8d3f124cd9d6474d7d3e0f332cca5ff3478715e4263cbb8e3d369ddb6582081831c5cf7acee406e1f2c1d61bfd38d6e05ef43ad39e98926d332e9c85810b7a1783531365569753248416b795152694137704d677a674c6a39476761424a454a61387a6d7839647a7155446136577851504a383267685558419007b10f7db8d76aa533d01fd17596ee7fbdaeb6cd2b7097c67b5e2391d6438c6a1a3b9734c32e22811d01295d6d5c22415feb556532cc61846f5a3e704cef0101"
+      }
+    },
+    "nametags": [
+      {
+        "genesis": {
+          "data": {
+            "coinData": null,
+            "reason": null,
+            "recipient": "DIRECT://00009fac116800fb291d68d6060cc2b235fdb598a489a9138370aa5089814a221483d5b7304c",
+            "recipientDataHash": null,
+            "salt": "7ee2e6ba47d422fb4dff15184e494b113a5ae3369f58379f01f33b1f52130457",
+            "tokenData": "4449524543543a2f2f30303030396661633131363830306662323931643638643630363063633262323335666462353938613438396139313338333730616135303839383134613232313438336435623733303463",
+            "tokenId": "000050d80c780b5737cc28dd5ebfb4e38a19ff325981f223d46877f70eb99e9ac785",
+            "tokenType": "f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe397867509"
+          },
+          "inclusionProof": {
+            "authenticator": {
+              "algorithm": "secp256k1",
+              "publicKey": "027e36d765cc67ca0e86087d1163c6d646e4a4c11ae5cfc365b79ae215c392f13e",
+              "signature": "2fcff3c49c87de7c995e40576e25623cf2a492580163567ed96edbcca2d4d1d033332b1ecf676a4550764febf723efa287249b92918145b602f81d35a47d7c4a01",
+              "stateHash": "000084d82c121f62defd59de9b7f3fe0a657238f33803a933e770526e908843756c1"
+            },
+            "merkleTreePath": {
+              "root": "0000a9ccb03a5648f2e4e0b98936794f1ad57369c0400913b0fa52ead6768e3ee7eb",
+              "steps": [
+                { "data": "0000a09252273d291bf1d264422dacf6cadc752a46a1cfe2c602215b56081945419c", "path": "463173912653332971197029146511962916219743101902252076413000309295050477951098" },
+                { "data": "858f1a762fad16231e3d71c38308797b249819fb18f62c706985d60f17f397e3", "path": "5" },
+                { "data": "47c38d73debed9704346bcd7d99c365d1c01325e82f87bac5221a924f1d1d49d", "path": "3" },
+                { "data": "5eaa2a6e5ef361720c9ea1e681b0ddaf75a832fc5bdea2759baef82c59876fdb", "path": "3" },
+                { "data": "d933d6af2bab67fc8449369c11bf297a44b0b2c2237e3824e200400229b32cbf", "path": "3" },
+                { "data": "ad1916253344ca7001a7f80b980f04201a64ccaf43358758675f82abd604d1ca", "path": "2" },
+                { "data": "ce361fd375f8b92e90ebcc00b5f8976a29e89c0e67b475354200e0e419d30802", "path": "2" },
+                { "data": "624735ea92207f379eaadbf4819fcb8354cb29d75c4fc24f37588a5da4fae156", "path": "3" },
+                { "data": "9907e72b7e6de41f44ea8a67652374a0557bfe610a06ef5c38dc0c2ecfa2b2c8", "path": "3" },
+                { "data": "c9587d851c6ad3af5d05962df3587bc04057dfea11ba7695d0edeeb8d37a73c5", "path": "3" },
+                { "data": "a8965b59a7c9632a3b9ea5069f3b3779809dccad14a2ac5bc79451f2a0676ee9", "path": "2" },
+                { "data": "a766ab975c00b5c39138eb9b32a57c075267acc00ab95cba169a1f7564d0a600", "path": "2" },
+                { "data": "763f5363501cfdfa03b36a0f415c02ba7c5419bb30a12589e5c3be5824a852f0", "path": "3" },
+                { "data": "430ea812c5fa44ca8380b77bd4b8617f0cce0d9a5f83072e4ae4cf593d1d0b6f", "path": "2" },
+                { "data": "1d57f2a716c15fe78843a62567201c714c44663d0a658ad8c50718fb46a302ab", "path": "1" }
+              ]
+            },
+            "transactionHash": "00008da9af9be3e019db57a1df61602c247cd2e0f5f6b7116849e7876f5223d9efc1",
+            "unicityCertificate": "d903ef8701d903f08a011a001b821100582200004d10480879951a08cef61efa61a1769b591bec41cf8687e97b4ab84623b61e9958220000a9ccb03a5648f2e4e0b98936794f1ad57369c0400913b0fa52ead6768e3ee7eb401a698f54a258220000a9ccb03a5648f2e4e0b98936794f1ad57369c0400913b0fa52ead6768e3ee7eb00f658203028bf3ac6cedd89b639a863882f22ba394db5797ccebda1bf3bd3415da44086582006fb06b1e4a90313b8017f19b5586dbb9e1a6fd50b9701d8f2b3b41efed1c15382418080d903f683010780d903e98801031a005d61a6011a698f54a35820ea6c639e93a8ed88018acbf1e6247a82a2f93d6034e15523b6d151079865304f5820e0cf5119d9f871f154ca2646d71d0847a336a830bbfee447dadafae6560c77c4a1783531365569753248416b795152694137704d677a674c6a39476761424a454a61387a6d7839647a7155446136577851504a383267685558412a266c6f2109b59b838f1dc5740eb4e715a93fde1c6f4e97175c224dd09f4cff69eb516b129c4f10a65634d8783508fb2a14be27a9b929b6ef53b27cd20b0ec200"
+          }
+        },
+        "nametags": [],
+        "state": {
+          "data": null,
+          "predicate": "8300410058b7865822000050d80c780b5737cc28dd5ebfb4e38a19ff325981f223d46877f70eb99e9ac7855820f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe397867509582103ec310ebd8e78ac49449be916f4f8add04619edcea7ef328b03aca14d9f38526a69736563703235366b31005840ccfc91c89ed7dff214f00fdd033c23a9071081052affc94548f29c4c018b3f460ab20eca7fd776627706c34edd12a8d77e2e4882b18a86d39fe89c5adcfa503b"
+        },
+        "transactions": [],
+        "version": "2.0"
+      }
+    ],
+    "state": {
+      "data": null,
+      "predicate": "8300410058b58658204c4e3117eb7b94eea20568ff9713bff35af5048c1caf38bdee843335e4d30dbe5820f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe397867509582103ec310ebd8e78ac49449be916f4f8add04619edcea7ef328b03aca14d9f38526a69736563703235366b3100584018836e75a2633817f30b5017fce5950c621bb7d3a4dcd1132a02bcb7a5f1fcc1119fdbb2a2074f6c49de465421e65a97908e98353ac853d96890b17a164611fb"
+    },
+    "transactions": [
+      {
+        "data": {
+          "message": null,
+          "nametags": [],
+          "recipient": "PROXY://000050d80c780b5737cc28dd5ebfb4e38a19ff325981f223d46877f70eb99e9ac785a8d023e3",
+          "recipientDataHash": null,
+          "salt": "3d8421b4a516ba779ebd3a891232933fe3854502116f2e3cd08bd4329c779e0a",
+          "sourceState": {
+            "data": null,
+            "predicate": "8300410158958658204c4e3117eb7b94eea20568ff9713bff35af5048c1caf38bdee843335e4d30dbe5820f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe39786750958210363b9da109bbfa6cea908cc14646719e95f711e0c9108512010fc4a4539d17dcb69736563703235366b31005820ae4c8215dfdec3838d2584f310a04ea06566ea811916a514434be37222079c2f"
+          }
+        },
+        "inclusionProof": {
+          "authenticator": {
+            "algorithm": "secp256k1",
+            "publicKey": "0363b9da109bbfa6cea908cc14646719e95f711e0c9108512010fc4a4539d17dcb",
+            "signature": "3f81144cb39b423d1645746be797c60e98001dff6662703a9f90efd3affe07850ab852b4378a5adf816993474e2cfb4db8f89feb1c14d8dbbf904d8118c4156400",
+            "stateHash": "000074907eba0d0bad46cc3226078442cff02c49c5a5bdbb17d3dd1f04bb171a4a53"
+          },
+          "merkleTreePath": {
+            "root": "0000d204a494da559ca26f7c6f199e48ee8ce28ffe708e0afc0db09e4074568d97a3",
+            "steps": [
+              { "data": "00008df83db58ec34fed322b5e42dbc875f8a4f7dc101aebf433628d5f5941517a98", "path": "926336984737576440790733570649162893121489910411697230351975717837827412408755" },
+              { "data": "ac740c6f746da360f6d2f2197bf3287563a96cd8f8c0699a724d82a160649ee3", "path": "3" },
+              { "data": "c35bbb4697330d83cad1b717dffb5529b21907865b242c23ff76cb6ef3f7b21a", "path": "2" },
+              { "data": "ace1490a47edb7d263f5564a7bf0bdf1078e72f0193776ca05982e88e31d23a5", "path": "2" },
+              { "data": "e7767bcf6707f40fd1f4ccd2db281f605f1a9a7760efd95841473955229aae3c", "path": "2" },
+              { "data": "d84916d10ad777e0afe3d83d865315d00ca52349aee68dd08028571fc6e6deb4", "path": "2" },
+              { "data": "70d8a9b59582be75c4f690ddd08e0a0e93e2f2312606baa4f90eb6d3a23a3cfa", "path": "3" },
+              { "data": "cf47975a885230fc12fdaf04a663f0ed37e97dec04f6270f3aaeae7cdd78be47", "path": "2" },
+              { "data": "a7d874233541084a06db0a154418fd80c4f10241739f6ea2faff787e470abfc6", "path": "2" },
+              { "data": "b6ed94b99cd33fb5290ff37892e176ccafa7403e2647846dbf2c47615140a1f4", "path": "2" },
+              { "data": "b9a86e410e5fb02bb23f068590d528be29d4c838ea44b147af983ac9327c089d", "path": "2" },
+              { "data": "f1672152e38bb0bf1a958e0f2fa2a27d036439239d43e7cf002dd40e430cb8ba", "path": "2" },
+              { "data": "a4b46e89d67359a29af136b5f6d5a2390726f3aeb740e3d751df7d0d0947a865", "path": "3" },
+              { "data": "7cc5bb1b9d62eac591d9bd469ea0451806fc3eedd1df86bca4cc8ef05bc0b97b", "path": "2" },
+              { "data": "cfb217f6914d65c6bb95734628a6eeb8c9b0562a0a487d8ed239aa614e9f831c", "path": "1" }
+            ]
+          },
+          "transactionHash": "00008a65376c0c172c2bd587b2f9f9eed069677c53329e7b4bd489b0712e577f59d7",
+          "unicityCertificate": "d903ef8701d903f08a011a001e5dcd0058220000ef62aac22ca0c08cf1a7b45280d4dd0c8f6857a61aec521a3acf577aeae0f8d558220000d204a494da559ca26f7c6f199e48ee8ce28ffe708e0afc0db09e4074568d97a3401a6993405f58220000d204a494da559ca26f7c6f199e48ee8ce28ffe708e0afc0db09e4074568d97a300f658203fee92d70aeb9c49bb4c7ded229ffbef1a49c44d467b46c1f4a86ac606580d0a582006fb06b1e4a90313b8017f19b5586dbb9e1a6fd50b9701d8f2b3b41efed1c15382418080d903f683010780d903e98801031a0065f4fa011a699340605820cf4cf73d675ec3bdaf50aa2c6d1b5aefe5d29facbc988aae9309bd4afe40d6c058202ffea71b691fce58aee6b0c2ac12e5764f92b193f22f43c413b44e6560b0a801a1783531365569753248416b795152694137704d677a674c6a39476761424a454a61387a6d7839647a7155446136577851504a38326768555841c9f945a0c67ae1538ac119591aa0c8c2f73f58bd411491c4c7860e6ebb190d9f54f2d8763cf3ebf13ea9a7b1bde3b5b27c8a99b4c10b11e9ff132fdf5636160301"
+        }
+      }
+    ],
+    "version": "2.0",
+    "_integrity": {
+      "genesisDataJSONHash": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  }
+}

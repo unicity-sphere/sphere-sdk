@@ -1,16 +1,16 @@
 {
   "_provenance": {
     "issue": "https://github.com/unicity-sphere/sphere-sdk/issues/295",
-    "description": "Representative InclusionProof.toJSON() fixture exercising the >256-bit SMT path failure mode reported in issue #295. Other fields (root, authenticator, unicityCertificate) are synthetic but well-formed; only the path encoding is under test. See tests/unit/uxf/hash.real-inclusion-proof.test.ts.",
+    "description": "Representative InclusionProof.toJSON() fixture exercising long step paths (originally surfaced as the >256-bit SMT path failure mode reported in issue #295). After issue #295 rewrite #2, UXF treats the SmtPath as an opaque STS-canonical CBOR blob and imposes no bit-length constraint — this fixture now verifies that UXF forwards the bytes verbatim regardless of step-path bit-width. Other fields (root, authenticator, unicityCertificate) are synthetic but well-formed. See tests/unit/uxf/hash.real-inclusion-proof.test.ts.",
     "fields_under_test": [
       "merkleTreePath.steps[].path"
     ],
     "step_path_bit_lengths": {
       "0": "6 bits — small-value smoke test",
-      "1": "256 bits (2^256 - 1) — legacy ceiling regression: must still encode as 32-byte fixed bstr",
+      "1": "256 bits (2^256 - 1) — value at the historical UXF-imposed limit (no longer enforced — STS owns the bound)",
       "2": "259 bits — exact decimal extracted from the user-reported sphere.telco migration failure",
-      "3": "273 bits — BitString(32-byte hash) boundary case",
-      "4": "280 bits — the new UXF SPEC §11 ceiling (max BitString(34-byte imprint))"
+      "3": "273 bits — BitString(34-byte imprint) boundary case",
+      "4": "280 bits — beyond STS's current bit-length range; verifies UXF imposes no upper bound (STS may, or may not, accept it independently)"
     }
   },
   "merkleTreePath": {
