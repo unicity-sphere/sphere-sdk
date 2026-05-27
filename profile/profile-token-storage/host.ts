@@ -37,6 +37,7 @@ import type {
   TxfSentEntry,
 } from '../../storage/storage-provider.js';
 import type {
+  ProfileRecoveryMarker,
   ProfileSnapshotPublishResult,
   ProfileTokenStorageProviderOptions,
 } from '../types.js';
@@ -225,6 +226,30 @@ export interface ProfileTokenStorageHost {
   writeProfileKey(key: string, value: string): Promise<void>;
   readProfileKey(key: string): Promise<string | null>;
   readProfileKeyJson<T>(key: string): Promise<T | null>;
+
+  /**
+   * Persist a {@link ProfileRecoveryMarker} for this Profile.
+   *
+   * MUST be called AFTER `db.resetCorruptedLog` succeeds. Idempotent —
+   * subsequent calls overwrite the marker (intentional: we want the
+   * most recent `recoveredAt` / `lostHeadCid` for operator triage).
+   *
+   * The marker is OBSERVABLE and PERMANENT — the wallet cannot un-mark
+   * itself once recovery has happened. The SDK never deletes it; only
+   * `Sphere.clear()` (full wallet wipe) removes it. Surface via
+   * `getRecoveryStatus()` to display a "Recovered" badge in the UI.
+   *
+   * Stored under key `_profile_recovered:<addressId>` via the same
+   * encrypted-write path used by other Profile metadata.
+   */
+  writeRecoveryMarker(marker: ProfileRecoveryMarker): Promise<void>;
+
+  /**
+   * Read the {@link ProfileRecoveryMarker} for this Profile, or null
+   * when no recovery has ever happened on this device for this address.
+   * Public surface lives on the facade as `getRecoveryStatus()`.
+   */
+  readRecoveryMarker(): Promise<ProfileRecoveryMarker | null>;
 
   // --- Flush coordination (FlushScheduler entry point) ---
   /** Snapshot pendingData and run a single IPFS pin + OrbitDB write. */

@@ -81,6 +81,17 @@ export class OrbitDbAdapter implements ProfileDatabase {
   private closeInFlight: Promise<void> | null = null;
 
   /**
+   * Last `OrbitDbConfig` passed to a successful `connect()`. Captured at
+   * the end of `connectInner` and retained across `close()` so
+   * `resetCorruptedLog()` can rebuild a fresh OrbitDB instance without
+   * the caller having to re-supply config. Cleared only by `cleanupOnError`
+   * (a config that produced a failure is suspect and should not be
+   * silently reused) — note `close()` intentionally does NOT clear it,
+   * the recovered Profile re-uses the same dbNameOverride / directory.
+   */
+  private currentConfig: OrbitDbConfig | null = null;
+
+  /**
    * Steelman remediation for issue #236 — set TRUE at the entry of
    * `closeInner()` (BEFORE the bounded teardown begins), cleared after
    * the close completes (or at the start of the next successful
@@ -568,6 +579,10 @@ export class OrbitDbAdapter implements ProfileDatabase {
       this.db = await this.orbitdb.open(dbName, openOptions);
 
       this.connected = true;
+      // Capture config for resetCorruptedLog (issue #310 / OpLog auto-reset).
+      // Retained across close() so a flush-time auto-reset can rebuild a
+      // fresh OrbitDB+Helia pair without the caller re-supplying config.
+      this.currentConfig = config;
     } catch (err) {
       // Clean up partial state on failure
       await this.cleanupOnError();
@@ -1076,7 +1091,183 @@ export class OrbitDbAdapter implements ProfileDatabase {
     this.orbitdb = null;
     this.helia = null;
     this.connected = false;
+    // A config that produced a failed connect is suspect — wipe it so
+    // resetCorruptedLog() cannot silently reuse a known-bad input.
+    // close() (the success path) intentionally keeps the config.
+    this.currentConfig = null;
   }
+
+  /**
+   * Recover from an unreachable-block OpLog corruption by tearing down
+   * the current OrbitDB DB and reconnecting from scratch.
+   *
+   * # When to call
+   *
+   * Invoked by callers (today: `FlushScheduler.flushToIpfs` →
+   * `BundleIndex.addBundle`) that catch a `PROFILE:ORBITDB_WRITE_FAILED`
+   * whose underlying error matches the "Failed to load block for <CID>"
+   * pattern emitted by Helia when the OpLog head block is unreachable.
+   * This happens reliably in browser deployments where Helia uses
+   * MemoryBlockstore (no persistence) while OrbitDB's level state (which
+   * holds the head CID pointer) IS persisted to IndexedDB. After a page
+   * reload, the level state survives but the head block bytes are gone —
+   * every subsequent append fails with the same error, forever.
+   *
+   * # Behaviour
+   *
+   *   1. Best-effort `db.drop()` — wipes the underlying level state so
+   *      the next `connect()` opens an empty OpLog. Some adapter shapes
+   *      (test stubs, future @orbitdb/core versions) may not expose
+   *      `drop`; we log the situation and proceed with close+reconnect.
+   *      In the no-drop case the corrupt level state may persist and
+   *      re-trigger failure on the next flush — the caller's error
+   *      handling should retry once and then bubble.
+   *   2. Full `close()` — releases helia + orbitdb + db handles so the
+   *      reconnect starts from a clean slate.
+   *   3. `connect()` against the captured `currentConfig` — rebuilds
+   *      the OrbitDB + Helia + libp2p stack.
+   *
+   * # Blast radius
+   *
+   * **Per-DB only.** The helia blockstore (FsBlockstore on Node;
+   * MemoryBlockstore in browser without a custom blockstore) is
+   * recreated by connect(); previously-cached UXF bundle bytes
+   * (in-session) are lost. Token data on IndexedDB token storage
+   * (`sphere-token-storage-<addressId>`) is UNTOUCHED — this method
+   * only operates on the OrbitDB profile layer.
+   *
+   * **Walk-back closed.** Prior OpLog entries become permanently
+   * inaccessible. The caller MUST write a recovery marker (via
+   * `ProfileTokenStorageHost.writeRecoveryMarker`) so the Profile is
+   * observably "Recovered" and downstream consumers know walk-back
+   * past `recoveredAt` is impossible.
+   *
+   * # Idempotency
+   *
+   * NOT idempotent if `connect()` fails: the second call will throw
+   * "currently not connected" if the failed connect cleaned up state.
+   * Callers should treat a failed reset as terminal for this session
+   * and surface the original error.
+   *
+   * @param reason  Diagnostics — the lost head CID (when captured by
+   *                the error pattern) and the call site ("flush-scheduler.bundle-write"
+   *                / etc.) for telemetry & operator triage.
+   * @returns       `{ recovered: true, lostHeadCid, recoveredAt }` on
+   *                success. Throws on failure.
+   */
+  async resetCorruptedLog(reason: {
+    lostHeadCid?: string;
+    context: string;
+  }): Promise<{ recovered: true; lostHeadCid?: string; recoveredAt: number }> {
+    // Pre-check: need a captured config so we can rebuild. The only
+    // path that produces a null `currentConfig` is "never connected" or
+    // "last connect failed and cleanupOnError wiped it" — either way
+    // there is nothing to reset back to. Fail loud rather than throwing
+    // an opaque NPE from inside connect().
+    if (this.currentConfig === null) {
+      throw new ProfileError(
+        'ORBITDB_CONNECTION_FAILED',
+        'resetCorruptedLog: no captured OrbitDbConfig — call connect() first.',
+      );
+    }
+
+    const lostCidLabel = reason.lostHeadCid ?? '(unknown)';
+    logger.debug(
+      'profile:orbitdb',
+      `resetCorruptedLog: starting (context=${reason.context}, lostHeadCid=${lostCidLabel}); ` +
+        `prior OpLog history will become permanently inaccessible.`,
+    );
+
+    // 1. Best-effort drop. `db.drop()` is provided by @orbitdb/core but
+    //    not by all test stubs. Wrap in try/catch so a missing or
+    //    throwing drop still lets us proceed to close+reconnect.
+    const dropFn = this.db && typeof (this.db as { drop?: unknown }).drop === 'function'
+      ? (this.db as { drop: () => Promise<void> }).drop.bind(this.db)
+      : null;
+    if (dropFn !== null) {
+      try {
+        await dropFn();
+        logger.debug('profile:orbitdb', 'resetCorruptedLog: db.drop() succeeded');
+      } catch (err) {
+        logger.debug(
+          'profile:orbitdb',
+          `resetCorruptedLog: db.drop() threw (${err instanceof Error ? err.message : String(err)}); proceeding`,
+        );
+      }
+    } else {
+      logger.debug(
+        'profile:orbitdb',
+        'resetCorruptedLog: OrbitDB drop unavailable; performing close+reconnect; ' +
+          'corrupt level state may persist and re-trigger failure.',
+      );
+    }
+
+    // 2. Full close — releases helia + orbitdb + db handles. `close()`
+    //    sets `connected = false` and nulls the handle fields.
+    //    `currentConfig` is intentionally retained by `close()`.
+    await this.close();
+
+    // 3. Reconnect against the captured config. This re-enters
+    //    `connectWithRetry` → `connectInner`, which rebuilds the entire
+    //    helia + orbitdb + db stack. On a connect failure the inner
+    //    `cleanupOnError` wipes `currentConfig`, so a follow-up
+    //    `resetCorruptedLog` call from the same caller will throw the
+    //    pre-check above rather than loop.
+    //
+    //    `currentConfig` is non-null per the pre-check above; close()
+    //    does not clear it. The non-null assertion is therefore safe.
+    await this.connect(this.currentConfig);
+
+    return {
+      recovered: true,
+      lostHeadCid: reason.lostHeadCid,
+      recoveredAt: Date.now(),
+    };
+  }
+}
+
+/**
+ * Inspect an error from put / putEntry / get / del paths and return the
+ * lost block CID iff the error's message chain matches the
+ * "Failed to load block for <CID>" pattern emitted by Helia when an
+ * OpLog head block is unreachable. Returns null otherwise.
+ *
+ * The matcher walks the `.cause` chain up to 4 levels deep — the
+ * pattern is sometimes wrapped by ProfileError / OrbitDB / IPFSBlockStorage
+ * before reaching the caller.
+ *
+ * Intentionally permissive on the CID shape — matches any `bafy[a-z0-9]+`
+ * (CIDv1 with multibase prefix `b`). Older OrbitDB releases may format
+ * the error differently; treat null as "not the auto-reset signature".
+ *
+ * @internal — Exported for FlushScheduler's auto-reset path and tests.
+ */
+export function extractLostHeadCid(err: unknown): string | null {
+  const pattern = /Failed to load block for (bafy[a-z0-9]+)/i;
+  let current: unknown = err;
+  for (let depth = 0; depth < 4 && current !== undefined && current !== null; depth++) {
+    let message: string | null = null;
+    if (current instanceof Error) {
+      message = current.message;
+    } else if (typeof current === 'string') {
+      message = current;
+    } else if (typeof current === 'object' && 'message' in (current as object)) {
+      const raw = (current as { message?: unknown }).message;
+      if (typeof raw === 'string') message = raw;
+    }
+    if (message !== null) {
+      const match = pattern.exec(message);
+      if (match !== null) {
+        return match[1];
+      }
+    }
+    // Descend the cause chain. ProfileError, Node's standard Error
+    // (`cause` option), and OrbitDB errors all expose `.cause`.
+    const next = (current as { cause?: unknown }).cause;
+    if (next === undefined || next === current) break;
+    current = next;
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------

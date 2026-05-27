@@ -64,7 +64,11 @@
 // introduced by the #212 monolithic-raw interim.
 import { fetchCarFromIpfs, pinCarBlocksToIpfs } from '../ipfs-client.js';
 import { extractCarRootCid } from '../../uxf/transfer-payload.js';
+import { extractLostHeadCid } from '../orbitdb-adapter.js';
+import type { OrbitDbAdapter } from '../orbitdb-adapter.js';
 import type {
+  ProfileDatabase,
+  ProfileRecoveryMarker,
   ProfileSnapshotPublishResult,
   UxfBundleRef,
 } from '../types.js';
@@ -1229,7 +1233,7 @@ export class FlushScheduler {
         createdAt: Math.floor(Date.now() / 1000),
         tokenCount: tokens.size,
       };
-      await this.bundleIndex.addBundle(cid, bundleRef);
+      await this.addBundleWithOplogAutoReset(cid, bundleRef);
 
       // Issue #239 — record this as the most-recent UXF bundle CID we
       // pinned + indexed. Survives across flushes for the life of the
@@ -1643,5 +1647,173 @@ export class FlushScheduler {
     this.host.setLastPinnedCid(null);
     this.host.setPendingData(data);
     this.scheduleFlush();
+  }
+
+  /**
+   * Item #157 — call `BundleIndex.addBundle` with detection + recovery
+   * for the "Failed to load block for <CID>" (OpLog head unreachable)
+   * failure mode.
+   *
+   * # Failure mode being addressed
+   *
+   * In browsers Helia defaults to `MemoryBlockstore` (no persistence)
+   * while OrbitDB's level state (which holds the head-CID pointer for
+   * the OpLog) IS persisted to IndexedDB. On reload, level state
+   * survives but the bytes of the OpLog head block are gone. Every
+   * subsequent OrbitDB write fails with the exact same error —
+   * `bundleIndex.addBundle` is the first writer in the flush path that
+   * sees this and, untreated, blocks the entire pipeline forever.
+   *
+   * # Recovery contract
+   *
+   *   1. On any throw from `addBundle`, check `extractLostHeadCid` for
+   *      the signature pattern. Non-matching errors propagate unchanged
+   *      (network errors, encryption failures, etc.).
+   *   2. If the adapter lacks `resetCorruptedLog` (legacy stubs / test
+   *      doubles), the original error propagates unchanged — we cannot
+   *      recover.
+   *   3. Emit `profile:oplog-auto-resetting` BEFORE the reset so
+   *      operators see the trigger even when the reset itself fails.
+   *   4. Run `db.resetCorruptedLog`. On success:
+   *      a. Write the persistent recovery marker via
+   *         `host.writeRecoveryMarker`. Marker-write failures are
+   *         logged but do NOT block the retry — the in-memory
+   *         recovery still applies for this session.
+   *      b. Retry `addBundle` ONCE. Success → emit `profile:recovered`
+   *         with `retrySucceeded: true` and return; the caller's flush
+   *         body proceeds to step 7 (operational state write).
+   *      c. Retry failure → emit `profile:recovered` with
+   *         `retrySucceeded: false` and re-throw the retry's error.
+   *   5. `resetCorruptedLog` itself throws → emit `profile:recovered`
+   *      with `retrySucceeded: false, resetFailed: true` and re-throw
+   *      the original write error (the reset failure is reported in the
+   *      event; the propagated error is the one the caller asked for).
+   */
+  private async addBundleWithOplogAutoReset(
+    cid: string,
+    bundleRef: UxfBundleRef,
+  ): Promise<void> {
+    try {
+      await this.bundleIndex.addBundle(cid, bundleRef);
+      return;
+    } catch (err) {
+      const lostHeadCid = extractLostHeadCid(err);
+      // Path 1: not the auto-reset signature — re-throw verbatim.
+      if (lostHeadCid === null) {
+        throw err;
+      }
+      // Path 2: adapter doesn't expose resetCorruptedLog — re-throw.
+      // Defensive cast: `ProfileDatabase` does not declare the method
+      // (it lives on the concrete `OrbitDbAdapter`), but production
+      // wiring always uses the adapter. Legacy in-memory stubs that
+      // implement only `ProfileDatabase` therefore see no reset path.
+      const dbWithReset = this.host.db as ProfileDatabase & {
+        resetCorruptedLog?: typeof OrbitDbAdapter.prototype.resetCorruptedLog;
+      };
+      if (typeof dbWithReset.resetCorruptedLog !== 'function') {
+        throw err;
+      }
+
+      this.host.log(
+        `OpLog head unreachable (lostHeadCid=${lostHeadCid}); auto-resetting Profile DB. ` +
+          `Prior OpLog history is permanently inaccessible. Token data on local IndexedDB is preserved.`,
+      );
+
+      const context = 'flush-scheduler.bundle-write';
+      // 3. Trigger event BEFORE the reset so operators see it even if
+      // the reset itself fails.
+      this.host.emitEvent({
+        type: 'profile:oplog-auto-resetting',
+        timestamp: Date.now(),
+        data: { lostHeadCid, context },
+      });
+
+      // 4. Run the reset.
+      let resetResult: { recovered: true; lostHeadCid?: string; recoveredAt: number };
+      try {
+        resetResult = await dbWithReset.resetCorruptedLog({
+          lostHeadCid,
+          context,
+        });
+      } catch (resetErr) {
+        // 5. Reset itself failed — emit the event and re-throw the
+        // original write error (the operator wants to see the write
+        // failure they triggered; the reset failure rides on the
+        // event payload).
+        this.host.emitEvent({
+          type: 'profile:recovered',
+          timestamp: Date.now(),
+          data: {
+            lostHeadCid,
+            recoveredAt: Date.now(),
+            context,
+            retrySucceeded: false,
+            resetFailed: true,
+          },
+          error: resetErr instanceof Error ? resetErr.message : String(resetErr),
+          cause: resetErr,
+        });
+        throw err;
+      }
+
+      // 4a. Best-effort marker write. Failure logs but does not block
+      // the retry — the in-memory recovery still applies for this
+      // session, and the next successful flush re-attempts the
+      // marker write (subsequent flushes' addBundle calls do not
+      // trigger a fresh reset because the OpLog is no longer
+      // corrupt, so this code path is not re-entered).
+      const marker: ProfileRecoveryMarker = {
+        version: 1,
+        recoveredAt: resetResult.recoveredAt,
+        lostHeadCid: resetResult.lostHeadCid ?? lostHeadCid,
+        context,
+        walkBackClosed: true,
+        note:
+          'Profile OpLog auto-reset: an OrbitDB head block was unreachable ' +
+          'and could not be served by any known store (Helia blockstore, ' +
+          'operator gateways). Walk-back past this point is permanently ' +
+          'closed; some operational metadata (outbox/sent/history not yet ' +
+          'pinned in a UXF bundle) may have been lost. Token data on ' +
+          'local IndexedDB token storage is preserved.',
+      };
+      try {
+        await this.host.writeRecoveryMarker(marker);
+      } catch (markerErr) {
+        this.host.log(
+          `Recovery marker write failed (continuing): ` +
+            `${markerErr instanceof Error ? markerErr.message : String(markerErr)}`,
+        );
+      }
+
+      // 4b. Retry the write ONCE.
+      try {
+        await this.bundleIndex.addBundle(cid, bundleRef);
+      } catch (retryErr) {
+        this.host.emitEvent({
+          type: 'profile:recovered',
+          timestamp: Date.now(),
+          data: {
+            lostHeadCid,
+            recoveredAt: resetResult.recoveredAt,
+            context,
+            retrySucceeded: false,
+          },
+          error: retryErr instanceof Error ? retryErr.message : String(retryErr),
+          cause: retryErr,
+        });
+        throw retryErr;
+      }
+
+      this.host.emitEvent({
+        type: 'profile:recovered',
+        timestamp: Date.now(),
+        data: {
+          lostHeadCid,
+          recoveredAt: resetResult.recoveredAt,
+          context,
+          retrySucceeded: true,
+        },
+      });
+    }
   }
 }
