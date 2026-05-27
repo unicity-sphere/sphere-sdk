@@ -342,8 +342,38 @@ export class LifecycleManager {
         return true;
       }
 
-      // Load known bundle CIDs from OrbitDB
-      await this.bundleIndex.refreshKnownBundles();
+      // Load known bundle CIDs from OrbitDB.
+      //
+      // Robustness: tolerate per-bundle / per-OpLog-entry block-load
+      // failures (e.g., a previous failed migration left a marker entry
+      // whose IPFS payload block is no longer pinned anywhere — Issue
+      // #239 territory). Without this guard, a single unreachable
+      // OpLog block makes `db.all()` throw, the outer catch returns
+      // `false`, and `setInitialized(true)` is NEVER called. The
+      // provider is then permanently `initialized=false` for the
+      // session, and every `save()` rejects with `"Provider not
+      // initialized"` — even though the wallet is otherwise perfectly
+      // usable through the cold-start recovery path.
+      //
+      // We log a warning and treat the bundle set as empty, which
+      // makes the next branch run cold-start recovery (aggregator
+      // pointer → legacy IPNS migration). The recovery's first
+      // successful `addBundle()` write inserts a fresh OpLog entry
+      // whose block IS reachable, and future reads of that key never
+      // need to resolve the corrupt historical entry.
+      try {
+        await this.bundleIndex.refreshKnownBundles();
+      } catch (err) {
+        this.host.log(
+          `bundleIndex.refreshKnownBundles failed (proceeding with empty ` +
+            `bundle set; cold-start recovery will repopulate): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+        );
+        // Defensively reset the known set in case a partial walk
+        // populated it before the throw.
+        this.host.setKnownBundleCids(new Set());
+      }
 
       // COLD-START RECOVERY: if OrbitDB has no bundles locally, this
       // is likely a fresh device (wallet re-imported from mnemonic
