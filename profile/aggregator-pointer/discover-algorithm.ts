@@ -10,17 +10,99 @@
  *
  *   Phase 3 — walk back through SEMANTICALLY_INVALID versions via
  *             classifyVersion (H1 three-way). TRANSIENT_UNAVAILABLE
- *             versions propagate as CAR_UNAVAILABLE — we do NOT skip
- *             past them because tokens may still exist. Bail after
- *             DISCOVERY_CORRUPT_WALKBACK consecutive invalid versions
- *             (→ CORRUPT_STREAK).
+ *             versions are SKIPPED PAST by default (`skipUnfetchableInWalkback`):
+ *             a slot whose proof is authentic but whose CAR cannot be
+ *             fetched (404 / network failure / persistent-unavailable)
+ *             is treated as walked-past, indistinguishable from
+ *             SEMANTICALLY_INVALID for the purpose of finding the
+ *             latest VALID predecessor. The skipped versions are
+ *             recorded in `walkbackUnfetchableSkipped` for operator
+ *             observability — the lifecycle layer logs them at
+ *             info-level when `recoverLatest()` surfaces them, so
+ *             monitoring can surface the data-loss window without
+ *             requiring the wallet to be blocked.
  *
- * Returns { validV, includedV } (H4 return shape).
+ *             SPEC-strict mode (legacy / strict consumers): pass
+ *             `skipUnfetchableInWalkback: false` to restore the
+ *             SPEC §13 / §10.7 behavior — TRANSIENT_UNAVAILABLE in
+ *             Phase 3 throws CAR_UNAVAILABLE so the caller can invoke
+ *             the operator-driven `acceptCarLoss(version)` flow after
+ *             the persistent-retry window.
+ *
+ *             Bail after DISCOVERY_CORRUPT_WALKBACK consecutive
+ *             non-VALID versions (→ CORRUPT_STREAK), counting both
+ *             SEMANTICALLY_INVALID and (when skipped) UNFETCHABLE.
+ *
+ * Returns { validV, includedV, probeVersions, walkbackUnfetchableSkipped }.
  *
  * W7 walkback floor: when an `acceptCorruptStreak(walkbackLimit)` override
  * raises the walkback ceiling, the effective floor MUST NOT cross below
  * localVersion — crossing below would walk past versions this wallet has
  * already confirmed as its own.
+ *
+ * ## Why `skipUnfetchableInWalkback` defaults to `true`
+ *
+ * A pointer slot that EXISTS (proof-included on the aggregator) but whose
+ * snapshot CID is unreachable on every configured IPFS gateway represents
+ * a real failure mode in production wallets:
+ *
+ *   - A prior publish landed the proof but the IPFS pin was lost
+ *     (operator gateway pruned the bundle, gateway DNS migration left
+ *     orphan content, gateway operator decommissioned).
+ *   - The 404 is durable — every retry of every gateway returns the
+ *     same 404; no amount of "retry later" rescues it.
+ *
+ * Under the legacy SPEC-strict semantic, `recoverLatest()` THROWS
+ * CAR_UNAVAILABLE at the broken version and the wallet has no recovery
+ * surface short of operator intervention. The publish path also fails on
+ * conflict-driven rediscovery for the same reason. The wallet becomes
+ * effectively bricked even though the on-aggregator proof history is
+ * intact and the wallet's PRIOR versions are still fetchable.
+ *
+ * The skip-past semantic preserves the distinction between:
+ *   - ABSENT (no probe match)            — true gap, walkback continues
+ *                                          past this slot only if Phase 2
+ *                                          located includedV above it
+ *   - SEMANTICALLY_INVALID (corrupt)     — walked past, counts toward
+ *                                          DISCOVERY_CORRUPT_WALKBACK
+ *   - EXISTS-BUT-UNFETCHABLE (new)       — walked past (same as
+ *                                          SEMANTICALLY_INVALID for
+ *                                          discovery purposes), counts
+ *                                          toward walkback budget, AND
+ *                                          recorded in
+ *                                          walkbackUnfetchableSkipped so
+ *                                          the caller emits an event for
+ *                                          monitoring
+ *
+ * For PUBLISH `nextV` computation:
+ * - `includedV` (the highest INCLUDED slot from Phase 2) is unchanged
+ *   by the skip-past behavior. Phase 2 uses `probeVersion` (H2
+ *   OR-predicate) which does NOT fetch CARs — only proofs. So even an
+ *   UNFETCHABLE slot is correctly counted as "included" for the purpose
+ *   of computing `nextV = max(validV, includedV) + 1`.
+ * - The skip-past therefore does NOT cause a new publish to overwrite or
+ *   collide with the broken prior slot. The new publish supersedes
+ *   normally at the next available version.
+ *
+ * For FETCH-AND-JOIN (cold-start recovery, periodic poll):
+ * - `recoverLatest()` returns the latest VALID — the skip-past gives the
+ *   wallet a fetchable predecessor instead of blocking entirely.
+ * - The fetch-and-join applier (factory closure) fetches the snapshot
+ *   CAR at the recovered version's CID. Because the recovered version
+ *   is the latest VALID predecessor (CAR was content-address verified
+ *   during Phase 3 classify), this fetch SHOULD succeed — but the
+ *   applier itself is already best-effort in the lifecycle layer
+ *   (`recoverFromAggregatorPointerBestEffort` logs + returns true on
+ *   apply failure, so the next periodic poll retries). The data-loss
+ *   window is the entries that lived ONLY in the unfetchable slot(s);
+ *   the wallet retains everything that survived in the recovered
+ *   predecessor and in the OrbitDB peer-to-peer log.
+ *
+ * Security model: pointer slots are signed by the wallet's own pointer
+ * key. A malicious aggregator cannot forge proofs at versions we have
+ * not authored. A malicious gateway can already serve a 404. The new
+ * semantic does not expand the attacker surface — it expands the
+ * recovery surface for the wallet user.
  */
 
 import type { AggregatorClient } from '@unicitylabs/state-transition-sdk/lib/api/AggregatorClient.js';
@@ -76,6 +158,22 @@ export interface DiscoverInput {
    * to its per-request timeout.
    */
   readonly abortSignal?: AbortSignal;
+  /**
+   * Phase 3 walkback policy for TRANSIENT_UNAVAILABLE versions.
+   *
+   * Defaults to `true` (skip-past): a slot whose proof is authentic but
+   * whose CAR cannot be fetched is treated as walked-past — Phase 3
+   * continues looking for an older VALID predecessor instead of throwing
+   * CAR_UNAVAILABLE. The skipped versions are recorded in
+   * `walkbackUnfetchableSkipped` for operator observability.
+   *
+   * Pass `false` to restore SPEC §13 / §10.7 strict behavior:
+   * TRANSIENT_UNAVAILABLE in Phase 3 throws CAR_UNAVAILABLE so the
+   * caller can invoke the operator-driven `acceptCarLoss(version)` flow.
+   *
+   * Rationale for the default: see the file-header comment block.
+   */
+  readonly skipUnfetchableInWalkback?: boolean;
 }
 
 export interface DiscoverResult {
@@ -89,6 +187,29 @@ export interface DiscoverResult {
    * Used by getProbeFingerprint() for UI clustering signal.
    */
   readonly probeVersions: readonly PointerVersion[];
+  /**
+   * Versions visited during Phase 3 walkback whose `classifyVersion`
+   * returned `TRANSIENT_UNAVAILABLE` and were skipped past (only when
+   * `skipUnfetchableInWalkback !== false`). Empty when no such versions
+   * were walked, when SPEC-strict mode was requested, or when Phase 3
+   * never ran.
+   *
+   * Surfaced to callers so they can emit a typed event
+   * (`storage:pointer-version-skipped-unfetchable`) for monitoring,
+   * even though discovery itself proceeds without blocking.
+   *
+   * A version listed here has these properties:
+   *   - Inclusion proof was authentic (proof verify OK).
+   *   - XOR-decode produced a parseable CID.
+   *   - The CAR at that CID was NOT fetchable from any gateway
+   *     (transient or persistent — Phase 3 treats them identically
+   *     under the skip-past policy).
+   *
+   * Versions listed here are NOT VALID for `recoverLatest()` purposes;
+   * the wallet will receive a strictly-older VALID predecessor (or null)
+   * if such a version exists.
+   */
+  readonly walkbackUnfetchableSkipped: readonly PointerVersion[];
 }
 
 // ── findLatestValidVersion ─────────────────────────────────────────────────
@@ -245,6 +366,13 @@ async function findLatestValidVersionInner(
   };
 
   const probeVersions: PointerVersion[] = [];
+  // Phase 3: track versions skipped under the EXISTS-BUT-UNFETCHABLE
+  // policy (default-on; see file-header). Empty when SPEC-strict mode
+  // (`skipUnfetchableInWalkback === false`) was requested or when Phase 3
+  // never encountered an unfetchable slot.
+  const walkbackUnfetchableSkipped: PointerVersion[] = [];
+  const skipUnfetchable = input.skipUnfetchableInWalkback !== false;
+
   const probeAndRecord = async (v: PointerVersion): Promise<boolean> => {
     checkDeadline();
     probeVersions.push(v);
@@ -295,7 +423,12 @@ async function findLatestValidVersionInner(
   const includedV = lo as PointerVersion;
   // Invariant after Phase 2: probe(includedV) == true (or includedV == 0) AND probe(includedV+1) == false.
 
-  // ── Phase 3 — walkback through SEMANTICALLY_INVALID versions ───────────
+  // ── Phase 3 — walkback through non-VALID versions ────────────────────
+  //
+  // Walks past SEMANTICALLY_INVALID and (when `skipUnfetchable` is true,
+  // the default) EXISTS-BUT-UNFETCHABLE versions, looking for the first
+  // VALID predecessor. See the file-header for the design rationale on
+  // the EXISTS-BUT-UNFETCHABLE policy.
   //
   // W7 walkback floor (SPEC §13 acceptCorruptStreak precondition):
   //   walkback from includedV down to max(0, currentLocalVersion).
@@ -321,8 +454,9 @@ async function findLatestValidVersionInner(
     }
 
     // Record this Phase 3 visit in the probe sequence so the probe fingerprint
-    // reflects the corruption walkback — clustering's MAIN use case is
-    // detecting same-corrupt-prefix wallets.
+    // reflects the walkback (corruption + unfetchable) — clustering's MAIN
+    // use case is detecting same-prefix wallets (corrupt streaks AND
+    // unfetchable-CAR clusters both surface here).
     checkDeadline();
     probeVersions.push(candidate);
 
@@ -339,7 +473,12 @@ async function findLatestValidVersionInner(
     });
 
     if (status === 'VALID') {
-      return { validV: candidate, includedV, probeVersions };
+      return {
+        validV: candidate,
+        includedV,
+        probeVersions,
+        walkbackUnfetchableSkipped,
+      };
     }
 
     if (status === 'SEMANTICALLY_INVALID') {
@@ -348,9 +487,39 @@ async function findLatestValidVersionInner(
       continue;
     }
 
-    // TRANSIENT_UNAVAILABLE: tokens may still exist at this version. DO NOT
-    // walk past — surface as CAR_UNAVAILABLE so the caller can retry later
-    // (or invoke §10.7 acceptCarLoss flow after the persistent-retry window).
+    // TRANSIENT_UNAVAILABLE: the slot exists (proof is authentic + CID
+    // decodes) but the CAR is not retrievable from any configured gateway.
+    //
+    // Default policy (`skipUnfetchableInWalkback !== false`): the slot is
+    // EXISTS-BUT-UNFETCHABLE — distinct from ABSENT (no proof) and from
+    // SEMANTICALLY_INVALID (proof partial / CID corrupt). For the purpose
+    // of finding the latest VALID predecessor, we treat it like
+    // SEMANTICALLY_INVALID: walk back one more, count toward the walkback
+    // budget, and record the skipped version for operator observability.
+    //
+    //   - `includedV` from Phase 2 remains the highest INCLUDED slot
+    //     regardless of fetchability, so a downstream publish's
+    //     `nextV = max(validV, includedV) + 1` correctly supersedes
+    //     above the broken slot. Skipping does NOT collapse the version
+    //     space.
+    //   - The caller (recoverLatest / reconcile loop) gets either an
+    //     older fetchable VALID predecessor or `validV === 0` if no
+    //     fetchable predecessor exists. Both outcomes keep the wallet
+    //     live.
+    //   - Operators receive the skipped versions via
+    //     `walkbackUnfetchableSkipped` and can emit a typed event for
+    //     monitoring without blocking the wallet.
+    //
+    // SPEC-strict policy (`skipUnfetchableInWalkback === false`): retain
+    // the SPEC §13 / §10.7 throw-CAR_UNAVAILABLE behavior. The caller
+    // can then invoke `acceptCarLoss(version)` to bypass the broken slot
+    // under operator control.
+    if (skipUnfetchable) {
+      walkbackUnfetchableSkipped.push(candidate);
+      candidate = (candidate - 1) as PointerVersion;
+      walked += 1;
+      continue;
+    }
     throw new AggregatorPointerError(
       AggregatorPointerErrorCode.CAR_UNAVAILABLE,
       `Phase 3 walkback: version=${candidate} is TRANSIENT_UNAVAILABLE. ` +
@@ -361,16 +530,33 @@ async function findLatestValidVersionInner(
 
   if (candidate === 0) {
     // No valid version ever existed — wallet is pristine, may begin publishing at v=1.
-    return { validV: 0 as PointerVersion, includedV, probeVersions };
+    return {
+      validV: 0 as PointerVersion,
+      includedV,
+      probeVersions,
+      walkbackUnfetchableSkipped,
+    };
   }
 
-  // Too many consecutive SEMANTICALLY_INVALID versions — bail out (§10.8).
+  // Too many consecutive non-VALID versions — bail out (§10.8). The
+  // diagnostic carries the unfetchable-skipped count so operators can
+  // distinguish "wallet is corrupt" (all skipped were SEMANTICALLY_INVALID)
+  // from "IPFS gateways are down" (mostly walkbackUnfetchableSkipped).
+  // Both classes trigger CORRUPT_STREAK because the wallet's effective
+  // walkback budget is the same — but the remediation differs (operator
+  // intervention vs gateway reconnect).
   throw new AggregatorPointerError(
     AggregatorPointerErrorCode.CORRUPT_STREAK,
     `Phase 3 walkback exhausted walkbackLimit=${walkbackLimit} without finding a VALID version ` +
-      `(includedV=${includedV}, candidate=${candidate}). ` +
+      `(includedV=${includedV}, candidate=${candidate}, ` +
+      `unfetchableSkipped=${walkbackUnfetchableSkipped.length}). ` +
       `Operator may invoke acceptCorruptStreak(walkbackLimit) to override.`,
-    { includedV, walkbackLimit, walkedSoFar: walked },
+    {
+      includedV,
+      walkbackLimit,
+      walkedSoFar: walked,
+      unfetchableSkippedCount: walkbackUnfetchableSkipped.length,
+    },
   );
 }
 

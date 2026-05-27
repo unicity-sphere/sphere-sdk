@@ -432,11 +432,20 @@ describe('Pointer Category-C — multi-device contention (SPEC §9)', () => {
       expect(CID.decode(recovered.cid).toString()).toBe(cid.toString());
     });
 
-    it('B without bridged CID → CAR_UNAVAILABLE (content-addressing gap)', async () => {
+    it('B without bridged CID → recoverLatest returns null (default skip-past) with no older predecessor', async () => {
       // Negative control for C1: if the winner's CID is NOT in B's IPFS,
-      // classifyVersion returns TRANSIENT_UNAVAILABLE and discover raises
-      // CAR_UNAVAILABLE. This pins the contract that replication requires
-      // the DHT layer to have propagated the CAR to B.
+      // classifyVersion returns TRANSIENT_UNAVAILABLE. Under the default
+      // Phase 3 walkback policy (`skipUnfetchableInWalkback: true`), the
+      // wallet skips past the unfetchable v=1 looking for an older
+      // VALID predecessor; here there is none (this was the only
+      // publish), so `recoverLatest()` returns `null`. The wallet stays
+      // live and can begin publishing at v=2 — exactly the
+      // not-bricked-by-broken-prior recovery semantic the user requested
+      // (see discover-algorithm.ts file header for design rationale).
+      //
+      // SPEC-strict mode (`skipUnfetchableInWalkback: false`) still
+      // throws CAR_UNAVAILABLE — that path is unit-tested in
+      // `tests/integration/pointer/walkback-skip-unfetchable.test.ts`.
       const agg = makeSharedAggregator();
       const ipfsA = new InMemoryIpfs();
       const ipfsB = new InMemoryIpfs();
@@ -451,10 +460,10 @@ describe('Pointer Category-C — multi-device contention (SPEC §9)', () => {
 
       // ipfsB is DELIBERATELY empty for the CID → CAR fetcher returns
       // transient_unavailable → classifyVersion returns TRANSIENT_UNAVAILABLE
-      // → discover-algorithm raises CAR_UNAVAILABLE.
-      await expect(devB.layer.recoverLatest()).rejects.toMatchObject({
-        code: AggregatorPointerErrorCode.CAR_UNAVAILABLE,
-      });
+      // → walkback skips past v=1 → no older predecessor → recoverLatest
+      // returns null.
+      const recovered = await devB.layer.recoverLatest();
+      expect(recovered).toBeNull();
     });
   });
 
@@ -766,8 +775,23 @@ describe('Pointer Category-C — multi-device contention (SPEC §9)', () => {
 
   // ── C8: IPFS temporarily unavailable for device B ───────────────────────
 
-  describe('C8 — B\'s IPFS unavailable → CAR_UNAVAILABLE (no silent walkpast)', () => {
-    it('latest valid version\'s CAR transiently missing → discover raises CAR_UNAVAILABLE', async () => {
+  describe('C8 — B\'s IPFS unavailable → recoverLatest skips past and returns null', () => {
+    it('latest valid version\'s CAR transiently missing → discover skips past + returns null (no older predecessor)', async () => {
+      // Under the new default Phase 3 walkback policy
+      // (`skipUnfetchableInWalkback: true`), TRANSIENT_UNAVAILABLE in
+      // Phase 3 is no longer a thrown CAR_UNAVAILABLE — the walkback
+      // looks for an older fetchable VALID predecessor. With only one
+      // published version (v=1) and its CAR unfetchable, the walkback
+      // bottoms out at v=0 → recoverLatest returns null.
+      //
+      // The wallet stays live; it can begin publishing at v=2. This is
+      // the user-stated requirement: a single unfetchable slot must not
+      // block the wallet (see discover-algorithm.ts file header).
+      //
+      // SPEC-strict mode (`skipUnfetchableInWalkback: false`) preserves
+      // the legacy throw for callers that want the operator-driven
+      // acceptCarLoss(version) flow — covered in
+      // `tests/integration/pointer/walkback-skip-unfetchable.test.ts`.
       const agg = makeSharedAggregator();
       const ipfsA = new InMemoryIpfs();
       const ipfsB = new InMemoryIpfs();
@@ -794,9 +818,8 @@ describe('Pointer Category-C — multi-device contention (SPEC §9)', () => {
         fetchCar,
       });
 
-      await expect(devB.layer.recoverLatest()).rejects.toMatchObject({
-        code: AggregatorPointerErrorCode.CAR_UNAVAILABLE,
-      });
+      const recovered = await devB.layer.recoverLatest();
+      expect(recovered).toBeNull();
     });
   });
 

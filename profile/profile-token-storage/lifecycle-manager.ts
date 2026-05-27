@@ -1700,7 +1700,11 @@ export class LifecycleManager {
       return status === 'pending';
     }
 
-    let recovered: { readonly cid: Uint8Array; readonly version: number } | null;
+    let recovered: {
+      readonly cid: Uint8Array;
+      readonly version: number;
+      readonly walkbackUnfetchableSkipped?: readonly number[];
+    } | null;
     try {
       recovered = await pointer.recoverLatest();
     } catch (err) {
@@ -1718,6 +1722,29 @@ export class LifecycleManager {
     if (!recovered) {
       this.host.log('Pointer recover: no anchor published yet');
       return false;
+    }
+
+    // If Phase 3 walkback skipped past EXISTS-BUT-UNFETCHABLE versions,
+    // surface them via a typed log line. The wallet has already recovered
+    // to an older fetchable predecessor — these slots represent the
+    // data-loss window the user has accepted by running with the default
+    // `skipUnfetchableInWalkback: true` policy. Operators monitoring
+    // wallet health can detect this and decide whether to investigate
+    // (e.g., re-pin the lost CARs from a backup or invoke acceptCarLoss).
+    //
+    // Logged at info-level (not error) because the skip is the policy,
+    // not a fault. Permanent errors that previously surfaced here
+    // (CAR_UNAVAILABLE) are now absorbed by the walkback's skip logic;
+    // the caller-visible signal is the recovered version + the skipped
+    // list, not an exception.
+    const skipped = recovered.walkbackUnfetchableSkipped;
+    if (skipped && skipped.length > 0) {
+      this.host.log(
+        `Pointer recover: walkback skipped ${skipped.length} ` +
+          `EXISTS-BUT-UNFETCHABLE version(s): [${skipped.join(', ')}]. ` +
+          `Wallet recovered to older predecessor version=${recovered.version}; ` +
+          `the listed slot(s) had authentic proofs but unreachable CARs.`,
+      );
     }
 
     let cidString: string;
@@ -1951,7 +1978,11 @@ export class LifecycleManager {
       );
     }
 
-    let recovered: { readonly cid: Uint8Array; readonly version: number } | null = null;
+    let recovered: {
+      readonly cid: Uint8Array;
+      readonly version: number;
+      readonly walkbackUnfetchableSkipped?: readonly number[];
+    } | null = null;
     try {
       recovered = await pointer.recoverLatest();
     } catch (err) {
@@ -1973,6 +2004,16 @@ export class LifecycleManager {
       // silently; this is a normal state for a fresh wallet.
       this.scheduleNextPointerPoll(nextBackoffMultiplier);
       return;
+    }
+
+    // Same skip-past observability as the cold-start recovery path.
+    const skipped = recovered.walkbackUnfetchableSkipped;
+    if (skipped && skipped.length > 0) {
+      this.host.log(
+        `Pointer poll: walkback skipped ${skipped.length} ` +
+          `EXISTS-BUT-UNFETCHABLE version(s): [${skipped.join(', ')}]. ` +
+          `Recovered to predecessor version=${recovered.version}.`,
+      );
     }
 
     let cidString: string;

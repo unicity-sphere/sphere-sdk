@@ -100,6 +100,21 @@ export interface PublishResult {
 export interface RecoverResult {
   readonly cid: Uint8Array;
   readonly version: PointerVersion;
+  /**
+   * Versions walked past during Phase 3 walkback whose CAR was
+   * EXISTS-BUT-UNFETCHABLE (proof authentic, CID decoded, but no
+   * gateway could serve the bytes). Empty when no such versions were
+   * encountered or when the wallet ran in SPEC-strict
+   * `skipUnfetchableInWalkback: false` mode.
+   *
+   * The wallet's `version` field is the latest VALID predecessor — older
+   * than every entry in this list. Surfaced so the lifecycle layer can
+   * emit a typed `storage:pointer-version-skipped-unfetchable` event for
+   * operator monitoring.
+   *
+   * See `discover-algorithm.ts` for the full design rationale.
+   */
+  readonly walkbackUnfetchableSkipped?: readonly PointerVersion[];
 }
 
 /**
@@ -473,7 +488,19 @@ export class ProfilePointerLayer {
     const discovery = await this.#discoverLatestVersionInner(undefined, abortSignal);
     if (discovery.validV === 0) return null;
     const cid = await this.#init.resolveRemoteCid(discovery.validV);
-    return { cid, version: discovery.validV };
+    // Surface walkback-unfetchable telemetry to the caller. The lifecycle
+    // layer uses this to emit a typed event so operators can detect when
+    // a wallet recovered to an older predecessor because a newer slot
+    // was EXISTS-BUT-UNFETCHABLE. Empty when no skip-past occurred or
+    // when the wallet ran in SPEC-strict mode.
+    const walkbackUnfetchableSkipped = discovery.walkbackUnfetchableSkipped;
+    return {
+      cid,
+      version: discovery.validV,
+      ...(walkbackUnfetchableSkipped && walkbackUnfetchableSkipped.length > 0
+        ? { walkbackUnfetchableSkipped }
+        : {}),
+    };
   }
 
   // ── reconcileLocalVersionDownward ────────────────────────────────────────
