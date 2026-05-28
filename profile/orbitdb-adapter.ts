@@ -409,8 +409,17 @@ export class OrbitDbAdapter implements ProfileDatabase {
         // expectation. The DB name defaults to `'sphere-helia-blocks'`
         // and is overridable via `config.browserBlockstorePath` for
         // callers who want per-wallet isolation.
+        // Use a STATIC-string dynamic import (no `as string` cast). The
+        // `as string` form in the Node `blockstore-fs` branch above
+        // tells tsup / consumer bundlers to leave the import alone as
+        // a runtime expression — which is fine for Node where the
+        // package is on the filesystem. For browser bundling we want
+        // tsup AND consumer bundlers (Vite / Webpack / esbuild) to
+        // statically discover `blockstore-idb` and include it in the
+        // output bundle. The string-literal form gives the bundler
+        // a deterministic target.
         try {
-          const blockstoreIdbModule: any = await import('blockstore-idb' as string);
+          const blockstoreIdbModule: any = await import('blockstore-idb');
           const IDBBlockstoreCtor =
             blockstoreIdbModule.IDBBlockstore ?? blockstoreIdbModule.default?.IDBBlockstore;
           if (typeof IDBBlockstoreCtor === 'function') {
@@ -421,20 +430,43 @@ export class OrbitDbAdapter implements ProfileDatabase {
                 : 'sphere-helia-blocks';
             const idbBlockstore = new IDBBlockstoreCtor(dbName);
             // blockstore-idb requires `open()` to be awaited before the
-            // store can serve get/put. Tolerate either a synchronous or
-            // an async open(); a missing open() is also acceptable for
-            // forward-compat with stores that auto-open on first use.
+            // store can serve get/put. Wrap with a generous deadline so
+            // a stuck IDB upgrade (sibling tab holding an older version)
+            // does not hang the entire wallet init. On timeout we fall
+            // through to MemoryBlockstore — same as if the dependency
+            // had been missing.
             if (typeof idbBlockstore.open === 'function') {
-              await idbBlockstore.open();
+              await Promise.race([
+                idbBlockstore.open(),
+                new Promise<never>((_, reject) =>
+                  setTimeout(
+                    () => reject(new Error('blockstore-idb open() timed out after 5_000ms')),
+                    5_000,
+                  ),
+                ),
+              ]);
             }
             heliaOptions.blockstore = idbBlockstore;
           }
-        } catch {
-          // blockstore-idb not installed or open() failed — fall back to
-          // Helia's MemoryBlockstore default. The wallet still functions
-          // for the lifetime of this tab but loses durability across
-          // reloads (the pre-#330 behaviour). The pin shim that follows
-          // will still attempt pin, but pinning memory is a no-op.
+        } catch (err) {
+          // blockstore-idb not installed, open() rejected, or open()
+          // exceeded the 5s deadline — fall back to Helia's
+          // MemoryBlockstore default. The wallet still functions for
+          // the lifetime of this tab but loses durability across
+          // reloads (the pre-#330 behaviour). Log loudly so the
+          // operator can investigate; the pin shim that follows will
+          // still attempt pin, but pinning memory is a no-op.
+          //
+          // Suppress logger import to keep the failure path small; the
+          // caller's outer connect()/init() telemetry will reflect the
+          // degraded mode via subsequent `storage:error` events.
+          if (typeof console !== 'undefined' && console.warn) {
+            console.warn(
+              '[OrbitDB] IDBBlockstore install failed; falling back to Helia MemoryBlockstore. ' +
+                'Browser wallet durability across reloads is degraded. ' +
+                `cause=${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
         }
       }
 

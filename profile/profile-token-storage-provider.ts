@@ -1378,6 +1378,12 @@ export class ProfileTokenStorageProvider
         if (fallback !== null) {
           this.lastLoadedData = fallback;
           this.lastLoadedFromBundleCids = new Set();
+          // Issue #330 — defensive: fallback bytes bypass the merge
+          // pipeline that normally populates `lastTokenManifest`.
+          // Reset to an empty manifest so a subsequent `getTokenManifest()`
+          // does not return whatever stale value was left from a prior
+          // primary load.
+          this.lastTokenManifest = new Map();
           this.emitEvent({ type: 'storage:loaded', timestamp: Date.now() });
           return {
             success: true,
@@ -1483,6 +1489,9 @@ export class ProfileTokenStorageProvider
           // Do NOT update lastLoadedFromBundleCids — we did not actually
           // load these bundles. Leaving it at its prior state (or
           // null) keeps the monotonicity assertion's baseline correct.
+          // Reset the manifest defensively (see #330 note at the
+          // no-bundles site above).
+          this.lastTokenManifest = new Map();
           this.emitEvent({ type: 'storage:loaded', timestamp: Date.now() });
           return {
             success: true,
@@ -1616,6 +1625,11 @@ export class ProfileTokenStorageProvider
       const fallback = await this.tryFallbackLoad('load-error');
       if (fallback !== null) {
         this.lastLoadedData = fallback;
+        // Reset the manifest defensively (see #330 note at the
+        // no-bundles site above). On error we do not touch
+        // `lastLoadedFromBundleCids` either — leave it at its prior
+        // value so any subsequent flush sees a consistent baseline.
+        this.lastTokenManifest = new Map();
         this.emitEvent({ type: 'storage:loaded', timestamp: Date.now() });
         return {
           success: true,

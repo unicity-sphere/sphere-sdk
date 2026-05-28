@@ -1373,6 +1373,39 @@ export class Sphere {
     // `getTokenStorage().setFallbackTokenStorage(...)` further below.
     sphere._fallbackTokenStorage = options.fallbackTokenStorage ?? null;
 
+    // Issue #330 — warn loudly when the underlying storage carries the
+    // legacy-migration marker but no `fallbackTokenStorage` was wired.
+    // This catches consumer apps that updated their SDK but did not
+    // migrate to the auto-wiring factory (`createBrowserProfileProvidersAuto`
+    // / equivalent). Without a fallback, pre-migration tokens are
+    // unrecoverable if the Profile blockstore loses them — exactly
+    // the symptom #330 sought to fix. Best-effort: any error during
+    // the probe is swallowed (the storage may not yet be connected,
+    // or the legacy KV may not implement `get`).
+    if (sphere._fallbackTokenStorage === null) {
+      try {
+        if (
+          typeof options.storage.isConnected === 'function' &&
+          options.storage.isConnected() &&
+          typeof options.storage.get === 'function'
+        ) {
+          const markerValue = await options.storage.get('migration.migratedAt');
+          if (typeof markerValue === 'string' && markerValue.length > 0) {
+            logger.warn(
+              'Sphere',
+              'Issue #330: legacy-migration marker detected on storage but no `fallbackTokenStorage` ' +
+                'was provided to Sphere.init/load. Tokens that were durable in the legacy IndexedDB ' +
+                'before Profile migration are NOT recoverable from this session. Use ' +
+                '`createBrowserProfileProvidersAuto` (or wire a legacy `IndexedDBTokenStorageProvider` ' +
+                'as `fallbackTokenStorage` manually) to close this gap.',
+            );
+          }
+        }
+      } catch {
+        // Probe is best-effort. Continue without warning.
+      }
+    }
+
     // Issue #330 — propagate the fallback into any token storage
     // provider that supports it (Profile-mode providers expose
     // `setFallbackTokenStorage`). Done here, before initialize() runs,
@@ -1667,6 +1700,9 @@ export class Sphere {
    * await Sphere.clear({
    *   storage: providers.storage,
    *   tokenStorage: providers.tokenStorage,
+   *   // Issue #330 — pass the legacy fallback if the wallet was
+   *   // migrated, so the resurrection footgun is closed.
+   *   fallbackTokenStorage: providers.fallbackTokenStorage,
    * });
    *
    * @example
@@ -1674,10 +1710,25 @@ export class Sphere {
    * await Sphere.clear(storage);
    */
   static async clear(
-    storageOrOptions: StorageProvider | { storage: StorageProvider; tokenStorage?: TokenStorageProvider<TxfStorageDataBase> },
+    storageOrOptions:
+      | StorageProvider
+      | {
+          storage: StorageProvider;
+          tokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
+          /**
+           * Issue #330 — read-only fallback token storage that was
+           * passed to `Sphere.init`/`load`. If supplied, `clear()`
+           * wipes it too. Without this, a user calling `clear()` and
+           * then re-running `init()` with the same mnemonic would see
+           * pre-clear tokens resurrected from the legacy IDB.
+           */
+          fallbackTokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
+        },
   ): Promise<void> {
     const storage = 'get' in storageOrOptions ? storageOrOptions as StorageProvider : storageOrOptions.storage;
     const tokenStorage = 'get' in storageOrOptions ? undefined : storageOrOptions.tokenStorage;
+    const fallbackTokenStorage =
+      'get' in storageOrOptions ? undefined : storageOrOptions.fallbackTokenStorage;
 
     // 1. Destroy Sphere instance — flushes pending IPFS writes (saves good
     //    state), then closes all connections. Awaited so IPFS completes
@@ -1709,6 +1760,34 @@ export class Sphere {
       }
     } else {
       logger.debug('Sphere', 'No token storage provider to clear');
+    }
+
+    // 4b. Issue #330 — also wipe the read-only fallback token storage
+    // (legacy IndexedDB from before Profile migration). Without this,
+    // a user who calls `clear()` to start over with the same mnemonic
+    // would see pre-clear tokens resurrected via the fallback wiring.
+    // This violates the "clear means clear" invariant and is a real
+    // data-integrity hazard, not just UX confusion.
+    //
+    // Idempotent and best-effort: a missing `clear` method (older
+    // legacy providers) or an exception is logged but does not block
+    // the rest of the cleanup. The fallback was never written to by
+    // this SDK; the bytes here are pre-migration legacy data.
+    if (fallbackTokenStorage?.clear) {
+      logger.debug('Sphere', 'Clearing fallback (legacy) token storage...');
+      try {
+        if (
+          typeof fallbackTokenStorage.isConnected === 'function' &&
+          !fallbackTokenStorage.isConnected() &&
+          typeof fallbackTokenStorage.connect === 'function'
+        ) {
+          await fallbackTokenStorage.connect();
+        }
+        await fallbackTokenStorage.clear();
+        logger.debug('Sphere', 'Fallback token storage cleared');
+      } catch (err) {
+        logger.warn('Sphere', 'Fallback token storage clear failed:', err);
+      }
     }
 
     // 5. Delete KV database (sphere-storage)

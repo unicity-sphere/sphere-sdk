@@ -263,6 +263,120 @@ describe('Issue #330 — ProfileTokenStorageProvider.setFallbackTokenStorage', (
     }
   });
 
+  it('load() returns fallback data when all bundle fetches fail (site #2)', async () => {
+    const provider = await makeProvider();
+    try {
+      const fallbackTokenData: TxfStorageDataBase = {
+        _meta: { version: 1 } as never,
+        '_recovered-from-fallback': { mock: true } as never,
+      } as TxfStorageDataBase;
+      const fallback = createFakeFallback(fallbackTokenData);
+      provider.setFallbackTokenStorage(fallback.provider);
+
+      // Monkey-patch the bundleIndex to return one active bundle that
+      // will fail to fetch (the gateway URL `https://mock-ipfs.test`
+      // does not resolve, so `fetchCarFromIpfs` throws for every CID).
+      // This drives `loadedBundles.length === 0 && activeBundles.size > 0`
+      // — the site-#2 condition.
+      const inner = (provider as unknown as {
+        bundleIndex: {
+          listActiveBundles: () => Promise<Map<string, unknown>>;
+        };
+      }).bundleIndex;
+      const originalList = inner.listActiveBundles.bind(inner);
+      inner.listActiveBundles = async () => {
+        return new Map<string, unknown>([
+          [
+            'bafkreigh2akiscaildc6ovwc6m3fy5puxhxcw7qveyf2nbn7xmqwfajeuy',
+            { cid: 'bafkreigh2akiscaildc6ovwc6m3fy5puxhxcw7qveyf2nbn7xmqwfajeuy', status: 'active' },
+          ],
+        ]);
+      };
+
+      try {
+        const result = await provider.load();
+        expect(result.success).toBe(true);
+        const tokenKeys = Object.keys(result.data!).filter(
+          (k) =>
+            k.startsWith('_') &&
+            k !== '_meta' &&
+            k !== '_tombstones' &&
+            k !== '_sent' &&
+            k !== '_outbox' &&
+            k !== '_history' &&
+            k !== '_nametag' &&
+            k !== '_nametags' &&
+            k !== '_mintOutbox' &&
+            k !== '_invalid' &&
+            k !== '_invalidatedNametags' &&
+            k !== '_integrity',
+        );
+        expect(tokenKeys).toEqual(['_recovered-from-fallback']);
+        expect(fallback.loadCalls).toBeGreaterThan(0);
+      } finally {
+        inner.listActiveBundles = originalList;
+      }
+    } finally {
+      await provider.shutdown();
+    }
+  }, 30_000);
+
+  it('load() returns fallback data when an inner error throws (site #3 outer-catch)', async () => {
+    const provider = await makeProvider();
+    try {
+      const fallbackTokenData: TxfStorageDataBase = {
+        _meta: { version: 1 } as never,
+        '_recovered-on-error': { mock: true } as never,
+      } as TxfStorageDataBase;
+      const fallback = createFakeFallback(fallbackTokenData);
+      provider.setFallbackTokenStorage(fallback.provider);
+
+      // Make bundleIndex.listActiveBundles itself THROW to drive the
+      // outer try/catch path (`load-error` reason). Mirrors what a
+      // CRITICAL-BLOCK-EVICTED would do when reading the OrbitDB
+      // OpLog head fails.
+      const inner = (provider as unknown as {
+        bundleIndex: {
+          listActiveBundles: () => Promise<Map<string, unknown>>;
+        };
+      }).bundleIndex;
+      const originalList = inner.listActiveBundles.bind(inner);
+      inner.listActiveBundles = async () => {
+        const err = new Error('simulated LoadBlockFailedError') as Error & {
+          code?: string;
+        };
+        err.code = 'LOAD_BLOCK_FAILED';
+        throw err;
+      };
+
+      try {
+        const result = await provider.load();
+        expect(result.success).toBe(true);
+        const tokenKeys = Object.keys(result.data!).filter(
+          (k) =>
+            k.startsWith('_') &&
+            k !== '_meta' &&
+            k !== '_tombstones' &&
+            k !== '_sent' &&
+            k !== '_outbox' &&
+            k !== '_history' &&
+            k !== '_nametag' &&
+            k !== '_nametags' &&
+            k !== '_mintOutbox' &&
+            k !== '_invalid' &&
+            k !== '_invalidatedNametags' &&
+            k !== '_integrity',
+        );
+        expect(tokenKeys).toEqual(['_recovered-on-error']);
+        expect(fallback.loadCalls).toBeGreaterThan(0);
+      } finally {
+        inner.listActiveBundles = originalList;
+      }
+    } finally {
+      await provider.shutdown();
+    }
+  });
+
   it('null fallback clears the wiring', async () => {
     const provider = await makeProvider();
     try {

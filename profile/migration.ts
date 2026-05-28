@@ -64,6 +64,24 @@ const MIGRATION_STARTED_AT_KEY = 'migration.startedAt';
 const LEGACY_MIGRATED_MARKER_KEY = 'migration.migratedAt';
 
 /**
+ * Issue #330 — public re-export of the legacy-migrated marker key.
+ *
+ * Factories and consumer apps can probe `legacyStorage.get(...)` for
+ * this key to auto-wire a `fallbackTokenStorage` when the wallet was
+ * migrated from a pre-Profile layout. Returns the migration-completion
+ * timestamp (ms since epoch, as a string) when present, null when
+ * the wallet either was never migrated or is a fresh Profile wallet.
+ *
+ * Storage shape: written via `legacyStorage.set(KEY, String(ts))` in
+ * `profile/migration.ts` step 5c. The KV provider prefixes with
+ * `STORAGE_PREFIX` ('sphere_') so the on-disk key is typically
+ * `sphere_migration.migratedAt`. Pass the unprefixed name to
+ * `StorageProvider.get` — providers do the prefix translation
+ * internally.
+ */
+export const LEGACY_MIGRATED_MARKER = LEGACY_MIGRATED_MARKER_KEY;
+
+/**
  * Regex pattern matching legacy IPFS sequence keys.
  * These indicate that the wallet has previously synced via IPFS/IPNS.
  */
