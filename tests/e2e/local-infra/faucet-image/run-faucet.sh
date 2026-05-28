@@ -30,6 +30,14 @@ NOSTR_RELAYS="${NOSTR_RELAYS:-wss://nostr-unicity-dev.dyndns.org}"
 UNICITY_NETWORK="${UNICITY_NETWORK:-testnet}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
 
+# Optional overrides for self-hosted aggregator + trust base + nametag.
+# Empty / unset → faucet uses the network-preset defaults baked into the
+# SDK. Required SDK env-var names match what main.ts (js-faucet) checks.
+FAUCET_AGGREGATOR_URL="${FAUCET_AGGREGATOR_URL:-}"
+FAUCET_TRUSTBASE_URL="${FAUCET_TRUSTBASE_URL:-}"
+FAUCET_NAMETAG="${FAUCET_NAMETAG:-}"
+FAUCET_SKIP_VERIFICATION="${FAUCET_SKIP_VERIFICATION:-}"
+
 # Override path — wallet/identity is persisted under a Docker volume.
 FAUCET_IDENTITY_VOLUME="${FAUCET_IDENTITY_VOLUME:-unicity-faucet-identity}"
 
@@ -46,11 +54,15 @@ source "${SCRIPT_DIR}/../_shared/run-lib.sh"
 
 app_parse_args() {
     case "$1" in
-        --nostr-relays)   require_arg "$1" "${2:-}"; NOSTR_RELAYS="$2";    return 2 ;;
-        --network)        require_arg "$1" "${2:-}"; UNICITY_NETWORK="$2"; return 2 ;;
-        --log-level)      require_arg "$1" "${2:-}"; LOG_LEVEL="$2";       return 2 ;;
-        --identity-vol)   require_arg "$1" "${2:-}"; FAUCET_IDENTITY_VOLUME="$2"; return 2 ;;
-        *)                return 0 ;;
+        --nostr-relays)      require_arg "$1" "${2:-}"; NOSTR_RELAYS="$2";    return 2 ;;
+        --network)           require_arg "$1" "${2:-}"; UNICITY_NETWORK="$2"; return 2 ;;
+        --log-level)         require_arg "$1" "${2:-}"; LOG_LEVEL="$2";       return 2 ;;
+        --identity-vol)      require_arg "$1" "${2:-}"; FAUCET_IDENTITY_VOLUME="$2"; return 2 ;;
+        --aggregator-url)    require_arg "$1" "${2:-}"; FAUCET_AGGREGATOR_URL="$2"; return 2 ;;
+        --trustbase-url)     require_arg "$1" "${2:-}"; FAUCET_TRUSTBASE_URL="$2";  return 2 ;;
+        --nametag)           require_arg "$1" "${2:-}"; FAUCET_NAMETAG="$2";        return 2 ;;
+        --skip-verification) FAUCET_SKIP_VERIFICATION="1";                          return 1 ;;
+        *)                   return 0 ;;
     esac
 }
 
@@ -59,6 +71,12 @@ app_env_args() {
     echo "-e UNICITY_NETWORK=${UNICITY_NETWORK}"
     echo "-e UNICITY_LOG_LEVEL=${LOG_LEVEL}"
     echo "-e FAUCET_DISCOVERY_PORT=${APP_HTTP_PORT}"
+    # Pass-through env vars the js-faucet reads when set. The faucet's
+    # main.ts treats empty / unset as "use the network preset default".
+    [ -n "$FAUCET_AGGREGATOR_URL" ]    && echo "-e SPHERE_AGGREGATOR_URL=${FAUCET_AGGREGATOR_URL}"
+    [ -n "$FAUCET_TRUSTBASE_URL" ]     && echo "-e SPHERE_TRUSTBASE_URL=${FAUCET_TRUSTBASE_URL}"
+    [ -n "$FAUCET_NAMETAG" ]           && echo "-e SPHERE_NAMETAG=${FAUCET_NAMETAG}"
+    [ -n "$FAUCET_SKIP_VERIFICATION" ] && echo "-e SPHERE_AGGREGATOR_SKIP_VERIFICATION=${FAUCET_SKIP_VERIFICATION}"
 }
 
 app_docker_args() {
@@ -94,6 +112,10 @@ app_print_config() {
     echo "  Nostr relays: $NOSTR_RELAYS"
     echo "  Network:      $UNICITY_NETWORK"
     echo "  Wallet vol:   $FAUCET_IDENTITY_VOLUME"
+    [ -n "$FAUCET_AGGREGATOR_URL" ] && echo "  Aggregator:   $FAUCET_AGGREGATOR_URL (override)"
+    [ -n "$FAUCET_TRUSTBASE_URL" ]  && echo "  Trust base:   $FAUCET_TRUSTBASE_URL"
+    [ -n "$FAUCET_NAMETAG" ]        && echo "  Nametag:      $FAUCET_NAMETAG"
+    [ -n "$FAUCET_SKIP_VERIFICATION" ] && echo "  Skip verify:  yes"
 }
 
 app_help() {
