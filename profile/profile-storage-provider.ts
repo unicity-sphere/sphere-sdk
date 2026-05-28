@@ -35,6 +35,7 @@ import { CidRefStore } from './cid-ref-store';
 import { Lamport } from './lamport';
 import { buildLocalEntry } from './oplog-entry';
 import { getEnvelopePayload } from './oplog-envelope-io';
+import { extractLostHeadCid } from './orbitdb-adapter';
 import type { OpLogEntryType } from './aggregator-pointer/originated-tag';
 import type { ProfilePointerLayer } from './aggregator-pointer';
 import {
@@ -1393,7 +1394,41 @@ export class ProfileStorageProvider implements StorageProvider {
       return null;
     }
 
-    const encrypted = await this.readEnvelopePayload(translated.profileKey);
+    // Issue #309 — `readEnvelopePayload` can throw a chained
+    // `LoadBlockFailedError` when the OpLog head references a content
+    // block that's no longer in the local Helia blockstore (browser
+    // eviction, origin purge, quota error during write, etc.). Letting
+    // that throw propagate makes the caller's identity-load fatal
+    // even though there's almost always a usable fallback (the legacy
+    // IndexedDB still has the same key with the same shape).
+    //
+    // Convert that specific failure shape into `return null` with a
+    // structured warning. Sphere.loadIdentityFromStorage will then
+    // consult its `fallbackStorage` if one was supplied; consumers
+    // without a fallback see "key not found" instead of a hard crash
+    // — which preserves the previous-behavior intent ("Profile read
+    // couldn't satisfy this") without nuking the boot.
+    //
+    // All OTHER throws (decode errors, decryption failures, unknown
+    // I/O errors) still propagate — only the specific "block missing
+    // from local store" signature is downgraded.
+    let encrypted: Uint8Array | null;
+    try {
+      encrypted = await this.readEnvelopePayload(translated.profileKey);
+    } catch (err) {
+      const lostCid = extractLostHeadCid(err);
+      if (lostCid !== null) {
+        logger.warn(
+          'ProfileStorage',
+          `[LOAD-BLOCK-MISSING] Local Helia blockstore is missing block ${lostCid} ` +
+            `for key="${translated.profileKey}". Returning null so a caller with a ` +
+            `fallback storage can attempt to satisfy the read from legacy cache. ` +
+            `Run an OpLog auto-reset (write a fresh entry) to clear the dangling head.`,
+        );
+        return null;
+      }
+      throw err;
+    }
     if (encrypted === null) {
       return null;
     }
