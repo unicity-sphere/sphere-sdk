@@ -1,17 +1,20 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 /**
- * Issue #312 — PaymentsModule.send() offline gate.
+ * Issue #312 — PaymentsModule.send() advisory connectivity hint.
  *
- * The send-path is gated by a callback wired by `Sphere.initializeModules()`
- * that returns `sphere.connectivity.status().aggregator`. When the gate
- * returns `'down'`, send refuses with `SphereError('OFFLINE', { which:
- * 'aggregator' })` BEFORE any state mutation (no aggregator call, no
- * reservation, no Nostr publish).
+ * The send-path reads a callback wired by `Sphere.initializeModules()`
+ * that returns `sphere.connectivity.status().aggregator`. The hint is
+ * ADVISORY: a `'down'` reading is logged but does NOT refuse the send.
+ * The state-transition-sdk transport is the authoritative health
+ * signal — it throws `JsonRpcNetworkError` on real transport failures,
+ * and ST-SDK exposes no health/ping API so any preflight refuse is a
+ * Sphere-SDK invention that risks blocking sends a recovered
+ * aggregator would have accepted.
  *
- * This test exercises the gate at the public entry point. We do NOT
- * fully initialize the module (which would require a real
- * StateTransitionClient) — the gate throws BEFORE `ensureInitialized`
- * even matters because we install our own `_initialized` flag.
+ * Prior behavior (throwing `SphereError('OFFLINE')` on `'down'`) was
+ * removed because a transient testnet aggregator outage propagated to
+ * a hard-refuse and broke CLI soak §C.2 (invoice pay) and the
+ * browser-side send path.
  */
 
 import { describe, it, expect, vi } from 'vitest';
@@ -37,39 +40,40 @@ function buildStubModule(): PaymentsModule {
   return module;
 }
 
-describe('PaymentsModule offline gate (Issue #312)', () => {
+describe('PaymentsModule advisory gate (Issue #312)', () => {
   const REQUEST = {
     recipient: '@bob',
     coinId: 'UCT',
     amount: '1000000',
   } as const;
 
-  it('throws OFFLINE without side effects when gate returns down', async () => {
+  it("proceeds past the gate when it returns 'down' (advisory only)", async () => {
     const module = buildStubModule();
     // Wire the connectivity gate as if Sphere did
     const gateFn = vi.fn(() => 'down' as const);
     (module as any).configureConnectivityGate(gateFn);
-    // Spy on the first downstream call inside send() after the gate —
-    // `maybeEmitCapabilityWarning` is the first inner method invoked.
-    // If the gate works correctly, this MUST NOT be called.
-    const downstreamSpy = vi.spyOn(module as any, 'maybeEmitCapabilityWarning' as any).mockImplementation(() => {
-      throw new Error('maybeEmitCapabilityWarning should not have been called');
-    });
+    // Spy on the first downstream call inside send() after the gate.
+    // The advisory hint MUST NOT short-circuit the dispatcher — this
+    // spy MUST be invoked.
+    const downstreamSpy = vi.spyOn(
+      module as any,
+      'maybeEmitCapabilityWarning' as any,
+    );
     let caught: unknown;
     try {
       await module.send(REQUEST);
     } catch (e) {
       caught = e;
     }
-    expect(caught).toBeDefined();
-    expect(isSphereError(caught)).toBe(true);
-    expect((caught as any).code).toBe('OFFLINE');
-    // SphereError redaction layer copies the cause object into `context`.
-    expect((caught as any).context).toEqual({ which: 'aggregator' });
     // Gate was called once
     expect(gateFn).toHaveBeenCalledTimes(1);
-    // No downstream side effect
-    expect(downstreamSpy).not.toHaveBeenCalled();
+    // Downstream WAS invoked — the send proceeded.
+    expect(downstreamSpy).toHaveBeenCalled();
+    // Whatever error eventually surfaces, it MUST NOT be the legacy
+    // 'OFFLINE' refuse (which is what we just removed).
+    if (isSphereError(caught)) {
+      expect((caught as any).code).not.toBe('OFFLINE');
+    }
   });
 
   it('proceeds past the gate when gate returns up', async () => {
@@ -151,10 +155,17 @@ describe('PaymentsModule offline gate (Issue #312)', () => {
 
   it('can be unwired via configureConnectivityGate(null)', async () => {
     const module = buildStubModule();
-    (module as any).configureConnectivityGate(() => 'down' as const);
-    // Confirm it gates first
-    await expect(module.send(REQUEST)).rejects.toThrow(/offline/i);
-    // Now unwire
+    const gateFn = vi.fn(() => 'down' as const);
+    (module as any).configureConnectivityGate(gateFn);
+    // First call: gate is invoked but advisory only — send proceeds.
+    try {
+      await module.send(REQUEST);
+    } catch {
+      // Downstream error from the partially-stubbed module is expected;
+      // we only care that the gate was consulted.
+    }
+    expect(gateFn).toHaveBeenCalledTimes(1);
+    // Now unwire — subsequent sends MUST NOT touch the gate.
     (module as any).configureConnectivityGate(null);
     let caught: unknown;
     try {
@@ -162,6 +173,8 @@ describe('PaymentsModule offline gate (Issue #312)', () => {
     } catch (e) {
       caught = e;
     }
+    // Still no extra gate calls after unwiring.
+    expect(gateFn).toHaveBeenCalledTimes(1);
     if (isSphereError(caught)) {
       expect((caught as any).code).not.toBe('OFFLINE');
     }

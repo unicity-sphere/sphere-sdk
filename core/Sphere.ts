@@ -2318,11 +2318,13 @@ export class Sphere {
    * `'connectivity:offline-degraded'` on the Sphere event bus on every
    * transition — bind via `sphere.on(...)` for the UI banner.
    *
-   * Send-path gating: `payments.send()` refuses with
-   * `SphereError('OFFLINE', { which: 'aggregator' })` (no state mutation)
-   * when `status().aggregator === 'down'`. The `'degraded'` state is
-   * allowed — the SDK's retry layer handles slow / partially-failing
-   * aggregators.
+   * Advisory only: `payments.send()` reads this status once at entry and
+   * logs a warning if `status().aggregator === 'down'`, but DOES NOT
+   * refuse the send. The state-transition-sdk transport is the
+   * authoritative health signal — it surfaces `JsonRpcNetworkError` on
+   * real transport failures, and ST-SDK exposes no health/ping API,
+   * so any preflight refuse is a Sphere-SDK invention that risks
+   * blocking sends a recovered aggregator would have accepted.
    *
    * Returns a no-op stub if accessed before `initializeModules()` ran —
    * production callers go through `Sphere.init()`, which calls

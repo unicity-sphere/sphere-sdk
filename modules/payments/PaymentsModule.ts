@@ -1741,18 +1741,19 @@ export class PaymentsModule {
   private readonly parsedTokenCache: Map<string, ParsedTokenEntry> = new Map();
 
   /**
-   * Issue #312 — send-path offline gate. When wired, every `send()` call
-   * reads this getter once at the very top of the public entry point and
-   * throws `SphereError('OFFLINE', { which: 'aggregator' })` (no state
-   * mutation) if the gate reports `'down'`. `'degraded'` / `'unknown'` /
-   * `'up'` all pass through — the SDK's retry layer absorbs degraded
-   * states, and we MUST NOT block sends pre-first-probe (the design
-   * constraint that `Sphere.init()` resolves before the manager has
-   * confirmed reachability).
+   * Issue #312 — advisory connectivity hint (NOT a send-path gate). When
+   * wired, every `send()` call reads this getter once at the top of the
+   * public entry point. A `'down'` return is LOGGED as a warning but
+   * does not block the send — the state-transition-sdk pattern is to
+   * call the real op and let transport surface a `JsonRpcNetworkError`
+   * on failure. ST-SDK has no health/ping API, so any preflight probe
+   * is a Sphere-SDK invention without an upstream contract; refusing
+   * preemptively would block sends that the aggregator would actually
+   * accept (e.g. recovery between probe and submit).
    *
    * Wired by `Sphere.initializeModules()` via
-   * {@link configureConnectivityGate}. Null = unwired (no gating); the
-   * module behaves exactly as it did pre-#312.
+   * {@link configureConnectivityGate}. Null = unwired (no advisory log);
+   * the module behaves exactly as it did pre-#312.
    */
   private _connectivityGate: (() => 'up' | 'down' | 'degraded' | 'unknown') | null = null;
 
@@ -1908,23 +1909,20 @@ export class PaymentsModule {
   }
 
   /**
-   * Issue #312 — wire the offline-mode send-path gate.
+   * Issue #312 — wire the advisory connectivity hint.
    *
    * Sphere calls this once during `initializeModules()` with a getter
    * that reads `sphere.connectivity.status().aggregator`. The getter is
    * invoked once per `send()` call at the very top of the public entry
-   * point, BEFORE any state mutation, and a `'down'` return triggers a
-   * `SphereError('OFFLINE', { which: 'aggregator' })` throw.
+   * point. A `'down'` return is LOGGED as a warning; it does NOT abort
+   * the send. The real op (submitCommitment via state-transition-sdk)
+   * is the authoritative health signal — if the aggregator is truly
+   * unreachable, transport throws `JsonRpcNetworkError` and the SDK's
+   * retry/recovery layer handles it.
    *
-   * Pass `null` to unwire (the module behaves exactly as pre-#312:
-   * no gating). Wired callers MAY replace the gate at runtime — the
-   * latest call wins.
-   *
-   * Steelman: the gate is a getter, not a snapshot, so a send that
-   * starts under `'up'` and transitions to `'down'` mid-send is NOT
-   * cancelled. That is by design — the aggregator retry layer absorbs
-   * mid-flight transitions, and we MUST NOT throw `OFFLINE` after
-   * partial state mutation (the no-side-effect contract).
+   * Pass `null` to unwire (no advisory log; exactly as pre-#312).
+   * Wired callers MAY replace the gate at runtime — the latest call
+   * wins.
    */
   configureConnectivityGate(
     fn: (() => 'up' | 'down' | 'degraded' | 'unknown') | null,
@@ -5519,24 +5517,23 @@ export class PaymentsModule {
   ): Promise<TransferResult> {
     this.ensureInitialized();
 
-    // Issue #312 — offline-mode send-path gate. BEFORE any state mutation
-    // (no aggregator call, no reservation, no Nostr publish), refuse the
-    // send if the aggregator backend is observed `'down'` by the
-    // connectivity manager. `'degraded'` and `'unknown'` pass through;
-    // the SDK's retry layer handles slow / partially-failing aggregators
-    // and we MUST NOT block sends pre-first-probe (the design constraint
-    // that init() resolves before reachability is confirmed). The gate
-    // is read once here, NOT polled mid-send — see the rationale in
-    // `configureConnectivityGate`.
+    // Issue #312 — advisory offline-mode signal. The connectivity gate is
+    // a hint from the manager; ALL states pass through to the dispatcher.
+    // We MUST NOT preemptively refuse sends based on a probe: the
+    // state-transition-sdk pattern is to call the real op and surface a
+    // `JsonRpcNetworkError` on transport failure. A momentarily-sick
+    // aggregator that recovers between probe and submit would otherwise
+    // be needlessly blocked here, and ST-SDK exposes no health/ping
+    // API so any preflight probe is a Sphere-SDK invention with no
+    // upstream contract behind it. We log when the gate reads `'down'`
+    // for operator visibility, then let the real op decide.
     if (this._connectivityGate) {
       let gateValue: 'up' | 'down' | 'degraded' | 'unknown' = 'unknown';
       try {
         gateValue = this._connectivityGate();
       } catch (err) {
         // A throwing gate must not break sends. Best-effort: treat as
-        // 'unknown' (pass-through). The wallet's send-side retry layer
-        // remains the authoritative recovery path if the aggregator
-        // truly is down.
+        // 'unknown' (pass-through).
         logger.warn(
           'PaymentsModule',
           `Connectivity gate threw (treating as 'unknown'): ${err instanceof Error ? err.message : String(err)}`,
@@ -5544,10 +5541,9 @@ export class PaymentsModule {
         gateValue = 'unknown';
       }
       if (gateValue === 'down') {
-        throw new SphereError(
-          'Aggregator is offline — send refused',
-          'OFFLINE',
-          { which: 'aggregator' },
+        logger.warn(
+          'PaymentsModule',
+          "Connectivity gate reports aggregator 'down'; proceeding with send and letting transport surface any real failure",
         );
       }
     }
