@@ -157,10 +157,22 @@ async function drainGenerator(
 /**
  * True when the thrown value is a "block not present" signal that
  * upstream callers expect to surface as `undefined` (NOT as an
- * exception). Covers both the canonical interface-store
- * `NotFoundError` (`name === 'NotFoundError'`, `code === 'ERR_NOT_FOUND'`)
- * AND the Helia `InvalidConfigurationError` thrown when
- * `blockBrokers: []` and the block isn't local.
+ * exception). Covers:
+ *   - the canonical interface-store `NotFoundError` (`name ===
+ *     'NotFoundError'`, `code === 'ERR_NOT_FOUND'`);
+ *   - the Helia `InvalidConfigurationError` thrown when
+ *     `blockBrokers: []` and the block isn't local;
+ *   - **Issue #330** — `PutFailedError` thrown by `blockstore-idb`
+ *     when an IDB read errors out. The library wraps any IDB-side
+ *     throw inside its `getAll()` generator as a `PutFailedError`
+ *     (`name === 'PutFailedError'`, `code === 'ERR_PUT_FAILED'`)
+ *     even though the throw came from a GET path —
+ *     `blockstore-idb@4.0.1` `dist/src/index.js:88`. Since this
+ *     matcher is consulted ONLY inside `wrappedGet`, treating
+ *     `PutFailedError` as a miss is safe: a true put failure cannot
+ *     surface through a get's error path, and the alternative is a
+ *     hard throw that breaks OrbitDB OpLog replay on transient IDB
+ *     errors — exactly the failure mode #330 sought to fix.
  */
 function isMissError(err: unknown): boolean {
   if (err === null || typeof err !== 'object') return false;
@@ -169,7 +181,9 @@ function isMissError(err: unknown): boolean {
     e.name === 'NotFoundError' ||
     e.code === 'ERR_NOT_FOUND' ||
     e.name === 'InvalidConfigurationError' ||
-    e.code === 'ERR_NO_BLOCK_BROKERS'
+    e.code === 'ERR_NO_BLOCK_BROKERS' ||
+    e.name === 'PutFailedError' ||
+    e.code === 'ERR_PUT_FAILED'
   );
 }
 

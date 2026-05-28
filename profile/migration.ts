@@ -49,6 +49,39 @@ const MIGRATION_PHASE_KEY = 'migration.phase';
 const MIGRATION_STARTED_AT_KEY = 'migration.startedAt';
 
 /**
+ * Issue #330 — marker key written into the LEGACY token storage when
+ * migration step 5c completes, in lieu of wiping it. Signals that the
+ * legacy token DB is post-migration and should be treated as a read-
+ * only fallback (not as the live token store). The marker carries the
+ * migration completion timestamp for forensics.
+ *
+ * Pre-#330 step 5c wiped the legacy token DB entirely. Post-#330 we
+ * keep the bytes in place so the runtime read fallback
+ * (`ProfileTokenStorageProvider.setFallbackTokenStorage`) can recover
+ * tokens whose Profile blockstore copies are lost (memory-blockstore
+ * eviction + gateway 404 = the failure mode in #330).
+ */
+const LEGACY_MIGRATED_MARKER_KEY = 'migration.migratedAt';
+
+/**
+ * Issue #330 — public re-export of the legacy-migrated marker key.
+ *
+ * Factories and consumer apps can probe `legacyStorage.get(...)` for
+ * this key to auto-wire a `fallbackTokenStorage` when the wallet was
+ * migrated from a pre-Profile layout. Returns the migration-completion
+ * timestamp (ms since epoch, as a string) when present, null when
+ * the wallet either was never migrated or is a fresh Profile wallet.
+ *
+ * Storage shape: written via `legacyStorage.set(KEY, String(ts))` in
+ * `profile/migration.ts` step 5c. The KV provider prefixes with
+ * `STORAGE_PREFIX` ('sphere_') so the on-disk key is typically
+ * `sphere_migration.migratedAt`. Pass the unprefixed name to
+ * `StorageProvider.get` — providers do the prefix translation
+ * internally.
+ */
+export const LEGACY_MIGRATED_MARKER = LEGACY_MIGRATED_MARKER_KEY;
+
+/**
  * Regex pattern matching legacy IPFS sequence keys.
  * These indicate that the wallet has previously synced via IPFS/IPNS.
  */
@@ -771,7 +804,13 @@ export class ProfileMigration {
       const stripped = key.startsWith(STORAGE_PREFIX)
         ? key.slice(STORAGE_PREFIX.length)
         : key;
-      if (stripped === MIGRATION_PHASE_KEY || stripped === MIGRATION_STARTED_AT_KEY) {
+      // Issue #330 — also preserve the legacy-migrated marker so a
+      // defensive re-run of migration does not nuke the fallback signal.
+      if (
+        stripped === MIGRATION_PHASE_KEY ||
+        stripped === MIGRATION_STARTED_AT_KEY ||
+        stripped === LEGACY_MIGRATED_MARKER_KEY
+      ) {
         continue;
       }
 
@@ -786,17 +825,30 @@ export class ProfileMigration {
       }
     }
 
-    // --- 5c. Clear legacy token storage ---
-    if (legacyTokenStorage.clear) {
-      try {
-        await legacyTokenStorage.clear();
-        this.log('Legacy token storage cleared');
-      } catch (err) {
-        this.log(
-          'Failed to clear legacy token storage:',
-          err instanceof Error ? err.message : String(err),
-        );
-      }
+    // --- 5c. Mark legacy token storage as migrated (preserve, don't wipe) ---
+    //
+    // Issue #330 — pre-fix this step called `legacyTokenStorage.clear()`
+    // which dropped the entire legacy token IDB. That made the legacy
+    // DB unusable as a fallback when the Profile blockstore loses
+    // tokens (the memory-only-blockstore + gateway-eviction race
+    // documented in #330). We now keep the bytes and write a marker
+    // alongside, so the runtime can wire the legacy DB as a read-only
+    // fallback (see `ProfileTokenStorageProvider.setFallbackTokenStorage`
+    // and `SphereLoadOptions.fallbackTokenStorage`).
+    //
+    // The marker is stored on the LEGACY KV store (passed in via the
+    // existing `legacyStorage` arg in step 5b's caller chain), not on
+    // the legacy token store — token stores don't have a generic kv
+    // surface. Callers that need to read the marker do so via the
+    // legacy `StorageProvider`. Token data persists; nothing is wiped.
+    try {
+      await legacyStorage.set(LEGACY_MIGRATED_MARKER_KEY, String(Date.now()));
+      this.log('Legacy token storage marked as migrated (preserved as fallback)');
+    } catch (err) {
+      this.log(
+        'Failed to write legacy migrated marker (non-fatal — token data still preserved):',
+        err instanceof Error ? err.message : String(err),
+      );
     }
 
     // --- 5d. Attempt to unpin last known IPFS CID (best-effort) ---

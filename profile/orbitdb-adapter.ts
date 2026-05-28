@@ -385,6 +385,89 @@ export class OrbitDbAdapter implements ProfileDatabase {
           // (cross-process recovery will not work). Logged via the host's
           // event surface elsewhere.
         }
+      } else if (isBrowserEnvironment()) {
+        // Issue #330 — install an IndexedDB-backed Helia blockstore in
+        // the browser. Without this, Helia v6 falls back to its default
+        // `MemoryBlockstore` and EVERY OpLog block (`helia.blockstore.put`
+        // from OrbitDB) and CAR block (`pinSingleBlock` write-back fast-
+        // path) lives only in tab memory. OrbitDB's level state IS
+        // persisted to IndexedDB, so after a page reload the head CID
+        // pointer survives but the block bytes it references are gone —
+        // every subsequent append fails with the same error, forever
+        // (the symptom described in #330 and called out verbatim in the
+        // JSDoc of `resetAndReconnect` below).
+        //
+        // The `helia-blockstore-pin-shim` (installed below) auto-pins
+        // every written block via `helia.pins.add(cid)` so the new
+        // IDBBlockstore retains them across reloads. The pin shim's
+        // defence against eviction is meaningful only against a
+        // persistent backing store; pinning a MemoryBlockstore is a
+        // no-op against reload.
+        //
+        // We use the same major as `blockstore-fs` (`^4.0.1`) so the
+        // `interface-blockstore` contract aligns with Helia v6's
+        // expectation. The DB name defaults to `'sphere-helia-blocks'`
+        // and is overridable via `config.browserBlockstorePath` for
+        // callers who want per-wallet isolation.
+        // Use a STATIC-string dynamic import (no `as string` cast). The
+        // `as string` form in the Node `blockstore-fs` branch above
+        // tells tsup / consumer bundlers to leave the import alone as
+        // a runtime expression — which is fine for Node where the
+        // package is on the filesystem. For browser bundling we want
+        // tsup AND consumer bundlers (Vite / Webpack / esbuild) to
+        // statically discover `blockstore-idb` and include it in the
+        // output bundle. The string-literal form gives the bundler
+        // a deterministic target.
+        try {
+          const blockstoreIdbModule: any = await import('blockstore-idb');
+          const IDBBlockstoreCtor =
+            blockstoreIdbModule.IDBBlockstore ?? blockstoreIdbModule.default?.IDBBlockstore;
+          if (typeof IDBBlockstoreCtor === 'function') {
+            const dbName =
+              typeof config.browserBlockstorePath === 'string' &&
+              config.browserBlockstorePath.length > 0
+                ? config.browserBlockstorePath
+                : 'sphere-helia-blocks';
+            const idbBlockstore = new IDBBlockstoreCtor(dbName);
+            // blockstore-idb requires `open()` to be awaited before the
+            // store can serve get/put. Wrap with a generous deadline so
+            // a stuck IDB upgrade (sibling tab holding an older version)
+            // does not hang the entire wallet init. On timeout we fall
+            // through to MemoryBlockstore — same as if the dependency
+            // had been missing.
+            if (typeof idbBlockstore.open === 'function') {
+              await Promise.race([
+                idbBlockstore.open(),
+                new Promise<never>((_, reject) =>
+                  setTimeout(
+                    () => reject(new Error('blockstore-idb open() timed out after 5_000ms')),
+                    5_000,
+                  ),
+                ),
+              ]);
+            }
+            heliaOptions.blockstore = idbBlockstore;
+          }
+        } catch (err) {
+          // blockstore-idb not installed, open() rejected, or open()
+          // exceeded the 5s deadline — fall back to Helia's
+          // MemoryBlockstore default. The wallet still functions for
+          // the lifetime of this tab but loses durability across
+          // reloads (the pre-#330 behaviour). Log loudly so the
+          // operator can investigate; the pin shim that follows will
+          // still attempt pin, but pinning memory is a no-op.
+          //
+          // Suppress logger import to keep the failure path small; the
+          // caller's outer connect()/init() telemetry will reflect the
+          // degraded mode via subsequent `storage:error` events.
+          if (typeof console !== 'undefined' && console.warn) {
+            console.warn(
+              '[OrbitDB] IDBBlockstore install failed; falling back to Helia MemoryBlockstore. ' +
+                'Browser wallet durability across reloads is degraded. ' +
+                `cause=${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
       }
 
       // Build libp2p config with gossipsub if available

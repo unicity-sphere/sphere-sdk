@@ -660,8 +660,14 @@ describe('ProfileMigration', () => {
       const profileStorage = createMockProfileStorage();
       const profileTokenStorage = createMockProfileTokenStorage(null);
 
-      // Track what gets called on legacy storage and token storage
+      // Track what gets called on legacy storage and token storage.
+      // Issue #330: step 5c no longer calls `legacyTokenStorage.clear()`
+      // — the legacy token DB is preserved as a read-only fallback and
+      // step 5c instead writes a `migration.migratedAt` marker into
+      // `legacyStorage` (the KV store). We assert both: legacy KV is
+      // touched, AND legacy token clear is NOT called.
       const removeSpy = vi.spyOn(legacyStorage, 'remove');
+      const setSpy = vi.spyOn(legacyStorage, 'set');
       const clearSpy = vi.spyOn(legacyTokenStorage, 'clear' as any);
 
       await migration.migrate(
@@ -671,11 +677,26 @@ describe('ProfileMigration', () => {
         profileTokenStorage as any,
       );
 
-      // Cleanup should only call legacyStorage.remove() (KV store)
-      // and legacyTokenStorage.clear() -- neither of which touches
-      // SphereVestingCacheV5 (a separate IndexedDB database)
+      // Cleanup touches legacyStorage.remove() (5b wipe of legacy KV)
+      // AND legacyStorage.set() for the post-#330 migrated marker (5c).
+      // Neither path touches SphereVestingCacheV5.
       expect(removeSpy).toHaveBeenCalled();
-      expect(clearSpy).toHaveBeenCalled();
+      expect(setSpy).toHaveBeenCalled();
+
+      // Issue #330 — step 5c MUST NOT wipe the legacy token storage.
+      // Pre-#330 behaviour was `legacyTokenStorage.clear()`; we now
+      // preserve the bytes so they can serve as a runtime fallback
+      // when the Profile blockstore loses tokens (memory-blockstore
+      // eviction + gateway 404 = #330's symptom).
+      expect(clearSpy).not.toHaveBeenCalled();
+
+      // The post-#330 migrated marker is written to the KV under
+      // `migration.migratedAt` (with the project storage prefix).
+      const markerWritten = setSpy.mock.calls.some(
+        (call) =>
+          typeof call[0] === 'string' && call[0].includes('migration.migratedAt'),
+      );
+      expect(markerWritten).toBe(true);
 
       // Verify no call references VestingClassifier or its DB
       for (const call of removeSpy.mock.calls) {

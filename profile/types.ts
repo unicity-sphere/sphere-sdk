@@ -130,6 +130,19 @@ export interface OrbitDbConfig {
   readonly dbNameOverride?: string;
   /** Local storage directory for OrbitDB data (Node.js only) */
   readonly directory?: string;
+  /**
+   * Issue #330 — IndexedDB database name for Helia's blockstore in the
+   * browser. When `directory` is not set and the runtime is a browser,
+   * the adapter installs `blockstore-idb` so OpLog + CAR blocks persist
+   * across page reloads (the pre-fix default was Helia's
+   * `MemoryBlockstore`, which evaporates on tab unload — root cause
+   * of #330). Defaults to `'sphere-helia-blocks'` when omitted; set
+   * a per-wallet name (e.g. `sphere-helia-blocks-<addressId>`) for
+   * full isolation between wallets sharing one origin.
+   *
+   * Ignored on Node (FsBlockstore is used instead).
+   */
+  readonly browserBlockstorePath?: string;
   /** libp2p bootstrap peers for peer discovery */
   readonly bootstrapPeers?: string[];
   /** Enable libp2p pubsub for replication (default: true) */
@@ -232,6 +245,30 @@ export interface ProfileConfig {
    * for full semantics.
    */
   readonly flushVerificationDeadlineMs?: number;
+  /**
+   * Issue #330 — inline durability gate on `publishAggregatorPointerBestEffort`.
+   *
+   * When set to a positive number, the publish path performs an inline
+   * HEAD-verify of the just-published snapshot CID against the configured
+   * IPFS gateways *before* clearing `pendingPublishCid`. If HEAD-verify
+   * does not confirm the CID within the deadline, the marker is kept
+   * (publish is treated as transient-failure for retry purposes) and a
+   * `storage:pending-publish` event fires.
+   *
+   * Distinct from `flushVerificationDeadlineMs` (which PR #272 moved off
+   * the critical path to background): this gate is on the marker-clear,
+   * not the flush completion. It enforces "the pointer never advertises
+   * a CID that isn't durably remote." The at-least-once Nostr ack gate
+   * is unaffected — the flush still completes; only the pending-publish
+   * retry marker is held until durability is confirmed.
+   *
+   * Default: 0 (no gate, preserves pre-#330 behaviour). The wallet
+   * factories (`createBrowserProfileProviders`, `createNodeProfileProviders`)
+   * override to a sensible production value (5 000 ms).
+   *
+   * Pass `0` to opt out (tests, dev fixtures, stub pointers).
+   */
+  readonly pointerPublishDurabilityGateMs?: number;
   /**
    * Item #15 Phase F — retention window (in ms) for OUTBOX/SENT
    * tombstones before they are GC'd at snapshot-build time. Tombstones
@@ -575,6 +612,22 @@ export interface ProfileTokenStorageProviderOptions {
    * cross-device recovery surface exists to verify).
    */
   readonly flushVerificationDeadlineMs?: number;
+  /**
+   * Issue #330 — inline durability gate on `publishAggregatorPointerBestEffort`.
+   * See `ProfileConfig.pointerPublishDurabilityGateMs` for full semantics.
+   *
+   * Default when constructed via `createProfileProviders`: **5 000** (5s,
+   * production contract; closes the #330 cross-device gap where the
+   * pointer can advertise a CID that the operator gateway hasn't yet
+   * propagated). Default when the provider is constructed directly
+   * without the factory: **0** (off) — same compatibility rationale as
+   * `flushVerificationDeadlineMs`.
+   *
+   * Set to `0` to disable inline gate entirely; the background verifier
+   * (`flushVerificationDeadlineMs`) still runs and emits
+   * `storage:durability-deferred` on failure.
+   */
+  readonly pointerPublishDurabilityGateMs?: number;
   /** Enable debug logging */
   readonly debug?: boolean;
 }
