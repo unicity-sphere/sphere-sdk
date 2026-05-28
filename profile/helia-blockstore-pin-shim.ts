@@ -70,6 +70,18 @@ export interface HeliaPinsLike {
 /** Minimal structural shape of the Helia v6+ blockstore. */
 export interface HeliaBlockstoreLike {
   put?: (cid: unknown, val: unknown, options?: unknown) => unknown;
+  /**
+   * Helia v6's batch ingest API. Used by Bitswap / NetworkedStorage for
+   * replication and by future OrbitDB Sync paths. Source yields
+   * `{cid, block}` pairs; the implementation persists each and yields
+   * the CID. Review fix (#311 PR #317): we must wrap this in addition
+   * to `put`, otherwise batch-ingested blocks (the very ones that
+   * arrive via Bitswap replication) bypass the pin defense entirely.
+   */
+  putMany?: (
+    source: AsyncIterable<{ cid: unknown; block: unknown }>,
+    options?: unknown,
+  ) => AsyncIterable<unknown>;
 }
 
 /** Minimal structural shape of the parts of the Helia instance we touch. */
@@ -188,7 +200,7 @@ export function installHeliaBlockstorePinShim(
     // Schedule the pin fire-and-forget. Pin attempts on non-CID inputs
     // are skipped (logged once) so a misconfigured caller does not
     // wedge the put path.
-    schedulePin(cid, pins, handle, putResult)
+    schedulePin(cid, pins, putResult)
       .then((outcome) => {
         if (outcome === 'pinned') {
           pinSucceeded++;
@@ -209,6 +221,46 @@ export function installHeliaBlockstorePinShim(
     return putResult;
   };
 
+  // Review fix (PR #317 finding F1) — wrap `putMany` so batch-ingested
+  // blocks (Bitswap replication / NetworkedStorage / future OrbitDB
+  // Sync paths) also land in the pin set. Pre-fix the shim only
+  // covered single `put` calls; any block that arrives via batch
+  // bypassed defense #1 entirely.
+  //
+  // Helia v6's contract: `putMany(source, options) => AsyncIterable<CID>`
+  // — each yielded CID has been persisted by the time it's yielded.
+  // We wrap the iterable to pin each yielded CID, then forward the
+  // CID downstream so existing callers see the same shape.
+  if (typeof blockstore.putMany === 'function') {
+    const originalPutMany = blockstore.putMany.bind(blockstore);
+    blockstore.putMany = function pinningPutMany(
+      source: AsyncIterable<{ cid: unknown; block: unknown }>,
+      options?: unknown,
+    ): AsyncIterable<unknown> {
+      const upstream = originalPutMany(source, options);
+      // Return an async generator that pins each yielded CID before
+      // forwarding it. Pin is fire-and-forget per CID so a slow pin
+      // doesn't stall the iterator chain.
+      return (async function* pinningPutManyGen() {
+        for await (const yieldedCid of upstream) {
+          pinAttempted++;
+          // Pin in the background; the put is already complete by
+          // the time the iterator yielded the CID.
+          schedulePin(yieldedCid, pins, Promise.resolve())
+            .then((outcome) => {
+              if (outcome === 'pinned') pinSucceeded++;
+              else if (outcome === 'skipped') pinSkipped++;
+              else pinFailed++;
+            })
+            .catch(() => {
+              pinFailed++;
+            });
+          yield yieldedCid;
+        }
+      })();
+    };
+  }
+
   return handle;
 
   // ---- inline helpers ----
@@ -216,7 +268,6 @@ export function installHeliaBlockstorePinShim(
   async function schedulePin(
     cid: unknown,
     pinsApi: HeliaPinsLike,
-    h: PinShimHandle,
     putResult: unknown,
   ): Promise<'pinned' | 'failed' | 'skipped'> {
     // Wait for the underlying put to settle. If the put rejected we
@@ -269,7 +320,11 @@ export function installHeliaBlockstorePinShim(
       } else if (result && typeof (result as { then?: unknown }).then === 'function') {
         await result;
       }
-      (h.getPinnedCids() as string[]).push?.(cidStr); // no-op for frozen arrays
+      // Review fix (PR #317 finding F4) — dropped a dead line that
+      // attempted `(h.getPinnedCids() as string[]).push?.(cidStr)`.
+      // `getPinnedCids()` returns `Array.from(pinnedCids)` — a fresh
+      // throwaway array — so the push did nothing. The actual
+      // persistence is `pinnedCids.add(cidStr)` below.
       pinnedCids.add(cidStr);
       return 'pinned';
     } catch (err) {
