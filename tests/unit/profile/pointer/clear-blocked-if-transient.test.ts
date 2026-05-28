@@ -175,4 +175,89 @@ describe('ProfilePointerLayer.clearBlockedIfTransient (issue #319)', () => {
     expect(second.cleared).toBe(false);
     expect(second.reason).toBeUndefined();
   });
+
+  it('refuses to clear when a concurrent writer flipped to a persistent reason between reads (TOCTOU)', async () => {
+    // Steelman²³: between the initial readBlockedState and the
+    // destructive clearBlockedFlag, a sibling process may write a
+    // persistent reason. Simulate that race by patching the underlying
+    // store so the SECOND read returns a persistent reason.
+    await setBlocked(fs, 'retry_exhausted');
+
+    // Patch FlagStore.get to return the persistent record on the
+    // SECOND call only. The first call returns the real (transient)
+    // record; the second call (our re-read) returns the simulated
+    // sibling write.
+    const realGet = (fs as unknown as { get: (k: string) => Promise<string | null> }).get.bind(fs);
+    let callCount = 0;
+    (fs as unknown as { get: (k: string) => Promise<string | null> }).get = async (k: string) => {
+      callCount += 1;
+      if (callCount === 2 && k === 'blocked') {
+        // Sibling wrote a persistent reason between our reads.
+        return JSON.stringify({
+          blocked: true,
+          reason: 'marker_corrupt',
+          setAt: Date.now(),
+        });
+      }
+      return realGet(k);
+    };
+
+    const result = await layer.clearBlockedIfTransient();
+    expect(result.cleared).toBe(false);
+    expect(result.reason).toBe('marker_corrupt');
+    // Restore for the next assertion.
+    (fs as unknown as { get: (k: string) => Promise<string | null> }).get = realGet;
+    // The persistent reason is what's now persisted — the original
+    // retry_exhausted record was logically superseded by the sibling
+    // write (the test simulates that).
+  });
+
+  it('refuses to clear when the reason changed to a different transient reason between reads', async () => {
+    // Steelman²³: edge case — sibling wrote a DIFFERENT transient
+    // reason between our reads. We must report the current reason
+    // (not the stale one we initially observed) so callers see the
+    // up-to-date state.
+    await setBlocked(fs, 'retry_exhausted');
+
+    const realGet = (fs as unknown as { get: (k: string) => Promise<string | null> }).get.bind(fs);
+    let callCount = 0;
+    (fs as unknown as { get: (k: string) => Promise<string | null> }).get = async (k: string) => {
+      callCount += 1;
+      if (callCount === 2 && k === 'blocked') {
+        return JSON.stringify({
+          blocked: true,
+          reason: 'network_timeout',
+          setAt: Date.now(),
+        });
+      }
+      return realGet(k);
+    };
+
+    const result = await layer.clearBlockedIfTransient();
+    expect(result.cleared).toBe(false);
+    expect(result.reason).toBe('network_timeout');
+    (fs as unknown as { get: (k: string) => Promise<string | null> }).get = realGet;
+  });
+
+  it('handles concurrent clears gracefully — both calls converge on cleared state', async () => {
+    // Both calls observe the same transient reason throughout (no
+    // sibling-write race), so both clear without error. The final
+    // state is unambiguously cleared. The mock store has no
+    // compare-and-swap, so we don't assert which call "won"; the
+    // correctness property is the absence of an incorrect persistent-
+    // reason clobber, which is verified by the dedicated TOCTOU test
+    // above.
+    await setBlocked(fs, 'retry_exhausted');
+    const results = await Promise.all([
+      layer.clearBlockedIfTransient(),
+      layer.clearBlockedIfTransient(),
+    ]);
+    // Both reads observed the same transient reason → both proceed
+    // to clear. Neither throws.
+    for (const r of results) {
+      expect(r.cleared).toBe(true);
+      expect(r.reason).toBe('retry_exhausted');
+    }
+    expect((await isBlocked(fs)).blocked).toBe(false);
+  });
 });

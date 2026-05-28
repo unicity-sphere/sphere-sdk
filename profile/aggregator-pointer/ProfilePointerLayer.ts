@@ -984,6 +984,45 @@ export class ProfilePointerLayer {
     if (!reason || !isTransientRecoveryReason(reason)) {
       return { cleared: false, reason };
     }
+    // Steelman²³: re-read inside the critical section just before the
+    // destructive clear. Two failure modes this defends against:
+    //
+    //   (1) Bare TOCTOU. A sibling process may have written a
+    //       PERSISTENT reason (e.g. `marker_corrupt`, `aggregator_rejected`,
+    //       `rejected`, `protocol_error`) between our initial read and
+    //       this point. The earlier read would surface the older
+    //       transient reason; clearing the record now would silently
+    //       wipe the persistent signal.
+    //
+    //   (2) Idempotency masking. `setBlocked` is idempotent — once a
+    //       record exists, subsequent calls SKIP overwriting. So if
+    //       the wallet was blocked with `retry_exhausted` and a
+    //       concurrent publish path then tried to flag `marker_corrupt`,
+    //       the persistent reason WAS dropped at write time. Our
+    //       initial read sees only the original transient reason.
+    //       Re-reading does NOT save us here — the persistent reason
+    //       was never persisted to read. The mitigation is owned by
+    //       `setBlocked`'s precedence rule (see blocked-state.ts);
+    //       this re-read defends only against case (1).
+    //
+    // Net guarantee with this guard: if a PERSISTENT reason was
+    // observably persisted at any point between our two reads, we
+    // refuse to clear. This is the narrow correctness property that
+    // matters; the broader masking concern is documented in
+    // `blocked-state.ts:setBlocked` and gated by the operator runbook.
+    const stateAfter = await readBlockedState(this.#init.flagStore);
+    if (!stateAfter.blocked) {
+      // Sibling cleared between our reads (e.g., explicit
+      // `clearBlocked()` from another tab). Nothing to do.
+      return { cleared: false };
+    }
+    const reasonAfter = stateAfter.reason as BlockedReason | undefined;
+    if (!reasonAfter || !isTransientRecoveryReason(reasonAfter) || reasonAfter !== reason) {
+      // Reason changed under us — either to a persistent class (must
+      // not clear) or to a different transient class (must report the
+      // current state, not the stale one we initially read).
+      return { cleared: false, reason: reasonAfter };
+    }
     await clearBlockedFlag(this.#init.flagStore);
     return { cleared: true, reason };
   }

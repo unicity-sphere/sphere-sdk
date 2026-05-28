@@ -632,12 +632,24 @@ export type StorageEventType =
    * trigger this event — those still require an explicit operator
    * decision per SPEC §10.2.4.
    *
+   * Suppressed when the same-tick post-clear retry immediately re-set
+   * BLOCKED — the operator-visible signal would otherwise flicker
+   * between "wallet recovered" and "wallet blocked" with no durable
+   * progress. The next successful poll will surface the auto-clear
+   * once the underlying connectivity actually stabilises.
+   *
    * `data` carries:
-   *   - `reason: BlockedReason`   the transient reason that was cleared
-   *   - `clearedAt: number`       UNIX ms timestamp
+   *   - `clearedReason: BlockedReason`   the transient reason that
+   *                                      WAS cleared (past tense — the
+   *                                      wallet is no longer blocked)
+   *   - `clearedAt: number`              UNIX ms timestamp
    *
    * Informational only. UIs may use this to dismiss a previously-shown
    * "wallet blocked" banner.
+   *
+   * Operator note: `clearedReason` is operational metadata, not user-
+   * identifying data, but telemetry pipelines that forward these events
+   * upstream SHOULD scrub or aggregate per their privacy policy.
    */
   | 'storage:blocked-auto-cleared';
 

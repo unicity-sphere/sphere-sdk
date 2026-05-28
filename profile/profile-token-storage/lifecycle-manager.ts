@@ -2164,19 +2164,16 @@ export class LifecycleManager {
           `Pointer poll: auto-cleared BLOCKED (reason=${clearResult.reason}) ` +
             `after successful recoverLatest — transient connectivity resolved.`,
         );
-        this.host.emitEvent({
-          type: 'storage:blocked-auto-cleared',
-          timestamp: Date.now(),
-          data: {
-            reason: clearResult.reason,
-            clearedAt: Date.now(),
-          },
-        });
         // The pending publish (if any) was refused for the entire
         // BLOCKED window. Re-run the retry now so the wallet recovers
         // in the same poll tick instead of waiting up to ~90s for the
-        // next scheduled poll. Failures here remain best-effort: any
-        // throw will surface via the regular publish error paths.
+        // next scheduled poll. Steelman²³: the leading
+        // `retryPendingPublishIfAny` above ran while BLOCKED was set,
+        // so it failed with UNREACHABLE_RECOVERY_BLOCKED and (when
+        // classified PERMANENT) may have already cleared
+        // `pendingPublishCid`. Whether or not it did, this post-clear
+        // call exercises the now-unblocked publish path: a no-op if
+        // there is no pending CID, or a real retry if one survived.
         try {
           await this.retryPendingPublishIfAny();
         } catch (retryErr) {
@@ -2184,6 +2181,40 @@ export class LifecycleManager {
             `Pointer poll: post-unblock pending-publish retry threw (best-effort): ${
               retryErr instanceof Error ? retryErr.message : String(retryErr)
             }`,
+          );
+        }
+        // Steelman²³: only emit the auto-cleared event if BLOCKED is
+        // still clear. The same-tick retry may have re-set BLOCKED via
+        // `maybeSetBlocked` inside `publishOnceAtVersion`'s catch
+        // (e.g., retry hit another transient → reason='retry_exhausted'
+        // again). Emitting the cleared event in that case would cause
+        // UI flicker: banner dismissed at T0, banner re-asserted at T1
+        // when the next poll/save flush sees BLOCKED=true again.
+        // Suppressing the event keeps the UI quiet until the wallet
+        // actually recovers durably.
+        let immediatelyReblocked = false;
+        try {
+          immediatelyReblocked = await pointer.isPublishBlocked();
+        } catch {
+          // If we can't query, default to emitting (safe: consumers
+          // treat this as at-least-once observability). A spurious
+          // emit is preferable to a silent miss.
+          immediatelyReblocked = false;
+        }
+        if (!immediatelyReblocked) {
+          this.host.emitEvent({
+            type: 'storage:blocked-auto-cleared',
+            timestamp: Date.now(),
+            data: {
+              clearedReason: clearResult.reason,
+              clearedAt: Date.now(),
+            },
+          });
+        } else {
+          this.host.log(
+            `Pointer poll: auto-cleared BLOCKED (${clearResult.reason}) ` +
+              `but the same-tick retry re-blocked the wallet; ` +
+              `suppressing storage:blocked-auto-cleared event to avoid UI flicker.`,
           );
         }
       }

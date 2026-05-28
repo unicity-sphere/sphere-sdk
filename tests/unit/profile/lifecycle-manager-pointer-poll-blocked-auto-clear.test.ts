@@ -78,6 +78,11 @@ function stubPointer(overrides: Partial<ProfilePointerLayer>): ProfilePointerLay
     async clearBlockedIfTransient() {
       return { cleared: false };
     },
+    // Default: not blocked after clear (happy path). Tests that
+    // exercise the immediate-reblock suppression override this.
+    async isPublishBlocked() {
+      return false;
+    },
     ...overrides,
   } as unknown as ProfilePointerLayer;
 }
@@ -143,7 +148,7 @@ describe('LifecycleManager.runPointerPollOnce — issue #319 auto-clear', () => 
       expect(events.length).toBeGreaterThanOrEqual(1);
       const evt = events[0];
       expect(evt.type).toBe('storage:blocked-auto-cleared');
-      expect((evt.data as { reason?: string }).reason).toBe('retry_exhausted');
+      expect((evt.data as { clearedReason?: string }).clearedReason).toBe('retry_exhausted');
       expect(typeof (evt.data as { clearedAt?: number }).clearedAt).toBe('number');
     } finally {
       await provider.shutdown();
@@ -171,7 +176,7 @@ describe('LifecycleManager.runPointerPollOnce — issue #319 auto-clear', () => 
       try {
         await vi.advanceTimersByTimeAsync(POINTER_POLL_MAX_MS + 1_000);
         expect(events.length).toBeGreaterThanOrEqual(1);
-        expect((events[0].data as { reason?: string }).reason).toBe(reason);
+        expect((events[0].data as { clearedReason?: string }).clearedReason).toBe(reason);
       } finally {
         await provider.shutdown();
       }
@@ -219,6 +224,68 @@ describe('LifecycleManager.runPointerPollOnce — issue #319 auto-clear', () => 
     try {
       await vi.advanceTimersByTimeAsync(POINTER_POLL_MAX_MS + 1_000);
       expect(events).toHaveLength(0);
+    } finally {
+      await provider.shutdown();
+    }
+  });
+
+  it('suppresses storage:blocked-auto-cleared event when the same-tick retry immediately re-blocks the wallet', async () => {
+    // Steelman²³: avoid UI flicker. If the post-clear retry trips the
+    // wallet back into BLOCKED (e.g., retry hit another transient and
+    // exhausted), emitting the auto-cleared event would tell the UI
+    // "wallet recovered" only to immediately tell it "wallet blocked"
+    // again. Suppress the event in this case.
+    const clearBlockedIfTransient = vi.fn(async () => ({
+      cleared: true,
+      reason: 'retry_exhausted' as const,
+    }));
+    // After clear, the same-tick retry re-blocks → isPublishBlocked
+    // returns true → event is suppressed.
+    const isPublishBlocked = vi.fn(async () => true);
+    const pointer = stubPointer({ clearBlockedIfTransient, isPublishBlocked });
+    const provider = createProvider({ db, getPointerLayer: () => pointer });
+
+    const events: Array<{ type: string }> = [];
+    provider.onEvent((ev) => {
+      if (ev.type === 'storage:blocked-auto-cleared') events.push({ type: ev.type });
+    });
+
+    await provider.initialize();
+    try {
+      await vi.advanceTimersByTimeAsync(POINTER_POLL_MAX_MS + 1_000);
+      // The clear happened (we logged it internally) but no event
+      // was emitted because the wallet was immediately re-blocked.
+      expect(clearBlockedIfTransient).toHaveBeenCalled();
+      expect(isPublishBlocked).toHaveBeenCalled();
+      expect(events).toHaveLength(0);
+    } finally {
+      await provider.shutdown();
+    }
+  });
+
+  it('emits the event when isPublishBlocked throws (defaults to emit — at-least-once observability)', async () => {
+    // If we can't query the post-retry BLOCKED state, default to
+    // emitting. The alternative — silently dropping the event — would
+    // make telemetry less reliable than just over-reporting.
+    const clearBlockedIfTransient = vi.fn(async () => ({
+      cleared: true,
+      reason: 'retry_exhausted' as const,
+    }));
+    const isPublishBlocked = vi.fn(async () => {
+      throw new Error('storage layer unavailable');
+    });
+    const pointer = stubPointer({ clearBlockedIfTransient, isPublishBlocked });
+    const provider = createProvider({ db, getPointerLayer: () => pointer });
+
+    const events: Array<{ type: string }> = [];
+    provider.onEvent((ev) => {
+      if (ev.type === 'storage:blocked-auto-cleared') events.push({ type: ev.type });
+    });
+
+    await provider.initialize();
+    try {
+      await vi.advanceTimersByTimeAsync(POINTER_POLL_MAX_MS + 1_000);
+      expect(events.length).toBeGreaterThanOrEqual(1);
     } finally {
       await provider.shutdown();
     }
