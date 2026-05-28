@@ -1,0 +1,2 @@
+# Runtime state — re-minted on every `./run-aggregator.sh --fresh`.
+data/
