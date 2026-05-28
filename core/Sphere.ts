@@ -58,6 +58,17 @@ import type {
 } from '../types';
 import { SphereError } from './errors';
 import type {
+  SphereProfileHandle,
+  ResetEpochParams,
+  ResetEpochResult,
+} from '../profile/profile-handle';
+import {
+  LOCAL_EPOCH_FLOOR_KEY,
+  LOCAL_EPOCH_RESET_FLUSH_TRIGGER_KEY,
+  LOCAL_EPOCH_RESET_REASON_KEY,
+} from '../profile/pointer-wiring';
+import { EPOCH_RESET_REASON_MAX_BYTES } from '../profile/profile-lean-snapshot';
+import type {
   ShutdownOptions,
   StorageProvider,
   TokenStorageProvider,
@@ -501,6 +512,31 @@ export interface SphereInitResult {
 
 /** Token type for Unicity network (used for L3 predicate address derivation) */
 const UNICITY_TOKEN_TYPE_HEX = 'f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe397867509';
+
+/**
+ * PR #316 F1 fix — default wall-clock budget for the pre-bump
+ * discovery RPC inside `resetEpoch`. The discovery makes one or more
+ * aggregator RPCs to determine the on-chain epoch floor before
+ * computing `newEpoch = max(local, discovered) + 1`. Bounded so a
+ * misbehaving aggregator cannot hang the user-facing reset call
+ * indefinitely; on timeout the bump proceeds from the local floor
+ * alone and `'profile:epoch-reset-discovery-skipped'` is emitted.
+ */
+const RESET_EPOCH_DISCOVERY_TIMEOUT_MS = 15_000;
+
+/**
+ * PR #316 F2 fix — default wall-clock budget for the post-bump
+ * publish await inside `resetEpoch`. After the local floor is
+ * persisted and `notifyProfileDirty()` is called, resetEpoch waits
+ * up to this long for a `'storage:pointer-published'` event so the
+ * returned `publishedVersion` is honest. On timeout, the local
+ * state is unchanged and a `'profile:epoch-reset-publish-pending'`
+ * event is emitted; the periodic-poll path republishes.
+ *
+ * The default is 30 000 ms, matching the per-flush remote-durability
+ * verification deadline in `ProfileConfig.flushVerificationDeadlineMs`.
+ */
+const RESET_EPOCH_PUBLISH_TIMEOUT_MS = 30_000;
 
 /**
  * Derive L3 predicate address (DIRECT://...) from private key
@@ -1675,6 +1711,573 @@ export class Sphere {
   /** Swap module (atomic token swaps). Null if not configured. */
   get swap(): SwapModule | null {
     return this._swap;
+  }
+
+  /**
+   * Issue #310 — Profile-mode public API surface.
+   *
+   * Returns a {@link SphereProfileHandle} when the wallet's
+   * StorageProvider is a Profile-backed adapter (duck-typed via the
+   * presence of `getPointerLayer`). Returns `null` for legacy
+   * (IndexedDB / File) storage — callers MUST null-check.
+   *
+   * The handle's primary method is `resetEpoch({ reason })`, which
+   * bumps the wallet's permanent OpLog epoch floor by +1 and triggers
+   * a republish so all clients refuse to walk back to any prior epoch.
+   * See `profile/profile-handle.ts` for the full contract.
+   */
+  get profile(): SphereProfileHandle | null {
+    const storage = this._storage as unknown as {
+      getPointerLayer?: () => unknown | null;
+    };
+    if (typeof storage.getPointerLayer !== 'function') {
+      return null;
+    }
+    return this.buildProfileHandle();
+  }
+
+  /**
+   * Lazily-constructed (per-call) handle so it picks up identity /
+   * storage rebinds across `Sphere.load()` reattach cycles. The handle
+   * is a thin lambda that closes over `this` — no state lives inside
+   * it.
+   */
+  private buildProfileHandle(): SphereProfileHandle {
+    return {
+      resetEpoch: (params: ResetEpochParams) => this.resetEpochImpl(params),
+      getEpochFloor: () => this.getEpochFloorImpl(),
+    };
+  }
+
+  /**
+   * Issue #310 — read the wallet's persisted epoch floor. Returns 0
+   * if the wallet has never observed a higher epoch on-chain AND has
+   * never called `resetEpoch`.
+   */
+  private async getEpochFloorImpl(): Promise<number> {
+    const raw = await this._storage.get(LOCAL_EPOCH_FLOOR_KEY);
+    if (raw === null) return 0;
+    const parsed = Number.parseInt(raw, 10);
+    if (
+      !Number.isFinite(parsed) ||
+      !Number.isInteger(parsed) ||
+      parsed < 0
+    ) {
+      return 0;
+    }
+    return parsed;
+  }
+
+  /**
+   * Issue #310 — serialization guard for concurrent `resetEpoch` calls
+   * on the same Sphere instance. Two concurrent invocations could
+   * otherwise both observe floor=N, both write floor=N+1, and emit
+   * two events for what is logically one epoch bump (the second
+   * caller's intent is silently merged into the first). Holding a
+   * per-instance promise serializes the read-modify-write cycle.
+   *
+   * This guard does NOT protect against concurrent SENDS / OpLog
+   * writes from PaymentsModule — those run through the OrbitDB
+   * adapter directly and are subject to OrbitDB's own write
+   * serialization. A concurrent send while resetEpoch is wiping the
+   * OpLog surfaces as a write error from PaymentsModule (caught by
+   * the dispatcher's retry path). Callers SHOULD quiesce sends
+   * externally; this is documented on `SphereProfileHandle.resetEpoch`.
+   */
+  private _resetEpochInFlight: Promise<ResetEpochResult> | null = null;
+
+  /**
+   * Issue #310 — bump the wallet's OpLog epoch floor by +1, kick off a
+   * republish, and emit `'profile:epoch-reset'`. See
+   * `SphereProfileHandle.resetEpoch` for the full contract.
+   */
+  private async resetEpochImpl(
+    params: ResetEpochParams,
+  ): Promise<ResetEpochResult> {
+    const storage = this._storage as unknown as {
+      getPointerLayer?: () => unknown | null;
+    };
+    if (typeof storage.getPointerLayer !== 'function') {
+      throw new SphereError(
+        'sphere.profile.resetEpoch requires Profile-mode storage (got non-Profile StorageProvider).',
+        'NOT_PROFILE_MODE',
+      );
+    }
+
+    if (typeof params.reason !== 'string' || params.reason.length === 0) {
+      throw new SphereError(
+        'sphere.profile.resetEpoch: reason must be a non-empty string.',
+        'INVALID_CONFIG',
+      );
+    }
+    const reasonBytes = new TextEncoder().encode(params.reason);
+    if (reasonBytes.byteLength > EPOCH_RESET_REASON_MAX_BYTES) {
+      throw new SphereError(
+        `sphere.profile.resetEpoch: reason ${reasonBytes.byteLength} bytes exceeds cap ${EPOCH_RESET_REASON_MAX_BYTES}.`,
+        'INVALID_CONFIG',
+      );
+    }
+
+    // Serialize: if a reset is already mid-flight, chain this call
+    // BEHIND it (not deduplicate — each call must produce a NEW epoch
+    // per the idempotency-against-re-runs contract). The check + set
+    // MUST be sync (no intermediate await) so two concurrent
+    // invocations see distinct mid-flight states.
+    const prior = this._resetEpochInFlight;
+    const promise = (async (): Promise<ResetEpochResult> => {
+      if (prior !== null) {
+        try {
+          await prior;
+        } catch {
+          // Previous call's error is irrelevant to this one; the
+          // floor-read below picks up whatever was actually persisted.
+        }
+      }
+      return this.resetEpochCore(params);
+    })();
+    this._resetEpochInFlight = promise;
+    try {
+      return await promise;
+    } finally {
+      if (this._resetEpochInFlight === promise) {
+        this._resetEpochInFlight = null;
+      }
+    }
+  }
+
+  /**
+   * Issue #310 — core read-modify-write cycle for a single resetEpoch
+   * call. Wrapped by `resetEpochImpl` with the mutex.
+   *
+   * PR #316 F1 fix — the floor bump now consults the on-chain epoch
+   * floor (`pointer.discoverLatestVersion().pickedEpoch`) before
+   * computing `newEpoch = max(local, discovered) + 1`. This closes
+   * the cross-device monotonicity gap: two devices that both observe
+   * `localFloor=N` will each discover the same `chainFloor=N` (or
+   * better) and both bump to N+1; whichever device's publish lands
+   * first wins, and the loser's subsequent publish forces a re-
+   * discovery (now seeing the winner's N+1) so its NEXT bump goes
+   * to N+2.
+   */
+  private async resetEpochCore(
+    params: ResetEpochParams,
+  ): Promise<ResetEpochResult> {
+    const ts = Date.now();
+
+    try {
+      // 1a. Read local floor.
+      const currentEpoch = await this.getEpochFloorImpl();
+
+      // 1b. PR #316 F1 fix — consult the on-chain epoch floor with a
+      //     bounded timeout. The walkback floor is the
+      //     `pickedEpoch` from Phase-3 discovery — the `max(epoch)`
+      //     observed across every Phase-3 candidate whose CAR the
+      //     wallet successfully inspected. On RPC failure (network
+      //     down, aggregator timeout, etc.) we fall back to the
+      //     local floor alone and emit the
+      //     `'profile:epoch-reset-discovery-skipped'` event so
+      //     callers can surface the PROVISIONAL nature of the bump.
+      const discoveryTimeoutMs =
+        params.discoveryTimeoutMs ?? RESET_EPOCH_DISCOVERY_TIMEOUT_MS;
+      let discoveredEpoch = 0;
+      let discoveryConsulted = false;
+      let discoveryError: string | null = null;
+      if (discoveryTimeoutMs > 0) {
+        try {
+          discoveredEpoch = await this.discoverChainEpochFloor(
+            discoveryTimeoutMs,
+          );
+          discoveryConsulted = true;
+        } catch (err) {
+          discoveryError = err instanceof Error ? err.message : String(err);
+          logger.warn(
+            'Sphere',
+            `resetEpoch: discovery failed (continuing with local floor only — ` +
+              `new epoch is PROVISIONAL): ${discoveryError}`,
+          );
+        }
+      }
+
+      // 1c. Compute new epoch from the higher of (local, discovered).
+      const baseEpoch = Math.max(currentEpoch, discoveredEpoch);
+      const newEpoch = baseEpoch + 1;
+
+      // 2. Persist BEFORE the OpLog wipe so a crash between (2) and
+      //    (3) leaves the local wallet with the new floor in place —
+      //    the next Sphere.load() publishes the bumped epoch on its
+      //    first dirty-flush.
+      await this._storage.set(LOCAL_EPOCH_FLOOR_KEY, String(newEpoch));
+      await this._storage.set(LOCAL_EPOCH_RESET_REASON_KEY, params.reason);
+
+      // 3. Best-effort OpLog wipe via OrbitDbAdapter.resetCorruptedLog.
+      try {
+        const storageWithAdapter = this._storage as unknown as {
+          getOrbitDbAdapter?: () => {
+            resetCorruptedLog?: (reason: {
+              lostHeadCid?: string;
+              context: string;
+            }) => Promise<unknown>;
+          } | null;
+        };
+        const adapter = storageWithAdapter.getOrbitDbAdapter?.() ?? null;
+        if (
+          adapter !== null &&
+          typeof adapter.resetCorruptedLog === 'function'
+        ) {
+          await adapter.resetCorruptedLog({
+            context: `sphere.profile.resetEpoch: ${params.reason}`,
+          });
+        }
+      } catch (err) {
+        logger.warn(
+          'Sphere',
+          `resetEpoch: OpLog wipe threw (continuing with epoch bump): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+
+      // 3b. PR #316 F3 fix — write a sentinel KV AFTER the OpLog wipe
+      //     so the snapshot builder has concrete OpLog state to flush
+      //     even when no other writers have mutated since the wipe.
+      //     The value is the post-reset epoch (decimal string); the
+      //     sentinel is overwritten on every subsequent reset and
+      //     never accumulates.
+      //
+      //     Ordering rationale: must run AFTER the OpLog wipe so the
+      //     sentinel lands in the FRESH OpLog (the wipe drops the
+      //     OrbitDB instance, so any pre-wipe write would be lost).
+      //     The local cache copy is also overwritten (via
+      //     ProfileStorageProvider.set's local-cache mirror) so the
+      //     wallet's next `Sphere.load()` reads the sentinel back
+      //     consistently.
+      //
+      //     Without this, a publish failure on the first post-reset
+      //     flush could leave the aggregator chain stuck at the
+      //     pre-reset version with no automatic retry surface — the
+      //     periodic poll's `retryPendingPublishIfAny` only fires
+      //     when `pendingPublishCid` is non-null, which in turn only
+      //     stamps when a publish actually attempted and transient-
+      //     failed. If the snapshot builder skipped the publish for
+      //     "no dirty state", no retry would ever run.
+      //
+      //     Best-effort: a write failure does NOT abort the bump.
+      //     The local floor IS already persisted; the wallet stays
+      //     consistent.
+      try {
+        await this._storage.set(
+          LOCAL_EPOCH_RESET_FLUSH_TRIGGER_KEY,
+          String(newEpoch),
+        );
+      } catch (err) {
+        logger.warn(
+          'Sphere',
+          `resetEpoch: flush-trigger sentinel write failed (epoch bump still persisted): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+
+      // 4a. PR #316 F2 fix — arm a one-shot listener on every token-
+      //     storage provider's `'storage:pointer-published'` event
+      //     BEFORE the dirty-flush is triggered. The event fires
+      //     unconditionally on any successful pointer publish (per
+      //     the lifecycle-manager change in this PR). We collect the
+      //     FIRST published version observed across all providers
+      //     within the bounded timeout window.
+      //
+      //     `armResetEpochPublishWaiter` returns `null` when no
+      //     token-storage providers expose `onEvent` — in that case
+      //     there is no event surface to observe and skipping the
+      //     wait is the honest behavior (we return
+      //     `publishedVersion: 0` and DO NOT emit
+      //     `'profile:epoch-reset-publish-pending'` — pending implies
+      //     "we tried and timed out", not "no wiring").
+      const publishTimeoutMs =
+        params.publishTimeoutMs ?? RESET_EPOCH_PUBLISH_TIMEOUT_MS;
+      const publishedVersionWaiter =
+        publishTimeoutMs > 0
+          ? this.armResetEpochPublishWaiter(publishTimeoutMs)
+          : null;
+      // Distinguish "skipped because no listeners" (publishedVersion
+      // remains 0; no pending event) from "skipped because timeout
+      // = 0" (same outcome, also no pending event) from "awaited and
+      // timed out" (publishedVersion = 0 AND pending event emitted).
+      const publishedVersionWaiterRanAndTimedOut: { value: boolean } = {
+        value: false,
+      };
+
+      // 4b. Trigger a dirty-flush so the next aggregator pointer
+      //    publish carries the new epoch (best-effort).
+      try {
+        for (const provider of this._tokenStorageProviders.values()) {
+          const dirtyTrigger = (provider as unknown as {
+            notifyProfileDirty?: () => void;
+          }).notifyProfileDirty;
+          if (typeof dirtyTrigger === 'function') {
+            dirtyTrigger.call(provider);
+          }
+        }
+      } catch (err) {
+        logger.warn(
+          'Sphere',
+          `resetEpoch: notifyProfileDirty threw (epoch bump still persisted): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+
+      // 4c. Await the publish (or timeout). Always cancel the
+      //     waiter — leaking the listener could pin the provider's
+      //     event-handler set across the next publish cycle.
+      let publishedVersion = 0;
+      if (publishedVersionWaiter !== null) {
+        try {
+          publishedVersion = await publishedVersionWaiter.promise;
+        } catch {
+          // Timeout → publishedVersion stays 0; emit the
+          // pending event below.
+          publishedVersionWaiterRanAndTimedOut.value = true;
+        } finally {
+          publishedVersionWaiter.cancel();
+        }
+      }
+
+      // 5. Emit the event.
+      this.emitEvent('profile:epoch-reset', {
+        newEpoch,
+        reason: params.reason,
+        ts,
+      });
+
+      // 5b. PR #316 F1 fix — surface discovery-failure so callers know
+      //     the bump is PROVISIONAL.
+      if (!discoveryConsulted && discoveryError !== null) {
+        this.emitEvent('profile:epoch-reset-discovery-skipped', {
+          newEpoch,
+          reason: params.reason,
+          discoveryError,
+          ts,
+        });
+      }
+
+      // 5c. PR #316 F2 fix — surface publish-timeout so callers know
+      //     to either retry / re-query or subscribe to
+      //     `'storage:pointer-published'` for the eventual landing.
+      //     Only emit when we actually awaited AND timed out — not
+      //     when the waiter was skipped (timeoutMs=0) or returned
+      //     null (no event surface).
+      if (publishedVersionWaiterRanAndTimedOut.value) {
+        this.emitEvent('profile:epoch-reset-publish-pending', {
+          newEpoch,
+          reason: params.reason,
+          timeoutMs: publishTimeoutMs,
+          ts,
+        });
+      }
+
+      return {
+        newEpoch,
+        reason: params.reason,
+        ts,
+        publishedVersion,
+        discoveryConsulted,
+      };
+    } catch (err) {
+      if (err instanceof SphereError) throw err;
+      throw new SphereError(
+        `sphere.profile.resetEpoch failed: ${err instanceof Error ? err.message : String(err)}`,
+        'PROFILE_RESET_FAILED',
+        err,
+      );
+    }
+  }
+
+  /**
+   * PR #316 F2 fix — arm a one-shot waiter on every token-storage
+   * provider's `'storage:pointer-published'` event. Returns a
+   * `{promise, cancel}` pair: the promise resolves with the FIRST
+   * observed `version` across any provider, or rejects on timeout.
+   * `cancel()` unsubscribes every listener and clears the timer
+   * (safe to call multiple times). Callers MUST always call
+   * `cancel()` in a `finally` so the listener set does not pin
+   * across the next event cycle.
+   *
+   * The event fires unconditionally on every successful publish (per
+   * the lifecycle-manager change in this PR), so the waiter does NOT
+   * depend on the `enablePointerWinBroadcasts` capability flag.
+   */
+  private armResetEpochPublishWaiter(
+    timeoutMs: number,
+  ): {
+    promise: Promise<number>;
+    cancel: () => void;
+  } | null {
+    // Collect candidate providers with an `onEvent` accessor BEFORE
+    // installing any listener. Without at least one such provider
+    // the waiter has no way to ever settle on the success path —
+    // letting it run would just stall for the full `timeoutMs`
+    // window with a guaranteed publish-pending event. Returning
+    // `null` is the honest answer: "I cannot observe the publish
+    // here; skip the await". This is the production behavior when
+    // no token storage providers are wired (e.g., pure read-only
+    // unit-test harnesses) and the legitimate behavior on a real
+    // wallet that has Profile storage as the kv-storage backend
+    // but no token storage providers attached.
+    const eligible: Array<{
+      onEvent: (
+        cb: (event: { type: string; data?: { version?: unknown } }) => void,
+      ) => () => void;
+      provider: unknown;
+    }> = [];
+    for (const provider of this._tokenStorageProviders.values()) {
+      const onEvent = (provider as unknown as {
+        onEvent?: (
+          cb: (event: { type: string; data?: { version?: unknown } }) => void,
+        ) => () => void;
+      }).onEvent;
+      if (typeof onEvent !== 'function') continue;
+      eligible.push({ onEvent, provider });
+    }
+    if (eligible.length === 0) {
+      return null;
+    }
+
+    const cleanups: Array<() => void> = [];
+    let settled = false;
+    // Holder for the timer handle. Filled below; `teardown` reads
+    // through the holder so we can declare it before the
+    // `setTimeout` call (avoids use-before-define).
+    const timerHolder: { value: ReturnType<typeof setTimeout> | null } = {
+      value: null,
+    };
+
+    let resolve!: (v: number) => void;
+    let reject!: (err: Error) => void;
+    const promise = new Promise<number>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+
+    const teardown = (): void => {
+      if (timerHolder.value !== null) clearTimeout(timerHolder.value);
+      for (const fn of cleanups) {
+        try {
+          fn();
+        } catch {
+          /* listener-removal must never throw past resetEpoch */
+        }
+      }
+    };
+
+    const cancel = (): void => {
+      if (settled) return;
+      settled = true;
+      teardown();
+    };
+
+    const timer: ReturnType<typeof setTimeout> = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      teardown();
+      // Reject so the caller's `await` throws and the catch arm in
+      // resetEpochCore drops `publishedVersion` to 0.
+      reject(
+        new Error(
+          `resetEpoch: storage:pointer-published not observed within ${timeoutMs}ms`,
+        ),
+      );
+    }, timeoutMs);
+    timerHolder.value = timer;
+    if (
+      typeof (timer as unknown as { unref?: unknown }).unref === 'function'
+    ) {
+      (timer as unknown as { unref: () => void }).unref();
+    }
+
+    for (const { onEvent, provider } of eligible) {
+      const unsub = onEvent.call(provider, (event) => {
+        if (settled) return;
+        if (event?.type !== 'storage:pointer-published') return;
+        const version = event?.data?.version;
+        if (
+          typeof version !== 'number' ||
+          !Number.isFinite(version) ||
+          !Number.isInteger(version) ||
+          version < 0
+        ) {
+          return;
+        }
+        settled = true;
+        teardown();
+        resolve(version);
+      });
+      if (typeof unsub === 'function') {
+        cleanups.push(unsub);
+      }
+    }
+
+    return { promise, cancel };
+  }
+
+  /**
+   * PR #316 F1 fix — best-effort discovery of the on-chain epoch
+   * floor. Runs `pointer.discoverLatestVersion()` with a
+   * caller-supplied wall-clock budget and returns the
+   * `pickedEpoch` value. Throws on any failure (RPC timeout,
+   * aggregator down, pointer layer missing) — the caller logs the
+   * error, emits the `'profile:epoch-reset-discovery-skipped'`
+   * event, and falls back to the local floor alone.
+   *
+   * Returns 0 for a fresh wallet that has never observed an
+   * on-chain epoch (the discovery returns `pickedEpoch: 0` in that
+   * case, which is correct — `max(local=0, discovered=0) + 1 = 1`).
+   */
+  private async discoverChainEpochFloor(
+    timeoutMs: number,
+  ): Promise<number> {
+    const storageWithPointer = this._storage as unknown as {
+      getPointerLayer?: () => {
+        discoverLatestVersion?: (
+          walkbackLimit?: number,
+          opts?: { abortSignal?: AbortSignal },
+        ) => Promise<{ pickedEpoch?: number }>;
+      } | null;
+    };
+    const pointer = storageWithPointer.getPointerLayer?.() ?? null;
+    if (
+      pointer === null ||
+      typeof pointer.discoverLatestVersion !== 'function'
+    ) {
+      throw new Error(
+        'pointer layer unavailable (discoverLatestVersion missing)',
+      );
+    }
+    const abortController = new AbortController();
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      deadlineTimer = setTimeout(() => {
+        try {
+          abortController.abort();
+        } catch {
+          /* noop */
+        }
+      }, timeoutMs);
+      // Some Node test runners support .unref() on timers; ignore otherwise.
+      if (
+        deadlineTimer !== undefined &&
+        typeof (deadlineTimer as unknown as { unref?: unknown }).unref ===
+          'function'
+      ) {
+        (deadlineTimer as unknown as { unref: () => void }).unref();
+      }
+      const result = await pointer.discoverLatestVersion(undefined, {
+        abortSignal: abortController.signal,
+      });
+      const picked = result?.pickedEpoch;
+      if (typeof picked !== 'number' || !Number.isFinite(picked) || picked < 0) {
+        return 0;
+      }
+      return picked;
+    } finally {
+      if (deadlineTimer !== undefined) {
+        clearTimeout(deadlineTimer);
+      }
+    }
   }
 
   // ===========================================================================

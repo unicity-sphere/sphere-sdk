@@ -196,6 +196,38 @@ export interface PointerWiringInput {
 const LOCAL_VERSION_KEY = 'profile.pointer.version';
 
 /**
+ * Issue #310 — local cache key for the OpLog epoch floor. Single
+ * source of truth for the key namespace; the snapshot builder in
+ * `factory.ts` reads from the same key when stamping the next root
+ * block's `epoch` field.
+ */
+export const LOCAL_EPOCH_FLOOR_KEY = 'profile.pointer.epoch_floor';
+export const LOCAL_EPOCH_RESET_REASON_KEY =
+  'profile.pointer.epoch_reset_reason';
+/**
+ * PR #316 F3 fix — sentinel KV key written by `resetEpoch` BEFORE
+ * triggering the dirty-flush. The value is the post-reset epoch
+ * encoded as a decimal string (matches `LOCAL_EPOCH_FLOOR_KEY`'s
+ * encoding).
+ *
+ * Purpose: give the OrbitDB-backed flush path concrete dirty state
+ * to write even when the OpLog has just been wiped via
+ * `OrbitDbAdapter.resetCorruptedLog`. Without this sentinel, an
+ * idle wallet whose post-reset OpLog is empty MAY (depending on
+ * the snapshot builder's internal change-detection heuristic)
+ * skip building a fresh snapshot — leaving the aggregator chain
+ * stuck at the pre-reset version and the local floor at +1
+ * indefinitely until the user triggers another mutation.
+ *
+ * **Single slot.** The key is overwritten on every subsequent
+ * reset (the value is always the latest `newEpoch`), so the
+ * sentinel never accumulates across many resets. The post-publish
+ * cleanup is a no-op — the next reset just overwrites it.
+ */
+export const LOCAL_EPOCH_RESET_FLUSH_TRIGGER_KEY =
+  'profile.pointer.epoch_reset_flush_trigger';
+
+/**
  * Parse a CAR byte buffer and return its root CID bytes, or `null`
  * if the CAR is malformed or has no roots. Dynamic import keeps
  * `@ipld/car` out of the hot path of tree-shaken browser bundles
@@ -648,6 +680,37 @@ export async function buildProfilePointerLayer(
       await input.localCache.set(LOCAL_VERSION_KEY, String(v));
     };
 
+    // Issue #310 — epoch floor read/write. Same pattern as the local
+    // version pair; fail-closed to 0 on any parse error so a
+    // corrupted cache cannot drive the walkback floor into an
+    // undefined state.
+    const readEpochFloor = async (): Promise<number> => {
+      const raw = await input.localCache.get(LOCAL_EPOCH_FLOOR_KEY);
+      if (raw === null) return 0;
+      const parsed = Number.parseInt(raw, 10);
+      if (
+        !Number.isFinite(parsed) ||
+        !Number.isInteger(parsed) ||
+        parsed < 0
+      ) {
+        return 0;
+      }
+      return parsed;
+    };
+    const persistEpochFloor = async (epoch: number): Promise<void> => {
+      if (
+        typeof epoch !== 'number' ||
+        !Number.isFinite(epoch) ||
+        !Number.isInteger(epoch) ||
+        epoch < 0
+      ) {
+        // Refuse to persist garbage; the pointer layer treats this as
+        // best-effort so a return is sufficient.
+        return;
+      }
+      await input.localCache.set(LOCAL_EPOCH_FLOOR_KEY, String(epoch));
+    };
+
     const resolveRemoteCid = buildResolveRemoteCid({
       keyMaterial,
       signer,
@@ -655,6 +718,64 @@ export async function buildProfilePointerLayer(
       trustBase,
       decodeCid,
     });
+
+    // Issue #310 — snapshot-epoch inspector. Re-resolve the CID for the
+    // given version, fetch the snapshot ROOT block (content-address
+    // verified by `fetchFromIpfs`), dag-cbor-decode the root, and
+    // return its `epoch` field (or undefined for pre-#310 snapshots).
+    const inspectSnapshotEpoch = async (
+      version: number,
+    ): Promise<number | undefined> => {
+      const cidBytes = await resolveRemoteCid(version);
+      if (input.ipfsGateways.length === 0) {
+        throw new Error(
+          `inspectSnapshotEpoch: no IPFS gateways configured for v=${version}`,
+        );
+      }
+      let cidString: string;
+      try {
+        cidString = CID.decode(cidBytes).toString();
+      } catch (err) {
+        throw new Error(
+          `inspectSnapshotEpoch: invalid CID bytes at v=${version}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      const rootBlockBytes = await fetchFromIpfs(
+        [...input.ipfsGateways],
+        cidString,
+      );
+      const { decode: cborDecode } = await import('@ipld/dag-cbor');
+      let decoded: unknown;
+      try {
+        decoded = cborDecode(rootBlockBytes);
+      } catch (err) {
+        throw new Error(
+          `inspectSnapshotEpoch: dag-cbor decode failed at v=${version}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      if (
+        decoded === null ||
+        typeof decoded !== 'object' ||
+        Array.isArray(decoded)
+      ) {
+        throw new Error(
+          `inspectSnapshotEpoch: root block decoded to non-object at v=${version}`,
+        );
+      }
+      const epoch = (decoded as Record<string, unknown>).epoch;
+      if (epoch === undefined) return undefined;
+      if (
+        typeof epoch !== 'number' ||
+        !Number.isFinite(epoch) ||
+        !Number.isInteger(epoch) ||
+        epoch < 0
+      ) {
+        throw new Error(
+          `inspectSnapshotEpoch: invalid epoch ${String(epoch)} at v=${version}`,
+        );
+      }
+      return epoch;
+    };
 
     // Item #15 Phase E: applySnapshot is the only sink for remote
     // pointer state. The precondition above (skip reason
@@ -679,6 +800,10 @@ export async function buildProfilePointerLayer(
       readLocalVersion,
       persistLocalVersion,
       resolveRemoteCid,
+      // Issue #310 — wire OpLog epoch-floor primitives.
+      readEpochFloor,
+      persistEpochFloor,
+      inspectSnapshotEpoch,
       config: input.config,
     });
 

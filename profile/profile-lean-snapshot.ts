@@ -139,6 +139,18 @@ function groupKeyFor(key: string): string {
  */
 export const LEAN_DEFAULT_MAX_SNAPSHOT_BYTES = 256 * 1024 * 1024;
 
+/**
+ * Issue #310 — hard cap on the `epochResetReason` string (UTF-8 bytes).
+ */
+export const EPOCH_RESET_REASON_MAX_BYTES = 256;
+
+/**
+ * Issue #310 — hard ceiling on the epoch field. Fail-closed at decode
+ * time rather than silently lose monotonicity. 2^20 (≈ 1 million)
+ * is multiple orders of magnitude above any plausible value.
+ */
+export const EPOCH_MAX = 1 << 20;
+
 /** Soft cap on number of KV entries we'll embed (matches v1). */
 const MAX_KV_ENTRIES = 100_000;
 
@@ -251,6 +263,23 @@ export interface LeanProfileSnapshot {
   /** Snapshot timestamp (ms since epoch). */
   readonly createdAt: number;
   /**
+   * Issue #310 — OpLog epoch floor. Default 0 for pre-#310 wallets
+   * (treated equivalently to "epoch 0" by walkback algorithms). Bumped
+   * by exactly +1 by `sphere.profile.resetEpoch()` each time the user
+   * abandons a corrupted OpLog. Once published, all clients refuse to
+   * walk back to any version whose snapshot carries `epoch < max(epoch)`.
+   *
+   * Backwards-compatible: readers that don't recognize the field treat
+   * it as `0`. Forward-compatible: writers may include the field even
+   * when 0 — readers ignore.
+   */
+  readonly epoch?: number;
+  /**
+   * Issue #310 — optional reset reason captured for operator triage.
+   * Free-form ASCII; capped at EPOCH_RESET_REASON_MAX_BYTES on encode.
+   */
+  readonly epochResetReason?: string;
+  /**
    * All Profile KV entries that should propagate (encrypted form),
    * fully materialised across every entry group. Sorted by `key`.
    */
@@ -282,6 +311,9 @@ export interface LeanProfileSnapshotPartial {
   readonly chainPubkey: string;
   readonly network: string;
   readonly createdAt: number;
+  /** Issue #310 — OpLog epoch floor (default 0). See {@link LeanProfileSnapshot.epoch}. */
+  readonly epoch?: number;
+  readonly epochResetReason?: string;
   readonly entries: ReadonlyArray<LeanProfileSnapshotKvEntry>;
   readonly entryGroups: ReadonlyArray<LeanProfileSnapshotEntryGroupRef>;
   readonly bundles: ReadonlyArray<LeanProfileSnapshotBundleEntry>;
@@ -339,6 +371,17 @@ export interface BuildLeanProfileSnapshotOptions {
    * @see docs/uxf/OUTBOX-SEND-FOLLOWUPS.md
    */
   readonly gcExpiredTombstones?: () => Promise<void>;
+  /**
+   * Issue #310 — OpLog epoch to stamp into the snapshot root. Pre-#310
+   * callers leave undefined → root block omits the field → readers
+   * treat it as epoch=0 (backwards-compatible).
+   */
+  readonly epoch?: number;
+  /**
+   * Issue #310 — operator triage reason captured at reset time.
+   * Capped at EPOCH_RESET_REASON_MAX_BYTES.
+   */
+  readonly epochResetReason?: string;
 }
 
 /** Diagnostic counters surfaced to callers. */
@@ -570,7 +613,9 @@ async function assembleCarBytes(
   // dag-cbor's built-in CID-link tagging via the CID instance type).
   const { groupRefs, groupBlocks } = buildEntryGroupBlocks(snapshot.entries);
 
-  const rootBytes = dagCborEncode({
+  // Issue #310 — emit epoch / epochResetReason iff explicitly provided.
+  // Pre-#310 wallets produce byte-identical root blocks (no fields added).
+  const rootDoc: Record<string, unknown> = {
     version: LEAN_PROFILE_SNAPSHOT_VERSION,
     chainPubkey: snapshot.chainPubkey,
     network: snapshot.network,
@@ -592,7 +637,14 @@ async function assembleCarBytes(
       if (b.tokenCount !== undefined) obj.tokenCount = b.tokenCount;
       return obj;
     }),
-  });
+  };
+  if (snapshot.epoch !== undefined) {
+    rootDoc.epoch = snapshot.epoch;
+  }
+  if (snapshot.epochResetReason !== undefined) {
+    rootDoc.epochResetReason = snapshot.epochResetReason;
+  }
+  const rootBytes = dagCborEncode(rootDoc);
 
   // Per-block byte cap fires on the root block itself.
   if (rootBytes.byteLength > PROFILE_CAR_IMPORT_MAX_BLOCK_BYTES) {
@@ -682,6 +734,42 @@ export async function buildLeanProfileSnapshot(
   const entries = await readAllKvEntries(options.storage);
   const bundles = await readBundleRefs(options.tokenStorage);
 
+  // Issue #310 — validate the epoch input at the build seam.
+  let normalizedEpoch: number | undefined;
+  if (options.epoch !== undefined) {
+    if (
+      typeof options.epoch !== 'number' ||
+      !Number.isFinite(options.epoch) ||
+      !Number.isInteger(options.epoch) ||
+      options.epoch < 0 ||
+      options.epoch > EPOCH_MAX
+    ) {
+      throw new ProfileError(
+        'PROFILE_NOT_INITIALIZED',
+        `Lean snapshot: epoch must be integer in [0, ${EPOCH_MAX}]; got ${String(options.epoch)}`,
+      );
+    }
+    normalizedEpoch = options.epoch;
+  }
+
+  let normalizedReason: string | undefined;
+  if (options.epochResetReason !== undefined) {
+    if (typeof options.epochResetReason !== 'string') {
+      throw new ProfileError(
+        'PROFILE_NOT_INITIALIZED',
+        `Lean snapshot: epochResetReason must be a string`,
+      );
+    }
+    const reasonBytes = new TextEncoder().encode(options.epochResetReason);
+    if (reasonBytes.byteLength > EPOCH_RESET_REASON_MAX_BYTES) {
+      throw new ProfileError(
+        'PROFILE_NOT_INITIALIZED',
+        `Lean snapshot: epochResetReason ${reasonBytes.byteLength} bytes exceeds cap ${EPOCH_RESET_REASON_MAX_BYTES}`,
+      );
+    }
+    normalizedReason = options.epochResetReason;
+  }
+
   // `entryGroups` is constructed inside `assembleCarBytes` from
   // `entries`, so the build-time view holds an empty list. The parser
   // populates it on the read side from the actual root block.
@@ -690,6 +778,10 @@ export async function buildLeanProfileSnapshot(
     chainPubkey: options.chainPubkey,
     network: options.network,
     createdAt: options.createdAt ?? Date.now(),
+    ...(normalizedEpoch !== undefined ? { epoch: normalizedEpoch } : {}),
+    ...(normalizedReason !== undefined
+      ? { epochResetReason: normalizedReason }
+      : {}),
     entries,
     entryGroups: [],
     bundles,
@@ -765,6 +857,11 @@ export async function parseLeanProfileSnapshot(
     chainPubkey: validated.chainPubkey,
     network: validated.network,
     createdAt: validated.createdAt,
+    // Issue #310 — propagate epoch / epochResetReason iff present.
+    ...(validated.epoch !== undefined ? { epoch: validated.epoch } : {}),
+    ...(validated.epochResetReason !== undefined
+      ? { epochResetReason: validated.epochResetReason }
+      : {}),
     entries,
     entryGroups: validated.entryGroups,
     bundles: validated.bundles,
@@ -927,6 +1024,11 @@ export async function parseLeanProfileSnapshotFromRootBlock(
       chainPubkey: validated.chainPubkey,
       network: validated.network,
       createdAt: validated.createdAt,
+      // Issue #310 — propagate epoch / epochResetReason iff present.
+      ...(validated.epoch !== undefined ? { epoch: validated.epoch } : {}),
+      ...(validated.epochResetReason !== undefined
+        ? { epochResetReason: validated.epochResetReason }
+        : {}),
       entries: [],
       entryGroups: validated.entryGroups,
       bundles: validated.bundles,
@@ -942,6 +1044,11 @@ export async function parseLeanProfileSnapshotFromRootBlock(
     chainPubkey: validated.chainPubkey,
     network: validated.network,
     createdAt: validated.createdAt,
+    // Issue #310 — propagate epoch / epochResetReason iff present.
+    ...(validated.epoch !== undefined ? { epoch: validated.epoch } : {}),
+    ...(validated.epochResetReason !== undefined
+      ? { epochResetReason: validated.epochResetReason }
+      : {}),
     entries,
     entryGroups: validated.entryGroups,
     bundles: validated.bundles,
@@ -1015,6 +1122,11 @@ export async function parseLeanProfileSnapshotPartial(
     chainPubkey: validated.chainPubkey,
     network: validated.network,
     createdAt: validated.createdAt,
+    // Issue #310 — propagate epoch / epochResetReason iff present.
+    ...(validated.epoch !== undefined ? { epoch: validated.epoch } : {}),
+    ...(validated.epochResetReason !== undefined
+      ? { epochResetReason: validated.epochResetReason }
+      : {}),
     entries,
     entryGroups: validated.entryGroups,
     bundles: validated.bundles,
@@ -1232,11 +1344,51 @@ function validateLeanSnapshotShape(decoded: unknown): LeanProfileSnapshot {
   const entryGroups = parseV3EntryGroups(obj.entryGroups);
   const bundles = parseBundleEntries(obj.bundles);
 
+  // Issue #310 — read epoch (default 0 for pre-#310 / omitted field).
+  // A present-but-malformed field is fail-closed corruption signal.
+  let epoch: number | undefined;
+  if (obj.epoch !== undefined) {
+    const e = obj.epoch;
+    if (
+      typeof e !== 'number' ||
+      !Number.isFinite(e) ||
+      !Number.isInteger(e) ||
+      e < 0 ||
+      e > EPOCH_MAX
+    ) {
+      throw new ProfileError(
+        'PROFILE_NOT_INITIALIZED',
+        `Lean snapshot: invalid epoch ${String(e)} (must be integer in [0, ${EPOCH_MAX}])`,
+      );
+    }
+    epoch = e;
+  }
+  let epochResetReason: string | undefined;
+  if (obj.epochResetReason !== undefined) {
+    const r = obj.epochResetReason;
+    if (typeof r !== 'string') {
+      throw new ProfileError(
+        'PROFILE_NOT_INITIALIZED',
+        `Lean snapshot: invalid epochResetReason ${typeof r} (must be string)`,
+      );
+    }
+    const rBytes = new TextEncoder().encode(r);
+    if (rBytes.byteLength > EPOCH_RESET_REASON_MAX_BYTES) {
+      throw new ProfileError(
+        'PROFILE_NOT_INITIALIZED',
+        `Lean snapshot: epochResetReason ${rBytes.byteLength} bytes exceeds cap ${EPOCH_RESET_REASON_MAX_BYTES}`,
+      );
+    }
+    epochResetReason = r;
+  }
+
   const result: LeanProfileSnapshot = {
     version: LEAN_PROFILE_SNAPSHOT_VERSION,
     chainPubkey,
     network,
     createdAt,
+    ...(epoch !== undefined ? { epoch } : {}),
+    ...(epochResetReason !== undefined ? { epochResetReason } : {}),
     entries: [],
     entryGroups,
     bundles,

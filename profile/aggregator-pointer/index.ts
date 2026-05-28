@@ -101,6 +101,14 @@ export type {
   RecoverResult,
 } from './ProfilePointerLayer.js';
 
+// Issue #310 — OpLog epoch-floor walkback primitive
+export {
+  normalizeEpoch,
+  pickEpochFloor,
+  shouldSkipForEpochFloor,
+  computeEpochFloor,
+} from './epoch-floor.js';
+
 // RFC-251 Approach D — pointer-publish win-broadcast (issue #255 Problem B)
 export {
   buildWinBroadcastHash,

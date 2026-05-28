@@ -73,6 +73,12 @@ export type SphereErrorCode =
   | 'STATE_ALREADY_SPENT_BY_OTHER'
   | 'STORAGE_ERROR'
   | 'STORAGE_CORRUPTED'
+  // Issue #310 — `sphere.profile.resetEpoch()` invoked when not in
+  // Profile mode. Defensive: `Sphere.profile` returns `null` for
+  // non-Profile wallets, so this is normally unreachable.
+  | 'NOT_PROFILE_MODE'
+  // Issue #310 — any step of `sphere.profile.resetEpoch()` threw.
+  | 'PROFILE_RESET_FAILED'
   | 'TRANSPORT_ERROR'
   | 'AGGREGATOR_ERROR'
   | 'VALIDATION_ERROR'

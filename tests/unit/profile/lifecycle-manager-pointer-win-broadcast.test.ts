@@ -231,7 +231,7 @@ describe('LifecycleManager.publishAggregatorPointerBestEffort — pointer-win br
     expect(h.events.find((e) => e.type === 'storage:pointer-published')).toBeUndefined();
   });
 
-  it('falls through gracefully when pointer lacks getSignerForWinBroadcast (legacy stub)', async () => {
+  it('falls through gracefully when pointer lacks getSignerForWinBroadcast (legacy stub) — PR #316 F2: event still emits without broadcast fields', async () => {
     // Stub WITHOUT the win-broadcast accessor — simulates pre-Approach-D
     // pointer layer (e.g. a unit test that doesn't extend the helper).
     const pointer = {
@@ -248,7 +248,22 @@ describe('LifecycleManager.publishAggregatorPointerBestEffort — pointer-win br
     // additive. The lifecycle manager's try/catch around the sign step
     // ensures a missing accessor doesn't taint the success return.
     expect(result.ok).toBe(true);
-    expect(h.events.find((e) => e.type === 'storage:pointer-published')).toBeUndefined();
+    // PR #316 F2: the event still fires (so resetEpoch's publish
+    // await observes the version), but without the optional
+    // signedPayloadJson / broadcastTag fields.
+    const published = h.events.find((e) => e.type === 'storage:pointer-published');
+    expect(published).toBeDefined();
+    const data = published!.data as {
+      cid?: string;
+      version?: number;
+      attemptsUsed?: number;
+      signedPayloadJson?: string;
+      broadcastTag?: string;
+    };
+    expect(data.cid).toBe(FAKE_CID);
+    expect(data.version).toBe(13);
+    expect(data.signedPayloadJson).toBeUndefined();
+    expect(data.broadcastTag).toBeUndefined();
   });
 
   it('emits a fresh ts on each publish (no stale-broadcast amplification)', async () => {

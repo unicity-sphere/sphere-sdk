@@ -86,6 +86,36 @@ export interface ProfilePointerLayerInit {
   readonly persistLocalVersion: (v: PointerVersion) => Promise<void>;
   /** Given a version, resolve its CID bytes (via classifyVersion or recoverLatest). */
   readonly resolveRemoteCid: (version: PointerVersion) => Promise<Uint8Array>;
+  /**
+   * Issue #310 — read the wallet's locally-persisted epoch floor.
+   * Optional: when omitted (or when a read throws), the discovery
+   * walkback floor starts at 0 — backwards-compatible with pre-#310
+   * SDK behavior. Otherwise the floor is primed with the returned
+   * value, preventing an aggregator that still serves a pre-reset
+   * pointer for the same wallet from tricking us into walking back
+   * to it.
+   */
+  readonly readEpochFloor?: () => Promise<number>;
+  /**
+   * Issue #310 — persist a newly-observed epoch floor (best-effort).
+   * Called by `discoverLatestVersion` whenever the Phase-3 walkback
+   * observes `pickedEpoch > initialEpochFloor`, so the wallet
+   * converges with sibling-device resets without requiring the user
+   * to re-trigger any reset locally.
+   */
+  readonly persistEpochFloor?: (epoch: number) => Promise<void>;
+  /**
+   * Issue #310 — given a Phase-3 candidate version, return the
+   * snapshot's claimed `epoch` (or `undefined` for pre-#310
+   * snapshots). The lifecycle layer wires this to a closure that
+   * re-resolves the CID + fetches the root block + dag-cbor decodes
+   * the `epoch` field. Throws on decode failure so the walkback
+   * treats the candidate as undetermined / SEMANTICALLY_INVALID-
+   * equivalent.
+   */
+  readonly inspectSnapshotEpoch?: (
+    version: PointerVersion,
+  ) => Promise<number | undefined>;
   /** Configuration (capabilities). */
   readonly config?: PointerLayerConfig;
 }
@@ -681,6 +711,26 @@ export class ProfilePointerLayer {
       throw err;
     }
     const currentLocalVersion = await this.#init.readLocalVersion();
+    // Issue #310 — prime walkback with the wallet's persisted epoch
+    // floor (best-effort). A missing or erroring callback leaves the
+    // floor at 0 (pre-#310 behavior).
+    let initialEpochFloor = 0;
+    if (this.#init.readEpochFloor) {
+      try {
+        const stored = await this.#init.readEpochFloor();
+        if (
+          typeof stored === 'number' &&
+          Number.isFinite(stored) &&
+          Number.isInteger(stored) &&
+          stored >= 0
+        ) {
+          initialEpochFloor = stored;
+        }
+      } catch {
+        // Best-effort: bad read → floor stays at 0.
+      }
+    }
+    const inspectEpochCb = this.#init.inspectSnapshotEpoch;
     const result = await findLatestValidVersion({
       currentLocalVersion,
       keyMaterial: this.#init.keyMaterial,
@@ -691,7 +741,27 @@ export class ProfilePointerLayer {
       fetchCar: this.#init.fetchCar,
       walkbackLimit,
       abortSignal,
+      initialEpochFloor,
+      inspectSnapshotEpoch: inspectEpochCb
+        ? (v: PointerVersion, _cidBytes: Uint8Array) => inspectEpochCb(v)
+        : undefined,
     });
+    // Issue #310 — persist a newly-observed epoch floor (best-effort).
+    // The next discovery starts from this primed value, so an
+    // aggregator that still serves a pre-reset pointer (e.g.,
+    // cross-device sync lag after a sibling's resetEpoch) cannot
+    // trick this wallet into walking back to a pre-reset version.
+    if (
+      this.#init.persistEpochFloor &&
+      typeof result.pickedEpoch === 'number' &&
+      result.pickedEpoch > initialEpochFloor
+    ) {
+      try {
+        await this.#init.persistEpochFloor(result.pickedEpoch);
+      } catch {
+        // Best-effort: next discovery re-observes + re-persists.
+      }
+    }
     // Issue #264 steelman fix (symmetric with `publish`): only overwrite
     // the probe-fingerprint history when discovery actually produced
     // probes. A discoverLatestVersion that resolves on the first probe

@@ -30,6 +30,10 @@ import {
   type LeanProfileSnapshot,
 } from './profile-lean-snapshot';
 import { fetchFromIpfs, pinCarBlocksToIpfs } from './ipfs-client';
+import {
+  LOCAL_EPOCH_FLOOR_KEY,
+  LOCAL_EPOCH_RESET_REASON_KEY,
+} from './pointer-wiring';
 import type { ProfilePointerLayer } from './aggregator-pointer';
 import {
   runProfileSnapshotJoin,
@@ -475,11 +479,45 @@ export function createProfileProviders(
         // `ProfileConfig.tombstoneRetentionMs` (defaults to 30 days).
         const retentionMs =
           resolvedConfig.tombstoneRetentionMs ?? DEFAULT_PROFILE_TOMBSTONE_RETENTION_MS;
+
+        // Issue #310 — read the wallet's persisted epoch floor and
+        // stamp it into the snapshot's root block. Best-effort: a
+        // read failure (or absent key — the pre-#310 default) leaves
+        // the snapshot with NO epoch field, matching legacy behavior.
+        // Once the wallet has called `resetEpoch` even once, the
+        // floor is > 0 and gets emitted into every subsequent
+        // snapshot, locking the chain at the new epoch.
+        let epoch: number | undefined;
+        let epochResetReason: string | undefined;
+        try {
+          const rawEpoch = await cacheStorage.get(LOCAL_EPOCH_FLOOR_KEY);
+          if (rawEpoch !== null) {
+            const parsed = Number.parseInt(rawEpoch, 10);
+            if (
+              Number.isFinite(parsed) &&
+              Number.isInteger(parsed) &&
+              parsed > 0
+            ) {
+              epoch = parsed;
+              const rawReason = await cacheStorage.get(
+                LOCAL_EPOCH_RESET_REASON_KEY,
+              );
+              if (rawReason !== null && rawReason.length > 0) {
+                epochResetReason = rawReason;
+              }
+            }
+          }
+        } catch {
+          // Best-effort — silently fall back to pre-#310 snapshot.
+        }
+
         return buildLeanProfileSnapshot({
           storage,
           tokenStorage,
           chainPubkey,
           network,
+          ...(epoch !== undefined ? { epoch } : {}),
+          ...(epochResetReason !== undefined ? { epochResetReason } : {}),
           gcExpiredTombstones: () =>
             runProfileTombstoneGc({
               listKeys: () => storage.keys(),

@@ -676,7 +676,36 @@ export type SphereEventType =
   | 'swap:cancelled'
   | 'swap:failed'
   | 'swap:deposit_returned'
-  | 'swap:bounce_received';
+  | 'swap:bounce_received'
+  /**
+   * Issue #310 — fires AFTER `sphere.profile.resetEpoch()` persists
+   * the new epoch floor locally. Payload: `{ newEpoch, reason, ts }`.
+   */
+  | 'profile:epoch-reset'
+  /**
+   * Issue #310 / PR #316 F1 fix — fires when `resetEpoch` could NOT
+   * consult the on-chain epoch floor (aggregator/discovery failure).
+   * The local epoch was still bumped from `localFloor + 1`, but the
+   * new epoch is PROVISIONAL — if a sibling device's higher epoch
+   * exists on-chain, the two devices may collide. The next discovery
+   * cycle (periodic poll or explicit `recoverLatest`) will surface
+   * the conflict via the normal walkback-floor path.
+   *
+   * Payload: `{ newEpoch, reason, discoveryError, ts }`.
+   */
+  | 'profile:epoch-reset-discovery-skipped'
+  /**
+   * Issue #310 / PR #316 F2 fix — fires when `resetEpoch` timed out
+   * waiting for the aggregator-pointer publish to land. The local
+   * epoch floor IS already persisted; the periodic-poll retry or
+   * next dirty-flush will republish in the background. Callers
+   * monitoring for the post-reset publish should keep watching
+   * `'storage:pointer-published'` events (or re-call
+   * `getEpochFloor()` after a few seconds).
+   *
+   * Payload: `{ newEpoch, reason, timeoutMs, ts }`.
+   */
+  | 'profile:epoch-reset-publish-pending';
 
 export interface SphereEventMap {
   'transfer:incoming': IncomingTransfer;
@@ -1493,6 +1522,39 @@ export interface SphereEventMap {
   'swap:failed': { swapId: string; error: string };
   'swap:deposit_returned': { swapId: string; transfer: import('../modules/accounting/types').InvoiceTransferRef; returnReason: string };
   'swap:bounce_received': { swapId: string; reason: string; returnedAmount: string; returnedCurrency: string };
+  /**
+   * Issue #310 — payload for `'profile:epoch-reset'`. `newEpoch` is the
+   * post-reset value (strictly `prev + 1`). `reason` is the
+   * operator-supplied triage string. `ts` is the wall-clock instant
+   * (ms epoch) of the reset.
+   */
+  'profile:epoch-reset': { newEpoch: number; reason: string; ts: number };
+  /**
+   * Issue #310 / PR #316 F1 fix — payload for
+   * `'profile:epoch-reset-discovery-skipped'`. `newEpoch` is the
+   * bumped local floor (provisional — see event-type doc).
+   * `discoveryError` is a short diagnostic string suitable for
+   * operator triage; the underlying error is also logged.
+   */
+  'profile:epoch-reset-discovery-skipped': {
+    newEpoch: number;
+    reason: string;
+    discoveryError: string;
+    ts: number;
+  };
+  /**
+   * Issue #310 / PR #316 F2 fix — payload for
+   * `'profile:epoch-reset-publish-pending'`. Fires when the publish
+   * step did not land within the bounded timeout. The wallet's local
+   * floor is unchanged from the corresponding `'profile:epoch-reset'`
+   * event; the publish will be retried by the periodic poll.
+   */
+  'profile:epoch-reset-publish-pending': {
+    newEpoch: number;
+    reason: string;
+    timeoutMs: number;
+    ts: number;
+  };
 }
 
 export type SphereEventHandler<T extends SphereEventType> = (
