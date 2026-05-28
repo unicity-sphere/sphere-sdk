@@ -38,7 +38,14 @@ export {
   resolvePublishVersion,
 } from './marker.js';
 export type { MarkerResolution } from './marker.js';
-export { isBlocked, setBlocked, clearBlocked, maybeSetBlocked, classifyBlockedReason } from './blocked-state.js';
+export {
+  isBlocked,
+  setBlocked,
+  clearBlocked,
+  maybeSetBlocked,
+  classifyBlockedReason,
+  isTransientRecoveryReason,
+} from './blocked-state.js';
 export type { BlockedReason } from './blocked-state.js';
 export { createPointerMutex } from './mutex-lock.js';
 export type { PointerMutex, MutexHandle, MutexAcquireOptions, MutexFactoryOptions, NodeLockPrimitives } from './mutex-lock.js';

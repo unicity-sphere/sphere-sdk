@@ -617,7 +617,41 @@ export type StorageEventType =
    *
    * `data` carries `{ reason: string, walletId?: string }`.
    */
-  | 'profile:snapshot-corrupt';
+  | 'profile:snapshot-corrupt'
+  /**
+   * Issue #319 — emitted by the pointer-poll worker when it observed a
+   * successful `recoverLatest()` round-trip against the aggregator AND
+   * the wallet was in a BLOCKED state with a transient-connectivity
+   * reason (`retry_exhausted`, `network_timeout`, `dns_failure`,
+   * `tls_failure`). The flag has been cleared automatically; subsequent
+   * publish attempts will proceed without the operator having to call
+   * `recoverLatest()` from a console.
+   *
+   * Persistent BLOCKED reasons (`aggregator_rejected`, `protocol_error`,
+   * `marker_corrupt`, `rejected`) are NEVER auto-cleared and never
+   * trigger this event — those still require an explicit operator
+   * decision per SPEC §10.2.4.
+   *
+   * Suppressed when the same-tick post-clear retry immediately re-set
+   * BLOCKED — the operator-visible signal would otherwise flicker
+   * between "wallet recovered" and "wallet blocked" with no durable
+   * progress. The next successful poll will surface the auto-clear
+   * once the underlying connectivity actually stabilises.
+   *
+   * `data` carries:
+   *   - `clearedReason: BlockedReason`   the transient reason that
+   *                                      WAS cleared (past tense — the
+   *                                      wallet is no longer blocked)
+   *   - `clearedAt: number`              UNIX ms timestamp
+   *
+   * Informational only. UIs may use this to dismiss a previously-shown
+   * "wallet blocked" banner.
+   *
+   * Operator note: `clearedReason` is operational metadata, not user-
+   * identifying data, but telemetry pipelines that forward these events
+   * upstream SHOULD scrub or aggregate per their privacy policy.
+   */
+  | 'storage:blocked-auto-cleared';
 
 export interface StorageEvent {
   type: StorageEventType;

@@ -138,6 +138,42 @@ const KNOWN_BLOCKED_REASONS = new Set<string>([
   'rejected',
 ]);
 
+// Issue #319 — BLOCKED reasons that represent a *transient connectivity*
+// failure mode and are therefore safe to clear automatically once a
+// subsequent operation against the aggregator pointer chain succeeds.
+//
+// Principle: a successful `recoverLatest()` round-trip proves that the
+// aggregator is reachable end-to-end (DNS resolved, TLS handshake passed,
+// HTTP responses parseable). Any BLOCKED state set BECAUSE the wallet
+// could not reach the aggregator therefore no longer reflects ground truth
+// and may be cleared.
+//
+// EXPLICITLY EXCLUDED — these encode persistent failures that require
+// operator investigation, not connectivity loss:
+//   - aggregator_rejected: 4xx permanent rejection (config/auth/version)
+//   - protocol_error:      unrecognized aggregator response (SDK mismatch)
+//   - marker_corrupt:      local pending-marker storage damage
+//   - rejected:            H8 v-burning (version permanently consumed)
+const TRANSIENT_RECOVERY_REASONS: ReadonlySet<BlockedReason> = new Set<BlockedReason>([
+  'retry_exhausted',
+  'network_timeout',
+  'dns_failure',
+  'tls_failure',
+]);
+
+/**
+ * Issue #319 — predicate: is `reason` a transient connectivity failure
+ * that the pointer-poll worker may clear automatically once it observes
+ * a successful aggregator round-trip?
+ *
+ * Returns `false` for any divergent-chain / snapshot-loss / corruption
+ * class of block so those continue to require operator action per
+ * SPEC §10.2.4.
+ */
+export function isTransientRecoveryReason(reason: BlockedReason): boolean {
+  return TRANSIENT_RECOVERY_REASONS.has(reason);
+}
+
 /**
  * Read the current BLOCKED state.  Returns `{ blocked: false }` if no flag
  * is present (normal — wallet never blocked).
