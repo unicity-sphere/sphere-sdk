@@ -16,6 +16,11 @@ import { hexToBytes } from '../core/hex.js';
 import { ProfileError } from './errors.js';
 import { installHeliaBlockstoreGetShim } from './helia-blockstore-shim.js';
 import {
+  installHeliaBlockstorePinShim,
+  requestPersistentStorage,
+  type PinShimHandle,
+} from './helia-blockstore-pin-shim.js';
+import {
   decodeAndDowngradeReplicated,
   decodeEntry,
   encodeEntry,
@@ -102,6 +107,29 @@ export class OrbitDbAdapter implements ProfileDatabase {
    * `helia.stop()` race and the `onSettle` null-out.
    */
   private shuttingDown = false;
+
+  /**
+   * Issue #311 — handle to the pin shim installed over
+   * `helia.blockstore.put`. Exposed via `getPinShimCounters()` for
+   * tests and operator diagnostics. Null until `connectInner()` has
+   * installed the shim; cleared on `cleanupOnError()` and `closeInner()`.
+   */
+  private pinShim: PinShimHandle | null = null;
+
+  /**
+   * Issue #311 — listener invoked exactly once during `connectInner()`
+   * AFTER the `navigator.storage.persist()` outcome is known. Tests
+   * subscribe to assert the boot path fired the event; production
+   * wiring (the factory) plumbs it into `tokenStorage.emitEvent` so
+   * it surfaces on the public `onEvent` surface as
+   * `profile:storage-persistence`.
+   *
+   * `null` (default) means the adapter still calls `requestPersistentStorage`
+   * but does not surface the result — useful for tests that don't care.
+   */
+  private storagePersistenceListener:
+    | ((info: { readonly granted: boolean; readonly supported: boolean }) => void)
+    | null = null;
 
   // ---------- ProfileDatabase implementation ----------
 
@@ -219,6 +247,31 @@ export class OrbitDbAdapter implements ProfileDatabase {
     // `shuttingDown = true` and silently disable the local-helia
     // fast-path for the lifetime of the next session.
     this.shuttingDown = false;
+
+    // Issue #311 — request persistent storage from the browser as the
+    // FIRST step so any subsequent IndexedDB writes (Helia FsBlockstore /
+    // IDBBlockstore, OrbitDB level state, libp2p keychain) land in
+    // storage that is NOT eligible for opportunistic browser eviction.
+    // Browser-only — Node returns
+    // `{ granted: false, supported: false }` synchronously without
+    // touching globals. Fire-and-forget so a slow `persist()` does
+    // NOT block OrbitDB attach. The result is surfaced via the
+    // optional `storagePersistenceListener` (wired by the factory).
+    void requestPersistentStorage()
+      .then((result) => {
+        const listener = this.storagePersistenceListener;
+        if (listener !== null) {
+          try {
+            listener(result);
+          } catch {
+            // Best-effort signal; never break attach on a misbehaving listener.
+          }
+        }
+      })
+      .catch(() => {
+        // Defense-in-depth — `requestPersistentStorage` already
+        // swallows its own errors.
+      });
 
     // --- Dynamic import of @orbitdb/core ---
     let orbitdbModule: any;
@@ -498,6 +551,20 @@ export class OrbitDbAdapter implements ProfileDatabase {
       if (heliaInstance?.blockstore && typeof heliaInstance.blockstore.get === 'function') {
         installHeliaBlockstoreGetShim(heliaInstance.blockstore);
       }
+
+      // Issue #311 — install the pin shim over `helia.blockstore.put`
+      // so every block OrbitDB writes is pinned via `helia.pins.add`.
+      // Pinned blocks survive Helia GC; the unpinned default is the
+      // root cause of the `sphere-telco-test.dyndns.org` lockout
+      // (block `bafyreihx3oa...` evicted from the IDBBlockstore
+      // between sessions). Best-effort: a missing `pins` API or a
+      // pin rejection does NOT break the put. The companion
+      // `requestPersistentStorage()` call fires earlier in
+      // `connectInner` (before any await) so the browser persistence
+      // request is initiated as soon as possible.
+      //
+      // Implementation: see `profile/helia-blockstore-pin-shim.ts`.
+      this.pinShim = installHeliaBlockstorePinShim(heliaInstance);
 
       // 2. Create OrbitDB instance
       const createOrbitDB =
@@ -982,6 +1049,11 @@ export class OrbitDbAdapter implements ProfileDatabase {
       this.helia = null;
     });
 
+    // Issue #311 — drop the pin-shim handle. The wrapped `blockstore.put`
+    // is held by Helia's now-stopped blockstore; we just release our
+    // observability reference. Next connect() installs a fresh shim.
+    this.pinShim = null;
+
     this.connected = false;
     // Clear the shutdown gate AFTER `this.connected` flips. A
     // subsequent connect() resets it again defensively below.
@@ -1048,6 +1120,49 @@ export class OrbitDbAdapter implements ProfileDatabase {
     return this.helia ?? null;
   }
 
+  /**
+   * Issue #311 — register a listener fired exactly once per `connect()`
+   * call with the result of `navigator.storage.persist()`. Must be set
+   * BEFORE `connect()` to be observed (the listener fires from inside
+   * `connectInner`). Pass `null` to disable.
+   *
+   * Production wiring routes this into the token-storage provider's
+   * `emitEvent` so it surfaces as a `profile:storage-persistence`
+   * StorageEvent. Tests use it directly to assert the call fired.
+   */
+  setStoragePersistenceListener(
+    listener:
+      | ((info: { readonly granted: boolean; readonly supported: boolean }) => void)
+      | null,
+  ): void {
+    this.storagePersistenceListener = listener;
+  }
+
+  /**
+   * Issue #311 — snapshot of the pin-shim counters. Null when the
+   * adapter has not yet connected (or has been closed). Test-observable.
+   */
+  getPinShimCounters(): {
+    readonly pinAttempted: number;
+    readonly pinSucceeded: number;
+    readonly pinFailed: number;
+    readonly pinSkipped: number;
+  } | null {
+    if (this.pinShim === null) return null;
+    return this.pinShim.getCounters();
+  }
+
+  /**
+   * Issue #311 — snapshot of pinned CIDs known to the shim. Null when
+   * not yet connected. Test-observable; production callers should not
+   * rely on this for correctness (the source of truth is
+   * `helia.pins.ls()`).
+   */
+  getPinnedCids(): ReadonlyArray<string> | null {
+    if (this.pinShim === null) return null;
+    return this.pinShim.getPinnedCids();
+  }
+
   // ---------- Private helpers ----------
 
   /**
@@ -1090,6 +1205,9 @@ export class OrbitDbAdapter implements ProfileDatabase {
     this.db = null;
     this.orbitdb = null;
     this.helia = null;
+    // Issue #311 — drop the pin-shim handle alongside helia (the
+    // wrapped blockstore.put is dead with helia stopped).
+    this.pinShim = null;
     this.connected = false;
     // A config that produced a failed connect is suspect — wipe it so
     // resetCorruptedLog() cannot silently reuse a known-bad input.

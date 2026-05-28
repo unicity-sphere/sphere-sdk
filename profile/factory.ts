@@ -572,6 +572,65 @@ export function createProfileProviders(
   );
   tokenStorageHolder.current = tokenStorage;
 
+  // Issue #311 — bridge the OrbitDbAdapter / ProfileStorageProvider
+  // observability hooks for Helia browser blockstore durability into
+  // the token-storage event surface so consumers (sphere.telco, the
+  // Sphere wallet UI, operator monitors) have a single subscription
+  // point for these typed events. Each notifier is best-effort and
+  // dedup'd at its source — they never trigger more than once per
+  // unique signal per provider instance.
+  //
+  // Defensive feature-probing: legacy test stubs that mock
+  // `OrbitDbAdapter` with a minimal `ProfileDatabase`-shaped object
+  // do NOT expose `setStoragePersistenceListener`. The bridge skips
+  // wiring in that case — wallets running against a legitimate
+  // adapter still get the events; the test stub remains compatible.
+  // Same defense applies to `setCriticalBlockEvictedNotifier`, which
+  // is technically present on every ProfileStorageProvider we ship
+  // but a future minimal-stub seam may not expose it.
+  const dbWithPersistenceHook = db as unknown as {
+    setStoragePersistenceListener?: (
+      cb:
+        | ((info: { readonly granted: boolean; readonly supported: boolean }) => void)
+        | null,
+    ) => void;
+  };
+  if (typeof dbWithPersistenceHook.setStoragePersistenceListener === 'function') {
+    dbWithPersistenceHook.setStoragePersistenceListener((result) => {
+      tokenStorage.emitExternalProfileEvent({
+        type: 'profile:storage-persistence',
+        timestamp: Date.now(),
+        data: { granted: result.granted, supported: result.supported },
+      });
+    });
+  }
+  const storageWithCriticalHook = storage as unknown as {
+    setCriticalBlockEvictedNotifier?: (
+      cb:
+        | ((info: {
+            readonly cid: string | null;
+            readonly key: string;
+            readonly attemptedAt: number;
+          }) => void)
+        | null,
+    ) => void;
+  };
+  if (
+    typeof storageWithCriticalHook.setCriticalBlockEvictedNotifier === 'function'
+  ) {
+    storageWithCriticalHook.setCriticalBlockEvictedNotifier((info) => {
+      tokenStorage.emitExternalProfileEvent({
+        type: 'profile:critical-block-evicted',
+        timestamp: Date.now(),
+        data: {
+          cid: info.cid,
+          key: info.key,
+          attemptedAt: info.attemptedAt,
+        },
+      });
+    });
+  }
+
   // Item #15 Phase C.3 — bridge writer-side dirty signals to the
   // token-storage debouncer. `setProfileDirtyNotifier(cb)` propagates
   // the callback into every per-writer instance produced by the

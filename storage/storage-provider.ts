@@ -517,7 +517,54 @@ export type StorageEventType =
    * `profile:recovered`; both are emitted on every auto-reset attempt
    * (one before, one after).
    */
-  | 'profile:oplog-auto-resetting';
+  | 'profile:oplog-auto-resetting'
+  /**
+   * Issue #311 — emitted once during browser profile factory boot to
+   * report the outcome of `navigator.storage.persist()`. Operators (and
+   * the wallet UI) use this to detect when persistence was DENIED so
+   * they can warn the user that the wallet may need to re-sync from
+   * remote storage after a browser-driven eviction.
+   *
+   * `data` carries `{ granted, supported }`:
+   *   - `supported: false` — the runtime has no `navigator.storage.persist`
+   *     (Node, SSR, legacy Safari, embedded WebViews). `granted` is also
+   *     false in this case.
+   *   - `supported: true, granted: false` — the platform supports the
+   *     API but the request was denied (user policy, permissions
+   *     policy, or the promise was rejected).
+   *   - `supported: true, granted: true` — the wallet's origin storage
+   *     is marked persistent and is NOT eligible for the browser's
+   *     opportunistic eviction sweep.
+   *
+   * Informational only — the wallet continues to operate regardless;
+   * `false` simply signals reduced durability guarantees.
+   */
+  | 'profile:storage-persistence'
+  /**
+   * Issue #311 — emitted when the Profile read path observed a
+   * "Failed to load block for <CID>" signature. This indicates that
+   * a block reachable from the live OpLog head (or a referenced
+   * snapshot) was evicted from the local Helia blockstore and the
+   * read could not be served. The companion `profile:oplog-auto-resetting`
+   * event will typically follow on the flush path; this event fires
+   * EARLIER and from the read path so operators see the eviction the
+   * moment it manifests, not after a write-side trigger.
+   *
+   * `data` carries `{ cid, key, attemptedAt }`:
+   *   - `cid` — the missing block CID extracted from the Helia error
+   *     message (matches the `bafy[a-z0-9]+` pattern via
+   *     {@link extractLostHeadCid}; null when the error carried no
+   *     identifiable CID).
+   *   - `key` — the profile key whose read triggered the error (e.g.
+   *     `outbox.<addr>.<entryId>`). May be redacted in logs.
+   *   - `attemptedAt` — UNIX ms timestamp of the failed read.
+   *
+   * Dedup: the provider tracks a bounded set of (cid, key) pairs and
+   * fires the event at most once per pair per provider instance so a
+   * persistent missing block does not spam the event surface on every
+   * subsequent read attempt.
+   */
+  | 'profile:critical-block-evicted';
 
 export interface StorageEvent {
   type: StorageEventType;
