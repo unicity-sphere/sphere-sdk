@@ -73,6 +73,7 @@ import {
 import type { ShutdownOptions } from '../../storage/storage-provider.js';
 import type { BundleIndex } from './bundle-index.js';
 import type { ProfileTokenStorageHost } from './host.js';
+import { tryAutoResetCorruptedOplog } from './oplog-auto-reset.js';
 // RFC-251 Approach D / issue #255 Problem B — pointer-publish win-broadcast.
 // Imported only for the publish-success path; absent pointer layer ⇒ skipped.
 import {
@@ -386,17 +387,20 @@ export class LifecycleManager {
       // subsequent `save()` then rejects with `"Provider not initialized"`,
       // making the wallet effectively unusable for the session.
       //
-      // **Scope of this band-aid.** Tolerating the throw here ONLY
-      // unblocks `initialize()`. Subsequent calls to `db.all()` —
-      // notably `provider.load()`, `provider.sync()`, and the flush
-      // scheduler's bundle-monotonicity checks — still throw on the
-      // same corrupt block (those paths have pre-existing try/catch
-      // swallows that may silently degrade further). The structural
-      // fix is to make `OrbitDbAdapter.all()` tolerate per-OpLog-entry
-      // block-load failures the same way it tolerates per-entry
-      // coercion failures (see `tryCoerce` in orbitdb-adapter.ts). That
-      // larger fix is tracked separately — search the issue tracker
-      // for "OrbitDbAdapter.all per-block tolerance".
+      // **Recovery (Issue #308).** When the throw carries the
+      // "Failed to load block for <CID>" signature, the catch below now
+      // routes through `tryAutoResetCorruptedOplog` to reset the corrupt
+      // OpLog, write a recovery marker, and retry `refreshKnownBundles`
+      // ONCE — the same recovery the WRITE path got in PR #305. Only when
+      // that recovery does not apply (signature mismatch, no
+      // `resetCorruptedLog` on the adapter, or the reset/retry fails) do
+      // we fall back to the tolerant band-aid below: tolerate the throw
+      // to unblock `initialize()` and proceed with an empty bundle set.
+      // Note that a still-orthogonal improvement — making
+      // `OrbitDbAdapter.all()` skip individual unreadable OpLog entries
+      // the way `tryCoerce` skips per-entry coercion failures — would let
+      // the read recover the *readable* bundles instead of resetting the
+      // whole log; that per-entry tolerance is tracked separately.
       //
       // **Operator observability.** The catch emits a `storage:error`
       // event with code `BUNDLE_INDEX_REFRESH_FAILED` so consumers
@@ -412,32 +416,59 @@ export class LifecycleManager {
       try {
         await this.bundleIndex.refreshKnownBundles();
       } catch (err) {
-        this.host.log(
-          `bundleIndex.refreshKnownBundles failed (proceeding with empty ` +
-            `bundle set; cold-start recovery may repopulate, but cross-` +
-            `device sync and load() will continue to fail until the ` +
-            `corrupt OpLog entry is bypassed): ${
-              err instanceof Error ? err.message : String(err)
-            }`,
+        // Issue #308 — mirror the WRITE-path corrupt-OpLog auto-reset
+        // (PR #305, `FlushScheduler.addBundleWithOplogAutoReset`) onto
+        // this READ path. When `db.all('tokens.bundle.')` throws the
+        // "Failed to load block for <CID>" signature, reset the corrupt
+        // log, write a recovery marker, and retry `refreshKnownBundles`
+        // ONCE against the fresh log. Without this, a wallet that does no
+        // bundle writes re-reads the unreachable head block — and
+        // re-emits the warning below — on every boot, because the
+        // write-path reset is gated on a write that never happens.
+        const outcome = await tryAutoResetCorruptedOplog(
+          this.host,
+          err,
+          'lifecycle-manager.bundle-index-refresh',
+          () => this.bundleIndex.refreshKnownBundles(),
         );
-        // Emit the degraded-state event so operator dashboards and the
-        // sphere.telco UI's migration banner can surface the condition
-        // BEFORE the user clicks Migrate and unwittingly publishes a
-        // partial-view bundle pointer.
-        this.host.emitEvent(
-          this.host.buildErrorEvent(
-            'storage:error',
-            err,
-            'BUNDLE_INDEX_REFRESH_FAILED',
-          ),
-        );
-        // Defense-in-depth reset. `refreshKnownBundles` builds its
-        // result locally and only writes to host AFTER `db.all()`
-        // succeeds, so a partial walk does NOT leak state under the
-        // current implementation. We still reset here so a future
-        // refactor that introduces incremental writes cannot silently
-        // bypass the catch.
-        this.host.setKnownBundleCids(new Set());
+
+        if (!outcome.retrySucceeded) {
+          // Pre-existing tolerant fallback (Issue #239 / #301). Reached
+          // when: the error is not the lost-head-CID signature; OR the
+          // adapter exposes no `resetCorruptedLog` (legacy stub); OR the
+          // reset / retry itself failed. Surface the degraded state and
+          // proceed with an empty bundle set so the cold-start recovery
+          // branch below can repopulate from the aggregator pointer layer.
+          this.host.log(
+            `bundleIndex.refreshKnownBundles failed (proceeding with empty ` +
+              `bundle set; cold-start recovery may repopulate): ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+          );
+          // Emit the degraded-state event so operator dashboards and the
+          // sphere.telco UI's migration banner can surface the condition
+          // BEFORE the user clicks Migrate and unwittingly publishes a
+          // partial-view bundle pointer.
+          this.host.emitEvent(
+            this.host.buildErrorEvent(
+              'storage:error',
+              err,
+              'BUNDLE_INDEX_REFRESH_FAILED',
+            ),
+          );
+          // Defense-in-depth reset. `refreshKnownBundles` builds its
+          // result locally and only writes to host AFTER `db.all()`
+          // succeeds, so a partial walk does NOT leak state under the
+          // current implementation. We still reset here so a future
+          // refactor that introduces incremental writes cannot silently
+          // bypass the catch.
+          this.host.setKnownBundleCids(new Set());
+        }
+        // else: the auto-reset succeeded and `refreshKnownBundles` re-ran
+        // against the fresh log, populating `knownBundleCids` via
+        // `host.setKnownBundleCids`. The helper already emitted
+        // `profile:oplog-auto-resetting` + `profile:recovered`; no
+        // degraded-state warning is emitted because we recovered.
       }
 
       // COLD-START RECOVERY: if OrbitDB has no bundles locally, this
