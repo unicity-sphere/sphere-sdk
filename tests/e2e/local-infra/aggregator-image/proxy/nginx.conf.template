@@ -38,11 +38,18 @@ server {
         proxy_send_timeout 600s;
     }
 
-    # Lightweight liveness — short-circuits the backend so the proxy
-    # itself can fail-fast if nginx is wedged but the backend is fine.
+    # /health passes through to the backend so callers see the full
+    # response (status, role, sharding, database details, etc.). The
+    # proxy's own liveness is implicit — if nginx is up enough to
+    # forward the request and read the reply, both halves are alive.
+    # Hiding the backend response behind a static 200 made tools like
+    # unicity-infra-probe report "degraded" because they couldn't see
+    # database state.
     location = /health {
         access_log off;
-        return 200 '{"status":"ok"}';
-        default_type application/json;
+        proxy_pass http://aggregator_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_read_timeout 10s;
     }
 }
