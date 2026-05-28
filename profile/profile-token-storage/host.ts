@@ -387,4 +387,52 @@ export interface ProfileTokenStorageHost {
    * by the reconcile loop's `fetchAndJoin` callback exclusively.
    */
   applySnapshotIfWired(cidString: string): Promise<ApplySnapshotResult | null>;
+
+  /**
+   * Issue #313 — atomic-write the local snapshot blob (lazy-load cache)
+   * with the current in-memory state. Called by `FlushScheduler` after
+   * every successful flush + publish, by `LifecycleManager.shutdown()`
+   * on graceful exit, and by `LifecycleManager` after a background sync
+   * walks the pointer forward.
+   *
+   * Failures are caught and surfaced via `storage:error` with code
+   * `PROFILE_SNAPSHOT_WRITE_FAILED`; they do NOT propagate to the caller
+   * because the snapshot is a perf optimisation, not a correctness gate
+   * (worst case: next cold boot falls through to the slow path).
+   *
+   * `trigger` is forwarded into the emitted
+   * `profile:snapshot-refreshed` event so operator dashboards can
+   * distinguish flush-driven writes from shutdown drains and from
+   * background-sync writes.
+   *
+   * No-ops when:
+   *   - `localCache` is null (provider constructed without a local cache);
+   *   - identity is not yet bound (cold-start before `setIdentity()`);
+   *   - the network identifier is not configured (defensive).
+   */
+  writeLocalSnapshot(
+    trigger: 'flush' | 'shutdown' | 'background-sync',
+    options?: {
+      readonly previousPointerVersion?: number | null;
+      readonly durationMs?: number;
+    },
+  ): Promise<void>;
+
+  /**
+   * Issue #313 — read the local snapshot blob and SEED the in-memory
+   * state (`lastLoadedData`, `knownBundleCids`, `lastDiscoveredPointerCid`)
+   * from it. Called by `LifecycleManager.initialize()` BEFORE the
+   * OrbitDB connect + bundle-index refresh so a cold-boot UI render
+   * does not wait on the aggregator pointer recovery.
+   *
+   * Returns `true` if a valid snapshot was found and applied; `false`
+   * otherwise (fresh wallet, corrupt blob, or no local cache). Caller
+   * still runs the normal initialize flow — the snapshot just pre-fills
+   * the state so the UI has something to render immediately.
+   *
+   * On corruption, the broken blob is cleaned up and
+   * `profile:snapshot-corrupt` is emitted. On a successful seed,
+   * `profile:snapshot-loaded` is emitted with timing metadata.
+   */
+  readLocalSnapshot(): Promise<boolean>;
 }

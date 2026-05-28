@@ -36,7 +36,6 @@ import { CidRefStore } from './cid-ref-store';
 import { Lamport } from './lamport';
 import { buildLocalEntry } from './oplog-entry';
 import { getEnvelopePayload } from './oplog-envelope-io';
-import { extractLostHeadCid } from './orbitdb-adapter';
 import type { OpLogEntryType } from './aggregator-pointer/originated-tag';
 import type { ProfilePointerLayer } from './aggregator-pointer';
 import {

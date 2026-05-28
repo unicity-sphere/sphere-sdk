@@ -334,10 +334,40 @@ export class LifecycleManager {
 
     this.host.setStatus('connecting');
 
+    // Issue #313 — lazy-load: seed the in-memory state from the local
+    // snapshot blob BEFORE the OrbitDB connect / bundle-index refresh
+    // path runs. On a valid snapshot the wallet has renderable
+    // `lastLoadedData` + `knownBundleCids` + `lastDiscoveredPointerCid`
+    // before any remote round-trip. The rest of this method continues
+    // unchanged and effectively becomes the background sync — bundle
+    // refresh + aggregator pointer recovery run from the seeded
+    // baseline.
+    //
+    // Best-effort: any failure inside the snapshot path falls through
+    // to the slow boot. The snapshot helper does NOT throw; it returns
+    // `true` only when a valid blob was applied. Corruption emits
+    // `profile:snapshot-corrupt` and removes the blob so the next
+    // successful flush replaces it cleanly.
+    let snapshotSeeded = false;
+    try {
+      snapshotSeeded = await this.host.readLocalSnapshot();
+    } catch (err) {
+      // Defensive — the host method already swallows storage errors.
+      // A throw here would be a programmer bug; log + continue.
+      this.host.log(
+        `readLocalSnapshot threw unexpectedly (continuing with slow boot): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+
     try {
       // Ensure OrbitDB is connected
       if (!this.host.db.isConnected()) {
-        this.host.log('OrbitDB not connected; skipping bundle load until connected');
+        this.host.log(
+          `OrbitDB not connected; skipping bundle load until connected` +
+            (snapshotSeeded ? ' (snapshot seeded for offline render)' : ''),
+        );
         this.host.setStatus('connected');
         this.host.setInitialized(true);
         return true;
@@ -564,6 +594,30 @@ export class LifecycleManager {
             (options?.reason ? ` reason=${options.reason}` : ''),
         );
       }
+    }
+
+    // Issue #313 — atomic-write the lazy-load snapshot blob on
+    // shutdown. This is the LAST safe point at which `lastLoadedData`
+    // + `knownBundleCids` + `lastDiscoveredPointerCid` are all still
+    // populated; the upcoming teardown block (`setLastLoadedData(null)`,
+    // etc.) wipes them. The write is best-effort: failures route
+    // through `storage:error` and do not block shutdown.
+    //
+    // Distinct from the flush-driven snapshot write at
+    // `FlushScheduler.flushToIpfs` — that one fires per successful
+    // flush; this one captures any in-memory state that arrived
+    // BETWEEN the last flush and shutdown (e.g., a save that landed
+    // after the final debounce cancel + force-flush above). For an
+    // immediately-after-flush shutdown this write is a no-op rewrite of
+    // the same blob; the cost is one local-storage transaction.
+    try {
+      await this.host.writeLocalSnapshot('shutdown');
+    } catch (err) {
+      this.host.log(
+        `Shutdown snapshot write threw unexpectedly (best-effort): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
     }
 
     // Steelman³⁸ warning: unsubscribe from replication BEFORE we null
@@ -2036,6 +2090,13 @@ export class LifecycleManager {
     const getPointerLayer = this.host.options?.getPointerLayer;
     if (!getPointerLayer) return; // wiring removed mid-flight — defensive
 
+    // Issue #313 — start timer for the `background-sync` snapshot
+    // refresh. Captured once at poll entry so the durationMs reported
+    // in `profile:snapshot-refreshed` measures the full poll-to-write
+    // window (recoverLatest + applySnapshotIfWired + load) not just
+    // the snapshot write itself.
+    const pollStartedAt = Date.now();
+
     let nextBackoffMultiplier = 1;
     const pointer = getPointerLayer() ?? null;
     if (!pointer) {
@@ -2209,6 +2270,30 @@ export class LifecycleManager {
           );
         }
       }
+
+      // Issue #313 — atomic-write the snapshot blob to capture the
+      // background-sync's freshly-merged state. The poll just walked
+      // the aggregator pointer forward + applied a new snapshot CID;
+      // `lastLoadedData` (updated by `onPollDiscoveredNewCid`) and
+      // `lastDiscoveredPointerCid` (set above) now reflect the
+      // post-sync view. Persist it so the NEXT cold boot reads the
+      // post-sync state without re-walking the aggregator.
+      //
+      // Fire-and-forget. Failures route through `storage:error`
+      // (`PROFILE_SNAPSHOT_WRITE_FAILED`) so the poll re-arm at the
+      // end of the method is unaffected.
+      const durationMs = Date.now() - pollStartedAt;
+      void this.host
+        .writeLocalSnapshot('background-sync', {
+          durationMs,
+        })
+        .catch((err2) => {
+          this.host.log(
+            `Pointer poll: writeLocalSnapshot threw unexpectedly: ${
+              err2 instanceof Error ? err2.message : String(err2)
+            }`,
+          );
+        });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.host.log(`Pointer poll: applySnapshotIfWired failed: ${msg}`);

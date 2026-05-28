@@ -564,7 +564,60 @@ export type StorageEventType =
    * persistent missing block does not spam the event surface on every
    * subsequent read attempt.
    */
-  | 'profile:critical-block-evicted';
+  | 'profile:critical-block-evicted'
+  /**
+   * Issue #311 — emitted when the adapter's best-effort
+   * `helia.pins.add(cid)` call fails for a freshly written OpLog
+   * entry. Distinct from `storage:error` (terminal): a pin failure is
+   * additive — the underlying write still succeeded and the block was
+   * stored — but the durability invariant ("every OpLog block reachable
+   * from the live head is pinned") was weakened for this one CID.
+   * `data` carries `{ cid, errorMessage }`.
+   */
+  | 'profile:oplog-pin-failed'
+  /**
+   * Issue #313 — emitted by `LifecycleManager.initialize()` when a
+   * valid cached snapshot blob has been read and used to seed the
+   * in-memory state. Fires BEFORE OrbitDB connect + bundle-index
+   * refresh; UI consumers can render the wallet from cached state
+   * immediately (no aggregator / remote IPFS round trips).
+   *
+   * `data` carries:
+   *   - `ageMs: number`           how stale the snapshot is (now - ts)
+   *   - `tokenCount: number`      number of tokens reconstituted from snapshot
+   *   - `bundleCount: number`     number of bundle CIDs primed
+   *   - `pointerVersion?: number` the cached pointer version (if any)
+   *
+   * Distinct from `storage:loaded` (which fires after a full OpLog walk).
+   * When no snapshot is present (fresh wallet, post-clear, or corrupt
+   * blob) this event is NOT emitted and boot falls through to the
+   * standard OpLog walk path.
+   */
+  | 'profile:snapshot-loaded'
+  /**
+   * Issue #313 — emitted after the snapshot blob has been atomically
+   * written (after a successful flush, after a background remote sync,
+   * or during graceful shutdown). Lets UI surfaces show a
+   * "last-saved" indicator without polling storage directly.
+   *
+   * `data` carries:
+   *   - `from?: number`     previous pointer version (if cached)
+   *   - `to?: number`       new pointer version (if any)
+   *   - `durationMs?: number` wall-clock time spent on sync (for refreshes)
+   *   - `trigger: 'flush' | 'shutdown' | 'background-sync'`
+   */
+  | 'profile:snapshot-refreshed'
+  /**
+   * Issue #313 — emitted when the cold-boot snapshot read detected a
+   * corrupt or schema-incompatible blob and fell through to the OpLog
+   * walk path. The corrupt blob has been removed; the wallet still
+   * boots normally (degraded performance only). Operator-visible
+   * signal that a previous shutdown left a partial-write or the
+   * schema version changed (post-upgrade first boot).
+   *
+   * `data` carries `{ reason: string, walletId?: string }`.
+   */
+  | 'profile:snapshot-corrupt';
 
 export interface StorageEvent {
   type: StorageEventType;
