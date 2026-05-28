@@ -127,6 +127,7 @@ import {
   type CarFetcher,
   type CidDecoder,
 } from './aggregator-probe.js';
+import { pickEpochFloor, shouldSkipForEpochFloor } from './epoch-floor.js';
 import {
   DISCOVERY_CORRUPT_WALKBACK,
   DISCOVERY_HARD_CEILING,
@@ -171,6 +172,33 @@ export interface DiscoverInput {
    * to its per-request timeout.
    */
   readonly abortSignal?: AbortSignal;
+  /**
+   * Issue #310 — OpLog epoch-floor inspector. Given a Phase-3
+   * candidate that classified as VALID, return its snapshot's
+   * `epoch` (or undefined for pre-#310 snapshots).
+   *
+   * Default behavior (callback omitted): epoch-floor walkback is
+   * DISABLED. Every VALID candidate is treated as `epoch = 0` —
+   * backwards-compatible with pre-#310 SDKs.
+   *
+   * When supplied, Phase 3 consults this callback on every VALID
+   * candidate, tracks the running max epoch as a floor, and SKIPS
+   * candidates whose snapshot's epoch is strictly below the floor.
+   *
+   * On throw, the candidate is treated as SEMANTICALLY_INVALID
+   * (skip + walk back, count toward budget).
+   */
+  readonly inspectSnapshotEpoch?: (
+    v: PointerVersion,
+    cidBytes: Uint8Array,
+  ) => Promise<number | undefined> | number | undefined;
+  /**
+   * Issue #310 — initial epoch floor before Phase 3 begins. Defaults
+   * to 0. Set to the wallet's last-applied snapshot epoch so an
+   * aggregator that still serves a pre-reset pointer cannot trick
+   * the wallet into walking back to it.
+   */
+  readonly initialEpochFloor?: number;
   /**
    * Phase 3 walkback policy for `CAR_TRANSIENT` versions (slot EXISTS
    * on-chain — proof verified + CID decoded — but CAR is unreachable).
@@ -234,6 +262,19 @@ export interface DiscoverResult {
    * if such a version exists.
    */
   readonly walkbackUnfetchableSkipped: readonly PointerVersion[];
+  /**
+   * Issue #310 — versions skipped because their snapshot epoch was
+   * strictly below the running floor. Empty when `inspectSnapshotEpoch`
+   * is not wired, when no candidate fell below the floor, or when
+   * Phase 3 never ran.
+   */
+  readonly walkbackEpochSkipped: readonly PointerVersion[];
+  /**
+   * Issue #310 — final epoch floor observed by Phase 3 walkback. The
+   * `max(epoch)` across all Phase-3 candidates whose CARs the wallet
+   * successfully inspected, primed with `initialEpochFloor`.
+   */
+  readonly pickedEpoch: number;
 }
 
 // ── findLatestValidVersion ─────────────────────────────────────────────────
@@ -397,6 +438,27 @@ async function findLatestValidVersionInner(
   const walkbackUnfetchableSkipped: PointerVersion[] = [];
   const skipUnfetchable = input.skipUnfetchableInWalkback !== false;
 
+  // Issue #310 — epoch-floor tracking. Disabled when
+  // `inspectSnapshotEpoch` is not provided.
+  const walkbackEpochSkipped: PointerVersion[] = [];
+  let epochFloor = (() => {
+    const initial = input.initialEpochFloor ?? 0;
+    if (
+      typeof initial !== 'number' ||
+      !Number.isFinite(initial) ||
+      !Number.isInteger(initial) ||
+      initial < 0
+    ) {
+      throw new AggregatorPointerError(
+        AggregatorPointerErrorCode.PROTOCOL_ERROR,
+        `Discovery: initialEpochFloor must be a non-negative integer; got ${String(initial)}.`,
+        { initialEpochFloor: initial },
+      );
+    }
+    return initial;
+  })();
+  const inspectEpoch = input.inspectSnapshotEpoch;
+
   const probeAndRecord = async (v: PointerVersion): Promise<boolean> => {
     checkDeadline();
     probeVersions.push(v);
@@ -497,11 +559,36 @@ async function findLatestValidVersionInner(
     });
 
     if (status === 'VALID') {
+      // Issue #310 — epoch-floor enforcement. Inspect the snapshot's
+      // claimed epoch; skip past versions whose epoch is below the
+      // running floor. Skip semantics mirror SEMANTICALLY_INVALID
+      // (counts toward walkback budget, surfaces in
+      // walkbackEpochSkipped for operator observability).
+      if (inspectEpoch !== undefined) {
+        let candidateEpoch: number | undefined;
+        try {
+          candidateEpoch = await inspectEpoch(candidate, new Uint8Array(0));
+        } catch {
+          // Inspector threw → treat as SEMANTICALLY_INVALID-equivalent.
+          candidate = (candidate - 1) as PointerVersion;
+          walked += 1;
+          continue;
+        }
+        if (shouldSkipForEpochFloor(epochFloor, candidateEpoch)) {
+          walkbackEpochSkipped.push(candidate);
+          candidate = (candidate - 1) as PointerVersion;
+          walked += 1;
+          continue;
+        }
+        epochFloor = pickEpochFloor(epochFloor, candidateEpoch);
+      }
       return {
         validV: candidate,
         includedV,
         probeVersions,
         walkbackUnfetchableSkipped,
+        walkbackEpochSkipped,
+        pickedEpoch: epochFloor,
       };
     }
 
@@ -581,27 +668,32 @@ async function findLatestValidVersionInner(
       includedV,
       probeVersions,
       walkbackUnfetchableSkipped,
+      walkbackEpochSkipped,
+      pickedEpoch: epochFloor,
     };
   }
 
   // Too many consecutive non-VALID versions — bail out (§10.8). The
-  // diagnostic carries the unfetchable-skipped count so operators can
-  // distinguish "wallet is corrupt" (all skipped were SEMANTICALLY_INVALID)
-  // from "IPFS gateways are down" (mostly walkbackUnfetchableSkipped).
-  // Both classes trigger CORRUPT_STREAK because the wallet's effective
-  // walkback budget is the same — but the remediation differs (operator
-  // intervention vs gateway reconnect).
+  // diagnostic carries the unfetchable-skipped + epoch-skipped (issue
+  // #310) counts so operators can distinguish "wallet is corrupt"
+  // (all skipped were SEMANTICALLY_INVALID) from "IPFS gateways are
+  // down" (mostly walkbackUnfetchableSkipped) from "post-reset chain
+  // ahead of floor" (mostly walkbackEpochSkipped).
   throw new AggregatorPointerError(
     AggregatorPointerErrorCode.CORRUPT_STREAK,
     `Phase 3 walkback exhausted walkbackLimit=${walkbackLimit} without finding a VALID version ` +
       `(includedV=${includedV}, candidate=${candidate}, ` +
-      `unfetchableSkipped=${walkbackUnfetchableSkipped.length}). ` +
+      `unfetchableSkipped=${walkbackUnfetchableSkipped.length}, ` +
+      `epochSkipped=${walkbackEpochSkipped.length}, ` +
+      `pickedEpoch=${epochFloor}). ` +
       `Operator may invoke acceptCorruptStreak(walkbackLimit) to override.`,
     {
       includedV,
       walkbackLimit,
       walkedSoFar: walked,
       unfetchableSkippedCount: walkbackUnfetchableSkipped.length,
+      epochSkippedCount: walkbackEpochSkipped.length,
+      pickedEpoch: epochFloor,
     },
   );
 }

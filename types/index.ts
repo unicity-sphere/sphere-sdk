@@ -665,7 +665,12 @@ export type SphereEventType =
   | 'swap:cancelled'
   | 'swap:failed'
   | 'swap:deposit_returned'
-  | 'swap:bounce_received';
+  | 'swap:bounce_received'
+  /**
+   * Issue #310 — fires AFTER `sphere.profile.resetEpoch()` persists
+   * the new epoch floor locally. Payload: `{ newEpoch, reason, ts }`.
+   */
+  | 'profile:epoch-reset';
 
 export interface SphereEventMap {
   'transfer:incoming': IncomingTransfer;
@@ -1477,6 +1482,13 @@ export interface SphereEventMap {
   'swap:failed': { swapId: string; error: string };
   'swap:deposit_returned': { swapId: string; transfer: import('../modules/accounting/types').InvoiceTransferRef; returnReason: string };
   'swap:bounce_received': { swapId: string; reason: string; returnedAmount: string; returnedCurrency: string };
+  /**
+   * Issue #310 — payload for `'profile:epoch-reset'`. `newEpoch` is the
+   * post-reset value (strictly `prev + 1`). `reason` is the
+   * operator-supplied triage string. `ts` is the wall-clock instant
+   * (ms epoch) of the reset.
+   */
+  'profile:epoch-reset': { newEpoch: number; reason: string; ts: number };
 }
 
 export type SphereEventHandler<T extends SphereEventType> = (
