@@ -620,6 +620,17 @@ export type SphereEventType =
    * not a paging signal.
    */
   | 'storage:monotonicity-recovered'
+  /**
+   * Issue #309 — Fires when the caller-supplied `fallbackStorage`
+   * (typically the legacy IndexedDB) fails to connect during Sphere
+   * load/init. The fallback is demoted to `null` so the rest of the
+   * boot proceeds, but identity-key reads that would have consulted it
+   * are now strictly bound to the primary's success. UI surfaces and
+   * monitoring dashboards listen for this so they can warn users that
+   * a Profile-mode wallet whose primary state has lost a block will
+   * not recover from cache on this boot.
+   */
+  | 'storage:fallback-demoted'
   | 'groupchat:message'
   | 'groupchat:joined'
   | 'groupchat:left'
@@ -1408,6 +1419,11 @@ export interface SphereEventMap {
     recoveredOutboxIdsDroppedAsSent: string[];
     recoveredOutboxIdsDroppedAsSentCount: number;
     truncated: boolean;
+  };
+  'storage:fallback-demoted': {
+    reason: 'connect-failed' | 'isConnected-false-after-connect';
+    error: string;
+    at: number;
   };
   'groupchat:message': import('../modules/groupchat/types').GroupMessageData;
   'groupchat:joined': { groupId: string; groupName: string };
