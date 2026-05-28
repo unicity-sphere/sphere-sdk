@@ -693,7 +693,19 @@ export type SphereEventType =
    *
    * Payload: `{ newEpoch, reason, discoveryError, ts }`.
    */
-  | 'profile:epoch-reset-discovery-skipped';
+  | 'profile:epoch-reset-discovery-skipped'
+  /**
+   * Issue #310 / PR #316 F2 fix — fires when `resetEpoch` timed out
+   * waiting for the aggregator-pointer publish to land. The local
+   * epoch floor IS already persisted; the periodic-poll retry or
+   * next dirty-flush will republish in the background. Callers
+   * monitoring for the post-reset publish should keep watching
+   * `'storage:pointer-published'` events (or re-call
+   * `getEpochFloor()` after a few seconds).
+   *
+   * Payload: `{ newEpoch, reason, timeoutMs, ts }`.
+   */
+  | 'profile:epoch-reset-publish-pending';
 
 export interface SphereEventMap {
   'transfer:incoming': IncomingTransfer;
@@ -1528,6 +1540,19 @@ export interface SphereEventMap {
     newEpoch: number;
     reason: string;
     discoveryError: string;
+    ts: number;
+  };
+  /**
+   * Issue #310 / PR #316 F2 fix — payload for
+   * `'profile:epoch-reset-publish-pending'`. Fires when the publish
+   * step did not land within the bounded timeout. The wallet's local
+   * floor is unchanged from the corresponding `'profile:epoch-reset'`
+   * event; the publish will be retried by the periodic poll.
+   */
+  'profile:epoch-reset-publish-pending': {
+    newEpoch: number;
+    reason: string;
+    timeoutMs: number;
     ts: number;
   };
 }

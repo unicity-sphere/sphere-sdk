@@ -1432,6 +1432,23 @@ export class LifecycleManager {
           );
           winBroadcastsOn = false;
         }
+        // PR #316 F2 fix — emit `storage:pointer-published` UNCONDITIONALLY
+        // on every successful publish. Previously this event only fired when
+        // `winBroadcastsOn === true` (issue #264 default-OFF gate), so any
+        // listener wanting a "publish landed" signal (e.g.,
+        // `sphere.profile.resetEpoch` awaiting the post-bump version) was
+        // dead-on-arrival in the default config.
+        //
+        // The event shape now carries `cid` + `version` + `attemptsUsed`
+        // on every emit. The `signedPayloadJson` / `broadcastTag` fields
+        // remain conditional on `winBroadcastsOn` — Sphere's
+        // `forwardPointerPublishedToNostr` already short-circuits when
+        // they are absent (see the type-narrow check in core/Sphere.ts).
+        // Sphere's `maybeInstallPointerWinSubscription` also gates on
+        // `winBroadcastsEnabled()` so the unconditional emit cannot
+        // accidentally arm a sibling subscription.
+        let signedPayloadJson: string | undefined;
+        let broadcastTag: string | undefined;
         if (winBroadcastsOn) {
           try {
             const signerHandle = pointer.getSignerForWinBroadcast();
@@ -1443,17 +1460,8 @@ export class LifecycleManager {
               signingPubKey: signerHandle.signingPubKeyHex,
               ts: Date.now(),
             });
-            this.host.emitEvent({
-              type: 'storage:pointer-published',
-              timestamp: Date.now(),
-              data: {
-                cid: cidString,
-                version: result.version,
-                attemptsUsed: result.attemptsUsed,
-                signedPayloadJson: JSON.stringify(signed),
-                broadcastTag: buildWinBroadcastTag(signerHandle.signingPubKeyHex),
-              },
-            });
+            signedPayloadJson = JSON.stringify(signed);
+            broadcastTag = buildWinBroadcastTag(signerHandle.signingPubKeyHex);
           } catch (broadcastErr) {
             const errMsg =
               broadcastErr instanceof Error
@@ -1465,6 +1473,17 @@ export class LifecycleManager {
             );
           }
         }
+        this.host.emitEvent({
+          type: 'storage:pointer-published',
+          timestamp: Date.now(),
+          data: {
+            cid: cidString,
+            version: result.version,
+            attemptsUsed: result.attemptsUsed,
+            ...(signedPayloadJson !== undefined ? { signedPayloadJson } : {}),
+            ...(broadcastTag !== undefined ? { broadcastTag } : {}),
+          },
+        });
         return { ok: true, transient: false } as const;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);

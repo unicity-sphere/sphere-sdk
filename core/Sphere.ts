@@ -524,6 +524,20 @@ const UNICITY_TOKEN_TYPE_HEX = 'f8aa13834268d29355ff12183066f0cb902003629bbc5eb9
 const RESET_EPOCH_DISCOVERY_TIMEOUT_MS = 15_000;
 
 /**
+ * PR #316 F2 fix — default wall-clock budget for the post-bump
+ * publish await inside `resetEpoch`. After the local floor is
+ * persisted and `notifyProfileDirty()` is called, resetEpoch waits
+ * up to this long for a `'storage:pointer-published'` event so the
+ * returned `publishedVersion` is honest. On timeout, the local
+ * state is unchanged and a `'profile:epoch-reset-publish-pending'`
+ * event is emitted; the periodic-poll path republishes.
+ *
+ * The default is 30 000 ms, matching the per-flush remote-durability
+ * verification deadline in `ProfileConfig.flushVerificationDeadlineMs`.
+ */
+const RESET_EPOCH_PUBLISH_TIMEOUT_MS = 30_000;
+
+/**
  * Derive L3 predicate address (DIRECT://...) from private key
  * Uses UnmaskedPredicateReference for stable wallet address
  */
@@ -1920,7 +1934,36 @@ export class Sphere {
         );
       }
 
-      // 4. Trigger a dirty-flush so the next aggregator pointer
+      // 4a. PR #316 F2 fix — arm a one-shot listener on every token-
+      //     storage provider's `'storage:pointer-published'` event
+      //     BEFORE the dirty-flush is triggered. The event fires
+      //     unconditionally on any successful pointer publish (per
+      //     the lifecycle-manager change in this PR). We collect the
+      //     FIRST published version observed across all providers
+      //     within the bounded timeout window.
+      //
+      //     `armResetEpochPublishWaiter` returns `null` when no
+      //     token-storage providers expose `onEvent` — in that case
+      //     there is no event surface to observe and skipping the
+      //     wait is the honest behavior (we return
+      //     `publishedVersion: 0` and DO NOT emit
+      //     `'profile:epoch-reset-publish-pending'` — pending implies
+      //     "we tried and timed out", not "no wiring").
+      const publishTimeoutMs =
+        params.publishTimeoutMs ?? RESET_EPOCH_PUBLISH_TIMEOUT_MS;
+      const publishedVersionWaiter =
+        publishTimeoutMs > 0
+          ? this.armResetEpochPublishWaiter(publishTimeoutMs)
+          : null;
+      // Distinguish "skipped because no listeners" (publishedVersion
+      // remains 0; no pending event) from "skipped because timeout
+      // = 0" (same outcome, also no pending event) from "awaited and
+      // timed out" (publishedVersion = 0 AND pending event emitted).
+      const publishedVersionWaiterRanAndTimedOut: { value: boolean } = {
+        value: false,
+      };
+
+      // 4b. Trigger a dirty-flush so the next aggregator pointer
       //    publish carries the new epoch (best-effort).
       try {
         for (const provider of this._tokenStorageProviders.values()) {
@@ -1936,6 +1979,22 @@ export class Sphere {
           'Sphere',
           `resetEpoch: notifyProfileDirty threw (epoch bump still persisted): ${err instanceof Error ? err.message : String(err)}`,
         );
+      }
+
+      // 4c. Await the publish (or timeout). Always cancel the
+      //     waiter — leaking the listener could pin the provider's
+      //     event-handler set across the next publish cycle.
+      let publishedVersion = 0;
+      if (publishedVersionWaiter !== null) {
+        try {
+          publishedVersion = await publishedVersionWaiter.promise;
+        } catch {
+          // Timeout → publishedVersion stays 0; emit the
+          // pending event below.
+          publishedVersionWaiterRanAndTimedOut.value = true;
+        } finally {
+          publishedVersionWaiter.cancel();
+        }
       }
 
       // 5. Emit the event.
@@ -1956,11 +2015,26 @@ export class Sphere {
         });
       }
 
+      // 5c. PR #316 F2 fix — surface publish-timeout so callers know
+      //     to either retry / re-query or subscribe to
+      //     `'storage:pointer-published'` for the eventual landing.
+      //     Only emit when we actually awaited AND timed out — not
+      //     when the waiter was skipped (timeoutMs=0) or returned
+      //     null (no event surface).
+      if (publishedVersionWaiterRanAndTimedOut.value) {
+        this.emitEvent('profile:epoch-reset-publish-pending', {
+          newEpoch,
+          reason: params.reason,
+          timeoutMs: publishTimeoutMs,
+          ts,
+        });
+      }
+
       return {
         newEpoch,
         reason: params.reason,
         ts,
-        publishedVersion: 0,
+        publishedVersion,
         discoveryConsulted,
       };
     } catch (err) {
@@ -1971,6 +2045,128 @@ export class Sphere {
         err,
       );
     }
+  }
+
+  /**
+   * PR #316 F2 fix — arm a one-shot waiter on every token-storage
+   * provider's `'storage:pointer-published'` event. Returns a
+   * `{promise, cancel}` pair: the promise resolves with the FIRST
+   * observed `version` across any provider, or rejects on timeout.
+   * `cancel()` unsubscribes every listener and clears the timer
+   * (safe to call multiple times). Callers MUST always call
+   * `cancel()` in a `finally` so the listener set does not pin
+   * across the next event cycle.
+   *
+   * The event fires unconditionally on every successful publish (per
+   * the lifecycle-manager change in this PR), so the waiter does NOT
+   * depend on the `enablePointerWinBroadcasts` capability flag.
+   */
+  private armResetEpochPublishWaiter(
+    timeoutMs: number,
+  ): {
+    promise: Promise<number>;
+    cancel: () => void;
+  } | null {
+    // Collect candidate providers with an `onEvent` accessor BEFORE
+    // installing any listener. Without at least one such provider
+    // the waiter has no way to ever settle on the success path —
+    // letting it run would just stall for the full `timeoutMs`
+    // window with a guaranteed publish-pending event. Returning
+    // `null` is the honest answer: "I cannot observe the publish
+    // here; skip the await". This is the production behavior when
+    // no token storage providers are wired (e.g., pure read-only
+    // unit-test harnesses) and the legitimate behavior on a real
+    // wallet that has Profile storage as the kv-storage backend
+    // but no token storage providers attached.
+    const eligible: Array<{
+      onEvent: (
+        cb: (event: { type: string; data?: { version?: unknown } }) => void,
+      ) => () => void;
+      provider: unknown;
+    }> = [];
+    for (const provider of this._tokenStorageProviders.values()) {
+      const onEvent = (provider as unknown as {
+        onEvent?: (
+          cb: (event: { type: string; data?: { version?: unknown } }) => void,
+        ) => () => void;
+      }).onEvent;
+      if (typeof onEvent !== 'function') continue;
+      eligible.push({ onEvent, provider });
+    }
+    if (eligible.length === 0) {
+      return null;
+    }
+
+    const cleanups: Array<() => void> = [];
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let settled = false;
+
+    let resolve!: (v: number) => void;
+    let reject!: (err: Error) => void;
+    const promise = new Promise<number>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+
+    const teardown = (): void => {
+      if (timer !== undefined) clearTimeout(timer);
+      for (const fn of cleanups) {
+        try {
+          fn();
+        } catch {
+          /* listener-removal must never throw past resetEpoch */
+        }
+      }
+    };
+
+    const cancel = (): void => {
+      if (settled) return;
+      settled = true;
+      teardown();
+    };
+
+    timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      teardown();
+      // Reject so the caller's `await` throws and the catch arm in
+      // resetEpochCore drops `publishedVersion` to 0.
+      reject(
+        new Error(
+          `resetEpoch: storage:pointer-published not observed within ${timeoutMs}ms`,
+        ),
+      );
+    }, timeoutMs);
+    if (
+      timer !== undefined &&
+      typeof (timer as unknown as { unref?: unknown }).unref === 'function'
+    ) {
+      (timer as unknown as { unref: () => void }).unref();
+    }
+
+    for (const { onEvent, provider } of eligible) {
+      const unsub = onEvent.call(provider, (event) => {
+        if (settled) return;
+        if (event?.type !== 'storage:pointer-published') return;
+        const version = event?.data?.version;
+        if (
+          typeof version !== 'number' ||
+          !Number.isFinite(version) ||
+          !Number.isInteger(version) ||
+          version < 0
+        ) {
+          return;
+        }
+        settled = true;
+        teardown();
+        resolve(version);
+      });
+      if (typeof unsub === 'function') {
+        cleanups.push(unsub);
+      }
+    }
+
+    return { promise, cancel };
   }
 
   /**

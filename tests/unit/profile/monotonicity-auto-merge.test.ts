@@ -439,7 +439,12 @@ describe('enablePointerWinBroadcasts — default-OFF policy (#264)', () => {
   beforeEach(() => { vi.useRealTimers(); });
   afterEach(() => { vi.useRealTimers(); });
 
-  it('default (no config): winBroadcastsEnabled() returns false; lifecycle-manager skips storage:pointer-published emit', async () => {
+  it('default (no config): winBroadcastsEnabled() returns false; storage:pointer-published fires WITHOUT signedPayloadJson/broadcastTag (PR #316 F2)', async () => {
+    // PR #316 F2: the event is now emitted UNCONDITIONALLY on a
+    // successful publish so consumers (e.g. resetEpoch's publish
+    // await) can observe the landing. The win-broadcast gate now
+    // controls only the signedPayloadJson / broadcastTag fields,
+    // NOT the event itself.
     const pointer = await buildRealPointerWithFlag(undefined);
     expect(pointer.winBroadcastsEnabled()).toBe(false);
 
@@ -447,20 +452,38 @@ describe('enablePointerWinBroadcasts — default-OFF policy (#264)', () => {
     const result = await h.publish(FAKE_CID);
     expect(result.ok).toBe(true);
 
-    // Gate trips → no storage:pointer-published event.
-    expect(h.events.find((e) => e.type === 'storage:pointer-published')).toBeUndefined();
+    const published = h.events.find((e) => e.type === 'storage:pointer-published');
+    expect(published).toBeDefined();
+    const data = published!.data as {
+      cid?: string;
+      version?: number;
+      signedPayloadJson?: string;
+      broadcastTag?: string;
+    };
+    expect(data.cid).toBe(FAKE_CID);
+    expect(data.version).toBe(11);
+    // Win-broadcast fields are suppressed because the flag is OFF.
+    expect(data.signedPayloadJson).toBeUndefined();
+    expect(data.broadcastTag).toBeUndefined();
 
     await h.shutdown();
   });
 
-  it('explicit false: same suppression as default', async () => {
+  it('explicit false: same shape as default (event emitted, no broadcast fields)', async () => {
     const pointer = await buildRealPointerWithFlag(false);
     expect(pointer.winBroadcastsEnabled()).toBe(false);
 
     const h = await createHarness(pointer);
     const result = await h.publish(FAKE_CID);
     expect(result.ok).toBe(true);
-    expect(h.events.find((e) => e.type === 'storage:pointer-published')).toBeUndefined();
+    const published = h.events.find((e) => e.type === 'storage:pointer-published');
+    expect(published).toBeDefined();
+    const data = published!.data as {
+      signedPayloadJson?: string;
+      broadcastTag?: string;
+    };
+    expect(data.signedPayloadJson).toBeUndefined();
+    expect(data.broadcastTag).toBeUndefined();
 
     await h.shutdown();
   });
@@ -489,18 +512,28 @@ describe('enablePointerWinBroadcasts — default-OFF policy (#264)', () => {
     await h.shutdown();
   });
 
-  it('truthy non-boolean (string "true", number 1) is coerced to false — strict === true policy', async () => {
+  it('truthy non-boolean (string "true", number 1) is coerced to false — strict === true policy (PR #316 F2: event emits but without broadcast fields)', async () => {
     // Pass `'true'` as a string and `1` as a number — both are truthy
     // but should fail closed per the normalization in ProfilePointerLayer's
     // frozen config snapshot (defense against accidentally truthy values
     // from env-var unmarshalling, JSON parsing, etc.).
+    //
+    // PR #316 F2: the gate still trips the broadcast fields off, but
+    // the event itself fires unconditionally.
     for (const accidental of ['true' as unknown as boolean, 1 as unknown as boolean]) {
       const pointer = await buildRealPointerWithFlag(accidental);
       expect(pointer.winBroadcastsEnabled()).toBe(false);
       const h = await createHarness(pointer);
       const result = await h.publish(FAKE_CID);
       expect(result.ok).toBe(true);
-      expect(h.events.find((e) => e.type === 'storage:pointer-published')).toBeUndefined();
+      const published = h.events.find((e) => e.type === 'storage:pointer-published');
+      expect(published).toBeDefined();
+      const data = published!.data as {
+        signedPayloadJson?: string;
+        broadcastTag?: string;
+      };
+      expect(data.signedPayloadJson).toBeUndefined();
+      expect(data.broadcastTag).toBeUndefined();
       await h.shutdown();
     }
   });

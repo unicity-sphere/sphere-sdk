@@ -45,16 +45,22 @@ export interface ResetEpochResult {
   /** Wall-clock timestamp of the reset (ms since epoch). */
   readonly ts: number;
   /**
-   * The aggregator-pointer version the publish landed at (or 0 if
-   * the publish did not run / failed gracefully — the local reset
-   * is still durable in that case; the publish will be retried on
-   * the next dirty-flush cycle).
+   * PR #316 F2 fix — the aggregator-pointer version the post-reset
+   * publish landed at. Populated when the publish completed within
+   * the bounded `publishTimeoutMs` window (default 30 000 ms); `0`
+   * otherwise.
    *
-   * NOTE: PR #316 F1 baseline keeps this hardcoded to `0` —
-   * populating it from the post-reset publish is delivered in the
-   * separate F2 commit. Callers reading this field on the F1
-   * commit should treat it as "publish state unknown; observe
-   * `'storage:pointer-published'` for the actual outcome".
+   * `publishedVersion === 0` is a SOFT signal, NOT a failure:
+   * `'profile:epoch-reset-publish-pending'` is emitted with the same
+   * `newEpoch`, and the periodic-poll / next dirty-flush will land
+   * the publish on the wallet's behalf. Callers can also subscribe
+   * to `'storage:pointer-published'` to observe the eventual landing.
+   *
+   * The wait is implemented as a one-shot listener on the storage
+   * provider's `'storage:pointer-published'` event (which fires
+   * UNCONDITIONALLY on every successful publish — see lifecycle-
+   * manager). Set `publishTimeoutMs: 0` in {@link ResetEpochParams}
+   * to skip the wait entirely.
    */
   readonly publishedVersion: number;
   /**
@@ -99,6 +105,15 @@ export interface ResetEpochParams {
    * cannot then be enforced).
    */
   readonly discoveryTimeoutMs?: number;
+  /**
+   * PR #316 F2 fix — bounded timeout (ms) for the post-bump publish
+   * await. Default: 30 000. On timeout,
+   * `'profile:epoch-reset-publish-pending'` is emitted and
+   * `publishedVersion: 0` is returned; the periodic-poll path will
+   * republish in the background. Set to `0` to skip the await
+   * entirely (caller does not need the version).
+   */
+  readonly publishTimeoutMs?: number;
 }
 
 /**
@@ -134,7 +149,15 @@ export interface SphereProfileHandle {
    *   6. Persist the new epoch floor and trigger a dirty-flush so
    *      the next snapshot's root block carries `epoch = newEpoch`
    *      and the new aggregator-pointer version publishes.
-   *   7. Emit `profile:epoch-reset` on the Sphere event bus.
+   *   7. (PR #316 F2 fix) **Await the publish** via the
+   *      `'storage:pointer-published'` event with a bounded timeout
+   *      (default 30 000 ms; configurable via `publishTimeoutMs`).
+   *      On observe, `publishedVersion` is set to the landed pointer
+   *      version. On timeout,
+   *      `'profile:epoch-reset-publish-pending'` is emitted and
+   *      `publishedVersion === 0` is returned — the periodic poll
+   *      will republish.
+   *   8. Emit `profile:epoch-reset` on the Sphere event bus.
    *
    * Idempotency: calling `resetEpoch` a second time lands a NEW
    * +1 epoch — it does NOT skip. Each invocation is a distinct

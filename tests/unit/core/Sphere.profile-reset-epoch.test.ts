@@ -496,6 +496,176 @@ describe('Sphere.profile.resetEpoch — F1 cross-device monotonicity', () => {
 });
 
 // =============================================================================
+// PR #316 F2 fix — publishedVersion is populated via storage:pointer-published
+// =============================================================================
+//
+// Without the F2 fix, `publishedVersion` was hardcoded to 0 — a
+// silent contract lie. The fix awaits a one-shot
+// `storage:pointer-published` event with a bounded timeout. On
+// observe, `publishedVersion` reflects the landed pointer version.
+// On timeout, `'profile:epoch-reset-publish-pending'` is emitted and
+// `publishedVersion` stays 0.
+
+interface ProfileStorageWithEventBus extends ProfileStorageStub {
+  emitPointerPublished(version: number): void;
+}
+
+function attachTokenStorageWithEventBus(
+  sphere: Sphere,
+  storage: ProfileStorageStub,
+): ProfileStorageWithEventBus {
+  // Simulate a token storage provider with `onEvent` support so the
+  // F2 publish waiter has something to listen on. Production wiring
+  // routes this through ProfileTokenStorageProvider; the test stub
+  // gives the bus a synchronous emit handle.
+  const listeners = new Set<(event: { type: string; data?: unknown }) => void>();
+  const fakeProvider = {
+    onEvent(cb: (event: { type: string; data?: unknown }) => void) {
+      listeners.add(cb);
+      return () => {
+        listeners.delete(cb);
+      };
+    },
+    notifyProfileDirty() {
+      /* no-op — production code emits a debounced flush; tests fire
+       * the event manually via `emitPointerPublished` */
+    },
+  };
+  (sphere as unknown as { _tokenStorageProviders: Map<string, unknown> })
+    ._tokenStorageProviders.set('default', fakeProvider);
+
+  const enriched = storage as ProfileStorageWithEventBus;
+  enriched.emitPointerPublished = (version: number) => {
+    for (const cb of listeners) {
+      cb({ type: 'storage:pointer-published', data: { version } });
+    }
+  };
+  return enriched;
+}
+
+describe('Sphere.profile.resetEpoch — F2 publishedVersion contract', () => {
+  it('populates publishedVersion from the storage:pointer-published event', async () => {
+    const storage = makeProfileStorage();
+    const { sphere } = buildSphereLike(storage);
+    const eventBus = attachTokenStorageWithEventBus(sphere, storage);
+
+    // Fire the publish event asynchronously after resetEpoch arms
+    // its waiter (after the notifyProfileDirty step).
+    setTimeout(() => eventBus.emitPointerPublished(42), 10);
+
+    const result = await sphere.profile!.resetEpoch({
+      reason: 'fired-after-bump',
+      // Generous budget so the test doesn't race against the
+      // 10ms setTimeout above on slow CI runners.
+      publishTimeoutMs: 5_000,
+    });
+
+    expect(result.publishedVersion).toBe(42);
+    expect(result.newEpoch).toBe(1);
+  });
+
+  it('emits profile:epoch-reset-publish-pending on publish timeout', async () => {
+    const storage = makeProfileStorage();
+    const { sphere } = buildSphereLike(storage);
+    attachTokenStorageWithEventBus(sphere, storage);
+    // Don't fire the publish event — let the waiter time out.
+
+    const pendingEvents: Array<{ payload: unknown }> = [];
+    (sphere as unknown as Sphere).on(
+      'profile:epoch-reset-publish-pending',
+      (payload) => {
+        pendingEvents.push({ payload });
+      },
+    );
+
+    const result = await sphere.profile!.resetEpoch({
+      reason: 'no-publish-coming',
+      publishTimeoutMs: 50, // very short — guaranteed to time out
+    });
+
+    expect(result.publishedVersion).toBe(0);
+    expect(pendingEvents).toHaveLength(1);
+    expect(pendingEvents[0].payload).toMatchObject({
+      newEpoch: 1,
+      reason: 'no-publish-coming',
+      timeoutMs: 50,
+    });
+  });
+
+  it('skips the wait entirely when publishTimeoutMs=0 (test escape hatch)', async () => {
+    const storage = makeProfileStorage();
+    const { sphere } = buildSphereLike(storage);
+    attachTokenStorageWithEventBus(sphere, storage);
+
+    const pendingEvents: unknown[] = [];
+    (sphere as unknown as Sphere).on(
+      'profile:epoch-reset-publish-pending',
+      (payload) => {
+        pendingEvents.push(payload);
+      },
+    );
+
+    const start = Date.now();
+    const result = await sphere.profile!.resetEpoch({
+      reason: 'no-wait',
+      publishTimeoutMs: 0,
+    });
+    const elapsed = Date.now() - start;
+
+    expect(result.publishedVersion).toBe(0);
+    // The "no-wait" path must NOT emit publish-pending — pending
+    // implies "we tried and timed out", not "we never tried".
+    expect(pendingEvents).toEqual([]);
+    // Sanity: didn't hang on the publish wait.
+    expect(elapsed).toBeLessThan(500);
+  });
+
+  it('does NOT emit publish-pending when no token storage providers are wired (no event surface)', async () => {
+    const storage = makeProfileStorage();
+    const { sphere } = buildSphereLike(storage);
+    // NO attachTokenStorageWithEventBus — no providers wired.
+
+    const pendingEvents: unknown[] = [];
+    (sphere as unknown as Sphere).on(
+      'profile:epoch-reset-publish-pending',
+      (payload) => {
+        pendingEvents.push(payload);
+      },
+    );
+
+    const result = await sphere.profile!.resetEpoch({
+      reason: 'no-providers',
+      // Even with a real timeout, the waiter is skipped because
+      // there's nothing to listen on.
+      publishTimeoutMs: 1_000,
+    });
+
+    expect(result.publishedVersion).toBe(0);
+    expect(pendingEvents).toEqual([]);
+  });
+
+  it('captures the first version when multiple publish events arrive', async () => {
+    const storage = makeProfileStorage();
+    const { sphere } = buildSphereLike(storage);
+    const eventBus = attachTokenStorageWithEventBus(sphere, storage);
+
+    // Fire two events in quick succession; the waiter MUST capture
+    // the first (v=7) and ignore subsequent events.
+    setTimeout(() => {
+      eventBus.emitPointerPublished(7);
+      eventBus.emitPointerPublished(8);
+    }, 5);
+
+    const result = await sphere.profile!.resetEpoch({
+      reason: 'first-wins',
+      publishTimeoutMs: 5_000,
+    });
+
+    expect(result.publishedVersion).toBe(7);
+  });
+});
+
+// =============================================================================
 // Second-device convergence simulation
 // =============================================================================
 //
