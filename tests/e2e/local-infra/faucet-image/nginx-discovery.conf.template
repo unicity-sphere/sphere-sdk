@@ -1,0 +1,44 @@
+# Nginx config rendered by entrypoint.sh.
+#
+# HAProxy in front runs in mode tcp (SNI passthrough), so we MUST
+# terminate TLS ourselves on :443. We also listen plaintext on the
+# discovery port for in-container health checks.
+
+# Shared content map — reused by both server blocks via include.
+# (nginx doesn't support `include` for `location` blocks at root scope
+#  in older versions, so we just duplicate the locations for clarity.)
+
+server {
+    # Plaintext discovery surface — used by health checks inside the
+    # container and by the ssl-http-proxy when SSL is disabled.
+    listen ${DISCOVERY_PORT};
+    listen [::]:${DISCOVERY_PORT};
+    server_name _;
+
+    location = /.well-known/faucet.json {
+        default_type application/json;
+        add_header Access-Control-Allow-Origin "*" always;
+        alias /var/lib/faucet/identity.json;
+    }
+    location = /faucet.json {
+        return 302 /.well-known/faucet.json;
+    }
+    location = /health {
+        default_type application/json;
+        add_header Access-Control-Allow-Origin "*" always;
+        return 200 '{"status":"ok"}';
+    }
+    location = / {
+        default_type text/plain;
+        return 200 'Unicity testnet faucet. See /.well-known/faucet.json for identity.\n';
+    }
+    location / { return 404; }
+
+    access_log /dev/stdout;
+    error_log  /dev/stderr warn;
+}
+
+# TLS-terminating block — rendered only when SSL_DOMAIN is set and
+# the LE cert is in place. entrypoint.sh appends it via a separate
+# include file.
+

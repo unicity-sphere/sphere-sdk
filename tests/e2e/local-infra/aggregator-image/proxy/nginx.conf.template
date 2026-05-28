@@ -1,0 +1,48 @@
+# nginx — terminates TLS on :443 and proxies to the aggregator
+# container on the private Docker network.
+
+upstream aggregator_backend {
+    server ${AGGREGATOR_BACKEND_HOST}:${AGGREGATOR_BACKEND_PORT};
+    keepalive 32;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+
+    server_name ${SSL_DOMAIN};
+
+    ssl_certificate     /etc/letsencrypt/live/${SSL_DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${SSL_DOMAIN}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    # Increase upload size — aggregator can accept moderate-sized
+    # commitment batches.
+    client_max_body_size 16M;
+
+    # JSON-RPC + REST + WebSocket — single upstream, single location.
+    location / {
+        proxy_pass http://aggregator_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+    }
+
+    # Lightweight liveness — short-circuits the backend so the proxy
+    # itself can fail-fast if nginx is wedged but the backend is fine.
+    location = /health {
+        access_log off;
+        return 200 '{"status":"ok"}';
+        default_type application/json;
+    }
+}

@@ -1,0 +1,302 @@
+# tests/e2e/local-infra/aggregator-image/docker-compose.yml
+#
+# Aggregator stack — bft-root, bft-aggregator-genesis-gen, mongo,
+# the aggregator binary itself, and a small ssl-manager-wrapped
+# nginx that fronts the aggregator on :443 with a real Let's Encrypt
+# cert + HAProxy auto-registration.
+#
+# Networks:
+#   default      — private, ONLY for internal bft/mongo/aggregator traffic
+#   haproxy-net  — external, the proxy container joins to be reachable by
+#                  the host HAProxy.
+#
+# Volumes — all named, persistent. Wipe explicitly when you want a
+# fresh genesis (the run-aggregator.sh helper has a --fresh flag for
+# this).
+#
+# Usage:
+#   ./run-aggregator.sh --domain aggregator-unicity-dev.dyndns.org \
+#                       --ssl-email ops@example.com
+#
+# Direct compose invocation (advanced):
+#   AGG_DOMAIN=aggregator-unicity-dev.dyndns.org \
+#   SSL_EMAIL=ops@example.com \
+#     docker compose -f docker-compose.yml up -d
+
+services:
+  # ---------------------------------------------------------------------------
+  # BFT root node — generates the trust base.
+  # ---------------------------------------------------------------------------
+  bft-root:
+    image: ghcr.io/unicitynetwork/bft-core:8e6f2507b8b69fc6d2d66c33fb7c4cb9dc61e8b0
+    container_name: agg-bft-root
+    platform: linux/amd64
+    user: "${USER_UID:-1001}:${USER_GID:-1001}"
+    restart: unless-stopped
+    volumes:
+      - ./data/genesis-root:/genesis/root
+      - ./data/genesis:/genesis
+    healthcheck:
+      test: ["CMD", "nc", "-zv", "bft-root", "8000"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    networks:
+      - default
+    entrypoint: ["/busybox/sh", "-c"]
+    command:
+      - |
+        if [ -f /genesis/root/node-info.json ] && [ -f /genesis/trust-base.json ] && [ -f /genesis/root/trust-base-signed.json ]; then
+          echo "Genesis files already exist, skipping initialization."
+        else
+          echo "Creating root genesis..." &&
+          ubft root-node init --home /genesis/root -g &&
+          echo "Creating root trust base..." &&
+          ubft trust-base generate --home /genesis --network-id 3 --node-info /genesis/root/node-info.json &&
+          echo "Signing root trust base..." &&
+          ubft trust-base sign --home /genesis/root --trust-base /genesis/trust-base.json
+        fi
+        echo "Starting root node..." &&
+        ubft root-node run --home /genesis/root --address "/ip4/$(hostname -i)/tcp/8000" --trust-base /genesis/trust-base.json --rpc-server-address "$(hostname -i):8002"
+
+  # ---------------------------------------------------------------------------
+  # Aggregator partition genesis generator (runs once, then exits).
+  # ---------------------------------------------------------------------------
+  bft-aggregator-genesis-gen:
+    image: ghcr.io/unicitynetwork/bft-core:8e6f2507b8b69fc6d2d66c33fb7c4cb9dc61e8b0
+    container_name: agg-bft-genesis-gen
+    platform: linux/amd64
+    user: "${USER_UID:-1001}:${USER_GID:-1001}"
+    volumes:
+      - ./data/genesis-root:/genesis/root
+      - ./data/genesis:/genesis
+    depends_on:
+      bft-root:
+        condition: service_healthy
+    networks:
+      - default
+    entrypoint: ["/busybox/sh", "-c"]
+    command:
+      - |
+        if [ -f /genesis/aggregator/node-info.json ] && [ -f /genesis/shard-conf-7_0.json ]; then
+          echo "Aggregator genesis already exists, skipping initialization."
+        else
+          echo "Creating aggregator genesis..." &&
+          ubft shard-node init --home /genesis/aggregator --generate &&
+          echo "Creating aggregator partition configuration..." &&
+          ubft shard-conf generate --home /genesis --network-id 3 --partition-id 7 --partition-type-id 7 --epoch-start 10 --node-info=/genesis/aggregator/node-info.json &&
+          echo "Creating aggregator partition state..." &&
+          ubft shard-conf genesis --home /genesis/aggregator --shard-conf /genesis/shard-conf-7_0.json
+        fi
+        chmod -R 755 /genesis/aggregator
+        chmod 644 /genesis/shard-conf-7_0.json
+        chmod 644 /genesis/trust-base.json
+        chmod -R 755 /genesis/root
+
+  # ---------------------------------------------------------------------------
+  # Upload partition configuration to the root node.
+  # ---------------------------------------------------------------------------
+  upload-configurations:
+    image: curlimages/curl:8.13.0
+    container_name: agg-upload-config
+    user: "${USER_UID:-1001}:${USER_GID:-1001}"
+    depends_on:
+      bft-root:
+        condition: service_healthy
+      bft-aggregator-genesis-gen:
+        condition: service_completed_successfully
+    restart: on-failure
+    volumes:
+      - ./data/genesis:/genesis
+    networks:
+      - default
+    command:
+      - /bin/sh
+      - -c
+      - |
+        echo "Uploading aggregator configuration..." &&
+        curl -X PUT -H 'Content-Type: application/json' \
+             -d @/genesis/shard-conf-7_0.json \
+             http://bft-root:8002/api/v1/configurations
+
+  # ---------------------------------------------------------------------------
+  # MongoDB — replica set is REQUIRED. The aggregator uses MongoDB
+  # transactions + change streams, both of which only work on a
+  # replica set. We run a single-node RS (rs0) for dev simplicity.
+  # ---------------------------------------------------------------------------
+  mongodb:
+    image: mongo:7.0
+    container_name: agg-mongodb
+    user: "${USER_UID:-1001}:${USER_GID:-1001}"
+    restart: unless-stopped
+    command: ["--replSet", "rs0", "--bind_ip_all", "--noauth"]
+    networks:
+      - default
+    volumes:
+      - ./data/mongodb_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # Initialise the rs0 replica set once mongo is healthy.
+  mongo-setup:
+    image: mongo:7.0
+    container_name: agg-mongo-setup
+    user: "${USER_UID:-1001}:${USER_GID:-1001}"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    networks:
+      - default
+    entrypoint:
+      - "mongosh"
+      - "--host"
+      - "mongodb:27017"
+      - "--eval"
+      - >
+        try {
+          rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'mongodb:27017'}]});
+        } catch (e) {
+          print('Replica set already initialised or error: ' + e.message);
+        }
+
+  # ---------------------------------------------------------------------------
+  # Aggregator — Go binary, plain HTTP on :3000.
+  # TLS is handled by the proxy container, not here.
+  # ---------------------------------------------------------------------------
+  aggregator:
+    # Pinned to the same image as the working dev-aggregator at
+    # /home/vrogojin/unicity-nft-mint/aggregator-latest/. The
+    # upstream `ghcr.io/unicitynetwork/aggregator-go:latest` has
+    # stricter trust-base validation that rejects the genesis
+    # we mint here.
+    image: aggregator-latest-aggregator:latest
+    container_name: agg-aggregator
+    restart: unless-stopped
+    networks:
+      - default
+    volumes:
+      - ./data/genesis:/app/bft-config
+    environment:
+      # Server
+      PORT: "3000"
+      HOST: "0.0.0.0"
+      CONCURRENCY_LIMIT: "1000"
+      ENABLE_DOCS: "true"
+      ENABLE_CORS: "true"
+      ENABLE_TLS: "false"
+
+      # Database — single-node replica set (rs0) without auth.
+      MONGODB_URI: "mongodb://mongodb:27017/aggregator?replicaSet=rs0"
+      MONGODB_DATABASE: "aggregator"
+      MONGODB_CONNECT_TIMEOUT: "10s"
+      MONGODB_SERVER_SELECTION_TIMEOUT: "5s"
+
+      # High availability — disabled for single-node dev so the
+      # round manager starts immediately.
+      DISABLE_HIGH_AVAILABILITY: "true"
+      LOCK_TTL_SECONDS: "30"
+      LEADER_HEARTBEAT_INTERVAL: "10s"
+      LEADER_ELECTION_POLLING_INTERVAL: "5s"
+
+      # Logging
+      LOG_LEVEL: "info"
+      LOG_FORMAT: "json"
+      LOG_ENABLE_JSON: "true"
+
+      # Processing
+      BATCH_LIMIT: "1000"
+
+      # BFT
+      BFT_ENABLED: "true"
+      BFT_KEY_CONF_FILE: "/app/bft-config/aggregator/keys.json"
+      BFT_SHARD_CONF_FILE: "/app/bft-config/shard-conf-7_0.json"
+      # Note: this build uses the plural variable name (BFT_TRUST_BASE_FILES).
+      BFT_TRUST_BASE_FILES: "/app/bft-config/trust-base.json"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        # Derive BFT_BOOTSTRAP_ADDRESSES from the trust-base file the
+        # genesis-gen wrote.
+        if [ -f /app/bft-config/trust-base.json ]; then
+          ROOT_NODE_ID=$$(grep -o '"nodeId": "[^"]*"' /app/bft-config/trust-base.json | head -1 | cut -d'"' -f4)
+          if [ -n "$$ROOT_NODE_ID" ]; then
+            export BFT_BOOTSTRAP_ADDRESSES="/dns4/bft-root/tcp/8000/p2p/$$ROOT_NODE_ID"
+            echo "Set BFT_BOOTSTRAP_ADDRESSES to: $$BFT_BOOTSTRAP_ADDRESSES"
+          else
+            echo "Warning: Could not extract nodeId from trust-base.json"
+            exit 1
+          fi
+        else
+          echo "Error: trust-base.json not found"
+          exit 1
+        fi
+        exec /app/aggregator
+    depends_on:
+      bft-aggregator-genesis-gen:
+        condition: service_completed_successfully
+      mongo-setup:
+        condition: service_completed_successfully
+      upload-configurations:
+        condition: service_completed_successfully
+    healthcheck:
+      # Use GET (-O-) not HEAD (--spider); /health doesn't reply to HEAD.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/health | grep -q '\"status\":\"ok\"' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # SSL-manager-wrapped nginx reverse proxy — the ONLY container
+  # exposed to HAProxy. Terminates TLS on :443 with a Let's Encrypt
+  # cert and proxies plaintext HTTP to aggregator:3000 on the
+  # private network.
+  # ---------------------------------------------------------------------------
+  aggregator-proxy:
+    image: unicity-aggregator-proxy:latest
+    build:
+      context: ./proxy
+      dockerfile: Dockerfile
+    container_name: agg-proxy
+    restart: unless-stopped
+    depends_on:
+      aggregator:
+        condition: service_healthy
+    networks:
+      - default
+      - haproxy-net
+    volumes:
+      - agg-letsencrypt:/etc/letsencrypt
+    environment:
+      # ${AGG_DOMAIN} and ${SSL_EMAIL} are validated at the wrapper-
+      # script level (run-aggregator.sh) so `docker compose down`
+      # doesn't fail when they're unset.
+      SSL_DOMAIN: "${AGG_DOMAIN:-}"
+      SSL_ADMIN_EMAIL: "${SSL_EMAIL:-}"
+      SSL_STAGING: "${SSL_STAGING:-}"
+      SSL_TEST_MODE: "${SSL_TEST_MODE:-}"
+      HAPROXY_HOST: "${HAPROXY_HOST:-haproxy}"
+      HAPROXY_PORT: "${HAPROXY_PORT:-8404}"
+      AGGREGATOR_BACKEND_HOST: aggregator
+      AGGREGATOR_BACKEND_PORT: "3000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsSk", "https://127.0.0.1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  agg-letsencrypt:
+    name: agg-letsencrypt
+
+networks:
+  default:
+    name: agg-internal-net
+  haproxy-net:
+    external: true
