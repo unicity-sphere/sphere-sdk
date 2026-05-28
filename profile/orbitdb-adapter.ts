@@ -385,6 +385,57 @@ export class OrbitDbAdapter implements ProfileDatabase {
           // (cross-process recovery will not work). Logged via the host's
           // event surface elsewhere.
         }
+      } else if (isBrowserEnvironment()) {
+        // Issue #330 — install an IndexedDB-backed Helia blockstore in
+        // the browser. Without this, Helia v6 falls back to its default
+        // `MemoryBlockstore` and EVERY OpLog block (`helia.blockstore.put`
+        // from OrbitDB) and CAR block (`pinSingleBlock` write-back fast-
+        // path) lives only in tab memory. OrbitDB's level state IS
+        // persisted to IndexedDB, so after a page reload the head CID
+        // pointer survives but the block bytes it references are gone —
+        // every subsequent append fails with the same error, forever
+        // (the symptom described in #330 and called out verbatim in the
+        // JSDoc of `resetAndReconnect` below).
+        //
+        // The `helia-blockstore-pin-shim` (installed below) auto-pins
+        // every written block via `helia.pins.add(cid)` so the new
+        // IDBBlockstore retains them across reloads. The pin shim's
+        // defence against eviction is meaningful only against a
+        // persistent backing store; pinning a MemoryBlockstore is a
+        // no-op against reload.
+        //
+        // We use the same major as `blockstore-fs` (`^4.0.1`) so the
+        // `interface-blockstore` contract aligns with Helia v6's
+        // expectation. The DB name defaults to `'sphere-helia-blocks'`
+        // and is overridable via `config.browserBlockstorePath` for
+        // callers who want per-wallet isolation.
+        try {
+          const blockstoreIdbModule: any = await import('blockstore-idb' as string);
+          const IDBBlockstoreCtor =
+            blockstoreIdbModule.IDBBlockstore ?? blockstoreIdbModule.default?.IDBBlockstore;
+          if (typeof IDBBlockstoreCtor === 'function') {
+            const dbName =
+              typeof config.browserBlockstorePath === 'string' &&
+              config.browserBlockstorePath.length > 0
+                ? config.browserBlockstorePath
+                : 'sphere-helia-blocks';
+            const idbBlockstore = new IDBBlockstoreCtor(dbName);
+            // blockstore-idb requires `open()` to be awaited before the
+            // store can serve get/put. Tolerate either a synchronous or
+            // an async open(); a missing open() is also acceptable for
+            // forward-compat with stores that auto-open on first use.
+            if (typeof idbBlockstore.open === 'function') {
+              await idbBlockstore.open();
+            }
+            heliaOptions.blockstore = idbBlockstore;
+          }
+        } catch {
+          // blockstore-idb not installed or open() failed — fall back to
+          // Helia's MemoryBlockstore default. The wallet still functions
+          // for the lifetime of this tab but loses durability across
+          // reloads (the pre-#330 behaviour). The pin shim that follows
+          // will still attempt pin, but pinning memory is a no-op.
+        }
       }
 
       // Build libp2p config with gossipsub if available
