@@ -396,10 +396,13 @@ export class ConnectivityManager implements ConnectivityManagerHandle {
     //                 → scheduleNext reads step 1 (15s), bumps to step 2
     //   etc.
     // On a success after several failures, applyResult sets step=0;
-    // scheduleNext reads step 0 (5s), bumps to step 1 — so the second
-    // probe after the recovery also uses 5s, only the third probe (if
-    // that one also fails) starts climbing again. That matches the
-    // spec's "reset to 5s on success".
+    // scheduleNext reads step 0 (5s), bumps to step 1. The NEXT probe
+    // uses 5 s (good — the "reset to 5s on success" spec). If THAT
+    // probe fails, applyResult leaves step at 1; scheduleNext reads
+    // step 1 (15s), bumps to step 2. So the climb after a recovery-
+    // then-failure resumes from 15 s on the SECOND failure — there is
+    // no "double 5 s" before climbing. Behavior matches the spec; the
+    // comment is the source of truth here (corrected in review of #312).
     state.backoffStep = Math.min(step + 1, this.schedule.length - 1);
     state.timer = setTimeout(() => {
       state.timer = null;
