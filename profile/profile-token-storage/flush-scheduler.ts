@@ -1454,6 +1454,36 @@ export class FlushScheduler {
         data: { cid, tokenCount: tokens.size },
       });
 
+      // Issue #313 — atomic-write the lazy-load snapshot blob after a
+      // successful flush. Fire-and-forget: the snapshot is a cold-boot
+      // performance optimisation, not a correctness gate, and the
+      // helper internally swallows failures and emits
+      // `storage:error` (`PROFILE_SNAPSHOT_WRITE_FAILED`) so operators
+      // see the degraded state without blocking the flush completion
+      // path.
+      //
+      // We write BEFORE the durability-verify leg fires because:
+      //   1. The snapshot represents LOCAL in-memory state already
+      //      durable in OrbitDB (the bundle ref was written at
+      //      step 6 of the flush). Whether the operator gateway is
+      //      yet serving the new CID is irrelevant to the cold-boot
+      //      contract — the next boot reads the snapshot blob
+      //      DIRECTLY from local storage.
+      //   2. The verify leg has its own background task; coupling the
+      //      snapshot write to it would unnecessarily delay the
+      //      "next cold boot can render" guarantee under gateway lag.
+      void this.host
+        .writeLocalSnapshot('flush')
+        .catch((err) => {
+          // writeLocalSnapshot already swallows + emits storage:error;
+          // a throw here would be a programmer bug. Log for triage.
+          this.host.log(
+            `writeLocalSnapshot (flush) threw unexpectedly: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        });
+
       if (publishThrew !== undefined) {
         throw publishThrew;
       }

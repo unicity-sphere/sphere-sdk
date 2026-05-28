@@ -102,6 +102,13 @@ import {
   type OperationalState,
   type ProfileTokenStorageHost,
 } from './profile-token-storage/index.js';
+import {
+  readSnapshot,
+  writeSnapshot,
+  clearSnapshot,
+  type ProfileSnapshotPointer,
+  type SnapshotReadResult,
+} from './profile-snapshot-cache.js';
 
 // =============================================================================
 // Constants
@@ -501,6 +508,13 @@ export class ProfileTokenStorageProvider
       // throws on deadline. See ProfileTokenStorageHost.verifyFlushDurability.
       verifyFlushDurability: (bundleCid, snapshotCid, deadlineMs) =>
         this.verifyFlushDurability(bundleCid, snapshotCid, deadlineMs),
+      // Issue #313 — lazy-load snapshot cache. Write hooks fire after
+      // flush completion and on shutdown; read hook runs at the head of
+      // LifecycleManager.initialize() to seed the in-memory state before
+      // any OrbitDB / aggregator round-trip.
+      writeLocalSnapshot: (trigger, options) =>
+        this.writeLocalSnapshot(trigger, options),
+      readLocalSnapshot: () => this.readLocalSnapshot(),
     };
   }
 
@@ -1240,6 +1254,44 @@ export class ProfileTokenStorageProvider
       const activeBundles = await this.bundleIndex.listActiveBundles();
 
       if (activeBundles.size === 0) {
+        // Issue #313 — if `lastLoadedData` is non-null AND non-empty
+        // (i.e., the lazy-load snapshot path seeded state from a local
+        // blob) AND OrbitDB has nothing locally, return the seeded
+        // state rather than wiping the view to empty. This covers:
+        //   - Helia GC ran since the last save (blocks gone, level
+        //     state intact but no bundles enumerable from OpLog walk).
+        //   - Fresh device just imported wallet, snapshot blob is the
+        //     baseline until aggregator recovery completes.
+        //   - Aggregator unreachable — snapshot is the only source.
+        //
+        // We do NOT touch `lastLoadedFromBundleCids` here so the
+        // monotonicity assertion's baseline stays at the seeded value
+        // — any subsequent flush will publish against the seeded
+        // bundle set, which is correct.
+        //
+        // Boundary: a wallet legitimately drained to empty (every
+        // token sent away) ALSO has activeBundles.size === 0 but
+        // `lastLoadedData` from a snapshot would still report the
+        // pre-drain tokens. The next save-driven flush (from
+        // `PaymentsModule.handleIncomingTransfer` or any user-driven
+        // mutation) overwrites `lastLoadedData` with the actual empty
+        // state and updates the snapshot accordingly. The window
+        // during which a fully-drained wallet incorrectly displays
+        // stale tokens is bounded by the next mutation; for the cold-
+        // boot offline render contract this is the right trade-off.
+        const seedHasTokens =
+          this.lastLoadedData !== null &&
+          Object.keys(this.lastLoadedData).some((k) => isTokenKey(k));
+        if (seedHasTokens) {
+          this.emitEvent({ type: 'storage:loaded', timestamp: Date.now() });
+          return {
+            success: true,
+            data: this.lastLoadedData!,
+            source: 'cache',
+            timestamp: Date.now(),
+          };
+        }
+
         // No bundles -- return empty data
         const emptyData = this.buildEmptyTxfData();
         this.lastLoadedData = emptyData;
@@ -2781,6 +2833,200 @@ export class ProfileTokenStorageProvider
           err instanceof Error ? err.message : String(err)
         }`,
       );
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Issue #313 — local snapshot cache (lazy-load)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Issue #313 — atomic-write the lazy-load snapshot blob.
+   *
+   * Reads the live in-memory state (identity, pendingData ∪
+   * lastLoadedData, knownBundleCids, lastDiscoveredPointerCid) and
+   * persists it via {@link writeSnapshot} (temp-key + swap with
+   * `setMany`). Best-effort: any failure is caught and surfaced via
+   * `storage:error` (`PROFILE_SNAPSHOT_WRITE_FAILED`) without
+   * propagating; the snapshot is a perf optimisation, not a correctness
+   * gate.
+   *
+   * No-ops when:
+   *   - no `localCache` is wired (provider constructed without cache);
+   *   - identity is not yet bound (cold-start);
+   *   - no in-memory state to snapshot (fresh wallet);
+   *   - the network identifier is not configured (defensive).
+   */
+  private async writeLocalSnapshot(
+    trigger: 'flush' | 'shutdown' | 'background-sync',
+    options?: {
+      readonly previousPointerVersion?: number | null;
+      readonly durationMs?: number;
+    },
+  ): Promise<void> {
+    if (!this.localCache) return;
+    if (!this.identity) return;
+    const addressId = this.getAddressId();
+    if (!addressId || addressId === 'default') {
+      // Defensive: pre-`setIdentity` writes route to the literal
+      // 'default' addressId. A snapshot written under that ID would be
+      // ambiguous across wallets; skip rather than poison the cache.
+      return;
+    }
+
+    // Prefer the most recent buffered save (pendingData) over the last
+    // loaded snapshot. If neither is set there's nothing meaningful to
+    // persist.
+    const data = this.pendingData ?? this.lastLoadedData;
+    if (!data) return;
+
+    const network = this.options?.config?.network ?? null;
+    if (!network) return;
+
+    // Pointer field: prefer the last-discovered aggregator pointer CID.
+    // The aggregator pointer layer doesn't expose its on-chain version
+    // directly to the token storage provider, so we pass null for
+    // version in the basic case. The `previousPointerVersion` option
+    // lets `background-sync` callers thread the prior version through
+    // the refreshed event payload.
+    const pointer: ProfileSnapshotPointer | null = this.lastDiscoveredPointerCid
+      ? {
+          version: 0,
+          cid: this.lastDiscoveredPointerCid,
+          ts: Date.now(),
+        }
+      : null;
+
+    try {
+      const ts = await writeSnapshot(this.localCache, {
+        walletId: this.identity.chainPubkey,
+        addressId,
+        network,
+        epoch: null, // OpLog epoch wiring is owned by issue #310's reset primitive
+        pointer,
+        bundleCids: Array.from(this.knownBundleCids),
+        data,
+      });
+      this.emitEvent({
+        type: 'profile:snapshot-refreshed',
+        timestamp: ts,
+        data: {
+          trigger,
+          from: options?.previousPointerVersion ?? null,
+          to: pointer?.version ?? null,
+          durationMs: options?.durationMs,
+        },
+      });
+    } catch (err) {
+      this.log(
+        `writeLocalSnapshot (${trigger}) failed (best-effort): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      this.emitEvent(
+        this.buildErrorEvent(
+          'storage:error',
+          err,
+          'PROFILE_SNAPSHOT_WRITE_FAILED',
+        ),
+      );
+    }
+  }
+
+  /**
+   * Issue #313 — read the lazy-load snapshot blob and SEED the
+   * in-memory state from it.
+   *
+   * Called by `LifecycleManager.initialize()` BEFORE the OrbitDB
+   * connect + bundle-index refresh. On a successful seed the wallet
+   * has renderable state (`lastLoadedData`, `knownBundleCids`,
+   * `lastDiscoveredPointerCid`) and `profile:snapshot-loaded` is
+   * emitted; the lifecycle still runs the full initialize flow which
+   * acts as a background sync (replication subscription, aggregator
+   * pointer recovery, periodic-poll arming).
+   *
+   * On corruption the blob is removed and `profile:snapshot-corrupt`
+   * is emitted; boot continues via the slow path.
+   *
+   * Returns true if a valid snapshot was applied; false otherwise.
+   */
+  private async readLocalSnapshot(): Promise<boolean> {
+    if (!this.localCache) return false;
+    if (!this.identity) return false;
+    const addressId = this.getAddressId();
+    if (!addressId || addressId === 'default') return false;
+
+    let result: SnapshotReadResult;
+    try {
+      result = await readSnapshot(
+        this.localCache,
+        addressId,
+        this.identity.chainPubkey,
+      );
+    } catch (err) {
+      this.log(
+        `readLocalSnapshot failed (best-effort): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return false;
+    }
+
+    switch (result.kind) {
+      case 'absent':
+        return false;
+      case 'corrupt':
+        this.log(
+          `Local snapshot corrupt (${result.reason}); cleaning + falling through to OpLog walk`,
+        );
+        await clearSnapshot(this.localCache, addressId);
+        this.emitEvent({
+          type: 'profile:snapshot-corrupt',
+          timestamp: Date.now(),
+          data: {
+            reason: result.reason,
+            walletId: result.walletId,
+          },
+        });
+        return false;
+      case 'ok': {
+        // Seed the in-memory state. We treat the snapshot as a
+        // BASELINE — subsequent OrbitDB enumeration / aggregator
+        // pointer recovery will overwrite these as newer state lands.
+        this.lastLoadedData = result.blob.data;
+        // Snapshot the seeded bundle-set so the runtime monotonicity
+        // assertion has a non-null baseline. Treated as authoritative
+        // until the post-init `refreshKnownBundles` either confirms or
+        // replaces it.
+        this.lastLoadedFromBundleCids = new Set(result.blob.bundleCids);
+        // Prime knownBundleCids so cold-start recovery (`if
+        // knownBundleCids.size === 0`) does not run when the snapshot
+        // already had bundle refs — that recovery is precisely the
+        // remote round-trip we want to defer to background.
+        this.knownBundleCids = new Set(result.blob.bundleCids);
+        if (result.blob.pointer) {
+          this.lastDiscoveredPointerCid = result.blob.pointer.cid;
+        }
+
+        const tokenCount = Object.keys(result.blob.data).filter((k) =>
+          k.startsWith('_') && !k.startsWith('__'),
+        ).length;
+
+        this.emitEvent({
+          type: 'profile:snapshot-loaded',
+          timestamp: Date.now(),
+          data: {
+            ageMs: result.ageMs,
+            tokenCount,
+            bundleCount: result.blob.bundleCids.length,
+            pointerVersion: result.blob.pointer?.version ?? null,
+          },
+        });
+        this.log(
+          `Loaded local snapshot: tokens=${tokenCount} bundles=${result.blob.bundleCids.length} ageMs=${result.ageMs}`,
+        );
+        return true;
+      }
     }
   }
 
