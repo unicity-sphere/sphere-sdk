@@ -274,6 +274,20 @@ export interface SphereLoadOptions {
   fallbackStorage?: StorageProvider;
   /** Optional token storage provider (for IPFS sync) */
   tokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
+  /**
+   * Issue #330 — Optional read-only fallback TOKEN storage consulted by
+   * Profile-mode token reads when the primary (OrbitDB-backed) read
+   * returns nothing or fails (e.g. `CRITICAL-BLOCK-EVICTED`). Intended
+   * for Profile-mode boots where a previously-working legacy
+   * `IndexedDBTokenStorageProvider` still holds tokens from before the
+   * migration to Profile. Token-side analogue of `fallbackStorage`.
+   * Never written to.
+   *
+   * Use `migrateLegacyToProfileBrowser` / `migrateLegacyToProfile` to
+   * write a "migrated" marker so legacy is preserved as read-only
+   * fallback (the post-#330 default) rather than wiped (pre-#330).
+   */
+  fallbackTokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
   /** Transport provider instance */
   transport: TransportProvider;
   /** Oracle provider instance */
@@ -427,6 +441,11 @@ export interface SphereInitOptions {
    * option types.
    */
   fallbackStorage?: StorageProvider;
+  /**
+   * Issue #330 — Optional read-only fallback TOKEN storage. See
+   * {@link SphereLoadOptions.fallbackTokenStorage} for semantics.
+   */
+  fallbackTokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
   /** Transport provider instance */
   transport: TransportProvider;
   /** Oracle provider instance */
@@ -764,6 +783,18 @@ export class Sphere {
    * forensics. `null` when there's no fallback or the connect succeeded.
    */
   private _fallbackStorageError: Error | null = null;
+  /**
+   * Issue #330 — read-only fallback TOKEN storage consulted by the
+   * primary token-storage provider on read miss or eviction. Set once
+   * at construction by the static factories. `null` when no fallback
+   * was supplied. Token-side analogue of `_fallbackStorage`.
+   *
+   * Wired into ProfileTokenStorageProvider via the
+   * `fallbackTokenStorage` option so the provider can consult the
+   * legacy `IndexedDBTokenStorageProvider` when a Profile block read
+   * fails (e.g. `[CRITICAL-BLOCK-EVICTED]`). Never written to.
+   */
+  private _fallbackTokenStorage: TokenStorageProvider<TxfStorageDataBase> | null = null;
   private _tokenStorageProviders: Map<string, TokenStorageProvider<TxfStorageDataBase>> = new Map();
   private _transport: TransportProvider;
   private _oracle: OracleProvider;
@@ -991,6 +1022,7 @@ export class Sphere {
       const sphere = await Sphere.load({
         storage: options.storage,
         fallbackStorage: options.fallbackStorage,
+        fallbackTokenStorage: options.fallbackTokenStorage,
         transport: options.transport,
         oracle: options.oracle,
         tokenStorage: options.tokenStorage,
@@ -1335,6 +1367,29 @@ export class Sphere {
     // Profile-mode boots where the legacy IndexedDB still holds the
     // encrypted-with-password identity material.
     sphere._fallbackStorage = options.fallbackStorage ?? null;
+    // Issue #330 — read-only fallback TOKEN storage for Profile-mode
+    // token reads. Consulted on miss/eviction. See
+    // {@link SphereLoadOptions.fallbackTokenStorage} and the wiring at
+    // `getTokenStorage().setFallbackTokenStorage(...)` further below.
+    sphere._fallbackTokenStorage = options.fallbackTokenStorage ?? null;
+
+    // Issue #330 — propagate the fallback into any token storage
+    // provider that supports it (Profile-mode providers expose
+    // `setFallbackTokenStorage`). Done here, before initialize() runs,
+    // so the first `load()` call sees the fallback. Other providers
+    // (legacy IndexedDB) silently ignore — duck-type check.
+    if (sphere._fallbackTokenStorage !== null) {
+      for (const provider of sphere._tokenStorageProviders.values()) {
+        const setter = (provider as {
+          setFallbackTokenStorage?: (
+            fb: TokenStorageProvider<TxfStorageDataBase>,
+          ) => void;
+        }).setFallbackTokenStorage;
+        if (typeof setter === 'function') {
+          setter.call(provider, sphere._fallbackTokenStorage);
+        }
+      }
+    }
 
     // exists() restores original (disconnected) state — reconnect for reads
     if (!options.storage.isConnected()) {
@@ -2500,6 +2555,22 @@ export class Sphere {
   async addTokenStorageProvider(provider: TokenStorageProvider<TxfStorageDataBase>): Promise<void> {
     if (this._tokenStorageProviders.has(provider.id)) {
       throw new SphereError(`Token storage provider '${provider.id}' already exists`, 'INVALID_CONFIG');
+    }
+
+    // Issue #330 — apply the fallback before initialize() so the first
+    // load() call on the newly-added provider can fall through to the
+    // legacy IDB if the Profile path returns empty/fails. Duck-typed:
+    // providers that don't expose `setFallbackTokenStorage` are
+    // silently skipped (legacy `IndexedDBTokenStorageProvider`).
+    if (this._fallbackTokenStorage !== null) {
+      const setter = (provider as {
+        setFallbackTokenStorage?: (
+          fb: TokenStorageProvider<TxfStorageDataBase>,
+        ) => void;
+      }).setFallbackTokenStorage;
+      if (typeof setter === 'function') {
+        setter.call(provider, this._fallbackTokenStorage);
+      }
     }
 
     // Set identity if wallet is initialized

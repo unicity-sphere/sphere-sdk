@@ -299,6 +299,19 @@ export class ProfileTokenStorageProvider
   // so we don't attempt the delete on every save.
   private legacyKeysCleaned = false;
 
+  // ---------------------------------------------------------------------------
+  // Issue #330 — read-only fallback token storage (legacy IDB)
+  //
+  // When the Profile load path returns empty or fails on a wallet that
+  // was migrated from a legacy `IndexedDBTokenStorageProvider`, this
+  // fallback is consulted as a last-resort read source. Wired by
+  // `Sphere.load()` after construction via {@link setFallbackTokenStorage}.
+  //
+  // Strictly read-only: never written to. If a successful primary load
+  // observes tokens, the fallback is NOT consulted for that call.
+  // ---------------------------------------------------------------------------
+  private fallbackTokenStorage: TokenStorageProvider<TxfStorageDataBase> | null = null;
+
   // --- Sub-modules (Phase 8 facade refactor) ---
   private readonly bundleIndex: BundleIndex;
   private readonly historyStore: HistoryStore;
@@ -871,6 +884,27 @@ export class ProfileTokenStorageProvider
   }
 
   /**
+   * Issue #330 — install a read-only fallback token-storage provider.
+   *
+   * Consulted by `load()` when the primary path returns empty (no
+   * bundles + no cached seed) or fails (e.g. `[CRITICAL-BLOCK-EVICTED]`).
+   * Token-side analogue of `Sphere.fallbackStorage` (which only covers
+   * identity keys). Set once at startup; subsequent calls overwrite.
+   * Pass `null` to clear.
+   *
+   * The fallback is strictly read-only: this provider NEVER writes to
+   * it. Migration from legacy IDB to Profile no longer wipes the
+   * legacy DB (see `migration.ts` step 5c) precisely so it can serve
+   * as a last-resort recovery source for tokens that were durable in
+   * legacy before the Profile blockstore lost them.
+   */
+  setFallbackTokenStorage(
+    fallback: TokenStorageProvider<TxfStorageDataBase> | null,
+  ): void {
+    this.fallbackTokenStorage = fallback;
+  }
+
+  /**
    * Item #15 Phase C.3 — public read accessor for the bound identity.
    * Returns `null` until {@link setIdentity} has been called.
    *
@@ -1209,6 +1243,49 @@ export class ProfileTokenStorageProvider
   }
 
   // ---------------------------------------------------------------------------
+  // Issue #330 — fallback-load helper
+  //
+  // Consult `fallbackTokenStorage` (if wired) as a last-resort read
+  // source. Returns the fallback's full load result only when it
+  // contains at least one token key; otherwise returns null so the
+  // caller's normal "empty" path runs (avoids masking a legitimately-
+  // empty wallet with stale fallback junk).
+  //
+  // Never throws — any error from the fallback is logged and treated
+  // as "no fallback data available." The fallback is strictly read-
+  // only; this helper never invokes `save`.
+  // ---------------------------------------------------------------------------
+  private async tryFallbackLoad(
+    reason: 'no-bundles' | 'no-bundles-fetched' | 'load-error',
+  ): Promise<TxfStorageDataBase | null> {
+    const fallback = this.fallbackTokenStorage;
+    if (!fallback) return null;
+    try {
+      if (typeof fallback.isConnected === 'function' && !fallback.isConnected()) {
+        if (typeof fallback.connect === 'function') {
+          await fallback.connect();
+        }
+      }
+      const result = await fallback.load();
+      if (!result.success || !result.data) return null;
+      const data = result.data;
+      const hasTokens = Object.keys(data).some((k) => isTokenKey(k));
+      if (!hasTokens) return null;
+      this.log(
+        `fallback-load: consulted fallbackTokenStorage (reason=${reason}); ` +
+          `recovered ${Object.keys(data).filter(isTokenKey).length} token key(s).`,
+      );
+      return data;
+    } catch (err) {
+      this.log(
+        `fallback-load: fallbackTokenStorage.load() threw (reason=${reason}): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return null;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // load() -- Multi-bundle merge
   // ---------------------------------------------------------------------------
 
@@ -1292,6 +1369,24 @@ export class ProfileTokenStorageProvider
           };
         }
 
+        // Issue #330 — before returning empty, consult the read-only
+        // fallback token storage (legacy IDB from pre-Profile-migration).
+        // Covers the symptom in #330 where Profile reports `tokens=0
+        // bundles=0` after a memory-only blockstore reload but tokens
+        // were durably persisted to legacy IDB by an earlier session.
+        const fallback = await this.tryFallbackLoad('no-bundles');
+        if (fallback !== null) {
+          this.lastLoadedData = fallback;
+          this.lastLoadedFromBundleCids = new Set();
+          this.emitEvent({ type: 'storage:loaded', timestamp: Date.now() });
+          return {
+            success: true,
+            data: fallback,
+            source: 'cache',
+            timestamp: Date.now(),
+          };
+        }
+
         // No bundles -- return empty data
         const emptyData = this.buildEmptyTxfData();
         this.lastLoadedData = emptyData;
@@ -1370,6 +1465,31 @@ export class ProfileTokenStorageProvider
           loadedBundles.push({ cid, pkg });
         } catch (err) {
           this.log(`Failed to load bundle ${cid}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+
+      // Issue #330 — if every bundle fetch failed but bundle refs DID
+      // exist, the Profile path is currently unreadable (e.g. all CIDs
+      // 404 from the gateway because the operator gateway evicted them,
+      // AND the local Helia blockstore was memory-only pre-#330 fix
+      // (a) and lost them on reload). Without this gate we would fall
+      // through to the merge over an empty loadedBundles set and return
+      // success with an empty wallet — silently losing tokens that ARE
+      // recoverable from the legacy IDB fallback.
+      if (loadedBundles.length === 0 && activeBundles.size > 0) {
+        const fallback = await this.tryFallbackLoad('no-bundles-fetched');
+        if (fallback !== null) {
+          this.lastLoadedData = fallback;
+          // Do NOT update lastLoadedFromBundleCids — we did not actually
+          // load these bundles. Leaving it at its prior state (or
+          // null) keeps the monotonicity assertion's baseline correct.
+          this.emitEvent({ type: 'storage:loaded', timestamp: Date.now() });
+          return {
+            success: true,
+            data: fallback,
+            source: 'cache',
+            timestamp: Date.now(),
+          };
         }
       }
 
@@ -1486,6 +1606,25 @@ export class ProfileTokenStorageProvider
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
       this.emitEvent(this.buildErrorEvent('storage:error', err));
+
+      // Issue #330 — outermost recovery. When the Profile load path
+      // throws (e.g. `LoadBlockFailedError` from a missing OrbitDB
+      // OpLog block — the `bafyreihmwunmk75i3h…` symptom in #330),
+      // consult the legacy fallback as a last resort. The fallback
+      // is the only on-device source that survives a memory-blockstore
+      // wipe + gateway eviction race.
+      const fallback = await this.tryFallbackLoad('load-error');
+      if (fallback !== null) {
+        this.lastLoadedData = fallback;
+        this.emitEvent({ type: 'storage:loaded', timestamp: Date.now() });
+        return {
+          success: true,
+          data: fallback,
+          source: 'cache',
+          timestamp: Date.now(),
+        };
+      }
+
       return {
         success: false,
         error: errorMsg,
