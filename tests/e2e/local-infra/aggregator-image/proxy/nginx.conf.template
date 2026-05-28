@@ -52,4 +52,21 @@ server {
         proxy_set_header Host $host;
         proxy_read_timeout 10s;
     }
+
+    # Serve OUR aggregator's trust-base.json so wallets can verify
+    # inclusion proofs against this chain's genesis. The file is
+    # bind-mounted into /etc/aggregator-config/ from the same host
+    # path the aggregator binary reads its config from (./data/genesis/
+    # in the compose file's working directory). When fresh genesis is
+    # minted via `run-aggregator.sh --fresh`, this URL serves the new
+    # trust-base on the next nginx reload — no restart required as
+    # long as the file's inode is preserved (which Docker bind-mounts
+    # of single files do).
+    location = /.well-known/trust-base.json {
+        access_log off;
+        default_type application/json;
+        add_header Access-Control-Allow-Origin "*" always;
+        add_header Cache-Control "no-cache, must-revalidate";
+        alias /etc/aggregator-config/trust-base.json;
+    }
 }
