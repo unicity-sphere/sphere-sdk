@@ -513,6 +513,17 @@ export interface SphereInitResult {
 const UNICITY_TOKEN_TYPE_HEX = 'f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe397867509';
 
 /**
+ * PR #316 F1 fix — default wall-clock budget for the pre-bump
+ * discovery RPC inside `resetEpoch`. The discovery makes one or more
+ * aggregator RPCs to determine the on-chain epoch floor before
+ * computing `newEpoch = max(local, discovered) + 1`. Bounded so a
+ * misbehaving aggregator cannot hang the user-facing reset call
+ * indefinitely; on timeout the bump proceeds from the local floor
+ * alone and `'profile:epoch-reset-discovery-skipped'` is emitted.
+ */
+const RESET_EPOCH_DISCOVERY_TIMEOUT_MS = 15_000;
+
+/**
  * Derive L3 predicate address (DIRECT://...) from private key
  * Uses UnmaskedPredicateReference for stable wallet address
  */
@@ -1822,6 +1833,16 @@ export class Sphere {
   /**
    * Issue #310 — core read-modify-write cycle for a single resetEpoch
    * call. Wrapped by `resetEpochImpl` with the mutex.
+   *
+   * PR #316 F1 fix — the floor bump now consults the on-chain epoch
+   * floor (`pointer.discoverLatestVersion().pickedEpoch`) before
+   * computing `newEpoch = max(local, discovered) + 1`. This closes
+   * the cross-device monotonicity gap: two devices that both observe
+   * `localFloor=N` will each discover the same `chainFloor=N` (or
+   * better) and both bump to N+1; whichever device's publish lands
+   * first wins, and the loser's subsequent publish forces a re-
+   * discovery (now seeing the winner's N+1) so its NEXT bump goes
+   * to N+2.
    */
   private async resetEpochCore(
     params: ResetEpochParams,
@@ -1829,9 +1850,42 @@ export class Sphere {
     const ts = Date.now();
 
     try {
-      // 1. Read current floor → compute new = current + 1.
+      // 1a. Read local floor.
       const currentEpoch = await this.getEpochFloorImpl();
-      const newEpoch = currentEpoch + 1;
+
+      // 1b. PR #316 F1 fix — consult the on-chain epoch floor with a
+      //     bounded timeout. The walkback floor is the
+      //     `pickedEpoch` from Phase-3 discovery — the `max(epoch)`
+      //     observed across every Phase-3 candidate whose CAR the
+      //     wallet successfully inspected. On RPC failure (network
+      //     down, aggregator timeout, etc.) we fall back to the
+      //     local floor alone and emit the
+      //     `'profile:epoch-reset-discovery-skipped'` event so
+      //     callers can surface the PROVISIONAL nature of the bump.
+      const discoveryTimeoutMs =
+        params.discoveryTimeoutMs ?? RESET_EPOCH_DISCOVERY_TIMEOUT_MS;
+      let discoveredEpoch = 0;
+      let discoveryConsulted = false;
+      let discoveryError: string | null = null;
+      if (discoveryTimeoutMs > 0) {
+        try {
+          discoveredEpoch = await this.discoverChainEpochFloor(
+            discoveryTimeoutMs,
+          );
+          discoveryConsulted = true;
+        } catch (err) {
+          discoveryError = err instanceof Error ? err.message : String(err);
+          logger.warn(
+            'Sphere',
+            `resetEpoch: discovery failed (continuing with local floor only — ` +
+              `new epoch is PROVISIONAL): ${discoveryError}`,
+          );
+        }
+      }
+
+      // 1c. Compute new epoch from the higher of (local, discovered).
+      const baseEpoch = Math.max(currentEpoch, discoveredEpoch);
+      const newEpoch = baseEpoch + 1;
 
       // 2. Persist BEFORE the OpLog wipe so a crash between (2) and
       //    (3) leaves the local wallet with the new floor in place —
@@ -1891,11 +1945,23 @@ export class Sphere {
         ts,
       });
 
+      // 5b. PR #316 F1 fix — surface discovery-failure so callers know
+      //     the bump is PROVISIONAL.
+      if (!discoveryConsulted && discoveryError !== null) {
+        this.emitEvent('profile:epoch-reset-discovery-skipped', {
+          newEpoch,
+          reason: params.reason,
+          discoveryError,
+          ts,
+        });
+      }
+
       return {
         newEpoch,
         reason: params.reason,
         ts,
         publishedVersion: 0,
+        discoveryConsulted,
       };
     } catch (err) {
       if (err instanceof SphereError) throw err;
@@ -1904,6 +1970,72 @@ export class Sphere {
         'PROFILE_RESET_FAILED',
         err,
       );
+    }
+  }
+
+  /**
+   * PR #316 F1 fix — best-effort discovery of the on-chain epoch
+   * floor. Runs `pointer.discoverLatestVersion()` with a
+   * caller-supplied wall-clock budget and returns the
+   * `pickedEpoch` value. Throws on any failure (RPC timeout,
+   * aggregator down, pointer layer missing) — the caller logs the
+   * error, emits the `'profile:epoch-reset-discovery-skipped'`
+   * event, and falls back to the local floor alone.
+   *
+   * Returns 0 for a fresh wallet that has never observed an
+   * on-chain epoch (the discovery returns `pickedEpoch: 0` in that
+   * case, which is correct — `max(local=0, discovered=0) + 1 = 1`).
+   */
+  private async discoverChainEpochFloor(
+    timeoutMs: number,
+  ): Promise<number> {
+    const storageWithPointer = this._storage as unknown as {
+      getPointerLayer?: () => {
+        discoverLatestVersion?: (
+          walkbackLimit?: number,
+          opts?: { abortSignal?: AbortSignal },
+        ) => Promise<{ pickedEpoch?: number }>;
+      } | null;
+    };
+    const pointer = storageWithPointer.getPointerLayer?.() ?? null;
+    if (
+      pointer === null ||
+      typeof pointer.discoverLatestVersion !== 'function'
+    ) {
+      throw new Error(
+        'pointer layer unavailable (discoverLatestVersion missing)',
+      );
+    }
+    const abortController = new AbortController();
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      deadlineTimer = setTimeout(() => {
+        try {
+          abortController.abort();
+        } catch {
+          /* noop */
+        }
+      }, timeoutMs);
+      // Some Node test runners support .unref() on timers; ignore otherwise.
+      if (
+        deadlineTimer !== undefined &&
+        typeof (deadlineTimer as unknown as { unref?: unknown }).unref ===
+          'function'
+      ) {
+        (deadlineTimer as unknown as { unref: () => void }).unref();
+      }
+      const result = await pointer.discoverLatestVersion(undefined, {
+        abortSignal: abortController.signal,
+      });
+      const picked = result?.pickedEpoch;
+      if (typeof picked !== 'number' || !Number.isFinite(picked) || picked < 0) {
+        return 0;
+      }
+      return picked;
+    } finally {
+      if (deadlineTimer !== undefined) {
+        clearTimeout(deadlineTimer);
+      }
     }
   }
 

@@ -33,7 +33,9 @@ import type { SphereEventMap, SphereEventType } from '../types/index.js';
 export interface ResetEpochResult {
   /**
    * The new epoch stamped into the freshly-minted OpLog snapshot.
-   * Strictly `prev.epoch + 1`. Persisted into the wallet's local
+   * Strictly `max(localFloor, discoveredFloor) + 1`, where
+   * `discoveredFloor` is the highest epoch observed on-chain at
+   * call time (PR #316 F1 fix). Persisted into the wallet's local
    * epoch-floor cache so subsequent walkback inspections refuse to
    * load any predecessor with `epoch < newEpoch`.
    */
@@ -47,8 +49,28 @@ export interface ResetEpochResult {
    * the publish did not run / failed gracefully — the local reset
    * is still durable in that case; the publish will be retried on
    * the next dirty-flush cycle).
+   *
+   * NOTE: PR #316 F1 baseline keeps this hardcoded to `0` —
+   * populating it from the post-reset publish is delivered in the
+   * separate F2 commit. Callers reading this field on the F1
+   * commit should treat it as "publish state unknown; observe
+   * `'storage:pointer-published'` for the actual outcome".
    */
   readonly publishedVersion: number;
+  /**
+   * PR #316 F1 fix — `true` when the on-chain epoch floor was
+   * consulted before bumping. `false` when the discovery RPC failed
+   * (network / aggregator down): the bump was computed from the
+   * local floor alone and is PROVISIONAL.
+   *
+   * A `false` result is rare — discovery uses the same RPC stack as
+   * the publish path, so a `false` here is usually accompanied by a
+   * `publishedVersion: 0` result (publish also failed). Callers in
+   * sibling-device deployments SHOULD surface a warning when this is
+   * `false`, since cross-device monotonicity was not verified at
+   * mint time.
+   */
+  readonly discoveryConsulted: boolean;
 }
 
 /**
@@ -67,6 +89,16 @@ export interface ResetEpochParams {
    *   - `'cidref-missing-block-bafyreih...'`
    */
   readonly reason: string;
+  /**
+   * PR #316 F1 fix — bounded timeout (ms) for the pre-bump
+   * discovery RPC. Default: 15 000. On timeout, the bump proceeds
+   * from the local floor alone and is PROVISIONAL (see
+   * `discoveryConsulted` in {@link ResetEpochResult}). Set to
+   * `0` to skip discovery entirely (test-only escape hatch — NOT
+   * recommended in production because cross-device monotonicity
+   * cannot then be enforced).
+   */
+  readonly discoveryTimeoutMs?: number;
 }
 
 /**
@@ -84,18 +116,25 @@ export interface SphereProfileHandle {
    * replicating the same wallet) honor.
    *
    * Operation:
-   *   1. Snapshot in-memory state (identity, tokens, tracked
+   *   1. (PR #316 F1 fix) **Consult the on-chain epoch floor.** Run a
+   *      best-effort `pointer.discoverLatestVersion()` with a bounded
+   *      timeout to capture `discoveredFloor = pickedEpoch` from
+   *      Phase-3 walkback. On RPC failure the discovered floor is
+   *      treated as 0 and `'profile:epoch-reset-discovery-skipped'`
+   *      is emitted; the bump proceeds from the local floor alone
+   *      and is PROVISIONAL.
+   *   2. Compute `newEpoch = max(localFloor, discoveredFloor) + 1`.
+   *   3. Snapshot in-memory state (identity, tokens, tracked
    *      addresses) into a transient buffer.
-   *   2. Wipe the local OrbitDB OpLog via
+   *   4. Wipe the local OrbitDB OpLog via
    *      `OrbitDbAdapter.resetCorruptedLog`.
-   *   3. Mint a fresh OpLog. Write the snapshot's KV entries back
+   *   5. Mint a fresh OpLog. Write the snapshot's KV entries back
    *      via the normal storage-provider write path (which lands
    *      them in the fresh OpLog).
-   *   4. Bump the persisted epoch floor by exactly +1 and trigger
-   *      a dirty-flush so the next snapshot's root block carries
-   *      `epoch = newEpoch` and the new aggregator-pointer version
-   *      publishes.
-   *   5. Emit `profile:epoch-reset` on the Sphere event bus.
+   *   6. Persist the new epoch floor and trigger a dirty-flush so
+   *      the next snapshot's root block carries `epoch = newEpoch`
+   *      and the new aggregator-pointer version publishes.
+   *   7. Emit `profile:epoch-reset` on the Sphere event bus.
    *
    * Idempotency: calling `resetEpoch` a second time lands a NEW
    * +1 epoch — it does NOT skip. Each invocation is a distinct
@@ -107,6 +146,21 @@ export interface SphereProfileHandle {
    * the next dirty-flush completes the publish) or — in the worst
    * case — re-runs the reset on operator request. Partial-reset
    * MUST NOT leave the wallet unloadable.
+   *
+   * Cross-device monotonicity (PR #316 F1 fix). Two devices A and B
+   * sharing the same wallet identity that both call `resetEpoch`
+   * concurrently SHOULD each observe the same `discoveredFloor`
+   * (assuming the aggregator's read-replica lag is below
+   * `discoveryTimeoutMs`). Each device bumps to
+   * `max(local, discovered) + 1` — if A is already at epoch N and B
+   * is at N, both bump to N+1. The first to land the publish wins;
+   * the second hits `WALKBACK_FLOOR` on its next publish attempt
+   * and re-discovers (now seeing the winner's N+1 on-chain), so its
+   * NEXT bump goes to N+2. The convergence window is bounded by the
+   * aggregator's read-replica lag. For DEVICES with disjoint
+   * aggregator views (network partition), this fix cannot prevent
+   * a temporary divergence — the cross-device walkback floor on the
+   * pointer-pointer (see `epoch-floor.ts`) eventually catches up.
    *
    * Concurrent calls: a per-instance mutex serializes concurrent
    * `resetEpoch` invocations on the same `Sphere` so each call

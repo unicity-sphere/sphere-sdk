@@ -56,8 +56,14 @@ function makeKv(): InMemoryKv {
 }
 
 interface LegacyStorageStub extends InMemoryKv {}
+interface PointerStub {
+  discoverLatestVersion?: (
+    walkbackLimit?: number,
+    opts?: { abortSignal?: AbortSignal },
+  ) => Promise<{ pickedEpoch?: number }>;
+}
 interface ProfileStorageStub extends InMemoryKv {
-  getPointerLayer(): unknown | null;
+  getPointerLayer(): PointerStub | null;
   getOrbitDbAdapter?(): {
     resetCorruptedLog?: (reason: {
       lostHeadCid?: string;
@@ -74,13 +80,35 @@ function makeProfileStorage(opts: {
   withAdapter?: boolean;
   resetThrows?: boolean;
   resetCalls?: Array<{ context: string }>;
+  /**
+   * PR #316 F1 fix — stub the on-chain discovery result. When set,
+   * the pointer-layer stub exposes `discoverLatestVersion()` that
+   * returns `{ pickedEpoch }`. When undefined, the pointer layer
+   * does NOT expose the method (matches legacy / pre-#310 stubs)
+   * and discovery is skipped.
+   */
+  discoveredEpoch?: number;
+  /**
+   * PR #316 F1 fix — stub a discovery throw. When set, the
+   * `discoverLatestVersion()` call rejects with this message;
+   * `resetEpoch` MUST proceed with local floor only.
+   */
+  discoveryThrows?: string;
 } = {}): ProfileStorageStub {
   const kv = makeKv();
+  const pointer: PointerStub = {};
+  if (opts.discoveryThrows !== undefined) {
+    pointer.discoverLatestVersion = async () => {
+      throw new Error(opts.discoveryThrows!);
+    };
+  } else if (opts.discoveredEpoch !== undefined) {
+    pointer.discoverLatestVersion = async () => ({
+      pickedEpoch: opts.discoveredEpoch!,
+    });
+  }
   const result: ProfileStorageStub = {
     ...kv,
-    getPointerLayer: () => ({}), // any truthy value is enough; the
-                                 // Sphere code only checks the method's
-                                 // presence
+    getPointerLayer: () => pointer,
   };
   if (opts.withAdapter) {
     result.getOrbitDbAdapter = () => ({
@@ -327,6 +355,143 @@ describe('Sphere.profile.resetEpoch()', () => {
       .map((e) => (e.payload as { newEpoch: number }).newEpoch)
       .sort();
     expect(eventEpochs).toEqual([1, 2]);
+  });
+});
+
+// =============================================================================
+// PR #316 F1 fix — cross-device monotonicity via discovered floor
+// =============================================================================
+//
+// Without the F1 fix, devices A and B both observing `localFloor=2`
+// would each mint `epoch=3` independently because the bump consults
+// only the LOCAL floor. The F1 fix consults the pointer layer's
+// `pickedEpoch` before bumping — so a device whose local floor lags
+// the on-chain floor catches up.
+
+describe('Sphere.profile.resetEpoch — F1 cross-device monotonicity', () => {
+  it('bumps from max(localFloor, discoveredEpoch) + 1 when discovery returns a higher epoch', async () => {
+    // Simulate the sibling-device race: device B has localFloor=0
+    // but the chain already serves epoch=4 from device A.
+    const storage = makeProfileStorage({ discoveredEpoch: 4 });
+    const { sphere } = buildSphereLike(storage);
+
+    const result = await sphere.profile!.resetEpoch({
+      reason: 'cross-device-catchup',
+    });
+
+    // newEpoch = max(0, 4) + 1 = 5
+    expect(result.newEpoch).toBe(5);
+    expect(result.discoveryConsulted).toBe(true);
+    expect(await storage.get(LOCAL_EPOCH_FLOOR_KEY)).toBe('5');
+  });
+
+  it('bumps from local floor when discovery returns a lower epoch (stale aggregator view)', async () => {
+    // Edge case: aggregator is behind our local floor (we already
+    // reset locally but the publish hasn't landed yet). Use the
+    // higher of the two.
+    const storage = makeProfileStorage({ discoveredEpoch: 1 });
+    await storage.set(LOCAL_EPOCH_FLOOR_KEY, '3'); // local is ahead
+
+    const { sphere } = buildSphereLike(storage);
+    const result = await sphere.profile!.resetEpoch({
+      reason: 'local-ahead-of-chain',
+    });
+
+    // newEpoch = max(3, 1) + 1 = 4
+    expect(result.newEpoch).toBe(4);
+    expect(result.discoveryConsulted).toBe(true);
+  });
+
+  it('falls back to local floor + 1 and emits discovery-skipped when discovery throws', async () => {
+    const storage = makeProfileStorage({
+      discoveryThrows: 'aggregator timeout',
+    });
+    const { sphere, events } = buildSphereLike(storage);
+    // Also subscribe to the new discovery-skipped event.
+    const skippedEvents: Array<{ payload: unknown }> = [];
+    (sphere as unknown as Sphere).on(
+      'profile:epoch-reset-discovery-skipped',
+      (payload) => {
+        skippedEvents.push({ payload });
+      },
+    );
+
+    const result = await sphere.profile!.resetEpoch({
+      reason: 'discovery-down',
+    });
+
+    // Bump still proceeds from local=0 → 1, but discoveryConsulted is false.
+    expect(result.newEpoch).toBe(1);
+    expect(result.discoveryConsulted).toBe(false);
+
+    // Both events fire — the canonical event AND the discovery-skipped
+    // warning so callers can surface the PROVISIONAL nature.
+    expect(events).toHaveLength(1);
+    expect(skippedEvents).toHaveLength(1);
+    expect(skippedEvents[0].payload).toMatchObject({
+      newEpoch: 1,
+      reason: 'discovery-down',
+      discoveryError: expect.stringContaining('aggregator timeout'),
+    });
+  });
+
+  it('skips discovery entirely when discoveryTimeoutMs=0 (test-only escape hatch)', async () => {
+    let discoveryCalled = false;
+    const storage = makeProfileStorage({ discoveredEpoch: 99 });
+    // Override the discover stub to flip a flag when called.
+    const original = storage.getPointerLayer()!.discoverLatestVersion!;
+    storage.getPointerLayer = () => ({
+      discoverLatestVersion: async (...args) => {
+        discoveryCalled = true;
+        return original(...args);
+      },
+    });
+
+    const { sphere } = buildSphereLike(storage);
+    const result = await sphere.profile!.resetEpoch({
+      reason: 'no-discovery',
+      discoveryTimeoutMs: 0,
+    });
+
+    expect(discoveryCalled).toBe(false);
+    expect(result.newEpoch).toBe(1); // local-only bump
+    expect(result.discoveryConsulted).toBe(false);
+  });
+
+  it('sibling-race simulation — two devices both observing chainFloor=N each bump to N+1 (no crossing of monotonicity)', async () => {
+    // Device A and B both query the chain and both see pickedEpoch=2.
+    // Each independently bumps. The MONOTONICITY contract is that
+    // neither device can publish a chain entry with epoch < 2
+    // (they would never call resetEpoch's bump path past their
+    // discovered floor). This is the property F1 enforces. The
+    // first-to-publish-wins resolution happens AFTER this method
+    // returns, via the aggregator's own WALKBACK_FLOOR protocol.
+    const stA = makeProfileStorage({ discoveredEpoch: 2 });
+    const stB = makeProfileStorage({ discoveredEpoch: 2 });
+    const { sphere: sA } = buildSphereLike(stA);
+    const { sphere: sB } = buildSphereLike(stB);
+
+    const [resA, resB] = await Promise.all([
+      sA.profile!.resetEpoch({ reason: 'device-A' }),
+      sB.profile!.resetEpoch({ reason: 'device-B' }),
+    ]);
+
+    // Both arrived at epoch=3 — neither tried to mint a lower epoch.
+    expect(resA.newEpoch).toBe(3);
+    expect(resB.newEpoch).toBe(3);
+    expect(resA.discoveryConsulted).toBe(true);
+    expect(resB.discoveryConsulted).toBe(true);
+
+    // Per-device persisted floor reflects the bump.
+    expect(await stA.get(LOCAL_EPOCH_FLOOR_KEY)).toBe('3');
+    expect(await stB.get(LOCAL_EPOCH_FLOOR_KEY)).toBe('3');
+
+    // After A's publish lands at epoch=3, B's next publish will
+    // hit WALKBACK_FLOOR (aggregator-side); B then re-discovers
+    // (chainFloor=3) and the NEXT resetEpoch bumps to 4. This
+    // second-round behavior is NOT tested here — F1 covers only
+    // the first round. The convergence-via-WALKBACK_FLOOR path is
+    // covered by the aggregator-pointer test suite.
   });
 });
 
