@@ -3394,6 +3394,30 @@ export class ProfileTokenStorageProvider
   }
 
   /**
+   * Issue #311 — narrow public emit hook for events sourced OUTSIDE
+   * the token-storage provider's own write/read paths. Used by the
+   * factory to route `profile:storage-persistence` and
+   * `profile:critical-block-evicted` events (sourced from the
+   * OrbitDbAdapter / ProfileStorageProvider boundary) into the
+   * provider's `onEvent` surface so consumers have a single
+   * subscription point.
+   *
+   * Restricted to the two `profile:*` event types added by issue #311
+   * to prevent misuse — every other event class has a canonical
+   * emitter site inside this provider. Unknown types are silently
+   * dropped (defense in depth).
+   */
+  emitExternalProfileEvent(event: StorageEvent): void {
+    if (
+      event.type !== 'profile:storage-persistence' &&
+      event.type !== 'profile:critical-block-evicted'
+    ) {
+      return;
+    }
+    this.emitEvent(event);
+  }
+
+  /**
    * Steelman³⁸ warning: build an event payload that preserves typed
    * error codes (AggregatorPointerError.code, ProfileError.code,
    * UxfError.code, SphereError.code) instead of flattening to a string.
