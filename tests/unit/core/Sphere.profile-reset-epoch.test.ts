@@ -27,6 +27,7 @@ import { Sphere } from '../../../core/Sphere';
 import { SphereError } from '../../../core/errors';
 import {
   LOCAL_EPOCH_FLOOR_KEY,
+  LOCAL_EPOCH_RESET_FLUSH_TRIGGER_KEY,
   LOCAL_EPOCH_RESET_REASON_KEY,
 } from '../../../profile/pointer-wiring';
 import { EPOCH_RESET_REASON_MAX_BYTES } from '../../../profile/profile-lean-snapshot';
@@ -662,6 +663,126 @@ describe('Sphere.profile.resetEpoch — F2 publishedVersion contract', () => {
     });
 
     expect(result.publishedVersion).toBe(7);
+  });
+});
+
+// =============================================================================
+// PR #316 F3 fix — sentinel KV write for republish retry-resilience
+// =============================================================================
+//
+// Without the F3 fix, a publish failure on the first post-reset
+// flush could leave the aggregator chain stuck at the pre-reset
+// version with no automatic retry surface — the snapshot builder
+// might skip the publish for "no dirty state" if the OpLog was
+// wiped and no other writers had mutated. The F3 fix writes a
+// sentinel KV (`LOCAL_EPOCH_RESET_FLUSH_TRIGGER_KEY`) BEFORE the
+// dirty-flush so the snapshot builder always has concrete state.
+
+describe('Sphere.profile.resetEpoch — F3 sentinel KV trigger', () => {
+  it('writes the post-reset epoch to LOCAL_EPOCH_RESET_FLUSH_TRIGGER_KEY', async () => {
+    const storage = makeProfileStorage();
+    const { sphere } = buildSphereLike(storage);
+
+    await sphere.profile!.resetEpoch({
+      reason: 'first-trigger',
+      publishTimeoutMs: 0,
+    });
+
+    const sentinel = await storage.get(LOCAL_EPOCH_RESET_FLUSH_TRIGGER_KEY);
+    expect(sentinel).toBe('1');
+  });
+
+  it('overwrites the sentinel on subsequent resets (single slot, no accumulation)', async () => {
+    const storage = makeProfileStorage();
+    const { sphere } = buildSphereLike(storage);
+
+    await sphere.profile!.resetEpoch({
+      reason: 'reset-1',
+      publishTimeoutMs: 0,
+    });
+    expect(await storage.get(LOCAL_EPOCH_RESET_FLUSH_TRIGGER_KEY)).toBe('1');
+
+    await sphere.profile!.resetEpoch({
+      reason: 'reset-2',
+      publishTimeoutMs: 0,
+    });
+    expect(await storage.get(LOCAL_EPOCH_RESET_FLUSH_TRIGGER_KEY)).toBe('2');
+
+    await sphere.profile!.resetEpoch({
+      reason: 'reset-3',
+      publishTimeoutMs: 0,
+    });
+    expect(await storage.get(LOCAL_EPOCH_RESET_FLUSH_TRIGGER_KEY)).toBe('3');
+  });
+
+  it('persists the sentinel even when the publish event never fires (failing publisher simulation)', async () => {
+    // Wire a token storage stub whose `notifyProfileDirty` simulates
+    // a failing publisher — the dirty flush would fire but the
+    // publish never lands (publish-pending event emits, sentinel
+    // stays in place for the periodic-poll retry path to consume).
+    const storage = makeProfileStorage();
+    const { sphere } = buildSphereLike(storage);
+    let dirtyCount = 0;
+    (sphere as unknown as { _tokenStorageProviders: Map<string, unknown> })
+      ._tokenStorageProviders.set('failing', {
+        notifyProfileDirty: () => {
+          dirtyCount += 1;
+          // No publish event fires — simulates the failure scenario.
+        },
+        onEvent: () => () => {
+          /* listener registered but never fires */
+        },
+      });
+
+    const result = await sphere.profile!.resetEpoch({
+      reason: 'publish-fails',
+      publishTimeoutMs: 30, // short timeout so the test doesn't stall
+    });
+
+    // The bump landed locally — sentinel is durably written.
+    expect(result.publishedVersion).toBe(0); // publish never fired
+    expect(await storage.get(LOCAL_EPOCH_FLOOR_KEY)).toBe('1');
+    expect(await storage.get(LOCAL_EPOCH_RESET_FLUSH_TRIGGER_KEY)).toBe('1');
+
+    // notifyProfileDirty was called — the snapshot builder has the
+    // sentinel as concrete state for its next attempt. The next
+    // dirty-flush (whether triggered by the periodic poll or by
+    // another mutation) will see this entry and rebuild the
+    // snapshot.
+    expect(dirtyCount).toBe(1);
+  });
+
+  it('does not abort the bump when sentinel write fails (best-effort)', async () => {
+    // Wrap the storage to make ONLY the sentinel write throw —
+    // other writes still succeed. The bump should still complete.
+    const storage = makeProfileStorage();
+    const realSet = storage.set.bind(storage);
+    storage.set = async (k: string, v: string) => {
+      if (k === LOCAL_EPOCH_RESET_FLUSH_TRIGGER_KEY) {
+        throw new Error('synthetic sentinel write failure');
+      }
+      return realSet(k, v);
+    };
+    const { sphere, events } = buildSphereLike(storage);
+
+    const result = await sphere.profile!.resetEpoch({
+      reason: 'sentinel-write-fails',
+      publishTimeoutMs: 0,
+    });
+
+    // Bump still landed.
+    expect(result.newEpoch).toBe(1);
+    expect(await storage.get(LOCAL_EPOCH_FLOOR_KEY)).toBe('1');
+    // Event still emitted.
+    expect(events).toHaveLength(1);
+  });
+
+  it('exposes the canonical sentinel key for cross-module consumers', () => {
+    // Pin the key namespace so the snapshot builder (or anything
+    // downstream that scans for OpLog keys) consumes the same name.
+    expect(LOCAL_EPOCH_RESET_FLUSH_TRIGGER_KEY).toBe(
+      'profile.pointer.epoch_reset_flush_trigger',
+    );
   });
 });
 

@@ -64,6 +64,7 @@ import type {
 } from '../profile/profile-handle';
 import {
   LOCAL_EPOCH_FLOOR_KEY,
+  LOCAL_EPOCH_RESET_FLUSH_TRIGGER_KEY,
   LOCAL_EPOCH_RESET_REASON_KEY,
 } from '../profile/pointer-wiring';
 import { EPOCH_RESET_REASON_MAX_BYTES } from '../profile/profile-lean-snapshot';
@@ -1931,6 +1932,45 @@ export class Sphere {
         logger.warn(
           'Sphere',
           `resetEpoch: OpLog wipe threw (continuing with epoch bump): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+
+      // 3b. PR #316 F3 fix — write a sentinel KV AFTER the OpLog wipe
+      //     so the snapshot builder has concrete OpLog state to flush
+      //     even when no other writers have mutated since the wipe.
+      //     The value is the post-reset epoch (decimal string); the
+      //     sentinel is overwritten on every subsequent reset and
+      //     never accumulates.
+      //
+      //     Ordering rationale: must run AFTER the OpLog wipe so the
+      //     sentinel lands in the FRESH OpLog (the wipe drops the
+      //     OrbitDB instance, so any pre-wipe write would be lost).
+      //     The local cache copy is also overwritten (via
+      //     ProfileStorageProvider.set's local-cache mirror) so the
+      //     wallet's next `Sphere.load()` reads the sentinel back
+      //     consistently.
+      //
+      //     Without this, a publish failure on the first post-reset
+      //     flush could leave the aggregator chain stuck at the
+      //     pre-reset version with no automatic retry surface — the
+      //     periodic poll's `retryPendingPublishIfAny` only fires
+      //     when `pendingPublishCid` is non-null, which in turn only
+      //     stamps when a publish actually attempted and transient-
+      //     failed. If the snapshot builder skipped the publish for
+      //     "no dirty state", no retry would ever run.
+      //
+      //     Best-effort: a write failure does NOT abort the bump.
+      //     The local floor IS already persisted; the wallet stays
+      //     consistent.
+      try {
+        await this._storage.set(
+          LOCAL_EPOCH_RESET_FLUSH_TRIGGER_KEY,
+          String(newEpoch),
+        );
+      } catch (err) {
+        logger.warn(
+          'Sphere',
+          `resetEpoch: flush-trigger sentinel write failed (epoch bump still persisted): ${err instanceof Error ? err.message : String(err)}`,
         );
       }
 

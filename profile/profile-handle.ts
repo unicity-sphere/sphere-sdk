@@ -146,9 +146,16 @@ export interface SphereProfileHandle {
    *   5. Mint a fresh OpLog. Write the snapshot's KV entries back
    *      via the normal storage-provider write path (which lands
    *      them in the fresh OpLog).
-   *   6. Persist the new epoch floor and trigger a dirty-flush so
-   *      the next snapshot's root block carries `epoch = newEpoch`
-   *      and the new aggregator-pointer version publishes.
+   *   6a. Persist the new epoch floor.
+   *   6b. (PR #316 F3 fix) **Write a sentinel KV** under
+   *       `LOCAL_EPOCH_RESET_FLUSH_TRIGGER_KEY` AFTER the OpLog
+   *       wipe so the snapshot builder has concrete OpLog dirty
+   *       state even when no other writers have mutated yet. The
+   *       sentinel is a single slot — overwritten on every reset,
+   *       never accumulates.
+   *   6c. Trigger a dirty-flush so the next snapshot's root block
+   *       carries `epoch = newEpoch` and the new aggregator-pointer
+   *       version publishes.
    *   7. (PR #316 F2 fix) **Await the publish** via the
    *      `'storage:pointer-published'` event with a bounded timeout
    *      (default 30 000 ms; configurable via `publishTimeoutMs`).

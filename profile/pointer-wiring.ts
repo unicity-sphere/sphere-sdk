@@ -204,6 +204,28 @@ const LOCAL_VERSION_KEY = 'profile.pointer.version';
 export const LOCAL_EPOCH_FLOOR_KEY = 'profile.pointer.epoch_floor';
 export const LOCAL_EPOCH_RESET_REASON_KEY =
   'profile.pointer.epoch_reset_reason';
+/**
+ * PR #316 F3 fix — sentinel KV key written by `resetEpoch` BEFORE
+ * triggering the dirty-flush. The value is the post-reset epoch
+ * encoded as a decimal string (matches `LOCAL_EPOCH_FLOOR_KEY`'s
+ * encoding).
+ *
+ * Purpose: give the OrbitDB-backed flush path concrete dirty state
+ * to write even when the OpLog has just been wiped via
+ * `OrbitDbAdapter.resetCorruptedLog`. Without this sentinel, an
+ * idle wallet whose post-reset OpLog is empty MAY (depending on
+ * the snapshot builder's internal change-detection heuristic)
+ * skip building a fresh snapshot — leaving the aggregator chain
+ * stuck at the pre-reset version and the local floor at +1
+ * indefinitely until the user triggers another mutation.
+ *
+ * **Single slot.** The key is overwritten on every subsequent
+ * reset (the value is always the latest `newEpoch`), so the
+ * sentinel never accumulates across many resets. The post-publish
+ * cleanup is a no-op — the next reset just overwrites it.
+ */
+export const LOCAL_EPOCH_RESET_FLUSH_TRIGGER_KEY =
+  'profile.pointer.epoch_reset_flush_trigger';
 
 /**
  * Parse a CAR byte buffer and return its root CID bytes, or `null`
