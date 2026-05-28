@@ -31,8 +31,14 @@ max_ws_message_bytes = 196608
 max_ws_frame_bytes = 196608
 broadcast_buffer = 16384
 event_persist_buffer = 4096
-event_kind_blacklist = []
-event_kind_allowlist = []
+# CRITICAL: do NOT set these to empty arrays. In nostr-rs-relay,
+# `event_kind_allowlist = []` means "allow ZERO kinds" — every
+# publish is rejected with "blocked: event kind is blocked by
+# relay". Leaving the fields unset (i.e. omitted entirely from
+# the config) makes the relay open to all kinds, which is what
+# we want for a dev relay.
+# event_kind_blacklist = [1234]   # uncomment to deny specific kinds
+# event_kind_allowlist = [1, 4]   # uncomment to ONLY accept these kinds
 
 [authorization]
 # pubkey_whitelist = []       # leave commented for an open relay
