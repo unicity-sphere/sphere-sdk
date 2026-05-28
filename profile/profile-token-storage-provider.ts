@@ -3008,9 +3008,14 @@ export class ProfileTokenStorageProvider
           this.lastDiscoveredPointerCid = result.blob.pointer.cid;
         }
 
-        const tokenCount = Object.keys(result.blob.data).filter((k) =>
-          k.startsWith('_') && !k.startsWith('__'),
-        ).length;
+        // Review fix — use the canonical `isTokenKey()` predicate
+        // instead of the `_`-prefix-without-`__` filter. Pre-fix counted
+        // every operational key (`_meta`, `_tombstones`, `_outbox`,
+        // `_sent`, `_invalid`, `_history`, `_audit`, …) — inflating the
+        // observed `tokenCount` by ~7-10 on a wallet with no real
+        // tokens. The canonical helper excludes the reserved-keys list
+        // and is already imported in this file (see line 75).
+        const tokenCount = Object.keys(result.blob.data).filter(isTokenKey).length;
 
         this.emitEvent({
           type: 'profile:snapshot-loaded',
