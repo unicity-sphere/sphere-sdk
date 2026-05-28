@@ -2139,6 +2139,65 @@ export class LifecycleManager {
       return;
     }
 
+    // Issue #319 — successful `recoverLatest()` round-trip proves the
+    // aggregator pointer chain is reachable end-to-end. If the wallet
+    // had been BLOCKED for a transient-connectivity reason (most
+    // commonly `retry_exhausted` after the 5-attempt publish budget
+    // ran out during a brief aggregator flap) it is safe to clear the
+    // flag now without operator intervention.
+    //
+    // This handles even the `recovered === null` case below (fresh
+    // wallet — no anchor) because reaching that branch ALSO required a
+    // successful aggregator round-trip; the null only signals "nothing
+    // anchored yet", not connectivity loss. The `all-unfetchable`
+    // branch similarly proves the aggregator responded — IPFS gateways
+    // are a separate failure domain.
+    //
+    // Persistent BLOCKED reasons (`aggregator_rejected`, `protocol_error`,
+    // `marker_corrupt`, `rejected`) are left in place; the
+    // `clearBlockedIfTransient` predicate is the single source of
+    // truth for that classification.
+    try {
+      const clearResult = await pointer.clearBlockedIfTransient();
+      if (clearResult.cleared && clearResult.reason) {
+        this.host.log(
+          `Pointer poll: auto-cleared BLOCKED (reason=${clearResult.reason}) ` +
+            `after successful recoverLatest — transient connectivity resolved.`,
+        );
+        this.host.emitEvent({
+          type: 'storage:blocked-auto-cleared',
+          timestamp: Date.now(),
+          data: {
+            reason: clearResult.reason,
+            clearedAt: Date.now(),
+          },
+        });
+        // The pending publish (if any) was refused for the entire
+        // BLOCKED window. Re-run the retry now so the wallet recovers
+        // in the same poll tick instead of waiting up to ~90s for the
+        // next scheduled poll. Failures here remain best-effort: any
+        // throw will surface via the regular publish error paths.
+        try {
+          await this.retryPendingPublishIfAny();
+        } catch (retryErr) {
+          this.host.log(
+            `Pointer poll: post-unblock pending-publish retry threw (best-effort): ${
+              retryErr instanceof Error ? retryErr.message : String(retryErr)
+            }`,
+          );
+        }
+      }
+    } catch (err) {
+      // clearBlockedIfTransient should not throw on the happy path; any
+      // throw is best-effort and must not abort the rest of the poll
+      // (snapshot apply, schedule re-arm).
+      this.host.log(
+        `Pointer poll: clearBlockedIfTransient threw (best-effort): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+
     if (!recovered) {
       // No anchor published yet — operator hasn't flushed. Re-arm
       // silently; this is a normal state for a fresh wallet.

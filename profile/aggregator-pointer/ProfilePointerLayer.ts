@@ -43,8 +43,10 @@ import {
   clearBlocked as clearBlockedFlag,
   hasUnrecognizedBlockedReason,
   isBlocked as readBlockedState,
+  isTransientRecoveryReason,
   setBlocked,
 } from './blocked-state.js';
+import type { BlockedReason } from './blocked-state.js';
 import { AggregatorPointerError, AggregatorPointerErrorCode } from './errors.js';
 import {
   computeProbeFingerprint,
@@ -904,6 +906,86 @@ export class ProfilePointerLayer {
       assertOperatorOverridesAllowed(this.#config, 'clearBlocked');
     }
     await clearBlockedFlag(this.#init.flagStore);
+  }
+
+  // ── clearBlockedIfTransient ──────────────────────────────────────────────
+
+  /**
+   * Issue #319 — auto-clear the BLOCKED flag iff the current reason is a
+   * transient-connectivity class (see {@link isTransientRecoveryReason}).
+   * Intended to be invoked by the pointer-poll worker AFTER a successful
+   * `recoverLatest()` round-trip, on the principle that a working
+   * aggregator response refutes any prior "I can't reach the aggregator"
+   * BLOCKED reason.
+   *
+   * Categorical safety rules:
+   *
+   *   - Does NOT consult `allowOperatorOverrides`. This is not an
+   *     operator-initiated clear — it is a self-healing clear gated on
+   *     the narrow predicate that the reason itself is transient. The
+   *     existing operator-override gate is reserved for `clearBlocked()`
+   *     which must remain capable of clearing ANY reason (including
+   *     persistent ones like `rejected` / `marker_corrupt`).
+   *
+   *   - Treats a CORRUPT blocked-state record as "do not clear". A
+   *     tampered or malformed record must surface to the operator via
+   *     the existing CORRUPT paths.
+   *
+   *   - Treats no-block-set (`{ blocked: false }`) as a no-op success.
+   *
+   *   - Persistent-class reasons (`aggregator_rejected`, `protocol_error`,
+   *     `marker_corrupt`, `rejected`) are LEFT UNTOUCHED and reported back
+   *     via the return value's `reason` field so callers can surface them.
+   *
+   * Race window: between the read (`isBlocked`) and the destructive
+   * `clearBlockedFlag`, a sibling process MAY rewrite the BLOCKED record
+   * with a persistent reason. The transient/persistent classification is
+   * a property of the SPEC reason taxonomy, so the worst-case outcome of
+   * such a race is that we clear a persistent block whose persistent
+   * status was being established. We accept this because (a) the sibling
+   * race is exceptionally narrow and (b) the next failed publish will
+   * immediately re-set BLOCKED with the persistent reason. The mutex on
+   * publish prevents the AUTOMATED case (poll + publish overlap) entirely.
+   *
+   * @returns `{ cleared: true, reason }` when the flag was removed,
+   *   `{ cleared: false }` when nothing was cleared, or
+   *   `{ cleared: false, reason }` when a non-transient block remains in place.
+   */
+  async clearBlockedIfTransient(): Promise<{
+    readonly cleared: boolean;
+    readonly reason?: BlockedReason;
+  }> {
+    this.#assertNotShuttingDown('clearBlockedIfTransient');
+    return this.#tracked(this.#clearBlockedIfTransientInner());
+  }
+  async #clearBlockedIfTransientInner(): Promise<{
+    readonly cleared: boolean;
+    readonly reason?: BlockedReason;
+  }> {
+    let state: BlockedState;
+    try {
+      state = await readBlockedState(this.#init.flagStore);
+    } catch (err) {
+      // CORRUPT / read failure: never auto-clear. The existing CORRUPT
+      // surfacing path (via getBlockedState / publishOnceAtVersion) is the
+      // correct channel for the operator-investigation signal.
+      if (err instanceof AggregatorPointerError && err.code === AggregatorPointerErrorCode.CORRUPT) {
+        return { cleared: false };
+      }
+      throw err;
+    }
+    if (!state.blocked) return { cleared: false };
+    // When `blocked === true`, `readBlockedState` (isBlocked in
+    // blocked-state.ts) has already validated `reason` against
+    // KNOWN_BLOCKED_REASONS, so the cast to BlockedReason is sound.
+    // The structural typing in `BlockedState.reason: string | undefined`
+    // is intentionally loose to accommodate the `blocked: false` branch.
+    const reason = state.reason as BlockedReason | undefined;
+    if (!reason || !isTransientRecoveryReason(reason)) {
+      return { cleared: false, reason };
+    }
+    await clearBlockedFlag(this.#init.flagStore);
+    return { cleared: true, reason };
   }
 
   // ── clearPendingMarker ───────────────────────────────────────────────────

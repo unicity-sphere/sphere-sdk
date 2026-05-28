@@ -11,6 +11,7 @@ import {
   clearBlocked,
   maybeSetBlocked,
   classifyBlockedReason,
+  isTransientRecoveryReason,
   DURABLE_STORAGE,
   FlagStore,
   AggregatorPointerError,
@@ -219,5 +220,28 @@ describe('maybeSetBlocked', () => {
     const reason = await maybeSetBlocked(fs, err);
     expect(reason).toBeNull();
     expect((await isBlocked(fs)).blocked).toBe(false);
+  });
+});
+
+describe('isTransientRecoveryReason (issue #319)', () => {
+  it('classifies transient-connectivity reasons as auto-recoverable', () => {
+    expect(isTransientRecoveryReason('retry_exhausted')).toBe(true);
+    expect(isTransientRecoveryReason('network_timeout')).toBe(true);
+    expect(isTransientRecoveryReason('dns_failure')).toBe(true);
+    expect(isTransientRecoveryReason('tls_failure')).toBe(true);
+  });
+
+  it('refuses to classify divergent-chain / corruption reasons as transient', () => {
+    expect(isTransientRecoveryReason('aggregator_rejected')).toBe(false);
+    expect(isTransientRecoveryReason('protocol_error')).toBe(false);
+    expect(isTransientRecoveryReason('marker_corrupt')).toBe(false);
+    expect(isTransientRecoveryReason('rejected')).toBe(false);
+  });
+
+  it("refuses to classify the synthetic 'corrupt' read-side reason as transient", () => {
+    // 'corrupt' is the synthetic reason returned by getBlockedState when a
+    // stored record is malformed. It MUST NOT auto-clear — tampered or
+    // malformed records require operator investigation.
+    expect(isTransientRecoveryReason('corrupt')).toBe(false);
   });
 });

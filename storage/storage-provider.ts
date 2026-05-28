@@ -617,7 +617,29 @@ export type StorageEventType =
    *
    * `data` carries `{ reason: string, walletId?: string }`.
    */
-  | 'profile:snapshot-corrupt';
+  | 'profile:snapshot-corrupt'
+  /**
+   * Issue #319 — emitted by the pointer-poll worker when it observed a
+   * successful `recoverLatest()` round-trip against the aggregator AND
+   * the wallet was in a BLOCKED state with a transient-connectivity
+   * reason (`retry_exhausted`, `network_timeout`, `dns_failure`,
+   * `tls_failure`). The flag has been cleared automatically; subsequent
+   * publish attempts will proceed without the operator having to call
+   * `recoverLatest()` from a console.
+   *
+   * Persistent BLOCKED reasons (`aggregator_rejected`, `protocol_error`,
+   * `marker_corrupt`, `rejected`) are NEVER auto-cleared and never
+   * trigger this event — those still require an explicit operator
+   * decision per SPEC §10.2.4.
+   *
+   * `data` carries:
+   *   - `reason: BlockedReason`   the transient reason that was cleared
+   *   - `clearedAt: number`       UNIX ms timestamp
+   *
+   * Informational only. UIs may use this to dismiss a previously-shown
+   * "wallet blocked" banner.
+   */
+  | 'storage:blocked-auto-cleared';
 
 export interface StorageEvent {
   type: StorageEventType;
