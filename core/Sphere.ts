@@ -58,6 +58,16 @@ import type {
 } from '../types';
 import { SphereError } from './errors';
 import type {
+  SphereProfileHandle,
+  ResetEpochParams,
+  ResetEpochResult,
+} from '../profile/profile-handle';
+import {
+  LOCAL_EPOCH_FLOOR_KEY,
+  LOCAL_EPOCH_RESET_REASON_KEY,
+} from '../profile/pointer-wiring';
+import { EPOCH_RESET_REASON_MAX_BYTES } from '../profile/profile-lean-snapshot';
+import type {
   ShutdownOptions,
   StorageProvider,
   TokenStorageProvider,
@@ -1675,6 +1685,226 @@ export class Sphere {
   /** Swap module (atomic token swaps). Null if not configured. */
   get swap(): SwapModule | null {
     return this._swap;
+  }
+
+  /**
+   * Issue #310 — Profile-mode public API surface.
+   *
+   * Returns a {@link SphereProfileHandle} when the wallet's
+   * StorageProvider is a Profile-backed adapter (duck-typed via the
+   * presence of `getPointerLayer`). Returns `null` for legacy
+   * (IndexedDB / File) storage — callers MUST null-check.
+   *
+   * The handle's primary method is `resetEpoch({ reason })`, which
+   * bumps the wallet's permanent OpLog epoch floor by +1 and triggers
+   * a republish so all clients refuse to walk back to any prior epoch.
+   * See `profile/profile-handle.ts` for the full contract.
+   */
+  get profile(): SphereProfileHandle | null {
+    const storage = this._storage as unknown as {
+      getPointerLayer?: () => unknown | null;
+    };
+    if (typeof storage.getPointerLayer !== 'function') {
+      return null;
+    }
+    return this.buildProfileHandle();
+  }
+
+  /**
+   * Lazily-constructed (per-call) handle so it picks up identity /
+   * storage rebinds across `Sphere.load()` reattach cycles. The handle
+   * is a thin lambda that closes over `this` — no state lives inside
+   * it.
+   */
+  private buildProfileHandle(): SphereProfileHandle {
+    return {
+      resetEpoch: (params: ResetEpochParams) => this.resetEpochImpl(params),
+      getEpochFloor: () => this.getEpochFloorImpl(),
+    };
+  }
+
+  /**
+   * Issue #310 — read the wallet's persisted epoch floor. Returns 0
+   * if the wallet has never observed a higher epoch on-chain AND has
+   * never called `resetEpoch`.
+   */
+  private async getEpochFloorImpl(): Promise<number> {
+    const raw = await this._storage.get(LOCAL_EPOCH_FLOOR_KEY);
+    if (raw === null) return 0;
+    const parsed = Number.parseInt(raw, 10);
+    if (
+      !Number.isFinite(parsed) ||
+      !Number.isInteger(parsed) ||
+      parsed < 0
+    ) {
+      return 0;
+    }
+    return parsed;
+  }
+
+  /**
+   * Issue #310 — serialization guard for concurrent `resetEpoch` calls
+   * on the same Sphere instance. Two concurrent invocations could
+   * otherwise both observe floor=N, both write floor=N+1, and emit
+   * two events for what is logically one epoch bump (the second
+   * caller's intent is silently merged into the first). Holding a
+   * per-instance promise serializes the read-modify-write cycle.
+   *
+   * This guard does NOT protect against concurrent SENDS / OpLog
+   * writes from PaymentsModule — those run through the OrbitDB
+   * adapter directly and are subject to OrbitDB's own write
+   * serialization. A concurrent send while resetEpoch is wiping the
+   * OpLog surfaces as a write error from PaymentsModule (caught by
+   * the dispatcher's retry path). Callers SHOULD quiesce sends
+   * externally; this is documented on `SphereProfileHandle.resetEpoch`.
+   */
+  private _resetEpochInFlight: Promise<ResetEpochResult> | null = null;
+
+  /**
+   * Issue #310 — bump the wallet's OpLog epoch floor by +1, kick off a
+   * republish, and emit `'profile:epoch-reset'`. See
+   * `SphereProfileHandle.resetEpoch` for the full contract.
+   */
+  private async resetEpochImpl(
+    params: ResetEpochParams,
+  ): Promise<ResetEpochResult> {
+    const storage = this._storage as unknown as {
+      getPointerLayer?: () => unknown | null;
+    };
+    if (typeof storage.getPointerLayer !== 'function') {
+      throw new SphereError(
+        'sphere.profile.resetEpoch requires Profile-mode storage (got non-Profile StorageProvider).',
+        'NOT_PROFILE_MODE',
+      );
+    }
+
+    if (typeof params.reason !== 'string' || params.reason.length === 0) {
+      throw new SphereError(
+        'sphere.profile.resetEpoch: reason must be a non-empty string.',
+        'INVALID_CONFIG',
+      );
+    }
+    const reasonBytes = new TextEncoder().encode(params.reason);
+    if (reasonBytes.byteLength > EPOCH_RESET_REASON_MAX_BYTES) {
+      throw new SphereError(
+        `sphere.profile.resetEpoch: reason ${reasonBytes.byteLength} bytes exceeds cap ${EPOCH_RESET_REASON_MAX_BYTES}.`,
+        'INVALID_CONFIG',
+      );
+    }
+
+    // Serialize: if a reset is already mid-flight, chain this call
+    // BEHIND it (not deduplicate — each call must produce a NEW epoch
+    // per the idempotency-against-re-runs contract). The check + set
+    // MUST be sync (no intermediate await) so two concurrent
+    // invocations see distinct mid-flight states.
+    const prior = this._resetEpochInFlight;
+    const promise = (async (): Promise<ResetEpochResult> => {
+      if (prior !== null) {
+        try {
+          await prior;
+        } catch {
+          // Previous call's error is irrelevant to this one; the
+          // floor-read below picks up whatever was actually persisted.
+        }
+      }
+      return this.resetEpochCore(params);
+    })();
+    this._resetEpochInFlight = promise;
+    try {
+      return await promise;
+    } finally {
+      if (this._resetEpochInFlight === promise) {
+        this._resetEpochInFlight = null;
+      }
+    }
+  }
+
+  /**
+   * Issue #310 — core read-modify-write cycle for a single resetEpoch
+   * call. Wrapped by `resetEpochImpl` with the mutex.
+   */
+  private async resetEpochCore(
+    params: ResetEpochParams,
+  ): Promise<ResetEpochResult> {
+    const ts = Date.now();
+
+    try {
+      // 1. Read current floor → compute new = current + 1.
+      const currentEpoch = await this.getEpochFloorImpl();
+      const newEpoch = currentEpoch + 1;
+
+      // 2. Persist BEFORE the OpLog wipe so a crash between (2) and
+      //    (3) leaves the local wallet with the new floor in place —
+      //    the next Sphere.load() publishes the bumped epoch on its
+      //    first dirty-flush.
+      await this._storage.set(LOCAL_EPOCH_FLOOR_KEY, String(newEpoch));
+      await this._storage.set(LOCAL_EPOCH_RESET_REASON_KEY, params.reason);
+
+      // 3. Best-effort OpLog wipe via OrbitDbAdapter.resetCorruptedLog.
+      try {
+        const storageWithAdapter = this._storage as unknown as {
+          getOrbitDbAdapter?: () => {
+            resetCorruptedLog?: (reason: {
+              lostHeadCid?: string;
+              context: string;
+            }) => Promise<unknown>;
+          } | null;
+        };
+        const adapter = storageWithAdapter.getOrbitDbAdapter?.() ?? null;
+        if (
+          adapter !== null &&
+          typeof adapter.resetCorruptedLog === 'function'
+        ) {
+          await adapter.resetCorruptedLog({
+            context: `sphere.profile.resetEpoch: ${params.reason}`,
+          });
+        }
+      } catch (err) {
+        logger.warn(
+          'Sphere',
+          `resetEpoch: OpLog wipe threw (continuing with epoch bump): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+
+      // 4. Trigger a dirty-flush so the next aggregator pointer
+      //    publish carries the new epoch (best-effort).
+      try {
+        for (const provider of this._tokenStorageProviders.values()) {
+          const dirtyTrigger = (provider as unknown as {
+            notifyProfileDirty?: () => void;
+          }).notifyProfileDirty;
+          if (typeof dirtyTrigger === 'function') {
+            dirtyTrigger.call(provider);
+          }
+        }
+      } catch (err) {
+        logger.warn(
+          'Sphere',
+          `resetEpoch: notifyProfileDirty threw (epoch bump still persisted): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+
+      // 5. Emit the event.
+      this.emitEvent('profile:epoch-reset', {
+        newEpoch,
+        reason: params.reason,
+        ts,
+      });
+
+      return {
+        newEpoch,
+        reason: params.reason,
+        ts,
+        publishedVersion: 0,
+      };
+    } catch (err) {
+      if (err instanceof SphereError) throw err;
+      throw new SphereError(
+        `sphere.profile.resetEpoch failed: ${err instanceof Error ? err.message : String(err)}`,
+        'PROFILE_RESET_FAILED',
+        err,
+      );
+    }
   }
 
   // ===========================================================================
