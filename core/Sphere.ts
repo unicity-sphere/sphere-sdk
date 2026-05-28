@@ -2138,8 +2138,13 @@ export class Sphere {
     }
 
     const cleanups: Array<() => void> = [];
-    let timer: ReturnType<typeof setTimeout> | undefined;
     let settled = false;
+    // Holder for the timer handle. Filled below; `teardown` reads
+    // through the holder so we can declare it before the
+    // `setTimeout` call (avoids use-before-define).
+    const timerHolder: { value: ReturnType<typeof setTimeout> | null } = {
+      value: null,
+    };
 
     let resolve!: (v: number) => void;
     let reject!: (err: Error) => void;
@@ -2149,7 +2154,7 @@ export class Sphere {
     });
 
     const teardown = (): void => {
-      if (timer !== undefined) clearTimeout(timer);
+      if (timerHolder.value !== null) clearTimeout(timerHolder.value);
       for (const fn of cleanups) {
         try {
           fn();
@@ -2165,7 +2170,7 @@ export class Sphere {
       teardown();
     };
 
-    timer = setTimeout(() => {
+    const timer: ReturnType<typeof setTimeout> = setTimeout(() => {
       if (settled) return;
       settled = true;
       teardown();
@@ -2177,8 +2182,8 @@ export class Sphere {
         ),
       );
     }, timeoutMs);
+    timerHolder.value = timer;
     if (
-      timer !== undefined &&
       typeof (timer as unknown as { unref?: unknown }).unref === 'function'
     ) {
       (timer as unknown as { unref: () => void }).unref();
