@@ -37,7 +37,8 @@ services:
       - ./data/genesis-root:/genesis/root
       - ./data/genesis:/genesis
     healthcheck:
-      test: ["CMD", "nc", "-zv", "bft-root", "8000"]
+      # `-v` floods the daemon log on every probe; -z is silent enough.
+      test: ["CMD", "nc", "-z", "bft-root", "8000"]
       interval: 5s
       timeout: 3s
       retries: 12

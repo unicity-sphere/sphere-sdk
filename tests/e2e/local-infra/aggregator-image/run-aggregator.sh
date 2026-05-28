@@ -113,11 +113,17 @@ fi
 mkdir -p ./data/genesis ./data/genesis-root ./data/mongodb_data
 
 # ── Verify haproxy-net exists (proxy container joins it) ────────────────────
-if ! docker network ls --format '{{.Name}}' | grep -q '^haproxy-net$'; then
-    fail "haproxy-net external network missing — is the host HAProxy stack running?"
-    exit 1
+# Skipped in --ssl-test-mode: that path is for offline dev where no HAProxy
+# stack is running. Note the compose file declares haproxy-net `external: true`
+# unconditionally, so even in test-mode you'll need to `docker network create
+# haproxy-net` once on the host.
+if [ -z "$SSL_TEST_MODE" ]; then
+    if ! docker network ls --format '{{.Name}}' | grep -q '^haproxy-net$'; then
+        fail "haproxy-net external network missing — is the host HAProxy stack running?"
+        exit 1
+    fi
+    pass "haproxy-net network present"
 fi
-pass "haproxy-net network present"
 
 # ── Verify the proxy image builds (catch syntax errors early) ───────────────
 log "building the aggregator-proxy image…"
@@ -151,13 +157,17 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     sleep 3
 done
 
-# Final check via external DNS / public TLS.
-echo ""
-log "running external reachability check…"
-if curl -fsS --max-time 10 "https://${AGG_DOMAIN}/health" -o /dev/null; then
-    pass "https://${AGG_DOMAIN}/health responds"
-else
-    warn "https://${AGG_DOMAIN}/health not reachable yet — check 'docker logs agg-proxy'"
+# Final check via external DNS / public TLS — only when a real domain
+# is configured. In --ssl-test-mode AGG_DOMAIN is unset and the URL
+# would degenerate to https:///health.
+if [ -n "$AGG_DOMAIN" ]; then
+    echo ""
+    log "running external reachability check…"
+    if curl -fsS --max-time 10 "https://${AGG_DOMAIN}/health" -o /dev/null; then
+        pass "https://${AGG_DOMAIN}/health responds"
+    else
+        warn "https://${AGG_DOMAIN}/health not reachable yet — check 'docker logs agg-proxy'"
+    fi
 fi
 
 echo ""

@@ -23,11 +23,13 @@ identity discovery.
 ## Build
 
 ```bash
-# 1. Make sure the upstream js-faucet image is available locally:
-docker pull ghcr.io/unicitynetwork/agentic-hosting/faucet:local
-#  OR build it from source:
-#  cd /home/vrogojin && docker build -f js-faucet/Dockerfile \
-#       -t ghcr.io/unicitynetwork/agentic-hosting/faucet:local .
+# 1. Build the upstream js-faucet image — the `:local` tag is built
+#    on the deployment host (not served by GHCR). Build context needs
+#    js-faucet and sphere-sdk as siblings:
+git clone https://github.com/unicitynetwork/js-faucet  ../js-faucet
+git clone https://github.com/unicity-sphere/sphere-sdk ../sphere-sdk-build
+( cd .. && docker build -f js-faucet/Dockerfile \
+    -t ghcr.io/unicitynetwork/agentic-hosting/faucet:local . )
 
 # 2. Build the SSL wrapper:
 docker build \

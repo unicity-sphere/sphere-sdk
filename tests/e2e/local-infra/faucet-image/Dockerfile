@@ -20,9 +20,16 @@
 #     -t unicity-faucet-tls:latest \
 #     tests/e2e/local-infra/faucet-image/
 #
-# Requires the upstream js-faucet image to be present locally:
-#   docker pull ghcr.io/unicitynetwork/agentic-hosting/faucet:local
-# OR build from /home/vrogojin/js-faucet/.
+# Requires the upstream js-faucet image to be present locally
+# (it's tagged `:local` because it's built on the deployment host —
+# the tag is NOT served by GHCR). Build it via:
+#
+#   git clone https://github.com/unicitynetwork/js-faucet ../js-faucet
+#   git clone https://github.com/unicity-sphere/sphere-sdk ../sphere-sdk
+#   cd .. && docker build -f js-faucet/Dockerfile \
+#       -t ghcr.io/unicitynetwork/agentic-hosting/faucet:local .
+#
+# Override with --build-arg FAUCET_IMAGE=... to use a different tag.
 
 # ---------------------------------------------------------------------------
 # Stage 1: extract js-faucet runtime + node_modules from the upstream image
