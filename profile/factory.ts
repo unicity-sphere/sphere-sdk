@@ -586,6 +586,13 @@ export function createProfileProviders(
     // wallets the verification contract.
     flushVerificationDeadlineMs:
       resolvedConfig.flushVerificationDeadlineMs ?? 30_000,
+    // Issue #330 — propagate the inline durability gate on
+    // `publishAggregatorPointerBestEffort`. Default 5_000 ms for the
+    // factory (production wallets); direct-construction default in
+    // the provider is 0 (off) for test compatibility. See
+    // `ProfileTokenStorageProviderOptions.pointerPublishDurabilityGateMs`.
+    pointerPublishDurabilityGateMs:
+      resolvedConfig.pointerPublishDurabilityGateMs ?? 5_000,
     oracle,
     // Lazy accessor: the pointer layer is built inside
     // `storage.doConnect()` after OrbitDB attach, long after the

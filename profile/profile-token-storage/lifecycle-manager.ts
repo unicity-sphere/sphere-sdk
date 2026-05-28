@@ -1379,6 +1379,61 @@ export class LifecycleManager {
         const cidBytes = CID.parse(cidString).bytes;
         const result = await pointer.publish(async () => cidBytes);
         this.host.setLastDiscoveredPointerCid(cidString);
+
+        // Issue #330 — inline durability gate. Before clearing
+        // `pendingPublishCid`, HEAD-verify the just-published snapshot
+        // CID is fetchable from the configured IPFS gateways. This
+        // prevents the marker from being cleared on a pointer that
+        // advertises a CID the operator gateway hasn't yet propagated
+        // (the "publish-before-durable" gap that produces the cross-
+        // device 404s in #330).
+        //
+        // The gate uses the same `verifyPinLeg` machinery as
+        // `verifyFlushDurability` (which after PR #272 runs in
+        // background). The flush still completes synchronously — only
+        // the marker-clear is gated. On HEAD-verify timeout we treat
+        // the publish as transient-failed (marker stays, retry on next
+        // flush / pointer poll) and emit `storage:pending-publish` so
+        // operators see the deferred state.
+        //
+        // Default 0 (no gate) preserves current behaviour for tests
+        // and stub-pointer fixtures. The wallet factories opt-in with
+        // 5_000 ms (`createBrowserProfileProviders`,
+        // `createNodeProfileProviders`).
+        const inlineGateMs =
+          this.host.options?.pointerPublishDurabilityGateMs ?? 0;
+        if (inlineGateMs > 0) {
+          try {
+            await this.verifyFlushDurability(cidString, cidString, inlineGateMs);
+          } catch (verifyErr) {
+            // HEAD-verify failed within the gate deadline. Keep the
+            // marker live so a subsequent flush / pointer poll re-runs
+            // this method (and re-HEADs the same CID against the
+            // gateway). Treat as a transient failure for the caller
+            // (FlushScheduler routes it to `storage:pending-publish`).
+            this.host.setPendingPublishCid(cidString);
+            this.host.emitEvent({
+              type: 'storage:pending-publish',
+              timestamp: Date.now(),
+              data: {
+                cid: cidString,
+                code: 'IPFS_NOT_YET_DURABLE',
+                gateDeadlineMs: inlineGateMs,
+              },
+            });
+            this.host.log(
+              `Pointer publish ok (aggregator) but IPFS HEAD-verify timed out within ${inlineGateMs}ms gate ` +
+                `for cid=${cidString} — keeping pendingPublishCid for retry. ` +
+                `Local state is durable; cross-device recovery is held until gateway propagation completes.`,
+            );
+            return {
+              ok: false as const,
+              transient: true as const,
+              code: 'IPFS_NOT_YET_DURABLE' as const,
+            };
+          }
+        }
+
         // Clear any previously-pending marker — this publish succeeded,
         // so the cross-device recovery path can now reach the bundle.
         this.host.setPendingPublishCid(null);
