@@ -249,6 +249,11 @@ export interface SphereCreateOptions {
 export interface SphereLoadOptions {
   /** Storage provider instance */
   storage: StorageProvider;
+  /**
+   * Optional read-only fallback storage. See
+   * {@link SphereInitOptions.fallbackStorage} for semantics.
+   */
+  fallbackStorage?: StorageProvider;
   /** Optional token storage provider (for IPFS sync) */
   tokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
   /** Transport provider instance */
@@ -387,6 +392,18 @@ export interface L1Config {
 export interface SphereInitOptions {
   /** Storage provider instance */
   storage: StorageProvider;
+  /**
+   * Optional read-only fallback storage consulted when the primary
+   * storage returns null or throws a recoverable error (e.g.
+   * `LoadBlockFailedError` for a missing OrbitDB content block) while
+   * `loadIdentityFromStorage` is reading wallet keys. Intended for
+   * Profile-mode boots where a previously-working legacy
+   * `IndexedDBStorageProvider` still holds the encrypted-with-password
+   * identity material at the same key shape — supplying it lets the
+   * wallet boot from cached local state even if Profile/OrbitDB
+   * has lost the block. Never written to.
+   */
+  fallbackStorage?: StorageProvider;
   /** Transport provider instance */
   transport: TransportProvider;
   /** Oracle provider instance */
@@ -684,6 +701,14 @@ export class Sphere {
 
   // Providers
   private _storage: StorageProvider;
+  /**
+   * Read-only fallback storage consulted by `loadIdentityFromStorage`
+   * when the primary returns null or throws a recoverable error for an
+   * identity-key read. See {@link SphereInitOptions.fallbackStorage}.
+   * Set once at construction by the static factories; never mutated
+   * after wallet load. `null` when no fallback was supplied.
+   */
+  private _fallbackStorage: StorageProvider | null = null;
   private _tokenStorageProviders: Map<string, TokenStorageProvider<TxfStorageDataBase>> = new Map();
   private _transport: TransportProvider;
   private _oracle: OracleProvider;
@@ -891,6 +916,7 @@ export class Sphere {
       // Load existing wallet
       const sphere = await Sphere.load({
         storage: options.storage,
+        fallbackStorage: options.fallbackStorage,
         transport: options.transport,
         oracle: options.oracle,
         tokenStorage: options.tokenStorage,
@@ -1229,10 +1255,31 @@ export class Sphere {
     // before `initializeModules()` threads it into PaymentsModule.
     sphere._publishToIpfs = options.publishToIpfs ?? null;
     sphere._cidFetchGateways = options.cidFetchGateways ?? null;
+    // Issue #309 — read-only fallback storage for identity-key reads.
+    // Consulted by loadIdentityFromStorage() when the primary returns
+    // null or throws a recoverable LoadBlockFailedError. Used in
+    // Profile-mode boots where the legacy IndexedDB still holds the
+    // encrypted-with-password identity material.
+    sphere._fallbackStorage = options.fallbackStorage ?? null;
 
     // exists() restores original (disconnected) state — reconnect for reads
     if (!options.storage.isConnected()) {
       await options.storage.connect();
+    }
+    // Same for fallback if supplied — it must be connected before the
+    // identity-load helper consults it.
+    if (sphere._fallbackStorage && !sphere._fallbackStorage.isConnected()) {
+      try {
+        await sphere._fallbackStorage.connect();
+      } catch (err) {
+        logger.warn(
+          'Sphere',
+          `fallbackStorage.connect failed; proceeding without fallback: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+        sphere._fallbackStorage = null;
+      }
     }
 
     // Load identity from storage
@@ -5137,15 +5184,66 @@ export class Sphere {
   // ===========================================================================
 
   private async loadIdentityFromStorage(): Promise<void> {
+    // Issue #309 — read each identity key with a primary→fallback
+    // retry. The primary path can fail in two ways for a Profile-mode
+    // boot whose local Helia blockstore has lost a referenced block:
+    //   (a) the read throws a chained `LoadBlockFailedError`
+    //       (OrbitDB walks the OpLog head, hits the missing block);
+    //   (b) the read swallows the throw upstream and returns `null`
+    //       (e.g. Profile's getEnvelopePayload catches the envelope
+    //       decode failure but still can't reach the raw bytes).
+    // In either case, if a legacy IndexedDB fallback is available it
+    // still holds the encrypted-with-password identity material at the
+    // same key shape, so the wallet can boot from cached local state.
+    // The helper retries the same key against `this._fallbackStorage`
+    // on any null-or-throw outcome from the primary.
+    const readIdentityKey = async (key: string): Promise<string | null> => {
+      let primaryValue: string | null = null;
+      let primaryThrew: unknown = null;
+      try {
+        primaryValue = await this._storage.get(key);
+      } catch (err) {
+        primaryThrew = err;
+      }
+      if (primaryValue !== null && primaryValue !== undefined) {
+        return primaryValue;
+      }
+      if (!this._fallbackStorage) {
+        if (primaryThrew !== null) throw primaryThrew;
+        return null;
+      }
+      // Fallback path. Log so operators can see we're booting from
+      // legacy state, not the post-migration Profile state. A throw
+      // from the fallback itself is forwarded to the caller — the
+      // caller's existing error-handling treats it the same as a
+      // primary-storage failure.
+      logger.warn(
+        'Sphere',
+        `Identity read for "${key}" missing from primary storage` +
+          (primaryThrew instanceof Error
+            ? ` (threw: ${primaryThrew.message})`
+            : '') +
+          `; consulting fallbackStorage (legacy cached identity).`,
+      );
+      const fallbackValue = await this._fallbackStorage.get(key);
+      if (fallbackValue !== null && fallbackValue !== undefined) {
+        return fallbackValue;
+      }
+      // Neither side has it. Preserve the original throw if there
+      // was one, so the caller surfaces the most informative error.
+      if (primaryThrew !== null) throw primaryThrew;
+      return null;
+    };
+
     // Load keys that are saved with 'default' address (before identity is set)
-    const encryptedMnemonic = await this._storage.get(STORAGE_KEYS_GLOBAL.MNEMONIC);
-    const encryptedMasterKey = await this._storage.get(STORAGE_KEYS_GLOBAL.MASTER_KEY);
-    const chainCode = await this._storage.get(STORAGE_KEYS_GLOBAL.CHAIN_CODE);
-    const derivationPath = await this._storage.get(STORAGE_KEYS_GLOBAL.DERIVATION_PATH);
-    const savedBasePath = await this._storage.get(STORAGE_KEYS_GLOBAL.BASE_PATH);
-    const savedDerivationMode = await this._storage.get(STORAGE_KEYS_GLOBAL.DERIVATION_MODE);
-    const savedSource = await this._storage.get(STORAGE_KEYS_GLOBAL.WALLET_SOURCE);
-    const savedAddressIndex = await this._storage.get(STORAGE_KEYS_GLOBAL.CURRENT_ADDRESS_INDEX);
+    const encryptedMnemonic = await readIdentityKey(STORAGE_KEYS_GLOBAL.MNEMONIC);
+    const encryptedMasterKey = await readIdentityKey(STORAGE_KEYS_GLOBAL.MASTER_KEY);
+    const chainCode = await readIdentityKey(STORAGE_KEYS_GLOBAL.CHAIN_CODE);
+    const derivationPath = await readIdentityKey(STORAGE_KEYS_GLOBAL.DERIVATION_PATH);
+    const savedBasePath = await readIdentityKey(STORAGE_KEYS_GLOBAL.BASE_PATH);
+    const savedDerivationMode = await readIdentityKey(STORAGE_KEYS_GLOBAL.DERIVATION_MODE);
+    const savedSource = await readIdentityKey(STORAGE_KEYS_GLOBAL.WALLET_SOURCE);
+    const savedAddressIndex = await readIdentityKey(STORAGE_KEYS_GLOBAL.CURRENT_ADDRESS_INDEX);
 
     // Steelman⁵² CRITICAL: detect partial-write corruption. F.56's
     // best-effort rollback in storeMnemonic/storeMasterKey may itself
