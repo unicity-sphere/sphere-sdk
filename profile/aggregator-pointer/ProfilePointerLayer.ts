@@ -86,6 +86,42 @@ export interface ProfilePointerLayerInit {
   readonly persistLocalVersion: (v: PointerVersion) => Promise<void>;
   /** Given a version, resolve its CID bytes (via classifyVersion or recoverLatest). */
   readonly resolveRemoteCid: (version: PointerVersion) => Promise<Uint8Array>;
+  /**
+   * Issue #310 — read the wallet's locally-persisted epoch floor.
+   * Defaults to 0 when not wired or when the storage is fresh. Used
+   * to PRIME the walkback floor before Phase 3 inspects on-chain
+   * candidates, so an aggregator that still serves a pre-reset pointer
+   * for the same wallet cannot trick us into walking back to it.
+   *
+   * The persisted floor is bumped on every successful
+   * `sphere.profile.resetEpoch()` call (the new epoch lands here)
+   * AND on every successful `recoverLatest()` whose `pickedEpoch`
+   * exceeds the prior value (we observed a fresher reset from another
+   * device replicating the same wallet).
+   */
+  readonly readEpochFloor?: () => Promise<number>;
+  /**
+   * Issue #310 — persist the latest seen epoch floor. Called by the
+   * pointer layer whenever Phase 3 walkback observes an epoch larger
+   * than the prior persisted value. Best-effort: a persist failure
+   * does NOT block the recovery — the next discovery will re-observe
+   * the on-chain entry and retry the persist.
+   */
+  readonly persistEpochFloor?: (epoch: number) => Promise<void>;
+  /**
+   * Issue #310 — given a version, return the snapshot's `epoch` field
+   * (or undefined for pre-#310 snapshots / no field). Called by Phase 3
+   * walkback to enforce the epoch-floor predicate.
+   *
+   * Implementations re-decode the version's CID (via the same primitive
+   * path as `resolveRemoteCid`), fetch the snapshot root block via the
+   * already-warm gateway path, and dag-cbor-decode the root to read
+   * the `epoch` field. Forwarded through `findLatestValidVersion`'s
+   * `inspectSnapshotEpoch` input.
+   */
+  readonly inspectSnapshotEpoch?: (
+    version: PointerVersion,
+  ) => Promise<number | undefined>;
   /** Configuration (capabilities). */
   readonly config?: PointerLayerConfig;
 }
@@ -681,6 +717,26 @@ export class ProfilePointerLayer {
       throw err;
     }
     const currentLocalVersion = await this.#init.readLocalVersion();
+    // Issue #310 — prime walkback with the wallet's persisted epoch
+    // floor (the highest epoch this wallet has ever observed or
+    // produced via `resetEpoch`). Best-effort read: a missing or
+    // erroring callback leaves the floor at 0 (pre-#310 behavior).
+    let initialEpochFloor = 0;
+    if (this.#init.readEpochFloor) {
+      try {
+        const stored = await this.#init.readEpochFloor();
+        if (
+          typeof stored === 'number' &&
+          Number.isFinite(stored) &&
+          Number.isInteger(stored) &&
+          stored >= 0
+        ) {
+          initialEpochFloor = stored;
+        }
+      } catch {
+        // Best-effort: bad read → floor stays at 0.
+      }
+    }
     const result = await findLatestValidVersion({
       currentLocalVersion,
       keyMaterial: this.#init.keyMaterial,
@@ -691,7 +747,27 @@ export class ProfilePointerLayer {
       fetchCar: this.#init.fetchCar,
       walkbackLimit,
       abortSignal,
+      initialEpochFloor,
+      inspectSnapshotEpoch: this.#init.inspectSnapshotEpoch
+        ? (v: PointerVersion, _cidBytes: Uint8Array) => this.#init.inspectSnapshotEpoch!(v)
+        : undefined,
     });
+    // Issue #310 — persist the latest seen epoch floor (best-effort).
+    // This converges the wallet's local floor with on-chain
+    // observations: even a wallet that never reset itself can pick up
+    // a sibling device's reset by walking the chain and seeing
+    // `pickedEpoch > readEpochFloor`.
+    if (
+      this.#init.persistEpochFloor &&
+      typeof result.pickedEpoch === 'number' &&
+      result.pickedEpoch > initialEpochFloor
+    ) {
+      try {
+        await this.#init.persistEpochFloor(result.pickedEpoch);
+      } catch {
+        // Best-effort: next discovery re-observes and re-persists.
+      }
+    }
     // Issue #264 steelman fix (symmetric with `publish`): only overwrite
     // the probe-fingerprint history when discovery actually produced
     // probes. A discoverLatestVersion that resolves on the first probe

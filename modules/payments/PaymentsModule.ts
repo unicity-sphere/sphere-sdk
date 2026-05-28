@@ -1740,6 +1740,22 @@ export class PaymentsModule {
   /** Cache of parsed SdkToken data for synchronous queue re-evaluation */
   private readonly parsedTokenCache: Map<string, ParsedTokenEntry> = new Map();
 
+  /**
+   * Issue #312 — send-path offline gate. When wired, every `send()` call
+   * reads this getter once at the very top of the public entry point and
+   * throws `SphereError('OFFLINE', { which: 'aggregator' })` (no state
+   * mutation) if the gate reports `'down'`. `'degraded'` / `'unknown'` /
+   * `'up'` all pass through — the SDK's retry layer absorbs degraded
+   * states, and we MUST NOT block sends pre-first-probe (the design
+   * constraint that `Sphere.init()` resolves before the manager has
+   * confirmed reachability).
+   *
+   * Wired by `Sphere.initializeModules()` via
+   * {@link configureConnectivityGate}. Null = unwired (no gating); the
+   * module behaves exactly as it did pre-#312.
+   */
+  private _connectivityGate: (() => 'up' | 'down' | 'degraded' | 'unknown') | null = null;
+
   constructor(config?: PaymentsModuleConfig) {
     this.moduleConfig = {
       autoSync: config?.autoSync ?? true,
@@ -1889,6 +1905,31 @@ export class PaymentsModule {
    */
   getFeatures(): Readonly<Required<UxfTransferFeatures>> {
     return this.features;
+  }
+
+  /**
+   * Issue #312 — wire the offline-mode send-path gate.
+   *
+   * Sphere calls this once during `initializeModules()` with a getter
+   * that reads `sphere.connectivity.status().aggregator`. The getter is
+   * invoked once per `send()` call at the very top of the public entry
+   * point, BEFORE any state mutation, and a `'down'` return triggers a
+   * `SphereError('OFFLINE', { which: 'aggregator' })` throw.
+   *
+   * Pass `null` to unwire (the module behaves exactly as pre-#312:
+   * no gating). Wired callers MAY replace the gate at runtime — the
+   * latest call wins.
+   *
+   * Steelman: the gate is a getter, not a snapshot, so a send that
+   * starts under `'up'` and transitions to `'down'` mid-send is NOT
+   * cancelled. That is by design — the aggregator retry layer absorbs
+   * mid-flight transitions, and we MUST NOT throw `OFFLINE` after
+   * partial state mutation (the no-side-effect contract).
+   */
+  configureConnectivityGate(
+    fn: (() => 'up' | 'down' | 'degraded' | 'unknown') | null,
+  ): void {
+    this._connectivityGate = fn;
   }
 
   /**
@@ -5477,6 +5518,39 @@ export class PaymentsModule {
     internal?: { existingReservationId?: string; existingSplitPlan?: SplitPlan },
   ): Promise<TransferResult> {
     this.ensureInitialized();
+
+    // Issue #312 — offline-mode send-path gate. BEFORE any state mutation
+    // (no aggregator call, no reservation, no Nostr publish), refuse the
+    // send if the aggregator backend is observed `'down'` by the
+    // connectivity manager. `'degraded'` and `'unknown'` pass through;
+    // the SDK's retry layer handles slow / partially-failing aggregators
+    // and we MUST NOT block sends pre-first-probe (the design constraint
+    // that init() resolves before reachability is confirmed). The gate
+    // is read once here, NOT polled mid-send — see the rationale in
+    // `configureConnectivityGate`.
+    if (this._connectivityGate) {
+      let gateValue: 'up' | 'down' | 'degraded' | 'unknown' = 'unknown';
+      try {
+        gateValue = this._connectivityGate();
+      } catch (err) {
+        // A throwing gate must not break sends. Best-effort: treat as
+        // 'unknown' (pass-through). The wallet's send-side retry layer
+        // remains the authoritative recovery path if the aggregator
+        // truly is down.
+        logger.warn(
+          'PaymentsModule',
+          `Connectivity gate threw (treating as 'unknown'): ${err instanceof Error ? err.message : String(err)}`,
+        );
+        gateValue = 'unknown';
+      }
+      if (gateValue === 'down') {
+        throw new SphereError(
+          'Aggregator is offline — send refused',
+          'OFFLINE',
+          { which: 'aggregator' },
+        );
+      }
+    }
 
     // Issue #274 — perf instrumentation. Top-level `payments:send` span;
     // `.end()` / `.endWithError()` are called on EVERY exit path below

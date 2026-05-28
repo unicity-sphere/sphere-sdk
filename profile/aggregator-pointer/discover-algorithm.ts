@@ -127,6 +127,7 @@ import {
   type CarFetcher,
   type CidDecoder,
 } from './aggregator-probe.js';
+import { pickEpochFloor, shouldSkipForEpochFloor } from './epoch-floor.js';
 import {
   DISCOVERY_CORRUPT_WALKBACK,
   DISCOVERY_HARD_CEILING,
@@ -171,6 +172,51 @@ export interface DiscoverInput {
    * to its per-request timeout.
    */
   readonly abortSignal?: AbortSignal;
+  /**
+   * Issue #310 — OpLog epoch-floor inspector. Given a version that just
+   * passed `classifyVersion === 'VALID'` and its decoded CID bytes,
+   * return the snapshot's claimed `epoch` (default 0 for pre-#310
+   * snapshots).
+   *
+   * Default behavior (callback omitted): epoch-floor walkback is
+   * DISABLED. Every classified-VALID candidate is treated as
+   * `epoch = 0` — backwards-compatible with pre-#310 SDKs.
+   *
+   * When supplied, Phase 3 consults this callback for every VALID
+   * candidate, tracks the running max epoch as a floor, and SKIPS
+   * candidates whose snapshot's epoch is strictly below the floor.
+   * Skipped versions are recorded in `walkbackEpochSkipped` for
+   * operator observability.
+   *
+   * Callback contract:
+   *   - MUST be deterministic for a given CID (it inspects the
+   *     content-address-verified CAR root block).
+   *   - MAY return `undefined` to signal "snapshot lacks epoch field"
+   *     (treated as epoch=0, same as backwards-compat).
+   *   - On throw, the candidate is treated as SEMANTICALLY_INVALID
+   *     (consistent with "we couldn't parse the snapshot" being a
+   *     hard fail for that version). The throw is swallowed at the
+   *     walkback boundary — the walkback continues with the next
+   *     candidate.
+   *
+   * Floor-priming. The caller MAY pass `initialEpochFloor` to
+   * prime the floor with a locally-known epoch (the wallet's last
+   * successfully-applied snapshot). Defaults to 0. This guarantees
+   * that even a wallet whose Phase 2 `includedV` is itself BELOW
+   * the local floor (e.g., the publisher was a stale device that
+   * has been overtaken by a reset) refuses to walk to it.
+   */
+  readonly inspectSnapshotEpoch?: (
+    v: PointerVersion,
+    cidBytes: Uint8Array,
+  ) => Promise<number | undefined> | number | undefined;
+  /**
+   * Issue #310 — initial epoch floor before Phase 3 begins. Defaults
+   * to 0. Set to the wallet's last-applied snapshot epoch to harden
+   * against an aggregator that still serves a pre-reset pointer for
+   * the same wallet (a possible cross-device race after a reset).
+   */
+  readonly initialEpochFloor?: number;
   /**
    * Phase 3 walkback policy for `CAR_TRANSIENT` versions (slot EXISTS
    * on-chain — proof verified + CID decoded — but CAR is unreachable).
@@ -234,6 +280,30 @@ export interface DiscoverResult {
    * if such a version exists.
    */
   readonly walkbackUnfetchableSkipped: readonly PointerVersion[];
+  /**
+   * Issue #310 — versions visited during Phase 3 walkback that were
+   * skipped because their snapshot's `epoch < pickedFloor`. Distinct
+   * from `walkbackUnfetchableSkipped` (CAR unreachable) and from
+   * SEMANTICALLY_INVALID (proof bad / CAR contents bad) — the slot's
+   * proof verified, the CAR fetched, but the wallet has explicitly
+   * abandoned the OpLog state that snapshot represents via a
+   * `sphere.profile.resetEpoch()` call (whose post-reset publish
+   * carries `epoch >= pickedFloor`). See `epoch-floor.ts` for the
+   * primitive.
+   *
+   * Empty when `inspectSnapshotEpoch` is not wired, when no candidate's
+   * epoch fell below the floor, or when Phase 3 never ran.
+   */
+  readonly walkbackEpochSkipped: readonly PointerVersion[];
+  /**
+   * Issue #310 — final epoch floor observed by Phase 3 walkback. The
+   * `max(epoch)` across all Phase-3 candidates whose CARs the wallet
+   * successfully inspected, primed with `initialEpochFloor`. 0 when no
+   * candidate carried an epoch field (pre-#310 chain) or when Phase 3
+   * never ran. Surfaced for operator observability + downstream
+   * persistence (the wallet's local "highest seen epoch" cache).
+   */
+  readonly pickedEpoch: number;
 }
 
 // ── findLatestValidVersion ─────────────────────────────────────────────────
@@ -397,6 +467,28 @@ async function findLatestValidVersionInner(
   const walkbackUnfetchableSkipped: PointerVersion[] = [];
   const skipUnfetchable = input.skipUnfetchableInWalkback !== false;
 
+  // Issue #310 — track versions skipped by the epoch-floor predicate.
+  // Disabled when `inspectSnapshotEpoch` is not provided (the floor
+  // stays at the prime value and no candidate is below 0/prime).
+  const walkbackEpochSkipped: PointerVersion[] = [];
+  let epochFloor = (() => {
+    const initial = input.initialEpochFloor ?? 0;
+    if (
+      typeof initial !== 'number' ||
+      !Number.isFinite(initial) ||
+      !Number.isInteger(initial) ||
+      initial < 0
+    ) {
+      throw new AggregatorPointerError(
+        AggregatorPointerErrorCode.PROTOCOL_ERROR,
+        `Discovery: initialEpochFloor must be a non-negative integer; got ${String(initial)}.`,
+        { initialEpochFloor: initial },
+      );
+    }
+    return initial;
+  })();
+  const inspectEpoch = input.inspectSnapshotEpoch;
+
   const probeAndRecord = async (v: PointerVersion): Promise<boolean> => {
     checkDeadline();
     probeVersions.push(v);
@@ -497,11 +589,59 @@ async function findLatestValidVersionInner(
     });
 
     if (status === 'VALID') {
+      // Issue #310 — epoch-floor enforcement. Inspect the snapshot's
+      // claimed epoch (if a callback is wired); skip past versions
+      // whose epoch is strictly below the running floor.
+      //
+      // Skip semantics mirror SEMANTICALLY_INVALID: counts toward the
+      // walkback budget so a chain whose entire tail is below-floor
+      // surfaces as CORRUPT_STREAK rather than silently looping.
+      //
+      // Floor monotone: any candidate's epoch that is >= floor RAISES
+      // the floor for subsequent (older) candidates. This is what
+      // makes a single observed epoch=N entry "lock in" the floor
+      // for the rest of Phase 3 — once we see N, no entry with
+      // epoch<N is acceptable.
+      if (inspectEpoch !== undefined) {
+        let candidateEpoch: number | undefined;
+        try {
+          // The inspector is responsible for its own CID→CAR lookup
+          // (cheap because the just-completed classifyVersion VALID
+          // result implies the gateway holds the CAR). We pass an
+          // empty CID-bytes placeholder for forward-compat with a
+          // future inspector signature that may accept the cidBytes
+          // directly; today's wiring resolves them internally via
+          // the same `resolveRemoteCid` path the pointer layer uses
+          // for fetchAndJoin.
+          candidateEpoch = await inspectEpoch(candidate, new Uint8Array(0));
+        } catch {
+          // Inspector throw → treat as SEMANTICALLY_INVALID-equivalent:
+          // we can't determine the epoch, so we can't safely accept
+          // the candidate. Walk back one more and count toward budget.
+          candidate = (candidate - 1) as PointerVersion;
+          walked += 1;
+          continue;
+        }
+
+        if (shouldSkipForEpochFloor(epochFloor, candidateEpoch)) {
+          walkbackEpochSkipped.push(candidate);
+          candidate = (candidate - 1) as PointerVersion;
+          walked += 1;
+          continue;
+        }
+        // Candidate's epoch is at-or-above the floor — accept it AND
+        // bump the floor for any further iteration (defense-in-depth;
+        // an early return below will not hit this).
+        epochFloor = pickEpochFloor(epochFloor, candidateEpoch);
+      }
+
       return {
         validV: candidate,
         includedV,
         probeVersions,
         walkbackUnfetchableSkipped,
+        walkbackEpochSkipped,
+        pickedEpoch: epochFloor,
       };
     }
 
@@ -581,27 +721,34 @@ async function findLatestValidVersionInner(
       includedV,
       probeVersions,
       walkbackUnfetchableSkipped,
+      walkbackEpochSkipped,
+      pickedEpoch: epochFloor,
     };
   }
 
   // Too many consecutive non-VALID versions — bail out (§10.8). The
-  // diagnostic carries the unfetchable-skipped count so operators can
-  // distinguish "wallet is corrupt" (all skipped were SEMANTICALLY_INVALID)
-  // from "IPFS gateways are down" (mostly walkbackUnfetchableSkipped).
-  // Both classes trigger CORRUPT_STREAK because the wallet's effective
-  // walkback budget is the same — but the remediation differs (operator
-  // intervention vs gateway reconnect).
+  // diagnostic carries the unfetchable-skipped + epoch-skipped counts
+  // so operators can distinguish "wallet is corrupt" (all skipped were
+  // SEMANTICALLY_INVALID) from "IPFS gateways are down" (mostly
+  // walkbackUnfetchableSkipped) from "post-reset chain ahead of floor"
+  // (mostly walkbackEpochSkipped — see issue #310). Both classes trigger
+  // CORRUPT_STREAK because the wallet's effective walkback budget is
+  // the same — but the remediation differs.
   throw new AggregatorPointerError(
     AggregatorPointerErrorCode.CORRUPT_STREAK,
     `Phase 3 walkback exhausted walkbackLimit=${walkbackLimit} without finding a VALID version ` +
       `(includedV=${includedV}, candidate=${candidate}, ` +
-      `unfetchableSkipped=${walkbackUnfetchableSkipped.length}). ` +
+      `unfetchableSkipped=${walkbackUnfetchableSkipped.length}, ` +
+      `epochSkipped=${walkbackEpochSkipped.length}, ` +
+      `pickedEpoch=${epochFloor}). ` +
       `Operator may invoke acceptCorruptStreak(walkbackLimit) to override.`,
     {
       includedV,
       walkbackLimit,
       walkedSoFar: walked,
       unfetchableSkippedCount: walkbackUnfetchableSkipped.length,
+      epochSkippedCount: walkbackEpochSkipped.length,
+      pickedEpoch: epochFloor,
     },
   );
 }

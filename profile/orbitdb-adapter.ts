@@ -28,6 +28,89 @@ export type { OrbitDbConfig, ProfileDatabase };
 export { ProfileError };
 export type { OpLogEntryEnvelope };
 
+/**
+ * Issue #311 — observer contract used by the Profile durability
+ * hardening to surface block-eviction signals on top of the existing
+ * OrbitDB wrapper. Wired by the factory (browser only today; the
+ * Node.js factory leaves this unset, keeping that path unchanged).
+ *
+ * All callbacks MUST be safe to invoke synchronously inside an
+ * OrbitDB event handler — the adapter does not await them.
+ * Implementations should defer expensive work (event emission, log
+ * I/O) to a microtask if needed.
+ */
+export interface ProfileDurabilityObserver {
+  /**
+   * Best-effort `helia.pins.add(cid)` failed for a freshly written
+   * OpLog entry. The underlying write succeeded — only the pin
+   * (eviction-protection) failed.
+   */
+  onPinFailed?(cid: string, errorMessage: string): void;
+  /**
+   * A `db.get` / `db.getEntry` read failed because the referenced
+   * block CID is no longer present in the local Helia blockstore.
+   *
+   *   - `cid` is the block CID we extracted from the error message
+   *     (Helia v6 emits "Failed to load block for &lt;CID&gt;"), or
+   *     `null` if the regex missed.
+   *   - `key` is the OrbitDB key whose read triggered the miss.
+   */
+  onBlockEvicted?(cid: string | null, key: string): void;
+}
+
+/**
+ * Issue #311 — Helia v6 surfaces missing-block failures with one of
+ * these markers in the error message. Used by {@link extractMissingBlockCid}
+ * + {@link isBlockNotLoadableError} to recognize evictions inside
+ * `db.get` / `db.getEntry` error paths.
+ *
+ * Listed in priority order; the FIRST regex that matches wins. The
+ * markers are best-effort — Helia / libp2p error messages have
+ * changed across minor versions, and a future rename would simply
+ * cause the eviction event to fire with `cid: null` rather than
+ * crash the read path.
+ */
+const BLOCK_NOT_LOADABLE_PATTERNS: ReadonlyArray<RegExp> = [
+  // Helia v6 BlockStorage drain shim:
+  //   "Failed to load block for bafy..."
+  /Failed to load block for\s+([A-Za-z0-9]+)/i,
+  // OrbitDB IPFSBlockStorage when underlying BlockStorage rejects:
+  //   "block <bafy...> not found"
+  /block\s+([A-Za-z0-9]+)\s+not\s+found/i,
+  // Direct Helia/blockstore NotFoundError:
+  //   "Could not load block bafy..."
+  /Could not load block\s+([A-Za-z0-9]+)/i,
+];
+
+/**
+ * Issue #311 — extract the missing-block CID string from an arbitrary
+ * error. Returns `null` when no recognized pattern matches.
+ *
+ * Exported for unit tests; production callers go through
+ * {@link recognizeBlockEviction} which combines pattern matching with
+ * the boolean classification helper.
+ */
+export function extractMissingBlockCid(err: unknown): string | null {
+  const message = err instanceof Error ? err.message : String(err);
+  for (const pattern of BLOCK_NOT_LOADABLE_PATTERNS) {
+    const match = pattern.exec(message);
+    if (match !== null && match[1] !== undefined) {
+      return match[1];
+    }
+  }
+  return null;
+}
+
+/**
+ * Issue #311 — true when the error looks like a block-not-loadable
+ * signal from any of the recognized Helia/OrbitDB layers. Used by
+ * `get` / `getEntry` to decide whether to fire the `onBlockEvicted`
+ * observer callback in addition to surfacing the original error.
+ */
+export function isBlockNotLoadableError(err: unknown): boolean {
+  return extractMissingBlockCid(err) !== null;
+}
+
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
@@ -102,6 +185,51 @@ export class OrbitDbAdapter implements ProfileDatabase {
    * `helia.stop()` race and the `onSettle` null-out.
    */
   private shuttingDown = false;
+
+  /**
+   * Issue #311 — optional durability observer. When set, the adapter
+   * notifies on:
+   *   - `onPinFailed(cid, errorMessage)` — best-effort `helia.pins.add`
+   *     threw for an OpLog entry block. The write itself succeeded
+   *     (additive failure); operators are alerted that the eviction-
+   *     protection invariant was weakened for this CID.
+   *   - `onBlockEvicted(cid, key)` — a `db.get` / `db.getEntry` read
+   *     failed because the referenced block CID is no longer present
+   *     in the local Helia blockstore. This is the kind of silent
+   *     eviction the durability hardening prevents; surfacing it
+   *     gives operators a signal even when prevention fails.
+   *
+   * Both notifications are best-effort. Exceptions thrown by the
+   * observer are caught + logged here, never propagated.
+   */
+  private durabilityObserver: ProfileDurabilityObserver | null = null;
+
+  /**
+   * Issue #311 — handle returned by `db.events.on('update', pinHandler)`.
+   * Captured so close() can detach the pin listener cleanly.
+   */
+  private pinUpdateHandler: ((entry: unknown) => void) | null = null;
+
+  /**
+   * Issue #311 — set of OpLog entry CIDs we have attempted to pin in
+   * this session. Two purposes:
+   *   1. Dedup — `db.events.on('update')` may fire repeatedly for the
+   *      same entry (local write + remote replication echo, or
+   *      multiple subscribers in one logical write). A small set keeps
+   *      `helia.pins.add` from being invoked redundantly.
+   *   2. Test assertions — exposed via `getPinnedCidsForTest()` so the
+   *      unit suite can verify every write CID was passed to the pin
+   *      hook without spinning up a real Helia.
+   *
+   * Bounded by `PIN_TRACKING_CAP`. After the cap a fresh CID still
+   * gets pinned (we still call `helia.pins.add`), we just stop
+   * tracking it in the dedup set — the dedup degrades to "no dedup
+   * past N" rather than letting memory grow unbounded. Production
+   * traffic does not approach this cap (one OpLog entry per logical
+   * write; a busy wallet generates ~100s/day).
+   */
+  private pinnedCidsTracker: Set<string> = new Set();
+  private static readonly PIN_TRACKING_CAP = 65_536;
 
   // ---------- ProfileDatabase implementation ----------
 
@@ -578,6 +706,34 @@ export class OrbitDbAdapter implements ProfileDatabase {
 
       this.db = await this.orbitdb.open(dbName, openOptions);
 
+      // Issue #311 — pin every OpLog entry block at write/replication
+      // time so Helia GC never reaps a block reachable from the live
+      // OpLog head. `db.events.on('update', entry)` fires for both
+      // local writes (entry.identity === ours) and remote-replicated
+      // entries (entry.identity === peer's). `entry.hash` is the CID
+      // string of the entry block in the underlying blockstore.
+      //
+      // The handler is fire-and-forget (we don't await the pin call)
+      // so OpLog progress is never gated on a slow / hung pin. Pin
+      // failures are surfaced via `notifyPinFailed` on the observer.
+      this.pinUpdateHandler = (entry: unknown) => {
+        try {
+          const hash = this.extractEntryHash(entry);
+          if (hash === null) return;
+          // Fire-and-forget: a slow pin must NOT back up the OrbitDB
+          // event loop. `pinEntryBlock` catches all errors internally.
+          void this.pinEntryBlock(hash);
+        } catch (err) {
+          // Defensive: the handler itself MUST NOT throw, or OrbitDB's
+          // EventEmitter will unsubscribe us.
+          logger.debug(
+            'profile:orbitdb',
+            `#311: pin-update handler threw — ignoring: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      };
+      this.db?.events?.on?.('update', this.pinUpdateHandler);
+
       this.connected = true;
       // Capture config for resetCorruptedLog (issue #310 / OpLog auto-reset).
       // Retained across close() so a flush-time auto-reset can rebuild a
@@ -625,6 +781,10 @@ export class OrbitDbAdapter implements ProfileDatabase {
       // across all three entry points.
       return coerceToUint8Array(value);
     } catch (err) {
+      // Issue #311 — surface block-eviction signals before wrapping
+      // the error. The observer fires on Helia "Failed to load block"
+      // patterns; for non-eviction errors this is a no-op.
+      this.notifyBlockEvictedIfApplicable(key, err);
       if (err instanceof ProfileError) throw err;
       throw new ProfileError(
         'ORBITDB_READ_FAILED',
@@ -687,6 +847,190 @@ export class OrbitDbAdapter implements ProfileDatabase {
    */
   markLocallyAuthored(key: string): void {
     this.localAuthoredKeys.add(key);
+  }
+
+  /**
+   * Issue #311 — register the Profile durability observer. Wired by
+   * the factory (browser only today; the Node.js factory leaves this
+   * unset).
+   *
+   * Idempotent: callers MAY re-register (the most recent observer
+   * wins). Pass `null` to disable. The pin-on-update listener wired
+   * during `connect()` is independent of the observer and continues
+   * to fire `helia.pins.add` regardless of whether `onPinFailed` is
+   * wired — the observer is a notification surface, not a precondition.
+   */
+  setDurabilityObserver(observer: ProfileDurabilityObserver | null): void {
+    this.durabilityObserver = observer;
+  }
+
+  /**
+   * Issue #311 — exposed for unit tests so the suite can assert "every
+   * OpLog entry block was passed to the pin hook" without spinning up
+   * a real Helia. Returns a copy so tests cannot mutate internal state.
+   */
+  getPinnedCidsForTest(): ReadonlyArray<string> {
+    return Array.from(this.pinnedCidsTracker);
+  }
+
+  /**
+   * Issue #311 — extract the entry-block CID string from an OrbitDB v3
+   * `db.events.on('update', entry)` payload. Returns `null` if the
+   * entry shape isn't recognized (handler swallows null silently).
+   *
+   * OrbitDB v3 entries expose `entry.hash` as the OpLog entry's IPFS
+   * CID (string). Some adapter mocks and older versions used
+   * `entry.payload.cid` / `entry.cid` — we accept any of these for
+   * defensive forward/back compat.
+   */
+  private extractEntryHash(entry: unknown): string | null {
+    if (entry === null || entry === undefined) return null;
+    if (typeof entry !== 'object') return null;
+    const obj = entry as Record<string, unknown>;
+    // Most common: { hash: 'bafy...' } on OrbitDB v3.
+    if (typeof obj.hash === 'string' && obj.hash.length > 0) return obj.hash;
+    // Some shapes nest the CID under .cid (toString-able).
+    const cidField = obj.cid;
+    if (typeof cidField === 'string' && cidField.length > 0) return cidField;
+    if (cidField && typeof cidField === 'object' && typeof (cidField as { toString?: () => string }).toString === 'function') {
+      const s = (cidField as { toString: () => string }).toString();
+      if (s.length > 0 && s !== '[object Object]') return s;
+    }
+    return null;
+  }
+
+  /**
+   * Issue #311 — best-effort `helia.pins.add(cid)` for a single OpLog
+   * entry block CID. Wired into the OrbitDB `db.events.on('update')`
+   * listener during `connect()` so every entry the wallet writes OR
+   * replicates from a peer becomes a permanent pin.
+   *
+   * Three failure modes are tolerated gracefully:
+   *   1. `helia.pins` is undefined — older Helia builds without the
+   *      Pins API. We log a warning ONCE per session and stop trying.
+   *   2. `CID.parse(hash)` throws — corrupted or non-string hash.
+   *      Logged + observer notified; pin skipped for this CID.
+   *   3. `helia.pins.add` throws or rejects — quota exceeded, IDB
+   *      teardown race, etc. Logged + observer notified; pin skipped.
+   *
+   * In all three failure modes the underlying OrbitDB write has
+   * ALREADY succeeded — the pin is an additive durability layer. We
+   * never propagate a pin failure as a write failure.
+   */
+  private async pinEntryBlock(hashString: string): Promise<void> {
+    // Cheap dedup before any work — the OrbitDB 'update' event may fire
+    // multiple times for the same entry (local write + replication
+    // echo) and we want to avoid burning CPU on redundant pins.
+    if (this.pinnedCidsTracker.has(hashString)) return;
+    if (this.pinnedCidsTracker.size < OrbitDbAdapter.PIN_TRACKING_CAP) {
+      this.pinnedCidsTracker.add(hashString);
+    }
+
+    const helia: any = this.helia;
+    if (!helia) return; // already torn down
+
+    if (this.pinsApiUnavailable) return;
+    const pins = helia.pins;
+    if (!pins || typeof pins.add !== 'function') {
+      this.pinsApiUnavailable = true;
+      logger.warn(
+        'profile:orbitdb',
+        '#311: helia.pins API unavailable — OpLog entry blocks will rely on Helia GC defaults. Wallets running an older Helia build accept the block-eviction risk this issue documents.',
+      );
+      return;
+    }
+
+    let cid: unknown;
+    try {
+      const cidModule: any = await import('multiformats/cid' as string);
+      const CidCtor = cidModule.CID ?? cidModule.default?.CID;
+      if (!CidCtor || typeof CidCtor.parse !== 'function') {
+        // Fall back to treating the hash string as already-parsed.
+        cid = hashString;
+      } else {
+        cid = CidCtor.parse(hashString);
+      }
+    } catch (err) {
+      // Hash isn't a parseable CID — surface as a pin failure but do
+      // not throw; the write itself already succeeded.
+      this.notifyPinFailed(hashString, err);
+      return;
+    }
+
+    try {
+      const result = pins.add(cid);
+      // helia.pins.add returns an AsyncIterable (or AsyncGenerator) of
+      // pinned-block CIDs. We have to drain it for the pin to actually
+      // complete; just awaiting the return value is insufficient on
+      // some Helia builds. Tolerate both sync-return and async-iterable
+      // shapes so unit-test stubs can return a plain Promise.
+      if (result && typeof (result as { [Symbol.asyncIterator]?: unknown })[Symbol.asyncIterator] === 'function') {
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        for await (const _pinned of result as AsyncIterable<unknown>) {
+          // drain
+        }
+      } else if (result && typeof (result as Promise<unknown>).then === 'function') {
+        await result;
+      }
+    } catch (err) {
+      this.notifyPinFailed(hashString, err);
+    }
+  }
+
+  /**
+   * Issue #311 — set true once we observe `helia.pins` is undefined,
+   * to avoid logging the warning on every entry write.
+   */
+  private pinsApiUnavailable = false;
+
+  /**
+   * Issue #311 — surface a pin-failure on the observer. Errors thrown
+   * from the observer are caught + logged here so an observer bug
+   * never cascades into the write path.
+   */
+  private notifyPinFailed(cid: string, err: unknown): void {
+    const message = err instanceof Error ? err.message : String(err);
+    logger.warn(
+      'profile:orbitdb',
+      `#311: helia.pins.add(${cid.slice(0, 12)}...) failed — ${message}. The block is still durably written; only the pin (eviction protection) failed.`,
+    );
+    const observer = this.durabilityObserver;
+    if (observer?.onPinFailed) {
+      try {
+        observer.onPinFailed(cid, message);
+      } catch (observerErr) {
+        logger.debug(
+          'profile:orbitdb',
+          `#311: durability observer onPinFailed threw — ignoring: ${observerErr instanceof Error ? observerErr.message : String(observerErr)}`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Issue #311 — recognize block-eviction errors thrown from
+   * `db.get` / `db.getEntry` and fire the observer's `onBlockEvicted`
+   * hook. ALWAYS returns control to the caller (it never throws of
+   * its own accord); the original error is re-thrown by the caller
+   * unchanged.
+   *
+   * Best-effort by design: when the underlying error doesn't match
+   * any of the Helia "block not loadable" patterns this is a no-op
+   * (the caller surfaces a generic `ORBITDB_READ_FAILED`).
+   */
+  private notifyBlockEvictedIfApplicable(key: string, err: unknown): void {
+    if (!isBlockNotLoadableError(err)) return;
+    const cid = extractMissingBlockCid(err);
+    const observer = this.durabilityObserver;
+    if (!observer?.onBlockEvicted) return;
+    try {
+      observer.onBlockEvicted(cid, key);
+    } catch (observerErr) {
+      logger.debug(
+        'profile:orbitdb',
+        `#311: durability observer onBlockEvicted threw — ignoring: ${observerErr instanceof Error ? observerErr.message : String(observerErr)}`,
+      );
+    }
   }
 
   /**
@@ -758,6 +1102,9 @@ export class OrbitDbAdapter implements ProfileDatabase {
       // sibling-tab writes; deferred until a use case justifies it.
       return decodeAndDowngradeReplicated(bytes);
     } catch (err) {
+      // Issue #311 — surface block-eviction signals before wrapping
+      // the error. Best-effort: a non-eviction error path is a no-op.
+      this.notifyBlockEvictedIfApplicable(key, err);
       // Steelman³ remediation: pass ProfileError through unchanged.
       // Re-wrapping double-prefixes the error code (`[PROFILE:ORBITDB_READ_FAILED]
       // ... [PROFILE:ORBITDB_READ_FAILED]`) and obscures the original
@@ -967,6 +1314,21 @@ export class OrbitDbAdapter implements ProfileDatabase {
     // trust keys from the prior session (post-session peer writes may have
     // overwritten them).
     this.localAuthoredKeys.clear();
+
+    // Issue #311 — detach the OpLog pin listener and reset the
+    // session-scoped dedup tracker. The next connect() installs a
+    // fresh listener; the dedup tracker MUST be reset because a new
+    // OrbitDB instance opens a fresh log (different entry CIDs).
+    if (this.pinUpdateHandler && this.db?.events?.off) {
+      try {
+        this.db.events.off('update', this.pinUpdateHandler);
+      } catch {
+        // best-effort cleanup
+      }
+    }
+    this.pinUpdateHandler = null;
+    this.pinnedCidsTracker.clear();
+    this.pinsApiUnavailable = false;
 
     // Bounded teardown (#137). Each step gets a budget — a hung
     // libp2p / pubsub / DAG-sync layer must not pin `Sphere.destroy()`

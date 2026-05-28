@@ -596,6 +596,24 @@ export type SphereEventType =
   | 'sync:provider'
   | 'sync:error'
   | 'connection:changed'
+  /**
+   * Issue #312 — connectivity surface. Emitted on every transition of
+   * any per-backend (`aggregator | ipfs | nostr`) reachability state.
+   * Payload is the full {@link ConnectivityStatusPayload} snapshot.
+   */
+  | 'connectivity:changed'
+  /**
+   * Issue #312 — fires when all three backends transition from a state
+   * where at least one was `'down'` / `'unknown'` to all `'up'`. Pairs
+   * with `'connectivity:offline-degraded'`.
+   */
+  | 'connectivity:online'
+  /**
+   * Issue #312 — fires when at least one backend transitions to `'down'`
+   * while the wallet was previously fully online. `'degraded'` alone
+   * does not trigger this event (the send-path retry layer absorbs it).
+   */
+  | 'connectivity:offline-degraded'
   | 'nametag:registered'
   | 'nametag:recovered'
   | 'identity:changed'
@@ -665,7 +683,15 @@ export type SphereEventType =
   | 'swap:cancelled'
   | 'swap:failed'
   | 'swap:deposit_returned'
-  | 'swap:bounce_received';
+  | 'swap:bounce_received'
+  /**
+   * Issue #310 — fires AFTER the user invokes
+   * `sphere.profile.resetEpoch()` and the local epoch floor has been
+   * persisted (the aggregator publish is kicked off asynchronously and
+   * may complete later; the event does NOT wait for the publish ack).
+   * Payload carries `{ newEpoch, reason, ts }`.
+   */
+  | 'profile:epoch-reset';
 
 export interface SphereEventMap {
   'transfer:incoming': IncomingTransfer;
@@ -1388,6 +1414,9 @@ export interface SphereEventMap {
   'sync:provider': { providerId: string; success: boolean; added?: number; removed?: number; error?: string };
   'sync:error': { source: string; error: string };
   'connection:changed': { provider: string; connected: boolean; status?: ProviderStatus; enabled?: boolean; error?: string };
+  'connectivity:changed': ConnectivityStatusPayload;
+  'connectivity:online': ConnectivityStatusPayload;
+  'connectivity:offline-degraded': ConnectivityStatusPayload;
   'nametag:registered': { nametag: string; addressIndex: number };
   'nametag:recovered': { nametag: string };
   'identity:changed': { l1Address: string; directAddress?: string; chainPubkey: string; nametag?: string; addressIndex: number };
@@ -1477,6 +1506,13 @@ export interface SphereEventMap {
   'swap:failed': { swapId: string; error: string };
   'swap:deposit_returned': { swapId: string; transfer: import('../modules/accounting/types').InvoiceTransferRef; returnReason: string };
   'swap:bounce_received': { swapId: string; reason: string; returnedAmount: string; returnedCurrency: string };
+  /**
+   * Issue #310 — payload for `'profile:epoch-reset'`. `newEpoch` is the
+   * post-reset value (strictly `prev + 1`). `reason` is the
+   * operator-supplied triage string. `ts` is the wall-clock instant
+   * (ms epoch) of the reset.
+   */
+  'profile:epoch-reset': { newEpoch: number; reason: string; ts: number };
 }
 
 export type SphereEventHandler<T extends SphereEventType> = (
@@ -1666,6 +1702,40 @@ export interface NetworkHealthResult {
   };
   /** Total time to complete all checks (ms) */
   totalTimeMs: number;
+}
+
+// =============================================================================
+// Connectivity Types (Issue #312)
+// =============================================================================
+
+/**
+ * Per-backend reachability state. Mirrors {@link ConnectivityBackendStatus}
+ * in `core/connectivity.ts`, re-declared here so it can be referenced from
+ * the central event-map typings without a runtime import cycle.
+ *
+ * `'unknown'` is the pre-probe state right after Sphere.init() — the
+ * manager fires the first probe asynchronously, so any caller that reads
+ * `sphere.connectivity.status()` immediately after `init()` sees `'unknown'`
+ * for every backend.
+ */
+export type ConnectivityBackendStatusType = 'up' | 'down' | 'degraded' | 'unknown';
+
+/**
+ * Snapshot of the connectivity surface, emitted as the payload of
+ * `connectivity:changed` / `connectivity:online` /
+ * `connectivity:offline-degraded`.
+ */
+export interface ConnectivityStatusPayload {
+  /** Aggregator (L3 state-transition oracle) reachability. */
+  readonly aggregator: ConnectivityBackendStatusType;
+  /** IPFS gateway reachability. */
+  readonly ipfs: ConnectivityBackendStatusType;
+  /** Nostr relay reachability. */
+  readonly nostr: ConnectivityBackendStatusType;
+  /** ms-epoch of the most recent fully-online moment, or null if never. */
+  readonly lastOnlineAt: number | null;
+  /** ms-epoch of the most recent backend transition (any direction). */
+  readonly lastChangedAt: number;
 }
 
 // =============================================================================

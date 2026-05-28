@@ -196,6 +196,18 @@ export interface PointerWiringInput {
 const LOCAL_VERSION_KEY = 'profile.pointer.version';
 
 /**
+ * Issue #310 — local cache key for the OpLog epoch floor. Single
+ * source of truth for the key namespace; the snapshot builder in
+ * `factory.ts` reads from the same key when stamping the next root
+ * block's `epoch` field. Exported so factory.ts can re-import the
+ * canonical constant (`profile-handle.ts` → factory imports it via
+ * a side path).
+ */
+export const LOCAL_EPOCH_FLOOR_KEY = 'profile.pointer.epoch_floor';
+export const LOCAL_EPOCH_RESET_REASON_KEY =
+  'profile.pointer.epoch_reset_reason';
+
+/**
  * Parse a CAR byte buffer and return its root CID bytes, or `null`
  * if the CAR is malformed or has no roots. Dynamic import keeps
  * `@ipld/car` out of the hot path of tree-shaken browser bundles
@@ -648,6 +660,105 @@ export async function buildProfilePointerLayer(
       await input.localCache.set(LOCAL_VERSION_KEY, String(v));
     };
 
+    // Issue #310 — local epoch-floor persistence. Mirrors the
+    // localVersion read/write pair: best-effort string-int round
+    // trip, fail-closed to 0 on any parse error.
+    const readEpochFloor = async (): Promise<number> => {
+      const raw = await input.localCache.get(LOCAL_EPOCH_FLOOR_KEY);
+      if (raw === null) return 0;
+      const parsed = Number.parseInt(raw, 10);
+      if (!Number.isFinite(parsed) || parsed < 0 || !Number.isInteger(parsed)) {
+        return 0;
+      }
+      return parsed;
+    };
+    const persistEpochFloor = async (epoch: number): Promise<void> => {
+      if (
+        typeof epoch !== 'number' ||
+        !Number.isFinite(epoch) ||
+        !Number.isInteger(epoch) ||
+        epoch < 0
+      ) {
+        // Refuse to persist garbage; surface as a no-op rather than
+        // corrupting the floor record. The pointer layer treats this
+        // as best-effort so a return is sufficient.
+        return;
+      }
+      await input.localCache.set(LOCAL_EPOCH_FLOOR_KEY, String(epoch));
+    };
+
+    // Issue #310 — snapshot-epoch inspector. Given a pointer version
+    // that just classified as VALID, re-resolve its CID via the same
+    // primitives the recover path uses, fetch the snapshot ROOT block
+    // (cheap — `fetchFromIpfs` content-address-verifies it), and
+    // dag-cbor-decode the root to read its `epoch` field. Returns
+    // `undefined` for pre-#310 snapshots (no field) so the floor
+    // primitive treats them as epoch=0.
+    //
+    // Any error in the inspector (decode failure, gateway outage, CBOR
+    // shape violation) propagates as a throw so the walkback floor
+    // logic can treat the candidate as SEMANTICALLY_INVALID-equivalent
+    // (skip and walk back one more).
+    const inspectSnapshotEpoch = async (
+      version: number,
+    ): Promise<number | undefined> => {
+      const cidBytes = await resolveRemoteCid(version);
+      if (input.ipfsGateways.length === 0) {
+        // No gateways — can't fetch the snapshot. Throw so the
+        // walkback floor treats this candidate as undetermined.
+        throw new Error(
+          `inspectSnapshotEpoch: no IPFS gateways configured for v=${version}`,
+        );
+      }
+      let cidString: string;
+      try {
+        cidString = CID.decode(cidBytes).toString();
+      } catch (err) {
+        throw new Error(
+          `inspectSnapshotEpoch: invalid CID bytes at v=${version}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      const rootBlockBytes = await fetchFromIpfs(
+        [...input.ipfsGateways],
+        cidString,
+      );
+      // dag-cbor-decode only the field we need; do NOT fully parse the
+      // snapshot (saves an entry-group sub-block walk in the hot path).
+      const { decode: cborDecode } = await import('@ipld/dag-cbor');
+      let decoded: unknown;
+      try {
+        decoded = cborDecode(rootBlockBytes);
+      } catch (err) {
+        throw new Error(
+          `inspectSnapshotEpoch: dag-cbor decode failed at v=${version}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      if (
+        decoded === null ||
+        typeof decoded !== 'object' ||
+        Array.isArray(decoded)
+      ) {
+        // Not an object — refuse to interpret. Throw so the walkback
+        // treats it as undetermined / SEMANTICALLY_INVALID-equivalent.
+        throw new Error(
+          `inspectSnapshotEpoch: root block decoded to non-object at v=${version}`,
+        );
+      }
+      const epoch = (decoded as Record<string, unknown>).epoch;
+      if (epoch === undefined) return undefined;
+      if (
+        typeof epoch !== 'number' ||
+        !Number.isFinite(epoch) ||
+        !Number.isInteger(epoch) ||
+        epoch < 0
+      ) {
+        throw new Error(
+          `inspectSnapshotEpoch: invalid epoch ${String(epoch)} at v=${version}`,
+        );
+      }
+      return epoch;
+    };
+
     const resolveRemoteCid = buildResolveRemoteCid({
       keyMaterial,
       signer,
@@ -679,6 +790,10 @@ export async function buildProfilePointerLayer(
       readLocalVersion,
       persistLocalVersion,
       resolveRemoteCid,
+      // Issue #310 — wire OpLog epoch-floor primitives.
+      readEpochFloor,
+      persistEpochFloor,
+      inspectSnapshotEpoch,
       config: input.config,
     });
 

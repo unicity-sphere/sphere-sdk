@@ -58,6 +58,23 @@ import type {
 } from '../types';
 import { SphereError } from './errors';
 import type {
+  SphereProfileHandle,
+  ResetEpochParams,
+  ResetEpochResult,
+} from '../profile/profile-handle';
+import {
+  LOCAL_EPOCH_FLOOR_KEY,
+  LOCAL_EPOCH_RESET_REASON_KEY,
+} from '../profile/pointer-wiring';
+import { EPOCH_RESET_REASON_MAX_BYTES } from '../profile/profile-lean-snapshot';
+import {
+  ConnectivityManager,
+  AggregatorPinger,
+  IpfsPinger,
+  NostrPinger,
+  type ConnectivityManagerHandle,
+} from './connectivity';
+import type {
   ShutdownOptions,
   StorageProvider,
   TokenStorageProvider,
@@ -721,6 +738,25 @@ export class Sphere {
   private _market: MarketModule | null = null;
   private _accounting: AccountingModule | null = null;
   private _swap: SwapModule | null = null;
+
+  /**
+   * Issue #312 — unified connectivity surface. Construction is deferred to
+   * `initializeModules()` so the manager binds to the same OracleProvider /
+   * TransportProvider / IPFS gateways already wired into payments. The
+   * manager's initial state is `'unknown'` for all backends; the first
+   * probe fires async, so `sphere.connectivity.status()` is usable
+   * immediately after `Sphere.init()` returns but reports `'unknown'`
+   * until the first probes land.
+   *
+   * Null in two cases:
+   *   - The Sphere is mid-construction (before `initializeModules()` ran).
+   *   - The wallet was created with no connectivity-eligible backends
+   *     (currently impossible in practice — every wallet has at least an
+   *     oracle and a transport).
+   *
+   * Accessed via {@link Sphere.connectivity}.
+   */
+  private _connectivity: ConnectivityManager | null = null;
 
   // Per-address module instances (Phase 2: independent parallel operation)
   private _addressModules: Map<number, AddressModuleSet> = new Map();
@@ -1601,6 +1637,262 @@ export class Sphere {
   get swap(): SwapModule | null {
     return this._swap;
   }
+
+  /**
+   * Issue #312 — unified connectivity surface for the
+   * `aggregator | ipfs | nostr` backends. The handle exposes:
+   *
+   *   - `status()`   — sync snapshot of per-backend reachability.
+   *   - `subscribe(fn)` — per-transition callback (returns unsubscribe).
+   *   - `ping(which)` — force-probe one or all backends.
+   *
+   * The wallet fires `'connectivity:changed'`, `'connectivity:online'`, and
+   * `'connectivity:offline-degraded'` on the Sphere event bus on every
+   * transition — bind via `sphere.on(...)` for the UI banner.
+   *
+   * Send-path gating: `payments.send()` refuses with
+   * `SphereError('OFFLINE', { which: 'aggregator' })` (no state mutation)
+   * when `status().aggregator === 'down'`. The `'degraded'` state is
+   * allowed — the SDK's retry layer handles slow / partially-failing
+   * aggregators.
+   *
+   * Returns a no-op stub if accessed before `initializeModules()` ran —
+   * production callers go through `Sphere.init()`, which calls
+   * `initializeModules()` before resolving, so this stub is only visible
+   * in degenerate test setups.
+   */
+  get connectivity(): ConnectivityManagerHandle {
+    if (this._connectivity) return this._connectivity;
+    // No-op stub when accessed before init. Returns a synthetic
+    // all-`'unknown'` snapshot, accepts subscribers (silently discards),
+    // and resolves `.ping()` immediately. This keeps `sphere.connectivity`
+    // a single accessor across construction phases — UIs binding to it at
+    // construction time won't crash.
+    return Sphere.UNINITIALIZED_CONNECTIVITY;
+  }
+
+  /**
+   * Issue #310 — Profile-mode public API surface.
+   *
+   * Returns a {@link SphereProfileHandle} when the wallet's
+   * StorageProvider is a Profile-backed adapter (duck-typed via the
+   * presence of `getPointerLayer`). Returns `null` for legacy
+   * (IndexedDB / File) storage — callers MUST null-check and surface
+   * a clear "this operation requires Profile mode" message in the UI.
+   *
+   * The handle's primary method is `resetEpoch({ reason })`, which
+   * bumps the wallet's permanent OpLog epoch floor by +1 and triggers
+   * a republish so all clients refuse to walk back to any prior epoch.
+   * See `profile/profile-handle.ts` for the full contract.
+   */
+  get profile(): SphereProfileHandle | null {
+    const storage = this._storage as unknown as {
+      getPointerLayer?: () => unknown | null;
+    };
+    if (typeof storage.getPointerLayer !== 'function') {
+      // Not a ProfileStorageProvider — surface null so the UI can
+      // route around the API.
+      return null;
+    }
+    return this.buildProfileHandle();
+  }
+
+  /**
+   * Lazily-constructed (per-call) handle so it picks up identity /
+   * storage rebinds across `Sphere.load()` reattach cycles. The handle
+   * is a thin lambda that closes over `this` — no state lives inside
+   * it.
+   */
+  private buildProfileHandle(): SphereProfileHandle {
+    return {
+      resetEpoch: (params: ResetEpochParams) => this.resetEpochImpl(params),
+      getEpochFloor: () => this.getEpochFloorImpl(),
+    };
+  }
+
+  /**
+   * Issue #310 — read the wallet's persisted epoch floor. Returns 0
+   * if the wallet has never observed a higher epoch on-chain AND has
+   * never called `resetEpoch`.
+   */
+  private async getEpochFloorImpl(): Promise<number> {
+    const raw = await this._storage.get(LOCAL_EPOCH_FLOOR_KEY);
+    if (raw === null) return 0;
+    const parsed = Number.parseInt(raw, 10);
+    if (
+      !Number.isFinite(parsed) ||
+      !Number.isInteger(parsed) ||
+      parsed < 0
+    ) {
+      return 0;
+    }
+    return parsed;
+  }
+
+  /**
+   * Issue #310 — bump the wallet's OpLog epoch floor by +1, kick off a
+   * republish, and emit `'profile:epoch-reset'`. See
+   * `SphereProfileHandle.resetEpoch` for the full contract.
+   *
+   * Profile-mode gate: this method is reachable only via
+   * `sphere.profile.resetEpoch()`, which returns `null` for non-Profile
+   * wallets. The defensive `NOT_PROFILE_MODE` throw guards against
+   * operator misuse via reflection / direct invocation.
+   */
+  private async resetEpochImpl(
+    params: ResetEpochParams,
+  ): Promise<ResetEpochResult> {
+    // Defensive: re-verify Profile mode in case the storage was rebound
+    // between handle construction and call site.
+    const storage = this._storage as unknown as {
+      getPointerLayer?: () => unknown | null;
+    };
+    if (typeof storage.getPointerLayer !== 'function') {
+      throw new SphereError(
+        'sphere.profile.resetEpoch requires Profile-mode storage (got non-Profile StorageProvider).',
+        'NOT_PROFILE_MODE',
+      );
+    }
+
+    // Validate the reason. The lean-snapshot encoder also enforces the
+    // byte cap, but failing here gives the caller a typed error before
+    // any state mutation.
+    if (typeof params.reason !== 'string' || params.reason.length === 0) {
+      throw new SphereError(
+        'sphere.profile.resetEpoch: reason must be a non-empty string.',
+        'INVALID_CONFIG',
+      );
+    }
+    const reasonBytes = new TextEncoder().encode(params.reason);
+    if (reasonBytes.byteLength > EPOCH_RESET_REASON_MAX_BYTES) {
+      throw new SphereError(
+        `sphere.profile.resetEpoch: reason ${reasonBytes.byteLength} bytes exceeds cap ${EPOCH_RESET_REASON_MAX_BYTES}.`,
+        'INVALID_CONFIG',
+      );
+    }
+
+    const ts = Date.now();
+
+    try {
+      // 1. Read the current epoch floor. A first-time reset starts
+      //    at 0 → 1. A subsequent reset bumps by exactly +1 (NOT
+      //    idempotent — each invocation is a distinct user-affirmed
+      //    reset per the issue spec).
+      const currentEpoch = await this.getEpochFloorImpl();
+      const newEpoch = currentEpoch + 1;
+
+      // 2. Persist the new floor BEFORE the OpLog wipe so a crash
+      //    between (2) and (3) leaves the local wallet with the new
+      //    floor in place — the next `Sphere.load()` will publish
+      //    the bumped epoch on its first dirty-flush without needing
+      //    the user to re-invoke `resetEpoch`.
+      await this._storage.set(LOCAL_EPOCH_FLOOR_KEY, String(newEpoch));
+      await this._storage.set(LOCAL_EPOCH_RESET_REASON_KEY, params.reason);
+
+      // 3. Best-effort OpLog wipe via OrbitDbAdapter.resetCorruptedLog.
+      //    A storage that lacks the method (test stub / pre-#305 fork)
+      //    proceeds without the wipe — the epoch bump alone is still
+      //    semantically correct: every future snapshot carries the
+      //    new epoch, so the chain converges on the new floor.
+      //
+      //    The wipe is asynchronous and may block on Helia teardown +
+      //    OrbitDB drop — wrap in a try/catch so a wipe failure does
+      //    not strand the wallet in a half-reset state (the local
+      //    epoch is already persisted; the publish path will pick up
+      //    the new value on next dirty-flush).
+      try {
+        const storageWithAdapter = this._storage as unknown as {
+          getOrbitDbAdapter?: () => {
+            resetCorruptedLog?: (reason: {
+              lostHeadCid?: string;
+              context: string;
+            }) => Promise<unknown>;
+          } | null;
+        };
+        const adapter = storageWithAdapter.getOrbitDbAdapter?.() ?? null;
+        if (
+          adapter !== null &&
+          typeof adapter.resetCorruptedLog === 'function'
+        ) {
+          await adapter.resetCorruptedLog({
+            context: `sphere.profile.resetEpoch: ${params.reason}`,
+          });
+        }
+      } catch (err) {
+        // Log + continue — the local epoch floor IS persisted; the
+        // republish path will run on next dirty-flush and the
+        // post-reset snapshot will carry the bumped epoch even
+        // though the OpLog wipe failed. UI / operator can re-invoke
+        // resetEpoch to retry the wipe if needed.
+        logger.warn(
+          'Sphere',
+          `resetEpoch: OpLog wipe threw (continuing with epoch bump): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+
+      // 4. Trigger a dirty-flush so the next aggregator pointer
+      //    publish carries the new epoch. Best-effort — the flush
+      //    is debounced and runs asynchronously; the caller does
+      //    not wait for it. The persisted floor is already in
+      //    place, so even if the flush is skipped, the next normal
+      //    flush will pick up the new value.
+      let publishedVersion = 0;
+      try {
+        for (const provider of this._tokenStorageProviders.values()) {
+          const dirtyTrigger = (provider as unknown as {
+            notifyProfileDirty?: () => void;
+          }).notifyProfileDirty;
+          if (typeof dirtyTrigger === 'function') {
+            dirtyTrigger.call(provider);
+          }
+        }
+      } catch (err) {
+        logger.warn(
+          'Sphere',
+          `resetEpoch: notifyProfileDirty threw (epoch bump still persisted): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+
+      // 5. Emit the event AFTER the persist + wipe + flush trigger
+      //    succeed. The event is informational — subscribers should
+      //    not assume the publish has landed.
+      this.emitEvent('profile:epoch-reset', {
+        newEpoch,
+        reason: params.reason,
+        ts,
+      });
+
+      return {
+        newEpoch,
+        reason: params.reason,
+        ts,
+        publishedVersion,
+      };
+    } catch (err) {
+      if (err instanceof SphereError) throw err;
+      throw new SphereError(
+        `sphere.profile.resetEpoch failed: ${err instanceof Error ? err.message : String(err)}`,
+        'PROFILE_RESET_FAILED',
+        err,
+      );
+    }
+  }
+
+  /**
+   * Singleton "uninitialized" connectivity handle. See {@link connectivity}
+   * for rationale.
+   */
+  private static readonly UNINITIALIZED_CONNECTIVITY: ConnectivityManagerHandle = {
+    status: () => ({
+      aggregator: 'unknown',
+      ipfs: 'unknown',
+      nostr: 'unknown',
+      lastOnlineAt: null,
+      lastChangedAt: 0,
+    }),
+    subscribe: () => () => undefined,
+    ping: async () => undefined,
+  };
 
   // ===========================================================================
   // Public Properties - State
@@ -4784,6 +5076,20 @@ export class Sphere {
 
     this.cleanupProviderEventSubscriptions();
 
+    // Issue #312 — stop the connectivity manager FIRST so its scheduled
+    // probes (which dereference `this._oracle` and `this._transport`)
+    // cannot race with provider teardown below. `stop()` aborts in-flight
+    // probes, clears subscribers, and resolves once every probe has
+    // settled — safe to await; bounded by `pingTimeoutMs`.
+    if (this._connectivity) {
+      try {
+        await this._connectivity.stop();
+      } catch (err) {
+        logger.warn('Sphere', 'ConnectivityManager stop failed:', err);
+      }
+      this._connectivity = null;
+    }
+
     // Destroy swap FIRST — it depends on accounting (which depends on payments)
     try {
       await this._swap?.destroy();
@@ -6281,6 +6587,98 @@ export class Sphere {
       transportAdapter: adapter,
       tokenStorageProviders: new Map(this._tokenStorageProviders),
       initialized: true,
+    });
+
+    // Issue #312 — connectivity manager. Build AFTER providers are wired
+    // (we read the transport's `isConnected()` and the oracle's
+    // `getCurrentRound()`), but BEFORE returning so the public
+    // `sphere.connectivity` accessor is live for any caller binding to
+    // events immediately. The manager's `start()` returns sync; the first
+    // probe fires on a microtask, so this does NOT block the init path.
+    try {
+      this._connectivity = this.buildConnectivityManager();
+      this._connectivity.start();
+    } catch (err) {
+      // Non-fatal: a broken connectivity manager MUST NOT brick init().
+      // The wallet remains fully functional; `sphere.connectivity` falls
+      // through to the uninitialized stub (all-`'unknown'`).
+      logger.warn(
+        'Sphere',
+        `Failed to build ConnectivityManager (sphere.connectivity will be inert): ${safeErrorMessage(err)}`,
+      );
+      this._connectivity = null;
+    }
+
+    // Wire the send-path gate. The PaymentsModule receives a snapshot
+    // getter — it does NOT hold a reference to the manager, so a future
+    // manager rebuild (post-address-switch) does not need to thread the
+    // dependency back through.
+    try {
+      const paymentsForGate = this._payments as unknown as {
+        configureConnectivityGate?: (
+          fn: () => 'up' | 'down' | 'degraded' | 'unknown',
+        ) => void;
+      };
+      if (typeof paymentsForGate.configureConnectivityGate === 'function') {
+        paymentsForGate.configureConnectivityGate(() =>
+          this._connectivity ? this._connectivity.status().aggregator : 'unknown',
+        );
+      }
+    } catch (err) {
+      logger.warn(
+        'Sphere',
+        `Failed to wire connectivity gate into PaymentsModule (sends will not gate on OFFLINE): ${safeErrorMessage(err)}`,
+      );
+    }
+  }
+
+  /**
+   * Issue #312 — build the per-wallet ConnectivityManager.
+   *
+   * Pingers wired:
+   *   - `aggregator`: probes `oracle.getCurrentRound()` (cheap JSON-RPC).
+   *   - `ipfs`: HEAD-probes the configured gateways (skipped when no
+   *      gateways are wired — wallet stays "fully online" w.r.t. IPFS).
+   *   - `nostr`: reads `transport.isConnected()` (the transport owns its
+   *      reconnect loop; we don't open a parallel subscription).
+   *
+   * Returns a freshly-built manager; the caller is responsible for
+   * `.start()` and `.stop()`.
+   */
+  private buildConnectivityManager(): ConnectivityManager {
+    const emitEvent = this.emitEvent.bind(this);
+
+    const aggregatorPinger = new AggregatorPinger({
+      provider: {
+        getCurrentRound: () => this._oracle.getCurrentRound(),
+      },
+    });
+
+    // IPFS gateways are wired only when the host app's provider factory
+    // populated `_cidFetchGateways` (the wallet has IPFS sync configured).
+    // Without gateways we skip the IPFS pinger entirely so the
+    // "no-IPFS" wallet is not stuck in permanent offline-degraded.
+    const ipfsGateways = this._cidFetchGateways ?? [];
+    const pingers: import('./connectivity').Pinger[] = [aggregatorPinger];
+    if (ipfsGateways.length > 0) {
+      pingers.push(new IpfsPinger(ipfsGateways));
+    }
+    pingers.push(
+      new NostrPinger(() => {
+        try {
+          return this._transport.isConnected();
+        } catch {
+          return false;
+        }
+      }),
+    );
+
+    return new ConnectivityManager(pingers, {
+      emitEvent: (type, payload) => {
+        // Forward to the Sphere event bus — types narrow correctly via
+        // SphereEventMap.
+        emitEvent(type as SphereEventType, payload as SphereEventMap[SphereEventType]);
+      },
     });
   }
 

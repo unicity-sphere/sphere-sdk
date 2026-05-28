@@ -921,6 +921,38 @@ export class ProfileStorageProvider implements StorageProvider {
   }
 
   /**
+   * Issue #310 — expose the underlying OrbitDB adapter (read-only,
+   * not mutable) so the `sphere.profile.resetEpoch` API can invoke
+   * `resetCorruptedLog` without leaking the inner state machine.
+   *
+   * Returns `null` when the adapter exposes no `resetCorruptedLog`
+   * method (test stub / pre-#305 fork). Callers MUST treat null as
+   * "wipe unavailable" and proceed with the epoch bump alone.
+   *
+   * Typed as a structural shape rather than the concrete
+   * `OrbitDbAdapter` class so the public surface does not leak
+   * adapter internals. The shape mirrors only the method
+   * `sphere.profile.resetEpoch` needs.
+   */
+  getOrbitDbAdapter(): {
+    readonly resetCorruptedLog?: (reason: {
+      lostHeadCid?: string;
+      context: string;
+    }) => Promise<unknown>;
+  } | null {
+    const db = this.db as unknown as {
+      resetCorruptedLog?: (reason: {
+        lostHeadCid?: string;
+        context: string;
+      }) => Promise<unknown>;
+    };
+    if (typeof db.resetCorruptedLog === 'function') {
+      return db;
+    }
+    return null;
+  }
+
+  /**
    * Steelman accessor: the pointer-build state machine viewed from the
    * outside.
    *   - 'ready'       — `pointerLayer !== null`.
