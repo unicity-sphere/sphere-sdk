@@ -57,6 +57,13 @@ import type {
   TrackedAddressEntry,
 } from '../types';
 import { SphereError } from './errors';
+import {
+  ConnectivityManager,
+  AggregatorPinger,
+  IpfsPinger,
+  NostrPinger,
+  type ConnectivityManagerHandle,
+} from './connectivity';
 import type {
   SphereProfileHandle,
   ResetEpochParams,
@@ -794,6 +801,25 @@ export class Sphere {
   private _market: MarketModule | null = null;
   private _accounting: AccountingModule | null = null;
   private _swap: SwapModule | null = null;
+
+  /**
+   * Issue #312 — unified connectivity surface. Construction is deferred to
+   * `initializeModules()` so the manager binds to the same OracleProvider /
+   * TransportProvider / IPFS gateways already wired into payments. The
+   * manager's initial state is `'unknown'` for all backends; the first
+   * probe fires async, so `sphere.connectivity.status()` is usable
+   * immediately after `Sphere.init()` returns but reports `'unknown'`
+   * until the first probes land.
+   *
+   * Null in two cases:
+   *   - The Sphere is mid-construction (before `initializeModules()` ran).
+   *   - The wallet was created with no connectivity-eligible backends
+   *     (currently impossible in practice — every wallet has at least an
+   *     oracle and a transport).
+   *
+   * Accessed via {@link Sphere.connectivity}.
+   */
+  private _connectivity: ConnectivityManager | null = null;
 
   // Per-address module instances (Phase 2: independent parallel operation)
   private _addressModules: Map<number, AddressModuleSet> = new Map();
@@ -2279,6 +2305,50 @@ export class Sphere {
       }
     }
   }
+
+  /**
+   * Issue #312 — unified connectivity surface for the
+   * `aggregator | ipfs | nostr` backends. The handle exposes:
+   *
+   *   - `status()`   — sync snapshot of per-backend reachability.
+   *   - `subscribe(fn)` — per-transition callback (returns unsubscribe).
+   *   - `ping(which)` — force-probe one or all backends.
+   *
+   * The wallet fires `'connectivity:changed'`, `'connectivity:online'`, and
+   * `'connectivity:offline-degraded'` on the Sphere event bus on every
+   * transition — bind via `sphere.on(...)` for the UI banner.
+   *
+   * Send-path gating: `payments.send()` refuses with
+   * `SphereError('OFFLINE', { which: 'aggregator' })` (no state mutation)
+   * when `status().aggregator === 'down'`. The `'degraded'` state is
+   * allowed — the SDK's retry layer handles slow / partially-failing
+   * aggregators.
+   *
+   * Returns a no-op stub if accessed before `initializeModules()` ran —
+   * production callers go through `Sphere.init()`, which calls
+   * `initializeModules()` before resolving, so this stub is only visible
+   * in degenerate test setups.
+   */
+  get connectivity(): ConnectivityManagerHandle {
+    if (this._connectivity) return this._connectivity;
+    return Sphere.UNINITIALIZED_CONNECTIVITY;
+  }
+
+  /**
+   * Singleton "uninitialized" connectivity handle. See {@link connectivity}
+   * for rationale.
+   */
+  private static readonly UNINITIALIZED_CONNECTIVITY: ConnectivityManagerHandle = {
+    status: () => ({
+      aggregator: 'unknown',
+      ipfs: 'unknown',
+      nostr: 'unknown',
+      lastOnlineAt: null,
+      lastChangedAt: 0,
+    }),
+    subscribe: () => () => undefined,
+    ping: async () => undefined,
+  };
 
   // ===========================================================================
   // Public Properties - State
@@ -5462,6 +5532,20 @@ export class Sphere {
 
     this.cleanupProviderEventSubscriptions();
 
+    // Issue #312 — stop the connectivity manager FIRST so its scheduled
+    // probes (which dereference `this._oracle` and `this._transport`)
+    // cannot race with provider teardown below. `stop()` aborts in-flight
+    // probes, clears subscribers, and resolves once every probe has
+    // settled — safe to await; bounded by `pingTimeoutMs`.
+    if (this._connectivity) {
+      try {
+        await this._connectivity.stop();
+      } catch (err) {
+        logger.warn('Sphere', 'ConnectivityManager stop failed:', err);
+      }
+      this._connectivity = null;
+    }
+
     // Destroy swap FIRST — it depends on accounting (which depends on payments)
     try {
       await this._swap?.destroy();
@@ -7058,6 +7142,98 @@ export class Sphere {
       transportAdapter: adapter,
       tokenStorageProviders: new Map(this._tokenStorageProviders),
       initialized: true,
+    });
+
+    // Issue #312 — connectivity manager. Build AFTER providers are wired
+    // (we read the transport's `isConnected()` and the oracle's
+    // `getCurrentRound()`), but BEFORE returning so the public
+    // `sphere.connectivity` accessor is live for any caller binding to
+    // events immediately. `start()` returns sync; the first probe fires
+    // on a microtask, so this does NOT block the init path.
+    try {
+      this._connectivity = this.buildConnectivityManager();
+      this._connectivity.start();
+    } catch (err) {
+      // Non-fatal: a broken connectivity manager MUST NOT brick init().
+      // The wallet remains fully functional; `sphere.connectivity` falls
+      // through to the uninitialized stub (all-`'unknown'`).
+      logger.warn(
+        'Sphere',
+        `Failed to build ConnectivityManager (sphere.connectivity will be inert): ${safeErrorMessage(err)}`,
+      );
+      this._connectivity = null;
+    }
+
+    // Wire the send-path gate. The PaymentsModule receives a snapshot
+    // getter — it does NOT hold a reference to the manager, so a future
+    // manager rebuild (post-address-switch) does not need to thread the
+    // dependency back through.
+    try {
+      const paymentsForGate = this._payments as unknown as {
+        configureConnectivityGate?: (
+          fn: () => 'up' | 'down' | 'degraded' | 'unknown',
+        ) => void;
+      };
+      if (typeof paymentsForGate.configureConnectivityGate === 'function') {
+        paymentsForGate.configureConnectivityGate(() =>
+          this._connectivity ? this._connectivity.status().aggregator : 'unknown',
+        );
+      }
+    } catch (err) {
+      logger.warn(
+        'Sphere',
+        `Failed to wire connectivity gate into PaymentsModule (sends will not gate on OFFLINE): ${safeErrorMessage(err)}`,
+      );
+    }
+  }
+
+  /**
+   * Issue #312 — build the per-wallet ConnectivityManager.
+   *
+   * Pingers wired:
+   *   - `aggregator`: probes `oracle.getCurrentRound()` (cheap JSON-RPC).
+   *   - `ipfs`: HEAD-probes the configured gateways (skipped when no
+   *      gateways are wired — wallet stays "fully online" w.r.t. IPFS).
+   *   - `nostr`: reads `transport.isConnected()` (the transport owns its
+   *      reconnect loop; we don't open a parallel subscription).
+   *
+   * Returns a freshly-built manager; the caller is responsible for
+   * `.start()` and `.stop()`.
+   */
+  private buildConnectivityManager(): ConnectivityManager {
+    const emitEvent = this.emitEvent.bind(this);
+
+    const aggregatorPinger = new AggregatorPinger({
+      provider: {
+        getCurrentRound: () => this._oracle.getCurrentRound(),
+      },
+    });
+
+    // IPFS gateways are wired only when the host app's provider factory
+    // populated `_cidFetchGateways` (the wallet has IPFS sync configured).
+    // Without gateways we skip the IPFS pinger entirely so the
+    // "no-IPFS" wallet is not stuck in permanent offline-degraded.
+    const ipfsGateways = this._cidFetchGateways ?? [];
+    const pingers: import('./connectivity').Pinger[] = [aggregatorPinger];
+    if (ipfsGateways.length > 0) {
+      pingers.push(new IpfsPinger(ipfsGateways));
+    }
+    pingers.push(
+      new NostrPinger(() => {
+        try {
+          return this._transport.isConnected();
+        } catch {
+          return false;
+        }
+      }),
+    );
+
+    return new ConnectivityManager(pingers, {
+      emitEvent: (type, payload) => {
+        // Forward to the Sphere event bus — types narrow correctly via
+        // SphereEventMap.
+        emitEvent(type as SphereEventType, payload as SphereEventMap[SphereEventType]);
+      },
     });
   }
 

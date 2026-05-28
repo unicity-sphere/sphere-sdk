@@ -543,7 +543,28 @@ export type SphereErrorCode =
    * sub-module is disabled). This code signals a SPECIFIC integration
    * point inside an otherwise-functional payments module.
    */
-  | 'OPERATOR_ESCAPE_HATCH_NOT_CONFIGURED';
+  | 'OPERATOR_ESCAPE_HATCH_NOT_CONFIGURED'
+  /**
+   * Issue #312 — offline-mode send-path gate.
+   *
+   * `PaymentsModule.send()` throws this code BEFORE any state mutation
+   * (no aggregator call, no Nostr publish, no token reservation) when
+   * the aggregator backend is observed `'down'` by the connectivity
+   * manager. Callers receive a structured `context` payload:
+   *
+   *     { which: 'aggregator' }
+   *
+   * The `'degraded'` aggregator state does NOT trigger this gate: the
+   * SDK's retry layer already handles slow / partially-failing
+   * aggregators, and the UX cost of blocking sends under `'degraded'`
+   * is worse than letting the retry complete.
+   *
+   * IPFS and Nostr are NOT gated by this code. An IPFS outage means
+   * the send may downgrade to inline delivery (under the relay-safe
+   * cap), and a Nostr outage means delivery may be queued for retry —
+   * neither is a hard offline condition.
+   */
+  | 'OFFLINE';
 
 // ===========================================================================
 // W40 — SphereError redaction layer (T.8.C)
