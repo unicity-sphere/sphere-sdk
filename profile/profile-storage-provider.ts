@@ -23,7 +23,6 @@ import {
   computeAddressId,
 } from './types';
 import { ProfileError } from './errors';
-import { extractLostHeadCid } from './orbitdb-adapter';
 import { deriveProfileEncryptionKey, encryptString, decryptString } from './encryption';
 import { OrbitDbDispositionStorageAdapter } from './disposition-storage-adapters';
 import {
@@ -36,6 +35,7 @@ import { CidRefStore } from './cid-ref-store';
 import { Lamport } from './lamport';
 import { buildLocalEntry } from './oplog-entry';
 import { getEnvelopePayload } from './oplog-envelope-io';
+import { extractLostHeadCid } from './orbitdb-adapter';
 import type { OpLogEntryType } from './aggregator-pointer/originated-tag';
 import type { ProfilePointerLayer } from './aggregator-pointer';
 import {
@@ -580,29 +580,6 @@ export class ProfileStorageProvider implements StorageProvider {
     this.envelopeFallbackNotifier = notifier;
   }
 
-  /**
-   * Issue #311 — register a listener fired when the read path detects
-   * an evicted critical block (Helia "Failed to load block for <CID>"
-   * pattern). The factory routes this into `tokenStorage.emitEvent`
-   * so it surfaces as a `profile:critical-block-evicted` StorageEvent.
-   * Pass `null` to disable.
-   *
-   * Dedup is applied per `(cid, key)` pair to a bounded cap so a
-   * persistent missing block does not spam the event surface on every
-   * subsequent read.
-   */
-  setCriticalBlockEvictedNotifier(
-    notifier:
-      | ((info: {
-          readonly cid: string | null;
-          readonly key: string;
-          readonly attemptedAt: number;
-        }) => void)
-      | null,
-  ): void {
-    this.criticalBlockEvictedNotifier = notifier;
-  }
-
   private envelopeFallbackNotifier:
     | ((info: { readonly key: string; readonly errorMessage: string }) => void)
     | null = null;
@@ -615,32 +592,6 @@ export class ProfileStorageProvider implements StorageProvider {
    */
   private envelopeFallbackSeen = new Set<string>();
   private static readonly ENVELOPE_FALLBACK_DEDUP_CAP = 1024;
-
-  /**
-   * Issue #311 — listener invoked when the read path observes a
-   * "Failed to load block for <CID>" error from Helia. The factory
-   * wires this into the token-storage provider's `emitEvent` so it
-   * surfaces as `profile:critical-block-evicted` on the public event
-   * surface. `null` (default) disables the surface but does NOT
-   * disable the warn-log path below.
-   */
-  private criticalBlockEvictedNotifier:
-    | ((info: {
-        readonly cid: string | null;
-        readonly key: string;
-        readonly attemptedAt: number;
-      }) => void)
-    | null = null;
-
-  /**
-   * Issue #311 — dedup set for `criticalBlockEvictedNotifier`. Limits
-   * a single `(cid, key)` pair to fire the notifier (and log the
-   * warning) once per provider instance. Bounded to the same cap as
-   * the envelope-fallback set; same adversarial-amplification
-   * considerations apply (see `handleEnvelopeFallback`).
-   */
-  private criticalBlockEvictedSeen = new Set<string>();
-  private static readonly CRITICAL_BLOCK_EVICTED_DEDUP_CAP = 1024;
 
   constructor(
     private readonly localCache: StorageProvider,
@@ -1443,7 +1394,41 @@ export class ProfileStorageProvider implements StorageProvider {
       return null;
     }
 
-    const encrypted = await this.readEnvelopePayload(translated.profileKey);
+    // Issue #309 — `readEnvelopePayload` can throw a chained
+    // `LoadBlockFailedError` when the OpLog head references a content
+    // block that's no longer in the local Helia blockstore (browser
+    // eviction, origin purge, quota error during write, etc.). Letting
+    // that throw propagate makes the caller's identity-load fatal
+    // even though there's almost always a usable fallback (the legacy
+    // IndexedDB still has the same key with the same shape).
+    //
+    // Convert that specific failure shape into `return null` with a
+    // structured warning. Sphere.loadIdentityFromStorage will then
+    // consult its `fallbackStorage` if one was supplied; consumers
+    // without a fallback see "key not found" instead of a hard crash
+    // — which preserves the previous-behavior intent ("Profile read
+    // couldn't satisfy this") without nuking the boot.
+    //
+    // All OTHER throws (decode errors, decryption failures, unknown
+    // I/O errors) still propagate — only the specific "block missing
+    // from local store" signature is downgraded.
+    let encrypted: Uint8Array | null;
+    try {
+      encrypted = await this.readEnvelopePayload(translated.profileKey);
+    } catch (err) {
+      const lostCid = extractLostHeadCid(err);
+      if (lostCid !== null) {
+        logger.warn(
+          'ProfileStorage',
+          `[LOAD-BLOCK-MISSING] Local Helia blockstore is missing block ${lostCid} ` +
+            `for key="${translated.profileKey}". Returning null so a caller with a ` +
+            `fallback storage can attempt to satisfy the read from legacy cache. ` +
+            `Run an OpLog auto-reset (write a fresh entry) to clear the dangling head.`,
+        );
+        return null;
+      }
+      throw err;
+    }
     if (encrypted === null) {
       return null;
     }
@@ -1631,76 +1616,12 @@ export class ProfileStorageProvider implements StorageProvider {
    * defense regardless of which side hits the corruption first.
    */
   private async readEnvelopePayload(profileKey: string): Promise<Uint8Array | null> {
-    try {
-      if (this.supportsEnvelopes()) {
-        return await getEnvelopePayload(this.db, profileKey, (info) => {
-          this.handleEnvelopeFallback(info);
-        });
-      }
-      return await this.db.get(profileKey);
-    } catch (err) {
-      // Issue #311 — detect Helia's "Failed to load block for <CID>"
-      // signature. The `extractLostHeadCid` helper walks the cause
-      // chain so we catch the error regardless of how many wrappers
-      // (ProfileError / OrbitDB / IPFSBlockStorage) sit between the
-      // raw Helia throw and the surface we observe here. Fire the
-      // observable alarm BEFORE re-throwing so an operator's UI can
-      // surface the eviction the moment it manifests — auto-reset
-      // (see `flush-scheduler.ts`) happens on the WRITE path, which
-      // a read-only client would never hit.
-      const lostCid = extractLostHeadCid(err);
-      if (lostCid !== null) {
-        this.handleCriticalBlockEvicted({
-          cid: lostCid,
-          key: profileKey,
-          attemptedAt: Date.now(),
-        });
-      }
-      throw err;
+    if (this.supportsEnvelopes()) {
+      return getEnvelopePayload(this.db, profileKey, (info) => {
+        this.handleEnvelopeFallback(info);
+      });
     }
-  }
-
-  /**
-   * Issue #311 — dispatcher for the critical-block-evicted hook.
-   *
-   * Logs at WARN level on the first sighting of a unique `(cid, key)`
-   * pair AND invokes the user-supplied notifier (if any) so consumers
-   * can route the signal into typed events / metrics / alerts.
-   *
-   * Dedup uses the same bounded-cap + early-return pattern as
-   * `handleEnvelopeFallback`. The cap protects against adversarial
-   * input that would otherwise flood the event surface; the
-   * trade-off ("lost signal beyond cap" vs "no unbounded amplification")
-   * is identical and we choose the same answer.
-   */
-  private handleCriticalBlockEvicted(info: {
-    readonly cid: string | null;
-    readonly key: string;
-    readonly attemptedAt: number;
-  }): void {
-    const cidKey = info.cid ?? '';
-    const dedupKey = `${cidKey}\x1f${info.key}`;
-    if (this.criticalBlockEvictedSeen.has(dedupKey)) return;
-    if (
-      this.criticalBlockEvictedSeen.size >=
-      ProfileStorageProvider.CRITICAL_BLOCK_EVICTED_DEDUP_CAP
-    ) {
-      return;
-    }
-    this.criticalBlockEvictedSeen.add(dedupKey);
-    logger.warn(
-      'ProfileStorage',
-      `[CRITICAL-BLOCK-EVICTED] Helia could not load block for key="${redactProfileKey(info.key)}" ` +
-        `cid="${info.cid ?? '<unknown>'}". The block was evicted from the local blockstore between sessions. ` +
-        `If this fires on a fresh-load read, the wallet may need to re-sync from remote storage.`,
-    );
-    if (this.criticalBlockEvictedNotifier !== null) {
-      try {
-        this.criticalBlockEvictedNotifier(info);
-      } catch {
-        // Best-effort signal; never propagate notifier errors into reads.
-      }
-    }
+    return this.db.get(profileKey);
   }
 
   /**
