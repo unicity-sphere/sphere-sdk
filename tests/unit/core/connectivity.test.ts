@@ -412,18 +412,62 @@ describe('AggregatorPinger', () => {
     expect(await p.ping(new AbortController().signal)).toBe('up');
   });
 
-  it('returns degraded when provider.getCurrentRound() returns 0 (legacy fallback)', async () => {
+  // Fresh shards / between-batch states can legitimately return a `0`
+  // block height. The reference infra-probe treats ANY structured
+  // JSON-RPC response as alive, and URL-mode (below) accepts any
+  // finite numeric `result`. Provider-mode must match — previously
+  // `0` was demoted to `'degraded'` and the wallet UI surfaced a
+  // false "Aggregator service unavailable" banner.
+  it('returns up when provider.getCurrentRound() returns 0 (real aggregator response)', async () => {
     const p = new AggregatorPinger({
       provider: { getCurrentRound: async () => 0 },
     });
-    expect(await p.ping(new AbortController().signal)).toBe('degraded');
+    expect(await p.ping(new AbortController().signal)).toBe('up');
   });
 
-  it('returns down when provider.getCurrentRound() throws', async () => {
+  it('returns up for large positive numbers (no upper bound)', async () => {
     const p = new AggregatorPinger({
+      provider: { getCurrentRound: async () => Number.MAX_SAFE_INTEGER },
+    });
+    expect(await p.ping(new AbortController().signal)).toBe('up');
+  });
+
+  it('returns degraded when provider.getCurrentRound() returns a non-finite/negative number', async () => {
+    const nan = new AggregatorPinger({
+      provider: { getCurrentRound: async () => Number.NaN },
+    });
+    expect(await nan.ping(new AbortController().signal)).toBe('degraded');
+
+    const inf = new AggregatorPinger({
+      provider: { getCurrentRound: async () => Number.POSITIVE_INFINITY },
+    });
+    expect(await inf.ping(new AbortController().signal)).toBe('degraded');
+
+    const neg = new AggregatorPinger({
+      provider: { getCurrentRound: async () => -1 },
+    });
+    expect(await neg.ping(new AbortController().signal)).toBe('degraded');
+  });
+
+  it('returns down when provider.getCurrentRound() throws (including the legacy "no aggregator client" stub path)', async () => {
+    // Any thrown error → 'down'. The stub path in
+    // UnicityAggregatorProvider.getCurrentRound() now throws when
+    // `aggregatorClient` is null (pre-`initialize()`), so the pinger
+    // correctly classifies an uninitialized provider as offline rather
+    // than silently treating `0` as a real round value.
+    const stub = new AggregatorPinger({
+      provider: {
+        getCurrentRound: async () => {
+          throw new Error('UnicityAggregatorProvider: aggregator client not initialized');
+        },
+      },
+    });
+    expect(await stub.ping(new AbortController().signal)).toBe('down');
+
+    const generic = new AggregatorPinger({
       provider: { getCurrentRound: async () => { throw new Error('503'); } },
     });
-    expect(await p.ping(new AbortController().signal)).toBe('down');
+    expect(await generic.ping(new AbortController().signal)).toBe('down');
   });
 
   it('returns down when neither provider nor URL is supplied', async () => {

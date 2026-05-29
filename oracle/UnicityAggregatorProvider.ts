@@ -947,11 +947,21 @@ export class UnicityAggregatorProvider implements OracleProvider {
   }
 
   async getCurrentRound(): Promise<number> {
-    if (this.aggregatorClient) {
-      const blockHeight = await this.aggregatorClient.getBlockHeight();
-      return Number(blockHeight);
+    if (!this.aggregatorClient) {
+      // Defensive: aggregator client is constructed in `initialize()`. If
+      // `getCurrentRound()` is called before `initialize()` (or after a
+      // failed init), we have no live RPC channel — surface that as a
+      // throw so the AggregatorPinger correctly classifies the wallet as
+      // `'down'` rather than silently treating "no client" as a numeric
+      // round value. Prior code returned `0` here, which leaked the stub
+      // sentinel into the connectivity layer and demoted a healthy
+      // aggregator to `'degraded'` whenever any real-shard `0` round
+      // looked indistinguishable from this fallback (issue: page top-bar
+      // false-negative "Aggregator service unavailable").
+      throw new Error('UnicityAggregatorProvider: aggregator client not initialized');
     }
-    return 0;
+    const blockHeight = await this.aggregatorClient.getBlockHeight();
+    return Number(blockHeight);
   }
 
   async mint(params: MintParams): Promise<MintResult> {
