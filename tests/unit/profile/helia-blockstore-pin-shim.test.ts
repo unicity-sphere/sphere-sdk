@@ -194,6 +194,71 @@ describe('installHeliaBlockstorePinShim', () => {
     const counters = handle.getCounters();
     expect(counters.pinSkipped).toBeGreaterThanOrEqual(1);
   });
+
+  // Issue #330 follow-up — silence "Already pinned" noise.
+  // When OrbitDB replays its OpLog, every block touched fires
+  // `blockstore.put` again, which in turn fires `helia.pins.add`. Helia
+  // rejects the second add with "Already pinned" — that's the EXPECTED
+  // outcome for a CID we already pinned. Pre-fix this produced hundreds
+  // of warn-log entries per second, freezing the page in DevTools. The
+  // fix has two parts:
+  //   1. Skip the `pins.add` round-trip when the in-memory Set already
+  //      tracks the CID (saves the network/datastore call entirely).
+  //   2. Catch the "Already pinned" error from helia and treat it as
+  //      success without a warn (covers the case where the Set was
+  //      reset by a destroy/reconnect but helia's pin records survive).
+  it('pre-checks in-memory tracker and skips redundant pins.add calls', async () => {
+    const { helia, pinCalls } = makeHelia({});
+    const handle = installHeliaBlockstorePinShim(helia);
+
+    await helia.blockstore!.put!('bafyAAA', new Uint8Array([1]));
+    await flushAsync();
+    // Same CID written again — pre-check should short-circuit.
+    await helia.blockstore!.put!('bafyAAA', new Uint8Array([1]));
+    await flushAsync();
+    await helia.blockstore!.put!('bafyAAA', new Uint8Array([1]));
+    await flushAsync();
+
+    // Only ONE pins.add call should reach the API, even though put was
+    // called three times for the same CID.
+    expect(pinCalls()).toEqual(['bafyAAA']);
+    const counters = handle.getCounters();
+    expect(counters.pinAttempted).toBe(3);
+    expect(counters.pinSucceeded).toBe(3);
+    expect(counters.pinFailed).toBe(0);
+  });
+
+  it('treats "Already pinned" from helia.pins.add as success (no warn)', async () => {
+    // Custom pins API: throws "Already pinned" — simulates the helia
+    // pin-tracker survived state where the in-memory Set was cleared
+    // but the pin record persisted.
+    const pinsApi = {
+      add(cid: unknown): AsyncIterable<unknown> {
+        return (async function* () {
+          throw new Error('Already pinned');
+          // eslint-disable-next-line @typescript-eslint/no-unreachable
+          yield cid;
+        })();
+      },
+    };
+    const blockstore = makeBlockstore('ok');
+    const helia: HeliaWithPinsLike = {
+      blockstore: blockstore.bs,
+      pins: pinsApi,
+    } as unknown as HeliaWithPinsLike;
+    const handle = installHeliaBlockstorePinShim(helia);
+
+    await helia.blockstore!.put!('bafyDUP', new Uint8Array([1]));
+    await flushAsync();
+
+    const counters = handle.getCounters();
+    expect(counters.pinAttempted).toBe(1);
+    // Should be counted as SUCCESS, not failure.
+    expect(counters.pinSucceeded).toBe(1);
+    expect(counters.pinFailed).toBe(0);
+    // CID is now tracked in the in-memory set.
+    expect(handle.getPinnedCids()).toContain('bafyDUP');
+  });
 });
 
 // ---------------------------------------------------------------------------
