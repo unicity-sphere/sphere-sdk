@@ -575,7 +575,13 @@ export class ProfileStorageProvider implements StorageProvider {
    * The hook contract MUST NOT throw — exceptions are swallowed.
    */
   setEnvelopeFallbackNotifier(
-    notifier: ((info: { readonly key: string; readonly errorMessage: string }) => void) | null,
+    notifier:
+      | ((info: {
+          readonly key: string;
+          readonly errorMessage: string;
+          readonly isCborDecodeError?: boolean;
+        }) => void)
+      | null,
   ): void {
     this.envelopeFallbackNotifier = notifier;
   }
@@ -604,7 +610,11 @@ export class ProfileStorageProvider implements StorageProvider {
   }
 
   private envelopeFallbackNotifier:
-    | ((info: { readonly key: string; readonly errorMessage: string }) => void)
+    | ((info: {
+        readonly key: string;
+        readonly errorMessage: string;
+        readonly isCborDecodeError?: boolean;
+      }) => void)
     | null = null;
 
   /**
@@ -1779,6 +1789,7 @@ export class ProfileStorageProvider implements StorageProvider {
   private handleEnvelopeFallback(info: {
     readonly key: string;
     readonly errorMessage: string;
+    readonly isCborDecodeError?: boolean;
   }): void {
     // Delimiter (`\x1f` = ASCII Unit Separator) prevents collisions
     // between (key="ab", err="cd") and (key="a", err="bcd"). Profile
@@ -1804,16 +1815,37 @@ export class ProfileStorageProvider implements StorageProvider {
       return;
     }
     this.envelopeFallbackSeen.add(dedupKey);
-    logger.warn(
-      'ProfileStorage',
-      `[ENVELOPE-FALLBACK] OpLog envelope decode failed for key="${redactProfileKey(info.key)}" ` +
-        `— served raw bytes via legacy compat path. ` +
-        `This is expected for pre-#247 wallets but indicates live envelope ` +
-        `corruption when seen on freshly-written entries. ` +
-        `error="${info.errorMessage}"`,
-    );
+    // Raw-CBOR-decode failures are the dominant signature of pre-#247
+    // raw-bytes writes (e.g. SentLedgerWriter writes ciphertext directly
+    // via `db.put` — random AES-GCM IVs occasionally start with a CBOR
+    // simple-value code that cborg rejects). The fallback path is the
+    // intended path; logging at WARN was the source of soak-log noise
+    // (e.g. "CBOR decode error: simple values are not supported" hits
+    // observed 2026-05-29) without indicating any real problem. Real
+    // envelope corruption surfaces as a non-cbor-decode failure (wrong
+    // shape, unknown v, unexpected field) — keep WARN for that case.
+    if (info.isCborDecodeError === true) {
+      logger.debug(
+        'ProfileStorage',
+        `[ENVELOPE-FALLBACK] legacy raw-bytes read for key="${redactProfileKey(info.key)}" ` +
+          `— served via db.get compat path (CBOR decode failed, expected for ` +
+          `pre-#247 raw-bytes writers like SentLedgerWriter).`,
+      );
+    } else {
+      logger.warn(
+        'ProfileStorage',
+        `[ENVELOPE-FALLBACK] OpLog envelope shape invalid for key="${redactProfileKey(info.key)}" ` +
+          `— served raw bytes via legacy compat path. ` +
+          `Indicates live envelope corruption (decoded to a non-envelope ` +
+          `shape) — operator triage recommended. ` +
+          `error="${info.errorMessage}"`,
+      );
+    }
     if (this.envelopeFallbackNotifier !== null) {
       try {
+        // Notifier always fires — observability hook lets consumers
+        // decide their own threshold for both legacy-noise and
+        // genuine-corruption signals.
         this.envelopeFallbackNotifier(info);
       } catch {
         // Best-effort signal; never propagate notifier errors.

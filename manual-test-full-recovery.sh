@@ -120,12 +120,41 @@ wait_for_log() {
   return 1
 }
 
+# Normalize a snapshot before byte-comparison. Strips lines that are
+# legitimately volatile across runs but do NOT reflect logical wallet
+# state. False positives observed on 2026-05-29 (issue: page-freeze):
+#
+#   - "  IPFS: +N added, -M removed" — transient sync-status emitted
+#     when `sphere balance` notices background IPFS sync activity. The
+#     count varies depending on whether a prior write is still landing.
+#   - "Syncing..." / "  Ready." — wallet-load progress banner.
+#   - "[YYYY-MM-DDThh:mm:ss.sssZ] [LEVEL] [Component] ..." — debug
+#     output captured when the CLI runs in verbose mode. Wall-clock
+#     timestamps + monotonic counters (event IDs, bundle counts) make
+#     these lines pure noise for state comparison.
+#
+# Filtering operates on a temp file the caller hands to diff, leaving
+# the original snapshot untouched for forensics.
+normalize_snapshot() {
+  # shellcheck disable=SC2016
+  sed -E \
+    -e '/^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z\] /d' \
+    -e '/^  IPFS: \+[0-9]+ added, -[0-9]+ removed$/d' \
+    -e '/^Syncing\.\.\.$/d' \
+    -e '/^  Ready\.$/d' \
+    "$1"
+}
+
 assert_diff_empty() {
   local label="$1" a="$2" b="$3"
-  if diff -u "$a" "$b" > "$SNAP/${label}.diff"; then
+  local na="$SNAP/${label}.a.norm" nb="$SNAP/${label}.b.norm"
+  normalize_snapshot "$a" > "$na"
+  normalize_snapshot "$b" > "$nb"
+  if diff -u "$na" "$nb" > "$SNAP/${label}.diff"; then
     echo "ASSERT OK ($label): $(basename "$a") == $(basename "$b")"
   else
     echo "ASSERT FAIL ($label): see $SNAP/${label}.diff" >&2
+    echo "  (compared normalized snapshots: ${label}.a.norm vs ${label}.b.norm)" >&2
     cat "$SNAP/${label}.diff" >&2 || true
     return 1
   fi
