@@ -206,7 +206,7 @@ Returns `PeerInfo`:
 
 ```typescript
 interface PeerInfo {
-  nametag?: string;        // @name if registered
+  nametag?: string;        // Unicity ID (e.g. @alice) if registered
   transportPubkey: string; // 32-byte transport key
   chainPubkey: string;     // 33-byte compressed secp256k1
   l1Address: string;       // alpha1... L1 address
@@ -222,7 +222,7 @@ interface PeerInfo {
 
 Access via `sphere.payments`.
 
-Handles all L3 (Unicity state transition network) token operations including transfers, balance queries, token lifecycle management, nametag minting, and multi-provider sync.
+Handles all L3 (Unicity state transition network) token operations including transfers, balance queries, token lifecycle management, Unicity ID minting, and multi-provider sync.
 
 ### Transfer Modes
 
@@ -685,7 +685,7 @@ Remove a token. Archives it first, creates a tombstone `(tokenId, stateHash)`, a
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `tokenId` | `string` | — | Local UUID of the token |
-| `recipientNametag` | `string?` | — | Recipient nametag for history |
+| `recipientNametag` | `string?` | — | Recipient Unicity ID for history |
 | `skipHistory` | `boolean` | `false` | Skip creating a SENT history entry |
 
 ---
@@ -790,11 +790,11 @@ Append a history entry (UUID auto-generated). Persisted immediately.
 
 ---
 
-### Methods: Nametag Management
+### Methods: Unicity ID Management
 
 #### `mintNametag(nametag: string): Promise<MintNametagResult>`
 
-Mint a nametag token on-chain. Required for receiving tokens via PROXY addresses.
+Mint a Unicity ID token on-chain. Required for receiving tokens via PROXY addresses.
 
 ```typescript
 interface MintNametagResult {
@@ -821,23 +821,23 @@ type TransferStatus = 'pending' | 'submitted' | 'confirmed' | 'delivered' | 'com
 
 #### `isNametagAvailable(nametag: string): Promise<boolean>`
 
-Check if a nametag is available for minting.
+Check if a Unicity ID is available for minting.
 
 #### `setNametag(nametag: NametagData): Promise<void>`
 
-Set nametag data (persists to storage and file).
+Set Unicity ID data (persists to storage and file).
 
 #### `getNametag(): NametagData | null`
 
-Get current nametag data.
+Get current Unicity ID data.
 
 #### `hasNametag(): boolean`
 
-Check if a nametag is set.
+Check if a Unicity ID is set.
 
 #### `clearNametag(): Promise<void>`
 
-Remove nametag data from memory and storage.
+Remove Unicity ID data from memory and storage.
 
 ---
 
@@ -1186,11 +1186,11 @@ interface DirectMessage {
 
 #### `resolvePeerNametag(peerPubkey: string): Promise<string | undefined>`
 
-Resolve a peer's nametag by their transport pubkey via live lookup from Nostr relay binding events. Returns `undefined` if the transport doesn't support resolution, the peer has no registered nametag, or the lookup fails. Useful as a fallback when no nametag is available in stored messages.
+Resolve a peer's Unicity ID by their transport pubkey via live lookup from Nostr relay binding events. Returns `undefined` if the transport doesn't support resolution, the peer has no registered Unicity ID, or the lookup fails. Useful as a fallback when no Unicity ID is available in stored messages.
 
 #### `onDirectMessage(handler: (msg: DirectMessage) => void): () => void`
 
-Subscribe to incoming direct messages. Supports both NIP-17 gift-wrapped messages (kind 1059, used by Sphere app) and NIP-04 encrypted DMs (kind 4, legacy). For NIP-17 messages, the sender's nametag is extracted from the Sphere messaging format if present.
+Subscribe to incoming direct messages. Supports both NIP-17 gift-wrapped messages (kind 1059, used by Sphere app) and NIP-04 encrypted DMs (kind 4, legacy). For NIP-17 messages, the sender's Unicity ID is extracted from the Sphere messaging format if present.
 
 **DM history on connect:** The SDK persists the timestamp of the last processed DM event. On reconnect, only DMs newer than that timestamp are fetched from the relay. On first connect (no persisted timestamp), the SDK starts from "now" unless `dmSince` is set in `Sphere.init()` options — a unix timestamp (seconds) controlling how far back to fetch. This is a fallback: once the SDK processes a DM, the persisted timestamp takes priority on subsequent connects.
 
@@ -1329,7 +1329,7 @@ interface Identity {
   directAddress?: string;
   /** IPNS identifier for storage */
   ipnsName?: string;
-  /** Registered @name alias */
+  /** Registered Unicity ID (e.g. @alice) */
   nametag?: string;
 }
 
@@ -1505,9 +1505,9 @@ interface PaymentsModuleDependencies {
 
 ---
 
-## Nametag Minting
+## Unicity ID Minting
 
-Mint nametag tokens on-chain for PROXY address support (required for receiving tokens via @nametag).
+Mint Unicity ID tokens on-chain for PROXY address support (required for receiving tokens via @Unicity ID).
 
 ### Sphere Methods
 
@@ -1580,7 +1580,7 @@ interface NametagMinterConfig {
 
 ### Auto-mint on Registration
 
-The SDK automatically mints the nametag token on-chain whenever `registerNametag()` is called:
+The SDK automatically mints the Unicity ID token on-chain whenever `registerNametag()` is called:
 
 ```typescript
 // Option 1: During init (new wallet)
@@ -1600,12 +1600,12 @@ const { sphere } = await Sphere.init({ ...providers });
 ```
 
 **When minting happens:**
-- `Sphere.create()` with nametag → mints via `registerNametag()`
-- `Sphere.load()` → mints if nametag exists but token is missing
-- `Sphere.import()` with nametag → mints via `registerNametag()`
+- `Sphere.create()` with Unicity ID → mints via `registerNametag()`
+- `Sphere.load()` → mints if Unicity ID exists but token is missing
+- `Sphere.import()` with Unicity ID → mints via `registerNametag()`
 - `registerNametag()` → always mints if token not present
 
-Nametag token is required for receiving tokens via PROXY addresses (`finalizeTransaction` requires nametag token for PROXY scheme).
+Unicity ID token is required for receiving tokens via PROXY addresses (`finalizeTransaction` requires Unicity ID token for PROXY scheme).
 
 ---
 
@@ -3253,7 +3253,7 @@ try {
 | `INVALID_CONFIG` | Invalid configuration parameters |
 | `INVALID_IDENTITY` | Invalid mnemonic or key |
 | `INSUFFICIENT_BALANCE` | Not enough funds for transfer |
-| `INVALID_RECIPIENT` | Recipient nametag not found or invalid |
+| `INVALID_RECIPIENT` | Recipient Unicity ID not found or invalid |
 | `TRANSFER_FAILED` | Token transfer/mint/burn failed |
 | `STORAGE_ERROR` | Storage read/write failed |
 | `TRANSPORT_ERROR` | Relay/network transport error |

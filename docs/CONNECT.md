@@ -154,6 +154,10 @@ const result = await autoConnect({
   dapp: { name: 'My App', url: location.origin },
   walletUrl: 'https://sphere.unicity.network',
   silent: true, // auto-reconnect without UI if already approved
+  // Request only the scopes you need. If `permissions` is OMITTED, autoConnect
+  // requests ALL scopes (including intent scopes like transfer:request) —
+  // prefer least privilege:
+  permissions: ['identity:read', 'balance:read', 'events:subscribe'],
 });
 
 // Use the client
@@ -302,11 +306,11 @@ The wallet's `onConnectionRequest` receives `silent=true` and must return `{ app
 | Method | Params | Returns |
 |--------|--------|---------|
 | `sphere_getIdentity` | — | `PublicIdentity` |
-| `sphere_getBalance` | `coinId?` | balance array |
-| `sphere_getAssets` | `coinId?` | asset array |
-| `sphere_getFiatBalance` | — | `{ fiatBalance }` |
-| `sphere_getTokens` | `coinId?` | token array |
-| `sphere_getHistory` | — | transaction history |
+| `sphere_getBalance` | `coinId?` | `Asset[]` (per-coin breakdown; **not** a USD total) |
+| `sphere_getAssets` | `coinId?` | `Asset[]` (adds `priceUsd` / `fiatValueUsd` when prices are enabled) |
+| `sphere_getFiatBalance` | — | `{ fiatBalance }` (USD total, or `null`) |
+| `sphere_getTokens` | `coinId?` | `Token[]` |
+| `sphere_getHistory` | — | `TransactionHistoryEntry[]` (full history — see note) |
 | `sphere_l1GetBalance` | — | L1 balance |
 | `sphere_l1GetHistory` | `limit?` | L1 history |
 | `sphere_resolve` | `identifier` | resolved address info |
@@ -315,6 +319,19 @@ The wallet's `onConnectionRequest` receives `silent=true` and must return `{ app
 | `sphere_subscribe` | `event` | `{ subscribed, event }` |
 | `sphere_unsubscribe` | `event` | `{ unsubscribed, event }` |
 | `sphere_disconnect` | — | `{ disconnected }` |
+
+> **`sphere_getHistory` takes no params and returns the full history.** Unlike `sphere_l1GetHistory` (which accepts `limit?`), incremental sync / pagination is the dApp's responsibility — filter client-side (e.g. by timestamp).
+
+**Return shapes** (forwarded from the wallet SDK):
+
+```typescript
+interface Asset { coinId; symbol; totalAmount; confirmedAmount?; tokenCount;
+                  priceUsd?; fiatValueUsd?; change24h?; }
+interface TransactionHistoryEntry { type: 'SENT'|'RECEIVED'|'SPLIT'|'MINT';
+                  amount; coinId; symbol; timestamp;
+                  recipientNametag?; senderPubkey?; }
+interface PublicIdentity { chainPubkey; directAddress?; l1Address; nametag?; }
+```
 
 ## Intent Actions (require user confirmation)
 
@@ -369,14 +386,24 @@ const isValid = verifySignedMessage(originalMessage, signature, expectedPubkey);
 
 ## Events (wallet → dApp push)
 
+There are **two delivery mechanisms** — don't conflate them.
+
+**Auto‑pushed** by the host with no subscription needed (these are the only two; see `WALLET_EVENTS` in `connect/protocol.ts`):
+
+| Event | Constant | Payload |
+|-------|----------|---------|
+| `wallet:locked` | `WALLET_EVENTS.LOCKED` | wallet locked / user logged out |
+| `identity:changed` | `WALLET_EVENTS.IDENTITY_CHANGED` | active address changed |
+
+**Subscribable** — require the `events:subscribe` permission and a `client.on(...)` (which issues `sphere_subscribe`):
+
 | Event | Payload |
 |-------|---------|
-| `transfer:incoming` | token transfer received |
-| `transfer:confirmed` | transfer confirmed on chain |
-| `transfer:failed` | transfer failed |
-| `balance:updated` | balance changed |
-| `identity:updated` | identity info changed |
-| `session:expired` | session TTL reached |
+| `transfer:incoming` | token transfer received (`{ tokens, senderNametag?, … }`) |
+| `transfer:confirmed` | outgoing transfer confirmed |
+| `transfer:failed` | outgoing transfer failed |
+
+> Use the exported constants (`WALLET_EVENTS.IDENTITY_CHANGED`) in code rather than the literal string, so it can't drift.
 
 ### Wallet Lock Handling
 
@@ -398,14 +425,14 @@ client.on('wallet:locked', async () => {
 
 #### Extension / iframe mode (P1, P2)
 
-The wallet's background service worker or parent frame stays alive. Instead of disconnecting, set a `isWalletLocked` flag and wait for the user to unlock. When the wallet is unlocked, the host calls `updateSphere(newSphere)` and fires an `identity:updated` event, which signals the dApp to resume:
+The wallet's background service worker or parent frame stays alive. Instead of disconnecting, set a `isWalletLocked` flag and wait for the user to unlock. When the wallet is unlocked, the host calls `updateSphere(newSphere)` and fires an `identity:changed` event, which signals the dApp to resume:
 
 ```typescript
 client.on('wallet:locked', () => {
   setIsWalletLocked(true);
 });
 
-client.on('identity:updated', (identity) => {
+client.on('identity:changed', (identity) => {
   setIsWalletLocked(false);
   // Refresh UI with new identity if it changed
 });
@@ -417,23 +444,24 @@ client.on('identity:updated', (identity) => {
 
 Permissions are requested during handshake and checked on every request:
 
+These are the exact scope strings from `connect/permissions.ts` (`PERMISSION_SCOPES`). Only `identity:read` is granted by default.
+
 | Scope | Grants access to |
 |-------|-----------------|
-| `identity:read` | `sphere_getIdentity` |
-| `balance:read` | `sphere_getBalance`, `sphere_getFiatBalance` |
-| `assets:read` | `sphere_getAssets` |
+| `identity:read` | `sphere_getIdentity` (+ the `receive` intent) |
+| `balance:read` | `sphere_getBalance`, `sphere_getAssets`, `sphere_getFiatBalance` |
 | `tokens:read` | `sphere_getTokens` |
 | `history:read` | `sphere_getHistory` |
 | `l1:read` | `sphere_l1GetBalance`, `sphere_l1GetHistory` |
-| `events:subscribe` | `sphere_subscribe/unsubscribe` |
-| `intent:send` | `send` intent |
-| `intent:l1_send` | `l1_send` intent |
-| `intent:dm` | `dm` intent |
-| `intent:payment_request` | `payment_request` intent |
-| `intent:receive` | `receive` intent |
-| `intent:sign_message` | `sign_message` intent |
-| `comms:read` | DM conversations |
-| `comms:write` | send DMs |
+| `resolve:peer` | `sphere_resolve` |
+| `events:subscribe` | `sphere_subscribe` / `sphere_unsubscribe` |
+| `transfer:request` | `send`, `pay_invoice`, `return_invoice_payment` intents |
+| `l1:transfer` | `l1_send` intent |
+| `dm:request` | `dm` intent |
+| `dm:read` | `sphere_getConversations`, `sphere_getMessages`, `sphere_getDMUnreadCount` |
+| `dm:manage` | `sphere_markAsRead` |
+| `payment:request` | `payment_request` intent |
+| `sign:request` | `sign_message` intent |
 | `invoice:read` | `sphere_getInvoices`, `sphere_getInvoiceStatus` |
 | `invoice:write` | `create_invoice`, `close_invoice`, `cancel_invoice`, `import_invoice`, `send_invoice_receipts`, `send_cancellation_notices`, `set_auto_return` intents |
 
