@@ -32,6 +32,11 @@ import {
 } from './finalization-queue-storage-adapter';
 import { OutboxWriter } from './outbox-writer';
 import { SentLedgerWriter } from './sent-ledger-writer';
+import {
+  buildInvalidatedNametagsSyncWriter,
+  buildTombstonesSyncWriter,
+  type SingleBlobSyncWriter,
+} from './single-blob-sync-writer';
 import { CidRefStore } from './cid-ref-store';
 import { Lamport } from './lamport';
 import { buildLocalEntry } from './oplog-entry';
@@ -1206,6 +1211,54 @@ export class ProfileStorageProvider implements StorageProvider {
       encryptionKey: this.profileEncryptionKey,
       addressId,
       lamport: lamport ?? new Lamport(),
+      notifyProfileDirty: this.profileDirtyNotifier ?? undefined,
+    });
+  }
+
+  /**
+   * Issue #335 — Build a sync writer for `${addressId}.tombstones`.
+   *
+   * The lean-snapshot dispatcher had no writer registered for this
+   * single-blob key, so cross-device snapshot apply silently dropped
+   * spent-token tombstones. See profile/single-blob-sync-writer.ts and
+   * issue #335 for the full RCA. Lifecycle and null semantics mirror
+   * {@link buildOutboxWriter} — returns `null` when encryption is not
+   * yet wired so the dispatcher's `writersFor()` skip-empty path is
+   * preserved.
+   */
+  buildTombstonesSyncWriter(addressId: string): SingleBlobSyncWriter<{
+    readonly tokenId: string;
+    readonly stateHash: string;
+    readonly timestamp: number;
+  }> | null {
+    if (!this.encryptionEnabled) return null;
+    if (this.profileEncryptionKey === null) return null;
+    if (typeof addressId !== 'string' || addressId.length === 0) return null;
+    return buildTombstonesSyncWriter({
+      db: this.db,
+      encryptionKey: this.profileEncryptionKey,
+      addressId,
+      notifyProfileDirty: this.profileDirtyNotifier ?? undefined,
+    });
+  }
+
+  /**
+   * Issue #335 (companion) — Build a sync writer for
+   * `${addressId}.invalidatedNametags`. Same propagation gap as
+   * tombstones: the key is a single blob (a `string[]` set) written
+   * via `writeProfileKey` and never registered in the dispatcher.
+   * Lifecycle and null semantics mirror {@link buildTombstonesSyncWriter}.
+   */
+  buildInvalidatedNametagsSyncWriter(
+    addressId: string,
+  ): SingleBlobSyncWriter<string> | null {
+    if (!this.encryptionEnabled) return null;
+    if (this.profileEncryptionKey === null) return null;
+    if (typeof addressId !== 'string' || addressId.length === 0) return null;
+    return buildInvalidatedNametagsSyncWriter({
+      db: this.db,
+      encryptionKey: this.profileEncryptionKey,
+      addressId,
       notifyProfileDirty: this.profileDirtyNotifier ?? undefined,
     });
   }
