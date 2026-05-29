@@ -299,6 +299,18 @@ export function installHeliaBlockstorePinShim(
       return 'skipped';
     }
 
+    // Pre-check: if we've already pinned this CID in this session, skip
+    // the round-trip to `pinsApi.add` entirely. Without this, every block
+    // touched during an OrbitDB OpLog replay or a re-flush calls
+    // `pins.add` for an already-pinned CID, which then rejects with
+    // "Already pinned" and triggers the warn-log spam observed in
+    // production (hundreds of warnings per second freezing the page in
+    // DevTools). The Set is the authoritative in-session tracker
+    // populated below on success.
+    if (pinnedCids.has(cidStr)) {
+      return 'pinned';
+    }
+
     try {
       const result = pinsApi.add(cid);
       // Helia v6 returns AsyncIterable<CID>; older / test stubs may
@@ -328,15 +340,26 @@ export function installHeliaBlockstorePinShim(
       pinnedCids.add(cidStr);
       return 'pinned';
     } catch (err) {
+      // "Already pinned" is NOT a failure — Helia rejects re-adds with
+      // this message when the pin record already exists in the pin
+      // datastore. It means the previous pin is still durable, which is
+      // exactly what we want. Stamp the in-memory tracker so the pre-
+      // check above short-circuits subsequent puts of the same CID, and
+      // return success WITHOUT warning. Without this branch, OpLog
+      // replays of pre-pinned blocks produced hundreds of warns per
+      // second, freezing the page in DevTools.
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/already pinned/i.test(msg)) {
+        pinnedCids.add(cidStr);
+        return 'pinned';
+      }
       // Best-effort: log at warn level and move on. The single most
       // common cause in production is `add` rejecting because the
       // datastore is mid-shutdown — re-pinning on the next session
       // restores the invariant.
       logger.warn(
         'ProfilePinShim',
-        `helia.pins.add failed for ${cidStr.slice(0, 16)}…: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
+        `helia.pins.add failed for ${cidStr.slice(0, 16)}…: ${msg}`,
       );
       return 'failed';
     }
