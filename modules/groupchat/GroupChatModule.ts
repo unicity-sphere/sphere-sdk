@@ -76,6 +76,48 @@ const MAX_GROUP_MESSAGE_SIZE = 64 * 1024;
  */
 const MAX_INDEX_ITEMS = 10_000;
 
+/**
+ * Concurrency cap for per-message CID fetches on load (Pattern B index).
+ *
+ * Before this cap, `fetched.items.map(async i => fetchJson(i))` + Promise.all
+ * spawned up to MAX_INDEX_ITEMS (10k) parallel HTTP requests per group, with
+ * additional fan-out across groups. With a single slow/sick gateway (e.g.
+ * unicity-ipfs1.dyndns.org returning 404/502), that fan-out becomes a
+ * thundering-herd: each request pins one socket for the 30s fetch timeout,
+ * and the cumulative wall-time grows quadratically.
+ *
+ * 4 keeps the existing "parallel-not-serial" speed-up (a small batch still
+ * overlaps network + decode latency) while leaving headroom for the rest of
+ * the page (transport, payments, profile-storage) to make progress on shared
+ * gateways. The page-freeze symptom (issue: 2026-05-29) was driven primarily
+ * by this unbounded fan-out colliding with a degraded testnet gateway.
+ */
+const LOAD_FETCH_CONCURRENCY = 4;
+
+/**
+ * Run an async mapper across `items` with a bounded number of concurrent
+ * workers. Preserves order in the output. Failures inside `fn` propagate to
+ * the caller (matching `Promise.all(items.map(fn))` semantics).
+ */
+async function mapWithConcurrency<T, R>(
+  items: ReadonlyArray<T>,
+  limit: number,
+  fn: (item: T, idx: number) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const workerCount = Math.min(Math.max(1, limit), items.length);
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i], i);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 interface GroupChatMessagesIndexItem {
   /** Stable message id (from Nostr event id). Always present for persisted messages. */
   readonly id: string;
@@ -354,20 +396,26 @@ export class GroupChatModule {
       let parsed: GroupData[] | null = null;
       if (ref) {
         if (!this.deps!.cidRefStore) {
-          const { ProfileError } = await import('../../profile/errors.js');
-          throw new ProfileError(
-            'CID_REF_UNREADABLE',
-            `GroupChatModule.load: groups key contains a CID ref (cid=${ref.cid}) ` +
-              `but no cidRefStore was injected. Check module init.`,
+          // Degrade rather than brick load. Symmetric to the catch below: a
+          // missing cidRefStore is treated like a fetch failure — start with
+          // an empty groups set; relay re-delivery repopulates. The previous
+          // fatal throw bricked the whole wallet load when this happened,
+          // taking down every other module's load with it (issue:
+          // page-freeze 2026-05-29).
+          logger.warn(
+            'GroupChat',
+            `[CID_REF_DEGRADE] groups key contains a CID ref (cid=${ref.cid}) ` +
+              `but no cidRefStore was injected; starting fresh.`,
           );
-        }
-        try {
-          parsed = await this.deps!.cidRefStore.fetchJson<GroupData[]>(
-            ref,
-            { requireEncrypted: true },
-          );
-        } catch (err) {
-          logger.error('GroupChat', '[GROUP_CHAT_GROUPS] CID-ref fetch failed', err);
+        } else {
+          try {
+            parsed = await this.deps!.cidRefStore.fetchJson<GroupData[]>(
+              ref,
+              { requireEncrypted: true },
+            );
+          } catch (err) {
+            logger.error('GroupChat', '[GROUP_CHAT_GROUPS] CID-ref fetch failed', err);
+          }
         }
       } else {
         try {
@@ -425,12 +473,14 @@ export class GroupChatModule {
       let assembledMessages: GroupMessageData[] | null = null;
       if (ref) {
         if (!this.deps!.cidRefStore) {
-          const { ProfileError } = await import('../../profile/errors.js');
-          throw new ProfileError(
-            'CID_REF_UNREADABLE',
-            `GroupChatModule.load: messages:${groupId} contains a CID ref ` +
-              `(cid=${ref.cid}) but no cidRefStore was injected.`,
+          // Degrade: skip this group's messages; relay re-delivery repopulates.
+          // See [CID_REF_DEGRADE] note above the groups-key site.
+          logger.warn(
+            'GroupChat',
+            `[CID_REF_DEGRADE] messages:${groupId} contains a CID ref ` +
+              `(cid=${ref.cid}) but no cidRefStore was injected; skipping.`,
           );
+          continue;
         }
         let fetched: unknown;
         try {
@@ -464,7 +514,14 @@ export class GroupChatModule {
             continue;
           }
           const cidRefStoreRef = this.deps!.cidRefStore;
-          const fetches = fetched.items.map(async (item) => {
+          // Bound concurrency to LOAD_FETCH_CONCURRENCY (default 4) so a
+          // group with thousands of messages doesn't spawn thousands of
+          // parallel HTTP requests against a single gateway. The previous
+          // unbounded Promise.all(items.map(...)) was the primary driver of
+          // the 404-storm freeze observed 2026-05-29 — every miss pinned a
+          // socket for the 30 s fetch timeout. See LOAD_FETCH_CONCURRENCY
+          // doc-comment for the rationale on the limit.
+          const results = await mapWithConcurrency(fetched.items, LOAD_FETCH_CONCURRENCY, async (item) => {
             if (!isValidIndexItem(item)) {
               logger.error(
                 'GroupChat',
@@ -508,7 +565,6 @@ export class GroupChatModule {
               return null;
             }
           });
-          const results = await Promise.all(fetches);
           assembledMessages = results.filter((m): m is GroupMessageData => m !== null);
           // Seed the per-group index memo so an immediate re-persist
           // doesn't re-pin the whole index for unchanged state.
@@ -636,12 +692,14 @@ export class GroupChatModule {
       let parsed: unknown = null;
       if (ref) {
         if (!this.deps!.cidRefStore) {
-          const { ProfileError } = await import('../../profile/errors.js');
-          throw new ProfileError(
-            'CID_REF_UNREADABLE',
-            `GroupChatModule.load: members:${groupId} contains a CID ref ` +
-              `(cid=${ref.cid}) but no cidRefStore was injected.`,
+          // Degrade: skip this group's members; relay re-delivery repopulates.
+          // See [CID_REF_DEGRADE] note above the groups-key site.
+          logger.warn(
+            'GroupChat',
+            `[CID_REF_DEGRADE] members:${groupId} contains a CID ref ` +
+              `(cid=${ref.cid}) but no cidRefStore was injected; skipping.`,
           );
+          continue;
         }
         try {
           parsed = await this.deps!.cidRefStore.fetchJson(ref, { requireEncrypted: true });
@@ -725,28 +783,32 @@ export class GroupChatModule {
       let parsed: string[] | null = null;
       if (ref) {
         if (!this.deps!.cidRefStore) {
-          const { ProfileError } = await import('../../profile/errors.js');
-          throw new ProfileError(
-            'CID_REF_UNREADABLE',
-            `GroupChatModule.load: processedEvents key contains a CID ref ` +
-              `(cid=${ref.cid}) but no cidRefStore was injected.`,
-          );
-        }
-        try {
-          parsed = await this.deps!.cidRefStore.fetchJson<string[]>(
-            ref,
-            { requireEncrypted: true },
-          );
-        } catch (err) {
-          // Best-effort: continue with empty set rather than poisoning load.
-          // The ledger is recoverable — relay re-delivery will re-populate
-          // on the next sync (worst case: a few duplicate event-handler
-          // dispatches; the handlers themselves are idempotent).
-          logger.error(
+          // Degrade: start with an empty processed-events set; relay
+          // re-delivery repopulates via idempotent event handlers. See
+          // [CID_REF_DEGRADE] note above the groups-key site.
+          logger.warn(
             'GroupChat',
-            '[GROUP_CHAT_PROCESSED_EVENTS] CID-ref fetch failed; starting fresh',
-            err,
+            `[CID_REF_DEGRADE] processedEvents key contains a CID ref ` +
+              `(cid=${ref.cid}) but no cidRefStore was injected; ` +
+              `starting fresh.`,
           );
+        } else {
+          try {
+            parsed = await this.deps!.cidRefStore.fetchJson<string[]>(
+              ref,
+              { requireEncrypted: true },
+            );
+          } catch (err) {
+            // Best-effort: continue with empty set rather than poisoning load.
+            // The ledger is recoverable — relay re-delivery will re-populate
+            // on the next sync (worst case: a few duplicate event-handler
+            // dispatches; the handlers themselves are idempotent).
+            logger.error(
+              'GroupChat',
+              '[GROUP_CHAT_PROCESSED_EVENTS] CID-ref fetch failed; starting fresh',
+              err,
+            );
+          }
         }
       } else {
         try {
