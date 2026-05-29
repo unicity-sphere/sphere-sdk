@@ -4,6 +4,7 @@
  */
 
 import type { BaseProvider, FullIdentity, ComposingIndicator } from '../types';
+import type { UxfTransferPayload } from '../types/uxf-transfer';
 
 // =============================================================================
 // Transport Provider Interface
@@ -292,6 +293,47 @@ export interface TransportProvider extends BaseProvider {
   fetchPendingEvents?(): Promise<void>;
 
   /**
+   * Issue #166 P2 #3 — Re-query the underlying transport (e.g. Nostr
+   * relay set) to verify that a previously published event identified
+   * by `eventId` is still persisted / available for delivery.
+   *
+   * Used by the {@link NostrPersistenceVerifier} worker to detect
+   * relay retention drops AFTER the immediate post-publish
+   * verification window has passed (the `publishWithVerification` path
+   * in NostrTransportProvider catches losses within the first second;
+   * this method catches longer-term eviction or relay-segregation
+   * failures minutes to hours later).
+   *
+   * Return semantics:
+   *  - `'retained'` — the event is present on at least one queried
+   *    relay. Worker marks the SENT entry as verified and skips it on
+   *    subsequent cycles.
+   *  - `'missing'`  — the event is NOT present on any queried relay
+   *    despite a successful past publish. Worker emits
+   *    `transfer:retention-warning`. The bundle is still
+   *    content-addressed via `bundleCid` so the recipient's replay-LRU
+   *    deduplicates on re-publish, but THIS PR does not attempt
+   *    re-publication — that is gated to a follow-up wave because the
+   *    safety surface (preserved bundle data, recipient pubkey, key
+   *    rotation interaction) is too large to ship as a backfill.
+   *  - `'unverifiable'` — the query itself failed (relay timeout,
+   *    connection lost, malformed response). Worker leaves the entry
+   *    untouched and retries next cycle. NOT treated as missing
+   *    because a transient query failure must not produce false
+   *    `retention-warning` events.
+   *
+   * Implementations SHOULD make this method best-effort and never
+   * throw — convert exceptions to `'unverifiable'` internally.
+   *
+   * @param eventId  The relay-assigned event id returned by
+   *                 {@link sendTokenTransfer}.
+   * @returns        See above.
+   */
+  verifyTokenTransferRetained?(
+    eventId: string,
+  ): Promise<'retained' | 'missing' | 'unverifiable'>;
+
+  /**
    * Register a handler to be called when the chat subscription receives EOSE
    * (End Of Stored Events), indicating that historical DMs have been delivered.
    * The handler fires at most once per subscription lifecycle.
@@ -364,20 +406,30 @@ export type MessageHandler = (message: IncomingMessage) => void;
 // Token Transfer Types
 // =============================================================================
 
-export interface TokenTransferPayload {
-  /** Serialized token data */
-  token: string;
-  /** Inclusion proof */
-  proof: unknown;
-  /** Optional memo */
-  memo?: string;
-  /** Sender info */
-  sender?: {
-    /** Transport-specific pubkey */
-    transportPubkey: string;
-    nametag?: string;
-  };
-}
+/**
+ * Wire payload for the Nostr `TOKEN_TRANSFER` event (kind 31113).
+ *
+ * Shape-agnostic at the transport layer — this is a tagged union of:
+ *
+ *  - {@link UxfTransferPayloadCar} (`kind: 'uxf-car'`) — inline CAR via base64
+ *  - {@link UxfTransferPayloadCid} (`kind: 'uxf-cid'`) — CID-by-reference
+ *  - {@link LegacyTokenTransferPayload} — one of four pre-UXF shapes
+ *    (Sphere TXF `{sourceToken, transferTx}`, V6 `COMBINED_TRANSFER`,
+ *    V5/V4 `INSTANT_SPLIT`, SDK `{token, proof}`).
+ *
+ * The transport layer SERIALIZES whichever shape it is handed (UXF via
+ * the canonical encoder from {@link "../uxf/transfer-payload"}, legacy via
+ * pass-through `JSON.stringify`), and DELIVERS whichever shape arrives over
+ * the wire to {@link TokenTransferHandler}. Shape discrimination is the
+ * receiver/handler's responsibility — see `PaymentsModule` (T.7.A).
+ *
+ * Re-exported from `types/uxf-transfer` (T.1.A) so all transport callers
+ * share one source of truth for the union.
+ *
+ * @see UxfTransferPayload
+ * @see LegacyTokenTransferPayload
+ */
+export type TokenTransferPayload = UxfTransferPayload;
 
 export interface IncomingTokenTransfer {
   id: string;
@@ -387,7 +439,26 @@ export interface IncomingTokenTransfer {
   timestamp: number;
 }
 
-export type TokenTransferHandler = (transfer: IncomingTokenTransfer) => void | Promise<void>;
+/**
+ * Token-transfer handler return contract (at-least-once invariant):
+ *  - `true` (or `void`/`undefined` — legacy backward-compat): the inbound
+ *    event has been durably processed (token persisted to all configured
+ *    TokenStorageProviders, including IPFS pin for the Profile provider).
+ *    The transport MAY advance `lastEventTs` past this event.
+ *  - `false`: the event was received but the handler could not durably
+ *    persist its tokens (flush failure, IPFS unreachable, monotonicity
+ *    violation, etc.). The transport MUST NOT advance `lastEventTs` so
+ *    the event is re-replayed on the next reconnect. Re-processing is
+ *    idempotent (addToken stateHash dedup; processedCombinedTransferIds
+ *    dedup; etc.).
+ *
+ * Returning `void`/`undefined` preserves the pre-invariant contract for
+ * external handlers — they default to "durable" so existing code does
+ * not regress to "never ack".
+ */
+export type TokenTransferHandler = (
+  transfer: IncomingTokenTransfer,
+) => void | boolean | Promise<void | boolean>;
 
 // =============================================================================
 // Payment Request Types
@@ -535,7 +606,57 @@ export interface PeerInfo {
   proxyAddress?: string;
   /** Event timestamp */
   timestamp: number;
+
+  // ───────────────────────────────────────────────────────────────────────
+  // T.8.B — Capability hints (informational, per UXF §10.4).
+  //
+  // Fields are OPTIONAL on the type but a publishing peer SHOULD set both
+  // when its identity binding event is constructed; absence at the wire
+  // level encodes "older peer with unknown capability". Receivers MUST
+  // NOT auto-coerce or auto-strip based on these hints — they are
+  // ADVISORY ONLY. The actual interop guarantee comes from the receiver's
+  // T.2.B `UNKNOWN_ASSET_KIND` reject rule and the bundle wire-format
+  // negotiation in §3.3.
+  // ───────────────────────────────────────────────────────────────────────
+
+  /**
+   * Wire protocols the peer advertises support for. Canonical v1.0 set is
+   * `['uxf-car', 'uxf-cid', 'txf']`. Empty/absent means "unknown".
+   */
+  wireProtocols?: ReadonlyArray<string>;
+  /**
+   * Asset kinds the peer advertises support for. Canonical v1.0 set is
+   * `['coin', 'nft']`. Per §10.4 / W20: ABSENT ⇒ assume `['coin']`
+   * (forward-compatibility default for older peers that pre-date NFTs).
+   */
+  assetKinds?: ReadonlyArray<string>;
 }
+
+// =============================================================================
+// T.8.B — Canonical capability values (UXF §10.4)
+// =============================================================================
+
+/**
+ * Wire protocols supported by this SDK build. Published in identity binding
+ * events so peers can detect mismatches before sending.
+ */
+export const SUPPORTED_WIRE_PROTOCOLS: ReadonlyArray<string> = [
+  'uxf-car',
+  'uxf-cid',
+  'txf',
+];
+
+/**
+ * Asset kinds supported by this SDK build. Published in identity binding
+ * events so peers can detect mismatches before sending.
+ */
+export const SUPPORTED_ASSET_KINDS: ReadonlyArray<string> = ['coin', 'nft'];
+
+/**
+ * W20 forward-compat default: when an identity binding event is silent
+ * about `assetKinds`, treat the peer as a v1.0 coin-only wallet.
+ */
+export const DEFAULT_ASSET_KINDS_WHEN_ABSENT: ReadonlyArray<string> = ['coin'];
 
 /** @deprecated Use PeerInfo instead */
 export type NametagInfo = PeerInfo;

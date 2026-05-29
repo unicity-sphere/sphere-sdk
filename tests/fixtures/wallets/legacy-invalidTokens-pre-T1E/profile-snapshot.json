@@ -1,0 +1,11 @@
+{
+  "address_id": "DIRECT_aabbcc_ddeeff",
+  "encryption": "none",
+  "description": "Legacy pre-T.1.E wallet snapshot — single-blob ${addr}.invalidTokens with two entries. Used to verify the one-way additive migration to ${addr}.invalid.${tokenId}.legacy-${tokenId} per-entry-key form.",
+  "entries": [
+    {
+      "key": "DIRECT_aabbcc_ddeeff.invalidTokens",
+      "value": "[{\"tokenId\":\"tokA\",\"reason\":\"corrupt\",\"detectedAt\":1000},{\"tokenId\":\"tokB\",\"reason\":\"unknown\",\"detectedAt\":2000}]"
+    }
+  ]
+}

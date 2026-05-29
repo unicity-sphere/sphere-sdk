@@ -1,0 +1,49 @@
+{
+  "_provenance": {
+    "issue": "https://github.com/unicity-sphere/sphere-sdk/issues/295",
+    "description": "Representative InclusionProof.toJSON() fixture exercising long step paths (originally surfaced as the >256-bit SMT path failure mode reported in issue #295). After issue #295 rewrite #2, UXF treats the SmtPath as an opaque STS-canonical CBOR blob and imposes no bit-length constraint — this fixture now verifies that UXF forwards the bytes verbatim regardless of step-path bit-width. Other fields (root, authenticator, unicityCertificate) are synthetic but well-formed. See tests/unit/uxf/hash.real-inclusion-proof.test.ts.",
+    "fields_under_test": [
+      "merkleTreePath.steps[].path"
+    ],
+    "step_path_bit_lengths": {
+      "0": "6 bits — small-value smoke test",
+      "1": "256 bits (2^256 - 1) — value at the historical UXF-imposed limit (no longer enforced — STS owns the bound)",
+      "2": "259 bits — exact decimal extracted from the user-reported sphere.telco migration failure",
+      "3": "273 bits — BitString(34-byte imprint) boundary case",
+      "4": "280 bits — beyond STS's current bit-length range; verifies UXF imposes no upper bound (STS may, or may not, accept it independently)"
+    }
+  },
+  "merkleTreePath": {
+    "root": "0000aabbccddeeff00112233445566778899aabbccddeeff0011223344556677",
+    "steps": [
+      {
+        "path": "42",
+        "data": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+      },
+      {
+        "path": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+        "data": "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff"
+      },
+      {
+        "path": "463173912653332971197029146511962916219743101902252076413000309295050477951098",
+        "data": "22334455667788990011aabbccddeeff22334455667788990011aabbccddeeff"
+      },
+      {
+        "path": "7588550360256754183279148073529370729071902011038175081847196924933548864923487727",
+        "data": "33445566778899001122aabbccddeeff33445566778899001122aabbccddeeff"
+      },
+      {
+        "path": "1942668892225729070919461906823518906642406839052139521251812409738904285205208485830",
+        "data": null
+      }
+    ]
+  },
+  "authenticator": {
+    "algorithm": "secp256k1",
+    "publicKey": "02aabbccddeeff00112233445566778899aabbccddeeff001122334455667788ee",
+    "signature": "ccddeeff00112233445566778899aabbccddeeff00112233445566778899aabb00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff01",
+    "stateHash": "0000aabbccddeeff00112233445566778899aabbccddeeff0011223344556677"
+  },
+  "transactionHash": "0000aabbccddeeff00112233445566778899aabbccddeeff0011223344556677",
+  "unicityCertificate": "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0"
+}

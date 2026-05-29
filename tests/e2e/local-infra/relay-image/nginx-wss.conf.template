@@ -1,0 +1,50 @@
+# nginx config — terminates WSS on :443 (cert from ssl-manager / certbot)
+# and proxies to nostr-rs-relay on :8080.
+#
+# HAProxy in front of us is in mode tcp (SNI passthrough), so we MUST
+# present the cert ourselves. Cert paths are conventional /etc/letsencrypt
+# locations populated by ssl-setup.
+
+upstream nostr_relay_backend {
+    server 127.0.0.1:${RELAY_PORT};
+    keepalive 16;
+}
+
+# Map for WebSocket upgrade header passthrough.
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+
+    server_name ${SSL_DOMAIN};
+
+    ssl_certificate     /etc/letsencrypt/live/${SSL_DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${SSL_DOMAIN}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    # NIP-11 info doc + WebSocket upgrade are served from the same path.
+    location / {
+        proxy_pass http://nostr_relay_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+    }
+}
+
+# Plain :8080 listener is provided directly by nostr-rs-relay; nginx
+# does NOT bind it. ssl-manager's ssl-http-proxy occupies :80 for
+# acme-challenge, then redirects to :443 — no conflict.

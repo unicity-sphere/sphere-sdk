@@ -1,0 +1,63 @@
+# =============================================================================
+# Local infrastructure for sphere-sdk e2e tests.
+#
+# Boots a local Nostr relay (and optionally a faucet agent) so the e2e
+# suite can run against a deterministic, in-process stack instead of
+# the public testnet relay+faucet — useful when:
+#   - the testnet relay's write path is broken / silently dropping
+#     publishes (the 2026-05-04 outage that motivated this harness);
+#   - CI runs need reproducibility (no shared rate limits, no
+#     nametag collisions across concurrent jobs);
+#   - we are debugging the SDK's interaction with Nostr and want a
+#     SQLite-backed relay we can `docker exec sqlite3 ./events.db`.
+#
+# Aggregator (L3) and IPFS gateway are NOT replaced — the public
+# Unicity testnet aggregator/IPFS are reliable and the sphere-sdk has
+# no aggregator stub that would round-trip real inclusion proofs.
+# E2E tests that need the aggregator continue to talk to:
+#   wss://goggregator-test.unicity.network
+#   https://ipfs.unicity.network
+#
+# Usage from the global-setup:
+#   docker compose -f tests/e2e/local-infra/docker-compose.yml up -d
+#   …run tests with E2E_LOCAL_RELAY_URL=ws://127.0.0.1:7777 …
+#   docker compose -f tests/e2e/local-infra/docker-compose.yml down -v
+#
+# Versions are pinned. Update via the parent global-setup so any change
+# here is paired with a documented test-suite re-validation.
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # Local Nostr relay — ghcr.io/unicitynetwork/unicity-tokens-relay
+  #
+  # The Unicity org publishes a built nostr-rs-relay image. We pin to a
+  # specific SHA so unrelated relay updates don't silently change test
+  # behaviour. Bump this when validating against a newer relay release.
+  # ---------------------------------------------------------------------------
+  relay:
+    image: ghcr.io/unicitynetwork/unicity-tokens-relay:sha-1e1b544
+    container_name: uxf-e2e-relay
+    restart: unless-stopped
+    ports:
+      # Loopback only — never expose the test relay to the network.
+      # 7777 is arbitrary but unlikely to collide with developer tooling.
+      - "127.0.0.1:7777:8080"
+    volumes:
+      # Persist the SQLite event log between container restarts so we
+      # can post-mortem a failing test by `docker exec sqlite3`-ing
+      # into the volume. `down -v` wipes it; `down` (without -v)
+      # keeps it for inspection.
+      - relay-data:/usr/src/app/db
+    healthcheck:
+      # NIP-11 info doc on HTTP returns the relay metadata; if it
+      # responds 200 we know the WebSocket listener is also up
+      # (same handler).
+      test: ["CMD-SHELL", "wget -q -O - --header='Accept: application/nostr+json' http://127.0.0.1:8080 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+volumes:
+  relay-data:

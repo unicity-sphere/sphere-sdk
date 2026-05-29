@@ -56,7 +56,11 @@ export class FileTokenStorageProvider implements TokenStorageProvider<TxfStorage
     return true;
   }
 
-  async shutdown(): Promise<void> {
+  // Issue #239 — accept ShutdownOptions for interface conformance.
+  // FileTokenStorageProvider has no remote-durability boundary (every
+  // save() returns after the file is fsync'd locally) so `force` /
+  // `verificationDeadlineMs` / `reason` are intentionally ignored.
+  async shutdown(_options?: import('../../../storage/storage-provider.js').ShutdownOptions): Promise<void> {
     this.status = 'disconnected';
   }
 
@@ -86,8 +90,20 @@ export class FileTokenStorageProvider implements TokenStorageProvider<TxfStorage
       },
     };
 
+    // Steelman⁴³ warning: per-file size cap (16 MiB) and total-files
+    // cap (100K). `migrate-to-profile --legacy-tokens <user-supplied>`
+    // could otherwise be DoS'd by a hostile dir containing a 10GB
+    // _token.json or 10M empty .json files exhausting FDs/heap.
+    const FILE_TOKEN_MAX_BYTES_PER_FILE = 16 * 1024 * 1024;
+    const FILE_TOKEN_MAX_FILES = 100_000;
     try {
-      const files = fs.readdirSync(this.tokensDir).filter(f =>
+      const allFiles = fs.readdirSync(this.tokensDir);
+      if (allFiles.length > FILE_TOKEN_MAX_FILES) {
+        throw new Error(
+          `FileTokenStorage refuses dirs with > ${FILE_TOKEN_MAX_FILES} entries (got ${allFiles.length}).`,
+        );
+      }
+      const files = allFiles.filter(f =>
         f.endsWith('.json') &&
         f !== META_FILE &&
         f !== TOMBSTONES_FILE &&
@@ -105,7 +121,15 @@ export class FileTokenStorageProvider implements TokenStorageProvider<TxfStorage
             continue;
           }
 
-          const content = fs.readFileSync(path.join(this.tokensDir, file), 'utf-8');
+          const fullPath = path.join(this.tokensDir, file);
+          // Pre-stat to enforce size cap before reading.
+          const st = fs.statSync(fullPath);
+          if (st.size > FILE_TOKEN_MAX_BYTES_PER_FILE) {
+            throw new Error(
+              `FileTokenStorage refuses ${file} (${st.size} bytes > ${FILE_TOKEN_MAX_BYTES_PER_FILE} cap).`,
+            );
+          }
+          const content = fs.readFileSync(fullPath, 'utf-8');
           const token = JSON.parse(content);
 
           if (basename.startsWith('archived-')) {

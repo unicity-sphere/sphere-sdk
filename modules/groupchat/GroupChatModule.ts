@@ -14,6 +14,7 @@ import {
 
 import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
+import { hexToBytes as strictHexToBytes } from '../../core/hex';
 
 import type {
   FullIdentity,
@@ -22,6 +23,167 @@ import type {
 } from '../../types';
 import type { StorageProvider } from '../../storage';
 import { STORAGE_KEYS_GLOBAL, STORAGE_KEYS_ADDRESS, NIP29_KINDS } from '../../constants';
+import { CidRefStore, type CidRef } from '../../profile/cid-ref-store';
+
+/**
+ * Prefixes for per-groupId storage keys (PROFILE-CID-REFERENCES.md §8.5).
+ *
+ * Before this refactor, `group_chat_messages` and `group_chat_members` each
+ * stored ALL groups' data in a single global blob. The spec calls for
+ * per-groupId partitioning — each group gets its own KV key so a group's
+ * state can be read/written independently, and future CID-ref migrations
+ * can pin per-group rather than per-wallet-blob.
+ *
+ * `group_chat_groups` stays single-keyed — the spec allows this because it
+ * is bounded by group count (typically <100).
+ *
+ * `group_chat_processed_events` stays single-keyed — it is a dedup set not
+ * addressed by the spec.
+ */
+const GROUP_CHAT_MESSAGES_PREFIX = 'group_chat_messages:';
+const GROUP_CHAT_MEMBERS_PREFIX = 'group_chat_members:';
+
+/**
+ * Pattern B index schema (PROFILE-CID-REFERENCES.md §8.4 / §8.5).
+ *
+ * The KV value at `group_chat_messages:<groupId>` carries a CidRef that
+ * points to an index blob of this shape. Each `items[i].cid` is itself
+ * a plaintext CidRef over the corresponding message's JSON. This lets
+ * identical messages (same content across wallets) share one IPFS CID
+ * regardless of their position in any wallet's array — the dedup unit
+ * drops from "whole message list" (Pattern A) to "single message"
+ * (Pattern B).
+ */
+const GROUP_CHAT_MESSAGES_INDEX_V = 1 as const;
+
+/**
+ * Per-item size cap for the Pattern B message fetch path (steelman
+ * hardening — closes a bandwidth-DoS attack where a hostile index
+ * declares oversized items pointing at attacker-controlled IPFS
+ * content). Legitimate NIP-29 chat messages are text + light metadata;
+ * 64 KiB is a generous bound for structured content + attachment refs.
+ * Items exceeding this are skipped on load with a logger.error.
+ */
+const MAX_GROUP_MESSAGE_SIZE = 64 * 1024;
+
+/**
+ * Upper bound on items per index blob. A hostile index at the
+ * cidRefStore.maxFetchBytes limit (50 MiB default) could otherwise
+ * declare ~625k items and trigger that many parallel IPFS fetches on
+ * load, exhausting file descriptors / memory / socket pool. The
+ * spec's Phase-2 archive mechanism triggers at 5000 entries (§8.4);
+ * 10k is double that — any legitimate group is well under this cap.
+ */
+const MAX_INDEX_ITEMS = 10_000;
+
+/**
+ * Concurrency cap for per-message CID fetches on load (Pattern B index).
+ *
+ * Before this cap, `fetched.items.map(async i => fetchJson(i))` + Promise.all
+ * spawned up to MAX_INDEX_ITEMS (10k) parallel HTTP requests per group, with
+ * additional fan-out across groups. With a single slow/sick gateway (e.g.
+ * unicity-ipfs1.dyndns.org returning 404/502), that fan-out becomes a
+ * thundering-herd: each request pins one socket for the 30s fetch timeout,
+ * and the cumulative wall-time grows quadratically.
+ *
+ * 4 keeps the existing "parallel-not-serial" speed-up (a small batch still
+ * overlaps network + decode latency) while leaving headroom for the rest of
+ * the page (transport, payments, profile-storage) to make progress on shared
+ * gateways. The page-freeze symptom (issue: 2026-05-29) was driven primarily
+ * by this unbounded fan-out colliding with a degraded testnet gateway.
+ */
+const LOAD_FETCH_CONCURRENCY = 4;
+
+/**
+ * Run an async mapper across `items` with a bounded number of concurrent
+ * workers. Preserves order in the output.
+ *
+ * Error semantics: each worker pulls items off a shared cursor and calls
+ * `fn`. The expectation at every call site in this file is that `fn`
+ * handles per-item errors and returns a sentinel (typically `null`)
+ * rather than throwing. If `fn` does throw, the thrower's worker sets
+ * `aborted` so sibling workers stop pulling NEW items from the cursor
+ * — in-flight `fn` calls already dispatched still settle. The aggregate
+ * promise then rejects with the first thrown error via `Promise.all`.
+ *
+ * This is STRICTER than `Promise.all(items.map(fn))`, which keeps
+ * dispatching new work after the first rejection until it hits the end
+ * of the input — that looser semantic is the exact fan-out leak this
+ * helper exists to avoid (page-freeze 2026-05-29, where an unbounded
+ * `Promise.all(items.map(fetchJson))` on a sick gateway issued 30 s
+ * sockets per item even after the first 404).
+ */
+async function mapWithConcurrency<T, R>(
+  items: ReadonlyArray<T>,
+  limit: number,
+  fn: (item: T, idx: number) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  let aborted = false;
+  const workerCount = Math.min(Math.max(1, limit), items.length);
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (!aborted) {
+      const i = next++;
+      if (i >= items.length) return;
+      try {
+        results[i] = await fn(items[i], i);
+      } catch (err) {
+        aborted = true;
+        throw err;
+      }
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+interface GroupChatMessagesIndexItem {
+  /** Stable message id (from Nostr event id). Always present for persisted messages. */
+  readonly id: string;
+  /** Message timestamp (ms since epoch) — lets readers sort without fetching bodies. */
+  readonly ts: number;
+  /** Content-addressed CID of the individual message pin. */
+  readonly cid: string;
+  /** Size in bytes of the pinned message content. */
+  readonly size: number;
+}
+
+interface GroupChatMessagesIndex {
+  readonly v: typeof GROUP_CHAT_MESSAGES_INDEX_V;
+  readonly items: readonly GroupChatMessagesIndexItem[];
+}
+
+/** Pattern B index shape discriminator. Distinguishes from Pattern A
+ *  (plain message array) during the dual-read migration window.
+ *
+ *  Structural check only at this layer — per-item field validation
+ *  happens at load time (`isValidIndexItem`) so malformed items can
+ *  be skipped individually rather than aborting the whole group. */
+function isMessagesIndex(value: unknown): value is GroupChatMessagesIndex {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    !Array.isArray(value) &&
+    (value as GroupChatMessagesIndex).v === GROUP_CHAT_MESSAGES_INDEX_V &&
+    Array.isArray((value as GroupChatMessagesIndex).items)
+  );
+}
+
+/** Per-item validation for index items loaded from a potentially-hostile
+ *  source (attacker-controlled LWW replication could plant malformed
+ *  items — we fail-closed per-item rather than abort the whole group). */
+function isValidIndexItem(v: unknown): v is GroupChatMessagesIndexItem {
+  if (v === null || typeof v !== 'object') return false;
+  const item = v as Partial<GroupChatMessagesIndexItem>;
+  return (
+    typeof item.id === 'string' && item.id.length > 0 &&
+    typeof item.ts === 'number' && Number.isFinite(item.ts) &&
+    typeof item.cid === 'string' && item.cid.length > 0 &&
+    typeof item.size === 'number' && Number.isFinite(item.size) &&
+    item.size >= 0
+  );
+}
 
 import type {
   GroupData,
@@ -43,6 +205,20 @@ export interface GroupChatModuleDependencies {
   identity: FullIdentity;
   storage: StorageProvider;
   emitEvent: <T extends SphereEventType>(type: T, data: SphereEventMap[T]) => void;
+  /**
+   * Optional CID-reference store for OpLog fat-data migration
+   * (PROFILE-CID-REFERENCES.md §8.5). When present, group state is
+   * pinned to IPFS with a split encryption policy:
+   *   - `groupChatGroups` → encrypted (per-wallet membership view)
+   *   - `groupChatMembers:<groupId>` → encrypted (per-wallet view of
+   *     the group, small)
+   *   - `groupChatMessages:<groupId>` → PLAINTEXT (NIP-29 messages are
+   *     relay-plaintext anyway; plaintext pins enable full IPFS
+   *     content dedup across member wallets — a 100-member group
+   *     stores each message ONCE globally instead of 100×)
+   * When absent, falls back to legacy inline JSON storage.
+   */
+  cidRefStore?: CidRefStore;
 }
 
 // =============================================================================
@@ -98,9 +274,81 @@ export class GroupChatModule {
   private processedEventIds: Set<string> = new Set();
   private pendingLeaves: Set<string> = new Set();
 
+  /**
+   * Orphan-cleanup tracking for per-groupId storage keys. Records which
+   * groupIds currently have a per-group messages/members key in storage
+   * so that, on persist, we can delete keys for groups the user has left
+   * (otherwise per-group blobs would leak indefinitely).
+   *
+   * Populated on `load()` (from observed keys) and on each successful
+   * persist (with the just-written groupIds).
+   */
+  private _lastWrittenMessageGroupIds: Set<string> = new Set();
+  private _lastWrittenMemberGroupIds: Set<string> = new Set();
+
+  /**
+   * Memoized (plaintext JSON → CidRef) pairs for each persist target.
+   * AES-GCM uses random IVs so re-pinning identical plaintext encrypted
+   * produces a different CID; for plaintext pins the CID is deterministic,
+   * but we still avoid the round-trip cost on unchanged state. Both paths
+   * benefit from memoization.
+   *
+   * Groups memo: single ref (one key for the whole groups list).
+   * Members memo: keyed by groupId (one ref per group).
+   * Messages memo: keyed by groupId → per-group-INDEX ref (Pattern B —
+   * the stored ref points at an index blob, NOT the message array
+   * directly). The per-message CIDs are cached separately in
+   * `_pinnedMessageCids` so identical messages don't re-pin across
+   * persists.
+   */
+  private _lastPinnedGroupsJson: string | null = null;
+  private _lastPinnedGroupsRef: CidRef | null = null;
+  private _lastPinnedMembersByGroup = new Map<string, { json: string; ref: CidRef }>();
+  private _lastPinnedMessagesByGroup = new Map<string, { json: string; ref: CidRef }>();
+
+  /**
+   * Issue #285 — `processedEvents` (NIP-29 event ID dedup ledger) memo.
+   * Grows unbounded with relay activity (observed 263 KB after routine
+   * use) and was the second-worst soft-warn offender behind
+   * `groupChatMembers`. Pattern A encrypted pin (per-wallet view —
+   * dedup across wallets has no value).
+   */
+  private _lastPinnedProcessedEventsJson: string | null = null;
+  private _lastPinnedProcessedEventsRef: CidRef | null = null;
+
+  /**
+   * Pattern B per-message CID cache — maps a message's serialized JSON
+   * to the CID it was pinned under. Lets repeated persists for the same
+   * group reuse CIDs for unchanged messages (saves ~N pin round-trips
+   * per re-persist when only one message was added).
+   *
+   * Keyed by `JSON.stringify(message)` so any semantic change (content,
+   * id, metadata, anything) invalidates the memo automatically. Cache
+   * entries evict when the containing group is removed from
+   * `_lastPinnedMessagesByGroup` (group-leave → whole group's message
+   * memos drop).
+   */
+  private _pinnedMessageCids = new Map<string, { cid: string; size: number }>();
+
   // Persistence debounce
   private persistTimer: ReturnType<typeof setTimeout> | null = null;
-  private persistPromise: Promise<void> | null = null;
+  /**
+   * Single-flight chain serializing all persist work (debounced +
+   * explicit-flush + destroy-path). Every `doPersistAll()` invocation
+   * chains onto the previous tail via `.then()`, so two writers can
+   * never race — critical under Pattern B where `persistMessages` does
+   * N+1 awaits (per-message pin + index pin), leaving a wide window
+   * for a fresh message to arrive mid-persist and trigger a second
+   * persist that would otherwise race the in-flight one's storage.set.
+   *
+   * Prior failures are isolated via `.catch()` so one failed persist
+   * does not block subsequent persists. Mirrors
+   * PaymentsModule._saveChain and CommunicationsModule._saveChain.
+   *
+   * The tail is also what `destroy()` and the explicit `persistAll()`
+   * await to observe "all queued persists complete."
+   */
+  private persistPromise: Promise<void> = Promise.resolve();
 
   // Relay admin cache
   private relayAdminPubkeys: Set<string> | null = null;
@@ -132,7 +380,7 @@ export class GroupChatModule {
     this.deps = deps;
 
     // Create key manager from identity
-    const secretKey = Buffer.from(deps.identity.privateKey, 'hex');
+    const secretKey = strictHexToBytes(deps.identity.privateKey);
     this.keyManager = NostrKeyManager.fromPrivateKey(secretKey);
   }
 
@@ -146,62 +394,456 @@ export class GroupChatModule {
     this.messages.clear();
     this.members.clear();
     this.processedEventIds.clear();
+    // Reset orphan-cleanup tracking — the load() below repopulates it with
+    // whatever keys actually exist in storage for this address.
+    this._lastWrittenMessageGroupIds.clear();
+    this._lastWrittenMemberGroupIds.clear();
+    // Reset CID-ref memoization — a load-from-cold-storage doesn't know
+    // which CIDs were last pinned by the prior module lifecycle.
+    this._lastPinnedGroupsJson = null;
+    this._lastPinnedGroupsRef = null;
+    this._lastPinnedMembersByGroup.clear();
+    this._lastPinnedMessagesByGroup.clear();
+    this._pinnedMessageCids.clear();
+    this._lastPinnedProcessedEventsJson = null;
+    this._lastPinnedProcessedEventsRef = null;
 
-    // Load groups
+    // Load groups — dual-read: CID ref envelope → fetch from IPFS
+    // (encrypted, requireEncrypted strict); otherwise legacy inline JSON.
     const groupsJson = await storage.get(STORAGE_KEYS_ADDRESS.GROUP_CHAT_GROUPS);
     if (groupsJson) {
-      try {
-        const parsed: GroupData[] = JSON.parse(groupsJson);
+      const ref = CidRefStore.tryParseRef(groupsJson);
+      let parsed: GroupData[] | null = null;
+      if (ref) {
+        if (!this.deps!.cidRefStore) {
+          // Degrade rather than brick load. Symmetric to the catch below: a
+          // missing cidRefStore is treated like a fetch failure — start with
+          // an empty groups set; relay re-delivery repopulates. The previous
+          // fatal throw bricked the whole wallet load when this happened,
+          // taking down every other module's load with it (issue:
+          // page-freeze 2026-05-29).
+          logger.warn(
+            'GroupChat',
+            `[CID_REF_DEGRADE] groups key contains a CID ref (cid=${ref.cid}) ` +
+              `but no cidRefStore was injected; starting fresh.`,
+          );
+        } else {
+          try {
+            parsed = await this.deps!.cidRefStore.fetchJson<GroupData[]>(
+              ref,
+              { requireEncrypted: true },
+            );
+          } catch (err) {
+            logger.error('GroupChat', '[GROUP_CHAT_GROUPS] CID-ref fetch failed', err);
+          }
+        }
+      } else {
+        try {
+          parsed = JSON.parse(groupsJson) as GroupData[];
+        } catch (err) {
+          logger.error('GroupChat', '[GROUP_CHAT_GROUPS] legacy JSON parse failed', err);
+        }
+      }
+      if (Array.isArray(parsed)) {
         for (const g of parsed) {
           this.groups.set(g.id, g);
         }
-      } catch {
-        // Corrupted data, start fresh
+      } else if (parsed !== null) {
+        logger.error(
+          'GroupChat',
+          `[GROUP_CHAT_GROUPS] decoded data is not an array (got ${typeof parsed}); skipping.`,
+        );
       }
     }
 
-    // Load messages
-    const messagesJson = await storage.get(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MESSAGES);
-    if (messagesJson) {
-      try {
-        const parsed: GroupMessageData[] = JSON.parse(messagesJson);
-        for (const m of parsed) {
-          const groupId = m.groupId;
-          if (!this.messages.has(groupId)) {
-            this.messages.set(groupId, []);
-          }
-          this.messages.get(groupId)!.push(m);
+    // Load messages — dual-read per PROFILE-CID-REFERENCES.md §8.5.
+    //
+    // Strategy (post-steelman): ALWAYS consult the legacy blob when present.
+    // Per-group data wins on collision (it represents the most recent
+    // migration state), legacy fills in groups that weren't migrated yet.
+    // This closes the partial-migration data-loss bug: if a prior migration
+    // attempt wrote per-group keys for some groups but crashed before
+    // others, the remaining groups still migrate on the next load rather
+    // than being silently skipped because "some per-group keys exist."
+    //
+    // Orphan-cleanup tracking is seeded from `storage.keys(prefix)` so that
+    // stale per-group keys left over from prior sessions (e.g., groups the
+    // wallet has since left) are detected on the next persist and removed.
+    const existingMessageKeys = await storage.keys(GROUP_CHAT_MESSAGES_PREFIX);
+    for (const key of existingMessageKeys) {
+      this._lastWrittenMessageGroupIds.add(key.slice(GROUP_CHAT_MESSAGES_PREFIX.length));
+    }
+    for (const groupId of this.groups.keys()) {
+      const json = await storage.get(GROUP_CHAT_MESSAGES_PREFIX + groupId);
+      if (!json) continue;
+      // Dual-read layers (ordered):
+      //   1. CID ref envelope → fetch content.
+      //       1a. Content is Pattern B index { v:1, items: [...] }
+      //           → fetch each message CID in parallel, assemble the
+      //             in-memory array. Failed individual fetches are
+      //             logged and skipped — other messages still load.
+      //       1b. Content is a plain array (Pattern A)
+      //           → use directly; migration will upgrade to B on next
+      //             persist.
+      //   2. Legacy inline JSON — use directly.
+      //
+      // No `requireEncrypted` flag — messages legitimately use plaintext
+      // pins for IPFS dedup (see persistMessages doc).
+      const ref = CidRefStore.tryParseRef(json);
+      let assembledMessages: GroupMessageData[] | null = null;
+      if (ref) {
+        if (!this.deps!.cidRefStore) {
+          // Degrade: skip this group's messages; relay re-delivery repopulates.
+          // See [CID_REF_DEGRADE] note above the groups-key site.
+          logger.warn(
+            'GroupChat',
+            `[CID_REF_DEGRADE] messages:${groupId} contains a CID ref ` +
+              `(cid=${ref.cid}) but no cidRefStore was injected; skipping.`,
+          );
+          continue;
         }
-      } catch {
-        // Corrupted data, start fresh
-      }
-    }
-
-    // Load members
-    const membersJson = await storage.get(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MEMBERS);
-    if (membersJson) {
-      try {
-        const parsed: GroupMemberData[] = JSON.parse(membersJson);
-        for (const m of parsed) {
-          const groupId = m.groupId;
-          if (!this.members.has(groupId)) {
-            this.members.set(groupId, []);
-          }
-          this.members.get(groupId)!.push(m);
+        let fetched: unknown;
+        try {
+          fetched = await this.deps!.cidRefStore.fetchJson(ref);
+        } catch (err) {
+          logger.error('GroupChat', `[GROUP_MESSAGES] CID-ref fetch failed for ${groupId}`, err);
+          continue;
         }
-      } catch {
-        // Corrupted data, start fresh
+
+        if (isMessagesIndex(fetched)) {
+          // Pattern B: resolve each message CID in parallel. Parallel
+          // fetch bounds total load latency to ~max(1 message) instead
+          // of N × single-fetch — matters for groups with many messages.
+          //
+          // Steelman hardening:
+          //   * Reject oversized indexes BEFORE spawning fetches. An
+          //     attacker-crafted index at the 50 MiB cidRefStore cap
+          //     could declare ~625k items; without this check we'd
+          //     spawn that many parallel IPFS requests.
+          //   * Validate each item's shape; malformed items logged +
+          //     skipped without aborting the group.
+          //   * Cap per-item size at MAX_GROUP_MESSAGE_SIZE before
+          //     handing to cidRefStore.fetchJson — closes the
+          //     (50 MiB × N-items) bandwidth DoS where a hostile index
+          //     declares item.size near the cidRefStore cap.
+          if (fetched.items.length > MAX_INDEX_ITEMS) {
+            logger.error(
+              'GroupChat',
+              `[GROUP_MESSAGES] index for ${groupId} has ${fetched.items.length} items, exceeds cap ${MAX_INDEX_ITEMS}; refusing to load.`,
+            );
+            continue;
+          }
+          const cidRefStoreRef = this.deps!.cidRefStore;
+          // Bound concurrency to LOAD_FETCH_CONCURRENCY (default 4) so a
+          // group with thousands of messages doesn't spawn thousands of
+          // parallel HTTP requests against a single gateway. The previous
+          // unbounded Promise.all(items.map(...)) was the primary driver of
+          // the 404-storm freeze observed 2026-05-29 — every miss pinned a
+          // socket for the 30 s fetch timeout. See LOAD_FETCH_CONCURRENCY
+          // doc-comment for the rationale on the limit.
+          const results = await mapWithConcurrency(fetched.items, LOAD_FETCH_CONCURRENCY, async (item) => {
+            if (!isValidIndexItem(item)) {
+              logger.error(
+                'GroupChat',
+                `[GROUP_MESSAGES] malformed index item for ${groupId}; skipping.`,
+              );
+              return null;
+            }
+            if (item.size > MAX_GROUP_MESSAGE_SIZE) {
+              logger.error(
+                'GroupChat',
+                `[GROUP_MESSAGES] index item for ${groupId} msg=${item.id} declares size ${item.size} > cap ${MAX_GROUP_MESSAGE_SIZE}; skipping.`,
+              );
+              return null;
+            }
+            try {
+              const msg = await cidRefStoreRef.fetchJson<GroupMessageData>({
+                v: 1,
+                cid: item.cid,
+                size: item.size,
+                // Use Date.now() rather than a hardcoded sentinel — the
+                // synthetic ref is passed directly to fetchJson (not
+                // through tryParseRef), but using a plausible wall-clock
+                // value makes this resilient to any future validateRef
+                // plausibility checks.
+                ts: Date.now(),
+                enc: false,
+              });
+              // Seed the per-message CID memo so the next persist can
+              // skip re-pinning unchanged messages.
+              this._pinnedMessageCids.set(JSON.stringify(msg), {
+                cid: item.cid,
+                size: item.size,
+              });
+              return msg;
+            } catch (err) {
+              logger.error(
+                'GroupChat',
+                `[GROUP_MESSAGES] per-message CID fetch failed for ${groupId} msg=${item.id}; skipping.`,
+                err,
+              );
+              return null;
+            }
+          });
+          assembledMessages = results.filter((m): m is GroupMessageData => m !== null);
+          // Seed the per-group index memo so an immediate re-persist
+          // doesn't re-pin the whole index for unchanged state.
+          this._lastPinnedMessagesByGroup.set(groupId, {
+            json: JSON.stringify(fetched),
+            ref,
+          });
+        } else if (Array.isArray(fetched)) {
+          // Pattern A content — backward compat for data written pre-#101.
+          // Not seeding per-message memo because these weren't pinned
+          // individually; next persist will transparently migrate to B.
+          assembledMessages = fetched as GroupMessageData[];
+        } else {
+          logger.error(
+            'GroupChat',
+            `[GROUP_MESSAGES] CID-ref content for ${groupId} is neither an index nor an array (got ${typeof fetched}); skipping.`,
+          );
+          continue;
+        }
+      } else {
+        // Legacy inline JSON — direct array.
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(json);
+        } catch (err) {
+          logger.error(
+            'GroupChat',
+            `[GROUP_MESSAGES] per-group blob for ${groupId} JSON parse failed; skipping.`,
+            err,
+          );
+          continue;
+        }
+        if (!Array.isArray(parsed)) {
+          logger.error(
+            'GroupChat',
+            `[GROUP_MESSAGES] legacy data for ${groupId} is not an array (got ${typeof parsed}); skipping.`,
+          );
+          continue;
+        }
+        assembledMessages = parsed as GroupMessageData[];
+      }
+
+      if (assembledMessages !== null) {
+        this.messages.set(groupId, assembledMessages);
+      }
+    }
+    const legacyMessagesJson = await storage.get(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MESSAGES);
+    if (legacyMessagesJson) {
+      // Narrow try/catch: ONLY JSON.parse goes inside the try. Errors from
+      // persistMessages / storage.remove must propagate with their original
+      // semantics instead of being misreported as "JSON parse failed."
+      let parsed: unknown;
+      let parseOk = false;
+      try {
+        parsed = JSON.parse(legacyMessagesJson);
+        parseOk = true;
+      } catch (err) {
+        logger.error(
+          'GroupChat',
+          '[GROUP_MESSAGES_LEGACY] JSON parse failed; leaving legacy blob in place.',
+          err,
+        );
+      }
+      if (parseOk) {
+        if (!Array.isArray(parsed)) {
+          logger.error(
+            'GroupChat',
+            `[GROUP_MESSAGES_LEGACY] data is not an array (got ${typeof parsed}); leaving legacy blob in place.`,
+          );
+        } else {
+          // Snapshot the set of groups ALREADY covered by per-group reads
+          // BEFORE we start mutating this.messages. If we used
+          // `this.messages.has(groupId)` inside the loop, the first legacy
+          // message for g2 would populate the key, and every subsequent
+          // legacy message for g2 would be wrongly skipped.
+          const perGroupCovered = new Set(this.messages.keys());
+          let newlyAddedCount = 0;
+          for (const m of parsed as GroupMessageData[]) {
+            const groupId = m?.groupId;
+            if (!groupId) continue;
+            // Filter: only migrate for groups the wallet is currently in.
+            // Orphans (groups the user has left) are dropped — they
+            // wouldn't surface in the UI anyway and migrating them would
+            // pollute per-group keys forever.
+            if (!this.groups.has(groupId)) continue;
+            // Per-group wins on collision — only fill in groups with no
+            // per-group data pre-loop.
+            if (perGroupCovered.has(groupId)) continue;
+            const bucket = this.messages.get(groupId) ?? [];
+            if (bucket.length === 0) this.messages.set(groupId, bucket);
+            bucket.push(m);
+            newlyAddedCount++;
+          }
+          if (newlyAddedCount > 0) {
+            // Write per-group keys for the groups we just filled in.
+            // Throws here propagate to the caller — a persist failure is a
+            // real error and should NOT be silently mislabelled as a parse
+            // failure. Legacy blob stays in place; next load retries.
+            await this.persistMessages();
+            logger.debug(
+              'GroupChat',
+              `Migrated ${newlyAddedCount} legacy messages into per-group keys`,
+            );
+          }
+          // Remove legacy only after a successful migration pass (or a
+          // no-op pass if all groups were already covered). If a prior
+          // partial migration left the legacy blob in place, this call
+          // is idempotent. Throws propagate.
+          await storage.remove(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MESSAGES);
+        }
       }
     }
 
-    // Load processed event IDs
+    // Load members — same dual-read pattern as messages.
+    const existingMemberKeys = await storage.keys(GROUP_CHAT_MEMBERS_PREFIX);
+    for (const key of existingMemberKeys) {
+      this._lastWrittenMemberGroupIds.add(key.slice(GROUP_CHAT_MEMBERS_PREFIX.length));
+    }
+    for (const groupId of this.groups.keys()) {
+      const json = await storage.get(GROUP_CHAT_MEMBERS_PREFIX + groupId);
+      if (!json) continue;
+      // Dual-read: CID ref (encrypted — requireEncrypted strict) OR
+      // legacy inline JSON.
+      const ref = CidRefStore.tryParseRef(json);
+      let parsed: unknown = null;
+      if (ref) {
+        if (!this.deps!.cidRefStore) {
+          // Degrade: skip this group's members; relay re-delivery repopulates.
+          // See [CID_REF_DEGRADE] note above the groups-key site.
+          logger.warn(
+            'GroupChat',
+            `[CID_REF_DEGRADE] members:${groupId} contains a CID ref ` +
+              `(cid=${ref.cid}) but no cidRefStore was injected; skipping.`,
+          );
+          continue;
+        }
+        try {
+          parsed = await this.deps!.cidRefStore.fetchJson(ref, { requireEncrypted: true });
+        } catch (err) {
+          logger.error('GroupChat', `[GROUP_MEMBERS] CID-ref fetch failed for ${groupId}`, err);
+          continue;
+        }
+      } else {
+        try {
+          parsed = JSON.parse(json);
+        } catch (err) {
+          logger.error(
+            'GroupChat',
+            `[GROUP_MEMBERS] per-group blob for ${groupId} JSON parse failed; skipping.`,
+            err,
+          );
+          continue;
+        }
+      }
+      if (!Array.isArray(parsed)) {
+        logger.error(
+          'GroupChat',
+          `[GROUP_MEMBERS] decoded data for ${groupId} is not an array (got ${typeof parsed}); skipping.`,
+        );
+        continue;
+      }
+      this.members.set(groupId, parsed as GroupMemberData[]);
+    }
+    const legacyMembersJson = await storage.get(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MEMBERS);
+    if (legacyMembersJson) {
+      // Narrow try/catch — see messages-legacy block above for rationale.
+      let parsed: unknown;
+      let parseOk = false;
+      try {
+        parsed = JSON.parse(legacyMembersJson);
+        parseOk = true;
+      } catch (err) {
+        logger.error(
+          'GroupChat',
+          '[GROUP_MEMBERS_LEGACY] JSON parse failed; leaving legacy blob in place.',
+          err,
+        );
+      }
+      if (parseOk) {
+        if (!Array.isArray(parsed)) {
+          logger.error(
+            'GroupChat',
+            `[GROUP_MEMBERS_LEGACY] data is not an array (got ${typeof parsed}); leaving legacy blob in place.`,
+          );
+        } else {
+          const perGroupCovered = new Set(this.members.keys());
+          let newlyAddedCount = 0;
+          for (const m of parsed as GroupMemberData[]) {
+            const groupId = m?.groupId;
+            if (!groupId) continue;
+            if (!this.groups.has(groupId)) continue;
+            if (perGroupCovered.has(groupId)) continue;
+            const bucket = this.members.get(groupId) ?? [];
+            if (bucket.length === 0) this.members.set(groupId, bucket);
+            bucket.push(m);
+            newlyAddedCount++;
+          }
+          if (newlyAddedCount > 0) {
+            await this.persistMembers();
+            logger.debug(
+              'GroupChat',
+              `Migrated ${newlyAddedCount} legacy members into per-group keys`,
+            );
+          }
+          await storage.remove(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MEMBERS);
+        }
+      }
+    }
+
+    // Load processed event IDs — dual-read (CID ref envelope encrypted →
+    // fetch from IPFS, requireEncrypted strict; OR legacy inline JSON).
+    // Symmetric to the persistProcessedEvents() write path (#285 §8.5).
     const processedJson = await storage.get(STORAGE_KEYS_ADDRESS.GROUP_CHAT_PROCESSED_EVENTS);
     if (processedJson) {
-      try {
-        const parsed: string[] = JSON.parse(processedJson);
+      const ref = CidRefStore.tryParseRef(processedJson);
+      let parsed: string[] | null = null;
+      if (ref) {
+        if (!this.deps!.cidRefStore) {
+          // Degrade: start with an empty processed-events set; relay
+          // re-delivery repopulates via idempotent event handlers. See
+          // [CID_REF_DEGRADE] note above the groups-key site.
+          logger.warn(
+            'GroupChat',
+            `[CID_REF_DEGRADE] processedEvents key contains a CID ref ` +
+              `(cid=${ref.cid}) but no cidRefStore was injected; ` +
+              `starting fresh.`,
+          );
+        } else {
+          try {
+            parsed = await this.deps!.cidRefStore.fetchJson<string[]>(
+              ref,
+              { requireEncrypted: true },
+            );
+          } catch (err) {
+            // Best-effort: continue with empty set rather than poisoning load.
+            // The ledger is recoverable — relay re-delivery will re-populate
+            // on the next sync (worst case: a few duplicate event-handler
+            // dispatches; the handlers themselves are idempotent).
+            logger.error(
+              'GroupChat',
+              '[GROUP_CHAT_PROCESSED_EVENTS] CID-ref fetch failed; starting fresh',
+              err,
+            );
+          }
+        }
+      } else {
+        try {
+          parsed = JSON.parse(processedJson) as string[];
+        } catch {
+          // Start fresh on legacy parse failure (same semantic as pre-#285).
+        }
+      }
+      if (Array.isArray(parsed)) {
         this.processedEventIds = new Set(parsed);
-      } catch {
-        // Start fresh
+      } else if (parsed !== null) {
+        logger.error(
+          'GroupChat',
+          `[GROUP_CHAT_PROCESSED_EVENTS] decoded data is not an array (got ${typeof parsed}); starting fresh.`,
+        );
       }
     }
   }
@@ -209,16 +851,21 @@ export class GroupChatModule {
   destroy(): void {
     this.destroyConnection();
 
-    // Flush any pending debounced persist before clearing state.
-    // Persist methods capture map data synchronously before their first await,
-    // so fire-and-forget is safe even though maps are cleared below.
+    // Flush any pending debounced persist before clearing state. The
+    // persist is chained onto the existing persistPromise so it runs
+    // strictly AFTER any in-flight one, guaranteeing the final writes
+    // reflect the last-known state. Fire-and-forget (not awaited) — the
+    // chain head holds all in-flight work and will resolve independently.
     if (this.persistTimer) {
       clearTimeout(this.persistTimer);
       this.persistTimer = null;
       if (this.deps) {
-        this.doPersistAll().catch((err) =>
-          logger.debug('GroupChat', 'Persist on destroy failed', err),
-        );
+        this.persistPromise = this.persistPromise
+          .catch(() => { /* isolate prior */ })
+          .then(() => this.doPersistAll())
+          .catch((err) =>
+            logger.debug('GroupChat', 'Persist on destroy failed', err),
+          );
       }
     }
 
@@ -230,7 +877,11 @@ export class GroupChatModule {
     this.messageHandlers.clear();
     this.relayAdminPubkeys = null;
     this.relayAdminFetchPromise = null;
-    this.persistPromise = null;
+    // Reset chain tail to a fresh resolved promise — any in-flight
+    // persist queued above still holds its own reference and completes
+    // independently, but future schedulePersist() calls on a re-init
+    // start from a clean tail.
+    this.persistPromise = Promise.resolve();
     this.deps = null;
   }
 
@@ -304,7 +955,7 @@ export class GroupChatModule {
     this.subscriptionIds = [];
 
     // Update key manager for new identity
-    const secretKey = Buffer.from(this.deps!.identity.privateKey, 'hex');
+    const secretKey = strictHexToBytes(this.deps!.identity.privateKey);
     this.keyManager = NostrKeyManager.fromPrivateKey(secretKey);
 
     if (this.groups.size === 0) {
@@ -320,7 +971,7 @@ export class GroupChatModule {
     this.ensureInitialized();
 
     if (!this.keyManager) {
-      const secretKey = Buffer.from(this.deps!.identity.privateKey, 'hex');
+      const secretKey = strictHexToBytes(this.deps!.identity.privateKey);
       this.keyManager = NostrKeyManager.fromPrivateKey(secretKey);
     }
 
@@ -1555,25 +2206,40 @@ export class GroupChatModule {
     if (this.persistTimer) return; // Already scheduled
     this.persistTimer = setTimeout(() => {
       this.persistTimer = null;
-      this.persistPromise = this.doPersistAll().catch((err) => {
-        logger.error('GroupChat', 'Persistence error:', err);
-      }).finally(() => {
-        this.persistPromise = null;
-      });
+      // Chain onto the existing persistPromise so we can't race an
+      // in-flight persist. Errors from prior persists are isolated
+      // (.catch) so one failed attempt doesn't block subsequent ones;
+      // errors from THIS persist get logged here.
+      this.persistPromise = this.persistPromise
+        .catch(() => { /* isolate prior failure */ })
+        .then(() => this.doPersistAll())
+        .catch((err) => {
+          logger.error('GroupChat', 'Persistence error:', err);
+        });
     }, 200);
   }
 
-  /** Persist immediately (for explicit flush points). */
+  /** Persist immediately (for explicit flush points).
+   *
+   *  Joins the persist chain like `schedulePersist` but returns a
+   *  promise that resolves (or rejects) with THIS persist's outcome,
+   *  so explicit-flush callers see real errors instead of the
+   *  log-and-swallow treatment applied to the background chain. */
   private async persistAll(): Promise<void> {
-    // Wait for any pending debounced persist
     if (this.persistTimer) {
       clearTimeout(this.persistTimer);
       this.persistTimer = null;
     }
-    if (this.persistPromise) {
-      await this.persistPromise;
-    }
-    await this.doPersistAll();
+    // Build the chained persist. Prior-failure isolation on entry so a
+    // broken background persist doesn't poison the explicit flush.
+    const mine = this.persistPromise
+      .catch(() => { /* isolate prior failure */ })
+      .then(() => this.doPersistAll());
+    // Advance the shared tail so the next scheduled/explicit persist
+    // chains onto us. Swallow errors on the shared tail (they're
+    // surfaced via `mine` to the direct caller).
+    this.persistPromise = mine.catch(() => { /* isolated */ });
+    await mine;
   }
 
   private async doPersistAll(): Promise<void> {
@@ -1588,31 +2254,219 @@ export class GroupChatModule {
   private async persistGroups(): Promise<void> {
     if (!this.deps) return;
     const data = Array.from(this.groups.values());
+    const cidRefStore = this.deps.cidRefStore;
+
+    if (cidRefStore) {
+      const json = JSON.stringify(data);
+      // Memo hit — identical plaintext reuses the cached ref instead of
+      // re-pinning. For encrypted pins, re-pinning would produce a fresh
+      // CID (random IV) even on unchanged plaintext — wasted IPFS churn.
+      if (this._lastPinnedGroupsRef && this._lastPinnedGroupsJson === json) {
+        await this.deps.storage.set(
+          STORAGE_KEYS_ADDRESS.GROUP_CHAT_GROUPS,
+          CidRefStore.stringifyRef(this._lastPinnedGroupsRef),
+        );
+        return;
+      }
+      // Groups list is per-wallet membership view — ENCRYPTED.
+      const ref = await cidRefStore.pinJson(data);
+      await this.deps.storage.set(
+        STORAGE_KEYS_ADDRESS.GROUP_CHAT_GROUPS,
+        CidRefStore.stringifyRef(ref),
+      );
+      this._lastPinnedGroupsJson = json;
+      this._lastPinnedGroupsRef = ref;
+      return;
+    }
+
+    // Legacy inline path.
     await this.deps.storage.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_GROUPS, JSON.stringify(data));
   }
 
+  /**
+   * Write messages partitioned by groupId. See GROUP_CHAT_MESSAGES_PREFIX
+   * comment for the storage-layout rationale (PROFILE-CID-REFERENCES.md
+   * §8.5). On each persist:
+   *   1. Write a per-group key for every groupId currently in memory
+   *      (via CID ref when cidRefStore is available, inline JSON otherwise).
+   *   2. Delete per-group keys for groupIds that were written on a previous
+   *      persist but are no longer present (e.g., after leave-group).
+   *      Without this, orphaned blobs would leak indefinitely.
+   *
+   * **Encryption policy: PLAINTEXT PINS.** Group-chat messages transit
+   * through the Nostr relay as plaintext (signed but unencrypted —
+   * grep the module for `NIP17|giftWrap|encrypt|decrypt` to verify zero
+   * hits). Per-wallet AES-GCM encryption on IPFS under that threat model
+   * buys no real privacy and defeats content-addressed dedup (random
+   * IV → 100 members produce 100 different CIDs for the same message).
+   * Plaintext pins make one CID serve all members of a group.
+   */
   private async persistMessages(): Promise<void> {
     if (!this.deps) return;
-    const allMessages: GroupMessageData[] = [];
-    for (const msgs of this.messages.values()) {
-      allMessages.push(...msgs);
+    const storage = this.deps.storage;
+    const cidRefStore = this.deps.cidRefStore;
+
+    const current = new Set<string>();
+    for (const [groupId, msgs] of this.messages) {
+      const key = GROUP_CHAT_MESSAGES_PREFIX + groupId;
+
+      if (cidRefStore) {
+        // Pattern B: pin each message individually, build an index of
+        // {id, ts, cid, size}, pin the index, write its ref. The dedup
+        // unit is the individual message — Alice's [m1,m2,m3] and
+        // Bob's [m1,m3,m2] share message CIDs even though the array
+        // orders differ.
+        //
+        // Messages without an `id` (transient optimistic state, should
+        // not exist in this.messages but the type permits undefined)
+        // are skipped — they'll persist next round once they get an id.
+        const indexItems: GroupChatMessagesIndexItem[] = [];
+        for (const m of msgs) {
+          if (!m.id) continue;
+          const messageJson = JSON.stringify(m);
+          let cachedPin = this._pinnedMessageCids.get(messageJson);
+          if (!cachedPin) {
+            const ref = await cidRefStore.pinJson(m, { encrypted: false });
+            cachedPin = { cid: ref.cid, size: ref.size };
+            this._pinnedMessageCids.set(messageJson, cachedPin);
+          }
+          indexItems.push({
+            id: m.id,
+            ts: m.timestamp,
+            cid: cachedPin.cid,
+            size: cachedPin.size,
+          });
+        }
+        const index: GroupChatMessagesIndex = {
+          v: GROUP_CHAT_MESSAGES_INDEX_V,
+          items: indexItems,
+        };
+        const indexJson = JSON.stringify(index);
+
+        // Per-group index-ref memo — same plaintext → same CID, so
+        // unchanged state reuses the ref without a pin round-trip.
+        const cached = this._lastPinnedMessagesByGroup.get(groupId);
+        if (cached && cached.json === indexJson) {
+          await storage.set(key, CidRefStore.stringifyRef(cached.ref));
+        } else {
+          const indexRef = await cidRefStore.pinJson(index, { encrypted: false });
+          await storage.set(key, CidRefStore.stringifyRef(indexRef));
+          this._lastPinnedMessagesByGroup.set(groupId, { json: indexJson, ref: indexRef });
+        }
+      } else {
+        // Legacy inline fallback when no cidRefStore is available —
+        // unchanged from pre-Pattern-B behaviour.
+        await storage.set(key, JSON.stringify(msgs));
+      }
+      current.add(groupId);
     }
-    await this.deps.storage.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MESSAGES, JSON.stringify(allMessages));
+    // Orphan cleanup — groups dropped since the last persist.
+    for (const oldId of this._lastWrittenMessageGroupIds) {
+      if (!current.has(oldId)) {
+        await storage.remove(GROUP_CHAT_MESSAGES_PREFIX + oldId);
+        // Evict the orphan's memo so a future rejoin forces a fresh pin.
+        // The per-message CID cache is shared across groups and is not
+        // invalidated by single-group eviction — identical messages in
+        // a later group rejoin dedup correctly. (Cache-level GC is the
+        // Phase-2 pin-ledger workstream's concern.)
+        this._lastPinnedMessagesByGroup.delete(oldId);
+      }
+    }
+    this._lastWrittenMessageGroupIds = current;
   }
 
+  /**
+   * Write members partitioned by groupId. Encryption policy: ENCRYPTED
+   * (per-wallet). Member lists are this wallet's view of group membership
+   * at a point in time and don't share the "all members see identical
+   * content verbatim" property of messages — dedup wouldn't help. Apply
+   * the default wallet-key AES-GCM encryption for consistency with every
+   * other CID-refs migration in the suite.
+   */
   private async persistMembers(): Promise<void> {
     if (!this.deps) return;
-    const allMembers: GroupMemberData[] = [];
-    for (const mems of this.members.values()) {
-      allMembers.push(...mems);
+    const storage = this.deps.storage;
+    const cidRefStore = this.deps.cidRefStore;
+
+    const current = new Set<string>();
+    for (const [groupId, mems] of this.members) {
+      const key = GROUP_CHAT_MEMBERS_PREFIX + groupId;
+
+      if (cidRefStore) {
+        const json = JSON.stringify(mems);
+        const cached = this._lastPinnedMembersByGroup.get(groupId);
+        if (cached && cached.json === json) {
+          await storage.set(key, CidRefStore.stringifyRef(cached.ref));
+        } else {
+          // Encrypted (default — omit the `encrypted` option).
+          const ref = await cidRefStore.pinJson(mems);
+          await storage.set(key, CidRefStore.stringifyRef(ref));
+          this._lastPinnedMembersByGroup.set(groupId, { json, ref });
+        }
+      } else {
+        await storage.set(key, JSON.stringify(mems));
+      }
+      current.add(groupId);
     }
-    await this.deps.storage.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MEMBERS, JSON.stringify(allMembers));
+    for (const oldId of this._lastWrittenMemberGroupIds) {
+      if (!current.has(oldId)) {
+        await storage.remove(GROUP_CHAT_MEMBERS_PREFIX + oldId);
+        this._lastPinnedMembersByGroup.delete(oldId);
+      }
+    }
+    this._lastWrittenMemberGroupIds = current;
   }
 
+  /**
+   * Persist the NIP-29 event ID dedup ledger. The ledger grows
+   * unbounded with relay activity — observed 263 KB on routine sphere.telco
+   * use, which was the second-worst PAYLOAD-SIZE soft-warn after
+   * `groupChatMembers` (issue #285).
+   *
+   * Encryption policy: ENCRYPTED. The ledger is a per-wallet privacy
+   * footprint (it reveals which NIP-29 events this wallet has
+   * processed — including private/invite-only groups). Dedup across
+   * wallets is not a goal; the canonical-content-addressed property
+   * of plaintext pins would actively leak group-membership signal to
+   * any IPFS observer.
+   */
   private async persistProcessedEvents(): Promise<void> {
     if (!this.deps) return;
     const arr = Array.from(this.processedEventIds);
-    await this.deps.storage.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_PROCESSED_EVENTS, JSON.stringify(arr));
+    const cidRefStore = this.deps.cidRefStore;
+
+    if (cidRefStore) {
+      const json = JSON.stringify(arr);
+      // Memo: identical plaintext (no new processed event since last
+      // persist) reuses the previous ref. AES-GCM uses random IVs so
+      // re-pinning would produce a fresh CID — wasted IPFS churn.
+      if (
+        this._lastPinnedProcessedEventsRef &&
+        this._lastPinnedProcessedEventsJson === json
+      ) {
+        await this.deps.storage.set(
+          STORAGE_KEYS_ADDRESS.GROUP_CHAT_PROCESSED_EVENTS,
+          CidRefStore.stringifyRef(this._lastPinnedProcessedEventsRef),
+        );
+        return;
+      }
+      const ref = await cidRefStore.pinJson(arr);
+      await this.deps.storage.set(
+        STORAGE_KEYS_ADDRESS.GROUP_CHAT_PROCESSED_EVENTS,
+        CidRefStore.stringifyRef(ref),
+      );
+      // Update memo AFTER storage.set lands so a failed set does not
+      // leave us pointing at a CID the caller thinks is live.
+      this._lastPinnedProcessedEventsJson = json;
+      this._lastPinnedProcessedEventsRef = ref;
+      return;
+    }
+
+    // Legacy inline fallback when no cidRefStore is available.
+    await this.deps.storage.set(
+      STORAGE_KEYS_ADDRESS.GROUP_CHAT_PROCESSED_EVENTS,
+      JSON.stringify(arr),
+    );
   }
 
   // ===========================================================================

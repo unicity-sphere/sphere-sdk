@@ -48,6 +48,40 @@ export const STORAGE_KEYS_GLOBAL = {
   LAST_WALLET_EVENT_TS: 'last_wallet_event_ts',
   /** Last processed Nostr DM (gift-wrap) event timestamp (unix seconds), keyed per pubkey */
   LAST_DM_EVENT_TS: 'last_dm_event_ts',
+  /**
+   * Issue #275 — persistent dedup for Nostr wallet event IDs that have
+   * been SUCCESSFULLY processed (cursor advanced). Keyed per pubkey;
+   * stored as a JSON string array bounded by
+   * `LIMITS.PROCESSED_EVENT_IDS_CAP` (FIFO eviction).
+   *
+   * Distinct from in-memory `inFlightEventIds`: this set persists across
+   * process restarts so cross-process CLI invocations don't re-walk the
+   * full relay backlog. At-least-once is preserved because we ONLY add
+   * to this set after the event's cursor was advanced (durability ok
+   * or replay budget exhausted), never after a transient failure.
+   */
+  PROCESSED_WALLET_EVENT_IDS: 'processed_wallet_event_ids',
+  /**
+   * Issue #275 — persistent durability-cooldown ledger for
+   * TOKEN_TRANSFER events. Tracks `attempts` and `nextRetryAt` across
+   * process restarts so the bounded replay budget
+   * (`DURABILITY_MAX_REPLAY_ATTEMPTS = 3`) accumulates across CLI
+   * invocations rather than resetting per-process.
+   */
+  FAILED_EVENT_COOLDOWNS: 'failed_event_cooldowns',
+  /**
+   * Issue #275 — persistent dedup set for the MultiAddressTransportMux
+   * level. The Mux maintains its own `processedEventIds` (independent
+   * of NostrTransportProvider's set) and dispatches to per-address
+   * adapters. Without persistence, every fresh CLI invocation
+   * re-walked the relay backlog through the Mux path as well as the
+   * outer-provider path. Bounded by `LIMITS.PROCESSED_EVENT_IDS_CAP`.
+   * Per-wallet storage scope: each Sphere instance has its own
+   * `storage` provider, so a bare global key is sufficient (no
+   * per-pubkey suffix needed because the Mux spans all per-wallet
+   * addresses).
+   */
+  MUX_PROCESSED_EVENT_IDS: 'mux_processed_event_ids',
   /** Group chat: last used relay URL (stale data detection) — global, same relay for all addresses */
   GROUP_CHAT_RELAY_URL: 'group_chat_relay_url',
   /** Cached token registry JSON (fetched from remote) */
@@ -58,6 +92,40 @@ export const STORAGE_KEYS_GLOBAL = {
   PRICE_CACHE: 'price_cache',
   /** Timestamp of last price cache update (ms since epoch) */
   PRICE_CACHE_TS: 'price_cache_ts',
+  /**
+   * CID whose CAR is pinned + OrbitDB ref written but whose aggregator
+   * pointer publish is pending due to a transient failure. Persisted
+   * so a process restart resumes the retry rather than abandoning the
+   * publish (which would leave cross-device peers unable to discover
+   * the bundle via the aggregator path). Per-address suffix appended
+   * by the Profile provider (`<key>_<addressId>`).
+   */
+  PROFILE_PENDING_PUBLISH_CID: 'profile_pending_publish_cid',
+  /**
+   * Issue #313 — local snapshot blob for cold-boot lazy load. Holds the
+   * most recent in-memory state (identity, tokens, bundles, pointer,
+   * timestamps) so the next cold boot can render the wallet UI from
+   * local cache BEFORE connecting to aggregator / remote IPFS. Atomically
+   * replaced after every successful flush + publish and on graceful
+   * shutdown. Per-address suffix appended by the Profile provider
+   * (`<key>_<addressId>`).
+   *
+   * A companion key `<key>_<addressId>_pending` is written first; the
+   * swap to the main key happens via `setMany` (or a sequential fallback
+   * with explicit cleanup). Crash mid-write leaves the previous main
+   * key intact.
+   */
+  PROFILE_SNAPSHOT_BLOB: 'profile_snapshot_blob',
+  /**
+   * Issue #313 — last-known aggregator pointer for cold-boot priming.
+   * Mirrors the `pointer` field embedded in the snapshot blob so the
+   * boot path can short-circuit a pointer fetch when the cached version
+   * matches what the aggregator now exposes. Per-address suffix appended
+   * by the Profile provider (`<key>_<addressId>`).
+   *
+   * Stored as JSON: `{ version: number, cid: string, epoch?: number, ts: number }`.
+   */
+  PROFILE_LAST_POINTER: 'profile_last_pointer',
 } as const;
 
 /**
@@ -108,11 +176,36 @@ export const STORAGE_KEYS_ADDRESS = {
   INV_LEDGER_INDEX: 'inv_ledger_index',
   /** Token scan state watermarks (JSON: Record<tokenId, txCount>) */
   TOKEN_SCAN_STATE: 'token_scan_state',
+  /**
+   * Persisted NOSTR-FIRST proof-polling jobs. Issue #144: the in-memory
+   * `proofPollingJobs` Map dies with the process; on CLI usage every
+   * `sphere <cmd>` is a fresh Node.js process, so V6-direct receives
+   * whose proof arrives later never finalize. We persist enough state
+   * (genesisTokenId, stateHash, requestIdHex, commitmentJson,
+   * sourceTokenJson) to re-fire `finalizeReceivedToken` on next load().
+   */
+  PROOF_POLLING_JOBS: 'proof_polling_jobs',
   // Swap storage keys
   /** Per-swap key: swap:{swapId} */
   SWAP_RECORD_PREFIX: 'swap:',
   /** Lightweight index array for listing */
   SWAP_INDEX: 'swap_index',
+  // UXF inter-wallet transfer protocol storage keys (T.0.G7-fill-gaps)
+  /**
+   * Audit collection for structurally-valid-but-unspendable tokens
+   * (NOT_OUR_CURRENT_STATE / UNSPENDABLE_BY_US dispositions). Stored
+   * with composite id `${tokenId}.${observedTokenContentHash}` per
+   * PROFILE-ARCHITECTURE.md §10.10 / canonical UXF-TRANSFER-PROTOCOL §5.4.
+   * The per-entry-key writer treats the id as opaque — T.1.E declares
+   * the specific composite-id shape.
+   */
+  AUDIT: 'audit',
+  /**
+   * Finalization queue for pending chain-mode transactions, keyed by
+   * the request id. Persists across process restarts per
+   * UXF-TRANSFER-PROTOCOL §5.5.
+   */
+  FINALIZATION_QUEUE: 'finalizationQueue',
 } as const;
 
 /** @deprecated Use STORAGE_KEYS_GLOBAL and STORAGE_KEYS_ADDRESS instead */
@@ -245,10 +338,57 @@ export const DEFAULT_AGGREGATOR_API_KEY = 'sk_06365a9c44654841a366068bcfc68986' 
 // IPFS Defaults
 // =============================================================================
 
-/** Default IPFS gateways */
-export const DEFAULT_IPFS_GATEWAYS = [
+/**
+ * Built-in (compiled-in) IPFS gateway list. Kept as a separate constant so
+ * tests and consumers that need to compare against the static defaults can do
+ * so without going through {@link DEFAULT_IPFS_GATEWAYS} (which honors the
+ * `SPHERE_IPFS_GATEWAY` env override).
+ */
+export const BUILTIN_IPFS_GATEWAYS = [
   'https://unicity-ipfs1.dyndns.org',
 ] as const;
+
+/**
+ * Parse the `SPHERE_IPFS_GATEWAY` env override into a non-empty URL list,
+ * or `null` when the env var is unset/empty.
+ *
+ * Accepts a single URL or a comma-separated list. Whitespace around entries
+ * is trimmed; empty entries are dropped. The Node-only guard (`typeof
+ * process !== 'undefined'`) keeps this safe under the browser bundle, where
+ * `process` is undefined.
+ *
+ * Why it lives here: the override targets the testnet IPFS gateway outage
+ * (issue #154) so e2e suites can point at an alternate gateway without
+ * patching factories. Reading at module init means every downstream consumer
+ * (`NETWORKS[*].ipfsGateways`, `getIpfsGatewayUrls()`, the deprecated
+ * `IpfsStorageProvider` ctor) inherits the override automatically.
+ */
+function readIpfsGatewayEnvOverride(): readonly string[] | null {
+  if (typeof process === 'undefined' || typeof process.env === 'undefined') {
+    return null;
+  }
+  const raw = process.env.SPHERE_IPFS_GATEWAY;
+  if (!raw) return null;
+  const parts = raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  return parts.length > 0 ? parts : null;
+}
+
+const ENV_IPFS_GATEWAYS = readIpfsGatewayEnvOverride();
+
+/**
+ * Default IPFS gateways.
+ *
+ * Honors the `SPHERE_IPFS_GATEWAY` env override (single URL or comma-separated
+ * list) when present, falling back to {@link BUILTIN_IPFS_GATEWAYS}. The
+ * override is evaluated once at module load, so it must be set BEFORE
+ * `@unicitylabs/sphere-sdk` is imported (e2e runners and CI set this in the
+ * shell or vitest globalSetup).
+ */
+export const DEFAULT_IPFS_GATEWAYS: readonly string[] =
+  ENV_IPFS_GATEWAYS ?? BUILTIN_IPFS_GATEWAYS;
 
 /** Unicity IPFS bootstrap peers */
 export const DEFAULT_IPFS_BOOTSTRAP_PEERS = [
@@ -270,9 +410,16 @@ export const UNICITY_IPFS_NODES = [
 
 /**
  * Get IPFS gateway URLs for HTTP API access.
+ *
+ * If `SPHERE_IPFS_GATEWAY` is set, returns the override list verbatim — the
+ * caller is responsible for using a scheme/port compatible with their needs.
+ * Otherwise derives URLs from {@link UNICITY_IPFS_NODES}.
+ *
  * @param isSecure - Use HTTPS (default: true). Set false for development.
+ *                   Ignored when the env override is in effect.
  */
 export function getIpfsGatewayUrls(isSecure?: boolean): string[] {
+  if (ENV_IPFS_GATEWAYS) return [...ENV_IPFS_GATEWAYS];
   return UNICITY_IPFS_NODES.map((node) =>
     isSecure !== false
       ? `https://${node.host}`
@@ -407,4 +554,19 @@ export const LIMITS = {
   MEMO_MAX_LENGTH: 500,
   /** Max message length */
   MESSAGE_MAX_LENGTH: 10000,
+  /**
+   * Issue #275 — FIFO cap for persisted dedup IDs in
+   * `STORAGE_KEYS_GLOBAL.PROCESSED_WALLET_EVENT_IDS`. Sized for several
+   * days of Nostr relay retention (typical relay holds 1-7 days). A
+   * 10k cap at ~70 bytes per id is ~700KB serialized — well under
+   * IndexedDB / file storage budgets.
+   */
+  PROCESSED_EVENT_IDS_CAP: 10_000,
+  /**
+   * Issue #275 — debounce interval for persisted dedup-set flushes.
+   * Coalesces rapid arrivals (e.g., EOSE replay burst of N events) into
+   * a single storage write rather than N writes. 200ms matches the
+   * proven pattern in `GroupChatModule.persistProcessedEvents`.
+   */
+  PROCESSED_EVENT_IDS_FLUSH_MS: 200,
 } as const;

@@ -39,6 +39,9 @@ import type { NetworkType } from '../../constants';
 import type { GroupChatModuleConfig } from '../../modules/groupchat';
 import type { MarketModuleConfig } from '../../modules/market';
 import type { IpfsStorageConfig } from '../shared/ipfs';
+import { createUxfCarPublisher } from '../../modules/payments/transfer/ipfs-publisher';
+import type { PublishToIpfsCallback } from '../../modules/payments/transfer/delivery-resolver';
+import { DEFAULT_IPFS_GATEWAYS } from '../../constants';
 import {
   type BaseTransportConfig,
   type BaseOracleConfig,
@@ -141,6 +144,24 @@ export interface NodeProviders {
   price?: PriceProvider;
   /** IPFS token storage provider (when tokenSync.ipfs.enabled is true) */
   ipfsTokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
+  /**
+   * UXF bundle-CAR publisher for the `uxf-cid` Nostr delivery branch
+   * (Issue #200 Phase 1 wiring). Built from the same IPFS gateway list
+   * used by `ipfsTokenStorage` when `tokenSync.ipfs.enabled` is true.
+   * Forward to `Sphere.init({...providers})` to enable production
+   * CID-by-reference token delivery.
+   */
+  publishToIpfs?: PublishToIpfsCallback;
+  /**
+   * Issue #223 — recipient-side gateway list used to stream-fetch CARs
+   * for incoming `kind: 'uxf-cid'` bundles. Same gateways `publishToIpfs`
+   * uses, in the same order, so the sender's pin and the recipient's
+   * fetch target the same network. Forward to
+   * `Sphere.init({...providers})` so the auto-installed
+   * {@link IngestWorkerPool} can ingest `uxf-cid` events; without it,
+   * those events are silently dropped on receive.
+   */
+  cidFetchGateways?: ReadonlyArray<string>;
   /** Group chat config (resolved, for passing to Sphere.init) */
   groupChat?: GroupChatModuleConfig | boolean;
   /** Market module config (resolved, for passing to Sphere.init) */
@@ -217,8 +238,36 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
   if (config?.oracle?.debug) sdkLogger.setTagDebug('Aggregator', true);
   if (config?.price?.debug) sdkLogger.setTagDebug('Price', true);
 
+  // Local-infra override: if SPHERE_NOSTR_RELAYS is set in the
+  // environment AND the caller did not explicitly pass relays/
+  // additionalRelays, splice the env value into the transport config so
+  // the resolver picks it up as a hard override. Use cases:
+  //   - Local Docker Nostr relay (tests/e2e/local-infra) without
+  //     touching every test's makeProviders call site.
+  //   - Operator override on a shared deployment (e.g. running against
+  //     a staging relay while keeping the network preset for everything
+  //     else: aggregator, IPFS, group-chat).
+  //
+  // Format: comma-separated WebSocket URLs ("ws://localhost:7777,
+  // wss://backup.example.com"). Whitespace + empty entries trimmed.
+  // Only applies in Node — the browser factory has its own resolver.
+  const transportOverride = (() => {
+    const raw = process.env['SPHERE_NOSTR_RELAYS'];
+    if (!raw) return config?.transport;
+    if (config?.transport?.relays || config?.transport?.additionalRelays) {
+      // Caller is in charge — don't second-guess explicit wiring.
+      return config.transport;
+    }
+    const relays = raw
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+    if (relays.length === 0) return config?.transport;
+    return { ...config?.transport, relays };
+  })();
+
   // Resolve configurations using shared utilities
-  const transportConfig = resolveTransportConfig(network, config?.transport);
+  const transportConfig = resolveTransportConfig(network, transportOverride);
   const oracleConfig = resolveOracleConfig(network, config?.oracle);
   const l1Config = resolveL1Config(network, config?.l1);
 
@@ -233,6 +282,25 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
   const ipfsTokenStorage = ipfsSync?.enabled
     ? createNodeIpfsStorageProvider(ipfsSync.config, storage)
     : undefined;
+
+  // Issue #200 Phase 1 wiring — build the canonical UXF CAR publisher
+  // from the same gateway list when IPFS sync is enabled. The Node
+  // IpfsStorageConfig only exposes a `gateways` field on the inner
+  // `config` block; fall back to DEFAULT_IPFS_GATEWAYS (which already
+  // honors the SPHERE_IPFS_GATEWAY env override) when unset.
+  //
+  // Issue #223 — surface the same gateway list as `cidFetchGateways`
+  // so the recipient pipeline can stream-fetch incoming `uxf-cid`
+  // bundles. Without this, every `uxf-cid` event is silently dropped
+  // on receive (see PaymentsModule.cidFetchGateways doc).
+  const resolvedIpfsGateways = ipfsSync?.enabled
+    ? ipfsSync.config?.gateways ?? [...DEFAULT_IPFS_GATEWAYS]
+    : undefined;
+  const publishToIpfs: PublishToIpfsCallback | undefined = resolvedIpfsGateways
+    ? createUxfCarPublisher(resolvedIpfsGateways)
+    : undefined;
+  const cidFetchGateways: ReadonlyArray<string> | undefined =
+    resolvedIpfsGateways;
 
   // Resolve group chat config
   const groupChat = resolveGroupChatConfig(network, config?.groupChat);
@@ -270,5 +338,7 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
     l1: l1Config,
     price: priceConfig ? createPriceProvider(priceConfig) : undefined,
     ipfsTokenStorage,
+    publishToIpfs,
+    cidFetchGateways,
   };
 }

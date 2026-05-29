@@ -553,8 +553,18 @@ export function computeInvoiceStatus(
     // All targets covered — COVERED
     // (implicit close to CLOSED is the caller's responsibility with the gate)
     state = 'COVERED';
-  } else if (terms.dueDate !== undefined && terms.dueDate < Date.now()) {
-    // Past due date AND not fully covered — EXPIRED
+  } else if (typeof terms.dueDate === 'number' && terms.dueDate < Date.now()) {
+    // Past due date AND not fully covered — EXPIRED.
+    //
+    // Use a strict type check instead of `dueDate !== undefined`. After a
+    // round-trip through canonicalSerialize (which normalizes undefined →
+    // null) the parsed terms carry `dueDate: null`. `null !== undefined` is
+    // true and `null < Date.now()` coerces null → 0, so the old guard
+    // unconditionally marked every no-due-date invoice as EXPIRED on the
+    // read path — even though unit tests passed (they use in-memory terms
+    // with `dueDate: undefined`, never exercising the null-serialized form).
+    // The `typeof === 'number'` form rejects null, undefined, and any
+    // non-numeric junk uniformly.
     state = 'EXPIRED';
   } else if (anyPayment) {
     state = 'PARTIAL';

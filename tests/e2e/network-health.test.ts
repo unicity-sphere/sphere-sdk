@@ -17,6 +17,13 @@ if (!(globalThis as Record<string, unknown>).WebSocket) {
   (globalThis as Record<string, unknown>).WebSocket = WsWebSocket;
 }
 
+// Intentionally NOT gated by `preflightSkip` — this suite tests the
+// SDK's own `checkNetworkHealth` function, whose entire purpose IS to
+// report on the same infrastructure the infra-probe checks. The test
+// passes whether the infra is healthy or not (it only asserts the
+// function returns a structured report). Gating it on infra-probe
+// would be a false-negative: we'd skip the very test that would catch
+// SDK-side regressions in the health-check itself.
 describe('checkNetworkHealth — live testnet', () => {
   it('should check oracle (aggregator) on testnet', async () => {
     const result = await checkNetworkHealth('testnet', {

@@ -1,0 +1,306 @@
+/**
+ * E2E Test: Profile Multi-Device Sync
+ *
+ * Mirrors `ipfs-multi-device-sync.test.ts` but with the Profile stack
+ * (OrbitDB + IPFS CAR) replacing IPNS-based sync.
+ *
+ * Proves that a wallet's token inventory can be recovered on a
+ * DIFFERENT DEVICE (fresh temp dir, same mnemonic) through the Profile
+ * layer alone — the Nostr path is explicitly disabled with a no-op
+ * transport in the critical test so we verify IPFS+OrbitDB is the
+ * sole replication channel.
+ *
+ * Real infrastructure:
+ *   - Nostr testnet relay (initial token reception on Device A only)
+ *   - Unicity IPFS gateways (CAR pin/fetch)
+ *   - DEFAULT_IPFS_BOOTSTRAP_PEERS (libp2p gossipsub for OrbitDB)
+ *
+ * Run with: `npm run test:e2e`.
+ */
+
+import { describe, it, expect, afterAll } from 'vitest';
+import { rmSync } from 'node:fs';
+import { Sphere } from '../../core/Sphere';
+import {
+  TEST_COINS,
+  FAUCET_TOPUP_TIMEOUT_MS,
+  rand,
+  makeTempDirs,
+  ensureTrustbase,
+  createNoopTransport,
+  requestMultiCoinFaucet,
+  getBalance,
+  getTokenIds,
+  getTokenAmounts,
+  waitForAllCoins,
+  type BalanceSnapshot,
+} from './helpers';
+import { makeProfileProviders, unwrapProfileProviders } from './profile-helpers';
+import { preflightSkip } from './lib/preflight';
+
+// =============================================================================
+// Test Suite
+// =============================================================================
+
+const SKIP_INFRA = preflightSkip(["nostr","ipfs","faucet"], 'profile-multi-device-sync');
+
+describe.skipIf(SKIP_INFRA)('Profile Multi-Device Sync E2E', () => {
+  let savedMnemonic: string;
+  let savedNametag: string;
+  let originalBalances: Map<string, BalanceSnapshot>;
+  let originalTokenIds: Map<string, Set<string>>;
+  let originalTokenAmounts: Map<string, Map<string, string>>;
+
+  const cleanupDirs: string[] = [];
+  const spheres: Sphere[] = [];
+
+  afterAll(async () => {
+    for (const s of spheres) {
+      try { await s.destroy(); } catch { /* cleanup */ }
+    }
+    spheres.length = 0;
+    for (const d of cleanupDirs) {
+      try { rmSync(d, { recursive: true, force: true }); } catch { /* cleanup */ }
+    }
+    cleanupDirs.length = 0;
+  });
+
+  // ---------------------------------------------------------------------------
+  // Test 1: Device A creates wallet, receives all coins, publishes to Profile
+  // ---------------------------------------------------------------------------
+
+  it(
+    'Device A creates Profile-backed wallet, receives multi-coin tokens, publishes state',
+    async () => {
+      savedNametag = `e2e-pms-${rand()}`;
+      const dirsA = makeTempDirs('profile-multidev-a');
+      cleanupDirs.push(dirsA.base);
+      await ensureTrustbase(dirsA.dataDir);
+
+      // Suppress the auto-debouncer so all multi-coin faucet activity
+      // coalesces into one pending state; explicit `awaitNextFlush()`
+      // below produces V1 only — deterministic cross-device sync.
+      const providersA = makeProfileProviders(dirsA, { flushDebounceMs: 300_000 });
+      const tokenStorageA = unwrapProfileProviders(providersA).tokenStorage;
+
+      console.log(`\n[Test 1] Device A creating Profile wallet @${savedNametag}...`);
+      const { sphere, created, generatedMnemonic } = await Sphere.init({
+        ...providersA,
+        autoGenerate: true,
+        nametag: savedNametag,
+      });
+      spheres.push(sphere);
+
+      expect(created).toBe(true);
+      expect(generatedMnemonic).toBeTruthy();
+      savedMnemonic = generatedMnemonic!;
+
+      console.log(`  Requesting faucet for @${savedNametag}...`);
+      await requestMultiCoinFaucet(savedNametag);
+
+      console.log(`  Waiting for all ${TEST_COINS.length} coins...`);
+      originalBalances = await waitForAllCoins(sphere, FAUCET_TOPUP_TIMEOUT_MS);
+
+      originalTokenIds = new Map<string, Set<string>>();
+      originalTokenAmounts = new Map<string, Map<string, string>>();
+      for (const coin of TEST_COINS) {
+        const bal = originalBalances.get(coin.symbol)!;
+        console.log(`  ${coin.symbol}: total=${bal.total}, tokens=${bal.tokens}`);
+        expect(bal.total).toBeGreaterThan(0n);
+        originalTokenIds.set(coin.symbol, getTokenIds(sphere, coin.symbol));
+        originalTokenAmounts.set(coin.symbol, getTokenAmounts(sphere, coin.symbol));
+      }
+
+      // Drain pending V5 finalizations and snapshot local state.
+      // sync() drains finalizations internally so any token whose
+      // sdkData still carries `_pendingFinalization` (and would round-
+      // trip through tokenToTxf as null) is finalized first. Without
+      // this, `waitForAllCoins` exits as soon as balance > 0 (pending
+      // v5 counts toward balance) and a mid-finalization flush would
+      // publish a partial CAR — Device B's cold-start recovery then
+      // sees a partial inventory ("USDC missing" symptom).
+      console.log('  Draining pending V5 finalizations + saving local state...');
+      const syncResult = await sphere.payments.sync({ drainTimeoutMs: 60_000 });
+      console.log(`  Sync: added=${syncResult.added}, removed=${syncResult.removed}`);
+
+      // Full-profile-sync: force ONE explicit lean-snapshot publish via
+      // `awaitNextFlush()`. The raised `flushDebounceMs` (5 min, see
+      // makeProfileProviders) suppresses the auto-debouncer during
+      // reception — all saves coalesce into one pending state, and
+      // this serialized flush publishes V1 only. Phase-3 walkback is
+      // skipped (V1 is the first version on a fresh wallet); subsequent
+      // versions would race aggregator-gateway propagation and stall.
+      console.log('  Publishing lean profile snapshot to IPFS + aggregator pointer...');
+      await tokenStorageA.awaitNextFlush(120_000);
+
+      // Allow IPFS replication so Device B's `recoverLatest()` finds
+      // the freshly-pinned snapshot CAR via the aggregator's reachable
+      // gateway.
+      console.log('  Waiting 10s for IPFS replication to aggregator gateways...');
+      await new Promise((r) => setTimeout(r, 10_000));
+
+      await sphere.destroy();
+      spheres.splice(spheres.indexOf(sphere), 1);
+
+      console.log('[Test 1] PASSED: Device A state published');
+    },
+    240_000,
+  );
+
+  // ---------------------------------------------------------------------------
+  // Test 2: Device B (fresh dir, no-op transport) recovers ONLY via Profile
+  // ---------------------------------------------------------------------------
+
+  it(
+    'Device B recovers multi-coin tokens ONLY from Profile layer (no Nostr)',
+    async () => {
+      expect(savedMnemonic).toBeTruthy();
+      for (const coin of TEST_COINS) {
+        expect(originalTokenIds.get(coin.symbol)!.size).toBeGreaterThan(0);
+      }
+
+      // Wait for libp2p/IPFS propagation between devices.
+      console.log('\n[Test 2] Waiting for IPFS + OrbitDB propagation...');
+      await new Promise((r) => setTimeout(r, 10_000));
+
+      const dirsB = makeTempDirs('profile-multidev-b-noopnostr');
+      cleanupDirs.push(dirsB.base);
+      await ensureTrustbase(dirsB.dataDir);
+
+      const providersB = makeProfileProviders(dirsB);
+      const noopTransport = createNoopTransport();
+
+      console.log('  Importing wallet on Device B with NO-OP transport...');
+      const sphereB = await Sphere.import({
+        storage: providersB.storage,
+        tokenStorage: providersB.tokenStorage,
+        transport: noopTransport,
+        oracle: providersB.oracle,
+        mnemonic: savedMnemonic,
+      });
+      spheres.push(sphereB);
+      console.log(`  Device B imported: ${sphereB.identity!.l1Address}`);
+
+      // Profile recovery happens during Sphere.import() itself: the
+      // import path runs `payments.load()` which calls each token-storage
+      // provider's `load()`. The Profile token storage provider's
+      // `load()` walks the aggregator pointer → recovers the latest CAR
+      // CID → fetches the CAR over IPFS → assembles tokens. The no-op
+      // transport cannot have delivered anything; therefore any tokens
+      // present in the post-import state came strictly from the Profile
+      // layer.
+      //
+      // Allow a brief retry loop for libp2p peer discovery if the
+      // pointer layer happened to walk an older CID and a fresher OpLog
+      // entry replicates after import.
+      console.log('  Verifying post-import recovery (Profile is the only source)...');
+      // 100s deadline covers worst-case aggregator pointer poll cycle
+      // ([30s, 90s) + margin). Poll every 10s — early-exit on first
+      // success. When pubsub between Helia nodes works, this completes
+      // in seconds; the long deadline only matters when pubsub fails
+      // and the aggregator-poll safety net is doing the work.
+      const deadline = performance.now() + 100_000;
+      while (performance.now() < deadline) {
+        let allReady = true;
+        for (const coin of TEST_COINS) {
+          if (getBalance(sphereB, coin.symbol).total < 1n) {
+            allReady = false;
+            break;
+          }
+        }
+        if (allReady) break;
+        try {
+          await sphereB.payments.sync();
+        } catch (err) {
+          console.log(`  sync() attempt failed: ${err instanceof Error ? err.message : err}`);
+        }
+        await new Promise((r) => setTimeout(r, 10_000));
+      }
+
+      // Full inventory match
+      for (const coin of TEST_COINS) {
+        const post = getBalance(sphereB, coin.symbol);
+        const orig = originalBalances.get(coin.symbol)!;
+        console.log(`  Post-sync ${coin.symbol}: total=${post.total} (orig ${orig.total})`);
+        expect(post.total).toBe(orig.total);
+        expect(post.tokens).toBe(orig.tokens);
+
+        const recIds = getTokenIds(sphereB, coin.symbol);
+        const recAmounts = getTokenAmounts(sphereB, coin.symbol);
+        const origIds = originalTokenIds.get(coin.symbol)!;
+        const origAmounts = originalTokenAmounts.get(coin.symbol)!;
+        expect(recIds.size).toBe(origIds.size);
+        for (const id of origIds) {
+          expect(recIds.has(id)).toBe(true);
+          expect(recAmounts.get(id)).toBe(origAmounts.get(id));
+        }
+      }
+
+      await sphereB.destroy();
+      spheres.splice(spheres.indexOf(sphereB), 1);
+
+      console.log('[Test 2] PASSED: Device B recovered exclusively via Profile (no Nostr)');
+    },
+    300_000,
+  );
+
+  // ---------------------------------------------------------------------------
+  // Test 3: Full recovery with real Nostr — merge path works end-to-end
+  // ---------------------------------------------------------------------------
+
+  it(
+    'Device C full recovery: Profile + Nostr merge delivers the same inventory',
+    async () => {
+      expect(savedMnemonic).toBeTruthy();
+      for (const coin of TEST_COINS) {
+        expect(originalTokenIds.get(coin.symbol)!.size).toBeGreaterThan(0);
+      }
+
+      const dirsC = makeTempDirs('profile-multidev-c-full');
+      cleanupDirs.push(dirsC.base);
+      await ensureTrustbase(dirsC.dataDir);
+
+      const providersC = makeProfileProviders(dirsC);
+
+      console.log('\n[Test 3] Device C full recovery (Profile + Nostr)...');
+      const sphereC = await Sphere.import({
+        ...providersC,
+        mnemonic: savedMnemonic,
+        nametag: savedNametag,
+      });
+      spheres.push(sphereC);
+
+      // Sync — both paths (Profile and Nostr) should converge to the
+      // same inventory. 100s deadline covers worst-case aggregator
+      // pointer poll cycle ([30s, 90s) + margin). Poll every 10s.
+      console.log('  Syncing...');
+      const deadline = performance.now() + 100_000;
+      while (performance.now() < deadline) {
+        await sphereC.payments.sync();
+        let allReady = true;
+        for (const coin of TEST_COINS) {
+          if (getBalance(sphereC, coin.symbol).total < 1n) {
+            allReady = false;
+            break;
+          }
+        }
+        if (allReady) break;
+        await new Promise((r) => setTimeout(r, 10_000));
+      }
+
+      // Inventory match
+      for (const coin of TEST_COINS) {
+        const post = getBalance(sphereC, coin.symbol);
+        const orig = originalBalances.get(coin.symbol)!;
+        expect(post.total).toBe(orig.total);
+        expect(post.tokens).toBe(orig.tokens);
+      }
+
+      await sphereC.destroy();
+      spheres.splice(spheres.indexOf(sphereC), 1);
+
+      console.log('[Test 3] PASSED: Profile + Nostr full recovery');
+    },
+    300_000,
+  );
+});

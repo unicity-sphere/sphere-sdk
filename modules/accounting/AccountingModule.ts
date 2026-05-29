@@ -11,7 +11,12 @@
 
 import { logger } from '../../core/logger.js';
 import { SphereError } from '../../core/errors.js';
+import {
+  hexToBytes as strictHexToBytes,
+  hexToBytesAllowEmpty as strictHexToBytesAllowEmpty,
+} from '../../core/hex.js';
 import { AsyncGateMap } from '../../core/async-gate.js';
+import { CidRefStore, type CidRef } from '../../profile/cid-ref-store.js';
 import { STORAGE_KEYS_ADDRESS, INVOICE_TOKEN_TYPE_HEX, getAddressStorageKey, getAddressId } from '../../constants.js';
 import type {
   IncomingTransfer,
@@ -53,6 +58,10 @@ import type {
   FailedReceiptInfo,
   SentNoticeInfo,
   FailedNoticeInfo,
+  DeliverInvoiceOptions,
+  DeliverInvoiceResult,
+  DeliverInvoiceRecipientResult,
+  InvoiceDeliveryEnvelope,
 } from './types.js';
 import { parseInvoiceMemo, buildInvoiceMemo, decodeTransferMessage, hashInvoiceId } from './memo.js';
 import { AutoReturnManager } from './auto-return.js';
@@ -60,7 +69,7 @@ import { canonicalSerialize } from './serialization.js';
 import { hexToBytes } from '@noble/hashes/utils.js';
 import { computeInvoiceStatus, freezeBalances } from './balance-computer.js';
 import { TokenRegistry } from '../../registry/index.js';
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
+ 
 import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token.js';
 import { txfToToken } from '../../serialization/txf-serializer.js';
 
@@ -100,6 +109,41 @@ const LOG_TAG = 'Accounting';
 
 /** Prefix for per-invoice transfer ledger storage keys. */
 const INV_LEDGER_PREFIX = 'inv_ledger:';
+
+/**
+ * DM prefix for per-invoice UXF-bundle delivery (#226).
+ *
+ * `deliverInvoice` packages the invoice token into a real UXF CARv1 (the
+ * same content-addressed packaging the payments instant-sender uses) and
+ * ships it inside a NIP-17 DM. The DM body after this prefix is a JSON
+ * `InvoiceDeliveryEnvelope` carrying either inline CAR base64 (`uxf-car`)
+ * or a CID-by-reference (`uxf-cid`). Receivers decode the bundle,
+ * extract the invoice token via `UxfPackage.assemble`, and call
+ * `importInvoice` to land it in the local ledger.
+ *
+ * Distinct from the swap module's `invoice_delivery` JSON discriminator
+ * (escrow→wallet, raw TXF over DM) — that path predates UXF packaging
+ * and is owned by the swap protocol. This prefix lives at the DM-content
+ * layer; the swap discriminator lives inside the structured swap JSON.
+ */
+const INVOICE_DELIVERY_DM_PREFIX = 'invoice_delivery:';
+
+/**
+ * Maximum byte length of an `invoice_delivery:` DM payload (substring
+ * after the prefix). 128 KB matches the swap-module's `MAX_DM_LENGTH` and
+ * gives roughly 2× headroom over a CAR built from a maxed-out 64 KB terms
+ * blob plus its genesis transaction + inclusion proof.
+ */
+const MAX_INVOICE_DELIVERY_BYTES = 131_072;
+
+/**
+ * Inline CAR ceiling (bytes). Above this size, the helper attempts CID
+ * delivery via the wallet's configured `publishToIpfs` callback. Matches
+ * the payments instant-sender's `MAX_INLINE_CAR_BYTES` (16 KiB) so that
+ * a stack of inline-only relays handles the same cutoff for both
+ * pipelines.
+ */
+const INVOICE_INLINE_CAR_CEILING_BYTES = 16_384;
 
 // =============================================================================
 // AccountingModule
@@ -160,6 +204,29 @@ export class AccountingModule {
   private cancelledInvoices: Set<string> = new Set();
   private closedInvoices: Set<string> = new Set();
   private frozenBalances: Map<string, FrozenInvoiceBalances> = new Map();
+
+  // ---------------------------------------------------------------------------
+  // T.7.D / W21: Forced-conservative coercion for escrow-bridged invoices
+  // ---------------------------------------------------------------------------
+  //
+  // When a higher-level orchestrator (e.g. SwapModule) routes a payInvoice()
+  // through a deposit invoice owned by an external escrow, the orchestrator
+  // marks the invoice via `markInvoiceEscrowBridged(invoiceId)`. Subsequent
+  // `payInvoice(invoiceId, …)` calls then silently coerce
+  // `allowPendingTokens` to `false` (§2.5 last paragraph) regardless of the
+  // caller's value, surfacing the override via TransferResult.overrides.
+  //
+  // Not persisted: the set is rebuilt on each session by the orchestrator
+  // when it rehydrates its own state (e.g. SwapModule.load() repopulates
+  // invoiceToSwapIndex). This avoids cross-module storage coupling.
+  private escrowBridgedInvoices: Set<string> = new Set();
+
+  /**
+   * Override marker emitted in TransferResult.overrides whenever
+   * `payInvoice()` silently coerces `allowPendingTokens=true` to `false`
+   * because the invoice is bridged to escrow.
+   */
+  static readonly OVERRIDE_FORCED_CONSERVATIVE = 'allowPendingTokens-coerced-to-false';
 
   // ---------------------------------------------------------------------------
   // Auto-return settings (in-memory, persisted via storage)
@@ -232,6 +299,18 @@ export class AccountingModule {
 
   /** W2 fix: Serialization guard for _flushDirtyLedgerEntries. */
   private _flushPromise: Promise<void> | null = null;
+
+  /**
+   * Memoization of the last successful CID pin per invoice
+   * (PROFILE-CID-REFERENCES.md §8.3). AES-GCM uses random IVs so re-pinning
+   * identical plaintext produces a different CID; the memo skips re-pinning
+   * when the entries-for-invoice JSON is byte-identical to the last pin.
+   *
+   * Keyed by invoiceId — each invoice has its own KV key and therefore its
+   * own pin lifecycle. Memo entries are cleared when an invoice is
+   * terminated (closed/cancelled) since no further writes should occur.
+   */
+  private _lastPinnedLedgerByInvoice = new Map<string, { json: string; ref: CidRef }>();
 
   // ---------------------------------------------------------------------------
   // Per-invoice concurrency gate (promise chain)
@@ -384,56 +463,11 @@ export class AccountingModule {
     // from TokenStorageProvider by PaymentsModule.load()). We filter by
     // INVOICE_TOKEN_TYPE_HEX, which is stored in genesis.data.tokenType.
     // ------------------------------------------------------------------
-    try {
-      const allTokens = deps.payments.getTokens();
-      for (const token of allTokens) {
-        if (!token.sdkData) continue;
-        try {
-          const txf = JSON.parse(token.sdkData) as TxfToken;
-          // Filter by invoice token type
-          const tokenType = txf.genesis?.data?.tokenType;
-          if (tokenType !== INVOICE_TOKEN_TYPE_HEX) continue;
-
-          const tokenData = txf.genesis?.data?.tokenData;
-          if (!tokenData) continue;
-
-          const rawTerms = this._parseInvoiceTerms(tokenData);
-          if (rawTerms) {
-            this.invoiceTermsCache.set(token.id, this._normalizeInvoiceTerms(rawTerms));
-          }
-        } catch (err) {
-          logger.warn(LOG_TAG, `Failed to parse invoice token ${token.id}:`, err);
-        }
-      }
-
-      // Also scan archived tokens (spec §5.4 Phase 2 step 5)
-      const archivedTokens = deps.payments.getArchivedTokens();
-      for (const [archivedId, txf] of archivedTokens) {
-        try {
-          const tokenType = txf.genesis?.data?.tokenType;
-          if (tokenType !== INVOICE_TOKEN_TYPE_HEX) continue;
-
-          const tokenData = txf.genesis?.data?.tokenData;
-          if (!tokenData) continue;
-
-          const rawTerms = this._parseInvoiceTerms(tokenData);
-          if (rawTerms) {
-            this.invoiceTermsCache.set(archivedId, this._normalizeInvoiceTerms(rawTerms));
-          }
-        } catch (err) {
-          logger.warn(LOG_TAG, `Failed to parse archived invoice token ${archivedId}:`, err);
-        }
-      }
-
-      // Build hash→ID index for privacy-preserving on-chain lookups
-      this._rebuildHashIndex();
-
-      if (this.config.debug) {
-        logger.debug(LOG_TAG, `Loaded ${this.invoiceTermsCache.size} invoice token(s), hash index: ${this.invoiceIdHashIndex.size}`);
-      }
-    } catch (err) {
-      logger.warn(LOG_TAG, 'Failed to enumerate tokens via PaymentsModule:', err);
-    }
+    // Initial scan: populate from scratch — every invoice token currently
+    // in the wallet's storage. No `invoice:created` is emitted here because
+    // this is post-restart cache rehydration, not new discovery (callers
+    // already saw those events when the invoices first arrived).
+    this._refreshInvoiceTermsCache({ emitForNew: false });
 
     // W16: destroyed check between major steps — prevents partial state population
     // if destroy() was called while _doLoad() is in progress.
@@ -563,9 +597,13 @@ export class AccountingModule {
     // C5 fix: Await the save — fire-and-forget risks losing reconstructed
     // frozen balances on crash, leaving recovery in a loop.
     if (anyReconstructed) {
+      // W11 (T-D8): reconciliation snapshot of derived state —
+      // housekeeping, not a user action (the original close/cancel
+      // that generated this terminal state happened in a prior session).
       await this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.FROZEN_BALANCES,
         Object.fromEntries(this.frozenBalances),
+        'cache_index',
       );
     }
 
@@ -706,6 +744,7 @@ export class AccountingModule {
     if (!/^(0|[1-9]\d*)$/.test(amount)) return 0n;
     return BigInt(amount);
   }
+
 
   /**
    * Safely defer an event emission via queueMicrotask. Wraps the callback in
@@ -986,13 +1025,18 @@ export class AccountingModule {
     if (!privateKeyHex) {
       throw new SphereError('Private key required for invoice creation', 'NOT_INITIALIZED');
     }
-    const hexMatches = privateKeyHex.match(/.{1,2}/g);
-    if (!hexMatches) {
-      throw new SphereError('Invalid private key format', 'NOT_INITIALIZED');
+    // Steelman³⁶: consolidated to core/hex.ts:hexToBytes via the shared
+    // import. RangeError → SphereError remap so the contract stays the
+    // same for callers (NOT_INITIALIZED on malformed identity input).
+    let signingKeyBytes: Uint8Array;
+    try {
+      signingKeyBytes = strictHexToBytes(privateKeyHex);
+    } catch (err) {
+      throw new SphereError(
+        `Invalid private key format: ${err instanceof Error ? err.message : String(err)}`,
+        'NOT_INITIALIZED',
+      );
     }
-    const signingKeyBytes = new Uint8Array(
-      hexMatches.map((byte) => parseInt(byte, 16)),
-    );
     const saltInput = new Uint8Array(signingKeyBytes.length + invoiceBytesEncoded.length);
     saltInput.set(signingKeyBytes, 0);
     saltInput.set(invoiceBytesEncoded, signingKeyBytes.length);
@@ -1046,7 +1090,7 @@ export class AccountingModule {
       const { TokenState } = await import(
         '@unicitylabs/state-transition-sdk/lib/token/TokenState.js'
       );
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+       
       const { Token: SdkToken } = await import(
         '@unicitylabs/state-transition-sdk/lib/token/Token.js'
       );
@@ -1311,6 +1355,289 @@ export class AccountingModule {
   }
 
   /**
+   * Deliver an existing invoice to one or more recipients (#226).
+   *
+   * Packages the invoice's TXF token into a UXF CARv1 bundle (the same
+   * content-addressed packaging the payments instant-sender uses) and
+   * ships the bundle inside a NIP-17 DM with prefix `invoice_delivery:`.
+   * The DM body is a JSON {@link InvoiceDeliveryEnvelope} carrying either
+   * the CAR inline (`uxf-car`, default for bundles ≤ ~16 KiB) or a CID
+   * reference (`uxf-cid`, requires `publishToIpfs` injection).
+   *
+   * Decoupled from {@link createInvoice}: the mint step records the
+   * invoice locally; callers explicitly trigger delivery when they want
+   * payers to discover the invoice. This separation lets callers mint
+   * once and deliver multiple times (e.g. re-deliver after a relay outage,
+   * deliver to a late-added target).
+   *
+   * Recipients default to every `terms.targets[].address` that is NOT one
+   * of our own active addresses (multi-HD self-skip). Callers can override
+   * via `options.recipients`. Each recipient resolves through the shared
+   * `transportResolver` so `@nametag`, `DIRECT://`, and chain pubkey are
+   * all accepted.
+   *
+   * Delivery is best-effort per recipient — one failure does NOT block
+   * subsequent recipients and does NOT throw. The returned
+   * {@link DeliverInvoiceResult} carries per-recipient outcome so callers
+   * (CLI, UI) can surface partial-failure reports and retry.
+   *
+   * @param invoiceId - 64-char hex tokenId of an invoice the wallet owns.
+   * @param options   - Optional recipient override and memo.
+   * @returns Per-recipient outcome.
+   *
+   * @throws {SphereError} `INVOICE_NOT_FOUND` — invoice token absent locally.
+   * @throws {SphereError} `COMMUNICATIONS_UNAVAILABLE` — no CommunicationsModule.
+   * @throws {SphereError} `INVOICE_DELIVERY_FAILED` — token storage / UXF
+   *   build threw irrecoverably before any recipient was attempted.
+   * @throws {SphereError} `NOT_INITIALIZED` — module not initialized.
+   * @throws {SphereError} `MODULE_DESTROYED` — module has been destroyed.
+   */
+  async deliverInvoice(
+    invoiceId: string,
+    options?: DeliverInvoiceOptions,
+  ): Promise<DeliverInvoiceResult> {
+    this.ensureNotDestroyed();
+    this.ensureInitialized();
+    const deps = this.deps!;
+
+    // ------------------------------------------------------------------
+    // Step 1: Validate invoice exists and is known locally.
+    // ------------------------------------------------------------------
+    const terms = this.invoiceTermsCache.get(invoiceId);
+    if (!terms) {
+      throw new SphereError(`Invoice not found: ${invoiceId}`, 'INVOICE_NOT_FOUND');
+    }
+
+    // ------------------------------------------------------------------
+    // Step 2: Locate the token in the wallet's token store. The token was
+    // added by createInvoice via `payments.addToken`, so it is reachable
+    // through `getTokens()` keyed by tokenId.
+    // ------------------------------------------------------------------
+    const tokens = deps.payments.getTokens();
+    const tokenRecord = tokens.find((t) => t.id === invoiceId);
+    if (!tokenRecord || !tokenRecord.sdkData) {
+      throw new SphereError(
+        `Invoice ${invoiceId}: token data missing from local storage — cannot build UXF bundle`,
+        'INVOICE_NOT_FOUND',
+      );
+    }
+    let tokenJson: unknown;
+    try {
+      tokenJson = JSON.parse(tokenRecord.sdkData);
+    } catch (err) {
+      throw new SphereError(
+        `Invoice ${invoiceId}: stored sdkData is not valid JSON — cannot build UXF bundle`,
+        'INVOICE_DELIVERY_FAILED',
+        err,
+      );
+    }
+
+    // ------------------------------------------------------------------
+    // Step 3: CommunicationsModule required for DM transport.
+    // ------------------------------------------------------------------
+    if (!deps.communications) {
+      throw new SphereError(
+        'CommunicationsModule is required to deliver invoices via DM.',
+        'COMMUNICATIONS_UNAVAILABLE',
+      );
+    }
+
+    // ------------------------------------------------------------------
+    // Step 4: Resolve recipient set.
+    //
+    // Caller-provided list wins. Otherwise default to every target whose
+    // DIRECT:// address is NOT one of our active addresses. Active
+    // addresses are queried fresh (multi-HD wallets may have added a
+    // target after the invoice was minted).
+    // ------------------------------------------------------------------
+    const ownAddresses = new Set<string>();
+    try {
+      for (const addr of deps.getActiveAddresses()) {
+        if (addr.directAddress) ownAddresses.add(addr.directAddress);
+      }
+    } catch (err) {
+      logger.warn(LOG_TAG, 'deliverInvoice: getActiveAddresses() threw — proceeding without self-skip', err);
+    }
+    if (deps.identity?.directAddress) ownAddresses.add(deps.identity.directAddress);
+
+    let recipients: string[];
+    let skippedSelf = 0;
+    if (options?.recipients !== undefined) {
+      recipients = options.recipients.slice();
+    } else {
+      recipients = [];
+      const seen = new Set<string>();
+      for (const target of terms.targets) {
+        const addr = target.address;
+        if (!addr || typeof addr !== 'string') continue;
+        if (ownAddresses.has(addr)) {
+          skippedSelf++;
+          continue;
+        }
+        if (seen.has(addr)) continue;
+        seen.add(addr);
+        recipients.push(addr);
+      }
+    }
+
+    if (recipients.length === 0) {
+      // Nothing to deliver: caller passed empty list, or every target
+      // was self. Not an error — return a clean empty result.
+      return { invoiceId, sent: 0, failed: 0, skippedSelf, recipients: [] };
+    }
+
+    // ------------------------------------------------------------------
+    // Step 5: Assemble the UXF bundle and serialize to CAR bytes.
+    //
+    // Failure here aborts BEFORE any DM is sent — no partial delivery.
+    // The CAR bytes are content-addressed; we re-derive the CID once
+    // and reuse it across all recipients (the bundle contents are
+    // identical for every target).
+    // ------------------------------------------------------------------
+    let carBytes: Uint8Array;
+    let bundleCid: string;
+    try {
+      const { UxfPackage } = await import('../../uxf/UxfPackage.js');
+      const pkg = UxfPackage.create({
+        description: 'invoice-delivery',
+        creator: deps.identity.chainPubkey,
+      });
+      pkg.ingest(tokenJson);
+      carBytes = await pkg.toCar();
+      const { extractCarRootCid } = await import('../../uxf/transfer-payload.js');
+      bundleCid = await extractCarRootCid(carBytes);
+    } catch (err) {
+      throw new SphereError(
+        `Invoice ${invoiceId}: UXF bundle assembly failed — ${err instanceof Error ? err.message : String(err)}`,
+        'INVOICE_DELIVERY_FAILED',
+        err,
+      );
+    }
+
+    // ------------------------------------------------------------------
+    // Step 6: Decide inline vs CID delivery shape based on CAR size.
+    //
+    // ≤ INVOICE_INLINE_CAR_CEILING_BYTES → inline (uxf-car).
+    // > ceiling AND publishToIpfs available → pin and use uxf-cid.
+    // > ceiling AND no publisher           → fail this delivery (typed).
+    // ------------------------------------------------------------------
+    const wantsCidBranch = carBytes.byteLength > INVOICE_INLINE_CAR_CEILING_BYTES;
+    let carBase64Inline: string | null = null;
+    let cidPublishError: string | null = null;
+
+    if (!wantsCidBranch) {
+      // Inline path. Encode once for all recipients using the shared
+      // helper that the payments instant-sender / receiver use for
+      // uxf-car payloads — keeps the wire format identical to the
+      // existing TOKEN_TRANSFER instant-mode pipeline.
+      const { carBytesToBase64 } = await import('../../uxf/transfer-payload.js');
+      carBase64Inline = carBytesToBase64(carBytes);
+      // Defense-in-depth: the encoded length plus envelope overhead must
+      // fit under MAX_INVOICE_DELIVERY_BYTES. If a future ceiling change
+      // pushes inline above the DM cap, we'd silently emit DMs that the
+      // receiver drops. Pre-check and reject with a typed error instead.
+      const envelopeOverhead = 512; // generous for JSON keys + invoiceId + memo
+      if (carBase64Inline.length + envelopeOverhead > MAX_INVOICE_DELIVERY_BYTES) {
+        throw new SphereError(
+          `Invoice ${invoiceId}: encoded CAR (${carBase64Inline.length} bytes) exceeds DM cap (${MAX_INVOICE_DELIVERY_BYTES}); configure publishToIpfs to deliver via CID`,
+          'INVOICE_DELIVERY_FAILED',
+        );
+      }
+    } else if (deps.publishToIpfs) {
+      // CID path. Pin the same CAR bytes; the publisher's contract
+      // requires the returned CID to match `bundleCid`.
+      try {
+        const published = await deps.publishToIpfs(carBytes);
+        if (published?.cid !== bundleCid) {
+          cidPublishError = `publishToIpfs returned mismatched CID (got ${published?.cid ?? 'undefined'}, expected ${bundleCid})`;
+        }
+      } catch (err) {
+        cidPublishError = `publishToIpfs threw: ${err instanceof Error ? err.message : String(err)}`;
+      }
+    } else {
+      // No publisher and bundle exceeds inline ceiling. Surface a
+      // typed error rather than silently inline-shipping an oversized DM.
+      throw new SphereError(
+        `Invoice ${invoiceId}: assembled CAR (${carBytes.byteLength} bytes) exceeds inline ceiling (${INVOICE_INLINE_CAR_CEILING_BYTES}) and no publishToIpfs callback is configured`,
+        'INVOICE_DELIVERY_FAILED',
+      );
+    }
+
+    // ------------------------------------------------------------------
+    // Step 7: Build the envelope JSON once and dispatch per recipient.
+    // ------------------------------------------------------------------
+    const envelopeBundle: InvoiceDeliveryEnvelope['bundle'] =
+      carBase64Inline !== null
+        ? { kind: 'uxf-car', carBase64: carBase64Inline, bundleCid }
+        : {
+            kind: 'uxf-cid',
+            bundleCid,
+            ...(deps.cidFetchGateways && deps.cidFetchGateways.length > 0
+              ? { gateways: deps.cidFetchGateways.slice() }
+              : {}),
+          };
+
+    const envelope: InvoiceDeliveryEnvelope = {
+      type: 'invoice_delivery',
+      version: 1,
+      invoiceId,
+      bundle: envelopeBundle,
+      ...(options?.memo !== undefined ? { memo: options.memo } : {}),
+    };
+
+    const dmContent = INVOICE_DELIVERY_DM_PREFIX + JSON.stringify(envelope);
+
+    const recipientResults: DeliverInvoiceRecipientResult[] = [];
+    let sent = 0;
+    let failed = 0;
+
+    for (const recipient of recipients) {
+      // If CID publication failed earlier, fail every recipient with a
+      // uniform error. We don't fall back to inline silently — a caller
+      // who configured CID delivery may have meant to enforce that path.
+      if (cidPublishError !== null) {
+        recipientResults.push({
+          recipient,
+          success: false,
+          shape: '',
+          error: cidPublishError,
+        });
+        failed++;
+        continue;
+      }
+      try {
+        await deps.communications.sendDM(recipient, dmContent);
+        recipientResults.push({
+          recipient,
+          success: true,
+          shape: carBase64Inline !== null ? 'inline' : 'cid',
+        });
+        sent++;
+      } catch (err) {
+        // Common per-recipient failures: resolver miss (nametag not
+        // registered, no binding event), transport offline, relay
+        // rejection. Surface the message so callers can present it to
+        // the user without leaking SDK internals.
+        recipientResults.push({
+          recipient,
+          success: false,
+          shape: '',
+          error: err instanceof Error ? err.message : String(err),
+        });
+        failed++;
+      }
+    }
+
+    return {
+      invoiceId,
+      sent,
+      failed,
+      skippedSelf,
+      recipients: recipientResults,
+    };
+  }
+
+  /**
    * Import an invoice token received from another party.
    * The token is validated (proof chain, token type, parseable tokenData).
    * Stored via TokenStorageProvider alongside other tokens.
@@ -1359,7 +1686,7 @@ export class AccountingModule {
     // tokenData may be plain JSON or hex-encoded UTF-8 JSON
     // (state-transition-sdk stores it as hex via HexConverter.encode).
     let jsonString = tokenData;
-    if (!/^\s*[\[{"]/.test(tokenData)) {
+    if (!/^\s*[[{"]/.test(tokenData)) {
       // Doesn't look like JSON — attempt hex decode
       try {
         const bytes = hexToBytes(tokenData);
@@ -2198,14 +2525,19 @@ export class AccountingModule {
       // The terminal set write is the commit point — if we crash between writes,
       // the invoice is NOT terminal on recovery (safe to re-close).
       this.frozenBalances.set(invoiceId, frozen);
+      // W11 (T-D8): frozen balances snapshot is derived-state housekeeping;
+      // the CLOSED-set write below is the commit point that carries the
+      // `invoice_close` user-action tag.
       await this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.FROZEN_BALANCES,
         Object.fromEntries(this.frozenBalances),
+        'cache_index',
       );
       this.closedInvoices.add(invoiceId);
       await this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.CLOSED_INVOICES,
         Array.from(this.closedInvoices),
+        'invoice_close',
       );
 
       if (this.config.debug) {
@@ -2298,14 +2630,19 @@ export class AccountingModule {
       // The terminal set write is the commit point — if we crash between writes,
       // the invoice is NOT terminal on recovery (safe to re-cancel).
       this.frozenBalances.set(invoiceId, frozen);
+      // W11 (T-D8): frozen balances snapshot is derived-state housekeeping;
+      // the CANCELLED-set write below is the commit point that carries the
+      // `invoice_cancel` user-action tag.
       await this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.FROZEN_BALANCES,
         Object.fromEntries(this.frozenBalances),
+        'cache_index',
       );
       this.cancelledInvoices.add(invoiceId);
       await this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.CANCELLED_INVOICES,
         Array.from(this.cancelledInvoices),
+        'invoice_cancel',
       );
 
       if (this.config.debug) {
@@ -2328,6 +2665,51 @@ export class AccountingModule {
     });
   }
 
+  // ===========================================================================
+  // T.7.D / W21: Escrow-bridged invoice registry (public API for orchestrators)
+  // ===========================================================================
+
+  /**
+   * Mark an invoice as bridged to an external escrow flow.
+   *
+   * Higher-level orchestrators (SwapModule, future P2P trading flows) call
+   * this when they receive a deposit invoice from an escrow service. From
+   * that moment on, any caller-supplied `allowPendingTokens=true` on
+   * `payInvoice(invoiceId, …)` is silently coerced to `false` per §2.5 last
+   * paragraph, and `TransferResult.overrides` carries the
+   * `'allowPendingTokens-coerced-to-false'` marker so callers can audit the
+   * coercion.
+   *
+   * Idempotent: re-marking an already-marked invoice is a no-op.
+   *
+   * @param invoiceId - The invoice token ID to mark as escrow-bridged.
+   */
+  markInvoiceEscrowBridged(invoiceId: string): void {
+    this.escrowBridgedInvoices.add(invoiceId);
+  }
+
+  /**
+   * Remove the escrow-bridged marker for an invoice (e.g., after the swap
+   * reaches a terminal state and no further payInvoice() calls should be
+   * coerced). Idempotent.
+   *
+   * @param invoiceId - The invoice token ID to unmark.
+   */
+  unmarkInvoiceEscrowBridged(invoiceId: string): void {
+    this.escrowBridgedInvoices.delete(invoiceId);
+  }
+
+  /**
+   * Whether the given invoice is currently registered as bridged to an
+   * external escrow flow. Exposed primarily for tests and audit tooling.
+   *
+   * @param invoiceId - The invoice token ID to check.
+   * @returns `true` if the invoice is escrow-bridged.
+   */
+  isInvoiceEscrowBridged(invoiceId: string): boolean {
+    return this.escrowBridgedInvoices.has(invoiceId);
+  }
+
   /**
    * Pay an invoice — send tokens referencing the given invoice (§2.1, §8.5).
    *
@@ -2337,10 +2719,20 @@ export class AccountingModule {
    * 3. Auto-populates contact info from identity.directAddress if not provided.
    * 4. Calls PaymentsModule.send().
    *
+   * §2.5 forced-conservative coercion (T.7.D / W21):
+   *   When the invoice has been marked escrow-bridged (see
+   *   `markInvoiceEscrowBridged()`), a caller-supplied
+   *   `params.allowPendingTokens = true` is silently coerced to `false`
+   *   before being forwarded to `payments.send()`. The returned
+   *   `TransferResult` carries `overrides: ['allowPendingTokens-coerced-to-false']`
+   *   so callers can audit the coercion. Non-escrow invoice flows pass the
+   *   flag through verbatim and surface no override marker.
+   *
    * @param invoiceId - The invoice token ID.
    * @param params    - Pay parameters: targetIndex, assetIndex?, amount?, freeText?,
-   *                    refundAddress?, contact?.
-   * @returns TransferResult from PaymentsModule.send().
+   *                    refundAddress?, contact?, allowPendingTokens?.
+   * @returns TransferResult from PaymentsModule.send(), with `overrides`
+   *          augmented when forced-conservative coercion was applied.
    *
    * @throws {SphereError} `INVOICE_NOT_FOUND` — invoice token not found locally.
    * @throws {SphereError} `INVOICE_TERMINATED` — invoice is CLOSED or CANCELLED.
@@ -2354,6 +2746,15 @@ export class AccountingModule {
   async payInvoice(invoiceId: string, params: PayInvoiceParams): Promise<TransferResult> {
     this.ensureNotDestroyed();
     this.ensureInitialized();
+
+    // Issue #274 — `payInvoice` invokes payments.send under the hood, which is
+    // the §C.2 hot path. Emitting one entry log here lets operators correlate
+    // an invoice attribution with its corresponding `payments:send` span.
+    logger.debug('accounting:invoice', 'payInvoice enter', {
+      invoiceId: invoiceId?.slice(0, 16),
+      targetIndex: params.targetIndex,
+      assetIndex: params.assetIndex,
+    });
 
     const deps = this.deps!;
 
@@ -2493,25 +2894,45 @@ export class AccountingModule {
       // §4.4: Build transport memo
       const memo = buildInvoiceMemo(invoiceId, 'F', params.freeText);
 
+      // §2.5 (T.7.D / W21): forced-conservative coercion when the invoice
+      // bridges to an external escrow. We compute `effectiveAllowPending`
+      // and a `coerced` flag here — the flag drives the override marker
+      // appended to the eventual TransferResult below. Coercion is silent:
+      // we do NOT throw, we do NOT log a warning by default (debug mode
+      // logs at info level so audit traces still capture it).
+      const requestedAllowPending = params.allowPendingTokens === true;
+      const isEscrowBridged = this.escrowBridgedInvoices.has(invoiceId);
+      const coerced = requestedAllowPending && isEscrowBridged;
+      const effectiveAllowPending = coerced ? false : requestedAllowPending;
+
       if (this.config.debug) {
         logger.debug(
           LOG_TAG,
-          `payInvoice(${invoiceId}) → target=${target.address} coinId=${coinId} amount=${sendAmount}`,
+          `payInvoice(${invoiceId}) → target=${target.address} coinId=${coinId} amount=${sendAmount}` +
+            (coerced
+              ? ' [forced-conservative: allowPendingTokens coerced from true to false (escrow-bridged invoice)]'
+              : ''),
         );
       }
 
       // §5.9: Apply 60-second timeout to send() within the gate (matches returnInvoicePayment)
+      // T.7.C — pass `transferMode: 'instant'` explicitly per §10.1. The default is already
+      // `'instant'` at the PaymentsModule layer, but every production call-site of
+      // `payments.send()` MUST be explicit so the audit shim removal (T.1.B.2) can prove
+      // there are no implicit-default consumers when the type-level default flips later.
       const sendPromise = deps.payments.send({
         recipient: target.address,
         amount: sendAmount,
         coinId,
         memo,
+        transferMode: 'instant',
         invoiceRefundAddress: params.refundAddress,
         invoiceContact: effectiveContact,
         // R23 fix: forward transferMode so callers can opt into
         // 'conservative' (proof-on-sender) delivery for forwarding flows
         // like withdraw. Undefined preserves existing instant-mode default.
         ...(params.transferMode !== undefined ? { transferMode: params.transferMode } : {}),
+        allowPendingTokens: effectiveAllowPending,
       });
 
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -2557,6 +2978,22 @@ export class AccountingModule {
           // over-coverage on receivers without this — see the audit and the
           // helper docstring for the full rationale and implementation notes.
           await this._persistProvisionalAndVerify(invoiceId, 'payInvoice');
+        }
+
+        // T.7.D / W21: surface the forced-conservative coercion to the caller
+        // by appending the override marker to TransferResult.overrides without
+        // mutating any other field. Preserves backward compatibility with
+        // callers that ignore the field.
+        if (coerced) {
+          const existingOverrides = result.overrides ?? [];
+          const marker = AccountingModule.OVERRIDE_FORCED_CONSERVATIVE;
+          // Idempotent: do not append the marker if a downstream layer already
+          // added it (e.g. a future PaymentsModule that performs its own
+          // coercion). Set semantics — order is informational.
+          const merged = existingOverrides.includes(marker)
+            ? existingOverrides
+            : [...existingOverrides, marker];
+          return { ...result, overrides: merged };
         }
 
         return result;
@@ -2757,11 +3194,14 @@ export class AccountingModule {
       }
 
       // §5.9: Apply 60-second timeout to send() within the gate
+      // T.7.C — explicit `transferMode: 'instant'` per §10.1 (production call-site
+      // migration). Same rationale as the payInvoice site at the top of the gate.
       const sendPromise = deps.payments.send({
         recipient: senderAddress,
         amount: params.amount,
         coinId,
         memo,
+        transferMode: 'instant',
       });
 
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -3583,19 +4023,26 @@ export class AccountingModule {
     // frozen balances FIRST, then terminal set. The terminal set write is the
     // commit point — crash between writes = not terminal on recovery.
     this.frozenBalances.set(invoiceId, frozen);
+    // W11 (T-D8): frozen balances snapshot is derived-state housekeeping;
+    // the terminal-set write below carries the `invoice_close` /
+    // `invoice_cancel` user-action tag matching the implicit termination
+    // direction.
     await this.saveJsonToStorage(
       STORAGE_KEYS_ADDRESS.FROZEN_BALANCES,
       Object.fromEntries(this.frozenBalances),
+      'cache_index',
     );
     if (state === 'CLOSED') {
       await this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.CLOSED_INVOICES,
         Array.from(this.closedInvoices),
+        'invoice_close',
       );
     } else {
       await this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.CANCELLED_INVOICES,
         Array.from(this.cancelledInvoices),
+        'invoice_cancel',
       );
     }
 
@@ -3700,7 +4147,8 @@ export class AccountingModule {
           try {
             // Steelman fix: Wrap send() with 60s timeout, matching Fix 3 pattern in
             // _executeTerminationReturns. Without this, a hung send holds the gate indefinitely.
-            const arSendPromise = deps.payments.send({ recipient, amount, coinId, memo });
+            // T.7.C — explicit `transferMode: 'instant'` per §10.1 (production call-site migration).
+            const arSendPromise = deps.payments.send({ recipient, amount, coinId, memo, transferMode: 'instant' });
             let arSendTimer: ReturnType<typeof setTimeout> | undefined;
             const arSendTimeout = new Promise<never>((_, reject) => {
               arSendTimer = setTimeout(
@@ -3864,7 +4312,8 @@ export class AccountingModule {
             // BUG-002 Fix 3: Wrap send() in Promise.race with 60s timeout, matching
             // returnInvoicePayment() pattern. Without this, a hung send blocks all
             // subsequent returns and holds the invoice gate indefinitely.
-            const sendPromise = deps.payments.send({ recipient, amount, coinId, memo });
+            // T.7.C — explicit `transferMode: 'instant'` per §10.1 (production call-site migration).
+            const sendPromise = deps.payments.send({ recipient, amount, coinId, memo, transferMode: 'instant' });
             let sendTimer: ReturnType<typeof setTimeout> | undefined;
             const sendTimeoutPromise = new Promise<never>((_, reject) => {
               sendTimer = setTimeout(
@@ -3964,6 +4413,100 @@ export class AccountingModule {
   // ===========================================================================
 
   /**
+   * Scan PaymentsModule's live + archived token sets for INVOICE-typed
+   * tokens and populate `invoiceTermsCache` with any whose terms are
+   * parseable. Idempotent — existing entries are NOT overwritten (the
+   * cache is also a write-through surface for locally-minted /
+   * locally-imported invoices that may have additional state the
+   * on-disk genesis doesn't carry yet).
+   *
+   * Used by:
+   *   - `_doLoad()` to populate the cache at startup (`emitForNew: false`).
+   *   - The `sync:completed` subscriber to pick up invoice tokens that
+   *     a peer published to Profile/IPFS but never delivered via DM-TXF
+   *     (`emitForNew: true`). The §C.4 cross-device flow depends on this.
+   *
+   * Always rebuilds the hash→ID index at the end so the index stays in
+   * sync with the cache.
+   *
+   * @param opts.emitForNew  When true, fire `invoice:created` with
+   *                         `confirmed: false` for any invoiceId that
+   *                         was NOT already in the cache before this
+   *                         call (matches `importInvoice` semantics —
+   *                         externally-sourced invoices are
+   *                         "unconfirmed" until the caller validates).
+   * @returns The list of invoiceIds newly added by this call.
+   */
+  private _refreshInvoiceTermsCache(opts: { emitForNew: boolean }): string[] {
+    if (!this.deps) return [];
+    const deps = this.deps;
+    const newlyAdded: string[] = [];
+
+    const tryAdd = (id: string, tokenData: string): void => {
+      if (this.invoiceTermsCache.has(id)) return;
+      const rawTerms = this._parseInvoiceTerms(tokenData);
+      if (!rawTerms) return;
+      this.invoiceTermsCache.set(id, this._normalizeInvoiceTerms(rawTerms));
+      newlyAdded.push(id);
+    };
+
+    try {
+      const allTokens = deps.payments.getTokens();
+      for (const token of allTokens) {
+        if (!token.sdkData) continue;
+        try {
+          const txf = JSON.parse(token.sdkData) as TxfToken;
+          const tokenType = txf.genesis?.data?.tokenType;
+          if (tokenType !== INVOICE_TOKEN_TYPE_HEX) continue;
+          const tokenData = txf.genesis?.data?.tokenData;
+          if (!tokenData) continue;
+          tryAdd(token.id, tokenData);
+        } catch (err) {
+          logger.warn(LOG_TAG, `Failed to parse invoice token ${token.id}:`, err);
+        }
+      }
+
+      const archivedTokens = deps.payments.getArchivedTokens();
+      for (const [archivedId, txf] of archivedTokens) {
+        try {
+          const tokenType = txf.genesis?.data?.tokenType;
+          if (tokenType !== INVOICE_TOKEN_TYPE_HEX) continue;
+          const tokenData = txf.genesis?.data?.tokenData;
+          if (!tokenData) continue;
+          tryAdd(archivedId, tokenData);
+        } catch (err) {
+          logger.warn(LOG_TAG, `Failed to parse archived invoice token ${archivedId}:`, err);
+        }
+      }
+    } catch (err) {
+      logger.warn(LOG_TAG, 'Failed to enumerate tokens via PaymentsModule:', err);
+    }
+
+    // Always rebuild the hash index so it stays consistent with the cache.
+    this._rebuildHashIndex();
+
+    if (this.config.debug) {
+      logger.debug(
+        LOG_TAG,
+        `_refreshInvoiceTermsCache: cache=${this.invoiceTermsCache.size}, hashIndex=${this.invoiceIdHashIndex.size}, newlyAdded=${newlyAdded.length}`,
+      );
+    }
+
+    if (opts.emitForNew && newlyAdded.length > 0) {
+      for (const invoiceId of newlyAdded) {
+        // confirmed: false — matches `importInvoice` semantics for
+        // externally-sourced invoices. The sync provider's trust chain
+        // is stronger than DM-TXF in practice, but downstream
+        // consumers should still treat this as "needs payment-side
+        // attribution before any UI commits".
+        deps.emitEvent('invoice:created', { invoiceId, confirmed: false });
+      }
+    }
+
+    return newlyAdded;
+  }
+
+  /**
    * Rebuild the hash→invoiceId index from all known invoices.
    * Called after invoiceTermsCache is fully populated during load().
    */
@@ -4001,39 +4544,76 @@ export class AccountingModule {
   // Internal: Terminal set persistence helpers
   // ===========================================================================
 
-  /** Persist frozen balances map to storage. */
+  /**
+   * Persist frozen balances map to storage.
+   *
+   * W11 (T-D8): frozen balances are derived-state housekeeping — the
+   * user action that triggered the freeze (close / cancel / implicit
+   * terminate) is committed by a separate terminal-set write that
+   * carries the `invoice_close` / `invoice_cancel` tag. Hence
+   * `cache_index` here is correct regardless of caller context.
+   */
   private async _persistFrozenBalances(): Promise<void> {
     const frozenObj: FrozenBalancesStorage = {};
     for (const [invoiceId, frozen] of this.frozenBalances) {
       frozenObj[invoiceId] = frozen;
     }
-    await this.saveJsonToStorage(STORAGE_KEYS_ADDRESS.FROZEN_BALANCES, frozenObj);
+    await this.saveJsonToStorage(
+      STORAGE_KEYS_ADDRESS.FROZEN_BALANCES,
+      frozenObj,
+      'cache_index',
+    );
   }
 
-  /** Persist both terminal sets (CANCELLED and CLOSED) to storage. */
+  /**
+   * Persist both terminal sets (CANCELLED and CLOSED) to storage.
+   *
+   * W11 (T-D8): this helper is a bulk snapshot of BOTH sets — called
+   * from contexts where either set may have changed (load
+   * reconciliation, auto-close on coverage). Classifying as
+   * `cache_index` is a deliberate choice: the caller-side user-action
+   * commit points in `closeInvoice` / `cancelInvoice` / `_terminateInvoice`
+   * already write only the single mutated set with the specific
+   * `invoice_close` / `invoice_cancel` tag; this bulk re-snapshot is
+   * defensive housekeeping (and on the load path the "user action"
+   * already happened in a prior session).
+   */
   private async _persistTerminalSets(): Promise<void> {
     await Promise.all([
       this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.CANCELLED_INVOICES,
         Array.from(this.cancelledInvoices),
+        'cache_index',
       ),
       this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.CLOSED_INVOICES,
         Array.from(this.closedInvoices),
+        'cache_index',
       ),
     ]);
   }
 
-  /** Persist auto-return settings (global flag + per-invoice map) to storage. */
+  /**
+   * Persist auto-return settings (global flag + per-invoice map) to storage.
+   *
+   * W11 (T-D8): auto-return settings are preferences / housekeeping
+   * state (per SPEC §10.2.3 → "auto-return ledger" is `cache_index`).
+   * The user-action triggers (close / cancel) carry their own tag at
+   * the terminal-set commit point; this settings write is ancillary.
+   */
   private async _persistAutoReturnSettings(): Promise<void> {
     const perInvoice: Record<string, boolean> = {};
     for (const [id, enabled] of this.autoReturnPerInvoice.entries()) {
       perInvoice[id] = enabled;
     }
-    await this.saveJsonToStorage(STORAGE_KEYS_ADDRESS.AUTO_RETURN, {
-      global: this.autoReturnGlobal,
-      perInvoice,
-    });
+    await this.saveJsonToStorage(
+      STORAGE_KEYS_ADDRESS.AUTO_RETURN,
+      {
+        global: this.autoReturnGlobal,
+        perInvoice,
+      },
+      'cache_index',
+    );
   }
 
   // ===========================================================================
@@ -4142,11 +4722,16 @@ export class AccountingModule {
       }
 
       try {
+        // T.7.C — explicit `transferMode: 'instant'` per §10.1 (production call-site migration).
+        // Crash-recovery replays a previously-intended auto-return; the original intent's
+        // wire shape was 'instant' (no other mode is selected by AccountingModule today),
+        // so explicit re-statement keeps the replay byte-equivalent post-default-flip.
         const result = await deps.payments.send({
           recipient: entry.recipient,
           amount: entry.amount,
           coinId: entry.coinId,
           memo: entry.memo,
+          transferMode: 'instant',
         });
 
         const returnTransferId = result.id;
@@ -4241,7 +4826,18 @@ export class AccountingModule {
       try {
         const raw = await this.deps!.storage.get(key);
         if (!raw) continue;
-        const entries = JSON.parse(raw) as Record<string, InvoiceTransferRef>;
+        // Dual-read per PROFILE-CID-REFERENCES.md §6: detects CID ref and
+        // fetches from IPFS, or falls through to legacy inline JSON.
+        // `_parseLedgerPayload` returns `null` on corrupt shape (not an
+        // object) — caller treats the same as the existing parse-error path:
+        // reset the inner map and rescan. CID_REF_UNREADABLE (ref present +
+        // no cidRefStore) propagates through the outer try/catch as a
+        // corruption signal (safe — the reset-and-rescan path rebuilds from
+        // on-chain data).
+        const entries = await this._parseLedgerPayload(raw, invoiceId);
+        if (entries === null) {
+          throw new Error(`_parseLedgerPayload returned null for invoice ${invoiceId}`);
+        }
         const innerMap = this.invoiceLedger.get(invoiceId)!;
         const now = Date.now();
         const PROVISIONAL_TTL_MS = 10 * 60 * 1000; // 10 minutes
@@ -4469,15 +5065,15 @@ export class AccountingModule {
       if (!tx?.data?.['message']) continue;
 
       // Decode hex-encoded UTF-8 JSON message to TransferMessagePayload
+      // Steelman³² + ³⁴: use the central strictHexToBytesAllowEmpty
+      // helper — accepts empty (returns empty bytes; decoder falls
+      // through to "no payload"), rejects odd-length and non-hex.
       let payload: TransferMessagePayload | null = null;
       try {
         const hexStr = tx.data['message'] as string;
         if (!hexStr || hexStr.length > 8192) continue;
-        // W10 fix: validate hex chars before parseInt to avoid NaN bytes
-        if (!/^[0-9a-fA-F]*$/.test(hexStr)) continue;
-        const matches = hexStr.match(/.{1,2}/g);
-        if (!matches) continue;
-        const bytes = new Uint8Array(matches.map((b) => parseInt(b, 16)));
+        const bytes = strictHexToBytesAllowEmpty(hexStr);
+        if (bytes.length === 0) continue;
         payload = decodeTransferMessage(bytes);
       } catch {
         continue;
@@ -4725,7 +5321,44 @@ export class AccountingModule {
       }
     });
 
-    this.unsubscribePayments = [unsubIncoming, unsubConfirmed, unsubHistory, unsubTokenChange];
+    // Refresh the invoice terms cache on every sync completion.
+    //
+    // `PaymentsModule.sync()` pulls new tokens from Profile/IPFS providers
+    // via `loadFromStorageData(result.merged)`, which intentionally
+    // BYPASSES `addToken()` — so the `onTokenChange` observer above
+    // never fires for sync-imported invoice tokens. Without this
+    // subscriber, an invoice that another peer minted + published to
+    // Profile (the §C.4 cross-device flow) never lands in
+    // `invoiceTermsCache`, and `getInvoiceStatus(invoiceId)` returns
+    // "No invoice found matching prefix" even though the token IS in
+    // the local store.
+    //
+    // The handler runs the same scan as `load()` but in idempotent
+    // mode: only new IDs are added, existing entries are preserved
+    // (they may carry write-through state from locally-minted invoices
+    // that the on-disk genesis doesn't reflect yet), and
+    // `invoice:created` fires once per newly-discovered ID with
+    // `confirmed: false`. See `_refreshInvoiceTermsCache` for details.
+    //
+    // Companion CLI fix: sphere-cli#24 routes `invoice-status` /
+    // `invoice-list` through `ensureSync(sphere, 'full')` so this
+    // listener actually has data to pick up.
+    const unsubSyncCompleted = deps.on('sync:completed', () => {
+      if (this.destroyed) return;
+      try {
+        this._refreshInvoiceTermsCache({ emitForNew: true });
+      } catch (err) {
+        logger.warn(LOG_TAG, 'Error refreshing invoice terms cache after sync:', err);
+      }
+    });
+
+    this.unsubscribePayments = [
+      unsubIncoming,
+      unsubConfirmed,
+      unsubHistory,
+      unsubTokenChange,
+      unsubSyncCompleted,
+    ];
   }
 
   // ===========================================================================
@@ -5315,8 +5948,163 @@ export class AccountingModule {
       this._processReceiptDM(message);
     } else if (content.startsWith('invoice_cancellation:')) {
       this._processCancellationDM(message);
+    } else if (content.startsWith(INVOICE_DELIVERY_DM_PREFIX)) {
+      // #226: per-invoice UXF-bundle delivery. Awaited so concurrent
+      // arrivals for the same invoice serialize on the importInvoice
+      // side-effects (token storage + ledger cache). Errors are swallowed
+      // inside `_processInvoiceDeliveryDM`; the try/catch here is
+      // defense-in-depth against programmer error.
+      try {
+        await this._processInvoiceDeliveryDM(message);
+      } catch (err) {
+        logger.warn(LOG_TAG, '_processInvoiceDeliveryDM threw unexpectedly:', err);
+      }
     }
-    // Neither prefix → regular DM, no action
+    // No recognized prefix → regular DM, no action
+  }
+
+  /**
+   * Parse and import an `invoice_delivery:` UXF-bundle DM (#226).
+   *
+   * Steps:
+   *   1. Apply DM-size guard (`MAX_INVOICE_DELIVERY_BYTES`).
+   *   2. JSON.parse the substring after the prefix.
+   *   3. Validate the {@link InvoiceDeliveryEnvelope} shape (type / version
+   *      / invoiceId / bundle discriminator).
+   *   4. For `uxf-car`: base64-decode the CAR bytes inline.
+   *      For `uxf-cid`: deferred to a follow-up; logs a warning and drops.
+   *   5. `UxfPackage.fromCar(carBytes)` then `pkg.assemble(invoiceId)` to
+   *      rebuild the TxfToken JSON.
+   *   6. Call {@link importInvoice} with the assembled token. The import
+   *      path owns full proof verification + token-type guard + ledger
+   *      insertion — no logic is duplicated here.
+   *   7. `INVOICE_ALREADY_EXISTS` is treated as benign (relay replay,
+   *      prior manual import, parallel deliverInvoice). All other
+   *      `SphereError` codes are logged and dropped — a single malicious
+   *      DM must NOT break the wider receive pipeline.
+   *
+   * @param message - DM whose content starts with `invoice_delivery:`.
+   */
+  private async _processInvoiceDeliveryDM(message: DirectMessage): Promise<void> {
+    const jsonSubstring = message.content.slice(INVOICE_DELIVERY_DM_PREFIX.length);
+
+    // Size guard — drop oversized DMs silently. Matches the swap
+    // module's `MAX_INVOICE_TOKEN_BYTES` philosophy: malformed input is
+    // an attacker concern, not a caller error.
+    if (jsonSubstring.length > MAX_INVOICE_DELIVERY_BYTES) return;
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(jsonSubstring);
+    } catch {
+      return; // malformed envelope JSON — drop, treat as regular DM
+    }
+
+    if (typeof parsed !== 'object' || parsed === null) return;
+    const raw = parsed as Record<string, unknown>;
+
+    if (raw['type'] !== 'invoice_delivery') return;
+
+    const version = raw['version'];
+    if (typeof version !== 'number' || !Number.isInteger(version) || version < 1) return;
+    if (version > 1) return; // forward-compat: silently ignore future versions
+
+    const invoiceId = raw['invoiceId'];
+    if (typeof invoiceId !== 'string' || !/^[0-9a-f]{64,68}$/.test(invoiceId)) return;
+
+    const bundle = raw['bundle'];
+    if (typeof bundle !== 'object' || bundle === null) return;
+    const bundleRecord = bundle as Record<string, unknown>;
+    const bundleKind = bundleRecord['kind'];
+    const bundleCid = bundleRecord['bundleCid'];
+    if (typeof bundleCid !== 'string' || bundleCid.length === 0) return;
+
+    let carBytes: Uint8Array | null = null;
+    if (bundleKind === 'uxf-car') {
+      const carBase64 = bundleRecord['carBase64'];
+      if (typeof carBase64 !== 'string' || carBase64.length === 0) return;
+      try {
+        // Strict-mode decode (rejects characters outside the base64
+        // alphabet) — same helper the payments instant-mode receiver
+        // uses on uxf-car payloads.
+        const { carBase64ToBytes } = await import('../../uxf/transfer-payload.js');
+        carBytes = carBase64ToBytes(carBase64);
+      } catch (err) {
+        logger.warn(
+          LOG_TAG,
+          `Invoice delivery ${invoiceId}: base64 decode failed (sender=${message.senderPubkey.slice(0, 16)})`,
+          err,
+        );
+        return;
+      }
+    } else if (bundleKind === 'uxf-cid') {
+      // CID-by-reference delivery requires an IPFS fetch path. The
+      // primary fetch infrastructure lives in PaymentsModule's
+      // `cidFetchGateways` + `acquireBundle` pipeline (issue #223). A
+      // future follow-up will share that fetch path; for now we log
+      // and drop so callers get visibility instead of silent failure.
+      logger.warn(
+        LOG_TAG,
+        `Invoice delivery ${invoiceId}: kind=uxf-cid not yet supported on the receiver — ` +
+          `caller must pin via deliverInvoice's inline path. bundleCid=${bundleCid.slice(0, 16)} ` +
+          `sender=${message.senderPubkey.slice(0, 16)}`,
+      );
+      return;
+    } else {
+      return; // unknown bundle.kind — silent drop, forward-compat
+    }
+
+    // Decode the UXF CAR and assemble the invoice token.
+    let assembledToken: unknown;
+    try {
+      const { UxfPackage } = await import('../../uxf/UxfPackage.js');
+      const pkg = await UxfPackage.fromCar(carBytes);
+      // Verify the bundle contains the claimed invoiceId. A hostile
+      // sender could ship a different invoice; reject rather than
+      // surprise-import an unrelated token.
+      if (!pkg.hasToken(invoiceId)) {
+        logger.warn(
+          LOG_TAG,
+          `Invoice delivery ${invoiceId}: CAR does not contain the claimed tokenId ` +
+            `(present: ${pkg.tokenIds().slice(0, 5).join(',')} ${pkg.tokenIds().length > 5 ? '…' : ''}) ` +
+            `sender=${message.senderPubkey.slice(0, 16)}`,
+        );
+        return;
+      }
+      assembledToken = pkg.assemble(invoiceId);
+    } catch (err) {
+      logger.warn(
+        LOG_TAG,
+        `Invoice delivery ${invoiceId}: UXF decode/assemble failed (sender=${message.senderPubkey.slice(0, 16)})`,
+        err,
+      );
+      return;
+    }
+
+    // Hand off to importInvoice. Same path swap uses for escrow
+    // deliveries — it owns proof verification, token-type guard, terms
+    // parse, storage, and ledger insertion.
+    try {
+      await this.importInvoice(assembledToken as TxfToken);
+      if (this.config.debug) {
+        logger.debug(
+          LOG_TAG,
+          `Invoice ${invoiceId}: imported from UXF delivery DM (sender=${message.senderPubkey.slice(0, 16)})`,
+        );
+      }
+    } catch (err) {
+      if (err instanceof SphereError && err.code === 'INVOICE_ALREADY_EXISTS') {
+        if (this.config.debug) {
+          logger.debug(LOG_TAG, `Invoice ${invoiceId}: already exists locally — delivery DM ignored`);
+        }
+        return;
+      }
+      logger.warn(
+        LOG_TAG,
+        `Invoice ${invoiceId}: import from UXF delivery DM failed (sender=${message.senderPubkey.slice(0, 16)})`,
+        err,
+      );
+    }
   }
 
   /**
@@ -5870,7 +6658,9 @@ export class AccountingModule {
 
     // §6.2 step 7e: Expiry check — fire informational expired event if dueDate passed
     if (
-      terms.dueDate !== undefined &&
+      // typeof === 'number' rejects both undefined AND the null produced by
+      // canonicalSerialize round-trip (see balance-computer.ts state guard).
+      typeof terms.dueDate === 'number' &&
       Date.now() > terms.dueDate &&
       status.state !== 'COVERED' &&
       status.state !== 'CLOSED' &&
@@ -6117,7 +6907,8 @@ export class AccountingModule {
     }
 
     if (
-      terms.dueDate !== undefined &&
+      // Same null-after-round-trip guard as above and balance-computer.ts.
+      typeof terms.dueDate === 'number' &&
       Date.now() > terms.dueDate &&
       status.state !== 'COVERED' &&
       status.state !== 'CLOSED' &&
@@ -6194,11 +6985,13 @@ export class AccountingModule {
     // (causing duplicate payment on crash recovery).
     try {
       // Steelman fix: Wrap send() with 60s timeout for consistency with all other send paths.
+      // T.7.C — explicit `transferMode: 'instant'` per §10.1 (production call-site migration).
       const evtSendPromise = deps.payments.send({
         recipient: sendParams.returnTo,
         amount: sendParams.amount,
         coinId: sendParams.coinId,
         memo: sendParams.memo,
+        transferMode: 'instant',
       });
       let evtSendTimer: ReturnType<typeof setTimeout> | undefined;
       const evtSendTimeout = new Promise<never>((_, reject) => {
@@ -6525,10 +7318,7 @@ export class AccountingModule {
         entries[k] = v;
       }
       try {
-        await this.deps!.storage.set(
-          this.getStorageKey(`${INV_LEDGER_PREFIX}${invoiceId}`),
-          JSON.stringify(entries),
-        );
+        await this._persistLedgerForInvoice(invoiceId, entries);
         written.add(invoiceId);
       } catch (err) {
         logger.warn(LOG_TAG, `Failed to persist ledger for invoice ${invoiceId} — aborting flush`, err);
@@ -6545,13 +7335,23 @@ export class AccountingModule {
     if (step1Failed) return;
 
     // Step 2: Write token_scan_state
+    // W11 (T-D8): the scan watermark is per-token processing state —
+    // pure bookkeeping, not itself a user action. The user action
+    // (payment attribution) is already persisted by step 1's per-invoice
+    // ledger write which carries the `invoice_pay` tag.
     const scanStateObj: Record<string, number> = {};
     for (const [tokenId, count] of this.tokenScanState.entries()) {
       scanStateObj[tokenId] = count;
     }
-    await this.saveJsonToStorage(STORAGE_KEYS_ADDRESS.TOKEN_SCAN_STATE, scanStateObj);
+    await this.saveJsonToStorage(
+      STORAGE_KEYS_ADDRESS.TOKEN_SCAN_STATE,
+      scanStateObj,
+      'cache_index',
+    );
 
     // Step 3: Write INV_LEDGER_INDEX
+    // W11 (T-D8): the index is a derived-state metadata snapshot of
+    // which invoices exist and their terminal/frozen state — housekeeping.
     const indexMeta: InvLedgerIndex = {};
     for (const invoiceId of this.invoiceLedger.keys()) {
       indexMeta[invoiceId] = {
@@ -6559,7 +7359,11 @@ export class AccountingModule {
         frozenAt: this.frozenBalances.get(invoiceId)?.frozenAt,
       };
     }
-    await this.saveJsonToStorage(STORAGE_KEYS_ADDRESS.INV_LEDGER_INDEX, indexMeta);
+    await this.saveJsonToStorage(
+      STORAGE_KEYS_ADDRESS.INV_LEDGER_INDEX,
+      indexMeta,
+      'cache_index',
+    );
 
     // W9 fix: clear tokenScanDirty AFTER all 3 steps complete, not between steps 2 and 3.
     // If step 3 fails, the dirty flag remains set so the next flush retries.
@@ -6580,6 +7384,111 @@ export class AccountingModule {
       this.tokenInvoiceMap.set(tokenId, set);
     }
     set.add(invoiceId);
+  }
+
+  // ===========================================================================
+  // Internal: Per-invoice ledger CID-ref persistence (PROFILE-CID-REFERENCES.md §8.3)
+  // ===========================================================================
+
+  /**
+   * Persist an invoice's ledger entries — via CID reference when
+   * `cidRefStore` is injected, inline JSON otherwise. Pattern A per-invoice
+   * per spec §8.3. Each invoice has its own KV key and its own memo slot,
+   * so pins/refs for different invoices never collide.
+   *
+   * Memoization: if the serialized entries match the last successful pin
+   * for this invoice, reuse the cached ref rather than re-pinning (AES-GCM
+   * random IVs would otherwise churn a new CID on every unchanged flush).
+   */
+  private async _persistLedgerForInvoice(
+    invoiceId: string,
+    entries: Record<string, InvoiceTransferRef>,
+  ): Promise<void> {
+    const key = this.getStorageKey(`${INV_LEDGER_PREFIX}${invoiceId}`);
+    const cidRefStore = this.deps!.cidRefStore;
+
+    if (cidRefStore) {
+      const json = JSON.stringify(entries);
+
+      // Memo hit — identical plaintext, reuse cached ref.
+      const cached = this._lastPinnedLedgerByInvoice.get(invoiceId);
+      if (cached && cached.json === json) {
+        // W11 (T-D8): per-invoice ledger entries persist payment
+        // attributions for this invoice — user action `invoice_pay`.
+        await this.setStorageEntry(key, CidRefStore.stringifyRef(cached.ref), 'invoice_pay');
+        return;
+      }
+
+      const ref = await cidRefStore.pinJson(entries);
+      await this.setStorageEntry(key, CidRefStore.stringifyRef(ref), 'invoice_pay');
+      // Update memo AFTER successful storage.set — a set-failure must not
+      // leave us pointing at a CID the caller thinks is live.
+      this._lastPinnedLedgerByInvoice.set(invoiceId, { json, ref });
+      return;
+    }
+
+    // Legacy path: inline JSON.
+    await this.setStorageEntry(key, JSON.stringify(entries), 'invoice_pay');
+  }
+
+  /**
+   * Parse a raw ledger KV payload for one invoice — dual-read per §6:
+   *   - CID ref envelope → fetch from IPFS via `cidRefStore`.
+   *   - No cidRefStore but ref present → throw CID_REF_UNREADABLE (silent
+   *     fallback would mean silently losing all tracked payments for this
+   *     invoice, corrupting balance computation).
+   *   - Legacy inline JSON → parse with narrow SyntaxError catch.
+   *
+   * Returns `null` on malformed non-ref data; caller treats that as
+   * "reset this invoice's inner map and force rescan" (same contract as
+   * the pre-refactor try/catch at the load call site).
+   */
+  private async _parseLedgerPayload(
+    raw: string,
+    invoiceId: string,
+  ): Promise<Record<string, InvoiceTransferRef> | null> {
+    const ref = CidRefStore.tryParseRef(raw);
+    if (ref) {
+      if (!this.deps!.cidRefStore) {
+        const { ProfileError } = await import('../../profile/errors.js');
+        throw new ProfileError(
+          'CID_REF_UNREADABLE',
+          `AccountingModule._parseLedgerPayload: ledger for invoice ${invoiceId} ` +
+            `contains a CID ref (cid=${ref.cid}) but no cidRefStore was injected. ` +
+            `Invoice payments cannot be restored without IPFS access. ` +
+            `Check AccountingModule init — is cidRefStore provided?`,
+        );
+      }
+      const fetched = await this.deps!.cidRefStore.fetchJson<Record<string, InvoiceTransferRef>>(ref);
+      // Defensive shape check — IPFS content should be a plain object map.
+      if (fetched === null || typeof fetched !== 'object' || Array.isArray(fetched)) {
+        logger.warn(
+          LOG_TAG,
+          `[LEDGER] CID-ref content at ${ref.cid} for invoice ${invoiceId} is not an object (got ${typeof fetched}); treating as corrupt.`,
+        );
+        return null;
+      }
+      return fetched;
+    }
+
+    // Legacy inline JSON — narrow catch for corruption.
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        logger.warn(
+          LOG_TAG,
+          `[LEDGER] Decoded data for invoice ${invoiceId} is not an object (got ${typeof parsed}); treating as corrupt.`,
+        );
+        return null;
+      }
+      return parsed as Record<string, InvoiceTransferRef>;
+    } catch (err) {
+      if (err instanceof SyntaxError) {
+        logger.warn(LOG_TAG, `[LEDGER] Legacy JSON parse failed for invoice ${invoiceId}:`, err);
+        return null;
+      }
+      throw err;
+    }
   }
 
   // ===========================================================================
@@ -6679,18 +7588,94 @@ export class AccountingModule {
   }
 
   /**
-   * JSON-serialize and save a value to storage.
+   * JSON-serialize and save a value to storage with an explicit W11
+   * originated-tag classification (T-D8, SPEC §10.2.3).
    *
-   * @param key   - Storage key (will be scoped via getStorageKey).
-   * @param value - Value to serialize and store.
+   * Callers MUST choose `entryType` at the call site — the helper does
+   * not infer. Mis-classification is caught at runtime by
+   * `assertOriginTagLocal` inside the storage layer and surfaced as
+   * SECURITY_ORIGIN_MISMATCH. TypeScript catches unknown tags at
+   * compile time via the narrow union.
+   *
+   * @param key       - Storage key (will be scoped via getStorageKey).
+   * @param value     - Value to serialize and store.
+   * @param entryType - W11 classification (see setStorageEntry).
    */
-  private async saveJsonToStorage(key: string, value: unknown): Promise<void> {
+  private async saveJsonToStorage(
+    key: string,
+    value: unknown,
+    entryType: 'invoice_close' | 'invoice_cancel' | 'cache_index',
+  ): Promise<void> {
     try {
-      await this.deps!.storage.set(this.getStorageKey(key), JSON.stringify(value));
+      await this.setStorageEntry(
+        this.getStorageKey(key),
+        JSON.stringify(value),
+        entryType,
+      );
     } catch (err) {
       logger.warn(LOG_TAG, `Failed to save storage key "${key}":`, err);
     }
   }
+
+  /**
+   * W11 originated-tag dispatcher (T-D8, SPEC §10.2.3). Writes through
+   * `storage.setEntry` when the provider supports it so the OpLog
+   * envelope carries an explicit `originated` tag matching the semantic
+   * class of the write. Providers without envelope-storage (plain
+   * IndexedDB / file KV) fall through to the plain `set()` — semantics
+   * are identical, only the peer-replicated classification differs.
+   *
+   * Classification (see profile/aggregator-pointer/originated-tag.ts):
+   *   - `invoice_pay`    — per-invoice ledger entry persists a payment
+   *                         attribution (user action on the target side).
+   *   - `invoice_close`  — explicit or implicit CLOSED-set commit point.
+   *   - `invoice_cancel` — explicit or implicit CANCELLED-set commit point.
+   *   - `cache_index`    — derived-state snapshots (frozen balances,
+   *                         auto-return settings, token scan watermark,
+   *                         INV_LEDGER_INDEX, bulk terminal-set
+   *                         re-writes, load-time reconciliation).
+   *
+   * `invoice_mint` is deliberately NOT in the union: invoice mint
+   * persists the token via `PaymentsModule.addToken` (TokenStorageProvider
+   * — envelope-stamped separately in T-D11) and never reaches this
+   * KV-level helper.
+   *
+   * Callers MUST choose the classification at the call site — the
+   * helper does NOT infer. Mis-classification is caught by
+   * `assertOriginTagLocal` inside the storage layer and surfaced as
+   * SECURITY_ORIGIN_MISMATCH.
+   */
+  private async setStorageEntry(
+    key: string,
+    value: string,
+    entryType: 'invoice_pay' | 'invoice_close' | 'invoice_cancel' | 'cache_index',
+  ): Promise<void> {
+    const storage = this.deps!.storage;
+    const setEntryFn = (storage as { setEntry?: (k: string, v: string, t: string) => Promise<void> })
+      .setEntry;
+    if (typeof setEntryFn === 'function') {
+      await setEntryFn.call(storage, key, value, entryType);
+      return;
+    }
+    // Fallback: provider has no envelope-storage layer (plain IndexedDB
+    // / file KV). Log once per provider-class so a silent loss of W11
+    // stamping during a migration is visible in ops. Subsequent calls
+    // from the same class are silent to avoid log spam.
+    const providerClass = (storage as { constructor?: { name?: string } }).constructor?.name
+      ?? 'UnknownStorage';
+    if (!AccountingModule._w11FallbackLogged.has(providerClass)) {
+      AccountingModule._w11FallbackLogged.add(providerClass);
+      logger.debug(
+        LOG_TAG,
+        `[W11] storage.setEntry not available on ${providerClass}; originated tags will not be stamped ` +
+          `(this is expected for plain IndexedDB / file storage, unexpected when ProfileStorageProvider is in the chain).`,
+      );
+    }
+    await storage.set(key, value);
+  }
+
+  /** Per-class dedup set for the W11 fallback log (see setStorageEntry). */
+  private static _w11FallbackLogged: Set<string> = new Set();
 }
 
 // =============================================================================

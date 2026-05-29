@@ -250,7 +250,8 @@ describe('History sync integration (multi-device)', () => {
 
     const dedupKeys = historyB.map(e => e.dedupKey);
     expect(dedupKeys).toContain('RECEIVED_token-from-alice');
-    expect(dedupKeys).toContain('SENT_transfer_transfer-to-bob');
+    // #149 multi-coin follow-up — SENT dedupKey now includes coinId
+    expect(dedupKeys).toContain('SENT_transfer_transfer-to-bob_UCT');
 
     // Verify content preserved
     const received = historyB.find(e => e.type === 'RECEIVED');
@@ -344,7 +345,8 @@ describe('History sync integration (multi-device)', () => {
     // Should have 3 unique entries (shared-token deduped, only-on-a, only-on-b)
     const dedupKeys = historyB.map(e => e.dedupKey);
     expect(dedupKeys).toContain('RECEIVED_shared-token');
-    expect(dedupKeys).toContain('SENT_transfer_only-on-a');
+    // #149 multi-coin follow-up — SENT dedupKey now includes coinId
+    expect(dedupKeys).toContain('SENT_transfer_only-on-a_UCT');
     expect(dedupKeys).toContain('RECEIVED_only-on-b');
 
     // No duplicates

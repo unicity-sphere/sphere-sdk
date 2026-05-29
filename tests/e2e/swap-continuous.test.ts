@@ -25,7 +25,7 @@
 import { describe, it, expect, afterAll, beforeAll } from 'vitest';
 import { Sphere } from '../../core/Sphere';
 import { execSync, spawn, ChildProcess } from 'node:child_process';
-import { mkdirSync, writeFileSync, existsSync, cpSync, readFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync, existsSync, cpSync, readFileSync, openSync, closeSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -37,10 +37,24 @@ import {
   getBalance,
   rand,
 } from './helpers';
+import { preflightSkip } from './lib/preflight';
 
-const SKIP = !process.env.RUN_CONTINUOUS_TESTS;
 const ESCROW_SRC = process.env.ESCROW_DIR || join(__dirname, '../../../../escrow-service');
 const SDK_ROOT = join(__dirname, '../..');
+const ESCROW_AVAILABLE = existsSync(ESCROW_SRC);
+if (process.env.RUN_CONTINUOUS_TESTS && !ESCROW_AVAILABLE) {
+  console.warn(
+    `[preflight] skipping swap-continuous: escrow source not present at ${ESCROW_SRC}`,
+  );
+}
+// Continuous swap exercises the full transfer lifecycle: nostr (proposal +
+// gift-wrap delivery), aggregator (commitment submission + inclusion proofs).
+// Gated by RUN_CONTINUOUS_TESTS opt-in AND the local escrow-service checkout
+// AND the infra-probe preflight.
+const SKIP =
+  !process.env.RUN_CONTINUOUS_TESTS ||
+  !ESCROW_AVAILABLE ||
+  preflightSkip(['nostr', 'aggregator', 'faucet'], 'swap-continuous');
 
 // Timeouts
 const ESCROW_STARTUP_TIMEOUT = 60_000;
@@ -129,7 +143,7 @@ describe.skipIf(SKIP)('Continuous-process swap E2E (full lifecycle)', () => {
     // Launch escrow as a persistent process
     console.log(`Launching escrow @${escrowNametag}...`);
     const escrowLog = join(workspace, 'escrow.log');
-    escrowLogFd = require('fs').openSync(escrowLog, 'w');
+    escrowLogFd = openSync(escrowLog, 'w');
     escrowProcess = spawn('npx', ['tsx', '--env-file=.env', 'src/index.ts'], {
       cwd: escrowDir,
       stdio: ['ignore', escrowLogFd, escrowLogFd],
@@ -167,7 +181,7 @@ describe.skipIf(SKIP)('Continuous-process swap E2E (full lifecycle)', () => {
 
     // Close escrow log fd
     if (escrowLogFd !== null) {
-      try { require('fs').closeSync(escrowLogFd); } catch { /* ignore */ }
+      try { closeSync(escrowLogFd); } catch { /* ignore */ }
       escrowLogFd = null;
     }
 

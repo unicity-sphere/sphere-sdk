@@ -1,0 +1,40 @@
+# Optional TLS server block — included only when SSL_DOMAIN is set
+# and the Let's Encrypt cert is in place. entrypoint.sh stages this
+# file into /etc/nginx/sites-enabled/ alongside the plaintext config.
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+
+    server_name ${SSL_DOMAIN};
+
+    ssl_certificate     /etc/letsencrypt/live/${SSL_DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${SSL_DOMAIN}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    location = /.well-known/faucet.json {
+        default_type application/json;
+        add_header Access-Control-Allow-Origin "*" always;
+        alias /var/lib/faucet/identity.json;
+    }
+    location = /faucet.json {
+        return 302 /.well-known/faucet.json;
+    }
+    location = /health {
+        default_type application/json;
+        add_header Access-Control-Allow-Origin "*" always;
+        return 200 '{"status":"ok"}';
+    }
+    location = / {
+        default_type text/plain;
+        return 200 'Unicity testnet faucet. See /.well-known/faucet.json for identity.\n';
+    }
+    location / { return 404; }
+
+    access_log /dev/stdout;
+    error_log  /dev/stderr warn;
+}

@@ -252,10 +252,18 @@ const balance = await client.query('sphere_getBalance');
 const assets  = await client.query('sphere_getAssets');
 
 // Intents — wallet opens UI for user confirmation
+// The `send` intent payload is the SDK's TransferRequest verbatim.
 const txResult = await client.intent('send', {
   recipient: '@alice',
-  amount: 100,
+  amount: '100',          // string, smallest units
   coinId: 'USDC',
+  // Multi-asset (optional):
+  // additionalAssets: [{ kind: 'coin', coinId: 'UCT', amount: '50' },
+  //                    { kind: 'nft',  tokenId: '0xabc...' }],
+  // Mode + chain mode (optional):
+  // transferMode: 'instant',           // 'instant' | 'conservative'
+  // allowPendingTokens: false,         // chain-mode opt-in
+  // confirmNftPending: false,          // required true if NFT source is pending
 });
 
 // Sign a message (e.g. challenge-response auth)
@@ -329,7 +337,7 @@ interface PublicIdentity { chainPubkey; directAddress?; l1Address; nametag?; }
 
 | Action | Params |
 |--------|--------|
-| `send` | `recipient, amount, coinId` |
+| `send` | `recipient, coinId, amount, additionalAssets?, memo?, transferMode?, allowPendingTokens?, confirmNftPending?` (full `TransferRequest` — see [API.md](API.md) and the canonical [UXF-TRANSFER-PROTOCOL §4.1](uxf/UXF-TRANSFER-PROTOCOL.md)) |
 | `l1_send` | `recipient, amount` |
 | `dm` | `recipient, content` |
 | `payment_request` | `amount, coinId, description?` |
@@ -344,6 +352,8 @@ interface PublicIdentity { chainPubkey; directAddress?; l1Address; nametag?; }
 | `send_invoice_receipts` | `invoiceId, memo?, includeZeroBalance?` |
 | `send_cancellation_notices` | `invoiceId, reason?, dealDescription?, includeZeroBalance?` |
 | `set_auto_return` | `invoiceId, enabled` |
+
+> **Normative note (send intent payload)**: the `send` intent payload is the SDK's `TransferRequest` verbatim. Wallet hosts MUST validate `additionalAssets` per [UXF-TRANSFER-PROTOCOL §4.1](uxf/UXF-TRANSFER-PROTOCOL.md) — including the forward-compat reject for unrecognized `kind` values (`UNKNOWN_ASSET_KIND`). Hosts SHOULD surface NFT entries distinctly in the user-confirmation UI: NFT transfers are class-disjoint from coin transfers and not refundable in the same way (canonical asset model). When `allowPendingTokens: true` is combined with NFT entries whose source has unfinalized predecessor txs, hosts MUST require `confirmNftPending: true` (per the cascade-asymmetry warning).
 
 ### sign_message Intent
 

@@ -1,0 +1,44 @@
+# nostr-rs-relay config — rendered by entrypoint.sh with envsubst.
+#
+# Defaults are deliberately permissive (no auth, no allow-list, no
+# rate limiting beyond the relay's built-in floors). Tighten before
+# exposing the relay publicly long-term.
+
+[info]
+relay_url = "${RELAY_URL}"
+name = "${RELAY_NAME}"
+description = "${RELAY_DESCRIPTION}"
+pubkey = ""
+contact = ""
+
+[database]
+data_directory = "${RELAY_DATA_DIR}"
+in_memory = false
+
+[network]
+port = ${RELAY_PORT}
+address = "0.0.0.0"
+remote_ip_header = "x-forwarded-for"
+ping_interval_seconds = 300
+
+[limits]
+messages_per_sec = 0          # 0 = unlimited
+subscriptions_per_min = 0
+db_conns_per_client = 0
+max_blocking_threads = 16
+max_event_bytes = 131072      # 128 KiB
+max_ws_message_bytes = 196608
+max_ws_frame_bytes = 196608
+broadcast_buffer = 16384
+event_persist_buffer = 4096
+event_kind_blacklist = []
+event_kind_allowlist = []
+
+[authorization]
+# pubkey_whitelist = []       # leave commented for an open relay
+
+[verified_users]
+mode = "disabled"
+
+[diagnostics]
+tracing = false

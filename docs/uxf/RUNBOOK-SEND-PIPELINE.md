@@ -1,0 +1,281 @@
+# Operator Runbook — OUTBOX/SEND Pipeline Events
+
+**Audience**: operators and on-call engineers running wallets that emit Sphere SDK events on the send side. Every event in this runbook can fire in normal operation; the runbook describes what each one means, what state the wallet is in when it fires, the diagnostic data to collect, and the recommended actions.
+
+**Scope**: the eight events surfaced by Issue #166 + the OUTBOX-SEND-FOLLOWUPS wave + Issue #174:
+
+- `transfer:orphan-spending-detected`
+- `transfer:orphan-recovered`
+- `transfer:sent-reconciliation-recovered`
+- `transfer:sent-reconciliation-failed`
+- `transfer:retention-warning`
+- `transfer:retention-republish-rearmed`
+- `transfer:retention-republish-skipped`
+- `transfer:off-record-spent`
+
+**See also**:
+- [OUTBOX-SEND-FOLLOWUPS.md](./OUTBOX-SEND-FOLLOWUPS.md) — open follow-ups + architecture recap
+- [UXF-TRANSFER-PROTOCOL.md](./UXF-TRANSFER-PROTOCOL.md) §7 — outbox state machine
+- [PROFILE-ARCHITECTURE.md](./PROFILE-ARCHITECTURE.md) §10.12 — per-entry-key storage
+
+---
+
+## Architecture recap (skip if you know it)
+
+The OUTBOX is a working queue. Each entry tracks a single token-transfer bundle from `'packaging' → 'sending' → 'delivered'`/`'delivered-instant' → ...`. On terminal success, the entry's contents are copied into the **SENT ledger** (the durable historical record) and the OUTBOX entry is **tombstoned** (deleted via marker, not via `db.del()` — so concurrent replicas can't resurrect).
+
+Three background workers maintain the pipeline:
+
+| Worker | Purpose |
+|--------|---------|
+| `SendingRecoveryWorker` | Republishes entries stuck in `'sending'` past a threshold. |
+| `SentReconciliationWorker` | Re-runs SENT-writes that failed at the dispatcher's transition. |
+| `NostrPersistenceVerifier` | Detects retention drops on previously-delivered events. Default-OFF. |
+| `TombstoneGcWorker` | Reclaims storage by `db.del()`-ing tombstones past a retention window. Default-OFF. |
+| `SpentStateRescanWorker` | Probes `oracle.isSpent` per active-pool token to detect off-record (sibling-instance) spends. Default-OFF. |
+
+A sweeper (`detectOrphanSpendingTokens()`) catches tokens marked `'transferring'` locally but never persisted to OUTBOX — the crash window between `commitSources` and `outbox.create`.
+
+CAR bytes are pinned to IPFS by our node. Nostr `TOKEN_TRANSFER` events carry either inline CAR bytes (for small bundles) or just the CID-by-reference. **Bundle bytes are NEVER stored in OUTBOX, SENT, or tombstones — only the CID is retained.**
+
+---
+
+## Event sections
+
+### `transfer:orphan-spending-detected`
+
+**Payload**: `{ tokenId, detectedAt, coinId, amount }`
+
+**What it means.** The orphan-spending sweeper found a token marked `'transferring'` in the local store but absent from both OUTBOX and SENT. This is the signature of a crash between two steps in the send flow:
+
+1. `selectSources` marked the token `'transferring'` and `commitSources` issued the spending commit to the aggregator.
+2. The orchestrator's `outbox.create` hook failed to write the OUTBOX entry (process crash, browser tab kill, OrbitDB unavailable, etc.).
+
+The aggregator's view may or may not include the commit. Locally the token is unspendable (`'transferring'`).
+
+**Diagnostic data to collect.**
+
+- The `tokenId` from the payload.
+- Recent log lines matching `[Payments] Orphan spending tx detected: token <tokenId>` (these include the last-known `updatedAt` for the token).
+- Wallet's `getTokens({ tokenId })` output to see the on-disk state.
+- If the aggregator is queryable: `oracle.isSpent(<sourceStateHash>)` answer for the token's pre-commit state.
+
+**Actions.**
+
+1. **If `features.orphanAutoRecovery` is explicitly set to `false` (default-ON since PR #181):** the wallet emits this event but takes no action. You can:
+   - Manually flip the token's status back to `'confirmed'` via direct profile edit (test environments only).
+   - Or: remove the explicit `false` so `features.orphanAutoRecovery` reverts to its default-ON state and restart the wallet — the recovery hook runs aggregator cross-check before restoring (see `transfer:orphan-recovered`).
+2. **If aggregator reports the source state SPENT:** the commit landed on-chain. Local restore would diverge from the aggregator's view. You must either re-package the bundle from the post-spend state (out of scope for the auto-recovery hook today) or accept the value as already-sent.
+3. **If aggregator reports the source state UNSPENT:** safe to restore. Enabling `features.orphanAutoRecovery` performs this restore automatically; `transfer:orphan-recovered` then fires.
+
+**Forward direction.** A repeated `'orphan-spending-detected'` for the same `tokenId` across many cycles is a stuck state — operator intervention is required.
+
+---
+
+### `transfer:orphan-recovered`
+
+**Payload**: `{ tokenId, coinId, amount, fromStatus, toStatus, strategy, recoveredAt }`
+
+**What it means.** The auto-recovery hook (gated on `features.orphanAutoRecovery`, default-ON since PR #181) cross-checked the aggregator and confirmed the source state was UNSPENT, then flipped the token from `'transferring'` back to `toStatus` (today: `'confirmed'`). The value is spendable again.
+
+**State of the system.** Token is back in normal circulation. No OUTBOX or SENT entry is created — the recovery is purely local (the send that originally moved the token to `'transferring'` is treated as if it never happened).
+
+**Diagnostic data.** Generally none required — the event is informational.
+
+**Actions.**
+
+- **None required** in the happy path. Log line `[Payments] Orphan spending tx auto-recovered: token <tokenId>` will be present at DEBUG level.
+- **If you see this for a tokenId AND the recipient later reports they got the bundle:** the aggregator cross-check returned UNSPENT but the commit had actually landed via a separate path (rare race during aggregator reconciliation, or aggregator returned a stale view). Re-validate the token via `payments.validate()`; expect an aggregator-side state-mismatch error. Manual reconciliation: re-package or write off.
+
+**Strategy field.** Today only `'restore-to-confirmed'` is implemented. Future strategies (e.g. `'restore-with-recipient-notification'`) extend the union additively.
+
+---
+
+### `transfer:sent-reconciliation-recovered`
+
+**Payload**: `{ outboxId, tokenIds, mode, recoveredAt }`
+
+**What it means.** A SENT-ledger write that was missed at the dispatcher's `delivered`/`delivered-instant` transition (because the SENT writer threw — usually OrbitDB transient unavailability) was successfully retried by the `SentReconciliationWorker`. The OUTBOX entry is now tombstoned; the SENT entry is durable.
+
+**State of the system.** Normal operation has resumed. The forensic OUTBOX entry that was kept live at `'delivered'` for triage has been retired.
+
+**Diagnostic data.** Generally none — the worker logged the retry attempts at WARN level (`[Payments] SentReconciliationWorker: retry succeeded`).
+
+**Actions.**
+
+- **None required.** This is the documented happy path for SENT-write transient failures.
+- **If this event fires frequently for many `outboxId`s:** OrbitDB / profile storage is intermittently failing at the dispatcher's transition step. Investigate the underlying storage layer (disk pressure, IPFS gateway latency, peer connectivity for OrbitDB replication).
+
+---
+
+### `transfer:sent-reconciliation-failed`
+
+**Payload**: `{ outboxId, consecutiveFailures, lastError, failedAt }`
+
+**What it means.** The `SentReconciliationWorker` retried a SENT-write `maxRetries` times in a row and gave up. The OUTBOX entry remains live at `'delivered'` (or `'delivered-instant'`) as the forensic record. Auto-retry is suspended for this entry until the wallet restarts (the failure counter is process-local).
+
+**State of the system.** Forensic-record mode. The recipient already has the bundle (the original publish succeeded), but the wallet's permanent SENT-ledger record is incomplete.
+
+**Diagnostic data.**
+
+- The `outboxId` from the payload.
+- The `lastError` field — usually the SENT writer's underlying throw message.
+- Recent log lines matching `[Payments] SentReconciliationWorker: transition to failed-transient`.
+- Profile storage health: is OrbitDB responding? Is the address's per-entry-key prefix readable?
+
+**Actions.**
+
+1. **Inspect `lastError`.**
+   - **Disk full / OS-level write error:** free space, then restart the wallet. On restart the reconciliation worker re-arms and will retry; `transfer:sent-reconciliation-recovered` should fire on success.
+   - **OrbitDB peer disconnected:** wait for reconnection then restart. Same recovery path.
+   - **Profile encryption failure:** check the wallet's master key state. If keys are corrupted, profile data is unrecoverable — escalate.
+2. **If the underlying issue is resolved but `transfer:sent-reconciliation-recovered` does NOT fire after restart:** the OUTBOX entry's status may have advanced past `'delivered'` (e.g. recovery worker re-published and got a different ack path). Inspect via direct profile read; if structurally valid, the SENT entry can be written manually via test/escape-hatch APIs.
+
+---
+
+### `transfer:retention-warning`
+
+**Payload**: `{ sentId, nostrEventId, bundleCid, tokenIds, recipientTransportPubkey, detectedAt }`
+
+**What it means.** The `NostrPersistenceVerifier` queried the relay set for a previously-delivered `nostrEventId` and the relay returned "missing" (verified absent). The bundle reached the relay at publish time (we got the ack), but is now gone — retention policy eviction, relay restart, or relay-segregation.
+
+Whether the recipient saw the event before it dropped is **unknown**. They may have it; they may not. This event fires regardless.
+
+**State of the system.** Send is in an uncertain state. The SENT ledger entry is the durable record of the historical delivery; nothing on the wallet side is broken.
+
+**Diagnostic data.**
+
+- The `bundleCid` — verifies the bundle is still pinned (check IPFS).
+- The `recipientTransportPubkey` — verifies the recipient is reachable.
+- Companion event: a `transfer:retention-republish-rearmed` OR `transfer:retention-republish-skipped` should fire immediately after this one if `outboxProvider` is wired. If it doesn't, the verifier's republish wiring is broken.
+
+**Actions.**
+
+1. **If the wallet wires `outboxProvider` (the default for `Sphere`):** wait for the `republish-rearmed` companion. The `SendingRecoveryWorker` will republish on its next cycle (≤30s).
+2. **If `republish-skipped` companion fires with `reason='entry-tombstoned-or-missing'`:** the OUTBOX entry is gone (conservative-mode successful send). Today the worker cannot re-publish; manual recovery is to ask the recipient if they received it. **Future:** the cross-cutting "Re-publish from where?" follow-up will use the IPFS-pinned bundle + the SENT entry's CID to materialize a new OUTBOX entry.
+3. **If you see this event for many `sentId`s simultaneously:** the relay set is experiencing retention pressure. Consider widening the relay list or moving to longer-retention relays.
+
+---
+
+### `transfer:retention-republish-rearmed`
+
+**Payload**: `{ sentId, nostrEventId, bundleCid, tokenIds, recipientTransportPubkey, fromStatus, toStatus, rearmedAt }`
+
+**What it means.** Companion to `transfer:retention-warning`. The verifier successfully transitioned the live OUTBOX entry at `sentId` from `fromStatus` (`'delivered'` or `'delivered-instant'`) back to `'sending'`. The `SendingRecoveryWorker` will pick it up on its next cycle and republish.
+
+The original SENT entry is **untouched** — it stays as the historical record of the first delivery. The recipient's replay-LRU dedupes by `bundleCid`, so duplicate publishes are harmless.
+
+**State of the system.** Recovery is in flight. The OUTBOX entry is back at `'sending'`; the worker will republish.
+
+**Diagnostic data.** Generally none.
+
+**Actions.**
+
+- **None required in the happy path.** Watch for the recovery worker's `[Payments] SendingRecoveryWorker: re-publish ok` log line.
+- **If the OUTBOX entry remains at `'sending'` for >5 minutes without a `delivered`/`delivered-instant` transition:** something in the republish path is failing. Inspect via `getOutboxEntries()` and look at the `submitRetryCount` field. After `maxRetries` failures the entry transitions to `'failed-transient'`.
+- **If the SAME `sentId` re-arms on consecutive wallet restarts** (the verifier's in-memory `checkedIds` set clears at process boundary, so re-arming the same entry once per restart is expected for a short window — but indefinite cross-restart re-arms are a livelock signal): the most likely cause is a `'car-over-nostr'` entry created BEFORE PR #188 (Item #6.a) landed. Pre-#6.a CAR sends did not pin the bundle locally; the default republish closure (Item #2 final closure, PR #189) downgrades to a CID-shape re-publish that the recipient cannot fetch. The verifier then re-detects `'missing'` on the next cycle and re-arms again. Manual intervention: either (a) re-pin the CAR bytes on the local IPFS node (operator out-of-band), (b) accept that the legacy entry is unrecoverable and close it via direct profile edit, or (c) install a custom `republish` closure via `installSendingRecoveryWorker()` that preserves the strict-throw behavior so the entry transitions to `'failed-transient'` after `maxRetries` and stops looping.
+
+> **Note on `delivered` semantics after a retention re-publish.** A successful `'delivered'` transition after re-publish confirms the Nostr event reached the relay, NOT that the recipient successfully fetched the bundle. For `'cid-over-nostr'` entries (and post-#6.a `'car-over-nostr'` entries with a live pin), the recipient's CID-fetch should succeed. For pre-#6.a `'car-over-nostr'` entries lacking a local pin, the recipient receives a CID it cannot fetch and surfaces the failure in its own bundle-acquirer logs — invisible to the sender. The only sender-side confirmation is a subsequent recipient-side ack OR the verifier's next-cycle retention probe coming back `'retained'`.
+
+---
+
+### `transfer:retention-republish-skipped`
+
+**Payload**: `{ sentId, nostrEventId, bundleCid, reason, observedStatus?, errorMessage?, detectedAt }`
+
+**What it means.** Companion to `transfer:retention-warning`. The verifier could NOT initiate a re-publish for this `sentId`. The `reason` field explains why.
+
+**Reasons and actions.**
+
+| Reason | What it means | Action |
+|--------|---------------|--------|
+| `'no-outbox-writer'` | The feature is wired but no `OutboxWriter` is currently installed (legacy wallet, pre-install, or post-destroy). | Confirm the wallet uses the profile-backed storage path. Legacy KV-only wallets cannot use this recovery surface. |
+| `'entry-tombstoned-or-missing'` | The SENT-ledger id has no live OUTBOX counterpart. **Common in conservative-mode wallets** where successful SENT writes tombstone the OUTBOX entry. | The IPFS-pinned bundle bytes (referenced by `bundleCid`) ARE available, but the code path to materialize a new OUTBOX entry from the SENT entry has not yet landed. Manual recovery: contact the recipient. Future: see OUTBOX-SEND-FOLLOWUPS "Re-publish from where?". |
+| `'wrong-status'` | The OUTBOX entry exists but is at a status other than `'delivered'`/`'delivered-instant'` (e.g. `'finalizing'`, `'expired'`, post-cancellation). | Check `observedStatus` for forensic context. If the entry is in `'finalizing'`, the finalization worker is making progress and this re-publish path is the wrong recovery surface. If `'expired'`, the retention window passed — no recovery is appropriate. |
+| `'transition-failed'` | The state-machine update itself threw. | `errorMessage` carries the underlying throw. **Post-#6.a (PR #188) + post-#2-final (PR #189):** the most common transient cause — the historical default-closure throw for `deliveryMethod='car-over-nostr'` — is GONE. The default closure now downgrades CAR-mode entries to a `'uxf-cid'` re-publish unconditionally because Item #6.a pins inline-CAR sends to the local IPFS node. Other transition-failed causes (OrbitDB read failure, unrelated SphereError, custom-installed closure throwing) remain. Retry on next verifier cycle (the entry's `checkedIds` flag was set so it won't be retried — wallet restart re-arms). |
+
+**Forward direction.** Once the "Re-publish from where?" architectural decision lands (using the IPFS-pinned CAR bytes referenced by `bundleCid`), the `'entry-tombstoned-or-missing'` skip reason will become rare — the verifier will materialize a fresh OUTBOX entry from the SENT record and CID, and re-publish from there. The historical `'transition-failed'` skips driven by the CAR-mode throw are already extinct under the default closure post-#6.a/#2-final; a custom-installed `republish` closure that retains the strict throw remains the only path back to that skip reason for new sends.
+
+---
+
+### `transfer:off-record-spent`
+
+**Payload**: `{ tokenId, detectedAt, suspectedSiblingInstance, coinId, amount }`
+
+**What it means.** The `SpentStateRescanWorker` (Issue #174; UXF-TRANSFER-PROTOCOL §12.3.2) probed `oracle.isSpent(currentDestinationStateHash)` for a token in the local active pool (`status === 'confirmed'`) and the aggregator confirmed the state is SPENT. The local manifest still believed the token was spendable; the L3 chain says otherwise.
+
+The most common cause is **a sibling instance of the same wallet** — desktop + mobile sharing the same mnemonic / chain pubkey, primary + recovered backup, lost-then-found device. One instance spent the token without the other having pulled the spender's profile snapshot via §12.3.1 / Item #15 yet. The `suspectedSiblingInstance` flag is the worker's heuristic verdict on this:
+
+- **`true`**  → neither the local OUTBOX nor the SENT ledger holds any record referencing `tokenId`, so the spend cannot have been initiated on THIS device. Almost certainly a sibling-device spend.
+- **`false`** → either OUTBOX or SENT has a record. The local instance is (or was) the spender; the manifest just hasn't been GC'd to reflect the spend yet. Rare edge case — typically only happens if the SENT-write path raced the next rescan cycle.
+
+**Wallet-side state after the event.** Out of the box, the auto-installed default closure (`PaymentsModule.defaultSpentStateTransition`) does TWO things:
+1. Calls `removeToken()` on the off-record-spent token — archive + tombstone + active-map deletion + persist. The token leaves the spendable pool; the tombstone prevents re-sync resurrection.
+2. When a `DispositionWriter` is installed via `payments.installSpentStateAuditWriter()` (Sphere wires this from the wallet's `OrbitDbDispositionStorageAdapter` at bootstrap), ALSO writes a durable `_audit` record (reason `'off-record-spend'`, `auditStatus: 'audit-off-record-spend'`, §5.3 [E] / §5.4) for forensic traceability.
+
+If you've explicitly overridden the closure with a no-op via `setSpentStateRescanTransitionToAudit(...)`, the worker stays in detect-only mode — the event fires, but neither cleanup nor audit-record write happens. Legacy wallets without an `OrbitDbDispositionStorageAdapter` get the local cleanup but skip the durable `_audit` record (the writer slot stays null).
+
+**Diagnostic data to collect.**
+
+- The `tokenId`, `coinId`, `amount` from the payload (forensic triage).
+- The `suspectedSiblingInstance` flag.
+- The wallet's `getTokens({ tokenId })` output — has the disposition writer already transitioned the token to `_audit`?
+- The aggregator's `oracle.isSpent(<currentStateHash>)` answer — confirm the worker's call wasn't a transient false-positive.
+- The wallet's sibling devices (if any) — check whether one of them recently sent this token (look at their `getHistory()`).
+- Recent log lines matching `[Payments] SpentStateRescanWorker: …`.
+
+**Actions.**
+
+1. **Confirm the spend on a sibling device.** Ask the user whether another wallet instance recently spent this token. If yes → no action; the audit transition correctly reflects reality.
+2. **No sibling device matches.** Inspect via direct profile read:
+   - Check OUTBOX (`getOutboxEntries()` or profile dump) for any entry with this `tokenId`.
+   - Check SENT (`getSentEntries()` or profile dump) similarly.
+   - Re-run `oracle.isSpent(<currentStateHash>)` manually — does it still report `true`?
+3. **If the aggregator now reports UNSPENT** (the worker raced a transient cache state):
+   - This is a false-positive transition. The token is in `_audit` but is actually spendable. Operator-override the disposition via the `_audit` → manifest promotion path (`dispositionWriter.promoteAuditEntry`) — escape hatch only after confirming the unspent status from multiple aggregator query attempts.
+4. **If the aggregator confirms SPENT and no sibling can explain it:** the chain has a transition consuming our state that we did NOT author. This is either a key-compromise scenario (someone else holds the private key) or an aggregator-side bug. Escalate. Do NOT operator-override.
+
+**Forward direction.**
+
+- Repeated `transfer:off-record-spent` events firing for many `tokenId`s in a short window typically mean a sibling device recently sent multiple tokens. After the sibling's profile snapshot syncs (§12.3.1), the local view should converge naturally; the audit transitions are correct.
+- If the event fires every cycle for the SAME `tokenId` (5 min cadence by default), the local Token.status flip path is NOT firing — either an explicit `setSpentStateRescanTransitionToAudit(...)` override is in place and not removing the token, OR `removeToken()` is throwing internally (check WARN-level `[Payments] defaultSpentStateTransition: removeToken failed` log lines). Out of the box the auto-installed default closure (`defaultSpentStateTransition`) calls `removeToken()` so the spent token is archived + tombstoned + dropped from the active map after the first detection.
+
+**Companion events.** Distinct from `transfer:double-spend-detected` (multi-device double-spend loss — fires from TWO trigger sources: (1) reactive submit-time when YOU attempt a send and the aggregator rejects with `STATE_ALREADY_SPENT_BY_OTHER`, Item #14 Phase 1; (2) JOIN-time when `loadFromStorageData` detects a snapshot loser whose `'transferring'` state was superseded by another device's winner, PR #182 / Item #14 Phase 2) and from `transfer:orphan-spending-detected` (covers `'transferring'` tokens stuck mid-send). All three can fire for related tokens during a sibling-device race; the `tokenId` is the join key.
+
+---
+
+## Cross-cutting troubleshooting
+
+### "I see retention warnings for every SENT entry"
+
+Likely cause: the relay set's retention window is shorter than `verifyDelayMs`. Tune `NostrPersistenceVerifierOptions.verifyDelayMs` upward, or move to longer-retention relays.
+
+### "Orphan-spending detection fires after every restart"
+
+Likely cause: a send is genuinely stuck in `'transferring'` and the wallet hasn't been told whether to recover or escalate. Either enable `features.orphanAutoRecovery` (after confirming the safety contract) or manually triage via the steps in `transfer:orphan-spending-detected`.
+
+### "SENT-reconciliation-failed fires repeatedly for the same outboxId"
+
+Likely cause: persistent OrbitDB write failure at the SENT-ledger prefix. After `maxRetries`, auto-retry is suspended in-process. A wallet restart re-arms the worker. If failures persist across restarts, the underlying storage is broken — escalate.
+
+### "Tombstone GC reports zero purged but tombstones exist"
+
+Likely cause: the tombstones are within the retention window (default 30 days from their `deletedAt`). If you need to reclaim storage urgently, you can construct a worker with a shorter `retentionMs` — but DO NOT go below the longest realistic concurrent-replica pre-sync window. See OUTBOX-SEND-FOLLOWUPS item #4 safety contract.
+
+---
+
+## Configuration reference
+
+```typescript
+// All flags are properties of PaymentsModuleConfig.features:
+features: {
+  recoveryWorker:                true,   // default-ON
+  sentReconciliationWorker:      true,   // default-ON
+  nostrPersistenceVerifier:      true,   // default-ON (item #5 — LRU + cooldown bound the load)
+  orphanAutoRecovery:            true,   // default-ON (PR #181 — item #1 aggregator cross-check landed)
+  tombstoneGcWorker:             true,   // default-ON (item #5 — 30-day retention is safe)
+  spentStateRescan:              true,   // default-ON (Issue #174 — soak gate cleared)
+}
+```
+
+All soak-gated workers have now flipped to default-ON under OUTBOX-SEND-FOLLOWUPS item #5. `orphanAutoRecovery` flipped in PR #181 once item #1's aggregator cross-check landed (`PaymentsModule.defaultOrphanRecovery` queries `oracle.isSpent(sourceStateHash)` before flipping `'transferring'` → `'confirmed'` and escalates to `'manual'` on conflict). `tombstoneGcWorker` flipped under item #5 — the 30-day retention default is conservative enough that no concurrent-replica pre-sync state can resurrect a swept slot. `nostrPersistenceVerifier` flipped under item #5 — query traffic is proportional to eligible SENT volume with an LRU-bounded cap and per-entry cooldown (default 5 minutes), and the worker self-skips wallets with no `nostrEventId`-tagged SENT entries. `spentStateRescan` (Issue #174) flipped after its soak gate cleared — the worker probes `oracle.isSpent` for each `'confirmed'` token and routes detection through the default `removeToken()` cleanup. Wallets that prefer the reactive-only surface (`transfer:double-spend-detected` at next `send()`) can explicitly set `features.spentStateRescan: false`. Deployments on restrictive relay sets that cannot absorb the verifier's steady load should set `features.nostrPersistenceVerifier: false`. Set any flag to `false` explicitly to opt out (e.g. timer-sensitive unit tests).

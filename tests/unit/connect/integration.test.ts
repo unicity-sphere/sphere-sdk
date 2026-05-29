@@ -278,7 +278,14 @@ describe('Sphere Connect Integration', () => {
         message: 'Hello!',
       });
 
-      expect(onIntent).toHaveBeenCalledWith('dm', { to: '@alice', message: 'Hello!' }, expect.any(Object));
+      // T.7.C.5: ConnectHost now passes a 4th positional arg `schemaVersion`
+      // ('uxf-1' | 'legacy') to onIntent. A bare DM payload is legacy.
+      expect(onIntent).toHaveBeenCalledWith(
+        'dm',
+        { to: '@alice', message: 'Hello!' },
+        expect.any(Object),
+        'legacy',
+      );
       expect(result.sent).toBe(true);
       expect(result.messageId).toBe('msg123');
     });

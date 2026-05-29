@@ -321,8 +321,22 @@ export function parseForkedKey(key: string): { tokenId: string; stateHash: strin
 }
 
 /**
- * Validate 64-character hex token ID
+ * Validate 64-character hex token ID.
+ *
+ * Round 3 — tightened from the case-insensitive `[0-9a-fA-F]{64}` form
+ * to the canonical lowercase `[0-9a-f]{64}` form so this validator
+ * agrees with the importer's `CANONICAL_TOKEN_ID_RE` shape contract
+ * (`modules/payments/transfer/import-inclusion-proof.ts`).
+ *
+ * The two-shape disagreement was a per-tokenId mutex hazard: an
+ * uppercase tokenId that satisfied `isValidTokenId` (legacy form)
+ * was rejected by the importer's strict regex, but downstream paths
+ * that took a different branch on `isValidTokenId` could acquire a
+ * separate mutex slot keyed on the uppercase string and race past
+ * the importer's serialization promise. Callers that legitimately
+ * receive uppercase hex from the SDK MUST lowercase-normalize at the
+ * call site before invoking this validator.
  */
 export function isValidTokenId(tokenId: string): boolean {
-  return /^[0-9a-fA-F]{64}$/.test(tokenId);
+  return /^[0-9a-f]{64}$/.test(tokenId);
 }

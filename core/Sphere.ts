@@ -38,6 +38,7 @@
  */
 
 import { logger } from './logger';
+import { hexToBytes as strictHexToBytes } from './hex';
 import type {
   Identity,
   FullIdentity,
@@ -56,12 +57,37 @@ import type {
   TrackedAddressEntry,
 } from '../types';
 import { SphereError } from './errors';
-import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../storage';
+import {
+  ConnectivityManager,
+  AggregatorPinger,
+  IpfsPinger,
+  NostrPinger,
+  type ConnectivityManagerHandle,
+} from './connectivity';
+import type {
+  SphereProfileHandle,
+  ResetEpochParams,
+  ResetEpochResult,
+} from '../profile/profile-handle';
+import {
+  LOCAL_EPOCH_FLOOR_KEY,
+  LOCAL_EPOCH_RESET_FLUSH_TRIGGER_KEY,
+  LOCAL_EPOCH_RESET_REASON_KEY,
+} from '../profile/pointer-wiring';
+import { EPOCH_RESET_REASON_MAX_BYTES } from '../profile/profile-lean-snapshot';
+import type {
+  ShutdownOptions,
+  StorageProvider,
+  TokenStorageProvider,
+  TxfStorageDataBase,
+} from '../storage';
 import type { TransportProvider, PeerInfo } from '../transport';
 import { MultiAddressTransportMux, AddressTransportAdapter } from '../transport/MultiAddressTransportMux';
 import type { OracleProvider } from '../oracle';
 import type { PriceProvider } from '../price';
 import { PaymentsModule, createPaymentsModule } from '../modules/payments';
+import type { SyncOptions, SyncResult } from '../modules/payments';
+import type { PublishToIpfsCallback } from '../modules/payments/transfer/delivery-resolver';
 import { CommunicationsModule, createCommunicationsModule } from '../modules/communications';
 import type { CommunicationsModuleConfig } from '../modules/communications';
 import { GroupChatModule, createGroupChatModule } from '../modules/groupchat';
@@ -132,6 +158,7 @@ import type {
   LegacyFileType,
   DecryptionProgressCallback,
 } from '../serialization/types';
+import { safeErrorMessage } from './error-sanitize';
 
 // =============================================================================
 // Progress Callback
@@ -214,14 +241,53 @@ export interface SphereCreateOptions {
   debug?: boolean;
   /** Optional callback to report initialization progress steps */
   onProgress?: InitProgressCallback;
+  /**
+   * Optional UXF bundle-CAR publisher for the `uxf-cid` delivery branch
+   * (Issue #200 Phase 1 wiring). When omitted, CID-bound delivery falls
+   * back to inline (under cap) or throws `IPFS_PUBLISHER_REQUIRED`
+   * (force-cid, over-cap auto). The provider factories
+   * (`createBrowserProviders` / `createNodeProviders`) construct this
+   * with `createUxfCarPublisher(gateways)` from `tokenSync.ipfs` and
+   * expose it on their returned object — propagate it here.
+   */
+  publishToIpfs?: PublishToIpfsCallback;
+  /**
+   * Issue #223 — recipient-side gateway list used to stream-fetch
+   * CARs for incoming `kind: 'uxf-cid'` bundles. Same gateways the
+   * `publishToIpfs` callback targets. Without this list the
+   * auto-installed {@link IngestWorkerPool} silently drops every
+   * `uxf-cid` arrival — see PaymentsModule.cidFetchGateways doc.
+   * The provider factories populate this from `tokenSync.ipfs` —
+   * propagate it here.
+   */
+  cidFetchGateways?: ReadonlyArray<string>;
 }
 
 /** Options for loading existing wallet */
 export interface SphereLoadOptions {
   /** Storage provider instance */
   storage: StorageProvider;
+  /**
+   * Optional read-only fallback storage. See
+   * {@link SphereInitOptions.fallbackStorage} for semantics.
+   */
+  fallbackStorage?: StorageProvider;
   /** Optional token storage provider (for IPFS sync) */
   tokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
+  /**
+   * Issue #330 — Optional read-only fallback TOKEN storage consulted by
+   * Profile-mode token reads when the primary (OrbitDB-backed) read
+   * returns nothing or fails (e.g. `CRITICAL-BLOCK-EVICTED`). Intended
+   * for Profile-mode boots where a previously-working legacy
+   * `IndexedDBTokenStorageProvider` still holds tokens from before the
+   * migration to Profile. Token-side analogue of `fallbackStorage`.
+   * Never written to.
+   *
+   * Use `migrateLegacyToProfileBrowser` / `migrateLegacyToProfile` to
+   * write a "migrated" marker so legacy is preserved as read-only
+   * fallback (the post-#330 default) rather than wiped (pre-#330).
+   */
+  fallbackTokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
   /** Transport provider instance */
   transport: TransportProvider;
   /** Oracle provider instance */
@@ -259,6 +325,21 @@ export interface SphereLoadOptions {
   debug?: boolean;
   /** Optional callback to report initialization progress steps */
   onProgress?: InitProgressCallback;
+  /**
+   * Optional UXF bundle-CAR publisher for the `uxf-cid` delivery branch
+   * (Issue #200 Phase 1 wiring). See {@link SphereCreateOptions.publishToIpfs}.
+   */
+  publishToIpfs?: PublishToIpfsCallback;
+  /**
+   * Issue #223 — recipient-side gateway list used to stream-fetch
+   * CARs for incoming `kind: 'uxf-cid'` bundles. Same gateways the
+   * `publishToIpfs` callback targets. Without this list the
+   * auto-installed {@link IngestWorkerPool} silently drops every
+   * `uxf-cid` arrival — see PaymentsModule.cidFetchGateways doc.
+   * The provider factories populate this from `tokenSync.ipfs` —
+   * propagate it here.
+   */
+  cidFetchGateways?: ReadonlyArray<string>;
 }
 
 /** Options for importing a wallet */
@@ -312,6 +393,21 @@ export interface SphereImportOptions {
   debug?: boolean;
   /** Optional callback to report initialization progress steps */
   onProgress?: InitProgressCallback;
+  /**
+   * Optional UXF bundle-CAR publisher for the `uxf-cid` delivery branch
+   * (Issue #200 Phase 1 wiring). See {@link SphereCreateOptions.publishToIpfs}.
+   */
+  publishToIpfs?: PublishToIpfsCallback;
+  /**
+   * Issue #223 — recipient-side gateway list used to stream-fetch
+   * CARs for incoming `kind: 'uxf-cid'` bundles. Same gateways the
+   * `publishToIpfs` callback targets. Without this list the
+   * auto-installed {@link IngestWorkerPool} silently drops every
+   * `uxf-cid` arrival — see PaymentsModule.cidFetchGateways doc.
+   * The provider factories populate this from `tokenSync.ipfs` —
+   * propagate it here.
+   */
+  cidFetchGateways?: ReadonlyArray<string>;
 }
 
 /** L1 (ALPHA blockchain) configuration */
@@ -328,6 +424,28 @@ export interface L1Config {
 export interface SphereInitOptions {
   /** Storage provider instance */
   storage: StorageProvider;
+  /**
+   * Optional read-only fallback storage consulted when the primary
+   * storage returns null or throws a recoverable error (e.g.
+   * `LoadBlockFailedError` for a missing OrbitDB content block) while
+   * `loadIdentityFromStorage` is reading wallet keys. Intended for
+   * Profile-mode boots where a previously-working legacy
+   * `IndexedDBStorageProvider` still holds the encrypted-with-password
+   * identity material at the same key shape — supplying it lets the
+   * wallet boot from cached local state even if Profile/OrbitDB
+   * has lost the block. Never written to.
+   *
+   * NOT applicable to `Sphere.create()` / `Sphere.import()` — those
+   * flows write a fresh identity to the primary storage; a fallback
+   * read makes no sense there. Intentionally omitted from those
+   * option types.
+   */
+  fallbackStorage?: StorageProvider;
+  /**
+   * Issue #330 — Optional read-only fallback TOKEN storage. See
+   * {@link SphereLoadOptions.fallbackTokenStorage} for semantics.
+   */
+  fallbackTokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
   /** Transport provider instance */
   transport: TransportProvider;
   /** Oracle provider instance */
@@ -387,6 +505,21 @@ export interface SphereInitOptions {
   debug?: boolean;
   /** Optional callback to report initialization progress steps */
   onProgress?: InitProgressCallback;
+  /**
+   * Optional UXF bundle-CAR publisher for the `uxf-cid` delivery branch
+   * (Issue #200 Phase 1 wiring). See {@link SphereCreateOptions.publishToIpfs}.
+   */
+  publishToIpfs?: PublishToIpfsCallback;
+  /**
+   * Issue #223 — recipient-side gateway list used to stream-fetch
+   * CARs for incoming `kind: 'uxf-cid'` bundles. Same gateways the
+   * `publishToIpfs` callback targets. Without this list the
+   * auto-installed {@link IngestWorkerPool} silently drops every
+   * `uxf-cid` arrival — see PaymentsModule.cidFetchGateways doc.
+   * The provider factories populate this from `tokenSync.ipfs` —
+   * propagate it here.
+   */
+  cidFetchGateways?: ReadonlyArray<string>;
 }
 
 /** Result of init operation */
@@ -407,11 +540,38 @@ export interface SphereInitResult {
 const UNICITY_TOKEN_TYPE_HEX = 'f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe397867509';
 
 /**
+ * PR #316 F1 fix — default wall-clock budget for the pre-bump
+ * discovery RPC inside `resetEpoch`. The discovery makes one or more
+ * aggregator RPCs to determine the on-chain epoch floor before
+ * computing `newEpoch = max(local, discovered) + 1`. Bounded so a
+ * misbehaving aggregator cannot hang the user-facing reset call
+ * indefinitely; on timeout the bump proceeds from the local floor
+ * alone and `'profile:epoch-reset-discovery-skipped'` is emitted.
+ */
+const RESET_EPOCH_DISCOVERY_TIMEOUT_MS = 15_000;
+
+/**
+ * PR #316 F2 fix — default wall-clock budget for the post-bump
+ * publish await inside `resetEpoch`. After the local floor is
+ * persisted and `notifyProfileDirty()` is called, resetEpoch waits
+ * up to this long for a `'storage:pointer-published'` event so the
+ * returned `publishedVersion` is honest. On timeout, the local
+ * state is unchanged and a `'profile:epoch-reset-publish-pending'`
+ * event is emitted; the periodic-poll path republishes.
+ *
+ * The default is 30 000 ms, matching the per-flush remote-durability
+ * verification deadline in `ProfileConfig.flushVerificationDeadlineMs`.
+ */
+const RESET_EPOCH_PUBLISH_TIMEOUT_MS = 30_000;
+
+/**
  * Derive L3 predicate address (DIRECT://...) from private key
  * Uses UnmaskedPredicateReference for stable wallet address
  */
 async function deriveL3PredicateAddress(privateKey: string): Promise<string> {
-  const secret = Buffer.from(privateKey, 'hex');
+  // Steelman³³ warning: strict hex decode — Buffer.from(_, 'hex') silently
+  // truncates odd-length and stops at first non-hex char.
+  const secret = strictHexToBytes(privateKey);
   const signingService = await SigningService.createFromSecret(secret);
 
   const tokenTypeBytes = Buffer.from(UNICITY_TOKEN_TYPE_HEX, 'hex');
@@ -425,6 +585,66 @@ async function deriveL3PredicateAddress(privateKey: string): Promise<string> {
   );
 
   return (await (await predicateRef).toAddress()).toString();
+}
+
+// =============================================================================
+// Issue #174 — spent-state-rescan AUDIT DispositionWriter factory
+// =============================================================================
+
+/**
+ * Build a {@link DispositionWriter} narrowed to the AUDIT collection
+ * (`reason: 'off-record-spend'`, §5.3 [E] / §5.4) for the spent-state
+ * rescan worker.
+ *
+ * The writer's `manifestStore` field is wired to a throw-on-access
+ * stub: the spent-state-rescan default closure only routes through
+ * `writeAudit` (which never touches `manifestStore`), so any
+ * accidental invocation of the VALID / PENDING / CONFLICTING branches
+ * on THIS writer instance fires the stub loudly. Defense-in-depth:
+ * the writer's discriminated-union switch routes by `record.disposition`
+ * — non-AUDIT records reach the manifest path and the stub catches
+ * them, surfacing a clear `INTERNAL_ERROR` instead of silent data
+ * loss.
+ *
+ * Returns a writer immediately ready to be passed to
+ * `PaymentsModule.installSpentStateAuditWriter`. Never throws at
+ * construction time.
+ */
+async function buildSpentStateAuditWriter(
+  adapter: import('../profile/disposition-storage-adapters').OrbitDbDispositionStorageAdapter,
+  emitEvent: <T extends import('../types').SphereEventType>(
+    type: T,
+    data: import('../types').SphereEventMap[T],
+  ) => void,
+): Promise<import('../profile/disposition-writer').DispositionWriter> {
+  const { DispositionWriter } = await import('../profile/disposition-writer');
+  const { ManifestStore } = await import('../profile/manifest-store');
+  const { Lamport } = await import('../profile/lamport');
+  const stubManifestStorage: import('../profile/manifest-cas').MinimalManifestStorage = {
+    async readEntry(): Promise<never> {
+      throw new SphereError(
+        'spent-state-rescan AUDIT-only DispositionWriter: manifestStore.readEntry called — ' +
+          'this writer is wired only for AUDIT records; non-AUDIT records must not be routed through it.',
+        'VALIDATION_ERROR',
+      );
+    },
+    async writeEntry(): Promise<never> {
+      throw new SphereError(
+        'spent-state-rescan AUDIT-only DispositionWriter: manifestStore.writeEntry called — ' +
+          'this writer is wired only for AUDIT records; non-AUDIT records must not be routed through it.',
+        'VALIDATION_ERROR',
+      );
+    },
+  };
+  const stubManifestStore = new ManifestStore({
+    storage: stubManifestStorage,
+    lamport: new Lamport(),
+  });
+  return new DispositionWriter({
+    storage: adapter,
+    manifestStore: stubManifestStore,
+    emit: emitEvent,
+  });
 }
 
 // =============================================================================
@@ -454,6 +674,68 @@ export interface AddressModuleSet {
   transportAdapter: AddressTransportAdapter | null;
   tokenStorageProviders: Map<string, TokenStorageProvider<TxfStorageDataBase>>;
   initialized: boolean;
+}
+
+/**
+ * Issue #239 — options accepted by {@link Sphere.destroy}.
+ *
+ * The default contract is "normal mode": destroy() must not return
+ * until any in-flight flush is drained AND the most-recent pin +
+ * pointer publish are verifiably durable on remote infrastructure
+ * (HEAD-readable bundle CID + aggregator `recoverLatest` returns the
+ * just-published snapshot CID). The verification deadline is
+ * configurable via {@link DestroyOptions.verificationDeadlineMs} and
+ * defaults to 30 000 ms.
+ *
+ * `force: true` switches to "fast-exit": the remote-durability gate is
+ * skipped and any unconfirmed publish is stamped as a
+ * `pendingPublishCid` retry marker. Cold-start on next boot replays
+ * the unverified publish via the existing retry machinery
+ * (`LifecycleManager.retryPendingPublishIfAny`). Use for E2E tests
+ * that simulate ungraceful crash, or for operator-triggered fast
+ * exits where waiting for gateway propagation is not acceptable.
+ */
+/**
+ * Wallet-layer destroy options. Extends `ShutdownOptions` with
+ * wallet-only knobs the storage layer doesn't see.
+ *
+ * Issue #255 (2026-05-25) — `skipFlush` + `flushTimeoutMs` added so
+ * `Sphere.destroy()` can drive a synchronous pre-shutdown
+ * `awaitNextFlush()` on every TokenStorageProvider. Without that,
+ * fire-and-exit CLI commands (`sphere init`, `sphere faucet`,
+ * `sphere invoice pay`, etc.) trigger `notifyProfileDirty()` but
+ * exit before the debounced flush timer fires — their state
+ * mutations never reach IPFS / the aggregator pointer, leaving
+ * sibling devices unable to discover what just happened. The
+ * default behavior is now "flush then shutdown" so CLI mutations
+ * are durably published before the process exits.
+ *
+ * Use `skipFlush: true` for ungraceful-shutdown simulation in tests
+ * or any caller that explicitly wants the legacy fast-exit
+ * semantics (state stamps `pendingPublishCid` and replays on next
+ * boot).
+ */
+export interface DestroyOptions extends ShutdownOptions {
+  /**
+   * If `true`, skip the pre-shutdown
+   * `provider.awaitNextFlush(flushTimeoutMs)` call. Default `false`
+   * — destroy waits for any pending debounced flush to complete
+   * (pin + OrbitDB ref + aggregator pointer publish) before
+   * shutting providers down. Set to `true` for fast-exit
+   * scenarios where the cold-start `pendingPublishCid` retry path
+   * is an acceptable recovery surface.
+   */
+  readonly skipFlush?: boolean;
+  /**
+   * Per-provider timeout for the pre-shutdown
+   * `awaitNextFlush(timeoutMs)` call. Default 30 000 ms (matches
+   * `awaitNextFlush`'s own default, and the `flushVerificationDeadlineMs`
+   * the factory wires by default). On TIMEOUT the provider's
+   * `pendingPublishCid` retry marker is left stamped — destroy()
+   * proceeds to shutdown anyway so the caller doesn't hang
+   * indefinitely on a misbehaving gateway.
+   */
+  readonly flushTimeoutMs?: number;
 }
 
 // =============================================================================
@@ -486,10 +768,62 @@ export class Sphere {
 
   // Providers
   private _storage: StorageProvider;
+  /**
+   * Read-only fallback storage consulted by `loadIdentityFromStorage`
+   * when the primary returns null or throws a recoverable error for an
+   * identity-key read. See {@link SphereInitOptions.fallbackStorage}.
+   * Set once at construction by the static factories; never mutated
+   * after wallet load. `null` when no fallback was supplied.
+   */
+  private _fallbackStorage: StorageProvider | null = null;
+  /**
+   * Issue #309 review — set when `fallbackStorage.connect()` failed
+   * during load/init. The fallback is demoted to `null` so the rest of
+   * the boot proceeds; this field preserves the original error for
+   * forensics. `null` when there's no fallback or the connect succeeded.
+   */
+  private _fallbackStorageError: Error | null = null;
+  /**
+   * Issue #330 — read-only fallback TOKEN storage consulted by the
+   * primary token-storage provider on read miss or eviction. Set once
+   * at construction by the static factories. `null` when no fallback
+   * was supplied. Token-side analogue of `_fallbackStorage`.
+   *
+   * Wired into ProfileTokenStorageProvider via the
+   * `fallbackTokenStorage` option so the provider can consult the
+   * legacy `IndexedDBTokenStorageProvider` when a Profile block read
+   * fails (e.g. `[CRITICAL-BLOCK-EVICTED]`). Never written to.
+   */
+  private _fallbackTokenStorage: TokenStorageProvider<TxfStorageDataBase> | null = null;
   private _tokenStorageProviders: Map<string, TokenStorageProvider<TxfStorageDataBase>> = new Map();
   private _transport: TransportProvider;
   private _oracle: OracleProvider;
   private _priceProvider: PriceProvider | null;
+  /**
+   * Optional UXF bundle-CAR publisher for the `uxf-cid` delivery branch
+   * (Issue #200 Phase 1 wiring). Forwarded into every PaymentsModule
+   * instance — including those created per-address by
+   * `initializeAddressModules` — so CID-bound delivery branches actually
+   * pin. When null, CID-bound delivery falls back to inline (under cap)
+   * or throws `IPFS_PUBLISHER_REQUIRED` (force-cid, over-cap auto).
+   *
+   * Set by the caller via `SphereCreateOptions.publishToIpfs` /
+   * `SphereLoadOptions.publishToIpfs` / `SphereInitOptions.publishToIpfs`
+   * / `SphereImportOptions.publishToIpfs`. The provider factories
+   * (`createBrowserProviders`, `createNodeProviders`) build this with
+   * `createUxfCarPublisher(gateways)` when `tokenSync.ipfs` is configured.
+   */
+  private _publishToIpfs: PublishToIpfsCallback | null = null;
+
+  /**
+   * Issue #223 — gateway list forwarded to every per-address
+   * PaymentsModule's auto-installed IngestWorkerPool so incoming
+   * `kind: 'uxf-cid'` bundles can be stream-fetched. Same value as
+   * the gateways the `publishToIpfs` callback targets — the provider
+   * factories populate both from `tokenSync.ipfs.gateways`. Null /
+   * empty preserves legacy drop-silent behaviour for `uxf-cid` events.
+   */
+  private _cidFetchGateways: ReadonlyArray<string> | null = null;
 
   // Modules (single-instance — backward compat, delegates to active address)
   private _payments: PaymentsModule;
@@ -498,6 +832,25 @@ export class Sphere {
   private _market: MarketModule | null = null;
   private _accounting: AccountingModule | null = null;
   private _swap: SwapModule | null = null;
+
+  /**
+   * Issue #312 — unified connectivity surface. Construction is deferred to
+   * `initializeModules()` so the manager binds to the same OracleProvider /
+   * TransportProvider / IPFS gateways already wired into payments. The
+   * manager's initial state is `'unknown'` for all backends; the first
+   * probe fires async, so `sphere.connectivity.status()` is usable
+   * immediately after `Sphere.init()` returns but reports `'unknown'`
+   * until the first probes land.
+   *
+   * Null in two cases:
+   *   - The Sphere is mid-construction (before `initializeModules()` ran).
+   *   - The wallet was created with no connectivity-eligible backends
+   *     (currently impossible in practice — every wallet has at least an
+   *     oracle and a transport).
+   *
+   * Accessed via {@link Sphere.connectivity}.
+   */
+  private _connectivity: ConnectivityManager | null = null;
 
   // Per-address module instances (Phase 2: independent parallel operation)
   private _addressModules: Map<number, AddressModuleSet> = new Map();
@@ -518,6 +871,21 @@ export class Sphere {
   private _disabledProviders: Set<string> = new Set();
   private _providerEventCleanups: (() => void)[] = [];
   private _lastProviderConnected: Map<string, boolean> = new Map();
+
+  // RFC-251 Approach D / issue #255 Problem B — pointer-publish win-broadcast.
+  // Tracks whether the per-wallet Nostr subscription for sibling
+  // pointer-win broadcasts has been installed (one per pointer-signing
+  // pubkey ever seen during this Sphere lifetime). Cleared on destroy().
+  private _pointerWinSubscriptions = new Map<string, () => void>();
+  // Bounded dedup of (signingPubKey + version) tuples observed via
+  // sibling broadcasts — bounds within-replay-window duplicate
+  // processing. LRU-evicted at MAX_SIZE entries.
+  private _pointerWinSeen = new Set<string>();
+  // Sentinel: when the pointer layer is built async after OrbitDB attach,
+  // we poll for it once and install the subscription. This flag prevents
+  // multiple parallel install attempts when several pointer events fire
+  // close together.
+  private _pointerWinInstallInFlight = false;
 
   // ===========================================================================
   // Constructor (private)
@@ -625,6 +993,16 @@ export class Sphere {
     // Configure debug logging (also needed in main bundle context, same as TokenRegistry)
     if (options.debug) logger.configure({ debug: true });
 
+    // Issue #274 — lifecycle span. The init/load path is the slowest cold-start
+    // surface and the entry point operators reach for when debugging "wallet
+    // takes minutes to come up". `created` field tells fresh-vs-existing apart.
+    const __span = logger.time('sphere:lifecycle', 'init', {
+      network: options.network,
+      hasNametag: !!options.nametag,
+      autoGenerate: !!options.autoGenerate,
+      hasMnemonic: !!options.mnemonic,
+    });
+
     // Configure TokenRegistry in the main bundle context.
     // Factory functions (createBrowserProviders/createNodeProviders) are built as
     // separate bundles by tsup, so their TokenRegistry.configure() call configures
@@ -643,6 +1021,8 @@ export class Sphere {
       // Load existing wallet
       const sphere = await Sphere.load({
         storage: options.storage,
+        fallbackStorage: options.fallbackStorage,
+        fallbackTokenStorage: options.fallbackTokenStorage,
         transport: options.transport,
         oracle: options.oracle,
         tokenStorage: options.tokenStorage,
@@ -655,11 +1035,48 @@ export class Sphere {
         password: options.password,
         discoverAddresses: options.discoverAddresses,
         onProgress: options.onProgress,
+        publishToIpfs: options.publishToIpfs,
+        cidFetchGateways: options.cidFetchGateways,
       });
       // Store dmSince for forwarding to transport/mux when subscriptions are set up
       if (options.dmSince != null) {
         sphere._dmSince = options.dmSince;
       }
+
+      // Honor `options.nametag` on the loaded-wallet path. Prior behavior:
+      // `Sphere.load` silently ignored it, so `sphere init --nametag X` on
+      // an existing profile printed "Wallet initialized successfully!"
+      // without actually registering X — a silent failure that left the
+      // wallet in whatever nametag state it had before.
+      if (options.nametag) {
+        const stripped = options.nametag.startsWith('@')
+          ? options.nametag.slice(1)
+          : options.nametag;
+        const requested = normalizeNametag(stripped);
+        const current = sphere._identity?.nametag;
+        if (!current) {
+          // No active claim on the loaded wallet — register the requested
+          // nametag now. May throw (NAMETAG_CONFLICT / NAMETAG_TAKEN /
+          // AGGREGATOR_ERROR) per the same invariants as a fresh-create
+          // `registerNametag` call.
+          await sphere.registerNametag(options.nametag);
+        } else if (current !== requested) {
+          // Refuse to silently switch the active nametag of an already-
+          // claimed wallet. (Multi-nametag selection is a deliberate
+          // future feature — for now, force the operator to clear or
+          // switchToAddress explicitly.)
+          throw new SphereError(
+            `Wallet already claims Unicity ID "@${current}" — cannot re-init ` +
+            `with "@${requested}". Use sphere.clear() and re-init to switch ` +
+            `nametags, or switchToAddress to register a different name on ` +
+            `another HD address.`,
+            'ALREADY_INITIALIZED',
+          );
+        }
+        // else: current === requested — no-op, idempotent re-init
+      }
+
+      __span.end({ created: false });
       return { sphere, created: false };
     }
 
@@ -697,11 +1114,14 @@ export class Sphere {
       password: options.password,
       discoverAddresses: options.discoverAddresses,
       onProgress: options.onProgress,
+      publishToIpfs: options.publishToIpfs,
+      cidFetchGateways: options.cidFetchGateways,
     });
 
     if (options.dmSince != null) {
       sphere._dmSince = options.dmSince;
     }
+    __span.end({ created: true, autoGenerated: !!generatedMnemonic });
     return { sphere, created: true, generatedMnemonic };
   }
 
@@ -834,6 +1254,11 @@ export class Sphere {
       options.communications,
     );
     sphere._password = options.password ?? null;
+    // Issue #200 Phase 1 wiring — capture optional UXF CAR publisher
+    // before `initializeModules()` runs (which threads it into the
+    // primary PaymentsModule).
+    sphere._publishToIpfs = options.publishToIpfs ?? null;
+    sphere._cidFetchGateways = options.cidFetchGateways ?? null;
 
     // Store mnemonic (encrypted if password provided, plaintext otherwise)
     progress?.({ step: 'storing_keys', message: 'Storing wallet keys...' });
@@ -932,10 +1357,107 @@ export class Sphere {
       options.communications,
     );
     sphere._password = options.password ?? null;
+    // Issue #200 Phase 1 wiring — capture optional UXF CAR publisher
+    // before `initializeModules()` threads it into PaymentsModule.
+    sphere._publishToIpfs = options.publishToIpfs ?? null;
+    sphere._cidFetchGateways = options.cidFetchGateways ?? null;
+    // Issue #309 — read-only fallback storage for identity-key reads.
+    // Consulted by loadIdentityFromStorage() when the primary returns
+    // null or throws a recoverable LoadBlockFailedError. Used in
+    // Profile-mode boots where the legacy IndexedDB still holds the
+    // encrypted-with-password identity material.
+    sphere._fallbackStorage = options.fallbackStorage ?? null;
+    // Issue #330 — read-only fallback TOKEN storage for Profile-mode
+    // token reads. Consulted on miss/eviction. See
+    // {@link SphereLoadOptions.fallbackTokenStorage} and the wiring at
+    // `getTokenStorage().setFallbackTokenStorage(...)` further below.
+    sphere._fallbackTokenStorage = options.fallbackTokenStorage ?? null;
+
+    // Issue #330 — warn loudly when the underlying storage carries the
+    // legacy-migration marker but no `fallbackTokenStorage` was wired.
+    // This catches consumer apps that updated their SDK but did not
+    // migrate to the auto-wiring factory (`createBrowserProfileProvidersAuto`
+    // / equivalent). Without a fallback, pre-migration tokens are
+    // unrecoverable if the Profile blockstore loses them — exactly
+    // the symptom #330 sought to fix. Best-effort: any error during
+    // the probe is swallowed (the storage may not yet be connected,
+    // or the legacy KV may not implement `get`).
+    if (sphere._fallbackTokenStorage === null) {
+      try {
+        if (
+          typeof options.storage.isConnected === 'function' &&
+          options.storage.isConnected() &&
+          typeof options.storage.get === 'function'
+        ) {
+          const markerValue = await options.storage.get('migration.migratedAt');
+          if (typeof markerValue === 'string' && markerValue.length > 0) {
+            logger.warn(
+              'Sphere',
+              'Issue #330: legacy-migration marker detected on storage but no `fallbackTokenStorage` ' +
+                'was provided to Sphere.init/load. Tokens that were durable in the legacy IndexedDB ' +
+                'before Profile migration are NOT recoverable from this session. Use ' +
+                '`createBrowserProfileProvidersAuto` (or wire a legacy `IndexedDBTokenStorageProvider` ' +
+                'as `fallbackTokenStorage` manually) to close this gap.',
+            );
+          }
+        }
+      } catch {
+        // Probe is best-effort. Continue without warning.
+      }
+    }
+
+    // Issue #330 — propagate the fallback into any token storage
+    // provider that supports it (Profile-mode providers expose
+    // `setFallbackTokenStorage`). Done here, before initialize() runs,
+    // so the first `load()` call sees the fallback. Other providers
+    // (legacy IndexedDB) silently ignore — duck-type check.
+    if (sphere._fallbackTokenStorage !== null) {
+      for (const provider of sphere._tokenStorageProviders.values()) {
+        const setter = (provider as {
+          setFallbackTokenStorage?: (
+            fb: TokenStorageProvider<TxfStorageDataBase>,
+          ) => void;
+        }).setFallbackTokenStorage;
+        if (typeof setter === 'function') {
+          setter.call(provider, sphere._fallbackTokenStorage);
+        }
+      }
+    }
 
     // exists() restores original (disconnected) state — reconnect for reads
     if (!options.storage.isConnected()) {
       await options.storage.connect();
+    }
+    // Same for fallback if supplied — it must be connected before the
+    // identity-load helper consults it.
+    //
+    // Review fix #2 — Demote fallback to `null` on connect failure with
+    // ERROR level (not warn) plus a structured Sphere event. If the
+    // caller went to the trouble of supplying a fallback, a silent
+    // demotion can turn a recoverable boot into a fatal one downstream
+    // with only a buried log line. The event lets consumers (UI banners,
+    // operator dashboards) observe the demotion.
+    if (sphere._fallbackStorage && !sphere._fallbackStorage.isConnected()) {
+      try {
+        await sphere._fallbackStorage.connect();
+      } catch (err) {
+        const errMessage = err instanceof Error ? err.message : String(err);
+        logger.error(
+          'Sphere',
+          `fallbackStorage.connect failed; proceeding WITHOUT fallback ` +
+            `(identity recovery will not be attempted from legacy storage): ${errMessage}`,
+        );
+        sphere._fallbackStorage = null;
+        sphere._fallbackStorageError = err instanceof Error ? err : new Error(errMessage);
+        // Best-effort event so consumers can surface the demotion in UI
+        // / monitoring. Fires synchronously inside `emitEvent`; handler
+        // throws are swallowed by the bus.
+        sphere.emitEvent('storage:fallback-demoted', {
+          reason: 'connect-failed',
+          error: errMessage,
+          at: Date.now(),
+        });
+      }
     }
 
     // Load identity from storage
@@ -1047,6 +1569,10 @@ export class Sphere {
       options.communications,
     );
     sphere._password = options.password ?? null;
+    // Issue #200 Phase 1 wiring — capture optional UXF CAR publisher
+    // before `initializeModules()` threads it into PaymentsModule.
+    sphere._publishToIpfs = options.publishToIpfs ?? null;
+    sphere._cidFetchGateways = options.cidFetchGateways ?? null;
 
     progress?.({ step: 'storing_keys', message: 'Storing wallet keys...' });
 
@@ -1154,6 +1680,19 @@ export class Sphere {
    * Removes wallet keys, per-address data, and optionally token storage.
    * Does NOT affect application-level data stored outside the SDK.
    *
+   * **W46 — per-entry-key collections coverage (T.1.E):**
+   * Per-entry-key collections (outbox, mintOutbox, audit, invalid,
+   * finalizationQueue) live under composite keys of the form
+   * `${addr}.<collection>.${id}` (and, for multi-rep collections,
+   * further composite ids `${tokenId}.${observedTokenContentHash}`).
+   * `clear()` reaches them via the parent `StorageProvider.clear()`
+   * call below — a full prefix-scan-and-delete on the underlying
+   * KV — NOT via `PROFILE_KEY_MAPPING` lookup. This is intentional:
+   * adding a new per-entry-key collection requires zero changes to
+   * `Sphere.clear()`. The mapping table declares the LOGICAL schema;
+   * runtime keys are always reached by prefix wipe. See
+   * `profile/types.ts` PROFILE_KEY_MAPPING contract block.
+   *
    * @param storageOrOptions - StorageProvider (backward compatible) or options object
    *
    * @example
@@ -1161,6 +1700,9 @@ export class Sphere {
    * await Sphere.clear({
    *   storage: providers.storage,
    *   tokenStorage: providers.tokenStorage,
+   *   // Issue #330 — pass the legacy fallback if the wallet was
+   *   // migrated, so the resurrection footgun is closed.
+   *   fallbackTokenStorage: providers.fallbackTokenStorage,
    * });
    *
    * @example
@@ -1168,10 +1710,25 @@ export class Sphere {
    * await Sphere.clear(storage);
    */
   static async clear(
-    storageOrOptions: StorageProvider | { storage: StorageProvider; tokenStorage?: TokenStorageProvider<TxfStorageDataBase> },
+    storageOrOptions:
+      | StorageProvider
+      | {
+          storage: StorageProvider;
+          tokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
+          /**
+           * Issue #330 — read-only fallback token storage that was
+           * passed to `Sphere.init`/`load`. If supplied, `clear()`
+           * wipes it too. Without this, a user calling `clear()` and
+           * then re-running `init()` with the same mnemonic would see
+           * pre-clear tokens resurrected from the legacy IDB.
+           */
+          fallbackTokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
+        },
   ): Promise<void> {
     const storage = 'get' in storageOrOptions ? storageOrOptions as StorageProvider : storageOrOptions.storage;
     const tokenStorage = 'get' in storageOrOptions ? undefined : storageOrOptions.tokenStorage;
+    const fallbackTokenStorage =
+      'get' in storageOrOptions ? undefined : storageOrOptions.fallbackTokenStorage;
 
     // 1. Destroy Sphere instance — flushes pending IPFS writes (saves good
     //    state), then closes all connections. Awaited so IPFS completes
@@ -1203,6 +1760,34 @@ export class Sphere {
       }
     } else {
       logger.debug('Sphere', 'No token storage provider to clear');
+    }
+
+    // 4b. Issue #330 — also wipe the read-only fallback token storage
+    // (legacy IndexedDB from before Profile migration). Without this,
+    // a user who calls `clear()` to start over with the same mnemonic
+    // would see pre-clear tokens resurrected via the fallback wiring.
+    // This violates the "clear means clear" invariant and is a real
+    // data-integrity hazard, not just UX confusion.
+    //
+    // Idempotent and best-effort: a missing `clear` method (older
+    // legacy providers) or an exception is logged but does not block
+    // the rest of the cleanup. The fallback was never written to by
+    // this SDK; the bytes here are pre-migration legacy data.
+    if (fallbackTokenStorage?.clear) {
+      logger.debug('Sphere', 'Clearing fallback (legacy) token storage...');
+      try {
+        if (
+          typeof fallbackTokenStorage.isConnected === 'function' &&
+          !fallbackTokenStorage.isConnected() &&
+          typeof fallbackTokenStorage.connect === 'function'
+        ) {
+          await fallbackTokenStorage.connect();
+        }
+        await fallbackTokenStorage.clear();
+        logger.debug('Sphere', 'Fallback token storage cleared');
+      } catch (err) {
+        logger.warn('Sphere', 'Fallback token storage clear failed:', err);
+      }
     }
 
     // 5. Delete KV database (sphere-storage)
@@ -1288,6 +1873,619 @@ export class Sphere {
     return this._swap;
   }
 
+  /**
+   * Issue #310 — Profile-mode public API surface.
+   *
+   * Returns a {@link SphereProfileHandle} when the wallet's
+   * StorageProvider is a Profile-backed adapter (duck-typed via the
+   * presence of `getPointerLayer`). Returns `null` for legacy
+   * (IndexedDB / File) storage — callers MUST null-check.
+   *
+   * The handle's primary method is `resetEpoch({ reason })`, which
+   * bumps the wallet's permanent OpLog epoch floor by +1 and triggers
+   * a republish so all clients refuse to walk back to any prior epoch.
+   * See `profile/profile-handle.ts` for the full contract.
+   */
+  get profile(): SphereProfileHandle | null {
+    const storage = this._storage as unknown as {
+      getPointerLayer?: () => unknown | null;
+    };
+    if (typeof storage.getPointerLayer !== 'function') {
+      return null;
+    }
+    return this.buildProfileHandle();
+  }
+
+  /**
+   * Lazily-constructed (per-call) handle so it picks up identity /
+   * storage rebinds across `Sphere.load()` reattach cycles. The handle
+   * is a thin lambda that closes over `this` — no state lives inside
+   * it.
+   */
+  private buildProfileHandle(): SphereProfileHandle {
+    return {
+      resetEpoch: (params: ResetEpochParams) => this.resetEpochImpl(params),
+      getEpochFloor: () => this.getEpochFloorImpl(),
+    };
+  }
+
+  /**
+   * Issue #310 — read the wallet's persisted epoch floor. Returns 0
+   * if the wallet has never observed a higher epoch on-chain AND has
+   * never called `resetEpoch`.
+   */
+  private async getEpochFloorImpl(): Promise<number> {
+    const raw = await this._storage.get(LOCAL_EPOCH_FLOOR_KEY);
+    if (raw === null) return 0;
+    const parsed = Number.parseInt(raw, 10);
+    if (
+      !Number.isFinite(parsed) ||
+      !Number.isInteger(parsed) ||
+      parsed < 0
+    ) {
+      return 0;
+    }
+    return parsed;
+  }
+
+  /**
+   * Issue #310 — serialization guard for concurrent `resetEpoch` calls
+   * on the same Sphere instance. Two concurrent invocations could
+   * otherwise both observe floor=N, both write floor=N+1, and emit
+   * two events for what is logically one epoch bump (the second
+   * caller's intent is silently merged into the first). Holding a
+   * per-instance promise serializes the read-modify-write cycle.
+   *
+   * This guard does NOT protect against concurrent SENDS / OpLog
+   * writes from PaymentsModule — those run through the OrbitDB
+   * adapter directly and are subject to OrbitDB's own write
+   * serialization. A concurrent send while resetEpoch is wiping the
+   * OpLog surfaces as a write error from PaymentsModule (caught by
+   * the dispatcher's retry path). Callers SHOULD quiesce sends
+   * externally; this is documented on `SphereProfileHandle.resetEpoch`.
+   */
+  private _resetEpochInFlight: Promise<ResetEpochResult> | null = null;
+
+  /**
+   * Issue #310 — bump the wallet's OpLog epoch floor by +1, kick off a
+   * republish, and emit `'profile:epoch-reset'`. See
+   * `SphereProfileHandle.resetEpoch` for the full contract.
+   */
+  private async resetEpochImpl(
+    params: ResetEpochParams,
+  ): Promise<ResetEpochResult> {
+    const storage = this._storage as unknown as {
+      getPointerLayer?: () => unknown | null;
+    };
+    if (typeof storage.getPointerLayer !== 'function') {
+      throw new SphereError(
+        'sphere.profile.resetEpoch requires Profile-mode storage (got non-Profile StorageProvider).',
+        'NOT_PROFILE_MODE',
+      );
+    }
+
+    if (typeof params.reason !== 'string' || params.reason.length === 0) {
+      throw new SphereError(
+        'sphere.profile.resetEpoch: reason must be a non-empty string.',
+        'INVALID_CONFIG',
+      );
+    }
+    const reasonBytes = new TextEncoder().encode(params.reason);
+    if (reasonBytes.byteLength > EPOCH_RESET_REASON_MAX_BYTES) {
+      throw new SphereError(
+        `sphere.profile.resetEpoch: reason ${reasonBytes.byteLength} bytes exceeds cap ${EPOCH_RESET_REASON_MAX_BYTES}.`,
+        'INVALID_CONFIG',
+      );
+    }
+
+    // Serialize: if a reset is already mid-flight, chain this call
+    // BEHIND it (not deduplicate — each call must produce a NEW epoch
+    // per the idempotency-against-re-runs contract). The check + set
+    // MUST be sync (no intermediate await) so two concurrent
+    // invocations see distinct mid-flight states.
+    const prior = this._resetEpochInFlight;
+    const promise = (async (): Promise<ResetEpochResult> => {
+      if (prior !== null) {
+        try {
+          await prior;
+        } catch {
+          // Previous call's error is irrelevant to this one; the
+          // floor-read below picks up whatever was actually persisted.
+        }
+      }
+      return this.resetEpochCore(params);
+    })();
+    this._resetEpochInFlight = promise;
+    try {
+      return await promise;
+    } finally {
+      if (this._resetEpochInFlight === promise) {
+        this._resetEpochInFlight = null;
+      }
+    }
+  }
+
+  /**
+   * Issue #310 — core read-modify-write cycle for a single resetEpoch
+   * call. Wrapped by `resetEpochImpl` with the mutex.
+   *
+   * PR #316 F1 fix — the floor bump now consults the on-chain epoch
+   * floor (`pointer.discoverLatestVersion().pickedEpoch`) before
+   * computing `newEpoch = max(local, discovered) + 1`. This closes
+   * the cross-device monotonicity gap: two devices that both observe
+   * `localFloor=N` will each discover the same `chainFloor=N` (or
+   * better) and both bump to N+1; whichever device's publish lands
+   * first wins, and the loser's subsequent publish forces a re-
+   * discovery (now seeing the winner's N+1) so its NEXT bump goes
+   * to N+2.
+   */
+  private async resetEpochCore(
+    params: ResetEpochParams,
+  ): Promise<ResetEpochResult> {
+    const ts = Date.now();
+
+    try {
+      // 1a. Read local floor.
+      const currentEpoch = await this.getEpochFloorImpl();
+
+      // 1b. PR #316 F1 fix — consult the on-chain epoch floor with a
+      //     bounded timeout. The walkback floor is the
+      //     `pickedEpoch` from Phase-3 discovery — the `max(epoch)`
+      //     observed across every Phase-3 candidate whose CAR the
+      //     wallet successfully inspected. On RPC failure (network
+      //     down, aggregator timeout, etc.) we fall back to the
+      //     local floor alone and emit the
+      //     `'profile:epoch-reset-discovery-skipped'` event so
+      //     callers can surface the PROVISIONAL nature of the bump.
+      const discoveryTimeoutMs =
+        params.discoveryTimeoutMs ?? RESET_EPOCH_DISCOVERY_TIMEOUT_MS;
+      let discoveredEpoch = 0;
+      let discoveryConsulted = false;
+      let discoveryError: string | null = null;
+      if (discoveryTimeoutMs > 0) {
+        try {
+          discoveredEpoch = await this.discoverChainEpochFloor(
+            discoveryTimeoutMs,
+          );
+          discoveryConsulted = true;
+        } catch (err) {
+          discoveryError = err instanceof Error ? err.message : String(err);
+          logger.warn(
+            'Sphere',
+            `resetEpoch: discovery failed (continuing with local floor only — ` +
+              `new epoch is PROVISIONAL): ${discoveryError}`,
+          );
+        }
+      }
+
+      // 1c. Compute new epoch from the higher of (local, discovered).
+      const baseEpoch = Math.max(currentEpoch, discoveredEpoch);
+      const newEpoch = baseEpoch + 1;
+
+      // 2. Persist BEFORE the OpLog wipe so a crash between (2) and
+      //    (3) leaves the local wallet with the new floor in place —
+      //    the next Sphere.load() publishes the bumped epoch on its
+      //    first dirty-flush.
+      await this._storage.set(LOCAL_EPOCH_FLOOR_KEY, String(newEpoch));
+      await this._storage.set(LOCAL_EPOCH_RESET_REASON_KEY, params.reason);
+
+      // 3. Best-effort OpLog wipe via OrbitDbAdapter.resetCorruptedLog.
+      try {
+        const storageWithAdapter = this._storage as unknown as {
+          getOrbitDbAdapter?: () => {
+            resetCorruptedLog?: (reason: {
+              lostHeadCid?: string;
+              context: string;
+            }) => Promise<unknown>;
+          } | null;
+        };
+        const adapter = storageWithAdapter.getOrbitDbAdapter?.() ?? null;
+        if (
+          adapter !== null &&
+          typeof adapter.resetCorruptedLog === 'function'
+        ) {
+          await adapter.resetCorruptedLog({
+            context: `sphere.profile.resetEpoch: ${params.reason}`,
+          });
+        }
+      } catch (err) {
+        logger.warn(
+          'Sphere',
+          `resetEpoch: OpLog wipe threw (continuing with epoch bump): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+
+      // 3b. PR #316 F3 fix — write a sentinel KV AFTER the OpLog wipe
+      //     so the snapshot builder has concrete OpLog state to flush
+      //     even when no other writers have mutated since the wipe.
+      //     The value is the post-reset epoch (decimal string); the
+      //     sentinel is overwritten on every subsequent reset and
+      //     never accumulates.
+      //
+      //     Ordering rationale: must run AFTER the OpLog wipe so the
+      //     sentinel lands in the FRESH OpLog (the wipe drops the
+      //     OrbitDB instance, so any pre-wipe write would be lost).
+      //     The local cache copy is also overwritten (via
+      //     ProfileStorageProvider.set's local-cache mirror) so the
+      //     wallet's next `Sphere.load()` reads the sentinel back
+      //     consistently.
+      //
+      //     Without this, a publish failure on the first post-reset
+      //     flush could leave the aggregator chain stuck at the
+      //     pre-reset version with no automatic retry surface — the
+      //     periodic poll's `retryPendingPublishIfAny` only fires
+      //     when `pendingPublishCid` is non-null, which in turn only
+      //     stamps when a publish actually attempted and transient-
+      //     failed. If the snapshot builder skipped the publish for
+      //     "no dirty state", no retry would ever run.
+      //
+      //     Best-effort: a write failure does NOT abort the bump.
+      //     The local floor IS already persisted; the wallet stays
+      //     consistent.
+      try {
+        await this._storage.set(
+          LOCAL_EPOCH_RESET_FLUSH_TRIGGER_KEY,
+          String(newEpoch),
+        );
+      } catch (err) {
+        logger.warn(
+          'Sphere',
+          `resetEpoch: flush-trigger sentinel write failed (epoch bump still persisted): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+
+      // 4a. PR #316 F2 fix — arm a one-shot listener on every token-
+      //     storage provider's `'storage:pointer-published'` event
+      //     BEFORE the dirty-flush is triggered. The event fires
+      //     unconditionally on any successful pointer publish (per
+      //     the lifecycle-manager change in this PR). We collect the
+      //     FIRST published version observed across all providers
+      //     within the bounded timeout window.
+      //
+      //     `armResetEpochPublishWaiter` returns `null` when no
+      //     token-storage providers expose `onEvent` — in that case
+      //     there is no event surface to observe and skipping the
+      //     wait is the honest behavior (we return
+      //     `publishedVersion: 0` and DO NOT emit
+      //     `'profile:epoch-reset-publish-pending'` — pending implies
+      //     "we tried and timed out", not "no wiring").
+      const publishTimeoutMs =
+        params.publishTimeoutMs ?? RESET_EPOCH_PUBLISH_TIMEOUT_MS;
+      const publishedVersionWaiter =
+        publishTimeoutMs > 0
+          ? this.armResetEpochPublishWaiter(publishTimeoutMs)
+          : null;
+      // Distinguish "skipped because no listeners" (publishedVersion
+      // remains 0; no pending event) from "skipped because timeout
+      // = 0" (same outcome, also no pending event) from "awaited and
+      // timed out" (publishedVersion = 0 AND pending event emitted).
+      const publishedVersionWaiterRanAndTimedOut: { value: boolean } = {
+        value: false,
+      };
+
+      // 4b. Trigger a dirty-flush so the next aggregator pointer
+      //    publish carries the new epoch (best-effort).
+      try {
+        for (const provider of this._tokenStorageProviders.values()) {
+          const dirtyTrigger = (provider as unknown as {
+            notifyProfileDirty?: () => void;
+          }).notifyProfileDirty;
+          if (typeof dirtyTrigger === 'function') {
+            dirtyTrigger.call(provider);
+          }
+        }
+      } catch (err) {
+        logger.warn(
+          'Sphere',
+          `resetEpoch: notifyProfileDirty threw (epoch bump still persisted): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+
+      // 4c. Await the publish (or timeout). Always cancel the
+      //     waiter — leaking the listener could pin the provider's
+      //     event-handler set across the next publish cycle.
+      let publishedVersion = 0;
+      if (publishedVersionWaiter !== null) {
+        try {
+          publishedVersion = await publishedVersionWaiter.promise;
+        } catch {
+          // Timeout → publishedVersion stays 0; emit the
+          // pending event below.
+          publishedVersionWaiterRanAndTimedOut.value = true;
+        } finally {
+          publishedVersionWaiter.cancel();
+        }
+      }
+
+      // 5. Emit the event.
+      this.emitEvent('profile:epoch-reset', {
+        newEpoch,
+        reason: params.reason,
+        ts,
+      });
+
+      // 5b. PR #316 F1 fix — surface discovery-failure so callers know
+      //     the bump is PROVISIONAL.
+      if (!discoveryConsulted && discoveryError !== null) {
+        this.emitEvent('profile:epoch-reset-discovery-skipped', {
+          newEpoch,
+          reason: params.reason,
+          discoveryError,
+          ts,
+        });
+      }
+
+      // 5c. PR #316 F2 fix — surface publish-timeout so callers know
+      //     to either retry / re-query or subscribe to
+      //     `'storage:pointer-published'` for the eventual landing.
+      //     Only emit when we actually awaited AND timed out — not
+      //     when the waiter was skipped (timeoutMs=0) or returned
+      //     null (no event surface).
+      if (publishedVersionWaiterRanAndTimedOut.value) {
+        this.emitEvent('profile:epoch-reset-publish-pending', {
+          newEpoch,
+          reason: params.reason,
+          timeoutMs: publishTimeoutMs,
+          ts,
+        });
+      }
+
+      return {
+        newEpoch,
+        reason: params.reason,
+        ts,
+        publishedVersion,
+        discoveryConsulted,
+      };
+    } catch (err) {
+      if (err instanceof SphereError) throw err;
+      throw new SphereError(
+        `sphere.profile.resetEpoch failed: ${err instanceof Error ? err.message : String(err)}`,
+        'PROFILE_RESET_FAILED',
+        err,
+      );
+    }
+  }
+
+  /**
+   * PR #316 F2 fix — arm a one-shot waiter on every token-storage
+   * provider's `'storage:pointer-published'` event. Returns a
+   * `{promise, cancel}` pair: the promise resolves with the FIRST
+   * observed `version` across any provider, or rejects on timeout.
+   * `cancel()` unsubscribes every listener and clears the timer
+   * (safe to call multiple times). Callers MUST always call
+   * `cancel()` in a `finally` so the listener set does not pin
+   * across the next event cycle.
+   *
+   * The event fires unconditionally on every successful publish (per
+   * the lifecycle-manager change in this PR), so the waiter does NOT
+   * depend on the `enablePointerWinBroadcasts` capability flag.
+   */
+  private armResetEpochPublishWaiter(
+    timeoutMs: number,
+  ): {
+    promise: Promise<number>;
+    cancel: () => void;
+  } | null {
+    // Collect candidate providers with an `onEvent` accessor BEFORE
+    // installing any listener. Without at least one such provider
+    // the waiter has no way to ever settle on the success path —
+    // letting it run would just stall for the full `timeoutMs`
+    // window with a guaranteed publish-pending event. Returning
+    // `null` is the honest answer: "I cannot observe the publish
+    // here; skip the await". This is the production behavior when
+    // no token storage providers are wired (e.g., pure read-only
+    // unit-test harnesses) and the legitimate behavior on a real
+    // wallet that has Profile storage as the kv-storage backend
+    // but no token storage providers attached.
+    const eligible: Array<{
+      onEvent: (
+        cb: (event: { type: string; data?: { version?: unknown } }) => void,
+      ) => () => void;
+      provider: unknown;
+    }> = [];
+    for (const provider of this._tokenStorageProviders.values()) {
+      const onEvent = (provider as unknown as {
+        onEvent?: (
+          cb: (event: { type: string; data?: { version?: unknown } }) => void,
+        ) => () => void;
+      }).onEvent;
+      if (typeof onEvent !== 'function') continue;
+      eligible.push({ onEvent, provider });
+    }
+    if (eligible.length === 0) {
+      return null;
+    }
+
+    const cleanups: Array<() => void> = [];
+    let settled = false;
+    // Holder for the timer handle. Filled below; `teardown` reads
+    // through the holder so we can declare it before the
+    // `setTimeout` call (avoids use-before-define).
+    const timerHolder: { value: ReturnType<typeof setTimeout> | null } = {
+      value: null,
+    };
+
+    let resolve!: (v: number) => void;
+    let reject!: (err: Error) => void;
+    const promise = new Promise<number>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+
+    const teardown = (): void => {
+      if (timerHolder.value !== null) clearTimeout(timerHolder.value);
+      for (const fn of cleanups) {
+        try {
+          fn();
+        } catch {
+          /* listener-removal must never throw past resetEpoch */
+        }
+      }
+    };
+
+    const cancel = (): void => {
+      if (settled) return;
+      settled = true;
+      teardown();
+    };
+
+    const timer: ReturnType<typeof setTimeout> = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      teardown();
+      // Reject so the caller's `await` throws and the catch arm in
+      // resetEpochCore drops `publishedVersion` to 0.
+      reject(
+        new Error(
+          `resetEpoch: storage:pointer-published not observed within ${timeoutMs}ms`,
+        ),
+      );
+    }, timeoutMs);
+    timerHolder.value = timer;
+    if (
+      typeof (timer as unknown as { unref?: unknown }).unref === 'function'
+    ) {
+      (timer as unknown as { unref: () => void }).unref();
+    }
+
+    for (const { onEvent, provider } of eligible) {
+      const unsub = onEvent.call(provider, (event) => {
+        if (settled) return;
+        if (event?.type !== 'storage:pointer-published') return;
+        const version = event?.data?.version;
+        if (
+          typeof version !== 'number' ||
+          !Number.isFinite(version) ||
+          !Number.isInteger(version) ||
+          version < 0
+        ) {
+          return;
+        }
+        settled = true;
+        teardown();
+        resolve(version);
+      });
+      if (typeof unsub === 'function') {
+        cleanups.push(unsub);
+      }
+    }
+
+    return { promise, cancel };
+  }
+
+  /**
+   * PR #316 F1 fix — best-effort discovery of the on-chain epoch
+   * floor. Runs `pointer.discoverLatestVersion()` with a
+   * caller-supplied wall-clock budget and returns the
+   * `pickedEpoch` value. Throws on any failure (RPC timeout,
+   * aggregator down, pointer layer missing) — the caller logs the
+   * error, emits the `'profile:epoch-reset-discovery-skipped'`
+   * event, and falls back to the local floor alone.
+   *
+   * Returns 0 for a fresh wallet that has never observed an
+   * on-chain epoch (the discovery returns `pickedEpoch: 0` in that
+   * case, which is correct — `max(local=0, discovered=0) + 1 = 1`).
+   */
+  private async discoverChainEpochFloor(
+    timeoutMs: number,
+  ): Promise<number> {
+    const storageWithPointer = this._storage as unknown as {
+      getPointerLayer?: () => {
+        discoverLatestVersion?: (
+          walkbackLimit?: number,
+          opts?: { abortSignal?: AbortSignal },
+        ) => Promise<{ pickedEpoch?: number }>;
+      } | null;
+    };
+    const pointer = storageWithPointer.getPointerLayer?.() ?? null;
+    if (
+      pointer === null ||
+      typeof pointer.discoverLatestVersion !== 'function'
+    ) {
+      throw new Error(
+        'pointer layer unavailable (discoverLatestVersion missing)',
+      );
+    }
+    const abortController = new AbortController();
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      deadlineTimer = setTimeout(() => {
+        try {
+          abortController.abort();
+        } catch {
+          /* noop */
+        }
+      }, timeoutMs);
+      // Some Node test runners support .unref() on timers; ignore otherwise.
+      if (
+        deadlineTimer !== undefined &&
+        typeof (deadlineTimer as unknown as { unref?: unknown }).unref ===
+          'function'
+      ) {
+        (deadlineTimer as unknown as { unref: () => void }).unref();
+      }
+      const result = await pointer.discoverLatestVersion(undefined, {
+        abortSignal: abortController.signal,
+      });
+      const picked = result?.pickedEpoch;
+      if (typeof picked !== 'number' || !Number.isFinite(picked) || picked < 0) {
+        return 0;
+      }
+      return picked;
+    } finally {
+      if (deadlineTimer !== undefined) {
+        clearTimeout(deadlineTimer);
+      }
+    }
+  }
+
+  /**
+   * Issue #312 — unified connectivity surface for the
+   * `aggregator | ipfs | nostr` backends. The handle exposes:
+   *
+   *   - `status()`   — sync snapshot of per-backend reachability.
+   *   - `subscribe(fn)` — per-transition callback (returns unsubscribe).
+   *   - `ping(which)` — force-probe one or all backends.
+   *
+   * The wallet fires `'connectivity:changed'`, `'connectivity:online'`, and
+   * `'connectivity:offline-degraded'` on the Sphere event bus on every
+   * transition — bind via `sphere.on(...)` for the UI banner.
+   *
+   * Advisory only: `payments.send()` reads this status once at entry and
+   * logs a warning if `status().aggregator === 'down'`, but DOES NOT
+   * refuse the send. The state-transition-sdk transport is the
+   * authoritative health signal — it surfaces `JsonRpcNetworkError` on
+   * real transport failures, and ST-SDK exposes no health/ping API,
+   * so any preflight refuse is a Sphere-SDK invention that risks
+   * blocking sends a recovered aggregator would have accepted.
+   *
+   * Returns a no-op stub if accessed before `initializeModules()` ran —
+   * production callers go through `Sphere.init()`, which calls
+   * `initializeModules()` before resolving, so this stub is only visible
+   * in degenerate test setups.
+   */
+  get connectivity(): ConnectivityManagerHandle {
+    if (this._connectivity) return this._connectivity;
+    return Sphere.UNINITIALIZED_CONNECTIVITY;
+  }
+
+  /**
+   * Singleton "uninitialized" connectivity handle. See {@link connectivity}
+   * for rationale.
+   */
+  private static readonly UNINITIALIZED_CONNECTIVITY: ConnectivityManagerHandle = {
+    status: () => ({
+      aggregator: 'unknown',
+      ipfs: 'unknown',
+      nostr: 'unknown',
+      lastOnlineAt: null,
+      lastChangedAt: 0,
+    }),
+    subscribe: () => () => undefined,
+    ping: async () => undefined,
+  };
+
   // ===========================================================================
   // Public Properties - State
   // ===========================================================================
@@ -1329,6 +2527,83 @@ export class Sphere {
   }
 
   // ===========================================================================
+  // Internal — Issue #292 (SDK-private; do not call from consumer code)
+  // ===========================================================================
+
+  /**
+   * Attach this Sphere's internal {@link FullIdentity} (with privateKey) to
+   * a pair of identity-consuming providers WITHOUT exposing the private key
+   * to the caller. Used exclusively by the Sphere-bound Profile factories
+   * in `profile/browser.ts` / `profile/node.ts` and the
+   * `migrateLegacyToProfile({ sphere, ... })` overload in
+   * `profile/token-storage-migration.ts`.
+   *
+   * The `privateKey` field is read from `this._identity` (a private field),
+   * passed directly into `setIdentity` on each provider, and never escapes
+   * the closure. The callback shape is intentionally narrow — only
+   * `setIdentity(FullIdentity): void` is invoked — so the helper cannot
+   * be subverted into leaking the identity through some other provider
+   * method.
+   *
+   * Honors the architectural invariant from the issue #292 owner comment:
+   *
+   * > "Private key material should never leave Sphere SDK itself. However,
+   * > it should be possible to perform all the relevant cryptographic
+   * > operations within Sphere SDK over external materials by means of
+   * > undisclosed respective private key."
+   *
+   * @param applySetIdentity Synchronous callback that receives the live
+   *        `FullIdentity` and calls `setIdentity` on each provider. The
+   *        identity reference MUST NOT be stored, logged, or returned by
+   *        the callback. The helper invokes it once and discards.
+   * @throws {SphereError} `NOT_INITIALIZED` when no identity is bound
+   *        (call this AFTER `Sphere.init` / `Sphere.create` / `Sphere.load`
+   *        resolves). Distinct from the `hexToBytes: empty hex string`
+   *        crash that would have fired inside `Profile*.setIdentity`
+   *        without this guard.
+   *
+   * @internal — sphere-sdk private. Not part of the public API surface.
+   *           Consumers should use `createBrowserProfileProvidersFromSphere`
+   *           or `migrateLegacyToProfile({ sphere, ... })` instead.
+   */
+  _withFullIdentityForProfileFactory(
+    applySetIdentity: (identity: FullIdentity) => void,
+  ): void {
+    if (!this._identity?.privateKey) {
+      throw new SphereError(
+        'Wallet not initialized — call Sphere.init/create/load before constructing Sphere-bound Profile providers',
+        'NOT_INITIALIZED',
+      );
+    }
+    // Snapshot the identity into a local const so a concurrent
+    // `setIdentity` / re-derive on Sphere can't mutate `_identity`
+    // mid-callback. The snapshot is a fresh plain object that the
+    // callback may pass into provider `setIdentity` methods — those
+    // providers retain the reference for their lifetime (they read
+    // `identity.privateKey` lazily inside `connect()`'s Phase B; see
+    // `profile/profile-storage-provider.ts` `identityAtStart`).
+    //
+    // We intentionally do NOT scrub the snapshot's `privateKey` after
+    // the callback: the providers store the snapshot reference and
+    // continue to read `privateKey` during their own connect()
+    // lifecycle, so a scrub would null out their authoritative source
+    // mid-flight (the original sin caught in steelman round 1 of this
+    // PR — see docs/PROFILE-FROM-SPHERE.md "Security review"). The
+    // provider's encryption-key copy is the long-lived secret; the
+    // wallet's `_identity.privateKey` is the canonical source. Both
+    // live for the wallet's lifetime regardless.
+    const snapshot: FullIdentity = {
+      chainPubkey: this._identity.chainPubkey,
+      l1Address: this._identity.l1Address,
+      directAddress: this._identity.directAddress,
+      ipnsName: this._identity.ipnsName,
+      nametag: this._identity.nametag,
+      privateKey: this._identity.privateKey,
+    };
+    applySetIdentity(snapshot);
+  }
+
+  // ===========================================================================
   // Public Methods - Providers Access
   // ===========================================================================
 
@@ -1359,6 +2634,22 @@ export class Sphere {
   async addTokenStorageProvider(provider: TokenStorageProvider<TxfStorageDataBase>): Promise<void> {
     if (this._tokenStorageProviders.has(provider.id)) {
       throw new SphereError(`Token storage provider '${provider.id}' already exists`, 'INVALID_CONFIG');
+    }
+
+    // Issue #330 — apply the fallback before initialize() so the first
+    // load() call on the newly-added provider can fall through to the
+    // legacy IDB if the Profile path returns empty/fails. Duck-typed:
+    // providers that don't expose `setFallbackTokenStorage` are
+    // silently skipped (legacy `IndexedDBTokenStorageProvider`).
+    if (this._fallbackTokenStorage !== null) {
+      const setter = (provider as {
+        setFallbackTokenStorage?: (
+          fb: TokenStorageProvider<TxfStorageDataBase>,
+        ) => void;
+      }).setFallbackTokenStorage;
+      if (typeof setter === 'function') {
+        setter.call(provider, this._fallbackTokenStorage);
+      }
     }
 
     // Set identity if wallet is initialized
@@ -2329,6 +3620,30 @@ export class Sphere {
           emitEvent: this.emitEvent.bind(this),
           chainCode: this._masterKey?.chainCode || undefined,
           price: this._priceProvider ?? undefined,
+          // Issue #200 Phase 1 wiring — keep CID-by-reference publisher
+          // wired across nametag-driven re-initialization.
+          publishToIpfs: this._publishToIpfs ?? undefined,
+          cidFetchGateways: this._cidFetchGateways ?? undefined,
+          // Issue #285 — preserve the CidRefStore across nametag re-init.
+          // The wallet's encryption key has not changed (only the nametag
+          // moved), so the cached store is still valid; we rebuild for
+          // safety because `Sphere.buildCidRefStoreOrNull()` is cheap
+          // (one constructor call). Without this line, the re-init would
+          // drop the deps.cidRefStore field back to undefined and the
+          // PaymentsModule would silently fall back to inline JSON for
+          // pending V5 token persistence.
+          cidRefStore: this.buildCidRefStoreOrNull() ?? undefined,
+          // Issue #255 Problem A — re-thread HD-index recovery hooks on
+          // nametag-driven re-init so per-address PaymentsModule
+          // instances keep the recovery surface alive after identity
+          // updates.
+          ...(this._masterKey
+            ? {
+                deriveAddressInfo: (idx: number) =>
+                  this._deriveAddressInternal(idx, false),
+                getActiveAddresses: () => this._getActiveAddressesInternal(),
+              }
+            : {}),
         });
       }
     }
@@ -2477,6 +3792,51 @@ export class Sphere {
     const groupChat = this._groupChatConfig ? createGroupChatModule(this._groupChatConfig) : null;
     const market = this._marketConfig ? createMarketModule(this._marketConfig) : null;
 
+    // G3 + G7 — Wire Profile-backed persisted storage for the recipient
+    // cross-restart safety net BEFORE payments.initialize() so the
+    // auto-installed FinalizationWorkerRecipient picks up the persisted
+    // FinalizationQueueStorage and the in-memory recipient context Maps
+    // re-hydrate from the persisted contexts. The wiring is best-effort:
+    // when the StorageProvider isn't a ProfileStorageProvider (e.g.
+    // legacy IndexedDB), the auto-install falls back to in-memory shims
+    // (legacy behavior — does NOT survive Sphere.destroy() / restart).
+    try {
+      const storageWithBuilders = this._storage as unknown as {
+        buildFinalizationQueueStorageAdapter?: () =>
+          | import('../profile/finalization-queue-storage-adapter').OrbitDbFinalizationQueueStorageAdapter
+          | null;
+        buildRecipientContextStorageAdapter?: () =>
+          | import('../profile/finalization-queue-storage-adapter').OrbitDbRecipientContextStorageAdapter
+          | null;
+      };
+      const queueAdapter =
+        typeof storageWithBuilders.buildFinalizationQueueStorageAdapter === 'function'
+          ? storageWithBuilders.buildFinalizationQueueStorageAdapter()
+          : null;
+      const ctxAdapter =
+        typeof storageWithBuilders.buildRecipientContextStorageAdapter === 'function'
+          ? storageWithBuilders.buildRecipientContextStorageAdapter()
+          : null;
+      if (queueAdapter !== null || ctxAdapter !== null) {
+        payments.configureRecipientPersistedStorage({
+          ...(queueAdapter !== null
+            ? { finalizationQueueStorage: queueAdapter }
+            : {}),
+          ...(ctxAdapter !== null ? { recipientContextStorage: ctxAdapter } : {}),
+        });
+      }
+    } catch (err) {
+      logger.warn(
+        'Sphere',
+        `G3/G7: failed to wire Profile-backed recipient persisted storage (continuing with in-memory shims): ${safeErrorMessage(err)}`,
+      );
+    }
+
+    // Issue #285 — per-address CidRefStore. Same null semantics as the
+    // primary load() path (see buildCidRefStoreOrNull). All modules
+    // sharing this storage provider use the same CidRefStore instance.
+    const cidRefStore = this.buildCidRefStoreOrNull();
+
     // Initialize with address-specific identity and per-address transport
     payments.initialize({
       identity,
@@ -2487,6 +3847,23 @@ export class Sphere {
       emitEvent,
       chainCode: this._masterKey?.chainCode || undefined,
       price: this._priceProvider ?? undefined,
+      // Issue #200 Phase 1 wiring — forward canonical UXF CAR publisher
+      // to every per-address PaymentsModule (one closure shared across
+      // all addresses; the publisher is identity-independent).
+      publishToIpfs: this._publishToIpfs ?? undefined,
+      cidFetchGateways: this._cidFetchGateways ?? undefined,
+      // Issue #285 — CID-ref store for pending V5 token storage (fat-data).
+      cidRefStore: cidRefStore ?? undefined,
+      // Issue #255 Problem A — HD-index recovery hooks for
+      // finalizeTransferToken. See initializeModules() above for full
+      // rationale.
+      ...(this._masterKey
+        ? {
+            deriveAddressInfo: (idx: number) =>
+              this._deriveAddressInternal(idx, false),
+            getActiveAddresses: () => this._getActiveAddressesInternal(),
+          }
+        : {}),
     });
 
     communications.initialize({
@@ -2494,12 +3871,16 @@ export class Sphere {
       storage: this._storage,
       transport: addressTransport,
       emitEvent,
+      // Issue #285 — CID-ref store for per-address DM cache.
+      cidRefStore: cidRefStore ?? undefined,
     });
 
     groupChat?.initialize({
       identity,
       storage: this._storage,
       emitEvent,
+      // Issue #285 — CID-ref store for group/member/messages/processedEvents.
+      cidRefStore: cidRefStore ?? undefined,
     });
 
     market?.initialize({
@@ -2530,6 +3911,8 @@ export class Sphere {
           on: this.on.bind(this),
           storage: this._storage,
           communications,
+          // Issue #285 — CID-ref store for invoice ledger.
+          cidRefStore: cidRefStore ?? undefined,
         });
       } else {
         logger.warn('Sphere', 'Accounting module enabled but no token storage available — disabling');
@@ -2570,6 +3953,119 @@ export class Sphere {
       }
     }
 
+    // Round 7 (FIX 1) / Round 8 (FIX 1) — Wire production OrbitDb-backed
+    // disposition storage AND oracle.verifyInclusionProof into the
+    // operator escape-hatch importer. Mirrors the wiring in
+    // `initializeModules()` for the default-address path. See there
+    // for full rationale + KNOWN LIMITATION docstring.
+    //
+    // Round 8 (FIX 2) — Without this hop, every non-default address
+    // would silently retain the Round 7 fail-closed verifier stub even
+    // when the wallet has a real oracle wired. That asymmetry meant a
+    // multi-address wallet could pass operator probes on its primary
+    // address but fail them on derived addresses.
+    try {
+      const storageWithBuilder = this._storage as unknown as {
+        buildDispositionStorageAdapter?: () =>
+          | import('../profile/disposition-storage-adapters').OrbitDbDispositionStorageAdapter
+          | null;
+      };
+      const builderAvailable =
+        typeof storageWithBuilder.buildDispositionStorageAdapter === 'function';
+      const adapter = builderAvailable
+        ? storageWithBuilder.buildDispositionStorageAdapter!()
+        : null;
+
+      // Round 8 (FIX 1) — verifyProof adapter (same shape as the
+      // default-address path).
+      const oracleForVerify = this._oracle as unknown as {
+        verifyInclusionProof?: (input: {
+          readonly proofJson: unknown;
+          readonly transactionHash: string;
+          readonly proofHash?: string;
+        }) => Promise<boolean>;
+      };
+      const oracleHasVerify =
+        typeof oracleForVerify.verifyInclusionProof === 'function';
+      const verifyProofAdapter:
+        | import('../modules/payments/transfer/import-inclusion-proof').ProofVerifier
+        | undefined = oracleHasVerify
+        ? async (
+            proof: import('../modules/payments/transfer/import-inclusion-proof').ImportableInclusionProof,
+          ): Promise<import('../modules/payments/transfer/proof-verifier').ProofVerifyStatus> => {
+            try {
+              const ok = await oracleForVerify.verifyInclusionProof!({
+                proofJson: proof.proof,
+                transactionHash: proof.transactionHash,
+              });
+              return ok ? 'OK' : 'NOT_AUTHENTICATED';
+            } catch {
+              return 'NOT_AUTHENTICATED';
+            }
+          }
+        : undefined;
+
+      if (adapter !== null && adapter !== undefined) {
+        payments.configureOperatorEscapeHatchStorage(
+          adapter,
+          verifyProofAdapter !== undefined
+            ? { verifyProof: verifyProofAdapter }
+            : undefined,
+        );
+        // Issue #174 (DispositionWriter wiring) — also wire the
+        // spent-state-rescan AUDIT route. Re-uses the same OrbitDb
+        // adapter so the `_audit` records the operator escape-hatch
+        // imports already touch and the records the spent-state-rescan
+        // worker writes both land in the SAME collection — single
+        // source of truth per §5.4.
+        try {
+          const auditWriter = await buildSpentStateAuditWriter(adapter, emitEvent);
+          payments.installSpentStateAuditWriter(auditWriter);
+          logger.debug(
+            'Sphere',
+            `Wired spent-state-rescan AUDIT DispositionWriter for address ${index}`,
+          );
+        } catch (auditErr) {
+          logger.warn(
+            'Sphere',
+            `Failed to wire spent-state-rescan AUDIT DispositionWriter for address ${index}: ${safeErrorMessage(auditErr)}`,
+          );
+        }
+        logger.debug(
+          'Sphere',
+          `Wired OrbitDb-backed disposition storage + verifyProof for address ${index}`,
+        );
+      } else if (verifyProofAdapter !== undefined) {
+        // No OrbitDb adapter, but we still have a real oracle —
+        // upgrade just the verifier so multi-address wallets also
+        // benefit from the Round 8 verifier wiring.
+        const { InMemoryDispositionStorageAdapter } = await import(
+          '../profile/disposition-storage-adapters'
+        );
+        payments.configureOperatorEscapeHatchStorage(
+          new InMemoryDispositionStorageAdapter(),
+          { verifyProof: verifyProofAdapter },
+        );
+        logger.debug(
+          'Sphere',
+          `Wired oracle.verifyInclusionProof for address ${index} (in-memory disposition storage)`,
+        );
+      }
+    } catch (err) {
+      logger.warn(
+        'Sphere',
+        `Failed to wire operator-escape-hatch importer overrides for address ${index}: ${safeErrorMessage(err)}`,
+      );
+    }
+
+    // Issue #97 (steelman C1) — wire profile-resident outbox + SENT
+    // ledger BEFORE payments.load() so the load-tail orphan sweeper
+    // sees the writers. Mirrors the wiring in `initializeModules`
+    // (primary address). Without this, multi-address wallets'
+    // non-primary addresses silently fall back to the legacy KV
+    // outbox — losing crash-safety guarantees.
+    this.wireProfilePersistedSendStorage(payments, identity);
+
     // payments.load() is critical — must succeed for wallet to be usable
     await payments.load();
 
@@ -2608,6 +4104,130 @@ export class Sphere {
     });
 
     return moduleSet;
+  }
+
+  /**
+   * Issue #97 — Wire the profile-resident OutboxWriter + SentLedgerWriter
+   * onto a PaymentsModule. Used by BOTH `initializeModules` (primary
+   * address bootstrap) and `initializeAddressModules` (per-address
+   * bootstrap on `switchToAddress`).
+   *
+   * **Atomicity (steelman C5 partial fix):** the OutboxWriter and
+   * SentLedgerWriter MUST be installed together. PaymentsModule's
+   * dispatcher hooks dual-write through both — installing OutboxWriter
+   * alone would tombstone outbox entries on `delivered` with no
+   * permanent SENT backup. To enforce this:
+   *   - If either build returns null, install NEITHER. Falls back to
+   *     legacy KV outbox.
+   *   - Pre-check both before either install fires.
+   *
+   * **Best-effort:** when the storage provider is not a
+   * `ProfileStorageProvider` (e.g. legacy IndexedDB), this is a no-op.
+   *
+   * @param payments  The PaymentsModule instance to wire.
+   * @param identity  The full identity carrying the directAddress (used
+   *                  to derive the addressId scope for both writers).
+   */
+  private wireProfilePersistedSendStorage(
+    payments: PaymentsModule,
+    identity: FullIdentity | null,
+  ): void {
+    if (identity === null) return;
+    try {
+      const storageForOutbox = this._storage as unknown as {
+        buildOutboxWriter?: (
+          addressId: string,
+        ) => import('../profile/outbox-writer').OutboxWriter | null;
+        buildSentLedgerWriter?: (
+          addressId: string,
+        ) => import('../profile/sent-ledger-writer').SentLedgerWriter | null;
+      };
+      if (
+        typeof storageForOutbox.buildOutboxWriter !== 'function' ||
+        typeof storageForOutbox.buildSentLedgerWriter !== 'function'
+      ) {
+        return;
+      }
+      const directAddress = identity.directAddress;
+      if (typeof directAddress !== 'string' || directAddress.length === 0) {
+        return;
+      }
+      const addressId = getAddressId(directAddress);
+
+      // Pre-check both before installing either (atomicity).
+      const outboxWriter = storageForOutbox.buildOutboxWriter(addressId);
+      const sentWriter = storageForOutbox.buildSentLedgerWriter(addressId);
+      if (outboxWriter === null || sentWriter === null) {
+        if (outboxWriter !== null || sentWriter !== null) {
+          logger.warn(
+            'Sphere',
+            `wireProfilePersistedSendStorage(${addressId}): partial build (outbox=${outboxWriter !== null} sent=${sentWriter !== null}) — refusing to install either (atomicity invariant); PaymentsModule will use legacy KV outbox`,
+          );
+        } else {
+          logger.debug(
+            'Sphere',
+            `wireProfilePersistedSendStorage(${addressId}): builds returned null (encryption disabled or identity pending) — PaymentsModule uses legacy KV outbox`,
+          );
+        }
+        return;
+      }
+
+      payments.installOutboxWriter(outboxWriter);
+      payments.installSentLedgerWriter(sentWriter);
+      logger.debug(
+        'Sphere',
+        `Wired profile-resident OutboxWriter + SentLedgerWriter for address ${addressId}`,
+      );
+    } catch (err) {
+      logger.warn(
+        'Sphere',
+        `wireProfilePersistedSendStorage threw — PaymentsModule falls back to legacy KV outbox: ${safeErrorMessage(err)}`,
+      );
+    }
+  }
+
+  /**
+   * Issue #285 — Construct a {@link CidRefStore} via the storage
+   * provider's `buildCidRefStore()` helper when available.
+   *
+   * The four fat-data OpLog write sites
+   * (`CommunicationsModule._doSave`, `GroupChatModule.persistMembers`,
+   * `GroupChatModule.persistProcessedEvents`,
+   * `GroupChatModule.persistMessages`) — plus `PaymentsModule` pending
+   * V5 tokens and `AccountingModule` invoice ledger — accept an
+   * optional CidRefStore via their `initialize()` deps. Without one,
+   * each falls through to inline JSON storage which routinely exceeds
+   * the 128 KiB Profile OpLog cap (3.98 MB observed for the
+   * `announcements` group's `groupChatMembers` blob).
+   *
+   * Best-effort: when the storage provider is not a
+   * `ProfileStorageProvider`, when encryption is disabled, when the
+   * identity has not been set yet, or when no IPFS gateways are
+   * configured, this returns `null` and the modules retain their
+   * legacy inline behaviour (still bounded by the 128 KiB cap; the
+   * existing PAYLOAD-SIZE soft-warn will fire on offending writes).
+   *
+   * The returned store is cached per-Sphere-instance. Identity
+   * rotation (`load()` switching to a different address) MUST
+   * `_cidRefStore = null` to force a rebuild — the captured
+   * encryption key is the one at construction time.
+   */
+  private buildCidRefStoreOrNull(): import('../profile/cid-ref-store').CidRefStore | null {
+    try {
+      const storageWithBuilder = this._storage as unknown as {
+        buildCidRefStore?: () => import('../profile/cid-ref-store').CidRefStore | null;
+      };
+      if (typeof storageWithBuilder.buildCidRefStore !== 'function') {
+        return null;
+      }
+      return storageWithBuilder.buildCidRefStore();
+    } catch (err) {
+      logger.warn(
+        'Sphere',
+        `buildCidRefStoreOrNull threw — modules fall back to inline JSON storage: ${safeErrorMessage(err)}`,
+      );
+      return null;
+    }
   }
 
   /**
@@ -3255,9 +4875,9 @@ export class Sphere {
   // Public Methods - Sync
   // ===========================================================================
 
-  async sync(): Promise<void> {
+  async sync(options?: SyncOptions): Promise<SyncResult> {
     this.ensureReady();
-    await this._payments.sync();
+    return this._payments.sync(options);
   }
 
   // ===========================================================================
@@ -3369,10 +4989,27 @@ export class Sphere {
       throw new SphereError(`Unicity ID already registered for address ${this._currentAddressIndex}: @${this._identity.nametag}`, 'ALREADY_INITIALIZED');
     }
 
-    // 1. Mint nametag token on-chain FIRST
-    // Required for receiving tokens via @nametag (PROXY address finalization).
-    // Minting before publishing ensures the nametag is backed by an on-chain token.
-    if (!this._payments.hasNametag()) {
+    // 1. Mint nametag token on-chain FIRST — required so the Nostr
+    //    binding we publish is backed by an on-chain token under this
+    //    wallet's control. Skip the mint only when a token for THIS
+    //    EXACT name is already stored (idempotent re-register). If a
+    //    DIFFERENT nametag is stored, throw NAMETAG_CONFLICT: registering
+    //    `B` while the wallet's anchor is `A` would publish `@B → me`
+    //    but finalize incoming PROXY transfers via the `A` token,
+    //    producing the alice-vs-alice-t1 mismatch this guard exists for.
+    let mintedFresh = false;
+    if (!this._payments.hasNametagNamed(cleanNametag)) {
+      if (this._payments.hasNametag()) {
+        const existingName = this._payments.getNametag()!.name;
+        throw new SphereError(
+          `Cannot register Unicity ID "@${cleanNametag}" — this wallet ` +
+          `already holds an on-chain nametag token for "@${existingName}". ` +
+          `A single address binds to a single nametag on-chain; switch to ` +
+          `a different HD address (sphere.switchToAddress) and register ` +
+          `"@${cleanNametag}" there, or clear the wallet to start fresh.`,
+          'NAMETAG_CONFLICT',
+        );
+      }
       logger.debug('Sphere', `Minting nametag token for @${cleanNametag}...`);
       const result = await this.mintNametag(cleanNametag);
       if (!result.success) {
@@ -3381,10 +5018,32 @@ export class Sphere {
           'AGGREGATOR_ERROR',
         );
       }
-      logger.debug('Sphere', `Nametag token minted successfully`);
+      mintedFresh = true;
+      logger.debug('Sphere', 'Nametag token minted successfully');
     }
 
-    // 2. Publish identity binding with nametag to Nostr AFTER minting succeeds
+    // Belt-and-braces: defense-in-depth against future regressions in
+    // PaymentsModule.mintNametag that report success without persisting
+    // the NametagData. The current implementation can't reach here
+    // legitimately (mint failure throws above; mint success calls
+    // setNametag before returning), so this is a guard for the contract,
+    // not for any observed bug.
+    if (!this._payments.hasNametagNamed(cleanNametag)) {
+      throw new SphereError(
+        `Refusing to publish Nostr binding for "@${cleanNametag}" — mint ` +
+        `reported success but no matching nametag token was persisted to ` +
+        `the local store. Indicates a partial-write bug in the mint pipeline.`,
+        'AGGREGATOR_ERROR',
+      );
+    }
+
+    // 2. Publish identity binding with nametag to Nostr AFTER minting
+    //    succeeds. The publish step is a relay write — failures are
+    //    DISTINCT from aggregator-mint failures and need a separate
+    //    error code so operators can act correctly:
+    //      - AGGREGATOR_ERROR (above): bad oracle, retry-later
+    //      - NAMETAG_TAKEN (here): the name is owned on the relay by a
+    //        different pubkey, no amount of retry will fix it
     if (this._transport.publishIdentityBinding) {
       const success = await this._transport.publishIdentityBinding(
         this._identity!.chainPubkey,
@@ -3393,7 +5052,41 @@ export class Sphere {
         cleanNametag,
       );
       if (!success) {
-        throw new SphereError('Failed to register Unicity ID. It may already be taken.', 'VALIDATION_ERROR');
+        // Rollback an orphaned mint: if THIS call minted the nametag and
+        // the public claim then failed, the local store has a token we
+        // can't legitimately advertise. Leaving it would trip
+        // NAMETAG_CONFLICT on every subsequent registerNametag attempt
+        // with a different name. The on-chain token itself is permanent
+        // — minting is irreversible — but we drop the local pointer so
+        // the wallet's state is consistent. (If the conflict on the
+        // relay ever clears, the deterministic-salt mint will recover
+        // the same token via REQUEST_ID_EXISTS.)
+        if (mintedFresh) {
+          try {
+            await this._payments.clearNametagByName(cleanNametag);
+            logger.debug(
+              'Sphere',
+              `Rolled back orphan local nametag entry for "@${cleanNametag}" after publish failure`,
+            );
+          } catch (rollbackErr) {
+            logger.warn(
+              'Sphere',
+              `Failed to roll back nametag "@${cleanNametag}" after publish failure (continuing):`,
+              rollbackErr,
+            );
+          }
+        }
+        const restoredSuffix = mintedFresh
+          ? ` The orphan local nametag entry from THIS attempt has been rolled back.`
+          : ``;
+        throw new SphereError(
+          `Cannot claim Unicity ID "@${cleanNametag}" on the relay — the binding ` +
+          `event was rejected. Most commonly this means another wallet already ` +
+          `owns "@${cleanNametag}" on this relay (the relay enforces uniqueness ` +
+          `independently of the aggregator).${restoredSuffix} Retry with a ` +
+          `different --nametag, or contact relay ops if you expected to own this name.`,
+          'NAMETAG_TAKEN',
+        );
       }
     }
 
@@ -3412,8 +5105,25 @@ export class Sphere {
       nametags.set(0, cleanNametag);
     }
 
-    // Persist nametag cache
-    await this.persistAddressNametags();
+    // Persist nametag cache. Steelman⁵³ WARNING: at this point Nostr
+    // already advertises @cleanNametag bound to our pubkey (step 2),
+    // so a persistence failure here would leave local-vs-relay
+    // inconsistent — the next cold load() would not see the
+    // nametag in local state. Best-effort: catch the persistence
+    // failure, surface a typed error to the caller, but do NOT
+    // throw. The relay binding remains authoritative (sync on
+    // next switchToAddress / postSwitchSync recovers the nametag
+    // via transport lookup).
+    try {
+      await this.persistAddressNametags();
+    } catch (persistErr) {
+      logger.warn(
+        'Sphere',
+        `registerNametag: relay binding succeeded for @${cleanNametag} but ` +
+          `local persistence failed (${persistErr instanceof Error ? persistErr.message : String(persistErr)}). ` +
+          `Next load() will recover via Nostr lookup.`,
+      );
+    }
 
     this.emitEvent('nametag:registered', {
       nametag: cleanNametag,
@@ -3822,6 +5532,60 @@ export class Sphere {
       // Note: no need to re-publish here — callers follow up with
       // syncIdentityWithTransport() which will publish WITH the recovered nametag.
 
+      // Re-mint the on-chain nametag TOKEN. Without this, the wallet's
+      // identity claim (set above) advertises @recoveredNametag on Nostr,
+      // but `_payments.nametags` is empty — so the wallet has no
+      // `nametagToken.id` to derive the expected PROXY against, and every
+      // inbound PROXY-mode transfer fails `finalizeTransferToken` with
+      // "Cannot finalize PROXY transfer - no Unicity ID token".
+      //
+      // Recovery is one deterministic-salt mint call. The aggregator
+      // returns `REQUEST_ID_EXISTS` with the original inclusion proof
+      // (because the salt is `SHA256(this.signingKey || name)` — same
+      // wallet, same name → same commitment ID), and the wallet
+      // reconstructs the token locally. No extra round-trip beyond what
+      // a fresh mint would cost.
+      //
+      // If the mint fails (network hiccup, aggregator down, or — in the
+      // hypothetical Nostr-binding-forged scenario — the salt doesn't
+      // match a prior commitment under this pubkey), we keep the
+      // identity claim but warn. PROXY-mode transfers will fail until a
+      // subsequent successful `sphere.mintNametag()` call; the operator
+      // can retry manually.
+      if (!this._payments.hasNametagNamed(recoveredNametag)) {
+        try {
+          // Call PaymentsModule.mintNametag directly, NOT this.mintNametag.
+          // The public Sphere.mintNametag wrapper invokes ensureReady() —
+          // which throws "Sphere not initialized" because Sphere.create
+          // calls recoverNametagFromTransport BEFORE setting
+          // `_initialized = true`. The PaymentsModule's own
+          // ensureInitialized() check is satisfied at this point
+          // (initializeModules ran earlier in the create flow).
+          const mintResult = await this._payments.mintNametag(recoveredNametag);
+          if (mintResult.success) {
+            logger.debug(
+              'Sphere',
+              `Re-minted on-chain nametag token for recovered "@${recoveredNametag}"`,
+            );
+          } else {
+            logger.warn(
+              'Sphere',
+              `Recovered Unicity ID "@${recoveredNametag}" from transport but ` +
+              `on-chain token mint-recovery failed: ${mintResult.error}. ` +
+              `PROXY-mode inbound transfers will fail until a subsequent ` +
+              `sphere.mintNametag("${recoveredNametag}") call succeeds.`,
+            );
+          }
+        } catch (mintErr) {
+          logger.warn(
+            'Sphere',
+            `Recovered Unicity ID "@${recoveredNametag}" from transport but ` +
+            `on-chain token mint-recovery threw (continuing without token):`,
+            mintErr,
+          );
+        }
+      }
+
       this.emitEvent('nametag:recovered', { nametag: recoveredNametag });
     } catch {
       // Don't fail wallet import on nametag recovery errors
@@ -3840,8 +5604,99 @@ export class Sphere {
   // Public Methods - Lifecycle
   // ===========================================================================
 
-  async destroy(): Promise<void> {
+  /**
+   * Issue #255 (2026-05-25) — synchronously drain every pending
+   * debounced flush across all per-address ProfileTokenStorage
+   * providers (pin + OrbitDB ref + aggregator pointer publish +
+   * per-flush remote-durability verification per #239).
+   *
+   * Use this when a CLI command wants to confirm its state mutation
+   * is durably published BEFORE returning a success exit, without
+   * actually tearing the wallet down. Equivalent to the implicit
+   * pre-shutdown sweep `destroy()` now does, but re-callable.
+   *
+   * Returns when all providers report no pending data OR the
+   * `timeoutMs` budget is exhausted (in which case the affected
+   * provider's `pendingPublishCid` retry marker remains stamped for
+   * cold-start recovery and this method resolves normally — never
+   * throws). Errors during individual provider flushes are logged
+   * and swallowed; the caller cannot distinguish per-provider
+   * failures via this API. For that, call
+   * `(provider as { awaitNextFlush?: ... }).awaitNextFlush(timeoutMs)`
+   * directly on the specific provider you care about.
+   *
+   * @param timeoutMs Per-provider deadline. Default 30 000 ms.
+   */
+  async flushPending(timeoutMs: number = 30_000): Promise<void> {
+    if (!this._initialized) return;
+    const allProviders: TokenStorageProvider<TxfStorageDataBase>[] = [];
+    for (const moduleSet of this._addressModules.values()) {
+      for (const provider of moduleSet.tokenStorageProviders.values()) {
+        allProviders.push(provider);
+      }
+    }
+    for (const provider of this._tokenStorageProviders.values()) {
+      if (!allProviders.includes(provider)) {
+        allProviders.push(provider);
+      }
+    }
+    for (const provider of allProviders) {
+      try {
+        await (provider as TokenStorageProvider<TxfStorageDataBase> & {
+          awaitNextFlush?: (timeoutMs?: number) => Promise<void>;
+        }).awaitNextFlush?.(timeoutMs);
+      } catch (err) {
+        logger.warn(
+          'Sphere',
+          `flushPending: provider ${provider.id ?? '<unknown>'} flush failed ` +
+          `(continuing; pendingPublishCid retry will handle): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+  }
+
+  async destroy(options?: DestroyOptions): Promise<void> {
+    // Issue #239 — the shutdown durability gate is OPT-IN at the
+    // wallet layer. Rationale: the per-flush verification gate
+    // (`flushVerificationDeadlineMs` on `ProfileTokenStorageProviderOptions`,
+    // wired ON by `createProfileProviders` with a 30 s deadline)
+    // already enforces remote-pin durability for every profile update
+    // BEFORE the flush returns. By the time `destroy()` is called,
+    // the most-recent CIDs have already been HEAD-verified on the
+    // IPFS gateways; the shutdown gate's pin-verify leg short-circuits
+    // via the verified-watermark optimisation. The remaining shutdown
+    // leg — aggregator `recoverLatest()` read-back — is purely a
+    // cross-device-recovery quality-of-service check (it verifies
+    // read replicas have caught up). For single-machine cross-process
+    // CLI flows the local OrbitDB write is the recovery path, not
+    // the aggregator read, so the read-back is redundant overhead.
+    //
+    // Operators who explicitly need cross-device read-replica catch-up
+    // before exit MUST pass `verificationDeadlineMs: N` to opt in
+    // (typical N = 30 000). E2E tests that want to simulate an
+    // ungraceful crash continue to use `force: true`.
+    const effectiveOptions = options;
+    // Issue #255 (2026-05-25) — opt-out flag for the new pre-shutdown
+    // flush sweep; default false ⇒ flush before shutting down.
+    const skipFlush = options?.skipFlush === true;
+    const flushTimeoutMs = options?.flushTimeoutMs ?? 30_000;
+
     this.cleanupProviderEventSubscriptions();
+
+    // Issue #312 — stop the connectivity manager FIRST so its scheduled
+    // probes (which dereference `this._oracle` and `this._transport`)
+    // cannot race with provider teardown below. `stop()` aborts in-flight
+    // probes, clears subscribers, and resolves once every probe has
+    // settled — safe to await; bounded by `pingTimeoutMs`.
+    if (this._connectivity) {
+      try {
+        await this._connectivity.stop();
+      } catch (err) {
+        logger.warn('Sphere', 'ConnectivityManager stop failed:', err);
+      }
+      this._connectivity = null;
+    }
 
     // Destroy swap FIRST — it depends on accounting (which depends on payments)
     try {
@@ -3858,6 +5713,93 @@ export class Sphere {
       logger.warn('Sphere', 'Accounting module destroy failed:', err);
     }
 
+    // Issue #255 (2026-05-25) — synchronous pre-shutdown flush sweep.
+    //
+    // Fire-and-exit CLI commands (`sphere init`, `sphere faucet`,
+    // `sphere invoice pay`, etc.) call into PaymentsModule which
+    // writes to the per-address ProfileTokenStorage. Those writes
+    // call `notifyProfileDirty()`, which arms a debounced flush
+    // timer (default `flushDebounceMs = 2000`). If the CLI process
+    // exits before the timer fires, the dirty data never gets
+    // pinned to IPFS and never gets a pointer publish — sibling
+    // devices have no way to discover the mutation until some
+    // long-running daemon happens to retry via the
+    // `pendingPublishCid` cold-start path.
+    //
+    // The fix: before shutting providers down, call each
+    // provider's `awaitNextFlush(timeoutMs)`. That cancels the
+    // debounce timer, forces a serialized flush, and waits for
+    // pin + OrbitDB ref + aggregator pointer publish + per-flush
+    // remote-durability verification (per #239) to complete. On
+    // TIMEOUT the `pendingPublishCid` retry marker is left
+    // stamped; destroy() proceeds with shutdown so the caller
+    // doesn't hang on a misbehaving gateway.
+    //
+    // `options.skipFlush = true` opts out for fast-exit / E2E
+    // crash-simulation paths. Swap + accounting destroy run
+    // BEFORE this sweep so their in-flight operations have
+    // already committed to token-storage by flush time.
+    //
+    // Providers that don't implement `awaitNextFlush` (File /
+    // IndexedDB / IPFS-legacy) silently skip via optional chaining
+    // — they don't have a debounced flush surface to drain.
+    if (!skipFlush) {
+      const allProviders: TokenStorageProvider<TxfStorageDataBase>[] = [];
+      for (const moduleSet of this._addressModules.values()) {
+        for (const provider of moduleSet.tokenStorageProviders.values()) {
+          allProviders.push(provider);
+        }
+      }
+      for (const provider of this._tokenStorageProviders.values()) {
+        // De-dupe: per-address modules' providers may also be in the
+        // top-level map (the active-address modules reference is a
+        // pointer to the same Map entry). Identity-compare to avoid
+        // double-flushing.
+        if (!allProviders.includes(provider)) {
+          allProviders.push(provider);
+        }
+      }
+      for (const provider of allProviders) {
+        try {
+          await (provider as TokenStorageProvider<TxfStorageDataBase> & {
+            awaitNextFlush?: (timeoutMs?: number) => Promise<void>;
+          }).awaitNextFlush?.(flushTimeoutMs);
+        } catch (err) {
+          // Don't hang destroy() on a flush failure. The provider's
+          // own `pendingPublishCid` retry marker covers the next-boot
+          // recovery path. Log so the operator sees it.
+          logger.warn(
+            'Sphere',
+            `pre-shutdown awaitNextFlush failed on provider ${provider.id ?? '<unknown>'} ` +
+            `(continuing with shutdown; pendingPublishCid retry will handle): ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+    }
+
+    // Issue #97 (steelman C6) — null out per-address profile writers
+    // BEFORE the storage provider disconnects. The writers hold a
+    // reference to the underlying ProfileDatabase; in-flight fire-
+    // and-forget hydration Promises (kicked off by installOutboxWriter)
+    // would otherwise dispatch reads against a closing/closed DB and
+    // log spurious errors on the way out.
+    for (const moduleSet of this._addressModules.values()) {
+      try {
+        moduleSet.payments.installOutboxWriter(null);
+        moduleSet.payments.installSentLedgerWriter(null);
+      } catch {
+        // Non-fatal — installer is a 1-line setter, but defensive
+        // wrap protects future-stricter contracts.
+      }
+    }
+    try {
+      this._payments.installOutboxWriter(null);
+      this._payments.installSentLedgerWriter(null);
+    } catch {
+      // Non-fatal.
+    }
+
     // Destroy all per-address module sets
     for (const [idx, moduleSet] of this._addressModules.entries()) {
       try {
@@ -3865,9 +5807,13 @@ export class Sphere {
         moduleSet.communications.destroy();
         moduleSet.groupChat?.destroy();
         moduleSet.market?.destroy();
-        // Shutdown per-address token storage providers
+        // Shutdown per-address token storage providers.
+        // Issue #239 — propagate destroy options (force / reason /
+        // verificationDeadlineMs) so the per-address token storage
+        // providers run (or skip) the remote-durability gate consistent
+        // with the caller's intent.
         for (const provider of moduleSet.tokenStorageProviders.values()) {
-          try { await provider.shutdown(); } catch { /* non-fatal */ }
+          try { await provider.shutdown(effectiveOptions); } catch { /* non-fatal */ }
         }
         moduleSet.tokenStorageProviders.clear();
         logger.debug('Sphere', `Destroyed modules for address ${idx}`);
@@ -3891,18 +5837,39 @@ export class Sphere {
     }
 
     await this._transport.disconnect();
-    await this._storage.disconnect();
-    await this._oracle.disconnect();
 
-    // Shutdown original token storage providers (close IndexedDB connections etc.)
+    // Issue #234 (shutdown ordering): shutdown token storage providers
+    // BEFORE disconnecting the KV storage. ProfileTokenStorageProvider
+    // shares its OrbitDbAdapter instance with ProfileStorageProvider
+    // (see profile/factory.ts:427); the token provider's shutdown-time
+    // flush writes the bundle CID via bundleIndex.addBundle ->
+    // db.putEntry on that shared adapter. If _storage.disconnect()
+    // runs first, the put throws PROFILE_NOT_INITIALIZED, the flush
+    // throws, the aggregator pointer publish is skipped, and the
+    // just-pinned CAR is orphaned. Note: this races a SECOND failure
+    // mode tracked under #234 — IPFS gateway propagation lag, where
+    // even a successful flush leaves the next process's load() unable
+    // to fetch the CAR until the gateways catch up. This reorder is
+    // necessary but NOT sufficient to fix the manual-test failure;
+    // the IPFS propagation fix (e.g., persist CAR blocks to the local
+    // Helia blockstore) is recommended as a follow-up.
     for (const provider of this._tokenStorageProviders.values()) {
       try {
-        await provider.shutdown();
+        // Issue #239 — propagate destroy options (force / reason /
+        // verificationDeadlineMs). The Profile provider's
+        // LifecycleManager.shutdown reads these to gate (or skip) the
+        // remote-durability verification round-trips before returning.
+        // Providers without a remote-durability boundary (File /
+        // IndexedDB / IPFS legacy) silently ignore the parameter.
+        await provider.shutdown(effectiveOptions);
       } catch {
         // Non-fatal — provider may already be closed
       }
     }
     this._tokenStorageProviders.clear();
+
+    await this._storage.disconnect();
+    await this._oracle.disconnect();
 
     this._initialized = false;
     this._trackedAddressesLoaded = false;
@@ -3923,24 +5890,77 @@ export class Sphere {
   // ===========================================================================
 
   private async storeMnemonic(mnemonic: string, derivationPath?: string, basePath?: string): Promise<void> {
-    // TODO: Encrypt with user password/PIN
+    // Wave G.6: prefer the atomic setMany() path when the provider
+    // implements it (IndexedDB cross-key transaction, FileStorage
+    // file-lock-guarded snapshot rewrite). Either every key lands or
+    // none do — no rollback needed. Falls back to the F.56 best-
+    // effort transactional rollback for providers that don't.
+    //
+    // Wave I.3 CRITICAL: snapshot in-memory state BEFORE mutating
+    // and BEFORE awaiting setMany. If setMany throws (quota, IDB
+    // abort, lock-contended file write), the in-memory state was
+    // already mutated — caller's `sphere.getMnemonic()` would return
+    // an unstored mnemonic, silent divergence between live instance
+    // and disk. Restore on catch matches the F.51 fallback contract.
     const encrypted = this.encrypt(mnemonic);
-    await this._storage.set(STORAGE_KEYS_GLOBAL.MNEMONIC, encrypted);
-
-    // Store mnemonic in memory for getMnemonic()
+    const prevMnemonic = this._mnemonic;
+    const prevSource = this._source;
+    const prevDerivationMode = this._derivationMode;
+    const prevBasePath = this._basePath;
     this._mnemonic = mnemonic;
     this._source = 'mnemonic';
     this._derivationMode = 'bip32';
-
-    if (derivationPath) {
-      await this._storage.set(STORAGE_KEYS_GLOBAL.DERIVATION_PATH, derivationPath);
-    }
-
     const effectiveBasePath = basePath ?? DEFAULT_BASE_PATH;
     this._basePath = effectiveBasePath;
-    await this._storage.set(STORAGE_KEYS_GLOBAL.BASE_PATH, effectiveBasePath);
-    await this._storage.set(STORAGE_KEYS_GLOBAL.DERIVATION_MODE, this._derivationMode);
-    await this._storage.set(STORAGE_KEYS_GLOBAL.WALLET_SOURCE, this._source);
+    const entries: Array<[string, string]> = [
+      [STORAGE_KEYS_GLOBAL.MNEMONIC, encrypted],
+      [STORAGE_KEYS_GLOBAL.BASE_PATH, effectiveBasePath],
+      [STORAGE_KEYS_GLOBAL.DERIVATION_MODE, this._derivationMode],
+      [STORAGE_KEYS_GLOBAL.WALLET_SOURCE, this._source],
+    ];
+    if (derivationPath) {
+      entries.splice(1, 0, [STORAGE_KEYS_GLOBAL.DERIVATION_PATH, derivationPath]);
+    }
+    if (this._storage.setMany) {
+      try {
+        await this._storage.setMany(entries);
+      } catch (err) {
+        this._mnemonic = prevMnemonic;
+        this._source = prevSource;
+        this._derivationMode = prevDerivationMode;
+        this._basePath = prevBasePath;
+        throw err;
+      }
+      return;
+    }
+    // Steelman⁵¹ CRITICAL fallback: best-effort transactional rollback.
+    // See pre-G.6 implementation for full rationale — kept verbatim
+    // for providers without setMany().
+    const writtenKeys: string[] = [];
+    const writeKey = async (key: string, value: string): Promise<void> => {
+      await this._storage.set(key, value);
+      writtenKeys.push(key);
+    };
+    try {
+      for (const [k, v] of entries) {
+        await writeKey(k, v);
+      }
+    } catch (writeErr) {
+      for (const k of writtenKeys.reverse()) {
+        try {
+          await this._storage.remove(k);
+        } catch {
+          /* best-effort cleanup */
+        }
+      }
+      // Wave I.3: restore in-memory state on rollback so caller does
+      // not observe an unstored mnemonic via sphere.getMnemonic().
+      this._mnemonic = prevMnemonic;
+      this._source = prevSource;
+      this._derivationMode = prevDerivationMode;
+      this._basePath = prevBasePath;
+      throw writeErr;
+    }
     // Note: WALLET_EXISTS is set in finalizeWalletCreation() after successful initialization
   }
 
@@ -3951,33 +5971,69 @@ export class Sphere {
     basePath?: string,
     derivationMode?: DerivationMode
   ): Promise<void> {
+    // Wave G.6: prefer setMany when available; fall back to F.56
+    // best-effort rollback otherwise.
+    //
+    // Wave I.3 CRITICAL: snapshot in-memory state before mutating;
+    // restore on any failure so caller does not observe unstored
+    // master-key state (silent disk/memory divergence).
     const encrypted = this.encrypt(masterKey);
-    await this._storage.set(STORAGE_KEYS_GLOBAL.MASTER_KEY, encrypted);
-
-    // Set source and derivation mode
+    const prevMnemonic = this._mnemonic;
+    const prevSource = this._source;
+    const prevDerivationMode = this._derivationMode;
+    const prevBasePath = this._basePath;
     this._source = 'file';
     this._mnemonic = null;
-
-    // Determine derivation mode from chain code if not specified
     if (derivationMode) {
       this._derivationMode = derivationMode;
     } else {
       this._derivationMode = chainCode ? 'bip32' : 'wif_hmac';
     }
-
-    if (chainCode) {
-      await this._storage.set(STORAGE_KEYS_GLOBAL.CHAIN_CODE, chainCode);
-    }
-
-    if (derivationPath) {
-      await this._storage.set(STORAGE_KEYS_GLOBAL.DERIVATION_PATH, derivationPath);
-    }
-
     const effectiveBasePath = basePath ?? DEFAULT_BASE_PATH;
     this._basePath = effectiveBasePath;
-    await this._storage.set(STORAGE_KEYS_GLOBAL.BASE_PATH, effectiveBasePath);
-    await this._storage.set(STORAGE_KEYS_GLOBAL.DERIVATION_MODE, this._derivationMode);
-    await this._storage.set(STORAGE_KEYS_GLOBAL.WALLET_SOURCE, this._source);
+    const entries: Array<[string, string]> = [
+      [STORAGE_KEYS_GLOBAL.MASTER_KEY, encrypted],
+      [STORAGE_KEYS_GLOBAL.BASE_PATH, effectiveBasePath],
+      [STORAGE_KEYS_GLOBAL.DERIVATION_MODE, this._derivationMode],
+      [STORAGE_KEYS_GLOBAL.WALLET_SOURCE, this._source],
+    ];
+    if (chainCode) entries.splice(1, 0, [STORAGE_KEYS_GLOBAL.CHAIN_CODE, chainCode]);
+    if (derivationPath) entries.splice(chainCode ? 2 : 1, 0, [STORAGE_KEYS_GLOBAL.DERIVATION_PATH, derivationPath]);
+    if (this._storage.setMany) {
+      try {
+        await this._storage.setMany(entries);
+      } catch (err) {
+        this._mnemonic = prevMnemonic;
+        this._source = prevSource;
+        this._derivationMode = prevDerivationMode;
+        this._basePath = prevBasePath;
+        throw err;
+      }
+      return;
+    }
+    const writtenKeys: string[] = [];
+    const writeKey = async (key: string, value: string): Promise<void> => {
+      await this._storage.set(key, value);
+      writtenKeys.push(key);
+    };
+    try {
+      for (const [k, v] of entries) {
+        await writeKey(k, v);
+      }
+    } catch (writeErr) {
+      for (const k of writtenKeys.reverse()) {
+        try {
+          await this._storage.remove(k);
+        } catch {
+          /* best-effort cleanup */
+        }
+      }
+      this._mnemonic = prevMnemonic;
+      this._source = prevSource;
+      this._derivationMode = prevDerivationMode;
+      this._basePath = prevBasePath;
+      throw writeErr;
+    }
     // Note: WALLET_EXISTS is set in finalizeWalletCreation() after successful initialization
   }
 
@@ -3995,15 +6051,155 @@ export class Sphere {
   // ===========================================================================
 
   private async loadIdentityFromStorage(): Promise<void> {
+    // Issue #309 — read each identity key with a primary→fallback
+    // retry. The primary path can fail in two ways for a Profile-mode
+    // boot whose local Helia blockstore has lost a referenced block:
+    //   (a) the read throws a chained `LoadBlockFailedError`
+    //       (OrbitDB walks the OpLog head, hits the missing block);
+    //   (b) the read swallows the throw upstream and returns `null`
+    //       (e.g. Profile's getEnvelopePayload catches the envelope
+    //       decode failure but still can't reach the raw bytes).
+    // In either case, if a legacy IndexedDB fallback is available it
+    // still holds the encrypted-with-password identity material at the
+    // same key shape, so the wallet can boot from cached local state.
+    // The helper retries the same key against `this._fallbackStorage`
+    // on any null-or-throw outcome from the primary.
+    const readIdentityKey = async (key: string): Promise<string | null> => {
+      let primaryValue: string | null = null;
+      let primaryThrew: unknown = null;
+      try {
+        primaryValue = await this._storage.get(key);
+      } catch (err) {
+        primaryThrew = err;
+      }
+      if (primaryValue !== null && primaryValue !== undefined) {
+        return primaryValue;
+      }
+      if (!this._fallbackStorage) {
+        if (primaryThrew !== null) throw primaryThrew;
+        return null;
+      }
+      // Fallback path. Log so operators can see we're booting from
+      // legacy state, not the post-migration Profile state.
+      logger.warn(
+        'Sphere',
+        `Identity read for "${key}" missing from primary storage` +
+          (primaryThrew instanceof Error
+            ? ` (threw: ${primaryThrew.message})`
+            : '') +
+          `; consulting fallbackStorage (legacy cached identity).`,
+      );
+      // Review fix #1 — Wrap the fallback read in its own try/catch.
+      // Previously a throw from the fallback shadowed the primary's
+      // throw on the way out; operators care most about the primary
+      // (typically a chained LoadBlockFailedError) because it identifies
+      // the missing block CID. On a both-throw outcome the primary error
+      // is rethrown, with the fallback error attached as `cause` for
+      // forensics.
+      let fallbackValue: string | null = null;
+      let fallbackThrew: unknown = null;
+      try {
+        fallbackValue = await this._fallbackStorage.get(key);
+      } catch (err) {
+        fallbackThrew = err;
+      }
+      if (fallbackValue !== null && fallbackValue !== undefined) {
+        return fallbackValue;
+      }
+      // Neither side has it. The primary error wins when both threw —
+      // it's the more diagnostic of the two for the typical Profile-
+      // mode failure mode. Fallback error is preserved as `cause`.
+      if (primaryThrew !== null) {
+        if (
+          fallbackThrew !== null &&
+          primaryThrew instanceof Error &&
+          fallbackThrew instanceof Error &&
+          (primaryThrew as { cause?: unknown }).cause === undefined
+        ) {
+          try {
+            Object.defineProperty(primaryThrew, 'cause', {
+              value: fallbackThrew,
+              enumerable: false,
+              writable: true,
+              configurable: true,
+            });
+          } catch {
+            // Defining `cause` on the original error is best-effort;
+            // a frozen or hostile Error subclass would refuse.
+          }
+        }
+        throw primaryThrew;
+      }
+      if (fallbackThrew !== null) {
+        // Primary returned null cleanly but fallback threw —
+        // surface the fallback error so the operator sees a
+        // diagnosable failure rather than a silent "no wallet".
+        throw fallbackThrew;
+      }
+      return null;
+    };
+
     // Load keys that are saved with 'default' address (before identity is set)
-    const encryptedMnemonic = await this._storage.get(STORAGE_KEYS_GLOBAL.MNEMONIC);
-    const encryptedMasterKey = await this._storage.get(STORAGE_KEYS_GLOBAL.MASTER_KEY);
-    const chainCode = await this._storage.get(STORAGE_KEYS_GLOBAL.CHAIN_CODE);
-    const derivationPath = await this._storage.get(STORAGE_KEYS_GLOBAL.DERIVATION_PATH);
-    const savedBasePath = await this._storage.get(STORAGE_KEYS_GLOBAL.BASE_PATH);
-    const savedDerivationMode = await this._storage.get(STORAGE_KEYS_GLOBAL.DERIVATION_MODE);
-    const savedSource = await this._storage.get(STORAGE_KEYS_GLOBAL.WALLET_SOURCE);
-    const savedAddressIndex = await this._storage.get(STORAGE_KEYS_GLOBAL.CURRENT_ADDRESS_INDEX);
+    const encryptedMnemonic = await readIdentityKey(STORAGE_KEYS_GLOBAL.MNEMONIC);
+    const encryptedMasterKey = await readIdentityKey(STORAGE_KEYS_GLOBAL.MASTER_KEY);
+    const chainCode = await readIdentityKey(STORAGE_KEYS_GLOBAL.CHAIN_CODE);
+    const derivationPath = await readIdentityKey(STORAGE_KEYS_GLOBAL.DERIVATION_PATH);
+    const savedBasePath = await readIdentityKey(STORAGE_KEYS_GLOBAL.BASE_PATH);
+    const savedDerivationMode = await readIdentityKey(STORAGE_KEYS_GLOBAL.DERIVATION_MODE);
+    const savedSource = await readIdentityKey(STORAGE_KEYS_GLOBAL.WALLET_SOURCE);
+    const savedAddressIndex = await readIdentityKey(STORAGE_KEYS_GLOBAL.CURRENT_ADDRESS_INDEX);
+
+    // Steelman⁵² CRITICAL: detect partial-write corruption. F.56's
+    // best-effort rollback in storeMnemonic/storeMasterKey may itself
+    // fail (e.g., if remove() also hits the same lock contention)
+    // — the wallet file would then have MNEMONIC/MASTER_KEY plus
+    // SOME metadata keys but be missing OTHERS. We only fire on the
+    // partial state — if all three metadata keys are missing, treat
+    // as a legacy / external-app-created wallet (e.g., a plaintext
+    // mnemonic dropped into wallet.json by an external tool, or an
+    // older SDK build that did not write the metadata triplet).
+    // Defaults apply for those flows.
+    //
+    // The genuine corruption signature is "at least one metadata
+    // key written, at least one missing" — that pattern can only
+    // result from an aborted multi-key write whose rollback also
+    // failed, and silently applying defaults to the missing fields
+    // would derive the wrong identity for the persisted MNEMONIC.
+    //
+    // Issue #309 review (Finding #3) — when `fallbackStorage` is set,
+    // these values are the MERGED view: any key not in primary was
+    // satisfied from fallback. The partial-write detector's invariant
+    // therefore weakens: a "primary partial + fallback complete" wallet
+    // looks identical to a "primary complete + fallback unused" wallet.
+    // Acceptable for the migration-recovery flow this option exists for
+    // — both shapes derive the SAME identity, so the wallet boots
+    // correctly. A genuine partial-write that ALSO had a holey fallback
+    // would still trip the detector. Document the weakening explicitly
+    // so future readers don't tighten the check by accident.
+    if (encryptedMnemonic || encryptedMasterKey) {
+      const present: string[] = [];
+      const missing: string[] = [];
+      (savedBasePath ? present : missing).push('BASE_PATH');
+      (savedDerivationMode ? present : missing).push('DERIVATION_MODE');
+      (savedSource ? present : missing).push('WALLET_SOURCE');
+      // Steelman⁵² + ⁵² test fix: only fire on STRONG partial-write
+      // signature — at least 2 of the 3 metadata keys present and
+      // at least 1 missing. This pattern is unique to modern writes
+      // that got most of the way through but not all the way; a
+      // legacy / external-app wallet typically has 0 or 1 of these
+      // keys (no metadata or just WALLET_SOURCE for older SDK
+      // builds), and we don't want to brick load() for those.
+      if (present.length >= 2 && missing.length > 0) {
+        throw new SphereError(
+          `Wallet storage is in an inconsistent state — key material is present along ` +
+            `with partial metadata (have: ${present.join(', ')}; missing: ${missing.join(', ')}). ` +
+            `This indicates a partial-write corruption (e.g., an aborted Sphere.create / ` +
+            `Sphere.import whose rollback also failed). Run Sphere.clear() and re-import ` +
+            `the wallet from its mnemonic to recover.`,
+          'STORAGE_CORRUPTED',
+        );
+      }
+    }
 
     // Restore wallet metadata
     this._basePath = savedBasePath ?? DEFAULT_BASE_PATH;
@@ -4191,22 +6387,62 @@ export class Sphere {
       provider.setIdentity(this._identity!);
     }
 
-    // Connect providers (skip if already connected, e.g. after setIdentity reconnect)
-    if (!this._storage.isConnected()) {
-      await this._storage.connect();
-    }
+    // Connect providers. Ordering matters:
+    //
+    //   1. Oracle first — `oracle.initialize()` loads the embedded
+    //      RootTrustBase and constructs the AggregatorClient. This
+    //      is load-bearing for the Profile aggregator pointer layer:
+    //      ProfileStorageProvider.doConnect() Phase C calls
+    //      `oracle.getAggregatorClient()` / `getRootTrustBase()` to
+    //      build ProfilePointerLayer. If storage connects before
+    //      oracle, Phase C exits early with
+    //      `aggregator_client_unavailable` and the pointer channel
+    //      stays dark until a later explicit retry.
+    //   2. Storage second — Phase A (local cache) + Phase B
+    //      (OrbitDB attach) + Phase C (pointer layer construction,
+    //      reads oracle state).
+    //   3. Transport third — Nostr connection, independent.
+    await this._oracle.initialize();
+    // ALWAYS call connect() after oracle.initialize(), regardless of
+    // current `isConnected()` state. Consumers may have pre-connected
+    // the storage provider (e.g., the Sphere-bound Profile factory
+    // `attachIdentityToProfileProviders` connects so the standalone
+    // migration call sites can use the providers immediately). When
+    // pre-connect happened BEFORE oracle.initialize, Phase C exited
+    // with a retryable `aggregator_client_unavailable` skip reason
+    // and `pointerLayer` is still null. `connect()` is idempotent:
+    // Phase A is gated on `status !== 'connected'`, Phase B on
+    // `dbStatus !== 'attached'`, and Phase C re-attempts when
+    // `pointerLayer === null && !isPointerSkipSticky()`. So a second
+    // call here cheaply finishes Phase C with the now-initialized
+    // oracle and the pointer channel is live for the rest of the
+    // session — instead of staying dark (issue #239 regression risk).
+    await this._storage.connect();
     if (!this._transport.isConnected()) {
       await this._transport.connect();
     }
-    await this._oracle.initialize();
+
+    // Subscribe to provider events BEFORE token-storage initialize so
+    // any `storage:error` events emitted during initialize (e.g.,
+    // `BUNDLE_INDEX_REFRESH_FAILED` from the Profile band-aid that
+    // tolerates corrupt-OpLog initialization) reach the
+    // `connection:changed` bridge. `provider.onEvent` is a synchronous
+    // listener registry (`ProfileTokenStorageProvider.onEvent` lines
+    // 1662-1667) with no replay buffer — subscribers added after
+    // emission do NOT receive past events. Subscribing first ensures
+    // production consumers see the degraded-state signal that unit
+    // tests already pin.
+    //
+    // Safe to wire pre-initialize: `_tokenStorageProviders` Map is
+    // populated by the constructor / setup phase well before
+    // `initializeProviders` runs, and `onEvent` just appends to the
+    // provider's local Set. No initialization order side effects.
+    this.subscribeToProviderEvents();
 
     // Initialize all token storage providers in parallel
     await Promise.all(
       [...this._tokenStorageProviders.values()].map(p => p.initialize())
     );
-
-    // Subscribe to provider events and bridge to connection:changed
-    this.subscribeToProviderEvents();
   }
 
   /**
@@ -4261,9 +6497,344 @@ export class Sphere {
           if (event.type === 'storage:error' || event.type === 'sync:error') {
             this.emitConnectionChanged(providerId, provider.isConnected(), provider.getStatus(), event.error);
           }
+          // RFC-251 Approach D / issue #255 Problem B — pointer-publish
+          // win-broadcast publisher side. After the lifecycle manager
+          // emits a `storage:pointer-published` event (containing the
+          // already-signed payload + broadcast tag), forward it to
+          // Nostr so sibling devices sharing this wallet's identity
+          // can adopt V=N without waiting for the aggregator's 30-60s
+          // read-replica lag.
+          //
+          // Best-effort: any failure (transport down, relay reject) is
+          // logged and dropped. The aggregator publish has already
+          // succeeded; the wallet's own state is correct without the
+          // broadcast. Siblings just fall back to the existing
+          // WALKBACK_FLOOR + reconcile path (~60-90 s).
+          if (event.type === 'storage:pointer-published') {
+            void this.forwardPointerPublishedToNostr(event);
+            // Also try to install the sibling-subscription side now
+            // that we know a pointer layer is live (signing is what
+            // produced this event). Idempotent — repeat calls no-op
+            // when the subscription is already in place.
+            void this.maybeInstallPointerWinSubscription();
+          }
+          // Issue #264 — bridge `storage:monotonicity-recovered` to a
+          // user-visible Sphere event so dashboards / telemetry
+          // pipelines subscribing via `sphere.on(...)` can observe
+          // auto-merge convergence work without dropping to provider-
+          // direct subscriptions. Pure informational forward — the
+          // provider's data payload rides through verbatim with
+          // `providerId` added for fan-out attribution.
+          if (event.type === 'storage:monotonicity-recovered') {
+            const d = (event.data ?? {}) as {
+              recoveredTokenIds?: string[];
+              recoveredTokenCount?: number;
+              mergedUnknownBundleCids?: string[];
+              mergedUnknownBundleCount?: number;
+              residualUnknownBundleCids?: string[];
+              residualUnknownBundleCount?: number;
+              residualTokenMissingIds?: string[];
+              residualTokenMissingCount?: number;
+              recoveredOutboxIdsDroppedAsSent?: string[];
+              recoveredOutboxIdsDroppedAsSentCount?: number;
+              truncated?: boolean;
+            };
+            this.emitEvent('storage:monotonicity-recovered', {
+              providerId,
+              recoveredTokenIds: d.recoveredTokenIds ?? [],
+              recoveredTokenCount: d.recoveredTokenCount ?? 0,
+              mergedUnknownBundleCids: d.mergedUnknownBundleCids ?? [],
+              mergedUnknownBundleCount: d.mergedUnknownBundleCount ?? 0,
+              residualUnknownBundleCids: d.residualUnknownBundleCids ?? [],
+              residualUnknownBundleCount: d.residualUnknownBundleCount ?? 0,
+              residualTokenMissingIds: d.residualTokenMissingIds ?? [],
+              residualTokenMissingCount: d.residualTokenMissingCount ?? 0,
+              recoveredOutboxIdsDroppedAsSent: d.recoveredOutboxIdsDroppedAsSent ?? [],
+              recoveredOutboxIdsDroppedAsSentCount: d.recoveredOutboxIdsDroppedAsSentCount ?? 0,
+              truncated: d.truncated === true,
+            });
+          }
         });
         if (unsub) this._providerEventCleanups.push(unsub);
       }
+    }
+  }
+
+  /**
+   * RFC-251 Approach D / issue #255 Problem B — publisher side.
+   *
+   * Receives a `storage:pointer-published` event from the lifecycle
+   * manager (which carries an already-signed broadcast payload + its
+   * per-wallet tag) and forwards it over Nostr. Best-effort:
+   * - No publish? Drop silently (transport doesn't support broadcasts
+   *   — falls back to existing WALKBACK_FLOOR convergence).
+   * - Publish throws? Log warn and drop.
+   *
+   * The signing happened upstream (in lifecycle-manager where the
+   * pointer layer is reachable). This method does pure transport I/O.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async forwardPointerPublishedToNostr(event: any): Promise<void> {
+    try {
+      const data = event?.data as
+        | {
+            signedPayloadJson?: unknown;
+            broadcastTag?: unknown;
+            version?: unknown;
+            cid?: unknown;
+          }
+        | undefined;
+      const signedPayloadJson = data?.signedPayloadJson;
+      const broadcastTag = data?.broadcastTag;
+      if (
+        typeof signedPayloadJson !== 'string' ||
+        typeof broadcastTag !== 'string' ||
+        signedPayloadJson.length === 0 ||
+        broadcastTag.length === 0
+      ) {
+        // Event shape didn't include the signed payload (e.g. pointer
+        // layer absent at sign time, or upstream sign failure). Caller
+        // already logged the sign error; nothing useful to publish.
+        return;
+      }
+      if (typeof this._transport.publishBroadcast !== 'function') {
+        // Transport doesn't support broadcasts (e.g., file-only mock).
+        // Silently skip — the existing WALKBACK_FLOOR path still
+        // handles cross-device convergence.
+        return;
+      }
+      await this._transport.publishBroadcast(signedPayloadJson, [broadcastTag]);
+      logger.debug(
+        'Sphere',
+        `pointer-win broadcast published: version=${String(data?.version ?? '?')} ` +
+        `cid=${String(data?.cid ?? '?')} tag=${broadcastTag}`,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn(
+        'Sphere',
+        `pointer-win broadcast publish failed (best-effort, ignored): ${msg}`,
+      );
+    }
+  }
+
+  /**
+   * RFC-251 Approach D / issue #255 Problem B — subscriber side.
+   *
+   * Install the per-wallet Nostr subscription so this device receives
+   * pointer-win broadcasts from sibling devices sharing the same
+   * wallet identity. Idempotent — safe to call repeatedly; once the
+   * subscription is in place for a given signing pubkey, subsequent
+   * invocations short-circuit.
+   *
+   * Pointer layer is built async during OrbitDB attach, so the
+   * subscription cannot be installed at Sphere init time. Two
+   * triggers eventually fire `maybeInstallPointerWinSubscription`:
+   *   - Lazy-on-own-publish: our own first `storage:pointer-published`
+   *     event implies pointer is live. We install then.
+   *   - (Phase 2 expansion) An eager polling loop after init for
+   *     receive-only devices that never publish themselves. NOT
+   *     wired in Phase 1 — those devices currently miss broadcasts
+   *     until they themselves publish at least once. Acceptable for
+   *     prototype; document as known-gap.
+   */
+  private async maybeInstallPointerWinSubscription(): Promise<void> {
+    if (this._pointerWinInstallInFlight) return;
+    this._pointerWinInstallInFlight = true;
+    try {
+      const storageWithPointer = this._storage as unknown as {
+        getPointerLayer?: () =>
+          | import('../profile/aggregator-pointer/ProfilePointerLayer').ProfilePointerLayer
+          | null;
+      };
+      const pointer = storageWithPointer.getPointerLayer?.() ?? null;
+      if (!pointer) {
+        // Pointer layer not yet built; try again on the next event.
+        return;
+      }
+      // Issue #264 — gated behind the pointer layer's
+      // `enablePointerWinBroadcasts` capability (default OFF). With
+      // the flag false this subscriber side is dormant: no per-wallet
+      // Nostr subscription is installed, so no sibling broadcasts can
+      // reach `handleIncomingPointerWinBroadcast`. The aggregator
+      // pointer + auto-merge convergence path covers correctness
+      // without the broadcast optimization.
+      //
+      // Tolerant of pointer stubs that predate the
+      // `winBroadcastsEnabled` accessor (mirrors the symmetric guard
+      // in `lifecycle-manager.ts:publishAggregatorPointerBestEffort`):
+      // a missing method is treated as flag=false (fail-closed). The
+      // production code path always builds a real `ProfilePointerLayer`
+      // which implements the method; this defensive check keeps the
+      // contract robust for any future test stub or duck-typed
+      // consumer.
+      // Defensive try/catch around the accessor: same rationale as
+      // lifecycle-manager. The accessor contract says
+      // `winBroadcastsEnabled()` MUST NOT throw, but a misbehaving
+      // stub could violate it. Without this catch, an accessor
+      // throw would escape to the outer `try { ... } catch (err)`
+      // and surface as a noisy "subscription install failed (will
+      // retry on next event)" warn — re-arming on every subsequent
+      // `storage:pointer-published` event indefinitely. Treat the
+      // throw as flag=false (fail-closed) so the early-return path
+      // fires cleanly with no noise.
+      let armed = false;
+      try {
+        armed =
+          typeof pointer.winBroadcastsEnabled === 'function' &&
+          // Strict `=== true` mirrors the production normalization
+          // in ProfilePointerLayer's frozen config snapshot. A test
+          // stub returning a truthy non-boolean (`1`, `'yes'`, `{}`)
+          // must be treated as flag=false — same fail-closed policy.
+          pointer.winBroadcastsEnabled() === true &&
+          // Symmetric stub guard: a fake pointer that returns
+          // `winBroadcastsEnabled() === true` but lacks
+          // `getSignerForWinBroadcast` would TypeError at the call
+          // below; fail-closed earlier.
+          typeof pointer.getSignerForWinBroadcast === 'function';
+      } catch (accessorErr) {
+        const msg =
+          accessorErr instanceof Error
+            ? accessorErr.message
+            : String(accessorErr);
+        logger.debug(
+          'Sphere',
+          `pointer-win subscription: winBroadcastsEnabled() threw ` +
+            `(accessor contract violation, treating as flag=false): ${msg}`,
+        );
+        armed = false;
+      }
+      if (!armed) {
+        return;
+      }
+      const signerHandle = pointer.getSignerForWinBroadcast();
+      const signingPubKeyHex = signerHandle.signingPubKeyHex;
+      if (this._pointerWinSubscriptions.has(signingPubKeyHex)) {
+        // Already subscribed for this wallet identity.
+        return;
+      }
+      if (typeof this._transport.subscribeToBroadcast !== 'function') {
+        return;
+      }
+
+      // Late-imported to avoid pulling the win-broadcast module into the
+      // happy path for wallets that disable pointer broadcasts entirely.
+      const {
+        buildWinBroadcastTag,
+        verifyWinBroadcastPayload,
+      } = await import('../profile/aggregator-pointer/win-broadcast');
+      const tag = buildWinBroadcastTag(signingPubKeyHex);
+
+      const unsub = this._transport.subscribeToBroadcast(
+        [tag],
+        (broadcast) => {
+          void this.handleIncomingPointerWinBroadcast(broadcast.content, signingPubKeyHex, pointer, verifyWinBroadcastPayload);
+        },
+      );
+      this._pointerWinSubscriptions.set(signingPubKeyHex, unsub);
+      logger.debug(
+        'Sphere',
+        `pointer-win subscription installed: tag=${tag}`,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn(
+        'Sphere',
+        `pointer-win subscription install failed (will retry on next event): ${msg}`,
+      );
+    } finally {
+      this._pointerWinInstallInFlight = false;
+    }
+  }
+
+  /**
+   * Handle an incoming pointer-win broadcast from a sibling device.
+   *
+   * Flow:
+   *   1. Parse JSON content.
+   *   2. Verify signature against own signingPubKey (signature mismatch
+   *      = spoofed or wrong-wallet event; drop silently).
+   *   3. Dedup by (signingPubKey, version) — bounded LRU.
+   *   4. Trigger early reconcile: `recoverLatest()` + `reconcileLocalVersionDownward()`.
+   *      Same path the WALKBACK_FLOOR catch arm runs (lifecycle-manager.ts
+   *      lines 1311-1331), just collapsed to "now" instead of "60s
+   *      throttle expiry".
+   *
+   * All errors are caught and logged at debug — never propagate to the
+   * transport handler.
+   */
+  private async handleIncomingPointerWinBroadcast(
+    contentJson: string,
+    ownSigningPubKeyHex: string,
+    pointer: import('../profile/aggregator-pointer/ProfilePointerLayer').ProfilePointerLayer,
+    verify: (
+      payload: import('../profile/aggregator-pointer/win-broadcast').SignedWinBroadcastPayload,
+      expectedSigningPubKeyHex: string,
+    ) => Promise<boolean>,
+  ): Promise<void> {
+    try {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(contentJson);
+      } catch {
+        // Not our JSON; relay-noise on the same tag (improbable but
+        // defensive). Drop.
+        return;
+      }
+      const payload = parsed as import('../profile/aggregator-pointer/win-broadcast').SignedWinBroadcastPayload;
+      const ok = await verify(payload, ownSigningPubKeyHex);
+      if (!ok) {
+        logger.debug(
+          'Sphere',
+          'pointer-win broadcast: verification failed (spoof, expired, or wrong-wallet); dropped',
+        );
+        return;
+      }
+      const dedupKey = `${payload.signingPubKey}:${payload.version}`;
+      if (this._pointerWinSeen.has(dedupKey)) {
+        return;
+      }
+      // Bounded LRU — drop oldest insertion when over cap.
+      if (this._pointerWinSeen.size >= 256) {
+        const oldest = this._pointerWinSeen.values().next().value;
+        if (oldest !== undefined) this._pointerWinSeen.delete(oldest);
+      }
+      this._pointerWinSeen.add(dedupKey);
+
+      logger.debug(
+        'Sphere',
+        `pointer-win broadcast received: version=${payload.version} ` +
+        `cid=${payload.cid} — triggering early reconcile`,
+      );
+
+      // Phase 1: trigger an early `recoverLatest` + `reconcileLocalVersionDownward`.
+      // This is the same path the WALKBACK_FLOOR catch arm runs after a
+      // race-loss; here we run it eagerly on the broadcast without
+      // waiting for the throttle to expire. Acknowledged limitation:
+      // when own localVersion is already at broadcast.version (same-
+      // version race), reconcileDownward is a no-op — Phase 2 would add
+      // a `ProfilePointerLayer.adoptBroadcast(payload)` entrypoint that
+      // bypasses the >= comparison. For Phase 1 this still helps the
+      // cross-version case where own localVersion < broadcast.version.
+      const recovered = await pointer.recoverLatest();
+      // `'cid' in recovered` narrows RecoverResult | RecoverAllUnfetchableResult
+      // to RecoverResult — RecoverAllUnfetchableResult has no `cid` field.
+      // RecoverAllUnfetchableResult has no fetchable version to adopt, so skip.
+      if (recovered && 'cid' in recovered) {
+        const outcome = await pointer.reconcileLocalVersionDownward(recovered);
+        logger.debug(
+          'Sphere',
+          `pointer-win broadcast: post-receipt reconcile ` +
+          `reconciled=${outcome.reconciled} ` +
+          `fromVersion=${outcome.fromVersion} toVersion=${outcome.toVersion}`,
+        );
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.debug(
+        'Sphere',
+        `pointer-win broadcast: handler threw (dropped): ${msg}`,
+      );
     }
   }
 
@@ -4296,6 +6867,22 @@ export class Sphere {
     }
     this._providerEventCleanups = [];
     this._lastProviderConnected.clear();
+    // RFC-251 Approach D — also tear down per-wallet pointer-win
+    // broadcast subscriptions to avoid relay-side subscription leaks
+    // across Sphere reinit cycles. Defensive: legacy test harnesses
+    // construct Sphere via `Object.create(prototype)` which skips
+    // class-field initializers, leaving these fields undefined. Skip
+    // the cleanup cleanly when the state never got installed.
+    if (this._pointerWinSubscriptions !== undefined) {
+      for (const unsub of this._pointerWinSubscriptions.values()) {
+        try { unsub(); } catch { /* ignore */ }
+      }
+      this._pointerWinSubscriptions.clear();
+    }
+    if (this._pointerWinSeen !== undefined) {
+      this._pointerWinSeen.clear();
+    }
+    this._pointerWinInstallInFlight = false;
   }
 
   private async initializeModules(): Promise<void> {
@@ -4305,6 +6892,49 @@ export class Sphere {
     // from the start. The original transport stays connected for resolve operations.
     const adapter = await this.ensureTransportMux(this._currentAddressIndex, this._identity!);
     const moduleTransport: TransportProvider = adapter ?? this._transport;
+
+    // G3 + G7 — Wire Profile-backed persisted storage for the recipient
+    // cross-restart safety net. Mirrors the wiring in
+    // `initializeAddressModules`. Best-effort — when StorageProvider
+    // does not expose the builders, the auto-installed worker falls
+    // back to the legacy in-memory shims.
+    try {
+      const storageWithBuilders = this._storage as unknown as {
+        buildFinalizationQueueStorageAdapter?: () =>
+          | import('../profile/finalization-queue-storage-adapter').OrbitDbFinalizationQueueStorageAdapter
+          | null;
+        buildRecipientContextStorageAdapter?: () =>
+          | import('../profile/finalization-queue-storage-adapter').OrbitDbRecipientContextStorageAdapter
+          | null;
+      };
+      const queueAdapter =
+        typeof storageWithBuilders.buildFinalizationQueueStorageAdapter === 'function'
+          ? storageWithBuilders.buildFinalizationQueueStorageAdapter()
+          : null;
+      const ctxAdapter =
+        typeof storageWithBuilders.buildRecipientContextStorageAdapter === 'function'
+          ? storageWithBuilders.buildRecipientContextStorageAdapter()
+          : null;
+      if (queueAdapter !== null || ctxAdapter !== null) {
+        this._payments.configureRecipientPersistedStorage({
+          ...(queueAdapter !== null
+            ? { finalizationQueueStorage: queueAdapter }
+            : {}),
+          ...(ctxAdapter !== null ? { recipientContextStorage: ctxAdapter } : {}),
+        });
+      }
+    } catch (err) {
+      logger.warn(
+        'Sphere',
+        `G3/G7: failed to wire Profile-backed recipient persisted storage (continuing with in-memory shims): ${safeErrorMessage(err)}`,
+      );
+    }
+
+    // Issue #285 — build the per-wallet CidRefStore once (lazy: returns
+    // null if the storage provider is not Profile, encryption is off,
+    // identity is not set yet, or IPFS gateways are not configured).
+    // Pass it into every module that has a fat-data OpLog write site.
+    const cidRefStore = this.buildCidRefStoreOrNull();
 
     this._payments.initialize({
       identity: this._identity!,
@@ -4317,6 +6947,25 @@ export class Sphere {
       chainCode: this._masterKey?.chainCode || undefined,
       price: this._priceProvider ?? undefined,
       disabledProviderIds: this._disabledProviders,
+      // Issue #200 Phase 1 wiring — forward the canonical UXF CAR
+      // publisher (built by the providers factory from the wallet's
+      // IPFS gateway list). Absent → CID delivery falls back to inline
+      // (under cap) or rejects (over cap / force-cid).
+      publishToIpfs: this._publishToIpfs ?? undefined,
+      cidFetchGateways: this._cidFetchGateways ?? undefined,
+      // Issue #285 — CID-ref store for pending V5 token storage (fat-data).
+      cidRefStore: cidRefStore ?? undefined,
+      // Issue #255 Problem A — HD-index recovery hooks for
+      // finalizeTransferToken. Only wired when a master key is
+      // available (HD derivation requires it); without it,
+      // finalize keeps single-identity behavior.
+      ...(this._masterKey
+        ? {
+            deriveAddressInfo: (idx: number) =>
+              this._deriveAddressInternal(idx, false),
+            getActiveAddresses: () => this._getActiveAddressesInternal(),
+          }
+        : {}),
     });
 
     this._communications.initialize({
@@ -4324,12 +6973,17 @@ export class Sphere {
       storage: this._storage,
       transport: moduleTransport,
       emitEvent,
+      // Issue #285 — CID-ref store for the per-address DM cache.
+      cidRefStore: cidRefStore ?? undefined,
     });
 
     this._groupChat?.initialize({
       identity: this._identity!,
       storage: this._storage,
       emitEvent,
+      // Issue #285 — CID-ref store for group/member/messages/processedEvents
+      // (the four GroupChat fat-data write sites flagged in #285).
+      cidRefStore: cidRefStore ?? undefined,
     });
 
     this._market?.initialize({
@@ -4360,6 +7014,9 @@ export class Sphere {
           on: this.on.bind(this),
           storage: this._storage,
           communications: this._communications,
+          // Issue #285 — CID-ref store for invoice ledger (per-invoice
+          // Pattern A pin via §8.3).
+          cidRefStore: cidRefStore ?? undefined,
         });
       } else {
         logger.warn('Sphere', 'Accounting module enabled but no token storage available — disabling');
@@ -4402,10 +7059,218 @@ export class Sphere {
       }
     }
 
-    // Load modules in parallel — they are independent of each other.
-    // allSettled so one failing module doesn't block the rest.
+    // Round 7 (FIX 1) / Round 8 (FIX 1) — Wire production OrbitDb-backed
+    // disposition storage AND the trust-base-aware proof verifier into
+    // the operator escape-hatch InclusionProofImporter.
+    //
+    // Round 5 auto-installed an in-memory default that failed closed on
+    // every operator-supplied proof; Round 7 swapped the disposition
+    // storage for an OrbitDb-backed adapter so `_invalid` / `_audit`
+    // records persist across restarts. Round 8 closes the remaining
+    // verification gap: the importer's case 8 / 9 short-circuits now
+    // run through `oracle.verifyInclusionProof()` (the same trust-base-
+    // aware verifier the regular finalization workers use) instead of
+    // the Round 7 fail-closed stub.
+    //
+    // The disposition-storage swap is best-effort: when the storage
+    // provider is not a `ProfileStorageProvider` (e.g. legacy IndexedDB
+    // / file storage), the auto-installed in-memory default stays in
+    // place. The verifyProof wiring is ALWAYS attempted regardless of
+    // storage provider — a real verifier on top of in-memory disposition
+    // storage is still strictly better than the fail-closed stub
+    // (operator probe calls return structured `proof-not-anchored` /
+    // `proof-trustbase-failed` results instead of every proof being
+    // dismissed as `NOT_AUTHENTICATED`).
+    //
+    // KNOWN LIMITATION: `graftCallback` / `overrideCallback` are NOT
+    // wired here because the default builder's `queueScanner` returns
+    // no entries — case 3 / 5 / 6 are unreachable in the auto-installed
+    // harness. A follow-up wave will land a real `queueScanner` (the
+    // FinalizationQueue-backed scanner) alongside production graft +
+    // override callbacks; until then the no-op defaults are correct
+    // (every reachable case routes through `verifyProof` first, and a
+    // verified proof against an empty queue/manifest correctly resolves
+    // to `'no-such-token'` or `'requestid-mismatch'`).
+    try {
+      // Duck-typed check: ProfileStorageProvider exposes
+      // `buildDispositionStorageAdapter`. Other providers don't.
+      const storageWithBuilder = this._storage as unknown as {
+        buildDispositionStorageAdapter?: () =>
+          | import('../profile/disposition-storage-adapters').OrbitDbDispositionStorageAdapter
+          | null;
+      };
+      const builderAvailable =
+        typeof storageWithBuilder.buildDispositionStorageAdapter === 'function';
+      const adapter = builderAvailable
+        ? storageWithBuilder.buildDispositionStorageAdapter!()
+        : null;
+
+      // Round 8 (FIX 1) — Build a verifyProof adapter that bridges the
+      // {@link ImportableInclusionProof} shape used by the importer to
+      // the oracle's `verifyInclusionProof` boolean API. The oracle
+      // returns `true` only on `OK`; every other status (PATH_INVALID,
+      // PATH_NOT_INCLUDED, NOT_AUTHENTICATED, THROWN) collapses to
+      // `false`. We map `true → 'OK'` and `false → 'NOT_AUTHENTICATED'`
+      // — losing the granular distinction between PATH_INVALID and
+      // PATH_NOT_INCLUDED is acceptable because the importer's case 8
+      // / 9 routing treats both as proof-trustbase-failed (only OK
+      // proceeds to graft/override). A follow-up wave can plumb the
+      // granular status if forensic distinction becomes load-bearing.
+      //
+      // The trustBase is loaded LAZILY: oracle.initialize() may run
+      // after this hop (the oracle wires trustBase at first connect),
+      // so the adapter resolves the trust-base on each call by calling
+      // through `oracle.verifyInclusionProof()` which performs its own
+      // null-check and throws `NOT_INITIALIZED` when trustBase is not
+      // yet loaded. We catch and translate to `'NOT_AUTHENTICATED'` so
+      // a probe call before oracle init does not crash bootstrap.
+      const oracleForVerify = this._oracle as unknown as {
+        verifyInclusionProof?: (input: {
+          readonly proofJson: unknown;
+          readonly transactionHash: string;
+          readonly proofHash?: string;
+        }) => Promise<boolean>;
+      };
+      const oracleHasVerify =
+        typeof oracleForVerify.verifyInclusionProof === 'function';
+      const verifyProofAdapter:
+        | import('../modules/payments/transfer/import-inclusion-proof').ProofVerifier
+        | undefined = oracleHasVerify
+        ? async (
+            proof: import('../modules/payments/transfer/import-inclusion-proof').ImportableInclusionProof,
+          ): Promise<import('../modules/payments/transfer/proof-verifier').ProofVerifyStatus> => {
+            try {
+              const ok = await oracleForVerify.verifyInclusionProof!({
+                proofJson: proof.proof,
+                transactionHash: proof.transactionHash,
+              });
+              return ok ? 'OK' : 'NOT_AUTHENTICATED';
+            } catch {
+              // Trust-base not loaded yet, network blip, malformed
+              // input. Fail closed — the operator can retry once the
+              // oracle finishes initialize(). Distinct from a
+              // structurally-bad proof (which the oracle itself
+              // returns false for); both collapse to the same case-9
+              // routing here.
+              return 'NOT_AUTHENTICATED';
+            }
+          }
+        : undefined;
+
+      if (adapter !== null && adapter !== undefined) {
+        this._payments.configureOperatorEscapeHatchStorage(
+          adapter,
+          verifyProofAdapter !== undefined
+            ? { verifyProof: verifyProofAdapter }
+            : undefined,
+        );
+        // Issue #174 (DispositionWriter wiring) — primary-address
+        // mirror of the multi-address wiring above. The OrbitDb
+        // adapter backs BOTH the operator escape-hatch importer's
+        // `_audit` writes and the spent-state-rescan worker's
+        // off-record-spend AUDIT writes.
+        try {
+          const sphereEmit = this.emitEvent.bind(this);
+          const auditWriter = await buildSpentStateAuditWriter(adapter, sphereEmit);
+          this._payments.installSpentStateAuditWriter(auditWriter);
+          logger.debug(
+            'Sphere',
+            'Wired spent-state-rescan AUDIT DispositionWriter (primary address)',
+          );
+        } catch (auditErr) {
+          logger.warn(
+            'Sphere',
+            `Failed to wire spent-state-rescan AUDIT DispositionWriter (primary address): ${safeErrorMessage(auditErr)}`,
+          );
+        }
+        logger.debug(
+          'Sphere',
+          'Wired OrbitDb-backed disposition storage + oracle.verifyInclusionProof into operator escape-hatch importer',
+        );
+      } else if (verifyProofAdapter !== undefined) {
+        // No OrbitDb adapter, but we still have a real oracle —
+        // upgrade just the verifier so the importer can validate
+        // proofs even when running against in-memory disposition
+        // storage. Use the public install* hook by rebuilding the
+        // default importer with the verifier override.
+        // Round 8 (FIX 1) — even without dispositionStorage upgrade,
+        // verifyProof wiring is strictly better than the stub.
+        const paymentsForVerify = this._payments as unknown as {
+          configureOperatorEscapeHatchStorage?: (
+            ds: import('../profile/disposition-writer').DispositionPerEntryStorage,
+            options?: {
+              readonly verifyProof?: import('../modules/payments/transfer/import-inclusion-proof').ProofVerifier;
+            },
+          ) => void;
+        };
+        // Synthesize an in-memory dispositionStorage. We could reach
+        // through to the auto-installed importer's existing
+        // dispositionStorage instance, but rebuilding fresh keeps the
+        // public surface narrow — the cost is one extra empty Map.
+        const { InMemoryDispositionStorageAdapter } = await import(
+          '../profile/disposition-storage-adapters'
+        );
+        if (typeof paymentsForVerify.configureOperatorEscapeHatchStorage === 'function') {
+          paymentsForVerify.configureOperatorEscapeHatchStorage(
+            new InMemoryDispositionStorageAdapter(),
+            { verifyProof: verifyProofAdapter },
+          );
+          logger.debug(
+            'Sphere',
+            'Wired oracle.verifyInclusionProof into operator escape-hatch importer (in-memory disposition storage)',
+          );
+        }
+      } else if (builderAvailable) {
+        logger.debug(
+          'Sphere',
+          'ProfileStorageProvider returned null disposition adapter (encryption disabled or identity pending) — escape-hatch importer keeps in-memory default',
+        );
+      }
+    } catch (err) {
+      // Non-fatal: bootstrap continues with the auto-installed default.
+      // The operator escape-hatch still works (just with the Round 7
+      // fail-closed verifier stub). Round 8 (FIX 2) — use
+      // `safeErrorMessage` so a hostile Proxy on `err` (throwing
+      // getPrototypeOf / Symbol.hasInstance / .message getter) cannot
+      // crash the bootstrap path. The previous pattern
+      // (`err instanceof Error ? err.message : String(err)`) goes
+      // through `instanceof` which calls Symbol.hasInstance — a
+      // throwing trap escapes here.
+      logger.warn(
+        'Sphere',
+        `Failed to wire operator-escape-hatch importer overrides — falling back to in-memory default: ${safeErrorMessage(err)}`,
+      );
+    }
+
+    // Issue #97 — Build and install the profile-resident OutboxWriter
+    // when the StorageProvider exposes `buildOutboxWriter`. The writer
+    // persists per-entry-key UXF outbox entries under
+    // `${addressId}.outbox.${id}` so they survive total local profile
+    // loss (recovered on next sync via aggregator pointer / IPNS
+    // snapshot). PaymentsModule's dispatcher hooks dual-write to this
+    // writer plus the legacy KV chain; the SendingRecoveryWorker reads
+    // from this writer on restart.
+    //
+    // Best-effort: when the storage provider is not a
+    // `ProfileStorageProvider`, or encryption is disabled / key not yet
+    // derived, the install is skipped and PaymentsModule falls back to
+    // the legacy KV-only outbox path (pre-#97 behaviour).
+    this.wireProfilePersistedSendStorage(this._payments, this._identity);
+
+    // PR #151 — payments.load() is critical and MUST complete BEFORE
+    // accounting/swap load. `AccountingModule.load()` populates its
+    // `invoiceTermsCache` by iterating `payments.getTokens()` (filter
+    // by `tokenType === INVOICE_TOKEN_TYPE_HEX`); running it in parallel
+    // with `payments.load()` reads from an empty `this.tokens` map and
+    // leaves the cache empty until a later manual `accounting.load()`
+    // — which the CLI never issues. Result: invoice-list / invoice-status
+    // / invoice-pay all returned "not found" even though the invoice
+    // token was persisted on disk. Mirrors the ordering in
+    // `initializeAddressModules()` (line ~2566).
+    await this._payments.load();
+
+    // Non-critical modules load in parallel — failures are non-fatal
     const results = await Promise.allSettled([
-      this._payments.load(),
       this._communications.load(),
       this._groupChat?.load(),
       this._market?.load(),
@@ -4429,6 +7294,98 @@ export class Sphere {
       transportAdapter: adapter,
       tokenStorageProviders: new Map(this._tokenStorageProviders),
       initialized: true,
+    });
+
+    // Issue #312 — connectivity manager. Build AFTER providers are wired
+    // (we read the transport's `isConnected()` and the oracle's
+    // `getCurrentRound()`), but BEFORE returning so the public
+    // `sphere.connectivity` accessor is live for any caller binding to
+    // events immediately. `start()` returns sync; the first probe fires
+    // on a microtask, so this does NOT block the init path.
+    try {
+      this._connectivity = this.buildConnectivityManager();
+      this._connectivity.start();
+    } catch (err) {
+      // Non-fatal: a broken connectivity manager MUST NOT brick init().
+      // The wallet remains fully functional; `sphere.connectivity` falls
+      // through to the uninitialized stub (all-`'unknown'`).
+      logger.warn(
+        'Sphere',
+        `Failed to build ConnectivityManager (sphere.connectivity will be inert): ${safeErrorMessage(err)}`,
+      );
+      this._connectivity = null;
+    }
+
+    // Wire the send-path gate. The PaymentsModule receives a snapshot
+    // getter — it does NOT hold a reference to the manager, so a future
+    // manager rebuild (post-address-switch) does not need to thread the
+    // dependency back through.
+    try {
+      const paymentsForGate = this._payments as unknown as {
+        configureConnectivityGate?: (
+          fn: () => 'up' | 'down' | 'degraded' | 'unknown',
+        ) => void;
+      };
+      if (typeof paymentsForGate.configureConnectivityGate === 'function') {
+        paymentsForGate.configureConnectivityGate(() =>
+          this._connectivity ? this._connectivity.status().aggregator : 'unknown',
+        );
+      }
+    } catch (err) {
+      logger.warn(
+        'Sphere',
+        `Failed to wire connectivity gate into PaymentsModule (sends will not gate on OFFLINE): ${safeErrorMessage(err)}`,
+      );
+    }
+  }
+
+  /**
+   * Issue #312 — build the per-wallet ConnectivityManager.
+   *
+   * Pingers wired:
+   *   - `aggregator`: probes `oracle.getCurrentRound()` (cheap JSON-RPC).
+   *   - `ipfs`: HEAD-probes the configured gateways (skipped when no
+   *      gateways are wired — wallet stays "fully online" w.r.t. IPFS).
+   *   - `nostr`: reads `transport.isConnected()` (the transport owns its
+   *      reconnect loop; we don't open a parallel subscription).
+   *
+   * Returns a freshly-built manager; the caller is responsible for
+   * `.start()` and `.stop()`.
+   */
+  private buildConnectivityManager(): ConnectivityManager {
+    const emitEvent = this.emitEvent.bind(this);
+
+    const aggregatorPinger = new AggregatorPinger({
+      provider: {
+        getCurrentRound: () => this._oracle.getCurrentRound(),
+      },
+    });
+
+    // IPFS gateways are wired only when the host app's provider factory
+    // populated `_cidFetchGateways` (the wallet has IPFS sync configured).
+    // Without gateways we skip the IPFS pinger entirely so the
+    // "no-IPFS" wallet is not stuck in permanent offline-degraded.
+    const ipfsGateways = this._cidFetchGateways ?? [];
+    const pingers: import('./connectivity').Pinger[] = [aggregatorPinger];
+    if (ipfsGateways.length > 0) {
+      pingers.push(new IpfsPinger(ipfsGateways));
+    }
+    pingers.push(
+      new NostrPinger(() => {
+        try {
+          return this._transport.isConnected();
+        } catch {
+          return false;
+        }
+      }),
+    );
+
+    return new ConnectivityManager(pingers, {
+      emitEvent: (type, payload) => {
+        // Forward to the Sphere event bus — types narrow correctly via
+        // SphereEventMap.
+        emitEvent(type as SphereEventType, payload as SphereEventMap[SphereEventType]);
+      },
     });
   }
 

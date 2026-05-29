@@ -27,6 +27,7 @@ import {
 import type { ConnectionEventListener } from '@unicitylabs/nostr-js-sdk';
 import { logger } from '../core/logger';
 import { SphereError } from '../core/errors';
+import { hexToBytes as strictHexToBytes } from '../core/hex';
 
 import type { ProviderStatus, FullIdentity } from '../types';
 import type {
@@ -61,6 +62,7 @@ import { NostrTransportProvider } from './NostrTransportProvider';
 import type { TransportStorageAdapter, NostrTransportProviderConfig } from './NostrTransportProvider';
 import {
   DEFAULT_NOSTR_RELAYS,
+  LIMITS,
   NOSTR_EVENT_KINDS,
   STORAGE_KEYS_GLOBAL,
   TIMEOUTS,
@@ -166,8 +168,21 @@ export class MultiAddressTransportMux {
 
   // Dedup — bounded to prevent memory leak in long-running sessions.
   // Set preserves insertion order; evict oldest entries when cap is reached.
+  //
+  // Issue #275: This set is PERSISTED via `storage` so cross-process CLI
+  // invocations don't re-walk the relay backlog through the Mux path.
+  // Without persistence, every `sphere <cmd>` paid the legacy SDK-format
+  // path's 4-8s per-event cost for events the prior process already
+  // finalized. See `hydrateProcessedDedup` / `schedulePersistDedup` below.
+  // FIFO eviction is at `LIMITS.PROCESSED_EVENT_IDS_CAP`.
   private processedEventIds = new Set<string>();
-  private static readonly MAX_PROCESSED_IDS = 10_000;
+  private static readonly MAX_PROCESSED_IDS = LIMITS.PROCESSED_EVENT_IDS_CAP;
+  /** Debounce timer for persisted dedup writes (#275). */
+  private persistDedupTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Serialize concurrent persistDedupNow calls (#275). */
+  private persistDedupInFlight: Promise<void> | null = null;
+  /** Gates re-hydration; true after the first successful load (#275). */
+  private dedupHydrated = false;
 
   // Event callbacks (mux-level, forwarded to all adapters)
   private eventCallbacks: Set<TransportEventCallback> = new Set();
@@ -227,7 +242,7 @@ export class MultiAddressTransportMux {
     const existing = this.addresses.get(index);
     if (existing) {
       existing.identity = identity;
-      existing.keyManager = NostrKeyManager.fromPrivateKey(Buffer.from(identity.privateKey, 'hex'));
+      existing.keyManager = NostrKeyManager.fromPrivateKey(strictHexToBytes(identity.privateKey));
       existing.nostrPubkey = existing.keyManager.getPublicKeyHex();
       // Update pubkey mapping
       for (const [pk, idx] of this.pubkeyToIndex) {
@@ -239,7 +254,7 @@ export class MultiAddressTransportMux {
       return existing.adapter;
     }
 
-    const keyManager = NostrKeyManager.fromPrivateKey(Buffer.from(identity.privateKey, 'hex'));
+    const keyManager = NostrKeyManager.fromPrivateKey(strictHexToBytes(identity.privateKey));
     const nostrPubkey = keyManager.getPublicKeyHex();
 
     const adapter = new AddressTransportAdapter(this, index, identity, resolveDelegate);
@@ -359,7 +374,18 @@ export class MultiAddressTransportMux {
           autoReconnect: this.config.autoReconnect,
           reconnectIntervalMs: this.config.reconnectDelay,
           maxReconnectIntervalMs: this.config.reconnectDelay * 16,
-          pingIntervalMs: 15000,
+          // pingIntervalMs intentionally raised. The 15 s interval combined with
+          // the SDK's no-filter `['REQ','ping',{limit:1}]` keepalive trick has
+          // been observed to false-positive on real testnet under uneven relay
+          // response timing — the relay floods events to a no-filter sub but
+          // occasional 30+ s gaps in that flood (rate-limit / backend hiccup)
+          // race the 30 s stale threshold. The Mux already runs its own
+          // application-layer chat-event health check (see
+          // `[Mux] No chat events for X — re-subscribing` in this file), so
+          // we don't rely on NostrClient's stale-detect for liveness — we
+          // raise the interval to push the false-positive past any realistic
+          // run, while keeping the timer in place as a defense-in-depth signal.
+          pingIntervalMs: 60000,
         });
       }
 
@@ -409,6 +435,22 @@ export class MultiAddressTransportMux {
   }
 
   async disconnect(): Promise<void> {
+    // Issue #275 — flush any pending dedup write BEFORE tearing down
+    // the connection. A process exit that catches the tail of a
+    // 200ms debounce window would otherwise lose the latest adds
+    // and force the next process to re-walk the same relay backlog.
+    if (this.persistDedupTimer) {
+      clearTimeout(this.persistDedupTimer);
+      this.persistDedupTimer = null;
+    }
+    if (this.storage) {
+      try {
+        await this.persistDedupNow();
+      } catch (err) {
+        logger.debug('Mux', '[#275] disconnect: flush of persisted dedup failed:', err);
+      }
+    }
+
     if (this.resubscribeTimer) {
       clearTimeout(this.resubscribeTimer);
       this.resubscribeTimer = null;
@@ -734,6 +776,12 @@ export class MultiAddressTransportMux {
   private async updateSubscriptions(): Promise<void> {
     if (!this.nostrClient) return;
 
+    // Issue #275 — hydrate persistent dedup BEFORE EOSE replay arrives.
+    // The first CLI command of a new process otherwise re-walks the
+    // entire backlog through the Mux's `handleEvent`, paying the legacy
+    // SDK-format path's 4-8s addToken probe per event.
+    await this.hydrateProcessedDedup();
+
     // Always unsubscribe stale IDs first — the relay drops server-side
     // subscriptions on disconnect, so these IDs are dead after reconnect.
     if (this.walletSubscriptionId) {
@@ -908,12 +956,14 @@ export class MultiAddressTransportMux {
    * Route an incoming Nostr event to the correct address adapter.
    */
   private async handleEvent(event: NostrEvent): Promise<void> {
-    // Dedup — bounded set with LRU eviction
+    // Dedup — bounded set with FIFO eviction. Issue #275 persists this
+    // set so cross-process CLI invocations short-circuit at this gate.
     if (event.id && this.processedEventIds.has(event.id)) return;
     if (event.id) {
       this.processedEventIds.add(event.id);
+      // FIFO half-flush — preserves the legacy "evict half on overflow"
+      // behavior to avoid thrashing at the cap boundary under bursts.
       if (this.processedEventIds.size > MultiAddressTransportMux.MAX_PROCESSED_IDS) {
-        // Evict oldest entries (Set preserves insertion order)
         const it = this.processedEventIds.values();
         for (let i = 0; i < MultiAddressTransportMux.MAX_PROCESSED_IDS / 2; i++) {
           const entry = it.next();
@@ -921,6 +971,12 @@ export class MultiAddressTransportMux {
           this.processedEventIds.delete(entry.value);
         }
       }
+      // Persist asynchronously (#275). The Mux's dispatch model
+      // unconditionally advances `lastEventTs` per-address, so we
+      // don't need the two-tier "successfully processed vs. in-flight"
+      // split that NostrTransportProvider uses. Every add is a
+      // commitment to advance.
+      this.schedulePersistDedup();
     }
     try {
       if (event.kind === EventKinds.GIFT_WRAP) {
@@ -1589,10 +1645,110 @@ export class MultiAddressTransportMux {
   // ===========================================================================
 
   /**
-   * Clear processed event IDs (e.g., on address change or periodic cleanup).
+   * Clear processed event IDs.
+   *
+   * Currently unused — kept as part of the public surface for future
+   * forced-reset scenarios (e.g., a hypothetical "wipe dedup but keep
+   * connection" path). The Mux's dedup set is shared across all
+   * addresses, so address add/remove does NOT need to clear it — they
+   * legitimately share the same relay event stream. `Sphere.clear()`
+   * handles the full-wipe case via `storage.clear()`, which
+   * implicitly removes the persisted `MUX_PROCESSED_EVENT_IDS` key.
+   *
+   * Issue #275: when called, also cancels any pending persist timer
+   * and resets `dedupHydrated` so a follow-up `updateSubscriptions`
+   * re-hydrates from storage.
    */
   clearProcessedEvents(): void {
     this.processedEventIds.clear();
+    if (this.persistDedupTimer) {
+      clearTimeout(this.persistDedupTimer);
+      this.persistDedupTimer = null;
+    }
+    this.dedupHydrated = false;
+  }
+
+  /**
+   * Issue #275 — hydrate `processedEventIds` from storage. Idempotent;
+   * subsequent calls are no-ops once `dedupHydrated` is true. Failure
+   * modes (storage throw, JSON parse error, non-array) degrade to
+   * "start fresh" — the Mux still functions, just pays the legacy
+   * re-dispatch cost once until the next debounce flush repopulates.
+   */
+  private async hydrateProcessedDedup(): Promise<void> {
+    if (this.dedupHydrated) return;
+    if (!this.storage) {
+      this.dedupHydrated = true;
+      return;
+    }
+    try {
+      const raw = await this.storage.get(STORAGE_KEYS_GLOBAL.MUX_PROCESSED_EVENT_IDS);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          for (const id of parsed) {
+            if (typeof id === 'string' && id.length > 0) {
+              this.processedEventIds.add(id);
+            }
+          }
+        }
+      }
+    } catch (err) {
+      logger.debug('Mux', '[#275] hydrateProcessedDedup parse/read failed:', err);
+    }
+    this.dedupHydrated = true;
+    logger.debug(
+      'Mux',
+      `[#275] Mux dedup hydrated: ${this.processedEventIds.size} event IDs`,
+    );
+  }
+
+  /**
+   * Issue #275 — schedule a debounced write of `processedEventIds`.
+   * Coalesces a burst of EOSE-replay arrivals into a single storage
+   * transaction. Subsequent calls within the debounce window are
+   * no-ops (timer already armed).
+   */
+  private schedulePersistDedup(): void {
+    if (!this.storage) return;
+    if (this.persistDedupTimer) return;
+    this.persistDedupTimer = setTimeout(() => {
+      this.persistDedupTimer = null;
+      this.persistDedupNow().catch((err) => {
+        logger.debug('Mux', '[#275] Persisted dedup write failed (will retry on next mark):', err);
+      });
+    }, LIMITS.PROCESSED_EVENT_IDS_FLUSH_MS);
+  }
+
+  /**
+   * Issue #275 — write the persistent dedup set to storage. Serialized
+   * via `persistDedupInFlight` so concurrent timer fires and the
+   * disconnect-flush don't race on the underlying KV write.
+   */
+  private async persistDedupNow(): Promise<void> {
+    if (!this.storage) return;
+    if (this.persistDedupInFlight) {
+      await this.persistDedupInFlight.catch(() => undefined);
+    }
+    const inFlight = this.doPersistDedup();
+    this.persistDedupInFlight = inFlight;
+    try {
+      await inFlight;
+    } finally {
+      if (this.persistDedupInFlight === inFlight) {
+        this.persistDedupInFlight = null;
+      }
+    }
+  }
+
+  private async doPersistDedup(): Promise<void> {
+    if (!this.storage) return;
+    const ids = Array.from(this.processedEventIds);
+    try {
+      await this.storage.set(STORAGE_KEYS_GLOBAL.MUX_PROCESSED_EVENT_IDS, JSON.stringify(ids));
+    } catch (err) {
+      logger.debug('Mux', '[#275] doPersistDedup write failed:', err);
+    }
   }
 
   /**
@@ -1642,6 +1798,15 @@ export class AddressTransportAdapter implements TransportProvider {
   private broadcastHandlers: Map<string, Set<BroadcastHandler>> = new Map();
   private eventCallbacks: Set<TransportEventCallback> = new Set();
   private pendingMessages: IncomingMessage[] = [];
+  // Issue #223 — cross-process Nostr delivery race. The relay's REQ response
+  // can land between `mux.addAddress()` (which subscribes) and
+  // `PaymentsModule.initialize()` (which calls `onTokenTransfer`). Without a
+  // queue, `dispatchTokenTransfer` would iterate an empty handler set and
+  // silently drop the event. Mirror the pre-existing `pendingMessages` pattern
+  // for token transfers and payment-request / payment-response events.
+  private pendingTransfers: IncomingTokenTransfer[] = [];
+  private pendingPaymentRequests: IncomingPaymentRequest[] = [];
+  private pendingPaymentRequestResponses: IncomingPaymentRequestResponse[] = [];
   private chatEoseHandlers: Array<() => void> = [];
 
   constructor(
@@ -1811,16 +1976,40 @@ export class AddressTransportAdapter implements TransportProvider {
 
   onTokenTransfer(handler: TokenTransferHandler): () => void {
     this.transferHandlers.add(handler);
+    // Issue #223 — drain pending transfers queued before any handler existed.
+    if (this.pendingTransfers.length > 0) {
+      const pending = this.pendingTransfers;
+      this.pendingTransfers = [];
+      for (const transfer of pending) {
+        try { handler(transfer); } catch (e) { logger.debug('MuxAdapter', 'Pending transfer drain error:', e); }
+      }
+    }
     return () => this.transferHandlers.delete(handler);
   }
 
   onPaymentRequest(handler: PaymentRequestHandler): () => void {
     this.paymentRequestHandlers.add(handler);
+    // Issue #223 — drain pending payment requests queued before any handler existed.
+    if (this.pendingPaymentRequests.length > 0) {
+      const pending = this.pendingPaymentRequests;
+      this.pendingPaymentRequests = [];
+      for (const request of pending) {
+        try { handler(request); } catch (e) { logger.debug('MuxAdapter', 'Pending payment request drain error:', e); }
+      }
+    }
     return () => this.paymentRequestHandlers.delete(handler);
   }
 
   onPaymentRequestResponse(handler: PaymentRequestResponseHandler): () => void {
     this.paymentRequestResponseHandlers.add(handler);
+    // Issue #223 — drain pending payment responses queued before any handler existed.
+    if (this.pendingPaymentRequestResponses.length > 0) {
+      const pending = this.pendingPaymentRequestResponses;
+      this.pendingPaymentRequestResponses = [];
+      for (const response of pending) {
+        try { handler(response); } catch (e) { logger.debug('MuxAdapter', 'Pending payment response drain error:', e); }
+      }
+    }
     return () => this.paymentRequestResponseHandlers.delete(handler);
   }
 
@@ -1923,8 +2112,13 @@ export class AddressTransportAdapter implements TransportProvider {
   }
 
   async fetchPendingEvents(): Promise<void> {
-    // Fetching is handled by subscription — no-op for mux-based adapters
-    // The mux subscription already includes this address's pubkey
+    // Issue #223 — backstop for cases where the persistent subscription
+    // missed events (e.g. relay disconnect/reconnect, or — in older builds
+    // before the pending-queue fix — race between subscribe and handler
+    // registration). Delegates to the mux's bounded one-shot fetch which
+    // walks the same handleEvent dispatch chain (mux-level dedup prevents
+    // double-processing with the live subscription).
+    await this.mux.fetchPendingEvents();
   }
 
   onChatReady(handler: () => void): () => void {
@@ -1946,18 +2140,35 @@ export class AddressTransportAdapter implements TransportProvider {
   }
 
   dispatchTokenTransfer(transfer: IncomingTokenTransfer): void {
+    // Issue #223 — queue if no handler is registered yet. The relay can push
+    // events between mux.addAddress (which subscribes) and PaymentsModule.
+    // initialize (which calls onTokenTransfer); without the queue this fires
+    // into an empty Set and the event is lost. Mirrors the dispatchMessage /
+    // pendingMessages pattern.
+    if (this.transferHandlers.size === 0) {
+      this.pendingTransfers.push(transfer);
+      return;
+    }
     for (const handler of this.transferHandlers) {
       try { handler(transfer); } catch (e) { logger.debug('MuxAdapter', 'Transfer handler error:', e); }
     }
   }
 
   dispatchPaymentRequest(request: IncomingPaymentRequest): void {
+    if (this.paymentRequestHandlers.size === 0) {
+      this.pendingPaymentRequests.push(request);
+      return;
+    }
     for (const handler of this.paymentRequestHandlers) {
       try { handler(request); } catch (e) { logger.debug('MuxAdapter', 'Payment request handler error:', e); }
     }
   }
 
   dispatchPaymentRequestResponse(response: IncomingPaymentRequestResponse): void {
+    if (this.paymentRequestResponseHandlers.size === 0) {
+      this.pendingPaymentRequestResponses.push(response);
+      return;
+    }
     for (const handler of this.paymentRequestResponseHandlers) {
       try { handler(response); } catch (e) { logger.debug('MuxAdapter', 'Payment response handler error:', e); }
     }

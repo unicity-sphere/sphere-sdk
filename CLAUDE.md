@@ -58,7 +58,7 @@ const totalUsd = await sphere.payments.getFiatBalance(); // number | null (null 
 const tokens = sphere.payments.getTokens();           // individual Token[]
 const uctOnly = sphere.payments.getTokens({ coinId: 'UCT' }); // filter by coin
 
-// 5. Send tokens (L3)
+// 5. Send tokens (L3) — single-coin
 const result = await sphere.payments.send({
   recipient: '@bob',           // @nametag, DIRECT://..., chain pubkey (02...), or alpha1...
   amount: '1000000',           // in smallest unit (string)
@@ -66,9 +66,47 @@ const result = await sphere.payments.send({
   memo: 'Payment for coffee', // optional
   // transferMode: 'instant',      // default — fast, receiver resolves proofs
   // transferMode: 'conservative', // slower — sender collects all proofs first
+  // allowPendingTokens: false,    // default — only finalized tokens; true enables chain mode
 });
 // result: { id, status, tokens, tokenTransfers, error? }
 // status: 'pending' | 'submitted' | 'delivered' | 'completed' | 'failed'
+
+// 5a. Multi-coin send — deliver UCT + USDU in one call
+const multiResult = await sphere.payments.send({
+  recipient: '@bob',
+  coinId: 'UCT', amount: '1000000',           // primary coin asset
+  additionalAssets: [                          // multi-asset extension
+    { kind: 'coin', coinId: 'USDU', amount: '500000' },
+  ],
+  memo: 'Multi-coin payment',
+});
+
+// 5b. Mixed coin + NFT send — deliver UCT and a specific NFT in one call
+const mixedResult = await sphere.payments.send({
+  recipient: '@bob',
+  coinId: 'UCT', amount: '1000000',
+  additionalAssets: [
+    { kind: 'nft', tokenId: '0xabc123...' },   // whole-token (NFT) transfer
+  ],
+  memo: 'Coin + NFT bundle',
+});
+
+// 5c. NFT-only send — once the implementation wave widens coinId/amount to
+//     optional, this becomes:
+//
+//     const nftResult = await sphere.payments.send({
+//       recipient: '@bob',
+//       additionalAssets: [{ kind: 'nft', tokenId: '0xabc123...' }],
+//     });
+//
+//     Until then, NFT-only sends require a small primary coin slice or wait
+//     for the widening release.
+
+// All assets ride in a single UXF bundle. Coin sources are split via mint
+// (recipient + change get fresh tokenIds); NFT sources are transferred
+// whole-token (recipient gets the original tokenId preserved). Coin and NFT
+// source tokens are class-disjoint per the canonical model — no single token
+// carries both.
 
 // 6. Receive tokens (explicit one-shot query + optional finalization)
 const { transfers } = await sphere.payments.receive();
@@ -225,8 +263,17 @@ Typed RPC layer for dApp ↔ wallet communication. Full guide: [`docs/CONNECT.md
 | `swap:deposit_confirmed` | `{ swapId, party, amount, coinId }` | Deposit confirmed by escrow |
 | `swap:completed` | `{ swapId, payoutVerified }` | Swap completed (terminal) |
 | `swap:cancelled` | `{ swapId, reason, depositsReturned? }` | Swap cancelled (terminal) |
+| `transfer:orphan-spending-detected` | `{ tokenId, detectedAt, coinId, amount }` | Sweeper found a token stuck `'transferring'` with no matching OUTBOX/SENT entry — operator triage |
+| `transfer:orphan-recovered` | `{ tokenId, coinId, amount, fromStatus, toStatus, strategy, recoveredAt }` | Auto-recovery hook flipped an orphan back to `'confirmed'` (requires `features.orphanAutoRecovery`) |
+| `transfer:double-spend-detected` | `{ tokenId, sourceStateHash, ourIntendedRecipient, detectedAt }` | Multi-device double-spend loss. Fires from two trigger sources: (1) reactive submit-time when aggregator rejects with `STATE_ALREADY_SPENT_BY_OTHER` (Item #14 Phase 1); (2) JOIN-time when `loadFromStorageData` detects a snapshot loser whose `'transferring'` state was superseded by a winner from another device (PR #182, Item #14 Phase 2). Operator surface — companion to `transfer:orphan-spending-detected` (crash-window orphan) |
+| `transfer:off-record-spent` | `{ tokenId, coinId, amount, suspectedSiblingInstance, detectedAt }` | Spent-state rescan worker found a `'confirmed'` token whose destination state is already spent on-chain (Issue #174). Routes through DispositionWriter for the `off-record-spend` `_audit` record; local cleanup via `removeToken` |
+| `transfer:sent-reconciliation-recovered` | `{ outboxId, tokenIds, mode, recoveredAt }` | Worker re-ran a missed SENT-write after the dispatcher's transition step threw |
+| `transfer:sent-reconciliation-failed` | `{ outboxId, consecutiveFailures, lastError, failedAt }` | SENT-write retry exhausted `maxRetries`; OUTBOX entry kept live at `'delivered'` for triage |
+| `transfer:retention-warning` | `{ sentId, nostrEventId, bundleCid, tokenIds, recipientTransportPubkey, detectedAt }` | Relay no longer retains the Nostr TOKEN_TRANSFER event for a SENT entry |
+| `transfer:retention-republish-rearmed` | `{ sentId, nostrEventId, bundleCid, tokenIds, recipientTransportPubkey, fromStatus, toStatus, rearmedAt }` | Verifier transitioned a live OUTBOX entry back to `'sending'` so the recovery worker republishes |
+| `transfer:retention-republish-skipped` | `{ sentId, nostrEventId, bundleCid, reason, observedStatus?, errorMessage?, detectedAt }` | Retention re-publish could not be initiated (`reason ∈ no-outbox-writer / entry-tombstoned-or-missing / wrong-status / transition-failed`) |
 
-See [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) and [QUICKSTART-NODEJS.md](docs/QUICKSTART-NODEJS.md) for detailed guides.
+See [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) and [QUICKSTART-NODEJS.md](docs/QUICKSTART-NODEJS.md) for detailed guides. Operator runbooks for the send-pipeline events live at [docs/uxf/RUNBOOK-SEND-PIPELINE.md](docs/uxf/RUNBOOK-SEND-PIPELINE.md).
 
 ---
 
@@ -367,10 +414,35 @@ interface FullIdentity extends Identity {
 
 interface TransferRequest {
   recipient: string;        // @nametag, DIRECT://..., chain pubkey, alpha1...
-  amount: string;           // Amount in smallest unit
-  coinId: string;           // Token coin ID (e.g., 'UCT')
+  // Primary coin slot — type retains required for v1.0 backward compat;
+  // implementation wave widens to optional (coinId?, amount?).
+  coinId: string;           // Primary coin ID (e.g., 'UCT')
+  amount: string;           // Primary amount in smallest unit (> 0)
+  // Multi-asset extension (optional):
+  additionalAssets?: ReadonlyArray<AdditionalAsset>;
+                            // Each entry is either a coin or an NFT.
+                            // All coinIds (including primary) MUST be distinct.
+                            // All NFT tokenIds MUST be distinct.
+                            // Receivers REJECT unrecognized `kind` values
+                            // (forward-compat).
   memo?: string;            // Optional message
+  transferMode?: 'instant' | 'conservative';  // Default 'instant'
+  allowPendingTokens?: boolean;  // Default false; chain-mode source selection
+  confirmNftPending?: boolean;   // Default false; required true if any NFT
+                                 // target is backed by a pending source token
+                                 // (NFT cascades are irrecoverable).
 }
+
+type AdditionalAsset =
+  | { kind: 'coin'; coinId: string; amount: string }   // fungible
+  | { kind: 'nft';  tokenId: string };                 // whole-token / NFT
+
+// Canonical asset model:
+//   - Coin token: non-empty coinData; may be split via burn-then-mint
+//     (each output gets a fresh tokenId).
+//   - NFT token:  empty/null coinData; transferred whole-token only
+//     (preserves tokenId, tokenType, identity data).
+// Coin and NFT tokens are class-disjoint — no mixed-asset tokens.
 
 interface TransferResult {
   readonly id: string;
@@ -571,6 +643,17 @@ TxfStorageDataBase {
 
 **Deposit via invoice.** Each party deposits by paying an escrow-created invoice. Payout is verified locally via `verifyPayout()`.
 
+## OUTBOX/SEND pipeline follow-ups (post-#166)
+
+Issue #166 closed all in-scope OUTBOX/SEND crash-safety + hardening work (PRs #167–#172 merged into `integration/all-fixes`). Deferred follow-ups are tracked in **[`docs/uxf/OUTBOX-SEND-FOLLOWUPS.md`](docs/uxf/OUTBOX-SEND-FOLLOWUPS.md)** — read that document before starting any work on this pipeline. It covers:
+
+- Aggregator cross-check before orphan auto-recovery (blocks flipping `features.orphanAutoRecovery` default-ON)
+- Automatic re-publication of detected retention drops (blocks flipping `features.nostrPersistenceVerifier` default-ON)
+- `SentLedgerWriter.contains()` in-memory index (perf at high SENT volumes)
+- Tombstone storage GC (true `db.del()` after retention window)
+- Operator runbooks for the new events
+- Architecture decision: vector vs per-entry-key OUTBOX storage model
+
 ## Testing
 
 **Framework:** Vitest
@@ -617,6 +700,14 @@ RELAY_URL=wss://sphere-relay.unicity.network npm run test:relay
 - `@libp2p/crypto` - Ed25519 key generation for IPNS
 - `@libp2p/peer-id` - PeerId derivation for IPNS names
 - `ipns` - IPNS record creation and marshalling
+- `multiformats` - CID parsing and content-address verification
+
+**Profile (OrbitDB) storage (built-in):**
+- `@orbitdb/core` - OrbitDB key-value database for per-wallet Profile
+- `helia` - IPFS node runtime (dynamically imported by Profile backend)
+- `@libp2p/bootstrap` - Peer discovery for Helia
+- `@chainsafe/libp2p-gossipsub` - PubSub required by OrbitDB v3
+- `@ipld/car`, `@ipld/dag-cbor` - CAR file serialization for UXF bundles
 
 ## File Size Reference
 

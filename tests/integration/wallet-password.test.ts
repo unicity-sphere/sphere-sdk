@@ -11,6 +11,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
 import { Sphere } from '../../core/Sphere';
@@ -26,9 +27,24 @@ import type { ProviderStatus } from '../../types';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const TEST_DIR = path.join(__dirname, '.test-wallet-password');
-const DATA_DIR = path.join(TEST_DIR, 'data');
-const TOKENS_DIR = path.join(TEST_DIR, 'tokens');
+// Per-test unique directory (Date.now() + random suffix). The previous
+// shared `path.join(__dirname, '.test-wallet-password')` triggered
+// intermittent failures under full-suite worker contention (#217) —
+// five distinct tests in this file failed across 5/10 runs due to FS
+// race between cleanTestDir() and the next test's wallet write. Same
+// family of fix as commit `9bf3e90` on Sphere.test.ts.
+let TEST_DIR: string = path.join(__dirname, '.test-wallet-password');
+let DATA_DIR: string = path.join(TEST_DIR, 'data');
+let TOKENS_DIR: string = path.join(TEST_DIR, 'tokens');
+
+function freshTestDirs(): void {
+  TEST_DIR = path.join(
+    os.tmpdir(),
+    `sphere-wallet-password-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+  );
+  DATA_DIR = path.join(TEST_DIR, 'data');
+  TOKENS_DIR = path.join(TEST_DIR, 'tokens');
+}
 
 const TEST_MNEMONIC = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 const TEST_PASSWORD = 'my-secret-password';
@@ -131,11 +147,24 @@ async function createAndDestroy(options: {
 // =============================================================================
 
 describe('Wallet password encryption', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    if (Sphere.getInstance()) {
+      try { await Sphere.getInstance()!.destroy(); } catch { /* ignore */ }
+    }
+    (Sphere as unknown as { instance: null }).instance = null;
+    // Wait a microtask tick to let any pending async storage writes
+    // (from a prior test that didn't await its own destroy) flush
+    // before we delete the directory. cleanTestDir is sync rm.
+    await new Promise((r) => setImmediate(r));
+    freshTestDirs();
     cleanTestDir();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    if (Sphere.getInstance()) {
+      try { await Sphere.getInstance()!.destroy(); } catch { /* ignore */ }
+    }
+    (Sphere as unknown as { instance: null }).instance = null;
     cleanTestDir();
   });
 

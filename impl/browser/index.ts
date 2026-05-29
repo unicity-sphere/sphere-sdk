@@ -41,6 +41,8 @@ import type { MarketModuleConfig } from '../../modules/market';
 import type { PriceProvider } from '../../price';
 import { createPriceProvider } from '../../price';
 import { TokenRegistry } from '../../registry';
+import { createUxfCarPublisher } from '../../modules/payments/transfer/ipfs-publisher';
+import type { PublishToIpfsCallback } from '../../modules/payments/transfer/delivery-resolver';
 import {
   type BaseTransportConfig,
   type BaseOracleConfig,
@@ -207,6 +209,23 @@ export interface BrowserProviders {
   price?: PriceProvider;
   /** IPFS token storage provider (when tokenSync.ipfs.enabled is true) */
   ipfsTokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
+  /**
+   * UXF bundle-CAR publisher for the `uxf-cid` Nostr delivery branch
+   * (Issue #200 Phase 1 wiring). Built from the resolved IPFS gateway
+   * list when `tokenSync.ipfs.enabled` is true — same gateways used by
+   * the IPFS token-storage backend. Forward to `Sphere.init({...providers})`
+   * to enable production CID-by-reference token delivery.
+   */
+  publishToIpfs?: PublishToIpfsCallback;
+  /**
+   * Issue #223 — recipient-side gateway list used to stream-fetch CARs
+   * for incoming `kind: 'uxf-cid'` bundles. Same gateways
+   * `publishToIpfs` uses, in the same order. Forward to
+   * `Sphere.init({...providers})` so the auto-installed
+   * {@link IngestWorkerPool} can ingest `uxf-cid` events; without it,
+   * those events are silently dropped on receive.
+   */
+  cidFetchGateways?: ReadonlyArray<string>;
   /** Group chat config (resolved, for passing to Sphere.init) */
   groupChat?: GroupChatModuleConfig | boolean;
   /** Market module config (resolved, for passing to Sphere.init) */
@@ -397,6 +416,23 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
       })
     : undefined;
 
+  // Issue #200 Phase 1 wiring — build the canonical UXF CAR publisher
+  // from the same gateway list when IPFS sync is enabled. Forwarded to
+  // PaymentsModule via Sphere.init({...providers}) so the `uxf-cid`
+  // delivery branch becomes live in production. Reusing the gateway
+  // list keeps publish and storage targeting consistent.
+  //
+  // Issue #223 — surface the same gateway list as `cidFetchGateways`
+  // so the recipient pipeline can stream-fetch incoming `uxf-cid`
+  // bundles. Without this, every `uxf-cid` event is silently dropped
+  // on receive.
+  const publishToIpfs: PublishToIpfsCallback | undefined = ipfsConfig?.enabled
+    ? createUxfCarPublisher(ipfsConfig.gateways)
+    : undefined;
+  const cidFetchGateways: ReadonlyArray<string> | undefined = ipfsConfig?.enabled
+    ? ipfsConfig.gateways
+    : undefined;
+
   // Resolve group chat config
   const groupChat = resolveGroupChatConfig(network, config?.groupChat);
 
@@ -432,6 +468,8 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
     l1: l1Config,
     price: priceConfig ? createPriceProvider(priceConfig) : undefined,
     ipfsTokenStorage,
+    publishToIpfs,
+    cidFetchGateways,
     tokenSyncConfig,
   };
 }

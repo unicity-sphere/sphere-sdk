@@ -8,7 +8,7 @@
  *   import { ConnectClient } from '@unicitylabs/sphere-sdk/connect';
  */
 
-export { ConnectHost } from './host/ConnectHost';
+export { ConnectHost, detectIntentSchemaVersion } from './host/ConnectHost';
 export { ConnectClient } from './client/ConnectClient';
 
 // Protocol
@@ -64,4 +64,5 @@ export type {
   ConnectClientConfig,
   ConnectResult,
   ConnectEventHandler,
+  IntentSchemaVersion,
 } from './types';

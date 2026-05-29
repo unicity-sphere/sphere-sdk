@@ -2913,6 +2913,89 @@ On CommunicationsModule 'message:dm' (same subscription as §5.11, continued):
 
 **Receipt vs cancellation notice overlap:** A cancelled invoice may receive both receipt DMs (`sendInvoiceReceipts()`) and cancellation notice DMs (`sendCancellationNotices()`) — receipts apply to any terminal state (CLOSED or CANCELLED), while cancellation notices are CANCELLED-only. Applications SHOULD choose one or the other based on their use case. Sending both is valid but may confuse payers. If both are sent, the payer's UI should present them as complementary: the receipt provides a settlement summary while the cancellation notice carries the cancellation reason and deal context.
 
+### 5.13 Invoice Delivery via UXF Bundle (#226)
+
+**Problem.** An invoice token is minted in the creator's wallet. A payer named in `terms.targets[].address` has no built-in way to discover the invoice — there is no per-target index queryable from the network. Without out-of-band coordination, `payInvoice(invoiceId)` fails with `INVOICE_NOT_FOUND` because the payer never received the token.
+
+**Solution.** `accounting.deliverInvoice(invoiceId, options?)` packages the locally-stored invoice token into a real UXF CARv1 bundle — the same content-addressed packaging the payments instant-sender uses — and ships the bundle inside a NIP-17 DM with prefix `invoice_delivery:`. The receiver's AccountingModule parses the envelope, decodes the CAR, extracts the invoice token via `pkg.assemble`, and calls `importInvoice(token)` to land it in the local ledger.
+
+**Decoupled from `createInvoice`.** The mint path mints; the deliver path delivers. Callers explicitly trigger delivery when they want payers to discover the invoice. This separation lets callers mint once and deliver multiple times (re-deliver after a relay outage, deliver to a late-added target).
+
+**Wire format:**
+
+```
+invoice_delivery:<JSON envelope>
+```
+
+Envelope shape:
+
+```ts
+{
+  type: 'invoice_delivery',
+  version: 1,
+  invoiceId: '<64-hex>',
+  bundle:
+    | { kind: 'uxf-car', carBase64: string, bundleCid: string }
+    | { kind: 'uxf-cid', bundleCid: string, gateways?: string[] },
+  memo?: string,
+}
+```
+
+The CAR inside is a real UXF CARv1 — receivers can `UxfPackage.fromCar(carBytes)` and inspect it with the standard UXF APIs.
+
+**Sender algorithm:**
+
+```
+1. Look up invoice in the local terms cache. Throw INVOICE_NOT_FOUND if absent.
+2. Read the TxfToken JSON from payments.getTokens() (the invoice was added
+   by createInvoice via payments.addToken).
+3. Require deps.communications — else throw COMMUNICATIONS_UNAVAILABLE.
+4. Resolve recipients:
+   - If options.recipients is set, use that list verbatim.
+   - Else default to terms.targets[].address, skipping any address that
+     matches one of our active addresses (multi-HD self-skip).
+5. Build the UXF bundle once (UxfPackage.create + ingest + toCar).
+6. Decide shape:
+   - CAR size ≤ INVOICE_INLINE_CAR_CEILING_BYTES (16 KiB) → inline 'uxf-car'.
+   - CAR size > ceiling AND publishToIpfs available → 'uxf-cid'.
+   - CAR size > ceiling AND no publisher → throw INVOICE_DELIVERY_FAILED.
+7. Construct the envelope, prefix with 'invoice_delivery:', sendDM per
+   recipient. Per-recipient failures are recorded and DO NOT block others.
+8. Return DeliverInvoiceResult { invoiceId, sent, failed, skippedSelf,
+   recipients[] }.
+```
+
+**Receiver algorithm:**
+
+```
+On CommunicationsModule 'message:dm':
+  1. Check 'invoice_delivery:' prefix.
+  2. Size guard (MAX_INVOICE_DELIVERY_BYTES = 128 KB).
+  3. JSON.parse; validate envelope (type / version / invoiceId hex /
+     bundle.kind / bundle.bundleCid). Forward-compat: version > 1 silently
+     dropped.
+  4. For kind 'uxf-car': base64-decode carBase64 via the SDK's strict
+     carBase64ToBytes (rejects non-alphabet characters).
+     For kind 'uxf-cid': currently logged and dropped — fetching CAR
+     bytes from IPFS gateways is deferred to a follow-up (will share the
+     payments path's cidFetchGateways + acquireBundle infrastructure).
+  5. UxfPackage.fromCar(carBytes); verify the claimed invoiceId is
+     present (`pkg.hasToken(invoiceId)`). Reject mismatched bundles.
+  6. pkg.assemble(invoiceId) → token JSON.
+  7. importInvoice(token). INVOICE_ALREADY_EXISTS is benign (relay
+     replay, prior manual import). Other SphereError codes are logged
+     and dropped — a single malicious DM must NOT break the wider
+     receive pipeline.
+```
+
+**Self-target skip.** The sender computes `ownAddresses` from `getActiveAddresses()` (all tracked HD addresses) and `identity.directAddress`. This covers multi-address wallets — an invoice minted on address 0 that targets address 1 of the same wallet is recognized as self.
+
+**Idempotency.** `importInvoice` is idempotent via `INVOICE_ALREADY_EXISTS`. Relay re-delivery, manual import, and prior-sync replay all converge on the same end state.
+
+**Why UXF, not raw TXF JSON in the DM?** Invoices are tokens; tokens are packaged as UXF bundles for delivery just like any other tokens. The UXF format gives content addressing (`bundleCid` lets receivers re-derive the hash from the bytes), CAR streaming for large bundles, and cross-pipeline compatibility with the payments instant-sender's bundle plumbing. The legacy raw-TXF-in-DM pattern is preserved by the swap module's escrow→wallet `invoice_delivery` discriminator (`modules/swap/dm-protocol.ts`) but is not the SDK-level default for new flows.
+
+**Future: combined token+invoice bundles.** A planned follow-up extends `TransferRequest.additionalAssets` with `{ kind: 'invoice', tokenId: string }` so a single `payments.send()` call can deliver coin/NFT transfers AND invoices in the same UXF bundle over the TOKEN_TRANSFER event channel. That work touches the heavily-invariant-laden `processToken` receiver path (which currently assumes state-transition semantics) and is scoped separately.
+
 ---
 
 ## 6. Events

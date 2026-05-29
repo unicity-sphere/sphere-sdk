@@ -906,6 +906,67 @@ describe('getAssets()', () => {
     expect(assets[0]?.fiatValueUsd).toBeNull();
     expect(assets[0]?.fiatValueEur).toBeNull();
   });
+
+  // Issue #282 Residual #1 — same token set inserted in different order
+  // on two devices MUST aggregate to the same rendered sequence. Without
+  // the deterministic sort the underlying Map iteration follows
+  // insertion order, which differs across snapshot replays.
+  it('should return assets in deterministic (alphabetical by symbol) order regardless of token-insertion sequence (#282 Residual #1)', async () => {
+    const sequenceA = [
+      { id: 't1', coinId: '0xeth', symbol: 'ETH', name: 'Ethereum', decimals: 18, amount: '42', status: 'confirmed' },
+      { id: 't2', coinId: '0xusdt', symbol: 'USDT', name: 'Tether', decimals: 6, amount: '1000', status: 'confirmed' },
+      { id: 't3', coinId: '0xsol', symbol: 'SOL', name: 'Solana', decimals: 9, amount: '1000', status: 'confirmed' },
+      { id: 't4', coinId: '0xbtc', symbol: 'BTC', name: 'Bitcoin', decimals: 8, amount: '1', status: 'confirmed' },
+      { id: 't5', coinId: '0xusdu', symbol: 'USDU', name: 'USDU', decimals: 6, amount: '1000', status: 'confirmed' },
+      { id: 't6', coinId: '0xusdc', symbol: 'USDC', name: 'USDC', decimals: 6, amount: '1000', status: 'confirmed' },
+      { id: 't7', coinId: '0xuct', symbol: 'UCT', name: 'Unicity', decimals: 18, amount: '100', status: 'confirmed' },
+    ];
+    const sequenceB = [
+      { id: 't2', coinId: '0xusdt', symbol: 'USDT', name: 'Tether', decimals: 6, amount: '1000', status: 'confirmed' },
+      { id: 't5', coinId: '0xusdu', symbol: 'USDU', name: 'USDU', decimals: 6, amount: '1000', status: 'confirmed' },
+      { id: 't7', coinId: '0xuct', symbol: 'UCT', name: 'Unicity', decimals: 18, amount: '100', status: 'confirmed' },
+      { id: 't4', coinId: '0xbtc', symbol: 'BTC', name: 'Bitcoin', decimals: 8, amount: '1', status: 'confirmed' },
+      { id: 't6', coinId: '0xusdc', symbol: 'USDC', name: 'USDC', decimals: 6, amount: '1000', status: 'confirmed' },
+      { id: 't1', coinId: '0xeth', symbol: 'ETH', name: 'Ethereum', decimals: 18, amount: '42', status: 'confirmed' },
+      { id: 't3', coinId: '0xsol', symbol: 'SOL', name: 'Solana', decimals: 9, amount: '1000', status: 'confirmed' },
+    ];
+
+    const moduleA = createModuleWithTokens(sequenceA);
+    const moduleB = createModuleWithTokens(sequenceB);
+
+    const assetsA = await moduleA.getAssets();
+    const assetsB = await moduleB.getAssets();
+
+    const symbolsA = assetsA.map((a) => a.symbol);
+    const symbolsB = assetsB.map((a) => a.symbol);
+
+    expect(symbolsA).toEqual(['BTC', 'ETH', 'SOL', 'UCT', 'USDC', 'USDT', 'USDU']);
+    expect(symbolsB).toEqual(symbolsA);
+  });
+
+  // Issue #282 Residual #3 — invoice tokens (and any residual empty-coinId
+  // shape) must not surface in `getAssets()`. Pre-fix they appeared as
+  // `: 0 (1 token)` after `txfToToken` round-tripped the invoice via
+  // storage and lost its symbolic coinId.
+  it('should exclude invoice tokens from getAssets (#282 Residual #3)', async () => {
+    const INVOICE_COIN_ID =
+      '14676a280bda4275baf865b67cd4c611bcd58c9bf8226d508acaa10a8fcaccc6';
+    const module = createModuleWithTokens([
+      { id: 't1', coinId: '0xaaa', symbol: 'UCT', name: 'Unicity', decimals: 18, amount: '1000', status: 'confirmed' },
+      // Invoice in symbolic shape (post-create / post-import).
+      { id: 'inv-1', coinId: INVOICE_COIN_ID, symbol: 'INVOICE', name: 'Invoice', decimals: 0, amount: '0', status: 'confirmed' },
+      // Defensive: residual empty-coinId entry (catch-all in
+      // aggregateTokens). Mirrors the phantom shape pre-fix on the
+      // IPFS-recovery side.
+      { id: 'phantom-1', coinId: '', symbol: '', name: '', decimals: 0, amount: '0', status: 'confirmed' },
+    ]);
+
+    const assets = await module.getAssets();
+    expect(assets.length).toBe(1);
+    expect(assets[0]?.symbol).toBe('UCT');
+    expect(assets.find((a) => a.symbol === 'INVOICE')).toBeUndefined();
+    expect(assets.find((a) => a.coinId === '')).toBeUndefined();
+  });
 });
 
 // =============================================================================
@@ -1114,6 +1175,48 @@ describe('Nametag preservation during sync', () => {
     // Nametag should be updated to the one from merged data
     expect(module.hasNametag()).toBe(true);
     expect(module.getNametag()?.name).toBe('updateduser');
+  });
+
+  it('should clear nametags when sync provider returns explicit empty _nametags array', async () => {
+    // Intentional cross-device removal: another device cleared its nametag
+    // and synced. The merged payload carries `_nametags: []` (explicit,
+    // not absent). We MUST clear locally — preservation only kicks in
+    // when the field is absent. (#136 boundary case)
+    const mockProvider = {
+      id: 'test-provider',
+      name: 'Test Provider',
+      type: 'local' as const,
+      setIdentity: vi.fn(),
+      initialize: vi.fn().mockResolvedValue(true),
+      shutdown: vi.fn().mockResolvedValue(undefined),
+      connect: vi.fn().mockResolvedValue(undefined),
+      disconnect: vi.fn().mockResolvedValue(undefined),
+      isConnected: vi.fn().mockReturnValue(true),
+      getStatus: vi.fn().mockReturnValue('connected' as const),
+      save: vi.fn().mockResolvedValue({ success: true, timestamp: Date.now() }),
+      load: vi.fn().mockResolvedValue({ success: true, data: { _meta: { version: 1, address: '', formatVersion: '2.0', updatedAt: Date.now() } }, source: 'local', timestamp: Date.now() }),
+      sync: vi.fn().mockResolvedValue({
+        success: true,
+        merged: {
+          _meta: { version: 2, address: '', formatVersion: '2.0', updatedAt: Date.now() },
+          _nametags: [],
+        },
+        added: 0,
+        removed: 0,
+        conflicts: 0,
+      }),
+    };
+
+    const providers = new Map([['test', mockProvider]]);
+    const module = createInitializedModule(providers);
+
+    await module.setNametag(TEST_NAMETAG);
+    expect(module.hasNametag()).toBe(true);
+
+    await module.sync();
+
+    // Explicit empty array → cleared.
+    expect(module.hasNametag()).toBe(false);
   });
 
   it('should recover nametags from storage via reloadNametagsFromStorage', async () => {

@@ -4,6 +4,12 @@
 > **Module path:** `modules/accounting/AccountingModule.ts`
 > **Barrel:** `modules/accounting/index.ts`
 
+> **Transfer-protocol coordination** (per [UXF-TRANSFER-PROTOCOL](uxf/UXF-TRANSFER-PROTOCOL.md)):
+> - **`payInvoice()` flows through `payments.send()`** — the canonical TransferRequest contract applies. Multi-asset invoice payments (covering multiple `(coinId, amount)` targets in a single transfer) MAY use `additionalAssets: AdditionalAsset[]` once the implementation wave widens primary `coinId`/`amount` to optional. NFT-target invoices (where invoice's `nft?: NFTEntry` is populated) MUST be paid with NFT-class source tokens (empty `coinData` per the canonical asset model — coin tokens cannot satisfy NFT targets even on tokenId match).
+> - **Cascade rule**: a `payInvoice()` whose underlying transfer hard-fails (per UXF-TRANSFER-PROTOCOL §6.1.1) emits `transfer:cascade-failed` for downstream recipients. The accounting module's invoice payment-attribution logic (`balanceComputer`) MUST treat cascaded transfers as failed payments — invoice `senderContribution` for cascaded tokens rolls back automatically once the cascade event is observed.
+> - **Auto-return uses `payments.send()`** and inherits the same cascade-risk semantics. An auto-returned token that subsequently cascade-invalidates requires operator override via `payments.importInclusionProof()` + `revalidateCascadedChildren()` (per UXF-TRANSFER-PROTOCOL §6.3 + §6.1.1).
+> - **Invoice tokens are NFTs by canonical class**: invoice mint sets `coinData: null`, satisfying the canonical NFT predicate (`isNft(token) := token.coins.length === 0` after zero-amount pruning). Whole-token transfer of an invoice (the typical send flow) preserves `tokenId`.
+
 ## 1. Overview
 
 The Accounting Module extends Sphere SDK with invoice creation, tracking, and settlement capabilities. It follows the SDK's existing module pattern (like `PaymentsModule`, `MarketModule`) and integrates with the existing token and transfer infrastructure without modifying it.

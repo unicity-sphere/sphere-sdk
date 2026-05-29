@@ -34,7 +34,10 @@
     "validation/**/*.ts",
     "impl/**/*.ts",
     "l1/**/*.ts",
-    "registry/**/*.ts"
+    "registry/**/*.ts",
+    "uxf/**/*.ts",
+    "profile/**/*.ts",
+    "tools/**/*.ts"
   ],
   "exclude": [
     "node_modules",

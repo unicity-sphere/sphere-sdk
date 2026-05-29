@@ -27,8 +27,13 @@ import {
   isReadReceipt,
 } from '@unicitylabs/nostr-js-sdk';
 import type { BindingInfo } from '@unicitylabs/nostr-js-sdk';
+import {
+  SUPPORTED_WIRE_PROTOCOLS,
+  SUPPORTED_ASSET_KINDS,
+} from './transport-provider';
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
 import { logger } from '../core/logger';
+import { hexToBytes as strictHexToBytes } from '../core/hex';
 import type { ProviderStatus, FullIdentity } from '../types';
 import { SphereError } from '../core/errors';
 import type {
@@ -59,10 +64,13 @@ import type { WebSocketFactory, UUIDGenerator } from './websocket';
 import { defaultUUIDGenerator } from './websocket';
 import {
   DEFAULT_NOSTR_RELAYS,
+  LIMITS,
   NOSTR_EVENT_KINDS,
   STORAGE_KEYS_GLOBAL,
   TIMEOUTS,
 } from '../constants';
+import { isUxfTransferPayload } from '../types/uxf-transfer';
+import { encodeTransferPayload, decodeTransferPayload } from '../uxf/transfer-payload';
 
 // =============================================================================
 // Configuration
@@ -136,8 +144,84 @@ export class NostrTransportProvider implements TransportProvider {
   private nostrClient: NostrClient | null = null;
   private mainSubscriptionId: string | null = null;
 
-  // Event handlers
+  // Event handlers — two-tier dedup (issue #275).
+  //
+  // `processedEventIds` is the PERSISTED set of event IDs that we have
+  // successfully processed (i.e., the wallet cursor advanced past them).
+  // It is hydrated from KV storage on connect/fetchPendingEvents so
+  // cross-process CLI invocations do not re-walk the relay backlog. The
+  // §C soak forensics in issue #275 showed 169 dispatches across 15
+  // unique event IDs because this set previously lived in-process only
+  // — 71.5% of §C wall-clock was wasted on duplicate dispatch.
+  //
+  // We MUST NOT add to this set before the event handler completes
+  // successfully: doing so would mask the at-least-once retry that
+  // TOKEN_TRANSFER's durability gate depends on (a failed event would
+  // be persisted as "processed" and never re-tried across restarts).
+  //
+  // `inFlightEventIds` is the IN-MEMORY set used for concurrent-arrival
+  // dedup: the same relay event may be delivered via multiple
+  // subscriptions (wallet sub + chat sub) within the same process. It
+  // is never persisted; entries are removed in the `finally` block of
+  // `handleEvent` so the second arrival short-circuits while the first
+  // is still in flight.
   private processedEventIds = new Set<string>();
+  private inFlightEventIds = new Set<string>();
+
+  /**
+   * Issue #275 — debounce timer for persisting `processedEventIds` and
+   * `failedEventCooldowns`. Coalesces a burst of EOSE-replay arrivals
+   * into a single storage write. Set to `LIMITS.PROCESSED_EVENT_IDS_FLUSH_MS`.
+   */
+  private persistDedupTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Reentrancy guard so concurrent schedules don't race the in-flight write. */
+  private persistDedupInFlight: Promise<void> | null = null;
+  /** True once dedup state has been hydrated from storage; gates re-hydration. */
+  private dedupHydrated = false;
+
+  /**
+   * Issue #272 + #275 — per-event failure cooldown ledger for TOKEN_TRANSFER
+   * replays. When `handleIncomingTransfer` returns `false` (the at-
+   * least-once gate refused the ack), we record an exponential cool-
+   * down so the relay-paced replay storm cannot busy-spin the
+   * receive pipeline (parse → crypto verify → flush → HEAD-verify)
+   * for the same event on every reconnect cycle.
+   *
+   * Semantics:
+   *   - `attempts` counts consecutive durability misses. Cleared on
+   *     success (advance happens) or when the bounded budget exhausts.
+   *   - `nextRetryAt` is `Date.now() + min(COOLDOWN_BASE_MS * 2^(n-1),
+   *     COOLDOWN_MAX_MS)`. Events arriving inside the cooldown window
+   *     are skipped without entering the gate.
+   *   - After `MAX_REPLAY_ATTEMPTS` consecutive misses, we ADVANCE the
+   *     cursor anyway and emit an operator alert. This matches the
+   *     acceptance criterion in issue #272: "`[AT-LEAST-ONCE] not
+   *     durable` count per token bounded by a small constant (≤3)
+   *     rather than unbounded replay." Local-durability is intact
+   *     (issue #272 also decoupled the per-flush HEAD-verify from
+   *     the gate, so persistent durability=false now strictly
+   *     indicates an underlying OrbitDB/pin POST/publish failure that
+   *     replay alone won't fix — operator intervention is the right
+   *     escalation).
+   *   - The map is LRU-capped to bound memory under pathological
+   *     replay floods. Eviction is single-victim per insert when at
+   *     capacity (cheap; no full sort).
+   *
+   * Issue #275: this map is now PERSISTED across process restarts so
+   * the bounded replay budget accumulates across CLI invocations
+   * instead of resetting to zero per-process. Without persistence, a
+   * persistently-failing TOKEN_TRANSFER could replay across CLI
+   * sessions indefinitely because every fresh process saw `attempts=1`
+   * and never reached the budget exhaustion threshold.
+   */
+  private failedEventCooldowns = new Map<
+    string,
+    { nextRetryAt: number; attempts: number }
+  >();
+  private static readonly DURABILITY_COOLDOWN_BASE_MS = 30_000;
+  private static readonly DURABILITY_COOLDOWN_MAX_MS = 120_000;
+  private static readonly DURABILITY_MAX_REPLAY_ATTEMPTS = 3;
+  private static readonly DURABILITY_COOLDOWN_MAP_CAP = 256;
   private messageHandlers: Set<MessageHandler> = new Set();
   private transferHandlers: Set<TokenTransferHandler> = new Set();
   private paymentRequestHandlers: Set<PaymentRequestHandler> = new Set();
@@ -146,6 +230,30 @@ export class NostrTransportProvider implements TransportProvider {
   private typingIndicatorHandlers: Set<TypingIndicatorHandler> = new Set();
   private composingHandlers: Set<ComposingHandler> = new Set();
   private pendingMessages: IncomingMessage[] = [];
+  /**
+   * Issue #247 — buffer for TOKEN_TRANSFER events that arrive on this
+   * outer provider before any handler is registered. The pre-Mux race
+   * (#223 comment in `handleTokenTransfer`) sees relay events landing
+   * here while `PaymentsModule` has registered its handler on the
+   * AddressTransportAdapter, not on this provider. Without a buffer,
+   * the events are dropped (allDurable=false → since-not-advanced) and
+   * the only recovery is replay-on-reconnect — producing the persistent
+   * "TOKEN_TRANSFER ... not durable" storm observed in
+   * manual-test-full-recovery.sh.
+   *
+   * Buffered transfers are drained when a handler registers via
+   * `onTokenTransfer` (in-session catch-up). If the process exits
+   * before any handler registers, `lastEventTs` was not advanced and
+   * the events replay on next reconnect — preserving at-least-once.
+   *
+   * Each entry retains the original event's `created_at` (seconds) so
+   * the drain can advance `lastEventTs` per-event on successful
+   * delivery.
+   */
+  private pendingTransfers: Array<{
+    readonly transfer: IncomingTokenTransfer;
+    readonly createdAtSec: number;
+  }> = [];
   private broadcastHandlers: Map<string, Set<BroadcastHandler>> = new Map();
   private eventCallbacks: Set<TransportEventCallback> = new Set();
 
@@ -200,6 +308,14 @@ export class NostrTransportProvider implements TransportProvider {
    * Suppress event subscriptions — unsubscribe wallet/chat filters
    * but keep the connection alive for resolve/identity-binding operations.
    * Used when MultiAddressTransportMux takes over event handling.
+   *
+   * Stops application-level keepalive ping timers on the bare connection.
+   * After suppression this NostrClient has zero active subscriptions; the
+   * connection is retained only as an outbound resolve()/identity-binding
+   * channel. Application pings on a subscription-free connection have been
+   * empirically observed to elicit no relay response, causing
+   * `appears stale` flapping every ~45 s. OS-level TCP keepalive maintains
+   * connection liveness; we don't need application-level pings here.
    */
   suppressSubscriptions(): void {
     if (!this.nostrClient) return;
@@ -217,9 +333,34 @@ export class NostrTransportProvider implements TransportProvider {
       this.mainSubscriptionId = null;
     }
 
+    this.stopApplicationPingsOnBareClient();
+
     // Prevent re-subscription on reconnect by marking subscriptions as suppressed
     this._subscriptionsSuppressed = true;
     logger.debug('Nostr', 'Subscriptions suppressed — mux handles event routing');
+  }
+
+  /**
+   * Stop the bare NostrClient's per-relay application-level keepalive
+   * ping timers. Reaches into NostrClient internals via a structural cast
+   * because `stopPingTimer(url)` and `relays` are declared `private` in
+   * @unicitylabs/nostr-js-sdk. An upstream PR adding a public
+   * `stopAllPingTimers()` would let us drop this cast.
+   *
+   * Called from `suppressSubscriptions()` and from the post-reconnect path
+   * in `setIdentity` when suppression is active — every fresh NostrClient
+   * starts its own ping timers on connect, so we must re-stop them after
+   * each replacement.
+   */
+  private stopApplicationPingsOnBareClient(): void {
+    if (!this.nostrClient) return;
+    const internals = this.nostrClient as unknown as {
+      relays: Map<string, unknown>;
+      stopPingTimer(url: string): void;
+    };
+    for (const url of internals.relays.keys()) {
+      internals.stopPingTimer(url);
+    }
   }
 
   // Flag to prevent re-subscription after suppressSubscriptions()
@@ -251,7 +392,13 @@ export class NostrTransportProvider implements TransportProvider {
         autoReconnect: this.config.autoReconnect,
         reconnectIntervalMs: this.config.reconnectDelay,
         maxReconnectIntervalMs: this.config.reconnectDelay * 16, // exponential backoff cap
-        pingIntervalMs: 15000, // 15 second keepalive pings (more aggressive to prevent drops)
+        // 60 s keepalive — the SDK's no-filter `['REQ','ping',{limit:1}]`
+        // trick false-positives at 15 s on real testnet under uneven relay
+        // timing. After Mux takeover suppressSubscriptions stops these
+        // timers entirely (see `stopApplicationPingsOnBareClient`); 60 s
+        // covers the brief pre-suppress window AND any reconnect that
+        // re-establishes the timer before suppression re-runs.
+        pingIntervalMs: 60000,
         // Bump query timeout from the SDK default of 5s to 20s.
         // Real-world testnet observation (2026-05-01): under transient
         // relay overload, kind:30078 (nametag binding) queries take 5-7s
@@ -284,6 +431,11 @@ export class NostrTransportProvider implements TransportProvider {
           this.subscribeToEvents().catch((err) => {
             logger.error('Nostr', 'Failed to re-subscribe after reconnect:', err);
           });
+          // The reconnected socket starts a fresh ping timer; under
+          // suppression we don't want it (see suppressSubscriptions()).
+          if (this._subscriptionsSuppressed) {
+            this.stopApplicationPingsOnBareClient();
+          }
         },
       });
 
@@ -317,6 +469,24 @@ export class NostrTransportProvider implements TransportProvider {
   }
 
   async disconnect(): Promise<void> {
+    // Issue #275 — flush any pending dedup writes before tearing down
+    // the connection. Without this, a process exit that catches the
+    // tail of a 200ms debounce window would lose the latest
+    // `processedEventIds` adds and force the next process to re-walk
+    // the same relay backlog. The flush is best-effort; we swallow
+    // errors so disconnect remains robust.
+    if (this.persistDedupTimer) {
+      clearTimeout(this.persistDedupTimer);
+      this.persistDedupTimer = null;
+    }
+    if (this.storage && this.keyManager) {
+      try {
+        await this.persistDedupNow();
+      } catch (err) {
+        logger.debug('Nostr', 'disconnect: flush of persisted dedup failed:', err);
+      }
+    }
+
     if (this.nostrClient) {
       this.nostrClient.disconnect();
       this.nostrClient = null;
@@ -462,12 +632,23 @@ export class NostrTransportProvider implements TransportProvider {
     // Clear per-address state so stale dedup entries from previous address
     // don't block legitimate events for the new address.
     this.processedEventIds.clear();
+    this.inFlightEventIds.clear();
+    this.failedEventCooldowns.clear();
+    this.dedupHydrated = false;
     this.lastEventTs = 0;
     this.lastDmEventTs = 0;
     this.fallbackDmSince = null;
+    // Cancel any pending debounced persist — the previous identity's
+    // state must not leak into the new identity's storage namespace.
+    if (this.persistDedupTimer) {
+      clearTimeout(this.persistDedupTimer);
+      this.persistDedupTimer = null;
+    }
 
-    // Create NostrKeyManager from private key
-    const secretKey = Buffer.from(identity.privateKey, 'hex');
+    // Create NostrKeyManager from private key.
+    // Steelman³³ warning: strict hex decode — Buffer.from(_, 'hex')
+    // silently truncates malformed inputs.
+    const secretKey = strictHexToBytes(identity.privateKey);
     this.keyManager = NostrKeyManager.fromPrivateKey(secretKey);
 
     // Use Nostr-format pubkey (32 bytes / 64 hex chars) from keyManager
@@ -502,6 +683,11 @@ export class NostrTransportProvider implements TransportProvider {
         },
         onReconnected: (url) => {
           logger.debug('Nostr', 'NostrClient reconnected to relay:', url);
+          // Mirror the primary listener: under suppression, the
+          // reconnected socket's fresh ping timer is unwanted.
+          if (this._subscriptionsSuppressed) {
+            this.stopApplicationPingsOnBareClient();
+          }
         },
       });
 
@@ -515,6 +701,12 @@ export class NostrTransportProvider implements TransportProvider {
         ),
       ]);
       await this.subscribeToEvents();
+      // The fresh NostrClient started its own ping timers on connect.
+      // If subscriptions were suppressed (mux owns event routing), the
+      // bare client should not ping — see suppressSubscriptions() docstring.
+      if (this._subscriptionsSuppressed) {
+        this.stopApplicationPingsOnBareClient();
+      }
       oldClient.disconnect();
     } else if (this.isConnected()) {
       // Already connected with right key, just subscribe
@@ -610,9 +802,32 @@ export class NostrTransportProvider implements TransportProvider {
   ): Promise<string> {
     this.ensureReady();
 
-    // Create encrypted token transfer event
-    // Content must have "token_transfer:" prefix for nostr-js-sdk compatibility
-    const content = 'token_transfer:' + JSON.stringify(payload);
+    // T.2.E — shape-agnostic outbound serialization.
+    //
+    // Two valid serialization paths exist for the `TokenTransferPayload`
+    // tagged union (`types/uxf-transfer`):
+    //
+    //   1. UXF v1.0 envelopes (`kind === 'uxf-car' | 'uxf-cid'`) and the
+    //      four legacy shapes recognized by `isLegacyTokenTransferPayload`:
+    //      use the canonical, byte-deterministic encoder from T.1.D so that
+    //      every legitimate envelope on the wire is identical across
+    //      sender runs (important for content-addressed audit and replay
+    //      detection — §5.6).
+    //   2. Anything else (custom test payloads, callers that bypass the
+    //      `as unknown as TokenTransferPayload` cast already used by
+    //      `PaymentsModule` for partially-built shapes): fall through to
+    //      `JSON.stringify`. This preserves backward compatibility with
+    //      the pre-T.2.E behavior — no caller currently exercises this
+    //      path, but the safety valve is critical to avoid breaking the
+    //      legacy chain split during the migration wave.
+    //
+    // Content must have "token_transfer:" prefix for nostr-js-sdk
+    // compatibility — preserved verbatim from the pre-T.2.E implementation
+    // and matched by `stripContentPrefix()` on the receive side.
+    const serialized = isUxfTransferPayload(payload)
+      ? encodeTransferPayload(payload)
+      : JSON.stringify(payload);
+    const content = 'token_transfer:' + serialized;
 
     // IMPORTANT: kind 31113 is a Parameterized Replaceable Event (NIP-01).
     // The relay keeps only the LATEST event per (pubkey, kind, d-tag).
@@ -644,6 +859,55 @@ export class NostrTransportProvider implements TransportProvider {
 
   onTokenTransfer(handler: TokenTransferHandler): () => void {
     this.transferHandlers.add(handler);
+
+    // Issue #247 — drain any TOKEN_TRANSFER events that arrived BEFORE
+    // this handler was registered (the pre-Mux window race documented
+    // in `handleTokenTransfer`). Buffer is snapshotted and cleared
+    // atomically before the (async) handler calls — events arriving
+    // during the drain take the live path (`transferHandlers.size > 0`
+    // is true now) and won't double-buffer.
+    //
+    // Per-event durability propagation: if the handler returns truthy
+    // (or undefined), advance `lastEventTs` so the event doesn't
+    // re-replay on next reconnect. If the handler returns `false` or
+    // throws, leave `lastEventTs` alone — the event replays normally.
+    //
+    // Fire-and-forget the drain so onTokenTransfer remains synchronous
+    // (its existing contract). Errors are logged at debug; the drain
+    // is best-effort and re-replay covers any losses.
+    if (this.pendingTransfers.length > 0) {
+      const pending = this.pendingTransfers;
+      this.pendingTransfers = [];
+      logger.debug(
+        'Nostr',
+        `Flushing ${pending.length} buffered TOKEN_TRANSFER event(s) to new handler`,
+      );
+      void (async () => {
+        for (const { transfer, createdAtSec } of pending) {
+          try {
+            const result = await handler(transfer);
+            // `undefined` is the legacy "no opinion" contract → durable.
+            if (result !== false) {
+              this.updateLastEventTimestamp(createdAtSec);
+              // Issue #275 — mark the buffered event as processed so
+              // cross-process replays short-circuit. Without this, the
+              // pre-Mux buffered events (which never enter handleEvent's
+              // success branches) would not be persisted in the dedup
+              // set, and every fresh CLI invocation would re-walk them.
+              this.markEventProcessed(transfer.id);
+            } else {
+              logger.debug(
+                'Nostr',
+                `Buffered TOKEN_TRANSFER drain handler returned false — leaving since at ${this.lastEventTs}`,
+              );
+            }
+          } catch (error) {
+            logger.debug('Nostr', 'Buffered transfer handler error:', error);
+          }
+        }
+      })();
+    }
+
     return () => this.transferHandlers.delete(handler);
   }
 
@@ -888,6 +1152,11 @@ export class NostrTransportProvider implements TransportProvider {
   /**
    * Convert a BindingInfo (from nostr-js-sdk) to PeerInfo (sphere-sdk type).
    * Computes PROXY address from nametag if available.
+   *
+   * T.8.B — When a nametag is resolved we additionally do a best-effort
+   * query for the peer's capability-bearing identity binding event (lives
+   * on a different d-tag than the nametag binding). Capability hints are
+   * informational only and the lookup never throws on failure.
    */
   private async bindingInfoToPeerInfo(binding: BindingInfo, nametag?: string): Promise<PeerInfo> {
     const nametagValue = nametag || binding.nametag;
@@ -904,6 +1173,11 @@ export class NostrTransportProvider implements TransportProvider {
       }
     }
 
+    // T.8.B — Best-effort capability hint enrichment. Upstream BindingInfo
+    // is lossy w.r.t. wireProtocols / assetKinds; query the predictable
+    // per-pubkey identity binding event to recover them. Failure is silent.
+    const capabilities = await this.fetchCapabilityHints(binding.transportPubkey);
+
     return {
       nametag: nametagValue,
       transportPubkey: binding.transportPubkey,
@@ -912,7 +1186,81 @@ export class NostrTransportProvider implements TransportProvider {
       directAddress: binding.directAddress || '',
       proxyAddress,
       timestamp: binding.timestamp,
+      ...capabilities,
     };
+  }
+
+  /**
+   * T.8.B — Extract capability hints (`wireProtocols`, `assetKinds`) from
+   * a binding event's raw JSON content.
+   *
+   * Returns an object whose keys are present ONLY when the corresponding
+   * field appeared in the parsed content. This preserves the W20 absent vs
+   * empty distinction at the type level: a missing key on the returned
+   * object means "field absent on the wire" (for `assetKinds` callers
+   * default to `['coin']` per W20); an EMPTY array means "field present
+   * but empty" (informational quirk, no W20 default).
+   */
+  private extractCapabilityHints(rawContent: unknown): {
+    wireProtocols?: ReadonlyArray<string>;
+    assetKinds?: ReadonlyArray<string>;
+  } {
+    if (!rawContent || typeof rawContent !== 'object') return {};
+    const content = rawContent as Record<string, unknown>;
+    const out: {
+      wireProtocols?: ReadonlyArray<string>;
+      assetKinds?: ReadonlyArray<string>;
+    } = {};
+    const wp = content.wire_protocols;
+    if (Array.isArray(wp)) {
+      out.wireProtocols = wp.filter((v): v is string => typeof v === 'string');
+    }
+    const ak = content.asset_kinds;
+    if (Array.isArray(ak)) {
+      out.assetKinds = ak.filter((v): v is string => typeof v === 'string');
+    }
+    return out;
+  }
+
+  /**
+   * T.8.B — Best-effort fetch of capability hints for a peer.
+   *
+   * Queries the predictable per-pubkey identity binding event (the one
+   * `publishIdentityBindingWithCapabilities` writes) and returns the hints
+   * extracted from its content. Returns an empty object on any failure
+   * (relay error, no event, parse error). Capability hints are
+   * informational and MUST NOT block resolution.
+   */
+  private async fetchCapabilityHints(transportPubkey: string): Promise<{
+    wireProtocols?: ReadonlyArray<string>;
+    assetKinds?: ReadonlyArray<string>;
+  }> {
+    try {
+      const events = await this.queryEvents({
+        kinds: [EVENT_KINDS.NAMETAG_BINDING],
+        authors: [transportPubkey],
+        limit: 5,
+      });
+      if (events.length === 0) return {};
+      // Newest-first; pick the first event whose content carries either
+      // capability field. Older entries authored by the same pubkey may
+      // pre-date T.8.B and lack the fields entirely.
+      const sorted = [...events].sort((a, b) => b.created_at - a.created_at);
+      for (const event of sorted) {
+        try {
+          const content = JSON.parse(event.content) as Record<string, unknown>;
+          const hints = this.extractCapabilityHints(content);
+          if (hints.wireProtocols !== undefined || hints.assetKinds !== undefined) {
+            return hints;
+          }
+        } catch {
+          // Skip unparseable events.
+        }
+      }
+      return {};
+    } catch {
+      return {};
+    }
   }
 
   /**
@@ -936,6 +1284,8 @@ export class NostrTransportProvider implements TransportProvider {
 
     try {
       const content = JSON.parse(bindingEvent.content);
+      // T.8.B — Capability hints from the same content blob (when present).
+      const capabilities = this.extractCapabilityHints(content);
 
       return {
         nametag: content.nametag || undefined,
@@ -945,6 +1295,7 @@ export class NostrTransportProvider implements TransportProvider {
         directAddress: content.direct_address || '',
         proxyAddress: content.proxy_address || undefined,
         timestamp: bindingEvent.created_at * 1000,
+        ...capabilities,
       };
     } catch {
       return {
@@ -987,6 +1338,8 @@ export class NostrTransportProvider implements TransportProvider {
     for (const [pubkey, event] of byAuthor) {
       try {
         const content = JSON.parse(event.content);
+        // T.8.B — Capability hints from the same event content (when present).
+        const capabilities = this.extractCapabilityHints(content);
         results.push({
           nametag: content.nametag || undefined,
           transportPubkey: pubkey,
@@ -995,6 +1348,7 @@ export class NostrTransportProvider implements TransportProvider {
           directAddress: content.direct_address || '',
           proxyAddress: content.proxy_address || undefined,
           timestamp: event.created_at * 1000,
+          ...capabilities,
         });
       } catch {
         // Skip unparseable events
@@ -1103,6 +1457,20 @@ export class NostrTransportProvider implements TransportProvider {
 
         if (success) {
           logger.debug('Nostr', 'Published identity binding with Unicity ID:', nametag, 'for pubkey:', nostrPubkey.slice(0, 16) + '...');
+
+          // T.8.B — Additionally publish a no-nametag identity binding event
+          // carrying capability hints (wireProtocols + assetKinds, §10.4).
+          // The nametag binding above uses a different d-tag (hashedNametag)
+          // so the two events coexist; capability hints live on the
+          // predictable per-pubkey d-tag and remain queryable via
+          // resolveTransportPubkeyInfo() even when the nametag is unknown
+          // to the caller. We pass the nametag through so the per-pubkey
+          // event also carries the plaintext nametag — without this,
+          // `resolveTransportPubkeyInfo` (most-recent-author wins) would
+          // return `nametag: undefined` after this event lands.
+          await this.publishIdentityBindingWithCapabilities(
+            chainPubkey, l1Address, directAddress, nametag, proxyAddr.toString(),
+          );
         }
         return success;
       } catch (error) {
@@ -1115,17 +1483,91 @@ export class NostrTransportProvider implements TransportProvider {
       }
     }
 
-    // No nametag — delegate to nostr-js-sdk for base identity binding
-    const success = await this.nostrClient!.publishIdentityBinding({
-      publicKey: chainPubkey,
-      l1Address,
-      directAddress,
-    });
+    // No nametag — publish our own identity binding event so we can include
+    // T.8.B capability hints (the upstream SDK's IdentityBindingParams type
+    // does not surface wireProtocols / assetKinds, so we construct the event
+    // ourselves; the d-tag formula is identical so this is wire-compatible
+    // with older consumers that ignore the extra fields).
+    const success = await this.publishIdentityBindingWithCapabilities(
+      chainPubkey, l1Address, directAddress,
+    );
 
     if (success) {
       logger.debug('Nostr', 'Published identity binding (no Unicity ID) for pubkey:', nostrPubkey.slice(0, 16) + '...');
     }
     return success;
+  }
+
+  /**
+   * T.8.B — Publish a base identity binding event (no nametag) carrying
+   * capability hints in the JSON content.
+   *
+   * Uses the same d-tag formula as the upstream nostr-js-sdk
+   * createIdentityBindingEvent (`SHA256('unicity:identity:' + nostrPubkey)`)
+   * so this event participates in the same parameterized-replaceable slot
+   * (kind 30078 — APP_DATA). Older readers that parse only the four
+   * canonical fields (`public_key`, `l1_address`, `direct_address`,
+   * `proxy_address`) ignore the additional `wire_protocols` and
+   * `asset_kinds` arrays — forward-compatible by construction.
+   *
+   * Spec refs: §10.4 (capability hints), W20 (assetKinds default).
+   */
+  private async publishIdentityBindingWithCapabilities(
+    chainPubkey: string,
+    l1Address: string,
+    directAddress: string,
+    nametag?: string,
+    proxyAddress?: string,
+  ): Promise<boolean> {
+    const nostrPubkey = this.getNostrPubkey();
+    const dTag = bytesToHex(
+      sha256Noble(new TextEncoder().encode('unicity:identity:' + nostrPubkey)),
+    );
+
+    const content: Record<string, unknown> = {
+      public_key: chainPubkey,
+      l1_address: l1Address,
+      direct_address: directAddress,
+      // T.8.B — capability hints (§10.4). Snake_case to match the upstream
+      // content schema convention.
+      wire_protocols: [...SUPPORTED_WIRE_PROTOCOLS],
+      asset_kinds: [...SUPPORTED_ASSET_KINDS],
+    };
+    // T.8.B — preserve the nametag-bearing identity's `nametag` /
+    // `proxy_address` fields on the per-pubkey binding so `resolveTransportPubkeyInfo`
+    // (most-recent-by-author) does not return `nametag: undefined` after
+    // this event lands. Without this, the no-nametag binding would shadow
+    // the nametag-binding's metadata for pubkey-based reverse lookups.
+    if (nametag) content.nametag = nametag;
+    if (proxyAddress) content.proxy_address = proxyAddress;
+
+    // Mirror the upstream's `t` tag indexing so reverse-lookup by address
+    // continues to work. We hash with the same upstream helper to stay in
+    // lock-step with NametagUtils.hashAddressForTag().
+    const { NametagUtils } = await import('@unicitylabs/nostr-js-sdk');
+    const tags: string[][] = [['d', dTag]];
+    if (chainPubkey) {
+      tags.push(['t', NametagUtils.hashAddressForTag(chainPubkey)]);
+    }
+    if (l1Address) {
+      tags.push(['t', NametagUtils.hashAddressForTag(l1Address)]);
+    }
+    if (directAddress) {
+      tags.push(['t', NametagUtils.hashAddressForTag(directAddress)]);
+    }
+
+    const event = await this.createEvent(
+      EVENT_KINDS.NAMETAG_BINDING,
+      JSON.stringify(content),
+      tags,
+    );
+    try {
+      await this.publishEvent(event);
+      return true;
+    } catch (err) {
+      logger.warn('Nostr', 'Failed to publish identity binding with capabilities:', err);
+      return false;
+    }
   }
 
   // Track broadcast subscriptions
@@ -1183,16 +1625,39 @@ export class NostrTransportProvider implements TransportProvider {
   // ===========================================================================
 
   private async handleEvent(event: NostrEvent): Promise<void> {
-    // Dedup: skip events already processed by another subscription
+    // Issue #275 — two-tier dedup. The persistent set blocks events that
+    // were already FULLY processed in a prior session (cross-process
+    // dedup). The in-flight set blocks concurrent arrivals via multiple
+    // subscriptions within the same process. Neither set is added to
+    // until we've confirmed processing — at-least-once depends on
+    // failed TOKEN_TRANSFER events being replayable on next reconnect.
     if (event.id && this.processedEventIds.has(event.id)) {
       return;
     }
+    if (event.id && this.inFlightEventIds.has(event.id)) {
+      return;
+    }
     if (event.id) {
-      this.processedEventIds.add(event.id);
+      this.inFlightEventIds.add(event.id);
     }
 
     logger.debug('Nostr', 'Processing event kind:', event.kind, 'id:', event.id?.slice(0, 12));
     try {
+      // At-least-once invariant: TOKEN_TRANSFER events are gated on
+      // durability — `handleTokenTransfer` returns `true` only when
+      // every registered handler reported the inbound token(s)
+      // durably persisted (IPFS pin + OrbitDB ref + aggregator
+      // pointer for the Profile provider). When `false`, we do NOT
+      // advance `lastEventTs` AND we do NOT add to `processedEventIds`,
+      // so the event is re-replayed on the next reconnect (idempotent
+      // via addToken stateHash dedup).
+      //
+      // Other wallet kinds (DM, payment-request, payment-request-
+      // response) retain the legacy "advance on completion"
+      // semantics — their persistence model is in-memory + KV save
+      // which is synchronous on save() return, so the gap that
+      // motivated the invariant (debounced IPFS pin) does not apply.
+      let tokenTransferDurable = true;
       switch (event.kind) {
         case EVENT_KINDS.DIRECT_MESSAGE:
           await this.handleDirectMessage(event);
@@ -1202,7 +1667,23 @@ export class NostrTransportProvider implements TransportProvider {
           await this.handleGiftWrap(event);
           break;
         case EVENT_KINDS.TOKEN_TRANSFER:
-          await this.handleTokenTransfer(event);
+          // Issue #272: cooldown gate. Skip processing entirely when a
+          // recent durability miss for this event ID is still within
+          // its cooldown window. Without this, relay reconnect immediately
+          // re-fires the failing event and the receive pipeline (parse +
+          // crypto verify + flush + HEAD-verify) burns CPU on every retry
+          // before refusing the ack again. The cooldown map is now
+          // persisted (issue #275) so the bounded replay budget
+          // (`DURABILITY_MAX_REPLAY_ATTEMPTS = 3`) accumulates across
+          // process restarts rather than resetting per-process.
+          if (event.id && this.isInDurabilityCooldown(event.id)) {
+            logger.debug(
+              'Nostr',
+              `[AT-LEAST-ONCE] TOKEN_TRANSFER ${event.id.slice(0, 12)} in durability cooldown — skipping replay`,
+            );
+            return;
+          }
+          tokenTransferDurable = await this.handleTokenTransfer(event);
           break;
         case EVENT_KINDS.PAYMENT_REQUEST:
           await this.handlePaymentRequest(event);
@@ -1217,20 +1698,278 @@ export class NostrTransportProvider implements TransportProvider {
 
       // Persist the latest event timestamp for resumption on reconnect.
       // Only update for wallet event kinds (not chat/broadcast).
+      // Skip for TOKEN_TRANSFER when the handler reported non-durable —
+      // re-replay on next reconnect protects against silent loss when
+      // IPFS pin / OrbitDB write / aggregator publish fails.
+      //
+      // Issue #275: cursor advance and `processedEventIds` add MUST move
+      // together — they're the two halves of "this event is done." If
+      // we mark processed without advancing the cursor, the relay will
+      // re-deliver the event and we'll spin forever in dedup-skip. If
+      // we advance the cursor without marking processed, a process
+      // restart will refetch and reprocess the event (wasteful but
+      // safe). The lockstep below is the at-least-once invariant.
       if (event.created_at && this.storage && this.keyManager) {
         const kind = event.kind;
         if (
           kind === EVENT_KINDS.DIRECT_MESSAGE ||
-          kind === EVENT_KINDS.TOKEN_TRANSFER ||
           kind === EVENT_KINDS.PAYMENT_REQUEST ||
           kind === EVENT_KINDS.PAYMENT_REQUEST_RESPONSE
         ) {
           this.updateLastEventTimestamp(event.created_at);
+          this.markEventProcessed(event.id);
+        } else if (kind === EVENT_KINDS.TOKEN_TRANSFER) {
+          if (tokenTransferDurable) {
+            // Issue #272: success — drop any prior cooldown tracking
+            // so a future event with the same ID (which shouldn't
+            // normally happen, but happens during cold-start replay
+            // floods on Nostr reconnect) gets a fresh budget.
+            if (event.id) this.failedEventCooldowns.delete(event.id);
+            this.updateLastEventTimestamp(event.created_at);
+            this.markEventProcessed(event.id);
+          } else if (event.id) {
+            // Issue #272: bounded replay budget. `recordDurabilityMiss`
+            // increments the per-event attempt counter, arms an
+            // exponential cooldown, and returns `true` once the budget
+            // is exhausted — at which point we advance the cursor to
+            // unstick subsequent events behind this one.
+            const shouldAdvance = this.recordDurabilityMiss(event.id);
+            if (shouldAdvance) {
+              logger.warn(
+                'Nostr',
+                `[AT-LEAST-ONCE] TOKEN_TRANSFER ${event.id.slice(0, 12)} exhausted ${NostrTransportProvider.DURABILITY_MAX_REPLAY_ATTEMPTS} durability replay attempts — advancing cursor; operator should investigate local OrbitDB/IPFS-pin/publish failures.`,
+              );
+              this.updateLastEventTimestamp(event.created_at);
+              // Mark processed so subsequent cross-process replays
+              // short-circuit at the top of handleEvent. Without this,
+              // a budget-exhausted event would replay forever after
+              // process restart (its event ID isn't in `processedEventIds`
+              // and the persisted cooldowns may have expired).
+              this.markEventProcessed(event.id);
+            } else {
+              const entry = this.failedEventCooldowns.get(event.id);
+              const cooldownMs = entry ? Math.max(0, entry.nextRetryAt - Date.now()) : 0;
+              logger.warn(
+                'Nostr',
+                `[AT-LEAST-ONCE] TOKEN_TRANSFER ${event.id.slice(0, 12)} not durable — leaving 'since' at ${this.lastEventTs}; cooldown ${cooldownMs}ms (attempt ${entry?.attempts ?? '?'}/${NostrTransportProvider.DURABILITY_MAX_REPLAY_ATTEMPTS}).`,
+              );
+              // Persist the cooldown bump so a process restart sees
+              // the accumulated attempt count.
+              this.schedulePersistDedup();
+            }
+          } else {
+            // Defensive: no event.id means we can't track cooldown or
+            // advance idempotently. Preserve legacy behavior.
+            logger.warn(
+              'Nostr',
+              `[AT-LEAST-ONCE] TOKEN_TRANSFER (no id) not durable — leaving 'since' at ${this.lastEventTs}; event will replay on next reconnect`,
+            );
+          }
+        } else {
+          // BROADCAST / GIFT_WRAP: no cursor tracking on the wallet
+          // since-filter (GIFT_WRAP uses lastDmEventTs which the DM
+          // handler advances; BROADCAST has no since-resume). Still
+          // mark processed so multi-subscription concurrent arrivals
+          // don't double-emit to handlers.
+          this.markEventProcessed(event.id);
         }
+      } else {
+        // No created_at or no storage — best-effort mark to dedup
+        // within session. Without storage we can't persist anyway.
+        this.markEventProcessed(event.id);
       }
     } catch (error) {
       logger.debug('Nostr', 'Failed to handle event:', error);
+    } finally {
+      // Always release in-flight slot so a retry (next reconnect) can
+      // re-enter handleEvent. Persistent dedup at the top will block
+      // duplicates of fully-processed events.
+      if (event.id) {
+        this.inFlightEventIds.delete(event.id);
+      }
     }
+  }
+
+  /**
+   * Issue #275 — add an event ID to the persistent dedup set and
+   * schedule a debounced write. FIFO-eviction keeps the set bounded
+   * at `LIMITS.PROCESSED_EVENT_IDS_CAP`.
+   */
+  private markEventProcessed(eventId: string | undefined): void {
+    if (!eventId) return;
+    if (this.processedEventIds.has(eventId)) return;
+    this.processedEventIds.add(eventId);
+    // FIFO eviction: Set preserves insertion order, so keys().next().value
+    // is the oldest entry. Evict in a single step (cheap) per insert at
+    // capacity; no full re-sort needed.
+    while (this.processedEventIds.size > LIMITS.PROCESSED_EVENT_IDS_CAP) {
+      const oldest = this.processedEventIds.keys().next().value;
+      if (oldest === undefined) break;
+      this.processedEventIds.delete(oldest);
+    }
+    this.schedulePersistDedup();
+  }
+
+  /**
+   * Issue #275 — schedule a debounced write of the persistent dedup
+   * sets to storage. Coalesces a burst of EOSE-replay arrivals into a
+   * single storage transaction. Subsequent calls within the debounce
+   * window are no-ops (timer already armed).
+   */
+  private schedulePersistDedup(): void {
+    if (!this.storage || !this.keyManager) return;
+    if (this.persistDedupTimer) return;
+    this.persistDedupTimer = setTimeout(() => {
+      this.persistDedupTimer = null;
+      this.persistDedupNow().catch((err) => {
+        logger.debug('Nostr', 'Persisted dedup write failed (will retry on next mark):', err);
+      });
+    }, LIMITS.PROCESSED_EVENT_IDS_FLUSH_MS);
+  }
+
+  /**
+   * Issue #275 — write the persistent dedup sets to storage. Serialized
+   * via `persistDedupInFlight` so concurrent timer fires (debounce + a
+   * forced flush) don't race on the underlying KV write.
+   */
+  private async persistDedupNow(): Promise<void> {
+    if (!this.storage || !this.keyManager) return;
+    // Serialize against any in-flight write — proper-lockfile in
+    // FileStorageProvider would block anyway, but IndexedDB doesn't,
+    // and overlapping writes risk last-writer-wins of a stale snapshot.
+    if (this.persistDedupInFlight) {
+      await this.persistDedupInFlight.catch(() => undefined);
+    }
+    const inFlight = this.doPersistDedup();
+    this.persistDedupInFlight = inFlight;
+    try {
+      await inFlight;
+    } finally {
+      if (this.persistDedupInFlight === inFlight) {
+        this.persistDedupInFlight = null;
+      }
+    }
+  }
+
+  private async doPersistDedup(): Promise<void> {
+    if (!this.storage || !this.keyManager) return;
+    const pubkey = this.keyManager.getPublicKeyHex();
+    const prefix = pubkey.slice(0, 16);
+    const eventsKey = `${STORAGE_KEYS_GLOBAL.PROCESSED_WALLET_EVENT_IDS}_${prefix}`;
+    const cooldownsKey = `${STORAGE_KEYS_GLOBAL.FAILED_EVENT_COOLDOWNS}_${prefix}`;
+
+    // Snapshot under sync — Set/Map iteration is stable but a concurrent
+    // markEventProcessed can mutate the underlying collection. Array.from
+    // captures a stable view for serialization.
+    const ids = Array.from(this.processedEventIds);
+    const cooldownsArr: Array<[string, { nextRetryAt: number; attempts: number }]> = Array.from(
+      this.failedEventCooldowns.entries(),
+    );
+
+    // Write events + cooldowns independently — they target distinct
+    // KV keys so a partial failure on one shouldn't block the other.
+    try {
+      await this.storage.set(eventsKey, JSON.stringify(ids));
+    } catch (err) {
+      logger.debug('Nostr', 'Persisted dedup: events write failed:', err);
+    }
+    try {
+      await this.storage.set(cooldownsKey, JSON.stringify(cooldownsArr));
+    } catch (err) {
+      logger.debug('Nostr', 'Persisted dedup: cooldowns write failed:', err);
+    }
+  }
+
+  /**
+   * Issue #275 — hydrate the persistent dedup sets from storage on the
+   * first connect/fetchPendingEvents per identity. Idempotent: subsequent
+   * calls are no-ops once `dedupHydrated` is true.
+   *
+   * Failure modes (storage read throw, JSON parse error, malformed
+   * data) all degrade to "start fresh" — the wallet still works, just
+   * pays the cross-process re-dispatch tax once until the next write
+   * cycle repopulates the disk.
+   */
+  private async hydrateProcessedDedup(): Promise<void> {
+    if (this.dedupHydrated) return;
+    if (!this.storage || !this.keyManager) {
+      this.dedupHydrated = true;
+      return;
+    }
+    const pubkey = this.keyManager.getPublicKeyHex();
+    const prefix = pubkey.slice(0, 16);
+    const eventsKey = `${STORAGE_KEYS_GLOBAL.PROCESSED_WALLET_EVENT_IDS}_${prefix}`;
+    const cooldownsKey = `${STORAGE_KEYS_GLOBAL.FAILED_EVENT_COOLDOWNS}_${prefix}`;
+
+    try {
+      const raw = await this.storage.get(eventsKey);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          for (const id of parsed) {
+            if (typeof id === 'string' && id.length > 0) {
+              this.processedEventIds.add(id);
+            }
+          }
+        }
+      }
+    } catch (err) {
+      logger.debug('Nostr', 'hydrateProcessedDedup events parse/read failed:', err);
+    }
+
+    try {
+      const raw = await this.storage.get(cooldownsKey);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          const now = Date.now();
+          let dropped = 0;
+          for (const entry of parsed) {
+            if (
+              Array.isArray(entry) &&
+              entry.length === 2 &&
+              typeof entry[0] === 'string' &&
+              entry[1] !== null &&
+              typeof entry[1] === 'object'
+            ) {
+              const [eventId, meta] = entry as [string, unknown];
+              const m = meta as { nextRetryAt?: unknown; attempts?: unknown };
+              const nextRetryAt = typeof m.nextRetryAt === 'number' ? m.nextRetryAt : NaN;
+              const attempts = typeof m.attempts === 'number' ? m.attempts : NaN;
+              if (
+                Number.isFinite(nextRetryAt) &&
+                Number.isFinite(attempts) &&
+                attempts >= 1 &&
+                attempts < NostrTransportProvider.DURABILITY_MAX_REPLAY_ATTEMPTS
+              ) {
+                // Drop entries whose cooldown elapsed more than one
+                // COOLDOWN_MAX_MS ago — the cooldown is meaningless and
+                // we'd just keep stale clutter. Keep recently-expired
+                // ones because the attempt counter still matters for
+                // budget accumulation.
+                const elapsed = now - nextRetryAt;
+                if (elapsed > NostrTransportProvider.DURABILITY_COOLDOWN_MAX_MS * 2) {
+                  dropped++;
+                  continue;
+                }
+                this.failedEventCooldowns.set(eventId, { nextRetryAt, attempts });
+              }
+            }
+          }
+          if (dropped > 0) {
+            logger.debug('Nostr', `hydrateProcessedDedup: dropped ${dropped} stale cooldown entries`);
+          }
+        }
+      }
+    } catch (err) {
+      logger.debug('Nostr', 'hydrateProcessedDedup cooldowns parse/read failed:', err);
+    }
+
+    this.dedupHydrated = true;
+    logger.debug(
+      'Nostr',
+      `[#275] Persisted dedup hydrated: ${this.processedEventIds.size} event IDs, ${this.failedEventCooldowns.size} cooldown entries`,
+    );
   }
 
   /**
@@ -1249,6 +1988,69 @@ export class NostrTransportProvider implements TransportProvider {
     this.storage.set(storageKey, createdAt.toString()).catch(err => {
       logger.debug('Nostr', 'Failed to save last event timestamp:', err);
     });
+  }
+
+  /**
+   * Issue #272 — return true iff this event ID has a live durability
+   * cooldown. Cleans up the entry when the cooldown has expired so the
+   * map doesn't accumulate stale entries on the read path.
+   */
+  private isInDurabilityCooldown(eventId: string): boolean {
+    const entry = this.failedEventCooldowns.get(eventId);
+    if (!entry) return false;
+    if (Date.now() >= entry.nextRetryAt) {
+      // Cooldown expired — leave the attempts count INTACT (we still
+      // need it so the next failure increments correctly toward the
+      // MAX_REPLAY_ATTEMPTS budget). The entry will be replaced on
+      // the next miss or deleted on the next success.
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Issue #272 — record a durability miss for this event ID and arm
+   * an exponential cooldown. Returns `true` when the per-event replay
+   * budget (`DURABILITY_MAX_REPLAY_ATTEMPTS`) is exhausted — in that
+   * case the caller should advance the `since` cursor (the entry is
+   * deleted by this method to free the slot) so subsequent events
+   * are not blocked indefinitely behind one persistently-failing one.
+   * Local-durability is decoupled from this gate (issue #272 background-
+   * verify patch in `flush-scheduler.ts`), so a persistent miss after
+   * the budget exhausts indicates a genuine local persistence failure
+   * (OrbitDB write timeout / pin POST != 200 / monotonicity violation)
+   * that re-replay alone cannot resolve.
+   */
+  private recordDurabilityMiss(eventId: string): boolean {
+    const prior = this.failedEventCooldowns.get(eventId);
+    const attempts = (prior?.attempts ?? 0) + 1;
+
+    if (attempts >= NostrTransportProvider.DURABILITY_MAX_REPLAY_ATTEMPTS) {
+      this.failedEventCooldowns.delete(eventId);
+      return true;
+    }
+
+    // LRU-style cap: when at capacity, evict the oldest insertion
+    // (Map preserves insertion order, so the first key IS the oldest).
+    // Single-victim eviction per insert is sufficient under typical
+    // replay-flood pressure (14 unique IDs in the §C.2 forensics; cap
+    // of 256 covers >18x that headroom).
+    if (this.failedEventCooldowns.size >= NostrTransportProvider.DURABILITY_COOLDOWN_MAP_CAP) {
+      const oldestKey = this.failedEventCooldowns.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.failedEventCooldowns.delete(oldestKey);
+      }
+    }
+
+    const delayMs = Math.min(
+      NostrTransportProvider.DURABILITY_COOLDOWN_BASE_MS * Math.pow(2, attempts - 1),
+      NostrTransportProvider.DURABILITY_COOLDOWN_MAX_MS,
+    );
+    this.failedEventCooldowns.set(eventId, {
+      nextRetryAt: Date.now() + delayMs,
+      attempts,
+    });
+    return false;
   }
 
   /** Persist the max DM (gift-wrap) event timestamp for the since filter on next connect. */
@@ -1428,12 +2230,35 @@ export class NostrTransportProvider implements TransportProvider {
     }
   }
 
-  private async handleTokenTransfer(event: NostrEvent): Promise<void> {
-    if (!this.identity) return;
+  private async handleTokenTransfer(event: NostrEvent): Promise<boolean> {
+    if (!this.identity) return true;
 
-    // Decrypt content
+    // Decrypt content (the `token_transfer:` prefix is stripped inside
+    // `decryptContent` → `stripContentPrefix`, so by the time we get
+    // `content` it's a plain JSON document — no extra trimming required
+    // here).
     const content = await this.decryptContent(event.content, event.pubkey);
-    const payload = JSON.parse(content) as TokenTransferPayload;
+
+    // T.2.E — shape-agnostic inbound parsing.
+    //
+    // `decodeTransferPayload` (T.1.D) is structurally paranoid: it parses
+    // the JSON, runs `isUxfTransferPayload`, and either returns a typed
+    // union value or throws `BUNDLE_REJECTED_MALFORMED_ENVELOPE`. The
+    // outer `handleEvent` switch catches this error and logs at debug
+    // level — same fail-soft behavior as the pre-T.2.E `JSON.parse` path,
+    // which would have thrown `SyntaxError` on bad bytes.
+    //
+    // The handler downstream (PaymentsModule) discriminates by shape:
+    // `kind === 'uxf-car' | 'uxf-cid'` routes to the new UXF receive
+    // path (T.7.A), absence of `kind` routes to the legacy adapter
+    // (existing four-shape `processTokenTransfer` flow).
+    //
+    // Note that `decodeTransferPayload` deliberately collapses every
+    // failure mode (non-JSON, wrong type, missing fields, unknown
+    // discriminator) to a single error code so we don't have to fan-out
+    // here — the receiver's idempotency layer (§5.6) treats every kind
+    // of malformed envelope the same way: drop and move on.
+    const payload = decodeTransferPayload(content);
 
     const transfer: IncomingTokenTransfer = {
       id: event.id,
@@ -1444,13 +2269,53 @@ export class NostrTransportProvider implements TransportProvider {
 
     this.emitEvent({ type: 'transfer:received', timestamp: Date.now() });
 
+    // At-least-once invariant: collect durability signal from every
+    // registered handler. If ANY handler returns `false` (could not
+    // persist), or throws, we treat the whole event as non-durable so
+    // the transport refuses to advance `lastEventTs`. The legacy
+    // contract (handlers returning `void` / `undefined`) maps to
+    // `true` (durable) so existing wrappers do not regress to
+    // "never ack".
+    //
+    // Issue #223 / #247 — the pre-Mux window (between
+    // `transport.connect()` and `mux.suppressSubscriptions()` in
+    // Sphere.ensureTransportMux) leaves this provider's own subscription
+    // live while PaymentsModule has registered its handler on the
+    // *AddressTransportAdapter*, not on the outer provider. An empty
+    // `transferHandlers` set previously produced a vacuous
+    // `allDurable = true`, which advanced `lastEventTs` and silently
+    // dropped the event; the issue #223 fix flipped it to `false`,
+    // which produced the persistent "TOKEN_TRANSFER ... not durable"
+    // replay storm observed in manual-test-full-recovery.sh.
+    //
+    // Issue #247 fix: buffer the transfer for delivery to the FIRST
+    // handler that registers (`onTokenTransfer` drains the buffer).
+    // Still return `false` to keep `lastEventTs` pinned — if this
+    // process exits before any handler registers, the event must
+    // replay on next reconnect. The drain advances `lastEventTs`
+    // per-event on successful delivery, so a handler that arrives
+    // later in the same session avoids the replay.
+    if (this.transferHandlers.size === 0) {
+      this.pendingTransfers.push({ transfer, createdAtSec: event.created_at });
+      logger.debug(
+        'Nostr',
+        `Buffered TOKEN_TRANSFER ${event.id?.slice(0, 12)} — no handler registered yet ` +
+          `(buffer size=${this.pendingTransfers.length})`,
+      );
+      return false;
+    }
+
+    let allDurable = true;
     for (const handler of this.transferHandlers) {
       try {
-        await handler(transfer);
+        const result = await handler(transfer);
+        if (result === false) allDurable = false;
       } catch (error) {
         logger.debug('Nostr', 'Transfer handler error:', error);
+        allDurable = false;
       }
     }
+    return allDurable;
   }
 
   private async handlePaymentRequest(event: NostrEvent): Promise<void> {
@@ -1750,11 +2615,60 @@ export class NostrTransportProvider implements TransportProvider {
     }
   }
 
+  /**
+   * Issue #166 P2 #3 — Verify a previously published TOKEN_TRANSFER
+   * event is still persisted by querying the relay for its event id.
+   *
+   * Implements the {@link TransportProvider.verifyTokenTransferRetained}
+   * contract: NEVER throws — converts query failures (no connection,
+   * timeout, malformed response) to `'unverifiable'`. The verifier
+   * worker treats `'unverifiable'` as "retry next cycle"; only
+   * `'missing'` triggers a retention-warning event.
+   */
+  async verifyTokenTransferRetained(
+    eventId: string,
+  ): Promise<'retained' | 'missing' | 'unverifiable'> {
+    if (typeof eventId !== 'string' || eventId.length === 0) {
+      // Defense-in-depth: empty id would query every event on the
+      // relay (huge response). Treat as unverifiable.
+      return 'unverifiable';
+    }
+    if (!this.nostrClient?.isConnected()) {
+      return 'unverifiable';
+    }
+    try {
+      const found = await this.queryEvents({
+        ids: [eventId],
+        limit: 1,
+      });
+      return found.length > 0 ? 'retained' : 'missing';
+    } catch {
+      // Any query throw — relay timeout, lost connection mid-query,
+      // unparseable response — degrades to unverifiable so the worker
+      // does not false-positive a retention warning.
+      return 'unverifiable';
+    }
+  }
+
   async fetchPendingEvents(): Promise<void> {
     if (!this.nostrClient?.isConnected() || !this.keyManager) {
       throw new SphereError('Transport not connected', 'TRANSPORT_ERROR');
     }
 
+    // Issue #275 — hydrate persistent dedup BEFORE pulling EOSE backlog.
+    // Without this, the first CLI command of a new process would walk
+    // the full relay backlog once (pre-fix #275 §C soak: 169 dispatches
+    // across 15 unique ids). This is the same hook installed in
+    // `subscribeToEvents` for the long-lived subscription path; CLIs
+    // that only call `fetchPendingEvents` (no persistent subscription)
+    // also need the hydrate to take effect.
+    await this.hydrateProcessedDedup();
+
+    // Issue #274 — perf instrumentation. Called once per `sphere.payments.receive()`
+    // and once per `ensureSync(sphere, 'full')`. Per perf-engineer, the CLI runs
+    // ensureSync at the start of every command — making this span the cheapest
+    // diagnostic for cross-process replay-storm volume.
+    const __span = logger.time('transport:nostr', 'fetchPendingEvents', {});
     const nostrPubkey = this.keyManager.getPublicKeyHex();
 
     const walletFilter = new Filter();
@@ -1822,14 +2736,33 @@ export class NostrTransportProvider implements TransportProvider {
     // Unsubscribe AFTER the Promise resolves — subId is now the real subscription ID.
     // This also ensures onEvent cannot fire while we iterate events below.
     if (subId) { try { client.unsubscribe(subId); } catch { /* disconnected */ } }
+    __span.mark('eose', { eventCount: events.length });
 
     // Process collected events sequentially (dedup skips already-processed ones)
+    const __dispatchT0 = Date.now();
     for (const event of events) {
       await this.handleEvent(event);
     }
+    __span.end({
+      eventCount: events.length,
+      dispatchDurationMs: Date.now() - __dispatchT0,
+    });
   }
 
-  private async queryEvents(filterObj: NostrFilter): Promise<NostrEvent[]> {
+  /**
+   * Default upper bound for `queryEvents` REQ→EOSE wait. Was 15 s historically
+   * but real-network testnet runs (Phase 9 e2e) repeatedly observed the relay
+   * fluctuating between healthy (<200 ms EOSE) and degraded (10-25 s EOSE,
+   * sometimes never EOSE). 60 s pushes the timeout past every degraded
+   * sample we've captured while still failing fast on real "no such event"
+   * queries. Override per call via the second argument.
+   */
+  private static readonly DEFAULT_QUERY_TIMEOUT_MS = 60000;
+
+  private async queryEvents(
+    filterObj: NostrFilter,
+    timeoutMs: number = NostrTransportProvider.DEFAULT_QUERY_TIMEOUT_MS,
+  ): Promise<NostrEvent[]> {
     if (!this.nostrClient || !this.nostrClient.isConnected()) {
       throw new SphereError('No connected relays', 'TRANSPORT_ERROR');
     }
@@ -1851,9 +2784,9 @@ export class NostrTransportProvider implements TransportProvider {
         if (subId) {
           try { client.unsubscribe(subId); } catch { /* disconnected */ }
         }
-        logger.warn('Nostr', `queryEvents timed out after 15s, returning ${events.length} event(s)`, { kinds: filterObj.kinds, limit: filterObj.limit });
+        logger.warn('Nostr', `queryEvents timed out after ${timeoutMs}ms, returning ${events.length} event(s)`, { kinds: filterObj.kinds, limit: filterObj.limit });
         resolve(events);
-      }, 15000);
+      }, timeoutMs);
 
       const settle = () => {
         if (settled) return;
@@ -1927,6 +2860,13 @@ export class NostrTransportProvider implements TransportProvider {
     // Use 32-byte Nostr pubkey (x-coordinate only), not 33-byte compressed key
     const nostrPubkey = this.keyManager.getPublicKeyHex();
     logger.debug('Nostr', 'Subscribing with Nostr pubkey:', nostrPubkey);
+
+    // Issue #275 — hydrate persistent dedup BEFORE the relay since-filter
+    // re-delivers backlog events. Without this, the relay's EOSE burst
+    // would hit the empty in-memory set, re-dispatch every event, and
+    // pay the parse/adapter/addToken cost for events the previous
+    // process already finalized.
+    await this.hydrateProcessedDedup();
 
     // Determine 'since' filter from persisted last event timestamp.
     // - Existing wallet: resume from last processed event (inclusive >=, dedup handles replays)

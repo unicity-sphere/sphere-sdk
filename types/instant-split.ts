@@ -315,6 +315,17 @@ export interface InstantSplitOptions {
   /** Callback when burn is completed */
   onBurnCompleted?: (burnTxJson: string) => void;
 
+  /**
+   * Loop2-C2 — fired AFTER the burn commitment's submit response is
+   * SUCCESS/REQUEST_ID_EXISTS but BEFORE the proof wait. Signals the
+   * caller that the burn IS durable on-chain regardless of any
+   * subsequent throw (proof wait timeout, mint submit failure, etc.).
+   * The dispatcher uses this to mark `committedOnChainTokenIds`
+   * exactly when the source becomes on-chain spent — so the outer
+   * catch's restoration logic does NOT restore a burnt source.
+   */
+  onBurnSubmitted?: () => void;
+
   /** Callback when Nostr delivery is completed */
   onNostrDelivered?: (eventId: string) => void;
 
@@ -499,4 +510,133 @@ export interface BuildSplitBundleResult {
   splitGroupId: string;
   /** Call this after transport delivery to start background mint proof + change token creation */
   startBackground: () => Promise<void>;
+
+  // ---------------------------------------------------------------
+  // #142 UXF instant-split wiring — exposed artifacts for the UXF
+  // dispatcher (dispatchUxfInstantSend) to assemble a recipient-shaped
+  // SDK Token JSON for ingestion into the UXF bundle.
+  //
+  // The legacy V6 path (CombinedTransferBundleV6) embeds the full V5
+  // bundle on the wire and reconstructs on the recipient side. The
+  // UXF path instead ships standard SDK Token JSON ({genesis, state,
+  // transactions}) with `inclusionProof: null` on every transition —
+  // the recipient's chain-walker resolves proofs when the aggregator
+  // has them. For that to work, the recipient mint and transfer
+  // commitments MUST be submitted to the aggregator BEFORE the UXF
+  // bundle ships (otherwise the chain-walker sees them as unknown
+  // forever).
+  //
+  // The legacy `startBackground()` callback batches all three
+  // commitment submissions into the background — too late for the
+  // UXF path. {@link submitCommitmentsImmediate} factors out the
+  // commit submissions (no proof waits, ~50ms) so the UXF dispatcher
+  // can run them before transport. The slow part — waiting for the
+  // sender's mint proof and constructing the change token — stays in
+  // {@link awaitChangeTokenWithProofs} and runs after transport ack.
+  // ---------------------------------------------------------------
+
+  /**
+   * Submit the sender mint, recipient mint, and transfer commitments
+   * to the aggregator, await the recipient mint inclusion proof,
+   * and return the proven recipient genesis JSON ready for ingestion
+   * as a UXF token genesis. Throws SphereError if any submission
+   * fails (status not SUCCESS/REQUEST_ID_EXISTS) or the proof wait
+   * fails.
+   *
+   * **Why we wait for the recipient mint proof here** (Loop4 e2e fix):
+   * the UXF bundle format requires every token's genesis to carry a
+   * proven `inclusionProof`. Without this wait, `pkg.ingestAll`
+   * throws on the sender side because `deconstructInclusionProof`
+   * can't handle a null inclusionProof on the Genesis shape.
+   *
+   * The change-token recovery (waiting for the SENDER mint proof
+   * and minting the local change token) remains in
+   * {@link awaitChangeTokenWithProofs} so it can run fire-and-forget
+   * post-transport.
+   *
+   * Optional — set only when buildSplitBundle is invoked with
+   * `skipBackground: true`. Legacy V6 callers (PaymentsModule
+   * line ~3683) leave this undefined and rely on the
+   * `startBackground()` path that submits in the background.
+   */
+  readonly submitCommitmentsImmediate?: () => Promise<{
+    /**
+     * JSON form of the PROVEN recipient mint transaction —
+     * `{data, inclusionProof}`. Replaces the previous
+     * `recipientMintDataJson` (data-only) shape because the UXF
+     * format requires a non-null `inclusionProof` on every Genesis.
+     */
+    readonly recipientMintProvenGenesisJson: unknown;
+    /**
+     * Loop4-S2 — DataHash imprint hex of the transfer commitment's
+     * `transactionData.calculateHash()`. The dispatcher writes it
+     * into `_senderRequestContextMap` so the sender-side §6.1
+     * finalization worker can resolve the per-requestId context
+     * and detect race-lost outcomes. Without this, the worker's
+     * resolver returns null → hard-fail 'structural' → cascade
+     * abort → `transfer:confirmed` never emits.
+     */
+    readonly transferTransactionHashHex: string;
+    /**
+     * Loop4-S2 — Stable canonical JSON of the transfer commitment's
+     * authenticator. Same purpose as `transferTransactionHashHex`
+     * (per-requestId context for race-lost detection). Aggregator
+     * proofs carry the same shape; byte-equality between this and
+     * `proof.authenticator` JSON resolves the §6.3 same-value vs
+     * different-value branch.
+     */
+    readonly transferAuthenticatorJsonStr: string;
+  }>;
+
+  /**
+   * After submitCommitmentsImmediate, wait for the sender's mint
+   * proof, construct the change token via Token.mint, and invoke
+   * `onChangeTokenCreated`. Fire-and-forget from the UXF dispatcher
+   * (failure is logged, not propagated — the bundle has already
+   * shipped).
+   *
+   * Optional — see submitCommitmentsImmediate.
+   */
+  readonly awaitChangeTokenWithProofs?: () => Promise<void>;
+
+  /**
+   * Hex-encoded requestId of the transfer commitment (the new
+   * transition that ships in the recipient token JSON's transactions
+   * array). Used by the UXF dispatcher to populate
+   * {@link InstantCommitResult.requestIdHex} for the split path.
+   *
+   * Optional — see submitCommitmentsImmediate.
+   */
+  readonly transferRequestIdHex?: string;
+
+  /**
+   * JSON form of the recipient's mint transaction data. Goes into
+   * the recipient token JSON's `genesis.data` field with
+   * `inclusionProof: null`. The recipient's chain-walker resolves
+   * the proof when the aggregator returns it.
+   *
+   * Optional — see submitCommitmentsImmediate.
+   */
+  readonly recipientMintDataJson?: unknown;
+
+  /**
+   * JSON form of the recipient's minted state (after the mint, before
+   * the transfer). Goes into the recipient token JSON's `state` field.
+   * The recipient needs this to reconstruct the predicate before
+   * applying the transfer (the recipient cannot derive sender-keyed
+   * predicates from their own signing service).
+   *
+   * Optional — see submitCommitmentsImmediate.
+   */
+  readonly recipientMintedStateJson?: unknown;
+
+  /**
+   * JSON form of the transfer transaction's `transactionData`
+   * (recipient address + salt + nametags). Goes into the recipient
+   * token JSON's `transactions[0].data` field with
+   * `inclusionProof: null`.
+   *
+   * Optional — see submitCommitmentsImmediate.
+   */
+  readonly transferTxDataJson?: unknown;
 }
