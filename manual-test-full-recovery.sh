@@ -120,6 +120,48 @@ wait_for_log() {
   return 1
 }
 
+# Poll `sphere invoice status $INVOICE` until peer2 has replicated the
+# invoice, OR fail after TIMEOUT seconds. Cross-device invoice visibility
+# requires three legs to complete:
+#
+#   1. Sender (Bob)'s profile-token IPFS publish lands durably.
+#   2. Sender's Nostr at-least-once mux acks (60s cooldown on retry).
+#   3. Receiver (peer2-alice)'s OrbitDB replicates the accounting key.
+#
+# Under flaky testnet conditions (e.g. unicity-ipfs1.dyndns.org HTTP 500
+# observed 2026-05-29), any leg can stall. Without this loop a transient
+# stall trips `set -euo pipefail` and aborts the soak at §C.4 even though
+# the wallet code is correct. Treats ONLY "No invoice found" as transient;
+# other errors (e.g. "Database is not open") still propagate immediately.
+wait_for_invoice_visible() {
+  local invoice="$1" output_file="$2" timeout="${3:-150}"
+  local elapsed=0 step=15 rc
+  : > "$output_file"
+  while (( elapsed < timeout )); do
+    if sphere invoice status "$invoice" > "$output_file" 2>&1; then
+      if ! grep -q 'No invoice found' "$output_file"; then
+        cat "$output_file"
+        return 0
+      fi
+      # Found a "No invoice" — transient. Retry after sleep.
+    else
+      rc=$?
+      if ! grep -q 'No invoice found' "$output_file"; then
+        # CLI failed for a non-transient reason (e.g. DB lock, network
+        # config). Surface immediately so the soak fails informatively.
+        cat "$output_file" >&2
+        echo "sphere invoice status failed with rc=$rc (non-transient — not retrying)" >&2
+        return "$rc"
+      fi
+    fi
+    sleep "$step"
+    elapsed=$((elapsed + step))
+  done
+  cat "$output_file" >&2
+  echo "TIMEOUT (${timeout}s) waiting for peer2 to see invoice $invoice — testnet replication stalled" >&2
+  return 1
+}
+
 # Normalize a snapshot before byte-comparison. Strips lines that are
 # legitimately volatile across runs but do NOT reflect logical wallet
 # state. False positives observed on 2026-05-29 (issue: page-freeze):
@@ -412,7 +454,10 @@ cd "$PEER2_BOB"   && sphere daemon stop || true
 sleep 2
 
 cd "$PEER2_ALICE"
-sphere invoice status "$INV" 2>&1 | tee "$SNAP/peer2-alice-invoice-status.log"
+# Wait for cross-device replication to complete before asserting peer2's
+# view. Under flaky testnet conditions the invoice can take 30s+ to land.
+# Treats "No invoice found" as transient; other errors propagate.
+wait_for_invoice_visible "$INV" "$SNAP/peer2-alice-invoice-status.log" 150
 sphere balance               | tee "$SNAP/peer2-alice-postC-balance.txt"
 
 cd "$PEER2_BOB"
