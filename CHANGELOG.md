@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-05-29
+
 ### Changed (BREAKING — wire-shape default flip)
 - **UXF feature flags now default-ON** (T.8.D part 1 of 2 — production cutover, NO legacy code path removal). All four UXF feature flags moved from default `false` → default `true` in `PaymentsModuleConfig.features`:
   - `senderUxf` — `payments.send({transferMode:'instant'})` (the public default) now routes through the new UXF instant-sender; conservative-mode also routes through the UXF orchestrator.
