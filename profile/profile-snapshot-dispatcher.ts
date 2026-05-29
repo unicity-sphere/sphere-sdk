@@ -158,6 +158,89 @@ export interface ApplySnapshotResult {
 const ADDRESS_ID_PREFIX_RE = /^(DIRECT_[0-9a-f]{6}_[0-9a-f]{6})\./;
 
 /**
+ * Issue #335 Phase 2.5 — legacy → profile key normalization table for
+ * single-blob per-address keys.
+ *
+ * **Why this exists.** The lean-snapshot publisher reads keys via
+ * `ProfileStorageProvider.keys()` which translates OrbitDB profile-form
+ * keys (`${addressId}.tombstones`) back to legacy form
+ * (`${addressId}_tombstones`) for backward compatibility with the
+ * non-Profile `StorageProvider` interface. The reverse-mapping fires
+ * only when a key matches a static `PROFILE_KEY_MAPPING` per-address
+ * suffix (e.g., `.tombstones`, `.invalidatedNametags`). Per-entry keys
+ * like `${addressId}.outbox.${id}` are NOT remapped — their suffix
+ * (`.outbox.${id}`) doesn't match the static `.outbox` suffix.
+ *
+ * Consequence pre-Phase-2.5: snapshot entries for single-blob keys
+ * carry the legacy form (`${addressId}_tombstones`). The dispatcher
+ * routes by profile-form prefix (`${addressId}.tombstones`) — no match,
+ * silent drop. The Phase 2 `SingleBlobSyncWriter` was correctly wired
+ * via `factory.ts:writersFor()` but never fired because the dispatcher
+ * pre-filter `entries.filter(e => e.key.startsWith(keyPrefix))` never
+ * matched a single entry. Soak `bob-peer1-vs-peer2-after` failed with
+ * the same divergence Phase 2 was meant to fix.
+ *
+ * **Per-entry writers are unaffected.** Outbox/sent/dispositions/
+ * finalization/recipient-context entries flow as `${addressId}.${prefix}.${id}`
+ * — the suffix-match in `reverseMapProfileKey` doesn't trigger for
+ * those (the suffix is `.${prefix}.${id}`, not `.${prefix}`), so they
+ * stay in profile form end-to-end.
+ *
+ * **Scope.** This table covers ONLY the single-blob per-address keys
+ * Phase 2 added writers for (`tombstones`, `invalidatedNametags`).
+ * Adding more single-blob writers in the future requires extending
+ * both this table AND `factory.ts:writersFor()`. The dispatcher fails
+ * closed on unlisted legacy suffixes — the entry is dispatched in its
+ * legacy form, which downstream writers will not match, exactly
+ * mirroring the pre-fix behaviour for those (currently unrouted)
+ * keys.
+ *
+ * Keep the table sorted by `legacySuffix` for stable iteration.
+ */
+const PER_ADDRESS_LEGACY_SUFFIX_MAP: ReadonlyArray<{
+  readonly legacySuffix: string;
+  readonly profileSuffix: string;
+}> = [
+  { legacySuffix: '_invalidatedNametags', profileSuffix: '.invalidatedNametags' },
+  { legacySuffix: '_tombstones', profileSuffix: '.tombstones' },
+];
+
+/**
+ * Match the leading addressId (anchored, hex-strict) so the
+ * normalization step cannot accidentally pick up a key like
+ * `not_a_direct_addr_tombstones`. Mirrors the strictness of
+ * {@link ADDRESS_ID_PREFIX_RE} but without the trailing `.` — the
+ * trailing delimiter (`_` or `.`) is appended by the suffix check.
+ */
+const ADDRESS_ID_BARE_RE = /^DIRECT_[0-9a-f]{6}_[0-9a-f]{6}/;
+
+/**
+ * Issue #335 Phase 2.5 — normalize a snapshot entry's key from legacy
+ * form to profile form when it matches the
+ * {@link PER_ADDRESS_LEGACY_SUFFIX_MAP} table. Returns the input
+ * unchanged when no mapping applies — per-entry keys, bundle keys, and
+ * any not-yet-covered single-blob key pass through verbatim.
+ *
+ * Pure function; safe to call N times.
+ */
+function normalizeEntryKey(key: string): string {
+  // Cheap reject when the key isn't even an addressId-prefixed key.
+  const addrMatch = ADDRESS_ID_BARE_RE.exec(key);
+  if (addrMatch === null) return key;
+  const addrEnd = addrMatch[0].length;
+  // Must be followed by `_` to be a legacy form candidate. `.` form is
+  // already profile-form (or per-entry) and needs no rewrite.
+  if (key[addrEnd] !== '_') return key;
+  const suffixFromAddr = key.slice(addrEnd);
+  for (const { legacySuffix, profileSuffix } of PER_ADDRESS_LEGACY_SUFFIX_MAP) {
+    if (suffixFromAddr === legacySuffix) {
+      return key.slice(0, addrEnd) + profileSuffix;
+    }
+  }
+  return key;
+}
+
+/**
  * Decode a base64-encoded ciphertext blob into raw bytes. Mirrors the
  * encoding used by `profile-storage-provider.ts:getEncryptedRaw` which
  * is what the lean-snapshot builder reads.
@@ -230,8 +313,20 @@ export async function runProfileSnapshotJoin(
 
   // 1. Decode base64 once. Reuse the resulting bytes for every writer's
   //    prefix-filtered view via `Array.prototype.filter` — no copies.
+  //
+  //    Issue #335 Phase 2.5 — normalize legacy-form single-blob keys
+  //    (`${addr}_tombstones`, `${addr}_invalidatedNametags`) to profile
+  //    form (`${addr}.tombstones`, `${addr}.invalidatedNametags`). The
+  //    lean-snapshot publisher's `storage.keys()` call returns legacy
+  //    form for these via `reverseMapProfileKey`, but the Phase 2
+  //    `SingleBlobSyncWriter` is wired with profile-form `keyPrefix`.
+  //    Without this normalization the dispatcher's pre-filter
+  //    `entries.filter(e.key.startsWith(keyPrefix))` slices an empty
+  //    array and the writer is never called — Phase 2's wiring is
+  //    correct, the entries simply never reach it. See
+  //    `normalizeEntryKey` doc-comment for the full rationale.
   const entries: SnapshotEntry[] = snapshot.entries.map((e) => ({
-    key: e.key,
+    key: normalizeEntryKey(e.key),
     encryptedValue: base64ToBytes(e.value),
   }));
 
@@ -322,4 +417,10 @@ export async function runProfileSnapshotJoin(
 export const __internal = {
   base64ToBytes,
   ADDRESS_ID_PREFIX_RE,
+  // Issue #335 Phase 2.5 — exposed so unit tests can pin the legacy →
+  // profile key mapping table without re-deriving it from the storage
+  // layer's PROFILE_KEY_MAPPING (which would couple the dispatcher
+  // tests to unrelated mapping changes).
+  PER_ADDRESS_LEGACY_SUFFIX_MAP,
+  normalizeEntryKey,
 };

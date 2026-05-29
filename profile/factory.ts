@@ -762,6 +762,32 @@ export function createProfileProviders(
             writer: dispoQuad.auditOrphan,
           });
         }
+        // Issue #335 — register sync writers for the two single-blob
+        // OrbitDB keys (`${addr}.tombstones` and
+        // `${addr}.invalidatedNametags`). Every other per-address key
+        // is per-entry with a trailing-dot prefix; these two are the
+        // last single-blob holdouts. Before this registration the
+        // lean-snapshot dispatcher silently dropped them — see
+        // SingleBlobSyncWriter's module doc-comment and the issue #335
+        // RCA for the soak failure that surfaced the gap. The writer's
+        // `keyPrefix` here is the EXACT key (no trailing dot); the
+        // writer itself enforces exact-key match in `joinSnapshot()`
+        // as defense in depth.
+        const tombstonesWriter = storage.buildTombstonesSyncWriter(addressId);
+        if (tombstonesWriter !== null) {
+          writers.push({
+            keyPrefix: `${addressId}.tombstones`,
+            writer: tombstonesWriter,
+          });
+        }
+        const invalidatedNametagsWriter =
+          storage.buildInvalidatedNametagsSyncWriter(addressId);
+        if (invalidatedNametagsWriter !== null) {
+          writers.push({
+            keyPrefix: `${addressId}.invalidatedNametags`,
+            writer: invalidatedNametagsWriter,
+          });
+        }
         return writers;
       },
       getBundleIndex: () => tokenStorage.getBundleIndex(),
