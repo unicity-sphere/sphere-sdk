@@ -585,11 +585,18 @@ export class AggregatorPinger implements Pinger {
     if (signal.aborted) return 'down';
     if (this.provider) {
       try {
-        // `getCurrentRound()` returns 0 on the legacy "no aggregator client"
-        // fallback path — treat that as degraded so the UI shows trouble
-        // without locking the wallet into hard offline.
+        // Any finite numeric round (including 0) is a structured response
+        // from the aggregator and counts as alive — matches the reference
+        // infra-probe semantics (any JSON-RPC `result` ⇒ alive) and the
+        // URL-mode fallback below. Fresh shards / between-batch states
+        // can legitimately surface a `0` block height; demoting those to
+        // `'degraded'` would surface a false "Aggregator unavailable" in
+        // the wallet UI. The legacy "no aggregator client" stub path
+        // (UnicityAggregatorProvider before `initialize()`) now throws
+        // instead of returning `0`, so the catch below routes it to
+        // `'down'` as intended.
         const round = await this.provider.getCurrentRound();
-        if (typeof round === 'number' && Number.isFinite(round) && round > 0) {
+        if (typeof round === 'number' && Number.isFinite(round) && round >= 0) {
           return 'up';
         }
         return 'degraded';
