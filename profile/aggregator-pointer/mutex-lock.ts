@@ -227,6 +227,163 @@ export interface NodeLockPrimitives {
   acquireFileLock(path: string, staleMs: number): Promise<() => Promise<void>>;
 }
 
+/**
+ * Issue #336: PID-liveness probe for stale file locks.
+ *
+ * proper-lockfile's `stale` parameter is mtime-based: it considers the lock
+ * stale only after `stale` ms have elapsed since the lockfile was last
+ * touched. FILE_LOCK_STALE_MS is calibrated to ~15min to cover the worst-case
+ * publishOnce hold time for browser/daemon contexts — far longer than the
+ * 30s mutex acquire timeout. A CLI process that crashes (SIGKILL, OOM, soak
+ * teardown) before releasing its lock leaves the next CLI invocation
+ * spinning for 30s and giving up with PUBLISH_BUSY even though no process
+ * holds the lock.
+ *
+ * The fix is to supplement mtime-staleness with a PID-liveness probe:
+ *
+ *   1. After acquiring the lock, write a sibling `${lockPath}.owner.json`
+ *      file containing {pid, hostname, acquiredAt}.
+ *   2. When a contender encounters ELOCKED, read the owner metadata. If the
+ *      hostname matches the local host AND `process.kill(pid, 0)` reports
+ *      the PID is dead (ESRCH), forcibly remove the lock dir + metadata and
+ *      retry the acquire. This bypasses the FILE_LOCK_STALE_MS window
+ *      entirely for the (common) crashed-CLI-on-same-host case.
+ *   3. Cross-host or unreadable metadata: skip the probe and fall back to
+ *      the existing FILE_LOCK_STALE_MS path. PID probing across hosts is
+ *      meaningless (and dangerous — pid 1234 on this host has nothing to
+ *      do with pid 1234 on another host).
+ *
+ * Safety invariants (DEFENSIVE — false-positive "dead" detection causes
+ * data corruption from concurrent writers):
+ *   - If hostname mismatch → treat as alive (skip probe).
+ *   - If metadata file missing/unreadable/malformed → treat as alive
+ *     (we don't know who holds it).
+ *   - If PID equals our own process.pid → treat as alive (defensive; the
+ *     in-process async-mutex already prevents this, but belt-and-suspenders).
+ *   - If process.kill(pid, 0) throws EPERM → treat as alive (process
+ *     exists but is owned by another user).
+ *   - If process.kill(pid, 0) succeeds → alive.
+ *   - Only ESRCH (no such process) is treated as dead.
+ *   - Any other error from kill/fs → treat as alive (conservative fallback).
+ *
+ * The steal step (rmdir + unlink) is best-effort and races against other
+ * contenders attempting the same steal — but the subsequent
+ * proper-lockfile mkdir is atomic (O_EXCL), so only one steal-then-acquire
+ * sequence can succeed even with concurrent stealers.
+ */
+interface LockOwnerMetadata {
+  readonly pid: number;
+  readonly hostname: string;
+  readonly acquiredAt: number;
+}
+
+const OWNER_METADATA_SUFFIX = '.owner.json';
+
+/**
+ * Read and parse owner metadata from a sibling .owner.json file.
+ * Returns null on ANY failure — caller treats null as "unknown owner;
+ * assume alive". The conservative default avoids false-positive steals
+ * that would cause concurrent-writer data corruption.
+ */
+async function readOwnerMetadata(lockFilePath: string): Promise<LockOwnerMetadata | null> {
+  try {
+    const { readFile } = await import('node:fs/promises');
+    const raw = await readFile(lockFilePath + OWNER_METADATA_SUFFIX, 'utf8');
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      parsed === null ||
+      typeof parsed !== 'object' ||
+      typeof (parsed as { pid?: unknown }).pid !== 'number' ||
+      !Number.isInteger((parsed as { pid: number }).pid) ||
+      (parsed as { pid: number }).pid <= 0 ||
+      typeof (parsed as { hostname?: unknown }).hostname !== 'string' ||
+      (parsed as { hostname: string }).hostname.length === 0 ||
+      typeof (parsed as { acquiredAt?: unknown }).acquiredAt !== 'number' ||
+      !Number.isFinite((parsed as { acquiredAt: number }).acquiredAt)
+    ) {
+      return null;
+    }
+    return parsed as LockOwnerMetadata;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Write owner metadata to the sibling .owner.json file. Failures are
+ * logged but non-fatal — the lock is still held by proper-lockfile; we
+ * simply lose the PID-probe optimization for any future contender.
+ */
+async function writeOwnerMetadata(lockFilePath: string): Promise<void> {
+  try {
+    const { writeFile } = await import('node:fs/promises');
+    const os = await import('node:os');
+    const meta: LockOwnerMetadata = {
+      pid: process.pid,
+      hostname: os.hostname(),
+      acquiredAt: Date.now(),
+    };
+    await writeFile(lockFilePath + OWNER_METADATA_SUFFIX, JSON.stringify(meta), 'utf8');
+  } catch {
+    /* non-fatal — see comment above */
+  }
+}
+
+/**
+ * Best-effort cleanup of the owner metadata file on release.
+ */
+async function removeOwnerMetadata(lockFilePath: string): Promise<void> {
+  try {
+    const { unlink } = await import('node:fs/promises');
+    await unlink(lockFilePath + OWNER_METADATA_SUFFIX);
+  } catch {
+    /* non-fatal — leftover metadata is harmless; the next acquire will
+       overwrite it, and stale metadata is treated conservatively */
+  }
+}
+
+/**
+ * Probe whether a given (hostname, pid) pair represents a still-running
+ * process on the LOCAL host. Returns true if alive (or unknown — the
+ * conservative default), false ONLY if we can prove the PID is dead.
+ *
+ * Cross-host probing is meaningless — pid N on host A has nothing to do
+ * with pid N on host B. We short-circuit to "alive" in that case.
+ */
+async function isLockHolderAlive(meta: LockOwnerMetadata): Promise<boolean> {
+  let localHostname: string;
+  try {
+    const os = await import('node:os');
+    localHostname = os.hostname();
+  } catch {
+    return true; // cannot determine local hostname → conservative
+  }
+  if (meta.hostname !== localHostname) {
+    return true; // cross-host → skip PID probe; fall back to mtime-based stale
+  }
+  if (meta.pid === process.pid) {
+    // Self-PID. In-process async-mutex layer prevents reaching here, but
+    // defend anyway: treat self as alive — we never want to "steal" our
+    // own live lock.
+    return true;
+  }
+  try {
+    // signal 0 = existence check; no signal delivered.
+    // Returns true → process exists. We never reach the truthy branch in
+    // a way that means "dead"; the dead path is the ESRCH catch below.
+    process.kill(meta.pid, 0);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === 'ESRCH') {
+      return false; // proven dead
+    }
+    // EPERM: process exists but we lack permission to signal — treat as alive.
+    // Anything else: conservative — treat as alive.
+    return true;
+  }
+}
+
 async function defaultNodeLockPrimitives(lockFilePath: string): Promise<NodeLockPrimitives> {
   const { Mutex } = await import('async-mutex');
   const mutex = new Mutex();
@@ -236,9 +393,79 @@ async function defaultNodeLockPrimitives(lockFilePath: string): Promise<NodeLock
       const lockfile = await import('proper-lockfile');
       const { writeFile } = await import('node:fs/promises');
       await writeFile(p, '', { flag: 'a' });
-      return lockfile.lock(p, { stale: staleMs, realpath: false, retries: { retries: 0 } });
+      // Issue #336: before each acquire attempt, check whether an existing
+      // lock dir is held by a dead PID on the local host. If so, force-clean
+      // it so the immediate mkdir below can succeed. This is best-effort;
+      // any failure falls through to the normal proper-lockfile acquire
+      // (which then either succeeds, returns ELOCKED for caller retry, or
+      // reaps via mtime-staleness after FILE_LOCK_STALE_MS).
+      await maybeStealDeadLock(p);
+      const release = await lockfile.lock(p, {
+        stale: staleMs,
+        realpath: false,
+        retries: { retries: 0 },
+      });
+      // We hold the lock now — record our ownership for future contenders.
+      await writeOwnerMetadata(p);
+      // Wrap release so the metadata file is cleaned up before the lock dir.
+      // Order matters: if we removed the lock dir first, a contender could
+      // mkdir between our two cleanups, then read OUR stale metadata and
+      // wrongly attribute the lock to us.
+      return async () => {
+        await removeOwnerMetadata(p);
+        await release();
+      };
     },
   };
+}
+
+/**
+ * If a lock dir exists at `p` and its owner metadata reports a dead
+ * local-host PID, forcibly remove both the lock dir and the metadata
+ * so the next `lockfile.lock` mkdir can succeed.
+ *
+ * All failures are swallowed — falling back to the existing
+ * FILE_LOCK_STALE_MS path is always safe (just slower).
+ */
+async function maybeStealDeadLock(p: string): Promise<void> {
+  try {
+    const { stat } = await import('node:fs/promises');
+    // Probe whether the lock dir actually exists. If not, nothing to steal.
+    try {
+      await stat(p + '.lock');
+    } catch {
+      return;
+    }
+    const meta = await readOwnerMetadata(p);
+    if (meta === null) {
+      // No metadata → unknown owner → conservative: do not steal.
+      return;
+    }
+    const alive = await isLockHolderAlive(meta);
+    if (alive) {
+      return;
+    }
+    // Proven dead local PID — steal. Best-effort; ignore failures.
+    const { rm, unlink } = await import('node:fs/promises');
+    try {
+      await rm(p + '.lock', { recursive: true, force: true });
+    } catch {
+      /* concurrent stealer or transient fs error */
+    }
+    try {
+      await unlink(p + OWNER_METADATA_SUFFIX);
+    } catch {
+      /* already gone */
+    }
+    // Best-effort logging — visibility for operators investigating recoveries.
+    console.warn(
+      `[pointer-mutex] stole lock at ${p}: previous holder pid=${meta.pid} ` +
+        `(hostname=${meta.hostname}, acquiredAt=${new Date(meta.acquiredAt).toISOString()}) ` +
+        `not alive (issue #336)`,
+    );
+  } catch {
+    /* any unexpected error → conservative fallback */
+  }
 }
 
 class NodeMutex implements PointerMutex {
