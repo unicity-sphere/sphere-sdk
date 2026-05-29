@@ -220,6 +220,30 @@ export class LifecycleManager {
   private pointerPollTimer: ReturnType<typeof setTimeout> | null = null;
 
   /**
+   * Aborted in `shutdown()` to cancel any in-flight `pointer.recoverLatest()`
+   * calls that don't otherwise have a signal threaded through from a
+   * higher caller. Page-freeze 2026-05-29: without this, a `Sphere.destroy()`
+   * during a slow IPFS gateway round-trip leaves the recoverLatest walkback
+   * issuing requests for tens of seconds AFTER the user has reloaded the
+   * page or unmounted the provider — feeding the dual-instance leak we saw
+   * in the browser flame graph.
+   */
+  private destroyController: AbortController | null = null;
+
+  /**
+   * Lazily-allocated accessor for the destroy controller's signal. We create
+   * the controller on first use (after `initialize()` runs and before the
+   * first pointer poll) so test harnesses that wire up a `LifecycleManager`
+   * without ever polling don't pay the allocation cost.
+   */
+  private getDestroySignal(): AbortSignal {
+    if (this.destroyController === null) {
+      this.destroyController = new AbortController();
+    }
+    return this.destroyController.signal;
+  }
+
+  /**
    * Issue #245 #3 — wall-clock deadline (ms epoch) until which a
    * publish attempt should short-circuit because a recent attempt
    * hit `AGGREGATOR_POINTER_WALKBACK_FLOOR`. Zero when no throttle is
@@ -501,6 +525,18 @@ export class LifecycleManager {
     if (this.pointerPollTimer !== null) {
       clearTimeout(this.pointerPollTimer);
       this.pointerPollTimer = null;
+    }
+
+    // Abort any in-flight pointer.recoverLatest() calls that don't have a
+    // signal threaded through from a higher caller. Page-freeze 2026-05-29:
+    // a slow IPFS gateway can keep the discovery walkback alive for tens of
+    // seconds after the user closes/reloads the tab, doubling resource use
+    // until the network round-trip finally returns. The abort here lets
+    // those promises settle (with an AbortError) so the rest of shutdown
+    // can proceed promptly.
+    if (this.destroyController !== null) {
+      this.destroyController.abort();
+      this.destroyController = null;
     }
 
     // Cancel debounce timer
@@ -1683,7 +1719,9 @@ export class LifecycleManager {
           });
           let reconciledDownward = false;
           try {
-            const recovered = await pointer.recoverLatest();
+            const recovered = await pointer.recoverLatest({
+              abortSignal: this.getDestroySignal(),
+            });
             // Only attempt downward reconcile when we have a concrete RecoverResult
             // (cid + version). RecoverAllUnfetchableResult (all-unfetchable) has no
             // fetchable version to adopt as a new baseline, so skip the downgrade.
@@ -1879,7 +1917,9 @@ export class LifecycleManager {
 
     let recovered: Awaited<ReturnType<typeof pointer.recoverLatest>>;
     try {
-      recovered = await pointer.recoverLatest();
+      recovered = await pointer.recoverLatest({
+        abortSignal: this.getDestroySignal(),
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (this.isPermanentPointerError(err)) {
@@ -2196,7 +2236,9 @@ export class LifecycleManager {
 
     let recovered: Awaited<ReturnType<typeof pointer.recoverLatest>> = null;
     try {
-      recovered = await pointer.recoverLatest();
+      recovered = await pointer.recoverLatest({
+        abortSignal: this.getDestroySignal(),
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (this.isPermanentPointerError(err)) {
