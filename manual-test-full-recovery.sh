@@ -202,11 +202,37 @@ assert_diff_empty() {
   fi
 }
 
+# Wall-clock anchor + per-section elapsed. SECTION_T0 is set the first
+# time `banner` is invoked; SECTION_LAST_TS tracks the previous banner so
+# each new section prints how long the previous one took. The full
+# breakdown is the diff between any two section-banner timestamps.
+SECTION_T0=0
+SECTION_LAST_TS=0
+SECTION_LAST_NAME=""
 banner() {
+  local now ts iso elapsed_total elapsed_section
+  ts=$(date +%s)
+  iso=$(date -Iseconds)
+  if (( SECTION_T0 == 0 )); then
+    SECTION_T0=$ts
+    SECTION_LAST_TS=$ts
+    elapsed_total=0
+    elapsed_section=0
+  else
+    elapsed_total=$((ts - SECTION_T0))
+    elapsed_section=$((ts - SECTION_LAST_TS))
+  fi
   echo
   echo "================================================================"
+  if [[ -n "$SECTION_LAST_NAME" ]]; then
+    printf "[%s] +%-4ds (prev section %s took %ds)\n" "$iso" "$elapsed_total" "$SECTION_LAST_NAME" "$elapsed_section"
+  else
+    printf "[%s] +0s (soak start)\n" "$iso"
+  fi
   echo "$*"
   echo "================================================================"
+  SECTION_LAST_TS=$ts
+  SECTION_LAST_NAME="$*"
 }
 
 # ---------------------------------------------------------------------------
