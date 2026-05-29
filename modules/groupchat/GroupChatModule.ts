@@ -96,8 +96,22 @@ const LOAD_FETCH_CONCURRENCY = 4;
 
 /**
  * Run an async mapper across `items` with a bounded number of concurrent
- * workers. Preserves order in the output. Failures inside `fn` propagate to
- * the caller (matching `Promise.all(items.map(fn))` semantics).
+ * workers. Preserves order in the output.
+ *
+ * Error semantics: each worker pulls items off a shared cursor and calls
+ * `fn`. The expectation at every call site in this file is that `fn`
+ * handles per-item errors and returns a sentinel (typically `null`)
+ * rather than throwing. If `fn` does throw, the thrower's worker sets
+ * `aborted` so sibling workers stop pulling NEW items from the cursor
+ * — in-flight `fn` calls already dispatched still settle. The aggregate
+ * promise then rejects with the first thrown error via `Promise.all`.
+ *
+ * This is STRICTER than `Promise.all(items.map(fn))`, which keeps
+ * dispatching new work after the first rejection until it hits the end
+ * of the input — that looser semantic is the exact fan-out leak this
+ * helper exists to avoid (page-freeze 2026-05-29, where an unbounded
+ * `Promise.all(items.map(fetchJson))` on a sick gateway issued 30 s
+ * sockets per item even after the first 404).
  */
 async function mapWithConcurrency<T, R>(
   items: ReadonlyArray<T>,
@@ -106,12 +120,18 @@ async function mapWithConcurrency<T, R>(
 ): Promise<R[]> {
   const results: R[] = new Array(items.length);
   let next = 0;
+  let aborted = false;
   const workerCount = Math.min(Math.max(1, limit), items.length);
   const workers = Array.from({ length: workerCount }, async () => {
-    while (true) {
+    while (!aborted) {
       const i = next++;
       if (i >= items.length) return;
-      results[i] = await fn(items[i], i);
+      try {
+        results[i] = await fn(items[i], i);
+      } catch (err) {
+        aborted = true;
+        throw err;
+      }
     }
   });
   await Promise.all(workers);
