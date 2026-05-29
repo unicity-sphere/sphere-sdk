@@ -723,58 +723,110 @@ export async function buildProfilePointerLayer(
     // given version, fetch the snapshot ROOT block (content-address
     // verified by `fetchFromIpfs`), dag-cbor-decode the root, and
     // return its `epoch` field (or undefined for pre-#310 snapshots).
+    //
+    // Page-freeze 2026-05-29 fix — closure-scope memoization.
+    //
+    // Without a memo, every pointer-poll cycle re-issues the full
+    // `resolveRemoteCid(v) → fetchFromIpfs(cid)` round-trip for every
+    // version it walks back through, even when the previous poll
+    // already learned the version's epoch (positive result) or its
+    // CID 404s (negative result). Under a degraded testnet gateway
+    // that floods the browser console with `/sidecar/blob?cid=… 404`
+    // and pegs the daemon CPU, this is the dominant source of
+    // redundant work. The memo TTL of 30 s ≥ POINTER_POLL_MIN_MS so
+    // a single full poll cycle dedups; values older than that are
+    // recomputed in case a stuck gateway has recovered.
+    //
+    // Memo key = version (a number). Positive entries cache the epoch
+    // (`value`); negative entries cache the error so callers see the
+    // same failure signature instead of re-walking the same
+    // 404/decode/shape failure. The memo lives in the closure of the
+    // surrounding layer-build call and is GC'd when the layer is.
+    const INSPECT_EPOCH_MEMO_TTL_MS = 30_000;
+    interface EpochMemoEntry {
+      readonly expiresAt: number;
+      readonly value?: number;
+      readonly error?: Error;
+    }
+    const epochMemo = new Map<number, EpochMemoEntry>();
+
     const inspectSnapshotEpoch = async (
       version: number,
     ): Promise<number | undefined> => {
-      const cidBytes = await resolveRemoteCid(version);
-      if (input.ipfsGateways.length === 0) {
-        throw new Error(
-          `inspectSnapshotEpoch: no IPFS gateways configured for v=${version}`,
-        );
+      const now = Date.now();
+      const cached = epochMemo.get(version);
+      if (cached !== undefined && cached.expiresAt > now) {
+        if (cached.error !== undefined) throw cached.error;
+        return cached.value;
       }
-      let cidString: string;
+
+      const compute = async (): Promise<number | undefined> => {
+        const cidBytes = await resolveRemoteCid(version);
+        if (input.ipfsGateways.length === 0) {
+          throw new Error(
+            `inspectSnapshotEpoch: no IPFS gateways configured for v=${version}`,
+          );
+        }
+        let cidString: string;
+        try {
+          cidString = CID.decode(cidBytes).toString();
+        } catch (err) {
+          throw new Error(
+            `inspectSnapshotEpoch: invalid CID bytes at v=${version}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        const rootBlockBytes = await fetchFromIpfs(
+          [...input.ipfsGateways],
+          cidString,
+        );
+        const { decode: cborDecode } = await import('@ipld/dag-cbor');
+        let decoded: unknown;
+        try {
+          decoded = cborDecode(rootBlockBytes);
+        } catch (err) {
+          throw new Error(
+            `inspectSnapshotEpoch: dag-cbor decode failed at v=${version}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        if (
+          decoded === null ||
+          typeof decoded !== 'object' ||
+          Array.isArray(decoded)
+        ) {
+          throw new Error(
+            `inspectSnapshotEpoch: root block decoded to non-object at v=${version}`,
+          );
+        }
+        const epoch = (decoded as Record<string, unknown>).epoch;
+        if (epoch === undefined) return undefined;
+        if (
+          typeof epoch !== 'number' ||
+          !Number.isFinite(epoch) ||
+          !Number.isInteger(epoch) ||
+          epoch < 0
+        ) {
+          throw new Error(
+            `inspectSnapshotEpoch: invalid epoch ${String(epoch)} at v=${version}`,
+          );
+        }
+        return epoch;
+      };
+
       try {
-        cidString = CID.decode(cidBytes).toString();
+        const result = await compute();
+        epochMemo.set(version, {
+          value: result,
+          expiresAt: Date.now() + INSPECT_EPOCH_MEMO_TTL_MS,
+        });
+        return result;
       } catch (err) {
-        throw new Error(
-          `inspectSnapshotEpoch: invalid CID bytes at v=${version}: ${err instanceof Error ? err.message : String(err)}`,
-        );
+        const error = err instanceof Error ? err : new Error(String(err));
+        epochMemo.set(version, {
+          error,
+          expiresAt: Date.now() + INSPECT_EPOCH_MEMO_TTL_MS,
+        });
+        throw error;
       }
-      const rootBlockBytes = await fetchFromIpfs(
-        [...input.ipfsGateways],
-        cidString,
-      );
-      const { decode: cborDecode } = await import('@ipld/dag-cbor');
-      let decoded: unknown;
-      try {
-        decoded = cborDecode(rootBlockBytes);
-      } catch (err) {
-        throw new Error(
-          `inspectSnapshotEpoch: dag-cbor decode failed at v=${version}: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-      if (
-        decoded === null ||
-        typeof decoded !== 'object' ||
-        Array.isArray(decoded)
-      ) {
-        throw new Error(
-          `inspectSnapshotEpoch: root block decoded to non-object at v=${version}`,
-        );
-      }
-      const epoch = (decoded as Record<string, unknown>).epoch;
-      if (epoch === undefined) return undefined;
-      if (
-        typeof epoch !== 'number' ||
-        !Number.isFinite(epoch) ||
-        !Number.isInteger(epoch) ||
-        epoch < 0
-      ) {
-        throw new Error(
-          `inspectSnapshotEpoch: invalid epoch ${String(epoch)} at v=${version}`,
-        );
-      }
-      return epoch;
     };
 
     // Item #15 Phase E: applySnapshot is the only sink for remote

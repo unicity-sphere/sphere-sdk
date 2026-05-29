@@ -464,10 +464,17 @@ describe('GroupChatModule — CID-refs persistence (commit 7b.2)', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Config error: CID_REF_UNREADABLE
+  // Config degrade: CID_REF_DEGRADE
+  //
+  // When a stored value carries a CID ref but the wallet was opened without
+  // a cidRefStore (e.g. legacy `createBrowserProviders` factory), load() used
+  // to throw `ProfileError(CID_REF_UNREADABLE)` and brick every other module's
+  // load via the shared `Promise.allSettled`. The page-freeze investigation
+  // 2026-05-29 moved this to a logger.warn + start-empty fallback so relay
+  // re-delivery can repopulate the state on the next sync.
   // ---------------------------------------------------------------------------
 
-  it('throws CID_REF_UNREADABLE when ref present and cidRefStore absent', async () => {
+  it('degrades to empty state when groups ref present and cidRefStore absent', async () => {
     // Inject cidRefStore only to create the ref, then detach.
     const { fakeStore } = makeFakeCidRefStore();
     const ref = await fakeStore.pinJson([makeGroup('g1')]);
@@ -475,7 +482,11 @@ describe('GroupChatModule — CID-refs persistence (commit 7b.2)', () => {
 
     const mod = new GroupChatModule();
     mod.initialize(createDeps(storage)); // NO cidRefStore
-    await expect(mod.load()).rejects.toThrow(/CID_REF_UNREADABLE/);
+
+    // No throw: load resolves, but the groups Map is empty because we
+    // can't dereference the CID without a store.
+    await expect(mod.load()).resolves.toBeUndefined();
+    expect((mod as any).groups.size).toBe(0);
   });
 
   // ---------------------------------------------------------------------------
@@ -1050,7 +1061,11 @@ describe('GroupChatModule — CID-refs persistence (commit 7b.2)', () => {
     expect(fakeStore.fetchJson).not.toHaveBeenCalled();
   });
 
-  it('processedEvents: load CID-ref-without-store throws CID_REF_UNREADABLE', async () => {
+  it('processedEvents: load CID-ref-without-store degrades to empty set', async () => {
+    // Matches the groups-key fallback added 2026-05-29 — when the legacy
+    // factory wires the module without a cidRefStore, the processedEvents
+    // ledger starts fresh and relay re-delivery rehydrates via the
+    // idempotent event handlers. The previous throw bricked module load.
     const { fakeStore } = makeFakeCidRefStore();
     const ref = await fakeStore.pinJson(['evt']);
     storage._data.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_PROCESSED_EVENTS, JSON.stringify(ref));
@@ -1059,7 +1074,8 @@ describe('GroupChatModule — CID-refs persistence (commit 7b.2)', () => {
     const mod = new GroupChatModule();
     mod.initialize(createDeps(storage, undefined));
 
-    await expect(mod.load()).rejects.toMatchObject({ code: 'CID_REF_UNREADABLE' });
+    await expect(mod.load()).resolves.toBeUndefined();
+    expect((mod as any).processedEventIds.size).toBe(0);
   });
 
   it('processedEvents: load CID-ref fetch failure starts fresh (best-effort)', async () => {

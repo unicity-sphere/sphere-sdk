@@ -120,22 +120,119 @@ wait_for_log() {
   return 1
 }
 
+# Poll `sphere invoice status $INVOICE` until peer2 has replicated the
+# invoice, OR fail after TIMEOUT seconds. Cross-device invoice visibility
+# requires three legs to complete:
+#
+#   1. Sender (Bob)'s profile-token IPFS publish lands durably.
+#   2. Sender's Nostr at-least-once mux acks (60s cooldown on retry).
+#   3. Receiver (peer2-alice)'s OrbitDB replicates the accounting key.
+#
+# Under flaky testnet conditions (e.g. unicity-ipfs1.dyndns.org HTTP 500
+# observed 2026-05-29), any leg can stall. Without this loop a transient
+# stall trips `set -euo pipefail` and aborts the soak at §C.4 even though
+# the wallet code is correct. Treats ONLY "No invoice found" as transient;
+# other errors (e.g. "Database is not open") still propagate immediately.
+wait_for_invoice_visible() {
+  local invoice="$1" output_file="$2" timeout="${3:-150}"
+  local elapsed=0 step=15 rc
+  : > "$output_file"
+  while (( elapsed < timeout )); do
+    if sphere invoice status "$invoice" > "$output_file" 2>&1; then
+      if ! grep -q 'No invoice found' "$output_file"; then
+        cat "$output_file"
+        return 0
+      fi
+      # Found a "No invoice" — transient. Retry after sleep.
+    else
+      rc=$?
+      if ! grep -q 'No invoice found' "$output_file"; then
+        # CLI failed for a non-transient reason (e.g. DB lock, network
+        # config). Surface immediately so the soak fails informatively.
+        cat "$output_file" >&2
+        echo "sphere invoice status failed with rc=$rc (non-transient — not retrying)" >&2
+        return "$rc"
+      fi
+    fi
+    sleep "$step"
+    elapsed=$((elapsed + step))
+  done
+  cat "$output_file" >&2
+  echo "TIMEOUT (${timeout}s) waiting for peer2 to see invoice $invoice — testnet replication stalled" >&2
+  return 1
+}
+
+# Normalize a snapshot before byte-comparison. Strips lines that are
+# legitimately volatile across runs but do NOT reflect logical wallet
+# state. False positives observed on 2026-05-29 (issue: page-freeze):
+#
+#   - "  IPFS: +N added, -M removed" — transient sync-status emitted
+#     when `sphere balance` notices background IPFS sync activity. The
+#     count varies depending on whether a prior write is still landing.
+#   - "Syncing..." / "  Ready." — wallet-load progress banner.
+#   - "[YYYY-MM-DDThh:mm:ss.sssZ] [LEVEL] [Component] ..." — debug
+#     output captured when the CLI runs in verbose mode. Wall-clock
+#     timestamps + monotonic counters (event IDs, bundle counts) make
+#     these lines pure noise for state comparison.
+#
+# Filtering operates on a temp file the caller hands to diff, leaving
+# the original snapshot untouched for forensics.
+normalize_snapshot() {
+  # shellcheck disable=SC2016
+  sed -E \
+    -e '/^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z\] /d' \
+    -e '/^  IPFS: \+[0-9]+ added, -[0-9]+ removed$/d' \
+    -e '/^Syncing\.\.\.$/d' \
+    -e '/^  Ready\.$/d' \
+    "$1"
+}
+
 assert_diff_empty() {
   local label="$1" a="$2" b="$3"
-  if diff -u "$a" "$b" > "$SNAP/${label}.diff"; then
+  local na="$SNAP/${label}.a.norm" nb="$SNAP/${label}.b.norm"
+  normalize_snapshot "$a" > "$na"
+  normalize_snapshot "$b" > "$nb"
+  if diff -u "$na" "$nb" > "$SNAP/${label}.diff"; then
     echo "ASSERT OK ($label): $(basename "$a") == $(basename "$b")"
   else
     echo "ASSERT FAIL ($label): see $SNAP/${label}.diff" >&2
+    echo "  (compared normalized snapshots: ${label}.a.norm vs ${label}.b.norm)" >&2
     cat "$SNAP/${label}.diff" >&2 || true
     return 1
   fi
 }
 
+# Wall-clock anchor + per-section elapsed. SECTION_T0 is set the first
+# time `banner` is invoked; SECTION_LAST_TS tracks the previous banner so
+# each new section prints how long the previous one took. The full
+# breakdown is the diff between any two section-banner timestamps.
+SECTION_T0=0
+SECTION_LAST_TS=0
+SECTION_LAST_NAME=""
 banner() {
+  local now ts iso elapsed_total elapsed_section
+  ts=$(date +%s)
+  iso=$(date -Iseconds)
+  if (( SECTION_T0 == 0 )); then
+    SECTION_T0=$ts
+    SECTION_LAST_TS=$ts
+    elapsed_total=0
+    elapsed_section=0
+  else
+    elapsed_total=$((ts - SECTION_T0))
+    elapsed_section=$((ts - SECTION_LAST_TS))
+  fi
   echo
   echo "================================================================"
+  if [[ -n "$SECTION_LAST_NAME" ]]; then
+    printf "[%s] +%-4ds (prev section %s took %ds)\n" "$iso" "$elapsed_total" "$SECTION_LAST_NAME" "$elapsed_section"
+  else
+    printf "[%s] +0s (soak start)\n" "$iso"
+  fi
   echo "$*"
   echo "================================================================"
+  SECTION_LAST_TS=$ts
+  SECTION_LAST_NAME="$*"
 }
 
 # ---------------------------------------------------------------------------
@@ -383,7 +480,10 @@ cd "$PEER2_BOB"   && sphere daemon stop || true
 sleep 2
 
 cd "$PEER2_ALICE"
-sphere invoice status "$INV" 2>&1 | tee "$SNAP/peer2-alice-invoice-status.log"
+# Wait for cross-device replication to complete before asserting peer2's
+# view. Under flaky testnet conditions the invoice can take 30s+ to land.
+# Treats "No invoice found" as transient; other errors propagate.
+wait_for_invoice_visible "$INV" "$SNAP/peer2-alice-invoice-status.log" 150
 sphere balance               | tee "$SNAP/peer2-alice-postC-balance.txt"
 
 cd "$PEER2_BOB"

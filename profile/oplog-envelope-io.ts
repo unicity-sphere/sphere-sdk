@@ -131,6 +131,20 @@ export function unwrapEnvelopeBytes(bytes: Uint8Array): Uint8Array {
 export type GetEnvelopePayloadFallbackHook = (info: {
   readonly key: string;
   readonly errorMessage: string;
+  /**
+   * `true` when the underlying failure was a raw CBOR decode error
+   * (the bytes do not decode as CBOR at all). This is the dominant
+   * signature for pre-#247 raw-bytes writes (e.g. SentLedgerWriter at
+   * `${addressId}.sent.${id}`): the bytes are AES-GCM ciphertext whose
+   * random IV occasionally starts with a CBOR major-type-7 simple-value
+   * code that cborg rejects ("simple values are not supported"). In
+   * that case the fallback path is the CORRECT path and the WARN log
+   * is misleading. `false` means decode succeeded but the resulting
+   * shape was not a valid envelope — that DOES indicate real envelope
+   * corruption (unexpected field / unknown v / wrong decoded kind) and
+   * should be logged at WARN.
+   */
+  readonly isCborDecodeError: boolean;
 }) => void;
 
 /**
@@ -189,10 +203,20 @@ export async function getEnvelopePayload(
       // can detect live corruption (the silent path also masked
       // genuine envelope-write damage, not just legacy bytes).
       if (onFallback !== undefined) {
+        // Distinguish raw-CBOR-decode failure (legacy pre-#247 raw bytes —
+        // expected, not corruption) from envelope-shape failure (real
+        // corruption — wrong v / wrong field / wrong decoded kind).
+        // `OpLogEntryCorrupt` carries `details.cborError === true` ONLY
+        // for the raw-decode case; see `decodeEntry` catch at
+        // `oplog-entry.ts:188`. Anything else has details without that
+        // flag (or no details at all on synthetic legacy entries).
+        const details = (err as { details?: Record<string, unknown> } | null)?.details;
+        const isCborDecodeError = details?.cborError === true;
         try {
           onFallback({
             key,
             errorMessage: err instanceof Error ? err.message : String(err),
+            isCborDecodeError,
           });
         } catch {
           // Best-effort signal — never propagate hook errors into the
