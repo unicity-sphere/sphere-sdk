@@ -250,4 +250,62 @@ describe('UnicityAggregatorProvider — JSON-RPC wire method names', () => {
       expect(calls[0].method).not.toBe('submitCommitment');
     });
   });
+
+  describe('getCurrentRound()', () => {
+    // Before this fix `getCurrentRound()` returned `0` when
+    // `aggregatorClient` was null (the pre-`initialize()` stub path).
+    // The AggregatorPinger was using `round > 0` to discriminate that
+    // stub case from a real aggregator response — but the stub
+    // sentinel collided with legitimate `0` round numbers from fresh
+    // shards / between-batch states, producing false-negative
+    // "Aggregator service unavailable" banners. The fix throws on
+    // the uninitialized path so the pinger routes it to `'down'` and
+    // can treat any finite numeric round (including 0) as alive.
+    it('throws when aggregator client is not initialized (no initialize() call)', async () => {
+      const provider = new UnicityAggregatorProvider({
+        url: 'https://test.example/',
+        timeout: 1000,
+        skipVerification: true,
+      });
+      // NOTE: deliberately NOT calling initialize() — aggregatorClient is null.
+      await expect(provider.getCurrentRound()).rejects.toThrow(/not initialized/);
+    });
+
+    it('returns the live block height (as a number) when the aggregator client is wired', async () => {
+      const provider = new UnicityAggregatorProvider({
+        url: 'https://test.example/',
+        timeout: 1000,
+        skipVerification: true,
+      });
+      // Stub `aggregatorClient` directly to avoid the real SDK init path
+      // (which would require fetching a trust base from the network).
+      const fakeClient = {
+        getBlockHeight: vi.fn(async () => 42n),
+      };
+      (provider as unknown as { aggregatorClient: typeof fakeClient }).aggregatorClient = fakeClient;
+
+      const round = await provider.getCurrentRound();
+      expect(round).toBe(42);
+      expect(fakeClient.getBlockHeight).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns 0 (numeric) when the aggregator reports block height 0 — does NOT swallow the response', async () => {
+      // Regression: a fresh shard or between-batch state can return 0
+      // from `get_block_height`. The pinger must see this as a real
+      // numeric value (and treat it as alive), not as the stub sentinel.
+      const provider = new UnicityAggregatorProvider({
+        url: 'https://test.example/',
+        timeout: 1000,
+        skipVerification: true,
+      });
+      const fakeClient = {
+        getBlockHeight: vi.fn(async () => 0n),
+      };
+      (provider as unknown as { aggregatorClient: typeof fakeClient }).aggregatorClient = fakeClient;
+
+      const round = await provider.getCurrentRound();
+      expect(round).toBe(0);
+      expect(Number.isFinite(round)).toBe(true);
+    });
+  });
 });
