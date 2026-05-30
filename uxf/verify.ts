@@ -24,8 +24,7 @@ import type {
   InstanceChainEntry,
 } from './types.js';
 import { ELEMENT_TYPE_TOKEN_ROOT } from './types.js';
-import { computeElementHash } from './hash.js';
-import { encode as dagCborEncode } from '@ipld/dag-cbor';
+import { computeElementHashWithSize } from './hash.js';
 import { VERIFY_MAX_ELEMENT_BYTES } from './limits.js';
 
 // ---------------------------------------------------------------------------
@@ -123,40 +122,46 @@ export function verify(pkg: UxfPackageData): UxfVerificationResult {
   // Steelman Wave 3 warning: per-element BYTE cap, not just per-element
   // count. VERIFY_MAX_POOL_SIZE bounds N (count) but N × per-element-bytes
   // is the true memory pressure. A 100k-element pool of 100 KiB elements
-  // fits the count cap but is 10 GB total. Re-encode each element's
-  // content+children sub-tree once and reject before re-hashing if any
-  // single element exceeds VERIFY_MAX_ELEMENT_BYTES.
+  // fits the count cap but is 10 GB total.
+  //
+  // Issue #360 finding #6 — fold the size probe into the hash compute.
+  // `computeElementHashWithSize` performs ONE dag-cbor encode and
+  // returns both the SHA-256 content address and the encoded byte
+  // length. The cap now applies to the exact bytes that determine the
+  // content address — a tighter, honest invariant — and the verifier
+  // pays one encode per element instead of two.
   for (const [hash, element] of pkg.pool) {
+    let recomputed: ContentHash;
     let elementSizeBytes: number;
     try {
-      // We measure the size of the element's content+children sub-tree
-      // (the data blobs that drive memory cost). Header is bounded
-      // size (small fixed schema) so excluded from the cap window.
-      const probe = dagCborEncode({
-        content: element.content,
-        children: element.children,
+      ({ hash: recomputed, sizeBytes: elementSizeBytes } =
+        computeElementHashWithSize(element));
+    } catch (err) {
+      // Hash compute can throw on structurally unencodable / unknown
+      // element types. Surface as a verification failure rather than
+      // letting the exception escape verify().
+      errors.push({
+        code: 'VERIFICATION_FAILED',
+        message:
+          `Element ${hash} hash recompute threw: ` +
+          (err instanceof Error ? err.message : String(err)),
+        elementHash: hash,
       });
-      elementSizeBytes = probe.byteLength;
-    } catch {
-      // dag-cbor encode failure here means the element is structurally
-      // unencodable — let computeElementHash below produce the precise
-      // error.
-      elementSizeBytes = 0;
+      continue;
     }
     if (elementSizeBytes > VERIFY_MAX_ELEMENT_BYTES) {
       errors.push({
         code: 'INVALID_PACKAGE',
         message:
-          `Element ${hash} content+children size ${elementSizeBytes} bytes ` +
+          `Element ${hash} canonical-encoded size ${elementSizeBytes} bytes ` +
           `exceeds VERIFY_MAX_ELEMENT_BYTES=${VERIFY_MAX_ELEMENT_BYTES} ` +
           `(per-element bloat-DoS protection).`,
         elementHash: hash,
       });
-      // Skip the recompute for oversized elements — re-hashing a 100 MiB
-      // body burns CPU we explicitly refuse to spend.
+      // Do NOT also record a hash mismatch for the same element — the
+      // size error already disqualifies it. Drop through to next.
       continue;
     }
-    const recomputed = computeElementHash(element);
     if (recomputed !== hash) {
       errors.push({
         code: 'VERIFICATION_FAILED',

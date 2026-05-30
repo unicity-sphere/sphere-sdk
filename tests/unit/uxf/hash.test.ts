@@ -5,6 +5,7 @@ import {
   prepareContentForHashing,
   prepareChildrenForHashing,
   computeElementHash,
+  computeElementHashWithSize,
 } from '../../../uxf/hash.js';
 import { UxfError } from '../../../uxf/errors.js';
 import type { ContentHash, UxfElement } from '../../../uxf/types.js';
@@ -473,6 +474,55 @@ describe('computeElementHash', () => {
     } catch (e) {
       expect((e as UxfError).code).toBe('INVALID_HASH');
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #360 finding #6 — computeElementHashWithSize folds the size
+// probe into the hash compute. Both outputs MUST derive from the
+// SAME canonical CBOR bytes, eliminating a redundant encode pass in
+// `verify.ts`.
+// ---------------------------------------------------------------------------
+
+describe('computeElementHashWithSize', () => {
+  it('hash field equals computeElementHash for the same input', () => {
+    const el = makeElement('token-state', {
+      data: 'ab'.repeat(32),
+      predicate: 'cd'.repeat(32),
+    });
+    const { hash } = computeElementHashWithSize(el);
+    expect(hash).toBe(computeElementHash(el));
+  });
+
+  it('sizeBytes is a positive integer matching the canonical encode length', () => {
+    const el = makeElement('token-state', {
+      data: 'ab'.repeat(32),
+      predicate: 'cd'.repeat(32),
+    });
+    const { sizeBytes } = computeElementHashWithSize(el);
+    expect(sizeBytes).toBeGreaterThan(0);
+    expect(Number.isInteger(sizeBytes)).toBe(true);
+  });
+
+  it('sizeBytes grows with the payload size', () => {
+    const small = makeElement('token-state', {
+      data: 'ab'.repeat(16),
+      predicate: 'cd'.repeat(32),
+    });
+    const large = makeElement('token-state', {
+      data: 'ab'.repeat(2048),
+      predicate: 'cd'.repeat(32),
+    });
+    expect(computeElementHashWithSize(large).sizeBytes).toBeGreaterThan(
+      computeElementHashWithSize(small).sizeBytes,
+    );
+  });
+
+  it('throws on unknown element type (matches computeElementHash)', () => {
+    const el = makeElement('not-a-real-type' as UxfElement['type'], {
+      data: 'aa'.repeat(32),
+    });
+    expect(() => computeElementHashWithSize(el)).toThrow(UxfError);
   });
 });
 

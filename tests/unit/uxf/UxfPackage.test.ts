@@ -254,6 +254,72 @@ describe('UxfPackage', () => {
       expect(pkg1.hasToken(tokenId(TOKEN_B))).toBe(true);
       expect(pkg1.tokenCount).toBe(2);
     });
+
+    // Issue #360 finding #6 — incremental rebuildIndexes
+    //
+    // The post-merge index rebuild must NOT touch index entries for
+    // tokens that the merge did not change. Pre-fix the rebuild
+    // cleared all three indexes and walked the whole manifest. With
+    // the incremental path, an unchanged token's prior index entries
+    // remain physically intact across the merge call.
+    it('merge does not clear-and-rewalk indexes for unchanged tokens', () => {
+      const pkg1 = UxfPackage.create();
+      pkg1.ingest(TOKEN_A);
+
+      // Snapshot the index Sets BY IDENTITY (Set object reference).
+      // The legacy clear-and-rebuild would replace these with brand
+      // new Set instances; the incremental path keeps the SAME Sets
+      // and only mutates membership for changed tokens.
+      const aCoinId = ((TOKEN_A.genesis as any).data as any).coinData[0][0];
+      const aTypeId = ((TOKEN_A.genesis as any).data as any).tokenType;
+      const indexes = pkg1.packageData.indexes;
+      const coinSetBefore = (indexes.byCoinId as Map<string, Set<string>>).get(
+        aCoinId,
+      );
+      const typeSetBefore = (
+        indexes.byTokenType as Map<string, Set<string>>
+      ).get(aTypeId);
+      expect(coinSetBefore).toBeDefined();
+      expect(typeSetBefore).toBeDefined();
+
+      // Merge in a package that only adds a NEW token (TOKEN_B).
+      // The existing TOKEN_A entry must not be touched.
+      const pkg2 = UxfPackage.create();
+      pkg2.ingest(TOKEN_B);
+      pkg1.merge(pkg2);
+
+      const coinSetAfter = (indexes.byCoinId as Map<string, Set<string>>).get(
+        aCoinId,
+      );
+      const typeSetAfter = (
+        indexes.byTokenType as Map<string, Set<string>>
+      ).get(aTypeId);
+
+      // Same Set instances — legacy clear()+rebuild would replace.
+      expect(coinSetAfter).toBe(coinSetBefore);
+      expect(typeSetAfter).toBe(typeSetBefore);
+
+      // TOKEN_A still present in indexes (sanity).
+      expect(pkg1.tokensByCoinId(aCoinId)).toContain(tokenId(TOKEN_A));
+      expect(pkg1.tokensByTokenType(aTypeId)).toContain(tokenId(TOKEN_A));
+      // TOKEN_B now present (the new token's index entries were added).
+      expect(pkg1.tokensByCoinId(aCoinId)).toContain(tokenId(TOKEN_B));
+    });
+
+    it('merge with no manifest changes leaves indexes byte-for-byte identical', () => {
+      // Idempotent merge: pkg1 already contains everything pkg2 has.
+      // No staged manifest writes; rebuildIndexes is called with an
+      // empty changedTokens map and must be a no-op.
+      const pkg1 = UxfPackage.create();
+      pkg1.ingestAll([TOKEN_A, TOKEN_B]);
+      const pkg2 = UxfPackage.create();
+      pkg2.ingestAll([TOKEN_A, TOKEN_B]);
+
+      const idxBefore = JSON.parse(pkg1.toJson()).indexes;
+      pkg1.merge(pkg2);
+      const idxAfter = JSON.parse(pkg1.toJson()).indexes;
+      expect(idxAfter).toEqual(idxBefore);
+    });
   });
 
   // -------------------------------------------------------------------------

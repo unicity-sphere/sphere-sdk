@@ -900,6 +900,13 @@ function mergePkg(
   const stagedManifestWrites = new Map<string, ContentHash>();
   const stagedSyntheticInserts = new Map<ContentHash, UxfElement>();
 
+  // Issue #360 finding #6 — track the PRE-merge manifest root for each
+  // staged tokenId so the post-merge `rebuildIndexes` can do an
+  // incremental update (remove old contribution, add new) instead of
+  // a full O(N) clear+rebuild. `undefined` value = newly-added token
+  // (no old contribution to remove).
+  const stagedOldRoots = new Map<string, ContentHash | undefined>();
+
   // Audit #333 H3 — collect per-token failures so the caller can
   // observe them. Pre-fix the only signal was a logger.warn, and the
   // failed tokens silently vanished from the merged manifest. Now the
@@ -912,6 +919,7 @@ function mergePkg(
       const existingRoot = mutableManifest.get(tokenId);
       if (existingRoot === undefined) {
         stagedManifestWrites.set(tokenId, incomingRoot);
+        stagedOldRoots.set(tokenId, undefined);
         continue;
       }
       if (existingRoot === incomingRoot) {
@@ -933,7 +941,14 @@ function mergePkg(
       if (outcome.kind === 'enriched') {
         stagedSyntheticInserts.set(outcome.rootHash, outcome.syntheticRoot);
       }
-      stagedManifestWrites.set(tokenId, outcome.rootHash);
+      // Only stage a manifest write if the root actually changed; the
+      // resolver may return `outcome.rootHash === existingRoot` when
+      // the existing root already dominates. Index rebuilding is
+      // similarly only needed when the root truly changed.
+      if (outcome.rootHash !== existingRoot) {
+        stagedManifestWrites.set(tokenId, outcome.rootHash);
+        stagedOldRoots.set(tokenId, existingRoot);
+      }
     } catch (err) {
       // Audit #333 H3: a per-token resolver failure used to vanish
       // with only a logger.warn — token loss from the receive path's
@@ -1024,8 +1039,11 @@ function mergePkg(
     targetPool,
   );
 
-  // Rebuild secondary indexes from scratch (simplest correct approach)
-  rebuildIndexes(target);
+  // Issue #360 finding #6 — incremental rebuild. Only the tokens whose
+  // manifest root actually changed need their index contributions
+  // recomputed; everything else keeps its existing index entries
+  // untouched. This is O(|stagedOldRoots|) instead of O(target.size).
+  rebuildIndexes(target, stagedOldRoots);
 
   // Update envelope timestamp
   (target.envelope as { updatedAt: number }).updatedAt = Math.floor(Date.now() / 1000);
@@ -1168,6 +1186,94 @@ function updateIndexesForToken(
 }
 
 /**
+ * Remove the specific index entries that {@link updateIndexesForToken}
+ * would have produced for `(tokenId, oldRootHash)`, without scanning
+ * the whole index map.
+ *
+ * Used by the incremental {@link rebuildIndexes} path (Issue #360
+ * finding #6). The merge phase has the OLD root hash readily
+ * available (captured before the manifest write); deriving the
+ * (tokenType, coinId, stateHashKey) trio from it gives an O(1) per
+ * token removal — much cheaper than the full O(N) clear+rebuild for
+ * a B-bundle JOIN over an N-token profile.
+ *
+ * Falls back to the heavier {@link removeFromIndexes} reverse scan if
+ * the OLD root is missing from the pool (defensive — should not
+ * happen in the merge call path since the merge never removes pool
+ * entries, but verifying once and gracefully degrading is cheap).
+ *
+ * Note: byTokenType and byCoinId map a TYPE / COIN to a SET of token
+ * IDs. We only remove `tokenId` from the matching set; we do NOT
+ * delete the outer entry unless the set becomes empty.
+ */
+function removeIndexEntriesForToken(
+  pkg: UxfPackageData,
+  tokenId: string,
+  oldRootHash: ContentHash,
+): void {
+  const rootElement = pkg.pool.get(oldRootHash);
+  if (!rootElement) {
+    // Old root not in pool — fall back to the safe reverse-scan path.
+    removeFromIndexes(pkg.indexes, tokenId);
+    return;
+  }
+
+  const rootChildren = rootElement.children as unknown as TokenRootChildren;
+
+  // Extract genesis data for tokenType + coinId.
+  const genesisHash = rootChildren.genesis;
+  const genesisElement = pkg.pool.get(genesisHash);
+  if (genesisElement) {
+    const genesisChildren = genesisElement.children as unknown as GenesisChildren;
+    const genesisDataElement = pkg.pool.get(genesisChildren.data);
+    if (genesisDataElement) {
+      const genesisData = genesisDataElement.content as unknown as GenesisDataContent;
+
+      if (genesisData.tokenType) {
+        const mutableByTokenType = pkg.indexes.byTokenType as Map<string, Set<string>>;
+        const typeSet = mutableByTokenType.get(genesisData.tokenType);
+        if (typeSet) {
+          typeSet.delete(tokenId);
+          if (typeSet.size === 0) {
+            mutableByTokenType.delete(genesisData.tokenType);
+          }
+        }
+      }
+
+      if (genesisData.coinData && genesisData.coinData.length > 0) {
+        const coinId = genesisData.coinData[0][0];
+        if (coinId) {
+          const mutableByCoinId = pkg.indexes.byCoinId as Map<string, Set<string>>;
+          const coinSet = mutableByCoinId.get(coinId);
+          if (coinSet) {
+            coinSet.delete(tokenId);
+            if (coinSet.size === 0) {
+              mutableByCoinId.delete(coinId);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Remove the (oldStateHashKey -> tokenId) entry, but only if the
+  // current mapping still points at THIS tokenId. Two tokens cannot
+  // share the same byStateHash key in a well-formed package — defensive
+  // check guards a future regression that allowed collisions.
+  const stateHash = rootChildren.state;
+  const stateElement = pkg.pool.get(stateHash);
+  if (stateElement) {
+    const stateContent = stateElement.content as unknown as StateContent;
+    if (stateContent.data) {
+      const mutableByStateHash = pkg.indexes.byStateHash as Map<string, string>;
+      if (mutableByStateHash.get(stateContent.data) === tokenId) {
+        mutableByStateHash.delete(stateContent.data);
+      }
+    }
+  }
+}
+
+/**
  * Remove a token from all secondary indexes.
  */
 function removeFromIndexes(indexes: UxfIndexes, tokenId: string): void {
@@ -1199,21 +1305,66 @@ function removeFromIndexes(indexes: UxfIndexes, tokenId: string): void {
 }
 
 /**
- * Rebuild all secondary indexes from scratch by scanning the manifest
- * and resolving each token's genesis data.
+ * Rebuild secondary indexes.
+ *
+ * Two modes:
+ *
+ * 1. **Full rebuild (default)** — clears all three indexes and walks the
+ *    manifest. Always safe; preserved for legacy callers (CAR import,
+ *    initial load).
+ *
+ * 2. **Incremental rebuild** — when `changedTokens` is provided, ONLY
+ *    the listed tokenIds are reindexed. For each entry, the old
+ *    index contributions (derived from `oldRootHash`) are removed,
+ *    then `updateIndexesForToken` re-adds the new contributions
+ *    (looked up from the manifest's current state). Tokens NOT in
+ *    `changedTokens` keep their existing index entries untouched.
+ *
+ *    This is Issue #360 finding #6: across a JOIN pass that merges
+ *    B bundles into a target of size N, the legacy full rebuild
+ *    costs O(B · N). The incremental path costs O(Σ|changed_i|)
+ *    where |changed_i| is the per-merge changed-token count — for
+ *    typical bundles |changed| ≪ N, so the JOIN becomes O(total
+ *    changed) instead of O(B · N).
+ *
+ *    Tokens with `oldRootHash === undefined` are new entries; no
+ *    removal step is needed for them.
  */
-function rebuildIndexes(pkg: UxfPackageData): void {
-  // Clear all existing indexes
+function rebuildIndexes(
+  pkg: UxfPackageData,
+  changedTokens?: ReadonlyMap<string, ContentHash | undefined>,
+): void {
   const mutableByTokenType = pkg.indexes.byTokenType as Map<string, Set<string>>;
   const mutableByCoinId = pkg.indexes.byCoinId as Map<string, Set<string>>;
   const mutableByStateHash = pkg.indexes.byStateHash as Map<string, string>;
 
-  mutableByTokenType.clear();
-  mutableByCoinId.clear();
-  mutableByStateHash.clear();
+  if (changedTokens === undefined) {
+    // Legacy full rebuild — clear and walk the manifest.
+    mutableByTokenType.clear();
+    mutableByCoinId.clear();
+    mutableByStateHash.clear();
+    for (const [tokenId, rootHash] of pkg.manifest.tokens) {
+      updateIndexesForToken(pkg, tokenId, rootHash);
+    }
+    return;
+  }
 
-  // Rebuild from manifest
-  for (const [tokenId, rootHash] of pkg.manifest.tokens) {
-    updateIndexesForToken(pkg, tokenId, rootHash);
+  // Incremental rebuild.
+  for (const [tokenId, oldRootHash] of changedTokens) {
+    // Remove the OLD index contributions (only if the token existed
+    // before — newly-added tokens have oldRootHash === undefined and
+    // skip the removal step).
+    if (oldRootHash !== undefined) {
+      removeIndexEntriesForToken(pkg, tokenId, oldRootHash);
+    }
+
+    // Re-add from the manifest's CURRENT state. If the token was
+    // removed (manifest no longer contains it), skip the re-add —
+    // current callers do not remove during merge, so this is a
+    // future-proofing branch.
+    const newRootHash = pkg.manifest.tokens.get(tokenId);
+    if (newRootHash !== undefined) {
+      updateIndexesForToken(pkg, tokenId, newRootHash);
+    }
   }
 }

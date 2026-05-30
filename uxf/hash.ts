@@ -259,6 +259,29 @@ export function prepareChildrenForHashing(
  * @returns A branded ContentHash (64-char lowercase hex)
  */
 export function computeElementHash(element: UxfElement): ContentHash {
+  return computeElementHashWithSize(element).hash;
+}
+
+/**
+ * Compute the content hash AND the canonical-encoded byte size of a
+ * UXF element in a single pass.
+ *
+ * Both outputs derive from the same deterministic CBOR encoding of the
+ * canonical 4-key map (header + type + content + children). Callers
+ * that need to enforce a per-element byte cap (see
+ * `VERIFY_MAX_ELEMENT_BYTES` in `verify.ts`) can use `sizeBytes`
+ * directly — this guarantees the size check and the content address
+ * are computed over the SAME bytes, eliminating a second
+ * `dagCborEncode` pass that the verifier previously performed over a
+ * different (header-less) canonical form.
+ *
+ * Perf: Issue #360 finding #6 — folds the separate size probe in
+ * `verify.ts:129-167` into the hash recompute. The verifier now pays
+ * one dag-cbor encode per element instead of two.
+ */
+export function computeElementHashWithSize(
+  element: UxfElement,
+): { hash: ContentHash; sizeBytes: number } {
   // Build the canonical header array: [repr, sem, kind, predecessor]
   const header = [
     element.header.representation,
@@ -310,5 +333,8 @@ export function computeElementHash(element: UxfElement): ContentHash {
   const cborBytes = encode(canonical);
   const hashBytes = sha256(cborBytes);
 
-  return contentHash(bytesToHex(hashBytes));
+  return {
+    hash: contentHash(bytesToHex(hashBytes)),
+    sizeBytes: cborBytes.byteLength,
+  };
 }
