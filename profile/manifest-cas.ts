@@ -87,12 +87,57 @@ export type ManifestCasResult =
   | { readonly ok: true }
   | {
       readonly ok: false;
-      readonly reason: 'cas-mismatch' | 'not-found' | 'concurrent-modification';
+      readonly reason:
+        | 'cas-mismatch'
+        | 'not-found'
+        | 'concurrent-modification'
+        /**
+         * Audit #333 H7 — `verifyEntryRoot` reported the stored entry's
+         * `rootHash` label does NOT match the actual content under that
+         * hash. The CAS label-match would have passed pre-fix; with the
+         * verifier wired we surface the structural defect instead of
+         * silently accepting the swap against forged content.
+         */
+        | 'integrity-failed';
       /** When `reason === 'cas-mismatch'`, the actually-observed entry
        *  (so the caller can retry against the latest state). Omitted
        *  for `'not-found'` and `'concurrent-modification'`. */
       readonly observed?: { readonly contentHash: ContentHash };
+      /** Optional diagnostic detail for `'integrity-failed'`. */
+      readonly integrityDetail?: string;
     };
+
+/**
+ * Audit #333 H7 — recomputed-content verifier hook.
+ *
+ * `ManifestCas.update`'s precondition check compares
+ * `observed.rootHash` (a string read from the entry) to `prev.contentHash`
+ * (the caller's expected value). Both sides are arbitrary writer-supplied
+ * labels — a CAS pass means "the labels agree", not "the content under
+ * the label is the content the caller meant". An attacker writing an
+ * entry with a forged `rootHash` field that doesn't match the actual
+ * pool content slips through the CAS check unchanged.
+ *
+ * When wired, this hook is called AFTER the label CAS passes and BEFORE
+ * the write. It is responsible for fetching the content the entry's
+ * `rootHash` refers to (typically the UXF pool element), recomputing
+ * the hash, and asserting the recomputed value matches the entry's
+ * declaration. Production wiring routes through `computeElementHash`
+ * over the pool element.
+ *
+ * Returns `{ ok: true }` to permit the write, or `{ ok: false, reason }`
+ * to abort with `ManifestCasResult.reason === 'integrity-failed'`.
+ *
+ * Optional — when absent the CAS retains its pre-fix label-only
+ * semantics. Production wiring SHOULD always provide; the optional
+ * shape preserves test back-compat (existing tests do not assume the
+ * verifier is wired).
+ */
+export type VerifyEntryRootFn = (
+  addr: string,
+  tokenId: string,
+  entry: TokenManifestEntry,
+) => Promise<{ readonly ok: boolean; readonly reason?: string }>;
 
 /**
  * Compare-and-swap helper over manifest entries.
@@ -110,7 +155,20 @@ export type ManifestCasResult =
  * on log-replay conflict; verify when wiring.
  */
 export class ManifestCas {
-  constructor(private readonly storage: MinimalManifestStorage) {}
+  /**
+   * Audit #333 H7 — optional recomputed-content verifier. See
+   * {@link VerifyEntryRootFn}. When omitted the CAS retains its
+   * pre-fix label-only semantics (back-compat with existing tests
+   * that do not wire the hook).
+   */
+  private readonly verifyEntryRoot: VerifyEntryRootFn | undefined;
+
+  constructor(
+    private readonly storage: MinimalManifestStorage,
+    opts?: { readonly verifyEntryRoot?: VerifyEntryRootFn },
+  ) {
+    this.verifyEntryRoot = opts?.verifyEntryRoot;
+  }
 
   /**
    * Atomic-from-the-caller's-perspective compare-and-swap on the
@@ -158,6 +216,30 @@ export class ManifestCas {
           ok: false,
           reason: 'cas-mismatch',
           observed: { contentHash: observed.rootHash },
+        };
+      }
+    }
+
+    // Step 2.5 — Audit #333 H7 — recomputed-content integrity check.
+    //
+    // The label CAS above proved that `observed.rootHash === prev.contentHash`
+    // (both are arbitrary writer-supplied labels). When a verifier hook is
+    // wired, also confirm that the bytes under `observed.rootHash` actually
+    // hash to `observed.rootHash` — promoting the label-only CAS to a real
+    // content-addressed check.
+    //
+    // Skipped on the `prev === null` (asserts-no-entry) path because there
+    // is no observed entry to verify. Skipped when the hook is omitted —
+    // back-compat with pre-fix callers (and the 100% of existing tests
+    // that do not wire the verifier).
+    if (prev !== null && observed !== undefined && this.verifyEntryRoot !== undefined) {
+      const verify = await this.verifyEntryRoot(addr, tokenId, observed);
+      if (!verify.ok) {
+        return {
+          ok: false,
+          reason: 'integrity-failed',
+          observed: { contentHash: observed.rootHash },
+          ...(verify.reason !== undefined ? { integrityDetail: verify.reason } : {}),
         };
       }
     }
