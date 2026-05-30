@@ -42,7 +42,7 @@ import type {
   InstanceChainIndex,
   UxfInstanceKind,
 } from './types.js';
-import { contentHash, ELEMENT_TYPE_IDS } from './types.js';
+import { contentHash, ELEMENT_TYPE_IDS, ELEMENT_TYPE_TOKEN_ROOT } from './types.js';
 import { ENRICHED_SYNTHETIC_KIND } from './token-join.js';
 import { UxfError } from './errors.js';
 import { assertHeaderKindField, assertHeaderVersionField } from './header-validation.js';
@@ -661,6 +661,47 @@ export async function importFromCar(car: Uint8Array): Promise<UxfPackageData> {
           `for token ${tokenId} (rootHash=${rootHash}). Synthetic roots are ephemeral ` +
           `merge artifacts that must NOT cross peer boundaries.`,
       );
+    }
+
+    // Audit #333 H2 — manifest tokenId binding.
+    //
+    // Pre-fix the manifest key was only regex-shape-checked at parse
+    // (line ~555) and never asserted against the actual genesis
+    // tokenId encoded in the referenced root. A hostile sender could
+    // craft `{ "<tokenId-A>": <cid-of-root-that-mints-tokenId-B> }`,
+    // pass every element-hash check, and supply downstream consumers
+    // with a corrupt mapping that mis-identifies the token.
+    //
+    // verify.ts also catches this — belt-and-braces for consumers that
+    // bypass verify (e.g., direct `fromCar` use without a downstream
+    // bundle-verifier round). Failing fast at the import boundary
+    // also prevents the corrupt mapping from ever materialising in
+    // the in-memory UxfPackageData.
+    if (rootEl) {
+      if (rootEl.type !== ELEMENT_TYPE_TOKEN_ROOT) {
+        throw new UxfError(
+          'VERIFICATION_FAILED',
+          `Manifest entry for tokenId=${tokenId} points to a non-root element ` +
+            `(type='${rootEl.type}'); expected '${ELEMENT_TYPE_TOKEN_ROOT}' ` +
+            `(Audit #333 H2).`,
+        );
+      }
+      const rootContentTokenId = (rootEl.content as { tokenId?: unknown })
+        .tokenId;
+      if (
+        typeof rootContentTokenId !== 'string' ||
+        rootContentTokenId !== tokenId
+      ) {
+        throw new UxfError(
+          'VERIFICATION_FAILED',
+          `Manifest key tokenId=${tokenId} does not match token-root ` +
+            `content.tokenId=${
+              typeof rootContentTokenId === 'string'
+                ? rootContentTokenId
+                : '(missing/non-string)'
+            } (Audit #333 H2 — identity-confusion primitive).`,
+        );
+      }
     }
   }
 
