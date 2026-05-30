@@ -583,6 +583,27 @@ export class FlushScheduler {
     const encryptionKey = this.host.getEncryptionKey();
     if (!encryptionKey) return;
 
+    // Issue #360 Finding #3 — open the per-flush memoization scope on
+    // `BundleIndex` so the 3+ `listActiveBundles` gates below share a
+    // single OrbitDB oplog walk per flush. The corresponding
+    // `endFlushScope()` runs in the outer `finally` to guarantee
+    // teardown on every code path (early-return, throw, monotonicity
+    // residual continue, etc.).
+    this.bundleIndex.beginFlushScope();
+    try {
+      return await this.flushToIpfsInner(encryptionKey);
+    } finally {
+      this.bundleIndex.endFlushScope();
+    }
+  }
+
+  /**
+   * Body of `flushToIpfs()` extracted so the outer wrapper can manage
+   * the per-flush `BundleIndex` memoization scope without indenting
+   * the entire function (~800 lines) inside a try/finally.
+   */
+  private async flushToIpfsInner(encryptionKey: Uint8Array): Promise<void> {
+
     // Note on pending-publish retry: we deliberately do NOT throw at
     // the START of flushToIpfs when a previous publish was transient.
     // An early throw here would prevent pin + ref-write for the
@@ -733,7 +754,7 @@ export class FlushScheduler {
           return;
         }
         try {
-          const activeBundles = await this.bundleIndex.listActiveBundles();
+          const activeBundles = await this.bundleIndex.listActiveBundlesCached();
           if (activeBundles.has(projectedCid)) {
             this.host.log(
               `Flush (no-data) short-circuit: merged-state CID ${projectedCid} ` +
@@ -901,7 +922,7 @@ export class FlushScheduler {
       let unknownBundleCids: string[] = [];
       if (loadedBundleCids !== null) {
         try {
-          const activeBundles = await this.bundleIndex.listActiveBundles();
+          const activeBundles = await this.bundleIndex.listActiveBundlesCached();
           for (const cid of activeBundles.keys()) {
             if (!loadedBundleCids.has(cid)) {
               unknownBundleCids.push(cid);
@@ -1202,7 +1223,7 @@ export class FlushScheduler {
       let useCachedCid = cachedCid !== null;
       if (useCachedCid && cachedCid !== null) {
         try {
-          const activeBundles = await this.bundleIndex.listActiveBundles();
+          const activeBundles = await this.bundleIndex.listActiveBundlesCached();
           if (!activeBundles.has(cachedCid)) {
             // Our cached CID is no longer active (superseded by another
             // instance's pin or by consolidation). Re-pin from scratch.

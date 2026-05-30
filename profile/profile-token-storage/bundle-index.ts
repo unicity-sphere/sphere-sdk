@@ -59,7 +59,110 @@ export class BundleIndex implements ProfileSyncWriter {
   constructor(private readonly host: ProfileTokenStorageHost) {}
 
   /**
+   * Issue #360 Finding #3 — per-flush memoization of `listActiveBundles()`.
+   *
+   * `db.all(BUNDLE_KEY_PREFIX)` underneath does NOT push the prefix down
+   * into OrbitDB's keyvalue store — it walks the entire oplog and
+   * filters in JS (see `profile/orbitdb-adapter.ts:925-1036`). With a
+   * 10k-entry oplog this is ~50k entry decodes per flush across the 5+
+   * sites in `FlushScheduler.flushToIpfs()` that ask for the same
+   * "active bundle ref set".
+   *
+   * Lifecycle:
+   *   - `beginFlushScope()`  → installs an empty cache slot. Subsequent
+   *     `listActiveBundlesCached()` calls populate on first hit, then
+   *     return the populated map verbatim until invalidation or scope
+   *     end.
+   *   - `invalidateFlushScopedActiveBundles()` → drops the populated
+   *     value but keeps the scope open so the next call re-populates.
+   *     Called automatically on `addBundle()` (our own ref write); the
+   *     replication path is responsible for invalidating when peer
+   *     `'update'` events on bundle-ref keys arrive (Finding #1).
+   *   - `endFlushScope()`    → tears the cache down so a stray post-
+   *     flush call cannot read stale state.
+   *
+   * Outside the flush boundary (`flushScopedActiveBundles === null`)
+   * `listActiveBundlesCached()` degrades to a pass-through to
+   * `listActiveBundles()`, so callers in other contexts (`load()`,
+   * `refreshBaselineForMonotonicity`, snapshot/dispatcher paths) keep
+   * their fresh-read semantics unchanged.
+   */
+  private flushScopedActiveBundles: Map<string, UxfBundleRef> | null = null;
+  private flushScopeActive = false;
+
+  /**
+   * Open a per-flush memoization scope. Called by `FlushScheduler.
+   * flushToIpfs()` at flush entry. Subsequent `listActiveBundlesCached()`
+   * calls populate-on-first-hit and reuse the snapshot across all gates
+   * in this flush.
+   *
+   * Idempotent: nested scopes collapse — flushes are serialized so this
+   * is mostly defensive against a future caller invoking flushToIpfs()
+   * outside the serialized chain.
+   */
+  beginFlushScope(): void {
+    this.flushScopeActive = true;
+    this.flushScopedActiveBundles = null;
+  }
+
+  /**
+   * Close the per-flush memoization scope. Called by `FlushScheduler.
+   * flushToIpfs()` from a `finally` block so cache teardown runs on
+   * both success and failure paths.
+   */
+  endFlushScope(): void {
+    this.flushScopeActive = false;
+    this.flushScopedActiveBundles = null;
+  }
+
+  /**
+   * Drop the populated per-flush snapshot. The scope stays open so the
+   * next `listActiveBundlesCached()` call re-populates from OrbitDB.
+   * Safe to call when no scope is open (no-op).
+   *
+   * Conservative invalidation contract: when in doubt, invalidate. The
+   * cache only needs to survive a single flush (~1 second).
+   */
+  invalidateFlushScopedActiveBundles(): void {
+    this.flushScopedActiveBundles = null;
+  }
+
+  /**
+   * Active-bundles accessor that honours the per-flush memoization
+   * scope. When a scope is open, the first call walks OrbitDB and
+   * caches the result; later calls return the cached map. Outside a
+   * scope this falls through to `listActiveBundles()` — semantically
+   * identical to the uncached path.
+   *
+   * Callers MUST NOT mutate the returned map. Treat the value as a
+   * read-only snapshot; if a mutation is required, take a defensive
+   * copy at the call site (the existing call sites only read keys/
+   * values, so this is safe today).
+   */
+  async listActiveBundlesCached(): Promise<Map<string, UxfBundleRef>> {
+    if (!this.flushScopeActive) {
+      return this.listActiveBundles();
+    }
+    if (this.flushScopedActiveBundles !== null) {
+      return this.flushScopedActiveBundles;
+    }
+    const fresh = await this.listActiveBundles();
+    // Re-check scope: a `endFlushScope()` could have run during the
+    // awaited walk (e.g., outer flush rejected and finally fired
+    // before this microtask). In that case we still return the freshly
+    // computed map but do NOT cache it.
+    if (this.flushScopeActive) {
+      this.flushScopedActiveBundles = fresh;
+    }
+    return fresh;
+  }
+
+  /**
    * List all bundle refs from OrbitDB, filtered to active status.
+   *
+   * Direct OrbitDB walker — bypasses the per-flush memoization scope.
+   * Use `listActiveBundlesCached()` inside `flushToIpfs()` to amortise
+   * the walk across multiple gates.
    */
   async listActiveBundles(): Promise<Map<string, UxfBundleRef>> {
     const allBundles = await this.listBundles();
@@ -191,6 +294,10 @@ export class BundleIndex implements ProfileSyncWriter {
       }
     }
     this.host.getKnownBundleCids().add(cid);
+    // Issue #360 Finding #3 — our own write changes the active-bundle
+    // set; drop the per-flush memoized snapshot so the next gate in
+    // this flush re-reads the post-write state. No-op outside a scope.
+    this.invalidateFlushScopedActiveBundles();
     // Item #15 Phase C — every bundle-ref add changes our snapshot.
     this.host.notifyProfileDirty();
   }
@@ -200,7 +307,7 @@ export class BundleIndex implements ProfileSyncWriter {
    * threshold.
    */
   async shouldConsolidate(): Promise<boolean> {
-    const active = await this.listActiveBundles();
+    const active = await this.listActiveBundlesCached();
     return active.size > CONSOLIDATION_WARNING_THRESHOLD;
   }
 
@@ -327,6 +434,11 @@ export class BundleIndex implements ProfileSyncWriter {
         if (cid.length > 0) {
           this.host.getKnownBundleCids().add(cid);
         }
+        // Issue #360 Finding #3 — conservative invalidation: any
+        // remote bundle-ref landed via the snapshot merge changes
+        // the active-bundle set the cache may be holding. No-op
+        // outside a flush scope.
+        this.invalidateFlushScopedActiveBundles();
       },
     });
     // Item #15 Phase C — any landed remote bytes change our local
