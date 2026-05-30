@@ -371,7 +371,13 @@ export class ManifestCidRewriteCasError extends Error {
   readonly casReason:
     | 'cas-mismatch'
     | 'not-found'
-    | 'concurrent-modification';
+    | 'concurrent-modification'
+    /** Audit #333 H7 — surfaced when ManifestCas's wired verifier
+     *  detected the entry's `rootHash` label does not match its
+     *  recomputed content. The worker treats this the same as a hard
+     *  CAS failure (bubble to outer retry); the new code preserves the
+     *  structured reason for triage. */
+    | 'integrity-failed';
   /**
    * The actually-observed `contentHash` when `casReason ===
    * 'cas-mismatch'`. Useful for the worker's retry path.
@@ -382,7 +388,8 @@ export class ManifestCidRewriteCasError extends Error {
     casReason:
       | 'cas-mismatch'
       | 'not-found'
-      | 'concurrent-modification',
+      | 'concurrent-modification'
+      | 'integrity-failed',
     observedCid?: ContentHash,
   ) {
     super(`manifest CID rewrite CAS failure: ${casReason}`);
