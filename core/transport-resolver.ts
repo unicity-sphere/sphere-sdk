@@ -114,7 +114,8 @@ export function createTransportAddressResolver(
     }
 
     // DIRECT:// or PROXY:// — resolve via transport address lookup
-    if (address.startsWith('DIRECT://') || address.startsWith('PROXY://')) {
+    const upperAddress = address.toUpperCase();
+    if (upperAddress.startsWith('DIRECT://') || upperAddress.startsWith('PROXY://')) {
       // Primary: transport.resolve() handles all address formats
       if (transport.resolve) {
         const peerInfo = await transport.resolve(address);
@@ -130,7 +131,7 @@ export function createTransportAddressResolver(
         }
       }
       // Last resort: strip prefix and try as raw pubkey
-      const prefix = address.startsWith('DIRECT://') ? 'DIRECT://' : 'PROXY://';
+      const prefix = upperAddress.startsWith('DIRECT://') ? 'DIRECT://' : 'PROXY://';
       const raw = address.slice(prefix.length);
       if (raw.length === 0) {
         throw new SphereError(`Invalid ${prefix} address: empty value`, 'INVALID_RECIPIENT');
