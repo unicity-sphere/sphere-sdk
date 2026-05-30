@@ -32,6 +32,7 @@ import {
   encryptProfileValue,
   decryptProfileValue,
 } from '../encryption.js';
+import { incr, observeMs } from '../../core/perf-counters.js';
 import { buildLocalEntry, decodeEntry } from '../oplog-entry.js';
 import {
   runJoinSnapshot,
@@ -85,7 +86,12 @@ export class BundleIndex implements ProfileSyncWriter {
    * adapter's legacy-wrapping).
    */
   async listBundles(): Promise<Map<string, UxfBundleRef>> {
+    // GH #363 measurement: how often is this called per second, and
+    // how much wall-clock does the underlying `db.all` walk cost?
+    // Issue #360 Finding #3 claimed 5× per flush — confirm or refute.
+    const t0 = performance.now();
     const rawEntries = await this.host.db.all(BUNDLE_KEY_PREFIX);
+    observeMs('bundleIndex.listBundles.dbAllMs', performance.now() - t0);
     const result = new Map<string, UxfBundleRef>();
 
     // Steelman⁴⁰ warning: aggregate corrupt-bundle events into a single
@@ -130,6 +136,7 @@ export class BundleIndex implements ProfileSyncWriter {
       }
     }
 
+    incr('bundleIndex.listBundles.entries', result.size);
     if (corruptCids.length > 0) {
       const ev = this.host.buildErrorEvent('storage:error', firstCorruptError, 'CID_REF_CORRUPT');
       const truncated = corruptCids.length > CORRUPT_CIDS_PREVIEW_CAP;

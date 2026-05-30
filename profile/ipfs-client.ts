@@ -22,6 +22,7 @@ import { CID } from 'multiformats/cid';
 import * as raw from 'multiformats/codecs/raw';
 import { create as createMultihash } from 'multiformats/hashes/digest';
 import { logger } from '../core/logger.js';
+import { incr, observeMs } from '../core/perf-counters.js';
 import { ProfileError } from './errors.js';
 
 // =============================================================================
@@ -695,6 +696,12 @@ export async function pinCarBlocksToIpfs(
   helia?: unknown,
   concurrency: number = DEFAULT_PIN_CONCURRENCY,
 ): Promise<string> {
+  // GH #363 measurement: total pin wall-clock + block count + total
+  // bytes. Resolves whether the per-write-round-trip pattern the
+  // maintainer hypothesised about is actually network-bound on this
+  // function.
+  const __perfStart = performance.now();
+  const __perfBytes = carBytes.byteLength;
   const localHelia = asHelia(helia);
   // Parse the CAR locally to extract each block. Done up front so a
   // malformed CAR fails fast before any network round-trips.
@@ -891,9 +898,15 @@ export async function pinCarBlocksToIpfs(
     // failed against a downed sidecar) are discarded; if operator
     // diagnostics need them, attach a `storage:error` event before
     // re-throwing in a future enhancement.
+    incr('ipfs.pinCar.error');
+    observeMs('ipfs.pinCar.totalMs', performance.now() - __perfStart);
     throw workerErrors[0];
   }
 
+  // GH #363 measurement.
+  incr('ipfs.pinCar.blocks', blocks.length);
+  incr('ipfs.pinCar.bytes', __perfBytes);
+  observeMs('ipfs.pinCar.totalMs', performance.now() - __perfStart);
   return expectedRootCid;
 }
 
@@ -946,6 +959,9 @@ export async function fetchFromIpfs(
   maxSizeBytes: number = DEFAULT_MAX_SIZE_BYTES,
   helia?: unknown,
 ): Promise<Uint8Array> {
+  // GH #363 measurement — split local-Helia hits from HTTP gateway
+  // fetches so the two cost models are visible separately.
+  const __perfStart = performance.now();
   // Issue #236 — local Helia blockstore fast-path. When the block was
   // pinned through this process (or any prior process with the same
   // `dataDir`), it is already on disk and a synchronous get() avoids
@@ -960,6 +976,8 @@ export async function fetchFromIpfs(
         // gateways (which apply their own enforcement) rather than
         // returning oversized bytes.
       } else {
+        incr('ipfs.fetchBlock.localHit');
+        observeMs('ipfs.fetchBlock.localHitMs', performance.now() - __perfStart);
         return local;
       }
     }
@@ -1154,6 +1172,10 @@ export async function fetchFromIpfs(
         await putBlockToLocalHelia(localHelia, cid, bytesOrNull);
       }
 
+      // GH #363 — gateway hit (HTTP round-trip cost).
+      incr('ipfs.fetchBlock.gatewayHit');
+      incr('ipfs.fetchBlock.bytes', bytesOrNull.byteLength);
+      observeMs('ipfs.fetchBlock.gatewayMs', performance.now() - __perfStart);
       return bytesOrNull;
     } catch (err) {
       // Size-limit ProfileError is fatal for this request (not per-gateway)
@@ -1165,6 +1187,8 @@ export async function fetchFromIpfs(
     }
   }
 
+  incr('ipfs.fetchBlock.allGatewaysFailed');
+  observeMs('ipfs.fetchBlock.failedMs', performance.now() - __perfStart);
   throw new ProfileError(
     'BUNDLE_NOT_FOUND',
     `Failed to fetch CAR ${cid} from all gateways: ${lastError?.message ?? 'unknown error'}`,
@@ -1233,6 +1257,11 @@ export async function fetchCarFromIpfs(
   maxSizeBytesPerBlock: number = DEFAULT_MAX_SIZE_BYTES,
   helia?: unknown,
 ): Promise<Uint8Array> {
+  // GH #363 measurement — per-CAR walk wall-clock + block count. Issue
+  // #360 claimed sequential block-fetch dominated load time; verify or
+  // refute with real data instead of speculating.
+  const __perfStart = performance.now();
+  incr('ipfs.fetchCar.calls');
   let parsedRoot: CID;
   try {
     parsedRoot = CID.parse(rootCid);
@@ -1361,6 +1390,9 @@ export async function fetchCarFromIpfs(
     carBytes.set(c, offset);
     offset += c.length;
   }
+  incr('ipfs.fetchCar.blocks', blocks.length);
+  incr('ipfs.fetchCar.bytes', totalLength);
+  observeMs('ipfs.fetchCar.totalMs', performance.now() - __perfStart);
   return carBytes;
 }
 
