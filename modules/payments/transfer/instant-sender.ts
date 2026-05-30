@@ -402,6 +402,27 @@ export interface InstantSenderDeps {
    * @internal Test seam only.
    */
   readonly __sourceLockMaxHoldMs?: number;
+  /**
+   * Lock the bundle envelope's `createdAt` timestamp (UNIX
+   * milliseconds) for cross-attempt determinism. Production workers
+   * pass the persisted outbox entry's `createdAt` on **resume** so the
+   * rebuilt bundle reproduces the exact bytes the first attempt
+   * produced — making `bundleCid` stable across retries.
+   *
+   * Why this matters: `bundleCid` is the dag-cbor SHA-256 of the
+   * envelope block, which embeds `createdAt`. Two `Date.now()` calls
+   * straddling a wall-clock second boundary (a few ms apart) produce
+   * different second-resolution stamps → different envelopes →
+   * different `bundleCid`s. That breaks every system keyed on
+   * `bundleCid` for idempotency (replay-LRU at the recipient, IPFS
+   * pin reuse, outbox dedup, audit-#333 H3 fast path).
+   *
+   * Omitted on first-attempt sends → the orchestrator locks
+   * `Date.now()` once at the top of {@link sendInstantUxf} and threads
+   * it through. Within-call determinism is therefore guaranteed
+   * regardless of how slowly the bundle build runs.
+   */
+  readonly bundleCreatedAt?: number;
 }
 
 // =============================================================================
@@ -647,7 +668,12 @@ export async function sendInstantUxf(
   deps: InstantSenderDeps,
 ): Promise<TransferResult> {
   const transferId = deps.transferId ?? cryptoRandomUUID();
-  const now = Date.now();
+  // Lock the timestamp once at the start. Use the caller-supplied
+  // `bundleCreatedAt` on resume so the bundleCid reproduces the
+  // original; otherwise lock `Date.now()` once here and thread it
+  // through every downstream use (outbox createdAt, envelope
+  // createdAt). See `InstantSenderDeps.bundleCreatedAt`.
+  const now = deps.bundleCreatedAt ?? Date.now();
 
   // Mutable working copy — projected to readonly TransferResult on return.
   const result: {
@@ -880,11 +906,23 @@ export async function sendInstantUxf(
     // carries `inclusionProof: null` on the new transition — the
     // recipient's reader (T.5.D) walks the chain when proofs land.
     // -----------------------------------------------------------------
+    const envelopeStamp = Math.floor(now / 1000);
     const pkg = UxfPackage.create({
       description: 'inter-wallet-transfer',
       creator: deps.identity.chainPubkey,
+      // Lock the envelope timestamp to the orchestrator's pinned
+      // `now` so the bundle bytes (and therefore the CAR root CID
+      // we publish + persist as `bundleCid`) are deterministic
+      // across crash-restart retries.
+      createdAt: envelopeStamp,
     });
-    pkg.ingestAll(orderedResults.map((r) => r.recipientTokenJson));
+    // Also lock updatedAt: ingestAll would otherwise stamp
+    // Math.floor(Date.now()/1000) at call time, which drifts past
+    // `envelopeStamp` if the build crosses a second boundary.
+    pkg.ingestAll(
+      orderedResults.map((r) => r.recipientTokenJson),
+      { updatedAt: envelopeStamp },
+    );
 
     // -----------------------------------------------------------------
     // Step 6: serialize CAR.

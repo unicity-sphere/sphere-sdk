@@ -453,6 +453,11 @@ describe('T.6.E — conservative crash between outbox commit and Nostr publish',
       ...baseDeps,
       transport: freshTransport,
       emit: resumeEmit,
+      // bundleCid-determinism fix: replay the persisted createdAt so
+      // the rebuilt bundle bytes match the original. Without this the
+      // envelope's Math.floor(Date.now()/1000) drifts across seconds
+      // and the assertion at line 516 flakes on slow CI runs.
+      bundleCreatedAt: persisted!.createdAt,
       // The resume path uses the SAME outbox writer surface but a
       // fresh writer instance, mirroring a fresh Sphere process. The
       // store is shared — the writer reads the existing 'sending'
@@ -602,6 +607,9 @@ describe('T.6.E — conservative crash between Nostr ack and outbox commit', () 
       ...baseDeps,
       transport: freshTransport,
       emit: vi.fn(),
+      // bundleCid-determinism fix: replay the persisted createdAt so
+      // the bundle bytes (and CID) reproduce the original.
+      bundleCreatedAt: persistedAfterCrash!.createdAt,
       outbox: resumeOutbox,
       __faultInject: undefined,
     };
@@ -688,6 +696,9 @@ describe('T.6.E — instant crash between outbox commit and Nostr publish', () =
       ...baseDeps,
       transport: freshTransport,
       emit: vi.fn(),
+      // bundleCid-determinism fix: replay the persisted createdAt so
+      // the rebuilt bundle reproduces the original.
+      bundleCreatedAt: persisted!.createdAt,
       outbox: {
         write: async (entry) => {
           const existing = readPersistedEntry(store, addressId, entry.id);

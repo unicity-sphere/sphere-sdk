@@ -424,6 +424,15 @@ export interface ConservativeSenderDeps {
    * @internal Test seam only.
    */
   readonly __sourceLockMaxHoldMs?: number;
+  /**
+   * Lock the bundle envelope's `createdAt` timestamp (UNIX
+   * milliseconds) for cross-attempt determinism. Symmetric with
+   * `InstantSenderDeps.bundleCreatedAt` — see that field for the
+   * full rationale. Production workers pass the persisted outbox
+   * entry's `createdAt` on **resume** so the rebuilt bundle bytes
+   * (and `bundleCid`) reproduce the original first-attempt values.
+   */
+  readonly bundleCreatedAt?: number;
 }
 
 /**
@@ -641,7 +650,10 @@ export async function sendConservativeUxf(
   deps: ConservativeSenderDeps,
 ): Promise<TransferResult> {
   const transferId = deps.transferId ?? cryptoRandomUUID();
-  const now = Date.now();
+  // Lock the timestamp once at the start; use caller-supplied
+  // `bundleCreatedAt` on resume so the bundleCid reproduces the
+  // original. See `ConservativeSenderDeps.bundleCreatedAt`.
+  const now = deps.bundleCreatedAt ?? Date.now();
 
   // Mutable working copy — the public TransferResult is `readonly` on
   // most fields, so we project at the end. Until we know which tokens
@@ -824,11 +836,19 @@ export async function sendConservativeUxf(
     // -----------------------------------------------------------------
     // Step 5: build UxfPackage and ingest tokens.
     // -----------------------------------------------------------------
+    const envelopeStamp = Math.floor(now / 1000);
     const pkg = UxfPackage.create({
       description: 'inter-wallet-transfer',
       creator: deps.identity.chainPubkey,
+      // Lock the envelope timestamp to the pinned `now` so the
+      // bundleCid is deterministic across crash-restart retries.
+      createdAt: envelopeStamp,
     });
-    pkg.ingestAll(orderedResults.map((r) => r.recipientTokenJson));
+    // Also lock updatedAt to prevent ingestAll from drifting it.
+    pkg.ingestAll(
+      orderedResults.map((r) => r.recipientTokenJson),
+      { updatedAt: envelopeStamp },
+    );
 
     // -----------------------------------------------------------------
     // Step 6: serialize CAR.

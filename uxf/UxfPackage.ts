@@ -70,13 +70,43 @@ export class UxfPackage {
 
   /**
    * Create a new empty package.
+   *
+   * **Determinism note (post-#362):** the envelope `createdAt` /
+   * `updatedAt` fields are baked into the CAR root CID (the
+   * dag-cbor-encoded envelope IS the root block). If a caller invokes
+   * `create()` twice — e.g., a sender that crashes mid-flight and the
+   * worker rebuilds the bundle on resume — the two `Date.now()` calls
+   * straddling a second boundary would produce DIFFERENT envelope
+   * bytes → DIFFERENT bundleCids. That breaks every system that
+   * indexes on `bundleCid` for idempotency (replay-LRU at the
+   * recipient, IPFS pin reuse, outbox bundleCid dedup, the audit-#333
+   * H3 `targetExisting === sourceIncoming` fast path).
+   *
+   * Production senders therefore lock a single `createdAt` value at
+   * the start of a send attempt and persist it in the outbox entry's
+   * `createdAt`. On resume, the worker reads the persisted value and
+   * passes it back as `options.createdAt`. The `Date.now()` fallback
+   * stays for callers that don't need cross-attempt determinism
+   * (tests, ad-hoc tooling, archival exports).
+   *
+   * @param options.createdAt  Override the envelope timestamp (unix
+   *   seconds). When omitted, `Math.floor(Date.now() / 1000)` is used.
+   * @param options.updatedAt  Override the envelope updated-at timestamp.
+   *   Defaults to `createdAt` (a brand-new package's createdAt and
+   *   updatedAt are equal — they only diverge after `merge()`).
    */
-  static create(options?: { description?: string; creator?: string }): UxfPackage {
-    const now = Math.floor(Date.now() / 1000);
+  static create(options?: {
+    description?: string;
+    creator?: string;
+    createdAt?: number;
+    updatedAt?: number;
+  }): UxfPackage {
+    const now = options?.createdAt ?? Math.floor(Date.now() / 1000);
+    const updated = options?.updatedAt ?? now;
     const envelope: UxfEnvelope = {
       version: '1.0.0',
       createdAt: now,
-      updatedAt: now,
+      updatedAt: updated,
       ...(options?.description !== undefined ? { description: options.description } : {}),
       ...(options?.creator !== undefined ? { creator: options.creator } : {}),
     };
@@ -127,17 +157,24 @@ export class UxfPackage {
   /**
    * Deconstruct a token and add to the package.
    * If the token already exists, its manifest entry is updated to the new root.
+   *
+   * `opts.updatedAt` (unix seconds) overrides the post-ingest envelope
+   * `updatedAt` bump — required for bundleCid determinism across
+   * crash-restart retries (see {@link UxfPackage.create} determinism
+   * note).
    */
-  ingest(token: unknown): this {
-    ingest(this.data, token);
+  ingest(token: unknown, opts?: { updatedAt?: number }): this {
+    ingest(this.data, token, opts);
     return this;
   }
 
   /**
    * Batch ingest multiple tokens.
+   *
+   * See {@link ingest} for `opts.updatedAt`.
    */
-  ingestAll(tokens: unknown[]): this {
-    ingestAll(this.data, tokens);
+  ingestAll(tokens: unknown[], opts?: { updatedAt?: number }): this {
+    ingestAll(this.data, tokens, opts);
     return this;
   }
 
@@ -502,7 +539,11 @@ function syncPool(pkg: UxfPackageData, pool: ElementPool): void {
  * Deconstruct a token and add it to the package.
  * Updates manifest and secondary indexes.
  */
-export function ingest(pkg: UxfPackageData, token: unknown): void {
+export function ingest(
+  pkg: UxfPackageData,
+  token: unknown,
+  opts?: { updatedAt?: number },
+): void {
   const pool = wrapPool(pkg);
   const rootHash = deconstructToken(pool, token);
   syncPool(pkg, pool);
@@ -516,8 +557,11 @@ export function ingest(pkg: UxfPackageData, token: unknown): void {
   const mutableManifest = pkg.manifest.tokens as Map<string, ContentHash>;
   mutableManifest.set(tokenId, rootHash);
 
-  // Update envelope timestamp
-  (pkg.envelope as { updatedAt: number }).updatedAt = Math.floor(Date.now() / 1000);
+  // Update envelope timestamp. Caller can lock the value for bundleCid
+  // determinism across crash-restart retries (see UxfPackage.create
+  // docstring). Default: stamp wall clock at second resolution.
+  (pkg.envelope as { updatedAt: number }).updatedAt =
+    opts?.updatedAt ?? Math.floor(Date.now() / 1000);
 
   // Update secondary indexes
   updateIndexesForToken(pkg, tokenId, rootHash);
@@ -543,7 +587,11 @@ export function ingest(pkg: UxfPackageData, token: unknown): void {
  *       in a local list; commit pool + manifest + indexes only after
  *       the loop completes.
  */
-export function ingestAll(pkg: UxfPackageData, tokens: unknown[]): void {
+export function ingestAll(
+  pkg: UxfPackageData,
+  tokens: unknown[],
+  opts?: { updatedAt?: number },
+): void {
   if (tokens.length === 0) return;
   const pool = wrapPool(pkg);
   const newTokens: Array<{ tokenId: string; rootHash: ContentHash }> = [];
@@ -639,7 +687,9 @@ export function ingestAll(pkg: UxfPackageData, tokens: unknown[]): void {
     }
     throw err;
   }
-  (pkg.envelope as { updatedAt: number }).updatedAt = Math.floor(Date.now() / 1000);
+  // Stamp envelope updatedAt; caller can lock for determinism.
+  (pkg.envelope as { updatedAt: number }).updatedAt =
+    opts?.updatedAt ?? Math.floor(Date.now() / 1000);
 }
 
 /**
