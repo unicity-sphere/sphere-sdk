@@ -259,6 +259,45 @@ export type VerifyProofFn = (
   requestId: unknown,
 ) => Promise<ProofVerifyStatus>;
 
+/**
+ * Audit #333 H4 — re-derive RequestId and assert the binding.
+ *
+ * Pre-fix the engine called `verifyProof(proof, trustBase, requestId)`
+ * with the bundle-supplied `requestId` and trusted that the un-audited
+ * `hydrateChain` adapter had derived it canonically (i.e.,
+ * `RequestId.create(authenticator.publicKey, sourceState)`). If the
+ * adapter erred or a malicious sender hand-crafted the bundle with a
+ * proof anchored to a DIFFERENT transaction's requestId, the proof
+ * would still verify (it IS a genuine on-chain proof) but it would
+ * be incorrectly attributed to this transaction — a proof-binding
+ * forgery.
+ *
+ * This hook canonically re-derives the requestId from the (parsed)
+ * authenticator and compares it to the bundle-supplied requestId.
+ * `{ ok: true }` permits proof verification to proceed; `{ ok: false }`
+ * routes to `proof-invalid` (the same §5.3 [C](3) class as a clean
+ * PATH_INVALID failure — the proof does not bind to this transaction).
+ *
+ * Production implementations call `RequestId.create(auth.publicKey,
+ * auth.stateHash)` and compare `.toJSON()` (or the SDK's equality
+ * operator) against the bundle's `requestId`. Tests can stub this
+ * directly to exercise the engine's binding-rejection paths.
+ *
+ * Optional — when absent the engine logs a one-shot warning on the
+ * first proof-verify attempt and proceeds with the pre-fix behaviour.
+ * Production wiring SHOULD always provide the hook; the optional shape
+ * preserves back-compat with existing tests.
+ */
+export interface AssertRequestIdBindingResult {
+  readonly ok: boolean;
+  /** Diagnostic for the cryptoInvalid 'proof-invalid' reason payload. */
+  readonly reason?: string;
+}
+export type AssertRequestIdBindingFn = (
+  bundleRequestId: unknown,
+  authenticator: unknown,
+) => Promise<AssertRequestIdBindingResult>;
+
 export type OracleIsSpentFn = (stateHash: string) => Promise<boolean>;
 
 /**
@@ -289,6 +328,15 @@ export interface DispositionEngineInput {
   readonly walkContinuity: WalkContinuityFn;
   readonly verifyProof: VerifyProofFn;
   readonly oracleIsSpent: OracleIsSpentFn;
+  /**
+   * Audit #333 H4 — optional `RequestId` binding asserter. When
+   * provided, called BEFORE every `verifyProof` invocation to confirm
+   * that the bundle's `requestId` was canonically derived from this
+   * tx's `(authenticator.publicKey, sourceState)`. Production wiring
+   * SHOULD always provide; the optional shape preserves test back-
+   * compat. See {@link AssertRequestIdBindingFn}.
+   */
+  readonly assertRequestIdBinding?: AssertRequestIdBindingFn;
 }
 
 // =============================================================================
@@ -636,6 +684,50 @@ export async function processDisposition(
         'structural',
       );
     }
+
+    // Audit #333 H4 — re-derive RequestId and assert the binding.
+    //
+    // BEFORE verifying the inclusion proof, confirm that the bundle-
+    // supplied `requestId` was canonically derived from this tx's
+    // (authenticator.publicKey, sourceState). Without this gate, a
+    // hostile sender could pair a genuine on-chain proof (anchored
+    // to some OTHER transaction's requestId) with this tx, and the
+    // proof verifier would accept it — a proof-binding forgery.
+    //
+    // Production wiring SHOULD provide `assertRequestIdBinding`; when
+    // absent we fall back to the pre-fix behaviour (a one-shot warning
+    // is emitted by the wiring layer, not here, to avoid log spam).
+    if (input.assertRequestIdBinding !== undefined) {
+      let binding: AssertRequestIdBindingResult;
+      try {
+        binding = await input.assertRequestIdBinding(
+          tx.requestId,
+          tx.authenticator,
+        );
+      } catch {
+        // Asserter threw — structural defect at the SDK adapter layer.
+        return structuralInvalid(
+          input,
+          chain.tokenId,
+          input.tokenRootHash,
+          'proof-throw',
+        );
+      }
+      if (!binding.ok) {
+        // The (proof, requestId) pair does not bind to this tx's
+        // (publicKey, sourceState). The proof may itself be a genuine
+        // anchored proof — but it does not belong to this transaction.
+        // §5.3 [C](3) "proof-invalid" — the same class as PATH_INVALID
+        // at the verifier — is the correct routing.
+        return cryptoInvalid(
+          input,
+          chain.tokenId,
+          input.tokenRootHash,
+          'proof-invalid',
+        );
+      }
+    }
+
     let proofStatus: ProofVerifyStatus;
     try {
       proofStatus = await input.verifyProof(

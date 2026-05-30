@@ -157,6 +157,7 @@ import type { DispositionRecord } from '../../../types/disposition';
 import type { ContentHash, UxfElement } from '../../../uxf/types';
 import {
   processDisposition,
+  type AssertRequestIdBindingFn,
   type DispositionEngineInput,
   type EvaluatePredicateFn,
   type HydratedChain,
@@ -354,6 +355,13 @@ export interface LegacyShapeAdapterInput {
   readonly walkContinuity: WalkContinuityFn;
   /** Disposition-engine hook (T.3.B.1 proof verifier). */
   readonly verifyProof: VerifyProofFn;
+  /**
+   * Audit #333 H4 — re-derive RequestId and assert binding. Optional;
+   * when omitted the engine falls back to the pre-fix behaviour of
+   * trusting the hydrateChain-supplied `requestId` unchecked. See
+   * `DispositionEngineInput.assertRequestIdBinding`.
+   */
+  readonly assertRequestIdBinding?: AssertRequestIdBindingFn;
   /** Disposition-engine hook — `oracle.isSpent`. */
   readonly oracleIsSpent: OracleIsSpentFn;
   /** Disposition-engine hook — local manifest reader. */
@@ -742,6 +750,12 @@ function buildEngineInput(
     walkContinuity: input.walkContinuity,
     verifyProof: input.verifyProof,
     oracleIsSpent: input.oracleIsSpent,
+    // Audit #333 H4 — re-derive requestId and assert binding.
+    // Forwarded only when the caller supplies the hook; tests that
+    // do not exercise the binding gate can omit it.
+    ...(input.assertRequestIdBinding !== undefined
+      ? { assertRequestIdBinding: input.assertRequestIdBinding }
+      : {}),
   };
 }
 
