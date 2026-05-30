@@ -33,6 +33,7 @@ import {
   pinCarBlocksToIpfs,
   fetchFromIpfs,
   fetchCarFromIpfs,
+  __resetTrustedRecentWritesForTest,
 } from '../../../profile/ipfs-client';
 import { makeFakeUxfCar } from './_helpers/fake-uxf-car.js';
 import { CarReader } from '@ipld/car';
@@ -753,5 +754,97 @@ describe('Issue #236 follow-up — HTTP-to-local write-back', () => {
     expect(secondCar.byteLength).toBeGreaterThan(0);
     // Confirm zero additional HTTP hits.
     expect(httpHits).toBe(httpHitsAfterFirst);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #360 finding #4 — trusted recent local-helia writes skip read-time
+// verifyCidMatchesBytes for blocks we ourselves just put().
+// ---------------------------------------------------------------------------
+
+describe('Issue #360 finding #4 — trusted-recent-writes skip read-time verify', () => {
+  afterEach(() => {
+    __resetTrustedRecentWritesForTest();
+  });
+
+  it('skips the CID/bytes verify when reading a block we just wrote via pinCarBlocksToIpfs', async () => {
+    // After pinCarBlocksToIpfs writes a block to local helia, the very
+    // next tryGetBlockFromLocalHelia must accept the bytes WITHOUT
+    // re-hashing. We prove the skip by tampering with the on-disk
+    // bytes (the fake helia returns whatever we planted) AFTER the
+    // pin. If the skip is in place, fetchFromIpfs returns the tampered
+    // bytes; if verification ran, it would log a warning and fall
+    // through to HTTP gateways (which we make fail).
+    __resetTrustedRecentWritesForTest();
+    const payload = { tokens: [{ id: 't-trust-1' }] };
+    const carBytes = await makeFakeUxfCar(payload);
+    const reader = await CarReader.fromBytes(carBytes);
+    const roots = await reader.getRoots();
+    const rootCid = roots[0]!.toString();
+
+    const fakeHelia = makeFakeHelia();
+    installPinSuccessMock();
+
+    await pinCarBlocksToIpfs(
+      ['https://gw.test'],
+      carBytes,
+      rootCid,
+      undefined,
+      fakeHelia.helia,
+    );
+
+    // Tamper with the on-disk bytes for rootCid in our fake helia.
+    // A real disk could silently flip a bit; we simulate by overwriting.
+    fakeHelia.blocks.set(rootCid, new Uint8Array([0xde, 0xad, 0xbe, 0xef]));
+
+    // Network off — any HTTP call inflates fetchCalls, failing this test.
+    const offMock = installNetworkOffMock();
+    const fetched = await fetchFromIpfs(
+      ['https://gw.test'],
+      rootCid,
+      1000,
+      undefined,
+      fakeHelia.helia,
+    );
+
+    // Trusted-write skip path returned the tampered bytes verbatim
+    // (no HTTP, no verify error).
+    expect(fetched).toEqual(new Uint8Array([0xde, 0xad, 0xbe, 0xef]));
+    expect(offMock.fetchCalls).toBe(0);
+  });
+
+  it('falls through to HTTP for non-trusted (never-written-here) CIDs that fail local verify', async () => {
+    // Inverse: a CID we never wrote ourselves is NOT in the trusted
+    // set, so read-time verifyCidMatchesBytes runs and rejects the
+    // tampered bytes, falling through to the HTTP gateway.
+    __resetTrustedRecentWritesForTest();
+    const honestBytes = new TextEncoder().encode('honest payload');
+    const honestCid = rawCidFor(honestBytes);
+
+    const fakeHelia = makeFakeHelia();
+    // Plant TAMPERED bytes under the honestCid key — bypassing
+    // putBlockToLocalHelia so the trusted-write set stays empty.
+    fakeHelia.blocks.set(honestCid, new Uint8Array([0xba, 0xad]));
+
+    // HTTP gateway returns the honest bytes — the trusted-set miss
+    // forces the local read to verify, reject, and fall through.
+    globalThis.fetch = async (input) => {
+      const url = typeof input === 'string' ? input : (input as Request).url;
+      if (url.includes('/api/v0/block/get')) {
+        return new Response(honestBytes, { status: 200 });
+      }
+      return new Response('nope', { status: 404 });
+    };
+
+    const fetched = await fetchFromIpfs(
+      ['https://gw.test'],
+      honestCid,
+      5000,
+      undefined,
+      fakeHelia.helia,
+    );
+
+    // Local read rejected (CID mismatch) → gateway delivered honest bytes.
+    expect(fetched).toEqual(honestBytes);
   });
 });

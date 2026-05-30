@@ -58,6 +58,69 @@ function asHelia(value: unknown): HeliaLike | null {
   return value as HeliaLike;
 }
 
+// ---------------------------------------------------------------------------
+// Issue #360 finding #4 — trusted recent local-helia writes.
+//
+// We content-address-verify every byte that crosses an untrusted boundary
+// (HTTP gateway response, CAR/JSON deserialize). For blocks we ourselves
+// just wrote to the local blockstore via `putBlockToLocalHelia` — typically
+// during `pinCarBlocksToIpfs`, where the producer-side CID/bytes binding
+// was already asserted at write time (see ipfs-client.ts:835) — the
+// immediate read-back through `tryGetBlockFromLocalHelia` is redundant.
+//
+// The window is intentionally narrow: a short TTL (~30s) catches the
+// common "write-then-immediately-read" hot path (consolidation flushing
+// a CAR → load() reading the same CAR) without papering over genuine
+// long-term on-disk corruption. Anything older than TTL falls back to
+// the full verify. We also bound the set size so a pathological producer
+// burst cannot grow it unboundedly.
+//
+// We do NOT propagate this trust to the HTTP gateway path
+// (`fetchFromIpfs` → its own `verifyCidMatchesBytes`) — gateway bytes
+// remain fully verified.
+// ---------------------------------------------------------------------------
+
+const TRUSTED_WRITES_TTL_MS = 30_000;
+const TRUSTED_WRITES_MAX = 1_000;
+/** CID string → unix-ms timestamp of the local put. */
+const trustedRecentWrites = new Map<string, number>();
+
+function markCidLocallyWritten(cidString: string): void {
+  const now = Date.now();
+  // Bound-LRU prune: when at the cap, drop the oldest entries (Map
+  // iteration order is insertion order, so the first keys are the
+  // oldest). Keep ~10% headroom to avoid prune-on-every-write churn.
+  if (trustedRecentWrites.size >= TRUSTED_WRITES_MAX) {
+    const targetSize = Math.floor(TRUSTED_WRITES_MAX * 0.9);
+    const toDrop = trustedRecentWrites.size - targetSize;
+    let dropped = 0;
+    for (const key of trustedRecentWrites.keys()) {
+      if (dropped >= toDrop) break;
+      trustedRecentWrites.delete(key);
+      dropped++;
+    }
+  }
+  trustedRecentWrites.set(cidString, now);
+}
+
+function isCidLocallyWrittenRecently(cidString: string): boolean {
+  const ts = trustedRecentWrites.get(cidString);
+  if (ts === undefined) return false;
+  if (Date.now() - ts > TRUSTED_WRITES_TTL_MS) {
+    trustedRecentWrites.delete(cidString);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Test-only — reset the trusted-writes set so test isolation holds.
+ * Exported for unit tests; production code should never call this.
+ */
+export function __resetTrustedRecentWritesForTest(): void {
+  trustedRecentWrites.clear();
+}
+
 /**
  * Best-effort write of a single block into the local Helia blockstore.
  *
@@ -72,6 +135,11 @@ function asHelia(value: unknown): HeliaLike | null {
  * successful HTTP pin. The fallback is the pre-#236 behaviour: the
  * caller's next-process load() reads via HTTP gateways, which becomes
  * available once propagation completes.
+ *
+ * Issue #360 finding #4 — on success we mark the CID in the trusted-
+ * recent-writes set so the very-next `tryGetBlockFromLocalHelia` can
+ * skip the redundant `verifyCidMatchesBytes` (we already CID-verified
+ * the bytes at producer time; see `pinCarBlocksToIpfs`).
  *
  * @returns `true` if the local write succeeded, `false` on any error
  *          (logged via `logger.warn`). The return is informational
@@ -95,6 +163,7 @@ async function putBlockToLocalHelia(
   }
   try {
     await helia.blockstore.put(parsed, blockBytes);
+    markCidLocallyWritten(cidString);
     return true;
   } catch (err) {
     logger.warn(
@@ -182,16 +251,26 @@ async function tryGetBlockFromLocalHelia(
   // verifier. On mismatch: log once, return null, fall through to
   // gateways (which apply their own verification on gateway-returned
   // bytes — see `verifyCidMatchesBytes` in `fetchFromIpfs`).
-  try {
-    verifyCidMatchesBytes(cidString, bytes);
-  } catch (err) {
-    logger.warn(
-      'ipfs-client',
-      `local-helia get returned bytes whose sha256 does NOT match ${cidString} ` +
-        `(likely on-disk corruption); falling through to HTTP gateways: ` +
-        `${err instanceof Error ? err.message : String(err)}`,
-    );
-    return null;
+  //
+  // Issue #360 finding #4 — skip the recompute for CIDs we ourselves
+  // just wrote to the local blockstore within the trusted-write TTL
+  // (`putBlockToLocalHelia` records the CID on success; the producer
+  // path already verified CID/bytes binding at write time via
+  // `pinCarBlocksToIpfs`). The trusted-write trust is bounded by both
+  // TTL and entry count, so an old/cold CID still goes through full
+  // verification.
+  if (!isCidLocallyWrittenRecently(cidString)) {
+    try {
+      verifyCidMatchesBytes(cidString, bytes);
+    } catch (err) {
+      logger.warn(
+        'ipfs-client',
+        `local-helia get returned bytes whose sha256 does NOT match ${cidString} ` +
+          `(likely on-disk corruption); falling through to HTTP gateways: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return null;
+    }
   }
   return bytes;
 }

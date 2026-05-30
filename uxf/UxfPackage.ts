@@ -868,6 +868,15 @@ function mergePkg(
   // Decision 7 — every incoming element's hash must match its key.
   // A failure here is a whole-bundle corruption and aborts the
   // merge before ANY target state is touched.
+  //
+  // Issue #360 finding #4 (DEFERRED): the loop appeared redundant
+  // against importFromCar / packageFromJson verification at source
+  // construction time. But it is ALSO the per-token atomicity
+  // contract's fast-fail gate (see UxfPackage.merge-atomicity tests
+  // and the `Per-token atomicity contract` block above): throw BEFORE
+  // any target mutation. The later `wrapPool(target)` re-verifies
+  // the post-merge pool but too late — target.pool / target.manifest
+  // have already been committed. So we keep the recompute here.
   const stagedPoolInserts = new Map<ContentHash, UxfElement>();
   for (const [hash, element] of source.pool) {
     const recomputed = computeElementHash(element);
