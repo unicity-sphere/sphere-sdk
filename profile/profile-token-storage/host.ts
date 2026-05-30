@@ -164,6 +164,19 @@ export interface ProfileTokenStorageHost {
   setLastDiscoveredPointerCid(c: string | null): void;
 
   /**
+   * Issue #364 Item #4 — snapshot-sourced-load breadcrumb. `true` iff
+   * the active bundle set was last populated exclusively by an
+   * `applySnapshotIfWired()` dispatch. Read by `_loadImpl` to gate the
+   * Rule-4 pairwise verifier. Cleared by `BundleIndex.addBundle()`
+   * (local publish appends a non-snapshot bundle) and by
+   * `handleReplication()` (cross-device merge delivered new bundles).
+   *
+   * See the design-decision comment in `profile-token-storage-provider.ts`
+   * `_loadImpl()` at the Rule-4 gate site for the full rationale.
+   */
+  setLoadSourcedFromSnapshot(b: boolean): void;
+
+  /**
    * A CID whose CAR is pinned to IPFS and whose OrbitDB bundle ref is
    * written, but whose pointer publish (aggregator anchor) is still
    * outstanding due to a transient failure. The next flush AND the

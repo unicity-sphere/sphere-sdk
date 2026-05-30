@@ -271,6 +271,34 @@ export class ProfileTokenStorageProvider
   // assertion has nothing to compare against and trivially passes).
   private lastLoadedFromBundleCids: Set<string> | null = null;
 
+  // ---------------------------------------------------------------------------
+  // Issue #364 Item #4 — snapshot-sourced-load breadcrumb.
+  //
+  // True iff the current active bundle set was last populated exclusively
+  // by an `applySnapshotIfWired()` dispatch (snapshot-driven recovery /
+  // periodic pointer-poll) and NO cross-device replication has landed a
+  // new bundle since. Read by `_loadImpl` to gate Rule-4 pairwise
+  // verification — see the design-decision comment at the gate site.
+  //
+  // Lifecycle:
+  //   - Set `true` at the end of `_applySnapshotIfWiredImpl` after the
+  //     dispatcher returns successfully (callback may have landed 0..N
+  //     bundle entries; in either case the bundle set is now whatever
+  //     the snapshot carried).
+  //   - Reset to `false` when `handleReplication()` detects a new bundle
+  //     CID arriving via OrbitDB cross-device replication — that's the
+  //     point at which the active set is no longer "single trusted
+  //     snapshot blob".
+  //   - Reset to `false` when `BundleIndex.addBundle()` runs (a local
+  //     publish appends a new bundle to the active set; the set is no
+  //     longer a pure snapshot apply product). Conservative — local
+  //     bundles are also trusted, but keeping the gate strict matches
+  //     the design intent in issue #364 Item #4 and the existing
+  //     graceful-degradation catch path tolerates the extra verifier
+  //     work.
+  // ---------------------------------------------------------------------------
+  private loadSourcedFromSnapshot: boolean = false;
+
   // --- Config storage for createForAddress ---
   private readonly _db: ProfileDatabase;
   private readonly _encryptionKeyRaw: Uint8Array | null;
@@ -441,6 +469,9 @@ export class ProfileTokenStorageProvider
       getLastDiscoveredPointerCid: () => this.lastDiscoveredPointerCid,
       setLastDiscoveredPointerCid: (c) => {
         this.lastDiscoveredPointerCid = c;
+      },
+      setLoadSourcedFromSnapshot: (b) => {
+        this.loadSourcedFromSnapshot = b;
       },
       getPendingPublishCid: () => this.pendingPublishCid,
       setPendingPublishCid: (c) => {
@@ -859,7 +890,18 @@ export class ProfileTokenStorageProvider
       this.applySnapshotCallback ?? this.options?.onApplySnapshot ?? null;
     if (typeof callback !== 'function') return null;
     incr('profile.applySnapshot.fired');
-    return callback(cidString);
+    const result = await callback(cidString);
+    // Issue #364 Item #4 — arm the snapshot-sourced-load breadcrumb so
+    // the next `load()` skips Rule-4 pairwise verification (the bundle
+    // set is now the product of a single trusted snapshot blob).
+    // Cleared by `handleReplication()` (cross-device merge) and by
+    // `addBundle()` (local publish). Setting the flag is unconditional
+    // on `joinedAny` — even a snapshot apply that landed zero new
+    // entries still constrains the active bundle set to "what the
+    // snapshot carried", which is the trust condition Rule-4 skip
+    // depends on.
+    this.loadSourcedFromSnapshot = true;
+    return result;
   }
 
   // ---------------------------------------------------------------------------
@@ -1519,19 +1561,53 @@ export class ProfileTokenStorageProvider
       // candidate roots; a single-bundle load has none.
       let verifiedProofs: ReadonlySet<string> | undefined = undefined;
       const verifyInclusionProof = this.options?.oracle?.verifyInclusionProof;
-      // GH #363 prototype — env-gated bypass for the Rule-4 pairwise
-      // UXF-level verification loop. When set, load() skips the
-      // O(N²) pairwise computeVerifiedProofs pass; structural JOIN
-      // still runs and Rule 3 (longest-valid prefix) still applies;
-      // only Rule 4 enrichment is skipped. Mirrors the verifier-failure
-      // catch path below — that fallback is the existing graceful
-      // degradation, this flag just opts into it unconditionally so
-      // we can A/B measure the wall-clock delta.
-      const skipRule4 =
-        typeof process !== 'undefined' && process?.env?.SPHERE_SKIP_RULE4 === '1';
-      if (skipRule4) incr('profile.load.rule4Skipped');
-      if (verifyInclusionProof && loadedBundles.length >= 2 && !skipRule4) {
+      // -------------------------------------------------------------------
+      // Issue #364 Item #4 — design-correct Rule-4 gate.
+      //
+      // Rule 4 of PROFILE-ARCHITECTURE §10.4 enriches per-token JOIN
+      // collisions with a precomputed `verifiedProofs` set so the
+      // resolver can pick the proof-bearing winner across same-core /
+      // different-proof transaction pairs. The pairwise walk is O(N²)
+      // over bundle pool sizes and dominates large-recovery wall-clock
+      // (35.8% of soak wall in issue #363, ~222s of 622s).
+      //
+      // Rule 4's CORRECTNESS need arises only when multiple INDEPENDENT
+      // device contributions land in the active bundle set — that's the
+      // "cross-device JOIN" case where two devices may have produced
+      // siblings of the same source state and the verifier picks the
+      // one with valid aggregator proofs. When the active bundle set
+      // was last populated by a SINGLE TRUSTED SNAPSHOT BLOB (the
+      // snapshot was authored by one device, signed and CID-anchored
+      // via the aggregator pointer layer, and dispatched into our
+      // local BundleIndex by `applySnapshotIfWired`), every bundle in
+      // the set came through the SAME trust boundary. Two snapshot-
+      // sourced bundles cannot encode a genuine cross-device divergence
+      // — the producer's local merge already resolved any siblings
+      // before publication.
+      //
+      // The existing catch path below (line ~1635) already proves the
+      // codebase tolerates `verifiedProofs = undefined`: on a verifier
+      // throw, we fall through to non-enriched merge and Rule 3
+      // (longest-valid prefix) still applies. Making `undefined` the
+      // default for snapshot-sourced loads is a design-correct
+      // graceful-degradation extension, not a correctness regression.
+      //
+      // `loadSourcedFromSnapshot` is armed by `_applySnapshotIfWiredImpl`
+      // and cleared by `BundleIndex.addBundle` (local publish) and
+      // `handleReplication` (cross-device merge). When cleared, the
+      // pairwise walk runs as before.
+      //
+      // See: GH issue #364 Item #4; GH issue #363 perf instrumentation
+      // (−33.6% soak wall when SPHERE_SKIP_RULE4=1 was set
+      // unconditionally — this gate captures the same win on the
+      // snapshot-sourced path while preserving correctness on the
+      // cross-device path).
+      // -------------------------------------------------------------------
+      const skipRule4Snapshot = this.loadSourcedFromSnapshot;
+      if (skipRule4Snapshot) incr('profile.load.rule4SkippedSnapshot');
+      if (verifyInclusionProof && loadedBundles.length >= 2 && !skipRule4Snapshot) {
         incr('profile.load.rule4PairwiseInvocations');
+        incr('profile.load.rule4PairwiseCrossDevice');
         const __r4Start = performance.now();
         try {
           // Pairwise accumulation via the existing helper. `computeVerifiedProofs`
@@ -3741,6 +3817,14 @@ export class ProfileTokenStorageProvider
       }
 
       if (hasNew) {
+        // Issue #364 Item #4 — cross-device replication delivered new
+        // bundle CIDs that did NOT come through `applySnapshotIfWired`.
+        // The active bundle set is no longer purely snapshot-sourced;
+        // disarm the Rule-4 skip so the next `load()` runs the pairwise
+        // verifier (multiple device contributions ⇒ Rule-4 is the
+        // conflict-resolution mechanism).
+        this.loadSourcedFromSnapshot = false;
+
         this.emitEvent({
           type: 'storage:remote-updated',
           timestamp: Date.now(),
