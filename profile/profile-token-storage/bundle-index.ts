@@ -191,6 +191,13 @@ export class BundleIndex implements ProfileSyncWriter {
       }
     }
     this.host.getKnownBundleCids().add(cid);
+    // Issue #360 Finding #1 (second-order) — record that the local
+    // process just authored this bundle CID. `handleReplication`
+    // consults this set so the OrbitDB 'update' event our own write
+    // triggers does NOT fire a full aggregator poll + bundle re-fetch.
+    // Best-effort: a missing hook on a test stub host is tolerated by
+    // the optional chain below.
+    this.host.noteLocallyAuthoredBundleCid?.(cid);
     // Item #15 Phase C — every bundle-ref add changes our snapshot.
     this.host.notifyProfileDirty();
   }

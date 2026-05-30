@@ -190,6 +190,23 @@ export interface ProfileTokenStorageHost {
   getKnownBundleCids(): Set<string>;
   setKnownBundleCids(s: Set<string>): void;
 
+  /**
+   * Issue #360 Finding #1 (second-order) — record that the local process
+   * just authored a bundle ref for `cid`. The provider tracks these in a
+   * small time-bounded set (~60s window) so the replication handler can
+   * distinguish "a CID newly visible to OrbitDB because WE wrote it" from
+   * "a CID newly visible because a peer replicated it". The former needs
+   * no aggregator poll or CAR re-fetch — pre-#360 it triggered both,
+   * yielding a feedback loop where 1 save → ~B IPFS round-trips.
+   *
+   * Best-effort, never throws. Bounded internally by the provider to
+   * keep memory deterministic across long-running daemon sessions.
+   *
+   * Optional so test-stub hosts that don't model the dedup path remain
+   * compatible (the BundleIndex caller uses optional chaining).
+   */
+  noteLocallyAuthoredBundleCid?(cid: string): void;
+
   // --- Last-loaded snapshot (read by load() / shutdown()) ---
   getLastLoadedData(): TxfStorageDataBase | null;
   setLastLoadedData(d: TxfStorageDataBase | null): void;

@@ -117,6 +117,23 @@ import {
 /** Default write-behind debounce interval in milliseconds. */
 const DEFAULT_FLUSH_DEBOUNCE_MS = 2000;
 
+/**
+ * Issue #360 Finding #1 (second-order) — how long a locally-authored
+ * bundle CID stays in the "recently authored" guard set. Sized to comfortably
+ * exceed typical OrbitDB gossipsub + aggregator-poll round-trip latency so
+ * a delayed `handleReplication` for our OWN write still skips the full
+ * re-sync. After the window elapses, the CID is treated as novel (worst
+ * case: one redundant aggregator poll on a CID we already know).
+ */
+const RECENTLY_AUTHORED_BUNDLE_WINDOW_MS = 60_000;
+
+/**
+ * Cap on the resident size of the recently-authored bundle CID set.
+ * Prevents unbounded memory growth in a daemon that emits thousands of
+ * bundles per minute. Eviction is FIFO by insertion order.
+ */
+const RECENTLY_AUTHORED_BUNDLE_MAX = 256;
+
 // =============================================================================
 // ProfileTokenStorageProvider
 // =============================================================================
@@ -189,6 +206,26 @@ export class ProfileTokenStorageProvider
 
   // --- Bundle tracking (local cache of known bundles) ---
   private knownBundleCids: Set<string> = new Set();
+
+  /**
+   * Issue #360 Finding #1 (second-order) — bundle CIDs that the LOCAL
+   * process just authored, mapped to their authorship timestamp (ms).
+   * Used by `handleReplication` to detect "OrbitDB 'update' fired
+   * because WE wrote, not because a peer wrote" — a CID set diff alone
+   * cannot distinguish those without this hint.
+   *
+   * Pruned lazily on read: entries older than
+   * `RECENTLY_AUTHORED_BUNDLE_WINDOW_MS` are dropped. The window is
+   * intentionally larger than typical aggregator-poll round-trip
+   * latency so a slightly-delayed `handleReplication` for our OWN
+   * write still skips the full re-sync. After the window elapses,
+   * the CID is treated as "novel" by the guard, which is conservative
+   * (worst case: one redundant aggregator poll).
+   *
+   * Bounded by a simple eviction cap to keep memory deterministic in
+   * a long-running daemon that emits thousands of bundles.
+   */
+  private recentlyAuthoredBundleCids: Map<string, number> = new Map();
 
   // --- Replication listener cleanup ---
   private replicationUnsub: (() => void) | null = null;
@@ -462,6 +499,7 @@ export class ProfileTokenStorageProvider
       setKnownBundleCids: (s) => {
         this.knownBundleCids = s;
       },
+      noteLocallyAuthoredBundleCid: (cid) => this.noteLocallyAuthoredBundleCid(cid),
       // Last-loaded snapshot
       getLastLoadedData: () => this.lastLoadedData,
       setLastLoadedData: (d) => {
@@ -1941,6 +1979,40 @@ export class ProfileTokenStorageProvider
     ref: import('./types.js').UxfBundleRef,
   ): Promise<void> {
     return this.bundleIndex.addBundle(cid, ref);
+  }
+
+  /**
+   * Issue #360 Finding #1 (second-order) — record a locally-authored
+   * bundle CID. Called by `BundleIndex.addBundle` via the host facade
+   * after the underlying OrbitDB write succeeds. Prunes expired entries
+   * inline and caps the resident set to keep memory deterministic in
+   * long-running daemons.
+   */
+  private noteLocallyAuthoredBundleCid(cid: string): void {
+    const now = Date.now();
+    this.pruneRecentlyAuthoredBundleCids(now);
+    this.recentlyAuthoredBundleCids.set(cid, now);
+    if (this.recentlyAuthoredBundleCids.size > RECENTLY_AUTHORED_BUNDLE_MAX) {
+      // Evict oldest by insertion order (Map iteration is insertion-ordered).
+      const oldest = this.recentlyAuthoredBundleCids.keys().next().value;
+      if (oldest !== undefined) {
+        this.recentlyAuthoredBundleCids.delete(oldest);
+      }
+    }
+  }
+
+  /** Drop entries older than the recent-authorship window. */
+  private pruneRecentlyAuthoredBundleCids(now: number): void {
+    const cutoff = now - RECENTLY_AUTHORED_BUNDLE_WINDOW_MS;
+    for (const [cid, ts] of this.recentlyAuthoredBundleCids) {
+      if (ts < cutoff) {
+        this.recentlyAuthoredBundleCids.delete(cid);
+      } else {
+        // Map iteration is insertion-ordered; once we hit a fresh
+        // entry every following entry is fresher.
+        break;
+      }
+    }
   }
 
   private async listBundles(): Promise<Map<string, import('./types.js').UxfBundleRef>> {
@@ -3704,16 +3776,24 @@ export class ProfileTokenStorageProvider
     try {
       await this.bundleIndex.refreshKnownBundles();
 
-      // Check if any new bundle CIDs appeared
-      let hasNew = false;
+      // Check if any new bundle CIDs appeared AND at least one of them
+      // was NOT just authored by this process. Issue #360 Finding #1
+      // (second-order): a CID-set diff alone cannot distinguish "OrbitDB
+      // saw a new ref because a peer replicated" from "OrbitDB saw a new
+      // ref because WE wrote it in this very flush". Pre-#360 the latter
+      // case triggered a full aggregator poll + bundle CAR re-fetch on
+      // every save — N saves caused N redundant network round-trips.
+      // Prune expired entries before the check.
+      this.pruneRecentlyAuthoredBundleCids(Date.now());
+      let hasTrulyNew = false;
       for (const cid of this.knownBundleCids) {
-        if (!previousCids.has(cid)) {
-          hasNew = true;
-          break;
-        }
+        if (previousCids.has(cid)) continue;
+        if (this.recentlyAuthoredBundleCids.has(cid)) continue;
+        hasTrulyNew = true;
+        break;
       }
 
-      if (hasNew) {
+      if (hasTrulyNew) {
         this.emitEvent({
           type: 'storage:remote-updated',
           timestamp: Date.now(),

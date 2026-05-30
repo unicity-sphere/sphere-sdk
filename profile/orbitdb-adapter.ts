@@ -71,8 +71,33 @@ export class OrbitDbAdapter implements ProfileDatabase {
    * correct: a key we wrote in session N cannot be trusted across
    * sessions because a remote peer may have overwritten it (LWW) while
    * we were offline. Local writes are always re-stamped on next write.
+   *
+   * Issue #360 Finding #7 — bounded LRU (max 1000 entries). Pre-fix this
+   * was an unbounded `Set<string>` that grew on every local PUT and was
+   * only cleared on a replication 'update' event (or `close()`). A long-
+   * running session with no peer churn could accumulate tens of thousands
+   * of keys with no upper bound; LRU eviction keeps the working set
+   * deterministic without changing the security contract (older keys
+   * fall out → conservative downgrade to 'replicated' on next read).
    */
-  private localAuthoredKeys: Set<string> = new Set();
+  private localAuthoredKeys: LruSet = new LruSet(LOCAL_AUTHORED_KEYS_MAX);
+
+  /**
+   * Issue #360 Finding #1 — OrbitDB identity hash captured at
+   * `connectInner()` time. Used by the `'update'` event handler to
+   * filter out OUR OWN local writes (`addOperation` in upstream
+   * `@orbitdb/core/src/database.js` emits `'update'` for both local
+   * `addOperation` and remote `applyOperation`). When the handler can
+   * confidently match the entry's `identity` field against this hash,
+   * it skips `localAuthoredKeys.clear()` and the replication callback
+   * — local writes do NOT amplify into a full network re-sync.
+   *
+   * Null when identity is not yet captured (pre-connect / between
+   * connects) or the OrbitDB instance does not expose `identity.hash`
+   * (very old test stubs). In that case the handler falls back to the
+   * pre-#360 conservative behaviour (fire on every update).
+   */
+  private ownIdentityId: string | null = null;
 
   /**
    * Steelman⁴⁸ WARNING: dedup concurrent connect() calls.
@@ -728,6 +753,24 @@ export class OrbitDbAdapter implements ProfileDatabase {
 
       this.db = await this.orbitdb.open(dbName, openOptions);
 
+      // Issue #360 Finding #1 — capture the OrbitDB identity hash so the
+      // 'update' event handler can distinguish OUR local writes from
+      // peer replication. `entry.identity` on an OpLog entry is the
+      // author identity's hash (see `@orbitdb/core/src/oplog/entry.js`
+      // → `entry.identity = identity.hash`); the matching field on the
+      // open DB / OrbitDB instance is `identity.hash`. Prefer the DB's
+      // identity (the one the access controller signs against), fall
+      // back to the orbitdb instance's identity. Null on test stubs
+      // that don't model identities — the handler degrades gracefully.
+      this.ownIdentityId =
+        (this.db?.identity as { hash?: unknown } | undefined)?.hash as
+          | string
+          | undefined ??
+        (this.orbitdb?.identity as { hash?: unknown } | undefined)?.hash as
+          | string
+          | undefined ??
+        null;
+
       this.connected = true;
       // Capture config for resetCorruptedLog (issue #310 / OpLog auto-reset).
       // Retained across close() so a flush-time auto-reset can rebuild a
@@ -1137,6 +1180,11 @@ export class OrbitDbAdapter implements ProfileDatabase {
     // observability reference. Next connect() installs a fresh shim.
     this.pinShim = null;
 
+    // Issue #360 — drop the cached OrbitDB identity hash. The next
+    // connect() captures a fresh one (deterministic for the same
+    // privateKey/dbNameOverride, but conceptually session-scoped).
+    this.ownIdentityId = null;
+
     this.connected = false;
     // Clear the shutdown gate AFTER `this.connected` flips. A
     // subsequent connect() resets it again defensively below.
@@ -1146,12 +1194,41 @@ export class OrbitDbAdapter implements ProfileDatabase {
   onReplication(callback: () => void): () => void {
     this.ensureConnected();
 
-    // OrbitDB databases emit 'update' events when remote entries are merged.
-    // Invalidate the locally-authored set: a replication event means a peer
-    // may have overwritten any of our keys (LWW per-key), so we can no
-    // longer trust the stored `originated` tag for ANY key without
-    // re-authoring. This is conservative (over-invalidates) but safe.
-    const handler = () => {
+    // OrbitDB databases emit 'update' events from BOTH local `addOperation`
+    // AND remote `applyOperation` (see `@orbitdb/core/src/database.js`
+    // lines 137 & 153). Pre-#360 the handler fired on every update,
+    // causing the profile-token-storage `handleReplication` callback to
+    // poll the aggregator + refetch every bundle CAR every single time
+    // WE wrote — a save loop where N saves = N full network re-syncs.
+    //
+    // Issue #360 Finding #1 — filter by author identity. The OrbitDB entry's
+    // `identity` field is the author identity's hash (see
+    // `@orbitdb/core/src/oplog/entry.js`: `entry.identity = identity.hash`).
+    // Match against the hash we captured in `connectInner` and skip both
+    // the `localAuthoredKeys.clear()` and the replication callback when
+    // it's our own write. When the entry shape is unexpected (missing
+    // identity, no captured ownIdentityId, test stub without identities),
+    // fall back to the conservative pre-#360 behaviour (clear + fire).
+    const handler = (entry?: { identity?: unknown } | unknown) => {
+      const entryIdentity =
+        entry !== null &&
+        typeof entry === 'object' &&
+        'identity' in (entry as { identity?: unknown })
+          ? (entry as { identity?: unknown }).identity
+          : undefined;
+      if (
+        this.ownIdentityId !== null &&
+        typeof entryIdentity === 'string' &&
+        entryIdentity === this.ownIdentityId
+      ) {
+        // Our own write — no peer state landed, no callback needed.
+        return;
+      }
+      // Replication event from a peer (or unknown provenance).
+      // Invalidate the locally-authored set: a peer may have
+      // overwritten any of our keys (LWW per-key), so we can no
+      // longer trust the stored `originated` tag for ANY key
+      // without re-authoring.
       this.localAuthoredKeys.clear();
       callback();
     };
@@ -1291,6 +1368,8 @@ export class OrbitDbAdapter implements ProfileDatabase {
     // Issue #311 — drop the pin-shim handle alongside helia (the
     // wrapped blockstore.put is dead with helia stopped).
     this.pinShim = null;
+    // Issue #360 — see closeInner() for rationale.
+    this.ownIdentityId = null;
     this.connected = false;
     // A config that produced a failed connect is suspect — wipe it so
     // resetCorruptedLog() cannot silently reuse a known-bad input.
@@ -1725,4 +1804,61 @@ export const __coerceToUint8ArrayForTest = coerceToUint8Array;
  */
 function isBrowserEnvironment(): boolean {
   return typeof (globalThis as { window?: unknown }).window !== 'undefined';
+}
+
+/**
+ * Issue #360 Finding #7 — maximum size of the bounded `localAuthoredKeys`
+ * LRU. Caps the per-session memory growth from unbounded LOCAL `putEntry`
+ * accumulation. 1000 keeps the working set well above any realistic
+ * single-session write burst (token-bundle refs, profile keys) without
+ * unbounded growth in a long-running daemon process.
+ */
+const LOCAL_AUTHORED_KEYS_MAX = 1000;
+
+/**
+ * Tiny LRU set with the same API surface as `Set<string>` for `has`,
+ * `add`, and `clear` — the only three methods `OrbitDbAdapter` consumes.
+ * Backed by a `Map<string, true>` so JS's Map insertion-order preserves
+ * the access ordering: on overflow we evict the oldest key
+ * (`map.keys().next().value`).
+ *
+ * Issue #360 Finding #7: replaces the unbounded `Set<string>` that grew
+ * on every local PUT with a bounded structure. Eviction is conservative
+ * for the security contract — an evicted key reads back via `getEntry`
+ * as `'replicated'` (the fail-closed default), not as a forged claim.
+ */
+class LruSet {
+  private readonly max: number;
+  private readonly map: Map<string, true> = new Map();
+
+  constructor(max: number) {
+    this.max = max;
+  }
+
+  has(key: string): boolean {
+    return this.map.has(key);
+  }
+
+  add(key: string): void {
+    // Re-insert to refresh recency (Map preserves insertion order).
+    if (this.map.has(key)) {
+      this.map.delete(key);
+    }
+    this.map.set(key, true);
+    if (this.map.size > this.max) {
+      const oldest = this.map.keys().next().value;
+      if (oldest !== undefined) {
+        this.map.delete(oldest);
+      }
+    }
+  }
+
+  clear(): void {
+    this.map.clear();
+  }
+
+  /** Test-only — current resident key count. */
+  get size(): number {
+    return this.map.size;
+  }
 }
