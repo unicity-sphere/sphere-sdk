@@ -325,19 +325,25 @@ describe('Profile Integration', () => {
 
       let savedData: TxfStorageDataBase | null = null;
       const historyEntries: any[] = [];
+      // C2 (Audit #333) — mock simulates the real flush contract:
+      //   - save() places data in "pendingData" (source: 'cache')
+      //   - awaitNextFlush() promotes it to "durable" (source: 'remote')
+      let _flushed = false;
       const profileTokenStorage = {
         setIdentity() {},
         async initialize() { return true; },
         async shutdown() {},
         async save(data: TxfStorageDataBase) {
           savedData = data;
+          _flushed = false;
           return { success: true, timestamp: Date.now() };
         },
+        async awaitNextFlush(_timeoutMs?: number) { _flushed = true; },
         async load() {
           return {
             success: savedData !== null,
             data: savedData,
-            source: 'cache',
+            source: _flushed ? 'remote' : 'cache',
             timestamp: Date.now(),
           };
         },
@@ -395,12 +401,17 @@ describe('Profile Integration', () => {
         getStatus() { return 'connected'; },
       } as any;
 
+      // C2 (Audit #333) — null-txfData path: no save() call, no flush
+      // requirement (migration's stepPersistToOrbitDb skips when
+      // data.txfData === null). The mock still implements awaitNextFlush
+      // for future-proofing in case the migration tightens the contract.
       const profileTokenStorage = {
         setIdentity() {},
         async initialize() { return true; },
         async shutdown() {},
         async save() { return { success: true, timestamp: Date.now() }; },
-        async load() { return { success: true, data: undefined, source: 'cache', timestamp: Date.now() }; },
+        async awaitNextFlush(_timeoutMs?: number) { /* no-op */ },
+        async load() { return { success: true, data: undefined, source: 'remote', timestamp: Date.now() }; },
         async sync() { return { success: true, added: 0, removed: 0, conflicts: 0 }; },
         async connect() {},
         async disconnect() {},
