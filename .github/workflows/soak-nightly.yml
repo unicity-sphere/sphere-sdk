@@ -1,0 +1,207 @@
+# V6-RECOVER Soak (nightly + on-demand)
+#
+# Layer-3 deliverable of the V6-RECOVER test-coverage gap (companion to
+# tests/integration/payments/v6-recover-real-sdk-recovery.test.ts).
+#
+# Why this exists
+# ---------------
+# The V6-RECOVER "Stranded receive ... Recipient address mismatch" failure
+# mode is currently only catchable end-to-end by running
+# `manual-test-full-recovery.sh` — a multi-process, cross-network soak that
+# drives two daemons (peer1, peer2), real testnet aggregator, real Nostr
+# relay, and real IPFS. Unit tests (the L1 file referenced above; plus the
+# existing PaymentsModule.recipient-address-mismatch-recovery.test.ts and
+# PaymentsModule.proof-polling-persistence.test.ts #269 tests) cover the
+# helper logic and the error classifier, but only the soak exercises the
+# §C → §D handoff where the regression manifests.
+#
+# Running the soak under CI:
+#   - schedule: nightly at 06:00 UTC (off-peak for testnet aggregator)
+#   - workflow_dispatch: on-demand for triage / pre-merge verification
+#
+# External dependencies
+# ---------------------
+# The soak requires the @unicity-sphere/cli tool installed globally. The
+# CLI is a separate repository (https://github.com/unicity-sphere/sphere-cli)
+# that vendors a built version of THIS sphere-sdk repo via npm link. The
+# `Prepare CLI` step below clones, builds, and links it.
+#
+# Skip-not-fail policy
+# --------------------
+# Testnet aggregator and Nostr relay are external to this repo. When either
+# is unreachable we mark the job as PASS with a clear "external infra down"
+# message rather than failing — a flake on a third-party service must NOT
+# block a release.
+#
+# Artifacts
+# ---------
+# On any non-skip exit, we upload the full soak workspace + log so a
+# developer can inspect snapshots, daemon state, and the verbose-debug log.
+
+name: V6-RECOVER Soak
+
+on:
+  schedule:
+    # 06:00 UTC daily — well off-peak for the testnet aggregator.
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: 'SPHERE_DEBUG value (use "*" for full verbose)'
+        required: false
+        default: '*'
+      timeout-minutes:
+        description: 'Hard timeout for the soak script (minutes)'
+        required: false
+        default: '30'
+
+permissions:
+  contents: read
+
+jobs:
+  soak:
+    name: manual-test-full-recovery.sh (testnet)
+    runs-on: ubuntu-latest
+    # Default 35 min: 5 min headroom over the workflow_dispatch input.
+    # Override via the dispatch input when triaging hangs.
+    timeout-minutes: ${{ fromJSON(github.event.inputs.timeout-minutes || '30') }}
+
+    steps:
+      - name: Checkout sphere-sdk
+        uses: actions/checkout@v4
+        with:
+          path: sphere-sdk
+
+      - name: Use Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: sphere-sdk/package-lock.json
+
+      - name: Probe external dependencies (skip-not-fail when down)
+        id: probe
+        run: |
+          set -u
+          # Probe 1 — testnet aggregator HTTPS endpoint.
+          if ! curl -fsSL --max-time 10 -o /dev/null \
+               https://goggregator-test.unicity.network/health 2>/dev/null \
+            && ! curl -fsSL --max-time 10 -o /dev/null \
+                  https://goggregator-test.unicity.network/ 2>/dev/null; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "reason=testnet aggregator unreachable" >> "$GITHUB_OUTPUT"
+            echo "::warning::testnet aggregator at goggregator-test.unicity.network is unreachable — skipping soak (not a sphere-sdk regression)"
+            exit 0
+          fi
+          # Probe 2 — testnet Nostr relay (WebSocket; HEAD on the HTTPS
+          # form of the URL is sufficient to confirm DNS + TLS reach).
+          if ! curl -fsSL --max-time 10 -o /dev/null \
+               https://nostr-relay.testnet.unicity.network/ 2>/dev/null; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "reason=testnet Nostr relay unreachable" >> "$GITHUB_OUTPUT"
+            echo "::warning::testnet Nostr relay at nostr-relay.testnet.unicity.network is unreachable — skipping soak (not a sphere-sdk regression)"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "reason=" >> "$GITHUB_OUTPUT"
+
+      - name: Build sphere-sdk
+        if: steps.probe.outputs.skip != 'true'
+        working-directory: sphere-sdk
+        run: |
+          npm install --include=optional --ignore-scripts
+          npm rebuild
+          npm run build
+
+      - name: Checkout sphere-cli
+        if: steps.probe.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: unicity-sphere/sphere-cli
+          path: sphere-cli
+
+      - name: Prepare sphere-cli (link to local sphere-sdk)
+        if: steps.probe.outputs.skip != 'true'
+        working-directory: sphere-cli
+        run: |
+          # sphere-cli depends on a built sphere-sdk via file: link.
+          # The expected layout (see sphere-cli's package.json) is:
+          #   sphere-cli/node_modules/@unicitylabs/sphere-sdk → ../../sphere-sdk
+          mkdir -p node_modules/@unicitylabs
+          ln -sf "${GITHUB_WORKSPACE}/sphere-sdk" node_modules/@unicitylabs/sphere-sdk
+          npm install --ignore-scripts
+          # Make the CLI binary discoverable on PATH via a wrapper.
+          mkdir -p "${HOME}/.local/bin"
+          ln -sf "$(pwd)/bin/sphere.mjs" "${HOME}/.local/bin/sphere"
+          chmod +x "$(pwd)/bin/sphere.mjs"
+          echo "${HOME}/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Run soak (SPHERE_DEBUG=${{ github.event.inputs.debug || '*' }})
+        if: steps.probe.outputs.skip != 'true'
+        id: soak
+        env:
+          # Verbose debug surfaces V6-RECOVER, Pointer, Profile-TokenStorage
+          # error/warn lines so artifacts contain the full failure context
+          # rather than just the final exit code.
+          SPHERE_DEBUG: ${{ github.event.inputs.debug || '*' }}
+          SPHERE_FULL_TEST_DIR: ${{ github.workspace }}/soak-workspace
+        working-directory: sphere-sdk
+        run: |
+          set +e
+          mkdir -p "${SPHERE_FULL_TEST_DIR}"
+          bash manual-test-full-recovery.sh > "${{ github.workspace }}/soak.log" 2>&1
+          EXIT=$?
+          echo "exit_code=${EXIT}" >> "$GITHUB_OUTPUT"
+          # Emit summary metrics whether the soak passed or failed —
+          # operators want to see V6-RECOVER counts even on green runs.
+          V6_RECOVER_COUNT=$(grep -c 'V6-RECOVER' "${{ github.workspace }}/soak.log" || true)
+          STRANDED_COUNT=$(grep -c 'Stranded receive' "${{ github.workspace }}/soak.log" || true)
+          MONOTONICITY_COUNT=$(grep -c 'POINTER_MONOTONICITY_VIOLATION' "${{ github.workspace }}/soak.log" || true)
+          BCAST_PUB_COUNT=$(grep -cE 'bcast_pub[^0]' "${{ github.workspace }}/soak.log" || true)
+          echo "v6_recover_count=${V6_RECOVER_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "stranded_count=${STRANDED_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "monotonicity_count=${MONOTONICITY_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "bcast_pub_count=${BCAST_PUB_COUNT}" >> "$GITHUB_OUTPUT"
+          # Report to the workflow summary.
+          {
+            echo "## Soak metrics"
+            echo ""
+            echo "| Signal | Count |"
+            echo "|---|---|"
+            echo "| V6-RECOVER lines | ${V6_RECOVER_COUNT} |"
+            echo "| Stranded receive lines | ${STRANDED_COUNT} |"
+            echo "| POINTER_MONOTONICITY_VIOLATION | ${MONOTONICITY_COUNT} |"
+            echo "| bcast_pub > 0 | ${BCAST_PUB_COUNT} |"
+            echo "| Script exit code | ${EXIT} |"
+            echo ""
+            if [ "${EXIT}" -ne 0 ]; then
+              echo "**FAILED** — workspace + log artifacts uploaded; see the \"soak-artifacts-*\" archive."
+            else
+              echo "PASS"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit ${EXIT}
+
+      - name: Upload soak artifacts (on any non-skip exit)
+        if: always() && steps.probe.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ github.workspace }}/soak.log
+            ${{ github.workspace }}/soak-workspace
+          # Retain failures longer than passes so triage has a generous
+          # window; passes auto-prune sooner to keep storage cost down.
+          retention-days: ${{ steps.soak.outputs.exit_code == '0' && 7 || 30 }}
+          if-no-files-found: warn
+
+      - name: Skip summary
+        if: steps.probe.outputs.skip == 'true'
+        run: |
+          {
+            echo "## Soak skipped"
+            echo ""
+            echo "${{ steps.probe.outputs.reason }}"
+            echo ""
+            echo "_This is not a sphere-sdk regression — external infrastructure was unreachable during the probe step._"
+          } >> "$GITHUB_STEP_SUMMARY"
