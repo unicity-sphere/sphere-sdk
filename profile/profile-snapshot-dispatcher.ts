@@ -291,14 +291,28 @@ function accumulate(agg: {
  * per-writer JOIN dispatch. See module docstring for the full
  * contract.
  *
- * Sequencing:
- *   1. Decode every entry's base64 ciphertext (once — shared across
- *      all writer dispatches).
- *   2. Extract unique addressIds.
- *   3. For each addressId, build its writer set and dispatch each
- *      writer's `joinSnapshot()` over its prefix-filtered slice.
- *   4. For the wallet-global BundleIndex, dispatch over the
- *      `tokens.bundle.*` slice.
+ * Sequencing (Issue #360 Finding #8 — single-pass bucketing):
+ *   1. Normalize legacy keys and extract unique addressIds in one
+ *      pass over `snapshot.entries`. No base64 decode yet — that's
+ *      deferred until an entry is actually routed to a writer.
+ *   2. Build the per-writer prefix table by calling
+ *      `deps.writersFor(addressId)` once per observed addressId,
+ *      then sort the combined table by prefix length descending so
+ *      longest-prefix-wins for any future overlap. As of writing,
+ *      no two registered prefixes overlap (see {@link
+ *      ProfileSnapshotJoinDeps.writersFor} and `factory.ts`), so
+ *      longest-match-wins is identical to the prior per-writer
+ *      filter semantics.
+ *   3. Single pass over normalized keys: bucket each entry under
+ *      the first (longest) matching prefix. Decode base64 at the
+ *      moment of bucketing — entries that match no prefix skip
+ *      decode entirely.
+ *   4. Dispatch each writer with its bucket (preserving the prior
+ *      empty-bucket short-circuit). Dispatch order is preserved by
+ *      iterating addressIds and their writers in registration
+ *      order rather than by prefix-length order.
+ *   5. For the wallet-global BundleIndex, dispatch over the
+ *      `tokens.bundle.*` bucket.
  *
  * Per-writer errors are swallowed and logged — a single misbehaving
  * writer must NOT block convergence of the other writers. The
@@ -311,32 +325,115 @@ export async function runProfileSnapshotJoin(
 ): Promise<ApplySnapshotResult> {
   const log = deps.log ?? ((msg: string): void => logger.debug('SnapshotDispatcher', msg));
 
-  // 1. Decode base64 once. Reuse the resulting bytes for every writer's
-  //    prefix-filtered view via `Array.prototype.filter` — no copies.
+  const rawEntries = snapshot.entries;
+  const entryCount = rawEntries.length;
+
+  // 1. Normalize keys + extract addressIds in one pass. Base64 decode
+  //    is deferred to the bucketing step below so entries that no
+  //    writer claims never pay the decode cost (Finding #8).
   //
   //    Issue #335 Phase 2.5 — normalize legacy-form single-blob keys
   //    (`${addr}_tombstones`, `${addr}_invalidatedNametags`) to profile
-  //    form (`${addr}.tombstones`, `${addr}.invalidatedNametags`). The
-  //    lean-snapshot publisher's `storage.keys()` call returns legacy
-  //    form for these via `reverseMapProfileKey`, but the Phase 2
-  //    `SingleBlobSyncWriter` is wired with profile-form `keyPrefix`.
-  //    Without this normalization the dispatcher's pre-filter
-  //    `entries.filter(e.key.startsWith(keyPrefix))` slices an empty
-  //    array and the writer is never called — Phase 2's wiring is
-  //    correct, the entries simply never reach it. See
-  //    `normalizeEntryKey` doc-comment for the full rationale.
-  const entries: SnapshotEntry[] = snapshot.entries.map((e) => ({
-    key: normalizeEntryKey(e.key),
-    encryptedValue: base64ToBytes(e.value),
-  }));
-
-  // 2. Extract unique addressIds.
+  //    form (`${addr}.tombstones`, `${addr}.invalidatedNametags`).
+  //    See `normalizeEntryKey` for the full rationale.
+  const normalizedKeys: string[] = new Array(entryCount);
   const addressIds = new Set<string>();
-  for (const e of entries) {
-    const m = ADDRESS_ID_PREFIX_RE.exec(e.key);
+  for (let i = 0; i < entryCount; i++) {
+    const k = normalizeEntryKey(rawEntries[i].key);
+    normalizedKeys[i] = k;
+    const m = ADDRESS_ID_PREFIX_RE.exec(k);
     if (m !== null) addressIds.add(m[1]);
   }
 
+  // 2. Build the per-writer prefix table. We keep a parallel
+  //    `dispatchOrder` array so the eventual writer-call sequence
+  //    matches the original (addressId iteration order × writer
+  //    registration order, then bundleIndex last). The
+  //    `prefixTable` is sorted by prefix length descending purely
+  //    for the bucketing step's longest-match-wins lookup — no
+  //    writer is invoked out of registration order.
+  interface DispatchSlot {
+    readonly prefix: string;
+    readonly writer: ProfileSyncWriter;
+    readonly label: string; // for error logging
+  }
+  const dispatchOrder: DispatchSlot[] = [];
+  const skippedAddresses: string[] = [];
+  for (const addressId of addressIds) {
+    const writers = deps.writersFor(addressId);
+    if (writers.length === 0) {
+      skippedAddresses.push(addressId);
+      continue;
+    }
+    for (const { keyPrefix, writer } of writers) {
+      dispatchOrder.push({
+        prefix: keyPrefix,
+        writer,
+        label: `writer @ ${keyPrefix}`,
+      });
+    }
+  }
+  for (const addressId of skippedAddresses) {
+    log(
+      `runProfileSnapshotJoin: no writers available for address ${addressId} ` +
+        '(encryption/identity preconditions not yet met) — skipping',
+    );
+  }
+
+  // Sorted prefix table for bucketing. Longest first so a key like
+  // `${addr}.recipientContext.request.X` lands under
+  // `.recipientContext.request.` rather than a hypothetical shorter
+  // `.recipientContext.` prefix. Currently no overlap exists, but
+  // the sort costs O(W log W) (W ≈ 25) and is a free safety net.
+  const prefixTable: DispatchSlot[] = [...dispatchOrder].sort(
+    (a, b) => b.prefix.length - a.prefix.length,
+  );
+
+  // 3. Single-pass bucketing. `buckets` is keyed by writer slot
+  //    identity (the DispatchSlot reference) via a Map; bundle
+  //    entries go into `bundleBucket` directly. Entries that match
+  //    no known prefix are simply unrouted (and skip base64 decode).
+  const buckets = new Map<DispatchSlot, SnapshotEntry[]>();
+  const bundleBucket: SnapshotEntry[] = [];
+
+  for (let i = 0; i < entryCount; i++) {
+    const key = normalizedKeys[i];
+
+    // BundleIndex check first — `tokens.bundle.` is not addressId
+    // prefixed, so testing it once per entry is cheap and avoids
+    // walking the per-address table for global keys.
+    if (key.startsWith(BUNDLE_KEY_PREFIX)) {
+      if (deps.bundleIndex !== null) {
+        bundleBucket.push({
+          key,
+          encryptedValue: base64ToBytes(rawEntries[i].value),
+        });
+      }
+      continue;
+    }
+
+    // Longest-prefix-wins match against per-writer table. Stop at
+    // the first hit — see the doc-comment for why this is
+    // semantically identical to the original per-writer filter for
+    // the current prefix set.
+    for (const slot of prefixTable) {
+      if (key.startsWith(slot.prefix)) {
+        let bucket = buckets.get(slot);
+        if (bucket === undefined) {
+          bucket = [];
+          buckets.set(slot, bucket);
+        }
+        bucket.push({
+          key,
+          encryptedValue: base64ToBytes(rawEntries[i].value),
+        });
+        break;
+      }
+    }
+  }
+
+  // 4. Dispatch in original registration order. Each writer gets
+  //    its bucket (or skips when empty).
   const aggregated = {
     entriesEvaluated: 0,
     liveLanded: 0,
@@ -344,46 +441,32 @@ export async function runProfileSnapshotJoin(
     localWon: 0,
     remoteRejectedMalformed: 0,
   };
-  let bundleEntriesSeen = 0;
 
-  // 3. Per-address writer dispatch.
-  for (const addressId of addressIds) {
-    const writers = deps.writersFor(addressId);
-    if (writers.length === 0) {
+  for (const slot of dispatchOrder) {
+    const slice = buckets.get(slot);
+    if (slice === undefined || slice.length === 0) continue;
+    try {
+      const result = await slot.writer.joinSnapshot(slice);
+      accumulate(aggregated, result);
+    } catch (err) {
+      // A single writer's failure must not block convergence for
+      // the others. The writer's own classifier is responsible for
+      // skipping malformed entries; an exception escaping here is a
+      // hard storage error that the next reconcile will retry.
       log(
-        `runProfileSnapshotJoin: no writers available for address ${addressId} ` +
-          '(encryption/identity preconditions not yet met) — skipping',
+        `runProfileSnapshotJoin: ${slot.label} threw — skipping ` +
+          `(error: ${err instanceof Error ? err.message : String(err)})`,
       );
-      continue;
-    }
-    for (const { keyPrefix, writer } of writers) {
-      // Pre-filter to the writer's exact prefix. Keeps the
-      // `remoteRejectedMalformed` counter signal-only.
-      const slice = entries.filter((e) => e.key.startsWith(keyPrefix));
-      if (slice.length === 0) continue;
-      try {
-        const result = await writer.joinSnapshot(slice);
-        accumulate(aggregated, result);
-      } catch (err) {
-        // A single writer's failure must not block convergence for
-        // the others. The writer's own classifier is responsible for
-        // skipping malformed entries; an exception escaping here is a
-        // hard storage error that the next reconcile will retry.
-        log(
-          `runProfileSnapshotJoin: writer @ ${keyPrefix} threw — skipping ` +
-            `(error: ${err instanceof Error ? err.message : String(err)})`,
-        );
-      }
     }
   }
 
-  // 4. Wallet-global BundleIndex dispatch.
+  // 5. Wallet-global BundleIndex dispatch.
+  let bundleEntriesSeen = 0;
   if (deps.bundleIndex !== null) {
-    const bundleSlice = entries.filter((e) => e.key.startsWith(BUNDLE_KEY_PREFIX));
-    bundleEntriesSeen = bundleSlice.length;
-    if (bundleSlice.length > 0) {
+    bundleEntriesSeen = bundleBucket.length;
+    if (bundleBucket.length > 0) {
       try {
-        const result = await deps.bundleIndex.joinSnapshot(bundleSlice);
+        const result = await deps.bundleIndex.joinSnapshot(bundleBucket);
         accumulate(aggregated, result);
       } catch (err) {
         log(

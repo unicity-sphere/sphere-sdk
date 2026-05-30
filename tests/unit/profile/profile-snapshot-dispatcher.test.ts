@@ -537,3 +537,170 @@ describe('__internal.ADDRESS_ID_PREFIX_RE', () => {
     expect(__internal.ADDRESS_ID_PREFIX_RE.test('DIRECT_aabbccddee_ff.outbox.id1')).toBe(false);
   });
 });
+
+// =============================================================================
+// 8. Issue #360 Finding #8 — single-pass bucketing + longest-prefix-wins
+// =============================================================================
+
+describe('runProfileSnapshotJoin — single-pass bucketing (Finding #8)', () => {
+  it('routes 500 entries across 5 writers in a single pass over the entry list', async () => {
+    // Build a fixture with N writers each owning a distinct prefix
+    // and assert (a) every entry lands in exactly one writer's
+    // bucket and (b) `entries` is iterated at most once. We probe
+    // the iteration count by wrapping `snapshot.entries` in a Proxy
+    // whose `get` counter we inspect afterwards — `Array.prototype.filter`
+    // would re-enter for each writer; the new bucketing reads each
+    // index exactly once.
+    const PREFIXES = [
+      `${ADDR_A}.outbox.`,
+      `${ADDR_A}.sent.`,
+      `${ADDR_A}.recipientContext.request.`,
+      `${ADDR_A}.recipientContext.finalization.`,
+      `${ADDR_A}.invalid.`,
+    ] as const;
+    const writers = PREFIXES.map(() => createStubWriter());
+    const entriesArr: Array<{ key: string; value: string }> = [];
+    for (let i = 0; i < 500; i++) {
+      const prefix = PREFIXES[i % PREFIXES.length];
+      entriesArr.push({
+        key: `${prefix}id${i}`,
+        value: b64(new Uint8Array([i & 0xff])),
+      });
+    }
+    // Track index-level reads on the entries array. We can't easily
+    // proxy a plain array literal through the runtime path, but we
+    // can count `.value` and `.key` accesses on each entry: in the
+    // old code each entry's `.key` was read W=5 times (once per
+    // writer's filter). In the new single-pass code each entry's
+    // `.key` is read exactly once during normalization + bucketing.
+    let keyReads = 0;
+    let valueReads = 0;
+    const probed = entriesArr.map((e) =>
+      new Proxy(e, {
+        get(target, prop, recv) {
+          if (prop === 'key') keyReads++;
+          if (prop === 'value') valueReads++;
+          return Reflect.get(target, prop, recv);
+        },
+      }),
+    );
+    const snapshot: LeanProfileSnapshot = {
+      version: 2,
+      chainPubkey: '02' + 'cc'.repeat(32),
+      network: 'testnet',
+      createdAt: 1_700_000_000_000,
+      entries: probed,
+      bundles: [],
+    };
+
+    const writersFor = (addressId: string): ReadonlyArray<SnapshotJoinWriterEntry> => {
+      if (addressId !== ADDR_A) return [];
+      return PREFIXES.map((p, i) => ({ keyPrefix: p, writer: writers[i] }));
+    };
+
+    await runProfileSnapshotJoin(snapshot, { writersFor, bundleIndex: null });
+
+    // Each writer received its 1/5 slice.
+    for (let i = 0; i < writers.length; i++) {
+      expect(writers[i].calls).toHaveLength(1);
+      expect(writers[i].calls[0]).toHaveLength(100);
+      for (const e of writers[i].calls[0]) {
+        expect(e.key.startsWith(PREFIXES[i])).toBe(true);
+      }
+    }
+    // Single-pass invariant: `.key` is read once for normalization
+    // and once for the address-id regex + bucketing. Either way it
+    // must be MUCH less than 500 * 5 (which is what the original
+    // per-writer filter approach used). Allow a small constant
+    // multiplier headroom for normalization re-reads.
+    expect(keyReads).toBeLessThan(500 * 3);
+    // Each entry's value is decoded exactly once (when bucketed).
+    expect(valueReads).toBe(500);
+  });
+
+  it('longest-prefix-wins when one writer prefix is a prefix of another', async () => {
+    // Construct an overlap: a (hypothetical) shorter prefix and a
+    // longer one. Entries that start with the longer prefix must
+    // land in the longer-prefix writer ONLY, not in the shorter
+    // one's bucket. Entries that start with the short prefix but
+    // not the long one stay with the short writer.
+    const SHORT = `${ADDR_A}.outer.`;
+    const LONG = `${ADDR_A}.outer.inner.`;
+    const shortWriter = createStubWriter();
+    const longWriter = createStubWriter();
+
+    const snapshot = buildSnapshot([
+      // Long-prefix entries
+      { key: `${LONG}a1`, value: b64(new Uint8Array([1])) },
+      { key: `${LONG}a2`, value: b64(new Uint8Array([2])) },
+      // Short-only entries (don't match the long prefix)
+      { key: `${SHORT}other`, value: b64(new Uint8Array([3])) },
+    ]);
+
+    await runProfileSnapshotJoin(snapshot, {
+      writersFor: (addressId) => {
+        if (addressId !== ADDR_A) return [];
+        return [
+          { keyPrefix: SHORT, writer: shortWriter },
+          { keyPrefix: LONG, writer: longWriter },
+        ];
+      },
+      bundleIndex: null,
+    });
+
+    // Long writer claims both long-prefix entries.
+    expect(longWriter.calls).toHaveLength(1);
+    expect(longWriter.calls[0].map((e) => e.key)).toEqual([
+      `${LONG}a1`,
+      `${LONG}a2`,
+    ]);
+    // Short writer claims only the entry that doesn't match the
+    // longer prefix.
+    expect(shortWriter.calls).toHaveLength(1);
+    expect(shortWriter.calls[0].map((e) => e.key)).toEqual([
+      `${SHORT}other`,
+    ]);
+  });
+
+  it('skips base64 decode for entries that match no writer prefix', async () => {
+    // Entries that match neither a writer prefix nor BUNDLE_KEY_PREFIX
+    // must NOT have their base64 value read — that's the lazy-decode
+    // half of Finding #8. Use a Proxy on a junk entry's `.value` to
+    // assert it stays untouched.
+    const writer = createStubWriter();
+    let unroutedValueReads = 0;
+    const unroutedEntry = new Proxy(
+      { key: 'global_key_not_routed', value: b64(new Uint8Array([0xAA])) },
+      {
+        get(target, prop, recv) {
+          if (prop === 'value') unroutedValueReads++;
+          return Reflect.get(target, prop, recv);
+        },
+      },
+    );
+
+    const snapshot: LeanProfileSnapshot = {
+      version: 2,
+      chainPubkey: '02' + 'dd'.repeat(32),
+      network: 'testnet',
+      createdAt: 1_700_000_000_000,
+      entries: [
+        unroutedEntry,
+        { key: `${ADDR_A}.outbox.id1`, value: b64(new Uint8Array([1])) },
+      ],
+      bundles: [],
+    };
+
+    await runProfileSnapshotJoin(snapshot, {
+      writersFor: (addressId) => {
+        if (addressId !== ADDR_A) return [];
+        return [{ keyPrefix: `${ADDR_A}.outbox.`, writer }];
+      },
+      bundleIndex: null,
+    });
+
+    expect(writer.calls).toHaveLength(1);
+    expect(writer.calls[0]).toHaveLength(1);
+    expect(unroutedValueReads).toBe(0);
+  });
+});
