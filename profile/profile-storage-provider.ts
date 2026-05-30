@@ -1597,6 +1597,29 @@ export class ProfileStorageProvider implements StorageProvider {
    * SHOULD use `setEntry()` (see below) which accepts an explicit type.
    */
   async set(key: string, value: string, opts?: { entryType?: OpLogEntryType }): Promise<void> {
+    // C1 fail-closed gate (Audit #333):
+    //
+    // The actual attack surface is the OrbitDB write path: the audit's
+    // described scenario is "the seed replicated to third-party IPFS
+    // gateways in cleartext". Local-cache writes are NOT replicated to
+    // IPFS — they live in the device's IndexedDB / FileStorage same
+    // as legacy. The primary defense is therefore the `encrypt()`
+    // throw further down: when `encryptionEnabled === true` and no
+    // key is derived, the OrbitDB write is rejected at the
+    // `writeEnvelope` boundary.
+    //
+    // Sphere.create() legitimately calls `set('mnemonic', ...)` during
+    // Phase A (localCache attached, OrbitDB not yet attached because
+    // identity has not been derived YET — the mnemonic is the INPUT
+    // to identity derivation). Pre-fix-fix the C1 gate fired here too
+    // aggressively and broke that flow. The encrypt() throw remains
+    // the catch-all for the actual IPFS-leak window.
+    //
+    // Identity-class keys (`mnemonic`, `master_key`, ...) intentionally
+    // flow through `localCache.set()` below — that is how the wallet
+    // has always persisted the seed locally. Audit #333 C1 only ever
+    // cared about the OrbitDB replication path.
+
     const translated = translateKey(key, this.addressId);
 
     // Excluded keys — silently drop
@@ -2208,24 +2231,58 @@ export class ProfileStorageProvider implements StorageProvider {
 
   /**
    * Encrypt a string value for OrbitDB storage.
-   * If encryption is disabled, returns the raw UTF-8 bytes.
+   *
+   * Fails CLOSED (Audit #333 C1): when encryption is configured
+   * (`encryptionEnabled === true`) but the encryption key has not
+   * been derived yet (no `setIdentity()` call), throws
+   * `PROFILE_NOT_INITIALIZED`. The previous behaviour returned raw
+   * UTF-8 bytes, which under the common Sphere ordering of
+   * `connect() → setIdentity()` allowed plaintext writes (including
+   * the wallet seed during migration) to land in OrbitDB and
+   * replicate to public IPFS gateways.
+   *
+   * When encryption is disabled entirely (`encrypt: false`, test
+   * mode), returns raw UTF-8 bytes.
    */
   private async encrypt(value: string): Promise<Uint8Array> {
-    if (!this.encryptionEnabled || !this.profileEncryptionKey) {
-      return new TextEncoder().encode(value);
+    if (this.encryptionEnabled) {
+      if (this.profileEncryptionKey === null) {
+        throw new ProfileError(
+          'PROFILE_NOT_INITIALIZED',
+          'ProfileStorageProvider.encrypt() called before setIdentity() ' +
+            'derived the encryption key. Returning plaintext here would ' +
+            'leak the unencrypted value to OrbitDB → IPFS replication. ' +
+            'Call setIdentity() before any write.',
+        );
+      }
+      return encryptString(this.profileEncryptionKey, value);
     }
-    return encryptString(this.profileEncryptionKey, value);
+    return new TextEncoder().encode(value);
   }
 
   /**
    * Decrypt bytes from OrbitDB to a string.
-   * If encryption is disabled, decodes as raw UTF-8.
+   *
+   * Symmetric to {@link encrypt}: throws `PROFILE_NOT_INITIALIZED` when
+   * encryption is enabled but the key has not been derived. A silent
+   * UTF-8 decode in that window would interpret ciphertext as garbage
+   * and quietly corrupt reads of envelope-encrypted entries.
+   *
+   * When encryption is disabled entirely, decodes as raw UTF-8.
    */
   private async decrypt(encrypted: Uint8Array): Promise<string> {
-    if (!this.encryptionEnabled || !this.profileEncryptionKey) {
-      return new TextDecoder().decode(encrypted);
+    if (this.encryptionEnabled) {
+      if (this.profileEncryptionKey === null) {
+        throw new ProfileError(
+          'PROFILE_NOT_INITIALIZED',
+          'ProfileStorageProvider.decrypt() called before setIdentity() ' +
+            'derived the encryption key. Reading ciphertext as UTF-8 would ' +
+            'silently corrupt the returned value. Call setIdentity() first.',
+        );
+      }
+      return decryptString(this.profileEncryptionKey, encrypted);
     }
-    return decryptString(this.profileEncryptionKey, encrypted);
+    return new TextDecoder().decode(encrypted);
   }
 
   // ===========================================================================
