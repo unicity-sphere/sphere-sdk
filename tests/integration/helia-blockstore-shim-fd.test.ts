@@ -25,7 +25,18 @@ import { installHeliaBlockstoreGetShim } from '../../profile/helia-blockstore-sh
 const FD_DIR = '/proc/self/fd';
 const FD_AVAILABLE = existsSync(FD_DIR);
 
-const run = FD_AVAILABLE ? describe : describe.skip;
+// Helia v6 + libp2p stack uses `Promise.withResolvers` transitively via
+// `it-queue` / `mortice` / `@libp2p/peer-store`. On Node 20 the libp2p
+// shutdown path (`Registrar.unhandle` → `PersistentPeerStore.patch`)
+// throws `TypeError: Promise.withResolvers is not a function` during
+// `afterAll`. Matches the existing Node ≥ 22 gate on
+// `tests/integration/orbitdb-adapter.test.ts:32` — same root cause,
+// same fix. Both gates lift when the project drops Node 20 entirely
+// (sphere-sdk#105 follow-up).
+const NODE_MAJOR = parseInt(process.versions.node.split('.')[0], 10);
+const NODE_OK = NODE_MAJOR >= 22;
+
+const run = FD_AVAILABLE && NODE_OK ? describe : describe.skip;
 
 run('helia-blockstore-shim — real FsBlockstore FD bound (#278)', () => {
   let tmp: string;
