@@ -249,9 +249,41 @@ export class UxfPackage {
    * omitted, falls back to the conservative pre-G.3 `divergent`
    * resolution for any pairwise hash mismatch.
    */
-  merge(other: UxfPackage, opts?: { verifiedProofs?: ReadonlySet<string> }): this {
-    mergePkg(this.data, other.data, opts?.verifiedProofs);
-    return this;
+  merge(
+    other: UxfPackage,
+    opts?: {
+      readonly verifiedProofs?: ReadonlySet<string>;
+      /**
+       * Audit #333 H3 — strict mode. When `true`, mergePkg throws a
+       * `UxfError('MERGE_PARTIAL_FAILURE')` summarising every per-token
+       * resolver failure instead of silently dropping the affected
+       * tokens. The default (`false`) preserves the existing "good
+       * tokens survive; bad ones are skipped" contract but now
+       * returns the skipped set so the caller can react.
+       *
+       * Use `strict: true` on the recipient receive path where any
+       * silent drop is observable as token loss; leave default-off
+       * for opportunistic peer JOIN merges where partial coverage
+       * is acceptable.
+       */
+      readonly strict?: boolean;
+      /**
+       * Audit #333 H3 — per-token error callback. Fires once per
+       * skipped tokenId BEFORE strict-mode aggregation. Useful for
+       * telemetry / operator visibility surfaces that want each
+       * failure surfaced individually.
+       */
+      readonly onSkip?: (event: {
+        readonly tokenId: string;
+        readonly error: Error;
+      }) => void;
+    },
+  ): { readonly skipped: ReadonlyArray<MergeSkip> } {
+    return mergePkg(this.data, other.data, {
+      verifiedProofs: opts?.verifiedProofs,
+      strict: opts?.strict,
+      onSkip: opts?.onSkip,
+    });
   }
 
   /**
@@ -725,11 +757,59 @@ export function removeToken(pkg: UxfPackageData, tokenId: string): void {
  *   compatibility partition and pick the majority class. Leave the
  *   refactor — just documenting.
  */
+/**
+ * Audit #333 H3 — per-token merge skip record.
+ *
+ * One entry per source tokenId whose resolver threw during
+ * {@link mergePkg}. The token is NOT present in the merged manifest;
+ * `targetExisting` records what the target already had (if anything)
+ * so the caller can decide whether the skip is recoverable (e.g., the
+ * target's existing root is still good).
+ */
+export interface MergeSkip {
+  readonly tokenId: string;
+  readonly error: Error;
+  /** target.manifest.tokens.get(tokenId) BEFORE the merge attempt. */
+  readonly targetExisting: ContentHash | undefined;
+  /** source.manifest.tokens.get(tokenId) that we failed to incorporate. */
+  readonly sourceIncoming: ContentHash;
+}
+
+/** Internal merge options bag — surfaced through {@link UxfPackage.merge}. */
+interface MergePkgOpts {
+  readonly verifiedProofs?: ReadonlySet<string>;
+  readonly strict?: boolean;
+  readonly onSkip?: (event: {
+    readonly tokenId: string;
+    readonly error: Error;
+  }) => void;
+}
+
+interface MergePkgResult {
+  readonly skipped: ReadonlyArray<MergeSkip>;
+}
+
 function mergePkg(
   target: UxfPackageData,
   source: UxfPackageData,
-  verifiedProofs?: ReadonlySet<string>,
-): void {
+  opts?: MergePkgOpts | ReadonlySet<string>,
+): MergePkgResult {
+  // Back-compat: legacy callers passed `verifiedProofs` directly as the
+  // third positional argument. Normalise both shapes into the opts bag.
+  // (ReadonlySet does not narrow through `instanceof Set` cleanly under
+  // strict-mode TS — fall through an explicit cast.)
+  let normalisedOpts: MergePkgOpts;
+  if (opts === undefined) {
+    normalisedOpts = {};
+  } else if (opts instanceof Set) {
+    normalisedOpts = { verifiedProofs: opts as unknown as ReadonlySet<string> };
+  } else {
+    normalisedOpts = opts as MergePkgOpts;
+  }
+  const verifiedProofs = normalisedOpts.verifiedProofs;
+  const strict = normalisedOpts.strict === true;
+  const onSkip = normalisedOpts.onSkip;
+
   const mutablePool = target.pool as Map<ContentHash, UxfElement>;
   const mutableManifest = target.manifest.tokens as Map<string, ContentHash>;
 
@@ -770,6 +850,13 @@ function mergePkg(
   const stagedManifestWrites = new Map<string, ContentHash>();
   const stagedSyntheticInserts = new Map<ContentHash, UxfElement>();
 
+  // Audit #333 H3 — collect per-token failures so the caller can
+  // observe them. Pre-fix the only signal was a logger.warn, and the
+  // failed tokens silently vanished from the merged manifest. Now the
+  // result carries an explicit `skipped` array; strict mode aggregates
+  // them into a hard throw.
+  const skipped: MergeSkip[] = [];
+
   for (const [tokenId, incomingRoot] of source.manifest.tokens) {
     try {
       const existingRoot = mutableManifest.get(tokenId);
@@ -798,18 +885,62 @@ function mergePkg(
       }
       stagedManifestWrites.set(tokenId, outcome.rootHash);
     } catch (err) {
-      // One poisoned tokenId must not abort the whole merge.
-      // Skip this entry, log it for telemetry / operator review,
-      // and continue. Target state for this tokenId stays at its
-      // pre-merge value (whatever `mutableManifest.get(tokenId)`
-      // was — possibly undefined, i.e. the entry is simply
-      // absent from the merged manifest).
-      const message = err instanceof Error ? err.message : String(err);
+      // Audit #333 H3: a per-token resolver failure used to vanish
+      // with only a logger.warn — token loss from the receive path's
+      // point of view. Now we ALSO record the skip in the result so
+      // the caller can react (telemetry, retry, operator surface,
+      // or hard-fail in strict mode).
+      const error = err instanceof Error ? err : new Error(String(err));
       logger.warn(
         'UxfPackage',
-        `mergePkg: skipping tokenId ${tokenId} — resolver threw: ${message}`,
+        `mergePkg: skipping tokenId ${tokenId} — resolver threw: ${error.message}`,
       );
+      const existingRoot = mutableManifest.get(tokenId);
+      const skipRecord: MergeSkip = {
+        tokenId,
+        error,
+        targetExisting: existingRoot,
+        sourceIncoming: incomingRoot,
+      };
+      skipped.push(skipRecord);
+      if (onSkip) {
+        try {
+          onSkip({ tokenId, error });
+        } catch (cbErr) {
+          // Best-effort: onSkip is observability. A callback throw
+          // must not change merge semantics, so we swallow and log.
+          logger.warn(
+            'UxfPackage',
+            `mergePkg: onSkip callback threw for tokenId=${tokenId} (ignored): ` +
+              `${cbErr instanceof Error ? cbErr.message : String(cbErr)}`,
+          );
+        }
+      }
     }
+  }
+
+  // Audit #333 H3 — strict-mode aggregation.
+  //
+  // BEFORE the atomic apply phase so target state is untouched on the
+  // throw. The aggregated error preserves each per-token cause for
+  // operator triage.
+  if (strict && skipped.length > 0) {
+    const summary = skipped
+      .slice(0, 5)
+      .map((s) => `${s.tokenId.slice(0, 16)}…: ${s.error.message}`)
+      .join('; ');
+    const suffix = skipped.length > 5 ? ` (and ${skipped.length - 5} more)` : '';
+    const aggregate = new UxfError(
+      'MERGE_PARTIAL_FAILURE',
+      `mergePkg(strict): ${skipped.length} per-token resolver failure(s); ` +
+        `target unchanged. ${summary}${suffix}`,
+    );
+    // Stash the structured skip list on the error for callers that
+    // want machine-readable details. We extend the error rather than
+    // bloating UxfError's type so the public type stays stable.
+    (aggregate as unknown as { skipped: ReadonlyArray<MergeSkip> }).skipped =
+      skipped;
+    throw aggregate;
   }
 
   // ---- Phase 3: atomic apply ----
@@ -848,6 +979,9 @@ function mergePkg(
 
   // Update envelope timestamp
   (target.envelope as { updatedAt: number }).updatedAt = Math.floor(Date.now() / 1000);
+
+  // Audit #333 H3 — surface the per-token skip list to the caller.
+  return { skipped };
 }
 
 /**

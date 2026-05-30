@@ -15,7 +15,15 @@ export type UxfErrorCode =
   | 'INVALID_PACKAGE'
   | 'INVALID_INPUT'
   | 'LIMIT_EXCEEDED'
-  | 'NOT_IMPLEMENTED';
+  | 'NOT_IMPLEMENTED'
+  /**
+   * Audit #333 H3 — surfaced by `UxfPackage.merge({ strict: true })`
+   * when one or more per-token resolvers throw. Pre-fix the failures
+   * silently disappeared with only a `logger.warn`. The error
+   * carries a `skipped: MergeSkip[]` field (machine-readable) so
+   * callers can decide how to react.
+   */
+  | 'MERGE_PARTIAL_FAILURE';
 
 /**
  * Structured error for all UXF operations.
