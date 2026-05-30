@@ -32,6 +32,7 @@ import {
   decryptProfileValue,
 } from './encryption.js';
 import { pinCarBlocksToIpfs, fetchCarFromIpfs } from './ipfs-client.js';
+import { runWithConcurrency } from './internal/concurrency.js';
 import { extractCarRootCid } from '../uxf/transfer-payload.js';
 
 // =============================================================================
@@ -52,6 +53,14 @@ const DEFAULT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 /** Threshold: consolidation is needed when active count exceeds this. */
 const CONSOLIDATION_THRESHOLD = 3;
+
+/**
+ * Issue #360 Finding #5 — bundle-fetch concurrency cap for the
+ * consolidation merge loop. Matches the JOIN-load cap in
+ * `profile-token-storage-provider.ts` so both paths exert the same
+ * load shape on the IPFS layer.
+ */
+const DEFAULT_CONSOLIDATION_FETCH_CONCURRENCY = 8;
 
 
 // =============================================================================
@@ -253,20 +262,50 @@ export class ConsolidationEngine {
       const mergedPkg = UxfPackage.create({ description: 'consolidated' });
       const successfullyMergedCids: string[] = [];
 
-      for (const cid of sourceCids) {
+      // Issue #360 Finding #5: fetch source bundles in parallel with a
+      // bounded concurrency cap. Merge stays sequential because
+      // `mergedPkg.merge()` mutates shared state, but the IPFS-bound
+      // wait (which dominates wall-clock) is now O(N / cap) per layer
+      // instead of O(N). Per-bundle fetch failures are non-fatal —
+      // those CIDs simply stay active for retry on the next pass.
+      type FetchOutcome =
+        | { kind: 'ok'; cid: string; pkg: ReturnType<typeof UxfPackage.create> }
+        | { kind: 'err'; cid: string; error: unknown };
+      const fetchOutcomes = await runWithConcurrency<string, FetchOutcome>(
+        sourceCids,
+        DEFAULT_CONSOLIDATION_FETCH_CONCURRENCY,
+        async (cid): Promise<FetchOutcome> => {
+          try {
+            // Issue #200 Phase 2: bundle CIDs are now dag-cbor envelope
+            // CIDs (per-block pinned). `fetchCarFromIpfs` walks the
+            // hierarchical DAG and reassembles a synthetic CAR so the
+            // downstream `UxfPackage.fromCar` consumer stays unchanged.
+            // Legacy raw-CIDs still resolve via the backward-compat branch.
+            const carBytes = await fetchCarFromIpfs(this.ipfsGateways, cid);
+            const pkg = await UxfPackage.fromCar(carBytes);
+            return { kind: 'ok', cid, pkg };
+          } catch (err) {
+            return { kind: 'err', cid, error: err };
+          }
+        },
+      );
+
+      for (const outcome of fetchOutcomes) {
+        if (outcome.kind === 'err') {
+          this.log(
+            `Failed to load bundle ${outcome.cid} during consolidation — ` +
+            `keeping it active (will retry next consolidation): ` +
+            `${outcome.error instanceof Error ? outcome.error.message : String(outcome.error)}`,
+          );
+          // Do NOT mark this bundle as superseded — it stays active for retry
+          continue;
+        }
         try {
-          // Issue #200 Phase 2: bundle CIDs are now dag-cbor envelope
-          // CIDs (per-block pinned). `fetchCarFromIpfs` walks the
-          // hierarchical DAG and reassembles a synthetic CAR so the
-          // downstream `UxfPackage.fromCar` consumer stays unchanged.
-          // Legacy raw-CIDs still resolve via the backward-compat branch.
-          const carBytes = await fetchCarFromIpfs(this.ipfsGateways, cid);
-          const pkg = await UxfPackage.fromCar(carBytes);
-          mergedPkg.merge(pkg);
-          successfullyMergedCids.push(cid);
+          mergedPkg.merge(outcome.pkg);
+          successfullyMergedCids.push(outcome.cid);
         } catch (err) {
           this.log(
-            `Failed to load bundle ${cid} during consolidation — ` +
+            `Failed to merge bundle ${outcome.cid} during consolidation — ` +
             `keeping it active (will retry next consolidation): ` +
             `${err instanceof Error ? err.message : String(err)}`,
           );

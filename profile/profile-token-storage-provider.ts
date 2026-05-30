@@ -84,6 +84,7 @@ import {
   decryptProfileValue,
 } from './encryption.js';
 import { fetchCarFromIpfs } from './ipfs-client.js';
+import { runWithConcurrency } from './internal/concurrency.js';
 import {
   deriveSentFromArchived,
   deriveHistoryFromArchived,
@@ -116,6 +117,19 @@ import {
 
 /** Default write-behind debounce interval in milliseconds. */
 const DEFAULT_FLUSH_DEBOUNCE_MS = 2000;
+
+/**
+ * Issue #360 Finding #5 — bundle-level fetch concurrency cap.
+ *
+ * The JOIN load path fetches every active bundle CAR before merging.
+ * Pre-fix it ran sequentially (B × N × per-block-latency). With this
+ * cap the wall-clock collapses to roughly `ceil(B / cap) × per-bundle`
+ * while keeping the active socket count bounded.
+ *
+ * Picked to match `pinCarBlocksToIpfs`'s pin-side default so the
+ * fetch + pin paths exert the same load shape on the IPFS layer.
+ */
+const DEFAULT_BUNDLE_FETCH_CONCURRENCY = 8;
 
 // =============================================================================
 // ProfileTokenStorageProvider
@@ -1442,36 +1456,59 @@ export class ProfileTokenStorageProvider
       // we can pre-compute verifiedProofs across the full set before
       // running the resolver. Per-bundle fetch failures are non-fatal
       // (partial load is better than failure).
+      //
+      // Issue #360 Finding #5: fetch bundles in parallel with a bounded
+      // concurrency cap (DEFAULT_BUNDLE_FETCH_CONCURRENCY). Order of
+      // `loadedBundles` is rebuilt from the activeBundles iteration
+      // order below — the downstream merge loop (Rule 4 enrichment, see
+      // §10.4) treats the bundle set as a JOIN candidate and is
+      // commutative w.r.t. tokenId, but we preserve insertion order
+      // so logs and the resolver's tie-break visit order stay
+      // deterministic across loads.
+      const bundleCids = Array.from(activeBundles.keys());
+      const fetchResults = await runWithConcurrency(
+        bundleCids,
+        DEFAULT_BUNDLE_FETCH_CONCURRENCY,
+        async (cid): Promise<{ cid: string; pkg: UxfPackageInstance } | null> => {
+          try {
+            // Issue #200 Phase 2: bundle CIDs are now dag-cbor envelope
+            // CIDs (per-block pinned), not raw-CIDs over the CAR bytes.
+            // `fetchCarFromIpfs` walks the dag-cbor link graph and
+            // reassembles a synthetic CAR so `UxfPackage.fromCar` stays
+            // unchanged. Legacy raw-CIDs (pre-#200) still resolve via the
+            // backward-compat branch inside `fetchCarFromIpfs`.
+            //
+            // Issue #236 — pass the local Helia handle so the BFS block
+            // walk satisfies each per-block fetch from our on-disk
+            // blockstore first when available. Cross-process recovery on
+            // the same `dataDir` becomes deterministic: blocks pinned by
+            // the prior process are read locally, independent of HTTP
+            // gateway propagation (~15s on testnet). Cross-device
+            // recovery (where the local blockstore is empty) falls back
+            // to the gateway loop as before.
+            const carBytes = await fetchCarFromIpfs(
+              this._ipfsGateways,
+              cid,
+              undefined,
+              undefined,
+              this.db.getHelia?.(),
+            );
+            const pkg = await UxfPackage.fromCar(carBytes);
+            return { cid, pkg };
+          } catch (err) {
+            this.log(
+              `Failed to load bundle ${cid}: ${err instanceof Error ? err.message : String(err)}`,
+            );
+            return null;
+          }
+        },
+      );
+      // Preserve activeBundles iteration order — `runWithConcurrency`
+      // already returns results in input-index order, so filtering nulls
+      // keeps the original Map insertion order.
       const loadedBundles: Array<{ cid: string; pkg: UxfPackageInstance }> = [];
-      for (const [cid] of activeBundles) {
-        try {
-          // Issue #200 Phase 2: bundle CIDs are now dag-cbor envelope
-          // CIDs (per-block pinned), not raw-CIDs over the CAR bytes.
-          // `fetchCarFromIpfs` walks the dag-cbor link graph and
-          // reassembles a synthetic CAR so `UxfPackage.fromCar` stays
-          // unchanged. Legacy raw-CIDs (pre-#200) still resolve via the
-          // backward-compat branch inside `fetchCarFromIpfs`.
-          //
-          // Issue #236 — pass the local Helia handle so the BFS block
-          // walk satisfies each per-block fetch from our on-disk
-          // blockstore first when available. Cross-process recovery on
-          // the same `dataDir` becomes deterministic: blocks pinned by
-          // the prior process are read locally, independent of HTTP
-          // gateway propagation (~15s on testnet). Cross-device
-          // recovery (where the local blockstore is empty) falls back
-          // to the gateway loop as before.
-          const carBytes = await fetchCarFromIpfs(
-            this._ipfsGateways,
-            cid,
-            undefined,
-            undefined,
-            this.db.getHelia?.(),
-          );
-          const pkg = await UxfPackage.fromCar(carBytes);
-          loadedBundles.push({ cid, pkg });
-        } catch (err) {
-          this.log(`Failed to load bundle ${cid}: ${err instanceof Error ? err.message : String(err)}`);
-        }
+      for (const entry of fetchResults) {
+        if (entry !== null) loadedBundles.push(entry);
       }
 
       // Issue #330 — if every bundle fetch failed but bundle refs DID

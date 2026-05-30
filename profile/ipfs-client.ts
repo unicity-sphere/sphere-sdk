@@ -23,6 +23,7 @@ import * as raw from 'multiformats/codecs/raw';
 import { create as createMultihash } from 'multiformats/hashes/digest';
 import { logger } from '../core/logger.js';
 import { ProfileError } from './errors.js';
+import { runWithConcurrency } from './internal/concurrency.js';
 
 // =============================================================================
 // Issue #236 — Local-Helia primary blockstore
@@ -248,6 +249,23 @@ const DEFAULT_PIN_TIMEOUT_MS = 60_000;
  * where the CAR may contain thousands of blocks.
  */
 const DEFAULT_PIN_CONCURRENCY = 10;
+
+/**
+ * Issue #360 Finding #5 — BFS frontier concurrency for the per-block
+ * walk in `fetchCarFromIpfs`.
+ *
+ * The pre-fix walk fetched every block in the DAG sequentially. With
+ * ~100 blocks per bundle and ~50 ms per fetch, a single bundle took
+ * ~5 s on the gateway path. The frontier-parallel walk collapses each
+ * BFS layer to `ceil(layer_size / cap) × per-block` wall-clock.
+ *
+ * 8 picked to stay under typical browser per-origin HTTP/1.1 socket
+ * caps (Chrome's 6 is multiplexed by HTTP/2 on Kubo) while leaving
+ * headroom for the bundle-level fetch pool above us (worst case both
+ * caps multiply to 8 × 8 = 64 sockets, well under the 256 default
+ * Node limit).
+ */
+const DEFAULT_DAG_WALK_FRONTIER_CONCURRENCY = 8;
 
 /** Default timeout for fetch operations (ms). */
 const DEFAULT_FETCH_TIMEOUT_MS = 30_000;
@@ -1262,60 +1280,112 @@ export async function fetchCarFromIpfs(
   const { decode: dagCborDecode } = await import('@ipld/dag-cbor');
   const { CarWriter } = await import('@ipld/car/writer');
 
+  // Issue #360 Finding #5 — BFS layer-parallel walk.
+  //
+  // The pre-fix loop popped CIDs one at a time and awaited each
+  // `fetchFromIpfs` sequentially. With ~50ms per gateway HEAD/GET and
+  // ~100 blocks per bundle, that was ~5s per CAR even on a healthy
+  // network. The new walk drains the entire current frontier in
+  // parallel (bounded by DEFAULT_DAG_WALK_FRONTIER_CONCURRENCY) and
+  // only awaits decode + child-enqueue serially because decoding
+  // is microsecond-cheap.
+  //
+  // Invariants preserved:
+  //   * Visit-set dedup — frontier entries are de-duplicated against
+  //     `visited` BEFORE the parallel fetch, so the same CID never
+  //     fans out into multiple in-flight requests.
+  //   * Block-cap abort — checked after each frontier resolves so a
+  //     hostile fan-out is still bounded by FETCH_CAR_MAX_BLOCKS.
+  //   * Root-first ordering — `rootCid` is the sole frontier-0 entry
+  //     and is pushed into `blocks` before any children. Within a
+  //     frontier, blocks land in `runWithConcurrency`'s input-index
+  //     order (i.e. the order children were enqueued in the previous
+  //     layer), so the CAR write order remains deterministic across
+  //     repeated walks of the same DAG.
+  //   * Error/timeout semantics — `fetchFromIpfs` and `CID.parse`
+  //     throw the same `ProfileError`s as before; the first failure
+  //     in a frontier aborts the walk (via `runWithConcurrency`).
   const visited = new Set<string>();
   const blocks: Array<{ cid: CID; bytes: Uint8Array }> = [];
-  const queue: string[] = [rootCid];
+  let frontier: string[] = [rootCid];
 
-  while (queue.length > 0) {
-    if (blocks.length >= FETCH_CAR_MAX_BLOCKS) {
+  while (frontier.length > 0) {
+    if (blocks.length + frontier.length > FETCH_CAR_MAX_BLOCKS) {
       throw new ProfileError(
         'BUNDLE_NOT_FOUND',
         `fetchCarFromIpfs: block count exceeded ${FETCH_CAR_MAX_BLOCKS} walking from ${rootCid} ` +
           `(possible cyclic or maliciously-fanned-out DAG)`,
       );
     }
-    const cidStr = queue.shift()!;
-    if (visited.has(cidStr)) continue;
-    visited.add(cidStr);
 
-    let blockCid: CID;
-    try {
-      blockCid = CID.parse(cidStr);
-    } catch (err) {
-      throw new ProfileError(
-        'BUNDLE_NOT_FOUND',
-        `fetchCarFromIpfs: child CID ${cidStr} (reachable from ${rootCid}) failed to parse: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-
-    const blockBytes = await fetchFromIpfs(
-      gateways,
-      cidStr,
-      timeoutMs,
-      maxSizeBytesPerBlock,
-      helia,
-    );
-    blocks.push({ cid: blockCid, bytes: blockBytes });
-
-    // Only dag-cbor blocks can carry inter-block references. Raw blocks
-    // (codec 0x55) are leaves. Unknown codecs are also treated as
-    // leaves — if a future block type needs link walking, extend
-    // this branch explicitly rather than guessing.
-    if (blockCid.code === CODEC_DAG_CBOR) {
-      let decoded: unknown;
+    // De-dupe & parse the frontier BEFORE fetching so we never spawn
+    // two in-flight requests for the same CID.
+    const toFetch: Array<{ cidStr: string; cid: CID }> = [];
+    for (const cidStr of frontier) {
+      if (visited.has(cidStr)) continue;
+      visited.add(cidStr);
+      let blockCid: CID;
       try {
-        decoded = dagCborDecode(blockBytes);
+        blockCid = CID.parse(cidStr);
       } catch (err) {
         throw new ProfileError(
           'BUNDLE_NOT_FOUND',
-          `fetchCarFromIpfs: dag-cbor decode failed for ${cidStr} (reachable from ${rootCid}): ${err instanceof Error ? err.message : String(err)}`,
+          `fetchCarFromIpfs: child CID ${cidStr} (reachable from ${rootCid}) failed to parse: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      toFetch.push({ cidStr, cid: blockCid });
+    }
+    if (toFetch.length === 0) {
+      frontier = [];
+      continue;
+    }
+
+    // Fetch every block in this frontier in parallel (bounded).
+    const fetched = await runWithConcurrency(
+      toFetch,
+      DEFAULT_DAG_WALK_FRONTIER_CONCURRENCY,
+      async ({ cidStr, cid }) => {
+        const bytes = await fetchFromIpfs(
+          gateways,
+          cidStr,
+          timeoutMs,
+          maxSizeBytesPerBlock,
+          helia,
+        );
+        return { cid, cidStr, bytes };
+      },
+    );
+
+    // Append to `blocks` in input-index order (root-first preserved).
+    for (const f of fetched) {
+      blocks.push({ cid: f.cid, bytes: f.bytes });
+    }
+
+    // Decode dag-cbor children to build the next frontier. Decoding is
+    // synchronous and microsecond-cheap so it stays serial; it would
+    // not benefit from worker parallelism.
+    const nextFrontier: string[] = [];
+    const enqueueChild = (childCid: CID): void => {
+      const childStr = childCid.toString();
+      if (!visited.has(childStr)) nextFrontier.push(childStr);
+    };
+    for (const f of fetched) {
+      if (f.cid.code !== CODEC_DAG_CBOR) {
+        // Raw and unknown codecs are leaves — no links to walk. Matches
+        // the pre-fix behaviour (see the "Only dag-cbor blocks can
+        // carry inter-block references" comment removed above).
+        continue;
+      }
+      let decoded: unknown;
+      try {
+        decoded = dagCborDecode(f.bytes);
+      } catch (err) {
+        throw new ProfileError(
+          'BUNDLE_NOT_FOUND',
+          `fetchCarFromIpfs: dag-cbor decode failed for ${f.cidStr} (reachable from ${rootCid}): ${err instanceof Error ? err.message : String(err)}`,
           err,
         );
       }
-      const visit = (childCid: CID): void => {
-        const childStr = childCid.toString();
-        if (!visited.has(childStr)) queue.push(childStr);
-      };
       // Issue #213 (Option C): UXF element blocks encode children as
       // raw 32-byte hash bytes (CBOR bstr) — the SAME canonical form
       // used for hashing — so `sha256(bytes) === cid.multihash.digest`
@@ -1326,11 +1396,12 @@ export async function fetchCarFromIpfs(
       // walker for envelope, manifest, and lean-snapshot blocks (which
       // continue to use CID-link references).
       if (isUxfElement(decoded)) {
-        walkUxfElement(decoded, visit);
+        walkUxfElement(decoded, enqueueChild);
       } else {
-        collectCidLinks(decoded, visit);
+        collectCidLinks(decoded, enqueueChild);
       }
     }
+    frontier = nextFrontier;
   }
 
   // Reassemble a CAR with `rootCid` as the single root and all walked
