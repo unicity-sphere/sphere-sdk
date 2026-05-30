@@ -549,6 +549,12 @@ interface OutboxBuildArgs {
   readonly transferId: string;
   readonly bundleCid: string;
   readonly tokenIds: ReadonlyArray<string>;
+  /**
+   * Audit #333 H5 — source tokens spent in this transfer attempt. The
+   * finalization worker reads this at the `failed-permanent` transition
+   * to drive the source-unlock hook.
+   */
+  readonly sourceTokenIds: ReadonlyArray<string>;
   readonly deliveryMethod: 'car-over-nostr' | 'cid-over-nostr';
   readonly recipient: string;
   readonly recipientTransportPubkey: string;
@@ -576,6 +582,12 @@ function buildOutboxRecord(
     id: args.transferId,
     bundleCid: args.bundleCid,
     tokenIds: args.tokenIds,
+    // Audit #333 H5 — surface the source set for failed-permanent
+    // recovery. Omitted when the set is empty (back-compat: the field
+    // is optional, undefined === empty).
+    ...(args.sourceTokenIds.length > 0
+      ? { sourceTokenIds: args.sourceTokenIds }
+      : {}),
     deliveryMethod: args.deliveryMethod,
     recipient: args.recipient,
     recipientTransportPubkey: args.recipientTransportPubkey,
@@ -937,6 +949,9 @@ export async function sendInstantUxf(
       transferId,
       bundleCid,
       tokenIds,
+      // Audit #333 H5 — record the source token set so the worker can
+      // unlock them on failed-permanent.
+      sourceTokenIds,
       // Set placeholder; updated to the real method when the
       // resolveDelivery decision is known.
       deliveryMethod: wantsCidBranch ? 'cid-over-nostr' : 'car-over-nostr',

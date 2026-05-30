@@ -195,6 +195,21 @@ export interface UxfTransferOutboxEntry {
    *  permitted only for the migration synthetic case. */
   readonly tokenIds: ReadonlyArray<string>;
 
+  /**
+   * Audit #333 H5 — source tokens this outbox entry spent (sender-side
+   * locking surface). Populated by the instant-sender at outbox-record
+   * construction time from the selected source set. Consumed by the
+   * finalization worker at the `failed-permanent` transition to drive
+   * the `recoverFailedPermanentSources` hook — so a hard-failed instant
+   * send unlocks the spender-side balance rather than permanently
+   * locking it as `pending`/`transferring`.
+   *
+   * Optional with `[]` semantics on `undefined` to preserve back-compat
+   * with entries written before H5; the worker treats pre-H5 entries as
+   * "no recovery target" rather than blocking the terminal transition.
+   */
+  readonly sourceTokenIds?: ReadonlyArray<string>;
+
   /** How the bundle was sent. */
   readonly deliveryMethod: 'car-over-nostr' | 'cid-over-nostr' | 'txf-legacy';
 
