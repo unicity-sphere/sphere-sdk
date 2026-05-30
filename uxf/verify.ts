@@ -23,6 +23,7 @@ import type {
   UxfVerificationIssue,
   InstanceChainEntry,
 } from './types.js';
+import { ELEMENT_TYPE_TOKEN_ROOT } from './types.js';
 import { computeElementHash } from './hash.js';
 import { encode as dagCborEncode } from '@ipld/dag-cbor';
 import { VERIFY_MAX_ELEMENT_BYTES } from './limits.js';
@@ -180,6 +181,58 @@ export function verify(pkg: UxfPackageData): UxfVerificationResult {
         elementHash: rootHash,
       });
       continue;
+    }
+
+    // Audit #333 H2 — manifest tokenId binding.
+    //
+    // Pre-fix, the manifest key was only regex-shape-checked at the
+    // import boundary (uxf/json.ts:430, uxf/ipld.ts:555) and never
+    // asserted against the actual genesis tokenId encoded in the
+    // referenced root. Every element hash still self-verified, so a
+    // bundle mapping `tokenId=A → root that mints tokenId=B` passed
+    // every existing gate — an identity-confusion primitive for any
+    // downstream logic that trusts the manifest key (dedup, ownership
+    // filtering, balance computation).
+    //
+    // The token-root element's `content.tokenId` IS the canonical
+    // tokenId for the root (see types.ts:172 TokenRootContent). The
+    // manifest key MUST equal it. Failure here is a hard verification
+    // error; the bundle is structurally unsafe to use.
+    {
+      const rootElement = pkg.pool.get(rootHash);
+      if (rootElement !== undefined) {
+        if (rootElement.type !== ELEMENT_TYPE_TOKEN_ROOT) {
+          errors.push({
+            code: 'MANIFEST_TYPE_MISMATCH',
+            message:
+              `Manifest entry for tokenId=${tokenId} points to a non-root element ` +
+              `(type=${rootElement.type}); expected '${ELEMENT_TYPE_TOKEN_ROOT}'`,
+            tokenId,
+            elementHash: rootHash,
+          });
+        } else {
+          const rootContentTokenId = (rootElement.content as { tokenId?: unknown })
+            .tokenId;
+          if (
+            typeof rootContentTokenId !== 'string' ||
+            rootContentTokenId !== tokenId
+          ) {
+            errors.push({
+              code: 'MANIFEST_TOKENID_MISMATCH',
+              message:
+                `Manifest key tokenId=${tokenId} does not match the referenced ` +
+                `token-root's content.tokenId=${
+                  typeof rootContentTokenId === 'string'
+                    ? rootContentTokenId
+                    : '(missing/non-string)'
+                }. Bundle is structurally inconsistent ` +
+                `(Audit #333 H2 — identity-confusion primitive).`,
+              tokenId,
+              elementHash: rootHash,
+            });
+          }
+        }
+      }
     }
 
     // DFS walk from this token's root, detecting cycles within this subgraph.
