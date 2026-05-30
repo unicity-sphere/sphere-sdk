@@ -13,7 +13,8 @@
  * layer and the conservative `divergent` outcome was the only
  * behaviour ever surfaced to consumers.
  *
- * Strategy: spy on `UxfPackage.prototype.computeVerifiedProofs` and
+ * Strategy: spy on `UxfPackage.computeVerifiedProofsAcross` (the
+ * multi-bundle helper introduced for Issue #360 Finding #2) and on
  * `UxfPackage.prototype.merge` to assert the wiring lights up the
  * right code paths. We don't need a real CAR with verified proofs —
  * the JOIN resolver itself is tested elsewhere. The contract this
@@ -22,13 +23,13 @@
  *
  * Coverage:
  *   - Multi-bundle load with oracle.verifyInclusionProof wired →
- *     computeVerifiedProofs is invoked at least once AND merge() is
- *     called with `{verifiedProofs}`.
- *   - Single-bundle load → computeVerifiedProofs is NOT invoked
- *     AND merge() is called without verifiedProofs.
- *   - No-oracle load → computeVerifiedProofs is NOT invoked.
- *   - computeVerifiedProofs throws → load() still succeeds, falls
- *     back to non-enriched merge.
+ *     computeVerifiedProofsAcross is invoked AND merge() is called
+ *     with `{verifiedProofs}`.
+ *   - Single-bundle load → computeVerifiedProofsAcross is NOT
+ *     invoked AND merge() is called without verifiedProofs.
+ *   - No-oracle load → computeVerifiedProofsAcross is NOT invoked.
+ *   - computeVerifiedProofsAcross throws → load() still succeeds,
+ *     falls back to non-enriched merge.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -203,7 +204,7 @@ describe('ProfileTokenStorageProvider.load — Gap 3 verifiedProofs wiring', () 
     // load() are observed. The spy returns an empty set — we're not
     // testing the verifier itself, only that the wiring fires.
     const computeSpy = vi
-      .spyOn(UxfPackage.prototype, 'computeVerifiedProofs')
+      .spyOn(UxfPackage, 'computeVerifiedProofsAcross')
       .mockResolvedValue(new Set<string>(['stub-proof-hash']));
     const mergeSpy = vi.spyOn(UxfPackage.prototype, 'merge');
 
@@ -234,9 +235,10 @@ describe('ProfileTokenStorageProvider.load — Gap 3 verifiedProofs wiring', () 
     const result = await provider.load();
     expect(result.success).toBe(true);
 
-    // Verification pass: computeVerifiedProofs called at least once
-    // across the bundles (pairwise loop walks each pair).
-    expect(computeSpy).toHaveBeenCalled();
+    // Verification pass: computeVerifiedProofsAcross called once
+    // across all bundles (single combined-pool walk, Issue #360
+    // Finding #2 replacement for the prior pairwise loop).
+    expect(computeSpy).toHaveBeenCalledTimes(1);
 
     // The merge calls AFTER the pre-compute pass must receive
     // `{ verifiedProofs }` as the second arg. mergeSpy may have been
@@ -253,7 +255,7 @@ describe('ProfileTokenStorageProvider.load — Gap 3 verifiedProofs wiring', () 
 
   it('does NOT pre-compute verifiedProofs on single-bundle load (no JOIN collisions possible)', async () => {
     const computeSpy = vi
-      .spyOn(UxfPackage.prototype, 'computeVerifiedProofs')
+      .spyOn(UxfPackage, 'computeVerifiedProofsAcross')
       .mockResolvedValue(new Set<string>());
     const mergeSpy = vi.spyOn(UxfPackage.prototype, 'merge');
 
@@ -282,7 +284,7 @@ describe('ProfileTokenStorageProvider.load — Gap 3 verifiedProofs wiring', () 
 
   it('does NOT pre-compute verifiedProofs when no oracle is wired', async () => {
     const computeSpy = vi
-      .spyOn(UxfPackage.prototype, 'computeVerifiedProofs')
+      .spyOn(UxfPackage, 'computeVerifiedProofsAcross')
       .mockResolvedValue(new Set<string>());
 
     const provider = createProvider(db /* no oracle */);
@@ -315,7 +317,7 @@ describe('ProfileTokenStorageProvider.load — Gap 3 verifiedProofs wiring', () 
   });
 
   it('survives computeVerifiedProofs throwing — load() succeeds and merges proceed without enrichment', async () => {
-    vi.spyOn(UxfPackage.prototype, 'computeVerifiedProofs').mockRejectedValue(
+    vi.spyOn(UxfPackage, 'computeVerifiedProofsAcross').mockRejectedValue(
       new Error('simulated verifier failure'),
     );
     const mergeSpy = vi.spyOn(UxfPackage.prototype, 'merge');

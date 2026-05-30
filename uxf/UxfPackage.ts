@@ -348,14 +348,66 @@ export class UxfPackage {
       proofHash?: string;
     }) => Promise<boolean>,
   ): Promise<Set<string>> {
-    const verified = new Set<string>();
+    // Backward-compat thin wrapper. The multi-bundle implementation
+    // is the single source of truth; the two-package case is just
+    // `[this, other]`.
+    const result = await UxfPackage.computeVerifiedProofsAcross(
+      [this, other],
+      verifier,
+    );
+    // Existing callers expect a mutable `Set<string>`; clone the
+    // ReadonlySet to preserve that contract.
+    return new Set<string>(result);
+  }
+
+  /**
+   * Issue #360 Finding #2 — multi-bundle proof verification.
+   *
+   * Build a single combined pool by merging every package's pool
+   * (later writes overwrite earlier; ContentHash keys make this
+   * collision-safe). Walk the combined pool ONCE to collect each
+   * unique inclusion-proof element, assemble it into the SDK JSON
+   * shape, then run all verifier calls in parallel via
+   * `Promise.all`.
+   *
+   * The previous `computeVerifiedProofs(other)` call-pattern over
+   * B bundles required `B*(B-1)/2` pair walks and re-verified the
+   * same proof once per pair it appeared in. This collapses the
+   * work to `O(unique_proof_count)` verifier invocations dispatched
+   * concurrently, eliminating both the quadratic pair fan-out and
+   * the sequential verifier awaits inside each pair.
+   *
+   * Failures (verifier rejects, assemble throws, etc.) are treated
+   * as "not verified" — the returned set is conservative.
+   */
+  static async computeVerifiedProofsAcross(
+    packages: ReadonlyArray<UxfPackage>,
+    verifier: (input: {
+      proofJson: unknown;
+      transactionHash: string;
+      proofHash?: string;
+    }) => Promise<boolean>,
+  ): Promise<ReadonlySet<string>> {
     const ELEMENT_TYPE_INCLUSION_PROOF = 'inclusion-proof' as const;
-    // Pool from both packages — same proof element may appear in
-    // either or both. Deduped by content hash naturally via Map.
+    // 1. Union pool: ContentHash keys dedupe naturally; later writes
+    //    overwrite earlier (semantically identical for our use case
+    //    because the key IS the content hash, so collisions only
+    //    happen on byte-identical elements).
     const combinedPool = new Map<ContentHash, UxfElement>();
-    for (const [k, v] of this.data.pool) combinedPool.set(k, v);
-    for (const [k, v] of other.data.pool) combinedPool.set(k, v);
+    for (const pkg of packages) {
+      for (const [k, v] of pkg.data.pool) combinedPool.set(k, v);
+    }
+    if (combinedPool.size === 0) return new Set<string>();
+
     const { assembleInclusionProofForVerification } = await import('./assemble.js');
+
+    // 2. Single pass: collect unique inclusion-proof tasks. Assembly
+    //    failures (dangling refs, malformed children) are dropped
+    //    silently — the original per-pair helper did the same.
+    const tasks: Array<{
+      hash: ContentHash;
+      input: { proofJson: unknown; transactionHash: string; proofHash: string };
+    }> = [];
     for (const [hash, el] of combinedPool) {
       if (el.type !== ELEMENT_TYPE_INCLUSION_PROOF) continue;
       const txHashImprintHex = (el.content as Record<string, unknown>).transactionHash;
@@ -366,16 +418,27 @@ export class UxfPackage {
       } catch {
         continue;
       }
-      try {
-        const ok = await verifier({
-          proofJson,
-          transactionHash: txHashImprintHex,
-          proofHash: hash,
-        });
-        if (ok) verified.add(hash);
-      } catch {
-        /* verifier failure → not verified, conservative */
-      }
+      tasks.push({
+        hash,
+        input: { proofJson, transactionHash: txHashImprintHex, proofHash: hash },
+      });
+    }
+
+    // 3. Fan out the verifier calls in parallel. Each task's
+    //    failure is locally caught so one rejection cannot poison
+    //    the whole Promise.all.
+    const results = await Promise.all(
+      tasks.map((t) =>
+        verifier(t.input)
+          .then((ok) => ({ hash: t.hash, ok }))
+          .catch(() => ({ hash: t.hash, ok: false as const })),
+      ),
+    );
+
+    // 4. Collect successes into the result set.
+    const verified = new Set<string>();
+    for (const r of results) {
+      if (r.ok) verified.add(r.hash);
     }
     return verified;
   }

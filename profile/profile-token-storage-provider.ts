@@ -1510,31 +1510,25 @@ export class ProfileTokenStorageProvider
       const verifyInclusionProof = this.options?.oracle?.verifyInclusionProof;
       if (verifyInclusionProof && loadedBundles.length >= 2) {
         try {
-          // Pairwise accumulation via the existing helper. `computeVerifiedProofs`
-          // walks BOTH packages' pools dedup-by-content-hash, so for N
-          // bundles we accumulate the union by walking the previously
-          // merged set against each new bundle. The verifier itself is
-          // deterministic (same input → same output) so cross-device
-          // agreement holds. Each proof is verified at most once because
-          // the helper dedupes by ContentHash inside.
-          const accum = new Set<string>();
-          for (let i = 0; i < loadedBundles.length; i++) {
-            for (let j = i + 1; j < loadedBundles.length; j++) {
-              const pairwise = await loadedBundles[i].pkg.computeVerifiedProofs(
-                loadedBundles[j].pkg,
-                (input: {
-                  proofJson: unknown;
-                  transactionHash: string;
-                  proofHash?: string;
-                }) => verifyInclusionProof.call(this.options!.oracle!, input),
-              );
-              for (const h of pairwise) accum.add(h);
-            }
-          }
-          verifiedProofs = accum;
+          // Issue #360 Finding #2 — single combined-pool walk with
+          // parallel verifier dispatch. The prior `O(B²)` pair loop
+          // re-verified each shared proof once per pair it appeared
+          // in and awaited the verifier sequentially within each
+          // pair; `computeVerifiedProofsAcross` collapses both axes
+          // (verifier called once per unique proof, all in flight
+          // simultaneously). Each proof is verified at most once
+          // because the helper dedupes by ContentHash inside.
+          verifiedProofs = await UxfPackage.computeVerifiedProofsAcross(
+            loadedBundles.map((b) => b.pkg),
+            (input: {
+              proofJson: unknown;
+              transactionHash: string;
+              proofHash?: string;
+            }) => verifyInclusionProof.call(this.options!.oracle!, input),
+          );
           this.log(
             `JOIN: computed verifiedProofs across ${loadedBundles.length} bundles ` +
-              `(${accum.size} proof element(s) verified)`,
+              `(${verifiedProofs.size} proof element(s) verified)`,
           );
         } catch (err) {
           // Verifier failure must not abort the load — fall back to the
