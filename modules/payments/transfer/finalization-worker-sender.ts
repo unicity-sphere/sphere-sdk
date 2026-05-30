@@ -335,6 +335,35 @@ export interface FinalizationWorkerSenderOptions {
    * deterministic version that resolves immediately.
    */
   readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
+  /**
+   * Audit #333 H5 — recover source tokens on `failed-permanent`.
+   *
+   * Pre-fix the worker transitioned to `failed-permanent` and never
+   * touched the source tokens that the instant-sender had marked
+   * `'transferring'` (or `'pending'`) at submit time. With orphan
+   * auto-recovery default-OFF, a failed instant send permanently
+   * locked the source balance as unspendable.
+   *
+   * When wired, this hook fires once per `failed-permanent` transition
+   * with the entry's `sourceTokenIds`. Production should flip each
+   * tokenId's status from `transferring`/`pending` back to a
+   * spendable state (typically `confirmed`) — but only when safe
+   * (e.g., no other live outbox entry holds the same source).
+   *
+   * Errors thrown by the hook are caught and logged; they MUST NOT
+   * block the `failed-permanent` transition itself, which is the
+   * pre-existing terminal-state contract.
+   *
+   * Reads `sourceTokenIds` from the outbox entry (added to
+   * `UxfTransferOutboxEntry` as an optional field for back-compat).
+   * Entries written before H5 lacked this field — for those the hook
+   * is invoked with an empty array (preserves pre-fix behaviour while
+   * still firing the hook for observability).
+   */
+  readonly recoverFailedPermanentSources?: (
+    sourceTokenIds: ReadonlyArray<string>,
+    outboxId: string,
+  ) => Promise<void>;
   /** Optional override of the §6.1 caps. */
   readonly caps?: FinalizationWorkerCaps;
   /**
@@ -1000,6 +1029,41 @@ export class FinalizationWorkerSender {
       }));
       terminal = 'failed-permanent';
       cascadeFailedEmitted = this.maybeEmitCascadeFailed(working, failures);
+
+      // Audit #333 H5 — unlock source tokens on failed-permanent.
+      //
+      // Pre-fix the worker left the source tokens that the instant-
+      // sender had marked `transferring`/`pending` in their locked
+      // state. With orphan auto-recovery default-OFF, the spender-side
+      // balance was permanently stuck. The hook fires once with the
+      // entry's recorded `sourceTokenIds`; production wiring flips
+      // each source back to a spendable state (typically `confirmed`)
+      // gated on a same-source-no-other-live-outbox check.
+      //
+      // Wrap in try/catch — the failed-permanent transition above has
+      // ALREADY committed; a hook failure must not block the terminal
+      // state or it would re-introduce the locked-pending bug it
+      // exists to fix. Errors log via the event surface for triage.
+      if (this.options.recoverFailedPermanentSources !== undefined) {
+        const sources = working.sourceTokenIds ?? [];
+        try {
+          await this.options.recoverFailedPermanentSources(sources, working.id);
+        } catch (err) {
+          // Best-effort observability — emit via the standard event
+          // surface so operators see the unlock failure even though
+          // the failed-permanent transition succeeded.
+          this.options.emit('transfer:failed', {
+            id: working.id,
+            status: 'failed',
+            tokens: [],
+            tokenTransfers: [],
+            error:
+              'failed-permanent transition succeeded, but source-unlock ' +
+              'recovery threw: ' +
+              (err instanceof Error ? err.message : String(err)),
+          });
+        }
+      }
     } else if (
       totalSuccess === outstanding.filter((r) => !completed.has(r)).length &&
       totalSuccess > 0
