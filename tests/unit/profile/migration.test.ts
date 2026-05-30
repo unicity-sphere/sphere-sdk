@@ -101,16 +101,33 @@ function createMockProfileStorage(): ProfileStorageProvider & { _store: Map<stri
 function createMockProfileTokenStorage(
   loadData?: TxfStorageDataBase | null,
   linkedProfileStorage?: { _store: Map<string, string> },
-): ProfileTokenStorageProvider & { _savedData: TxfStorageDataBase | null; _historyEntries: any[] } {
+): ProfileTokenStorageProvider & {
+  _savedData: TxfStorageDataBase | null;
+  _historyEntries: any[];
+  _awaitNextFlushCalls: number;
+  _flushed: boolean;
+} {
   let savedData: TxfStorageDataBase | null = null;
   const historyEntries: any[] = [];
+  // C2 (Audit #333) — mock simulates the real flush contract:
+  //   - save() places data in "pendingData" (source: 'cache')
+  //   - awaitNextFlush() promotes it to "durable" (source: 'remote')
+  // The migration's stepPersistToOrbitDb must call awaitNextFlush() or
+  // stepSanityCheck rejects the source='cache' load.
+  let awaitNextFlushCalls = 0;
+  let flushed = false;
   return {
     setIdentity() {},
     async initialize() { return true; },
     async shutdown() {},
     async save(data: TxfStorageDataBase) {
       savedData = data;
+      flushed = false; // saved → not yet durable until awaitNextFlush
       return { success: true, timestamp: Date.now() };
+    },
+    async awaitNextFlush(_timeoutMs?: number) {
+      awaitNextFlushCalls++;
+      flushed = true;
     },
     async load() {
       // loadData override takes priority (for sanity check simulation);
@@ -119,7 +136,12 @@ function createMockProfileTokenStorage(
       return {
         success: data !== null,
         data: data ?? undefined,
-        source: 'cache' as const,
+        // Mirror the real provider's contract: 'cache' when pendingData
+        // is still live, 'remote' once awaitNextFlush has driven the
+        // flush through to OrbitDB. `loadData` overrides (forced
+        // sanity-check scenarios) still report 'remote' because the
+        // override pretends to come from durable backing.
+        source: (flushed || loadData !== undefined ? 'remote' : 'cache') as const,
         timestamp: Date.now(),
       };
     },
@@ -147,6 +169,8 @@ function createMockProfileTokenStorage(
     async addHistoryEntry(entry: any) { historyEntries.push(entry); },
     get _savedData() { return savedData; },
     _historyEntries: historyEntries,
+    get _awaitNextFlushCalls() { return awaitNextFlushCalls; },
+    get _flushed() { return flushed; },
   } as any;
 }
 
@@ -454,9 +478,12 @@ describe('ProfileMigration', () => {
         async initialize() { return true; },
         async shutdown() {},
         async save() { return { success: true, timestamp: Date.now() }; },
+        async awaitNextFlush(_timeoutMs?: number) { /* no-op */ },
         async load() {
-          // Always return the incomplete data (simulates data loss)
-          return { success: true, data: lessData, source: 'cache' as const, timestamp: Date.now() };
+          // Always return the incomplete data (simulates data loss after
+          // a "successful" flush — source='remote' satisfies the C2 gate
+          // so the sanity-check token-count mismatch path is exercised).
+          return { success: true, data: lessData, source: 'remote' as const, timestamp: Date.now() };
         },
         async sync() { return { success: true, added: 0, removed: 0, conflicts: 0 }; },
         async clear() { return true; },

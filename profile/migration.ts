@@ -619,7 +619,52 @@ export class ProfileMigration {
           `Failed to save token data: ${saveResult.error ?? 'unknown error'}`,
         );
       }
-      this.log(`Token data saved, CID: ${saveResult.cid ?? 'debounced'}`);
+      this.log(`Token data save() returned (initial CID: ${saveResult.cid ?? 'debounced'})`);
+
+      // C2 fix (Audit #333): force durability before cleanup.
+      //
+      // `save()` is debounce-based — it may return `cid: 'debounced'`
+      // and `success: true` while the IPFS pin + OrbitDB bundle ref are
+      // still pending. The legacy cleanup step (5) deletes legacy KV
+      // keys and unpins the legacy CID. If the wallet crashes (or the
+      // debounced flush fails later) between these two points, we lose
+      // both the legacy state AND the new (un-pinned, gateway-
+      // reclaimable) CID. The Profile-side bundle ref is not yet on
+      // OrbitDB, so token-DB loss is also possible.
+      //
+      // `awaitNextFlush()` drives the flush via
+      // `flushScheduler.forceFlushSerialized()` and throws on TIMEOUT or
+      // POINTER_MONOTONICITY_VIOLATION — converting a silent crash-
+      // window data loss into a recoverable MIGRATION_FAILED. The 4-
+      // iteration cap inside `awaitNextFlush` is the only termination
+      // condition (we pass timeoutMs=0 → no wall-clock deadline) since
+      // migration durability legitimately scales with token count and
+      // testnet/IPFS latency.
+      if (typeof profileTokenStorage.awaitNextFlush === 'function') {
+        try {
+          await profileTokenStorage.awaitNextFlush(0);
+          this.log('Token data flush durable (Audit #333 C2)');
+        } catch (err) {
+          throw new ProfileError(
+            'MIGRATION_FAILED',
+            `Forced flush of token data failed; refusing to proceed to ` +
+              `cleanup. Reason: ${err instanceof Error ? err.message : String(err)}`,
+            err,
+          );
+        }
+      } else {
+        // A token-storage provider without `awaitNextFlush` cannot
+        // guarantee durability — refusing to enter cleanup is the only
+        // safe option. This is a hard error rather than a warning
+        // because the alternative is the pre-fix silent-loss path.
+        throw new ProfileError(
+          'MIGRATION_FAILED',
+          'ProfileTokenStorageProvider lacks awaitNextFlush() — refusing ' +
+            'to proceed without a durability gate (Audit #333 C2). ' +
+            'Upgrade the SDK or wire a real provider implementing the ' +
+            'TokenStorageProvider durability contract.',
+        );
+      }
     }
   }
 
@@ -676,6 +721,24 @@ export class ProfileMigration {
           `Failed to load token data from profile: ${loadResult.error ?? 'no data returned'}`,
         );
       } else {
+        // C2 fix (Audit #333): post-flush durability assertion.
+        //
+        // After `stepPersistToOrbitDb`'s `awaitNextFlush()` returns,
+        // `pendingData` MUST be null on the real provider — load() then
+        // walks active bundles in OrbitDB and reports `source:
+        // 'remote'`. A `source: 'cache'` here means the sanity check is
+        // reading uncommitted in-memory state (the audit's exact
+        // complaint: "passes even if nothing was pinned"). Surface as a
+        // hard error so cleanup does not proceed against unverified
+        // backing.
+        if (loadResult.source === 'cache') {
+          errors.push(
+            `Sanity-check load returned source='cache' after persist's ` +
+              `awaitNextFlush(); the bundle ref / IPFS pin is not durable yet. ` +
+              `Refusing to proceed to cleanup (Audit #333 C2).`,
+          );
+        }
+
         const loadedData = loadResult.data;
 
         // Collect token IDs from loaded data
