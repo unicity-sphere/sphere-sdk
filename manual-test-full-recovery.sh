@@ -174,17 +174,55 @@ wait_for_invoice_visible() {
 #     output captured when the CLI runs in verbose mode. Wall-clock
 #     timestamps + monotonic counters (event IDs, bundle counts) make
 #     these lines pure noise for state comparison.
+#   - "[perf-counters] snapshot: { ... }" — MULTI-LINE perf dump emitted
+#     by core/perf-counters.ts on a setInterval when SPHERE_PERF=1. The
+#     opening line is timestamped (and would be stripped by the ISO rule
+#     below), but the continuation lines and the bare closing `}` at
+#     column 0 survive a per-line sed filter and produce spurious
+#     diffs between otherwise-equal snapshots. Issue #364 Item #6.
 #
 # Filtering operates on a temp file the caller hands to diff, leaving
 # the original snapshot untouched for forensics.
+#
+# Implementation note: the awk pass runs FIRST so it can detect the
+# opening `[perf-counters] snapshot: {` line even when that line is
+# timestamped (and would otherwise be eaten by the ISO sed rule before
+# awk gets to see it). The awk state machine drops every line from
+# the opening through the matching closing `}` at column 0 inclusive.
 normalize_snapshot() {
   # shellcheck disable=SC2016
-  sed -E \
+  awk '
+    BEGIN { in_perf = 0 }
+    {
+      if (in_perf) {
+        # Closing brace of the perf-block — always at column 0 because
+        # Node util.inspect renders the top-level } unindented.
+        if ($0 ~ /^\}[[:space:]]*$/) {
+          in_perf = 0
+        }
+        next
+      }
+      # Detect opening of a perf-counters snapshot block. Substring
+      # match works for both timestamped ("[ISO] [INFO ] [perf] ...")
+      # and untimestamped ("[perf] ...") logger output.
+      if (index($0, "[perf-counters] snapshot:") > 0) {
+        # Single-line snapshot (1-counter case): line ends with "}".
+        # Drop and stay outside block mode.
+        if ($0 ~ /\}[[:space:]]*$/) {
+          next
+        }
+        # Multi-line snapshot: line ends with "{". Drop and enter
+        # block mode so subsequent continuation lines are dropped too.
+        in_perf = 1
+        next
+      }
+      print
+    }
+  ' "$1" | sed -E \
     -e '/^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z\] /d' \
     -e '/^  IPFS: \+[0-9]+ added, -[0-9]+ removed$/d' \
     -e '/^Syncing\.\.\.$/d' \
-    -e '/^  Ready\.$/d' \
-    "$1"
+    -e '/^  Ready\.$/d'
 }
 
 assert_diff_empty() {
@@ -201,6 +239,182 @@ assert_diff_empty() {
     return 1
   fi
 }
+
+# ---------------------------------------------------------------------------
+# Optional self-test for normalize_snapshot()
+#
+# Run with: RUN_NORMALIZE_TESTS=1 bash manual-test-full-recovery.sh
+#
+# Pipes synthetic snapshots that EQUAL each other modulo `[perf-counters]
+# snapshot:` blocks through normalize_snapshot() and asserts the diff is
+# empty. Protects against regressions of the #364 Item #6 fix where the
+# multi-line perf dump contaminates byte comparisons between
+# logically-equivalent `sphere status` / `sphere balance` outputs.
+#
+# Exits 0 on pass, non-zero on fail. Bypasses the teardown trap.
+# ---------------------------------------------------------------------------
+
+run_normalize_self_tests() {
+  local tmpdir a b na nb rc=0
+  tmpdir="$(mktemp -d -t normalize-tests.XXXXXX)"
+  a="$tmpdir/a.txt"
+  b="$tmpdir/b.txt"
+  na="$tmpdir/a.norm"
+  nb="$tmpdir/b.norm"
+
+  echo "=== normalize_snapshot self-tests ==="
+
+  # ---- T1: multi-line perf block (untimestamped) ----
+  cat > "$a" <<'EOF'
+Balance: 11 UCT
+Tokens: 3
+EOF
+  cat > "$b" <<'EOF'
+Balance: 11 UCT
+[perf] [perf-counters] snapshot: {
+  'profile.applySnapshot': { count: 42, totalMs: 123.4, avgMs: 2.9, maxMs: 9.8 },
+  'aggregator.fetch': { count: 7, totalMs: 12.3, avgMs: 1.7, maxMs: 4.5 }
+}
+Tokens: 3
+EOF
+  normalize_snapshot "$a" > "$na"
+  normalize_snapshot "$b" > "$nb"
+  if diff -u "$na" "$nb" >/dev/null; then
+    echo "T1 OK: multi-line untimestamped perf block stripped"
+  else
+    echo "T1 FAIL: multi-line untimestamped perf block leaked" >&2
+    diff -u "$na" "$nb" >&2 || true
+    rc=1
+  fi
+
+  # ---- T2: multi-line perf block (timestamped opening) ----
+  cat > "$b" <<'EOF'
+Balance: 11 UCT
+[2026-05-31T12:34:56.789Z] [INFO ] [perf] [perf-counters] snapshot: {
+  'profile.applySnapshot': { count: 42, totalMs: 123.4, avgMs: 2.9, maxMs: 9.8 },
+  'aggregator.fetch': { count: 7, totalMs: 12.3, avgMs: 1.7, maxMs: 4.5 }
+}
+Tokens: 3
+EOF
+  normalize_snapshot "$a" > "$na"
+  normalize_snapshot "$b" > "$nb"
+  if diff -u "$na" "$nb" >/dev/null; then
+    echo "T2 OK: timestamped-opening perf block stripped"
+  else
+    echo "T2 FAIL: timestamped-opening perf block leaked" >&2
+    diff -u "$na" "$nb" >&2 || true
+    rc=1
+  fi
+
+  # ---- T3: single-line perf block (1-counter case) ----
+  cat > "$b" <<'EOF'
+Balance: 11 UCT
+[perf] [perf-counters] snapshot: { a: { count: 1, totalMs: 2, avgMs: 2, maxMs: 2 } }
+Tokens: 3
+EOF
+  normalize_snapshot "$a" > "$na"
+  normalize_snapshot "$b" > "$nb"
+  if diff -u "$na" "$nb" >/dev/null; then
+    echo "T3 OK: single-line perf block stripped"
+  else
+    echo "T3 FAIL: single-line perf block leaked" >&2
+    diff -u "$na" "$nb" >&2 || true
+    rc=1
+  fi
+
+  # ---- T4: multiple consecutive perf blocks ----
+  cat > "$b" <<'EOF'
+Balance: 11 UCT
+[perf] [perf-counters] snapshot: {
+  'a.b.c': { count: 1, totalMs: 2, avgMs: 2, maxMs: 2 },
+  'd.e.f': { count: 3, totalMs: 4, avgMs: 4, maxMs: 4 }
+}
+[perf] [perf-counters] snapshot: {
+  'g.h.i': { count: 5, totalMs: 6, avgMs: 6, maxMs: 6 }
+}
+Tokens: 3
+EOF
+  normalize_snapshot "$a" > "$na"
+  normalize_snapshot "$b" > "$nb"
+  if diff -u "$na" "$nb" >/dev/null; then
+    echo "T4 OK: multiple consecutive perf blocks stripped"
+  else
+    echo "T4 FAIL: multiple consecutive perf blocks leaked" >&2
+    diff -u "$na" "$nb" >&2 || true
+    rc=1
+  fi
+
+  # ---- T5: existing strips still work (ISO + IPFS + Syncing + Ready) ----
+  cat > "$b" <<'EOF'
+Balance: 11 UCT
+[2026-05-31T12:34:56.789Z] [INFO ] [Sphere] something happened
+  IPFS: +3 added, -1 removed
+Syncing...
+  Ready.
+Tokens: 3
+EOF
+  normalize_snapshot "$a" > "$na"
+  normalize_snapshot "$b" > "$nb"
+  if diff -u "$na" "$nb" >/dev/null; then
+    echo "T5 OK: legacy strips intact"
+  else
+    echo "T5 FAIL: legacy strips broken" >&2
+    diff -u "$na" "$nb" >&2 || true
+    rc=1
+  fi
+
+  # ---- T6: counter name containing '}' must not exit perf block early ----
+  # Defensive: counter names in our codebase are dot-paths, but a future
+  # operator-style counter could contain literal braces. We trust the
+  # column-0 anchor of the closing `}` per Node util.inspect formatting.
+  cat > "$b" <<'EOF'
+Balance: 11 UCT
+[perf] [perf-counters] snapshot: {
+  'odd}name': { count: 1, totalMs: 2, avgMs: 2, maxMs: 2 },
+  'other': { count: 3, totalMs: 4, avgMs: 4, maxMs: 4 }
+}
+Tokens: 3
+EOF
+  normalize_snapshot "$a" > "$na"
+  normalize_snapshot "$b" > "$nb"
+  if diff -u "$na" "$nb" >/dev/null; then
+    echo "T6 OK: indented '}' inside counter name does not exit block"
+  else
+    echo "T6 FAIL: indented '}' inside counter name exited block early" >&2
+    diff -u "$na" "$nb" >&2 || true
+    rc=1
+  fi
+
+  # ---- T7: no perf block — identical inputs stay identical ----
+  cat > "$b" <<'EOF'
+Balance: 11 UCT
+Tokens: 3
+EOF
+  normalize_snapshot "$a" > "$na"
+  normalize_snapshot "$b" > "$nb"
+  if diff -u "$na" "$nb" >/dev/null; then
+    echo "T7 OK: identity passthrough"
+  else
+    echo "T7 FAIL: passthrough corrupted equal inputs" >&2
+    diff -u "$na" "$nb" >&2 || true
+    rc=1
+  fi
+
+  rm -rf "$tmpdir"
+  if (( rc == 0 )); then
+    echo "=== normalize_snapshot self-tests: ALL PASS ==="
+  else
+    echo "=== normalize_snapshot self-tests: FAILED ===" >&2
+  fi
+  return "$rc"
+}
+
+if [[ "${RUN_NORMALIZE_TESTS:-}" == "1" ]]; then
+  run_normalize_self_tests
+  # Bypass teardown trap — nothing was created.
+  trap - EXIT INT TERM
+  exit $?
+fi
 
 # Wall-clock anchor + per-section elapsed. SECTION_T0 is set the first
 # time `banner` is invoked; SECTION_LAST_TS tracks the previous banner so
