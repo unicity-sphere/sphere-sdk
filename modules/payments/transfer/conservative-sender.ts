@@ -116,6 +116,7 @@ import {
   type PreflightFinalizeOptions,
 } from './preflight-finalize';
 import { validateTargets, type ValidatedTargets } from './target-validator';
+import { acquireSourceLocks } from './source-locks';
 
 // =============================================================================
 // 1. Public types — commit + select callbacks, deps, return value
@@ -413,6 +414,16 @@ export interface ConservativeSenderDeps {
    * injection.
    */
   readonly __faultInject?: FaultInjectionHooks;
+  /**
+   * **TEST-ONLY** override for the source-lock max-hold timeout
+   * (Audit #333 H1). Defaults to 60_000ms in production; tests override
+   * to a smaller value to exercise the force-release path without
+   * burning real wall-clock seconds. Symmetric with
+   * `InstantSenderDeps.__sourceLockMaxHoldMs`.
+   *
+   * @internal Test seam only.
+   */
+  readonly __sourceLockMaxHoldMs?: number;
 }
 
 /**
@@ -644,6 +655,11 @@ export async function sendConservativeUxf(
     tokenTransfers: [],
   };
 
+  // Audit #333 H1 — same-process source-lock seam, symmetric with
+  // sendInstantUxf. Bound to `null` until selection completes; released
+  // in the outer `finally`. See `./source-locks.ts` for the rationale.
+  let releaseSourceLocks: (() => void) | null = null;
+
   try {
     // -----------------------------------------------------------------
     // Step 1: validate target list (T.2.B).
@@ -715,6 +731,28 @@ export async function sendConservativeUxf(
       );
     }
     result.tokens = [...selected];
+
+    // -----------------------------------------------------------------
+    // Step 2.5 (Audit #333 H1): acquire per-source in-memory locks.
+    //
+    // Mirrors the instant-sender pattern (Wave 4 #171). Held across the
+    // entire preflight → commit → transport → mark sequence so two
+    // parallel sendConservativeUxf calls (or one conservative + one
+    // instant) sharing source tokens cannot both pass selection and
+    // race to commit on-chain. Without this, the aggregator catches
+    // the duplicate-spend after a source is already burned, leaving
+    // the loser's outbox in a recoverable-but-broken state.
+    //
+    // Locks acquired in lex-sorted order of tokenId (deadlock-prevention
+    // discipline shared with instant-sender). Released in the outer
+    // `finally` regardless of success/failure.
+    // -----------------------------------------------------------------
+    const sourceTokenIds = selected.map((t) => t.id);
+    releaseSourceLocks = await acquireSourceLocks(
+      sourceTokenIds,
+      deps.__sourceLockMaxHoldMs,
+      'sendConservativeUxf',
+    );
 
     // -----------------------------------------------------------------
     // Step 3: preflight finalize (T.2.A).
@@ -1207,6 +1245,14 @@ export async function sendConservativeUxf(
     result.error = err instanceof Error ? err.message : String(err);
     deps.emit('transfer:failed', result as TransferResult);
     throw err;
+  } finally {
+    // Audit #333 H1: release per-source locks regardless of success or
+    // failure. Bound to `null` until selection completes; if we threw
+    // before locks were acquired (e.g. validateTargets rejection, empty
+    // selection) there is nothing to release.
+    if (releaseSourceLocks !== null) {
+      releaseSourceLocks();
+    }
   }
 }
 
