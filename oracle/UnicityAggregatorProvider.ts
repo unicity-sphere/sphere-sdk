@@ -11,6 +11,7 @@
  */
 
 import { logger } from '../core/logger';
+import { incr, time } from '../core/perf-counters';
 import type { ProviderStatus } from '../types';
 import type {
   OracleProvider,
@@ -298,6 +299,9 @@ export class UnicityAggregatorProvider implements OracleProvider {
    * Accepts either an SDK TransferCommitment or a simple commitment object.
    */
   async submitCommitment(commitment: TransferCommitment | SdkTransferCommitment): Promise<SubmitResult> {
+    return time('aggregator.submitCommitment', () => this._submitCommitmentImpl(commitment));
+  }
+  private async _submitCommitmentImpl(commitment: TransferCommitment | SdkTransferCommitment): Promise<SubmitResult> {
     this.ensureConnected();
 
     try {
@@ -358,6 +362,9 @@ export class UnicityAggregatorProvider implements OracleProvider {
    * @param commitment - SDK MintCommitment instance
    */
   async submitMintCommitment(commitment: SdkMintCommitment): Promise<SubmitResult> {
+    return time('aggregator.submitMintCommitment', () => this._submitMintCommitmentImpl(commitment));
+  }
+  private async _submitMintCommitmentImpl(commitment: SdkMintCommitment): Promise<SubmitResult> {
     this.ensureConnected();
 
     try {
@@ -405,6 +412,9 @@ export class UnicityAggregatorProvider implements OracleProvider {
   }
 
   async getProof(requestId: string): Promise<InclusionProof | null> {
+    return time('aggregator.getProof', () => this._getProofImpl(requestId));
+  }
+  private async _getProofImpl(requestId: string): Promise<InclusionProof | null> {
     this.ensureConnected();
 
     try {
@@ -495,6 +505,9 @@ export class UnicityAggregatorProvider implements OracleProvider {
   }
 
   async waitForProof(requestId: string, options?: WaitOptions): Promise<InclusionProof> {
+    return time('aggregator.waitForProof', () => this._waitForProofImpl(requestId, options));
+  }
+  private async _waitForProofImpl(requestId: string, options?: WaitOptions): Promise<InclusionProof> {
     const timeout = options?.timeout ?? this.config.timeout;
     const pollInterval = options?.pollInterval ?? TIMEOUTS.PROOF_POLL_INTERVAL;
     const startTime = Date.now();
@@ -520,6 +533,9 @@ export class UnicityAggregatorProvider implements OracleProvider {
   }
 
   async validateToken(tokenData: unknown): Promise<ValidationResult> {
+    return time('aggregator.validateToken', () => this._validateTokenImpl(tokenData));
+  }
+  private async _validateTokenImpl(tokenData: unknown): Promise<ValidationResult> {
     this.ensureConnected();
 
     // Issue #245 #5 — parse the SDK token ONCE so we can reuse it for
@@ -641,6 +657,12 @@ export class UnicityAggregatorProvider implements OracleProvider {
    */
   async waitForProofSdk(
     commitment: SdkTransferCommitment | SdkMintCommitment,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    return time('aggregator.waitForProofSdk', () => this._waitForProofSdkImpl(commitment, signal));
+  }
+  private async _waitForProofSdkImpl(
+    commitment: SdkTransferCommitment | SdkMintCommitment,
     signal?: AbortSignal
   ): Promise<unknown> {
     this.ensureConnected();
@@ -681,6 +703,13 @@ export class UnicityAggregatorProvider implements OracleProvider {
   private static INCLUSION_PROOF_CACHE_MAX = 1024;
 
   async verifyInclusionProof(input: {
+    proofJson: unknown;
+    transactionHash: string;
+    proofHash?: string;
+  }): Promise<boolean> {
+    return time('aggregator.verifyInclusionProof', () => this._verifyInclusionProofImpl(input));
+  }
+  private async _verifyInclusionProofImpl(input: {
     proofJson: unknown;
     transactionHash: string;
     proofHash?: string;
@@ -806,6 +835,9 @@ export class UnicityAggregatorProvider implements OracleProvider {
   }
 
   async isSpent(publicKey: string, stateHash: string): Promise<boolean> {
+    return time('aggregator.isSpent', () => this._isSpentImpl(publicKey, stateHash));
+  }
+  private async _isSpentImpl(publicKey: string, stateHash: string): Promise<boolean> {
     // Cache key binds publicKey + stateHash. A given stateHash may
     // be commit-checked under multiple pubkeys in a multi-address
     // wallet; we MUST NOT cross-pollinate cache hits between keys.
@@ -924,6 +956,9 @@ export class UnicityAggregatorProvider implements OracleProvider {
   }
 
   async getTokenState(tokenId: string): Promise<TokenState | null> {
+    return time('aggregator.getTokenState', () => this._getTokenStateImpl(tokenId));
+  }
+  private async _getTokenStateImpl(tokenId: string): Promise<TokenState | null> {
     this.ensureConnected();
 
     try {
@@ -947,6 +982,9 @@ export class UnicityAggregatorProvider implements OracleProvider {
   }
 
   async getCurrentRound(): Promise<number> {
+    return time('aggregator.getCurrentRound', () => this._getCurrentRoundImpl());
+  }
+  private async _getCurrentRoundImpl(): Promise<number> {
     if (!this.aggregatorClient) {
       // Defensive: aggregator client is constructed in `initialize()`. If
       // `getCurrentRound()` is called before `initialize()` (or after a
@@ -965,6 +1003,9 @@ export class UnicityAggregatorProvider implements OracleProvider {
   }
 
   async mint(params: MintParams): Promise<MintResult> {
+    return time('aggregator.mint', () => this._mintImpl(params));
+  }
+  private async _mintImpl(params: MintParams): Promise<MintResult> {
     this.ensureConnected();
 
     try {
@@ -1002,38 +1043,42 @@ export class UnicityAggregatorProvider implements OracleProvider {
   // ===========================================================================
 
   private async rpcCall<T>(method: string, params: unknown): Promise<T> {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.config.timeout);
+    return time(`aggregator.rpc.${method}`, async () => {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), this.config.timeout);
 
-    try {
-      const response = await fetch(this.config.url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: Date.now(),
-          method,
-          params,
-        }),
-        signal: controller.signal,
-      });
+      try {
+        const response = await fetch(this.config.url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: Date.now(),
+            method,
+            params,
+          }),
+          signal: controller.signal,
+        });
 
-      if (!response.ok) {
-        throw new SphereError(`HTTP ${response.status}: ${response.statusText}`, 'AGGREGATOR_ERROR');
+        if (!response.ok) {
+          incr(`aggregator.rpc.${method}.http_error`);
+          throw new SphereError(`HTTP ${response.status}: ${response.statusText}`, 'AGGREGATOR_ERROR');
+        }
+
+        const result = await response.json();
+
+        if (result.error) {
+          incr(`aggregator.rpc.${method}.rpc_error`);
+          throw new SphereError(result.error.message ?? 'RPC error', 'AGGREGATOR_ERROR');
+        }
+
+        return (result.result ?? {}) as T;
+      } finally {
+        clearTimeout(timeout);
       }
-
-      const result = await response.json();
-
-      if (result.error) {
-        throw new SphereError(result.error.message ?? 'RPC error', 'AGGREGATOR_ERROR');
-      }
-
-      return (result.result ?? {}) as T;
-    } finally {
-      clearTimeout(timeout);
-    }
+    });
   }
 
   // ===========================================================================

@@ -60,6 +60,7 @@ import type { PointerMutex } from './mutex-lock.js';
 import { reconcileAndPublish, type FetchAndJoinCallback } from './reconcile-algorithm.js';
 import type { PointerSigner } from './signing.js';
 import type { BlockedState, PointerVersion } from './types.js';
+import { time } from '../../core/perf-counters.js';
 
 // ── Constructor input ──────────────────────────────────────────────────────
 
@@ -566,8 +567,10 @@ export class ProfilePointerLayer {
   async recoverLatest(opts?: {
     abortSignal?: AbortSignal;
   }): Promise<RecoverResult | RecoverAllUnfetchableResult | null> {
-    this.#assertNotShuttingDown('recoverLatest');
-    return this.#tracked(this.#recoverLatestInner(opts?.abortSignal));
+    return time('pointerLayer.recoverLatest', () => {
+      this.#assertNotShuttingDown('recoverLatest');
+      return this.#tracked(this.#recoverLatestInner(opts?.abortSignal));
+    });
   }
 
   async #recoverLatestInner(
@@ -699,8 +702,10 @@ export class ProfilePointerLayer {
     walkbackLimit?: number,
     opts?: { abortSignal?: AbortSignal },
   ): Promise<DiscoverResult> {
-    this.#assertNotShuttingDown('discoverLatestVersion');
-    return this.#tracked(this.#discoverLatestVersionInner(walkbackLimit, opts?.abortSignal));
+    return time('pointerLayer.discoverLatestVersion', () => {
+      this.#assertNotShuttingDown('discoverLatestVersion');
+      return this.#tracked(this.#discoverLatestVersionInner(walkbackLimit, opts?.abortSignal));
+    });
   }
 
   async #discoverLatestVersionInner(
@@ -1127,20 +1132,23 @@ export class ProfilePointerLayer {
 
   /** Low-level probe for a single version — H2 OR-predicate. */
   async probe(v: PointerVersion): Promise<boolean> {
-    this.#assertNotShuttingDown('probe');
-    return this.#tracked(probeVersion({
-      v,
-      keyMaterial: this.#init.keyMaterial,
-      signer: this.#init.signer,
-      aggregatorClient: this.#init.aggregatorClient,
-      trustBase: this.#init.trustBase,
-    }));
+    return time('pointerLayer.probe', () => {
+      this.#assertNotShuttingDown('probe');
+      return this.#tracked(probeVersion({
+        v,
+        keyMaterial: this.#init.keyMaterial,
+        signer: this.#init.signer,
+        aggregatorClient: this.#init.aggregatorClient,
+        trustBase: this.#init.trustBase,
+      }));
+    });
   }
 
   /** Low-level classifyVersion. */
   async classify(v: PointerVersion): Promise<'VALID' | 'SEMANTICALLY_INVALID' | 'PROOF_TRANSIENT' | 'CAR_TRANSIENT'> {
-    this.#assertNotShuttingDown('classify');
-    return this.#tracked(classifyVersion({
+    return time('pointerLayer.classify', () => {
+      this.#assertNotShuttingDown('classify');
+      return this.#tracked(classifyVersion({
       v,
       keyMaterial: this.#init.keyMaterial,
       signer: this.#init.signer,
@@ -1149,5 +1157,6 @@ export class ProfilePointerLayer {
       decodeCid: this.#init.decodeCid,
       fetchCar: this.#init.fetchCar,
     }));
+    });
   }
 }

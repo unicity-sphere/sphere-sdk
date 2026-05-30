@@ -84,6 +84,7 @@
 import type { StorageProvider, TxfStorageDataBase } from '../storage/storage-provider.js';
 import { STORAGE_KEYS_GLOBAL } from '../constants.js';
 import { sha256 as nobleSha256 } from '@noble/hashes/sha2.js';
+import { time } from '../core/perf-counters.js';
 
 /**
  * Current snapshot schema version. Bumped on incompatible changes; the
@@ -274,6 +275,12 @@ export async function writeSnapshot(
   storage: StorageProvider,
   input: WriteSnapshotInput,
 ): Promise<number> {
+  return time('snapshotCache.writeSnapshot', () => _writeSnapshotImpl(storage, input));
+}
+async function _writeSnapshotImpl(
+  storage: StorageProvider,
+  input: WriteSnapshotInput,
+): Promise<number> {
   const ts = (input.now ?? Date.now)();
   const blobNoHash: Omit<ProfileSnapshotBlob, 'contentHash'> = {
     version: PROFILE_SNAPSHOT_SCHEMA_VERSION,
@@ -376,6 +383,14 @@ export async function writeSnapshot(
  * the next successful flush writes a fresh blob in the current schema.
  */
 export async function readSnapshot(
+  storage: StorageProvider,
+  addressId: string,
+  expectedWalletId: string,
+  now: () => number = Date.now,
+): Promise<SnapshotReadResult> {
+  return time('snapshotCache.readSnapshot', () => _readSnapshotImpl(storage, addressId, expectedWalletId, now));
+}
+async function _readSnapshotImpl(
   storage: StorageProvider,
   addressId: string,
   expectedWalletId: string,

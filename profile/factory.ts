@@ -30,6 +30,7 @@ import {
   type LeanProfileSnapshot,
 } from './profile-lean-snapshot';
 import { fetchFromIpfs, pinCarBlocksToIpfs } from './ipfs-client';
+import { time, incr, observeMs } from '../core/perf-counters';
 import {
   LOCAL_EPOCH_FLOOR_KEY,
   LOCAL_EPOCH_RESET_REASON_KEY,
@@ -817,6 +818,8 @@ export function createProfileProviders(
   // object is built. The provider's late-binding setter resolves this
   // ordering cleanly.
   tokenStorage.setApplySnapshotCallback(async (cidString) => {
+    incr('applySnapshotCb.calls');
+    const __cbStart = performance.now();
     // `dag/put` (used by `pinCarBlocksToIpfs`) stored each CAR block
     // under its canonical CID, so `block/get(rootCid)` returns the
     // dag-cbor encoded root block bytes (NOT a CAR envelope).
@@ -835,19 +838,19 @@ export function createProfileProviders(
     // accessor as the bundle load path: cross-process snapshot apply
     // becomes deterministic, cross-device apply falls back to HTTP.
     const helia = db.getHelia?.();
-    const rootBlockBytes = await fetchFromIpfs(
-      ipfsGateways,
-      cidString,
-      undefined,
-      undefined,
-      helia,
+    const rootBlockBytes = await time('applySnapshotCb.fetchRootMs', () =>
+      fetchFromIpfs(ipfsGateways, cidString, undefined, undefined, helia),
     );
-    const snapshot = await parseLeanProfileSnapshotFromRootBlock(
-      rootBlockBytes,
-      (subBlockCid) =>
-        fetchFromIpfs(ipfsGateways, subBlockCid, undefined, undefined, helia),
+    const snapshot = await time('applySnapshotCb.parseSnapshotMs', () =>
+      parseLeanProfileSnapshotFromRootBlock(
+        rootBlockBytes,
+        (subBlockCid) =>
+          fetchFromIpfs(ipfsGateways, subBlockCid, undefined, undefined, helia),
+      ),
     );
-    return dispatchParsedSnapshot(snapshot);
+    const result = await time('applySnapshotCb.dispatchMs', () => dispatchParsedSnapshot(snapshot));
+    observeMs('applySnapshotCb.totalMs', performance.now() - __cbStart);
+    return result;
   });
 
   return { storage, tokenStorage };
