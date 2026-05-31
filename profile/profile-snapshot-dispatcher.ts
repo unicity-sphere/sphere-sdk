@@ -44,6 +44,7 @@
  */
 
 import { logger } from '../core/logger';
+import { incr, observeMs } from '../core/perf-counters.js';
 import type { LeanProfileSnapshot } from './profile-lean-snapshot';
 import type {
   JoinResult,
@@ -311,6 +312,9 @@ export async function runProfileSnapshotJoin(
 ): Promise<ApplySnapshotResult> {
   const log = deps.log ?? ((msg: string): void => logger.debug('SnapshotDispatcher', msg));
 
+  const __sjStart = performance.now();
+  incr('profile.snapshotJoin.calls');
+
   // 1. Decode base64 once. Reuse the resulting bytes for every writer's
   //    prefix-filtered view via `Array.prototype.filter` — no copies.
   //
@@ -325,10 +329,13 @@ export async function runProfileSnapshotJoin(
   //    array and the writer is never called — Phase 2's wiring is
   //    correct, the entries simply never reach it. See
   //    `normalizeEntryKey` doc-comment for the full rationale.
+  const __decodeStart = performance.now();
   const entries: SnapshotEntry[] = snapshot.entries.map((e) => ({
     key: normalizeEntryKey(e.key),
     encryptedValue: base64ToBytes(e.value),
   }));
+  observeMs('profile.snapshotJoin.decodeMs', performance.now() - __decodeStart);
+  incr('profile.snapshotJoin.decodedEntries', entries.length);
 
   // 2. Extract unique addressIds.
   const addressIds = new Set<string>();
@@ -361,6 +368,8 @@ export async function runProfileSnapshotJoin(
       // `remoteRejectedMalformed` counter signal-only.
       const slice = entries.filter((e) => e.key.startsWith(keyPrefix));
       if (slice.length === 0) continue;
+      incr('profile.snapshotJoin.perWriterDispatchCalls');
+      const __wStart = performance.now();
       try {
         const result = await writer.joinSnapshot(slice);
         accumulate(aggregated, result);
@@ -373,6 +382,8 @@ export async function runProfileSnapshotJoin(
           `runProfileSnapshotJoin: writer @ ${keyPrefix} threw — skipping ` +
             `(error: ${err instanceof Error ? err.message : String(err)})`,
         );
+      } finally {
+        observeMs('profile.snapshotJoin.perWriterDispatchMs', performance.now() - __wStart);
       }
     }
   }
@@ -382,6 +393,8 @@ export async function runProfileSnapshotJoin(
     const bundleSlice = entries.filter((e) => e.key.startsWith(BUNDLE_KEY_PREFIX));
     bundleEntriesSeen = bundleSlice.length;
     if (bundleSlice.length > 0) {
+      incr('profile.snapshotJoin.bundleIndexJoinCalls');
+      const __bStart = performance.now();
       try {
         const result = await deps.bundleIndex.joinSnapshot(bundleSlice);
         accumulate(aggregated, result);
@@ -390,6 +403,8 @@ export async function runProfileSnapshotJoin(
           `runProfileSnapshotJoin: bundleIndex.joinSnapshot threw — skipping ` +
             `(error: ${err instanceof Error ? err.message : String(err)})`,
         );
+      } finally {
+        observeMs('profile.snapshotJoin.bundleIndexJoinMs', performance.now() - __bStart);
       }
     }
   } else {
@@ -397,6 +412,8 @@ export async function runProfileSnapshotJoin(
       'runProfileSnapshotJoin: bundleIndex not available — bundle JOIN skipped',
     );
   }
+
+  observeMs('profile.snapshotJoin.totalMs', performance.now() - __sjStart);
 
   const joinedAny = aggregated.liveLanded > 0 || aggregated.tombstonesLanded > 0;
   return {
