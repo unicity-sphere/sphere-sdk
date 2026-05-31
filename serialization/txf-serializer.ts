@@ -31,6 +31,7 @@ import {
 import type { Token, TokenStatus } from '../types';
 import { TokenRegistry } from '../registry/TokenRegistry';
 import { INVOICE_TOKEN_TYPE_HEX } from '../constants';
+import { incr, observeMs } from '../core/perf-counters.js';
 
 // =============================================================================
 // SDK Token Normalization
@@ -234,6 +235,16 @@ function determineTokenStatus(txf: TxfToken): TokenStatus {
  * for any persisted invoice.
  */
 export function txfToToken(tokenId: string, txf: TxfToken): Token {
+  incr('serialization.txfSerializer.txfToToken.calls');
+  const __t0 = performance.now();
+  try {
+    return __txfToTokenImpl(tokenId, txf);
+  } finally {
+    observeMs('serialization.txfSerializer.txfToToken.totalMs', performance.now() - __t0);
+  }
+}
+
+function __txfToTokenImpl(tokenId: string, txf: TxfToken): Token {
   const coinData = txf.genesis.data.coinData ?? [];
   const totalAmount = coinData.reduce((sum, [, amt]) => {
     return sum + BigInt(amt || '0');
@@ -400,6 +411,19 @@ export interface ParsedStorageData {
  * Parse TXF storage data
  */
 export function parseTxfStorageData(data: unknown): ParsedStorageData {
+  incr('serialization.txfSerializer.parseStorageData.calls');
+  const __pStart = performance.now();
+  try {
+    return __parseTxfStorageDataImpl(data);
+  } finally {
+    observeMs(
+      'serialization.txfSerializer.parseStorageData.totalMs',
+      performance.now() - __pStart,
+    );
+  }
+}
+
+function __parseTxfStorageDataImpl(data: unknown): ParsedStorageData {
   const result: ParsedStorageData = {
     tokens: [],
     meta: null,

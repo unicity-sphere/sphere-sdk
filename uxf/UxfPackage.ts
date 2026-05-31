@@ -562,6 +562,8 @@ export function ingest(
   token: unknown,
   opts?: { updatedAt?: number },
 ): void {
+  incr('uxf.ingest.calls');
+  const __iStart = performance.now();
   const pool = wrapPool(pkg);
   const rootHash = deconstructToken(pool, token);
   syncPool(pkg, pool);
@@ -583,6 +585,7 @@ export function ingest(
 
   // Update secondary indexes
   updateIndexesForToken(pkg, tokenId, rootHash);
+  observeMs('uxf.ingest.totalMs', performance.now() - __iStart);
 }
 
 /**
@@ -611,10 +614,15 @@ export function ingestAll(
   opts?: { updatedAt?: number },
 ): void {
   if (tokens.length === 0) return;
+  incr('uxf.ingestAll.calls');
+  incr('uxf.ingestAll.tokens', tokens.length);
+  const __iaStart = performance.now();
   const pool = wrapPool(pkg);
   const newTokens: Array<{ tokenId: string; rootHash: ContentHash }> = [];
   for (const token of tokens) {
+    const __dStart = performance.now();
     const rootHash = deconstructToken(pool, token);
+    observeMs('uxf.ingestAll.perTokenDeconstructMs', performance.now() - __dStart);
     const rootElement = pool.get(rootHash)!;
     const rootContent = rootElement.content as unknown as TokenRootContent;
     newTokens.push({ tokenId: rootContent.tokenId, rootHash });
@@ -703,11 +711,13 @@ export function ingestAll(
     } catch {
       /* best-effort — pool integrity already compromised, throw the original error */
     }
+    observeMs('uxf.ingestAll.totalMs', performance.now() - __iaStart);
     throw err;
   }
   // Stamp envelope updatedAt; caller can lock for determinism.
   (pkg.envelope as { updatedAt: number }).updatedAt =
     opts?.updatedAt ?? Math.floor(Date.now() / 1000);
+  observeMs('uxf.ingestAll.totalMs', performance.now() - __iaStart);
 }
 
 /**
@@ -718,8 +728,13 @@ export function assemble(
   tokenId: string,
   strategy: InstanceSelectionStrategy = STRATEGY_LATEST,
 ): unknown {
-  const pool = wrapPool(pkg);
-  return assembleToken(pool, pkg.manifest, tokenId, pkg.instanceChains, strategy);
+  incr('uxf.assemble.calls');
+  const __aStart = performance.now();
+  try {
+    return assembleToken(wrapPool(pkg), pkg.manifest, tokenId, pkg.instanceChains, strategy);
+  } finally {
+    observeMs('uxf.assemble.totalMs', performance.now() - __aStart);
+  }
 }
 
 /**

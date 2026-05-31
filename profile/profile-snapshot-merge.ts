@@ -73,6 +73,8 @@
  * @see profile/lamport.ts — §7.1 Lamport invariants, W39 bounds defence
  */
 
+import { incr, observeMs } from '../core/perf-counters.js';
+
 // =============================================================================
 // 1. Constants
 // =============================================================================
@@ -348,16 +350,20 @@ export async function runJoinSnapshot(
 
   for (const entry of remote) {
     entriesEvaluated += 1;
+    incr('profile.snapshotJoin.perKeyApplyCalls');
+    const __keyStart = performance.now();
 
     let remoteSlot: ClassifiedSlot | null;
     try {
       remoteSlot = await deps.classifyRemote(entry);
     } catch {
       remoteRejectedMalformed += 1;
+      observeMs('profile.snapshotJoin.perKeyApplyMs', performance.now() - __keyStart);
       continue;
     }
     if (remoteSlot === null || remoteSlot.kind === 'absent') {
       remoteRejectedMalformed += 1;
+      observeMs('profile.snapshotJoin.perKeyApplyMs', performance.now() - __keyStart);
       continue;
     }
 
@@ -373,6 +379,7 @@ export async function runJoinSnapshot(
     const action = mergeSlots(localSlot, remoteSlot);
     if (action.kind === 'noop') {
       localWon += 1;
+      observeMs('profile.snapshotJoin.perKeyApplyMs', performance.now() - __keyStart);
       continue;
     }
 
@@ -385,6 +392,8 @@ export async function runJoinSnapshot(
       }
     } catch {
       remoteRejectedMalformed += 1;
+    } finally {
+      observeMs('profile.snapshotJoin.perKeyApplyMs', performance.now() - __keyStart);
     }
   }
 
