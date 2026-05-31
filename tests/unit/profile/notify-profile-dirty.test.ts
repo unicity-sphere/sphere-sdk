@@ -173,6 +173,7 @@ function createMockHost(opts: {
     setLastPinnedCid: () => {},
     getLastDiscoveredPointerCid: () => null,
     setLastDiscoveredPointerCid: () => {},
+    setLoadSourcedFromSnapshot: () => {},
     getPendingPublishCid: () => null,
     setPendingPublishCid: () => {},
     getKnownBundleCids: () => knownBundleCids,

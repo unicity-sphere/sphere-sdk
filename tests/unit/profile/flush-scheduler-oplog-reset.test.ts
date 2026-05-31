@@ -122,6 +122,7 @@ function buildHarness(opts: {
     setLastVerifiedSnapshotCid: () => {},
     getLastDiscoveredPointerCid: () => null,
     setLastDiscoveredPointerCid: () => {},
+    setLoadSourcedFromSnapshot: () => {},
     getPendingPublishCid: () => null,
     setPendingPublishCid: () => {},
     getKnownBundleCids: () => new Set<string>(),

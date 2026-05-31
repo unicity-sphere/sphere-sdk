@@ -198,6 +198,12 @@ export class BundleIndex implements ProfileSyncWriter {
       }
     }
     this.host.getKnownBundleCids().add(cid);
+    // Issue #364 Item #4 — a local-publish bundle add means the active
+    // bundle set is no longer purely snapshot-sourced. Disarm the
+    // Rule-4 skip breadcrumb so the next `load()` runs the pairwise
+    // verifier (conservative: see design-decision comment at the gate
+    // site in `profile-token-storage-provider.ts:_loadImpl`).
+    this.host.setLoadSourcedFromSnapshot(false);
     // Item #15 Phase C — every bundle-ref add changes our snapshot.
     this.host.notifyProfileDirty();
   }
