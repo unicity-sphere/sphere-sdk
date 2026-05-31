@@ -136,6 +136,16 @@ export class ProfileTokenStorageProvider
   private encryptionKey: Uint8Array | null = null;
   private initialized = false;
   private isShuttingDown = false;
+  /**
+   * Issue #364 Item #2 — true between {@link clear} entry and exit.
+   * `clear()` is destructive; allowing the periodic pointer-poll's
+   * `applySnapshotIfWired` to run mid-clear would dispatch a snapshot
+   * against state that is about to be wiped, wasting IPFS round-trips
+   * and risking partial seeding of about-to-be-deleted data. The
+   * shutdown gate (`isShuttingDown`/`hasShutdown`) does not cover the
+   * clear-on-a-live-provider path, hence the separate latch.
+   */
+  private isClearing = false;
 
   // --- Write-behind buffer ---
   private pendingData: TxfStorageDataBase | null = null;
@@ -883,6 +893,10 @@ export class ProfileTokenStorageProvider
   private async _applySnapshotIfWiredImpl(
     cidString: string,
   ): Promise<import('./profile-snapshot-dispatcher.js').ApplySnapshotResult | null> {
+    if (this.isClearing) {
+      incr('profile.applySnapshot.suppressedDuringClear');
+      return null;
+    }
     if (this.isShuttingDown || this.hasShutdown) return null;
     // Late-bound setter wins; falls back to construction-time option
     // for callers that prefer the static-config style.
@@ -1928,6 +1942,11 @@ export class ProfileTokenStorageProvider
   async clear(): Promise<boolean> {
     if (!this.initialized) return false;
 
+    // Issue #364 Item #2 — gate concurrent applySnapshotIfWired calls
+    // for the duration of clear(). A periodic pointer-poll that fires
+    // during destructive teardown would dispatch a snapshot against
+    // about-to-be-wiped state, racing the deletes below.
+    this.isClearing = true;
     try {
       // Remove all bundle refs from OrbitDB
       const allBundles = await this.db.all(BUNDLE_KEY_PREFIX);
@@ -1964,6 +1983,8 @@ export class ProfileTokenStorageProvider
     } catch (err) {
       this.log(`clear() failed: ${err instanceof Error ? err.message : String(err)}`);
       return false;
+    } finally {
+      this.isClearing = false;
     }
   }
 
