@@ -44,6 +44,7 @@
 
 import { logger } from '../core/logger.js';
 import { SphereError } from '../core/errors.js';
+import { incr, time, observeMs } from '../core/perf-counters.js';
 import { STORAGE_KEYS_GLOBAL } from '../constants.js';
 import type { ProviderStatus, FullIdentity } from '../types/index.js';
 import type {
@@ -846,12 +847,18 @@ export class ProfileTokenStorageProvider
   async applySnapshotIfWired(
     cidString: string,
   ): Promise<import('./profile-snapshot-dispatcher.js').ApplySnapshotResult | null> {
+    return time('profile.applySnapshot', () => this._applySnapshotIfWiredImpl(cidString));
+  }
+  private async _applySnapshotIfWiredImpl(
+    cidString: string,
+  ): Promise<import('./profile-snapshot-dispatcher.js').ApplySnapshotResult | null> {
     if (this.isShuttingDown || this.hasShutdown) return null;
     // Late-bound setter wins; falls back to construction-time option
     // for callers that prefer the static-config style.
     const callback =
       this.applySnapshotCallback ?? this.options?.onApplySnapshot ?? null;
     if (typeof callback !== 'function') return null;
+    incr('profile.applySnapshot.fired');
     return callback(cidString);
   }
 
@@ -1290,6 +1297,10 @@ export class ProfileTokenStorageProvider
   // ---------------------------------------------------------------------------
 
   async load(_identifier?: string): Promise<LoadResult<TxfStorageDataBase>> {
+    incr('profile.load.calls');
+    return time('profile.load.totalMs', () => this._loadImpl(_identifier));
+  }
+  private async _loadImpl(_identifier?: string): Promise<LoadResult<TxfStorageDataBase>> {
     const timestamp = Date.now();
 
     if (!this.initialized || !this.encryptionKey) {
@@ -1508,7 +1519,20 @@ export class ProfileTokenStorageProvider
       // candidate roots; a single-bundle load has none.
       let verifiedProofs: ReadonlySet<string> | undefined = undefined;
       const verifyInclusionProof = this.options?.oracle?.verifyInclusionProof;
-      if (verifyInclusionProof && loadedBundles.length >= 2) {
+      // GH #363 prototype — env-gated bypass for the Rule-4 pairwise
+      // UXF-level verification loop. When set, load() skips the
+      // O(N²) pairwise computeVerifiedProofs pass; structural JOIN
+      // still runs and Rule 3 (longest-valid prefix) still applies;
+      // only Rule 4 enrichment is skipped. Mirrors the verifier-failure
+      // catch path below — that fallback is the existing graceful
+      // degradation, this flag just opts into it unconditionally so
+      // we can A/B measure the wall-clock delta.
+      const skipRule4 =
+        typeof process !== 'undefined' && process?.env?.SPHERE_SKIP_RULE4 === '1';
+      if (skipRule4) incr('profile.load.rule4Skipped');
+      if (verifyInclusionProof && loadedBundles.length >= 2 && !skipRule4) {
+        incr('profile.load.rule4PairwiseInvocations');
+        const __r4Start = performance.now();
         try {
           // Pairwise accumulation via the existing helper. `computeVerifiedProofs`
           // walks BOTH packages' pools dedup-by-content-hash, so for N
@@ -1531,12 +1555,15 @@ export class ProfileTokenStorageProvider
               for (const h of pairwise) accum.add(h);
             }
           }
+          observeMs('profile.load.rule4PairwiseMs', performance.now() - __r4Start);
           verifiedProofs = accum;
           this.log(
             `JOIN: computed verifiedProofs across ${loadedBundles.length} bundles ` +
               `(${accum.size} proof element(s) verified)`,
           );
         } catch (err) {
+          observeMs('profile.load.rule4PairwiseMs', performance.now() - __r4Start);
+          incr('profile.load.rule4PairwiseThrew');
           // Verifier failure must not abort the load — fall back to the
           // conservative (no-enrichment) resolution. The structural JOIN
           // still runs and Rule 3 (longest-valid prefix) still applies;

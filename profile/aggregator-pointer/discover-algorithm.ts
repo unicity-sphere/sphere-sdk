@@ -136,6 +136,7 @@ import {
   VERSION_MAX,
 } from './constants.js';
 import { AggregatorPointerError, AggregatorPointerErrorCode } from './errors.js';
+import { time } from '../../core/perf-counters.js';
 import type { PointerKeyMaterial } from './key-derivation.js';
 import type { PointerSigner } from './signing.js';
 import type { PointerVersion } from './types.js';
@@ -280,6 +281,9 @@ export interface DiscoverResult {
 // ── findLatestValidVersion ─────────────────────────────────────────────────
 
 export async function findLatestValidVersion(input: DiscoverInput): Promise<DiscoverResult> {
+  return time('pointerLayer.findLatestValidVersion', () => _findLatestValidVersionImpl(input));
+}
+async function _findLatestValidVersionImpl(input: DiscoverInput): Promise<DiscoverResult> {
   // Wave G.4: small wrapper that ensures the external-abort listener
   // is removed on every exit path (success, throw, abort). Without
   // this, a long-lived caller signal would leak a closure-reference

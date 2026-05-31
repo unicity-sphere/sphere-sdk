@@ -13,6 +13,7 @@
 
 import { logger } from '../core/logger.js';
 import { hexToBytes } from '../core/hex.js';
+import { incr, observeMs } from '../core/perf-counters.js';
 import { ProfileError } from './errors.js';
 import { installHeliaBlockstoreGetShim } from './helia-blockstore-shim.js';
 import {
@@ -814,6 +815,13 @@ export class OrbitDbAdapter implements ProfileDatabase {
    */
   async putEntry(key: string, entry: OpLogEntryEnvelope): Promise<void> {
     this.ensureConnected();
+    // GH #363 — measure putEntry round-trip. Hypothesis under
+    // investigation: every logical operation produces many putEntry
+    // calls, each paying a full IPFS round-trip. Counter splits the
+    // bundle-ref keyspace from everything else so the batching
+    // question (issue #363) gets a direct signal.
+    const t0 = performance.now();
+    const isBundleKey = key.startsWith('tokens.bundle.');
     try {
       const cborBytes = encodeEntry(entry);
       await this.db.put(key, cborBytes);
@@ -821,10 +829,16 @@ export class OrbitDbAdapter implements ProfileDatabase {
       // decide whether to trust the stored `originated` tag.
       this.localAuthoredKeys.add(key);
     } catch (err) {
+      incr('orbitdb.putEntry.error');
       throw new ProfileError(
         'ORBITDB_WRITE_FAILED',
         `Failed to write structured entry at "${key}": ${err instanceof Error ? err.message : String(err)}`,
         err,
+      );
+    } finally {
+      observeMs(
+        isBundleKey ? 'orbitdb.putEntry.bundle' : 'orbitdb.putEntry.other',
+        performance.now() - t0,
       );
     }
   }
@@ -1151,9 +1165,20 @@ export class OrbitDbAdapter implements ProfileDatabase {
     // may have overwritten any of our keys (LWW per-key), so we can no
     // longer trust the stored `originated` tag for ANY key without
     // re-authoring. This is conservative (over-invalidates) but safe.
+    //
+    // GH #363 measurement: count BOTH the raw 'update' fires AND the
+    // callback-side wall-clock. Issue #360 Finding #1 claimed every
+    // local write triggers this handler — but never measured the rate
+    // or the callback cost. Confirm or refute with real data.
     const handler = () => {
+      incr('orbitdb.onReplication.fired');
+      const t0 = performance.now();
       this.localAuthoredKeys.clear();
-      callback();
+      try {
+        callback();
+      } finally {
+        observeMs('orbitdb.onReplication.callbackMs', performance.now() - t0);
+      }
     };
 
     this.db.events.on('update', handler);

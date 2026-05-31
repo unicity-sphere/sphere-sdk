@@ -68,6 +68,7 @@ import {
   verifyCidAccessibleWithRetry,
 } from '../ipfs-client.js';
 import { extractCarRootCid } from '../../uxf/transfer-payload.js';
+import { incr, observeMs } from '../../core/perf-counters.js';
 import { extractLostHeadCid } from '../orbitdb-adapter.js';
 import type { OrbitDbAdapter } from '../orbitdb-adapter.js';
 import type {
@@ -580,6 +581,22 @@ export class FlushScheduler {
    * the remote originator already published while we were merging).
    */
   async flushToIpfs(): Promise<void> {
+    // GH #363 measurement — how often does flushToIpfs run and how
+    // long does it take? Issue #360 Finding #1 hypothesised every
+    // local write triggers a full flush; the rate counter answers it.
+    incr('flushScheduler.flushToIpfs.calls');
+    const __perfStart = performance.now();
+    try {
+      return await this.__flushToIpfsBody();
+    } finally {
+      observeMs(
+        'flushScheduler.flushToIpfs.totalMs',
+        performance.now() - __perfStart,
+      );
+    }
+  }
+
+  private async __flushToIpfsBody(): Promise<void> {
     const encryptionKey = this.host.getEncryptionKey();
     if (!encryptionKey) return;
 

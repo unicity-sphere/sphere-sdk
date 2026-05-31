@@ -30,6 +30,7 @@ import type {
   TokenRootChildren,
   GenesisChildren,
 } from './types.js';
+import { incr, observeMs } from '../core/perf-counters.js';
 import { STRATEGY_LATEST } from './types.js';
 import { UxfError } from './errors.js';
 import { computeElementHash } from './hash.js';
@@ -348,6 +349,15 @@ export class UxfPackage {
       proofHash?: string;
     }) => Promise<boolean>,
   ): Promise<Set<string>> {
+    // GH #363 measurement. Issue #360 Finding #2 claimed this is
+    // O(B²·P) sequential and dominates load latency; verify on real
+    // data before any future optimisation. Counters split:
+    //   .calls       — invocations
+    //   .verifyCalls — verifier RPCs actually made
+    //   .verifyOk    — verifier returned true
+    //   .totalMs     — outer wall-clock per call
+    incr('uxf.computeVerifiedProofs.calls');
+    const __perfStart = performance.now();
     const verified = new Set<string>();
     const ELEMENT_TYPE_INCLUSION_PROOF = 'inclusion-proof' as const;
     // Pool from both packages — same proof element may appear in
@@ -367,16 +377,24 @@ export class UxfPackage {
         continue;
       }
       try {
+        incr('uxf.computeVerifiedProofs.verifyCalls');
+        const __vStart = performance.now();
         const ok = await verifier({
           proofJson,
           transactionHash: txHashImprintHex,
           proofHash: hash,
         });
-        if (ok) verified.add(hash);
+        observeMs('uxf.computeVerifiedProofs.verifyMs', performance.now() - __vStart);
+        if (ok) {
+          incr('uxf.computeVerifiedProofs.verifyOk');
+          verified.add(hash);
+        }
       } catch {
         /* verifier failure → not verified, conservative */
+        incr('uxf.computeVerifiedProofs.verifyThrew');
       }
     }
+    observeMs('uxf.computeVerifiedProofs.totalMs', performance.now() - __perfStart);
     return verified;
   }
 

@@ -22,6 +22,7 @@ import { CID } from 'multiformats/cid';
 import * as raw from 'multiformats/codecs/raw';
 import { create as createMultihash } from 'multiformats/hashes/digest';
 import { logger } from '../core/logger.js';
+import { incr, observeMs } from '../core/perf-counters.js';
 import { ProfileError } from './errors.js';
 
 // =============================================================================
@@ -514,17 +515,34 @@ async function probeEndpointExposed(url: string): Promise<boolean> {
 /**
  * Probe a gateway for `/dag/import` and `/dag/export` support, caching
  * the result for the rest of the process lifetime. Issue #370.
+ *
+ * Counters:
+ *   - `ipfs.probe.calls`        — every selector call to this function
+ *   - `ipfs.probe.cacheHits`    — call satisfied from the per-process cache
+ *   - `ipfs.probe.dagImportOk`  — cached probe says /dag/import exposed
+ *   - `ipfs.probe.dagExportOk`  — cached probe says /dag/export exposed
+ *   - `ipfs.probe.dagImportMissing` / `ipfs.probe.dagExportMissing`
  */
 async function probeGatewayCapabilities(gateway: string): Promise<GatewayCapabilities> {
+  incr('ipfs.probe.calls');
   const key = normalizeGatewayKey(gateway);
   const cached = capabilityCache.get(key);
-  if (cached !== undefined) return cached;
+  if (cached !== undefined) {
+    incr('ipfs.probe.cacheHits');
+    return cached;
+  }
 
+  const probeStart = performance.now();
   const probe = (async (): Promise<GatewayCapabilities> => {
     const [dagImport, dagExport] = await Promise.all([
       probeEndpointExposed(`${key}/api/v0/dag/import`),
       probeEndpointExposed(`${key}/api/v0/dag/export`),
     ]);
+    if (dagImport) incr('ipfs.probe.dagImportOk');
+    else incr('ipfs.probe.dagImportMissing');
+    if (dagExport) incr('ipfs.probe.dagExportOk');
+    else incr('ipfs.probe.dagExportMissing');
+    observeMs('ipfs.probe.totalMs', performance.now() - probeStart);
     if (!dagImport || !dagExport) {
       logger.warn(
         'ipfs-client',
@@ -1025,6 +1043,11 @@ export async function pinCarBlocksToIpfs(
   helia?: unknown,
   concurrency: number = DEFAULT_PIN_CONCURRENCY,
 ): Promise<string> {
+  // GH #363 / #370 — pin wall-clock for the WHOLE selector (covers both
+  // /dag/import fast-path and legacy per-block fallback). The
+  // fastPath/legacyPath split counter at the exit attributes the time.
+  const __perfStart = performance.now();
+  const __perfBytes = carBytes.byteLength;
   const effectiveGateways = gateways.length > 0 ? gateways : [DEFAULT_IPFS_API_URL];
   validateGatewayUrls(effectiveGateways);
 
@@ -1052,6 +1075,8 @@ export async function pinCarBlocksToIpfs(
     try {
       parsed = await parseCarForFastPathPin(carBytes, expectedRootCid);
     } catch (err) {
+      incr('ipfs.pinCar.error');
+      observeMs('ipfs.pinCar.totalMs', performance.now() - __perfStart);
       if (err instanceof ProfileError) throw err;
       throw new ProfileError(
         'ORBITDB_WRITE_FAILED',
@@ -1080,11 +1105,25 @@ export async function pinCarBlocksToIpfs(
     }
 
     try {
-      await pinCarViaImport(gateway, carBytes, expectedRootCid, timeoutMs);
+      // Issue #370 fast-path counters (#363 perf framework).
+      const __dagImportStart = performance.now();
+      incr('ipfs.dagImport.calls');
+      try {
+        await pinCarViaImport(gateway, carBytes, expectedRootCid, timeoutMs);
+      } finally {
+        observeMs('ipfs.dagImport.totalMs', performance.now() - __dagImportStart);
+      }
+      incr('ipfs.dagImport.bytes', __perfBytes);
       // One sidecar submit per CAR root (issue #370 explicit guidance).
       submitToSidecarBestEffort(gateway, expectedRootCid, parsed.rootBlock.bytes);
+      // Selector-level counters: fast path was taken successfully.
+      incr('ipfs.pinCar.fastPath');
+      incr('ipfs.pinCar.blocks', parsed.blocks.length);
+      incr('ipfs.pinCar.bytes', __perfBytes);
+      observeMs('ipfs.pinCar.totalMs', performance.now() - __perfStart);
       return expectedRootCid;
     } catch (err) {
+      incr('ipfs.dagImport.error');
       logger.warn(
         'ipfs-client',
         `pinCarBlocksToIpfs: /dag/import fast path failed on ${gateway} for ${expectedRootCid}, ` +
@@ -1098,16 +1137,29 @@ export async function pinCarBlocksToIpfs(
     }
   }
 
-  return pinCarBlocksToIpfsLegacy(
-    effectiveGateways,
-    carBytes,
-    expectedRootCid,
-    timeoutMs,
-    // Skip the legacy path's local-Helia write loop if the fast path
-    // already wrote every block — avoids duplicate puts.
-    localHeliaWrittenInFastPath ? undefined : helia,
-    concurrency,
-  );
+  // Legacy fallback path. The legacy records its own ipfs.pinCar.legacy.*
+  // attribution; the selector records the public ipfs.pinCar.{totalMs,
+  // bytes, error, legacyPath} so soak A/B can compare like-for-like.
+  incr('ipfs.pinCar.legacyPath');
+  try {
+    const out = await pinCarBlocksToIpfsLegacy(
+      effectiveGateways,
+      carBytes,
+      expectedRootCid,
+      timeoutMs,
+      // Skip the legacy path's local-Helia write loop if the fast path
+      // already wrote every block — avoids duplicate puts.
+      localHeliaWrittenInFastPath ? undefined : helia,
+      concurrency,
+    );
+    incr('ipfs.pinCar.bytes', __perfBytes);
+    return out;
+  } catch (err) {
+    incr('ipfs.pinCar.error');
+    throw err;
+  } finally {
+    observeMs('ipfs.pinCar.totalMs', performance.now() - __perfStart);
+  }
 }
 
 /**
@@ -1163,6 +1215,12 @@ async function pinCarBlocksToIpfsLegacy(
   helia?: unknown,
   concurrency: number = DEFAULT_PIN_CONCURRENCY,
 ): Promise<string> {
+  // GH #363 measurement: legacy-path wall-clock. The selector-level
+  // ipfs.pinCar.totalMs counter records the public entry-to-exit time
+  // (including the fast-path attempt that fell through to here); this
+  // counter records the legacy-only wall-clock for separate attribution.
+  const __perfStart = performance.now();
+  const __perfBytes = carBytes.byteLength;
   const localHelia = asHelia(helia);
   // Parse the CAR locally to extract each block. Done up front so a
   // malformed CAR fails fast before any network round-trips.
@@ -1359,9 +1417,21 @@ async function pinCarBlocksToIpfsLegacy(
     // failed against a downed sidecar) are discarded; if operator
     // diagnostics need them, attach a `storage:error` event before
     // re-throwing in a future enhancement.
+    // Legacy-path-specific counters (don't collide with the selector's
+    // public ipfs.pinCar.* counters — those measure the WHOLE selector
+    // wall-clock including the fast-path attempt that fell through).
+    incr('ipfs.pinCar.legacy.error');
+    observeMs('ipfs.pinCar.legacy.totalMs', performance.now() - __perfStart);
     throw workerErrors[0];
   }
 
+  // GH #363 / #370 — legacy-only attribution. The selector's
+  // ipfs.pinCar.{blocks,bytes,totalMs} counters cover the public
+  // surface; these legacy.* counters expose the cost of the per-block
+  // `/dag/put` work specifically.
+  incr('ipfs.pinCar.legacy.blocks', blocks.length);
+  incr('ipfs.pinCar.legacy.bytes', __perfBytes);
+  observeMs('ipfs.pinCar.legacy.totalMs', performance.now() - __perfStart);
   return expectedRootCid;
 }
 
@@ -1414,6 +1484,9 @@ export async function fetchFromIpfs(
   maxSizeBytes: number = DEFAULT_MAX_SIZE_BYTES,
   helia?: unknown,
 ): Promise<Uint8Array> {
+  // GH #363 measurement — split local-Helia hits from HTTP gateway
+  // fetches so the two cost models are visible separately.
+  const __perfStart = performance.now();
   // Issue #236 — local Helia blockstore fast-path. When the block was
   // pinned through this process (or any prior process with the same
   // `dataDir`), it is already on disk and a synchronous get() avoids
@@ -1428,6 +1501,8 @@ export async function fetchFromIpfs(
         // gateways (which apply their own enforcement) rather than
         // returning oversized bytes.
       } else {
+        incr('ipfs.fetchBlock.localHit');
+        observeMs('ipfs.fetchBlock.localHitMs', performance.now() - __perfStart);
         return local;
       }
     }
@@ -1622,6 +1697,10 @@ export async function fetchFromIpfs(
         await putBlockToLocalHelia(localHelia, cid, bytesOrNull);
       }
 
+      // GH #363 — gateway hit (HTTP round-trip cost).
+      incr('ipfs.fetchBlock.gatewayHit');
+      incr('ipfs.fetchBlock.bytes', bytesOrNull.byteLength);
+      observeMs('ipfs.fetchBlock.gatewayMs', performance.now() - __perfStart);
       return bytesOrNull;
     } catch (err) {
       // Size-limit ProfileError is fatal for this request (not per-gateway)
@@ -1633,6 +1712,8 @@ export async function fetchFromIpfs(
     }
   }
 
+  incr('ipfs.fetchBlock.allGatewaysFailed');
+  observeMs('ipfs.fetchBlock.failedMs', performance.now() - __perfStart);
   throw new ProfileError(
     'BUNDLE_NOT_FOUND',
     `Failed to fetch CAR ${cid} from all gateways: ${lastError?.message ?? 'unknown error'}`,
@@ -1701,10 +1782,17 @@ export async function fetchCarFromIpfs(
   maxSizeBytesPerBlock: number = DEFAULT_MAX_SIZE_BYTES,
   helia?: unknown,
 ): Promise<Uint8Array> {
+  // GH #363 / #370 — fetch wall-clock for the WHOLE selector (covers
+  // all branches: raw-codec backcompat, local-Helia short-circuit,
+  // /dag/export fast path, legacy BFS fallback). The fastPath/legacyPath
+  // split counter at the exit attributes which path served the call.
+  const __perfStart = performance.now();
+  incr('ipfs.fetchCar.calls');
   let parsedRoot: CID;
   try {
     parsedRoot = CID.parse(rootCid);
   } catch (err) {
+    observeMs('ipfs.fetchCar.totalMs', performance.now() - __perfStart);
     throw new ProfileError(
       'BUNDLE_NOT_FOUND',
       `fetchCarFromIpfs: cannot parse root CID ${rootCid}: ${err instanceof Error ? err.message : String(err)}`,
@@ -1716,9 +1804,17 @@ export async function fetchCarFromIpfs(
   // verbatim — they ARE the CAR. Skip the walk. Taken BEFORE the
   // capability probe — raw-codec roots never need /dag/export.
   if (parsedRoot.code === CODEC_RAW) {
-    return fetchFromIpfs(gateways, rootCid, timeoutMs, maxSizeBytesPerBlock, helia);
+    try {
+      const raw = await fetchFromIpfs(gateways, rootCid, timeoutMs, maxSizeBytesPerBlock, helia);
+      incr('ipfs.fetchCar.rawCodec');
+      incr('ipfs.fetchCar.bytes', raw.byteLength);
+      return raw;
+    } finally {
+      observeMs('ipfs.fetchCar.totalMs', performance.now() - __perfStart);
+    }
   }
   if (parsedRoot.code !== CODEC_DAG_CBOR) {
+    observeMs('ipfs.fetchCar.totalMs', performance.now() - __perfStart);
     throw new ProfileError(
       'BUNDLE_NOT_FOUND',
       `fetchCarFromIpfs: unsupported root codec 0x${parsedRoot.code.toString(16)} for ${rootCid} ` +
@@ -1739,14 +1835,21 @@ export async function fetchCarFromIpfs(
   if (localHeliaForRoot !== null) {
     const localRoot = await tryGetBlockFromLocalHelia(localHeliaForRoot, rootCid);
     if (localRoot !== null) {
-      return fetchCarFromIpfsLegacy(
-        effectiveGateways,
-        rootCid,
-        parsedRoot,
-        timeoutMs,
-        maxSizeBytesPerBlock,
-        helia,
-      );
+      try {
+        const out = await fetchCarFromIpfsLegacy(
+          effectiveGateways,
+          rootCid,
+          parsedRoot,
+          timeoutMs,
+          maxSizeBytesPerBlock,
+          helia,
+        );
+        incr('ipfs.fetchCar.localHeliaPath');
+        incr('ipfs.fetchCar.bytes', out.byteLength);
+        return out;
+      } finally {
+        observeMs('ipfs.fetchCar.totalMs', performance.now() - __perfStart);
+      }
     }
   }
 
@@ -1760,9 +1863,22 @@ export async function fetchCarFromIpfs(
     const caps = await probeGatewayCapabilities(gateway);
     if (!caps.dagExport) continue;
     try {
-      const carBytes = await fetchCarViaExport(gateway, rootCid, timeoutMs, maxSizeBytesPerBlock);
-      return await verifyAndReassembleExportedCar(carBytes, rootCid, helia);
+      const __dagExportStart = performance.now();
+      incr('ipfs.dagExport.calls');
+      let carBytes: Uint8Array;
+      try {
+        carBytes = await fetchCarViaExport(gateway, rootCid, timeoutMs, maxSizeBytesPerBlock);
+      } finally {
+        observeMs('ipfs.dagExport.totalMs', performance.now() - __dagExportStart);
+      }
+      incr('ipfs.dagExport.bytes', carBytes.byteLength);
+      const reassembled = await verifyAndReassembleExportedCar(carBytes, rootCid, helia);
+      incr('ipfs.fetchCar.fastPath');
+      incr('ipfs.fetchCar.bytes', reassembled.byteLength);
+      observeMs('ipfs.fetchCar.totalMs', performance.now() - __perfStart);
+      return reassembled;
     } catch (err) {
+      incr('ipfs.dagExport.error');
       logger.warn(
         'ipfs-client',
         `fetchCarFromIpfs: /dag/export fast path failed on ${gateway} for ${rootCid}, ` +
@@ -1776,14 +1892,21 @@ export async function fetchCarFromIpfs(
     }
   }
 
-  return fetchCarFromIpfsLegacy(
-    effectiveGateways,
-    rootCid,
-    parsedRoot,
-    timeoutMs,
-    maxSizeBytesPerBlock,
-    helia,
-  );
+  incr('ipfs.fetchCar.legacyPath');
+  try {
+    const out = await fetchCarFromIpfsLegacy(
+      effectiveGateways,
+      rootCid,
+      parsedRoot,
+      timeoutMs,
+      maxSizeBytesPerBlock,
+      helia,
+    );
+    incr('ipfs.fetchCar.bytes', out.byteLength);
+    return out;
+  } finally {
+    observeMs('ipfs.fetchCar.totalMs', performance.now() - __perfStart);
+  }
 }
 
 /**
@@ -1804,6 +1927,11 @@ async function fetchCarFromIpfsLegacy(
   maxSizeBytesPerBlock: number = DEFAULT_MAX_SIZE_BYTES,
   helia?: unknown,
 ): Promise<Uint8Array> {
+  // GH #363 / #370 — legacy-path-only wall-clock attribution. The
+  // selector's ipfs.fetchCar.totalMs counter records the public
+  // entry-to-exit time (including the probe + fast-path attempt that
+  // fell through); this counter records the legacy BFS walk only.
+  const __perfStart = performance.now();
   // Lazy-import @ipld/dag-cbor + CarWriter to keep the cold-path import
   // off the synchronous load of every module that touches ipfs-client.
   const { decode: dagCborDecode } = await import('@ipld/dag-cbor');
@@ -1908,6 +2036,12 @@ async function fetchCarFromIpfsLegacy(
     carBytes.set(c, offset);
     offset += c.length;
   }
+  // Legacy-path-specific counters (don't collide with the selector's
+  // public ipfs.fetchCar.{blocks,bytes,totalMs} — those measure the
+  // whole selector wall-clock and aggregate across all paths).
+  incr('ipfs.fetchCar.legacy.blocks', blocks.length);
+  incr('ipfs.fetchCar.legacy.bytes', totalLength);
+  observeMs('ipfs.fetchCar.legacy.totalMs', performance.now() - __perfStart);
   return carBytes;
 }
 
