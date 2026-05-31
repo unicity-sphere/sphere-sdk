@@ -430,6 +430,319 @@ async function tryReadFromSidecar(
 }
 
 // =============================================================================
+// Issue #370 — Capability probe and CAR-batched fast paths
+// =============================================================================
+
+/**
+ * Per-gateway timeout for the capability probe. Short and bounded so a
+ * slow or unreachable gateway can't block the first hot-path pin beyond
+ * this window. On timeout / network error the probe caches the gateway
+ * as "fast path unsupported" for the process lifetime — same outcome as
+ * an explicit 404 from the operator gateway.
+ */
+const PROBE_TIMEOUT_MS = 2_000;
+
+/**
+ * Result of the per-gateway capability probe. Each field is `true` iff
+ * the gateway advertises the corresponding endpoint at the operator
+ * layer (haproxy/nginx ACL passes the route through to Kubo).
+ */
+interface GatewayCapabilities {
+  readonly dagImport: boolean;
+  readonly dagExport: boolean;
+}
+
+/**
+ * Per-process probe cache. Keyed by normalized gateway URL (trailing
+ * slash trimmed). Stores the in-flight Promise, not the resolved value,
+ * so a concurrent burst of pins triggers exactly one probe per gateway.
+ * Capability is treated as a static property of a gateway within a
+ * process's lifetime — operator reconfiguration requires a new wallet
+ * process to pick up the change.
+ */
+const capabilityCache = new Map<string, Promise<GatewayCapabilities>>();
+
+/**
+ * Test-only helper to reset the probe cache between tests. Production
+ * code does not call this — operator gateway reconfiguration requires a
+ * process restart.
+ */
+export function _resetGatewayCapabilityCache(): void {
+  capabilityCache.clear();
+}
+
+function normalizeGatewayKey(gateway: string): string {
+  return gateway.replace(/\/$/, '');
+}
+
+/**
+ * POST a single empty request to `url` to determine whether the
+ * operator gateway exposes that endpoint. Returns `true` iff the
+ * gateway responded with a 4xx status that is NOT 404 (route absent)
+ * or 405 (POST blocked at the proxy layer). A healthy Kubo returns
+ * 400 *Bad Request* for an empty POST to `/dag/import` / `/dag/export`
+ * — that's the positive signal we look for.
+ *
+ * 5xx is treated as "not exposed" — a healthy operator gateway would
+ * have returned 4xx for empty input. 5xx suggests an unhealthy upstream
+ * or a misconfigured proxy returning a synthetic error page. 2xx is
+ * accepted (defense: the operator may have rewritten the endpoint to
+ * return 200; if the actual call later fails, the selector falls
+ * through to legacy).
+ *
+ * Network errors, timeouts, or aborts → returns `false` (treat as not
+ * exposed). The caller's legacy path will rediscover real failures at
+ * call time through its own per-gateway iteration.
+ */
+async function probeEndpointExposed(url: string): Promise<boolean> {
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+    });
+    response.body?.cancel?.().catch(() => { /* ignore */ });
+    return (
+      response.status !== 404 &&
+      response.status !== 405 &&
+      response.status < 500
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Probe a gateway for `/dag/import` and `/dag/export` support, caching
+ * the result for the rest of the process lifetime. Issue #370.
+ */
+async function probeGatewayCapabilities(gateway: string): Promise<GatewayCapabilities> {
+  const key = normalizeGatewayKey(gateway);
+  const cached = capabilityCache.get(key);
+  if (cached !== undefined) return cached;
+
+  const probe = (async (): Promise<GatewayCapabilities> => {
+    const [dagImport, dagExport] = await Promise.all([
+      probeEndpointExposed(`${key}/api/v0/dag/import`),
+      probeEndpointExposed(`${key}/api/v0/dag/export`),
+    ]);
+    if (!dagImport || !dagExport) {
+      logger.warn(
+        'ipfs-client',
+        `#370 capability probe ${key}: dagImport=${dagImport} dagExport=${dagExport} ` +
+          `— legacy per-block path will be used where the fast path is unavailable`,
+      );
+    }
+    return { dagImport, dagExport };
+  })();
+  capabilityCache.set(key, probe);
+  return probe;
+}
+
+/**
+ * Single-round-trip CAR push: POST `carBytes` to Kubo's
+ * `/api/v0/dag/import?pin=true`. Replaces the per-block `/dag/put`
+ * loop when the operator gateway exposes the import endpoint.
+ *
+ * Parses the NDJSON response and verifies `expectedRootCid` appears
+ * among the imported roots with no `PinErrorMsg`. CAR-bytes content
+ * verification is end-to-end via receiver-side `fetchFromIpfs` checks
+ * — this function does NOT recompute every block's CID (Kubo does that
+ * server-side during import).
+ *
+ * Permissive `Cid` shape parsing accepts both modern
+ * `{"Root": {"Cid": {"/": "bafy..."}}}` and older
+ * `{"Root": {"Cid": "bafy..."}}` Kubo response forms.
+ *
+ * Multi-root defensive check: validates our root is present, ignores
+ * extra roots the gateway reports (defense for a hostile gateway
+ * appending phantom entries).
+ *
+ * Throws on any failure so the caller's selector can fall through to
+ * the legacy per-block path.
+ */
+async function pinCarViaImport(
+  gateway: string,
+  carBytes: Uint8Array,
+  expectedRootCid: string,
+  timeoutMs: number,
+): Promise<void> {
+  const url = `${normalizeGatewayKey(gateway)}/api/v0/dag/import?pin=true`;
+  const form = new FormData();
+  form.append('file', new Blob([carBytes as BlobPart]), 'bundle.car');
+
+  const response = await fetch(url, {
+    method: 'POST',
+    body: form,
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!response.ok) {
+    throw new Error(
+      `HTTP ${response.status} ${response.statusText} from ${gateway} for /dag/import`,
+    );
+  }
+
+  const text = await response.text();
+  let foundExpectedRoot = false;
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) continue;
+    let node: unknown;
+    try {
+      node = JSON.parse(trimmed);
+    } catch {
+      continue; // ignore non-JSON noise
+    }
+    if (node === null || typeof node !== 'object') continue;
+    const root = (node as { Root?: unknown }).Root;
+    if (root === null || root === undefined || typeof root !== 'object') continue;
+    const rootObj = root as { Cid?: unknown; PinErrorMsg?: unknown };
+    let cidStr: string | null = null;
+    const cid = rootObj.Cid;
+    if (typeof cid === 'string') {
+      cidStr = cid;
+    } else if (cid !== null && typeof cid === 'object') {
+      const inner = (cid as { '/'?: unknown })['/'];
+      if (typeof inner === 'string') cidStr = inner;
+    }
+    if (cidStr === expectedRootCid) {
+      const errMsg = rootObj.PinErrorMsg;
+      if (typeof errMsg === 'string' && errMsg.length > 0) {
+        throw new Error(
+          `Gateway ${gateway} reported PinErrorMsg for ${expectedRootCid}: ${errMsg}`,
+        );
+      }
+      foundExpectedRoot = true;
+    }
+  }
+  if (!foundExpectedRoot) {
+    throw new Error(
+      `Gateway ${gateway} /dag/import did not include expected root ${expectedRootCid} in NDJSON response`,
+    );
+  }
+}
+
+/**
+ * Single-round-trip CAR pull: POST to Kubo's
+ * `/api/v0/dag/export?arg=<root>` and return the response bytes
+ * verbatim. The bytes ARE a CARv1 stream — feed directly to
+ * `CarReader.fromBytes`. Replaces the per-block BFS walk when the
+ * operator gateway exposes the export endpoint.
+ *
+ * Per-block CID verification happens after parse in the caller
+ * (`verifyAndReassembleExportedCar`). This function only handles the
+ * HTTP transport. A hostile gateway can DoS but cannot forge data —
+ * the caller's CID-binding check rejects mismatched bytes.
+ *
+ * Throws on any HTTP failure or size-cap breach so the caller's
+ * selector can fall through to the legacy BFS path.
+ */
+async function fetchCarViaExport(
+  gateway: string,
+  rootCid: string,
+  timeoutMs: number,
+  maxSizeBytes: number,
+): Promise<Uint8Array> {
+  const url =
+    `${normalizeGatewayKey(gateway)}/api/v0/dag/export?arg=${encodeURIComponent(rootCid)}`;
+  const response = await fetch(url, {
+    method: 'POST',
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!response.ok) {
+    throw new Error(
+      `HTTP ${response.status} ${response.statusText} from ${gateway} for /dag/export`,
+    );
+  }
+
+  const contentLength = response.headers.get('Content-Length');
+  if (contentLength != null) {
+    const size = parseInt(contentLength, 10);
+    if (!isNaN(size) && size > maxSizeBytes) {
+      throw new Error(
+        `Gateway ${gateway} /dag/export Content-Length ${size} exceeds limit ${maxSizeBytes}`,
+      );
+    }
+  }
+
+  if (response.body != null) {
+    return await readStreamWithLimit(response.body, maxSizeBytes, gateway);
+  }
+  const buf = await response.arrayBuffer();
+  if (buf.byteLength > maxSizeBytes) {
+    throw new Error(
+      `Gateway ${gateway} /dag/export returned ${buf.byteLength} bytes exceeding limit ${maxSizeBytes}`,
+    );
+  }
+  return new Uint8Array(buf);
+}
+
+/**
+ * Verify every block CID-binding in an exported CAR and reassemble it
+ * into a CARv1 rooted at `rootCid` (stream order preserved). Issue
+ * #370 fetch-path companion to {@link fetchCarViaExport}.
+ *
+ * On verification or root-absence failure, throws so the caller's
+ * selector can fall through to the legacy BFS path (which will fetch
+ * each block individually and apply the same CID check via
+ * `fetchFromIpfs`).
+ *
+ * Also write-backs every verified block to the local Helia blockstore
+ * (preserves the #236 bidirectional cache invariant).
+ */
+async function verifyAndReassembleExportedCar(
+  carBytes: Uint8Array,
+  rootCid: string,
+  helia: unknown,
+): Promise<Uint8Array> {
+  const { CarReader } = await import('@ipld/car');
+  const { CarWriter } = await import('@ipld/car/writer');
+  const reader = await CarReader.fromBytes(carBytes);
+
+  let rootBlockCid: CID | null = null;
+  const collected: Array<{ cid: CID; bytes: Uint8Array }> = [];
+  for await (const block of reader.blocks()) {
+    const cidStr = block.cid.toString();
+    verifyCidMatchesBytes(cidStr, block.bytes);
+    collected.push({ cid: block.cid, bytes: block.bytes });
+    if (cidStr === rootCid) rootBlockCid = block.cid;
+  }
+  if (rootBlockCid === null) {
+    throw new Error(
+      `/dag/export response for ${rootCid} did not include the requested root block`,
+    );
+  }
+
+  const localHelia = asHelia(helia);
+  if (localHelia !== null) {
+    for (const block of collected) {
+      await putBlockToLocalHelia(localHelia, block.cid.toString(), block.bytes);
+    }
+  }
+
+  const { writer, out } = CarWriter.create([rootBlockCid]);
+  const chunks: Uint8Array[] = [];
+  const collectPromise = (async () => {
+    for await (const chunk of out) chunks.push(chunk);
+  })();
+  try {
+    for (const block of collected) await writer.put(block);
+  } finally {
+    await writer.close();
+  }
+  await collectPromise;
+
+  let totalLength = 0;
+  for (const c of chunks) totalLength += c.length;
+  const reassembled = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const c of chunks) {
+    reassembled.set(c, offset);
+    offset += c.length;
+  }
+  return reassembled;
+}
+
+// =============================================================================
 // Public API
 // =============================================================================
 
@@ -640,10 +953,15 @@ async function pinSingleBlock(
  * CARs (lean v3 and fat v2), and the Nostr `uxf-cid` publisher (via
  * `createUxfCarPublisher`).
  *
- * Why not `/api/v0/dag/import`: the Unicity IPFS gateway does not expose
- * that endpoint. `dag/put` is universally available across Kubo deploys,
- * including hardened gateways that restrict the API surface. The
- * tradeoff is one HTTP round-trip per block.
+ * Relationship to `/api/v0/dag/import`: as of issue #370, the SDK
+ * prefers `/dag/import` (single CAR push) over this per-block loop
+ * whenever a gateway's capability probe confirms the endpoint is
+ * exposed at the operator layer. This legacy per-block path remains
+ * the hardened fallback for gateways that don't expose `/dag/import`
+ * (or for fast-path call-time failures). `dag/put` is universally
+ * available across Kubo deploys, including hardened gateways that
+ * restrict the API surface; the tradeoff is one HTTP round-trip per
+ * block.
  *
  * The function trusts the caller-supplied `expectedRootCid` and the
  * framed CIDs in the CAR (`@ipld/car`'s `CarReader` does NOT recompute
@@ -687,7 +1005,157 @@ async function pinSingleBlock(
  * @throws {ProfileError} `ORBITDB_WRITE_FAILED` if all gateways fail to
  *         accept a pin or the CAR doesn't contain the expected root.
  */
+/**
+ * Issue #370 fast-path selector. Probes each gateway for `/dag/import`
+ * support and uses the single-shot CAR push when available. Falls
+ * through to {@link pinCarBlocksToIpfsLegacy} when no gateway exposes
+ * the endpoint, or when the fast path fails mid-flight (which would
+ * suggest a transient gateway issue that the hardened per-block path
+ * may still ride out on a sibling gateway).
+ *
+ * Local Helia writes happen on both paths (preserves the #236
+ * crash-safety invariant). The sidecar submit fires once for the CAR
+ * root on the fast path and once per block on the legacy path.
+ */
 export async function pinCarBlocksToIpfs(
+  gateways: string[],
+  carBytes: Uint8Array,
+  expectedRootCid: string,
+  timeoutMs: number = DEFAULT_PIN_TIMEOUT_MS,
+  helia?: unknown,
+  concurrency: number = DEFAULT_PIN_CONCURRENCY,
+): Promise<string> {
+  const effectiveGateways = gateways.length > 0 ? gateways : [DEFAULT_IPFS_API_URL];
+  validateGatewayUrls(effectiveGateways);
+
+  // Track whether we already wrote every block into the local Helia
+  // store on the fast-path attempt. If so, the legacy fallback must
+  // NOT re-write them (would surface as duplicate puts in tests and
+  // wasted disk I/O at runtime). We pass `helia: undefined` to the
+  // legacy call in that case to skip its own per-block local-Helia
+  // write loop.
+  let localHeliaWrittenInFastPath = false;
+
+  for (const gateway of effectiveGateways) {
+    const caps = await probeGatewayCapabilities(gateway);
+    if (!caps.dagImport) continue;
+
+    // Parse the CAR locally for the fast path's local-Helia write and
+    // root-block extraction (used by the post-success sidecar submit).
+    // A malformed CAR fails with a deterministic ProfileError and we
+    // re-throw without falling through — the legacy path would emit
+    // the same error after re-parsing.
+    let parsed: {
+      readonly blocks: ReadonlyArray<{ cid: string; bytes: Uint8Array }>;
+      readonly rootBlock: { cid: string; bytes: Uint8Array };
+    };
+    try {
+      parsed = await parseCarForFastPathPin(carBytes, expectedRootCid);
+    } catch (err) {
+      if (err instanceof ProfileError) throw err;
+      throw new ProfileError(
+        'ORBITDB_WRITE_FAILED',
+        `pinCarBlocksToIpfs: fast-path CAR parse failed: ${err instanceof Error ? err.message : String(err)}`,
+        err,
+      );
+    }
+
+    const localHelia = asHelia(helia);
+    if (localHelia !== null && !localHeliaWrittenInFastPath) {
+      for (const block of parsed.blocks) {
+        let cidBindingOk = true;
+        try {
+          verifyCidMatchesBytes(block.cid, block.bytes);
+        } catch (err) {
+          cidBindingOk = false;
+          logger.warn(
+            'ipfs-client',
+            `pinCarBlocksToIpfs: producer-side CID/bytes mismatch for ${block.cid} ` +
+              `— skipping local-helia put. ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        if (cidBindingOk) await putBlockToLocalHelia(localHelia, block.cid, block.bytes);
+      }
+      localHeliaWrittenInFastPath = true;
+    }
+
+    try {
+      await pinCarViaImport(gateway, carBytes, expectedRootCid, timeoutMs);
+      // One sidecar submit per CAR root (issue #370 explicit guidance).
+      submitToSidecarBestEffort(gateway, expectedRootCid, parsed.rootBlock.bytes);
+      return expectedRootCid;
+    } catch (err) {
+      logger.warn(
+        'ipfs-client',
+        `pinCarBlocksToIpfs: /dag/import fast path failed on ${gateway} for ${expectedRootCid}, ` +
+          `falling back to legacy per-block path. Reason: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      // Exit the gateway probe loop; legacy iterates the full list itself
+      // (a sibling gateway may still accept per-block /dag/put even if
+      // /dag/import on this gateway stumbled).
+      break;
+    }
+  }
+
+  return pinCarBlocksToIpfsLegacy(
+    effectiveGateways,
+    carBytes,
+    expectedRootCid,
+    timeoutMs,
+    // Skip the legacy path's local-Helia write loop if the fast path
+    // already wrote every block — avoids duplicate puts.
+    localHeliaWrittenInFastPath ? undefined : helia,
+    concurrency,
+  );
+}
+
+/**
+ * Parse a CAR upfront for the fast-path pin. Materialises the block
+ * list and extracts the root block bytes for sidecar submit. Throws
+ * `ProfileError(ORBITDB_WRITE_FAILED)` on malformed CARs, zero-block
+ * CARs, or missing-expected-root CARs (matches the legacy path's
+ * pre-flight checks).
+ */
+async function parseCarForFastPathPin(
+  carBytes: Uint8Array,
+  expectedRootCid: string,
+): Promise<{
+  readonly blocks: ReadonlyArray<{ cid: string; bytes: Uint8Array }>;
+  readonly rootBlock: { cid: string; bytes: Uint8Array };
+}> {
+  const { CarReader } = await import('@ipld/car');
+  const reader = await CarReader.fromBytes(carBytes);
+  const blocks: Array<{ cid: string; bytes: Uint8Array }> = [];
+  for await (const block of reader.blocks()) {
+    blocks.push({ cid: block.cid.toString(), bytes: block.bytes });
+  }
+  if (blocks.length === 0) {
+    throw new ProfileError(
+      'ORBITDB_WRITE_FAILED',
+      'CAR contained zero blocks — refusing to publish a phantom rootCid.',
+    );
+  }
+  const rootBlock = blocks.find((b) => b.cid === expectedRootCid);
+  if (rootBlock === undefined) {
+    throw new ProfileError(
+      'ORBITDB_WRITE_FAILED',
+      `expectedRootCid ${expectedRootCid} is not present among CAR blocks (count=${blocks.length}) — builder/publisher mismatch.`,
+    );
+  }
+  return { blocks, rootBlock };
+}
+
+/**
+ * Legacy per-block pin implementation. Issue #370 turned the public
+ * `pinCarBlocksToIpfs` into a selector that prefers `/dag/import` when
+ * the operator gateway advertises it; this function is the fallback
+ * path for legacy gateways and for fast-path call-time failures.
+ *
+ * Signature and behaviour are exactly what `pinCarBlocksToIpfs` had
+ * before issue #370.
+ */
+async function pinCarBlocksToIpfsLegacy(
   gateways: string[],
   carBytes: Uint8Array,
   expectedRootCid: string,
@@ -1245,7 +1713,8 @@ export async function fetchCarFromIpfs(
 
   // Backcompat path: the legacy raw-pinning scheme pinned the entire
   // CAR as one raw block. `fetchFromIpfs` already returns the bytes
-  // verbatim — they ARE the CAR. Skip the walk.
+  // verbatim — they ARE the CAR. Skip the walk. Taken BEFORE the
+  // capability probe — raw-codec roots never need /dag/export.
   if (parsedRoot.code === CODEC_RAW) {
     return fetchFromIpfs(gateways, rootCid, timeoutMs, maxSizeBytesPerBlock, helia);
   }
@@ -1257,6 +1726,84 @@ export async function fetchCarFromIpfs(
     );
   }
 
+  const effectiveGateways = gateways.length > 0 ? gateways : [DEFAULT_IPFS_API_URL];
+  validateGatewayUrls(effectiveGateways);
+
+  // Issue #236 + #370 — local-helia-first short-circuit. When the root
+  // block is already in the local Helia blockstore the legacy BFS path
+  // satisfies the entire walk from disk via `fetchFromIpfs`'s
+  // local-first lookup with zero HTTP round-trips. Take that path
+  // BEFORE the capability probe so we don't spend an /dag/export probe
+  // round-trip when no HTTP is needed at all.
+  const localHeliaForRoot = asHelia(helia);
+  if (localHeliaForRoot !== null) {
+    const localRoot = await tryGetBlockFromLocalHelia(localHeliaForRoot, rootCid);
+    if (localRoot !== null) {
+      return fetchCarFromIpfsLegacy(
+        effectiveGateways,
+        rootCid,
+        parsedRoot,
+        timeoutMs,
+        maxSizeBytesPerBlock,
+        helia,
+      );
+    }
+  }
+
+  // Issue #370 fast path: probe each gateway for /dag/export. On a
+  // capable gateway, fetch the whole CAR in a single HTTP request,
+  // verify every block CID-binding, reassemble and return. On any
+  // failure (404 probe miss, mid-call HTTP error, CID mismatch on
+  // any block, missing root in the exported CAR) fall through to the
+  // legacy per-block BFS path with the full gateway list.
+  for (const gateway of effectiveGateways) {
+    const caps = await probeGatewayCapabilities(gateway);
+    if (!caps.dagExport) continue;
+    try {
+      const carBytes = await fetchCarViaExport(gateway, rootCid, timeoutMs, maxSizeBytesPerBlock);
+      return await verifyAndReassembleExportedCar(carBytes, rootCid, helia);
+    } catch (err) {
+      logger.warn(
+        'ipfs-client',
+        `fetchCarFromIpfs: /dag/export fast path failed on ${gateway} for ${rootCid}, ` +
+          `falling back to legacy per-block BFS. Reason: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      // Exit the gateway probe loop; legacy iterates the full gateway
+      // list itself (a sibling gateway may still serve per-block
+      // /block/get even if /dag/export on this gateway stumbled).
+      break;
+    }
+  }
+
+  return fetchCarFromIpfsLegacy(
+    effectiveGateways,
+    rootCid,
+    parsedRoot,
+    timeoutMs,
+    maxSizeBytesPerBlock,
+    helia,
+  );
+}
+
+/**
+ * Legacy per-block BFS implementation. Issue #370 turned the public
+ * `fetchCarFromIpfs` into a selector that prefers `/dag/export` when
+ * the operator gateway advertises it; this function is the fallback
+ * path for legacy gateways and for fast-path failures.
+ *
+ * Signature differs from the public function: takes the already-parsed
+ * `rootCid` to avoid re-parsing in the selector. Behaviour is exactly
+ * what `fetchCarFromIpfs` had before issue #370.
+ */
+async function fetchCarFromIpfsLegacy(
+  gateways: string[],
+  rootCid: string,
+  parsedRoot: CID,
+  timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
+  maxSizeBytesPerBlock: number = DEFAULT_MAX_SIZE_BYTES,
+  helia?: unknown,
+): Promise<Uint8Array> {
   // Lazy-import @ipld/dag-cbor + CarWriter to keep the cold-path import
   // off the synchronous load of every module that touches ipfs-client.
   const { decode: dagCborDecode } = await import('@ipld/dag-cbor');
