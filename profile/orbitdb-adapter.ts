@@ -751,22 +751,32 @@ export class OrbitDbAdapter implements ProfileDatabase {
 
   async put(key: string, value: Uint8Array): Promise<void> {
     this.ensureConnected();
+    const __t0 = performance.now();
+    const isBundleKey = key.startsWith('tokens.bundle.');
     try {
       await this.db.put(key, value);
     } catch (err) {
+      incr('orbitdb.put.error');
       throw new ProfileError(
         'ORBITDB_WRITE_FAILED',
         `Failed to write key "${key}": ${err instanceof Error ? err.message : String(err)}`,
         err,
+      );
+    } finally {
+      observeMs(
+        isBundleKey ? 'orbitdb.put.bundle' : 'orbitdb.put.other',
+        performance.now() - __t0,
       );
     }
   }
 
   async get(key: string): Promise<Uint8Array | null> {
     this.ensureConnected();
+    const __t0 = performance.now();
     try {
       const value = await this.db.get(key);
       if (value === undefined || value === null) {
+        observeMs('orbitdb.get.missMs', performance.now() - __t0);
         return null;
       }
       // Steelman² remediation: shape validation now lives inside
@@ -774,8 +784,12 @@ export class OrbitDbAdapter implements ProfileDatabase {
       // getEntry() and all()). A peer-crafted LWW write that puts a
       // pathological object in the value slot is rejected uniformly
       // across all three entry points.
-      return coerceToUint8Array(value);
+      const result = coerceToUint8Array(value);
+      observeMs('orbitdb.get.hitMs', performance.now() - __t0);
+      return result;
     } catch (err) {
+      incr('orbitdb.get.error');
+      observeMs('orbitdb.get.errorMs', performance.now() - __t0);
       if (err instanceof ProfileError) throw err;
       throw new ProfileError(
         'ORBITDB_READ_FAILED',
@@ -787,14 +801,18 @@ export class OrbitDbAdapter implements ProfileDatabase {
 
   async del(key: string): Promise<void> {
     this.ensureConnected();
+    const __t0 = performance.now();
     try {
       await this.db.del(key);
     } catch (err) {
+      incr('orbitdb.del.error');
       throw new ProfileError(
         'ORBITDB_WRITE_FAILED',
         `Failed to delete key "${key}": ${err instanceof Error ? err.message : String(err)}`,
         err,
       );
+    } finally {
+      observeMs('orbitdb.del.totalMs', performance.now() - __t0);
     }
   }
 
@@ -882,14 +900,27 @@ export class OrbitDbAdapter implements ProfileDatabase {
     } = {},
   ): Promise<OpLogEntryEnvelope | null> {
     this.ensureConnected();
+    const __geStart = performance.now();
+    const isBundleKey = key.startsWith('tokens.bundle.');
     try {
       const raw = await this.db.get(key);
-      if (raw === undefined || raw === null) return null;
+      if (raw === undefined || raw === null) {
+        observeMs(
+          isBundleKey ? 'orbitdb.getEntry.bundleMissMs' : 'orbitdb.getEntry.missMs',
+          performance.now() - __geStart,
+        );
+        return null;
+      }
       const bytes = coerceToUint8Array(raw);
 
       // Explicit downgrade requested → route through the ingress path.
       if (opts.downgradeAsReplicated === true) {
-        return decodeAndDowngradeReplicated(bytes);
+        const result = decodeAndDowngradeReplicated(bytes);
+        observeMs(
+          isBundleKey ? 'orbitdb.getEntry.bundleHitMs' : 'orbitdb.getEntry.hitMs',
+          performance.now() - __geStart,
+        );
+        return result;
       }
 
       // Default: decode, then enforce the downgrade UNLESS the caller
@@ -899,11 +930,19 @@ export class OrbitDbAdapter implements ProfileDatabase {
       // Legacy entries (v=0) always carry the synthesized system tag —
       // pass through unchanged; the v=0 sentinel tells the caller.
       if (envelope.v === 0) {
+        observeMs(
+          isBundleKey ? 'orbitdb.getEntry.bundleHitMs' : 'orbitdb.getEntry.hitMs',
+          performance.now() - __geStart,
+        );
         return envelope;
       }
 
       const trusted = opts.trustLocalClaim === true && this.localAuthoredKeys.has(key);
       if (trusted) {
+        observeMs(
+          isBundleKey ? 'orbitdb.getEntry.bundleHitMs' : 'orbitdb.getEntry.hitMs',
+          performance.now() - __geStart,
+        );
         return envelope;
       }
 
@@ -920,8 +959,15 @@ export class OrbitDbAdapter implements ProfileDatabase {
       // default. A future enhancement could verify the OpLog entry's
       // identity field against the wallet's chainPubkey to recognize
       // sibling-tab writes; deferred until a use case justifies it.
-      return decodeAndDowngradeReplicated(bytes);
+      const downgraded = decodeAndDowngradeReplicated(bytes);
+      observeMs(
+        isBundleKey ? 'orbitdb.getEntry.bundleHitMs' : 'orbitdb.getEntry.hitMs',
+        performance.now() - __geStart,
+      );
+      return downgraded;
     } catch (err) {
+      incr('orbitdb.getEntry.error');
+      observeMs('orbitdb.getEntry.errorMs', performance.now() - __geStart);
       // Steelman³ remediation: pass ProfileError through unchanged.
       // Re-wrapping double-prefixes the error code (`[PROFILE:ORBITDB_READ_FAILED]
       // ... [PROFILE:ORBITDB_READ_FAILED]`) and obscures the original
@@ -941,11 +987,15 @@ export class OrbitDbAdapter implements ProfileDatabase {
     opts?: { readonly maxResults?: number },
   ): Promise<Map<string, Uint8Array>> {
     this.ensureConnected();
+    incr('orbitdb.all.calls');
+    const __allStart = performance.now();
     try {
       const result = new Map<string, Uint8Array>();
       // OrbitDB keyvalue databases expose an `all()` method that returns
       // all entries as an object or iterable.
+      const __dbAllStart = performance.now();
       const allEntries = await this.db.all();
+      observeMs('orbitdb.all.dbAllMs', performance.now() - __dbAllStart);
       // Round 5 (FIX 3) — short-circuit iteration once the requested
       // `maxResults` matching entries have been buffered. Defends
       // against a hostile peer planting millions of crafted prefix
@@ -1064,8 +1114,12 @@ export class OrbitDbAdapter implements ProfileDatabase {
         );
       }
 
+      incr('orbitdb.all.entries', result.size);
+      observeMs('orbitdb.all.totalMs', performance.now() - __allStart);
       return result;
     } catch (err) {
+      incr('orbitdb.all.error');
+      observeMs('orbitdb.all.totalMs', performance.now() - __allStart);
       if (err instanceof ProfileError) throw err;
       throw new ProfileError(
         'ORBITDB_READ_FAILED',

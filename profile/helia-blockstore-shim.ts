@@ -61,6 +61,8 @@
  * @module profile/helia-blockstore-shim
  */
 
+import { incr, observeMs } from '../core/perf-counters.js';
+
 /**
  * Default maximum LRU entries. 64 entries comfortably covers the
  * OpLog head + recent snapshot + tens of bundle CIDs the load path
@@ -275,6 +277,8 @@ export function installHeliaBlockstoreGetShim(
     cid: unknown,
     opts?: unknown,
   ): Promise<Uint8Array | undefined> => {
+    incr('helia.blockstore.get.calls');
+    const __gStart = performance.now();
     const key = cidKey(cid);
 
     if (key !== null) {
@@ -286,16 +290,22 @@ export function installHeliaBlockstoreGetShim(
         lru.delete(key);
         lru.set(key, cached);
         hits++;
+        incr('helia.blockstore.get.cacheHit');
+        observeMs('helia.blockstore.get.cacheHitMs', performance.now() - __gStart);
         return cached;
       }
       const pending = inflight.get(key);
       if (pending !== undefined) {
         hits++;
-        return pending;
+        incr('helia.blockstore.get.inflightHit');
+        const result = await pending;
+        observeMs('helia.blockstore.get.inflightHitMs', performance.now() - __gStart);
+        return result;
       }
     }
 
     misses++;
+    incr('helia.blockstore.get.miss');
     const work = (async (): Promise<Uint8Array | undefined> => {
       try {
         const source = originalGet(cid, opts) as AsyncIterable<Uint8Array>;
@@ -313,7 +323,9 @@ export function installHeliaBlockstoreGetShim(
     const result = await work;
     if (key !== null && result instanceof Uint8Array) {
       touch(key, result);
+      incr('helia.blockstore.get.bytes', result.byteLength);
     }
+    observeMs('helia.blockstore.get.missMs', performance.now() - __gStart);
     return result;
   };
 
@@ -322,12 +334,21 @@ export function installHeliaBlockstoreGetShim(
   let wrappedPut: ((cid: unknown, val: unknown, opts?: unknown) => unknown) | null = null;
   if (originalPut !== null) {
     wrappedPut = (cid: unknown, val: unknown, opts?: unknown): unknown => {
+      incr('helia.blockstore.put.calls');
+      const __pStart = performance.now();
       const key = cidKey(cid);
       if (key !== null) {
         lru.delete(key);
         inflight.delete(key);
       }
-      return originalPut(cid, val, opts);
+      const result = originalPut(cid, val, opts);
+      if (result && typeof (result as { then?: unknown }).then === 'function') {
+        return (result as Promise<unknown>).finally(() => {
+          observeMs('helia.blockstore.put.totalMs', performance.now() - __pStart);
+        });
+      }
+      observeMs('helia.blockstore.put.totalMs', performance.now() - __pStart);
+      return result;
     };
     blockstore.put = wrappedPut as HeliaBlockstoreLike['put'];
   }
@@ -341,12 +362,21 @@ export function installHeliaBlockstoreGetShim(
   let wrappedDelete: ((cid: unknown, opts?: unknown) => unknown) | null = null;
   if (originalDelete !== null) {
     wrappedDelete = (cid: unknown, opts?: unknown): unknown => {
+      incr('helia.blockstore.delete.calls');
+      const __dStart = performance.now();
       const key = cidKey(cid);
       if (key !== null) {
         lru.delete(key);
         inflight.delete(key);
       }
-      return originalDelete(cid, opts);
+      const result = originalDelete(cid, opts);
+      if (result && typeof (result as { then?: unknown }).then === 'function') {
+        return (result as Promise<unknown>).finally(() => {
+          observeMs('helia.blockstore.delete.totalMs', performance.now() - __dStart);
+        });
+      }
+      observeMs('helia.blockstore.delete.totalMs', performance.now() - __dStart);
+      return result;
     };
     blockstore.delete = wrappedDelete as HeliaBlockstoreLike['delete'];
   }
