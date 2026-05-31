@@ -472,6 +472,22 @@ export function _resetGatewayCapabilityCache(): void {
   capabilityCache.clear();
 }
 
+/**
+ * Test/soak-only helper to pre-populate the capability cache for a
+ * specific gateway URL. Lets a smoke probe force the legacy path for
+ * an A/B comparison against the live gateway without needing to
+ * spin up a second gateway that doesn't expose /dag/import.
+ *
+ * Production code MUST NOT call this — the probe is the source of
+ * truth at runtime.
+ */
+export function _setGatewayCapabilityForTest(
+  gateway: string,
+  caps: { readonly dagImport: boolean; readonly dagExport: boolean },
+): void {
+  capabilityCache.set(normalizeGatewayKey(gateway), Promise.resolve(caps));
+}
+
 function normalizeGatewayKey(gateway: string): string {
   return gateway.replace(/\/$/, '');
 }
