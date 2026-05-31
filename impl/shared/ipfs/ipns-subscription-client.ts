@@ -261,9 +261,22 @@ export class IpnsSubscriptionClient {
     if (this.ws) {
       this.ws.onopen = null;
       this.ws.onclose = null;
-      this.ws.onerror = null;
+      // Keep a no-op error handler so the `ws` library's
+      // "WebSocket was closed before the connection was established"
+      // event (emitted asynchronously after a close() during CONNECTING)
+      // doesn't surface as an unhandled 'error' on the EventEmitter and
+      // crash the process. Disconnect is a teardown — we don't care
+      // about errors past this point.
+      this.ws.onerror = () => {
+        /* swallow post-close errors during shutdown */
+      };
       this.ws.onmessage = null;
-      this.ws.close();
+      try {
+        this.ws.close();
+      } catch {
+        /* close() can throw synchronously if the socket is in an
+           illegal state; treat the same as a post-close error. */
+      }
       this.ws = null;
     }
     this.isConnecting = false;
