@@ -313,7 +313,13 @@ describe('CommunicationsModule — DM CID-ref persistence', () => {
     expect(fakeStore.pinJson).toHaveBeenCalledTimes(1);
   });
 
-  it('throws CID_REF_UNREADABLE when ref present but cidRefStore absent', async () => {
+  it('degrades to empty messages when ref present but cidRefStore absent', async () => {
+    // Mirrors the GroupChat fallback added 2026-05-29 — when the legacy
+    // factory wires the module without a cidRefStore, the messages KV
+    // starts fresh and NIP-17 relay re-delivery rehydrates whatever the
+    // relay still retains. The previous fatal throw bricked `Sphere.load`
+    // via the shared `Promise.allSettled`, taking down every other module's
+    // load with it.
     const store = new Map<string, string>();
     const storage = createMockStorage(store);
     // No cidRefStore injected.
@@ -330,7 +336,44 @@ describe('CommunicationsModule — DM CID-ref persistence', () => {
     );
 
     mod.initialize(deps);
-    await expect(mod.load()).rejects.toThrow(/CID_REF_UNREADABLE/);
+
+    // No throw: load resolves and the messages Map is empty.
+    await expect(mod.load()).resolves.toBeUndefined();
+    expect((mod as unknown as { messages: Map<string, DirectMessage> }).messages.size).toBe(0);
+  });
+
+  it('degrades to empty messages when CID-ref fetch fails (e.g., gateway 404)', async () => {
+    // Companion to the previous test. Even with a cidRefStore wired up, the
+    // fetch can fail at runtime (offline gateway, GC'd content, network
+    // glitch). Before the 2026-06-01 fix the rejection propagated and
+    // bricked Sphere.load; now we log error and start fresh.
+    const store = new Map<string, string>();
+    const storage = createMockStorage(store);
+
+    const fakeStore = {
+      pinJson: vi.fn(),
+      fetchJson: vi.fn(async () => {
+        throw new Error('gateway 404');
+      }),
+      destroy: vi.fn(),
+    };
+    const deps = createDeps({ storage, cidRefStore: fakeStore as never });
+
+    store.set(
+      STORAGE_KEYS_ADDRESS.MESSAGES,
+      JSON.stringify({
+        v: 1,
+        cid: 'bafkreieyqvmjr6zq5adijx2kzlcfmdvexmy2i6knyj4w2pybmzxmvg6bze',
+        size: 1000,
+        ts: 1700000000000,
+      }),
+    );
+
+    mod.initialize(deps);
+
+    await expect(mod.load()).resolves.toBeUndefined();
+    expect((mod as unknown as { messages: Map<string, DirectMessage> }).messages.size).toBe(0);
+    expect(fakeStore.fetchJson).toHaveBeenCalledTimes(1);
   });
 
   it('OpLog value shrinks dramatically when CidRefStore is used', async () => {
