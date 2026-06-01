@@ -464,4 +464,121 @@ describe('ProfilePointerLayer recoverLatest cache (issue #364 Item #1)', () => {
       layer.recoverLatest({ abortSignal: controller.signal }),
     ).rejects.toThrow(/abort/i);
   });
+
+  // ---------------------------------------------------------------------------
+  // Issue #366 — publish-time invalidation
+  // ---------------------------------------------------------------------------
+
+  it('publish() invalidates the cache: subsequent recoverLatest is a fresh round-trip', async () => {
+    const agg = makeCountingAggregator();
+    const layer = await buildLayer({
+      aggregatorClient: agg.client,
+      readLocal: async () => localVersion,
+      persistLocal: async (v) => {
+        localVersion = v;
+      },
+      recoverLatestCacheTtlMs: 10_000,
+    });
+
+    // Seed v=1 so a recoverLatest has something to return.
+    const firstCid = cidForBytes(new TextEncoder().encode('first-payload'));
+    await layer.publish(async () => firstCid.bytes);
+
+    // Warm the cache.
+    agg.callCount.value = 0;
+    const cachedBefore = await layer.recoverLatest();
+    expect(cachedBefore).not.toBeNull();
+    const callsForFirstRecover = agg.callCount.value;
+    expect(callsForFirstRecover).toBeGreaterThan(0);
+
+    // Within TTL → cache hit → no new aggregator activity.
+    agg.callCount.value = 0;
+    await layer.recoverLatest();
+    expect(agg.callCount.value).toBe(0);
+
+    // Publish a NEW pointer (v=2). This MUST invalidate the cache so the
+    // next recoverLatest reads through to the aggregator rather than
+    // returning the v=1 view.
+    agg.callCount.value = 0;
+    const secondCid = cidForBytes(new TextEncoder().encode('second-payload'));
+    await layer.publish(async () => secondCid.bytes);
+
+    // Counter signal: the invalidation fired (cache was warm at publish time).
+    const counters = snapshot();
+    expect(
+      counters['pointerLayer.recoverLatest.cacheInvalidatedOnPublish']?.count,
+    ).toBeGreaterThan(0);
+
+    // Next recoverLatest is a fresh round-trip and surfaces v=2.
+    agg.callCount.value = 0;
+    const fresh = await layer.recoverLatest();
+    expect(fresh).not.toBeNull();
+    expect(agg.callCount.value).toBeGreaterThan(0);
+    if (fresh && 'version' in fresh) {
+      expect(fresh.version).toBe(2);
+      expect(CID.decode(fresh.cid).toString()).toBe(secondCid.toString());
+    }
+  });
+
+  it('publish() with no cached value is a no-op for the invalidation counter', async () => {
+    const agg = makeCountingAggregator();
+    const layer = await buildLayer({
+      aggregatorClient: agg.client,
+      readLocal: async () => localVersion,
+      persistLocal: async (v) => {
+        localVersion = v;
+      },
+      recoverLatestCacheTtlMs: 10_000,
+    });
+
+    // No recoverLatest before publish → cache stays null → invalidation
+    // should NOT fire (the guard only bumps the counter when there's
+    // something to clear).
+    const cid = cidForBytes(new TextEncoder().encode('no-cache-payload'));
+    await layer.publish(async () => cid.bytes);
+
+    const counters = snapshot();
+    expect(
+      counters['pointerLayer.recoverLatest.cacheInvalidatedOnPublish'],
+    ).toBeUndefined();
+  });
+
+  it('publish() invalidation does not abort an in-flight recoverLatest started before publish', async () => {
+    const agg = makeCountingAggregator();
+    const layer = await buildLayer({
+      aggregatorClient: agg.client,
+      readLocal: async () => localVersion,
+      persistLocal: async (v) => {
+        localVersion = v;
+      },
+      recoverLatestCacheTtlMs: 10_000,
+    });
+
+    const firstCid = cidForBytes(new TextEncoder().encode('first-inflight'));
+    await layer.publish(async () => firstCid.bytes);
+
+    // Start a recoverLatest and a publish concurrently. The publish's
+    // invalidation must not corrupt the in-flight recover's result —
+    // the in-flight slot is owned by the operation already in motion.
+    const inflightRecover = layer.recoverLatest();
+    const secondCid = cidForBytes(new TextEncoder().encode('second-inflight'));
+    const publishPromise = layer.publish(async () => secondCid.bytes);
+
+    const [recovered, published] = await Promise.all([
+      inflightRecover,
+      publishPromise,
+    ]);
+
+    expect(recovered).not.toBeNull();
+    expect(published.version).toBe(2);
+
+    // A FRESH recoverLatest after both settle must see v=2 (invalidation
+    // applied; the cache no longer holds the pre-publish v=1 view).
+    agg.callCount.value = 0;
+    const post = await layer.recoverLatest();
+    expect(post).not.toBeNull();
+    if (post && 'version' in post) {
+      expect(post.version).toBe(2);
+    }
+  });
 });

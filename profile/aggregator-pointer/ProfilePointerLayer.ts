@@ -575,6 +575,31 @@ export class ProfilePointerLayer {
       resolveRemoteCid: this.#init.resolveRemoteCid,
       abortSignal,
     });
+    // Issue #366 — invalidate the recoverLatest head cache after a
+    // successful publish. The cache's pre-#366 design assumed the
+    // aggregator view was the only source of pointer-version change
+    // observable to this layer; a local publish that commits a new
+    // version (`reconcileAndPublish` returns without throwing) breaks
+    // that assumption. Downstream readers — chiefly the read-back loop
+    // at `LifecycleManager.awaitAggregatorPointerReadBack`, but also
+    // any caller polling after a flush — must see the freshly-committed
+    // version, not the cached pre-publish view served for the rest of
+    // the TTL window. The §D.4 wall-clock degradation observed in PR
+    // #365's A/B (243s → 467s when the cache was enabled) traced
+    // directly to this gap: the read-back loop spent the cache TTL
+    // re-asserting a stale answer.
+    //
+    // Cleared inside the `#publishInner` body (post-publish, pre-
+    // return) so EVERY successful publish path invalidates — including
+    // the fast-path that skips Step B (`result.attemptsUsed === 0`).
+    // The in-flight slot is NOT touched here: a concurrent recover
+    // that's already awaiting `#inFlightRecover` will still receive
+    // that round-trip's result. A NEW recover after this point starts
+    // fresh.
+    if (this.#cachedRecover !== null) {
+      incr('pointerLayer.recoverLatest.cacheInvalidatedOnPublish');
+      this.#cachedRecover = null;
+    }
     // Issue #264 steelman fix: only overwrite the probe history when
     // the publish actually ran a discovery walkback. The fast-path
     // (#263, attempts === 0) skips Step B and returns
