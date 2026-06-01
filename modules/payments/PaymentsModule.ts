@@ -1673,6 +1673,27 @@ export class PaymentsModule {
 
   // NOSTR-FIRST proof polling (background proof verification)
   private proofPollingJobs: Map<string, ProofPollingJob> = new Map();
+
+  /**
+   * Issue #378 (#275 P4) — persistent ledger of V6-RECOVER permanent
+   * verdicts. Keyed by in-memory `Token.id`; value carries the verdict
+   * label + timestamp the recovery code stamped at the time the
+   * permanent classification was determined.
+   *
+   * Read by `drainPendingFinalizations` (and the stranded-token
+   * registration scan in `recoverStrandedReceivedTokens`) so a
+   * subsequent `sphere balance` / `sphere payments receive`
+   * invocation does NOT re-pay the 60s drain timeout polling a token
+   * whose V6-RECOVER verdict is already known to be unrecoverable.
+   *
+   * Hydrated by `restoreV6RecoverPermanent()` on `load()` so the
+   * verdict survives process restart. Cleared by `Sphere.clear()`
+   * (full wallet wipe — the underlying KV key goes with it) and by
+   * `payments receive --finalize` (operator-forced retry: clears the
+   * map so the recovery path runs one more time in case the HD-index
+   * recovery window has since widened).
+   */
+  private v6RecoverPermanent: Map<string, { reason: string; ts: number }> = new Map();
   /**
    * Lowercase hex of the signing-service publicKey used by
    * `UnmaskedPredicate.create` / `MaskedPredicate.create`. Lazily
@@ -3691,6 +3712,22 @@ export class PaymentsModule {
         await this.restoreProofPollingJobs();
       } catch (err) {
         logger.error('Payments', '[V6-RESTORE] Failed to restore proof-polling jobs:', err);
+      }
+
+      // Issue #378 (#275 P4) — hydrate the V6-RECOVER permanent-verdict
+      // ledger BEFORE `recoverStrandedReceivedTokens` runs so the scan
+      // below sees the marker and skips already-failed tokens. Without
+      // this ordering, a cold-start would re-register every previously-
+      // permanent token for another round of probe + finalize work —
+      // exactly the redundant-polling pattern this commit eliminates.
+      try {
+        await this.restoreV6RecoverPermanent();
+      } catch (err) {
+        logger.error(
+          'Payments',
+          '[V6-RECOVER-PERM] Failed to restore permanent-verdict ledger:',
+          err,
+        );
       }
 
       // Recover stranded V6-direct receives (#144 L3 migration). Walks
@@ -7819,6 +7856,34 @@ export class PaymentsModule {
     const result: ReceiveResult = { transfers: received };
 
     if (opts.finalize) {
+      // Issue #378 (#275 P4) — `receive({ finalize: true })` is the
+      // operator-forced retry path. Clear the persistent permanent-
+      // verdict ledger so any token previously classified as
+      // unrecoverable gets one more shot at finalization. The
+      // recovery scan that runs below (via `drainPendingFinalizations`
+      // → `resolveUnconfirmed`) will re-derive the verdict from
+      // first principles; if the underlying condition genuinely
+      // hasn't cleared (HD index still doesn't cover the recipient,
+      // structural shape still broken) the ledger is re-stamped on
+      // the next round and subsequent non-forced calls short-circuit
+      // again. The empty-map clear is best-effort — a save failure
+      // logs and proceeds; the in-memory clear has already taken
+      // effect for this drain.
+      if (this.v6RecoverPermanent.size > 0) {
+        const clearedCount = this.v6RecoverPermanent.size;
+        this.v6RecoverPermanent.clear();
+        this.saveV6RecoverPermanent().catch((persistErr) =>
+          logger.debug(
+            'Payments',
+            `[V6-RECOVER-PERM] saveV6RecoverPermanent after forced-retry clear failed:`,
+            persistErr,
+          ),
+        );
+        logger.debug(
+          'Payments',
+          `[V6-RECOVER-PERM] Cleared ${clearedCount} permanent-verdict entries for forced retry`,
+        );
+      }
       const drain = await this.drainPendingFinalizations({
         timeoutMs: opts.timeout ?? 60_000,
         pollIntervalMs: opts.pollInterval ?? 2_000,
@@ -7874,10 +7939,20 @@ export class PaymentsModule {
     // that haven't yet reached `addToken` (their tokens are not in
     // `this.tokens` yet, so the status scan below would miss them).
     // See `inflightReceiveCount` doc for why.
+    //
+    // Issue #378 (#275 P4) — a token whose tokenId is in the persistent
+    // `v6RecoverPermanent` ledger is intentionally EXCLUDED from the
+    // drain predicate even if its status reverted to 'submitted' /
+    // 'pending'. The V6-RECOVER verdict is final ("HD-index recovery
+    // exhausted" / "structural failure" — no retry semantically
+    // recovers it); polling it on every `sphere balance` is wasted
+    // wall-clock that historically stacked to ~60s per command.
     const hasUnconfirmedOrInflight = (): boolean =>
       this.inflightReceiveCount > 0 ||
-      Array.from(this.tokens.values()).some(
-        (t) => t.status === 'submitted' || t.status === 'pending',
+      Array.from(this.tokens.entries()).some(
+        ([tokenId, t]) =>
+          (t.status === 'submitted' || t.status === 'pending') &&
+          !this.v6RecoverPermanent.has(tokenId),
       );
 
     // Drain ingest worker pool first (UXF v1 path, defense in depth).
@@ -9329,6 +9404,15 @@ export class PaymentsModule {
     for (const [tokenId, token] of this.tokens) {
       if (token.status !== 'pending') continue;
       if (this.proofPollingJobs.has(tokenId)) continue;
+      // Issue #378 (#275 P4) — a tokenId already in the persistent
+      // permanent-verdict ledger has been classified as un-recoverable
+      // (HD-index recovery exhausted or structural failure). Re-running
+      // the recovery scan against it on every cold start would pay
+      // multi-second probe + finalize costs per stranded token without
+      // ever changing the verdict. Skip until an operator explicitly
+      // forces a retry via `payments receive --finalize` (which clears
+      // the ledger).
+      if (this.v6RecoverPermanent.has(tokenId)) continue;
       if (this.parsePendingFinalization(token.sdkData)) continue;
       if (!this.isReceivedLegacyPending(token)) continue;
 
@@ -9767,6 +9851,29 @@ export class PaymentsModule {
             logger.warn('Payments', `[V6-RECOVER] Failed to persist invalid status for ${tokenId.slice(0, 12)}:`, saveErr);
           }
         }
+
+        // 1a. Issue #378 (#275 P4) — record the verdict in the
+        // persistent ledger so subsequent `drainPendingFinalizations`
+        // and `recoverStrandedReceivedTokens` scans short-circuit
+        // this tokenId in <100ms instead of repeating the V6-RECOVER
+        // probe + the 60s drain timeout. Defense-in-depth above the
+        // status='invalid' write at step 1: a load() that re-ingests
+        // the source TXF bytes from disk would re-derive the in-memory
+        // token map and could (depending on the storage layer's
+        // status-merge semantics) restore the original 'submitted'
+        // status. The persistent ledger key is independent of the
+        // token bytes and so survives those round-trips deterministically.
+        this.v6RecoverPermanent.set(tokenId, {
+          reason: classLabel,
+          ts: Date.now(),
+        });
+        this.saveV6RecoverPermanent().catch((persistErr) =>
+          logger.debug(
+            'Payments',
+            `[V6-RECOVER-PERM] saveV6RecoverPermanent after permanent-fail mark failed:`,
+            persistErr,
+          ),
+        );
 
         // 2. Remove the proof-polling job and persist the change.
         this.proofPollingJobs.delete(tokenId);
@@ -16958,6 +17065,102 @@ export class PaymentsModule {
         `[V6-RESTORE] Restored ${restored} proof-polling job(s) from storage`
       );
       this.startProofPolling();
+    }
+  }
+
+  // ===========================================================================
+  // Issue #378 (#275 P4) — V6-RECOVER permanent-verdict persistence
+  // ===========================================================================
+
+  /**
+   * Persist the `v6RecoverPermanent` map to storage so the verdict
+   * survives process restart. Fire-and-forget at call sites — failures
+   * are logged via the caller's catch arm; the next call re-attempts.
+   *
+   * Empty map → `storage.remove()` so a stale list does not survive
+   * (mirrors `saveProofPollingJobs` exactly).
+   */
+  private async saveV6RecoverPermanent(): Promise<void> {
+    const entries = Array.from(this.v6RecoverPermanent.entries()).map(
+      ([tokenId, v]) => ({ tokenId, reason: v.reason, ts: v.ts }),
+    );
+
+    if (entries.length === 0) {
+      const storage = this.deps!.storage;
+      const removeFn = (storage as { remove?: (k: string) => Promise<void> }).remove;
+      if (typeof removeFn === 'function') {
+        await removeFn.call(storage, STORAGE_KEYS_ADDRESS.V6_RECOVER_PERMANENT);
+      } else {
+        await this.setStorageEntry(
+          STORAGE_KEYS_ADDRESS.V6_RECOVER_PERMANENT,
+          '[]',
+          'cache_index',
+        );
+      }
+      return;
+    }
+
+    await this.setStorageEntry(
+      STORAGE_KEYS_ADDRESS.V6_RECOVER_PERMANENT,
+      JSON.stringify(entries),
+      'cache_index',
+    );
+  }
+
+  /**
+   * Restore the `v6RecoverPermanent` map from storage. Called from
+   * `load()` AFTER `loadFromStorageData` populates `this.tokens`.
+   *
+   * Malformed entries are silently skipped — a single stray entry must
+   * not block legitimate verdicts. A wholly-malformed payload is logged
+   * once and the map starts empty.
+   */
+  private async restoreV6RecoverPermanent(): Promise<void> {
+    const data = await this.deps!.storage.get(
+      STORAGE_KEYS_ADDRESS.V6_RECOVER_PERMANENT,
+    );
+    if (!data) return;
+
+    let entries: Array<{ tokenId: string; reason: string; ts: number }>;
+    try {
+      const parsed = JSON.parse(data);
+      if (!Array.isArray(parsed)) {
+        logger.error(
+          'Payments',
+          '[V6-RECOVER-PERM] Persisted ledger is not an array; clearing',
+        );
+        return;
+      }
+      entries = parsed as Array<{ tokenId: string; reason: string; ts: number }>;
+    } catch (err) {
+      logger.error(
+        'Payments',
+        '[V6-RECOVER-PERM] Failed to parse persisted ledger:',
+        err,
+      );
+      return;
+    }
+
+    let restored = 0;
+    for (const e of entries) {
+      if (
+        typeof e?.tokenId !== 'string' ||
+        e.tokenId.length === 0 ||
+        typeof e.reason !== 'string' ||
+        typeof e.ts !== 'number' ||
+        !Number.isFinite(e.ts)
+      ) {
+        continue;
+      }
+      this.v6RecoverPermanent.set(e.tokenId, { reason: e.reason, ts: e.ts });
+      restored += 1;
+    }
+
+    if (restored > 0) {
+      logger.debug(
+        'Payments',
+        `[V6-RECOVER-PERM] Restored ${restored} permanent-verdict entries from storage`,
+      );
     }
   }
 
