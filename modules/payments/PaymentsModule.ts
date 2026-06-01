@@ -17127,7 +17127,7 @@ export class PaymentsModule {
       if (!Array.isArray(parsed)) {
         logger.error(
           'Payments',
-          '[V6-RECOVER-PERM] Persisted ledger is not an array; clearing',
+          '[V6-RECOVER-PERM] Persisted ledger is not an array; ignoring (in-memory ledger preserved)',
         );
         return;
       }
