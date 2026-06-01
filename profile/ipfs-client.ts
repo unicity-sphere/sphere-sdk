@@ -237,18 +237,155 @@ const DEFAULT_PIN_TIMEOUT_MS = 60_000;
  * single HTTP POST to the sidecar; round-trip is ~80-150 ms regardless of
  * payload size, so serial = N × RTT and dominates wall-clock for any
  * non-trivial wallet (a 24-token migration emits ~250 blocks, which at
- * 100 ms each is ~25 s serial). 10 concurrent in-flight pins reduces the
- * same workload to ~2.5 s while staying well under typical browser
- * per-origin connection caps (Chrome's 6 HTTP/1.1 cap is multiplexed by
- * HTTP/2 on the sidecar). Overridable per-call to support stress tests
- * or sidecars with explicit per-client rate limits.
+ * 100 ms each is ~25 s serial).
+ *
+ * Issue #369 — lowered from 10 → 5. The Unicity kubo container caps at
+ * `MAX_PINS_PER_SECOND=100`; 10 concurrent slots × ~10 pin/s/slot peaks
+ * at ~100 pin/s and routinely brushed the limit on bursts, producing
+ * intermittent `IPFS dag/put failed on all gateways for <CID>: fetch
+ * failed` surface errors that the soak couldn't reproduce on demand.
+ * 5 concurrent slots stay comfortably under the cap (~50 pin/s peak)
+ * while still parallelizing meaningfully — the 250-block migration
+ * pays ~5 s instead of ~2.5 s, but with substantially fewer
+ * rate-limit-induced retry storms. Overridable per-call for stress
+ * tests or operator deployments with explicit per-client rate limits.
  *
  * Concurrency is bounded by a worker pool (not Promise.all over all
  * blocks) so memory stays O(concurrency × block-size) rather than
  * O(blocks × block-size) — important for migration of large wallets
  * where the CAR may contain thousands of blocks.
  */
-const DEFAULT_PIN_CONCURRENCY = 10;
+const DEFAULT_PIN_CONCURRENCY = 5;
+
+// =============================================================================
+// Issue #369 — retry-with-backoff for transient pin failures.
+// =============================================================================
+
+/**
+ * Backoff schedule for a single pin attempt's retries (ms). The
+ * indices line up 1:1 with retry attempts AFTER the initial pass:
+ * a single call to {@link withPinRetry} makes `1 + backoffs.length`
+ * attempts total before throwing.
+ *
+ * 100 / 500 / 2000 ms is the issue #369 recommendation — fast first
+ * retry to absorb the dominant TCP retransmit-window blip, longer
+ * second retry to ride through a gateway hiccup, and a third retry
+ * for the rare extended outage. After 2.6 s of accumulated backoff,
+ * if the gateway still rejects, the failure is unlikely to clear in
+ * the operation's deadline.
+ */
+const PIN_RETRY_BACKOFFS_MS: readonly number[] = [100, 500, 2000];
+
+/**
+ * Classify whether a pin failure is worth retrying.
+ *
+ * Transient (retry):
+ *   - Native `fetch()` throws — network blip, ECONNRESET, ETIMEDOUT,
+ *     TLS handshake stall, AbortError from the per-attempt timeout.
+ *   - HTTP 5xx — gateway-side transient (overload, bad backend).
+ *   - HTTP 429 — explicit rate-limit signal; backoff is the right
+ *     response.
+ *
+ * Permanent (do NOT retry):
+ *   - Other HTTP 4xx — deterministic client-side failures (bad
+ *     request, unauthorized, not found, payload too large).
+ *
+ * Default is transient — leniency favours availability over giving
+ * up on an unrecognised error shape; the bounded backoff schedule
+ * caps the cost.
+ *
+ * The classifier inspects the error's `message` against the shape
+ * `pinToIpfs` / `pinSingleBlock` use for their own throws
+ * (`"HTTP <code> <statusText> from <gw>"`) so a synthetic test error
+ * with that prefix is classified identically to a real one.
+ */
+export function isTransientPinError(err: unknown): boolean {
+  if (!(err instanceof Error)) return true;
+  const msg = err.message;
+
+  // HTTP-derived errors carry the explicit status in the message. We
+  // match anywhere in the string so a wrapped failure (e.g.,
+  // `pinToIpfs` packaging the last gateway's "HTTP 400 …" into its
+  // `IPFS pin failed on all gateways: HTTP 400 …` final throw) still
+  // classifies on the inner status code rather than falling through
+  // to the lenient default.
+  const httpMatch = /\bHTTP (\d{3})\b/.exec(msg);
+  if (httpMatch !== null) {
+    const status = Number.parseInt(httpMatch[1], 10);
+    if (status === 429) return true;
+    if (status >= 500 && status < 600) return true;
+    if (status >= 400 && status < 500) return false;
+  }
+
+  // Network / abort errors propagate from `fetch()` directly. Patterns
+  // observed across Node 18+ undici (`fetch failed`, `Connect Timeout
+  // Error`) and the platform `AbortError` from `AbortSignal.timeout`.
+  if (
+    msg.toLowerCase().includes('fetch failed') ||
+    msg.toLowerCase().includes('network') ||
+    msg.includes('ECONNRESET') ||
+    msg.includes('ETIMEDOUT') ||
+    msg.includes('ECONNREFUSED') ||
+    msg.includes('EAI_AGAIN') ||
+    err.name === 'AbortError' ||
+    err.name === 'TimeoutError'
+  ) {
+    return true;
+  }
+
+  // Lenient default — unrecognised shape is treated as transient. The
+  // bounded backoff schedule caps the cost; a truly-permanent failure
+  // exhausts the retries in 2.6 s and surfaces normally.
+  return true;
+}
+
+/**
+ * Run `fn` with retry-with-backoff for transient pin failures. Makes
+ * up to `1 + backoffs.length` attempts; the first attempt fires
+ * immediately, each subsequent retry waits `backoffs[i]` ms.
+ *
+ * `isRetryable` classifies the thrown error. On the FINAL attempt a
+ * failure short-circuits — no further backoff is paid. On a permanent
+ * (non-retryable) failure the function throws immediately with the
+ * observed error, regardless of the retry budget.
+ *
+ * Counters (fired only when `SPHERE_PERF=1`):
+ *   - `ipfs.pin.retry.attempt` — bumped on each transient retry just
+ *     before the backoff sleep. Total fires = number of paid retries.
+ *   - `ipfs.pin.retry.exhausted` — bumped when all retries fail with
+ *     transient errors AND we throw the last one. Distinct from
+ *     `ipfs.pin.retry.permanent` (a permanent failure exits before the
+ *     retry budget runs out).
+ *   - `ipfs.pin.retry.permanent` — bumped when the classifier returns
+ *     `false` and the function throws the permanent error without
+ *     consuming further retries.
+ */
+export async function withPinRetry<T>(
+  fn: () => Promise<T>,
+  isRetryable: (err: unknown) => boolean = isTransientPinError,
+  backoffs: readonly number[] = PIN_RETRY_BACKOFFS_MS,
+): Promise<T> {
+  for (let attempt = 0; attempt <= backoffs.length; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const isLast = attempt >= backoffs.length;
+      if (isLast) {
+        incr('ipfs.pin.retry.exhausted');
+        throw err;
+      }
+      if (!isRetryable(err)) {
+        incr('ipfs.pin.retry.permanent');
+        throw err;
+      }
+      incr('ipfs.pin.retry.attempt');
+      await new Promise<void>((resolve) => setTimeout(resolve, backoffs[attempt]));
+    }
+  }
+  // Unreachable — the loop above either returns or throws on every
+  // path. This satisfies TypeScript's exhaustiveness check.
+  throw new Error('withPinRetry: unreachable');
+}
 
 /** Default timeout for fetch operations (ms). */
 const DEFAULT_FETCH_TIMEOUT_MS = 30_000;
@@ -452,6 +589,21 @@ export async function pinToIpfs(
 ): Promise<string> {
   const effectiveGateways = gateways.length > 0 ? gateways : [DEFAULT_IPFS_API_URL];
   validateGatewayUrls(effectiveGateways);
+
+  // Issue #369 — wrap the gateway-iteration in retry-with-backoff so a
+  // single transient hiccup (network blip, brief TLS slowdown, 429 from
+  // a rate-limited gateway) no longer aborts the pin. The retry only
+  // fires when EVERY configured gateway has failed in the current
+  // attempt — a single healthy gateway still satisfies the pin without
+  // paying any backoff cost.
+  return withPinRetry(() => pinToIpfsOnce(effectiveGateways, data, timeoutMs));
+}
+
+async function pinToIpfsOnce(
+  effectiveGateways: string[],
+  data: Uint8Array,
+  timeoutMs: number,
+): Promise<string> {
   let lastError: Error | null = null;
 
   for (const gateway of effectiveGateways) {
@@ -570,6 +722,22 @@ async function pinSingleBlock(
   const effectiveGateways = gateways.length > 0 ? gateways : [DEFAULT_IPFS_API_URL];
   validateGatewayUrls(effectiveGateways);
 
+  // Issue #369 — wrap the per-block pin in retry-with-backoff so a
+  // single transient network/gateway failure on this one block doesn't
+  // abort the whole CAR pin (a 250-block CAR has 250 retry slots — a
+  // single 1% failure rate without retries cascades to ~92% chance of
+  // at-least-one-failure per CAR).
+  return withPinRetry(() =>
+    pinSingleBlockOnce(effectiveGateways, blockBytes, expectedCid, timeoutMs),
+  );
+}
+
+async function pinSingleBlockOnce(
+  effectiveGateways: string[],
+  blockBytes: Uint8Array,
+  expectedCid: string,
+  timeoutMs: number,
+): Promise<void> {
   // Derive the Kubo codec token from the CID's multicodec prefix.
   // Unknown codecs fall back to `raw` so we still store the bytes (the
   // gateway will compute a different CID, but our locally-computed

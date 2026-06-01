@@ -369,6 +369,16 @@ describe('LifecycleManager periodic pointer poll (Path 2 safety net)', () => {
     const lifecycle = getLifecycle(provider);
     expect(lifecycle.pointerPollTimer).not.toBeNull();
 
+    // Issue #369 — the apply-snapshot path schedules a flush whose
+    // CAR-pin now sits behind `withPinRetry` (retry-with-backoff on
+    // transient pin failures). Under `vi.useFakeTimers()` the retry's
+    // setTimeout-based backoff doesn't fire on its own, so the
+    // shutdown's flush would block forever waiting for retries. Switch
+    // to real timers for teardown so the retries drain promptly — the
+    // assertions above already cover the test's intent (applier was
+    // invoked with the new snapshot CID); the shutdown is only here to
+    // satisfy the test's resource-cleanup discipline.
+    vi.useRealTimers();
     await provider.shutdown();
   });
 
