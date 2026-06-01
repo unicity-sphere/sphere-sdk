@@ -60,7 +60,7 @@ import type { PointerMutex } from './mutex-lock.js';
 import { reconcileAndPublish, type FetchAndJoinCallback } from './reconcile-algorithm.js';
 import type { PointerSigner } from './signing.js';
 import type { BlockedState, PointerVersion } from './types.js';
-import { time } from '../../core/perf-counters.js';
+import { incr, time } from '../../core/perf-counters.js';
 
 // ── Constructor input ──────────────────────────────────────────────────────
 
@@ -121,6 +121,35 @@ export interface ProfilePointerLayerInit {
   ) => Promise<number | undefined>;
   /** Configuration (capabilities). */
   readonly config?: PointerLayerConfig;
+  /**
+   * Issue #364 Item #1 — TTL (ms) for the `recoverLatest()` head cache.
+   *
+   * A short cache eliminates the read-back tight-loop's redundant
+   * aggregator round-trips: the §D.4 recovery soak observed 108
+   * recoverLatest calls in 123 s (0.88/s), driven by the
+   * `awaitAggregatorPointerReadBack` loop polling every 500 ms while
+   * the per-call cost averages 250 ms. With this cache, only the first
+   * call in each TTL window hits the aggregator; subsequent calls
+   * within the window return the cached value in sub-millisecond time
+   * and bump the `pointerLayer.recoverLatest.cacheHit` counter.
+   *
+   * Concurrent callers that arrive while a call is in flight attach to
+   * the in-flight promise (`pointerLayer.recoverLatest.inFlightDedup`)
+   * rather than launching a parallel aggregator round-trip.
+   *
+   * Default: 10_000 (10 s). Trade-off rationale:
+   *   - The read-back loop's 500 ms poll cadence over a typical 30 s
+   *     shutdown-durability deadline drops from 60 calls to 3.
+   *   - The periodic pointer poll's 30-90 s cadence is unaffected
+   *     (each poll exceeds the TTL).
+   *   - New pointer versions are still observed within 10 s, which is
+   *     well inside the worst-case aggregator read-replica lag this
+   *     loop is designed to absorb.
+   *
+   * Set `0` to disable the cache entirely (every call hits the
+   * aggregator — restores pre-#364 behavior).
+   */
+  readonly recoverLatestCacheTtlMs?: number;
 }
 
 // ── Public result types ────────────────────────────────────────────────────
@@ -227,6 +256,21 @@ export class ProfilePointerLayer {
   // immediately after shutdown starts.
   #shuttingDown = false;
 
+  // ── Issue #364 Item #1 — recoverLatest head cache ──────────────────────
+  // Cached most-recent result of recoverLatest() with a short TTL.
+  // Subsequent calls within the TTL return the cached value, eliminating
+  // the read-back tight-loop's redundant aggregator round-trips.
+  // Cleared on shutdown(); concurrent callers attach to #inFlightRecover.
+  readonly #recoverCacheTtlMs: number;
+  #cachedRecover: {
+    readonly result: RecoverResult | RecoverAllUnfetchableResult | null;
+    readonly expiresAt: number;
+  } | null = null;
+  // In-flight dedup: when set, a concurrent recoverLatest awaits this
+  // promise instead of launching a parallel aggregator round-trip.
+  // Cleared in finally after settle (success or failure).
+  #inFlightRecover: Promise<RecoverResult | RecoverAllUnfetchableResult | null> | null = null;
+
   constructor(init: ProfilePointerLayerInit) {
     this.#init = init;
     // Steelman² remediation: extract just the known boolean fields
@@ -259,6 +303,17 @@ export class ProfilePointerLayer {
       enablePointerWinBroadcasts:
         suppliedConfig.enablePointerWinBroadcasts === true,
     });
+
+    // Issue #364 Item #1 — clamp the recoverLatest cache TTL. A non-
+    // finite / negative value disables the cache (treated as 0). The
+    // upper bound (60s) prevents pathological misconfigurations from
+    // pinning a stale aggregator view for arbitrarily long.
+    const rawTtl = init.recoverLatestCacheTtlMs;
+    const ttlCandidate =
+      typeof rawTtl === 'number' && Number.isFinite(rawTtl) && rawTtl >= 0
+        ? rawTtl
+        : 10_000;
+    this.#recoverCacheTtlMs = Math.min(ttlCandidate, 60_000);
   }
 
   /**
@@ -459,6 +514,11 @@ export class ProfilePointerLayer {
     // shutdown cycle. The fingerprint API is not safe to call after
     // shutdown anyway (#assertNotShuttingDown gates it).
     this.#lastProbeVersions = [];
+    // Issue #364 Item #1 — clear the recoverLatest cache so a future
+    // re-init reading a fresh aggregator view never observes stale
+    // bytes. The in-flight slot is cleared by the operation's own
+    // finally arm during the drain above.
+    this.#cachedRecover = null;
   }
 
   // ── publish ──────────────────────────────────────────────────────────────
@@ -515,6 +575,31 @@ export class ProfilePointerLayer {
       resolveRemoteCid: this.#init.resolveRemoteCid,
       abortSignal,
     });
+    // Issue #366 — invalidate the recoverLatest head cache after a
+    // successful publish. The cache's pre-#366 design assumed the
+    // aggregator view was the only source of pointer-version change
+    // observable to this layer; a local publish that commits a new
+    // version (`reconcileAndPublish` returns without throwing) breaks
+    // that assumption. Downstream readers — chiefly the read-back loop
+    // at `LifecycleManager.awaitAggregatorPointerReadBack`, but also
+    // any caller polling after a flush — must see the freshly-committed
+    // version, not the cached pre-publish view served for the rest of
+    // the TTL window. The §D.4 wall-clock degradation observed in PR
+    // #365's A/B (243s → 467s when the cache was enabled) traced
+    // directly to this gap: the read-back loop spent the cache TTL
+    // re-asserting a stale answer.
+    //
+    // Cleared inside the `#publishInner` body (post-publish, pre-
+    // return) so EVERY successful publish path invalidates — including
+    // the fast-path that skips Step B (`result.attemptsUsed === 0`).
+    // The in-flight slot is NOT touched here: a concurrent recover
+    // that's already awaiting `#inFlightRecover` will still receive
+    // that round-trip's result. A NEW recover after this point starts
+    // fresh.
+    if (this.#cachedRecover !== null) {
+      incr('pointerLayer.recoverLatest.cacheInvalidatedOnPublish');
+      this.#cachedRecover = null;
+    }
     // Issue #264 steelman fix: only overwrite the probe history when
     // the publish actually ran a discovery walkback. The fast-path
     // (#263, attempts === 0) skips Step B and returns
@@ -567,9 +652,73 @@ export class ProfilePointerLayer {
   async recoverLatest(opts?: {
     abortSignal?: AbortSignal;
   }): Promise<RecoverResult | RecoverAllUnfetchableResult | null> {
-    return time('pointerLayer.recoverLatest', () => {
+    return time('pointerLayer.recoverLatest', async () => {
       this.#assertNotShuttingDown('recoverLatest');
-      return this.#tracked(this.#recoverLatestInner(opts?.abortSignal));
+      // Issue #364 Item #1 — cache-first path. The cache sits INSIDE
+      // the `time()` wrapper so hit/miss latencies both count toward
+      // the aggregate cost recorded in `pointerLayer.recoverLatest`.
+      // Cache hits are sub-millisecond, which shows up in the counter
+      // snapshot as a dramatic drop in totalMs/avgMs without changing
+      // the call count semantic (every public call is counted once).
+      const abortSignal = opts?.abortSignal;
+      if (abortSignal?.aborted) {
+        const err = new Error('recoverLatest aborted by caller');
+        err.name = 'AbortError';
+        throw err;
+      }
+      // Cache hit: serve from #cachedRecover when within TTL. The
+      // cached value is shared across callers — this is sound because
+      // RecoverResult / RecoverAllUnfetchableResult / null are
+      // immutable value types from the caller's perspective.
+      if (this.#recoverCacheTtlMs > 0 && this.#cachedRecover !== null) {
+        if (Date.now() < this.#cachedRecover.expiresAt) {
+          incr('pointerLayer.recoverLatest.cacheHit');
+          return this.#cachedRecover.result;
+        }
+        // TTL expired — fall through to a fresh aggregator round-trip.
+        incr('pointerLayer.recoverLatest.cacheStale');
+        this.#cachedRecover = null;
+      }
+      // In-flight dedup: a concurrent caller already triggered the
+      // aggregator call. Attach to the same promise instead of
+      // launching a parallel round-trip. The attached caller does NOT
+      // share the upstream call's abort signal — aborting one waiter
+      // must not cancel the request for the others (we've already
+      // checked our own signal above).
+      if (this.#inFlightRecover !== null) {
+        incr('pointerLayer.recoverLatest.inFlightDedup');
+        return this.#inFlightRecover;
+      }
+      // cacheMiss is only meaningful when caching is enabled. With
+      // TTL=0 (cache disabled) every call is structurally a miss and
+      // emitting the counter would conflate the two modes.
+      if (this.#recoverCacheTtlMs > 0) {
+        incr('pointerLayer.recoverLatest.cacheMiss');
+      }
+      const inner = this.#tracked(this.#recoverLatestInner(abortSignal));
+      this.#inFlightRecover = inner;
+      try {
+        const result = await inner;
+        // Populate the cache only when the TTL is enabled. A fresh
+        // shutdown() between launch and settle clears #cachedRecover
+        // below; we still record the result on the local variable so
+        // any awaiting callers receive it consistently.
+        if (this.#recoverCacheTtlMs > 0 && !this.#shuttingDown) {
+          this.#cachedRecover = {
+            result,
+            expiresAt: Date.now() + this.#recoverCacheTtlMs,
+          };
+        }
+        return result;
+      } finally {
+        // Always clear the in-flight slot, even on failure — the next
+        // call should retry the aggregator rather than re-throwing the
+        // cached rejection (which would defeat the read-back retry
+        // loop's recovery semantics).
+        if (this.#inFlightRecover === inner) {
+          this.#inFlightRecover = null;
+        }
+      }
     });
   }
 
