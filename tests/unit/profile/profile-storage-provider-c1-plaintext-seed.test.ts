@@ -206,16 +206,13 @@ describe('Audit #333 C1 — plaintext-seed window', () => {
       expect(cache._store.get('wallet_exists')).toBe('true');
     });
 
-    it('encrypt() also throws on identity-class writes in the danger window', async () => {
-      const { provider, db } = buildDangerWindowProvider();
-      // dbStatus='attached' + profileEncryptionKey=null is the
-      // audit's exact dangerous scenario. Even though the localCache
-      // write succeeds first (legacy behaviour), the OrbitDB write
-      // is rejected at the encrypt() boundary — the mnemonic does
-      // NOT reach OrbitDB, and therefore does NOT replicate to IPFS.
-      await expect(provider.set('mnemonic', 'plaintext-seed-bytes'))
-        .rejects.toMatchObject({ code: 'PROFILE_NOT_INITIALIZED' });
-      // OrbitDB store is empty — the audit's described leak is blocked.
+    it('identity-class writes in the danger window never reach OrbitDB (cache-only short-circuit precedes encrypt())', async () => {
+      // Post IDENTITY_KEYS ⊂ CACHE_ONLY_KEYS: identity writes resolve
+      // to localCache only, so `encrypt()` is never invoked and `set()`
+      // does not throw. The OrbitDB store stays empty regardless.
+      const { provider, db, cache } = buildDangerWindowProvider();
+      await provider.set('mnemonic', 'plaintext-seed-bytes');
+      expect(cache._store.get('mnemonic')).toBe('plaintext-seed-bytes');
       expect(db._store.size).toBe(0);
     });
 
@@ -237,13 +234,31 @@ describe('Audit #333 C1 — plaintext-seed window', () => {
         .rejects.toMatchObject({ code: 'PROFILE_NOT_INITIALIZED' });
     });
 
-    it('after setIdentity, writes succeed and land ENCRYPTED in OrbitDB', async () => {
-      const { provider, db } = buildDangerWindowProvider();
+    it('after setIdentity, identity-class writes STILL never reach OrbitDB (cache-only)', async () => {
+      // Post-IDENTITY_KEYS-cache-only fix: even with a valid encryption
+      // key, `mnemonic` / `master_key` / etc. are cache-only by the
+      // `CACHE_ONLY_KEYS` set in profile/types.ts. The set() short-
+      // circuits at the localCache step. This closes the seed-leak
+      // window completely — encrypt()-throw was only a Phase-A defense.
+      const { provider, db, cache } = buildDangerWindowProvider();
       provider.setIdentity(TEST_IDENTITY);
       await provider.set('mnemonic', 'abandon abandon abandon');
-      const stored = db._store.get('identity.mnemonic');
+      expect(cache._store.get('mnemonic')).toBe('abandon abandon abandon');
+      // No OrbitDB entry at any identity.* key.
+      expect(db._store.get('identity.mnemonic')).toBeUndefined();
+      expect([...db._store.keys()].filter((k) => k.startsWith('identity.'))).toEqual([]);
+    });
+
+    it('after setIdentity, non-identity writes still land ENCRYPTED in OrbitDB (control)', async () => {
+      // Sanity: the cache-only routing is scoped to IDENTITY_KEYS, not
+      // a side effect of any other refactor. A non-identity key like
+      // `address_nametags` still flows through writeEnvelope→encrypt.
+      const { provider, db } = buildDangerWindowProvider();
+      provider.setIdentity(TEST_IDENTITY);
+      await provider.set('address_nametags', '{"a":1}');
+      const stored = db._store.get('addresses.nametags');
       expect(stored).toBeDefined();
-      expect(new TextDecoder().decode(stored!)).not.toBe('abandon abandon abandon');
+      expect(new TextDecoder().decode(stored!)).not.toBe('{"a":1}');
     });
   });
 
@@ -252,24 +267,23 @@ describe('Audit #333 C1 — plaintext-seed window', () => {
   // -------------------------------------------------------------------------
 
   describe('boot-order regression — IPFS replication leak is closed', () => {
-    it('the audit\'s scenario (OrbitDB attached + no setIdentity + set mnemonic) is REJECTED at the OrbitDB boundary', async () => {
-      // The audit's exact described attack: provider in the dangerous
-      // window, writes the seed via set('mnemonic', ...). Pre-fix the
-      // encrypt() fallback would return raw UTF-8 bytes and the
-      // mnemonic would land in OrbitDB → replicate to IPFS. Post-fix
-      // the encrypt() throws and the OrbitDB store stays empty.
+    it('the audit\'s scenario (OrbitDB attached + no setIdentity + set mnemonic) is blocked by the cache-only routing; post-setIdentity it is STILL blocked', async () => {
+      // Pre-fix the encrypt() fallback returned raw UTF-8 bytes and the
+      // mnemonic landed in OrbitDB. The C1 fix made encrypt() throw in
+      // the danger window; this present fix (IDENTITY_KEYS ⊂
+      // CACHE_ONLY_KEYS) makes the cache-only routing skip OrbitDB
+      // *entirely* — both before and after a valid encryption key is
+      // attached.
       const { provider, db } = buildDangerWindowProvider();
-      await expect(provider.set('mnemonic', 'twelve word phrase'))
-        .rejects.toMatchObject({ code: 'PROFILE_NOT_INITIALIZED' });
-      expect([...db._store.keys()]).not.toContain('identity.mnemonic');
-
-      // Recovery: after setIdentity, the write succeeds and lands
-      // ENCRYPTED (not plaintext) in OrbitDB.
-      provider.setIdentity(TEST_IDENTITY);
       await provider.set('mnemonic', 'twelve word phrase');
-      const stored = db._store.get('identity.mnemonic');
-      expect(stored).toBeDefined();
-      expect(new TextDecoder().decode(stored!)).not.toBe('twelve word phrase');
+      expect([...db._store.keys()]).not.toContain('identity.mnemonic');
+      expect(db._store.size).toBe(0);
+
+      // Post-setIdentity: the seed STILL never lands in OrbitDB.
+      provider.setIdentity(TEST_IDENTITY);
+      await provider.set('mnemonic', 'twelve word phrase v2');
+      expect(db._store.get('identity.mnemonic')).toBeUndefined();
+      expect([...db._store.keys()].filter((k) => k.startsWith('identity.'))).toEqual([]);
     });
 
     it('the legitimate Sphere.create flow (Phase A → setIdentity → Phase B) WORKS end-to-end', async () => {

@@ -197,16 +197,18 @@ describe('Issue #311 — critical-block-evicted notifier', () => {
       fired.push({ cid: info.cid, key: info.key, attemptedAt: info.attemptedAt });
     });
 
-    // `mnemonic` translates to the profile key `identity.mnemonic`. The
+    // `wallet_exists` translates to the profile key `wallet_exists`. The
     // adapter's `get(...)` throws our crafted error → readEnvelopePayload
     // detects the LoadBlockFailed signature and fires the notifier.
-    await expect(provider.getEncryptedRaw('mnemonic')).rejects.toThrow(
+    // (Using a non-identity key — `mnemonic` is cache-only post the
+    // IDENTITY_KEYS ⊂ CACHE_ONLY_KEYS fix and would not reach `db.get`.)
+    await expect(provider.getEncryptedRaw('wallet_exists')).rejects.toThrow(
       /Failed to load block/,
     );
 
     expect(fired.length).toBe(1);
     expect(fired[0].cid).toBe(MISSING_CID);
-    expect(fired[0].key).toBe('identity.mnemonic');
+    expect(fired[0].key).toBe('wallet_exists');
     expect(typeof fired[0].attemptedAt).toBe('number');
     expect(fired[0].attemptedAt).toBeGreaterThan(0);
   });
@@ -218,7 +220,7 @@ describe('Issue #311 — critical-block-evicted notifier', () => {
       if (info.cid !== null) fired.push(info.cid);
     });
 
-    await expect(provider.getEncryptedRaw('mnemonic')).rejects.toBeDefined();
+    await expect(provider.getEncryptedRaw('wallet_exists')).rejects.toBeDefined();
 
     expect(fired).toEqual([MISSING_CID]);
   });
@@ -231,7 +233,7 @@ describe('Issue #311 — critical-block-evicted notifier', () => {
     });
 
     for (let i = 0; i < 5; i++) {
-      await expect(provider.getEncryptedRaw('mnemonic')).rejects.toBeDefined();
+      await expect(provider.getEncryptedRaw('wallet_exists')).rejects.toBeDefined();
     }
     expect(count).toBe(1);
   });
@@ -243,7 +245,7 @@ describe('Issue #311 — critical-block-evicted notifier', () => {
     });
     // The original "Failed to load block" error must still surface to
     // the caller — the observability hook is best-effort, not a sink.
-    await expect(provider.getEncryptedRaw('mnemonic')).rejects.toThrow(
+    await expect(provider.getEncryptedRaw('wallet_exists')).rejects.toThrow(
       /Failed to load block/,
     );
   });
@@ -256,7 +258,7 @@ describe('Issue #311 — critical-block-evicted notifier', () => {
       fired += 1;
     });
     // The key is absent, so getEncryptedRaw resolves to null cleanly.
-    const result = await provider.getEncryptedRaw('mnemonic');
+    const result = await provider.getEncryptedRaw('wallet_exists');
     expect(result).toBeNull();
     expect(fired).toBe(0);
   });

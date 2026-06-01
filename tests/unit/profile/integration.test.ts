@@ -231,9 +231,11 @@ describe('Profile Integration', () => {
       storageA.setIdentity(TEST_IDENTITY);
       await mockDb.connect({} as any);
 
-      // Access internal connection state
+      // Use a non-identity key — `mnemonic`/`master_key` are
+      // cache-only post the IDENTITY_KEYS ⊂ CACHE_ONLY_KEYS fix and
+      // never reach OrbitDB.
       (storageA as any).dbStatus = "attached";
-      await storageA.set('mnemonic', 'encrypt me');
+      await storageA.set('wallet_exists', 'encrypt me');
 
       // Provider B reads from the same OrbitDB with fresh cache
       const cacheB = createMockCacheStorage();
@@ -244,8 +246,8 @@ describe('Profile Integration', () => {
       storageB.setIdentity(TEST_IDENTITY);
       (storageB as any).dbStatus = "attached";
 
-      // Clear cache so it falls through to OrbitDB
-      const value = await storageB.get('mnemonic');
+      // Cache cold → falls through to OrbitDB.
+      const value = await storageB.get('wallet_exists');
       expect(value).toBe('encrypt me');
     });
   });
@@ -255,7 +257,11 @@ describe('Profile Integration', () => {
   // ---------------------------------------------------------------------------
 
   describe('multi-device simulation', () => {
-    it('two providers sharing OrbitDB see data from both', async () => {
+    it('two providers sharing OrbitDB see data from both (non-identity keys only)', async () => {
+      // Note: identity / seed material is intentionally NOT cross-device
+      // synced — `mnemonic` / `master_key` etc. are cache-only post the
+      // IDENTITY_KEYS ⊂ CACHE_ONLY_KEYS fix, and the user moves them
+      // between devices via BIP-39 mnemonic backup, not OrbitDB.
       const sharedDb = createMockProfileDatabase();
       await sharedDb.connect({} as any);
 
@@ -267,7 +273,7 @@ describe('Profile Integration', () => {
       });
       storageA.setIdentity(TEST_IDENTITY);
       (storageA as any).dbStatus = "attached";
-      await storageA.set('mnemonic', 'shared secret');
+      await storageA.set('wallet_exists', 'shared marker');
 
       // Provider B
       const cacheB = createMockCacheStorage();
@@ -279,8 +285,8 @@ describe('Profile Integration', () => {
       (storageB as any).dbStatus = "attached";
 
       // B should see A's data via OrbitDB fallback
-      const value = await storageB.get('mnemonic');
-      expect(value).toBe('shared secret');
+      const value = await storageB.get('wallet_exists');
+      expect(value).toBe('shared marker');
     });
   });
 
@@ -369,9 +375,16 @@ describe('Profile Integration', () => {
       expect(result.tokensMigrated).toBe(2);
       expect(result.keysMigrated).toBeGreaterThan(0);
 
-      // Verify profile has identity keys
-      expect(profileStore.has('identity.mnemonic')).toBe(true);
-      expect(profileStore.get('identity.mnemonic')).toBe('abandon abandon abandon');
+      // Verify identity keys live in the Profile localCache under
+      // their LEGACY name (not the `identity.*` Profile key). The
+      // migration writes them as cache-only — they must not appear
+      // under `identity.*` because OrbitDB replicates that namespace.
+      // This mock profileStorage doesn't distinguish localCache vs
+      // OrbitDB, so we just verify the legacy key is present and the
+      // identity.* key is NOT.
+      expect(profileStore.has('identity.mnemonic')).toBe(false);
+      expect(profileStore.has('mnemonic')).toBe(true);
+      expect(profileStore.get('mnemonic')).toBe('abandon abandon abandon');
     });
 
     it('post-migration cleanup removes legacy data', async () => {

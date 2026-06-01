@@ -430,8 +430,15 @@ describe('Audit #333 C2 — migration cleanup-before-flush', () => {
         expect(key).toMatch(/^migration\./);
       }
 
-      // Profile side has the token data + identity keys.
-      expect(profileStorage._store.has('identity.mnemonic')).toBe(true);
+      // Profile side has the token data + identity keys. Post the
+      // IDENTITY_KEYS ⊂ CACHE_ONLY_KEYS fix, identity material is
+      // written via its LEGACY key name (`mnemonic`), not the
+      // `identity.mnemonic` profile key — so the OrbitDB-replicated
+      // namespace stays clean. The mock profileStorage doesn't model
+      // localCache vs OrbitDB separately, so we just check the legacy
+      // key landed and the `identity.*` profile key did NOT.
+      expect(profileStorage._store.has('identity.mnemonic')).toBe(false);
+      expect(profileStorage._store.has('mnemonic')).toBe(true);
       expect(profileTokenStorage._savedData).toEqual(SAMPLE_TXF);
     });
 

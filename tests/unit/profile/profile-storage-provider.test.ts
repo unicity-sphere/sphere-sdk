@@ -184,9 +184,16 @@ describe('ProfileStorageProvider', () => {
   // =========================================================================
 
   describe('key translation', () => {
-    it("global key 'mnemonic' maps to 'identity.mnemonic'", async () => {
+    it("global key 'mnemonic' maps to 'identity.mnemonic' (translation lookup only — write is cache-only)", async () => {
+      // PROFILE_KEY_MAPPING still maps `mnemonic` → `identity.mnemonic`,
+      // but `mnemonic` is now in CACHE_ONLY_KEYS (identity / seed
+      // material) — the set() write does NOT reach OrbitDB. Verify the
+      // mapping via the cache instead.
       await provider.set('mnemonic', 'test-mnemonic');
-      expect(db._store.has('identity.mnemonic')).toBe(true);
+      expect(db._store.has('identity.mnemonic')).toBe(false);
+      // Cache holds it under the legacy key (same key that
+      // ProfileStorageProvider.get() will look up).
+      expect(cache._store.get('mnemonic')).toBe('test-mnemonic');
     });
 
     it("global key 'wallet_exists' maps to 'wallet_exists'", async () => {
@@ -303,18 +310,22 @@ describe('ProfileStorageProvider', () => {
       expect(result).toBe('secret');
     });
 
-    it('get falls back to OrbitDB on cache miss', async () => {
-      // Write encrypted value directly to OrbitDB (bypassing provider)
+    it('get falls back to OrbitDB on cache miss (non-identity keys only)', async () => {
+      // Use a non-identity key. Identity keys are cache-only post the
+      // IDENTITY_KEYS ⊂ CACHE_ONLY_KEYS fix; get() short-circuits to
+      // null on cache miss for them. `address_nametags` flows through
+      // the legacy translate-encrypt-write path so cache-fallback to
+      // OrbitDB is still exercised here.
       const encKey = deriveProfileEncryptionKey(hexToBytes(TEST_PRIVATE_KEY));
       const encrypted = await encryptString(encKey, 'from-orbit');
-      db._store.set('identity.mnemonic', encrypted);
+      db._store.set('addresses.nametags', encrypted);
 
       // Cache is empty, so get should fall back to OrbitDB
-      const result = await provider.get('mnemonic');
+      const result = await provider.get('address_nametags');
       expect(result).toBe('from-orbit');
 
       // Also should have populated cache
-      expect(cache._store.get('mnemonic')).toBe('from-orbit');
+      expect(cache._store.get('address_nametags')).toBe('from-orbit');
     });
 
     it('get returns null when neither cache nor OrbitDB has the key', async () => {
@@ -473,11 +484,14 @@ describe('ProfileStorageProvider', () => {
       // Verify cache received the identity
       expect(cacheSpy).toHaveBeenCalledWith(TEST_IDENTITY);
 
-      // Verify encryption key was derived (set a value and check it is encrypted in OrbitDB)
+      // Verify encryption key was derived. Use a NON-identity key
+      // (`address_nametags` → `addresses.nametags`) — `mnemonic` is
+      // cache-only post IDENTITY_KEYS-cache-only fix and would not
+      // reach the encrypt path.
       (newProvider as any).dbStatus = 'attached';
       (newProvider as any).status = 'connected';
-      await newProvider.set('mnemonic', 'test');
-      const stored = db._store.get('identity.mnemonic');
+      await newProvider.set('address_nametags', 'test');
+      const stored = db._store.get('addresses.nametags');
       expect(stored).toBeDefined();
       // The stored value should be encrypted (not raw UTF-8)
       const rawText = new TextDecoder().decode(stored!);
@@ -1011,9 +1025,12 @@ describe('ProfileStorageProvider', () => {
       (provider as unknown as { dbStatus: string }).dbStatus = 'attached';
       (provider as unknown as { status: string }).status = 'connected';
 
-      await provider.set('mnemonic', 'test-mnemonic');
+      // `wallet_exists` is a non-identity, non-cache-only global key —
+      // suitable for exercising the OrbitDB envelope write path.
+      // (`mnemonic` is now cache-only and would not reach OrbitDB.)
+      await provider.set('wallet_exists', 'true');
 
-      const setWrite = entryWrites.find((w) => w.key === 'identity.mnemonic');
+      const setWrite = entryWrites.find((w) => w.key === 'wallet_exists');
       expect(setWrite).toBeDefined();
       expect(setWrite!.type).toBe('cache_index');
       expect(setWrite!.originated).toBe('system');
@@ -1028,8 +1045,8 @@ describe('ProfileStorageProvider', () => {
       (provider as unknown as { dbStatus: string }).dbStatus = 'attached';
       (provider as unknown as { status: string }).status = 'connected';
 
-      await provider.setEntry('mnemonic', 'val', 'token_send');
-      const write = entryWrites.find((w) => w.key === 'identity.mnemonic');
+      await provider.setEntry('wallet_exists', 'val', 'token_send');
+      const write = entryWrites.find((w) => w.key === 'wallet_exists');
       expect(write!.type).toBe('token_send');
       expect(write!.originated).toBe('user');
     });
@@ -1062,10 +1079,10 @@ describe('ProfileStorageProvider', () => {
       (provider as unknown as { dbStatus: string }).dbStatus = 'attached';
       (provider as unknown as { status: string }).status = 'connected';
 
-      await provider.set('mnemonic', 'test-value');
+      await provider.set('wallet_exists', 'test-value');
       // Clear local cache so read hits OrbitDB.
       cache._store.clear();
-      const read = await provider.get('mnemonic');
+      const read = await provider.get('wallet_exists');
       expect(read).toBe('test-value');
     });
 
@@ -1078,8 +1095,8 @@ describe('ProfileStorageProvider', () => {
       (provider as unknown as { dbStatus: string }).dbStatus = 'attached';
       (provider as unknown as { status: string }).status = 'connected';
 
-      await provider.set('mnemonic', 'val');
-      const bytes = store.get('identity.mnemonic');
+      await provider.set('wallet_exists', 'val');
+      const bytes = store.get('wallet_exists');
       expect(bytes).toBeDefined();
 
       const { decodeEntry, OPLOG_ENTRY_SCHEMA_VERSION } = await import('../../../profile/oplog-entry');
@@ -1100,12 +1117,12 @@ describe('ProfileStorageProvider', () => {
       (provider as unknown as { dbStatus: string }).dbStatus = 'attached';
       (provider as unknown as { status: string }).status = 'connected';
 
-      await provider.set('mnemonic', 'legacy-value');
+      await provider.set('wallet_exists', 'legacy-value');
       // The raw store contains encrypted bytes (not envelope CBOR).
       expect(db._store.size).toBeGreaterThan(0);
       // Read round-trips via the legacy path.
       cache._store.clear();
-      const read = await provider.get('mnemonic');
+      const read = await provider.get('wallet_exists');
       expect(read).toBe('legacy-value');
     });
 
@@ -1128,7 +1145,7 @@ describe('ProfileStorageProvider', () => {
       (provider as unknown as { dbStatus: string }).dbStatus = 'attached';
       (provider as unknown as { status: string }).status = 'connected';
 
-      await expect(provider.set('mnemonic', 'val')).rejects.toMatchObject({
+      await expect(provider.set('wallet_exists', 'val')).rejects.toMatchObject({
         code: 'PROFILE_NOT_INITIALIZED',
       });
     });
@@ -1143,7 +1160,7 @@ describe('ProfileStorageProvider', () => {
       (provider as unknown as { dbStatus: string }).dbStatus = 'attached';
       (provider as unknown as { status: string }).status = 'connected';
 
-      await expect(provider.set('mnemonic', 'val')).rejects.toMatchObject({
+      await expect(provider.set('wallet_exists', 'val')).rejects.toMatchObject({
         code: 'PROFILE_NOT_INITIALIZED',
       });
     });
@@ -1170,7 +1187,9 @@ describe('ProfileStorageProvider', () => {
     });
 
     it('does NOT warn for small payloads (<8 KiB)', async () => {
-      await provider.set('mnemonic', 'a small value');
+      // Drive the OrbitDB encrypt path via a non-identity key.
+      // (`mnemonic` is cache-only and never hits the size-guarded path.)
+      await provider.set('wallet_exists', 'a small value');
       // Any unrelated warnings from setup are fine; assert none mention PAYLOAD-SIZE.
       const payloadWarnings = warnSpy.mock.calls.filter(
         (args: unknown[]) => typeof args[1] === 'string' && (args[1] as string).includes('[PAYLOAD-SIZE]'),
@@ -1181,7 +1200,7 @@ describe('ProfileStorageProvider', () => {
     it('warns when encrypted payload exceeds 8 KiB soft threshold', async () => {
       // Plaintext ~10 KiB (encrypted will be ~10 KiB + ~28 B AES-GCM overhead).
       const fatValue = 'x'.repeat(10 * 1024);
-      await provider.set('mnemonic', fatValue);
+      await provider.set('wallet_exists', fatValue);
 
       const payloadWarnings = warnSpy.mock.calls.filter(
         (args: unknown[]) => typeof args[1] === 'string' && (args[1] as string).includes('[PAYLOAD-SIZE]'),
@@ -1193,21 +1212,21 @@ describe('ProfileStorageProvider', () => {
       const fatValue = 'y'.repeat(10 * 1024);
       // `token_send` is a canonical user-action type from originated-tag.ts —
       // using it here ensures the test documents a realistic call shape.
-      await provider.setEntry('mnemonic', fatValue, 'token_send');
+      await provider.setEntry('wallet_exists', fatValue, 'token_send');
 
       const payloadWarnings = warnSpy.mock.calls.filter(
         (args: unknown[]) => typeof args[1] === 'string' && (args[1] as string).includes('[PAYLOAD-SIZE]'),
       );
       expect(payloadWarnings.length).toBeGreaterThanOrEqual(1);
       const warnMsg = payloadWarnings[0]![1] as string;
-      expect(warnMsg).toContain('key=identity.mnemonic');
+      expect(warnMsg).toContain('key=wallet_exists');
       expect(warnMsg).toContain('type=token_send');
       expect(warnMsg).toMatch(/size=\d+/);
     });
 
     it('warning does NOT contain payload content (privacy — size is already a fingerprint)', async () => {
       const sensitive = 'SECRET_MARKER_' + 'z'.repeat(10 * 1024);
-      await provider.set('mnemonic', sensitive);
+      await provider.set('wallet_exists', sensitive);
 
       const payloadWarnings = warnSpy.mock.calls.filter(
         (args: unknown[]) => typeof args[1] === 'string' && (args[1] as string).includes('[PAYLOAD-SIZE]'),
@@ -1220,9 +1239,9 @@ describe('ProfileStorageProvider', () => {
 
     it('write still succeeds despite warning (non-fatal)', async () => {
       const fatValue = 'q'.repeat(10 * 1024);
-      await expect(provider.set('mnemonic', fatValue)).resolves.toBeUndefined();
+      await expect(provider.set('wallet_exists', fatValue)).resolves.toBeUndefined();
       // Round-trip: we can still read it back.
-      const roundTrip = await provider.get('mnemonic');
+      const roundTrip = await provider.get('wallet_exists');
       expect(roundTrip).toBe(fatValue);
     });
 
@@ -1231,8 +1250,8 @@ describe('ProfileStorageProvider', () => {
       // see that a write site is CHRONICALLY oversized, not just the first
       // occurrence.
       const fatValue = 'p'.repeat(10 * 1024);
-      await provider.set('mnemonic', fatValue);
-      await provider.set('mnemonic', fatValue + '-v2');
+      await provider.set('wallet_exists', fatValue);
+      await provider.set('wallet_exists', fatValue + '-v2');
 
       const payloadWarnings = warnSpy.mock.calls.filter(
         (args: unknown[]) => typeof args[1] === 'string' && (args[1] as string).includes('[PAYLOAD-SIZE]'),
@@ -1263,20 +1282,20 @@ describe('ProfileStorageProvider', () => {
     });
 
     it('warning does NOT redact static keys with short suffixes', async () => {
-      // `identity.mnemonic` has no dynamic suffix to redact; the key should
+      // `wallet_exists` has no dynamic suffix to redact; the key should
       // appear as-is so operators can see exactly which static site is
       // oversized.
       const fatValue = 's'.repeat(10 * 1024);
-      await provider.set('mnemonic', fatValue);
+      await provider.set('wallet_exists', fatValue);
 
       const payloadWarnings = warnSpy.mock.calls.filter(
         (args: unknown[]) => typeof args[1] === 'string' && (args[1] as string).includes('[PAYLOAD-SIZE]'),
       );
       expect(payloadWarnings.length).toBeGreaterThanOrEqual(1);
       const warnMsg = payloadWarnings[0]![1] as string;
-      expect(warnMsg).toContain('key=identity.mnemonic');
+      expect(warnMsg).toContain('key=wallet_exists');
       // No redaction marker for static keys.
-      expect(warnMsg).not.toContain('identity.mnem…');
+      expect(warnMsg).not.toContain('wallet_exi…');
     });
   });
 
@@ -1361,16 +1380,16 @@ describe('ProfileStorageProvider', () => {
       const { provider, db } = await buildEnvelopeProvider();
       // Step 1 — write a legitimate envelope at the key so the bookkeeping
       // is consistent with a real write path.
-      await provider.set('mnemonic', 'original plaintext');
+      await provider.set('wallet_exists', 'original plaintext');
       // Step 2 — corrupt the stored bytes to force the envelope decoder
       // to throw `invalid minor (30) for major 3` — the production
       // signature from the issue-280 production logs.
-      db._store.set('identity.mnemonic', invalidCborBytes());
+      db._store.set('wallet_exists', invalidCborBytes());
       // Step 3 — `getEncryptedRaw` exercises `readEnvelopePayload`. With
       // the Issue #280 fix the call returns the raw bytes (base64-
       // encoded) instead of propagating the decode error up to the
       // lean-snapshot builder where it would be silently skipped.
-      const encryptedRaw = await provider.getEncryptedRaw('mnemonic');
+      const encryptedRaw = await provider.getEncryptedRaw('wallet_exists');
       expect(encryptedRaw).not.toBeNull();
       const decodedBytes = Buffer.from(encryptedRaw!, 'base64');
       // The raw bytes returned match the corrupted bytes verbatim —
@@ -1381,26 +1400,26 @@ describe('ProfileStorageProvider', () => {
 
     it('envelope-fallback notifier fires with the key + error message', async () => {
       const { provider, db } = await buildEnvelopeProvider();
-      await provider.set('mnemonic', 'value');
-      db._store.set('identity.mnemonic', invalidCborBytes());
+      await provider.set('wallet_exists', 'value');
+      db._store.set('wallet_exists', invalidCborBytes());
 
       const fired: Array<{ key: string; errorMessage: string }> = [];
       provider.setEnvelopeFallbackNotifier((info) => {
         fired.push({ key: info.key, errorMessage: info.errorMessage });
       });
 
-      await provider.getEncryptedRaw('mnemonic');
+      await provider.getEncryptedRaw('wallet_exists');
 
       expect(fired.length).toBe(1);
-      expect(fired[0].key).toBe('identity.mnemonic');
+      expect(fired[0].key).toBe('wallet_exists');
       expect(fired[0].errorMessage).toContain('invalid minor');
       expect(fired[0].errorMessage).toContain('major 3');
     });
 
     it('notifier is dedup-ed: same (key, error) fires only once', async () => {
       const { provider, db } = await buildEnvelopeProvider();
-      await provider.set('mnemonic', 'v');
-      db._store.set('identity.mnemonic', invalidCborBytes());
+      await provider.set('wallet_exists', 'v');
+      db._store.set('wallet_exists', invalidCborBytes());
 
       let count = 0;
       provider.setEnvelopeFallbackNotifier(() => {
@@ -1408,18 +1427,18 @@ describe('ProfileStorageProvider', () => {
       });
 
       // Read 4 times — same key, same error, same dedup signature.
-      await provider.getEncryptedRaw('mnemonic');
-      await provider.getEncryptedRaw('mnemonic');
-      await provider.getEncryptedRaw('mnemonic');
-      await provider.getEncryptedRaw('mnemonic');
+      await provider.getEncryptedRaw('wallet_exists');
+      await provider.getEncryptedRaw('wallet_exists');
+      await provider.getEncryptedRaw('wallet_exists');
+      await provider.getEncryptedRaw('wallet_exists');
 
       expect(count).toBe(1);
     });
 
     it('notifier exception does NOT break the read path (best-effort signal)', async () => {
       const { provider, db } = await buildEnvelopeProvider();
-      await provider.set('mnemonic', 'v');
-      db._store.set('identity.mnemonic', invalidCborBytes());
+      await provider.set('wallet_exists', 'v');
+      db._store.set('wallet_exists', invalidCborBytes());
 
       provider.setEnvelopeFallbackNotifier(() => {
         throw new Error('notifier exploded');
@@ -1428,7 +1447,7 @@ describe('ProfileStorageProvider', () => {
       // Despite the notifier throwing, the read still returns the raw
       // bytes — the corruption visibility hook MUST NOT regress the
       // primary data path.
-      const encryptedRaw = await provider.getEncryptedRaw('mnemonic');
+      const encryptedRaw = await provider.getEncryptedRaw('wallet_exists');
       expect(encryptedRaw).not.toBeNull();
     });
 
@@ -1443,8 +1462,8 @@ describe('ProfileStorageProvider', () => {
       // operator triage is already required and the cap (1024) is well
       // above any legitimate single-instance corruption surface).
       const { provider, db } = await buildEnvelopeProvider();
-      await provider.set('mnemonic', 'v');
-      db._store.set('identity.mnemonic', invalidCborBytes());
+      await provider.set('wallet_exists', 'v');
+      db._store.set('wallet_exists', invalidCborBytes());
 
       // Pre-populate the dedup set to the cap via direct private-state
       // access. This is the only practical way to exercise the cap
@@ -1467,14 +1486,14 @@ describe('ProfileStorageProvider', () => {
         fired += 1;
       });
 
-      // Read multiple times — the (identity.mnemonic, invalid-minor-30)
+      // Read multiple times — the (wallet_exists, invalid-minor-30)
       // pair has NOT been added to the set (it's not in the pre-populated
       // filler entries), so pre-fix this would fire on every read. Post-
       // fix, at-cap early-return means the notifier fires ZERO times.
-      await provider.getEncryptedRaw('mnemonic');
-      await provider.getEncryptedRaw('mnemonic');
-      await provider.getEncryptedRaw('mnemonic');
-      await provider.getEncryptedRaw('mnemonic');
+      await provider.getEncryptedRaw('wallet_exists');
+      await provider.getEncryptedRaw('wallet_exists');
+      await provider.getEncryptedRaw('wallet_exists');
+      await provider.getEncryptedRaw('wallet_exists');
 
       expect(fired).toBe(0);
     });
@@ -1488,10 +1507,10 @@ describe('ProfileStorageProvider', () => {
       // error message text. Verify the dedupKey shape by inspecting
       // the populated set.
       const { provider, db } = await buildEnvelopeProvider();
-      await provider.set('mnemonic', 'v');
-      db._store.set('identity.mnemonic', invalidCborBytes());
+      await provider.set('wallet_exists', 'v');
+      db._store.set('wallet_exists', invalidCborBytes());
 
-      await provider.getEncryptedRaw('mnemonic');
+      await provider.getEncryptedRaw('wallet_exists');
 
       const seen = (provider as unknown as {
         envelopeFallbackSeen: Set<string>;
@@ -1501,12 +1520,12 @@ describe('ProfileStorageProvider', () => {
       // The dedup key includes the separator; key bytes precede it,
       // error text follows.
       expect(onlyKey).toContain('\x1f');
-      expect(onlyKey.startsWith('identity.mnemonic\x1f')).toBe(true);
+      expect(onlyKey.startsWith('wallet_exists\x1f')).toBe(true);
     });
 
     it('clean envelope round-trip does NOT fire the notifier', async () => {
       const { provider } = await buildEnvelopeProvider();
-      await provider.set('mnemonic', 'v');
+      await provider.set('wallet_exists', 'v');
       // No corruption — read should succeed via the envelope path.
 
       let fired = 0;
@@ -1514,8 +1533,8 @@ describe('ProfileStorageProvider', () => {
         fired += 1;
       });
 
-      await provider.get('mnemonic');
-      await provider.getEncryptedRaw('mnemonic');
+      await provider.get('wallet_exists');
+      await provider.getEncryptedRaw('wallet_exists');
       expect(fired).toBe(0);
     });
 
