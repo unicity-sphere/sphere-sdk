@@ -183,7 +183,14 @@ function installConcurrencyMock(
         }
         await new Promise((r) => setTimeout(r, delayMs));
         if (tracker.failNthBlock !== null && myIdx === tracker.failNthBlock) {
-          return new Response('forced failure', { status: 500 });
+          // Issue #369 — HTTP 400 is classified as a PERMANENT failure
+          // by `isTransientPinError`, so `withPinRetry` short-circuits
+          // the retry budget and surfaces the error immediately. This
+          // preserves the original test intent of these abort-propagation
+          // scenarios (single failure → abort the whole CAR pin) under
+          // the new retry-with-backoff wrap; transient codes (5xx, 429,
+          // network errors) would now be retried instead.
+          return new Response('forced failure', { status: 400 });
         }
         return new Response(JSON.stringify({ Cid: { '/': 'ignored' } }), {
           status: 200,
@@ -356,7 +363,7 @@ describe('pinCarBlocksToIpfs — bounded-concurrency worker pool', () => {
         undefined,
         4,
       ),
-    ).rejects.toThrow(/ORBITDB_WRITE_FAILED|dag\/put failed|HTTP 500/);
+    ).rejects.toThrow(/ORBITDB_WRITE_FAILED|dag\/put failed|HTTP 400/);
   });
 
   it('order-independent: pins arrive in any order, every index processed exactly once', async () => {
@@ -415,7 +422,7 @@ describe('pinCarBlocksToIpfs — bounded-concurrency worker pool', () => {
           undefined,
           4,
         ),
-      ).rejects.toThrow(/ORBITDB_WRITE_FAILED|HTTP 500/);
+      ).rejects.toThrow(/ORBITDB_WRITE_FAILED|HTTP 400/);
       // Give the peer workers enough time to finish their in-flight
       // pin POSTs and any post-throw microtask processing.
       await new Promise((r) => setTimeout(r, 150));
