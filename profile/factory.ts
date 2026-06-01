@@ -370,10 +370,12 @@ export interface ProfileSnapshotApplyDeps {
 export function runProfileSnapshotApply(
   snapshot: LeanProfileSnapshot,
   deps: ProfileSnapshotApplyDeps,
+  sourcePointerCid?: string,
 ): Promise<ApplySnapshotResult> {
   return runProfileSnapshotJoin(snapshot, {
     writersFor: deps.writersFor,
     bundleIndex: deps.getBundleIndex(),
+    sourcePointerCid,
     log: deps.log,
   });
 }
@@ -704,6 +706,7 @@ export function createProfileProviders(
   // instances (the adapter is a thin handle over `db` + key).
   const dispatchParsedSnapshot = (
     snapshot: LeanProfileSnapshot,
+    sourcePointerCid?: string,
   ): Promise<ApplySnapshotResult> =>
     runProfileSnapshotApply(snapshot, {
       writersFor: (addressId) => {
@@ -792,9 +795,11 @@ export function createProfileProviders(
         return writers;
       },
       getBundleIndex: () => tokenStorage.getBundleIndex(),
-    });
+    }, sourcePointerCid);
 
-  storage.setSnapshotApplier((snapshot) => dispatchParsedSnapshot(snapshot));
+  storage.setSnapshotApplier((snapshot, sourcePointerCid) =>
+    dispatchParsedSnapshot(snapshot, sourcePointerCid),
+  );
 
   // Item #15 Phase E follow-up — install the pull-side dispatcher for
   // the periodic-poll / cold-start recovery paths. Symmetric to
@@ -848,7 +853,7 @@ export function createProfileProviders(
           fetchFromIpfs(ipfsGateways, subBlockCid, undefined, undefined, helia),
       ),
     );
-    const result = await time('applySnapshotCb.dispatchMs', () => dispatchParsedSnapshot(snapshot));
+    const result = await time('applySnapshotCb.dispatchMs', () => dispatchParsedSnapshot(snapshot, cidString));
     observeMs('applySnapshotCb.totalMs', performance.now() - __cbStart);
     return result;
   });

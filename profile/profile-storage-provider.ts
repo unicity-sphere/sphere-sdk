@@ -506,8 +506,10 @@ export class ProfileStorageProvider implements StorageProvider {
    * In practice the factory sets it once at construction.
    */
   private snapshotApplier:
-    | ((snapshot: import('./profile-lean-snapshot').LeanProfileSnapshot)
-        => Promise<import('./profile-snapshot-dispatcher').ApplySnapshotResult>)
+    | ((
+        snapshot: import('./profile-lean-snapshot').LeanProfileSnapshot,
+        sourcePointerCid?: string,
+      ) => Promise<import('./profile-snapshot-dispatcher').ApplySnapshotResult>)
     | null = null;
 
   /**
@@ -553,8 +555,10 @@ export class ProfileStorageProvider implements StorageProvider {
    */
   setSnapshotApplier(
     applier:
-      | ((snapshot: import('./profile-lean-snapshot').LeanProfileSnapshot)
-          => Promise<import('./profile-snapshot-dispatcher').ApplySnapshotResult>)
+      | ((
+          snapshot: import('./profile-lean-snapshot').LeanProfileSnapshot,
+          sourcePointerCid?: string,
+        ) => Promise<import('./profile-snapshot-dispatcher').ApplySnapshotResult>)
       | null,
   ): void {
     this.snapshotApplier = applier;
