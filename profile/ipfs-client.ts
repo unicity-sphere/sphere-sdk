@@ -427,6 +427,80 @@ const SIDECAR_SUBMIT_TIMEOUT_MS = 5_000;
 const SIDECAR_READ_TIMEOUT_MS = 500;
 
 /**
+ * Per-gateway adaptive cold-cache state. The sidecar correctly GCs
+ * blobs after they're promoted to Kubo (see ipfs-storage's
+ * `instant_pin_cache._reconcile_once`), so for any wallet load that
+ * walks an *old* Profile bundle the steady-state outcome is 404 on
+ * every block. With N blocks in a Profile snapshot that produces N
+ * console-visible failed fetches (Chrome auto-logs every non-2xx
+ * `fetch()` even when the JS swallows the result), drowning real
+ * signal.
+ *
+ * Strategy: track consecutive misses per gateway. After
+ * {@link SIDECAR_COLD_MISS_THRESHOLD} misses in a row, mark the
+ * gateway "sidecar cold" for {@link SIDECAR_COLD_DURATION_MS}.
+ * During the cold window both {@link tryReadFromSidecar} and
+ * {@link submitToSidecarBestEffort} short-circuit before issuing the
+ * HTTP request — eliminating the console noise while preserving the
+ * cross-device fast path: a single hit (or a successful submit,
+ * which usually means a sibling device just published) resets the
+ * counter, and after the cooldown a single re-probe re-arms the
+ * fast path automatically.
+ *
+ * 3 / 60 s is intentionally conservative — we want to keep probing
+ * during cross-device bursts (where hits are likely), and only cool
+ * off when the gateway looks genuinely empty for this wallet's
+ * working set.
+ */
+const SIDECAR_COLD_MISS_THRESHOLD = 3;
+const SIDECAR_COLD_DURATION_MS = 60_000;
+
+interface SidecarColdState {
+  consecutiveMisses: number;
+  coldUntil: number; // epoch ms; 0 means not cold
+}
+
+const sidecarColdState = new Map<string, SidecarColdState>();
+
+function getSidecarColdState(gateway: string): SidecarColdState {
+  const key = normalizeGatewayKey(gateway);
+  let state = sidecarColdState.get(key);
+  if (!state) {
+    state = { consecutiveMisses: 0, coldUntil: 0 };
+    sidecarColdState.set(key, state);
+  }
+  return state;
+}
+
+function isSidecarCold(gateway: string): boolean {
+  const state = sidecarColdState.get(normalizeGatewayKey(gateway));
+  if (!state) return false;
+  return state.coldUntil > Date.now();
+}
+
+function recordSidecarMiss(gateway: string): void {
+  const state = getSidecarColdState(gateway);
+  state.consecutiveMisses += 1;
+  if (state.consecutiveMisses >= SIDECAR_COLD_MISS_THRESHOLD) {
+    state.coldUntil = Date.now() + SIDECAR_COLD_DURATION_MS;
+  }
+}
+
+function recordSidecarHit(gateway: string): void {
+  const state = getSidecarColdState(gateway);
+  state.consecutiveMisses = 0;
+  state.coldUntil = 0;
+}
+
+/**
+ * Test-only helper to reset the cold-cache between tests. Production
+ * code does not call this — the state self-heals via the cooldown.
+ */
+export function _resetSidecarColdState(): void {
+  sidecarColdState.clear();
+}
+
+/**
  * Fire-and-forget POST the raw bytes that hash to `cid` to the
  * gateway's instant-pin sidecar (`/sidecar/submit?cid=<cid>`). Lets
  * cross-device readers fetch `cid` immediately after pin, before
@@ -457,6 +531,12 @@ function submitToSidecarBestEffort(
   if (typeof cid !== 'string' || cid.length === 0) return;
   if (!(bytes instanceof Uint8Array) || bytes.length === 0) return;
   if (bytes.length > SIDECAR_SUBMIT_MAX_BYTES) return;
+  // Cold-cache short-circuit: if this gateway has consistently failed
+  // recent sidecar interactions, skip the POST entirely. The primary
+  // pin path is the source of truth; this skip only loses the
+  // cross-device fast-path acceleration for the cooldown window. See
+  // SIDECAR_COLD_* doc for the rationale.
+  if (isSidecarCold(gateway)) return;
   const url =
     `${gateway.replace(/\/$/, '')}/sidecar/submit?cid=${encodeURIComponent(cid)}`;
   // Detached fire-and-forget. The .catch swallows any rejection so
@@ -475,12 +555,18 @@ function submitToSidecarBestEffort(
       // into how often sphere-sdk publishes actually populate the
       // cache vs how often they get 503-back-pressured or 4xx-rejected.
       if (!response.ok) {
+        // 404 = sidecar not deployed on this gateway → count as miss.
+        // 503 = cache_full back-pressure → not a "cold" signal, the
+        //       sidecar is alive and rejecting under load. Don't count.
+        // 413 = oversize → also not "cold"; don't count.
+        if (response.status === 404) recordSidecarMiss(gateway);
         logger.debug(
           'IPFS-Sidecar',
           `submit ${cid.slice(0, 16)} → HTTP ${response.status} ` +
           `(${response.statusText}) on ${gateway}`,
         );
       } else {
+        recordSidecarHit(gateway);
         logger.debug(
           'IPFS-Sidecar',
           `submit ${cid.slice(0, 16)} → 200 on ${gateway}`,
@@ -493,7 +579,9 @@ function submitToSidecarBestEffort(
     .catch(() => {
       // Network error, timeout, gateway-without-sidecar (404 → ok=false
       // above), or AbortError. All silently dropped — the primary pin
-      // already succeeded; this is pure optimization.
+      // already succeeded; this is pure optimization. Network/timeout
+      // counts as a miss for cooldown purposes.
+      recordSidecarMiss(gateway);
     });
 }
 
@@ -527,6 +615,12 @@ async function tryReadFromSidecar(
 ): Promise<Uint8Array | null> {
   if (typeof gateway !== 'string' || gateway.length === 0) return null;
   if (typeof cid !== 'string' || cid.length === 0) return null;
+  // Cold-cache short-circuit: skip the probe if this gateway has 404'd
+  // SIDECAR_COLD_MISS_THRESHOLD times in a row. The normal multi-gateway
+  // `/api/v0/block/get` path is unaffected — this only skips the
+  // cross-device fast-path optimization during the cooldown window.
+  // See SIDECAR_COLD_* doc above for the noise rationale.
+  if (isSidecarCold(gateway)) return null;
   try {
     const url =
       `${gateway.replace(/\/$/, '')}/sidecar/blob?cid=${encodeURIComponent(cid)}`;
@@ -539,6 +633,7 @@ async function tryReadFromSidecar(
       // 404 (cache miss / sidecar disabled) is the common case; drain
       // and return null so caller falls through to the normal fetch.
       response.body?.cancel?.().catch(() => { /* ignore */ });
+      recordSidecarMiss(gateway);
       return null;
     }
     // Sniff content-type — a gateway that doesn't run the sidecar
@@ -551,10 +646,17 @@ async function tryReadFromSidecar(
       !ct.startsWith('application/vnd.ipld')
     ) {
       response.body?.cancel?.().catch(() => { /* ignore */ });
+      // Wrong content-type = same operational signal as a miss
+      // (gateway returning HTML/JSON catch-all means no sidecar).
+      recordSidecarMiss(gateway);
       return null;
     }
     const buf = await response.arrayBuffer();
-    if (buf.byteLength === 0) return null;
+    if (buf.byteLength === 0) {
+      recordSidecarMiss(gateway);
+      return null;
+    }
+    recordSidecarHit(gateway);
     logger.debug(
       'IPFS-Sidecar',
       `read hit ${cid.slice(0, 16)} (${buf.byteLength} bytes) on ${gateway}`,
@@ -563,6 +665,7 @@ async function tryReadFromSidecar(
   } catch {
     // Timeout, network error, abort — all treated as a miss. The
     // caller's normal-path fetch is the source of truth.
+    recordSidecarMiss(gateway);
     return null;
   }
 }
