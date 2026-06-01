@@ -75,6 +75,7 @@ import {
   LOCAL_EPOCH_RESET_REASON_KEY,
 } from '../profile/pointer-wiring';
 import { EPOCH_RESET_REASON_MAX_BYTES } from '../profile/profile-lean-snapshot';
+import { beginGlobalClear, endGlobalClear } from '../profile/global-clear-gate';
 import type {
   ShutdownOptions,
   StorageProvider,
@@ -1730,82 +1731,105 @@ export class Sphere {
     const fallbackTokenStorage =
       'get' in storageOrOptions ? undefined : storageOrOptions.fallbackTokenStorage;
 
-    // 1. Destroy Sphere instance — flushes pending IPFS writes (saves good
-    //    state), then closes all connections. Awaited so IPFS completes
-    //    before we delete databases.
-    if (Sphere.instance) {
-      logger.debug('Sphere', 'Destroying Sphere instance...');
-      await Sphere.instance.destroy();
-      logger.debug('Sphere', 'Sphere instance destroyed');
-    }
-
-    // 2. Clear L1 vesting cache
-    logger.debug('Sphere', 'Clearing L1 vesting cache...');
-    await vestingClassifier.destroy();
-
-    // 3. Yield to let IndexedDB finalize pending transactions after close().
-    //    db.close() is synchronous but the connection isn't fully released
-    //    until all in-flight transactions complete.
-    logger.debug('Sphere', 'Yielding 50ms for IDB transaction settlement...');
-    await new Promise((r) => setTimeout(r, 50));
-
-    // 4. Delete token databases (sphere-token-storage-*)
-    if (tokenStorage?.clear) {
-      logger.debug('Sphere', 'Clearing token storage...');
-      try {
-        await tokenStorage.clear();
-        logger.debug('Sphere', 'Token storage cleared');
-      } catch (err) {
-        logger.warn('Sphere', 'Token storage clear failed:', err);
-      }
-    } else {
-      logger.debug('Sphere', 'No token storage provider to clear');
-    }
-
-    // 4b. Issue #330 — also wipe the read-only fallback token storage
-    // (legacy IndexedDB from before Profile migration). Without this,
-    // a user who calls `clear()` to start over with the same mnemonic
-    // would see pre-clear tokens resurrected via the fallback wiring.
-    // This violates the "clear means clear" invariant and is a real
-    // data-integrity hazard, not just UX confusion.
+    // Issue #368 — bracket the destructive body with the process-wide
+    // global-clear gate. While the bracket is held, every
+    // `ProfileTokenStorageProvider._applySnapshotIfWiredImpl` call in
+    // this process early-returns and bumps
+    // `profile.applySnapshot.suppressedDuringGlobalClear`. Closes the
+    // multi-wallet gap left by the per-instance `isClearing` latch:
+    // sibling wallets' periodic pointer-polls must not seed snapshot
+    // state mid-batch while another wallet's `clear()` is in flight.
     //
-    // Idempotent and best-effort: a missing `clear` method (older
-    // legacy providers) or an exception is logged but does not block
-    // the rest of the cleanup. The fallback was never written to by
-    // this SDK; the bytes here are pre-migration legacy data.
-    if (fallbackTokenStorage?.clear) {
-      logger.debug('Sphere', 'Clearing fallback (legacy) token storage...');
-      try {
-        if (
-          typeof fallbackTokenStorage.isConnected === 'function' &&
-          !fallbackTokenStorage.isConnected() &&
-          typeof fallbackTokenStorage.connect === 'function'
-        ) {
-          await fallbackTokenStorage.connect();
-        }
-        await fallbackTokenStorage.clear();
-        logger.debug('Sphere', 'Fallback token storage cleared');
-      } catch (err) {
-        logger.warn('Sphere', 'Fallback token storage clear failed:', err);
+    // The bracket nests safely (reference-counted), so an orchestrator
+    // wrapping its own sequence of `Sphere.clear()` calls in a higher-
+    // level bracket sees both layers compose. `endGlobalClear()` is
+    // no-op-safe at depth 0, so a stray double-end is harmless.
+    beginGlobalClear();
+    try {
+      // 1. Destroy Sphere instance — flushes pending IPFS writes (saves good
+      //    state), then closes all connections. Awaited so IPFS completes
+      //    before we delete databases.
+      if (Sphere.instance) {
+        logger.debug('Sphere', 'Destroying Sphere instance...');
+        await Sphere.instance.destroy();
+        logger.debug('Sphere', 'Sphere instance destroyed');
       }
-    }
 
-    // 5. Delete KV database (sphere-storage)
-    logger.debug('Sphere', 'Clearing KV storage...');
-    if (!storage.isConnected()) {
-      try {
-        await storage.connect();
-      } catch {
-        // May fail if database was already deleted — that's fine
+      // 2. Clear L1 vesting cache
+      logger.debug('Sphere', 'Clearing L1 vesting cache...');
+      await vestingClassifier.destroy();
+
+      // 3. Yield to let IndexedDB finalize pending transactions after close().
+      //    db.close() is synchronous but the connection isn't fully released
+      //    until all in-flight transactions complete.
+      logger.debug('Sphere', 'Yielding 50ms for IDB transaction settlement...');
+      await new Promise((r) => setTimeout(r, 50));
+
+      // 4. Delete token databases (sphere-token-storage-*)
+      if (tokenStorage?.clear) {
+        logger.debug('Sphere', 'Clearing token storage...');
+        try {
+          await tokenStorage.clear();
+          logger.debug('Sphere', 'Token storage cleared');
+        } catch (err) {
+          logger.warn('Sphere', 'Token storage clear failed:', err);
+        }
+      } else {
+        logger.debug('Sphere', 'No token storage provider to clear');
       }
+
+      // 4b. Issue #330 — also wipe the read-only fallback token storage
+      // (legacy IndexedDB from before Profile migration). Without this,
+      // a user who calls `clear()` to start over with the same mnemonic
+      // would see pre-clear tokens resurrected via the fallback wiring.
+      // This violates the "clear means clear" invariant and is a real
+      // data-integrity hazard, not just UX confusion.
+      //
+      // Idempotent and best-effort: a missing `clear` method (older
+      // legacy providers) or an exception is logged but does not block
+      // the rest of the cleanup. The fallback was never written to by
+      // this SDK; the bytes here are pre-migration legacy data.
+      if (fallbackTokenStorage?.clear) {
+        logger.debug('Sphere', 'Clearing fallback (legacy) token storage...');
+        try {
+          if (
+            typeof fallbackTokenStorage.isConnected === 'function' &&
+            !fallbackTokenStorage.isConnected() &&
+            typeof fallbackTokenStorage.connect === 'function'
+          ) {
+            await fallbackTokenStorage.connect();
+          }
+          await fallbackTokenStorage.clear();
+          logger.debug('Sphere', 'Fallback token storage cleared');
+        } catch (err) {
+          logger.warn('Sphere', 'Fallback token storage clear failed:', err);
+        }
+      }
+
+      // 5. Delete KV database (sphere-storage)
+      logger.debug('Sphere', 'Clearing KV storage...');
+      if (!storage.isConnected()) {
+        try {
+          await storage.connect();
+        } catch {
+          // May fail if database was already deleted — that's fine
+        }
+      }
+      if (storage.isConnected()) {
+        await storage.clear();
+        logger.debug('Sphere', 'KV storage cleared');
+      } else {
+        logger.debug('Sphere', 'KV storage not connected, skipping');
+      }
+      logger.debug('Sphere', 'Done');
+    } finally {
+      // Issue #368 — release the global-clear bracket. Reached even on
+      // a destructive failure inside the try body so a partial clear
+      // never leaves the gate stuck closed (which would silently
+      // disable applySnapshot dispatch for the rest of the process
+      // lifetime).
+      endGlobalClear();
     }
-    if (storage.isConnected()) {
-      await storage.clear();
-      logger.debug('Sphere', 'KV storage cleared');
-    } else {
-      logger.debug('Sphere', 'KV storage not connected, skipping');
-    }
-    logger.debug('Sphere', 'Done');
   }
 
   /**

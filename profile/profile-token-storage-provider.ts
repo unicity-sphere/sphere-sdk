@@ -45,6 +45,7 @@
 import { logger } from '../core/logger.js';
 import { SphereError } from '../core/errors.js';
 import { incr, time, observeMs } from '../core/perf-counters.js';
+import { isGlobalClearActive } from './global-clear-gate.js';
 import { STORAGE_KEYS_GLOBAL } from '../constants.js';
 import type { ProviderStatus, FullIdentity } from '../types/index.js';
 import type {
@@ -146,6 +147,12 @@ export class ProfileTokenStorageProvider
    * clear-on-a-live-provider path, hence the separate latch.
    */
   private isClearing = false;
+
+  // Issue #368 — the process-wide global-clear gate lives in a
+  // dedicated leaf module (`profile/global-clear-gate.ts`) so
+  // `core/Sphere.ts` can bracket multi-wallet clears without taking a
+  // hard import on `ProfileTokenStorageProvider`. The gate is consulted
+  // inside `_applySnapshotIfWiredImpl` below.
 
   // --- Write-behind buffer ---
   private pendingData: TxfStorageDataBase | null = null;
@@ -864,6 +871,17 @@ export class ProfileTokenStorageProvider
   ): Promise<import('./profile-snapshot-dispatcher.js').ApplySnapshotResult | null> {
     if (this.isClearing) {
       incr('profile.applySnapshot.suppressedDuringClear');
+      return null;
+    }
+    // Issue #368 — process-wide gate. Suppresses applySnapshot across
+    // EVERY provider in this process while ANY `Sphere.clear()` (or
+    // batch orchestrator) holds the global-clear bracket. Closes the
+    // multi-wallet gap left by the per-instance `isClearing` latch:
+    // wallets B/C/D's periodic pointer-polls must not seed snapshot
+    // state mid-batch while wallet A's clear() is in flight, because
+    // B/C/D are about to be cleared next.
+    if (isGlobalClearActive()) {
+      incr('profile.applySnapshot.suppressedDuringGlobalClear');
       return null;
     }
     if (this.isShuttingDown || this.hasShutdown) return null;
