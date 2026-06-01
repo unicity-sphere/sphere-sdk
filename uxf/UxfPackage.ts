@@ -30,6 +30,7 @@ import type {
   TokenRootChildren,
   GenesisChildren,
 } from './types.js';
+import { incr, observeMs } from '../core/perf-counters.js';
 import { STRATEGY_LATEST } from './types.js';
 import { UxfError } from './errors.js';
 import { computeElementHash } from './hash.js';
@@ -348,6 +349,15 @@ export class UxfPackage {
       proofHash?: string;
     }) => Promise<boolean>,
   ): Promise<Set<string>> {
+    // GH #363 measurement. Issue #360 Finding #2 claimed this is
+    // O(B²·P) sequential and dominates load latency; verify on real
+    // data before any future optimisation. Counters split:
+    //   .calls       — invocations
+    //   .verifyCalls — verifier RPCs actually made
+    //   .verifyOk    — verifier returned true
+    //   .totalMs     — outer wall-clock per call
+    incr('uxf.computeVerifiedProofs.calls');
+    const __perfStart = performance.now();
     const verified = new Set<string>();
     const ELEMENT_TYPE_INCLUSION_PROOF = 'inclusion-proof' as const;
     // Pool from both packages — same proof element may appear in
@@ -367,16 +377,24 @@ export class UxfPackage {
         continue;
       }
       try {
+        incr('uxf.computeVerifiedProofs.verifyCalls');
+        const __vStart = performance.now();
         const ok = await verifier({
           proofJson,
           transactionHash: txHashImprintHex,
           proofHash: hash,
         });
-        if (ok) verified.add(hash);
+        observeMs('uxf.computeVerifiedProofs.verifyMs', performance.now() - __vStart);
+        if (ok) {
+          incr('uxf.computeVerifiedProofs.verifyOk');
+          verified.add(hash);
+        }
       } catch {
         /* verifier failure → not verified, conservative */
+        incr('uxf.computeVerifiedProofs.verifyThrew');
       }
     }
+    observeMs('uxf.computeVerifiedProofs.totalMs', performance.now() - __perfStart);
     return verified;
   }
 
@@ -544,6 +562,8 @@ export function ingest(
   token: unknown,
   opts?: { updatedAt?: number },
 ): void {
+  incr('uxf.ingest.calls');
+  const __iStart = performance.now();
   const pool = wrapPool(pkg);
   const rootHash = deconstructToken(pool, token);
   syncPool(pkg, pool);
@@ -565,6 +585,7 @@ export function ingest(
 
   // Update secondary indexes
   updateIndexesForToken(pkg, tokenId, rootHash);
+  observeMs('uxf.ingest.totalMs', performance.now() - __iStart);
 }
 
 /**
@@ -593,10 +614,15 @@ export function ingestAll(
   opts?: { updatedAt?: number },
 ): void {
   if (tokens.length === 0) return;
+  incr('uxf.ingestAll.calls');
+  incr('uxf.ingestAll.tokens', tokens.length);
+  const __iaStart = performance.now();
   const pool = wrapPool(pkg);
   const newTokens: Array<{ tokenId: string; rootHash: ContentHash }> = [];
   for (const token of tokens) {
+    const __dStart = performance.now();
     const rootHash = deconstructToken(pool, token);
+    observeMs('uxf.ingestAll.perTokenDeconstructMs', performance.now() - __dStart);
     const rootElement = pool.get(rootHash)!;
     const rootContent = rootElement.content as unknown as TokenRootContent;
     newTokens.push({ tokenId: rootContent.tokenId, rootHash });
@@ -685,11 +711,13 @@ export function ingestAll(
     } catch {
       /* best-effort — pool integrity already compromised, throw the original error */
     }
+    observeMs('uxf.ingestAll.totalMs', performance.now() - __iaStart);
     throw err;
   }
   // Stamp envelope updatedAt; caller can lock for determinism.
   (pkg.envelope as { updatedAt: number }).updatedAt =
     opts?.updatedAt ?? Math.floor(Date.now() / 1000);
+  observeMs('uxf.ingestAll.totalMs', performance.now() - __iaStart);
 }
 
 /**
@@ -700,8 +728,13 @@ export function assemble(
   tokenId: string,
   strategy: InstanceSelectionStrategy = STRATEGY_LATEST,
 ): unknown {
-  const pool = wrapPool(pkg);
-  return assembleToken(pool, pkg.manifest, tokenId, pkg.instanceChains, strategy);
+  incr('uxf.assemble.calls');
+  const __aStart = performance.now();
+  try {
+    return assembleToken(wrapPool(pkg), pkg.manifest, tokenId, pkg.instanceChains, strategy);
+  } finally {
+    observeMs('uxf.assemble.totalMs', performance.now() - __aStart);
+  }
 }
 
 /**

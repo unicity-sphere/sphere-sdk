@@ -351,6 +351,26 @@ export interface UxfBundleRef {
   readonly removeFromProfileAfter?: number;
   /** Number of tokens in this bundle (for quick display without fetching CAR) */
   readonly tokenCount?: number;
+  /**
+   * Issue #367 — pointer CID of the lean-snapshot blob that placed this
+   * bundle ref into the local OrbitDB store via a snapshot-apply dispatch.
+   *
+   * Set ONLY when the writer that landed the ref was the snapshot
+   * dispatcher's `writeRemote` path inside `BundleIndex.joinSnapshot`.
+   * Unset (undefined) on:
+   *   - locally-published bundles written via `BundleIndex.addBundle`;
+   *   - bundles arriving via OrbitDB cross-device pubsub replication
+   *     (which doesn't flow through the snapshot dispatcher);
+   *   - legacy bundle refs persisted before this field existed.
+   *
+   * Read by `load()`'s Rule-4 pairwise gate: when every active bundle's
+   * `sourcedFromSnapshotPointerCid` is non-null AND identical, the load
+   * is sourced from a single trusted snapshot blob and Rule-4 enrichment
+   * can be skipped (the snapshot producer's local merge already resolved
+   * any siblings before publication). Any non-snapshot bundle in the
+   * active set forces Rule-4 to run.
+   */
+  readonly sourcedFromSnapshotPointerCid?: string;
 }
 
 // =============================================================================

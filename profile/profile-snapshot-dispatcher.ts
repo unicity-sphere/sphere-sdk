@@ -44,6 +44,7 @@
  */
 
 import { logger } from '../core/logger';
+import { incr, observeMs } from '../core/perf-counters.js';
 import type { LeanProfileSnapshot } from './profile-lean-snapshot';
 import type {
   JoinResult,
@@ -97,10 +98,41 @@ export interface ProfileSnapshotJoinDeps {
    * the token storage layer is not ready (e.g., shutdown in progress).
    * BundleIndex implements `ProfileSyncWriter` directly and owns the
    * `tokens.bundle.*` namespace.
+   *
+   * Issue #367 — when the concrete type also exposes
+   * {@link BundleIndexSnapshotContextSetter.setCurrentSnapshotApplyCid},
+   * the dispatcher arms it with {@link sourcePointerCid} before calling
+   * `joinSnapshot()` so each landed bundle ref can be annotated with the
+   * source snapshot's pointer CID for downstream Rule-4 provenance gating.
    */
   readonly bundleIndex: ProfileSyncWriter | null;
+  /**
+   * Issue #367 — IPFS pointer CID of the lean-snapshot blob currently
+   * being applied. Propagates into each landed bundle ref via
+   * `BundleIndex.joinSnapshot`'s `writeRemote` callback so a subsequent
+   * `load()` can identify pure-snapshot bundle sets and skip Rule-4
+   * pairwise verification (no cross-device sibling collisions possible
+   * when every bundle came through a single trusted snapshot blob).
+   *
+   * Empty string indicates "context not propagated" — preserves the
+   * pre-#367 behaviour where bundle refs land without provenance and
+   * the gate degrades safely (Rule-4 runs).
+   */
+  readonly sourcePointerCid?: string;
   /** Optional debug logger; falls back to the SDK logger. */
   readonly log?: (msg: string) => void;
+}
+
+/**
+ * Issue #367 — structural type the dispatcher duck-types against to
+ * arm the snapshot-source context on `BundleIndex` before its
+ * `joinSnapshot` runs. The setter is OPTIONAL on the dispatcher-facing
+ * interface so legacy bundle-index doubles (test stubs) and other
+ * future writers can satisfy `ProfileSyncWriter` without implementing
+ * the snapshot-annotation contract.
+ */
+interface BundleIndexSnapshotContextSetter {
+  setCurrentSnapshotApplyCid(cid: string | null): void;
 }
 
 /**
@@ -311,6 +343,9 @@ export async function runProfileSnapshotJoin(
 ): Promise<ApplySnapshotResult> {
   const log = deps.log ?? ((msg: string): void => logger.debug('SnapshotDispatcher', msg));
 
+  const __sjStart = performance.now();
+  incr('profile.snapshotJoin.calls');
+
   // 1. Decode base64 once. Reuse the resulting bytes for every writer's
   //    prefix-filtered view via `Array.prototype.filter` — no copies.
   //
@@ -325,10 +360,13 @@ export async function runProfileSnapshotJoin(
   //    array and the writer is never called — Phase 2's wiring is
   //    correct, the entries simply never reach it. See
   //    `normalizeEntryKey` doc-comment for the full rationale.
+  const __decodeStart = performance.now();
   const entries: SnapshotEntry[] = snapshot.entries.map((e) => ({
     key: normalizeEntryKey(e.key),
     encryptedValue: base64ToBytes(e.value),
   }));
+  observeMs('profile.snapshotJoin.decodeMs', performance.now() - __decodeStart);
+  incr('profile.snapshotJoin.decodedEntries', entries.length);
 
   // 2. Extract unique addressIds.
   const addressIds = new Set<string>();
@@ -361,6 +399,8 @@ export async function runProfileSnapshotJoin(
       // `remoteRejectedMalformed` counter signal-only.
       const slice = entries.filter((e) => e.key.startsWith(keyPrefix));
       if (slice.length === 0) continue;
+      incr('profile.snapshotJoin.perWriterDispatchCalls');
+      const __wStart = performance.now();
       try {
         const result = await writer.joinSnapshot(slice);
         accumulate(aggregated, result);
@@ -373,6 +413,8 @@ export async function runProfileSnapshotJoin(
           `runProfileSnapshotJoin: writer @ ${keyPrefix} threw — skipping ` +
             `(error: ${err instanceof Error ? err.message : String(err)})`,
         );
+      } finally {
+        observeMs('profile.snapshotJoin.perWriterDispatchMs', performance.now() - __wStart);
       }
     }
   }
@@ -382,6 +424,29 @@ export async function runProfileSnapshotJoin(
     const bundleSlice = entries.filter((e) => e.key.startsWith(BUNDLE_KEY_PREFIX));
     bundleEntriesSeen = bundleSlice.length;
     if (bundleSlice.length > 0) {
+      // Item #3 attribution counters (PR #365).
+      incr('profile.snapshotJoin.bundleIndexJoinCalls');
+      const __bStart = performance.now();
+      // Issue #367 — arm the snapshot-source context if the concrete
+      // bundle-index implementation exposes the setter (production
+      // `BundleIndex` does; test stubs typically don't). Clearing in
+      // `finally` keeps the field at `null` between applies so a stale
+      // CID can never leak into a later non-snapshot path.
+      const setter = (
+        deps.bundleIndex as ProfileSyncWriter & Partial<BundleIndexSnapshotContextSetter>
+      ).setCurrentSnapshotApplyCid;
+      const armed = typeof setter === 'function';
+      const cidForContext = deps.sourcePointerCid ?? '';
+      if (armed && cidForContext.length > 0) {
+        try {
+          setter.call(deps.bundleIndex, cidForContext);
+        } catch (err) {
+          log(
+            `runProfileSnapshotJoin: setCurrentSnapshotApplyCid threw — proceeding without provenance annotation ` +
+              `(error: ${err instanceof Error ? err.message : String(err)})`,
+          );
+        }
+      }
       try {
         const result = await deps.bundleIndex.joinSnapshot(bundleSlice);
         accumulate(aggregated, result);
@@ -390,6 +455,15 @@ export async function runProfileSnapshotJoin(
           `runProfileSnapshotJoin: bundleIndex.joinSnapshot threw — skipping ` +
             `(error: ${err instanceof Error ? err.message : String(err)})`,
         );
+      } finally {
+        observeMs('profile.snapshotJoin.bundleIndexJoinMs', performance.now() - __bStart);
+        if (armed) {
+          try {
+            setter.call(deps.bundleIndex, null);
+          } catch {
+            /* swallow — setter must not break the JOIN result reporting */
+          }
+        }
       }
     }
   } else {
@@ -397,6 +471,8 @@ export async function runProfileSnapshotJoin(
       'runProfileSnapshotJoin: bundleIndex not available — bundle JOIN skipped',
     );
   }
+
+  observeMs('profile.snapshotJoin.totalMs', performance.now() - __sjStart);
 
   const joinedAny = aggregated.liveLanded > 0 || aggregated.tombstonesLanded > 0;
   return {

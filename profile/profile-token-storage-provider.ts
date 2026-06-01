@@ -44,6 +44,8 @@
 
 import { logger } from '../core/logger.js';
 import { SphereError } from '../core/errors.js';
+import { incr, time, observeMs } from '../core/perf-counters.js';
+import { isGlobalClearActive } from './global-clear-gate.js';
 import { STORAGE_KEYS_GLOBAL } from '../constants.js';
 import type { ProviderStatus, FullIdentity } from '../types/index.js';
 import type {
@@ -135,6 +137,22 @@ export class ProfileTokenStorageProvider
   private encryptionKey: Uint8Array | null = null;
   private initialized = false;
   private isShuttingDown = false;
+  /**
+   * Issue #364 Item #2 — true between {@link clear} entry and exit.
+   * `clear()` is destructive; allowing the periodic pointer-poll's
+   * `applySnapshotIfWired` to run mid-clear would dispatch a snapshot
+   * against state that is about to be wiped, wasting IPFS round-trips
+   * and risking partial seeding of about-to-be-deleted data. The
+   * shutdown gate (`isShuttingDown`/`hasShutdown`) does not cover the
+   * clear-on-a-live-provider path, hence the separate latch.
+   */
+  private isClearing = false;
+
+  // Issue #368 — the process-wide global-clear gate lives in a
+  // dedicated leaf module (`profile/global-clear-gate.ts`) so
+  // `core/Sphere.ts` can bracket multi-wallet clears without taking a
+  // hard import on `ProfileTokenStorageProvider`. The gate is consulted
+  // inside `_applySnapshotIfWiredImpl` below.
 
   // --- Write-behind buffer ---
   private pendingData: TxfStorageDataBase | null = null;
@@ -846,12 +864,33 @@ export class ProfileTokenStorageProvider
   async applySnapshotIfWired(
     cidString: string,
   ): Promise<import('./profile-snapshot-dispatcher.js').ApplySnapshotResult | null> {
+    return time('profile.applySnapshot', () => this._applySnapshotIfWiredImpl(cidString));
+  }
+  private async _applySnapshotIfWiredImpl(
+    cidString: string,
+  ): Promise<import('./profile-snapshot-dispatcher.js').ApplySnapshotResult | null> {
+    if (this.isClearing) {
+      incr('profile.applySnapshot.suppressedDuringClear');
+      return null;
+    }
+    // Issue #368 — process-wide gate. Suppresses applySnapshot across
+    // EVERY provider in this process while ANY `Sphere.clear()` (or
+    // batch orchestrator) holds the global-clear bracket. Closes the
+    // multi-wallet gap left by the per-instance `isClearing` latch:
+    // wallets B/C/D's periodic pointer-polls must not seed snapshot
+    // state mid-batch while wallet A's clear() is in flight, because
+    // B/C/D are about to be cleared next.
+    if (isGlobalClearActive()) {
+      incr('profile.applySnapshot.suppressedDuringGlobalClear');
+      return null;
+    }
     if (this.isShuttingDown || this.hasShutdown) return null;
     // Late-bound setter wins; falls back to construction-time option
     // for callers that prefer the static-config style.
     const callback =
       this.applySnapshotCallback ?? this.options?.onApplySnapshot ?? null;
     if (typeof callback !== 'function') return null;
+    incr('profile.applySnapshot.fired');
     return callback(cidString);
   }
 
@@ -1290,6 +1329,10 @@ export class ProfileTokenStorageProvider
   // ---------------------------------------------------------------------------
 
   async load(_identifier?: string): Promise<LoadResult<TxfStorageDataBase>> {
+    incr('profile.load.calls');
+    return time('profile.load.totalMs', () => this._loadImpl(_identifier));
+  }
+  private async _loadImpl(_identifier?: string): Promise<LoadResult<TxfStorageDataBase>> {
     const timestamp = Date.now();
 
     if (!this.initialized || !this.encryptionKey) {
@@ -1442,8 +1485,12 @@ export class ProfileTokenStorageProvider
       // we can pre-compute verifiedProofs across the full set before
       // running the resolver. Per-bundle fetch failures are non-fatal
       // (partial load is better than failure).
-      const loadedBundles: Array<{ cid: string; pkg: UxfPackageInstance }> = [];
-      for (const [cid] of activeBundles) {
+      const loadedBundles: Array<{
+        cid: string;
+        pkg: UxfPackageInstance;
+        sourcedFromSnapshotPointerCid: string | null;
+      }> = [];
+      for (const [cid, ref] of activeBundles) {
         try {
           // Issue #200 Phase 2: bundle CIDs are now dag-cbor envelope
           // CIDs (per-block pinned), not raw-CIDs over the CAR bytes.
@@ -1468,7 +1515,11 @@ export class ProfileTokenStorageProvider
             this.db.getHelia?.(),
           );
           const pkg = await UxfPackage.fromCar(carBytes);
-          loadedBundles.push({ cid, pkg });
+          loadedBundles.push({
+            cid,
+            pkg,
+            sourcedFromSnapshotPointerCid: ref.sourcedFromSnapshotPointerCid ?? null,
+          });
         } catch (err) {
           this.log(`Failed to load bundle ${cid}: ${err instanceof Error ? err.message : String(err)}`);
         }
@@ -1508,7 +1559,52 @@ export class ProfileTokenStorageProvider
       // candidate roots; a single-bundle load has none.
       let verifiedProofs: ReadonlySet<string> | undefined = undefined;
       const verifyInclusionProof = this.options?.oracle?.verifyInclusionProof;
-      if (verifyInclusionProof && loadedBundles.length >= 2) {
+      // GH #363 prototype — env-gated bypass for the Rule-4 pairwise
+      // UXF-level verification loop. When set, load() skips the
+      // O(N²) pairwise computeVerifiedProofs pass; structural JOIN
+      // still runs and Rule 3 (longest-valid prefix) still applies;
+      // only Rule 4 enrichment is skipped. Mirrors the verifier-failure
+      // catch path below — that fallback is the existing graceful
+      // degradation, this flag just opts into it unconditionally so
+      // we can A/B measure the wall-clock delta.
+      const skipRule4Env =
+        typeof process !== 'undefined' && process?.env?.SPHERE_SKIP_RULE4 === '1';
+      if (skipRule4Env) incr('profile.load.rule4Skipped');
+
+      // GH #367 — per-bundle provenance gate. Skip Rule-4 pairwise
+      // verification when every active bundle was placed into the
+      // local OrbitDB store by the snapshot dispatcher's `writeRemote`
+      // path and they ALL trace to the same source snapshot. In that
+      // case the snapshot producer's local merge already resolved any
+      // siblings before publishing — the receiver's pairwise loop is
+      // redundant.
+      //
+      // The gate fails-safe: any bundle without provenance (locally-
+      // published, replication-arrived, or legacy pre-#367), or a
+      // mix of source snapshots, leaves Rule-4 enabled. Single-bundle
+      // loads are handled by the `>= 2` guard below — Rule-4 doesn't
+      // fire on single bundles anyway.
+      let skipRule4Snapshot = false;
+      if (loadedBundles.length >= 2) {
+        const firstCid = loadedBundles[0].sourcedFromSnapshotPointerCid;
+        if (firstCid !== null) {
+          skipRule4Snapshot = loadedBundles.every(
+            (b) => b.sourcedFromSnapshotPointerCid === firstCid,
+          );
+        }
+      }
+      if (skipRule4Snapshot) {
+        incr('profile.load.rule4SkippedSnapshot');
+        this.log(
+          `JOIN: Rule-4 pairwise skipped — all ${loadedBundles.length} bundles ` +
+            `sourced from snapshot ${loadedBundles[0].sourcedFromSnapshotPointerCid?.slice(0, 12)}…`,
+        );
+      }
+
+      const skipRule4 = skipRule4Env || skipRule4Snapshot;
+      if (verifyInclusionProof && loadedBundles.length >= 2 && !skipRule4) {
+        incr('profile.load.rule4PairwiseInvocations');
+        const __r4Start = performance.now();
         try {
           // Pairwise accumulation via the existing helper. `computeVerifiedProofs`
           // walks BOTH packages' pools dedup-by-content-hash, so for N
@@ -1531,12 +1627,15 @@ export class ProfileTokenStorageProvider
               for (const h of pairwise) accum.add(h);
             }
           }
+          observeMs('profile.load.rule4PairwiseMs', performance.now() - __r4Start);
           verifiedProofs = accum;
           this.log(
             `JOIN: computed verifiedProofs across ${loadedBundles.length} bundles ` +
               `(${accum.size} proof element(s) verified)`,
           );
         } catch (err) {
+          observeMs('profile.load.rule4PairwiseMs', performance.now() - __r4Start);
+          incr('profile.load.rule4PairwiseThrew');
           // Verifier failure must not abort the load — fall back to the
           // conservative (no-enrichment) resolution. The structural JOIN
           // still runs and Rule 3 (longest-valid prefix) still applies;
@@ -1825,6 +1924,11 @@ export class ProfileTokenStorageProvider
   async clear(): Promise<boolean> {
     if (!this.initialized) return false;
 
+    // Issue #364 Item #2 — gate concurrent applySnapshotIfWired calls
+    // for the duration of clear(). A periodic pointer-poll that fires
+    // during destructive teardown would dispatch a snapshot against
+    // about-to-be-wiped state, racing the deletes below.
+    this.isClearing = true;
     try {
       // Remove all bundle refs from OrbitDB
       const allBundles = await this.db.all(BUNDLE_KEY_PREFIX);
@@ -1861,6 +1965,8 @@ export class ProfileTokenStorageProvider
     } catch (err) {
       this.log(`clear() failed: ${err instanceof Error ? err.message : String(err)}`);
       return false;
+    } finally {
+      this.isClearing = false;
     }
   }
 

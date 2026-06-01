@@ -55,6 +55,7 @@
  */
 
 import { logger } from '../core/logger';
+import { incr, observeMs } from '../core/perf-counters.js';
 
 /** Minimal structural shape of the Helia v6+ pins API. */
 export interface HeliaPinsLike {
@@ -237,25 +238,34 @@ export function installHeliaBlockstorePinShim(
       source: AsyncIterable<{ cid: unknown; block: unknown }>,
       options?: unknown,
     ): AsyncIterable<unknown> {
+      incr('helia.blockstore.putMany.calls');
+      const __pmStart = performance.now();
       const upstream = originalPutMany(source, options);
       // Return an async generator that pins each yielded CID before
       // forwarding it. Pin is fire-and-forget per CID so a slow pin
       // doesn't stall the iterator chain.
       return (async function* pinningPutManyGen() {
-        for await (const yieldedCid of upstream) {
-          pinAttempted++;
-          // Pin in the background; the put is already complete by
-          // the time the iterator yielded the CID.
-          schedulePin(yieldedCid, pins, Promise.resolve())
-            .then((outcome) => {
-              if (outcome === 'pinned') pinSucceeded++;
-              else if (outcome === 'skipped') pinSkipped++;
-              else pinFailed++;
-            })
-            .catch(() => {
-              pinFailed++;
-            });
-          yield yieldedCid;
+        let itemCount = 0;
+        try {
+          for await (const yieldedCid of upstream) {
+            itemCount++;
+            pinAttempted++;
+            // Pin in the background; the put is already complete by
+            // the time the iterator yielded the CID.
+            schedulePin(yieldedCid, pins, Promise.resolve())
+              .then((outcome) => {
+                if (outcome === 'pinned') pinSucceeded++;
+                else if (outcome === 'skipped') pinSkipped++;
+                else pinFailed++;
+              })
+              .catch(() => {
+                pinFailed++;
+              });
+            yield yieldedCid;
+          }
+        } finally {
+          incr('helia.blockstore.putMany.items', itemCount);
+          observeMs('helia.blockstore.putMany.totalMs', performance.now() - __pmStart);
         }
       })();
     };
@@ -308,9 +318,12 @@ export function installHeliaBlockstorePinShim(
     // DevTools). The Set is the authoritative in-session tracker
     // populated below on success.
     if (pinnedCids.has(cidStr)) {
+      incr('helia.pins.add.cached');
       return 'pinned';
     }
 
+    incr('helia.pins.add.calls');
+    const __pStart = performance.now();
     try {
       const result = pinsApi.add(cid);
       // Helia v6 returns AsyncIterable<CID>; older / test stubs may
@@ -338,6 +351,7 @@ export function installHeliaBlockstorePinShim(
       // throwaway array — so the push did nothing. The actual
       // persistence is `pinnedCids.add(cidStr)` below.
       pinnedCids.add(cidStr);
+      observeMs('helia.pins.add.successMs', performance.now() - __pStart);
       return 'pinned';
     } catch (err) {
       // "Already pinned" is NOT a failure — Helia rejects re-adds with
@@ -351,6 +365,8 @@ export function installHeliaBlockstorePinShim(
       const msg = err instanceof Error ? err.message : String(err);
       if (/already pinned/i.test(msg)) {
         pinnedCids.add(cidStr);
+        incr('helia.pins.add.alreadyPinned');
+        observeMs('helia.pins.add.alreadyPinnedMs', performance.now() - __pStart);
         return 'pinned';
       }
       // Best-effort: log at warn level and move on. The single most
@@ -361,6 +377,8 @@ export function installHeliaBlockstorePinShim(
         'ProfilePinShim',
         `helia.pins.add failed for ${cidStr.slice(0, 16)}…: ${msg}`,
       );
+      incr('helia.pins.add.failed');
+      observeMs('helia.pins.add.failedMs', performance.now() - __pStart);
       return 'failed';
     }
   }

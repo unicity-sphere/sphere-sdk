@@ -32,6 +32,7 @@ import {
   encryptProfileValue,
   decryptProfileValue,
 } from '../encryption.js';
+import { incr, observeMs } from '../../core/perf-counters.js';
 import { buildLocalEntry, decodeEntry } from '../oplog-entry.js';
 import {
   runJoinSnapshot,
@@ -56,7 +57,41 @@ export const CONSOLIDATION_WARNING_THRESHOLD = 3;
 const CORRUPT_CIDS_PREVIEW_CAP = 100;
 
 export class BundleIndex implements ProfileSyncWriter {
+  /**
+   * Issue #367 — set by {@link runProfileSnapshotJoin} BEFORE invoking
+   * this writer's `joinSnapshot()` and cleared in `finally` after.
+   * Read inside `joinSnapshot`'s `writeRemote` callback to annotate
+   * each landed bundle ref with its source snapshot's pointer CID.
+   *
+   * Null outside of an active snapshot apply — covers production code
+   * paths (where the dispatcher always arms it for non-empty bundle
+   * slices) AND legacy code paths / test doubles (where the dispatcher
+   * may not arm it at all). The `writeRemote` callback treats null as
+   * "no provenance available" and writes the bundle ref bytes verbatim,
+   * matching the pre-#367 behaviour.
+   */
+  private currentSnapshotApplyCid: string | null = null;
+
   constructor(private readonly host: ProfileTokenStorageHost) {}
+
+  /**
+   * Issue #367 — arm/clear the source-snapshot context consulted by
+   * `joinSnapshot`'s `writeRemote` callback. Invoked by the snapshot
+   * dispatcher around its BundleIndex JOIN call. Never throws.
+   *
+   * The setter is idempotent and does NOT enforce ownership — callers
+   * are responsible for clearing after their JOIN completes (the
+   * dispatcher's `finally` block satisfies this). A leaked non-null
+   * value into a later apply with a stale CID is the worst-case
+   * downside; the Rule-4 gate would then group bundles under the
+   * wrong source — but Rule-4 is an enrichment skip, not a correctness
+   * gate, so the cost is at most a missed optimisation, never lost
+   * tokens. The serialized `_applySnapshotIfWiredImpl` call site
+   * prevents this in practice.
+   */
+  setCurrentSnapshotApplyCid(cid: string | null): void {
+    this.currentSnapshotApplyCid = cid;
+  }
 
   /**
    * List all bundle refs from OrbitDB, filtered to active status.
@@ -85,7 +120,12 @@ export class BundleIndex implements ProfileSyncWriter {
    * adapter's legacy-wrapping).
    */
   async listBundles(): Promise<Map<string, UxfBundleRef>> {
+    // GH #363 measurement: how often is this called per second, and
+    // how much wall-clock does the underlying `db.all` walk cost?
+    // Issue #360 Finding #3 claimed 5× per flush — confirm or refute.
+    const t0 = performance.now();
     const rawEntries = await this.host.db.all(BUNDLE_KEY_PREFIX);
+    observeMs('bundleIndex.listBundles.dbAllMs', performance.now() - t0);
     const result = new Map<string, UxfBundleRef>();
 
     // Steelman⁴⁰ warning: aggregate corrupt-bundle events into a single
@@ -130,6 +170,7 @@ export class BundleIndex implements ProfileSyncWriter {
       }
     }
 
+    incr('bundleIndex.listBundles.entries', result.size);
     if (corruptCids.length > 0) {
       const ev = this.host.buildErrorEvent('storage:error', firstCorruptError, 'CID_REF_CORRUPT');
       const truncated = corruptCids.length > CORRUPT_CIDS_PREVIEW_CAP;
@@ -308,16 +349,56 @@ export class BundleIndex implements ProfileSyncWriter {
         // Falling back to raw `db.put` when `putEntry` is unavailable
         // matches `addBundle()`'s pattern — the adapter's read-time
         // legacy wrap (v=0 synthetic envelope) handles those bytes.
+        //
+        // Issue #367 — annotate the landed bundle ref with the source
+        // snapshot's pointer CID so a subsequent `load()` can identify
+        // pure-snapshot bundle sets and skip Rule-4 pairwise verification.
+        // The annotation is best-effort: any failure (decrypt, JSON
+        // parse, re-encrypt) falls back to the verbatim write — the JOIN
+        // still lands and the Rule-4 gate degrades safely (Rule-4 runs).
+        let bytesToWrite = bytes;
+        const sourceCid = this.currentSnapshotApplyCid;
+        const encryptionKey = this.host.getEncryptionKey();
+        if (sourceCid !== null && sourceCid.length > 0 && encryptionKey !== null) {
+          try {
+            let encryptedPayload: Uint8Array = bytes;
+            try {
+              const envelope = decodeEntry(bytes);
+              if (envelope.v === 1) {
+                encryptedPayload = envelope.payload;
+              }
+            } catch {
+              /* legacy raw-bytes — encryptedPayload is `bytes` already */
+            }
+            const decrypted = await decryptProfileValue(encryptionKey, encryptedPayload);
+            const parsed = JSON.parse(new TextDecoder().decode(decrypted)) as unknown;
+            if (isUxfBundleRef(parsed)) {
+              const annotated: UxfBundleRef = {
+                ...parsed,
+                sourcedFromSnapshotPointerCid: sourceCid,
+              };
+              const reSerialized = new TextEncoder().encode(JSON.stringify(annotated));
+              bytesToWrite = await encryptProfileValue(encryptionKey, reSerialized);
+            }
+          } catch (err) {
+            this.host.log(
+              `BundleIndex.joinSnapshot: provenance annotation failed for ${key}; persisting verbatim ` +
+                `(${err instanceof Error ? err.message : String(err)})`,
+            );
+            bytesToWrite = bytes;
+          }
+        }
+
         const db = this.host.db;
         if (typeof db.putEntry === 'function') {
           const envelope = buildLocalEntry({
             type: 'cache_index',
             originated: 'system',
-            payload: bytes,
+            payload: bytesToWrite,
           });
           await db.putEntry(key, envelope);
         } else {
-          await db.put(key, bytes);
+          await db.put(key, bytesToWrite);
           const markHook = (db as { markLocallyAuthored?: (k: string) => void }).markLocallyAuthored;
           if (typeof markHook === 'function') {
             markHook.call(db, key);

@@ -180,9 +180,19 @@ export interface PointerWiringInput {
    * `snapshot_applier_missing` skip reason — the wallet then runs
    * without aggregator-pointer recovery rather than silently writing
    * the wrong CAR shape to the bundle index.
+   *
+   * Issue #367 — accepts an optional `sourcePointerCid` carrying the
+   * IPFS CID of the snapshot blob being applied. The dispatcher uses
+   * it to annotate each landed bundle ref with its source snapshot so
+   * a subsequent `load()` can skip Rule-4 pairwise verification when
+   * every active bundle traces to the same single trusted snapshot.
+   * Pre-#367 callers may omit the parameter — the dispatcher then
+   * treats the apply as "context-unknown" (no annotation) and the
+   * Rule-4 gate degrades safely (Rule-4 runs).
    */
   readonly applySnapshot: (
     snapshot: LeanProfileSnapshot,
+    sourcePointerCid?: string,
   ) => Promise<ApplySnapshotResult>;
   /** Turn on verbose logging for the wiring helper itself. */
   readonly debug?: boolean;
@@ -444,6 +454,7 @@ function buildFetchAndJoin(deps: {
    */
   applySnapshot: (
     snapshot: LeanProfileSnapshot,
+    sourcePointerCid?: string,
   ) => Promise<ApplySnapshotResult>;
 }): FetchAndJoinCallback {
   return async (remoteCid: Uint8Array, remoteVersion: PointerVersion) => {
@@ -517,7 +528,10 @@ function buildFetchAndJoin(deps: {
     }
 
     try {
-      await deps.applySnapshot(snapshot);
+      // Issue #367 — pass the snapshot's IPFS pointer CID so the
+      // dispatcher can annotate each landed bundle ref. Already
+      // decoded at line ~453 above.
+      await deps.applySnapshot(snapshot, cidString);
     } catch (err) {
       // Throwing here keeps the cursor behind the unconsumed
       // remote, so the next reconcile pass re-fetches + re-applies.

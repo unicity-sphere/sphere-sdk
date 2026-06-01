@@ -30,6 +30,7 @@ import {
   type LeanProfileSnapshot,
 } from './profile-lean-snapshot';
 import { fetchFromIpfs, pinCarBlocksToIpfs } from './ipfs-client';
+import { time, incr, observeMs } from '../core/perf-counters';
 import {
   LOCAL_EPOCH_FLOOR_KEY,
   LOCAL_EPOCH_RESET_REASON_KEY,
@@ -369,10 +370,12 @@ export interface ProfileSnapshotApplyDeps {
 export function runProfileSnapshotApply(
   snapshot: LeanProfileSnapshot,
   deps: ProfileSnapshotApplyDeps,
+  sourcePointerCid?: string,
 ): Promise<ApplySnapshotResult> {
   return runProfileSnapshotJoin(snapshot, {
     writersFor: deps.writersFor,
     bundleIndex: deps.getBundleIndex(),
+    sourcePointerCid,
     log: deps.log,
   });
 }
@@ -703,6 +706,7 @@ export function createProfileProviders(
   // instances (the adapter is a thin handle over `db` + key).
   const dispatchParsedSnapshot = (
     snapshot: LeanProfileSnapshot,
+    sourcePointerCid?: string,
   ): Promise<ApplySnapshotResult> =>
     runProfileSnapshotApply(snapshot, {
       writersFor: (addressId) => {
@@ -791,9 +795,11 @@ export function createProfileProviders(
         return writers;
       },
       getBundleIndex: () => tokenStorage.getBundleIndex(),
-    });
+    }, sourcePointerCid);
 
-  storage.setSnapshotApplier((snapshot) => dispatchParsedSnapshot(snapshot));
+  storage.setSnapshotApplier((snapshot, sourcePointerCid) =>
+    dispatchParsedSnapshot(snapshot, sourcePointerCid),
+  );
 
   // Item #15 Phase E follow-up — install the pull-side dispatcher for
   // the periodic-poll / cold-start recovery paths. Symmetric to
@@ -817,6 +823,8 @@ export function createProfileProviders(
   // object is built. The provider's late-binding setter resolves this
   // ordering cleanly.
   tokenStorage.setApplySnapshotCallback(async (cidString) => {
+    incr('applySnapshotCb.calls');
+    const __cbStart = performance.now();
     // `dag/put` (used by `pinCarBlocksToIpfs`) stored each CAR block
     // under its canonical CID, so `block/get(rootCid)` returns the
     // dag-cbor encoded root block bytes (NOT a CAR envelope).
@@ -835,19 +843,19 @@ export function createProfileProviders(
     // accessor as the bundle load path: cross-process snapshot apply
     // becomes deterministic, cross-device apply falls back to HTTP.
     const helia = db.getHelia?.();
-    const rootBlockBytes = await fetchFromIpfs(
-      ipfsGateways,
-      cidString,
-      undefined,
-      undefined,
-      helia,
+    const rootBlockBytes = await time('applySnapshotCb.fetchRootMs', () =>
+      fetchFromIpfs(ipfsGateways, cidString, undefined, undefined, helia),
     );
-    const snapshot = await parseLeanProfileSnapshotFromRootBlock(
-      rootBlockBytes,
-      (subBlockCid) =>
-        fetchFromIpfs(ipfsGateways, subBlockCid, undefined, undefined, helia),
+    const snapshot = await time('applySnapshotCb.parseSnapshotMs', () =>
+      parseLeanProfileSnapshotFromRootBlock(
+        rootBlockBytes,
+        (subBlockCid) =>
+          fetchFromIpfs(ipfsGateways, subBlockCid, undefined, undefined, helia),
+      ),
     );
-    return dispatchParsedSnapshot(snapshot);
+    const result = await time('applySnapshotCb.dispatchMs', () => dispatchParsedSnapshot(snapshot, cidString));
+    observeMs('applySnapshotCb.totalMs', performance.now() - __cbStart);
+    return result;
   });
 
   return { storage, tokenStorage };
