@@ -223,7 +223,7 @@ normalize_snapshot() {
     -e '/^  IPFS: \+[0-9]+ added, -[0-9]+ removed$/d' \
     -e '/^Syncing\.\.\.$/d' \
     -e '/^  Ready\.$/d' \
-    -e 's/ \(\+ [0-9]+ unconfirmed\)//' \
+    -e 's/ \(\+ [0-9.]+ unconfirmed\)//' \
     -e 's/ \[[0-9]+\+[0-9]+ tokens\]//' \
     -e 's/ \([0-9]+ tokens?\)//' \
     -e 's/ \(1 token\)//'
@@ -256,11 +256,30 @@ assert_no_unconfirmed_after_finalize() {
     echo "ASSERT FAIL ($label): missing snapshot file: $snapshot" >&2
     return 1
   fi
-  if grep -q '(+ [1-9][0-9]* unconfirmed)' "$snapshot"; then
+  # Issue #389 finding #2 — match decimal amounts, not just integers.
+  # Real CLI output is e.g. `UCT: 100.000000000011 (2 tokens)` and a
+  # 10-satoshi V6-RECOVER pollution renders as `(+ 0.0000001 unconfirmed)`
+  # which the old `[1-9][0-9]*` ASCII-integer pattern silently missed.
+  #
+  # We deliberately avoid awk's `+ 0` numeric coercion (which would
+  # cast the matched amount through an IEEE-754 double and silently
+  # lose precision for any token whose smallest-unit count exceeds
+  # 2^53). The SDK aggregates balances as bigint throughout (see
+  # `aggregateTokens`); the soak gate must respect that. Instead we
+  # match by pattern: the amount must contain at least one non-zero
+  # digit somewhere in its [0-9.]* run. This is a pure
+  # string/character-class check — no numeric conversion, valid at
+  # arbitrary precision.
+  local pat='\(\+ [0-9.]*[1-9][0-9.]* unconfirmed\)'
+  if grep -qE "$pat" "$snapshot"; then
     echo "ASSERT FAIL ($label): unconfirmed tokens present after receive --finalize" >&2
     echo "  Issue #387 — V6-RECOVER permanent-mismatch should durably mark the token invalid." >&2
     echo "  Snapshot: $snapshot" >&2
-    grep -n 'unconfirmed' "$snapshot" >&2 || true
+    # Issue #389 finding #14 — diagnostic line MUST mirror the gate's
+    # decimal-aware pattern so operators see the same lines the gate
+    # tripped on, not unrelated 'unconfirmed' noise (e.g. log strings
+    # containing the word 'unconfirmed' outside the balance-line shape).
+    grep -nE "$pat" "$snapshot" >&2 || true
     return 1
   fi
   echo "ASSERT OK ($label): no unconfirmed tokens in post-finalize snapshot"
@@ -482,6 +501,58 @@ EOF
     echo "T9 OK: assert_no_unconfirmed_after_finalize gate semantics correct"
   else
     echo "T9 FAIL: gate semantics broken (clean rc=$rc1 expected 0; polluted rc=$rc2 expected non-0)" >&2
+    rc=1
+  fi
+
+  # ---- T10 (#389 #2): decimal-amount pollution must trip the gate ----
+  # Real CLI output uses decimal amounts (e.g. `UCT: 100.000000000011`),
+  # so a 10-satoshi V6-RECOVER pollution renders as `(+ 0.0000001
+  # unconfirmed)`. The pre-#389 ASCII-integer pattern silently passed
+  # exactly the shape it was designed to catch. T10 locks this in.
+  cat > "$a" <<'EOF'
+UCT: 100.000000000011 (2 tokens)
+EOF
+  cat > "$b" <<'EOF'
+UCT: 100.000000000011 (+ 0.0000001 unconfirmed) [2+1 tokens]
+EOF
+  cat > "$tmpdir/c.txt" <<'EOF'
+UCT: 100 (+ 0.0 unconfirmed) [2+1 tokens]
+EOF
+  cat > "$tmpdir/d.txt" <<'EOF'
+UCT: 100 (+ 0 unconfirmed) [2+1 tokens]
+EOF
+  local rc3=0 rc4=0 rc5=0 rc6=0
+  assert_no_unconfirmed_after_finalize "T10-clean-decimal"   "$a" >/dev/null 2>&1 || rc3=$?
+  assert_no_unconfirmed_after_finalize "T10-decimal-poll"    "$b" >/dev/null 2>&1 || rc4=$?
+  assert_no_unconfirmed_after_finalize "T10-zero-decimal-ok" "$tmpdir/c.txt" >/dev/null 2>&1 || rc5=$?
+  assert_no_unconfirmed_after_finalize "T10-zero-int-ok"     "$tmpdir/d.txt" >/dev/null 2>&1 || rc6=$?
+  if (( rc3 == 0 )) && (( rc4 != 0 )) && (( rc5 == 0 )) && (( rc6 == 0 )); then
+    echo "T10 OK: decimal-amount unconfirmed pollution detected (clean+zero-only snapshots accepted)"
+  else
+    echo "T10 FAIL: decimal-amount gate broken (clean-decimal=$rc3 expect 0; decimal-poll=$rc4 expect non-0; zero-decimal=$rc5 expect 0; zero-int=$rc6 expect 0)" >&2
+    rc=1
+  fi
+
+  # ---- T11 (#389 #3): normalize_snapshot must strip decimal unconfirmed
+  # clauses too. Otherwise diff-based gates either false-pass (both
+  # sides keep the same unstripped clause) or false-fail (one side
+  # synced more), instead of measuring the intended confirmed-only
+  # equivalence.
+  cat > "$a" <<'EOF'
+L3 Balance:
+UCT: 100.000000000011 (2 tokens)
+EOF
+  cat > "$b" <<'EOF'
+L3 Balance:
+UCT: 100.000000000011 (+ 0.0000001 unconfirmed) [2+1 tokens]
+EOF
+  normalize_snapshot "$a" > "$na"
+  normalize_snapshot "$b" > "$nb"
+  if diff -u "$na" "$nb" >/dev/null; then
+    echo "T11 OK: normalize_snapshot strips decimal (+N.M unconfirmed) clause"
+  else
+    echo "T11 FAIL: normalize_snapshot left decimal (+N.M unconfirmed) clause unstripped" >&2
+    diff -u "$na" "$nb" >&2 || true
     rc=1
   fi
 

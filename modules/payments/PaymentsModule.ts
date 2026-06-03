@@ -1717,6 +1717,14 @@ export class PaymentsModule {
   private resolveUnconfirmedTimer: ReturnType<typeof setInterval> | null = null;
   private static readonly RESOLVE_UNCONFIRMED_INTERVAL_MS = 10_000; // Retry every 10s
 
+  // Issue #389 finding #11 — best-effort retry for `saveV6RecoverPermanent`
+  // when the initial persist throws. Exponential backoff capped at
+  // `V6_RECOVER_PERM_SAVE_MAX_ATTEMPTS`. Cleared on destroy / address switch.
+  private v6RecoverPermSaveRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private v6RecoverPermSaveRetryAttempts = 0;
+  private static readonly V6_RECOVER_PERM_SAVE_RETRY_BASE_MS = 2_000;
+  private static readonly V6_RECOVER_PERM_SAVE_MAX_ATTEMPTS = 5;
+
   // Guard: ensure load() completes before processing incoming bundles
   private loadedPromise: Promise<void> | null = null;
   private loaded = false;
@@ -2012,6 +2020,9 @@ export class PaymentsModule {
     this.stopProofPolling();
     this.proofPollingJobs.clear();
     this.stopResolveUnconfirmedPolling();
+    // Issue #389 finding #11 — kill any pending V6-RECOVER save retry
+    // so it doesn't fire into the new address's storage context.
+    this.stopV6RecoverPermanentSaveRetry();
     this.unsubscribeStorageEvents();
 
     // Cancel pending payment response resolvers
@@ -3703,23 +3714,26 @@ export class PaymentsModule {
         logger.debug('Payments', '[PROXY-CACHE] primeProxyAddressCache failed:', err);
       }
 
-      // Restore proof-polling jobs (#144 L1). Must run AFTER the active
-      // token map is populated so we can resolve persisted
-      // (genesisTokenId, stateHash) pairs to in-memory `Token.id`s — and
-      // BEFORE `resolveUnconfirmed` fires so newly-restored jobs are part
-      // of the same accounting.
-      try {
-        await this.restoreProofPollingJobs();
-      } catch (err) {
-        logger.error('Payments', '[V6-RESTORE] Failed to restore proof-polling jobs:', err);
-      }
-
-      // Issue #378 (#275 P4) — hydrate the V6-RECOVER permanent-verdict
-      // ledger BEFORE `recoverStrandedReceivedTokens` runs so the scan
-      // below sees the marker and skips already-failed tokens. Without
-      // this ordering, a cold-start would re-register every previously-
-      // permanent token for another round of probe + finalize work —
-      // exactly the redundant-polling pattern this commit eliminates.
+      // Issue #389 finding #6 — hydrate the V6-RECOVER permanent-verdict
+      // ledger BEFORE `restoreProofPollingJobs` so re-registered polling
+      // jobs (each carrying a `finalizeReceivedToken` callback) cannot
+      // race the ledger-load and overwrite a ledgered token's
+      // `'invalid'` status with `'confirmed'` on the next proof arrival.
+      //
+      // This also preserves the original #378 invariant: the ledger
+      // hydrates BEFORE `recoverStrandedReceivedTokens` (further down)
+      // so its scan sees the marker and skips already-failed tokens
+      // rather than re-registering them for another probe+finalize
+      // round.
+      //
+      // The previous ordering was: `restoreProofPollingJobs` →
+      // `restoreV6RecoverPermanent`. That ordering left a cold-start
+      // race window in which a polling tick firing between these two
+      // calls would call `finalizeReceivedToken` on a token whose
+      // ledger entry had not yet hydrated, defeating the persistent-
+      // verdict design. The companion `isV6RecoverPermanentToken`
+      // guard inside `finalizeReceivedToken` itself is the belt; this
+      // reorder is the suspenders.
       try {
         await this.restoreV6RecoverPermanent();
       } catch (err) {
@@ -3728,6 +3742,21 @@ export class PaymentsModule {
           '[V6-RECOVER-PERM] Failed to restore permanent-verdict ledger:',
           err,
         );
+      }
+
+      // Restore proof-polling jobs (#144 L1). Must run AFTER the active
+      // token map is populated so we can resolve persisted
+      // (genesisTokenId, stateHash) pairs to in-memory `Token.id`s,
+      // AFTER `restoreV6RecoverPermanent` (so ledgered tokens are
+      // already patched to `'invalid'` and the job-restore loop's
+      // `existingToken.status === 'confirmed'` short-circuit is not the
+      // only line of defense — see also #389 #6 above), and BEFORE
+      // `resolveUnconfirmed` fires so newly-restored jobs are part of
+      // the same accounting.
+      try {
+        await this.restoreProofPollingJobs();
+      } catch (err) {
+        logger.error('Payments', '[V6-RESTORE] Failed to restore proof-polling jobs:', err);
       }
 
       // Recover stranded V6-direct receives (#144 L3 migration). Walks
@@ -5400,6 +5429,8 @@ export class PaymentsModule {
 
     // Stop V5 resolve-unconfirmed retry polling
     this.stopResolveUnconfirmedPolling();
+    // Issue #389 finding #11 — kill any pending V6-RECOVER save retry.
+    this.stopV6RecoverPermanentSaveRetry();
 
     // Clear pending response resolvers
     for (const [, resolver] of this.pendingResponseResolvers) {
@@ -7872,13 +7903,22 @@ export class PaymentsModule {
       if (this.v6RecoverPermanent.size > 0) {
         const clearedCount = this.v6RecoverPermanent.size;
         this.v6RecoverPermanent.clear();
-        this.saveV6RecoverPermanent().catch((persistErr) =>
-          logger.debug(
+        // Issue #389 finding #11 — escalate save failures here too.
+        // The forced-retry clear path is less load-bearing than the
+        // verdict-stamp path (the worst outcome of a missed clear is
+        // a stale ledger that re-applies on next load — recoverable
+        // by another forced retry), but it still warrants a retry
+        // schedule so transient storage hiccups don't leave the
+        // operator with a confusing stale ledger entry across
+        // restart.
+        this.saveV6RecoverPermanent().catch((persistErr) => {
+          logger.error(
             'Payments',
             `[V6-RECOVER-PERM] saveV6RecoverPermanent after forced-retry clear failed:`,
             persistErr,
-          ),
-        );
+          );
+          this.scheduleV6RecoverPermanentSaveRetry();
+        });
         logger.debug(
           'Payments',
           `[V6-RECOVER-PERM] Cleared ${clearedCount} permanent-verdict entries for forced retry`,
@@ -8290,7 +8330,31 @@ export class PaymentsModule {
    * @returns Array of matching {@link Token} objects (synchronous).
    */
   getTokens(filter?: { coinId?: string; status?: TokenStatus }): Token[] {
-    let tokens = Array.from(this.tokens.values());
+    // Issue #389 finding #9 — present-status accuracy across the
+    // cold-start window. `loadFromStorageData` calls
+    // `applyV6RecoverPermanentInvalidStatus` AT ITS END, but every
+    // sync() reload re-derives `Token.status` from TXF transactions
+    // (`determineTokenStatus` only emits `'pending'`/`'confirmed'`).
+    // Between the re-derive and the apply, the in-memory tokens map
+    // briefly holds ledgered tokens at `'pending'`. AccountingModule,
+    // SwapModule, and any direct API consumer reading `getTokens`
+    // during that window would observe an unspendable token as
+    // `'pending'` — the precise lie #387 closed. Patch on read,
+    // returning a synthesized view rather than mutating the map (which
+    // would race the next save). The hot path is unaffected: when the
+    // ledger is empty (the common case), `isV6RecoverPermanentToken`
+    // short-circuits before the array walk.
+    const ledgerActive = this.v6RecoverPermanent.size > 0;
+    let tokens: Token[] = ledgerActive
+      ? Array.from(this.tokens.entries(), ([id, t]) =>
+          t.status !== 'invalid' &&
+          t.status !== 'spent' &&
+          t.status !== 'transferring' &&
+          this.isV6RecoverPermanentToken(t, id)
+            ? { ...t, status: 'invalid' as TokenStatus }
+            : t,
+        )
+      : Array.from(this.tokens.values());
 
     if (filter?.coinId) {
       tokens = tokens.filter((t) => t.coinId === filter.coinId);
@@ -8766,8 +8830,21 @@ export class PaymentsModule {
     // #144: include 'pending' status too — V6-direct receives flip from
     // 'submitted' to 'pending' after save→load and would never re-engage
     // the periodic retry otherwise.
-    const hasUnconfirmed = Array.from(this.tokens.values()).some(
-      (t) => t.status === 'submitted' || t.status === 'pending',
+    //
+    // Issue #389 finding #8 — symmetry with `hasUnconfirmedOrInflight`
+    // (which already consults the ledger). Without the ledger check
+    // here, a cold-start window where `loadFromStorageData` has run
+    // but `restoreV6RecoverPermanent`'s ledger hydrate or
+    // `applyV6RecoverPermanentInvalidStatus` patch has not yet
+    // completed would see ledgered tokens as `'pending'` and arm the
+    // periodic retry timer for them — burning a `resolveUnconfirmed`
+    // cycle every interval until they're patched. The pre-#389
+    // load() ordering fix makes this window narrow; the guard here
+    // closes it entirely.
+    const hasUnconfirmed = Array.from(this.tokens.entries()).some(
+      ([id, t]) =>
+        (t.status === 'submitted' || t.status === 'pending') &&
+        !this.isV6RecoverPermanentToken(t, id),
     );
     if (!hasUnconfirmed) {
       logger.debug('Payments', '[V5-RESOLVE] scheduleResolveUnconfirmed: no submitted/pending tokens, not starting timer');
@@ -8793,6 +8870,70 @@ export class PaymentsModule {
       clearInterval(this.resolveUnconfirmedTimer);
       this.resolveUnconfirmedTimer = null;
     }
+  }
+
+  /**
+   * Issue #389 finding #11 — best-effort retry scheduler for
+   * `saveV6RecoverPermanent` failures.
+   *
+   * The ledger is load-bearing for balance correctness across restart;
+   * a single persist failure (transient storage hiccup, IndexedDB
+   * transaction rejected, file lock contention) would otherwise lose the
+   * verdict on process exit. This retries with exponential backoff
+   * (2s × 2^attempt) capped at `V6_RECOVER_PERM_SAVE_MAX_ATTEMPTS`. Each
+   * successful save resets the attempt counter. After exhaustion we
+   * stop retrying — the next legitimate verdict path (or the next call
+   * site that hits `saveV6RecoverPermanent` directly) will re-trigger.
+   */
+  private scheduleV6RecoverPermanentSaveRetry(): void {
+    if (this.v6RecoverPermSaveRetryTimer) return;
+    if (
+      this.v6RecoverPermSaveRetryAttempts >=
+      PaymentsModule.V6_RECOVER_PERM_SAVE_MAX_ATTEMPTS
+    ) {
+      logger.error(
+        'Payments',
+        `[V6-RECOVER-PERM] save retry attempts exhausted (` +
+          `${this.v6RecoverPermSaveRetryAttempts} attempts). Verdict is in ` +
+          `memory only; restart will lose it. Operator intervention required.`,
+      );
+      return;
+    }
+    const attempt = this.v6RecoverPermSaveRetryAttempts;
+    // 2s, 4s, 8s, 16s, 32s
+    const delayMs =
+      PaymentsModule.V6_RECOVER_PERM_SAVE_RETRY_BASE_MS * Math.pow(2, attempt);
+    this.v6RecoverPermSaveRetryTimer = setTimeout(async () => {
+      this.v6RecoverPermSaveRetryTimer = null;
+      this.v6RecoverPermSaveRetryAttempts += 1;
+      try {
+        await this.saveV6RecoverPermanent();
+        // Success — reset counter so the next legitimate failure starts
+        // fresh from a 2s delay.
+        this.v6RecoverPermSaveRetryAttempts = 0;
+        logger.debug(
+          'Payments',
+          `[V6-RECOVER-PERM] save retry succeeded after ` +
+            `${attempt + 1} attempt(s)`,
+        );
+      } catch (err) {
+        logger.error(
+          'Payments',
+          `[V6-RECOVER-PERM] save retry attempt ${attempt + 1} failed:`,
+          err,
+        );
+        // Schedule the next attempt up to the cap.
+        this.scheduleV6RecoverPermanentSaveRetry();
+      }
+    }, delayMs);
+  }
+
+  private stopV6RecoverPermanentSaveRetry(): void {
+    if (this.v6RecoverPermSaveRetryTimer) {
+      clearTimeout(this.v6RecoverPermSaveRetryTimer);
+      this.v6RecoverPermSaveRetryTimer = null;
+    }
+    this.v6RecoverPermSaveRetryAttempts = 0;
   }
 
   // ===========================================================================
@@ -9907,14 +10048,35 @@ export class PaymentsModule {
         // verdict (e.g. CLI completion) cannot lose the entry. The
         // ledger is now load-bearing for balance correctness — we can
         // no longer afford fire-and-forget here.
+        //
+        // Issue #389 finding #11 — if the persist fails (storage
+        // unavailable, disk full, IndexedDB transaction rejected),
+        // the verdict survives only in memory. On CLI exit the
+        // verdict is lost; the next session re-runs the full
+        // V6-RECOVER probe + 60s drain timeout cycle. Bump the log
+        // level to `error` so observability surfaces it (operators
+        // grep for `[V6-RECOVER-PERM]` ERROR lines), and schedule a
+        // best-effort retry on a short backoff so a transient storage
+        // hiccup self-heals before the next session's load(). The
+        // in-memory `'invalid'` status from step 1 above still
+        // protects the current session's balance.
+        //
+        // We deliberately do NOT emit `transfer:operator-alert` here
+        // — that event surface is constrained to the §5.4
+        // `DispositionReason` enum (14 values, snapshot-tested) which
+        // is a transfer-disposition contract, not a generic operator
+        // channel. A storage-side failure does not fit any of the
+        // existing codes and adding a new one requires an ADR.
         try {
           await this.saveV6RecoverPermanent();
         } catch (persistErr) {
-          logger.warn(
+          logger.error(
             'Payments',
-            `[V6-RECOVER-PERM] saveV6RecoverPermanent after permanent-fail mark failed:`,
+            `[V6-RECOVER-PERM] saveV6RecoverPermanent after permanent-fail mark failed (in-memory verdict ` +
+              `for ${tokenId.slice(0, 12)} is correct, but will be lost on restart):`,
             persistErr,
           );
+          this.scheduleV6RecoverPermanentSaveRetry();
         }
 
         // 2. Remove the proof-polling job and persist the change.
@@ -10648,12 +10810,23 @@ export class PaymentsModule {
     // recovery scans see the correct status immediately. We must NOT
     // reject the addToken (returning false would block the Nostr
     // at-least-once cursor from advancing, causing perpetual replay).
+    //
+    // Issue #389 finding #4 — patch the status IN PLACE on the caller's
+    // reference, not via spread-into-new-object. Callers commonly read
+    // `incoming` after the addToken call to populate event payloads
+    // (e.g. `emitEvent('transfer:incoming', { tokens: [incoming] })`).
+    // The spread version of this guard rebound a local but left the
+    // caller's reference with the pre-patch `status: 'pending'`, so the
+    // event payload claimed the token was incoming as spendable while
+    // the map held it as `'invalid'`. AccountingModule's
+    // `_handleTokenChange` and UI listeners then drew the wrong status.
     if (this.isV6RecoverPermanentToken(token)) {
       logger.debug(
         'Payments',
         `[V6-RECOVER-PERM] Incoming token ${(incomingTokenId ?? token.id).slice(0, 12)}... matches permanent verdict — persisting as 'invalid'`,
       );
-      token = { ...token, status: 'invalid', updatedAt: Date.now() };
+      token.status = 'invalid';
+      token.updatedAt = Date.now();
     }
 
     // Add the new token state
@@ -10705,6 +10878,24 @@ export class PaymentsModule {
 
     const incomingTokenId = extractTokenIdFromSdkData(token.sdkData);
     let found = false;
+
+    // Issue #389 finding #5 — mirror `addToken`'s V6-RECOVER permanent
+    // ledger consult. A finalization worker or future internal caller
+    // could otherwise hand updateToken a `'confirmed'` (or any non-
+    // invalid) status and silently overwrite the durable `'invalid'`
+    // verdict — the very regression #387 closed for the load path,
+    // re-introduced through a different door. Patching in place
+    // (matching #389 finding #4 in addToken) keeps the caller's
+    // reference honest for event payloads downstream of this call.
+    if (this.isV6RecoverPermanentToken(token)) {
+      logger.debug(
+        'Payments',
+        `[V6-RECOVER-PERM] updateToken on ${(incomingTokenId ?? token.id).slice(0, 12)}... ` +
+          `intersects permanent-verdict ledger — coercing status to 'invalid'`,
+      );
+      token.status = 'invalid';
+      token.updatedAt = Date.now();
+    }
 
     // Find by genesis tokenId first
     let oldId: string | undefined;
@@ -12082,6 +12273,25 @@ export class PaymentsModule {
     const invalid: Token[] = [];
 
     for (const token of this.tokens.values()) {
+      // Issue #389 finding #7 — short-circuit ledgered tokens. The
+      // V6-RECOVER permanent-verdict ledger is authoritative: the
+      // wallet has decided structurally / by-recipient-mismatch that
+      // it cannot finalize this token. Re-asking the aggregator about
+      // it is wasted round-trips (and, worse, can return `valid=true`
+      // for a token the wallet permanently rejected — a
+      // `validate()` caller would then see a "valid" entry in the
+      // returned array that the rest of the SDK would refuse to
+      // spend). Route ledgered tokens straight to `invalid` so the
+      // returned partition reflects on-wallet reality.
+      if (this.isV6RecoverPermanentToken(token)) {
+        if (token.status !== 'invalid') {
+          token.status = 'invalid';
+        }
+        this.parsedTokenCache.delete(token.id);
+        invalid.push(token);
+        continue;
+      }
+
       const result = await this.deps!.oracle.validateToken(token.sdkData);
 
       if (result.valid && !result.spent) {
@@ -15427,6 +15637,40 @@ export class PaymentsModule {
         return;
       }
 
+      // Issue #389 finding #1 — the V6-RECOVER permanent ledger is
+      // authoritative for "this wallet cannot finalize this token".
+      // If a previous session stamped this tokenId as permanent (HD-
+      // index recovery exhausted / structural failure), a restored
+      // proof-polling job from `restoreProofPollingJobs` (or a stale
+      // in-memory job left over from before the verdict landed) would
+      // otherwise call into this method, succeed in fetching a proof,
+      // and overwrite the durable `'invalid'` status with `'confirmed'`
+      // — exactly the regression #387 closed. The `restoreV6RecoverPermanent`-
+      // before-`restoreProofPollingJobs` ordering fix on `load()` closes
+      // the cold-start race for fresh jobs, but a process that picks up
+      // a job mid-flight, or a future caller that bypasses the load
+      // ordering, would still hit this method. The ledger consult here
+      // is the belt to that braces.
+      if (this.isV6RecoverPermanentToken(token, tokenId)) {
+        logger.debug(
+          'Payments',
+          `[V6-RECOVER-PERM] Skipping finalize for ${tokenId.slice(0, 12)}... ` +
+            `— token is on the permanent-verdict ledger; status stays 'invalid'`,
+        );
+        // Best-effort cleanup of the polling job so subsequent ticks
+        // don't keep firing this no-op path.
+        if (this.proofPollingJobs.delete(tokenId)) {
+          this.saveProofPollingJobs().catch((persistErr) =>
+            logger.debug(
+              'Payments',
+              `[V6-RECOVER-PERM] saveProofPollingJobs after ledger-skip failed:`,
+              persistErr,
+            ),
+          );
+        }
+        return;
+      }
+
       // Get proof from aggregator
       const commitment = await TransferCommitment.fromJSON(commitmentInput);
       if (!this.deps!.oracle.waitForProofSdk) {
@@ -17065,6 +17309,23 @@ export class PaymentsModule {
         continue;
       }
 
+      // Issue #389 finding #6 — V6-RECOVER permanent ledger short-circuit.
+      // With the new load() ordering, `restoreV6RecoverPermanent` ran
+      // before this method, so the ledger is hydrated and we can skip
+      // job re-registration for any token whose canonical id was
+      // permanently rejected. Without this guard, the job would be
+      // re-registered, fire on the next proof, hit the
+      // `finalizeReceivedToken` ledger guard, and no-op — wasted work
+      // but not incorrect. The early skip here keeps load() O(restored)
+      // instead of O(restored + permanent).
+      if (existingToken && this.isV6RecoverPermanentToken(existingToken, memoryTokenId)) {
+        logger.debug(
+          'Payments',
+          `[V6-RESTORE] Token ${memoryTokenId.slice(0, 12)} on permanent-verdict ledger, skipping job`,
+        );
+        continue;
+      }
+
       // Steelman FIX G (#144): cumulative-attempts cap. If this token
       // has already burned through MAX_CUMULATIVE_ATTEMPTS across
       // prior process lifetimes, mark it invalid and skip restoration.
@@ -17273,10 +17534,35 @@ export class PaymentsModule {
     if (this.v6RecoverPermanent.size === 0) return 0;
     let patched = 0;
     for (const [mapKey, token] of this.tokens) {
-      if (token.status === 'invalid' || token.status === 'spent') continue;
+      // Issue #389 finding #10 — `'transferring'` indicates an in-flight
+      // send: an outbound commit was submitted and the recipient state
+      // is in the process of being claimed by the sender. Flipping that
+      // status to `'invalid'` would abort the in-flight send mid-way,
+      // a strictly worse outcome than letting the send complete (which
+      // it will, since the ledger only applies to RECEIVED tokens — a
+      // ledgered token can never be in `'transferring'` for our wallet
+      // in well-formed practice). Treat `'transferring'` as a terminal-
+      // for-this-cycle state the same way `'invalid'` and `'spent'`
+      // are.
+      if (
+        token.status === 'invalid' ||
+        token.status === 'spent' ||
+        token.status === 'transferring'
+      ) {
+        continue;
+      }
       if (!this.isV6RecoverPermanentToken(token, mapKey)) continue;
       token.status = 'invalid';
-      token.updatedAt = Date.now();
+      // Issue #389 finding #13 — do NOT bump `updatedAt` here.
+      // `determineTokenStatus` re-derives status to `'pending'` on every
+      // TXF reload (see also #387 root cause), so this patch runs on
+      // every load() and every sync() cycle. Bumping `updatedAt` would
+      // pollute the "last meaningful change" signal that downstream
+      // observers (AccountingModule, history projection, UI sort) read
+      // — they would see a perpetual stream of bogus "this token just
+      // changed" events even though only the load-time status re-derive
+      // happened. The status flip itself is the only signal that
+      // matters; readers that care about that observe it directly.
       this.tokens.set(mapKey, token);
       patched += 1;
     }

@@ -363,6 +363,17 @@ describe('Issue #387 — V6-RECOVER permanent-mismatch e2e (load + balance + rec
     );
 
     // TXF carrying TWO tokens: the polluted one + a healthy unrelated one.
+    // The healthy token's state predicate MUST bind to the wallet's
+    // chainPubkey — `loadFromStorageData` archives any active token whose
+    // latest state predicate doesn't bind AND that has no finalization
+    // plan (the balance-model invariant from #144). The wallet identity
+    // sets `chainPubkey = '02' + 'a'.repeat(64)`; we use that same value
+    // in an unmasked predicate so `latestStatePredicateMatchesWallet`
+    // returns true and the token stays in the active map.
+    //
+    // `determineTokenStatus` returns 'confirmed' for a token with no
+    // transactions, so a genesis-only token at a non-ledgered canonical
+    // id with a wallet-bound predicate MUST land in `confirmedAmount`.
     const healthyTokenId = 'd'.repeat(64);
     const healthyTxf = {
       genesis: {
@@ -372,7 +383,7 @@ describe('Issue #387 — V6-RECOVER permanent-mismatch e2e (load + balance + rec
           coinData: [[UCT_COIN_ID, '7']],
         },
       },
-      state: { predicate: { type: 'masked', publicKey: '03' + 'b'.repeat(64) } },
+      state: { predicate: { type: 'unmasked', publicKey: '02' + 'a'.repeat(64) } },
       // No transactions → determineTokenStatus returns 'confirmed'.
       transactions: [],
     };
@@ -386,15 +397,86 @@ describe('Issue #387 — V6-RECOVER permanent-mismatch e2e (load + balance + rec
     await module.load();
     const internal = asInternals(module);
 
+    // Polluted side is filtered.
     expect(internal.tokens.get(CANONICAL_TOKEN_ID)?.status).toBe('invalid');
-    // The healthy token's predicate doesn't match the wallet's chainPubkey
-    // either, but it has no transactions → `latestStatePredicateMatchesWallet`
-    // checks rely on identity match logic; the simplest place to land
-    // here is checking that the polluted side is filtered out at minimum.
+    // Healthy side is preserved as 'confirmed' — `isV6RecoverPermanentToken`
+    // matches by canonical id (`healthyTokenId` ≠ `CANONICAL_TOKEN_ID`),
+    // so the ledger filter must not touch it.
+    expect(internal.tokens.get(healthyTokenId)?.status).toBe('confirmed');
+
     const balance = module.getBalance();
     const uct = balance.find((a) => a.coinId === UCT_COIN_ID);
-    const unconfirmed = uct ? BigInt(uct.unconfirmedAmount) : 0n;
-    // The polluted 10 UCT MUST NOT appear in unconfirmed.
-    expect(unconfirmed).toBe(0n);
+    expect(uct).toBeDefined();
+    // Issue #389 finding #12 — explicit positive assertion. The pre-#389
+    // test only checked `unconfirmedAmount === 0` which would silently
+    // pass an over-broad ledger filter regression that ALSO excluded
+    // the healthy token. Lock in the 7-UCT confirmed balance so future
+    // refactors can't quietly drop the healthy side.
+    expect(uct!.confirmedAmount).toBe('7');
+    expect(uct!.unconfirmedAmount).toBe('0');
+    expect(uct!.confirmedTokenCount).toBe(1);
+    expect(uct!.unconfirmedTokenCount).toBe(0);
+    expect(uct!.totalAmount).toBe('7');
+  });
+
+  // ===========================================================================
+  // Issue #389 finding #15 — backward compatibility with #378 ledger payloads.
+  // ===========================================================================
+  //
+  // #378 stamped entries under the map iteration key, which post-
+  // `loadFromStorageData` is the canonical genesis tokenId — i.e. for
+  // every in-practice path the two coincide. #388 made the canonical-id
+  // lookup explicit via `isV6RecoverPermanentToken`. We lock in that a
+  // ledger payload produced by the #378 stamping path continues to
+  // function correctly when loaded by the #388 + #389 logic:
+  //  - tokens at the canonical id are flipped to 'invalid'
+  //  - balance excludes them
+  //  - the recover scan short-circuits
+  // This is the "zero migration risk" check from finding #15.
+  it('#389 #15: legacy #378-shaped ledger payload (canonical-id key) drives #388 lookup correctly', async () => {
+    // #378 produced ledger entries with the SAME shape as #388/#389
+    // (`{ tokenId, reason, ts }`), keyed by the canonical genesis
+    // tokenId post-load. We simulate that exact payload here and
+    // assert all three #389 lookup paths agree on it.
+    const legacyShapedLedger = JSON.stringify([
+      {
+        tokenId: CANONICAL_TOKEN_ID, // canonical genesis id, as #378 wrote
+        reason: 'permanent recipient-address mismatch (HD-index recovery exhausted)',
+        ts: 1_700_000_000_000,
+      },
+    ]);
+    storage._store.set(STORAGE_KEYS_ADDRESS.V6_RECOVER_PERMANENT, legacyShapedLedger);
+    tokenStorage.setData(makeTxfStorageData(CANONICAL_TOKEN_ID));
+
+    const module = makeModuleWithProviders(storage, tokenStorage);
+    await module.load();
+    const internal = asInternals(module);
+
+    // 1) Token is correctly classified.
+    const restored = internal.tokens.get(CANONICAL_TOKEN_ID);
+    expect(restored).toBeDefined();
+    expect(restored!.status).toBe('invalid');
+
+    // 2) Balance excludes it (the #388 `aggregateTokens` filter).
+    const balance = module.getBalance();
+    const uct = balance.find((a) => a.coinId === UCT_COIN_ID);
+    if (uct) {
+      expect(uct.confirmedAmount).toBe('0');
+      expect(uct.unconfirmedAmount).toBe('0');
+    } else {
+      expect(uct).toBeUndefined();
+    }
+
+    // 3) Recover scan short-circuits.
+    const recovered = await internal.recoverStrandedReceivedTokens();
+    expect(recovered).toBe(0);
+
+    // 4) `getTokens()` returns the token but reports its status as
+    //    'invalid' via the #389 #9 lazy filter — important for any
+    //    direct API consumer (AccountingModule, SwapModule, CLI).
+    const all = module.getTokens();
+    const observed = all.find((t) => t.id === CANONICAL_TOKEN_ID);
+    expect(observed).toBeDefined();
+    expect(observed!.status).toBe('invalid');
   });
 });

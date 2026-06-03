@@ -548,6 +548,147 @@ describe('Issue #387 — V6-RECOVER permanent-mismatch durable invalid status', 
       expect(registered).toBe(0);
     });
 
+    // -------------------------------------------------------------------------
+    // Issue #389 review-follow-up regressions (PR #388 hardening).
+    // -------------------------------------------------------------------------
+
+    it('#389 #1: finalizeReceivedToken skips status write for a ledgered token', async () => {
+      // Stamp the ledger BEFORE the in-memory token would otherwise
+      // be marked confirmed by a stale proof-polling callback.
+      internal.v6RecoverPermanent.set(CANONICAL_TOKEN_ID, {
+        reason: 'permanent recipient-address mismatch (HD-index recovery exhausted)',
+        ts: 1,
+      });
+      const t = makeStrandedToken(CANONICAL_TOKEN_ID, 'invalid');
+      internal.tokens.set(t.id, t);
+
+      // Pretend a polling job was registered (we manipulate the
+      // private map directly so the cleanup branch can be exercised).
+      const pollJobs = (internal as unknown as {
+        proofPollingJobs: Map<string, unknown>;
+      }).proofPollingJobs;
+      pollJobs.set(t.id, {} as unknown);
+
+      // Call finalizeReceivedToken directly. Without the #389 #1
+      // guard, this method would build `{ ...token, status: 'confirmed' }`
+      // and clobber the ledgered 'invalid' verdict. With the guard,
+      // it must short-circuit and leave the token at 'invalid'.
+      const fin = (internal as unknown as {
+        finalizeReceivedToken: (
+          tokenId: string,
+          src: unknown,
+          commit: unknown,
+        ) => Promise<void>;
+      }).finalizeReceivedToken;
+      await fin.call(internal, t.id, {}, {});
+
+      expect(internal.tokens.get(t.id)?.status).toBe('invalid');
+      // Polling job cleanup runs (best-effort).
+      expect(pollJobs.has(t.id)).toBe(false);
+    });
+
+    it('#389 #4: addToken patches caller reference IN PLACE (event payloads see invalid)', async () => {
+      internal.v6RecoverPermanent.set(CANONICAL_TOKEN_ID, { reason: 'x', ts: 1 });
+      // The caller hangs on to `incoming` and reads its status AFTER
+      // addToken returns (mirrors handleIncomingTransfer's pattern).
+      const incoming = makeStrandedToken(CANONICAL_TOKEN_ID, 'pending', 'uuid-caller-ref');
+      expect(incoming.status).toBe('pending');
+      await module.addToken(incoming);
+      // The caller's own reference now reflects the patch — not just
+      // the entry inside `this.tokens`. Without in-place mutation,
+      // `incoming.status` would still read 'pending' here.
+      expect(incoming.status).toBe('invalid');
+      expect(internal.tokens.get('uuid-caller-ref')?.status).toBe('invalid');
+    });
+
+    it('#389 #5: updateToken coerces incoming non-invalid status to invalid when ledgered', async () => {
+      internal.v6RecoverPermanent.set(CANONICAL_TOKEN_ID, { reason: 'x', ts: 1 });
+      // A pre-existing entry that addToken seeded as 'invalid'.
+      const existing = makeStrandedToken(CANONICAL_TOKEN_ID, 'invalid');
+      internal.tokens.set(existing.id, existing);
+
+      // A future caller hands updateToken the same token but at
+      // 'confirmed' — pretending to finalize. The ledger guard must
+      // coerce it back to 'invalid' BEFORE the map.set.
+      const incoming = makeStrandedToken(CANONICAL_TOKEN_ID, 'confirmed');
+      await module.updateToken(incoming);
+      expect(incoming.status).toBe('invalid');
+      expect(internal.tokens.get(incoming.id)?.status).toBe('invalid');
+    });
+
+    it('#389 #8: scheduleResolveUnconfirmed does NOT arm the timer when only ledgered tokens are pending', () => {
+      // Place a ledgered token at 'pending' (still un-patched — the
+      // cold-start window). Without the #389 #8 guard, the some()
+      // predicate matches and the timer is armed.
+      const t = makeStrandedToken(CANONICAL_TOKEN_ID, 'pending');
+      internal.tokens.set(t.id, t);
+      internal.v6RecoverPermanent.set(CANONICAL_TOKEN_ID, { reason: 'x', ts: 1 });
+
+      const schedule = (internal as unknown as {
+        scheduleResolveUnconfirmed: () => void;
+      }).scheduleResolveUnconfirmed;
+      // Sanity: timer is not running before.
+      const timerSlot = internal as unknown as {
+        resolveUnconfirmedTimer: unknown;
+      };
+      timerSlot.resolveUnconfirmedTimer = null;
+
+      schedule.call(internal);
+      // With the guard, the predicate finds nothing and returns early.
+      expect(timerSlot.resolveUnconfirmedTimer).toBeNull();
+    });
+
+    it('#389 #9: getTokens() returns invalid-view for ledgered tokens even pre-patch', () => {
+      // Place a ledgered token at 'pending' BEFORE
+      // applyV6RecoverPermanentInvalidStatus has been called — the
+      // cold-start race window the lazy filter closes.
+      const t = makeStrandedToken(CANONICAL_TOKEN_ID, 'pending');
+      internal.tokens.set(t.id, t);
+      internal.v6RecoverPermanent.set(CANONICAL_TOKEN_ID, { reason: 'x', ts: 1 });
+
+      // The in-memory entry is still 'pending' (we deliberately did
+      // NOT call applyV6RecoverPermanentInvalidStatus).
+      expect(internal.tokens.get(t.id)?.status).toBe('pending');
+
+      // But getTokens() returns the patched view.
+      const all = module.getTokens();
+      const observed = all.find((tk) => tk.id === t.id);
+      expect(observed).toBeDefined();
+      expect(observed!.status).toBe('invalid');
+    });
+
+    it('#389 #10: applyV6RecoverPermanentInvalidStatus skips transferring (in-flight send safety)', () => {
+      // A token mid-send: status='transferring' indicates an outbound
+      // commit is in-flight. The ledger MUST NOT flip it — that would
+      // abort the send.
+      const t = makeStrandedToken(CANONICAL_TOKEN_ID, 'transferring');
+      internal.tokens.set(t.id, t);
+      internal.v6RecoverPermanent.set(CANONICAL_TOKEN_ID, { reason: 'x', ts: 1 });
+
+      const patched = internal.applyV6RecoverPermanentInvalidStatus();
+      expect(patched).toBe(0);
+      expect(internal.tokens.get(t.id)?.status).toBe('transferring');
+    });
+
+    it('#389 #13: applyV6RecoverPermanentInvalidStatus does NOT bump updatedAt', () => {
+      const ORIGINAL_TS = 1_700_000_000_000;
+      const t: Token = {
+        ...makeStrandedToken(CANONICAL_TOKEN_ID, 'pending'),
+        updatedAt: ORIGINAL_TS,
+      };
+      internal.tokens.set(t.id, t);
+      internal.v6RecoverPermanent.set(CANONICAL_TOKEN_ID, { reason: 'x', ts: 1 });
+
+      internal.applyV6RecoverPermanentInvalidStatus();
+
+      const patched = internal.tokens.get(t.id);
+      expect(patched).toBeDefined();
+      expect(patched!.status).toBe('invalid');
+      // The status flip alone is the signal; updatedAt is reserved
+      // for genuine downstream-meaningful changes.
+      expect(patched!.updatedAt).toBe(ORIGINAL_TS);
+    });
+
     it('AC4 (regression): full round-trip — load, sync, balance, recover all agree', async () => {
       // End-to-end: stamp the ledger, simulate a sync() that re-runs
       // loadFromStorageData, then verify status, balance, and recover
