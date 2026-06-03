@@ -9623,8 +9623,25 @@ export class PaymentsModule {
         // the same shape `assembleAtState(tokenId, txCount - 1)` produces
         // for the UXF path. `SdkToken.fromJSON` only accepts source tokens
         // whose transactions all have inclusionProofs.
+        //
+        // Issue #390 — also reset `state` to the transfer's `sourceState`
+        // (the sender's mint state). The top-level `parsed.state` was
+        // written by the ingestion path with the RECIPIENT's predicate so
+        // the on-disk shape advertises bob as the owner once finalize
+        // completes. But the SOURCE token (state N-1) used by
+        // `Token.update` → `transaction.verify` → `verifyRecipient` must
+        // expose the SENDER's predicate so the
+        // `expectedRecipient == previousTransaction.recipient`
+        // invariant holds (alice's mint state predicate ⇒ alice's
+        // directAddress, which equals genesis.data.recipient). Without
+        // this fix, every fresh-send V6-RECOVER path failed permanently
+        // with "Recipient address mismatch" and the receiver lost the
+        // value (#387/#388/#389 only stamped the durable verdict —
+        // they did NOT fix this construction). Mirrors the correct
+        // pattern in `tryLocalFinalizeUnconfirmed` (~line 10249).
         const sourceTokenJsonObj = {
           ...parsed,
+          state: (lastTxJson.data as { sourceState?: unknown }).sourceState,
           transactions: txs.slice(0, -1),
         };
         const sourceTokenJson = JSON.stringify(sourceTokenJsonObj);

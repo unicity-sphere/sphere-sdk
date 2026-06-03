@@ -657,6 +657,92 @@ describe('#144 L3 — balance-model invariant + stranded recovery', () => {
     expect(sourceParsed.transactions).toHaveLength(1);
   });
 
+  // ---------------------------------------------------------------------------
+  // Issue #390 — source-state reconstruction invariant
+  //
+  // The pre-#390 reconstruction in recoverStrandedReceivedTokens did:
+  //     { ...parsed, transactions: txs.slice(0, -1) }
+  // which left the top-level `state` field pointing at the RECIPIENT's
+  // predicate (written by `saveCommitmentOnlyToken` for instant receives
+  // so the on-disk shape advertises us as the owner once finalize
+  // completes). Token.update → transaction.verify(trustBase, this) →
+  // this.verifyRecipient() reads state.predicate.getReference().toAddress()
+  // and compares it to genesis.data.recipient — those don't match for a
+  // freshly-minted recipient token (genesis recipient = sender's
+  // directAddress; state.predicate.publicKey = recipient's pubkey ⇒
+  // recipient's directAddress). The SDK throws
+  // `VerificationError('Recipient address mismatch')` and V6-RECOVER
+  // stamps the durable permanent-invalid verdict. The fix replaces
+  // `state` with the transfer's `sourceState` (= sender's mint state)
+  // so verifyRecipient on the source-at-state-N-1 sees consistent
+  // (state.predicate ⇒ genesis.recipient).
+  // ---------------------------------------------------------------------------
+  it('recoverStrandedReceivedTokens rewrites sourceTokenJson.state to the transfer sourceState (#390)', async () => {
+    const recipientStatePredicateMarker = '<<RECIPIENT-STATE-MARKER>>';
+    const senderSourceStatePredicateMarker = '<<SENDER-SOURCE-STATE-MARKER>>';
+
+    // Build sdkData where:
+    //   - top-level state.predicate carries the RECIPIENT marker (the
+    //     ingestion-path write that #390 regresses through).
+    //   - transactions[-1].data.sourceState.predicate carries the SENDER
+    //     marker (the transfer's source state — what verifyRecipient
+    //     on the source-at-state-N-1 must see).
+    // The mocked TransferTransactionData.fromJSON ignores `lastTxJson.data`
+    // contents (returns a stub), so the JSON shape only needs to expose
+    // `data.sourceState.predicate` for the reconstruction code to read.
+    const sdkData = JSON.stringify({
+      version: '2.0',
+      genesis: {
+        data: { tokenId: GENESIS_TOKEN_ID, tokenType: 'coinType', coinData: [['UCT_HEX', '100']] },
+        inclusionProof: { authenticator: { stateHash: 'genesisHash' } },
+      },
+      state: {
+        data: '',
+        predicate: recipientStatePredicateMarker,
+      },
+      transactions: [
+        {
+          inclusionProof: null,
+          data: {
+            recipient: { address: OUR_DIRECT, scheme: 'DIRECT' },
+            salt: '0x33',
+            sourceState: {
+              data: null,
+              predicate: senderSourceStatePredicateMarker,
+            },
+          },
+        },
+      ],
+      _integrity: { genesisDataJSONHash: '0000' + '0'.repeat(60), currentStateHash: STATE_HASH },
+    });
+
+    const token: Token = {
+      id: GENESIS_TOKEN_ID,
+      coinId: 'UCT_HEX',
+      symbol: 'UCT',
+      amount: '100',
+      status: 'pending',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      sdkData,
+    };
+    internals(module).tokens.set(token.id, token);
+
+    const recovered = await internals(module).recoverStrandedReceivedTokens();
+    expect(recovered).toBe(1);
+
+    const job = internals(module).proofPollingJobs.get(GENESIS_TOKEN_ID);
+    expect(job).toBeDefined();
+    const sourceParsed = JSON.parse(job?.sourceTokenJson ?? '{}');
+    // Source token at state N-1 — last tx stripped.
+    expect(sourceParsed.transactions).toHaveLength(0);
+    // CRITICAL #390 invariant: the source token's state MUST come from
+    // the transfer's sourceState (sender's mint state), NOT the
+    // top-level state on the saved sdkData (recipient's predicate).
+    expect(sourceParsed.state?.predicate).toBe(senderSourceStatePredicateMarker);
+    expect(sourceParsed.state?.predicate).not.toBe(recipientStatePredicateMarker);
+  });
+
   it('recoverStrandedReceivedTokens skips tokens that already have a polling job', async () => {
     const sdkData = makeV6DirectReceiveSdkData();
     const token: Token = {
