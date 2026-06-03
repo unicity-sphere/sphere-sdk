@@ -1,6 +1,15 @@
 /**
  * Tests for the `assertNoDuplicateBundleMembership` helper in
- * PaymentsModule (Issue #166 P2 #2 — duplicate-bundle guard).
+ * PaymentsModule.
+ *
+ * **History.** Originally Issue #166 P2 #2 (the guard's introduction).
+ * Reworked under issue #391 — the guard now compares new source
+ * candidates against each OUTBOX entry's `sourceTokenIds` set, NOT its
+ * `tokenIds` (recipient mint-output) set. The pre-#391 comparison was a
+ * category error: it never caught a real double-spend AND false-
+ * positived on legitimate round-trips (alice → bob → alice). The SENT
+ * branch was removed for the same reason (`UxfSentLedgerEntry` has no
+ * source field).
  *
  * **Why this file exists.** The guard is the single load-bearing site
  * for the duplicate-bundle check called from THREE dispatcher
@@ -9,11 +18,6 @@
  * thousands of lines of orchestrator scaffolding. Instead, this file
  * pins the helper contract directly so a regression in any of the
  * three call sites is caught by the unchanged contract.
- *
- * The dispatcher-level wiring (call the helper BEFORE marking sources
- * as `'transferring'` so a throw leaves sources in their original
- * status) is structural plumbing on top of this helper — the helper
- * IS the load-bearing arc.
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -147,7 +151,7 @@ function makePaymentsWithWriters(): {
 // Tests
 // ---------------------------------------------------------------------------
 
-describe('assertNoDuplicateBundleMembership (Issue #166 P2 #2)', () => {
+describe('assertNoDuplicateBundleMembership (Issue #166 P2 #2, reworked under #391)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -156,11 +160,14 @@ describe('assertNoDuplicateBundleMembership (Issue #166 P2 #2)', () => {
   // No-op paths
   // -------------------------------------------------------------------------
 
-  it('is a no-op when allowOverride is true (even if duplicates exist)', async () => {
+  it('is a no-op when allowOverride is true (even if a real source duplicate exists)', async () => {
     const { payments, outboxWriter } = makePaymentsWithWriters();
-    // Plant a duplicate entry — should be ignored on override.
     await outboxWriter.write({
-      ...makeOutboxEntry({ id: 'live', tokenIds: ['tok-A'], status: 'sending' }),
+      ...makeOutboxEntry({
+        id: 'live',
+        sourceTokenIds: ['tok-A'],
+        status: 'sending',
+      }),
     });
 
     await expect(
@@ -194,7 +201,7 @@ describe('assertNoDuplicateBundleMembership (Issue #166 P2 #2)', () => {
     ).resolves.toBeUndefined();
   });
 
-  it('is a no-op when SENT writer is uninstalled (legacy-only wallet)', async () => {
+  it('is a no-op when SENT writer is uninstalled (#391 — SENT is no longer required for the guard)', async () => {
     const payments = createPaymentsModule({
       debug: false,
       autoSync: false,
@@ -205,25 +212,34 @@ describe('assertNoDuplicateBundleMembership (Issue #166 P2 #2)', () => {
       },
     });
     payments.initialize(createPaymentsDeps());
-    // Install ONLY the OUTBOX writer.
+    // Install ONLY the OUTBOX writer. Pre-#391 the guard required BOTH
+    // writers and silently skipped; post-#391 the OUTBOX writer alone
+    // is sufficient AND the guard still fires on a real source dup.
     const { outboxWriter } = createWriterPair();
     payments.installOutboxWriter(outboxWriter);
+
+    await outboxWriter.write(
+      makeOutboxEntry({
+        id: 'in-flight',
+        sourceTokenIds: ['tok-A'],
+        status: 'sending',
+      }),
+    );
 
     await expect(
       asInternals(payments).assertNoDuplicateBundleMembership(['tok-A'], {
         opLabel: 'test',
         allowOverride: false,
       }),
-    ).resolves.toBeUndefined();
+    ).rejects.toThrow('OUTBOX entry');
   });
 
   it('is a no-op when candidateTokenIds is empty', async () => {
     const { payments, outboxWriter } = makePaymentsWithWriters();
-    // Plant something so the OUTBOX read would otherwise find data.
-    await outboxWriter.write(makeOutboxEntry({ id: 'live', tokenIds: ['tok-A'] }));
+    await outboxWriter.write(
+      makeOutboxEntry({ id: 'live', sourceTokenIds: ['tok-A'] }),
+    );
 
-    // An empty candidate list short-circuits BEFORE reading — but even if
-    // it did read, an empty set has no intersection.
     await expect(
       asInternals(payments).assertNoDuplicateBundleMembership([], {
         opLabel: 'test',
@@ -236,20 +252,11 @@ describe('assertNoDuplicateBundleMembership (Issue #166 P2 #2)', () => {
   // Clean selection
   // -------------------------------------------------------------------------
 
-  it('passes silently when no candidate is in OUTBOX or SENT', async () => {
-    const { payments, outboxWriter, sentLedgerWriter } = makePaymentsWithWriters();
-    // OUTBOX has tok-X, SENT has tok-Y. We're sending tok-A and tok-B.
-    await outboxWriter.write(makeOutboxEntry({ id: 'in-flight', tokenIds: ['tok-X'] }));
-    await sentLedgerWriter.write({
-      id: 'delivered',
-      tokenIds: ['tok-Y'],
-      bundleCid: 'bafy-Y',
-      recipient: '@bob',
-      recipientTransportPubkey: 'a'.repeat(64),
-      deliveryMethod: 'car-over-nostr',
-      mode: 'conservative',
-      sentAt: 1_700_000_000_000,
-    });
+  it('passes silently when no candidate is in any OUTBOX entry sourceTokenIds set', async () => {
+    const { payments, outboxWriter } = makePaymentsWithWriters();
+    await outboxWriter.write(
+      makeOutboxEntry({ id: 'in-flight', sourceTokenIds: ['tok-X'] }),
+    );
 
     await expect(
       asInternals(payments).assertNoDuplicateBundleMembership(['tok-A', 'tok-B'], {
@@ -260,15 +267,15 @@ describe('assertNoDuplicateBundleMembership (Issue #166 P2 #2)', () => {
   });
 
   // -------------------------------------------------------------------------
-  // Rejection paths
+  // Rejection path — the load-bearing arc (#391 invariant)
   // -------------------------------------------------------------------------
 
-  it('throws DUPLICATE_BUNDLE_MEMBERSHIP when a candidate is in a live OUTBOX entry', async () => {
+  it('throws DUPLICATE_BUNDLE_MEMBERSHIP when a candidate matches a sourceTokenIds entry in OUTBOX', async () => {
     const { payments, outboxWriter } = makePaymentsWithWriters();
     await outboxWriter.write(
       makeOutboxEntry({
         id: 'in-flight',
-        tokenIds: ['tok-A', 'tok-B'],
+        sourceTokenIds: ['tok-A', 'tok-B'],
         status: 'sending',
       }),
     );
@@ -294,11 +301,50 @@ describe('assertNoDuplicateBundleMembership (Issue #166 P2 #2)', () => {
     expect(message).toContain('allowDuplicateBundleMembership');
   });
 
-  it('throws DUPLICATE_BUNDLE_MEMBERSHIP when a candidate is in SENT', async () => {
+  // -------------------------------------------------------------------------
+  // Issue #391 — round-trip false-positive avoidance.
+  // -------------------------------------------------------------------------
+
+  it('#391 — does NOT throw when candidate matches a past entry tokenIds (recipient) but NOT sourceTokenIds', async () => {
+    const { payments, outboxWriter } = makePaymentsWithWriters();
+    // Scenario from the issue:
+    //   - bob's prior 2-UCT send to alice. OUTBOX entry's `tokenIds`
+    //     carries the RECIPIENT genesis tokenIds (alice's mint output
+    //     'round-trip-A'). `sourceTokenIds` carries bob's burned source
+    //     ('bob-original-10').
+    //   - Later, alice transfers the same token back to bob (whole-token).
+    //     bob now legitimately owns 'round-trip-A' and tries to send it
+    //     onward.
+    //
+    // Pre-#391 the guard compared candidates against `tokenIds` and
+    // false-positived ('round-trip-A' matches the past recipient set).
+    // Post-#391 it compares against `sourceTokenIds` and lets the legal
+    // round-trip through.
+    await outboxWriter.write(
+      makeOutboxEntry({
+        id: 'old-2uct-send',
+        tokenIds: ['round-trip-A'],
+        sourceTokenIds: ['bob-original-10'],
+        status: 'delivered-instant',
+      }),
+    );
+
+    await expect(
+      asInternals(payments).assertNoDuplicateBundleMembership(
+        ['round-trip-A'],
+        { opLabel: 'dispatchUxfInstantSend', allowOverride: false },
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  it('#391 — does NOT throw when a SENT entry carries the candidate id in tokenIds (SENT no longer participates)', async () => {
     const { payments, sentLedgerWriter } = makePaymentsWithWriters();
+    // SENT records the recipient mint-output as `tokenIds`. Pre-#391
+    // the guard rejected any candidate that matched it. Post-#391 the
+    // SENT branch is removed entirely (the schema has no source field).
     await sentLedgerWriter.write({
       id: 'past-delivery',
-      tokenIds: ['tok-A'],
+      tokenIds: ['round-trip-A'],
       bundleCid: 'bafy-A',
       recipient: '@bob',
       recipientTransportPubkey: 'a'.repeat(64),
@@ -307,136 +353,79 @@ describe('assertNoDuplicateBundleMembership (Issue #166 P2 #2)', () => {
       sentAt: 1_700_000_000_000,
     });
 
-    let caught: unknown;
-    try {
-      await asInternals(payments).assertNoDuplicateBundleMembership(
-        ['tok-A'],
-        { opLabel: 'dispatchUxfInstantSend', allowOverride: false },
-      );
-    } catch (err) {
-      caught = err;
-    }
-    expect(caught).toBeDefined();
-    expect(isSphereError(caught)).toBe(true);
-    expect((caught as { code: string }).code).toBe('DUPLICATE_BUNDLE_MEMBERSHIP');
-    const message = (caught as Error).message;
-    expect(message).toContain('tok-A');
-    expect(message).toContain('SENT ledger entry');
-    expect(message).toContain('past-delivery');
-    expect(message).toContain('dispatchUxfInstantSend');
+    await expect(
+      asInternals(payments).assertNoDuplicateBundleMembership(['round-trip-A'], {
+        opLabel: 'dispatchUxfInstantSend',
+        allowOverride: false,
+      }),
+    ).resolves.toBeUndefined();
   });
 
-  it('checks OUTBOX before SENT (more diagnostic value for operator triage)', async () => {
-    const { payments, outboxWriter, sentLedgerWriter } = makePaymentsWithWriters();
-    // The same tokenId is in BOTH writers — guard should report OUTBOX
-    // first, not SENT, because "still in flight" is more actionable for
-    // operator triage than "already delivered."
-    await outboxWriter.write(
-      makeOutboxEntry({
-        id: 'in-flight',
-        tokenIds: ['tok-DUP'],
-        status: 'sending',
-      }),
-    );
-    await sentLedgerWriter.write({
-      id: 'past-delivery',
-      tokenIds: ['tok-DUP'],
-      bundleCid: 'bafy-DUP',
-      recipient: '@bob',
-      recipientTransportPubkey: 'a'.repeat(64),
-      deliveryMethod: 'car-over-nostr',
-      mode: 'conservative',
-      sentAt: 1_700_000_000_000,
-    });
+  // -------------------------------------------------------------------------
+  // Back-compat — pre-H5 entries lack sourceTokenIds and are silently skipped
+  // -------------------------------------------------------------------------
 
-    let caught: unknown;
-    try {
-      await asInternals(payments).assertNoDuplicateBundleMembership(['tok-DUP'], {
-        opLabel: 'test',
-        allowOverride: false,
-      });
-    } catch (err) {
-      caught = err;
-    }
-    expect(caught).toBeDefined();
-    const message = (caught as Error).message;
-    // OUTBOX wins the diagnostic — the message mentions OUTBOX, not SENT.
-    expect(message).toContain('OUTBOX entry');
-    expect(message).not.toContain('SENT ledger entry');
-    expect(message).toContain('in-flight');
-    expect(message).not.toContain('past-delivery');
+  it('treats pre-H5 OUTBOX entries (no sourceTokenIds) as empty source set', async () => {
+    const { payments, outboxWriter } = makePaymentsWithWriters();
+    // Plant a pre-H5-shape entry — explicitly clear sourceTokenIds.
+    const entry = makeOutboxEntry({
+      id: 'pre-h5',
+      tokenIds: ['some-recipient-token'],
+      status: 'delivered-instant',
+    });
+    // Avoid reaching into the type contract — strip the field at the
+    // raw shape (some test fixtures never set it; this just makes the
+    // intent explicit when reading the test).
+    const { sourceTokenIds: _drop, ...preH5 } = {
+      ...entry,
+      sourceTokenIds: undefined,
+    };
+    void _drop;
+    await outboxWriter.write(preH5 as typeof entry);
+
+    // No source side to compare against — candidate passes through.
+    await expect(
+      asInternals(payments).assertNoDuplicateBundleMembership(
+        ['some-recipient-token'],
+        { opLabel: 'test', allowOverride: false },
+      ),
+    ).resolves.toBeUndefined();
   });
 
   // -------------------------------------------------------------------------
   // Read-failure semantics (best-effort safety contract)
   // -------------------------------------------------------------------------
 
-  it('proceeds without OUTBOX check when readAllNew throws; SENT check still attempted', async () => {
-    const { payments, sentLedgerWriter } = makePaymentsWithWriters();
+  it('proceeds without throwing when OUTBOX readAllNew throws (best-effort guard)', async () => {
+    const { payments } = makePaymentsWithWriters();
     // Replace the OUTBOX writer with one that throws on read.
     const throwingOutbox = {
       readAllNew: vi.fn().mockRejectedValue(new Error('orbitdb-down')),
     } as unknown as OutboxWriter;
     payments.installOutboxWriter(throwingOutbox);
-    // SENT writer is healthy and contains the duplicate.
-    await sentLedgerWriter.write({
-      id: 'past-delivery',
-      tokenIds: ['tok-DUP'],
-      bundleCid: 'bafy-DUP',
-      recipient: '@bob',
-      recipientTransportPubkey: 'a'.repeat(64),
-      deliveryMethod: 'car-over-nostr',
-      mode: 'conservative',
-      sentAt: 1_700_000_000_000,
-    });
 
-    // The OUTBOX read throws, so the guard skips that branch and
-    // proceeds to SENT — which catches the duplicate.
-    await expect(
-      asInternals(payments).assertNoDuplicateBundleMembership(['tok-DUP'], {
-        opLabel: 'test',
-        allowOverride: false,
-      }),
-    ).rejects.toThrow('SENT ledger entry');
-    // The throwing OUTBOX may be called more than once because
-    // `installOutboxWriter` ALSO triggers a fire-and-forget hydration
-    // read on install — both calls return rejection, both logged. The
-    // load-bearing assertion is that we reached the SENT check (the
-    // rejects.toThrow above) despite the OUTBOX read failure.
-    expect(throwingOutbox.readAllNew).toHaveBeenCalled();
-  });
-
-  it('proceeds without SENT check when readAll throws; OUTBOX check still authoritative', async () => {
-    const { payments, outboxWriter } = makePaymentsWithWriters();
-    // Replace SENT with a throwing writer.
-    const throwingSent = {
-      readAll: vi.fn().mockRejectedValue(new Error('orbitdb-down')),
-    } as unknown as SentLedgerWriter;
-    payments.installSentLedgerWriter(throwingSent);
-    // OUTBOX is clean: no duplicate.
-    await outboxWriter.write(makeOutboxEntry({ id: 'live', tokenIds: ['tok-X'] }));
-
-    // Guard reads OUTBOX (clean), tries SENT (throws → warn-and-skip),
-    // returns without throwing. The candidate may legitimately
-    // duplicate a SENT entry we couldn't read — that's the trade-off:
-    // a transient read failure should NOT block legitimate sends.
+    // The OUTBOX read throws → guard warns + skips. Without OUTBOX the
+    // guard cannot check anything (SENT has no source field). Resolves
+    // without throwing; the `'transferring'`-status planner filter is
+    // the load-bearing defense.
     await expect(
       asInternals(payments).assertNoDuplicateBundleMembership(['tok-A'], {
         opLabel: 'test',
         allowOverride: false,
       }),
     ).resolves.toBeUndefined();
-    expect(throwingSent.readAll).toHaveBeenCalledTimes(1);
+    expect(throwingOutbox.readAllNew).toHaveBeenCalled();
   });
 
   it('is best-effort: tombstoned OUTBOX entries are NOT counted (readAllNew skips them)', async () => {
     const { payments, outboxWriter } = makePaymentsWithWriters();
-    // Write then delete (tombstone) — `readAllNew` filters these out.
-    await outboxWriter.write(makeOutboxEntry({ id: 'gone', tokenIds: ['tok-A'] }));
+    await outboxWriter.write(
+      makeOutboxEntry({ id: 'gone', sourceTokenIds: ['tok-A'] }),
+    );
     await outboxWriter.delete('gone');
 
-    // Candidate tok-A overlaps a TOMBSTONED entry — guard should NOT
-    // throw, because the entry is no longer live.
+    // Candidate tok-A overlaps a TOMBSTONED entry's source set — guard
+    // should NOT throw because the entry is no longer live.
     await expect(
       asInternals(payments).assertNoDuplicateBundleMembership(['tok-A'], {
         opLabel: 'test',
@@ -446,22 +435,14 @@ describe('assertNoDuplicateBundleMembership (Issue #166 P2 #2)', () => {
   });
 
   // -------------------------------------------------------------------------
-  // Override flag interaction with both writers populated
+  // Override flag interaction
   // -------------------------------------------------------------------------
 
-  it('override bypasses the guard even when duplicates exist in BOTH writers', async () => {
-    const { payments, outboxWriter, sentLedgerWriter } = makePaymentsWithWriters();
-    await outboxWriter.write(makeOutboxEntry({ id: 'live', tokenIds: ['tok-DUP'] }));
-    await sentLedgerWriter.write({
-      id: 'past',
-      tokenIds: ['tok-DUP'],
-      bundleCid: 'bafy',
-      recipient: '@bob',
-      recipientTransportPubkey: 'a'.repeat(64),
-      deliveryMethod: 'car-over-nostr',
-      mode: 'conservative',
-      sentAt: 1_700_000_000_000,
-    });
+  it('override bypasses the guard even when a real source duplicate exists', async () => {
+    const { payments, outboxWriter } = makePaymentsWithWriters();
+    await outboxWriter.write(
+      makeOutboxEntry({ id: 'live', sourceTokenIds: ['tok-DUP'] }),
+    );
 
     await expect(
       asInternals(payments).assertNoDuplicateBundleMembership(['tok-DUP'], {

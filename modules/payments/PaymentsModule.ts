@@ -3838,6 +3838,64 @@ export class PaymentsModule {
         });
     }
 
+    // Issue #391 — fire-and-forget SENT reconciliation pass.
+    //
+    // The worker's periodic timer waits one full
+    // DEFAULT_RECONCILIATION_INTERVAL_MS (60s) before its first scan
+    // (see `transfer/sent-reconciliation-worker.ts:start()`), so
+    // short-lived processes (CLI invocations, headless scripts) exit
+    // before any cycle fires. The result: a `delivered-instant`
+    // OUTBOX entry written in process N stays live indefinitely,
+    // bloating `readAllNew()` for every subsequent send and feeding
+    // false-positive throws into the duplicate-bundle guard once a
+    // token round-trips (the original symptom — see issue #391).
+    //
+    // Running ONE cycle right after load() lets a fresh process
+    // tombstone the prior process's leftover delivered entries
+    // (those that already have a SENT row) before its first send
+    // hits the guard. Long-running consumers (sphere.telco UI,
+    // daemons) keep getting the periodic-timer behavior; this just
+    // closes the short-process gap.
+    //
+    // Self-skip semantics mirror the orphan sweep above: the worker
+    // returns `skipped: true` when either writer is unavailable, so
+    // the call is safe even before the bootstrap installs them.
+    // Errors are caught so a reconciliation failure cannot break
+    // load() for downstream callers.
+    if (this.sentReconciliationWorker !== null) {
+      const reconciler = this.sentReconciliationWorker;
+      void (async (): Promise<void> => {
+        try {
+          const result = await reconciler.runScanCycle();
+          if (result.skipped) {
+            logger.debug(
+              'Payments',
+              'SENT reconciliation sweep on load skipped (writer unavailable)',
+            );
+            return;
+          }
+          if (
+            result.alreadyConverged > 0 ||
+            result.recovered > 0 ||
+            result.suspended > 0
+          ) {
+            logger.debug(
+              'Payments',
+              `SENT reconciliation sweep on load: attempted=${result.attempted} ` +
+                `alreadyConverged=${result.alreadyConverged} ` +
+                `recovered=${result.recovered} ` +
+                `suspended=${result.suspended}`,
+            );
+          }
+        } catch (err) {
+          logger.warn(
+            'Payments',
+            `SENT reconciliation sweep on load failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      })();
+    }
+
     // Issue #280 Layer 2 — fire-and-forget recovery-time aggregator-spent
     // sweep. Defense-in-depth against missing/corrupt local SENT records
     // (the Layer-1 fix in `oplog-envelope-io.ts` keeps the envelope
@@ -4068,36 +4126,64 @@ export class PaymentsModule {
   /**
    * Issue #166 P2 #2 — duplicate-bundle guard.
    *
-   * Verify that none of `candidateTokenIds` is already referenced by a
-   * live OUTBOX entry OR present in the SENT ledger. Throws
-   * `DUPLICATE_BUNDLE_MEMBERSHIP` on the first overlap found
-   * (OUTBOX checked before SENT — more diagnostic value, "still in
-   * flight" beats "already delivered" for operator triage).
+   * Verify that none of `candidateTokenIds` (= source tokens the new
+   * bundle is about to commit-spend) is already referenced as a
+   * SOURCE by a live OUTBOX entry. Throws `DUPLICATE_BUNDLE_MEMBERSHIP`
+   * on the first overlap found.
+   *
+   * **Issue #391 — guard now compares against `entry.sourceTokenIds`,
+   * not `entry.tokenIds`.** Source candidates are SOURCE-side ids;
+   * `entry.tokenIds` carries the RECIPIENT mint-output ids per
+   * {@link UxfTransferOutboxEntry} ("Tokens shipped in this bundle —
+   * genesis token ids"). Comparing source candidates against the
+   * recipient-id field is a category error that never catches a real
+   * double-spend AND false-positives on legitimate round-trips
+   * (A→B→A: B forwards a previously-received token back to A while a
+   * stale `delivered-instant` OUTBOX entry still lists it as a
+   * recipient id). The SOURCE invariant — "don't burn the same
+   * source twice" — is what this guard actually defends; the source
+   * set is the only field that can express it.
+   *
+   * **SENT check removed (#391).** `UxfSentLedgerEntry` does not
+   * carry a source set (see `types/uxf-sent.ts:59-136`); the previous
+   * comparison against `sentEntry.tokenIds` had the same category-error
+   * problem. The OUTBOX check (using `sourceTokenIds`) plus the
+   * load-bearing `'transferring'`-status filter in
+   * `SpendPlanner.buildParsedPool` already cover the spend-side
+   * invariant. If we ever want a post-SENT defense we'll add
+   * `sourceTokenIds` to the SENT schema and check it here.
    *
    * **Self-skip conditions** (all silent no-ops):
    *  - `allowOverride === true` — caller explicitly opted out.
-   *  - Either writer is `null` — legacy-only wallet OR the bootstrap
-   *    has not yet installed both writers. The guard cannot
+   *  - `this._outboxWriter === null` — legacy-only wallet OR the
+   *    bootstrap has not yet installed the writer. The guard cannot
    *    distinguish "not in any tracked structure" from "writer
    *    unavailable," so we conservatively skip rather than reject.
    *  - `candidateTokenIds` is empty.
    *
    * **Read-failure semantics** (best-effort safety contract):
-   *  - The guard catches throws from `readAllNew()` / `readAll()` and
-   *    logs a `warn`, then proceeds WITHOUT the check. Rationale: the
-   *    guard's job is to catch races/bugs that would silently
-   *    double-include a token; a transient OrbitDB read failure
-   *    should NOT block a legitimate send. The natural
-   *    `'transferring'`-status filter in `SpendPlanner.buildParsedPool`
-   *    is still in place as the load-bearing line of defense.
+   *  - The guard catches throws from `readAllNew()` and logs a `warn`,
+   *    then proceeds WITHOUT the check. Rationale: the guard's job is
+   *    to catch races/bugs that would silently double-include a token;
+   *    a transient OrbitDB read failure should NOT block a legitimate
+   *    send. The natural `'transferring'`-status filter in
+   *    `SpendPlanner.buildParsedPool` is still in place as the
+   *    load-bearing line of defense.
    *
-   * **Cost.** O(o + s + k) where `o` is the total tokenIds across
-   * OUTBOX entries, `s` is the total across SENT, and `k` is
-   * `candidateTokenIds.length`. The OUTBOX/SENT reads are the
-   * dominant cost; the set lookups are O(1).
+   * **Back-compat with pre-H5 OUTBOX entries.** Entries written before
+   * Audit #333 H5 lack the `sourceTokenIds` field
+   * (`types/uxf-outbox.ts:211` documents this — optional with `[]`
+   * semantics). The guard treats `undefined` as the empty set and
+   * silently skips those entries, matching the worker's "no recovery
+   * target" semantics. The pre-H5 send pipeline's source tombstoning
+   * remains the safety surface for those entries.
+   *
+   * **Cost.** O(o + k) where `o` is the total source-id count across
+   * OUTBOX entries and `k` is `candidateTokenIds.length`. The OUTBOX
+   * read is the dominant cost; the set lookups are O(1).
    *
    * @param candidateTokenIds  Token ids the dispatcher is about to mark
-   *                           as `'transferring'`.
+   *                           as `'transferring'` (= source-side ids).
    * @param options.opLabel    Short context tag for the throw message
    *                           (e.g. 'dispatchUxfConservativeSend').
    * @param options.allowOverride  When true, the guard is a no-op.
@@ -4109,49 +4195,33 @@ export class PaymentsModule {
     options: { readonly opLabel: string; readonly allowOverride: boolean },
   ): Promise<void> {
     if (options.allowOverride) return;
-    if (this._outboxWriter === null || this._sentLedgerWriter === null) return;
+    if (this._outboxWriter === null) return;
     if (candidateTokenIds.length === 0) return;
 
     const candidates = new Set<string>(candidateTokenIds);
 
     // ── OUTBOX check ────────────────────────────────────────────────────
+    // Compare candidates against each entry's SOURCE set
+    // (`sourceTokenIds`), which is the only field that can express the
+    // "don't burn the same source twice" invariant this guard defends.
+    // See issue #391 in the docstring above.
     let outboxEntries: ReadonlyArray<UxfTransferOutboxEntry>;
     try {
       outboxEntries = await this._outboxWriter.readAllNew();
     } catch (err) {
       logger.warn(
         'Payments',
-        `${options.opLabel}: duplicate-bundle guard could not read OUTBOX (proceeding without OUTBOX check, SENT check still attempted): ${err instanceof Error ? err.message : String(err)}`,
-      );
-      outboxEntries = [];
-    }
-    for (const entry of outboxEntries) {
-      for (const tid of entry.tokenIds) {
-        if (candidates.has(tid)) {
-          throw new SphereError(
-            `${options.opLabel}: refusing to include token ${tid} in this bundle — it is already referenced by OUTBOX entry ${entry.id} (status=${entry.status}). Set TransferRequest.allowDuplicateBundleMembership=true to bypass this guard if the re-include is intentional.`,
-            'DUPLICATE_BUNDLE_MEMBERSHIP',
-          );
-        }
-      }
-    }
-
-    // ── SENT check ──────────────────────────────────────────────────────
-    let sentEntries: ReadonlyArray<UxfSentLedgerEntry>;
-    try {
-      sentEntries = await this._sentLedgerWriter.readAll();
-    } catch (err) {
-      logger.warn(
-        'Payments',
-        `${options.opLabel}: duplicate-bundle guard could not read SENT ledger (proceeding without SENT check, OUTBOX check already passed): ${err instanceof Error ? err.message : String(err)}`,
+        `${options.opLabel}: duplicate-bundle guard could not read OUTBOX (proceeding without check): ${err instanceof Error ? err.message : String(err)}`,
       );
       return;
     }
-    for (const entry of sentEntries) {
-      for (const tid of entry.tokenIds) {
+    for (const entry of outboxEntries) {
+      const sources = entry.sourceTokenIds;
+      if (sources === undefined) continue; // pre-H5 entry — silently skip
+      for (const tid of sources) {
         if (candidates.has(tid)) {
           throw new SphereError(
-            `${options.opLabel}: refusing to include token ${tid} in this bundle — it is already recorded as delivered in SENT ledger entry ${entry.id}. Set TransferRequest.allowDuplicateBundleMembership=true to bypass this guard if the re-include is intentional.`,
+            `${options.opLabel}: refusing to include token ${tid} in this bundle — it is already in flight as a source of OUTBOX entry ${entry.id} (status=${entry.status}). Set TransferRequest.allowDuplicateBundleMembership=true to bypass this guard if the re-include is intentional.`,
             'DUPLICATE_BUNDLE_MEMBERSHIP',
           );
         }
