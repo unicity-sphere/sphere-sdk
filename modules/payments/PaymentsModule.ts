@@ -7947,12 +7947,17 @@ export class PaymentsModule {
     // exhausted" / "structural failure" — no retry semantically
     // recovers it); polling it on every `sphere balance` is wasted
     // wall-clock that historically stacked to ~60s per command.
+    // Issue #387 — canonical-id-first lookup. The ledger is keyed by
+    // canonical genesis tokenId; the map iteration key matches that
+    // immediately after `loadFromStorageData` but can be a randomUUID
+    // immediately after `addToken`. Use the helper so both forms
+    // resolve correctly.
     const hasUnconfirmedOrInflight = (): boolean =>
       this.inflightReceiveCount > 0 ||
       Array.from(this.tokens.entries()).some(
         ([tokenId, t]) =>
           (t.status === 'submitted' || t.status === 'pending') &&
-          !this.v6RecoverPermanent.has(tokenId),
+          !this.isV6RecoverPermanentToken(t, tokenId),
       );
 
     // Drain ingest worker pool first (UXF v1 path, defense in depth).
@@ -8181,6 +8186,18 @@ export class PaymentsModule {
     for (const token of this.tokens.values()) {
       // Skip spent and invalid tokens; transferring tokens remain visible
       if (token.status === 'spent' || token.status === 'invalid') continue;
+      // Issue #387 — defense in depth: any token whose tokenId carries
+      // a permanent V6-RECOVER verdict is unspendable by this wallet
+      // (HD-index recovery exhausted / structural failure). Even if a
+      // TXF round-trip stripped its `'invalid'` status, the persistent
+      // ledger is the authoritative verdict source and must be honored
+      // here so balance NEVER includes unspendable tokens. The
+      // `applyV6RecoverPermanentInvalidStatus` patch from
+      // `loadFromStorageData` makes this filter normally redundant —
+      // belt-and-braces against any future caller mutating status
+      // independently or any code path that bypasses load (e.g. a
+      // direct `tokens.set()` in tests).
+      if (this.isV6RecoverPermanentToken(token)) continue;
       // Issue #282 Residual #3 — skip invoice tokens and any residual
       // empty-coinId entries. Invoices carry zero amount and have no
       // place in a balance summary; an empty coinId is a defensive
@@ -9412,7 +9429,13 @@ export class PaymentsModule {
       // ever changing the verdict. Skip until an operator explicitly
       // forces a retry via `payments receive --finalize` (which clears
       // the ledger).
-      if (this.v6RecoverPermanent.has(tokenId)) continue;
+      //
+      // Issue #387 — use canonical-id-first lookup. The ledger is keyed
+      // by canonical genesis tokenId; the map iteration key matches
+      // that immediately after `loadFromStorageData` but `addToken` from
+      // a Nostr replay can re-key under a `crypto.randomUUID`. The
+      // `isV6RecoverPermanentToken` helper handles both forms.
+      if (this.isV6RecoverPermanentToken(token, tokenId)) continue;
       if (this.parsePendingFinalization(token.sdkData)) continue;
       if (!this.isReceivedLegacyPending(token)) continue;
 
@@ -9863,17 +9886,36 @@ export class PaymentsModule {
         // status-merge semantics) restore the original 'submitted'
         // status. The persistent ledger key is independent of the
         // token bytes and so survives those round-trips deterministically.
-        this.v6RecoverPermanent.set(tokenId, {
+        //
+        // Issue #387 — confirmed: `determineTokenStatus` only emits
+        // {pending, confirmed} from TXF; the in-memory `'invalid'`
+        // write at step 1 above is LOST on the next load. The ledger
+        // is now the SOLE durable representation of the verdict, and
+        // `loadFromStorageData` → `applyV6RecoverPermanentInvalidStatus`
+        // re-derives the `'invalid'` status from the ledger after
+        // every load + sync. Use the canonical genesis tokenId
+        // (extracted from `sdkData`) as the ledger key so the value
+        // is stable across `addToken` UUID re-keying — it always
+        // equals the storage-derived map key post-load.
+        const ledgerKey =
+          (token && extractTokenIdFromSdkData(token.sdkData)) ?? tokenId;
+        this.v6RecoverPermanent.set(ledgerKey, {
           reason: classLabel,
           ts: Date.now(),
         });
-        this.saveV6RecoverPermanent().catch((persistErr) =>
-          logger.debug(
+        // Await persistence so a process exit immediately after the
+        // verdict (e.g. CLI completion) cannot lose the entry. The
+        // ledger is now load-bearing for balance correctness — we can
+        // no longer afford fire-and-forget here.
+        try {
+          await this.saveV6RecoverPermanent();
+        } catch (persistErr) {
+          logger.warn(
             'Payments',
             `[V6-RECOVER-PERM] saveV6RecoverPermanent after permanent-fail mark failed:`,
             persistErr,
-          ),
-        );
+          );
+        }
 
         // 2. Remove the proof-polling job and persist the change.
         this.proofPollingJobs.delete(tokenId);
@@ -10596,6 +10638,22 @@ export class PaymentsModule {
           }
         }
       }
+    }
+
+    // Issue #387 — Nostr at-least-once replay can re-deliver a token
+    // whose canonical tokenId already carries a permanent V6-RECOVER
+    // verdict (HD-index recovery exhausted / structural failure). The
+    // ledger is the authoritative source; mark the incoming entry as
+    // `'invalid'` BEFORE inserting into `this.tokens` so balance and
+    // recovery scans see the correct status immediately. We must NOT
+    // reject the addToken (returning false would block the Nostr
+    // at-least-once cursor from advancing, causing perpetual replay).
+    if (this.isV6RecoverPermanentToken(token)) {
+      logger.debug(
+        'Payments',
+        `[V6-RECOVER-PERM] Incoming token ${(incomingTokenId ?? token.id).slice(0, 12)}... matches permanent verdict — persisting as 'invalid'`,
+      );
+      token = { ...token, status: 'invalid', updatedAt: Date.now() };
     }
 
     // Add the new token state
@@ -16781,6 +16839,17 @@ export class PaymentsModule {
     if (incomingHasNametags || this.nametags.length === 0) {
       this.nametags = parsed.nametags;
     }
+
+    // Issue #387 — every TXF round-trip through `parseTxfStorageData →
+    // txfToToken → determineTokenStatus` rewrites token status from
+    // {transactions, inclusionProof} only; the application-level
+    // `'invalid'` verdict (set by `finalizeStrandedReceivedToken` after
+    // a V6-RECOVER permanent-fail) is lost. Re-apply the persistent
+    // `v6RecoverPermanent` ledger to the freshly-loaded tokens so the
+    // verdict survives initial load AND every subsequent `sync()`
+    // (which calls back into `loadFromStorageData`). No-op when the
+    // ledger is empty.
+    this.applyV6RecoverPermanentInvalidStatus();
   }
 
   // ===========================================================================
@@ -17162,6 +17231,85 @@ export class PaymentsModule {
         `[V6-RECOVER-PERM] Restored ${restored} permanent-verdict entries from storage`,
       );
     }
+
+    // Issue #387 — re-apply the permanent verdict to any in-memory token
+    // whose status was reset to 'pending' by the TXF round-trip during
+    // `loadFromStorageData` (`determineTokenStatus` only knows the
+    // `pending`/`confirmed` shapes — the application-level `'invalid'`
+    // verdict is lost on every reload). The ledger is the authoritative
+    // source for V6-RECOVER permanent verdicts; patching the in-memory
+    // status here makes `aggregateTokens` (which already filters
+    // `'invalid'`) and every downstream status consumer correct without
+    // requiring a new format-version on the persisted TXF.
+    this.applyV6RecoverPermanentInvalidStatus();
+  }
+
+  /**
+   * Issue #387 — apply the persistent V6-RECOVER permanent-verdict ledger
+   * to in-memory tokens by setting their status to `'invalid'`.
+   *
+   * Called from:
+   *   - `restoreV6RecoverPermanent` after the ledger is hydrated on cold
+   *     start (handles the initial load where the ledger arrives after
+   *     `loadFromStorageData` already populated `this.tokens`).
+   *   - `loadFromStorageData` after every TXF reload (handles the
+   *     `sync()` path that re-parses storage with the ledger already in
+   *     memory; the TXF round-trip strips the previously-applied
+   *     `'invalid'` status because `determineTokenStatus` re-derives
+   *     from transactions/inclusionProofs only).
+   *
+   * Lookup is canonical-id-first: extracts the genesis tokenId from
+   * `sdkData` and checks the ledger. Falls back to the map key (which
+   * post-load equals the canonical tokenId; pre-load can be a
+   * crypto.randomUUID from `addToken`).
+   *
+   * Does NOT call `save()` — the next ordinary save consolidates the
+   * patched in-memory state to TXF. Avoiding save here keeps the load
+   * path O(n) and avoids re-entering the storage write pipeline.
+   *
+   * Returns the number of tokens whose status was patched (for tests).
+   */
+  private applyV6RecoverPermanentInvalidStatus(): number {
+    if (this.v6RecoverPermanent.size === 0) return 0;
+    let patched = 0;
+    for (const [mapKey, token] of this.tokens) {
+      if (token.status === 'invalid' || token.status === 'spent') continue;
+      if (!this.isV6RecoverPermanentToken(token, mapKey)) continue;
+      token.status = 'invalid';
+      token.updatedAt = Date.now();
+      this.tokens.set(mapKey, token);
+      patched += 1;
+    }
+    if (patched > 0) {
+      logger.debug(
+        'Payments',
+        `[V6-RECOVER-PERM] Patched ${patched} in-memory token(s) to status='invalid' from ledger`,
+      );
+    }
+    return patched;
+  }
+
+  /**
+   * Issue #387 — predicate: is this token's canonical (or fallback) id in
+   * the V6-RECOVER permanent-verdict ledger?
+   *
+   * Canonical-id-first: pulls the genesis tokenId from `sdkData` and
+   * checks the ledger. Falls back to `mapKey` (when available) so that a
+   * token whose `sdkData` is non-parseable (unlikely but defensible) is
+   * still classifiable when the caller knows the map key.
+   *
+   * Returns `false` cheaply when the ledger is empty — the hot
+   * `aggregateTokens` loop only pays the extraction cost when there is
+   * at least one ledgered verdict.
+   */
+  private isV6RecoverPermanentToken(token: Token, mapKey?: string): boolean {
+    if (this.v6RecoverPermanent.size === 0) return false;
+    const canonical = extractTokenIdFromSdkData(token.sdkData);
+    if (canonical && this.v6RecoverPermanent.has(canonical)) return true;
+    if (mapKey && mapKey !== canonical && this.v6RecoverPermanent.has(mapKey)) {
+      return true;
+    }
+    return false;
   }
 
   /**
