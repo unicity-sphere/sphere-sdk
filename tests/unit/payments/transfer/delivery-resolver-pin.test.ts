@@ -222,10 +222,12 @@ describe('resolveDelivery — CID branches preserve existing shouldPin: true con
   });
 
   ifAutoCid('auto-over-cap with publisher still returns CID with shouldPin: true', async () => {
+    // Issue #394 — default auto cap is RELAY_SAFE_CAP_BYTES (96 KiB).
+    // Bundle must clear that to route through the auto/CID branch.
     const { callback: publishToIpfs } = mockPublisher();
     const decision = await resolveDelivery({
       strategy: { kind: 'auto' },
-      carBytes: makeCarBytes(MAX_INLINE_CAR_BYTES + 1),
+      carBytes: makeCarBytes(RELAY_SAFE_CAP_BYTES + 1),
       publishToIpfs,
     });
     expect(decision.kind).toBe('cid');

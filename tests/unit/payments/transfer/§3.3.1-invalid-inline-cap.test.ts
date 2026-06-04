@@ -203,16 +203,21 @@ describe('§3.3.1 INVALID_INLINE_CAP — in-range caps pass through', () => {
 // =============================================================================
 
 describe('§3.3.1 INVALID_INLINE_CAP — oversized cap silently clamps (does NOT throw)', () => {
-  it('inlineCapBytes: 200000 (> 96 KiB) → silent clamp + telemetry, NO throw', async () => {
+  it('inlineCapBytes: 2 × RELAY_SAFE_CAP_BYTES → silent clamp + telemetry, NO throw', async () => {
     // The dual case to the undersized-reject branch: oversized values are
     // CLAMPED, not rejected. This contrast is the heart of W12 — without
     // this asymmetry, callers couldn't tell which behavior they're getting
     // for a given out-of-range input. The deterministic spec is:
     //   - undersized → throw INVALID_INLINE_CAP
     //   - oversized  → silent clamp to RELAY_SAFE_CAP_BYTES + telemetry
+    //
+    // Issue #394b — RELAY_SAFE_CAP_BYTES was raised from 96 KiB to
+    // 512 KiB. We express the oversized cap as 2× the constant so this
+    // test stays valid regardless of the constant's exact value.
+    const oversizedCap = RELAY_SAFE_CAP_BYTES * 2;
     let telemetryFired = 0;
     const result = await resolveDelivery({
-      strategy: { kind: 'auto', inlineCapBytes: 200_000 },
+      strategy: { kind: 'auto', inlineCapBytes: oversizedCap },
       carBytes: minimalCar,
       publishToIpfs: noopPublisher,
       emitTelemetry: () => {
@@ -220,11 +225,11 @@ describe('§3.3.1 INVALID_INLINE_CAP — oversized cap silently clamps (does NOT
       },
     });
 
-    // Decision: inline (CAR is 2 bytes, well under the clamped 96 KiB).
+    // Decision: inline (CAR is 2 bytes, well under the clamped ceiling).
     expect(result.kind).toBe('inline');
     if (result.kind === 'inline') {
       expect(result.clampInfo).toEqual({
-        originalCap: 200_000,
+        originalCap: oversizedCap,
         effectiveCap: RELAY_SAFE_CAP_BYTES,
         reason: 'above-relay-cap',
       });

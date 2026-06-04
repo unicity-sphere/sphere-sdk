@@ -42,6 +42,16 @@ import type { IpfsStorageConfig } from '../shared/ipfs';
 import { createUxfCarPublisher } from '../../modules/payments/transfer/ipfs-publisher';
 import type { PublishToIpfsCallback } from '../../modules/payments/transfer/delivery-resolver';
 import { DEFAULT_IPFS_GATEWAYS } from '../../constants';
+
+// Issue #394 — re-export the canonical UXF publisher factory + default
+// gateway list so consumers (notably sphere-cli's `buildSphereProviders`)
+// can wire `publishToIpfs` and `cidFetchGateways` without re-enabling
+// the deprecated `tokenSync.ipfs.enabled` flag (which couples publisher
+// construction with the `IpfsStorageProvider` wallet-storage path
+// Profile has replaced).
+export { createUxfCarPublisher } from '../../modules/payments/transfer/ipfs-publisher';
+export type { PublishToIpfsCallback } from '../../modules/payments/transfer/delivery-resolver';
+export { DEFAULT_IPFS_GATEWAYS } from '../../constants';
 import {
   type BaseTransportConfig,
   type BaseOracleConfig,

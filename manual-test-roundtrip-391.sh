@@ -267,11 +267,28 @@ echo "ASSERT OK (hop4-no-dup-bundle-err): bob's 98.5-UCT send passed the duplica
 # subsequent balance reconciliation when it fires. The #393 message
 # is fingerprint-stable per the throw in
 # `modules/payments/transfer/instant-sender.ts`.
+#
+# **Issue #394 strict mode.** Set `STRICT_CID_DELIVERY=1` to require
+# HOP 4 to ACTUALLY DELIVER (via CID-over-Nostr when the bundle
+# exceeds the inline cap). When the SDK has `AUTOMATED_CID_DELIVERY_ENABLED = true`
+# AND the CLI's `buildSphereProviders` wires `publishToIpfs`
+# (sphere-cli issue #394), this assertion holds. The two states the
+# soak covers:
+#   - `STRICT_CID_DELIVERY` unset (default): post-#393 soft-pass —
+#     INLINE_CAR_TOO_LARGE is acceptable; balance reconciliation is
+#     skipped; soak still exits 0 because the #391 invariant held.
+#   - `STRICT_CID_DELIVERY=1`: post-#394 hard requirement —
+#     INLINE_CAR_TOO_LARGE means the publisher wiring is broken or
+#     the kill-switch is off; fail the soak.
 hop4_delivered=1
 if grep -qE 'INLINE_CAR_TOO_LARGE|automated CID delivery is currently disabled' \
     "$SNAP/hop4-bob-send.log"; then
   hop4_delivered=0
-  echo "ASSERT INFO (hop4-cid-disabled): bundle exceeded inline cap AND automated CID delivery is OFF (#393); HOP 4 did not deliver. The #391 invariant is still verified by the assertion above. Skipping balance reconciliation."
+  if [[ "${STRICT_CID_DELIVERY:-0}" == "1" ]]; then
+    echo "ASSERT FAIL (hop4-cid-must-deliver): STRICT_CID_DELIVERY=1 set, but HOP 4 threw INLINE_CAR_TOO_LARGE — kill-switch off OR CLI publisher not wired (sphere-cli #394 + sphere-sdk #394)." >&2
+    exit 1
+  fi
+  echo "ASSERT INFO (hop4-cid-disabled): bundle exceeded inline cap AND automated CID delivery is OFF (#393); HOP 4 did not deliver. The #391 invariant is still verified by the assertion above. Skipping balance reconciliation. (Pass STRICT_CID_DELIVERY=1 to fail-fast on this outcome.)"
 fi
 
 if (( hop4_delivered == 1 )); then
@@ -321,7 +338,7 @@ else
 
   # Net deltas. Use signed arithmetic; bash supports negatives in $((...)).
   alice_net_delta=$(( alice_4 - alice_0 ))
-  bob_net_delta=$(  ( bob_4   - bob_0   ) )
+  bob_net_delta=$(( bob_4 - bob_0 ))
   expected_alice=-50000000
   expected_bob=50000000
 

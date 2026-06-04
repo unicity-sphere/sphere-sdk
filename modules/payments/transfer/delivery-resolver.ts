@@ -538,9 +538,21 @@ function resolveAutoCap(
   emitTelemetry: EmitTelemetryCallback | undefined,
 ): ClampInfo {
   if (inlineCapBytes === undefined) {
+    // Issue #394 — default cap is RELAY_SAFE_CAP_BYTES (96 KiB, the Nostr
+    // relay event-size ceiling). Previously the default was
+    // MAX_INLINE_CAR_BYTES (16 KiB), which promoted bundles to CID
+    // delivery at a quarter of the actual relay budget — over-eager and
+    // costly when the bundle would have fit inline fine. The new default
+    // makes auto-promotion trip NEAR the relay cap, so CID delivery is
+    // reserved for bundles that genuinely cannot ship inline (typically
+    // multi-hop chains with chained-transfer histories).
+    //
+    // MAX_INLINE_CAR_BYTES (16 KiB) is preserved as a documented soft
+    // hint for callers that explicitly want a smaller cap — pass it via
+    // `inlineCapBytes` and it'll be honored.
     return {
-      originalCap: MAX_INLINE_CAR_BYTES,
-      effectiveCap: MAX_INLINE_CAR_BYTES,
+      originalCap: RELAY_SAFE_CAP_BYTES,
+      effectiveCap: RELAY_SAFE_CAP_BYTES,
       reason: 'default',
     };
   }

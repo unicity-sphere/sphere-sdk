@@ -42,68 +42,81 @@ import { CID } from 'multiformats';
 // =============================================================================
 
 /**
- * Default inline-CAR cap when `delivery: { kind: 'auto' }`. Below this, the
- * sender embeds the CAR bytes inside the Nostr event. Spec default: 16 KiB
- * (§3.3.1). Per-call overrides are clamped to {@link RELAY_SAFE_CAP_BYTES}.
+ * Documented soft hint for callers that explicitly want a smaller inline
+ * cap via `delivery: { kind: 'auto', inlineCapBytes: <n> }`.
+ *
+ * **History.** Was originally the default cap for `auto` mode (16 KiB,
+ * §3.3.1). Issue #394 raised the default to {@link RELAY_SAFE_CAP_BYTES}
+ * because the 16 KiB threshold was a quarter of what the relay can
+ * actually handle, causing unnecessary CID promotion. The constant is
+ * preserved because callers may still want a conservative inline cap
+ * for bandwidth-sensitive paths; pass it via `inlineCapBytes`.
  */
 export const MAX_INLINE_CAR_BYTES = 16 * 1024;
 
 /**
- * Hard ceiling for inline CAR delivery, regardless of caller override. The
- * SDK silently clamps `inlineCapBytes` to this value when the caller passes
- * a larger number — `auto` mode never publishes inline above the relay-safe
- * ceiling. (§3.3.1, normative.)
+ * Hard ceiling for inline CAR delivery, regardless of caller override.
+ *
+ * **Issue #394b — raised from 96 KiB to 512 KiB (this constant).** The
+ * Nostr relays in use today can comfortably carry events up to roughly
+ * 1 MiB per the relay operators' confirmation; 512 KiB is the
+ * half-of-1-MiB safety budget. The previous 96 KiB was conservative for
+ * older relay implementations and produced unnecessary CID-promotion
+ * pressure on multi-hop bundles — typical 3-token chains land around
+ * 100-150 KiB, well inside the new envelope.
+ *
+ * The SDK silently clamps caller-supplied `inlineCapBytes` to this value
+ * when the caller passes a larger number — `auto` mode never publishes
+ * inline above the relay-safe ceiling. Bundles beyond this ceiling MUST
+ * route through CID-over-Nostr (`uxf-cid`).
  */
-export const RELAY_SAFE_CAP_BYTES = 96 * 1024;
+export const RELAY_SAFE_CAP_BYTES = 512 * 1024;
 
 /**
- * Master kill-switch for automated CID delivery (issue #393, sphere-sdk).
+ * Master kill-switch for automated CID delivery (issues #393/#394, sphere-sdk).
  *
- * **What this controls.** When `false` (current default), `delivery:
- * { kind: 'auto' }` NEVER promotes a bundle to CID-over-Nostr — even if
- * `carBytes.byteLength > inlineCapBytes`. The resolver and the dispatcher
- * pre-flights treat `auto` as "force inline up to {@link RELAY_SAFE_CAP_BYTES},
- * throw INLINE_CAR_TOO_LARGE beyond that." `{kind: 'force-cid'}` still
- * works — it is the only way to request CID delivery while this flag is
- * off.
+ * **What this controls.** When `true` (the current default, post-#394),
+ * `delivery: { kind: 'auto' }` promotes bundles to CID-over-Nostr when
+ * `carBytes.byteLength > inlineCapBytes` (default cap:
+ * {@link RELAY_SAFE_CAP_BYTES}, 96 KiB — the Nostr relay event-size
+ * ceiling). When `false`, `auto` mode NEVER promotes — it stays inline
+ * up to RELAY_SAFE_CAP_BYTES and throws `INLINE_CAR_TOO_LARGE` past
+ * that, requiring callers to explicitly use `{kind: 'force-cid'}`.
  *
- * **Why this is currently disabled.**
- *  1. The CLI's `createNodeProviders` factory does not wire a
- *     `publishToIpfs` callback by default. Bundles that overflow the
- *     inline cap (easily reached after a few whole-token transfers, each
- *     of which drags its transaction history along) trip
- *     `IPFS_PUBLISHER_REQUIRED` at the resolver and break user-facing
- *     sends.
- *  2. The auto-fallback layer (auto-over-cap + no publisher →
- *     `carInlineFallback` silently downgrades back to inline) is a
- *     non-trivial branch that has never been exercised end-to-end on
- *     the CLI surface. The complexity surface is not justified by the
- *     coverage we have today.
- *  3. Soak coverage for the size-promotion path is missing. Until we
- *     have a soak that exercises auto-promotion through a wired
- *     publisher across a multi-hop chain, every change in this area
- *     ships with no real safety net.
+ * **History.**
  *
- * **How to re-enable.** Flip this constant to `true`. The auto-promotion
- * code paths in {@link resolveDelivery} (`'auto'` case) and in the
- * dispatcher pre-flights (`instant-sender.ts`, `conservative-sender.ts`)
- * are still in place; they're gated on this constant. Re-enabling
- * requires:
- *  - The CLI's provider factories wire `publishToIpfs` by default
- *    (see `impl/nodejs/index.ts` / `createNodeProviders`).
- *  - A soak script that exercises auto-promotion with a wired publisher
- *    end-to-end (multi-hop chain, large bundle, verify the CID-over-Nostr
- *    delivery actually reaches the receiver and is retrievable).
- *  - The dispatcher pre-flights and the resolver's `auto` branch are
- *    re-exercised by their existing unit tests (the gated paths stay
- *    in place — flipping this constant flips them back on).
+ * Issue #393 introduced the kill-switch with default OFF because the
+ * sphere-cli's `buildSphereProviders` did not wire a `publishToIpfs`
+ * callback. Sends that overflowed the inline cap (easily reached after
+ * a few whole-token transfers with their chained inclusion-proof
+ * histories) tripped `IPFS_PUBLISHER_REQUIRED` and broke user flows.
  *
- * **Tests.** Unit tests under `tests/unit/payments/transfer/delivery-resolver.test.ts`
- * that exercise the auto-promotion path are conditionally skipped via
- * `it.skipIf(!AUTOMATED_CID_DELIVERY_ENABLED)`. They snap back into
- * service automatically when the constant flips.
+ * Issue #394 closed those prerequisites:
+ *  - sphere-cli's `buildSphereProviders` now wires both
+ *    `publishToIpfs` (via the canonical `createUxfCarPublisher`
+ *    exported from `@unicitylabs/sphere-sdk/impl/nodejs`) and
+ *    `cidFetchGateways` for the recipient pipeline.
+ *  - The auto-promotion threshold was raised from
+ *    `MAX_INLINE_CAR_BYTES` (16 KiB) to `RELAY_SAFE_CAP_BYTES`
+ *    (96 KiB), so promotion trips near the Nostr cap rather than at a
+ *    quarter of it.
+ *  - A dedicated soak (`manual-test-cid-delivery-394.sh`) drives the
+ *    multi-hop chain that produces a > 96 KiB bundle and confirms
+ *    the CID-over-Nostr round-trip works end-to-end.
+ *
+ * **If you need to disable this again.** Set the constant to `false`
+ * and the legacy "force-cid-only" behaviour returns. The gated paths
+ * stay in place; flipping the flag flips them back on. The 12+1 unit
+ * + integration tests under `tests/unit/payments/transfer/*.test.ts`
+ * use the `it.skipIf(!AUTOMATED_CID_DELIVERY_ENABLED)` pattern to
+ * adapt automatically.
+ *
+ * **Tests.** Unit tests that exercise the auto-promotion path were
+ * gated off during the #393 disable window and re-arm automatically
+ * here. They run under both flag states (ON: assert promotion path;
+ * OFF: assert inline-only).
  */
-export const AUTOMATED_CID_DELIVERY_ENABLED = false;
+export const AUTOMATED_CID_DELIVERY_ENABLED = true;
 
 /**
  * Maximum CAR size the recipient will fetch via `kind: 'uxf-cid'`. Streaming

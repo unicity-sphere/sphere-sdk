@@ -943,18 +943,23 @@ export async function sendInstantUxf(
     // Step 8: resolve delivery (T.2.C).
     // -----------------------------------------------------------------
     const strategy: DeliveryStrategy = request.delivery ?? { kind: 'auto' };
-    // Issue #393 — `wantsCidBranch` mirrors the CID-vs-inline decision
+    // Issue #394 — `wantsCidBranch` mirrors the CID-vs-inline decision
     // that `resolveDelivery` will make. The predicate is gated on the
     // kill-switch {@link AUTOMATED_CID_DELIVERY_ENABLED} (see
-    // `limits.ts`): when the flag is OFF (current default), `auto`
-    // mode never promotes to CID, so the only path that wants CID is
-    // the explicit `force-cid`. When the flag flips back ON, the
-    // legacy bundle-size predicate is restored.
+    // `limits.ts`):
+    //  - When OFF: only `force-cid` requests CID.
+    //  - When ON (the post-#394 default): `force-cid` OR `auto` with a
+    //    bundle exceeding the cap. The cap defaults to
+    //    {@link RELAY_SAFE_CAP_BYTES} (96 KiB — the Nostr relay event
+    //    ceiling) rather than the smaller {@link MAX_INLINE_CAR_BYTES}
+    //    (16 KiB) used pre-#394, so promotion to CID trips NEAR the
+    //    relay cap instead of at a quarter of it. Callers that want a
+    //    smaller cap can still pass `inlineCapBytes` explicitly.
     const wantsCidBranch = AUTOMATED_CID_DELIVERY_ENABLED
       ? strategy.kind === 'force-cid' ||
         (strategy.kind === 'auto' &&
           carBytes.byteLength >
-            (strategy.inlineCapBytes ?? MAX_INLINE_CAR_BYTES))
+            (strategy.inlineCapBytes ?? RELAY_SAFE_CAP_BYTES))
       : strategy.kind === 'force-cid';
     if (wantsCidBranch && deps.publishToIpfs === undefined) {
       // Pre-flight reject: bundle needs CID delivery, no publisher is

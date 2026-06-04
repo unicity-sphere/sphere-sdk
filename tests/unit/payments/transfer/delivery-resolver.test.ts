@@ -99,12 +99,18 @@ function mockTelemetry(): {
 }
 
 // =============================================================================
-// 2. `auto` mode — default cap (16 KiB)
+// 2. `auto` mode — default cap (RELAY_SAFE_CAP_BYTES = 96 KiB, post-#394)
 // =============================================================================
 
 describe('resolveDelivery — auto mode, default cap', () => {
-  it('returns inline for a CAR ≤ 16 KiB', async () => {
-    const carBytes = makeCarBytes(MAX_INLINE_CAR_BYTES);
+  it('returns inline for a CAR ≤ RELAY_SAFE_CAP_BYTES', async () => {
+    // Issue #394 — default cap was raised from MAX_INLINE_CAR_BYTES
+    // (16 KiB) to RELAY_SAFE_CAP_BYTES so auto-promotion to
+    // CID trips near the Nostr relay event ceiling, not at a quarter
+    // of it. A CAR that's slightly larger than the OLD 16 KiB default
+    // (e.g. 16 KiB + 1) now stays inline because it's still well under
+    // the relay cap.
+    const carBytes = makeCarBytes(MAX_INLINE_CAR_BYTES + 1);
     const { fn: publishFn, callback: publishToIpfs } = mockPublisher();
     const decision = await resolveDelivery({
       strategy: { kind: 'auto' },
@@ -116,8 +122,8 @@ describe('resolveDelivery — auto mode, default cap', () => {
     if (decision.kind === 'inline') {
       expect(decision.carBase64).toBe(carBytesToBase64(carBytes));
       expect(decision.clampInfo).toEqual({
-        originalCap: MAX_INLINE_CAR_BYTES,
-        effectiveCap: MAX_INLINE_CAR_BYTES,
+        originalCap: RELAY_SAFE_CAP_BYTES,
+        effectiveCap: RELAY_SAFE_CAP_BYTES,
         reason: 'default',
       });
     }
@@ -125,8 +131,8 @@ describe('resolveDelivery — auto mode, default cap', () => {
     expect(publishFn).not.toHaveBeenCalled();
   });
 
-  ifAutoCid('returns CID for a CAR > 16 KiB', async () => {
-    const carBytes = makeCarBytes(MAX_INLINE_CAR_BYTES + 1);
+  ifAutoCid('returns CID for a CAR > RELAY_SAFE_CAP_BYTES (post-#394b: 512 KiB)', async () => {
+    const carBytes = makeCarBytes(RELAY_SAFE_CAP_BYTES + 1);
     const { fn: publishFn, callback: publishToIpfs } = mockPublisher('bafyhugecid');
     const decision = await resolveDelivery({
       strategy: { kind: 'auto' },
@@ -143,9 +149,9 @@ describe('resolveDelivery — auto mode, default cap', () => {
     expect(publishFn).toHaveBeenCalledWith(carBytes);
   });
 
-  it('returns inline at the exact 16 KiB boundary', async () => {
+  it('returns inline at the exact RELAY_SAFE_CAP_BYTES boundary', async () => {
     // Boundary check: ≤ is inline, > is CID.
-    const carBytes = makeCarBytes(MAX_INLINE_CAR_BYTES);
+    const carBytes = makeCarBytes(RELAY_SAFE_CAP_BYTES);
     const { callback: publishToIpfs } = mockPublisher();
     const decision = await resolveDelivery({
       strategy: { kind: 'auto' },
@@ -210,19 +216,25 @@ describe('resolveDelivery — auto mode, custom in-range cap', () => {
 });
 
 // =============================================================================
-// 4. `auto` mode — cap > 96 KiB (silent clamp + telemetry)
+// 4. `auto` mode — cap > RELAY_SAFE_CAP_BYTES (silent clamp + telemetry)
 // =============================================================================
 
-describe('resolveDelivery — auto mode, cap > 96 KiB clamps silently', () => {
-  it('clamps a 200 KiB cap down to 96 KiB and emits telemetry', async () => {
-    // Bundle is 64 KiB — fits under the clamped 96 KiB ceiling, so the
-    // decision is inline despite the original cap being unreasonably large.
+describe('resolveDelivery — auto mode, cap above RELAY_SAFE_CAP_BYTES clamps silently', () => {
+  // Issue #394b — RELAY_SAFE_CAP_BYTES was raised from 96 KiB to 512 KiB.
+  // Caller caps above the new ceiling get silently clamped. We use
+  // `RELAY_SAFE_CAP_BYTES * 2` (a 1 MiB cap that gets clamped to 512 KiB)
+  // and `RELAY_SAFE_CAP_BYTES + 1` (slightly over the ceiling) to drive
+  // the clamp branches regardless of the constant's exact numeric value.
+
+  it('clamps an oversized cap down to RELAY_SAFE_CAP_BYTES and emits telemetry', async () => {
+    // Bundle is small enough to fit inline under the clamped ceiling.
     const carBytes = makeCarBytes(64 * 1024);
     const { events, callback: emitTelemetry } = mockTelemetry();
     const { fn: publishFn, callback: publishToIpfs } = mockPublisher();
 
+    const oversizedCap = RELAY_SAFE_CAP_BYTES * 2;
     const decision = await resolveDelivery({
-      strategy: { kind: 'auto', inlineCapBytes: 200 * 1024 },
+      strategy: { kind: 'auto', inlineCapBytes: oversizedCap },
       carBytes,
       publishToIpfs,
       emitTelemetry,
@@ -231,7 +243,7 @@ describe('resolveDelivery — auto mode, cap > 96 KiB clamps silently', () => {
     expect(decision.kind).toBe('inline');
     if (decision.kind === 'inline') {
       expect(decision.clampInfo).toEqual({
-        originalCap: 200 * 1024,
+        originalCap: oversizedCap,
         effectiveCap: RELAY_SAFE_CAP_BYTES,
         reason: 'above-relay-cap',
       });
@@ -242,20 +254,20 @@ describe('resolveDelivery — auto mode, cap > 96 KiB clamps silently', () => {
     expect(events[0]).toEqual<ClampTelemetry>({
       type: 'inline-cap-clamped',
       clampInfo: {
-        originalCap: 200 * 1024,
+        originalCap: oversizedCap,
         effectiveCap: RELAY_SAFE_CAP_BYTES,
         reason: 'above-relay-cap',
       },
     });
   });
 
-  ifAutoCid('clamps and routes to CID when CAR exceeds the clamped 96 KiB ceiling', async () => {
+  ifAutoCid('clamps and routes to CID when CAR exceeds the clamped ceiling', async () => {
     const carBytes = makeCarBytes(RELAY_SAFE_CAP_BYTES + 1);
     const { events, callback: emitTelemetry } = mockTelemetry();
     const { fn: publishFn, callback: publishToIpfs } = mockPublisher('bafyclamped');
 
     const decision = await resolveDelivery({
-      strategy: { kind: 'auto', inlineCapBytes: 1024 * 1024 }, // 1 MiB → clamped to 96 KiB
+      strategy: { kind: 'auto', inlineCapBytes: RELAY_SAFE_CAP_BYTES * 2 },
       carBytes,
       publishToIpfs,
       emitTelemetry,
@@ -274,9 +286,10 @@ describe('resolveDelivery — auto mode, cap > 96 KiB clamps silently', () => {
   it('omitting emitTelemetry callback is non-fatal even when clamp fires', async () => {
     const carBytes = makeCarBytes(50);
     const { callback: publishToIpfs } = mockPublisher();
-    // No `emitTelemetry` field — clamp still happens silently.
+    // No `emitTelemetry` field — clamp still happens silently. Cap must
+    // exceed RELAY_SAFE_CAP_BYTES to trigger the clamp.
     const decision = await resolveDelivery({
-      strategy: { kind: 'auto', inlineCapBytes: 200 * 1024 },
+      strategy: { kind: 'auto', inlineCapBytes: RELAY_SAFE_CAP_BYTES * 2 },
       carBytes,
       publishToIpfs,
     });
@@ -292,7 +305,7 @@ describe('resolveDelivery — auto mode, cap > 96 KiB clamps silently', () => {
 // =============================================================================
 
 describe('resolveDelivery — force-inline mode', () => {
-  it('returns inline for a CAR within the 96 KiB ceiling', async () => {
+  it('returns inline for a CAR within the RELAY_SAFE_CAP_BYTES ceiling', async () => {
     const carBytes = makeCarBytes(50 * 1024);
     const { fn: publishFn, callback: publishToIpfs } = mockPublisher();
     const decision = await resolveDelivery({
@@ -309,7 +322,7 @@ describe('resolveDelivery — force-inline mode', () => {
     expect(publishFn).not.toHaveBeenCalled();
   });
 
-  it('returns inline at the exact 96 KiB boundary', async () => {
+  it('returns inline at the exact RELAY_SAFE_CAP_BYTES boundary', async () => {
     const carBytes = makeCarBytes(RELAY_SAFE_CAP_BYTES);
     const { callback: publishToIpfs } = mockPublisher();
     const decision = await resolveDelivery({
@@ -320,7 +333,7 @@ describe('resolveDelivery — force-inline mode', () => {
     expect(decision.kind).toBe('inline');
   });
 
-  it('throws INLINE_CAR_TOO_LARGE for a CAR > 96 KiB', async () => {
+  it('throws INLINE_CAR_TOO_LARGE for a CAR > RELAY_SAFE_CAP_BYTES (boundary +1)', async () => {
     const carBytes = makeCarBytes(RELAY_SAFE_CAP_BYTES + 1);
     const { callback: publishToIpfs } = mockPublisher();
     await expect(
@@ -335,8 +348,11 @@ describe('resolveDelivery — force-inline mode', () => {
     });
   });
 
-  it('throws INLINE_CAR_TOO_LARGE for a CAR substantially over the ceiling (100 KiB)', async () => {
-    const carBytes = makeCarBytes(100 * 1024);
+  it('throws INLINE_CAR_TOO_LARGE for a CAR substantially over the ceiling (2x cap)', async () => {
+    // Use a multiple of RELAY_SAFE_CAP_BYTES so this test stays valid
+    // regardless of the constant's exact numeric value (issue #394b
+    // raised it from 96 KiB to 512 KiB).
+    const carBytes = makeCarBytes(RELAY_SAFE_CAP_BYTES * 2);
     const { callback: publishToIpfs } = mockPublisher();
     await expect(
       resolveDelivery({
@@ -440,7 +456,9 @@ describe('resolveDelivery — force-cid mode', () => {
 
 describe('resolveDelivery — IPFS failure propagation', () => {
   ifAutoCid('propagates publishToIpfs rejection from auto/CID branch', async () => {
-    const carBytes = makeCarBytes(MAX_INLINE_CAR_BYTES + 1); // routes to CID
+    // Bundle must exceed the new default cap (RELAY_SAFE_CAP_BYTES,
+    // 96 KiB post-#394) to route through the auto/CID branch.
+    const carBytes = makeCarBytes(RELAY_SAFE_CAP_BYTES + 1);
     const error = new Error('pin failed');
     const publishToIpfs: PublishToIpfsCallback = async () => {
       throw error;
@@ -461,7 +479,7 @@ describe('resolveDelivery — IPFS failure propagation', () => {
 
 describe('resolveDelivery — CAR-inline fallback when publishToIpfs absent', () => {
   it('auto + no publisher + small bundle → falls back to inline (uxf-car)', async () => {
-    // Bundle > 16 KiB (CID branch) but <= RELAY_SAFE_CAP_BYTES (96 KiB).
+    // Bundle > 16 KiB (CID branch) but <= RELAY_SAFE_CAP_BYTES.
     // Without a publisher the resolver must fall back to inline delivery.
     const carBytes = makeCarBytes(MAX_INLINE_CAR_BYTES + 1);
     const decision = await resolveDelivery({

@@ -866,18 +866,15 @@ export async function sendConservativeUxf(
     // payload; CID → publishToIpfs invoked here.
     // -----------------------------------------------------------------
     const strategy: DeliveryStrategy = request.delivery ?? { kind: 'auto' };
-    // Issue #393 — `wantsCidBranch` mirrors the CID-vs-inline decision
-    // that `resolveDelivery` will make. The predicate is gated on the
-    // kill-switch {@link AUTOMATED_CID_DELIVERY_ENABLED} (see
-    // `limits.ts`): when the flag is OFF (current default), `auto`
-    // mode never promotes to CID, so the only path that wants CID is
-    // the explicit `force-cid`. When the flag flips back ON, the
-    // legacy bundle-size predicate is restored.
+    // Issue #394 — see instant-sender.ts for the full doc. Default cap
+    // is RELAY_SAFE_CAP_BYTES (96 KiB, Nostr cap), not the pre-#394
+    // MAX_INLINE_CAR_BYTES (16 KiB) — promotion trips near the relay
+    // ceiling so CID delivery is reserved for bundles that truly need it.
     const wantsCidBranch = AUTOMATED_CID_DELIVERY_ENABLED
       ? strategy.kind === 'force-cid' ||
         (strategy.kind === 'auto' &&
           carBytes.byteLength >
-            (strategy.inlineCapBytes ?? MAX_INLINE_CAR_BYTES))
+            (strategy.inlineCapBytes ?? RELAY_SAFE_CAP_BYTES))
       : strategy.kind === 'force-cid';
     if (wantsCidBranch && deps.publishToIpfs === undefined) {
       // Pre-flight reject: bundle needs CID delivery and no publisher

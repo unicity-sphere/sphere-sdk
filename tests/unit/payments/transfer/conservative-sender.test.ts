@@ -494,11 +494,11 @@ describe('sendConservativeUxf — auto-route to CID for oversized bundles', () =
 
 describe('sendConservativeUxf — force-inline relay-safe ceiling', () => {
   it('throws INLINE_CAR_TOO_LARGE when force-inline + oversize CAR', async () => {
-    // Build a synthetic large multi-token bundle to exceed the 96 KiB
+    // Build a synthetic large multi-token bundle to exceed
     // RELAY_SAFE_CAP_BYTES. Each TOKEN_A occupies ~0.9 KiB after CAR
-    // encoding; 120 distinct copies (~110 KiB) cleanly exceeds the
-    // 96 KiB ceiling.
-    const N = 120;
+    // encoding; 640 distinct copies (~576 KiB) cleanly exceeds the
+    // post-#394b 512 KiB ceiling (was 96 KiB pre-#394b).
+    const N = 640;
     const sources = Array.from({ length: N }, (_, i) => makeToken(`tok-${i}`, TOKEN_A));
     const commitResults = sources.map((s, i) =>
       makeCommitResult({
@@ -580,9 +580,9 @@ describe('sendConservativeUxf — CAR-inline fallback when publishToIpfs absent'
   });
 
   ifAutoCid('auto + no publisher + oversized bundle → throws IPFS_PUBLISHER_REQUIRED', async () => {
-    // Build a bundle exceeding RELAY_SAFE_CAP_BYTES (96 KiB).
-    // Each TOKEN_A fixture is ~0.9 KiB; 120 tokens ≈ 110 KiB.
-    const N = 120;
+    // Build a bundle exceeding RELAY_SAFE_CAP_BYTES (512 KiB post-#394b).
+    // Each TOKEN_A fixture is ~0.9 KiB; 640 tokens ≈ 576 KiB.
+    const N = 640;
     const sources = Array.from({ length: N }, (_, i) => makeToken(`tok-${i}`, TOKEN_A));
     const commitResults = sources.map((s, i) =>
       makeCommitResult({
@@ -602,8 +602,8 @@ describe('sendConservativeUxf — CAR-inline fallback when publishToIpfs absent'
     try {
       await sendConservativeUxf(
         // Loop1-S6 — request budget must cover the summed shipped
-        // amount across all 120 sources (each ships 1_000_000 UCT)
-        // so the new OVER_TRANSFER_GUARD doesn't trip first. The
+        // amount across all sources (each ships 1_000_000 UCT) so
+        // the new OVER_TRANSFER_GUARD doesn't trip first. The
         // test's purpose is to assert the IPFS_PUBLISHER_REQUIRED
         // pre-flight; we set the request amount to the total
         // shipped to keep the guard a no-op for this scenario.
