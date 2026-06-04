@@ -55,6 +55,7 @@ import type {
   InstantSplitBundlePayload,
   InstantSplitBundleHandler,
   IncomingInstantSplitBundle,
+  SendMessageOptions,
 } from './transport-provider';
 import type { WebSocketFactory, UUIDGenerator } from './websocket';
 import { defaultUUIDGenerator } from './websocket';
@@ -1427,11 +1428,23 @@ export class MultiAddressTransportMux {
 
   /**
    * Create and publish a NIP-17 gift wrap message for a specific address.
+   *
+   * @param options - Optional publish-behavior flags:
+   *   - `extendedDurability` (issue #397): when true, hold the gift wrap
+   *     event on the relay across an extended window via repeated
+   *     verify+republish at escalating checkpoints. See
+   *     {@link NostrTransportProvider}'s sister method
+   *     `publishWithExtendedDurability` for the schedule + budget.
+   *     Throws `TRANSPORT_ERROR` if the republish budget is exhausted.
+   *
+   * Default (no options): single publish, no verification. Matches
+   * the pre-#397 behavior so existing callers do not regress.
    */
   async sendGiftWrap(
     addressIndex: number,
     recipientPubkey: string,
-    content: string
+    content: string,
+    options?: { extendedDurability?: boolean }
   ): Promise<string> {
     const entry = this.addresses.get(addressIndex);
     if (!entry) throw new SphereError('Address not registered in mux', 'NOT_INITIALIZED');
@@ -1445,9 +1458,20 @@ export class MultiAddressTransportMux {
 
     const giftWrap = NIP17.createGiftWrap(entry.keyManager, nostrRecipient, content);
     const giftWrapEvent = NostrEventClass.fromJSON(giftWrap);
-    await this.nostrClient.publishEvent(giftWrapEvent);
 
-    // Self-wrap for relay replay
+    if (options?.extendedDurability) {
+      // Issue #397 — keep the gift wrap live on the relay across an
+      // extended window so a short-lived recipient CLI process that
+      // subscribes anywhere inside the window observes the event.
+      // Pass the raw signed object — the helper rehydrates a fresh
+      // SDK Event class per publish to avoid `pendingOks` reuse.
+      await this._publishWithExtendedDurability(giftWrap, giftWrap.id, 'dm');
+    } else {
+      await this.nostrClient.publishEvent(giftWrapEvent);
+    }
+
+    // Self-wrap for relay replay (fire-and-forget; losing the self-wrap
+    // only affects local conversation-history replay, not delivery).
     const selfPubkey = entry.keyManager.getPublicKeyHex();
     const senderNametag = entry.identity.nametag;
     const selfWrapContent = JSON.stringify({
@@ -1465,6 +1489,133 @@ export class MultiAddressTransportMux {
 
     return giftWrap.id;
   }
+
+  /**
+   * Issue #397 — Mux equivalent of
+   * {@link NostrTransportProvider}.publishWithExtendedDurability. Same
+   * schedule + budget. Uses the Mux's own `_queryEventById` for the
+   * verification cycles so the relay round-trip semantics match the
+   * adjacent `createAndPublishEncryptedEvent` flow.
+   *
+   * @param event   - The pre-signed gift wrap event to publish.
+   * @param eventId - The id of `event` (cached so we don't re-extract).
+   * @param label   - Human label for log/error messages (`'dm'` etc.).
+   */
+  private async _publishWithExtendedDurability(
+    rawEvent: NostrEvent,
+    eventId: string,
+    label: string,
+  ): Promise<void> {
+    if (!this.nostrClient) throw new SphereError('Not connected', 'NOT_INITIALIZED');
+
+    // 1. Initial publish + immediate verification (~300-1500 ms after
+    //    publish). Mirrors the inner verify loop of
+    //    `createAndPublishEncryptedEvent` so behavior is consistent
+    //    across publish paths.
+    await this._publishVerified(rawEvent, eventId, label);
+
+    const checkpointsMs = MultiAddressTransportMux.EXTENDED_DURABILITY_CHECKPOINTS_MS;
+    const maxRepublishes = MultiAddressTransportMux.EXTENDED_DURABILITY_MAX_REPUBLISHES;
+    let republishes = 0;
+    let elapsedMs = 1500;
+
+    for (const checkpointMs of checkpointsMs) {
+      if (checkpointMs <= elapsedMs) continue;
+      await new Promise(r => setTimeout(r, checkpointMs - elapsedMs));
+      elapsedMs = checkpointMs;
+
+      let stillThere: boolean;
+      try {
+        stillThere = await this._queryEventById(eventId);
+      } catch {
+        logger.debug('Mux', `${label} extended-durability verify query failed at ${checkpointMs}ms — treating optimistically`);
+        continue;
+      }
+      if (stillThere) continue;
+
+      if (republishes >= maxRepublishes) {
+        throw new SphereError(
+          `${label} event ${eventId.slice(0, 12)} non-durable at ${checkpointMs}ms after ${republishes} republish attempts — relay retention shorter than delivery window`,
+          'TRANSPORT_ERROR',
+        );
+      }
+
+      logger.warn(
+        'Mux',
+        `[EXTENDED-DURABILITY] ${label} event ${eventId.slice(0, 12)} missing from relay at ${checkpointMs}ms; republishing (attempt ${republishes + 1}/${maxRepublishes})`,
+      );
+      await this._publishVerified(rawEvent, eventId, label);
+      republishes++;
+    }
+  }
+
+  /**
+   * Mux's equivalent of `NostrTransportProvider.publishWithVerification`.
+   * Publishes the event, waits for relay indexing, then queries by id;
+   * retries up to `maxAttempts` times if not observed. Throws
+   * `TRANSPORT_ERROR` if exhausted.
+   *
+   * Pulled into a helper so both `_publishWithExtendedDurability` and
+   * a future hardening of `sendGiftWrap`'s default path share the same
+   * verified-publish semantics.
+   */
+  private async _publishVerified(
+    rawEvent: NostrEvent,
+    eventId: string,
+    label: string,
+    maxAttempts = 3,
+  ): Promise<void> {
+    if (!this.nostrClient) throw new SphereError('Not connected', 'NOT_INITIALIZED');
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        // Re-create the SDK Event class per attempt — mirrors
+        // `NostrTransportProvider.publishEvent`'s defense against
+        // pendingOks-map reuse leaks across retries.
+        const sdkEvent = NostrEventClass.fromJSON(rawEvent);
+        await this.nostrClient.publishEvent(sdkEvent);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes('Event rejected') && !msg.includes('rate') && !msg.includes('limit')) {
+          throw err;
+        }
+        if (attempt === maxAttempts) throw err;
+        logger.debug('Mux', `${label} publish attempt ${attempt} failed (${msg}), retrying...`);
+        await new Promise(r => setTimeout(r, 1000 * attempt));
+        continue;
+      }
+
+      await new Promise(r => setTimeout(r, 300 + Math.random() * 1200));
+      try {
+        if (await this._queryEventById(eventId)) {
+          if (attempt > 1) {
+            logger.debug('Mux', `${label} verified on relay after ${attempt} attempt(s)`);
+          }
+          return;
+        }
+      } catch {
+        if (attempt === maxAttempts) {
+          logger.debug('Mux', `${label} verification query failed — accepting as best-effort`);
+          return;
+        }
+      }
+
+      if (attempt < maxAttempts) {
+        const delay = Math.min(2000 * attempt, 10000);
+        logger.debug('Mux', `${label} not found on relay, retrying in ${delay}ms (attempt ${attempt}/${maxAttempts})...`);
+        await new Promise(r => setTimeout(r, delay));
+      } else {
+        throw new SphereError(
+          `${label} not verified on relay after ${maxAttempts} attempts — delivery failed`,
+          'TRANSPORT_ERROR',
+        );
+      }
+    }
+  }
+
+  private static readonly EXTENDED_DURABILITY_CHECKPOINTS_MS: ReadonlyArray<number> =
+    [3000, 8000, 18000, 30000];
+  private static readonly EXTENDED_DURABILITY_MAX_REPUBLISHES = 3;
 
   /**
    * Send a NIP-17 read receipt (kind 15) for a specific address.
@@ -1859,13 +2010,22 @@ export class AddressTransportAdapter implements TransportProvider {
   // Sending — delegates to mux with this address's keyManager
   // ===========================================================================
 
-  async sendMessage(recipientPubkey: string, content: string): Promise<string> {
+  async sendMessage(
+    recipientPubkey: string,
+    content: string,
+    options?: SendMessageOptions,
+  ): Promise<string> {
     const senderNametag = this.identity.nametag;
     const wrappedContent = senderNametag
       ? JSON.stringify({ senderNametag, text: content })
       : content;
 
-    return this.mux.sendGiftWrap(this.addressIndex, recipientPubkey, wrappedContent);
+    return this.mux.sendGiftWrap(
+      this.addressIndex,
+      recipientPubkey,
+      wrappedContent,
+      options,
+    );
   }
 
   async sendTokenTransfer(recipientPubkey: string, payload: TokenTransferPayload): Promise<string> {

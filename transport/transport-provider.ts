@@ -23,9 +23,16 @@ export interface TransportProvider extends BaseProvider {
   /**
    * Send encrypted direct message
    * @param recipientTransportPubkey - Transport-specific pubkey for messaging
+   * @param options - Optional publish/durability behavior. See
+   *   {@link SendMessageOptions}. Backwards-compatible: callers that omit
+   *   the argument get the existing immediate-verification behavior.
    * @returns Event ID
    */
-  sendMessage(recipientTransportPubkey: string, content: string): Promise<string>;
+  sendMessage(
+    recipientTransportPubkey: string,
+    content: string,
+    options?: SendMessageOptions,
+  ): Promise<string>;
 
   /**
    * Subscribe to incoming direct messages
@@ -380,6 +387,56 @@ export interface IncomingInstantSplitBundle {
  * Handler for instant split bundles
  */
 export type InstantSplitBundleHandler = (bundle: IncomingInstantSplitBundle) => void;
+
+// =============================================================================
+// sendMessage Options
+// =============================================================================
+
+/**
+ * Options accepted by {@link TransportProvider.sendMessage}.
+ *
+ * The legacy two-argument call (no options) is preserved verbatim. New
+ * publish behaviors are opted-in via these flags so existing callers
+ * never see a behavior change without their consent.
+ *
+ * @see TransportProvider.sendMessage
+ */
+export interface SendMessageOptions {
+  /**
+   * Issue #397 — when `true`, the transport performs **extended-window
+   * durability verification** AFTER the initial publish.
+   *
+   * Background: `NostrTransportProvider.publishWithVerification` queries
+   * the relay ~300-1500 ms after publish to confirm the event was
+   * stored. That suffices for healthy relays, but on testnet (single
+   * relay, short effective retention) the event is sometimes evicted
+   * within seconds — well before a short-lived CLI recipient subscribes.
+   *
+   * Extended durability extends the verify window into the seconds-to-
+   * tens-of-seconds range: the transport re-queries the relay at a
+   * schedule of escalating checkpoints and re-publishes the same event
+   * if it is observed missing. This keeps the event live on the relay
+   * long enough for a recipient CLI that connects within the window to
+   * receive it.
+   *
+   * Contract:
+   *  - Resolves once the configured checkpoint schedule completes
+   *    without observing the event missing on the final query, OR
+   *    after a final-checkpoint republish succeeds.
+   *  - Throws {@link SphereError} with code `'TRANSPORT_ERROR'` if the
+   *    republish budget is exhausted (the event keeps being evicted).
+   *  - The caller's promise resolves substantially later than the
+   *    non-extended path — on the order of tens of seconds.
+   *
+   * Use this for one-way deliveries to short-lived recipient processes
+   * (e.g. invoice delivery). Do NOT use it for high-volume fan-outs
+   * where the per-recipient publisher hold time would multiply.
+   *
+   * Transports that do not implement extended durability MUST silently
+   * fall through to their normal publish path — the flag is advisory.
+   */
+  readonly extendedDurability?: boolean;
+}
 
 // =============================================================================
 // Message Types

@@ -166,7 +166,9 @@ describe('CommunicationsModule cacheMessages option', () => {
 
       // Transport receives x-only key (02 prefix stripped by resolver)
       const xOnlyPeer = 'b'.repeat(64);
-      expect(deps.transport.sendMessage).toHaveBeenCalledWith(xOnlyPeer, 'hi');
+      // Issue #397 — sendDM forwards an options bag to transport.sendMessage.
+      // Default callers pass nothing, so options arrives as `undefined`.
+      expect(deps.transport.sendMessage).toHaveBeenCalledWith(xOnlyPeer, 'hi', undefined);
       expect(message).toMatchObject({ content: 'hi' });
       expect(mod.getConversation(PEER_PUBKEY)).toEqual([]);
       expect(deps.storage.set).not.toHaveBeenCalled();

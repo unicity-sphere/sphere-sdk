@@ -16,7 +16,7 @@ import type {
   SphereEventMap,
 } from '../../types';
 import type { StorageProvider } from '../../storage';
-import type { TransportProvider, IncomingMessage, IncomingBroadcast } from '../../transport';
+import type { TransportProvider, IncomingMessage, IncomingBroadcast, SendMessageOptions } from '../../transport';
 import { STORAGE_KEYS_ADDRESS } from '../../constants';
 
 // =============================================================================
@@ -39,6 +39,22 @@ export interface CommunicationsModuleConfig {
    *  events may occur if the relay delivers the same message twice. */
   cacheMessages?: boolean;
 }
+
+// =============================================================================
+// sendDM Options
+// =============================================================================
+
+/**
+ * Options accepted by {@link CommunicationsModule.sendDM}. Forwarded
+ * verbatim to the underlying {@link TransportProvider.sendMessage}.
+ *
+ * Re-exported as a named type so consumers (callers in other modules,
+ * apps embedding the SDK) can construct option bags without reaching
+ * into the transport layer.
+ *
+ * @see SendMessageOptions
+ */
+export type SendDMOptions = SendMessageOptions;
 
 // =============================================================================
 // Pagination Types
@@ -333,16 +349,32 @@ export class CommunicationsModule {
   // ===========================================================================
 
   /**
-   * Send direct message
+   * Send direct message.
+   *
+   * @param recipient - Identifier accepted by the transport resolver
+   *   (`@nametag`, `DIRECT://...`, chain pubkey, transport pubkey).
+   * @param content - Plaintext DM payload (the transport handles NIP-17
+   *   encryption + gift-wrap framing).
+   * @param options - Optional transport publish flags. See
+   *   {@link SendDMOptions}. The default (omitted) preserves the legacy
+   *   immediate-verification behavior. Callers that need higher
+   *   delivery confidence — notably the accounting module's invoice
+   *   delivery (issue #397) — pass `{ extendedDurability: true }` to
+   *   keep the gift wrap live on the relay long enough for a short-
+   *   lived recipient CLI to subscribe and ingest it.
    */
-  async sendDM(recipient: string, content: string): Promise<DirectMessage> {
+  async sendDM(
+    recipient: string,
+    content: string,
+    options?: SendDMOptions,
+  ): Promise<DirectMessage> {
     this.ensureInitialized();
 
     // Resolve recipient
     const resolved = await this.resolveRecipient(recipient);
 
     // Send via transport
-    const eventId = await this.deps!.transport.sendMessage(resolved.pubkey, content);
+    const eventId = await this.deps!.transport.sendMessage(resolved.pubkey, content, options);
 
     // Create message record
     // isRead=false for sent messages means "not yet read by recipient".

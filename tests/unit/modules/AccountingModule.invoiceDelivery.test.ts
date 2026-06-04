@@ -479,6 +479,8 @@ describe('AccountingModule.deliverInvoice — happy path (real createInvoice fix
     expect(mocks.communications.sendDM).toHaveBeenCalledWith(
       '@arbitrary-recipient',
       expect.any(String),
+      // Issue #397 — invoice deliveries always opt in to extended durability.
+      { extendedDurability: true },
     );
   });
 
@@ -567,6 +569,67 @@ describe('AccountingModule.deliverInvoice — failure modes', () => {
     expect(bobResult.error).toContain('relay offline');
     const carolResult = result.recipients.find((r) => r.recipient === REMOTE_CAROL)!;
     expect(carolResult.success).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------
+  // Issue #397 — invoice:deliver-failed event + extendedDurability opt-in
+  // -------------------------------------------------------------------------
+
+  it('UT-DELIVER-104 (#397): passes extendedDurability:true to sendDM', async () => {
+    const { invoiceId } = await mintRealInvoice();
+    mocks.communications.sendDM.mockImplementation((_recipient: string, content: string) =>
+      Promise.resolve({
+        id: 'mock-dm-' + Math.random().toString(36).slice(2),
+        senderPubkey: '02' + 'a'.repeat(64),
+        recipientPubkey: '02' + 'b'.repeat(64),
+        content,
+        timestamp: Date.now(),
+        isRead: false,
+      }),
+    );
+    await module.deliverInvoice(invoiceId);
+    // Final option-bag argument must request extended durability.
+    const lastCall = mocks.communications.sendDM.mock.calls.at(-1)!;
+    expect(lastCall[2]).toEqual({ extendedDurability: true });
+  });
+
+  it('UT-DELIVER-105 (#397): emits invoice:deliver-failed with reason "non-durable" when transport throws non-durable error', async () => {
+    const { invoiceId } = await mintRealInvoice();
+    // Mirror NostrTransportProvider.publishWithExtendedDurability's
+    // exhausted-budget error shape (substring match in deliverInvoice
+    // is on /non-durable\b/i).
+    mocks.communications.sendDM.mockRejectedValue(
+      new Error('dm event abcdef012345 non-durable at 30000ms after 3 republish attempts — relay retention shorter than delivery window'),
+    );
+    const emitEvent = (module as any).deps?.emitEvent as ReturnType<typeof vi.fn>;
+    const result = await module.deliverInvoice(invoiceId);
+    expect(result.sent).toBe(0);
+    expect(result.failed).toBe(1);
+    expect(emitEvent).toHaveBeenCalledWith(
+      'invoice:deliver-failed',
+      expect.objectContaining({
+        invoiceId,
+        recipient: REMOTE_BOB,
+        reason: 'non-durable',
+        errorMessage: expect.stringContaining('non-durable'),
+      }),
+    );
+  });
+
+  it('UT-DELIVER-106 (#397): emits invoice:deliver-failed with reason "transport-error" on generic transport error', async () => {
+    const { invoiceId } = await mintRealInvoice();
+    mocks.communications.sendDM.mockRejectedValue(new Error('relay offline'));
+    const emitEvent = (module as any).deps?.emitEvent as ReturnType<typeof vi.fn>;
+    const result = await module.deliverInvoice(invoiceId);
+    expect(result.failed).toBe(1);
+    expect(emitEvent).toHaveBeenCalledWith(
+      'invoice:deliver-failed',
+      expect.objectContaining({
+        invoiceId,
+        recipient: REMOTE_BOB,
+        reason: 'transport-error',
+      }),
+    );
   });
 });
 

@@ -679,6 +679,7 @@ export type SphereEventType =
   | 'invoice:receipt_received'
   | 'invoice:cancellation_sent'
   | 'invoice:cancellation_received'
+  | 'invoice:deliver-failed'
   // Swap events
   | 'swap:proposal_received'
   | 'swap:proposed'
@@ -1527,6 +1528,37 @@ export interface SphereEventMap {
   'invoice:receipt_received': { invoiceId: string; receipt: import('../modules/accounting/types').IncomingInvoiceReceipt };
   'invoice:cancellation_sent': { invoiceId: string; sent: number; failed: number };
   'invoice:cancellation_received': { invoiceId: string; notice: import('../modules/accounting/types').IncomingCancellationNotice };
+  /**
+   * Issue #397 — fires when an invoice delivery DM could not be
+   * confirmed durable on the relay despite the publisher's extended-
+   * durability republish budget. The recipient will NOT receive the
+   * invoice over Nostr; operators should retry `deliverInvoice` (the
+   * relay may have recovered), use the IPFS uxf-cid delivery path, or
+   * deliver the invoice ID out-of-band.
+   *
+   * Payload fields:
+   *  - `invoiceId`: hex tokenId of the invoice whose delivery failed.
+   *  - `recipient`: the recipient identifier passed to `deliverInvoice`
+   *    (`@nametag`, `DIRECT://…`, etc.). NOT the resolved transport
+   *    pubkey — operator-facing.
+   *  - `reason`: classifies the failure cause:
+   *      - `'non-durable'`: the relay kept evicting the gift wrap
+   *        within the publisher's hold window.
+   *      - `'transport-error'`: the publish itself failed (relay
+   *        offline, rejected event, etc.) before durability was even
+   *        attempted.
+   *      - `'unknown'`: the SDK could not classify the error.
+   *  - `errorMessage`: short human-readable message (the SphereError
+   *    `message` field or a fallback).
+   *
+   * This is a terminal event — the SDK does not retry on its own.
+   */
+  'invoice:deliver-failed': {
+    invoiceId: string;
+    recipient: string;
+    reason: 'non-durable' | 'transport-error' | 'unknown';
+    errorMessage: string;
+  };
   // Swap event payloads
   'swap:proposal_received': { swapId: string; deal: Record<string, unknown>; senderPubkey: string; senderNametag?: string };
   'swap:proposed': { swapId: string; deal: Record<string, unknown>; recipientPubkey: string };

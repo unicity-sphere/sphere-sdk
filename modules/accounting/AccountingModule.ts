@@ -1603,10 +1603,27 @@ export class AccountingModule {
           error: cidPublishError,
         });
         failed++;
+        // Mirror the failure into a structured event so operator surfaces
+        // can react without parsing per-recipient `error` strings.
+        deps.emitEvent('invoice:deliver-failed', {
+          invoiceId,
+          recipient,
+          reason: 'transport-error',
+          errorMessage: cidPublishError,
+        });
         continue;
       }
       try {
-        await deps.communications.sendDM(recipient, dmContent);
+        // Issue #397 — invoice deliveries always request extended-
+        // durability. The publisher keeps the gift wrap live on the
+        // relay across an extended window so a short-lived recipient
+        // CLI process that subscribes anytime during the window
+        // ingests it. Throws `TRANSPORT_ERROR` if the publisher's
+        // republish budget is exhausted (relay retention shorter than
+        // the delivery window).
+        await deps.communications.sendDM(recipient, dmContent, {
+          extendedDurability: true,
+        });
         recipientResults.push({
           recipient,
           success: true,
@@ -1616,15 +1633,36 @@ export class AccountingModule {
       } catch (err) {
         // Common per-recipient failures: resolver miss (nametag not
         // registered, no binding event), transport offline, relay
-        // rejection. Surface the message so callers can present it to
-        // the user without leaking SDK internals.
+        // rejection, extended-durability budget exhausted. Surface the
+        // message so callers can present it to the user without leaking
+        // SDK internals.
+        const errorMessage = err instanceof Error ? err.message : String(err);
         recipientResults.push({
           recipient,
           success: false,
           shape: '',
-          error: err instanceof Error ? err.message : String(err),
+          error: errorMessage,
         });
         failed++;
+        // Classify the failure for the new `invoice:deliver-failed`
+        // event so consumers can branch on cause. The message-substring
+        // check is intentionally narrow: only the extended-durability
+        // exhaustion path uses the `non-durable` phrase in its
+        // SphereError message (see NostrTransportProvider.
+        // publishWithExtendedDurability). Everything else falls into
+        // `transport-error`.
+        const reason: 'non-durable' | 'transport-error' | 'unknown' =
+          /non-durable\b/i.test(errorMessage)
+            ? 'non-durable'
+            : err instanceof Error
+              ? 'transport-error'
+              : 'unknown';
+        deps.emitEvent('invoice:deliver-failed', {
+          invoiceId,
+          recipient,
+          reason,
+          errorMessage,
+        });
       }
     }
 

@@ -59,6 +59,7 @@ import type {
   IncomingReadReceipt,
   TypingIndicatorHandler,
   IncomingTypingIndicator,
+  SendMessageOptions,
 } from './transport-provider';
 import type { WebSocketFactory, UUIDGenerator } from './websocket';
 import { defaultUUIDGenerator } from './websocket';
@@ -733,7 +734,11 @@ export class NostrTransportProvider implements TransportProvider {
     return this.keyManager.getPublicKeyHex();
   }
 
-  async sendMessage(recipientPubkey: string, content: string): Promise<string> {
+  async sendMessage(
+    recipientPubkey: string,
+    content: string,
+    options?: SendMessageOptions,
+  ): Promise<string> {
     this.ensureReady();
 
     // NIP-17 requires 32-byte x-only pubkey; strip 02/03 prefix if present
@@ -750,10 +755,20 @@ export class NostrTransportProvider implements TransportProvider {
     // Create NIP-17 gift-wrapped message (kind 1059) for recipient
     const giftWrap = NIP17.createGiftWrap(this.keyManager!, nostrRecipient, wrappedContent);
 
-    await this.publishWithVerification(giftWrap, 3, 'dm');
+    if (options?.extendedDurability) {
+      // Issue #397 — keep the event live on the relay across an
+      // extended window so a short-lived recipient CLI that subscribes
+      // anywhere inside the window observes the event. See
+      // `publishWithExtendedDurability` for the schedule + budget.
+      await this.publishWithExtendedDurability(giftWrap, 'dm');
+    } else {
+      await this.publishWithVerification(giftWrap, 3, 'dm');
+    }
 
     // NIP-17 self-wrap: send a copy to ourselves so relay can replay sent messages.
     // Content includes recipientPubkey and originalId for dedup against the live-sent record.
+    // We do NOT extend-durability the self-wrap: it's a local-history replay copy
+    // only; losing it has no user-visible effect on the receiver's delivery.
     const selfWrapContent = JSON.stringify({
       selfWrap: true,
       originalId: giftWrap.id,
@@ -2614,6 +2629,166 @@ export class NostrTransportProvider implements TransportProvider {
       }
     }
   }
+
+  /**
+   * Issue #397 — extended-window durability verification + republish.
+   *
+   * After the initial {@link publishWithVerification} confirms the event
+   * landed on the relay (within ~1.5 s), this method continues checking
+   * relay retention at a schedule of escalating delays. If the event is
+   * observed missing at any checkpoint, the SAME event is re-published
+   * (`event.id` is content-derived so the relay treats the re-publish as
+   * idempotent and the recipient's NIP-17 unwrap pipeline dedupes by id).
+   * The republish budget is bounded; once exhausted we throw a typed
+   * `TRANSPORT_ERROR` so callers can surface the failure to operators.
+   *
+   * The motivating case (issue #397): testnet's single Nostr relay
+   * sometimes evicts gift wraps within seconds of publish, well before
+   * a short-lived recipient CLI process subscribes. The original
+   * `publishWithVerification` returned success at +1.5 s — long before
+   * the eviction window — so the publisher believed delivery succeeded
+   * and exited, leaving the recipient with nothing to fetch.
+   *
+   * The schedule below covers roughly the first ~30 s after publish.
+   * In aggregate this gives the recipient a ~30-second window during
+   * which any subscription will land on a live event. Beyond 30 s we
+   * accept that delivery requires the recipient to be online during
+   * the publisher's hold — out-of-scope channels (IPFS uxf-cid pinning,
+   * a daemon on the receiver side, or periodic re-runs of `invoice
+   * deliver` by the operator) cover the longer tail.
+   *
+   * Idempotency: the relay deduplicates by `event.id`; the recipient
+   * deduplicates by `event.id` in its incoming-message dedup. Republishes
+   * are safe to attempt multiple times.
+   *
+   * Concurrency: the verify queries reuse `queryEvents` with a tight
+   * 8 s timeout. A query timeout (resolves to empty) is treated the same
+   * as a true "no events" result — conservatively, we republish. This
+   * may over-publish under a degraded relay, but republishes are
+   * idempotent (event id is content-addressed; relay + recipient both
+   * dedupe). A *thrown* queryEvents error (disconnect mid-flight) is
+   * treated optimistically (no republish): if we cannot reach the
+   * relay at all, a republish would fail too, and the next checkpoint
+   * will retry the verify.
+   *
+   * @param event - The NostrEvent already produced by the caller. It
+   *                must be the same event published by the initial
+   *                publish; re-publishing creates the same wire bytes.
+   * @param label - Human-friendly label used in logs and error messages
+   *                (e.g. `'dm'`, `'invoice_delivery'`).
+   *
+   * @throws {SphereError} `TRANSPORT_ERROR` — final checkpoint observed
+   *   the event missing AND the republish budget is exhausted. Callers
+   *   should surface this as a delivery failure.
+   */
+  private async publishWithExtendedDurability(
+    event: NostrEvent,
+    label: string,
+  ): Promise<void> {
+    // 1. Initial publish + immediate verification (~300-1500 ms after
+    //    publish). On failure this throws; the caller's outer catch sees
+    //    the same TRANSPORT_ERROR semantics as the non-extended path.
+    await this.publishWithVerification(event, 3, label);
+
+    const checkpointsMs = NostrTransportProvider.EXTENDED_DURABILITY_CHECKPOINTS_MS;
+    const maxRepublishes = NostrTransportProvider.EXTENDED_DURABILITY_MAX_REPUBLISHES;
+
+    let republishes = 0;
+    // publishWithVerification waited 300-1500 ms before its verify query,
+    // and the query itself takes some time. We approximate the elapsed
+    // budget as 1500 ms — the schedule below skips checkpoints that
+    // would land inside that already-verified window.
+    let elapsedMs = 1500;
+
+    for (const checkpointMs of checkpointsMs) {
+      if (checkpointMs <= elapsedMs) continue;
+      const waitMs = checkpointMs - elapsedMs;
+      await new Promise(r => setTimeout(r, waitMs));
+      elapsedMs = checkpointMs;
+
+      let found: NostrEvent[];
+      try {
+        // Use a tight query timeout for the durability check — a 60 s
+        // default would dominate the schedule and stall the publisher.
+        found = await this.queryEvents({ ids: [event.id], limit: 1 }, 8000);
+      } catch {
+        // Verification query failed (transport error, relay timeout).
+        // Treat optimistically: do not republish on the basis of a
+        // verification failure — only on observed absence. The next
+        // checkpoint will retry the verify.
+        logger.debug('Nostr', `${label} extended-durability verify query failed at ${checkpointMs}ms — treating optimistically`);
+        continue;
+      }
+
+      if (found.length > 0) {
+        // Still on relay; nothing to do.
+        continue;
+      }
+
+      // Observed missing. Republish if budget allows.
+      if (republishes >= maxRepublishes) {
+        throw new SphereError(
+          `${label} event ${event.id.slice(0, 12)} non-durable at ${checkpointMs}ms after ${republishes} republish attempts — relay retention shorter than delivery window`,
+          'TRANSPORT_ERROR',
+        );
+      }
+
+      logger.warn(
+        'Nostr',
+        `[EXTENDED-DURABILITY] ${label} event ${event.id.slice(0, 12)} missing from relay at ${checkpointMs}ms; republishing (attempt ${republishes + 1}/${maxRepublishes})`,
+      );
+      try {
+        await this.publishWithVerification(event, 3, label);
+      } catch (err) {
+        // publishWithVerification exhausted its own retry budget. Surface
+        // as TRANSPORT_ERROR — the publisher cannot keep the event live.
+        throw err instanceof SphereError
+          ? err
+          : new SphereError(
+              `${label} republish at ${checkpointMs}ms failed: ${err instanceof Error ? err.message : String(err)}`,
+              'TRANSPORT_ERROR',
+              err,
+            );
+      }
+      republishes++;
+      // After republish, the relay has just verified it again; treat the
+      // freshly-verified state as the new baseline so the very next
+      // checkpoint does not immediately re-verify with no elapsed delay.
+      // (The for-loop iteration already advances `elapsedMs`; no further
+      // adjustment needed here.)
+    }
+  }
+
+  /**
+   * Issue #397 — extended-durability checkpoint schedule (ms after the
+   * initial publish, measured from `publishEvent` return).
+   *
+   * Rationale for the schedule:
+   *  - 3000 ms: catches relays that evict within the first few seconds.
+   *  - 8000 ms / 18000 ms: covers the most common "short retention"
+   *    window observed on testnet reproducers.
+   *  - 30000 ms: spans typical CLI recipient boot+subscribe latency.
+   *
+   * Beyond 30 s the publisher hold cost outweighs the marginal value:
+   * recipients that haven't subscribed in the first 30 seconds are
+   * unlikely to subscribe before a relay's longer-tail retention also
+   * elapses. Operators with stronger guarantees should run a daemon on
+   * the receiver side or use the IPFS uxf-cid delivery path.
+   */
+  private static readonly EXTENDED_DURABILITY_CHECKPOINTS_MS: ReadonlyArray<number> =
+    [3000, 8000, 18000, 30000];
+
+  /**
+   * Issue #397 — extended-durability republish budget.
+   *
+   * 3 republishes across the 4 checkpoints means the publisher can
+   * survive up to 3 separate eviction events within the 30 s window
+   * before declaring terminal failure. 4 republishes within 30 s would
+   * indicate a relay so aggressive that no in-band fix can rescue
+   * delivery — the operator must switch to a longer-retention relay or
+   * use the IPFS uxf-cid path.
+   */
+  private static readonly EXTENDED_DURABILITY_MAX_REPUBLISHES = 3;
 
   /**
    * Issue #166 P2 #3 — Verify a previously published TOKEN_TRANSFER
