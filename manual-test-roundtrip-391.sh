@@ -233,29 +233,59 @@ sphere balance | tee "$SNAP/alice-balance-3.txt"
 #           load-tail SENT-reconciliation sweep also runs once at the
 #           start of bob's CLI process and tombstones the stale entry
 #           outright; either fix alone breaks the failure mode.
+#
+# **Issue #393 layered effect.** With automated CID delivery currently
+# disabled (kill-switch in modules/payments/transfer/limits.ts), this
+# hop's bundle (3 source tokens, each carrying multi-hop history) ALSO
+# exceeds the 96 KiB inline ceiling and throws INLINE_CAR_TOO_LARGE
+# from the dispatcher pre-flight. That secondary throw is EXPECTED
+# post-#393 and is treated as a "soft pass" here: the load-bearing
+# assertion is that bob's send did NOT trip the duplicate-bundle
+# guard. The full balance reconciliation in Section 7 is conditional
+# on HOP 4 actually delivering — when it doesn't (the expected
+# post-#393 outcome), the section emits an INFO line and the soak
+# exits 0 if the #391 invariant held.
 # ---------------------------------------------------------------------------
 banner "Section 6: HOP 4 — bob → @${ALICE_TAG} (98.5 UCT) ← #391 CRITICAL HOP"
 
 cd "$PEER_BOB"
 sphere wallet use bob
-sphere payments send "@${ALICE_TAG}" 98.5 UCT 2>&1 | tee "$SNAP/hop4-bob-send.log"
+# Capture exit code so the script doesn't abort on the now-expected
+# post-#393 INLINE_CAR_TOO_LARGE failure. The duplicate-bundle
+# assertion below is the load-bearing check.
+hop4_send_rc=0
+sphere payments send "@${ALICE_TAG}" 98.5 UCT 2>&1 | tee "$SNAP/hop4-bob-send.log" || hop4_send_rc=$?
+echo "hop4-bob-send exit code: $hop4_send_rc"
 
 if contains_duplicate_bundle_error "$SNAP/hop4-bob-send.log"; then
   echo "ASSERT FAIL (hop4-no-dup-bundle-err): bob's 98.5-UCT send tripped duplicate-bundle guard (#391 REGRESSION)" >&2
   exit 1
 fi
-echo "ASSERT OK (hop4-no-dup-bundle-err): bob's 98.5-UCT send passed the duplicate-bundle guard"
+echo "ASSERT OK (hop4-no-dup-bundle-err): bob's 98.5-UCT send passed the duplicate-bundle guard (#391 INVARIANT VERIFIED)"
 
-cd "$PEER_ALICE"
-sphere wallet use alice
-sphere payments sync                2>&1 | tee "$SNAP/hop4-alice-sync.log"
-sphere payments receive --finalize  2>&1 | tee "$SNAP/hop4-alice-receive.log"
-sphere balance | tee "$SNAP/alice-balance-4.txt"
+# Detect the post-#393 documented limit and short-circuit the
+# subsequent balance reconciliation when it fires. The #393 message
+# is fingerprint-stable per the throw in
+# `modules/payments/transfer/instant-sender.ts`.
+hop4_delivered=1
+if grep -qE 'INLINE_CAR_TOO_LARGE|automated CID delivery is currently disabled' \
+    "$SNAP/hop4-bob-send.log"; then
+  hop4_delivered=0
+  echo "ASSERT INFO (hop4-cid-disabled): bundle exceeded inline cap AND automated CID delivery is OFF (#393); HOP 4 did not deliver. The #391 invariant is still verified by the assertion above. Skipping balance reconciliation."
+fi
 
-cd "$PEER_BOB"
-sphere wallet use bob
-sphere payments sync                2>&1 | tee "$SNAP/hop4-bob-sync.log"
-sphere balance | tee "$SNAP/bob-balance-4.txt"
+if (( hop4_delivered == 1 )); then
+  cd "$PEER_ALICE"
+  sphere wallet use alice
+  sphere payments sync                2>&1 | tee "$SNAP/hop4-alice-sync.log"
+  sphere payments receive --finalize  2>&1 | tee "$SNAP/hop4-alice-receive.log"
+  sphere balance | tee "$SNAP/alice-balance-4.txt"
+
+  cd "$PEER_BOB"
+  sphere wallet use bob
+  sphere payments sync                2>&1 | tee "$SNAP/hop4-bob-sync.log"
+  sphere balance | tee "$SNAP/bob-balance-4.txt"
+fi
 
 # ---------------------------------------------------------------------------
 # Section 7 — Verify balances (integer-only)
@@ -267,43 +297,52 @@ sphere balance | tee "$SNAP/bob-balance-4.txt"
 # So:
 #   alice_final - alice_0 = -0.5 UCT = -50_000_000
 #   bob_final   - bob_0   = +0.5 UCT = +50_000_000
+#
+# **Issue #393.** When HOP 4 hits the disabled-automated-CID throw
+# (expected post-#393), there is no balance to reconcile against.
+# Section 7 emits an INFO line and is skipped — the #391 invariant
+# assertion above is the load-bearing check.
 # ---------------------------------------------------------------------------
 banner "Section 7: Verify net deltas (integer-only)"
 
-alice_0=$(extract_uct_confirmed_smallest_units < "$SNAP/alice-balance-0.txt")
-alice_4=$(extract_uct_confirmed_smallest_units < "$SNAP/alice-balance-4.txt")
-bob_0=$(  extract_uct_confirmed_smallest_units < "$SNAP/bob-balance-0.txt")
-bob_4=$(  extract_uct_confirmed_smallest_units < "$SNAP/bob-balance-4.txt")
-
-echo "alice CONFIRMED hop-0 baseline: $alice_0  (smallest units)"
-echo "alice CONFIRMED hop-4 final:    $alice_4  (smallest units)"
-echo "bob   CONFIRMED hop-0 baseline: $bob_0    (smallest units)"
-echo "bob   CONFIRMED hop-4 final:    $bob_4    (smallest units)"
-
-# Net deltas. Use signed arithmetic; bash supports negatives in $((...)).
-alice_net_delta=$(( alice_4 - alice_0 ))
-bob_net_delta=$(  ( bob_4   - bob_0   ) )
-expected_alice=-50000000
-expected_bob=50000000
-
-echo
-echo "alice net delta (final - baseline): $alice_net_delta"
-echo "bob   net delta (final - baseline): $bob_net_delta"
-echo "expected alice:                     $expected_alice  (-0.5 UCT × 10^8)"
-echo "expected bob:                       $expected_bob   (+0.5 UCT × 10^8)"
-
 rc=0
-if (( alice_net_delta == expected_alice )); then
-  echo "ASSERT OK (alice-net-delta-minus-0.5-UCT)"
+if (( hop4_delivered == 0 )); then
+  echo "ASSERT INFO (section-7-skipped): HOP 4 did not deliver (post-#393 expected). Skipping balance reconciliation; #391 invariant verified above."
 else
-  echo "ASSERT FAIL (alice-net-delta-minus-0.5-UCT): expected $expected_alice, got $alice_net_delta" >&2
-  rc=1
-fi
-if (( bob_net_delta == expected_bob )); then
-  echo "ASSERT OK (bob-net-delta-plus-0.5-UCT)"
-else
-  echo "ASSERT FAIL (bob-net-delta-plus-0.5-UCT): expected $expected_bob, got $bob_net_delta" >&2
-  rc=1
+  alice_0=$(extract_uct_confirmed_smallest_units < "$SNAP/alice-balance-0.txt")
+  alice_4=$(extract_uct_confirmed_smallest_units < "$SNAP/alice-balance-4.txt")
+  bob_0=$(  extract_uct_confirmed_smallest_units < "$SNAP/bob-balance-0.txt")
+  bob_4=$(  extract_uct_confirmed_smallest_units < "$SNAP/bob-balance-4.txt")
+
+  echo "alice CONFIRMED hop-0 baseline: $alice_0  (smallest units)"
+  echo "alice CONFIRMED hop-4 final:    $alice_4  (smallest units)"
+  echo "bob   CONFIRMED hop-0 baseline: $bob_0    (smallest units)"
+  echo "bob   CONFIRMED hop-4 final:    $bob_4    (smallest units)"
+
+  # Net deltas. Use signed arithmetic; bash supports negatives in $((...)).
+  alice_net_delta=$(( alice_4 - alice_0 ))
+  bob_net_delta=$(  ( bob_4   - bob_0   ) )
+  expected_alice=-50000000
+  expected_bob=50000000
+
+  echo
+  echo "alice net delta (final - baseline): $alice_net_delta"
+  echo "bob   net delta (final - baseline): $bob_net_delta"
+  echo "expected alice:                     $expected_alice  (-0.5 UCT × 10^8)"
+  echo "expected bob:                       $expected_bob   (+0.5 UCT × 10^8)"
+
+  if (( alice_net_delta == expected_alice )); then
+    echo "ASSERT OK (alice-net-delta-minus-0.5-UCT)"
+  else
+    echo "ASSERT FAIL (alice-net-delta-minus-0.5-UCT): expected $expected_alice, got $alice_net_delta" >&2
+    rc=1
+  fi
+  if (( bob_net_delta == expected_bob )); then
+    echo "ASSERT OK (bob-net-delta-plus-0.5-UCT)"
+  else
+    echo "ASSERT FAIL (bob-net-delta-plus-0.5-UCT): expected $expected_bob, got $bob_net_delta" >&2
+    rc=1
+  fi
 fi
 
 # Per-hop status sanity: no DUPLICATE_BUNDLE_MEMBERSHIP in any send log
@@ -337,12 +376,18 @@ check_no_unconfirmed() {
   echo "ASSERT OK ($label): no unconfirmed residue post-finalize"
 }
 
-check_no_unconfirmed "alice-balance-4" "$SNAP/alice-balance-4.txt" || rc=1
-check_no_unconfirmed "bob-balance-4"   "$SNAP/bob-balance-4.txt"   || rc=1
+if (( hop4_delivered == 1 )); then
+  check_no_unconfirmed "alice-balance-4" "$SNAP/alice-balance-4.txt" || rc=1
+  check_no_unconfirmed "bob-balance-4"   "$SNAP/bob-balance-4.txt"   || rc=1
+fi
 
 echo
 if (( rc == 0 )); then
-  banner "ALL GREEN — 4-hop A→B→A→B→A round-trip succeeded; #391 guard + load-tail fix verified"
+  if (( hop4_delivered == 1 )); then
+    banner "ALL GREEN — 4-hop A→B→A→B→A round-trip succeeded; #391 guard + load-tail fix verified"
+  else
+    banner "GREEN-WITH-NOTE — #391 invariant verified (no duplicate-bundle false-positive). HOP 4 did not deliver because automated CID is disabled (#393); balance reconciliation skipped."
+  fi
 else
   banner "FAIL — see ASSERT FAIL lines above"
 fi
