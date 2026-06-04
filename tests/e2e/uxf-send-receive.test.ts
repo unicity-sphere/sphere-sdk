@@ -27,35 +27,22 @@
  *     resolve to `it.skip(...)` so the test file stays green when the
  *     runner has no network access (e.g., a sandboxed CI shard).
  *   - `RUN_UXF_E2E=1` opt-in — by default the live-network scenarios are
- *     SKIPPED in vitest. Opt in to drive the actual sends. See "Known UXF
- *     orchestrator blockers" below for why this is opt-in for now.
+ *     SKIPPED in vitest. Opt in to drive the actual sends.
  *
- * Known UXF orchestrator blockers surfaced by this test (as of writing):
- *   1. CBOR uint64 overflow on SMT path bignums.
- *      `uxf/hash.ts:prepareSmtSegments` casts SMT path strings to native
- *      bigints (`path: BigInt(seg.path)`). When the source token's
- *      inclusion proof carries a 256-bit SMT path (always, post-aggregator),
- *      `@ipld/dag-cbor` (via `cborg`) rejects the bigint with
- *      `encountered BigInt larger than allowable range` because it tries
- *      raw uint encoding (top out at 2^64 - 1) instead of CBOR tag 2
- *      (bignum). Reproduces with USDU (6 decimals) — confirms the bigint
- *      is the SMT path, not the coin amount.
- *   2. Symbol → hex coinId resolution missing on the UXF dispatch arm.
- *      The legacy `instantSplitSend` path (PaymentsModule ~line 1868) does
- *      `TokenRegistry.getDefinitionBySymbol(...)` if no token literally
- *      matches `request.coinId`. The UXF dispatcher
- *      (`dispatchUxfConservativeSend`, `dispatchUxfInstantSend`) does NOT
- *      replicate that resolution — `request.coinId === 'UCT'` lands in
- *      `validateTargets` against tokens whose projected `coinData[0][0]`
- *      is the hex coinId, returning `available=0` and throwing
- *      `INSUFFICIENT_BALANCE`. The test sidesteps this by calling
- *      `sphere.payments.getBalance()[i].coinId` and passing the canonical
- *      hex coinId straight through — but production callers passing
- *      symbols will trip this.
+ * **History note.** Earlier revisions of this header documented two UXF
+ * orchestrator blockers (a CBOR uint64 overflow on SMT path bignums,
+ * and a symbol→hex coinId resolution gap on the UXF dispatch arm).
+ * Both are RESOLVED:
+ *   - Issue #295 made SmtPath an opaque STS-canonical CBOR blob in
+ *     `uxf/hash.ts:80-83`; UXF no longer touches bignum segments.
+ *   - `PaymentsModule.resolveCoinIdSymbol()` (call sites at
+ *     `dispatchUxfConservativeSend` line ~12795 and the instant
+ *     dispatcher counterpart) now invokes
+ *     `TokenRegistry.getDefinitionBySymbol(...)` so callers passing
+ *     symbols are routed identically to the legacy path.
  *
- * The scenarios in this file would pass if the orchestrator worked. They
- * exist precisely to detect a regression once those bugs are fixed; until
- * then the suite is opt-in via `RUN_UXF_E2E=1`.
+ * The note is preserved so future readers know which obstacles WERE
+ * in place and have been cleared.
  *
  * Network requirements:
  *   - Outbound HTTPS to `faucet.unicity.network`,

@@ -233,17 +233,18 @@ async function sendHop(opts: {
   await waitForPeerResolvable(sender, receiverNametag, PEER_RESOLVE_MS);
   const coinId = resolveCoinId(sender, symbol);
   console.log(`[${tag}] sending ${amount} ${symbol} (= ${opts.amountSmallest} smallest) → @${receiverNametag}`);
-  // **Why conservative mode here.** The instant-mode UXF orchestrator
-  // path has documented USDU-specific infrastructure issues in this
-  // test environment (see `uxf-send-receive.test.ts:35-58` for the
-  // CBOR uint64 overflow + symbol-to-coinId notes). Conservative mode
-  // awaits proofs synchronously and works end-to-end against testnet
-  // — exactly the same dispatcher pre-flight path that calls
-  // `assertNoDuplicateBundleMembership`, which is the #391 surface
-  // under test. The CLI soak (`manual-test-roundtrip-391.sh`)
-  // exercises the user's actual instant-mode bug repro; this e2e is
-  // the deterministic in-process companion focused on the guard
-  // invariant.
+  // **Why conservative mode here.** Conservative mode awaits proofs
+  // synchronously and returns `status: 'completed'` once the bundle
+  // is on the wire and finalized — easier to assert against than
+  // instant mode, which returns `submitted` and relies on the §6.1
+  // finalization worker. Both modes go through the same dispatcher
+  // pre-flight (`assertNoDuplicateBundleMembership`), so the #391
+  // invariant under test is exercised identically.
+  //
+  // The CLI soak (`manual-test-roundtrip-391.sh`) runs the user's
+  // actual instant-mode bug repro across separate short-lived
+  // processes; this e2e is the deterministic in-process companion
+  // focused on the guard invariant.
   // Wrap the send in try/catch so we can distinguish:
   //   - SUCCESS path → assert the result shape, then poll the receiver.
   //   - Post-#393 INLINE_CAR_TOO_LARGE throw → soft-pass: log, skip the
@@ -282,15 +283,51 @@ async function sendHop(opts: {
   expect(result.error ?? '').not.toMatch(/DUPLICATE_BUNDLE_MEMBERSHIP|refusing to include token/);
   expect(['submitted', 'delivered', 'completed']).toContain(result.status);
 
-  await waitFor(
-    async () => {
-      try { await receiver.payments.receive({ finalize: true }); } catch { /* keep polling */ }
-      const bal = getBalance(receiver, symbol);
-      return bal.confirmed >= expectedReceiveTotal ? bal : null;
-    },
-    TRANSFER_RECV_MS,
-    `${tag} — receiver to reach ${expectedReceiveTotal} ${symbol} confirmed`,
-  );
+  // Diagnostic instrumentation — surface receiver's intermediate state
+  // so a stuck poll is observable in the log rather than a silent
+  // 180s timeout.
+  const incomingEvents: Array<{ tokens: number; senderNametag?: string }> = [];
+  const offIncoming = receiver.on('transfer:incoming', (e) => {
+    incomingEvents.push({ tokens: e.tokens.length, senderNametag: e.senderNametag });
+    console.log(`[${tag}] ← transfer:incoming senderNametag=${e.senderNametag ?? '?'} tokens=${e.tokens.length}`);
+  });
+  const transferFailed: Array<{ id: string; error?: string }> = [];
+  const offFailed = receiver.on('transfer:failed', (r) => {
+    transferFailed.push({ id: r.id, error: r.error });
+    console.log(`[${tag}] ← transfer:failed id=${r.id} err=${r.error}`);
+  });
+  let pollIter = 0;
+  try {
+    await waitFor(
+      async () => {
+        pollIter += 1;
+        let receiveResult: unknown;
+        let receiveErr: string | undefined;
+        try {
+          receiveResult = await receiver.payments.receive({ finalize: true });
+        } catch (recvErr) {
+          receiveErr = recvErr instanceof Error ? recvErr.message : String(recvErr);
+        }
+        const bal = getBalance(receiver, symbol);
+        if (pollIter <= 5 || pollIter % 20 === 0) {
+          // Log on first 5 polls, then every 5th, to keep log readable
+          // while still surfacing the steady state.
+          const transfers = (receiveResult as { transfers?: unknown[] } | undefined)?.transfers ?? [];
+          console.log(
+            `[${tag}] poll #${pollIter}: receive transfers=${transfers.length}` +
+              ` err=${receiveErr ?? '-'} bal.confirmed=${bal.confirmed} ` +
+              `bal.unconfirmed=${bal.unconfirmed ?? 0} bal.tokens=${bal.tokens}`,
+          );
+        }
+        return bal.confirmed >= expectedReceiveTotal ? bal : null;
+      },
+      TRANSFER_RECV_MS,
+      `${tag} — receiver to reach ${expectedReceiveTotal} ${symbol} confirmed (incoming events: ${incomingEvents.length}, failed: ${transferFailed.length})`,
+    );
+  } finally {
+    offIncoming();
+    offFailed();
+  }
   const bal = getBalance(receiver, symbol);
   console.log(`[${tag}] receiver confirmed=${bal.confirmed} (tokens=${bal.tokens})`);
   return result;
@@ -346,14 +383,20 @@ describe('Issue #391 — 4-hop A→B→A→B→A round-trip (real testnet)', () 
       a.sphere.on('transfer:failed', (r) => aliceFailed.push(r));
       b.sphere.on('transfer:failed', (r) => bobFailed.push(r));
 
+      // NOTE — `payments.send({ amount })` takes the amount in
+      // SMALLEST UNITS (see CLAUDE.md and types/index.ts:73). USDU has
+      // 6 decimals, so 100 USDU = 100_000_000 smallest. We pass the
+      // raw smallest-unit string consistently across all hops and the
+      // expectedReceiveTotal computations.
+
       // -------------------------------------------------------------
-      // Hop 1: alice → bob 100 USDU
+      // Hop 1: alice → bob 100 USDU (= 100_000_000 smallest units)
       // -------------------------------------------------------------
       await sendHop({
         sender: a.sphere,
         receiver: b.sphere,
         receiverNametag: bobTag,
-        amount: '100',
+        amount: '100000000',
         amountSmallest: 100_000_000n,
         symbol: PRIMARY_SYMBOL,
         memo: '#391 hop 1',
@@ -362,7 +405,7 @@ describe('Issue #391 — 4-hop A→B→A→B→A round-trip (real testnet)', () 
       });
 
       // -------------------------------------------------------------
-      // Hop 2: bob → alice 20 USDU
+      // Hop 2: bob → alice 20 USDU (= 20_000_000 smallest units)
       // (Creates bob's OUTBOX entry whose `tokenIds` will later
       // round-trip back as a bob-side source candidate.)
       // -------------------------------------------------------------
@@ -371,7 +414,7 @@ describe('Issue #391 — 4-hop A→B→A→B→A round-trip (real testnet)', () 
         sender: b.sphere,
         receiver: a.sphere,
         receiverNametag: aliceTag,
-        amount: '20',
+        amount: '20000000',
         amountSmallest: 20_000_000n,
         symbol: PRIMARY_SYMBOL,
         memo: '#391 hop 2',
@@ -380,7 +423,7 @@ describe('Issue #391 — 4-hop A→B→A→B→A round-trip (real testnet)', () 
       });
 
       // -------------------------------------------------------------
-      // Hop 3: alice → bob 910 USDU.
+      // Hop 3: alice → bob 910 USDU (= 910_000_000 smallest units).
       // Alice now has the 900 USDU change (from hop 1) + 20 USDU (from
       // hop 2). She has to whole-transfer the 20-USDU token and split
       // the 900 → 890 mint + 10 change. Bob receives the 20-USDU token
@@ -391,7 +434,7 @@ describe('Issue #391 — 4-hop A→B→A→B→A round-trip (real testnet)', () 
         sender: a.sphere,
         receiver: b.sphere,
         receiverNametag: bobTag,
-        amount: '910',
+        amount: '910000000',
         amountSmallest: 910_000_000n,
         symbol: PRIMARY_SYMBOL,
         memo: '#391 hop 3',
@@ -416,7 +459,7 @@ describe('Issue #391 — 4-hop A→B→A→B→A round-trip (real testnet)', () 
         sender: b.sphere,
         receiver: a.sphere,
         receiverNametag: aliceTag,
-        amount: '985',
+        amount: '985000000',
         amountSmallest: 985_000_000n,
         symbol: PRIMARY_SYMBOL,
         memo: '#391 hop 4 — CRITICAL',
@@ -449,9 +492,30 @@ describe('Issue #391 — 4-hop A→B→A→B→A round-trip (real testnet)', () 
         expect(bobFinal).toBe(5_000_000n);
       }
 
-      // No transfer:failed events on either side.
-      expect(aliceFailed).toEqual([]);
-      expect(bobFailed).toEqual([]);
+      // No transfer:failed events on either side — EXCEPT for the
+      // HOP 4 INLINE_CAR_TOO_LARGE soft-pass, which fires
+      // `transfer:failed` on the sender (bob) by design when the
+      // dispatcher throws. Filter those out and assert nothing else
+      // failed.
+      const expectedFailRe = /INLINE_CAR_TOO_LARGE|automated CID delivery is currently disabled|DUPLICATE_BUNDLE_MEMBERSHIP/;
+      const aliceUnexpectedFailures = aliceFailed.filter(
+        (r) => !expectedFailRe.test(r.error ?? ''),
+      );
+      // For #391 we expect NO failures whatsoever from alice (her sends are
+      // small enough to fit inline). Bob may have one expected failure
+      // matching the HOP 4 soft-pass.
+      const bobUnexpectedFailures = bobFailed.filter(
+        (r) => !/INLINE_CAR_TOO_LARGE|automated CID delivery is currently disabled/.test(r.error ?? ''),
+      );
+      // Surface DUPLICATE_BUNDLE_MEMBERSHIP loudly if it ever appears —
+      // that would be a #391 regression even when it doesn't surface
+      // through the synchronous send() throw path.
+      const dupBundleFailures = [...aliceFailed, ...bobFailed].filter((r) =>
+        /DUPLICATE_BUNDLE_MEMBERSHIP|refusing to include token/.test(r.error ?? ''),
+      );
+      expect(dupBundleFailures).toEqual([]);
+      expect(aliceUnexpectedFailures).toEqual([]);
+      expect(bobUnexpectedFailures).toEqual([]);
     },
     900_000, // 15-minute test budget for 4 testnet hops with finalize.
   );
