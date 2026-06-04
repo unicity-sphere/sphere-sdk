@@ -252,7 +252,14 @@ while (( $(date +%s) < INV_LIST_DEADLINE )); do
   sphere payments sync                2>&1 > "$SNAP/alice-pre-pay-sync.log"
   # Fresh-list dump on every poll so the final state is captured.
   sphere invoice list 2>&1 | tee "$SNAP/alice-invoice-list-before-pay.log" || true
-  if grep -qE "(\"invoiceId\":[[:space:]]*\"${INV}\"|^${INV:0:16})" "$SNAP/alice-invoice-list-before-pay.log"; then
+  # Accept any of the three shapes the CLI emits:
+  #   - JSON: "invoiceId": "<hex>"
+  #   - `ID:   <hex>` from the human-readable `invoice list` formatter (note
+  #     the leading whitespace before the hex — the prior `^<hex>` anchor
+  #     missed this and reported false-negative timeouts even when the
+  #     invoice WAS in alice's local store, see #397).
+  #   - bare prefix at line start (catch-all for future formatters).
+  if grep -qE "(\"invoiceId\":[[:space:]]*\"${INV}\"|ID:[[:space:]]+${INV:0:16}|^${INV:0:16})" "$SNAP/alice-invoice-list-before-pay.log"; then
     echo "INFO: invoice $INV visible in alice's local list"
     INV_FOUND=1
     break
@@ -300,12 +307,16 @@ rc=0
 
 # (a) Invoice state — the CLI's `invoice status` output includes a
 # `state: <STATE>` field; we grep tolerantly because the JSON formatter
-# may render it in any of several equivalent shapes.
-if grep -qE '("state"[[:space:]]*:[[:space:]]*"COVERED"|State:[[:space:]]*COVERED|state:[[:space:]]*COVERED)' \
+# may render it in any of several equivalent shapes. Accept COVERED or
+# CLOSED because the auto-terminate-on-full-cover lifecycle (default on
+# in AccountingModule) walks COVERED → CLOSED in a single step once all
+# targets are fully paid — both indicate the payment was attributed to
+# the invoice correctly.
+if grep -qE '("state"[[:space:]]*:[[:space:]]*"(COVERED|CLOSED)"|State:[[:space:]]*(COVERED|CLOSED)|state:[[:space:]]*(COVERED|CLOSED))' \
     "$SNAP/bob-invoice-status.log"; then
-  echo "ASSERT OK (invoice-covered): bob's invoice transitioned to COVERED"
+  echo "ASSERT OK (invoice-covered): bob's invoice transitioned to COVERED or CLOSED"
 else
-  echo "ASSERT FAIL (invoice-covered): bob's invoice did not reach COVERED" >&2
+  echo "ASSERT FAIL (invoice-covered): bob's invoice did not reach COVERED/CLOSED" >&2
   echo "--- bob-invoice-status.log tail ---" >&2
   tail -30 "$SNAP/bob-invoice-status.log" >&2
   rc=1

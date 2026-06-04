@@ -1,15 +1,23 @@
 /**
- * AccountingModule — Invoice Delivery (#226)
+ * AccountingModule — Invoice Delivery (#226 + #397 rework)
  *
- * Tests the per-invoice UXF-bundle delivery mechanism end-to-end:
+ * Tests the per-invoice UXF-bundle delivery mechanism end-to-end after
+ * the #397 refactor:
  *
  * - Sender side: `deliverInvoice(invoiceId, options?)` packages the
- *   locally-stored invoice token into a real UXF CARv1 bundle, ships it
- *   inside an `invoice_delivery:` DM (inline `uxf-car` or `uxf-cid` via
- *   `publishToIpfs`), and reports per-recipient outcome.
- * - Receiver side: `_handleIncomingDM` decodes the envelope, parses the
- *   UXF CAR, extracts the invoice via `pkg.assemble`, and calls
- *   `importInvoice` to land it in the local ledger.
+ *   locally-stored invoice token into a real UXF CARv1 bundle and ships
+ *   it through the standard TOKEN_TRANSFER pipeline via
+ *   `payments.publishUxfBundle`. Per-recipient outcome is reported via
+ *   `DeliverInvoiceResult` and structured failures fire
+ *   `invoice:deliver-failed`.
+ * - Receiver side: an invoice token arriving via the standard
+ *   TOKEN_TRANSFER ingest pipeline (PaymentsModule.addToken →
+ *   onTokenChange) is routed by `_handleTokenChange`'s
+ *   `INVOICE_TOKEN_TYPE_HEX` branch into `invoiceTermsCache` with an
+ *   `invoice:created { confirmed: true }` event.
+ *
+ * Pre-#397 the path was a bespoke `invoice_delivery:` NIP-17 DM with a
+ * separate sender/receiver decoder; that path has been removed.
  *
  * **Fixture strategy:** the invoice token used in these tests is a REAL
  * invoice produced by the actual `createInvoice()` flow — not a
@@ -22,8 +30,6 @@
  * Decoupling guarantee: `createInvoice` is unchanged — no auto-delivery
  * side effect. The mint path mints; the deliver path delivers. The
  * UT-DELIVER-201 test asserts this contract.
- *
- * @see modules/accounting/AccountingModule.ts INVOICE_DELIVERY_DM_PREFIX
  */
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -39,10 +45,9 @@ import type { AccountingModule } from '../../../modules/accounting/AccountingMod
 import type {
   TestAccountingModuleMocks,
 } from './accounting-test-helpers.js';
-import type { DirectMessage, Token } from '../../../types/index.js';
+import type { Token } from '../../../types/index.js';
 import { INVOICE_TOKEN_TYPE_HEX } from '../../../constants.js';
 import { UxfPackage } from '../../../uxf/UxfPackage.js';
-import { carBytesToBase64, extractCarRootCid } from '../../../uxf/transfer-payload.js';
 
 // =============================================================================
 // SDK dynamic-import mocks (mirror createInvoice.test.ts so createInvoice
@@ -361,45 +366,14 @@ async function mintRealInvoice(args?: {
   };
 }
 
-function makeDM(content: string, overrides?: Partial<DirectMessage>): DirectMessage {
-  return {
-    id: 'dm-' + Math.random().toString(36).slice(2),
-    senderPubkey: '02' + 'b'.repeat(64),
-    recipientPubkey: '02' + 'a'.repeat(64),
-    content,
-    timestamp: Date.now(),
-    isRead: false,
-    ...overrides,
-  };
-}
-
-/**
- * Build the same DM envelope the sender emits — used by receiver-side
- * tests to feed messages directly into `mocks.communications._emit`.
- */
-async function buildDeliveryDM(
-  tokenJson: Record<string, unknown>,
-  invoiceId: string,
-  overrides?: Partial<{ memo?: string; mutateEnvelope: (env: any) => void }>,
-): Promise<DirectMessage> {
-  const pkg = UxfPackage.create({ description: 'invoice-delivery' });
-  pkg.ingest(tokenJson);
-  const carBytes = await pkg.toCar();
-  const carBase64 = carBytesToBase64(carBytes);
-  const bundleCid = await extractCarRootCid(carBytes);
-  const envelope: any = {
-    type: 'invoice_delivery',
-    version: 1,
-    invoiceId,
-    bundle: { kind: 'uxf-car', carBase64, bundleCid },
-  };
-  if (overrides?.memo !== undefined) envelope.memo = overrides.memo;
-  if (overrides?.mutateEnvelope) overrides.mutateEnvelope(envelope);
-  return makeDM('invoice_delivery:' + JSON.stringify(envelope));
-}
 
 // =============================================================================
 // SENDER: deliverInvoice — happy path on real-flow invoices
+//
+// Issue #397 — invoice deliveries now ride the standard TOKEN_TRANSFER
+// pipeline via `payments.publishUxfBundle` instead of the legacy
+// `invoice_delivery:` NIP-17 DM. Assertions target the `publishUxfBundle`
+// mock; the legacy DM path is gone.
 // =============================================================================
 
 describe('AccountingModule.deliverInvoice — happy path (real createInvoice fixture)', () => {
@@ -408,9 +382,9 @@ describe('AccountingModule.deliverInvoice — happy path (real createInvoice fix
     await module.load();
   });
 
-  it('UT-DELIVER-001: delivers a real-flow invoice via uxf-car DM to a single non-self target', async () => {
+  it('UT-DELIVER-001: delivers a real-flow invoice via publishUxfBundle to a single non-self target', async () => {
     const { invoiceId } = await mintRealInvoice();
-    expect(mocks.communications.sendDM).not.toHaveBeenCalled(); // mint must not deliver
+    expect(mocks.payments.publishUxfBundle).not.toHaveBeenCalled(); // mint must not deliver
 
     const result = await module.deliverInvoice(invoiceId);
     expect(result.invoiceId).toBe(invoiceId);
@@ -421,29 +395,31 @@ describe('AccountingModule.deliverInvoice — happy path (real createInvoice fix
     expect(result.recipients[0]!.success).toBe(true);
     expect(result.recipients[0]!.shape).toBe('inline');
 
-    const [recipient, content] = mocks.communications.sendDM.mock.calls[0]!;
-    expect(recipient).toBe(REMOTE_BOB);
-    expect((content as string).startsWith('invoice_delivery:')).toBe(true);
-
-    const env = JSON.parse((content as string).slice('invoice_delivery:'.length));
-    expect(env.type).toBe('invoice_delivery');
-    expect(env.version).toBe(1);
-    expect(env.invoiceId).toBe(invoiceId);
-    expect(env.bundle.kind).toBe('uxf-car');
-    expect(typeof env.bundle.carBase64).toBe('string');
-    expect(env.bundle.carBase64.length).toBeGreaterThan(0);
-    expect(typeof env.bundle.bundleCid).toBe('string');
+    expect(mocks.payments.publishUxfBundle).toHaveBeenCalledTimes(1);
+    const params = mocks.payments.publishUxfBundle.mock.calls[0]![0] as {
+      recipient: string;
+      bundleCid: string;
+      tokenIds: ReadonlyArray<string>;
+      carBytes: Uint8Array;
+      publishViaIpfsCid?: boolean;
+    };
+    expect(params.recipient).toBe(REMOTE_BOB);
+    expect(params.tokenIds).toEqual([invoiceId]);
+    expect(params.publishViaIpfsCid).toBe(false);
+    expect(typeof params.bundleCid).toBe('string');
+    expect(params.bundleCid.length).toBeGreaterThan(0);
+    expect(params.carBytes).toBeInstanceOf(Uint8Array);
+    expect(params.carBytes.byteLength).toBeGreaterThan(0);
   });
 
   it('UT-DELIVER-002: round-trip — the emitted CAR decodes back to a UxfPackage containing the invoice', async () => {
     const { invoiceId } = await mintRealInvoice();
     await module.deliverInvoice(invoiceId);
 
-    const [, content] = mocks.communications.sendDM.mock.calls[0]!;
-    const env = JSON.parse((content as string).slice('invoice_delivery:'.length));
-    const { carBase64ToBytes } = await import('../../../uxf/transfer-payload.js');
-    const carBytes = carBase64ToBytes(env.bundle.carBase64);
-    const pkg = await UxfPackage.fromCar(carBytes);
+    const params = mocks.payments.publishUxfBundle.mock.calls[0]![0] as {
+      carBytes: Uint8Array;
+    };
+    const pkg = await UxfPackage.fromCar(params.carBytes);
     expect(pkg.tokenIds()).toContain(invoiceId);
     const assembled = pkg.assemble(invoiceId) as any;
     expect(assembled?.genesis?.data?.tokenId).toBe(invoiceId);
@@ -466,7 +442,7 @@ describe('AccountingModule.deliverInvoice — happy path (real createInvoice fix
     expect(result.recipients.map((r) => r.recipient).sort()).toEqual(
       [REMOTE_BOB, REMOTE_CAROL].sort(),
     );
-    expect(mocks.communications.sendDM).toHaveBeenCalledTimes(2);
+    expect(mocks.payments.publishUxfBundle).toHaveBeenCalledTimes(2);
   });
 
   it('UT-DELIVER-004: caller-provided recipients override the terms.targets default', async () => {
@@ -476,9 +452,8 @@ describe('AccountingModule.deliverInvoice — happy path (real createInvoice fix
     });
     expect(result.sent).toBe(1);
     expect(result.recipients[0]!.recipient).toBe('@arbitrary-recipient');
-    expect(mocks.communications.sendDM).toHaveBeenCalledWith(
-      '@arbitrary-recipient',
-      expect.any(String),
+    expect(mocks.payments.publishUxfBundle).toHaveBeenCalledWith(
+      expect.objectContaining({ recipient: '@arbitrary-recipient' }),
     );
   });
 
@@ -491,7 +466,7 @@ describe('AccountingModule.deliverInvoice — happy path (real createInvoice fix
     expect(result.failed).toBe(0);
     expect(result.skippedSelf).toBe(1);
     expect(result.recipients).toHaveLength(0);
-    expect(mocks.communications.sendDM).not.toHaveBeenCalled();
+    expect(mocks.payments.publishUxfBundle).not.toHaveBeenCalled();
   });
 
   it('UT-DELIVER-006: caller-provided empty recipient array short-circuits', async () => {
@@ -499,15 +474,15 @@ describe('AccountingModule.deliverInvoice — happy path (real createInvoice fix
     const result = await module.deliverInvoice(invoiceId, { recipients: [] });
     expect(result.sent).toBe(0);
     expect(result.recipients).toHaveLength(0);
-    expect(mocks.communications.sendDM).not.toHaveBeenCalled();
+    expect(mocks.payments.publishUxfBundle).not.toHaveBeenCalled();
   });
 
-  it('UT-DELIVER-007: memo is included in the envelope when provided', async () => {
+  it('UT-DELIVER-007: memo is forwarded to publishUxfBundle when provided', async () => {
     const { invoiceId } = await mintRealInvoice();
     await module.deliverInvoice(invoiceId, { memo: 'hello bob' });
-    const [, content] = mocks.communications.sendDM.mock.calls[0]!;
-    const env = JSON.parse((content as string).slice('invoice_delivery:'.length));
-    expect(env.memo).toBe('hello bob');
+    expect(mocks.payments.publishUxfBundle).toHaveBeenCalledWith(
+      expect.objectContaining({ memo: 'hello bob' }),
+    );
   });
 });
 
@@ -529,36 +504,24 @@ describe('AccountingModule.deliverInvoice — failure modes', () => {
     );
   });
 
-  it('UT-DELIVER-102: throws COMMUNICATIONS_UNAVAILABLE when comms is absent', async () => {
-    const { invoiceId } = await mintRealInvoice();
-    (module as any).deps.communications = undefined;
-    await expect(
-      module.deliverInvoice(invoiceId),
-    ).rejects.toSatisfy(
-      (e: unknown) =>
-        e instanceof SphereError &&
-        (e as SphereError).code === 'COMMUNICATIONS_UNAVAILABLE',
-    );
-  });
-
-  it('UT-DELIVER-103: per-recipient sendDM failure does not block other recipients and does not throw', async () => {
+  it('UT-DELIVER-103 (#397): per-recipient publishUxfBundle failure does not block other recipients and does not throw', async () => {
     const { invoiceId } = await mintRealInvoice({
       targets: [
         { address: REMOTE_BOB, assets: [{ coin: ['UCT', '11000000'] }] },
         { address: REMOTE_CAROL, assets: [{ coin: ['UCT', '22000000'] }] },
       ],
     });
-    mocks.communications.sendDM.mockImplementation((recipient: string, content: string) => {
-      if (recipient === REMOTE_BOB) return Promise.reject(new Error('relay offline'));
-      return Promise.resolve({
-        id: 'mock-dm-' + Math.random().toString(36).slice(2),
-        senderPubkey: '02' + 'a'.repeat(64),
-        recipientPubkey: '02' + 'b'.repeat(64),
-        content,
-        timestamp: Date.now(),
-        isRead: false,
-      });
-    });
+    mocks.payments.publishUxfBundle.mockImplementation(
+      (params: { recipient: string }) => {
+        if (params.recipient === REMOTE_BOB) {
+          return Promise.reject(new Error('relay offline'));
+        }
+        return Promise.resolve({
+          nostrEventId: 'mock-event-' + Math.random().toString(36).slice(2),
+          recipientTransportPubkey: params.recipient,
+        });
+      },
+    );
     const result = await module.deliverInvoice(invoiceId);
     expect(result.sent).toBe(1);
     expect(result.failed).toBe(1);
@@ -567,6 +530,23 @@ describe('AccountingModule.deliverInvoice — failure modes', () => {
     expect(bobResult.error).toContain('relay offline');
     const carolResult = result.recipients.find((r) => r.recipient === REMOTE_CAROL)!;
     expect(carolResult.success).toBe(true);
+  });
+
+  it('UT-DELIVER-104 (#397): emits invoice:deliver-failed with reason "transport-error" on publish failure', async () => {
+    const { invoiceId } = await mintRealInvoice();
+    mocks.payments.publishUxfBundle.mockRejectedValue(new Error('relay offline'));
+    const emitEvent = (module as any).deps?.emitEvent as ReturnType<typeof vi.fn>;
+    const result = await module.deliverInvoice(invoiceId);
+    expect(result.failed).toBe(1);
+    expect(emitEvent).toHaveBeenCalledWith(
+      'invoice:deliver-failed',
+      expect.objectContaining({
+        invoiceId,
+        recipient: REMOTE_BOB,
+        reason: 'transport-error',
+        errorMessage: expect.stringContaining('relay offline'),
+      }),
+    );
   });
 });
 
@@ -587,10 +567,22 @@ describe('AccountingModule — createInvoice does not auto-deliver (#226)', () =
 });
 
 // =============================================================================
-// RECEIVER: _handleIncomingDM → importInvoice via UXF bundle (real fixture)
+// RECEIVER: _handleTokenChange → invoice registration via TOKEN_TRANSFER pipeline
+//
+// Issue #397 — invoice tokens arriving via the standard TOKEN_TRANSFER
+// pipeline (handled by PaymentsModule's ingest pool) land in PaymentsModule
+// via `addToken`, which fires the `onTokenChange` observer that
+// AccountingModule subscribed to during load(). Detection is by token
+// type (`INVOICE_TOKEN_TYPE_HEX`); the observer registers the invoice in
+// `invoiceTermsCache` and emits `invoice:created`.
+//
+// These tests directly exercise that observer path via the helper
+// `mocks.payments._notifyTokenChange(tokenId, sdkData)` — equivalent to
+// what PaymentsModule.addToken does after a CAR decode lands an invoice
+// token in storage.
 // =============================================================================
 
-describe('AccountingModule — Invoice Delivery (receiver side, real fixture)', () => {
+describe('AccountingModule — Invoice Delivery (receiver side: TOKEN_TRANSFER routing)', () => {
   let receivedInvoiceJson: Record<string, unknown>;
   let receivedInvoiceId: string;
 
@@ -604,108 +596,95 @@ describe('AccountingModule — Invoice Delivery (receiver side, real fixture)', 
     receivedInvoiceJson = tokenJson;
     receivedInvoiceId = invoiceId;
     // Reset the spy / cache from the minting step so the receiver-side
-    // assertion only counts the import triggered by the inbound DM.
+    // assertion only counts the registration triggered by the inbound
+    // TOKEN_TRANSFER routing.
     mocks.payments._tokens.length = 0;
     (module as any).invoiceTermsCache.delete(invoiceId);
   });
 
-  it('UT-DELIVER-301: invoice_delivery: DM with valid uxf-car triggers importInvoice and lands the token', async () => {
-    const dm = await buildDeliveryDM(receivedInvoiceJson, receivedInvoiceId);
-    mocks.communications._emit('message:dm', dm);
-    await new Promise((r) => setTimeout(r, 50));
+  it('UT-DELIVER-301: incoming INVOICE token via onTokenChange registers terms + emits invoice:created', async () => {
+    const emitEvent = (module as any).deps?.emitEvent as ReturnType<typeof vi.fn>;
+    emitEvent.mockClear();
 
-    // importInvoice persisted the token through addToken (which our mock
-    // pushes into _tokens). Asserting on the stored side rather than a
-    // spy keeps the test focused on observable end state.
-    const persisted = mocks.payments._tokens.find((t) => t.id === receivedInvoiceId);
-    expect(persisted).toBeDefined();
-    expect(persisted!.coinId).toBe(INVOICE_TOKEN_TYPE_HEX);
-    // Terms cache populated as part of importInvoice.
+    // Drive the observer the same way PaymentsModule's addToken does
+    // after the standard ingest pool unpacks an incoming TOKEN_TRANSFER
+    // bundle carrying the invoice token.
+    mocks.payments._notifyTokenChange(
+      receivedInvoiceId,
+      JSON.stringify(receivedInvoiceJson),
+    );
+
     expect((module as any).invoiceTermsCache.has(receivedInvoiceId)).toBe(true);
+    expect(emitEvent).toHaveBeenCalledWith(
+      'invoice:created',
+      { invoiceId: receivedInvoiceId, confirmed: true },
+    );
   });
 
-  it('UT-DELIVER-302: replay of the same DM is benign (INVOICE_ALREADY_EXISTS handled)', async () => {
-    const dm1 = await buildDeliveryDM(receivedInvoiceJson, receivedInvoiceId);
-    mocks.communications._emit('message:dm', dm1);
-    await new Promise((r) => setTimeout(r, 50));
-    expect(mocks.payments._tokens.find((t) => t.id === receivedInvoiceId)).toBeDefined();
+  it('UT-DELIVER-302: replayed onTokenChange for the same invoice is benign (idempotent cache)', async () => {
+    const emitEvent = (module as any).deps?.emitEvent as ReturnType<typeof vi.fn>;
+    mocks.payments._notifyTokenChange(
+      receivedInvoiceId,
+      JSON.stringify(receivedInvoiceJson),
+    );
+    emitEvent.mockClear();
 
-    // Re-emit (relay replay). MUST NOT throw and MUST NOT corrupt cache.
-    const dm2 = await buildDeliveryDM(receivedInvoiceJson, receivedInvoiceId);
+    // Re-fire — must NOT throw, must NOT emit a second invoice:created.
     expect(() => {
-      mocks.communications._emit('message:dm', dm2);
+      mocks.payments._notifyTokenChange(
+        receivedInvoiceId,
+        JSON.stringify(receivedInvoiceJson),
+      );
     }).not.toThrow();
-    await new Promise((r) => setTimeout(r, 50));
-    // Still exactly one persisted token.
-    expect(mocks.payments._tokens.filter((t) => t.id === receivedInvoiceId)).toHaveLength(1);
+    expect((module as any).invoiceTermsCache.size).toBe(1);
+    expect(emitEvent).not.toHaveBeenCalledWith(
+      'invoice:created',
+      expect.objectContaining({ invoiceId: receivedInvoiceId }),
+    );
   });
 
-  it('UT-DELIVER-303: malformed JSON after prefix is silently dropped', async () => {
-    const dm = makeDM('invoice_delivery: {not json!!}');
-    mocks.communications._emit('message:dm', dm);
-    await new Promise((r) => setTimeout(r, 30));
-    expect(mocks.payments._tokens.find((t) => t.id === receivedInvoiceId)).toBeUndefined();
-  });
-
-  it('UT-DELIVER-304: wrong type discriminator silently dropped', async () => {
-    const dm = await buildDeliveryDM(receivedInvoiceJson, receivedInvoiceId, {
-      mutateEnvelope: (env) => { env.type = 'something_else'; },
-    });
-    mocks.communications._emit('message:dm', dm);
-    await new Promise((r) => setTimeout(r, 30));
-    expect(mocks.payments._tokens.find((t) => t.id === receivedInvoiceId)).toBeUndefined();
-  });
-
-  it('UT-DELIVER-305: future version silently dropped (forward compat)', async () => {
-    const dm = await buildDeliveryDM(receivedInvoiceJson, receivedInvoiceId, {
-      mutateEnvelope: (env) => { env.version = 99; },
-    });
-    mocks.communications._emit('message:dm', dm);
-    await new Promise((r) => setTimeout(r, 30));
-    expect(mocks.payments._tokens.find((t) => t.id === receivedInvoiceId)).toBeUndefined();
-  });
-
-  it('UT-DELIVER-306: invoiceId not present in bundle is silently dropped', async () => {
-    const dm = await buildDeliveryDM(receivedInvoiceJson, receivedInvoiceId, {
-      mutateEnvelope: (env) => { env.invoiceId = 'f'.repeat(64); },
-    });
-    mocks.communications._emit('message:dm', dm);
-    await new Promise((r) => setTimeout(r, 30));
-    expect(mocks.payments._tokens.find((t) => t.id === 'f'.repeat(64))).toBeUndefined();
-  });
-
-  it('UT-DELIVER-307: oversized DM payload is silently dropped', async () => {
-    const oversized = 'invoice_delivery:' + 'x'.repeat(131_073);
-    const dm = makeDM(oversized);
-    mocks.communications._emit('message:dm', dm);
-    await new Promise((r) => setTimeout(r, 30));
-    expect(mocks.payments._tokens.length).toBe(0);
-  });
-
-  it('UT-DELIVER-308: uxf-cid bundle kind is logged and dropped (deferred follow-up)', async () => {
-    const envelope = {
-      type: 'invoice_delivery',
-      version: 1,
-      invoiceId: receivedInvoiceId,
-      bundle: {
-        kind: 'uxf-cid',
-        bundleCid: 'bafybeibogusplaceholder1234567890abcdef',
-        gateways: ['https://gw.example/'],
+  it('UT-DELIVER-303: non-invoice token type does NOT register an invoice', async () => {
+    const emitEvent = (module as any).deps?.emitEvent as ReturnType<typeof vi.fn>;
+    emitEvent.mockClear();
+    // Synthesize a fake "regular" token with a non-invoice tokenType.
+    const fakeTxf = {
+      genesis: {
+        data: {
+          tokenId: 'b'.repeat(64),
+          tokenType: 'aa'.repeat(32), // not INVOICE
+          tokenData: 'whatever',
+        },
       },
+      transactions: [],
     };
-    const dm = makeDM('invoice_delivery:' + JSON.stringify(envelope));
-    mocks.communications._emit('message:dm', dm);
-    await new Promise((r) => setTimeout(r, 30));
-    expect(mocks.payments._tokens.find((t) => t.id === receivedInvoiceId)).toBeUndefined();
+    mocks.payments._notifyTokenChange('b'.repeat(64), JSON.stringify(fakeTxf));
+    expect((module as any).invoiceTermsCache.has('b'.repeat(64))).toBe(false);
+    expect(emitEvent).not.toHaveBeenCalledWith(
+      'invoice:created',
+      expect.anything(),
+    );
+  });
+
+  it('UT-DELIVER-304: malformed sdkData is silently dropped (no throw, no registration)', async () => {
+    const emitEvent = (module as any).deps?.emitEvent as ReturnType<typeof vi.fn>;
+    expect(() => {
+      mocks.payments._notifyTokenChange('c'.repeat(64), 'not json!!');
+    }).not.toThrow();
+    expect((module as any).invoiceTermsCache.has('c'.repeat(64))).toBe(false);
+    expect(emitEvent).not.toHaveBeenCalledWith(
+      'invoice:created',
+      expect.objectContaining({ invoiceId: 'c'.repeat(64) }),
+    );
   });
 });
 
 // =============================================================================
-// END-TO-END (sender + receiver in two modules, real-flow invoice)
+// END-TO-END (sender publishes via TOKEN_TRANSFER pipeline; receiver routes
+// the unpacked invoice token through the new onTokenChange observer)
 // =============================================================================
 
-describe('AccountingModule — Invoice Delivery (round-trip across two modules)', () => {
-  it('UT-DELIVER-401: deliverInvoice on sender → captured DM → receiver imports successfully', async () => {
+describe('AccountingModule — Invoice Delivery (round-trip via TOKEN_TRANSFER pipeline)', () => {
+  it('UT-DELIVER-401: sender deliverInvoice → captured CAR → receiver routes via onTokenChange', async () => {
     // ---- Sender ----
     const sender = createTestAccountingModule();
     (sender.mocks.payments as any).addToken = vi.fn().mockImplementation((t: Token) => {
@@ -726,23 +705,35 @@ describe('AccountingModule — Invoice Delivery (round-trip across two modules)'
     expect(senderResult.success).toBe(true);
     const invoiceId = senderResult.invoiceId;
 
-    let outbound: { recipient: string; content: string } | null = null;
-    sender.mocks.communications.sendDM.mockImplementation((recipient: string, content: string) => {
-      outbound = { recipient, content };
-      return Promise.resolve({
-        id: 'mock-dm-' + Math.random().toString(36).slice(2),
-        senderPubkey: '02' + 'a'.repeat(64),
-        recipientPubkey: '02' + 'b'.repeat(64),
-        content,
-        timestamp: Date.now(),
-        isRead: false,
-      });
-    });
+    // Capture the CAR that publishUxfBundle would have shipped.
+    let outbound: { recipient: string; carBytes: Uint8Array; tokenIds: ReadonlyArray<string> } | null = null;
+    sender.mocks.payments.publishUxfBundle.mockImplementation(
+      (params: { recipient: string; carBytes: Uint8Array; tokenIds: ReadonlyArray<string> }) => {
+        outbound = {
+          recipient: params.recipient,
+          carBytes: params.carBytes,
+          tokenIds: params.tokenIds,
+        };
+        return Promise.resolve({
+          nostrEventId: 'mock-event-id',
+          recipientTransportPubkey: params.recipient,
+        });
+      },
+    );
     const delivery = await sender.module.deliverInvoice(invoiceId);
     expect(delivery.sent).toBe(1);
     expect(outbound).not.toBeNull();
+    expect(outbound!.tokenIds).toEqual([invoiceId]);
 
     // ---- Receiver ----
+    // Simulate the receiver's standard TOKEN_TRANSFER decode pipeline:
+    // unpack the CAR, extract the invoice token JSON, hand it to addToken
+    // (which fires onTokenChange — exactly what `_handleTokenChange`
+    // listens to). Verifies the invoice lands in invoiceTermsCache
+    // without any DM-prefix handling.
+    const pkg = await UxfPackage.fromCar(outbound!.carBytes);
+    const assembledTokenJson = pkg.assemble(invoiceId);
+
     const receiver = createTestAccountingModule();
     (receiver.mocks.payments as any).addToken = vi.fn().mockImplementation((t: Token) => {
       receiver.mocks.payments._tokens.push(t);
@@ -753,15 +744,19 @@ describe('AccountingModule — Invoice Delivery (round-trip across two modules)'
       requestId: 'test-request-id',
     });
     await receiver.module.load();
-    const dm = makeDM(outbound!.content);
-    receiver.mocks.communications._emit('message:dm', dm);
-    await new Promise((r) => setTimeout(r, 50));
 
-    // Receiver landed the invoice via importInvoice + addToken.
-    const persisted = receiver.mocks.payments._tokens.find((t) => t.id === invoiceId);
-    expect(persisted).toBeDefined();
-    expect(persisted!.coinId).toBe(INVOICE_TOKEN_TYPE_HEX);
+    const emitEvent = (receiver.module as any).deps?.emitEvent as ReturnType<typeof vi.fn>;
+    emitEvent.mockClear();
+    receiver.mocks.payments._notifyTokenChange(
+      invoiceId,
+      JSON.stringify(assembledTokenJson),
+    );
+
     expect((receiver.module as any).invoiceTermsCache.has(invoiceId)).toBe(true);
+    expect(emitEvent).toHaveBeenCalledWith(
+      'invoice:created',
+      { invoiceId, confirmed: true },
+    );
 
     sender.module.destroy();
     receiver.module.destroy();

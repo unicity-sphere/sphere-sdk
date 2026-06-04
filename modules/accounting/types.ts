@@ -1276,37 +1276,3 @@ export interface DeliverInvoiceResult {
   readonly recipients: ReadonlyArray<DeliverInvoiceRecipientResult>;
 }
 
-/**
- * Inner JSON envelope carried after the `invoice_delivery:` DM prefix (#226).
- * Validated by the receiver before any bundle handling.
- *
- * The bundle is a UXF CARv1 — the same content-addressed packaging the
- * payments instant-sender uses for token transfers — either inline as
- * base64 or by-CID-reference for bundles exceeding the inline ceiling.
- */
-export interface InvoiceDeliveryEnvelope {
-  readonly type: 'invoice_delivery';
-  readonly version: 1;
-  /** 64-char lowercase hex tokenId of the invoice inside the bundle. */
-  readonly invoiceId: string;
-  /** Bundle wire shape — either inline CAR base64 or CID by reference. */
-  readonly bundle:
-    | {
-        readonly kind: 'uxf-car';
-        /** Base64-encoded CARv1 bytes. */
-        readonly carBase64: string;
-        /** Bundle CID (CIDv1, base32, multibase prefix `b`). Receiver MAY
-         *  re-derive and compare. */
-        readonly bundleCid: string;
-      }
-    | {
-        readonly kind: 'uxf-cid';
-        readonly bundleCid: string;
-        /** Optional gateway URLs the receiver MAY consult for IPFS fetch.
-         *  Informational only — the receiver always re-derives the CID
-         *  from the fetched bytes. */
-        readonly gateways?: ReadonlyArray<string>;
-      };
-  /** Optional memo from the sender. UNAUTHENTICATED (outside the bundle hash). */
-  readonly memo?: string;
-}
