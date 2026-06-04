@@ -107,7 +107,7 @@ interface ITokenEngine {
   appendTransfer(t: SphereToken, c: CertifiedTransferTransaction): Promise<SphereToken>;          // token.transfer(...)
   verifyInclusionProof(proof: InclusionProof, tx: ITransaction): Promise<EngineVerifyResult>;
 ```
-Notes: `mint`/`transfer`/`split` are the façade compositions of the granular steps. `SplitTokenRequest`/`SplitToken` internal shapes are finalized in Phase 0 against `TokenSplit.split`.
+Notes: `mint`/`transfer`/`split` are the façade compositions of the granular steps. **S0-verified (6027e82):** `SplitTokenRequest.create(recipient, assets: PaymentAssetCollection, tokenType?, salt?)`; `TokenSplit.split(token, decodePaymentData, SplitTokenRequest[])` → `ISplit{ burn:{ownerPredicate,transaction}, tokens: SplitToken[] }`; `SplitToken{ networkId, recipient, tokenType, salt, assets, proofs: SplitAssetProof[] }`.
 
 ### A.3 `SpherePaymentData` (implements v2 `IPaymentData`) — the value model
 v2 `Token` has **no coins**; value is app-defined in `MintTransaction.data`:
@@ -224,14 +224,17 @@ Granular split: `buildTransfer`(1–3) → `toCertificationData`+`submit`(4–6)
 | `transaction→transition` import resolution | DELETE | recipient predicate is fully specified by sender |
 | `ReceiveOptions.{finalize,timeout,pollInterval,onProgress}` | DELETE | async finalize gone |
 
-### B.4 SPLIT → `engine.split`
+### B.4 SPLIT → `engine.split`  *(signatures verified on 6027e82, Spike S0)*
 ```
-1. requests = outputs grouped into [TokenId(child), PaymentAssetCollection][]   // child tokenId from each mint's salt+networkId
+1. requests = outputs.map(o => SplitTokenRequest.create(o.recipient, PaymentAssetCollection.create(Asset(assetId(o.coinId), o.amount)), tokenType?, salt?))
+              // SplitTokenRequest { recipient, tokenType, assets, salt }; child tokenId is derived = TokenId.fromSalt(networkId, salt)
 2. split   = await TokenSplit.split(token.sdkToken, SpherePaymentData.fromCBOR, requests)
-            // → { burn:{ ownerPredicate: BurnPredicate, transaction: TransferTransaction }, proofs: Map<TokenId, SplitAssetProof[]> }
+            // ISplit → { burn:{ ownerPredicate: BurnPredicate, transaction: TransferTransaction }, tokens: SplitToken[] }
 3. burn    : cert = CertificationData.fromTransaction(split.burn.transaction, unlock); submit; awaitProof; token.transfer(certBurn) → burntToken
-4. per out : just  = SplitMintJustification.create(burntToken, split.proofs.get(tid)).toCBOR()
-             mintTx= await MintTransaction.create(networkId, recipientPredicate, paymentData, tokenType, salt, just)
+4. per out st of split.tokens (SplitToken { networkId, recipient, tokenType, salt, assets, proofs: SplitAssetProof[] }):
+             just  = SplitMintJustification.create(burntToken, st.proofs).toCBOR()                  // CBOR_TAG 39044n
+             data  = await new SpherePaymentData(st.assets).encode()
+             mintTx= await MintTransaction.create(st.networkId, st.recipient, data, st.tokenType, st.salt, just)
              → CertificationData.fromMintTransaction → submit → awaitProof → toCertifiedTransaction → Token.mint
 5. conservation enforced inside TokenSplit: SparseMerkleSumTree root.value === asset.value, else TokenAssetValueMismatchError
 ```
