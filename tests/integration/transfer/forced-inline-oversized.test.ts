@@ -49,10 +49,12 @@ import {
 
 describe('§11.2 — force-inline with an oversized bundle (> RELAY_SAFE_CAP_BYTES)', () => {
   it('throws INLINE_CAR_TOO_LARGE; transport never called; transfer:failed emitted', async () => {
-    // Build enough sources so the assembled CAR exceeds 96 KiB. Each
-    // TOKEN_A child is roughly ~700 bytes serialized; 200 of them
-    // comfortably crosses the 96 KiB ceiling.
-    const N = 200;
+    // Build enough sources so the assembled CAR exceeds
+    // RELAY_SAFE_CAP_BYTES. Each TOKEN_A child is roughly ~700 bytes
+    // serialized; #394b raised the cap from 96 KiB to 512 KiB, so we
+    // need ~800 tokens (~560 KiB) to comfortably cross the new
+    // ceiling.
+    const N = 800;
     const sources = Array.from({ length: N }, (_, i) => {
       const serial = (i + 1).toString(16).padStart(4, '0');
       const idHex = `aa${serial}${'0'.repeat(58)}`;
@@ -118,9 +120,9 @@ describe('§11.2 — force-inline with an oversized bundle (> RELAY_SAFE_CAP_BYT
   });
 
   it('boundary: bundle just under RELAY_SAFE_CAP_BYTES succeeds force-inline', async () => {
-    // Sanity: a 50-token bundle is ~35 KiB — well under the 96 KiB
-    // ceiling. force-inline accepts. Confirms the rejection above is
-    // size-driven, not a bug.
+    // Sanity: a 50-token bundle is ~35 KiB — well under the 512 KiB
+    // post-#394b ceiling. force-inline accepts. Confirms the
+    // rejection above is size-driven, not a bug.
     const N = 50;
     const sources = Array.from({ length: N }, (_, i) => {
       const serial = (i + 1).toString(16).padStart(4, '0');
