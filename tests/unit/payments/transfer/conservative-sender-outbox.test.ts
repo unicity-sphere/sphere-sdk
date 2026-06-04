@@ -31,6 +31,9 @@
  */
 
 import { describe, expect, it, vi } from 'vitest';
+import { AUTOMATED_CID_DELIVERY_ENABLED } from '../../../../modules/payments/transfer/limits';
+// Issue #393 — gate auto-CID-promotion tests on the kill-switch.
+const ifAutoCid = AUTOMATED_CID_DELIVERY_ENABLED ? it : it.skip;
 
 import {
   sendConservativeUxf,
@@ -411,7 +414,7 @@ describe('sendConservativeUxf outbox integration — CID delivery', () => {
     expect(statuses).toEqual(['pinned', 'sending', 'delivered']);
   });
 
-  it('CID delivery via auto-mode-over-cap also goes through pinned', async () => {
+  ifAutoCid('CID delivery via auto-mode-over-cap also goes through pinned', async () => {
     const source = makeToken('tok-1', TOKEN_A);
     const commitResult = makeCommitResult({ sourceTokenId: 'tok-1', fixture: TOKEN_A });
     const publishToIpfs = vi.fn<PublishToIpfsCallback>().mockResolvedValue({

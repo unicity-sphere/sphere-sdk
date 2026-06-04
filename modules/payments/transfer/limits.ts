@@ -57,6 +57,55 @@ export const MAX_INLINE_CAR_BYTES = 16 * 1024;
 export const RELAY_SAFE_CAP_BYTES = 96 * 1024;
 
 /**
+ * Master kill-switch for automated CID delivery (issue #393, sphere-sdk).
+ *
+ * **What this controls.** When `false` (current default), `delivery:
+ * { kind: 'auto' }` NEVER promotes a bundle to CID-over-Nostr — even if
+ * `carBytes.byteLength > inlineCapBytes`. The resolver and the dispatcher
+ * pre-flights treat `auto` as "force inline up to {@link RELAY_SAFE_CAP_BYTES},
+ * throw INLINE_CAR_TOO_LARGE beyond that." `{kind: 'force-cid'}` still
+ * works — it is the only way to request CID delivery while this flag is
+ * off.
+ *
+ * **Why this is currently disabled.**
+ *  1. The CLI's `createNodeProviders` factory does not wire a
+ *     `publishToIpfs` callback by default. Bundles that overflow the
+ *     inline cap (easily reached after a few whole-token transfers, each
+ *     of which drags its transaction history along) trip
+ *     `IPFS_PUBLISHER_REQUIRED` at the resolver and break user-facing
+ *     sends.
+ *  2. The auto-fallback layer (auto-over-cap + no publisher →
+ *     `carInlineFallback` silently downgrades back to inline) is a
+ *     non-trivial branch that has never been exercised end-to-end on
+ *     the CLI surface. The complexity surface is not justified by the
+ *     coverage we have today.
+ *  3. Soak coverage for the size-promotion path is missing. Until we
+ *     have a soak that exercises auto-promotion through a wired
+ *     publisher across a multi-hop chain, every change in this area
+ *     ships with no real safety net.
+ *
+ * **How to re-enable.** Flip this constant to `true`. The auto-promotion
+ * code paths in {@link resolveDelivery} (`'auto'` case) and in the
+ * dispatcher pre-flights (`instant-sender.ts`, `conservative-sender.ts`)
+ * are still in place; they're gated on this constant. Re-enabling
+ * requires:
+ *  - The CLI's provider factories wire `publishToIpfs` by default
+ *    (see `impl/nodejs/index.ts` / `createNodeProviders`).
+ *  - A soak script that exercises auto-promotion with a wired publisher
+ *    end-to-end (multi-hop chain, large bundle, verify the CID-over-Nostr
+ *    delivery actually reaches the receiver and is retrievable).
+ *  - The dispatcher pre-flights and the resolver's `auto` branch are
+ *    re-exercised by their existing unit tests (the gated paths stay
+ *    in place — flipping this constant flips them back on).
+ *
+ * **Tests.** Unit tests under `tests/unit/payments/transfer/delivery-resolver.test.ts`
+ * that exercise the auto-promotion path are conditionally skipped via
+ * `it.skipIf(!AUTOMATED_CID_DELIVERY_ENABLED)`. They snap back into
+ * service automatically when the constant flips.
+ */
+export const AUTOMATED_CID_DELIVERY_ENABLED = false;
+
+/**
  * Maximum CAR size the recipient will fetch via `kind: 'uxf-cid'`. Streaming
  * fetches abort with `FETCHED_CAR_TOO_LARGE` once running byte-count crosses
  * this threshold. DoS defense against hostile pinned CIDs. (§3.3.1.)
