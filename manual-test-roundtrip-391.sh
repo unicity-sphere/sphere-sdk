@@ -338,7 +338,7 @@ else
 
   # Net deltas. Use signed arithmetic; bash supports negatives in $((...)).
   alice_net_delta=$(( alice_4 - alice_0 ))
-  bob_net_delta=$(  ( bob_4   - bob_0   ) )
+  bob_net_delta=$(( bob_4 - bob_0 ))
   expected_alice=-50000000
   expected_bob=50000000
 

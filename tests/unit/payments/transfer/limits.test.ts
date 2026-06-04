@@ -35,8 +35,11 @@ describe('UXF transfer limits — constant values', () => {
     expect(MAX_INLINE_CAR_BYTES).toBe(16 * 1024);
   });
 
-  it('RELAY_SAFE_CAP_BYTES === 96 KiB', () => {
-    expect(RELAY_SAFE_CAP_BYTES).toBe(96 * 1024);
+  it('RELAY_SAFE_CAP_BYTES === 512 KiB (post-#394b)', () => {
+    // Issue #394b — raised from 96 KiB to 512 KiB. Today's Nostr
+    // relays carry events up to ~1 MiB comfortably; 512 KiB is the
+    // half-of-1-MiB safety budget.
+    expect(RELAY_SAFE_CAP_BYTES).toBe(512 * 1024);
   });
 
   it('MAX_FETCHED_CAR_BYTES === 32 MiB', () => {

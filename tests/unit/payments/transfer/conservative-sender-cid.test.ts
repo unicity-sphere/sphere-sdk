@@ -419,11 +419,14 @@ describe('sendConservativeUxf CID — auto-route over inline cap', () => {
   });
 
   ifAutoCid('large multi-token bundle (>RELAY_SAFE_CAP_BYTES) auto-routes to CID with default delivery', async () => {
-    // Build a multi-token bundle that exceeds the default 96 KiB
-    // inline cap (RELAY_SAFE_CAP_BYTES, raised from 16 KiB by issue
-    // #394). Each TOKEN_A serializes to roughly ~0.9 KiB post-CAR;
-    // 120 distinct copies (~108 KiB) cleanly clears the new cap.
-    const N = 120;
+    // Build a multi-token bundle that exceeds the default
+    // RELAY_SAFE_CAP_BYTES inline cap. Issue #394 raised this default
+    // from 16 KiB to 96 KiB; issue #394b raised it again to 512 KiB
+    // (today's Nostr relays comfortably carry up to ~1 MiB; 512 KiB
+    // is the half-of-1-MiB safety budget). Each TOKEN_A serializes to
+    // roughly ~0.9 KiB post-CAR; 640 distinct copies (~576 KiB)
+    // cleanly clears the 512 KiB cap.
+    const N = 640;
     const sources = Array.from({ length: N }, (_, i) => makeToken(`tok-${i}`, TOKEN_A));
     const commitResults = sources.map((s, i) =>
       makeCommitResult({
@@ -455,11 +458,12 @@ describe('sendConservativeUxf CID — auto-route over inline cap', () => {
     expect(transport._calls).toHaveLength(1);
     const payload = transport._calls[0].payload as UxfTransferPayloadCid;
     expect(payload.kind).toBe('uxf-cid');
-    // Verify the published CAR genuinely exceeded 96 KiB (regression
+    // Verify the published CAR genuinely exceeded 512 KiB (regression
     // gate against future fixture shrinkage that would silently route
-    // through the inline branch under the new RELAY_SAFE_CAP_BYTES cap).
+    // through the inline branch under the post-#394b RELAY_SAFE_CAP_BYTES
+    // cap).
     const carBytesArg = publishToIpfs.mock.calls[0][0];
-    expect(carBytesArg.byteLength).toBeGreaterThan(96 * 1024);
+    expect(carBytesArg.byteLength).toBeGreaterThan(512 * 1024);
   });
 });
 

@@ -42,19 +42,35 @@ import { CID } from 'multiformats';
 // =============================================================================
 
 /**
- * Default inline-CAR cap when `delivery: { kind: 'auto' }`. Below this, the
- * sender embeds the CAR bytes inside the Nostr event. Spec default: 16 KiB
- * (§3.3.1). Per-call overrides are clamped to {@link RELAY_SAFE_CAP_BYTES}.
+ * Documented soft hint for callers that explicitly want a smaller inline
+ * cap via `delivery: { kind: 'auto', inlineCapBytes: <n> }`.
+ *
+ * **History.** Was originally the default cap for `auto` mode (16 KiB,
+ * §3.3.1). Issue #394 raised the default to {@link RELAY_SAFE_CAP_BYTES}
+ * because the 16 KiB threshold was a quarter of what the relay can
+ * actually handle, causing unnecessary CID promotion. The constant is
+ * preserved because callers may still want a conservative inline cap
+ * for bandwidth-sensitive paths; pass it via `inlineCapBytes`.
  */
 export const MAX_INLINE_CAR_BYTES = 16 * 1024;
 
 /**
- * Hard ceiling for inline CAR delivery, regardless of caller override. The
- * SDK silently clamps `inlineCapBytes` to this value when the caller passes
- * a larger number — `auto` mode never publishes inline above the relay-safe
- * ceiling. (§3.3.1, normative.)
+ * Hard ceiling for inline CAR delivery, regardless of caller override.
+ *
+ * **Issue #394b — raised from 96 KiB to 512 KiB (this constant).** The
+ * Nostr relays in use today can comfortably carry events up to roughly
+ * 1 MiB per the relay operators' confirmation; 512 KiB is the
+ * half-of-1-MiB safety budget. The previous 96 KiB was conservative for
+ * older relay implementations and produced unnecessary CID-promotion
+ * pressure on multi-hop bundles — typical 3-token chains land around
+ * 100-150 KiB, well inside the new envelope.
+ *
+ * The SDK silently clamps caller-supplied `inlineCapBytes` to this value
+ * when the caller passes a larger number — `auto` mode never publishes
+ * inline above the relay-safe ceiling. Bundles beyond this ceiling MUST
+ * route through CID-over-Nostr (`uxf-cid`).
  */
-export const RELAY_SAFE_CAP_BYTES = 96 * 1024;
+export const RELAY_SAFE_CAP_BYTES = 512 * 1024;
 
 /**
  * Master kill-switch for automated CID delivery (issues #393/#394, sphere-sdk).
