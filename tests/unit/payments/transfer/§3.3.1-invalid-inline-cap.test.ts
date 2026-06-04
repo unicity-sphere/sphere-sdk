@@ -22,7 +22,10 @@
 import { describe, it, expect } from 'vitest';
 
 import { resolveDelivery } from '../../../../modules/payments/transfer/delivery-resolver';
-import { RELAY_SAFE_CAP_BYTES } from '../../../../modules/payments/transfer/limits';
+import {
+  AUTOMATED_CID_DELIVERY_ENABLED,
+  RELAY_SAFE_CAP_BYTES,
+} from '../../../../modules/payments/transfer/limits';
 import { SphereError } from '../../../../core/errors';
 
 // =============================================================================
@@ -146,15 +149,23 @@ describe('§3.3.1 INVALID_INLINE_CAP — undersized cap rejects deterministicall
 
 describe('§3.3.1 INVALID_INLINE_CAP — in-range caps pass through', () => {
   it('inlineCapBytes: 1 (the minimum legal value) → no throw', async () => {
-    // 1 is the minimum legal value (the boundary). The CAR is 2 bytes,
-    // exceeding cap of 1, so the routing is CID. Critical: it must NOT
+    // 1 is the minimum legal value (the boundary). Critical: it must NOT
     // throw INVALID_INLINE_CAP (cap = 1 is legal, not "< 1").
+    //
+    // **Issue #393 — kill-switch dependent outcome.**
+    //  - When AUTOMATED_CID_DELIVERY_ENABLED === true (legacy behaviour):
+    //    the CAR (2 bytes) exceeds the 1-byte cap, so the resolver
+    //    promotes to CID.
+    //  - When AUTOMATED_CID_DELIVERY_ENABLED === false (current default):
+    //    auto-mode never promotes, so the routing stays inline. The
+    //    no-throw assertion still holds — that's the load-bearing
+    //    contract this test pins.
     const result = await resolveDelivery({
       strategy: { kind: 'auto', inlineCapBytes: 1 },
       carBytes: minimalCar,
       publishToIpfs: async () => ({ cid: 'bafyok' }),
     });
-    expect(result.kind).toBe('cid');
+    expect(result.kind).toBe(AUTOMATED_CID_DELIVERY_ENABLED ? 'cid' : 'inline');
   });
 
   it('inlineCapBytes: 16384 (default) → no throw, inline path, no clamp', async () => {

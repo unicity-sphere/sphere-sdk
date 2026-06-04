@@ -91,6 +91,7 @@ import type { FaultInjectionHooks } from './conservative-sender';
 import type { PublishToIpfsCallback } from './delivery-resolver';
 import { resolveDelivery } from './delivery-resolver';
 import {
+  AUTOMATED_CID_DELIVERY_ENABLED,
   MAX_INLINE_CAR_BYTES,
   RELAY_SAFE_CAP_BYTES,
 } from './limits';
@@ -942,18 +943,19 @@ export async function sendInstantUxf(
     // Step 8: resolve delivery (T.2.C).
     // -----------------------------------------------------------------
     const strategy: DeliveryStrategy = request.delivery ?? { kind: 'auto' };
-    // `wantsCidBranch` mirrors the CID-vs-inline decision that
-    // `resolveDelivery` will make. For `auto` mode we use
-    // `MAX_INLINE_CAR_BYTES` (16 KiB) as the default cap — the same
-    // constant the resolver uses — so the two predicates stay in sync.
-    // (The former code used `Number.POSITIVE_INFINITY` which caused the
-    // pre-flight to never fire for default-auto bundles while the resolver
-    // still routed them to the CID branch and threw IPFS_PUBLISHER_MISSING.)
-    const wantsCidBranch =
-      strategy.kind === 'force-cid' ||
-      (strategy.kind === 'auto' &&
-        carBytes.byteLength >
-          (strategy.inlineCapBytes ?? MAX_INLINE_CAR_BYTES));
+    // Issue #393 — `wantsCidBranch` mirrors the CID-vs-inline decision
+    // that `resolveDelivery` will make. The predicate is gated on the
+    // kill-switch {@link AUTOMATED_CID_DELIVERY_ENABLED} (see
+    // `limits.ts`): when the flag is OFF (current default), `auto`
+    // mode never promotes to CID, so the only path that wants CID is
+    // the explicit `force-cid`. When the flag flips back ON, the
+    // legacy bundle-size predicate is restored.
+    const wantsCidBranch = AUTOMATED_CID_DELIVERY_ENABLED
+      ? strategy.kind === 'force-cid' ||
+        (strategy.kind === 'auto' &&
+          carBytes.byteLength >
+            (strategy.inlineCapBytes ?? MAX_INLINE_CAR_BYTES))
+      : strategy.kind === 'force-cid';
     if (wantsCidBranch && deps.publishToIpfs === undefined) {
       // Pre-flight reject: bundle needs CID delivery, no publisher is
       // wired, and the bundle is too large for the CAR-inline fallback
@@ -975,6 +977,28 @@ export async function sendInstantUxf(
       }
       // Bundle fits within RELAY_SAFE_CAP_BYTES: resolveDelivery will
       // apply the CAR-inline fallback transparently. No pre-flight throw.
+    }
+    // Issue #393 — when automated CID is OFF and the bundle exceeds
+    // RELAY_SAFE_CAP_BYTES in `auto` mode, surface the error here at
+    // pre-flight rather than after the full CAR build/pin work
+    // completes in resolveDelivery. Same throw text as the resolver's
+    // `'auto'` branch so operators see one consistent message regardless
+    // of which call site detects the overflow.
+    if (
+      !AUTOMATED_CID_DELIVERY_ENABLED &&
+      strategy.kind === 'auto' &&
+      carBytes.byteLength > RELAY_SAFE_CAP_BYTES
+    ) {
+      throw new SphereError(
+        `sendInstantUxf: bundle is ${carBytes.byteLength} bytes, exceeds the ` +
+          `relay-safe inline ceiling of ${RELAY_SAFE_CAP_BYTES} bytes, AND ` +
+          `automated CID delivery is currently disabled (see ` +
+          `AUTOMATED_CID_DELIVERY_ENABLED in modules/payments/transfer/limits.ts). ` +
+          `Either reduce the source set so the bundle fits inline, or pass ` +
+          `\`delivery: { kind: 'force-cid' }\` with an IPFS publisher wired ` +
+          `via createNodeProviders/createBrowserProviders.`,
+        'INLINE_CAR_TOO_LARGE',
+      );
     }
 
     // -----------------------------------------------------------------

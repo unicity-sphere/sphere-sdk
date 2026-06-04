@@ -42,6 +42,7 @@
 
 import { describe, expect, it, vi } from 'vitest';
 
+import { AUTOMATED_CID_DELIVERY_ENABLED } from '../../../../modules/payments/transfer/limits';
 import {
   sendConservativeUxf,
   type ConservativeCommitResult,
@@ -49,6 +50,10 @@ import {
   type OutboxIntegrationHooks,
   type OutboxTransitionPatch,
 } from '../../../../modules/payments/transfer/conservative-sender';
+
+// Issue #393 — gate auto-CID-promotion tests on the kill-switch (see
+// `modules/payments/transfer/limits.ts`).
+const ifAutoCid = AUTOMATED_CID_DELIVERY_ENABLED ? it : it.skip;
 import type { PreflightFinalizeOptions } from '../../../../modules/payments/transfer/preflight-finalize';
 import type { TokenLike } from '../../../../modules/payments/transfer/classify-token';
 import type { PublishToIpfsCallback } from '../../../../modules/payments/transfer/delivery-resolver';
@@ -370,7 +375,7 @@ describe('sendConservativeUxf CID — force-cid for tiny bundles', () => {
 // =============================================================================
 
 describe('sendConservativeUxf CID — auto-route over inline cap', () => {
-  it('routes to CID branch and exposes uxf-cid payload (>16 KiB simulated)', async () => {
+  ifAutoCid('routes to CID branch and exposes uxf-cid payload (>16 KiB simulated)', async () => {
     // The default `MAX_INLINE_CAR_BYTES` is 16 KiB. We can deterministically
     // exercise the auto-over-cap branch by using a 1-byte cap — any
     // non-empty CAR exceeds it. This preserves the spec guarantee
@@ -413,7 +418,7 @@ describe('sendConservativeUxf CID — auto-route over inline cap', () => {
     expect(statuses).toEqual(['pinned', 'sending', 'delivered']);
   });
 
-  it('large multi-token bundle (>16 KiB) auto-routes to CID with default delivery', async () => {
+  ifAutoCid('large multi-token bundle (>16 KiB) auto-routes to CID with default delivery', async () => {
     // Build a multi-token bundle that genuinely exceeds the default
     // 16 KiB inline cap. Each TOKEN_A serializes to roughly ~0.9 KiB
     // post-CAR; 30 distinct copies (~27 KiB) cleanly clears the cap.
