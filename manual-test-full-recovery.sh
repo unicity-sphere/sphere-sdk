@@ -222,7 +222,67 @@ normalize_snapshot() {
     -e '/^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z\] /d' \
     -e '/^  IPFS: \+[0-9]+ added, -[0-9]+ removed$/d' \
     -e '/^Syncing\.\.\.$/d' \
-    -e '/^  Ready\.$/d'
+    -e '/^  Ready\.$/d' \
+    -e 's/ \(\+ [0-9.]+ unconfirmed\)//' \
+    -e 's/ \[[0-9]+\+[0-9]+ tokens\]//' \
+    -e 's/ \([0-9]+ tokens?\)//' \
+    -e 's/ \(1 token\)//'
+}
+# Issue #387 — confirmed-balance-only diff. The two `s/.../...` rules
+# above strip the optional `(+ N unconfirmed)` and `[X+Y tokens]`
+# clauses, plus the `(N tokens)` suffix that appears for fully-
+# confirmed entries. After normalization, each balance line is
+# reduced to `COIN: amount` (e.g. `UCT: 42`) — diff comparisons
+# therefore measure CONFIRMED balance equality only. Unconfirmed
+# pollution (the exact #387 failure mode) is caught by the dedicated
+# `assert_no_unconfirmed_after_finalize` gate below, NOT by the
+# byte-comparison diff (which would mask it equally on both sides).
+#
+# Issue #387 gate — fail the soak if any `sphere balance` snapshot
+# captured after `sphere payments receive --finalize` contains a
+# `(+ N unconfirmed)` clause with N>=1. Per #387's reproduction, a
+# V6-RECOVER permanent-mismatch verdict that doesn't durably mark
+# the token invalid surfaces as persistent unconfirmed UCT pollution
+# across multiple receive --finalize calls. The diff-based gates
+# never caught this because the pollution was equal on both sides
+# of the diff (same wallet, same stuck event).
+#
+# A finalize that "drained successfully" MUST leave zero unconfirmed
+# tokens — anything in the snapshot at that point is a regression of
+# the durable-invalid contract.
+assert_no_unconfirmed_after_finalize() {
+  local label="$1" snapshot="$2"
+  if [[ ! -f "$snapshot" ]]; then
+    echo "ASSERT FAIL ($label): missing snapshot file: $snapshot" >&2
+    return 1
+  fi
+  # Issue #389 finding #2 — match decimal amounts, not just integers.
+  # Real CLI output is e.g. `UCT: 100.000000000011 (2 tokens)` and a
+  # 10-satoshi V6-RECOVER pollution renders as `(+ 0.0000001 unconfirmed)`
+  # which the old `[1-9][0-9]*` ASCII-integer pattern silently missed.
+  #
+  # We deliberately avoid awk's `+ 0` numeric coercion (which would
+  # cast the matched amount through an IEEE-754 double and silently
+  # lose precision for any token whose smallest-unit count exceeds
+  # 2^53). The SDK aggregates balances as bigint throughout (see
+  # `aggregateTokens`); the soak gate must respect that. Instead we
+  # match by pattern: the amount must contain at least one non-zero
+  # digit somewhere in its [0-9.]* run. This is a pure
+  # string/character-class check — no numeric conversion, valid at
+  # arbitrary precision.
+  local pat='\(\+ [0-9.]*[1-9][0-9.]* unconfirmed\)'
+  if grep -qE "$pat" "$snapshot"; then
+    echo "ASSERT FAIL ($label): unconfirmed tokens present after receive --finalize" >&2
+    echo "  Issue #387 — V6-RECOVER permanent-mismatch should durably mark the token invalid." >&2
+    echo "  Snapshot: $snapshot" >&2
+    # Issue #389 finding #14 — diagnostic line MUST mirror the gate's
+    # decimal-aware pattern so operators see the same lines the gate
+    # tripped on, not unrelated 'unconfirmed' noise (e.g. log strings
+    # containing the word 'unconfirmed' outside the balance-line shape).
+    grep -nE "$pat" "$snapshot" >&2 || true
+    return 1
+  fi
+  echo "ASSERT OK ($label): no unconfirmed tokens in post-finalize snapshot"
 }
 
 assert_diff_empty() {
@@ -400,6 +460,102 @@ EOF
     rc=1
   fi
 
+  # ---- T8 (#387): confirmed-only diff masks (+N unconfirmed) ----
+  # Two snapshots with identical confirmed amounts but different
+  # unconfirmed clauses MUST compare equal after normalize. Without
+  # this, diff-based gates would flag every transient sync race as
+  # a regression.
+  cat > "$a" <<'EOF'
+L3 Balance:
+ETH: 42 (1 token)
+UCT: 100 (3 tokens)
+EOF
+  cat > "$b" <<'EOF'
+L3 Balance:
+ETH: 42 (1 token)
+UCT: 100 (+ 5 unconfirmed) [3+1 tokens]
+EOF
+  normalize_snapshot "$a" > "$na"
+  normalize_snapshot "$b" > "$nb"
+  if diff -u "$na" "$nb" >/dev/null; then
+    echo "T8 OK: confirmed-only normalize masks (+N unconfirmed) clause"
+  else
+    echo "T8 FAIL: confirmed-only normalize did not mask unconfirmed clause" >&2
+    diff -u "$na" "$nb" >&2 || true
+    rc=1
+  fi
+
+  # ---- T9 (#387): assert_no_unconfirmed_after_finalize semantics ----
+  # Gate must FAIL on (+N unconfirmed) with N>=1, PASS on clean
+  # snapshots.
+  cat > "$a" <<'EOF'
+UCT: 100 (3 tokens)
+EOF
+  cat > "$b" <<'EOF'
+UCT: 0 (+ 16 unconfirmed) [0+3 tokens]
+EOF
+  local rc1=0 rc2=0
+  assert_no_unconfirmed_after_finalize "T9-clean"    "$a" >/dev/null 2>&1 || rc1=$?
+  assert_no_unconfirmed_after_finalize "T9-polluted" "$b" >/dev/null 2>&1 || rc2=$?
+  if (( rc1 == 0 )) && (( rc2 != 0 )); then
+    echo "T9 OK: assert_no_unconfirmed_after_finalize gate semantics correct"
+  else
+    echo "T9 FAIL: gate semantics broken (clean rc=$rc1 expected 0; polluted rc=$rc2 expected non-0)" >&2
+    rc=1
+  fi
+
+  # ---- T10 (#389 #2): decimal-amount pollution must trip the gate ----
+  # Real CLI output uses decimal amounts (e.g. `UCT: 100.000000000011`),
+  # so a 10-satoshi V6-RECOVER pollution renders as `(+ 0.0000001
+  # unconfirmed)`. The pre-#389 ASCII-integer pattern silently passed
+  # exactly the shape it was designed to catch. T10 locks this in.
+  cat > "$a" <<'EOF'
+UCT: 100.000000000011 (2 tokens)
+EOF
+  cat > "$b" <<'EOF'
+UCT: 100.000000000011 (+ 0.0000001 unconfirmed) [2+1 tokens]
+EOF
+  cat > "$tmpdir/c.txt" <<'EOF'
+UCT: 100 (+ 0.0 unconfirmed) [2+1 tokens]
+EOF
+  cat > "$tmpdir/d.txt" <<'EOF'
+UCT: 100 (+ 0 unconfirmed) [2+1 tokens]
+EOF
+  local rc3=0 rc4=0 rc5=0 rc6=0
+  assert_no_unconfirmed_after_finalize "T10-clean-decimal"   "$a" >/dev/null 2>&1 || rc3=$?
+  assert_no_unconfirmed_after_finalize "T10-decimal-poll"    "$b" >/dev/null 2>&1 || rc4=$?
+  assert_no_unconfirmed_after_finalize "T10-zero-decimal-ok" "$tmpdir/c.txt" >/dev/null 2>&1 || rc5=$?
+  assert_no_unconfirmed_after_finalize "T10-zero-int-ok"     "$tmpdir/d.txt" >/dev/null 2>&1 || rc6=$?
+  if (( rc3 == 0 )) && (( rc4 != 0 )) && (( rc5 == 0 )) && (( rc6 == 0 )); then
+    echo "T10 OK: decimal-amount unconfirmed pollution detected (clean+zero-only snapshots accepted)"
+  else
+    echo "T10 FAIL: decimal-amount gate broken (clean-decimal=$rc3 expect 0; decimal-poll=$rc4 expect non-0; zero-decimal=$rc5 expect 0; zero-int=$rc6 expect 0)" >&2
+    rc=1
+  fi
+
+  # ---- T11 (#389 #3): normalize_snapshot must strip decimal unconfirmed
+  # clauses too. Otherwise diff-based gates either false-pass (both
+  # sides keep the same unstripped clause) or false-fail (one side
+  # synced more), instead of measuring the intended confirmed-only
+  # equivalence.
+  cat > "$a" <<'EOF'
+L3 Balance:
+UCT: 100.000000000011 (2 tokens)
+EOF
+  cat > "$b" <<'EOF'
+L3 Balance:
+UCT: 100.000000000011 (+ 0.0000001 unconfirmed) [2+1 tokens]
+EOF
+  normalize_snapshot "$a" > "$na"
+  normalize_snapshot "$b" > "$nb"
+  if diff -u "$na" "$nb" >/dev/null; then
+    echo "T11 OK: normalize_snapshot strips decimal (+N.M unconfirmed) clause"
+  else
+    echo "T11 FAIL: normalize_snapshot left decimal (+N.M unconfirmed) clause unstripped" >&2
+    diff -u "$na" "$nb" >&2 || true
+    rc=1
+  fi
+
   rm -rf "$tmpdir"
   if (( rc == 0 )); then
     echo "=== normalize_snapshot self-tests: ALL PASS ==="
@@ -553,6 +709,11 @@ sphere payments receive --finalize         2>&1 | tee "$SNAP/peer2-alice-receive
 sphere balance                             > "$SNAP/peer2-alice-initial.txt"
 cat "$SNAP/peer2-alice-initial.txt"
 
+# Issue #387 — post-finalize MUST have zero unconfirmed tokens.
+assert_no_unconfirmed_after_finalize \
+  "alice-peer2-initial-post-finalize" \
+  "$SNAP/peer2-alice-initial.txt"
+
 # Peer1 snapshot for diffing
 ( cd "$PEER1" && sphere wallet use alice && sphere balance ) > "$SNAP/peer1-alice-initial.txt"
 
@@ -572,6 +733,11 @@ sphere payments sync                       2>&1 | tee "$SNAP/peer2-bob-sync.log"
 sphere payments receive --finalize         2>&1 | tee "$SNAP/peer2-bob-receive.log"
 sphere balance                             > "$SNAP/peer2-bob-initial.txt"
 cat "$SNAP/peer2-bob-initial.txt"
+
+# Issue #387 — post-finalize MUST have zero unconfirmed tokens.
+assert_no_unconfirmed_after_finalize \
+  "bob-peer2-initial-post-finalize" \
+  "$SNAP/peer2-bob-initial.txt"
 
 # ---------------------------------------------------------------------------
 # §B — Daemons on peer2
@@ -652,6 +818,14 @@ sphere payments sync       2>&1 | tee "$SNAP/peer1-bob-pre-pay-sync.log"
 # `invoice_delivery:` DM channel (handled by AccountingModule, not
 # the payments pipeline) — included here purely for hygiene.
 sphere payments receive --finalize 2>&1 | tee "$SNAP/peer1-bob-pre-pay-receive.log"
+sphere balance                     > "$SNAP/peer1-bob-pre-pay-balance.txt"
+# Issue #387 — bob's wallet MUST NOT carry any unconfirmed UCT into the
+# invoice payment, otherwise the V6-RECOVER permanent-mismatch pollution
+# would surface inside the invoice payment flow (spend planner sees a
+# phantom unconfirmed source it can never actually consume).
+assert_no_unconfirmed_after_finalize \
+  "bob-pre-pay-post-finalize" \
+  "$SNAP/peer1-bob-pre-pay-balance.txt"
 sphere invoice pay "$INV"  2>&1 | tee "$SNAP/peer1-invoice-pay.log"
 sphere payments sync       2>&1 | tee "$SNAP/peer1-invoice-pay-sync.log"
 
@@ -773,6 +947,14 @@ sphere balance                      > "$SNAP/alice-after.txt"
 sphere payments tokens              > "$SNAP/alice-tokens-after.txt"
 sphere invoice list --state COVERED > "$SNAP/alice-invoices-after.txt"
 
+# Issue #387 — recovery completes when ALL finalizable receives are
+# resolved AND nothing remains stranded as unconfirmed. A stranded
+# V6-RECOVER permanent-mismatch token would survive
+# `receive --finalize` as `(+ N unconfirmed)` despite being unspendable.
+assert_no_unconfirmed_after_finalize \
+  "alice-peer1-post-recovery" \
+  "$SNAP/alice-after.txt"
+
 # Peer1 bob
 sphere wallet use bob
 sphere init --network testnet --no-nostr --mnemonic "$BOB_MNEMONIC"
@@ -781,6 +963,11 @@ sphere payments receive --finalize
 sphere balance                      > "$SNAP/bob-after.txt"
 sphere payments tokens              > "$SNAP/bob-tokens-after.txt"
 sphere invoice list --state COVERED > "$SNAP/bob-invoices-after.txt"
+
+# Issue #387 — same gate for bob.
+assert_no_unconfirmed_after_finalize \
+  "bob-peer1-post-recovery" \
+  "$SNAP/bob-after.txt"
 
 # Peer2-alice
 cd "$PEER2_ALICE"
