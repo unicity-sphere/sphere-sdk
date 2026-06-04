@@ -31,6 +31,9 @@
  */
 
 import { describe, expect, it, vi } from 'vitest';
+import { AUTOMATED_CID_DELIVERY_ENABLED } from '../../../../modules/payments/transfer/limits';
+// Issue #393 — gate auto-CID-promotion tests on the kill-switch.
+const ifAutoCid = AUTOMATED_CID_DELIVERY_ENABLED ? it : it.skip;
 
 import {
   sendConservativeUxf,
@@ -452,7 +455,7 @@ describe('sendConservativeUxf — auto-route to CID for oversized bundles', () =
     expect(result.status).toBe('completed');
   });
 
-  it('routes auto-mode CAR > inlineCapBytes to CID branch', async () => {
+  ifAutoCid('routes auto-mode CAR > inlineCapBytes to CID branch', async () => {
     const source = makeToken('tok-1', TOKEN_A);
     const commitResult = makeCommitResult({
       sourceTokenId: 'tok-1',
@@ -576,7 +579,7 @@ describe('sendConservativeUxf — CAR-inline fallback when publishToIpfs absent'
     expect(transport._calls).toHaveLength(0);
   });
 
-  it('auto + no publisher + oversized bundle → throws IPFS_PUBLISHER_REQUIRED', async () => {
+  ifAutoCid('auto + no publisher + oversized bundle → throws IPFS_PUBLISHER_REQUIRED', async () => {
     // Build a bundle exceeding RELAY_SAFE_CAP_BYTES (96 KiB).
     // Each TOKEN_A fixture is ~0.9 KiB; 120 tokens ≈ 110 KiB.
     const N = 120;

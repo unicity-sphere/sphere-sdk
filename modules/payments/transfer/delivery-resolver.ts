@@ -41,6 +41,7 @@ import type { DeliveryStrategy } from '../../../types/uxf-transfer.js';
 import { carBytesToBase64 } from '../../../uxf/transfer-payload.js';
 
 import {
+  AUTOMATED_CID_DELIVERY_ENABLED,
   MAX_INLINE_CAR_BYTES,
   RELAY_SAFE_CAP_BYTES,
   clampInlineCap,
@@ -368,6 +369,46 @@ export async function resolveDelivery(
         };
       }
 
+      // Bundle exceeds the (possibly-clamped) inline cap.
+      //
+      // **Issue #393 — automated CID delivery DISABLED.** When the kill-
+      // switch {@link AUTOMATED_CID_DELIVERY_ENABLED} is `false` (the
+      // current default; see `limits.ts` for the rationale), `auto`
+      // mode is NOT allowed to promote oversized bundles to CID
+      // delivery. Instead we treat the over-cap branch as
+      // "inline-up-to-RELAY_SAFE_CAP_BYTES, throw beyond that," and we
+      // direct the caller to {kind: 'force-cid'} for explicit opt-in.
+      // The two branches below (publisher present vs absent + the
+      // CAR-inline fallback) are KEPT IN PLACE behind the flag so the
+      // re-enable is a single constant flip — no logic restoration
+      // needed when the time comes.
+      if (!AUTOMATED_CID_DELIVERY_ENABLED) {
+        // Bundle fits within the relay-safe ceiling → silently inline,
+        // ignoring `inlineCapBytes` for the CID-promotion decision
+        // (the cap remains a soft hint for telemetry / future use).
+        if (carBytes.byteLength <= RELAY_SAFE_CAP_BYTES) {
+          return {
+            ...inlineDecision(carBytes, publishToIpfs !== undefined),
+            clampInfo,
+          };
+        }
+        // Beyond the relay-safe ceiling: no automatic escape hatch.
+        // Operator MUST pick `force-cid` (with publisher wired) to
+        // ship bundles this large.
+        throw new SphereError(
+          `resolveDelivery: bundle is ${carBytes.byteLength} bytes, exceeds the ` +
+            `relay-safe inline ceiling of ${RELAY_SAFE_CAP_BYTES} bytes, AND ` +
+            `automated CID delivery is currently disabled (see ` +
+            `AUTOMATED_CID_DELIVERY_ENABLED in modules/payments/transfer/limits.ts). ` +
+            `Either reduce the source set so the bundle fits inline, or pass ` +
+            `\`delivery: { kind: 'force-cid' }\` with an IPFS publisher wired ` +
+            `via createNodeProviders/createBrowserProviders.`,
+          'INLINE_CAR_TOO_LARGE',
+        );
+      }
+
+      // ---- Code below this point only runs when the kill-switch is ON ----
+      //
       // Bundle exceeds the (possibly-clamped) inline cap → CID branch.
       //
       // No-publisher fallback (approach γ): if no IPFS publisher is wired,

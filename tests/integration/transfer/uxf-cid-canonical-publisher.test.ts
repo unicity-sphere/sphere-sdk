@@ -29,6 +29,9 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { AUTOMATED_CID_DELIVERY_ENABLED } from '../../../modules/payments/transfer/limits';
+// Issue #393 — gate auto-CID-promotion tests on the kill-switch.
+const ifAutoCid = AUTOMATED_CID_DELIVERY_ENABLED ? it : it.skip;
 
 import {
   sendConservativeUxf,
@@ -163,7 +166,7 @@ describe('Issue #200 Phase 1 — auto-over-cap CID delivery with canonical publi
     if (restoreFetch) restoreFetch();
   });
 
-  it('canonical publisher returns bundleCid == extractCarRootCid; every block is pinned', async () => {
+  ifAutoCid('canonical publisher returns bundleCid == extractCarRootCid; every block is pinned', async () => {
     const gateway = installStubGateway();
     restoreFetch = gateway.restore;
 
