@@ -418,11 +418,12 @@ describe('sendConservativeUxf CID — auto-route over inline cap', () => {
     expect(statuses).toEqual(['pinned', 'sending', 'delivered']);
   });
 
-  ifAutoCid('large multi-token bundle (>16 KiB) auto-routes to CID with default delivery', async () => {
-    // Build a multi-token bundle that genuinely exceeds the default
-    // 16 KiB inline cap. Each TOKEN_A serializes to roughly ~0.9 KiB
-    // post-CAR; 30 distinct copies (~27 KiB) cleanly clears the cap.
-    const N = 30;
+  ifAutoCid('large multi-token bundle (>RELAY_SAFE_CAP_BYTES) auto-routes to CID with default delivery', async () => {
+    // Build a multi-token bundle that exceeds the default 96 KiB
+    // inline cap (RELAY_SAFE_CAP_BYTES, raised from 16 KiB by issue
+    // #394). Each TOKEN_A serializes to roughly ~0.9 KiB post-CAR;
+    // 120 distinct copies (~108 KiB) cleanly clears the new cap.
+    const N = 120;
     const sources = Array.from({ length: N }, (_, i) => makeToken(`tok-${i}`, TOKEN_A));
     const commitResults = sources.map((s, i) =>
       makeCommitResult({
@@ -443,7 +444,7 @@ describe('sendConservativeUxf CID — auto-route over inline cap', () => {
     });
 
     // Default delivery (no `delivery` field) → strategy = { kind: 'auto' }
-    // → auto-route picks CID because the bundle CAR > 16 KiB.
+    // → auto-route picks CID because the bundle CAR > RELAY_SAFE_CAP_BYTES.
     await sendConservativeUxf(
       basicRequest({ amount: (1_000_000 * N).toString() }),
       makePeerInfo(),
@@ -454,11 +455,11 @@ describe('sendConservativeUxf CID — auto-route over inline cap', () => {
     expect(transport._calls).toHaveLength(1);
     const payload = transport._calls[0].payload as UxfTransferPayloadCid;
     expect(payload.kind).toBe('uxf-cid');
-    // Verify the published CAR genuinely exceeded 16 KiB (regression
+    // Verify the published CAR genuinely exceeded 96 KiB (regression
     // gate against future fixture shrinkage that would silently route
-    // through the inline branch).
+    // through the inline branch under the new RELAY_SAFE_CAP_BYTES cap).
     const carBytesArg = publishToIpfs.mock.calls[0][0];
-    expect(carBytesArg.byteLength).toBeGreaterThan(16 * 1024);
+    expect(carBytesArg.byteLength).toBeGreaterThan(96 * 1024);
   });
 });
 
