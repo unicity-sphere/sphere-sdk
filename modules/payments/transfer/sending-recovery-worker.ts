@@ -369,9 +369,11 @@ export class SendingRecoveryWorker {
     cause: unknown,
   ): Promise<void> {
     const message = errMessage(cause);
+    let didTransition = false;
     try {
       await this.deps.outbox.update(entry.id, (prev) => {
         if (prev.status !== 'sending') return prev;
+        didTransition = true;
         return {
           ...prev,
           status: 'failed-transient',
@@ -384,6 +386,22 @@ export class SendingRecoveryWorker {
         bundleCid: entry.bundleCid,
         lastError: message,
       });
+      // Issue #401 — emit a terminal-failure signal so subscribers
+      // (AccountingModule re-emits `'invoice:deliver-failed' { reason:
+      // 'non-durable' }`) can surface the failure to operators. Gate
+      // on the CAS to avoid firing on concurrent-advance no-ops, same
+      // pattern as `transitionToDelivered`'s `didTransition` guard.
+      if (didTransition) {
+        this.deps.emit('transfer:recovery-republish-exhausted', {
+          outboxId: entry.id,
+          bundleCid: entry.bundleCid,
+          tokenIds: entry.tokenIds,
+          mode: entry.mode,
+          recipient: entry.recipient,
+          lastError: message,
+          exhaustedAt: this.now(),
+        });
+      }
     } catch (err) {
       this.warn('failed-transient transition failed', {
         outboxId: entry.id,

@@ -5330,12 +5330,47 @@ export class AccountingModule {
       }
     });
 
+    // Issue #401 — surface SendingRecoveryWorker exhaustion as
+    // `invoice:deliver-failed { reason: 'non-durable' }` when the
+    // exhausted OUTBOX entry carried an invoice token. The token-id
+    // lookup against `invoiceTermsCache` is the same predicate that
+    // `_handleTokenChange` uses to recognize an incoming invoice; if
+    // the cache hasn't picked the invoice up yet (race with sync) we
+    // skip — non-invoice exhaustions stay silent here on purpose, the
+    // `'transfer:recovery-republish-exhausted'` event is the generic
+    // operator surface for those.
+    const unsubRecoveryExhausted = deps.on(
+      'transfer:recovery-republish-exhausted',
+      (payload: SphereEventMap['transfer:recovery-republish-exhausted']) => {
+        if (this.destroyed) return;
+        try {
+          const invoiceTokenId = payload.tokenIds.find((id) =>
+            this.invoiceTermsCache.has(id),
+          );
+          if (invoiceTokenId === undefined) return;
+          deps.emitEvent('invoice:deliver-failed', {
+            invoiceId: invoiceTokenId,
+            recipient: payload.recipient,
+            reason: 'non-durable',
+            errorMessage: payload.lastError,
+          });
+        } catch (err) {
+          logger.warn(
+            LOG_TAG,
+            'Error handling transfer:recovery-republish-exhausted event:',
+            err,
+          );
+        }
+      },
+    );
+
     this.unsubscribePayments = [
       unsubIncoming,
       unsubConfirmed,
       unsubHistory,
       unsubTokenChange,
       unsubSyncCompleted,
+      unsubRecoveryExhausted,
     ];
   }
 
