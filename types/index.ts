@@ -116,7 +116,7 @@ export type TransferStatus =
   | 'completed'
   | 'failed';
 
-export type AddressMode = 'auto' | 'direct' | 'proxy';
+export type AddressMode = 'auto' | 'direct';
 
 export type TransferMode = 'instant' | 'conservative';
 
@@ -125,7 +125,7 @@ export interface TransferRequest {
   readonly amount: string;
   readonly recipient: string;
   readonly memo?: string;
-  /** Address mode: 'auto' (default) uses directAddress if available, 'direct' forces DIRECT, 'proxy' forces PROXY */
+  /** Address mode: 'auto' (default) and 'direct' both resolve to the recipient's key-based DirectAddress (D5 — no PROXY). */
   readonly addressMode?: AddressMode;
   /** Transfer mode: 'instant' (default) sends via Nostr immediately, 'conservative' collects all proofs first */
   readonly transferMode?: TransferMode;

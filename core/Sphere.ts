@@ -89,6 +89,7 @@ import {
   deriveAddressInfo,
   getPublicKey,
   sha256,
+  hexToBytes,
   publicKeyToAddress,
   signMessage as signMessageCrypto,
   type MasterKey,
@@ -117,10 +118,7 @@ import {
   isSQLiteDatabase,
   isWalletDatEncrypted,
 } from '../serialization/wallet-dat';
-import { SigningService } from '@unicitylabs/state-transition-sdk/lib/sign/SigningService';
-import { TokenType } from '@unicitylabs/state-transition-sdk/lib/token/TokenType';
-import { HashAlgorithm } from '@unicitylabs/state-transition-sdk/lib/hash/HashAlgorithm';
-import { UnmaskedPredicateReference } from '@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicateReference';
+import { deriveDirectAddress } from '../token-engine';
 import { normalizeNametag, isPhoneNumber } from '@unicitylabs/nostr-js-sdk';
 
 export function isValidNametag(nametag: string): boolean {
@@ -403,28 +401,22 @@ export interface SphereInitResult {
 // L3 Predicate Address Derivation
 // =============================================================================
 
-/** Token type for Unicity network (used for L3 predicate address derivation) */
-const UNICITY_TOKEN_TYPE_HEX = 'f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe397867509';
-
 /**
- * Derive L3 predicate address (DIRECT://...) from private key
- * Uses UnmaskedPredicateReference for stable wallet address
+ * Derive the wallet's legacy L3 identity address (DIRECT://...) from a private key.
+ *
+ * Delegates to the shared, golden-locked `deriveDirectAddress` helper (token-engine,
+ * A6) so the engine and the wallet derive byte-identical addresses from ONE recipe.
+ *
+ * XP-CRITICAL (Path A / D10): Quest XP and Unicity IDs are keyed on this address, so it
+ * MUST stay byte-identical across the v1→v2 migration. The legacy v1 derivation ran the
+ * secret through `SigningService.createFromSecret`, which SHA-256-hashes the secret before
+ * using it as the signing scalar — so the address is a function of
+ * `getPublicKey(SHA256(privateKey))`, NOT of the raw `chainPubkey`. That pre-hash is
+ * reproduced here and locked by tests/unit/core/Sphere.l3-identity-address.golden.test.ts.
  */
 async function deriveL3PredicateAddress(privateKey: string): Promise<string> {
-  const secret = Buffer.from(privateKey, 'hex');
-  const signingService = await SigningService.createFromSecret(secret);
-
-  const tokenTypeBytes = Buffer.from(UNICITY_TOKEN_TYPE_HEX, 'hex');
-  const tokenType = new TokenType(tokenTypeBytes);
-
-  const predicateRef = UnmaskedPredicateReference.create(
-    tokenType,
-    signingService.algorithm,
-    signingService.publicKey,
-    HashAlgorithm.SHA256
-  );
-
-  return (await (await predicateRef).toAddress()).toString();
+  const prehashedPublicKey = getPublicKey(sha256(privateKey, 'hex'));
+  return deriveDirectAddress(hexToBytes(prehashedPublicKey));
 }
 
 // =============================================================================
@@ -481,8 +473,6 @@ export class Sphere {
   private _addressIdToIndex: Map<string, number> = new Map();
   /** Nametag cache: addressId -> (nametagIndex -> nametag). Separate from tracked addresses. */
   private _addressNametags: Map<string, Map<number, string>> = new Map();
-  /** Cached PROXY address (computed once when nametag is set) */
-  private _cachedProxyAddress: string | undefined = undefined;
 
   // Providers
   private _storage: StorageProvider;
@@ -953,23 +943,6 @@ export class Sphere {
 
     sphere._initialized = true;
     Sphere.instance = sphere;
-
-    // If nametag name exists but token is missing, try to mint it.
-    // This handles the case where the token was lost from IndexedDB.
-    if (sphere._identity?.nametag && !sphere._payments.hasNametag()) {
-      progress?.({ step: 'registering_nametag', message: 'Restoring nametag token...' });
-      logger.debug('Sphere', `Unicity ID @${sphere._identity.nametag} has no token, attempting to mint...`);
-      try {
-        const result = await sphere.mintNametag(sphere._identity.nametag);
-        if (result.success) {
-          logger.debug('Sphere', `Nametag token minted successfully on load`);
-        } else {
-          logger.warn('Sphere', `Could not mint nametag token: ${result.error}`);
-        }
-      } catch (err) {
-        logger.warn('Sphere', `Nametag token mint failed:`, err);
-      }
-    }
 
     // Auto-discover previously used HD addresses
     if (options.discoverAddresses !== false && sphere._transport.discoverAddresses && sphere._masterKey) {
@@ -2336,7 +2309,6 @@ export class Sphere {
     // Switch the active pointer — instant, no destroy
     this._identity = newIdentity;
     this._currentAddressIndex = index;
-    await this._updateCachedProxyAddress();
 
     // Update active module references for backward compatibility
     const activeModules = this._addressModules.get(index)!;
@@ -2393,41 +2365,15 @@ export class Sphere {
       await this.syncIdentityWithTransport();
     }
 
-    // If new nametag was registered, persist cache and mint token
+    // If a new nametag was registered on switch, persist the cache and emit. D5: there is no
+    // on-chain nametag token to mint — the Nostr binding (published in registerNametag) is the record.
     if (newNametag) {
       await this.persistAddressNametags();
-
-      if (!this._payments.hasNametag()) {
-        logger.debug('Sphere', `Minting nametag token for @${newNametag}...`);
-        try {
-          const result = await this.mintNametag(newNametag);
-          if (result.success) {
-            logger.debug('Sphere', `Nametag token minted successfully`);
-          } else {
-            logger.warn('Sphere', `Could not mint nametag token: ${result.error}`);
-          }
-        } catch (err) {
-          logger.warn('Sphere', `Nametag token mint failed:`, err);
-        }
-      }
 
       this.emitEvent('nametag:registered', {
         nametag: newNametag,
         addressIndex: index,
       });
-    } else if (this._identity?.nametag && !this._payments.hasNametag()) {
-      // Existing address with nametag but missing token — mint it
-      logger.debug('Sphere', `Unicity ID @${this._identity.nametag} has no token after switch, minting...`);
-      try {
-        const result = await this.mintNametag(this._identity.nametag);
-        if (result.success) {
-          logger.debug('Sphere', `Nametag token minted successfully after switch`);
-        } else {
-          logger.warn('Sphere', `Could not mint nametag token after switch: ${result.error}`);
-        }
-      } catch (err) {
-        logger.warn('Sphere', `Nametag token mint failed after switch:`, err);
-      }
     }
   }
 
@@ -3277,15 +3223,6 @@ export class Sphere {
     return !!this._identity?.nametag;
   }
 
-  /**
-   * Get the PROXY address for the current nametag
-   * PROXY addresses are derived from the nametag hash and require
-   * the nametag token to claim funds sent to them
-   * @returns PROXY address string or undefined if no nametag
-   */
-  getProxyAddress(): string | undefined {
-    return this._cachedProxyAddress;
-  }
 
   /**
    * Resolve any identifier to full peer information.
@@ -3324,17 +3261,6 @@ export class Sphere {
     }
   }
 
-  /** Compute and cache the PROXY address from the current nametag */
-  private async _updateCachedProxyAddress(): Promise<void> {
-    const nametag = this._identity?.nametag;
-    if (!nametag) {
-      this._cachedProxyAddress = undefined;
-      return;
-    }
-    const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
-    const proxyAddr = await ProxyAddress.fromNameTag(nametag);
-    this._cachedProxyAddress = proxyAddr.toString();
-  }
 
   /**
    * Register a nametag for the current active address
@@ -3368,22 +3294,10 @@ export class Sphere {
       throw new SphereError(`Unicity ID already registered for address ${this._currentAddressIndex}: @${this._identity.nametag}`, 'ALREADY_INITIALIZED');
     }
 
-    // 1. Mint nametag token on-chain FIRST
-    // Required for receiving tokens via @nametag (PROXY address finalization).
-    // Minting before publishing ensures the nametag is backed by an on-chain token.
-    if (!this._payments.hasNametag()) {
-      logger.debug('Sphere', `Minting nametag token for @${cleanNametag}...`);
-      const result = await this.mintNametag(cleanNametag);
-      if (!result.success) {
-        throw new SphereError(
-          `Failed to mint nametag token: ${result.error}`,
-          'AGGREGATOR_ERROR',
-        );
-      }
-      logger.debug('Sphere', `Nametag token minted successfully`);
-    }
-
-    // 2. Publish identity binding with nametag to Nostr AFTER minting succeeds
+    // Register the nametag by publishing the Nostr identity binding (name ↔ chainPubkey).
+    // D5: nametags are Nostr bindings only — there is no on-chain nametag token. Receive is
+    // always SignaturePredicate(chainPubkey); the binding is the sole registration act, and its
+    // first-seen-wins failure path below is the uniqueness guard.
     if (this._transport.publishIdentityBinding) {
       const success = await this._transport.publishIdentityBinding(
         this._identity!.chainPubkey,
@@ -3396,9 +3310,8 @@ export class Sphere {
       }
     }
 
-    // 3. Update local state
+    // Update local state.
     this._identity!.nametag = cleanNametag;
-    await this._updateCachedProxyAddress();
 
     // Update nametag cache
     const currentAddressId = this._trackedAddresses.get(this._currentAddressIndex)?.addressId;
@@ -3438,36 +3351,19 @@ export class Sphere {
   }
 
   /**
-   * Mint a nametag token on-chain (like Sphere wallet and lottery)
-   * This creates the nametag token required for receiving tokens via PROXY addresses (@nametag)
+   * Check whether a nametag is available to register.
    *
-   * @param nametag - The nametag to mint (e.g., "alice" or "@alice")
-   * @returns MintNametagResult with success status and token if successful
+   * D5: nametags are Nostr bindings (name ↔ chainPubkey), not on-chain tokens. Availability is
+   * first-seen-wins — a name is available iff no binding resolves for it.
    *
-   * @example
-   * ```typescript
-   * // Mint nametag token for receiving via @alice
-   * const result = await sphere.mintNametag('alice');
-   * if (result.success) {
-   *   console.log('Nametag minted:', result.nametagData?.name);
-   * } else {
-   *   console.error('Mint failed:', result.error);
-   * }
-   * ```
-   */
-  async mintNametag(nametag: string): Promise<import('../modules/payments').MintNametagResult> {
-    this.ensureReady();
-    return this._payments.mintNametag(nametag);
-  }
-
-  /**
-   * Check if a nametag is available for minting
    * @param nametag - The nametag to check (e.g., "alice" or "@alice")
-   * @returns true if available, false if taken or error
+   * @returns true if available, false if already taken
    */
   async isNametagAvailable(nametag: string): Promise<boolean> {
     this.ensureReady();
-    return this._payments.isNametagAvailable(nametag);
+    if (!this._transport.resolveNametag) return true;
+    const bound = await this._transport.resolveNametag(this.cleanNametag(nametag));
+    return bound == null;
   }
 
   /**
@@ -3684,7 +3580,6 @@ export class Sphere {
 
             if (recoveredNametag && !this._identity?.nametag) {
               (this._identity as MutableFullIdentity).nametag = recoveredNametag;
-              await this._updateCachedProxyAddress();
 
               const entry = await this.ensureAddressTracked(this._currentAddressIndex);
               let nametags = this._addressNametags.get(entry.addressId);
@@ -3804,7 +3699,6 @@ export class Sphere {
       // Update identity with recovered nametag
       if (this._identity) {
         (this._identity as MutableFullIdentity).nametag = recoveredNametag;
-        await this._updateCachedProxyAddress();
       }
 
       // Update nametag cache
@@ -4071,7 +3965,6 @@ export class Sphere {
       // Restore nametag from cache
       this._identity.nametag = nametag;
     }
-    await this._updateCachedProxyAddress();
   }
 
   private async initializeIdentityFromMnemonic(

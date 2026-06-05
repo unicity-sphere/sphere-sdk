@@ -887,30 +887,14 @@ export class NostrTransportProvider implements TransportProvider {
 
   /**
    * Convert a BindingInfo (from nostr-js-sdk) to PeerInfo (sphere-sdk type).
-   * Computes PROXY address from nametag if available.
    */
   private async bindingInfoToPeerInfo(binding: BindingInfo, nametag?: string): Promise<PeerInfo> {
-    const nametagValue = nametag || binding.nametag;
-    let proxyAddress: string | undefined = binding.proxyAddress;
-
-    // Compute PROXY address from nametag if not already in binding
-    if (nametagValue && !proxyAddress) {
-      try {
-        const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
-        const proxyAddr = await ProxyAddress.fromNameTag(nametagValue);
-        proxyAddress = proxyAddr.toString();
-      } catch {
-        // Ignore — proxy address computation is best-effort
-      }
-    }
-
     return {
-      nametag: nametagValue,
+      nametag: nametag || binding.nametag,
       transportPubkey: binding.transportPubkey,
       chainPubkey: binding.publicKey || '',
       l1Address: binding.l1Address || '',
       directAddress: binding.directAddress || '',
-      proxyAddress,
       timestamp: binding.timestamp,
     };
   }
@@ -943,7 +927,6 @@ export class NostrTransportProvider implements TransportProvider {
         chainPubkey: content.public_key || '',
         l1Address: content.l1_address || '',
         directAddress: content.direct_address || '',
-        proxyAddress: content.proxy_address || undefined,
         timestamp: bindingEvent.created_at * 1000,
       };
     } catch {
@@ -993,7 +976,6 @@ export class NostrTransportProvider implements TransportProvider {
           chainPubkey: content.public_key || '',
           l1Address: content.l1_address || '',
           directAddress: content.direct_address || '',
-          proxyAddress: content.proxy_address || undefined,
           timestamp: event.created_at * 1000,
         });
       } catch {
@@ -1086,9 +1068,6 @@ export class NostrTransportProvider implements TransportProvider {
 
     if (nametag) {
       // Delegate to nostr-js-sdk — handles conflict detection, encryption, and event creation
-      const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
-      const proxyAddr = await ProxyAddress.fromNameTag(nametag);
-
       try {
         const success = await this.nostrClient!.publishNametagBinding(
           nametag,
@@ -1097,7 +1076,6 @@ export class NostrTransportProvider implements TransportProvider {
             publicKey: chainPubkey,
             l1Address,
             directAddress,
-            proxyAddress: proxyAddr.toString(),
           },
         );
 

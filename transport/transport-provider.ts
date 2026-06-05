@@ -60,7 +60,7 @@ export interface TransportProvider extends BaseProvider {
 
   /**
    * Resolve nametag to full peer information
-   * Returns transportPubkey, chainPubkey, l1Address, directAddress, proxyAddress
+   * Returns transportPubkey, chainPubkey, l1Address, directAddress
    */
   resolveNametagInfo?(nametag: string): Promise<PeerInfo | null>;
 
@@ -518,7 +518,7 @@ export type TransportProviderFactory<TConfig, TProvider extends TransportProvide
 /**
  * Resolved peer identity information.
  * Returned by resolve methods — contains all public address formats for a peer.
- * Fields nametag and proxyAddress are optional (only present if nametag is registered).
+ * The nametag field is optional (only present if a nametag is registered).
  */
 export interface PeerInfo {
   /** Nametag name (without @), if registered */
@@ -531,8 +531,6 @@ export interface PeerInfo {
   l1Address: string;
   /** L3 DIRECT address (DIRECT://...) */
   directAddress: string;
-  /** L3 PROXY address derived from nametag hash (PROXY:...), only if nametag registered */
-  proxyAddress?: string;
   /** Event timestamp */
   timestamp: number;
 }

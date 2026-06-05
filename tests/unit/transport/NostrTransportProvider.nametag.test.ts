@@ -186,7 +186,6 @@ vi.mock('@unicitylabs/nostr-js-sdk', async (importOriginal) => {
 // Import after mock is set up
 const { NostrTransportProvider } = await import('../../../transport/NostrTransportProvider');
 const { hashNametag } = await import('@unicitylabs/nostr-js-sdk');
-const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
 type WebSocketFactory = import('../../../transport/websocket').WebSocketFactory;
 
 // =============================================================================
@@ -378,8 +377,6 @@ describe('NostrTransportProvider.resolveNametagInfo()', () => {
     expect(info!.chainPubkey).toBe(TEST_COMPRESSED_PUBKEY);
     expect(info!.l1Address).toBe(TEST_L1_ADDRESS);
     expect(info!.directAddress).toBe(TEST_DIRECT_ADDRESS);
-    const expectedProxy = (await ProxyAddress.fromNameTag(TEST_NAMETAG)).toString();
-    expect(info!.proxyAddress).toBe(expectedProxy);
     expect(info!.timestamp).toBeGreaterThan(0);
   });
 
@@ -413,8 +410,6 @@ describe('NostrTransportProvider.resolveNametagInfo()', () => {
     expect(info!.transportPubkey).toBe(nostrPubkey);
     expect(info!.chainPubkey).toBe('');
     expect(info!.l1Address).toBe('');
-    const expectedProxy = (await ProxyAddress.fromNameTag('legacy')).toString();
-    expect(info!.proxyAddress).toBe(expectedProxy);
   });
 
   it('should handle event with content fields (pubkey and l1 in content)', async () => {

@@ -33,7 +33,6 @@ import { TokenSplitCalculator, type SplitPlan, type TokenWithAmount } from './To
 import { TokenSplitExecutor } from './TokenSplitExecutor';
 import { TokenReservationLedger } from './TokenReservationLedger';
 import { SpendPlanner, SpendQueue, type ParsedTokenEntry, type ParsedTokenPool } from './SpendQueue';
-import { NametagMinter, type MintNametagResult } from './NametagMinter';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase, HistoryRecord } from '../../storage';
 import type {
   TransportProvider,
@@ -4432,87 +4431,6 @@ export class PaymentsModule {
     }
   }
 
-  /**
-   * Mint a nametag token on-chain (like Sphere wallet and lottery)
-   * This creates the nametag token required for receiving tokens via PROXY addresses
-   *
-   * @param nametag - The nametag to mint (e.g., "alice" or "@alice")
-   * @returns MintNametagResult with success status and token if successful
-   */
-  async mintNametag(nametag: string): Promise<MintNametagResult> {
-    this.ensureInitialized();
-
-    // Get state transition client and trust base
-    const stClient = this.deps!.oracle.getStateTransitionClient?.();
-    if (!stClient) {
-      return {
-        success: false,
-        error: 'State transition client not available. Oracle provider must implement getStateTransitionClient()',
-      };
-    }
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const trustBase = (this.deps!.oracle as any).getTrustBase?.();
-    if (!trustBase) {
-      return {
-        success: false,
-        error: 'Trust base not available. Oracle provider must implement getTrustBase()',
-      };
-    }
-
-    try {
-      // Create signing service
-      const signingService = await this.createSigningService();
-
-      // Create owner address using UnmaskedPredicateReference (same pattern as TokenSplitExecutor)
-      const { UnmaskedPredicateReference } = await import('@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicateReference');
-      const { TokenType } = await import('@unicitylabs/state-transition-sdk/lib/token/TokenType');
-
-      // Use a dummy token type for address creation (like Sphere wallet does)
-      const UNICITY_TOKEN_TYPE_HEX = 'f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe397867509';
-      const tokenType = new TokenType(Buffer.from(UNICITY_TOKEN_TYPE_HEX, 'hex'));
-
-      const addressRef = await UnmaskedPredicateReference.create(
-        tokenType,
-        signingService.algorithm,
-        signingService.publicKey,
-        HashAlgorithm.SHA256
-      );
-      const ownerAddress = await addressRef.toAddress();
-
-      // Create NametagMinter
-      const minter = new NametagMinter({
-        stateTransitionClient: stClient,
-        trustBase,
-        signingService,
-        debug: this.moduleConfig.debug,
-      });
-
-      // Mint the nametag
-      const result = await minter.mintNametag(nametag, ownerAddress);
-
-      if (result.success && result.nametagData) {
-        // Save the nametag data
-        await this.setNametag(result.nametagData);
-        logger.debug('Payments', `Unicity ID minted and saved: ${result.nametagData.name}`);
-
-        // Emit event (use existing nametag:registered event type)
-        this.deps!.emitEvent('nametag:registered', {
-          nametag: result.nametagData.name,
-          addressIndex: 0, // Primary address
-        });
-      }
-
-      return result;
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error);
-      logger.debug('Payments', 'mintNametag failed:', errorMsg);
-      return {
-        success: false,
-        error: errorMsg,
-      };
-    }
-  }
 
   /**
    * Mint a fungible token directly to this wallet (genesis mint).
@@ -4665,34 +4583,6 @@ export class PaymentsModule {
     }
   }
 
-  /**
-   * Check if a nametag is available for minting
-   * @param nametag - The nametag to check (e.g., "alice" or "@alice")
-   */
-  async isNametagAvailable(nametag: string): Promise<boolean> {
-    this.ensureInitialized();
-
-    const stClient = this.deps!.oracle.getStateTransitionClient?.();
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const trustBase = (this.deps!.oracle as any).getTrustBase?.();
-
-    if (!stClient || !trustBase) {
-      return false;
-    }
-
-    try {
-      const signingService = await this.createSigningService();
-      const minter = new NametagMinter({
-        stateTransitionClient: stClient,
-        trustBase,
-        signingService,
-      });
-
-      return await minter.isNametagAvailable(nametag);
-    } catch {
-      return false;
-    }
-  }
 
   // ===========================================================================
   // Public API - Sync & Validate
@@ -5158,60 +5048,43 @@ export class PaymentsModule {
    */
   private async resolveRecipientAddress(
     recipient: string,
-    addressMode: 'auto' | 'direct' | 'proxy' = 'auto',
+    _addressMode: 'auto' | 'direct' = 'auto',
     peerInfo?: PeerInfo | null,
   ): Promise<IAddress> {
     const { AddressFactory } = await import('@unicitylabs/state-transition-sdk/lib/address/AddressFactory');
-    const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
 
-    // PROXY: or DIRECT: prefixed — parse directly (explicit address overrides mode)
-    if (recipient.startsWith('PROXY:') || recipient.startsWith('DIRECT:')) {
+    // DIRECT: prefixed — parse directly.
+    if (recipient.startsWith('DIRECT:')) {
       return AddressFactory.createAddress(recipient);
     }
 
-    // 66-char hex (33-byte compressed pubkey) — create DirectAddress
+    // 66-char hex (33-byte compressed pubkey) — create DirectAddress.
     if (recipient.length === 66 && /^[0-9a-fA-F]+$/.test(recipient)) {
       logger.debug('Payments', 'Creating DirectAddress from 33-byte compressed pubkey');
       return this.createDirectAddressFromPubkey(recipient);
     }
 
-    // For nametag-based recipients, use PeerInfo (pre-resolved or resolve now)
+    // Nametag-based recipient — resolve to PeerInfo and use its key-based DirectAddress.
+    // D5: receive is always SignaturePredicate(chainPubkey); there is no PROXY fallback, so a
+    // recipient without a published DirectAddress cannot be paid.
     const info = peerInfo ?? await this.deps?.transport.resolve?.(recipient) ?? null;
     if (!info) {
       throw new SphereError(
-        `Recipient "${recipient}" not found. ` +
-        `Use @nametag, a valid PROXY:/DIRECT: address, or a 33-byte hex pubkey.`,
+        `Recipient "${recipient}" not found. Use @nametag, a DIRECT: address, or a 33-byte hex pubkey.`,
         'INVALID_RECIPIENT',
       );
     }
 
-    // Determine nametag for PROXY address derivation
-    const nametag = recipient.startsWith('@') ? recipient.slice(1)
-      : info.nametag || recipient;
+    const nametag = recipient.startsWith('@') ? recipient.slice(1) : info.nametag || recipient;
 
-    // Force PROXY mode
-    if (addressMode === 'proxy') {
-      logger.debug('Payments', `Using PROXY address for "${nametag}" (forced)`);
-      return ProxyAddress.fromNameTag(nametag);
+    if (!info.directAddress) {
+      throw new SphereError(
+        `"${nametag}" has no DirectAddress — the recipient must publish a key-based identity binding.`,
+        'INVALID_RECIPIENT',
+      );
     }
-
-    // Force DIRECT mode
-    if (addressMode === 'direct') {
-      if (!info.directAddress) {
-        throw new SphereError(`"${nametag}" has no DirectAddress stored. It may be a legacy registration.`, 'INVALID_RECIPIENT');
-      }
-      logger.debug('Payments', `Using DirectAddress for "${nametag}" (forced): ${info.directAddress.slice(0, 30)}...`);
-      return AddressFactory.createAddress(info.directAddress);
-    }
-
-    // AUTO mode: prefer directAddress, fallback to PROXY for legacy
-    if (info.directAddress) {
-      logger.debug('Payments', `Using DirectAddress for "${nametag}": ${info.directAddress.slice(0, 30)}...`);
-      return AddressFactory.createAddress(info.directAddress);
-    }
-
-    logger.debug('Payments', `Using PROXY address for legacy nametag "${nametag}"`);
-    return ProxyAddress.fromNameTag(nametag);
+    logger.debug('Payments', `Using DirectAddress for "${nametag}": ${info.directAddress.slice(0, 30)}...`);
+    return AddressFactory.createAddress(info.directAddress);
   }
 
   /**
