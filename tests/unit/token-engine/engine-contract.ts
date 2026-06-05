@@ -26,10 +26,10 @@ export function runEngineContract(name: string, makeEngine: () => ITokenEngine):
       expect(id.chainPubkey.length).toBe(33);
     });
 
-    it('deriveIdentityAddress is a pure function of the pubkey', () => {
+    it('deriveIdentityAddress is a pure function of the pubkey', async () => {
       const e = makeEngine();
-      expect(e.deriveIdentityAddress(PK_A)).toBe(e.deriveIdentityAddress(PK_A));
-      expect(e.deriveIdentityAddress(PK_A)).not.toBe(e.deriveIdentityAddress(PK_B));
+      expect(await e.deriveIdentityAddress(PK_A)).toBe(await e.deriveIdentityAddress(PK_A));
+      expect(await e.deriveIdentityAddress(PK_A)).not.toBe(await e.deriveIdentityAddress(PK_B));
     });
 
     it('mint yields a token whose value and balance reflect the mint', async () => {

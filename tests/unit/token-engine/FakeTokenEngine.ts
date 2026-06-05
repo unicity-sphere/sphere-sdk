@@ -57,8 +57,8 @@ export class FakeTokenEngine implements ITokenEngine {
     return { chainPubkey: new Uint8Array(this.identity.chainPubkey) };
   }
 
-  public deriveIdentityAddress(pubkey?: Uint8Array): string {
-    return `DIRECT://${HexConverter.encode(pubkey ?? this.identity.chainPubkey)}`;
+  public deriveIdentityAddress(pubkey?: Uint8Array): Promise<string> {
+    return Promise.resolve(`DIRECT://${HexConverter.encode(pubkey ?? this.identity.chainPubkey)}`);
   }
 
   public readValue(token: SphereToken): SphereValue | null {
