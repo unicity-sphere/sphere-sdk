@@ -768,3 +768,133 @@ describe('AccountingModule.returnInvoicePayment()', () => {
     expect(ledger.has(entryKey)).toBe(true);
   });
 });
+
+// ============================================================================
+// returnAllInvoicePayments() — bulk companion to returnInvoicePayment
+// ============================================================================
+
+describe('AccountingModule.returnAllInvoicePayments()', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * Set up an invoice with two forward payments from two different senders
+   * so the bulk-return iteration has more than one row to traverse.
+   */
+  async function setupTwoSenderScenario() {
+    const terms = makeTerms();
+    const { module, mocks } = createTestAccountingModule();
+    mocks.payments._tokens = [makeInvoiceToken(terms)];
+
+    const senderA = SENDER_ADDRESS;
+    const senderB = 'DIRECT://sender_b_address_999000';
+
+    const entries: Record<string, InvoiceTransferRef> = {
+      'tx-a::UCT': {
+        transferId: 'tx-a',
+        direction: 'inbound',
+        paymentDirection: 'forward',
+        coinId: 'UCT',
+        amount: '4000000',
+        destinationAddress: TARGET_ADDRESS,
+        timestamp: Date.now() - 7000,
+        confirmed: true,
+        senderAddress: senderA,
+      },
+      'tx-b::UCT': {
+        transferId: 'tx-b',
+        direction: 'inbound',
+        paymentDirection: 'forward',
+        coinId: 'UCT',
+        amount: '3000000',
+        destinationAddress: TARGET_ADDRESS,
+        timestamp: Date.now() - 5000,
+        confirmed: true,
+        senderAddress: senderB,
+      },
+    };
+
+    await mocks.storage.set(
+      `${STORAGE_PREFIX}_inv_ledger:${INVOICE_ID}`,
+      JSON.stringify(entries),
+    );
+    await mocks.storage.set(
+      `${STORAGE_PREFIX}_inv_ledger_index`,
+      JSON.stringify({ [INVOICE_ID]: { terminated: false } }),
+    );
+
+    await module.load();
+    return { module, mocks, senderA, senderB };
+  }
+
+  it('refunds every sender with positive net balance when called without options', async () => {
+    const { module, mocks, senderA, senderB } = await setupTwoSenderScenario();
+
+    const results = await module.returnAllInvoicePayments(INVOICE_ID);
+
+    expect(results).toHaveLength(2);
+    expect(mocks.payments.send).toHaveBeenCalledTimes(2);
+
+    const calls = mocks.payments.send.mock.calls.map(
+      (c) => c[0] as Record<string, unknown>,
+    );
+    const recipients = calls.map((c) => c.recipient as string).sort();
+    expect(recipients).toEqual([senderA, senderB].sort());
+
+    // Each refund must have the full attributed amount.
+    const amountsByRecipient = new Map(calls.map((c) => [c.recipient as string, c.amount as string]));
+    expect(amountsByRecipient.get(senderA)).toBe('4000000');
+    expect(amountsByRecipient.get(senderB)).toBe('3000000');
+
+    // Memos use the :B (back) direction tag — same as returnInvoicePayment.
+    for (const call of calls) {
+      expect(call.memo as string).toMatch(/^INV:[0-9a-f]{64}:B/);
+    }
+  });
+
+  it('refunds only the specified recipient when options.recipient is provided', async () => {
+    const { module, mocks, senderA, senderB } = await setupTwoSenderScenario();
+
+    const results = await module.returnAllInvoicePayments(INVOICE_ID, { recipient: senderB });
+
+    expect(results).toHaveLength(1);
+    expect(mocks.payments.send).toHaveBeenCalledOnce();
+    const call = mocks.payments.send.mock.calls[0]![0] as Record<string, unknown>;
+    expect(call.recipient).toBe(senderB);
+    expect(call.amount).toBe('3000000');
+    // senderA's row must not have been refunded.
+    expect(call.recipient).not.toBe(senderA);
+  });
+
+  it('returns an empty array and makes no send calls when nothing is refundable', async () => {
+    const terms = makeTerms();
+    const { module, mocks } = createTestAccountingModule();
+    mocks.payments._tokens = [makeInvoiceToken(terms)];
+    // No ledger entries seeded — nothing to refund.
+    await mocks.storage.set(
+      `${STORAGE_PREFIX}_inv_ledger_index`,
+      JSON.stringify({ [INVOICE_ID]: { terminated: false } }),
+    );
+    await module.load();
+
+    const results = await module.returnAllInvoicePayments(INVOICE_ID);
+    expect(results).toEqual([]);
+    expect(mocks.payments.send).not.toHaveBeenCalled();
+  });
+
+  it('throws INVOICE_NOT_FOUND when the invoice is unknown', async () => {
+    const { module } = createTestAccountingModule();
+    await module.load();
+    await expect(module.returnAllInvoicePayments(INVOICE_ID)).rejects.toMatchObject({
+      code: 'INVOICE_NOT_FOUND',
+    });
+  });
+
+  it('throws INVOICE_INVALID_RECIPIENT when options.recipient is not a DIRECT:// address', async () => {
+    const { module } = await setupTwoSenderScenario();
+    await expect(
+      module.returnAllInvoicePayments(INVOICE_ID, { recipient: '@alice' }),
+    ).rejects.toMatchObject({ code: 'INVOICE_INVALID_RECIPIENT' });
+  });
+});
