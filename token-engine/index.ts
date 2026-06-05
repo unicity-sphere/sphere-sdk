@@ -32,3 +32,7 @@ export type {
   SplitResult,
   EngineVerifyResult,
 } from './types';
+
+// Identity (A6): legacy DIRECT:// address derivation (Path A — XP-invariant).
+// Reused by core/Sphere (B6) and the engine's deriveIdentityAddress.
+export { deriveDirectAddress } from './identity';
