@@ -300,6 +300,56 @@ describe('SendingRecoveryWorker', () => {
     expect(finalEntry?.error).toContain('relay down');
   });
 
+  it('Issue #401: emits transfer:recovery-republish-exhausted on maxRetries exhaustion (and not on intermediate failures)', async () => {
+    const stuckEntry = makeEntry({
+      id: 'outbox-exhaust',
+      bundleCid: 'bafy-exhaust',
+      tokenIds: ['invoice-token-id'],
+      mode: 'instant',
+      recipient: '@bob',
+      updatedAt: 1_000,
+    });
+    const outboxFixture = makeFakeOutbox([stuckEntry]);
+    const republish = vi
+      .fn<RepublishFn>()
+      .mockRejectedValue(new Error('relay down for 90s'));
+
+    const recorder = makeEventRecorder();
+    const worker = new SendingRecoveryWorker(
+      makeDeps({
+        outboxFixture,
+        republish,
+        nowMs: 2_000_000,
+        emit: recorder.emit,
+      }),
+      { maxRetries: 3 },
+    );
+
+    // First two cycles fail without exhaustion — no event yet.
+    await worker.runScanCycle();
+    await worker.runScanCycle();
+    expect(
+      recorder.events.filter((e) => e.type === 'transfer:recovery-republish-exhausted'),
+    ).toHaveLength(0);
+
+    // Third cycle exhausts; event fires exactly once.
+    await worker.runScanCycle();
+
+    const exhausted = recorder.events.filter(
+      (e) => e.type === 'transfer:recovery-republish-exhausted',
+    );
+    expect(exhausted).toHaveLength(1);
+    expect(exhausted[0]!.data).toMatchObject({
+      outboxId: 'outbox-exhaust',
+      bundleCid: 'bafy-exhaust',
+      tokenIds: ['invoice-token-id'],
+      mode: 'instant',
+      recipient: '@bob',
+      lastError: expect.stringContaining('relay down'),
+    });
+    expect((exhausted[0]!.data as { exhaustedAt: number }).exhaustedAt).toBe(2_000_000);
+  });
+
   it('skips entries whose updatedAt is within the stuck threshold', async () => {
     const fresh = makeEntry({
       id: 'fresh',

@@ -548,6 +548,65 @@ describe('AccountingModule.deliverInvoice — failure modes', () => {
       }),
     );
   });
+
+  it('UT-DELIVER-105 (#401): re-emits invoice:deliver-failed with reason "non-durable" when SendingRecoveryWorker exhausts on a delivered invoice', async () => {
+    // Mint and "deliver" an invoice so it lives in invoiceTermsCache —
+    // this is the predicate AccountingModule uses to decide whether a
+    // recovery-republish-exhausted event belongs to it.
+    const { invoiceId } = await mintRealInvoice();
+    await module.deliverInvoice(invoiceId);
+
+    const emitEvent = (module as any).deps?.emitEvent as ReturnType<typeof vi.fn>;
+    emitEvent.mockClear();
+
+    // Fire the new SendingRecoveryWorker exhaustion event through the
+    // mock payments emit pipe (deps.on routes subscriptions to this).
+    // tokenIds includes the invoice id so AccountingModule recognizes
+    // it as one of its own and re-emits the focused failure.
+    mocks.payments._emit('transfer:recovery-republish-exhausted', {
+      outboxId: 'outbox-fake',
+      bundleCid: 'bafy-fake',
+      tokenIds: [invoiceId],
+      mode: 'instant',
+      recipient: REMOTE_BOB,
+      lastError: 'relay down for 90s',
+      exhaustedAt: Date.now(),
+    });
+
+    expect(emitEvent).toHaveBeenCalledWith(
+      'invoice:deliver-failed',
+      expect.objectContaining({
+        invoiceId,
+        recipient: REMOTE_BOB,
+        reason: 'non-durable',
+        errorMessage: expect.stringContaining('relay down'),
+      }),
+    );
+  });
+
+  it('UT-DELIVER-106 (#401): does NOT re-emit invoice:deliver-failed when exhausted entry is unrelated to any tracked invoice', async () => {
+    await mintRealInvoice();
+
+    const emitEvent = (module as any).deps?.emitEvent as ReturnType<typeof vi.fn>;
+    emitEvent.mockClear();
+
+    // tokenIds carries an id that is NOT in invoiceTermsCache — the
+    // exhaustion is for an ordinary token transfer, not an invoice.
+    mocks.payments._emit('transfer:recovery-republish-exhausted', {
+      outboxId: 'outbox-fake',
+      bundleCid: 'bafy-fake',
+      tokenIds: ['deadbeef'.repeat(8)],
+      mode: 'instant',
+      recipient: REMOTE_BOB,
+      lastError: 'relay down',
+      exhaustedAt: Date.now(),
+    });
+
+    expect(emitEvent).not.toHaveBeenCalledWith(
+      'invoice:deliver-failed',
+      expect.objectContaining({ reason: 'non-durable' }),
+    );
+  });
 });
 
 // =============================================================================

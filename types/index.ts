@@ -572,6 +572,7 @@ export type SphereEventType =
   | 'transfer:override-applied'
   | 'transfer:capability-warning'
   | 'transfer:recovery-republished'
+  | 'transfer:recovery-republish-exhausted'
   | 'transfer:orphan-spending-detected'
   | 'transfer:orphan-recovered'
   | 'transfer:sent-reconciliation-recovered'
@@ -1152,6 +1153,36 @@ export interface SphereEventMap {
     readonly mode: 'conservative' | 'instant' | 'txf';
     readonly targetStatus: 'delivered' | 'delivered-instant';
     readonly recoveredAt: number;
+  };
+  /**
+   * Issue #401 — SendingRecoveryWorker exhausted its per-entry retry
+   * budget (`maxRetries`, default 3 consecutive failed republish
+   * attempts) and transitioned the OUTBOX entry to `'failed-transient'`.
+   * The bundle is provably undeliverable on the current relay set.
+   *
+   * Companion signal to `'transfer:recovery-republished'` (success). This
+   * is the terminal-failure signal the recovery layer was missing — the
+   * AccountingModule subscribes to it and re-emits as
+   * `'invoice:deliver-failed' { reason: 'non-durable' }` for invoice
+   * tokenIds it owns, so operators receive a focused failure event for
+   * the at-least-once durability path.
+   *
+   * Payload fields:
+   *  - `outboxId`    — the entry that exhausted
+   *  - `bundleCid`   — content-addressed handle (for IPFS triage)
+   *  - `tokenIds`    — bundle recipients (for AccountingModule filter)
+   *  - `mode`        — entry's transfer mode at exhaustion
+   *  - `lastError`   — final failure's message (sanitized)
+   *  - `exhaustedAt` — wall-clock ms timestamp
+   */
+  'transfer:recovery-republish-exhausted': {
+    readonly outboxId: string;
+    readonly bundleCid: string;
+    readonly tokenIds: ReadonlyArray<string>;
+    readonly mode: 'conservative' | 'instant' | 'txf';
+    readonly recipient: string;
+    readonly lastError: string;
+    readonly exhaustedAt: number;
   };
   /**
    * Issue #97 — A token in `'transferring'` status (= has an

@@ -272,6 +272,7 @@ Typed RPC layer for dApp ↔ wallet communication. Full guide: [`docs/CONNECT.md
 | `transfer:retention-warning` | `{ sentId, nostrEventId, bundleCid, tokenIds, recipientTransportPubkey, detectedAt }` | Relay no longer retains the Nostr TOKEN_TRANSFER event for a SENT entry |
 | `transfer:retention-republish-rearmed` | `{ sentId, nostrEventId, bundleCid, tokenIds, recipientTransportPubkey, fromStatus, toStatus, rearmedAt }` | Verifier transitioned a live OUTBOX entry back to `'sending'` so the recovery worker republishes |
 | `transfer:retention-republish-skipped` | `{ sentId, nostrEventId, bundleCid, reason, observedStatus?, errorMessage?, detectedAt }` | Retention re-publish could not be initiated (`reason ∈ no-outbox-writer / entry-tombstoned-or-missing / wrong-status / transition-failed`) |
+| `transfer:recovery-republish-exhausted` | `{ outboxId, bundleCid, tokenIds, mode, recipient, lastError, exhaustedAt }` | SendingRecoveryWorker exhausted `maxRetries` (default 3) and transitioned OUTBOX entry to `'failed-transient'`. Issue #401 — AccountingModule listens and re-emits `invoice:deliver-failed { reason: 'non-durable' }` when `tokenIds` contains a tracked invoice |
 
 See [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) and [QUICKSTART-NODEJS.md](docs/QUICKSTART-NODEJS.md) for detailed guides. Operator runbooks for the send-pipeline events live at [docs/uxf/RUNBOOK-SEND-PIPELINE.md](docs/uxf/RUNBOOK-SEND-PIPELINE.md).
 
