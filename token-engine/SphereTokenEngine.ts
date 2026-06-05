@@ -1,11 +1,11 @@
 /**
  * token-engine/SphereTokenEngine.ts — the real ITokenEngine adapter (Track A).
  *
- * Work in progress: this commit implements identity, value reads, serialization,
- * verification, mint and transfer (A1 + A2). `split` and `isSpent` land in
- * follow-up commits, after which the class declares `implements ITokenEngine`.
- * Kept un-declared until then so every commit compiles green (the port cannot be
- * implemented half-way).
+ * The full sender-driven engine over the v2 SDK: identity, value reads,
+ * serialization, verification, mint, transfer, split and spent-status. All
+ * crypto/value logic is the SDK's; this class orchestrates build → submit →
+ * wait-proof → certify → realize, and maps SDK errors/states to the
+ * sphere-domain ITokenEngine port.
  *
  * SDK objects are injected via `EngineDeps` (built by the factory in A4, or by
  * test wiring around TestAggregatorClient), keeping the engine logic independent
@@ -29,6 +29,7 @@ import {
   type SigningService,
   SplitMintJustification,
   SplitTokenRequest,
+  StateId,
   type StateTransitionClient,
   Token,
   TokenSplit,
@@ -38,7 +39,7 @@ import {
 } from './sdk';
 import { decodeSpherePaymentData, SpherePaymentData, sphereAssetToSdk } from './SpherePaymentData';
 import { TOKEN_BLOB_VERSION } from './token-blob';
-import type { EngineOpOptions } from './engine';
+import type { EngineOpOptions, ITokenEngine } from './engine';
 import type {
   CoinId,
   EngineIdentity,
@@ -63,7 +64,7 @@ export interface EngineDeps {
   readonly networkId: NetworkId;
 }
 
-export class SphereTokenEngine {
+export class SphereTokenEngine implements ITokenEngine {
   public constructor(private readonly deps: EngineDeps) {}
 
   // ── identity ────────────────────────────────────────────────────────────────
@@ -236,6 +237,21 @@ export class SphereTokenEngine {
       this.deps.mintJustificationVerifier,
     );
     return result.status === VerificationStatus.OK ? { ok: true } : { ok: false, reason: String(result.status) };
+  }
+
+  public async isSpent(token: SphereToken, _options?: EngineOpOptions): Promise<boolean> {
+    // The token's current state id = what a future transfer would spend. Derive it via a
+    // probe transfer (never submitted) — StateId depends only on the source's lock script
+    // and state hash, not on the recipient or state mask.
+    const probe = await TransferTransaction.create(
+      token.sdkToken,
+      SignaturePredicate.create(this.deps.signingService.publicKey),
+      new Uint8Array(32),
+    );
+    const stateId = await StateId.fromTransaction(probe);
+    const response = await this.deps.client.getInclusionProof(stateId);
+    // A present inclusion certificate means the state has already been consumed on-chain.
+    return response.inclusionProof.inclusionCertificate !== null;
   }
 
   // ── serialization ────────────────────────────────────────────────────────────

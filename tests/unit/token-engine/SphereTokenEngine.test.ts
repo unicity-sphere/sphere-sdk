@@ -11,6 +11,7 @@ import {
 } from '../../../token-engine/sdk';
 import { decodeSpherePaymentData } from '../../../token-engine/SpherePaymentData';
 import { type EngineDeps, SphereTokenEngine } from '../../../token-engine/SphereTokenEngine';
+import { runEngineContract } from './engine-contract';
 import { TestAggregatorClient } from './support/TestAggregatorClient';
 
 const COIN = 'a'.repeat(64);
@@ -34,6 +35,9 @@ function makeEngine(): SphereTokenEngine {
   };
   return new SphereTokenEngine(deps);
 }
+
+// The real adapter must satisfy the same behavioural contract as FakeTokenEngine.
+runEngineContract('SphereTokenEngine', makeEngine);
 
 describe('SphereTokenEngine (real adapter, A1–A3) — via in-memory aggregator', () => {
   it('mints a token and reflects its value', async () => {
