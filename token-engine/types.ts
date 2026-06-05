@@ -90,6 +90,12 @@ export interface TransferParams {
   readonly recipientPubkey: Uint8Array;
 }
 
+/**
+ * One split output = one single-coin token. To split a multi-coin token, emit
+ * one output per coin (the recipient receives the value as several tokens; the
+ * SDK enforces per-coin conservation). If a single multi-coin output token is
+ * ever needed, generalize this to `assets: readonly SphereAsset[]` (additive).
+ */
 export interface SplitOutput {
   readonly recipientPubkey: Uint8Array;
   readonly coinId: CoinId;
