@@ -185,7 +185,10 @@ banner "Section 3: Bob creates a 7 UCT invoice (human-friendly --asset)"
 
 cd "$PEER_BOB"
 sphere wallet use bob
-sphere invoice create --target "@${BOB_TAG}" --asset "7 UCT" --memo "Accounting demo invoice — 7 UCT" \
+# Canonical UX (sphere-cli #32): `--asset <amount> <coin>` is two
+# positional tokens (no quoted compound form). `--json` opts back into
+# the machine-readable output the grep below expects.
+sphere invoice create --target "@${BOB_TAG}" --asset 7 UCT --memo "Accounting demo invoice — 7 UCT" --json \
   2>&1 | tee "$SNAP/bob-invoice-create.log"
 
 INV="$(grep -Eo '"invoiceId":[[:space:]]*"[^"]+"' "$SNAP/bob-invoice-create.log" | head -1 | sed 's/.*"\([^"]*\)"$/\1/')"
@@ -209,7 +212,7 @@ sphere balance | tee "$SNAP/bob-balance-1.txt"
 # ---------------------------------------------------------------------------
 banner "Section 4: Bob delivers invoice to @${ALICE_TAG}"
 
-sphere invoice deliver "$INV" --to "@${ALICE_TAG}" 2>&1 | tee "$SNAP/bob-invoice-deliver.log"
+sphere invoice deliver "$INV" --to "@${ALICE_TAG}" --json 2>&1 | tee "$SNAP/bob-invoice-deliver.log"
 grep -qE '"sent":[[:space:]]*1' "$SNAP/bob-invoice-deliver.log" \
   || { echo "ASSERT FAIL (deliver-acked): expected 'sent: 1' in deliver response" >&2; exit 1; }
 echo "ASSERT OK (deliver-acked): invoice delivery DM sent"
@@ -312,7 +315,7 @@ rc=0
 # in AccountingModule) walks COVERED → CLOSED in a single step once all
 # targets are fully paid — both indicate the payment was attributed to
 # the invoice correctly.
-if grep -qE '("state"[[:space:]]*:[[:space:]]*"(COVERED|CLOSED)"|State:[[:space:]]*(COVERED|CLOSED)|state:[[:space:]]*(COVERED|CLOSED))' \
+if grep -qiE '("state"[[:space:]]*:[[:space:]]*"(COVERED|CLOSED)"|state[[:space:]]*:[[:space:]]*(COVERED|CLOSED))' \
     "$SNAP/bob-invoice-status.log"; then
   echo "ASSERT OK (invoice-covered): bob's invoice transitioned to COVERED or CLOSED"
 else

@@ -139,14 +139,14 @@ wait_for_invoice_visible() {
   : > "$output_file"
   while (( elapsed < timeout )); do
     if sphere invoice status "$invoice" > "$output_file" 2>&1; then
-      if ! grep -q 'No invoice found' "$output_file"; then
+      if ! grep -q -i 'no invoice found' "$output_file"; then
         cat "$output_file"
         return 0
       fi
       # Found a "No invoice" — transient. Retry after sleep.
     else
       rc=$?
-      if ! grep -q 'No invoice found' "$output_file"; then
+      if ! grep -q -i 'no invoice found' "$output_file"; then
         # CLI failed for a non-transient reason (e.g. DB lock, network
         # config). Surface immediately so the soak fails informatively.
         cat "$output_file" >&2
@@ -786,7 +786,10 @@ sphere wallet use alice
 # `invoice deliver` in §C.1b via `--to`, because the invoice's only
 # target is self and `deliver`'s default ("every non-self target")
 # would yield zero recipients.
-sphere invoice create --target "@$ALICE_TAG" --asset "11 UCT" --memo "Full-recovery test invoice" \
+# Canonical UX (sphere-cli #32): `--asset <amount> <coin>` is two
+# positional tokens (no quoted compound form). `--json` opts back into
+# the machine-readable output the grep below expects.
+sphere invoice create --target "@$ALICE_TAG" --asset 11 UCT --memo "Full-recovery test invoice" --json \
   2>&1 | tee "$SNAP/peer1-invoice-create.log"
 
 INV="$(grep -Eo '"invoiceId":[[:space:]]*"[^"]+"' "$SNAP/peer1-invoice-create.log" | head -1 | sed 's/.*"\([^"]*\)"$/\1/')"
