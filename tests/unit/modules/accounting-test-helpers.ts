@@ -60,6 +60,15 @@ export interface MockPaymentsModule {
   send: ReturnType<typeof vi.fn>;
   on: ReturnType<typeof vi.fn>;
   onTokenChange: ReturnType<typeof vi.fn>;
+  /**
+   * Issue #397 — invoice delivery now ships via PaymentsModule's
+   * `publishUxfBundle` primitive (TOKEN_TRANSFER pipeline) instead of
+   * `CommunicationsModule.sendDM`. The mock returns a fake event id by
+   * default; tests that need to inspect the CAR/payload or simulate
+   * publish failure override via `.mockImplementation` /
+   * `.mockRejectedValue`.
+   */
+  publishUxfBundle: ReturnType<typeof vi.fn>;
   l1: null;
   // Test helpers
   _tokens: Token[];
@@ -142,6 +151,19 @@ export function createMockPaymentsModule(): MockPaymentsModule {
     for (const cb of tokenChangeCallbacks) cb(tokenId, sdkData);
   };
 
+  // Issue #397 — publishUxfBundle stub. Returns a randomized fake
+  // event id and echoes the recipient as both transportPubkey + nametag
+  // (tests rarely care about the exact resolution). Override in
+  // individual tests to inspect the call arguments or simulate failure.
+  const publishUxfBundle = vi.fn().mockImplementation(
+    (params: { recipient: string }) => {
+      return Promise.resolve({
+        nostrEventId: 'mock-event-' + Math.random().toString(36).slice(2, 10),
+        recipientTransportPubkey: params.recipient,
+      });
+    },
+  );
+
   const mock: MockPaymentsModule = {
     getTokens,
     getArchivedTokens,
@@ -150,6 +172,7 @@ export function createMockPaymentsModule(): MockPaymentsModule {
     send,
     on,
     onTokenChange,
+    publishUxfBundle,
     l1: null,
     _tokens: tokens,
     _archivedTokens: archivedTokens,

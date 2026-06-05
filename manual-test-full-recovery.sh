@@ -786,7 +786,7 @@ sphere wallet use alice
 # `invoice deliver` in §C.1b via `--to`, because the invoice's only
 # target is self and `deliver`'s default ("every non-self target")
 # would yield zero recipients.
-sphere invoice create --target "@$ALICE_TAG" --asset "11000000 UCT" --memo "Full-recovery test invoice" \
+sphere invoice create --target "@$ALICE_TAG" --asset "11 UCT" --memo "Full-recovery test invoice" \
   2>&1 | tee "$SNAP/peer1-invoice-create.log"
 
 INV="$(grep -Eo '"invoiceId":[[:space:]]*"[^"]+"' "$SNAP/peer1-invoice-create.log" | head -1 | sed 's/.*"\([^"]*\)"$/\1/')"

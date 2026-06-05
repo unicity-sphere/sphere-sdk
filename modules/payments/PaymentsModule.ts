@@ -223,7 +223,8 @@ import type { TokenManifestEntry } from '../../profile/token-manifest';
 import type { CascadeManifestScanner as CascadeManifestScannerForRevalidate } from './transfer/cascade-walker';
 import type { ProofVerifyStatus } from './transfer/proof-verifier';
 import { contentHash, type ContentHash } from '../../uxf/types';
-import { isLegacyTokenTransferPayload } from '../../types/uxf-transfer';
+import { isLegacyTokenTransferPayload, type UxfTransferPayload } from '../../types/uxf-transfer';
+import { carBytesToBase64 } from '../../uxf/transfer-payload';
 import type { UxfTransferOutboxEntry } from '../../types/uxf-outbox';
 import type { UxfSentLedgerEntry } from '../../types/uxf-sent';
 import type { OutboxWriter } from '../../profile/outbox-writer';
@@ -6433,6 +6434,145 @@ export class PaymentsModule {
   // ===========================================================================
   // Public API - Instant Split (V5 Optimized)
   // ===========================================================================
+
+  /**
+   * Issue #397 — Publish a pre-built UXF CAR bundle to a recipient via
+   * the standard TOKEN_TRANSFER pipeline (Nostr kind 31113).
+   *
+   * Public primitive used by callers that already own the bundle bytes
+   * and want the token-pipeline wire path (matching at-least-once gate,
+   * shared receiver decode/route, future OUTBOX coverage) instead of
+   * inventing their own DM-based delivery. The current consumer is
+   * `AccountingModule.deliverInvoice`, replacing the legacy
+   * `invoice_delivery:` NIP-17 DM path that lacked all of that
+   * infrastructure.
+   *
+   * Recipient resolution: `recipient` accepts the same identifiers as
+   * the rest of the SDK (`@nametag`, `DIRECT://...`, chain pubkey,
+   * transport pubkey). Resolution goes through the transport's
+   * `resolve()` if available, then falls back to direct hex parsing.
+   *
+   * Wire shape:
+   *  - `kind: 'uxf-car'` (default) — inline CAR base64 in the payload.
+   *    `carBase64` is derived from `carBytes` if not pre-supplied.
+   *  - `kind: 'uxf-cid'` (when `publishViaIpfsCid: true`) — the caller
+   *    is responsible for IPFS-pinning the CAR beforehand; only the
+   *    CID rides on the wire.
+   *
+   * Does NOT mint, sign, finalize, or otherwise mutate state — those
+   * concerns belong in the higher-level `send` / `sendInstant` paths
+   * which work with un-finalized source tokens. This primitive trusts
+   * the caller to hand it a bundle whose contents are already terminal.
+   *
+   * Does NOT yet write OUTBOX entries (follow-up). Failure recovery for
+   * invoice deliveries currently depends on caller-side republish.
+   *
+   * @throws {SphereError} `INVALID_RECIPIENT` — recipient could not be
+   *   resolved to a transport pubkey.
+   * @throws {SphereError} `TRANSPORT_ERROR` — transport rejected the
+   *   `sendTokenTransfer` call.
+   * @throws {SphereError} `NOT_INITIALIZED` — module not initialized.
+   */
+  async publishUxfBundle(params: {
+    readonly recipient: string;
+    readonly bundleCid: string;
+    readonly tokenIds: ReadonlyArray<string>;
+    readonly carBytes: Uint8Array;
+    readonly publishViaIpfsCid?: boolean;
+    readonly carBase64Inline?: string;
+    readonly cidFetchGateways?: ReadonlyArray<string>;
+    /**
+     * Optional sender memo. UNAUTHENTICATED — the outer envelope is
+     * not covered by `bundleCid`. Forwarded into the
+     * `UxfTransferPayload.memo` field so it survives the same wire
+     * boundary as memos on ordinary token transfers.
+     */
+    readonly memo?: string;
+  }): Promise<{
+    readonly nostrEventId: string;
+    readonly recipientTransportPubkey: string;
+    readonly recipientNametag?: string;
+  }> {
+    this.ensureInitialized();
+
+    // Resolve recipient → transport pubkey. Mirrors the same two-step
+    // pattern as `send`/`sendInstant` (transport.resolve → fallback
+    // hex parsing inside `resolveTransportPubkey`).
+    const peerInfo: PeerInfo | null =
+      (await this.deps!.transport.resolve?.(params.recipient)) ?? null;
+    const recipientTransportPubkey = this.resolveTransportPubkey(
+      params.recipient,
+      peerInfo,
+    );
+
+    // Build the wire payload. Shape mirrors the canonical envelopes
+    // produced by `instant-sender.ts` so legacy decoders + the receive
+    // pipeline see identical wire bytes from both senders. `mode:
+    // 'instant'` is the discriminator the receiver's ingest pool keys
+    // on; it is advisory per §3.1 ("recipient processes per bundle
+    // contents, not per this field").
+    const tokenIds = params.tokenIds.slice();
+    const senderField = {
+      transportPubkey: this.deps!.identity.chainPubkey,
+      ...(this.deps!.identity.nametag !== undefined
+        ? { nametag: this.deps!.identity.nametag }
+        : {}),
+    };
+    let payload: UxfTransferPayload;
+    if (params.publishViaIpfsCid) {
+      payload = {
+        kind: 'uxf-cid',
+        version: '1.0',
+        mode: 'instant',
+        bundleCid: params.bundleCid,
+        tokenIds,
+        sender: senderField,
+        ...(params.memo !== undefined ? { memo: params.memo } : {}),
+        ...(params.cidFetchGateways && params.cidFetchGateways.length > 0
+          ? { senderGateways: params.cidFetchGateways.slice() }
+          : {}),
+      };
+    } else {
+      const carBase64 =
+        params.carBase64Inline ?? carBytesToBase64(params.carBytes);
+      payload = {
+        kind: 'uxf-car',
+        version: '1.0',
+        mode: 'instant',
+        bundleCid: params.bundleCid,
+        tokenIds,
+        sender: senderField,
+        ...(params.memo !== undefined ? { memo: params.memo } : {}),
+        carBase64,
+      };
+    }
+
+    // Publish via TOKEN_TRANSFER (kind 31113) — same wire kind as
+    // ordinary token transfers, so the receiver's existing ingest
+    // pool + at-least-once gate cover this delivery for free.
+    let nostrEventId: string;
+    try {
+      nostrEventId = await this.deps!.transport.sendTokenTransfer(
+        recipientTransportPubkey,
+        payload,
+      );
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      throw new SphereError(
+        `publishUxfBundle: transport.sendTokenTransfer failed: ${message}`,
+        'TRANSPORT_ERROR',
+        cause,
+      );
+    }
+
+    return {
+      nostrEventId,
+      recipientTransportPubkey,
+      ...(peerInfo?.nametag !== undefined
+        ? { recipientNametag: peerInfo.nametag }
+        : {}),
+    };
+  }
 
   /**
    * Send tokens using INSTANT_SPLIT V5 optimized flow.

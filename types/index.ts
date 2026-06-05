@@ -679,6 +679,7 @@ export type SphereEventType =
   | 'invoice:receipt_received'
   | 'invoice:cancellation_sent'
   | 'invoice:cancellation_received'
+  | 'invoice:deliver-failed'
   // Swap events
   | 'swap:proposal_received'
   | 'swap:proposed'
@@ -1527,6 +1528,31 @@ export interface SphereEventMap {
   'invoice:receipt_received': { invoiceId: string; receipt: import('../modules/accounting/types').IncomingInvoiceReceipt };
   'invoice:cancellation_sent': { invoiceId: string; sent: number; failed: number };
   'invoice:cancellation_received': { invoiceId: string; notice: import('../modules/accounting/types').IncomingCancellationNotice };
+  /**
+   * Issue #397 — fires when an invoice delivery via the standard
+   * TOKEN_TRANSFER pipeline could not be published to a recipient.
+   * Replaces the silent `sent: 0, failed: N` shape pre-fix had.
+   *
+   *  - `invoiceId`: 64-hex tokenId of the invoice whose delivery failed.
+   *  - `recipient`: identifier passed to `deliverInvoice` (`@nametag`,
+   *    `DIRECT://…`, chain pubkey). Operator-facing — NOT the resolved
+   *    transport pubkey.
+   *  - `reason`:
+   *      - `'non-durable'`: reserved for future OUTBOX-backed durability
+   *        republish failures.
+   *      - `'transport-error'`: publish itself failed (relay offline,
+   *        rejected event, CID-pin failure, recipient unresolvable, ...).
+   *      - `'unknown'`: SDK could not classify the underlying error.
+   *  - `errorMessage`: short human-readable message.
+   *
+   * Terminal event — the SDK does not retry on its own.
+   */
+  'invoice:deliver-failed': {
+    invoiceId: string;
+    recipient: string;
+    reason: 'non-durable' | 'transport-error' | 'unknown';
+    errorMessage: string;
+  };
   // Swap event payloads
   'swap:proposal_received': { swapId: string; deal: Record<string, unknown>; senderPubkey: string; senderNametag?: string };
   'swap:proposed': { swapId: string; deal: Record<string, unknown>; recipientPubkey: string };
