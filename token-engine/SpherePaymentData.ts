@@ -23,6 +23,28 @@ import {
   PaymentAssetCollection,
 } from './sdk';
 import type { CoinId, SphereValue } from './types';
+import { SphereError } from '../core/errors';
+
+/** Canonical coin id: non-empty, even-length lowercase hex (the form `toValue` emits). */
+const COIN_ID_PATTERN = /^([0-9a-f]{2})+$/;
+
+/** Guard a sphere-domain asset before it crosses into the SDK value model. */
+function assertAsset(coinId: CoinId, amount: bigint): void {
+  if (!COIN_ID_PATTERN.test(coinId)) {
+    throw new SphereError(`Invalid coin id (expected even-length lowercase hex): "${coinId}"`, 'VALIDATION_ERROR');
+  }
+  if (amount < 0n) {
+    // Negative bigints silently encode to an empty byte string (decoding back to 0n)
+    // in the SDK's BigintConverter — reject loudly to avoid silent value loss.
+    throw new SphereError(`Asset amount must be non-negative: ${amount.toString()}`, 'VALIDATION_ERROR');
+  }
+}
+
+/** Validate a sphere-domain asset and build the SDK Asset — the single validation point. */
+export function sphereAssetToSdk(coinId: CoinId, amount: bigint): Asset {
+  assertAsset(coinId, amount);
+  return new Asset(new AssetId(HexConverter.decode(coinId)), amount);
+}
 
 export class SpherePaymentData implements IPaymentData {
   /** Sphere-private CBOR tag (verified free in the v2 SDK tag space). */
@@ -39,9 +61,7 @@ export class SpherePaymentData implements IPaymentData {
 
   /** Build from a sphere-domain value (hex coin id → bigint amount). */
   public static fromValue(value: SphereValue): SpherePaymentData {
-    const assets = value.assets.map(
-      (a) => new Asset(new AssetId(HexConverter.decode(a.coinId)), a.amount),
-    );
+    const assets = value.assets.map((a) => sphereAssetToSdk(a.coinId, a.amount));
     return new SpherePaymentData(PaymentAssetCollection.create(...assets));
   }
 
@@ -84,7 +104,18 @@ export class SpherePaymentData implements IPaymentData {
 
   /** Balance of a single coin within this payload (0n when absent). */
   public balanceOf(coinId: CoinId): bigint {
+    if (!COIN_ID_PATTERN.test(coinId)) {
+      throw new SphereError(`Invalid coin id (expected even-length lowercase hex): "${coinId}"`, 'VALIDATION_ERROR');
+    }
     const asset = this.assets.get(new AssetId(HexConverter.decode(coinId)));
     return asset ? asset.value : 0n;
   }
+}
+
+/**
+ * Async payment-data decoder matching the SDK's `decodePaymentData` signature.
+ * Used by `TokenSplit.split` (value conservation) and `SplitMintJustificationVerifier`.
+ */
+export function decodeSpherePaymentData(bytes: Uint8Array): Promise<IPaymentData> {
+  return Promise.resolve(SpherePaymentData.fromCBOR(bytes));
 }

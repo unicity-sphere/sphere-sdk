@@ -57,8 +57,8 @@ export class FakeTokenEngine implements ITokenEngine {
     return { chainPubkey: new Uint8Array(this.identity.chainPubkey) };
   }
 
-  public deriveIdentityAddress(pubkey?: Uint8Array): string {
-    return `DIRECT://${HexConverter.encode(pubkey ?? this.identity.chainPubkey)}`;
+  public deriveIdentityAddress(pubkey?: Uint8Array): Promise<string> {
+    return Promise.resolve(`DIRECT://${HexConverter.encode(pubkey ?? this.identity.chainPubkey)}`);
   }
 
   public readValue(token: SphereToken): SphereValue | null {
@@ -94,10 +94,9 @@ export class FakeTokenEngine implements ITokenEngine {
     return { outputs };
   }
 
-  public verify(token: SphereToken, _options?: EngineOpOptions): Promise<EngineVerifyResult> {
-    return Promise.resolve(
-      this.spent.has(this.idOf(token)) ? { ok: false, reason: 'token already spent' } : { ok: true },
-    );
+  public verify(_token: SphereToken, _options?: EngineOpOptions): Promise<EngineVerifyResult> {
+    // Structural validity only — fake tokens are always well-formed. Spent-status is isSpent's job.
+    return Promise.resolve({ ok: true });
   }
 
   public isSpent(token: SphereToken, _options?: EngineOpOptions): Promise<boolean> {

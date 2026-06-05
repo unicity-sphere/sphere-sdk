@@ -66,4 +66,14 @@ describe('SpherePaymentData', () => {
     );
     expect(() => SpherePaymentData.fromCBOR(future)).toThrow(CborError);
   });
+
+  it('rejects a negative amount (would silently encode to 0n otherwise)', () => {
+    expect(() => SpherePaymentData.fromValue({ assets: [{ coinId: COIN_A, amount: -1n }] })).toThrow(/non-negative/);
+  });
+
+  it('rejects a malformed coin id', () => {
+    expect(() => SpherePaymentData.fromValue({ assets: [{ coinId: 'XYZ', amount: 1n }] })).toThrow(/coin id/);
+    expect(() => SpherePaymentData.fromValue({ assets: [{ coinId: 'abc', amount: 1n }] })).toThrow(/coin id/); // odd length
+    expect(() => SpherePaymentData.fromValue({ assets: [{ coinId: COIN_A.toUpperCase(), amount: 1n }] })).toThrow(/coin id/);
+  });
 });
