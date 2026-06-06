@@ -16,6 +16,9 @@ import { TokenReservationLedger } from '../../../modules/payments/TokenReservati
 import { SphereError } from '../../../core/errors';
 import type { Token } from '../../../types';
 import type { SplitPlan } from '../../../modules/payments/TokenSplitCalculator';
+import { FakeTokenEngine } from '../token-engine/FakeTokenEngine';
+import { encodeTokenBlob } from '../../../token-engine/token-blob';
+import { bytesToHex } from '../../../core/crypto';
 
 // =============================================================================
 // Helpers
@@ -840,5 +843,85 @@ describe('SpendPlanner', () => {
         100_000n, // totalInventory = 600k < 2M
       )).toThrow('Insufficient balance');
     });
+  });
+});
+
+// =============================================================================
+// buildParsedPool — engine path (B3, path B)
+//
+// When an ITokenEngine is injected, buildParsedPool reads each token's value
+// from the v2 engine: sdkData holds the engine blob (hex of CBOR(TokenBlob)),
+// decoded via engine.decodeToken and summed via engine.balanceOf. The legacy
+// v1 SdkToken.fromJSON path remains as the fallback when no engine is present.
+// =============================================================================
+
+describe('SpendPlanner.buildParsedPool — engine path (B3)', () => {
+  const PUBKEY = new Uint8Array([0x02, ...new Array<number>(32).fill(7)]); // 33 bytes
+  // v2 engine coin ids are lowercase even-length hex (NOT the UI symbol).
+  const UCT = '11'.repeat(32);
+  const USDC = '22'.repeat(32);
+
+  /** A confirmed UI Token whose sdkData is the v2 engine blob (hex of CBOR(TokenBlob)). */
+  async function engineToken(
+    fake: FakeTokenEngine,
+    id: string,
+    coinId: string,
+    amount: bigint,
+  ): Promise<Token> {
+    const st = await fake.mint({ recipientPubkey: PUBKEY, value: { assets: [{ coinId, amount }] } });
+    const sdkData = bytesToHex(encodeTokenBlob(fake.encodeToken(st)));
+    return { ...makeToken(id, coinId, amount.toString()), sdkData };
+  }
+
+  it('computes amounts via engine.balanceOf from v2-blob sdkData', async () => {
+    const fake = new FakeTokenEngine();
+    const planner = new SpendPlanner(fake);
+    const tokens = [
+      await engineToken(fake, 'tok-1', UCT, 100n),
+      await engineToken(fake, 'tok-2', UCT, 250n),
+    ];
+
+    const pool = await planner.buildParsedPool(tokens, UCT);
+
+    expect(pool.size).toBe(2);
+    expect(pool.get('tok-1')!.amount).toBe(100n);
+    expect(pool.get('tok-2')!.amount).toBe(250n);
+  });
+
+  it('skips tokens whose engine balance for the requested coin is zero', async () => {
+    const fake = new FakeTokenEngine();
+    const planner = new SpendPlanner(fake);
+    const tokens = [
+      await engineToken(fake, 'tok-uct', UCT, 100n),
+      await engineToken(fake, 'tok-usdc', USDC, 500n),
+    ];
+
+    const pool = await planner.buildParsedPool(tokens, UCT);
+
+    expect(pool.size).toBe(1);
+    expect(pool.has('tok-uct')).toBe(true);
+  });
+
+  it('carries the decoded SphereToken (with genesis-stable id) as the entry sdkToken', async () => {
+    const fake = new FakeTokenEngine();
+    const planner = new SpendPlanner(fake);
+    const t = await engineToken(fake, 'tok-1', UCT, 100n);
+
+    const pool = await planner.buildParsedPool([t], UCT);
+
+    const entry = pool.get('tok-1')!;
+    expect((entry.sdkToken as { blob: { tokenId: string } }).blob.tokenId).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('ignores non-confirmed tokens', async () => {
+    const fake = new FakeTokenEngine();
+    const planner = new SpendPlanner(fake);
+    const confirmed = await engineToken(fake, 'tok-ok', UCT, 100n);
+    const pending = { ...(await engineToken(fake, 'tok-pending', UCT, 100n)), status: 'pending' as const };
+
+    const pool = await planner.buildParsedPool([confirmed, pending], UCT);
+
+    expect(pool.size).toBe(1);
+    expect(pool.has('tok-ok')).toBe(true);
   });
 });

@@ -30,6 +30,7 @@ import type {
 } from '../../types/txf';
 import { L1PaymentsModule, type L1PaymentsModuleConfig } from './L1PaymentsModule';
 import type { SplitPlan, TokenWithAmount } from './TokenSplitCalculator';
+import type { ITokenEngine } from '../../token-engine';
 import { TokenSplitExecutor } from './TokenSplitExecutor';
 import { TokenReservationLedger } from './TokenReservationLedger';
 import { SpendPlanner, SpendQueue, type ParsedTokenEntry, type ParsedTokenPool } from './SpendQueue';
@@ -652,6 +653,12 @@ export interface PaymentsModuleDependencies {
   tokenStorageProviders?: Map<string, TokenStorageProvider<TxfStorageDataBase>>;
   transport: TransportProvider;
   oracle: OracleProvider;
+  /**
+   * Token engine (v2). Optional during migration (path B): when provided, value
+   * reads / lifecycle go through the engine; otherwise the legacy v1 SDK path is
+   * used. Wired by Sphere once the engine is constructed (A4-int).
+   */
+  tokenEngine?: ITokenEngine;
   emitEvent: <T extends SphereEventType>(type: T, data: SphereEventMap[T]) => void;
   /** Chain code for BIP32 HD derivation (for L1 multi-address support) */
   chainCode?: string;
@@ -872,6 +879,8 @@ export class PaymentsModule {
 
     this.deps = deps;
     this.priceProvider = deps.price ?? null;
+    // Path B: wire the engine into the planner (value reads use it when present).
+    this.spendPlanner.setEngine(deps.tokenEngine);
 
     // Initialize L1 sub-module with chain code, addresses, and transport (if enabled)
     if (this.l1) {

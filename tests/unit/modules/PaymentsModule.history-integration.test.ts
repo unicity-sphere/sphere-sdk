@@ -50,6 +50,7 @@ let currentSplitPlan: any = null;
 vi.mock('../../../modules/payments/SpendQueue', () => ({
   SpendPlanner: class {
     buildParsedPool = vi.fn().mockResolvedValue(new Map());
+    setEngine = vi.fn();
     planSend = vi.fn().mockImplementation(
       (_req: any, _pool: any, _ledger: any, _queue: any, reservationId: string) => {
         if (currentSplitPlan === null) {

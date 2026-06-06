@@ -18,6 +18,9 @@ import type { SplitPlan, TokenWithAmount } from './TokenSplitCalculator';
 import type { TokenReservationLedger } from './TokenReservationLedger';
 import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token';
 import { CoinId } from '@unicitylabs/state-transition-sdk/lib/token/fungible/CoinId';
+import type { ITokenEngine } from '../../token-engine';
+import { decodeTokenBlob } from '../../token-engine/token-blob';
+import { hexToBytes } from '../../core/crypto';
 
 // =============================================================================
 // Constants
@@ -43,7 +46,8 @@ export const QUEUE_MAX_SIZE = 100;
 /** A pre-parsed token with its SDK object and bigint amount already computed. */
 export interface ParsedTokenEntry {
   token: Token;
-  sdkToken: SdkToken<any>;
+  /** Opaque per-token handle: a v1 SdkToken (legacy path) or a v2 SphereToken (engine path). Pass-through only. */
+  sdkToken: unknown;
   amount: bigint;
 }
 
@@ -77,11 +81,29 @@ const TAG = 'SpendQueue';
 
 export class SpendPlanner {
   /**
+   * Token engine (path B). When injected, value reads go through the v2 engine
+   * (sdkData = engine blob); otherwise the legacy v1 SdkToken path is used. The
+   * engine is wired after construction via {@link setEngine} (it is bound to the
+   * payments deps, which arrive after the planner is built).
+   */
+  private engine?: ITokenEngine;
+
+  constructor(engine?: ITokenEngine) {
+    this.engine = engine;
+  }
+
+  /** Inject (or clear) the token engine. */
+  setEngine(engine?: ITokenEngine): void {
+    this.engine = engine;
+  }
+
+  /**
    * Async pre-computation: parse all tokens for a given coinId.
    * Called BEFORE the synchronous critical section.
    *
-   * Filters to confirmed tokens matching the coinId, parses each
-   * token's sdkData into an SdkToken, and extracts the bigint amount.
+   * Filters to confirmed tokens matching the coinId, decodes each token's
+   * sdkData and extracts the bigint amount — via the v2 engine when injected,
+   * else the legacy v1 SdkToken path.
    */
   async buildParsedPool(tokens: Token[], coinId: string): Promise<ParsedTokenPool> {
     const pool: ParsedTokenPool = new Map();
@@ -92,22 +114,34 @@ export class SpendPlanner {
       if (!t.sdkData) continue;
 
       try {
-        const parsed = JSON.parse(t.sdkData);
-        const sdkToken = await SdkToken.fromJSON(parsed);
-        const realAmount = this.getTokenBalance(sdkToken, coinId);
+        const { sdkToken, amount } = this.engine
+          ? await this.parseViaEngine(t.sdkData, coinId)
+          : await this.parseViaSdk(t.sdkData, coinId);
 
-        if (realAmount <= 0n) {
+        if (amount <= 0n) {
           logger.warn(TAG, `Token ${t.id} has 0 balance for coinId ${coinId}`);
           continue;
         }
 
-        pool.set(t.id, { token: t, sdkToken, amount: realAmount });
+        pool.set(t.id, { token: t, sdkToken, amount });
       } catch (e) {
         logger.warn(TAG, 'Failed to parse token', t.id, e);
       }
     }
 
     return pool;
+  }
+
+  /** Engine path (v2): sdkData is the engine blob (hex of CBOR(TokenBlob)). */
+  private async parseViaEngine(sdkData: string, coinId: string): Promise<{ sdkToken: unknown; amount: bigint }> {
+    const token = await this.engine!.decodeToken(decodeTokenBlob(hexToBytes(sdkData)));
+    return { sdkToken: token, amount: this.engine!.balanceOf(token, coinId) };
+  }
+
+  /** Legacy v1 path: sdkData is TXF JSON. */
+  private async parseViaSdk(sdkData: string, coinId: string): Promise<{ sdkToken: unknown; amount: bigint }> {
+    const sdkToken = await SdkToken.fromJSON(JSON.parse(sdkData));
+    return { sdkToken, amount: this.getTokenBalance(sdkToken, coinId) };
   }
 
   /**
@@ -137,7 +171,7 @@ export class SpendPlanner {
 
     // Build free view: only fully-free tokens (no partial reservations).
     // Matches buildFreeView() in SpendQueue — whole-token transfer semantics.
-    const freeView: Array<{ token: Token; sdkToken: SdkToken<any>; amount: bigint }> = [];
+    const freeView: Array<{ token: Token; sdkToken: unknown; amount: bigint }> = [];
     let totalInventory = 0n;
 
     for (const [, entry] of parsedPool) {
@@ -199,7 +233,7 @@ export class SpendPlanner {
    * 3. Greedy selection with split
    */
   calculateOptimalSplitSync(
-    candidates: Array<{ token: Token; sdkToken: SdkToken<any>; amount: bigint }>,
+    candidates: Array<{ token: Token; sdkToken: unknown; amount: bigint }>,
     targetAmount: bigint
   ): SplitPlan | null {
     if (candidates.length === 0) return null;
@@ -214,7 +248,7 @@ export class SpendPlanner {
     }
 
     // Convert to TokenWithAmount for plan creation
-    const asTokenWithAmount = (entry: { token: Token; sdkToken: SdkToken<any>; amount: bigint }): TokenWithAmount => ({
+    const asTokenWithAmount = (entry: { token: Token; sdkToken: unknown; amount: bigint }): TokenWithAmount => ({
       sdkToken: entry.sdkToken,
       amount: entry.amount,
       uiToken: entry.token,
@@ -605,8 +639,8 @@ export class SpendQueue {
   private buildFreeView(
     pool: ParsedTokenPool,
     coinId: string
-  ): Array<{ token: Token; sdkToken: SdkToken<any>; amount: bigint }> {
-    const view: Array<{ token: Token; sdkToken: SdkToken<any>; amount: bigint }> = [];
+  ): Array<{ token: Token; sdkToken: unknown; amount: bigint }> {
+    const view: Array<{ token: Token; sdkToken: unknown; amount: bigint }> = [];
     const liveTokens = this.getTokens();
 
     for (const [tokenId, entry] of pool) {

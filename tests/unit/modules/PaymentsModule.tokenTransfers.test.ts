@@ -36,6 +36,7 @@ vi.mock('../../../modules/payments/SpendQueue', () => ({
   SpendPlanner: class {
     buildParsedPool = mockBuildParsedPool;
     planSend = mockPlanSend;
+    setEngine = vi.fn();
   },
   SpendQueue: class {
     enqueue = vi.fn();
