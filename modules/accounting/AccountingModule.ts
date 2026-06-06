@@ -3232,6 +3232,140 @@ export class AccountingModule {
   }
 
   /**
+   * Refund every attributed payment on a NON-TERMINAL invoice back to its
+   * recorded sender — the bulk companion to {@link returnInvoicePayment}.
+   *
+   * Use cases:
+   *   - Cancel-and-refund-without-terminating: caller wants the invoice to
+   *     remain payable (state can drop back to OPEN/PARTIAL once
+   *     attributed balances reach zero).
+   *   - One-shot UX (`sphere invoice return <id>`): no need for the caller
+   *     to fish per-send DIRECT://… addresses out of `invoice status` —
+   *     this method composes that iteration internally. Particularly
+   *     important for masked-predicate sends, where the on-chain sender
+   *     address is a one-time DIRECT://… the user cannot guess.
+   *
+   * Difference vs `cancelInvoice({ autoReturn: true })`:
+   *   - `cancelInvoice` TERMINATES the invoice (transitions to CANCELLED,
+   *     freezes balances). This method does NOT — `returnInvoicePayment`
+   *     calls update `coveredAmount`/`returnedAmount` and the invoice's
+   *     dynamic state recomputes (e.g., PARTIAL → OPEN when netCovered
+   *     drops to zero), but the invoice remains payable.
+   *
+   * Difference vs `closeInvoice({ autoReturn: true })`:
+   *   - `closeInvoice` refunds only the SURPLUS (overpayments, direction
+   *     `:RC`) and terminates. This method refunds the FULL attributed
+   *     balance per sender (direction `:B`) and does not terminate.
+   *
+   * What this method does NOT cover:
+   *   - Terminal invoices (CLOSED / CANCELLED): for the rare case of
+   *     refunding more from a frozen-balance invoice after termination,
+   *     `returnInvoicePayment` already handles the frozen-baseline math
+   *     directly; call it per-sender.
+   *
+   * Implementation: iterates `getInvoiceStatus(invoiceId).targets[i].
+   * coinAssets[j].senderBalances[k]`, calling `returnInvoicePayment`
+   * for every row with `netBalance > 0`. Each underlying call goes
+   * through the per-invoice gate, so concurrent invocations of this
+   * method would serialise correctly; rows are processed sequentially
+   * to keep the returned ordering deterministic.
+   *
+   * @param invoiceId - Invoice token ID.
+   * @param options.recipient - Optional. If provided, only refund balances
+   *   whose recorded sender address matches this DIRECT:// address. Useful
+   *   for refunding a single payer when an invoice has multiple senders.
+   *   Must be a DIRECT:// address (callers resolving @nametag /
+   *   chain-pubkey / alpha1 should do that upstream).
+   *
+   * @returns Array of `TransferResult` — one per refund row, in iteration
+   *   order. Empty array if no refundable balances were found.
+   *
+   * @throws {SphereError} `INVOICE_NOT_FOUND` — invoice not found locally.
+   * @throws {SphereError} `INVOICE_NOT_TARGET` — caller is not a target.
+   * @throws Any error thrown by `returnInvoicePayment` for a specific row
+   *   (e.g., `INVOICE_RETURN_EXCEEDS_BALANCE` if state drifts under us).
+   */
+  async returnAllInvoicePayments(
+    invoiceId: string,
+    options?: { recipient?: string },
+  ): Promise<TransferResult[]> {
+    this.ensureNotDestroyed();
+    this.ensureInitialized();
+
+    // Pre-validations mirror `returnInvoicePayment` so error shapes are
+    // identical from the caller's perspective.
+    if (!this.invoiceTermsCache.has(invoiceId)) {
+      throw new SphereError(`Invoice not found: ${invoiceId}`, 'INVOICE_NOT_FOUND');
+    }
+    if (!this.isTarget(invoiceId)) {
+      throw new SphereError(
+        `Caller is not a target of invoice: ${invoiceId}`,
+        'INVOICE_NOT_TARGET',
+      );
+    }
+    if (options?.recipient !== undefined) {
+      if (
+        typeof options.recipient !== 'string' ||
+        !options.recipient.startsWith('DIRECT://') ||
+        options.recipient.length <= 'DIRECT://'.length
+      ) {
+        throw new SphereError(
+          'options.recipient must be a valid DIRECT:// address',
+          'INVOICE_INVALID_RECIPIENT',
+        );
+      }
+    }
+
+    // getInvoiceStatus serves both as the per-sender balance source AND as
+    // the freshness gate: it pulls the latest ledger state into the
+    // computation. For COVERED-and-allConfirmed invoices it also fires the
+    // implicit close gate (line ~2154) which would terminate the invoice
+    // before we got to the refund call. That's acceptable here — a
+    // fully-covered invoice that's about to be refunded was going to
+    // auto-close on next status check anyway, and the downstream
+    // returnInvoicePayment calls handle terminal-state returns correctly
+    // (frozen-baseline path).
+    const status = await this.getInvoiceStatus(invoiceId);
+
+    interface RefundRow {
+      readonly recipient: string;
+      readonly coinId: string;
+      readonly amount: string;
+    }
+    const plan: RefundRow[] = [];
+
+    for (const target of status.targets) {
+      for (const ca of target.coinAssets) {
+        const [coinId] = ca.coin;
+        for (const sb of ca.senderBalances) {
+          const bal = AccountingModule._safeBigInt(sb.netBalance);
+          if (bal <= 0n) continue;
+          if (options?.recipient !== undefined && sb.senderAddress !== options.recipient) continue;
+          plan.push({
+            recipient: sb.senderAddress,
+            coinId,
+            amount: sb.netBalance,
+          });
+        }
+      }
+    }
+
+    // Execute the plan. Each call enters the per-invoice gate inside
+    // returnInvoicePayment, so they serialise. Sequential execution keeps
+    // the result order stable for callers that want deterministic logs.
+    const results: TransferResult[] = [];
+    for (const row of plan) {
+      const result = await this.returnInvoicePayment(invoiceId, {
+        recipient: row.recipient,
+        amount: row.amount,
+        coinId: row.coinId,
+      });
+      results.push(result);
+    }
+    return results;
+  }
+
+  /**
    * Enable or disable auto-return for terminated invoices (§2.1, §8.7).
    *
    * When auto-return is enabled for a terminated invoice, future incoming forward
