@@ -362,6 +362,50 @@ export function computeInvoiceStatus(
   let allConfirmed = true; // will be set to false on first unconfirmed
 
   // ---------------------------------------------------------------------------
+  // Pre-pass — index forward senders by (targetAddress, coinId) for null-sender
+  // back-direction recovery (issue #404).
+  //
+  // Back-direction transfers (B / RC / RX) normally route via
+  // `entry.senderAddress === target.address`: the refunder IS the target.
+  // When the refund itself uses a masked predicate, `entry.senderAddress` is
+  // null on-chain (the sender identity is unresolvable from a one-time
+  // masked address) and the straightforward match fails — pre-fix, the
+  // entry was bucketed as `unknown_address_and_asset` and the invoice's
+  // `returnedAmount` stayed stuck at zero. Bob's wallet would also miss its
+  // OWN refund, because the recording path uses the on-chain payload, not
+  // wallet identity (see issue #404 §"Root cause").
+  //
+  // The recovery: build an index of every (target, coin) → {senderAddress}
+  // pair we've seen from forward payments. If a null-sender back-direction
+  // transfer's (destinationAddress, coinId) matches exactly one such target,
+  // route it there. Ambiguity (multiple targets match) leaves the entry as
+  // irrelevant — preserving the spec's "only attribute when we know" stance.
+  // ---------------------------------------------------------------------------
+  const forwardSendersByTargetCoin = new Map<string, Map<string, Set<string>>>();
+  for (const entry of entries) {
+    if (isReturnDirection(entry.paymentDirection)) continue;
+    if (!targetIndexMap.has(entry.destinationAddress)) continue;
+    if (entry.senderAddress === null) continue;
+    // Use refundAddress if present (matches the per-sender keying rule used
+    // by senderBalances) — falling back to senderAddress preserves the
+    // legacy lookup behaviour for entries without a refund address.
+    const effectiveSender =
+      ('refundAddress' in entry && (entry as { refundAddress?: string | null }).refundAddress)
+        || entry.senderAddress;
+    let perCoin = forwardSendersByTargetCoin.get(entry.destinationAddress);
+    if (!perCoin) {
+      perCoin = new Map();
+      forwardSendersByTargetCoin.set(entry.destinationAddress, perCoin);
+    }
+    let senderSet = perCoin.get(entry.coinId);
+    if (!senderSet) {
+      senderSet = new Set();
+      perCoin.set(entry.coinId, senderSet);
+    }
+    senderSet.add(effectiveSender);
+  }
+
+  // ---------------------------------------------------------------------------
   // Process each entry
   // ---------------------------------------------------------------------------
   for (const entry of entries) {
@@ -406,9 +450,28 @@ export function computeInvoiceStatus(
         matchedTargetAddress = entry.destinationAddress;
       }
     } else {
-      // Return: sender is the target (return flows from target)
+      // Return: sender is the target (return flows from target).
       if (entry.senderAddress !== null && targetIndexMap.has(entry.senderAddress)) {
         matchedTargetAddress = entry.senderAddress;
+      } else if (entry.senderAddress === null) {
+        // Issue #404 — masked-predicate refund recovery. When a back-direction
+        // transfer comes from a target via a masked predicate, on-chain
+        // senderAddress is null. Fall back to matching against the forward-
+        // sender index built in the pre-pass: if exactly one target had this
+        // destinationAddress as a recorded sender on this coinId, route there.
+        const candidateTargets: string[] = [];
+        for (const [targetAddr, perCoin] of forwardSendersByTargetCoin) {
+          const senderSet = perCoin.get(entry.coinId);
+          if (senderSet && senderSet.has(entry.destinationAddress)) {
+            candidateTargets.push(targetAddr);
+          }
+        }
+        if (candidateTargets.length === 1) {
+          matchedTargetAddress = candidateTargets[0]!;
+        }
+        // Zero or multiple candidates → leave matchedTargetAddress null;
+        // the entry falls through to the irrelevantTransfers path with
+        // reason='unknown_address_and_asset' as before.
       }
     }
 

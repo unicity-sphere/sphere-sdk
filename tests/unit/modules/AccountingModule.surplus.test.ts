@@ -963,3 +963,118 @@ describe('AccountingModule.surplus.test - freezeBalances() surplus assignment', 
     expect(frozenCoin.frozenSenderBalances[0]!.netBalance).toBe(expectedSurplus);
   });
 });
+
+// ============================================================================
+// Issue #404 — masked-predicate refund attribution recovery
+//
+// When a target refunds an attributed payment using a masked predicate, the
+// resulting back-direction transfer has `senderAddress: null` on-chain (the
+// per-send masked address is unresolvable). Pre-fix, computeInvoiceStatus
+// matched back-direction transfers by `entry.senderAddress === target.address`
+// — null fails the match → the entry went to irrelevantTransfers with
+// `reason: 'unknown_address_and_asset'` and the invoice's `returnedAmount`
+// stayed stuck at zero.
+//
+// The fix indexes forward-payment senders per (target, coin) in a pre-pass,
+// then routes null-sender back-direction transfers by matching their
+// `destinationAddress` against the index. Exactly-one-match attributes;
+// zero/multiple leaves the entry irrelevant.
+// ============================================================================
+
+describe('issue #404 — masked-refund attribution recovery', () => {
+  const TARGET = 'DIRECT://bob_target_addr';
+  const ALICE_MASKED = 'DIRECT://alice_one_time_predicate';
+  const REQUESTED = '7000000000000000000'; // 7 UCT
+
+  it('attributes a null-sender back-direction transfer when destination matches a single forward sender', () => {
+    const terms = createTerms(TARGET, 'UCT', REQUESTED);
+    const forwardEntry = createForwardTransfer(
+      'tx-forward', ALICE_MASKED, TARGET, 'UCT', '3000000000000000000',
+    );
+    // Bob's refund via masked predicate — senderAddress null, destination is
+    // alice's recorded per-send address.
+    const backEntry = createReturnTransfer(
+      'tx-back', /* senderAddress */ 'placeholder', ALICE_MASKED, 'UCT', '3000000000000000000',
+    );
+    (backEntry as { senderAddress: string | null }).senderAddress = null;
+
+    const status = computeInvoiceStatus('invoice-404', terms, [forwardEntry, backEntry], null, new Set());
+
+    // Refund routed back to the invoice — returnedAmount equals the refund.
+    expect(status.targets[0]!.coinAssets[0]!.returnedAmount).toBe('3000000000000000000');
+    // Net covered drops to zero (forward minus return).
+    expect(status.targets[0]!.coinAssets[0]!.netCoveredAmount).toBe('0');
+    // Invoice goes back to OPEN (no net payment after the refund).
+    expect(status.state).toBe('OPEN');
+    // No irrelevant transfers — the back entry was attributed.
+    expect(status.irrelevantTransfers).toHaveLength(0);
+  });
+
+  it('leaves a null-sender back-direction transfer irrelevant when destination matches no forward sender', () => {
+    const terms = createTerms(TARGET, 'UCT', REQUESTED);
+    const forwardEntry = createForwardTransfer(
+      'tx-forward', ALICE_MASKED, TARGET, 'UCT', '3000000000000000000',
+    );
+    // Back transfer going to an address that was NEVER a forward sender.
+    const backEntry = createReturnTransfer(
+      'tx-back', 'placeholder', 'DIRECT://some_other_address', 'UCT', '1000000000000000000',
+    );
+    (backEntry as { senderAddress: string | null }).senderAddress = null;
+
+    const status = computeInvoiceStatus('invoice-404', terms, [forwardEntry, backEntry], null, new Set());
+
+    // Refund not attributed — net covered = forward amount (3 UCT), no return recorded.
+    expect(status.targets[0]!.coinAssets[0]!.returnedAmount).toBe('0');
+    expect(status.targets[0]!.coinAssets[0]!.netCoveredAmount).toBe('3000000000000000000');
+    // Back entry recorded as irrelevant.
+    expect(status.irrelevantTransfers).toHaveLength(1);
+    expect(status.irrelevantTransfers[0]!.transferId).toBe('tx-back');
+  });
+
+  it('leaves a null-sender back-direction transfer irrelevant when multiple targets have matching senders (ambiguous)', () => {
+    // Multi-target invoice where the same masked predicate appears as a
+    // forward sender on TWO targets for the same coin. A back-direction
+    // transfer toward that predicate is ambiguous: which target refunded it?
+    // The recovery declines to guess and leaves it irrelevant.
+    const TARGET_2 = 'DIRECT://carol_target_addr';
+    const terms: InvoiceTerms = {
+      createdAt: Date.now(),
+      targets: [
+        { address: TARGET,   assets: [{ coin: ['UCT', REQUESTED] }] },
+        { address: TARGET_2, assets: [{ coin: ['UCT', REQUESTED] }] },
+      ],
+    };
+    const forwardEntry1 = createForwardTransfer('tx-fwd-1', ALICE_MASKED, TARGET,   'UCT', '3000000000000000000');
+    const forwardEntry2 = createForwardTransfer('tx-fwd-2', ALICE_MASKED, TARGET_2, 'UCT', '3000000000000000000');
+    const backEntry = createReturnTransfer('tx-back', 'placeholder', ALICE_MASKED, 'UCT', '3000000000000000000');
+    (backEntry as { senderAddress: string | null }).senderAddress = null;
+
+    const status = computeInvoiceStatus('invoice-404', terms, [forwardEntry1, forwardEntry2, backEntry], null, new Set());
+
+    // Neither target picks up the refund — disambiguation is impossible.
+    expect(status.targets[0]!.coinAssets[0]!.returnedAmount).toBe('0');
+    expect(status.targets[1]!.coinAssets[0]!.returnedAmount).toBe('0');
+    expect(status.irrelevantTransfers).toHaveLength(1);
+    expect(status.irrelevantTransfers[0]!.transferId).toBe('tx-back');
+  });
+
+  it('preserves the existing match path for non-null senderAddress (no regression)', () => {
+    // Sanity: when senderAddress IS set on a back-direction transfer (the
+    // pre-#404 happy path), matching by senderAddress === target.address
+    // still works.
+    const terms = createTerms(TARGET, 'UCT', REQUESTED);
+    const forwardEntry = createForwardTransfer(
+      'tx-forward', ALICE_MASKED, TARGET, 'UCT', '3000000000000000000',
+    );
+    // Back transfer with proper senderAddress set (target's address).
+    const backEntry = createReturnTransfer(
+      'tx-back', TARGET, ALICE_MASKED, 'UCT', '3000000000000000000',
+    );
+
+    const status = computeInvoiceStatus('invoice-404', terms, [forwardEntry, backEntry], null, new Set());
+
+    expect(status.targets[0]!.coinAssets[0]!.returnedAmount).toBe('3000000000000000000');
+    expect(status.targets[0]!.coinAssets[0]!.netCoveredAmount).toBe('0');
+    expect(status.irrelevantTransfers).toHaveLength(0);
+  });
+});
