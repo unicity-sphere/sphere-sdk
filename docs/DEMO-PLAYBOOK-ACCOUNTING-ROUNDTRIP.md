@@ -27,19 +27,18 @@ SCENARIO B — partial-pay + bulk-refund + repeat-pay
 §9      Alice partial-pays:   `sphere invoice pay $INV2 --amount 3`
                                   alice 93 → 90,  invoice PARTIAL
 §10     Bob refunds (no args): `sphere invoice return $INV2`              ←  the payoff
-                                  bob -3 UCT (token level — invoice attribution blocked by #404)
+                                  bob -3 UCT, invoice's returnedAmount tracks the refund
 §11     Alice receives the 3 UCT refund
                                   alice 90 → 93
 §12     Alice partial-pays:   `sphere invoice pay $INV2 --amount 3`
                                   alice 93 → 90,  invoice PARTIAL
-§13     Alice covers the rest: `sphere invoice pay $INV2 --amount 4` *
+§13     Alice covers the rest: `sphere invoice pay $INV2`
+                                  (no --amount → SDK defaults to remaining = 4 UCT)
                                   alice 90 → 86,  invoice COVERED → CLOSED
 §14     Bob confirms COVERED + final balance check
                                   alice 100 → 86,  bob 100 → 114
 NET                                  alice −14 UCT,  bob +14 UCT
 ```
-
-*`--amount 4` is **explicit** because of a known SDK attribution bug (sphere-sdk #404) that prevents `--amount` defaulting to remaining from accounting for the refund. Token-level balances are correct; only the invoice's internal view miscounts. Once #404 lands, §13 becomes `sphere invoice pay $INV2` (no `--amount`).
 
 Total run time: ~6-8 minutes on a healthy testnet.
 
@@ -63,6 +62,7 @@ This playbook exercises features added across three coordinated PRs:
 | sphere-cli | PR #37 (`fix/issue-36-invoice-pay-human-units`) | `--amount` interprets as HUMAN units (matches `payments send`). Pre-PR-#37 the CLI treats `--amount 3` as 3 atoms (≈3×10⁻¹⁸ UCT) and §9 fails the balance assertion. |
 | sphere-cli | `feat/invoice-return-bulk-and-nametag` | `sphere invoice return <id>` (no flags) → calls SDK bulk-refund. Without this PR §10's one-shot form fails with "missing --recipient". |
 | sphere-sdk | PR #405 (`feat/accounting-return-all-invoice-payments`) | `AccountingModule.returnAllInvoicePayments` — the bulk-refund SDK primitive the CLI wrapper calls. Without this PR the CLI wrapper compiles but the SDK method doesn't exist. |
+| sphere-sdk | PR #413 (`fix/issue-404-masked-refund-attribution`) | Masked-predicate refund attribution recovery. Without this PR, §10's refund is correctly emitted at the token level but the SDK's invoice ledger doesn't see it — so §13's bare `sphere invoice pay $INV2` (default `--amount`) under-pays (sends 1 UCT instead of 4). |
 
 Confirm the running CLI binary includes all three:
 
@@ -73,6 +73,7 @@ sphere invoice pay --help    | grep -c "HUMAN units"          # should be 1 (pos
 # Resolve where the CLI's SDK actually lives:
 SDK_DIST="$(readlink -f /usr/local/lib/node_modules/@unicitylabs/sphere-sdk)/dist/index.js"
 grep -c "returnAllInvoicePayments" "$SDK_DIST"                # should be >= 1 (post-PR #405)
+grep -c "forwardSendersByTargetCoin" "$SDK_DIST"              # should be >= 1 (post-PR #413)
 ```
 
 If any of those return `0`, the binary on PATH is behind one of the PRs — rebuild before demoing.
@@ -388,7 +389,7 @@ sphere balance
 
 Expected — alice's `UCT: 93 (>=1 token)` (90 + 3 = 93).
 
-**Talk track:** "The refund is a real on-chain back-direction transfer. Bob's wallet sent 3 UCT to the address recorded in alice's original payment. The :B memo direction tells AccountingModule to attribute it as a refund — and that's where SDK issue #404 currently bites: when the refund itself uses a masked predicate, attribution-back-to-invoice fails. Token-level money flow is correct (everything is in alice's wallet); only the invoice's view of its own balance lags."
+**Talk track:** "The refund is a real on-chain back-direction transfer. Bob's wallet sent 3 UCT to the address recorded in alice's original payment. The :B memo direction tells AccountingModule to attribute it as a refund — and after PR #413, masked-predicate refunds are correctly attributed back to the invoice via the destinationAddress fallback in `computeInvoiceStatus`. The invoice's `returnedAmount` updates and `netCovered` drops correctly."
 
 ---
 
@@ -408,33 +409,19 @@ Expected — alice's `UCT: 90 (1 token)` (93 − 3 = 90).
 
 ---
 
-## §13 Alice covers the rest — 4 UCT (explicit, workaround for #404)
+## §13 Alice covers the rest (default `--amount`)
 
 ### T1
 
 ```bash
-sphere invoice pay "$INV2" --amount 4
+sphere invoice pay "$INV2"
 sphere payments sync
 sphere balance
 ```
 
-Expected — alice's `UCT: 86 (1 token)` (90 − 4 = 86).
+No `--amount` → the SDK reads the invoice's current state, computes `remaining = requested − netCovered = 7 − 3 = 4 UCT`, and sends that. Expected — alice's `UCT: 86 (1 token)` (90 − 4 = 86).
 
-### Why explicit `--amount 4` instead of bare `sphere invoice pay $INV2`
-
-**Ideal UX:** `sphere invoice pay $INV2` (no flag) — the SDK defaults to "remaining needed to cover the asset" and sends 4 UCT.
-
-**Today's workaround:** explicit `--amount 4` because of the masked-predicate refund-attribution bug (sphere-sdk #404).
-
-- §10's refund correctly drained bob's wallet by 3 UCT (token-level).
-- But because the refund used a masked predicate, the resulting back-direction transfer has `senderAddress: null` on-chain.
-- The SDK's `computeInvoiceStatus` requires `senderAddress === target.address` to attribute a back-direction transfer to a target. `null` fails the match → refund goes to `irrelevantTransfers` → invoice's `returnedAmount` stays 0.
-- So the SDK sees `netCovered = 6` (3 from §9 + 3 from §12) instead of the true `netCovered = 3` (3 + 3 − 3 refund).
-- Default `--amount` would compute `remaining = 7 − 6 = 1 UCT`, under-paying.
-
-Explicit `--amount 4` sidesteps the SDK's wrong remaining-calculation. Token-level deltas (alice −4, bob +4) are exact.
-
-**After #404 lands, this section becomes `sphere invoice pay $INV2` (no `--amount`) and the comment above goes away.**
+**Talk track:** "Default `--amount` works correctly post-PR #413: the SDK sees the refund recorded in §10 (netCovered correctly drops from 6 to 3 after the refund is attributed), so 'remaining' computes to the right value. Operators don't have to manually track what's been refunded."
 
 ---
 
@@ -472,7 +459,7 @@ In smallest-unit integers (UCT has 18 decimals):
 - alice: `100·10¹⁸ → 86·10¹⁸` (Δ = `−14·10¹⁸`)
 - bob:   `100·10¹⁸ → 114·10¹⁸` (Δ = `+14·10¹⁸`)
 
-Both reconcile. The 3 UCT that flowed bob→alice in §10 is real, on-chain, and accounted for at the token level even if the invoice's internal view (per #404) doesn't reflect it.
+Both reconcile. The 3 UCT that flowed bob→alice in §10 is real, on-chain, and accounted for at every level — token-level balances AND the invoice's internal ledger (per PR #413's attribution-recovery fix).
 
 ---
 
@@ -505,7 +492,8 @@ A green run prints `ALL GREEN — round-trip + partial-pay + bulk-return + repea
 | `Connectivity gate reports aggregator 'down'` | Testnet aggregator's health probe failed. Send proceeds anyway and usually succeeds — note it in the talk but don't panic. | Continue the demo. |
 | `[Nostr] [AT-LEAST-ONCE] TOKEN_TRANSFER … not durable — leaving 'since' at <ts>; cooldown 30000ms` | Background durability verifier couldn't confirm a previous event landed durably on the relay. Independent of the current step. | Continue the demo. |
 | Alice's balance lags after refund in §11 | The back-direction transfer hasn't fully propagated yet — Nostr fan-out + IPFS pin can take 10-30s on a slow testnet. | Retry `sphere payments sync && sphere payments receive --finalize` once or twice before failing. |
-| Invoice state stays at PARTIAL after §13 | If you used the workaround `--amount 4`, the SDK's view shows surplus (because the refund isn't attributed). State should still be COVERED (netCovered >= requested) — if it shows PARTIAL the SDK build is missing something. | Inspect `sphere invoice status $INV2 --json` and check whether `coveredAmount` matches expectation. |
+| §13 default `--amount` sends 1 UCT instead of 4 | The SDK build predates PR #413 (masked-predicate refund attribution). The refund in §10 isn't being attributed back to the invoice, so the SDK overestimates netCovered. | Bump SDK to post-#413, OR fall back to explicit `--amount 4` for the duration of the demo. |
+| Invoice state stays at PARTIAL after §13 | Either the demo is running with the legacy default-amount under-pay (above row), or `coveredAmount` is incorrect for a different reason. | Inspect `sphere invoice status $INV2 --json` — `coveredAmount` should equal 7 UCT and `netCovered` should equal 7 UCT after §13. |
 
 ---
 
@@ -547,7 +535,7 @@ The wallet directories contain the OrbitDB-backed Profile storage; re-attach to 
    §10 sphere invoice return $INV2                ← bob refunds (NO FLAGS) ← payoff
    §11 alice receives the refund
    §12 sphere invoice pay $INV2 --amount 3        ← alice partial-pay again
-   §13 sphere invoice pay $INV2 --amount 4 *      ← alice covers rest (* #404 workaround)
+   §13 sphere invoice pay $INV2                   ← alice covers rest (default --amount)
    §14 bob confirms COVERED
    NET (over A+B):  alice -14, bob +14   ✓
 ```
@@ -558,7 +546,7 @@ The wallet directories contain the OrbitDB-backed Profile storage; re-attach to 
 
 - `manual-test-accounting-roundtrip.sh` — the automated version of this playbook.
 - sphere-sdk PR #405 — `AccountingModule.returnAllInvoicePayments`.
-- sphere-sdk issue #404 — masked-predicate refund attribution bug (workaround at §13 until merged).
+- sphere-sdk PR #413 — masked-predicate refund attribution fix (closes #404). Enables §13's default-`--amount` form.
 - sphere-cli PR #37 (`fix/issue-36-invoice-pay-human-units`) — `invoice pay --amount` human units.
 - sphere-cli branch `feat/invoice-return-bulk-and-nametag` — `sphere invoice return <id>` (no flags) and `--recipient @nametag` resolution.
 - [`DEMO-PLAYBOOK-PAYMENT-ROUNDTRIP.md`](DEMO-PLAYBOOK-PAYMENT-ROUNDTRIP.md) — companion demo for the direct-payment round-trip (#391 guard).
