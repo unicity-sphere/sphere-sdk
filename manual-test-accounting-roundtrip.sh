@@ -570,38 +570,24 @@ echo "alice partial-2 delta:       $partial_2_delta  (expected $expected_3_uct)"
 echo "ASSERT OK (alice-partial-2-minus-3): alice partial-paid exactly 3 UCT (second time)"
 
 # ===========================================================================
-# Section 13 — Alice covers the rest (4 UCT, explicit --amount)
+# Section 13 — Alice covers the rest (no --amount → SDK defaults to remaining)
 #
-# IDEAL UX: `sphere invoice pay $INV2` (no --amount → SDK defaults to
-# remaining = 7 - netCovered).
+# Per PayInvoiceParams.amount doc: "defaults to remaining needed to cover
+# the asset". After §10's bulk refund AND §12's second partial-pay, the
+# invoice's netCovered is 3 UCT (the §12 payment; §9's payment was refunded
+# in §10). The SDK computes remaining = 7 - 3 = 4 UCT and sends that.
 #
-# WORKAROUND today: explicit `--amount 4` because of a known SDK bug
-# (filed as sphere-sdk #TODO):
-#
-#   When bob's §10 refund used a masked predicate (the default), the
-#   resulting back-direction transfer has `senderAddress: null` on-chain.
-#   `computeInvoiceStatus` (balance-computer.ts ~line 408-413) only
-#   matches back-direction transfers when `senderAddress` exactly equals
-#   a target address — null fails the match and the refund goes to
-#   `irrelevantTransfers` instead of being attributed to the invoice.
-#
-#   As a result:
-#     - The SDK's view of INV2 shows `coveredAmount = 3 + 3 = 6`,
-#       `returnedAmount = 0` (refund not seen), `netCovered = 6`.
-#     - Default --amount in payInvoice computes `remaining = 7 - 6 = 1`,
-#       sending only 1 UCT instead of the 4 we actually need.
-#     - Token-level balances are CORRECT (bob -3 on refund send, alice
-#       +3 on refund receive) — this is purely an invoice-attribution
-#       miss inside AccountingModule, not a payment failure.
-#
-# Once the SDK bug is fixed, this section becomes `sphere invoice pay
-# $INV2` (no --amount). The final balance assertions in §14 are
-# computed against EXPLICIT amounts so they don't depend on the SDK's
-# remaining-calculation correctness.
+# This used to require an explicit `--amount 4` workaround because of
+# sphere-sdk #404 (masked-predicate refund attribution): the §10 refund's
+# back-direction transfer had `senderAddress: null` on-chain, so the
+# balance-computer's per-target matcher classified it as irrelevant and
+# the invoice's `returnedAmount` stayed stuck at zero. PR #413 fixed that
+# with a destinationAddress-fallback recovery, and §13 can now use the
+# canonical default-amount form.
 # ===========================================================================
-banner "Section 13: Alice covers the rest of invoice #2 — 4 UCT (explicit, SDK-bug workaround)"
+banner "Section 13: Alice covers the rest of invoice #2 (default --amount = remaining)"
 
-sphere invoice pay "$INV2" --amount 4 2>&1 | tee "$SNAP/alice-invoice-pay2-final.log"
+sphere invoice pay "$INV2" 2>&1 | tee "$SNAP/alice-invoice-pay2-final.log"
 sphere payments sync 2>&1 | tee "$SNAP/alice-post-final-sync.log"
 sphere balance | tee "$SNAP/alice-balance-final.txt"
 
