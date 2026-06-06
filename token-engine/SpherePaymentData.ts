@@ -79,12 +79,14 @@ export class SpherePaymentData implements IPaymentData {
     if (tag.tag !== SpherePaymentData.CBOR_TAG) {
       throw new CborError(`Invalid SpherePaymentData tag: ${tag.tag}`);
     }
-    const fields = CborDeserializer.decodeArray(tag.data);
+    // Strict structure: exactly [version, assets, memo] (matches encode + the SDK's
+    // fixed-shape decoders). Extra/missing fields are corruption, not tolerated.
+    const fields = CborDeserializer.decodeArray(tag.data, 3);
     const version = CborDeserializer.decodeUnsignedInteger(fields[0]);
     if (version !== SpherePaymentData.VERSION) {
       throw new CborError(`Unsupported SpherePaymentData version: ${version}`);
     }
-    const memo = fields.length > 2 ? CborDeserializer.decodeNullable(fields[2], CborDeserializer.decodeByteString) : null;
+    const memo = CborDeserializer.decodeNullable(fields[2], CborDeserializer.decodeByteString);
     return new SpherePaymentData(PaymentAssetCollection.fromCBOR(fields[1]), memo);
   }
 

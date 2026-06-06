@@ -22,7 +22,10 @@ import {
   CborDeserializer,
   CborSerializer,
   HexConverter,
+  NetworkId,
   type Token,
+  TokenId,
+  TokenSalt,
 } from '../../../token-engine/sdk';
 import type {
   CoinId,
@@ -121,8 +124,11 @@ export class FakeTokenEngine implements ITokenEngine {
   }
 
   public async mintDataToken(params: MintDataTokenParams, _options?: EngineOpOptions): Promise<SphereToken> {
-    // Deterministic salt → deterministic, terms-derived tokenId (mirrors the real engine's intent).
-    const tokenId = params.salt ? to32(params.salt) : this.nextId();
+    // Derive the tokenId EXACTLY as the real engine does (TokenId.fromSalt = SHA-256 over
+    // [salt, networkId]) so the fake is a faithful double — the id is NOT the raw salt.
+    const tokenId = params.salt
+      ? (await TokenId.fromSalt(networkIdOf(this.network), TokenSalt.fromCBOR(CborSerializer.encodeByteString(params.salt)))).bytes
+      : this.nextId();
     return this.makeToken({
       tokenId,
       stateId: this.nextId(),
@@ -260,11 +266,11 @@ function isSpherePaymentData(data: Uint8Array): boolean {
   }
 }
 
-/** Pad/truncate to 32 bytes so a (terms-derived) salt yields a stable 64-hex tokenId. */
-function to32(bytes: Uint8Array): Uint8Array {
-  const out = new Uint8Array(32);
-  out.set(bytes.subarray(0, 32));
-  return out;
+/** Map the fake's numeric network to the SDK NetworkId instance (for TokenId.fromSalt). */
+function networkIdOf(n: number): NetworkId {
+  if (n === NetworkId.MAINNET.id) return NetworkId.MAINNET;
+  if (n === NetworkId.LOCAL.id) return NetworkId.LOCAL;
+  return NetworkId.TESTNET;
 }
 
 // Opaque placeholder for SphereToken.sdkToken — callers never call methods on it.

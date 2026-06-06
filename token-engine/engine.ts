@@ -59,7 +59,10 @@ export interface ITokenEngine {
   /**
    * The opaque on-chain memo delivered with this token: the latest transfer's
    * data for a transferred token, else the memo in a minted output's value
-   * envelope (split). `null` when there is none. Synchronous.
+   * envelope (split). Returns `null` when there is no memo — including for data
+   * tokens (no value envelope; use `readTokenData`) and memo-less value tokens.
+   * To tell a data token from a value token, check `readValue` (null ⇒
+   * data/value-less token). Synchronous.
    */
   readMemo(token: SphereToken): Uint8Array | null;
   /** Raw genesis data of a token (e.g. a data-token's terms). `null` when absent. Synchronous. */

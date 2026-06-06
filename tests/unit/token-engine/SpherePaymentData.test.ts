@@ -76,9 +76,21 @@ describe('SpherePaymentData', () => {
   it('rejects an unsupported version', () => {
     const future = CborSerializer.encodeTag(
       SpherePaymentData.CBOR_TAG,
-      CborSerializer.encodeArray(CborSerializer.encodeUnsignedInteger(999n), CborSerializer.encodeArray()),
+      CborSerializer.encodeArray(
+        CborSerializer.encodeUnsignedInteger(999n),
+        CborSerializer.encodeArray(),
+        CborSerializer.encodeNullable(null, CborSerializer.encodeByteString),
+      ),
     );
     expect(() => SpherePaymentData.fromCBOR(future)).toThrow(CborError);
+  });
+
+  it('rejects an envelope with the wrong number of fields', () => {
+    const malformed = CborSerializer.encodeTag(
+      SpherePaymentData.CBOR_TAG,
+      CborSerializer.encodeArray(CborSerializer.encodeUnsignedInteger(1n), CborSerializer.encodeArray()),
+    );
+    expect(() => SpherePaymentData.fromCBOR(malformed)).toThrow(CborError);
   });
 
   it('rejects a negative amount (would silently encode to 0n otherwise)', () => {
