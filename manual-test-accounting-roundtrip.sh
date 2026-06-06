@@ -379,9 +379,308 @@ check_no_unconfirmed() {
 check_no_unconfirmed "alice-balance-1" "$SNAP/alice-balance-1.txt" || rc=1
 check_no_unconfirmed "bob-balance-2"   "$SNAP/bob-balance-2.txt"   || rc=1
 
+if (( rc != 0 )); then
+  banner "FAIL (§5-§7) — see ASSERT FAIL lines above"
+  exit "$rc"
+fi
+echo
+echo "INFO: round-trip leg (§5-§7) green; proceeding to partial-pay + bulk-return leg."
+
+# ===========================================================================
+# Section 8 — Bob creates a SECOND 7 UCT invoice (partial-pay + return scenario)
+#
+# Invoice #1 is sealed in CLOSED state after §6's auto-close; `payInvoice` on
+# CLOSED throws INVOICE_TERMINATED. We use a fresh invoice for the partial-pay
+# scenario so the state machine has somewhere to flow (OPEN → PARTIAL → OPEN
+# after return → PARTIAL again → COVERED).
+# ===========================================================================
+banner "Section 8: Bob creates a second 7 UCT invoice (partial-pay leg)"
+
+cd "$PEER_BOB"
+sphere wallet use bob
+sphere invoice create --target "@${BOB_TAG}" --asset 7 UCT --memo "Accounting demo invoice #2 — partial-pay + return" --json \
+  2>&1 | tee "$SNAP/bob-invoice-create-2.log"
+
+INV2="$(grep -Eo '"invoiceId":[[:space:]]*"[^"]+"' "$SNAP/bob-invoice-create-2.log" | head -1 | sed 's/.*"\([^"]*\)"$/\1/')"
+[[ -n "$INV2" ]] || { echo "FAIL: couldn't extract invoice #2 invoiceId" >&2; exit 1; }
+echo "INV2=$INV2"
+
+sphere invoice deliver "$INV2" --to "@${ALICE_TAG}" --json 2>&1 | tee "$SNAP/bob-invoice-deliver-2.log"
+grep -qE '"sent":[[:space:]]*1' "$SNAP/bob-invoice-deliver-2.log" \
+  || { echo "ASSERT FAIL (deliver-2-acked): expected 'sent: 1' in invoice #2 deliver response" >&2; exit 1; }
+echo "ASSERT OK (deliver-2-acked): invoice #2 delivery DM sent"
+
+# ===========================================================================
+# Section 9 — Alice partially covers invoice #2 (3 UCT of 7)
+#
+# Requires sphere-cli #36 (PR #37) — `invoice pay --amount <value>`
+# interprets value as HUMAN units of the invoice's coin (matches
+# `payments send 3 UCT`). Pre-PR-#37 CLIs treat --amount as smallest
+# units, which would send 3 atoms (not 3 UCT) and break the balance
+# assertions below.
+# ===========================================================================
+banner "Section 9: Alice partially covers invoice #2 — 3 UCT (explicit --amount)"
+
+cd "$PEER_ALICE"
+sphere wallet use alice
+
+# Poll for alice's wallet to ingest invoice #2 (same pattern as §5).
+INV2_DEADLINE=$(( $(date +%s) + 60 ))
+INV2_FOUND=0
+while (( $(date +%s) < INV2_DEADLINE )); do
+  sphere payments sync 2>&1 > "$SNAP/alice-pre-pay2-sync.log"
+  sphere invoice list 2>&1 | tee "$SNAP/alice-invoice-list-before-pay2.log" || true
+  if grep -qE "(\"invoiceId\":[[:space:]]*\"${INV2}\"|ID:[[:space:]]+${INV2:0:16}|^${INV2:0:16})" \
+       "$SNAP/alice-invoice-list-before-pay2.log"; then
+    echo "INFO: invoice #2 visible in alice's local list"
+    INV2_FOUND=1
+    break
+  fi
+  echo "  invoice #2 not yet visible — sleeping 3s and retrying…"
+  sleep 3
+done
+(( INV2_FOUND == 1 )) || { echo "ASSERT FAIL (invoice2-ingest-timeout)" >&2; exit 1; }
+
+sphere balance | tee "$SNAP/alice-balance-before-partial-1.txt"
+sphere invoice pay "$INV2" --amount 3 2>&1 | tee "$SNAP/alice-invoice-pay2-partial-1.log"
+sphere payments sync 2>&1 | tee "$SNAP/alice-post-partial-1-sync.log"
+sphere balance | tee "$SNAP/alice-balance-after-partial-1.txt"
+
+# Assert: alice dropped exactly 3 UCT.
+alice_uct_before_p1=$(extract_confirmed_smallest_units UCT < "$SNAP/alice-balance-before-partial-1.txt")
+alice_uct_after_p1=$(extract_confirmed_smallest_units UCT < "$SNAP/alice-balance-after-partial-1.txt")
+partial_1_delta=$(python3 -c "print($alice_uct_before_p1 - $alice_uct_after_p1)")
+expected_3_uct=3000000000000000000
+echo "alice UCT before partial #1: $alice_uct_before_p1"
+echo "alice UCT after  partial #1: $alice_uct_after_p1"
+echo "alice partial-1 delta:       $partial_1_delta  (expected $expected_3_uct)"
+if [[ "$partial_1_delta" == "$expected_3_uct" ]]; then
+  echo "ASSERT OK (alice-partial-1-minus-3): alice partial-paid exactly 3 UCT"
+else
+  echo "ASSERT FAIL (alice-partial-1-minus-3): expected $expected_3_uct, got $partial_1_delta" >&2
+  echo "  HINT: if delta is '3' your sphere-cli predates PR #37 — --amount is being interpreted as smallest units." >&2
+  exit 1
+fi
+
+# ===========================================================================
+# Section 10 — Bob refunds alice's partial payment with `sphere invoice return $INV2`
+#
+# This is the canonical one-shot bulk-refund UX: no --recipient, no --asset.
+# The CLI calls AccountingModule.returnAllInvoicePayments() under the hood,
+# which iterates senderBalances and refunds every attributed payment to its
+# recorded sender — including masked-predicate sends whose on-chain sender
+# is a per-send one-time DIRECT://… the user cannot guess.
+#
+# Requires sphere-sdk PR #404 (returnAllInvoicePayments) and sphere-cli PR
+# #39 (invoice return bulk wrapper).
+#
+# After this section: invoice #2's netCovered drops back to 0; state
+# returns to OPEN (PARTIAL only if any payment remains attributed). The
+# invoice is NOT terminated — alice can pay it again.
+# ===========================================================================
+banner "Section 10: Bob refunds alice's partial payment with one-shot \`sphere invoice return\`"
+
+cd "$PEER_BOB"
+sphere wallet use bob
+sleep 5
+sphere payments sync 2>&1 | tee "$SNAP/bob-pre-return-sync.log"
+sphere payments receive --finalize 2>&1 | tee "$SNAP/bob-pre-return-recv.log" || true
+sphere balance | tee "$SNAP/bob-balance-before-return.txt"
+
+# The one-liner — no --recipient, no --asset. The SDK figures out who paid
+# what and refunds them.
+sphere invoice return "$INV2" --json 2>&1 | tee "$SNAP/bob-invoice-return-bulk.log"
+if grep -qE '"refunds"[[:space:]]*:[[:space:]]*\[' "$SNAP/bob-invoice-return-bulk.log"; then
+  echo "ASSERT OK (bulk-return-emitted): bob's bulk-return produced a refunds array"
+else
+  echo "ASSERT FAIL (bulk-return-emitted): expected a 'refunds' array in invoice-return-bulk.log" >&2
+  tail -30 "$SNAP/bob-invoice-return-bulk.log" >&2
+  exit 1
+fi
+
+# Verify exactly one refund row was submitted (alice's 3 UCT) by counting
+# nested status objects.
+refund_count=$(grep -oE '"status"[[:space:]]*:[[:space:]]*"(pending|submitted|delivered|completed)"' \
+  "$SNAP/bob-invoice-return-bulk.log" | wc -l)
+echo "refund count: $refund_count  (expected 1)"
+[[ "$refund_count" == "1" ]] \
+  || { echo "ASSERT FAIL (bulk-return-count): expected 1 refund, got $refund_count" >&2; exit 1; }
+
+sphere payments sync 2>&1 | tee "$SNAP/bob-post-return-sync.log"
+sphere balance | tee "$SNAP/bob-balance-after-return.txt"
+
+# Bob's balance dropped by 3 UCT (the amount he just refunded).
+bob_uct_before_return=$(extract_confirmed_smallest_units UCT < "$SNAP/bob-balance-before-return.txt")
+bob_uct_after_return=$(extract_confirmed_smallest_units UCT < "$SNAP/bob-balance-after-return.txt")
+bob_return_delta=$(python3 -c "print($bob_uct_before_return - $bob_uct_after_return)")
+echo "bob UCT before return: $bob_uct_before_return"
+echo "bob UCT after  return: $bob_uct_after_return"
+echo "bob return delta:      $bob_return_delta  (expected $expected_3_uct)"
+[[ "$bob_return_delta" == "$expected_3_uct" ]] \
+  || { echo "ASSERT FAIL (bob-return-delta-minus-3): expected $expected_3_uct, got $bob_return_delta" >&2; exit 1; }
+echo "ASSERT OK (bob-return-delta-minus-3): bob refunded exactly 3 UCT"
+
+# ===========================================================================
+# Section 11 — Alice receives the 3 UCT refund (back-direction transfer)
+# ===========================================================================
+banner "Section 11: Alice receives the 3 UCT refund"
+
+cd "$PEER_ALICE"
+sphere wallet use alice
+
+RECV_DEADLINE=$(( $(date +%s) + 90 ))
+RECV_OK=0
+while (( $(date +%s) < RECV_DEADLINE )); do
+  sphere payments sync                2>&1 > "$SNAP/alice-refund-poll-sync.log"
+  sphere payments receive --finalize  2>&1 | tee "$SNAP/alice-refund-poll-recv.log" || true
+  sphere balance | tee "$SNAP/alice-refund-poll-balance.txt"
+  alice_uct_now=$(extract_confirmed_smallest_units UCT < "$SNAP/alice-refund-poll-balance.txt")
+  delta=$(python3 -c "print($alice_uct_now - $alice_uct_after_p1)")
+  if [[ "$delta" == "$expected_3_uct" ]]; then
+    echo "INFO: alice received the 3 UCT refund (delta=$delta)"
+    RECV_OK=1
+    break
+  fi
+  echo "  alice UCT not yet +3 UCT (delta=$delta) — sleeping 5s and retrying…"
+  sleep 5
+done
+(( RECV_OK == 1 )) || { echo "ASSERT FAIL (refund-receive-timeout)" >&2; exit 1; }
+cp "$SNAP/alice-refund-poll-balance.txt" "$SNAP/alice-balance-after-refund.txt"
+
+# ===========================================================================
+# Section 12 — Alice partial-pays invoice #2 AGAIN — 3 UCT (explicit --amount)
+#
+# After the refund, invoice #2's netCovered dropped to 0 → state is OPEN.
+# This pay puts it back in PARTIAL.
+# ===========================================================================
+banner "Section 12: Alice partial-pays invoice #2 AGAIN — 3 UCT (explicit --amount)"
+
+sphere invoice pay "$INV2" --amount 3 2>&1 | tee "$SNAP/alice-invoice-pay2-partial-2.log"
+sphere payments sync 2>&1 | tee "$SNAP/alice-post-partial-2-sync.log"
+sphere balance | tee "$SNAP/alice-balance-after-partial-2.txt"
+
+alice_uct_after_p2=$(extract_confirmed_smallest_units UCT < "$SNAP/alice-balance-after-partial-2.txt")
+alice_uct_after_refund=$(extract_confirmed_smallest_units UCT < "$SNAP/alice-balance-after-refund.txt")
+partial_2_delta=$(python3 -c "print($alice_uct_after_refund - $alice_uct_after_p2)")
+echo "alice UCT after refund:      $alice_uct_after_refund"
+echo "alice UCT after  partial #2: $alice_uct_after_p2"
+echo "alice partial-2 delta:       $partial_2_delta  (expected $expected_3_uct)"
+[[ "$partial_2_delta" == "$expected_3_uct" ]] \
+  || { echo "ASSERT FAIL (alice-partial-2-minus-3): expected $expected_3_uct, got $partial_2_delta" >&2; exit 1; }
+echo "ASSERT OK (alice-partial-2-minus-3): alice partial-paid exactly 3 UCT (second time)"
+
+# ===========================================================================
+# Section 13 — Alice covers the rest (4 UCT, explicit --amount)
+#
+# IDEAL UX: `sphere invoice pay $INV2` (no --amount → SDK defaults to
+# remaining = 7 - netCovered).
+#
+# WORKAROUND today: explicit `--amount 4` because of a known SDK bug
+# (filed as sphere-sdk #TODO):
+#
+#   When bob's §10 refund used a masked predicate (the default), the
+#   resulting back-direction transfer has `senderAddress: null` on-chain.
+#   `computeInvoiceStatus` (balance-computer.ts ~line 408-413) only
+#   matches back-direction transfers when `senderAddress` exactly equals
+#   a target address — null fails the match and the refund goes to
+#   `irrelevantTransfers` instead of being attributed to the invoice.
+#
+#   As a result:
+#     - The SDK's view of INV2 shows `coveredAmount = 3 + 3 = 6`,
+#       `returnedAmount = 0` (refund not seen), `netCovered = 6`.
+#     - Default --amount in payInvoice computes `remaining = 7 - 6 = 1`,
+#       sending only 1 UCT instead of the 4 we actually need.
+#     - Token-level balances are CORRECT (bob -3 on refund send, alice
+#       +3 on refund receive) — this is purely an invoice-attribution
+#       miss inside AccountingModule, not a payment failure.
+#
+# Once the SDK bug is fixed, this section becomes `sphere invoice pay
+# $INV2` (no --amount). The final balance assertions in §14 are
+# computed against EXPLICIT amounts so they don't depend on the SDK's
+# remaining-calculation correctness.
+# ===========================================================================
+banner "Section 13: Alice covers the rest of invoice #2 — 4 UCT (explicit, SDK-bug workaround)"
+
+sphere invoice pay "$INV2" --amount 4 2>&1 | tee "$SNAP/alice-invoice-pay2-final.log"
+sphere payments sync 2>&1 | tee "$SNAP/alice-post-final-sync.log"
+sphere balance | tee "$SNAP/alice-balance-final.txt"
+
+alice_uct_final=$(extract_confirmed_smallest_units UCT < "$SNAP/alice-balance-final.txt")
+partial_3_delta=$(python3 -c "print($alice_uct_after_p2 - $alice_uct_final)")
+expected_4_uct=4000000000000000000
+echo "alice UCT after partial #2:  $alice_uct_after_p2"
+echo "alice UCT final:             $alice_uct_final"
+echo "alice partial-3 delta:       $partial_3_delta  (expected $expected_4_uct)"
+[[ "$partial_3_delta" == "$expected_4_uct" ]] \
+  || { echo "ASSERT FAIL (alice-partial-3-minus-4): expected $expected_4_uct, got $partial_3_delta" >&2; exit 1; }
+echo "ASSERT OK (alice-partial-3-minus-4): alice covered remaining 4 UCT"
+
+# ===========================================================================
+# Section 14 — Bob confirms invoice #2 fully covered + final balance check
+# ===========================================================================
+banner "Section 14: Bob confirms invoice #2 COVERED + balance sanity"
+
+cd "$PEER_BOB"
+sphere wallet use bob
+sleep 5
+sphere payments sync 2>&1 | tee "$SNAP/bob-post-final-sync.log"
+sphere payments receive --finalize 2>&1 | tee "$SNAP/bob-post-final-recv.log" || true
+sphere balance | tee "$SNAP/bob-balance-final.txt"
+sphere invoice status "$INV2" 2>&1 | tee "$SNAP/bob-invoice-status-final.log"
+
+rc=0
+if grep -qiE '("state"[[:space:]]*:[[:space:]]*"(COVERED|CLOSED)"|state[[:space:]]*:[[:space:]]*(COVERED|CLOSED))' \
+    "$SNAP/bob-invoice-status-final.log"; then
+  echo "ASSERT OK (invoice2-covered): invoice #2 reached COVERED/CLOSED after partial + cover"
+else
+  echo "ASSERT FAIL (invoice2-covered): invoice #2 did NOT reach COVERED/CLOSED" >&2
+  tail -30 "$SNAP/bob-invoice-status-final.log" >&2
+  rc=1
+fi
+
+# Net flow on bob across the whole scenario (UCT):
+#   §5  +7 (alice's first invoice payment, attributed to INV1)
+#   §10 -3 (refund of alice's partial on INV2)
+#   §12 +3 (alice's second partial on INV2)
+#   §13 +4 (alice's remainder on INV2)
+#   ── net +11 vs baseline. INV1 contributed +7, INV2 contributed +7-3+3+4 = ... wait,
+#   that's +4 net for INV2 because alice paid 3, was refunded 3, paid 3, paid 4 = net +7 paid
+#   minus 3 refunded by bob = +4 attribution. But bob's wallet TOKEN flow is the
+#   sum of inbound forward minus outbound refund = +3-3+3+4 = +7 from INV2.
+#
+# Concretely: bob received (7 + 3 + 3 + 4) = 17 UCT and sent back 3 UCT → net +14.
+bob_uct_final=$(extract_confirmed_smallest_units UCT < "$SNAP/bob-balance-final.txt")
+bob_total_delta=$(python3 -c "print($bob_uct_final - $bob_uct_0)")
+expected_total_bob=14000000000000000000   # 7 (INV1) + 3 - 3 + 3 + 4 (INV2 round-trip net) = 14
+echo "bob UCT baseline (§2): $bob_uct_0"
+echo "bob UCT final    (§14): $bob_uct_final"
+echo "bob total delta:        $bob_total_delta  (expected $expected_total_bob)"
+if [[ "$bob_total_delta" == "$expected_total_bob" ]]; then
+  echo "ASSERT OK (bob-net-+14): bob net UCT flow matches scenario expectations"
+else
+  echo "ASSERT FAIL (bob-net-+14): expected $expected_total_bob, got $bob_total_delta" >&2
+  rc=1
+fi
+
+# Alice's net flow: -7 (§5) -3 (§9) +3 (§10 refund received) -3 (§12) -4 (§13) = -14 UCT.
+alice_total_delta=$(python3 -c "print($alice_uct_0 - $alice_uct_final)")
+expected_total_alice=14000000000000000000
+echo "alice UCT baseline (§2):  $alice_uct_0"
+echo "alice UCT final    (§14):  $alice_uct_final"
+echo "alice total delta:         $alice_total_delta  (expected $expected_total_alice)"
+if [[ "$alice_total_delta" == "$expected_total_alice" ]]; then
+  echo "ASSERT OK (alice-net--14): alice net UCT flow matches scenario expectations"
+else
+  echo "ASSERT FAIL (alice-net--14): expected $expected_total_alice, got $alice_total_delta" >&2
+  rc=1
+fi
+
+check_no_unconfirmed "alice-balance-final" "$SNAP/alice-balance-final.txt" || rc=1
+check_no_unconfirmed "bob-balance-final"   "$SNAP/bob-balance-final.txt"   || rc=1
+
 echo
 if (( rc == 0 )); then
-  banner "ALL GREEN — invoice round-trip succeeded; bob +7 UCT, alice -7 UCT, invoice COVERED"
+  banner "ALL GREEN — round-trip + partial-pay + bulk-return + repeat-pay scenario succeeded"
 else
   banner "FAIL — see ASSERT FAIL lines above"
 fi
