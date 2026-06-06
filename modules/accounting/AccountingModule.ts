@@ -58,7 +58,7 @@ import { parseInvoiceMemo, buildInvoiceMemo, decodeTransferMessage, hashInvoiceI
 import { AutoReturnManager } from './auto-return.js';
 import { canonicalSerialize } from './serialization.js';
 import { hexToBytes, bytesToHex } from '@noble/hashes/utils.js';
-import { encodeTokenBlob } from '../../token-engine/token-blob.js';
+import { encodeTokenBlob, decodeTokenBlob } from '../../token-engine/token-blob.js';
 import { computeInvoiceStatus, freezeBalances } from './balance-computer.js';
 import { TokenRegistry } from '../../registry/index.js';
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1361,6 +1361,35 @@ export class AccountingModule {
 
     const deps = this.deps!;
 
+    let terms: InvoiceTerms;
+    let tokenId: string | undefined;
+    let sdkDataForStore: string;
+    const engine = deps.tokenEngine;
+    const isV2 = !!engine && typeof (token as unknown) === 'string';
+
+    if (isV2) {
+      // v2: `token` is the engine blob (hex). The proof chain (engine.verify)
+      // binds the genesis data (= the invoice terms) to the on-chain commitment,
+      // replacing the v1 terms→tokenId re-hash + SDK proof check. The data token's
+      // type is established at mint (mintDataToken), so no separate type check.
+      const sphereToken = await engine!.decodeToken(decodeTokenBlob(hexToBytes(token as unknown as string)));
+      const verifyResult = await engine!.verify(sphereToken);
+      if (!verifyResult.ok) {
+        throw new SphereError('Invoice import failed: inclusion proof is invalid.', 'INVOICE_INVALID_PROOF');
+      }
+      tokenId = engine!.tokenId(sphereToken);
+      const data = engine!.readTokenData(sphereToken);
+      if (!data) {
+        throw new SphereError('Invoice import failed: missing or invalid tokenData field.', 'INVOICE_INVALID_DATA');
+      }
+      try {
+        terms = JSON.parse(new TextDecoder().decode(data)) as InvoiceTerms;
+      } catch {
+        throw new SphereError('Invoice import failed: tokenData is not valid JSON.', 'INVOICE_INVALID_DATA');
+      }
+      sdkDataForStore = token as unknown as string;
+    } else {
+
     // ------------------------------------------------------------------
     // Step 1: Validate token type
     // ------------------------------------------------------------------
@@ -1395,7 +1424,6 @@ export class AccountingModule {
         // not valid hex — fall through to JSON.parse which will produce the proper error
       }
     }
-    let terms: InvoiceTerms;
     try {
       terms = JSON.parse(jsonString) as InvoiceTerms;
     } catch {
@@ -1404,6 +1432,8 @@ export class AccountingModule {
         'INVOICE_INVALID_DATA',
       );
     }
+    sdkDataForStore = JSON.stringify(token);
+    } // end v1 (TXF) extraction branch
 
     // ------------------------------------------------------------------
     // Step 3: Business validation of InvoiceTerms (§8.2)
@@ -1531,7 +1561,7 @@ export class AccountingModule {
     // ------------------------------------------------------------------
     // Step 4: Check for duplicate (token already imported)
     // ------------------------------------------------------------------
-    const tokenId = token.genesis?.data?.tokenId;
+    if (!isV2) tokenId = token.genesis?.data?.tokenId;
     if (!tokenId || typeof tokenId !== 'string') {
       throw new SphereError(
         'Invoice import failed: missing tokenId in genesis data.',
@@ -1556,7 +1586,8 @@ export class AccountingModule {
     // [32-byte SHA-256] = 34 bytes → TokenId.toJSON() = 68-char hex.
     // crypto.subtle.digest produces only the 32-byte SHA-256 (64-char hex) which
     // does NOT match the 68-char tokenId stored on-chain.
-    {
+    // v2: skipped — the proof chain (engine.verify) already binds terms↔token.
+    if (!isV2) {
       const { DataHasher } = await import(
         '@unicitylabs/state-transition-sdk/lib/hash/DataHasher.js'
       );
@@ -1586,6 +1617,9 @@ export class AccountingModule {
     // verify() performs the cryptographic proof check.
     // ------------------------------------------------------------------
 
+    // v2 verified the proof via engine.verify above; the v1 SDK proof path below
+    // runs only for legacy TXF imports.
+    if (!isV2) {
     // C2/C6 fix: Reject imports when trustBase is empty — without a valid trust
     // base, verify() may silently accept forged proofs depending on SDK behavior.
     if (!deps.trustBase || (deps.trustBase instanceof Uint8Array && deps.trustBase.length === 0)) {
@@ -1629,6 +1663,7 @@ export class AccountingModule {
         'INVOICE_INVALID_PROOF',
       );
     }
+    } // end v1-only SDK proof verification
 
     // ------------------------------------------------------------------
     // Step 6: Store the token via PaymentsModule.addToken()
@@ -1647,7 +1682,7 @@ export class AccountingModule {
         status: 'confirmed',
         createdAt: terms.createdAt,
         updatedAt: terms.createdAt,
-        sdkData: JSON.stringify(token),
+        sdkData: sdkDataForStore,
       };
       await deps.payments.addToken(uiToken);
     } catch (err) {

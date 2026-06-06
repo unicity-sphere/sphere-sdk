@@ -54,3 +54,41 @@ describe('createInvoice — v2 engine path (B2)', () => {
     expect(result.token).toBeDefined();
   });
 });
+
+describe('importInvoice — v2 engine path (B2)', () => {
+  it('round-trips: createInvoice (v2) → importInvoice (v2 blob)', async () => {
+    const engine = new FakeTokenEngine();
+
+    // Creator mints a v2 invoice; result.token is the engine blob (hex).
+    const creator = createTestAccountingModule({ tokenEngine: engine });
+    (creator.mocks.payments as any).addToken = vi.fn().mockResolvedValue(undefined);
+    const created = await creator.module.createInvoice(createTestInvoice({ memo: 'round-trip' }));
+    expect(created.success).toBe(true);
+
+    // A fresh importer (same engine fixture) decodes + verifies + stores it.
+    const importer = createTestAccountingModule({ tokenEngine: engine });
+    (importer.mocks.payments as any).addToken = vi.fn().mockResolvedValue(undefined);
+    const terms = await importer.module.importInvoice(created.token);
+
+    expect(terms.memo).toBe('round-trip');
+    // Stored under the same genesis-stable id with the blob as sdkData.
+    const added = (importer.mocks.payments as any).addToken.mock.calls.at(-1)[0];
+    expect(added.id).toBe(created.invoiceId);
+    expect(added.coinId).toBe(INVOICE_TOKEN_TYPE_HEX);
+  });
+
+  it('rejects a blob whose proof does not verify', async () => {
+    const engine = new FakeTokenEngine();
+    const creator = createTestAccountingModule({ tokenEngine: engine });
+    (creator.mocks.payments as any).addToken = vi.fn().mockResolvedValue(undefined);
+    const created = await creator.module.createInvoice(createTestInvoice());
+
+    // An engine whose verify() fails ⇒ INVOICE_INVALID_PROOF on import.
+    const badEngine = new FakeTokenEngine();
+    (badEngine as any).verify = vi.fn().mockResolvedValue({ ok: false, reason: 'bad' });
+    const importer = createTestAccountingModule({ tokenEngine: badEngine });
+    (importer.mocks.payments as any).addToken = vi.fn().mockResolvedValue(undefined);
+
+    await expect(importer.module.importInvoice(created.token)).rejects.toThrow(/proof is invalid/i);
+  });
+});
