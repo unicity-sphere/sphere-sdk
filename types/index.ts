@@ -617,6 +617,20 @@ export type SphereEventType =
   | 'connectivity:offline-degraded'
   | 'nametag:registered'
   | 'nametag:recovered'
+  /**
+   * Issue #42 — Fires when a background Nostr identity-binding publish
+   * (out-of-band from `registerNametag(name, { publishMode: 'background' })`)
+   * resolves with `success === false` or throws. The on-chain mint has
+   * already landed; only the relay-side discoverability binding is
+   * affected. Apps may react by re-prompting the user or scheduling
+   * a manual republish.
+   *
+   * Distinct from a synchronous `NAMETAG_TAKEN` throw (which only fires
+   * in `publishMode: 'await'`): in background mode the publish failure
+   * surfaces here instead of throwing, so the caller's promise has
+   * already resolved by the time this event lands.
+   */
+  | 'nametag:publish-failed'
   | 'identity:changed'
   | 'address:activated'
   | 'address:hidden'
@@ -1483,6 +1497,26 @@ export interface SphereEventMap {
   'connectivity:offline-degraded': ConnectivityStatusPayload;
   'nametag:registered': { nametag: string; addressIndex: number };
   'nametag:recovered': { nametag: string };
+  /**
+   * Issue #42 — payload for the background-publish failure event.
+   *
+   * - `reason: 'taken'`: relay rejected the binding because another
+   *   pubkey owns the name (deterministic failure — no retry will fix).
+   * - `reason: 'error'`: the publish threw (network / relay disconnect /
+   *   internal). May be transient; next wallet load republishes via
+   *   `syncIdentityWithTransport`.
+   *
+   * `rolledBack` indicates whether the local nametag entry that THIS
+   * call minted was removed from the wallet's nametag store. Only true
+   * when (a) the mint happened in this call and (b) the publish failed
+   * deterministically (`reason: 'taken'`).
+   */
+  'nametag:publish-failed': {
+    nametag: string;
+    reason: 'taken' | 'error';
+    error?: string;
+    rolledBack: boolean;
+  };
   'identity:changed': { l1Address: string; directAddress?: string; chainPubkey: string; nametag?: string; addressIndex: number };
   'address:activated': { address: TrackedAddress };
   'address:hidden': { index: number; addressId: string };
