@@ -551,10 +551,21 @@ describe('Sphere.clear() integration', () => {
 
       // Wait for the detached handler to settle. The mock publish promise
       // resolves on the next microtask; the rollback chain spans several
-      // additional microtasks (clearNametagByName, _updateCachedProxyAddress,
-      // persistAddressNametags). Use a few setTimeout(0) ticks for paranoia.
-      for (let i = 0; i < 5; i++) {
-        await new Promise((r) => setTimeout(r, 0));
+      // additional microtasks AND real `proper-lockfile` file I/O via
+      // `clearNametagByName` → `setNametag` → `save`, then
+      // `persistAddressNametags`. Pure microtask draining doesn't cover
+      // the lockfile's setImmediate / setTimeout-based fsync, and CI
+      // runners (especially the slower Node 20 lane) need more wall
+      // budget than the previous 5×setTimeout(0) afforded. Mirror the
+      // `flushBackgroundPublish` shape from
+      // `tests/unit/core/Sphere.mint-before-publish.test.ts` — fixed
+      // 200 ms lead + microtask/macrotask interleave — and poll until
+      // the event lands (bounded ~5 s).
+      await new Promise((r) => setTimeout(r, 200));
+      for (let i = 0; i < 50 && publishFailedEvents.length === 0; i++) {
+        await Promise.resolve();
+        await new Promise((r) => setImmediate(r));
+        await new Promise((r) => setTimeout(r, 100));
       }
 
       // Detached handler observed the relay rejection and rolled back.
