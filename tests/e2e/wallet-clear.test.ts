@@ -228,22 +228,56 @@ describe.skipIf(SKIP_INFRA)('Wallet clear end-to-end', () => {
     const providers2 = makeProviders(dirs2);
 
     console.log(`Wallet 2: attempting to register @${nametag}...`);
-    // PR #127 split the generic VALIDATION_ERROR "Failed to register Unicity
-    // ID" into the specific NAMETAG_TAKEN code with a clearer message
-    // ("binding event was rejected") so operators can distinguish
-    // Nostr-relay collision from aggregator-mint failure.
-    await expect(
-      Sphere.init({
-        ...providers2,
-        autoGenerate: true,
-        nametag,
-      })
-    ).rejects.toMatchObject({
-      code: 'NAMETAG_TAKEN',
-      message: expect.stringMatching(/binding event was rejected/),
+    // sphere-cli #42 / sphere-sdk #415 — `registerNametag` now publishes
+    // the Nostr binding fire-and-forget by default (`publishMode:
+    // 'background'`). Sphere.init RESOLVES SUCCESSFULLY even when the
+    // relay rejects the binding; the failure surfaces via the new
+    // `'nametag:publish-failed'` event and the orphan local mint
+    // pointer + identity claim get rolled back in the detached handler.
+    //
+    // Pre-#415 this branch threw NAMETAG_TAKEN synchronously (PR #127
+    // had split the generic VALIDATION_ERROR into the specific code).
+    // For the strict-throw contract, callers can opt into
+    // `publishMode: 'await'` via the SDK API — but Sphere.init doesn't
+    // pipe that knob through, so we exercise the background-mode
+    // contract here.
+    const publishFailedEvents: Array<{
+      nametag: string;
+      reason: 'taken' | 'error';
+      rolledBack: boolean;
+    }> = [];
+
+    const { sphere: sphere2 } = await Sphere.init({
+      ...providers2,
+      autoGenerate: true,
+      nametag,
+    });
+    spheres.push(sphere2);
+
+    sphere2.on('nametag:publish-failed', (payload) => {
+      publishFailedEvents.push(payload);
     });
 
-    console.log('Wallet 2 correctly rejected — nametag is taken on Nostr.');
+    // The mint landed — identity reflects the claim immediately.
+    expect(sphere2.identity!.nametag).toBe(nametag);
+
+    // Wait for the detached publish + rollback chain to settle.
+    // The relay round-trip is real testnet here, so allow a generous
+    // budget (Nostr publish + IPFS round-trip + the local rollback's
+    // file I/O via FileStorageProvider's proper-lockfile).
+    for (let i = 0; i < 60 && publishFailedEvents.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 250));
+    }
+
+    expect(publishFailedEvents).toHaveLength(1);
+    expect(publishFailedEvents[0]).toMatchObject({
+      nametag,
+      reason: 'taken',
+      rolledBack: true,
+    });
+    expect(sphere2.identity!.nametag).toBeUndefined();
+
+    console.log('Wallet 2 correctly rolled back — nametag is taken on Nostr.');
   }, 90000);
 
   it('same mnemonic can reclaim nametag after clear and re-import', async () => {
