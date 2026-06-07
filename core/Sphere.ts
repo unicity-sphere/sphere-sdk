@@ -566,6 +566,37 @@ const RESET_EPOCH_DISCOVERY_TIMEOUT_MS = 15_000;
 const RESET_EPOCH_PUBLISH_TIMEOUT_MS = 30_000;
 
 /**
+ * Issue #42 review B1 — snapshot captured at `registerNametag`'s
+ * dispatch site, threaded into the detached publish handler so the
+ * rollback path operates on the address WE MINTED FOR even when a
+ * concurrent `switchToAddress(N)` has since swapped
+ * `this._payments` / `this._currentAddressIndex` / `this._identity`.
+ *
+ * `payments` is the PaymentsModule reference at dispatch time —
+ * `switchToAddress` rotates `this._payments` to the new address's
+ * module (Sphere.ts ~line 3682), so a live reference would clear
+ * the wrong wallet's nametag store.
+ *
+ * `addressIndex` and `addressId` pin the tracked-address entry
+ * whose nametag cache must be cleared on rollback.
+ *
+ * `identityRef` is the same `MutableFullIdentity` object we mutated
+ * in step 3 of `registerNametag`. We hold a reference (not a copy)
+ * because that's the object whose `.nametag = undefined` clear
+ * propagates to the cached identity getter. A switch-then-switch-
+ * back round trip leaves the original `identityRef` detached from
+ * `this._identity`; the handler uses identity-equality
+ * (`this._identity === ctx.identityRef`) to know whether to refresh
+ * the cached proxy address.
+ */
+interface DetachedPublishContext {
+  readonly payments: PaymentsModule;
+  readonly addressIndex: number;
+  readonly addressId: string | undefined;
+  readonly identityRef: MutableFullIdentity | null;
+}
+
+/**
  * Derive L3 predicate address (DIRECT://...) from private key
  * Uses UnmaskedPredicateReference for stable wallet address
  */
@@ -5193,6 +5224,13 @@ export class Sphere {
     //
     //    `void` is intentional — we don't re-await this. The promise
     //    is detached from the caller's resolution path.
+    //
+    //    Snapshot the address context (issue #42 review B1): a
+    //    subsequent `switchToAddress(N)` would swap `this._payments`,
+    //    `this._currentAddressIndex`, and the live `this._identity`
+    //    before the detached handler resumes. The handler must
+    //    operate on the address WE MINTED FOR, not whatever address
+    //    happens to be active when the publish settles.
     if (publishMode === 'background' && this._transport.publishIdentityBinding) {
       const publishPromise = this._transport.publishIdentityBinding(
         this._identity!.chainPubkey,
@@ -5200,10 +5238,17 @@ export class Sphere {
         this._identity!.directAddress || '',
         cleanNametag,
       );
+      const ctx: DetachedPublishContext = {
+        payments: this._payments,
+        addressIndex: this._currentAddressIndex,
+        addressId: this._trackedAddresses.get(this._currentAddressIndex)?.addressId,
+        identityRef: this._identity,
+      };
       void this._handleDetachedPublishOutcome(
         cleanNametag,
         mintedFresh,
         publishPromise,
+        ctx,
       );
     }
   }
@@ -5223,11 +5268,26 @@ export class Sphere {
    * different name isn't blocked by NAMETAG_CONFLICT. Transient
    * errors (network / disconnect) do NOT roll back —
    * `syncIdentityWithTransport` republishes on next wallet load.
+   *
+   * All rollback writes target the {@link DetachedPublishContext}
+   * captured at registration time, NOT `this.*` at handler-resume
+   * time. This is the fix for the review-B1 race: if the caller
+   * issues `switchToAddress(N)` (which swaps `this._payments`,
+   * `this._currentAddressIndex`, and `this._identity`) between
+   * `registerNametag` returning and the publish settling, the
+   * rollback must still affect the address we minted for, not the
+   * newly-active address.
+   *
+   * Destroy guard (review B2): if the wallet has been destroyed
+   * since dispatch (`this._initialized === false`), bail out before
+   * touching storage that's already been disconnected. The next
+   * cold load's `syncIdentityWithTransport` will reconcile.
    */
   private async _handleDetachedPublishOutcome(
     cleanNametag: string,
     mintedFresh: boolean,
     publishPromise: Promise<boolean>,
+    ctx: DetachedPublishContext,
   ): Promise<void> {
     try {
       const success = await publishPromise;
@@ -5235,24 +5295,43 @@ export class Sphere {
         return;
       }
 
+      // Destroy guard — Sphere has been torn down since the publish
+      // dispatched. Storage / transport are disconnected; the
+      // rollback's storage writes would silently no-op and the
+      // emitted event would land on cleared handler sets. Defer to
+      // next cold load.
+      if (!this._initialized) {
+        return;
+      }
+
       // Relay rejected — treat as `taken` (deterministic, no retry).
       let rolledBack = false;
       if (mintedFresh) {
         try {
-          await this._payments.clearNametagByName(cleanNametag);
+          // Use the captured `payments` reference — `this._payments`
+          // may have been swapped by a concurrent `switchToAddress`.
+          await ctx.payments.clearNametagByName(cleanNametag);
           rolledBack = true;
           // Clear the in-memory identity claim too — without this,
-          // `_identity.nametag` still says the claimed name while
-          // the wallet's nametag store has been cleared, an
-          // inconsistency that would confuse the next address-switch
-          // post-sync.
-          if (this._identity?.nametag === cleanNametag) {
-            this._identity.nametag = undefined;
-            await this._updateCachedProxyAddress();
+          // the (possibly still-active) `identityRef` still says the
+          // claimed name while the wallet's nametag store has been
+          // cleared, an inconsistency that would confuse the next
+          // address-switch post-sync. We compare BY VALUE on the
+          // captured reference so a switch-then-switch-back round
+          // trip that reset `identityRef.nametag` for unrelated
+          // reasons doesn't get clobbered.
+          if (ctx.identityRef && ctx.identityRef.nametag === cleanNametag) {
+            ctx.identityRef.nametag = undefined;
+            // Only refresh the cached proxy address if the captured
+            // identity is STILL the active one — otherwise the
+            // switchToAddress dance already rebuilt it for the new
+            // active address and we'd be overwriting fresh state.
+            if (this._identity === ctx.identityRef) {
+              await this._updateCachedProxyAddress();
+            }
           }
-          const currentAddressId = this._trackedAddresses.get(this._currentAddressIndex)?.addressId;
-          if (currentAddressId) {
-            const nametagsMap = this._addressNametags.get(currentAddressId);
+          if (ctx.addressId) {
+            const nametagsMap = this._addressNametags.get(ctx.addressId);
             if (nametagsMap?.get(0) === cleanNametag) {
               nametagsMap.delete(0);
               try {
@@ -5268,7 +5347,7 @@ export class Sphere {
           }
           logger.debug(
             'Sphere',
-            `Rolled back orphan local nametag entry for "@${cleanNametag}" after background publish failure`,
+            `Rolled back orphan local nametag entry for "@${cleanNametag}" (address ${ctx.addressIndex}) after background publish failure`,
           );
         } catch (rollbackErr) {
           logger.warn(
@@ -5277,6 +5356,14 @@ export class Sphere {
             rollbackErr,
           );
         }
+      }
+
+      // Second destroy-guard pass — the rollback chain awaited file
+      // I/O; the wallet may have been torn down during it. Suppress
+      // the event so apps don't react to a publish-failure on a
+      // wallet they've already destroyed.
+      if (!this._initialized) {
+        return;
       }
 
       logger.warn(
@@ -5296,7 +5383,12 @@ export class Sphere {
       // Transient (network / disconnect / internal). Do NOT roll back —
       // `syncIdentityWithTransport` will republish on next load and
       // the relay may still accept us. Surface the failure for
-      // observability.
+      // observability — but suppress if the wallet has been destroyed
+      // since dispatch (the throw is most likely the transport tear-
+      // down itself).
+      if (!this._initialized) {
+        return;
+      }
       const errorMsg = err instanceof Error ? err.message : String(err);
       logger.warn(
         'Sphere',
@@ -5316,6 +5408,17 @@ export class Sphere {
    * Rollback an orphaned mint when synchronous publish fails (the
    * `await`-mode path). Extracted for symmetry with the background-
    * mode rollback logic.
+   *
+   * Note (review N5): unlike `_handleDetachedPublishOutcome`'s
+   * rollback, this helper does NOT touch `_identity.nametag` or
+   * `_addressNametags`. That asymmetry is intentional — in `'await'`
+   * mode the throw fires in step 2 of `registerNametag`, BEFORE
+   * step 3 mutates `_identity.nametag` / `_addressNametags`. The
+   * caller's mutations are still local to step 1's mint pointer,
+   * so only the mint pointer needs reverting. Don't "fix" this by
+   * adding identity-clear logic — that would double-clear nothing
+   * (the field was never set on this code path) and could
+   * inadvertently regress unrelated state.
    */
   private async _rollbackOrphanNametagMint(
     cleanNametag: string,

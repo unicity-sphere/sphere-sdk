@@ -511,6 +511,124 @@ describe('Sphere.registerNametag() mint-before-publish ordering', () => {
     await sphere.destroy();
   });
 
+  it('background mode: destroy() while publish is in flight does NOT throw nametag:publish-failed (review B2)', async () => {
+    // The detached publish handler must bail out when the wallet has
+    // been torn down between dispatch and resume. Otherwise: emitEvent
+    // lands on a cleared handler set (harmless), but the rollback's
+    // storage writes silently no-op against a disconnected provider
+    // and leave the wallet's on-disk nametag store inconsistent for
+    // the next cold load.
+    const transport = createMockTransport();
+    const oracle = createMockOracle();
+
+    const { sphere } = await Sphere.init({
+      storage,
+      transport,
+      oracle,
+      tokenStorage,
+      autoGenerate: true,
+    });
+
+    mintSpy = installMintMock(sphere, { success: true });
+
+    // Hold the publish promise in a pending state so we can interleave
+    // `destroy()` between `registerNametag` returning and the handler
+    // resuming.
+    let resolvePublish!: (v: boolean) => void;
+    const heldPublish = new Promise<boolean>((r) => { resolvePublish = r; });
+    (transport.publishIdentityBinding as ReturnType<typeof vi.fn>).mockReturnValue(heldPublish);
+
+    const publishFailedEvents: Array<{ nametag: string; reason: 'taken' | 'error'; rolledBack: boolean }> = [];
+    sphere.on('nametag:publish-failed', (p) => publishFailedEvents.push(p));
+
+    await sphere.registerNametag('alice');
+    expect(sphere.identity!.nametag).toBe('alice');
+
+    // Destroy BEFORE the publish settles.
+    await sphere.destroy();
+
+    // Now let the publish settle as a relay rejection.
+    resolvePublish(false);
+    await flushBackgroundPublish();
+
+    // Destroy guard suppressed the event — apps don't react to a
+    // publish-failure on a wallet they've already torn down.
+    expect(publishFailedEvents).toHaveLength(0);
+  });
+
+  it('background mode: switchToAddress between dispatch and resume rolls back the ORIGINAL address (review B1)', async () => {
+    // Reproduces the live-reference bug the review caught: the
+    // handler captures `this._payments`, `this._currentAddressIndex`,
+    // `this._addressNametags`, and `this._identity` at the call site
+    // (RegistrationContext), so a `switchToAddress(N)` between the
+    // caller's await resolving and the publish settling does NOT
+    // misdirect the rollback at the new address's PaymentsModule.
+    const transport = createMockTransport();
+    const oracle = createMockOracle();
+
+    const { sphere } = await Sphere.init({
+      storage,
+      transport,
+      oracle,
+      tokenStorage,
+      autoGenerate: true,
+    });
+
+    mintSpy = installMintMock(sphere, { success: true });
+
+    // Hold the publish so we can `switchToAddress` in between.
+    let resolvePublish!: (v: boolean) => void;
+    const heldPublish = new Promise<boolean>((r) => { resolvePublish = r; });
+    (transport.publishIdentityBinding as ReturnType<typeof vi.fn>).mockReturnValue(heldPublish);
+
+    const publishFailedEvents: Array<{ nametag: string; reason: 'taken' | 'error'; rolledBack: boolean }> = [];
+    sphere.on('nametag:publish-failed', (p) => publishFailedEvents.push(p));
+
+    // Register `alice` on address 0.
+    await sphere.registerNametag('alice');
+    expect(sphere.identity!.nametag).toBe('alice');
+
+    const address0Payments = (sphere as unknown as { _payments: PaymentsModule })._payments;
+    expect(address0Payments.hasNametagNamed('alice')).toBe(true);
+
+    // Switch to address 1 — `_payments` rotates, `_identity` swaps,
+    // `_currentAddressIndex` becomes 1. Mint mock is still installed
+    // on address-0's PaymentsModule, but address 1 has its own
+    // (un-mocked) instance; the switch doesn't trigger any mint.
+    await sphere.switchToAddress(1);
+    expect(sphere.getCurrentAddressIndex()).toBe(1);
+    expect(sphere.identity!.nametag).toBeUndefined(); // address 1 has no nametag
+
+    const address1Payments = (sphere as unknown as { _payments: PaymentsModule })._payments;
+    expect(address1Payments).not.toBe(address0Payments);
+
+    // Now resolve the publish with a relay rejection.
+    resolvePublish(false);
+    await flushBackgroundPublish();
+
+    // The rollback must have hit address 0's PaymentsModule, NOT
+    // address 1's. Pre-fix behaviour: `this._payments.clearNametagByName`
+    // would call address 1's empty store, return false, and leave
+    // address 0's orphan `alice` in place.
+    expect(address0Payments.hasNametagNamed('alice')).toBe(false);
+
+    // The event still fires (with rolledBack: true).
+    expect(publishFailedEvents).toHaveLength(1);
+    expect(publishFailedEvents[0]).toMatchObject({
+      nametag: 'alice',
+      reason: 'taken',
+      rolledBack: true,
+    });
+
+    // Switch back to address 0 — its identity should NOT have a
+    // resurrected stale `alice` (the `_addressNametags` entry for
+    // address 0 was cleared as part of the rollback).
+    await sphere.switchToAddress(0);
+    expect(sphere.identity!.nametag).toBeUndefined();
+
+    await sphere.destroy();
+  });
+
   it('should update local state after mint succeeds (background mode default)', async () => {
     const transport = createMockTransport();
     const oracle = createMockOracle();

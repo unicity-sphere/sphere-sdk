@@ -157,11 +157,14 @@ const SKIP_INFRA = preflightSkip(["nostr","aggregator","ipfs","faucet"], 'wallet
 // (`IPFS state: seq=0, lastCid=N/A; ✗ IPFS auto-sync NOT triggered`),
 // so the post-destroy recovery resurrects the PRE-send balance. The
 // equivalent recovery on the modern Profile path is covered by
-// `profile-sync.test.ts` (which has its own known flake, tracked
-// separately). Re-enable only if/when the legacy provider is brought
-// back into active maintenance — otherwise this is a CI churn cost
-// with no signal value.
-const SKIP_LEGACY_IPFS = true;
+// `profile-sync.test.ts` (a real flake tracked in #419 — the CAR pin
+// recovery returns 0 tokens because the gateway-side `helia.pins.add`
+// can't load blocks). Re-enable only if/when the legacy provider is
+// brought back into active maintenance — otherwise this is a CI
+// churn cost with no signal value. Set `RUN_LEGACY_IPFS_E2E=1` to
+// opt back in for a one-off debug session without flipping the
+// constant.
+const SKIP_LEGACY_IPFS = process.env.RUN_LEGACY_IPFS_E2E !== '1';
 
 describe.skipIf(SKIP_INFRA || SKIP_LEGACY_IPFS)('Wallet lifecycle: create → topup → send → destroy → import → IPFS recover', () => {
   const cleanupDirs: string[] = [];
