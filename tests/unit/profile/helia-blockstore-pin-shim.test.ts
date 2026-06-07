@@ -17,6 +17,7 @@ import {
   requestPersistentStorage,
   type HeliaWithPinsLike,
 } from '../../../profile/helia-blockstore-pin-shim';
+import { logger } from '../../../core/logger';
 
 // ---------------------------------------------------------------------------
 // Mock helpers
@@ -228,6 +229,235 @@ describe('installHeliaBlockstorePinShim', () => {
     expect(counters.pinFailed).toBe(0);
   });
 
+  // -------------------------------------------------------------------------
+  // Issue #419 — pin shim must pass `{ depth: 0 }` so Helia does NOT
+  // walk descendants. Default `pins.add` is `depth: Infinity`, which
+  // makes Helia decode each pinned block and walk its CID-link
+  // descendants. Descendants that aren't yet on disk fall through to
+  // Bitswap and time out — the failure surfaces as
+  // `helia.pins.add failed for X: Failed to load block for Y` warnings
+  // (X != Y). The shim's contract is "pin individual leaf blocks at
+  // write time"; depth: 0 aligns Helia with that contract.
+  // -------------------------------------------------------------------------
+
+  it('invokes pins.add with { depth: 0 } so Helia does NOT walk descendants', async () => {
+    const optionsSeen: unknown[] = [];
+    const blockstore = makeBlockstore('ok');
+    const pinsApi = {
+      add(cid: unknown, options?: unknown): AsyncIterable<unknown> {
+        optionsSeen.push(options);
+        return (async function* () {
+          yield cid;
+        })();
+      },
+    };
+    const helia: HeliaWithPinsLike = {
+      blockstore: blockstore.bs,
+      pins: pinsApi,
+    };
+    installHeliaBlockstorePinShim(helia);
+
+    await helia.blockstore!.put!('bafyDEPTH', new Uint8Array([1]));
+    await flushAsync();
+
+    expect(optionsSeen.length).toBe(1);
+    expect(optionsSeen[0]).toMatchObject({ depth: 0 });
+  });
+
+  it('survives a Helia stub that throws when asked to walk descendants', async () => {
+    // Simulate Helia v6's real behaviour without depth: 0 — `pins.add`
+    // walks the DAG, fails to load a referenced descendant, and throws
+    // "Failed to load block for <child cid>". With our depth: 0 fix the
+    // PRODUCTION Helia would not even attempt the walk, but a strict
+    // stub helps us verify the shim's failure path stays well-behaved
+    // (counters increment correctly, warn fires, put never throws).
+    const blockstore = makeBlockstore('ok');
+    const pinsApi = {
+      add(_cid: unknown, _options?: unknown): AsyncIterable<unknown> {
+        return (async function* () {
+          throw new Error('Failed to load block for bafy_descendant');
+           
+          yield _cid;
+        })();
+      },
+    };
+    const helia: HeliaWithPinsLike = {
+      blockstore: blockstore.bs,
+      pins: pinsApi,
+    };
+    const handle = installHeliaBlockstorePinShim(helia);
+
+    // Put MUST resolve cleanly even though pin descends-and-fails.
+    await expect(
+      helia.blockstore!.put!('bafyROOT', new Uint8Array([1])),
+    ).resolves.toBeUndefined();
+    await flushAsync();
+
+    const counters = handle.getCounters();
+    expect(counters.pinAttempted).toBe(1);
+    expect(counters.pinSucceeded).toBe(0);
+    expect(counters.pinFailed).toBe(1);
+  });
+
+  // -------------------------------------------------------------------------
+  // Issue #419 — one-shot Helia config snapshot on FIRST pin failure.
+  // Each subsequent failure must NOT re-emit the snapshot (otherwise it
+  // floods the log just like the bare "Failed to load block" warnings
+  // it's supposed to disambiguate).
+  // -------------------------------------------------------------------------
+
+  it('emits a Helia config snapshot exactly ONCE across many pin failures', async () => {
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      const blockstore = makeBlockstore('ok');
+      const pinsApi = {
+        add(_cid: unknown, _options?: unknown): AsyncIterable<unknown> {
+          return (async function* () {
+            throw new Error('Failed to load block for bafy_descendant');
+             
+            yield _cid;
+          })();
+        },
+      };
+      const helia: HeliaWithPinsLike = {
+        blockstore: blockstore.bs,
+        pins: pinsApi,
+      };
+      installHeliaBlockstorePinShim(helia);
+
+      for (let i = 0; i < 5; i++) {
+        await helia.blockstore!.put!(`bafyDUMP${i}`, new Uint8Array([i]));
+      }
+      await flushAsync();
+
+      // Per-failure warn fires 5×; snapshot fires once.
+      const snapshotLogs = warnSpy.mock.calls.filter((call) => {
+        const msg = call[1];
+        return typeof msg === 'string' && msg.includes('helia config snapshot');
+      });
+      expect(snapshotLogs.length).toBe(1);
+
+      // The snapshot line should mention the structural fields we
+      // promised in the doc-comment: blockstore, pins, libp2p,
+      // peerCount. Failure to include them makes the diagnostic
+      // surface less useful in production triage.
+      const snapshotMsg = snapshotLogs[0][1] as string;
+      expect(snapshotMsg).toMatch(/blockstore=/);
+      expect(snapshotMsg).toMatch(/pins=/);
+      expect(snapshotMsg).toMatch(/libp2p=(present|absent|unknown)/);
+      expect(snapshotMsg).toMatch(/peerCount=/);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('does NOT emit a config snapshot when "Already pinned" is the only failure surface', async () => {
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      const blockstore = makeBlockstore('ok');
+      const pinsApi = {
+        add(_cid: unknown, _options?: unknown): AsyncIterable<unknown> {
+          return (async function* () {
+            throw new Error('Already pinned');
+             
+            yield _cid;
+          })();
+        },
+      };
+      const helia: HeliaWithPinsLike = {
+        blockstore: blockstore.bs,
+        pins: pinsApi,
+      };
+      installHeliaBlockstorePinShim(helia);
+
+      await helia.blockstore!.put!('bafyDUP', new Uint8Array([1]));
+      await flushAsync();
+
+      const snapshotLogs = warnSpy.mock.calls.filter((call) => {
+        const msg = call[1];
+        return typeof msg === 'string' && msg.includes('helia config snapshot');
+      });
+      // "Already pinned" classifies as success — the failure branch
+      // never runs, and the snapshot stays silent.
+      expect(snapshotLogs.length).toBe(0);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('reflects an HTTP-only Helia (no libp2p) in the snapshot', async () => {
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      const blockstore = makeBlockstore('ok');
+      const pinsApi = {
+        add(_cid: unknown, _options?: unknown): AsyncIterable<unknown> {
+          return (async function* () {
+            throw new Error('something broke');
+             
+            yield _cid;
+          })();
+        },
+      };
+      // Helia handle WITHOUT a libp2p field — issue #266 HTTP-only mode.
+      const helia: HeliaWithPinsLike = {
+        blockstore: blockstore.bs,
+        pins: pinsApi,
+      };
+      installHeliaBlockstorePinShim(helia);
+
+      await helia.blockstore!.put!('bafyHTTP', new Uint8Array([1]));
+      await flushAsync();
+
+      const snapshotMsg = warnSpy.mock.calls.find((call) => {
+        const msg = call[1];
+        return typeof msg === 'string' && msg.includes('helia config snapshot');
+      })?.[1] as string | undefined;
+      expect(snapshotMsg).toBeTruthy();
+      expect(snapshotMsg!).toMatch(/libp2p=absent/);
+      expect(snapshotMsg!).toMatch(/peerCount=unknown/);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('reflects a libp2p-equipped Helia (with peers) in the snapshot', async () => {
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      const blockstore = makeBlockstore('ok');
+      const pinsApi = {
+        add(_cid: unknown, _options?: unknown): AsyncIterable<unknown> {
+          return (async function* () {
+            throw new Error('something broke');
+             
+            yield _cid;
+          })();
+        },
+      };
+      const heliaWithLibp2p = {
+        blockstore: blockstore.bs,
+        pins: pinsApi,
+        libp2p: {
+          getPeers: () => ['peer1', 'peer2', 'peer3'],
+        },
+      };
+      installHeliaBlockstorePinShim(heliaWithLibp2p as unknown as HeliaWithPinsLike);
+
+      await (heliaWithLibp2p.blockstore as { put: (cid: unknown, val: unknown) => Promise<void> })
+        .put('bafyP2P', new Uint8Array([1]));
+      await flushAsync();
+
+      const snapshotMsg = warnSpy.mock.calls.find((call) => {
+        const msg = call[1];
+        return typeof msg === 'string' && msg.includes('helia config snapshot');
+      })?.[1] as string | undefined;
+      expect(snapshotMsg).toBeTruthy();
+      expect(snapshotMsg!).toMatch(/libp2p=present/);
+      expect(snapshotMsg!).toMatch(/peerCount=3/);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
   it('treats "Already pinned" from helia.pins.add as success (no warn)', async () => {
     // Custom pins API: throws "Already pinned" — simulates the helia
     // pin-tracker survived state where the in-memory Set was cleared
@@ -236,7 +466,7 @@ describe('installHeliaBlockstorePinShim', () => {
       add(cid: unknown): AsyncIterable<unknown> {
         return (async function* () {
           throw new Error('Already pinned');
-          // eslint-disable-next-line @typescript-eslint/no-unreachable
+           
           yield cid;
         })();
       },
