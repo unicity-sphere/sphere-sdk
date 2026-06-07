@@ -506,34 +506,80 @@ describe('Sphere.clear() integration', () => {
       });
 
       expect(sphere1.identity!.nametag).toBe('taken');
+      // Wait for the background publish to land on the mock relay before
+      // we destroy. Otherwise the relay might not see the registration.
+      await new Promise((r) => setTimeout(r, 50));
       await sphere1.destroy();
 
       // Clear local data
       await Sphere.clear({ storage, tokenStorage });
 
-      // Wallet 2 (different mnemonic = different keys) tries the same nametag
+      // Wallet 2 (different mnemonic = different keys) tries the same nametag.
+      // Sphere.init with nametag calls registerNametag internally under the
+      // default `publishMode: 'background'` (issue #42) — the publish is
+      // fire-and-forget so init RESOLVES SUCCESSFULLY even though the relay
+      // will reject the binding. The collision surfaces via the
+      // `'nametag:publish-failed'` event and the orphan local mint pointer
+      // (plus `_identity.nametag`) gets rolled back in the detached handler.
+      const transport2 = createMockTransport();
+      const oracle2 = createMockOracle();
       const storage2 = new FileStorageProvider({ dataDir: DATA_DIR });
       await storage2.connect();
 
-      // Sphere.init with nametag calls registerNametag internally.
-      // Since the nametag is taken by a different pubkey on Nostr,
-      // registration fails and Sphere throws.
-      await expect(
-        Sphere.init({
-          storage: storage2,
-          transport: createMockTransport(),
-          oracle: createMockOracle(),
-          tokenStorage,
-          autoGenerate: true,
-          nametag: 'taken',
-        })
-      ).rejects.toMatchObject({
-        code: 'NAMETAG_TAKEN',
-        message: expect.stringMatching(/binding event was rejected/),
+      const publishFailedEvents: Array<{
+        nametag: string;
+        reason: 'taken' | 'error';
+        rolledBack: boolean;
+      }> = [];
+
+      const { sphere: sphere2 } = await Sphere.init({
+        storage: storage2,
+        transport: transport2,
+        oracle: oracle2,
+        tokenStorage,
+        autoGenerate: true,
+        nametag: 'taken',
       });
+
+      sphere2.on('nametag:publish-failed', (payload) => {
+        publishFailedEvents.push(payload);
+      });
+
+      // The mint landed (so the identity reflects the claim immediately),
+      // but the detached publish handler hasn't run yet.
+      expect(sphere2.identity!.nametag).toBe('taken');
+
+      // Wait for the detached handler to settle. The mock publish promise
+      // resolves on the next microtask; the rollback chain spans several
+      // additional microtasks AND real `proper-lockfile` file I/O via
+      // `clearNametagByName` → `setNametag` → `save`, then
+      // `persistAddressNametags`. Pure microtask draining doesn't cover
+      // the lockfile's setImmediate / setTimeout-based fsync, and CI
+      // runners (especially the slower Node 20 lane) need more wall
+      // budget than the previous 5×setTimeout(0) afforded. Mirror the
+      // `flushBackgroundPublish` shape from
+      // `tests/unit/core/Sphere.mint-before-publish.test.ts` — fixed
+      // 200 ms lead + microtask/macrotask interleave — and poll until
+      // the event lands (bounded ~5 s).
+      await new Promise((r) => setTimeout(r, 200));
+      for (let i = 0; i < 50 && publishFailedEvents.length === 0; i++) {
+        await Promise.resolve();
+        await new Promise((r) => setImmediate(r));
+        await new Promise((r) => setTimeout(r, 100));
+      }
+
+      // Detached handler observed the relay rejection and rolled back.
+      expect(publishFailedEvents).toHaveLength(1);
+      expect(publishFailedEvents[0]).toMatchObject({
+        nametag: 'taken',
+        reason: 'taken',
+        rolledBack: true,
+      });
+      expect(sphere2.identity!.nametag).toBeUndefined();
 
       // Nametag is still owned by wallet 1's pubkey on Nostr
       expect(nostrRelayNametags.has('taken')).toBe(true);
+      await sphere2.destroy();
     });
 
     it('should allow same nametag when re-importing same mnemonic', async () => {
