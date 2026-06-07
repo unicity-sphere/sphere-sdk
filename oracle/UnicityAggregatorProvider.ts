@@ -123,10 +123,22 @@ export class UnicityAggregatorProvider implements OracleProvider {
   private aggregatorClient: AggregatorClient | null = null;
   private stateTransitionClient: StateTransitionClient | null = null;
   private trustBase: RootTrustBase | null = null;
+  /** Raw trust-base JSON as loaded (kept so the v2 token engine can re-parse it). */
+  private trustBaseJson: unknown | null = null;
 
   /** Get the current trust base */
   getTrustBase(): RootTrustBase | null {
     return this.trustBase;
+  }
+
+  /** Raw trust-base JSON (for constructing the v2 token engine); null if loaded as an object. */
+  getTrustBaseJson(): unknown | null {
+    return this.trustBaseJson;
+  }
+
+  /** The aggregator URL this provider is configured against. */
+  getAggregatorUrl(): string {
+    return this.config.url;
   }
 
   /** Get the state transition client */
@@ -203,6 +215,7 @@ export class UnicityAggregatorProvider implements OracleProvider {
       try {
         const trustBaseJson = await this.config.trustBaseLoader.load();
         if (trustBaseJson) {
+          this.trustBaseJson = trustBaseJson;
           this.trustBase = RootTrustBase.fromJSON(trustBaseJson);
         }
       } catch (error) {

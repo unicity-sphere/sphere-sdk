@@ -13,7 +13,6 @@ import type {
   SphereValue,
   SphereToken,
   TokenBlob,
-  SphereNetwork,
   MintParams,
   MintDataTokenParams,
   TransferParams,
@@ -111,18 +110,17 @@ export interface ITokenEngine {
  * this shape may gain fields there without affecting the ITokenEngine contract.
  */
 export interface EngineConfig {
-  /** Target network; selects NetworkId and the default trust base. */
-  readonly network: SphereNetwork;
   /** Aggregator (gateway) base URL the StateTransitionClient talks to. */
   readonly aggregatorUrl: string;
   /** Wallet signing key (secp256k1 private scalar, 32 bytes). Held inside the engine only. */
   readonly privateKey: Uint8Array;
   /**
-   * Optional explicit root-trust-base JSON. When omitted, the factory uses the
-   * built-in default for `network`. Typed `unknown` to keep SDK types out of
-   * the public surface (the factory parses it internally).
+   * Root-trust-base JSON. The single source of truth for the network — the engine's
+   * NetworkId is taken from it (`RootTrustBase.networkId` via `NetworkId.fromId`), so
+   * any network id works (e.g. testnet2 = 4) with no enum entry. Typed `unknown` to
+   * keep SDK types off the public surface (the factory parses it internally).
    */
-  readonly trustBaseJson?: unknown;
+  readonly trustBaseJson: unknown;
   /** Inclusion-proof poll cadence in ms (engine owns the await policy; Spike S1). */
   readonly proofPollIntervalMs?: number;
   /** Inclusion-proof overall timeout in ms (0/undefined = no engine-side cap). */

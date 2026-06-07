@@ -118,7 +118,7 @@ import {
   isSQLiteDatabase,
   isWalletDatEncrypted,
 } from '../serialization/wallet-dat';
-import { deriveDirectAddress } from '../token-engine';
+import { createSphereTokenEngine, deriveDirectAddress, type ITokenEngine } from '../token-engine';
 import { normalizeNametag, isPhoneNumber } from '@unicitylabs/nostr-js-sdk';
 
 export function isValidNametag(nametag: string): boolean {
@@ -480,6 +480,8 @@ export class Sphere {
   private _transport: TransportProvider;
   private _oracle: OracleProvider;
   private _priceProvider: PriceProvider | null;
+  /** v2 token engine (built per active address from the oracle); injected into modules. */
+  private _tokenEngine: ITokenEngine | undefined;
 
   // Modules (single-instance — backward compat, delegates to active address)
   private _payments: PaymentsModule;
@@ -4190,6 +4192,40 @@ export class Sphere {
     this._lastProviderConnected.clear();
   }
 
+  /**
+   * Construct the v2 token engine for the active address from the oracle's gateway
+   * URL + trust base and this address's signing key. The trust base is the single
+   * source of truth for the network id (so any id works — e.g. testnet2 = 4 — with
+   * no enum entry). Returns undefined (modules keep their legacy path) when the
+   * oracle can't supply a trust base / url, or construction fails — a misconfigured
+   * oracle never breaks initialization.
+   */
+  private async buildTokenEngine(): Promise<ITokenEngine | undefined> {
+    const oracle = this._oracle as {
+      getTrustBaseJson?: () => unknown;
+      getAggregatorUrl?: () => string;
+    };
+    const trustBaseJson = oracle.getTrustBaseJson?.() ?? null;
+    const aggregatorUrl = oracle.getAggregatorUrl?.();
+    if (!trustBaseJson || !aggregatorUrl || !this._identity?.privateKey) {
+      logger.warn('Sphere', 'v2 token engine not constructed (oracle has no trust base / url, or no identity) — legacy path');
+      return undefined;
+    }
+    try {
+      return await createSphereTokenEngine({
+        aggregatorUrl,
+        privateKey: hexToBytes(this._identity.privateKey),
+        trustBaseJson,
+      });
+    } catch (err) {
+      logger.warn(
+        'Sphere',
+        `Failed to construct v2 token engine — modules use the legacy path: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return undefined;
+    }
+  }
+
   private async initializeModules(): Promise<void> {
     const emitEvent = this.emitEvent.bind(this);
 
@@ -4197,6 +4233,11 @@ export class Sphere {
     // from the start. The original transport stays connected for resolve operations.
     const adapter = await this.ensureTransportMux(this._currentAddressIndex, this._identity!);
     const moduleTransport: TransportProvider = adapter ?? this._transport;
+
+    // Build the v2 token engine for this active address (from the oracle's gateway +
+    // trust base + this address's key). Injected into the caller modules below.
+    this._tokenEngine = await this.buildTokenEngine();
+    const tokenEngine = this._tokenEngine;
 
     this._payments.initialize({
       identity: this._identity!,
@@ -4209,6 +4250,7 @@ export class Sphere {
       chainCode: this._masterKey?.chainCode || undefined,
       price: this._priceProvider ?? undefined,
       disabledProviderIds: this._disabledProviders,
+      tokenEngine,
     });
 
     this._communications.initialize({
@@ -4252,6 +4294,7 @@ export class Sphere {
           on: this.on.bind(this),
           storage: this._storage,
           communications: this._communications,
+          tokenEngine,
         });
       } else {
         logger.warn('Sphere', 'Accounting module enabled but no token storage available — disabling');

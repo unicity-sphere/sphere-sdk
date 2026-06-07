@@ -22,7 +22,6 @@ describe('createSphereTokenEngine', () => {
   it('wires an engine from sphere-domain config (no network)', async () => {
     const privateKey = SigningService.generatePrivateKey();
     const engine = await createSphereTokenEngine({
-      network: 'local',
       aggregatorUrl: 'http://localhost:3000',
       privateKey,
       trustBaseJson: TRUST_BASE_JSON,
@@ -32,12 +31,22 @@ describe('createSphereTokenEngine', () => {
     expect(await engine.deriveIdentityAddress()).toMatch(/^DIRECT:\/\//);
   });
 
+  it('takes the network id from the trust base — non-standard ids work (e.g. testnet2 = 4)', async () => {
+    const engine = await createSphereTokenEngine({
+      aggregatorUrl: 'http://localhost:3000',
+      privateKey: SigningService.generatePrivateKey(),
+      trustBaseJson: { ...TRUST_BASE_JSON, networkId: 4 },
+    });
+    // Construction succeeds: NetworkId.fromId(4) is valid; no enum entry needed.
+    expect(engine.getIdentity().chainPubkey).toBeInstanceOf(Uint8Array);
+  });
+
   it('rejects a config without a trust base', async () => {
     await expect(
       createSphereTokenEngine({
-        network: 'local',
         aggregatorUrl: 'http://localhost:3000',
         privateKey: SigningService.generatePrivateKey(),
+        trustBaseJson: null,
       }),
     ).rejects.toThrow();
   });
