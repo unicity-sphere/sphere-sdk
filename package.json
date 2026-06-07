@@ -92,7 +92,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsup",
+    "build": "tsup && npm run build:types",
+    "build:types": "tsc --emitDeclarationOnly --declarationMap false && node scripts/copy-dcts.mjs",
     "build:watch": "tsup --watch",
     "clean": "rm -rf dist",
     "prepublishOnly": "npm run clean && npm run build",
