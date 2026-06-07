@@ -4985,22 +4985,51 @@ export class Sphere {
    * Register a nametag for the current active address
    * Each address can have its own independent nametag
    *
+   * **Publish mode** (issue #42):
+   * - `'background'` (default): mint is in-band; the Nostr binding
+   *   publish is **fire-and-forget**. `registerNametag` resolves as
+   *   soon as the on-chain mint lands and local state is updated;
+   *   the relay write runs detached. Publish failures
+   *   (`NAMETAG_TAKEN` from the relay, network errors) surface via
+   *   the `'nametag:publish-failed'` event with rollback of orphan
+   *   mints for deterministic rejections. This is the load-bearing
+   *   fix for issue #42: a stalled or flaky relay no longer blocks
+   *   `sphere init --nametag` for the full CLI timeout. The relay
+   *   binding is re-published by `syncIdentityWithTransport` on
+   *   every subsequent wallet load, so missed first attempts are
+   *   self-healing.
+   * - `'await'`: publish is awaited and a relay rejection
+   *   (`NAMETAG_TAKEN`) or network throw fails the call synchronously
+   *   with rollback. Use when the caller MUST know about
+   *   relay collisions before treating the registration as complete
+   *   and is willing to block indefinitely on a slow relay.
+   *
+   * Why background is the default: the on-chain mint is the load-bearing
+   * step (irreversible, gas-spending, ownership-establishing). The Nostr
+   * binding is a discoverability cache — `syncIdentityWithTransport`
+   * republishes it on every wallet load, so a missed first attempt is
+   * self-healing.
+   *
    * @example
    * ```ts
-   * // Register nametag for first address (index 0)
+   * // Default — fast, fire-and-forget Nostr publish
    * await sphere.registerNametag('alice');
    *
-   * // Switch to second address and register different nametag
-   * await sphere.switchToAddress(1);
-   * await sphere.registerNametag('bob');
+   * // Strict — block until publish succeeds OR is deterministically rejected
+   * await sphere.registerNametag('alice', { publishMode: 'await' });
    *
-   * // Now:
-   * // - Address 0 has nametag @alice
-   * // - Address 1 has nametag @bob
+   * // React to background publish failure (e.g. surface a banner in UI)
+   * sphere.on('nametag:publish-failed', ({ nametag, reason, rolledBack }) => {
+   *   // Show: "@${nametag} claim couldn't reach the relay (${reason})"
+   * });
    * ```
    */
-  async registerNametag(nametag: string): Promise<void> {
+  async registerNametag(
+    nametag: string,
+    options?: { publishMode?: 'await' | 'background' },
+  ): Promise<void> {
     this.ensureReady();
+    const publishMode = options?.publishMode ?? 'background';
 
     // Normalize and validate nametag format
     const cleanNametag = this.cleanNametag(nametag);
@@ -5061,60 +5090,51 @@ export class Sphere {
       );
     }
 
-    // 2. Publish identity binding with nametag to Nostr AFTER minting
-    //    succeeds. The publish step is a relay write — failures are
-    //    DISTINCT from aggregator-mint failures and need a separate
-    //    error code so operators can act correctly:
-    //      - AGGREGATOR_ERROR (above): bad oracle, retry-later
-    //      - NAMETAG_TAKEN (here): the name is owned on the relay by a
-    //        different pubkey, no amount of retry will fix it
-    if (this._transport.publishIdentityBinding) {
-      const success = await this._transport.publishIdentityBinding(
-        this._identity!.chainPubkey,
-        this._identity!.l1Address,
-        this._identity!.directAddress || '',
-        cleanNametag,
-      );
-      if (!success) {
-        // Rollback an orphaned mint: if THIS call minted the nametag and
-        // the public claim then failed, the local store has a token we
-        // can't legitimately advertise. Leaving it would trip
-        // NAMETAG_CONFLICT on every subsequent registerNametag attempt
-        // with a different name. The on-chain token itself is permanent
-        // — minting is irreversible — but we drop the local pointer so
-        // the wallet's state is consistent. (If the conflict on the
-        // relay ever clears, the deterministic-salt mint will recover
-        // the same token via REQUEST_ID_EXISTS.)
-        if (mintedFresh) {
-          try {
-            await this._payments.clearNametagByName(cleanNametag);
-            logger.debug(
-              'Sphere',
-              `Rolled back orphan local nametag entry for "@${cleanNametag}" after publish failure`,
-            );
-          } catch (rollbackErr) {
-            logger.warn(
-              'Sphere',
-              `Failed to roll back nametag "@${cleanNametag}" after publish failure (continuing):`,
-              rollbackErr,
-            );
-          }
-        }
-        const restoredSuffix = mintedFresh
-          ? ` The orphan local nametag entry from THIS attempt has been rolled back.`
-          : ``;
-        throw new SphereError(
-          `Cannot claim Unicity ID "@${cleanNametag}" on the relay — the binding ` +
-          `event was rejected. Most commonly this means another wallet already ` +
-          `owns "@${cleanNametag}" on this relay (the relay enforces uniqueness ` +
-          `independently of the aggregator).${restoredSuffix} Retry with a ` +
-          `different --nametag, or contact relay ops if you expected to own this name.`,
-          'NAMETAG_TAKEN',
+    // 2. Publish identity binding with nametag to Nostr.
+    //
+    //    Two modes:
+    //    - 'await' preserves the strict legacy contract: surface a relay
+    //      rejection (NAMETAG_TAKEN) synchronously, rollback orphan
+    //      mints, fail the whole call. Used when the caller MUST know
+    //      about relay collisions before treating the registration as
+    //      complete and is willing to block indefinitely.
+    //    - 'background' (default, issue #42) is FIRE-AND-FORGET: the
+    //      publish is scheduled after local state lands (step 3) and
+    //      the caller's promise resolves immediately. This decouples
+    //      the relay write from the user-visible operation, fixing
+    //      the `init --nametag` stall that motivated the issue.
+    //      Failures surface via the `'nametag:publish-failed'` event;
+    //      see `_handleDetachedPublishOutcome` for the detail.
+    if (publishMode === 'await') {
+      if (this._transport.publishIdentityBinding) {
+        const success = await this._transport.publishIdentityBinding(
+          this._identity!.chainPubkey,
+          this._identity!.l1Address,
+          this._identity!.directAddress || '',
+          cleanNametag,
         );
+        if (!success) {
+          await this._rollbackOrphanNametagMint(cleanNametag, mintedFresh);
+          const restoredSuffix = mintedFresh
+            ? ` The orphan local nametag entry from THIS attempt has been rolled back.`
+            : ``;
+          throw new SphereError(
+            `Cannot claim Unicity ID "@${cleanNametag}" on the relay — the binding ` +
+            `event was rejected. Most commonly this means another wallet already ` +
+            `owns "@${cleanNametag}" on this relay (the relay enforces uniqueness ` +
+            `independently of the aggregator).${restoredSuffix} Retry with a ` +
+            `different --nametag, or contact relay ops if you expected to own this name.`,
+            'NAMETAG_TAKEN',
+          );
+        }
       }
     }
 
-    // 3. Update local state
+    // 3. Update local state. In `await` mode, we reach this point only
+    //    after the publish succeeded. In `background` mode, we reach
+    //    this point AS SOON AS the on-chain mint succeeded — the relay
+    //    publish runs detached below (step 4) and feeds
+    //    `nametag:publish-failed` on failure.
     this._identity!.nametag = cleanNametag;
     await this._updateCachedProxyAddress();
 
@@ -5129,22 +5149,28 @@ export class Sphere {
       nametags.set(0, cleanNametag);
     }
 
-    // Persist nametag cache. Steelman⁵³ WARNING: at this point Nostr
-    // already advertises @cleanNametag bound to our pubkey (step 2),
-    // so a persistence failure here would leave local-vs-relay
-    // inconsistent — the next cold load() would not see the
-    // nametag in local state. Best-effort: catch the persistence
-    // failure, surface a typed error to the caller, but do NOT
-    // throw. The relay binding remains authoritative (sync on
-    // next switchToAddress / postSwitchSync recovers the nametag
-    // via transport lookup).
+    // Persist nametag cache.
+    //
+    // In `await` mode (legacy): at this point Nostr already advertises
+    // @cleanNametag bound to our pubkey (step 2), so a persistence
+    // failure here would leave local-vs-relay inconsistent — the next
+    // cold load() would not see the nametag in local state. Best-
+    // effort: catch the persistence failure, log it, but do NOT throw.
+    // The relay binding remains authoritative (sync on next
+    // switchToAddress / postSwitchSync recovers the nametag via
+    // transport lookup).
+    //
+    // In `background` mode: persistence happens BEFORE the relay
+    // publish settles, so a persistence failure means the wallet's
+    // local state will be reconstructed from the relay binding on next
+    // load. Same best-effort semantics.
     try {
       await this.persistAddressNametags();
     } catch (persistErr) {
       logger.warn(
         'Sphere',
-        `registerNametag: relay binding succeeded for @${cleanNametag} but ` +
-          `local persistence failed (${persistErr instanceof Error ? persistErr.message : String(persistErr)}). ` +
+        `registerNametag: local persistence failed for @${cleanNametag} ` +
+          `(${persistErr instanceof Error ? persistErr.message : String(persistErr)}). ` +
           `Next load() will recover via Nostr lookup.`,
       );
     }
@@ -5154,6 +5180,161 @@ export class Sphere {
       addressIndex: this._currentAddressIndex,
     });
     logger.debug('Sphere', `Unicity ID registered for address ${this._currentAddressIndex}:`, cleanNametag);
+
+    // 4. Detached publish (issue #42, `'background'` mode only).
+    //
+    //    Fire-and-forget — the caller has already gotten the success
+    //    they wanted (mint landed, identity reflects the claim).
+    //    Publish failures surface via `nametag:publish-failed` so
+    //    apps can react. Deterministic rejections (relay says
+    //    "taken") roll back the orphan mint pointer in the async
+    //    handler so a subsequent register-with-a-different-name
+    //    attempt isn't gated by NAMETAG_CONFLICT.
+    //
+    //    `void` is intentional — we don't re-await this. The promise
+    //    is detached from the caller's resolution path.
+    if (publishMode === 'background' && this._transport.publishIdentityBinding) {
+      const publishPromise = this._transport.publishIdentityBinding(
+        this._identity!.chainPubkey,
+        this._identity!.l1Address,
+        this._identity!.directAddress || '',
+        cleanNametag,
+      );
+      void this._handleDetachedPublishOutcome(
+        cleanNametag,
+        mintedFresh,
+        publishPromise,
+      );
+    }
+  }
+
+  /**
+   * Issue #42 — detached-publish observer for the bounded-race branch
+   * of `registerNametag`. Attaches to a publish promise that already
+   * started in step 2 of `registerNametag` (the in-flight wire
+   * operation we couldn't / didn't want to wait for synchronously).
+   * Failures are reported via the `nametag:publish-failed` event,
+   * never re-thrown.
+   *
+   * Mirrors the rollback semantics of the `await`-mode failure path:
+   * a deterministic `false` return from publish (relay says taken)
+   * rolls back the orphan local mint pointer AND clears
+   * `_identity.nametag` so a subsequent registration attempt with a
+   * different name isn't blocked by NAMETAG_CONFLICT. Transient
+   * errors (network / disconnect) do NOT roll back —
+   * `syncIdentityWithTransport` republishes on next wallet load.
+   */
+  private async _handleDetachedPublishOutcome(
+    cleanNametag: string,
+    mintedFresh: boolean,
+    publishPromise: Promise<boolean>,
+  ): Promise<void> {
+    try {
+      const success = await publishPromise;
+      if (success) {
+        return;
+      }
+
+      // Relay rejected — treat as `taken` (deterministic, no retry).
+      let rolledBack = false;
+      if (mintedFresh) {
+        try {
+          await this._payments.clearNametagByName(cleanNametag);
+          rolledBack = true;
+          // Clear the in-memory identity claim too — without this,
+          // `_identity.nametag` still says the claimed name while
+          // the wallet's nametag store has been cleared, an
+          // inconsistency that would confuse the next address-switch
+          // post-sync.
+          if (this._identity?.nametag === cleanNametag) {
+            this._identity.nametag = undefined;
+            await this._updateCachedProxyAddress();
+          }
+          const currentAddressId = this._trackedAddresses.get(this._currentAddressIndex)?.addressId;
+          if (currentAddressId) {
+            const nametagsMap = this._addressNametags.get(currentAddressId);
+            if (nametagsMap?.get(0) === cleanNametag) {
+              nametagsMap.delete(0);
+              try {
+                await this.persistAddressNametags();
+              } catch (persistErr) {
+                logger.warn(
+                  'Sphere',
+                  `Background publish rollback persistence failed for @${cleanNametag} (continuing):`,
+                  persistErr,
+                );
+              }
+            }
+          }
+          logger.debug(
+            'Sphere',
+            `Rolled back orphan local nametag entry for "@${cleanNametag}" after background publish failure`,
+          );
+        } catch (rollbackErr) {
+          logger.warn(
+            'Sphere',
+            `Failed to roll back nametag "@${cleanNametag}" after background publish failure (continuing):`,
+            rollbackErr,
+          );
+        }
+      }
+
+      logger.warn(
+        'Sphere',
+        `Background publish rejected "@${cleanNametag}" — relay says the name is taken by another pubkey. ` +
+          (rolledBack
+            ? `Local mint pointer has been rolled back.`
+            : `Local mint pointer was preserved (pre-existing).`),
+      );
+
+      this.emitEvent('nametag:publish-failed', {
+        nametag: cleanNametag,
+        reason: 'taken',
+        rolledBack,
+      });
+    } catch (err) {
+      // Transient (network / disconnect / internal). Do NOT roll back —
+      // `syncIdentityWithTransport` will republish on next load and
+      // the relay may still accept us. Surface the failure for
+      // observability.
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      logger.warn(
+        'Sphere',
+        `Background publish for "@${cleanNametag}" threw (transient — will republish on next load):`,
+        errorMsg,
+      );
+      this.emitEvent('nametag:publish-failed', {
+        nametag: cleanNametag,
+        reason: 'error',
+        error: errorMsg,
+        rolledBack: false,
+      });
+    }
+  }
+
+  /**
+   * Rollback an orphaned mint when synchronous publish fails (the
+   * `await`-mode path). Extracted for symmetry with the background-
+   * mode rollback logic.
+   */
+  private async _rollbackOrphanNametagMint(
+    cleanNametag: string,
+    mintedFresh: boolean,
+  ): Promise<void> {
+    if (!mintedFresh) return;
+    try {
+      await this._payments.clearNametagByName(cleanNametag);
+      logger.debug(
+        'Sphere',
+        `Rolled back orphan local nametag entry for "@${cleanNametag}" after publish failure`,
+      );
+    } catch (rollbackErr) {
+      logger.warn(
+        'Sphere',
+        `Failed to roll back nametag "@${cleanNametag}" after publish failure (continuing):`,
+        rollbackErr,
+      );
+    }
   }
 
   /**
