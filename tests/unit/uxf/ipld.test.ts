@@ -249,6 +249,36 @@ describe('elementToIpldBlock', () => {
     const hash = computeElementHash(el);
     expect(cidToContentHash(block.cid)).toBe(hash);
   });
+
+  it('header[3] predecessor encoded as Tag 42 CID-link (#435 wire-shape)', () => {
+    // Issue #435 — predecessor refs ride in the canonical CBOR as Tag
+    // 42 CID-links so Kubo's recursive pin / `/dag/export` walkers
+    // traverse instance-chain edges natively.
+    //
+    // The self-consistency test above (`block bytes hash to the block
+    // CID`) would still pass under a regression to `hexToBytes(predecessor)`
+    // because both `computeElementHash` and `elementToIpldBlock` share
+    // `buildCanonicalHeader`. This test inspects the dag-cbor-decoded
+    // wire bytes directly to guard against that silent drift.
+    const predecessorHex = '11'.repeat(32);
+    const el: UxfElement = {
+      header: { representation: 1, semantics: 1, kind: 'default', predecessor: contentHash(predecessorHex) },
+      type: 'token-state',
+      content: { predicate: 'a0'.repeat(32), data: null },
+      children: {},
+    };
+    const block = elementToIpldBlock(el);
+    const decoded = dagCborDecode(block.bytes) as Record<string, unknown>;
+    const header = decoded.header as unknown[];
+    expect(Array.isArray(header)).toBe(true);
+    const wirePredecessor = header[3];
+    expect(wirePredecessor).toBeInstanceOf(CID);
+    const wirePredCid = wirePredecessor as CID;
+    expect(wirePredCid.code).toBe(0x71);
+    expect(wirePredCid.multihash.code).toBe(0x12);
+    expect(wirePredCid.multihash.digest.byteLength).toBe(32);
+    expect(wirePredCid.multihash.digest).toEqual(new Uint8Array(32).fill(0x11));
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -80,13 +80,42 @@ export function contentHashToCid(hash: ContentHash): CID {
 /**
  * Extract the SHA-256 digest from a CID and return as a ContentHash.
  *
- * @throws UxfError if the CID does not use sha2-256 hashing.
+ * Validates three dimensions at the parse boundary so a hostile or
+ * corrupt CID can't sneak past with a partially-correct shape:
+ *
+ *   1. **Multicodec** — `cid.code === 0x71` (dag-cbor). UXF CIDs are
+ *      always dag-cbor; accepting a raw-codec (0x55) CID with a
+ *      matching sha2-256 digest would let an adversary bind a
+ *      manifest entry to a raw-bytes block instead of an element
+ *      block.
+ *   2. **Multihash code** — `cid.multihash.code === 0x12` (sha2-256).
+ *      Other hash algorithms are out of spec.
+ *   3. **Digest length** — exactly 32 bytes. The deleted
+ *      `decodeChildBytes` helper enforced this; restoring the check
+ *      here preserves the fail-fast diagnostic ('must be 32 bytes,
+ *      got N') instead of producing a malformed ContentHash that
+ *      later trips the `contentHash()` brand validator with a less
+ *      informative 'Invalid content hash' error.
+ *
+ * @throws UxfError(SERIALIZATION_ERROR) on any of the above.
  */
 export function cidToContentHash(cid: CID): ContentHash {
+  if (cid.code !== DAG_CBOR_CODE) {
+    throw new UxfError(
+      'SERIALIZATION_ERROR',
+      `Expected dag-cbor (0x71) multicodec, got 0x${cid.code.toString(16)}`,
+    );
+  }
   if (cid.multihash.code !== SHA256_CODE) {
     throw new UxfError(
       'SERIALIZATION_ERROR',
       `Expected sha2-256 (0x12) multihash, got 0x${cid.multihash.code.toString(16)}`,
+    );
+  }
+  if (cid.multihash.digest.length !== 32) {
+    throw new UxfError(
+      'SERIALIZATION_ERROR',
+      `Expected sha2-256 digest of 32 bytes, got ${cid.multihash.digest.length}`,
     );
   }
   return contentHash(bytesToHex(cid.multihash.digest));

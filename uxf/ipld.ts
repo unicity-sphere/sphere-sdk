@@ -383,9 +383,16 @@ export async function importFromCar(car: Uint8Array): Promise<UxfPackageData> {
     unknown
   >;
 
-  // Extract manifest CID from envelope
-  const manifestCid = envelopeNode.manifest;
-  if (!(manifestCid instanceof CID)) {
+  // Extract manifest CID from envelope.
+  //
+  // Use `CID.asCID(value)` rather than `instanceof CID` so the check
+  // survives cross-realm decoders (Webpack code-splitting, worker_threads,
+  // separate vm contexts) where `@ipld/dag-cbor`'s CID instance is from
+  // a different module realm than the one imported here. The multiformats
+  // library documents `CID.asCID` as the canonical predicate; raw
+  // `instanceof` silently rejects every legitimate CID in those builds.
+  const manifestCid = CID.asCID(envelopeNode.manifest);
+  if (manifestCid === null) {
     throw new UxfError(
       'SERIALIZATION_ERROR',
       'Envelope does not contain a valid manifest CID link',
@@ -519,13 +526,16 @@ export async function importFromCar(car: Uint8Array): Promise<UxfPackageData> {
         `Invalid manifest tokenId: ${tokenId.slice(0, 32)}…`,
       );
     }
-    if (!(cid instanceof CID)) {
+    // Use `CID.asCID` for the same cross-realm reason as the envelope
+    // decode above — `instanceof` is unsafe across module realms.
+    const manifestEntryCid = CID.asCID(cid);
+    if (manifestEntryCid === null) {
       throw new UxfError(
         'SERIALIZATION_ERROR',
         `Manifest value for tokenId ${tokenId} is not a CID`,
       );
     }
-    tokens.set(tokenId, cidToContentHash(cid));
+    tokens.set(tokenId, cidToContentHash(manifestEntryCid));
   }
   const manifest: UxfManifest = { tokens };
 
@@ -691,11 +701,24 @@ export async function importFromCar(car: Uint8Array): Promise<UxfPackageData> {
 // ---------------------------------------------------------------------------
 
 /**
- * Build the canonical form for hashing (same as in hash.ts computeElementHash).
+ * Build the canonical form for hashing (same as in hash.ts
+ * computeElementHash). The unknown-type guard mirrors hash.ts so the
+ * IPLD encoder and the content-hash computer fail symmetrically on
+ * an unrecognised element type — without this guard, a future schema
+ * change adding a `UxfElementType` without updating `ELEMENT_TYPE_IDS`
+ * would silently produce `{type: undefined}` here (dag-cbor encodes
+ * it) while computeElementHash throws, breaking the bit-identical
+ * canonical-form invariant.
  */
 function buildCanonicalForm(element: UxfElement): Record<string, unknown> {
   const header = buildCanonicalHeader(element);
   const typeId = ELEMENT_TYPE_IDS[element.type];
+  if (typeId === undefined) {
+    throw new UxfError(
+      'INVALID_HASH',
+      `Unknown element type: ${String(element.type)}`,
+    );
+  }
   const preparedContent = prepareContentForHashing(
     element.type,
     element.content as Record<string, unknown>,
@@ -766,16 +789,33 @@ function decodeIpldElement(node: {
   assertHeaderVersionField(hdrArray[1], 'IPLD element header[1] (semantics)');
   assertHeaderKindField(hdrArray[2], 'IPLD element header[2] (kind)');
 
-  // Issue #435 — predecessor is a Tag 42 CID-link (sha2-256, dag-cbor)
+  // Issue #435 — predecessor is a Tag 42 CID-link (dag-cbor, sha2-256)
   // or `null`. The producer (`buildCanonicalHeader`) emits a `CID`
   // instance; nothing else is accepted. `cidToContentHash` enforces
-  // the multihash code is 0x12 (sha2-256) and surfaces a clear
-  // serialization error otherwise.
+  // codec + multihash + digest length (steelman remediation against
+  // hostile / corrupt CIDs).
+  //
+  // `CID.asCID` rather than `instanceof CID` for cross-realm safety —
+  // see the envelope decode above.
+  //
+  // Branch on `Uint8Array` BEFORE the generic catch-all so legacy
+  // Option-C bundles (the pre-#435 encoding) get a specific error
+  // message that distinguishes 'sender on old firmware' from
+  // 'genuinely corrupt bytes' during the cutover window.
   const predecessor = hdrArray[3];
   let predecessorHash: ContentHash | null = null;
-  if (predecessor instanceof CID) {
-    predecessorHash = cidToContentHash(predecessor);
-  } else if (predecessor !== null && predecessor !== undefined) {
+  const predecessorCid = predecessor != null ? CID.asCID(predecessor) : null;
+  if (predecessorCid !== null) {
+    predecessorHash = cidToContentHash(predecessorCid);
+  } else if (predecessor === null || predecessor === undefined) {
+    // null head of an instance chain — no predecessor link.
+  } else if (predecessor instanceof Uint8Array) {
+    throw new UxfError(
+      'SERIALIZATION_ERROR',
+      `IPLD element header[3] (predecessor) is a Uint8Array (legacy PR-#213 Option C ` +
+        `encoding) — wallets must re-mint / re-receive per issue #435.`,
+    );
+  } else {
     throw new UxfError(
       'SERIALIZATION_ERROR',
       `IPLD element header[3] (predecessor) must be a Tag 42 CID-link or null, ` +
@@ -899,12 +939,20 @@ function decodeIpldChildren(
   for (const [key, value] of Object.entries(children)) {
     if (value === null) {
       result[key] = null;
-    } else if (value instanceof CID) {
-      result[key] = cidToContentHash(value);
+      continue;
+    }
+    // Use `CID.asCID(value)` rather than `instanceof CID` so the check
+    // survives cross-realm decoders (Webpack code-splitting,
+    // worker_threads, separate vm contexts) — see the envelope decode
+    // above for the rationale.
+    const valueCid = CID.asCID(value);
+    if (valueCid !== null) {
+      result[key] = cidToContentHash(valueCid);
     } else if (Array.isArray(value)) {
       result[key] = value.map((item, index) => {
-        if (item instanceof CID) {
-          return cidToContentHash(item);
+        const itemCid = CID.asCID(item);
+        if (itemCid !== null) {
+          return cidToContentHash(itemCid);
         }
         throw new UxfError(
           'SERIALIZATION_ERROR',
