@@ -332,6 +332,35 @@ describe('SwapModule — getSwapStatus / getSwaps', () => {
     });
   });
 
+  it('UT-SWAP-STATUS-013: queryEscrow=true on a lazy-loaded terminal swap is refused (DM would be dropped)', async () => {
+    // The downstream `status_result` DM handler resolves the swap via
+    // `this.swaps.get` — it has no path for lazy-loading from storage,
+    // so an escrow response to a lazy-loaded swap is silently dropped
+    // on arrival. `getSwapStatus` must therefore refuse the DM in the
+    // first place, even when the caller explicitly opted in. This test
+    // pins that contract.
+    const ref = createTestSwapRef({ progress: 'completed' });
+    const addressId = mocks.identity.directAddress!;
+    const storageKey = `${addressId}_swap:${ref.swapId}`;
+    mocks.storage._data.set(
+      storageKey,
+      JSON.stringify({ version: 1, swap: ref }),
+    );
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (module as any).terminalSwapIds.add(ref.swapId);
+
+    // Caller explicitly asks for an escrow query. The lazy-load path
+    // logs a debug line and skips the DM.
+    const result = await module.getSwapStatus(ref.swapId, { queryEscrow: true });
+
+    expect(result.swapId).toBe(ref.swapId);
+    // Give the fire-and-forget chain a tick to settle so a regression
+    // that DID send the DM has a chance to be observed by the mock.
+    await new Promise((r) => setTimeout(r, 10));
+    expect(mocks.communications.sendDM).not.toHaveBeenCalled();
+    expect(mocks.resolve).not.toHaveBeenCalled();
+  });
+
   it('UT-SWAP-STATUS-012: lazy-load prefers the in-memory entry when both exist (no double-read)', async () => {
     // If a swap is in `this.swaps` AND in storage (e.g. an active swap
     // that just transitioned to terminal in this process), the in-
