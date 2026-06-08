@@ -221,7 +221,7 @@ Expected — bob's list now shows an entry with `swapId: 0000…` (the first 16 
 ```bash
 # T2 — poll-and-wait pattern
 for i in {1..20}; do
-  sphere swap list --role acceptor | grep -q "${SWAP_ID:0:16}" && break
+  sphere swap list --role acceptor | grep -q "${SWAP_ID:0:8}" && break
   sleep 3
 done
 sphere swap list --role acceptor
@@ -430,7 +430,7 @@ sphere wallet use bob
 sphere balance | tee /tmp/bob-pre-B.txt
 # Poll until bob sees the new proposal:
 for i in {1..20}; do
-  sphere swap list --role acceptor | grep -q "${SWAP_B:0:16}" && break
+  sphere swap list --role acceptor | grep -q "${SWAP_B:0:8}" && break
   sleep 3
 done
 # Reject with an explanatory reason:

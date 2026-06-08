@@ -200,6 +200,26 @@ echo "BASELINE bob   UCT=$bob_uct_0    ETH=$bob_eth_0"
 EXPECTED_50_UCT=50000000000000000000   # 50 × 10^18
 EXPECTED_5_ETH=5000000000000000000     #  5 × 10^18
 
+# ---------------------------------------------------------------------------
+# Section 2.5 — Escrow liveness pre-flight
+#
+# Without this, an unreachable escrow surfaces as
+# `FAIL: couldn't extract swap_id from alice-propose-A.log` at §3, which
+# misdirects operators to debug the propose command. A direct ping
+# narrows the failure to "escrow not online" before we burn any swap
+# state.
+# ---------------------------------------------------------------------------
+banner "Section 2.5: Escrow liveness pre-flight ($ESCROW)"
+
+cd "$PEER_ALICE"
+sphere wallet use alice
+if ! sphere swap ping "$ESCROW" 2>&1 | tee "$SNAP/alice-escrow-ping.log"; then
+  echo "ASSERT FAIL (escrow-unreachable): $ESCROW did not respond to swap ping" >&2
+  echo "Hint: set ESCROW=<addr> to point at a different escrow service." >&2
+  exit 1
+fi
+echo "ASSERT OK (escrow-reachable): $ESCROW responded"
+
 # ===========================================================================
 # Scenario A — Full swap roundtrip
 # ===========================================================================
@@ -242,7 +262,7 @@ sphere wallet use bob
 DEADLINE=$(( $(date +%s) + 90 ))
 PROPOSAL_SEEN=0
 while (( $(date +%s) < DEADLINE )); do
-  sphere payments sync 2>&1 > "$SNAP/bob-pre-list-A.log" || true
+  sphere payments sync > "$SNAP/bob-pre-list-A.log" 2>&1 || true
   sphere swap list --role acceptor 2>&1 | tee "$SNAP/bob-swap-list-A.log" || true
   # swap-list prints only the first 8 hex chars in its SWAP ID column.
   if grep -qE "${SWAP_A:0:8}" "$SNAP/bob-swap-list-A.log"; then
@@ -289,7 +309,7 @@ sphere wallet use alice
 DEADLINE=$(( $(date +%s) + 120 ))
 ANNOUNCED=0
 while (( $(date +%s) < DEADLINE )); do
-  sphere payments sync 2>&1 > "$SNAP/alice-pre-deposit-sync.log" || true
+  sphere payments sync > "$SNAP/alice-pre-deposit-sync.log" 2>&1 || true
   sphere swap status "$SWAP_A" 2>&1 | tee "$SNAP/alice-swap-status-pre-deposit.log" || true
   # `progress: announced`, `progress: depositing`, or `progress: awaiting_counter`
   # all indicate the escrow's announce_result has been processed.
@@ -317,6 +337,15 @@ sphere swap deposit "$SWAP_A" 2>&1 | tee "$SNAP/alice-deposit-A.log"
 # transition, and exits 0 only when local progress reaches 'completed'.
 # We run alice in the background and bob in the foreground so the
 # script blocks until BOTH return.
+#
+# Subshell exit-code semantics (load-bearing): `set -euo pipefail` is
+# inherited by the subshell. `sphere swap wait | tee` is a 2-stage
+# pipeline. With `pipefail`, the pipeline's exit code is the first
+# non-zero stage — so a non-zero exit from sphere swap wait (terminal
+# state with --exit-on-failure → 1, or timeout → 124) propagates
+# through tee (which is always 0) to the subshell's exit. `wait $PID`
+# then captures it correctly. If a future edit drops the subshell or
+# replaces `tee` with a write that can fail, this contract breaks.
 # ---------------------------------------------------------------------------
 banner "Section 7: Both parties wait for swap completion"
 
@@ -480,7 +509,7 @@ if [[ "$SCENARIO" == *"B"* ]]; then
   DEADLINE=$(( $(date +%s) + 90 ))
   PROPOSAL_SEEN=0
   while (( $(date +%s) < DEADLINE )); do
-    sphere payments sync 2>&1 > /dev/null || true
+    sphere payments sync >/dev/null 2>&1 || true
     sphere swap list --role acceptor 2>&1 | tee "$SNAP/bob-swap-list-B.log" || true
     if grep -qE "${SWAP_B:0:8}" "$SNAP/bob-swap-list-B.log"; then
       PROPOSAL_SEEN=1
@@ -491,7 +520,10 @@ if [[ "$SCENARIO" == *"B"* ]]; then
   (( PROPOSAL_SEEN == 1 )) \
     || { echo "ASSERT FAIL (B-proposal-ingest): bob did not see proposal B within 90s" >&2; exit 1; }
 
-  sphere swap reject "$SWAP_B" --reason "soak: declining for B" --json \
+  # NOTE: deliberately NOT using --json — assert_grep below targets the
+  # human renderer's unquoted "key : value" form rather than the
+  # double-quoted JSON shape that formatOutput emits in --json mode.
+  sphere swap reject "$SWAP_B" --reason "soak: declining for B" \
     2>&1 | tee "$SNAP/bob-reject-B.log"
   assert_grep "B-reject-state" 'new_state[[:space:]]*:[[:space:]]*cancelled' \
     "$SNAP/bob-reject-B.log" || rc=1
@@ -504,7 +536,7 @@ if [[ "$SCENARIO" == *"B"* ]]; then
   DEADLINE=$(( $(date +%s) + 90 ))
   CANCEL_SEEN=0
   while (( $(date +%s) < DEADLINE )); do
-    sphere payments sync 2>&1 > /dev/null || true
+    sphere payments sync >/dev/null 2>&1 || true
     sphere swap status "$SWAP_B" 2>&1 | tee "$SNAP/alice-swap-status-B.log" || true
     if grep -qE 'progress[[:space:]]*:[[:space:]]*cancelled' "$SNAP/alice-swap-status-B.log"; then
       CANCEL_SEEN=1
@@ -518,10 +550,10 @@ if [[ "$SCENARIO" == *"B"* ]]; then
 
   banner "Section B.4: No balance changes from Scenario B"
   cd "$PEER_ALICE"; sphere wallet use alice
-  sphere payments sync 2>&1 > /dev/null || true
+  sphere payments sync >/dev/null 2>&1 || true
   sphere balance | tee "$SNAP/alice-balance-post-B.txt"
   cd "$PEER_BOB"; sphere wallet use bob
-  sphere payments sync 2>&1 > /dev/null || true
+  sphere payments sync >/dev/null 2>&1 || true
   sphere balance | tee "$SNAP/bob-balance-post-B.txt"
 
   alice_uct_post_B=$(extract_confirmed_smallest_units UCT < "$SNAP/alice-balance-post-B.txt")
@@ -581,7 +613,9 @@ if [[ "$SCENARIO" == *"C"* ]]; then
   # state-aware cancel takes the pre-announce branch and exits without
   # waiting for any escrow round-trip.
   banner "Section C.2: Alice cancels the swap (pre-announce)"
-  sphere swap cancel "$SWAP_C" --json 2>&1 | tee "$SNAP/alice-cancel-C.log"
+  # See note in §B.2 — human renderer's "key : value" lines are what
+  # assert_grep targets.
+  sphere swap cancel "$SWAP_C" 2>&1 | tee "$SNAP/alice-cancel-C.log"
   assert_grep "C-cancel-state" 'new_state[[:space:]]*:[[:space:]]*cancelled' \
     "$SNAP/alice-cancel-C.log" || rc=1
   assert_grep "C-cancel-prev-state" 'prev_state[[:space:]]*:[[:space:]]*(proposed|accepted)' \
@@ -594,7 +628,7 @@ if [[ "$SCENARIO" == *"C"* ]]; then
     "$SNAP/alice-cancel-C.log" || rc=1
 
   banner "Section C.3: No balance changes from Scenario C"
-  sphere payments sync 2>&1 > /dev/null || true
+  sphere payments sync >/dev/null 2>&1 || true
   sphere balance | tee "$SNAP/alice-balance-post-C.txt"
   alice_uct_post_C=$(extract_confirmed_smallest_units UCT < "$SNAP/alice-balance-post-C.txt")
   alice_eth_post_C=$(extract_confirmed_smallest_units ETH < "$SNAP/alice-balance-post-C.txt")
