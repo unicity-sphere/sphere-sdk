@@ -5,6 +5,9 @@ import {
   IpfsPinger,
   NostrPinger,
   DEFAULT_BACKOFF_SCHEDULE_MS,
+  DEFAULT_FAILURE_THRESHOLD,
+  AGGREGATOR_RETRY_BACKOFFS_MS,
+  isTransientAggregatorError,
   type ConnectivityStatus,
   type Pinger,
   type PingResult,
@@ -96,7 +99,10 @@ describe('ConnectivityManager', () => {
 
     it('respects 5/15/60/300s backoff schedule on consecutive failures', async () => {
       const agg = new MockPinger('aggregator', 'down');
-      const m = new ConnectivityManager([agg]);
+      // failureThreshold:1 — this test pre-dates #424 and asserts
+      // immediate-flip semantics. Threshold behaviour is exercised in
+      // its dedicated block.
+      const m = new ConnectivityManager([agg], { failureThreshold: 1 });
       m.start();
       // 1st probe fires on microtask.
       await drain();
@@ -185,7 +191,9 @@ describe('ConnectivityManager', () => {
   describe('subscribers and events', () => {
     it('notifies subscribers on every state transition', async () => {
       const agg = new MockPinger('aggregator', 'down');
-      const m = new ConnectivityManager([agg]);
+      // failureThreshold:1 — pre-#424 immediate-flip semantics; this test
+      // is about subscriber notification, not about threshold behaviour.
+      const m = new ConnectivityManager([agg], { failureThreshold: 1 });
       const seen: ConnectivityStatus[] = [];
       m.subscribe((s) => { seen.push(s); });
       m.start();
@@ -234,8 +242,11 @@ describe('ConnectivityManager', () => {
       const ipfs = new MockPinger('ipfs', 'up');
       const nostr = new MockPinger('nostr', 'up');
       const events: Array<{ type: string; payload: ConnectivityStatus }> = [];
+      // failureThreshold:1 — this test asserts an immediate flip on a
+      // single failure. The #424 threshold block covers default-2 semantics.
       const m = new ConnectivityManager([agg, ipfs, nostr], {
         emitEvent: (type, payload) => { events.push({ type, payload }); },
+        failureThreshold: 1,
       });
       m.start();
       await drain();
@@ -279,7 +290,8 @@ describe('ConnectivityManager', () => {
   describe('probe error handling', () => {
     it('treats a throwing pinger as down', async () => {
       const agg = new MockPinger('aggregator', 'throw');
-      const m = new ConnectivityManager([agg]);
+      // failureThreshold:1 — pre-#424 immediate-flip semantics.
+      const m = new ConnectivityManager([agg], { failureThreshold: 1 });
       m.start();
       await drain();
       expect(m.status().aggregator).toBe('down');
@@ -293,7 +305,8 @@ describe('ConnectivityManager', () => {
         backend: 'aggregator',
         ping: () => new Promise(() => undefined), // never resolves
       };
-      const m = new ConnectivityManager([slowAgg], { pingTimeoutMs: 100 });
+      // failureThreshold:1 — pre-#424 immediate-flip semantics.
+      const m = new ConnectivityManager([slowAgg], { pingTimeoutMs: 100, failureThreshold: 1 });
       m.start();
       // 1st probe is enqueued
       await drain();
@@ -455,23 +468,32 @@ describe('AggregatorPinger', () => {
     // `aggregatorClient` is null (pre-`initialize()`), so the pinger
     // correctly classifies an uninitialized provider as offline rather
     // than silently treating `0` as a real round value.
+    //
+    // Issue #424: retries disabled here (`retryBackoffsMs: []`) to
+    // preserve the original test intent — verify the FINAL outcome is
+    // 'down' — without adding real-time retry budget.
     const stub = new AggregatorPinger({
       provider: {
         getCurrentRound: async () => {
           throw new Error('UnicityAggregatorProvider: aggregator client not initialized');
         },
       },
+      retryBackoffsMs: [],
     });
     expect(await stub.ping(new AbortController().signal)).toBe('down');
 
     const generic = new AggregatorPinger({
       provider: { getCurrentRound: async () => { throw new Error('503'); } },
+      retryBackoffsMs: [],
     });
     expect(await generic.ping(new AbortController().signal)).toBe('down');
   });
 
   it('returns down when neither provider nor URL is supplied', async () => {
-    const p = new AggregatorPinger({});
+    // Issue #424: retries disabled — the 'down' path exits early (no URL,
+    // no provider) without going through the retry loop, but we disable
+    // explicitly to guard against future changes in that code path.
+    const p = new AggregatorPinger({ retryBackoffsMs: [] });
     expect(await p.ping(new AbortController().signal)).toBe('down');
   });
 
@@ -487,9 +509,12 @@ describe('AggregatorPinger', () => {
 
   it('reports down when URL-mode fetch fails', async () => {
     const fetchImpl = vi.fn(async () => { throw new Error('ECONNREFUSED'); });
+    // Issue #424: retries disabled to avoid real-time backoff in this
+    // legacy test. Retry behaviour is covered in the #424 block.
     const p = new AggregatorPinger({
       url: 'https://example.com/rpc',
       fetchImpl: fetchImpl as unknown as typeof fetch,
+      retryBackoffsMs: [],
     });
     expect(await p.ping(new AbortController().signal)).toBe('down');
   });
@@ -552,5 +577,388 @@ describe('NostrPinger', () => {
 describe('DEFAULT_BACKOFF_SCHEDULE_MS', () => {
   it('matches the spec: 5/15/60/300 seconds', () => {
     expect(DEFAULT_BACKOFF_SCHEDULE_MS).toEqual([5_000, 15_000, 60_000, 300_000]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #424: AggregatorPinger flake resilience
+// ---------------------------------------------------------------------------
+
+describe('AggregatorPinger flake resilience (issue #424)', () => {
+  // Use real timers — the retry-loop's sleepWithAbort schedules sub-ms
+  // backoffs (we override the schedule to [0, 0, 0]) and real timers
+  // keep the test logic simple.
+  beforeEach(() => {
+    vi.useRealTimers();
+  });
+
+  describe('quick in-probe retry', () => {
+    it('returns "up" when a transient error throws then a retry succeeds', async () => {
+      let calls = 0;
+      const p = new AggregatorPinger({
+        provider: {
+          getCurrentRound: async () => {
+            calls += 1;
+            if (calls < 2) throw new Error('fetch failed');
+            return 42;
+          },
+        },
+        retryBackoffsMs: [0, 0, 0],
+      });
+      expect(await p.ping(new AbortController().signal)).toBe('up');
+      expect(calls).toBe(2);
+    });
+
+    it('retries through two transient throws then succeeds on the third attempt', async () => {
+      let calls = 0;
+      const p = new AggregatorPinger({
+        provider: {
+          getCurrentRound: async () => {
+            calls += 1;
+            if (calls < 3) throw new Error('ECONNRESET');
+            return 7;
+          },
+        },
+        retryBackoffsMs: [0, 0, 0],
+      });
+      expect(await p.ping(new AbortController().signal)).toBe('up');
+      expect(calls).toBe(3);
+    });
+
+    it('returns "down" only after exhausting the retry budget', async () => {
+      let calls = 0;
+      const p = new AggregatorPinger({
+        provider: {
+          getCurrentRound: async () => {
+            calls += 1;
+            throw new Error('fetch failed');
+          },
+        },
+        retryBackoffsMs: [0, 0, 0],
+      });
+      expect(await p.ping(new AbortController().signal)).toBe('down');
+      // 1 initial + 3 retries = 4 attempts total
+      expect(calls).toBe(4);
+    });
+
+    it('disables retries when retryBackoffsMs is empty (legacy single-attempt behaviour)', async () => {
+      let calls = 0;
+      const p = new AggregatorPinger({
+        provider: {
+          getCurrentRound: async () => {
+            calls += 1;
+            throw new Error('fetch failed');
+          },
+        },
+        retryBackoffsMs: [],
+      });
+      expect(await p.ping(new AbortController().signal)).toBe('down');
+      expect(calls).toBe(1);
+    });
+  });
+
+  describe('error classification', () => {
+    it('does NOT retry on HTTP 4xx (permanent error)', async () => {
+      const fetchImpl = vi.fn(async () =>
+        new Response('', { status: 400, statusText: 'Bad Request' }),
+      );
+      const p = new AggregatorPinger({
+        url: 'https://example.com/rpc',
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        retryBackoffsMs: [0, 0, 0],
+      });
+      expect(await p.ping(new AbortController().signal)).toBe('down');
+      // Only one fetch call — no retries for permanent errors.
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    });
+
+    it('retries on HTTP 5xx (transient server error)', async () => {
+      let calls = 0;
+      const fetchImpl = vi.fn(async () => {
+        calls += 1;
+        if (calls < 3) return new Response('', { status: 503, statusText: 'Unavailable' });
+        return new Response(JSON.stringify({ result: 42 }), { status: 200 });
+      });
+      const p = new AggregatorPinger({
+        url: 'https://example.com/rpc',
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        retryBackoffsMs: [0, 0, 0],
+      });
+      expect(await p.ping(new AbortController().signal)).toBe('up');
+      expect(fetchImpl).toHaveBeenCalledTimes(3);
+    });
+
+    it('retries on HTTP 429 (rate-limit)', async () => {
+      let calls = 0;
+      const fetchImpl = vi.fn(async () => {
+        calls += 1;
+        if (calls < 2) return new Response('', { status: 429, statusText: 'Too Many Requests' });
+        return new Response(JSON.stringify({ result: 1 }), { status: 200 });
+      });
+      const p = new AggregatorPinger({
+        url: 'https://example.com/rpc',
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        retryBackoffsMs: [0, 0, 0],
+      });
+      expect(await p.ping(new AbortController().signal)).toBe('up');
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+    });
+
+    it('classifier returns true for network-error shapes', () => {
+      expect(isTransientAggregatorError(new Error('fetch failed'))).toBe(true);
+      expect(isTransientAggregatorError(new Error('ECONNRESET'))).toBe(true);
+      expect(isTransientAggregatorError(new Error('ECONNREFUSED'))).toBe(true);
+      expect(isTransientAggregatorError(new Error('ENOTFOUND'))).toBe(true);
+      expect(isTransientAggregatorError(new Error('ETIMEDOUT'))).toBe(true);
+      expect(isTransientAggregatorError(new Error('EAI_AGAIN'))).toBe(true);
+      const abortErr = new Error('aborted');
+      abortErr.name = 'AbortError';
+      expect(isTransientAggregatorError(abortErr)).toBe(true);
+    });
+
+    it('classifier returns false for HTTP 4xx (except 429)', () => {
+      expect(isTransientAggregatorError(new Error('HTTP 400 Bad Request from x'))).toBe(false);
+      expect(isTransientAggregatorError(new Error('HTTP 401 Unauthorized from x'))).toBe(false);
+      expect(isTransientAggregatorError(new Error('HTTP 404 Not Found from x'))).toBe(false);
+      // 429 is the explicit exception — rate-limit is retryable.
+      expect(isTransientAggregatorError(new Error('HTTP 429 Too Many Requests from x'))).toBe(true);
+    });
+
+    it('classifier returns true for HTTP 5xx', () => {
+      expect(isTransientAggregatorError(new Error('HTTP 500 Internal Server Error'))).toBe(true);
+      expect(isTransientAggregatorError(new Error('HTTP 502 Bad Gateway'))).toBe(true);
+      expect(isTransientAggregatorError(new Error('HTTP 503 Service Unavailable'))).toBe(true);
+    });
+
+    it('classifier returns true for non-Error / unknown shapes (lenient default)', () => {
+      expect(isTransientAggregatorError('plain string')).toBe(true);
+      expect(isTransientAggregatorError(null)).toBe(true);
+      expect(isTransientAggregatorError({ foo: 'bar' })).toBe(true);
+      expect(isTransientAggregatorError(new Error('totally unrecognised'))).toBe(true);
+    });
+  });
+
+  describe('abort propagation', () => {
+    it('returns "down" immediately when the caller aborts before the first attempt', async () => {
+      const ctrl = new AbortController();
+      ctrl.abort();
+      let calls = 0;
+      const p = new AggregatorPinger({
+        provider: {
+          getCurrentRound: async () => {
+            calls += 1;
+            return 1;
+          },
+        },
+        retryBackoffsMs: [50, 50, 50],
+      });
+      expect(await p.ping(ctrl.signal)).toBe('down');
+      expect(calls).toBe(0);
+    });
+
+    it('returns "down" when the caller aborts mid-backoff between attempts', async () => {
+      let calls = 0;
+      const ctrl = new AbortController();
+      const p = new AggregatorPinger({
+        provider: {
+          getCurrentRound: async () => {
+            calls += 1;
+            throw new Error('fetch failed');
+          },
+        },
+        // Long enough backoff for the abort to land mid-sleep.
+        retryBackoffsMs: [200, 200, 200],
+      });
+      const promise = p.ping(ctrl.signal);
+      // Let the first attempt run and start sleeping.
+      await new Promise<void>((r) => setTimeout(r, 20));
+      ctrl.abort();
+      expect(await promise).toBe('down');
+      // Only the first attempt ran; we aborted during the first backoff.
+      expect(calls).toBe(1);
+    });
+  });
+
+  describe('AGGREGATOR_RETRY_BACKOFFS_MS', () => {
+    it('matches the [100, 500, 2000] schedule', () => {
+      expect(AGGREGATOR_RETRY_BACKOFFS_MS).toEqual([100, 500, 2000]);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #424: ConnectivityManager consecutive-failure threshold
+// ---------------------------------------------------------------------------
+
+describe('ConnectivityManager consecutive-failure threshold (issue #424)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers({
+      toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'],
+    });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** Drain microtasks + zero-delay timers. */
+  async function drainLocal(): Promise<void> {
+    for (let i = 0; i < 20; i++) {
+      await vi.advanceTimersByTimeAsync(0);
+    }
+  }
+
+  it('DEFAULT_FAILURE_THRESHOLD is 2', () => {
+    expect(DEFAULT_FAILURE_THRESHOLD).toBe(2);
+  });
+
+  it('a single failed probe does NOT flip status to "down" (threshold=2)', async () => {
+    const agg = new MockPinger('aggregator', 'down');
+    const m = new ConnectivityManager([agg], { failureThreshold: 2 });
+    m.start();
+    await drainLocal();
+    // First probe failed but status is still 'unknown' (held previous).
+    expect(agg.calls).toBe(1);
+    expect(m.status().aggregator).toBe('unknown');
+    await m.stop();
+  });
+
+  it('flips to "down" only after N consecutive failures', async () => {
+    const agg = new MockPinger('aggregator', 'down');
+    const m = new ConnectivityManager([agg], { failureThreshold: 3 });
+    m.start();
+    await drainLocal();
+    expect(agg.calls).toBe(1);
+    expect(m.status().aggregator).toBe('unknown');
+
+    // 2nd failure (after 5s) — still not flipped (threshold is 3).
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(agg.calls).toBe(2);
+    expect(m.status().aggregator).toBe('unknown');
+
+    // 3rd failure (after 15s) — now flips to 'down'.
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(agg.calls).toBe(3);
+    expect(m.status().aggregator).toBe('down');
+
+    await m.stop();
+  });
+
+  it('threshold=1 reproduces the legacy "flip on first failure" behaviour', async () => {
+    const agg = new MockPinger('aggregator', 'down');
+    const m = new ConnectivityManager([agg], { failureThreshold: 1 });
+    m.start();
+    await drainLocal();
+    expect(m.status().aggregator).toBe('down');
+    await m.stop();
+  });
+
+  it('a single success after "down" flips back to "up" immediately (fast recovery)', async () => {
+    const agg = new MockPinger('aggregator', 'down');
+    const m = new ConnectivityManager([agg], { failureThreshold: 2 });
+    m.start();
+    await drainLocal();
+    expect(m.status().aggregator).toBe('unknown');
+
+    // Second failure (5s) — flips to 'down'.
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(m.status().aggregator).toBe('down');
+
+    // Now flip the mock to up; the next scheduled probe (at 15s from
+    // last) will return 'up'.
+    agg.result = 'up';
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(m.status().aggregator).toBe('up');
+
+    await m.stop();
+  });
+
+  it('resets the failure counter on success — alternating fail/pass never flips', async () => {
+    let n = 0;
+    const flaky: Pinger = {
+      backend: 'aggregator',
+      ping: async () => {
+        n += 1;
+        return n % 2 === 1 ? 'down' : 'up';
+      },
+    };
+    const m = new ConnectivityManager([flaky], { failureThreshold: 2 });
+    m.start();
+    await drainLocal();
+    // 1st: down → counter=1, prev='unknown', status stays 'unknown'.
+    expect(m.status().aggregator).toBe('unknown');
+    // 2nd (at 5s): up → counter resets, status flips to 'up'.
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(m.status().aggregator).toBe('up');
+    // 3rd (at 5s after up): down → counter=1, status stays 'up'.
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(m.status().aggregator).toBe('up');
+    // 4th: up → counter resets, status stays 'up'.
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(m.status().aggregator).toBe('up');
+    await m.stop();
+  });
+
+  it('default threshold (no config) is 2 — one failure does not flip', async () => {
+    const agg = new MockPinger('aggregator', 'down');
+    const m = new ConnectivityManager([agg]); // no config → DEFAULT_FAILURE_THRESHOLD = 2
+    m.start();
+    await drainLocal();
+    expect(m.status().aggregator).toBe('unknown');
+    // Second failure flips it.
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(m.status().aggregator).toBe('down');
+    await m.stop();
+  });
+
+  it('subscriber is NOT notified on a suppressed failure (status unchanged)', async () => {
+    const agg = new MockPinger('aggregator', 'down');
+    const m = new ConnectivityManager([agg], { failureThreshold: 2 });
+    const seen: ConnectivityStatus[] = [];
+    m.subscribe((s) => { seen.push(s); });
+    m.start();
+    await drainLocal();
+    // First failure suppressed — no transition, no notification.
+    expect(seen).toHaveLength(0);
+    // Second failure flips to 'down' — notification fires.
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.aggregator).toBe('down');
+    await m.stop();
+  });
+
+  it('backoff schedule still advances even on suppressed failures', async () => {
+    // Verify no regression: the 5/15/60/300 backoff still climbs for
+    // consecutive failures regardless of whether status flipped.
+    const agg = new MockPinger('aggregator', 'down');
+    const m = new ConnectivityManager([agg], { failureThreshold: 5 });
+    m.start();
+    await drainLocal();
+    expect(agg.calls).toBe(1);
+    // Failures 1-5 — all suppressed (threshold=5) but schedule
+    // climbs identically to the all-flips case.
+    await vi.advanceTimersByTimeAsync(5_000);   // step 0 → 5s
+    expect(agg.calls).toBe(2);
+    await vi.advanceTimersByTimeAsync(15_000);  // step 1 → 15s
+    expect(agg.calls).toBe(3);
+    await vi.advanceTimersByTimeAsync(60_000);  // step 2 → 60s
+    expect(agg.calls).toBe(4);
+    await vi.advanceTimersByTimeAsync(300_000); // step 3 → 300s
+    expect(agg.calls).toBe(5);
+    // 5th failure meets the threshold — status flips to 'down'.
+    expect(m.status().aggregator).toBe('down');
+    await m.stop();
+  });
+
+  it('throws on invalid failureThreshold (zero / negative / non-integer)', () => {
+    expect(() =>
+      new ConnectivityManager([new MockPinger('aggregator')], { failureThreshold: 0 }),
+    ).toThrow(/failureThreshold/);
+    expect(() =>
+      new ConnectivityManager([new MockPinger('aggregator')], { failureThreshold: -1 }),
+    ).toThrow(/failureThreshold/);
+    expect(() =>
+      new ConnectivityManager([new MockPinger('aggregator')], { failureThreshold: 1.5 }),
+    ).toThrow(/failureThreshold/);
   });
 });
