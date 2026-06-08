@@ -813,6 +813,53 @@ export class SwapModule {
   }
 
   /**
+   * Lazy-load a terminal swap record from per-swap storage. Used by
+   * {@link getSwapStatus} after a cache miss on {@link swaps} — see the
+   * comment there for why terminal swaps are deliberately kept out of
+   * the in-memory working set.
+   *
+   * Returns null when:
+   *   - the id is not in {@link terminalSwapIds} (truly unknown — guards
+   *     against fetching arbitrary keys, including unrelated namespaces
+   *     that happen to share the {@code swap:} prefix on misuse).
+   *   - the storage read or JSON parse fails.
+   *   - the persisted record lacks a {@code swap} field.
+   *
+   * The loaded record is NOT inserted into {@link swaps} — callers that
+   * need repeated access should hold the returned ref. Keeping the
+   * terminal working set out of memory preserves the bound that
+   * {@link loadFromStorage} establishes ({@code terminalPurgeTtlMs}
+   * window × cardinality), which can be hundreds of swaps for a heavy
+   * wallet.
+   */
+  private async loadTerminalSwapFromStorage(swapId: string): Promise<SwapRef | null> {
+    if (!this.terminalSwapIds.has(swapId)) return null;
+    const deps = this.deps;
+    if (!deps) return null;
+
+    const addressId = deps.identity.directAddress
+      ? deps.identity.directAddress
+      : deps.identity.chainPubkey;
+    const swapKey = getAddressStorageKey(
+      addressId,
+      `${STORAGE_KEYS_ADDRESS.SWAP_RECORD_PREFIX}${swapId}`,
+    );
+
+    try {
+      const raw = await deps.storage.get(swapKey);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw) as SwapStorageData;
+      if (parsed.version > 1) {
+        logger.warn(LOG_TAG, `Terminal swap ${swapId} has version ${parsed.version}, expected 1. Attempting best-effort load.`);
+      }
+      return parsed.swap ?? null;
+    } catch (err) {
+      logger.warn(LOG_TAG, `Failed to load terminal swap ${swapId} from storage:`, err);
+      return null;
+    }
+  }
+
+  /**
    * Remove a single swap from storage (per-swap key) and update the index.
    */
   private async removeSwapFromStorage(swapId: string): Promise<void> {
@@ -2150,9 +2197,22 @@ export class SwapModule {
     this.ensureNotDestroyed();
     this.ensureReady();
 
-    const swap = this.swaps.get(swapId);
+    let swap = this.swaps.get(swapId);
     if (!swap) {
-      throw new SphereError(`Swap not found: ${swapId}`, 'SWAP_NOT_FOUND');
+      // Terminal swaps are deliberately omitted from `this.swaps` at
+      // load time (see `loadFromStorage`) to keep memory bounded — a
+      // long-lived wallet can accumulate hundreds of terminal entries
+      // inside the `terminalPurgeTtlMs` window. `getSwapStatus` is the
+      // one public surface where callers legitimately want to query a
+      // terminal swap (e.g. a soak verification that the swap reached
+      // `completed` after a fresh-CLI restart), so fall through to
+      // storage on demand. The loaded record is NOT inserted into
+      // `this.swaps` — that map stays the active-swap working set.
+      const terminalSwap = await this.loadTerminalSwapFromStorage(swapId);
+      if (!terminalSwap) {
+        throw new SphereError(`Swap not found: ${swapId}`, 'SWAP_NOT_FOUND');
+      }
+      swap = terminalSwap;
     }
 
     // Determine whether to query the escrow for the latest state.
