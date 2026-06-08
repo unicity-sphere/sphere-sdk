@@ -366,6 +366,44 @@ export class NostrTransportProvider implements TransportProvider {
   // Flag to prevent re-subscription after suppressSubscriptions()
   private _subscriptionsSuppressed = false;
 
+  // ---------------------------------------------------------------------------
+  // Issue #423 — handler-readiness gate
+  //
+  // Pre-#423: connect()/setIdentity() called subscribeToEvents() inline, opening
+  // the relay subscription BEFORE any caller had registered handlers via
+  // onTokenTransfer/onMessage/etc. When Sphere uses the MultiAddressTransportMux
+  // path, handlers are registered on the MUX ADAPTER, not on this outer
+  // provider — so the outer subscription would fire TOKEN_TRANSFER events at
+  // an empty handler set, route them through the defensive `pendingTransfers`
+  // buffer, and pin `lastEventTs` (issues #223 / #247). That produced the
+  // "[AT-LEAST-ONCE] TOKEN_TRANSFER ... not durable" warn storm in soak logs.
+  //
+  // Fix: defer subscribeToEvents() until ARMED. Three ways to arm:
+  //   1. Explicit `armSubscriptions()` call — Sphere uses this after wiring
+  //      all modules (the bootstrap-time path).
+  //   2. First `on*` handler registration — backward compatibility for
+  //      consumers that register handlers directly on this provider (the
+  //      non-mux path) without knowing about the gate.
+  //   3. `suppressSubscriptions()` — mux is taking over; the gate becomes
+  //      irrelevant because we won't subscribe anyway.
+  //
+  // `pendingArm` records that connect/setIdentity wanted to subscribe but the
+  // gate was closed. When the gate opens (via #1 or #2), we drain the pending
+  // arm. Reconnect-after-disconnect re-checks armed state so a relay reconnect
+  // before arming does not bypass the gate. The state is "sticky": once armed,
+  // re-arming is a no-op and subscriptions stay live for the rest of the
+  // session.
+  //
+  // The `pendingTransfers` buffer (around line 2298) becomes effectively dead
+  // code in the common Sphere paths now — events can no longer arrive before
+  // a handler is wired. It is kept as defense-in-depth and STILL warns at the
+  // `[AT-LEAST-ONCE] not durable` site, because if it ever fires post-#423,
+  // something genuinely unexpected is happening (e.g., a backfill burst that
+  // outraces the handler-attach sequence) and an operator should see it.
+  // ---------------------------------------------------------------------------
+  private subscriptionsArmed = false;
+  private pendingArm = false;
+
   // ===========================================================================
   // BaseProvider Implementation
   // ===========================================================================
@@ -428,7 +466,11 @@ export class NostrTransportProvider implements TransportProvider {
           logger.debug('Nostr', 'NostrClient reconnected to relay:', url);
           this.emitEvent({ type: 'transport:connected', timestamp: Date.now() });
           // Re-establish subscriptions — the relay drops them on disconnect.
-          this.subscribeToEvents().catch((err) => {
+          // Issue #423: gated on the readiness arm. If the original session
+          // was never armed (e.g., mux took over before any direct handler
+          // registered), the re-subscribe path is a no-op until something
+          // arms us. Once armed, reconnects re-subscribe automatically.
+          this.maybeSubscribe().catch((err) => {
             logger.error('Nostr', 'Failed to re-subscribe after reconnect:', err);
           });
           // The reconnected socket starts a fresh ping timer; under
@@ -458,9 +500,15 @@ export class NostrTransportProvider implements TransportProvider {
       this.emitEvent({ type: 'transport:connected', timestamp: Date.now() });
       logger.debug('Nostr', 'Connected to', this.nostrClient.getConnectedRelays().size, 'relays');
 
-      // Set up subscriptions
+      // Set up subscriptions — gated on the handler-readiness arm (#423).
+      // When the gate is closed, record `pendingArm` so `armSubscriptions()`
+      // can drain it once handlers are wired. Without the gate, a relay event
+      // could land before any consumer registered a handler (the pre-Mux race
+      // in the Sphere bootstrap), and the outer transport would route through
+      // the `pendingTransfers` defensive buffer, emit the "not durable" warn,
+      // and pin `lastEventTs`.
       if (this.identity) {
-        await this.subscribeToEvents();
+        await this.maybeSubscribe();
       }
     } catch (error) {
       this.status = 'error';
@@ -700,7 +748,12 @@ export class NostrTransportProvider implements TransportProvider {
           )), this.config.timeout)
         ),
       ]);
-      await this.subscribeToEvents();
+      // Issue #423 — gate on handler-readiness arm. The previous identity may
+      // have armed subscriptions already, in which case `maybeSubscribe()`
+      // proceeds. Otherwise it records `pendingArm` so the next arming call
+      // (`armSubscriptions()` or first handler registration) opens the
+      // subscription against the new identity.
+      await this.maybeSubscribe();
       // The fresh NostrClient started its own ping timers on connect.
       // If subscriptions were suppressed (mux owns event routing), the
       // bare client should not ping — see suppressSubscriptions() docstring.
@@ -709,8 +762,8 @@ export class NostrTransportProvider implements TransportProvider {
       }
       oldClient.disconnect();
     } else if (this.isConnected()) {
-      // Already connected with right key, just subscribe
-      await this.subscribeToEvents();
+      // Already connected with right key, just subscribe (gated; #423).
+      await this.maybeSubscribe();
     }
   }
 
@@ -778,6 +831,10 @@ export class NostrTransportProvider implements TransportProvider {
 
   onMessage(handler: MessageHandler): () => void {
     this.messageHandlers.add(handler);
+    // Issue #423 — auto-arm the readiness gate so the relay subscription
+    // opens once a handler exists (backward compat for consumers that
+    // don't call `armSubscriptions()` explicitly).
+    this.autoArmOnHandlerRegistration();
 
     // Flush any messages that arrived before this handler was registered
     if (this.pendingMessages.length > 0) {
@@ -859,13 +916,22 @@ export class NostrTransportProvider implements TransportProvider {
 
   onTokenTransfer(handler: TokenTransferHandler): () => void {
     this.transferHandlers.add(handler);
+    // Issue #423 — auto-arm the readiness gate. Subscription opens here
+    // for direct-on-outer-provider consumers; for the mux path the gate
+    // is suppressed and no subscription opens on the outer provider.
+    this.autoArmOnHandlerRegistration();
 
     // Issue #247 — drain any TOKEN_TRANSFER events that arrived BEFORE
-    // this handler was registered (the pre-Mux window race documented
-    // in `handleTokenTransfer`). Buffer is snapshotted and cleared
-    // atomically before the (async) handler calls — events arriving
-    // during the drain take the live path (`transferHandlers.size > 0`
-    // is true now) and won't double-buffer.
+    // this handler was registered. With #423 in place the gate prevents
+    // subscriptions from opening before handlers attach, so this drain
+    // should be effectively dead code in the Sphere bootstrap path. It
+    // is retained as defense-in-depth (no-op when the buffer is empty)
+    // for any pathological case the gate cannot cover.
+    //
+    // Buffer is snapshotted and cleared atomically before the (async)
+    // handler calls — events arriving during the drain take the live
+    // path (`transferHandlers.size > 0` is true now) and won't
+    // double-buffer.
     //
     // Per-event durability propagation: if the handler returns truthy
     // (or undefined), advance `lastEventTs` so the event doesn't
@@ -958,6 +1024,7 @@ export class NostrTransportProvider implements TransportProvider {
 
   onPaymentRequest(handler: PaymentRequestHandler): () => void {
     this.paymentRequestHandlers.add(handler);
+    this.autoArmOnHandlerRegistration(); // Issue #423
     return () => this.paymentRequestHandlers.delete(handler);
   }
 
@@ -998,6 +1065,7 @@ export class NostrTransportProvider implements TransportProvider {
 
   onPaymentRequestResponse(handler: PaymentRequestResponseHandler): () => void {
     this.paymentRequestResponseHandlers.add(handler);
+    this.autoArmOnHandlerRegistration(); // Issue #423
     return () => this.paymentRequestResponseHandlers.delete(handler);
   }
 
@@ -1020,6 +1088,7 @@ export class NostrTransportProvider implements TransportProvider {
 
   onReadReceipt(handler: ReadReceiptHandler): () => void {
     this.readReceiptHandlers.add(handler);
+    this.autoArmOnHandlerRegistration(); // Issue #423
     return () => this.readReceiptHandlers.delete(handler);
   }
 
@@ -1044,6 +1113,7 @@ export class NostrTransportProvider implements TransportProvider {
 
   onTypingIndicator(handler: TypingIndicatorHandler): () => void {
     this.typingIndicatorHandlers.add(handler);
+    this.autoArmOnHandlerRegistration(); // Issue #423
     return () => this.typingIndicatorHandlers.delete(handler);
   }
 
@@ -1065,6 +1135,7 @@ export class NostrTransportProvider implements TransportProvider {
 
   onComposing(handler: ComposingHandler): () => void {
     this.composingHandlers.add(handler);
+    this.autoArmOnHandlerRegistration(); // Issue #423
     return () => this.composingHandlers.delete(handler);
   }
 
@@ -2831,6 +2902,94 @@ export class NostrTransportProvider implements TransportProvider {
   // Chat EOSE handlers — fired once when relay finishes delivering stored DMs
   private chatEoseHandlers: Array<() => void> = [];
   private chatEoseFired = false;
+
+  // ---------------------------------------------------------------------------
+  // Issue #423 — handler-readiness gate (public + helpers)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Issue #423 — explicitly arm subscriptions. Call this AFTER all message
+   * handlers (`onTokenTransfer`, `onMessage`, `onPaymentRequest`, etc.) have
+   * been registered on this provider, so relay events arrive at fully-wired
+   * handlers and do NOT fall into the defensive `pendingTransfers` buffer
+   * that triggers the "[AT-LEAST-ONCE] not durable" warn.
+   *
+   * Idempotent: subsequent calls are no-ops once subscriptions are armed.
+   * Safe to call before `connect()` — the arming state is recorded and the
+   * next `connect()` will open the subscription as part of its normal flow.
+   * Safe to call multiple times during a single session: re-arming is a no-op.
+   *
+   * Sphere bootstrap calls this from `initializeModules()` after every
+   * module's `initialize()` has run (handlers attached). The mux path does
+   * NOT need to call this — `suppressSubscriptions()` skips the auto-arm
+   * because the outer provider's subscription is irrelevant when the mux
+   * owns event routing.
+   *
+   * The gate is sticky: armed → stays armed for the lifetime of this
+   * instance. Reconnects re-subscribe automatically once armed. A subsequent
+   * call to `disconnect()` resets the arming state so a fresh `connect()`
+   * cycle goes through the gate again — this matches the existing contract
+   * where `disconnect()` tears down all session state.
+   */
+  async armSubscriptions(): Promise<void> {
+    if (this.subscriptionsArmed) return;
+    this.subscriptionsArmed = true;
+    logger.debug('Nostr', '[#423] Subscriptions armed — opening relay subscription if connected');
+    await this.maybeSubscribe();
+  }
+
+  /** Issue #423 — for tests and operator inspection. */
+  isSubscriptionsArmed(): boolean {
+    return this.subscriptionsArmed;
+  }
+
+  /**
+   * Issue #423 — gated wrapper around `subscribeToEvents()`. Called from
+   * connect()/setIdentity()/reconnect/armSubscriptions/on*-handler-register.
+   *
+   * Behavior:
+   *   - If suppressed (mux took over): no-op (mux owns subscriptions).
+   *   - If armed: proceed to `subscribeToEvents()` — opens the relay
+   *     subscription on the underlying NostrClient.
+   *   - Otherwise: record `pendingArm = true` and bail. The next call from
+   *     a gate-opening surface (armSubscriptions / on*-register) will
+   *     proceed.
+   */
+  private async maybeSubscribe(): Promise<void> {
+    if (this._subscriptionsSuppressed) return;
+    if (!this.subscriptionsArmed) {
+      this.pendingArm = true;
+      logger.debug(
+        'Nostr',
+        '[#423] subscribe deferred — handler-readiness gate closed (waiting for armSubscriptions or first handler)',
+      );
+      return;
+    }
+    this.pendingArm = false;
+    await this.subscribeToEvents();
+  }
+
+  /**
+   * Issue #423 — auto-arm on first handler registration. Called from each
+   * `on*` registration method as a backward-compat fallback for consumers
+   * that do not know about the explicit `armSubscriptions()` API.
+   *
+   * No-op once already armed or suppressed. Fire-and-forget: the underlying
+   * subscribe is async but `on*` methods are synchronous in their existing
+   * contract, so we don't await here.
+   */
+  private autoArmOnHandlerRegistration(): void {
+    if (this.subscriptionsArmed) return;
+    if (this._subscriptionsSuppressed) return;
+    this.subscriptionsArmed = true;
+    logger.debug(
+      'Nostr',
+      '[#423] Subscriptions auto-armed on first handler registration',
+    );
+    this.maybeSubscribe().catch((err) => {
+      logger.error('Nostr', '[#423] auto-arm subscribe failed:', err);
+    });
+  }
 
   private async subscribeToEvents(): Promise<void> {
     logger.debug('Nostr', 'subscribeToEvents called, identity:', !!this.identity, 'keyManager:', !!this.keyManager, 'nostrClient:', !!this.nostrClient);
