@@ -100,11 +100,36 @@ export const DEFAULT_BACKOFF_SCHEDULE_MS: ReadonlyArray<number> = [
  *  `'down'`. */
 export const DEFAULT_PING_TIMEOUT_MS = 8_000;
 
+/**
+ * Default number of consecutive `'down'` probe results required before the
+ * manager flips a backend's status to `'down'` (Issue #424).
+ *
+ * The intent is to absorb single transient blips — a TCP RST, a DNS hiccup,
+ * a one-off undici `fetch failed` — without flipping the public status. A
+ * sustained outage will still flip after this many consecutive failures.
+ *
+ * Recovery is asymmetric: a single successful probe (`'up'` or `'degraded'`)
+ * resets the counter AND flips the status immediately. Failure is patient;
+ * recovery is fast.
+ */
+export const DEFAULT_FAILURE_THRESHOLD = 2;
+
 export interface ConnectivityManagerConfig {
   /** Probe schedule. Defaults to {@link DEFAULT_BACKOFF_SCHEDULE_MS}. */
   readonly backoffScheduleMs?: ReadonlyArray<number>;
   /** Per-probe wall-clock timeout. Defaults to {@link DEFAULT_PING_TIMEOUT_MS}. */
   readonly pingTimeoutMs?: number;
+  /**
+   * Number of consecutive `'down'` probe results required before the manager
+   * flips a backend's status to `'down'`. Defaults to
+   * {@link DEFAULT_FAILURE_THRESHOLD}. Must be >= 1; a value of 1 means
+   * "flip on the first failure" (the legacy pre-#424 behaviour).
+   *
+   * Applies to ALL backends uniformly. The counter is reset to 0 on every
+   * successful (`'up'` or `'degraded'`) result, so a flaky alternate-success
+   * stream never accumulates enough consecutive failures to flip.
+   */
+  readonly failureThreshold?: number;
   /**
    * Event-emit hook. The manager calls this with three event types:
    *
@@ -153,6 +178,13 @@ interface PerBackendState {
   inFlight: Promise<void> | null;
   /** AbortController for the in-flight probe (used to cancel on stop()). */
   abort: AbortController | null;
+  /**
+   * Issue #424: consecutive `'down'` probe results since the last `'up'` or
+   * `'degraded'`. Saturates at `failureThreshold` to avoid unbounded growth
+   * on a long-running offline wallet; we only ever care whether the counter
+   * has met the threshold. Reset to 0 on any successful result.
+   */
+  consecutiveFailures: number;
 }
 
 export class ConnectivityManager implements ConnectivityManagerHandle {
@@ -161,6 +193,7 @@ export class ConnectivityManager implements ConnectivityManagerHandle {
   private readonly subscribers: Set<ConnectivitySubscriber> = new Set();
   private readonly schedule: ReadonlyArray<number>;
   private readonly pingTimeoutMs: number;
+  private readonly failureThreshold: number;
   private readonly emitEvent: ConnectivityManagerConfig['emitEvent'];
 
   private lastOnlineAt: number | null = null;
@@ -185,6 +218,7 @@ export class ConnectivityManager implements ConnectivityManagerHandle {
         timer: null,
         inFlight: null,
         abort: null,
+        consecutiveFailures: 0,
       });
     }
     this.schedule = config?.backoffScheduleMs ?? DEFAULT_BACKOFF_SCHEDULE_MS;
@@ -195,6 +229,14 @@ export class ConnectivityManager implements ConnectivityManagerHandle {
       );
     }
     this.pingTimeoutMs = config?.pingTimeoutMs ?? DEFAULT_PING_TIMEOUT_MS;
+    const ft = config?.failureThreshold ?? DEFAULT_FAILURE_THRESHOLD;
+    if (!Number.isFinite(ft) || ft < 1 || !Number.isInteger(ft)) {
+      throw new SphereError(
+        'ConnectivityManager: failureThreshold must be a positive integer (>= 1)',
+        'INVALID_CONFIG',
+      );
+    }
+    this.failureThreshold = ft;
     this.emitEvent = config?.emitEvent;
     this.cachedSnapshot = this.buildSnapshot();
   }
@@ -422,7 +464,6 @@ export class ConnectivityManager implements ConnectivityManagerHandle {
     if (!state) return;
 
     const prev = state.status;
-    const next: ConnectivityBackendStatus = result;
 
     // Schedule semantics: `backoffStep` is the index of `schedule` to USE
     // for the NEXT probe. The first failure → use schedule[0] = 5 s for
@@ -445,6 +486,36 @@ export class ConnectivityManager implements ConnectivityManagerHandle {
     // step advances for the slot after that. This makes the first
     // failure use schedule[0] (= 5s) for the next probe — matching the
     // spec.
+
+    // Issue #424: consecutive-failure threshold for `'down'` flips.
+    //
+    // - A successful result (`'up'` or `'degraded'`) resets the counter
+    //   and the visible status is whatever the probe reported. Recovery
+    //   is immediate — one good probe is enough.
+    // - A failed result (`'down'`) bumps the counter (saturating at the
+    //   threshold so a long-running offline wallet never grows the
+    //   number unboundedly). The visible status only flips to `'down'`
+    //   when the counter reaches the threshold.
+    //
+    // Until the threshold is reached we hold the previous status. This
+    // means an `'unknown'` start → 1 `'down'` keeps `'unknown'` visible,
+    // and an `'up'` → 1 `'down'` keeps `'up'` visible. Operators get
+    // false-negative suppression at the cost of slightly delayed real-
+    // outage detection (one extra probe interval).
+    let next: ConnectivityBackendStatus;
+    if (result === 'down') {
+      // Saturating increment — see steelman note: a 32-bit counter would
+      // be fine in practice, but capping at the threshold keeps the
+      // semantics tight: "have we hit threshold yet?" is the only
+      // question we ask.
+      if (state.consecutiveFailures < this.failureThreshold) {
+        state.consecutiveFailures += 1;
+      }
+      next = state.consecutiveFailures >= this.failureThreshold ? 'down' : prev;
+    } else {
+      state.consecutiveFailures = 0;
+      next = result;
+    }
 
     if (prev === next) {
       // No transition — still refresh cached snapshot's `lastOnlineAt`
@@ -555,7 +626,13 @@ export class ConnectivityManager implements ConnectivityManagerHandle {
  *     Used when no provider instance is available (e.g. pre-init health
  *     checks, tests). Sends a `get_block_height` JSON-RPC POST.
  *
- * Treats:
+ * Issue #424: each `ping()` call internally retries transient failures with a
+ * `[100, 500, 2000]` ms backoff before surfacing `'down'` to the manager.
+ * This absorbs the dominant TCP retransmit-window blip and DNS hiccup without
+ * stacking up against the manager's consecutive-failure threshold. The manager
+ * still has the final say on status transitions (see `failureThreshold`).
+ *
+ * Treats (after retries exhausted):
  *   - successful call (numeric round / `result` field) ⇒ `'up'`
  *   - 200 OK with `error` body / unrecognizable result ⇒ `'degraded'`
  *   - any throw / 4xx / 5xx / abort / timeout          ⇒ `'down'`
@@ -564,82 +641,244 @@ export interface AggregatorPingerProvider {
   getCurrentRound(): Promise<number>;
 }
 
+/**
+ * Issue #424: backoff schedule (ms) for {@link AggregatorPinger}'s
+ * in-probe retries on transient failures. Matches the IPFS layer's
+ * `withPinRetry` schedule — 100 / 500 / 2000 ms.
+ *
+ * Total budget: ~2.6 s of accumulated backoff between attempts; the
+ * manager's `pingTimeoutMs` (default 8 s) caps the overall wall-clock
+ * cost. Each retry runs a fresh inner ping attempt, so a slow-but-
+ * eventually-failing call could be aborted mid-retry by the manager's
+ * outer timeout.
+ */
+export const AGGREGATOR_RETRY_BACKOFFS_MS: ReadonlyArray<number> = [100, 500, 2000] as const;
+
+/**
+ * Issue #424: classify whether an aggregator-probe failure is worth a
+ * quick in-probe retry.
+ *
+ * Transient (retry):
+ *   - `AbortError` / `TimeoutError` from the per-attempt timeout.
+ *   - Network errors (`ECONNRESET`, `ECONNREFUSED`, `ENOTFOUND`,
+ *     `ETIMEDOUT`, `EAI_AGAIN`, undici `fetch failed`).
+ *   - HTTP 5xx — server-side transient (overload, bad backend).
+ *   - HTTP 429 — rate-limit signal; backoff is the right response.
+ *   - Anything we can't classify — the bounded 2.6 s budget caps the
+ *     cost of guessing wrong.
+ *
+ * Permanent (do NOT retry — return `'down'` without consuming more budget):
+ *   - HTTP 4xx (except 429) — deterministic client error; retry wastes
+ *     budget and is semantically wrong.
+ *
+ * The classifier matches the shape of errors thrown by both provider-mode
+ * (the underlying transport rethrows) and URL-mode (we throw synthetic
+ * `"HTTP <status>"` errors for non-OK responses so this classifier can
+ * route by status code).
+ */
+export function isTransientAggregatorError(err: unknown): boolean {
+  if (!(err instanceof Error)) return true;
+  const msg = err.message;
+
+  // HTTP-derived: explicit status code in the message.
+  const httpMatch = /\bHTTP (\d{3})\b/.exec(msg);
+  if (httpMatch !== null) {
+    const status = Number.parseInt(httpMatch[1], 10);
+    if (status === 429) return true;               // rate-limit → retry
+    if (status >= 500 && status < 600) return true; // 5xx → retry
+    if (status >= 400 && status < 500) return false; // 4xx → permanent
+  }
+
+  // Network / abort signals from `fetch` and friends.
+  if (
+    msg.toLowerCase().includes('fetch failed') ||
+    msg.toLowerCase().includes('network') ||
+    msg.includes('ECONNRESET') ||
+    msg.includes('ECONNREFUSED') ||
+    msg.includes('ENOTFOUND') ||
+    msg.includes('ETIMEDOUT') ||
+    msg.includes('EAI_AGAIN') ||
+    err.name === 'AbortError' ||
+    err.name === 'TimeoutError'
+  ) {
+    return true;
+  }
+
+  // Unknown shape — lenient default, capped by the bounded retry budget.
+  return true;
+}
+
 export class AggregatorPinger implements Pinger {
   readonly backend: ConnectivityBackend = 'aggregator';
 
   private readonly provider: AggregatorPingerProvider | null;
   private readonly url: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly retryBackoffsMs: ReadonlyArray<number>;
+  private readonly isTransient: (err: unknown) => boolean;
 
   constructor(opts: {
     provider?: AggregatorPingerProvider;
     url?: string;
     fetchImpl?: typeof fetch;
+    /**
+     * Issue #424 (test-seam): override the retry backoff schedule.
+     * Defaults to {@link AGGREGATOR_RETRY_BACKOFFS_MS}. Pass an empty
+     * array to disable retries entirely (single-attempt, legacy behaviour).
+     */
+    retryBackoffsMs?: ReadonlyArray<number>;
+    /**
+     * Issue #424 (test-seam): override the transient-error classifier.
+     * Defaults to {@link isTransientAggregatorError}.
+     */
+    isTransientError?: (err: unknown) => boolean;
   }) {
     this.provider = opts.provider ?? null;
     this.url = opts.url ?? '';
     this.fetchImpl = opts.fetchImpl ?? globalThis.fetch;
+    this.retryBackoffsMs = opts.retryBackoffsMs ?? AGGREGATOR_RETRY_BACKOFFS_MS;
+    this.isTransient = opts.isTransientError ?? isTransientAggregatorError;
   }
 
   async ping(signal: AbortSignal): Promise<PingResult> {
     if (signal.aborted) return 'down';
-    if (this.provider) {
+    // Issue #424: in-probe retry loop. A single transient blip (TCP RST,
+    // DNS hiccup, undici `fetch failed`) should not surface as `'down'`
+    // to the manager. We attempt up to `1 + retryBackoffsMs.length`
+    // times; each attempt runs the underlying probe (provider or URL).
+    // On a permanent error (e.g. HTTP 4xx) we short-circuit immediately.
+    // On caller abort, we return `'down'` without further retries.
+    const totalAttempts = 1 + this.retryBackoffsMs.length;
+    let lastResult: PingResult = 'down';
+    for (let attempt = 0; attempt < totalAttempts; attempt++) {
+      if (signal.aborted) return 'down';
+      let attemptError: unknown = null;
       try {
-        // Any finite numeric round (including 0) is a structured response
-        // from the aggregator and counts as alive — matches the reference
-        // infra-probe semantics (any JSON-RPC `result` ⇒ alive) and the
-        // URL-mode fallback below. Fresh shards / between-batch states
-        // can legitimately surface a `0` block height; demoting those to
-        // `'degraded'` would surface a false "Aggregator unavailable" in
-        // the wallet UI. The legacy "no aggregator client" stub path
-        // (UnicityAggregatorProvider before `initialize()`) now throws
-        // instead of returning `0`, so the catch below routes it to
-        // `'down'` as intended.
-        const round = await this.provider.getCurrentRound();
-        if (typeof round === 'number' && Number.isFinite(round) && round >= 0) {
-          return 'up';
-        }
-        return 'degraded';
-      } catch {
+        lastResult = await this.runSingleAttempt(signal);
+        // 'up' and 'degraded' are conclusive — return immediately.
+        if (lastResult !== 'down') return lastResult;
+      } catch (err) {
+        attemptError = err;
+        lastResult = 'down';
+      }
+
+      // We either got a thrown error or a 'down' result. Decide whether
+      // to retry.
+      const isLast = attempt === totalAttempts - 1;
+      if (isLast) break;
+      if (attemptError !== null && !this.isTransient(attemptError)) {
+        // Permanent error — surface 'down' without burning more budget.
         return 'down';
       }
+      // Sleep for the backoff between attempts. Honours caller abort
+      // mid-sleep so a stop() during the retry loop short-circuits.
+      const delay = this.retryBackoffsMs[attempt]!;
+      const aborted = await sleepWithAbort(delay, signal);
+      if (aborted) return 'down';
+    }
+    return lastResult;
+  }
+
+  /**
+   * Run a single underlying probe attempt — provider mode if a provider
+   * is configured, URL-mode otherwise. Throws on network / HTTP errors
+   * (so the retry loop can classify and retry). Returns `'up'`,
+   * `'degraded'`, or `'down'` on a successful structured response.
+   *
+   * Provider-mode preserves the legacy semantics: any finite non-negative
+   * numeric round counts as `'up'`; a non-finite or negative result is
+   * `'degraded'`; a thrown error propagates out (the retry loop catches
+   * and decides).
+   *
+   * URL-mode throws a synthetic `"HTTP <status>"` error on non-OK
+   * responses so {@link isTransientAggregatorError} can classify by
+   * status code.
+   */
+  private async runSingleAttempt(signal: AbortSignal): Promise<PingResult> {
+    if (this.provider) {
+      // Any finite numeric round (including 0) is a structured response
+      // from the aggregator and counts as alive — matches the reference
+      // infra-probe semantics (any JSON-RPC `result` ⇒ alive) and the
+      // URL-mode fallback below. Fresh shards / between-batch states
+      // can legitimately surface a `0` block height; demoting those to
+      // `'degraded'` would surface a false "Aggregator unavailable" in
+      // the wallet UI. The legacy "no aggregator client" stub path
+      // (UnicityAggregatorProvider before `initialize()`) now throws
+      // instead of returning `0`, so the catch in the retry loop routes
+      // it to `'down'` as intended.
+      const round = await this.provider.getCurrentRound();
+      if (typeof round === 'number' && Number.isFinite(round) && round >= 0) {
+        return 'up';
+      }
+      return 'degraded';
     }
     if (!this.url) return 'down';
+    const response = await this.fetchImpl(this.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'get_block_height',
+        params: {},
+      }),
+      signal,
+    });
+    if (!response.ok) {
+      // Throw a synthetic "HTTP <status>" error so the classifier can
+      // decide retry-vs-permanent by status code. The retry loop catches
+      // and routes; a 4xx surfaces as 'down' immediately (no further
+      // budget consumed).
+      throw new Error(`HTTP ${response.status} ${response.statusText} from ${this.url}`);
+    }
     try {
-      const response = await this.fetchImpl(this.url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'get_block_height',
-          params: {},
-        }),
-        signal,
-      });
-      if (!response.ok) return 'down';
-      try {
-        const body = (await response.json()) as { result?: unknown; error?: unknown };
-        if (body && typeof body === 'object' && body.error) {
-          return 'degraded';
-        }
-        const result = body && typeof body === 'object' ? body.result : null;
-        if (
-          typeof result === 'number' ||
-          typeof result === 'bigint' ||
-          (typeof result === 'string' && result.length > 0) ||
-          (result !== null && typeof result === 'object')
-        ) {
-          return 'up';
-        }
-        return 'degraded';
-      } catch {
+      const body = (await response.json()) as { result?: unknown; error?: unknown };
+      if (body && typeof body === 'object' && body.error) {
+        // A genuine JSON-RPC error envelope means the aggregator IS up
+        // but rejected our specific payload. Surface as 'degraded' —
+        // the backend is reachable, not retried, not counted as 'down'.
         return 'degraded';
       }
+      const result = body && typeof body === 'object' ? body.result : null;
+      if (
+        typeof result === 'number' ||
+        typeof result === 'bigint' ||
+        (typeof result === 'string' && result.length > 0) ||
+        (result !== null && typeof result === 'object')
+      ) {
+        return 'up';
+      }
+      return 'degraded';
     } catch {
-      return 'down';
+      // JSON parse failure on a 200 response — backend reachable but
+      // body is junk. Treat as degraded (backend IS reachable).
+      return 'degraded';
     }
   }
+}
+
+/**
+ * Sleep for `ms` milliseconds, honouring `signal`. Returns `true` if the
+ * sleep was cut short by an abort (caller should stop retrying); returns
+ * `false` on a clean timeout.
+ *
+ * Used by {@link AggregatorPinger}'s retry loop so a `stop()` landing
+ * during a backoff sleep short-circuits the loop instead of pinning the
+ * probe in a no-op wait.
+ */
+async function sleepWithAbort(ms: number, signal: AbortSignal): Promise<boolean> {
+  if (signal.aborted) return true;
+  return await new Promise<boolean>((resolve) => {
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve(false);
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 /**
