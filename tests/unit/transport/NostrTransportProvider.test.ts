@@ -104,6 +104,8 @@ describe('NostrTransportProvider', () => {
       mockGetConnectedRelays.mockReturnValue(new Set(['wss://relay1.test', 'wss://relay2.test']));
       const provider = createProvider(['wss://relay1.test', 'wss://relay2.test']);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
 
       const connected = provider.getConnectedRelays();
       expect(connected).toContain('wss://relay1.test');
@@ -115,6 +117,8 @@ describe('NostrTransportProvider', () => {
       mockGetConnectedRelays.mockReturnValue(new Set(['wss://relay1.test']));
       const provider = createProvider(['wss://relay1.test', 'wss://relay2.test']);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
 
       const connected = provider.getConnectedRelays();
       expect(connected).toContain('wss://relay1.test');
@@ -144,6 +148,8 @@ describe('NostrTransportProvider', () => {
       mockGetConnectedRelays.mockReturnValue(new Set(['wss://relay1.test']));
       const provider = createProvider(['wss://relay1.test']);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
       expect(provider.isRelayConnected('wss://relay1.test')).toBe(true);
     });
 
@@ -151,6 +157,8 @@ describe('NostrTransportProvider', () => {
       mockGetConnectedRelays.mockReturnValue(new Set(['wss://relay2.test']));
       const provider = createProvider(['wss://relay1.test', 'wss://relay2.test']);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
       expect(provider.isRelayConnected('wss://relay1.test')).toBe(false);
       expect(provider.isRelayConnected('wss://relay2.test')).toBe(true);
     });
@@ -173,6 +181,8 @@ describe('NostrTransportProvider', () => {
       mockGetConnectedRelays.mockReturnValue(new Set(['wss://relay1.test', 'wss://relay2.test']));
       const provider = createProvider(['wss://relay1.test']);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
 
       const result = await provider.addRelay('wss://relay2.test');
       expect(result).toBe(true);
@@ -183,6 +193,8 @@ describe('NostrTransportProvider', () => {
       mockGetConnectedRelays.mockReturnValue(new Set(['wss://relay1.test']));
       const provider = createProvider(['wss://relay1.test']);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
 
       // Mock connect failure for the new relay
       mockConnect.mockRejectedValueOnce(new Error('Connection failed'));
@@ -211,6 +223,8 @@ describe('NostrTransportProvider', () => {
       mockGetConnectedRelays.mockReturnValue(new Set(['wss://relay1.test', 'wss://relay2.test']));
       const provider = createProvider(['wss://relay1.test', 'wss://relay2.test']);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
 
       expect(provider.isRelayConnected('wss://relay2.test')).toBe(true);
 
@@ -226,6 +240,8 @@ describe('NostrTransportProvider', () => {
       mockGetConnectedRelays.mockReturnValue(new Set(['wss://relay1.test']));
       const provider = createProvider(['wss://relay1.test']);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
 
       // After removing, mock that no relays are connected
       mockIsConnected.mockReturnValue(false);
@@ -248,6 +264,8 @@ describe('NostrTransportProvider', () => {
     it('stops application-level ping timers on every relay', async () => {
       const provider = createProvider(['wss://relay1.test', 'wss://relay2.test']);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
       // Pre-flight: provider should not have called stopPingTimer at connect time.
       expect(mockStopPingTimer).not.toHaveBeenCalled();
 
@@ -297,6 +315,10 @@ describe('Reconnect re-subscription', () => {
 
     await provider.connect();
 
+    // Issue #423 — auto-arm to preserve pre-gate test semantics
+
+    await provider.armSubscriptions();
+
     // Capture the connection listener registered during connect()
     expect(mockAddConnectionListener).toHaveBeenCalled();
     const listener = mockAddConnectionListener.mock.calls[0][0];
@@ -318,6 +340,8 @@ describe('Reconnect re-subscription', () => {
 
     // Connect without identity
     await provider.connect();
+    // Issue #423 — auto-arm to preserve pre-gate test semantics
+    await provider.armSubscriptions();
 
     const listener = mockAddConnectionListener.mock.calls[0][0];
 
@@ -422,6 +446,10 @@ describe('Event subscription pubkey format', () => {
 
     await provider.connect();
 
+    // Issue #423 — auto-arm to preserve pre-gate test semantics
+
+    await provider.armSubscriptions();
+
     // Wait for subscription to be sent
     await new Promise(resolve => setTimeout(resolve, 50));
 
@@ -459,6 +487,10 @@ describe('Event subscription pubkey format', () => {
     });
 
     await provider.connect();
+
+    // Issue #423 — auto-arm to preserve pre-gate test semantics
+
+    await provider.armSubscriptions();
     await new Promise(resolve => setTimeout(resolve, 50));
 
     // Should create two subscriptions: wallet and chat
@@ -617,6 +649,8 @@ describe('Last event timestamp persistence', () => {
       const provider = createProviderWithStorage(mockStorage);
       setIdentity(provider);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
       await new Promise(resolve => setTimeout(resolve, 50));
 
       expect(mockSubscribe).toHaveBeenCalled();
@@ -635,6 +669,8 @@ describe('Last event timestamp persistence', () => {
       const provider = createProviderWithStorage(mockStorage);
       setIdentity(provider);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
       await new Promise(resolve => setTimeout(resolve, 50));
 
       expect(mockSubscribe).toHaveBeenCalled();
@@ -655,6 +691,8 @@ describe('Last event timestamp persistence', () => {
       const provider = createProviderWithStorage(mockStorage);
       setIdentity(provider);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
       await new Promise(resolve => setTimeout(resolve, 50));
 
       expect(mockSubscribe).toHaveBeenCalled();
@@ -670,6 +708,8 @@ describe('Last event timestamp persistence', () => {
 
       const now = Math.floor(Date.now() / 1000);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
       await new Promise(resolve => setTimeout(resolve, 50));
 
       expect(mockSubscribe).toHaveBeenCalled();
@@ -694,6 +734,8 @@ describe('Last event timestamp persistence', () => {
       const provider = createProviderWithStorage(mockStorage);
       setIdentity(provider);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
       await new Promise(resolve => setTimeout(resolve, 50));
 
       // Two subscriptions: wallet and DM (chat)
@@ -715,6 +757,8 @@ describe('Last event timestamp persistence', () => {
       const provider = createProviderWithStorage(mockStorage);
       setIdentity(provider);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
       await new Promise(resolve => setTimeout(resolve, 50));
 
       // Four reads: persistent dedup events (#275) + persistent cooldowns (#275)
@@ -742,6 +786,8 @@ describe('Last event timestamp persistence', () => {
       provider.setFallbackSince(fallbackTs);
       setIdentity(provider);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
       await new Promise(resolve => setTimeout(resolve, 50));
 
       expect(mockSubscribe).toHaveBeenCalled();
@@ -761,6 +807,8 @@ describe('Last event timestamp persistence', () => {
       provider.setFallbackSince(1690000000); // Earlier than stored
       setIdentity(provider);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
       await new Promise(resolve => setTimeout(resolve, 50));
 
       expect(mockSubscribe).toHaveBeenCalled();
@@ -780,6 +828,8 @@ describe('Last event timestamp persistence', () => {
       provider.setFallbackSince(fallbackTs);
       setIdentity(provider);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
       await new Promise(resolve => setTimeout(resolve, 50));
 
       // First subscription should use fallback
@@ -810,6 +860,8 @@ describe('Last event timestamp persistence', () => {
       const provider = createProviderWithStorage(mockStorage);
       setIdentity(provider);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
       await new Promise(resolve => setTimeout(resolve, 50));
 
       // Reset mock to only track calls from handleEvent
@@ -850,6 +902,8 @@ describe('Last event timestamp persistence', () => {
       const provider = createProviderWithStorage(mockStorage);
       setIdentity(provider);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
       await new Promise(resolve => setTimeout(resolve, 50));
 
       mockStorage.set.mockClear();
@@ -880,6 +934,8 @@ describe('Last event timestamp persistence', () => {
       const provider = createProviderWithStorage(mockStorage);
       setIdentity(provider);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
       await new Promise(resolve => setTimeout(resolve, 50));
 
       mockStorage.set.mockClear();
@@ -912,6 +968,8 @@ describe('Last event timestamp persistence', () => {
       const provider = createProviderWithStorage(mockStorage);
       setIdentity(provider);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
       await new Promise(resolve => setTimeout(resolve, 50));
 
       mockStorage.set.mockClear();
@@ -953,6 +1011,8 @@ describe('Last event timestamp persistence', () => {
       const provider = createProviderWithStorage(mockStorage);
       setIdentity(provider);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
       await new Promise(resolve => setTimeout(resolve, 50));
 
       mockStorage.get.mockClear();
@@ -986,6 +1046,8 @@ describe('Last event timestamp persistence', () => {
       const provider = createProviderWithStorage(mockStorage);
       setIdentity(provider);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
       await new Promise(resolve => setTimeout(resolve, 50));
 
       mockStorage.set.mockClear();
@@ -1056,6 +1118,8 @@ describe('Issue #275 — persistent dedup', () => {
       const provider = createProviderWithStorage(mockStorage);
       setIdentity(provider);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
       await new Promise(resolve => setTimeout(resolve, 50));
 
       // Fire one of the hydrated event IDs through the handler
@@ -1099,6 +1163,8 @@ describe('Issue #275 — persistent dedup', () => {
       setIdentity(provider);
       // Should not throw — corrupt data degrades to "start fresh".
       await expect(provider.connect()).resolves.toBeUndefined();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
       await new Promise(resolve => setTimeout(resolve, 50));
       expect(mockSubscribe).toHaveBeenCalled();
     });
@@ -1117,6 +1183,8 @@ describe('Issue #275 — persistent dedup', () => {
       const provider = createProviderWithStorage(mockStorage);
       setIdentity(provider);
       await expect(provider.connect()).resolves.toBeUndefined();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
       await new Promise(resolve => setTimeout(resolve, 50));
 
       // Subsequent event with same id should be processed (not deduped).
@@ -1155,6 +1223,8 @@ describe('Issue #275 — persistent dedup', () => {
       const provider = createProviderWithStorage(mockStorage);
       setIdentity(provider);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
       await new Promise(resolve => setTimeout(resolve, 50));
 
       // Direct map inspection — the cooldown should have been hydrated
@@ -1192,6 +1262,8 @@ describe('Issue #275 — persistent dedup', () => {
       const provider = createProviderWithStorage(mockStorage);
       setIdentity(provider);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
       await new Promise(resolve => setTimeout(resolve, 50));
 
       // Inspect the private field to verify the drop happened.
@@ -1214,6 +1286,8 @@ describe('Issue #275 — persistent dedup', () => {
       const provider = createProviderWithStorage(mockStorage);
       setIdentity(provider);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
       await new Promise(resolve => setTimeout(resolve, 50));
 
       mockStorage.set.mockClear();
@@ -1250,6 +1324,8 @@ describe('Issue #275 — persistent dedup', () => {
       const provider = createProviderWithStorage(mockStorage);
       setIdentity(provider);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
       await new Promise(resolve => setTimeout(resolve, 50));
 
       mockStorage.set.mockClear();
@@ -1290,6 +1366,8 @@ describe('Issue #275 — persistent dedup', () => {
       const provider = createProviderWithStorage(mockStorage);
       setIdentity(provider);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
       await new Promise(resolve => setTimeout(resolve, 50));
       mockStorage.set.mockClear();
 
@@ -1319,6 +1397,8 @@ describe('Issue #275 — persistent dedup', () => {
       const provider = createProviderWithStorage(mockStorage);
       setIdentity(provider);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
       await new Promise(resolve => setTimeout(resolve, 50));
 
       // Pre-populate the set to exactly the cap by reaching into the
@@ -1351,6 +1431,8 @@ describe('Issue #275 — persistent dedup', () => {
       const provider = createProviderWithStorage(mockStorage);
       setIdentity(provider);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
       await new Promise(resolve => setTimeout(resolve, 50));
 
       const callbacks = mockSubscribe.mock.calls[0][1];
@@ -1389,6 +1471,8 @@ describe('Issue #275 — persistent dedup', () => {
       const provider = createProviderWithStorage(mockStorage);
       setIdentity(provider);
       await provider.connect();
+      // Issue #423 — auto-arm to preserve pre-gate test semantics
+      await provider.armSubscriptions();
       await new Promise(resolve => setTimeout(resolve, 50));
 
       const callbacks = mockSubscribe.mock.calls[0][1];

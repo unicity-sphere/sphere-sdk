@@ -127,6 +127,8 @@ describe('NostrTransportProvider — onChatReady()', () => {
     // Connect + setIdentity triggers subscribeToEvents internally
     await provider.connect();
     await provider.setIdentity(TEST_IDENTITY);
+    // Issue #423 — arm the gate so subscribeToEvents() runs in test setup
+    await provider.armSubscriptions();
 
     // Verify subscriptions were created
     expect(subscribeCalls.length).toBeGreaterThan(0);
@@ -146,6 +148,8 @@ describe('NostrTransportProvider — onChatReady()', () => {
     // Connect and trigger EOSE
     await provider.connect();
     await provider.setIdentity(TEST_IDENTITY);
+    // Issue #423 — arm the gate so subscribeToEvents() runs in test setup
+    await provider.armSubscriptions();
     triggerChatEose();
 
     // Late handler — should fire immediately since EOSE already happened
@@ -164,6 +168,8 @@ describe('NostrTransportProvider — onChatReady()', () => {
 
     await provider.connect();
     await provider.setIdentity(TEST_IDENTITY);
+    // Issue #423 — arm the gate so subscribeToEvents() runs in test setup
+    await provider.armSubscriptions();
     triggerChatEose();
 
     expect(handler1).toHaveBeenCalledTimes(1);
@@ -175,6 +181,8 @@ describe('NostrTransportProvider — onChatReady()', () => {
 
     await provider.connect();
     await provider.setIdentity(TEST_IDENTITY);
+    // Issue #423 — arm the gate so subscribeToEvents() runs in test setup
+    await provider.armSubscriptions();
     triggerChatEose();
 
     // Verify late handler fires immediately
@@ -201,6 +209,8 @@ describe('NostrTransportProvider — onChatReady()', () => {
 
     await provider.connect();
     await provider.setIdentity(TEST_IDENTITY);
+    // Issue #423 — arm the gate so subscribeToEvents() runs in test setup
+    await provider.armSubscriptions();
 
     expect(() => triggerChatEose()).not.toThrow();
     expect(goodHandler).toHaveBeenCalledTimes(1);
@@ -214,6 +224,8 @@ describe('NostrTransportProvider — onChatReady()', () => {
 
     await provider.connect();
     await provider.setIdentity(TEST_IDENTITY);
+    // Issue #423 — arm the gate so subscribeToEvents() runs in test setup
+    await provider.armSubscriptions();
 
     triggerChatEose();
     triggerChatEose(); // Second EOSE — no-op
@@ -226,6 +238,8 @@ describe('NostrTransportProvider — onChatReady()', () => {
 
     await provider.connect();
     await provider.setIdentity(TEST_IDENTITY);
+    // Issue #423 — arm the gate so subscribeToEvents() runs in test setup
+    await provider.armSubscriptions();
     triggerChatEose();
 
     const handler = vi.fn();

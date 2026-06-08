@@ -7645,6 +7645,50 @@ export class Sphere {
         `Failed to wire connectivity gate into PaymentsModule (sends will not gate on OFFLINE): ${safeErrorMessage(err)}`,
       );
     }
+
+    // Issue #423 — arm the Nostr transport's subscription gate now that all
+    // modules have registered their handlers (either directly on the outer
+    // provider in the non-mux path, or on the MultiAddressTransportMux's
+    // per-address adapter in the mux path).
+    //
+    // Pre-#423: `transport.connect()` opened the relay subscription inline,
+    // BEFORE PaymentsModule / CommunicationsModule / AccountingModule /
+    // SwapModule registered their `onTokenTransfer` / `onMessage` /
+    // `onPaymentRequest` / `onPaymentRequestResponse` handlers. In the mux
+    // path the outer provider never gets handlers at all (they live on the
+    // mux adapter), so the outer subscription would route every TOKEN_TRANSFER
+    // through the defensive `pendingTransfers` buffer and pin `lastEventTs`
+    // — surfacing as the persistent `[AT-LEAST-ONCE] TOKEN_TRANSFER ... not
+    // durable` warn storm in soak logs.
+    //
+    // For the mux path: `ensureTransportMux()` already called
+    // `suppressSubscriptions()` on the outer provider, so the `armSubscriptions`
+    // call below is a no-op (the gate short-circuits when suppressed). The
+    // mux owns event routing and is independent.
+    //
+    // For the non-mux path: this is where the outer provider's subscription
+    // actually opens. Idempotent — safe to re-call across `initializeModules`
+    // re-runs (the gate is sticky).
+    //
+    // Duck-typed: legacy/test transports may not expose `armSubscriptions`.
+    // No-op in that case — those transports never had the gated behavior.
+    try {
+      const transportWithArm = this._transport as unknown as {
+        armSubscriptions?: () => Promise<void>;
+      };
+      if (typeof transportWithArm.armSubscriptions === 'function') {
+        await transportWithArm.armSubscriptions();
+      }
+    } catch (err) {
+      // Non-fatal — if arming throws (e.g., transient relay error during the
+      // first subscribe), the auto-arm fallback inside the next `on*` handler
+      // registration still covers us. Better to log and continue than to
+      // brick init.
+      logger.warn(
+        'Sphere',
+        `[#423] armSubscriptions failed (continuing — auto-arm fallback will retry): ${safeErrorMessage(err)}`,
+      );
+    }
   }
 
   /**
