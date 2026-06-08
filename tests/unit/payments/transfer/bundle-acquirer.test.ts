@@ -27,6 +27,7 @@ import {
 } from '../../../../modules/payments/transfer/bundle-acquirer';
 import { ReplayLRU } from '../../../../modules/payments/transfer/replay-lru';
 import { RELAY_SAFE_CAP_BYTES } from '../../../../modules/payments/transfer/limits';
+import { _resetGatewayCapabilityCache } from '../../../../profile/ipfs-client';
 import type {
   UxfTransferPayload,
   UxfTransferPayloadCar,
@@ -807,9 +808,26 @@ describe('acquireBundle — negative-LRU short-circuit (steelman warning)', () =
 // `recordVerifyFailure`. Permanent / structural rejections still cache.
 
 describe('acquireBundle — negative LRU skips transient errors (Round 3)', () => {
-  afterEach(() => __clearInflightForTests());
+  afterEach(() => {
+    __clearInflightForTests();
+    // Issue #429 follow-up — the per-process gateway capability cache
+    // (`profile/ipfs-client.ts:capabilityCache`, issue #370) survives
+    // across tests within a Vitest worker. Earlier tests in this file
+    // implicitly poison it for `m1.example`/`m2.example` via DNS
+    // failures, masking a flake where the `dag/import`/`dag/export`
+    // probe HTTP fetches consume this test's mocked-fetch budget when
+    // run in isolation. Clear it here so order-of-execution does not
+    // change observable behaviour.
+    _resetGatewayCapabilityCache();
+  });
 
   it('TRANSIENT failure is NOT cached: immediate retry runs the pipeline afresh', async () => {
+    // Pre-reset the cache for this test in case prior tests in the same
+    // worker primed it with stale values (real or DNS-failed). The
+    // `afterEach` above takes care of *outgoing* state; this guards the
+    // *incoming* state for the first test in the describe block.
+    _resetGatewayCapabilityCache();
+
     // Setup: a uxf-cid payload whose gateway fetches fail intermittently
     // First attempt: every block/get fails (network blip) →
     // `fetchCarFromIpfs` throws BUNDLE_NOT_FOUND →
@@ -847,26 +865,43 @@ describe('acquireBundle — negative LRU skips transient errors (Round 3)', () =
       tokenIds: [TOKEN_A_ID],
     };
 
-    let attempts = 0;
+    // Switch from "first 2 fetches fail" to "every fetch fails during
+    // the first acquireBundle() call, none fail after". The previous
+    // count-based gate was fragile: the issue #370 capability probe
+    // (`probeGatewayCapabilities`) issues 2 fetches per gateway before
+    // the per-block BFS walk, silently consuming budget slots and
+    // causing the first acquireBundle() call to succeed instead of
+    // throwing. Issue #429.
+    let firstCallActive = false;
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(
       async (input: string | URL | Request) => {
         const url = typeof input === 'string' ? input : input.toString();
         // Issue #255 Problem B / ipfs-storage#7 — fetchFromIpfs now
         // probes `/sidecar/blob?cid=<cid>` once per call before the
         // /api/v0/block/get path. Treat it as an instant miss here
-        // (no sidecar in this test fixture) WITHOUT incrementing the
-        // attempts counter — the test's transient-vs-recovered
-        // simulation depends on a specific number of block/get
-        // attempts, and we don't want the probe to consume a budget
-        // slot.
+        // (no sidecar in this test fixture).
         if (url.includes('/sidecar/blob')) {
           return new Response('not in sidecar cache', { status: 404 });
         }
-        attempts++;
-        // Network blip on the first 2 attempts — the block-walk's
-        // gateway fallback exhausts both gateways and throws on the
-        // first acquireBundle call.
-        if (attempts <= 2) {
+        // Issue #370 / #429 — `fetchCarFromIpfs` probes each gateway's
+        // `/api/v0/dag/import` and `/api/v0/dag/export` once per
+        // process to decide whether to take the fast path. Return 404
+        // so `probeEndpointExposed` deterministically caches both
+        // capabilities as `false`, forcing the legacy per-block BFS
+        // path regardless of the transient-blip state below. Without
+        // this, the probe's HTTP calls fall into the `firstCallActive`
+        // branch and the fast path is never even probed deterministically.
+        if (
+          url.includes('/api/v0/dag/import') ||
+          url.includes('/api/v0/dag/export')
+        ) {
+          return new Response('not exposed', { status: 404 });
+        }
+        // Network blip during the FIRST acquireBundle call only: every
+        // `block/get` fetch fails, so the block-walk's gateway fallback
+        // exhausts both gateways and throws BUNDLE_NOT_FOUND, which
+        // `acquireBundle` rewraps as BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT.
+        if (firstCallActive) {
           return new Response('upstream blip', { status: 503 });
         }
         // Recovered: serve per-block via /api/v0/block/get?arg=<cid>.
@@ -887,12 +922,15 @@ describe('acquireBundle — negative LRU skips transient errors (Round 3)', () =
 
       // First arrival — every gateway fails → TRANSIENT.
       let firstErr: unknown;
+      firstCallActive = true;
       try {
         await acquireBundle(payload, SENDER, lru, {
           gateways: ['https://m1.example', 'https://m2.example'],
         });
       } catch (err) {
         firstErr = err;
+      } finally {
+        firstCallActive = false;
       }
       if (!isSphereError(firstErr)) throw new Error('expected SphereError');
       expect(firstErr.code).toBe('BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT');
