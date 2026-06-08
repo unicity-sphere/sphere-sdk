@@ -43,6 +43,7 @@ export {
   DEFAULT_ENCRYPTION_CONFIG,
   PROFILE_KEY_MAPPING,
   CACHE_ONLY_KEYS,
+  IDENTITY_KEYS,
   IPFS_STATE_KEYS_PATTERN,
   computeAddressId,
 } from './types';

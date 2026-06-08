@@ -19,6 +19,7 @@ import {
   type ProfileStorageProviderOptions,
   PROFILE_KEY_MAPPING,
   CACHE_ONLY_KEYS,
+  IDENTITY_KEYS,
   IPFS_STATE_KEYS_PATTERN,
   computeAddressId,
 } from './types';
@@ -1601,34 +1602,52 @@ export class ProfileStorageProvider implements StorageProvider {
    * SHOULD use `setEntry()` (see below) which accepts an explicit type.
    */
   async set(key: string, value: string, opts?: { entryType?: OpLogEntryType }): Promise<void> {
-    // C1 fail-closed gate (Audit #333):
+    // Audit #333 C1 — identity / seed material MUST NOT replicate via
+    // OrbitDB/IPFS. The defense is two-layer:
     //
-    // The actual attack surface is the OrbitDB write path: the audit's
-    // described scenario is "the seed replicated to third-party IPFS
-    // gateways in cleartext". Local-cache writes are NOT replicated to
-    // IPFS — they live in the device's IndexedDB / FileStorage same
-    // as legacy. The primary defense is therefore the `encrypt()`
-    // throw further down: when `encryptionEnabled === true` and no
-    // key is derived, the OrbitDB write is rejected at the
-    // `writeEnvelope` boundary.
+    //   (1) The IDENTITY_KEYS set in `profile/types.ts` is folded into
+    //       `CACHE_ONLY_KEYS`, so `translateKey()` returns
+    //       `cacheOnly: true` for `mnemonic`, `master_key`, `chain_code`,
+    //       `derivation_path`, `base_path`, `derivation_mode`,
+    //       `wallet_source`, and `current_address_index`. The write
+    //       short-circuits at step 2 below (localCache only).
+    //
+    //   (2) The post-translation assertion below — belt-and-suspenders.
+    //       If a future refactor adds an identity-shaped Profile key
+    //       (anything translating to `identity.*`) but forgets to also
+    //       add it to CACHE_ONLY_KEYS, the assertion throws here rather
+    //       than silently pinning the encrypted seed to IPFS.
     //
     // Sphere.create() legitimately calls `set('mnemonic', ...)` during
     // Phase A (localCache attached, OrbitDB not yet attached because
-    // identity has not been derived YET — the mnemonic is the INPUT
-    // to identity derivation). Pre-fix-fix the C1 gate fired here too
-    // aggressively and broke that flow. The encrypt() throw remains
-    // the catch-all for the actual IPFS-leak window.
+    // identity has not been derived YET — the mnemonic is the INPUT to
+    // identity derivation). Step 2 keeps the localCache write working;
+    // step 3 never fires for these keys.
     //
-    // Identity-class keys (`mnemonic`, `master_key`, ...) intentionally
-    // flow through `localCache.set()` below — that is how the wallet
-    // has always persisted the seed locally. Audit #333 C1 only ever
-    // cared about the OrbitDB replication path.
+    // The earlier "encrypt() throw is the catch-all" reasoning is
+    // insufficient: `encrypt()` only throws *before* the key is derived.
+    // Any post-Phase-A rewrite would otherwise have encrypted the seed
+    // and pushed it onto the OpLog. The cache-only classification closes
+    // that hole completely.
 
     const translated = translateKey(key, this.addressId);
 
     // Excluded keys — silently drop
     if (translated.excluded) {
       return;
+    }
+
+    // Defense in depth: identity-shaped translations MUST be cache-only.
+    // This catches refactor regressions where someone introduces a new
+    // `identity.*` mapping but forgets the CACHE_ONLY_KEYS entry.
+    if (translated.profileKey.startsWith('identity.') && !translated.cacheOnly) {
+      throw new ProfileError(
+        'PROFILE_NOT_INITIALIZED',
+        `Refusing to write identity-shaped Profile key "${translated.profileKey}" ` +
+          `to OrbitDB: seed material must NEVER replicate. Add the legacy key ` +
+          `"${key}" to CACHE_ONLY_KEYS in profile/types.ts. ` +
+          `See IDENTITY_KEYS for the canonical list.`,
+      );
     }
 
     // 1. Always write to local cache

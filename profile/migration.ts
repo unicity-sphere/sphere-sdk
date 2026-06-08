@@ -30,7 +30,12 @@ import type {
 import type { ProfileStorageProvider } from './profile-storage-provider.js';
 import type { ProfileTokenStorageProvider } from './profile-token-storage-provider.js';
 import type { ProfileDatabase, MigrationPhase, MigrationResult } from './types.js';
-import { PROFILE_KEY_MAPPING, CACHE_ONLY_KEYS, IPFS_STATE_KEYS_PATTERN } from './types.js';
+import {
+  PROFILE_KEY_MAPPING,
+  CACHE_ONLY_KEYS,
+  IDENTITY_KEYS,
+  IPFS_STATE_KEYS_PATTERN,
+} from './types.js';
 import { ProfileError } from './errors.js';
 import { STORAGE_PREFIX } from '../constants.js';
 import {
@@ -135,6 +140,17 @@ const DEFAULT_IPFS_API_URL = 'https://ipfs.unicity.network';
 interface TransformedData {
   /** Profile-format key-value pairs (global + per-address). */
   readonly profileKeys: Map<string, string>;
+  /**
+   * Identity / seed material legacy keys (`mnemonic`, `master_key`, ...).
+   * These NEVER touch OrbitDB — they are written to ProfileStorageProvider
+   * via `storage.set(LEGACY_KEY, value)`, which short-circuits at the
+   * `cacheOnly` step (CACHE_ONLY_KEYS contains IDENTITY_KEYS). Tracked
+   * separately so they:
+   *   (a) skip the read-back sanity check (no OrbitDB record exists);
+   *   (b) make a future audit grep ("is identity material ever pushed
+   *       to OrbitDB?") return zero hits.
+   */
+  readonly identityKeys: Map<string, string>;
   /** TXF storage data (tokens + operational state) from legacy TokenStorageProvider. */
   readonly txfData: TxfStorageDataBase | null;
   /** Token IDs extracted from TXF data (for sanity check). */
@@ -335,7 +351,7 @@ export class ProfileMigration {
 
       const result: MigrationResult = {
         success: true,
-        keysMigrated: transformed.profileKeys.size,
+        keysMigrated: transformed.profileKeys.size + transformed.identityKeys.size,
         tokensMigrated: transformed.tokenIds.size,
         addressesMigrated: countAddresses(transformed),
         durationMs: Date.now() - startTime,
@@ -351,7 +367,8 @@ export class ProfileMigration {
 
       return {
         success: false,
-        keysMigrated: transformed?.profileKeys.size ?? 0,
+        keysMigrated:
+          (transformed?.profileKeys.size ?? 0) + (transformed?.identityKeys.size ?? 0),
         tokensMigrated: transformed?.tokenIds.size ?? 0,
         addressesMigrated: transformed !== null ? countAddresses(transformed) : 0,
         durationMs: Date.now() - startTime,
@@ -441,6 +458,7 @@ export class ProfileMigration {
     this.log('Step 2: TRANSFORM LOCAL');
 
     const profileKeys = new Map<string, string>();
+    const identityKeys = new Map<string, string>();
     const tokenIds = new Set<string>();
     let historyCount = 0;
     let conversationCount = 0;
@@ -471,6 +489,18 @@ export class ProfileMigration {
       // Read the value
       const value = await legacyStorage.get(rawKey);
       if (value === null) continue;
+
+      // Identity / seed material — divert to a separate map. These MUST
+      // NOT be mapped to their `identity.*` Profile key (which would
+      // try to write them to OrbitDB and trip the IDENTITY_KEYS guard
+      // in ProfileStorageProvider.set). Instead, persist them via the
+      // LEGACY key — ProfileStorageProvider treats them as cache-only
+      // (CACHE_ONLY_KEYS), so the write lands in the Profile localCache
+      // only and never replicates.
+      if (IDENTITY_KEYS.has(stripped)) {
+        identityKeys.set(stripped, value);
+        continue;
+      }
 
       // Map to Profile key name
       const profileKey = mapLegacyKeyToProfileKey(stripped);
@@ -561,6 +591,7 @@ export class ProfileMigration {
 
     return {
       profileKeys,
+      identityKeys,
       txfData,
       tokenIds,
       historyCount,
@@ -608,6 +639,28 @@ export class ProfileMigration {
       }
     }
     this.log(`Wrote ${keysWritten} profile keys`);
+
+    // Identity / seed material — write via the LEGACY key name so
+    // ProfileStorageProvider's `translateKey` reports `cacheOnly: true`
+    // and the write short-circuits at the localCache step (no OrbitDB
+    // entry, no IPFS replication). The defense-in-depth assertion in
+    // `ProfileStorageProvider.set` would fail-closed if anything routed
+    // an `identity.*` Profile key through here instead.
+    let identityKeysWritten = 0;
+    for (const [legacyKey, value] of data.identityKeys) {
+      try {
+        await storage.set(legacyKey, value);
+        identityKeysWritten++;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        throw new ProfileError(
+          'MIGRATION_FAILED',
+          `Failed to write identity key '${legacyKey}': ${msg}`,
+          err,
+        );
+      }
+    }
+    this.log(`Wrote ${identityKeysWritten} identity keys (cache-only, never OrbitDB)`);
 
     // Save TXF data via ProfileTokenStorageProvider
     // (builds UXF bundle, encrypts CAR, pins to IPFS, adds bundle ref to OrbitDB)

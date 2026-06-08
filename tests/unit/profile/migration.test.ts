@@ -394,6 +394,7 @@ describe('ProfileMigration', () => {
     it('catches missing profile key', async () => {
       const legacyStorage = createMockLegacyStorage({
         wallet_exists: 'true',
+        address_nametags: '{"alice":1}',
         mnemonic: 'secret',
       });
 
@@ -401,12 +402,16 @@ describe('ProfileMigration', () => {
 
       // Profile storage where set() works but get() returns null for
       // a specific key during sanity check (simulates data loss in OrbitDB).
+      // We target `addresses.nametags` — a non-identity profile key that
+      // DOES go through the OrbitDB-backed sanity-check path. (Identity
+      // keys are now diverted to a separate cache-only path and the
+      // sanity check intentionally skips them per CACHE_ONLY_KEYS.)
       const store = new Map<string, string>();
       let verifyingPhase = false;
       const profileStorage = {
         async get(key: string) {
-          // During verifying phase, pretend 'identity.mnemonic' is missing
-          if (verifyingPhase && key === 'identity.mnemonic') return null;
+          // During verifying phase, pretend 'addresses.nametags' is missing
+          if (verifyingPhase && key === 'addresses.nametags') return null;
           return store.get(key) ?? null;
         },
         async set(key: string, value: string) {

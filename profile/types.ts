@@ -939,15 +939,70 @@ export const PROFILE_KEY_MAPPING: ProfileKeyMap = {
 
 /**
  * Keys that are stored ONLY in the local cache, never written to OrbitDB.
- * These are regenerated from external APIs and are not replicated.
+ *
+ * Two distinct reasons land a key here:
+ *
+ * 1. **External-API caches** (`token_registry_*`, `price_*`) — regenerated
+ *    from network calls; replicating wastes OpLog bytes and stale entries
+ *    on one device can poison a cross-device read.
+ *
+ * 2. **Identity / seed material** (the IDENTITY_KEYS block) —
+ *    *security boundary*. OrbitDB content is replicated to IPFS (the
+ *    snapshot CAR is pinned by the user's own pin gateway *and*, in
+ *    practice, observable by any peer the pubsub topic reaches). Even
+ *    when wrapped by the password-derived `encrypt()`, distributing the
+ *    encrypted seed lowers the threat model from "attacker must
+ *    compromise the device" to "attacker must brute-force a password
+ *    against an IPFS-pinned ciphertext". The seed MUST stay
+ *    device-local; the only legitimate cross-device transport for the
+ *    seed is the user's own BIP-39 mnemonic backup. Audit #333 C1 was
+ *    interpreted as "encrypt before OrbitDB write" — that defense holds
+ *    only during Phase A (no key derived → `encrypt()` throws); any
+ *    post-Phase-A rewrite of an identity key would otherwise succeed
+ *    encrypted and leak. Mark them cache-only so the write short-
+ *    circuits at the localCache step in `ProfileStorageProvider.set()`.
  *
  * See PROFILE-ARCHITECTURE.md Section 2.1 "Cache-only keys".
  */
 export const CACHE_ONLY_KEYS: ReadonlySet<string> = new Set([
+  // External-API caches (regenerated from network)
   'token_registry_cache',
   'token_registry_cache_ts',
   'price_cache',
   'price_cache_ts',
+
+  // Identity / seed material — NEVER replicate via OrbitDB/IPFS.
+  // Keep this list in sync with IDENTITY_KEYS below.
+  'mnemonic',
+  'master_key',
+  'chain_code',
+  'derivation_path',
+  'base_path',
+  'derivation_mode',
+  'wallet_source',
+  // `current_address_index` is the active HD slot pointer. Could be cross-
+  // device synced in principle, but on a fresh-device boot the address-
+  // discovery walker re-derives it from the mnemonic anyway; keeping it
+  // device-local removes one more identity-shaped key from the OpLog.
+  'current_address_index',
+]);
+
+/**
+ * The identity / seed-material keys. Listed separately so other modules
+ * (migration, audits, tests) can refer to "the identity class" without
+ * coupling to the full CACHE_ONLY_KEYS list.
+ *
+ * Every key here MUST also appear in CACHE_ONLY_KEYS.
+ */
+export const IDENTITY_KEYS: ReadonlySet<string> = new Set([
+  'mnemonic',
+  'master_key',
+  'chain_code',
+  'derivation_path',
+  'base_path',
+  'derivation_mode',
+  'wallet_source',
+  'current_address_index',
 ]);
 
 /**

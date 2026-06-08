@@ -6412,6 +6412,32 @@ export class Sphere {
         fallbackThrew = err;
       }
       if (fallbackValue !== null && fallbackValue !== undefined) {
+        // Lazy backfill — write the fallback value into primary so the
+        // next boot finds it without consulting fallback again. With
+        // the IDENTITY_KEYS ⊂ CACHE_ONLY_KEYS fix in
+        // `profile-storage-provider.ts`, identity-key writes route to
+        // the Profile localCache (IndexedDB) only — they never reach
+        // OrbitDB / IPFS. So the backfill is the right move: it
+        // silences the per-boot "missing from primary; consulting
+        // fallbackStorage" warning for wallets that predate this fix
+        // without re-introducing the OrbitDB leak the cache-only
+        // routing closes.
+        //
+        // Best-effort: a failure to backfill is non-fatal — the read
+        // already succeeded and the caller has the value. We log at
+        // debug so operators can see why a subsequent boot still
+        // re-falls-back if the backfill kept failing.
+        try {
+          await this._storage.set(key, fallbackValue);
+        } catch (err) {
+          logger.debug(
+            'Sphere',
+            `Identity backfill of "${key}" into primary storage failed; the ` +
+              `next boot will re-consult fallback. (${
+                err instanceof Error ? err.message : String(err)
+              })`,
+          );
+        }
         return fallbackValue;
       }
       // Neither side has it. The primary error wins when both threw —
