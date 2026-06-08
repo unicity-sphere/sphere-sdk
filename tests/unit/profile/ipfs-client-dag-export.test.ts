@@ -173,13 +173,28 @@ describe('Issue #370 — fetchCarFromIpfs /dag/export fast path', () => {
     const reader = await CarReader.fromBytes(carBytes);
     const roots = await reader.getRoots();
     const rootCid = roots[0]!.toString();
+    // Issue #434 — fetchCarFromIpfs now peeks the root block via
+    // /block/get BEFORE deciding whether /dag/export is safe (Kubo's
+    // server-side IPLD walk only follows Tag 42 CID-links; UXF roots
+    // with raw 32-byte child refs would return an incomplete CAR via
+    // /dag/export, silently losing children — see issue #434). The
+    // peek needs the root bytes to decode and check `isUxfElement`,
+    // so the mock must serve the root block on /block/get even on
+    // the fast-path test.
+    const blocks = await carToBlockMap(carBytes);
 
-    mock = installMock({ probeStatus: 400, exportBytes: carBytes });
+    mock = installMock({ probeStatus: 400, exportBytes: carBytes, blocks });
     const out = await fetchCarFromIpfs(['https://gw-fast.test'], rootCid);
 
-    // Single export call, zero per-block fetches.
+    // Issue #434 — exactly one /block/get (the root peek) plus the
+    // /dag/export call. The peek replaces the "zero per-block
+    // fetches" claim of the original test: we now pay one extra
+    // round-trip for the UXF safety check. For non-UXF roots (this
+    // fixture's `makeFakeUxfCar` payload is `{ payload: ... }`,
+    // which doesn't match the UXF element shape) the fast path
+    // proceeds normally after the peek.
     expect(mock.exportCalls()).toBe(1);
-    expect(mock.blockGetCalls()).toBe(0);
+    expect(mock.blockGetCalls()).toBe(1);
 
     // Output is a valid CAR with the same root.
     const outReader = await CarReader.fromBytes(out);

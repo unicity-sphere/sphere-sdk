@@ -879,6 +879,114 @@ async function pinCarViaImport(
 }
 
 /**
+ * Issue #434 — direct-pin each child block to the gateway after a
+ * `/dag/import` succeeds.
+ *
+ * # Why this exists
+ *
+ * Kubo's `/api/v0/dag/import?pin-roots=true` pins each CAR root
+ * RECURSIVELY. Recursive pin walks the DAG via dag-cbor Tag 42 CID
+ * links. This works for the lean Profile snapshot CAR (root's
+ * `entryGroups[i].entriesCid` is a CID instance → encoded as Tag 42)
+ * but FAILS for UXF bundle CARs, whose children are referenced as
+ * raw 32-byte Uint8Array (PR #213 Option C — see
+ * `uxf/ipld.ts:elementToIpldBlock`). Kubo's recursive walk doesn't
+ * recognize raw 32-byte references as CID-links → it never reaches
+ * the children → only the root is pinned.
+ *
+ * The children DO land in the gateway's blockstore via the import
+ * (the entire CAR is uploaded), but they're unpinned and therefore
+ * eligible for GC. Worse, on some operator deployments unpinned
+ * blocks are evicted on memory pressure or LRU. The next cross-
+ * device recovery walks the bundle DAG via the UXF-aware walker
+ * (`walkUxfElement`), can't fetch a child block, and surfaces as
+ * `BUNDLE_NOT_FOUND` → 0 tokens recovered.
+ *
+ * This was the exact regression that triggered issue #434 — PR #199
+ * (May 21) fixed cross-device recovery by introducing per-block
+ * pinning via `pinCarBlocksToIpfs`'s legacy path. PR #370 (May 31)
+ * added the `/dag/import` fast path for performance, but the fast
+ * path silently regressed PR #199's fix for any CAR whose children
+ * aren't dag-cbor Tag 42 links.
+ *
+ * # Contract
+ *
+ * Issues a `/api/v0/pin/add?arg=<cid>&recursive=false` per block in
+ * `blocks` (excluding `expectedRootCid` which is already pinned
+ * recursively by the upstream `/dag/import`). `recursive=false`
+ * creates a "direct" pin — Kubo retains the block under GC but does
+ * NOT walk its children. This is exactly the contract we want:
+ * every block in the CAR gets its own pin record, regardless of
+ * whether the parent's recursive walk reaches it.
+ *
+ * Failures are LOGGED at warn and SWALLOWED — the `/dag/import`
+ * has already succeeded so the CAR is materially on the gateway.
+ * A pin-add failure on a SINGLE child is a soft signal (operator
+ * config / transient gateway hiccup) that doesn't justify
+ * unwinding an otherwise-successful import. The next flush /
+ * pointer-poll cycle will pick up any cross-device recovery gap
+ * via the existing retry machinery (issue #239 / #268).
+ *
+ * # Idempotency
+ *
+ * Kubo's `/pin/add` is idempotent at the gateway: re-pinning a CID
+ * already pinned returns success without side effect. So if the
+ * fast-path's `/dag/import?pin-roots=true` already pinned the root
+ * recursively AND that walk reached this child (Tag 42 case), the
+ * direct-pin here is a no-op. If it didn't reach the child (raw-
+ * byte case), the direct-pin closes the gap.
+ *
+ * Idempotent calls also preserve correctness against test stubs
+ * that don't actually pin — the contract is "best-effort" both at
+ * the gateway level and at the test-stub level.
+ */
+async function pinDirectBlocksToGateway(
+  gateway: string,
+  blocks: ReadonlyArray<{ cid: string; bytes: Uint8Array }>,
+  expectedRootCid: string,
+  timeoutMs: number,
+): Promise<void> {
+  const gatewayBase = normalizeGatewayKey(gateway);
+  for (const block of blocks) {
+    // Skip the root — already pinned recursively by /dag/import.
+    if (block.cid === expectedRootCid) continue;
+    const url =
+      `${gatewayBase}/api/v0/pin/add` +
+      `?arg=${encodeURIComponent(block.cid)}&recursive=false`;
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      // Drain so the connection releases.
+      try {
+        await response.text();
+      } catch {
+        /* ignore body parse failure */
+      }
+      if (!response.ok) {
+        logger.warn(
+          'ipfs-client',
+          `pinDirectBlocksToGateway: pin/add ${block.cid} on ${gateway} ` +
+            `returned HTTP ${response.status} ${response.statusText} ` +
+            `(continuing — block is in gateway blockstore from /dag/import)`,
+        );
+      }
+    } catch (err) {
+      // Network / timeout / abort — log + continue. The /dag/import
+      // already landed the bytes; a pin failure here means the block
+      // is unpinned at this gateway but still retrievable until GC.
+      logger.warn(
+        'ipfs-client',
+        `pinDirectBlocksToGateway: pin/add ${block.cid} on ${gateway} threw: ` +
+          `${err instanceof Error ? err.message : String(err)} ` +
+          `(continuing — block is in gateway blockstore from /dag/import)`,
+      );
+    }
+  }
+}
+
+/**
  * Single-round-trip CAR pull: POST to Kubo's
  * `/api/v0/dag/export?arg=<root>` and return the response bytes
  * verbatim. The bytes ARE a CARv1 stream — feed directly to
@@ -1369,6 +1477,29 @@ export async function pinCarBlocksToIpfs(
 
     try {
       await pinCarViaImport(gateway, carBytes, expectedRootCid, timeoutMs);
+      // Issue #434 — direct-pin every non-root block so children of
+      // CARs whose internal references aren't dag-cbor Tag 42 CID-links
+      // (e.g., UXF bundle CARs encode children as raw 32-byte
+      // Uint8Array per PR #213 Option C) are explicitly retained at
+      // the gateway. Kubo's `/dag/import?pin-roots=true` recursively
+      // pins from the root, but its walk only follows Tag 42 links —
+      // so raw-byte children remain unpinned in the gateway blockstore
+      // and become GC candidates. This loop adds a direct pin to each
+      // non-root block, closing the cross-device recovery gap that
+      // surfaces as `BUNDLE_NOT_FOUND` / 0-token recovery on the
+      // receiver. See `pinDirectBlocksToGateway` for the full
+      // rationale.
+      //
+      // Best-effort: pin failures are logged and swallowed by the
+      // helper. The /dag/import has already succeeded so the CAR is
+      // materially on the gateway; a pin gap will be picked up by the
+      // existing retry machinery (issue #239 / #268).
+      await pinDirectBlocksToGateway(
+        gateway,
+        parsed.blocks,
+        expectedRootCid,
+        timeoutMs,
+      );
       // One sidecar submit per CAR root (issue #370 explicit guidance).
       submitToSidecarBestEffort(gateway, expectedRootCid, parsed.rootBlock.bytes);
       return expectedRootCid;
@@ -2070,10 +2201,77 @@ export async function fetchCarFromIpfs(
 
   // Issue #370 fast path: probe each gateway for /dag/export. On a
   // capable gateway, fetch the whole CAR in a single HTTP request,
-  // verify every block CID-binding, reassemble and return. On any
-  // failure (404 probe miss, mid-call HTTP error, CID mismatch on
-  // any block, missing root in the exported CAR) fall through to the
-  // legacy per-block BFS path with the full gateway list.
+  // verify every block CID-binding, reassemble and return.
+  //
+  // Issue #434 — peek the root block FIRST to decide whether the fast
+  // path is safe. Kubo's `/dag/export` walks the DAG via codec-aware
+  // IPLD link extraction. For dag-cbor that means Tag 42 CBOR tags
+  // only. UXF bundle CAR roots encode their children as raw 32-byte
+  // Uint8Array (PR #213 Option C — see `uxf/ipld.ts:elementToIpldBlock`),
+  // NOT as Tag 42 tags. Kubo's walker doesn't recognize raw-byte refs
+  // as links and so `/dag/export` returns ONLY the root for a UXF CAR
+  // — even when the children are present in the gateway blockstore.
+  // The receiver then can't reassemble the bundle and downstream
+  // `UxfPackage.fromCar` silently produces zero tokens (the regression
+  // tracked in issue #434).
+  //
+  // To preserve the fast path's perf win for lean Profile snapshot
+  // CARs (whose children DO use Tag 42 CIDs) while restoring
+  // correctness for UXF bundle CARs, we fetch and inspect the root
+  // block before committing to /dag/export. If the root has the UXF
+  // shape (envelope + manifest CIDs in `[1]` / `[2]` / element header
+  // children encoded as Uint8Array), we skip the fast path and let
+  // the UXF-aware legacy BFS walker (`walkUxfElement`) handle it.
+  //
+  // Cost: one extra HTTP `block/get` per fetch. Mitigations:
+  //   - The legacy BFS path issues the same `block/get` for the root
+  //     as its first step, so for UXF CARs we've just hoisted that
+  //     call earlier (zero net round-trips).
+  //   - For non-UXF CARs we pay one extra round-trip in exchange for
+  //     the certainty that `/dag/export` returns a complete CAR — well
+  //     worth it given the silent-data-loss alternative.
+  //   - The root block is the smallest block of any CAR (just metadata
+  //     + child CID list) so the call is fast.
+  let rootIsUxf = false;
+  try {
+    const rootBlockBytes = await fetchFromIpfs(
+      effectiveGateways,
+      rootCid,
+      timeoutMs,
+      maxSizeBytesPerBlock,
+      helia,
+    );
+    try {
+      const { decode: dagCborDecode } = await import('@ipld/dag-cbor');
+      const decoded = dagCborDecode(rootBlockBytes);
+      rootIsUxf = isUxfElement(decoded);
+    } catch {
+      // Decode failure is non-fatal here — fall through to /dag/export
+      // which will surface the same decode issue at verifyAnd... time,
+      // and ultimately legacy BFS will reproduce the error with full
+      // context.
+    }
+  } catch {
+    // If we can't even fetch the root, /dag/export has no chance
+    // either. Let the legacy path's per-block fetch loop surface the
+    // canonical `BUNDLE_NOT_FOUND` with full per-gateway details.
+  }
+
+  if (rootIsUxf) {
+    // UXF root — force legacy BFS so `walkUxfElement` traverses the
+    // raw-byte children correctly. The fast path WOULD return a
+    // single-block CAR (just the root) and downstream consumers would
+    // silently get an empty package.
+    return fetchCarFromIpfsLegacy(
+      effectiveGateways,
+      rootCid,
+      parsedRoot,
+      timeoutMs,
+      maxSizeBytesPerBlock,
+      helia,
+    );
+  }
+
   for (const gateway of effectiveGateways) {
     const caps = await probeGatewayCapabilities(gateway);
     if (!caps.dagExport) continue;
