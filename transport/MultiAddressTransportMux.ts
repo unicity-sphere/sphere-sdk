@@ -638,6 +638,16 @@ export class MultiAddressTransportMux {
           this.emitEvent({ type: 'transport:connected', timestamp: Date.now() });
         }
         // Re-establish subscriptions — the relay drops them on disconnect.
+        //
+        // Issue #442 caveat: if reconnect lands inside the bootstrap
+        // suppression window (between `ensureTransportMux` and the
+        // trailing `armSubscriptions` in `initializeModules`), this
+        // call short-circuits at the gate inside `updateSubscriptions`
+        // and no rebuild fires here. That's intentional — `arm`
+        // itself calls `updateSubscriptions` unconditionally, so the
+        // explicit arm masks rebuilds dropped during the suppress
+        // window. Outside the bootstrap window the gate is open and
+        // this path behaves as before.
         this.updateSubscriptions().catch((err) => {
           logger.error('Mux', 'Failed to re-subscribe after reconnect:', err);
         });
@@ -1011,6 +1021,14 @@ export class MultiAddressTransportMux {
    * Schedule a re-subscription after a relay-initiated subscription closure.
    * Debounced: if both wallet and chat subscriptions fire onError in quick
    * succession, only one updateSubscriptions() call runs.
+   *
+   * Issue #442 caveat: if the 2 s timer ticks while the gate is
+   * suppressed (during the bootstrap window), `updateSubscriptions`
+   * short-circuits and the rebuild is dropped. The explicit
+   * `armSubscriptions` at the end of `Sphere.initializeModules`
+   * always calls `updateSubscriptions` unconditionally, so any
+   * rebuild dropped here self-heals when arm fires. Outside the
+   * bootstrap window the gate is open and this path is unaffected.
    */
   private scheduleResubscribe(): void {
     if (this.resubscribeTimer) return; // already scheduled
