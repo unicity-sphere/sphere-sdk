@@ -10,6 +10,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { Sphere } from '../../core/Sphere';
 import { FileStorageProvider } from '../../impl/nodejs/storage/FileStorageProvider';
@@ -28,9 +29,16 @@ vi.mock('../../l1/network', () => ({
 // Test directories
 // =============================================================================
 
-const TEST_DIR = path.join(__dirname, '.test-provider-disable-sync');
-const DATA_DIR = path.join(TEST_DIR, 'data');
-const TOKENS_DIR = path.join(TEST_DIR, 'tokens');
+// Per-test unique directory under tmpfs (see commit 9bf3e90 and PR #432).
+let TEST_DIR = '';
+let DATA_DIR = '';
+let TOKENS_DIR = '';
+
+function freshTestDirs(): void {
+  TEST_DIR = path.join(os.tmpdir(), `sphere-provider-disable-sync-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
+  DATA_DIR = path.join(TEST_DIR, 'data');
+  TOKENS_DIR = path.join(TEST_DIR, 'tokens');
+}
 
 // =============================================================================
 // Mock providers
@@ -130,7 +138,7 @@ describe('Provider disable/enable integration', () => {
   let tokenStorageMock: TokenStorageProvider<TxfStorageDataBase>;
 
   beforeEach(async () => {
-    cleanTestDir();
+    freshTestDirs();
     if (Sphere.getInstance()) {
       try { await Sphere.getInstance()!.destroy(); } catch { /* ignore */ }
     }

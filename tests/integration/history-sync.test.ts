@@ -15,6 +15,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { Sphere } from '../../core/Sphere';
 import { FileStorageProvider } from '../../impl/nodejs/storage/FileStorageProvider';
@@ -40,9 +41,16 @@ vi.mock('../../l1/network', () => ({
 // Test directories
 // =============================================================================
 
-const TEST_DIR = path.join(__dirname, '.test-history-sync');
-const DEVICE_A_DIR = path.join(TEST_DIR, 'device-a');
-const DEVICE_B_DIR = path.join(TEST_DIR, 'device-b');
+// Per-test unique directory under tmpfs (see commit 9bf3e90 and PR #432).
+let TEST_DIR = '';
+let DEVICE_A_DIR = '';
+let DEVICE_B_DIR = '';
+
+function freshTestDirs(): void {
+  TEST_DIR = path.join(os.tmpdir(), `sphere-history-sync-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
+  DEVICE_A_DIR = path.join(TEST_DIR, 'device-a');
+  DEVICE_B_DIR = path.join(TEST_DIR, 'device-b');
+}
 
 // =============================================================================
 // Mock providers
@@ -161,7 +169,7 @@ describe('History sync integration (multi-device)', () => {
   let sharedIpfsState: { data: TxfStorageDataBase | null };
 
   beforeEach(() => {
-    cleanTestDir();
+    freshTestDirs();
     sharedIpfsState = { data: null };
     if (Sphere.getInstance()) {
       (Sphere as unknown as { instance: null }).instance = null;
