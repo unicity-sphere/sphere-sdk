@@ -813,6 +813,61 @@ export class SwapModule {
   }
 
   /**
+   * Lazy-load a terminal swap record from per-swap storage. Used by
+   * {@link getSwapStatus} after a cache miss on {@link swaps} — see the
+   * comment there for why terminal swaps are deliberately kept out of
+   * the in-memory working set.
+   *
+   * Returns null when:
+   *   - the id is NOT in {@link terminalSwapIds} — the gate restricts
+   *     storage reads to ids the module has previously observed as
+   *     terminal (either at {@link loadFromStorage} time or via an
+   *     in-process transition). Note that this set is sticky for the
+   *     process lifetime: ids that {@link loadFromStorage} added before
+   *     deciding to PURGE the storage record (TTL-expired entries) stay
+   *     in the set — that is intentional, so DM-driven replays cannot
+   *     resurrect a closed swap. For purged ids the helper still
+   *     returns null because the subsequent storage read finds no
+   *     record, so the caller's {@code SWAP_NOT_FOUND} surface is
+   *     unchanged. \"Gate true, no record\" is a normal, expected case.
+   *   - the storage read or JSON parse fails.
+   *   - the persisted record lacks a {@code swap} field.
+   *
+   * The loaded record is NOT inserted into {@link swaps} — callers that
+   * need repeated access should hold the returned ref. Keeping the
+   * terminal working set out of memory preserves the bound that
+   * {@link loadFromStorage} establishes ({@code terminalPurgeTtlMs}
+   * window × cardinality), which can be hundreds of swaps for a heavy
+   * wallet.
+   */
+  private async loadTerminalSwapFromStorage(swapId: string): Promise<SwapRef | null> {
+    if (!this.terminalSwapIds.has(swapId)) return null;
+    const deps = this.deps;
+    if (!deps) return null;
+
+    const addressId = deps.identity.directAddress
+      ? deps.identity.directAddress
+      : deps.identity.chainPubkey;
+    const swapKey = getAddressStorageKey(
+      addressId,
+      `${STORAGE_KEYS_ADDRESS.SWAP_RECORD_PREFIX}${swapId}`,
+    );
+
+    try {
+      const raw = await deps.storage.get(swapKey);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw) as SwapStorageData;
+      if (parsed.version > 1) {
+        logger.warn(LOG_TAG, `Terminal swap ${swapId} has version ${parsed.version}, expected 1. Attempting best-effort load.`);
+      }
+      return parsed.swap ?? null;
+    } catch (err) {
+      logger.warn(LOG_TAG, `Failed to load terminal swap ${swapId} from storage:`, err);
+      return null;
+    }
+  }
+
+  /**
    * Remove a single swap from storage (per-swap key) and update the index.
    */
   private async removeSwapFromStorage(swapId: string): Promise<void> {
@@ -2150,15 +2205,47 @@ export class SwapModule {
     this.ensureNotDestroyed();
     this.ensureReady();
 
-    const swap = this.swaps.get(swapId);
+    let swap = this.swaps.get(swapId);
+    let isLazyLoadedTerminal = false;
     if (!swap) {
-      throw new SphereError(`Swap not found: ${swapId}`, 'SWAP_NOT_FOUND');
+      // Terminal swaps are deliberately omitted from `this.swaps` at
+      // load time (see `loadFromStorage`) to keep memory bounded — a
+      // long-lived wallet can accumulate hundreds of terminal entries
+      // inside the `terminalPurgeTtlMs` window. `getSwapStatus` is the
+      // one public surface where callers legitimately want to query a
+      // terminal swap (e.g. a soak verification that the swap reached
+      // `completed` after a fresh-CLI restart), so fall through to
+      // storage on demand. The loaded record is NOT inserted into
+      // `this.swaps` — that map stays the active-swap working set.
+      const terminalSwap = await this.loadTerminalSwapFromStorage(swapId);
+      if (!terminalSwap) {
+        throw new SphereError(`Swap not found: ${swapId}`, 'SWAP_NOT_FOUND');
+      }
+      swap = terminalSwap;
+      isLazyLoadedTerminal = true;
     }
 
     // Determine whether to query the escrow for the latest state.
     // If options.queryEscrow is explicitly set, use that; otherwise default to
     // true for active swaps and false for terminal swaps.
-    const shouldQuery = options?.queryEscrow ?? !isTerminalProgress(swap.progress);
+    //
+    // EXCEPT: for a lazy-loaded terminal swap (not in `this.swaps`), we
+    // unconditionally skip the escrow DM even when the caller explicitly
+    // requested `queryEscrow: true`. The downstream `status_result` DM
+    // handler resolves the swap via `this.swaps.get` — it has no path
+    // for lazy-loading from storage — so the response from escrow
+    // would be silently dropped on arrival. Firing the DM under
+    // those conditions is a footgun (network noise, escrow load, no
+    // observable effect for the caller); refuse it explicitly instead.
+    const shouldQuery = !isLazyLoadedTerminal
+      && (options?.queryEscrow ?? !isTerminalProgress(swap.progress));
+
+    if (isLazyLoadedTerminal && options?.queryEscrow === true) {
+      logger.debug(
+        LOG_TAG,
+        `getSwapStatus(${swapId}): queryEscrow ignored — swap is lazy-loaded from storage and the status_result handler cannot reach it. Re-issue the call after the swap is brought back into the active working set.`,
+      );
+    }
 
     if (shouldQuery) {
       // Fire-and-forget: resolve escrow address and send status DM.

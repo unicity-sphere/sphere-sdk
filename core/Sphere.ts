@@ -3829,6 +3829,20 @@ export class Sphere {
 
     const emitEvent = this.emitEvent.bind(this);
 
+    // Issue #442 — suppress the mux subscription BEFORE addAddress so the
+    // relay filter is NOT rebuilt with the new pubkey until this address's
+    // modules finish loading. The mux is already armed from the primary
+    // address's `initializeModules()`, so without this hop the upcoming
+    // `addAddress(...)` would auto-call `updateSubscriptions()` and the
+    // relay would immediately start streaming events for the new pubkey
+    // into adapters whose handlers haven't registered yet — same race as
+    // the primary path. The primary address's existing wallet/chat sub
+    // continues delivering through the suppression window (suppress is a
+    // gate on FUTURE updates, not a tear-down).
+    if (this._transportMux) {
+      this._transportMux.suppressSubscriptions();
+    }
+
     // Ensure transport mux exists for non-primary addresses
     const adapter = await this.ensureTransportMux(index, identity);
 
@@ -4138,6 +4152,21 @@ export class Sphere {
       }
     }
 
+    // Issue #442 — arm the mux now that the new address's modules have
+    // registered their handlers. Rebuilds the relay filter to include the
+    // new pubkey alongside any previously-tracked addresses. See the
+    // matching suppress call earlier in this method.
+    if (this._transportMux) {
+      try {
+        await this._transportMux.armSubscriptions();
+      } catch (err) {
+        logger.warn(
+          'Sphere',
+          `[#442] mux armSubscriptions failed in initializeAddressModules (continuing — address ${index} will receive no events until reconnect): ${safeErrorMessage(err)}`,
+        );
+      }
+    }
+
     const moduleSet: AddressModuleSet = {
       index,
       identity,
@@ -4317,6 +4346,17 @@ export class Sphere {
           ? () => nostrTransport.getNostrClient()
           : undefined,
       });
+
+      // Issue #442 — suppress mux subscriptions BEFORE connect so the
+      // relay subscription is NOT opened until armSubscriptions() runs
+      // after every module's `load()` returns. Without this, DMs replayed
+      // by the relay between `mux.connect()` and `swap.load()` register
+      // their `communications.onDirectMessage(...)` handler land in the
+      // CommunicationsModule inbox (via the comms-owned onMessage handler
+      // that DOES register early) but never reach SwapModule's
+      // `swap_proposal:` parser — breaking cross-process swap flows
+      // (sphere-sdk#437). Mirrors the #423 fix for the non-mux path.
+      this._transportMux.suppressSubscriptions();
 
       // Connect the mux
       await this._transportMux.connect();
@@ -7714,6 +7754,27 @@ export class Sphere {
         'Sphere',
         `[#423] armSubscriptions failed (continuing — auto-arm fallback will retry): ${safeErrorMessage(err)}`,
       );
+    }
+
+    // Issue #442 — arm the MUX's relay subscription. Mirrors the #423 arm
+    // above but for the mux path (which the #423 fix explicitly leaves as
+    // a no-op — see the comment in the #423 block above for the
+    // "suppressSubscriptions on the outer provider, mux owns event routing"
+    // architecture). Without this, the mux's `updateSubscriptions()` never
+    // runs after `ensureTransportMux()` suppressed it pre-connect, and the
+    // wallet receives no DMs / token transfers / payment requests at all
+    // (worse than the original bug — total event blackout instead of
+    // late-handler drops). Always paired with the suppress call in
+    // `ensureTransportMux`.
+    if (this._transportMux) {
+      try {
+        await this._transportMux.armSubscriptions();
+      } catch (err) {
+        logger.warn(
+          'Sphere',
+          `[#442] mux armSubscriptions failed (continuing — wallet will receive no events until reconnect): ${safeErrorMessage(err)}`,
+        );
+      }
     }
   }
 
