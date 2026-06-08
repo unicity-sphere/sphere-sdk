@@ -197,11 +197,6 @@ async function tryGetBlockFromLocalHelia(
   return bytes;
 }
 
-// SHA-256 multihash code (multiformats `sha2-256`).
-const MULTIHASH_SHA256 = 0x12;
-/** Length of a sha2-256 digest in bytes. */
-const SHA256_DIGEST_BYTES = 32;
-
 // =============================================================================
 // Multicodec constants (subset used by the Profile/UXF stack)
 // =============================================================================
@@ -1213,9 +1208,10 @@ async function pinSingleBlockOnce(
       // to the sidecar (same gateway). The bytes hash to `expectedCid`
       // by construction here (each block in a CAR satisfies
       // `sha256(block.bytes) === block.cid.multihash.digest` per Issue
-      // #213 / Option C). The sidecar's `_infer_block_put_params`
-      // handles raw / dag-cbor / dag-pb codecs by CID prefix — no
-      // codec-specific gating needed on this side.
+      // #435 — Tag 42 CID-link encoding preserves the equivalence). The
+      // sidecar's `_infer_block_put_params` handles raw / dag-cbor /
+      // dag-pb codecs by CID prefix — no codec-specific gating needed
+      // on this side.
       submitToSidecarBestEffort(gateway, expectedCid, blockBytes);
       return;
     } catch (err) {
@@ -1256,16 +1252,20 @@ async function pinSingleBlockOnce(
  * `sha256(bytes)` against the framed CID — it just slices framed
  * `{cid, bytes}` pairs from the stream).
  *
- * Issue #213 (Option C) reconciled the prior CID/bytes mismatch in
- * `uxf/ipld.ts:elementToIpldBlock`: sub-block bytes are now encoded in
- * the SAME canonical form used for content hashing (children as raw
- * 32-byte Uint8Array, not Tag 42 CID links), so
- * `sha256(block.bytes) === block.cid.multihash.digest` holds for every
- * UXF sub-block. The producer-side verification is performed
- * per-block below (a lightweight sanity check that catches builder
- * bugs without re-deriving the CIDs Kubo would assign). Receiver-side
- * verification continues via `fetchFromIpfs` (CID-binding check
- * against gateway-returned bytes).
+ * Issue #435 — `uxf/ipld.ts:elementToIpldBlock` emits child references
+ * and `header[3]` predecessor as dag-cbor **Tag 42 CID-links**. The
+ * hash canonical form and the IPLD canonical form remain a single
+ * bit-identical form, so `sha256(block.bytes) === block.cid.multihash.digest`
+ * holds for every UXF sub-block. Tag 42 framing is what Kubo's
+ * recursive pin (`/dag/import?pin-roots=true`) walks natively — so the
+ * fast-path code above is sufficient for UXF CARs without any
+ * client-side per-block follow-up. This legacy per-block loop remains
+ * the hardened fallback for gateways that don't expose `/dag/import`.
+ * Producer-side verification is performed per-block below (a
+ * lightweight sanity check that catches builder bugs without
+ * re-deriving the CIDs Kubo would assign). Receiver-side verification
+ * continues via `fetchFromIpfs` (CID-binding check against
+ * gateway-returned bytes).
  *
  * Issue #236 — when `helia` is supplied (the local Helia node managed by
  * the `OrbitDbAdapter`), each block is written to the local on-disk
@@ -1478,30 +1478,18 @@ async function pinCarBlocksToIpfsLegacy(
   for await (const block of reader.blocks()) {
     blocks.push({ cid: block.cid.toString(), bytes: block.bytes });
   }
-  // Issue #213 (Option C) — UXF element bytes are now encoded in the
-  // SAME canonical form used for hashing (children as raw 32-byte
-  // Uint8Array; predecessor in `header[3]` likewise). That makes
-  // `sha256(block.bytes) === block.cid.multihash.digest` hold for
-  // every sub-block of every legitimate bundle CAR. Kubo's `dag/put`
-  // re-derives the CID from the bytes; under Option C it agrees with
-  // our locally claimed CID, so the per-block pin/fetch round-trips
-  // succeed under the same CID we publish in the manifest.
+  // Issue #435 — UXF element bytes are encoded in the SAME canonical
+  // form used for hashing (children + `header[3]` predecessor emitted
+  // as dag-cbor **Tag 42 CID-links**). That keeps
+  // `sha256(block.bytes) === block.cid.multihash.digest` for every
+  // sub-block of a bundle CAR, so Kubo's `dag/put` re-derives the same
+  // CID we publish under and per-block round-trips agree.
   //
   // We don't run a uniform `verifyCidMatchesBytes` here — that's a
   // receiver-side defense (gateway tampering). The producer is the
   // bytes' authority. If a future builder bug breaks the equivalence,
   // it would surface immediately as a downstream `fetchFromIpfs`
   // mismatch on the next consumer fetch.
-  //
-  // Backward-compatibility note: legacy bundle CARs produced before
-  // #213 encoded children as Tag 42 CID links. Their sub-block CIDs
-  // did not match `sha256(bytes)`. They remain readable by the
-  // hierarchical walker (`walkUxfElement` accepts both forms) but
-  // cannot be pinned under their original CIDs by `pinCarBlocksToIpfs`
-  // — a fresh export via `exportToCar` will produce the new canonical
-  // form. The dual-codec receiver in `fetchCarFromIpfs` continues to
-  // accept the legacy single-block raw-codec CARs from the #212
-  // interim, so in-flight wallet pointers remain reachable.
   if (blocks.length === 0) {
     throw new ProfileError(
       'ORBITDB_WRITE_FAILED',
@@ -2186,20 +2174,12 @@ async function fetchCarFromIpfsLegacy(
         const childStr = childCid.toString();
         if (!visited.has(childStr)) queue.push(childStr);
       };
-      // Issue #213 (Option C): UXF element blocks encode children as
-      // raw 32-byte hash bytes (CBOR bstr) — the SAME canonical form
-      // used for hashing — so `sha256(bytes) === cid.multihash.digest`
-      // for every element block. The generic `CID.asCID`-based walker
-      // misses these references because they're Uint8Array, not Tag 42
-      // CID objects. Detect UXF shape and walk via
-      // `contentHashBytesToCid` instead. Falls through to the generic
-      // walker for envelope, manifest, and lean-snapshot blocks (which
-      // continue to use CID-link references).
-      if (isUxfElement(decoded)) {
-        walkUxfElement(decoded, visit);
-      } else {
-        collectCidLinks(decoded, visit);
-      }
+      // Issue #435: every UXF element block now encodes children
+      // (and `header[3]` predecessor) as dag-cbor **Tag 42 CID-links**.
+      // `collectCidLinks` follows them uniformly across UXF, envelope,
+      // manifest, and lean-snapshot blocks — no client-side UXF-aware
+      // walker required.
+      collectCidLinks(decoded, visit);
     }
   }
 
@@ -2272,127 +2252,12 @@ function collectCidLinks(value: unknown, visit: (cid: CID) => void): void {
 }
 
 // ---------------------------------------------------------------------------
-// UXF-aware walker (issue #213, Option C)
+// (Issue #435) — the UXF-aware walker (`isUxfElement` / `walkUxfElement` /
+// `contentHashBytesToCid`) was removed once `uxf/ipld.ts:elementToIpldBlock`
+// switched to dag-cbor Tag 42 CID-links for child references and
+// `header[3]` predecessor. `collectCidLinks` now follows every link
+// uniformly. See PR for issue #435.
 // ---------------------------------------------------------------------------
-
-/**
- * Internal type guard: detect the structural shape of a UXF element
- * block as produced by `uxf/ipld.ts:elementToIpldBlock`.
- *
- * A UXF element block is a dag-cbor map with four keys:
- *   - `header`:   array of length >= 4 ([representation, semantics,
- *                 kind, predecessor]); predecessor is `null` or a
- *                 32-byte Uint8Array (sha-256 digest).
- *   - `type`:     integer type ID (see `ELEMENT_TYPE_IDS` in
- *                 `uxf/types.ts`).
- *   - `content`:  object map (per-type schema).
- *   - `children`: object map; values are `null`, 32-byte Uint8Array,
- *                 or arrays thereof. Issue #213 transition tolerates
- *                 legacy Tag 42 CID values too, but the walker only
- *                 follows Uint8Array references — CID children are
- *                 redundantly handled by the generic walker fallback.
- *
- * The check is intentionally permissive on `content` (per-type schema
- * variance) and tight on the four-key surface that distinguishes UXF
- * elements from envelope / manifest / lean-snapshot blocks. False
- * positives are harmless: the worst case is that `walkUxfElement`
- * runs against a non-element shape and finds no Uint8Array children
- * (returns no CIDs, matching the safe fallback behaviour). False
- * negatives would silently break per-block traversal — keep the
- * predicate stable.
- */
-function isUxfElement(value: unknown): value is {
-  header: unknown[];
-  type: number;
-  content: Record<string, unknown>;
-  children: Record<string, unknown>;
-} {
-  if (value === null || typeof value !== 'object') return false;
-  if (value instanceof Uint8Array) return false;
-  if (Array.isArray(value)) return false;
-  const obj = value as Record<string, unknown>;
-  if (!Array.isArray(obj.header)) return false;
-  if (obj.header.length < 4) return false;
-  if (typeof obj.type !== 'number') return false;
-  if (typeof obj.content !== 'object' || obj.content === null) return false;
-  if (Array.isArray(obj.content)) return false;
-  if (typeof obj.children !== 'object' || obj.children === null) return false;
-  if (Array.isArray(obj.children)) return false;
-  return true;
-}
-
-/**
- * Convert a 32-byte sha2-256 content hash digest (raw bytes) into a
- * CIDv1 with dag-cbor codec — the inverse of
- * `uxf/ipld.ts:contentHashToCid`. Mirrors that function locally so the
- * Profile package doesn't take a cross-package dependency on `uxf/` for
- * a hot fetch path.
- */
-function contentHashBytesToCid(bytes: Uint8Array): CID {
-  return CID.createV1(CODEC_DAG_CBOR, createMultihash(MULTIHASH_SHA256, bytes));
-}
-
-/**
- * Walk a UXF element block and invoke `visit` on every child CID
- * reference. Issue #213 (Option C) — UXF element blocks encode
- * `children` values as raw 32-byte Uint8Array digests (CBOR bstr) and
- * `header[3]` (predecessor) the same way. Each 32-byte digest is
- * converted into a CIDv1(dag-cbor, sha2-256) so the BFS walker treats
- * it as a normal child link.
- *
- * Mixed-form tolerance: a single element with a legacy Tag 42 CID
- * value alongside a Uint8Array value is visited correctly — Uint8Array
- * via `contentHashBytesToCid`, CID via `CID.asCID`. No producer emits
- * mixed shapes; the dual handling exists for the cutover window.
- *
- * Items of unexpected length (not 32 bytes) are silently skipped:
- * malformed bytes that survived `importFromCar`'s validation would
- * fail downstream verification anyway, so the walker stays liberal.
- */
-function walkUxfElement(
-  node: {
-    header: unknown[];
-    children: Record<string, unknown>;
-  },
-  visit: (cid: CID) => void,
-): void {
-  // Walk header[3] (predecessor). New canonical form encodes it as a
-  // 32-byte Uint8Array. `header[0..2]` are scalar fields (numbers /
-  // strings) with no link references.
-  const predecessor = node.header[3];
-  if (predecessor instanceof Uint8Array && predecessor.byteLength === SHA256_DIGEST_BYTES) {
-    visit(contentHashBytesToCid(predecessor));
-  } else {
-    const asCid = predecessor != null ? CID.asCID(predecessor as CID) : null;
-    if (asCid !== null) visit(asCid);
-  }
-
-  // Walk children. Each value is null | Uint8Array(32) | CID | array
-  // of the prior.
-  for (const value of Object.values(node.children)) {
-    walkUxfChildValue(value, visit);
-  }
-}
-
-function walkUxfChildValue(value: unknown, visit: (cid: CID) => void): void {
-  if (value === null || value === undefined) return;
-  if (value instanceof Uint8Array) {
-    if (value.byteLength === SHA256_DIGEST_BYTES) {
-      visit(contentHashBytesToCid(value));
-    }
-    return;
-  }
-  const asCid = CID.asCID(value as CID);
-  if (asCid !== null) {
-    visit(asCid);
-    return;
-  }
-  if (Array.isArray(value)) {
-    for (const item of value) walkUxfChildValue(item, visit);
-  }
-  // Unknown shapes: silently skip — the importFromCar path would have
-  // rejected them on the receiver side.
-}
 
 /**
  * Verify that `sha256(bytes)` matches the multihash digest encoded in

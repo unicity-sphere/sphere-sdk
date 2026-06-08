@@ -92,6 +92,40 @@ Required steps:
 
 ## Bump history
 
+### v6 — Encode child / predecessor refs as dag-cbor Tag 42 CID-links (issue #435)
+
+PR #213 Option C (v3) made `uxf/ipld.ts:elementToIpldBlock` emit child
+references as raw 32-byte `Uint8Array` digests so the IPLD canonical form
+matched the hash canonical form and `sha256(block.bytes) === cid.multihash.digest`.
+That fix worked for hashing but broke the client / server contract with
+Kubo: `/api/v0/dag/import?pin-roots=true` only walks the DAG via dag-cbor
+**Tag 42** CID-links, so raw-byte children were never recursively pinned;
+`/api/v0/dag/export?arg=<root>` likewise only follows Tag 42 tags, so the
+fast-path receiver returned the root + envelope + manifest and stopped.
+The two workarounds layered on top of #213 (per-block `/pin/add` loop on
+publish + root-shape peek and UXF-aware BFS walker on fetch) lived in
+`profile/ipfs-client.ts` and were architecturally redundant.
+
+Issue #435 emits both `element.children` refs and `header[3]` predecessor
+refs as Tag 42 CID-links. The IPLD canonical form and the hash canonical
+form remain a single bit-identical form (the only change is that the
+child bstr becomes a CID tag), so `sha256(block.bytes) === cid.multihash.digest`
+still holds. Kubo's recursive pin walks the whole DAG; `/dag/export`
+returns the whole DAG; the client-side per-block pin loop and the
+UXF-aware walker (`isUxfElement` / `walkUxfElement` / `contentHashBytesToCid`)
+were deleted. Wire format intentionally diverged from v5 — testnet
+posture, no backward compatibility (wallets re-mint or migrate by
+re-receiving tokens).
+
+Bytes shifted: every child reference grew from a 33-byte CBOR bstr
+(1 tag + 32 digest) to a Tag 42 CID-link (≈40 bytes: Tag 42 + CIDv1
+multibase + multicodec + multihash + digest). TOKEN_A's bundle grew
+from 2317 to 2373 bytes.
+
+`_marker` bumped to `T.2.D.REFERENCE.SNAPSHOT.v6`. ADR documented
+inline in `uxf/ipld.ts:elementToIpldBlock`, `uxf/hash.ts:prepareChildrenForHashing`,
+and in issue #435's description.
+
 ### v5 — Embed SmtPath as opaque STS-canonical CBOR (issue #295 rewrite #2)
 
 The v4 bump still left UXF reaching into STS's encoding by calling

@@ -201,17 +201,16 @@ describe('fetchCarFromIpfs (Issue #200 Phase 2)', () => {
     expect(cids.size).toBe(4);
   });
 
-  it('#213: walks UXF element blocks via Uint8Array children (Option C walker)', async () => {
-    // Real Option C round-trip: produce a multi-block UXF bundle via
-    // `exportToCar` (envelope + manifest + per-element blocks where
-    // children are encoded as raw 32-byte Uint8Array, not Tag 42 CID
-    // links), plant every block in the gateway, then walk the CAR
-    // from the root via `fetchCarFromIpfs`. The walker MUST detect
-    // UXF element shape (`isUxfElement`) and convert Uint8Array
-    // children into CID references via `contentHashBytesToCid` —
-    // otherwise the BFS terminates after the envelope+manifest and
-    // misses every element block, returning an incomplete CAR that
-    // `UxfPackage.fromCar` rejects with a missing-block error.
+  it('#435: walks the full UXF DAG via generic Tag 42 CID-link walker', async () => {
+    // Produce a multi-block UXF bundle via `exportToCar` (envelope +
+    // manifest + per-element blocks where children and `header[3]`
+    // predecessor are encoded as dag-cbor **Tag 42 CID-links** per
+    // issue #435), plant every block in the gateway, then walk the
+    // CAR from the root via `fetchCarFromIpfs`. The generic
+    // `collectCidLinks` walker MUST follow every Tag 42 link across
+    // both UXF and non-UXF dag-cbor blocks — otherwise the BFS
+    // terminates early and `UxfPackage.fromCar` rejects the
+    // incomplete CAR with a missing-block error.
     const { exportToCar } = await import('../../../uxf/ipld.js');
     const { ElementPool } = await import('../../../uxf/element-pool.js');
     const { deconstructToken } = await import('../../../uxf/deconstruct.js');
@@ -301,7 +300,9 @@ describe('fetchCarFromIpfs (Issue #200 Phase 2)', () => {
     installBlockGateway(blocks);
 
     // Walk via fetchCarFromIpfs — this is the consumer-side path that
-    // exercises `isUxfElement` + `walkUxfElement` + `contentHashBytesToCid`.
+    // exercises the generic `collectCidLinks` walker across every
+    // Tag 42 CID-link in the bundle (envelope → manifest → token
+    // roots → child elements → predecessors).
     const reassembled = await fetchCarFromIpfs(
       ['https://gateway.test'],
       rootCid,
@@ -309,8 +310,8 @@ describe('fetchCarFromIpfs (Issue #200 Phase 2)', () => {
 
     // The reassembled CAR must contain every source block — the walker
     // discovered every element block reachable from the root via
-    // Uint8Array children (envelope CID-link to manifest, manifest
-    // CID-links to roots, roots' Uint8Array children to descendants).
+    // Tag 42 CID-links (envelope → manifest → token roots → child
+    // elements → predecessors).
     const reassembledReader = await CarReader.fromBytes(reassembled);
     const reassembledCids = new Set<string>();
     for await (const block of reassembledReader.blocks()) {

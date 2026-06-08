@@ -618,8 +618,9 @@ async function doAcquireBundle(
     // hard bundle rejection — the transfer is invisible.
     //
     // `fetchCarFromIpfs` is the symmetric consumer for the producer's
-    // per-block pin path: it parses the root, walks UXF-aware element
-    // children (`isUxfElement` / `walkUxfElement`), fetches each block
+    // CAR-import path: it parses the root, prefers `/api/v0/dag/export`
+    // and falls back to a per-block BFS that follows Tag 42 CID-links
+    // uniformly via `collectCidLinks` (issue #435), fetches each block
     // via `block/get`, and reassembles a CAR. The result is a CAR
     // that `UxfPackage.fromCar` and `pkg.verify` will accept.
     //
@@ -646,7 +647,7 @@ async function doAcquireBundle(
       // Steelman fix on the initial #223 fix — the narrow
       // `instanceof ProfileError && code === BUNDLE_NOT_FOUND` catch
       // let plain `Error` / `TypeError` / dynamic-import failures /
-      // `validateGatewayUrls` throws / `walkUxfElement` errors escape
+      // `validateGatewayUrls` throws / dag-cbor decode errors escape
       // uncaught into `IngestWorkerPool.classifyAcquireError`. That
       // path logs at warn and silently drops the bundle — exactly the
       // failure mode this PR is supposed to make observable.

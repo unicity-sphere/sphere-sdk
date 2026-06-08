@@ -12,8 +12,8 @@
  *
  *   - `validateGatewayUrls` throws plain `Error` for malformed URLs
  *   - Dynamic `import('@ipld/dag-cbor')` failures throw the loader error
- *   - `CID.parse` / `contentHashBytesToCid` can throw on malformed CIDs
- *   - `walkUxfElement` / `dagCborDecode` can throw on hostile blocks
+ *   - `CID.parse` can throw on malformed CIDs reached via Tag 42 walk
+ *   - `dagCborDecode` / `collectCidLinks` can throw on hostile blocks
  *   - `CarWriter.put` / async writer errors
  *
  * Pre-fix: these escape the narrow catch as bare exceptions, hit
