@@ -86,7 +86,7 @@ import type { UxfSentLedgerEntry } from '../../../types/uxf-sent';
 import type { SentLedgerWriter } from '../../../profile/sent-ledger-writer';
 import type { OutboxWriter } from '../../../profile/outbox-writer';
 import type { UxfTransferOutboxEntry } from '../../../types/uxf-outbox';
-import { redactCause, SphereError } from '../../../core/errors';
+import { errMessage, SphereError } from '../../../core/errors';
 
 // =============================================================================
 // 1. Public types — dependency surface + options
@@ -637,12 +637,3 @@ function emptyResult(
   };
 }
 
-function errMessage(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  if (typeof err === 'string') return err;
-  try {
-    return JSON.stringify(redactCause(err));
-  } catch {
-    return String(err);
-  }
-}

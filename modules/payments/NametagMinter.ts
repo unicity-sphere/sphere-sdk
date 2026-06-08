@@ -14,6 +14,7 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { logger } from '../../core/logger';
+import { errMessage } from '../../core/errors';
 
 import { Token } from '@unicitylabs/state-transition-sdk/lib/token/Token';
 import { TokenId } from '@unicitylabs/state-transition-sdk/lib/token/TokenId';
@@ -179,7 +180,7 @@ export class NametagMinter {
           if (attempt === MAX_RETRIES) {
             return {
               success: false,
-              error: `Submit failed: ${error instanceof Error ? error.message : String(error)}`,
+              error: `Submit failed: ${errMessage(error)}`,
             };
           }
           await new Promise(r => setTimeout(r, 1000 * attempt));
@@ -253,7 +254,7 @@ export class NametagMinter {
       this.log('Minting failed:', error);
       return {
         success: false,
-        error: error instanceof Error ? error.message : String(error),
+        error: errMessage(error),
       };
     }
   }

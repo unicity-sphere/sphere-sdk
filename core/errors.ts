@@ -985,3 +985,38 @@ export class SphereError extends Error {
 export function isSphereError(err: unknown): err is SphereError {
   return err instanceof SphereError;
 }
+
+/**
+ * Lossy-safe stringification of an unknown error value (issue #191).
+ *
+ * The inline pattern `err instanceof Error ? err.message : String(err)`
+ * collapses object-shaped errors to the default `Object.prototype.toString`
+ * output (`'[object Object]'`), masking aggregator response payloads,
+ * structured RPC errors, and any other non-Error throw value with useful
+ * field-level forensics. NametagMinter's testnet failure surface is the
+ * highest-visibility instance — operators saw `Submit failed: [object Object]`
+ * with no way to distinguish rate-limit / API-key / faucet-exhausted /
+ * validation-rejected outcomes.
+ *
+ * `errMessage` collapses to the same `Error.message` / `string` paths but
+ * falls back to `JSON.stringify(redactCause(err))` for everything else,
+ * routing through the W40 redaction layer so cryptographic-secret /
+ * untrusted-payload fields never leak even on this debug path. The final
+ * `String(err)` is the bottom of the stack for non-stringifiable values
+ * (cycles that survive `redactCause`, BigInts in the redacted view, ...).
+ *
+ * @example
+ *   errMessage(new Error('boom'))           // 'boom'
+ *   errMessage('boom')                       // 'boom'
+ *   errMessage({ status: 'BAD_REQUEST' })    // '{"status":"BAD_REQUEST"}'
+ *   errMessage({ signedTransferTxBytes: u8 }) // '{"signedTransferTxBytes":"[REDACTED: signedTransferTxBytes(<n>-bytes)]"}'
+ */
+export function errMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === 'string') return err;
+  try {
+    return JSON.stringify(redactCause(err));
+  } catch {
+    return String(err);
+  }
+}
