@@ -273,6 +273,11 @@ services:
       - haproxy-net
     volumes:
       - agg-letsencrypt:/etc/letsencrypt
+      # Read-only bind-mount of the genesis dir so the proxy nginx can
+      # serve trust-base.json at /.well-known/trust-base.json. Wallets
+      # talking to this aggregator need OUR trust base (not the testnet
+      # one) to verify inclusion proofs against this chain's genesis.
+      - ./data/genesis:/etc/aggregator-config:ro
     environment:
       # ${AGG_DOMAIN} and ${SSL_EMAIL} are validated at the wrapper-
       # script level (run-aggregator.sh) so `docker compose down`
