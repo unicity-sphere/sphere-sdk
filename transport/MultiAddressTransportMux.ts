@@ -205,6 +205,23 @@ export class MultiAddressTransportMux {
   // re-establish subscriptions it shouldn't have.
   private connectionListener: ConnectionEventListener | null = null;
 
+  // Issue #442 — gate the relay subscription open until all module DM
+  // handlers (CommunicationsModule + late-registering fan-out subscribers:
+  // SwapModule, AccountingModule, GroupChatModule, MarketModule) have
+  // attached. Default-armed for backward compat with consumers that build
+  // a Mux directly without going through Sphere bootstrap; Sphere
+  // explicitly calls {@link suppressSubscriptions} before
+  // {@link connect} so the gate opens on the explicit
+  // {@link armSubscriptions} call after every module's `load()` returns.
+  //
+  // When suppressed, {@link updateSubscriptions} short-circuits before
+  // touching the relay (no unsubscribe of stale IDs, no resubscribe). The
+  // mux still tracks addresses, but the relay sub stays in its previous
+  // state — closed for a freshly-connected Mux, or the prior address
+  // filter for the multi-address-switch path (primary keeps receiving
+  // events through the existing sub during the gate window).
+  private subscriptionsArmed = true;
+
   constructor(config: MultiAddressTransportMuxConfig) {
     this.identityPrivateKey = config.identityPrivateKey;
     this.config = {
@@ -493,6 +510,79 @@ export class MultiAddressTransportMux {
     return this.status === 'connected' && this.nostrClient?.isConnected() === true;
   }
 
+  // ===========================================================================
+  // Issue #442 — Subscription gate (mirror of NostrTransportProvider's #423
+  // gate, but for the mux path which #423 left uncovered).
+  //
+  // Pre-#442: `ensureTransportMux()` opened the WebSocket and immediately
+  // called `updateSubscriptions()` (via `connect()` / `addAddress()`), so
+  // the relay started replaying events BEFORE Sphere's module loads
+  // registered their handlers. Events that arrived before
+  // `SwapModule.load()` ran its `communications.onDirectMessage(...)` were
+  // routed through `CommunicationsModule.handleIncomingMessage` (which
+  // persisted to inbox) but missed the late-registering fan-out
+  // subscribers entirely — so a `swap_proposal:` DM landed in `sphere dm
+  // history` but `sphere swap list` returned "No swaps found".
+  //
+  // The gate decouples WebSocket open from relay-subscription open. Sphere
+  // bootstrap suppresses BEFORE `connect()`, runs all module loads, then
+  // arms — guaranteeing every onDirectMessage subscriber is wired before
+  // the relay starts streaming.
+  // ===========================================================================
+
+  /**
+   * Suppress the relay subscription so {@link updateSubscriptions} becomes a
+   * no-op. The WebSocket stays open (so resolve / sendDM still work), but no
+   * new wallet / chat filter is registered with the relay. Active filters
+   * registered before suppression are NOT torn down — they continue
+   * delivering events for the still-tracked pubkeys.
+   *
+   * Idempotent. Sticky until {@link armSubscriptions} is called.
+   *
+   * Used by:
+   *   - `Sphere.ensureTransportMux` BEFORE `connect()` on first
+   *     creation, so the initial address's `addAddress(...)` auto-update
+   *     no-ops until module handlers register.
+   *   - `Sphere.initializeAddressModules` BEFORE adding a non-primary
+   *     address, so the relay filter is not rebuilt with the new pubkey
+   *     until the new address's modules finish loading. (The primary
+   *     address's active filter keeps delivering events through the
+   *     suppression window — we explicitly do NOT unsubscribe here.)
+   */
+  suppressSubscriptions(): void {
+    if (!this.subscriptionsArmed) return;
+    this.subscriptionsArmed = false;
+    logger.debug('Mux', '[#442] Subscriptions suppressed — updateSubscriptions deferred until armSubscriptions()');
+  }
+
+  /**
+   * Arm the relay subscription. Sets armed=true and (when connected with
+   * at least one tracked address) rebuilds the wallet / chat filters via
+   * {@link updateSubscriptions}. Always rebuilds so multi-address switch
+   * paths can use this as the "open relay sub for the newly-added pubkey
+   * now that its modules have loaded" trigger — `armSubscriptions()` after
+   * a previous `armSubscriptions()` is NOT a no-op when new addresses have
+   * been registered in between.
+   *
+   * Safe to call before {@link connect}; the gate stays open, and connect
+   * will subscribe inline when it reaches its tail (existing behaviour).
+   *
+   * Returns once `updateSubscriptions` resolves so callers can await an
+   * established subscription before proceeding.
+   */
+  async armSubscriptions(): Promise<void> {
+    this.subscriptionsArmed = true;
+    if (this.isConnected() && this.addresses.size > 0) {
+      await this.updateSubscriptions();
+    }
+    logger.debug('Mux', '[#442] Subscriptions armed');
+  }
+
+  /** For tests and operator inspection. */
+  isSubscriptionsArmed(): boolean {
+    return this.subscriptionsArmed;
+  }
+
   /**
    * Build the connection listener used by both {@link connect} and
    * {@link rebindToSharedClient}.
@@ -775,6 +865,18 @@ export class MultiAddressTransportMux {
    */
   private async updateSubscriptions(): Promise<void> {
     if (!this.nostrClient) return;
+
+    // Issue #442 — Subscription gate. When suppressed (Sphere bootstrap
+    // before module loads complete, or the multi-address switch window)
+    // skip the relay update entirely. Critically, this MUST short-circuit
+    // BEFORE the stale-ID unsubscribe below — otherwise a suppress that
+    // lands between two updateSubscriptions calls would tear down the
+    // active sub without rebuilding it, dropping incoming events for the
+    // already-tracked addresses.
+    if (!this.subscriptionsArmed) {
+      logger.debug('Mux', '[#442] updateSubscriptions deferred — subscriptions not armed');
+      return;
+    }
 
     // Issue #275 — hydrate persistent dedup BEFORE EOSE replay arrives.
     // The first CLI command of a new process otherwise re-walks the
@@ -2119,6 +2221,30 @@ export class AddressTransportAdapter implements TransportProvider {
     // walks the same handleEvent dispatch chain (mux-level dedup prevents
     // double-processing with the live subscription).
     await this.mux.fetchPendingEvents();
+  }
+
+  /**
+   * Issue #442 — delegate to the underlying mux. Exposed on the adapter so
+   * consumers holding only an `AddressTransportAdapter` reference (the
+   * `TransportProvider` returned to PaymentsModule / CommunicationsModule)
+   * can also gate subscription arming through the same API shape as
+   * `NostrTransportProvider` (issue #423).
+   *
+   * Note: the gate is mux-wide, NOT per-adapter — calling
+   * `armSubscriptions` on one adapter opens the relay sub for every tracked
+   * address. Sphere bootstrap is the only intended caller; module code
+   * should not touch this.
+   */
+  suppressSubscriptions(): void {
+    this.mux.suppressSubscriptions();
+  }
+
+  async armSubscriptions(): Promise<void> {
+    await this.mux.armSubscriptions();
+  }
+
+  isSubscriptionsArmed(): boolean {
+    return this.mux.isSubscriptionsArmed();
   }
 
   onChatReady(handler: () => void): () => void {
