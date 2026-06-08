@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { CID } from 'multiformats';
 import { SparseMerkleTreePath } from '@unicitylabs/state-transition-sdk/lib/mtree/plain/SparseMerkleTreePath.js';
 import {
   hexToBytes,
@@ -293,21 +294,30 @@ describe('prepareContentForHashing', () => {
 });
 
 describe('prepareChildrenForHashing', () => {
-  it('converts single ContentHash to Uint8Array', () => {
+  // Issue #435 — children are emitted as Tag 42 CID-links so Kubo's
+  // recursive pin / `/dag/export` walkers natively follow the DAG.
+  it('converts single ContentHash to a Tag 42 CID-link', () => {
     const hash = contentHash('aa'.repeat(32));
     const result = prepareChildrenForHashing({ genesis: hash });
-    expect(result.genesis).toBeInstanceOf(Uint8Array);
-    expect((result.genesis as Uint8Array).length).toBe(32);
+    expect(result.genesis).toBeInstanceOf(CID);
+    const cid = result.genesis as CID;
+    // dag-cbor codec (0x71) + sha2-256 multihash (0x12) with the
+    // original 32-byte digest preserved.
+    expect(cid.code).toBe(0x71);
+    expect(cid.multihash.code).toBe(0x12);
+    expect(cid.multihash.digest).toEqual(new Uint8Array(32).fill(0xaa));
   });
 
-  it('converts array of ContentHash to array of Uint8Array', () => {
+  it('converts array of ContentHash to array of Tag 42 CID-links', () => {
     const h1 = contentHash('aa'.repeat(32));
     const h2 = contentHash('bb'.repeat(32));
     const result = prepareChildrenForHashing({ transactions: [h1, h2] });
-    const arr = result.transactions as Uint8Array[];
+    const arr = result.transactions as CID[];
     expect(arr).toHaveLength(2);
-    expect(arr[0]).toBeInstanceOf(Uint8Array);
-    expect(arr[1]).toBeInstanceOf(Uint8Array);
+    expect(arr[0]).toBeInstanceOf(CID);
+    expect(arr[1]).toBeInstanceOf(CID);
+    expect(arr[0].multihash.digest).toEqual(new Uint8Array(32).fill(0xaa));
+    expect(arr[1].multihash.digest).toEqual(new Uint8Array(32).fill(0xbb));
   });
 
   it('preserves null children', () => {

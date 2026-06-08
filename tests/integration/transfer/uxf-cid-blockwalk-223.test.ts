@@ -5,26 +5,22 @@
  *
  * **Why this is critical to test (root cause #2 of Issue #223):**
  *
- * UXF element blocks use Issue #213's Option-C canonical encoding —
- * child references are stored as raw 32-byte bstrs so that
+ * UXF element blocks (per issue #435) encode child references and
+ * `header[3]` predecessor as dag-cbor **Tag 42 CID-links**. The hash
+ * canonical form and the IPLD canonical form share a single shape so
  * `sha256(block.bytes) === block.cid.multihash.digest` for every
- * sub-block (enabling per-block `dag/put` pinning under each block's
- * canonical CID).
+ * sub-block.
  *
  * The standard IPFS Trustless Gateway `?format=car` endpoint only
- * traverses CBOR Tag 42 CID links when assembling the DAG, so for
- * UXF bundles it returns ONLY the root + envelope + manifest and stops.
- * The receiver gets an incomplete CAR; `pkg.verify()` throws
- * `MISSING_ELEMENT`; `IngestWorkerPool.classifyAcquireError` silently
- * swallows it; the transfer is invisible.
- *
- * The fix (committed alongside this test): the uxf-cid branch in
- * `bundle-acquirer` now uses `fetchCarFromIpfs` (per-block walk via
- * `/api/v0/block/get`), which IS UXF-aware (`walkUxfElement` follows
- * raw-bstr children). This test reproduces the gateway shape that
- * surfaced the bug — a node that exposes `/api/v0/block/get` per block
- * but cannot serve a complete `?format=car` for Option-C bundles —
- * and asserts that the recipient successfully reassembles the bundle.
+ * traverses CBOR Tag 42 CID links when assembling the DAG — but a
+ * gateway running an old / partial implementation can still return
+ * an incomplete CAR. This test pins every block individually and
+ * verifies that the receiver's per-block walker (`fetchCarFromIpfs`
+ * → BFS over `collectCidLinks`) successfully reassembles the bundle
+ * from a gateway that does NOT expose `?format=car` or the `/dag/export`
+ * fast path. The receiver path now uses the generic `collectCidLinks`
+ * walker for every dag-cbor block (issue #435 dropped the UXF-aware
+ * walker).
  *
  * **Test gateway shape:**
  *   - `/api/v0/block/get?arg=<cid>` → returns the pinned block bytes
@@ -33,10 +29,10 @@
  *     behavior with and without the fix on the same gateway).
  *
  * Spec references:
- *   - Issue #213 — Option C canonical encoding (children as raw bstrs).
+ *   - Issue #435 — Tag 42 CID-link canonical encoding.
  *   - Issue #223 — the bug this test guards against.
- *   - profile/ipfs-client.ts:578 fetchCarFromIpfs — symmetric receiver.
- *   - profile/ipfs-client.ts:293 pinCarBlocksToIpfs — producer.
+ *   - profile/ipfs-client.ts fetchCarFromIpfs — symmetric receiver.
+ *   - profile/ipfs-client.ts pinCarBlocksToIpfs — producer.
  *
  * @packageDocumentation
  */

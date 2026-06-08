@@ -1,6 +1,6 @@
 {
-  "_marker": "T.2.D.REFERENCE.SNAPSHOT.v5",
-  "_note": "T.2.D reference snapshot, NOT a v1.0 wire format claim. See README.md. v5 (issue #295 rewrite #2): SmtPath element content is now a single opaque STS-canonical CBOR blob (`SparseMerkleTreePath.toCBOR()`). UXF no longer decomposes into {root, segments}; STS owns the binary representation entirely. Replaces v4's BigintConverter-delegated segment encoding.",
+  "_marker": "T.2.D.REFERENCE.SNAPSHOT.v6",
+  "_note": "T.2.D reference snapshot, NOT a v1.0 wire format claim. See README.md. v6 (issue #435): UXF element child references and `header[3]` predecessor refs are now emitted as dag-cbor **Tag 42 CID-links** instead of raw 32-byte Uint8Array (PR #213 Option C is removed). Kubo's recursive pin (`/dag/import?pin-roots=true`) and recursive walk (`/dag/export?arg=<root>`) now traverse the whole DAG natively, eliminating the client-side per-block pin loop and UXF-aware walker. Backward compatibility intentionally dropped (testnet posture — wallets re-mint / re-receive).",
   "tag": "T.2.D.2-reference-snapshot",
   "generated": {
     "frozenEpochMs": 1735689600000,

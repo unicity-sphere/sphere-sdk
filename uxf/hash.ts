@@ -12,6 +12,7 @@
 
 import { sha256 } from '@noble/hashes/sha2.js';
 import { encode } from '@ipld/dag-cbor';
+import type { CID } from 'multiformats';
 import { bytesToHex } from '../core/crypto.js';
 import {
   type ContentHash,
@@ -21,6 +22,7 @@ import {
   ELEMENT_TYPE_IDS,
 } from './types.js';
 import { UxfError } from './errors.js';
+import { contentHashToCid } from './cid-utils.js';
 
 // ---------------------------------------------------------------------------
 // Hex/Bytes helpers
@@ -209,26 +211,35 @@ export function prepareContentForHashing(
 // ---------------------------------------------------------------------------
 
 /**
- * Convert all ContentHash hex strings in children to Uint8Array so that
- * dag-cbor encodes them as CBOR bstr (raw 32-byte hash values).
+ * Convert all ContentHash hex strings in children to CIDv1 (dag-cbor,
+ * sha2-256) instances. `@ipld/dag-cbor` encodes a `CID` value as a
+ * CBOR Tag 42 link, which Kubo's recursive pin and `/dag/export`
+ * walkers natively follow.
  *
  * Handles:
- * - Single ContentHash -> Uint8Array
- * - Array of ContentHash -> Array of Uint8Array
+ * - Single ContentHash -> CID
+ * - Array of ContentHash -> Array of CID
  * - null -> null (CBOR null)
+ *
+ * Issue #435 — switching from raw 32-byte `Uint8Array` (PR #213 Option C)
+ * to Tag 42 CIDs restores the "client builds CAR, Kubo pins recursively,
+ * receiver exports recursively" mental model. Wire bytes change but
+ * the `sha256(elementBytes) === cid.multihash.digest` invariant is
+ * preserved because the hash canonical form and the IPLD canonical
+ * form are still bit-identical.
  */
 export function prepareChildrenForHashing(
   children: Record<string, ContentHash | ContentHash[] | null>,
-): Record<string, Uint8Array | Uint8Array[] | null> {
-  const result: Record<string, Uint8Array | Uint8Array[] | null> = {};
+): Record<string, CID | CID[] | null> {
+  const result: Record<string, CID | CID[] | null> = {};
 
   for (const [key, value] of Object.entries(children)) {
     if (value === null) {
       result[key] = null;
     } else if (Array.isArray(value)) {
-      result[key] = (value as ContentHash[]).map((h) => hexToBytes(h));
+      result[key] = (value as ContentHash[]).map((h) => contentHashToCid(h));
     } else {
-      result[key] = hexToBytes(value as string);
+      result[key] = contentHashToCid(value as ContentHash);
     }
   }
 
@@ -259,13 +270,19 @@ export function prepareChildrenForHashing(
  * @returns A branded ContentHash (64-char lowercase hex)
  */
 export function computeElementHash(element: UxfElement): ContentHash {
-  // Build the canonical header array: [repr, sem, kind, predecessor]
+  // Build the canonical header array: [repr, sem, kind, predecessor].
+  // Issue #435 — predecessor is emitted as a Tag 42 CID (or null) so the
+  // instance-chain link is part of the dag-cbor DAG walked by Kubo's
+  // recursive pin and `/dag/export`. This keeps every block within an
+  // exported CAR reachable by Kubo's codec-aware walker (the same reason
+  // the BFS export step in `exportToCar` already enqueues predecessors —
+  // Steelman remediation in writeBfs).
   const header = [
     element.header.representation,
     element.header.semantics,
     element.header.kind,
     element.header.predecessor !== null
-      ? hexToBytes(element.header.predecessor)
+      ? contentHashToCid(element.header.predecessor)
       : null,
   ];
 

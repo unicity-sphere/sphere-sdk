@@ -1248,10 +1248,11 @@ export class FlushScheduler {
         // `extractCarRootCid` reads the envelope CID from the CAR
         // header — that's the entry-point CID published in our
         // `UxfBundleRef` and on the aggregator pointer. Receivers
-        // walk the DAG starting from this CID via
-        // `fetchCarFromIpfs`, which detects the dag-cbor codec and
-        // traverses sub-blocks using the UXF-aware walker
-        // (`walkUxfElement` in `ipfs-client.ts`).
+        // walk the DAG starting from this CID via `fetchCarFromIpfs`,
+        // which prefers `/api/v0/dag/export` and falls back to a
+        // generic Tag 42 CID-link BFS via `collectCidLinks` (issue
+        // #435 dropped the UXF-aware walker now that children +
+        // predecessor are Tag 42 CIDs).
         const expectedRootCid = await extractCarRootCid(carBytes);
         // Issue #236 — pass the local Helia handle so each block is
         // written to the on-disk blockstore before the HTTP pin. This

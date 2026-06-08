@@ -187,7 +187,10 @@ describe('elementToIpldBlock', () => {
     expect(block.bytes.length).toBeGreaterThan(0);
   });
 
-  it('children encoded as raw 32-byte hash bytes (#213 canonical form)', () => {
+  it('children encoded as dag-cbor Tag 42 CID-links (#435 canonical form)', () => {
+    // Issue #435 — child references are emitted as Tag 42 CID-links
+    // so Kubo's recursive pin / `/dag/export` walkers natively follow
+    // the DAG. Same for `header[3]` predecessor refs.
     const pkg = buildPackageFromToken(makeValidToken('a1'));
 
     for (const [, element] of pkg.pool) {
@@ -200,12 +203,16 @@ describe('elementToIpldBlock', () => {
           if (value !== null) {
             if (Array.isArray(value)) {
               for (const item of value) {
-                expect(item).toBeInstanceOf(Uint8Array);
-                expect((item as Uint8Array).byteLength).toBe(32);
+                expect(item).toBeInstanceOf(CID);
+                expect((item as CID).code).toBe(0x71);
+                expect((item as CID).multihash.code).toBe(0x12);
+                expect((item as CID).multihash.digest.byteLength).toBe(32);
               }
             } else {
-              expect(value).toBeInstanceOf(Uint8Array);
-              expect((value as Uint8Array).byteLength).toBe(32);
+              expect(value).toBeInstanceOf(CID);
+              expect((value as CID).code).toBe(0x71);
+              expect((value as CID).multihash.code).toBe(0x12);
+              expect((value as CID).multihash.digest.byteLength).toBe(32);
             }
           }
         }
@@ -215,10 +222,12 @@ describe('elementToIpldBlock', () => {
     expect.fail('No element with children found');
   });
 
-  it('block bytes hash to the block CID (#213 self-consistency)', () => {
-    // Option C invariant: sha256(block.bytes) === cid.multihash.digest
-    // for every UXF element block, so per-block IPFS pin/fetch
-    // round-trips agree on the CID.
+  it('block bytes hash to the block CID (#435 self-consistency)', () => {
+    // Issue #435 invariant (carried over from #213): `sha256(block.bytes)`
+    // === `cid.multihash.digest` for every UXF element block. The hash
+    // canonical form and the IPLD canonical form are still a single
+    // bit-identical form; the only change is that child / predecessor
+    // refs are now Tag 42 CIDs instead of raw 32-byte Uint8Array.
     const pkg = buildPackageFromToken(makeValidToken('a1'));
     let checked = 0;
     for (const [, element] of pkg.pool) {
@@ -239,6 +248,36 @@ describe('elementToIpldBlock', () => {
     const block = elementToIpldBlock(el);
     const hash = computeElementHash(el);
     expect(cidToContentHash(block.cid)).toBe(hash);
+  });
+
+  it('header[3] predecessor encoded as Tag 42 CID-link (#435 wire-shape)', () => {
+    // Issue #435 — predecessor refs ride in the canonical CBOR as Tag
+    // 42 CID-links so Kubo's recursive pin / `/dag/export` walkers
+    // traverse instance-chain edges natively.
+    //
+    // The self-consistency test above (`block bytes hash to the block
+    // CID`) would still pass under a regression to `hexToBytes(predecessor)`
+    // because both `computeElementHash` and `elementToIpldBlock` share
+    // `buildCanonicalHeader`. This test inspects the dag-cbor-decoded
+    // wire bytes directly to guard against that silent drift.
+    const predecessorHex = '11'.repeat(32);
+    const el: UxfElement = {
+      header: { representation: 1, semantics: 1, kind: 'default', predecessor: contentHash(predecessorHex) },
+      type: 'token-state',
+      content: { predicate: 'a0'.repeat(32), data: null },
+      children: {},
+    };
+    const block = elementToIpldBlock(el);
+    const decoded = dagCborDecode(block.bytes) as Record<string, unknown>;
+    const header = decoded.header as unknown[];
+    expect(Array.isArray(header)).toBe(true);
+    const wirePredecessor = header[3];
+    expect(wirePredecessor).toBeInstanceOf(CID);
+    const wirePredCid = wirePredecessor as CID;
+    expect(wirePredCid.code).toBe(0x71);
+    expect(wirePredCid.multihash.code).toBe(0x12);
+    expect(wirePredCid.multihash.digest.byteLength).toBe(32);
+    expect(wirePredCid.multihash.digest).toEqual(new Uint8Array(32).fill(0x11));
   });
 });
 
@@ -309,16 +348,15 @@ describe('exportToCar / importFromCar', () => {
     await expect(importFromCar(tampered)).rejects.toThrow();
   });
 
-  it('#213 backward-compat: legacy Tag 42 CID-link children decode correctly', async () => {
-    // The new producer encodes children as Uint8Array. The receiver
-    // must still accept legacy Tag 42 CID-link children for in-flight
-    // bundles produced before #213. We hand-craft a single element
-    // block with CID-link children, wrap it in a minimal CAR, and
-    // verify importFromCar reconstructs the same ContentHash that
-    // the new form would have produced.
+  it('#435: rejects legacy PR-#213 Option C Uint8Array children at import', async () => {
+    // Issue #435 explicitly drops backward compatibility for the PR
+    // #213 Option C raw-byte child encoding (testnet posture — wallets
+    // re-mint / re-receive tokens). A hand-crafted block whose children
+    // are raw 32-byte Uint8Array values must be rejected by the
+    // receiver instead of silently decoded.
     const pkg = buildPackageFromToken(makeValidToken('a1'));
 
-    // Find an element with at least one non-null child reference.
+    // Find any element with at least one non-null child reference.
     let target: { hash: ContentHash; element: UxfElement } | null = null;
     for (const [hash, element] of pkg.pool) {
       if (Object.values(element.children).some((v) => v !== null)) {
@@ -327,79 +365,78 @@ describe('exportToCar / importFromCar', () => {
       }
     }
     if (!target) {
-      expect.fail('No element with children to test legacy decode path');
+      expect.fail('No element with children to test Option-C rejection path');
     }
 
-    // Re-encode the element using the LEGACY Tag 42 form to simulate a
-    // bundle that landed via the old producer.
-    const legacyHeader = [
+    // Re-encode the element using the OLD Option-C form (raw Uint8Array
+    // children) and a Tag 42 predecessor (#435 form) so the only deviation
+    // is the children encoding — the import must reject this shape.
+    const headerArr = [
       target.element.header.representation,
       target.element.header.semantics,
       target.element.header.kind,
       target.element.header.predecessor !== null
-        ? hexToBytesLocal(target.element.header.predecessor)
+        ? CID.createV1(
+            0x71,
+            makeSha256DigestLocal(hexToBytesLocal(target.element.header.predecessor)),
+          )
         : null,
     ];
-    const typeIds: Record<string, number> = {
-      'genesis-data': 0x01,
-      'inclusion-proof': 0x02,
-      'merkle-tree-path': 0x03,
-      'smt-path': 0x04,
-      authenticator: 0x05,
-      'token-state': 0x06,
-      transaction: 0x07,
-      'transaction-data': 0x08,
-      nametag: 0x09,
-      'token-root': 0x0a,
-    };
-    const typeId = typeIds[target.element.type as string];
-    expect(typeId).toBeDefined();
-
-    // Encode children as CID links (legacy Tag 42 form).
-    const legacyChildren: Record<string, any> = {};
+    const optionCChildren: Record<string, any> = {};
     for (const [k, v] of Object.entries(target.element.children)) {
       if (v === null) {
-        legacyChildren[k] = null;
+        optionCChildren[k] = null;
       } else if (Array.isArray(v)) {
-        legacyChildren[k] = (v as string[]).map((h) =>
-          CID.createV1(0x71, makeSha256DigestLocal(hexToBytesLocal(h))),
-        );
+        optionCChildren[k] = (v as string[]).map((h) => hexToBytesLocal(h));
       } else {
-        legacyChildren[k] = CID.createV1(
-          0x71,
-          makeSha256DigestLocal(hexToBytesLocal(v as string)),
-        );
+        optionCChildren[k] = hexToBytesLocal(v as string);
       }
     }
 
-    // The legacy form's bytes differ from the new canonical bytes,
-    // so we don't pin/import them through a CAR (which would
-    // verify hash → CID match). Instead test the decoder directly:
-    const legacyNode = {
-      header: legacyHeader,
-      type: typeId,
+    // Decode and confirm the test fixture really is in Option-C shape.
+    const optionCNode = {
+      header: headerArr,
+      type: 0x01, // arbitrary — fixture is for decodeIpldChildren shape only
       content: target.element.content,
-      children: legacyChildren,
+      children: optionCChildren,
     };
-    const legacyBytes = dagCborEncode(legacyNode);
-    const legacyDecoded = dagCborDecode(legacyBytes) as any;
-
-    // Use the exported decodeIpldElement via private route — we
-    // assert behavior by checking decoded child types after a manual
-    // import. The simpler route is to assert at the receiver level
-    // via importFromCar with a hand-built CAR. To keep this test
-    // small, just verify that decodeIpldChildren accepts both via
-    // a direct shape check on the IPLD form.
-    for (const value of Object.values(legacyDecoded.children)) {
+    const optionCBytes = dagCborEncode(optionCNode);
+    const optionCDecoded = dagCborDecode(optionCBytes) as any;
+    for (const value of Object.values(optionCDecoded.children)) {
       if (value === null) continue;
       if (Array.isArray(value)) {
         for (const item of value) {
-          expect(item).toBeInstanceOf(CID);
+          expect(item).toBeInstanceOf(Uint8Array);
         }
       } else {
-        expect(value).toBeInstanceOf(CID);
+        expect(value).toBeInstanceOf(Uint8Array);
       }
     }
+
+    // Build a single-element CAR that points at this node as the
+    // envelope root. The point is to exercise the import-side decoder
+    // — it must reject Option-C-shaped children with SERIALIZATION_ERROR.
+    const rootDigest = makeSha256DigestLocal(nobleSha256(optionCBytes));
+    const rootCid = CID.createV1(0x71, rootDigest);
+    const { writer, out } = CarWriter.create([rootCid]);
+    const collectPromise = (async () => {
+      const chunks: Uint8Array[] = [];
+      for await (const c of out) chunks.push(c);
+      return chunks;
+    })();
+    await writer.put({ cid: rootCid, bytes: optionCBytes });
+    await writer.close();
+    const chunks = await collectPromise;
+    let total = 0;
+    for (const c of chunks) total += c.byteLength;
+    const carBytes = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) {
+      carBytes.set(c, off);
+      off += c.byteLength;
+    }
+
+    await expect(importFromCar(carBytes)).rejects.toThrow();
   });
 });
 
