@@ -11,6 +11,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { Sphere } from '../../core/Sphere';
 import { mockMintNametagSuccess } from '../helpers/mockMintNametag';
@@ -26,9 +27,17 @@ import { vi } from 'vitest';
 // Test directories
 // =============================================================================
 
-const TEST_DIR = path.join(__dirname, '.test-wallet-clear');
-const DATA_DIR = path.join(TEST_DIR, 'data');
-const TOKENS_DIR = path.join(TEST_DIR, 'tokens');
+// Per-test unique directory under tmpfs to eliminate full-suite-only
+// FS race (see commit 9bf3e90 and PR #432).
+let TEST_DIR = '';
+let DATA_DIR = '';
+let TOKENS_DIR = '';
+
+function freshTestDirs(): void {
+  TEST_DIR = path.join(os.tmpdir(), `sphere-wallet-clear-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
+  DATA_DIR = path.join(TEST_DIR, 'data');
+  TOKENS_DIR = path.join(TEST_DIR, 'tokens');
+}
 
 // =============================================================================
 // Mock providers
@@ -146,7 +155,7 @@ describe('Sphere.clear() integration', () => {
   let mintSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
-    cleanTestDir();
+    freshTestDirs();
     clearNostrRelay();
     // Reset Sphere singleton
     if (Sphere.getInstance()) {
