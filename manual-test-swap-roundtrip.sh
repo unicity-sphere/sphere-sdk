@@ -447,11 +447,18 @@ assert_grep "bob-status-completed" 'progress[[:space:]]*:[[:space:]]*completed' 
 # ---------------------------------------------------------------------------
 banner "Section 10: Poison-pill scan across all logs"
 
-POISON_HITS=$(grep -cE "SERIALIZATION_ERROR|VERIFICATION_FAILED|DUPLICATE_BUNDLE_MEMBERSHIP" \
-  "$SNAP"/*.log 2>/dev/null | grep -vE ':0$' | wc -l)
-if [[ "$POISON_HITS" -gt 0 ]]; then
+# Use `grep -l` (list filenames with matches). The old `grep -c | grep -v ':0$'`
+# pipeline tripped `set -euo pipefail` on a clean run: the inner `grep -v`
+# exits 1 when every file is `:0` (no matches), pipefail propagates, and
+# the command substitution aborts the script before we ever print
+# "ASSERT OK". `|| true` keeps the pipeline non-fatal on no-matches —
+# emptiness is the success case here, not an error.
+POISON_FILES=$(grep -lE "SERIALIZATION_ERROR|VERIFICATION_FAILED|DUPLICATE_BUNDLE_MEMBERSHIP" \
+  "$SNAP"/*.log 2>/dev/null || true)
+if [[ -n "$POISON_FILES" ]]; then
+  POISON_HITS=$(printf '%s\n' "$POISON_FILES" | wc -l)
   echo "ASSERT FAIL (poison-pill): found $POISON_HITS log(s) with poison-pill errors" >&2
-  grep -lE "SERIALIZATION_ERROR|VERIFICATION_FAILED|DUPLICATE_BUNDLE_MEMBERSHIP" "$SNAP"/*.log >&2 || true
+  printf '%s\n' "$POISON_FILES" >&2
   rc=1
 else
   echo "ASSERT OK (poison-pill-clean): no SERIALIZATION_ERROR / VERIFICATION_FAILED / DUPLICATE_BUNDLE_MEMBERSHIP across any log"
