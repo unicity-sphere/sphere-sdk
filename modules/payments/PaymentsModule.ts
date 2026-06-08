@@ -4730,8 +4730,8 @@ export class PaymentsModule {
     if (amount <= 0n) {
       return { success: false, error: 'Mint amount must be greater than zero' };
     }
-    if (!/^([0-9a-fA-F]{2})+$/.test(coinIdHex)) {
-      return { success: false, error: `Invalid coin id (expected even-length hex): ${coinIdHex}` };
+    if (!/^([0-9a-f]{2})+$/.test(coinIdHex)) {
+      return { success: false, error: `Invalid coin id (expected even-length lowercase hex): ${coinIdHex}` };
     }
 
     try {

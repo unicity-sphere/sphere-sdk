@@ -16,6 +16,12 @@ import { FakeTokenEngine } from '../token-engine/FakeTokenEngine';
 import { decodeTokenBlob } from '../../../token-engine/token-blob';
 import { hexToBytes } from '../../../core/crypto';
 
+class ThrowingMintEngine extends FakeTokenEngine {
+  mint(): Promise<never> {
+    return Promise.reject(new Error('boom'));
+  }
+}
+
 const FAKE_PRIVATE_KEY = 'a'.repeat(64);
 const FAKE_PUBKEY = '02' + 'b'.repeat(64);
 const UCT = '11'.repeat(32); // v2 coin ids are lowercase hex
@@ -23,7 +29,7 @@ const UCT = '11'.repeat(32); // v2 coin ids are lowercase hex
 function mockIdentity(): FullIdentity {
   return {
     chainPubkey: FAKE_PUBKEY, l1Address: 'alpha1x', directAddress: 'DIRECT://x',
-    privateKey: FAKE_PRIVATE_KEY, transportPubkey: 'dd'.repeat(32),
+    privateKey: FAKE_PRIVATE_KEY,
   };
 }
 
@@ -123,6 +129,9 @@ describe('mintFungibleToken — v2 engine self-mint (top-up)', () => {
     expect(tokens[0].coinId).toBe(UCT);
     expect(tokens[0].amount).toBe('500');
     expect(tokens[0].status).toBe('confirmed');
+    // Registry-fallback: unregistered coin — symbol = first 6 chars uppercased, name = full coinId
+    expect(tokens[0].symbol).toBe('111111');
+    expect(tokens[0].name).toBe(UCT);
   });
 
   it('stores a blob that decodes back to the requested value (engine.balanceOf)', async () => {
@@ -158,6 +167,27 @@ describe('mintFungibleToken — v2 engine self-mint (top-up)', () => {
     const res = await module.mintFungibleToken('abc', 100n);
 
     expect(res.success).toBe(false);
+    expect(module.getTokens()).toHaveLength(0);
+  });
+
+  it('rejects an uppercase hex coin id without minting', async () => {
+    const { module } = setup();
+    const res = await module.mintFungibleToken('AB'.repeat(32), 100n);
+
+    expect(res.success).toBe(false);
+    if (res.success) return;
+    expect(res.error).toContain('lowercase');
+    expect(module.getTokens()).toHaveLength(0);
+  });
+
+  it('returns a V2 mint failed error and stores nothing when engine.mint throws', async () => {
+    const { module } = setup({ engine: new ThrowingMintEngine() });
+    const res = await module.mintFungibleToken(UCT, 100n);
+
+    expect(res.success).toBe(false);
+    if (res.success) return;
+    expect(res.error).toContain('V2 mint failed');
+    expect(res.error).toContain('boom');
     expect(module.getTokens()).toHaveLength(0);
   });
 });
