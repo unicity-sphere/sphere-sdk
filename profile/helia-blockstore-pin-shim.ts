@@ -57,15 +57,30 @@
 import { logger } from '../core/logger';
 import { incr, observeMs } from '../core/perf-counters.js';
 
-/** Minimal structural shape of the Helia v6+ pins API. */
+/**
+ * Minimal structural shape of the Helia v6+ pins API.
+ *
+ * The shim always passes `{ depth: 0 }` so Helia pins each block as a
+ * leaf without walking referenced descendants — see issue #419 + the
+ * "Why depth: 0" doc-comment on {@link installHeliaBlockstorePinShim}.
+ */
 export interface HeliaPinsLike {
   /**
-   * Pin a CID so the block (and its references) survive Helia GC.
+   * Pin a CID so the block survives Helia GC.
+   *
    * Helia v6 returns an `AsyncIterable<CID>` that yields each pinned
-   * descendant. The shim consumes the iterable so the pin is actually
-   * applied (Helia computes the pin set lazily on iteration).
+   * descendant (one CID per depth-0 add when called with `{ depth: 0 }`).
+   * The shim consumes the iterable so the pin is actually applied —
+   * Helia computes the pin set lazily on iteration.
+   *
+   * `options` is forwarded verbatim; the only field the shim sets is
+   * `depth`. Other fields (metadata, AbortSignal) are not used today
+   * but the structural shape allows future call sites to pass them.
    */
-  add(cid: unknown, options?: unknown): AsyncIterable<unknown> | Promise<unknown>;
+  add(
+    cid: unknown,
+    options?: { readonly depth?: number; readonly metadata?: unknown; readonly signal?: unknown },
+  ): AsyncIterable<unknown> | Promise<unknown>;
 }
 
 /** Minimal structural shape of the Helia v6+ blockstore. */
@@ -142,6 +157,17 @@ export function installHeliaBlockstorePinShim(
   let pinFailed = 0;
   let pinSkipped = 0;
   const pinnedCids = new Set<string>();
+
+  // Issue #419 follow-up — capture a one-shot Helia config snapshot the
+  // first time `pins.add` raises a non-"Already pinned" failure. Many
+  // pin failures look identical in the warn-log; the snapshot tells an
+  // operator at a glance whether they're looking at an HTTP-only Helia
+  // (no libp2p), a libp2p-with-bootstraps wallet that can't reach its
+  // peers, or an unfamiliar blockstore/pins surface. Captured at install
+  // time (cheap, runs once) and emitted lazily on the first failure so
+  // a healthy session never logs the snapshot at all.
+  const heliaConfigSnapshot = snapshotHeliaConfig(helia);
+  let firstFailureSnapshotEmitted = false;
 
   const handle: PinShimHandle = {
     getCounters: () => ({ pinAttempted, pinSucceeded, pinFailed, pinSkipped }),
@@ -325,7 +351,36 @@ export function installHeliaBlockstorePinShim(
     incr('helia.pins.add.calls');
     const __pStart = performance.now();
     try {
-      const result = pinsApi.add(cid);
+      // Pin as a LEAF: `{ depth: 0 }` tells Helia to pin this block
+      // alone without walking the DAG of referenced descendants.
+      //
+      // Why this matters (issue #419):
+      //   `@helia/utils`'s `Pins.add` defaults to `depth: Infinity`,
+      //   meaning every pin call decodes the block, follows every CID
+      //   link, and recursively pins descendants. Each descendant load
+      //   goes through `blockstore.get(cid)`, which (in online mode)
+      //   falls through to Bitswap when the block isn't already on
+      //   disk — and throws "Failed to load block for <child cid>"
+      //   when Bitswap can't satisfy it either.
+      //
+      //   Every OpLog block this shim pins references its parent
+      //   block. Every CAR block pinned via `putBlockToLocalHelia`
+      //   (issue #236) references its children. Recursive descent
+      //   makes the FIRST pin try to load the WHOLE chain — most of
+      //   which isn't local yet (e.g., the genesis OpLog block from a
+      //   different session, or a CAR child that hasn't been put yet
+      //   because the worker pool ordered the puts arbitrarily).
+      //
+      //   The shim's contract is "pin individual blocks at write
+      //   time". Recursive walks contradict that contract and produce
+      //   the floods of `helia.pins.add failed for X: Failed to load
+      //   block for Y` warnings observed in issue #419. Switching to
+      //   `depth: 0` aligns Helia's behaviour with the contract: each
+      //   pin call pins exactly the block whose put just succeeded.
+      //   The DAG remains fully pinned across calls because every
+      //   block in it is the subject of its own `put` (and therefore
+      //   its own pin).
+      const result = pinsApi.add(cid, { depth: 0 });
       // Helia v6 returns AsyncIterable<CID>; older / test stubs may
       // return a thenable. Drain both shapes.
       if (
@@ -377,11 +432,96 @@ export function installHeliaBlockstorePinShim(
         'ProfilePinShim',
         `helia.pins.add failed for ${cidStr.slice(0, 16)}…: ${msg}`,
       );
+      // Issue #419 — emit the captured Helia config snapshot exactly
+      // once across the install lifetime. Tells the operator at a
+      // glance which Helia shape is in use (HTTP-only vs libp2p,
+      // blockstore type, pins implementation) so a flurry of identical
+      // pin-failure warnings doesn't bury the actual diagnostic signal.
+      if (!firstFailureSnapshotEmitted) {
+        firstFailureSnapshotEmitted = true;
+        logger.warn(
+          'ProfilePinShim',
+          `first pin failure — helia config snapshot: ${heliaConfigSnapshot}`,
+        );
+      }
       incr('helia.pins.add.failed');
       observeMs('helia.pins.add.failedMs', performance.now() - __pStart);
       return 'failed';
     }
   }
+}
+
+/**
+ * Capture a compact, one-line description of the Helia instance the
+ * shim has been bound to. Emitted lazily by {@link installHeliaBlockstorePinShim}
+ * on the first observed pin failure (issue #419).
+ *
+ * Fields:
+ *   - `blockstore`: blockstore class name (e.g., `FsBlockstore`,
+ *     `MemoryBlockstore`, `IDBBlockstore`). A failed pin against an
+ *     `FsBlockstore` points at on-disk corruption / fd exhaustion; a
+ *     failure against `MemoryBlockstore` points at a test stub.
+ *   - `pins`: pins implementation class name (real Helia is
+ *     `DefaultPins`; tests stub this).
+ *   - `libp2p`: `present`, `absent`, or `unknown`. `absent` is the
+ *     HTTP-only Helia config introduced in issue #266 — when present
+ *     the failure may be a Bitswap walk that couldn't reach a peer.
+ *   - `peerCount`: number of libp2p peers known to be connected (or
+ *     `unknown` when libp2p is absent). A peer count of 0 with libp2p
+ *     present signals isolation — Helia's Bitswap descendant walks
+ *     have no chance of succeeding.
+ *
+ * Defensive: every field falls back to `unknown` on any access error.
+ * Never throws — the caller emits this from a warn branch and must
+ * not amplify a logging path's cost into a control-flow problem.
+ */
+function snapshotHeliaConfig(helia: HeliaWithPinsLike): string {
+  const safeClassName = (value: unknown): string => {
+    if (value === null || value === undefined) return 'absent';
+    try {
+      const ctor = (value as { constructor?: { name?: unknown } }).constructor;
+      const name = ctor?.name;
+      return typeof name === 'string' && name.length > 0 ? name : 'unknown';
+    } catch {
+      return 'unknown';
+    }
+  };
+  let blockstoreName = 'unknown';
+  let pinsName = 'unknown';
+  let libp2pState: 'present' | 'absent' | 'unknown' = 'absent';
+  let peerCount: number | 'unknown' = 'unknown';
+  try {
+    blockstoreName = safeClassName(helia.blockstore);
+  } catch {
+    /* ignore */
+  }
+  try {
+    pinsName = safeClassName(helia.pins);
+  } catch {
+    /* ignore */
+  }
+  try {
+    const libp2p = (helia as unknown as { libp2p?: unknown }).libp2p;
+    if (libp2p === null || libp2p === undefined) {
+      libp2pState = 'absent';
+    } else {
+      libp2pState = 'present';
+      try {
+        const peers = (libp2p as { getPeers?: () => ReadonlyArray<unknown> }).getPeers?.();
+        if (Array.isArray(peers)) {
+          peerCount = peers.length;
+        }
+      } catch {
+        /* peer-count lookup is best-effort; libp2p shape varies */
+      }
+    }
+  } catch {
+    libp2pState = 'unknown';
+  }
+  return (
+    `blockstore=${blockstoreName} pins=${pinsName} ` +
+    `libp2p=${libp2pState} peerCount=${peerCount}`
+  );
 }
 
 /**
