@@ -26,6 +26,7 @@ import {
 } from '@unicitylabs/nostr-js-sdk';
 import { logger } from '../core/logger';
 import { SphereError } from '../core/errors';
+
 import type { ProviderStatus, FullIdentity } from '../types';
 import type {
   TransportProvider,
@@ -117,10 +118,14 @@ export interface MultiAddressTransportMuxConfig {
   createWebSocket: WebSocketFactory;
   generateUUID?: UUIDGenerator;
   storage?: TransportStorageAdapter;
+  /** Private key for the Mux's NostrClient identity. If provided, the Mux
+   *  authenticates as this key — required for relays that filter gift-wrap
+   *  event delivery to the recipient's subscription. */
+  identityPrivateKey?: Uint8Array;
 }
 
 export class MultiAddressTransportMux {
-  private config: Required<Omit<MultiAddressTransportMuxConfig, 'createWebSocket' | 'generateUUID' | 'storage'>> & {
+  private config: Required<Omit<MultiAddressTransportMuxConfig, 'createWebSocket' | 'generateUUID' | 'storage' | 'identityPrivateKey'>> & {
     createWebSocket: WebSocketFactory;
     generateUUID: UUIDGenerator;
   };
@@ -143,6 +148,7 @@ export class MultiAddressTransportMux {
   private chatEoseFired = false;
   private resubscribeTimer: ReturnType<typeof setTimeout> | null = null;
   private lastWalletEventAt: number = Date.now();
+  private lastChatEventAt: number = Date.now();
   private healthCheckTimer: ReturnType<typeof setInterval> | null = null;
   private chatEoseHandlers: Array<() => void> = [];
 
@@ -154,7 +160,17 @@ export class MultiAddressTransportMux {
   // Event callbacks (mux-level, forwarded to all adapters)
   private eventCallbacks: Set<TransportEventCallback> = new Set();
 
+  // Identity key for the Mux's NostrClient — relays may filter gift-wrap
+  // delivery to the recipient's subscription key.
+  private readonly identityPrivateKey: Uint8Array | undefined;
+
+  // Issue #442 — gate the relay subscription open until all module DM
+  // handlers have attached. See main fork commit a7229d1 / docstring on
+  // `suppressSubscriptions` below.
+  private subscriptionsArmed = true;
+
   constructor(config: MultiAddressTransportMuxConfig) {
+    this.identityPrivateKey = config.identityPrivateKey;
     this.config = {
       relays: config.relays ?? [...DEFAULT_NOSTR_RELAYS],
       timeout: config.timeout ?? TIMEOUTS.WEBSOCKET_CONNECT,
@@ -280,11 +296,19 @@ export class MultiAddressTransportMux {
     this.status = 'connecting';
 
     try {
-      // Create primary keyManager if none exists
+      // Use the identity key if provided (avoids relay filtering issues where
+      // gift-wrap events are only pushed to subscriptions from the recipient's key).
+      // Falls back to random key.
       if (!this.primaryKeyManager) {
-        const tempKey = Buffer.alloc(32);
-        crypto.getRandomValues(tempKey);
-        this.primaryKeyManager = NostrKeyManager.fromPrivateKey(tempKey);
+        if (this.identityPrivateKey) {
+          this.primaryKeyManager = NostrKeyManager.fromPrivateKey(
+            Buffer.from(this.identityPrivateKey),
+          );
+        } else {
+          const tempKey = Buffer.alloc(32);
+          crypto.getRandomValues(tempKey);
+          this.primaryKeyManager = NostrKeyManager.fromPrivateKey(tempKey);
+        }
       }
 
       this.nostrClient = new NostrClient(this.primaryKeyManager, {
@@ -309,6 +333,16 @@ export class MultiAddressTransportMux {
         onReconnected: (url) => {
           logger.debug('Mux', 'Reconnected to relay:', url);
           this.emitEvent({ type: 'transport:connected', timestamp: Date.now() });
+          // Re-establish subscriptions — the relay drops them on disconnect.
+          //
+          // Issue #442 caveat: if reconnect lands inside the bootstrap
+          // suppression window, `updateSubscriptions` short-circuits at
+          // the gate. The explicit `armSubscriptions` at the end of
+          // `Sphere.initializeModules` always rebuilds, so any rebuild
+          // dropped here self-heals on arm.
+          this.updateSubscriptions().catch((err) => {
+            logger.error('Mux', 'Failed to re-subscribe after reconnect:', err);
+          });
         },
       });
 
@@ -354,12 +388,48 @@ export class MultiAddressTransportMux {
     this.walletSubscriptionId = null;
     this.chatSubscriptionId = null;
     this.chatEoseFired = false;
+    this.lastWalletEventAt = Date.now();
+    this.lastChatEventAt = Date.now();
     this.status = 'disconnected';
     this.emitEvent({ type: 'transport:disconnected', timestamp: Date.now() });
   }
 
   isConnected(): boolean {
     return this.status === 'connected' && this.nostrClient?.isConnected() === true;
+  }
+
+  /**
+   * Issue #442 — suppress the relay subscription so `updateSubscriptions`
+   * becomes a no-op. The WebSocket stays open (so resolve / sendDM still
+   * work), but no new wallet / chat filter is registered with the relay.
+   * Active filters from before suppression are NOT torn down. Idempotent.
+   * Sphere bootstrap uses this BEFORE `connect()` so late-registering DM
+   * consumers (SwapModule, AccountingModule) have a chance to wire up
+   * before the relay starts streaming.
+   */
+  suppressSubscriptions(): void {
+    if (!this.subscriptionsArmed) return;
+    this.subscriptionsArmed = false;
+    logger.debug('Mux', '[#442] Subscriptions suppressed');
+  }
+
+  /**
+   * Issue #442 — arm the relay subscription. Sets armed=true and rebuilds
+   * the wallet / chat filters via `updateSubscriptions` when connected
+   * with at least one tracked address. Always rebuilds so the multi-
+   * address switch path (suppress → addAddress(N) → arm) folds the
+   * newly-added pubkey into the filter without losing the gate.
+   */
+  async armSubscriptions(): Promise<void> {
+    this.subscriptionsArmed = true;
+    if (this.isConnected() && this.addresses.size > 0) {
+      await this.updateSubscriptions();
+    }
+    logger.debug('Mux', '[#442] Subscriptions armed');
+  }
+
+  isSubscriptionsArmed(): boolean {
+    return this.subscriptionsArmed;
   }
 
   /**
@@ -512,9 +582,18 @@ export class MultiAddressTransportMux {
    * Called whenever addresses are added/removed.
    */
   private async updateSubscriptions(): Promise<void> {
-    if (!this.nostrClient || this.addresses.size === 0) return;
+    if (!this.nostrClient) return;
 
-    // Unsubscribe existing
+    // Issue #442 — gate BEFORE the stale-ID unsubscribe. A naive
+    // early-return after unsubscribe would tear down active subs without
+    // rebuilding, dropping events for already-tracked addresses.
+    if (!this.subscriptionsArmed) {
+      logger.debug('Mux', '[#442] updateSubscriptions deferred — subscriptions not armed');
+      return;
+    }
+
+    // Always unsubscribe stale IDs first — the relay drops server-side
+    // subscriptions on disconnect, so these IDs are dead after reconnect.
     if (this.walletSubscriptionId) {
       this.nostrClient.unsubscribe(this.walletSubscriptionId);
       this.walletSubscriptionId = null;
@@ -523,6 +602,13 @@ export class MultiAddressTransportMux {
       this.nostrClient.unsubscribe(this.chatSubscriptionId);
       this.chatSubscriptionId = null;
     }
+
+    // Reset health check timestamps — fresh subscriptions start clean.
+    this.lastWalletEventAt = Date.now();
+    this.lastChatEventAt = Date.now();
+
+    // Nothing to subscribe to if no addresses registered
+    if (this.addresses.size === 0) return;
 
     // Collect all pubkeys
     const allPubkeys: string[] = [];
@@ -588,10 +674,10 @@ export class MultiAddressTransportMux {
     const chatFilter = new Filter();
     chatFilter.kinds = [EventKinds.GIFT_WRAP];
     chatFilter['#p'] = allPubkeys;
-    // NIP-17 gift wraps use a randomized created_at (±2 days) for privacy.
-    // Subtract the maximum randomization window so the relay returns events
-    // whose actual send time is >= globalDmSince even if their created_at
-    // was shifted backwards. processedEventIds dedup prevents re-processing.
+    // NIP-17 gift wraps have created_at randomized ±2 days for privacy.
+    // Without this offset, ~50% of messages are silently dropped by the relay
+    // because their randomized timestamp lands before the `since` filter.
+    // Math.max(0, ...) prevents negative timestamps when globalDmSince is small.
     chatFilter.since = Math.max(0, globalDmSince - NIP17_TIMESTAMP_RANDOMIZATION);
 
     this.chatSubscriptionId = this.nostrClient.subscribe(chatFilter, {
@@ -636,10 +722,18 @@ export class MultiAddressTransportMux {
       // Check wallet subscription health separately from chat subscription.
       // DMs (gift wraps) keep the chat subscription alive, but the wallet
       // subscription (TOKEN_TRANSFER events) can die silently.
-      const elapsed = Date.now() - this.lastWalletEventAt;
-      if (elapsed > 300_000) { // 5 minutes — avoid unnecessary relay churn on idle wallets
-        logger.warn('Mux', `No wallet events for ${Math.round(elapsed / 1000)}s — re-subscribing`);
-        this.lastWalletEventAt = Date.now(); // prevent rapid re-subscribe
+      // Check BOTH subscriptions independently — chat is more latency-sensitive.
+      const chatElapsed = Date.now() - this.lastChatEventAt;
+      const walletElapsed = Date.now() - this.lastWalletEventAt;
+      const needResubscribe = chatElapsed > 60_000 || walletElapsed > 300_000;
+
+      if (needResubscribe) {
+        const reason = chatElapsed > 60_000
+          ? `No chat events for ${Math.round(chatElapsed / 1000)}s`
+          : `No wallet events for ${Math.round(walletElapsed / 1000)}s`;
+        logger.warn('Mux', `${reason} — re-subscribing`);
+        this.lastChatEventAt = Date.now();
+        this.lastWalletEventAt = Date.now();
         this.updateSubscriptions().catch((err) => {
           logger.warn('Mux', 'Health check re-subscription failed:', err);
         });
@@ -651,6 +745,12 @@ export class MultiAddressTransportMux {
    * Schedule a re-subscription after a relay-initiated subscription closure.
    * Debounced: if both wallet and chat subscriptions fire onError in quick
    * succession, only one updateSubscriptions() call runs.
+   *
+   * Issue #442 caveat: if the 2 s timer ticks while the gate is
+   * suppressed (bootstrap window), `updateSubscriptions` short-
+   * circuits and the rebuild is dropped. The explicit
+   * `armSubscriptions` at the end of `Sphere.initializeModules`
+   * always rebuilds, so any dropped rebuild self-heals.
    */
   private scheduleResubscribe(): void {
     if (this.resubscribeTimer) return; // already scheduled
@@ -712,9 +812,12 @@ export class MultiAddressTransportMux {
         }
       }
     }
-    // Track wallet events (non-gift-wrap) for subscription health check.
+    // Track wallet and chat events separately for subscription health checks.
     if (event.kind !== EventKinds.GIFT_WRAP) {
       this.lastWalletEventAt = Date.now();
+    }
+    if (event.kind === EventKinds.GIFT_WRAP) {
+      this.lastChatEventAt = Date.now();
     }
 
     try {
@@ -1046,7 +1149,8 @@ export class MultiAddressTransportMux {
     addressIndex: number,
     kind: number,
     content: string,
-    tags: string[][]
+    tags: string[][],
+    options?: { verify?: boolean; maxAttempts?: number; label?: string }
   ): Promise<string> {
     const entry = this.addresses.get(addressIndex);
     if (!entry) throw new SphereError('Address not registered in mux', 'NOT_INITIALIZED');
@@ -1070,8 +1174,97 @@ export class MultiAddressTransportMux {
       tags: signedEvent.tags, pubkey: signedEvent.pubkey,
       created_at: signedEvent.created_at, sig: signedEvent.sig,
     });
-    await this.nostrClient.publishEvent(nostrEvent);
+
+    const verify = options?.verify ?? false;
+    if (!verify) {
+      await this.nostrClient.publishEvent(nostrEvent);
+      return signedEvent.id;
+    }
+
+    // Verified publish: publish → query-back → retry.
+    // Matches NostrTransportProvider.publishWithVerification() pattern.
+    const maxAttempts = options?.maxAttempts ?? 3;
+    const label = options?.label ?? 'event';
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        await this.nostrClient.publishEvent(nostrEvent);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes('Event rejected') && !msg.includes('rate') && !msg.includes('limit')) {
+          throw err;
+        }
+        if (attempt === maxAttempts) throw err;
+        logger.debug('Mux', `${label} publish attempt ${attempt} failed (${msg}), retrying...`);
+        await new Promise(r => setTimeout(r, 1000 * attempt));
+        continue;
+      }
+
+      // Verify: query relay for this event (jittered delay to reduce fingerprinting)
+      await new Promise(r => setTimeout(r, 300 + Math.random() * 1200));
+      try {
+        const found = await this._queryEventById(signedEvent.id);
+        if (found) {
+          if (attempt > 1) {
+            logger.debug('Mux', `${label} verified on relay after ${attempt} attempt(s)`);
+          }
+          return signedEvent.id;
+        }
+      } catch {
+        if (attempt === maxAttempts) {
+          logger.debug('Mux', `${label} verification query failed — accepting as best-effort`);
+          return signedEvent.id;
+        }
+      }
+
+      if (attempt < maxAttempts) {
+        const delay = Math.min(2000 * attempt, 10000);
+        logger.debug('Mux', `${label} not found on relay, retrying in ${delay}ms (attempt ${attempt}/${maxAttempts})...`);
+        await new Promise(r => setTimeout(r, delay));
+      } else {
+        throw new SphereError(
+          `${label} not verified on relay after ${maxAttempts} attempts — delivery failed`,
+          'TRANSPORT_ERROR',
+        );
+      }
+    }
+
     return signedEvent.id;
+  }
+
+  /**
+   * Query the relay for a specific event by ID.
+   * Returns true if the event exists, false otherwise.
+   */
+  private async _queryEventById(eventId: string): Promise<boolean> {
+    const client = this.nostrClient;
+    if (!client) return false;
+    const filter = new Filter();
+    filter.ids = [eventId];
+    filter.limit = 1;
+
+    return new Promise<boolean>((resolve) => {
+      let found = false;
+      let subId: string | undefined;
+      const timeout = setTimeout(() => {
+        if (subId) { try { client.unsubscribe(subId); } catch { /* */ } }
+        resolve(found);
+      }, 3000);
+
+      try {
+        subId = client.subscribe(filter, {
+          onEvent: () => { found = true; },
+          onEndOfStoredEvents: () => {
+            clearTimeout(timeout);
+            if (subId) { try { client.unsubscribe(subId); } catch { /* */ } }
+            resolve(found);
+          },
+        });
+      } catch {
+        clearTimeout(timeout);
+        resolve(false);
+      }
+    });
   }
 
   /**
@@ -1415,7 +1608,8 @@ export class AddressTransportAdapter implements TransportProvider {
       this.addressIndex,
       EVENT_KINDS.TOKEN_TRANSFER,
       content,
-      [['p', recipientPubkey], ['d', uniqueD], ['type', 'token_transfer']]
+      [['p', recipientPubkey], ['d', uniqueD], ['type', 'token_transfer']],
+      { verify: true, maxAttempts: 3, label: 'token_transfer' }
     );
   }
 
@@ -1629,6 +1823,19 @@ export class AddressTransportAdapter implements TransportProvider {
   async fetchPendingEvents(): Promise<void> {
     // Fetching is handled by subscription — no-op for mux-based adapters
     // The mux subscription already includes this address's pubkey
+  }
+
+  /** Issue #442 — delegate to the underlying mux for API parity. */
+  suppressSubscriptions(): void {
+    this.mux.suppressSubscriptions();
+  }
+
+  async armSubscriptions(): Promise<void> {
+    await this.mux.armSubscriptions();
+  }
+
+  isSubscriptionsArmed(): boolean {
+    return this.mux.isSubscriptionsArmed();
   }
 
   onChatReady(handler: () => void): () => void {

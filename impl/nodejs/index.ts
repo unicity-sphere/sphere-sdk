@@ -180,6 +180,26 @@ export interface NodeProviders {
  * ```
  */
 export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders {
+  // Ensure globalThis.fetch exists — state-transition-sdk calls fetch() as a
+  // bare global with no way to inject a custom implementation.  Node 18.0-18.16
+  // has fetch behind --experimental-fetch; some VM/worker contexts strip it.
+  if (typeof globalThis.fetch !== 'function') {
+    try {
+      // undici ships with Node 18+ and provides a spec-compliant fetch
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const undici = require('undici');
+      globalThis.fetch = undici.fetch;
+      globalThis.Headers = undici.Headers;
+      globalThis.Request = undici.Request;
+      globalThis.Response = undici.Response;
+    } catch {
+      throw new Error(
+        'globalThis.fetch is not available and undici could not be loaded. ' +
+        'Upgrade to Node.js >= 18.17 or install undici: npm install undici'
+      );
+    }
+  }
+
   const network = config?.network ?? 'mainnet';
 
   // Configure global logger: top-level debug enables all, per-provider overrides are additive

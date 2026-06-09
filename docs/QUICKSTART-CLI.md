@@ -86,7 +86,7 @@ sphere-cli wallet <TAB>             # list create use current delete
 | `init` | Create or import wallet |
 | `status` | Show wallet identity |
 | `config` | Show or set CLI configuration |
-| `clear` | Delete all wallet data |
+| `clear` | Delete all wallet data (requires confirmation or `--yes`) |
 | `wallet list` | List wallet profiles |
 | `wallet create <name>` | Create a new wallet profile |
 | `wallet use <name>` | Switch to a wallet profile |
@@ -156,7 +156,7 @@ sphere-cli wallet <TAB>             # list create use current delete
 | `decrypt <json> <pass>` | Decrypt encrypted data |
 | `parse-wallet <file>` | Parse wallet backup file |
 | `wallet-info <file>` | Show wallet file metadata |
-| `generate-key` | Generate random private key |
+| `generate-key` | Generate random key pair (private key hidden; use `--unsafe-print` to show) |
 | `validate-key <hex>` | Validate secp256k1 key |
 | `hex-to-wif <hex>` | Convert hex to WIF |
 | `derive-pubkey <hex>` | Derive public key |
@@ -200,9 +200,15 @@ npm run cli -- init --network testnet --nametag alice
 # Import an existing wallet from a 12 or 24-word mnemonic
 npm run cli -- init --mnemonic "word1 word2 word3 ... word24"
 
+# Interactive mnemonic import (more secure — mnemonic never in process args)
+npm run cli -- init --mnemonic
+# Prompts: "Enter mnemonic phrase: "
+
 # Import with a nametag registration in one step
 npm run cli -- init --mnemonic "word1 ..." --nametag alice
 ```
+
+> **Security:** Using `--mnemonic` without a value prompts interactively, keeping the mnemonic out of shell history and `/proc/<pid>/cmdline`. Prefer this mode for production wallets.
 
 > **Important:** When a new wallet is created without `--mnemonic`, a 24-word mnemonic is generated and printed once to the terminal. Save it immediately — it cannot be recovered.
 
@@ -1411,8 +1417,12 @@ npm run cli -- wallet-info wallet.dat
 These commands work without a wallet and are useful for low-level key management and testing.
 
 ```bash
-# Generate a fresh secp256k1 private key
+# Generate a fresh secp256k1 key pair (private key hidden by default)
 npm run cli -- generate-key
+# Output: Public Key: 02abc... / Address: alpha1...
+
+# Show private key and WIF (use with caution — never in scripts/CI)
+npm run cli -- generate-key --unsafe-print
 # Output: { privateKey, publicKey, wif, address }
 
 # Validate a private key

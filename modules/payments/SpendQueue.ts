@@ -29,7 +29,7 @@ export const RESERVATION_TIMEOUT_MS = 30_000;
 /** How long a queued entry waits before being rejected with SEND_QUEUE_TIMEOUT. */
 export const QUEUE_TIMEOUT_MS = 30_000;
 
-/** Max times an entry can be skipped (no plan found) before it blocks the queue head. */
+/** Exported for test compatibility. Not used by production queue logic. */
 export const MAX_SKIP_COUNT = 10;
 
 /** Maximum number of entries allowed in the queue across all coinIds. */
@@ -64,7 +64,6 @@ export interface QueueEntry {
   readonly coinId: string;
   readonly amount: bigint;
   readonly enqueuedAt: number;
-  skipCount: number;
   resolve: (result: PlanResult) => void;
   reject: (error: Error) => void;
   timeout: ReturnType<typeof setTimeout>;
@@ -127,10 +126,17 @@ export class SpendPlanner {
     reservationId: string,
     pendingChangeAmount?: bigint,
   ): PlanResult | 'queued' {
+    if (!request.amount || !/^\d+$/.test(request.amount)) {
+      throw new SphereError('Invalid send amount', 'VALIDATION_ERROR');
+    }
     const requestedAmount = BigInt(request.amount);
+    if (requestedAmount <= 0n) {
+      throw new SphereError('Send amount must be positive', 'VALIDATION_ERROR');
+    }
     const coinId = request.coinId;
 
-    // Build free view: entries with positive free amounts after subtracting reservations
+    // Build free view: only fully-free tokens (no partial reservations).
+    // Matches buildFreeView() in SpendQueue — whole-token transfer semantics.
     const freeView: Array<{ token: Token; sdkToken: SdkToken<any>; amount: bigint }> = [];
     let totalInventory = 0n;
 
@@ -138,7 +144,7 @@ export class SpendPlanner {
       if (entry.token.coinId !== coinId) continue;
       totalInventory += entry.amount;
       const freeAmount = ledger.getFreeAmount(entry.token.id, entry.amount);
-      if (freeAmount > 0n) {
+      if (freeAmount > 0n && freeAmount === entry.amount) {
         freeView.push({ token: entry.token, sdkToken: entry.sdkToken, amount: freeAmount });
       }
     }
@@ -154,7 +160,7 @@ export class SpendPlanner {
     // Case C: total inventory (ignoring reservations) is insufficient
     if (totalInventory < requestedAmount) {
       throw new SphereError(
-        `Insufficient balance. Available: ${totalInventory}, Required: ${requestedAmount}`,
+        'Insufficient balance for this transaction',
         'SEND_INSUFFICIENT_BALANCE'
       );
     }
@@ -220,12 +226,15 @@ export class SpendPlanner {
       return this.createDirectPlan([asTokenWithAmount(exactMatch)], targetAmount);
     }
 
-    // Strategy 2: Combination search (up to 5 tokens)
-    const maxCombinationSize = Math.min(5, sorted.length);
-    for (let size = 2; size <= maxCombinationSize; size++) {
-      const combo = this.findCombinationOfSize(sorted, targetAmount, size, asTokenWithAmount);
-      if (combo) {
-        return this.createDirectPlan(combo, targetAmount);
+    // Strategy 2: Combination search (up to 5 tokens).
+    // Skip if too many candidates — C(n,5) is exponential.
+    if (sorted.length <= 20) {
+      const maxCombinationSize = Math.min(5, sorted.length);
+      for (let size = 2; size <= maxCombinationSize; size++) {
+        const combo = this.findCombinationOfSize(sorted, targetAmount, size, asTokenWithAmount);
+        if (combo) {
+          return this.createDirectPlan(combo, targetAmount);
+        }
       }
     }
 
@@ -378,17 +387,27 @@ export class SpendQueue {
    * later by notifyChange().
    */
   enqueue(
-    entry: Omit<QueueEntry, 'skipCount' | 'resolve' | 'reject' | 'timeout'>
+    entry: Omit<QueueEntry, 'resolve' | 'reject' | 'timeout'>
   ): Promise<PlanResult> {
+    if (this.destroyed) {
+      const p = Promise.reject(
+        new SphereError('Module has been destroyed', 'MODULE_DESTROYED')
+      );
+      p.catch(() => {});
+      return p;
+    }
+
     // Check queue size limit
     let totalSize = 0;
     for (const [, q] of this.queues) {
       totalSize += q.length;
     }
     if (totalSize >= QUEUE_MAX_SIZE) {
-      return Promise.reject(
+      const p = Promise.reject(
         new SphereError('Send queue is full', 'SEND_QUEUE_FULL')
       );
+      p.catch(() => {});
+      return p;
     }
 
     let resolvePromise!: (result: PlanResult) => void;
@@ -405,7 +424,6 @@ export class SpendQueue {
 
     const fullEntry: QueueEntry = {
       ...entry,
-      skipCount: 0,
       resolve: resolvePromise,
       reject: rejectPromise,
       timeout,
@@ -482,10 +500,15 @@ export class SpendQueue {
         }
       }
       // Then: add original entries only if not already in cache (stale fallback)
+      let staleCount = 0;
       for (const [id, original] of entry.parsedPool) {
         if (!mergedPool.has(id)) {
           mergedPool.set(id, original);
+          staleCount++;
         }
+      }
+      if (staleCount > 0) {
+        logger.warn(TAG, `Queue entry ${entry.id}: ${staleCount} token(s) using stale pool data`);
       }
 
       // Build free view and try planning
@@ -519,11 +542,8 @@ export class SpendQueue {
       }
 
       // Could not plan — skip this entry and try later ones.
-      // W23 fix: Only increment skipCount when this is a fresh evaluation
-      // (not a repeated scan triggered by unrelated token events).
-      // We skip over the entry instead of breaking — smaller entries behind
-      // a large blocked one can still be planned, preventing starvation.
-      entry.skipCount++;
+      // Skip over the entry — smaller entries behind a large blocked one can
+      // still be planned, preventing starvation.
 
       i++;
     }

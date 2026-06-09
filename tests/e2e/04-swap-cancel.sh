@@ -113,11 +113,11 @@ accept_swap "$BOB" "${SWAP_C:0:8}" 300
 # Only Alice deposits
 deposit_swap "$ALICE" "${SWAP_C:0:8}"
 
-# CRITICAL: Verify Alice's change token survived the deposit
-# Alice had 50 BTC (minus amounts from 4a/4b proposals that don't deposit),
-# deposited 5 BTC — must still have BTC from the change token.
-log "4c: Verifying change token after deposit..."
-assert_deposit_change "$ALICE" BTC "4c: Alice BTC change after depositing 5"
+# CRITICAL: Verify Alice's exact balance after deposit
+# Alice had 50 BTC, deposited 5 BTC → should have exactly 45 BTC remaining.
+# (4a and 4b proposals don't deposit, so no BTC was consumed by them.)
+log "4c: Verifying exact balance after deposit..."
+assert_balance "$ALICE" BTC "45" "4c: Alice BTC after depositing 5 of 50"
 
 # Verify Alice deposited (no artificial wait — deposit_swap already completed)
 PROGRESS=$(cli_as "$ALICE" swap-list 2>&1 | grep "${SWAP_C:0:8}" | { grep -oP 'depositing|announced' || true; } | head -1)
@@ -147,7 +147,7 @@ while [[ $RETURN_ELAPSED -lt 90 ]]; do
   ALICE_BTC_COUNT=$(get_coin_token_count "$ALICE" BTC)
   log "4c: [${RETURN_ELAPSED}s] Alice BTC tokens: ${ALICE_BTC_COUNT:-0}"
   # After deposit return, Alice should have 2+ BTC tokens (change + returned deposit)
-  if [[ -n "$ALICE_BTC_COUNT" && "$ALICE_BTC_COUNT" -ge 2 ]]; then
+  if [[ "${ALICE_BTC_COUNT:-0}" -ge 2 ]]; then
     log "4c: Deposit returned after ~${RETURN_ELAPSED}s"
     break
   fi
@@ -165,7 +165,7 @@ else
   # The cancel itself succeeded (verified above). The return is async.
   log "  Note: Auto-return requires aggregator confirmation of deposit tokens — may take >180s on testnet"
   log "  The cancel command succeeded; deposit return is a known timing limitation"
-  ok "4c: Cancel succeeded (deposit return is async, may exceed test timeout)"
+  log "4c: Cancel succeeded (deposit return is async, may exceed test timeout)"
 fi
 
 summary

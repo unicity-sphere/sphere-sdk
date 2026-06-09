@@ -63,6 +63,7 @@ import type { OracleProvider } from '../oracle';
 import type { PriceProvider } from '../price';
 import { PaymentsModule, createPaymentsModule } from '../modules/payments';
 import { CommunicationsModule, createCommunicationsModule } from '../modules/communications';
+import type { CommunicationsModuleConfig } from '../modules/communications';
 import { GroupChatModule, createGroupChatModule } from '../modules/groupchat';
 import type { GroupChatModuleConfig } from '../modules/groupchat';
 import { MarketModule, createMarketModule } from '../modules/market';
@@ -180,8 +181,8 @@ export interface SphereCreateOptions {
   transport: TransportProvider;
   /** Oracle provider instance */
   oracle: OracleProvider;
-  /** L1 (ALPHA blockchain) configuration */
-  l1?: L1Config;
+  /** L1 (ALPHA blockchain) configuration. Pass null to disable L1 entirely. */
+  l1?: L1Config | null;
   /** Optional price provider for fiat conversion */
   price?: PriceProvider;
   /**
@@ -198,6 +199,8 @@ export interface SphereCreateOptions {
   accounting?: AccountingModuleConfig | boolean;
   /** Swap module configuration. `true` for defaults, object for custom config, `false`/`undefined` to disable. */
   swap?: SwapModuleConfig | boolean;
+  /** Communications module configuration. */
+  communications?: CommunicationsModuleConfig;
   /** Optional password to encrypt the wallet. If omitted, mnemonic is stored as plaintext. */
   password?: string;
   /**
@@ -223,8 +226,8 @@ export interface SphereLoadOptions {
   transport: TransportProvider;
   /** Oracle provider instance */
   oracle: OracleProvider;
-  /** L1 (ALPHA blockchain) configuration */
-  l1?: L1Config;
+  /** L1 (ALPHA blockchain) configuration. Pass null to disable L1 entirely. */
+  l1?: L1Config | null;
   /** Optional price provider for fiat conversion */
   price?: PriceProvider;
   /**
@@ -241,6 +244,8 @@ export interface SphereLoadOptions {
   accounting?: AccountingModuleConfig | boolean;
   /** Swap module configuration. `true` for defaults, object for custom config, `false`/`undefined` to disable. */
   swap?: SwapModuleConfig | boolean;
+  /** Communications module configuration. */
+  communications?: CommunicationsModuleConfig;
   /** Optional password to decrypt the wallet. Must match the password used during creation. */
   password?: string;
   /**
@@ -280,8 +285,8 @@ export interface SphereImportOptions {
   transport: TransportProvider;
   /** Oracle provider instance */
   oracle: OracleProvider;
-  /** L1 (ALPHA blockchain) configuration */
-  l1?: L1Config;
+  /** L1 (ALPHA blockchain) configuration. Pass null to disable L1 entirely. */
+  l1?: L1Config | null;
   /** Optional price provider for fiat conversion */
   price?: PriceProvider;
   /** Group chat configuration (NIP-29). Omit to disable groupchat. */
@@ -292,6 +297,8 @@ export interface SphereImportOptions {
   accounting?: AccountingModuleConfig | boolean;
   /** Swap module configuration. `true` for defaults, object for custom config, `false`/`undefined` to disable. */
   swap?: SwapModuleConfig | boolean;
+  /** Communications module configuration. */
+  communications?: CommunicationsModuleConfig;
   /** Optional password to encrypt the wallet. If omitted, mnemonic/key is stored as plaintext. */
   password?: string;
   /**
@@ -335,8 +342,8 @@ export interface SphereInitOptions {
   derivationPath?: string;
   /** Optional nametag to register (only on create). Token is auto-minted. */
   nametag?: string;
-  /** L1 (ALPHA blockchain) configuration */
-  l1?: L1Config;
+  /** L1 (ALPHA blockchain) configuration. Pass null to disable L1 entirely. */
+  l1?: L1Config | null;
   /** Optional price provider for fiat conversion */
   price?: PriceProvider;
   /**
@@ -374,6 +381,8 @@ export interface SphereInitOptions {
    * Without this, a fresh wallet starts from "now" and misses older DMs.
    */
   dmSince?: number;
+  /** Communications module configuration. */
+  communications?: CommunicationsModuleConfig;
   /** Enable debug logging (default: false) */
   debug?: boolean;
   /** Optional callback to report initialization progress steps */
@@ -497,9 +506,10 @@ export class Sphere {
   private _dmSince: number | null = null;
 
   // Stored configs for creating per-address modules
-  private _l1Config: L1Config | undefined;
+  private _l1Config: L1Config | null | undefined;
   private _groupChatConfig: GroupChatModuleConfig | undefined;
   private _marketConfig: MarketModuleConfig | undefined;
+  private _communicationsConfig: CommunicationsModuleConfig | undefined;
 
   // Events
   private eventHandlers: Map<SphereEventType, Set<SphereEventHandler<SphereEventType>>> = new Map();
@@ -518,12 +528,13 @@ export class Sphere {
     transport: TransportProvider,
     oracle: OracleProvider,
     tokenStorage?: TokenStorageProvider<TxfStorageDataBase>,
-    l1Config?: L1Config,
+    l1Config?: L1Config | null,
     priceProvider?: PriceProvider,
     groupChatConfig?: GroupChatModuleConfig,
     marketConfig?: MarketModuleConfig,
     accountingConfig?: AccountingModuleConfig,
     swapConfig?: SwapModuleConfig,
+    communicationsConfig?: CommunicationsModuleConfig,
   ) {
     this._storage = storage;
     this._transport = transport;
@@ -539,9 +550,10 @@ export class Sphere {
     this._l1Config = l1Config;
     this._groupChatConfig = groupChatConfig;
     this._marketConfig = marketConfig;
+    this._communicationsConfig = communicationsConfig;
 
     this._payments = createPaymentsModule({ l1: l1Config });
-    this._communications = createCommunicationsModule();
+    this._communications = createCommunicationsModule(communicationsConfig);
     this._groupChat = groupChatConfig ? createGroupChatModule(groupChatConfig) : null;
     this._market = marketConfig ? createMarketModule(marketConfig) : null;
     this._accounting = accountingConfig ? createAccountingModule(accountingConfig) : null;
@@ -819,6 +831,7 @@ export class Sphere {
       marketConfig,
       accountingConfig,
       swapConfig,
+      options.communications,
     );
     sphere._password = options.password ?? null;
 
@@ -916,6 +929,7 @@ export class Sphere {
       marketConfig,
       accountingConfig,
       swapConfig,
+      options.communications,
     );
     sphere._password = options.password ?? null;
 
@@ -1030,6 +1044,7 @@ export class Sphere {
       marketConfig,
       accountingConfig,
       swapConfig,
+      options.communications,
     );
     sphere._password = options.password ?? null;
 
@@ -1403,17 +1418,14 @@ export class Sphere {
 
   /**
    * Fetch pending events from Nostr relay and process them through the
-   * multi-address transport mux. This ensures DMs (swap proposals, invoice
-   * receipts, escrow messages, transfer notifications) are delivered to
-   * module handlers before reading in-memory state.
+   * multi-address transport mux. This ensures DMs (invoice receipts,
+   * escrow messages, transfer notifications) are delivered to module
+   * handlers before reading in-memory state.
    *
    * Tolerates failures — returns silently if transport is not connected.
    */
   async fetchPendingEvents(): Promise<void> {
-    if (this._transportMux) {
-      await this._transportMux.fetchPendingEvents();
-    } else if (this._transport.isConnected() && this._transport.fetchPendingEvents) {
-      // Fallback to raw transport if mux not available
+    if (this._transport.isConnected() && this._transport.fetchPendingEvents) {
       await this._transport.fetchPendingEvents();
     }
   }
@@ -2439,6 +2451,14 @@ export class Sphere {
 
     const emitEvent = this.emitEvent.bind(this);
 
+    // Issue #442 — suppress the mux subscription BEFORE addAddress so the
+    // relay filter is NOT rebuilt with the new pubkey until this address's
+    // modules finish loading. The primary address's existing wallet/chat
+    // sub continues delivering through the suppression window.
+    if (this._transportMux) {
+      this._transportMux.suppressSubscriptions();
+    }
+
     // Ensure transport mux exists for non-primary addresses
     const adapter = await this.ensureTransportMux(index, identity);
 
@@ -2453,7 +2473,7 @@ export class Sphere {
 
     // Create fresh module instances for this address
     const payments = createPaymentsModule({ l1: this._l1Config });
-    const communications = createCommunicationsModule();
+    const communications = createCommunicationsModule(this._communicationsConfig);
     const groupChat = this._groupChatConfig ? createGroupChatModule(this._groupChatConfig) : null;
     const market = this._marketConfig ? createMarketModule(this._marketConfig) : null;
 
@@ -2491,8 +2511,6 @@ export class Sphere {
       const accountingTokenStorage = tokenStorageProviders.values().next().value;
       if (accountingTokenStorage) {
         // Resolve trustBase from oracle for invoice proof verification
-        // W3-R17 fix: Type as unknown — actual value is RootTrustBase (not Uint8Array),
-        // AccountingModule.deps.trustBase is typed as unknown.
         let trustBase: unknown = null;
         try {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -2500,8 +2518,6 @@ export class Sphere {
         } catch {
           logger.warn('Sphere', 'Oracle does not support getTrustBase — invoice proof verification will be unavailable');
         }
-        // NOTE: If trustBase is null/empty, AccountingModule.importInvoice() will reject imports
-        // that require proof verification. createInvoice() is unaffected.
 
         this._accounting.initialize({
           payments,
@@ -2516,8 +2532,6 @@ export class Sphere {
           communications,
         });
       } else {
-        // W2-R17 fix: If no tokenStorage, log and disable accounting to prevent
-        // load() throwing NOT_INITIALIZED downstream.
         logger.warn('Sphere', 'Accounting module enabled but no token storage available — disabling');
         this._accounting = null;
       }
@@ -2572,6 +2586,17 @@ export class Sphere {
       }
     }
 
+    // Issue #442 — arm the mux now that the new address's modules have
+    // registered their DM handlers. Rebuilds the relay filter to include
+    // the new pubkey alongside any previously-tracked addresses.
+    if (this._transportMux) {
+      try {
+        await this._transportMux.armSubscriptions();
+      } catch (err) {
+        logger.warn('Sphere', `[#442] mux armSubscriptions failed: ${err}`);
+      }
+    }
+
     const moduleSet: AddressModuleSet = {
       index,
       identity,
@@ -2620,6 +2645,11 @@ export class Sphere {
         createWebSocket: nostrTransport.getWebSocketFactory(),
         storage: nostrTransport.getStorageAdapter() ?? undefined,
       });
+
+      // Issue #442 — suppress mux subscriptions BEFORE connect so the relay
+      // sub stays closed until every module's handlers register (see
+      // initializeModules / initializeAddressModules trailing armSubscriptions).
+      this._transportMux.suppressSubscriptions();
 
       // Connect the mux
       await this._transportMux.connect();
@@ -2680,13 +2710,8 @@ export class Sphere {
    * Internal getActiveAddresses without ensureReady() check.
    * IMPORTANT: This method skips ensureReady() because it's called during initialization
    * before _initialized is set. It REQUIRES that loadTrackedAddresses() has already completed.
-   * If this assertion fails, the initialization order in _doLoad() has been broken.
    */
   private _getActiveAddressesInternal(): TrackedAddress[] {
-    if (!this._trackedAddressesLoaded) {
-      logger.warn('Sphere', '_getActiveAddressesInternal called before tracked addresses loaded');
-      return [];
-    }
     const result: TrackedAddress[] = [];
     for (const entry of this._trackedAddresses.values()) {
       if (!entry.hidden) {
@@ -3286,6 +3311,26 @@ export class Sphere {
   async resolve(identifier: string): Promise<PeerInfo | null> {
     this.ensureReady();
     return this._transport.resolve?.(identifier) ?? null;
+  }
+
+  /**
+   * Pre-resolve a Unicity address for DM delivery.
+   *
+   * Warms the CommunicationsModule's internal resolution cache so that
+   * subsequent sendDM() calls to this address avoid the network round-trip.
+   * Useful before a batch of DM operations (e.g., sending hello_ack to
+   * multiple tenants, or broadcasting to a list of agents).
+   *
+   * @param address - Any valid Unicity address (@nametag, DIRECT://, PROXY://, hex pubkey)
+   * @throws SphereError if the address cannot be resolved
+   */
+  async preResolveDM(address: string): Promise<void> {
+    this.ensureReady();
+    // Pre-resolve via transport for DM delivery
+    const peerInfo = await this._transport.resolve?.(address);
+    if (!peerInfo) {
+      throw new SphereError(`Cannot resolve address: ${address.slice(0, 30)}`, 'INVALID_RECIPIENT');
+    }
   }
 
   /** Compute and cache the PROXY address from the current nametag */
@@ -4304,8 +4349,6 @@ export class Sphere {
       const accountingTokenStorage = this._tokenStorageProviders.values().next().value;
       if (accountingTokenStorage) {
         // Resolve trustBase from oracle for invoice proof verification
-        // W3-R17 fix: Type as unknown — actual value is RootTrustBase (not Uint8Array),
-        // AccountingModule.deps.trustBase is typed as unknown.
         let trustBase: unknown = null;
         try {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -4313,8 +4356,6 @@ export class Sphere {
         } catch {
           logger.warn('Sphere', 'Oracle does not support getTrustBase — invoice proof verification will be unavailable');
         }
-        // NOTE: If trustBase is null/empty, AccountingModule.importInvoice() will reject imports
-        // that require proof verification. createInvoice() is unaffected.
 
         this._accounting.initialize({
           payments: this._payments,
@@ -4329,8 +4370,6 @@ export class Sphere {
           communications: this._communications,
         });
       } else {
-        // W2-R17 fix: If no tokenStorage, log and disable accounting to prevent
-        // load() throwing NOT_INITIALIZED downstream.
         logger.warn('Sphere', 'Accounting module enabled but no token storage available — disabling');
         this._accounting = null;
       }
@@ -4383,6 +4422,20 @@ export class Sphere {
     for (const r of results) {
       if (r.status === 'rejected') {
         logger.warn('Sphere', 'Module load failed:', r.reason);
+      }
+    }
+
+    // Issue #442 — arm the MUX's relay subscription now that all module
+    // DM handlers are registered (CommunicationsModule.onMessage + every
+    // late onDirectMessage fan-out subscriber from AccountingModule,
+    // SwapModule, MarketModule, GroupChatModule). Without this the wallet
+    // never opens a relay sub at all — total event blackout because
+    // ensureTransportMux suppressed it pre-connect.
+    if (this._transportMux) {
+      try {
+        await this._transportMux.armSubscriptions();
+      } catch (err) {
+        logger.warn('Sphere', `[#442] mux armSubscriptions failed: ${err}`);
       }
     }
 

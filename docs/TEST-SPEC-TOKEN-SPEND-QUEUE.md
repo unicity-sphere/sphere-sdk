@@ -5,13 +5,13 @@
 This document specifies a complete test suite for the Token Spend Queue feature in Sphere SDK. The test suite covers:
 
 - **TokenReservationLedger**: Core reservation tracking with partial reservations and lifecycle management
-- **SpendPlanner**: Token selection logic with skip-ahead queue integration
+- **SpendPlanner**: Token selection logic with pass-over queue integration
 - **SpendQueue**: Queue lifecycle, timeouts, and concurrency coordination
 - **PaymentsModule Concurrency**: End-to-end race condition scenarios
 - **Send-Queue Integration**: Complete wallet state consistency
-- **Starvation Protection**: Fairness guarantees with skip-ahead logic
+- **Pass-Over Behavior**: Fairness guarantees with pass-over logic
 
-**Total Estimated Test Cases: 240+**
+**Total Estimated Test Cases: ~203**
 
 ---
 
@@ -27,7 +27,7 @@ This document specifies a complete test suite for the Token Spend Queue feature 
 
 #### It: "reserve() creates a reservation with correct amounts" `[UNIT]`
 - **Setup**: Ledger with one token (id: `tok-1`, amount: `1000000` satoshis)
-- **Action**: `reserve({ tokens: [{ tokenId: 'tok-1', amount: '500000' }] })`
+- **Action**: `reserve(reservationId, [{ tokenId: 'tok-1', amount: '500000' }], coinId)`
 - **Expected**: 
   - Returns reservationId string (UUID format)
   - `getFreeAmount('tok-1')` returns `500000` (1000000 - 500000)
@@ -35,7 +35,7 @@ This document specifies a complete test suite for the Token Spend Queue feature 
 
 #### It: "reserve() for multiple tokens in one reservation" `[UNIT]`
 - **Setup**: Ledger with 3 tokens: `tok-1` (1000000), `tok-2` (2000000), `tok-3` (500000)
-- **Action**: `reserve({ tokens: [{ tokenId: 'tok-1', amount: '400000' }, { tokenId: 'tok-2', amount: '1000000' }] })`
+- **Action**: `reserve(reservationId, [{ tokenId: 'tok-1', amount: '400000' }, { tokenId: 'tok-2', amount: '1000000' }], coinId)`
 - **Expected**:
   - Single reservationId returned
   - `getFreeAmount('tok-1')` = `600000`
@@ -70,12 +70,12 @@ This document specifies a complete test suite for the Token Spend Queue feature 
 - **Action**: Call `getTotalReserved('tok-1')`
 - **Expected**: Returns `700000` (sum of both)
 
-#### It: "getActiveCoinReservations() returns all reserved amounts for a coinId" `[UNIT]`
+#### It: "getTotalReserved() returns correct amounts per token across multiple reservations" `[UNIT]`
 - **Setup**: Ledger with 2 tokens of same coin (UCT): `tok-1` (1000000), `tok-2` (2000000). Three reservations: tok-1→300000, tok-2→500000, tok-1→100000
-- **Action**: Call `getActiveCoinReservations('UCT')`
+- **Action**: Call `getTotalReserved('tok-1')` and `getTotalReserved('tok-2')`
 - **Expected**:
-  - Returns map: `{ 'tok-1': '400000', 'tok-2': '500000' }`
-  - Order doesn't matter (set semantics)
+  - `getTotalReserved('tok-1')` returns `400000`
+  - `getTotalReserved('tok-2')` returns `500000`
 
 ---
 
@@ -84,8 +84,8 @@ This document specifies a complete test suite for the Token Spend Queue feature 
 #### It: "Two reservations on same token, each claiming part of the amount" `[UNIT]`
 - **Setup**: Token `tok-1` (1000000)
 - **Action**: 
-  1. res-1 = `reserve({ tokens: [{ tokenId: 'tok-1', amount: '300000' }] })`
-  2. res-2 = `reserve({ tokens: [{ tokenId: 'tok-1', amount: '400000' }] })`
+  1. res-1 = `reserve(reservationId, [{ tokenId: 'tok-1', amount: '300000' }], coinId)`
+  2. res-2 = `reserve(reservationId, [{ tokenId: 'tok-1', amount: '400000' }], coinId)`
 - **Expected**: Both succeed, no throw
 
 #### It: "getFreeAmount after two partial reservations is correct" `[UNIT]`
@@ -115,22 +115,22 @@ This document specifies a complete test suite for the Token Spend Queue feature 
 
 #### It: "reserve() with amount exceeding free amount → throws" `[UNIT]`
 - **Setup**: Token `tok-1` (1000000), existing reservation for 700000
-- **Action**: Try `reserve({ tokens: [{ tokenId: 'tok-1', amount: '500000' }] })`
+- **Action**: Try `reserve(reservationId, [{ tokenId: 'tok-1', amount: '500000' }], coinId)`
 - **Expected**: Throws `Error` with message matching "insufficient.*free.*amount" or similar
 
 #### It: "reserve() for token not in pool → throws" `[UNIT]`
 - **Setup**: Ledger with token `tok-1` (1000000)
-- **Action**: Try `reserve({ tokens: [{ tokenId: 'nonexistent', amount: '100' }] })`
+- **Action**: Try `reserve(reservationId, [{ tokenId: 'nonexistent', amount: '100' }], coinId)`
 - **Expected**: Throws `Error` with message matching "token.*not.*found" or "unknown.*token"
 
 #### It: "reserve() with zero amount → accepted or rejected consistently" `[UNIT]`
 - **Setup**: Token `tok-1` (1000000)
-- **Action**: Try `reserve({ tokens: [{ tokenId: 'tok-1', amount: '0' }] })`
+- **Action**: Try `reserve(reservationId, [{ tokenId: 'tok-1', amount: '0' }], coinId)`
 - **Expected**: Either returns valid reservationId or throws with clear message. **Document the design decision.**
 
 #### It: "reserve() with negative amount → throws" `[UNIT]`
 - **Setup**: Token `tok-1` (1000000)
-- **Action**: Try `reserve({ tokens: [{ tokenId: 'tok-1', amount: '-100' }] })`
+- **Action**: Try `reserve(reservationId, [{ tokenId: 'tok-1', amount: '-100' }], coinId)`
 - **Expected**: Throws `Error`
 
 #### It: "cancel() for unknown reservationId → no-op or safe" `[UNIT]`
@@ -243,8 +243,8 @@ This document specifies a complete test suite for the Token Spend Queue feature 
 #### It: "After any sequence of reserve/cancel/commit: getFreeAmount + getTotalReserved === token.amount" `[UNIT]`
 - **Setup**: Token `tok-1` (1000000)
 - **Action**: Perform sequence:
-  1. res-1 = `reserve({ tokens: [{ tokenId: 'tok-1', amount: '300000' }] })`
-  2. res-2 = `reserve({ tokens: [{ tokenId: 'tok-1', amount: '200000' }] })`
+  1. res-1 = `reserve(reservationId, [{ tokenId: 'tok-1', amount: '300000' }], coinId)`
+  2. res-2 = `reserve(reservationId, [{ tokenId: 'tok-1', amount: '200000' }], coinId)`
   3. `commit(res-1)`
   4. `cancel(res-2)`
 - **Expected**: At each step, verify: `getFreeAmount('tok-1') + getTotalReserved('tok-1') == 1000000`
@@ -271,7 +271,7 @@ This document specifies a complete test suite for the Token Spend Queue feature 
 
 ## FILE 2: `tests/unit/modules/SpendPlanner.test.ts`
 
-**Purpose**: Verify token selection logic, split detection, and queue interaction with skip-ahead.
+**Purpose**: Verify token selection logic, split detection, and queue interaction with pass-over.
 
 **Test Type Tags**: `[UNIT]` for basic operations, `[INTEGRATION]` for queue interaction.
 
@@ -389,32 +389,31 @@ This document specifies a complete test suite for the Token Spend Queue feature 
   1. Add both to queue
   2. Call `notifyChange('UCT')`
 - **Expected**:
-  - small_request is planned and removed from queue first (skip-ahead)
+  - small_request is planned and removed from queue first (pass-over)
   - large_request remains queued
-  - skipCount for small_request is NOT incremented (it was served)
+  - small_request served and removed
 
-#### It: "Skip count incremented for skipped entry" `[INTEGRATION]`
+#### It: "Passed-over entry remains queued" `[INTEGRATION]`
 - **Setup**: Queue with [large_req, small_req]. Change token covers only small.
 - **Action**: Call `notifyChange('UCT')`
 - **Expected**:
-  - large_req is skipped
-  - large_req.skipCount incremented from 0 to 1
+  - large_req is passed over
+  - large_req remains queued
   - small_req served and removed
 
-#### It: "After MAX_SKIP_COUNT (10) skips, large request blocks small ones (starvation protection)" `[INTEGRATION]`
-- **Setup**: Queue with [large_req (skipCount: 10), small_req (skipCount: 0)]. Change token covers only small.
-- **Action**: Call `notifyChange('UCT')`
+#### It: "Large request eventually times out if never satisfiable" `[INTEGRATION]`
+- **Setup**: Queue with [large_req, small_req]. Change tokens repeatedly cover only small amounts. 30s elapses.
+- **Action**: Advance time past QUEUE_TIMEOUT_MS, call `notifyChange('UCT')`
 - **Expected**:
-  - Both remain queued
-  - large_req is served first (starvation limit reached)
-  - skipCount resets to 0 for remaining entries
+  - large_req rejected with SEND_QUEUE_TIMEOUT
+  - small_req served if tokens available
 
-#### It: "Multiple small requests skip ahead of one large request (up to limit)" `[INTEGRATION]`
+#### It: "Multiple small requests pass over one large request" `[INTEGRATION]`
 - **Setup**: Queue with [large_req, small-1, small-2, small-3]. Change covers small-1 only.
 - **Action**: Call `notifyChange('UCT')`
 - **Expected**:
   - small-1 served and removed
-  - skipCount for large_req incremented
+  - large_req passed over, remains queued
   - small-2, small-3 remain queued
 
 ---
@@ -494,7 +493,7 @@ This document specifies a complete test suite for the Token Spend Queue feature 
 - **Setup**: Queue with 5 requests, mocked callbacks
 - **Action**: Call `cancelAll('TEST_REASON')`
 - **Expected**:
-  - All 5 callbacks are invoked with error code `SEND_QUEUE_CANCELLED`
+  - All 5 callbacks are invoked with error code `MODULE_DESTROYED`
   - Queue size is 0
   - Each callback receives error object with reason field
 
@@ -582,15 +581,6 @@ This document specifies a complete test suite for the Token Spend Queue feature 
 - **Expected**:
   - Planner called exactly twice (once per UCT request)
   - USDC request untouched
-
-#### It: "Multiple rapid notifyChange calls are coalesced (queueMicrotask batching)" `[UNIT]`
-- **Setup**: Queue with request, planner mock tracks call count
-- **Action**:
-  1. Call `notifyChange('UCT')` 3 times synchronously
-  2. Await microtask queue drain
-- **Expected**:
-  - Planner is called only once (batched)
-  - Not three times (coalesced)
 
 ---
 
@@ -1033,7 +1023,7 @@ This document specifies a complete test suite for the Token Spend Queue feature 
   - Second send proceeds, splits, change (800000)
   - ... cascade continues
   - At least 90% of sends complete within timeout
-  - No starvation (skip-ahead prevents last sends from starving)
+  - No starvation (pass-over prevents last sends from starving)
 
 ---
 
@@ -1049,186 +1039,15 @@ This document specifies a complete test suite for the Token Spend Queue feature 
 
 ---
 
-## FILE 5: `tests/unit/modules/PaymentsModule.send-queue-integration.test.ts`
+## FILE 5: `tests/unit/modules/SpendQueue.starvation.test.ts`
 
-**Purpose**: End-to-end scenarios with full mocked environment, verifying state consistency.
+**Purpose**: Deep dive into pass-over behavior and queue fairness.
 
-**Test Type Tags**: `[INTEGRATION]` for all.
-
----
-
-### Describe Block: End-to-End Scenarios (with mocked transport/oracle)
-
-#### It: "Escrow: deposit → two payouts → surplus return (original bug scenario from issue)" `[INTEGRATION]`
-- **Setup**:
-  - Invoice created by merchant: targets = [{ address: merchant, assets: [{ coinId: 'UCT', amount: '1000000' }] }]
-  - Invoice token sent to payer
-  - Payer receives token, imports invoice
-  - Token pool: `tok-1` (1500000)
-- **Action**:
-  1. payer.accounting.payInvoice(invId, { amount: '1500000' }) — overpayment
-  2. Concurrent: merchant awaits payment, payer awaits return
-  3. Merchant receives payment, auto-return kicks in for surplus (500000)
-  4. Payer receives return
-- **Expected**:
-  - Payment transfer completes (1500000)
-  - invoice:payment event fires
-  - invoice:overpayment event fires (surplus: 500000)
-  - Auto-return transfer sent (500000 back to payer)
-  - Payer receives return transfer
-  - Merchant's balance shows 1000000, payer's net spend is 1000000
-  - invoice:auto_returned event fires
-  - No double-spending, no lost tokens
-
-#### It: "Multi-invoice payment: pay 3 invoices concurrently from same wallet" `[INTEGRATION]`
-- **Setup**:
-  - 3 invoices: inv-1 (1000000 UCT), inv-2 (500000 UCT), inv-3 (300000 UCT)
-  - Token pool: `tok-1` (2000000), `tok-2` (1000000)
-- **Action**:
-  1. payInvoice(inv-1, 1000000), payInvoice(inv-2, 500000), payInvoice(inv-3, 300000) concurrently
-- **Expected**:
-  - inv-1 uses tok-1 (1000000)
-  - inv-2 uses tok-2 (500000) or tok-1 change
-  - inv-3 uses remaining tokens
-  - All 3 invoices marked COVERED
-  - All 3 transfer events fire correctly
-  - Memo tags correctly attribute transfers to invoices
-
-#### It: "Payment + receive: send tokens while receiving tokens on Nostr" `[INTEGRATION]`
-- **Setup**: 
-  - Wallet balance: `tok-1` (1000000)
-  - Concurrent: send 300000 AND receive 500000 from peer
-- **Action**:
-  1. Send-1: 300000 to @bob (reserved, in-flight)
-  2. Nostr event: @alice sends 500000 (token added to pool)
-  3. Both complete
-- **Expected**:
-  - Send-1 completes using tok-1 (still available)
-  - Received token added to pool
-  - Final balance: tok-1 change (700000) + received token (500000) = 1200000 effective
-  - No conflict, parallel operation
-
-#### It: "Rapid fire: user clicks send 3 times fast (debounce at UI, but SDK must handle)" `[INTEGRATION]`
-- **Setup**: Token pool: `tok-1` (1000000), `tok-2` (1000000)
-- **Action**:
-  1. Send-1 (400000)
-  2. Send-2 (400000) — 10ms later
-  3. Send-3 (400000) — 20ms later
-  - All fire without waiting for previous to complete
-- **Expected**:
-  - Send-1 uses tok-1, reserves 400000
-  - Send-2 uses tok-2, reserves 400000
-  - Send-3 queued
-  - Send-3 fulfilled by change token or external token arrival
-  - All complete successfully
+**Test Type Tags**: `[UNIT]` for pass-over logic, `[INTEGRATION]` for queue behavior.
 
 ---
 
-### Describe Block: State Consistency After Concurrent Sends
-
-#### It: "After all concurrent sends complete: tokens map is consistent" `[INTEGRATION]`
-- **Setup**: 10 concurrent sends from mixed pool
-- **Action**: Wait for all to settle, inspect `sphere.payments.getTokens()`
-- **Expected**:
-  - No duplicates in tokens map
-  - No self-contradictory entries (e.g., token both 'confirmed' and 'spent')
-  - Token IDs are unique
-  - All amounts are valid bigints
-
-#### It: "After all concurrent sends complete: no orphaned reservations" `[INTEGRATION]`
-- **Setup**: 10 concurrent sends, some queue, some complete, some timeout
-- **Action**: Inspect ledger after all settle
-- **Expected**:
-  - Ledger size: 0 (all reservations either committed or cancelled)
-  - getFreeAmount + getTotalReserved == token.amount for each token
-
-#### It: "After all concurrent sends complete: tombstones correct" `[INTEGRATION]`
-- **Setup**: Send tokens (some spent, some returned)
-- **Action**: Inspect `_tombstones` in storage
-- **Expected**:
-  - Each spent token has a (tokenId, stateHash) entry
-  - No duplicate tombstones
-  - Spent tokens not re-added
-
-#### It: "After all concurrent sends complete: archived tokens correct" `[INTEGRATION]`
-- **Setup**: Send tokens, some spent
-- **Action**: Inspect `archivedTokens` in storage
-- **Expected**:
-  - Each spent token moved to archived
-  - Original token file deleted
-  - Archived file correctly formatted
-
-#### It: "After all concurrent sends complete: save() reflects final state" `[INTEGRATION]`
-- **Setup**: Multiple sends, await all, call `sphere.destroy()`
-- **Action**: Re-load sphere from storage
-- **Expected**:
-  - Tokens reloaded are consistent with final state (no loss)
-  - No double-loads of archived tokens
-  - Ledger state empty (reserved → committed or cancelled)
-
----
-
-### Describe Block: Recovery Scenarios
-
-#### It: "Send partially completes (Nostr sent, aggregator pending) → reservation committed even if proof slow" `[INTEGRATION]`
-- **Setup**: Oracle mocked to delay proof by 5s, Nostr mocked to send immediately
-- **Action**:
-  1. Send fires
-  2. Nostr send succeeds
-  3. Oracle proof pending
-  4. Concurrent: Send-2 fires (queued if proof delayed)
-  5. Proof arrives
-- **Expected**:
-  - Send-1 marked 'submitted' (Nostr sent)
-  - Reservation committed in ledger
-  - Send-2 doesn't resurrect Send-1's tokens (committed)
-  - Proof arrival transitions Send-1 to 'completed'
-
-#### It: "Queue entry fulfilled by token that is then invalidated → re-plan or fail gracefully" `[INTEGRATION]`
-- **Setup**: Send queued, token from oracle arrives but oracle later rejects it
-- **Action**:
-  1. Token added to pool
-  2. notifyChange, queued send planned with token
-  3. Before send completes, token invalidated (oracle says 'invalid')
-  4. Re-validate
-- **Expected**:
-  - Planner detects invalid token (buildParsedPool skips it)
-  - Send re-planned with remaining valid tokens, or fails with INSUFFICIENT_BALANCE
-  - No crash, graceful fallback
-
-#### It: "Storage save fails during send → reservation still in memory, consistency on retry" `[INTEGRATION]`
-- **Setup**: Storage mocked to fail on save during send
-- **Action**:
-  1. Send fires, completes in-memory
-  2. Storage save fails
-  3. Retry send from same wallet (fresh load)
-- **Expected**:
-  - First send may throw (storage error surfaced)
-  - On fresh load, wallet state reloaded (may have partial token state)
-  - Retry succeeds without double-spend
-  - Tombstone check prevents re-adding spent tokens
-
----
-
-### Shared Fixtures
-
-- **FullSphereHarness**: Sphere instance with transport, oracle, storage, accounting, all mocked
-- **InvoiceBuilder**: Creates test invoices with configurable targets
-- **PaymentScenarioHelper**: Utilities for multi-invoice payment tests
-
-**Estimated Test Count: 15 tests**
-
----
-
-## FILE 6: `tests/unit/modules/SpendQueue.starvation.test.ts`
-
-**Purpose**: Deep dive into starvation protection and skip-ahead fairness.
-
-**Test Type Tags**: `[UNIT]` for skip-ahead logic, `[INTEGRATION]` for queue behavior.
-
----
-
-### Describe Block: Starvation Protection Deep Dive
+### Describe Block: Pass-Over Behavior Deep Dive
 
 #### It: "FIFO order respected when all requests are same size" `[UNIT]`
 - **Setup**: Queue with 5 requests all for 500000 UCT. Change tokens arrive in order.
@@ -1237,34 +1056,22 @@ This document specifies a complete test suite for the Token Spend Queue feature 
   2. notifyChange fires multiple times (change token covers each)
 - **Expected**:
   - Requests served in enqueue order: req-1, req-2, req-3, req-4, req-5
-  - No skip-ahead (all same size, no reason to skip)
-  - skipCount for all remains 0
+  - No pass-over needed (all same size)
 
-#### It: "Skip-ahead activates: small request jumps large one → skipCount incremented" `[UNIT]`
+#### It: "Pass-over activates: small request jumps large one" `[UNIT]`
 - **Setup**: Queue with [large: 1000000, small: 100000]. Change token covers only small (100000).
 - **Action**: notifyChange('UCT')
 - **Expected**:
-  - small served first (skip-ahead activated)
+  - small served first (pass-over activated)
   - small removed from queue
-  - large.skipCount incremented from 0 to 1
-  - large remains queued
+  - large remains queued (passed over)
 
-#### It: "skipCount reaches MAX_SKIP_COUNT (10) → large request blocks small ones (starvation protection)" `[UNIT]`
-- **Setup**: Queue with [large (skipCount: 10), small-1, small-2]. Change covers only small-1.
+#### It: "Large request served when tokens become available" `[UNIT]`
+- **Setup**: Queue with [large, small-1, small-2]. Change covers all.
 - **Action**: notifyChange('UCT')
 - **Expected**:
-  - large served first (starvation limit enforced)
-  - large removed from queue
-  - small-1, small-2 remain
-  - skipCount resets for both (they weren't skipped)
-
-#### It: "After large request is served → skipCounts reset for remaining entries" `[UNIT]`
-- **Setup**: Queue with [large (skipCount: 8), small-1, small-2]. Change covers all.
-- **Action**: notifyChange('UCT') — large served, removed
-- **Expected**:
-  - large removed
-  - skipCount for small-1, small-2 reset to 0 (not incremented)
-  - Fairness resets
+  - All entries served (first satisfiable processed first)
+  - Queue empty after processing
 
 #### It: "Mixed sizes: verify fairness over many rounds" `[INTEGRATION]`
 - **Setup**: Queue with mix: [tiny (50k), large (500k), small (100k), large (400k), tiny (50k)]. Change tokens simulated to arrive each round covering all sizes.
@@ -1285,36 +1092,25 @@ This document specifies a complete test suite for the Token Spend Queue feature 
   2. Simulate 30s passing with periodic notifyChange
   3. Each notifyChange shows impossible still insufficient
 - **Expected**:
-  - possible-1, possible-2 served and removed (skip-ahead works)
+  - possible-1, possible-2 served and removed (pass-over works)
   - impossible times out at 30s (not served, cannot be served)
   - Timeout doesn't wait for impossible to fail
   - No deadlock (possible requests complete while impossible pending)
 
-#### It: "Edge: skipCount reaches limit on same notifyChange as another entry would be served → correct ordering" `[UNIT]`
-- **Setup**: Queue with [large (skipCount: 9), small, tiny]. Change covers tiny only.
-- **Action**: notifyChange('UCT')
+#### It: "Multiple notifyChange calls process queue correctly" `[UNIT]`
+- **Setup**: Queue with [large, small, tiny]. Change covers tiny only.
+- **Action**: notifyChange('UCT') called multiple times synchronously
 - **Expected**:
-  - tiny served first (skip-ahead still active, skipCount < 10)
-  - large.skipCount incremented to 10
-  - small.skipCount incremented to 1
-  - On next notifyChange, if change covers large, large served (starvation limit)
-
-#### It: "Concurrent notifyChange calls don't corrupt skipCount" `[UNIT]`
-- **Setup**: Queue with [large (skipCount: 5), small-1, small-2]. Multiple notifyChange calls fire before first completes.
-- **Action**:
-  1. Fire notifyChange('UCT') 3 times synchronously
-  2. Await microtask batch
-- **Expected**:
-  - skipCount increment is atomic (no race, no double-increment)
-  - large.skipCount == 6 (exactly +1), not 7 or 8
-  - Ordering deterministic
+  - notifyChange is synchronous — each call processes queue fully
+  - No corruption from multiple synchronous calls
+  - Ordering is deterministic
 
 ---
 
 ### Shared Fixtures
 
-- **RequestQueue with metrics**: Queue that tracks skipCount per entry and request order
-- **SkipAheadAnalyzer**: Helper to analyze and verify fairness properties
+- **RequestQueue with metrics**: Queue that tracks request order and completion times
+- **PassOverAnalyzer**: Helper to analyze and verify fairness properties
 - **ProbabilisticChangeSimulator**: Simulates random token arrival patterns for stress testing
 
 **Estimated Test Count: 20 tests**
@@ -1329,10 +1125,9 @@ This document specifies a complete test suite for the Token Spend Queue feature 
 | **SpendPlanner.test.ts** | Token selection + queue | 30 | 80% UNIT, 20% INTEGRATION |
 | **SpendQueue.test.ts** | Queue lifecycle + timeout | 25 | 80% UNIT, 20% INTEGRATION |
 | **PaymentsModule.concurrency.test.ts** | Race condition scenarios | 60 | 100% INTEGRATION |
-| **PaymentsModule.send-queue-integration.test.ts** | End-to-end state consistency | 15 | 100% INTEGRATION |
-| **SpendQueue.starvation.test.ts** | Fairness + skip-ahead | 20 | 75% UNIT, 25% INTEGRATION |
+| **SpendQueue.starvation.test.ts** | Fairness + pass-over | 20 | 75% UNIT, 25% INTEGRATION |
 
-**Total Estimated Tests: 185 tests**
+**Total Estimated Tests: ~203 tests**
 
 ---
 
@@ -1362,7 +1157,7 @@ This document specifies a complete test suite for the Token Spend Queue feature 
 expectLedgerInvariant(ledger, tokenPool)  // assert free + reserved == total
 expectNoOrphanedReservations(ledger)      // assert size == 0 after cleanup
 expectNoDuplicateTokens(tokenPool)        // assert all tokenIds unique
-expectQueueFairness(sequence)              // analyze skip-ahead fairness
+expectQueueFairness(sequence)              // analyze pass-over fairness
 ```
 
 ---

@@ -41,6 +41,13 @@ export type SphereErrorCode =
   | 'DECRYPTION_ERROR'
   | 'MODULE_NOT_AVAILABLE'
   | 'SIGNING_ERROR'
+  // Token Spend Queue error codes
+  | 'SEND_QUEUE_TIMEOUT'
+  | 'SEND_INSUFFICIENT_BALANCE'
+  | 'SEND_RESERVATION_CANCELLED'
+  | 'SEND_QUEUE_FULL'
+  | 'MODULE_DESTROYED'
+  | 'REENTRANT_GATE'
   // Invoice / Accounting error codes
   | 'INVOICE_NO_TARGETS'
   | 'INVOICE_INVALID_ADDRESS'
@@ -80,12 +87,6 @@ export type SphereErrorCode =
   | 'INVOICE_STORAGE_FAILED'
   | 'RATE_LIMITED'
   | 'COMMUNICATIONS_UNAVAILABLE'
-  // Token Spend Queue error codes
-  | 'SEND_QUEUE_TIMEOUT'
-  | 'SEND_INSUFFICIENT_BALANCE'
-  | 'SEND_RESERVATION_CANCELLED'
-  | 'SEND_QUEUE_FULL'
-  | 'MODULE_DESTROYED'
   // Swap error codes
   | 'SWAP_INVALID_DEAL'
   | 'SWAP_INVALID_MANIFEST'

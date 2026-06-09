@@ -68,6 +68,7 @@ import type {
   ManifestAuxiliary,
   ManifestSignatures,
 } from './types.js';
+import type { InvoiceStatus } from '../accounting/types.js';
 
 // Logger tag
 const LOG_TAG = 'Swap';
@@ -261,7 +262,7 @@ export class SwapModule {
       if (
         swap.progress === 'proposed' &&
         swap.role === 'proposer' &&
-        now - swap.createdAt > Math.max(this.config.proposalTimeoutMs, swap.deal.timeout * 1000)
+        now - swap.createdAt > Math.max(this.config.proposalTimeoutMs, (swap.deal?.timeout ?? 0) * 1000)
       ) {
         swap.progress = 'failed';
         swap.error = 'Proposal timed out';
@@ -722,6 +723,40 @@ export class SwapModule {
   }
 
   /**
+   * Issue #445 — lazy-load a terminal swap record from per-swap storage.
+   * Used by `getSwapStatus` after a cache miss on `this.swaps`.
+   *
+   * Returns null on gate miss (`terminalSwapIds.has(swapId) === false`),
+   * read/parse failure, or missing `swap` field. The loaded record is
+   * NOT inserted into `this.swaps` — that map remains the active-swap
+   * working set, preserving the memory bound that `loadFromStorage`
+   * establishes.
+   */
+  private async loadTerminalSwapFromStorage(swapId: string): Promise<SwapRef | null> {
+    if (!this.terminalSwapIds.has(swapId)) return null;
+    const deps = this.deps;
+    if (!deps) return null;
+
+    const addressId = deps.identity.directAddress
+      ? deps.identity.directAddress
+      : deps.identity.chainPubkey;
+    const swapKey = getAddressStorageKey(
+      addressId,
+      `${STORAGE_KEYS_ADDRESS.SWAP_RECORD_PREFIX}${swapId}`,
+    );
+
+    try {
+      const raw = await deps.storage.get(swapKey);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw) as SwapStorageData;
+      return parsed.swap ?? null;
+    } catch (err) {
+      logger.warn(LOG_TAG, `Failed to load terminal swap ${swapId} from storage:`, err);
+      return null;
+    }
+  }
+
+  /**
    * Remove a single swap from storage (per-swap key) and update the index.
    */
   private async removeSwapFromStorage(swapId: string): Promise<void> {
@@ -791,6 +826,11 @@ export class SwapModule {
 
     // Persist per-swap key
     await this.persistSwap(swap);
+
+    // Log terminal transitions for diagnosis (especially 'failed').
+    if (to === 'failed') {
+      logger.warn(LOG_TAG, `Swap ${swap.swapId.slice(0, 12)} → failed: ${(swap as { error?: string }).error ?? 'none'}`);
+    }
 
     // Clear local timer and track terminal ID on terminal states.
     // Also push to _storedTerminalEntries so that subsequent persistIndex() calls
@@ -1664,20 +1704,21 @@ export class SwapModule {
     } | null;
 
     if (!invoiceRef) {
-      throw new SphereError('Payout invoice not found', 'SWAP_PAYOUT_VERIFICATION_FAILED');
+      // Payout invoice ID is set (from invoice_delivery DM) but the token hasn't
+      // been imported into AccountingModule yet. This is a timing issue — the import
+      // may still be in progress or the token was lost. Return false (unverified)
+      // instead of throwing — the swap stays completed with payoutVerified=false.
+      // Throwing here would transition the swap to 'failed' via the catch in the
+      // auto-verify caller, which is wrong when the escrow genuinely completed.
+      logger.warn(LOG_TAG, `verifyPayout(${swapId.slice(0, 12)}): payout invoice ${swap.payoutInvoiceId?.slice(0, 12)} not found — returning unverified`);
+      return returnFalse();
     }
 
-    // Get invoice status for coverage check
-    const status = deps.accounting.getInvoiceStatus(swap.payoutInvoiceId) as {
-      state: string;
-      targets: Array<{
-        coinAssets: Array<{
-          coin: [string, string];
-          netCoveredAmount: string;
-          isCovered: boolean;
-        }>;
-      }>;
-    };
+    // Get invoice status for coverage check. Use the canonical `InvoiceStatus`
+    // type from accounting/types.ts rather than an inline structural cast —
+    // keeps this consumer in lockstep with upstream field changes (e.g. the
+    // `surplusAmount` field is required, not optional, per the canonical type).
+    const status = (await deps.accounting.getInvoiceStatus(swap.payoutInvoiceId)) as InvoiceStatus;
 
     // Determine expected currency and amount based on our role
     const myDirectAddress = deps.identity.directAddress;
@@ -1708,6 +1749,7 @@ export class SwapModule {
     // We must replicate the side effects of transitionProgress() via direct mutation instead
     // so that fraud is surfaced rather than silently swallowed by a SWAP_WRONG_STATE throw.
     const failPayout = async (error: string): Promise<false> => {
+      logger.warn(LOG_TAG, `failPayout(${swapId.slice(0, 12)}): ${error}`);
       if (swap.progress === 'completed') {
         // Direct mutation: completed → failed bypass (invalid state machine edge).
         // Side effects are replicated manually (clearLocalTimer, terminalSwapIds,
@@ -1725,7 +1767,15 @@ export class SwapModule {
         swap.updatedAt = Date.now();
         this.clearLocalTimer(swap.swapId);
         this.terminalSwapIds.add(swap.swapId);
-        const entryIdx = this._storedTerminalEntries.length;
+        // Append our terminal-entry marker. We deliberately DO NOT capture a
+        // positional index here for rollback — `_storedTerminalEntries` is
+        // shared across all swaps in this module, and a concurrent swap's
+        // own `transitionProgress(*, terminal)` can append to this same array
+        // during the `await persistSwap()` below. A `splice(entryIdx, 1)`
+        // rollback would then remove the WRONG entry, silently corrupting an
+        // unrelated swap's terminal record. Roll back by `(swapId, progress)`
+        // identity instead — uniquely identifies our marker regardless of
+        // intervening appends.
         this._storedTerminalEntries.push({
           swapId: swap.swapId,
           progress: 'failed',
@@ -1735,13 +1785,34 @@ export class SwapModule {
         try {
           await this.persistSwap(swap);
         } catch (persistErr) {
-          // Storage failed — roll back so next load retries fraud detection.
+          // Storage failure rollback. Note the partial-failure window:
+          // `persistSwap` writes the swap record FIRST then the index. If the
+          // record write succeeded and only the index write failed, the on-disk
+          // record already says `'failed'`; rolling back in-memory creates a
+          // brief in-memory/disk skew until either the index write retries on
+          // next save or the next load picks up the on-disk `'failed'`. The
+          // "next load retries fraud detection" story holds when the
+          // record-write itself failed (the most common case for ENOSPC /
+          // permissions / disk-quota errors); for partial-write failures,
+          // the on-disk state is the source of truth on next load and our
+          // in-memory rollback only restores responsiveness for the current
+          // session.
           swap.progress = prevProgress;
           (swap as { payoutVerified?: boolean }).payoutVerified = prevPayoutVerified;
           (swap as { error?: string }).error = prevError;
           swap.updatedAt = prevUpdatedAt;
           this.terminalSwapIds.delete(swap.swapId);
-          this._storedTerminalEntries.splice(entryIdx, 1);
+          // Remove BY IDENTITY (swapId + progress), not positional index, so a
+          // concurrent swap's terminal entry that landed during the await is
+          // not accidentally evicted. Iterate from the end since our marker
+          // was the most recent push for this swap.
+          for (let i = this._storedTerminalEntries.length - 1; i >= 0; i--) {
+            const entry = this._storedTerminalEntries[i]!;
+            if (entry.swapId === swap.swapId && entry.progress === 'failed') {
+              this._storedTerminalEntries.splice(i, 1);
+              break;
+            }
+          }
           logger.warn(LOG_TAG, `failPayout: persistSwap failed for ${swapId}; fraud detection will retry on next load:`, persistErr);
           throw persistErr;
         }
@@ -1781,8 +1852,11 @@ export class SwapModule {
     }
 
     // Verify coverage from invoice status
+    if (!status?.targets) {
+      return returnFalse();
+    }
     const targetStatus = status.targets[0];
-    if (!targetStatus || !targetStatus.coinAssets[0]) {
+    if (!targetStatus || !targetStatus.coinAssets?.[0]) {
       return returnFalse();
     }
 
@@ -1795,8 +1869,52 @@ export class SwapModule {
       return returnFalse();
     }
 
-    if (BigInt(targetStatus.coinAssets[0].netCoveredAmount) < BigInt(expectedAmount)) {
+    // Coverage equality check (exact-amount enforcement).
+    //
+    // The accounting layer permits the payout invoice to receive more than the
+    // requested amount (`netCoveredAmount > expectedAmount`) — surplus is tracked
+    // per-payer and refunded by the SDK's auto-return mechanism on closeInvoice.
+    // For *swap settlement*, however, over-coverage indicates one of:
+    //   (a) the escrow paid out twice for the same swap (e.g., a crash-mid-conclude
+    //       race in which crash-recovery's `_resumePayouts` re-issued payInvoice
+    //       because the SDK's provisional ledger entry had not yet been flushed);
+    //   (b) a malicious or buggy third party deposited into the same payout invoice;
+    //   (c) some other settlement-layer fault.
+    // In all three cases the swap should NOT silently complete — the surplus must be
+    // returned (auto-return on the receiver) and the swap explicitly failed so the
+    // application layer can recover with a clear reason. Without this check, the
+    // swap would either continue with `verified=true` (accepting an invalid token
+    // mix that subsequent state transitions would reject) or hang for the trader's
+    // verifyPayout retry budget while `validate()` repeatedly rejects an unrelated
+    // wallet token, producing a 20-min opaque hang instead of a clear failure.
+    // Parse defensively: a malformed `netCoveredAmount` (non-numeric, undefined,
+    // or NaN-like) from a buggy/compromised accounting backend would synchronously
+    // throw `TypeError`/`SyntaxError` from BigInt(). That escapes the gate and is
+    // swallowed by the auto-verify catch, surfacing as an opaque error rather than
+    // a structured SphereError. Treat parse failures as a settlement-layer fault —
+    // consistent with the rest of the over-coverage rationale below.
+    let netCoveredAmount: bigint;
+    let expectedAmountBigInt: bigint;
+    try {
+      netCoveredAmount = BigInt(targetStatus.coinAssets[0].netCoveredAmount);
+      expectedAmountBigInt = BigInt(expectedAmount);
+    } catch (parseErr) {
+      return failPayout(
+        `MALFORMED_AMOUNT: failed to parse coverage amounts (netCoveredAmount=${
+          targetStatus.coinAssets[0].netCoveredAmount
+        }, expectedAmount=${expectedAmount}): ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`,
+      );
+    }
+    if (netCoveredAmount < expectedAmountBigInt) {
+      // Not yet fully covered — keep retrying (transient).
       return returnFalse();
+    }
+    if (netCoveredAmount > expectedAmountBigInt) {
+      // Over-coverage is a settlement fault — fail explicitly.
+      const surplus = netCoveredAmount - expectedAmountBigInt;
+      return failPayout(
+        `OVER_COVERAGE: net=${netCoveredAmount.toString()}, expected=${expectedAmount}, surplus=${surplus.toString()} — surplus refund expected via auto-return; settlement halted`,
+      );
     }
 
     // Verify escrow creator identity
@@ -1858,15 +1976,38 @@ export class SwapModule {
     this.ensureNotDestroyed();
     this.ensureReady();
 
-    const swap = this.swaps.get(swapId);
+    let swap = this.swaps.get(swapId);
+    let isLazyLoadedTerminal = false;
     if (!swap) {
-      throw new SphereError(`Swap not found: ${swapId}`, 'SWAP_NOT_FOUND');
+      // Issue #445 — terminal swaps are parked in `_storedTerminalEntries`
+      // by `loadFromStorage`, not `this.swaps`. Fall through to a one-
+      // shot storage read so soak / status verification flows can query
+      // completed swaps after a CLI restart.
+      const terminalSwap = await this.loadTerminalSwapFromStorage(swapId);
+      if (!terminalSwap) {
+        throw new SphereError(`Swap not found: ${swapId}`, 'SWAP_NOT_FOUND');
+      }
+      swap = terminalSwap;
+      isLazyLoadedTerminal = true;
     }
 
     // Determine whether to query the escrow for the latest state.
     // If options.queryEscrow is explicitly set, use that; otherwise default to
     // true for active swaps and false for terminal swaps.
-    const shouldQuery = options?.queryEscrow ?? !isTerminalProgress(swap.progress);
+    //
+    // Lazy-loaded terminal swaps refuse queryEscrow even when explicitly
+    // requested — the downstream status_result DM handler resolves via
+    // `this.swaps.get` and has no path for lazy-loading, so the escrow
+    // response would be silently dropped on arrival.
+    const shouldQuery = !isLazyLoadedTerminal
+      && (options?.queryEscrow ?? !isTerminalProgress(swap.progress));
+
+    if (isLazyLoadedTerminal && options?.queryEscrow === true) {
+      logger.debug(
+        LOG_TAG,
+        `getSwapStatus(${swapId}): queryEscrow ignored — swap is lazy-loaded from storage`,
+      );
+    }
 
     if (shouldQuery) {
       // Fire-and-forget: resolve escrow address and send status DM.
@@ -2066,10 +2207,7 @@ export class SwapModule {
     readonly senderNametag?: string;
     readonly timestamp?: number;
   }): void {
-    // Quick check: skip non-swap DMs early
-    if (!isSwapDM(dm.content)) return;
-
-    // Parse the DM into a typed discriminated union
+    // Parse the DM into a typed discriminated union (returns null for non-swap DMs)
     const parsed = parseSwapDM(dm.content);
     if (!parsed) return;
 
@@ -3141,10 +3279,10 @@ export class SwapModule {
         const partyBCoinId = resolveSymbolToCoinId(swap.manifest.party_b_currency_to_change);
         let party: 'A' | 'B';
         let requiredAmount: string;
-        if (transfer.coinId === partyACoinId) {
+        if (coinIdsMatch(transfer.coinId, partyACoinId)) {
           party = 'A';
           requiredAmount = swap.manifest.party_a_value_to_change;
-        } else if (transfer.coinId === partyBCoinId) {
+        } else if (coinIdsMatch(transfer.coinId, partyBCoinId)) {
           party = 'B';
           requiredAmount = swap.manifest.party_b_value_to_change;
         } else {
@@ -3299,7 +3437,7 @@ export class SwapModule {
     this.clearLocalTimer(swap.swapId);
 
     // Compute total timeout: escrow timeout (seconds -> ms) + 30s grace
-    const totalTimeoutMs = swap.deal.timeout * 1000 + LOCAL_TIMEOUT_GRACE_MS;
+    const totalTimeoutMs = (swap.deal?.timeout ?? 0) * 1000 + LOCAL_TIMEOUT_GRACE_MS;
     const elapsed = Date.now() - swap.announcedAt;
     const remaining = totalTimeoutMs - elapsed;
 
@@ -3409,12 +3547,14 @@ export class SwapModule {
 
     if (remaining <= 0) {
       // Already expired — transition immediately
+      logger.warn(LOG_TAG, `Proposal timer expired: ${swapId.slice(0, 12)} elapsed=${elapsed}ms timeout=${effectiveTimeout}ms progress=${swap?.progress}`);
       void this.withSwapGate(swapId, async () => {
         const s = this.swaps.get(swapId);
         if (!s || s.progress !== 'proposed') return;
         await this.transitionProgress(s, 'failed', {
           error: 'Proposal timed out',
         });
+        this.deps?.emitEvent('swap:failed', { swapId, error: 'Proposal timed out' });
       }).catch((err) => {
         logger.warn(LOG_TAG, `Failed to expire proposal ${swapId}:`, err);
       });
@@ -3429,9 +3569,7 @@ export class SwapModule {
         await this.transitionProgress(s, 'failed', {
           error: 'Proposal timed out',
         });
-        if (this.config.debug) {
-          logger.debug(LOG_TAG, `Proposal ${swapId} timed out`);
-        }
+        this.deps?.emitEvent('swap:failed', { swapId, error: 'Proposal timed out' });
       }).catch((err) => {
         logger.warn(LOG_TAG, `Failed to expire proposal ${swapId}:`, err);
       });

@@ -1090,8 +1090,8 @@ export class PaymentsModule {
     const committedOnChainTokenIds = new Set<string>();
 
     try {
-      // Resolve recipient once — single network query
-      const peerInfo = await this.deps!.transport.resolve?.(request.recipient) ?? null;
+      // Resolve recipient
+      const peerInfo: PeerInfo | null = await this.deps!.transport.resolve?.(request.recipient) ?? null;
       const recipientPubkey = this.resolveTransportPubkey(request.recipient, peerInfo);
       const recipientAddress = await this.resolveRecipientAddress(request.recipient, request.addressMode, peerInfo);
 
@@ -1193,7 +1193,6 @@ export class PaymentsModule {
 
       const transferMode = request.transferMode ?? 'instant';
 
-      // Encode invoice memo into on-chain message bytes (null for non-invoice memos)
       const onChainMessage = parseInvoiceMemoForOnChain(
         request.memo,
         request.invoiceRefundAddress,
@@ -1257,22 +1256,13 @@ export class PaymentsModule {
             ? Array.from(splitCommitmentRequestId).map((b: number) => b.toString(16).padStart(2, '0')).join('')
             : splitCommitmentRequestId ? String(splitCommitmentRequestId) : undefined;
 
-          // Commit reservation BEFORE removing tokens — prevents cancelForToken()
-          // from cancelling our own active reservation
-          this.reservationLedger.commit(result.id);
-
-          await this.removeToken(splitPlan.tokenToSplit.uiToken.id);
+          await this.removeToken(splitPlan.tokenToSplit.uiToken.id, result.id);
           result.tokenTransfers.push({
             sourceTokenId: splitPlan.tokenToSplit.uiToken.id,
             method: 'split',
             requestIdHex: splitRequestIdHex,
           });
           logger.debug('Payments', 'Conservative split transfer completed');
-        }
-
-        // Commit reservation if not already committed by split path above
-        if (!splitPlan.requiresSplit) {
-          this.reservationLedger.commit(result.id);
         }
 
         // Transfer direct tokens
@@ -1310,7 +1300,7 @@ export class PaymentsModule {
             requestIdHex,
           });
           logger.debug('Payments', `Token ${token.id} sent via CONSERVATIVE, requestId: ${requestIdHex}`);
-          await this.removeToken(token.id);
+          await this.removeToken(token.id, result.id);
         }
       } else {
         // =================================================================
@@ -1457,14 +1447,9 @@ export class PaymentsModule {
           );
         }
 
-        // Commit reservation BEFORE removing tokens — prevents cancelForToken()
-        // from cancelling our own active reservation and waking queued sends
-        // that could re-plan against already-spent tokens.
-        this.reservationLedger.commit(result.id);
-
         // 7. Track and remove tokens (removeToken archives + tombstones + saves)
         if (splitPlan.requiresSplit && splitPlan.tokenToSplit) {
-          await this.removeToken(splitPlan.tokenToSplit.uiToken.id);
+          await this.removeToken(splitPlan.tokenToSplit.uiToken.id, result.id);
           result.tokenTransfers.push({
             sourceTokenId: splitPlan.tokenToSplit.uiToken.id,
             method: 'split',
@@ -1486,7 +1471,7 @@ export class PaymentsModule {
             method: 'direct',
             requestIdHex,
           });
-          await this.removeToken(token.id);
+          await this.removeToken(token.id, result.id);
         }
 
         logger.debug('Payments', 'V6 combined transfer completed');
@@ -1527,7 +1512,7 @@ export class PaymentsModule {
         tokenIds: sentTokenIds.length > 0 ? sentTokenIds : undefined,
       });
 
-      // Commit reservation (idempotent — may already be committed by mode-specific code above)
+      // Commit reservation — all tokens have been sent on-chain and removed.
       this.reservationLedger.commit(result.id);
 
       this.deps!.emitEvent('transfer:confirmed', result);
@@ -1670,8 +1655,8 @@ export class PaymentsModule {
     let tokenToSplitRef: Token | undefined;
 
     try {
-      // Resolve recipient once — single network query
-      const peerInfo = await this.deps!.transport.resolve?.(request.recipient) ?? null;
+      // Resolve recipient
+      const peerInfo: PeerInfo | null = await this.deps!.transport.resolve?.(request.recipient) ?? null;
       const recipientPubkey = this.resolveTransportPubkey(request.recipient, peerInfo);
       const recipientAddress = await this.resolveRecipientAddress(request.recipient, request.addressMode, peerInfo);
 
@@ -1761,12 +1746,7 @@ export class PaymentsModule {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const devMode = options?.devMode ?? (this.deps!.oracle as any).isDevMode?.() ?? false;
 
-      // Encode invoice memo into on-chain message bytes (null for non-invoice memos)
-      const onChainMessage = parseInvoiceMemoForOnChain(
-        request.memo,
-        request.invoiceRefundAddress,
-        request.invoiceContact,
-      );
+      const onChainMessage: Uint8Array | null = null;
 
       // Create instant split executor
       const executor = new InstantSplitExecutor({
@@ -1821,11 +1801,12 @@ export class PaymentsModule {
           this.pendingBackgroundTasks.push(result.backgroundPromise);
         }
 
-        // Commit reservation BEFORE removing token
+        // Commit reservation AFTER transfer — removing token passes excludeReservationId
+        // to prevent cancelForToken() from cancelling our own in-flight reservation.
         this.reservationLedger.commit(reservationId);
 
         // Remove the original token
-        await this.removeToken(tokenToSplit.id);
+        await this.removeToken(tokenToSplit.id, reservationId);
 
         // Add to transaction history (single entry for the actual sent amount)
         const recipientNametag = peerInfo?.nametag
@@ -3829,6 +3810,8 @@ export class PaymentsModule {
       this.spendQueue.notifyChange(token.coinId);
     }
 
+    this.notifyTokenChange(token);
+
     logger.debug('Payments', `Added token ${token.id}, total: ${this.tokens.size}`);
     return true;
   }
@@ -3904,14 +3887,15 @@ export class PaymentsModule {
    *
    * @param tokenId - Local UUID of the token to remove.
    */
-  async removeToken(tokenId: string): Promise<void> {
+  async removeToken(tokenId: string, excludeReservationId?: string): Promise<void> {
     this.ensureInitialized();
 
     const token = this.tokens.get(tokenId);
     if (!token) return;
 
-    // Spend Queue: cancel any active reservations referencing this token
-    this.reservationLedger.cancelForToken(tokenId);
+    // Spend Queue: cancel any OTHER active reservations referencing this token.
+    // excludeReservationId prevents cancelling the caller's own in-flight reservation.
+    this.reservationLedger.cancelForToken(tokenId, excludeReservationId);
     this.parsedTokenCache.delete(tokenId);
 
     // Archive before removing
@@ -4916,7 +4900,7 @@ export class PaymentsModule {
    * Uses pre-resolved PeerInfo if available, otherwise resolves via transport.
    */
   private resolveTransportPubkey(recipient: string, peerInfo?: PeerInfo | null): string {
-    // If we have PeerInfo, use it
+    // If we already have PeerInfo from a prior resolve() call, use it directly
     if (peerInfo?.transportPubkey) {
       return peerInfo.transportPubkey;
     }
@@ -4944,7 +4928,7 @@ export class PaymentsModule {
     token: Token,
     recipientAddress: IAddress,
     signingService: SigningService,
-    message?: Uint8Array | null
+    onChainMessage?: Uint8Array | null
   ): Promise<TransferCommitment> {
     // Parse SDK token from stored data
     const tokenData = token.sdkData
@@ -4962,7 +4946,7 @@ export class PaymentsModule {
       recipientAddress,
       salt,
       null, // recipientDataHash
-      message ?? null, // on-chain message (invoice memo bytes, or null)
+      onChainMessage ?? null, // on-chain message bytes
       signingService
     );
 
@@ -5664,11 +5648,24 @@ export class PaymentsModule {
     // Load tombstones FIRST so we can filter tokens
     this.tombstones = parsed.tombstones;
     this.rebuildTombstoneKeySet();
-    // Load tokens, filtering out tombstoned ones
-    // NOTE: Only filter by exact (tokenId, stateHash) match to avoid over-blocking
-    // When state hash is unavailable, we can't reliably distinguish old from new
+    // Load tokens, filtering out tombstoned ones.
+    // Preserve tokens with 'transferring' status — they are part of an in-flight send().
+    const preservedTransferring = new Map<string, Token>();
+    for (const [id, token] of this.tokens) {
+      if (token.status === 'transferring') {
+        preservedTransferring.set(id, token);
+      }
+    }
+
     this.tokens.clear();
+    for (const [id, token] of preservedTransferring) {
+      this.tokens.set(id, token);
+    }
+
     for (const token of parsed.tokens) {
+      // Don't overwrite in-flight tokens preserved above
+      if (preservedTransferring.has(token.id)) continue;
+
       const sdkTokenId = extractTokenIdFromSdkData(token.sdkData);
       const stateHash = extractStateHashFromSdkData(token.sdkData);
 

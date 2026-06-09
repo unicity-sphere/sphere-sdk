@@ -374,7 +374,7 @@ describe('TokenReservationLedger', () => {
       // Only res-2 should be cancelled (active); res-1 was already deleted by commit
       expect(cancelled).toEqual(['res-2']);
       expect(ledger.getReservation('res-1')).toBeUndefined();
-      expect(ledger.getReservation('res-2')?.status).toBe('cancelled');
+      expect(ledger.getReservation('res-2')).toBeUndefined(); // deleted after cancel
     });
 
     it('after cancelForToken(), getFreeAmount returns full token amount when no committed reservations', () => {
@@ -753,6 +753,37 @@ describe('TokenReservationLedger', () => {
       } finally {
         Date.now = originalNow;
       }
+    });
+  });
+
+  describe('cancelForToken with excludeReservationId', () => {
+    it('skips the excluded reservation when cancelling for a token', () => {
+      ledger.reserve('res-keep', entry('tok-1', 300000n, 1000000n), 'UCT');
+      ledger.reserve('res-cancel', entry('tok-1', 200000n, 1000000n), 'UCT');
+
+      const cancelled = ledger.cancelForToken('tok-1', 'res-keep');
+      expect(cancelled).toEqual(['res-cancel']);
+      // Excluded reservation still active — token still reserved
+      expect(ledger.hasActiveReservation('tok-1')).toBe(true);
+      expect(ledger.getFreeAmount('tok-1', 1000000n)).toBe(700000n);
+    });
+
+    it('cancels all when excludeReservationId does not match any reservation', () => {
+      ledger.reserve('res-1', entry('tok-1', 300000n, 1000000n), 'UCT');
+      ledger.reserve('res-2', entry('tok-1', 200000n, 1000000n), 'UCT');
+
+      const cancelled = ledger.cancelForToken('tok-1', 'res-nonexistent');
+      expect(cancelled).toEqual(['res-1', 'res-2']);
+      // No active reservations remain for this token
+      expect(ledger.hasActiveReservation('tok-1')).toBe(false);
+    });
+
+    it('preserves excluded reservation even when it is the only one', () => {
+      ledger.reserve('res-only', entry('tok-1', 500000n, 1000000n), 'UCT');
+
+      const cancelled = ledger.cancelForToken('tok-1', 'res-only');
+      expect(cancelled).toEqual([]);
+      expect(ledger.getFreeAmount('tok-1', 1000000n)).toBe(500000n);
     });
   });
 });

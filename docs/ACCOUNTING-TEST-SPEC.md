@@ -741,7 +741,7 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 
 ### 3.6 getInvoice()
 
-**File:** `tests/unit/modules/AccountingModule.getInvoice.test.ts`
+**File:** `tests/unit/modules/AccountingModule.getInvoices.test.ts` (getInvoice tests are co-located with getInvoices)
 
 #### UT-GETINV-001: Get existing invoice
 - **Preconditions:** Module with 1 invoice
@@ -771,7 +771,7 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 
 ### 3.7 closeInvoice()
 
-**File:** `tests/unit/modules/AccountingModule.closeInvoice.test.ts`
+**File:** `tests/unit/modules/AccountingModule.closeCancel.test.ts` (close and cancel tests are merged)
 
 #### UT-CLOSE-001: Close invoice explicitly
 - **Preconditions:** Module with OPEN invoice, caller is target
@@ -837,7 +837,7 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 
 ### 3.8 cancelInvoice()
 
-**File:** `tests/unit/modules/AccountingModule.cancelInvoice.test.ts`
+**File:** `tests/unit/modules/AccountingModule.closeCancel.test.ts` (close and cancel tests are merged)
 
 #### UT-CANCEL-001: Cancel invoice
 - **Preconditions:** Module with OPEN invoice, caller is target
@@ -879,7 +879,7 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 
 ### 3.9 payInvoice()
 
-**File:** `tests/unit/modules/AccountingModule.payInvoice.test.ts`
+**File:** `tests/unit/modules/AccountingModule.payReturn.test.ts` (pay and return tests are merged)
 
 #### UT-PAY-001: Simple payment to invoice
 - **Preconditions:** Module with invoice requesting 10 UCT at target 0, asset 0
@@ -969,7 +969,7 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 
 ### 3.10 returnInvoicePayment()
 
-**File:** `tests/unit/modules/AccountingModule.returnInvoicePayment.test.ts`
+**File:** `tests/unit/modules/AccountingModule.payReturn.test.ts` (pay and return tests are merged)
 
 #### UT-RETURN-001: Return payment to payer
 - **Preconditions:** Module with invoice, target received 10 UCT from sender; caller is target
@@ -1331,7 +1331,7 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 
 ### 3.14 On-Chain Message Decoding
 
-**File:** `tests/unit/modules/AccountingModule.decodeTransferMessage.test.ts`
+**File:** `tests/unit/modules/AccountingModule.memo.test.ts` (decode tests are co-located with memo tests)
 
 #### UT-DECODE-001: Valid TransferMessagePayload parsed correctly
 - **Preconditions:** N/A
@@ -1403,7 +1403,7 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 
 ### 3.15 Token Minting Internals
 
-**File:** `tests/unit/modules/AccountingModule.tokenMinting.test.ts`
+**File:** `tests/unit/modules/AccountingModule.minting.test.ts`
 
 #### UT-MINT-001: INVOICE_TOKEN_TYPE_HEX = SHA-256(UTF-8("unicity.invoice.v1"))
 - **Preconditions:** N/A
@@ -1469,7 +1469,7 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 
 ### 3.16 Invoice-Transfer Index
 
-**File:** `tests/unit/modules/AccountingModule.index.test.ts`
+**File:** `tests/unit/modules/AccountingModule.relatedTransfers.test.ts` (index tests are co-located with relatedTransfers)
 
 #### UT-INDEX-001: Cold-start loads persisted inv_ledger:{id} entries
 - **Preconditions:** Storage contains inv_ledger:abc123 with previous transfer entries
@@ -1607,7 +1607,7 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 
 ### 3.18 autoTerminateOnReturn
 
-**File:** `tests/unit/modules/AccountingModule.autoTerminateOnReturn.test.ts`
+**File:** `tests/unit/modules/AccountingModule.autoTerminate.test.ts`
 
 #### UT-AUTOTERM-001: Receiving :RC with autoTerminateOnReturn: true → invoice auto-closed
 - **Preconditions:** Module configured with autoTerminateOnReturn: true; invoice is OPEN/PARTIAL
@@ -1778,7 +1778,7 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 
 ### 3.21 CLI Integration
 
-**File:** `tests/unit/modules/AccountingModule.cli.test.ts`
+**File:** `tests/scripts/test-e2e-accounting-cli.ts` (CLI tests are run as E2E scripts, not unit tests)
 
 #### CLI-001: invoice-create happy path
 - **Command:** `invoice-create @alice UCT 10.00 --memo "Test"`
@@ -1949,7 +1949,7 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 
 ### 3.22 sendInvoiceReceipts()
 
-**File:** `tests/unit/modules/AccountingModule.sendInvoiceReceipts.test.ts`
+**File:** `tests/unit/modules/AccountingModule.receipts.test.ts`
 
 #### UT-RECEIPTS-001: Happy path — send receipts for CLOSED invoice
 - **Preconditions:** Module loaded; invoice CLOSED with frozen balances; 2 senders with non-zero balances; CommunicationsModule available
@@ -2051,7 +2051,7 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 
 ### 3.23 sendCancellationNotices()
 
-**File:** `tests/unit/modules/AccountingModule.sendCancellationNotices.test.ts`
+**File:** `tests/unit/modules/AccountingModule.receipts.test.ts` (cancellation notices are co-located with receipts)
 
 #### UT-NOTICES-001: Happy path — send cancellation notices for CANCELLED invoice
 - **Preconditions:** Module loaded; invoice CANCELLED with frozen balances; 2 senders with non-zero balances; CommunicationsModule available
@@ -2319,6 +2319,21 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 - **Action:** `createInvoice({ dueDate: 999 })`
 - **Verify:** Throws INVOICE_PAST_DUE_DATE
 - **Spec ref:** §8.1 "dueDate must be in the future"
+
+---
+
+### Additional Test Files (Not Covered in Sections Above)
+
+The following test files exist in `tests/unit/modules/` and cover areas not fully specified in the sections above:
+
+| File | Coverage |
+|------|----------|
+| `AccountingModule.bug002-fixes.test.ts` | Regression tests for bug #002 fixes |
+| `AccountingModule.payInvoice-provisional.test.ts` | Provisional payment scenarios for payInvoice |
+| `AccountingModule.onChain.test.ts` | On-chain transfer attribution and message decoding |
+| `AccountingModule.surplus.test.ts` | Overpayment detection and surplus event emission |
+| `AccountingModule.errors.test.ts` | Error codes and SphereError propagation paths |
+| `AccountingModule.concurrency.test.ts` | Per-invoice async mutex (withInvoiceGate) serialization |
 
 ---
 

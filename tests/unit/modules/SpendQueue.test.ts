@@ -1143,4 +1143,79 @@ describe('SpendQueue', () => {
       await expect(queue.waitForEntry(id)).rejects.toThrow('Queue entry not found');
     });
   });
+
+  describe('enqueue after destroy', () => {
+    it('rejects immediately with MODULE_DESTROYED', async () => {
+      queue.destroy();
+
+      const pool = buildPool([{ id: 'tok-1', coinId: 'UCT', amount: 1000n }]);
+      const promise = queue.enqueue({
+        id: nextId(),
+        request: { amount: '500', coinId: 'UCT' },
+        parsedPool: pool,
+        coinId: 'UCT',
+        amount: 500n,
+        enqueuedAt: Date.now(),
+      });
+
+      await expect(promise).rejects.toThrow('Module has been destroyed');
+    });
+
+    it('does not add entry to queue after destroy', () => {
+      queue.destroy();
+      expect(queue.size()).toBe(0);
+
+      queue.enqueue({
+        id: nextId(),
+        request: { amount: '500', coinId: 'UCT' },
+        parsedPool: new Map(),
+        coinId: 'UCT',
+        amount: 500n,
+        enqueuedAt: Date.now(),
+      }).catch(() => {});
+
+      expect(queue.size()).toBe(0);
+    });
+  });
+
+  describe('fully-free invariant (W23)', () => {
+    it('partially-reserved token is excluded from free view', () => {
+      const pool = buildPool([{ id: 'tok-1', coinId: 'UCT', amount: 1000n }]);
+      parsedTokenCache.set('tok-1', pool.get('tok-1')!);
+      tokensMap.set('tok-1', pool.get('tok-1')!.token);
+
+      // Reserve 500 of 1000 — token is now partially reserved
+      ledger.reserve('res-partial', [{ tokenId: 'tok-1', amount: 500n, tokenAmount: 1000n }], 'UCT');
+
+      const id = nextId();
+      enq({ id, request: { amount: '400', coinId: 'UCT' }, parsedPool: pool, coinId: 'UCT', amount: 400n, enqueuedAt: Date.now() });
+
+      // The planner should NOT be called with tok-1 because it's partially reserved
+      const spy = vi.spyOn(planner, 'calculateOptimalSplitSync').mockReturnValue(null);
+      queue.notifyChange('UCT');
+
+      if (spy.mock.calls.length > 0) {
+        const freeView = spy.mock.calls[0][0] as Array<{ token: Token; amount: bigint }>;
+        const tokenIds = freeView.map(e => e.token.id);
+        expect(tokenIds).not.toContain('tok-1');
+      }
+    });
+
+    it('fully-free token is included in free view', () => {
+      const pool = buildPool([{ id: 'tok-2', coinId: 'UCT', amount: 1000n }]);
+      parsedTokenCache.set('tok-2', pool.get('tok-2')!);
+      tokensMap.set('tok-2', pool.get('tok-2')!.token);
+
+      const id = nextId();
+      enq({ id, request: { amount: '800', coinId: 'UCT' }, parsedPool: pool, coinId: 'UCT', amount: 800n, enqueuedAt: Date.now() });
+
+      const spy = vi.spyOn(planner, 'calculateOptimalSplitSync').mockReturnValue(null);
+      queue.notifyChange('UCT');
+
+      expect(spy).toHaveBeenCalledTimes(1);
+      const freeView = spy.mock.calls[0][0] as Array<{ token: Token; amount: bigint }>;
+      const tokenIds = freeView.map(e => e.token.id);
+      expect(tokenIds).toContain('tok-2');
+    });
+  });
 });

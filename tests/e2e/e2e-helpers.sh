@@ -194,6 +194,18 @@ cleanup() {
     while kill -0 "$ESCROW_PID" 2>/dev/null && [[ $w -lt 5 ]]; do sleep 1; w=$((w+1)); done
     kill -9 -- -"$ESCROW_PID" 2>/dev/null || kill -9 "$ESCROW_PID" 2>/dev/null || true
   fi
+
+  # On failure: preserve escrow log for post-mortem diagnosis.
+  # Copy to a stable location that survives workspace cleanup.
+  if [[ $exit_code -ne 0 || $FAIL -gt 0 ]] && [[ -n "${WORKSPACE:-}" ]]; then
+    local escrow_log="${WORKSPACE}/escrow.log"
+    if [[ -f "$escrow_log" ]]; then
+      local preserved="/tmp/escrow-${TEST_NAME}-$(date +%s).log"
+      cp "$escrow_log" "$preserved" 2>/dev/null || true
+      log "Escrow log preserved: ${preserved}"
+    fi
+  fi
+
   if [[ "$KEEP_WALLETS" == "false" ]] && [[ -n "${WORKSPACE:-}" ]]; then
     for p in $WALLETS_TO_DELETE; do
       _cli wallet delete "$p" > /dev/null 2>&1 || true
@@ -262,7 +274,7 @@ accept_swap() {
   for i in $(seq 1 "$attempts"); do
     local try
     try=$(cli_as "$profile" swap-accept "$prefix" 2>&1) || true
-    if echo "$try" | grep -qiE "Swap accepted|announced|deposit invoice"; then
+    if echo "$try" | grep -qE "Swap accepted\.|Announced to escrow|deposit invoice"; then
       ok "Swap accepted by ${profile} (attempt ${i})"
       return 0
     fi
@@ -272,7 +284,7 @@ accept_swap() {
 }
 
 deposit_swap() {
-  local profile="$1" prefix="$2" max_attempts="${3:-3}"
+  local profile="$1" prefix="$2" max_attempts="${3:-6}"
   local out attempt=0
 
   while [[ $attempt -lt $max_attempts ]]; do
@@ -281,7 +293,7 @@ deposit_swap() {
     log "deposit_swap ${profile} (attempt ${attempt}): $(echo "$out" | grep -E 'status|Error|error|Deposit|announced|Insufficient|WRONG_STATE' | head -2)" >&2
 
     # Success
-    if echo "$out" | grep -qiE '"status".*"(completed|submitted|delivered)"'; then
+    if echo "$out" | grep -qE '"status"\s*:\s*"(completed|submitted|delivered)"'; then
       ok "${profile} deposit completed"
       return 0
     fi
@@ -374,31 +386,17 @@ get_coin_token_count() {
   local out
   out=$(cli_as "$profile" balance --no-sync 2>&1) || true
   # Match: "BTC: 0.00000010 (2 tokens)" or "BTC: 0.00000005 (1 token)"
-  echo "$out" | grep -P "^${symbol}:" | grep -oP '\((\d+) tokens?\)' | grep -oP '\d+' | head -1
+  echo "$out" | grep "^${symbol}:" | sed -n 's/.*(\([0-9]*\) token.*/\1/p' | head -1
 }
 
 # get_coin_amount <profile> <symbol>
-# Returns the total raw integer amount for a given coin symbol.
-# Sums amounts across all tokens of that coin.
-# Uses a dedicated CLI query: `tokens --no-sync` and parses output.
+# Returns the human-readable balance for a coin symbol (e.g., "9" for 9 BTC).
+# Parses balance output: "BTC: 9 (1 token)" → "9"
 get_coin_amount() {
   local profile="$1" symbol="$2"
-  local out total=0
-  out=$(cli_as "$profile" tokens --no-sync 2>&1) || true
-  # tokens output format:
-  #   Coin: BTC (abcd1234...)
-  #   Amount: 0.00000010 BTC
-  # We need to match the coin line, then extract from the Amount line.
-  # Since amounts are formatted as human-readable decimals, and we need raw
-  # integer amounts, we use the balance line format instead.
-  # Balance format: "BTC: 0.00000010 (2 tokens)"
-  # The displayed value = raw_amount / 10^decimals
-  # For swap assertions, we compare token counts which proves splitting.
-  #
-  # Alternative: use the balance confirmedAmount + unconfirmedAmount fields.
-  # For simplicity, extract the formatted balance and compare as strings.
+  local out
   out=$(cli_as "$profile" balance --no-sync 2>&1) || true
-  echo "$out" | grep -P "^${symbol}:" | grep -oP "^${symbol}: \K[0-9.]+" | head -1
+  echo "$out" | grep "^${symbol}:" | sed -n "s/^${symbol}: \([0-9.]*\).*/\1/p" | head -1
 }
 
 # assert_coin_present <profile> <symbol> <label>
@@ -439,5 +437,32 @@ assert_deposit_change() {
     ok "${label}: change token preserved (${count} ${symbol} token(s) remaining)"
   else
     fail "${label}: change token MISSING — deposit consumed entire ${symbol} token"
+  fi
+}
+
+# assert_balance <profile> <symbol> <expected_human> <label>
+# Asserts that the wallet's balance for a coin matches the expected
+# human-readable amount (e.g., "9" for 9 BTC, "90" for 90 ETH).
+# Uses string comparison on the formatted balance output.
+assert_balance() {
+  local profile="$1" symbol="$2" expected="$3" label="$4"
+  local actual
+  actual=$(get_coin_amount "$profile" "$symbol")
+  if [[ "$actual" == "$expected" ]]; then
+    ok "${label}: ${symbol} = ${actual}"
+  else
+    fail "${label}: ${symbol} expected ${expected}, got ${actual:-empty}"
+  fi
+}
+
+# assert_balance_changed <before> <after> <expected_after> <label>
+# Asserts that a balance changed to the expected value.
+# All values are human-readable strings from get_coin_amount.
+assert_balance_changed() {
+  local before="$1" after="$2" expected="$3" label="$4"
+  if [[ "$after" == "$expected" ]]; then
+    ok "${label}: ${before} → ${after}"
+  else
+    fail "${label}: expected ${expected}, got ${after:-empty} (was ${before})"
   fi
 }

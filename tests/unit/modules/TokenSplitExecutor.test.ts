@@ -79,7 +79,7 @@ describe('TokenSplitExecutor', () => {
 
       // Verify method exists with correct signature
       expect(typeof executor.executeSplit).toBe('function');
-      expect(executor.executeSplit.length).toBe(6); // 6 parameters (5 required + 1 optional message)
+      expect(executor.executeSplit.length).toBe(6); // 6 required-position parameters (message is optional)
 
       // Type check: these should be valid parameter types
       type ExpectedParams = Parameters<typeof executor.executeSplit>;
@@ -89,7 +89,7 @@ describe('TokenSplitExecutor', () => {
         25n,                                                       // remainderAmount
         'abcd1234',                                               // coinIdHex
         { scheme: 1 },                                            // recipientAddress
-        null,                                                      // message (optional)
+        null,                                                     // message (optional)
       ];
       expect(_typeCheck).toHaveLength(6);
     });

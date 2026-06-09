@@ -258,6 +258,10 @@ export class NostrTransportProvider implements TransportProvider {
         onReconnected: (url) => {
           logger.debug('Nostr', 'NostrClient reconnected to relay:', url);
           this.emitEvent({ type: 'transport:connected', timestamp: Date.now() });
+          // Re-establish subscriptions — the relay drops them on disconnect.
+          this.subscribeToEvents().catch((err) => {
+            logger.error('Nostr', 'Failed to re-subscribe after reconnect:', err);
+          });
         },
       });
 
@@ -1599,9 +1603,63 @@ export class NostrTransportProvider implements TransportProvider {
       throw new SphereError('NostrClient not initialized', 'NOT_INITIALIZED');
     }
 
-    // Convert to nostr-js-sdk Event and publish
-    const sdkEvent = NostrEventClass.fromJSON(event);
-    await this.nostrClient.publishEvent(sdkEvent);
+    const MAX_ATTEMPTS = 3;
+    const RETRY_BASE_DELAY_MS = 500;
+    const RETRY_JITTER_MS = 200;
+
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      // Snapshot this.nostrClient at the top of each iteration. Using a local
+      // reference (instead of `this.nostrClient.publishEvent(...)`) prevents a
+      // concurrent disconnect() during the subsequent await from turning the
+      // call into a TypeError on null.
+      const client = this.nostrClient;
+      if (!client) {
+        throw new SphereError('Transport disconnected during retry', 'TRANSPORT_ERROR');
+      }
+
+      try {
+        // Re-create SDK event each attempt to avoid reusing the same event ID
+        // in nostr-js-sdk's pendingOks map (which would leak timers from prior attempts)
+        const sdkEvent = NostrEventClass.fromJSON(event);
+        await client.publishEvent(sdkEvent);
+        return;
+      } catch (err: unknown) {
+        lastError = err;
+        const rawMessage = err instanceof Error ? err.message : String(err);
+
+        // Only retry relay-level rejections (nostr-js-sdk wraps these as "Event rejected: <reason>")
+        // or relay broadcast failures ("sent 0 of N"). All other errors (disconnected, closed,
+        // no connected relays) are non-transient and should fail immediately.
+        // Locale-invariant match with `en-US` to avoid Turkish-locale surprises
+        // where `'I'.toLowerCase()` yields `'ı'` (dotless i).
+        const lowered = rawMessage.toLocaleLowerCase('en-US');
+        const isRelayRejection =
+          lowered.startsWith('event rejected:') ||
+          lowered.startsWith('sent 0 of');
+
+        if (!isRelayRejection || attempt === MAX_ATTEMPTS) {
+          break;
+        }
+
+        // Add jitter to desynchronize retries across concurrent clients
+        const delay = RETRY_BASE_DELAY_MS + Math.floor(Math.random() * RETRY_JITTER_MS);
+        logger.debug(
+          'Nostr',
+          `publishEvent attempt ${attempt}/${MAX_ATTEMPTS} failed (${rawMessage}); retrying in ${delay}ms`
+        );
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+
+    const reason = lastError instanceof Error ? lastError.message : String(lastError);
+    logger.error('Nostr', `publishEvent failed after ${MAX_ATTEMPTS} attempts: ${reason}`);
+    // Chain the original error as `cause` to preserve context for debugging
+    throw new SphereError(
+      `Failed to publish event: ${reason}`,
+      'TRANSPORT_ERROR',
+      lastError
+    );
   }
 
   /**
@@ -1633,8 +1691,8 @@ export class NostrTransportProvider implements TransportProvider {
       }
 
       // Verify: query the relay for this specific event by ID.
-      // Short delay to let the relay index the event.
-      await new Promise(r => setTimeout(r, 500));
+      // Jittered delay to let relay index + reduce temporal fingerprinting.
+      await new Promise(r => setTimeout(r, 300 + Math.random() * 1200));
       try {
         const found = await this.queryEvents({
           ids: [event.id],
@@ -1768,7 +1826,7 @@ export class NostrTransportProvider implements TransportProvider {
         if (settled) return;
         settled = true;
         if (subId) {
-          try { this.nostrClient?.unsubscribe(subId); } catch { /* disconnected */ }
+          try { client.unsubscribe(subId); } catch { /* disconnected */ }
         }
         logger.warn('Nostr', `queryEvents timed out after 15s, returning ${events.length} event(s)`, { kinds: filterObj.kinds, limit: filterObj.limit });
         resolve(events);
@@ -1798,6 +1856,7 @@ export class NostrTransportProvider implements TransportProvider {
           onEndOfStoredEvents: () => settle(),
         });
       } catch {
+        clearTimeout(timeout);
         resolve(events);
         return;
       }
@@ -1960,13 +2019,11 @@ export class NostrTransportProvider implements TransportProvider {
     const chatFilter = new Filter();
     chatFilter.kinds = [EventKinds.GIFT_WRAP];
     chatFilter['#p'] = [nostrPubkey];
-    // NIP-17 gift wraps use a randomized created_at (±2 days / 172800 s) for privacy.
-    // The relay filters events by created_at, so a gift wrap sent right now may have
-    // created_at up to 172800 s in the past and would be invisible to a filter with
-    // since = dmSince.  Subtract the maximum randomization window so the relay
-    // returns events whose actual send time is >= dmSince even if their created_at
-    // was shifted backwards.  processedEventIds dedup prevents re-processing old events.
-    chatFilter.since = Math.max(0, dmSince - 172800);
+    // NIP-17 gift wraps have created_at randomized ±2 days for privacy.
+    // Without this offset, ~50% of messages are silently dropped by the relay
+    // because their randomized timestamp lands before the `since` filter.
+    // Math.max(0, ...) prevents negative timestamps when dmSince is small.
+    chatFilter.since = Math.max(0, dmSince - TIMESTAMP_RANDOMIZATION);
 
     this.chatSubscriptionId = this.nostrClient.subscribe(chatFilter, {
       onEvent: (event) => {

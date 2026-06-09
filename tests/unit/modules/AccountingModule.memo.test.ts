@@ -15,6 +15,8 @@ import {
   buildInvoiceMemo,
   decodeTransferMessage,
   encodeTransferMessage,
+  parseInvoiceMemoForOnChain,
+  hashInvoiceId,
 } from '../../../modules/accounting/memo.js';
 import { SphereError } from '../../../core/errors.js';
 import type { TransferMessagePayload } from '../../../modules/accounting/types.js';
@@ -98,11 +100,57 @@ describe('AccountingModule Memo Utilities', () => {
     expect(result).toBeNull();
   });
 
-  // UT-MEMO-008
-  it('UT-MEMO-008: buildInvoiceMemo produces correct INV:<id>:F format', () => {
+  // UT-MEMO-008: buildInvoiceMemo now uses SHA-256 hash for privacy
+  it('UT-MEMO-008: buildInvoiceMemo embeds hashed invoice ID (not raw)', () => {
     const memo = buildInvoiceMemo(VALID_ID, 'F');
+    const expectedHash = hashInvoiceId(VALID_ID);
 
-    expect(memo).toBe(`INV:${VALID_ID}:F`);
+    expect(memo).toBe(`INV:${expectedHash}:F`);
+    expect(memo).not.toContain(VALID_ID);
+  });
+
+  it('hashInvoiceId produces 64-char lowercase hex', () => {
+    const hash = hashInvoiceId(VALID_ID);
+    expect(hash).toHaveLength(64);
+    expect(hash).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('hashInvoiceId is deterministic', () => {
+    expect(hashInvoiceId(VALID_ID)).toBe(hashInvoiceId(VALID_ID));
+  });
+
+  it('hashInvoiceId normalizes case before hashing', () => {
+    const upper = VALID_ID.toUpperCase();
+    expect(hashInvoiceId(upper)).toBe(hashInvoiceId(VALID_ID));
+  });
+
+  it('hashInvoiceId produces different hashes for different IDs', () => {
+    const other = 'b'.repeat(64);
+    expect(hashInvoiceId(VALID_ID)).not.toBe(hashInvoiceId(other));
+  });
+
+  it('buildInvoiceMemo output is parseable by parseInvoiceMemo', () => {
+    const memo = buildInvoiceMemo(VALID_ID, 'B', 'some text');
+    const parsed = parseInvoiceMemo(memo);
+
+    expect(parsed).not.toBeNull();
+    expect(parsed!.invoiceId).toBe(hashInvoiceId(VALID_ID));
+    expect(parsed!.paymentDirection).toBe('back');
+    expect(parsed!.freeText).toBe('some text');
+  });
+
+  it('on-chain message contains single hash (not double-hash)', () => {
+    const memo = buildInvoiceMemo(VALID_ID, 'F');
+    const onChainBytes = parseInvoiceMemoForOnChain(memo);
+
+    expect(onChainBytes).not.toBeNull();
+    const payload = JSON.parse(new TextDecoder().decode(onChainBytes!));
+    const singleHash = hashInvoiceId(VALID_ID);
+    const doubleHash = hashInvoiceId(singleHash);
+
+    expect(payload.inv.id).toBe(singleHash);
+    expect(payload.inv.id).not.toBe(doubleHash);
+    expect(payload.inv.id).not.toBe(VALID_ID);
   });
 
   // UT-MEMO-009

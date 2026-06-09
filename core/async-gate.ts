@@ -14,6 +14,7 @@ import { SphereError } from './errors.js';
 
 export class AsyncGateMap {
   private gates: Map<string, Promise<void>> = new Map();
+  private executing: Set<string> = new Set();
 
   /**
    * Execute `fn` exclusively for the given key.
@@ -31,8 +32,6 @@ export class AsyncGateMap {
     isDestroyed?: () => boolean,
     destroyedErrorCode: SphereErrorCode = 'MODULE_DESTROYED',
   ): Promise<T> {
-    // Early check before registering the gate — prevents registering new gates
-    // after destroy() has already snapshot the gate map for draining.
     if (isDestroyed?.()) {
       throw new SphereError('Module has been destroyed.', destroyedErrorCode);
     }
@@ -49,19 +48,25 @@ export class AsyncGateMap {
       if (isDestroyed?.()) {
         throw new SphereError('Module has been destroyed.', destroyedErrorCode);
       }
-      result = await fn();
+      if (this.executing.has(key)) {
+        throw new SphereError(
+          `Re-entrant gate access on key "${key}". This would deadlock.`,
+          'REENTRANT_GATE',
+        );
+      }
+      this.executing.add(key);
+      try {
+        result = await fn();
+      } finally {
+        this.executing.delete(key);
+      }
     };
 
     try {
-      // Use .then(run, run) so fn executes even if prior gate op rejected
       await current.then(run, run);
       return result;
     } finally {
       resolve();
-      // Clean up gate if it's still the last one (prevent memory leak).
-      // Multi-waiter invariant: if A, B, C are queued, C's promise is the tail.
-      // When A completes, A sees get(key) === C_next (set by C), so A skips deletion.
-      // B also skips. Only C (the tail) deletes. This is correct.
       if (this.gates.get(key) === next) {
         this.gates.delete(key);
       }
@@ -71,11 +76,15 @@ export class AsyncGateMap {
   /**
    * Wait for all in-flight gate operations to complete.
    * Called during module destroy to drain pending work.
+   * @returns true if all gates drained, false if iteration limit was reached.
    */
-  async drainAll(): Promise<void> {
-    while (this.gates.size > 0) {
+  async drainAll(maxIterations = 100): Promise<boolean> {
+    let iterations = 0;
+    while (this.gates.size > 0 && iterations < maxIterations) {
       await Promise.allSettled(Array.from(this.gates.values()));
+      iterations++;
     }
+    return this.gates.size === 0;
   }
 
   /** Number of active gates (for testing/monitoring). */

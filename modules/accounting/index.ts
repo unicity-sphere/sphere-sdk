@@ -7,6 +7,7 @@ export {
   decodeTransferMessage,
   encodeTransferMessage,
   parseInvoiceMemoForOnChain,
+  hashInvoiceId,
   INVOICE_MEMO_REGEX,
   INVOICE_ID_REGEX,
   DIRECTION_TO_CODE,

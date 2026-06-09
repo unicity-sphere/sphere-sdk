@@ -63,6 +63,18 @@ const transport = WebSocketTransport.forClient({ url: 'ws://localhost:3000' });
 const transport = WebSocketTransport.forHost({ port: 3000 });
 ```
 
+#### safeSend pattern for WebSocket bridges
+
+When building a WebSocket bridge (e.g. a backend relay between two `WebSocketTransport` instances), always guard `ws.send()` calls. Queries from the remote side may arrive while the local WebSocket is closing, which throws an error.
+
+```typescript
+const safeSend = (data: string) => {
+  if (ws.readyState === WebSocket.OPEN) ws.send(data);
+};
+```
+
+Use `safeSend` everywhere you would otherwise call `ws.send()` in message handlers and forwarding logic.
+
 ---
 
 ## Setting up ConnectHost (wallet side)
@@ -104,9 +116,30 @@ const host = new ConnectHost({
 // Revoke current session without destroying the host
 host.revokeSession();
 
+// Notify connected dApp that the wallet is locked / logged out
+host.notifyWalletLocked();
+
 // Destroy host and clean up transport
 host.destroy();
 ```
+
+### notifyWalletLocked()
+
+Wallet hosts **must** call `host.notifyWalletLocked()` when the wallet is logged out or the `Sphere` instance is destroyed. This fires a `WALLET_EVENTS.LOCKED` event to the connected dApp so it can react appropriately (see [Wallet Lock Handling](#wallet-lock-handling) below).
+
+In the Sphere web app's ConnectPage, watch the `sphere` instance and notify when it becomes null:
+
+```typescript
+useEffect(() => {
+  if (sphere && hostRef.current) {
+    hostRef.current.updateSphere(sphere);
+  } else if (!sphere && !isLoading && hostRef.current) {
+    hostRef.current.notifyWalletLocked();
+  }
+}, [sphere, isLoading]);
+```
+
+The extension's background script should do the same when the wallet is destroyed or the user logs out.
 
 ---
 
@@ -335,6 +368,39 @@ const isValid = verifySignedMessage(originalMessage, signature, expectedPubkey);
 | `identity:updated` | identity info changed |
 | `session:expired` | session TTL reached |
 
+### Wallet Lock Handling
+
+When the wallet is locked or the user logs out, the host fires a `WALLET_EVENTS.LOCKED` event (see [`notifyWalletLocked()`](#notifywalletlocked) above). How the dApp handles this depends on the transport mode:
+
+#### Popup mode (P3)
+
+Fully disconnect — destroy the transport, clear the client reference, and remove the saved session from `sessionStorage`. **Do not close the popup window itself**, because the user may log into a different wallet in the same popup. The dApp should show the "Connect" button again.
+
+```typescript
+client.on('wallet:locked', async () => {
+  await disconnect();
+  sessionStorage.removeItem(SESSION_KEY);
+  setClient(null);
+  setConnection(null);
+  // Do NOT call popup.close() — user may log in again in the popup
+});
+```
+
+#### Extension / iframe mode (P1, P2)
+
+The wallet's background service worker or parent frame stays alive. Instead of disconnecting, set a `isWalletLocked` flag and wait for the user to unlock. When the wallet is unlocked, the host calls `updateSphere(newSphere)` and fires an `identity:updated` event, which signals the dApp to resume:
+
+```typescript
+client.on('wallet:locked', () => {
+  setIsWalletLocked(true);
+});
+
+client.on('identity:updated', (identity) => {
+  setIsWalletLocked(false);
+  // Refresh UI with new identity if it changed
+});
+```
+
 ---
 
 ## Permission Scopes
@@ -365,17 +431,67 @@ Permissions are requested during handshake and checked on every request:
 
 ## Session Resume (popup mode)
 
-When using a popup window (P3), the session ID can be persisted to avoid re-showing the approval modal on page reload:
+When using a popup window (P3), the session ID can be persisted to avoid re-showing the approval modal on page reload. Extension mode (P2) does not need this — the extension's background service worker keeps the session alive, and a silent `autoConnect` on mount is sufficient.
+
+### Full lifecycle
+
+**1. Save session after successful connect:**
 
 ```typescript
-// Save after connect
-sessionStorage.setItem('sphere-session', result.sessionId);
+const SESSION_KEY = 'sphere-session';
 
-// Restore on next load
+const result = await autoConnect({ dapp, walletUrl, permissions });
+sessionStorage.setItem(SESSION_KEY, result.connection.sessionId);
+```
+
+**2. Resume on page refresh:**
+
+Read the saved sessionId and pass it as `resumeSessionId`. If resume fails (e.g. wallet popup was closed), clear storage and fall back to a fresh connect:
+
+```typescript
+const savedSession = sessionStorage.getItem(SESSION_KEY);
+
+try {
+  const result = await autoConnect({
+    dapp,
+    walletUrl,
+    permissions,
+    resumeSessionId: savedSession ?? undefined,
+  });
+  sessionStorage.setItem(SESSION_KEY, result.connection.sessionId);
+} catch {
+  sessionStorage.removeItem(SESSION_KEY);
+  // Show Connect button — session could not be resumed
+}
+```
+
+**3. Clear on disconnect:**
+
+```typescript
+await result.disconnect();
+sessionStorage.removeItem(SESSION_KEY);
+```
+
+**4. `willAutoConnect` check:**
+
+To prevent a flash of the Connect button before auto-connect completes, check whether a resume is likely to succeed before rendering:
+
+```typescript
+const willAutoConnect =
+  !!sessionStorage.getItem(SESSION_KEY) || (await hasExtension());
+```
+
+Use this to show a loading state instead of the Connect button while auto-connect is in progress.
+
+### Low-level ConnectClient usage
+
+If you are using `ConnectClient` directly instead of `autoConnect`:
+
+```typescript
 const client = new ConnectClient({
   transport,
   dapp,
-  resumeSessionId: sessionStorage.getItem('sphere-session') ?? undefined,
+  resumeSessionId: sessionStorage.getItem(SESSION_KEY) ?? undefined,
 });
 ```
 

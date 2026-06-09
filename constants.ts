@@ -152,17 +152,6 @@ export function getAddressId(directAddress: string): string {
 }
 
 // =============================================================================
-// Invoice / Accounting Constants
-// =============================================================================
-
-/**
- * Token type identifier for invoice tokens.
- * SHA-256(UTF-8("unicity.invoice.v1"))
- * Used in genesis.data.tokenType to distinguish invoice tokens from other token types.
- */
-export const INVOICE_TOKEN_TYPE_HEX = '14676a280bda4275baf865b67cd4c611bcd58c9bf8226d508acaa10a8fcaccc6' as const;
-
-// =============================================================================
 // Nostr Defaults
 // =============================================================================
 
@@ -407,6 +396,8 @@ export const HOST_READY_TYPE = 'sphere-connect:host-ready' as const;
 export const HOST_READY_TIMEOUT = 30_000;
 
 /** Validation limits */
+export const INVOICE_TOKEN_TYPE_HEX = '14676a280bda4275baf865b67cd4c611bcd58c9bf8226d508acaa10a8fcaccc6' as const;
+
 export const LIMITS = {
   /** Min nametag length */
   NAMETAG_MIN_LENGTH: 3,

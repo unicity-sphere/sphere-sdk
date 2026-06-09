@@ -481,52 +481,21 @@ export interface SphereEventMap {
   'communications:ready': { conversationCount: number };
   'history:updated': import('../modules/payments/PaymentsModule').TransactionHistoryEntry;
   // Invoice / Accounting event payloads
-  'invoice:created': {
-    invoiceId: string;
-    confirmed: boolean;
-  };
+  'invoice:created': { invoiceId: string; confirmed: boolean };
   'invoice:payment': {
     invoiceId: string;
     transfer: import('../modules/accounting/types').InvoiceTransferRef;
     paymentDirection: 'forward' | 'back' | 'return_closed' | 'return_cancelled';
     confirmed: boolean;
   };
-  'invoice:asset_covered': {
-    invoiceId: string;
-    address: string;
-    coinId: string;
-    confirmed: boolean;
-  };
-  'invoice:target_covered': {
-    invoiceId: string;
-    address: string;
-    confirmed: boolean;
-  };
-  'invoice:covered': {
-    invoiceId: string;
-    confirmed: boolean;
-  };
-  'invoice:closed': {
-    invoiceId: string;
-    explicit: boolean;
-  };
-  'invoice:cancelled': {
-    invoiceId: string;
-  };
-  'invoice:expired': {
-    invoiceId: string;
-  };
-  'invoice:unknown_reference': {
-    invoiceId: string;
-    transfer: import('../modules/accounting/types').InvoiceTransferRef;
-  };
-  'invoice:overpayment': {
-    invoiceId: string;
-    address: string;
-    coinId: string;
-    surplus: string;
-    confirmed: boolean;
-  };
+  'invoice:asset_covered': { invoiceId: string; address: string; coinId: string; confirmed: boolean };
+  'invoice:target_covered': { invoiceId: string; address: string; confirmed: boolean };
+  'invoice:covered': { invoiceId: string; confirmed: boolean };
+  'invoice:closed': { invoiceId: string; explicit: boolean };
+  'invoice:cancelled': { invoiceId: string };
+  'invoice:expired': { invoiceId: string };
+  'invoice:unknown_reference': { invoiceId: string; transfer: import('../modules/accounting/types').InvoiceTransferRef };
+  'invoice:overpayment': { invoiceId: string; address: string; coinId: string; surplus: string; confirmed: boolean };
   'invoice:irrelevant': {
     invoiceId: string;
     transfer: import('../modules/accounting/types').InvoiceTransferRef;
@@ -539,55 +508,33 @@ export interface SphereEventMap {
     returnTransfer: import('../modules/accounting/types').InvoiceTransferRef;
   };
   'invoice:auto_return_failed': {
-    invoiceId: string;
-    transferId: string;
+    invoiceId: string; transferId: string;
     reason: 'sender_unresolvable' | 'send_failed' | 'max_retries_exceeded';
-    refundAddress?: string;
-    contactAddresses?: string[];
+    refundAddress?: string; contactAddresses?: string[];
   };
   'invoice:return_received': {
     invoiceId: string;
     transfer: import('../modules/accounting/types').InvoiceTransferRef;
     returnReason: 'manual' | 'closed' | 'cancelled';
   };
-  'invoice:over_refund_warning': {
-    invoiceId: string;
-    senderAddress: string;
-    coinId: string;
-    forwardedAmount: string;
-    returnedAmount: string;
-  };
-  'invoice:receipt_sent': {
-    invoiceId: string;
-    sent: number;
-    failed: number;
-  };
-  'invoice:receipt_received': {
-    invoiceId: string;
-    receipt: import('../modules/accounting/types').IncomingInvoiceReceipt;
-  };
-  'invoice:cancellation_sent': {
-    invoiceId: string;
-    sent: number;
-    failed: number;
-  };
-  'invoice:cancellation_received': {
-    invoiceId: string;
-    notice: import('../modules/accounting/types').IncomingCancellationNotice;
-  };
-  // Swap events
+  'invoice:over_refund_warning': { invoiceId: string; senderAddress: string; coinId: string; forwardedAmount: string; returnedAmount: string };
+  'invoice:receipt_sent': { invoiceId: string; sent: number; failed: number };
+  'invoice:receipt_received': { invoiceId: string; receipt: import('../modules/accounting/types').IncomingInvoiceReceipt };
+  'invoice:cancellation_sent': { invoiceId: string; sent: number; failed: number };
+  'invoice:cancellation_received': { invoiceId: string; notice: import('../modules/accounting/types').IncomingCancellationNotice };
+  // Swap event payloads
   'swap:proposal_received': { swapId: string; deal: Record<string, unknown>; senderPubkey: string; senderNametag?: string };
   'swap:proposed': { swapId: string; deal: Record<string, unknown>; recipientPubkey: string };
   'swap:accepted': { swapId: string; role: string };
   'swap:rejected': { swapId: string; reason?: string };
   'swap:announced': { swapId: string; depositInvoiceId: string };
   'swap:deposit_sent': { swapId: string; transferResult: TransferResult };
-  'swap:deposit_confirmed': { swapId: string; party: 'A' | 'B'; amount: string; coinId: string };
+  'swap:deposit_confirmed': { swapId: string; party: string; amount: string; coinId: string };
   'swap:deposits_covered': { swapId: string };
   'swap:concluding': { swapId: string };
   'swap:payout_received': { swapId: string; payoutInvoiceId: string };
   'swap:completed': { swapId: string; payoutVerified: boolean };
-  'swap:cancelled': { swapId: string; reason: 'timeout' | 'explicit' | 'escrow_failed' | 'rejected'; depositsReturned?: boolean };
+  'swap:cancelled': { swapId: string; reason: string; depositsReturned?: boolean };
   'swap:failed': { swapId: string; error: string };
   'swap:deposit_returned': { swapId: string; transfer: import('../modules/accounting/types').InvoiceTransferRef; returnReason: string };
   'swap:bounce_received': { swapId: string; reason: string; returnedAmount: string; returnedCurrency: string };

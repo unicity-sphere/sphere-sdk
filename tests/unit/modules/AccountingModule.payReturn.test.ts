@@ -18,6 +18,7 @@ import {
   INVOICE_TOKEN_TYPE_HEX,
 } from './accounting-test-helpers.js';
 import { getAddressId } from '../../../constants.js';
+import { hashInvoiceId } from '../../../modules/accounting/memo.js';
 import type { InvoiceTerms, InvoiceTransferRef } from '../../../modules/accounting/types.js';
 import type { Token } from '../../../types/index.js';
 
@@ -105,7 +106,7 @@ describe('AccountingModule.payInvoice()', () => {
     expect(sendCall.coinId).toBe('UCT');
     // Memo must contain forward reference: INV:<id>:F
     expect(typeof sendCall.memo).toBe('string');
-    expect((sendCall.memo as string).startsWith(`INV:${INVOICE_ID}:F`)).toBe(true);
+    expect((sendCall.memo as string).startsWith(`INV:${hashInvoiceId(INVOICE_ID)}:F`)).toBe(true);
   });
 
   // UT-PAY-002
@@ -246,7 +247,7 @@ describe('AccountingModule.payInvoice()', () => {
     const sendCall = mocks.payments.send.mock.calls[0]![0] as Record<string, unknown>;
     const memo = sendCall.memo as string;
     expect(memo).toMatch(/^INV:[0-9a-f]{64}:F/);
-    expect(memo).toContain(INVOICE_ID);
+    expect(memo).toContain(hashInvoiceId(INVOICE_ID));
   });
 
   // UT-PAY-010
@@ -435,7 +436,7 @@ describe('AccountingModule.returnInvoicePayment()', () => {
     const sendCall = mocks.payments.send.mock.calls[0]![0] as Record<string, unknown>;
     const memo = sendCall.memo as string;
     expect(memo).toMatch(/^INV:[0-9a-f]{64}:B/);
-    expect(memo).toContain(INVOICE_ID);
+    expect(memo).toContain(hashInvoiceId(INVOICE_ID));
   });
 
   // UT-RETURN-003

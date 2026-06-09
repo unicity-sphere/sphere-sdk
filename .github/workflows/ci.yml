@@ -21,9 +21,12 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
+          cache: npm
 
-      - name: Install dependencies (including optional)
-        run: npm install --include=optional
+      - name: Install dependencies
+        run: |
+          npm install --include=optional --ignore-scripts
+          npm rebuild
 
       - name: Build
         run: npm run build
