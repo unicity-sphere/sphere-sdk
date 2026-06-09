@@ -16,6 +16,7 @@ import { FileStorageProvider } from '../../../impl/nodejs/storage/FileStoragePro
 import { FileTokenStorageProvider } from '../../../impl/nodejs/storage/FileTokenStorageProvider';
 import type { TransportProvider, OracleProvider } from '../../../index';
 import type { ProviderStatus } from '../../../types';
+import { TEST_NETWORK } from '../../test-network';
 
 const TEST_DIR = path.join(__dirname, '.test-register-nametag');
 const DATA_DIR = path.join(TEST_DIR, 'data');
@@ -100,7 +101,7 @@ describe('Sphere.registerNametag() — Nostr-binding only (D5, no on-chain mint)
       transport,
       oracle,
       tokenStorage,
-      network: 'testnet2',
+      network: TEST_NETWORK,
       autoGenerate: true,
     });
 
@@ -134,7 +135,7 @@ describe('Sphere.registerNametag() — Nostr-binding only (D5, no on-chain mint)
       transport,
       oracle,
       tokenStorage,
-      network: 'testnet2',
+      network: TEST_NETWORK,
       autoGenerate: true,
     });
 

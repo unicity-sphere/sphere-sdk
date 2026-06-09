@@ -22,6 +22,7 @@ import { encryptSimple } from '../../core/encryption';
 import { validateMnemonic as validateBip39Mnemonic } from '../../core/crypto';
 import type { TransportProvider, OracleProvider } from '../../index';
 import type { ProviderStatus } from '../../types';
+import { TEST_NETWORK } from '../test-network';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -119,7 +120,7 @@ async function createAndDestroy(options: {
     tokenStorage,
     transport: createMockTransport(),
     oracle: createMockOracle(),
-    network: 'testnet2',
+    network: TEST_NETWORK,
     mnemonic: TEST_MNEMONIC,
     password: options.password,
   });
@@ -161,7 +162,7 @@ describe('Wallet password encryption', () => {
         tokenStorage,
         transport: createMockTransport(),
         oracle: createMockOracle(),
-        network: 'testnet2',
+        network: TEST_NETWORK,
       });
 
       expect(sphere.getMnemonic()).toBe(TEST_MNEMONIC);
@@ -191,7 +192,7 @@ describe('Wallet password encryption', () => {
         tokenStorage,
         transport: createMockTransport(),
         oracle: createMockOracle(),
-        network: 'testnet2',
+        network: TEST_NETWORK,
         password: TEST_PASSWORD,
       });
 
@@ -211,7 +212,7 @@ describe('Wallet password encryption', () => {
           tokenStorage,
           transport: createMockTransport(),
           oracle: createMockOracle(),
-        network: 'testnet2',
+        network: TEST_NETWORK,
           password: 'wrong-password',
         })
       ).rejects.toThrow('Failed to decrypt mnemonic');
@@ -230,7 +231,7 @@ describe('Wallet password encryption', () => {
           tokenStorage,
           transport: createMockTransport(),
           oracle: createMockOracle(),
-        network: 'testnet2',
+        network: TEST_NETWORK,
         })
       ).rejects.toThrow('Failed to decrypt mnemonic');
     });
@@ -254,7 +255,7 @@ describe('Wallet password encryption', () => {
         tokenStorage,
         transport: createMockTransport(),
         oracle: createMockOracle(),
-        network: 'testnet2',
+        network: TEST_NETWORK,
         // No password — should fall back to DEFAULT_ENCRYPTION_KEY
       });
 
@@ -278,7 +279,7 @@ describe('Wallet password encryption', () => {
         tokenStorage,
         transport: createMockTransport(),
         oracle: createMockOracle(),
-        network: 'testnet2',
+        network: TEST_NETWORK,
       });
 
       expect(sphere.getMnemonic()).toBe(TEST_MNEMONIC);
@@ -306,7 +307,7 @@ describe('Wallet password encryption', () => {
         tokenStorage,
         transport: createMockTransport(),
         oracle: createMockOracle(),
-        network: 'testnet2',
+        network: TEST_NETWORK,
       });
 
       expect(sphere.getMnemonic()).toBe(TEST_MNEMONIC);
@@ -326,7 +327,7 @@ describe('Wallet password encryption', () => {
         ...providers,
         transport: createMockTransport(),
         oracle: createMockOracle(),
-        network: 'testnet2',
+        network: TEST_NETWORK,
         mnemonic: TEST_MNEMONIC,
       });
 
@@ -358,7 +359,7 @@ describe('Wallet password encryption', () => {
         tokenStorage,
         transport: createMockTransport(),
         oracle: createMockOracle(),
-        network: 'testnet2',
+        network: TEST_NETWORK,
         password: TEST_PASSWORD,
       });
 
@@ -381,7 +382,7 @@ describe('Wallet password encryption', () => {
         tokenStorage,
         transport: createMockTransport(),
         oracle: createMockOracle(),
-        network: 'testnet2',
+        network: TEST_NETWORK,
       });
 
       expect(sphere.getMnemonic()).toBe(TEST_MNEMONIC);
@@ -402,7 +403,7 @@ describe('Wallet password encryption', () => {
         tokenStorage,
         transport: createMockTransport(),
         oracle: createMockOracle(),
-        network: 'testnet2',
+        network: TEST_NETWORK,
         password: TEST_PASSWORD,
       });
 
@@ -435,7 +436,7 @@ describe('Wallet password encryption', () => {
         tokenStorage,
         transport: createMockTransport(),
         oracle: createMockOracle(),
-        network: 'testnet2',
+        network: TEST_NETWORK,
         password: TEST_PASSWORD,
       });
 

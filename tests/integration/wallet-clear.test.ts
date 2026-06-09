@@ -20,6 +20,7 @@ import type { TransportProvider, OracleProvider } from '../../index';
 import type { ProviderStatus, FullIdentity } from '../../types';
 import type { TxfStorageDataBase } from '../../storage';
 import { vi } from 'vitest';
+import { TEST_NETWORK } from '../test-network';
 
 // =============================================================================
 // Test directories
@@ -171,7 +172,7 @@ describe('Sphere.clear() integration', () => {
         storage,
         transport,
         oracle,
-        network: 'testnet2',
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
         nametag: 'alice',
@@ -212,7 +213,7 @@ describe('Sphere.clear() integration', () => {
         storage,
         transport,
         oracle,
-        network: 'testnet2',
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
         nametag: 'bob',
@@ -250,7 +251,7 @@ describe('Sphere.clear() integration', () => {
         storage,
         transport,
         oracle,
-        network: 'testnet2',
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
       });
@@ -322,7 +323,7 @@ describe('Sphere.clear() integration', () => {
         storage,
         transport,
         oracle,
-        network: 'testnet2',
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
         nametag: 'firstwallet',
@@ -345,7 +346,7 @@ describe('Sphere.clear() integration', () => {
         storage: storage2,
         transport: createMockTransport(),
         oracle: createMockOracle(),
-        network: 'testnet2',
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
         nametag: 'secondwallet',
@@ -370,7 +371,7 @@ describe('Sphere.clear() integration', () => {
         storage,
         transport,
         oracle,
-        network: 'testnet2',
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
         nametag: 'primary',
@@ -415,7 +416,7 @@ describe('Sphere.clear() integration', () => {
         storage,
         transport,
         oracle,
-        network: 'testnet2',
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
       });
@@ -469,7 +470,7 @@ describe('Sphere.clear() integration', () => {
         storage,
         transport,
         oracle,
-        network: 'testnet2',
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
         nametag: 'unique123',
@@ -501,7 +502,7 @@ describe('Sphere.clear() integration', () => {
         storage,
         transport,
         oracle,
-        network: 'testnet2',
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
         nametag: 'taken',
@@ -525,7 +526,7 @@ describe('Sphere.clear() integration', () => {
           storage: storage2,
           transport: createMockTransport(),
           oracle: createMockOracle(),
-          network: 'testnet2',
+          network: TEST_NETWORK,
           tokenStorage,
           autoGenerate: true,
           nametag: 'taken',
@@ -545,7 +546,7 @@ describe('Sphere.clear() integration', () => {
         storage,
         transport,
         oracle,
-        network: 'testnet2',
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
         nametag: 'myname',
@@ -568,7 +569,7 @@ describe('Sphere.clear() integration', () => {
         storage: storage2,
         transport: createMockTransport(),
         oracle: createMockOracle(),
-        network: 'testnet2',
+        network: TEST_NETWORK,
         tokenStorage,
         mnemonic,
         nametag: 'myname',
@@ -591,7 +592,7 @@ describe('Sphere.clear() integration', () => {
         storage,
         transport,
         oracle,
-        network: 'testnet2',
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
       });
@@ -617,7 +618,7 @@ describe('Sphere.clear() integration', () => {
         storage,
         transport,
         oracle,
-        network: 'testnet2',
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
       });
@@ -643,7 +644,7 @@ describe('Sphere.clear() integration', () => {
         storage,
         transport,
         oracle,
-        network: 'testnet2',
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
       });
@@ -671,7 +672,7 @@ describe('Sphere.clear() integration', () => {
         storage,
         transport,
         oracle,
-        network: 'testnet2',
+        network: TEST_NETWORK,
         tokenStorage,
         mnemonic: Sphere.generateMnemonic(),
       });
@@ -695,7 +696,7 @@ describe('Sphere.clear() integration', () => {
         storage,
         transport,
         oracle,
-        network: 'testnet2',
+        network: TEST_NETWORK,
         tokenStorage,
         autoGenerate: true,
       });
@@ -709,7 +710,7 @@ describe('Sphere.clear() integration', () => {
         storage,
         transport: createMockTransport(),
         oracle: createMockOracle(),
-        network: 'testnet2',
+        network: TEST_NETWORK,
         tokenStorage,
         mnemonic: Sphere.generateMnemonic(),
       });

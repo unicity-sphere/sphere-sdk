@@ -21,6 +21,7 @@ import { FileTokenStorageProvider } from '../../impl/nodejs/storage/FileTokenSto
 import type { TransportProvider, OracleProvider } from '../../index';
 import type { PeerInfo } from '../../transport/transport-provider';
 import type { ProviderStatus } from '../../types';
+import { TEST_NETWORK } from '../test-network';
 
 // =============================================================================
 // Test directories
@@ -186,7 +187,7 @@ describe('Nametag overwrite guard (syncIdentityWithTransport)', () => {
       storage,
       transport,
       oracle,
-      network: 'testnet2',
+      network: TEST_NETWORK,
       tokenStorage,
       autoGenerate: true,
     });
@@ -215,7 +216,7 @@ describe('Nametag overwrite guard (syncIdentityWithTransport)', () => {
       storage,
       transport,
       oracle,
-      network: 'testnet2',
+      network: TEST_NETWORK,
       tokenStorage,
       autoGenerate: true,
       nametag: 'alice',
@@ -240,7 +241,7 @@ describe('Nametag overwrite guard (syncIdentityWithTransport)', () => {
       storage,
       transport,
       oracle,
-      network: 'testnet2',
+      network: TEST_NETWORK,
       tokenStorage,
     });
 
@@ -267,7 +268,7 @@ describe('Nametag overwrite guard (syncIdentityWithTransport)', () => {
       storage,
       transport,
       oracle,
-      network: 'testnet2',
+      network: TEST_NETWORK,
       tokenStorage,
       autoGenerate: true,
       nametag: 'bob',
@@ -309,7 +310,7 @@ describe('Nametag overwrite guard (syncIdentityWithTransport)', () => {
       storage,
       transport,
       oracle,
-      network: 'testnet2',
+      network: TEST_NETWORK,
       tokenStorage,
     });
 
@@ -345,7 +346,7 @@ describe('Nametag overwrite guard (syncIdentityWithTransport)', () => {
       storage,
       transport: transport1,
       oracle,
-      network: 'testnet2',
+      network: TEST_NETWORK,
       tokenStorage,
       autoGenerate: true,
       nametag: 'carol',
@@ -364,7 +365,7 @@ describe('Nametag overwrite guard (syncIdentityWithTransport)', () => {
       storage,
       transport: transport2,
       oracle,
-      network: 'testnet2',
+      network: TEST_NETWORK,
       tokenStorage,
     });
 
@@ -388,7 +389,7 @@ describe('Nametag overwrite guard (syncIdentityWithTransport)', () => {
       storage,
       transport,
       oracle,
-      network: 'testnet2',
+      network: TEST_NETWORK,
       tokenStorage,
       autoGenerate: true,
       nametag: 'dave',
@@ -421,7 +422,7 @@ describe('Nametag overwrite guard (syncIdentityWithTransport)', () => {
       storage,
       transport,
       oracle,
-      network: 'testnet2',
+      network: TEST_NETWORK,
       tokenStorage,
     });
 
@@ -436,7 +437,7 @@ describe('Nametag overwrite guard (syncIdentityWithTransport)', () => {
       storage,
       transport,
       oracle,
-      network: 'testnet2',
+      network: TEST_NETWORK,
       tokenStorage,
     });
 
@@ -456,7 +457,7 @@ describe('Nametag overwrite guard (syncIdentityWithTransport)', () => {
       storage,
       transport,
       oracle,
-      network: 'testnet2',
+      network: TEST_NETWORK,
       tokenStorage,
       autoGenerate: true,
       nametag: 'legacy_user',
@@ -503,7 +504,7 @@ describe('Nametag overwrite guard (syncIdentityWithTransport)', () => {
       storage,
       transport,
       oracle,
-      network: 'testnet2',
+      network: TEST_NETWORK,
       tokenStorage,
     });
 
@@ -536,7 +537,7 @@ describe('Nametag overwrite guard (syncIdentityWithTransport)', () => {
       storage,
       transport,
       oracle,
-      network: 'testnet2',
+      network: TEST_NETWORK,
       tokenStorage,
     });
 

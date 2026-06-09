@@ -17,6 +17,7 @@ import { FileTokenStorageProvider } from '../../impl/nodejs/storage/FileTokenSto
 import type { TransportProvider, OracleProvider } from '../../index';
 import type { ProviderStatus } from '../../types';
 import { vi } from 'vitest';
+import { TEST_NETWORK } from '../test-network';
 
 // =============================================================================
 // Test directories
@@ -131,7 +132,7 @@ describe('Nametag normalization integration', () => {
       storage,
       transport,
       oracle,
-      network: 'testnet2',
+      network: TEST_NETWORK,
       tokenStorage,
       autoGenerate: true,
     });
@@ -152,7 +153,7 @@ describe('Nametag normalization integration', () => {
       storage,
       transport,
       oracle,
-      network: 'testnet2',
+      network: TEST_NETWORK,
       tokenStorage,
       autoGenerate: true,
       nametag: 'BOB',
@@ -171,7 +172,7 @@ describe('Nametag normalization integration', () => {
       storage,
       transport,
       oracle,
-      network: 'testnet2',
+      network: TEST_NETWORK,
       tokenStorage,
       autoGenerate: true,
     });
@@ -191,7 +192,7 @@ describe('Nametag normalization integration', () => {
       storage,
       transport,
       oracle,
-      network: 'testnet2',
+      network: TEST_NETWORK,
       tokenStorage,
       autoGenerate: true,
     });
@@ -209,7 +210,7 @@ describe('Nametag normalization integration', () => {
       storage,
       transport,
       oracle,
-      network: 'testnet2',
+      network: TEST_NETWORK,
       tokenStorage,
       autoGenerate: true,
     });
@@ -227,7 +228,7 @@ describe('Nametag normalization integration', () => {
       storage,
       transport,
       oracle,
-      network: 'testnet2',
+      network: TEST_NETWORK,
       tokenStorage,
       autoGenerate: true,
     });
@@ -247,7 +248,7 @@ describe('Nametag normalization integration', () => {
       storage,
       transport,
       oracle,
-      network: 'testnet2',
+      network: TEST_NETWORK,
       tokenStorage,
       autoGenerate: true,
     });

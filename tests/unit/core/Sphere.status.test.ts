@@ -17,6 +17,7 @@ vi.mock('../../../l1/network', () => ({
 }));
 
 import { Sphere } from '../../../core/Sphere';
+import { TEST_NETWORK } from '../../test-network';
 
 // =============================================================================
 // Mock Factories
@@ -171,7 +172,7 @@ describe('Sphere Status & Provider Management', () => {
       transport: transport as unknown as TransportProvider,
       oracle: oracle as unknown as OracleProvider,
       tokenStorage,
-      network: 'testnet2',
+      network: TEST_NETWORK,
       autoGenerate: true,
     };
     if (options?.l1) {

@@ -21,6 +21,7 @@ import { TokenRegistry } from '../../../registry';
 import { NETWORKS } from '../../../constants';
 import { Sphere } from '../../../core/Sphere';
 import { makeMockProviders } from './support/mock-providers';
+import { TEST_NETWORK } from '../../test-network';
 
 // Mock L1 network module so init() never reaches Fulcrum (mirrors other core tests).
 vi.mock('../../../l1/network', () => ({
@@ -80,7 +81,7 @@ describe('Sphere.init network → TokenRegistry delegation (regression guard)', 
       transport,
       oracle,
       l1,
-      network: 'testnet2',
+      network: TEST_NETWORK,
       autoGenerate: true,
     });
 
@@ -106,7 +107,7 @@ describe('Sphere.init network → TokenRegistry delegation (regression guard)', 
       transport,
       oracle,
       l1,
-      network: 'testnet2',
+      network: TEST_NETWORK,
     });
 
     // Sanity: this went through the load branch.
