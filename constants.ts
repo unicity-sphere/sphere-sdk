@@ -331,6 +331,22 @@ export const DEFAULT_GROUP_RELAYS = [
   'wss://sphere-relay.unicity.network',
 ] as const;
 
+/**
+ * Complete configuration for one network. Every field is required, so adding a
+ * network (or a field) that is missing any of these is a COMPILE error at the
+ * NETWORKS literal below (via `satisfies`) — a half-configured network can never
+ * be defined silently.
+ */
+export interface NetworkConfig {
+  readonly name: string;
+  readonly aggregatorUrl: string;
+  readonly nostrRelays: readonly string[];
+  readonly ipfsGateways: readonly string[];
+  readonly electrumUrl: string;
+  readonly groupRelays: readonly string[];
+  readonly tokenRegistryUrl: string;
+}
+
 /** Network configurations */
 export const NETWORKS = {
   mainnet: {
@@ -371,10 +387,9 @@ export const NETWORKS = {
     groupRelays: DEFAULT_GROUP_RELAYS,
     tokenRegistryUrl: TOKEN_REGISTRY_URL,
   },
-} as const;
+} as const satisfies Record<string, NetworkConfig>;
 
 export type NetworkType = keyof typeof NETWORKS;
-export type NetworkConfig = (typeof NETWORKS)[NetworkType];
 
 // =============================================================================
 // Timeouts & Limits

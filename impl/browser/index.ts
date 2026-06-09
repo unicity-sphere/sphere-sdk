@@ -29,6 +29,7 @@ export type {
 
 import { logger as sdkLogger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
+import { assertNetworkConsistency } from '../shared/network';
 import { createIndexedDBStorageProvider, type IndexedDBStorageProviderConfig, createIndexedDBTokenStorageProvider } from './storage';
 import { createNostrTransportProvider } from './transport';
 import { createUnicityAggregatorProvider } from './oracle';
@@ -368,6 +369,9 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
     throw new SphereError('createBrowserProviders: config.network is required.', 'INVALID_CONFIG');
   }
   const network = config.network;
+  // Refuse provably-broken networks (e.g. a null/mismatched trust base would
+  // silently accept unverified tokens) before building any provider.
+  assertNetworkConsistency(network);
 
   // Configure global logger: top-level debug enables all, per-provider overrides are additive.
   // Only override global debug flag when explicitly provided — don't reset a previously-configured value.
