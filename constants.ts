@@ -102,6 +102,34 @@ export const STORAGE_KEYS_GLOBAL = {
    */
   PROFILE_PENDING_PUBLISH_CID: 'profile_pending_publish_cid',
   /**
+   * Issue #454 finding #2 — SIGKILL recovery marker for the Issue #444
+   * `skipPublish` (local-only flush) path.
+   *
+   * `awaitNextLocalFlush` intentionally skips the aggregator pointer
+   * publish and schedules a deferred publish via the dirty-flush
+   * debouncer (`notifyProfileDirty()`). The in-process drain in
+   * {@link ProfileTokenStorageProvider.shutdown} handles graceful
+   * exits; a SIGKILL (or hard crash) during the debounce window
+   * leaves no `pendingPublishCid` marker (the BUNDLE CID alone is
+   * insufficient — pendingPublishCid stores SNAPSHOT CIDs that the
+   * pointer layer expects).
+   *
+   * This sibling marker is a boolean flag: presence ⇒ "a deferred
+   * publish is owed for the most recent local-only flush". Set inside
+   * the `skipPublish` branch of `__flushToIpfsBody` after the bundle
+   * ref is durably written; cleared after a successful snapshot
+   * publish via the dirty-flush callback or a same-CID `pendingPublishCid`
+   * retry. On the next process boot, `initialize()` restores the flag
+   * and triggers a deferred `publishSnapshotIfWired()` (best-effort)
+   * so siblings discover the bundle without waiting for the next
+   * local mutation to drive a save-side flush.
+   *
+   * Per-address suffix appended by the Profile provider
+   * (`<key>_<addressId>`). Value: literal "1" for set, key absent for
+   * unset.
+   */
+  PROFILE_PENDING_DEFERRED_PUBLISH: 'profile_pending_deferred_publish',
+  /**
    * Issue #313 — local snapshot blob for cold-boot lazy load. Holds the
    * most recent in-memory state (identity, tokens, bundles, pointer,
    * timestamps) so the next cold boot can render the wallet UI from

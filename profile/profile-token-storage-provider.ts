@@ -276,6 +276,30 @@ export class ProfileTokenStorageProvider
    */
   private pendingPublishCid: string | null = null;
 
+  /**
+   * Issue #454 finding #2 — SIGKILL recovery marker for the Issue #444
+   * `skipPublish` (local-only flush) path.
+   *
+   * `awaitNextLocalFlush` does NOT stamp `pendingPublishCid` because
+   * that field holds SNAPSHOT CIDs and the bundle CID from a local-only
+   * flush is the wrong shape for `retryPendingPublishIfAny`. Instead,
+   * the skipPublish branch sets this boolean flag to signal "a deferred
+   * publish is owed". The flag is persisted to `localCache` so a SIGKILL
+   * during the debounce window does not silently lose the publish — the
+   * next process boot observes the flag and drives a deferred
+   * `publishSnapshotIfWired()` from the initialize path.
+   *
+   * Cleared:
+   *   - synchronously after a successful `publishSnapshotIfWired()`
+   *     (debounce-fire OR shutdown drain);
+   *   - after a successful `flushToIpfs({ skipPublish: false })`
+   *     (the save-side flush re-publishes the current head).
+   *
+   * Persisted to `localCache` under
+   * `<STORAGE_KEYS_GLOBAL.PROFILE_PENDING_DEFERRED_PUBLISH>_<addressId>`.
+   */
+  private pendingDeferredPublishMarker = false;
+
   // --- Bundle CIDs merged into lastLoadedData (pointer monotonicity) ---
   // Snapshot of the active OrbitDB bundle index at the moment load()
   // produced lastLoadedData. Used by FlushScheduler's runtime monotonicity
@@ -470,6 +494,21 @@ export class ProfileTokenStorageProvider
         this.persistPendingPublishCid(c).catch((err) => {
           this.log(
             `persistPendingPublishCid failed (best-effort): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        });
+      },
+      // Issue #454 finding #2 — SIGKILL recovery marker for the
+      // skipPublish (local-only flush) path.
+      getPendingDeferredPublishMarker: () => this.pendingDeferredPublishMarker,
+      setPendingDeferredPublishMarker: (v) => {
+        this.pendingDeferredPublishMarker = v;
+        // Fire-and-forget persistence — see persistPendingPublishCid
+        // for the same best-effort rationale.
+        this.persistPendingDeferredPublishMarker(v).catch((err) => {
+          this.log(
+            `persistPendingDeferredPublishMarker failed (best-effort): ${
               err instanceof Error ? err.message : String(err)
             }`,
           );
@@ -782,7 +821,23 @@ export class ProfileTokenStorageProvider
     this.dirtyFlushPromise = tracked;
 
     try {
-      return await flushBody;
+      const result = await flushBody;
+      // Issue #454 finding #2 — clear the SIGKILL recovery marker on a
+      // confirmed-ok publish. Transient failures (replica lag) and
+      // structural skips keep the marker live so a future boot retries.
+      if (result && result.ok && this.pendingDeferredPublishMarker) {
+        this.pendingDeferredPublishMarker = false;
+        // Fire-and-forget — same best-effort persistence semantics as
+        // `setPendingPublishCid`.
+        this.persistPendingDeferredPublishMarker(false).catch((err) => {
+          this.log(
+            `Clearing pendingDeferredPublishMarker (post-publish) failed (best-effort): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        });
+      }
+      return result;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.log(`publishSnapshotIfWired (synchronous fire) failed: ${msg}`);
@@ -1028,10 +1083,21 @@ export class ProfileTokenStorageProvider
     // process run BEFORE lifecycle wires up — this lets the very
     // first periodic poll / save-driven flush retry the publish.
     await this.restorePendingPublishCidFromCache();
-    return this.lifecycleManager.initialize(
+    // Issue #454 finding #2 — also restore the sibling deferred-publish
+    // marker (set on the Issue #444 skipPublish path; uncleared marker
+    // implies SIGKILL during debounce window).
+    await this.restorePendingDeferredPublishMarkerFromCache();
+    const ok = await this.lifecycleManager.initialize(
       () => this.handleReplication(),
       () => this.onPollDiscoveredNewCid(),
     );
+    // Trigger deferred-publish recovery AFTER lifecycle is up so the
+    // snapshot publisher (and pointer layer) are available. Best-effort
+    // — failures keep the marker live for next boot.
+    if (ok) {
+      this.triggerDeferredPublishRecoveryIfMarked();
+    }
+    return ok;
   }
 
   async shutdown(options?: ShutdownOptions): Promise<void> {
@@ -1084,38 +1150,60 @@ export class ProfileTokenStorageProvider
   /**
    * Issue #444 — shutdown-time drain for deferred dirty-flush signals.
    *
-   * Fires the `onProfileDirtyFlush` callback ONCE if there is a pending
-   * signal (armed timer or `dirtyFlushPending` latch) at shutdown time;
-   * otherwise no-op. Unlike {@link publishSnapshotIfWired} (which
-   * unconditionally fires on every call), this drain checks the pending
-   * state explicitly so an idle-wallet shutdown does not trigger a
-   * redundant publish round-trip.
+   * Fires the `onProfileDirtyFlush` callback ONCE (via
+   * {@link publishSnapshotIfWired}) if there is a pending signal
+   * (armed timer or `dirtyFlushPending` latch) at shutdown time;
+   * otherwise no-op. Unlike {@link publishSnapshotIfWired} called
+   * unconditionally, this drain checks the pending state explicitly
+   * so an idle-wallet shutdown does not trigger a redundant publish
+   * round-trip.
    *
    * Sequence:
    *   1. Snapshot `hadArmedTimer` BEFORE clearing — the timer is the
    *      "pending signal that hasn't fired yet" indicator from a
    *      recent local-only flush.
-   *   2. Cancel the timer (we're about to drain it synchronously).
-   *   3. Await any in-flight dirty-flush callback so we serialize
-   *      against it (avoids firing the same snapshot build twice
-   *      concurrently). Loop because the callback's finally can
-   *      re-arm via `consumePendingDirtyFlag`.
-   *   4. If `hadArmedTimer` OR `dirtyFlushPending` was true, fire the
-   *      callback once.
+   *   2. Drain any in-flight dispatch (loop on re-arm) so we serialize.
+   *      Note: we DO NOT cancel the timer here — `publishSnapshotIfWired`
+   *      does that internally as part of its bookkeeping. Pre-cancelling
+   *      would also lose the `hadArmedTimer` signal we use to decide
+   *      whether to fire, but capturing it before publishSnapshotIfWired
+   *      lets us preserve the no-op-on-idle property regardless.
+   *   3. If `hadArmedTimer` OR `dirtyFlushPending` was true, fire via
+   *      `publishSnapshotIfWired()`. That entry point does the full
+   *      coordination: cancels timer, tracks `dirtyFlushPromise`,
+   *      consumes latch, and re-arms (during normal operation) on a
+   *      mid-fire `notifyProfileDirty()`. During shutdown the re-arm
+   *      is suppressed by the `isShuttingDown` guard in the finally
+   *      block — but the `dirtyFlushPromise` tracking still closes
+   *      Finding #1's race window (a `notifyProfileDirty()` arriving
+   *      while we're awaiting the callback latches into
+   *      `dirtyFlushPending` instead of arming a fresh timer that
+   *      the post-drain `cancelDirtyFlushTimer` would silently
+   *      cancel).
    *
    * Errors from the callback are logged at warn and swallowed —
    * shutdown MUST complete; the pointer's `pendingPublishCid` retry
-   * marker covers cross-process recovery for transient publish
-   * failures.
+   * marker (and the new `pendingDeferredPublishMarker` for the
+   * skipPublish path) covers cross-process recovery for transient
+   * publish failures.
+   *
+   * Issue #454 finding #1 — previously this called the raw
+   * `onProfileDirtyFlush` callback directly, leaving `dirtyFlushPromise`
+   * null during the await. A concurrent `notifyProfileDirty()` would
+   * see `dirtyFlushPromise === null` and arm a fresh `dirtyFlushTimer`,
+   * which the post-drain `cancelDirtyFlushTimer()` then silently
+   * cancelled — same class of bug PR #453 claimed to fix. Switching
+   * to `publishSnapshotIfWired()` closes the race because it sets
+   * `dirtyFlushPromise = tracked` so concurrent notifications hit the
+   * `if (dirtyFlushPromise !== null) { dirtyFlushPending = true; return; }`
+   * branch in `notifyProfileDirty()`.
    */
   private async drainDeferredDirtyPublishOnShutdown(): Promise<void> {
-    // Snapshot pending state BEFORE we cancel.
+    // Snapshot pending state BEFORE invoking the publish. The armed
+    // timer is the "deferred publish accrued during this session"
+    // indicator; we preserve the no-op-on-idle property by gating the
+    // fire on it.
     const hadArmedTimer = this.dirtyFlushTimer !== null;
-
-    if (this.dirtyFlushTimer !== null) {
-      clearTimeout(this.dirtyFlushTimer);
-      this.dirtyFlushTimer = null;
-    }
 
     // Wait for any in-flight callback to settle. Loop to handle the
     // case where the dispatch's finally re-arms a fresh callback via
@@ -1137,22 +1225,74 @@ export class ProfileTokenStorageProvider
     }
 
     const needsFire = hadArmedTimer || this.dirtyFlushPending;
-    this.dirtyFlushPending = false;
 
-    if (!needsFire) return;
+    if (!needsFire) {
+      // Defensively cancel any lingering timer so the post-drain
+      // `cancelDirtyFlushTimer()` is a true no-op. (Normally there
+      // shouldn't be one at this point, but a notification that
+      // arrived between the `dirtyFlushPromise` drain loop and now
+      // would have armed a timer — drop it without firing because
+      // the caller decided there is nothing to anchor.)
+      if (this.dirtyFlushTimer !== null) {
+        clearTimeout(this.dirtyFlushTimer);
+        this.dirtyFlushTimer = null;
+      }
+      return;
+    }
 
     const callback = this.options?.onProfileDirtyFlush;
     if (typeof callback !== 'function') return;
 
-    try {
-      await callback();
-    } catch (err) {
-      this.log(
-        `Shutdown deferred-publish drain: callback threw (best-effort, ignored): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
+    // Loop the drain to handle racing signals: a `notifyProfileDirty()`
+    // arriving DURING the `publishSnapshotIfWired` await is captured
+    // either as a freshly-armed timer (cleared + re-fired here) OR as a
+    // `dirtyFlushPending` latch (the in-fire finally calls
+    // `notifyProfileDirty()` again, which arms another timer). Without
+    // the loop, that re-armed timer would be silently cancelled by the
+    // post-drain `cancelDirtyFlushTimer()` — the exact pre-#454 hazard.
+    // Bound to a small number of iterations so a pathological re-arm
+    // storm doesn't hang shutdown; in practice 1-2 iterations is plenty
+    // since `dirtyFlushDebounceMs` is typically ≥ 25ms and shutdown is
+    // synchronous from the producer's POV.
+    const MAX_DRAIN_ITERATIONS = 4;
+    for (let i = 0; i < MAX_DRAIN_ITERATIONS; i++) {
+      try {
+        // Use publishSnapshotIfWired so the bookkeeping (timer cancel,
+        // dirtyFlushPromise tracking, latch consumption, typed error
+        // emit) is preserved. Concurrent notifyProfileDirty() calls
+        // during this await now latch into `dirtyFlushPending` instead
+        // of arming a fresh, unprotected timer.
+        await this.publishSnapshotIfWired();
+      } catch (err) {
+        this.log(
+          `Shutdown deferred-publish drain: publishSnapshotIfWired threw (best-effort, ignored): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+      // After fire: if no new signal landed (no armed timer, no latch),
+      // we're done. The most common case — 1 iteration covers everything.
+      if (this.dirtyFlushTimer === null && !this.dirtyFlushPending) {
+        return;
+      }
+      // A signal raced in during the await. The re-arm path in
+      // publishSnapshotIfWired's finally already called
+      // notifyProfileDirty() which armed a fresh timer; cancel it
+      // (we'll fire synchronously on the next iteration) and clear
+      // the latch so the next loop body fires our captured intent.
+      if (this.dirtyFlushTimer !== null) {
+        clearTimeout(this.dirtyFlushTimer);
+        this.dirtyFlushTimer = null;
+      }
+      this.dirtyFlushPending = false;
     }
+    // Best-effort budget exhausted — log for triage. The persistent
+    // SIGKILL recovery marker (finding #2) will catch any owed publish
+    // on the next process boot.
+    this.log(
+      'Shutdown deferred-publish drain: max iterations reached; ' +
+        'further re-arms (if any) deferred to next-boot recovery.',
+    );
   }
 
   /**
@@ -1203,11 +1343,21 @@ export class ProfileTokenStorageProvider
    * the local OrbitDB log and can be loaded by the next process boot.
    *
    * The aggregator publish is deferred:
-   *   - `pendingPublishCid` is set so the next pointer-poll tick (or
-   *     graceful shutdown's `awaitRemoteDurability`) retries the publish;
    *   - `notifyProfileDirty()` is called so the dirty-flush debouncer
    *     coalesces multiple per-receive local flushes into a single
-   *     deferred publish.
+   *     deferred publish (the debouncer fires `publishSnapshotIfWired`
+   *     which is also the entry point used by the shutdown drain).
+   *   - A persistent boolean recovery marker
+   *     (`pendingDeferredPublishMarker`, issue #454 finding #2) is
+   *     stamped to local cache so a SIGKILL during the debounce window
+   *     triggers a recovery publish on the next process boot. Note that
+   *     `pendingPublishCid` is NOT set on this path: that field holds
+   *     SNAPSHOT CIDs and the local-only flush only pinned a BUNDLE CID.
+   *
+   * Issue #454 finding #4 — the background HEAD-verify leg is also
+   * skipped under `skipPublish=true` (it would otherwise reintroduce
+   * exactly the propagation-coupling #444 set out to break). The verify
+   * leg runs on the deferred-publish dispatch instead.
    *
    * PaymentsModule's at-least-once Nostr cursor gate (`handleIncomingTransfer`)
    * uses THIS method so the cursor advances on local commit, decoupled
@@ -3231,6 +3381,119 @@ export class ProfileTokenStorageProvider
         }`,
       );
     }
+  }
+
+  /**
+   * Issue #454 finding #2 — per-address storage key for the deferred-
+   * publish recovery marker. Mirrors the per-address scoping of
+   * `pendingPublishCid` so each derived address has its own marker.
+   */
+  private getPendingDeferredPublishMarkerKey(): string | null {
+    const addr = this.getAddressId();
+    return `${STORAGE_KEYS_GLOBAL.PROFILE_PENDING_DEFERRED_PUBLISH}_${addr}`;
+  }
+
+  /**
+   * Issue #454 finding #2 — persist the deferred-publish marker. Called
+   * from the host's `setPendingDeferredPublishMarker` setter (fire-and-
+   * forget). Same best-effort semantics as `persistPendingPublishCid`:
+   * an unwritten marker means the next process boot won't auto-publish,
+   * which silently regresses to the pre-#454 behavior. Acceptable for
+   * a SIGKILL-during-IndexedDB-write degenerate case; the next save-
+   * driven flush still re-derives the need to publish via the
+   * baseline-staleness check.
+   */
+  private async persistPendingDeferredPublishMarker(set: boolean): Promise<void> {
+    if (!this.localCache) return;
+    const key = this.getPendingDeferredPublishMarkerKey();
+    if (!key) return;
+    if (set) {
+      await this.localCache.set(key, '1');
+    } else {
+      await this.localCache.remove(key);
+    }
+  }
+
+  /**
+   * Issue #454 finding #2 — restore the deferred-publish marker on
+   * initialize. The flag is consumed by
+   * {@link triggerDeferredPublishRecoveryIfMarked} after lifecycle wires
+   * up the snapshot publisher. The restore step itself is a no-op if
+   * the marker was never set or was cleared cleanly on graceful shutdown.
+   */
+  private async restorePendingDeferredPublishMarkerFromCache(): Promise<void> {
+    if (!this.localCache) return;
+    const key = this.getPendingDeferredPublishMarkerKey();
+    if (!key) return;
+    try {
+      const raw = await this.localCache.get(key);
+      if (raw === '1') {
+        this.pendingDeferredPublishMarker = true;
+        this.log(
+          'Restored deferred-publish marker from cache — a SIGKILL-during-' +
+            'debounce-window scenario is suspected; will trigger publish on ' +
+            'init completion.',
+        );
+      }
+    } catch (err) {
+      this.log(
+        `restorePendingDeferredPublishMarkerFromCache failed (best-effort): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * Issue #454 finding #2 — if the restored marker indicates a deferred
+   * publish was owed at the time of the previous process exit, schedule
+   * a best-effort `publishSnapshotIfWired()` to land the pointer update.
+   * Run asynchronously (fire-and-forget) so it does not block
+   * `initialize()` — the at-least-once gate on subsequent receives
+   * already handles cursor advancement; this is a liveness optimization
+   * for COLD-IMPORT discovery (matching the rest of the deferred-publish
+   * path).
+   *
+   * Clears the marker on success. Leaves it set on failure so the next
+   * boot retries. A successful save-driven full flush (via the
+   * `setPendingDeferredPublishMarker(false)` call from `__flushToIpfsBody`)
+   * also clears the marker, covering the case where the wallet resumes
+   * normal activity before this best-effort recovery fires.
+   */
+  private triggerDeferredPublishRecoveryIfMarked(): void {
+    if (!this.pendingDeferredPublishMarker) return;
+    if (this.isShuttingDown || this.hasShutdown) return;
+    const callback = this.options?.onProfileDirtyFlush;
+    if (typeof callback !== 'function') {
+      // No publisher wired — nothing to do. Marker will be re-driven
+      // by the dirty-flush debouncer on the next save (or stay set
+      // until publisher is wired by a future boot).
+      return;
+    }
+    // Fire-and-forget: lifecycle initialize must not block on this
+    // best-effort recovery.
+    void (async () => {
+      try {
+        const result = await this.publishSnapshotIfWired();
+        // Only clear the marker when the publisher returned a definite
+        // success. Transient failures (replica lag) and structural-skip
+        // cases keep the marker live so the next boot retries.
+        if (result && result.ok) {
+          this.pendingDeferredPublishMarker = false;
+          await this.persistPendingDeferredPublishMarker(false);
+          this.log(
+            'Deferred-publish recovery succeeded — pointer anchored; ' +
+              'marker cleared.',
+          );
+        }
+      } catch (err) {
+        this.log(
+          `Deferred-publish recovery threw (best-effort, marker kept): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    })();
   }
 
   // ---------------------------------------------------------------------------

@@ -1565,7 +1565,28 @@ export class FlushScheduler {
         // shutdown which fires `publishSnapshotIfWired()` synchronously
         // before tearing down, so a graceful CLI exit before the
         // debounce window publishes the deferred snapshot.
+        //
+        // Issue #454 finding #2 — for SIGKILL (or hard crash) during
+        // the debounce window we additionally stamp a persistent
+        // boolean recovery marker via `setPendingDeferredPublishMarker`.
+        // The next process boot observes the marker and drives a
+        // deferred `publishSnapshotIfWired()` so the aggregator pointer
+        // is anchored without waiting for the next save-side flush.
+        // The marker is sibling to `pendingPublishCid`: we cannot
+        // re-use that field because it stores SNAPSHOT CIDs and the
+        // bundle CID we have here is the wrong shape. Cleared on a
+        // successful publish (debounce-fire OR shutdown drain OR a
+        // subsequent full save-side flush below).
+        this.host.setPendingDeferredPublishMarker(true);
         this.host.notifyProfileDirty();
+      }
+
+      // Issue #454 finding #2 — a successful full-flush (skipPublish=false)
+      // republishes the current head, so any stale skipPublish marker
+      // from a prior local-only flush is now subsumed. Clear it so
+      // a future boot doesn't trigger a redundant best-effort publish.
+      if (!options?.skipPublish && this.host.getPendingDeferredPublishMarker()) {
+        this.host.setPendingDeferredPublishMarker(false);
       }
 
       this.host.emitEvent({
@@ -1661,10 +1682,21 @@ export class FlushScheduler {
       const verifyDeadlineMs =
         this.host.options?.flushVerificationDeadlineMs ?? 0;
       const pointerWired = this.host.options?.getPointerLayer?.() ?? null;
+      // Issue #454 finding #4 — skip the background HEAD-verify leg on
+      // the Issue #444 `skipPublish` (local-only) flush path. The whole
+      // point of #444 was to decouple the per-receive at-least-once gate
+      // from cross-device propagation latency: spawning N background
+      // verify tasks (one per local-only flush) racing the dirty-flush
+      // debouncer reintroduces exactly the propagation-coupling we set
+      // out to break. The verify leg correctly fires on the next
+      // dirty-flush dispatch (which publishes a snapshot and runs its
+      // own verification path via the publisher's verifyFlushDurability
+      // round-trip), so we lose no durability assurance here.
       const shouldVerify =
         verifyDeadlineMs > 0 &&
         !this.host.getIsShuttingDown() &&
-        pointerWired !== null;
+        pointerWired !== null &&
+        !options?.skipPublish;
       if (shouldVerify) {
         // Snapshot CID is set on host by the successful publish path
         // (`LifecycleManager.publishAggregatorPointerBestEffort` →

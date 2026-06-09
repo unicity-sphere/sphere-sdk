@@ -16175,13 +16175,18 @@ export class PaymentsModule {
       // Issue #444 — prefer the local-only flush primitive when the
       // provider supports it. Falls back to legacy full flush when
       // absent (the two are equivalent on local-only providers).
-      const flusher = (
-        typeof (provider as { awaitNextLocalFlush?: (ms?: number) => Promise<void> })
-          .awaitNextLocalFlush === 'function'
-          ? (provider as { awaitNextLocalFlush: (ms?: number) => Promise<void> })
-              .awaitNextLocalFlush
-          : provider.awaitNextFlush
-      ) as ((ms?: number) => Promise<void>) | undefined;
+      //
+      // Issue #454 finding #9 — use the typed optional declarations on
+      // the TokenStorageProvider interface (`awaitNextLocalFlush?` and
+      // `awaitNextFlush?`) instead of a structural-name cast. The cast
+      // let any provider exposing a method NAME silently win — even a
+      // no-op stub that mocks `awaitNextLocalFlush` would advance the
+      // Nostr cursor without actually persisting anything, defeating the
+      // at-least-once invariant. The typed access narrows to the
+      // declared `(timeoutMs?: number) => Promise<void>` contract so
+      // misshaped providers fail at compile time rather than silently
+      // breaking the gate at runtime.
+      const flusher = provider.awaitNextLocalFlush ?? provider.awaitNextFlush;
       if (typeof flusher !== 'function') continue;
       const __t0 = Date.now();
       try {
