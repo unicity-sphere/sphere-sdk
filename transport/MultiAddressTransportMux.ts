@@ -811,6 +811,17 @@ export class MultiAddressTransportMux {
       await this.handleEvent(event);
     }
 
+    // Issue #464 — flush any drain promises tracked by adapters during this
+    // call. `dispatch*` already awaits handler completion for events
+    // delivered through `handleEvent`, but if a late handler registration
+    // occurred concurrently (its drain runs as a tracked async IIFE),
+    // we must also wait for that drain to settle before returning so
+    // the caller's next `load()` / state read sees a consistent view.
+    for (const entry of this.addresses.values()) {
+      try { await entry.adapter.flushPendingDrains(); }
+      catch (e) { logger.debug('Mux', 'flushPendingDrains error:', e); }
+    }
+
     logger.debug('Mux', `fetchPendingEvents: processed ${events.length} events`);
   }
 
@@ -1196,7 +1207,8 @@ export class MultiAddressTransportMux {
                 encrypted: true,
                 isSelfWrap: true,
               };
-              entry.adapter.dispatchMessage(message);
+              // Issue #464 — await dispatch so handler durability propagates.
+              await entry.adapter.dispatchMessage(message);
               return;
             }
           } catch {
@@ -1214,7 +1226,7 @@ export class MultiAddressTransportMux {
               messageEventId: pm.replyToEventId,
               timestamp: pm.timestamp * 1000,
             };
-            entry.adapter.dispatchReadReceipt(receipt);
+            await entry.adapter.dispatchReadReceipt(receipt);
           }
           return;
         }
@@ -1228,7 +1240,7 @@ export class MultiAddressTransportMux {
             senderNametag = parsed.senderNametag || undefined;
             expiresIn = parsed.expiresIn ?? 30000;
           } catch { /* defaults */ }
-          entry.adapter.dispatchComposingIndicator({
+          await entry.adapter.dispatchComposingIndicator({
             senderPubkey: pm.senderPubkey,
             senderNametag,
             expiresIn,
@@ -1245,7 +1257,7 @@ export class MultiAddressTransportMux {
               messageEventId: parsed.messageEventId,
               timestamp: pm.timestamp * 1000,
             };
-            entry.adapter.dispatchReadReceipt(receipt);
+            await entry.adapter.dispatchReadReceipt(receipt);
             return;
           }
           if (parsed?.type === 'typing') {
@@ -1254,11 +1266,11 @@ export class MultiAddressTransportMux {
               senderNametag: parsed.senderNametag,
               timestamp: pm.timestamp * 1000,
             };
-            entry.adapter.dispatchTypingIndicator(indicator);
+            await entry.adapter.dispatchTypingIndicator(indicator);
             return;
           }
           if (parsed?.senderNametag !== undefined && parsed?.expiresIn !== undefined && !parsed?.text) {
-            entry.adapter.dispatchComposingIndicator({
+            await entry.adapter.dispatchComposingIndicator({
               senderPubkey: pm.senderPubkey,
               senderNametag: parsed.senderNametag || undefined,
               expiresIn: parsed.expiresIn ?? 30000,
@@ -1289,7 +1301,7 @@ export class MultiAddressTransportMux {
           encrypted: true,
         };
 
-        entry.adapter.dispatchMessage(message);
+        await entry.adapter.dispatchMessage(message);
         return; // Successfully routed, stop trying other addresses
       } catch {
         // Decryption failed for this address — try next
@@ -1340,7 +1352,13 @@ export class MultiAddressTransportMux {
         timestamp: event.created_at * 1000,
       };
 
-      entry.adapter.dispatchTokenTransfer(transfer);
+      // Issue #464 — await dispatch so handler durability propagates upstream.
+      // The async handler (`PaymentsModule.handleIncomingTransfer`) must
+      // complete its storage write before `dispatchWalletEvent` returns,
+      // otherwise `fetchPendingEvents` resolves mid-write and the caller's
+      // next `load()` reads stale storage. Single-coin faucet flakiness
+      // (#455 → #464 root-cause) lived in this gap.
+      await entry.adapter.dispatchTokenTransfer(transfer);
     } catch (err) {
       logger.debug('Mux', `Token transfer decrypt failed for address ${entry.index}:`, (err as Error)?.message?.slice(0, 50));
     }
@@ -1365,7 +1383,8 @@ export class MultiAddressTransportMux {
         timestamp: event.created_at * 1000,
       };
 
-      entry.adapter.dispatchPaymentRequest(request);
+      // Issue #464 — await dispatch (see dispatchTokenTransfer above).
+      await entry.adapter.dispatchPaymentRequest(request);
     } catch (err) {
       logger.debug('Mux', `Payment request decrypt failed for address ${entry.index}:`, (err as Error)?.message?.slice(0, 50));
     }
@@ -1388,7 +1407,8 @@ export class MultiAddressTransportMux {
         timestamp: event.created_at * 1000,
       };
 
-      entry.adapter.dispatchPaymentRequestResponse(response);
+      // Issue #464 — await dispatch (see dispatchTokenTransfer above).
+      await entry.adapter.dispatchPaymentRequestResponse(response);
     } catch (err) {
       logger.debug('Mux', `Payment response decrypt failed for address ${entry.index}:`, (err as Error)?.message?.slice(0, 50));
     }
@@ -1929,6 +1949,19 @@ export class AddressTransportAdapter implements TransportProvider {
   private pendingPaymentRequestResponses: IncomingPaymentRequestResponse[] = [];
   private chatEoseHandlers: Array<() => void> = [];
 
+  // Issue #464 — drain promise tracker. When `onTokenTransfer` (or sibling
+  // `on*` registrations) drains its pending buffer, it does so via an async
+  // handler. Pre-#464 the drain iterated synchronously and dropped the
+  // returned Promise — a future `dispatchTokenTransfer` or
+  // `fetchPendingEvents` could resolve while drained-event writes were
+  // still in flight. We track every drain as a Promise here so that any
+  // ordering-sensitive caller (in particular `dispatchTokenTransfer` and
+  // the mux's `fetchPendingEvents`) can `await flushPendingDrains()`
+  // before observing storage state. `Promise.allSettled` keeps fault
+  // isolation across handlers and across drains. Completed drains are
+  // pruned lazily inside `flushPendingDrains`.
+  private inFlightDrains: Set<Promise<unknown>> = new Set();
+
   constructor(
     mux: MultiAddressTransportMux,
     addressIndex: number,
@@ -2080,16 +2113,53 @@ export class AddressTransportAdapter implements TransportProvider {
   // ===========================================================================
   // Subscription handlers — per-address
   // ===========================================================================
+  //
+  // Issue #464 — drain path. The `on*(handler)` registration returns the
+  // unsubscribe function synchronously (legacy contract), but the actual
+  // drain of any buffered events runs asynchronously and is tracked in
+  // `inFlightDrains`. `flushPendingDrains()` / `dispatchTokenTransfer`
+  // (and siblings) await those tracked promises before observing storage
+  // state, so a caller that does `onTokenTransfer(h); await flushPendingDrains()`
+  // sees the drain settled.
+  //
+  // The drain buffer is snapshotted and cleared atomically before the
+  // async fan-out — events arriving during the drain take the live
+  // dispatch path (`transferHandlers.size > 0` is true now) and won't
+  // double-buffer.
+
+  /**
+   * Track an async drain so ordering-sensitive callers can await it.
+   * Auto-removes itself on settle.
+   */
+  private trackDrain(p: Promise<unknown>): void {
+    this.inFlightDrains.add(p);
+    p.finally(() => { this.inFlightDrains.delete(p); }).catch(() => { /* tracked */ });
+  }
+
+  /**
+   * Await all in-flight drains for this adapter. Used by the mux's
+   * `fetchPendingEvents` to guarantee that a `receive()` call sees the
+   * effects of any drain triggered by handler registration during init.
+   */
+  async flushPendingDrains(): Promise<void> {
+    if (this.inFlightDrains.size === 0) return;
+    // Snapshot — new drains added during settle won't block this call.
+    const snapshot = Array.from(this.inFlightDrains);
+    await Promise.allSettled(snapshot);
+  }
 
   onMessage(handler: MessageHandler): () => void {
     this.messageHandlers.add(handler);
-    // Flush pending
+    // Flush pending — async drain tracked for `flushPendingDrains`.
     if (this.pendingMessages.length > 0) {
       const pending = this.pendingMessages;
       this.pendingMessages = [];
-      for (const msg of pending) {
-        try { handler(msg); } catch { /* ignore */ }
-      }
+      this.trackDrain((async () => {
+        for (const msg of pending) {
+          try { await handler(msg); }
+          catch (e) { logger.debug('MuxAdapter', 'Pending message drain error:', e); }
+        }
+      })());
     }
     return () => this.messageHandlers.delete(handler);
   }
@@ -2097,12 +2167,16 @@ export class AddressTransportAdapter implements TransportProvider {
   onTokenTransfer(handler: TokenTransferHandler): () => void {
     this.transferHandlers.add(handler);
     // Issue #223 — drain pending transfers queued before any handler existed.
+    // Issue #464 — drain is async-aware and tracked via `inFlightDrains`.
     if (this.pendingTransfers.length > 0) {
       const pending = this.pendingTransfers;
       this.pendingTransfers = [];
-      for (const transfer of pending) {
-        try { handler(transfer); } catch (e) { logger.debug('MuxAdapter', 'Pending transfer drain error:', e); }
-      }
+      this.trackDrain((async () => {
+        for (const transfer of pending) {
+          try { await handler(transfer); }
+          catch (e) { logger.debug('MuxAdapter', 'Pending transfer drain error:', e); }
+        }
+      })());
     }
     return () => this.transferHandlers.delete(handler);
   }
@@ -2113,9 +2187,12 @@ export class AddressTransportAdapter implements TransportProvider {
     if (this.pendingPaymentRequests.length > 0) {
       const pending = this.pendingPaymentRequests;
       this.pendingPaymentRequests = [];
-      for (const request of pending) {
-        try { handler(request); } catch (e) { logger.debug('MuxAdapter', 'Pending payment request drain error:', e); }
-      }
+      this.trackDrain((async () => {
+        for (const request of pending) {
+          try { await handler(request); }
+          catch (e) { logger.debug('MuxAdapter', 'Pending payment request drain error:', e); }
+        }
+      })());
     }
     return () => this.paymentRequestHandlers.delete(handler);
   }
@@ -2126,9 +2203,12 @@ export class AddressTransportAdapter implements TransportProvider {
     if (this.pendingPaymentRequestResponses.length > 0) {
       const pending = this.pendingPaymentRequestResponses;
       this.pendingPaymentRequestResponses = [];
-      for (const response of pending) {
-        try { handler(response); } catch (e) { logger.debug('MuxAdapter', 'Pending payment response drain error:', e); }
-      }
+      this.trackDrain((async () => {
+        for (const response of pending) {
+          try { await handler(response); }
+          catch (e) { logger.debug('MuxAdapter', 'Pending payment response drain error:', e); }
+        }
+      })());
     }
     return () => this.paymentRequestResponseHandlers.delete(handler);
   }
@@ -2272,18 +2352,48 @@ export class AddressTransportAdapter implements TransportProvider {
   // ===========================================================================
   // Dispatch methods — called by MultiAddressTransportMux to route events
   // ===========================================================================
+  //
+  // Issue #464 — dispatch contract MUST propagate handler durability.
+  //
+  // PaymentsModule.handleIncomingTransfer is async; before #464 the
+  // dispatcher iterated handlers synchronously (`handler(transfer);`),
+  // discarded the returned Promise, and returned. The synchronous
+  // `try/catch` only caught synchronous throws — async rejections silently
+  // resolved into unhandled-rejection territory. Worse, the caller of
+  // `dispatchTokenTransfer` (in particular `fetchPendingEvents` via
+  // `handleTokenTransfer`) saw the dispatch return immediately and
+  // happily resolved its outer Promise BEFORE the handler had finished
+  // writing the token to storage. The next caller step (typically
+  // `PaymentsModule.load()`) then raced against an in-flight `addToken`
+  // and roughly half the time observed empty storage.
+  //
+  // Fix: every dispatch method is now `async` and uses `Promise.allSettled`
+  // to await every handler invocation before resolving. The
+  // `allSettled` (not `Promise.all`) choice preserves the per-handler
+  // fault-isolation guarantee — a rejection in one handler must not
+  // prevent the remaining handlers from running. Sync handlers (e.g.
+  // `MessageHandler` returns `void`) `await` to a no-op via microtask;
+  // the per-dispatch cost is one microtask which is negligible relative
+  // to the handler workload.
+  //
+  // Upstream call sites (`handleTokenTransfer`, `handlePaymentRequest`,
+  // gift-wrap path) MUST `await` the dispatch — see those methods
+  // above for the awaited calls.
 
-  dispatchMessage(message: IncomingMessage): void {
+  async dispatchMessage(message: IncomingMessage): Promise<void> {
     if (this.messageHandlers.size === 0) {
       this.pendingMessages.push(message);
       return;
     }
-    for (const handler of this.messageHandlers) {
-      try { handler(message); } catch (e) { logger.debug('MuxAdapter', 'Message handler error:', e); }
-    }
+    await Promise.allSettled(
+      Array.from(this.messageHandlers).map(async (h) => {
+        try { await h(message); }
+        catch (e) { logger.debug('MuxAdapter', 'Message handler error:', e); }
+      }),
+    );
   }
 
-  dispatchTokenTransfer(transfer: IncomingTokenTransfer): void {
+  async dispatchTokenTransfer(transfer: IncomingTokenTransfer): Promise<void> {
     // Issue #223 — queue if no handler is registered yet. The relay can push
     // events between mux.addAddress (which subscribes) and PaymentsModule.
     // initialize (which calls onTokenTransfer); without the queue this fires
@@ -2293,54 +2403,78 @@ export class AddressTransportAdapter implements TransportProvider {
       this.pendingTransfers.push(transfer);
       return;
     }
-    for (const handler of this.transferHandlers) {
-      try { handler(transfer); } catch (e) { logger.debug('MuxAdapter', 'Transfer handler error:', e); }
-    }
+    // Issue #464 — the CRITICAL site. PaymentsModule.handleIncomingTransfer
+    // is `async`; awaiting here closes the gap between `fetchPendingEvents`
+    // resolving and the handler's storage write completing.
+    await Promise.allSettled(
+      Array.from(this.transferHandlers).map(async (h) => {
+        try { await h(transfer); }
+        catch (e) { logger.debug('MuxAdapter', 'Transfer handler error:', e); }
+      }),
+    );
   }
 
-  dispatchPaymentRequest(request: IncomingPaymentRequest): void {
+  async dispatchPaymentRequest(request: IncomingPaymentRequest): Promise<void> {
     if (this.paymentRequestHandlers.size === 0) {
       this.pendingPaymentRequests.push(request);
       return;
     }
-    for (const handler of this.paymentRequestHandlers) {
-      try { handler(request); } catch (e) { logger.debug('MuxAdapter', 'Payment request handler error:', e); }
-    }
+    await Promise.allSettled(
+      Array.from(this.paymentRequestHandlers).map(async (h) => {
+        try { await h(request); }
+        catch (e) { logger.debug('MuxAdapter', 'Payment request handler error:', e); }
+      }),
+    );
   }
 
-  dispatchPaymentRequestResponse(response: IncomingPaymentRequestResponse): void {
+  async dispatchPaymentRequestResponse(response: IncomingPaymentRequestResponse): Promise<void> {
     if (this.paymentRequestResponseHandlers.size === 0) {
       this.pendingPaymentRequestResponses.push(response);
       return;
     }
-    for (const handler of this.paymentRequestResponseHandlers) {
-      try { handler(response); } catch (e) { logger.debug('MuxAdapter', 'Payment response handler error:', e); }
-    }
+    await Promise.allSettled(
+      Array.from(this.paymentRequestResponseHandlers).map(async (h) => {
+        try { await h(response); }
+        catch (e) { logger.debug('MuxAdapter', 'Payment response handler error:', e); }
+      }),
+    );
   }
 
-  dispatchReadReceipt(receipt: IncomingReadReceipt): void {
-    for (const handler of this.readReceiptHandlers) {
-      try { handler(receipt); } catch (e) { logger.debug('MuxAdapter', 'Read receipt handler error:', e); }
-    }
+  async dispatchReadReceipt(receipt: IncomingReadReceipt): Promise<void> {
+    await Promise.allSettled(
+      Array.from(this.readReceiptHandlers).map(async (h) => {
+        try { await h(receipt); }
+        catch (e) { logger.debug('MuxAdapter', 'Read receipt handler error:', e); }
+      }),
+    );
   }
 
-  dispatchTypingIndicator(indicator: IncomingTypingIndicator): void {
-    for (const handler of this.typingIndicatorHandlers) {
-      try { handler(indicator); } catch (e) { logger.debug('MuxAdapter', 'Typing handler error:', e); }
-    }
+  async dispatchTypingIndicator(indicator: IncomingTypingIndicator): Promise<void> {
+    await Promise.allSettled(
+      Array.from(this.typingIndicatorHandlers).map(async (h) => {
+        try { await h(indicator); }
+        catch (e) { logger.debug('MuxAdapter', 'Typing handler error:', e); }
+      }),
+    );
   }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  dispatchComposingIndicator(indicator: any): void {
-    for (const handler of this.composingHandlers) {
-      try { handler(indicator); } catch (e) { logger.debug('MuxAdapter', 'Composing handler error:', e); }
-    }
+  async dispatchComposingIndicator(indicator: any): Promise<void> {
+    await Promise.allSettled(
+      Array.from(this.composingHandlers).map(async (h) => {
+        try { await h(indicator); }
+        catch (e) { logger.debug('MuxAdapter', 'Composing handler error:', e); }
+      }),
+    );
   }
 
-  dispatchInstantSplitBundle(bundle: IncomingInstantSplitBundle): void {
-    for (const handler of this.instantSplitBundleHandlers) {
-      try { handler(bundle); } catch (e) { logger.debug('MuxAdapter', 'Instant split handler error:', e); }
-    }
+  async dispatchInstantSplitBundle(bundle: IncomingInstantSplitBundle): Promise<void> {
+    await Promise.allSettled(
+      Array.from(this.instantSplitBundleHandlers).map(async (h) => {
+        try { await h(bundle); }
+        catch (e) { logger.debug('MuxAdapter', 'Instant split handler error:', e); }
+      }),
+    );
   }
 
   emitTransportEvent(event: TransportEvent): void {
