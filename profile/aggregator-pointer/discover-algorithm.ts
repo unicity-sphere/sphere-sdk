@@ -354,9 +354,31 @@ async function findLatestValidVersionInner(
       // the throw below propagates immediately but a probe that's
       // mid-RPC continues to the wire and consumes resources.
       armDeadlineAbort();
+      // Issue #450 diagnostic fix: distinguish "deadline already past
+      // at start" from "deadline expired during discovery". Previously
+      // the message always read "after Nms" where N was elapsed since
+      // the local start, even when the caller-supplied
+      // `discoveryDeadlineMs` was already in the past (in which case N
+      // is ≈0 and the message looks like an instant aggregator
+      // failure). The reconcile-algorithm's shared 5-minute budget
+      // (see reconcile-algorithm.ts:RECONCILE_WALL_CLOCK_BUDGET_MS)
+      // makes this scenario routine: when the initial discovery +
+      // publish exhaust the budget, the conflict rediscovery inherits
+      // an expired deadline and trips this check on its first probe.
+      // Without distinguishing the two cases, operators chasing
+      // pre-shutdown loops cannot tell whether the publish path is
+      // hitting a real aggregator stall or an exhausted retry budget.
+      const elapsed = Date.now() - discoveryStartMs;
+      const initialBudgetMs = discoveryDeadlineMs - discoveryStartMs;
+      const message =
+        initialBudgetMs <= 0
+          ? `Discovery deadline was already ${-initialBudgetMs}ms in the past at start ` +
+            `(discoveryDeadlineMs=${discoveryDeadlineMs}, discoveryStartMs=${discoveryStartMs}); ` +
+            `caller-supplied deadline had already expired before discovery began.`
+          : `Discovery exceeded wall-clock deadline after ${elapsed}ms (budget=${initialBudgetMs}ms).`;
       throw new AggregatorPointerError(
         AggregatorPointerErrorCode.RETRY_EXHAUSTED,
-        `Discovery exceeded wall-clock deadline after ${Date.now() - discoveryStartMs}ms.`,
+        message,
         { currentLocalVersion },
       );
     }

@@ -651,7 +651,38 @@ export type StorageEventType =
    * identifying data, but telemetry pipelines that forward these events
    * upstream SHOULD scrub or aggregate per their privacy policy.
    */
-  | 'storage:blocked-auto-cleared';
+  | 'storage:blocked-auto-cleared'
+  /**
+   * Issue #450 — emitted by `LifecycleManager.awaitPendingPublishCleared`
+   * when N consecutive iterations of the pre-shutdown retry loop have
+   * failed against the SAME `pendingPublishCid` with the SAME error
+   * code. Surfaces stable failure modes (e.g. contended-testnet
+   * aggregator + exhausted reconcile budget) so operators see the
+   * "stuck" signal instead of the loop spinning silently against the
+   * shutdown deadline while the daemon burns CPU.
+   *
+   * `data` carries:
+   *   - `cid: string`                     the pending publish CID that
+   *                                        could not be cleared.
+   *   - `consecutiveFailures: number`     count of identical-key
+   *                                        failures observed before
+   *                                        bailing.
+   *   - `lastError?: string`              the error code or message
+   *                                        observed on each failure
+   *                                        (same value across the run).
+   *   - `elapsedMs: number`               wall-clock ms spent in the
+   *                                        retry loop before bailing.
+   *   - `reason?: string`                 free-form context propagated
+   *                                        from `ShutdownOptions.reason`.
+   *
+   * Informational only — shutdown continues. The `pendingPublishCid`
+   * marker is preserved so the next process boot retries the publish
+   * via the cold-start recovery path. Distinct from
+   * `shutdown:verification-timeout` (deadline-exceeded), which still
+   * fires on this leg AFTER the stuck event so existing dashboards
+   * continue to receive the timeout signal as well.
+   */
+  | 'storage:pending-publish-stuck';
 
 export interface StorageEvent {
   type: StorageEventType;

@@ -159,6 +159,34 @@ const POINTER_READBACK_POLL_MS = 500;
 const PENDING_PUBLISH_RETRY_INTERVAL_MS = 1_000;
 
 /**
+ * Issue #450 — stuck-progress threshold for
+ * {@link LifecycleManager.awaitPendingPublishCleared}. When N
+ * consecutive iterations of the pre-shutdown retry loop observe the
+ * SAME `pendingPublishCid` + SAME error code, treat the failure as
+ * stable and bail rather than burn the rest of the shutdown deadline.
+ *
+ * Why this exists: under contended-testnet conditions, each retry can
+ * burn the reconcile algorithm's shared 5-minute wall-clock budget
+ * (see `reconcile-algorithm.ts:RECONCILE_WALL_CLOCK_BUDGET_MS`). In
+ * the §D.1 hang reported in issue #450, the loop spun for ~6 hours at
+ * ~150% CPU before SIGTERM rescued the host. Detecting that the
+ * failure is stable and giving up cleanly hands the work to the
+ * cold-start retry path on next boot (the `pendingPublishCid` marker
+ * is preserved across the bail).
+ *
+ * Threshold = 3 balances responsiveness against false positives:
+ *   - 1 single failure could be a transient blip.
+ *   - 2 still gives the underlying lag one chance to clear.
+ *   - 3 confirms the failure pattern is stable.
+ *
+ * Combined with `PENDING_PUBLISH_RETRY_INTERVAL_MS`, the worst-case
+ * loop runtime drops from "deadline" to roughly
+ * `3 × (per-attempt cost + sleep) ≈ 3 × (5 min budget + 1s)`,
+ * bounded by `awaitRemoteDurability`'s deadline regardless.
+ */
+const STUCK_PENDING_PUBLISH_THRESHOLD = 3;
+
+/**
  * Issue #239 — discriminated identifier for the durability leg that
  * tripped the shutdown deadline. Surfaced via the
  * `shutdown:verification-timeout` event so operators see which path
@@ -822,8 +850,17 @@ export class LifecycleManager {
     signal: AbortSignal,
     reason: string | undefined,
   ): Promise<void> {
+    const loopStartedAt = Date.now();
     let lastError: string | undefined;
     let lastCid: string | null = this.host.getPendingPublishCid();
+    // Issue #450 stuck-progress detection: track the most recent
+    // (cid, errorKey) tuple and how many CONSECUTIVE iterations have
+    // observed it. When the count crosses `STUCK_PENDING_PUBLISH_THRESHOLD`,
+    // emit `storage:pending-publish-stuck` and bail so cold-start
+    // recovery on next boot handles the publish via the preserved
+    // marker. See the constant's doc-comment for rationale.
+    let lastFailureKey: string | null = null;
+    let consecutiveSameFailures = 0;
 
     while (Date.now() < deadline && !signal.aborted) {
       const pending = this.host.getPendingPublishCid();
@@ -846,7 +883,64 @@ export class LifecycleManager {
         // so we re-check at the top of the next loop iteration.
         lastError = result.code ?? (result.transient ? 'TRANSIENT' : 'PERMANENT');
       } catch (err) {
-        lastError = err instanceof Error ? err.message : String(err);
+        // Issue #450 hardening: prefer a typed `.code` over the raw
+        // message so the stuck-detection failureKey stays stable
+        // iteration-over-iteration. Without this, a typed error whose
+        // message embeds a varying value (e.g. elapsed-ms) would
+        // produce a different key every loop and the counter would
+        // never reach the threshold. In practice
+        // `publishAggregatorPointerBestEffort` converts every internal
+        // throw to a structured result before returning, so the catch
+        // arm is currently dead code — this is defense-in-depth
+        // against future regressions that let a typed error escape.
+        const errCode =
+          err && typeof (err as { code?: unknown }).code === 'string'
+            ? (err as { code: string }).code
+            : undefined;
+        lastError = errCode ?? (err instanceof Error ? err.message : String(err));
+      }
+
+      // Issue #450: update the stuck-progress counter. Key combines
+      // CID and error so a NEW pending CID or DIFFERENT failure code
+      // resets the counter (we only bail on STABLE failure patterns).
+      const failureKey = `${pending}|${lastError ?? 'unknown'}`;
+      if (failureKey === lastFailureKey) {
+        consecutiveSameFailures += 1;
+      } else {
+        consecutiveSameFailures = 1;
+        lastFailureKey = failureKey;
+      }
+      if (consecutiveSameFailures >= STUCK_PENDING_PUBLISH_THRESHOLD) {
+        const elapsedMs = Date.now() - loopStartedAt;
+        this.host.log(
+          `Shutdown durability: pending-publish appears stuck for ` +
+            `cid=${pending} after ${consecutiveSameFailures} consecutive ` +
+            `identical failures (lastError=${lastError ?? 'unknown'}, ` +
+            `elapsedMs=${elapsedMs}). Bailing — cold-start retry on ` +
+            `next boot will handle via preserved pendingPublishCid marker.`,
+        );
+        this.host.emitEvent({
+          type: 'storage:pending-publish-stuck',
+          timestamp: Date.now(),
+          data: {
+            cid: pending,
+            consecutiveFailures: consecutiveSameFailures,
+            lastError,
+            elapsedMs,
+            reason,
+          },
+          code: lastError,
+        });
+        // Also surface the existing verification-timeout signal so
+        // operator dashboards routing on `shutdown:verification-timeout`
+        // continue to receive this leg's terminal outcome.
+        this.emitVerificationTimeout({
+          leg: 'pending-publish-retry',
+          cidsInQuestion: [pending],
+          lastError,
+          reason,
+        });
+        return;
       }
 
       if (signal.aborted || Date.now() >= deadline) break;
