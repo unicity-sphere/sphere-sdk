@@ -214,3 +214,86 @@ describe('computeProbeFingerprint', () => {
     expect(fp1).not.toBe(fp2);
   });
 });
+
+// Issue #450 — Discovery deadline diagnostic. Previously the
+// RETRY_EXHAUSTED message always read "after Nms" where N was elapsed
+// since the locally-captured `discoveryStartMs`. When the caller (e.g.
+// reconcile-algorithm sharing a single 5-min budget across initial
+// discovery + conflict rediscovery) supplied a `discoveryDeadlineMs`
+// that was ALREADY in the past, N was ≈0 and the message read
+// "after 0ms" — which looked like an instant aggregator failure
+// instead of an exhausted retry budget. The fix distinguishes the
+// two cases in the message.
+describe('findLatestValidVersion — deadline diagnostic (#450)', () => {
+  it('reports "deadline already past at start" when caller-supplied deadline has already expired', async () => {
+    const { keyMaterial, signer } = await buildFixtures();
+    const trustBase = fakeTrustBase();
+    const pastDeadline = Date.now() - 1234;
+    let caught: unknown = undefined;
+    try {
+      await findLatestValidVersion({
+        currentLocalVersion: 0,
+        keyMaterial,
+        signer,
+        aggregatorClient: allNotIncludedClient(),
+        trustBase,
+        decodeCid: okDecoder,
+        fetchCar: validFetcher,
+        discoveryDeadlineMs: pastDeadline,
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeDefined();
+    expect((caught as { code?: string }).code).toBe(
+      AggregatorPointerErrorCode.RETRY_EXHAUSTED,
+    );
+    const msg = (caught as { message: string }).message;
+    expect(msg).toMatch(/already .*ms in the past at start/);
+    expect(msg).toMatch(/caller-supplied deadline had already expired/);
+    expect(msg).toContain(String(pastDeadline));
+  });
+
+  it('reports "exceeded wall-clock deadline after Nms (budget=Bms)" when deadline expires mid-discovery', async () => {
+    const { keyMaterial, signer } = await buildFixtures();
+    const trustBase = fakeTrustBase();
+    // Caller supplies a positive-budget deadline. We force expiry by
+    // pinning the deadline 5ms into the future and then having the
+    // mock client sleep past it before responding to the first probe.
+    const initialBudgetMs = 5;
+    const start = Date.now();
+    const slowClient: AggregatorClient = {
+      getInclusionProof: vi.fn(async () => {
+        await new Promise((r) => setTimeout(r, initialBudgetMs + 25));
+        return new InclusionProofResponse(
+          fakeProof(InclusionProofVerificationStatus.PATH_NOT_INCLUDED),
+        );
+      }),
+    } as unknown as AggregatorClient;
+    let caught: unknown = undefined;
+    try {
+      await findLatestValidVersion({
+        currentLocalVersion: 0,
+        keyMaterial,
+        signer,
+        aggregatorClient: slowClient,
+        trustBase,
+        decodeCid: okDecoder,
+        fetchCar: validFetcher,
+        discoveryDeadlineMs: start + initialBudgetMs,
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeDefined();
+    expect((caught as { code?: string }).code).toBe(
+      AggregatorPointerErrorCode.RETRY_EXHAUSTED,
+    );
+    const msg = (caught as { message: string }).message;
+    // The "elapsed positive-budget" branch — distinct from the
+    // "already past at start" branch above.
+    expect(msg).toMatch(/exceeded wall-clock deadline after \d+ms/);
+    expect(msg).toMatch(/budget=\d+ms/);
+    expect(msg).not.toMatch(/already .*ms in the past at start/);
+  });
+});
