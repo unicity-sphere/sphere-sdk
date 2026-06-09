@@ -163,7 +163,16 @@ describe('ProfileTokenStorageProvider — notifyProfileDirty debounce', () => {
     expect(errors[0]?.code).toBe('PROFILE_DIRTY_FLUSH_FAILED');
   });
 
-  it('shutdown cancels armed timers — pending signal never fires', async () => {
+  it('shutdown DRAINS armed timer — pending signal fires synchronously before teardown (#444)', async () => {
+    // Issue #444 — pre-#444 semantics: shutdown CANCELLED the armed
+    // dirty-flush timer, so a deferred publish from a recent
+    // `awaitNextLocalFlush` was lost on graceful exit (silent staleness
+    // of the aggregator pointer until next process boot).
+    //
+    // Post-#444 semantics: shutdown DRAINS the armed timer — fires the
+    // callback once synchronously so the deferred publish lands before
+    // teardown. This is THE publish that anchors every local-only
+    // TOKEN_TRANSFER ack accrued during the CLI lifetime.
     const onProfileDirtyFlush = vi.fn(async () => {});
     const { provider, fire } = buildProvider({
       onProfileDirtyFlush,
@@ -172,14 +181,16 @@ describe('ProfileTokenStorageProvider — notifyProfileDirty debounce', () => {
     fire();
     // Switch to real timers for the await provider.shutdown() — shutdown
     // chains promises, not timers, so fake-timer fakery would deadlock.
-    // The cancelDirtyFlushTimer path uses clearTimeout on the fake
-    // timer that's still pending.
     vi.useRealTimers();
     await provider.shutdown();
-    // Re-enable fake timers, advance past the cancelled debounce.
+    // Callback fired ONCE during the shutdown drain (not via the
+    // cancelled debounce timer).
+    expect(onProfileDirtyFlush).toHaveBeenCalledTimes(1);
+    // Re-enable fake timers, advance past the original debounce window
+    // to verify the cancelled timer does NOT also fire (no double-call).
     vi.useFakeTimers();
     await vi.advanceTimersByTimeAsync(1000);
-    expect(onProfileDirtyFlush).not.toHaveBeenCalled();
+    expect(onProfileDirtyFlush).toHaveBeenCalledTimes(1);
   });
 
   it('shutdown waits for an in-flight dirty flush', async () => {

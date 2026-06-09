@@ -535,9 +535,28 @@ export class FlushScheduler {
     return this.startSerializedFlushInternal('save', /* propagateError */ true);
   }
 
+  /**
+   * Issue #444 — local-only counterpart to {@link forceFlushSerialized}.
+   *
+   * Composes into the same serialized flush chain, but the underlying
+   * `flushToIpfs` call passes `{ skipPublish: true }`: the bundle CAR
+   * is pinned + the OrbitDB bundle ref is written synchronously, but
+   * the aggregator pointer publish (and per-flush remote-durability
+   * verification) is deferred to the dirty-flush debounce / periodic
+   * pointer-poll / shutdown drain.
+   */
+  forceFlushSerializedLocal(): Promise<void> {
+    return this.startSerializedFlushInternal(
+      'save',
+      /* propagateError */ true,
+      { skipPublish: true },
+    );
+  }
+
   private startSerializedFlushInternal(
     mode: 'save' | 'no-data',
     propagateError: boolean,
+    flushOptions?: { skipPublish?: boolean },
   ): Promise<void> {
     const previous = this.host.getFlushPromise() ?? Promise.resolve();
     const flushBox: { ref: Promise<void> | null } = { ref: null };
@@ -546,7 +565,7 @@ export class FlushScheduler {
         // Prior flush already surfaced its error via its own catch arm.
         // Don't propagate — we want our flush to run regardless.
       })
-      .then(() => this.flushToIpfs())
+      .then(() => this.flushToIpfs(flushOptions))
       .catch((err) => {
         const prefix = mode === 'no-data' ? 'Flush (no-data) failed' : 'Flush failed';
         this.host.log(`${prefix}: ${err instanceof Error ? err.message : String(err)}`);
@@ -580,14 +599,14 @@ export class FlushScheduler {
    * authoritative pointer already anchored this exact bytes — e.g.,
    * the remote originator already published while we were merging).
    */
-  async flushToIpfs(): Promise<void> {
+  async flushToIpfs(options?: { skipPublish?: boolean }): Promise<void> {
     // GH #363 measurement — how often does flushToIpfs run and how
     // long does it take? Issue #360 Finding #1 hypothesised every
     // local write triggers a full flush; the rate counter answers it.
     incr('flushScheduler.flushToIpfs.calls');
     const __perfStart = performance.now();
     try {
-      return await this.__flushToIpfsBody();
+      return await this.__flushToIpfsBody(options);
     } finally {
       observeMs(
         'flushScheduler.flushToIpfs.totalMs',
@@ -596,7 +615,37 @@ export class FlushScheduler {
     }
   }
 
-  private async __flushToIpfsBody(): Promise<void> {
+  /**
+   * Issue #444 — local-only flush variant.
+   *
+   * Drives the same flush body as {@link flushToIpfs} except the
+   * aggregator pointer publish (`publishSnapshotIfWired`) and the
+   * per-flush remote-durability verification leg are SKIPPED.
+   * Instead, `pendingPublishCid` is stamped with the just-pinned
+   * bundle CID AND `notifyProfileDirty()` is called so the
+   * dirty-flush debouncer schedules a deferred publish.
+   *
+   * This is the per-receive durability primitive: it commits the
+   * incoming token's CAR to local Helia + writes the OrbitDB bundle
+   * ref synchronously (so the next process load sees it), while
+   * coalescing the much more expensive aggregator publish into a
+   * single deferred operation that batches every TOKEN_TRANSFER
+   * received during the dirty-flush debounce window.
+   *
+   * The deferred publish fires from any of three triggers:
+   *   1. The dirty-flush debounce timer (default `flushDebounceMs`,
+   *      typically 2s) — covers the live daemon case.
+   *   2. The periodic pointer-poll's `retryPendingPublishIfAny()`
+   *      — covers the "next poll time" case.
+   *   3. `LifecycleManager.shutdown()`'s `awaitRemoteDurability()`
+   *      — covers the graceful CLI / daemon termination case.
+   *
+   * Local-loss surface (encryption fail, bundle CAR pin fail,
+   * OrbitDB write fail) still throws from this method, so the
+   * at-least-once Nostr cursor stays pinned for genuine local-loss
+   * cases — preserving the safety invariant of issue #105.
+   */
+  private async __flushToIpfsBody(options?: { skipPublish?: boolean }): Promise<void> {
     const encryptionKey = this.host.getEncryptionKey();
     if (!encryptionKey) return;
 
@@ -1487,10 +1536,36 @@ export class FlushScheduler {
       //    help (operator intervention required).
       let publishResult: ProfileSnapshotPublishResult | null = null;
       let publishThrew: unknown = undefined;
-      try {
-        publishResult = await this.host.publishSnapshotIfWired();
-      } catch (err) {
-        publishThrew = err;
+      if (!options?.skipPublish) {
+        try {
+          publishResult = await this.host.publishSnapshotIfWired();
+        } catch (err) {
+          publishThrew = err;
+        }
+      } else {
+        // Issue #444 — local-only flush. Schedule a deferred publish via
+        // the dirty-flush debouncer: `notifyProfileDirty()` arms (or
+        // re-arms) the `dirtyFlushTimer`, which fires `dispatchDirtyFlush`
+        // → `onProfileDirtyFlush` → snapshot build + pin + publish.
+        //
+        // We deliberately DO NOT call `setPendingPublishCid(cid)` here.
+        // `pendingPublishCid` is the SNAPSHOT CID (set by
+        // `publishAggregatorPointerBestEffort` on transient publish
+        // failure); stamping it with the BUNDLE CID would publish an
+        // invalid pointer (other devices would parse a bundle CAR as
+        // a snapshot CAR and fail).
+        //
+        // Multiple local-only flushes within `dirtyFlushDebounceMs`
+        // (default = `flushDebounceMs`) coalesce: the timer is reset
+        // on each `notifyProfileDirty()` call so the publish fires
+        // once with the most-recent OrbitDB head as the snapshot
+        // anchor.
+        //
+        // Shutdown drain is handled by ProfileTokenStorageProvider
+        // shutdown which fires `publishSnapshotIfWired()` synchronously
+        // before tearing down, so a graceful CLI exit before the
+        // debounce window publishes the deferred snapshot.
+        this.host.notifyProfileDirty();
       }
 
       this.host.emitEvent({

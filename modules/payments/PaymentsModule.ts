@@ -16135,6 +16135,32 @@ export class PaymentsModule {
    * `warn` and surface as `false` so the caller refuses to advance the
    * `since` filter.
    */
+  /**
+   * Issue #444 — drive each provider's LOCAL-only flush so the OrbitDB
+   * bundle ref + local Helia pin commit synchronously, and surface any
+   * local-loss failure (OrbitDB write throws, bundle CAR pin fails)
+   * as `false`. The aggregator publish + HEAD-verify is DEFERRED:
+   * providers that support `awaitNextLocalFlush` (the Profile provider)
+   * stamp `pendingPublishCid` + call `notifyProfileDirty()` from the
+   * flush body so the publish happens via the dirty-flush debouncer,
+   * the periodic pointer-poll's `retryPendingPublishIfAny`, or the
+   * graceful-shutdown `awaitRemoteDurability` gate — coalescing every
+   * TOKEN_TRANSFER received during the debounce window into ONE
+   * pointer update at the aggregator.
+   *
+   * Providers without a local-only variant fall back to `awaitNextFlush`
+   * (filesystem / IndexedDB stores have no cross-device publish step,
+   * so the two semantics are equivalent on those providers).
+   *
+   * The return value is the at-least-once gate signal for the Nostr
+   * cursor: `true` ⇒ local state is durable on every provider, advance
+   * the cursor; `false` ⇒ at least one provider's local-write failed,
+   * keep the cursor pinned so the event replays on next reconnect.
+   *
+   * Cross-device propagation failures (publish blip, HEAD-verify
+   * timeout) DO NOT reach this method post-#444 — they are handled
+   * in the deferred publish path.
+   */
   private async awaitAllProvidersDurable(timeoutMs = 60_000): Promise<boolean> {
     const providers = this.getTokenStorageProviders();
     if (providers.size === 0) return true;
@@ -16146,10 +16172,20 @@ export class PaymentsModule {
     });
     let allDurable = true;
     for (const [providerId, provider] of providers) {
-      if (typeof provider.awaitNextFlush !== 'function') continue;
+      // Issue #444 — prefer the local-only flush primitive when the
+      // provider supports it. Falls back to legacy full flush when
+      // absent (the two are equivalent on local-only providers).
+      const flusher = (
+        typeof (provider as { awaitNextLocalFlush?: (ms?: number) => Promise<void> })
+          .awaitNextLocalFlush === 'function'
+          ? (provider as { awaitNextLocalFlush: (ms?: number) => Promise<void> })
+              .awaitNextLocalFlush
+          : provider.awaitNextFlush
+      ) as ((ms?: number) => Promise<void>) | undefined;
+      if (typeof flusher !== 'function') continue;
       const __t0 = Date.now();
       try {
-        await provider.awaitNextFlush(timeoutMs);
+        await flusher.call(provider, timeoutMs);
         __span.mark(`provider:${providerId}`, { durationMs: Date.now() - __t0, ok: true });
       } catch (err) {
         __span.mark(`provider:${providerId}`, {
@@ -16159,7 +16195,7 @@ export class PaymentsModule {
         });
         logger.warn(
           'Payments',
-          `[AT-LEAST-ONCE] provider ${providerId} awaitNextFlush failed — Nostr event will NOT be acked, replayed on next reconnect:`,
+          `[AT-LEAST-ONCE] provider ${providerId} local flush failed — Nostr event will NOT be acked, replayed on next reconnect:`,
           err instanceof Error ? err.message : err,
         );
         allDurable = false;
@@ -16239,9 +16275,10 @@ export class PaymentsModule {
       }
       // Pool's enqueue() awaits the worker `settled` promise, so by the
       // time we get here the worker has processed the bundle and addToken
-      // ran inside processToken. Now flush to make the token durable in
-      // IPFS+OrbitDB+aggregator-pointer before letting the Nostr ack
-      // advance.
+      // ran inside processToken. Drive the LOCAL-only flush so OrbitDB
+      // + local Helia pin commit before the Nostr cursor advances; the
+      // aggregator pointer publish batches via the dirty-flush debouncer
+      // (issue #444).
       return await this.awaitAllProvidersDurable();
     }
 
@@ -16339,7 +16376,9 @@ export class PaymentsModule {
           v6Success = false;
         }
         if (!v6Success) return false;
-        // V6 path persists via internal save calls — await flush durability.
+        // V6 path persists via internal save calls — drive LOCAL-only
+        // flush so OrbitDB commits before cursor advance; aggregator
+        // publish is deferred and batched (issue #444).
         return await this.awaitAllProvidersDurable();
       }
 
@@ -16400,7 +16439,9 @@ export class PaymentsModule {
           logger.error('Payments', 'INSTANT_SPLIT processing error:', err);
           return false;
         }
-        // INSTANT_SPLIT success — await flush before acking Nostr event.
+        // INSTANT_SPLIT success — drive LOCAL-only flush before
+        // acking Nostr event; aggregator publish is deferred + batched
+        // (issue #444).
         return await this.awaitAllProvidersDurable();
       }
 
@@ -16408,7 +16449,9 @@ export class PaymentsModule {
       if (payload.sourceToken && payload.commitmentData && !payload.transferTx) {
         logger.debug('Payments', 'NOSTR-FIRST commitment-only transfer detected');
         await this.handleCommitmentOnlyTransfer(transfer, payload);
-        // NOSTR-FIRST persists internally — await flush before acking.
+        // NOSTR-FIRST persists internally — drive LOCAL-only flush
+        // before acking; aggregator publish is deferred + batched
+        // (issue #444).
         return await this.awaitAllProvidersDurable();
       }
 
@@ -16749,10 +16792,14 @@ export class PaymentsModule {
       // where we record the actual durable result.
     }
 
-    // At-least-once invariant: if the body completed and persisted a
-    // token, we MUST await flush completion on every provider that
-    // supports it before returning durable=true. The transport layer
-    // uses our return value to gate `lastEventTs` advancement.
+    // At-least-once invariant (post-#444): if the body completed and
+    // persisted a token, drive each provider's LOCAL-only flush before
+    // returning so the OrbitDB bundle ref + local Helia pin commit
+    // synchronously. Local-loss failures (OrbitDB write throws, pin
+    // fails) surface as `false` and pin the Nostr cursor for replay.
+    // Cross-device propagation (aggregator publish, HEAD-verify) is
+    // deferred and batched via `notifyProfileDirty` + `pendingPublishCid`
+    // — see `awaitAllProvidersDurable`'s doc comment.
     if (!bodyCompleted) return false;
     if (nothingToPerist) return true;
     const __durable = await this.awaitAllProvidersDurable(60_000);

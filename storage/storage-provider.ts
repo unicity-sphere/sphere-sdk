@@ -232,6 +232,43 @@ export interface TokenStorageProvider<TData = unknown> extends BaseProvider {
   awaitNextFlush?(timeoutMs?: number): Promise<void>;
 
   /**
+   * Issue #444 — local-only flush primitive.
+   *
+   * Optional — providers without a remote-publish leg (filesystem,
+   * IndexedDB, IPFS-legacy) can omit it; callers fall back to
+   * {@link awaitNextFlush} when this is absent (the legacy
+   * "always-full" flush, semantically equivalent on those providers
+   * because they have no cross-device publish step).
+   *
+   * Returns when the LOCAL durability invariant holds: the bundle CAR
+   * is pinned to the local content-addressed store, the OrbitDB bundle
+   * ref is written, and any per-flush local cache is populated. The
+   * cross-device propagation (aggregator pointer publish, HEAD-verify)
+   * is DEFERRED and handled by:
+   *   - the periodic pointer-poll's `retryPendingPublishIfAny` (live
+   *     daemon);
+   *   - `LifecycleManager.shutdown`'s `awaitRemoteDurability` gate
+   *     (graceful CLI / daemon termination);
+   *   - the dirty-flush debouncer (in-process coalescing of N
+   *     receives into 1 publish).
+   *
+   * Used by `payments.handleIncomingTransfer` to advance the Nostr
+   * cursor on local commit, decoupled from cross-device propagation
+   * latency. The legacy {@link awaitNextFlush} is still used by
+   * shutdown drain and explicit "fully durable" call sites that need
+   * cross-device verified before returning.
+   *
+   * Same throwing semantics as {@link awaitNextFlush}: rejects with
+   * `SphereError('TIMEOUT')` on deadline expiry, propagates flush
+   * errors (POINTER_MONOTONICITY_VIOLATION, OrbitDB write failure,
+   * bundle CAR pin failure) so the at-least-once invariant catches
+   * genuine local-loss cases.
+   *
+   * @param timeoutMs Max wall-clock time. Default 30s.
+   */
+  awaitNextLocalFlush?(timeoutMs?: number): Promise<void>;
+
+  /**
    * Check if data exists
    */
   exists?(identifier?: string): Promise<boolean>;

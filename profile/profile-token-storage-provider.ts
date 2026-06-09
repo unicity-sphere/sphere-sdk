@@ -1035,11 +1035,35 @@ export class ProfileTokenStorageProvider
   }
 
   async shutdown(options?: ShutdownOptions): Promise<void> {
+    // Issue #444 — drain any deferred publish from a local-only flush
+    // BEFORE the lifecycle teardown. `awaitNextLocalFlush` (used by
+    // `PaymentsModule.handleIncomingTransfer`) skips the synchronous
+    // publish and schedules a deferred snapshot publish via
+    // `notifyProfileDirty()` so multiple TOKEN_TRANSFER receives
+    // coalesce into one publish at the debounce-fire. Without an
+    // explicit shutdown drain, a graceful CLI exit before the
+    // debounce timer would cancel the armed timer and silently lose
+    // the aggregator pointer publish — sibling devices would not see
+    // the updated wallet state until next process boot's
+    // `pendingPublishCid` retry (fragile across process boundaries
+    // per issue #234).
+    //
+    // The drain is SURGICAL: it only fires the dirty-flush callback
+    // when there is actually a pending signal (armed timer OR
+    // `dirtyFlushPending` latch). On an idle wallet (no dirty signal
+    // since last publish), it is a no-op — there is nothing to
+    // anchor and we avoid a redundant publish round-trip.
+    await this.drainDeferredDirtyPublishOnShutdown();
+
     // Item #15 Phase C.2 — cancel the dirty-flush debounce BEFORE the
     // lifecycle's shutdown so the lifecycle's `setIsShuttingDown(true)`
     // doesn't race a late-firing timer that would re-enter the dispatch
     // path. Then await any in-flight dirty-flush callback so we don't
     // leave a Sphere-injected flush dangling past provider teardown.
+    //
+    // After the #444 drain above this is typically a no-op (the timer
+    // is cancelled, the dispatch settled). Kept as defense-in-depth
+    // against a late `notifyProfileDirty()` signal racing the drain.
     this.cancelDirtyFlushTimer();
     try {
       await this.awaitDirtyFlushSettled();
@@ -1055,6 +1079,80 @@ export class ProfileTokenStorageProvider
     // any late-arriving signal from a writer that outlives the
     // provider becomes a definite no-op.
     this.hasShutdown = true;
+  }
+
+  /**
+   * Issue #444 — shutdown-time drain for deferred dirty-flush signals.
+   *
+   * Fires the `onProfileDirtyFlush` callback ONCE if there is a pending
+   * signal (armed timer or `dirtyFlushPending` latch) at shutdown time;
+   * otherwise no-op. Unlike {@link publishSnapshotIfWired} (which
+   * unconditionally fires on every call), this drain checks the pending
+   * state explicitly so an idle-wallet shutdown does not trigger a
+   * redundant publish round-trip.
+   *
+   * Sequence:
+   *   1. Snapshot `hadArmedTimer` BEFORE clearing — the timer is the
+   *      "pending signal that hasn't fired yet" indicator from a
+   *      recent local-only flush.
+   *   2. Cancel the timer (we're about to drain it synchronously).
+   *   3. Await any in-flight dirty-flush callback so we serialize
+   *      against it (avoids firing the same snapshot build twice
+   *      concurrently). Loop because the callback's finally can
+   *      re-arm via `consumePendingDirtyFlag`.
+   *   4. If `hadArmedTimer` OR `dirtyFlushPending` was true, fire the
+   *      callback once.
+   *
+   * Errors from the callback are logged at warn and swallowed —
+   * shutdown MUST complete; the pointer's `pendingPublishCid` retry
+   * marker covers cross-process recovery for transient publish
+   * failures.
+   */
+  private async drainDeferredDirtyPublishOnShutdown(): Promise<void> {
+    // Snapshot pending state BEFORE we cancel.
+    const hadArmedTimer = this.dirtyFlushTimer !== null;
+
+    if (this.dirtyFlushTimer !== null) {
+      clearTimeout(this.dirtyFlushTimer);
+      this.dirtyFlushTimer = null;
+    }
+
+    // Wait for any in-flight callback to settle. Loop to handle the
+    // case where the dispatch's finally re-arms a fresh callback via
+    // `consumePendingDirtyFlag()` (an extremely tight race window;
+    // empirically rare but bounded by the latch semantics).
+    while (this.dirtyFlushPromise !== null) {
+      const inFlight = this.dirtyFlushPromise;
+      try {
+        await inFlight;
+      } catch {
+        // Surfaced via storage:error in dispatch's catch arm.
+      }
+      // Defense against re-arm races: re-check after await; if a fresh
+      // promise was installed, drain it too.
+      if (this.dirtyFlushPromise === inFlight) {
+        // Same promise we awaited — finally cleared it. Exit loop.
+        break;
+      }
+    }
+
+    const needsFire = hadArmedTimer || this.dirtyFlushPending;
+    this.dirtyFlushPending = false;
+
+    if (!needsFire) return;
+
+    const callback = this.options?.onProfileDirtyFlush;
+    if (typeof callback !== 'function') return;
+
+    try {
+      await callback();
+    } catch (err) {
+      this.log(
+        `Shutdown deferred-publish drain: callback threw (best-effort, ignored): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
   }
 
   /**
@@ -1091,6 +1189,41 @@ export class ProfileTokenStorageProvider
    *   non-finite handling here is "disable", there is "use default".
    */
   async awaitNextFlush(timeoutMs = 30_000): Promise<void> {
+    return this.awaitNextFlushInternal(timeoutMs, /* skipPublish */ false);
+  }
+
+  /**
+   * Issue #444 — local-only flush primitive.
+   *
+   * Drives the same flush body as {@link awaitNextFlush} except the
+   * aggregator pointer publish (and per-flush remote-durability
+   * verification) is SKIPPED. The bundle CAR pin + OrbitDB bundle ref
+   * write still happen synchronously, so the LOCAL durability invariant
+   * holds: when this resolves, the just-received token IS persisted to
+   * the local OrbitDB log and can be loaded by the next process boot.
+   *
+   * The aggregator publish is deferred:
+   *   - `pendingPublishCid` is set so the next pointer-poll tick (or
+   *     graceful shutdown's `awaitRemoteDurability`) retries the publish;
+   *   - `notifyProfileDirty()` is called so the dirty-flush debouncer
+   *     coalesces multiple per-receive local flushes into a single
+   *     deferred publish.
+   *
+   * PaymentsModule's at-least-once Nostr cursor gate (`handleIncomingTransfer`)
+   * uses THIS method so the cursor advances on local commit, decoupled
+   * from cross-device propagation latency. The legacy
+   * `awaitNextFlush()` is still used by `LifecycleManager.shutdown` and
+   * the explicit-drain code paths that need cross-device durability
+   * verified before returning.
+   */
+  async awaitNextLocalFlush(timeoutMs = 30_000): Promise<void> {
+    return this.awaitNextFlushInternal(timeoutMs, /* skipPublish */ true);
+  }
+
+  private async awaitNextFlushInternal(
+    timeoutMs: number,
+    skipPublish: boolean,
+  ): Promise<void> {
     if (!this.initialized || !this.encryptionKey) return;
 
     // Treat 0, negative, NaN, and ±Infinity as "no deadline". The flush
@@ -1162,7 +1295,12 @@ export class ProfileTokenStorageProvider
       // the first caller after a save(), this drives the first flush.
       // Errors from the chain (POINTER_MONOTONICITY_VIOLATION, etc.)
       // propagate as a rejection — caller decides ack behavior.
-      const chained = this.flushScheduler.forceFlushSerialized();
+      //
+      // Issue #444 — `skipPublish` routes to `forceFlushSerializedLocal`
+      // so the aggregator publish + verification leg is deferred.
+      const chained = skipPublish
+        ? this.flushScheduler.forceFlushSerializedLocal()
+        : this.flushScheduler.forceFlushSerialized();
       // Issue #272 — explicitly hold the timeout handle so we can
       // clearTimeout in finally. Without this, when `chained` settles
       // first, the setTimeout fires later (after the original deadline)
