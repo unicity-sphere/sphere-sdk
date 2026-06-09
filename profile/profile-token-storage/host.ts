@@ -186,6 +186,32 @@ export interface ProfileTokenStorageHost {
   getPendingPublishCid(): string | null;
   setPendingPublishCid(c: string | null): void;
 
+  /**
+   * Issue #454 finding #2 — SIGKILL recovery marker for the Issue #444
+   * `skipPublish` (local-only flush) path.
+   *
+   * `awaitNextLocalFlush` schedules a deferred publish via the dirty-
+   * flush debouncer but explicitly does NOT stamp `pendingPublishCid`
+   * (that field is shaped for SNAPSHOT CIDs; the local-only flush only
+   * pinned a BUNDLE CID). A SIGKILL during the debounce window would
+   * therefore lose the publish silently on the pre-#454 path: the
+   * aggregator pointer stays stale, `pendingPublishCid` is null, and
+   * `retryPendingPublishIfAny` is a no-op.
+   *
+   * This sibling marker is a boolean flag stamped from the skipPublish
+   * branch of `__flushToIpfsBody` after the bundle ref is written. On
+   * the next process boot, `initialize()` restores it and drives a
+   * deferred `publishSnapshotIfWired()` so siblings discover the
+   * just-received bundle without waiting for the next save-driven
+   * flush.
+   *
+   * Cleared after a successful publish (debounce-fire OR shutdown
+   * drain OR a full save-side flush). Persisted to `localCache` under
+   * `<STORAGE_KEYS_GLOBAL.PROFILE_PENDING_DEFERRED_PUBLISH>_<addressId>`.
+   */
+  getPendingDeferredPublishMarker(): boolean;
+  setPendingDeferredPublishMarker(v: boolean): void;
+
   // --- Bundle index state ---
   getKnownBundleCids(): Set<string>;
   setKnownBundleCids(s: Set<string>): void;
