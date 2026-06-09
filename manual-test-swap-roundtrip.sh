@@ -47,6 +47,18 @@
 #
 # Requires `sphere` on PATH, outbound HTTPS+WSS to testnet, and a
 # reachable escrow service.
+#
+# Escrow nametag resolution fallback (sphere-sdk#456):
+#   If the @escrow-testnet nametag does not resolve on the testnet
+#   relay (the §2.5 `sphere swap ping` pre-flight will fail with
+#   `Could not resolve recipient`), re-run with the escrow's raw
+#   DIRECT address. The production testnet escrow currently lives at:
+#
+#     ESCROW="DIRECT://00007968fa28648e4670438bf1f3c936296e84ff46dd5ebb2e34e20092e780b652da2d3d695b" \
+#       bash manual-test-swap-roundtrip.sh
+#
+#   The nametag remains the canonical reference — switch back once
+#   the operator republishes the binding event.
 
 set -euo pipefail
 
@@ -216,6 +228,12 @@ sphere wallet use alice
 if ! sphere swap ping "$ESCROW" 2>&1 | tee "$SNAP/alice-escrow-ping.log"; then
   echo "ASSERT FAIL (escrow-unreachable): $ESCROW did not respond to swap ping" >&2
   echo "Hint: set ESCROW=<addr> to point at a different escrow service." >&2
+  if [[ "$ESCROW" == "@escrow-testnet" ]]; then
+    echo "Hint (sphere-sdk#456): the @escrow-testnet nametag binding may be" >&2
+    echo "  missing on the testnet relay. Re-run with the DIRECT-address fallback:" >&2
+    echo "  ESCROW=\"DIRECT://00007968fa28648e4670438bf1f3c936296e84ff46dd5ebb2e34e20092e780b652da2d3d695b\" \\" >&2
+    echo "    bash manual-test-swap-roundtrip.sh" >&2
+  fi
   exit 1
 fi
 echo "ASSERT OK (escrow-reachable): $ESCROW responded"
