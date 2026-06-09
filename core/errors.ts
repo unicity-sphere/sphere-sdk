@@ -155,6 +155,26 @@ export type SphereErrorCode =
   | 'SWAP_ALREADY_INITIALIZED'
   | 'SWAP_MODULE_DESTROYED'
   | 'SWAP_NOT_INITIALIZED'
+  /**
+   * Issue #457 — counterparty / escrow peer resolved but the binding lacks a
+   * `transportPubkey`. The acceptor's wallet subscribes to NIP-17 events on
+   * the transport pubkey ONLY; previously the swap module silently fell
+   * back to `chainPubkey`, sealing the DM to a key the receiver never
+   * subscribes to. Result: the proposal vanishes with no error, no event,
+   * no warning — indistinguishable from a healthy proposal whose acceptor
+   * is offline.
+   *
+   * Fail-fast at all three sites in `modules/swap/SwapModule.ts`:
+   *  - `proposeSwap` counterparty resolution (line ~1133)
+   *  - `proposeSwap` escrow peer resolution (line ~1190)
+   *  - `getSwapStatus` escrow status-DM send (line ~2260)
+   *
+   * Surfaces when the resolved binding is partially propagated. The fix
+   * for the operator is to retry once `init` propagation finishes —
+   * usually seconds later, sometimes minutes if the relay is laggy. The
+   * thrown error's message text spells this out.
+   */
+  | 'SWAP_PEER_NO_TRANSPORT'
   // UXF transfer protocol error codes (T.1.D — bundle envelope decode failures).
   // The protocol surfaces three structurally-distinct failure modes that callers
   // and the receive worker must distinguish:
