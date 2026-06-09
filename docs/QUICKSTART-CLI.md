@@ -1225,7 +1225,7 @@ The swap module enables trustless two-party token swaps via an escrow service. B
 - Two wallet profiles set up (or two terminals with different data directories)
 - Both wallets initialized with nametags
 - Tokens available for the swap
-- An escrow service address (e.g., `@escrow-testnet` on testnet)
+- An escrow service address (e.g., `@escrow-testnet` on testnet, or its raw `DIRECT://…` form if the nametag is not currently resolvable — see [Troubleshooting](#troubleshooting-escrow-address) below)
 
 > **Note:** The swap module requires the Accounting module (for invoice-based deposits) and the Communications module (for DM negotiation). Both are included by default.
 
@@ -1356,6 +1356,21 @@ npm run cli -- swap-list --role acceptor
 # Show all swaps including completed/cancelled/failed (default hides terminal)
 npm run cli -- swap-list --all
 ```
+
+### Troubleshooting: escrow address
+
+If `swap-propose --escrow @escrow-testnet` fails with `Could not resolve recipient: @escrow-testnet`, the testnet escrow daemon's nametag binding event is not currently published on the relay (tracked in sphere-sdk#456). Fall back to the escrow's raw `DIRECT://…` address:
+
+```bash
+npm run cli -- swap-propose \
+  --to @bob \
+  --offer "1000000 UCT" \
+  --want "500000 USDU" \
+  --escrow DIRECT://00007968fa28648e4670438bf1f3c936296e84ff46dd5ebb2e34e20092e780b652da2d3d695b \
+  --timeout 3600
+```
+
+The escrow services both forms transparently. Once the operator republishes the `escrow-testnet` nametag binding, `@escrow-testnet` becomes usable again — keep DIRECT form as a fallback, not as the canonical reference.
 
 ### Cancellation and Timeouts
 
