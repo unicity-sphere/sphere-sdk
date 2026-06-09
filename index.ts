@@ -310,6 +310,8 @@ export {
   COIN_TYPES,
   // Networks
   NETWORKS,
+  // Swap
+  DEFAULT_ESCROW_ADDRESS,
   // Timeouts & Limits
   TIMEOUTS,
   LIMITS,
