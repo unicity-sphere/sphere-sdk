@@ -1156,7 +1156,14 @@ export class PaymentsModule {
       // Resolve recipient
       const peerInfo: PeerInfo | null = await this.deps!.transport.resolve?.(request.recipient) ?? null;
       const recipientPubkey = this.resolveTransportPubkey(request.recipient, peerInfo);
-      const recipientAddress = await this.resolveRecipientAddress(request.recipient, request.addressMode, peerInfo);
+      // v2 transfers to the recipient's chainPubkey (predicate); a DirectAddress is only
+      // needed by the v1 commitment paths below. Resolve it (and enforce its presence) only
+      // when the v1 path will run, so a recipient with a published chainPubkey can be paid
+      // even without a DirectAddress.
+      const willUseEngine = !!(this.deps?.tokenEngine && peerInfo?.chainPubkey);
+      const recipientAddress: IAddress | null = willUseEngine
+        ? null
+        : await this.resolveRecipientAddress(request.recipient, request.addressMode, peerInfo);
 
       // Create signing service
       const signingService = await this.createSigningService();
@@ -1336,7 +1343,7 @@ export class PaymentsModule {
             splitPlan.splitAmount!,
             splitPlan.remainderAmount!,
             splitPlan.coinId,
-            recipientAddress,
+            recipientAddress!, // v1 path only — non-null (would have thrown in resolve otherwise)
             onChainMessage,
           );
 
@@ -1386,7 +1393,7 @@ export class PaymentsModule {
         // Transfer direct tokens
         for (const tokenWithAmount of splitPlan.tokensToTransferDirectly) {
           const token = tokenWithAmount.uiToken;
-          const commitment = await this.createSdkCommitment(token, recipientAddress, signingService, onChainMessage);
+          const commitment = await this.createSdkCommitment(token, recipientAddress!, signingService, onChainMessage);
 
           logger.debug('Payments', `CONSERVATIVE: Sending direct token ${token.id.slice(0, 8)}... to ${recipientPubkey.slice(0, 8)}...`);
 
@@ -1448,7 +1455,7 @@ export class PaymentsModule {
             splitPlan.splitAmount!,
             splitPlan.remainderAmount!,
             splitPlan.coinId,
-            recipientAddress,
+            recipientAddress!, // v1 path only — non-null (would have thrown in resolve otherwise)
             {
               memo: request.memo,
               message: onChainMessage,
@@ -1490,7 +1497,7 @@ export class PaymentsModule {
         // 2. Prepare direct token entries in parallel — does NOT send
         const directCommitments = await Promise.all(
           splitPlan.tokensToTransferDirectly.map((tw: TokenWithAmount) =>
-            this.createSdkCommitment(tw.uiToken, recipientAddress, signingService, onChainMessage)
+            this.createSdkCommitment(tw.uiToken, recipientAddress!, signingService, onChainMessage)
           )
         );
 
@@ -5242,7 +5249,8 @@ export class PaymentsModule {
 
     if (!info.directAddress) {
       throw new SphereError(
-        `"${nametag}" has no DirectAddress — the recipient must publish a key-based identity binding.`,
+        `"${nametag}" has no published identity — the recipient must register a Unicity ID ` +
+          `(publish a key-based identity binding) before they can receive payments.`,
         'INVALID_RECIPIENT',
       );
     }
