@@ -908,6 +908,67 @@ export class SwapModule {
   }
 
   /**
+   * Issue #447: write-side helper for `acceptSwap`, `cancelSwap`,
+   * `deposit`, `rejectSwap`, and `verifyPayout`.
+   *
+   * Resolves a swap id to its in-memory SwapRef using the same lookup
+   * order as {@link getSwapStatus} (cache → terminal lazy-load), then
+   * enforces that the result is in a non-terminal state. Write
+   * operations against a terminal swap are never valid — the local
+   * state machine and the escrow are both done with the swap.
+   *
+   * Why this matters: PR #446 made `getSwapStatus` lazy-load terminal
+   * entries from storage and report their state, but
+   * `acceptSwap`/`cancelSwap`/etc. still did a bare `this.swaps.get()`
+   * which returned `undefined` for terminal ids. The result was an
+   * inconsistent operator surface — `swap status <id>` said "completed"
+   * while `swap cancel <id>` said "not found". This helper unifies the
+   * lookup and surfaces a clear `SWAP_ALREADY_TERMINAL` instead of the
+   * misleading `SWAP_NOT_FOUND`.
+   *
+   * @throws {SphereError} `SWAP_NOT_FOUND` if the id is not in the
+   *   working set and not in the terminal index.
+   * @throws {SphereError} `SWAP_ALREADY_TERMINAL` if the id resolves
+   *   to a terminal swap. The error message includes the terminal
+   *   state and the calling operation name (for UX clarity).
+   */
+  private async requireSwap(swapId: string, operation: string): Promise<SwapRef> {
+    const live = this.swaps.get(swapId);
+    if (live) {
+      // Return the live ref AS-IS — even if it's transiently terminal
+      // (a state transition happens before removal from the working
+      // set). The caller's existing state-machine guards
+      // (SWAP_ALREADY_COMPLETED / SWAP_ALREADY_CANCELLED /
+      // SWAP_WRONG_STATE) preserve the legacy fine-grained error codes
+      // for in-memory swaps. The SWAP_ALREADY_TERMINAL surface added by
+      // Issue #447 specifically replaces the misleading SWAP_NOT_FOUND
+      // that was thrown when a terminal swap was no longer in memory
+      // because loadFromStorage had already excluded it from the
+      // working set.
+      return live;
+    }
+
+    // Cache miss — try the terminal index. If the id is in
+    // _storedTerminalEntries or terminalSwapIds, the swap has been seen
+    // as terminal in this session and should NOT silently appear to the
+    // caller as "not found".
+    const terminalSwap = await this.loadTerminalSwapFromStorage(swapId);
+    if (terminalSwap) {
+      throw new SphereError(
+        `Swap ${swapId} is in terminal state '${terminalSwap.progress}'; ${operation} is not valid`,
+        'SWAP_ALREADY_TERMINAL',
+      );
+    }
+
+    // No in-memory entry, no lazy-loadable terminal record. Even if
+    // terminalSwapIds contains the id (e.g. the storage record was
+    // purged but the gate set is sticky), the caller has no usable
+    // record to act on — surface SWAP_NOT_FOUND. This matches the
+    // legacy contract for write-side "swap really doesn't exist".
+    throw new SphereError(`Swap not found: ${swapId}`, 'SWAP_NOT_FOUND');
+  }
+
+  /**
    * Remove a single swap from storage (per-swap key) and update the index.
    */
   private async removeSwapFromStorage(swapId: string): Promise<void> {
@@ -1321,6 +1382,9 @@ export class SwapModule {
    *
    * @param swapId - The swap ID to accept.
    * @throws {SphereError} `SWAP_NOT_FOUND` if swap does not exist.
+   * @throws {SphereError} `SWAP_ALREADY_TERMINAL` if the swap is already
+   *   in a terminal state (Issue #447 — consistent with `getSwapStatus`,
+   *   which lazy-loads terminal swaps and reports their state).
    * @throws {SphereError} `SWAP_WRONG_STATE` if swap is not in 'proposed' state.
    */
   async acceptSwap(swapId: string): Promise<void> {
@@ -1328,11 +1392,11 @@ export class SwapModule {
     this.ensureReady();
     const deps = this.deps!;
 
-    // Step 2: Look up swap
-    const swap = this.swaps.get(swapId);
-    if (!swap) {
-      throw new SphereError(`Swap not found: ${swapId}`, 'SWAP_NOT_FOUND');
-    }
+    // Step 2: Look up swap (Issue #447: requireSwap returns the live ref
+    // or throws SWAP_NOT_FOUND / SWAP_ALREADY_TERMINAL — never returns a
+    // terminal swap, so downstream state checks see only non-terminal
+    // progress values).
+    const swap = await this.requireSwap(swapId, 'acceptSwap');
     // Fast-path checks before gate (re-checked inside gate for TOCTOU safety)
     if (swap.progress !== 'proposed') {
       throw new SphereError(
@@ -1606,6 +1670,8 @@ export class SwapModule {
    * @param swapId - The swap ID to reject.
    * @param reason - Optional human-readable reason for rejection.
    * @throws {SphereError} `SWAP_NOT_FOUND` if swap does not exist.
+   * @throws {SphereError} `SWAP_ALREADY_TERMINAL` if the swap is already
+   *   in a terminal state (Issue #447).
    * @throws {SphereError} `SWAP_WRONG_STATE` if swap is not in 'proposed' state.
    */
   async rejectSwap(swapId: string, reason?: string): Promise<void> {
@@ -1613,13 +1679,17 @@ export class SwapModule {
     this.ensureReady();
     const deps = this.deps!;
 
-    // Step 2: Look up swap
-    const swap = this.swaps.get(swapId);
-    if (!swap) {
-      throw new SphereError(`Swap not found: ${swapId}`, 'SWAP_NOT_FOUND');
-    }
+    // Step 2: Look up swap. requireSwap returns the live in-memory ref
+    // when present, OR throws SWAP_ALREADY_TERMINAL for a lazy-loadable
+    // terminal swap, OR throws SWAP_NOT_FOUND otherwise (Issue #447).
+    // The fine-grained SWAP_ALREADY_COMPLETED / SWAP_ALREADY_CANCELLED
+    // codes below still apply to LIVE swaps that transitioned to
+    // terminal within this process — requireSwap intentionally returns
+    // those rather than throwing, to preserve the legacy contract for
+    // the in-memory case.
+    const swap = await this.requireSwap(swapId, 'rejectSwap');
 
-    // Allow rejection at any pre-payout state
+    // Allow rejection at any pre-payout state.
     if (swap.progress === 'concluding') {
       throw new SphereError('Cannot reject: payouts are already in progress', 'SWAP_WRONG_STATE');
     }
@@ -1699,6 +1769,8 @@ export class SwapModule {
    * @param swapId - The swap ID to deposit for.
    * @returns The transfer result from payInvoice().
    * @throws {SphereError} `SWAP_NOT_FOUND` if swap does not exist.
+   * @throws {SphereError} `SWAP_ALREADY_TERMINAL` if the swap is already
+   *   in a terminal state (Issue #447).
    * @throws {SphereError} `SWAP_WRONG_STATE` if swap is not in 'announced' state.
    * @throws {SphereError} `SWAP_DEPOSIT_FAILED` if payment fails.
    */
@@ -1707,11 +1779,10 @@ export class SwapModule {
     this.ensureReady();
     const deps = this.deps!;
 
-    // Look up swap
-    const swap = this.swaps.get(swapId);
-    if (!swap) {
-      throw new SphereError(`Swap ${swapId} not found`, 'SWAP_NOT_FOUND');
-    }
+    // Look up swap (Issue #447: requireSwap throws SWAP_ALREADY_TERMINAL
+    // for a lazy-loadable terminal swap, distinguishing it from the
+    // legacy SWAP_NOT_FOUND).
+    const swap = await this.requireSwap(swapId, 'deposit');
 
     // Verify progress is 'announced'
     if (swap.progress !== 'announced') {
@@ -1870,6 +1941,11 @@ export class SwapModule {
    * @param swapId - The swap ID to verify.
    * @returns true if payout is verified, false otherwise.
    * @throws {SphereError} `SWAP_NOT_FOUND` if swap does not exist.
+   * @throws {SphereError} `SWAP_ALREADY_TERMINAL` if the swap is already
+   *   in a terminal state (Issue #447). Note: a LIVE swap that is already
+   *   `completed` with `payoutVerified === true` short-circuits inside the
+   *   gate (idempotent re-verify); this code only surfaces for terminal
+   *   swaps no longer in the working set.
    * @throws {SphereError} `SWAP_PAYOUT_VERIFICATION_FAILED` on verification failure.
    */
   async verifyPayout(swapId: string): Promise<boolean> {
@@ -1877,11 +1953,11 @@ export class SwapModule {
     this.ensureReady();
     const deps = this.deps!;
 
-    // Look up swap (pre-gate fast check)
-    const swap = this.swaps.get(swapId);
-    if (!swap) {
-      throw new SphereError(`Swap ${swapId} not found`, 'SWAP_NOT_FOUND');
-    }
+    // Look up swap (pre-gate fast check). Issue #447: requireSwap throws
+    // SWAP_ALREADY_TERMINAL for lazy-loadable terminal swaps. Live swaps
+    // that are completed remain handled by the gate-internal idempotency
+    // branch below — they already passed verifyPayout once.
+    const swap = await this.requireSwap(swapId, 'verifyPayout');
 
     if (!swap.payoutInvoiceId) {
       throw new SphereError('Payout invoice not yet received', 'SWAP_WRONG_STATE');
@@ -2326,9 +2402,66 @@ export class SwapModule {
   }
 
   /**
+   * Materialize a stub SwapRef from a SwapIndexEntry. Used by
+   * {@link getSwaps} when `includeTerminal: true` — terminal entries
+   * stay out of the in-memory working set, so we synthesize a minimal
+   * SwapRef from the lightweight index entry rather than paying a
+   * storage read per terminal swap.
+   *
+   * The stub carries only `swapId`, `progress`, `role`, `createdAt`,
+   * `updatedAt` (aliased to createdAt — index entries don't track
+   * updatedAt) and `payoutVerified: false`. `deal` and `manifest` are
+   * empty placeholders — callers needing the full record must resolve
+   * each id via {@link getSwapStatus} (which lazy-loads from storage).
+   *
+   * This is sufficient for `sphere swap list` to render id, role,
+   * progress, and createdAt rows.
+   */
+  private materializeStubSwapRef(entry: SwapIndexEntry): SwapRef {
+    const stubDeal: SwapDeal = {
+      partyA: '',
+      partyB: '',
+      partyACurrency: '',
+      partyAAmount: '0',
+      partyBCurrency: '',
+      partyBAmount: '0',
+      timeout: 0,
+    };
+    const stubManifest: SwapManifest = {
+      swap_id: entry.swapId,
+      party_a_address: '',
+      party_b_address: '',
+      party_a_currency_to_change: '',
+      party_a_value_to_change: '0',
+      party_b_currency_to_change: '',
+      party_b_value_to_change: '0',
+      timeout: 0,
+      salt: '',
+    };
+    return {
+      swapId: entry.swapId,
+      deal: stubDeal,
+      manifest: stubManifest,
+      role: entry.role,
+      progress: entry.progress,
+      payoutVerified: false,
+      createdAt: entry.createdAt,
+      updatedAt: entry.createdAt,
+    };
+  }
+
+  /**
    * List swaps with optional filtering.
    *
-   * @param filter - Optional filter by progress, role, or excludeTerminal.
+   * By default returns only the in-memory working set, which excludes
+   * terminal swaps preserved in the storage index (see Issue #447).
+   * Pass `includeTerminal: true` to also surface stub SwapRefs for
+   * terminal entries — those stubs carry only id/role/progress/
+   * createdAt (see {@link materializeStubSwapRef}); call
+   * {@link getSwapStatus} per id to lazy-load the full record.
+   *
+   * @param filter - Optional filter by progress, role, excludeTerminal,
+   *   or includeTerminal.
    * @returns Array of SwapRef matching the filter.
    */
   getSwaps(filter?: GetSwapsFilter): SwapRef[] {
@@ -2336,6 +2469,19 @@ export class SwapModule {
     this.ensureReady();
 
     let results = Array.from(this.swaps.values());
+
+    // Issue #447: optionally surface terminal entries that were loaded
+    // from the swap index but are NOT in `this.swaps`. Dedup against
+    // ids already in the working set — a live swap can transiently
+    // appear in both during the terminal transition.
+    if (filter?.includeTerminal) {
+      const liveIds = new Set<string>();
+      for (const s of results) liveIds.add(s.swapId);
+      for (const entry of this._storedTerminalEntries) {
+        if (liveIds.has(entry.swapId)) continue;
+        results.push(this.materializeStubSwapRef(entry));
+      }
+    }
 
     if (filter?.progress) {
       const allowed = Array.isArray(filter.progress)
@@ -2364,17 +2510,22 @@ export class SwapModule {
    *
    * @param swapId - The swap ID to cancel.
    * @throws {SphereError} `SWAP_NOT_FOUND` if swap does not exist.
-   * @throws {SphereError} `SWAP_ALREADY_COMPLETED` if swap is already completed.
-   * @throws {SphereError} `SWAP_ALREADY_CANCELLED` if swap is already cancelled.
+   * @throws {SphereError} `SWAP_ALREADY_TERMINAL` if the swap is already
+   *   in a terminal state and was lazy-loaded from storage (Issue #447).
+   * @throws {SphereError} `SWAP_ALREADY_COMPLETED` if a LIVE swap is already
+   *   completed.
+   * @throws {SphereError} `SWAP_ALREADY_CANCELLED` if a LIVE swap is already
+   *   cancelled.
    */
   async cancelSwap(swapId: string): Promise<void> {
     this.ensureNotDestroyed();
     this.ensureReady();
 
-    const swap = this.swaps.get(swapId);
-    if (!swap) {
-      throw new SphereError(`Swap not found: ${swapId}`, 'SWAP_NOT_FOUND');
-    }
+    // Issue #447: requireSwap routes terminal-but-not-in-memory swaps
+    // through SWAP_ALREADY_TERMINAL. LIVE swaps that are transiently
+    // in terminal state still flow through the legacy
+    // SWAP_ALREADY_COMPLETED / SWAP_ALREADY_CANCELLED branches below.
+    const swap = await this.requireSwap(swapId, 'cancelSwap');
 
     // Fast-path checks before gate (TOCTOU-safe: re-checked inside gate)
     if (swap.progress === 'concluding') {
@@ -2444,12 +2595,27 @@ export class SwapModule {
 
   /**
    * Resolve a swap ID from a full 64-char hex string or a unique prefix (min 4 chars).
-   * Matches against all known swaps (active + terminal in current session).
+   * Matches against ALL known swap ids — both the active in-memory working
+   * set ({@link swaps}) and the terminal index loaded from storage
+   * ({@link _storedTerminalEntries}).
+   *
+   * Issue #447: terminal swaps deliberately stay out of `this.swaps` to
+   * bound the in-memory working set across the {@link terminalPurgeTtlMs}
+   * window. Before this fix, `resolveSwapId` only scanned `this.swaps`,
+   * so a prefix lookup against a terminal swap (e.g. `sphere swap status
+   * <prefix>` after the swap reached `completed`) threw `SWAP_NOT_FOUND`
+   * from the resolver before {@link getSwapStatus}' lazy-load could
+   * even run. The fix is to consult `_storedTerminalEntries` for prefix
+   * matches — those entries already carry enough metadata
+   * ({@link SwapIndexEntry}) for the prefix match without needing a
+   * storage read.
    *
    * @param idOrPrefix - Full swap ID or unique hex prefix (min 4 chars).
    * @returns The full 64-char swap ID.
-   * @throws {SphereError} `SWAP_NOT_FOUND` if no match or ambiguous prefix.
    * @throws {SphereError} `SWAP_INVALID_DEAL` if prefix is too short or not hex.
+   * @throws {SphereError} `SWAP_NOT_FOUND` if no live OR terminal entry matches.
+   * @throws {SphereError} `SWAP_AMBIGUOUS_PREFIX` if multiple entries match
+   *   the prefix across live + terminal (use more characters).
    */
   resolveSwapId(idOrPrefix: string): string {
     const trimmed = idOrPrefix.trim();
@@ -2466,19 +2632,31 @@ export class SwapModule {
     }
 
     const lower = trimmed.toLowerCase();
-    const matched = this.getSwaps().filter(s => s.swapId.startsWith(lower));
 
-    if (matched.length === 0) {
+    // Collect candidate IDs from live + terminal index. Use a Set to
+    // dedupe (a swap can briefly appear in both — e.g. when a live swap
+    // transitions to terminal in this process, it's added to
+    // _storedTerminalEntries before being removed from `this.swaps`).
+    const matched = new Set<string>();
+    for (const swap of this.swaps.values()) {
+      if (swap.swapId.startsWith(lower)) matched.add(swap.swapId);
+    }
+    for (const entry of this._storedTerminalEntries) {
+      if (entry.swapId.startsWith(lower)) matched.add(entry.swapId);
+    }
+
+    if (matched.size === 0) {
       throw new SphereError(`No swap found matching prefix: ${trimmed}`, 'SWAP_NOT_FOUND');
     }
-    if (matched.length > 1) {
+    if (matched.size > 1) {
       throw new SphereError(
-        `Ambiguous prefix "${trimmed}" matches ${matched.length} swaps. Use more characters.`,
-        'SWAP_NOT_FOUND',
+        `Ambiguous prefix "${trimmed}" matches ${matched.size} swaps. Use more characters.`,
+        'SWAP_AMBIGUOUS_PREFIX',
       );
     }
 
-    return matched[0].swapId;
+    // Set has size 1 — get the single value.
+    return matched.values().next().value as string;
   }
 
   // T2.4: IMPLEMENTATION END
