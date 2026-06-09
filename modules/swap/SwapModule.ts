@@ -91,6 +91,46 @@ const DEFAULT_TERMINAL_PURGE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 /** Grace period added to local timeout over escrow timeout: 30 seconds. */
 const LOCAL_TIMEOUT_GRACE_MS = 30_000;
 
+/**
+ * Issue #457 — assert the resolved peer binding includes a usable
+ * `transportPubkey`, and return it.
+ *
+ * Background: NIP-17 swap DMs are sealed to the recipient's `transportPubkey`
+ * — that is the ONLY key the acceptor's wallet subscribes to. Before this
+ * helper, three call sites silently fell back to `chainPubkey` via the
+ * `??` operator (counterparty resolve, escrow resolve, status-DM send).
+ * When a binding event was partially propagated (missing `transportPubkey`),
+ * the DM would be sealed to a key the receiver does NOT subscribe to —
+ * indistinguishable from a healthy proposal whose acceptor is offline.
+ *
+ * The fix is fail-fast: throw a typed `SWAP_PEER_NO_TRANSPORT` error that
+ * spells out the recommended remediation (retry after binding propagation
+ * completes). At the fire-and-forget status-DM site (line ~2260) the
+ * `.catch` already logs the error rather than propagating it to the
+ * caller — but a logged warn is dramatically better than a silent black
+ * hole.
+ */
+function requireTransportPubkey(
+  peer: { readonly transportPubkey?: string; readonly nametag?: string; readonly directAddress?: string },
+  context: string,
+): string {
+  if (peer.transportPubkey) {
+    return peer.transportPubkey;
+  }
+  const peerLabel = peer.nametag
+    ? `@${peer.nametag}`
+    : peer.directAddress
+      ? peer.directAddress
+      : '<unknown>';
+  throw new SphereError(
+    `Cannot send swap DM to ${peerLabel} (${context}): the resolved binding has no transportPubkey. `
+      + `This usually means the peer's identity binding event has not finished propagating across the relay. `
+      + `Retry once the recipient has been online long enough for their binding to publish — typically a few seconds, occasionally minutes on a laggy relay. `
+      + `Falling back to the chain pubkey would silently black-hole the DM: the recipient's wallet subscribes to NIP-17 on the transport pubkey only.`,
+    'SWAP_PEER_NO_TRANSPORT',
+  );
+}
+
 export class SwapModule {
   // =========================================================================
   // Private fields
@@ -1130,7 +1170,11 @@ export class SwapModule {
     }
     const role = 'proposer' as const;
     const counterpartyPeer = matchesPartyA ? peerB : peerA;
-    const counterpartyPubkey = counterpartyPeer.transportPubkey ?? counterpartyPeer.chainPubkey;
+    // Issue #457 — refuse to fall back to `chainPubkey`. The acceptor's wallet
+    // subscribes to NIP-17 on the transport pubkey only; a fallback DM would
+    // be sealed to a key the receiver never reads, silently dropping the
+    // proposal. Surface a typed SWAP_PEER_NO_TRANSPORT error instead.
+    const counterpartyPubkey = requireTransportPubkey(counterpartyPeer, 'proposeSwap counterparty');
     const counterpartyNametag = counterpartyPeer.nametag;
 
     // Step 6: Check pending swap limit
@@ -1187,7 +1231,11 @@ export class SwapModule {
       progress: 'proposed',
       counterpartyPubkey,
       counterpartyNametag,
-      escrowPubkey: escrowPeer.transportPubkey ?? escrowPeer.chainPubkey,
+      // Issue #457 — refuse to fall back to `chainPubkey` for the escrow
+      // either. Subsequent escrow DMs (announce / status query / cancel)
+      // would silently black-hole on a chain-pubkey send. Same fail-fast
+      // contract as the counterparty resolve above.
+      escrowPubkey: requireTransportPubkey(escrowPeer, 'proposeSwap escrow'),
       escrowDirectAddress: escrowPeer.directAddress,
       payoutVerified: false,
       createdAt: now,
@@ -2257,7 +2305,14 @@ export class SwapModule {
           .then((peer) => {
             if (peer) {
               const statusDM = buildStatusQueryDM(swapId);
-              return deps.communications.sendDM(peer.transportPubkey ?? peer.chainPubkey, statusDM).then(() => undefined);
+              // Issue #457 — refuse to fall back to `chainPubkey` here too.
+              // The escrow won't see a status query sealed to its chain
+              // pubkey, so silently sending to that key is a black-hole.
+              // The `.catch` below logs the SWAP_PEER_NO_TRANSPORT throw,
+              // which is dramatically better than a silent drop because
+              // operators see the actionable warning in their logs.
+              const escrowPubkey = requireTransportPubkey(peer, `getSwapStatus status query for swap ${swapId}`);
+              return deps.communications.sendDM(escrowPubkey, statusDM).then(() => undefined);
             }
           })
           .catch((err) => {
