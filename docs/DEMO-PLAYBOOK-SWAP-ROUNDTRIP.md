@@ -51,12 +51,19 @@ Total run time:
 
 ## §0 Before you start
 
+> **⚠️ TEMP WORKAROUND (sphere-sdk#456)** — the `@escrow-testnet` nametag
+> is currently **not resolvable** on the testnet relay. The §0 Workspace
+> block below defaults `ESCROW` to the escrow's raw DIRECT address
+> (`DIRECT://00007968fa28648e4670438bf1f3c936296e84ff46dd5ebb2e34e20092e780b652da2d3d695b`)
+> so `swap ping` / `swap propose` work today. Revert to `@escrow-testnet`
+> once #456 is closed.
+
 ### Prerequisites
 
 - `sphere` CLI on `PATH` (`which sphere` should resolve).
 - Outbound HTTPS to: `faucet.unicity.network`, `goggregator-test.unicity.network`, Unicity IPFS gateways.
 - Outbound WSS to: `wss://nostr-relay.testnet.unicity.network`.
-- An escrow service reachable on the same testnet relay set as the wallets. The default is `@escrow-testnet`; override with `--escrow @your-escrow` or `--escrow DIRECT://…` on `swap propose`.
+- An escrow service reachable on the same testnet relay set as the wallets. Default while #456 is open: the DIRECT address baked into §0's `ESCROW=…` line below. Override with `--escrow @your-escrow` or `--escrow DIRECT://…` on `swap propose`.
 - A clean workspace (the script wipes its own scratch dir on exit unless `KEEP=1`).
 
 ### Dependency check (one-time setup)
@@ -95,8 +102,12 @@ BOB_TAG="bob-$SUFFIX"
 echo "ALICE_TAG=$ALICE_TAG"
 echo "BOB_TAG=$BOB_TAG"
 
-# Default escrow. Override if your environment uses a different one.
-ESCROW="${ESCROW:-@escrow-testnet}"
+# Default escrow.
+# TEMP (sphere-sdk#456): the @escrow-testnet nametag is currently not
+# resolvable on the testnet relay (binding event aged out / not republished).
+# Use the escrow's raw DIRECT address until the nametag is re-bound.
+# Revert this default to @escrow-testnet once #456 is closed.
+ESCROW="${ESCROW:-DIRECT://00007968fa28648e4670438bf1f3c936296e84ff46dd5ebb2e34e20092e780b652da2d3d695b}"
 echo "ESCROW=$ESCROW"
 
 # CLI emits mnemonic on stdout in non-TTY when --no-encrypt-mnemonic
