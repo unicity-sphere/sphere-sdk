@@ -560,6 +560,25 @@ export const NETWORKS = {
 export type NetworkType = keyof typeof NETWORKS;
 export type NetworkConfig = (typeof NETWORKS)[NetworkType];
 
+/**
+ * Default escrow service address for the swap module.
+ *
+ * Used as the fallback when neither the per-deal `escrowAddress` nor the
+ * module-level `SwapModuleConfig.defaultEscrowAddress` is set. Hardcoded here
+ * so a wallet initialised with `swap: true` (no explicit escrow override) can
+ * still propose / accept swaps without per-call wiring.
+ *
+ * Versioned (`-v1`) so a future operator rotation (e.g. when the production
+ * escrow daemon's transport key changes and the old binding is no longer
+ * recoverable) can publish a new nametag (`-v2`, `-v3`, ...) without breaking
+ * older SDK builds that still reference the previous default.
+ *
+ * Tracked in sphere-sdk#456: the previous default `@escrow-testnet` was never
+ * published by the production daemon and proved unrecoverable; rotating to a
+ * fresh nametag was the operationally cheapest fix.
+ */
+export const DEFAULT_ESCROW_ADDRESS = '@escrow-testnet-v1' as const;
+
 // =============================================================================
 // Timeouts & Limits
 // =============================================================================

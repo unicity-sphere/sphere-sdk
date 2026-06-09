@@ -104,6 +104,7 @@ import {
   getAddressId,
   DEFAULT_BASE_PATH,
   DEFAULT_ENCRYPTION_KEY,
+  DEFAULT_ESCROW_ADDRESS,
   NETWORKS,
   type NetworkType,
 } from '../constants';
@@ -1215,16 +1216,25 @@ export class Sphere {
 
   /**
    * Resolve swap module config from Sphere.init() options.
-   * - `true` → enable with defaults
-   * - `SwapModuleConfig` → pass through
+   * - `true` → enable with defaults (uses hardcoded `DEFAULT_ESCROW_ADDRESS`)
+   * - `SwapModuleConfig` → pass through, defaulting `defaultEscrowAddress`
+   *   to `DEFAULT_ESCROW_ADDRESS` if the caller did not set one
    * - `false`/`undefined` → no swap module
+   *
+   * The hardcoded `DEFAULT_ESCROW_ADDRESS` (see `constants.ts`) means a wallet
+   * initialised with `swap: true` and no explicit escrow override can still
+   * propose / accept swaps against the canonical escrow nametag without any
+   * per-call wiring (sphere-sdk#456).
    */
   private static resolveSwapConfig(
     config: SwapModuleConfig | boolean | undefined,
   ): SwapModuleConfig | undefined {
     if (config === false || config === undefined) return undefined;
-    if (config === true) return {};
-    return config;
+    if (config === true) return { defaultEscrowAddress: DEFAULT_ESCROW_ADDRESS };
+    return {
+      ...config,
+      defaultEscrowAddress: config.defaultEscrowAddress ?? DEFAULT_ESCROW_ADDRESS,
+    };
   }
 
   /**
