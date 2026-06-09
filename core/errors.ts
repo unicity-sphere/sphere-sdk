@@ -175,6 +175,23 @@ export type SphereErrorCode =
    * thrown error's message text spells this out.
    */
   | 'SWAP_PEER_NO_TRANSPORT'
+  // Issue #447 — terminal-swap blindness fixes.
+  // `SWAP_ALREADY_TERMINAL` is thrown by write-side methods (acceptSwap,
+  // cancelSwap, deposit, rejectSwap, verifyPayout) when the swap exists
+  // but is already in a terminal state (completed/cancelled/failed).
+  // Previously these surfaces threw `SWAP_NOT_FOUND` because terminal
+  // swaps are deliberately kept out of the in-memory working set — that
+  // was inconsistent with `getSwapStatus`, which now lazy-loads
+  // terminal swaps and reports their state. Callers that previously
+  // caught `SWAP_NOT_FOUND` to detect "cannot mutate this swap" should
+  // also catch `SWAP_ALREADY_TERMINAL`.
+  //
+  // `SWAP_AMBIGUOUS_PREFIX` distinguishes the "prefix matches multiple
+  // swaps" case from the "no match" case in `resolveSwapId`. Previously
+  // both surfaces shared `SWAP_NOT_FOUND` which made it impossible for
+  // callers to give the user a "use more characters" hint.
+  | 'SWAP_ALREADY_TERMINAL'
+  | 'SWAP_AMBIGUOUS_PREFIX'
   // UXF transfer protocol error codes (T.1.D — bundle envelope decode failures).
   // The protocol surfaces three structurally-distinct failure modes that callers
   // and the receive worker must distinguish:

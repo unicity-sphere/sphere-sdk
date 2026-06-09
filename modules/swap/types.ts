@@ -488,6 +488,28 @@ export interface GetSwapsFilter {
   readonly role?: SwapRole;
   /** When true, exclude swaps where progress is 'completed', 'cancelled', or 'failed' */
   readonly excludeTerminal?: boolean;
+  /**
+   * Issue #447 — When true, also include terminal swaps that are present in
+   * the persisted swap index but not in the in-memory working set. This is
+   * the working-set complement of {@link excludeTerminal}: by default
+   * `getSwaps()` only returns swaps cached in {@link SwapModule.swaps},
+   * which excludes terminal entries that {@link SwapModule.loadFromStorage}
+   * deliberately kept out of memory to bound the active set.
+   *
+   * Terminal entries returned via this path are STUB SwapRefs materialized
+   * from the lightweight {@link SwapIndexEntry} (swapId/progress/role/
+   * createdAt only) — `deal`, `manifest`, and most other fields will be
+   * empty placeholders. Callers needing the full record should resolve
+   * each id via {@link SwapModule.getSwapStatus} (which lazy-loads from
+   * storage). Sufficient for `sphere swap list` to show id, role,
+   * progress, and createdAt.
+   *
+   * Has no effect when combined with `excludeTerminal: true` — terminal
+   * entries are filtered out either way.
+   *
+   * Default: `false` (preserves existing list behavior).
+   */
+  readonly includeTerminal?: boolean;
 }
 
 // =============================================================================
