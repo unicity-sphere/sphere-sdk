@@ -267,7 +267,7 @@ function captureSentPayloads(sphere: Sphere): {
  * Injection bypasses Nostr decryption + relay subscription entirely
  * while still walking the production `handleIncomingTransfer` pipeline.
  */
-function injectTokenTransfer(sphere: Sphere, transfer: IncomingTokenTransfer): void {
+async function injectTokenTransfer(sphere: Sphere, transfer: IncomingTokenTransfer): Promise<void> {
   const sphereAny = sphere as unknown as {
     _transportMux: MultiAddressTransportMux | null;
     _currentAddressIndex: number;
@@ -278,7 +278,8 @@ function injectTokenTransfer(sphere: Sphere, transfer: IncomingTokenTransfer): v
   if (!adapter) {
     throw new Error('Bob #2 has no Mux adapter — cannot inject token transfer');
   }
-  adapter.dispatchTokenTransfer(transfer);
+  // Issue #464 — dispatch is now async and awaits handler durability.
+  await adapter.dispatchTokenTransfer(transfer);
 }
 
 // =============================================================================
@@ -444,7 +445,7 @@ describe.skipIf(SKIP)(
           `[#223-iso] injecting synthetic event into bob #2 mux adapter — ` +
           `sender=${aliceTransportPubkey.slice(0, 16)}…`,
         );
-        injectTokenTransfer(bobReloaded, synthetic);
+        await injectTokenTransfer(bobReloaded, synthetic);
 
         // Poll Bob #2 balance. `dispatchTokenTransfer` invokes the
         // registered handler (PaymentsModule.handleIncomingTransfer)
