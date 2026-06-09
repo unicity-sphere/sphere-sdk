@@ -883,7 +883,21 @@ export class LifecycleManager {
         // so we re-check at the top of the next loop iteration.
         lastError = result.code ?? (result.transient ? 'TRANSIENT' : 'PERMANENT');
       } catch (err) {
-        lastError = err instanceof Error ? err.message : String(err);
+        // Issue #450 hardening: prefer a typed `.code` over the raw
+        // message so the stuck-detection failureKey stays stable
+        // iteration-over-iteration. Without this, a typed error whose
+        // message embeds a varying value (e.g. elapsed-ms) would
+        // produce a different key every loop and the counter would
+        // never reach the threshold. In practice
+        // `publishAggregatorPointerBestEffort` converts every internal
+        // throw to a structured result before returning, so the catch
+        // arm is currently dead code — this is defense-in-depth
+        // against future regressions that let a typed error escape.
+        const errCode =
+          err && typeof (err as { code?: unknown }).code === 'string'
+            ? (err as { code: string }).code
+            : undefined;
+        lastError = errCode ?? (err instanceof Error ? err.message : String(err));
       }
 
       // Issue #450: update the stuck-progress counter. Key combines
