@@ -3385,10 +3385,16 @@ export class Sphere {
   private ensureUnicityIdTokenStored(): void {
     const name = this._identity?.nametag;
     if (!name) return;
+    // Capture the address-bound collaborators NOW: the mint below is a
+    // multi-second network round-trip, and switchToAddress() swaps
+    // this._payments/this._identity synchronously — a late re-read would store
+    // address A's token into address B's nametag list.
+    const payments = this._payments;
+    const privateKey = this._identity?.privateKey;
     void (async () => {
       try {
         // Already stored for this address? (v2 entries carry the CBOR hex string.)
-        const existing = this._payments
+        const existing = payments
           .getNametags()
           .find((n) => n.name === name && n.format === 'v2-cbor' && typeof n.token === 'string');
         if (existing) return;
@@ -3400,7 +3406,6 @@ export class Sphere {
         };
         const trustBaseJson = oracle.getTrustBaseJson?.() ?? null;
         const aggregatorUrl = oracle.getAggregatorUrl?.();
-        const privateKey = this._identity?.privateKey;
         if (!trustBaseJson || !aggregatorUrl || !privateKey) {
           logger.warn('Sphere', `Unicity ID token for @${name} not minted (no v2 oracle config) — retried on next load`);
           return;
@@ -3413,7 +3418,7 @@ export class Sphere {
           trustBaseJson,
         });
         const result = await minter.mintUnicityIdToken(name);
-        await this._payments.setNametag({
+        await payments.setNametag({
           name,
           token: result.tokenCborHex,
           timestamp: Date.now(),
