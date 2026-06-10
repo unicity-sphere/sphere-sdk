@@ -35,7 +35,23 @@ export interface PostIntentRequest {
   description: string;
   intentType: IntentType;
   category?: string;
-  price?: number;
+  /**
+   * Price as a decimal-string bigint in the quote currency's smallest
+   * units. Same convention as token amounts everywhere else in the SDK
+   * (TXF amount fields, transfer payloads, etc.): internally bigint,
+   * over the wire decimal-string. This avoids JavaScript's `Number`
+   * precision loss for values above 2^53.
+   *
+   * Pass `(myBigInt).toString()` from a bigint source. NEVER cast a
+   * bigint to `Number` first — for 18-decimal coins, any price above
+   * roughly 0.09 in human units (i.e. 9 × 10^16 smallest units) loses
+   * precision and risks server-side rejection.
+   *
+   * Human-readable display is the UI layer's responsibility: render
+   * the bigint by dividing by `10^decimals` for the coin and showing
+   * a fractional number to the user.
+   */
+  price?: string;
   currency?: string;
   location?: string;
   contactHandle?: string;
@@ -52,6 +68,7 @@ export interface MarketIntent {
   id: string;
   intentType: IntentType;
   category?: string;
+  /** Decimal-string bigint — see {@link PostIntentRequest.price}. */
   price?: string;
   currency: string;
   location?: string;
@@ -68,7 +85,8 @@ export interface SearchIntentResult {
   description: string;
   intentType: IntentType;
   category?: string;
-  price?: number;
+  /** Decimal-string bigint — see {@link PostIntentRequest.price}. */
+  price?: string;
   currency: string;
   location?: string;
   contactMethod: string;
@@ -80,8 +98,10 @@ export interface SearchIntentResult {
 export interface SearchFilters {
   intentType?: IntentType;
   category?: string;
-  minPrice?: number;
-  maxPrice?: number;
+  /** Decimal-string bigint — see {@link PostIntentRequest.price}. */
+  minPrice?: string;
+  /** Decimal-string bigint — see {@link PostIntentRequest.price}. */
+  maxPrice?: string;
   location?: string;
   /** Minimum similarity score (0–1). Results below this threshold are excluded (client-side). */
   minScore?: number;

@@ -175,7 +175,11 @@ describe('MarketModule', () => {
         description: 'Looking for widgets',
         intentType: 'buy',
         category: 'goods',
-        price: 100,
+        // Decimal-string bigint — same convention as token amounts
+        // everywhere else in the SDK. Prevents Number precision loss
+        // for values above 2^53 (an 18-decimal coin hits that limit at
+        // ~0.09 in human units).
+        price: '100',
         currency: 'USD',
         location: 'NYC',
         contactHandle: '@alice',
@@ -189,7 +193,7 @@ describe('MarketModule', () => {
       expect(body.description).toBe('Looking for widgets');
       expect(body.intent_type).toBe('buy');
       expect(body.category).toBe('goods');
-      expect(body.price).toBe(100);
+      expect(body.price).toBe('100');
       expect(body.contact_handle).toBe('@alice');
       expect(body.expires_in_days).toBe(30);
       // camelCase result mapping
@@ -219,7 +223,7 @@ describe('MarketModule', () => {
       mod.initialize(mockDeps());
 
       const result = await mod.search('widget', {
-        filters: { intentType: 'sell', minPrice: 10, maxPrice: 200 },
+        filters: { intentType: 'sell', minPrice: '10', maxPrice: '200' },
         limit: 5,
       });
 
@@ -229,8 +233,8 @@ describe('MarketModule', () => {
       const body = JSON.parse(opts?.body as string);
       expect(body.query).toBe('widget');
       expect(body.intent_type).toBe('sell');
-      expect(body.min_price).toBe(10);
-      expect(body.max_price).toBe(200);
+      expect(body.min_price).toBe('10');
+      expect(body.max_price).toBe('200');
       expect(body.limit).toBe(5);
       // No auth headers on public endpoint
       const headers = opts?.headers as Record<string, string>;
@@ -743,13 +747,13 @@ describe('MarketModule', () => {
         await mod.postIntent({
           description: 'Looking for widgets',
           intentType: 'buy',
-          price: 100,
+          price: '100',
           contactHandle: '@alice',
         });
 
         const [, opts] = fetchSpy.mock.calls[0];
         const body = JSON.parse(opts?.body as string);
-        expect(body.price).toBe(100);
+        expect(body.price).toBe('100');
         expect(body.contact_handle).toBe('@alice');
         expect(body.category).toBeUndefined();
         expect(body.currency).toBeUndefined();
@@ -763,11 +767,15 @@ describe('MarketModule', () => {
         }));
         const mod = createRegisteredModule();
 
+        // Decimal-string bigint convention. UI layers display
+        // human-readable fractional numbers (e.g. 99.99) by dividing
+        // by 10^decimals; the wire and storage representations stay
+        // pure bigint to avoid Number precision loss.
         await mod.postIntent({
           description: 'Test widget',
           intentType: 'sell',
           category: 'goods',
-          price: 99.99,
+          price: '99990000000000000000', // = 99.99 in 18-decimal smallest units
           currency: 'EUR',
           location: 'Berlin',
           contactHandle: '@bob',
@@ -779,11 +787,22 @@ describe('MarketModule', () => {
         expect(body.description).toBe('Test widget');
         expect(body.intent_type).toBe('sell');
         expect(body.category).toBe('goods');
-        expect(body.price).toBe(99.99);
+        expect(body.price).toBe('99990000000000000000');
         expect(body.currency).toBe('EUR');
         expect(body.location).toBe('Berlin');
         expect(body.contact_handle).toBe('@bob');
         expect(body.expires_in_days).toBe(14);
+      });
+
+      it('preserves bigint precision past Number.MAX_SAFE_INTEGER', () => {
+        // The whole point of the string convention: this exact value
+        // would be `1e17` if we used Number, but as a string it
+        // survives the round-trip without precision loss.
+        const huge = '100000000000000000'; // 10^17
+        expect(huge.length).toBe(18);
+        // Round-trips through JSON without precision loss.
+        const reparsed: { price?: string } = JSON.parse(JSON.stringify({ price: huge }));
+        expect(reparsed.price).toBe(huge);
       });
     });
 
@@ -842,12 +861,12 @@ describe('MarketModule', () => {
         mod.initialize(mockDeps());
 
         await mod.search('widget', {
-          filters: { minPrice: 10 },
+          filters: { minPrice: '10' },
         });
 
         const [, opts] = fetchSpy.mock.calls[0];
         const body = JSON.parse(opts?.body as string);
-        expect(body.min_price).toBe(10);
+        expect(body.min_price).toBe('10');
       });
 
       it('should map maxPrice to max_price', async () => {
@@ -856,12 +875,12 @@ describe('MarketModule', () => {
         mod.initialize(mockDeps());
 
         await mod.search('widget', {
-          filters: { maxPrice: 200 },
+          filters: { maxPrice: '200' },
         });
 
         const [, opts] = fetchSpy.mock.calls[0];
         const body = JSON.parse(opts?.body as string);
-        expect(body.max_price).toBe(200);
+        expect(body.max_price).toBe('200');
       });
 
       it('should not add extra fields for empty filters', async () => {
