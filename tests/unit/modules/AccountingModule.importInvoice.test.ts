@@ -1,13 +1,19 @@
 /**
- * AccountingModule — importInvoice() tests (§3.3)
+ * AccountingModule — importInvoice() tests (§3.3) — v2 engine path.
  *
- * Validates the import flow: token type check, tokenData parsing,
- * terms business validation, duplicate detection, proof verification bypass,
- * storage, and retroactive payment indexing.
+ * importInvoice() accepts ONLY a v2 engine blob (hex string). The flow:
+ * engine.decodeToken → engine.verify (proof) → engine.tokenId →
+ * engine.readTokenData (terms JSON) → business validation of terms →
+ * duplicate check → store via payments.addToken → retroactive scan.
  *
- * importInvoice() internally calls Token.fromJSON() + token.verify() which
- * WILL FAIL with synthetic test data. We mock the SDK Token import at the
- * module level to bypass proof verification.
+ * Legacy v1 TXF invoice objects are rejected with INVOICE_INVALID_DATA —
+ * their proof verification required the removed v1 engine. The old v1
+ * canonical-hash and SdkToken.verify checks are covered by engine.verify
+ * by construction (the proof chain binds terms AND token id on-chain).
+ *
+ * Uses the FakeTokenEngine harness (no SDK vi.mock): valid import blobs are
+ * produced by minting a data token with crafted terms on the SAME engine
+ * instance the module is wired with.
  *
  * @see docs/ACCOUNTING-TEST-SPEC.md §3.3
  */
@@ -17,76 +23,46 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   createTestAccountingModule,
-  createTestToken,
   createTestTransfer,
   SphereError,
   INVOICE_TOKEN_TYPE_HEX,
+  DEFAULT_TEST_IDENTITY,
 } from './accounting-test-helpers.js';
+import { FakeTokenEngine } from '../token-engine/FakeTokenEngine';
+import { encodeTokenBlob } from '../../../token-engine/token-blob';
+import { bytesToHex, hexToBytes } from '../../../core/crypto';
 import type { AccountingModule } from '../../../modules/accounting/AccountingModule.js';
 import type { TestAccountingModuleMocks } from './accounting-test-helpers.js';
 import type { InvoiceTerms } from '../../../modules/accounting/types.js';
+import type { Token } from '../../../types/index.js';
 
 // =============================================================================
-// Mock SDK Token — bypass proof verification for importInvoice()
-// =============================================================================
-
-// C5-R17 fix: Mock returns VerificationResult-like object (not boolean).
-// Real Token.verify() returns { isSuccessful: boolean, ... }.
-// C1 fix: Mock returns .id.toJSON() matching the tokenId for canonical ID verification.
-let mockVerifyResult: unknown = { isSuccessful: true };
-const createMockSdkToken = (json: any) => ({
-  verify: vi.fn().mockImplementation(async () => mockVerifyResult),
-  id: { toJSON: () => json?.genesis?.data?.tokenId ?? null },
-});
-vi.mock('@unicitylabs/state-transition-sdk/lib/token/Token', () => ({
-  Token: {
-    fromJSON: vi.fn().mockImplementation(async (json: any) => createMockSdkToken(json)),
-  },
-}));
-vi.mock('@unicitylabs/state-transition-sdk/lib/token/Token.js', () => ({
-  Token: {
-    fromJSON: vi.fn().mockImplementation(async (json: any) => createMockSdkToken(json)),
-  },
-}));
-
-// Mock txfToToken for the storage path
-vi.mock('../../../serialization/txf-serializer.js', () => ({
-  txfToToken: vi.fn().mockImplementation((tokenId: string, _txf: unknown) => ({
-    id: tokenId,
-    coinId: 'INVOICE',
-    symbol: 'INVOICE',
-    name: 'Invoice',
-    decimals: 0,
-    amount: '0',
-    status: 'confirmed',
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-    sdkData: JSON.stringify(_txf),
-  })),
-}));
-
-// =============================================================================
-// Shared setup
+// Shared setup — module wired with a FakeTokenEngine
 // =============================================================================
 
 let module: AccountingModule;
 let mocks: TestAccountingModuleMocks;
+let engine: FakeTokenEngine;
 
 function setup(overrides?: Parameters<typeof createTestAccountingModule>[0]) {
-  const result = createTestAccountingModule(overrides);
+  engine = new FakeTokenEngine();
+  const result = createTestAccountingModule({ tokenEngine: engine, ...overrides });
   module = result.module;
   mocks = result.mocks;
+  // addToken is not part of the base payments mock — add it.
+  (mocks.payments as any).addToken = vi.fn().mockResolvedValue(undefined);
 }
 
 afterEach(() => {
   try { module.destroy(); } catch { /* ignore */ }
-  mockVerifyResult = { isSuccessful: true }; // Reset verify mock for next test
   vi.clearAllMocks();
 });
 
 // =============================================================================
-// Helper: create valid invoice terms
+// Helpers: valid invoice terms + v2 blob minting
 // =============================================================================
+
+const RECIPIENT_PUBKEY = hexToBytes(DEFAULT_TEST_IDENTITY.chainPubkey);
 
 function validTerms(overrides?: Partial<InvoiceTerms>): InvoiceTerms {
   return {
@@ -101,36 +77,63 @@ function validTerms(overrides?: Partial<InvoiceTerms>): InvoiceTerms {
   };
 }
 
+/** Mint a v2 invoice data token with the given (possibly crafted) terms and return its blob hex. */
+async function mintInvoiceBlob(
+  eng: FakeTokenEngine,
+  terms: unknown,
+): Promise<{ blob: string; tokenId: string }> {
+  const token = await eng.mintDataToken({
+    recipientPubkey: RECIPIENT_PUBKEY,
+    data: new TextEncoder().encode(JSON.stringify(terms)),
+    tokenType: hexToBytes(INVOICE_TOKEN_TYPE_HEX),
+  });
+  return {
+    blob: bytesToHex(encodeTokenBlob(eng.encodeToken(token))),
+    tokenId: eng.tokenId(token),
+  };
+}
+
+function expectCode(code: string) {
+  return (e: unknown) => e instanceof SphereError && (e as SphereError).code === code;
+}
+
 // =============================================================================
-// UT-IMPORT-001: Valid invoice token import
+// UT-IMPORT-001: Valid invoice blob import
 // =============================================================================
 
-describe('UT-IMPORT-001: Valid invoice token import', () => {
+describe('UT-IMPORT-001: Valid invoice blob import', () => {
   beforeEach(() => setup());
 
-  it('adds terms to cache and stores token via payments.addToken()', async () => {
+  it('adds terms to cache, stores the blob via payments.addToken(), fires invoice:created', async () => {
     await module.load();
 
     const terms = validTerms();
-    const token = createTestToken(terms);
-    const tokenId = token.genesis.data.tokenId;
+    const { blob, tokenId } = await mintInvoiceBlob(engine, terms);
 
-    // Mock addToken on payments
-    (mocks.payments as any).addToken = vi.fn().mockResolvedValue(undefined);
-
-    const result = await module.importInvoice(token);
+    const result = await module.importInvoice(blob);
 
     // Terms are returned
     expect(result).toBeDefined();
     expect(result.createdAt).toBe(terms.createdAt);
     expect(result.targets).toEqual(terms.targets);
 
-    // Cache is populated
+    // Cache is populated under the engine's genesis-stable token id
     const mod = module as any;
     expect(mod.invoiceTermsCache.has(tokenId)).toBe(true);
 
-    // addToken was called
-    expect((mocks.payments as any).addToken).toHaveBeenCalled();
+    // Stored exactly once, with the blob hex as sdkData + INVOICE coinId
+    const addToken = (mocks.payments as any).addToken;
+    expect(addToken).toHaveBeenCalledOnce();
+    const stored = addToken.mock.calls[0][0];
+    expect(stored.id).toBe(tokenId);
+    expect(stored.coinId).toBe(INVOICE_TOKEN_TYPE_HEX);
+    expect(stored.sdkData).toBe(blob);
+
+    // invoice:created fired (imported invoices are not locally confirmed)
+    expect(mod.deps.emitEvent).toHaveBeenCalledWith(
+      'invoice:created',
+      { invoiceId: tokenId, confirmed: false },
+    );
   });
 });
 
@@ -141,111 +144,227 @@ describe('UT-IMPORT-001: Valid invoice token import', () => {
 describe('UT-IMPORT-002: Duplicate import throws INVOICE_ALREADY_EXISTS', () => {
   beforeEach(() => setup());
 
-  it('throws INVOICE_ALREADY_EXISTS when importing same token twice', async () => {
+  it('throws INVOICE_ALREADY_EXISTS when importing the same blob twice', async () => {
     await module.load();
 
-    const terms = validTerms();
-    const token = createTestToken(terms);
+    const { blob } = await mintInvoiceBlob(engine, validTerms());
 
-    (mocks.payments as any).addToken = vi.fn().mockResolvedValue(undefined);
+    await module.importInvoice(blob);
 
-    await module.importInvoice(token);
-
-    // Second import should throw
-    await expect(module.importInvoice(token)).rejects.toSatisfy(
-      (e: unknown) => e instanceof SphereError && (e as SphereError).code === 'INVOICE_ALREADY_EXISTS',
+    await expect(module.importInvoice(blob)).rejects.toSatisfy(
+      expectCode('INVOICE_ALREADY_EXISTS'),
     );
   });
 });
 
 // =============================================================================
-// UT-IMPORT-003: Wrong token type throws INVOICE_WRONG_TOKEN_TYPE
+// UT-IMPORT-003: Legacy v1 TXF object rejected with INVOICE_INVALID_DATA
 // =============================================================================
 
-describe('UT-IMPORT-003: Wrong token type throws INVOICE_WRONG_TOKEN_TYPE', () => {
+describe('UT-IMPORT-003: Legacy (v1 TXF) invoice object is rejected', () => {
   beforeEach(() => setup());
 
-  it('rejects token with non-invoice tokenType', async () => {
+  it('throws INVOICE_INVALID_DATA with a "Legacy" message for a non-string token', async () => {
     await module.load();
 
-    const terms = validTerms();
-    const token = createTestToken(terms);
-    // Override tokenType to a non-invoice value
-    token.genesis.data.tokenType = 'deadbeef'.repeat(8);
+    // A v1-era TXF-shaped object (any non-string) — verification of these
+    // required the removed v1 engine, so import refuses them outright.
+    const legacyTxfObject = {
+      version: '2.0',
+      genesis: {
+        data: {
+          tokenId: 'a'.repeat(64),
+          tokenType: INVOICE_TOKEN_TYPE_HEX,
+          coinData: [],
+          tokenData: JSON.stringify(validTerms()),
+        },
+      },
+      state: { data: '', predicate: '' },
+      transactions: [],
+    };
 
-    await expect(module.importInvoice(token)).rejects.toSatisfy(
-      (e: unknown) => e instanceof SphereError && (e as SphereError).code === 'INVOICE_WRONG_TOKEN_TYPE',
+    const err = await module.importInvoice(legacyTxfObject as any).catch((e) => e);
+    expect(err).toBeInstanceOf(SphereError);
+    expect(err.code).toBe('INVOICE_INVALID_DATA');
+    expect(err.message).toContain('Legacy (v1 TXF) invoice tokens are no longer supported');
+
+    // Nothing was stored
+    expect((mocks.payments as any).addToken).not.toHaveBeenCalled();
+  });
+});
+
+// =============================================================================
+// UT-IMPORT-004: No token engine throws INVOICE_ORACLE_REQUIRED
+// =============================================================================
+
+describe('UT-IMPORT-004: Missing token engine throws INVOICE_ORACLE_REQUIRED', () => {
+  it('rejects a blob string when the module has no engine', async () => {
+    // Mint a perfectly valid blob on a standalone engine…
+    const minter = new FakeTokenEngine();
+    const { blob } = await mintInvoiceBlob(minter, validTerms());
+
+    // …but wire the module WITHOUT an engine.
+    setup({ tokenEngine: undefined });
+    await module.load();
+
+    await expect(module.importInvoice(blob)).rejects.toSatisfy(
+      expectCode('INVOICE_ORACLE_REQUIRED'),
     );
   });
 });
 
 // =============================================================================
-// UT-IMPORT-004: Unparseable tokenData throws INVOICE_INVALID_DATA
+// UT-IMPORT-005: Proof verification failure throws INVOICE_INVALID_PROOF
 // =============================================================================
 
-describe('UT-IMPORT-004: Unparseable tokenData throws INVOICE_INVALID_DATA', () => {
+describe('UT-IMPORT-005: Verification failure rejects import', () => {
   beforeEach(() => setup());
 
-  it('rejects token with corrupt JSON in tokenData', async () => {
+  it('throws INVOICE_INVALID_PROOF when engine.verify reports ok: false', async () => {
     await module.load();
 
-    const terms = validTerms();
-    const token = createTestToken(terms);
-    token.genesis.data.tokenData = '{not valid json!!!';
+    const { blob } = await mintInvoiceBlob(engine, validTerms());
 
-    await expect(module.importInvoice(token)).rejects.toSatisfy(
-      (e: unknown) => e instanceof SphereError && (e as SphereError).code === 'INVOICE_INVALID_DATA',
+    vi.spyOn(engine, 'verify').mockResolvedValue({ ok: false, reason: 'bad proof' });
+
+    await expect(module.importInvoice(blob)).rejects.toSatisfy(
+      expectCode('INVOICE_INVALID_PROOF'),
+    );
+    expect((mocks.payments as any).addToken).not.toHaveBeenCalled();
+  });
+});
+
+// =============================================================================
+// UT-IMPORT-006: Missing tokenData throws INVOICE_INVALID_DATA
+// =============================================================================
+
+describe('UT-IMPORT-006: Missing tokenData throws INVOICE_INVALID_DATA', () => {
+  beforeEach(() => setup());
+
+  it('rejects a token that carries no data payload (engine.readTokenData → null)', async () => {
+    await module.load();
+
+    // A value-less plain mint has no genesis data — readTokenData returns null.
+    const dataless = await engine.mint({ recipientPubkey: RECIPIENT_PUBKEY });
+    const blob = bytesToHex(encodeTokenBlob(engine.encodeToken(dataless)));
+
+    await expect(module.importInvoice(blob)).rejects.toSatisfy(
+      expectCode('INVOICE_INVALID_DATA'),
     );
   });
 });
 
 // =============================================================================
-// UT-IMPORT-005: Missing genesis data throws INVOICE_INVALID_DATA
+// UT-IMPORT-007: Unparseable tokenData throws INVOICE_INVALID_DATA
 // =============================================================================
 
-describe('UT-IMPORT-005: Missing tokenData throws INVOICE_INVALID_DATA', () => {
+describe('UT-IMPORT-007: Unparseable tokenData throws INVOICE_INVALID_DATA', () => {
   beforeEach(() => setup());
 
-  it('rejects token with empty tokenData', async () => {
+  it('rejects a data token whose payload is not valid JSON', async () => {
     await module.load();
 
-    const terms = validTerms();
-    const token = createTestToken(terms);
-    token.genesis.data.tokenData = '';
+    const token = await engine.mintDataToken({
+      recipientPubkey: RECIPIENT_PUBKEY,
+      data: new TextEncoder().encode('{not valid json!!!'),
+      tokenType: hexToBytes(INVOICE_TOKEN_TYPE_HEX),
+    });
+    const blob = bytesToHex(encodeTokenBlob(engine.encodeToken(token)));
 
-    await expect(module.importInvoice(token)).rejects.toSatisfy(
-      (e: unknown) => e instanceof SphereError && (e as SphereError).code === 'INVOICE_INVALID_DATA',
+    await expect(module.importInvoice(blob)).rejects.toSatisfy(
+      expectCode('INVOICE_INVALID_DATA'),
     );
   });
 });
 
 // =============================================================================
-// UT-IMPORT-006: Invalid token structure (empty targets) throws INVOICE_INVALID_DATA
+// UT-IMPORT-008: Terms business validation (createdAt skew, dueDate, targets)
 // =============================================================================
 
-describe('UT-IMPORT-006: Invalid token structure throws INVOICE_INVALID_DATA', () => {
+describe('UT-IMPORT-008: Terms business validation rejects invalid terms', () => {
   beforeEach(() => setup());
 
-  it('rejects token with empty targets array in terms', async () => {
+  async function importTerms(terms: unknown): Promise<unknown> {
+    const { blob } = await mintInvoiceBlob(engine, terms);
+    return module.importInvoice(blob).catch((e) => e);
+  }
+
+  it('rejects createdAt beyond the allowed 1-day clock skew', async () => {
     await module.load();
 
-    const terms = { createdAt: Date.now() - 1000, targets: [] };
-    const token = createTestToken(terms as any);
+    const err = await importTerms(validTerms({ createdAt: Date.now() + 2 * 86400000 }));
+    expect(err).toBeInstanceOf(SphereError);
+    expect((err as SphereError).code).toBe('INVOICE_INVALID_DATA');
+    expect((err as SphereError).message).toMatch(/createdAt/);
+  });
 
-    await expect(module.importInvoice(token)).rejects.toSatisfy(
-      (e: unknown) => e instanceof SphereError && (e as SphereError).code === 'INVOICE_INVALID_DATA',
-    );
+  it('rejects missing createdAt', async () => {
+    await module.load();
+
+    const terms: any = validTerms();
+    delete terms.createdAt;
+    const err = await importTerms(terms);
+    expect(err).toBeInstanceOf(SphereError);
+    expect((err as SphereError).code).toBe('INVOICE_INVALID_DATA');
+  });
+
+  it('rejects a dueDate that is not a positive integer', async () => {
+    await module.load();
+
+    const err = await importTerms(validTerms({ dueDate: -1 }));
+    expect(err).toBeInstanceOf(SphereError);
+    expect((err as SphereError).code).toBe('INVOICE_INVALID_DATA');
+    expect((err as SphereError).message).toMatch(/dueDate/);
+  });
+
+  it('rejects an empty targets array', async () => {
+    await module.load();
+
+    const err = await importTerms({ createdAt: Date.now() - 1000, targets: [] });
+    expect(err).toBeInstanceOf(SphereError);
+    expect((err as SphereError).code).toBe('INVOICE_INVALID_DATA');
+    expect((err as SphereError).message).toMatch(/targets/);
+  });
+
+  it('rejects a target address that is not DIRECT://', async () => {
+    await module.load();
+
+    const err = await importTerms(validTerms({
+      targets: [{ address: 'not-direct', assets: [{ coin: ['UCT', '100'] as [string, string] }] }],
+    }));
+    expect(err).toBeInstanceOf(SphereError);
+    expect((err as SphereError).code).toBe('INVOICE_INVALID_DATA');
+  });
+
+  it('rejects a target with no assets', async () => {
+    await module.load();
+
+    const err = await importTerms(validTerms({
+      targets: [{ address: 'DIRECT://target_addr_1', assets: [] }],
+    }));
+    expect(err).toBeInstanceOf(SphereError);
+    expect((err as SphereError).code).toBe('INVOICE_INVALID_DATA');
+  });
+
+  it('rejects a non-integer coin amount', async () => {
+    await module.load();
+
+    const err = await importTerms(validTerms({
+      targets: [{ address: 'DIRECT://target_addr_1', assets: [{ coin: ['UCT', '10.5'] as [string, string] }] }],
+    }));
+    expect(err).toBeInstanceOf(SphereError);
+    expect((err as SphereError).code).toBe('INVOICE_INVALID_DATA');
   });
 });
 
 // =============================================================================
-// UT-IMPORT-007: Multi-target terms parsed correctly
+// UT-IMPORT-009: Multi-target terms parsed correctly
 // =============================================================================
 
-describe('UT-IMPORT-007: Multi-target terms parsed correctly', () => {
+describe('UT-IMPORT-009: Multi-target terms parsed correctly', () => {
   beforeEach(() => setup());
 
-  it('imports token with multiple targets and assets', async () => {
+  it('imports a blob with multiple targets and assets', async () => {
     await module.load();
 
     const terms = validTerms({
@@ -263,56 +382,13 @@ describe('UT-IMPORT-007: Multi-target terms parsed correctly', () => {
         },
       ],
     });
-    const token = createTestToken(terms);
+    const { blob } = await mintInvoiceBlob(engine, terms);
 
-    (mocks.payments as any).addToken = vi.fn().mockResolvedValue(undefined);
-
-    const result = await module.importInvoice(token);
+    const result = await module.importInvoice(blob);
 
     expect(result.targets).toHaveLength(2);
     expect(result.targets[0].assets).toHaveLength(2);
     expect(result.targets[1].assets).toHaveLength(1);
-  });
-});
-
-// =============================================================================
-// UT-IMPORT-008: Import with empty targets array throws
-// =============================================================================
-
-describe('UT-IMPORT-008: Import with empty targets throws', () => {
-  beforeEach(() => setup());
-
-  it('rejects token whose terms have an empty targets array', async () => {
-    await module.load();
-
-    const terms = { createdAt: Date.now() - 1000, targets: [] };
-    const token = createTestToken(terms as any);
-
-    await expect(module.importInvoice(token)).rejects.toSatisfy(
-      (e: unknown) => e instanceof SphereError && (e as SphereError).code === 'INVOICE_INVALID_DATA',
-    );
-  });
-});
-
-// =============================================================================
-// UT-IMPORT-009: Token stored via payments.addToken()
-// =============================================================================
-
-describe('UT-IMPORT-009: Import stores invoice token via payments', () => {
-  beforeEach(() => setup());
-
-  it('calls payments.addToken during import', async () => {
-    await module.load();
-
-    const terms = validTerms();
-    const token = createTestToken(terms);
-
-    const addToken = vi.fn().mockResolvedValue(undefined);
-    (mocks.payments as any).addToken = addToken;
-
-    await module.importInvoice(token);
-
-    expect(addToken).toHaveBeenCalledOnce();
   });
 });
 
@@ -329,80 +405,102 @@ describe('UT-IMPORT-010: Import with expired dueDate still succeeds', () => {
     const terms = validTerms({
       dueDate: Date.now() - 86400000, // 1 day in the past
     });
-    const token = createTestToken(terms);
+    const { blob } = await mintInvoiceBlob(engine, terms);
 
-    (mocks.payments as any).addToken = vi.fn().mockResolvedValue(undefined);
-
-    const result = await module.importInvoice(token);
+    const result = await module.importInvoice(blob);
     expect(result.dueDate).toBe(terms.dueDate);
   });
 });
 
 // =============================================================================
-// UT-IMPORT-011: Proactive indexing — pre-indexed entries available on import
+// UT-IMPORT-011: Storage failure throws INVOICE_STORAGE_FAILED
 // =============================================================================
 
-describe('UT-IMPORT-011: Proactive indexing picks up pre-indexed entries', () => {
+describe('UT-IMPORT-011: Storage failure throws INVOICE_STORAGE_FAILED', () => {
   beforeEach(() => setup());
+
+  it('wraps payments.addToken rejection and does not register the invoice', async () => {
+    await module.load();
+
+    (mocks.payments as any).addToken = vi.fn().mockRejectedValue(new Error('disk full'));
+
+    const { blob, tokenId } = await mintInvoiceBlob(engine, validTerms());
+
+    const err = await module.importInvoice(blob).catch((e) => e);
+    expect(err).toBeInstanceOf(SphereError);
+    expect(err.code).toBe('INVOICE_STORAGE_FAILED');
+
+    // The invoice must NOT be registered when persistence failed
+    expect((module as any).invoiceTermsCache.has(tokenId)).toBe(false);
+  });
+});
+
+// =============================================================================
+// UT-IMPORT-012: Proactive indexing — pre-indexed entries available on import
+// =============================================================================
+
+describe('UT-IMPORT-012: Proactive indexing picks up pre-indexed entries', () => {
+  beforeEach(() => setup());
+
+  const PAYER = new Uint8Array([0x02, ...new Array<number>(32).fill(3)]); // 33 bytes
+  const UCT_HEX = '11'.repeat(32); // lowercase-hex coin id
 
   it('entries indexed before import are available in the ledger after import', async () => {
     await module.load();
     const mod = module as any;
 
+    // The invoice exists out there (minted on the same engine fixture) but is
+    // NOT imported yet.
     const terms = validTerms();
-    const invoiceToken = createTestToken(terms);
-    const invoiceId = invoiceToken.genesis.data.tokenId;
+    const { blob, tokenId: invoiceId } = await mintInvoiceBlob(engine, terms);
 
-    // Simulate a pre-existing payment token referencing this invoice BEFORE import.
-    // The transfer was already scanned during load() or a prior event.
-    const paymentTransfer = createTestTransfer(invoiceId, 'F', '5000000', 'UCT', 'DIRECT://some_sender', 'DIRECT://target_addr_1');
-
-    // Build a UI token with sdkData containing the transfer
-    const paymentTokenId = 'payment_' + 'f'.repeat(56);
-    const paymentUiToken = {
-      id: paymentTokenId,
-      coinId: 'UCT',
-      symbol: 'UCT',
-      name: 'UCT',
-      decimals: 0,
-      amount: '5000000',
-      status: 'confirmed',
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      sdkData: JSON.stringify(paymentTransfer),
+    // A v2 payment token referencing this invoice in its on-chain transfer memo
+    // arrives BEFORE the invoice is imported.
+    const valueToken = await engine.mint({
+      recipientPubkey: PAYER,
+      value: { assets: [{ coinId: UCT_HEX, amount: 5000000n }] },
+    });
+    const memo = new TextEncoder().encode(JSON.stringify({ inv: { id: invoiceId, dir: 'F' } }));
+    const paid = await engine.transfer({ token: valueToken, recipientPubkey: PAYER, data: memo });
+    const paymentToken: Token = {
+      id: 'pay-1', coinId: UCT_HEX, symbol: 'UCT', name: 'UCT', decimals: 0,
+      amount: '5000000', status: 'confirmed', createdAt: Date.now(), updatedAt: Date.now(),
+      sdkData: bytesToHex(encodeTokenBlob(engine.encodeToken(paid))),
     };
 
     // Make getTokens return this payment token (simulates pre-existing inventory)
-    mocks.payments.getTokens.mockReturnValue([paymentUiToken]);
+    mocks.payments.getTokens.mockReturnValue([paymentToken]);
 
-    // Force scan of payment token (simulates what happens during load or event handling)
-    mod._processTokenTransactions(paymentTokenId, paymentTransfer, 0);
+    // Scan it (simulates what happens during load or event handling)
+    expect(await mod._scanTokenForAttribution(paymentToken, 0)).toBe(true);
     await mod._flushDirtyLedgerEntries();
 
-    // At this point, invoiceTermsCache does NOT have invoiceId, but the ledger does
-    // (proactive indexing)
+    // At this point, invoiceTermsCache does NOT have invoiceId, but the ledger
+    // does (proactive indexing)
     expect(mod.invoiceTermsCache.has(invoiceId)).toBe(false);
     const preLedger = mod.invoiceLedger.get(invoiceId);
     expect(preLedger).toBeDefined();
     expect(preLedger.size).toBeGreaterThan(0);
 
     // Now import the invoice
-    (mocks.payments as any).addToken = vi.fn().mockResolvedValue(undefined);
-    const result = await module.importInvoice(invoiceToken);
+    const result = await module.importInvoice(blob);
     expect(result).toBeDefined();
 
     // Ledger entries from proactive indexing should still be present
     const postLedger = mod.invoiceLedger.get(invoiceId);
     expect(postLedger).toBeDefined();
     expect(postLedger.size).toBeGreaterThan(0);
+    const ref = [...postLedger.values()][0];
+    expect(ref.coinId).toBe(UCT_HEX);
+    expect(ref.amount).toBe('5000000');
   });
 });
 
 // =============================================================================
-// UT-IMPORT-012: Token observer indexes transactions at add time
+// UT-IMPORT-013: Token observer indexes transactions at add time
 // =============================================================================
 
-describe('UT-IMPORT-012: Token observer indexes transactions inline', () => {
+describe('UT-IMPORT-013: Token observer indexes transactions inline', () => {
   beforeEach(() => setup());
 
   it('token change callback indexes invoice transactions immediately', async () => {
@@ -412,11 +510,11 @@ describe('UT-IMPORT-012: Token observer indexes transactions inline', () => {
     // Verify onTokenChange was registered during load
     expect(mocks.payments.onTokenChange).toHaveBeenCalledOnce();
 
-    const terms = validTerms();
-    const invoiceToken = createTestToken(terms);
-    const invoiceId = invoiceToken.genesis.data.tokenId;
+    // The invoice the payment refers to (only its id matters here)
+    const { tokenId: invoiceId } = await mintInvoiceBlob(engine, validTerms());
 
-    // Create a payment token referencing this invoice
+    // Create a payment token referencing this invoice (TXF-format payment
+    // history is still scanned for attribution)
     const paymentTransfer = createTestTransfer(invoiceId, 'F', '5000000', 'UCT', 'DIRECT://some_sender', 'DIRECT://target_addr_1');
 
     // The observer receives the genesis tokenId (from TXF) and the sdkData JSON
@@ -433,79 +531,5 @@ describe('UT-IMPORT-012: Token observer indexes transactions inline', () => {
 
     // Watermark should be advanced
     expect(mod.tokenScanState.get(txfTokenId)).toBe(1);
-  });
-});
-
-// =============================================================================
-// UT-IMPORT-013: Verification failure rejects import (C4-R17)
-// =============================================================================
-
-describe('UT-IMPORT-013: Verification failure rejects import', () => {
-  beforeEach(() => setup());
-  afterEach(() => { mockVerifyResult = { isSuccessful: true }; });
-
-  it('rejects token when verify returns isSuccessful: false', async () => {
-    await module.load();
-    const terms = validTerms();
-    const token = createTestToken(terms);
-
-    mockVerifyResult = { isSuccessful: false, status: 'FAIL', message: 'bad proof' };
-
-    await expect(module.importInvoice(token)).rejects.toSatisfy(
-      (e: unknown) => e instanceof SphereError && (e as SphereError).code === 'INVOICE_INVALID_PROOF',
-    );
-  });
-});
-
-// =============================================================================
-// UT-IMPORT-014: Empty trustBase rejects import (C6-R17)
-// =============================================================================
-
-describe('UT-IMPORT-014: Empty/null trustBase rejects import', () => {
-  it('rejects when trustBase is null', async () => {
-    setup({ trustBase: null });
-    await module.load();
-    const terms = validTerms();
-    const token = createTestToken(terms);
-
-    await expect(module.importInvoice(token)).rejects.toSatisfy(
-      (e: unknown) => e instanceof SphereError && (e as SphereError).code === 'INVOICE_INVALID_PROOF',
-    );
-  });
-
-  it('rejects when trustBase is empty Uint8Array', async () => {
-    setup({ trustBase: new Uint8Array([]) });
-    await module.load();
-    const terms = validTerms();
-    const token = createTestToken(terms);
-
-    await expect(module.importInvoice(token)).rejects.toSatisfy(
-      (e: unknown) => e instanceof SphereError && (e as SphereError).code === 'INVOICE_INVALID_PROOF',
-    );
-  });
-});
-
-// =============================================================================
-// UT-IMPORT-015: TokenId mismatch rejects import (C7-R17)
-// =============================================================================
-
-describe('UT-IMPORT-015: TokenId mismatch rejects import', () => {
-  beforeEach(() => setup());
-
-  it('rejects when SDK token ID differs from claimed tokenId', async () => {
-    await module.load();
-    const terms = validTerms();
-    const token = createTestToken(terms);
-
-    // Override the Token.fromJSON mock for this test to return a mismatched ID
-    const { Token } = await import('@unicitylabs/state-transition-sdk/lib/token/Token.js');
-    (Token.fromJSON as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => ({
-      verify: vi.fn().mockResolvedValue({ isSuccessful: true }),
-      id: { toJSON: () => 'mismatched_' + 'a'.repeat(54) },
-    }));
-
-    await expect(module.importInvoice(token)).rejects.toSatisfy(
-      (e: unknown) => e instanceof SphereError && (e as SphereError).code === 'INVOICE_INVALID_DATA',
-    );
   });
 });

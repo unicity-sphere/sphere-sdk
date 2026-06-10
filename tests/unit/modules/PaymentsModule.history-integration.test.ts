@@ -1,22 +1,23 @@
 /**
- * Integration tests for L3 transaction history deduplication.
+ * Integration tests for L3 transaction history deduplication (v2 engine).
  *
  * Verifies that each logical operation (send, receive) produces exactly ONE
  * history entry — even though tokens pass through multiple internal methods
- * (addToken, removeToken, finalize, resolveV5Token) that historically created
- * duplicates.
+ * (addToken, removeToken, storeEngineToken) along the way.
  *
  * Covers:
- * 1. send() with direct tokens → 1 SENT entry (removeToken creates none)
- * 2. send() with instant split → 1 SENT entry
+ * 1. send() with multiple direct tokens → 1 SENT entry (removeToken creates none)
+ * 2. send() with an engine split → 1 SENT entry (change-token storage creates none)
  * 3. send() preserves memo and recipient metadata in history
- * 4. V5 instant split receive → 1 RECEIVED entry (resolveV5Token creates none)
- * 5. V5 receive populates sender info via resolveSenderInfo
- * 6. V5 receive passes memo into history
- * 7. V5 duplicate bundle → still 1 entry (dedup by splitGroupId)
- * 8. Commitment-only receive → 1 RECEIVED entry (finalizeReceivedToken creates none)
- * 9. finalizeReceivedToken() does NOT add to history
- * 10. resolveSenderInfo() — transport resolution and error handling
+ * 4. V2_TRANSFER receive → 1 RECEIVED entry (storeEngineToken creates none)
+ * 5. V2 receive populates sender info via resolveSenderInfo
+ * 6. V2 receive passes memo into history
+ * 7. Re-delivered identical V2 payload → still 1 entry (dedup by genesis token id)
+ * 8. resolveSenderInfo() — transport resolution and error handling
+ * 9. history:updated event on addToHistory
+ *
+ * Clean harness (no SDK vi.mock): the FakeTokenEngine, the real SpendPlanner /
+ * SpendQueue and the real send/receive paths run end-to-end.
  */
 
 import { describe, it, expect, vi } from 'vitest';
@@ -25,170 +26,10 @@ import type { Token, FullIdentity } from '../../../types';
 import type { TransportProvider } from '../../../transport';
 import type { OracleProvider } from '../../../oracle';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase, HistoryRecord } from '../../../storage';
-
-// =============================================================================
-// Mock SDK dependencies (same as tokenTransfers test)
-// =============================================================================
-
-const mockCalculateOptimalSplit = vi.fn();
-vi.mock('../../../modules/payments/TokenSplitCalculator', () => ({
-  TokenSplitCalculator: class {
-    calculateOptimalSplit = mockCalculateOptimalSplit;
-    calculateOptimalSplitSync = vi.fn();
-  },
-}));
-
-// Mock SpendPlanner + SpendQueue — bridge planSend() to mockCalculateOptimalSplit
-let currentSplitPlan: any = null;
-{
-  const _orig = mockCalculateOptimalSplit.mockResolvedValue.bind(mockCalculateOptimalSplit);
-  mockCalculateOptimalSplit.mockResolvedValue = (value: any) => {
-    currentSplitPlan = value;
-    return _orig(value);
-  };
-}
-vi.mock('../../../modules/payments/SpendQueue', () => ({
-  SpendPlanner: class {
-    buildParsedPool = vi.fn().mockResolvedValue(new Map());
-    setEngine = vi.fn();
-    planSend = vi.fn().mockImplementation(
-      (_req: any, _pool: any, _ledger: any, _queue: any, reservationId: string) => {
-        if (currentSplitPlan === null) {
-          throw new Error('Insufficient balance');
-        }
-        return { reservationId, splitPlan: currentSplitPlan };
-      }
-    );
-  },
-  SpendQueue: class {
-    enqueue = vi.fn();
-    waitForEntry = vi.fn();
-    notifyChange = vi.fn();
-    cancelAll = vi.fn();
-    destroy = vi.fn();
-  },
-  RESERVATION_TIMEOUT_MS: 30000,
-  QUEUE_TIMEOUT_MS: 30000,
-  MAX_SKIP_COUNT: 10,
-  QUEUE_MAX_SIZE: 100,
-}));
-
-const mockExecuteSplitInstant = vi.fn();
-const mockBuildSplitBundle = vi.fn();
-vi.mock('../../../modules/payments/InstantSplitExecutor', () => ({
-  InstantSplitExecutor: class {
-    constructor() {}
-    executeSplitInstant = mockExecuteSplitInstant;
-    buildSplitBundle = mockBuildSplitBundle;
-  },
-}));
-
-const mockExecuteSplit = vi.fn();
-vi.mock('../../../modules/payments/TokenSplitExecutor', () => ({
-  TokenSplitExecutor: class {
-    constructor() {}
-    executeSplit = mockExecuteSplit;
-  },
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/token/Token', () => ({
-  Token: {
-    fromJSON: vi.fn().mockResolvedValue({
-      id: { toString: () => 'mock-id', toJSON: () => 'mock-id' },
-      coins: null,
-      state: {},
-      toJSON: () => ({ genesis: {}, state: {} }),
-    }),
-  },
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/transaction/TransferCommitment', () => ({
-  TransferCommitment: {
-    create: vi.fn(),
-    fromJSON: vi.fn().mockResolvedValue({
-      requestId: new Uint8Array([0xaa, 0xbb, 0xcc]),
-      toJSON: () => ({ requestId: 'aabbcc' }),
-      toTransaction: () => ({
-        toJSON: () => ({ requestId: 'aabbcc', proof: 'mock' }),
-        data: { requestId: new Uint8Array([0xaa, 0xbb, 0xcc]) },
-      }),
-    }),
-  },
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/sign/SigningService', () => ({
-  SigningService: {
-    fromKeyPair: vi.fn().mockResolvedValue({}),
-  },
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicate', () => ({
-  UnmaskedPredicate: { create: vi.fn() },
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/token/TokenState', () => ({
-  TokenState: class { constructor() {} },
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/hash/HashAlgorithm', () => ({
-  HashAlgorithm: { SHA256: 'SHA256' },
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/token/TokenType', () => ({
-  TokenType: class { constructor() {} },
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/transaction/MintCommitment', () => ({
-  MintCommitment: { create: vi.fn() },
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/transaction/MintTransactionData', () => ({
-  MintTransactionData: { createFromNametag: vi.fn() },
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils', () => ({
-  waitInclusionProof: vi.fn().mockResolvedValue({ proof: 'mock-proof' }),
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/transaction/InclusionProof', () => ({
-  InclusionProof: {},
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/token/fungible/CoinId', () => ({
-  CoinId: class {
-    constructor() {}
-    static fromHex() { return new this(); }
-    toJSON() { return 'UCT_HEX'; }
-  },
-}));
-
-vi.mock('../../../l1/network', () => ({
-  connect: vi.fn().mockResolvedValue(undefined),
-  disconnect: vi.fn(),
-  isWebSocketConnected: vi.fn().mockReturnValue(false),
-}));
-
-vi.mock('../../../serialization/txf-serializer', () => ({
-  tokenToTxf: vi.fn(),
-  getCurrentStateHash: vi.fn(),
-  buildTxfStorageData: vi.fn().mockResolvedValue({}),
-  parseTxfStorageData: vi.fn().mockReturnValue({ tokens: [], tombstones: [], sent: [] }),
-}));
-
-vi.mock('../../../registry', () => ({
-  TokenRegistry: {
-    getInstance: vi.fn().mockReturnValue({
-      getToken: vi.fn(),
-      getAllTokens: vi.fn().mockReturnValue([]),
-      getSymbol: vi.fn().mockReturnValue('UCT'),
-      getName: vi.fn().mockReturnValue('Unicity Token'),
-      getDecimals: vi.fn().mockReturnValue(8),
-      getIconUrl: vi.fn().mockReturnValue(undefined),
-      getDefinition: vi.fn().mockReturnValue(null),
-    }),
-    waitForReady: vi.fn().mockResolvedValue(undefined),
-  },
-}));
+import type { V2TransferPayload } from '../../../types/v2-transfer';
+import { FakeTokenEngine } from '../token-engine/FakeTokenEngine';
+import { encodeTokenBlob } from '../../../token-engine/token-blob';
+import { bytesToHex } from '../../../core/crypto';
 
 // =============================================================================
 // Constants
@@ -197,6 +38,9 @@ vi.mock('../../../registry', () => ({
 const FAKE_PRIVATE_KEY = 'a'.repeat(64);
 const FAKE_PUBKEY = '02' + 'b'.repeat(64);
 const SENDER_TRANSPORT_PUBKEY = 'cc'.repeat(32);
+const BOB_CHAIN_PUBKEY = '02' + 'ee'.repeat(32); // recipient's 33-byte chain pubkey (hex)
+const RECIPIENT_DIRECT_ADDRESS = 'DIRECT://recipient';
+const UCT = '11'.repeat(32); // v2 coin ids are lowercase hex
 
 // =============================================================================
 // Helpers
@@ -262,15 +106,12 @@ function createMockTransport(senderNametag?: string): TransportProvider {
     onPaymentRequest: vi.fn().mockReturnValue(() => {}),
     onPaymentRequestResponse: vi.fn().mockReturnValue(() => {}),
     resolve: vi.fn().mockResolvedValue({
-      chainPubkey: FAKE_PUBKEY,
-      transportPubkey: 'transport-pub',
-      directAddress: 'DIRECT://recipient',
+      chainPubkey: BOB_CHAIN_PUBKEY,
+      transportPubkey: 'bob-transport-pubkey',
+      directAddress: RECIPIENT_DIRECT_ADDRESS,
       nametag: 'bob',
     }),
-    resolveNametagInfo: vi.fn().mockResolvedValue({
-      chainPubkey: FAKE_PUBKEY,
-      transportPubkey: 'transport-pub',
-    }),
+    resolveNametagInfo: vi.fn().mockResolvedValue(null),
     resolveTransportPubkeyInfo: vi.fn().mockResolvedValue({
       chainPubkey: FAKE_PUBKEY,
       transportPubkey: SENDER_TRANSPORT_PUBKEY,
@@ -288,66 +129,29 @@ function createMockTransport(senderNametag?: string): TransportProvider {
 
 function createMockOracle(): OracleProvider {
   return {
+    initialize: vi.fn().mockResolvedValue(undefined),
     validateToken: vi.fn().mockResolvedValue({ valid: true }),
-    getStateTransitionClient: vi.fn().mockReturnValue({
-      submitTransferCommitment: vi.fn().mockResolvedValue({ status: 'SUCCESS' }),
-    }),
-    getTrustBase: vi.fn().mockReturnValue({}),
-    isDevMode: vi.fn().mockReturnValue(false),
-    waitForProofSdk: vi.fn().mockResolvedValue({ proof: 'mock' }),
+    getTrustBaseJson: vi.fn().mockReturnValue(null),
+    getAggregatorUrl: vi.fn().mockReturnValue(null),
+    getApiKey: vi.fn().mockReturnValue(null),
+    connect: vi.fn().mockResolvedValue(undefined),
+    disconnect: vi.fn(),
+    isConnected: vi.fn().mockReturnValue(true),
+    getStatus: vi.fn().mockReturnValue('connected'),
+    onEvent: vi.fn().mockReturnValue(() => {}),
   } as unknown as OracleProvider;
-}
-
-function createMockToken(id: string, amount: string, coinId: string = 'UCT'): Token {
-  return {
-    id,
-    coinId,
-    symbol: 'UCT',
-    name: 'Unicity Token',
-    decimals: 8,
-    amount,
-    status: 'confirmed',
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-    sdkData: JSON.stringify({
-      genesis: { data: { tokenId: id, coinData: { [coinId]: amount } } },
-      state: {},
-    }),
-  };
-}
-
-function createMockSdkToken() {
-  return {
-    toJSON: () => ({
-      genesis: { data: { tokenId: 'sdk-token-id', coinData: { UCT: '1000000' } } },
-      state: {},
-    }),
-    state: { calculateHash: () => new Uint8Array(32) },
-  };
-}
-
-function createMockCommitment(requestIdHex: string) {
-  const requestIdBytes = new Uint8Array(
-    requestIdHex.match(/.{1,2}/g)!.map(b => parseInt(b, 16)),
-  );
-  return {
-    requestId: requestIdBytes,
-    toJSON: () => ({ requestId: requestIdHex }),
-    toTransaction: () => ({
-      toJSON: () => ({ requestId: requestIdHex, proof: 'mock' }),
-      data: { requestId: requestIdBytes },
-    }),
-  };
 }
 
 interface TestContext {
   module: ReturnType<typeof createPaymentsModule>;
   deps: PaymentsModuleDependencies;
+  engine: FakeTokenEngine;
   historyStore: ReturnType<typeof createMockHistoryStore>;
   transport: TransportProvider;
 }
 
 function setupModule(senderNametag?: string): TestContext {
+  const engine = new FakeTokenEngine();
   const historyStore = createMockHistoryStore();
   const transport = createMockTransport(senderNametag);
 
@@ -377,59 +181,62 @@ function setupModule(senderNametag?: string): TestContext {
     tokenStorageProviders,
     transport,
     oracle: createMockOracle(),
+    tokenEngine: engine,
     emitEvent: vi.fn(),
   };
 
   const module = createPaymentsModule({ debug: false });
   module.initialize(deps);
 
-  return { module, deps, historyStore, transport };
+  return { module, deps, engine, historyStore, transport };
 }
 
-/** Prepare module for send(): mock heavy private methods but keep addToHistory real */
-function prepareSendMocks(ctx: TestContext) {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const mod = ctx.module as any;
-  mod.resolveRecipient = vi.fn().mockResolvedValue(FAKE_PUBKEY);
-  mod.resolveRecipientAddress = vi.fn().mockResolvedValue({ scheme: 0 });
-  mod.createSigningService = vi.fn().mockResolvedValue({});
-  mod.save = vi.fn().mockResolvedValue(undefined);
-  mod.saveToOutbox = vi.fn().mockResolvedValue(undefined);
-  mod.removeFromOutbox = vi.fn().mockResolvedValue(undefined);
-  // removeToken: mock to just delete from map (no heavy storage ops)
-  mod.removeToken = vi.fn(async (tokenId: string) => {
-    mod.tokens.delete(tokenId);
+/** Mint a v2 engine token owned by this wallet and add it via addToken (no history). */
+async function addOwnedToken(ctx: TestContext, amount: bigint): Promise<Token> {
+  const minted = await ctx.engine.mint({
+    recipientPubkey: ctx.engine.getIdentity().chainPubkey,
+    value: { assets: [{ coinId: UCT, amount }] },
   });
-  // addToken: mock to just set in map
-  mod.addToken = vi.fn(async (token: Token) => {
-    mod.tokens.set(token.id, token);
-    return true;
-  });
-  // Do NOT mock addToHistory — that's what we're testing
-  return mod;
-}
-
-/** Create a V5 instant split bundle */
-function createV5Bundle(overrides?: Record<string, unknown>) {
-  return {
-    version: '5.0',
-    type: 'INSTANT_SPLIT',
-    splitGroupId: 'split-group-123',
-    coinId: 'UCT',
-    amount: '500000',
-    tokenTypeHex: '00',
-    burnTransaction: JSON.stringify({ data: 'burn-tx-data' }),
-    recipientMintData: JSON.stringify({ data: 'mint-data' }),
-    transferCommitment: JSON.stringify({ requestId: 'aabbcc' }),
-    senderPubkey: FAKE_PUBKEY,
-    recipientSaltHex: 'aa',
-    transferSaltHex: 'bb',
-    mintedTokenStateJson: JSON.stringify({ data: 'state' }),
-    finalRecipientStateJson: JSON.stringify({ data: 'final-state' }),
-    recipientAddressJson: JSON.stringify({ scheme: 0 }),
-    ...overrides,
+  const sdkData = bytesToHex(encodeTokenBlob(ctx.engine.encodeToken(minted)));
+  const token: Token = {
+    id: `v2_${ctx.engine.tokenId(minted)}`,
+    coinId: UCT,
+    symbol: 'UCT',
+    name: 'Unicity Token',
+    decimals: 8,
+    amount: String(amount),
+    status: 'confirmed',
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    sdkData,
   };
+  await ctx.module.addToken(token);
+  return token;
 }
+
+/** Build a V2_TRANSFER payload carrying a finished token minted to this wallet. */
+async function v2Payload(
+  engine: FakeTokenEngine,
+  amount: bigint,
+  memo?: string,
+): Promise<V2TransferPayload> {
+  const st = await engine.mint({
+    recipientPubkey: engine.getIdentity().chainPubkey,
+    value: { assets: [{ coinId: UCT, amount }] },
+  });
+  return { type: 'V2_TRANSFER', version: '2.0', tokenBlob: bytesToHex(encodeTokenBlob(engine.encodeToken(st))), memo };
+}
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+function deliver(ctx: TestContext, payload: V2TransferPayload, id = 'nostr-evt-1') {
+  return (ctx.module as any).handleIncomingTransfer({
+    id,
+    senderTransportPubkey: SENDER_TRANSPORT_PUBKEY,
+    payload,
+    timestamp: Date.now(),
+  });
+}
+/* eslint-enable @typescript-eslint/no-explicit-any */
 
 // =============================================================================
 // Tests
@@ -444,70 +251,42 @@ describe('History deduplication — integration flows', () => {
   describe('send() → single SENT history entry', () => {
     it('should create exactly 1 SENT entry for 2 direct tokens', async () => {
       const ctx = setupModule();
-      const mod = prepareSendMocks(ctx);
-
-      const token1 = createMockToken('token-aaa', '1000000');
-      const token2 = createMockToken('token-bbb', '2000000');
-      mod.tokens.set(token1.id, token1);
-      mod.tokens.set(token2.id, token2);
-
-      mockCalculateOptimalSplit.mockResolvedValue({
-        tokensToTransferDirectly: [
-          { sdkToken: createMockSdkToken(), amount: 1000000n, uiToken: token1 },
-          { sdkToken: createMockSdkToken(), amount: 2000000n, uiToken: token2 },
-        ],
-        tokenToSplit: null,
-        splitAmount: null,
-        remainderAmount: null,
-        totalTransferAmount: 3000000n,
-        coinId: 'UCT',
-        requiresSplit: false,
-      });
-
-      const commitment = createMockCommitment('aa'.repeat(16));
-      mod.createSdkCommitment = vi.fn().mockResolvedValue(commitment);
+      await addOwnedToken(ctx, 1000000n);
+      await addOwnedToken(ctx, 2000000n);
 
       await ctx.module.send({
         recipient: '@bob',
         amount: '3000000',
-        coinId: 'UCT',
+        coinId: UCT,
       });
 
+      // Two whole-token transfers went out on the wire...
+      /* eslint-disable-next-line @typescript-eslint/no-explicit-any */
+      expect((ctx.transport.sendTokenTransfer as any).mock.calls).toHaveLength(2);
+
+      // ...but exactly ONE SENT history entry was recorded.
       const history = ctx.module.getHistory();
       expect(history).toHaveLength(1);
       expect(history[0].type).toBe('SENT');
       expect(history[0].amount).toBe('3000000');
-      expect(history[0].coinId).toBe('UCT');
+      expect(history[0].coinId).toBe(UCT);
     });
 
-    it('should create exactly 1 SENT entry for instant split', async () => {
+    it('should create exactly 1 SENT entry for an engine split', async () => {
       const ctx = setupModule();
-      const mod = prepareSendMocks(ctx);
-
-      const token = createMockToken('token-big', '10000000');
-      mod.tokens.set(token.id, token);
-
-      mockCalculateOptimalSplit.mockResolvedValue({
-        tokensToTransferDirectly: [],
-        tokenToSplit: { sdkToken: createMockSdkToken(), amount: 10000000n, uiToken: token },
-        splitAmount: 3000000n,
-        remainderAmount: 7000000n,
-        totalTransferAmount: 3000000n,
-        coinId: 'UCT',
-        requiresSplit: true,
-      });
-
-      mockBuildSplitBundle.mockResolvedValue({
-        bundle: { version: '5.0', type: 'INSTANT_SPLIT', splitGroupId: 'sg-1' },
-        splitGroupId: 'sg-1',
-        startBackground: vi.fn().mockResolvedValue(undefined),
-      });
+      await addOwnedToken(ctx, 10000000n);
 
       await ctx.module.send({
         recipient: '@bob',
         amount: '3000000',
-        coinId: 'UCT',
+        coinId: UCT,
       });
+
+      // The change token (7000000) was stored confirmed — without history.
+      const tokens = ctx.module.getTokens();
+      expect(tokens).toHaveLength(1);
+      expect(tokens[0].amount).toBe('7000000');
+      expect(tokens[0].status).toBe('confirmed');
 
       const history = ctx.module.getHistory();
       expect(history).toHaveLength(1);
@@ -517,30 +296,12 @@ describe('History deduplication — integration flows', () => {
 
     it('should preserve memo in SENT history entry', async () => {
       const ctx = setupModule();
-      const mod = prepareSendMocks(ctx);
-
-      const token = createMockToken('token-memo', '5000000');
-      mod.tokens.set(token.id, token);
-
-      mockCalculateOptimalSplit.mockResolvedValue({
-        tokensToTransferDirectly: [
-          { sdkToken: createMockSdkToken(), amount: 5000000n, uiToken: token },
-        ],
-        tokenToSplit: null,
-        splitAmount: null,
-        remainderAmount: null,
-        totalTransferAmount: 5000000n,
-        coinId: 'UCT',
-        requiresSplit: false,
-      });
-
-      const commitment = createMockCommitment('dd'.repeat(16));
-      mod.createSdkCommitment = vi.fn().mockResolvedValue(commitment);
+      await addOwnedToken(ctx, 5000000n);
 
       await ctx.module.send({
         recipient: '@bob',
         amount: '5000000',
-        coinId: 'UCT',
+        coinId: UCT,
         memo: 'Payment for coffee',
       });
 
@@ -551,68 +312,36 @@ describe('History deduplication — integration flows', () => {
 
     it('should populate recipient metadata from peerInfo', async () => {
       const ctx = setupModule();
-      const mod = prepareSendMocks(ctx);
-
-      const token = createMockToken('token-meta', '1000000');
-      mod.tokens.set(token.id, token);
-
-      mockCalculateOptimalSplit.mockResolvedValue({
-        tokensToTransferDirectly: [
-          { sdkToken: createMockSdkToken(), amount: 1000000n, uiToken: token },
-        ],
-        tokenToSplit: null,
-        splitAmount: null,
-        remainderAmount: null,
-        totalTransferAmount: 1000000n,
-        coinId: 'UCT',
-        requiresSplit: false,
-      });
-
-      const commitment = createMockCommitment('ee'.repeat(16));
-      mod.createSdkCommitment = vi.fn().mockResolvedValue(commitment);
+      await addOwnedToken(ctx, 1000000n);
 
       await ctx.module.send({
         recipient: '@bob',
         amount: '1000000',
-        coinId: 'UCT',
+        coinId: UCT,
       });
 
       const history = ctx.module.getHistory();
       expect(history).toHaveLength(1);
       expect(history[0].recipientNametag).toBe('bob');
-      expect(history[0].recipientAddress).toBe('DIRECT://recipient');
+      expect(history[0].recipientAddress).toBe(RECIPIENT_DIRECT_ADDRESS);
     });
 
     it('should NOT create history entries from removeToken during send', async () => {
       const ctx = setupModule();
-      const mod = prepareSendMocks(ctx);
       const addToHistorySpy = vi.spyOn(ctx.module, 'addToHistory');
-
-      const token = createMockToken('token-rm', '1000000');
-      mod.tokens.set(token.id, token);
-
-      mockCalculateOptimalSplit.mockResolvedValue({
-        tokensToTransferDirectly: [
-          { sdkToken: createMockSdkToken(), amount: 1000000n, uiToken: token },
-        ],
-        tokenToSplit: null,
-        splitAmount: null,
-        remainderAmount: null,
-        totalTransferAmount: 1000000n,
-        coinId: 'UCT',
-        requiresSplit: false,
-      });
-
-      const commitment = createMockCommitment('ff'.repeat(16));
-      mod.createSdkCommitment = vi.fn().mockResolvedValue(commitment);
+      await addOwnedToken(ctx, 1000000n);
 
       await ctx.module.send({
         recipient: '@bob',
         amount: '1000000',
-        coinId: 'UCT',
+        coinId: UCT,
       });
 
-      // addToHistory called exactly once — from the send() success path, not from removeToken
+      // The source token was consumed and removed from the wallet...
+      expect(ctx.module.getTokens()).toHaveLength(0);
+
+      // ...and addToHistory was called exactly once — from the send() success
+      // path, not from removeToken.
       expect(addToHistorySpy).toHaveBeenCalledTimes(1);
       expect(addToHistorySpy).toHaveBeenCalledWith(
         expect.objectContaining({ type: 'SENT' }),
@@ -621,44 +350,26 @@ describe('History deduplication — integration flows', () => {
   });
 
   // ===========================================================================
-  // V5 instant split receive flow
+  // V2 transfer receive flow
   // ===========================================================================
 
-  describe('V5 instant split receive → single RECEIVED entry', () => {
+  describe('V2 transfer receive → single RECEIVED entry', () => {
     it('should create exactly 1 RECEIVED entry', async () => {
       const ctx = setupModule();
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const mod = ctx.module as any;
-      mod.save = vi.fn().mockResolvedValue(undefined);
-      mod.addToken = vi.fn(async (token: Token) => {
-        mod.tokens.set(token.id, token);
-        return true;
-      });
-      mod.resolveUnconfirmed = vi.fn().mockResolvedValue(undefined);
 
-      const bundle = createV5Bundle();
-      await mod.processInstantSplitBundle(bundle, SENDER_TRANSPORT_PUBKEY, 'hello');
+      await deliver(ctx, await v2Payload(ctx.engine, 500000n, 'hello'));
 
       const history = ctx.module.getHistory();
       expect(history).toHaveLength(1);
       expect(history[0].type).toBe('RECEIVED');
       expect(history[0].amount).toBe('500000');
-      expect(history[0].coinId).toBe('UCT');
+      expect(history[0].coinId).toBe(UCT);
     });
 
     it('should populate sender info via resolveSenderInfo', async () => {
       const ctx = setupModule('alice');
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const mod = ctx.module as any;
-      mod.save = vi.fn().mockResolvedValue(undefined);
-      mod.addToken = vi.fn(async (token: Token) => {
-        mod.tokens.set(token.id, token);
-        return true;
-      });
-      mod.resolveUnconfirmed = vi.fn().mockResolvedValue(undefined);
 
-      const bundle = createV5Bundle();
-      await mod.processInstantSplitBundle(bundle, SENDER_TRANSPORT_PUBKEY);
+      await deliver(ctx, await v2Payload(ctx.engine, 500000n));
 
       const history = ctx.module.getHistory();
       expect(history).toHaveLength(1);
@@ -669,57 +380,31 @@ describe('History deduplication — integration flows', () => {
 
     it('should preserve memo in RECEIVED entry', async () => {
       const ctx = setupModule();
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const mod = ctx.module as any;
-      mod.save = vi.fn().mockResolvedValue(undefined);
-      mod.addToken = vi.fn(async (token: Token) => {
-        mod.tokens.set(token.id, token);
-        return true;
-      });
-      mod.resolveUnconfirmed = vi.fn().mockResolvedValue(undefined);
 
-      const bundle = createV5Bundle();
-      await mod.processInstantSplitBundle(bundle, SENDER_TRANSPORT_PUBKEY, 'Thanks!');
+      await deliver(ctx, await v2Payload(ctx.engine, 500000n, 'Thanks!'));
 
       const history = ctx.module.getHistory();
       expect(history).toHaveLength(1);
       expect(history[0].memo).toBe('Thanks!');
     });
 
-    it('should not create a second entry for duplicate V5 bundle', async () => {
+    it('should not create a second entry for a re-delivered identical payload', async () => {
       const ctx = setupModule();
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const mod = ctx.module as any;
-      mod.save = vi.fn().mockResolvedValue(undefined);
-      mod.addToken = vi.fn(async (token: Token) => {
-        mod.tokens.set(token.id, token);
-        return true;
-      });
-      mod.resolveUnconfirmed = vi.fn().mockResolvedValue(undefined);
 
-      const bundle = createV5Bundle();
-      await mod.processInstantSplitBundle(bundle, SENDER_TRANSPORT_PUBKEY);
-      // Send the same bundle again (Nostr re-delivery)
-      await mod.processInstantSplitBundle(bundle, SENDER_TRANSPORT_PUBKEY);
+      const payload = await v2Payload(ctx.engine, 500000n);
+      await deliver(ctx, payload, 'evt-1');
+      // Same payload again (Nostr re-delivery)
+      await deliver(ctx, payload, 'evt-2');
 
-      const history = ctx.module.getHistory();
-      // Dedup: deterministic ID v5split_{splitGroupId} blocks the second call
-      expect(history).toHaveLength(1);
+      // Dedup: the genesis-stable token id blocks the second delivery
+      expect(ctx.module.getTokens()).toHaveLength(1);
+      expect(ctx.module.getHistory()).toHaveLength(1);
     });
 
     it('should emit transfer:incoming with senderNametag and memo', async () => {
       const ctx = setupModule('alice');
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const mod = ctx.module as any;
-      mod.save = vi.fn().mockResolvedValue(undefined);
-      mod.addToken = vi.fn(async (token: Token) => {
-        mod.tokens.set(token.id, token);
-        return true;
-      });
-      mod.resolveUnconfirmed = vi.fn().mockResolvedValue(undefined);
 
-      const bundle = createV5Bundle();
-      await mod.processInstantSplitBundle(bundle, SENDER_TRANSPORT_PUBKEY, 'test memo');
+      await deliver(ctx, await v2Payload(ctx.engine, 500000n, 'test memo'));
 
       expect(ctx.deps.emitEvent).toHaveBeenCalledWith(
         'transfer:incoming',
@@ -728,116 +413,6 @@ describe('History deduplication — integration flows', () => {
           memo: 'test memo',
         }),
       );
-    });
-  });
-
-  // ===========================================================================
-  // Commitment-only receive flow
-  // ===========================================================================
-
-  describe('commitment-only receive → single RECEIVED entry', () => {
-    it('should create exactly 1 RECEIVED entry from handleCommitmentOnlyTransfer', async () => {
-      const ctx = setupModule('alice');
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const mod = ctx.module as any;
-      mod.save = vi.fn().mockResolvedValue(undefined);
-      mod.addProofPollingJob = vi.fn();
-
-      const transfer = {
-        id: 'transfer-nostr-1',
-        senderTransportPubkey: SENDER_TRANSPORT_PUBKEY,
-        payload: {},
-        timestamp: Date.now(),
-      };
-
-      // sourceToken with TXF-style genesis data so extractTokenIdFromSdkData returns a value
-      const sourceToken = {
-        genesis: {
-          data: {
-            tokenId: 'token-conly-1',
-            tokenType: '00',
-            coinData: [['UCT_HEX', '750000']],
-            tokenData: '',
-            salt: '00',
-            recipient: 'DIRECT://test',
-            recipientDataHash: null,
-            reason: null,
-          },
-          inclusionProof: {
-            authenticator: { algorithm: 'secp256k1', publicKey: 'pk', signature: 'sig', stateHash: 'sh' },
-            merkleTreePath: { root: '00', steps: [] },
-            transactionHash: '00',
-            unicityCertificate: '00',
-          },
-        },
-        state: { data: 'statedata', predicate: 'predicate' },
-        transactions: [],
-      };
-
-      const payload = {
-        sourceToken: JSON.stringify(sourceToken),
-        commitmentData: JSON.stringify({ requestId: 'aabbcc' }),
-        memo: 'commitment memo',
-      };
-
-      await mod.handleCommitmentOnlyTransfer(transfer, payload);
-
-      const history = ctx.module.getHistory();
-      expect(history).toHaveLength(1);
-      expect(history[0].type).toBe('RECEIVED');
-      expect(history[0].senderPubkey).toBe(SENDER_TRANSPORT_PUBKEY);
-      expect(history[0].senderNametag).toBe('alice');
-      expect(history[0].memo).toBe('commitment memo');
-    });
-  });
-
-  // ===========================================================================
-  // finalizeReceivedToken does NOT create history
-  // ===========================================================================
-
-  describe('finalizeReceivedToken → no history entry', () => {
-    it('should NOT call addToHistory during finalization', async () => {
-      const ctx = setupModule();
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const mod = ctx.module as any;
-      mod.save = vi.fn().mockResolvedValue(undefined);
-      const addToHistorySpy = vi.spyOn(ctx.module, 'addToHistory');
-
-      // Pre-populate a submitted token (simulates what handleCommitmentOnlyTransfer creates)
-      const token: Token = {
-        id: 'token-to-finalize',
-        coinId: 'UCT',
-        symbol: 'UCT',
-        name: 'Unicity Token',
-        decimals: 8,
-        amount: '1000000',
-        status: 'submitted',
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-        sdkData: JSON.stringify({
-          genesis: { data: { tokenId: 'token-to-finalize' } },
-          state: {},
-        }),
-      };
-      mod.tokens.set(token.id, token);
-
-      // Mock the finalization helpers
-      mod.finalizeTransferToken = vi.fn().mockResolvedValue({
-        toJSON: () => ({
-          genesis: { data: { tokenId: 'token-to-finalize' } },
-          state: { finalized: true },
-        }),
-      });
-
-      const sourceTokenInput = { genesis: {}, state: {} };
-      const commitmentInput = { requestId: 'aabbcc' };
-
-      await mod.finalizeReceivedToken(token.id, sourceTokenInput, commitmentInput);
-
-      // The token should be confirmed now
-      expect(mod.tokens.get(token.id).status).toBe('confirmed');
-      // But NO new history entry was created
-      expect(addToHistorySpy).not.toHaveBeenCalled();
     });
   });
 

@@ -4,7 +4,12 @@
  * Validates that each INVOICE_* error code is thrown by the correct method,
  * SphereError instances have correct code/message/cause, error codes are unique,
  * MODULE_DESTROYED is thrown after destroy(), and INVOICE_ORACLE_REQUIRED when
- * oracle is unavailable.
+ * the token engine (v2 oracle config) is unavailable.
+ *
+ * Invoices run exclusively on the v2 token engine: importInvoice() accepts
+ * only a v2 engine blob hex string (legacy v1 TXF objects → INVOICE_INVALID_DATA)
+ * and createInvoice() mints via engine.mintDataToken. Engine-path cases use the
+ * FakeTokenEngine harness (no SDK mocks).
  *
  * @see docs/ACCOUNTING-TEST-SPEC.md §6, Appendix B
  */
@@ -14,29 +19,16 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   createTestAccountingModule,
-  createTestToken,
   createTestInvoice,
-  createMockOracleProvider,
   SphereError,
-  INVOICE_TOKEN_TYPE_HEX,
+  DEFAULT_TEST_IDENTITY,
   DEFAULT_TEST_TRACKED_ADDRESS,
 } from './accounting-test-helpers.js';
+import { FakeTokenEngine } from '../token-engine/FakeTokenEngine';
+import { encodeTokenBlob } from '../../../token-engine/token-blob';
+import { bytesToHex, hexToBytes } from '../../../core/crypto';
 import type { AccountingModule } from '../../../modules/accounting/AccountingModule.js';
 import type { TestAccountingModuleMocks } from './accounting-test-helpers.js';
-
-// Mock SDK Token for import tests
-vi.mock('@unicitylabs/state-transition-sdk/lib/token/Token', () => ({
-  Token: { mint: vi.fn(), fromJSON: vi.fn().mockResolvedValue({ verify: vi.fn().mockResolvedValue(true) }) },
-}));
-vi.mock('@unicitylabs/state-transition-sdk/lib/token/Token.js', () => ({
-  Token: { mint: vi.fn(), fromJSON: vi.fn().mockResolvedValue({ verify: vi.fn().mockResolvedValue(true) }) },
-}));
-vi.mock('../../../serialization/txf-serializer.js', () => ({
-  txfToToken: vi.fn().mockImplementation((id: string, txf: unknown) => ({
-    id, coinId: 'INV', symbol: 'INV', name: 'Invoice', decimals: 0, amount: '0',
-    status: 'confirmed', createdAt: Date.now(), updatedAt: Date.now(), sdkData: JSON.stringify(txf),
-  })),
-}));
 
 // =============================================================================
 // Shared setup
@@ -298,50 +290,52 @@ describe('Error: INVOICE_ALREADY_CANCELLED', () => {
 });
 
 // =============================================================================
-// INVOICE_WRONG_TOKEN_TYPE (importInvoice)
-// =============================================================================
-
-describe('Error: INVOICE_WRONG_TOKEN_TYPE', () => {
-  beforeEach(() => setup());
-
-  it('importInvoice with wrong token type throws INVOICE_WRONG_TOKEN_TYPE', async () => {
-    await module.load();
-
-    const terms = {
-      createdAt: Date.now() - 1000,
-      targets: [{ address: 'DIRECT://a', assets: [{ coin: ['UCT', '100'] as [string, string] }] }],
-    };
-    const token = createTestToken(terms);
-    token.genesis.data.tokenType = 'deadbeef'.repeat(8);
-
-    (mocks.payments as any).addToken = vi.fn().mockResolvedValue(undefined);
-
-    const err = await module.importInvoice(token).catch((e) => e);
-    expect(err).toBeInstanceOf(SphereError);
-    expect(err.code).toBe('INVOICE_WRONG_TOKEN_TYPE');
-  });
-});
-
-// =============================================================================
 // INVOICE_INVALID_DATA (importInvoice)
 // =============================================================================
 
 describe('Error: INVOICE_INVALID_DATA', () => {
-  beforeEach(() => setup());
-
-  it('importInvoice with corrupt tokenData throws INVOICE_INVALID_DATA', async () => {
+  it('importInvoice with a legacy v1 TXF object throws INVOICE_INVALID_DATA', async () => {
+    setup({ tokenEngine: new FakeTokenEngine() });
     await module.load();
 
-    const terms = {
-      createdAt: Date.now() - 1000,
-      targets: [{ address: 'DIRECT://a', assets: [{ coin: ['UCT', '100'] as [string, string] }] }],
+    // Any non-string token (the old TXF object form) is refused outright —
+    // verifying it required the removed v1 engine.
+    const legacyTxfObject = {
+      version: '2.0',
+      genesis: {
+        data: {
+          tokenId: 'a'.repeat(64),
+          coinData: [],
+          tokenData: JSON.stringify({
+            createdAt: Date.now() - 1000,
+            targets: [{ address: 'DIRECT://a', assets: [{ coin: ['UCT', '100'] }] }],
+          }),
+        },
+      },
+      transactions: [],
     };
-    const token = createTestToken(terms);
-    token.genesis.data.tokenData = '{{broken}}';
+
+    const err = await module.importInvoice(legacyTxfObject as any).catch((e) => e);
+    expect(err).toBeInstanceOf(SphereError);
+    expect(err.code).toBe('INVOICE_INVALID_DATA');
+    expect(err.message).toContain('Legacy (v1 TXF) invoice tokens are no longer supported');
+  });
+
+  it('importInvoice with corrupt tokenData throws INVOICE_INVALID_DATA', async () => {
+    const engine = new FakeTokenEngine();
+    setup({ tokenEngine: engine });
+    await module.load();
+
+    // A valid v2 blob whose data payload is not parseable JSON.
+    const token = await engine.mintDataToken({
+      recipientPubkey: hexToBytes(DEFAULT_TEST_IDENTITY.chainPubkey),
+      data: new TextEncoder().encode('{{broken}}'),
+    });
+    const blob = bytesToHex(encodeTokenBlob(engine.encodeToken(token)));
 
     (mocks.payments as any).addToken = vi.fn().mockResolvedValue(undefined);
 
-    const err = await module.importInvoice(token).catch((e) => e);
+    const err = await module.importInvoice(blob).catch((e) => e);
     expect(err).toBeInstanceOf(SphereError);
     expect(err.code).toBe('INVOICE_INVALID_DATA');
   });
@@ -377,21 +371,57 @@ describe('Error: MODULE_DESTROYED', () => {
 });
 
 // =============================================================================
-// INVOICE_ORACLE_REQUIRED when oracle unavailable
+// INVOICE_ORACLE_REQUIRED when the token engine is unavailable
 // =============================================================================
 
 describe('Error: INVOICE_ORACLE_REQUIRED', () => {
-  it('createInvoice without oracle throws INVOICE_ORACLE_REQUIRED', async () => {
-    // Create module with oracle that has no getStateTransitionClient
-    const oracle = createMockOracleProvider();
-    oracle.getStateTransitionClient = vi.fn().mockReturnValue(null);
-    setup({ oracle });
-
+  it('createInvoice without a token engine throws INVOICE_ORACLE_REQUIRED', async () => {
+    // Default setup has no tokenEngine — the v2 engine is mandatory for minting.
+    setup();
     await module.load();
 
     const err = await module.createInvoice(createTestInvoice()).catch((e) => e);
     expect(err).toBeInstanceOf(SphereError);
     expect(err.code).toBe('INVOICE_ORACLE_REQUIRED');
+    expect(err.message).toContain('Token engine unavailable');
+  });
+
+  it('importInvoice without a token engine throws INVOICE_ORACLE_REQUIRED', async () => {
+    // Mint a valid blob on a standalone engine, then import into an engineless module.
+    const minter = new FakeTokenEngine();
+    const token = await minter.mintDataToken({
+      recipientPubkey: hexToBytes(DEFAULT_TEST_IDENTITY.chainPubkey),
+      data: new TextEncoder().encode(JSON.stringify({
+        createdAt: Date.now() - 1000,
+        targets: [{ address: 'DIRECT://a', assets: [{ coin: ['UCT', '100'] }] }],
+      })),
+    });
+    const blob = bytesToHex(encodeTokenBlob(minter.encodeToken(token)));
+
+    setup();
+    await module.load();
+
+    const err = await module.importInvoice(blob).catch((e) => e);
+    expect(err).toBeInstanceOf(SphereError);
+    expect(err.code).toBe('INVOICE_ORACLE_REQUIRED');
+  });
+});
+
+// =============================================================================
+// INVOICE_MINT_FAILED when the engine mint fails
+// =============================================================================
+
+describe('Error: INVOICE_MINT_FAILED', () => {
+  it('createInvoice wraps engine.mintDataToken failure as INVOICE_MINT_FAILED', async () => {
+    const engine = new FakeTokenEngine();
+    setup({ tokenEngine: engine });
+    await module.load();
+
+    vi.spyOn(engine, 'mintDataToken').mockRejectedValue(new Error('aggregator down'));
+
+    const err = await module.createInvoice(createTestInvoice()).catch((e) => e);
+    expect(err).toBeInstanceOf(SphereError);
+    expect(err.code).toBe('INVOICE_MINT_FAILED');
   });
 });
 

@@ -19,6 +19,7 @@ import type { SplitPlan } from '../../../modules/payments/TokenSplitCalculator';
 import { FakeTokenEngine } from '../token-engine/FakeTokenEngine';
 import { encodeTokenBlob } from '../../../token-engine/token-blob';
 import { bytesToHex } from '../../../core/crypto';
+import { logger } from '../../../core/logger';
 
 // =============================================================================
 // Helpers
@@ -83,7 +84,8 @@ describe('SpendPlanner', () => {
   let mockQueue: ReturnType<typeof makeMockQueue>;
 
   beforeEach(() => {
-    planner = new SpendPlanner();
+    // Production wiring always injects the v2 engine (the only value-read path).
+    planner = new SpendPlanner(new FakeTokenEngine());
     ledger = new TokenReservationLedger();
     mockQueue = makeMockQueue();
   });
@@ -849,10 +851,10 @@ describe('SpendPlanner', () => {
 // =============================================================================
 // buildParsedPool — engine path (B3, path B)
 //
-// When an ITokenEngine is injected, buildParsedPool reads each token's value
-// from the v2 engine: sdkData holds the engine blob (hex of CBOR(TokenBlob)),
-// decoded via engine.decodeToken and summed via engine.balanceOf. The legacy
-// v1 SdkToken.fromJSON path remains as the fallback when no engine is present.
+// buildParsedPool reads each token's value from the v2 engine: sdkData holds
+// the engine blob (hex of CBOR(TokenBlob)), decoded via engine.decodeToken and
+// summed via engine.balanceOf. There is NO v1 parsing path: without an engine
+// the pool is empty (with a logger.warn) — see the "no engine" suite below.
 // =============================================================================
 
 describe('SpendPlanner.buildParsedPool — engine path (B3)', () => {
@@ -923,5 +925,52 @@ describe('SpendPlanner.buildParsedPool — engine path (B3)', () => {
 
     expect(pool.size).toBe(1);
     expect(pool.has('tok-ok')).toBe(true);
+  });
+
+  // ===========================================================================
+  // No engine: there is NO v1 parsing fallback — the pool is empty + warned
+  // ===========================================================================
+
+  describe('without an engine (v1 fallback removed)', () => {
+    it('returns an EMPTY pool and warns, even for valid v2-blob tokens', async () => {
+      const fake = new FakeTokenEngine(); // only used to mint the fixture
+      const noEnginePlanner = new SpendPlanner();
+      const tokens = [
+        await engineToken(fake, 'tok-1', UCT, 100n),
+        await engineToken(fake, 'tok-2', UCT, 250n),
+      ];
+      const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+      try {
+        const pool = await noEnginePlanner.buildParsedPool(tokens, UCT);
+
+        expect(pool.size).toBe(0);
+        expect(warnSpy).toHaveBeenCalledWith(
+          'SpendQueue',
+          expect.stringContaining('no token engine'),
+        );
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it('setEngine(undefined) clears the engine → empty pool; re-injecting restores parsing', async () => {
+      const fake = new FakeTokenEngine();
+      const planner = new SpendPlanner(fake);
+      const tokens = [await engineToken(fake, 'tok-1', UCT, 100n)];
+      const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+      try {
+        planner.setEngine(undefined);
+        expect((await planner.buildParsedPool(tokens, UCT)).size).toBe(0);
+
+        planner.setEngine(fake);
+        const pool = await planner.buildParsedPool(tokens, UCT);
+        expect(pool.size).toBe(1);
+        expect(pool.get('tok-1')!.amount).toBe(100n);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
   });
 });

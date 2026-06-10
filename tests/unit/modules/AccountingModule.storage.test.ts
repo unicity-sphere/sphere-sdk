@@ -17,28 +17,23 @@ import {
   SphereError,
   DEFAULT_TEST_TRACKED_ADDRESS,
 } from './accounting-test-helpers.js';
+import { FakeTokenEngine } from '../token-engine/FakeTokenEngine';
 import type { AccountingModule } from '../../../modules/accounting/AccountingModule.js';
 import type { TestAccountingModuleMocks } from './accounting-test-helpers.js';
 import { STORAGE_KEYS_ADDRESS } from '../../../constants.js';
 
-// Mock SDK Token to prevent cross-file mock contamination when run alongside
-// other test files (e.g., importInvoice, validation, errors) that mock this module.
-vi.mock('@unicitylabs/state-transition-sdk/lib/token/Token', () => ({
-  Token: { mint: vi.fn(), fromJSON: vi.fn().mockResolvedValue({ verify: vi.fn().mockResolvedValue(true) }) },
-}));
-vi.mock('@unicitylabs/state-transition-sdk/lib/token/Token.js', () => ({
-  Token: { mint: vi.fn(), fromJSON: vi.fn().mockResolvedValue({ verify: vi.fn().mockResolvedValue(true) }) },
-}));
-
 // =============================================================================
-// Shared setup
+// Shared setup — v2 harness: a FakeTokenEngine is wired into deps (no SDK
+// vi.mocks). These tests exercise storage round-trips with raw fixtures
+// injected directly into the mock storage / in-memory caches, so the engine
+// is only needed to satisfy the module's v2-only dependency contract.
 // =============================================================================
 
 let module: AccountingModule;
 let mocks: TestAccountingModuleMocks;
 
 function setup(overrides?: Parameters<typeof createTestAccountingModule>[0]) {
-  const result = createTestAccountingModule(overrides);
+  const result = createTestAccountingModule({ tokenEngine: new FakeTokenEngine(), ...overrides });
   module = result.module;
   mocks = result.mocks;
 }

@@ -2,9 +2,13 @@
  * AccountingModule — createInvoice() tests (§3.2)
  *
  * Validates the full validation pipeline (§8.1), InvoiceTerms construction,
- * minting flow, storage, event firing, and retroactive payment detection.
+ * the v2 engine guard / mint-failure mapping, duplicate detection, and event
+ * firing.
  *
- * All SDK dynamic imports are mocked so no aggregator network calls occur.
+ * Invoices are minted exclusively via the token engine (engine.mintDataToken),
+ * so the harness injects a FakeTokenEngine (no SDK vi.mock). Blob storage,
+ * import round-trips and attribution mechanics on the same harness live in
+ * AccountingModule.v2-createInvoice.test.ts.
  *
  * @see docs/ACCOUNTING-TEST-SPEC.md §3.2
  */
@@ -15,298 +19,11 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   createTestAccountingModule,
   createTestInvoice,
-  createMockOracleProvider,
   SphereError,
 } from './accounting-test-helpers.js';
+import { FakeTokenEngine } from '../token-engine/FakeTokenEngine';
 import type { AccountingModule } from '../../../modules/accounting/AccountingModule.js';
 import type { TestAccountingModuleMocks } from './accounting-test-helpers.js';
-
-// =============================================================================
-// Mock all SDK dynamic imports used by createInvoice()
-// These are registered both with and without .js extension so they intercept
-// the dynamic imports inside AccountingModule which use the .js suffix.
-// NOTE: vi.mock() factories cannot reference outer-scope variables (hoisting).
-// All factory content must be self-contained.
-// =============================================================================
-
-// --- TokenId ---
-vi.mock('@unicitylabs/state-transition-sdk/lib/token/TokenId', () => ({
-  TokenId: class { constructor(public readonly imprint: Uint8Array) {} toJSON() { return '0'.repeat(64); } },
-}));
-vi.mock('@unicitylabs/state-transition-sdk/lib/token/TokenId.js', () => ({
-  TokenId: class { constructor(public readonly imprint: Uint8Array) {} toJSON() { return '0'.repeat(64); } },
-}));
-
-// --- TokenType ---
-vi.mock('@unicitylabs/state-transition-sdk/lib/token/TokenType', () => ({
-  TokenType: class { constructor(_buf?: unknown) {} },
-}));
-vi.mock('@unicitylabs/state-transition-sdk/lib/token/TokenType.js', () => ({
-  TokenType: class { constructor(_buf?: unknown) {} },
-}));
-
-// --- MintTransactionData ---
-vi.mock('@unicitylabs/state-transition-sdk/lib/transaction/MintTransactionData', () => ({
-  MintTransactionData: { create: vi.fn().mockResolvedValue({ toJSON: () => ({}) }) },
-}));
-vi.mock('@unicitylabs/state-transition-sdk/lib/transaction/MintTransactionData.js', () => ({
-  MintTransactionData: { create: vi.fn().mockResolvedValue({ toJSON: () => ({}) }) },
-}));
-
-// --- MintCommitment ---
-vi.mock('@unicitylabs/state-transition-sdk/lib/transaction/MintCommitment', () => ({
-  MintCommitment: {
-    create: vi.fn().mockResolvedValue({
-      toTransaction: vi.fn().mockReturnValue({ toJSON: () => ({}) }),
-    }),
-  },
-}));
-vi.mock('@unicitylabs/state-transition-sdk/lib/transaction/MintCommitment.js', () => ({
-  MintCommitment: {
-    create: vi.fn().mockResolvedValue({
-      toTransaction: vi.fn().mockReturnValue({ toJSON: () => ({}) }),
-    }),
-  },
-}));
-
-// --- SigningService ---
-vi.mock('@unicitylabs/state-transition-sdk/lib/sign/SigningService', () => ({
-  SigningService: {
-    createFromSecret: vi.fn().mockResolvedValue({
-      algorithm: 1,
-      publicKey: new Uint8Array(33),
-      sign: vi.fn().mockResolvedValue(new Uint8Array(64)),
-    }),
-  },
-}));
-vi.mock('@unicitylabs/state-transition-sdk/lib/sign/SigningService.js', () => ({
-  SigningService: {
-    createFromSecret: vi.fn().mockResolvedValue({
-      algorithm: 1,
-      publicKey: new Uint8Array(33),
-      sign: vi.fn().mockResolvedValue(new Uint8Array(64)),
-    }),
-  },
-}));
-
-// --- HashAlgorithm ---
-vi.mock('@unicitylabs/state-transition-sdk/lib/hash/HashAlgorithm', () => ({
-  HashAlgorithm: { SHA256: 'SHA256' },
-}));
-vi.mock('@unicitylabs/state-transition-sdk/lib/hash/HashAlgorithm.js', () => ({
-  HashAlgorithm: { SHA256: 'SHA256' },
-}));
-
-// --- DataHasher ---
-vi.mock('@unicitylabs/state-transition-sdk/lib/hash/DataHasher', () => ({
-  DataHasher: class {
-    update() { return this; }
-    async digest() { return { imprint: new Uint8Array(32) }; }
-  },
-}));
-vi.mock('@unicitylabs/state-transition-sdk/lib/hash/DataHasher.js', () => ({
-  DataHasher: class {
-    update() { return this; }
-    async digest() { return { imprint: new Uint8Array(32) }; }
-  },
-}));
-
-// --- UnmaskedPredicate ---
-vi.mock('@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicate', () => ({
-  UnmaskedPredicate: { create: vi.fn().mockResolvedValue({ toJSON: () => ({}) }) },
-}));
-vi.mock('@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicate.js', () => ({
-  UnmaskedPredicate: { create: vi.fn().mockResolvedValue({ toJSON: () => ({}) }) },
-}));
-
-// --- UnmaskedPredicateReference ---
-vi.mock('@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicateReference', () => ({
-  UnmaskedPredicateReference: {
-    create: vi.fn().mockResolvedValue({
-      toAddress: vi.fn().mockResolvedValue('mock-owner-address'),
-    }),
-  },
-}));
-vi.mock('@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicateReference.js', () => ({
-  UnmaskedPredicateReference: {
-    create: vi.fn().mockResolvedValue({
-      toAddress: vi.fn().mockResolvedValue('mock-owner-address'),
-    }),
-  },
-}));
-
-// --- TokenState ---
-vi.mock('@unicitylabs/state-transition-sdk/lib/token/TokenState', () => ({
-  TokenState: class { constructor() {} toJSON() { return {}; } },
-}));
-vi.mock('@unicitylabs/state-transition-sdk/lib/token/TokenState.js', () => ({
-  TokenState: class { constructor() {} toJSON() { return {}; } },
-}));
-
-// --- Token ---
-vi.mock('@unicitylabs/state-transition-sdk/lib/token/Token', () => ({
-  Token: {
-    fromJSON: vi.fn().mockResolvedValue({
-      toJSON: () => ({
-        version: '2.0',
-        genesis: {
-          data: {
-            tokenId: '0'.repeat(64),
-            tokenType: '0101010101010101010101010101010101010101010101010101010101010101',
-            coinData: null,
-            tokenData: '{}',
-            salt: '0'.repeat(64),
-            recipient: 'DIRECT://test_target_address_abc123',
-            recipientDataHash: null,
-            reason: null,
-          },
-          inclusionProof: {
-            authenticator: {
-              algorithm: 'secp256k1',
-              publicKey: '02' + 'a'.repeat(64),
-              signature: '0'.repeat(128),
-              stateHash: '0'.repeat(64),
-            },
-            merkleTreePath: { root: '0'.repeat(64), steps: [] },
-            transactionHash: '0'.repeat(64),
-            unicityCertificate: '0'.repeat(256),
-          },
-        },
-        state: { data: '0'.repeat(64), predicate: '0'.repeat(64) },
-        transactions: [],
-      }),
-    }),
-    mint: vi.fn().mockResolvedValue({
-      toJSON: () => ({
-        version: '2.0',
-        genesis: {
-          data: {
-            tokenId: '0'.repeat(64),
-            tokenType: '0101010101010101010101010101010101010101010101010101010101010101',
-            coinData: null,
-            tokenData: '{}',
-            salt: '0'.repeat(64),
-            recipient: 'DIRECT://test_target_address_abc123',
-            recipientDataHash: null,
-            reason: null,
-          },
-          inclusionProof: {
-            authenticator: {
-              algorithm: 'secp256k1',
-              publicKey: '02' + 'a'.repeat(64),
-              signature: '0'.repeat(128),
-              stateHash: '0'.repeat(64),
-            },
-            merkleTreePath: { root: '0'.repeat(64), steps: [] },
-            transactionHash: '0'.repeat(64),
-            unicityCertificate: '0'.repeat(256),
-          },
-        },
-        state: { data: '0'.repeat(64), predicate: '0'.repeat(64) },
-        transactions: [],
-      }),
-    }),
-  },
-}));
-vi.mock('@unicitylabs/state-transition-sdk/lib/token/Token.js', () => ({
-  Token: {
-    fromJSON: vi.fn().mockResolvedValue({
-      toJSON: () => ({
-        version: '2.0',
-        genesis: {
-          data: {
-            tokenId: '0'.repeat(64),
-            tokenType: '0101010101010101010101010101010101010101010101010101010101010101',
-            coinData: null,
-            tokenData: '{}',
-            salt: '0'.repeat(64),
-            recipient: 'DIRECT://test_target_address_abc123',
-            recipientDataHash: null,
-            reason: null,
-          },
-          inclusionProof: {
-            authenticator: {
-              algorithm: 'secp256k1',
-              publicKey: '02' + 'a'.repeat(64),
-              signature: '0'.repeat(128),
-              stateHash: '0'.repeat(64),
-            },
-            merkleTreePath: { root: '0'.repeat(64), steps: [] },
-            transactionHash: '0'.repeat(64),
-            unicityCertificate: '0'.repeat(256),
-          },
-        },
-        state: { data: '0'.repeat(64), predicate: '0'.repeat(64) },
-        transactions: [],
-      }),
-    }),
-    mint: vi.fn().mockResolvedValue({
-      toJSON: () => ({
-        version: '2.0',
-        genesis: {
-          data: {
-            tokenId: '0'.repeat(64),
-            tokenType: '0101010101010101010101010101010101010101010101010101010101010101',
-            coinData: null,
-            tokenData: '{}',
-            salt: '0'.repeat(64),
-            recipient: 'DIRECT://test_target_address_abc123',
-            recipientDataHash: null,
-            reason: null,
-          },
-          inclusionProof: {
-            authenticator: {
-              algorithm: 'secp256k1',
-              publicKey: '02' + 'a'.repeat(64),
-              signature: '0'.repeat(128),
-              stateHash: '0'.repeat(64),
-            },
-            merkleTreePath: { root: '0'.repeat(64), steps: [] },
-            transactionHash: '0'.repeat(64),
-            unicityCertificate: '0'.repeat(256),
-          },
-        },
-        state: { data: '0'.repeat(64), predicate: '0'.repeat(64) },
-        transactions: [],
-      }),
-    }),
-  },
-}));
-
-// --- InclusionProofUtils ---
-vi.mock('@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils', () => ({
-  waitInclusionProof: vi.fn().mockResolvedValue({
-    authenticator: {
-      algorithm: 'secp256k1',
-      publicKey: '02' + 'a'.repeat(64),
-      signature: '0'.repeat(128),
-      stateHash: '0'.repeat(64),
-    },
-    merkleTreePath: { root: '0'.repeat(64), steps: [] },
-    transactionHash: '0'.repeat(64),
-    unicityCertificate: '0'.repeat(256),
-  }),
-}));
-vi.mock('@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils.js', () => ({
-  waitInclusionProof: vi.fn().mockResolvedValue({
-    authenticator: {
-      algorithm: 'secp256k1',
-      publicKey: '02' + 'a'.repeat(64),
-      signature: '0'.repeat(128),
-      stateHash: '0'.repeat(64),
-    },
-    merkleTreePath: { root: '0'.repeat(64), steps: [] },
-    transactionHash: '0'.repeat(64),
-    unicityCertificate: '0'.repeat(256),
-  }),
-}));
-
-// Mock the accounting serialization module (also dynamic-imported inside createInvoice)
-vi.mock('../../../modules/accounting/serialization.js', () => ({
-  canonicalSerialize: vi.fn().mockReturnValue('{}'),
-  INVOICE_TOKEN_TYPE_HEX: '0101010101010101010101010101010101010101010101010101010101010101',
-  deserializeInvoiceTerms: vi.fn(),
-}));
 
 // =============================================================================
 // Shared state
@@ -314,9 +31,11 @@ vi.mock('../../../modules/accounting/serialization.js', () => ({
 
 let module: AccountingModule;
 let mocks: TestAccountingModuleMocks;
+let engine: FakeTokenEngine;
 
 function setup(overrides?: Parameters<typeof createTestAccountingModule>[0]) {
-  const result = createTestAccountingModule(overrides);
+  engine = new FakeTokenEngine();
+  const result = createTestAccountingModule({ tokenEngine: engine, ...overrides });
   module = result.module;
   mocks = result.mocks;
 
@@ -324,25 +43,14 @@ function setup(overrides?: Parameters<typeof createTestAccountingModule>[0]) {
   (mocks.payments as any).addToken = vi.fn().mockResolvedValue(undefined);
 }
 
-afterEach(async () => {
+afterEach(() => {
   try {
     module.destroy();
   } catch {
     // ignore MODULE_DESTROYED
   }
-  // Use clearAllMocks (not restoreAllMocks) to preserve vi.mock() factory implementations.
-  // restoreAllMocks() would reset mockResolvedValue on the SDK stubs, causing subsequent tests
-  // to receive undefined from createFromSecret etc.
-  vi.clearAllMocks();
+  vi.restoreAllMocks();
 });
-
-// Helper: set up oracle to return SUCCESS on submitMintCommitment
-function makeOracleSucceed() {
-  mocks.oracle._stateTransitionClient.submitMintCommitment.mockResolvedValue({
-    status: 'SUCCESS',
-    requestId: 'test-request-id',
-  });
-}
 
 // Helper: build a valid single-target request
 function validRequest() {
@@ -356,7 +64,6 @@ function validRequest() {
 describe('UT-CREATE-001: simple single-target, single-asset creation', () => {
   beforeEach(async () => {
     setup();
-    makeOracleSucceed();
     await module.load();
   });
 
@@ -378,7 +85,6 @@ describe('UT-CREATE-001: simple single-target, single-asset creation', () => {
 describe('UT-CREATE-002: anonymous invoice omits creator', () => {
   beforeEach(async () => {
     setup();
-    makeOracleSucceed();
     await module.load();
   });
 
@@ -396,7 +102,6 @@ describe('UT-CREATE-002: anonymous invoice omits creator', () => {
 describe('UT-CREATE-003: non-anonymous invoice includes creator pubkey', () => {
   beforeEach(async () => {
     setup();
-    makeOracleSucceed();
     await module.load();
   });
 
@@ -422,7 +127,6 @@ describe('UT-CREATE-003: non-anonymous invoice includes creator pubkey', () => {
 describe('UT-CREATE-004: createdAt set to Date.now() at creation time', () => {
   beforeEach(async () => {
     setup();
-    makeOracleSucceed();
     await module.load();
   });
 
@@ -443,7 +147,6 @@ describe('UT-CREATE-004: createdAt set to Date.now() at creation time', () => {
 describe('UT-CREATE-005: dueDate in the future is accepted', () => {
   beforeEach(async () => {
     setup();
-    makeOracleSucceed();
     await module.load();
   });
 
@@ -903,7 +606,6 @@ describe('UT-CREATE-022: duplicate NFT tokenId within a target is rejected', () 
 describe('UT-CREATE-023: multi-target, multi-asset creation succeeds', () => {
   beforeEach(async () => {
     setup();
-    makeOracleSucceed();
     await module.load();
   });
 
@@ -962,7 +664,6 @@ describe('UT-CREATE-024: more than 100 targets is rejected', () => {
 describe('UT-CREATE-025: exactly 100 targets succeeds', () => {
   beforeEach(async () => {
     setup();
-    makeOracleSucceed();
     await module.load();
   });
 
@@ -1013,7 +714,6 @@ describe('UT-CREATE-026: more than 50 assets per target is rejected', () => {
 describe('UT-CREATE-027: exactly 50 assets per target succeeds', () => {
   beforeEach(async () => {
     setup();
-    makeOracleSucceed();
     await module.load();
   });
 
@@ -1058,7 +758,6 @@ describe('UT-CREATE-028: memo exceeding 4096 chars is rejected', () => {
 describe('UT-CREATE-029: memo exactly 4096 chars succeeds', () => {
   beforeEach(async () => {
     setup();
-    makeOracleSucceed();
     await module.load();
   });
 
@@ -1080,13 +779,16 @@ describe('UT-CREATE-030: serialized terms exceeding 64 KB is rejected', () => {
     await module.load();
   });
 
-  it('throws INVOICE_TERMS_TOO_LARGE when canonicalSerialize returns over-64KB content', async () => {
-    // Override the canonicalSerialize mock to return a large string
-    const { canonicalSerialize } = await import('../../../modules/accounting/serialization.js');
-    (canonicalSerialize as ReturnType<typeof vi.fn>).mockReturnValueOnce('x'.repeat(65 * 1024));
+  it('throws INVOICE_TERMS_TOO_LARGE when the canonical terms exceed 64 KB', async () => {
+    // 100 valid targets with ~700-char unique DIRECT:// addresses serialize to
+    // well over 64 KB while passing every per-target validation rule.
+    const targets = Array.from({ length: 100 }, (_, i) => ({
+      address: `DIRECT://${'x'.repeat(690)}${String(i).padStart(3, '0')}`,
+      assets: [{ coin: ['UCT', '100'] as [string, string] }],
+    }));
 
     await expect(
-      module.createInvoice(validRequest()),
+      module.createInvoice({ targets }),
     ).rejects.toSatisfy(
       (e: unknown) => e instanceof SphereError && (e as SphereError).code === 'INVOICE_TERMS_TOO_LARGE',
     );
@@ -1094,57 +796,57 @@ describe('UT-CREATE-030: serialized terms exceeding 64 KB is rejected', () => {
 });
 
 // =============================================================================
-// UT-CREATE-031: No oracle → INVOICE_ORACLE_REQUIRED
+// UT-CREATE-031: No token engine → INVOICE_ORACLE_REQUIRED
 // =============================================================================
 
-describe('UT-CREATE-031: missing oracle causes INVOICE_ORACLE_REQUIRED', () => {
-  it('throws INVOICE_ORACLE_REQUIRED when oracle has no getStateTransitionClient', async () => {
-    const oracle = createMockOracleProvider();
-    oracle.getStateTransitionClient.mockReturnValue(null);
-
-    setup({ oracle });
+describe('UT-CREATE-031: missing token engine causes INVOICE_ORACLE_REQUIRED', () => {
+  it('throws INVOICE_ORACLE_REQUIRED when no tokenEngine is injected', async () => {
+    setup({ tokenEngine: undefined });
     await module.load();
 
     await expect(
       module.createInvoice(validRequest()),
     ).rejects.toSatisfy(
-      (e: unknown) => e instanceof SphereError && (e as SphereError).code === 'INVOICE_ORACLE_REQUIRED',
+      (e: unknown) =>
+        e instanceof SphereError &&
+        (e as SphereError).code === 'INVOICE_ORACLE_REQUIRED' &&
+        (e as SphereError).message.includes('Token engine unavailable'),
     );
   });
 });
 
 // =============================================================================
-// UT-CREATE-032: Aggregator submission fails → INVOICE_MINT_FAILED
+// UT-CREATE-032: Engine mint failure → INVOICE_MINT_FAILED
 // =============================================================================
 
-describe('UT-CREATE-032: oracle submitMintCommitment rejection causes INVOICE_MINT_FAILED', () => {
+describe('UT-CREATE-032: engine.mintDataToken failure causes INVOICE_MINT_FAILED', () => {
   beforeEach(async () => {
     setup();
     await module.load();
   });
 
-  it('throws INVOICE_MINT_FAILED when submitMintCommitment rejects', async () => {
-    mocks.oracle._stateTransitionClient.submitMintCommitment.mockRejectedValue(
-      new Error('Network unreachable'),
-    );
+  it('throws INVOICE_MINT_FAILED when engine.mintDataToken rejects', async () => {
+    vi.spyOn(engine, 'mintDataToken').mockRejectedValue(new Error('Network unreachable'));
 
     await expect(
       module.createInvoice(validRequest()),
     ).rejects.toSatisfy(
-      (e: unknown) => e instanceof SphereError && (e as SphereError).code === 'INVOICE_MINT_FAILED',
+      (e: unknown) =>
+        e instanceof SphereError &&
+        (e as SphereError).code === 'INVOICE_MINT_FAILED' &&
+        (e as SphereError).message.includes('Network unreachable'),
     );
   });
 
-  it('throws INVOICE_MINT_FAILED when submitMintCommitment returns non-SUCCESS status', async () => {
-    mocks.oracle._stateTransitionClient.submitMintCommitment.mockResolvedValue({
-      status: 'REJECTED',
-      requestId: 'test-id',
-    });
+  it('rethrows a SphereError from engine.mintDataToken as-is (no INVOICE_MINT_FAILED wrap)', async () => {
+    vi.spyOn(engine, 'mintDataToken').mockRejectedValue(
+      new SphereError('Data-token mint failed: REJECTED', 'AGGREGATOR_ERROR'),
+    );
 
     await expect(
       module.createInvoice(validRequest()),
     ).rejects.toSatisfy(
-      (e: unknown) => e instanceof SphereError && (e as SphereError).code === 'INVOICE_MINT_FAILED',
+      (e: unknown) => e instanceof SphereError && (e as SphereError).code === 'AGGREGATOR_ERROR',
     );
   });
 });
@@ -1184,8 +886,6 @@ describe('UT-CREATE-033: invalid deliveryMethods URL scheme is rejected', () => 
   });
 
   it('accepts https:// and wss:// URLs', async () => {
-    makeOracleSucceed();
-
     const result = await module.createInvoice({
       ...validRequest(),
       deliveryMethods: ['https://example.com/pay', 'wss://example.com/ws'],
@@ -1239,7 +939,6 @@ describe('UT-CREATE-035: deliveryMethods URL exceeding 2048 chars is rejected', 
   });
 
   it('accepts a URL of exactly 2048 characters', async () => {
-    makeOracleSucceed();
     const exactUrl = 'https://' + 'x'.repeat(2040); // 2048 total
 
     const result = await module.createInvoice({
@@ -1258,51 +957,18 @@ describe('UT-CREATE-035: deliveryMethods URL exceeding 2048 chars is rejected', 
 describe('UT-CREATE-036: successful createInvoice() fires invoice:created event', () => {
   beforeEach(async () => {
     setup();
-    makeOracleSucceed();
     await module.load();
   });
 
   it('calls emitEvent with "invoice:created" after successful mint', async () => {
-    const emitEvent = mocks.payments.on.mock.calls.length >= 0
-      // Retrieve the emitEvent spy from the deps — it is stored in createTestAccountingModule
-      ? vi.fn()
-      : vi.fn();
-
-    // Re-setup to capture the emitEvent spy directly
-    const result2 = createTestAccountingModule();
-    const module2 = result2.module;
-    const mocks2 = result2.mocks;
-    (mocks2.payments as any).addToken = vi.fn().mockResolvedValue(undefined);
-
-    // Make the oracle succeed
-    mocks2.oracle._stateTransitionClient.submitMintCommitment.mockResolvedValue({
-      status: 'SUCCESS',
-      requestId: 'test-id',
-    });
-
-    // Get the emitEvent from the deps object used in createTestAccountingModule
-    // emitEvent is stored on the `deps` passed to initialize()
-    // The `on` wrapper in the test helper routes to payments.on, but emitEvent is separate
-    const emitSpy = (module2 as any).deps?.emitEvent as ReturnType<typeof vi.fn> | undefined;
-
-    await module2.load();
-    await module2.createInvoice(validRequest());
-
-    if (emitSpy) {
-      expect(emitSpy).toHaveBeenCalledWith(
-        'invoice:created',
-        expect.objectContaining({ confirmed: true }),
-      );
-    }
-
-    module2.destroy();
-  });
-
-  it('returns success: true and a non-empty invoiceId', async () => {
     const result = await module.createInvoice(validRequest());
 
-    expect(result.success).toBe(true);
-    expect(result.invoiceId).toHaveLength(64);
+    // emitEvent is the vi.fn() injected into deps by the test harness.
+    const emitSpy = (module as any).deps.emitEvent as ReturnType<typeof vi.fn>;
+    expect(emitSpy).toHaveBeenCalledWith(
+      'invoice:created',
+      expect.objectContaining({ invoiceId: result.invoiceId, confirmed: true }),
+    );
   });
 });
 
@@ -1368,8 +1034,6 @@ describe('UT-CREATE-037: NFT tokenId not 64-hex is rejected', () => {
   });
 
   it('accepts a valid lowercase 64-char hex NFT tokenId', async () => {
-    makeOracleSucceed();
-
     const result = await module.createInvoice(
       createTestInvoice({
         targets: [
@@ -1382,5 +1046,32 @@ describe('UT-CREATE-037: NFT tokenId not 64-hex is rejected', () => {
     );
 
     expect(result.success).toBe(true);
+  });
+});
+
+// =============================================================================
+// UT-CREATE-038: Duplicate terms → INVOICE_ALREADY_EXISTS
+// =============================================================================
+
+describe('UT-CREATE-038: duplicate terms cause INVOICE_ALREADY_EXISTS', () => {
+  beforeEach(async () => {
+    setup();
+    await module.load();
+  });
+
+  it('throws INVOICE_ALREADY_EXISTS on a second createInvoice with identical terms', async () => {
+    // Freeze the clock so createdAt (part of the terms) is identical across calls:
+    // identical terms ⇒ deterministic salt ⇒ same engine tokenId ⇒ duplicate.
+    vi.spyOn(Date, 'now').mockReturnValue(5_000_000);
+    const request = createTestInvoice({ dueDate: 6_000_000 });
+
+    const first = await module.createInvoice(request);
+    expect(first.success).toBe(true);
+
+    await expect(
+      module.createInvoice(request),
+    ).rejects.toSatisfy(
+      (e: unknown) => e instanceof SphereError && (e as SphereError).code === 'INVOICE_ALREADY_EXISTS',
+    );
   });
 });

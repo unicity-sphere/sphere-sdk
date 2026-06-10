@@ -6,6 +6,15 @@
  * 2. addToken() tombstone blocking (edge case: Nostr re-delivery)
  * 3. Nostr re-delivery protection (full add→remove→re-add cycle)
  * 4. mergeTombstones() - remote tombstone merging
+ * 5. v2 blob tokens — keys derived from the blob itself (no engine round-trip)
+ *
+ * Tombstones are storage-level and version-agnostic: keyed by
+ * `(tokenId, stateHash)`. Two stored sdkData shapes are valid:
+ * - legacy v1 TXF entries (plain JSON — parsed for display/keys only), and
+ * - v2 engine blobs (hex of CBOR(TokenBlob) — keys via tryParseBlobKeys:
+ *   blob tokenId + sha256 of the token bytes).
+ * Harness: post v1-cutover — no token-SDK vi.mocks; the v2 path uses
+ * FakeTokenEngine-minted blobs.
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -15,46 +24,14 @@ import type { TombstoneEntry } from '../../../types/txf';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../../storage';
 import type { TransportProvider } from '../../../transport';
 import type { OracleProvider } from '../../../oracle';
+import { FakeTokenEngine } from '../token-engine/FakeTokenEngine';
+import type { SphereToken } from '../../../token-engine';
+import { encodeTokenBlob } from '../../../token-engine/token-blob';
+import { sha256, bytesToHex } from '../../../core/crypto';
 
 // =============================================================================
-// Mock SDK static imports used by PaymentsModule
+// Mock platform modules (NOT the token SDK) to avoid network / file I/O
 // =============================================================================
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/token/Token', () => ({
-  Token: { fromJSON: vi.fn().mockResolvedValue({ id: { toString: () => 'mock-id' }, coins: null, state: {} }) },
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/token/fungible/CoinId', () => ({
-  CoinId: class MockCoinId { toJSON() { return 'UCT_HEX'; } },
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/transaction/TransferCommitment', () => ({
-  TransferCommitment: { fromJSON: vi.fn() },
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/transaction/TransferTransaction', () => ({
-  TransferTransaction: class MockTransferTransaction {},
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/sign/SigningService', () => ({
-  SigningService: class MockSigningService {},
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/address/AddressScheme', () => ({
-  AddressScheme: class MockAddressScheme {},
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicate', () => ({
-  UnmaskedPredicate: class MockUnmaskedPredicate {},
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/token/TokenState', () => ({
-  TokenState: class MockTokenState {},
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/hash/HashAlgorithm', () => ({
-  HashAlgorithm: { SHA256: 'sha256' },
-}));
 
 // Mock L1 network to prevent actual connection attempts
 vi.mock('../../../l1/network', () => ({
@@ -81,12 +58,19 @@ const TOKEN_ID_A = 'aaaa00000000000000000000000000000000000000000000000000000000
 const TOKEN_ID_B = 'bbbb000000000000000000000000000000000000000000000000000000000002';
 const STATE_HASH_1 = '1111000000000000000000000000000000000000000000000000000000000001';
 const STATE_HASH_2 = '2222000000000000000000000000000000000000000000000000000000000002';
-const _STATE_HASH_3 = '3333000000000000000000000000000000000000000000000000000000000003';
+
+/** v2 engine coin ids are lowercase even-length hex (not the UI symbol). */
+const V2_COIN = '11'.repeat(32);
 
 // =============================================================================
 // Test Helpers
 // =============================================================================
 
+/**
+ * Legacy v1 TXF JSON fixture — still a valid stored shape post-cutover
+ * (parsed as plain JSON for keys/display; txf-serializer unchanged).
+ * Gives the tests precise control over (tokenId, stateHash).
+ */
 function createMockToken(opts: {
   tokenId: string;
   stateHash: string;
@@ -129,7 +113,37 @@ function createMockToken(opts: {
   };
 }
 
-function createMockDeps(): PaymentsModuleDependencies {
+/**
+ * v2 stored shape: a confirmed UI Token whose sdkData is the engine blob
+ * (hex of CBOR(TokenBlob)). Returns the expected tombstone keys exactly as
+ * production derives them WITHOUT an engine (tryParseBlobKeys):
+ * tokenId = blob tokenId, stateHash = sha256 of the token bytes.
+ */
+function v2BlobToken(
+  engine: FakeTokenEngine,
+  st: SphereToken,
+  id: string,
+): { token: Token; tokenId: string; stateHash: string } {
+  const blob = engine.encodeToken(st);
+  return {
+    token: {
+      id,
+      coinId: V2_COIN,
+      symbol: 'UCT',
+      name: 'Unicity Token',
+      decimals: 8,
+      amount: '100',
+      status: 'confirmed',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      sdkData: bytesToHex(encodeTokenBlob(blob)),
+    },
+    tokenId: blob.tokenId,
+    stateHash: sha256(bytesToHex(blob.token), 'hex'),
+  };
+}
+
+function createMockDeps(engine: FakeTokenEngine): PaymentsModuleDependencies {
   const mockStorage: StorageProvider = {
     id: 'mock-storage',
     name: 'Mock Storage',
@@ -183,22 +197,21 @@ function createMockDeps(): PaymentsModuleDependencies {
     onPaymentRequestResponse: vi.fn().mockReturnValue(() => {}),
   } as unknown as TransportProvider;
 
-  const mockOracle = {
+  // Post-cutover oracle surface: network config + legacy-TXF validateToken only.
+  const mockOracle: OracleProvider = {
     id: 'mock-oracle',
     name: 'Mock Oracle',
-    type: 'network' as const,
+    type: 'network',
     connect: vi.fn().mockResolvedValue(undefined),
     disconnect: vi.fn().mockResolvedValue(undefined),
     isConnected: vi.fn().mockReturnValue(true),
     getStatus: vi.fn().mockReturnValue('connected' as const),
     initialize: vi.fn().mockResolvedValue(undefined),
-    submitCommitment: vi.fn().mockResolvedValue({ success: true }),
-    getProof: vi.fn().mockResolvedValue(null),
-    waitForProof: vi.fn().mockResolvedValue({}),
-    validateToken: vi.fn().mockResolvedValue({ isValid: true }),
-    isSpent: vi.fn().mockResolvedValue(false),
-    getTokenState: vi.fn().mockResolvedValue(null),
-  } as unknown as OracleProvider;
+    validateToken: vi.fn().mockResolvedValue({ valid: true, spent: false }),
+    getTrustBaseJson: vi.fn().mockReturnValue(null),
+    getAggregatorUrl: vi.fn().mockReturnValue('https://aggregator.test'),
+    getApiKey: vi.fn().mockReturnValue(undefined),
+  };
 
   const mockIdentity: FullIdentity = {
     chainPubkey: 'aabbccdd11223344556677889900aabbccdd11223344556677889900aabbccdd11',
@@ -213,6 +226,7 @@ function createMockDeps(): PaymentsModuleDependencies {
     tokenStorageProviders,
     transport: mockTransport,
     oracle: mockOracle,
+    tokenEngine: engine,
     emitEvent: vi.fn(),
   };
 }
@@ -224,11 +238,13 @@ function createMockDeps(): PaymentsModuleDependencies {
 describe('PaymentsModule - Tombstone Enforcement', () => {
   let module: ReturnType<typeof createPaymentsModule>;
   let deps: PaymentsModuleDependencies;
+  let engine: FakeTokenEngine;
 
   beforeEach(() => {
     vi.clearAllMocks();
     module = createPaymentsModule({ debug: false });
-    deps = createMockDeps();
+    engine = new FakeTokenEngine();
+    deps = createMockDeps(engine);
     module.initialize(deps);
   });
 
@@ -500,6 +516,64 @@ describe('PaymentsModule - Tombstone Enforcement', () => {
 
       expect(result).toBe(false);
       expect(module.getTokens().length).toBe(0);
+    });
+  });
+
+  // ===========================================================================
+  // 5. v2 blob tokens — keys derived from the blob (tryParseBlobKeys)
+  // ===========================================================================
+
+  describe('v2 blob tokens (engine-minted sdkData)', () => {
+    it('add → remove creates a tombstone keyed by (blob tokenId, sha256(token bytes))', async () => {
+      const st = await engine.mint({
+        recipientPubkey: engine.getIdentity().chainPubkey,
+        value: { assets: [{ coinId: V2_COIN, amount: 100n }] },
+      });
+      const { token, tokenId, stateHash } = v2BlobToken(engine, st, 'v2-tok-1');
+
+      await module.addToken(token);
+      await module.removeToken(token.id);
+
+      expect(module.getTombstones()).toContainEqual(expect.objectContaining({ tokenId, stateHash }));
+      expect(module.isStateTombstoned(tokenId, stateHash)).toBe(true);
+    });
+
+    it('re-delivered identical v2 blob is rejected by the tombstone', async () => {
+      const st = await engine.mint({
+        recipientPubkey: engine.getIdentity().chainPubkey,
+        value: { assets: [{ coinId: V2_COIN, amount: 100n }] },
+      });
+      const { token } = v2BlobToken(engine, st, 'v2-tok-1');
+      await module.addToken(token);
+      await module.removeToken(token.id);
+
+      const { token: redelivered } = v2BlobToken(engine, st, 'v2-redelivered');
+      const result = await module.addToken(redelivered);
+
+      expect(result).toBe(false);
+      expect(module.getTokens().length).toBe(0);
+    });
+
+    it('a NEW state of the same v2 token (after transfer) is not blocked', async () => {
+      const st = await engine.mint({
+        recipientPubkey: engine.getIdentity().chainPubkey,
+        value: { assets: [{ coinId: V2_COIN, amount: 100n }] },
+      });
+      const { token, tokenId } = v2BlobToken(engine, st, 'v2-tok-1');
+      await module.addToken(token);
+      await module.removeToken(token.id);
+
+      // Transfer produces a new state: same genesis tokenId, new token bytes →
+      // new stateHash (sha256 of bytes), so the tombstone must NOT block it.
+      const next = await engine.transfer({ token: st, recipientPubkey: engine.getIdentity().chainPubkey });
+      const { token: nextToken, tokenId: nextTokenId, stateHash: nextStateHash } = v2BlobToken(engine, next, 'v2-tok-2');
+      expect(nextTokenId).toBe(tokenId); // genesis-stable id survives the transfer
+
+      const result = await module.addToken(nextToken);
+
+      expect(result).toBe(true);
+      expect(module.getTokens().some(t => t.id === 'v2-tok-2')).toBe(true);
+      expect(module.isStateTombstoned(nextTokenId, nextStateHash)).toBe(false);
     });
   });
 });

@@ -1,153 +1,83 @@
 /**
- * Tests for PaymentsModule transaction history
+ * Tests for PaymentsModule transaction history (v2 engine harness).
  *
  * Covers:
  * 1. addToHistory() stores entries and prevents duplicates via dedupKey
  * 2. getHistory() returns sorted entries
- * 3. addToken() creates NO history entries
+ * 3. addToken() creates NO history entries (v2 blob tokens)
  * 4. removeToken() creates NO history entries
  * 5. Deduplication via dedupKey (same tokenId + type = single entry)
+ * 6. loadHistory() migrates legacy KV history into the history store
+ *
+ * Clean harness (no SDK vi.mock): tokens are generated via the FakeTokenEngine
+ * and stored as v2 engine blobs (hex of CBOR(TokenBlob)) in Token.sdkData.
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createPaymentsModule, type PaymentsModuleDependencies } from '../../../modules/payments/PaymentsModule';
 import type { Token, FullIdentity } from '../../../types';
-import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../../storage';
+import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase, HistoryRecord } from '../../../storage';
 import type { TransportProvider } from '../../../transport';
 import type { OracleProvider } from '../../../oracle';
-
-// =============================================================================
-// Mock SDK static imports used by PaymentsModule
-// =============================================================================
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/token/Token', () => ({
-  Token: { fromJSON: vi.fn().mockResolvedValue({ id: { toString: () => 'mock-id' }, coins: null, state: {} }) },
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/token/fungible/CoinId', () => ({
-  CoinId: class MockCoinId { toJSON() { return 'UCT_HEX'; } },
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/transaction/TransferCommitment', () => ({
-  TransferCommitment: { fromJSON: vi.fn() },
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/transaction/TransferTransaction', () => ({
-  TransferTransaction: class MockTransferTransaction {},
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/sign/SigningService', () => ({
-  SigningService: class MockSigningService {},
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/address/AddressScheme', () => ({
-  AddressScheme: class MockAddressScheme {},
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicate', () => ({
-  UnmaskedPredicate: class MockUnmaskedPredicate {},
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/token/TokenState', () => ({
-  TokenState: class MockTokenState {},
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/hash/HashAlgorithm', () => ({
-  HashAlgorithm: { SHA256: 'sha256' },
-}));
-
-vi.mock('../../../l1/network', () => ({
-  connect: vi.fn().mockResolvedValue(undefined),
-  disconnect: vi.fn(),
-  isWebSocketConnected: vi.fn().mockReturnValue(false),
-}));
-
-vi.mock('../../../registry', () => ({
-  TokenRegistry: {
-    getInstance: () => ({
-      getDefinition: () => null,
-      getIconUrl: () => null,
-      getSymbol: (id: string) => id,
-      getName: (id: string) => id,
-      getDecimals: () => 8,
-    }),
-    waitForReady: vi.fn().mockResolvedValue(undefined),
-  },
-}));
+import { FakeTokenEngine } from '../token-engine/FakeTokenEngine';
+import { encodeTokenBlob } from '../../../token-engine/token-blob';
+import { bytesToHex } from '../../../core/crypto';
+import { STORAGE_KEYS_ADDRESS } from '../../../constants';
 
 // =============================================================================
 // Test Constants
 // =============================================================================
 
-const TOKEN_ID_A = 'aaaa000000000000000000000000000000000000000000000000000000000001';
-const STATE_HASH_1 = '1111000000000000000000000000000000000000000000000000000000000001';
+const FAKE_PRIVATE_KEY = 'a'.repeat(64);
+const FAKE_PUBKEY = '02' + 'b'.repeat(64);
+const UCT = '11'.repeat(32); // v2 coin ids are lowercase hex
 
 // =============================================================================
 // Test Helpers
 // =============================================================================
 
-function createMockToken(opts: {
-  tokenId: string;
-  stateHash: string;
-  id?: string;
-  amount?: string;
-  coinId?: string;
-}): Token {
+function mockIdentity(): FullIdentity {
   return {
-    id: opts.id ?? `local-${opts.tokenId.slice(0, 8)}`,
-    coinId: opts.coinId ?? 'UCT',
-    symbol: 'UCT',
-    name: 'Unicity Token',
-    decimals: 8,
-    amount: opts.amount ?? '1000000',
-    status: 'confirmed',
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-    sdkData: JSON.stringify({
-      version: '2.0',
-      genesis: {
-        data: {
-          tokenId: opts.tokenId,
-          tokenType: '00',
-          coinData: [['UCT_HEX', opts.amount ?? '1000000']],
-          tokenData: '',
-          salt: '00',
-          recipient: 'DIRECT://test',
-          recipientDataHash: null,
-          reason: null,
-        },
-        inclusionProof: {
-          authenticator: { algorithm: 'secp256k1', publicKey: 'pubkey', signature: 'sig', stateHash: opts.stateHash },
-          merkleTreePath: { root: '00', steps: [] },
-          transactionHash: '00',
-          unicityCertificate: '00',
-        },
-      },
-      state: { data: 'statedata', predicate: 'predicate' },
-      transactions: [],
-    }),
+    chainPubkey: FAKE_PUBKEY,
+    l1Address: 'alpha1testaddress',
+    directAddress: 'DIRECT://testaddress',
+    privateKey: FAKE_PRIVATE_KEY,
+    transportPubkey: 'c'.repeat(64),
   };
 }
 
-/** In-memory history store that mimics IndexedDB history store */
-function createMockHistoryStore() {
-  const entries = new Map<string, Record<string, unknown>>();
+function mockStorage(): StorageProvider {
+  const s = new Map<string, string>();
   return {
-    addHistoryEntry: vi.fn(async (entry: Record<string, unknown>) => {
-      entries.set(entry.dedupKey as string, entry);
+    id: 'mock-storage', name: 'Mock Storage', type: 'local',
+    connect: vi.fn(), disconnect: vi.fn(),
+    isConnected: () => true, getStatus: () => 'connected', setIdentity: vi.fn(),
+    get: vi.fn(async (k: string) => s.get(k) ?? null),
+    set: vi.fn(async (k: string, v: string) => { s.set(k, v); }),
+    remove: vi.fn(async (k: string) => { s.delete(k); }),
+    has: vi.fn(async (k: string) => s.has(k)),
+    keys: vi.fn(async () => [...s.keys()]),
+    clear: vi.fn(async () => { s.clear(); }),
+  } as unknown as StorageProvider;
+}
+
+/** In-memory history store that mimics the IndexedDB history store */
+function createMockHistoryStore() {
+  const entries = new Map<string, HistoryRecord>();
+  return {
+    addHistoryEntry: vi.fn(async (entry: HistoryRecord) => {
+      entries.set(entry.dedupKey, entry);
     }),
-    getHistoryEntries: vi.fn(async () => {
-      return [...entries.values()].sort(
-        (a, b) => (b.timestamp as number) - (a.timestamp as number)
-      );
-    }),
+    getHistoryEntries: vi.fn(async () =>
+      [...entries.values()].sort((a, b) => b.timestamp - a.timestamp),
+    ),
     hasHistoryEntry: vi.fn(async (dedupKey: string) => entries.has(dedupKey)),
     clearHistory: vi.fn(async () => entries.clear()),
-    importHistoryEntries: vi.fn(async (importEntries: Record<string, unknown>[]) => {
+    importHistoryEntries: vi.fn(async (importEntries: HistoryRecord[]) => {
       let count = 0;
       for (const entry of importEntries) {
-        if (!entries.has(entry.dedupKey as string)) {
-          entries.set(entry.dedupKey as string, entry);
+        if (!entries.has(entry.dedupKey)) {
+          entries.set(entry.dedupKey, entry);
           count++;
         }
       }
@@ -157,99 +87,90 @@ function createMockHistoryStore() {
   };
 }
 
-function createMockDeps(): { deps: PaymentsModuleDependencies; historyStore: ReturnType<typeof createMockHistoryStore> } {
-  const historyStore = createMockHistoryStore();
-
-  const mockStorage: StorageProvider = {
-    id: 'mock-storage',
-    name: 'Mock Storage',
-    type: 'local',
-    connect: vi.fn().mockResolvedValue(undefined),
-    disconnect: vi.fn().mockResolvedValue(undefined),
-    isConnected: vi.fn().mockReturnValue(true),
-    getStatus: vi.fn().mockReturnValue('connected'),
-    setIdentity: vi.fn(),
-    get: vi.fn().mockResolvedValue(null),
-    set: vi.fn().mockResolvedValue(undefined),
-    remove: vi.fn().mockResolvedValue(undefined),
-    has: vi.fn().mockResolvedValue(false),
-    keys: vi.fn().mockResolvedValue([]),
-    clear: vi.fn().mockResolvedValue(undefined),
-  };
-
-  // Token storage provider with history methods (mimics IndexedDBTokenStorageProvider)
-  const mockTokenStorage = {
-    id: 'mock-token-storage',
-    name: 'Mock Token Storage',
-    type: 'local' as const,
-    connect: vi.fn().mockResolvedValue(undefined),
-    disconnect: vi.fn().mockResolvedValue(undefined),
-    isConnected: vi.fn().mockReturnValue(true),
-    getStatus: vi.fn().mockReturnValue('connected'),
-    setIdentity: vi.fn(),
-    initialize: vi.fn().mockResolvedValue(true),
-    shutdown: vi.fn().mockResolvedValue(undefined),
+function mockTokenStorage(historyStore: ReturnType<typeof createMockHistoryStore>): TokenStorageProvider<TxfStorageDataBase> {
+  return {
+    id: 'mock-token-storage', name: 'Mock Token Storage', type: 'local',
+    connect: vi.fn().mockResolvedValue(undefined), disconnect: vi.fn().mockResolvedValue(undefined),
+    isConnected: () => true, getStatus: () => 'connected', setIdentity: vi.fn(),
+    initialize: vi.fn().mockResolvedValue(true), shutdown: vi.fn().mockResolvedValue(undefined),
     save: vi.fn().mockResolvedValue({ success: true, timestamp: Date.now() }),
-    load: vi.fn().mockResolvedValue({ success: false, source: 'local' as const, timestamp: Date.now() }),
+    load: vi.fn().mockResolvedValue({ success: false, source: 'local', timestamp: Date.now() }),
     sync: vi.fn().mockResolvedValue({ success: true, added: 0, removed: 0, conflicts: 0 }),
-    // History store methods
     ...historyStore,
   } as unknown as TokenStorageProvider<TxfStorageDataBase>;
+}
 
-  const tokenStorageProviders = new Map<string, TokenStorageProvider<TxfStorageDataBase>>();
-  tokenStorageProviders.set('mock', mockTokenStorage);
-
-  const mockTransport = {
-    id: 'mock-transport',
-    name: 'Mock Transport',
-    type: 'p2p' as const,
-    connect: vi.fn().mockResolvedValue(undefined),
-    disconnect: vi.fn().mockResolvedValue(undefined),
-    isConnected: vi.fn().mockReturnValue(true),
-    getStatus: vi.fn().mockReturnValue('connected' as const),
-    setIdentity: vi.fn(),
-    sendMessage: vi.fn().mockResolvedValue('event-id'),
-    onMessage: vi.fn().mockReturnValue(() => {}),
-    sendTokenTransfer: vi.fn().mockResolvedValue('event-id'),
+function mockTransport(): TransportProvider {
+  return {
+    sendTokenTransfer: vi.fn().mockResolvedValue(undefined),
     onTokenTransfer: vi.fn().mockReturnValue(() => {}),
     onPaymentRequest: vi.fn().mockReturnValue(() => {}),
     onPaymentRequestResponse: vi.fn().mockReturnValue(() => {}),
+    resolve: vi.fn().mockResolvedValue(null),
+    resolveNametagInfo: vi.fn().mockResolvedValue(null),
+    resolveTransportPubkeyInfo: vi.fn().mockResolvedValue(null),
+    connect: vi.fn().mockResolvedValue(undefined), disconnect: vi.fn(), isConnected: () => true,
+    publishNametag: vi.fn().mockResolvedValue(undefined),
+    sendPaymentRequest: vi.fn().mockResolvedValue(undefined),
+    sendPaymentRequestResponse: vi.fn().mockResolvedValue(undefined),
   } as unknown as TransportProvider;
+}
 
-  const mockOracle = {
-    id: 'mock-oracle',
-    name: 'Mock Oracle',
-    type: 'network' as const,
-    connect: vi.fn().mockResolvedValue(undefined),
-    disconnect: vi.fn().mockResolvedValue(undefined),
-    isConnected: vi.fn().mockReturnValue(true),
-    getStatus: vi.fn().mockReturnValue('connected' as const),
+function mockOracle(): OracleProvider {
+  return {
     initialize: vi.fn().mockResolvedValue(undefined),
-    submitCommitment: vi.fn().mockResolvedValue({ success: true }),
-    getProof: vi.fn().mockResolvedValue(null),
-    waitForProof: vi.fn().mockResolvedValue({}),
-    validateToken: vi.fn().mockResolvedValue({ isValid: true }),
-    isSpent: vi.fn().mockResolvedValue(false),
+    validateToken: vi.fn().mockResolvedValue({ valid: true }),
+    getTrustBaseJson: vi.fn().mockReturnValue(null),
+    getAggregatorUrl: vi.fn().mockReturnValue(null),
+    getApiKey: vi.fn().mockReturnValue(null),
+    connect: vi.fn().mockResolvedValue(undefined),
+    disconnect: vi.fn(),
+    isConnected: () => true,
+    getStatus: () => 'connected',
+    onEvent: vi.fn().mockReturnValue(() => {}),
   } as unknown as OracleProvider;
+}
 
-  const mockIdentity: FullIdentity = {
-    chainPubkey: '02' + 'a'.repeat(64),
-    l1Address: 'alpha1testaddress',
-    directAddress: 'DIRECT://testaddress',
-    privateKey: '0x' + 'b'.repeat(64),
-    transportPubkey: 'c'.repeat(64),
-  };
+function createMockDeps(engine: FakeTokenEngine): {
+  deps: PaymentsModuleDependencies;
+  historyStore: ReturnType<typeof createMockHistoryStore>;
+} {
+  const historyStore = createMockHistoryStore();
+  const tokenStorageProviders = new Map<string, TokenStorageProvider<TxfStorageDataBase>>();
+  tokenStorageProviders.set('local', mockTokenStorage(historyStore));
 
   return {
     deps: {
-      identity: mockIdentity,
-      storage: mockStorage,
+      identity: mockIdentity(),
+      storage: mockStorage(),
       tokenStorageProviders,
-      transport: mockTransport,
-      oracle: mockOracle,
+      transport: mockTransport(),
+      oracle: mockOracle(),
+      tokenEngine: engine,
       emitEvent: vi.fn(),
     },
     historyStore,
+  };
+}
+
+/** Mint a v2 engine token and wrap it as a wallet Token (blob sdkData). */
+async function createBlobToken(engine: FakeTokenEngine, amount = 1000000n): Promise<Token> {
+  const minted = await engine.mint({
+    recipientPubkey: engine.getIdentity().chainPubkey,
+    value: { assets: [{ coinId: UCT, amount }] },
+  });
+  const sdkData = bytesToHex(encodeTokenBlob(engine.encodeToken(minted)));
+  return {
+    id: `v2_${engine.tokenId(minted)}`,
+    coinId: UCT,
+    symbol: 'UCT',
+    name: 'Unicity Token',
+    decimals: 8,
+    amount: String(amount),
+    status: 'confirmed',
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    sdkData,
   };
 }
 
@@ -259,11 +180,13 @@ function createMockDeps(): { deps: PaymentsModuleDependencies; historyStore: Ret
 
 describe('PaymentsModule Transaction History', () => {
   let module: ReturnType<typeof createPaymentsModule>;
+  let engine: FakeTokenEngine;
   let historyStore: ReturnType<typeof createMockHistoryStore>;
 
   beforeEach(() => {
-    module = createPaymentsModule();
-    const mocks = createMockDeps();
+    module = createPaymentsModule({ debug: false });
+    engine = new FakeTokenEngine();
+    const mocks = createMockDeps(engine);
     historyStore = mocks.historyStore;
     module.initialize(mocks.deps);
   });
@@ -384,10 +307,7 @@ describe('PaymentsModule Transaction History', () => {
 
   describe('addToken creates NO history', () => {
     it('should not call addHistoryEntry when adding a token', async () => {
-      const token = createMockToken({
-        tokenId: TOKEN_ID_A,
-        stateHash: STATE_HASH_1,
-      });
+      const token = await createBlobToken(engine);
 
       await module.addToken(token);
 
@@ -398,10 +318,7 @@ describe('PaymentsModule Transaction History', () => {
 
   describe('removeToken creates NO history', () => {
     it('should not call addHistoryEntry when removing a token', async () => {
-      const token = createMockToken({
-        tokenId: TOKEN_ID_A,
-        stateHash: STATE_HASH_1,
-      });
+      const token = await createBlobToken(engine);
 
       await module.addToken(token);
       historyStore.addHistoryEntry.mockClear();
@@ -415,16 +332,17 @@ describe('PaymentsModule Transaction History', () => {
 
   describe('loadHistory migration', () => {
     it('should migrate legacy KV history to new store on load', async () => {
-      const mocks = createMockDeps();
-      const mod = createPaymentsModule();
+      const mocks = createMockDeps(engine);
+      const mod = createPaymentsModule({ debug: false });
 
       // Set up legacy KV data
       const legacyEntries = [
         { id: 'old-1', type: 'RECEIVED', amount: '100', coinId: 'UCT', symbol: 'UCT', timestamp: 1000 },
         { id: 'old-2', type: 'SENT', amount: '200', coinId: 'UCT', symbol: 'UCT', timestamp: 2000 },
       ];
-      (mocks.deps.storage.get as ReturnType<typeof vi.fn>).mockResolvedValue(
-        JSON.stringify(legacyEntries)
+      await mocks.deps.storage.set(
+        STORAGE_KEYS_ADDRESS.TRANSACTION_HISTORY,
+        JSON.stringify(legacyEntries),
       );
 
       mod.initialize(mocks.deps);
@@ -432,8 +350,10 @@ describe('PaymentsModule Transaction History', () => {
 
       // importHistoryEntries should have been called with the legacy entries
       expect(mocks.historyStore.importHistoryEntries).toHaveBeenCalledTimes(1);
+      // Legacy entries are now in the history store / cache
+      expect(mod.getHistory()).toHaveLength(2);
       // Legacy KV key should have been deleted
-      expect(mocks.deps.storage.remove).toHaveBeenCalled();
+      expect(mocks.deps.storage.remove).toHaveBeenCalledWith(STORAGE_KEYS_ADDRESS.TRANSACTION_HISTORY);
     });
   });
 });

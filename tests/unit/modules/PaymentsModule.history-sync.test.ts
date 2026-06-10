@@ -6,6 +6,10 @@
  * 2. load() imports history from IPFS TXF data
  * 3. _doSync() imports merged history from IPFS sync result
  * 4. importRemoteHistoryEntries() delegates to provider and deduplicates
+ *
+ * Harness: post v1-cutover — no token-SDK vi.mocks. Token value reads go
+ * through the injected ITokenEngine (FakeTokenEngine); history
+ * sync/merge/import semantics are storage-level and engine-agnostic.
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -14,46 +18,11 @@ import type { FullIdentity } from '../../../types';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase, HistoryRecord } from '../../../storage';
 import type { TransportProvider } from '../../../transport';
 import type { OracleProvider } from '../../../oracle';
+import { FakeTokenEngine } from '../token-engine/FakeTokenEngine';
 
 // =============================================================================
-// Mock SDK static imports used by PaymentsModule
+// Mock platform modules (NOT the token SDK) to avoid network / file I/O
 // =============================================================================
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/token/Token', () => ({
-  Token: { fromJSON: vi.fn().mockResolvedValue({ id: { toString: () => 'mock-id' }, coins: null, state: {} }) },
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/token/fungible/CoinId', () => ({
-  CoinId: class MockCoinId { toJSON() { return 'UCT_HEX'; } },
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/transaction/TransferCommitment', () => ({
-  TransferCommitment: { fromJSON: vi.fn() },
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/transaction/TransferTransaction', () => ({
-  TransferTransaction: class MockTransferTransaction {},
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/sign/SigningService', () => ({
-  SigningService: class MockSigningService {},
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/address/AddressScheme', () => ({
-  AddressScheme: class MockAddressScheme {},
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicate', () => ({
-  UnmaskedPredicate: class MockUnmaskedPredicate {},
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/token/TokenState', () => ({
-  TokenState: class MockTokenState {},
-}));
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/hash/HashAlgorithm', () => ({
-  HashAlgorithm: { SHA256: 'sha256' },
-}));
 
 vi.mock('../../../l1/network', () => ({
   connect: vi.fn().mockResolvedValue(undefined),
@@ -175,21 +144,21 @@ function createMockDeps() {
     onPaymentRequestResponse: vi.fn().mockReturnValue(() => {}),
   } as unknown as TransportProvider;
 
-  const mockOracle = {
+  // Post-cutover oracle surface: network config + legacy-TXF validateToken only.
+  const mockOracle: OracleProvider = {
     id: 'mock-oracle',
     name: 'Mock Oracle',
-    type: 'network' as const,
+    type: 'network',
     connect: vi.fn().mockResolvedValue(undefined),
     disconnect: vi.fn().mockResolvedValue(undefined),
     isConnected: vi.fn().mockReturnValue(true),
     getStatus: vi.fn().mockReturnValue('connected' as const),
     initialize: vi.fn().mockResolvedValue(undefined),
-    submitCommitment: vi.fn().mockResolvedValue({ success: true }),
-    getProof: vi.fn().mockResolvedValue(null),
-    waitForProof: vi.fn().mockResolvedValue({}),
-    validateToken: vi.fn().mockResolvedValue({ isValid: true }),
-    isSpent: vi.fn().mockResolvedValue(false),
-  } as unknown as OracleProvider;
+    validateToken: vi.fn().mockResolvedValue({ valid: true, spent: false }),
+    getTrustBaseJson: vi.fn().mockReturnValue(null),
+    getAggregatorUrl: vi.fn().mockReturnValue('https://aggregator.test'),
+    getApiKey: vi.fn().mockReturnValue(undefined),
+  };
 
   const mockIdentity: FullIdentity = {
     chainPubkey: '02' + 'a'.repeat(64),
@@ -205,6 +174,7 @@ function createMockDeps() {
       tokenStorageProviders,
       transport: mockTransport,
       oracle: mockOracle,
+      tokenEngine: new FakeTokenEngine(),
       emitEvent: vi.fn(),
     } as PaymentsModuleDependencies,
     historyStore,

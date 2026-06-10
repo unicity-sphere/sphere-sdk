@@ -18,29 +18,21 @@ import {
   SphereError,
   DEFAULT_TEST_TRACKED_ADDRESS,
 } from './accounting-test-helpers.js';
+import { FakeTokenEngine } from '../token-engine/FakeTokenEngine';
 import type { AccountingModule } from '../../../modules/accounting/AccountingModule.js';
 import type { TestAccountingModuleMocks } from './accounting-test-helpers.js';
 
 // =============================================================================
-// Mock SDK imports to allow createInvoice validation tests (short-circuit before mint)
-// =============================================================================
-
-vi.mock('@unicitylabs/state-transition-sdk/lib/token/Token', () => ({
-  Token: { mint: vi.fn(), fromJSON: vi.fn() },
-}));
-vi.mock('@unicitylabs/state-transition-sdk/lib/token/Token.js', () => ({
-  Token: { mint: vi.fn(), fromJSON: vi.fn() },
-}));
-
-// =============================================================================
-// Shared setup
+// Shared setup — v2 harness: a FakeTokenEngine is wired into deps (no SDK
+// vi.mocks). createInvoice validates the request BEFORE touching the engine,
+// so all business-validation errors below short-circuit ahead of any mint.
 // =============================================================================
 
 let module: AccountingModule;
 let mocks: TestAccountingModuleMocks;
 
 function setup(overrides?: Parameters<typeof createTestAccountingModule>[0]) {
-  const result = createTestAccountingModule(overrides);
+  const result = createTestAccountingModule({ tokenEngine: new FakeTokenEngine(), ...overrides });
   module = result.module;
   mocks = result.mocks;
 }
