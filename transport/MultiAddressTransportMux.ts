@@ -986,8 +986,16 @@ export class MultiAddressTransportMux {
     // NIP-17 gift wraps have created_at randomized ±2 days for privacy.
     // Without this offset, ~50% of messages are silently dropped by the relay
     // because their randomized timestamp lands before the `since` filter.
+    //
+    // Issue #473: doubled to 2 × NIP17_TIMESTAMP_RANDOMIZATION (4 days). The
+    // single-buffer math only catches the publish-time-to-cursor-advance gap;
+    // the new routeGiftWrap finally-block keeps that gap tight, but the 2x
+    // buffer is belt-and-braces against residual clock skew and relay
+    // propagation lag. The persistent `processedEventIds` dedup (issue #275)
+    // absorbs the extra backlog with no double-handling.
+    //
     // Math.max(0, ...) prevents negative timestamps when globalDmSince is small.
-    chatFilter.since = Math.max(0, globalDmSince - NIP17_TIMESTAMP_RANDOMIZATION);
+    chatFilter.since = Math.max(0, globalDmSince - 2 * NIP17_TIMESTAMP_RANDOMIZATION);
 
     this.chatSubscriptionId = this.nostrClient.subscribe(chatFilter, {
       onEvent: (event) => {
@@ -1161,16 +1169,33 @@ export class MultiAddressTransportMux {
    */
   private async routeGiftWrap(event: NostrEvent): Promise<void> {
     for (const entry of this.addresses.values()) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let pm: ReturnType<typeof NIP17.unwrap>;
       try {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const pm = NIP17.unwrap(event as any, entry.keyManager);
+        pm = NIP17.unwrap(event as any, entry.keyManager);
+      } catch {
+        // Decryption failed for this address — try next
+        continue;
+      }
 
-        // Successfully decrypted — route to this address.
-        // Persist DM timestamp after successful unwrap so failed decryptions
-        // do not advance the since filter and permanently skip events.
-        // Use real wall-clock time, NOT event.created_at — NIP-17 gift wraps
-        // randomize created_at by ±2 days for privacy, so it can be in the future.
-        this.updateLastDmEventTimestamp(entry, Math.floor(Date.now() / 1000));
+      // Successfully decrypted — route to this address.
+      //
+      // Issue #473: the cursor advance is deferred until AFTER the dispatch
+      // chain resolves. The old code advanced `lastDmEventTs` immediately on
+      // successful unwrap, but the per-event handler chain below has many
+      // `await` points (`dispatchMessage`, `dispatchReadReceipt`, etc.) that
+      // can take seconds for SwapModule / AccountingModule persistence. If
+      // the host process exits or is killed between the unwrap-time advance
+      // and dispatch-completion (the soak's 3s poll loop is exactly this
+      // shape), the cursor permanently moves past the event's effective
+      // visibility window while leaving the swap/message unpersisted — and
+      // every subsequent boot's `since` filter excludes the event from the
+      // relay's reply. The persistent `processedEventIds` dedup (issue #275)
+      // means re-seeing the same gift wrap on a later boot is safe; the only
+      // hazard was advancing the cursor too eagerly.
+      let dispatched = false;
+      try {
         logger.debug('Mux', `Gift wrap decrypted by address ${entry.index}, sender: ${pm.senderPubkey?.slice(0, 16)}`);
 
         // Handle self-wrap
@@ -1182,6 +1207,7 @@ export class MultiAddressTransportMux {
               try {
                 const innerParsed = typeof parsed.text === 'string' ? JSON.parse(parsed.text) : null;
                 if (innerParsed?.type === 'read_receipt' || innerParsed?.type === 'typing') {
+                  dispatched = true;
                   return;
                 }
               } catch { /* not JSON inner, continue as message */ }
@@ -1209,12 +1235,15 @@ export class MultiAddressTransportMux {
               };
               // Issue #464 — await dispatch so handler durability propagates.
               await entry.adapter.dispatchMessage(message);
+              dispatched = true;
               return;
             }
           } catch {
             // Not JSON self-wrap
           }
-          // Skip own non-self-wrap message
+          // Skip own non-self-wrap message — no dispatch, no persistence work,
+          // safe to advance the cursor.
+          dispatched = true;
           return;
         }
 
@@ -1228,6 +1257,7 @@ export class MultiAddressTransportMux {
             };
             await entry.adapter.dispatchReadReceipt(receipt);
           }
+          dispatched = true;
           return;
         }
 
@@ -1245,6 +1275,7 @@ export class MultiAddressTransportMux {
             senderNametag,
             expiresIn,
           });
+          dispatched = true;
           return;
         }
 
@@ -1258,6 +1289,7 @@ export class MultiAddressTransportMux {
               timestamp: pm.timestamp * 1000,
             };
             await entry.adapter.dispatchReadReceipt(receipt);
+            dispatched = true;
             return;
           }
           if (parsed?.type === 'typing') {
@@ -1267,6 +1299,7 @@ export class MultiAddressTransportMux {
               timestamp: pm.timestamp * 1000,
             };
             await entry.adapter.dispatchTypingIndicator(indicator);
+            dispatched = true;
             return;
           }
           if (parsed?.senderNametag !== undefined && parsed?.expiresIn !== undefined && !parsed?.text) {
@@ -1275,12 +1308,17 @@ export class MultiAddressTransportMux {
               senderNametag: parsed.senderNametag || undefined,
               expiresIn: parsed.expiresIn ?? 30000,
             });
+            dispatched = true;
             return;
           }
         } catch { /* not JSON, continue */ }
 
         // Handle chat messages
-        if (!isChatMessage(pm)) return;
+        if (!isChatMessage(pm)) {
+          // Unknown kind / shape — no handler to call. Don't advance the
+          // cursor; rely on dedup to skip it on next boot.
+          return;
+        }
 
         let content = pm.content;
         let senderNametag: string | undefined;
@@ -1302,10 +1340,17 @@ export class MultiAddressTransportMux {
         };
 
         await entry.adapter.dispatchMessage(message);
+        dispatched = true;
         return; // Successfully routed, stop trying other addresses
-      } catch {
-        // Decryption failed for this address — try next
-        continue;
+      } finally {
+        // Advance the cursor only when the per-event handler chain has
+        // resolved to a definitive outcome. If `dispatched` is false the
+        // event will be re-seen on a later boot inside the look-back
+        // window; the persistent dedup (`processedEventIds`, issue #275)
+        // absorbs the duplicate.
+        if (dispatched) {
+          this.updateLastDmEventTimestamp(entry, Math.floor(Date.now() / 1000));
+        }
       }
     }
     // None could decrypt — expected for events not meant for us

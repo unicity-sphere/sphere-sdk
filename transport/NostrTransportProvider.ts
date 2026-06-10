@@ -3144,8 +3144,13 @@ export class NostrTransportProvider implements TransportProvider {
     // NIP-17 gift wraps have created_at randomized ±2 days for privacy.
     // Without this offset, ~50% of messages are silently dropped by the relay
     // because their randomized timestamp lands before the `since` filter.
+    //
+    // Issue #473: doubled to 2 × TIMESTAMP_RANDOMIZATION (4 days) to match the
+    // Mux's belt-and-braces window. Single-process callers also benefit from
+    // the wider lookback when their cursor was last persisted under load.
+    //
     // Math.max(0, ...) prevents negative timestamps when dmSince is small.
-    chatFilter.since = Math.max(0, dmSince - TIMESTAMP_RANDOMIZATION);
+    chatFilter.since = Math.max(0, dmSince - 2 * TIMESTAMP_RANDOMIZATION);
 
     this.chatSubscriptionId = this.nostrClient.subscribe(chatFilter, {
       onEvent: (event) => {
