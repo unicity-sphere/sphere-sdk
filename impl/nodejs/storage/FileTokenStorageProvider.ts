@@ -7,7 +7,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { TokenStorageProvider, TxfStorageDataBase, SyncResult, SaveResult, LoadResult, HistoryRecord } from '../../../storage';
 import type { FullIdentity, ProviderStatus } from '../../../types';
-import { getAddressId } from '../../../constants';
+import type { NetworkType } from '../../../constants';
 
 const META_FILE = '_meta.json';
 const TOMBSTONES_FILE = '_tombstones.json';
@@ -16,6 +16,11 @@ const HISTORY_FILE = '_history.json';
 export interface FileTokenStorageConfig {
   /** Directory to store token files */
   tokensDir: string;
+  /**
+   * Network this store belongs to. Added as a path segment so testnet/testnet2/mainnet
+   * (and v1/v2) never share a token dir for the same wallet identity.
+   */
+  network?: NetworkType;
 }
 
 export class FileTokenStorageProvider implements TokenStorageProvider<TxfStorageDataBase> {
@@ -24,11 +29,13 @@ export class FileTokenStorageProvider implements TokenStorageProvider<TxfStorage
   readonly type = 'local' as const;
 
   private baseTokensDir: string;
+  private network?: NetworkType;
   private status: ProviderStatus = 'disconnected';
   private identity: FullIdentity | null = null;
 
   constructor(config: FileTokenStorageConfig | string) {
     this.baseTokensDir = typeof config === 'string' ? config : config.tokensDir;
+    this.network = typeof config === 'string' ? undefined : config.network;
   }
 
   setIdentity(identity: FullIdentity): void {
@@ -36,14 +43,16 @@ export class FileTokenStorageProvider implements TokenStorageProvider<TxfStorage
   }
 
   /**
-   * Get tokens directory for current address
-   * Format: {baseTokensDir}/{addressId}/
+   * Get tokens directory for the current identity.
+   * Format: {baseTokensDir}/{network}/{chainPubkey}/ — network is its own segment so
+   * networks never share a dir; chainPubkey is always present and not truncated.
    */
   private get tokensDir(): string {
-    if (this.identity?.directAddress) {
-      // getAddressId returns sanitized format: DIRECT_abc123_xyz789
-      const addressId = getAddressId(this.identity.directAddress);
-      return path.join(this.baseTokensDir, addressId);
+    if (this.identity?.chainPubkey) {
+      const id = this.identity.chainPubkey;
+      return this.network
+        ? path.join(this.baseTokensDir, this.network, id)
+        : path.join(this.baseTokensDir, id);
     }
     return this.baseTokensDir;
   }

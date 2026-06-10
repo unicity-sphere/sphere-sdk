@@ -251,6 +251,7 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
     market,
     tokenStorage: createFileTokenStorageProvider({
       tokensDir: config?.tokensDir ?? './sphere-tokens',
+      network,
     }),
     transport: createNostrTransportProvider({
       relays: transportConfig.relays,

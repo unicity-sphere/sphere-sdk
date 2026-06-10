@@ -431,7 +431,7 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
       debug: oracleConfig.debug,
       network,
     }),
-    tokenStorage: createIndexedDBTokenStorageProvider(),
+    tokenStorage: createIndexedDBTokenStorageProvider({ network }),
     l1: l1Config,
     price: priceConfig ? createPriceProvider(priceConfig) : undefined,
     ipfsTokenStorage,

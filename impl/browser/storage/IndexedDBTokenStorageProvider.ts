@@ -7,7 +7,7 @@
 import { logger } from '../../../core/logger';
 import type { TokenStorageProvider, TxfStorageDataBase, SyncResult, SaveResult, LoadResult, HistoryRecord } from '../../../storage';
 import type { FullIdentity, ProviderStatus } from '../../../types';
-import { getAddressId } from '../../../constants';
+import type { NetworkType } from '../../../constants';
 
 // Re-export HistoryRecord for backwards compat
 export type { HistoryRecord } from '../../../storage';
@@ -25,6 +25,11 @@ const STORE_HISTORY = 'history';
 export interface IndexedDBTokenStorageConfig {
   /** Database name prefix (default: 'sphere-token-storage') */
   dbNamePrefix?: string;
+  /**
+   * Network this store belongs to. Baked into the DB name so testnet/testnet2/mainnet
+   * (and v1/v2) never share a token DB for the same wallet identity.
+   */
+  network?: NetworkType;
   /** Enable debug logging */
   debug?: boolean;
 }
@@ -51,18 +56,20 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
   private connId = 0;
 
   constructor(config?: IndexedDBTokenStorageConfig) {
-    this.dbNamePrefix = config?.dbNamePrefix ?? DB_NAME;
+    const base = config?.dbNamePrefix ?? DB_NAME;
+    // Bake the network into the prefix so the DB name AND clear()/findPrefixedDatabases
+    // (which filter by prefix) are per-network — clear() never wipes another network.
+    this.dbNamePrefix = config?.network ? `${base}-${config.network}` : base;
     this.dbName = this.dbNamePrefix;
     this.debug = config?.debug ?? false;
   }
 
   setIdentity(identity: FullIdentity): void {
     this.identity = identity;
-    // Scope database to address using consistent addressId format
-    if (identity.directAddress) {
-      const addressId = getAddressId(identity.directAddress);
-      this.dbName = `${this.dbNamePrefix}-${addressId}`;
-    }
+    // Scope the DB by chainPubkey: always present, and NOT truncated like getAddressId's
+    // DIRECT_first6_last6 — so two different wallets can never collide into one DB.
+    // Network is already in dbNamePrefix → the DB is per-network + per-identity.
+    this.dbName = `${this.dbNamePrefix}-${identity.chainPubkey}`;
     logger.debug('IndexedDBToken', `setIdentity: db=${this.dbName}`);
   }
 
