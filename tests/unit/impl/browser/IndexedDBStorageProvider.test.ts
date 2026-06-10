@@ -34,7 +34,9 @@ function createProvider(dbName?: string): IndexedDBStorageProvider {
 function createIdentity(directAddress = 'DIRECT://abcdef1234567890'): FullIdentity {
   return {
     privateKey: '0'.repeat(64),
-    chainPubkey: '02' + 'a'.repeat(64),
+    // Per-address storage is now keyed by chainPubkey, so distinct addresses must
+    // produce distinct chainPubkeys (realistic — directAddress is derived 1:1 from chainPubkey).
+    chainPubkey: '02' + Buffer.from(directAddress).toString('hex').padEnd(64, '0').slice(0, 64),
     l1Address: 'alpha1testaddr',
     directAddress,
     nametag: 'testuser',

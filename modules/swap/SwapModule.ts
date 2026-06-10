@@ -552,9 +552,7 @@ export class SwapModule {
     const deps = this.deps;
     if (!deps) return;
 
-    const addressId = deps.identity.directAddress
-      ? deps.identity.directAddress
-      : deps.identity.chainPubkey;
+    const addressId = deps.identity.chainPubkey;
 
     const storageKey = getAddressStorageKey(
       addressId,
@@ -581,9 +579,7 @@ export class SwapModule {
     const deps = this.deps;
     if (!deps) return;
 
-    const addressId = deps.identity.directAddress
-      ? deps.identity.directAddress
-      : deps.identity.chainPubkey;
+    const addressId = deps.identity.chainPubkey;
 
     const indexKey = getAddressStorageKey(
       addressId,
@@ -616,9 +612,7 @@ export class SwapModule {
    */
   private async loadFromStorage(): Promise<void> {
     const deps = this.deps!;
-    const addressId = deps.identity.directAddress
-      ? deps.identity.directAddress
-      : deps.identity.chainPubkey;
+    const addressId = deps.identity.chainPubkey;
 
     const indexKey = getAddressStorageKey(
       addressId,
@@ -736,9 +730,7 @@ export class SwapModule {
       if (swap.payoutInvoiceId) this.invoiceToSwapIndex.delete(swap.payoutInvoiceId);
     }
 
-    const addressId = deps.identity.directAddress
-      ? deps.identity.directAddress
-      : deps.identity.chainPubkey;
+    const addressId = deps.identity.chainPubkey;
 
     const swapKey = getAddressStorageKey(
       addressId,

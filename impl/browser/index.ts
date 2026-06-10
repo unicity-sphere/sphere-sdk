@@ -388,7 +388,7 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
   const l1Config = resolveL1Config(network, config?.l1);
   const tokenSyncConfig = resolveTokenSyncConfig(network, config?.tokenSync);
 
-  const storage = createIndexedDBStorageProvider(config?.storage);
+  const storage = createIndexedDBStorageProvider({ ...config?.storage, network });
   const priceConfig = resolvePriceConfig(config?.price, storage);
 
   // Create IPFS storage provider if enabled

@@ -17,7 +17,7 @@ import {
   createTestSwapDeal,
   injectSwapRef,
   SphereError,
-  DEFAULT_TEST_PARTY_A_ADDRESS,
+  DEFAULT_TEST_PARTY_A_PUBKEY,
   DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
   DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
   DEFAULT_TEST_ESCROW_ADDRESS,
@@ -39,7 +39,8 @@ describe('SwapModule Storage', () => {
   let module: SwapModule;
   let mocks: TestSwapModuleMocks;
 
-  const addressId = DEFAULT_TEST_PARTY_A_ADDRESS;
+  // Per-wallet swap storage is keyed by the identity's chainPubkey (matches SwapModule).
+  const addressId = DEFAULT_TEST_PARTY_A_PUBKEY;
 
   afterEach(async () => {
     try {

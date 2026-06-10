@@ -18,7 +18,7 @@ import {
 } from './accounting-test-helpers.js';
 import type { AccountingModule } from '../../../modules/accounting/AccountingModule.js';
 import type { TestAccountingModuleMocks } from './accounting-test-helpers.js';
-import { STORAGE_KEYS_ADDRESS, getAddressId } from '../../../constants.js';
+import { STORAGE_KEYS_ADDRESS } from '../../../constants.js';
 
 // =============================================================================
 // Shared setup
@@ -154,7 +154,7 @@ describe('UT-LIFECYCLE-003: load() loads terminal state from storage', () => {
     const storage = createMockStorageProvider();
     setup({ storage });
 
-    const addressId = getAddressId(mocks.identity.directAddress!);
+    const addressId = mocks.identity.chainPubkey;
     const cancelledKey = `${addressId}_${STORAGE_KEYS_ADDRESS.CANCELLED_INVOICES}`;
     const closedKey = `${addressId}_${STORAGE_KEYS_ADDRESS.CLOSED_INVOICES}`;
     const frozenKey = `${addressId}_${STORAGE_KEYS_ADDRESS.FROZEN_BALANCES}`;
@@ -208,7 +208,7 @@ describe('UT-LIFECYCLE-004: load() recovers auto-return settings', () => {
     const storage = createMockStorageProvider();
     setup({ storage });
 
-    const addressId = getAddressId(mocks.identity.directAddress!);
+    const addressId = mocks.identity.chainPubkey;
     const autoReturnKey = `${addressId}_${STORAGE_KEYS_ADDRESS.AUTO_RETURN}`;
     const invoiceId = 'c'.repeat(64);
 

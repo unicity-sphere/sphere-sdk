@@ -115,6 +115,51 @@ export const STORAGE_KEYS_ADDRESS = {
   SWAP_INDEX: 'swap_index',
 } as const;
 
+/**
+ * Per-address keys that are ALSO per-network: token/payment operational state. Mixing these
+ * across networks is unsafe (e.g. a testnet2 auto-return ledger firing a real send on mainnet).
+ * Chat/identity per-address keys (CONVERSATIONS/MESSAGES/GROUP_CHAT_*) are network-AGNOSTIC and
+ * are deliberately NOT listed — they stay per-address only.
+ */
+const NETWORK_SCOPED_ADDRESS_KEYS: readonly string[] = [
+  STORAGE_KEYS_ADDRESS.PENDING_TRANSFERS,
+  STORAGE_KEYS_ADDRESS.OUTBOX,
+  STORAGE_KEYS_ADDRESS.TRANSACTION_HISTORY,
+  STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS,
+  STORAGE_KEYS_ADDRESS.PROCESSED_SPLIT_GROUP_IDS,
+  STORAGE_KEYS_ADDRESS.PROCESSED_COMBINED_TRANSFER_IDS,
+  STORAGE_KEYS_ADDRESS.CANCELLED_INVOICES,
+  STORAGE_KEYS_ADDRESS.CLOSED_INVOICES,
+  STORAGE_KEYS_ADDRESS.FROZEN_BALANCES,
+  STORAGE_KEYS_ADDRESS.AUTO_RETURN,
+  STORAGE_KEYS_ADDRESS.AUTO_RETURN_LEDGER,
+  STORAGE_KEYS_ADDRESS.INV_LEDGER_INDEX,
+  STORAGE_KEYS_ADDRESS.TOKEN_SCAN_STATE,
+  STORAGE_KEYS_ADDRESS.SWAP_INDEX,
+];
+
+/** Composite per-address key prefixes (modules store `{addressId}_{prefix}{id}`) — per-network. */
+const NETWORK_SCOPED_ADDRESS_PREFIXES: readonly string[] = [
+  STORAGE_KEYS_ADDRESS.SWAP_RECORD_PREFIX, // 'swap:'
+  'inv_ledger:', // AccountingModule INV_LEDGER_PREFIX
+];
+
+/**
+ * True if a storage key is a per-NETWORK token/payment key (so the storage provider adds the
+ * network segment). Handles the bare form ('auto_return_ledger'), the module-built addressId
+ * form ('DIRECT_a_b_auto_return_ledger'), and composites ('{addressId}_swap:{id}'). Chat/identity
+ * keys return false — they remain per-address, network-agnostic.
+ */
+export function isNetworkScopedAddressKey(key: string): boolean {
+  for (const k of NETWORK_SCOPED_ADDRESS_KEYS) {
+    if (key === k || key.endsWith(`_${k}`)) return true;
+  }
+  for (const p of NETWORK_SCOPED_ADDRESS_PREFIXES) {
+    if (key.startsWith(p) || key.includes(`_${p}`)) return true;
+  }
+  return false;
+}
+
 /** @deprecated Use STORAGE_KEYS_GLOBAL and STORAGE_KEYS_ADDRESS instead */
 export const STORAGE_KEYS = {
   ...STORAGE_KEYS_GLOBAL,

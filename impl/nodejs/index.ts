@@ -226,6 +226,7 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
   const storage = createFileStorageProvider({
     dataDir: config?.dataDir ?? './sphere-data',
     ...(config?.walletFileName ? { fileName: config.walletFileName } : {}),
+    network,
   });
   const priceConfig = resolvePriceConfig(config?.price, storage);
 

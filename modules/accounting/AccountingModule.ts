@@ -12,7 +12,7 @@
 import { logger } from '../../core/logger.js';
 import { SphereError } from '../../core/errors.js';
 import { AsyncGateMap } from '../../core/async-gate.js';
-import { STORAGE_KEYS_ADDRESS, INVOICE_TOKEN_TYPE_HEX, getAddressStorageKey, getAddressId } from '../../constants.js';
+import { STORAGE_KEYS_ADDRESS, INVOICE_TOKEN_TYPE_HEX, getAddressStorageKey } from '../../constants.js';
 import type {
   IncomingTransfer,
   TransferRequest,
@@ -6684,7 +6684,7 @@ export class AccountingModule {
   private getStorageKey(key: string): string {
     const identity = this.deps!.identity;
     // Use condensed addressId format (DIRECT_abc123_xyz789) for consistency with other modules
-    const addressId = getAddressId(identity.directAddress ?? identity.chainPubkey);
+    const addressId = identity.chainPubkey;
     return getAddressStorageKey(addressId, key);
   }
 

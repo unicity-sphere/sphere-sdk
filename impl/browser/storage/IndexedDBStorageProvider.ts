@@ -7,7 +7,7 @@ import { logger } from '../../../core/logger';
 import { SphereError } from '../../../core/errors';
 import type { ProviderStatus, FullIdentity, TrackedAddressEntry } from '../../../types';
 import type { StorageProvider } from '../../../storage';
-import { STORAGE_KEYS_ADDRESS, STORAGE_KEYS_GLOBAL, getAddressId } from '../../../constants';
+import { STORAGE_KEYS_ADDRESS, STORAGE_KEYS_GLOBAL, isNetworkScopedAddressKey, type NetworkType } from '../../../constants';
 
 // =============================================================================
 // Configuration
@@ -22,6 +22,11 @@ export interface IndexedDBStorageProviderConfig {
   prefix?: string;
   /** Database name (default: 'sphere-storage') */
   dbName?: string;
+  /**
+   * Network. When set, token/payment per-address keys are network-scoped; chat/identity
+   * per-address keys and global (seed) keys stay shared across networks.
+   */
+  network?: NetworkType;
   /** Enable debug logging */
   debug?: boolean;
 }
@@ -41,6 +46,7 @@ export class IndexedDBStorageProvider implements StorageProvider {
 
   private prefix: string;
   private dbName: string;
+  private network?: NetworkType;
   private debug: boolean;
   private identity: FullIdentity | null = null;
   private status: ProviderStatus = 'disconnected';
@@ -51,6 +57,7 @@ export class IndexedDBStorageProvider implements StorageProvider {
   constructor(config?: IndexedDBStorageProviderConfig) {
     this.prefix = config?.prefix ?? 'sphere_';
     this.dbName = config?.dbName ?? DB_NAME;
+    this.network = config?.network;
     this.debug = config?.debug ?? false;
   }
 
@@ -259,17 +266,19 @@ export class IndexedDBStorageProvider implements StorageProvider {
   // ===========================================================================
 
   private getFullKey(key: string): string {
-    // Check if this is a per-address key
     const isPerAddressKey = Object.values(STORAGE_KEYS_ADDRESS).includes(key as typeof STORAGE_KEYS_ADDRESS[keyof typeof STORAGE_KEYS_ADDRESS]);
+    // Token/payment keys (incl. module composites like `{addressId}_auto_return_ledger`,
+    // `{addressId}_swap:{id}`) are ALSO per-network; chat/identity per-address keys are NOT.
+    const net = this.network && isNetworkScopedAddressKey(key) ? `${this.network}_` : '';
 
-    if (isPerAddressKey && this.identity?.directAddress) {
-      // Add address ID prefix for per-address data
-      const addressId = getAddressId(this.identity.directAddress);
-      return `${this.prefix}${addressId}_${key}`;
+    if (isPerAddressKey && this.identity?.chainPubkey) {
+      const id = this.identity.chainPubkey;
+      return `${this.prefix}${net}${id}_${key}`;
     }
 
-    // Global key - no address prefix
-    return `${this.prefix}${key}`;
+    // Global key OR a module-built composite (already addressId-prefixed). Add the network
+    // segment only for per-network token/payment keys; seed/identity/chat stay unprefixed.
+    return `${this.prefix}${net}${key}`;
   }
 
   private ensureConnected(): void {

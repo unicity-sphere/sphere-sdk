@@ -17,7 +17,6 @@ import {
   SphereError,
   INVOICE_TOKEN_TYPE_HEX,
 } from './accounting-test-helpers.js';
-import { getAddressId } from '../../../constants.js';
 import { hashInvoiceId } from '../../../modules/accounting/memo.js';
 import type { InvoiceTerms, InvoiceTransferRef } from '../../../modules/accounting/types.js';
 import type { Token } from '../../../types/index.js';
@@ -36,13 +35,13 @@ const SENDER_ADDRESS = 'DIRECT://sender_address_def456';
 const TARGET_ADDRESS = 'DIRECT://test_target_address_abc123';
 
 /**
- * The AccountingModule derives its storage key prefix via getAddressId():
- *   getAddressStorageKey(getAddressId(identity.directAddress), subKey)
- *     = `DIRECT_test_t_abc123_${subKey}`
+ * The AccountingModule derives its storage key prefix from the chainPubkey:
+ *   getAddressStorageKey(identity.chainPubkey, subKey)
+ *     = `${identity.chainPubkey}_${subKey}`
  *
- * DEFAULT_TEST_IDENTITY.directAddress = 'DIRECT://test_target_address_abc123'
+ * DEFAULT_TEST_IDENTITY.chainPubkey = '02' + 'a'.repeat(64)
  */
-const STORAGE_PREFIX = getAddressId(DEFAULT_TEST_IDENTITY.directAddress!);
+const STORAGE_PREFIX = DEFAULT_TEST_IDENTITY.chainPubkey;
 
 /** Build a Token shape that load() will parse as an invoice token. */
 function makeInvoiceToken(terms: InvoiceTerms, tokenId: string = INVOICE_ID): Token {
@@ -374,7 +373,7 @@ describe('AccountingModule.returnInvoicePayment()', () => {
     // forward payment entry from SENDER_ADDRESS → TARGET_ADDRESS when load() runs.
     //
     // AccountingModule._loadInvoiceTransferIndex() reads:
-    //   key: getAddressStorageKey(getAddressId(identity.directAddress), 'inv_ledger:{invoiceId}')
+    //   key: getAddressStorageKey(identity.chainPubkey, 'inv_ledger:{invoiceId}')
     //      = `${STORAGE_PREFIX}_inv_ledger:${INVOICE_ID}`
     //   format: Record<string, InvoiceTransferRef>  (keyed by composite entryKey)
     const entryKey = `mock-transfer-001::UCT`;

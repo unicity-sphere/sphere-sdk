@@ -17,6 +17,7 @@ import {
   createMockStorageProvider,
   SphereError,
   DEFAULT_TEST_PARTY_A_ADDRESS,
+  DEFAULT_TEST_PARTY_A_PUBKEY,
 } from './swap-test-helpers.js';
 import type { TestSwapModuleMocks } from './swap-test-helpers.js';
 import { STORAGE_KEYS_ADDRESS, getAddressStorageKey } from '../../../constants.js';
@@ -76,7 +77,8 @@ describe('SwapModule Lifecycle', () => {
     module = result.module;
     mocks = result.mocks;
 
-    const addressId = DEFAULT_TEST_PARTY_A_ADDRESS;
+    // Per-wallet swap storage is keyed by the identity's chainPubkey (matches SwapModule).
+    const addressId = DEFAULT_TEST_PARTY_A_PUBKEY;
 
     // Pre-populate storage with an index and one active swap record
     const activeSwapRef = createTestSwapRef({ progress: 'announced' });

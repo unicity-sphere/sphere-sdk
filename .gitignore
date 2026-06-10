@@ -36,3 +36,9 @@ ref_materials/
 # Integration test data
 tests/integration/.test-*/
 .claude/
+
+# Superpowers specs/plans — local only, never committed
+docs/superpowers/
+
+# Test runner artifacts
+.vitest-result.json

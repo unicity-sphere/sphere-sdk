@@ -7,13 +7,18 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { StorageProvider } from '../../../storage';
 import type { FullIdentity, ProviderStatus, TrackedAddressEntry } from '../../../types';
-import { STORAGE_KEYS_ADDRESS, STORAGE_KEYS_GLOBAL, getAddressId } from '../../../constants';
+import { STORAGE_KEYS_ADDRESS, STORAGE_KEYS_GLOBAL, isNetworkScopedAddressKey, type NetworkType } from '../../../constants';
 
 export interface FileStorageProviderConfig {
   /** Directory to store wallet data */
   dataDir: string;
   /** File name for key-value data (default: 'wallet.json') */
   fileName?: string;
+  /**
+   * When set, token/payment per-address keys are network-scoped; chat/identity
+   * per-address keys and global/seed keys stay shared.
+   */
+  network?: NetworkType;
 }
 
 export class FileStorageProvider implements StorageProvider {
@@ -24,6 +29,7 @@ export class FileStorageProvider implements StorageProvider {
   private dataDir: string;
   private filePath: string;
   private isTxtMode: boolean;
+  private network?: NetworkType;
   private data: Record<string, string> = {};
   private status: ProviderStatus = 'disconnected';
   private _identity: FullIdentity | null = null;
@@ -35,6 +41,7 @@ export class FileStorageProvider implements StorageProvider {
     } else {
       this.dataDir = config.dataDir;
       this.filePath = path.join(config.dataDir, config.fileName ?? 'wallet.json');
+      this.network = config.network;
     }
     this.isTxtMode = this.filePath.endsWith('.txt');
   }
@@ -185,15 +192,19 @@ export class FileStorageProvider implements StorageProvider {
     const isPerAddressKey = Object.values(STORAGE_KEYS_ADDRESS).includes(
       key as (typeof STORAGE_KEYS_ADDRESS)[keyof typeof STORAGE_KEYS_ADDRESS]
     );
+    // Token/payment keys (incl. module composites like `{addressId}_auto_return_ledger`,
+    // `{addressId}_swap:{id}`) are ALSO per-network; chat/identity per-address keys are NOT.
+    const net = this.network && isNetworkScopedAddressKey(key) ? `${this.network}_` : '';
 
-    if (isPerAddressKey && this._identity?.directAddress) {
+    if (isPerAddressKey && this._identity?.chainPubkey) {
       // Add address ID prefix for per-address data
-      const addressId = getAddressId(this._identity.directAddress);
-      return `${addressId}_${key}`;
+      const id = this._identity.chainPubkey;
+      return `${net}${id}_${key}`;
     }
 
-    // Global key - no address prefix
-    return key;
+    // Global key OR a module-built composite (already addressId-prefixed). Add the network
+    // segment only for per-network token/payment keys; seed/identity/chat stay unprefixed.
+    return `${net}${key}`;
   }
 
   private async save(): Promise<void> {
