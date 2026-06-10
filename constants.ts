@@ -560,6 +560,36 @@ export const NETWORKS = {
 export type NetworkType = keyof typeof NETWORKS;
 export type NetworkConfig = (typeof NETWORKS)[NetworkType];
 
+/**
+ * Default escrow service address for the swap module.
+ *
+ * Used as the fallback when neither the per-deal `escrowAddress` nor the
+ * module-level `SwapModuleConfig.defaultEscrowAddress` is set. Hardcoded here
+ * so a wallet initialised with `swap: true` (no explicit escrow override) can
+ * still propose / accept swaps without per-call wiring.
+ *
+ * Versioned suffix so a future operator rotation (e.g. when the production
+ * escrow daemon's transport key changes and the old binding is no longer
+ * recoverable) can publish a new nametag (`-02`, `-03`, ...) without
+ * breaking older SDK builds that still reference the previous default.
+ *
+ * Tracked in sphere-sdk#456:
+ *   - `@escrow-testnet`    — original default; the production daemon never
+ *                            published it (operator missed the env var).
+ *   - `@escrow-testnet-v1` — first rotation attempt; landed on the production
+ *                            tenant's secondary HD address via custom
+ *                            multi-address routing, but the routing had
+ *                            subtle relay-subscription gaps.
+ *   - `@escrow-test-01`    — second rotation attempt; squatted on the relay
+ *                            by a failed boot whose binding published before
+ *                            it crashed (Nostr first-seen-wins anti-hijacking).
+ *   - `@escrow-test-02`    — current default. Owned by a freshly-initialised
+ *                            escrow tenant wallet so the nametag is the
+ *                            tenant's sole primary identity — no
+ *                            cross-address routing needed.
+ */
+export const DEFAULT_ESCROW_ADDRESS = '@escrow-test-02' as const;
+
 // =============================================================================
 // Timeouts & Limits
 // =============================================================================
