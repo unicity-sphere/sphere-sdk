@@ -1,4 +1,5 @@
 # Track A — Status (for Track B)
+> **Status: HISTORICAL — the v1→v2 cutover completed 2026-06-10 (PRs #479/#480/#481). v1 is removed; see CHANGELOG.md.**
 
 **The v2 token engine is ready to consume.** The full sender-driven engine over
 state-transition v2 is implemented, twice adversarially reviewed, and proven to

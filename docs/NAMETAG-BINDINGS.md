@@ -22,18 +22,20 @@ Sphere.init()
        ├─ initializeProviders()
        ├─ initializeModules()
        └─ registerNametag('alice')
-            ├─ 1. mintNametag('alice')         ← on-chain first
-            │    └─ submits to Aggregator, waits for proof
-            ├─ 2. publishIdentityBinding(...)  ← Nostr second
+            ├─ 1. publishIdentityBinding(...)  ← the sole registration act
             │    └─ nostrClient.publishNametagBinding('alice', pubkey, identity)
             │         ├─ queryPubkeyByNametag('alice')  ← conflict check
             │         └─ publishEvent(bindingEvent)      ← kind 30078
-            └─ 3. update local state
+            ├─ 2. update local state
+            └─ 3. ensureUnicityIdTokenStored()  ← best-effort, fire-and-forget
+                 └─ mints a self-issued v2 UnicityIdToken via the v2 gateway
+                    and stores it (format: 'v2-cbor'); never blocks/fails
+                    registration
 ```
 
 **Events published: 1** — a nametag binding event with full identity fields.
 
-Mint-before-publish ordering ensures no unbacked nametag claims exist on the relay. If minting fails, nothing is published.
+Since the v1→v2 cutover there is **no on-chain nametag mint as part of registration**: publishing the Nostr binding is the registration act, and its first-seen-wins failure path is the uniqueness guard. A self-issued v2 **UnicityIdToken** is *additionally* minted and stored (format `'v2-cbor'`) **best-effort** after the binding is published — a gateway outage or missing v2 oracle config never fails registration, and the mint is retried on a later wallet load (it is deterministic per name + address key). The token is not consumed anywhere yet; **runtime name resolution stays Nostr-binding-only**.
 
 ### Path B: Without nametag (`Sphere.init({ autoGenerate: true })`)
 
@@ -91,8 +93,7 @@ Published by `registerNametag()` via nostr-js-sdk's `publishNametagBinding()`.
     ["pubkey", "<chainPubkey>"],
     ["t", "<SHA256('unicity:address:' + l1Address)>"],
     ["l1", "<l1Address>"],
-    ["t", "<SHA256('unicity:address:' + directAddress)>"],
-    ["t", "<SHA256('unicity:address:' + proxyAddress)>"]
+    ["t", "<SHA256('unicity:address:' + directAddress)>"]
   ],
   "content": {
     "nametag_hash": "<SHA256('unicity:nametag:alice')>",
@@ -102,11 +103,12 @@ Published by `registerNametag()` via nostr-js-sdk's `publishNametagBinding()`.
     "encrypted_nametag": "<AES-GCM encrypted>",
     "public_key": "02abc...",
     "l1_address": "alpha1...",
-    "direct_address": "DIRECT://...",
-    "proxy_address": "PROXY://..."
+    "direct_address": "DIRECT://..."
   }
 }
 ```
+
+> The wire format (nostr-js-sdk) still allows an optional `proxy_address` field and tag, but the SDK no longer emits them — PROXY addressing was removed in the v1→v2 cutover. Events published by older wallets may still contain them.
 
 ### Base Identity Binding Event (without nametag)
 
@@ -148,7 +150,7 @@ These are different d-tags, so they create **separate** replaceable events. A wa
 
 `publishNametagBinding()` queries the relay before publishing. If the nametag is already claimed by a different pubkey, it throws `"already claimed"`. Same pubkey re-publishing (update) is allowed.
 
-**TOCTOU caveat:** There is a race window between the conflict check and the publish. Another user can claim the same nametag in between. This is inherent to Nostr's eventually-consistent relay model — there is no atomic check-and-publish. The mint-before-publish ordering (see below) provides the real enforcement via on-chain state.
+**TOCTOU caveat:** There is a race window between the conflict check and the publish. Another user can claim the same nametag in between. This is inherent to Nostr's eventually-consistent relay model — there is no atomic check-and-publish. The first-seen-wins resolution strategy (below) is what settles such races at query time: the earliest `created_at` claim wins.
 
 ### Resolution Strategy (query-time)
 
@@ -162,12 +164,14 @@ All query methods (`queryPubkeyByNametag`, `queryBindingByNametag`, `queryBindin
 
 This is critical for Path C (register nametag after creation). Address-based lookups find both the old bare binding and the newer nametag binding. Without latest-wins-for-same-author, the stale bare binding (without nametag) would be returned.
 
-### Mint-Before-Publish
+### Self-Issued Unicity ID Token (v2)
 
-`registerNametag()` mints the nametag token on-chain **before** publishing to Nostr. This ensures:
-- If minting fails → nothing published (no unbacked claims)
-- If minting succeeds but publishing fails → error is surfaced to the user
-- No relay-only nametag claims without blockchain backing
+Since the v1→v2 cutover, the Nostr binding alone IS the registration — there is no on-chain mint gating it. After the binding is published, `registerNametag()` (and wallet create/import/load paths) call `ensureUnicityIdTokenStored()`, which **best-effort** mints a self-issued v2 `UnicityIdToken` via the v2 gateway (`createUnicityIdMinter().mintUnicityIdToken(name)`) and stores it in the wallet's nametag list with `format: 'v2-cbor'`:
+
+- Fire-and-forget: a gateway outage or missing v2 oracle config never fails registration
+- Idempotent: skipped if a `'v2-cbor'` token for the name is already stored
+- Deterministic per (name, address key): a later load re-mints the identical token (lost-storage recovery)
+- Not consumed anywhere yet — **runtime name resolution stays Nostr-binding-only**
 
 ## Privacy
 
@@ -182,7 +186,8 @@ This is critical for Path C (register nametag after creation). Address-based loo
 ### Publishing
 
 ```typescript
-// Register nametag (mints on-chain first, then publishes)
+// Register nametag (publishes the Nostr binding; afterwards a self-issued
+// v2 UnicityIdToken is minted + stored best-effort)
 await sphere.registerNametag('alice');
 
 // Low-level: publish identity binding directly
@@ -194,7 +199,7 @@ await transport.publishIdentityBinding(chainPubkey, l1Address, directAddress, 'a
 ```typescript
 // Unified resolution (accepts @nametag, address, pubkey)
 const peer = await sphere.resolve('@alice');
-// { nametag, transportPubkey, chainPubkey, l1Address, directAddress, proxyAddress, timestamp }
+// { nametag, transportPubkey, chainPubkey, l1Address, directAddress, timestamp }
 
 // Low-level nostr-js-sdk methods
 const pubkey = await nostrClient.queryPubkeyByNametag('alice');

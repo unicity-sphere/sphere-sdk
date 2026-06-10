@@ -1,4 +1,5 @@
 # Accounting Module Architecture
+> **Note: written against the v1 engine; invoices now mint via the v2 token engine (engine.mintDataToken) — see CHANGELOG.md and AccountingModule.ts.**
 
 > **Status:** Implemented
 > **Module path:** `modules/accounting/AccountingModule.ts`

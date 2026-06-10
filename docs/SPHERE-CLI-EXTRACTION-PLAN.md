@@ -1,4 +1,5 @@
 # Sphere CLI Extraction & DM-Transport Migration Plan
+> **Status: HISTORICAL — the extraction shipped; the CLI now lives in `@unicity-sphere/cli` (github.com/unicity-sphere/sphere-cli) and `sphere-sdk/cli/` was removed. Faucet/topup references below predate the v1→v2 cutover — top-up is now a v2 self-mint (payments.mintFungibleToken).**
 
 **Status:** Phase 0 complete (2026-04-21). Phase 1 in progress.
 **Target repo:** `github.com/unicity-sphere/sphere-cli` (created 2026-04-21)

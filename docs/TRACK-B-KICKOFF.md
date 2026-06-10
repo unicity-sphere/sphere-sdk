@@ -1,4 +1,5 @@
 # Track B — Kickoff (state-transition v2 migration)
+> **Status: HISTORICAL — the v1→v2 cutover completed 2026-06-10 (PRs #479/#480/#481). v1 is removed; see CHANGELOG.md.**
 
 You own **Track B: callers, identity wiring & tests** (Person 2). Phase 0 is merged: the
 `ITokenEngine` contract is **frozen** and `FakeTokenEngine` exists, so you can start now —

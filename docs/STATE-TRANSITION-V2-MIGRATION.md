@@ -1,4 +1,5 @@
 # Migration Plan — State Transition SDK v1.6.1 → v2
+> **Status: HISTORICAL — the v1→v2 cutover completed 2026-06-10 (PRs #479/#480/#481). v1 is removed; see CHANGELOG.md.**
 
 **Repository:** `sphere-sdk` · **Branch:** `feat/migrate-state-transition-sdk` (cut from `v0.7.2`)
 **Target dependency:** `@unicitylabs/state-transition-sdk@2.0.0-rc.6027e82` (replaces `1.6.1-rc.f37cb85`) — latest RC; the v2 API has been **stable across the recent RCs** (they differ only by packaging/CI), so pinning a newer RC is safe. **Requires Node ≥ 22** (the SDK now declares `engines >=22`, CI on Node 24) — sphere-sdk dev/CI must move to Node 22+ (ideally 24).

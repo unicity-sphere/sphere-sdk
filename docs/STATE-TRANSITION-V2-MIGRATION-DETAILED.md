@@ -1,4 +1,5 @@
 # State Transition v2 Migration — Detailed Specifications (companion)
+> **Status: HISTORICAL — the v1→v2 cutover completed 2026-06-10 (PRs #479/#480/#481). v1 is removed; see CHANGELOG.md.**
 
 > Companion to **STATE-TRANSITION-V2-MIGRATION.md** (read that first for goals, decisions, identity, the 2-owner split, phasing, risks). This doc is the deep, code-grounded reference: full engine contract, v2 flow sequences, per-file caller migration, serialization/storage, and the test plan.
 >

@@ -15,7 +15,9 @@ npm install @unicitylabs/sphere-sdk ws
 
 **Node.js version:** 18.0.0 or higher
 
-> **Note:** API key for aggregator is included by default. For custom deployments, configure via `oracle: { apiKey: 'your-key' }`.
+> **Note:** No API key is bundled with the SDK. The `testnet` gateway (testnet2, see below) requires one — inject it via `oracle: { apiKey: '...' }`. The testnet2 key is **not a secret** (see `.env.example`): `sk_ddc3cfcc001e4a28ac3fad7407f99590`. A mainnet key, by contrast, IS a secret — keep it in your deploy environment only.
+>
+> **Networks:** since the v1→v2 cutover, `network: 'testnet'` points at the **testnet2 v2 gateway** (`https://gateway.testnet2.unicity.network`; the network id comes from the trust base). `'testnet2'` is an alias of the same configuration. `mainnet`/`dev` still point at v1-era aggregators and cannot serve the v2 engine yet — wallet operations there fail with `AGGREGATOR_ERROR`.
 
 ## CLI (Quick Testing)
 
@@ -29,99 +31,91 @@ sphere --help
 The examples below use `sphere <command>` — replace any old `npm run cli -- <command>` references accordingly.
 
 ```bash
-# Initialize wallet (no token minted)
-npm run cli -- init --network testnet
+# Initialize wallet
+sphere init --network testnet
 
-# Initialize wallet WITH nametag (mints token on-chain!)
-npm run cli -- init --network testnet --nametag alice
+# Initialize wallet WITH nametag (publishes a Nostr identity binding)
+sphere init --network testnet --nametag alice
 
 # Check status
-npm run cli -- status
+sphere status
 
-# Check balance
-npm run cli -- balance
+# Check balance (fetches pending transfers first)
+sphere balance
 
-# Fetch pending transfers and finalize unconfirmed tokens
-npm run cli -- balance --finalize
-
-# Send tokens (instant mode — default, ~2-3s sender latency)
-npm run cli -- send @alice 1 UCT --instant
-
-# Send tokens (conservative mode — collect all proofs first)
-npm run cli -- send @alice 1 UCT --conservative
+# Send tokens (the sender certifies the transfer on-chain, then delivers
+# the finished token via Nostr)
+sphere send @alice 1 UCT
 
 # Show receive address
-npm run cli -- receive
+sphere receive
 
-# Request test tokens from faucet
-npm run cli -- topup
+# Top up with test tokens (self-mint via the v2 token engine — no faucet)
+sphere topup 10 UCT
 
-# Register nametag (mints token on-chain!)
-npm run cli -- nametag myname
+# Register nametag (publishes a Nostr identity binding)
+sphere nametag myname
 
-# Verify tokens against aggregator (detect spent tokens)
-npm run cli -- verify-balance
+# Verify tokens against the gateway (detect spent tokens)
+sphere verify-balance
 
 # Full help
-npm run cli -- --help
+sphere --help
 ```
 
-> **Important:** Commands with `--nametag` or `nametag` mint a token on-chain. This uses the Oracle (Aggregator) provider which is included by default with `createNodeProviders()`.
+> **Note:** Nametag registration publishes a Nostr identity binding (name ↔ chain pubkey, first-seen-wins). A self-issued v2 Unicity ID token is additionally minted and stored best-effort; runtime name resolution uses only the Nostr binding.
 
-### Transfer Modes
+### Transfer Mode
 
-| Mode | Flag | Description |
-|------|------|-------------|
-| **Instant** (default) | `--instant` | Sends tokens via Nostr immediately. Receiver resolves proofs in background. Fastest sender experience (~2-3s). |
-| **Conservative** | `--conservative` | Collects all aggregator proofs first, then sends fully finalized tokens. Slower but receiver gets immediately usable tokens. |
+v2 transfers are **sender-driven**: the sender certifies the transfer on-chain (collects the inclusion proof) and delivers a finished token via Nostr — the receiver stores it as confirmed with no finalization phase. The old `instant`/`conservative` transfer modes from the v1 engine no longer exist; the `transferMode` field on `TransferRequest` is still accepted for backwards compatibility but ignored.
 
 ### Address Management
 
 ```bash
-npm run cli -- addresses                        # List all tracked addresses
-npm run cli -- switch 1                         # Switch to address at HD index 1
-npm run cli -- hide 2                           # Hide address from active list
-npm run cli -- unhide 2                         # Unhide address
+sphere addresses                        # List all tracked addresses
+sphere switch 1                         # Switch to address at HD index 1
+sphere hide 2                           # Hide address from active list
+sphere unhide 2                         # Unhide address
 ```
 
 ### Direct Messages
 
 ```bash
-npm run cli -- dm @alice "Hello, how are you?"  # Send a DM
-npm run cli -- dm-inbox                         # List conversations + unread counts
-npm run cli -- dm-history @alice                 # Show conversation history
-npm run cli -- dm-history @alice --limit 20      # Limit messages shown
+sphere dm @alice "Hello, how are you?"  # Send a DM
+sphere dm-inbox                         # List conversations + unread counts
+sphere dm-history @alice                 # Show conversation history
+sphere dm-history @alice --limit 20      # Limit messages shown
 ```
 
 ### Group Chat (NIP-29)
 
 ```bash
-npm run cli -- group-list                                        # List available groups
-npm run cli -- group-create "Trading Chat" --description "Discuss trades"  # Create group
-npm run cli -- group-create "Private" --private                  # Create private group
-npm run cli -- group-join <groupId>                              # Join a group
-npm run cli -- group-join <groupId> --invite <code>              # Join with invite code
-npm run cli -- group-send <groupId> "Hello everyone!"            # Send message
-npm run cli -- group-send <groupId> "Reply" --reply <eventId>    # Reply to message
-npm run cli -- group-messages <groupId> --limit 20               # Show messages
-npm run cli -- group-members <groupId>                           # List members
-npm run cli -- group-info <groupId>                              # Show group details
-npm run cli -- group-leave <groupId>                             # Leave group
-npm run cli -- group-my                                          # List your groups
+sphere group-list                                        # List available groups
+sphere group-create "Trading Chat" --description "Discuss trades"  # Create group
+sphere group-create "Private" --private                  # Create private group
+sphere group-join <groupId>                              # Join a group
+sphere group-join <groupId> --invite <code>              # Join with invite code
+sphere group-send <groupId> "Hello everyone!"            # Send message
+sphere group-send <groupId> "Reply" --reply <eventId>    # Reply to message
+sphere group-messages <groupId> --limit 20               # Show messages
+sphere group-members <groupId>                           # List members
+sphere group-info <groupId>                              # Show group details
+sphere group-leave <groupId>                             # Leave group
+sphere group-my                                          # List your groups
 ```
 
 ### Market (Intent Bulletin Board)
 
 ```bash
-npm run cli -- market-post "Buying 100 UCT" --type buy                    # Post buy intent
-npm run cli -- market-post "Selling ETH" --type sell --price 50 --currency USD  # Post sell intent
-npm run cli -- market-post "Web dev services" --type service              # Post service intent
-npm run cli -- market-search "UCT tokens" --type sell --limit 5           # Search intents
-npm run cli -- market-search "tokens" --min-score 0.7                     # Search with score threshold
-npm run cli -- market-my                                                  # List own intents
-npm run cli -- market-close <id>                                          # Close an intent
-npm run cli -- market-feed                                                # Watch live feed (WebSocket)
-npm run cli -- market-feed --rest                                         # Fetch recent (REST fallback)
+sphere market-post "Buying 100 UCT" --type buy                    # Post buy intent
+sphere market-post "Selling ETH" --type sell --price 50 --currency USD  # Post sell intent
+sphere market-post "Web dev services" --type service              # Post service intent
+sphere market-search "UCT tokens" --type sell --limit 5           # Search intents
+sphere market-search "tokens" --min-score 0.7                     # Search with score threshold
+sphere market-my                                                  # List own intents
+sphere market-close <id>                                          # Close an intent
+sphere market-feed                                                # Watch live feed (WebSocket)
+sphere market-feed --rest                                         # Fetch recent (REST fallback)
 ```
 
 ### Wallet Profiles
@@ -129,15 +123,15 @@ npm run cli -- market-feed --rest                                         # Fetc
 Manage multiple wallets for testing:
 
 ```bash
-npm run cli -- wallet create alice              # Create profile "alice"
-npm run cli -- init --nametag alice             # Initialize wallet in profile
-npm run cli -- wallet create bob                # Create another profile
-npm run cli -- init --nametag bob               # Initialize second wallet
-npm run cli -- wallet list                      # List all profiles
-npm run cli -- wallet use alice                 # Switch to alice
-npm run cli -- send @bob 0.1 BTC                 # Send from alice to bob
-npm run cli -- wallet use bob                   # Switch to bob
-npm run cli -- balance --finalize               # Check bob's balance (fetch + finalize)
+sphere wallet create alice              # Create profile "alice"
+sphere init --nametag alice             # Initialize wallet in profile
+sphere wallet create bob                # Create another profile
+sphere init --nametag bob               # Initialize second wallet
+sphere wallet list                      # List all profiles
+sphere wallet use alice                 # Switch to alice
+sphere send @bob 0.1 BTC                 # Send from alice to bob
+sphere wallet use bob                   # Switch to bob
+sphere balance                          # Check bob's balance
 ```
 
 CLI stores data in `./.sphere-cli/` directory.
@@ -170,6 +164,7 @@ async function main() {
   // 2. Initialize wallet (auto-creates if doesn't exist)
   const { sphere, created, generatedMnemonic } = await Sphere.init({
     ...providers,
+    network: 'testnet', // required — Sphere.init throws without it
     autoGenerate: true,
   });
 
@@ -204,7 +199,9 @@ main().catch(console.error);
 
 ```typescript
 const providers = createNodeProviders({
-  // Network: 'mainnet' | 'testnet' | 'dev'
+  // Network: 'mainnet' | 'testnet' | 'testnet2' | 'dev'
+  // ('testnet' IS testnet2 — the v2 gateway; mainnet/dev are still v1-era and
+  //  cannot serve the v2 engine yet)
   network: 'testnet',
 
   // Storage directories (required)
@@ -224,11 +221,11 @@ const providers = createNodeProviders({
     debug: false,
   },
 
-  // Oracle options
+  // Oracle (v2 gateway) options
   oracle: {
-    aggregatorUrl: 'https://custom-aggregator.com/rpc',
-    trustBasePath: './trustbase.json',  // Local trustbase file
-    apiKey: 'your-api-key',             // If required
+    url: 'https://gateway.testnet2.unicity.network',  // Replace default gateway URL
+    trustBasePath: './trustbase.json',                // Local trust base file (optional)
+    apiKey: 'sk_ddc3cfcc001e4a28ac3fad7407f99590',    // Gateway API key (public testnet2 key)
   },
 
   // L1 blockchain options
@@ -260,7 +257,7 @@ const providers = createNodeProviders({
   },
 });
 
-const { sphere } = await Sphere.init({ ...providers, autoGenerate: true });
+const { sphere } = await Sphere.init({ ...providers, network: 'testnet', autoGenerate: true });
 
 // Sync tokens with IPFS (merges local and remote data)
 const result = await sphere.payments.sync();
@@ -285,13 +282,33 @@ for (const asset of assets) {
   }
 }
 
+// Per-coin balances (synchronous, no price data)
+const balances = sphere.payments.getBalance(); // Asset[]
+
 // Total portfolio value in USD (null if PriceProvider not configured)
-const totalUsd = await sphere.payments.getBalance();
+const totalUsd = await sphere.payments.getFiatBalance();
 console.log('Total USD:', totalUsd); // number | null
 
-// L1 (ALPHA) balance
-const l1Balance = await sphere.payments.l1.getBalance();
+// L1 (ALPHA) balance (payments.l1 is null when L1 is disabled via l1: null)
+const l1Balance = await sphere.payments.l1?.getBalance();
 console.log('L1 Balance:', l1Balance);
+```
+
+### Top Up (Testnet Self-Mint)
+
+There is no faucet — on testnet you top up by **self-minting** tokens via the v2 token engine:
+
+```typescript
+import { TokenRegistry } from '@unicitylabs/sphere-sdk';
+
+// mintFungibleToken takes the hex coin id, not the symbol
+const coinId = TokenRegistry.getInstance().getCoinIdBySymbol('UCT');
+const res = await sphere.payments.mintFungibleToken(coinId!, 100_000_000n);
+if (res.success) {
+  console.log('Minted token:', res.tokenId);
+} else {
+  console.error('Mint failed:', res.error);
+}
 ```
 
 ### Look Up Asset Metadata
@@ -321,28 +338,23 @@ const coinId = registry.getCoinIdBySymbol('UCT');
 ### Send Tokens
 
 ```typescript
-// Send to nametag (instant mode — default)
+// Send to nametag — the sender certifies the transfer on-chain (collects the
+// inclusion proof) and delivers a finished token via Nostr
 const result = await sphere.payments.send({
   recipient: '@alice',
   amount: '1000000',  // In base units
-  coinId: 'UCT',
-});
-
-// Send with conservative mode (collect proofs first, then deliver)
-const result = await sphere.payments.send({
-  recipient: '@alice',
-  amount: '1000000',
-  coinId: 'UCT',
-  transferMode: 'conservative',
+  coinId: 'UCT',      // Short symbols are resolved via the TokenRegistry
 });
 
 // Send to direct address
-const result = await sphere.payments.send({
+const result2 = await sphere.payments.send({
   recipient: 'DIRECT://0000be36...',
   amount: '500000',
   coinId: 'UCT',
 });
 ```
+
+> The legacy `transferMode` field (`'instant' | 'conservative'`) is still accepted on `TransferRequest` for backwards compatibility but **ignored** — v2 has a single sender-driven transfer flow.
 
 ### Fetch Pending Transfers (Explicit Receive)
 
@@ -359,12 +371,14 @@ await sphere.payments.receive(undefined, (transfer) => {
 });
 ```
 
+> The legacy `ReceiveOptions` (`finalize`, `timeout`, `pollInterval`) are deprecated **no-ops**: v2 transfers arrive as finished tokens and are stored confirmed immediately — there is no finalization phase.
+
 ### Register Nametag
 
-> **Note:** `registerNametag()` mints a token on-chain. This uses the Oracle (Aggregator) provider which is included by default with `createNodeProviders()`.
+> **Note:** `registerNametag()` registers the name by publishing a Nostr identity binding (name ↔ chain pubkey, first-seen-wins). A self-issued v2 Unicity ID token is additionally minted and stored **best-effort** — registration never fails because of it. Runtime name resolution uses only the Nostr binding.
 
 ```typescript
-// This registers on Nostr AND mints token on-chain
+// Publishes the Nostr binding; throws if the name is already taken
 await sphere.registerNametag('myusername');
 console.log('Registered:', sphere.identity?.nametag);
 ```
@@ -372,9 +386,12 @@ console.log('Registered:', sphere.identity?.nametag);
 ### Listen for Incoming Transfers
 
 ```typescript
-sphere.on('transfer:incoming', (event) => {
-  console.log('Received:', event.data.amount, event.data.coinId);
-  console.log('From:', event.data.sender);
+// Handlers receive the event payload directly (IncomingTransfer)
+sphere.on('transfer:incoming', (transfer) => {
+  for (const token of transfer.tokens) {
+    console.log('Received:', token.amount, token.symbol);
+  }
+  console.log('From:', transfer.senderNametag ?? transfer.senderPubkey);
 });
 ```
 
@@ -384,7 +401,7 @@ sphere.on('transfer:incoming', (event) => {
 await sphere.communications.sendDM('@alice', 'Hello!');
 
 sphere.communications.onDirectMessage((msg) => {
-  console.log('Message from', msg.sender, ':', msg.content);
+  console.log('Message from', msg.senderNametag ?? msg.senderPubkey, ':', msg.content);
 });
 ```
 
@@ -394,12 +411,14 @@ sphere.communications.onDirectMessage((msg) => {
 // From mnemonic (plaintext storage — default)
 const { sphere } = await Sphere.init({
   ...providers,
+  network: 'testnet',
   mnemonic: 'your twelve word mnemonic phrase here ...',
 });
 
 // From mnemonic with password encryption
 const { sphere } = await Sphere.init({
   ...providers,
+  network: 'testnet',
   mnemonic: 'your twelve word mnemonic phrase here ...',
   password: 'my-secret-password',
 });
@@ -410,6 +429,7 @@ const sphere = await Sphere.import({
   chainCode: '64-char-hex-chain-code',
   basePath: "m/84'/1'/0'",
   derivationMode: 'bip32',
+  network: 'testnet',
   ...providers,
 });
 ```
@@ -422,6 +442,7 @@ By default, the mnemonic is stored as **plaintext** in `wallet.json`. You can op
 // Create wallet with password encryption
 const { sphere } = await Sphere.init({
   ...providers,
+  network: 'testnet',
   autoGenerate: true,
   password: 'my-secret-password',
 });
@@ -429,11 +450,12 @@ const { sphere } = await Sphere.init({
 // Load wallet with password
 const { sphere } = await Sphere.init({
   ...providers,
+  network: 'testnet',
   password: 'my-secret-password',
 });
 
 // Load wallet without password (plaintext mnemonic — default)
-const { sphere } = await Sphere.init({ ...providers });
+const { sphere } = await Sphere.init({ ...providers, network: 'testnet' });
 ```
 
 **Backwards compatibility:** Wallets created with older SDK versions (encrypted with the internal default key) will load correctly without a password.
@@ -476,6 +498,7 @@ const { sphere } = await Sphere.init({
   tokenStorage: providers.tokenStorage,
   transport: providers.transport,
   oracle: providers.oracle,
+  network: 'testnet',
 });
 ```
 
@@ -500,10 +523,10 @@ console.log(addr.address, addr.publicKey);
 ## Event Handling
 
 ```typescript
-// All available events
+// Commonly used events (see SphereEventMap in types/index.ts for the full list)
 sphere.on('transfer:incoming', handler);
-sphere.on('transfer:sent', handler);
-sphere.on('transfer:pending', handler);
+sphere.on('transfer:confirmed', handler);
+sphere.on('transfer:failed', handler);
 sphere.on('payment_request:incoming', handler);
 sphere.on('payment_request:paid', handler);
 sphere.on('message:dm', handler);
@@ -525,11 +548,12 @@ unsubscribe(); // Stop listening
 
 The `AccountingModule` handles the full invoice lifecycle — creation, status queries, payment, and closing. Enable it by passing `accounting: true` to `Sphere.init()`.
 
-> **Note:** The accounting module requires the Oracle (Aggregator) provider, which is included by default with `createNodeProviders()`.
+> **Note:** The accounting module requires the Oracle provider (v2 gateway config), which is included by default with `createNodeProviders()`. Invoices are minted as data tokens via the v2 token engine.
 
 ```typescript
 const { sphere } = await Sphere.init({
   ...providers,
+  network: 'testnet',
   autoGenerate: true,
   accounting: true,   // Enable with defaults
 });
@@ -639,6 +663,7 @@ The swap module enables trustless two-party token exchanges via an escrow servic
 ```typescript
 const { sphere } = await Sphere.init({
   ...providers,
+  network: 'testnet',
   autoGenerate: true,
   accounting: true,  // Required (swap uses invoices internally)
   swap: true,        // Enable swap module
@@ -717,7 +742,7 @@ try {
     amount: '1000000',
     recipient: '@alice',
   });
-  console.log('Sent:', result.txId);
+  console.log('Sent:', result.id, result.status);
 } catch (error) {
   if (isSphereError(error)) {
     switch (error.code) {
@@ -773,6 +798,7 @@ async function main() {
 
   const { sphere, created, generatedMnemonic } = await Sphere.init({
     ...providers,
+    network: 'testnet',
     autoGenerate: true,
   });
 
@@ -786,11 +812,13 @@ async function main() {
   console.log('Direct Address:', sphere.identity?.directAddress);
   console.log('Nametag:', sphere.identity?.nametag || '(not registered)');
 
-  // Listen for incoming transfers
-  sphere.on('transfer:incoming', (event) => {
+  // Listen for incoming transfers (handler receives the IncomingTransfer payload)
+  sphere.on('transfer:incoming', (transfer) => {
     console.log('\nIncoming transfer!');
-    console.log('Amount:', event.data.amount);
-    console.log('From:', event.data.sender);
+    for (const token of transfer.tokens) {
+      console.log('Amount:', token.amount, token.symbol);
+    }
+    console.log('From:', transfer.senderNametag ?? transfer.senderPubkey);
   });
 
   // Keep running

@@ -1,4 +1,5 @@
 # AccountingModule Test Suite Specification
+> **Note: written against the v1 engine; invoices now mint via the v2 token engine (engine.mintDataToken) — see CHANGELOG.md and AccountingModule.ts.**
 
 > **Status:** Specification document (no code) for comprehensive test coverage of AccountingModule
 > **Framework:** Vitest

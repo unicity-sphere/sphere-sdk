@@ -1,4 +1,5 @@
 # Track B — Status
+> **Status: HISTORICAL — the v1→v2 cutover completed 2026-06-10 (PRs #479/#480/#481). v1 is removed; see CHANGELOG.md.**
 
 > Caller / identity / test side of the `@unicitylabs/state-transition-sdk` **v1 → v2** migration.
 > Companion to [`TRACK-B-KICKOFF.md`](TRACK-B-KICKOFF.md) (scope, locked decisions) and

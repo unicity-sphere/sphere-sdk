@@ -1,4 +1,5 @@
 # Token Spend Queue — Feature Specification
+> **Note: written against the v1 engine — the `instant`/`conservative` transfer modes no longer exist after the v1→v2 cutover (2026-06-10); the reservation/queue design now applies to the single sender-driven `send()` path. See CHANGELOG.md.**
 
 **Document status:** Draft v1.0
 **Scope:** `sphere-sdk` — `modules/payments/`

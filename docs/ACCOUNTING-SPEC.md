@@ -1,4 +1,5 @@
 # Accounting Module Specification
+> **Note: written against the v1 engine; invoices now mint via the v2 token engine (engine.mintDataToken) — see CHANGELOG.md and AccountingModule.ts.**
 
 > **Status:** Draft specification — no code yet
 > **Companion:** [ACCOUNTING-ARCHITECTURE.md](./ACCOUNTING-ARCHITECTURE.md)

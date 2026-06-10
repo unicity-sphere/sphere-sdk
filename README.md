@@ -6,15 +6,16 @@ A modular TypeScript SDK for Unicity wallet operations supporting both Layer 1 (
 
 - **Wallet Management** - BIP39/BIP32 key derivation, AES-256 encryption
 - **L1 Payments** - ALPHA blockchain transactions via Fulcrum WebSocket
-- **L3 Payments** - Token transfers with state transition proofs, concurrent-send safety (SpendQueue)
-- **Invoicing / Accounting** - On-chain invoice lifecycle with payment attribution, auto-return, privacy-preserving hashed invoice IDs
+- **L3 Payments** - Token transfers via the v2 state-transition token engine, concurrent-send safety (SpendQueue)
+- **Invoicing / Accounting** - On-chain invoice lifecycle with payment attribution, auto-return, privacy-preserving hashed invoice IDs; invoices travel as v2 data-token blobs (hex strings) — `createInvoice()` returns the blob, `importInvoice()` accepts it
 - **Token Swaps** - P2P atomic swaps via escrow with DM-based negotiation protocol
 - **Payment Requests** - Request payments with async response tracking
+- **Market (Intents)** - Signed intent bulletin board with semantic search and live feed — see [docs/MARKET.md](docs/MARKET.md)
 - **Group Chat** - NIP-29 relay-based group messaging with moderation
 - **Nostr Transport** - Resilient P2P messaging with verified publish, health checks, NIP-17 gift-wrap
 - **IPFS Storage** - Decentralized token backup via HTTP API (browser + Node.js)
 - **Multi-Address** - HD address derivation (BIP32/BIP44)
-- **Token Validation** - Aggregator-based token verification
+- **Token Validation** - Engine-based token verification (trust base + spent check via the v2 gateway)
 - **Connect Protocol** - dApp ↔ wallet communication via `ConnectClient` / `ConnectHost` (browser extension + popup)
 - **CLI** - Comprehensive command-line interface with shell auto-completion
 
@@ -52,11 +53,13 @@ See [docs/QUICKSTART-CLI.md](docs/QUICKSTART-CLI.md) for the full command refere
 import { Sphere } from '@unicitylabs/sphere-sdk';
 import { createBrowserProviders } from '@unicitylabs/sphere-sdk/impl/browser';
 
-// Create providers (browser) - defaults to mainnet
-const providers = createBrowserProviders();
-
-// Or use testnet for development
-const testnetProviders = createBrowserProviders({ network: 'testnet' });
+// Create providers (browser) — `network` is required (no default).
+// 'testnet' is the v2 testnet2 gateway; pass the gateway API key for
+// send/mint/invoice operations (see "API Key" below).
+const providers = createBrowserProviders({
+  network: 'testnet',
+  oracle: { apiKey: 'sk_...' },  // testnet2 key is not a secret — see .env.example
+});
 
 // Initialize (auto-creates wallet if needed)
 const { sphere, created, generatedMnemonic } = await Sphere.init({
@@ -76,10 +79,11 @@ const assets = await sphere.payments.getAssets();
 console.log('Assets:', assets);
 
 // Get total portfolio value in USD (requires PriceProvider)
-const balance = await sphere.payments.getBalance();
-console.log('Total USD:', balance); // number | null
+const totalUsd = await sphere.payments.getFiatBalance();
+console.log('Total USD:', totalUsd); // number | null
 
-// Send tokens
+// Send tokens — the recipient must have a published identity (chain pubkey),
+// e.g. a registered Unicity ID; otherwise send fails with INVALID_RECIPIENT
 const result = await sphere.payments.send({
   recipient: '@alice',
   amount: '1000000',
@@ -93,13 +97,16 @@ console.log('Address 1:', addr1.address);
 
 ## Network Configuration
 
-The SDK supports three network presets that configure all services automatically:
+The SDK ships network presets that configure all services automatically. `network` is **required** — there is no default:
 
-| Network | Aggregator | Nostr Relay | Electrum (L1) |
-|---------|------------|-------------|---------------|
-| `mainnet` | aggregator.unicity.network | relay.unicity.network | fulcrum.alpha.unicity.network |
-| `testnet` | goggregator-test.unicity.network | nostr-relay.testnet.unicity.network | fulcrum.alpha.testnet.unicity.network |
-| `dev` | dev-aggregator.dyndns.org | nostr-relay.testnet.unicity.network | fulcrum.alpha.testnet.unicity.network |
+| Network | Aggregator (gateway) | Nostr Relay | Electrum (L1) |
+|---------|----------------------|-------------|---------------|
+| `testnet` | gateway.testnet2.unicity.network (v2) | nostr-relay.testnet.unicity.network | fulcrum.unicity.network |
+| `testnet2` | alias of `testnet` (same configuration) | nostr-relay.testnet.unicity.network | fulcrum.unicity.network |
+| `mainnet` | aggregator.unicity.network (v1-era) | relay.unicity.network (+ public relays) | fulcrum.unicity.network |
+| `dev` | dev-aggregator.dyndns.org (v1-era) | nostr-relay.testnet.unicity.network | fulcrum.unicity.network |
+
+> **v1 → v2 cutover:** `testnet` now points at **testnet2**, the v2 state-transition gateway network (network id 4, taken from the trust base; own testnet2 token registry). The old `goggregator-test` testnet spoke the removed v1 protocol and is gone. `mainnet` and `dev` still point at v1-era aggregators — wallet operations that move money (`send`, `mintFungibleToken`, invoices) **fail loudly** (`AGGREGATOR_ERROR`) on those networks until their gateways are cut over to the v2 protocol. The only supported transfer wire payload is the finished v2 token blob — incoming v1-era payloads are dropped with an explicit error log, so peers must run a >= 0.8 wallet to send to this wallet.
 
 ```typescript
 // Use testnet for all services
@@ -108,15 +115,28 @@ const providers = createBrowserProviders({ network: 'testnet' });
 // Override specific services while using network preset
 const providers = createBrowserProviders({
   network: 'testnet',
-  oracle: { url: 'https://custom-aggregator.example.com' }, // custom oracle
+  oracle: { url: 'https://custom-gateway.example.com' }, // custom v2 gateway
 });
 
 // L1 is enabled by default — customize if needed
 const providers = createBrowserProviders({
   network: 'testnet',
-  l1: { enableVesting: true },  // uses testnet electrum URL automatically
+  l1: { enableVesting: true },  // uses network electrum URL automatically
 });
 ```
+
+### API Key
+
+The SDK bundles **no default API key**. Pass the gateway key via `oracle: { apiKey }` — without it, gateway requests are unauthenticated and money movement on testnet2 fails.
+
+```typescript
+const providers = createBrowserProviders({
+  network: 'testnet',
+  oracle: { apiKey: 'sk_...' },
+});
+```
+
+The **testnet2 key is not a secret** — it is published in [.env.example](.env.example) and safe to keep in docs and client code. A **mainnet** key, by contrast, IS a secret: keep it in your deploy environment only.
 
 ## Price Provider (Optional)
 
@@ -138,7 +158,7 @@ const providers = createBrowserProviders({
 const { sphere } = await Sphere.init({ ...providers, autoGenerate: true });
 
 // Total portfolio value in USD
-const totalUsd = await sphere.payments.getBalance();
+const totalUsd = await sphere.payments.getFiatBalance();
 // 1523.45
 
 // Assets with price data
@@ -146,7 +166,7 @@ const assets = await sphere.payments.getAssets();
 // [{ coinId, symbol, totalAmount, priceUsd: 97500, fiatValueUsd: 975.00, change24h: 2.3, ... }]
 ```
 
-Without `price` config, `getBalance()` returns `null` and price fields in `getAssets()` are `null`. All other functionality works normally.
+Without `price` config, `getFiatBalance()` returns `null` and price fields in `getAssets()` are `null`. All other functionality works normally. (`getBalance()` is the synchronous per-coin balance accessor — it returns `Asset[]` without price data.)
 
 You can also set the price provider after initialization:
 
@@ -159,27 +179,25 @@ sphere.setPriceProvider(createPriceProvider({
 }));
 ```
 
-## Testnet Faucet
+## Test Tokens on Testnet (Self-Mint)
 
-To get test tokens on testnet, you **must first register a nametag**:
+There is no faucet. On testnet you top up your wallet by **self-minting** fungible tokens via the v2 token engine — `mintFungibleToken(coinIdHex, amount)` mints a finished token directly to this wallet:
 
 ```typescript
-// 1. Create wallet and register nametag
-const { sphere } = await Sphere.init({
-  ...createBrowserProviders({ network: 'testnet' }),
-  autoGenerate: true,
-  nametag: 'myname',  // Register @myname
-});
+import { getCoinIdBySymbol } from '@unicitylabs/sphere-sdk';
 
-// 2. Request tokens from faucet using nametag
-const response = await fetch('https://faucet.unicity.network/api/v1/faucet/request', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ unicityId: 'myname', coin: 'unicity', amount: 100 }),
-});
+// Resolve the coin's hex id from the token registry (or pass a hex coinId directly)
+const coinId = getCoinIdBySymbol('UCT');
+
+const result = await sphere.payments.mintFungibleToken(coinId!, 1000n);
+if (result.success) {
+  console.log('Minted token:', result.tokenId);
+} else {
+  console.error('Mint failed:', result.error);
+}
 ```
 
-> **Note:** The faucet requires a registered nametag. Requests without a valid nametag will fail.
+> **Note:** Minting requires a working v2 oracle config (trust base + gateway URL + API key) — it fails with an error result otherwise. See [API Key](#api-key) above.
 
 ## Multi-Address Support
 
@@ -516,7 +534,7 @@ const { sphere } = await Sphere.init({
   ...providers,
   autoGenerate: true,
   // L1 config is optional — defaults are applied automatically:
-  // electrumUrl: network-specific (mainnet: fulcrum.alpha.unicity.network)
+  // electrumUrl: network-specific (default: wss://fulcrum.unicity.network:50004)
   // defaultFeeRate: 10 sat/byte
   // enableVesting: true
 });
@@ -563,8 +581,18 @@ import {
 } from '@unicitylabs/sphere-sdk/impl/browser';
 
 const storage = createLocalStorageProvider();
-const transport = createNostrTransportProvider();
-const oracle = createUnicityAggregatorProvider({ url: '/rpc' });
+// Without config the transport defaults to mainnet relays — pass the
+// testnet relay explicitly when pairing with the testnet2 gateway below.
+const transport = createNostrTransportProvider({
+  relays: ['wss://nostr-relay.testnet.unicity.network'],
+});
+// `network` (or `trustBaseUrl`) is required — it selects the trust base the
+// v2 token engine is built from. The apiKey authenticates gateway requests.
+const oracle = createUnicityAggregatorProvider({
+  url: 'https://gateway.testnet2.unicity.network',
+  apiKey: 'sk_...',
+  network: 'testnet',
+});
 
 // Check if wallet exists
 if (await Sphere.exists(storage)) {
@@ -718,7 +746,7 @@ import {
 
 ## TXF Serialization
 
-Token eXchange Format for storage and transfer:
+Token eXchange Format for storage. **Note:** TXF is the legacy v1 token format — post v2-cutover, stored v1 TXF tokens remain visible in the wallet (display only) but are unspendable; v2 tokens travel and persist as CBOR blob hex strings. These helpers remain for storage-data handling and legacy display:
 
 ```typescript
 import {
@@ -744,26 +772,14 @@ const storageData = await buildTxfStorageData(tokens, {
 
 ## Token Validation
 
-Validate tokens against the aggregator:
+Post v2-cutover, token verification goes through the token engine (structural validity via `engine.verify`, spent status via `engine.isSpent`). For applications, the supported entry point is the wallet itself:
 
 ```typescript
-import { createTokenValidator } from '@unicitylabs/sphere-sdk';
-
-const validator = createTokenValidator({
-  aggregatorClient: oracleProvider,
-  trustBase: trustBaseData,
-  skipVerification: false,
-});
-
-// Validate all tokens
-const { validTokens, issues } = await validator.validateAllTokens(tokens);
-
-// Check if token state is spent
-const isSpent = await validator.isTokenStateSpent(tokenId, stateHash, publicKey);
-
-// Check spent tokens in batch
-const { spentTokens, errors } = await validator.checkSpentTokens(tokens, publicKey);
+// Validate all wallet tokens against the network
+const { valid, invalid } = await sphere.payments.validate();
 ```
+
+A standalone `TokenValidator` also exists (`createTokenValidator(engine)`, exported from the SDK root) for advanced use. It operates on engine-level `SphereToken` objects and requires an `ITokenEngine` instance — the engine the wallet builds internally from the oracle's trust base + gateway config; there is currently no public factory entry point to construct one yourself.
 
 ## Architecture
 
@@ -784,7 +800,7 @@ mnemonic → master key → BIP32 derivation → identity
               ↓                  ↓                  ↓                  ↓
          L1 (ALPHA)        L3 (Unicity)        Group Chat           Nostr
      sphere.payments.l1  sphere.payments    sphere.groupChat  sphere.communications
-      UTXOs, blockchain  Tokens, aggregator  NIP-29 messaging    P2P messaging
+      UTXOs, blockchain  Tokens, v2 engine   NIP-29 messaging    P2P messaging
 ```
 
 ```
@@ -792,13 +808,25 @@ Sphere (main entry point)
 ├── identity       - Wallet identity (address, publicKey, nametag)
 ├── payments       - L3 token operations
 │   └── l1         - L1 ALPHA transactions (via sphere.payments.l1)
+├── accounting     - Invoice lifecycle (via sphere.accounting)
+├── swap           - P2P token swaps (via sphere.swap)
+├── market         - Intent bulletin board (via sphere.market)
 ├── groupChat      - NIP-29 group messaging (via sphere.groupChat)
 └── communications - Direct messages & broadcasts
+
+Token Engine (token-engine/)
+└── The wallet's boundary to the v2 state-transition SDK: all mint /
+    transfer / split / verify / spent-check operations go through the
+    ITokenEngine port. Sphere builds the engine from the oracle's config
+    (trust base JSON + gateway URL + API key); no state-transition SDK
+    objects cross this boundary.
 
 Providers (injectable dependencies)
 ├── StorageProvider      - Key-value persistence
 ├── TransportProvider    - P2P messaging (Nostr)
-├── OracleProvider       - State validation (Aggregator)
+├── OracleProvider       - Network config for the token engine (trust base
+│                          JSON + gateway URL + API key) + legacy v1 RPC
+│                          validateToken (display-only)
 └── TokenStorageProvider - Token backup (IPFS)
 
 Implementation (platform-specific)
@@ -887,7 +915,7 @@ The SDK includes browser-ready provider implementations:
 |----------|-------------|
 | `LocalStorageProvider` | Browser localStorage with SSR fallback |
 | `NostrTransportProvider` | Nostr relay messaging with NIP-04 |
-| `UnicityAggregatorProvider` | Unicity aggregator for state proofs |
+| `UnicityAggregatorProvider` | Network config for the v2 token engine (trust base + gateway URL + API key); also exposes a legacy `validateToken` RPC for v1-era tokens |
 | `IpfsStorageProvider` | HTTP-based IPFS/IPNS storage (cross-platform) |
 
 ## Node.js Providers
@@ -1265,13 +1293,13 @@ function getRelayStatuses() {
 }
 ```
 
-## Nametags
+## Nametags (Unicity IDs)
 
 Nametags provide human-readable addresses (e.g., `@alice`) for receiving payments. Valid formats: lowercase alphanumeric with `_` or `-` (3–20 chars), or E.164 phone numbers (e.g., `+14155552671`). Input is normalized to lowercase automatically.
 
-> **Important:** Nametags are required to use the testnet faucet. Register a nametag before requesting test tokens.
+**How registration works:** registering a nametag publishes a **Nostr identity binding** (name ↔ chain pubkey). Uniqueness is first-seen-wins — a name is available iff no binding already resolves for it (`sphere.isNametagAvailable(name)`). Runtime name resolution is binding-only; payments always go to the recipient's key-based `DIRECT://` address (there are no PROXY addresses).
 
-> **Note:** Nametag minting requires an aggregator API key for proof verification. Configure it via the `oracle.apiKey` option when creating providers. Contact Unicity to obtain an API key.
+In addition, a self-issued v2 `UnicityIdToken` (the on-chain claim) is minted and stored **best-effort** at registration — a gateway outage or missing v2 oracle config never fails registration; the mint is retried on the next load, and the token is not consumed anywhere at runtime yet.
 
 ### Registering a Nametag
 
@@ -1286,22 +1314,18 @@ const { sphere } = await Sphere.init({
 // Or after creation
 await sphere.registerNametag('alice');
 
-// Mint on-chain nametag token (required for receiving via PROXY addresses)
-const result = await sphere.mintNametag('alice');
-if (result.success) {
-  console.log('Nametag minted:', result.nametagData?.name);
-}
+// Check availability first
+const free = await sphere.isNametagAvailable('alice');
 ```
 
 ### Common Pitfall: Nametag Already Taken
 
 If you see this error:
 ```
-Failed to register nametag. It may already be taken.
-[NostrTransportProvider] Nametag already taken: myname - owner: f124f93ae6946ffd...
+Failed to register Unicity ID. It may already be taken.
 ```
 
-This means the nametag is registered to a **different public key**. Common causes:
+This means the nametag is registered (bound on Nostr) to a **different public key**. Common causes:
 
 1. **Storage cleared or not persisting**:
    - `Sphere.exists()` returns `false` because storage is empty/inaccessible

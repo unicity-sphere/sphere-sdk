@@ -66,7 +66,7 @@ await Sphere.clear(storage);
 |----------|------|-------------|
 | `identity` | `FullIdentity \| null` | Current wallet identity (after init/load) |
 | `payments` | `PaymentsModule` | L3 token operations + L1 via `.l1` |
-| `payments.l1` | `L1PaymentsModule` | L1 ALPHA operations |
+| `payments.l1` | `L1PaymentsModule \| null` | L1 ALPHA operations (`null` when disabled via `l1: null`) |
 | `communications` | `CommunicationsModule` | Messaging operations |
 | `accounting` | `AccountingModule \| null` | Invoice lifecycle and payment attribution |
 | `swap` | `SwapModule \| null` | P2P token swap orchestration |
@@ -211,7 +211,6 @@ interface PeerInfo {
   chainPubkey: string;     // 33-byte compressed secp256k1
   l1Address: string;       // alpha1... L1 address
   directAddress: string;   // DIRECT://... L3 address
-  proxyAddress?: string;   // PROXY://... (only if nametag registered)
   timestamp: number;       // Binding event timestamp
 }
 ```
@@ -222,31 +221,26 @@ interface PeerInfo {
 
 Access via `sphere.payments`.
 
-Handles all L3 (Unicity state transition network) token operations including transfers, balance queries, token lifecycle management, nametag minting, and multi-provider sync.
+Handles all L3 (Unicity state transition network) token operations including transfers, balance queries, token lifecycle management, self-mint, and multi-provider sync.
 
-### Transfer Modes
+### How Transfers Work (v2, sender-driven)
 
-`send()` automatically selects the optimal transfer path:
+`send()` runs the entire transfer through the v2 token engine on the **sender** side:
 
 ```
-Path 1 — Whole-Token NOSTR-FIRST (no split needed):
-  ┌─────────┐    commitment + token    ┌───────────┐
-  │  Sender  │ ────── Nostr ──────────>│ Recipient  │
-  └────┬─────┘                         └─────┬──────┘
-       │  submit commitment (background)      │  submit commitment (idempotent)
-       └──────> Aggregator <──────────────────┘  poll for proof → finalize
-
-Path 2 — Instant Split V5 (~2.3s sender latency):
-  ┌─────────┐  burn  ┌────────────┐  bundle via Nostr  ┌───────────┐
-  │  Sender  │──────> │ Aggregator │                    │ Recipient  │
-  └────┬─────┘ proof  └────────────┘                    └─────┬──────┘
-       │ create mints + transfer commitment                   │
-       │ ──────────── Nostr ─────────────────────────────────>│
-       │  background: submit mints, save change               │ submit mint
-       │                                                      │ wait for proof
-       │                                                      │ submit transfer
-       │                                                      │ finalize
+  ┌─────────┐  engine.transfer / engine.split   ┌──────────┐
+  │  Sender  │ ─────────────────────────────────>│ Gateway   │  certify on-chain,
+  └────┬─────┘     (source state is spent)       └──────────┘  wait inclusion proof
+       │
+       │  V2_TRANSFER payload (finished token blob) via Nostr
+       └──────────────────────────────────────────> Recipient
+                                  verifies (engine.verify + ownership) → stores 'confirmed'
 ```
+
+- The recipient receives a **finished** token — there is no commitment submission, proof polling, or finalization phase on the receiving side.
+- Whole-token transfers use `engine.transfer`; partial amounts use `engine.split` (recipient output + change output certified in one on-chain operation — the change token is real and immediately spendable, no placeholder).
+- Finished-but-undelivered blobs are journaled under the `PENDING_V2_DELIVERIES` storage key **before** the transport send and replayed by `load()` — a transport failure or crash never loses the recipient's token.
+- Requirements: the token engine must be available (the oracle supplies a v2 trust base + gateway URL; otherwise `AGGREGATOR_ERROR`), and the recipient must have a published chain pubkey (otherwise `INVALID_RECIPIENT`).
 
 ### Methods: Balance & Assets
 
@@ -262,7 +256,7 @@ const totalUsd = await sphere.payments.getFiatBalance();
 
 #### `getBalance(coinId?: string): Asset[]`
 
-Returns aggregated assets (tokens grouped by coinId) with confirmed/unconfirmed breakdown. Synchronous.
+Returns aggregated assets (tokens grouped by coinId) with confirmed/unconfirmed breakdown. Synchronous — price fields are always `null` here; use `getAssets()` for fiat values.
 
 ```typescript
 const balances = sphere.payments.getBalance();
@@ -272,9 +266,6 @@ for (const bal of balances) {
   console.log(`  Confirmed:   ${bal.confirmedAmount} (${bal.confirmedTokenCount} tokens)`);
   console.log(`  Unconfirmed: ${bal.unconfirmedAmount} (${bal.unconfirmedTokenCount} tokens)`);
   console.log(`  Total:       ${bal.totalAmount}`);
-  if (bal.fiatValueUsd !== null) {
-    console.log(`  USD Value:   $${bal.fiatValueUsd.toFixed(2)}`);
-  }
 }
 
 // Filter to a single coin
@@ -298,6 +289,7 @@ interface Asset {
   readonly unconfirmedAmount: string;   // Unconfirmed token amounts
   readonly confirmedTokenCount: number; // Number of confirmed tokens
   readonly unconfirmedTokenCount: number; // Number of unconfirmed tokens
+  readonly transferringTokenCount: number; // Number of tokens currently being sent
   readonly priceUsd: number | null;     // Price per unit in USD
   readonly priceEur: number | null;     // Price per unit in EUR
   readonly change24h: number | null;    // 24h price change %
@@ -345,19 +337,21 @@ Get a single token by ID.
 
 #### `send(request: TransferRequest): Promise<TransferResult>`
 
-Send tokens to a recipient. Automatically splits tokens when the exact amount is not available as a single token.
+Send tokens to a recipient via the v2 token engine (the only send path). Automatically splits a token when the exact amount is not available as a single token.
 
 ```typescript
 interface TransferRequest {
   readonly coinId: string;       // Coin type (hex string)
   readonly amount: string;       // Amount in smallest units
-  readonly recipient: string;    // @nametag, hex pubkey, DIRECT://, PROXY://, or alpha1... address
-  readonly memo?: string;        // Optional message
-  readonly addressMode?: AddressMode;  // 'auto' | 'direct' | 'proxy'
-  readonly transferMode?: TransferMode;  // 'instant' | 'conservative'
+  readonly recipient: string;    // @nametag, hex chain pubkey, DIRECT://, or alpha1... address
+  readonly memo?: string;        // Optional message (transport-only; invoice refs also go on-chain)
+  readonly addressMode?: AddressMode;    // 'auto' | 'direct' — both resolve to the recipient's key-based DIRECT address
+  readonly transferMode?: TransferMode;  // Deprecated: accepted but IGNORED (single engine path)
+  readonly invoiceRefundAddress?: string; // Invoice refund address (DIRECT://) — embedded in the on-chain message
+  readonly invoiceContact?: { address: string; url?: string }; // Invoice contact — embedded in the on-chain message
 }
 
-type AddressMode = 'auto' | 'direct' | 'proxy';
+type AddressMode = 'auto' | 'direct';
 type TransferMode = 'instant' | 'conservative';
 
 interface TransferResult {
@@ -371,9 +365,6 @@ interface TransferResult {
 interface TokenTransferDetail {
   readonly sourceTokenId: string;   // Source token ID consumed
   readonly method: 'direct' | 'split';  // Transfer method
-  readonly requestIdHex?: string;   // Aggregator commitment request ID (direct)
-  readonly splitGroupId?: string;   // Split group ID (split)
-  readonly nostrEventId?: string;   // Nostr event ID (split)
 }
 
 type TransferStatus = 'pending' | 'submitted' | 'confirmed' | 'delivered' | 'completed' | 'failed';
@@ -386,25 +377,16 @@ const result = await sphere.payments.send({
   recipient: '@alice',
   amount: '1000000',
   coinId: 'UCT',
-  addressMode: 'auto',
 });
 console.log(result.status); // 'completed'
 ```
 
-**Transfer Modes:**
+**Semantics (v2):**
 
-- **`'instant'`** (default) — Sends tokens via Nostr immediately with commitment data. The receiver resolves aggregator proofs in the background. Fastest sender experience (~2-3s for splits).
-- **`'conservative'`** — Collects all aggregator proofs at the sender side before delivering fully finalized tokens (with `{ sourceToken, transferTx }`) via Nostr. Slower for the sender but the receiver gets immediately usable tokens with no background proof resolution needed.
-
-```typescript
-// Conservative transfer — receiver gets fully finalized tokens
-const result = await sphere.payments.send({
-  recipient: '@alice',
-  amount: '1000000',
-  coinId: 'UCT',
-  transferMode: 'conservative',
-});
-```
+- The wire payload is always `V2_TRANSFER` — a finished v2 token blob. The recipient verifies it (`engine.verify` + ownership check) and stores it as `'confirmed'`; no receiver-side proof resolution exists.
+- The token engine and the recipient's published chain pubkey are **mandatory**: `send()` throws `AGGREGATOR_ERROR` when the engine is unavailable (no v2 oracle config) and `INVALID_RECIPIENT` when the recipient has no published identity.
+- Every finished output blob is journaled under the `PENDING_V2_DELIVERIES` storage key **before** transport delivery and removed after success; `load()` replays undelivered blobs from a previous session.
+- **Failure handling:** source tokens whose spend was certified on-chain during a failed send become terminal `'spent'` — never restored to `'confirmed'` (the finished output blob stays journaled for delivery replay); genuinely untouched tokens are restored to `'confirmed'`.
 
 #### `receive(options?, callback?): Promise<ReceiveResult>`
 
@@ -414,106 +396,66 @@ Unlike the persistent subscription that delivers events asynchronously, `receive
 queries the Nostr relay and resolves after all stored events are processed. Useful for
 batch/CLI applications.
 
-- **options** (`ReceiveOptions`, optional): Finalization control and progress reporting.
+v2 transfers arrive as **finished** tokens — there is no finalization phase. Incoming tokens are
+verified (`engine.verify` + ownership check against this wallet's chain pubkey) and stored as
+`'confirmed'` before the call resolves.
+
+- **options** (`ReceiveOptions`, optional): **Deprecated.** The former finalization options
+  (`finalize`, `timeout`, `pollInterval`) are accepted for backwards compatibility and ignored.
 - **callback** (`(transfer: IncomingTransfer) => void`, optional): Invoked for each newly received transfer.
-
-**ReceiveOptions:**
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `finalize` | `boolean` | `false` | Wait for all tokens to be finalized |
-| `timeout` | `number` | `60000` | Finalization timeout in ms |
-| `pollInterval` | `number` | `2000` | Poll interval between finalization attempts |
-| `onProgress` | `function` | — | Progress callback during finalization |
 
 **ReceiveResult:**
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `transfers` | `IncomingTransfer[]` | Newly received transfers |
-| `finalization` | `UnconfirmedResolutionResult` | Result from resolveUnconfirmed() |
-| `timedOut` | `boolean` | Whether finalization timed out |
-| `finalizationDurationMs` | `number` | Duration of finalization in ms |
 
 ```typescript
-// Simple usage — fetch and submit commitments once
+// Fetch and process pending transfers once
 const { transfers } = await sphere.payments.receive();
 
-// With callback only
+// With per-transfer callback
 await sphere.payments.receive(undefined, (transfer) => {
-  console.log(`Received ${transfer.tokens.length} tokens`);
-});
-
-// Wait for finalization
-const result = await sphere.payments.receive({
-  finalize: true,
-  timeout: 30000,
-  onProgress: (res) => console.log(`${res.stillPending} pending`),
-});
-
-// Both options and callback
-const result = await sphere.payments.receive({ finalize: true }, (transfer) => {
   console.log(`Received ${transfer.tokens.length} tokens`);
 });
 ```
 
 ---
 
-### Methods: Unconfirmed Token Resolution
+### Methods: Self-Mint
 
-#### `resolveUnconfirmed(): Promise<UnconfirmedResolutionResult>`
+#### `mintFungibleToken(coinIdHex: string, amount: bigint): Promise<{ success: true; token: Token; tokenId: string } | { success: false; error: string }>`
 
-Attempt to resolve unconfirmed (`status: 'submitted'`) tokens by acquiring missing aggregator proofs.
+Self-mint fungible tokens to this wallet via the v2 token engine (`engine.mint` — a finished
+token, no commitment round-trip). There is no faucet in v2; this is the way to top up a fresh
+wallet on networks where standalone mint is allowed (e.g. testnet2).
 
-V5 tokens progress through stages:
-
-```
-RECEIVED → MINT_SUBMITTED → MINT_PROVEN → TRANSFER_SUBMITTED → FINALIZED
-```
-
-- Uses 500ms quick-timeouts per proof check (non-blocking).
-- Tokens exceeding 50 failed attempts are marked `'invalid'`.
-- Automatically called (fire-and-forget) by `getBalance()` and `load()`.
+- `coinIdHex` must be even-length lowercase hex; `amount` must be `> 0n`.
+- Requires the token engine (v2 oracle config with trust base + gateway); otherwise returns
+  `{ success: false, error }` — this method returns an error result instead of throwing.
+- On success the minted token is stored as a `'confirmed'` wallet token; `tokenId` is the
+  genesis-stable 64-char hex id.
 
 ```typescript
-interface UnconfirmedResolutionResult {
-  resolved: number;       // Tokens fully confirmed
-  stillPending: number;   // Tokens still waiting for proofs
-  failed: number;         // Tokens that exceeded retry limit
-  details: Array<{
-    tokenId: string;
-    stage: string;        // Current V5FinalizationStage
-    status: 'resolved' | 'pending' | 'failed';
-  }>;
+const result = await sphere.payments.mintFungibleToken(coinIdHex, 1_000_000n);
+if (result.success) {
+  console.log('Minted token:', result.tokenId, result.token.amount);
+} else {
+  console.error('Mint failed:', result.error);
 }
-
-type V5FinalizationStage = 'RECEIVED' | 'MINT_SUBMITTED' | 'MINT_PROVEN' | 'TRANSFER_SUBMITTED' | 'FINALIZED';
 ```
 
 ---
 
 ### Methods: Balance & Token Queries
 
-#### `getBalance(coinId?: string): TokenBalance[]`
+#### `getBalance(coinId?: string): Asset[]`
 
-Get token balances grouped by coin type. **Synchronous** (no await needed).
+Get token balances grouped by coin type. **Synchronous** (no await needed) — returns the same
+`Asset` shape as `getAssets()` but with all price fields `null` (use `getAssets()` for prices).
 
-Skips tokens with status `'spent'`, `'invalid'`, or `'transferring'`. Fires a non-blocking `resolveUnconfirmed()` call as a side effect.
-
-```typescript
-interface TokenBalance {
-  readonly coinId: string;
-  readonly symbol: string;
-  readonly name: string;
-  readonly totalAmount: string;          // confirmedAmount + unconfirmedAmount
-  readonly confirmedAmount: string;      // Tokens with inclusion proofs
-  readonly unconfirmedAmount: string;    // Tokens pending proof (status: 'submitted')
-  readonly tokenCount: number;           // Total token count
-  readonly confirmedTokenCount: number;
-  readonly unconfirmedTokenCount: number;
-  readonly decimals: number;
-}
-```
+Skips tokens with status `'spent'` or `'invalid'`. Tokens with status `'transferring'` remain
+visible (counted in `unconfirmedAmount` and `transferringTokenCount`).
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -565,7 +507,7 @@ Get all in-progress (pending) outgoing transfers.
 
 ### Methods: Token CRUD
 
-#### `addToken(token: Token, skipHistory?: boolean): Promise<boolean>`
+#### `addToken(token: Token): Promise<boolean>`
 
 Add a token to the wallet.
 
@@ -573,26 +515,20 @@ Add a token to the wallet.
 - **Duplicate check**: Rejected if same composite key already exists.
 - **State replacement**: If same `tokenId` with different `stateHash`, archives old state and adds new.
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `token` | `Token` | — | Token to add |
-| `skipHistory` | `boolean` | `false` | Skip creating a RECEIVED history entry |
-
 Returns `true` if added, `false` if rejected.
 
 #### `updateToken(token: Token): Promise<void>`
 
 Update an existing token. Matches by genesis tokenId or `token.id`. Falls back to `addToken()` if not found.
 
-#### `removeToken(tokenId: string, recipientNametag?: string, skipHistory?: boolean): Promise<void>`
+#### `removeToken(tokenId: string, excludeReservationId?: string): Promise<void>`
 
-Remove a token. Archives it first, creates a tombstone `(tokenId, stateHash)`, and optionally adds a SENT history entry.
+Remove a token. Archives it first and creates a tombstone `(tokenId, stateHash)`.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `tokenId` | `string` | — | Local UUID of the token |
-| `recipientNametag` | `string?` | — | Recipient nametag for history |
-| `skipHistory` | `boolean` | `false` | Skip creating a SENT history entry |
+| `excludeReservationId` | `string?` | — | Reservation to exclude when notifying the spend queue (internal send-path use) |
 
 ---
 
@@ -674,68 +610,57 @@ Keep at most `maxCount` forked tokens (default: 50).
 
 #### `getHistory(): TransactionHistoryEntry[]`
 
-Get transaction history sorted newest-first.
+Get transaction history sorted newest-first. `TransactionHistoryEntry` is an alias of the
+shared `HistoryRecord` storage type:
 
 ```typescript
 interface TransactionHistoryEntry {
-  id: string;
+  dedupKey: string;               // Composite dedup key (primary key)
+  id: string;                     // UUID for public API consumption
   type: 'SENT' | 'RECEIVED' | 'SPLIT' | 'MINT';
   amount: string;
   coinId: string;
   symbol: string;
   timestamp: number;
-  recipientNametag?: string;
-  senderPubkey?: string;
   transferId?: string;            // Links to TransferResult.id (for SENT entries)
+  tokenId?: string;               // Genesis tokenId this entry relates to
+  // Sender info (for RECEIVED)
+  senderPubkey?: string;
+  senderAddress?: string;
+  senderNametag?: string;
+  // Recipient info (for SENT)
+  recipientPubkey?: string;
+  recipientAddress?: string;
+  recipientNametag?: string;
+  memo?: string;                  // Optional memo attached to the transfer
+  tokenIds?: Array<{ id: string; amount: string; source: 'split' | 'direct' }>;
 }
 ```
 
-#### `addToHistory(entry: Omit<TransactionHistoryEntry, 'id'>): Promise<void>`
+#### `addToHistory(entry: Omit<TransactionHistoryEntry, 'id' | 'dedupKey'>): Promise<void>`
 
-Append a history entry (UUID auto-generated). Persisted immediately.
+Append a history entry (UUID and dedup key auto-generated). Persisted immediately.
 
 ---
 
-### Methods: Nametag Management
+### Methods: Nametag Data (Unicity ID)
 
-#### `mintNametag(nametag: string): Promise<MintNametagResult>`
-
-Mint a nametag token on-chain. Required for receiving tokens via PROXY addresses.
-
-```typescript
-interface MintNametagResult {
-  success: boolean;
-  token?: Token;
-  nametagData?: NametagData;
-  readonly id: string;                       // Local transfer UUID
-  status: TransferStatus;                    // Current status
-  readonly tokens: Token[];                  // Tokens involved
-  readonly tokenTransfers: TokenTransferDetail[];  // Per-token transfer details
-  error?: string;                            // Error message if failed
-}
-
-interface TokenTransferDetail {
-  readonly sourceTokenId: string;   // Source token ID consumed
-  readonly method: 'direct' | 'split';  // Transfer method
-  readonly requestIdHex?: string;   // Aggregator commitment request ID (direct)
-  readonly splitGroupId?: string;   // Split group ID (split)
-  readonly nostrEventId?: string;   // Nostr event ID (split)
-}
-
-type TransferStatus = 'pending' | 'submitted' | 'confirmed' | 'delivered' | 'completed' | 'failed';
-```
-
-#### `isNametagAvailable(nametag: string): Promise<boolean>`
-
-Check if a nametag is available for minting.
+Nametag **registration** lives on the `Sphere` instance (`sphere.registerNametag()`,
+`sphere.isNametagAvailable()`) — see the [Unicity ID (Nametag) Registration](#unicity-id-nametag-registration)
+section. `PaymentsModule` only stores/loads the per-address `NametagData` records (including the
+self-issued v2 UnicityIdToken claim):
 
 #### `setNametag(nametag: NametagData): Promise<void>`
 
-Set nametag data (persists to storage and file).
+Set nametag data (persists to storage and token storage).
 
 #### `getNametag(): NametagData | null`
 
-Get current nametag data.
+Get the current (first) nametag data record.
+
+#### `getNametags(): NametagData[]`
+
+Get all nametag data records for the active address.
 
 #### `hasNametag(): boolean`
 
@@ -760,7 +685,10 @@ console.log(`Sync: +${result.added} -${result.removed}`);
 
 #### `validate(): Promise<{ valid: Token[]; invalid: Token[] }>`
 
-Validate tokens against the aggregator (checks state proofs).
+Validate all tokens. v2 blob tokens are verified via the token engine (`engine.verify` +
+on-chain `engine.isSpent`); legacy v1 TXF tokens fall back to the oracle's best-effort
+`validateToken` RPC. Tokens that fail are marked `'invalid'`; transient engine/network failures
+skip the token instead of invalidating funds.
 
 ```typescript
 const { valid, invalid } = await sphere.payments.validate();
@@ -776,7 +704,11 @@ Get transfers that are still in progress.
 
 #### `load(): Promise<void>`
 
-Load all token data from storage providers. Restores pending V5 tokens and triggers `resolveUnconfirmed()`.
+Load all token data from storage providers. Also performs v2 recovery work:
+
+- terminalizes orphaned pending-V5 tokens (from the removed v1 instant-split receiver) to `'invalid'` (data kept for audit);
+- reconciles tokens stuck in `'transferring'` after a crash against the network (`spent` on-chain → terminal `'spent'`, unspent → back to `'confirmed'`);
+- replays finished-but-undelivered transfer blobs from the `PENDING_V2_DELIVERIES` journal (fire-and-forget; failures stay journaled for the next load).
 
 #### `destroy(): void`
 
@@ -1304,18 +1236,26 @@ type SphereEventType =
   | 'payment_request:paid'
   | 'payment_request:response'
   | 'message:dm'
+  | 'message:read'
+  | 'message:typing'
+  | 'composing:started'
   | 'message:broadcast'
   | 'sync:started'
   | 'sync:completed'
   | 'sync:provider'
   | 'sync:error'
+  | 'sync:remote-update'
   | 'connection:changed'
   | 'nametag:registered'
   | 'nametag:recovered'
   | 'identity:changed'
   | 'address:activated'
   | 'address:hidden'
-  | 'address:unhidden';
+  | 'address:unhidden'
+  | 'communications:ready'
+  | 'history:updated';
+  // ...plus group chat ('groupchat:*'), invoice ('invoice:*'), and swap ('swap:*')
+  // events — see the GroupChatModule, AccountingModule, and SwapModule sections.
 ```
 
 ### SphereEventMap
@@ -1331,12 +1271,15 @@ interface SphereEventMap {
   'payment_request:paid': IncomingPaymentRequest;
   'payment_request:response': PaymentRequestResponse;
   'message:dm': DirectMessage;
+  'message:read': { messageIds: string[]; peerPubkey: string };
+  'message:typing': { senderPubkey: string; senderNametag?: string; timestamp: number };
   'message:broadcast': BroadcastMessage;
   'sync:started': { source: string };
   'sync:completed': { source: string; count: number };
   'sync:provider': { providerId: string; success: boolean; added?: number; removed?: number; error?: string };
   'sync:error': { source: string; error: string };
-  'connection:changed': { provider: string; connected: boolean };
+  'sync:remote-update': { providerId: string; name: string; sequence: number; cid: string; added: number; removed: number };
+  'connection:changed': { provider: string; connected: boolean; status?: ProviderStatus; enabled?: boolean; error?: string };
   'nametag:registered': { nametag: string; addressIndex: number };
   'nametag:recovered': { nametag: string };
   'identity:changed': {
@@ -1349,50 +1292,28 @@ interface SphereEventMap {
   'address:activated': { address: TrackedAddress };
   'address:hidden': { index: number; addressId: string };
   'address:unhidden': { index: number; addressId: string };
+  'communications:ready': { conversationCount: number };
+  'history:updated': TransactionHistoryEntry;
+  // ... plus 'groupchat:*', 'invoice:*', and 'swap:*' payloads (see module sections)
 }
 ```
 
-### InstantSplitBundleV5
+### V2_TRANSFER Wire Payload
 
-The production bundle format for instant split transfers (~2.3s sender latency).
+The only supported token-transfer payload post v1-cutover — a **finished** v2 token blob:
 
 ```typescript
-interface InstantSplitBundleV5 {
-  version: '5.0';
-  type: 'INSTANT_SPLIT';
-  burnTransaction: string;         // Proven burn transaction JSON
-  recipientMintData: string;       // MintTransactionData JSON
-  transferCommitment: string;      // Pre-created TransferCommitment JSON
-  amount: string;                  // Payment amount
-  coinId: string;                  // Coin ID hex
-  tokenTypeHex: string;
-  splitGroupId: string;            // Recovery correlation ID
-  senderPubkey: string;
-  recipientSaltHex: string;
-  transferSaltHex: string;
-  mintedTokenStateJson: string;    // Intermediate minted token state
-  finalRecipientStateJson: string; // Final recipient state after transfer
-  recipientAddressJson: string;    // PROXY or DIRECT address
-  nametagTokenJson?: string;       // Nametag token for PROXY transfers
+{
+  type: 'V2_TRANSFER';
+  version: '2.0';
+  tokenBlob: string;   // hex of CBOR(TokenBlob) — the finished recipient token
+  memo?: string;       // optional transport-level memo
 }
 ```
 
-### PendingV5Finalization
-
-Metadata stored in unconfirmed token's `sdkData` to track finalization progress.
-
-```typescript
-interface PendingV5Finalization {
-  type: 'v5_bundle';
-  stage: V5FinalizationStage;
-  bundleJson: string;
-  senderPubkey: string;
-  savedAt: number;
-  lastAttemptAt?: number;
-  attemptCount: number;
-  mintProofJson?: string;
-}
-```
+Incoming v1-era payloads (V5/V6 instant-split bundles, NOSTR-FIRST, `{sourceToken, transferTx}`,
+plain token JSON) are dropped with an explicit error log — peers must run a >=0.8 wallet to send
+to this wallet.
 
 ### PaymentsModuleDependencies
 
@@ -1400,144 +1321,118 @@ interface PendingV5Finalization {
 interface PaymentsModuleDependencies {
   identity: FullIdentity;
   storage: StorageProvider;
+  /** @deprecated Use tokenStorageProviders instead */
+  tokenStorage?: TokenStorageProvider;
+  /** Multiple token storage providers (e.g., IPFS, MongoDB, file) */
   tokenStorageProviders?: Map<string, TokenStorageProvider>;
   transport: TransportProvider;
   oracle: OracleProvider;
-  emitEvent: (type: SphereEventType, data: SphereEventMap[type]) => void;
+  /** v2 token engine — required for send/mint/validate of v2 tokens (wired by Sphere) */
+  tokenEngine?: ITokenEngine;
+  emitEvent: <T extends SphereEventType>(type: T, data: SphereEventMap[T]) => void;
+  /** Chain code for BIP32 HD derivation (for L1 multi-address support) */
   chainCode?: string;
+  /** Additional L1 addresses to watch */
   l1Addresses?: string[];
+  /** Price provider (optional — enables fiat value display) */
+  price?: PriceProvider;
+  /** Set of disabled provider IDs — skipped during sync/save */
+  disabledProviderIds?: ReadonlySet<string>;
 }
 ```
 
 ---
 
-## Nametag Minting
+## Unicity ID (Nametag) Registration
 
-Mint nametag tokens on-chain for PROXY address support (required for receiving tokens via @nametag).
+Nametags (Unicity IDs, `@alice`) are **Nostr identity bindings** (name ↔ chainPubkey) — there is
+no PROXY address scheme and receive is always locked to the recipient's chain pubkey
+(`SignaturePredicate`). Registration publishes the binding; global uniqueness is first-seen-wins
+on the binding.
 
 ### Sphere Methods
 
 ```typescript
-// Mint nametag token on-chain
-const result = await sphere.mintNametag('alice');
+// Register the nametag for the current active address.
+// Publishes the Nostr identity binding; throws SphereError('VALIDATION_ERROR')
+// when the name is invalid or already taken.
+await sphere.registerNametag('alice');
 
-if (result.success) {
-  console.log('Token minted:', result.nametagData?.name);
-} else {
-  console.error('Failed:', result.error);
-}
-
-// Check if nametag is available
+// Check if a nametag is available (no binding resolves for it)
 const available = await sphere.isNametagAvailable('alice');
 ```
 
-### MintNametagResult
+### On-chain Claim (best-effort)
+
+In addition to the Nostr binding, `registerNametag()` mints + stores a **self-issued v2
+`UnicityIdToken`** as an on-chain claim:
+
+- Stored via `payments.setNametag()` as `NametagData { format: 'v2-cbor', token: <hex CBOR> }`.
+- **Best-effort and idempotent** — a gateway outage or missing v2 oracle config never fails
+  registration; the mint is deterministic per (name, wallet key), so a later load re-mints the
+  identical token (lost-storage recovery). On networks without a v2 oracle config a warning is
+  logged on each load.
+- **Unused at runtime** — name resolution stays Nostr-binding-only; the token is kept for a
+  future issuer/verification model.
+
+The claim is also (re-)minted on wallet init/load and on address switch when a nametag exists
+but the v2 token is missing.
+
+### NametagData
 
 ```typescript
-interface MintNametagResult {
-  success: boolean;
-  token?: Token;           // The minted nametag token
-  nametagData?: NametagData;  // Nametag metadata
-  error?: string;          // Error message if failed
-}
-
 interface NametagData {
   name: string;            // Nametag without @ prefix
-  token: object;           // Token JSON (genesis + state)
+  token: object | string;  // 'v2-cbor': hex-encoded UnicityIdToken CBOR (string)
+                           // legacy 'txf': v1 nametag token JSON (object, inert)
   timestamp: number;       // Mint timestamp
-  format?: string;         // 'txf'
-  version?: string;        // '2.0'
+  format: string;          // 'v2-cbor' (current) | 'txf' (legacy)
+  version: string;         // '2.0'
 }
 ```
 
-### NametagMinter Class
+### Standalone Minter (token-engine)
 
-For advanced usage, create a NametagMinter directly:
+For advanced usage, mint the self-issued UnicityIdToken directly. `createUnicityIdMinter`,
+`IUnicityIdMinter`, and `UnicityIdMintResult` are exported from the SDK's `token-engine` module
+(`token-engine/index.ts`; not currently re-exported from the package root):
 
 ```typescript
-import { NametagMinter, createNametagMinter } from '@unicitylabs/sphere-sdk';
+import { createUnicityIdMinter } from './token-engine';          // sphere-sdk token-engine module
+import type { IUnicityIdMinter, UnicityIdMintResult } from './token-engine';
 
-const minter = createNametagMinter({
-  stateTransitionClient: client,
-  trustBase: trustBase,
-  signingService: signingService,
-  debug: false,
-  skipVerification: false,
+// Built from the same config shape the token engine uses (EngineConfig)
+const minter: IUnicityIdMinter = createUnicityIdMinter({
+  aggregatorUrl: 'https://gateway.testnet2.unicity.network',
+  apiKey: 'sk_...',                  // optional gateway API key
+  privateKey: privateKeyBytes,       // Uint8Array (32-byte secp256k1 scalar)
+  trustBaseJson,                     // required — throws INVALID_CONFIG when missing
 });
 
-// Mint nametag
-const result = await minter.mintNametag('alice', ownerAddress);
-
-// Check availability
-const available = await minter.isNametagAvailable('alice');
+const result: UnicityIdMintResult = await minter.mintUnicityIdToken('alice');
+console.log(result.tokenCborHex);  // UnicityIdToken CBOR, hex-encoded (storable form)
+console.log(result.tokenId);       // 64-char hex token id, stable across re-mints
 ```
 
-### NametagMinterConfig
-
 ```typescript
-interface NametagMinterConfig {
-  stateTransitionClient: StateTransitionClient;  // Required
-  trustBase: TrustBase;                          // Required
-  signingService: SigningService;                // Required
-  debug?: boolean;                               // Default: false
-  skipVerification?: boolean;                    // Default: false
+// Real signatures (token-engine/unicity-id.ts)
+interface UnicityIdMintResult {
+  readonly tokenCborHex: string;  // UnicityIdToken CBOR, hex — UnicityIdToken.fromCBOR round-trips it
+  readonly tokenId: string;       // 64-char hex, derived from the name (stable across re-mints)
 }
-```
 
-### Auto-mint on Registration
-
-The SDK automatically mints the nametag token on-chain whenever `registerNametag()` is called:
-
-```typescript
-// Option 1: During init (new wallet)
-const { sphere } = await Sphere.init({
-  ...providers,
-  mnemonic: 'your words...',
-  nametag: 'alice',  // Registers on Nostr AND mints token on-chain
-});
-
-// Option 2: Manual registration (e.g., for new derived address)
-await sphere.switchToAddress(1);
-await sphere.registerNametag('bob');  // Also mints token automatically
-
-// Option 3: On wallet load (auto-mint if token missing)
-const { sphere } = await Sphere.init({ ...providers });
-// If nametag exists but token is missing, it will be minted automatically
-```
-
-**When minting happens:**
-- `Sphere.create()` with nametag → mints via `registerNametag()`
-- `Sphere.load()` → mints if nametag exists but token is missing
-- `Sphere.import()` with nametag → mints via `registerNametag()`
-- `registerNametag()` → always mints if token not present
-
-Nametag token is required for receiving tokens via PROXY addresses (`finalizeTransaction` requires nametag token for PROXY scheme).
-
----
-
-## Token Split Calculator
-
-Utility for calculating optimal token splits for partial transfers.
-
-```typescript
-import { createTokenSplitCalculator } from '@unicitylabs/sphere-sdk';
-
-const calculator = createTokenSplitCalculator();
-
-const plan = await calculator.calculateOptimalSplit(
-  availableTokens,  // Token[]
-  targetAmount,     // bigint
-  coinIdHex         // string
-);
-
-if (plan) {
-  console.log('Requires split:', plan.requiresSplit);
-  console.log('Tokens to transfer:', plan.tokensToTransferDirectly);
-  console.log('Token to split:', plan.tokenToSplit);
-  console.log('Split amount:', plan.splitAmount);
-  console.log('Change amount:', plan.changeAmount);
+interface IUnicityIdMinter {
+  mintUnicityIdToken(name: string, options?: EngineOpOptions): Promise<UnicityIdMintResult>;
 }
+
+function createUnicityIdMinter(config: EngineConfig): IUnicityIdMinter;
 ```
+
+Trust model: **self-issued** — the wallet's own key is the issuer lock script, the recipient,
+and the target predicate. `tokenId = SHA256(CBOR["NAMETAG_", null, name])` with a pinned token
+type, so a re-mint re-certifies the same state and yields the identical token. On-chain
+uniqueness is per-issuer only; global name uniqueness remains the Nostr binding's job. Mint
+failures throw `SphereError('AGGREGATOR_ERROR')`.
 
 ---
 
@@ -1553,24 +1448,80 @@ createNodeIpfsStorageProvider(config?: IpfsStorageConfig, storage?: StorageProvi
 createNostrTransportProvider(config?: NostrTransportProviderConfig): NostrTransportProvider
 // NostrTransportProviderConfig accepts optional `storage` for event timestamp persistence
 
-// Oracle
-createUnicityAggregatorProvider(config?: UnicityAggregatorProviderConfig): UnicityAggregatorProvider
+// Oracle (network-config provider for the v2 token engine; see below)
+createUnicityAggregatorProvider(config: UnicityAggregatorProviderConfig): UnicityAggregatorProvider
 
 // Payments
 createPaymentsModule(config?: PaymentsModuleConfig): PaymentsModule
-// PaymentsModuleConfig includes optional l1?: L1PaymentsModuleConfig
+// PaymentsModuleConfig includes optional l1?: L1PaymentsModuleConfig | null
 createL1PaymentsModule(config?: L1PaymentsModuleConfig): L1PaymentsModule
 
 // Communications
 createCommunicationsModule(config?: CommunicationsModuleConfig): CommunicationsModule
 
-// Token Split
-createTokenSplitCalculator(): TokenSplitCalculator
-createTokenSplitExecutor(client, trustBase): TokenSplitExecutor
-
-// Validation
-createTokenValidator(options?: TokenValidatorOptions): TokenValidator
+// Validation (engine-based)
+createTokenValidator(engine: ITokenEngine): TokenValidator
 ```
+
+---
+
+## OracleProvider (Network-Config Provider)
+
+Post v1-cutover the oracle is a **thin network-config provider** for the v2 token engine: it
+loads the root trust base (JSON) and exposes the gateway URL + API key. The engine
+(`token-engine/`) builds its own SDK clients from these — no state-transition SDK objects cross
+this boundary. The v1 client surface (`submitCommitment`, `getProof`, `waitForProof`, `isSpent`,
+`getTokenState`, `getCurrentRound`, `mint`, `getStateTransitionClient`, `getAggregatorClient`,
+`waitForProofSdk`, …) is gone.
+
+```typescript
+interface OracleProvider extends BaseProvider {
+  /**
+   * Initialize the provider. Loads the trust base JSON via the configured
+   * platform loader when none is passed explicitly.
+   */
+  initialize(trustBaseJson?: unknown): Promise<void>;
+
+  /**
+   * Validate a LEGACY v1 TXF token against the aggregator (best-effort JSON-RPC,
+   * display path only). v2 blob tokens never reach this — they are verified via
+   * the token engine.
+   */
+  validateToken(tokenData: unknown): Promise<ValidationResult>;
+
+  // ── v2 token-engine config surface (REQUIRED — custom implementations must provide them) ──
+  /** Raw trust-base JSON (the engine parses it; the networkId comes from it). */
+  getTrustBaseJson(): unknown | null;
+  /** Gateway (aggregator) base URL. */
+  getAggregatorUrl(): string;
+  /** Gateway API key, when the gateway requires one (e.g. testnet2). */
+  getApiKey(): string | undefined;
+}
+
+interface ValidationResult {
+  valid: boolean;
+  spent: boolean;
+  error?: string;
+  stateHash?: string;
+}
+```
+
+### UnicityAggregatorProviderConfig
+
+```typescript
+interface UnicityAggregatorProviderConfig {
+  url: string;                       // Aggregator (gateway) URL — required
+  apiKey?: string;                   // API key for gateway authentication
+  timeout?: number;                  // Request timeout (ms)
+  skipVerification?: boolean;        // Skip trust base loading (dev only)
+  debug?: boolean;                   // Enable debug logging
+  trustBaseLoader?: TrustBaseLoader; // Platform-specific trust base loader
+}
+```
+
+The browser factory (`impl/browser`) additionally accepts `trustBaseUrl` / `network` and wires a
+fetch-based trust base loader; the Node.js factory uses a file-based loader (`trustBasePath`) —
+both fall back to the embedded per-network trust base.
 
 ---
 
@@ -1779,44 +1730,48 @@ countCommittedTransactions(token: Token): number
 
 ### TokenValidator
 
+Engine-based (v2): a thin, platform-independent wrapper over `ITokenEngine` — structural
+validity via `engine.verify`, spent-status via `engine.isSpent` (with a per-state TTL cache).
+Operates on `SphereToken` (the engine's token type); the v1 TXF / aggregator-client path is
+gone. This is a standalone public utility and is NOT on the live wallet path (payments validate
+via the engine/oracle internally).
+
 ```typescript
-const validator = createTokenValidator(options?: {
-  aggregatorClient?: AggregatorClient;
-  trustBase?: unknown;
-  skipVerification?: boolean;
-});
+import { createTokenValidator } from '@unicitylabs/sphere-sdk';
+
+const validator = createTokenValidator(engine);  // engine: ITokenEngine
 ```
 
 ### Methods
 
 ```typescript
-// Validate all tokens
+// Validate all tokens (parallel, with a batch limit)
 validateAllTokens(
-  tokens: Token[],
+  tokens: SphereToken[],
   options?: { batchSize?: number; onProgress?: (completed: number, total: number) => void }
 ): Promise<ValidationResult>
 
 interface ValidationResult {
-  validTokens: Token[];
+  validTokens: SphereToken[];
   issues: ValidationIssue[];
 }
 
-// Validate single token
-validateToken(token: Token): Promise<TokenValidationResult>
+// Validate a single token's structural integrity against the trust base
+validateToken(token: SphereToken): Promise<TokenValidationResult>
 
 interface TokenValidationResult {
   isValid: boolean;
   reason?: string;
-  action?: 'ACCEPT' | 'RETRY_LATER' | 'DISCARD_FORK';
+  action?: 'ACCEPT' | 'RETRY_LATER' | 'DISCARD_FORK';  // declared on the type; not set by the engine-based validator
 }
 
-// Check if token state is spent
-isTokenStateSpent(tokenId: string, stateHash: string, publicKey: string): Promise<boolean>
+// Whether the token's current state has been spent on the network
+// (cached: SPENT permanently, UNSPENT for 5 minutes; engine errors → treated as unspent)
+isSpent(token: SphereToken): Promise<boolean>
 
-// Check spent tokens in batch
+// Check which tokens are spent, returning them by per-state id
 checkSpentTokens(
-  tokens: Token[],
-  publicKey: string,
+  tokens: SphereToken[],
   options?: { batchSize?: number; onProgress?: (completed: number, total: number) => void }
 ): Promise<SpentTokenResult>
 
@@ -1826,36 +1781,11 @@ interface SpentTokenResult {
 }
 
 interface SpentTokenInfo {
-  tokenId: string;
-  localId: string;
-  stateHash: string;
+  stateId: string;  // SHA-256 of the token's CBOR — unique per state
 }
-
-// Set/update dependencies
-setAggregatorClient(client: AggregatorClient): void
-setTrustBase(trustBase: unknown): void
 
 // Cache management
 clearSpentStateCache(): void
-```
-
-### AggregatorClient Interface
-
-```typescript
-interface AggregatorClient {
-  getInclusionProof(requestId: unknown): Promise<{
-    inclusionProof?: {
-      authenticator: unknown | null;
-      merkleTreePath: {
-        verify(key: bigint): Promise<{
-          isPathValid: boolean;
-          isPathIncluded: boolean;
-        }>;
-      };
-    };
-  }>;
-  isTokenStateSpent?(trustBase: unknown, token: unknown, pubKey: Buffer): Promise<boolean>;
-}
 ```
 
 ---
@@ -2322,9 +2252,9 @@ const accounting = new AccountingModule({ debug: false });
 accounting.initialize({
   payments,        // PaymentsModule
   tokenStorage,    // TokenStorageProvider
-  oracle,          // OracleProvider
-  trustBase,       // aggregator trust base (from oracle config)
+  oracle,          // OracleProvider (network/trust-base config source)
   identity,        // FullIdentity
+  tokenEngine,     // ITokenEngine (v2) — required for createInvoice/importInvoice
   getActiveAddresses: () => sphere.getActiveAddresses(),
   emitEvent: (type, data) => sphere.emit(type, data),
   on: (type, handler) => sphere.on(type, handler),
@@ -2356,13 +2286,13 @@ const { invoiceId, token, terms } = await accounting.createInvoice({
   dueDate: Date.now() + 7 * 24 * 60 * 60 * 1000,  // 7 days
 });
 
-// Export the raw TXF token to share with the buyer
-const txfToken = await sphere.payments.getTokens().find(t => t.id === invoiceId);
+// `token` is the transmittable v2 invoice blob (hex string) — share it with
+// the buyer over any channel (DM, QR, file).
 
 // --- Payer (buyer) ---
 
-// Import the invoice token received out-of-band
-const terms = await accounting.importInvoice(txfToken);
+// Import the invoice blob received out-of-band
+const terms = await accounting.importInvoice(token);
 
 // Pay the first target's first asset
 const result = await accounting.payInvoice(invoiceId!, {
@@ -2413,7 +2343,9 @@ Unsubscribe from all events, drain in-flight operations, and mark the module as 
 
 #### `createInvoice(request: CreateInvoiceRequest): Promise<CreateInvoiceResult>`
 
-Mint a new invoice token on-chain via the Aggregator. The token IS the invoice: its genesis `tokenData` field contains the serialized `InvoiceTerms`.
+Mint a new invoice token on-chain as a v2 **data token** (`engine.mintDataToken`). The token IS
+the invoice: its genesis token data contains the serialized `InvoiceTerms`. The v2 token engine
+is **mandatory** — without it (no v2 oracle config) the call throws `INVOICE_ORACLE_REQUIRED`.
 
 ```typescript
 interface CreateInvoiceRequest {
@@ -2452,13 +2384,15 @@ interface InvoiceRequestedAsset {
 interface CreateInvoiceResult {
   readonly success: boolean;
   readonly invoiceId?: string;     // Invoice token ID (64-char hex)
-  readonly token?: TxfToken;       // Raw TXF token
+  readonly token?: string;         // Transmittable v2 invoice blob, hex-encoded —
+                                   // pass it to importInvoice on the receiving side
   readonly terms?: InvoiceTerms;   // Parsed invoice terms
   readonly error?: string;
 }
 ```
 
 **Throws:**
+- `INVOICE_ORACLE_REQUIRED` — no token engine (v2 oracle config with trust base + gateway missing).
 - `INVOICE_NO_TARGETS` — targets array is empty.
 - `INVOICE_TOO_MANY_TARGETS` — more than 100 targets.
 - `INVOICE_INVALID_ADDRESS` — a target address is not a valid `DIRECT://` address.
@@ -2476,15 +2410,18 @@ interface CreateInvoiceResult {
 - `INVOICE_MINT_FAILED` — aggregator submission failed after retries.
 - `NOT_INITIALIZED` / `MODULE_DESTROYED`
 
-#### `importInvoice(token: TxfToken): Promise<InvoiceTerms>`
+#### `importInvoice(token: string): Promise<InvoiceTerms>`
 
-Import an invoice token received out-of-band (e.g., shared by a creator via IPFS, DM, or QR code). Validates token type and parses `InvoiceTerms`. Persists the token in `TokenStorage` and adds it to the in-memory cache. Idempotent for the same token but fails if already exists with a different state.
+Import an invoice token received out-of-band (e.g., shared by a creator via IPFS, DM, or QR code). `token` is the **v2 invoice blob as a hex string** (the `CreateInvoiceResult.token` value). The token is verified via the engine, its `InvoiceTerms` parsed, persisted in `TokenStorage`, and added to the in-memory cache.
+
+Legacy v1 TXF invoice tokens (objects / TXF JSON) are **rejected** with `INVOICE_INVALID_DATA` — their proof verification required the removed v1 engine.
 
 **Returns:** Parsed `InvoiceTerms`.
 
 **Throws:**
-- `INVOICE_WRONG_TOKEN_TYPE` — token's `tokenType` is not the invoice type constant.
-- `INVOICE_INVALID_DATA` — `tokenData` field is missing or cannot be parsed as `InvoiceTerms`.
+- `INVOICE_ORACLE_REQUIRED` — no token engine (v2 oracle config missing).
+- `INVOICE_INVALID_PROOF` — inclusion proof is invalid.
+- `INVOICE_INVALID_DATA` — token data cannot be parsed as `InvoiceTerms`, or a legacy v1 TXF token was supplied.
 - `INVOICE_ALREADY_EXISTS` — an invoice with this token ID is already stored locally.
 - `NOT_INITIALIZED` / `MODULE_DESTROYED`
 
@@ -2864,8 +2801,8 @@ All invoice events are emitted via `sphere.on(eventType, handler)`.
 | `INVOICE_INVALID_CONTACT` | contact.address or contact.url is malformed |
 | `INVOICE_MINT_FAILED` | Aggregator token mint failed after retries |
 | `INVOICE_INVALID_PROOF` | Aggregator inclusion proof is invalid |
-| `INVOICE_WRONG_TOKEN_TYPE` | Token type does not match the invoice type constant |
-| `INVOICE_INVALID_DATA` | `tokenData` is missing, not JSON, or not a valid `InvoiceTerms` object |
+| `INVOICE_WRONG_TOKEN_TYPE` | Token type does not match the invoice type constant (declared but no longer thrown post v1-cutover) |
+| `INVOICE_INVALID_DATA` | Token data is missing / not a valid `InvoiceTerms` object, or a legacy v1 TXF token was supplied to `importInvoice` |
 | `INVOICE_ALREADY_EXISTS` | Invoice with this token ID already exists locally |
 | `INVOICE_NOT_FOUND` | Invoice token not found in local cache |
 | `INVOICE_NOT_TARGET` | Calling wallet is not a target of this invoice |
@@ -2874,7 +2811,7 @@ All invoice events are emitted via `sphere.on(eventType, handler)`.
 | `INVOICE_TERMINATED` | Invoice is in a terminal state (CLOSED or CANCELLED) |
 | `INVOICE_NOT_TERMINATED` | Invoice is not yet in a terminal state |
 | `INVOICE_NOT_CANCELLED` | Invoice is not in CANCELLED state (sendCancellationNotices only) |
-| `INVOICE_ORACLE_REQUIRED` | Oracle provider is required but not configured |
+| `INVOICE_ORACLE_REQUIRED` | Token engine unavailable — invoices require the v2 oracle config (trust base + gateway URL) |
 | `INVOICE_INVALID_TARGET` | `targetIndex` is out of range |
 | `INVOICE_INVALID_ASSET_INDEX` | `assetIndex` is out of range |
 | `INVOICE_RETURN_EXCEEDS_BALANCE` | Return amount exceeds the payer's net balance |
@@ -3169,6 +3106,17 @@ try {
 | `TIMEOUT` | Operation timed out |
 | `DECRYPTION_ERROR` | Wallet decryption failed |
 | `MODULE_NOT_AVAILABLE` | Requested module not registered |
+| `SIGNING_ERROR` | Message signing/verification failed |
+| `SEND_QUEUE_TIMEOUT` | Queued send timed out waiting for change tokens |
+| `SEND_INSUFFICIENT_BALANCE` | Not enough spendable tokens for the requested send |
+| `SEND_RESERVATION_CANCELLED` | Token reservation was cancelled while queued |
+| `SEND_QUEUE_FULL` | Send queue capacity exceeded |
+| `MODULE_DESTROYED` | Module was destroyed — no further calls accepted |
+| `REENTRANT_GATE` | Re-entrant call into a serialized (gated) operation |
+| `RATE_LIMITED` | Operation called within its cooldown window |
+| `COMMUNICATIONS_UNAVAILABLE` | CommunicationsModule not provided (receipt/notice DMs) |
+
+Invoice (`INVOICE_*`) and swap (`SWAP_*`) codes are listed in their module sections.
 
 ### Logger
 

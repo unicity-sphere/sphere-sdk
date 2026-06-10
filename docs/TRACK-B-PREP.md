@@ -1,4 +1,5 @@
 # Track B — Prep (state-transition v2 migration)
+> **Status: HISTORICAL — the v1→v2 cutover completed 2026-06-10 (PRs #479/#480/#481). v1 is removed; see CHANGELOG.md.**
 
 > **Status: PREP ONLY. No implementation written yet.** Produced while Phase 0's
 > hard-stop is interpreted conservatively (no code changes). Track A has already

@@ -14,7 +14,9 @@ npm install @unicitylabs/sphere-sdk
 
 **That's it!** No additional dependencies for basic usage. Browser uses native WebSocket. IPFS sync is built-in — no extra packages needed.
 
-> **Note:** API key for aggregator is included by default. For custom deployments, configure via `oracle: { apiKey: 'your-key' }`.
+> **Note:** No API key is bundled with the SDK. The `testnet` gateway (testnet2, see below) requires one — inject it via `oracle: { apiKey: '...' }`. The testnet2 key is **not a secret** (see `.env.example`): `sk_ddc3cfcc001e4a28ac3fad7407f99590`. A mainnet key, by contrast, IS a secret — keep it in your deploy environment only.
+>
+> **Networks:** since the v1→v2 cutover, `network: 'testnet'` points at the **testnet2 v2 gateway** (`https://gateway.testnet2.unicity.network`; the network id comes from the trust base). `'testnet2'` is an alias of the same configuration. `mainnet`/`dev` still point at v1-era aggregators and cannot serve the v2 engine yet — wallet operations there fail with `AGGREGATOR_ERROR`.
 
 ## Framework Setup
 
@@ -25,10 +27,14 @@ import { Sphere } from '@unicitylabs/sphere-sdk';
 import { createBrowserProviders } from '@unicitylabs/sphere-sdk/impl/browser';
 
 async function initWallet() {
-  const providers = createBrowserProviders({ network: 'testnet' });
+  const providers = createBrowserProviders({
+    network: 'testnet',
+    oracle: { apiKey: 'sk_ddc3cfcc001e4a28ac3fad7407f99590' }, // public testnet2 key
+  });
 
   const { sphere, created, generatedMnemonic } = await Sphere.init({
     ...providers,
+    network: 'testnet', // required — Sphere.init throws without it
     autoGenerate: true,
   });
 
@@ -59,6 +65,7 @@ function useWallet() {
 
       const { sphere, created, generatedMnemonic } = await Sphere.init({
         ...providers,
+        network: 'testnet',
         autoGenerate: true,
       });
 
@@ -123,6 +130,7 @@ onMounted(async () => {
 
   const result = await Sphere.init({
     ...providers,
+    network: 'testnet',
     autoGenerate: true,
   });
 
@@ -169,6 +177,7 @@ async function initWallet() {
 
   return Sphere.init({
     ...providers,
+    network: 'testnet',
     autoGenerate: true,
   });
 }
@@ -202,7 +211,9 @@ Browser SDK uses two storage mechanisms automatically:
 
 ```typescript
 const providers = createBrowserProviders({
-  // Network: 'mainnet' | 'testnet' | 'dev'
+  // Network: 'mainnet' | 'testnet' | 'testnet2' | 'dev'
+  // ('testnet' IS testnet2 — the v2 gateway; mainnet/dev are still v1-era and
+  //  cannot serve the v2 engine yet)
   network: 'testnet',
 
   // Transport options
@@ -214,12 +225,14 @@ const providers = createBrowserProviders({
     debug: false,
   },
 
-  // Oracle options
+  // Oracle (v2 gateway) options
   oracle: {
-    aggregatorUrl: 'https://custom-aggregator.com/rpc',
-    trustBaseUrl: '/trustbase.json',  // Fetch from your server
-    apiKey: 'your-api-key',
+    url: 'https://gateway.testnet2.unicity.network',   // Replace default gateway URL
+    apiKey: 'sk_ddc3cfcc001e4a28ac3fad7407f99590',     // Gateway API key (public testnet2 key)
   },
+  // For a custom trust base URL, build the oracle directly with
+  // createUnicityAggregatorProvider({ url, apiKey, trustBaseUrl, network })
+  // from '@unicitylabs/sphere-sdk/impl/browser'.
 
   // L1 blockchain options
   l1: {
@@ -269,13 +282,33 @@ for (const asset of assets) {
   }
 }
 
+// Per-coin balances (synchronous, no price data)
+const balances = sphere.payments.getBalance();
+
 // Total portfolio value in USD (null if PriceProvider not configured)
-const totalUsd = await sphere.payments.getBalance();
+const totalUsd = await sphere.payments.getFiatBalance();
 document.getElementById('balance').textContent =
   totalUsd != null ? `$${totalUsd.toFixed(2)}` : 'N/A';
 
-// L1 (ALPHA) balance
-const l1Balance = await sphere.payments.l1.getBalance();
+// L1 (ALPHA) balance (payments.l1 is null when L1 is disabled via l1: null)
+const l1Balance = await sphere.payments.l1?.getBalance();
+```
+
+### Top Up (Testnet Self-Mint)
+
+There is no faucet — on testnet you top up by **self-minting** tokens via the v2 token engine:
+
+```typescript
+import { TokenRegistry } from '@unicitylabs/sphere-sdk';
+
+// mintFungibleToken takes the hex coin id, not the symbol
+const coinId = TokenRegistry.getInstance().getCoinIdBySymbol('UCT');
+const res = await sphere.payments.mintFungibleToken(coinId!, 100_000_000n);
+if (res.success) {
+  console.log('Minted token:', res.tokenId);
+} else {
+  console.error('Mint failed:', res.error);
+}
 ```
 
 ### Look Up Asset Metadata
@@ -339,41 +372,45 @@ const { transfers } = await sphere.payments.receive();
 console.log(`Received ${transfers.length} new transfers`);
 ```
 
+> The legacy `ReceiveOptions` (`finalize`, `timeout`, `pollInterval`) are deprecated **no-ops**: v2 transfers arrive as finished tokens and are stored confirmed immediately — there is no finalization phase.
+
 ### Register Nametag
 
-> **Note:** `registerNametag()` mints a token on-chain. This uses the Oracle (Aggregator) provider which is included by default with `createBrowserProviders()`.
+> **Note:** `registerNametag()` registers the name by publishing a Nostr identity binding (name ↔ chain pubkey, first-seen-wins). A self-issued v2 Unicity ID token is additionally minted and stored **best-effort** — registration never fails because of it. Runtime name resolution uses only the Nostr binding.
 
 ```typescript
 async function registerNametag(username: string) {
-  // This registers on Nostr AND mints token on-chain
+  // Publishes the Nostr binding; throws if the name is already taken
   await sphere.registerNametag(username);
   console.log('Registered:', sphere.identity?.nametag);
 }
 
-// Alternative: register during init (also mints token)
+// Alternative: register during init
 const { sphere } = await Sphere.init({
   ...providers,
+  network: 'testnet',
   autoGenerate: true,
-  nametag: 'alice',  // Mints token on-chain!
+  nametag: 'alice',
 });
 ```
 
 ### Listen for Events
 
 ```typescript
-// Incoming transfers
-sphere.on('transfer:incoming', (event) => {
-  showNotification(`Received ${event.data.amount} from ${event.data.sender}`);
+// Incoming transfers — handlers receive the event payload directly
+sphere.on('transfer:incoming', (transfer) => {
+  const from = transfer.senderNametag ?? transfer.senderPubkey;
+  showNotification(`Received ${transfer.tokens.length} token(s) from ${from}`);
 });
 
 // Direct messages
 sphere.communications.onDirectMessage((msg) => {
-  showNotification(`Message from ${msg.sender}: ${msg.content}`);
+  showNotification(`Message from ${msg.senderNametag ?? msg.senderPubkey}: ${msg.content}`);
 });
 
 // Connection status
-sphere.on('connection:changed', (event) => {
-  updateConnectionStatus(event.data.connected);
+sphere.on('connection:changed', (status) => {
+  updateConnectionStatus(status.connected);
 });
 ```
 
@@ -390,12 +427,13 @@ Enable the accounting module when initializing the wallet:
 ```typescript
 const { sphere } = await Sphere.init({
   ...providers,
+  network: 'testnet',
   autoGenerate: true,
   accounting: true,  // Enable with defaults
 });
 ```
 
-**Create an invoice** (mints a token on-chain via the aggregator):
+**Create an invoice** (mints an invoice data token via the v2 token engine):
 
 ```typescript
 const result = await sphere.accounting!.createInvoice({
@@ -449,16 +487,16 @@ for (const ref of invoices) {
 **Listen for invoice events:**
 
 ```typescript
-sphere.on('invoice:payment', (event) => {
-  console.log(`Payment received for invoice ${event.data.invoiceId}`);
+sphere.on('invoice:payment', (data) => {
+  console.log(`Payment received for invoice ${data.invoiceId}`);
 });
 
-sphere.on('invoice:covered', (event) => {
-  console.log(`Invoice ${event.data.invoiceId} fully covered!`);
+sphere.on('invoice:covered', (data) => {
+  console.log(`Invoice ${data.invoiceId} fully covered!`);
 });
 ```
 
-> **Note:** `createInvoice()` requires the Oracle (Aggregator) provider, which is included automatically by `createBrowserProviders()`.
+> **Note:** `createInvoice()` requires the Oracle provider (v2 gateway config), which is included automatically by `createBrowserProviders()`.
 
 ### Token Swaps
 
@@ -467,6 +505,7 @@ The swap module enables trustless two-party token exchanges via an escrow servic
 ```typescript
 const { sphere } = await Sphere.init({
   ...providers,
+  network: 'testnet',
   autoGenerate: true,
   accounting: true,  // Required (swap uses invoices internally)
   swap: true,        // Enable swap module
@@ -547,12 +586,14 @@ console.log('Progress:', status.progress, 'Escrow state:', status.escrowState);
 // From mnemonic (recovery, plaintext storage — default)
 const { sphere } = await Sphere.init({
   ...providers,
+  network: 'testnet',
   mnemonic: 'word1 word2 word3 ... word12',
 });
 
 // From mnemonic with password encryption
 const { sphere } = await Sphere.init({
   ...providers,
+  network: 'testnet',
   mnemonic: 'word1 word2 word3 ... word12',
   password: 'my-secret-password',
 });
@@ -560,12 +601,13 @@ const { sphere } = await Sphere.init({
 // Load existing wallet with password
 const { sphere } = await Sphere.init({
   ...providers,
+  network: 'testnet',
   password: 'my-secret-password',
 });
 
 // Nametag will be auto-recovered from Nostr if it was registered
-sphere.on('nametag:recovered', (event) => {
-  console.log('Recovered nametag:', event.data.nametag);
+sphere.on('nametag:recovered', (data) => {
+  console.log('Recovered nametag:', data.nametag);
 });
 ```
 
@@ -589,6 +631,7 @@ function WalletApp() {
       const providers = createBrowserProviders({ network: 'testnet' });
       const { sphere, created, generatedMnemonic } = await Sphere.init({
         ...providers,
+        network: 'testnet',
         autoGenerate: true,
       });
 
@@ -601,12 +644,12 @@ function WalletApp() {
       setStatus('Connected');
 
       // Load balance (total USD value, null if no PriceProvider)
-      const bal = await sphere.payments.getBalance();
+      const bal = await sphere.payments.getFiatBalance();
       setBalance(bal != null ? `$${bal.toFixed(2)}` : 'N/A');
 
       // Listen for incoming
       sphere.on('transfer:incoming', async () => {
-        const newBal = await sphere.payments.getBalance();
+        const newBal = await sphere.payments.getFiatBalance();
         setBalance(newBal != null ? `$${newBal.toFixed(2)}` : 'N/A');
       });
     };
@@ -632,7 +675,7 @@ function WalletApp() {
       setAmount('');
 
       // Refresh balance
-      const bal = await sphere.payments.getBalance();
+      const bal = await sphere.payments.getFiatBalance();
       setBalance(bal != null ? `$${bal.toFixed(2)}` : 'N/A');
     } catch (err: any) {
       setStatus('Error: ' + err.message);
@@ -651,7 +694,7 @@ function WalletApp() {
             <br />
             <strong>Nametag:</strong> {sphere.identity?.nametag || 'Not registered'}
             <br />
-            <strong>Balance:</strong> {balance} UCT
+            <strong>Balance:</strong> {balance}
           </div>
 
           <div>
@@ -753,9 +796,11 @@ if (created && generatedMnemonic) {
 // When user logs out
 await sphere.destroy();
 
-// Optionally clear storage
-localStorage.clear();
-indexedDB.deleteDatabase('sphere-tokens');
+// Optionally clear all SDK-owned wallet data (keys + tokens)
+await Sphere.clear({
+  storage: providers.storage,
+  tokenStorage: providers.tokenStorage,
+});
 ```
 
 ### Use HTTPS

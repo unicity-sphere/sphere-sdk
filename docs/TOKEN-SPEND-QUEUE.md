@@ -1,4 +1,5 @@
 # Token Spend Queue Architecture
+> **Note: written against the v1 engine — `sendInstant()` no longer exists after the v1→v2 cutover (2026-06-10); the reservation/queue design now applies to the single `send()` path. See CHANGELOG.md.**
 
 **Status:** Proposal — v1.0
 **Date:** 2026-03-12
