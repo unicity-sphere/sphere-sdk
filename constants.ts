@@ -585,7 +585,7 @@ export type NetworkConfig = (typeof NETWORKS)[NetworkType];
  *                            tenant's sole primary identity — no
  *                            cross-address routing needed.
  */
-export const DEFAULT_ESCROW_ADDRESS = '@escrow-test-01' as const;
+export const DEFAULT_ESCROW_ADDRESS = '@escrow-test-02' as const;
 
 // =============================================================================
 // Timeouts & Limits
