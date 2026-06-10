@@ -312,7 +312,9 @@ export class FileTokenStorageProvider implements TokenStorageProvider<TxfStorage
    * Create an independent instance for a different address.
    */
   createForAddress(): FileTokenStorageProvider {
-    return new FileTokenStorageProvider({ tokensDir: this.baseTokensDir });
+    // Preserve the network so per-address sub-providers stay network-isolated
+    // (browser's createForAddress preserves it via the network-baked dbNamePrefix).
+    return new FileTokenStorageProvider({ tokensDir: this.baseTokensDir, network: this.network });
   }
 }
 
