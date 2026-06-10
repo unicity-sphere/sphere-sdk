@@ -580,7 +580,10 @@ export type NetworkConfig = (typeof NETWORKS)[NetworkType];
  *                            tenant's secondary HD address via custom
  *                            multi-address routing, but the routing had
  *                            subtle relay-subscription gaps.
- *   - `@escrow-test-01`    — current default. Owned by a freshly-initialised
+ *   - `@escrow-test-01`    — second rotation attempt; squatted on the relay
+ *                            by a failed boot whose binding published before
+ *                            it crashed (Nostr first-seen-wins anti-hijacking).
+ *   - `@escrow-test-02`    — current default. Owned by a freshly-initialised
  *                            escrow tenant wallet so the nametag is the
  *                            tenant's sole primary identity — no
  *                            cross-address routing needed.
