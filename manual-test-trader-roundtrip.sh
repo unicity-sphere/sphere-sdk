@@ -495,7 +495,11 @@ wait_for_tenant_running() {
 # ---------------------------------------------------------------------------
 extract_chain_pubkey() {
   local status_log="$1"
-  grep -Eo 'chainPubkey[[:space:]]*:[[:space:]]*[0-9a-fA-F]+' "$status_log" \
+  # Two output shapes:
+  #   - `sphere init`   emits `chainPubkey   : <hex>` (camelCase, JSON-ish block)
+  #   - `sphere status` emits `Chain Pubkey:  <hex>`  (human label)
+  # Match both; case-insensitive grep with optional internal whitespace.
+  grep -Eoi '(chain[[:space:]]*pubkey)[[:space:]]*:[[:space:]]*[0-9a-fA-F]+' "$status_log" \
     | head -1 \
     | sed -E 's/.*:[[:space:]]*([0-9a-fA-F]+).*/\1/'
 }
@@ -701,6 +705,34 @@ fi
 # ---------------------------------------------------------------------------
 banner "Section 3: Spawn alice-trader + bob-trader tenants (per-user local HM)"
 
+# Extract the tenant's actual address from the spawn JSON. The trader-
+# service derives its OWN nametag as `t-<18-hex>` from the instance ID
+# (see trader-service/src/trader/main.ts:279) — the operator-supplied
+# instance name is metadata only. We use the address the wrapper
+# returns so every subsequent ACP call lands at the right tenant.
+extract_tenant_address() {
+  local log="$1"
+  python3 - "$log" <<'PYEOF'
+import json, re, sys
+path = sys.argv[1]
+try:
+    raw = open(path, 'r').read()
+except Exception:
+    sys.exit(1)
+m = re.search(r'(\{[\s\S]*\})', raw)
+if not m:
+    sys.exit(1)
+try:
+    data = json.loads(m.group(1))
+except Exception:
+    sys.exit(1)
+addr = data.get('tenant_direct_address')
+if not addr:
+    sys.exit(1)
+print(addr)
+PYEOF
+}
+
 cd "$PEER_ALICE"
 sphere wallet use alice
 sphere trader spawn \
@@ -709,9 +741,18 @@ sphere trader spawn \
   --json \
   2>&1 | tee "$SNAP/alice-trader-spawn.log"
 
-grep -qE '"tenant_direct_address"|tenant_direct_address' "$SNAP/alice-trader-spawn.log" \
+ALICE_TRADER_ADDR="$(extract_tenant_address "$SNAP/alice-trader-spawn.log")"
+[[ -n "$ALICE_TRADER_ADDR" ]] \
   || { echo "ASSERT FAIL (alice-trader-spawn): no tenant_direct_address in spawn log" >&2; exit 1; }
+# Re-bind ALICE_TRADER_TAG to the tenant's actual nametag (strip leading
+# @). The placeholder value set at the top of the script assumed the
+# spawn payload's `nametag` field controlled the tenant's identity, but
+# the trader-service derives its own `t-<hex>` from the instance ID, so
+# every downstream `@$ALICE_TRADER_TAG` usage must use the live value.
+ALICE_TRADER_TAG="${ALICE_TRADER_ADDR#@}"
 echo "ASSERT OK (alice-trader-spawn): alice-trader instance spawned on alice's local HM"
+echo "ALICE_TRADER_ADDR=$ALICE_TRADER_ADDR"
+echo "ALICE_TRADER_TAG=$ALICE_TRADER_TAG  (live, derived from spawn)"
 
 cd "$PEER_BOB"
 sphere wallet use bob
@@ -721,9 +762,13 @@ sphere trader spawn \
   --json \
   2>&1 | tee "$SNAP/bob-trader-spawn.log"
 
-grep -qE '"tenant_direct_address"|tenant_direct_address' "$SNAP/bob-trader-spawn.log" \
+BOB_TRADER_ADDR="$(extract_tenant_address "$SNAP/bob-trader-spawn.log")"
+[[ -n "$BOB_TRADER_ADDR" ]] \
   || { echo "ASSERT FAIL (bob-trader-spawn): no tenant_direct_address in spawn log" >&2; exit 1; }
+BOB_TRADER_TAG="${BOB_TRADER_ADDR#@}"
 echo "ASSERT OK (bob-trader-spawn): bob-trader instance spawned on bob's local HM"
+echo "BOB_TRADER_ADDR=$BOB_TRADER_ADDR"
+echo "BOB_TRADER_TAG=$BOB_TRADER_TAG  (live, derived from spawn)"
 
 # ---------------------------------------------------------------------------
 # Section 4 — ACP smoke probe each tenant (primes the Nostr `since` cursor)
@@ -751,14 +796,16 @@ banner "Section 5: Controllers deposit working capital into their tenants"
 
 cd "$PEER_ALICE"
 sphere wallet use alice
-sphere payments send 50 UCT --to "@$ALICE_TRADER_TAG" \
-  --memo "trader-deposit:UCT" \
+# `sphere payments send <recipient> <amount> <coin>` — positional order
+# (recipient first). The `--memo` flag isn't supported on the current
+# CLI surface; rely on the trader's portfolio-poll to confirm the
+# deposit landed.
+sphere payments send "@$ALICE_TRADER_TAG" 50 UCT \
   2>&1 | tee "$SNAP/alice-deposit-uct.log"
 
 cd "$PEER_BOB"
 sphere wallet use bob
-sphere payments send 4.5 ETH --to "@$BOB_TRADER_TAG" \
-  --memo "trader-deposit:ETH" \
+sphere payments send "@$BOB_TRADER_TAG" 4.5 ETH \
   2>&1 | tee "$SNAP/bob-deposit-eth.log"
 
 banner "Section 5: Poll tenant portfolios for deposit confirmation"
