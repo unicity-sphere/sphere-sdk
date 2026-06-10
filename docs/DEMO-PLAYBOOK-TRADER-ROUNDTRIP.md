@@ -1,6 +1,6 @@
 # Sphere CLI Demo Playbook — Trader Round-Trip
 
-A presenter-friendly run-through of **autonomous AI agents trading on Unicity testnet**. Two trader tenants — `alice-trader` and `bob-trader` — are spawned as independent host-manager instances, each given a one-line trading intent by its human controller, and then left to negotiate, match, and execute a token swap entirely on their own. No human approvals, no orchestrator, no shared backend. Just two daemons watching a market and talking over Nostr DMs.
+A presenter-friendly run-through of **autonomous AI agents trading on Unicity testnet**. Two trader tenants — `alice-trader` and `bob-trader` — are each spawned by their controller on a **per-user local Host Manager** (one HM per developer, scoped to that wallet's controller pubkey), then given a one-line trading intent and left to negotiate, match, and execute a token swap entirely on their own. No human approvals, no orchestrator, no shared backend. No shared HM, either — each peer brings its own. Just two daemons watching a market and talking over Nostr DMs.
 
 The twist that makes this demo land (versus the swap playbook, which exercises the same escrow but with humans driving every state transition): **after §6, the controllers go quiet.** The audience watches two AI tenants find each other on the market, negotiate a price inside both their bands, deposit into the same escrow service, and verify the payout — peer-to-peer, no human in the loop. The §3 "spin up two autonomous agents" beat and the §7 "watch them negotiate" beat are the load-bearing audience moments.
 
@@ -16,12 +16,12 @@ This is the companion to the soak script [`manual-test-trader-roundtrip.sh`](../
 SETUP   alice + bob controller wallets on testnet
         alice faucet 100 UCT, bob faucet 10 ETH
 
-SPAWN   sphere host spawn alice-trader --template trader-agent
-                          --nametag alice-trader-$SUFFIX
-                          --env UNICITY_CONTROLLER_PUBKEY=<alice>
-        sphere host spawn bob-trader   --template trader-agent
-                          --nametag bob-trader-$SUFFIX
-                          --env UNICITY_CONTROLLER_PUBKEY=<bob>
+SPAWN   sphere trader spawn --name alice-trader-$SUFFIX
+                          --trusted-escrows @escrow-test-02
+        sphere trader spawn --name bob-trader-$SUFFIX
+                          --trusted-escrows @escrow-test-02
+        (each command brings up a per-user local Host Manager + the
+         trader tenant; no shared HM, no controller-pubkey whitelist)
 
 FUND    sphere payments send --recipient @alice-trader --amount 50 UCT
         sphere payments send --recipient @bob-trader   --amount 4.5 ETH
@@ -55,12 +55,12 @@ The "controller is just `sphere trader create-intent`; the rest happens autonomo
 
 ### Prerequisites
 
-- `sphere` CLI on `PATH` (`which sphere` should resolve).
-- A reachable **host-manager** instance — the one that will host both trader tenants. Confirm with `sphere host inspect <some-existing-instance>` or `sphere host list`.
-- The **trader-agent template** registered in that host-manager. Template id: `trader-agent`. The container image is `ghcr.io/vrogojin/agentic-hosting/trader:v0.1` (see [Trader image staleness](#trader-image-staleness) below).
+- `sphere` CLI on `PATH` (`which sphere` should resolve), built from a checkout that includes the `sphere trader spawn` / `sphere trader stop` wrapper ([unicity-sphere/sphere-cli#49](https://github.com/unicity-sphere/sphere-cli/pull/49) or later). The wrapper brings up a **per-user local Host Manager** scoped to the active wallet's controller pubkey, then spawns the trader tenant against it — no shared HM required.
+- **Docker** available on the demo machine. The wrapper drives docker to start the local HM container.
+- The **trader-agent template** registered in the wrapper's local templates registry. The container image is `ghcr.io/vrogojin/agentic-hosting/trader:v0.1` (see [Trader image staleness](#trader-image-staleness) below).
 - Outbound HTTPS to: `faucet.unicity.network`, `goggregator-test.unicity.network`, `market-api.unicity.network`, Unicity IPFS gateways.
 - Outbound WSS to: `wss://nostr-relay.testnet.unicity.network`.
-- An escrow service reachable on the same testnet relay set. Default `@escrow-test-02`; override via the tenant's `--trusted-escrows` strategy if you've stood up your own.
+- An escrow service reachable on the same testnet relay set. Default `@escrow-test-02`; pass via `--trusted-escrows` on `sphere trader spawn` or via `sphere trader set-strategy` if you've stood up your own.
 - A clean workspace (the script wipes its own scratch dir on exit unless `KEEP=1`).
 
 ### Pre-flight sanity checks
@@ -68,8 +68,8 @@ The "controller is just `sphere trader create-intent`; the rest happens autonomo
 Before you start typing for an audience, run all three of these and confirm the network is up:
 
 ```bash
-# 1. Host manager is reachable (you should see a list, possibly empty).
-sphere host list
+# 1. Docker is up (the wrapper needs it to start the per-user HM container).
+docker info >/dev/null && echo "docker OK"
 
 # 2. Escrow is reachable and signing.
 sphere swap ping @escrow-test-02
@@ -85,16 +85,16 @@ If any of these fail, fix it before the demo — none of them recover gracefully
 
 ```bash
 sphere --help | head -3
-sphere trader --help | head -3              # should list create-intent / cancel-intent / list-intents / list-deals / portfolio / set-strategy
-sphere host  --help | head -3               # should list spawn / list / inspect / stop / start / ...
+sphere trader --help | head -3              # should list spawn / stop / create-intent / cancel-intent / list-intents / list-deals / portfolio / set-strategy
 node --version                               # >= 18
+docker --version                             # any recent stable
 ```
 
 ### Suggested terminal layout
 
 - **T1** — alice's controller wallet. All `--tenant @alice-trader` commands.
 - **T2** — bob's controller wallet. All `--tenant @bob-trader` commands.
-- **T3** — log/inspect tail. After §6 starts, this is where you show `sphere host inspect` polling and `sphere trader list-deals --tenant @<tag>` running on both sides.
+- **T3** — log tail. After §6 starts, this is where you show `docker logs -f sphere-trader-<wallet>-<name>` and `sphere trader list-deals --tenant @<tag>` running on both sides.
 
 ### Workspace bootstrap
 
@@ -106,6 +106,12 @@ ALICE_TAG="alice-$SUFFIX"
 BOB_TAG="bob-$SUFFIX"
 ALICE_TRADER_TAG="alice-trader-$SUFFIX"
 BOB_TRADER_TAG="bob-trader-$SUFFIX"
+# Instance names passed to `sphere trader spawn --name` in §3. We use
+# the same slug as the nametag suffix for symmetry; they're separate
+# identifiers (the instance name is the wrapper's local registry key,
+# the nametag is the on-network identity).
+ALICE_TRADER_INSTANCE="alice-trader-$SUFFIX"
+BOB_TRADER_INSTANCE="bob-trader-$SUFFIX"
 echo "ALICE_TAG=$ALICE_TAG"
 echo "BOB_TAG=$BOB_TAG"
 echo "ALICE_TRADER_TAG=$ALICE_TRADER_TAG"
@@ -211,7 +217,7 @@ Default `TRADER_SCAN_INTERVAL_MS=30000` (30s). The first match round can take **
 
 ## §1 Create the two controller wallets
 
-These are the **humans'** wallets — alice and bob each have a sphere wallet that holds their primary funds, signs the spawn requests sent to the host manager, and authenticates as the controller on each tenant.
+These are the **humans'** wallets — alice and bob each have a sphere wallet that holds their primary funds, bootstraps their per-user local Host Manager (via `sphere trader spawn`), and authenticates as the controller on each tenant.
 
 ### Alice — T1
 
@@ -222,7 +228,7 @@ sphere wallet use alice
 sphere init --network testnet --nametag "$ALICE_TAG"
 ```
 
-Capture alice's pubkey — you'll need it for `UNICITY_CONTROLLER_PUBKEY` in §3:
+Capture alice's pubkey for the talk-track — the per-user local HM that `sphere trader spawn` brings up in §3 scopes ACP authorization to this pubkey automatically, so you don't pass it explicitly, but it's still useful to show the audience:
 
 ```bash
 ALICE_PUBKEY=$(sphere identity show --json | jq -r '.chainPubkey')
@@ -283,22 +289,29 @@ Expected:
 
 This is where the demo earns its title. The next two commands turn over the keys to two AI agents.
 
+Each peer runs its OWN local Host Manager — there's no shared backend, no whitelist to apply for, no operator to coordinate with. `sphere trader spawn` brings up a per-user HM container scoped to the current wallet's controller pubkey, then launches the trader tenant against it. One command per peer, no environment plumbing.
+
 ### T1 — spawn alice's trader
 
 ```bash
 cd "$ROOT/peer-alice"
 sphere wallet use alice
-sphere host spawn alice-trader-$SUFFIX \
-  --template trader-agent \
-  --nametag  "$ALICE_TRADER_TAG" \
-  --env "UNICITY_CONTROLLER_PUBKEY=$ALICE_PUBKEY"
+sphere trader spawn \
+  --name "$ALICE_TRADER_INSTANCE" \
+  --trusted-escrows "$ESCROW" \
+  --json
 ```
 
-Expected output excerpt:
+Expected JSON excerpt (the wrapper streams progress lines then a final JSON document):
 
-```text
-Accepted: t_01HX... (BOOTING)
-Container ready: alice-trader-XXXXX (DIRECT://0000...)
+```json
+{
+  "instance_name": "alice-trader-XXXXX",
+  "instance_id":   "t_01HX...",
+  "tenant_direct_address": "DIRECT://0000...",
+  "hm_container":  "sphere-hm-alice-...",
+  "hm_manager_address": "DIRECT://0000..."
+}
 ```
 
 ### T2 — spawn bob's trader
@@ -306,25 +319,18 @@ Container ready: alice-trader-XXXXX (DIRECT://0000...)
 ```bash
 cd "$ROOT/peer-bob"
 sphere wallet use bob
-sphere host spawn bob-trader-$SUFFIX \
-  --template trader-agent \
-  --nametag  "$BOB_TRADER_TAG" \
-  --env "UNICITY_CONTROLLER_PUBKEY=$BOB_PUBKEY"
+sphere trader spawn \
+  --name "$BOB_TRADER_INSTANCE" \
+  --trusted-escrows "$ESCROW" \
+  --json
 ```
 
-### Wait for both to be RUNNING
+### Probe each tenant via ACP (proves Nostr transport is live + primes `since` cursor)
+
+`sphere trader spawn` already blocks until the trader container reports ready (via `--ready-timeout-ms`). One ACP smoke call doubles as a transport-layer liveness probe and primes the tenant's Nostr `since` cursor for subsequent DMs (workaround for [sphere-sdk#473](https://github.com/unicity-sphere/sphere-sdk/issues/473)):
 
 ```bash
-# T1
-sphere host inspect alice-trader-$SUFFIX
-# T2
-sphere host inspect bob-trader-$SUFFIX
-```
-
-Look for `state: RUNNING`. Then prove the controller can talk to the tenant:
-
-```bash
-# T1 — first portfolio call also doubles as a liveness probe.
+# T1 — first portfolio call doubles as a transport-layer liveness probe.
 trader_retry sphere trader portfolio --tenant "@$ALICE_TRADER_TAG"
 # T2
 trader_retry sphere trader portfolio --tenant "@$BOB_TRADER_TAG"
@@ -339,7 +345,7 @@ Expected — an empty portfolio at this point (the tenant has its own wallet but
 }
 ```
 
-**Talk track:** "These two containers are now autonomous. They have their own secp256k1 keypairs, their own subscriptions to the testnet Nostr relays, and a strategy engine that scans market-api every 30 seconds. The host-manager is just a launcher — once the tenant is RUNNING, the manager is out of the data path. Alice's only relationship with her trader is that the tenant accepts ACP commands signed by her controller pubkey. Everything else, the tenant decides for itself."
+**Talk track:** "These two containers are now autonomous. They have their own secp256k1 keypairs, their own subscriptions to the testnet Nostr relays, and a strategy engine that scans market-api every 30 seconds. Each peer runs its own local Host Manager — no shared HM, no whitelist to negotiate. The HM is just a launcher: once the tenant is RUNNING, the manager is out of the data path. Alice's only relationship with her trader is that the tenant accepts ACP commands signed by her controller pubkey — the same pubkey the local HM was bootstrapped against. Everything else, the tenant decides for itself."
 
 ### §3.5 — Optional sidebar: tune strategy before funding
 
@@ -558,14 +564,16 @@ If after 2 minutes no tenant has flipped to `NEGOTIATING`, see [§11 — Negotia
 
 ### §7.5 — Optional sidebar: tail tenant logs
 
-If the audience wants to see the bots talking in real time, tail the container logs:
+If the audience wants to see the bots talking in real time, tail each trader container's logs directly via docker:
 
 ```bash
-# These commands depend on the host-manager exposing logs. If the
-# template image doesn't pipe stdout to a tailable channel, skip.
-sphere host cmd alice-trader-$SUFFIX TAIL_LOGS --params '{"lines": 50}' --json 2>/dev/null | jq -r '.result.lines[]'
-sphere host cmd bob-trader-$SUFFIX   TAIL_LOGS --params '{"lines": 50}' --json 2>/dev/null | jq -r '.result.lines[]'
+# T1 (alice's machine)
+docker logs -f --tail 50 sphere-trader-alice-$SUFFIX
+# T2 (bob's machine)
+docker logs -f --tail 50 sphere-trader-bob-$SUFFIX
 ```
+
+(Container names follow the `sphere-trader-<wallet>-<name>` pattern that `sphere trader spawn` uses; `docker ps | grep sphere-trader` will show the exact name if your wallet name differs.)
 
 Look for:
 - `intent_matched market_intent_id=mi_… counterparty=DIRECT://…` (the scanner woke up)
@@ -676,14 +684,26 @@ for id in $BOB_OPEN; do
 done
 ```
 
-### Stop the tenants (or KEEP=1)
+### Stop the tenants (or `--keep-hm` for Q&A)
 
 ```bash
-sphere host stop alice-trader-$SUFFIX
-sphere host stop bob-trader-$SUFFIX
+# T1
+cd "$ROOT/peer-alice" && sphere wallet use alice
+sphere trader stop --name "$ALICE_TRADER_INSTANCE"
+
+# T2
+cd "$ROOT/peer-bob" && sphere wallet use bob
+sphere trader stop --name "$BOB_TRADER_INSTANCE"
 ```
 
-If you want to leave the tenants running for Q&A (set `KEEP_TENANTS=1` and skip the `host stop` calls), the audience can ask the bots arbitrary questions via `sphere trader portfolio` / `list-intents` / `list-deals` until you tear them down.
+`sphere trader stop` stops the trader tenant and — when the last tenant attached to a given per-user local HM stops — also tears down the HM container. If you want to leave the local HMs running for Q&A so the audience can ask follow-up questions via `sphere trader portfolio` / `list-intents` / `list-deals`, pass `--keep-hm`:
+
+```bash
+sphere trader stop --name "$ALICE_TRADER_INSTANCE" --keep-hm
+sphere trader stop --name "$BOB_TRADER_INSTANCE"   --keep-hm
+```
+
+The tenant processes still stop (the wrapper's local registry is the source of truth — leaving an unregistered tenant alive would orphan it), but the HMs remain so you can `sphere trader spawn` a fresh tenant against them without re-paying the HM bootstrap cost.
 
 ### Wipe workspace
 
@@ -691,7 +711,7 @@ If you want to leave the tenants running for Q&A (set `KEEP_TENANTS=1` and skip 
 rm -rf "$ROOT"
 ```
 
-If you want to inspect afterwards: leave `$ROOT` in place; the controller wallet stores are in `$ROOT/peer-alice/.sphere-cli-alice/` and `$ROOT/peer-bob/.sphere-cli-bob/`. The tenant's state lives in the host-manager's docker volume — `sphere host inspect` shows the volume path under `docker_container_id`.
+If you want to inspect afterwards: leave `$ROOT` in place; the controller wallet stores are in `$ROOT/peer-alice/.sphere-cli-alice/` and `$ROOT/peer-bob/.sphere-cli-bob/`. The tenant's state lives in the per-user local HM's docker volume — `docker ps` will show the `sphere-hm-<wallet>-*` and `sphere-trader-*` containers and `docker inspect` will show the volume mounts.
 
 ---
 
@@ -699,9 +719,9 @@ If you want to inspect afterwards: leave `$ROOT` in place; the controller wallet
 
 | Symptom | What it means | Demo recovery |
 |---|---|---|
-| `sphere host spawn` exits 1 with `Failed: …` | Manager rejected the spawn (bad template id, missing template, no capacity). | Run `sphere host help` to confirm the manager actually exposes `trader-agent` as a template id. Check `sphere host list` to see if there's an `instance_name` collision — pick a fresh `$SUFFIX`. |
-| Tenant stays in `BOOTING` for >60 s | Container is fetching the image, or the image is failing first-boot. | `sphere host inspect <instance> --json` and look at the `last_heartbeat_at` field. If never, the container probably failed to start — check `host cmd <instance> TAIL_LOGS` if supported, or pull the docker logs out-of-band. |
-| Tenant doesn't respond to `sphere trader portfolio` (TimeoutError after 30s) | Either: (a) the tenant isn't actually RUNNING (re-check with `sphere host inspect`), (b) `UNICITY_CONTROLLER_PUBKEY` was set to the wrong pubkey, or (c) the cross-process DM flakiness from [sphere-sdk#473](https://github.com/unicity-sphere/sphere-sdk/issues/473). | Re-run `trader_retry sphere trader portfolio --tenant @<tag>`. If retries also fail, confirm `UNICITY_CONTROLLER_PUBKEY` matches the controller wallet's `chainPubkey` exactly. |
+| `sphere trader spawn` exits 1 before the JSON document | The wrapper couldn't bring up the local HM (docker daemon down, port collision, template missing). | Verify `docker info` works. Check `docker ps -a | grep sphere-hm` for a stuck container from a previous run — `docker rm -f` it and retry. Confirm the wrapper's templates registry includes `trader-agent`. |
+| `sphere trader spawn` ready-timeout exceeded | The trader image started but didn't reach ready before the wrapper's `--ready-timeout-ms` budget. | Tail the trader container with `docker logs -f sphere-trader-<wallet>-<name>` and check for image-pull or first-boot errors. As a workaround, re-run with `--ready-timeout-ms 240000` (4 min) for slow IPFS warmups. |
+| Tenant doesn't respond to `sphere trader portfolio` (TimeoutError after 30s) | Either: (a) the trader container died after `spawn` reported ready (check `docker logs`), or (b) the cross-process DM flakiness from [sphere-sdk#473](https://github.com/unicity-sphere/sphere-sdk/issues/473). | Re-run `trader_retry sphere trader portfolio --tenant @<tag>`. If retries also fail, check `docker ps` for the `sphere-trader-<wallet>-<name>` container — if it's gone, re-spawn. |
 | `sphere trader create-intent` returns `ok: false` with `INSUFFICIENT_BALANCE` | The strategy engine pre-flighted the intent against current tenant balance and it doesn't fit. | Re-check `sphere trader portfolio` and confirm §4 seed actually landed. If yes, the rate-unit ambiguity may have made the intent volume larger than expected — recompute (see below). |
 | `sphere trader create-intent` returns `INVALID_PARAM rate_min must be a non-negative integer string` (or `volume_min …`) | The CLI is on the pre-#474 bigint surface but you passed float values like `0.08`. The float→bigint conversion isn't wired yet, so the CLI sent `"0.08"` verbatim and the trader rejected it. | Switch the demo values from float form to the smallest-unit bigint form using the [Pre-flight table](#pre-flight-which-form-does-the-cli-accept-float-vs-bigint) in §0 (`0.08` → `80000000000000000`, etc.). Re-run create-intent. |
 | `sphere trader create-intent` returns `INVALID_PARAM` referencing `rate_min` / `rate_max` for any other reason | Rate-unit ambiguity — the value you sent decodes to something the trader rejects (wrong scale, out-of-range, min > max). | Verify locally with `sphere trader list-intents --tenant @<other-test-tenant>` on a tiny test intent first. **Recompute rate:** if you want rate `R` (quote per base, as a decimal), and both base and quote have 18 decimals, encode rate as `floor(R × 10^18)`. Example: `0.10 ETH/UCT` → `10^17` → `100000000000000000`. |
@@ -739,10 +759,9 @@ Everything in this playbook is the script [`manual-test-trader-roundtrip.sh`](..
 cd <sphere-sdk-checkout>
 bash manual-test-trader-roundtrip.sh                            # default scenario
 KEEP=1 bash manual-test-trader-roundtrip.sh                     # preserve workspace
-KEEP_TENANTS=1 bash manual-test-trader-roundtrip.sh             # leave tenants RUNNING
+KEEP_TENANTS=1 bash manual-test-trader-roundtrip.sh             # leave per-user HMs running (--keep-hm)
 ESCROW=@my-escrow bash manual-test-trader-roundtrip.sh          # override escrow
 SUFFIX=demo01 bash manual-test-trader-roundtrip.sh              # deterministic tags
-TRADER_SCAN_INTERVAL_MS=10000 bash manual-test-trader-roundtrip.sh   # faster scan
 ```
 
 A green run prints `ALL GREEN — trader round-trip soak succeeded` and exits 0.
@@ -766,7 +785,7 @@ Use the script for CI / nightly soaks; use this playbook for human demos.
    §0  $ROOT, $ALICE_TAG, $BOB_TAG, $ALICE_TRADER_TAG, $BOB_TRADER_TAG, $ESCROW
        SPHERE_ALLOW_MNEMONIC_NON_TTY=1
        trader_retry() helper for #473 flakiness
-       Pre-flight: sphere host list, sphere swap ping @escrow-test-02, market-api curl
+       Pre-flight: docker info, sphere swap ping @escrow-test-02, market-api curl
 
    §1  sphere wallet create / use / init --nametag       ×2 controller wallets
        capture ALICE_PUBKEY, BOB_PUBKEY  (chainPubkey)
@@ -774,12 +793,11 @@ Use the script for CI / nightly soaks; use this playbook for human demos.
    §2  sphere faucet 100 UCT   (alice controller)
        sphere faucet  10 ETH   (bob controller)            ← asymmetric on purpose
 
-   §3  sphere host spawn alice-trader-$SUFFIX
-            --template trader-agent --nametag @alice-trader-…
-            --env UNICITY_CONTROLLER_PUBKEY=$ALICE_PUBKEY
-       (and the same for bob)
-       Wait for RUNNING via sphere host inspect.
-       First successful sphere trader portfolio = liveness proof.
+   §3  sphere trader spawn --name alice-trader-$SUFFIX
+                            --trusted-escrows @escrow-test-02 --json
+       (and the same for bob — each peer brings up its OWN local HM)
+       Wrapper blocks until trader image reports ready.
+       First successful sphere trader portfolio = transport-layer liveness proof.
                                        ← BIG MOMENT: "autonomous agents are now alive"
 
    §4  sphere payments send → @alice-trader  --amount 50  --coinId UCT
@@ -812,32 +830,33 @@ Use the script for CI / nightly soaks; use this playbook for human demos.
        sphere trader portfolio --tenant @bob-trader     → UCT 5e19, ETH residue
        "Alice and Bob can now go to bed; the daemons handle the next round."
 
-   §10 cancel-intent leftovers, host stop both tenants, rm -rf $ROOT
-       (or KEEP_TENANTS=1 for Q&A)
+   §10 cancel-intent leftovers, sphere trader stop --name both tenants, rm -rf $ROOT
+       (or sphere trader stop --keep-hm for Q&A)
 ```
 
 ### Command quick reference
 
 | When you want to… | Run |
 |---|---|
-| Spawn a trader tenant | `sphere host spawn <name> --template trader-agent --nametag @<tag> --env UNICITY_CONTROLLER_PUBKEY=<pubkey>` |
-| Probe tenant liveness | `sphere host inspect <name>` (HMCP) or `sphere trader portfolio --tenant @<tag>` (ACP) |
+| Spawn a trader tenant | `sphere trader spawn --name <name> --trusted-escrows @<escrow> [--scan-interval-ms <ms>] [--ready-timeout-ms <ms>] [--json]` (brings up a per-user local HM + trader tenant) |
+| Probe tenant liveness | `sphere trader portfolio --tenant @<tag>` (ACP — first successful call doubles as a transport-layer liveness probe) |
 | Post a trading intent | `sphere trader create-intent --tenant @<tag> --direction <buy\|sell> --base <coin> --quote <coin> --rate-min <float> --rate-max <float> --volume-min <float> --volume-max <float>` (post-#474 UX; on pre-fix CLI, see [Pre-flight table](#pre-flight-which-form-does-the-cli-accept-float-vs-bigint)) |
 | List the tenant's intents | `sphere trader list-intents --tenant @<tag> [--state active\|filled\|cancelled\|expired]` |
 | Cancel an intent | `sphere trader cancel-intent --tenant @<tag> --intent-id <id>` |
 | List the tenant's deals | `sphere trader list-deals --tenant @<tag> [--state active\|completed\|failed]` |
 | Show tenant balance | `sphere trader portfolio --tenant @<tag>` |
 | Tune trader strategy | `sphere trader set-strategy --tenant @<tag> [--rate-strategy aggressive\|moderate\|conservative] [--max-concurrent <n>] [--trusted-escrows @e1,@e2]` |
-| Stop a tenant | `sphere host stop <name>` |
-| Start a stopped tenant | `sphere host start <name>` |
+| Stop a tenant | `sphere trader stop --name <name> [--keep-hm]` (auto-tears down the per-user HM when the last tenant stops; `--keep-hm` leaves it running for Q&A) |
 | Pre-flight escrow liveness | `sphere swap ping @escrow-test-02` |
 
 ### Exit codes that matter
 
 | Command | Exit | Meaning |
 |---|---|---|
-| `sphere host spawn`            | 0   | tenant `RUNNING` (or `BOOTING` reported then `ready`) |
-| `sphere host spawn`            | 1   | spawn failed (bad template, capacity, conflict) |
+| `sphere trader spawn`          | 0   | per-user HM up + tenant ready (final JSON document emitted) |
+| `sphere trader spawn`          | 1   | docker unavailable, port collision, template missing, or ready-timeout exceeded |
+| `sphere trader stop`           | 0   | tenant stopped (HM auto-torn-down unless `--keep-hm`) |
+| `sphere trader stop`           | 1   | name not found in wrapper's local registry, or docker error |
 | `sphere trader create-intent`  | 0   | intent accepted; `result.intent_id` returned |
 | `sphere trader create-intent`  | 1   | rejected (`INVALID_PARAM`, `INSUFFICIENT_BALANCE`, transport timeout) |
 | `sphere trader cancel-intent`  | 0   | cancelled; tenant flipped state to `cancelled` |

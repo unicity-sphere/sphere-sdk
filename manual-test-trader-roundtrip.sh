@@ -60,23 +60,15 @@
 #
 #   TRADER_TEST_DIR              Workspace root. Default /tmp/trader-roundtrip-$$
 #   KEEP=0|1                     Preserve $TRADER_TEST_DIR on exit. Default 0.
-#   KEEP_TENANTS=0|1             Leave spawned tenants running on exit. Default 0
-#                                (we `sphere host stop` them).
+#   KEEP_TENANTS=0|1             Leave spawned tenants AND their local HMs
+#                                running on exit. Default 0 (we
+#                                `sphere trader stop` them, which auto-tears
+#                                down the per-user HM when the last tenant
+#                                stops; setting this to 1 forwards `--keep-hm`).
 #   SUFFIX                       Unique suffix shared by the alice/bob/tenant
 #                                nametags. Default = epoch-tail + random.
 #   ESCROW                       Escrow @nametag or DIRECT://hex.
 #                                Default @escrow-test-02 (per sphere-sdk#456).
-#   HOST_MANAGER                 Host manager @nametag or DIRECT://hex.
-#                                Default: $SPHERE_HOST_MANAGER if set;
-#                                otherwise no default — script aborts.
-#   TRADER_TEMPLATE_ID           Host template ID. Default "trader-agent"
-#                                (config/templates.json).
-#   TRADER_IMAGE_OVERRIDE        Reserved for future use. Today the host CLI
-#                                does NOT expose `--image` (see KNOWN
-#                                LIMITATIONS); the script prints a warning and
-#                                continues. Override the image upstream by
-#                                editing /home/vrogojin/agentic_hosting/config/
-#                                templates.json or by adding a new template.
 #   TRADER_RATE_MIN_ETH_PER_UCT  Lower edge of the rate band, as a
 #                                **human-friendly float**. Default 0.08
 #                                (= 0.08 ETH per 1 UCT).
@@ -85,7 +77,10 @@
 #   TRADER_CLI_FLOAT_NATIVE      0 = skip the float attempt and go straight
 #                                to the bigint shim. Default 1.
 #   TRADER_DEAL_DEADLINE_S       Wall-clock cap for negotiation + settlement.
-#                                Default 600 (10 min). TRADER_SCAN_INTERVAL_MS
+#                                Default 900 (15 min). Bumped from 600 to
+#                                cover per-user local-HM bootstrap (two-shot
+#                                drift-guard restart) on top of the trader
+#                                scan interval. TRADER_SCAN_INTERVAL_MS
 #                                defaults to 30 s in the template, so a first
 #                                match round can take up to a minute.
 #   TRADER_DEPOSIT_TIMEOUT_S     Wall-clock cap for the controller→tenant
@@ -97,6 +92,16 @@
 #   SPHERE_ALLOW_MNEMONIC_NON_TTY Always exported as 1 — the soak runs
 #                                non-interactively, so it cannot prompt for
 #                                mnemonic entry.
+#
+# Prerequisites:
+#   - sphere-cli with `sphere trader spawn` / `sphere trader stop`
+#     (unicity-sphere/sphere-cli#49 or later). The wrapper brings up a
+#     per-user local Host Manager scoped to the current wallet's
+#     controller pubkey + spawns the trader tenant in one command. The
+#     public Host Manager is reserved for shared infra (escrow, faucet)
+#     and is NOT used by this soak.
+#   - Docker available locally — the wrapper drives docker for the
+#     per-user HM container.
 #
 # ---------------------------------------------------------------------------
 # KNOWN LIMITATIONS
@@ -113,7 +118,7 @@
 #          prime the tenant's `since` cursor before doing anything load-
 #          bearing.
 #        - The §8 deal-completion poll uses TRADER_DEAL_DEADLINE_S (default
-#          10 min, i.e. ~20× TRADER_SCAN_INTERVAL_MS) so a missed DM is
+#          15 min, i.e. ~30× TRADER_SCAN_INTERVAL_MS) so a missed DM is
 #          recovered by the next scan iteration.
 #
 #   2. CLI float-vs-bigint UX (covered by TODO(#474 follow-up) above).
@@ -124,26 +129,22 @@
 #      assumes UCT and ETH have 18 decimals (true on production testnet);
 #      override TRADER_*_DECIMALS env vars if your registry differs.
 #
-#   3. Trader image staleness (issue #474 prelude).
+#   3. Trader image staleness (vrogojin/agentic_hosting#26).
 #      The trader image tagged `ghcr.io/vrogojin/agentic-hosting/trader:v0.1`
 #      was built before the SDK-side rotations in:
 #        - sphere-sdk#456 (DEFAULT_ESCROW_ADDRESS = @escrow-test-02)
 #        - sphere-sdk#457 (counterparty transport pubkey fail-fast)
 #        - sphere-sdk#464 (MuxAdapter dispatch await)
-#      Until the image is rebuilt, this soak may fail in §8 with one of:
+#      Until the v0.2 image lands (vrogojin/agentic_hosting#26), this soak
+#      may fail in §8 with one of:
 #        - tenant times out negotiating because old SwapModule does not
 #          fail fast on missing transport pubkey;
 #        - tenant uses a stale default escrow that does not match $ESCROW
 #          and the swap proposal never gets accepted.
-#      The host CLI does NOT today expose `--image`, so we cannot inject
-#      an override at spawn time. Two remediations:
-#        a) Rebuild and republish the image upstream (preferred).
-#        b) Add a new template_id to /home/vrogojin/agentic_hosting/config/
-#           templates.json pointing at the rebuilt image, and override
-#           TRADER_TEMPLATE_ID to use it.
-#      The script warns once at boot and continues.
-#      TODO(#474): once host CLI supports `--image`, wire $TRADER_IMAGE_
-#      OVERRIDE into the `sphere host spawn` invocation in §3.
+#      Remediation: rebuild and republish the trader image upstream.
+#      The `sphere trader spawn` wrapper accepts `--hm-image` for the host
+#      manager image but the trader image itself is pinned by the template
+#      registry (config/templates.json).
 #
 #   4. Some intent state values are not enumerated in this soak. It ASSUMES
 #      that --state filters on list-intents/list-deals accept the canonical
@@ -179,9 +180,6 @@ PEER_BOB="$ROOT/bob-peer"
 mkdir -p "$PEER_ALICE" "$PEER_BOB"
 
 ESCROW="${ESCROW:-@escrow-test-02}"
-HOST_MANAGER="${HOST_MANAGER:-${SPHERE_HOST_MANAGER:-}}"
-TRADER_TEMPLATE_ID="${TRADER_TEMPLATE_ID:-trader-agent}"
-TRADER_IMAGE_OVERRIDE="${TRADER_IMAGE_OVERRIDE:-}"
 
 # Human-friendly floats. The CLI is responsible for converting these
 # to smallest-units (post-fix UX). The shim mode below converts inline
@@ -195,41 +193,33 @@ TRADER_CLI_FLOAT_NATIVE="${TRADER_CLI_FLOAT_NATIVE:-1}"
 TRADER_UCT_DECIMALS="${TRADER_UCT_DECIMALS:-18}"
 TRADER_ETH_DECIMALS="${TRADER_ETH_DECIMALS:-18}"
 
-TRADER_DEAL_DEADLINE_S="${TRADER_DEAL_DEADLINE_S:-600}"
+# Bumped 600→900 to cover per-user local-HM bootstrap on top of the
+# trader scan interval. The wrapper performs a two-shot drift-guard
+# restart of the HM before the trader tenant is ready, which the old
+# 10-min budget did not account for.
+TRADER_DEAL_DEADLINE_S="${TRADER_DEAL_DEADLINE_S:-900}"
 TRADER_DEPOSIT_TIMEOUT_S="${TRADER_DEPOSIT_TIMEOUT_S:-240}"
 TRADER_FAUCET_WAIT_S="${TRADER_FAUCET_WAIT_S:-120}"
 
 MARKET_API_URL="${MARKET_API_URL:-https://market-api.unicity.network}"
 
+# KEEP_TENANTS=1 forwards `--keep-hm` to `sphere trader stop` so the
+# per-user local HM stays running for inspection. Note: `sphere trader
+# stop` does NOT have a --keep-data flag; the tenant data dir is
+# preserved by default.
+KEEP_HM_FLAG=""
+if [[ "${KEEP_TENANTS:-0}" == "1" ]]; then
+  KEEP_HM_FLAG="--keep-hm"
+fi
+
 echo "ESCROW=$ESCROW"
-echo "HOST_MANAGER=${HOST_MANAGER:-<unset — will abort>}"
-echo "TRADER_TEMPLATE_ID=$TRADER_TEMPLATE_ID"
 echo "TRADER_RATE_MIN_ETH_PER_UCT=$TRADER_RATE_MIN_ETH_PER_UCT  (float)"
 echo "TRADER_RATE_MAX_ETH_PER_UCT=$TRADER_RATE_MAX_ETH_PER_UCT  (float)"
 echo "TRADER_VOLUME_UCT=$TRADER_VOLUME_UCT  (whole UCT)"
 echo "TRADER_CLI_FLOAT_NATIVE=$TRADER_CLI_FLOAT_NATIVE"
 echo "TRADER_DEAL_DEADLINE_S=$TRADER_DEAL_DEADLINE_S"
 echo "MARKET_API_URL=$MARKET_API_URL"
-
-if [[ -z "$HOST_MANAGER" ]]; then
-  echo
-  echo "FAIL: HOST_MANAGER (or SPHERE_HOST_MANAGER) is not set." >&2
-  echo "  Spawning trader tenants requires a reachable host manager." >&2
-  echo "  Export e.g. HOST_MANAGER=@hostmgr-test-01 and re-run." >&2
-  exit 1
-fi
-export SPHERE_HOST_MANAGER="$HOST_MANAGER"
-
-# Image-override warning (KNOWN LIMITATION #3).
-if [[ -n "$TRADER_IMAGE_OVERRIDE" ]]; then
-  echo
-  echo "WARNING: TRADER_IMAGE_OVERRIDE=$TRADER_IMAGE_OVERRIDE is set, but the" >&2
-  echo "  current sphere-cli does not expose a --image flag for \`sphere host" >&2
-  echo "  spawn\`. The override is being IGNORED — the host manager will use" >&2
-  echo "  the image hard-coded in templates.json for $TRADER_TEMPLATE_ID." >&2
-  echo "  To override: edit templates.json upstream or define a new template." >&2
-  echo "  TODO(#474): wire --image through the host CLI then update this soak." >&2
-fi
+echo "KEEP_HM_FLAG=${KEEP_HM_FLAG:-<auto-teardown>}"
 
 export SPHERE_ALLOW_MNEMONIC_NON_TTY=1
 
@@ -258,27 +248,37 @@ echo "ETH_MID_SMALLEST     =$ETH_MID_SMALLEST       (midpoint expectation)"
 
 cleanup() {
   local rc=$?
-  # Try to stop spawned tenants on the way out, unless the operator
-  # asked us to leave them running for inspection.
-  if [[ "${KEEP_TENANTS:-0}" != "1" ]]; then
-    if [[ -n "${PEER_ALICE:-}" && -d "$PEER_ALICE" ]]; then
-      (
-        cd "$PEER_ALICE" 2>/dev/null && \
-        sphere wallet use alice 2>/dev/null && \
-        sphere host stop "$ALICE_TRADER_INSTANCE" --manager "$HOST_MANAGER" \
-          2>&1 | tee -a "$SNAP/alice-trader-stop.log" || true
-      ) || true
-    fi
-    if [[ -n "${PEER_BOB:-}" && -d "$PEER_BOB" ]]; then
-      (
-        cd "$PEER_BOB" 2>/dev/null && \
-        sphere wallet use bob 2>/dev/null && \
-        sphere host stop "$BOB_TRADER_INSTANCE" --manager "$HOST_MANAGER" \
-          2>&1 | tee -a "$SNAP/bob-trader-stop.log" || true
-      ) || true
-    fi
-  else
-    echo "=== KEEP_TENANTS=1: tenants left running ($ALICE_TRADER_INSTANCE, $BOB_TRADER_INSTANCE) ==="
+  # Stop spawned tenants on the way out via `sphere trader stop`. The
+  # wrapper auto-tears down each peer's per-user local Host Manager when
+  # the last tenant attached to it stops; pass --keep-hm (via
+  # KEEP_HM_FLAG, set from KEEP_TENANTS) to leave the HM containers
+  # running for inspection.
+  #
+  # Even with KEEP_TENANTS=1 we still issue `sphere trader stop` (with
+  # --keep-hm) so the tenant process exits cleanly — this differs from
+  # the previous behavior, which skipped cleanup entirely. We do this
+  # because the wrapper's bookkeeping (tenant registry, HM ref count)
+  # is the source of truth; leaving the tenant alive but unregistered
+  # would orphan it. If you genuinely want a tenant left running for
+  # ACP probing, comment out the `sphere trader stop` lines.
+  if [[ -n "${PEER_ALICE:-}" && -d "$PEER_ALICE" ]]; then
+    (
+      cd "$PEER_ALICE" 2>/dev/null && \
+      sphere wallet use alice 2>/dev/null && \
+      sphere trader stop --name "$ALICE_TRADER_INSTANCE" $KEEP_HM_FLAG \
+        2>&1 | tee -a "$SNAP/alice-trader-stop.log" || true
+    ) || true
+  fi
+  if [[ -n "${PEER_BOB:-}" && -d "$PEER_BOB" ]]; then
+    (
+      cd "$PEER_BOB" 2>/dev/null && \
+      sphere wallet use bob 2>/dev/null && \
+      sphere trader stop --name "$BOB_TRADER_INSTANCE" $KEEP_HM_FLAG \
+        2>&1 | tee -a "$SNAP/bob-trader-stop.log" || true
+    ) || true
+  fi
+  if [[ "${KEEP_TENANTS:-0}" == "1" ]]; then
+    echo "=== KEEP_TENANTS=1: per-user HMs left running (--keep-hm); tenant processes stopped ==="
   fi
   if [[ "${KEEP:-0}" != "1" ]]; then
     rm -rf "$ROOT" 2>/dev/null || true
@@ -453,13 +453,18 @@ create_intent_with_shim() {
 }
 
 # ---------------------------------------------------------------------------
-# Wait for a tenant to be observable as RUNNING via host inspect.
-# Falls back to `sphere trader portfolio` as an implicit liveness probe
-# (the canonical ACP-style readiness check now that STATUS is system-
-# scoped — see comment in trader-commands.ts).
+# Smoke-probe a freshly-spawned tenant via ACP `sphere trader portfolio`.
+#
+# `sphere trader spawn` blocks until the trader image reports ready (via
+# --ready-timeout-ms, default exposed by the wrapper). By the time we
+# return from spawn, the local HM is up and the trader container is
+# running. We still need a one-shot ACP probe to:
+#   - Confirm the tenant's Nostr transport is online and listening.
+#   - Prime the tenant's `since` cursor for subsequent DMs from the
+#     controller (KNOWN LIMITATION #1).
 #
 # Args: $1 = peer dir, $2 = wallet name, $3 = instance name,
-#       $4 = tenant @nametag, $5 = output log, $6 = timeout seconds
+#       $4 = tenant @nametag, $5 = output log path, $6 = timeout seconds
 # ---------------------------------------------------------------------------
 wait_for_tenant_running() {
   local peer="$1" wallet="$2" instance="$3" tenant_nt="$4" log="$5" timeout_s="$6"
@@ -467,34 +472,26 @@ wait_for_tenant_running() {
   cd "$peer"
   sphere wallet use "$wallet"
   while (( $(date +%s) < deadline )); do
-    # First: ask the host manager what state the instance is in.
-    if sphere host inspect "$instance" --manager "$HOST_MANAGER" \
-         2>&1 | tee "$log" | grep -qE 'state:[[:space:]]+RUNNING'; then
-      echo "INFO: $instance reports RUNNING via host inspect"
-      # Second: smoke-test ACP by asking the tenant for its portfolio.
-      # This also primes the tenant's `since` cursor for subsequent DMs
-      # from the controller (KNOWN LIMITATION #1).
-      if sphere trader portfolio --tenant "@$tenant_nt" --timeout 20000 \
-           2>&1 | tee "${log%.log}-portfolio.log" \
-           | grep -qE '"balances"|balances'; then
-        echo "INFO: $instance accepted ACP probe (portfolio)"
-        return 0
-      fi
-      echo "  $instance is RUNNING but ACP probe not ready yet — sleeping 5 s…"
-    else
-      echo "  $instance not yet RUNNING — sleeping 5 s…"
+    if sphere trader portfolio --tenant "@$tenant_nt" --timeout 20000 \
+         2>&1 | tee "$log" \
+         | grep -qE '"balances"|balances'; then
+      echo "INFO: $instance accepted ACP probe (portfolio)"
+      return 0
     fi
+    echo "  $instance ACP probe not ready yet — sleeping 5 s…"
     sleep 5
   done
-  echo "ASSERT FAIL (tenant-running): $instance did not reach RUNNING + ACP-ready within ${timeout_s}s" >&2
+  echo "ASSERT FAIL (tenant-running): $instance did not pass ACP probe within ${timeout_s}s" >&2
   tail -30 "$log" >&2 || true
   return 1
 }
 
 # ---------------------------------------------------------------------------
-# Extract a controller's `chainPubkey` from `sphere status` output. The
-# host-manager template flow accepts UNICITY_CONTROLLER_PUBKEY as an env
-# var to authorize ACP requests from this wallet.
+# Extract a controller's `chainPubkey` from `sphere status` output.
+# Kept for diagnostic logging — the per-user local HM (spawned by
+# `sphere trader spawn`) already scopes ACP authorization to the active
+# wallet's controller pubkey, so we don't pass it explicitly to the
+# spawn command.
 # ---------------------------------------------------------------------------
 extract_chain_pubkey() {
   local status_log="$1"
@@ -688,61 +685,55 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Section 3 — Spawn alice-trader + bob-trader tenants via Host Manager
+# Section 3 — Spawn alice-trader + bob-trader tenants via per-user local HMs
 #
-# Each tenant is wired to:
-#   - Authorize ACP commands from its controller's chainPubkey
-#     (UNICITY_CONTROLLER_PUBKEY).
-#   - Register the tenant nametag at boot (--nametag), so the controller
-#     can address it via `--tenant @<tag>`.
-#   - Inherit SPHERE_NETWORK + TRADER_SCAN_INTERVAL_MS from the template
-#     defaults (LOG_LEVEL=info, SPHERE_NETWORK=testnet,
-#     TRADER_SCAN_INTERVAL_MS=30000, TRADER_MAX_ACTIVE_INTENTS=10).
+# Each peer brings up its OWN local Host Manager via `sphere trader spawn`.
+# The wrapper:
+#   - Boots a per-user HM container (scoped to the current wallet's
+#     controller pubkey — no shared whitelist, no public-HM dependency).
+#   - Spawns the trader tenant against that local HM with the canonical
+#     trader template + ESCROW + nametag wired in.
+#   - Blocks until the trader image reports ready (--ready-timeout-ms).
 #
-# `sphere host spawn` is a STREAMING request — the helper waits for
-# hm.spawn_ready / hm.spawn_failed / hm.error from the host manager.
+# This replaces the shared-HM pattern used in earlier revisions of the
+# soak. The public HM (@hostmgr-test-01) is reserved for shared infra
+# (escrow, faucet) and is not touched here.
 # ---------------------------------------------------------------------------
-banner "Section 3: Spawn alice-trader + bob-trader tenants"
+banner "Section 3: Spawn alice-trader + bob-trader tenants (per-user local HM)"
 
 cd "$PEER_ALICE"
 sphere wallet use alice
-sphere host spawn "$ALICE_TRADER_INSTANCE" \
-  --manager "$HOST_MANAGER" \
-  --template "$TRADER_TEMPLATE_ID" \
-  --nametag "$ALICE_TRADER_TAG" \
-  --env "UNICITY_CONTROLLER_PUBKEY=$ALICE_PUBKEY" \
-  --env "SPHERE_NAMETAG=$ALICE_TRADER_TAG" \
-  --env "ESCROW_ADDRESS=$ESCROW" \
+sphere trader spawn \
+  --name "$ALICE_TRADER_INSTANCE" \
+  --trusted-escrows "$ESCROW" \
+  --json \
   2>&1 | tee "$SNAP/alice-trader-spawn.log"
 
-grep -qE 'Container ready|hm\.spawn_ready' "$SNAP/alice-trader-spawn.log" \
-  || { echo "ASSERT FAIL (alice-trader-spawn): no spawn_ready in spawn log" >&2; exit 1; }
-echo "ASSERT OK (alice-trader-spawn): alice-trader instance accepted by host manager"
+grep -qE '"tenant_direct_address"|tenant_direct_address' "$SNAP/alice-trader-spawn.log" \
+  || { echo "ASSERT FAIL (alice-trader-spawn): no tenant_direct_address in spawn log" >&2; exit 1; }
+echo "ASSERT OK (alice-trader-spawn): alice-trader instance spawned on alice's local HM"
 
 cd "$PEER_BOB"
 sphere wallet use bob
-sphere host spawn "$BOB_TRADER_INSTANCE" \
-  --manager "$HOST_MANAGER" \
-  --template "$TRADER_TEMPLATE_ID" \
-  --nametag "$BOB_TRADER_TAG" \
-  --env "UNICITY_CONTROLLER_PUBKEY=$BOB_PUBKEY" \
-  --env "SPHERE_NAMETAG=$BOB_TRADER_TAG" \
-  --env "ESCROW_ADDRESS=$ESCROW" \
+sphere trader spawn \
+  --name "$BOB_TRADER_INSTANCE" \
+  --trusted-escrows "$ESCROW" \
+  --json \
   2>&1 | tee "$SNAP/bob-trader-spawn.log"
 
-grep -qE 'Container ready|hm\.spawn_ready' "$SNAP/bob-trader-spawn.log" \
-  || { echo "ASSERT FAIL (bob-trader-spawn): no spawn_ready in spawn log" >&2; exit 1; }
-echo "ASSERT OK (bob-trader-spawn): bob-trader instance accepted by host manager"
+grep -qE '"tenant_direct_address"|tenant_direct_address' "$SNAP/bob-trader-spawn.log" \
+  || { echo "ASSERT FAIL (bob-trader-spawn): no tenant_direct_address in spawn log" >&2; exit 1; }
+echo "ASSERT OK (bob-trader-spawn): bob-trader instance spawned on bob's local HM"
 
 # ---------------------------------------------------------------------------
-# Section 4 — Wait for both tenants to be RUNNING + ACP-ready
+# Section 4 — ACP smoke probe each tenant (primes the Nostr `since` cursor)
 # ---------------------------------------------------------------------------
-banner "Section 4: Wait for both tenants to be RUNNING + ACP-ready"
+banner "Section 4: ACP smoke probe each tenant"
 
 wait_for_tenant_running "$PEER_ALICE" alice "$ALICE_TRADER_INSTANCE" \
-  "$ALICE_TRADER_TAG" "$SNAP/alice-trader-inspect.log" 180
+  "$ALICE_TRADER_TAG" "$SNAP/alice-trader-acp-probe.log" 180
 wait_for_tenant_running "$PEER_BOB" bob "$BOB_TRADER_INSTANCE" \
-  "$BOB_TRADER_TAG" "$SNAP/bob-trader-inspect.log" 180
+  "$BOB_TRADER_TAG" "$SNAP/bob-trader-acp-probe.log" 180
 
 # Brief settle so each tenant's MarketModule subscription and Nostr
 # `since` cursor are fully primed before the controller starts hammering
@@ -1209,8 +1200,10 @@ fi
 # ---------------------------------------------------------------------------
 # Section 12 — Final banner
 #
-# Tenant cleanup (sphere host stop) happens in `cleanup()` on EXIT,
-# gated by KEEP_TENANTS. Default behavior: stop both tenants on exit.
+# Tenant cleanup (`sphere trader stop`) happens in `cleanup()` on EXIT.
+# Default behavior: stop both tenants on exit and auto-tear-down each
+# peer's per-user local HM. KEEP_TENANTS=1 forwards `--keep-hm` so the
+# HM containers stay running for inspection.
 # ---------------------------------------------------------------------------
 banner "ALL GREEN — trader round-trip succeeded"
 echo "Summary (smallest-unit deltas):"
