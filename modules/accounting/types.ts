@@ -393,8 +393,11 @@ export interface CreateInvoiceResult {
   readonly success: boolean;
   /** Invoice token ID (if successful) */
   readonly invoiceId?: string;
-  /** Invoice token in TXF format (if successful) */
-  readonly token?: TxfToken;
+  /**
+   * The transmittable v2 invoice blob, hex-encoded (if successful) — pass it
+   * to `importInvoice` on the receiving side.
+   */
+  readonly token?: string;
   /** Parsed invoice terms (if successful) */
   readonly terms?: InvoiceTerms;
   /** Error message (if failed) */

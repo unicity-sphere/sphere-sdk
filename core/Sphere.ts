@@ -119,7 +119,7 @@ import {
   isSQLiteDatabase,
   isWalletDatEncrypted,
 } from '../serialization/wallet-dat';
-import { createSphereTokenEngine, deriveDirectAddress, type ITokenEngine } from '../token-engine';
+import { createSphereTokenEngine, createUnicityIdMinter, deriveDirectAddress, type ITokenEngine } from '../token-engine';
 import { normalizeNametag, isPhoneNumber } from '@unicitylabs/nostr-js-sdk';
 
 export function isValidNametag(nametag: string): boolean {
@@ -884,6 +884,9 @@ export class Sphere {
       // Now publish identity binding (with recovered nametag if found)
       progress?.({ step: 'syncing_identity', message: 'Publishing identity...' });
       await sphere.syncIdentityWithTransport();
+      // Re-mint + store the on-chain Unicity ID claim if it is missing
+      // (best-effort, idempotent — no-op without a nametag).
+      sphere.ensureUnicityIdTokenStored();
     }
 
     // Auto-discover previously used HD addresses
@@ -1093,6 +1096,9 @@ export class Sphere {
       // Publish identity binding (with recovered nametag if found)
       progress?.({ step: 'syncing_identity', message: 'Publishing identity...' });
       await sphere.syncIdentityWithTransport();
+      // Re-mint + store the on-chain Unicity ID claim if it is missing
+      // (best-effort, idempotent — no-op without a nametag).
+      sphere.ensureUnicityIdTokenStored();
     }
 
     // Mark wallet as created only after successful initialization
@@ -2393,8 +2399,9 @@ export class Sphere {
       await this.syncIdentityWithTransport();
     }
 
-    // If a new nametag was registered on switch, persist the cache and emit. D5: there is no
-    // on-chain nametag token to mint — the Nostr binding (published in registerNametag) is the record.
+    // If a new nametag was registered on switch, persist the cache and emit. The Nostr
+    // binding stays the registration record (D5); the on-chain UnicityIdToken claim is
+    // additionally minted + stored below, best-effort.
     if (newNametag) {
       await this.persistAddressNametags();
 
@@ -2403,6 +2410,10 @@ export class Sphere {
         addressIndex: index,
       });
     }
+
+    // Mint + store the on-chain Unicity ID claim for this address if missing
+    // (covers both a newly registered and a recovered nametag; no-op otherwise).
+    this.ensureUnicityIdTokenStored();
   }
 
   /**
@@ -3356,6 +3367,69 @@ export class Sphere {
       addressIndex: this._currentAddressIndex,
     });
     logger.debug('Sphere', `Unicity ID registered for address ${this._currentAddressIndex}:`, cleanNametag);
+
+    // Mint + store the on-chain claim (best-effort, never blocks registration).
+    this.ensureUnicityIdTokenStored();
+  }
+
+  /**
+   * Best-effort: mint + store the self-issued v2 UnicityIdToken for the current
+   * address's nametag. The on-chain claim is kept minted + stored at creation
+   * (as the v1 nametag mint did), while RUNTIME name resolution stays
+   * Nostr-binding-only per D5 — the token is not consumed anywhere yet.
+   *
+   * Fire-and-forget: a gateway outage or missing v2 oracle config never fails
+   * registration/load; the mint is deterministic per (name, address key), so a
+   * later load re-mints the identical token (lost-storage recovery).
+   */
+  private ensureUnicityIdTokenStored(): void {
+    const name = this._identity?.nametag;
+    if (!name) return;
+    // Capture the address-bound collaborators NOW: the mint below is a
+    // multi-second network round-trip, and switchToAddress() swaps
+    // this._payments/this._identity synchronously — a late re-read would store
+    // address A's token into address B's nametag list.
+    const payments = this._payments;
+    const privateKey = this._identity?.privateKey;
+    void (async () => {
+      try {
+        // Already stored for this address? (v2 entries carry the CBOR hex string.)
+        const existing = payments
+          .getNametags()
+          .find((n) => n.name === name && n.format === 'v2-cbor' && typeof n.token === 'string');
+        if (existing) return;
+
+        const oracle = this._oracle as {
+          getTrustBaseJson?: () => unknown;
+          getAggregatorUrl?: () => string;
+          getApiKey?: () => string | undefined;
+        };
+        const trustBaseJson = oracle.getTrustBaseJson?.() ?? null;
+        const aggregatorUrl = oracle.getAggregatorUrl?.();
+        if (!trustBaseJson || !aggregatorUrl || !privateKey) {
+          logger.warn('Sphere', `Unicity ID token for @${name} not minted (no v2 oracle config) — retried on next load`);
+          return;
+        }
+
+        const minter = createUnicityIdMinter({
+          aggregatorUrl,
+          apiKey: oracle.getApiKey?.(),
+          privateKey: hexToBytes(privateKey),
+          trustBaseJson,
+        });
+        const result = await minter.mintUnicityIdToken(name);
+        await payments.setNametag({
+          name,
+          token: result.tokenCborHex,
+          timestamp: Date.now(),
+          format: 'v2-cbor',
+          version: '2.0',
+        });
+        logger.debug('Sphere', `Unicity ID token minted + stored for @${name} (${result.tokenId.slice(0, 12)}...)`);
+      } catch (err) {
+        logger.warn('Sphere', `Unicity ID token mint failed for @${name} (non-fatal, retried on next load):`, err);
+      }
+    })();
   }
 
   /**

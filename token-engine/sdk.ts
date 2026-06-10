@@ -74,6 +74,12 @@ export { SplitMintJustificationVerifier } from '@unicitylabs/state-transition-sd
 export { VerificationStatus } from '@unicitylabs/state-transition-sdk/lib/verification/VerificationStatus.js';
 export { VerificationResult } from '@unicitylabs/state-transition-sdk/lib/verification/VerificationResult.js';
 
+// ── unicity-id (nametag) ────────────────────────────────────────────────────
+export { UnicityId } from '@unicitylabs/state-transition-sdk/lib/unicity-id/UnicityId.js';
+export { UnicityIdMintTransaction } from '@unicitylabs/state-transition-sdk/lib/unicity-id/UnicityIdMintTransaction.js';
+export { CertifiedUnicityIdMintTransaction } from '@unicitylabs/state-transition-sdk/lib/unicity-id/CertifiedUnicityIdMintTransaction.js';
+export { UnicityIdToken } from '@unicitylabs/state-transition-sdk/lib/unicity-id/UnicityIdToken.js';
+
 // ── util ────────────────────────────────────────────────────────────────────
 export { HexConverter } from '@unicitylabs/state-transition-sdk/lib/util/HexConverter.js';
 export { BigintConverter } from '@unicitylabs/state-transition-sdk/lib/util/BigintConverter.js';

@@ -113,10 +113,16 @@ export interface TxfIntegrity {
 
 /**
  * Nametag data (one per identity)
+ *
+ * `token` shape by `format`:
+ * - `'v2-cbor'`: hex-encoded v2 UnicityIdToken CBOR (string) — the self-issued
+ *   on-chain claim minted at registration (stored, unused at runtime).
+ * - legacy `'txf'`: the v1 nametag token JSON (object) — inert since the v1
+ *   cutover, still round-tripped through storage untouched.
  */
 export interface NametagData {
   name: string;
-  token: object;
+  token: object | string;
   timestamp: number;
   format: string;
   version: string;

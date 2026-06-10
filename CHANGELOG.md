@@ -42,7 +42,25 @@ consumed exclusively through the `token-engine/` port. Consequences:
   still point at v1-era aggregators — wallet operations there fail loudly until
   those gateways are cut over to the v2 protocol.
 - **`AccountingModuleDependencies.trustBase` removed** (the engine owns trust);
-  `accounting.importInvoice` accepts the v2 invoice blob (hex string).
+  `accounting.importInvoice` accepts the v2 invoice blob (hex string);
+  `CreateInvoiceResult.token` is now that hex blob `string` (was the v1
+  `TxfToken` object type).
+- **Oracle interface gains three REQUIRED members** the v2 engine is built
+  from: `getTrustBaseJson()`, `getAggregatorUrl()`, `getApiKey()` — custom
+  `OracleProvider` implementations must provide them.
+- **Send-failure money-safety:** finished-but-undelivered transfer blobs are
+  journaled (`PENDING_V2_DELIVERIES`) and replayed on `load()`; sources
+  certified on-chain during a failed send become terminal `'spent'` (never
+  restored to `'confirmed'`); tokens stuck `'transferring'` after a crash are
+  reconciled against the network on `load()`.
+- **Unicity ID on-chain claim is minted + stored at nametag registration**
+  (`registerNametag`, init/load recovery, address switch): a self-issued v2
+  `UnicityIdToken` saved as `NametagData { format: 'v2-cbor', token: <hex> }`
+  (`NametagData.token` widened to `object | string`). Best-effort + idempotent —
+  a gateway outage never fails registration; runtime name resolution stays
+  Nostr-binding-only. On networks without a v2 oracle config a warn is logged
+  on each load. New exports: `createUnicityIdMinter`, `IUnicityIdMinter`,
+  `UnicityIdMintResult` (token-engine).
 
 ### Added
 - **`cacheMessages` option for CommunicationsModule** — `communications: { cacheMessages: false }` in `SphereInitOptions` disables DM caching in memory and storage. Messages still flow through `onDirectMessage()` handlers and `message:dm` events, but are never stored. Useful for anonymous/ephemeral agents (e.g. LLM bots) that only need streaming DM reception. `sendDM()` still works but doesn't cache the sent message. Deduplication is skipped when caching is disabled.

@@ -1079,16 +1079,12 @@ export class AccountingModule {
       // ------------------------------------------------------------------
       // Step 15: Return result
       // ------------------------------------------------------------------
-      // v1: the TxfToken JSON (round-trips from sdkData). v2: the engine blob hex
-      // (the transmittable form; the v2 importInvoice path decodes it).
-      const txfToken: TxfToken = engine
-        ? (sdkData as unknown as TxfToken)
-        : (JSON.parse(sdkData) as TxfToken);
-
       return {
         success: true,
         invoiceId,
-        token: txfToken,
+        // The transmittable v2 invoice blob (hex) — feed it to importInvoice
+        // on the receiving side.
+        token: sdkData,
         terms,
       };
     } catch (err) {
@@ -1153,8 +1149,19 @@ export class AccountingModule {
     // v2: `token` is the engine blob (hex). The proof chain (engine.verify)
     // binds the genesis data (= the invoice terms) to the on-chain commitment.
     // The data token's type is established at mint (mintDataToken), so no
-    // separate type check.
-    const sphereToken = await engine.decodeToken(decodeTokenBlob(hexToBytes(token as unknown as string)));
+    // separate type check. Decode failures (non-hex strings — incl. v1 TXF
+    // JSON strings — base64, truncated or non-blob CBOR) surface as the
+    // documented INVOICE_INVALID_DATA instead of raw noble/CBOR errors.
+    let sphereToken;
+    try {
+      sphereToken = await engine.decodeToken(decodeTokenBlob(hexToBytes(token as unknown as string)));
+    } catch (err) {
+      throw new SphereError(
+        'Invoice import failed: token is not a valid v2 invoice blob (legacy v1 TXF strings are not supported — ask the issuer for a v2 invoice blob).',
+        'INVOICE_INVALID_DATA',
+        err instanceof Error ? err : undefined,
+      );
+    }
     const verifyResult = await engine.verify(sphereToken);
     if (!verifyResult.ok) {
       throw new SphereError('Invoice import failed: inclusion proof is invalid.', 'INVOICE_INVALID_PROOF');

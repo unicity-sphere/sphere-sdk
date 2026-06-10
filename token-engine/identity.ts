@@ -20,8 +20,13 @@
 
 import { CborSerializer, DataHasher, HashAlgorithm, HexConverter } from './sdk';
 
-/** Unicity L3 token type used for identity-address derivation (immutable). */
-const UNICITY_TOKEN_TYPE_HEX = 'f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe397867509';
+/**
+ * Unicity L3 token type used for identity-address derivation (immutable).
+ * Also pinned as the fixed token type of self-issued Unicity ID tokens
+ * (token-engine/unicity-id.ts) — the same constant the v1 nametag mint used,
+ * keeping the mint deterministic per (name, wallet key).
+ */
+export const UNICITY_TOKEN_TYPE_HEX = 'f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe397867509';
 /** v1 `SigningService.algorithm` for secp256k1. */
 const SIGNING_ALGORITHM = 'secp256k1';
 /** v1 `EmbeddedPredicateType.UNMASKED`. */
