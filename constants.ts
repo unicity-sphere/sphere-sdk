@@ -568,16 +568,24 @@ export type NetworkConfig = (typeof NETWORKS)[NetworkType];
  * so a wallet initialised with `swap: true` (no explicit escrow override) can
  * still propose / accept swaps without per-call wiring.
  *
- * Versioned (`-v1`) so a future operator rotation (e.g. when the production
+ * Versioned suffix so a future operator rotation (e.g. when the production
  * escrow daemon's transport key changes and the old binding is no longer
- * recoverable) can publish a new nametag (`-v2`, `-v3`, ...) without breaking
- * older SDK builds that still reference the previous default.
+ * recoverable) can publish a new nametag (`-02`, `-03`, ...) without
+ * breaking older SDK builds that still reference the previous default.
  *
- * Tracked in sphere-sdk#456: the previous default `@escrow-testnet` was never
- * published by the production daemon and proved unrecoverable; rotating to a
- * fresh nametag was the operationally cheapest fix.
+ * Tracked in sphere-sdk#456:
+ *   - `@escrow-testnet`    — original default; the production daemon never
+ *                            published it (operator missed the env var).
+ *   - `@escrow-testnet-v1` — first rotation attempt; landed on the production
+ *                            tenant's secondary HD address via custom
+ *                            multi-address routing, but the routing had
+ *                            subtle relay-subscription gaps.
+ *   - `@escrow-test-01`    — current default. Owned by a freshly-initialised
+ *                            escrow tenant wallet so the nametag is the
+ *                            tenant's sole primary identity — no
+ *                            cross-address routing needed.
  */
-export const DEFAULT_ESCROW_ADDRESS = '@escrow-testnet-v1' as const;
+export const DEFAULT_ESCROW_ADDRESS = '@escrow-test-01' as const;
 
 // =============================================================================
 // Timeouts & Limits
