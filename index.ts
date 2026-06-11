@@ -56,6 +56,7 @@ export type {
   SphereInitOptions,
   SphereInitResult,
   SphereImportOptions,
+  SphereWalletApiSession,
   InitProgressStep,
   InitProgress,
   InitProgressCallback,
@@ -207,6 +208,20 @@ export {
   FIELD_ENVELOPE_MAX_BYTES,
 } from './core';
 
+// Delivery port (sdk-changes S7) — the swappable seam for handing finished
+// token blobs to recipients (covenant §3.1-6); wallet-api's mailbox provider
+// (impl/shared/wallet-api) is the reference implementation.
+export { computeDeliveryId, deliveryKeysFromBlob } from './transport';
+export type {
+  DeliveryProvider,
+  DeliveryReceipt,
+  DeliverOptions,
+  IncomingDelivery,
+  DeliveryDisposition,
+  DeliveryCustody,
+  DeliveryBlobKeys,
+} from './transport';
+
 export type {
   // Transport
   TransportProvider,
@@ -248,6 +263,7 @@ export {
 export type {
   PaymentsModuleConfig,
   PaymentsModuleDependencies,
+  PaymentsWalletApiPort,
   ReceiveOptions,
   ReceiveResult,
   TransactionHistoryEntry,

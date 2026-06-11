@@ -234,6 +234,25 @@ export class FakeTokenEngine implements ITokenEngine {
   }
 }
 
+/**
+ * Decode a fake inner-token state's value — the injectable `decodeAssets`
+ * port for FakeWalletApi (the §8.2 step-6 stand-in), so wallet-api
+ * integration tests can run PaymentsModule + FakeTokenEngine against the
+ * fake backend's deposit/apply validation pipeline.
+ */
+export function decodeFakeTokenAssets(
+  tokenBytes: Uint8Array
+): { coinId: string; amount: bigint }[] | null {
+  try {
+    const state = decodeFakeState(tokenBytes);
+    if (!state.genesisData || !isSpherePaymentData(state.genesisData)) return null;
+    const value = SpherePaymentData.fromCBOR(state.genesisData).toValue();
+    return value.assets.map((a) => ({ coinId: a.coinId, amount: a.amount }));
+  } catch {
+    return null;
+  }
+}
+
 // fake-token state: CBOR array[ tokenId, stateId, owner, genesisData?, transferMemo? ]
 function encodeFakeState(state: FakeState): Uint8Array {
   return CborSerializer.encodeArray(

@@ -59,10 +59,12 @@ import type {
 import { SphereError } from './errors';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../storage';
 import type { TransportProvider, PeerInfo } from '../transport';
+import type { DeliveryProvider } from '../transport/delivery-provider';
 import { MultiAddressTransportMux, AddressTransportAdapter } from '../transport/MultiAddressTransportMux';
 import type { OracleProvider } from '../oracle';
 import type { PriceProvider } from '../price';
 import { PaymentsModule, createPaymentsModule } from '../modules/payments';
+import type { PaymentsWalletApiPort } from '../modules/payments';
 import { CommunicationsModule, createCommunicationsModule } from '../modules/communications';
 import type { CommunicationsModuleConfig } from '../modules/communications';
 import { GroupChatModule, createGroupChatModule } from '../modules/groupchat';
@@ -164,6 +166,20 @@ export type InitProgressCallback = (progress: InitProgress) => void;
 // Options Types
 // =============================================================================
 
+/**
+ * The wallet-api session surface Sphere drives (sdk-changes S4): the auth
+ * lifecycle plus the PaymentsModule client slice. Structural — the S1
+ * `WalletApiClient` satisfies it without importing it here.
+ */
+export interface SphereWalletApiSession extends PaymentsWalletApiPort {
+  /** Bind the active wallet identity (resets the session). */
+  setIdentity(identity: { privateKey: string; chainPubkey: string }): void;
+  /** Establish a session (refresh-first, challenge fallback) — sign-in on unlock. */
+  signIn(): Promise<void>;
+  /** Revoke the session — logout on account switch. */
+  logout(): Promise<void>;
+}
+
 /** Options for creating a new wallet */
 export interface SphereCreateOptions {
   /** BIP39 mnemonic (12 or 24 words) */
@@ -180,6 +196,18 @@ export interface SphereCreateOptions {
   transport: TransportProvider;
   /** Oracle provider instance */
   oracle: OracleProvider;
+  /**
+   * Delivery port (sdk-changes S7). When provided, asset transfers ride it
+   * exclusively (wallet-api mailbox in the S4 presets); messaging, group chat
+   * and nametags stay on Nostr. Omit for the legacy relay asset path.
+   */
+  delivery?: DeliveryProvider;
+  /**
+   * wallet-api session (S4): the auth lifecycle (sign-in on unlock, logout on
+   * account switch, intent resume at sign-in) plus the E.3/§10 client slice
+   * injected into PaymentsModule. `WalletApiClient` satisfies it as-is.
+   */
+  walletApi?: SphereWalletApiSession;
   /** L1 (ALPHA blockchain) configuration. Pass null to disable L1 entirely. */
   l1?: L1Config | null;
   /** Optional price provider for fiat conversion */
@@ -225,6 +253,18 @@ export interface SphereLoadOptions {
   transport: TransportProvider;
   /** Oracle provider instance */
   oracle: OracleProvider;
+  /**
+   * Delivery port (sdk-changes S7). When provided, asset transfers ride it
+   * exclusively (wallet-api mailbox in the S4 presets); messaging, group chat
+   * and nametags stay on Nostr. Omit for the legacy relay asset path.
+   */
+  delivery?: DeliveryProvider;
+  /**
+   * wallet-api session (S4): the auth lifecycle (sign-in on unlock, logout on
+   * account switch, intent resume at sign-in) plus the E.3/§10 client slice
+   * injected into PaymentsModule. `WalletApiClient` satisfies it as-is.
+   */
+  walletApi?: SphereWalletApiSession;
   /** L1 (ALPHA blockchain) configuration. Pass null to disable L1 entirely. */
   l1?: L1Config | null;
   /** Optional price provider for fiat conversion */
@@ -288,6 +328,18 @@ export interface SphereImportOptions {
   transport: TransportProvider;
   /** Oracle provider instance */
   oracle: OracleProvider;
+  /**
+   * Delivery port (sdk-changes S7). When provided, asset transfers ride it
+   * exclusively (wallet-api mailbox in the S4 presets); messaging, group chat
+   * and nametags stay on Nostr. Omit for the legacy relay asset path.
+   */
+  delivery?: DeliveryProvider;
+  /**
+   * wallet-api session (S4): the auth lifecycle (sign-in on unlock, logout on
+   * account switch, intent resume at sign-in) plus the E.3/§10 client slice
+   * injected into PaymentsModule. `WalletApiClient` satisfies it as-is.
+   */
+  walletApi?: SphereWalletApiSession;
   /** L1 (ALPHA blockchain) configuration. Pass null to disable L1 entirely. */
   l1?: L1Config | null;
   /** Optional price provider for fiat conversion */
@@ -335,6 +387,18 @@ export interface SphereInitOptions {
   transport: TransportProvider;
   /** Oracle provider instance */
   oracle: OracleProvider;
+  /**
+   * Delivery port (sdk-changes S7). When provided, asset transfers ride it
+   * exclusively (wallet-api mailbox in the S4 presets); messaging, group chat
+   * and nametags stay on Nostr. Omit for the legacy relay asset path.
+   */
+  delivery?: DeliveryProvider;
+  /**
+   * wallet-api session (S4): the auth lifecycle (sign-in on unlock, logout on
+   * account switch, intent resume at sign-in) plus the E.3/§10 client slice
+   * injected into PaymentsModule. `WalletApiClient` satisfies it as-is.
+   */
+  walletApi?: SphereWalletApiSession;
   /** Optional token storage provider (for IPFS sync) */
   tokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
   /** BIP39 mnemonic - if wallet doesn't exist, use this to create */
@@ -487,6 +551,10 @@ export class Sphere {
   private _transport: TransportProvider;
   private _oracle: OracleProvider;
   private _priceProvider: PriceProvider | null;
+  /** Delivery port (S7) — null = legacy transport adapter inside PaymentsModule. */
+  private _delivery: DeliveryProvider | null = null;
+  /** wallet-api session (S4) — null in fully-local compositions. */
+  private _walletApi: SphereWalletApiSession | null = null;
   /** v2 token engine (built per active address from the oracle); injected into modules. */
   private _tokenEngine: ITokenEngine | undefined;
 
@@ -534,11 +602,15 @@ export class Sphere {
     accountingConfig?: AccountingModuleConfig,
     swapConfig?: SwapModuleConfig,
     communicationsConfig?: CommunicationsModuleConfig,
+    delivery?: DeliveryProvider,
+    walletApi?: SphereWalletApiSession,
   ) {
     this._storage = storage;
     this._transport = transport;
     this._oracle = oracle;
     this._priceProvider = priceProvider ?? null;
+    this._delivery = delivery ?? null;
+    this._walletApi = walletApi ?? null;
 
     // Initialize token storage providers map
     if (tokenStorage) {
@@ -842,6 +914,8 @@ export class Sphere {
       accountingConfig,
       swapConfig,
       options.communications,
+      options.delivery,
+      options.walletApi,
     );
     sphere._password = options.password ?? null;
 
@@ -943,6 +1017,8 @@ export class Sphere {
       accountingConfig,
       swapConfig,
       options.communications,
+      options.delivery,
+      options.walletApi,
     );
     sphere._password = options.password ?? null;
 
@@ -1047,6 +1123,8 @@ export class Sphere {
       accountingConfig,
       swapConfig,
       options.communications,
+      options.delivery,
+      options.walletApi,
     );
     sphere._password = options.password ?? null;
 
@@ -2245,6 +2323,16 @@ export class Sphere {
       throw new SphereError('Invalid Unicity ID format. Use lowercase alphanumeric, underscore, or hyphen (3-20 chars), or a valid phone number.', 'VALIDATION_ERROR');
     }
 
+    // S4 auth lifecycle: the wallet-api session is per identity — log out
+    // before switching; the new address's module init signs back in.
+    if (this._walletApi && index !== this._currentAddressIndex) {
+      try {
+        await this._walletApi.logout();
+      } catch (err) {
+        logger.warn('Sphere', 'wallet-api logout on address switch failed (continuing):', err);
+      }
+    }
+
     // Derive the address at the given index
     const addressInfo = this.deriveAddress(index, false);
 
@@ -2336,6 +2424,8 @@ export class Sphere {
           chainCode: this._masterKey?.chainCode || undefined,
           price: this._priceProvider ?? undefined,
           tokenEngine: moduleSet.tokenEngine,
+          delivery: this._delivery ?? undefined,
+          walletApi: this._walletApi ?? undefined,
         });
       }
     }
@@ -2476,6 +2566,8 @@ export class Sphere {
       chainCode: this._masterKey?.chainCode || undefined,
       price: this._priceProvider ?? undefined,
       tokenEngine,
+      delivery: this._delivery ?? undefined,
+      walletApi: this._walletApi ?? undefined,
     });
 
     communications.initialize({
@@ -2551,6 +2643,10 @@ export class Sphere {
 
     // payments.load() is critical — must succeed for wallet to be usable
     await payments.load();
+
+    // S4 auth lifecycle: sign in as this address's identity and resume its
+    // open intents (E.3) — sign-in on unlock / after an account switch.
+    await this.startWalletApiSession(payments);
 
     // Non-critical modules load in parallel — failures are non-fatal
     const results = await Promise.allSettled([
@@ -4351,6 +4447,8 @@ export class Sphere {
       price: this._priceProvider ?? undefined,
       disabledProviderIds: this._disabledProviders,
       tokenEngine,
+      delivery: this._delivery ?? undefined,
+      walletApi: this._walletApi ?? undefined,
     });
 
     this._communications.initialize({
@@ -4442,6 +4540,9 @@ export class Sphere {
       }
     }
 
+    // S4 auth lifecycle: sign in on unlock and resume open intents (E.3).
+    await this.startWalletApiSession(this._payments);
+
     // Register in per-address module map
     this._addressModules.set(this._currentAddressIndex, {
       index: this._currentAddressIndex,
@@ -4460,6 +4561,33 @@ export class Sphere {
   // ===========================================================================
   // Private: Helpers
   // ===========================================================================
+
+  /**
+   * S4 auth lifecycle: establish the wallet-api session (sign-in on unlock —
+   * silent: the wallet key is available) and resume open intents at sign-in
+   * (E.3 — list + re-run via PaymentsModule, fire-and-forget). A failed
+   * sign-in degrades to offline operation; it never blocks the wallet.
+   */
+  private async startWalletApiSession(payments: PaymentsModule): Promise<void> {
+    if (!this._walletApi) return;
+    try {
+      await this._walletApi.signIn();
+    } catch (err) {
+      logger.warn('Sphere', 'wallet-api sign-in failed — wallet continues offline:', err);
+      return;
+    }
+    void payments
+      .resumeOpenIntents()
+      .then((outcome) => {
+        if (outcome.resumed.length > 0 || outcome.conflicted.length > 0) {
+          logger.warn(
+            'Sphere',
+            `Intent resume: ${outcome.resumed.length} completed, ${outcome.conflicted.length} conflicted (aborted), ${outcome.failed.length} still open`
+          );
+        }
+      })
+      .catch((err) => logger.warn('Sphere', 'Open-intent resume failed (retried next sign-in):', err));
+  }
 
   private ensureReady(): void {
     if (!this._initialized) {

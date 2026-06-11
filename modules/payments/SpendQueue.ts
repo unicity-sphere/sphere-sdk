@@ -44,7 +44,12 @@ export const QUEUE_MAX_SIZE = 100;
 /** A pre-parsed token with its SDK object and bigint amount already computed. */
 export interface ParsedTokenEntry {
   token: Token;
-  /** Opaque per-token handle: a v2 SphereToken (engine path). Pass-through only. */
+  /**
+   * Opaque per-token handle: a v2 SphereToken (engine path). Pass-through only.
+   * `null` for LAZY inventory records (sdk-changes S2): coin-selection plans
+   * from the value metadata alone; the send path materializes the handle via
+   * `getToken()` only for the SELECTED sources.
+   */
   sdkToken: unknown;
   amount: bigint;
 }
@@ -114,7 +119,15 @@ export class SpendPlanner {
     for (const t of tokens) {
       if (t.coinId !== coinId) continue;
       if (t.status !== 'confirmed') continue;
-      if (!t.sdkData) continue;
+      if (!t.sdkData) {
+        // Lazy inventory record (sdk-changes S2): plan from the value
+        // metadata; the blob (and SphereToken handle) is fetched on demand by
+        // the send path only when this token is actually selected.
+        if (t.lazy && /^[0-9]+$/.test(t.amount) && BigInt(t.amount) > 0n) {
+          pool.set(t.id, { token: t, sdkToken: null, amount: BigInt(t.amount) });
+        }
+        continue;
+      }
 
       try {
         const { sdkToken, amount } = await this.parseViaEngine(t.sdkData, coinId);

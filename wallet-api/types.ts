@@ -133,6 +133,94 @@ export interface IntentRecord {
   createdAt: number;
 }
 
+// ── mailbox (§6/§16) ──────────────────────────────────────────────────────────
+
+/** `POST /v1/mailbox` request (§16). `memo` is the S6 `enc1.` envelope, verbatim. */
+export interface MailboxDepositRequest {
+  /** Recipient's 33-byte compressed chain pubkey (hex) — §6 addressing. */
+  recipientPubkey: string;
+  /** Content-addressed blob-store key of the already-uploaded blob (§5.2). */
+  key: string;
+  /** The send's transferId — §5.3 evidence lookup uses the STORED value. */
+  transferId: string;
+  /** Claimed final state hash — `hex(SHA-256(inner token bytes))`. */
+  stateHash: string;
+  /** Claimed genesis-stable token id. */
+  tokenId: string;
+  /** Optional S6-encrypted memo envelope. */
+  memo?: string;
+}
+
+export type MailboxEntryStatus = 'pending' | 'claimed' | 'rejected';
+
+/** One `GET /v1/mailbox` entry (§16). */
+export interface MailboxEntry {
+  /** Content-derived entry id — `hex(SHA-256(tokenId ‖ stateHash))` (§6). */
+  entryId: string;
+  /** Per-recipient gap-free, commit-ordered seq (§9). */
+  seq: bigint;
+  status: MailboxEntryStatus;
+  transferId: string;
+  tokenId: string;
+  /** Decoded value of the deposited blob (per §8.2 step 6). */
+  assets: { coinId: string; amount: bigint }[];
+  senderPubkey: string;
+  /** S6 `enc1.` envelope, verbatim (the server never sees plaintext). */
+  memo?: string;
+  createdAt: number;
+  /** Signed GET for the blob — present while the blob is retained (§6). */
+  getUrl?: string;
+  /** True once the blob was garbage-collected after resolution (§6). */
+  blobCollected?: boolean;
+}
+
+/** `GET /v1/mailbox?since=` page (§16). */
+export interface MailboxPage {
+  /** Highest contiguous resolved seq — the discovery cursor (§6). */
+  readPointer: bigint;
+  syncEpoch: bigint;
+  more: boolean;
+  entries: MailboxEntry[];
+}
+
+/** `POST /v1/mailbox/claim` result (§16). */
+export interface MailboxClaimResult {
+  claimed: string[];
+  /** Already-claimed entries with their STORED disposition (§6). */
+  alreadyClaimed: { entryId: string; intoInventory: boolean }[];
+  /** Defensive bucket — an entry that would now violate lineage (§5.3). */
+  failed: { entryId: string; code: string }[];
+}
+
+// ── history (§10/§16) ─────────────────────────────────────────────────────────
+
+/**
+ * One client-asserted history record (§10 — the server never writes history).
+ * `memo` and `counterpartyNametag` are S6 `enc1.` envelopes, verbatim (§8.3).
+ */
+export interface HistoryWireRecord {
+  /** Client dedup key — POST is idempotent by it. */
+  dedupKey: string;
+  type: string;
+  timestamp: number;
+  /** Decimal-string amounts (§11). */
+  assets: { coinId: string; amount: string }[];
+  transferId?: string;
+  tokenId?: string;
+  counterpartyPubkey?: string;
+  /** S6 envelope. */
+  memo?: string;
+  /** S6 envelope. */
+  counterpartyNametag?: string;
+}
+
+/** `GET /v1/history` page (§16): newest-first, opaque keyset cursor. */
+export interface HistoryPage {
+  records: HistoryWireRecord[];
+  /** Pass as `before` to fetch the next (older) page; absent when drained. */
+  nextBefore?: string;
+}
+
 /** WS wake nudge (§9): pull that stream's cursor; never a correctness dependency. */
 export interface WakeEvent {
   stream: 'inventory' | 'mailbox' | 'payment_requests';

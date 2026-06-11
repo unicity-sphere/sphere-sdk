@@ -157,10 +157,12 @@ describe('send() — failure recovery (v2)', () => {
     expect(tokens).toHaveLength(1);
     expect(tokens[0].status).toBe('spent');
 
-    // The finished blob is journaled for replay.
+    // The finished blob is journaled for replay. Since S3 the journal records
+    // the recipient's CHAIN pubkey — the delivery port's canonical addressing
+    // (the transport adapter resolves it to the transport pubkey at send time).
     const entries = journal(storage);
     expect(entries).toHaveLength(1);
-    expect(entries[0].recipientPubkey).toBe('bob-transport-pubkey');
+    expect(entries[0].recipientPubkey).toBe(BOB_CHAIN_PUBKEY);
 
     // The restore was persisted (a crash now must not resurrect 'transferring').
     expect(tokenStorage.save).toHaveBeenCalled();

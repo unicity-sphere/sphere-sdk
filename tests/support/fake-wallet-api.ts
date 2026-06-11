@@ -17,6 +17,14 @@
  *   - inventory/apply: idempotency, added-blob validation, lineage,
  *     evidence-marked tombstones (§5.3);
  *   - intents: write-once / abort / complete semantics (§16);
+ *   - mailbox (§6/§16): deposit validation + content-derived entry_id
+ *     idempotency (recipient/key mismatch 409), unclaimed + per-pair caps
+ *     (429), claim ownership handoff with alreadyClaimed dispositions /
+ *     intoInventory variants / the asymmetric false→true upgrade / the
+ *     defensive failed bucket, reject-stays-claimable, read pointer,
+ *     blobCollected retention signalling (`collectMailboxBlob()` test hook);
+ *   - history (§10/§16): client-asserted, dedupKey-idempotent POST + keyset
+ *     GET (the server never writes history rows);
  *   - ws-ticket + WS wake nudges (§9);
  *   - `bumpSyncEpoch()` test hook (§5.4 restore semantics).
  */
@@ -53,11 +61,43 @@ interface InventoryRow {
   removal?: 'evidenced' | 'unevidenced' | 'external';
 }
 
+/** One mailbox entry (§6): append-only per recipient, content-derived id. */
+interface MailboxEntryRow {
+  /** `hex(SHA-256(tokenId bytes ‖ stateHash bytes))` (§6). */
+  entryId: string;
+  /** Per-recipient monotonic, gap-free seq (§6/§9). */
+  seq: bigint;
+  status: 'pending' | 'claimed' | 'rejected';
+  recipientPubkey: string;
+  senderPubkey: string;
+  transferId: string;
+  tokenId: string;
+  stateHash: string;
+  /** Content-addressed blob key (§5.2) — claim takes `state_hash`/assets from the entry. */
+  s3Key: string;
+  assets: FakeAsset[];
+  /** S6 `enc1.` envelope, stored verbatim (§8.3) — the server never sees plaintext. */
+  memo?: string;
+  createdAt: string;
+  /** Stored claim disposition — reported in alreadyClaimed (§6). */
+  claimedIntoInventory?: boolean;
+  /** §5.4/§6: blob garbage-collected after the post-resolution retention window. */
+  blobCollected: boolean;
+}
+
 interface OwnerState {
   cursor: bigint; // gap-free, commit-ordered per-owner counter (§9)
   rows: Map<string, InventoryRow>; // one row per (owner, token) (§5.1)
   appliedTransfers: Map<string, bigint>; // §5.3 step 1 idempotency record
   intents: Map<string, { payload: string; status: 'open' | 'completed' | 'aborted'; createdAt: string }>;
+  /** Mailbox entries ADDRESSED TO this owner (§6), keyed by entry_id. */
+  mailbox: Map<string, MailboxEntryRow>;
+  /** Per-recipient monotonic mailbox seq counter (§6) — separate from `cursor`. */
+  mailboxSeq: bigint;
+  /** Highest contiguous resolved (claimed|rejected) seq — the discovery cursor (§6). */
+  readPointer: bigint;
+  /** Client-asserted history records by dedupKey (§10) in arrival order. */
+  history: Map<string, Record<string, unknown>>;
 }
 
 interface Session {
@@ -91,6 +131,10 @@ export interface FakeWalletApiOptions {
   wsTicketTtlMs?: number; // WS_TICKET_TTL (§14), default 30 s
   maxBlobBytes?: number; // MAX_BLOB_BYTES (§14), default 16 MiB
   intentMaxBytes?: number; // intent payload cap (§7), default 4 KiB
+  /** Per-recipient unclaimed-entry cap (§5.5/§6), default 1000. */
+  mailboxUnclaimedCap?: number;
+  /** Per-(recipient, sender) unclaimed sub-cap (§6), default 100. */
+  mailboxPerPairCap?: number;
   /**
    * APPROXIMATION of §8.2 steps 3–6: the real backend CBOR-decodes the v2
    * token, runs `token.verify` against the pinned trustbase and decodes the
@@ -105,6 +149,12 @@ export interface FakeWalletApiOptions {
 
 function hex(bytes: Uint8Array): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function hexToBytes(hexStr: string): Uint8Array {
+  const out = new Uint8Array(hexStr.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hexStr.slice(i * 2, i * 2 + 2), 16);
+  return out;
 }
 
 function defaultDecodeAssets(tokenBytes: Uint8Array): FakeAsset[] | null {
@@ -148,6 +198,8 @@ export class FakeWalletApi {
   private readonly wsTicketTtlMs: number;
   private readonly maxBlobBytes: number;
   private readonly intentMaxBytes: number;
+  private readonly mailboxUnclaimedCap: number;
+  private readonly mailboxPerPairCap: number;
   private readonly decodeAssets: (tokenBytes: Uint8Array) => FakeAsset[] | null;
 
   private server: http.Server | null = null;
@@ -181,6 +233,8 @@ export class FakeWalletApi {
     this.wsTicketTtlMs = options.wsTicketTtlMs ?? 30 * 1000; // WS_TICKET_TTL (§14)
     this.maxBlobBytes = options.maxBlobBytes ?? 16 * 1024 * 1024; // MAX_BLOB_BYTES (§14)
     this.intentMaxBytes = options.intentMaxBytes ?? 4096; // intent payload ≤ 4 KiB (§7)
+    this.mailboxUnclaimedCap = options.mailboxUnclaimedCap ?? 1000; // per-recipient unclaimed cap (§5.5)
+    this.mailboxPerPairCap = options.mailboxPerPairCap ?? 100; // per-sender-pair sub-cap (§6)
     this.decodeAssets = options.decodeAssets ?? defaultDecodeAssets;
   }
 
@@ -274,6 +328,68 @@ export class FakeWalletApi {
     return intent ? { payload: intent.payload, status: intent.status } : null;
   }
 
+  /** All mailbox entries addressed to a recipient (test inspection). */
+  listMailboxEntries(
+    recipientPubkey: string
+  ): { entryId: string; status: string; transferId: string; tokenId: string; senderPubkey: string }[] {
+    return [...this.owner(recipientPubkey).mailbox.values()].map((e) => ({
+      entryId: e.entryId,
+      status: e.status,
+      transferId: e.transferId,
+      tokenId: e.tokenId,
+      senderPubkey: e.senderPubkey,
+    }));
+  }
+
+  /** Mailbox entry inspection for tests (status + stored claim disposition). */
+  getMailboxEntry(
+    recipientPubkey: string,
+    entryId: string
+  ): { status: string; intoInventory?: boolean; transferId: string; memo?: string } | null {
+    const entry = this.owner(recipientPubkey).mailbox.get(entryId);
+    if (!entry) return null;
+    return {
+      status: entry.status,
+      ...(entry.claimedIntoInventory !== undefined ? { intoInventory: entry.claimedIntoInventory } : {}),
+      transferId: entry.transferId,
+      ...(entry.memo !== undefined ? { memo: entry.memo } : {}),
+    };
+  }
+
+  /**
+   * §5.4/§6 retention test hook: simulate the post-resolution GC collecting a
+   * resolved entry's blob — the list then serves `blobCollected: true` instead
+   * of a `getUrl`. (The blob store itself is content-addressed and may still
+   * back inventory rows; only the ENTRY's availability flag flips.)
+   */
+  collectMailboxBlob(recipientPubkey: string, entryId: string): void {
+    const entry = this.owner(recipientPubkey).mailbox.get(entryId);
+    if (entry) entry.blobCollected = true;
+  }
+
+  /**
+   * HOSTILE-BACKEND test hook (no §-citation — this is deliberately
+   * contract-violating behavior): flip a resolved entry back to `pending`,
+   * simulating a restored/buggy/malicious backend replaying an
+   * already-resolved delivery. The S7 port contract requires the CLIENT's
+   * persistent (tokenId, stateHash) seen-set to reject it — the recipient
+   * never trusts the backend (ARCHITECTURE §8.2).
+   */
+  tamperMailboxEntryToPending(recipientPubkey: string, entryId: string): void {
+    const recipient = this.owner(recipientPubkey);
+    const entry = recipient.mailbox.get(entryId);
+    if (entry) {
+      entry.status = 'pending';
+      entry.claimedIntoInventory = undefined;
+      recipient.readPointer = 0n;
+    }
+  }
+
+  /** Server-side history inspection for tests (§10). */
+  getHistoryRecords(pubkey: string): Record<string, unknown>[] {
+    return [...this.owner(pubkey).history.values()];
+  }
+
   isSessionRevoked(pubkey: string, deviceId: string): boolean {
     for (const s of this.sessions.values()) {
       if (s.pubkey === pubkey && s.deviceId === deviceId) return s.revoked;
@@ -287,7 +403,16 @@ export class FakeWalletApi {
   private owner(pubkey: string): OwnerState {
     let state = this.owners.get(pubkey);
     if (!state) {
-      state = { cursor: 0n, rows: new Map(), appliedTransfers: new Map(), intents: new Map() };
+      state = {
+        cursor: 0n,
+        rows: new Map(),
+        appliedTransfers: new Map(),
+        intents: new Map(),
+        mailbox: new Map(),
+        mailboxSeq: 0n,
+        readPointer: 0n,
+        history: new Map(),
+      };
       this.owners.set(pubkey, state);
     }
     return state;
@@ -363,6 +488,14 @@ export class FakeWalletApi {
     if (method === 'POST' && path === '/v1/tokens/blob-urls') return this.handleBlobUrls(req, res);
     if (method === 'POST' && path === '/v1/tokens/upload-urls') return this.handleUploadUrls(req, res);
     if (method === 'POST' && path === '/v1/inventory/apply') return this.handleApply(req, res);
+
+    if (method === 'POST' && path === '/v1/mailbox') return this.handleMailboxDeposit(req, res);
+    if (method === 'GET' && path === '/v1/mailbox') return this.handleMailboxList(req, res, url);
+    if (method === 'POST' && path === '/v1/mailbox/claim') return this.handleMailboxClaim(req, res);
+    if (method === 'POST' && path === '/v1/mailbox/reject') return this.handleMailboxReject(req, res);
+
+    if (method === 'POST' && path === '/v1/history') return this.handleHistoryPost(req, res);
+    if (method === 'GET' && path === '/v1/history') return this.handleHistoryGet(req, res, url);
 
     const intentMatch = path.match(/^\/v1\/intents\/([^/]+)(\/(abort|complete))?$/);
     if (intentMatch) return this.handleIntent(req, res, intentMatch[1], intentMatch[3]);
@@ -729,15 +862,29 @@ export class FakeWalletApi {
     // §5.3 lineage precedence: the cross-owner check runs first.
     for (const v of validated) this.checkLineage(v, session.pubkey);
 
-    // §5.3 step 3 — evidence-check every spent token.
-    // APPROXIMATION: the real evidence is a validated output blob on this
-    // backend whose history consumes the spent state — the mailbox deposit of
-    // the same transferId (whole-token transfer) or the split change in
-    // `added`. This fake has no mailbox yet (S3), so: added present ⇒
-    // 'evidenced' (split-change leg), otherwise 'unevidenced'.
-    // externalDelivery declares removals 'external' (§5.3: same
+    // §5.3 step 3 — evidence-check every spent token. The evidence is a
+    // validated output blob on this backend whose history consumes the spent
+    // state: the MAILBOX DEPOSIT of the same transferId (a whole-token
+    // transfer keeps its genesis tokenId — §6 evidence lookup uses the
+    // entry's STORED transfer_id) or the split change in `added`.
+    // APPROXIMATION: the real rule verifies the output blob's transition
+    // chain actually consumes the spent state; this fake matches on
+    // (transferId, tokenId) for deposits and on added-present for the split
+    // leg. externalDelivery declares removals 'external' (§5.3: same
     // never-collected retention as unevidenced, separate metric).
-    const removal = externalDelivery ? 'external' : validated.length > 0 ? 'evidenced' : 'unevidenced';
+    const depositEvidence = (tokenId: string): boolean => {
+      for (const state of this.owners.values()) {
+        for (const entry of state.mailbox.values()) {
+          if (entry.transferId === transferId && entry.tokenId === tokenId) return true;
+        }
+      }
+      return false;
+    };
+    const removalFor = (tokenId: string): 'evidenced' | 'unevidenced' | 'external' => {
+      if (externalDelivery) return 'external';
+      if (validated.length > 0 || depositEvidence(tokenId)) return 'evidenced';
+      return 'unevidenced';
+    };
 
     // §5.3 step 4 — one transaction: tombstone spent (drop asset rows), insert
     // or reactivate added, record applied_transfers, bump the owner cursor —
@@ -751,7 +898,7 @@ export class FakeWalletApi {
       row.status = 'removed';
       row.assets = null; // balances drop at the spend, not later (§5.3 step 4)
       row.seq = owner.cursor;
-      row.removal = removal;
+      row.removal = removalFor(tokenId);
     }
     for (const v of validated) {
       owner.cursor += 1n;
@@ -863,6 +1010,450 @@ export class FakeWalletApi {
     // Remaining cases: unevidenced/external tombstone at equal state
     // (reactivation — the undo path, §5.3) or a different state hash (strict
     // extension, APPROXIMATION above) — acceptance.
+  }
+
+  // ── mailbox (§6, §16) ────────────────────────────────────────────────────────
+
+  /** entry_id = SHA-256(token_id bytes ‖ final state_hash bytes) (§6). */
+  private entryIdFor(tokenIdHex: string, stateHashHex: string): string {
+    const tokenId = hexToBytes(tokenIdHex);
+    const stateHash = hexToBytes(stateHashHex);
+    const joined = new Uint8Array(tokenId.length + stateHash.length);
+    joined.set(tokenId, 0);
+    joined.set(stateHash, tokenId.length);
+    return hex(sha256(joined));
+  }
+
+  /** Locate an entry by id across ALL recipients (entry_id is content-global). */
+  private findMailboxEntry(entryId: string): MailboxEntryRow | null {
+    for (const state of this.owners.values()) {
+      const entry = state.mailbox.get(entryId);
+      if (entry) return entry;
+    }
+    return null;
+  }
+
+  /**
+   * §6 read pointer: the highest CONTIGUOUS seq whose entry is claimed *or*
+   * rejected — a discovery cursor, recomputed server-side inside the
+   * claim/reject transaction. Decoupled from claim idempotency (by entry_id),
+   * so out-of-order claims never corrupt it.
+   */
+  private recomputeReadPointer(recipient: OwnerState): void {
+    const bySeq = new Map<string, MailboxEntryRow>();
+    for (const e of recipient.mailbox.values()) bySeq.set(e.seq.toString(), e);
+    let pointer = recipient.readPointer;
+    for (;;) {
+      const next = bySeq.get((pointer + 1n).toString());
+      if (!next || next.status === 'pending') break;
+      pointer += 1n;
+    }
+    recipient.readPointer = pointer;
+  }
+
+  private async handleMailboxDeposit(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const session = this.authenticate(req);
+    const body = await this.readJsonBody(req);
+    const { recipientPubkey, key, transferId, stateHash, tokenId, memo } = body as {
+      recipientPubkey?: unknown; key?: unknown; transferId?: unknown;
+      stateHash?: unknown; tokenId?: unknown; memo?: unknown;
+    };
+    if (typeof recipientPubkey !== 'string' || !/^0[23][0-9a-f]{64}$/i.test(recipientPubkey)) {
+      throw new HttpError(422, 'VALIDATION', 'recipientPubkey must be a 33-byte compressed secp256k1 key (hex)');
+    }
+    if (typeof key !== 'string' || key === '') throw new HttpError(422, 'VALIDATION', 'key is required');
+    if (typeof transferId !== 'string' || transferId === '') {
+      throw new HttpError(422, 'VALIDATION', 'transferId is required');
+    }
+    if (typeof tokenId !== 'string' || !/^[0-9a-f]{64}$/.test(tokenId)) {
+      throw new HttpError(422, 'VALIDATION', 'tokenId must be 64-hex');
+    }
+    if (typeof stateHash !== 'string' || !/^[0-9a-f]{64}$/.test(stateHash)) {
+      throw new HttpError(422, 'VALIDATION', 'stateHash must be 64-hex');
+    }
+    if (memo !== undefined) {
+      // §8.3 wire mapping: the memo is an `enc1.` envelope, validated for
+      // shape + size cap ONLY and stored verbatim — never plaintext.
+      try {
+        assertFieldEnvelopeShape(memo);
+      } catch (err) {
+        throw new HttpError(422, 'VALIDATION', err instanceof Error ? err.message : 'bad memo envelope');
+      }
+    }
+
+    // §6: deposit is idempotent by entry_id — an entry in ANY status returns
+    // 200 with the existing entryId and changes nothing, PROVIDED the
+    // request's recipient and key match the stored entry; a mismatch is 409,
+    // never a false success.
+    const entryId = this.entryIdFor(tokenId, stateHash);
+    const existing = this.findMailboxEntry(entryId);
+    if (existing) {
+      if (existing.recipientPubkey !== recipientPubkey || existing.s3Key !== key) {
+        throw new HttpError(409, 'CONFLICT', 'entry exists with a different recipient or key');
+      }
+      this.json(res, 200, { entryId });
+      return;
+    }
+
+    // §6/§5.5 caps — what bounds abuse is validation plus quotas, not token
+    // cost: the per-recipient unclaimed cap and the per-sender-pair sub-cap
+    // (so a third party cannot fill the whole inbox). A 429 after
+    // certification is not a loss — the blob is regenerable and the sender's
+    // resume keeps retrying.
+    const recipient = this.owner(recipientPubkey); // accounts auto-provisioned on first touch (§4/§9)
+    let unclaimed = 0;
+    let unclaimedFromSender = 0;
+    for (const e of recipient.mailbox.values()) {
+      if (e.status !== 'pending') continue;
+      unclaimed++;
+      if (e.senderPubkey === session.pubkey) unclaimedFromSender++;
+    }
+    if (unclaimed >= this.mailboxUnclaimedCap) {
+      throw new HttpError(429, 'RATE_LIMITED', 'recipient unclaimed-entry cap reached (§5.5)');
+    }
+    if (unclaimedFromSender >= this.mailboxPerPairCap) {
+      throw new HttpError(429, 'RATE_LIMITED', 'per-sender-pair unclaimed sub-cap reached (§6)');
+    }
+
+    // §8.2 deposit validation pipeline (nothing invalid is stored):
+    // step 1 — fetch the blob by key; size cap.
+    const bytes = this.blobStore.get(key);
+    if (!bytes) throw new HttpError(422, 'VALIDATION', `no blob stored at key ${key}`);
+    if (bytes.length > this.maxBlobBytes) throw new HttpError(413, 'TOO_LARGE', 'blob exceeds MAX_BLOB_BYTES');
+    // step 2 — recompute SHA-256; it MUST equal the content-addressed key (§5.2).
+    if (`${this.network}/t/${hex(sha256(bytes))}` !== key) {
+      throw new HttpError(422, 'VALIDATION', 'blob bytes do not match the content-addressed key');
+    }
+    // step 3 — APPROXIMATION: the real server runs the SDK's three-service
+    // token.verify against the pinned trustbase; this fake decodes the sphere
+    // TokenBlob envelope only.
+    let blob;
+    try {
+      blob = decodeTokenBlob(bytes);
+    } catch {
+      throw new HttpError(422, 'VALIDATION', 'blob is not a decodable TokenBlob');
+    }
+    // step 4 — decoded tokenId MUST match the claim, and (deposits claim one)
+    // the decoded final state_hash MUST match the claimed stateHash.
+    if (blob.tokenId !== tokenId) {
+      throw new HttpError(422, 'VALIDATION', 'decoded tokenId does not match the claimed tokenId');
+    }
+    if (hex(sha256(blob.token)) !== stateHash) {
+      throw new HttpError(422, 'VALIDATION', 'decoded state hash does not match the claimed stateHash');
+    }
+    // step 5 — APPROXIMATION: recipient-ownership (predicate decode) is not
+    // modeled; the fake cannot read predicates. The REAL backend rejects a
+    // deposit whose current owner is not the addressed recipient.
+    // step 6 — decode the value to populate the entry (injected decoder).
+    const assets = this.decodeAssets(blob.token);
+    if (assets === null) throw new HttpError(422, 'VALIDATION', 'token value does not decode');
+    // step 7 (lineage) applies to inventory writes; the mailbox append itself
+    // is replay-guarded by the content-derived entry_id above.
+
+    // §6: assign a per-recipient monotonic seq and append; notify.
+    recipient.mailboxSeq += 1n;
+    recipient.mailbox.set(entryId, {
+      entryId,
+      seq: recipient.mailboxSeq,
+      status: 'pending',
+      recipientPubkey,
+      senderPubkey: session.pubkey,
+      transferId,
+      tokenId,
+      stateHash,
+      s3Key: key,
+      assets,
+      ...(memo !== undefined ? { memo: memo as string } : {}),
+      createdAt: new Date().toISOString(),
+      blobCollected: false,
+    });
+    this.wakeOwner(recipientPubkey, 'mailbox'); // §9 wake nudge
+    this.json(res, 200, { entryId });
+  }
+
+  private mailboxEntryToWire(entry: MailboxEntryRow): Record<string, unknown> {
+    // §6: a resolved entry keeps a working getUrl while its blob is within
+    // BLOB_RETENTION; `blobCollected: true` replaces it afterwards. A pending
+    // entry's blob is always retained (it may be someone's only copy).
+    const blobAvailable = !entry.blobCollected && this.blobStore.has(entry.s3Key);
+    return {
+      entryId: entry.entryId,
+      seq: entry.seq.toString(), // bigint counters travel as decimal strings (§11)
+      status: entry.status,
+      transferId: entry.transferId,
+      tokenId: entry.tokenId,
+      assets: entry.assets.map((a) => ({ coinId: a.coinId, amount: a.amount.toString() })),
+      senderPubkey: entry.senderPubkey,
+      ...(entry.memo !== undefined ? { memo: entry.memo } : {}), // verbatim envelope (§8.3)
+      createdAt: entry.createdAt,
+      ...(blobAvailable
+        ? { getUrl: this.signUrl({ key: entry.s3Key, method: 'GET', expiresAt: Date.now() + 5 * 60 * 1000 }) }
+        : { blobCollected: true }),
+    };
+  }
+
+  private handleMailboxList(req: http.IncomingMessage, res: http.ServerResponse, url: URL): void {
+    const session = this.authenticate(req);
+    const recipient = this.owner(session.pubkey);
+    const sinceRaw = url.searchParams.get('since');
+    const since = sinceRaw !== null ? BigInt(sinceRaw) : 0n;
+
+    // §16: entries of EVERY status are listable for any client-chosen since
+    // (delivery-only recipients re-fetch resolved entries within retention).
+    const entries = [...recipient.mailbox.values()]
+      .filter((e) => e.seq > since)
+      .sort((a, b) => (a.seq < b.seq ? -1 : 1)); // seq-ordered (§16)
+
+    // §16: PAGE_LIMIT + more (clients loop until more:false).
+    const page = entries.slice(0, this.pageLimit);
+    const more = entries.length > page.length;
+
+    this.json(res, 200, {
+      readPointer: recipient.readPointer.toString(),
+      syncEpoch: this.syncEpoch.toString(), // cursor-bearing responses carry syncEpoch (§9)
+      more,
+      entries: page.map((e) => this.mailboxEntryToWire(e)),
+    });
+  }
+
+  /**
+   * §6 claim — an ownership handoff, idempotent by entry_id, one transaction
+   * per entry: addressee check; alreadyClaimed with stored disposition (plus
+   * the asymmetric false→true upgrade); handoff (flip the holder's active row
+   * to an EVIDENCED tombstone — the claimed blob itself is the evidence);
+   * insert/reactivate the recipient's row (state_hash from the entry, assets
+   * from the entry's decoded value; self-send collapses to one in-place
+   * UPDATE); mark claimed; recompute the read pointer.
+   */
+  private async handleMailboxClaim(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const session = this.authenticate(req);
+    const body = await this.readJsonBody(req);
+    const entryIds = body.entryIds;
+    // §16 default: intoInventory is true (the full ownership handoff).
+    const intoInventory = body.intoInventory !== false;
+    if (!Array.isArray(entryIds) || !entryIds.every((e): e is string => typeof e === 'string')) {
+      throw new HttpError(422, 'VALIDATION', 'entryIds must be a string array');
+    }
+    const recipient = this.owner(session.pubkey);
+
+    const claimed: string[] = [];
+    const alreadyClaimed: { entryId: string; intoInventory: boolean }[] = [];
+    const failed: { entryId: string; code: string }[] = [];
+
+    for (const entryId of entryIds) {
+      const entry = recipient.mailbox.get(entryId);
+      // §6 step 1: addressee check (else 403) — claiming someone else's entry
+      // (or an unknown id) is a hard authorization failure, not a batch item.
+      if (!entry) throw new HttpError(403, 'FORBIDDEN', `not the addressee of entry ${entryId}`);
+
+      if (entry.status === 'claimed') {
+        // §6: the one asymmetric upgrade — intoInventory:true against an entry
+        // previously claimed false performs the missing §5.3-checked insert
+        // (idempotent); a later false NEVER removes rows.
+        if (intoInventory && entry.claimedIntoInventory === false) {
+          const verdict = this.performClaimHandoff(entry, recipient, session.pubkey);
+          if (verdict !== null) {
+            failed.push({ entryId, code: verdict });
+            continue;
+          }
+          entry.claimedIntoInventory = true;
+        }
+        // Already-claimed entries report their STORED disposition (§6).
+        alreadyClaimed.push({ entryId, intoInventory: entry.claimedIntoInventory === true });
+        continue;
+      }
+
+      // 'pending' or 'rejected' — a rejected entry REMAINS claimable (§6:
+      // reject is terminal for discovery, not for the asset).
+      if (intoInventory) {
+        const verdict = this.performClaimHandoff(entry, recipient, session.pubkey);
+        if (verdict !== null) {
+          // §16: `failed` is the defensive bucket for an entry that would now
+          // violate lineage (§5.3) — never an HTTP error for the batch.
+          failed.push({ entryId, code: verdict });
+          continue;
+        }
+      }
+      // §6 delivery-only claim (covenant §3.1-6): with intoInventory:false the
+      // entry flips and the pointer advances — NO inventory rows are touched.
+      entry.status = 'claimed';
+      entry.claimedIntoInventory = intoInventory;
+      this.recomputeReadPointer(recipient);
+      claimed.push(entryId);
+    }
+
+    this.wakeOwner(session.pubkey, 'inventory'); // §9 wake nudge
+    this.json(res, 200, { claimed, alreadyClaimed, failed });
+  }
+
+  /**
+   * §6 claim steps 2–3 (the inventory writes). Returns null on success, or a
+   * failure code for the defensive `failed` bucket (lineage violation).
+   */
+  private performClaimHandoff(
+    entry: MailboxEntryRow,
+    recipient: OwnerState,
+    recipientPubkey: string
+  ): string | null {
+    // Defensive lineage check (§5.3): if ANY owner already holds an ACTIVE row
+    // for this token at the entry's FINAL state, this exact state was already
+    // indexed — claiming it again would duplicate value. Unreachable in normal
+    // flows (the holder's row is at the PRE-transfer state).
+    for (const [pubkey, state] of this.owners) {
+      const row = state.rows.get(entry.tokenId);
+      if (row && row.status === 'active' && row.stateHash === entry.stateHash) {
+        // The recipient's own row at the final state = an idempotent replay of
+        // a claim whose insert already happened — success, not failure.
+        if (pubkey === recipientPubkey) return null;
+        return 'CONFLICT';
+      }
+    }
+
+    // §6 step 2: flip the active row under ANY owner — the sender (the normal
+    // race: notify fires at deposit, so the recipient may claim before the
+    // sender applies) or the recipient themself (a self-send) — to an
+    // EVIDENCED removal (the claimed blob itself is the evidence), delete its
+    // asset rows, bump that owner's cursor. The sender's later apply finds the
+    // row already removed and treats it as success (§5.3 step 4).
+    for (const [pubkey, state] of this.owners) {
+      if (pubkey === recipientPubkey) continue; // self-send handled below (steps 2+3 collapse)
+      const row = state.rows.get(entry.tokenId);
+      if (row && row.status === 'active') {
+        state.cursor += 1n;
+        row.status = 'removed';
+        row.assets = null;
+        row.seq = state.cursor;
+        row.removal = 'evidenced';
+        this.wakeOwner(pubkey, 'inventory');
+      }
+    }
+
+    // §6 step 3: insert the recipient's active row — or, if ANY prior row for
+    // this token exists under the recipient (a tombstone, or their own active
+    // row in a self-send), perform the §5.3 reactivating UPDATE in place
+    // (s3_key/state_hash/seq advance; for a self-send the row simply stays
+    // active). state_hash comes from the ENTRY, assets from the entry's
+    // decoded value.
+    recipient.cursor += 1n;
+    const own = recipient.rows.get(entry.tokenId);
+    if (own) {
+      own.status = 'active';
+      own.s3Key = entry.s3Key;
+      own.stateHash = entry.stateHash;
+      own.assets = entry.assets.map((a) => ({ ...a }));
+      own.seq = recipient.cursor;
+      own.removal = undefined;
+    } else {
+      recipient.rows.set(entry.tokenId, {
+        tokenId: entry.tokenId,
+        status: 'active',
+        s3Key: entry.s3Key,
+        stateHash: entry.stateHash,
+        assets: entry.assets.map((a) => ({ ...a })),
+        seq: recipient.cursor,
+      });
+    }
+    return null;
+  }
+
+  /**
+   * §6 reject — addressee-only, terminal FOR DISCOVERY ONLY: the entry counts
+   * toward read-pointer contiguity (one bad entry can never wedge discovery),
+   * is no longer surfaced by default, but REMAINS claimable and its blob is
+   * retained exactly like an unclaimed delivery — reject must never be a
+   * destruction path (a stolen JWT could otherwise mass-reject the inbox).
+   */
+  private async handleMailboxReject(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const session = this.authenticate(req);
+    const body = await this.readJsonBody(req);
+    const entryIds = body.entryIds;
+    if (!Array.isArray(entryIds) || !entryIds.every((e): e is string => typeof e === 'string')) {
+      throw new HttpError(422, 'VALIDATION', 'entryIds must be a string array');
+    }
+    const recipient = this.owner(session.pubkey);
+    const rejected: string[] = [];
+    for (const entryId of entryIds) {
+      const entry = recipient.mailbox.get(entryId);
+      if (!entry) throw new HttpError(403, 'FORBIDDEN', `not the addressee of entry ${entryId}`); // addressee-only (§16)
+      if (entry.status === 'pending') {
+        entry.status = 'rejected';
+        this.recomputeReadPointer(recipient);
+        rejected.push(entryId);
+      } else if (entry.status === 'rejected') {
+        rejected.push(entryId); // idempotent replay
+      }
+      // A claimed entry stays claimed — reject never reverts a resolution.
+    }
+    this.json(res, 200, { rejected });
+  }
+
+  // ── history (§10, §16) ───────────────────────────────────────────────────────
+
+  /**
+   * §10: history is an append-only, per-owner, deduped (by dedupKey) log
+   * WRITTEN BY THE CLIENT when a send or claim completes — the server never
+   * writes history rows; it is client-asserted, untrusted display data.
+   */
+  private async handleHistoryPost(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const session = this.authenticate(req);
+    const owner = this.owner(session.pubkey);
+    const body = await this.readJsonBody(req);
+    if (!Array.isArray(body.records)) throw new HttpError(422, 'VALIDATION', 'records must be an array');
+    for (const raw of body.records as unknown[]) {
+      if (typeof raw !== 'object' || raw === null) {
+        throw new HttpError(422, 'VALIDATION', 'records must be objects');
+      }
+      const rec = raw as Record<string, unknown>;
+      if (typeof rec.dedupKey !== 'string' || rec.dedupKey === '') {
+        throw new HttpError(422, 'VALIDATION', 'record.dedupKey is required');
+      }
+      if (typeof rec.type !== 'string' || typeof rec.timestamp !== 'number') {
+        throw new HttpError(422, 'VALIDATION', 'record.type and record.timestamp are required');
+      }
+      if (!Array.isArray(rec.assets)) throw new HttpError(422, 'VALIDATION', 'record.assets must be an array');
+      for (const a of rec.assets as { coinId?: unknown; amount?: unknown }[]) {
+        // Amounts are decimal strings in every JSON body (§11).
+        if (typeof a.coinId !== 'string' || typeof a.amount !== 'string' || !/^[0-9]+$/.test(a.amount)) {
+          throw new HttpError(422, 'VALIDATION', 'record.assets entries must be { coinId, amount: decimal string }');
+        }
+      }
+      // §8.3: memo + counterparty_nametag are S6 envelopes — shape + size cap
+      // validated, stored verbatim, never plaintext.
+      for (const field of ['memo', 'counterpartyNametag'] as const) {
+        if (rec[field] !== undefined) {
+          try {
+            assertFieldEnvelopeShape(rec[field]);
+          } catch (err) {
+            throw new HttpError(422, 'VALIDATION', err instanceof Error ? err.message : `bad ${field} envelope`);
+          }
+        }
+      }
+      // §10: dedup by dedupKey — a replayed record is a no-op (append-only log).
+      if (!owner.history.has(rec.dedupKey)) {
+        owner.history.set(rec.dedupKey, rec);
+      }
+    }
+    this.json(res, 200, {});
+  }
+
+  /** §10/§16: newest-first, opaque keyset cursor over (timestamp, dedupKey). */
+  private handleHistoryGet(req: http.IncomingMessage, res: http.ServerResponse, url: URL): void {
+    const session = this.authenticate(req);
+    const owner = this.owner(session.pubkey);
+    const before = url.searchParams.get('before');
+    const limitRaw = url.searchParams.get('limit');
+    const limit = limitRaw !== null ? Math.max(1, Math.min(Number(limitRaw), this.pageLimit)) : this.pageLimit;
+
+    const keyOf = (rec: Record<string, unknown>): string =>
+      `${String(rec.timestamp).padStart(16, '0')}:${rec.dedupKey as string}`;
+    const sorted = [...owner.history.values()].sort((a, b) => (keyOf(a) < keyOf(b) ? 1 : -1));
+    const filtered = before !== null ? sorted.filter((rec) => keyOf(rec) < before) : sorted;
+    const page = filtered.slice(0, limit);
+    const hasMore = filtered.length > page.length;
+    this.json(res, 200, {
+      records: page,
+      ...(hasMore && page.length > 0 ? { nextBefore: keyOf(page[page.length - 1]) } : {}),
+    });
   }
 
   // ── intents (§7, §16) ────────────────────────────────────────────────────────

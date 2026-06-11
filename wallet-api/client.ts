@@ -36,8 +36,13 @@ import {
   parseAuthTokens,
   parseBalances,
   parseBlobUrls,
+  parseClaimResult,
+  parseDepositResult,
+  parseHistoryPage,
   parseIntents,
   parseInventoryPage,
+  parseMailboxPage,
+  parseRejectResult,
   parseUploadUrls,
   parseWakeFrame,
   parseWsTicket,
@@ -48,9 +53,14 @@ import type {
   CoinBalance,
   FetchLike,
   FetchResponseLike,
+  HistoryPage,
+  HistoryWireRecord,
   IntentRecord,
   InventoryPage,
   KeyValueStore,
+  MailboxClaimResult,
+  MailboxDepositRequest,
+  MailboxPage,
   UploadUrlEntry,
   UploadUrlRequest,
   WakeCallback,
@@ -373,6 +383,79 @@ export class WalletApiClient {
     }
     if (res.ok || res.status === 412) return;
     throw WalletApiError.fromStatus(res.status, `blob upload failed with status ${res.status}`);
+  }
+
+  // ── mailbox (§6/§16) ────────────────────────────────────────────────────────
+
+  /**
+   * `POST /v1/mailbox` — deposit an already-uploaded finished blob to the
+   * recipient's mailbox. Idempotent by content-derived `entry_id` (§6): an
+   * existing entry in any status returns `200` with its id, provided the
+   * request's recipient and key match the stored entry (a mismatch is `409`).
+   */
+  async depositMailbox(req: MailboxDepositRequest): Promise<string> {
+    return parseDepositResult(
+      await this.requestJson('POST', '/v1/mailbox', {
+        recipientPubkey: req.recipientPubkey,
+        key: req.key,
+        transferId: req.transferId,
+        stateHash: req.stateHash,
+        tokenId: req.tokenId,
+        ...(req.memo !== undefined ? { memo: req.memo } : {}),
+      })
+    );
+  }
+
+  /**
+   * `GET /v1/mailbox?since=<seq>` — entries of EVERY status are listable for
+   * any client-chosen `since`; a claimed entry carries a working `getUrl`
+   * while its blob is within retention, `blobCollected: true` afterwards (§6).
+   */
+  async listMailbox(since?: bigint): Promise<MailboxPage> {
+    const query = since !== undefined ? `?since=${since.toString()}` : '';
+    const page = parseMailboxPage(await this.requestJson('GET', `/v1/mailbox${query}`));
+    await this.noteSyncEpoch(page.syncEpoch);
+    return page;
+  }
+
+  /**
+   * `POST /v1/mailbox/claim` — addressee-only, idempotent ownership handoff
+   * (§6). `intoInventory:false` is the delivery-only claim: the entry resolves
+   * and the pointer advances with ZERO inventory writes.
+   */
+  async claimMailbox(entryIds: string[], intoInventory: boolean): Promise<MailboxClaimResult> {
+    return parseClaimResult(
+      await this.requestJson('POST', '/v1/mailbox/claim', { entryIds, intoInventory })
+    );
+  }
+
+  /**
+   * `POST /v1/mailbox/reject` — addressee-only; terminal for DISCOVERY only:
+   * the entry counts toward read-pointer contiguity but remains claimable and
+   * its blob is retained (§6 — reject is never a destruction path).
+   */
+  async rejectMailbox(entryIds: string[]): Promise<string[]> {
+    return parseRejectResult(await this.requestJson('POST', '/v1/mailbox/reject', { entryIds }));
+  }
+
+  // ── history (§10/§16) ───────────────────────────────────────────────────────
+
+  /**
+   * `POST /v1/history` — client-asserted records, deduped by `dedupKey` (the
+   * server never writes history rows — §10). `memo`/`counterpartyNametag`
+   * MUST already be S6 envelopes.
+   */
+  async postHistoryRecords(records: HistoryWireRecord[]): Promise<void> {
+    await this.requestJson('POST', '/v1/history', { records });
+  }
+
+  /** `GET /v1/history?before=&limit=` — newest-first keyset pages (§10). */
+  async listHistory(options: { before?: string; limit?: number } = {}): Promise<HistoryPage> {
+    const params = new URLSearchParams();
+    if (options.before !== undefined) params.set('before', options.before);
+    if (options.limit !== undefined) params.set('limit', String(options.limit));
+    const qs = params.toString();
+    return parseHistoryPage(await this.requestJson('GET', `/v1/history${qs ? `?${qs}` : ''}`));
   }
 
   // ── intents (E.3) ───────────────────────────────────────────────────────────

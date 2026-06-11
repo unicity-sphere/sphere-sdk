@@ -72,6 +72,13 @@ export interface Token {
   readonly createdAt: number;
   updatedAt: number;
   readonly sdkData?: string;
+  /**
+   * Lazy inventory record (sdk-changes S2): the token's VALUE metadata came
+   * from the storage provider's `listInventory()` view and its blob has not
+   * been downloaded — `sdkData` is absent and the blob is fetched on demand
+   * (`getToken`) only when the token is selected for a spend.
+   */
+  readonly lazy?: boolean;
 }
 
 export interface Asset {
@@ -375,6 +382,7 @@ export type SphereEventType =
   | 'transfer:incoming'
   | 'transfer:confirmed'
   | 'transfer:failed'
+  | 'transfer:invalid'
   | 'payment_request:incoming'
   | 'payment_request:accepted'
   | 'payment_request:rejected'
@@ -448,6 +456,13 @@ export interface SphereEventMap {
   'transfer:incoming': IncomingTransfer;
   'transfer:confirmed': TransferResult;
   'transfer:failed': TransferResult;
+  /**
+   * An incoming delivery failed LOCAL verification and was rejected back to
+   * the delivery rail (sdk-changes S3): terminal for discovery only — the
+   * entry stays claimable server-side and may be retried after an app update
+   * (e.g. a trustbase fix).
+   */
+  'transfer:invalid': { deliveryId: string; senderPubkey?: string; reason: string };
   'payment_request:incoming': IncomingPaymentRequest;
   'payment_request:accepted': IncomingPaymentRequest;
   'payment_request:rejected': IncomingPaymentRequest;

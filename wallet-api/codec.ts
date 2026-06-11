@@ -14,8 +14,13 @@ import { WalletApiError } from './errors';
 import type {
   BlobUrlEntry,
   CoinBalance,
+  HistoryPage,
+  HistoryWireRecord,
   IntentRecord,
   InventoryPage,
+  MailboxClaimResult,
+  MailboxEntry,
+  MailboxPage,
   UploadUrlEntry,
 } from './types';
 
@@ -158,6 +163,122 @@ export function parseIntents(body: unknown): IntentRecord[] {
       createdAt,
     };
   });
+}
+
+// ── mailbox (§6/§16) ──────────────────────────────────────────────────────────
+
+/** `POST /v1/mailbox` → entryId (§16). */
+export function parseDepositResult(body: unknown): string {
+  const rec = asRecord(body, 'mailbox deposit response');
+  return asString(rec.entryId, 'mailbox deposit response .entryId');
+}
+
+function parseMailboxEntry(raw: unknown, what: string): MailboxEntry {
+  const rec = asRecord(raw, what);
+  const status = asString(rec.status, `${what}.status`);
+  if (status !== 'pending' && status !== 'claimed' && status !== 'rejected') {
+    throw protocolError(`${what}.status is not a known mailbox entry status`);
+  }
+  const createdAt = Date.parse(asString(rec.createdAt, `${what}.createdAt`));
+  if (Number.isNaN(createdAt)) throw protocolError(`${what}.createdAt is not a timestamp`);
+  return {
+    entryId: asString(rec.entryId, `${what}.entryId`),
+    seq: parseCounter(rec.seq, `${what}.seq`),
+    status,
+    transferId: asString(rec.transferId, `${what}.transferId`),
+    tokenId: asString(rec.tokenId, `${what}.tokenId`),
+    assets: (parseAssets(rec.assets, `${what}.assets`) ?? []).map((a) => ({ ...a })),
+    senderPubkey: asString(rec.senderPubkey, `${what}.senderPubkey`),
+    ...(rec.memo !== undefined && rec.memo !== null
+      ? { memo: asString(rec.memo, `${what}.memo`) }
+      : {}),
+    createdAt,
+    ...(rec.getUrl !== undefined && rec.getUrl !== null
+      ? { getUrl: asString(rec.getUrl, `${what}.getUrl`) }
+      : {}),
+    ...(rec.blobCollected === true ? { blobCollected: true } : {}),
+  };
+}
+
+/** `GET /v1/mailbox?since=` → {@link MailboxPage} (§16). */
+export function parseMailboxPage(body: unknown): MailboxPage {
+  const rec = asRecord(body, 'mailbox response');
+  if (typeof rec.more !== 'boolean') throw protocolError('mailbox response .more is not a boolean');
+  return {
+    readPointer: parseCounter(rec.readPointer, 'mailbox response .readPointer'),
+    syncEpoch: parseCounter(rec.syncEpoch, 'mailbox response .syncEpoch'),
+    more: rec.more,
+    entries: asArray(rec.entries, 'mailbox response .entries').map((raw, i) =>
+      parseMailboxEntry(raw, `entries[${i}]`)
+    ),
+  };
+}
+
+/** `POST /v1/mailbox/claim` → {@link MailboxClaimResult} (§16). */
+export function parseClaimResult(body: unknown): MailboxClaimResult {
+  const rec = asRecord(body, 'mailbox claim response');
+  return {
+    claimed: asArray(rec.claimed, 'claim response .claimed').map((raw, i) =>
+      asString(raw, `claimed[${i}]`)
+    ),
+    alreadyClaimed: asArray(rec.alreadyClaimed, 'claim response .alreadyClaimed').map((raw, i) => {
+      const a = asRecord(raw, `alreadyClaimed[${i}]`);
+      if (typeof a.intoInventory !== 'boolean') {
+        throw protocolError(`alreadyClaimed[${i}].intoInventory is not a boolean`);
+      }
+      return { entryId: asString(a.entryId, `alreadyClaimed[${i}].entryId`), intoInventory: a.intoInventory };
+    }),
+    failed: asArray(rec.failed, 'claim response .failed').map((raw, i) => {
+      const f = asRecord(raw, `failed[${i}]`);
+      return { entryId: asString(f.entryId, `failed[${i}].entryId`), code: asString(f.code, `failed[${i}].code`) };
+    }),
+  };
+}
+
+/** `POST /v1/mailbox/reject` → rejected entry ids (§16). */
+export function parseRejectResult(body: unknown): string[] {
+  const rec = asRecord(body, 'mailbox reject response');
+  return asArray(rec.rejected, 'reject response .rejected').map((raw, i) => asString(raw, `rejected[${i}]`));
+}
+
+// ── history (§10/§16) ─────────────────────────────────────────────────────────
+
+function parseHistoryRecord(raw: unknown, what: string): HistoryWireRecord {
+  const rec = asRecord(raw, what);
+  const timestamp = rec.timestamp;
+  if (typeof timestamp !== 'number' || !Number.isSafeInteger(timestamp) || timestamp < 0) {
+    throw protocolError(`${what}.timestamp is not a non-negative integer`);
+  }
+  return {
+    dedupKey: asString(rec.dedupKey, `${what}.dedupKey`),
+    type: asString(rec.type, `${what}.type`),
+    timestamp,
+    assets: asArray(rec.assets, `${what}.assets`).map((a, i) => {
+      const asset = asRecord(a, `${what}.assets[${i}]`);
+      // Amounts stay decimal strings on this surface — display data (§10).
+      parseAmount(asset.amount, `${what}.assets[${i}].amount`);
+      return {
+        coinId: asString(asset.coinId, `${what}.assets[${i}].coinId`),
+        amount: asString(asset.amount, `${what}.assets[${i}].amount`),
+      };
+    }),
+    ...(typeof rec.transferId === 'string' ? { transferId: rec.transferId } : {}),
+    ...(typeof rec.tokenId === 'string' ? { tokenId: rec.tokenId } : {}),
+    ...(typeof rec.counterpartyPubkey === 'string' ? { counterpartyPubkey: rec.counterpartyPubkey } : {}),
+    ...(typeof rec.memo === 'string' ? { memo: rec.memo } : {}),
+    ...(typeof rec.counterpartyNametag === 'string' ? { counterpartyNametag: rec.counterpartyNametag } : {}),
+  };
+}
+
+/** `GET /v1/history` → {@link HistoryPage} (§16). */
+export function parseHistoryPage(body: unknown): HistoryPage {
+  const rec = asRecord(body, 'history response');
+  return {
+    records: asArray(rec.records, 'history response .records').map((raw, i) =>
+      parseHistoryRecord(raw, `records[${i}]`)
+    ),
+    ...(typeof rec.nextBefore === 'string' ? { nextBefore: rec.nextBefore } : {}),
+  };
 }
 
 /** Auth responses (§4). */
