@@ -19,6 +19,7 @@ export default defineConfig({
         'transport/**/*.ts',
         'oracle/**/*.ts',
         'token-engine/**/*.ts',
+        'wallet-api/**/*.ts',
       ],
       exclude: ['**/index.ts', '**/*.test.ts'],
     },

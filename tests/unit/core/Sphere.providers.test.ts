@@ -4,7 +4,9 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import type { TokenStorageProvider, TxfStorageDataBase, SaveResult, LoadResult, SyncResult } from '../../../storage';
+import type { TokenStorageProvider, TxfStorageDataBase, SaveResult, LoadResult, SyncResult, InventoryView, ApplyDeltaAdded, ApplyDeltaOptions } from '../../../storage';
+import { WholeBlobInventoryAdapter } from '../../../storage';
+import type { TokenBlob } from '../../../token-engine/types';
 import type { FullIdentity, ProviderStatus } from '../../../types';
 
 // =============================================================================
@@ -100,6 +102,21 @@ class MockTokenStorageProvider implements TokenStorageProvider<TxfStorageDataBas
       removed: 0,
       conflicts: 0,
     };
+  }
+
+  // Lazy inventory port (sdk-changes S2) via the shared default adapter
+  private readonly inventoryAdapter = new WholeBlobInventoryAdapter<TxfStorageDataBase>(this);
+
+  listInventory(since?: bigint): Promise<InventoryView> {
+    return this.inventoryAdapter.listInventory(since);
+  }
+
+  getToken(tokenId: string): Promise<TokenBlob> {
+    return this.inventoryAdapter.getToken(tokenId);
+  }
+
+  applyDelta(transferId: string, spent: string[], added: ApplyDeltaAdded[], opts?: ApplyDeltaOptions): Promise<void> {
+    return this.inventoryAdapter.applyDelta(transferId, spent, added, opts);
   }
 
   // Helper methods for testing

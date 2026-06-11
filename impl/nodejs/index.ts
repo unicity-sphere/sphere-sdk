@@ -12,6 +12,9 @@ export * from './transport';
 // Oracle
 export * from './oracle';
 
+// Wallet-api storage provider (platform-neutral, sdk-changes S2)
+export * from '../shared/wallet-api';
+
 // Re-export shared types for convenience
 export type {
   BaseTransportConfig,

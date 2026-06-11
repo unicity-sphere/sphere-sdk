@@ -13,6 +13,9 @@ if (typeof globalThis.Buffer === 'undefined') {
 export * from './storage';
 export * from './transport';
 export * from './oracle';
+// Wallet-api storage provider (platform-neutral, sdk-changes S2)
+export * from '../shared/wallet-api';
+
 export * from './download';
 
 // Re-export shared types for convenience

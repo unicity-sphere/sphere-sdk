@@ -4,6 +4,7 @@
  */
 
 import type { BaseProvider, FullIdentity, TrackedAddressEntry } from '../types';
+import type { TokenBlob } from '../token-engine/types';
 
 // =============================================================================
 // Storage Provider Interface
@@ -92,6 +93,76 @@ export interface HistoryRecord {
 }
 
 // =============================================================================
+// Lazy inventory view (sdk-changes S2, ARCHITECTURE §5.1/§16)
+// =============================================================================
+
+/** One fungible position of an inventory item. Amounts are `bigint` in types
+ * (decimal strings on the wallet-api wire — they exceed 2^53). */
+export interface InventoryAsset {
+  coinId: string;
+  amount: bigint;
+}
+
+/**
+ * One row of the inventory view — value metadata only, **no blobs**.
+ * `status: 'removed'` is a tombstone: the token left this inventory (spent, or
+ * handed off at claim) — the only way a stale device learns about removals
+ * (ARCHITECTURE §5.1).
+ */
+export interface InventoryItem {
+  /** Genesis-stable 64-hex token id. */
+  tokenId: string;
+  status: 'active' | 'removed';
+  /** Decoded value; absent when unknown (e.g. a tombstone). */
+  assets?: InventoryAsset[];
+  /** Owner change-cursor value at this row's last change (`?since=` deltas). */
+  seq: bigint;
+}
+
+/** Result of {@link TokenStorageProvider.listInventory}. */
+export interface InventoryView {
+  /** Cursor to resume deltas from (`listInventory(cursor)`). */
+  cursor: bigint;
+  /**
+   * Server sync epoch (ARCHITECTURE §5.4/§9): changes ONLY when a server
+   * restore invalidated cursor continuity. On a change, clients discard all
+   * persisted cursors, do a full pull, and re-PUT locally-known open intents.
+   * Local providers (no server) report a constant `0n`.
+   */
+  syncEpoch: bigint;
+  /** Truncated page (PAGE_LIMIT) — loop with `since = cursor` until false. */
+  more: boolean;
+  items: InventoryItem[];
+}
+
+/** An `added` entry of {@link TokenStorageProvider.applyDelta}: the token id
+ * plus the content-addressed blob-store key of its already-uploaded bytes. */
+export interface ApplyDeltaAdded {
+  tokenId: string;
+  /** Content-addressed blob key — `<network>/t/<hex(sha256(blob))>` (ARCHITECTURE §5.2). */
+  key: string;
+}
+
+export interface ApplyDeltaOptions {
+  /**
+   * The wallet-api-storage + other-transport composition (ARCHITECTURE §5.3):
+   * removals cannot be evidence-checked against a mailbox deposit, so the
+   * server records them as `external` (never-collected blob retention).
+   */
+  externalDelivery?: boolean;
+}
+
+/** Result of an explicit `recoverRemoved()` maintenance run (sdk-changes S2). */
+export interface RecoverRemovedResult {
+  /** Tombstoned tokens re-verified and re-added (reactivation — ARCHITECTURE §5.3). */
+  recovered: string[];
+  /** Tokens the server 409'd as evidenced spends — "actually spent", tombstone kept. */
+  spent: string[];
+  /** Tombstones skipped (matched to a known local spend, or failed local verification). */
+  skipped: string[];
+}
+
+// =============================================================================
 // Token Storage Provider Interface
 // =============================================================================
 
@@ -156,6 +227,57 @@ export interface TokenStorageProvider<TData = unknown> extends BaseProvider {
    * Sync local data with remote
    */
   sync(localData: TData): Promise<SyncResult<TData>>;
+
+  // --- Lazy inventory port (sdk-changes S2; ARCHITECTURE §5/§16) -------------
+  // The whole-blob load()/sync() surface above remains for whole-blob
+  // providers, but the wallet's hot path is this view: balances and
+  // coin-selection read listInventory() (no blob download); a spend fetches
+  // only the selected blobs via getToken(). Whole-blob providers conform via
+  // the shared default adapter (storage/whole-blob-inventory-adapter.ts),
+  // which derives these from load() — swappability is preserved, not broken,
+  // by this extension.
+
+  /**
+   * The inventory view — value metadata only, never blobs.
+   *
+   * Without `since`: the current active rows. With `since`: every row changed
+   * after that cursor **including tombstones** (`status:'removed'`) — callers
+   * MUST apply tombstones (drop local entries) and loop while `more` is true.
+   * On a `syncEpoch` change the provider discards persisted cursors and
+   * resyncs from scratch (ARCHITECTURE §5.4).
+   *
+   * Whole-blob providers (no change journal) compute the view from the loaded
+   * set: all rows `'active'`, synthetic `seq`/`cursor`, `more: false`.
+   */
+  listInventory(since?: bigint): Promise<InventoryView>;
+
+  /**
+   * Fetch + decode one token blob on demand (a signed GET for remote
+   * providers; the loaded set for whole-blob providers). Throws when the
+   * token is unknown or carries no v2 blob.
+   */
+  getToken(tokenId: string): Promise<TokenBlob>;
+
+  /**
+   * Record a spend result: tombstone `spent` tokens, add `added` outputs.
+   * Idempotent by `transferId`. For wallet-api delivery this MUST be called
+   * **after** the mailbox deposit of the same `transferId` — the backend
+   * evidence-checks removals against it (ARCHITECTURE §5.3).
+   */
+  applyDelta(
+    transferId: string,
+    spent: string[],
+    added: ApplyDeltaAdded[],
+    opts?: ApplyDeltaOptions
+  ): Promise<void>;
+
+  /**
+   * Optional maintenance call (sdk-changes S2): re-fetch tombstoned tokens the
+   * client cannot match to a known spend, verify them locally, and re-add
+   * (reactivation). A server 409 means "actually spent" — keep the tombstone.
+   * Only meaningful for providers with server-side tombstones.
+   */
+  recoverRemoved?(): Promise<RecoverRemovedResult>;
 
   /**
    * Check if data exists

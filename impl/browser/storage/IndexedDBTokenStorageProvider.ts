@@ -5,7 +5,9 @@
  */
 
 import { logger } from '../../../core/logger';
-import type { TokenStorageProvider, TxfStorageDataBase, SyncResult, SaveResult, LoadResult, HistoryRecord } from '../../../storage';
+import type { TokenStorageProvider, TxfStorageDataBase, SyncResult, SaveResult, LoadResult, HistoryRecord, InventoryView, ApplyDeltaAdded, ApplyDeltaOptions } from '../../../storage';
+import { WholeBlobInventoryAdapter } from '../../../storage';
+import type { TokenBlob } from '../../../token-engine/types';
 import type { FullIdentity, ProviderStatus } from '../../../types';
 import type { NetworkType } from '../../../constants';
 
@@ -277,6 +279,23 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
         timestamp: Date.now(),
       };
     }
+  }
+
+  // ── Lazy inventory port (sdk-changes S2) — default whole-blob adapter ──────
+
+  /** Default lazy-port adapter over this store (sdk-changes S2). */
+  private readonly inventoryAdapter = new WholeBlobInventoryAdapter<TxfStorageDataBase>(this);
+
+  listInventory(since?: bigint): Promise<InventoryView> {
+    return this.inventoryAdapter.listInventory(since);
+  }
+
+  getToken(tokenId: string): Promise<TokenBlob> {
+    return this.inventoryAdapter.getToken(tokenId);
+  }
+
+  applyDelta(transferId: string, spent: string[], added: ApplyDeltaAdded[], opts?: ApplyDeltaOptions): Promise<void> {
+    return this.inventoryAdapter.applyDelta(transferId, spent, added, opts);
   }
 
   async sync(localData: TxfStorageDataBase): Promise<SyncResult<TxfStorageDataBase>> {
