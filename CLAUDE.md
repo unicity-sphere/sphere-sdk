@@ -2,6 +2,35 @@
 
 This file provides context for Claude Code when working with the Sphere SDK project.
 
+## ⚡ wallet-api program — current work (read first)
+
+This repo is part of the wallet-api program (process: `../wallet-api/development-workflow.md`).
+
+- **Branch topology:** all work branches from and PRs back to **`feat/wallet-api-integration`**
+  (never `main` directly). Every PR links a GitHub issue (`Closes #N`); squash-merge after green CI
+  (CI runs typecheck + lint + build + unit tests on PRs targeting the integration branch).
+- **The normative spec for the program's SDK work is `../wallet-api/sdk-changes.md`** — Part E
+  (recoverable engine) first, then S1–S7 (thin wallet, ports, wallet-api providers). It was
+  adversarially verified; build it, don't redesign it. Spec-first: contract changes land in the spec
+  in the same PR, before code.
+- **Resume is status-agnostic** (sdk-changes E.2): never key engine resume off a submit status —
+  submit, always `getInclusionProof`, match-verify (`OK` = mine, `TRANSACTION_HASH_MISMATCH` =
+  `TransferConflictError`). `STATE_ID_EXISTS` is transitional aggregator lag; tolerant parsing comes
+  via state-transition-sdk-js#125.
+- **Ports rule (S7 / covenant):** storage (`TokenStorageProvider`) and delivery (`DeliveryProvider`)
+  are independent, swappable, contract-test-enforced ports; the Sphere frontend is a **view** — no
+  provider-specific logic outside implementations; custody (`intoInventory`) is a composition-time
+  property, never a per-call flag.
+- **Never weaken a test to make it pass**; no `.skip`/`.only`. Known pre-existing flaky/failing
+  tests are tracked in #487 (deriveIpnsName: Node-26-local only; CI on 20/22 is authoritative).
+- **Releases:** npm dev versions publish from the integration branch via `publish.yml`
+  (workflow_dispatch, version input) — current line **`0.9.1-dev.#`**, dist-tag `dev`. Consumers
+  (wallet-api backend, sphere frontend) pin exact dev versions. The backend consumes ONLY the
+  `./token-engine` subpath (must stay browser/IPFS/Nostr-free — there's an import-closure check in
+  its CI eventually; keep `token-engine/` clean).
+- Pinned base SDK: `@unicitylabs/state-transition-sdk@2.0.0-rc.6027e82` (bump only via PR when the
+  #125 rc lands; then re-validate the wallet-api spike's vendored mock).
+
 ## Quick Start (Using SDK as Dependency)
 
 ### Installation
@@ -262,7 +291,7 @@ See [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) and [QUICKSTART-NODEJS.m
 - **L1 (ALPHA blockchain)** - UTXO-based blockchain transactions via Electrum (Fulcrum)
 - **L3 (Unicity state transition network)** - Token transfers via the **v2 state-transition SDK**, consumed exclusively through the `token-engine/` port
 
-**Version:** 0.8.0-dev.6 (post v1-cutover; see CHANGELOG `[Unreleased]`)
+**Version:** `0.9.1-dev.#` line — see `package.json` for the exact current version (post v1-cutover; see CHANGELOG `[Unreleased]`)
 **License:** MIT
 **Target:** Node.js >= 22.0.0, Browser (ESM/CJS)
 **CLI:** moved out to `@unicity-sphere/cli` (`npm run cli` only prints a pointer)
