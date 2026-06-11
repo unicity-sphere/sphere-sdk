@@ -82,8 +82,8 @@ describe('WalletApiClient — auth (§4)', () => {
   it('refuses a challenge with implausible timestamps', async () => {
     fake.tamperNextChallenge((c) =>
       c
-        .replace(/issuedAt: .*$/m, 'issuedAt: 1970-01-01T00:00:00.000Z')
-        .replace(/expiresAt: .*$/m, 'expiresAt: 1970-01-01T00:05:00.000Z')
+        .replace(/"issuedAt":"[^"]*"/, '"issuedAt":"1970-01-01T00:00:00.000Z"')
+        .replace(/"expiresAt":"[^"]*"/, '"expiresAt":"1970-01-01T00:05:00.000Z"')
     );
     await expect(client.signIn()).rejects.toThrowError(/expired/);
     expect(fake.verifyRequests).toBe(0);
@@ -139,13 +139,20 @@ describe('WalletApiClient — auth (§4)', () => {
 describe('verifyChallengeTemplate — direct edge cases (S1)', () => {
   const identity = testIdentity(42);
   const now = Date.parse('2026-06-11T12:00:00.000Z');
-  const valid =
-    AUTH_CHALLENGE_PREFIX +
-    `network: testnet2\n` +
-    `pubkey: ${identity.chainPubkey}\n` +
-    `nonce: abc123\n` +
-    `issuedAt: 2026-06-11T11:59:00.000Z\n` +
-    `expiresAt: 2026-06-11T12:04:00.000Z`;
+  // The real backend grammar: prefix + single-line JSON (wallet-api src/auth/service.ts).
+  const challengeJson = (overrides: Record<string, string | undefined> = {}): string => {
+    const fields: Record<string, string | undefined> = {
+      network: 'testnet2',
+      pubkey: identity.chainPubkey,
+      nonce: 'abc123',
+      issuedAt: '2026-06-11T11:59:00.000Z',
+      expiresAt: '2026-06-11T12:04:00.000Z',
+      ...overrides,
+    };
+    const present = Object.fromEntries(Object.entries(fields).filter(([, v]) => v !== undefined));
+    return AUTH_CHALLENGE_PREFIX + JSON.stringify(present);
+  };
+  const valid = challengeJson();
   const expect4 = { pubkey: identity.chainPubkey, nonce: 'abc123', network: 'testnet2', nowMs: now };
 
   it('accepts a well-formed challenge', () => {
@@ -161,12 +168,12 @@ describe('verifyChallengeTemplate — direct edge cases (S1)', () => {
   });
 
   it('rejects missing fields', () => {
-    const noExpiry = valid.split('\n').slice(0, -1).join('\n');
+    const noExpiry = challengeJson({ expiresAt: undefined });
     expect(() => verifyChallengeTemplate(noExpiry, expect4)).toThrowError(/expiresAt/);
   });
 
   it('rejects an implausible validity window', () => {
-    const longWindow = valid.replace('expiresAt: 2026-06-11T12:04:00.000Z', 'expiresAt: 2026-06-13T12:00:00.000Z');
+    const longWindow = challengeJson({ expiresAt: '2026-06-13T12:00:00.000Z' });
     expect(() => verifyChallengeTemplate(longWindow, expect4)).toThrowError(/window/);
   });
 

@@ -47,6 +47,12 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Verify packaging (critical artifacts present)
+        run: |
+          for f in dist/index.d.ts dist/core/index.d.ts dist/token-engine/index.d.ts dist/wallet-api/index.d.ts; do
+            test -f "$f" || { echo "MISSING $f — refusing to publish a broken tarball (cf. 0.9.1-dev.2 dts regression)"; exit 1; }
+          done
+
       - name: Determine npm dist-tag
         id: dist-tag
         run: |

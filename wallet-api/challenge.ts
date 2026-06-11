@@ -10,7 +10,8 @@
  *   3. carries plausible timestamps (`issuedAt` near now, `expiresAt` in the
  *      future, a sane validity window).
  *
- * The accepted grammar is the prefix line followed by `key: value` lines —
+ * The accepted grammar matches the REAL backend (wallet-api M1,
+ * src/auth/service.ts): the prefix followed by a single-line JSON object with
  * `network`, `pubkey`, `nonce`, `issuedAt`, `expiresAt` (ISO-8601). This
  * grammar is the client's acceptance contract: a server whose challenge does
  * not parse is refused, by design. The fake server
@@ -40,14 +41,21 @@ export interface ChallengeExpectation {
 }
 
 function parseFields(body: string): Map<string, string> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    throw new ChallengeTemplateError('Challenge body is not the single-line JSON object the backend emits');
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new ChallengeTemplateError('Challenge body must be a JSON object');
+  }
   const fields = new Map<string, string>();
-  for (const line of body.split('\n')) {
-    if (line.trim() === '') continue;
-    const idx = line.indexOf(':');
-    if (idx <= 0) {
-      throw new ChallengeTemplateError(`Challenge line does not parse as "key: value": ${JSON.stringify(line)}`);
+  for (const [key, value] of Object.entries(parsed)) {
+    if (typeof value !== 'string') {
+      throw new ChallengeTemplateError(`Challenge field "${key}" must be a string`);
     }
-    fields.set(line.slice(0, idx).trim(), line.slice(idx + 1).trim());
+    fields.set(key, value);
   }
   return fields;
 }

@@ -388,13 +388,17 @@ export class FakeWalletApi {
     // §4 step 1: a human-readable challenge beginning with the fixed
     // domain-separation prefix and embedding { network, pubkey, nonce,
     // issuedAt, expiresAt } — the spend key never signs unprefixed text.
+    // §4: prefix + single-line JSON — byte-for-byte the real backend's grammar
+    // (wallet-api src/auth/service.ts issueChallenge).
     let challenge =
       AUTH_CHALLENGE_PREFIX +
-      `network: ${this.network}\n` +
-      `pubkey: ${pubkey}\n` +
-      `nonce: ${nonce}\n` +
-      `issuedAt: ${new Date(now).toISOString()}\n` +
-      `expiresAt: ${new Date(expiresAt).toISOString()}`;
+      JSON.stringify({
+        network: this.network,
+        pubkey,
+        nonce,
+        issuedAt: new Date(now).toISOString(),
+        expiresAt: new Date(expiresAt).toISOString(),
+      });
     if (this.tamperChallenge) {
       challenge = this.tamperChallenge(challenge);
       this.tamperChallenge = null;
