@@ -25,6 +25,19 @@ import type {
 export interface EngineOpOptions {
   /** Cancels the operation (including inclusion-proof polling). */
   readonly signal?: AbortSignal;
+  /**
+   * Realization seed for deterministic transfer/split (Part E, sdk-changes E.1/E.3):
+   * a client-generated UUIDv4 in canonical lowercase string form. Every value the
+   * transaction binds to (stateMask, per-output salts) is HKDF-derived from the
+   * wallet key + this id, so re-calling the op with the same `transferId` and
+   * inputs rebuilds the byte-identical transaction and resumes an interrupted
+   * attempt instead of losing funds. Persist it BEFORE calling the engine.
+   *
+   * If absent, the engine generates one internally (`crypto.randomUUID()`) — the
+   * derivation path is identical, but the call is NOT resumable (the seed is
+   * gone if the process dies mid-op).
+   */
+  readonly transferId?: string;
 }
 
 /**

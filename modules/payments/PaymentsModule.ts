@@ -31,6 +31,7 @@ import type {
 import { L1PaymentsModule, type L1PaymentsModuleConfig } from './L1PaymentsModule';
 import type { SplitPlan, TokenWithAmount } from './TokenSplitCalculator';
 import type { ITokenEngine, SphereToken } from '../../token-engine';
+import { TransferConflictError } from '../../token-engine';
 import { isV2TransferPayload, type V2TransferPayload } from '../../types/v2-transfer';
 import { TokenReservationLedger } from './TokenReservationLedger';
 import { SpendPlanner, SpendQueue, type ParsedTokenEntry, type ParsedTokenPool } from './SpendQueue';
@@ -1212,7 +1213,10 @@ export class PaymentsModule {
           } as unknown as import('../../transport').TokenTransferPayload);
         };
 
-        // Whole-token direct transfers.
+        // Whole-token direct transfers. Each engine op gets its own UUIDv4
+        // realization seed (Part E): the transaction is deterministic in
+        // (key, transferId, inputs), so a certified-but-uncaptured op stays
+        // rebuildable. Server-side intent persistence + resume are Part S.
         for (const tw of splitPlan.tokensToTransferDirectly) {
           const finished = await engine.transfer(
             {
@@ -1220,7 +1224,7 @@ export class PaymentsModule {
               recipientPubkey: recipientChainPubkey,
               data: memoData,
             },
-            { signal: AbortSignal.timeout(SEND_ENGINE_OP_TIMEOUT_MS) },
+            { signal: AbortSignal.timeout(SEND_ENGINE_OP_TIMEOUT_MS), transferId: crypto.randomUUID() },
           );
           // The source state is spent on-chain from here on.
           committedOnChainTokenIds.add(tw.uiToken.id);
@@ -1253,7 +1257,8 @@ export class PaymentsModule {
                 { recipientPubkey: selfChainPubkey, coinId: request.coinId, amount: splitPlan.remainderAmount! },
               ],
             },
-            { signal: AbortSignal.timeout(SEND_ENGINE_OP_TIMEOUT_MS) },
+            // Per-op realization seed (Part E) — see the direct-transfer loop above.
+            { signal: AbortSignal.timeout(SEND_ENGINE_OP_TIMEOUT_MS), transferId: crypto.randomUUID() },
           );
           // The split source is burnt on-chain from here on. Persist BOTH outputs
           // (journal the recipient's blob, store our change token) BEFORE the
@@ -1323,7 +1328,14 @@ export class PaymentsModule {
       this.reservationLedger.cancel(result.id);
 
       result.status = 'failed';
-      result.error = error instanceof Error ? error.message : String(error);
+      // A TransferConflictError is a LOST RACE (Part E.2): another transaction —
+      // typically this owner's other device — already consumed a source token.
+      // Fail this send cleanly with a distinct message; the restore loop below
+      // marks the conflicted source 'spent' via the on-chain isSpent check.
+      // (Re-planning the uncovered remainder automatically is Part S.)
+      result.error = error instanceof TransferConflictError
+        ? `Send conflicted: a source token was already spent by a concurrent transfer — re-plan and retry (${error.message})`
+        : error instanceof Error ? error.message : String(error);
 
       // Restore tokens. Three classes (W23-R2/R3, v2 edition):
       //  - already removeToken()'d during a partially-successful loop → skip

@@ -5,6 +5,7 @@
  */
 
 import {
+  type IAggregatorClient,
   MintJustificationVerifierService,
   NetworkId,
   PredicateVerifierService,
@@ -16,24 +17,41 @@ import { decodeSpherePaymentData } from '../../../token-engine/SpherePaymentData
 import { type EngineDeps, SphereTokenEngine } from '../../../token-engine/SphereTokenEngine';
 import { TestAggregatorClient } from './support/TestAggregatorClient';
 
-/**
- * Build a real engine backed by a fresh in-memory aggregator.
- * `networkId` can be overridden to exercise cross-network guards.
- */
-export function createTestEngine(opts: { networkId?: NetworkId } = {}): SphereTokenEngine {
-  const aggregator = TestAggregatorClient.create();
+export interface TestEngineOptions {
+  /** Override to exercise cross-network guards. */
+  networkId?: NetworkId;
+  /**
+   * Reuse a specific in-memory aggregator (trust base + SMT). Lets two engines
+   * share one chain (conflict tests) or two chains share one trust base
+   * (determinism-across-devices tests via TestAggregatorClient.create(sameKey)).
+   */
+  aggregator?: TestAggregatorClient;
+  /** Wallet private key (defaults to a fresh random key). */
+  privateKey?: Uint8Array;
+  /**
+   * Optional wire-client wrapper around the aggregator for fault injection
+   * (e.g. a submit that throws). Trust base still comes from `aggregator`.
+   */
+  wireClient?: IAggregatorClient;
+}
+
+/** Build a real engine backed by an in-memory aggregator (fresh by default). */
+export function createTestEngine(opts: TestEngineOptions = {}): SphereTokenEngine {
+  const aggregator = opts.aggregator ?? TestAggregatorClient.create();
   const trustBase = aggregator.rootTrustBase;
   const predicateVerifier = PredicateVerifierService.create();
   const mintJustificationVerifier = new MintJustificationVerifierService();
   mintJustificationVerifier.register(
     new SplitMintJustificationVerifier(trustBase, predicateVerifier, decodeSpherePaymentData),
   );
+  const privateKey = opts.privateKey ?? SigningService.generatePrivateKey();
   const deps: EngineDeps = {
-    client: new StateTransitionClient(aggregator),
+    client: new StateTransitionClient(opts.wireClient ?? aggregator),
     trustBase,
     predicateVerifier,
     mintJustificationVerifier,
-    signingService: new SigningService(SigningService.generatePrivateKey()),
+    signingService: new SigningService(privateKey),
+    privateKey,
     networkId: opts.networkId ?? NetworkId.LOCAL,
   };
   return new SphereTokenEngine(deps);
