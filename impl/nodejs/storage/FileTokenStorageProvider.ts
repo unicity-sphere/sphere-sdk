@@ -5,7 +5,9 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import type { TokenStorageProvider, TxfStorageDataBase, SyncResult, SaveResult, LoadResult, HistoryRecord } from '../../../storage';
+import type { TokenStorageProvider, TxfStorageDataBase, SyncResult, SaveResult, LoadResult, HistoryRecord, InventoryView, ApplyDeltaAdded, ApplyDeltaOptions } from '../../../storage';
+import { WholeBlobInventoryAdapter } from '../../../storage';
+import type { TokenBlob } from '../../../token-engine/types';
 import type { FullIdentity, ProviderStatus } from '../../../types';
 import type { NetworkType } from '../../../constants';
 
@@ -32,6 +34,8 @@ export class FileTokenStorageProvider implements TokenStorageProvider<TxfStorage
   private network?: NetworkType;
   private status: ProviderStatus = 'disconnected';
   private identity: FullIdentity | null = null;
+  /** Default lazy-port adapter over this store (sdk-changes S2). */
+  private readonly inventoryAdapter = new WholeBlobInventoryAdapter<TxfStorageDataBase>(this);
 
   constructor(config: FileTokenStorageConfig | string) {
     this.baseTokensDir = typeof config === 'string' ? config : config.tokensDir;
@@ -226,6 +230,20 @@ export class FileTokenStorageProvider implements TokenStorageProvider<TxfStorage
       conflicts: 0,
       error: saveResult.error,
     };
+  }
+
+  // ── Lazy inventory port (sdk-changes S2) — default whole-blob adapter ──────
+
+  listInventory(since?: bigint): Promise<InventoryView> {
+    return this.inventoryAdapter.listInventory(since);
+  }
+
+  getToken(tokenId: string): Promise<TokenBlob> {
+    return this.inventoryAdapter.getToken(tokenId);
+  }
+
+  applyDelta(transferId: string, spent: string[], added: ApplyDeltaAdded[], opts?: ApplyDeltaOptions): Promise<void> {
+    return this.inventoryAdapter.applyDelta(transferId, spent, added, opts);
   }
 
   async clear(): Promise<boolean> {

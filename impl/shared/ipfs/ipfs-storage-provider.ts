@@ -18,7 +18,12 @@ import type {
   SyncResult,
   StorageEventCallback,
   StorageEvent,
+  InventoryView,
+  ApplyDeltaAdded,
+  ApplyDeltaOptions,
 } from '../../../storage';
+import { WholeBlobInventoryAdapter } from '../../../storage';
+import type { TokenBlob } from '../../../token-engine/types';
 import type {
   IpfsStorageConfig,
   IpfsStatePersistence,
@@ -589,6 +594,23 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
   // ---------------------------------------------------------------------------
   // Sync (enters serial queue to avoid concurrent IPNS conflicts)
   // ---------------------------------------------------------------------------
+
+  // ── Lazy inventory port (sdk-changes S2) — default whole-blob adapter ──────
+
+  /** Default lazy-port adapter over this store (sdk-changes S2). */
+  private readonly inventoryAdapter = new WholeBlobInventoryAdapter<TData>(this);
+
+  listInventory(since?: bigint): Promise<InventoryView> {
+    return this.inventoryAdapter.listInventory(since);
+  }
+
+  getToken(tokenId: string): Promise<TokenBlob> {
+    return this.inventoryAdapter.getToken(tokenId);
+  }
+
+  applyDelta(transferId: string, spent: string[], added: ApplyDeltaAdded[], opts?: ApplyDeltaOptions): Promise<void> {
+    return this.inventoryAdapter.applyDelta(transferId, spent, added, opts);
+  }
 
   async sync(localData: TData): Promise<SyncResult<TData>> {
     return this.flushQueue.enqueue(async () => {

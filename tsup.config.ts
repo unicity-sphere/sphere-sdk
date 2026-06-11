@@ -66,6 +66,26 @@ export default defineConfig([
       'ws',
     ],
   },
+  // Wallet-api client (sdk-changes S1) — platform-independent (fetch/WS injected)
+  {
+    entry: { 'wallet-api/index': 'wallet-api/index.ts' },
+    format: ['esm', 'cjs'],
+    dts: true,
+    clean: false,
+    splitting: false,
+    sourcemap: true,
+    platform: 'node',
+    target: 'es2022',
+    noExternal: [/^@noble\//],
+    external: [
+      /^@unicitylabs\//,
+      'bip39',
+      'buffer',
+      'crypto-js',
+      'elliptic',
+      'ws',
+    ],
+  },
   // L1 module (for direct crypto operations)
   {
     entry: { 'l1/index': 'l1/index.ts' },

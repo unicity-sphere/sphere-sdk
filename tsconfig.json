@@ -35,7 +35,8 @@
     "impl/**/*.ts",
     "l1/**/*.ts",
     "registry/**/*.ts",
-    "token-engine/**/*.ts"
+    "token-engine/**/*.ts",
+    "wallet-api/**/*.ts"
   ],
   "exclude": [
     "node_modules",
