@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, feat/wallet-api-integration]
   pull_request:
-    branches: [main]
+    branches: [main, feat/wallet-api-integration]
 
 jobs:
   build:
@@ -27,6 +27,12 @@ jobs:
         run: |
           npm install --include=optional --ignore-scripts
           npm rebuild
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
 
       - name: Build
         run: npm run build

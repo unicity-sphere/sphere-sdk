@@ -45,6 +45,16 @@
         "default": "./dist/core/index.cjs"
       }
     },
+    "./token-engine": {
+      "import": {
+        "types": "./dist/token-engine/index.d.ts",
+        "default": "./dist/token-engine/index.js"
+      },
+      "require": {
+        "types": "./dist/token-engine/index.d.cts",
+        "default": "./dist/token-engine/index.cjs"
+      }
+    },
     "./l1": {
       "import": {
         "types": "./dist/l1/index.d.ts",
@@ -102,7 +112,7 @@
     "test:relay": "vitest run --config vitest.relay.config.ts",
     "lint": "eslint . --ext .ts",
     "typecheck": "tsc --noEmit",
-    "cli": "echo 'The CLI has moved to @unicity-sphere/cli — install it with: npm install -g @unicity-sphere/cli' && exit 1"
+    "cli": "echo 'The CLI has moved to @unicity-sphere/cli \u2014 install it with: npm install -g @unicity-sphere/cli' && exit 1"
   },
   "keywords": [
     "unicity",
