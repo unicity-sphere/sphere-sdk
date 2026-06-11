@@ -52,6 +52,10 @@ jobs:
           for f in dist/index.d.ts dist/core/index.d.ts dist/token-engine/index.d.ts dist/wallet-api/index.d.ts; do
             test -f "$f" || { echo "MISSING $f — refusing to publish a broken tarball (cf. 0.9.1-dev.2 dts regression)"; exit 1; }
           done
+          # prepublishOnly is verify-only: npm publish packs THIS dist (no rebuild;
+          # the dev.2/dev.3 tarballs lost dts files to a pack-vs-DTS-worker race)
+          npm pack --dry-run --json > /tmp/pack.json
+          node -e "const files=require('/tmp/pack.json')[0].files.map(f=>f.path);for(const f of ['dist/index.d.ts','dist/core/index.d.ts','dist/token-engine/index.d.ts','dist/wallet-api/index.d.ts']){if(!files.includes(f)){console.error('TARBALL MISSING '+f);process.exit(1)}}console.log('tarball manifest verified: '+files.length+' files')"
 
       - name: Determine npm dist-tag
         id: dist-tag

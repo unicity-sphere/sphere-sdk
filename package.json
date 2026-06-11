@@ -115,7 +115,7 @@
     "build": "tsup",
     "build:watch": "tsup --watch",
     "clean": "rm -rf dist",
-    "prepublishOnly": "npm run clean && npm run build",
+    "prepublishOnly": "node -e \"const fs=require('fs');const must=['dist/index.d.ts','dist/core/index.d.ts','dist/token-engine/index.d.ts','dist/wallet-api/index.d.ts','dist/token-engine/index.js','dist/wallet-api/index.js'];const missing=must.filter(f=>!fs.existsSync(f));if(missing.length){console.error('prepublishOnly: dist is stale or incomplete — run npm run build first. Missing: '+missing.join(', '));process.exit(1)}\"",
     "test": "vitest",
     "test:run": "vitest run",
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
