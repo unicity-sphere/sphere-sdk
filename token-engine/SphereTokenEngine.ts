@@ -245,11 +245,14 @@ export class SphereTokenEngine implements ITokenEngine {
     );
 
     // Value conservation is enforced inside the SDK split (root.value === source value).
-    // The burn transaction's state mask is still random INSIDE TokenSplit.split —
-    // the pinned base SDK has no burnStateMask parameter yet (it arrives via
-    // state-transition-sdk-js#125; wiring tracked in #492) — so the burn leg is
-    // not yet rebuildable and a split resume stops at the burn.
-    const split = await TokenSplit.split(params.token.sdkToken, decodeSpherePaymentData, requests);
+    // E.1: the burn state mask is HKDF-derived, so the whole split — burn leg
+    // included — is rebuildable from the wallet key + transferId (crash resume).
+    const split = await TokenSplit.split(
+      params.token.sdkToken,
+      decodeSpherePaymentData,
+      requests,
+      deriveRealization(this.privateKeyHex, transferId, 0, 'burn'),
+    );
 
     // 1. Burn the source: certify the burn transfer and append it -> burntToken.
     const burnUnlock = await SignaturePredicateUnlockScript.create(split.burn.transaction, this.deps.signingService);

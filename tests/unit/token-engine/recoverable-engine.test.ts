@@ -182,6 +182,18 @@ describe('recoverable engine (Part E) — real adapter over in-memory aggregator
     expect(HexConverter.encode(runA.outputs[0].sdkToken.genesis.salt.toBytes())).not.toBe(
       HexConverter.encode(runA.outputs[1].sdkToken.genesis.salt.toBytes()),
     );
+
+    // AC-E1/AC-E2 split legs (complete since the burnStateMask rc): a full
+    // re-run against the SAME aggregator recovers BYTE-IDENTICAL finished
+    // outputs. This is also the burn-determinism proof: a random burn mask
+    // would rebuild a DIFFERENT burn transaction, the duplicate submit would
+    // be first-write-wins, and E.2's match-verify would throw
+    // TransferConflictError instead of completing. (Finished tokens are never
+    // byte-comparable across DIFFERENT aggregators — inclusion proofs embed
+    // aggregator state; AC-E1's cross-run byte-identity is about the rebuilt
+    // transactions, which the salt/tokenId assertions above pin cross-engine.)
+    const rerun = await engineA.split({ token: srcA, outputs }, { transferId });
+    expect(rerun.outputs.map((o) => engineA.encodeToken(o))).toEqual(runA.outputs.map((o) => engineA.encodeToken(o)));
   }, 40000);
 
   // E.2 status-agnostic submit: a submit that THROWS (response-parse failure)
