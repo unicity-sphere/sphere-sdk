@@ -5,10 +5,15 @@
  * TestAggregatorClient, whose first-write-wins duplicate submit + proof
  * re-fetch is the target aggregator contract for E.2.
  *
- * Split legs note: per-output salts/tokenType are deterministic here, but the
- * burn mask is still random inside the pinned base SDK's TokenSplit.split
- * (state-transition-sdk-js#125; wiring tracked in #492) — so split tests
- * assert salt/tokenId determinism, not burn-leg resume.
+ * Split legs note: per-output salts/tokenIds AND the burn mask are fully
+ * deterministic (st-sdk#125 burnStateMask + EngineOpOptions.opIndex), so a
+ * MID-split resume — re-running after the burn certified but before the mint
+ * legs landed — completes. A FULL re-run after the mint legs certified is the
+ * KNOWN GAP sphere-sdk#501: the aggregator rebuilds inclusion proofs from the
+ * live tree per request (st-sdk#126, owner analysis), so rebuilt mint
+ * transactions embed a byte-different burn proof and their hashes mismatch
+ * the certified leaves → TransferConflictError. Both behaviors are pinned
+ * below.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -48,6 +53,26 @@ class SubmitForwardsThenThrowsClient implements IAggregatorClient {
   public async submitCertificationRequest(certificationData: CertificationData): Promise<CertificationResponse> {
     await this.inner.submitCertificationRequest(certificationData);
     throw new Error('CertificationResponse.fromJSON: unknown certification status STATE_ID_EXISTS');
+  }
+}
+
+/** Forwards the FIRST submit (the burn), then crashes — a wallet dying
+ * mid-split after the burn certified but before any mint leg reached the
+ * aggregator. The resume-side of sphere-sdk#501's working case. */
+class CrashAfterBurnClient implements IAggregatorClient {
+  private submits = 0;
+
+  public constructor(private readonly inner: TestAggregatorClient) {}
+
+  public getInclusionProof(stateId: StateId): Promise<InclusionProofResponse> {
+    return this.inner.getInclusionProof(stateId);
+  }
+
+  public submitCertificationRequest(certificationData: CertificationData): Promise<CertificationResponse> {
+    if (this.submits++ > 0) {
+      return Promise.reject(new Error('wallet crashed mid-split (simulated)'));
+    }
+    return this.inner.submitCertificationRequest(certificationData);
   }
 }
 
@@ -183,17 +208,76 @@ describe('recoverable engine (Part E) — real adapter over in-memory aggregator
       HexConverter.encode(runA.outputs[1].sdkToken.genesis.salt.toBytes()),
     );
 
-    // AC-E1/AC-E2 split legs (complete since the burnStateMask rc): a full
-    // re-run against the SAME aggregator recovers BYTE-IDENTICAL finished
-    // outputs. This is also the burn-determinism proof: a random burn mask
-    // would rebuild a DIFFERENT burn transaction, the duplicate submit would
-    // be first-write-wins, and E.2's match-verify would throw
-    // TransferConflictError instead of completing. (Finished tokens are never
-    // byte-comparable across DIFFERENT aggregators — inclusion proofs embed
-    // aggregator state; AC-E1's cross-run byte-identity is about the rebuilt
-    // transactions, which the salt/tokenId assertions above pin cross-engine.)
-    const rerun = await engineA.split({ token: srcA, outputs }, { transferId });
-    expect(rerun.outputs.map((o) => engineA.encodeToken(o))).toEqual(runA.outputs.map((o) => engineA.encodeToken(o)));
+  }, 40000);
+
+  // The WORKING split resume (sdk-changes E.2): the wallet dies after the
+  // burn certified but before any mint leg landed. Re-running with the same
+  // {transferId} rebuilds the byte-identical burn (deterministic
+  // burnStateMask — duplicate submit absorbed first-write-wins, the
+  // refetched proof match-verifies because the certified transactionHash is
+  // stable), then submits the mint legs fresh: the split completes and every
+  // output verifies. This is ALSO the burn-determinism proof — a random burn
+  // mask would rebuild a different burn transaction and the resume would
+  // throw TransferConflictError instead of completing.
+  it('split resume: a crash after burn certification completes on re-run with the same transferId', async () => {
+    const aggregator = TestAggregatorClient.create();
+    const walletKey = SigningService.generatePrivateKey();
+    const crashing = createTestEngine({
+      aggregator,
+      privateKey: walletKey,
+      wireClient: new CrashAfterBurnClient(aggregator),
+    });
+    const plain = createTestEngine({ aggregator, privateKey: walletKey });
+
+    const self = plain.getIdentity().chainPubkey;
+    const src = await plain.mint({ recipientPubkey: self, value: { assets: [{ coinId: COIN, amount: 100n }] } });
+    const transferId = crypto.randomUUID();
+    const outputs = [
+      { recipientPubkey: freshPubkey(), coinId: COIN, amount: 60n },
+      { recipientPubkey: self, coinId: COIN, amount: 40n },
+    ];
+
+    await expect(
+      // Short proof-poll budget: the crashed mint submits leave no proof to find.
+      crashing.split({ token: src, outputs }, { transferId, signal: AbortSignal.timeout(2000) }),
+    ).rejects.toThrow('wallet crashed mid-split (simulated)');
+
+    const resumed = await plain.split({ token: src, outputs }, { transferId });
+    expect(resumed.outputs).toHaveLength(2);
+    expect(resumed.outputs.map((o) => plain.balanceOf(o, COIN))).toEqual([60n, 40n]);
+    for (const o of resumed.outputs) {
+      expect((await plain.verify(o)).ok).toBe(true);
+    }
+  }, 40000);
+
+  // KNOWN GAP sphere-sdk#501, pinned: a FULL re-run after the mint legs
+  // certified cannot recover. The aggregator rebuilds inclusion proofs from
+  // the live tree per request (st-sdk#126 — only CertificationData is
+  // stable), so the rebuilt mint transactions embed a byte-different burn
+  // proof; their transactionHashes mismatch the certified leaves and E.2's
+  // match-verify throws TransferConflictError. FLIP this test to assert
+  // recovery once the #501 persistence design (durable burn-certified split
+  // progress) lands.
+  it('split full re-run after certified mints throws TransferConflictError (#501 known gap)', async () => {
+    const aggregator = TestAggregatorClient.create();
+    const engine = createTestEngine({ aggregator });
+    const self = engine.getIdentity().chainPubkey;
+    const src = await engine.mint({ recipientPubkey: self, value: { assets: [{ coinId: COIN, amount: 100n }] } });
+    const transferId = crypto.randomUUID();
+    const outputs = [
+      { recipientPubkey: freshPubkey(), coinId: COIN, amount: 70n },
+      { recipientPubkey: self, coinId: COIN, amount: 30n },
+    ];
+
+    const first = await engine.split({ token: src, outputs }, { transferId });
+    expect(first.outputs).toHaveLength(2);
+
+    const err = await engine.split({ token: src, outputs }, { transferId }).then(
+      () => null,
+      (caught: unknown) => caught,
+    );
+    expect(err).toBeInstanceOf(TransferConflictError);
+    expect((err as TransferConflictError).code).toBe('TRANSFER_CONFLICT');
   }, 40000);
 
   // E.2 status-agnostic submit: a submit that THROWS (response-parse failure)

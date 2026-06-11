@@ -38,8 +38,6 @@ export class TestAggregatorClient implements IAggregatorClient {
   public readonly rootTrustBase: RootTrustBase;
   private readonly predicateVerifier: PredicateVerifierService;
   private readonly requests: Map<bigint, CertificationData> = new Map();
-  /** Inclusion proofs anchored at submission time (round-stable, like the real aggregator). */
-  private readonly proofs: Map<bigint, InclusionProofResponse> = new Map();
 
   private constructor(
     private readonly smt: SparseMerkleTree,
@@ -63,26 +61,34 @@ export class TestAggregatorClient implements IAggregatorClient {
   /**
    * @inheritDoc
    *
-   * Fidelity note (deliberate divergence from the upstream copy): the real
-   * aggregator anchors an inclusion proof at the round the leaf was included —
-   * refetching it later returns the SAME proof, regardless of later
-   * submissions. The upstream test client recomputes from the current tree,
-   * which silently breaks crash-resume tests (a refetched proof would differ
-   * once unrelated leaves land). We snapshot the proof at submission time.
+   * Fidelity note: the proof is REBUILT from the live SMT on every request —
+   * fresh sibling path + a fresh UnicityCertificate over the CURRENT root.
+   * This matches the real aggregator (aggregator-go rebuilds per request;
+   * confirmed by owner analysis on st-sdk#126, closed as invalid): only the
+   * stored CertificationData is stable across refetches. Consequence for
+   * resume flows: a proof refetched after later submissions differs
+   * byte-wise from the original — match on certificationData /
+   * transactionHash, never on proof bytes (sdk-changes E.2, sphere-sdk#501).
    */
   public async getInclusionProof(stateId: StateId): Promise<InclusionProofResponse> {
     const path = BitString.fromBytesReversedLSB(stateId.data).toBigInt();
-
-    const snapshot = this.proofs.get(path);
-    if (snapshot !== undefined) {
-      return Promise.resolve(snapshot);
-    }
-
     const root = await this.smt.calculateRoot();
-    return Promise.resolve(
-      new InclusionProofResponse(
+
+    const certificationData = this.requests.get(path);
+    if (certificationData === undefined) {
+      return new InclusionProofResponse(
         1n,
         new InclusionProof(null, null, await createUnicityCertificate(root.hash, this.signingService)),
+      );
+    }
+    // Recomputed from the CURRENT tree per request — like the real aggregator
+    // (fresh siblings + latest UC); only certificationData is stable (#126).
+    return new InclusionProofResponse(
+      1n,
+      new InclusionProof(
+        certificationData,
+        InclusionCertificate.create(root, stateId.data),
+        await createUnicityCertificate(root.hash, this.signingService),
       ),
     );
   }
@@ -106,22 +112,8 @@ export class TestAggregatorClient implements IAggregatorClient {
 
     const path = BitString.fromBytesReversedLSB(stateId.data).toBigInt();
     if (!this.requests.has(path)) {
-      const leafValue = certificationData.transactionHash;
-      await this.smt.addLeaf(stateId.data, leafValue.data);
+      await this.smt.addLeaf(stateId.data, certificationData.transactionHash.data);
       this.requests.set(path, certificationData);
-      // Anchor the proof at inclusion time (see getInclusionProof fidelity note).
-      const root = await this.smt.calculateRoot();
-      this.proofs.set(
-        path,
-        new InclusionProofResponse(
-          1n,
-          new InclusionProof(
-            certificationData,
-            InclusionCertificate.create(root, stateId.data),
-            await createUnicityCertificate(root.hash, this.signingService),
-          ),
-        ),
-      );
     }
 
     return CertificationResponse.create(CertificationStatus.SUCCESS);
