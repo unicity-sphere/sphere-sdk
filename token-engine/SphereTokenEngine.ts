@@ -15,6 +15,7 @@
 import { SphereError, type SphereErrorCode } from '../core/errors';
 import { TransferConflictError } from './errors';
 import { deriveDirectAddress, UNICITY_TOKEN_TYPE_HEX } from './identity';
+import { deriveDeliveryKeys } from './blob-keys';
 import { deriveRealization } from './realization';
 import {
   CborDeserializer,
@@ -206,7 +207,7 @@ export class SphereTokenEngine implements ITokenEngine {
     const recipient = SignaturePredicate.create(params.recipientPubkey);
     // E.1 deterministic realization: same transferId + inputs ⇒ byte-identical
     // transaction, so an interrupted transfer can be rebuilt and resumed (AC-E1/E2).
-    const stateMask = deriveRealization(this.privateKeyHex, transferId, 0, 'stateMask');
+    const stateMask = deriveRealization(this.privateKeyHex, transferId, this.resolveOpIndex(options), 'stateMask');
 
     const transferTx = await TransferTransaction.create(params.token.sdkToken, recipient, stateMask, params.data ?? null);
     const unlockScript = await SignaturePredicateUnlockScript.create(transferTx, this.deps.signingService);
@@ -251,7 +252,7 @@ export class SphereTokenEngine implements ITokenEngine {
       params.token.sdkToken,
       decodeSpherePaymentData,
       requests,
-      deriveRealization(this.privateKeyHex, transferId, 0, 'burn'),
+      deriveRealization(this.privateKeyHex, transferId, this.resolveOpIndex(options), 'burn'),
     );
 
     // 1. Burn the source: certify the burn transfer and append it -> burntToken.
@@ -339,6 +340,11 @@ export class SphereTokenEngine implements ITokenEngine {
 
   // ── serialization ────────────────────────────────────────────────────────────
 
+  /** @inheritDoc — SDK-derived (Token.fromCBOR → latestTransaction.calculateStateHash().imprint). */
+  public deliveryKeys(blobBytes: Uint8Array): Promise<{ tokenId: string; stateHash: string }> {
+    return deriveDeliveryKeys(blobBytes);
+  }
+
   public encodeToken(token: SphereToken): TokenBlob {
     return token.blob;
   }
@@ -364,6 +370,15 @@ export class SphereTokenEngine implements ITokenEngine {
    * The canonical-lowercase-UUID check also keeps the HKDF info string
    * unambiguous (no ':' injection, no case-variant double derivations).
    */
+  /** Validated op ordinal (§8.1 mask domain separation across ops of one send). */
+  private resolveOpIndex(options?: EngineOpOptions): number {
+    const opIndex = options?.opIndex ?? 0;
+    if (!Number.isInteger(opIndex) || opIndex < 0) {
+      throw new SphereError(`opIndex must be a non-negative integer, got ${String(opIndex)}`, 'VALIDATION_ERROR');
+    }
+    return opIndex;
+  }
+
   private resolveTransferId(options?: EngineOpOptions): string {
     const transferId = options?.transferId ?? crypto.randomUUID();
     if (!TRANSFER_ID_RE.test(transferId)) {

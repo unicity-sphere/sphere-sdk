@@ -211,7 +211,7 @@ export {
 // Delivery port (sdk-changes S7) — the swappable seam for handing finished
 // token blobs to recipients (covenant §3.1-6); wallet-api's mailbox provider
 // (impl/shared/wallet-api) is the reference implementation.
-export { computeDeliveryId, deliveryKeysFromBlob } from './transport';
+export { computeDeliveryId, composeDeliveryKeys } from './transport';
 export type {
   DeliveryProvider,
   DeliveryReceipt,

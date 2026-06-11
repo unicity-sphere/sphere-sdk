@@ -67,7 +67,7 @@ interface MailboxEntryRow {
   entryId: string;
   /** Per-recipient monotonic, gap-free seq (§6/§9). */
   seq: bigint;
-  status: 'pending' | 'claimed' | 'rejected';
+  status: 'unclaimed' | 'claimed' | 'rejected';
   recipientPubkey: string;
   senderPubkey: string;
   transferId: string;
@@ -131,9 +131,9 @@ export interface FakeWalletApiOptions {
   wsTicketTtlMs?: number; // WS_TICKET_TTL (§14), default 30 s
   maxBlobBytes?: number; // MAX_BLOB_BYTES (§14), default 16 MiB
   intentMaxBytes?: number; // intent payload cap (§7), default 4 KiB
-  /** Per-recipient unclaimed-entry cap (§5.5/§6), default 1000. */
+  /** Per-recipient unclaimed+rejected cap (§5.5), default 10000 (MAX_RECIPIENT_ENTRIES). */
   mailboxUnclaimedCap?: number;
-  /** Per-(recipient, sender) unclaimed sub-cap (§6), default 100. */
+  /** Per-(sender, recipient) sub-cap (§5.5), default 500 (MAX_SENDER_RECIPIENT_ENTRIES). */
   mailboxPerPairCap?: number;
   /**
    * APPROXIMATION of §8.2 steps 3–6: the real backend CBOR-decodes the v2
@@ -233,8 +233,8 @@ export class FakeWalletApi {
     this.wsTicketTtlMs = options.wsTicketTtlMs ?? 30 * 1000; // WS_TICKET_TTL (§14)
     this.maxBlobBytes = options.maxBlobBytes ?? 16 * 1024 * 1024; // MAX_BLOB_BYTES (§14)
     this.intentMaxBytes = options.intentMaxBytes ?? 4096; // intent payload ≤ 4 KiB (§7)
-    this.mailboxUnclaimedCap = options.mailboxUnclaimedCap ?? 1000; // per-recipient unclaimed cap (§5.5)
-    this.mailboxPerPairCap = options.mailboxPerPairCap ?? 100; // per-sender-pair sub-cap (§6)
+    this.mailboxUnclaimedCap = options.mailboxUnclaimedCap ?? 10000; // per-recipient unclaimed cap (§5.5)
+    this.mailboxPerPairCap = options.mailboxPerPairCap ?? 500; // per-sender-pair sub-cap (§5.5 MAX_SENDER_RECIPIENT_ENTRIES)
     this.decodeAssets = options.decodeAssets ?? defaultDecodeAssets;
   }
 
@@ -379,7 +379,7 @@ export class FakeWalletApi {
     const recipient = this.owner(recipientPubkey);
     const entry = recipient.mailbox.get(entryId);
     if (entry) {
-      entry.status = 'pending';
+      entry.status = 'unclaimed';
       entry.claimedIntoInventory = undefined;
       recipient.readPointer = 0n;
     }
@@ -1045,7 +1045,7 @@ export class FakeWalletApi {
     let pointer = recipient.readPointer;
     for (;;) {
       const next = bySeq.get((pointer + 1n).toString());
-      if (!next || next.status === 'pending') break;
+      if (!next || next.status === 'unclaimed') break;
       pointer += 1n;
     }
     recipient.readPointer = pointer;
@@ -1104,7 +1104,7 @@ export class FakeWalletApi {
     let unclaimed = 0;
     let unclaimedFromSender = 0;
     for (const e of recipient.mailbox.values()) {
-      if (e.status !== 'pending') continue;
+      if (e.status !== 'unclaimed') continue;
       unclaimed++;
       if (e.senderPubkey === session.pubkey) unclaimedFromSender++;
     }
@@ -1155,7 +1155,7 @@ export class FakeWalletApi {
     recipient.mailbox.set(entryId, {
       entryId,
       seq: recipient.mailboxSeq,
-      status: 'pending',
+      status: 'unclaimed',
       recipientPubkey,
       senderPubkey: session.pubkey,
       transferId,
@@ -1263,7 +1263,7 @@ export class FakeWalletApi {
         continue;
       }
 
-      // 'pending' or 'rejected' — a rejected entry REMAINS claimable (§6:
+      // 'unclaimed' or 'rejected' — a rejected entry REMAINS claimable (§6:
       // reject is terminal for discovery, not for the asset).
       if (intoInventory) {
         const verdict = this.performClaimHandoff(entry, recipient, session.pubkey);
@@ -1375,7 +1375,7 @@ export class FakeWalletApi {
     for (const entryId of entryIds) {
       const entry = recipient.mailbox.get(entryId);
       if (!entry) throw new HttpError(403, 'FORBIDDEN', `not the addressee of entry ${entryId}`); // addressee-only (§16)
-      if (entry.status === 'pending') {
+      if (entry.status === 'unclaimed') {
         entry.status = 'rejected';
         this.recomputeReadPointer(recipient);
         rejected.push(entryId);

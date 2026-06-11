@@ -151,7 +151,7 @@ export interface MailboxDepositRequest {
   memo?: string;
 }
 
-export type MailboxEntryStatus = 'pending' | 'claimed' | 'rejected';
+export type MailboxEntryStatus = 'unclaimed' | 'claimed' | 'rejected'; // §11/§16 wire values
 
 /** One `GET /v1/mailbox` entry (§16). */
 export interface MailboxEntry {

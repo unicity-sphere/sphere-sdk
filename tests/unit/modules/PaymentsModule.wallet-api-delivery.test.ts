@@ -232,7 +232,7 @@ describe('send — full wallet-api preset (S2 consumer + S3 + §7 pipeline)', ()
     // Mailbox deposit carries the send's transferId (entries group by it — §7).
     const entries = fake.listMailboxEntries(RECIPIENT.chainPubkey);
     expect(entries).toHaveLength(1);
-    expect(entries[0]).toMatchObject({ status: 'pending', transferId: result.id, tokenId: sourceTokenId });
+    expect(entries[0]).toMatchObject({ status: 'unclaimed', transferId: result.id, tokenId: sourceTokenId });
 
     // §5.3: the source removal is EVIDENCED by the deposit of the same transferId.
     expect(fake.getRow(SENDER.chainPubkey, sourceTokenId)).toMatchObject({

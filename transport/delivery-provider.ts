@@ -32,7 +32,7 @@
  */
 
 import { sha256 } from '@noble/hashes/sha2.js';
-import { decodeTokenBlob } from '../token-engine/token-blob';
+
 
 // =============================================================================
 // Normative shapes (sdk-changes S7)
@@ -131,6 +131,15 @@ export interface DeliveryProvider {
    * Returns an unsubscribe function.
    */
   onWake?(callback: () => void): () => void;
+
+  /**
+   * Late-bind the backend-true (tokenId, stateHash) derivation —
+   * `ITokenEngine.deliveryKeys`. Compositions are engine-less (the engine is
+   * built later); the module that owns both (PaymentsModule) binds this at
+   * init. Implementations that derive ids (S7) MUST use it and fail loudly if
+   * unbound; transports that don't derive may omit the method.
+   */
+  bindDeliveryKeys?(derive: (blobBytes: Uint8Array) => Promise<{ tokenId: string; stateHash: string }>): void;
 }
 
 // =============================================================================
@@ -154,7 +163,9 @@ function bytesToHex(bytes: Uint8Array): string {
  * implementation can substitute a server row id (covenant §3.1-4).
  *
  * @param tokenIdHex - genesis-stable 64-hex token id
- * @param stateHashHex - 64-hex per-state hash: `hex(SHA-256(inner token bytes))`
+ * @param stateHashHex - the SDK's per-state hash (DataHash imprint, hex) — the
+ *   backend's `state_hash` (wallet-api validation/chain.ts); NEVER a plain
+ *   sha256 over the token bytes (that variant 422s on deposit).
  */
 export function computeDeliveryId(tokenIdHex: string, stateHashHex: string): string {
   const tokenId = hexToBytes(tokenIdHex);
@@ -165,7 +176,7 @@ export function computeDeliveryId(tokenIdHex: string, stateHashHex: string): str
   return bytesToHex(sha256(joined));
 }
 
-/** The keys a finished token blob self-describes (no engine needed). */
+/** Full delivery keys: the engine-derived pair + the composed deliveryId. */
 export interface DeliveryBlobKeys {
   /** Genesis-stable 64-hex token id (from the TokenBlob envelope). */
   tokenId: string;
@@ -179,8 +190,11 @@ export interface DeliveryBlobKeys {
  * Derive (tokenId, stateHash, deliveryId) from encoded TokenBlob bytes.
  * Throws when the bytes are not a decodable TokenBlob.
  */
-export function deliveryKeysFromBlob(blobBytes: Uint8Array): DeliveryBlobKeys {
-  const blob = decodeTokenBlob(blobBytes);
-  const stateHash = bytesToHex(sha256(blob.token));
-  return { tokenId: blob.tokenId, stateHash, deliveryId: computeDeliveryId(blob.tokenId, stateHash) };
+/**
+ * Compose full delivery keys from an engine-derived (tokenId, stateHash) pair.
+ * The pair MUST come from `ITokenEngine.deliveryKeys` (the backend-true SDK
+ * derivation) — the port module deliberately cannot decode tokens itself.
+ */
+export function composeDeliveryKeys(keys: { tokenId: string; stateHash: string }): DeliveryBlobKeys {
+  return { ...keys, deliveryId: computeDeliveryId(keys.tokenId, keys.stateHash) };
 }

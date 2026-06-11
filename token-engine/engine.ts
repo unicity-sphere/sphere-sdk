@@ -38,6 +38,17 @@ export interface EngineOpOptions {
    * gone if the process dies mid-op).
    */
   readonly transferId?: string;
+  /**
+   * Ordinal of this engine op WITHIN one logical send sharing a `transferId`
+   * (ARCHITECTURE §7: D whole-token transfers + at most one split under ONE
+   * intent). It indexes the op-level HKDF derivations (`stateMask`, the split
+   * `burn` mask) so distinct ops never reuse a mask — §8.1's "per-transfer
+   * unique". Per-output split salts are indexed by output ordinal in their own
+   * `salt` field domain; callers MUST NOT run two splits under one transferId.
+   * Default 0 (single-op sends). Resume MUST replay the same (transferId,
+   * opIndex) pairing per source.
+   */
+  readonly opIndex?: number;
 }
 
 /**
@@ -118,6 +129,17 @@ export interface ITokenEngine {
   encodeToken(token: SphereToken): TokenBlob;
   /** Reconstruct a token from its blob (decodes embedded payment data). */
   decodeToken(blob: TokenBlob): Promise<SphereToken>;
+
+  /**
+   * The backend-true delivery keys for encoded TokenBlob bytes: the
+   * genesis-stable tokenId and the SDK's PROTOCOL state hash of the latest
+   * state (DataHash imprint, hex). wallet-api keys mailbox entries on exactly
+   * this pair (entry_id = SHA-256(tokenId ‖ stateHash); §8.2 step 4 validates
+   * a deposit's claimed stateHash against it) — a plain hash over the token
+   * bytes is NOT this value and 422s on deposit. Delivery implementations MUST
+   * derive their ids through this method, never locally.
+   */
+  deliveryKeys(blobBytes: Uint8Array): Promise<{ tokenId: string; stateHash: string }>;
 }
 
 /**

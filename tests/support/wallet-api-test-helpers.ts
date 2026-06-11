@@ -11,7 +11,8 @@
  */
 
 import { getPublicKey } from '../../core/crypto';
-import { encodeTokenBlob } from '../../token-engine/token-blob';
+import { decodeTokenBlob, encodeTokenBlob } from '../../token-engine/token-blob';
+import { sha256 } from '@noble/hashes/sha2.js';
 import type { TokenBlob } from '../../token-engine/types';
 import type { TxfStorageDataBase } from '../../storage';
 import type { KeyValueStore } from '../../wallet-api';
@@ -94,4 +95,15 @@ export class MemoryKeyValueStore implements KeyValueStore {
 export function testIdentity(n: number): { privateKey: string; chainPubkey: string } {
   const privateKey = (n + 1).toString(16).padStart(64, '0');
   return { privateKey, chainPubkey: getPublicKey(privateKey) };
+}
+
+/**
+ * Fake-world delivery-key derivation — mirrors FakeTokenEngine.deliveryKeys
+ * (sha256 over inner token bytes). Bind into standalone-constructed providers;
+ * the REAL SDK derivation is pinned by delivery-keys.test.ts + the harness.
+ */
+export function fakeDeliveryKeys(blobBytes: Uint8Array): Promise<{ tokenId: string; stateHash: string }> {
+  const blob = decodeTokenBlob(blobBytes);
+  const hex = Array.from(sha256(blob.token), (b) => b.toString(16).padStart(2, '0')).join('');
+  return Promise.resolve({ tokenId: blob.tokenId, stateHash: hex });
 }

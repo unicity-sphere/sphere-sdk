@@ -13,7 +13,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { FakeWalletApi } from '../support/fake-wallet-api';
-import { MemoryKeyValueStore, makeTestToken, testIdentity } from '../support/wallet-api-test-helpers';
+import { MemoryKeyValueStore, makeTestToken, testIdentity, fakeDeliveryKeys } from '../support/wallet-api-test-helpers';
 import { WalletApiClient } from '../../wallet-api';
 import { WalletApiMailboxProvider } from '../../impl/shared/wallet-api';
 import type { DeliveryCustody, IncomingDelivery } from '../../transport/delivery-provider';
@@ -47,6 +47,7 @@ async function makeHarness(custody: DeliveryCustody): Promise<Harness> {
     storage: new MemoryKeyValueStore(),
   });
   const sender = new WalletApiMailboxProvider({
+    deliveryKeys: fakeDeliveryKeys,
     client: senderClient,
     custody: 'external',
     stateStore: new MemoryKeyValueStore(),
@@ -62,6 +63,7 @@ async function makeHarness(custody: DeliveryCustody): Promise<Harness> {
   const recipientState = new MemoryKeyValueStore();
   const makeRecipient = (): WalletApiMailboxProvider => {
     const provider = new WalletApiMailboxProvider({
+      deliveryKeys: fakeDeliveryKeys,
       client: recipientClient,
       custody,
       stateStore: recipientState, // SAME persistent state across restarts
@@ -163,6 +165,7 @@ describe('WalletApiMailboxProvider — provider-specific semantics', () => {
       // re-acks the already-claimed entry — the §6 false→true upgrade inserts
       // the row (idempotent); the reverse direction never removes rows.
       const upgraded = new WalletApiMailboxProvider({
+        deliveryKeys: fakeDeliveryKeys,
         client: h.recipientClient,
         custody: 'inventory',
         stateStore: new MemoryKeyValueStore(),

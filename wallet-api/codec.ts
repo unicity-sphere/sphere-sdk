@@ -176,7 +176,7 @@ export function parseDepositResult(body: unknown): string {
 function parseMailboxEntry(raw: unknown, what: string): MailboxEntry {
   const rec = asRecord(raw, what);
   const status = asString(rec.status, `${what}.status`);
-  if (status !== 'pending' && status !== 'claimed' && status !== 'rejected') {
+  if (status !== 'unclaimed' && status !== 'claimed' && status !== 'rejected') {
     throw protocolError(`${what}.status is not a known mailbox entry status`);
   }
   const createdAt = Date.parse(asString(rec.createdAt, `${what}.createdAt`));

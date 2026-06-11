@@ -311,6 +311,11 @@ export async function parseTokenInfo(tokenData: unknown, engine?: ITokenEngine):
 // Cache parsed sdkData fields to avoid repeated JSON.parse in hot loops.
 // Key = sdkData string reference, value = { tokenId, stateHash }.
 // Cleared on address switch via clearSdkDataCache().
+// LOCAL-namespace keys ONLY (journal/tombstone dedup): this stateHash is a
+// plain sha256 over the token bytes — it is NOT the protocol state hash the
+// backend uses (that is token-engine deriveDeliveryKeys / the SDK imprint).
+// Both writers and readers of these keys use THIS function; never mix the two
+// derivations in one comparison.
 const sdkDataCache = new Map<string, { tokenId: string | null; stateHash: string }>();
 const SDK_DATA_CACHE_MAX = 2000;
 
@@ -917,7 +922,15 @@ export class PaymentsModule {
     // Delivery seam (sdk-changes S3/S7): the injected port, or the transport
     // adapter preserving the legacy relay leg through the same seam.
     this.injectedDelivery = deps.delivery ?? null;
-    this.delivery = deps.delivery ?? new TransportDeliveryAdapter(deps.transport);
+    const lazyDeliveryKeys = async (blobBytes: Uint8Array): Promise<{ tokenId: string; stateHash: string }> => {
+      const engine = this.deps?.tokenEngine;
+      if (!engine) throw new SphereError('Token engine required for delivery-key derivation (S7)', 'AGGREGATOR_ERROR');
+      return engine.deliveryKeys(blobBytes);
+    };
+    this.delivery = deps.delivery ?? new TransportDeliveryAdapter(deps.transport, lazyDeliveryKeys);
+    // S7: the module owns the engine — late-bind the backend-true derivation
+    // into whatever delivery provider was composed.
+    this.delivery.bindDeliveryKeys?.(lazyDeliveryKeys);
     this.delivery.setIdentity?.({
       privateKey: deps.identity.privateKey,
       chainPubkey: deps.identity.chainPubkey,
@@ -1405,14 +1418,16 @@ export class PaymentsModule {
         // (ARCHITECTURE §7/§8.1): the intent transferId seeds every engine op,
         // so any device holding the wallet seed can rebuild the identical
         // transactions and resume (Part E).
-        for (const tw of splitPlan.tokensToTransferDirectly) {
+        for (const [opIndex, tw] of splitPlan.tokensToTransferDirectly.entries()) {
           const finished = await engine.transfer(
             {
               token: tw.sdkToken as SphereToken,
               recipientPubkey: recipientChainPubkey,
               data: memoData,
             },
-            { signal: AbortSignal.timeout(SEND_ENGINE_OP_TIMEOUT_MS), transferId: result.id },
+            // opIndex = position in the persisted intent's `direct` order — the
+            // stable (transferId, opIndex) pairing resume replays (§8.1).
+            { signal: AbortSignal.timeout(SEND_ENGINE_OP_TIMEOUT_MS), transferId: result.id, opIndex },
           );
           // The source state is spent on-chain from here on.
           committedOnChainTokenIds.add(tw.uiToken.id);
@@ -1453,8 +1468,13 @@ export class PaymentsModule {
                 { recipientPubkey: selfChainPubkey, coinId: request.coinId, amount: splitPlan.remainderAmount! },
               ],
             },
-            // The same per-send realization seed (Part E) — see the loop above.
-            { signal: AbortSignal.timeout(SEND_ENGINE_OP_TIMEOUT_MS), transferId: result.id },
+            // Same per-send seed; the split's opIndex follows the direct ops
+            // (stable across resume — it is derived from the intent's order).
+            {
+              signal: AbortSignal.timeout(SEND_ENGINE_OP_TIMEOUT_MS),
+              transferId: result.id,
+              opIndex: splitPlan.tokensToTransferDirectly.length,
+            },
           );
           // The split source is burnt on-chain from here on. Journal the
           // recipient's blob BEFORE the delivery attempt.
@@ -4190,12 +4210,13 @@ export class PaymentsModule {
     };
 
     const spent: string[] = [];
-    for (const genesisId of payload.direct) {
+    for (const [opIndex, genesisId] of payload.direct.entries()) {
       const blob = await provider.getToken(genesisId);
       const source = await engine.decodeToken(blob);
       const finished = await engine.transfer(
         { token: source, recipientPubkey: recipientChainPubkey, data: memoData },
-        { signal: AbortSignal.timeout(SEND_ENGINE_OP_TIMEOUT_MS), transferId }
+        // (transferId, opIndex) pairing replayed from the intent's persisted order (§8.1)
+        { signal: AbortSignal.timeout(SEND_ENGINE_OP_TIMEOUT_MS), transferId, opIndex }
       );
       await deliverBlob(bytesToHex(encodeTokenBlob(engine.encodeToken(finished))));
       spent.push(genesisId);
@@ -4223,7 +4244,8 @@ export class PaymentsModule {
             },
           ],
         },
-        { signal: AbortSignal.timeout(SEND_ENGINE_OP_TIMEOUT_MS), transferId }
+        // Split opIndex follows the direct ops — replayed from the intent's order (§8.1).
+        { signal: AbortSignal.timeout(SEND_ENGINE_OP_TIMEOUT_MS), transferId, opIndex: payload.direct.length }
       );
       changeOutput = outputs[1];
       if (!serverApply) await this.storeEngineToken(engine, changeOutput);

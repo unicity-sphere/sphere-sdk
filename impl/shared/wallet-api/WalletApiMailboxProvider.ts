@@ -37,7 +37,7 @@ import type {
   DeliveryReceipt,
   IncomingDelivery,
 } from '../../../transport/delivery-provider';
-import { computeDeliveryId, deliveryKeysFromBlob } from '../../../transport/delivery-provider';
+import { composeDeliveryKeys, computeDeliveryId } from '../../../transport/delivery-provider';
 import { deriveFieldEncryptionKey, decryptField, encryptField } from '../../../core/field-encryption';
 import { WalletApiClient, WalletApiError } from '../../../wallet-api';
 import type { KeyValueStore, MailboxEntry } from '../../../wallet-api';
@@ -55,6 +55,13 @@ export interface WalletApiMailboxProviderConfig {
   custody: DeliveryCustody;
   /** Persists the per-identity seen-set + mailbox cursor. */
   stateStore: KeyValueStore;
+  /**
+   * The backend-true (tokenId, stateHash) derivation (`ITokenEngine.deliveryKeys`).
+   * Optional at construction — compositions are engine-less; `PaymentsModule`
+   * late-binds it via `bindDeliveryKeys` at init. The provider never derives
+   * these locally (§8.2 / sdk-changes S7) and fails loudly if unbound.
+   */
+  deliveryKeys?: (blobBytes: Uint8Array) => Promise<{ tokenId: string; stateHash: string }>;
 }
 
 function bytesToHex(bytes: Uint8Array): string {
@@ -68,6 +75,7 @@ export class WalletApiMailboxProvider implements DeliveryProvider {
 
   private readonly client: WalletApiClient;
   private readonly stateStore: KeyValueStore;
+  private deriveKeysFn: ((blobBytes: Uint8Array) => Promise<{ tokenId: string; stateHash: string }>) | null = null;
 
   private identity: { privateKey: string; chainPubkey: string } | null = null;
   private fieldKey: Uint8Array | null = null;
@@ -76,6 +84,22 @@ export class WalletApiMailboxProvider implements DeliveryProvider {
     this.client = config.client;
     this.custody = config.custody;
     this.stateStore = config.stateStore;
+    this.deriveKeysFn = config.deliveryKeys ?? null;
+  }
+
+  /** @inheritDoc — wired by PaymentsModule at init (engine-owning seam). */
+  bindDeliveryKeys(derive: (blobBytes: Uint8Array) => Promise<{ tokenId: string; stateHash: string }>): void {
+    this.deriveKeysFn = derive;
+  }
+
+  private deriveKeys(blobBytes: Uint8Array): Promise<{ tokenId: string; stateHash: string }> {
+    if (this.deriveKeysFn === null) {
+      throw new WalletApiError(
+        'deliveryKeys derivation not bound — PaymentsModule binds ITokenEngine.deliveryKeys at init (S7)',
+        'PROTOCOL'
+      );
+    }
+    return this.deriveKeysFn(blobBytes);
   }
 
   /** Bind the wallet identity (derives the S6 field key; binds the client). */
@@ -147,7 +171,7 @@ export class WalletApiMailboxProvider implements DeliveryProvider {
     if (!this.fieldKey) {
       throw new WalletApiError('No identity set — call setIdentity() first', 'CONFIG');
     }
-    const keys = deliveryKeysFromBlob(blob);
+    const keys = composeDeliveryKeys(await this.deriveKeys(blob));
 
     // Upload the finished blob (checksum-bound presigned PUT — §5.2).
     const sha = bytesToHex(sha256(blob));
@@ -210,7 +234,7 @@ export class WalletApiMailboxProvider implements DeliveryProvider {
     for (;;) {
       for (const entry of page.entries) {
         if (seen.has(entry.entryId)) continue; // persistent replay guard (S7)
-        if (entry.status !== 'pending') {
+        if (entry.status !== 'unclaimed') {
           // Resolved here earlier or on another of the owner's devices —
           // record and skip (claimed/rejected filtering for the consumer).
           seen.add(entry.entryId);
@@ -229,6 +253,7 @@ export class WalletApiMailboxProvider implements DeliveryProvider {
   private toIncomingDelivery(entry: MailboxEntry): IncomingDelivery {
     const client = this.client;
     const fieldKey = this.fieldKey;
+    const deriveKeys = (bytes: Uint8Array): Promise<{ tokenId: string; stateHash: string }> => this.deriveKeys(bytes);
 
     // S6: decrypt the memo envelope. NOTE: the S6 key is wallet-scoped (HKDF
     // from the wallet key), so only memos written by THIS wallet's key
@@ -262,7 +287,7 @@ export class WalletApiMailboxProvider implements DeliveryProvider {
         const bytes = await client.fetchBlob(entry.getUrl);
         // §8.2: the recipient never trusts the backend — re-derive the
         // content-derived id from the ACTUAL bytes and match it.
-        const keys = deliveryKeysFromBlob(bytes);
+        const keys = composeDeliveryKeys(await deriveKeys(bytes));
         if (keys.deliveryId !== entry.entryId) {
           throw new WalletApiError(
             `mailbox blob does not match its entry id (expected ${entry.entryId}, bytes derive ${keys.deliveryId})`,

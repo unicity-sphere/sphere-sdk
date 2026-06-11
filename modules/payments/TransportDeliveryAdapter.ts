@@ -30,7 +30,7 @@ import type {
   DeliveryReceipt,
   IncomingDelivery,
 } from '../../transport/delivery-provider';
-import { deliveryKeysFromBlob } from '../../transport/delivery-provider';
+import { composeDeliveryKeys } from '../../transport/delivery-provider';
 import type { TokenTransferPayload, TransportProvider } from '../../transport';
 import { bytesToHex } from '../../core/crypto';
 
@@ -38,10 +38,14 @@ export class TransportDeliveryAdapter implements DeliveryProvider {
   /** No server inventory exists on this rail — custody is always the app's. */
   readonly custody = 'external' as const;
 
-  constructor(private readonly transport: TransportProvider) {}
+  constructor(
+    private readonly transport: TransportProvider,
+    /** `ITokenEngine.deliveryKeys`, bound — the backend-true derivation. */
+    private readonly deliveryKeys: (blobBytes: Uint8Array) => Promise<{ tokenId: string; stateHash: string }>,
+  ) {}
 
   async deliver(recipientPubkey: string, blob: Uint8Array, options: DeliverOptions): Promise<DeliveryReceipt> {
-    const keys = deliveryKeysFromBlob(blob);
+    const keys = composeDeliveryKeys(await this.deliveryKeys(blob));
     const target = await this.resolveTransportTarget(recipientPubkey);
     await this.transport.sendTokenTransfer(target, {
       type: 'V2_TRANSFER',
