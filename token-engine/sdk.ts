@@ -22,6 +22,7 @@ export { InclusionProof } from '@unicitylabs/state-transition-sdk/lib/api/Inclus
 export { InclusionProofResponse } from '@unicitylabs/state-transition-sdk/lib/api/InclusionProofResponse.js';
 export { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/api/bft/RootTrustBase.js';
 export { waitInclusionProof } from '@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils.js';
+export { InclusionProofVerificationStatus } from '@unicitylabs/state-transition-sdk/lib/transaction/verification/rule/InclusionProofVerificationRule.js';
 
 // ── token / transactions ────────────────────────────────────────────────────
 export { Token } from '@unicitylabs/state-transition-sdk/lib/transaction/Token.js';

@@ -53,6 +53,9 @@ export async function createSphereTokenEngine(config: EngineConfig): Promise<ITo
     predicateVerifier,
     mintJustificationVerifier,
     signingService: new SigningService(config.privateKey),
+    // Also the HKDF ikm for deterministic realization (Part E.1) — the
+    // SigningService wraps the key but does not expose it back.
+    privateKey: config.privateKey,
     // The trust base is the single source of truth for the network id (it carries
     // NetworkId.fromId, so any id works — e.g. testnet2 = 4 — with no enum entry).
     networkId: trustBase.networkId,

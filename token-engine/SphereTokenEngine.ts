@@ -12,14 +12,19 @@
  * of how the aggregator/trust base are constructed.
  */
 
-import { SphereError } from '../core/errors';
-import { deriveDirectAddress } from './identity';
+import { SphereError, type SphereErrorCode } from '../core/errors';
+import { TransferConflictError } from './errors';
+import { deriveDirectAddress, UNICITY_TOKEN_TYPE_HEX } from './identity';
+import { deriveRealization } from './realization';
 import {
   CborDeserializer,
   CertificationData,
   CertificationStatus,
   EncodedPredicate,
   HexConverter,
+  type InclusionProof,
+  InclusionProofVerificationStatus,
+  type ITransaction,
   type MintJustificationVerifierService,
   MintTransaction,
   type NetworkId,
@@ -66,11 +71,24 @@ export interface EngineDeps {
   readonly mintJustificationVerifier: MintJustificationVerifierService;
   /** The wallet's signing key (its identity + the spender for transfers it owns). */
   readonly signingService: SigningService;
+  /**
+   * The same key as raw bytes — the HKDF ikm for deterministic realization
+   * (Part E.1; SigningService does not expose it back).
+   */
+  readonly privateKey: Uint8Array;
   readonly networkId: NetworkId;
 }
 
+/** Canonical lowercase UUID — the spec's `transferId` wire form (sdk-changes E.1). */
+const TRANSFER_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
 export class SphereTokenEngine implements ITokenEngine {
-  public constructor(private readonly deps: EngineDeps) {}
+  /** Hex form of the wallet key — deriveRealization's ikm input (Part E.1). */
+  private readonly privateKeyHex: string;
+
+  public constructor(private readonly deps: EngineDeps) {
+    this.privateKeyHex = HexConverter.encode(deps.privateKey);
+  }
 
   // ── identity ────────────────────────────────────────────────────────────────
 
@@ -184,24 +202,22 @@ export class SphereTokenEngine implements ITokenEngine {
 
   public async transfer(params: TransferParams, options?: EngineOpOptions): Promise<SphereToken> {
     this.assertOwned(params.token);
+    const transferId = this.resolveTransferId(options);
     const recipient = SignaturePredicate.create(params.recipientPubkey);
-    const stateMask = crypto.getRandomValues(new Uint8Array(32));
+    // E.1 deterministic realization: same transferId + inputs ⇒ byte-identical
+    // transaction, so an interrupted transfer can be rebuilt and resumed (AC-E1/E2).
+    const stateMask = deriveRealization(this.privateKeyHex, transferId, 0, 'stateMask');
 
     const transferTx = await TransferTransaction.create(params.token.sdkToken, recipient, stateMask, params.data ?? null);
     const unlockScript = await SignaturePredicateUnlockScript.create(transferTx, this.deps.signingService);
     const certificationData = await CertificationData.fromTransaction(transferTx, unlockScript);
 
-    const response = await this.deps.client.submitCertificationRequest(certificationData);
-    if (response.status !== CertificationStatus.SUCCESS) {
-      throw new SphereError(`Transfer certification failed: ${response.status}`, 'TRANSFER_FAILED');
-    }
-
-    const proof = await waitInclusionProof(
-      this.deps.client,
-      this.deps.trustBase,
-      this.deps.predicateVerifier,
+    const proof = await this.submitAndAwaitProof(
+      certificationData,
       transferTx,
-      options?.signal,
+      'Transfer certification failed',
+      'TRANSFER_FAILED',
+      options,
     );
     const certified = await transferTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, proof);
     const transferred = await params.token.sdkToken.transfer(this.deps.trustBase, this.deps.predicateVerifier, certified);
@@ -213,30 +229,37 @@ export class SphereTokenEngine implements ITokenEngine {
     if (params.outputs.length === 0) {
       throw new SphereError('Split requires at least one output', 'VALIDATION_ERROR');
     }
+    const transferId = this.resolveTransferId(options);
 
-    const requests = params.outputs.map((o) =>
+    // E.1 deterministic realization: a fixed token type + per-output HKDF salts
+    // make every output's mint transaction (and its salt-derived tokenId)
+    // reproducible from the wallet key + transferId.
+    const tokenType = new TokenType(HexConverter.decode(UNICITY_TOKEN_TYPE_HEX));
+    const requests = params.outputs.map((o, i) =>
       SplitTokenRequest.create(
         SignaturePredicate.create(o.recipientPubkey),
         PaymentAssetCollection.create(sphereAssetToSdk(o.coinId, o.amount)),
+        tokenType,
+        TokenSalt.fromBytes(deriveRealization(this.privateKeyHex, transferId, i, 'salt')),
       ),
     );
 
     // Value conservation is enforced inside the SDK split (root.value === source value).
+    // The burn transaction's state mask is still random INSIDE TokenSplit.split —
+    // the pinned base SDK has no burnStateMask parameter yet (it arrives via
+    // state-transition-sdk-js#125; wiring tracked in #492) — so the burn leg is
+    // not yet rebuildable and a split resume stops at the burn.
     const split = await TokenSplit.split(params.token.sdkToken, decodeSpherePaymentData, requests);
 
     // 1. Burn the source: certify the burn transfer and append it -> burntToken.
     const burnUnlock = await SignaturePredicateUnlockScript.create(split.burn.transaction, this.deps.signingService);
     const burnCert = await CertificationData.fromTransaction(split.burn.transaction, burnUnlock);
-    const burnResponse = await this.deps.client.submitCertificationRequest(burnCert);
-    if (burnResponse.status !== CertificationStatus.SUCCESS) {
-      throw new SphereError(`Split burn failed: ${burnResponse.status}`, 'TRANSFER_FAILED');
-    }
-    const burnProof = await waitInclusionProof(
-      this.deps.client,
-      this.deps.trustBase,
-      this.deps.predicateVerifier,
+    const burnProof = await this.submitAndAwaitProof(
+      burnCert,
       split.burn.transaction,
-      options?.signal,
+      'Split burn failed',
+      'TRANSFER_FAILED',
+      options,
     );
     const burnCertified = await split.burn.transaction.toCertifiedTransaction(
       this.deps.trustBase,
@@ -265,17 +288,7 @@ export class SphereTokenEngine implements ITokenEngine {
         justification,
       );
       const certData = await CertificationData.fromMintTransaction(mintTx);
-      const response = await this.deps.client.submitCertificationRequest(certData);
-      if (response.status !== CertificationStatus.SUCCESS) {
-        throw new SphereError(`Split mint failed: ${response.status}`, 'AGGREGATOR_ERROR');
-      }
-      const proof = await waitInclusionProof(
-        this.deps.client,
-        this.deps.trustBase,
-        this.deps.predicateVerifier,
-        mintTx,
-        options?.signal,
-      );
+      const proof = await this.submitAndAwaitProof(certData, mintTx, 'Split mint failed', 'AGGREGATOR_ERROR', options);
       const certified = await mintTx.toCertifiedTransaction(this.deps.trustBase, this.deps.predicateVerifier, proof);
       const token = await Token.mint(
         this.deps.trustBase,
@@ -340,6 +353,89 @@ export class SphereTokenEngine implements ITokenEngine {
   }
 
   // ── internals ────────────────────────────────────────────────────────────────
+
+  /**
+   * The effective realization seed for one transfer/split (Part E). A caller
+   * that wants resumability supplies a pre-persisted UUIDv4 (sdk-changes E.3);
+   * otherwise one is generated here — same derivation path, just non-resumable.
+   * The canonical-lowercase-UUID check also keeps the HKDF info string
+   * unambiguous (no ':' injection, no case-variant double derivations).
+   */
+  private resolveTransferId(options?: EngineOpOptions): string {
+    const transferId = options?.transferId ?? crypto.randomUUID();
+    if (!TRANSFER_ID_RE.test(transferId)) {
+      throw new SphereError(
+        `transferId must be a canonical lowercase UUID string, got "${transferId}"`,
+        'VALIDATION_ERROR',
+      );
+    }
+    return transferId;
+  }
+
+  /**
+   * E.2 — status-agnostic idempotent submit with conflict detection
+   * (sdk-changes E.2, ARCHITECTURE §8.1).
+   *
+   * Submit the certification request and treat ANY outcome — success status,
+   * error status, or a response-parse throw (the live gateway may still emit
+   * statuses this SDK no longer parses, e.g. the transitional STATE_ID_EXISTS)
+   * — as "a certification for this state may already exist". Then ALWAYS fetch
+   * the inclusion proof and match-verify it against the rebuilt transaction
+   * (`waitInclusionProof` only returns an OK-verified proof):
+   *
+   * - match (OK)                    → proceed; this is how an interrupted
+   *                                   attempt with the same transferId resumes;
+   * - mismatch (hash ≠ rebuilt tx)  → `TransferConflictError`: the source was
+   *                                   consumed by a DIFFERENT transaction (lost
+   *                                   race) — never applied, never retried;
+   * - no proof & the submit failed  → the original submit error (a genuine
+   *                                   failure, not a resume case).
+   */
+  private async submitAndAwaitProof(
+    certificationData: CertificationData,
+    transaction: ITransaction,
+    failLabel: string,
+    failCode: SphereErrorCode,
+    options?: EngineOpOptions,
+  ): Promise<InclusionProof> {
+    let submitError: unknown = null;
+    try {
+      const response = await this.deps.client.submitCertificationRequest(certificationData);
+      if (response.status !== CertificationStatus.SUCCESS) {
+        submitError = new SphereError(`${failLabel}: ${response.status}`, failCode);
+      }
+    } catch (err) {
+      submitError = err ?? new SphereError(`${failLabel}: submit failed`, failCode);
+    }
+
+    try {
+      return await waitInclusionProof(
+        this.deps.client,
+        this.deps.trustBase,
+        this.deps.predicateVerifier,
+        transaction,
+        options?.signal,
+      );
+    } catch (err) {
+      // The SDK surfaces a match-verify mismatch as a generic Error whose
+      // message embeds the verification status. Mapping that fragile string is
+      // done HERE — in the anti-corruption layer — and nowhere else; a test
+      // pins the exact SDK message so an upstream change fails loudly.
+      if (
+        err instanceof Error &&
+        err.message === `Invalid inclusion proof status: ${InclusionProofVerificationStatus.TRANSACTION_HASH_MISMATCH}`
+      ) {
+        throw new TransferConflictError(
+          `${failLabel}: the source state was already consumed by a different transaction ` +
+            '(lost race — abort this intent and re-plan under a new transferId)',
+          err,
+        );
+      }
+      // No certification materialized and the submit itself had failed.
+      if (submitError !== null) throw submitError;
+      throw err;
+    }
+  }
 
   /** Fail fast if this engine's key does not own the token's current state. */
   private assertOwned(token: SphereToken): void {

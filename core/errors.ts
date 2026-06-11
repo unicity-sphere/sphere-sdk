@@ -32,6 +32,9 @@ export type SphereErrorCode =
   | 'INSUFFICIENT_BALANCE'
   | 'INVALID_RECIPIENT'
   | 'TRANSFER_FAILED'
+  // The source state was consumed by a DIFFERENT transaction (lost race, not a
+  // resume) — raised as TransferConflictError (token-engine/errors.ts, Part E.2).
+  | 'TRANSFER_CONFLICT'
   | 'STORAGE_ERROR'
   | 'TRANSPORT_ERROR'
   | 'AGGREGATOR_ERROR'
