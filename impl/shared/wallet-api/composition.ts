@@ -22,8 +22,10 @@
  *
  * Asset-transport routing (S4): composing a delivery port moves ASSETS to it;
  * messaging, group chat and nametag bindings stay on the Nostr transport in
- * the base bundle. Payment requests are DEFERRED (backend M4 does not exist
- * yet) — the Nostr payment-request channel is untouched by these presets.
+ * the base bundle. Payment requests ride wallet-api whenever the `walletApi`
+ * client these presets return is passed to `Sphere.init` — `PaymentsModule`
+ * detects the §16 payment-request capability on it and does not install the
+ * Nostr payment-request channel (sdk-changes S4).
  */
 
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../../storage';

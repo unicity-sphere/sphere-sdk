@@ -21,6 +21,8 @@ import type {
   MailboxClaimResult,
   MailboxEntry,
   MailboxPage,
+  PaymentRequestRecord,
+  PaymentRequestsPage,
   UploadUrlEntry,
 } from './types';
 
@@ -239,6 +241,72 @@ export function parseClaimResult(body: unknown): MailboxClaimResult {
 export function parseRejectResult(body: unknown): string[] {
   const rec = asRecord(body, 'mailbox reject response');
   return asArray(rec.rejected, 'reject response .rejected').map((raw, i) => asString(raw, `rejected[${i}]`));
+}
+
+// ── payment requests (§10/§16) ────────────────────────────────────────────────
+
+/** One §16 payment request → {@link PaymentRequestRecord} (create/respond/list). */
+export function parsePaymentRequestRecord(raw: unknown, what: string): PaymentRequestRecord {
+  const rec = asRecord(raw, what);
+  const status = asString(rec.status, `${what}.status`);
+  if (status !== 'open' && status !== 'paid' && status !== 'declined' && status !== 'expired') {
+    throw protocolError(`${what}.status is not a known payment-request status`);
+  }
+  const createdAt = Date.parse(asString(rec.createdAt, `${what}.createdAt`));
+  if (Number.isNaN(createdAt)) throw protocolError(`${what}.createdAt is not a timestamp`);
+  let expiresAt: number | undefined;
+  if (rec.expiresAt !== undefined && rec.expiresAt !== null) {
+    expiresAt = Date.parse(asString(rec.expiresAt, `${what}.expiresAt`));
+    if (Number.isNaN(expiresAt)) throw protocolError(`${what}.expiresAt is not a timestamp`);
+  }
+  if (rec.transferId !== null && typeof rec.transferId !== 'string') {
+    throw protocolError(`${what}.transferId is neither a string nor null`);
+  }
+  return {
+    id: asString(rec.id, `${what}.id`),
+    seq: parseCounter(rec.seq, `${what}.seq`),
+    fromPubkey: asString(rec.fromPubkey, `${what}.fromPubkey`),
+    toPubkey: asString(rec.toPubkey, `${what}.toPubkey`),
+    assets: (parseAssets(rec.assets, `${what}.assets`) ?? []).map((a) => ({ ...a })),
+    ...(rec.memo !== undefined && rec.memo !== null
+      ? { memo: asString(rec.memo, `${what}.memo`) }
+      : {}),
+    status,
+    transferId: rec.transferId,
+    createdAt,
+    ...(expiresAt !== undefined ? { expiresAt } : {}),
+  };
+}
+
+/**
+ * `GET /v1/payment-requests?role=` → {@link PaymentRequestsPage} (§16). The
+ * cursor family is role-bound: incoming pages carry the `?since=` seq counter,
+ * outgoing pages an opaque keyset string (null once drained) — a page whose
+ * cursor does not match its role is a protocol violation.
+ */
+export function parsePaymentRequestsPage(
+  body: unknown,
+  role: 'incoming' | 'outgoing'
+): PaymentRequestsPage {
+  const rec = asRecord(body, 'payment-requests response');
+  if (typeof rec.more !== 'boolean') throw protocolError('payment-requests response .more is not a boolean');
+  const requests = asArray(rec.requests, 'payment-requests response .requests').map((raw, i) =>
+    parsePaymentRequestRecord(raw, `requests[${i}]`)
+  );
+  const syncEpoch = parseCounter(rec.syncEpoch, 'payment-requests response .syncEpoch');
+  if (role === 'incoming') {
+    return {
+      role,
+      requests,
+      more: rec.more,
+      cursor: parseCounter(rec.cursor, 'payment-requests response .cursor'),
+      syncEpoch,
+    };
+  }
+  if (rec.cursor !== null && typeof rec.cursor !== 'string') {
+    throw protocolError('payment-requests response .cursor is neither a keyset string nor null');
+  }
+  return { role, requests, more: rec.more, cursor: rec.cursor, syncEpoch };
 }
 
 // ── history (§10/§16) ─────────────────────────────────────────────────────────

@@ -612,6 +612,46 @@ export interface ProofPollingJob {
 // wallet-api port (sdk-changes E.3/S2/S4 — the slice PaymentsModule consumes)
 // =============================================================================
 
+/** §16 payment-request wire record (structural mirror of `wallet-api/types.ts`). */
+export interface WalletApiPaymentRequest {
+  id: string;
+  /** Per-payer gap-free, commit-ordered seq (§9/§10) — the incoming cursor unit. */
+  seq: bigint;
+  fromPubkey: string;
+  toPubkey: string;
+  assets: { coinId: string; amount: bigint }[];
+  /** S6 `enc1.` envelope, verbatim — decrypts only under the requester's wallet key. */
+  memo?: string;
+  status: 'open' | 'paid' | 'declined' | 'expired';
+  transferId: string | null;
+  createdAt: number;
+  expiresAt?: number;
+}
+
+/** §16 list query — the two role views carry DIFFERENT cursor families (never mixed). */
+export type WalletApiListPaymentRequestsParams =
+  | { role: 'incoming'; status?: 'open' | 'paid' | 'declined' | 'expired'; since?: bigint }
+  | { role: 'outgoing'; status?: 'open' | 'paid' | 'declined' | 'expired'; before?: string };
+
+/** §16 list page, discriminated by the requested role. */
+export type WalletApiPaymentRequestsPage =
+  | {
+      role: 'incoming';
+      requests: WalletApiPaymentRequest[];
+      more: boolean;
+      /** The gap-free `?since=` seq cursor (§9/§16). */
+      cursor: bigint;
+      syncEpoch: bigint;
+    }
+  | {
+      role: 'outgoing';
+      requests: WalletApiPaymentRequest[];
+      more: boolean;
+      /** Opaque keyset for the next (older) page; null when drained (§16). */
+      cursor: string | null;
+      syncEpoch: bigint;
+    };
+
 /**
  * The narrow, STRUCTURAL slice of the wallet-api client this module needs:
  * the E.3 intent lifecycle, blob uploads for spend outputs, and the §10
@@ -651,7 +691,43 @@ export interface PaymentsWalletApiPort {
       counterpartyNametag?: string;
     }[]
   ): Promise<void>;
+
+  // ── payment requests (sdk-changes S4 — §10/§16) — OPTIONAL capability ───────
+  // When the composed port carries all three endpoints (the S4 wallet-api
+  // presets do — `WalletApiClient` provides them), payment requests ride
+  // wallet-api and the Nostr payment-request channel is NOT installed.
+  // Compositions without them keep the transport path (port selection,
+  // covenant §3.1-6). Pre-S4 mocks/ports stay structurally conformant.
+
+  /** Network name — scopes the persisted payment-request cursor (mirrors the mailbox cursor). */
+  readonly network?: string;
+  /** `POST /v1/payment-requests` (§16) — `memo` MUST already be an S6 envelope (§8.3). */
+  createPaymentRequest?(input: {
+    toPubkey: string;
+    assets: { coinId: string; amount: bigint }[];
+    memo?: string;
+    expiresAt?: number;
+  }): Promise<WalletApiPaymentRequest>;
+  /** `GET /v1/payment-requests?role=` (§16) — role-bound cursor families. */
+  listPaymentRequests?<R extends 'incoming' | 'outgoing'>(
+    params: Extract<WalletApiListPaymentRequestsParams, { role: R }>
+  ): Promise<Extract<WalletApiPaymentRequestsPage, { role: R }>>;
+  /** `POST /v1/payment-requests/{id}/respond` (§16) — paid links the fulfilling transferId. */
+  respondPaymentRequest?(
+    id: string,
+    response: { action: 'paid'; transferId: string } | { action: 'declined' }
+  ): Promise<WalletApiPaymentRequest>;
 }
+
+/**
+ * The S4 capability slice once detected (see
+ * {@link PaymentsModule.paymentRequestsApi}) — the optional members above,
+ * required.
+ */
+type PaymentRequestsApi = Pick<PaymentsWalletApiPort, 'network'> &
+  Required<
+    Pick<PaymentsWalletApiPort, 'createPaymentRequest' | 'listPaymentRequests' | 'respondPaymentRequest'>
+  >;
 
 /** The decrypted E.3 intent payload (`{ sources, recipient, amounts }` concretized). */
 interface IntentPayloadV1 {
@@ -771,6 +847,18 @@ export class PaymentsModule {
   /** S6 field-encryption key (intent payloads, history memos) — per identity. */
   private fieldEncryptionKey: Uint8Array | null = null;
 
+  // wallet-api payment requests (sdk-changes S4 — §10/§16)
+  private prPollTimer: ReturnType<typeof setInterval> | null = null;
+  /** Coalesces concurrent payment-request pump runs. */
+  private prPumpInFlight: Promise<void> | null = null;
+  /**
+   * Set after the once-per-session `status=open` bootstrap scan: the surfaced
+   * incoming list is in-memory only, so still-open requests BELOW the
+   * persisted cursor must be recovered at session start (bounded by the §5.5
+   * per-payer open cap).
+   */
+  private prBootstrapped = false;
+
   // Guard: ensure load() completes before processing incoming bundles
   private loadedPromise: Promise<void> | null = null;
   private loaded = false;
@@ -879,6 +967,7 @@ export class PaymentsModule {
     this.unsubscribePaymentRequestResponses?.();
     this.unsubscribePaymentRequestResponses = null;
     this.teardownDeliveryPump();
+    this.teardownPaymentRequestPump();
 
     // Stop background subscriptions from the previous address context so they
     // don't call save() in the new address's storage context.
@@ -970,18 +1059,33 @@ export class PaymentsModule {
       );
     }
 
-    // Subscribe to incoming payment requests (if supported)
-    if (deps.transport.onPaymentRequest) {
-      this.unsubscribePaymentRequests = deps.transport.onPaymentRequest((request) => {
-        this.handleIncomingPaymentRequest(request);
-      });
-    }
+    // Payment requests (sdk-changes S4): when the composed wallet-api port
+    // carries the §16 payment-request endpoints they ride wallet-api — the
+    // incoming `?since=<seq>` stream is polled (gap-free — §9; the poll is the
+    // correctness path) and the Nostr payment-request channel is NOT
+    // installed. Without the capability the transport subscriptions stay
+    // exactly as before (port selection, covenant §3.1-6).
+    this.prBootstrapped = false;
+    if (this.paymentRequestsApi()) {
+      this.prPollTimer = setInterval(() => {
+        void this.pumpPaymentRequests().catch((err) =>
+          logger.warn('Payments', 'Payment-request pump (poll) failed:', err)
+        );
+      }, DELIVERY_POLL_INTERVAL_MS);
+    } else {
+      // Subscribe to incoming payment requests (if supported)
+      if (deps.transport.onPaymentRequest) {
+        this.unsubscribePaymentRequests = deps.transport.onPaymentRequest((request) => {
+          this.handleIncomingPaymentRequest(request);
+        });
+      }
 
-    // Subscribe to payment request responses (if supported)
-    if (deps.transport.onPaymentRequestResponse) {
-      this.unsubscribePaymentRequestResponses = deps.transport.onPaymentRequestResponse((response) => {
-        this.handlePaymentRequestResponse(response);
-      });
+      // Subscribe to payment request responses (if supported)
+      if (deps.transport.onPaymentRequestResponse) {
+        this.unsubscribePaymentRequestResponses = deps.transport.onPaymentRequestResponse((response) => {
+          this.handlePaymentRequestResponse(response);
+        });
+      }
     }
 
     // Subscribe to storage provider events (push-based sync)
@@ -1174,6 +1278,13 @@ export class PaymentsModule {
       void this.pumpIncomingDeliveries().catch((err) =>
         logger.warn('Payments', 'Incoming delivery pump (load) failed:', err));
     }
+
+    // S4: drain the payment-request `?since=` stream once at load (the poll
+    // keeps it drained afterwards).
+    if (this.paymentRequestsApi()) {
+      void this.pumpPaymentRequests().catch((err) =>
+        logger.warn('Payments', 'Payment-request pump (load) failed:', err));
+    }
   }
 
   /**
@@ -1190,6 +1301,7 @@ export class PaymentsModule {
     this.unsubscribePaymentRequestResponses?.();
     this.unsubscribePaymentRequestResponses = null;
     this.teardownDeliveryPump();
+    this.teardownPaymentRequestPump();
     this.paymentRequestHandlers.clear();
     this.paymentRequestResponseHandlers.clear();
 
@@ -1884,6 +1996,13 @@ export class PaymentsModule {
   ): Promise<PaymentRequestResult> {
     this.ensureInitialized();
 
+    // S4: with the wallet-api payment-request capability composed, the
+    // request rides the §16 endpoints — the Nostr channel is not used.
+    const prApi = this.paymentRequestsApi();
+    if (prApi) {
+      return this.sendWalletApiPaymentRequest(prApi, recipientPubkeyOrNametag, request);
+    }
+
     if (!this.deps!.transport.sendPaymentRequest) {
       return {
         success: false,
@@ -1943,6 +2062,76 @@ export class PaymentsModule {
   }
 
   /**
+   * S4: create the request via wallet-api (§16). The payer is addressed by
+   * CHAIN pubkey (the canonical identity); the memo is S6-encrypted client-
+   * side BEFORE it leaves the device (§8.3) — the operator stores ciphertext.
+   * Mirrors the transport path's no-throw contract: failures (including the
+   * §5.5 per-payer cap → 429) come back as `{ success: false, error }`.
+   */
+  private async sendWalletApiPaymentRequest(
+    api: PaymentRequestsApi,
+    recipientPubkeyOrNametag: string,
+    request: Omit<PaymentRequest, 'id' | 'createdAt'>
+  ): Promise<PaymentRequestResult> {
+    try {
+      const peerInfo = await this.deps!.transport.resolve?.(recipientPubkeyOrNametag) ?? null;
+      const toPubkey =
+        peerInfo?.chainPubkey ??
+        (/^0[23][0-9a-f]{64}$/i.test(recipientPubkeyOrNametag)
+          ? recipientPubkeyOrNametag.toLowerCase()
+          : null);
+      if (!toPubkey) {
+        return {
+          success: false,
+          error: `Recipient ${recipientPubkeyOrNametag} has no published identity (chain pubkey) — cannot receive payment requests.`,
+        };
+      }
+
+      const wire = await api.createPaymentRequest({
+        toPubkey,
+        // Amounts are decimal strings end-to-end (§11) — BigInt round-trips them exactly.
+        assets: [{ coinId: request.coinId, amount: BigInt(request.amount) }],
+        ...(request.message !== undefined
+          ? { memo: encryptField(this.getFieldEncryptionKey(), request.message) }
+          : {}),
+        ...(request.expiresAt !== undefined ? { expiresAt: request.expiresAt } : {}),
+      });
+
+      // Track the outgoing request under the SERVER id — the `?before=`
+      // backfill refresh (refreshOutgoingPaymentRequests) matches on it.
+      const outgoingRequest: OutgoingPaymentRequest = {
+        id: wire.id,
+        eventId: wire.id, // no relay event on this path — the server id stands in
+        recipientPubkey: toPubkey,
+        recipientNametag: recipientPubkeyOrNametag.startsWith('@')
+          ? recipientPubkeyOrNametag.slice(1)
+          : undefined,
+        amount: request.amount,
+        coinId: request.coinId,
+        message: request.message,
+        createdAt: wire.createdAt,
+        status: 'pending',
+      };
+      this.outgoingPaymentRequests.set(wire.id, outgoingRequest);
+
+      logger.debug('Payments', `Payment request created via wallet-api: ${wire.id}`);
+
+      return {
+        success: true,
+        requestId: wire.id,
+        eventId: wire.id,
+      };
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      logger.debug('Payments', `Failed to create wallet-api payment request: ${errorMsg}`);
+      return {
+        success: false,
+        error: errorMsg,
+      };
+    }
+  }
+
+  /**
    * Subscribe to incoming payment requests
    * @param handler - Handler function for incoming requests
    * @returns Unsubscribe function
@@ -1988,11 +2177,16 @@ export class PaymentsModule {
   /**
    * Reject a payment request and notify the requester.
    *
+   * On the wallet-api path (S4) the respond IS the state change — it is
+   * confirmed server-side (`action: 'declined'`, §16) before the local status
+   * flips, and a server rejection (403/409) propagates to the caller. The
+   * transport path is best-effort and never throws.
+   *
    * @param requestId - ID of the incoming payment request to reject.
    */
   async rejectPaymentRequest(requestId: string): Promise<void> {
-    this.updatePaymentRequestStatus(requestId, 'rejected');
     await this.sendPaymentRequestResponse(requestId, 'rejected');
+    this.updatePaymentRequestStatus(requestId, 'rejected');
   }
 
   /**
@@ -2051,9 +2245,15 @@ export class PaymentsModule {
         memo: memo || request.message,
       });
 
-      // Mark as paid and send response with transfer ID
+      // Mark as paid and send response with transfer ID. The transfer already
+      // succeeded — a failed status link (e.g. an expiry race on the
+      // wallet-api respond, §16) is logged, never reported as a failed payment.
       this.updatePaymentRequestStatus(requestId, 'paid');
-      await this.sendPaymentRequestResponse(requestId, 'paid', result.id);
+      try {
+        await this.sendPaymentRequestResponse(requestId, 'paid', result.id);
+      } catch (error) {
+        logger.warn('Payments', `Payment sent but the paid response failed for ${requestId}:`, error);
+      }
 
       return result;
     } catch (error) {
@@ -2219,22 +2419,8 @@ export class PaymentsModule {
   }
 
   private handlePaymentRequestResponse(transportResponse: TransportPaymentRequestResponse): void {
-    // Find the outgoing request by matching requestId
-    let outgoingRequest: OutgoingPaymentRequest | undefined;
-    let outgoingRequestId: string | undefined;
-
-    for (const [id, request] of this.outgoingPaymentRequests) {
-      // Match by eventId or requestId from the response
-      if (request.eventId === transportResponse.response.requestId ||
-          request.id === transportResponse.response.requestId) {
-        outgoingRequest = request;
-        outgoingRequestId = id;
-        break;
-      }
-    }
-
     // Convert transport response to PaymentRequestResponse
-    const response: PaymentRequestResponse = {
+    this.dispatchPaymentRequestResponse({
       id: transportResponse.id,
       responderPubkey: transportResponse.responderTransportPubkey,
       requestId: transportResponse.response.requestId,
@@ -2242,7 +2428,29 @@ export class PaymentsModule {
       message: transportResponse.response.message,
       transferId: transportResponse.response.transferId,
       timestamp: transportResponse.timestamp,
-    };
+    });
+  }
+
+  /**
+   * Fold a payment-request response into the outgoing surface and notify —
+   * shared by the transport subscription and the wallet-api outgoing refresh
+   * (S4): update the matched outgoing request, resolve any
+   * {@link waitForPaymentResponse} waiter, emit the event, run the handlers.
+   */
+  private dispatchPaymentRequestResponse(response: PaymentRequestResponse): void {
+    // Find the outgoing request by matching requestId
+    let outgoingRequest: OutgoingPaymentRequest | undefined;
+    let outgoingRequestId: string | undefined;
+
+    for (const [id, request] of this.outgoingPaymentRequests) {
+      // Match by eventId or requestId from the response
+      if (request.eventId === response.requestId ||
+          request.id === response.requestId) {
+        outgoingRequest = request;
+        outgoingRequestId = id;
+        break;
+      }
+    }
 
     // Update outgoing request if found
     if (outgoingRequest && outgoingRequestId) {
@@ -2285,6 +2493,25 @@ export class PaymentsModule {
   ): Promise<void> {
     const request = this.paymentRequests.find((r) => r.id === requestId);
     if (!request) return;
+
+    // S4: respond via the §16 endpoint. 'accepted' is a LOCAL UI state — the
+    // backend models open → paid|declined|expired only, so nothing is sent
+    // until the actual decision. Unlike the best-effort transport leg below,
+    // server rejections (403 non-addressee / 409 non-open) propagate.
+    const prApi = this.paymentRequestsApi();
+    if (prApi) {
+      if (responseType === 'accepted') return;
+      if (responseType === 'paid') {
+        if (transferId === undefined) {
+          throw new SphereError('A paid response requires the fulfilling transferId (§16)', 'VALIDATION_ERROR');
+        }
+        await prApi.respondPaymentRequest(request.requestId, { action: 'paid', transferId });
+      } else {
+        await prApi.respondPaymentRequest(request.requestId, { action: 'declined' });
+      }
+      logger.debug('Payments', `Responded to payment request via wallet-api: ${responseType} for ${requestId}`);
+      return;
+    }
 
     if (!this.deps?.transport.sendPaymentRequestResponse) {
       logger.debug('Payments', 'Transport does not support sendPaymentRequestResponse');
@@ -4118,6 +4345,234 @@ export class PaymentsModule {
         // Not a verdict on the token at all — leave unacked for a later pump.
         throw new SphereError('Token engine unavailable for incoming delivery', 'AGGREGATOR_ERROR');
     }
+  }
+
+  // ===========================================================================
+  // wallet-api payment requests: incoming pump + outgoing refresh (S4 — §10/§16)
+  // ===========================================================================
+
+  /** The S4 capability slice — null unless the composed wallet-api port carries it. */
+  private paymentRequestsApi(): PaymentRequestsApi | null {
+    const api = this.deps?.walletApi;
+    if (
+      !api ||
+      typeof api.createPaymentRequest !== 'function' ||
+      typeof api.listPaymentRequests !== 'function' ||
+      typeof api.respondPaymentRequest !== 'function'
+    ) {
+      return null;
+    }
+    return api as PaymentRequestsApi;
+  }
+
+  private teardownPaymentRequestPump(): void {
+    if (this.prPollTimer !== null) {
+      clearInterval(this.prPollTimer);
+      this.prPollTimer = null;
+    }
+  }
+
+  // ── persisted cursor (per network + identity — mirrors the mailbox cursor) ──
+
+  private prCursorKey(): string {
+    const network = this.paymentRequestsApi()?.network ?? 'default';
+    return `wallet-api-pr:cursor:${network}:${this.deps!.identity.chainPubkey}`;
+  }
+
+  private async readPrCursorState(): Promise<{ cursor: bigint; syncEpoch: bigint } | null> {
+    const raw = await this.deps!.storage.get(this.prCursorKey());
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw) as { cursor?: string; syncEpoch?: string };
+      if (typeof parsed.cursor !== 'string' || typeof parsed.syncEpoch !== 'string') return null;
+      return { cursor: BigInt(parsed.cursor), syncEpoch: BigInt(parsed.syncEpoch) };
+    } catch {
+      return null;
+    }
+  }
+
+  private async persistPrCursorState(cursor: bigint, syncEpoch: bigint): Promise<void> {
+    await this.deps!.storage.set(
+      this.prCursorKey(),
+      JSON.stringify({ cursor: cursor.toString(), syncEpoch: syncEpoch.toString() })
+    );
+  }
+
+  // ── the pump ─────────────────────────────────────────────────────────────────
+
+  /**
+   * Pull the wallet-api payment-request streams now (S4): drains the payer's
+   * incoming `?since=<seq>` stream (gap-free — §9/§16) into the existing
+   * handler/event surface and refreshes outgoing requests still awaiting a
+   * response. The poll interval and `load()` call this automatically; it is
+   * public for explicit fetch-now flows (mirrors {@link receive}). A no-op in
+   * compositions without the wallet-api payment-request capability — there
+   * the Nostr subscription is push-based.
+   */
+  async syncPaymentRequests(): Promise<void> {
+    await this.pumpPaymentRequests();
+  }
+
+  /** Coalesces concurrent pump runs (poll + wake + load can overlap). */
+  private async pumpPaymentRequests(): Promise<void> {
+    const api = this.paymentRequestsApi();
+    if (!api) return;
+    if (this.prPumpInFlight) return this.prPumpInFlight;
+    this.prPumpInFlight = this.doPumpPaymentRequests(api).finally(() => {
+      this.prPumpInFlight = null;
+    });
+    return this.prPumpInFlight;
+  }
+
+  private async doPumpPaymentRequests(api: PaymentRequestsApi): Promise<void> {
+    if (!this.loaded && this.loadedPromise) {
+      await this.loadedPromise;
+    }
+    await this.pumpIncomingPaymentRequests(api);
+    await this.refreshOutgoingPaymentRequests(api);
+  }
+
+  /**
+   * Drain the payer's gap-free `?since=<seq>` stream (§9/§16), mirroring the
+   * mailbox-cursor pattern: the persisted `{cursor, syncEpoch}` is the resume
+   * point; a `syncEpoch` change (server restore — §5.4) voids cursor
+   * continuity, so the tail re-pulls from 0 and the id-dedup in
+   * {@link surfaceIncomingPaymentRequest} absorbs the replays. Because the
+   * surfaced list is in-memory only, each session ALSO starts with one
+   * `status=open` bootstrap scan from 0 — still-open requests below the
+   * cursor (bounded by the §5.5 per-payer open cap) are recovered; resolved
+   * ones are not re-surfaced.
+   */
+  private async pumpIncomingPaymentRequests(api: PaymentRequestsApi): Promise<void> {
+    const persisted = await this.readPrCursorState();
+
+    if (!this.prBootstrapped) {
+      if (persisted !== null && persisted.cursor > 0n) {
+        let scan = await api.listPaymentRequests({ role: 'incoming', status: 'open', since: 0n });
+        for (;;) {
+          for (const wire of scan.requests) this.surfaceIncomingPaymentRequest(wire);
+          if (!scan.more) break;
+          scan = await api.listPaymentRequests({ role: 'incoming', status: 'open', since: scan.cursor });
+        }
+      }
+      // Marked only after the scan SUCCEEDS — a transient failure here must
+      // not skip recovery for the rest of the session (the next poll retries;
+      // the id-dedup makes a re-scan safe).
+      this.prBootstrapped = true;
+    }
+
+    let page = await api.listPaymentRequests({ role: 'incoming', since: persisted?.cursor ?? 0n });
+    if (persisted !== null && page.syncEpoch !== persisted.syncEpoch) {
+      page = await api.listPaymentRequests({ role: 'incoming', since: 0n });
+    }
+    for (;;) {
+      for (const wire of page.requests) this.surfaceIncomingPaymentRequest(wire);
+      await this.persistPrCursorState(page.cursor, page.syncEpoch);
+      if (!page.more) break;
+      page = await api.listPaymentRequests({ role: 'incoming', since: page.cursor });
+    }
+  }
+
+  /**
+   * Map a §16 wire request onto the public {@link IncomingPaymentRequest}
+   * surface and notify (event + handlers). Only `open` requests are
+   * actionable; the in-memory id-dedup doubles as the replay guard for
+   * cursor resets. Multi-asset requests surface their first asset (the
+   * module's request surface is single-asset; module-created requests
+   * always are).
+   */
+  private surfaceIncomingPaymentRequest(wire: WalletApiPaymentRequest): void {
+    if (wire.status !== 'open') return;
+    if (this.paymentRequests.some((r) => r.id === wire.id)) return;
+
+    const coinId = wire.assets[0]?.coinId ?? '';
+    const coinDef = TokenRegistry.getInstance().getDefinition(coinId);
+
+    // S6: the memo decrypts only under the REQUESTER's wallet key (field keys
+    // are wallet-scoped) — for the payer it is opaque ciphertext, surfaced as
+    // absent rather than garbage (same rule as mailbox memos).
+    let message: string | undefined;
+    if (wire.memo !== undefined) {
+      try {
+        message = decryptField(this.getFieldEncryptionKey(), wire.memo);
+      } catch {
+        logger.debug('Payments', `Payment request ${wire.id.slice(0, 12)}… memo not decryptable with this wallet's key`);
+      }
+    }
+
+    const request: IncomingPaymentRequest = {
+      id: wire.id,
+      senderPubkey: wire.fromPubkey,
+      amount: (wire.assets[0]?.amount ?? 0n).toString(),
+      coinId,
+      symbol: coinDef?.symbol || coinId.slice(0, 8),
+      ...(message !== undefined ? { message } : {}),
+      requestId: wire.id,
+      timestamp: wire.createdAt,
+      status: 'pending',
+    };
+
+    // Add to list (newest first)
+    this.paymentRequests.unshift(request);
+    this.deps?.emitEvent('payment_request:incoming', request);
+    for (const handler of this.paymentRequestHandlers) {
+      try {
+        handler(request);
+      } catch (error) {
+        logger.debug('Payments', 'Payment request handler error:', error);
+      }
+    }
+
+    logger.debug('Payments', `Incoming payment request: ${request.id} for ${request.amount} ${request.symbol}`);
+  }
+
+  /**
+   * Outgoing requests are a `?before=` backfill view (§16 — newest-first, no
+   * gap-free tail): refresh only while something local still awaits a
+   * response, paging until every pending id is resolved or the view drains.
+   */
+  private async refreshOutgoingPaymentRequests(api: PaymentRequestsApi): Promise<void> {
+    const pendingIds = new Set(
+      [...this.outgoingPaymentRequests.values()].filter((r) => r.status === 'pending').map((r) => r.id)
+    );
+    if (pendingIds.size === 0) return;
+
+    let before: string | undefined;
+    for (;;) {
+      const page = await api.listPaymentRequests({
+        role: 'outgoing',
+        ...(before !== undefined ? { before } : {}),
+      });
+      for (const wire of page.requests) {
+        if (!pendingIds.delete(wire.id)) continue;
+        this.applyOutgoingPaymentRequestState(wire);
+      }
+      if (pendingIds.size === 0 || !page.more || page.cursor === null) return;
+      before = page.cursor;
+    }
+  }
+
+  /** Fold a server-side status change into the outgoing surface (responses + expiry). */
+  private applyOutgoingPaymentRequestState(wire: WalletApiPaymentRequest): void {
+    if (wire.status === 'open') return;
+    const outgoing = this.outgoingPaymentRequests.get(wire.id);
+    if (!outgoing || outgoing.status !== 'pending') return;
+
+    if (wire.status === 'expired') {
+      // §10: expiry is server-owned, not client-inferred — fold the status in;
+      // there is no responder, so no response is dispatched.
+      outgoing.status = 'expired';
+      return;
+    }
+
+    this.dispatchPaymentRequestResponse({
+      id: wire.id,
+      responderPubkey: wire.toPubkey,
+      requestId: wire.id,
+      responseType: wire.status === 'paid' ? 'paid' : 'rejected',
+      ...(wire.transferId !== null ? { transferId: wire.transferId } : {}),
+      timestamp: Date.now(),
+    });
   }
 
   /**

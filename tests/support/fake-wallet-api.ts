@@ -25,6 +25,12 @@
  *     blobCollected retention signalling (`collectMailboxBlob()` test hook);
  *   - history (§10/§16): client-asserted, dedupKey-idempotent POST + keyset
  *     GET (the server never writes history rows);
+ *   - payment requests (§10/§16 — backend M4): create with per-payer gap-free
+ *     seq + payer auto-provisioning + the §5.5 open cap (429 QUOTA_EXCEEDED),
+ *     the incoming ?since= stream / outgoing ?before= keyset backfill (role ×
+ *     cursor mixing → 422), addressee-only respond (403/404/409/422 exactly
+ *     as wallet-api src/payments/*), `expireDuePaymentRequests()` test hook
+ *     for the server-owned expiry sweep;
  *   - ws-ticket + WS wake nudges (§9);
  *   - `bumpSyncEpoch()` test hook (§5.4 restore semantics).
  */
@@ -85,6 +91,24 @@ interface MailboxEntryRow {
   blobCollected: boolean;
 }
 
+/** One payment request (§10/§11), stored under the PAYER (to_owner) like the table's seq index. */
+interface PaymentRequestRow {
+  id: string;
+  fromPubkey: string;
+  toPubkey: string;
+  /** Per-payer gap-free, commit-ordered seq (§9/§10) — assigned from the payer's counter. */
+  seq: bigint;
+  assets: FakeAsset[];
+  /** S6 `enc1.` envelope, stored verbatim (§8.3) — the server never sees plaintext. */
+  memo?: string;
+  status: 'open' | 'paid' | 'declined' | 'expired';
+  /** The fulfilling send's transferId once paid (§16). */
+  transferId: string | null;
+  createdAt: string;
+  /** Server-owned expiry (§10): an already-past value is legal — the sweep flips it. */
+  expiresAt: string | null;
+}
+
 interface OwnerState {
   cursor: bigint; // gap-free, commit-ordered per-owner counter (§9)
   rows: Map<string, InventoryRow>; // one row per (owner, token) (§5.1)
@@ -98,6 +122,10 @@ interface OwnerState {
   readPointer: bigint;
   /** Client-asserted history records by dedupKey (§10) in arrival order. */
   history: Map<string, Record<string, unknown>>;
+  /** Payment requests ADDRESSED TO this owner (§10), keyed by id. */
+  paymentRequests: Map<string, PaymentRequestRow>;
+  /** The payer's gap-free payment-request seq counter (next_pr_seq — §9/§11). */
+  prSeq: bigint;
 }
 
 interface Session {
@@ -135,6 +163,8 @@ export interface FakeWalletApiOptions {
   mailboxUnclaimedCap?: number;
   /** Per-(sender, recipient) sub-cap (§5.5), default 500 (MAX_SENDER_RECIPIENT_ENTRIES). */
   mailboxPerPairCap?: number;
+  /** Per-payer OPEN payment-request cap (§5.5/§10), default 1000 (MAX_PAYER_OPEN_REQUESTS). */
+  maxPayerOpenRequests?: number;
   /**
    * APPROXIMATION of §8.2 steps 3–6: the real backend CBOR-decodes the v2
    * token, runs `token.verify` against the pinned trustbase and decodes the
@@ -176,6 +206,9 @@ function defaultDecodeAssets(tokenBytes: Uint8Array): FakeAsset[] | null {
   }
 }
 
+/** Route-level uuid validation (payment-request ids + transferIds — §16). */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 class HttpError extends Error {
   constructor(
     readonly status: number,
@@ -200,6 +233,7 @@ export class FakeWalletApi {
   private readonly intentMaxBytes: number;
   private readonly mailboxUnclaimedCap: number;
   private readonly mailboxPerPairCap: number;
+  private readonly maxPayerOpenRequests: number;
   private readonly decodeAssets: (tokenBytes: Uint8Array) => FakeAsset[] | null;
 
   private server: http.Server | null = null;
@@ -235,6 +269,7 @@ export class FakeWalletApi {
     this.intentMaxBytes = options.intentMaxBytes ?? 4096; // intent payload ≤ 4 KiB (§7)
     this.mailboxUnclaimedCap = options.mailboxUnclaimedCap ?? 10000; // per-recipient unclaimed cap (§5.5)
     this.mailboxPerPairCap = options.mailboxPerPairCap ?? 500; // per-sender-pair sub-cap (§5.5 MAX_SENDER_RECIPIENT_ENTRIES)
+    this.maxPayerOpenRequests = options.maxPayerOpenRequests ?? 1000; // MAX_PAYER_OPEN_REQUESTS (§14)
     this.decodeAssets = options.decodeAssets ?? defaultDecodeAssets;
   }
 
@@ -390,6 +425,41 @@ export class FakeWalletApi {
     return [...this.owner(pubkey).history.values()];
   }
 
+  /** Payment-request row inspection for tests (§10) — looked up across all payers. */
+  getPaymentRequest(
+    id: string
+  ): { status: string; transferId: string | null; seq: number; memo?: string; fromPubkey: string; toPubkey: string } | null {
+    const row = this.findPaymentRequest(id);
+    if (!row) return null;
+    return {
+      status: row.status,
+      transferId: row.transferId,
+      seq: Number(row.seq),
+      ...(row.memo !== undefined ? { memo: row.memo } : {}),
+      fromPubkey: row.fromPubkey,
+      toPubkey: row.toPubkey,
+    };
+  }
+
+  /**
+   * §10 server-owned expiry test hook (mirrors workers/pr-expiry.ts): flip
+   * every overdue OPEN request to 'expired' atomically and nudge both
+   * parties on the payment_requests stream. Expiry is never client-inferred.
+   */
+  expireDuePaymentRequests(now: number = Date.now()): number {
+    let flipped = 0;
+    for (const state of this.owners.values()) {
+      for (const row of state.paymentRequests.values()) {
+        if (row.status !== 'open' || row.expiresAt === null || Date.parse(row.expiresAt) > now) continue;
+        row.status = 'expired';
+        this.wakeOwner(row.toPubkey, 'payment_requests');
+        this.wakeOwner(row.fromPubkey, 'payment_requests');
+        flipped++;
+      }
+    }
+    return flipped;
+  }
+
   isSessionRevoked(pubkey: string, deviceId: string): boolean {
     for (const s of this.sessions.values()) {
       if (s.pubkey === pubkey && s.deviceId === deviceId) return s.revoked;
@@ -412,6 +482,8 @@ export class FakeWalletApi {
         mailboxSeq: 0n,
         readPointer: 0n,
         history: new Map(),
+        paymentRequests: new Map(),
+        prSeq: 0n,
       };
       this.owners.set(pubkey, state);
     }
@@ -496,6 +568,11 @@ export class FakeWalletApi {
 
     if (method === 'POST' && path === '/v1/history') return this.handleHistoryPost(req, res);
     if (method === 'GET' && path === '/v1/history') return this.handleHistoryGet(req, res, url);
+
+    if (method === 'POST' && path === '/v1/payment-requests') return this.handlePaymentRequestCreate(req, res);
+    if (method === 'GET' && path === '/v1/payment-requests') return this.handlePaymentRequestList(req, res, url);
+    const respondMatch = path.match(/^\/v1\/payment-requests\/([^/]+)\/respond$/);
+    if (method === 'POST' && respondMatch) return this.handlePaymentRequestRespond(req, res, respondMatch[1]);
 
     const intentMatch = path.match(/^\/v1\/intents\/([^/]+)(\/(abort|complete))?$/);
     if (intentMatch) return this.handleIntent(req, res, intentMatch[1], intentMatch[3]);
@@ -1454,6 +1531,291 @@ export class FakeWalletApi {
       records: page,
       ...(hasMore && page.length > 0 ? { nextBefore: keyOf(page[page.length - 1]) } : {}),
     });
+  }
+
+  // ── payment requests (§10, §16 — backend M4) ─────────────────────────────────
+  //
+  // Wire fidelity note: unlike the rest of this fake (which serializes bigint
+  // counters as decimal strings — the pg wire form), the REAL payments service
+  // serializes seq / cursor / syncEpoch as JSON NUMBERS
+  // (wallet-api src/payments/service.ts toWire / repository.ts), so this
+  // section does too. Error codes are the real backend's
+  // (VALIDATION_FAILED / QUOTA_EXCEEDED / FORBIDDEN / NOT_FOUND / CONFLICT).
+
+  /** Mirrors service.ts toWire exactly: memo verbatim, expiresAt omitted when null. */
+  private paymentRequestToWire(row: PaymentRequestRow): Record<string, unknown> {
+    return {
+      id: row.id,
+      seq: Number(row.seq),
+      fromPubkey: row.fromPubkey,
+      toPubkey: row.toPubkey,
+      assets: row.assets.map((a) => ({ coinId: a.coinId, amount: a.amount.toString() })), // §11 decimal strings
+      ...(row.memo !== undefined ? { memo: row.memo } : {}), // verbatim envelope (§8.3)
+      status: row.status,
+      transferId: row.transferId,
+      createdAt: row.createdAt,
+      ...(row.expiresAt !== null ? { expiresAt: row.expiresAt } : {}),
+    };
+  }
+
+  /** Locate a request by id across ALL payers (the table's primary key is global). */
+  private findPaymentRequest(id: string): PaymentRequestRow | null {
+    for (const state of this.owners.values()) {
+      const row = state.paymentRequests.get(id);
+      if (row) return row;
+    }
+    return null;
+  }
+
+  /** §16 create-body assets: 1–100 entries of { coinId, amount: decimal string }. */
+  private parsePaymentRequestAssets(value: unknown): FakeAsset[] {
+    if (!Array.isArray(value) || value.length < 1 || value.length > 100) {
+      throw new HttpError(422, 'VALIDATION_FAILED', 'assets must be an array of 1–100 entries');
+    }
+    return value.map((raw: unknown) => {
+      const rec = raw as { coinId?: unknown; amount?: unknown };
+      if (typeof rec.coinId !== 'string' || rec.coinId.length < 1 || rec.coinId.length > 128) {
+        throw new HttpError(422, 'VALIDATION_FAILED', 'asset coinId must be a 1–128 char string');
+      }
+      if (typeof rec.amount !== 'string' || !/^[0-9]+$/.test(rec.amount)) {
+        throw new HttpError(422, 'VALIDATION_FAILED', 'expected a decimal-string amount'); // §11
+      }
+      return { coinId: rec.coinId, amount: BigInt(rec.amount) };
+    });
+  }
+
+  private async handlePaymentRequestCreate(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const session = this.authenticate(req);
+    const body = await this.readJsonBody(req);
+    // zod .strict(): unknown fields are rejected, not ignored (§16).
+    for (const key of Object.keys(body)) {
+      if (!['toPubkey', 'assets', 'memo', 'expiresAt'].includes(key)) {
+        throw new HttpError(422, 'VALIDATION_FAILED', `unrecognized body key: ${key}`);
+      }
+    }
+    const { toPubkey, memo, expiresAt } = body as { toPubkey?: unknown; memo?: unknown; expiresAt?: unknown };
+    // The real route requires LOWERCASE hex (routes.ts createBody).
+    if (typeof toPubkey !== 'string' || !/^0[23][0-9a-f]{64}$/.test(toPubkey)) {
+      throw new HttpError(
+        422,
+        'VALIDATION_FAILED',
+        'expected a 33-byte compressed secp256k1 pubkey in lowercase hex'
+      );
+    }
+    const assets = this.parsePaymentRequestAssets(body.assets);
+    if (memo !== undefined) {
+      // §8.3: an `enc1.` envelope ≤ 4096 bytes (PR_MEMO_MAX_BYTES), shape +
+      // cap validated only, stored verbatim — never plaintext.
+      try {
+        assertFieldEnvelopeShape(memo, 4096);
+      } catch (err) {
+        throw new HttpError(422, 'VALIDATION_FAILED', err instanceof Error ? err.message : 'bad memo envelope');
+      }
+    }
+    let expiresAtIso: string | null = null;
+    if (expiresAt !== undefined) {
+      if (typeof expiresAt !== 'string' || !expiresAt.includes('T') || Number.isNaN(Date.parse(expiresAt))) {
+        throw new HttpError(422, 'VALIDATION_FAILED', 'expiresAt must be an ISO-8601 datetime');
+      }
+      // §10: an already-past expiresAt is LEGAL — the sweep owns the flip.
+      expiresAtIso = new Date(expiresAt).toISOString();
+    }
+
+    // §4/§9: the payer may have never authenticated — auto-provisioned on first touch.
+    const payer = this.owner(toPubkey);
+    // §5.5: only OPEN requests count toward the per-payer cap (responding frees capacity).
+    let open = 0;
+    for (const r of payer.paymentRequests.values()) if (r.status === 'open') open++;
+    if (open >= this.maxPayerOpenRequests) {
+      throw new HttpError(
+        429,
+        'QUOTA_EXCEEDED',
+        `open payment requests per payer exceed ${this.maxPayerOpenRequests} (§5.5)`
+      );
+    }
+
+    // §9: the per-payer seq is gap-free and commit-ordered — bumped with the
+    // insert; a cap bounce above burned nothing.
+    payer.prSeq += 1n;
+    const row: PaymentRequestRow = {
+      id: crypto.randomUUID(),
+      fromPubkey: session.pubkey,
+      toPubkey,
+      seq: payer.prSeq,
+      assets,
+      ...(memo !== undefined ? { memo: memo as string } : {}),
+      status: 'open',
+      transferId: null,
+      createdAt: new Date().toISOString(),
+      expiresAt: expiresAtIso,
+    };
+    payer.paymentRequests.set(row.id, row);
+    this.wakeOwner(toPubkey, 'payment_requests'); // §9: nudge the payer's devices
+    this.json(res, 200, this.paymentRequestToWire(row));
+  }
+
+  private handlePaymentRequestList(req: http.IncomingMessage, res: http.ServerResponse, url: URL): void {
+    const session = this.authenticate(req);
+    const params = url.searchParams;
+    for (const key of params.keys()) {
+      if (!['role', 'status', 'since', 'before'].includes(key)) {
+        throw new HttpError(422, 'VALIDATION_FAILED', `unrecognized query key: ${key}`); // zod .strict()
+      }
+    }
+    const role = params.get('role');
+    if (role !== 'incoming' && role !== 'outgoing') {
+      throw new HttpError(422, 'VALIDATION_FAILED', 'role must be incoming or outgoing');
+    }
+    const status = params.get('status');
+    if (status !== null && !['open', 'paid', 'declined', 'expired'].includes(status)) {
+      throw new HttpError(422, 'VALIDATION_FAILED', 'status must be open|paid|declined|expired');
+    }
+    if (role === 'incoming') {
+      this.servePaymentRequestsIncoming(res, session.pubkey, status, params);
+      return;
+    }
+    this.servePaymentRequestsOutgoing(res, session.pubkey, status, params);
+  }
+
+  /** §16 incoming: the payer's seq-ordered, gap-free ?since= stream. */
+  private servePaymentRequestsIncoming(
+    res: http.ServerResponse,
+    payerPubkey: string,
+    status: string | null,
+    params: URLSearchParams
+  ): void {
+    // §16: the role × cursor families never mix — a mismatch is rejected, not ignored.
+    if (params.get('before') !== null) {
+      throw new HttpError(422, 'VALIDATION_FAILED', 'incoming is a ?since= stream — before is rejected (§16)');
+    }
+    const sinceRaw = params.get('since');
+    if (sinceRaw !== null && !/^[0-9]+$/.test(sinceRaw)) {
+      throw new HttpError(422, 'VALIDATION_FAILED', 'since must be a non-negative integer');
+    }
+    const since = sinceRaw !== null ? BigInt(sinceRaw) : 0n;
+    const payer = this.owner(payerPubkey);
+    const rows = [...payer.paymentRequests.values()]
+      .filter((r) => r.seq > since && (status === null || r.status === status))
+      .sort((a, b) => (a.seq < b.seq ? -1 : 1)); // seq-ordered (§16)
+    const page = rows.slice(0, this.pageLimit);
+    const more = rows.length > page.length;
+    const last = page[page.length - 1];
+    // The standard §16 ?since= contract: a truncated page's cursor reflects
+    // the last returned row; otherwise the payer's seq counter (next_pr_seq).
+    const cursor = more && last !== undefined ? Number(last.seq) : Number(payer.prSeq);
+    this.json(res, 200, {
+      requests: page.map((r) => this.paymentRequestToWire(r)),
+      more,
+      cursor,
+      syncEpoch: Number(this.syncEpoch),
+    });
+  }
+
+  /** §16 outgoing: created_at-descending keyset backfill (id ASC tiebreak), opaque before cursor. */
+  private servePaymentRequestsOutgoing(
+    res: http.ServerResponse,
+    requesterPubkey: string,
+    status: string | null,
+    params: URLSearchParams
+  ): void {
+    if (params.get('since') !== null) {
+      throw new HttpError(422, 'VALIDATION_FAILED', 'outgoing is a ?before= backfill view — since is rejected (§16)');
+    }
+    const beforeRaw = params.get('before');
+    let before: { ts: string; id: string } | null = null;
+    if (beforeRaw !== null) before = this.decodePaymentRequestKeyset(beforeRaw);
+
+    const rows: PaymentRequestRow[] = [];
+    for (const state of this.owners.values()) {
+      for (const r of state.paymentRequests.values()) {
+        if (r.fromPubkey === requesterPubkey && (status === null || r.status === status)) rows.push(r);
+      }
+    }
+    rows.sort((a, b) =>
+      a.createdAt === b.createdAt ? (a.id < b.id ? -1 : 1) : a.createdAt < b.createdAt ? 1 : -1
+    );
+    const filtered =
+      before === null
+        ? rows
+        : rows.filter((r) => r.createdAt < before.ts || (r.createdAt === before.ts && r.id > before.id));
+    const page = filtered.slice(0, this.pageLimit);
+    const more = filtered.length > page.length;
+    const last = page[page.length - 1];
+    this.json(res, 200, {
+      requests: page.map((r) => this.paymentRequestToWire(r)),
+      more,
+      // Opaque keyset of the last returned row; null on the final page (§16).
+      cursor:
+        more && last !== undefined
+          ? Buffer.from(JSON.stringify({ ts: last.createdAt, id: last.id }), 'utf8').toString('base64url')
+          : null,
+      syncEpoch: Number(this.syncEpoch),
+    });
+  }
+
+  /** Mirrors lib/keyset.ts decodeKeyset: a malformed cursor is a 422, never a 500. */
+  private decodePaymentRequestKeyset(cursor: string): { ts: string; id: string } {
+    try {
+      const parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as {
+        ts?: unknown;
+        id?: unknown;
+      };
+      if (
+        typeof parsed.ts === 'string' &&
+        typeof parsed.id === 'string' &&
+        !Number.isNaN(Date.parse(parsed.ts)) &&
+        UUID_RE.test(parsed.id)
+      ) {
+        return { ts: parsed.ts, id: parsed.id };
+      }
+    } catch {
+      // fall through to the 422
+    }
+    throw new HttpError(422, 'VALIDATION_FAILED', 'malformed keyset cursor — pass the cursor from a prior response verbatim (§16)');
+  }
+
+  private async handlePaymentRequestRespond(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    id: string
+  ): Promise<void> {
+    const session = this.authenticate(req);
+    if (!UUID_RE.test(id)) throw new HttpError(422, 'VALIDATION_FAILED', 'id must be a uuid'); // route param zod
+    const body = await this.readJsonBody(req);
+    for (const key of Object.keys(body)) {
+      if (!['action', 'transferId'].includes(key)) {
+        throw new HttpError(422, 'VALIDATION_FAILED', `unrecognized body key: ${key}`); // zod .strict()
+      }
+    }
+    const { action, transferId } = body as { action?: unknown; transferId?: unknown };
+    if (action !== 'paid' && action !== 'declined') {
+      throw new HttpError(422, 'VALIDATION_FAILED', 'action must be paid or declined');
+    }
+    if (transferId !== undefined && (typeof transferId !== 'string' || !UUID_RE.test(transferId))) {
+      throw new HttpError(422, 'VALIDATION_FAILED', 'transferId must be a uuid');
+    }
+    // §16 pairing — checked BEFORE the lookup (service.ts assertTransferIdShape).
+    if (action === 'paid' && transferId === undefined) {
+      throw new HttpError(422, 'VALIDATION_FAILED', 'paid links the fulfilling transfer — transferId is required (§16)');
+    }
+    if (action === 'declined' && transferId !== undefined) {
+      throw new HttpError(422, 'VALIDATION_FAILED', 'declined carries no transfer — transferId is rejected (§16)');
+    }
+
+    const row = this.findPaymentRequest(id);
+    if (!row) throw new HttpError(404, 'NOT_FOUND', 'unknown payment request');
+    // §10: addressee-only — neither the requester nor a stranger may respond.
+    if (row.toPubkey !== session.pubkey) {
+      throw new HttpError(403, 'FORBIDDEN', 'only the addressee (the payer) may respond to a payment request (§10)');
+    }
+    // §16: respond is open-only — paid/declined/expired are terminal.
+    if (row.status !== 'open') {
+      throw new HttpError(409, 'CONFLICT', `only an open request may be responded to (status: ${row.status}) (§16)`);
+    }
+    row.status = action;
+    row.transferId = action === 'paid' ? (transferId as string) : null;
+    this.wakeOwner(row.fromPubkey, 'payment_requests'); // §9: nudge the requester
+    this.json(res, 200, this.paymentRequestToWire(row));
   }
 
   // ── intents (§7, §16) ────────────────────────────────────────────────────────
