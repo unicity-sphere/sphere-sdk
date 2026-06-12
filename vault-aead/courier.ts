@@ -1,10 +1,22 @@
 /**
- * Courier-envelope seal/open + base64(nonce24‖ct) wire framing.
- * The on-wire courier `ciphertext` is the single packed base64 string.
- * Filled in Task 1.5.
+ * Courier-envelope seal/open + base64(nonce24‖ct) wire framing (findings #10, #12).
+ *
+ * The sender derives a courier key from its ECDH-x shared secret with the
+ * recipient, seals the transfer with AAD bound to
+ * `(network, senderPubkey, recipientPubkey, entryId)`, and frames it as a single
+ * `base64(nonce24‖ct)` string — the on-wire `ciphertext`. The recipient
+ * re-derives the identical key from its own ECDH side, slices the first 24 bytes
+ * back off as the nonce, and rebuilds the SAME AAD; any 1-byte tamper of the
+ * entryId (AAD) or of the packed ciphertext fails the Poly1305 tag.
  */
 
-/* eslint-disable @typescript-eslint/no-unused-vars */
+import { randomBytes } from '@noble/hashes/utils.js';
+import { seal, open } from './aead';
+import { deriveCourierKey, lengthDelim } from './derive';
+import { ecdhX } from './ecdh';
+
+/** HKDF info for the courier AEAD key. */
+const COURIER_KEY_INFO = 'unicity-courier-aead-v1';
 
 export interface SealCourierParams {
   network: string;
@@ -30,21 +42,41 @@ export interface PackedCourier {
 }
 
 /** Pack a 24-byte nonce and ciphertext into a single base64 string. */
-export function packCourier(_nonce: Uint8Array, _ct: Uint8Array): string {
-  throw new Error('not implemented');
+export function packCourier(nonce: Uint8Array, ct: Uint8Array): string {
+  const out = new Uint8Array(nonce.length + ct.length);
+  out.set(nonce, 0);
+  out.set(ct, nonce.length);
+  return Buffer.from(out).toString('base64');
 }
 
 /** Slice the first 24 bytes back off as nonce, remainder as ct. */
-export function unpackCourier(_b64: string): PackedCourier {
-  throw new Error('not implemented');
+export function unpackCourier(b64: string): PackedCourier {
+  const bytes = new Uint8Array(Buffer.from(b64, 'base64'));
+  return { nonce: bytes.slice(0, 24), ct: bytes.slice(24) };
 }
 
-/** Seal a courier envelope; returns the packed base64 ciphertext string. */
-export function sealCourierEnvelope(_params: SealCourierParams): string {
-  throw new Error('not implemented');
+/** Build the AAD that binds a courier envelope. */
+function courierAad(p: { network: string; senderPubkey: string; recipientPubkey: string; entryId: string }): Uint8Array {
+  return lengthDelim([p.network, p.senderPubkey, p.recipientPubkey, p.entryId]);
 }
 
-/** Open a packed courier envelope; returns the plaintext. */
-export function openCourierEnvelope(_params: OpenCourierParams): Uint8Array {
-  throw new Error('not implemented');
+/**
+ * Seal a courier envelope; returns the packed `base64(nonce24‖ct)` string.
+ * `nonce` is optional — supply a fixed one for deterministic test vectors;
+ * production callers omit it so a fresh random nonce is drawn.
+ */
+export function sealCourierEnvelope(params: SealCourierParams, nonce?: Uint8Array): string {
+  const key = deriveCourierKey(ecdhX(params.senderPriv, params.recipientPubkey), COURIER_KEY_INFO);
+  const n = nonce ?? randomBytes(24);
+  const aad = courierAad(params);
+  const ct = seal(key, n, params.plaintext, aad);
+  return packCourier(n, ct);
+}
+
+/** Open a packed courier envelope; returns the plaintext. Throws on any tamper. */
+export function openCourierEnvelope(params: OpenCourierParams): Uint8Array {
+  const key = deriveCourierKey(ecdhX(params.recipientPriv, params.senderPubkey), COURIER_KEY_INFO);
+  const { nonce, ct } = unpackCourier(params.ciphertext);
+  const aad = courierAad(params);
+  return open(key, nonce, ct, aad);
 }
