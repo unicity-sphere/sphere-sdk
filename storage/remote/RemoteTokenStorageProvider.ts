@@ -47,6 +47,8 @@ import {
   RESERVED_ADDRESS_FORMAT_VERSION,
 } from './reserved-address';
 import { sealHistoryRecord, openHistoryRecord } from './history-codec';
+import { deleteCanon } from '../../vault-aead/canon';
+import { signMessage } from '../../core/crypto';
 import { deriveDirectAddress } from '../../token-engine/identity';
 import type {
   PatchOp,
@@ -617,6 +619,27 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
       imported += 1;
     }
     return imported;
+  }
+
+  // === account delete (Task 7.5) ============================================
+
+  /**
+   * Fresh-signature-gated account deletion (§7.4). Fetch a fresh single-use
+   * delete-nonce, sign the REAL `delete:v1` template — `unicity:vault:delete:v1\n`
+   * + `network\nownerId\nnonce` — with the wallet key, and send `DELETE /v1/account`.
+   * A missing/stale signature is rejected CLIENT-side (we never send an empty sig),
+   * so the spend key signs only a fresh, server-issued nonce. Returns the server's
+   * `ok` (a bad/stale signature → `false`, mapping to the server's 401).
+   */
+  async deleteAccount(): Promise<boolean> {
+    const client = this.client();
+    const { nonce } = await client.deleteNonce();
+    const ownerId = this.ownerId();
+    const signature = signMessage(this.config.privateKey, deleteCanon(this.config.network, ownerId, nonce));
+    // Client-side freshness guard: never send a missing/empty signature.
+    if (!nonce || !signature) throw new Error('vault account delete: missing fresh nonce/signature');
+    const res = await client.deleteAccount(nonce, signature);
+    return res.ok;
   }
 
   // === internals ============================================================
