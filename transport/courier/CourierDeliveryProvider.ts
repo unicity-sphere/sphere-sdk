@@ -1,76 +1,441 @@
 /**
- * CourierDeliveryProvider — the reference token-delivery transport over the
- * Token-Vault v2 courier endpoints (§3, §6).
+ * CourierDeliveryProvider — the reference {@link TokenDeliveryTransport} over the
+ * Token-Vault v2 courier endpoints (DESIGN §3, §6).
  *
- * Seals each transfer into a courier envelope (ECDH-derived key, AAD-bound
- * entryId) and exchanges it via deposit / receive / ack / sent. The real
- * bodies land in Phase 5; this is the typed skeleton from Task 0.1.
+ * It seals each transfer into a courier envelope (ECDH-derived key, AAD-bound
+ * entryId) and exchanges it via deposit / receive / ack / sent. Resolution
+ * (nametag→pubkey via Nostr) is a SEPARATE concern handled before delivery — the
+ * courier addresses purely by `recipientChainPubkey`.
+ *
+ * The provider talks to the courier through an injected {@link CourierHttpClient}
+ * (the swap seam): the Phase 5 tests inject the in-process fake server; Phase 8.3
+ * injects a real fetch+JWT client against `vaultUrl`. The incoming path feeds the
+ * EXISTING `handleV2Transfer` (verify + isOwnedBy + dedup) unchanged via an
+ * injected {@link V2TransferSink}.
  */
 
 import type { FullIdentity } from '../../types';
+import type { V2TransferPayload } from '../../types/v2-transfer';
+import { isV2TransferPayload } from '../../types/v2-transfer';
+import { signMessage, verifySignedMessage } from '../../core/crypto';
+import { sealCourierEnvelope, openCourierEnvelope } from '../../vault-aead/courier';
+import { courierEntryId } from './entryId';
+import { courierAckTemplate } from './ack-template';
+import type {
+  CourierHttpClient,
+  DeliveryHandle,
+  SignedReceipt,
+  TokenDeliveryCapabilities,
+  TokenDeliveryTransport,
+  TokenEnvelope,
+} from './types';
+
+/**
+ * Sink for a decoded incoming transfer — bound by PaymentsModule to its existing
+ * `handleV2Transfer(payload, senderPubkey)` so the receive path is unchanged.
+ */
+export type V2TransferSink = (payload: V2TransferPayload, senderPubkey: string) => Promise<void>;
+
+/** One ACK-PENDING journal entry (re-fired until the server shows `claimed`). */
+interface AckPendingEntry {
+  senderPubkey: string;
+}
+
+/** Per-entry sender-side delivery state for the redelivery/backoff loop. */
+type SenderDeliveryState = 'pending' | 'delivered' | 'delivery_unconfirmed';
+
+interface SentPendingEntry {
+  recipientPubkey: string;
+  attempts: number;
+  state: SenderDeliveryState;
+}
+
+/** Minimal persistent KV the journal needs (matches PaymentsModule storage). */
+export interface CourierJournalStore {
+  get(key: string): Promise<string | null>;
+  set(key: string, value: string): Promise<void>;
+}
 
 export interface CourierDeliveryConfig {
   /** Vault/courier base URL — `NETWORKS[network].vaultUrl`. */
   vaultUrl: string;
-  /** Canonical network name. */
+  /** Canonical network name (DESIGN §7.1 — `testnet2` / `mainnet`). */
   network: string;
+  /** Swap seam: build a courier client scoped to the authenticated caller. */
+  httpClientFactory: (ownerId: string) => CourierHttpClient;
+  /** Durable journal (ACK-PENDING, read pointer, sent watermark). */
+  journal: CourierJournalStore;
+  /** Feeds decoded incoming transfers into the existing handleV2Transfer path. */
+  onV2Transfer: V2TransferSink;
+  /**
+   * Called when a delivery is CONFIRMED by a VALID recipient ackSig — the only
+   * thing that licenses removing `PENDING_V2_DELIVERIES` + GC (DESIGN §6.5).
+   * A forged/absent sig never triggers this (the sender keeps redelivering).
+   */
+  onDelivered?: (entryId: string) => Promise<void>;
+  /** Max envelope bytes the courier accepts (DESIGN §6.6 default 16 MiB). */
+  maxBytes?: number;
+  /** Max redelivery attempts before the entry is surfaced `delivery_unconfirmed`. */
+  maxRedeliveryAttempts?: number;
+  /** Base backoff (ms) for the redelivery loop; doubles per attempt up to a cap. */
+  backoffBaseMs?: number;
+  /** Backoff cap (ms). */
+  backoffMaxMs?: number;
 }
 
-/** A sealed transfer ready to hand to the courier `deposit` endpoint. */
-export interface CourierEnvelope {
-  recipientPubkey: string;
-  entryId: string;
-  transferId: string;
-  /** base64(nonce24‖ct) packed string. */
-  ciphertext: string;
-  /** Single base64 scalar hint string (NOT a {nonce,ct} object). */
-  hint?: string;
-}
-
-/** Result of a courier deposit. */
-export interface CourierDepositResult {
-  entryId: string;
-}
-
-/** A received courier delivery, pre-decrypt. */
-export interface CourierDelivery {
-  entryId: string;
-  senderPubkey: string;
-  transferId: string;
-  ciphertext: string;
-  hint?: string;
-}
-
-export class CourierDeliveryProvider {
+export class CourierDeliveryProvider implements TokenDeliveryTransport {
   readonly id = 'courier-delivery';
   readonly name = 'Courier Delivery (Vault v2)';
   readonly type = 'network' as const;
 
-  constructor(_config: CourierDeliveryConfig) {
-    // Phase 5
+  readonly capabilities: TokenDeliveryCapabilities;
+
+  private readonly config: CourierDeliveryConfig;
+  private identity: FullIdentity | null = null;
+
+  constructor(config: CourierDeliveryConfig) {
+    this.config = config;
+    this.capabilities = {
+      async: true,
+      ack: true,
+      addressing: 'pubkey',
+      maxBytes: config.maxBytes ?? 16 * 1024 * 1024,
+    };
   }
 
-  setIdentity(_identity: FullIdentity): void {
-    throw new Error('not implemented');
+  setIdentity(identity: FullIdentity): void {
+    this.identity = identity;
   }
 
-  /** Seal + POST a transfer to `/v1/courier/deposit`. */
-  deposit(_envelope: CourierEnvelope): Promise<CourierDepositResult> {
-    throw new Error('not implemented');
+  // ===========================================================================
+  // Deposit (Task 5.1)
+  // ===========================================================================
+
+  /**
+   * Seal the envelope to the recipient (ECDH key, AAD-bound entryId), pack the
+   * `base64(nonce24‖ct)` ciphertext, and POST `/v1/courier/deposit`. The caller
+   * (sender) is `this.identity.chainPubkey`; the server keys dedup on
+   * `(recipientPubkey, entryId)`.
+   */
+  async deposit(envelope: TokenEnvelope): Promise<DeliveryHandle> {
+    const me = this.requireIdentity();
+    const entryId = courierEntryId(me.privateKey, envelope.recipientChainPubkey, envelope.tokenBlobHex);
+    const ciphertext = this.sealEnvelope(me, envelope, entryId);
+    const client = this.config.httpClientFactory(me.chainPubkey);
+    const res = await client.deposit({
+      recipientPubkey: envelope.recipientChainPubkey,
+      entryId,
+      transferId: envelope.transferId,
+      ciphertext,
+      // hint stays undefined here — a single base64 SCALAR when present (never an object).
+    });
+    // Track the entry sender-side so pollSent() can gate "delivered" on a valid
+    // recipient ackSig before removing PENDING_V2_DELIVERIES (DESIGN §6.5).
+    await this.journalSentPending(entryId, envelope.recipientChainPubkey);
+    return {
+      entryId: res.entryId,
+      transferId: envelope.transferId,
+      recipientChainPubkey: envelope.recipientChainPubkey,
+      sentSeq: res.sentSeq,
+    };
   }
 
-  /** Pull-since read of pending deliveries; feeds `handleV2Transfer`. */
-  receive(): Promise<void> {
-    throw new Error('not implemented');
+  /**
+   * Seal the V2_TRANSFER payload as a courier envelope; returns the packed
+   * `base64(nonce24‖ct)` on-wire `ciphertext`.
+   */
+  private sealEnvelope(me: FullIdentity, envelope: TokenEnvelope, entryId: string): string {
+    const payload: V2TransferPayload = {
+      type: 'V2_TRANSFER',
+      version: '2.0',
+      tokenBlob: envelope.tokenBlobHex,
+      memo: envelope.memo,
+    };
+    const plaintext = new TextEncoder().encode(JSON.stringify(payload));
+    return sealCourierEnvelope({
+      network: this.config.network,
+      senderPriv: me.privateKey,
+      senderPubkey: me.chainPubkey,
+      recipientPubkey: envelope.recipientChainPubkey,
+      entryId,
+      plaintext,
+    });
   }
 
-  /** Signed durable-copy ack for a claimed entry. */
-  confirmReceipt(_entryId: string): Promise<void> {
-    throw new Error('not implemented');
+  // ===========================================================================
+  // Receive (Task 5.2)
+  // ===========================================================================
+
+  /**
+   * Pull the inbox since the server read pointer, open each envelope, decode it
+   * to a {@link TokenEnvelope}, map it to a {@link V2TransferPayload}, and feed
+   * the EXISTING `handleV2Transfer` path (via {@link V2TransferSink}) UNCHANGED.
+   *
+   * Re-pulling an already-processed-but-unclaimed item is harmless — the sink
+   * dedups by `v2_${tokenId}`. After a successful receive the entry is queued for
+   * the signed ack (Task 5.3).
+   */
+  async receive(): Promise<void> {
+    const me = this.requireIdentity();
+    const client = this.config.httpClientFactory(me.chainPubkey);
+    const since = await this.readPointer();
+    const res = await client.inbox(since);
+    for (const item of res.items) {
+      if (item.status === 'claimed') continue;
+      await this.receiveItem(me, item);
+    }
   }
 
-  /** Sender-side poll of `/v1/courier/sent` to gate delivery confirmation. */
-  pollSent(): Promise<void> {
-    throw new Error('not implemented');
+  /** Open one inbox item and feed it to handleV2Transfer; then arm the ack. */
+  private async receiveItem(
+    me: FullIdentity,
+    item: { entryId: string; senderPubkey: string; ciphertext: string },
+  ): Promise<void> {
+    let payload: V2TransferPayload;
+    try {
+      payload = this.openItem(me, item);
+    } catch {
+      // A tampered / undecryptable envelope is dropped (the tag failure is the
+      // operator-blind integrity check); discovery is not wedged by one bad row.
+      return;
+    }
+    // Custody commit: hand the verified-by-engine payload to handleV2Transfer.
+    // The sender is addressed by chainPubkey; nametag enrichment no-ops over the
+    // courier (Nostr-keyed), so the RECEIVED history records the chainPubkey only.
+    await this.config.onV2Transfer(payload, item.senderPubkey);
+    // INVARIANT custody-commit ≺ ack-journal ≺ ack-POST: journal ACK-PENDING
+    // AFTER the custody commit, BEFORE the ack POST. A crash between the journal
+    // and the POST is recovered by replayAckPending() on the next load.
+    await this.journalAckPending(item.entryId, item.senderPubkey);
+    await this.ackEntry(item.entryId, item.senderPubkey);
+  }
+
+  /**
+   * `unpackCourier` slices the first 24 bytes as the nonce; `openCourierEnvelope`
+   * rebuilds the AAD and verifies the tag, then we decode the JSON V2_TRANSFER.
+   */
+  private openItem(
+    me: FullIdentity,
+    item: { entryId: string; senderPubkey: string; ciphertext: string },
+  ): V2TransferPayload {
+    const pt = openCourierEnvelope({
+      network: this.config.network,
+      recipientPriv: me.privateKey,
+      senderPubkey: item.senderPubkey,
+      recipientPubkey: me.chainPubkey,
+      entryId: item.entryId,
+      ciphertext: item.ciphertext,
+    });
+    const decoded = JSON.parse(new TextDecoder().decode(pt)) as unknown;
+    if (!isV2TransferPayload(decoded)) {
+      throw new Error('courier: decoded envelope is not a V2_TRANSFER payload');
+    }
+    return decoded;
+  }
+
+  // ===========================================================================
+  // Journal (read pointer + ACK-PENDING)
+  // ===========================================================================
+
+  private readPointerKey(): string {
+    return `courier_read_pointer:${this.config.network}:${this.requireIdentity().chainPubkey}`;
+  }
+
+  private async readPointer(): Promise<number> {
+    const raw = await this.config.journal.get(this.readPointerKey());
+    return raw ? Number(raw) : 0;
+  }
+
+  private ackPendingKey(): string {
+    return `courier_ack_pending:${this.config.network}:${this.requireIdentity().chainPubkey}`;
+  }
+
+  private async loadAckPending(): Promise<Record<string, AckPendingEntry>> {
+    const raw = await this.config.journal.get(this.ackPendingKey());
+    return raw ? (JSON.parse(raw) as Record<string, AckPendingEntry>) : {};
+  }
+
+  /**
+   * Journal an ACK-PENDING entry keyed by entryId, written AFTER the custody
+   * commit and BEFORE the ack POST (invariant: custody-commit ≺ ack-journal ≺
+   * ack-POST). Re-fired from the journal until the server shows `claimed`.
+   */
+  private async journalAckPending(entryId: string, senderPubkey: string): Promise<void> {
+    const pending = await this.loadAckPending();
+    if (!pending[entryId]) {
+      pending[entryId] = { senderPubkey };
+      await this.config.journal.set(this.ackPendingKey(), JSON.stringify(pending));
+    }
+  }
+
+  private async removeAckPending(entryId: string): Promise<void> {
+    const pending = await this.loadAckPending();
+    if (pending[entryId]) {
+      delete pending[entryId];
+      await this.config.journal.set(this.ackPendingKey(), JSON.stringify(pending));
+    }
+  }
+
+  // ===========================================================================
+  // Ack — signed durable-copy claim (Task 5.3)
+  // ===========================================================================
+
+  /**
+   * Send the signed ack for one entry: fetch a fresh server nonce, sign the bound
+   * template with the recipient spend key, and POST `{entryId, ackSig}`. On
+   * `claimed`/`alreadyClaimed` the ACK-PENDING journal row is cleared. Failure
+   * keeps the row so the next `replayAckPending()` re-fires it.
+   */
+  async ackEntry(entryId: string, senderPubkey: string): Promise<'claimed' | 'alreadyClaimed' | 'failed'> {
+    const me = this.requireIdentity();
+    const client = this.config.httpClientFactory(me.chainPubkey);
+    const { serverNonce } = await client.ackNonce(entryId);
+    const tmpl = courierAckTemplate(this.config.network, senderPubkey, entryId, serverNonce);
+    const ackSig = signMessage(me.privateKey, tmpl);
+    const { result } = await client.ack({ entryId, ackSig });
+    if (result === 'claimed' || result === 'alreadyClaimed') {
+      await this.removeAckPending(entryId);
+    }
+    return result;
+  }
+
+  /**
+   * Re-fire every journaled ACK-PENDING entry (called on `load()`). A crash
+   * between the ack-journal and the ack-POST is recovered here: the row survives,
+   * so the ack is retried until the server shows `claimed`/`alreadyClaimed`.
+   */
+  async replayAckPending(): Promise<void> {
+    const pending = await this.loadAckPending();
+    for (const [entryId, entry] of Object.entries(pending)) {
+      try {
+        await this.ackEntry(entryId, entry.senderPubkey);
+      } catch {
+        // Network failure — keep the row for the next load.
+      }
+    }
+  }
+
+  // ===========================================================================
+  // Sender-side delivery confirmation (Task 5.4)
+  // ===========================================================================
+
+  private sentWatermarkKey(): string {
+    return `courier_sent_watermark:${this.config.network}:${this.requireIdentity().chainPubkey}`;
+  }
+
+  private sentPendingKey(): string {
+    return `courier_sent_pending:${this.config.network}:${this.requireIdentity().chainPubkey}`;
+  }
+
+  private async loadSentPending(): Promise<Record<string, SentPendingEntry>> {
+    const raw = await this.config.journal.get(this.sentPendingKey());
+    return raw ? (JSON.parse(raw) as Record<string, SentPendingEntry>) : {};
+  }
+
+  private async saveSentPending(pending: Record<string, SentPendingEntry>): Promise<void> {
+    await this.config.journal.set(this.sentPendingKey(), JSON.stringify(pending));
+  }
+
+  private async journalSentPending(entryId: string, recipientPubkey: string): Promise<void> {
+    const pending = await this.loadSentPending();
+    if (!pending[entryId]) {
+      pending[entryId] = { recipientPubkey, attempts: 0, state: 'pending' };
+      await this.saveSentPending(pending);
+    }
+  }
+
+  /**
+   * The SENDER's delivery gate (DESIGN §6.5). Poll `/sent` since the per-sender
+   * watermark; for each row that the server marks `claimed`, the sender — NOT the
+   * server — verifies the recipient `ackSig` over the bound template. ONLY a valid
+   * signature licenses `onDelivered` (which removes `PENDING_V2_DELIVERIES` + GC).
+   * A forged flag without a valid sig is rejected → the entry stays pending and is
+   * redelivered (bounded by attempt count → `delivery_unconfirmed`).
+   */
+  async pollSent(): Promise<void> {
+    const me = this.requireIdentity();
+    const client = this.config.httpClientFactory(me.chainPubkey);
+    const since = await this.sentWatermark();
+    const res = await client.sent(since);
+    const pending = await this.loadSentPending();
+    for (const item of res.items) {
+      await this.reconcileSentItem(me, pending, item);
+    }
+    await this.saveSentPending(pending);
+  }
+
+  /** Verify one /sent row's ackSig and advance its sender-side state. */
+  private async reconcileSentItem(
+    me: FullIdentity,
+    pending: Record<string, SentPendingEntry>,
+    item: { entryId: string; recipientPubkey: string; ackSig: string | null; ackNonce: string | null },
+  ): Promise<void> {
+    const entry = pending[item.entryId];
+    if (!entry || entry.state === 'delivered') return;
+    if (this.isValidReceipt(me, item)) {
+      entry.state = 'delivered';
+      await this.config.onDelivered?.(item.entryId);
+      return;
+    }
+    // Not yet validly claimed (still unclaimed, or a FORGED ackSig that fails
+    // verification) — keep redelivering, bounded by the attempt cap.
+    entry.attempts += 1;
+    if (entry.attempts >= this.maxAttempts()) entry.state = 'delivery_unconfirmed';
+  }
+
+  /** True only for a recipient ackSig that verifies over the bound template. */
+  private isValidReceipt(
+    me: FullIdentity,
+    item: { entryId: string; recipientPubkey: string; ackSig: string | null; ackNonce: string | null },
+  ): boolean {
+    if (!item.ackSig || !item.ackNonce) return false;
+    const tmpl = courierAckTemplate(this.config.network, me.chainPubkey, item.entryId, item.ackNonce);
+    return verifySignedMessage(tmpl, item.ackSig, item.recipientPubkey);
+  }
+
+  /**
+   * Verify a delivery handle's signed receipt (DESIGN §3 port method). Returns the
+   * {@link SignedReceipt} only when the recipient's ackSig validly claims it.
+   */
+  async confirmReceipt(handle: DeliveryHandle): Promise<SignedReceipt | null> {
+    const me = this.requireIdentity();
+    const client = this.config.httpClientFactory(me.chainPubkey);
+    const res = await client.sent(0);
+    const row = res.items.find((i) => i.entryId === handle.entryId);
+    if (!row || !this.isValidReceipt(me, row)) return null;
+    return { entryId: row.entryId, ackSig: row.ackSig!, recipientChainPubkey: row.recipientPubkey };
+  }
+
+  private maxAttempts(): number {
+    return this.config.maxRedeliveryAttempts ?? 10;
+  }
+
+  /** Exponential backoff for the redelivery loop, capped (DESIGN §6.5). */
+  backoffMs(attempts: number): number {
+    const base = this.config.backoffBaseMs ?? 1000;
+    const cap = this.config.backoffMaxMs ?? 5 * 60_000;
+    return Math.min(cap, base * 2 ** attempts);
+  }
+
+  /** Current sender-side state for an entry (for the UI: pending/delivered/unconfirmed). */
+  async sentState(entryId: string): Promise<SenderDeliveryState | null> {
+    const pending = await this.loadSentPending();
+    return pending[entryId]?.state ?? null;
+  }
+
+  private async sentWatermark(): Promise<number> {
+    const raw = await this.config.journal.get(this.sentWatermarkKey());
+    return raw ? Number(raw) : 0;
+  }
+
+  // ===========================================================================
+  // Internals
+  // ===========================================================================
+
+  private requireIdentity(): FullIdentity {
+    if (!this.identity) {
+      throw new Error('CourierDeliveryProvider: setIdentity() must be called before use');
+    }
+    return this.identity;
   }
 }
