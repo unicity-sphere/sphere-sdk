@@ -13,5 +13,12 @@
   },
   "negative": {
     "plainSecpSig": "c1f432f94744d6e8ed392a632f7cae6fd9d99f583d382863808f9e9a2ad41eee4a93ca80918b87b16951f6920f911db16d5d275449558d64fee2c15665a2994701"
+  },
+  "epoch": {
+    "serverPriv": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "serverPubkey": "026a04ab98d9e4774ad806e302dddeb63bea16b5cb5f223ee77478e861bb583eb3",
+    "network": "testnet2",
+    "epoch": 7,
+    "epochSig": "20bb3907d7814f5aedba1cd2fa2c4a386002b075098a1719ec00e6bc2a4a1f9bd65ba78aa4dfc7116bf99388d495595e93a74110b9d9261e756032e58afa1d000a"
   }
 }
