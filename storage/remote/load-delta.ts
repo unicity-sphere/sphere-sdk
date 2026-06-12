@@ -70,8 +70,13 @@ export interface LoadPage {
   epochSig: string;
 }
 
-/** Gate verdict for one page. */
-export type GateResult = { ok: true } | { ok: false; reason: string };
+/**
+ * Gate verdict for one page. `reset` is set on the `ok` branch when a SANCTIONED
+ * epoch reset was recognised (a server-key-verified strict epoch bump, Task 8.2):
+ * the provider DROPS local vault state + re-baselines at the new epoch instead of
+ * alarming. A normal clean page carries `reset:false`.
+ */
+export type GateResult = { ok: true; reset: boolean } | { ok: false; reason: string };
 
 export class LoadDeltaTracker {
   private readonly config: LoadDeltaConfig;
@@ -116,18 +121,41 @@ export class LoadDeltaTracker {
     }
   }
 
-  /** Ingest one `/state` page: monotonicity + root gate. */
+  /**
+   * Re-arm the tracker for a SANCTIONED-RESET re-pass (Task 8.2). After a verified
+   * strict epoch bump the provider drops local state and re-paginates the fresh
+   * (epoch-bumped) seq space from `since=0`. We seed an EMPTY accumulator and clear
+   * the in-memory baseline so the re-pass does NOT run the stale-root gate against
+   * the pre-reset root — `commitBaseline` then persists a fresh signed root at the
+   * new epoch/cursor. The bump is server-key-verified by `ingestPage` BEFORE this
+   * is ever called, so dropping the baseline here cannot mask a hostile rollback.
+   */
+  beginReset(): void {
+    this.accState = new Map();
+    this.baseline = null;
+  }
+
+  /**
+   * Ingest one `/state` page: monotonicity + root gate.
+   *
+   * A server-key-VERIFIED strict epoch bump is evaluated FIRST and short-circuits
+   * BOTH gates (it is a sanctioned reset, Task 8.2 / finding #14): the page is
+   * reported `ok` with `reset:true`, and the provider drops local state + has the
+   * tracker re-baseline at the new epoch. WITHOUT a verified strict bump, a cursor
+   * regression or a root divergence still alarms (Task 4.2 is NOT weakened).
+   */
   async ingestPage(page: LoadPage): Promise<GateResult> {
     if (this.accState === null) await this.beginLoad(new Map());
     const epochOk = this.recogniseEpoch(page);
+    if (epochOk) return { ok: true, reset: true }; // sanctioned reset — provider drops + re-baselines
     const mono = this.checkMonotonic(page);
-    if (!mono.ok && !epochOk) return mono;
+    if (!mono.ok) return mono;
     this.fold(page.entries);
-    if (this.baseline && !epochOk) {
+    if (this.baseline) {
       const verdict = this.checkRoot();
       if (!verdict.ok) return verdict;
     }
-    return { ok: true };
+    return { ok: true, reset: false };
   }
 
   /** Recognise a server-verified epoch bump (sanctioned reset — 8.2 seam). */
@@ -140,11 +168,21 @@ export class LoadDeltaTracker {
   }
 
   /** Cursor must be non-decreasing relative to the `since` it answered. */
-  private checkMonotonic(page: LoadPage): GateResult {
+  private checkMonotonic(page: LoadPage): { ok: true } | { ok: false; reason: string } {
     if (page.cursor < page.since) {
       return { ok: false, reason: `cursor regressed: ${page.cursor} < since ${page.since}` };
     }
     return { ok: true };
+  }
+
+  /**
+   * Fold the post-reset state into the accumulator (Task 8.2). The reset re-pass
+   * pulls the fresh seq space UNGATED (the bump is already verified), so the
+   * provider folds those entries here before `commitBaseline` signs the new root —
+   * keeping the re-baselined root correct even for a NON-empty reset.
+   */
+  foldReset(entries: StateEntry[]): void {
+    this.fold(entries);
   }
 
   private fold(entries: StateEntry[]): void {
@@ -159,7 +197,7 @@ export class LoadDeltaTracker {
    * writer, so a delta it did not author (no intervening flush advanced the
    * baseline) means the server injected state — a rollback.
    */
-  private checkRoot(): GateResult {
+  private checkRoot(): { ok: true } | { ok: false; reason: string } {
     const folded = computeRoot(this.accState!);
     if (folded !== this.baseline!.root) {
       return { ok: false, reason: 'rollback' };

@@ -485,6 +485,9 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
         epochSig: page.epochSig,
       });
       if (!gate.ok) return this.rollback(gate.reason);
+      // Task 8.2 / #14: a server-key-VERIFIED strict epoch bump is a SANCTIONED
+      // reset, not an alarm — drop local state and re-baseline at the new epoch.
+      if (gate.reset) return this.handleSanctionedReset();
       pages.push(...page.entries);
       lastEpochSig = page.epochSig;
       lastEpoch = page.syncEpoch;
@@ -497,6 +500,61 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     await this.delta.commitBaseline(since, lastEpoch, lastEpochSig);
     const recovered = await this.loadHistory(); // single-channel history (Task 7.4)
     return this.materialize(pages, recovered);
+  }
+
+  /**
+   * Sanctioned-reset path (Task 8.2 / finding #14). A server-key-verified strict
+   * epoch bump was recognised, so the operator legitimately reset the network (a
+   * testnet wipe). DROP all local vault state and re-paginate the fresh seq space
+   * from `since=0`, then re-baseline the signed root at the NEW epoch/cursor — NO
+   * rollback alarm. This is only ever reached AFTER `ingestPage` verified the bump
+   * against `NETWORKS[net].vaultServerKey`, so it cannot mask a hostile rollback.
+   */
+  private async handleSanctionedReset(): Promise<LoadResult<TData>> {
+    this.dropLocalVaultState();
+    this.delta.beginReset(); // empty accumulator, no stale-root gate for the re-pass
+    const { entries, cursor, epoch, epochSig } = await this.repaginateFromReset();
+    this.delta.foldReset(entries); // re-baseline root reflects the actual reset state
+    this.serverCursor = cursor;
+    await this.delta.commitBaseline(cursor, epoch, epochSig); // persist the NEW epoch
+    const recovered = await this.loadHistory();
+    return this.materialize(entries, recovered);
+  }
+
+  /** Re-pull the post-reset state from `since=0` UNGATED (the reset is sanctioned). */
+  private async repaginateFromReset(): Promise<{ entries: StateEntry[]; cursor: number; epoch: number; epochSig: string }> {
+    const client = this.client();
+    const entries: StateEntry[] = [];
+    let since = 0;
+    let cursor = 0;
+    let epoch = 0;
+    let epochSig = '';
+    for (;;) {
+      const page = await client.getState(since);
+      entries.push(...page.entries);
+      cursor = page.cursor;
+      epoch = page.syncEpoch;
+      epochSig = page.epochSig;
+      if (!page.more || page.cursor <= since) break;
+      since = page.cursor;
+    }
+    return { entries, cursor, epoch, epochSig };
+  }
+
+  /**
+   * Drop all per-owner local vault state for a sanctioned reset: the internal
+   * last-known server view, content hashes, the pagination watermark, the restored
+   * address and the history watermark. The signed baseline is re-persisted fresh by
+   * `commitBaseline`. Storage scope (the literal-network baseline KEY) is unchanged.
+   */
+  private dropLocalVaultState(): void {
+    this.known.clear();
+    this.contentHash.clear();
+    this.serverCursor = 0;
+    this.restoredAddress = null;
+    this.localHistory.clear();
+    this.pushedHistory.clear();
+    this.historyCursor = 0;
   }
 
   /**
