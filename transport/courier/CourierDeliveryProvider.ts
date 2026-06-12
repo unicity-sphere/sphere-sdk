@@ -17,8 +17,10 @@
 import type { FullIdentity } from '../../types';
 import type { V2TransferPayload } from '../../types/v2-transfer';
 import { isV2TransferPayload } from '../../types/v2-transfer';
+import { signMessage } from '../../core/crypto';
 import { sealCourierEnvelope, openCourierEnvelope } from '../../vault-aead/courier';
 import { courierEntryId } from './entryId';
+import { courierAckTemplate } from './ack-template';
 import type {
   CourierHttpClient,
   DeliveryHandle,
@@ -176,8 +178,11 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
     // The sender is addressed by chainPubkey; nametag enrichment no-ops over the
     // courier (Nostr-keyed), so the RECEIVED history records the chainPubkey only.
     await this.config.onV2Transfer(payload, item.senderPubkey);
-    // ACK-PENDING is journaled AFTER the custody commit (Task 5.3).
+    // INVARIANT custody-commit ≺ ack-journal ≺ ack-POST: journal ACK-PENDING
+    // AFTER the custody commit, BEFORE the ack POST. A crash between the journal
+    // and the POST is recovered by replayAckPending() on the next load.
     await this.journalAckPending(item.entryId, item.senderPubkey);
+    await this.ackEntry(item.entryId, item.senderPubkey);
   }
 
   /**
@@ -235,6 +240,53 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
     if (!pending[entryId]) {
       pending[entryId] = { senderPubkey };
       await this.config.journal.set(this.ackPendingKey(), JSON.stringify(pending));
+    }
+  }
+
+  private async removeAckPending(entryId: string): Promise<void> {
+    const pending = await this.loadAckPending();
+    if (pending[entryId]) {
+      delete pending[entryId];
+      await this.config.journal.set(this.ackPendingKey(), JSON.stringify(pending));
+    }
+  }
+
+  // ===========================================================================
+  // Ack — signed durable-copy claim (Task 5.3)
+  // ===========================================================================
+
+  /**
+   * Send the signed ack for one entry: fetch a fresh server nonce, sign the bound
+   * template with the recipient spend key, and POST `{entryId, ackSig}`. On
+   * `claimed`/`alreadyClaimed` the ACK-PENDING journal row is cleared. Failure
+   * keeps the row so the next `replayAckPending()` re-fires it.
+   */
+  async ackEntry(entryId: string, senderPubkey: string): Promise<'claimed' | 'alreadyClaimed' | 'failed'> {
+    const me = this.requireIdentity();
+    const client = this.config.httpClientFactory(me.chainPubkey);
+    const { serverNonce } = await client.ackNonce(entryId);
+    const tmpl = courierAckTemplate(this.config.network, senderPubkey, entryId, serverNonce);
+    const ackSig = signMessage(me.privateKey, tmpl);
+    const { result } = await client.ack({ entryId, ackSig });
+    if (result === 'claimed' || result === 'alreadyClaimed') {
+      await this.removeAckPending(entryId);
+    }
+    return result;
+  }
+
+  /**
+   * Re-fire every journaled ACK-PENDING entry (called on `load()`). A crash
+   * between the ack-journal and the ack-POST is recovered here: the row survives,
+   * so the ack is retried until the server shows `claimed`/`alreadyClaimed`.
+   */
+  async replayAckPending(): Promise<void> {
+    const pending = await this.loadAckPending();
+    for (const [entryId, entry] of Object.entries(pending)) {
+      try {
+        await this.ackEntry(entryId, entry.senderPubkey);
+      } catch {
+        // Network failure — keep the row for the next load.
+      }
     }
   }
 

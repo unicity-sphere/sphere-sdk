@@ -22,6 +22,7 @@
  */
 
 import { verifySignedMessage } from '../../core/crypto';
+import { courierAckTemplate } from '../../transport/courier/ack-template';
 import type {
   CourierAckNonceResponse,
   CourierAckRequest,
@@ -159,7 +160,7 @@ export class FakeCourierServer {
     const nonce = this.ackNonces.get(req.entryId);
     if (!nonce) return { result: 'failed' };
     this.ackNonces.delete(req.entryId); // single-use
-    const tmpl = `unicity:courier:ack:v1\n${this.network}\n${d.senderId}\n${req.entryId}\n${nonce}`;
+    const tmpl = courierAckTemplate(this.network, d.senderId, req.entryId, nonce);
     if (!verifySignedMessage(tmpl, req.ackSig, recipientId)) return { result: 'failed' };
     d.status = 'claimed';
     d.ackSig = req.ackSig;
