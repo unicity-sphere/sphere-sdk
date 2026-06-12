@@ -727,6 +727,17 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     return this.auth;
   }
 
+  /**
+   * The provider's live JWT source (Task 8.3 wiring). The REAL `HttpVaultClient`
+   * reads the Bearer JWT + drives the serialized refresh through this same
+   * `VaultApiClient`, so the data client and the provider share ONE auth session.
+   * `setIdentity()` must have run first. Resolved lazily by the http-client factory
+   * (the factory closure is supplied at construction, before `setIdentity`).
+   */
+  authTokenSource(): VaultApiClient {
+    return this.requireAuth();
+  }
+
   private ownerId(): string {
     return this.requireIdentity().chainPubkey;
   }

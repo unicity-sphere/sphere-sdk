@@ -554,6 +554,28 @@ export type {
 
 export { normalizeVaultNetwork } from './storage/remote/normalize-network';
 
+// Real fetch HTTP clients (Task 8.3): the swap-in for the in-memory fakes — the
+// raw auth client, the authenticated vault data client, the courier client, and a
+// convenience factory that builds the two authenticated clients over one shared
+// JWT/refresh session (a `VaultApiClient`, or a provider's `authTokenSource()`).
+export {
+  HttpVaultAuthClient,
+  HttpVaultClient,
+  HttpCourierClient,
+  VaultHttpError,
+  createVaultHttpClients,
+  createVaultAuthClient,
+} from './storage/remote/http/index';
+export type {
+  HttpVaultAuthClientConfig,
+  HttpVaultClientConfig,
+  HttpCourierClientConfig,
+  VaultHttpClientsConfig,
+  VaultHttpClients,
+  VaultTokenSource,
+  FetchLike,
+} from './storage/remote/http/index';
+
 // vault-aead public crypto API (seal/open, key derivation, on-curve guard,
 // AAD-bound vault entries, courier envelope framing).
 export {
