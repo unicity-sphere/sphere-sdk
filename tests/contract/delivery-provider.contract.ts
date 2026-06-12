@@ -28,6 +28,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { sha256 } from '@noble/hashes/sha2.js';
 import type { DeliveryProvider, IncomingDelivery } from '../../transport/delivery-provider';
+import { unwrapTokenBlobBytes } from '../../token-engine/token-blob';
 
 export interface DeliveryBlobFixture {
   /** Encoded TokenBlob bytes addressed to the recipient. */
@@ -113,7 +114,7 @@ export function describeDeliveryProviderContract(
       expect(incoming.filter((d) => d.deliveryId === first.deliveryId)).toHaveLength(1);
     });
 
-    it('incoming() yields the delivery with the exact blob bytes and its transferId', async () => {
+    it('incoming() yields the delivery with the exact token bytes and its transferId', async () => {
       const blob = ctx.makeBlob();
       const { deliveryId } = await ctx.sender.deliver(ctx.recipientPubkey, blob.bytes, {
         transferId: 'tf-3',
@@ -124,7 +125,13 @@ export function describeDeliveryProviderContract(
       expect(delivery).toBeDefined();
       expect(delivery!.transferId).toBe('tf-3');
       expect(typeof delivery!.cursor).toBe('string');
-      expect(Array.from(await delivery!.fetchBlob())).toEqual(Array.from(blob.bytes));
+      // The INNER token bytes round-trip byte-exactly. The envelope itself is
+      // transport-dependent: the wallet-api rail carries RAW wire bytes
+      // (ARCHITECTURE §5.2/§8.2 — the 39051 envelope never crosses the §16
+      // API), while peer transports may carry the envelope verbatim.
+      expect(Array.from(unwrapTokenBlobBytes(await delivery!.fetchBlob()))).toEqual(
+        Array.from(unwrapTokenBlobBytes(blob.bytes))
+      );
     });
 
     it("custody is composition-time: ack('claimed') with NO options honors the constructed mode", async () => {

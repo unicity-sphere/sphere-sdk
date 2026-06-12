@@ -43,7 +43,11 @@ import type {
   TxfStorageDataBase,
 } from '../../../storage';
 import type { TokenBlob } from '../../../token-engine/types';
-import { decodeTokenBlob } from '../../../token-engine/token-blob';
+import {
+  TOKEN_BLOB_VERSION,
+  decodeTokenBlob,
+  unwrapTokenBlobBytes,
+} from '../../../token-engine/token-blob';
 import type { FullIdentity, ProviderStatus } from '../../../types';
 import { WalletApiClient, WalletApiError } from '../../../wallet-api';
 import type { KeyValueStore } from '../../../wallet-api';
@@ -306,7 +310,7 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
       throw new WalletApiError(`No blob URL for token ${tokenId} (not owned here)`, 'NOT_FOUND');
     }
     const bytes = await this.client.fetchBlob(entry.getUrl);
-    const blob = decodeTokenBlob(bytes);
+    const blob = this.wrapWireBlob(tokenId, bytes);
     if (blob.tokenId !== tokenId) {
       throw new WalletApiError(
         `Blob tokenId mismatch: requested ${tokenId}, blob carries ${blob.tokenId}`,
@@ -314,6 +318,23 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
       );
     }
     return blob;
+  }
+
+  /**
+   * The §16 wire serves RAW token bytes (§5.2/§8.2 — the sphere 39051
+   * envelope never crosses the API): re-wrap them for the engine-facing
+   * {@link TokenBlob} surface. Envelope bytes (older rows, fake-world seeds)
+   * still decode — their embedded tokenId is then checked by the caller. The
+   * `network` of a raw wrap is not recoverable without the engine; consumers
+   * derive it from the decoded token (`engine.decodeToken` re-wraps), so it
+   * is never read from this value.
+   */
+  private wrapWireBlob(tokenId: string, bytes: Uint8Array): TokenBlob {
+    try {
+      return decodeTokenBlob(bytes);
+    } catch {
+      return { v: TOKEN_BLOB_VERSION, network: 0, tokenId, token: bytes };
+    }
   }
 
   /**
@@ -397,12 +418,7 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
   }
 
   private async locallyValid(tokenId: string, bytes: Uint8Array): Promise<boolean> {
-    let blob: TokenBlob;
-    try {
-      blob = decodeTokenBlob(bytes);
-    } catch {
-      return false;
-    }
+    const blob = this.wrapWireBlob(tokenId, bytes);
     if (blob.tokenId !== tokenId) return false;
     if (this.verifyToken) return this.verifyToken(blob);
     return true;
@@ -476,7 +492,9 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
       // active row is a lineage 409 (§5.3), and tombstoned tokens re-enter
       // via recoverRemoved(), never via write-behind.
       if (excluded.has(tokenId) || this.view.has(tokenId)) continue;
-      toAdd.push({ tokenId, bytes: hexToBytes(value.sdkData) });
+      // §5.2/§8.2: the wire carries the RAW token bytes — the stored sdkData
+      // is the sphere envelope; unwrap it at the wallet-api boundary.
+      toAdd.push({ tokenId, bytes: unwrapTokenBlobBytes(hexToBytes(value.sdkData)) });
     }
     if (toAdd.length === 0) return;
 

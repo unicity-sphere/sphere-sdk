@@ -30,7 +30,7 @@ import type {
 } from '../../types/txf';
 import { L1PaymentsModule, type L1PaymentsModuleConfig } from './L1PaymentsModule';
 import type { SplitPlan, TokenWithAmount } from './TokenSplitCalculator';
-import type { ITokenEngine, SphereToken } from '../../token-engine';
+import type { ITokenEngine, SphereToken, TokenBlob } from '../../token-engine';
 import { TransferConflictError } from '../../token-engine';
 import { isV2TransferPayload, type V2TransferPayload } from '../../types/v2-transfer';
 import { TokenReservationLedger } from './TokenReservationLedger';
@@ -71,7 +71,7 @@ import { TokenRegistry } from '../../registry';
 import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
 import { sha256, bytesToHex, hexToBytes } from '../../core/crypto';
-import { decodeTokenBlob, encodeTokenBlob } from '../../token-engine/token-blob';
+import { decodeTokenBlob, encodeTokenBlob, unwrapTokenBlobBytes, TOKEN_BLOB_VERSION } from '../../token-engine/token-blob';
 import { parseInvoiceMemoForOnChain } from '../accounting/memo.js';
 
 // =============================================================================
@@ -677,12 +677,13 @@ export interface PaymentsWalletApiPort {
   ): Promise<{ sha256: string; key: string; putUrl: string }[]>;
   /** Upload to a presigned PUT (a 412 = already present = success — §5.2). */
   uploadBlob(putUrl: string, bytes: Uint8Array): Promise<void>;
-  /** §10: client-asserted history records, deduped by dedupKey server-side. */
+  /** §10: client-asserted history records (§16 wire shape), deduped by dedupKey server-side. */
   postHistoryRecords(
     records: {
       dedupKey: string;
+      id: string;
       type: string;
-      timestamp: number;
+      ts: string;
       assets: { coinId: string; amount: string }[];
       transferId?: string;
       tokenId?: string;
@@ -1925,13 +1926,16 @@ export class PaymentsModule {
   /** §5.2: upload a spend output blob (content-addressed; 412 = present = success). */
   private async uploadOutputBlob(bytes: Uint8Array): Promise<string> {
     const walletApi = this.deps!.walletApi!;
-    const sha = sha256(bytesToHex(bytes), 'hex');
-    const urls = await walletApi.getUploadUrls([{ sha256: sha, size: bytes.length }]);
+    // §5.2/§8.2: the wire carries RAW token bytes — callers hand the sphere
+    // envelope; unwrap at the wallet-api boundary.
+    const wire = unwrapTokenBlobBytes(bytes);
+    const sha = sha256(bytesToHex(wire), 'hex');
+    const urls = await walletApi.getUploadUrls([{ sha256: sha, size: wire.length }]);
     const url = urls.find((u) => u.sha256 === sha);
     if (!url) {
       throw new SphereError(`upload-urls response missing sha256 ${sha}`, 'STORAGE_ERROR');
     }
-    await walletApi.uploadBlob(url.putUrl, bytes);
+    await walletApi.uploadBlob(url.putUrl, wire);
     return url.key;
   }
 
@@ -3408,20 +3412,32 @@ export class PaymentsModule {
     // envelopes — the operator never sees plaintext (§8.3). Best-effort: a
     // failed POST never fails the money path; the record stays local.
     const walletApi = this.deps!.walletApi;
-    if (walletApi) {
+    // §16 wire shape (strict server-side zod; caught drifting by the phase-2
+    // harness — the fake had accepted the module's internal shape):
+    //  - `id` (uuid) + `ts` (ISO-8601), never `timestamp`;
+    //  - `type` is the §16 enum — anything else stays local-only;
+    //  - `tokenId` is the genesis-stable lowercase hex (strip the `v2_` UI prefix);
+    //  - `counterpartyPubkey` only when it IS a 33-byte compressed pubkey.
+    const postableType = historyEntry.type === 'SENT' || historyEntry.type === 'RECEIVED' || historyEntry.type === 'MINT';
+    if (walletApi && postableType) {
       try {
         const fieldKey = this.getFieldEncryptionKey();
         const counterpartyNametag = historyEntry.recipientNametag ?? historyEntry.senderNametag;
+        const wireTokenId = historyEntry.tokenId?.replace(/^v2_/, '');
+        const counterparty = historyEntry.recipientPubkey ?? historyEntry.senderPubkey;
         await walletApi.postHistoryRecords([
           {
             dedupKey: historyEntry.dedupKey,
+            id: crypto.randomUUID(),
             type: historyEntry.type,
-            timestamp: historyEntry.timestamp,
+            ts: new Date(historyEntry.timestamp).toISOString(),
             assets: [{ coinId: historyEntry.coinId, amount: historyEntry.amount }],
             ...(historyEntry.transferId !== undefined ? { transferId: historyEntry.transferId } : {}),
-            ...(historyEntry.tokenId !== undefined ? { tokenId: historyEntry.tokenId } : {}),
-            ...(historyEntry.recipientPubkey ?? historyEntry.senderPubkey
-              ? { counterpartyPubkey: historyEntry.recipientPubkey ?? historyEntry.senderPubkey }
+            ...(wireTokenId !== undefined && /^(?:[0-9a-f]{2}){1,64}$/.test(wireTokenId)
+              ? { tokenId: wireTokenId }
+              : {}),
+            ...(counterparty !== undefined && /^0[23][0-9a-f]{64}$/.test(counterparty)
+              ? { counterpartyPubkey: counterparty }
               : {}),
             ...(historyEntry.memo !== undefined ? { memo: encryptField(fieldKey, historyEntry.memo) } : {}),
             ...(counterpartyNametag !== undefined
@@ -4146,7 +4162,18 @@ export class PaymentsModule {
 
     let token: SphereToken;
     try {
-      token = await engine.decodeToken(decodeTokenBlob(hexToBytes(payload.tokenBlob)));
+      // Tolerant read: peers/journals carry the sphere envelope, while the
+      // wallet-api mailbox serves RAW wire bytes (§5.2/§8.2). Either way the
+      // engine's decode re-derives the authoritative blob from the token
+      // itself, so the placeholder fields of a raw wrap are never trusted.
+      const bytes = hexToBytes(payload.tokenBlob);
+      let blob: TokenBlob;
+      try {
+        blob = decodeTokenBlob(bytes);
+      } catch {
+        blob = { v: TOKEN_BLOB_VERSION, network: 0, tokenId: '', token: bytes };
+      }
+      token = await engine.decodeToken(blob);
     } catch (err) {
       logger.error('Payments', 'V2 transfer: failed to decode token blob:', err);
       return 'invalid';

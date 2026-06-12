@@ -313,14 +313,11 @@ export function parsePaymentRequestsPage(
 
 function parseHistoryRecord(raw: unknown, what: string): HistoryWireRecord {
   const rec = asRecord(raw, what);
-  const timestamp = rec.timestamp;
-  if (typeof timestamp !== 'number' || !Number.isSafeInteger(timestamp) || timestamp < 0) {
-    throw protocolError(`${what}.timestamp is not a non-negative integer`);
-  }
   return {
     dedupKey: asString(rec.dedupKey, `${what}.dedupKey`),
+    id: asString(rec.id, `${what}.id`),
     type: asString(rec.type, `${what}.type`),
-    timestamp,
+    ts: asString(rec.ts, `${what}.ts`),
     assets: asArray(rec.assets, `${what}.assets`).map((a, i) => {
       const asset = asRecord(a, `${what}.assets[${i}]`);
       // Amounts stay decimal strings on this surface — display data (§10).
@@ -341,11 +338,17 @@ function parseHistoryRecord(raw: unknown, what: string): HistoryWireRecord {
 /** `GET /v1/history` → {@link HistoryPage} (§16). */
 export function parseHistoryPage(body: unknown): HistoryPage {
   const rec = asRecord(body, 'history response');
+  if (typeof rec.more !== 'boolean') throw protocolError('history response .more is not a boolean');
+  if (rec.cursor !== null && typeof rec.cursor !== 'string') {
+    throw protocolError('history response .cursor is not a string or null');
+  }
   return {
     records: asArray(rec.records, 'history response .records').map((raw, i) =>
       parseHistoryRecord(raw, `records[${i}]`)
     ),
-    ...(typeof rec.nextBefore === 'string' ? { nextBefore: rec.nextBefore } : {}),
+    more: rec.more,
+    cursor: rec.cursor,
+    syncEpoch: parseCounter(rec.syncEpoch, 'history response .syncEpoch'),
   };
 }
 

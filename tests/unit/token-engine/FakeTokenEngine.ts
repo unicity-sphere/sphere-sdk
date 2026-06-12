@@ -202,12 +202,28 @@ export class FakeTokenEngine implements ITokenEngine {
    * in delivery-keys.test.ts and, end-to-end, by the cross-repo harness.
    */
   public deliveryKeys(blobBytes: Uint8Array): Promise<{ tokenId: string; stateHash: string }> {
-    const blob = decodeTokenBlob(blobBytes);
-    return Promise.resolve({ tokenId: blob.tokenId, stateHash: bytesToHexLocal(sha256(blob.token)) });
+    // Tolerant like the real derivation (blob-keys.ts): the cross-port blob
+    // is the sphere envelope, the wallet-api WIRE carries raw inner bytes
+    // (§5.2/§8.2). Both forms of the same token derive the identical pair.
+    try {
+      const blob = decodeTokenBlob(blobBytes);
+      return Promise.resolve({ tokenId: blob.tokenId, stateHash: bytesToHexLocal(sha256(blob.token)) });
+    } catch {
+      const state = decodeFakeState(blobBytes);
+      return Promise.resolve({
+        tokenId: HexConverter.encode(state.tokenId),
+        stateHash: bytesToHexLocal(sha256(blobBytes)),
+      });
+    }
   }
 
   public decodeToken(blob: TokenBlob): Promise<SphereToken> {
-    return Promise.resolve({ sdkToken: handleFor(blob.token), blob, value: valueOf(decodeFakeState(blob.token)) });
+    // Normalize like the real engine's wrapToken: tokenId/network come from
+    // the decoded token, never from the (possibly placeholder) envelope
+    // fields of a raw wire wrap.
+    const state = decodeFakeState(blob.token);
+    const normalized: TokenBlob = { ...blob, network: this.network, tokenId: HexConverter.encode(state.tokenId) };
+    return Promise.resolve({ sdkToken: handleFor(blob.token), blob: normalized, value: valueOf(state) });
   }
 
   // ── internals ──────────────────────────────────────────────────────────────
@@ -261,6 +277,19 @@ export function decodeFakeTokenAssets(
     if (!state.genesisData || !isSpherePaymentData(state.genesisData)) return null;
     const value = SpherePaymentData.fromCBOR(state.genesisData).toValue();
     return value.assets.map((a) => ({ coinId: a.coinId, amount: a.amount }));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Genesis-stable token id of fake inner-token bytes — the injectable
+ * `decodeTokenId` port for FakeWalletApi's §8.2 step-4 stand-in over RAW wire
+ * bytes (the wallet-api wire carries inner bytes, never the envelope).
+ */
+export function decodeFakeTokenId(tokenBytes: Uint8Array): string | null {
+  try {
+    return HexConverter.encode(decodeFakeState(tokenBytes).tokenId);
   } catch {
     return null;
   }

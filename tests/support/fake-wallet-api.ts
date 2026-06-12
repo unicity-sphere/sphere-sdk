@@ -175,6 +175,15 @@ export interface FakeWalletApiOptions {
    * failure (422).
    */
   decodeAssets?: (tokenBytes: Uint8Array) => FakeAsset[] | null;
+  /**
+   * §8.2 step-4 stand-in for RAW wire bytes: the wallet-api wire carries the
+   * INNER token bytes (§5.2 — never the 39051 envelope), so the fake needs an
+   * injected way to read the genesis-stable tokenId out of them (the real
+   * server decodes the v2 token). The default reads the synthetic JSON
+   * `{ tokenId }` payload; envelope bytes (legacy seeds) keep working via the
+   * envelope's own field. Returning null = validation failure (422).
+   */
+  decodeTokenId?: (tokenBytes: Uint8Array) => string | null;
 }
 
 function hex(bytes: Uint8Array): string {
@@ -201,6 +210,16 @@ function defaultDecodeAssets(tokenBytes: Uint8Array): FakeAsset[] | null {
       assets.push({ coinId: a.coinId, amount: BigInt(a.amount) });
     }
     return assets;
+  } catch {
+    return null;
+  }
+}
+
+/** Default raw-bytes tokenId reader: the synthetic JSON `{ tokenId }` payload. */
+function defaultDecodeTokenId(tokenBytes: Uint8Array): string | null {
+  try {
+    const parsed = JSON.parse(new TextDecoder().decode(tokenBytes)) as { tokenId?: unknown };
+    return typeof parsed.tokenId === 'string' ? parsed.tokenId : null;
   } catch {
     return null;
   }
@@ -235,6 +254,7 @@ export class FakeWalletApi {
   private readonly mailboxPerPairCap: number;
   private readonly maxPayerOpenRequests: number;
   private readonly decodeAssets: (tokenBytes: Uint8Array) => FakeAsset[] | null;
+  private readonly decodeTokenId: (tokenBytes: Uint8Array) => string | null;
 
   private server: http.Server | null = null;
   private wss: WebSocketServer | null = null;
@@ -271,6 +291,7 @@ export class FakeWalletApi {
     this.mailboxPerPairCap = options.mailboxPerPairCap ?? 500; // per-sender-pair sub-cap (§5.5 MAX_SENDER_RECIPIENT_ENTRIES)
     this.maxPayerOpenRequests = options.maxPayerOpenRequests ?? 1000; // MAX_PAYER_OPEN_REQUESTS (§14)
     this.decodeAssets = options.decodeAssets ?? defaultDecodeAssets;
+    this.decodeTokenId = options.decodeTokenId ?? defaultDecodeTokenId;
   }
 
   // ── lifecycle ────────────────────────────────────────────────────────────────
@@ -346,10 +367,25 @@ export class FakeWalletApi {
         tokenId: t.tokenId,
         status: 'active',
         s3Key: key,
-        stateHash: t.blob ? hex(sha256(decodeTokenBlob(t.blob).token)) : '',
+        stateHash: t.blob ? hex(sha256(this.resolveBlob(t.blob).inner)) : '',
         assets: t.assets,
         seq: owner.cursor,
       });
+    }
+  }
+
+  /**
+   * Tolerant §8.2 step-3 stand-in: wire bytes are the INNER token bytes
+   * (§5.2); envelope bytes (older seeds/uploads) unwrap. Returns the decoded
+   * tokenId (envelope field, else the injected raw decoder) and the inner
+   * bytes the value/state-hash derivations run over.
+   */
+  private resolveBlob(bytes: Uint8Array): { tokenId: string | null; inner: Uint8Array } {
+    try {
+      const blob = decodeTokenBlob(bytes);
+      return { tokenId: blob.tokenId, inner: blob.token };
+    } catch {
+      return { tokenId: this.decodeTokenId(bytes), inner: bytes };
     }
   }
 
@@ -868,6 +904,18 @@ export class FakeWalletApi {
       return;
     }
     if (req.method === 'PUT' && entry.method === 'PUT') {
+      // §5.2 / SigV4: the presign binds `x-amz-checksum-sha256` and
+      // `if-none-match` as SIGNED HEADERS — a real S3 endpoint rejects the
+      // signature when they are absent or differ. Enforced here because the
+      // phase-2 harness caught exactly this drift on first contact with real
+      // MinIO (the fake had validated only the body, never the headers).
+      const expectedChecksum = Buffer.from(entry.sha256, 'hex').toString('base64');
+      if (req.headers['x-amz-checksum-sha256'] !== expectedChecksum) {
+        throw new HttpError(403, 'FORBIDDEN', 'x-amz-checksum-sha256 signed header missing or mismatched');
+      }
+      if (req.headers['if-none-match'] !== '*') {
+        throw new HttpError(403, 'FORBIDDEN', 'if-none-match signed header missing (the presign binds it)');
+      }
       const bytes = await this.readBody(req);
       // §5.2: the URL pins the exact Content-Length…
       if (bytes.length !== entry.size) {
@@ -1026,26 +1074,25 @@ export class FakeWalletApi {
       throw new HttpError(422, 'VALIDATION', 'blob bytes do not match the content-addressed key');
     }
     // §8.2 step 3 — APPROXIMATION: the real server CBOR-decodes the v2 token
-    // and runs the SDK's three-service token.verify against the pinned
-    // trustbase. This fake decodes the sphere TokenBlob envelope only.
-    let blob;
-    try {
-      blob = decodeTokenBlob(bytes);
-    } catch {
-      throw new HttpError(422, 'VALIDATION', 'blob is not a decodable TokenBlob');
-    }
+    // (RAW wire bytes — §5.2) and runs the SDK's three-service token.verify
+    // against the pinned trustbase. This fake reads the tokenId via the
+    // injected decoder (envelope bytes from older seeds still unwrap).
+    const resolved = this.resolveBlob(bytes);
     // §8.2 step 4: the decoded tokenId MUST match the claimed tokenId.
-    if (blob.tokenId !== entry.tokenId) {
+    if (resolved.tokenId === null) {
+      throw new HttpError(422, 'VALIDATION', 'blob does not decode to a token id');
+    }
+    if (resolved.tokenId !== entry.tokenId) {
       throw new HttpError(422, 'VALIDATION', 'decoded tokenId does not match the claimed tokenId');
     }
     // §8.2 step 5 (ownership = self) is NOT modeled — the fake has no
     // predicate decoding. APPROXIMATION, noted.
     // §8.2 step 6: decode the value to populate the index (injected decoder
     // standing in for SpherePaymentData — see FakeWalletApiOptions).
-    const assets = this.decodeAssets(blob.token);
+    const assets = this.decodeAssets(resolved.inner);
     if (assets === null) throw new HttpError(422, 'VALIDATION', 'token value does not decode');
     // The per-state hash convention: hex(SHA-256(inner token bytes)).
-    return { tokenId: entry.tokenId, key: entry.key, stateHash: hex(sha256(blob.token)), assets };
+    return { tokenId: entry.tokenId, key: entry.key, stateHash: hex(sha256(resolved.inner)), assets };
   }
 
   /**
@@ -1202,27 +1249,26 @@ export class FakeWalletApi {
       throw new HttpError(422, 'VALIDATION', 'blob bytes do not match the content-addressed key');
     }
     // step 3 — APPROXIMATION: the real server runs the SDK's three-service
-    // token.verify against the pinned trustbase; this fake decodes the sphere
-    // TokenBlob envelope only.
-    let blob;
-    try {
-      blob = decodeTokenBlob(bytes);
-    } catch {
-      throw new HttpError(422, 'VALIDATION', 'blob is not a decodable TokenBlob');
-    }
+    // token.verify against the pinned trustbase over the RAW wire bytes
+    // (§5.2); this fake reads the tokenId via the injected decoder (envelope
+    // bytes from older seeds still unwrap).
+    const resolved = this.resolveBlob(bytes);
     // step 4 — decoded tokenId MUST match the claim, and (deposits claim one)
     // the decoded final state_hash MUST match the claimed stateHash.
-    if (blob.tokenId !== tokenId) {
+    if (resolved.tokenId === null) {
+      throw new HttpError(422, 'VALIDATION', 'blob does not decode to a token id');
+    }
+    if (resolved.tokenId !== tokenId) {
       throw new HttpError(422, 'VALIDATION', 'decoded tokenId does not match the claimed tokenId');
     }
-    if (hex(sha256(blob.token)) !== stateHash) {
+    if (hex(sha256(resolved.inner)) !== stateHash) {
       throw new HttpError(422, 'VALIDATION', 'decoded state hash does not match the claimed stateHash');
     }
     // step 5 — APPROXIMATION: recipient-ownership (predicate decode) is not
     // modeled; the fake cannot read predicates. The REAL backend rejects a
     // deposit whose current owner is not the addressed recipient.
     // step 6 — decode the value to populate the entry (injected decoder).
-    const assets = this.decodeAssets(blob.token);
+    const assets = this.decodeAssets(resolved.inner);
     if (assets === null) throw new HttpError(422, 'VALIDATION', 'token value does not decode');
     // step 7 (lineage) applies to inventory writes; the mailbox append itself
     // is replay-guarded by the content-derived entry_id above.
@@ -1484,8 +1530,29 @@ export class FakeWalletApi {
       if (typeof rec.dedupKey !== 'string' || rec.dedupKey === '') {
         throw new HttpError(422, 'VALIDATION', 'record.dedupKey is required');
       }
-      if (typeof rec.type !== 'string' || typeof rec.timestamp !== 'number') {
-        throw new HttpError(422, 'VALIDATION', 'record.type and record.timestamp are required');
+      // §16 strict record shape (mirrors the REAL backend's zod schema —
+      // caught drifting by the phase-2 harness): id uuid + ts ISO datetime,
+      // never `timestamp`; type is the §16 enum; hex-shaped tokenId/pubkey.
+      if (typeof rec.id !== 'string' || !UUID_RE.test(rec.id)) {
+        throw new HttpError(422, 'VALIDATION', 'record.id must be a uuid');
+      }
+      if (typeof rec.type !== 'string' || !['SENT', 'RECEIVED', 'MINT'].includes(rec.type)) {
+        throw new HttpError(422, 'VALIDATION', "record.type must be 'SENT' | 'RECEIVED' | 'MINT'");
+      }
+      if (typeof rec.ts !== 'string' || Number.isNaN(Date.parse(rec.ts))) {
+        throw new HttpError(422, 'VALIDATION', 'record.ts must be an ISO-8601 datetime');
+      }
+      if ('timestamp' in rec) {
+        throw new HttpError(422, 'VALIDATION', "Unrecognized key(s) in object: 'timestamp'");
+      }
+      if (rec.tokenId !== undefined && (typeof rec.tokenId !== 'string' || !/^(?:[0-9a-f]{2}){1,64}$/.test(rec.tokenId))) {
+        throw new HttpError(422, 'VALIDATION', 'record.tokenId must be a lowercase-hex token id');
+      }
+      if (
+        rec.counterpartyPubkey !== undefined &&
+        (typeof rec.counterpartyPubkey !== 'string' || !/^0[23][0-9a-f]{64}$/.test(rec.counterpartyPubkey))
+      ) {
+        throw new HttpError(422, 'VALIDATION', 'record.counterpartyPubkey must be a 33-byte compressed pubkey');
       }
       if (!Array.isArray(rec.assets)) throw new HttpError(422, 'VALIDATION', 'record.assets must be an array');
       for (const a of rec.assets as { coinId?: unknown; amount?: unknown }[]) {
@@ -1513,7 +1580,7 @@ export class FakeWalletApi {
     this.json(res, 200, {});
   }
 
-  /** §10/§16: newest-first, opaque keyset cursor over (timestamp, dedupKey). */
+  /** §10/§16: newest-first, opaque keyset cursor over (ts, dedupKey); the §16 page shape. */
   private handleHistoryGet(req: http.IncomingMessage, res: http.ServerResponse, url: URL): void {
     const session = this.authenticate(req);
     const owner = this.owner(session.pubkey);
@@ -1521,15 +1588,19 @@ export class FakeWalletApi {
     const limitRaw = url.searchParams.get('limit');
     const limit = limitRaw !== null ? Math.max(1, Math.min(Number(limitRaw), this.pageLimit)) : this.pageLimit;
 
-    const keyOf = (rec: Record<string, unknown>): string =>
-      `${String(rec.timestamp).padStart(16, '0')}:${rec.dedupKey as string}`;
+    const keyOf = (rec: Record<string, unknown>): string => `${rec.ts as string}:${rec.dedupKey as string}`;
     const sorted = [...owner.history.values()].sort((a, b) => (keyOf(a) < keyOf(b) ? 1 : -1));
     const filtered = before !== null ? sorted.filter((rec) => keyOf(rec) < before) : sorted;
     const page = filtered.slice(0, limit);
     const hasMore = filtered.length > page.length;
+    // §16 page shape (mirrors the real backend): records + more + cursor
+    // (string | null) + syncEpoch — `nextBefore` never existed on the wire
+    // (caught by the phase-2 harness).
     this.json(res, 200, {
       records: page,
-      ...(hasMore && page.length > 0 ? { nextBefore: keyOf(page[page.length - 1]) } : {}),
+      more: hasMore,
+      cursor: hasMore && page.length > 0 ? keyOf(page[page.length - 1]) : null,
+      syncEpoch: this.syncEpoch.toString(),
     });
   }
 

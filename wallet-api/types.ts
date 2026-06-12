@@ -201,12 +201,18 @@ export interface MailboxClaimResult {
 export interface HistoryWireRecord {
   /** Client dedup key — POST is idempotent by it. */
   dedupKey: string;
+  /** Client-generated record id (UUID — §16). */
+  id: string;
+  /** §16 enum: 'SENT' | 'RECEIVED' | 'MINT'. */
   type: string;
-  timestamp: number;
+  /** ISO-8601 timestamp with offset (§16 `ts`). */
+  ts: string;
   /** Decimal-string amounts (§11). */
   assets: { coinId: string; amount: string }[];
   transferId?: string;
+  /** Genesis-stable token id, lowercase hex (§16 — never a `v2_…` UI id). */
   tokenId?: string;
+  /** 33-byte compressed secp256k1 pubkey, lowercase hex (§16). */
   counterpartyPubkey?: string;
   /** S6 envelope. */
   memo?: string;
@@ -217,8 +223,10 @@ export interface HistoryWireRecord {
 /** `GET /v1/history` page (§16): newest-first, opaque keyset cursor. */
 export interface HistoryPage {
   records: HistoryWireRecord[];
-  /** Pass as `before` to fetch the next (older) page; absent when drained. */
-  nextBefore?: string;
+  more: boolean;
+  /** Pass as `before` for the next (older) page; null on the last page (§16). */
+  cursor: string | null;
+  syncEpoch: bigint;
 }
 
 // ── payment requests (§10/§16) ────────────────────────────────────────────────

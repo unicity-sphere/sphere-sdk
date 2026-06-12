@@ -48,3 +48,21 @@ export function decodeTokenBlob(bytes: Uint8Array): TokenBlob {
     token: CborDeserializer.decodeByteString(fields[3]),
   };
 }
+
+/**
+ * The wallet-api WIRE bytes for a blob (ARCHITECTURE §5.2/§8.2): the backend
+ * stores, content-addresses and validates the INNER `token` bytes (the v2
+ * `Token.toCBOR()` form — `Token.fromCBOR` at §8.2 step 3). The sphere-private
+ * 39051 envelope never crosses the §16 API. Tolerant on input: envelope bytes
+ * unwrap to their inner `token` bytes; anything else is already wire format
+ * and passes through. (The phase-2 harness caught the envelope leaking onto
+ * the wire — the real backend 422s it at §8.2 step 3 with "Invalid CBOR tag
+ * for Token: 39051"; only the test fake's matching wrongness had masked it.)
+ */
+export function unwrapTokenBlobBytes(bytes: Uint8Array): Uint8Array {
+  try {
+    return decodeTokenBlob(bytes).token;
+  } catch {
+    return bytes;
+  }
+}

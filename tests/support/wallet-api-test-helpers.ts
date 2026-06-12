@@ -40,8 +40,12 @@ export function makeTestToken(opts: { tokenId?: string; coinId?: string; amount?
     opts.tokenId ?? `${tokenCounter.toString(16).padStart(8, '0')}${'ab'.repeat(28)}`;
   const coinId = opts.coinId ?? 'c0'.repeat(32);
   const amount = opts.amount ?? 1000n;
+  // Self-describing inner bytes (tokenId included): the wallet-api WIRE
+  // carries the INNER bytes (§5.2/§8.2 — never the 39051 envelope), so the
+  // fake world's raw-bytes derivations need the id in-band, like the real
+  // SDK token carries its own id.
   const inner = new TextEncoder().encode(
-    JSON.stringify({ assets: [{ coinId, amount: amount.toString() }], salt: tokenCounter })
+    JSON.stringify({ tokenId, assets: [{ coinId, amount: amount.toString() }], salt: tokenCounter })
   );
   const blob: TokenBlob = { v: 1, network: 3, tokenId, token: inner };
   const bytes = encodeTokenBlob(blob);
@@ -103,7 +107,17 @@ export function testIdentity(n: number): { privateKey: string; chainPubkey: stri
  * the REAL SDK derivation is pinned by delivery-keys.test.ts + the harness.
  */
 export function fakeDeliveryKeys(blobBytes: Uint8Array): Promise<{ tokenId: string; stateHash: string }> {
-  const blob = decodeTokenBlob(blobBytes);
-  const hex = Array.from(sha256(blob.token), (b) => b.toString(16).padStart(2, '0')).join('');
-  return Promise.resolve({ tokenId: blob.tokenId, stateHash: hex });
+  // Tolerant like the real derivation (token-engine/blob-keys.ts): envelope
+  // bytes (the cross-port blob form) or raw wire bytes (§5.2/§8.2 — what the
+  // wallet-api serves) derive the identical pair for the same token.
+  try {
+    const blob = decodeTokenBlob(blobBytes);
+    const hex = Array.from(sha256(blob.token), (b) => b.toString(16).padStart(2, '0')).join('');
+    return Promise.resolve({ tokenId: blob.tokenId, stateHash: hex });
+  } catch {
+    const parsed = JSON.parse(new TextDecoder().decode(blobBytes)) as { tokenId?: unknown };
+    if (typeof parsed.tokenId !== 'string') throw new Error('fakeDeliveryKeys: bytes carry no tokenId');
+    const hex = Array.from(sha256(blobBytes), (b) => b.toString(16).padStart(2, '0')).join('');
+    return Promise.resolve({ tokenId: parsed.tokenId, stateHash: hex });
+  }
 }
