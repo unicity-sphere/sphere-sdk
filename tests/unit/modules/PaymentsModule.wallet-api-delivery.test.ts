@@ -23,7 +23,7 @@ import type { FullIdentity } from '../../../types';
 import type { TransportProvider } from '../../../transport';
 import type { OracleProvider } from '../../../oracle';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase, HistoryRecord } from '../../../storage';
-import { FakeTokenEngine, decodeFakeTokenAssets } from '../token-engine/FakeTokenEngine';
+import { FakeTokenEngine, decodeFakeTokenAssets, decodeFakeTokenId } from '../token-engine/FakeTokenEngine';
 import { FakeWalletApi } from '../../support/fake-wallet-api';
 import { MemoryKeyValueStore, testIdentity } from '../../support/wallet-api-test-helpers';
 import { WalletApiClient } from '../../../wallet-api';
@@ -130,7 +130,7 @@ afterEach(async () => {
 });
 
 async function startFake(): Promise<{ fake: FakeWalletApi; baseUrl: string }> {
-  const fake = new FakeWalletApi({ decodeAssets: decodeFakeTokenAssets });
+  const fake = new FakeWalletApi({ decodeAssets: decodeFakeTokenAssets, decodeTokenId: decodeFakeTokenId });
   const baseUrl = await fake.start();
   cleanups.push(() => fake.stop());
   return { fake, baseUrl };

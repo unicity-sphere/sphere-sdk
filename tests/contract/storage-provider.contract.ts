@@ -79,13 +79,16 @@ export function describeStorageProviderContract(
       expect(view.cursor >= i1!.seq && view.cursor >= i2!.seq).toBe(true);
     });
 
-    it('getToken returns the decoded blob for a stored token', async () => {
+    it('getToken returns the stored token (inner bytes byte-exact)', async () => {
       const t = makeTestToken();
       await ctx.seed([t]);
       const blob = await ctx.provider.getToken(t.tokenId);
       expect(blob.tokenId).toBe(t.tokenId);
       expect(blob.v).toBe(t.blob.v);
-      expect(blob.network).toBe(t.blob.network);
+      // The INNER token bytes are the §5.2 content and round-trip byte-exact.
+      // Envelope metadata (`network`) is provider-dependent: local whole-blob
+      // providers preserve it, while the wallet-api rail stores RAW wire
+      // bytes (the engine re-derives network from the decoded token).
       expect(Array.from(blob.token)).toEqual(Array.from(t.blob.token));
     });
 

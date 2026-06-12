@@ -27,6 +27,8 @@
  * backstop.
  */
 
+import { sha256 } from '@noble/hashes/sha2.js';
+
 import { signMessage } from '../core/crypto';
 import { WalletApiError } from './errors';
 import { verifyChallengeTemplate } from './challenge';
@@ -108,6 +110,13 @@ function assertSecureBaseUrl(baseUrl: string): URL {
     );
   }
   return url;
+}
+
+/** Platform-neutral bytes→base64 (browser btoa + Node ≥16 global btoa). */
+function bytesToBase64(bytes: Uint8Array): string {
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
 }
 
 function defaultWebSocketFactory(url: string): import('./types').WebSocketLike {
@@ -376,13 +385,23 @@ export class WalletApiClient {
    * Upload blob bytes to a signed PUT URL. A `412 Precondition Failed` means
    * the identical blob already exists (content addressing, `If-None-Match: *`
    * — §5.2) and is treated as success.
+   *
+   * The §5.2 presign binds `x-amz-checksum-sha256` and `if-none-match` (plus
+   * `content-length`) as SIGNED HEADERS — a real S3 endpoint rejects the
+   * SigV4 signature unless the uploader sends them verbatim. (Caught by the
+   * phase-2 harness on first contact with real MinIO — the in-process fake
+   * had only validated the body, not the signed headers.)
    */
   async uploadBlob(putUrl: string, bytes: Uint8Array): Promise<void> {
     let res: FetchResponseLike;
     try {
       res = await this.fetchFn(putUrl, {
         method: 'PUT',
-        headers: { 'content-type': 'application/octet-stream' },
+        headers: {
+          'content-type': 'application/octet-stream',
+          'x-amz-checksum-sha256': bytesToBase64(sha256(bytes)),
+          'if-none-match': '*',
+        },
         body: bytes,
       });
     } catch (err) {

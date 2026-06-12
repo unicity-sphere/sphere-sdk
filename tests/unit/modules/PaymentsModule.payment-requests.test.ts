@@ -21,7 +21,7 @@ import type { FullIdentity, IncomingPaymentRequest, PaymentRequestResponse } fro
 import type { TransportProvider } from '../../../transport';
 import type { OracleProvider } from '../../../oracle';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase, HistoryRecord } from '../../../storage';
-import { FakeTokenEngine, decodeFakeTokenAssets } from '../token-engine/FakeTokenEngine';
+import { FakeTokenEngine, decodeFakeTokenAssets, decodeFakeTokenId } from '../token-engine/FakeTokenEngine';
 import { FakeWalletApi } from '../../support/fake-wallet-api';
 import { MemoryKeyValueStore, testIdentity } from '../../support/wallet-api-test-helpers';
 import { WalletApiClient } from '../../../wallet-api';
@@ -131,7 +131,7 @@ afterEach(async () => {
 });
 
 async function startFake(): Promise<{ fake: FakeWalletApi; baseUrl: string }> {
-  const fake = new FakeWalletApi({ decodeAssets: decodeFakeTokenAssets });
+  const fake = new FakeWalletApi({ decodeAssets: decodeFakeTokenAssets, decodeTokenId: decodeFakeTokenId });
   const baseUrl = await fake.start();
   cleanups.push(() => fake.stop());
   return { fake, baseUrl };
@@ -369,7 +369,7 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
   });
 
   it('the §5.5 per-payer cap surfaces as a failed result, never a throw (cap → 429 QUOTA_EXCEEDED)', async () => {
-    const fake = new FakeWalletApi({ decodeAssets: decodeFakeTokenAssets, maxPayerOpenRequests: 1 });
+    const fake = new FakeWalletApi({ decodeAssets: decodeFakeTokenAssets, decodeTokenId: decodeFakeTokenId, maxPayerOpenRequests: 1 });
     const baseUrl = await fake.start();
     cleanups.push(() => fake.stop());
     const requester = makeWalletApiWallet(baseUrl, fake.network, REQUESTER, 'pr-7');

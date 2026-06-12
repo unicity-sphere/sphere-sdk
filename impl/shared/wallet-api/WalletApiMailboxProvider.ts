@@ -38,6 +38,7 @@ import type {
   IncomingDelivery,
 } from '../../../transport/delivery-provider';
 import { composeDeliveryKeys, computeDeliveryId } from '../../../transport/delivery-provider';
+import { unwrapTokenBlobBytes } from '../../../token-engine/token-blob';
 import { deriveFieldEncryptionKey, decryptField, encryptField } from '../../../core/field-encryption';
 import { WalletApiClient, WalletApiError } from '../../../wallet-api';
 import type { KeyValueStore, MailboxEntry } from '../../../wallet-api';
@@ -173,14 +174,20 @@ export class WalletApiMailboxProvider implements DeliveryProvider {
     }
     const keys = composeDeliveryKeys(await this.deriveKeys(blob));
 
+    // §5.2/§8.2: the wallet-api wire carries the RAW token bytes — the
+    // cross-port blob argument is the sphere envelope; unwrap at the boundary
+    // (the real backend content-addresses and Token.fromCBOR's exactly these
+    // bytes; the 39051 envelope never crosses the §16 API).
+    const wire = unwrapTokenBlobBytes(blob);
+
     // Upload the finished blob (checksum-bound presigned PUT — §5.2).
-    const sha = bytesToHex(sha256(blob));
-    const urls = await this.client.getUploadUrls([{ sha256: sha, size: blob.length }]);
+    const sha = bytesToHex(sha256(wire));
+    const urls = await this.client.getUploadUrls([{ sha256: sha, size: wire.length }]);
     const upload = urls.find((u) => u.sha256 === sha);
     if (!upload) {
       throw new WalletApiError(`upload-urls response missing sha256 ${sha}`, 'PROTOCOL');
     }
-    await this.client.uploadBlob(upload.putUrl, blob); // 412 = already present = success (§5.2)
+    await this.client.uploadBlob(upload.putUrl, wire); // 412 = already present = success (§5.2)
 
     // Deposit (idempotent by entry_id — §6). The memo is S6-encrypted BEFORE
     // it leaves the device (§8.3): the operator never sees plaintext.
