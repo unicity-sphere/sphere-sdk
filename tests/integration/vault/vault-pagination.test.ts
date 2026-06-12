@@ -85,6 +85,10 @@ describe('paginated state load', () => {
           calls += 1;
           return calls === 2 ? { ...page, cursor: since - 1, more: false } : page;
         },
+        appendHistory: (records) => inner.appendHistory(records),
+        historySince: (since) => inner.historySince(since),
+        deleteNonce: () => inner.deleteNonce(),
+        deleteAccount: (nonce, sig) => inner.deleteAccount(nonce, sig),
       };
     };
 

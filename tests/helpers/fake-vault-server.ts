@@ -30,12 +30,20 @@
  * no provider changes.
  */
 
+import { randomUUID } from 'node:crypto';
 import { recoverPubkeyFromSignature, verifySignedMessage, signMessage } from '../../core/crypto';
 import { epochCanon } from '../../vault-aead/canon';
 import type { VaultEntryPayload } from '../../vault-aead/entry';
 import type {
+  AccountDeleteResponse,
   AuthTokens,
   ChallengeResponse,
+  DeleteNonceResponse,
+  HistoryAppendRecord,
+  HistoryAppendResponse,
+  HistoryRejection,
+  HistorySinceResponse,
+  HistoryStateRecord,
   PatchOp,
   PatchRejection,
   PatchResponse,
@@ -53,6 +61,11 @@ export const SERVER_SIGN_PRIV = 'a'.repeat(64);
 const AUTH_PREFIX = 'unicity:vault:auth:v1\n';
 const CHALLENGE_TTL_MS = 5 * 60_000;
 const DEFAULT_PAGE_LIMIT = 1000;
+const DELETE_NONCE_TTL_MS = 5 * 60_000;
+
+/** REAL `deleteCanon` (account.service.ts:11) — `delete:v1`, NOT `account-delete:v1`. */
+const deleteCanon = (net: string, ownerId: string, nonce: string): string =>
+  `unicity:vault:delete:v1\n${net}\n${ownerId}\n${nonce}`;
 
 let counter = 0;
 const uniq = (p: string): string => `${p}-${++counter}-${Math.random().toString(36).slice(2)}`;
@@ -84,6 +97,22 @@ interface EntryRow {
   seq: number;
 }
 
+/** Stored history row (mirrors `HistoryRec`). */
+interface HistoryRow {
+  ownerId: string;
+  dedupKey: string;
+  seq: number;
+  payload: VaultEntryPayload;
+  createdAt: Date;
+}
+
+/** Account-delete nonce (mirrors `DeleteNonceDoc`) — single-use, owner-bound. */
+interface DeleteNonceRow {
+  ownerId: string;
+  nonce: string;
+  expiresAt: number;
+}
+
 export interface FakeVaultServerOptions {
   network?: string;
   pageLimit?: number;
@@ -101,8 +130,14 @@ export class FakeVaultServer {
   private readonly nonces = new Map<string, NonceRow>();
   private readonly sessions: SessionRow[] = [];
   private readonly entries: EntryRow[] = [];
+  private readonly historyRows: HistoryRow[] = [];
+  private readonly deleteNonces = new Map<string, DeleteNonceRow>();
+  /** Owners whose account has been deleted (purge armed). */
+  private readonly deleted = new Set<string>();
   /** Per-owner monotonic seq allocator (the `/state` pagination watermark). */
   private readonly seqCounter = new Map<string, number>();
+  /** Per-owner history-seq allocator (the `/history` pagination watermark). */
+  private readonly historySeqCounter = new Map<string, number>();
   /** Per-owner commit counter (the PATCH-response `cursor`). */
   private readonly cursorCounter = new Map<string, number>();
 
@@ -112,6 +147,8 @@ export class FakeVaultServer {
   private storageFull = false;
   /** Per-key byte cap for the `entry_too_large` path; undefined = unbounded. */
   private maxEntryBytes: number | undefined;
+  /** Per-owner history record cap (`history_full`); undefined = unbounded. */
+  private maxOwnerHistory: number | undefined;
 
   /** Per-endpoint call log — tests assert request bodies and call counts. */
   readonly calls: {
@@ -121,7 +158,14 @@ export class FakeVaultServer {
     logout: string[];
     patch: PatchOp[][];
     state: number[];
-  } = { challenge: [], verify: [], refresh: [], logout: [], patch: [], state: [] };
+    historyAppend: HistoryAppendRecord[][];
+    historySince: number[];
+    deleteNonce: string[];
+    deleteAccount: Array<{ nonce: string; signature: string }>;
+  } = {
+    challenge: [], verify: [], refresh: [], logout: [], patch: [], state: [],
+    historyAppend: [], historySince: [], deleteNonce: [], deleteAccount: [],
+  };
 
   constructor(opts: FakeVaultServerOptions | string = {}) {
     const o = typeof opts === 'string' ? { network: opts } : opts;
@@ -144,6 +188,10 @@ export class FakeVaultServer {
     return {
       patchEntries: (ops) => Promise.resolve(this.patchEntries(ownerId, ops)),
       getState: (since) => Promise.resolve(this.getState(ownerId, since)),
+      appendHistory: (records) => Promise.resolve(this.appendHistory(ownerId, records)),
+      historySince: (since) => Promise.resolve(this.historySince(ownerId, since)),
+      deleteNonce: () => Promise.resolve(this.deleteNonce(ownerId)),
+      deleteAccount: (nonce, signature) => Promise.resolve(this.deleteAccount(ownerId, nonce, signature)),
     };
   }
 
@@ -314,6 +362,88 @@ export class FakeVaultServer {
     return signMessage(SERVER_SIGN_PRIV, epochCanon(this.network, epoch));
   }
 
+  // === HISTORY (POST/GET /v1/history) =======================================
+
+  /**
+   * Idempotent append (mirrors `history.service.ts`): a duplicate `dedupKey` is
+   * NOT inserted but still counted `accepted`; oversize → `record_too_large`; the
+   * per-owner count cap → `history_full`. Always 200 (status stripped).
+   */
+  private appendHistory(ownerId: string, records: HistoryAppendRecord[]): HistoryAppendResponse {
+    this.calls.historyAppend.push(records);
+    const rejected: HistoryRejection[] = [];
+    let accepted = 0;
+    let count = this.historyRows.filter((r) => r.ownerId === ownerId).length;
+    for (const rec of records) {
+      if (this.payloadBytes(rec.payload) > (this.maxEntryBytes ?? Infinity)) {
+        rejected.push({ dedupKey: rec.dedupKey, reason: 'record_too_large' });
+        continue;
+      }
+      if (count >= (this.maxOwnerHistory ?? Infinity)) {
+        rejected.push({ dedupKey: rec.dedupKey, reason: 'history_full' });
+        continue;
+      }
+      if (this.appendHistoryRow(ownerId, rec)) count += 1;
+      accepted += 1;
+    }
+    return { accepted, rejected };
+  }
+
+  /** Append a history row; returns true when a NEW row was inserted (idempotent). */
+  private appendHistoryRow(ownerId: string, rec: HistoryAppendRecord): boolean {
+    const exists = this.historyRows.some((r) => r.ownerId === ownerId && r.dedupKey === rec.dedupKey);
+    if (exists) return false;
+    this.historyRows.push({
+      ownerId, dedupKey: rec.dedupKey, payload: rec.payload,
+      seq: this.nextHistorySeq(ownerId), createdAt: new Date(),
+    });
+    return true;
+  }
+
+  /** `GET /v1/history?since=<seq>` — rows with `seq > since`, page-limited by seq. */
+  private historySince(ownerId: string, since: number): HistorySinceResponse {
+    this.calls.historySince.push(since);
+    const rows = this.historyRows
+      .filter((r) => r.ownerId === ownerId && r.seq > since)
+      .sort((a, b) => a.seq - b.seq)
+      .slice(0, this.pageLimit);
+    return { records: rows.map(toHistoryRecord) };
+  }
+
+  // === ACCOUNT (delete-nonce + DELETE /v1/account) ==========================
+
+  /** Issue a fresh single-use, owner-bound delete nonce (5-min TTL). */
+  private deleteNonce(ownerId: string): DeleteNonceResponse {
+    this.calls.deleteNonce.push(ownerId);
+    const nonce = randomUUID();
+    this.deleteNonces.set(nonce, { ownerId, nonce, expiresAt: Date.now() + DELETE_NONCE_TTL_MS });
+    return { nonce };
+  }
+
+  /**
+   * Confirm deletion (mirrors `account.service.ts`): consume the nonce (single-use,
+   * owner-bound), verify the fresh signature over the REAL `delete:v1` template,
+   * and on success arm the purge. A bad/absent/stale signature → `{ok:false}` (401).
+   */
+  private deleteAccount(ownerId: string, nonce: string, signature: string): AccountDeleteResponse {
+    this.calls.deleteAccount.push({ nonce, signature });
+    const row = this.deleteNonces.get(nonce);
+    this.deleteNonces.delete(nonce); // single-use
+    if (!row || row.ownerId !== ownerId || Date.now() > row.expiresAt) return { ok: false };
+    const msg = deleteCanon(this.network, ownerId, nonce);
+    if (!this.verifyDelete(msg, signature, ownerId)) return { ok: false };
+    this.deleted.add(ownerId);
+    return { ok: true };
+  }
+
+  private verifyDelete(msg: string, signature: string, ownerId: string): boolean {
+    try {
+      return verifySignedMessage(msg, signature, ownerId);
+    } catch {
+      return false;
+    }
+  }
+
   // === seq / cursor allocators ==============================================
 
   private nextSeq(ownerId: string): number {
@@ -325,6 +455,12 @@ export class FakeVaultServer {
   private bumpCursor(ownerId: string): number {
     const next = (this.cursorCounter.get(ownerId) ?? 0) + 1;
     this.cursorCounter.set(ownerId, next);
+    return next;
+  }
+
+  private nextHistorySeq(ownerId: string): number {
+    const next = (this.historySeqCounter.get(ownerId) ?? 0) + 1;
+    this.historySeqCounter.set(ownerId, next);
     return next;
   }
 
@@ -344,6 +480,21 @@ export class FakeVaultServer {
   /** Set the per-entry byte cap (oversize → `entry_too_large`). */
   setMaxEntryBytes(max: number | undefined): void {
     this.maxEntryBytes = max;
+  }
+
+  /** Set the per-owner history record cap (`history_full`). */
+  setMaxOwnerHistory(max: number | undefined): void {
+    this.maxOwnerHistory = max;
+  }
+
+  /** Number of stored history rows for an owner (assertions). */
+  historyCount(ownerId: string): number {
+    return this.historyRows.filter((r) => r.ownerId === ownerId).length;
+  }
+
+  /** True once an owner's account has been deleted (assertions). */
+  isDeleted(ownerId: string): boolean {
+    return this.deleted.has(ownerId);
   }
 
   /** Number of live entries for an owner (assertions). */
@@ -382,4 +533,11 @@ const toStateEntry = (e: EntryRow): StateEntry => ({
   payload: e.payload,
   deleted: e.deleted,
   seq: e.seq,
+});
+
+const toHistoryRecord = (r: HistoryRow): HistoryStateRecord => ({
+  dedupKey: r.dedupKey,
+  seq: r.seq,
+  payload: r.payload,
+  createdAt: r.createdAt.toISOString(),
 });

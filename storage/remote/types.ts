@@ -116,6 +116,60 @@ export interface StateResponse {
   entries: StateEntry[];
 }
 
+// =============================================================================
+// History wire (DESIGN §5.6) — single-channel client-asserted log
+// =============================================================================
+
+/** One client-asserted history record on a `POST /v1/history` batch. */
+export interface HistoryAppendRecord {
+  dedupKey: string;
+  /** AEAD-sealed `HistoryRecord` JSON, like a vault entry payload. */
+  payload: VaultEntryPayload;
+}
+
+/** Why a history record was rejected (mirrors the real `HistoryReject`). */
+export type HistoryRejectReason = 'record_too_large' | 'history_full';
+
+/** One rejected record surfaced in the append response. */
+export interface HistoryRejection {
+  dedupKey: string;
+  reason: HistoryRejectReason;
+}
+
+/** `POST /v1/history` response — `accepted` counts inserts + idempotent dups. */
+export interface HistoryAppendResponse {
+  accepted: number;
+  rejected: HistoryRejection[];
+}
+
+/** One stored history row on a `GET /v1/history?since=` page. */
+export interface HistoryStateRecord {
+  dedupKey: string;
+  seq: number;
+  payload: VaultEntryPayload;
+  /** ISO-8601 (the server serializes a Date). */
+  createdAt: string;
+}
+
+/** `GET /v1/history?since=<seq>` response. No `more` flag — loop until `< PAGE_LIMIT`. */
+export interface HistorySinceResponse {
+  records: HistoryStateRecord[];
+}
+
+// =============================================================================
+// Account wire (DESIGN §7.4) — fresh-signature-gated deletion
+// =============================================================================
+
+/** `POST /v1/account/delete-nonce` response — a fresh single-use, owner-bound nonce. */
+export interface DeleteNonceResponse {
+  nonce: string;
+}
+
+/** `DELETE /v1/account {nonce, signature}` response. */
+export interface AccountDeleteResponse {
+  ok: boolean;
+}
+
 /**
  * The authenticated vault data seam. The caller (`ownerId = chainPubkey`) is
  * implied by how the client was obtained. Each method is one `/v1/*` endpoint.
@@ -125,4 +179,12 @@ export interface VaultHttpClient {
   patchEntries(ops: PatchOp[]): Promise<PatchResponse>;
   /** `GET /v1/state?since=<cursor>`. */
   getState(since: number): Promise<StateResponse>;
+  /** `POST /v1/history {records}` — idempotent append; 200 with `{accepted, rejected}`. */
+  appendHistory(records: HistoryAppendRecord[]): Promise<HistoryAppendResponse>;
+  /** `GET /v1/history?since=<seq>` — seq-paginated; loop until a short page. */
+  historySince(since: number): Promise<HistorySinceResponse>;
+  /** `POST /v1/account/delete-nonce` — a fresh single-use delete nonce. */
+  deleteNonce(): Promise<DeleteNonceResponse>;
+  /** `DELETE /v1/account {nonce, signature}` — fresh-sig gated; 401 → `{ok:false}`. */
+  deleteAccount(nonce: string, signature: string): Promise<AccountDeleteResponse>;
 }

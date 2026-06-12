@@ -43,6 +43,10 @@ function gatedClient(inner: VaultHttpClient, onPatch: () => Promise<void>): Vaul
       return inner.patchEntries(ops);
     },
     getState: (since): Promise<StateResponse> => inner.getState(since),
+    appendHistory: (records) => inner.appendHistory(records),
+    historySince: (since) => inner.historySince(since),
+    deleteNonce: () => inner.deleteNonce(),
+    deleteAccount: (nonce, sig) => inner.deleteAccount(nonce, sig),
   };
 }
 

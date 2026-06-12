@@ -88,6 +88,10 @@ describe('initialize() opens the flush gate', () => {
           if (calls === 1) return Promise.reject(new Error('transient /state failure'));
           return inner.getState(since);
         },
+        appendHistory: (records) => inner.appendHistory(records),
+        historySince: (since) => inner.historySince(since),
+        deleteNonce: () => inner.deleteNonce(),
+        deleteAccount: (nonce, sig) => inner.deleteAccount(nonce, sig),
       };
     };
     const provider = makeProvider(server, { httpClientFactory: wrap });

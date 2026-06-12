@@ -46,6 +46,7 @@ import {
   openReservedAddress,
   RESERVED_ADDRESS_FORMAT_VERSION,
 } from './reserved-address';
+import { sealHistoryRecord, openHistoryRecord } from './history-codec';
 import { deriveDirectAddress } from '../../token-engine/identity';
 import type {
   PatchOp,
@@ -138,6 +139,13 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
    */
   private identityEpoch = 0;
 
+  /** dedupKeys already POSTed to `/v1/history` (the pushed-set, Task 7.4). */
+  private readonly pushedHistory = new Set<string>();
+  /** The history-seq watermark for `GET /v1/history?since=` (Task 7.4). */
+  private historyCursor = 0;
+  /** Decrypted history records recovered on load, by dedupKey (contract history ops). */
+  private readonly localHistory = new Map<string, HistoryRecord>();
+
   constructor(config: RemoteTokenStorageConfig) {
     this.config = config;
     this.delta = new LoadDeltaTracker({
@@ -179,6 +187,9 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     this.serverCursor = 0;
     this.restoredAddress = null;
     this.initialLoadDone = false;
+    this.pushedHistory.clear();
+    this.localHistory.clear();
+    this.historyCursor = 0;
     this.auth = new VaultApiClient({
       network: this.config.network,
       chainPubkey: identity.chainPubkey,
@@ -252,6 +263,7 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
       const ops = this.planFlush(localData);
       const reserved = await this.planReservedAddress();
       this.assertEpoch(epoch); // re-check after the (async) reserved-address derive
+      await this.pushHistory(localData, epoch); // single-channel history (Task 7.4)
       if (ops.length === 0 && !reserved) return this.cleanResult(localData, 0, 0, 0);
       return await this.flush(localData, ops, reserved, epoch);
     } catch (error) {
@@ -259,6 +271,31 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
       this.emit('sync:error', undefined, message);
       return { success: false, added: 0, removed: 0, conflicts: 0, error: message };
     }
+  }
+
+  /**
+   * Single-channel history (Task 7.4): diff the `_history` dedupKeys vs the pushed
+   * set and POST only NEW records (each AEAD-sealed). `appendHistory` is idempotent
+   * server-side, so a duplicate dedupKey is accepted (not an error) — only a real
+   * failure rejects, and a real error rethrows up the flush path.
+   */
+  private async pushHistory(localData: TData, epoch: number): Promise<void> {
+    const history = localData._history ?? [];
+    const fresh = history.filter((r) => !this.pushedHistory.has(r.dedupKey));
+    if (fresh.length === 0) return;
+    const records = fresh.map((r) => ({ dedupKey: r.dedupKey, payload: this.sealHistory(r) }));
+    const res = await this.client().appendHistory(records);
+    this.assertEpoch(epoch); // fence after the history POST await
+    for (const r of fresh) {
+      const wasRejected = res.rejected.some((x) => x.dedupKey === r.dedupKey);
+      if (wasRejected) continue; // keep out of the pushed set → retried next flush
+      this.pushedHistory.add(r.dedupKey);
+      this.localHistory.set(r.dedupKey, r);
+    }
+  }
+
+  private sealHistory(record: HistoryRecord): { nonce: string; ct: string } {
+    return sealHistoryRecord(record, this.ownerId(), this.config.privateKey, this.config.network);
   }
 
   /**
@@ -442,7 +479,39 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     }
     this.serverCursor = since;
     await this.delta.commitBaseline(since, lastEpoch, lastEpochSig);
-    return this.materialize(pages);
+    const recovered = await this.loadHistory(); // single-channel history (Task 7.4)
+    return this.materialize(pages, recovered);
+  }
+
+  /**
+   * Pull the single-channel history log (Task 7.4). There is no `more` flag on the
+   * wire (`GET /v1/history?since=<seq>`): the client loops `since=maxSeq` until a
+   * page comes back SHORT — fewer records than the server's full page size, which
+   * we infer as the largest page seen. Each payload is decrypted to a
+   * `HistoryRecord`, merged into the local map, and marked pushed so a later flush
+   * never re-POSTs it. Returns the records recovered THIS load.
+   */
+  private async loadHistory(): Promise<HistoryRecord[]> {
+    const client = this.client();
+    const recovered: HistoryRecord[] = [];
+    let pageSize = 0; // inferred full-page size (the largest page observed)
+    for (;;) {
+      const page = await client.historySince(this.historyCursor);
+      for (const row of page.records) recovered.push(this.absorbHistoryRow(row));
+      pageSize = Math.max(pageSize, page.records.length);
+      // A short page (fewer than a full page, or empty) ends the loop.
+      if (page.records.length === 0 || page.records.length < pageSize) break;
+    }
+    return recovered;
+  }
+
+  /** Decrypt + cache one history row, marking it pushed and advancing the cursor. */
+  private absorbHistoryRow(row: { dedupKey: string; payload: { nonce: string; ct: string }; seq: number }): HistoryRecord {
+    const record = openHistoryRecord(row.dedupKey, row.payload, this.ownerId(), this.config.privateKey, this.config.network);
+    this.localHistory.set(record.dedupKey, record);
+    this.pushedHistory.add(record.dedupKey);
+    this.historyCursor = Math.max(this.historyCursor, row.seq);
+    return record;
   }
 
   private rollback(reason: string): LoadResult<TData> {
@@ -459,18 +528,21 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
    *  - EMPTY: no reserved entry has ever been seen → an `isEmpty` sentinel rides
    *    INSIDE `data` so it can never short-circuit local data (#22).
    */
-  private materialize(entries: StateEntry[]): LoadResult<TData> {
+  private materialize(entries: StateEntry[], history: HistoryRecord[]): LoadResult<TData> {
     const reserved = this.restoreReservedAddress(entries); // may throw → LOAD_FAILED
     for (const e of entries) {
       this.known.set(e.key, { version: e.version, deleted: e.deleted });
     }
-    const isEmpty = !reserved && this.restoredAddress === null && this.knownCount() === 0;
+    const isEmpty =
+      !reserved && this.restoredAddress === null && this.knownCount() === 0 && history.length === 0;
     const data: TxfStorageDataBase & { isEmpty?: boolean } = {
       _meta: { version: 1, address: this.restoredAddress ?? '', formatVersion: '2.0', updatedAt: Date.now() },
     };
+    // Attach recovered history for the existing import hook (importHistoryEntries).
+    if (history.length > 0) data._history = history;
     if (isEmpty) data.isEmpty = true;
     this.initialLoadDone = true; // the flush gate opens on a successful load (Task 7.1)
-    this.emit('storage:loaded', { entries: entries.length });
+    this.emit('storage:loaded', { entries: entries.length, history: history.length });
     return { success: true, data: data as TData, source: 'remote', timestamp: Date.now() };
   }
 
@@ -501,26 +573,50 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     for (const cb of this.listeners) cb(event);
   }
 
-  // === history (Phase 7) ====================================================
+  // === history (Task 7.4 — single channel) ==================================
 
-  async addHistoryEntry(_entry: HistoryRecord): Promise<void> {
-    throw new Error('history sync lands in Phase 7');
+  /**
+   * Append one history entry: seal + POST it to `/v1/history` (idempotent), then
+   * cache it locally and mark it pushed. A duplicate dedupKey is a no-op (idempotent
+   * server-side); a real append error rethrows.
+   */
+  async addHistoryEntry(entry: HistoryRecord): Promise<void> {
+    if (this.pushedHistory.has(entry.dedupKey)) {
+      this.localHistory.set(entry.dedupKey, entry);
+      return;
+    }
+    const res = await this.client().appendHistory([{ dedupKey: entry.dedupKey, payload: this.sealHistory(entry) }]);
+    if (res.rejected.some((r) => r.dedupKey === entry.dedupKey)) {
+      const reason = res.rejected.find((r) => r.dedupKey === entry.dedupKey)!.reason;
+      throw new Error(`vault history append rejected: ${reason}`);
+    }
+    this.pushedHistory.add(entry.dedupKey);
+    this.localHistory.set(entry.dedupKey, entry);
   }
 
+  /** All locally-known history records, newest first (recovered on load). */
   async getHistoryEntries(): Promise<HistoryRecord[]> {
-    return [];
+    return [...this.localHistory.values()].sort((a, b) => b.timestamp - a.timestamp);
   }
 
-  async hasHistoryEntry(_dedupKey: string): Promise<boolean> {
-    return false;
+  async hasHistoryEntry(dedupKey: string): Promise<boolean> {
+    return this.localHistory.has(dedupKey);
   }
 
+  /** Local-only clear (the server log is append-only and never truncated by a client). */
   async clearHistory(): Promise<void> {
-    // Phase 7
+    this.localHistory.clear();
   }
 
-  async importHistoryEntries(_entries: HistoryRecord[]): Promise<number> {
-    return 0;
+  /** Bulk-import history (skip existing dedupKeys); push each new record. Returns new count. */
+  async importHistoryEntries(entries: HistoryRecord[]): Promise<number> {
+    let imported = 0;
+    for (const entry of entries) {
+      if (this.localHistory.has(entry.dedupKey)) continue;
+      await this.addHistoryEntry(entry);
+      imported += 1;
+    }
+    return imported;
   }
 
   // === internals ============================================================
