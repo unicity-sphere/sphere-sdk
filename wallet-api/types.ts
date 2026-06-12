@@ -221,6 +221,81 @@ export interface HistoryPage {
   nextBefore?: string;
 }
 
+// ── payment requests (§10/§16) ────────────────────────────────────────────────
+
+export type PaymentRequestWireStatus = 'open' | 'paid' | 'declined' | 'expired'; // §11/§16 wire values
+
+/**
+ * One §16 payment request. `memo` is the S6 `enc1.` envelope, verbatim — it
+ * decrypts only under the REQUESTER's wallet key (S6 keys are wallet-scoped),
+ * so the payer surfaces it as absent, never as ciphertext.
+ */
+export interface PaymentRequestRecord {
+  id: string;
+  /** Per-payer gap-free, commit-ordered seq (§9/§10) — the incoming cursor unit. */
+  seq: bigint;
+  fromPubkey: string;
+  toPubkey: string;
+  assets: { coinId: string; amount: bigint }[];
+  /** S6 `enc1.` envelope, verbatim (the server never sees plaintext — §8.3). */
+  memo?: string;
+  status: PaymentRequestWireStatus;
+  /** The fulfilling send's transferId once paid; null otherwise (§16). */
+  transferId: string | null;
+  createdAt: number;
+  /** Server-owned expiry (§10) — the sweep flips overdue requests, never the client. */
+  expiresAt?: number;
+}
+
+/** `POST /v1/payment-requests` request (§16). */
+export interface CreatePaymentRequestInput {
+  /** The payer's 33-byte compressed chain pubkey (lowercase hex) — §10 addressing. */
+  toPubkey: string;
+  assets: { coinId: string; amount: bigint }[];
+  /** S6 `enc1.` envelope — encrypt client-side BEFORE calling (§8.3). */
+  memo?: string;
+  /** ms since epoch — sent as ISO-8601 (§16). */
+  expiresAt?: number;
+}
+
+/**
+ * `GET /v1/payment-requests` query (§16). The two role views carry DIFFERENT
+ * cursor families that never mix (the server 422s a mismatch): incoming is
+ * the payer's gap-free `?since=<seq>` stream; outgoing is the requester's
+ * newest-first `?before=<opaque keyset>` backfill.
+ */
+export type ListPaymentRequestsParams =
+  | { role: 'incoming'; status?: PaymentRequestWireStatus; since?: bigint }
+  | { role: 'outgoing'; status?: PaymentRequestWireStatus; before?: string };
+
+/** `GET /v1/payment-requests` page (§16), discriminated by the requested role. */
+export type PaymentRequestsPage =
+  | {
+      role: 'incoming';
+      requests: PaymentRequestRecord[];
+      more: boolean;
+      /** The §16 `?since=` seq cursor (gap-free — §9). */
+      cursor: bigint;
+      syncEpoch: bigint;
+    }
+  | {
+      role: 'outgoing';
+      requests: PaymentRequestRecord[];
+      more: boolean;
+      /** Opaque keyset for the next (older) page; null when drained (§16). */
+      cursor: string | null;
+      syncEpoch: bigint;
+    };
+
+/**
+ * `POST /v1/payment-requests/{id}/respond` body (§16): `paid` REQUIRES the
+ * fulfilling send's transferId, `declined` forbids it — the pairing is in the
+ * type, mirroring the server's validation.
+ */
+export type RespondPaymentRequestInput =
+  | { action: 'paid'; transferId: string }
+  | { action: 'declined' };
+
 /** WS wake nudge (§9): pull that stream's cursor; never a correctness dependency. */
 export interface WakeEvent {
   stream: 'inventory' | 'mailbox' | 'payment_requests';

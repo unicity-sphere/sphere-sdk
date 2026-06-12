@@ -42,6 +42,8 @@ import {
   parseIntents,
   parseInventoryPage,
   parseMailboxPage,
+  parsePaymentRequestRecord,
+  parsePaymentRequestsPage,
   parseRejectResult,
   parseUploadUrls,
   parseWakeFrame,
@@ -51,6 +53,7 @@ import type {
   ApplyDeltaRequest,
   BlobUrlEntry,
   CoinBalance,
+  CreatePaymentRequestInput,
   FetchLike,
   FetchResponseLike,
   HistoryPage,
@@ -58,9 +61,13 @@ import type {
   IntentRecord,
   InventoryPage,
   KeyValueStore,
+  ListPaymentRequestsParams,
   MailboxClaimResult,
   MailboxDepositRequest,
   MailboxPage,
+  PaymentRequestRecord,
+  PaymentRequestsPage,
+  RespondPaymentRequestInput,
   UploadUrlEntry,
   UploadUrlRequest,
   WakeCallback,
@@ -456,6 +463,71 @@ export class WalletApiClient {
     if (options.limit !== undefined) params.set('limit', String(options.limit));
     const qs = params.toString();
     return parseHistoryPage(await this.requestJson('GET', `/v1/history${qs ? `?${qs}` : ''}`));
+  }
+
+  // ── payment requests (§10/§16) ──────────────────────────────────────────────
+
+  /**
+   * `POST /v1/payment-requests` — create a request addressed to a payer (the
+   * payer's account is auto-provisioned even if they never authenticated —
+   * §4/§9; the per-payer open cap → 429, §5.5). `memo` MUST already be an S6
+   * `enc1.` envelope (§8.3) — only the requester's wallet key decrypts it.
+   */
+  async createPaymentRequest(input: CreatePaymentRequestInput): Promise<PaymentRequestRecord> {
+    return parsePaymentRequestRecord(
+      await this.requestJson('POST', '/v1/payment-requests', {
+        toPubkey: input.toPubkey,
+        // Amounts are decimal strings in every JSON body (§11).
+        assets: input.assets.map((a) => ({ coinId: a.coinId, amount: a.amount.toString() })),
+        ...(input.memo !== undefined ? { memo: input.memo } : {}),
+        ...(input.expiresAt !== undefined ? { expiresAt: new Date(input.expiresAt).toISOString() } : {}),
+      }),
+      'payment-request create response'
+    );
+  }
+
+  /**
+   * `GET /v1/payment-requests?role=…` (§16): `'incoming'` is the payer's
+   * gap-free `?since=<seq>` stream (cursor = bigint, the standard §16 since
+   * contract); `'outgoing'` is the requester's newest-first
+   * `?before=<opaque keyset>` backfill (cursor = string | null). The two
+   * cursor families never mix — the server 422s a mismatched parameter, and
+   * the parameter types make it unrepresentable here.
+   */
+  async listPaymentRequests<R extends 'incoming' | 'outgoing'>(
+    params: Extract<ListPaymentRequestsParams, { role: R }>
+  ): Promise<Extract<PaymentRequestsPage, { role: R }>> {
+    // Widened to the plain union — generic Extract<> members don't narrow.
+    const p: ListPaymentRequestsParams = params;
+    const query = new URLSearchParams();
+    query.set('role', p.role);
+    if (p.status !== undefined) query.set('status', p.status);
+    if (p.role === 'incoming') {
+      if (p.since !== undefined) query.set('since', p.since.toString());
+    } else if (p.before !== undefined) {
+      query.set('before', p.before);
+    }
+    const page = parsePaymentRequestsPage(
+      await this.requestJson('GET', `/v1/payment-requests?${query.toString()}`),
+      p.role
+    );
+    await this.noteSyncEpoch(page.syncEpoch);
+    // The codec already discriminated the page by role; Extract<> re-states
+    // the role-bound cursor family to the caller.
+    return page as Extract<PaymentRequestsPage, { role: R }>;
+  }
+
+  /**
+   * `POST /v1/payment-requests/{id}/respond` — addressee-only (§10, non-
+   * addressee → 403); only an `open` request may be responded to (else 409).
+   * `paid` REQUIRES and links the fulfilling send's transferId, `declined`
+   * carries none — the pairing is enforced by {@link RespondPaymentRequestInput}.
+   */
+  async respondPaymentRequest(id: string, response: RespondPaymentRequestInput): Promise<PaymentRequestRecord> {
+    return parsePaymentRequestRecord(
+      await this.requestJson('POST', `/v1/payment-requests/${id}/respond`, response),
+      'payment-request respond response'
+    );
   }
 
   // ── intents (E.3) ───────────────────────────────────────────────────────────
