@@ -57,8 +57,17 @@ import type {
 import { LoadDeltaTracker } from './load-delta';
 import type { LocalBaselineStore } from './load-delta';
 import type { EntryState } from './merkle';
+import { AsyncSerialQueue } from '../../impl/shared/ipfs/write-behind-buffer';
 
 const enc = (s: string): Uint8Array => new TextEncoder().encode(s);
+
+/** Thrown by the flush path when the identity epoch advanced across an await. */
+class IdentityFencedError extends Error {
+  constructor() {
+    super('vault flush aborted: identity changed mid-flush (epoch fenced)');
+    this.name = 'IdentityFencedError';
+  }
+}
 
 export interface RemoteTokenStorageConfig {
   /** Canonical network name (storage scope, AEAD/wireKey scope). */
@@ -117,6 +126,18 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
   /** The DIRECT:// address restored from the reserved meta-address entry (Task 7.2). */
   private restoredAddress: string | null = null;
 
+  /**
+   * Serialize flush / sync / shutdown so two flushes never interleave their CAS
+   * writes (Task 7.3). The same queue gates load too, so a load mid-flush waits.
+   */
+  private readonly queue = new AsyncSerialQueue();
+  /**
+   * Identity-epoch counter (Task 7.3). `setIdentity` bumps it; the flush path
+   * re-checks it after EVERY await and aborts on a mismatch, so a write keyed to
+   * the old identity can never reach the server after a switch.
+   */
+  private identityEpoch = 0;
+
   constructor(config: RemoteTokenStorageConfig) {
     this.config = config;
     this.delta = new LoadDeltaTracker({
@@ -147,7 +168,17 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
   // --- TokenStorageProvider -------------------------------------------------
 
   setIdentity(identity: FullIdentity): void {
+    // Bump the identity epoch FIRST so any in-flight flush awaiting an I/O round
+    // trip aborts the moment it next re-checks (Task 7.3) — no cross-identity write.
+    this.identityEpoch += 1;
     this.identity = identity;
+    // Switching identity resets the per-identity server view: the flush gate must
+    // re-open on the new owner's first load, and the old `known`/cursor are stale.
+    this.known.clear();
+    this.contentHash.clear();
+    this.serverCursor = 0;
+    this.restoredAddress = null;
+    this.initialLoadDone = false;
     this.auth = new VaultApiClient({
       network: this.config.network,
       chainPubkey: identity.chainPubkey,
@@ -157,6 +188,11 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     });
     this.delta.setIdentity(identity.chainPubkey);
     this.delta.setWalletPriv(this.config.privateKey);
+  }
+
+  /** Abort the flush path if the identity epoch advanced (Task 7.3). */
+  private assertEpoch(epoch: number): void {
+    if (epoch !== this.identityEpoch) throw new IdentityFencedError();
   }
 
   /**
@@ -182,7 +218,11 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
   }
 
   async shutdown(): Promise<void> {
-    this.status = 'disconnected';
+    // Route through the queue so an in-flight flush drains first (Task 7.3).
+    await this.queue.enqueue(() => {
+      this.status = 'disconnected';
+      return Promise.resolve();
+    });
   }
 
   /** `save` routes through `sync` (the vault has no local-only persistence). */
@@ -199,12 +239,21 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     if (!this.initialLoadDone) {
       return { success: true, merged: localData, added: 0, removed: 0, conflicts: 0 };
     }
+    // Capture the identity epoch BEFORE queueing; the flush aborts if it advances
+    // across any await (Task 7.3). Serialized so flushes never interleave.
+    const epoch = this.identityEpoch;
+    return this.queue.enqueue(() => this.runSync(localData, epoch));
+  }
+
+  private async runSync(localData: TData, epoch: number): Promise<SyncResult<TData>> {
     this.emit('sync:started');
     try {
+      this.assertEpoch(epoch);
       const ops = this.planFlush(localData);
       const reserved = await this.planReservedAddress();
+      this.assertEpoch(epoch); // re-check after the (async) reserved-address derive
       if (ops.length === 0 && !reserved) return this.cleanResult(localData, 0, 0, 0);
-      return await this.flush(localData, ops, reserved);
+      return await this.flush(localData, ops, reserved, epoch);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'sync failed';
       this.emit('sync:error', undefined, message);
@@ -248,10 +297,21 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
   }
 
   /** PATCH the planned ops (token ops + the optional reserved-address op). */
-  private async flush(localData: TData, ops: PlannedOp[], reserved: PatchOp | null): Promise<SyncResult<TData>> {
+  private async flush(
+    localData: TData,
+    ops: PlannedOp[],
+    reserved: PatchOp | null,
+    epoch: number,
+  ): Promise<SyncResult<TData>> {
     const wireOps = ops.map((op) => this.toWireOp(op));
     if (reserved) wireOps.push(reserved);
-    const res = await this.client().patchEntries(wireOps);
+    // Bind the client to the flush-start owner BEFORE the await so the patch can
+    // never re-target a switched identity.
+    const client = this.client();
+    const res = await client.patchEntries(wireOps);
+    // Identity fence (Task 7.3): if the identity switched across the patch await,
+    // abort WITHOUT committing local state under the wrong identity.
+    this.assertEpoch(epoch);
     if (reserved && res.applied.includes(reserved.key)) {
       this.known.set(reserved.key, { version: 1, deleted: false });
     }
@@ -259,6 +319,7 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     // Re-sign the local baseline so the wallet's OWN writes advance the signed
     // root — the next load must not see them as an unauthored delta (Task 7.1).
     await this.delta.rebaseline(this.serverCursor, this.knownAsEntryState());
+    this.assertEpoch(epoch); // re-check after the baseline persist await
     return result;
   }
 
