@@ -70,8 +70,6 @@ export class LoadDeltaTracker {
   private accState: Map<string, EntryState> | null = null;
   /** The signed baseline loaded at the start of this pass (null = first ever load). */
   private baseline: SignedBaseline | null = null;
-  /** Whether this pass observed a server-verified epoch bump (sanctioned reset). */
-  private sanctionedEpoch = false;
 
   constructor(config: LoadDeltaConfig) {
     this.config = config;
@@ -88,12 +86,18 @@ export class LoadDeltaTracker {
 
   /**
    * Begin a load pass: load + verify the persisted signed baseline and seed the
-   * accumulator from it. MUST be called once before the pagination loop.
+   * accumulator from the provider's authoritative `known` state (what it believes
+   * the server holds). MUST be called once before the pagination loop.
+   *
+   * Seeding from `known` is what makes the root gate precise: the wallet is the
+   * ONLY writer, so a clean re-load returns an EMPTY delta and the accumulator
+   * (= known) recomputes to the signed baseline root. A NON-empty delta the
+   * wallet did not author (mutation / injection) shifts the root away from the
+   * signed baseline → rollback.
    */
-  async beginLoad(): Promise<void> {
-    this.sanctionedEpoch = false;
+  async beginLoad(known: Map<string, EntryState>): Promise<void> {
     this.baseline = await this.loadBaseline();
-    this.accState = new Map();
+    this.accState = new Map(known);
     if (this.baseline && !verifyRoot(this.bindingFor(this.baseline.cursor, this.baseline.root), this.baseline.sig, this.ownerPubForVerify())) {
       // A corrupt/forged local baseline is treated as no baseline (a fresh load).
       this.baseline = null;
@@ -102,7 +106,7 @@ export class LoadDeltaTracker {
 
   /** Ingest one `/state` page: monotonicity + root gate. */
   async ingestPage(page: LoadPage): Promise<GateResult> {
-    if (this.accState === null) await this.beginLoad();
+    if (this.accState === null) await this.beginLoad(new Map());
     const epochOk = this.recogniseEpoch(page);
     const mono = this.checkMonotonic(page);
     if (!mono.ok && !epochOk) return mono;
@@ -120,9 +124,7 @@ export class LoadDeltaTracker {
     const baseEpoch = this.baseline?.epoch ?? 0;
     if (page.epoch <= baseEpoch) return false;
     const canon = epochCanon(this.config.network, page.epoch);
-    const verified = verifySignedMessage(canon, page.epochSig, this.config.vaultServerKey);
-    if (verified) this.sanctionedEpoch = true;
-    return verified;
+    return verifySignedMessage(canon, page.epochSig, this.config.vaultServerKey);
   }
 
   /** Cursor must be non-decreasing relative to the `since` it answered. */
@@ -167,18 +169,6 @@ export class LoadDeltaTracker {
     this.accState = null; // close the pass regardless of whether a baseline was persisted
   }
 
-  /**
-   * Persist a signed baseline for an EXPLICIT `known` state (used after a flush so
-   * a subsequent `load()` has a baseline to compare the delta against).
-   */
-  async baselineFromState(cursor: number, epoch: number, known: Map<string, EntryState>): Promise<void> {
-    if (!this.config.baseline || !this.walletPriv) return;
-    const root = computeRoot(known);
-    const sig = signRoot(this.walletPriv, this.bindingFor(cursor, root));
-    const baseline: SignedBaseline = { cursor, root, sig, epoch };
-    await this.config.baseline.set(this.baselineKey(), JSON.stringify(baseline));
-  }
-
   private async loadBaseline(): Promise<SignedBaseline | null> {
     if (!this.config.baseline) return null;
     const raw = await this.config.baseline.get(this.baselineKey());
@@ -196,10 +186,5 @@ export class LoadDeltaTracker {
 
   private baselineKey(): string {
     return `vault_baseline:${this.config.network}:${this.ownerId}`;
-  }
-
-  /** Whether the last pass saw a sanctioned (server-verified) epoch bump. */
-  get lastPassSanctioned(): boolean {
-    return this.sanctionedEpoch;
   }
 }

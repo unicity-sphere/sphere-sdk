@@ -48,6 +48,7 @@ import type {
 } from './types';
 import { LoadDeltaTracker } from './load-delta';
 import type { LocalBaselineStore } from './load-delta';
+import type { EntryState } from './merkle';
 
 const enc = (s: string): Uint8Array => new TextEncoder().encode(s);
 
@@ -286,7 +287,7 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
    */
   private async loadPaginated(): Promise<LoadResult<TData>> {
     const client = this.client();
-    await this.delta.beginLoad();
+    await this.delta.beginLoad(this.knownAsEntryState());
     let since = this.serverCursor;
     const pages: StateEntry[] = [];
     let lastEpochSig = '';
@@ -409,5 +410,12 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     let n = 0;
     for (const e of this.known.values()) if (!e.deleted) n += 1;
     return n;
+  }
+
+  /** Snapshot the internal last-known state as a merkle `EntryState` map. */
+  private knownAsEntryState(): Map<string, EntryState> {
+    const out = new Map<string, EntryState>();
+    for (const [wk, e] of this.known) out.set(wk, { version: e.version, deleted: e.deleted });
+    return out;
   }
 }
