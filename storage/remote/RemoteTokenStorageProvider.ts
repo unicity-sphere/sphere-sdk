@@ -173,12 +173,16 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
 
   /** Diff the TXF snapshot vs internal last-known state into a list of CAS ops. */
   private planFlush(localData: TData): PlannedOp[] {
-    const tokens = extractTokens(localData);
-    return planOps(tokens, this.known, (plainKey, value) => this.hasChanged(plainKey, value));
+    return planOps({
+      tokens: extractTokens(localData),
+      known: this.known,
+      wireKeyOf: (plainKey) => this.wireKeyFor(plainKey),
+      changed: (wk, value) => this.hasChanged(wk, value),
+    });
   }
 
-  private hasChanged(plainKey: string, value: unknown): boolean {
-    return this.contentHash.get(plainKey) !== this.hashValue(value);
+  private hasChanged(wk: string, value: unknown): boolean {
+    return this.contentHash.get(wk) !== this.hashValue(value);
   }
 
   /** PATCH the planned ops, map the response onto `SyncResult`. */
@@ -190,12 +194,11 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
 
   /** Seal one planned op into its on-wire `{key: wireKey, baseVersion, payload?, deleted?}`. */
   private toWireOp(op: PlannedOp): PatchOp {
-    const key = this.wireKeyFor(op.plainKey);
-    if (op.isDelete) return { key, baseVersion: op.baseVersion, deleted: true };
+    if (op.isDelete) return { key: op.wireKey, baseVersion: op.baseVersion, deleted: true };
     return {
-      key,
+      key: op.wireKey,
       baseVersion: op.baseVersion,
-      payload: this.sealValue(key, op.baseVersion + 1, op.value),
+      payload: this.sealValue(op.wireKey, op.baseVersion + 1, op.value),
     };
   }
 
@@ -222,12 +225,12 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     let added = 0;
     let removed = 0;
     for (const op of ops) {
-      if (!appliedKeys.has(this.wireKeyFor(op.plainKey))) continue;
+      if (!appliedKeys.has(op.wireKey)) continue;
       if (op.isDelete) {
         removed += 1;
-        this.recordDelete(op.plainKey);
+        this.recordDelete(op.wireKey);
       } else {
-        if (this.isCreate(op.plainKey)) added += 1;
+        if (this.isCreate(op.wireKey)) added += 1;
         this.recordApply(op);
       }
     }
@@ -236,24 +239,24 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     return this.cleanResult(localData, added, removed, conflicts);
   }
 
-  /** A create (counts toward `added`) is a key absent or currently tombstoned. */
-  private isCreate(plainKey: string): boolean {
-    const prev = this.known.get(plainKey);
+  /** A create (counts toward `added`) is a wireKey absent or currently tombstoned. */
+  private isCreate(wk: string): boolean {
+    const prev = this.known.get(wk);
     return !prev || prev.deleted;
   }
 
   /** Record an applied create/update in the internal last-known state. */
   private recordApply(op: PlannedOp): void {
-    const prev = this.known.get(op.plainKey);
+    const prev = this.known.get(op.wireKey);
     const version = prev ? prev.version + 1 : 1;
-    this.known.set(op.plainKey, { version, deleted: false });
-    this.contentHash.set(op.plainKey, this.hashValue(op.value));
+    this.known.set(op.wireKey, { version, deleted: false });
+    this.contentHash.set(op.wireKey, this.hashValue(op.value));
   }
 
-  private recordDelete(plainKey: string): void {
-    const prev = this.known.get(plainKey);
-    this.known.set(plainKey, { version: (prev?.version ?? 0) + 1, deleted: true });
-    this.contentHash.delete(plainKey);
+  private recordDelete(wk: string): void {
+    const prev = this.known.get(wk);
+    this.known.set(wk, { version: (prev?.version ?? 0) + 1, deleted: true });
+    this.contentHash.delete(wk);
   }
 
   private cleanResult(localData: TData, added: number, removed: number, conflicts: number): SyncResult<TData> {

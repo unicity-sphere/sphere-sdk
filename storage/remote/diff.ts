@@ -4,8 +4,13 @@
  * Maps a {@link TxfStorageDataBase} snapshot to the set of plaintext token keys
  * it carries (the dynamic `_<tokenId>` entries, excluding the reserved meta
  * slots), and computes the CAS ops needed to converge the server toward it given
- * the provider's INTERNAL last-known server state. All version/CAS bookkeeping is
- * internal (finding #29); the caller seals each op's payload separately.
+ * the provider's INTERNAL last-known server state.
+ *
+ * The last-known state is keyed by the OPAQUE wireKey — that is what `/state`
+ * reports (the server is operator-blind and never sees plaintext token ids). The
+ * diff computes `wireKey(plainKey)` for each local token to look it up, so a
+ * deleted server row (known only by its wireKey) is matched and resurrected.
+ * All version/CAS bookkeeping is internal (finding #29).
  */
 
 import type { TxfStorageDataBase } from '../storage-provider';
@@ -13,16 +18,19 @@ import type { TxfStorageDataBase } from '../storage-provider';
 /** Reserved TXF keys that are NOT token entries (never flushed as CAS rows here). */
 const RESERVED_KEYS = new Set(['_meta', '_tombstones', '_outbox', '_sent', '_invalid', '_history']);
 
-/** The provider's last-known view of one server entry. */
+/** The provider's last-known view of one server entry, keyed by wireKey. */
 export interface KnownEntry {
   /** The server version this key was last observed/applied at. */
   version: number;
   deleted: boolean;
 }
 
-/** A pending CAS op the provider must seal + PATCH. `plainKey` is pre-wire. */
+/** A pending CAS op the provider must seal + PATCH. Carries the OPAQUE wireKey. */
 export interface PlannedOp {
+  /** The plaintext token id (for content-hash bookkeeping). */
   plainKey: string;
+  /** The opaque wireKey the op targets on the wire. */
+  wireKey: string;
   baseVersion: number;
   /** false → create/update (carries a payload); true → delete (tombstone). */
   isDelete: boolean;
@@ -43,40 +51,42 @@ export function extractTokens(data: TxfStorageDataBase): Map<string, unknown> {
   return out;
 }
 
+export interface PlanOpsParams {
+  tokens: Map<string, unknown>;
+  /** Last-known server state, keyed by wireKey. */
+  known: Map<string, KnownEntry>;
+  /** Map a plaintext token id to its opaque wireKey. */
+  wireKeyOf: (plainKey: string) => string;
+  /** True when the value differs from the last-flushed content hash (skip no-op updates). */
+  changed: (wireKey: string, value: unknown) => boolean;
+}
+
 /**
  * Plan the CAS ops to converge the server from `known` toward `tokens`:
- *  - a token absent from `known` → create (`baseVersion 0`);
- *  - a token present in `known` (even as a tombstone) → re-create/update at
- *    `baseVersion 0` if the known row is deleted (delete-resurrect), else update
- *    at the known version. (We only emit an update when the value changed —
- *    callers pass already-changed values; here we re-flush every present token
- *    that is missing from the clean known map, which the provider suppresses via
- *    its content hash before calling this.)
- *  - a token in `known` (live) but absent from `tokens` → delete.
- *
- * `changed(plainKey, value)` lets the caller suppress no-op updates by comparing
- * against a content hash it persisted (returns false ⇒ skip the update op).
+ *  - a token whose wireKey is absent from `known` → create (`baseVersion 0`);
+ *  - a token whose wireKey is a known TOMBSTONE → re-create at `baseVersion 0`
+ *    AGAINST the deleted row (delete-resurrect, #16 — NOT rebased to its version);
+ *  - a token whose wireKey is a known LIVE row → update at the known version, but
+ *    only when the value changed;
+ *  - a known LIVE wireKey with no matching local token → delete.
  */
-export function planOps(
-  tokens: Map<string, unknown>,
-  known: Map<string, KnownEntry>,
-  changed: (plainKey: string, value: unknown) => boolean,
-): PlannedOp[] {
+export function planOps(params: PlanOpsParams): PlannedOp[] {
+  const { tokens, known, wireKeyOf, changed } = params;
   const ops: PlannedOp[] = [];
+  const liveWire = new Set<string>();
   for (const [plainKey, value] of tokens) {
-    const cur = known.get(plainKey);
-    if (!cur) {
-      ops.push({ plainKey, baseVersion: 0, isDelete: false, value });
-    } else if (cur.deleted) {
-      // Delete-resurrect: create AGAINST the deleted row at baseVersion 0 (#16).
-      ops.push({ plainKey, baseVersion: 0, isDelete: false, value });
-    } else if (changed(plainKey, value)) {
-      ops.push({ plainKey, baseVersion: cur.version, isDelete: false, value });
+    const wk = wireKeyOf(plainKey);
+    liveWire.add(wk);
+    const cur = known.get(wk);
+    if (!cur || cur.deleted) {
+      ops.push({ plainKey, wireKey: wk, baseVersion: 0, isDelete: false, value });
+    } else if (changed(wk, value)) {
+      ops.push({ plainKey, wireKey: wk, baseVersion: cur.version, isDelete: false, value });
     }
   }
-  for (const [plainKey, cur] of known) {
-    if (!cur.deleted && !tokens.has(plainKey)) {
-      ops.push({ plainKey, baseVersion: cur.version, isDelete: true });
+  for (const [wk, cur] of known) {
+    if (!cur.deleted && !liveWire.has(wk)) {
+      ops.push({ plainKey: '', wireKey: wk, baseVersion: cur.version, isDelete: true });
     }
   }
   return ops;
