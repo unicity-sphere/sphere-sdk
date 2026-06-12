@@ -33,12 +33,20 @@ import type {
   TokenStorageProvider,
   TxfStorageDataBase,
 } from '../storage-provider';
+import { hexToBytes } from '../../core/crypto';
 import { sealVaultEntry } from '../../vault-aead/entry';
 import { deriveVaultKey } from '../../vault-aead/derive';
 import { wireKey } from './wire-key';
 import { VaultApiClient } from './VaultApiClient';
 import { extractTokens, planOps } from './diff';
 import type { KnownEntry, PlannedOp } from './diff';
+import {
+  reservedAddressKey,
+  sealReservedAddress,
+  openReservedAddress,
+  RESERVED_ADDRESS_FORMAT_VERSION,
+} from './reserved-address';
+import { deriveDirectAddress } from '../../token-engine/identity';
 import type {
   PatchOp,
   PatchResponse,
@@ -105,6 +113,9 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
    * leaves this `false`, so an empty local snapshot can never wipe the server.
    */
   private initialLoadDone = false;
+
+  /** The DIRECT:// address restored from the reserved meta-address entry (Task 7.2). */
+  private restoredAddress: string | null = null;
 
   constructor(config: RemoteTokenStorageConfig) {
     this.config = config;
@@ -191,13 +202,34 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     this.emit('sync:started');
     try {
       const ops = this.planFlush(localData);
-      if (ops.length === 0) return this.cleanResult(localData, 0, 0, 0);
-      return await this.flush(localData, ops);
+      const reserved = await this.planReservedAddress();
+      if (ops.length === 0 && !reserved) return this.cleanResult(localData, 0, 0, 0);
+      return await this.flush(localData, ops, reserved);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'sync failed';
       this.emit('sync:error', undefined, message);
       return { success: false, added: 0, removed: 0, conflicts: 0, error: message };
     }
+  }
+
+  /**
+   * The reserved meta-address op (Task 7.2, finding #17). Sealed once, from the
+   * REAL engine identity (`deriveDirectAddress(hexToBytes(chainPubkey))`), so a
+   * fresh import restores `_meta.address` without re-deriving from tokens — the
+   * XP-invariant address survives a wipe. Returns `null` once it is on the server.
+   */
+  private async planReservedAddress(): Promise<PatchOp | null> {
+    const wk = reservedAddressKey(this.config.privateKey, this.config.network);
+    const cur = this.known.get(wk);
+    if (cur && !cur.deleted) return null; // already on the server
+    const chainPubkey = this.ownerId();
+    const directAddress = await deriveDirectAddress(hexToBytes(chainPubkey));
+    const payload = sealReservedAddress(
+      { directAddress, chainPubkey, formatVersion: RESERVED_ADDRESS_FORMAT_VERSION },
+      this.config.privateKey,
+      this.config.network,
+    );
+    return { key: wk, baseVersion: 0, payload };
   }
 
   /** Diff the TXF snapshot vs internal last-known state into a list of CAS ops. */
@@ -207,6 +239,7 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
       known: this.known,
       wireKeyOf: (plainKey) => this.wireKeyFor(plainKey),
       changed: (wk, value) => this.hasChanged(wk, value),
+      reserved: new Set([reservedAddressKey(this.config.privateKey, this.config.network)]),
     });
   }
 
@@ -214,10 +247,14 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     return this.contentHash.get(wk) !== this.hashValue(value);
   }
 
-  /** PATCH the planned ops, map the response onto `SyncResult`. */
-  private async flush(localData: TData, ops: PlannedOp[]): Promise<SyncResult<TData>> {
+  /** PATCH the planned ops (token ops + the optional reserved-address op). */
+  private async flush(localData: TData, ops: PlannedOp[], reserved: PatchOp | null): Promise<SyncResult<TData>> {
     const wireOps = ops.map((op) => this.toWireOp(op));
+    if (reserved) wireOps.push(reserved);
     const res = await this.client().patchEntries(wireOps);
+    if (reserved && res.applied.includes(reserved.key)) {
+      this.known.set(reserved.key, { version: 1, deleted: false });
+    }
     const result = this.applyPatchResult(localData, ops, res);
     // Re-sign the local baseline so the wallet's OWN writes advance the signed
     // root — the next load must not see them as an unauthored delta (Task 7.1).
@@ -352,22 +389,43 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     return { success: false, error: `vault rollback: ${reason}`, source: 'remote', timestamp: Date.now() };
   }
 
-  /** Build the TXF snapshot from the accumulated `/state` rows + adopt their versions. */
+  /**
+   * Build the TXF snapshot from the accumulated `/state` rows, adopting their
+   * versions and running the 3-state machine (Task 7.2):
+   *  - LOAD_FAILED: a corrupt reserved-address entry throws → caller returns
+   *    `success:false`, the gate stays SHUT (initialLoadDone untouched).
+   *  - POPULATED: the reserved entry decodes → `_meta.address` is restored (#17).
+   *  - EMPTY: no reserved entry has ever been seen → an `isEmpty` sentinel rides
+   *    INSIDE `data` so it can never short-circuit local data (#22).
+   */
   private materialize(entries: StateEntry[]): LoadResult<TData> {
-    const data: TxfStorageDataBase = {
-      _meta: {
-        version: 1,
-        address: this.identity?.directAddress ?? this.identity?.l1Address ?? '',
-        formatVersion: '2.0',
-        updatedAt: Date.now(),
-      },
-    };
+    const reserved = this.restoreReservedAddress(entries); // may throw → LOAD_FAILED
     for (const e of entries) {
       this.known.set(e.key, { version: e.version, deleted: e.deleted });
     }
+    const isEmpty = !reserved && this.restoredAddress === null && this.knownCount() === 0;
+    const data: TxfStorageDataBase & { isEmpty?: boolean } = {
+      _meta: { version: 1, address: this.restoredAddress ?? '', formatVersion: '2.0', updatedAt: Date.now() },
+    };
+    if (isEmpty) data.isEmpty = true;
     this.initialLoadDone = true; // the flush gate opens on a successful load (Task 7.1)
     this.emit('storage:loaded', { entries: entries.length });
     return { success: true, data: data as TData, source: 'remote', timestamp: Date.now() };
+  }
+
+  /**
+   * Find + decode the reserved meta-address entry from the page rows, caching the
+   * restored DIRECT:// address. Throws on a decrypt/verify failure (LOAD_FAILED);
+   * a missing reserved entry is fine (EMPTY / not-yet-flushed). Returns true when a
+   * reserved row was present on this page.
+   */
+  private restoreReservedAddress(entries: StateEntry[]): boolean {
+    const wk = reservedAddressKey(this.config.privateKey, this.config.network);
+    const row = entries.find((e) => e.key === wk && !e.deleted);
+    if (!row) return false;
+    const meta = openReservedAddress(row.payload, this.ownerId(), this.config.privateKey, this.config.network);
+    this.restoredAddress = meta.directAddress;
+    return true;
   }
 
   // === events ===============================================================

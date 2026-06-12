@@ -81,9 +81,11 @@ describe('CAS delete-resurrect', () => {
     // EXACTLY ONE patch call for the resurrect.
     expect(server.calls.patch.length).toBe(patchesBefore + 1);
     const ops = server.calls.patch[server.calls.patch.length - 1];
-    expect(ops).toHaveLength(1);
-    expect(ops[0].key).toBe(wkK);
-    expect(ops[0].baseVersion).toBe(0); // NOT rebased to the deleted row's version
+    // The 'k' resurrect op is present (the batch may also carry the reserved-address
+    // op on the wallet's first flush — Task 7.2).
+    const kOp = ops.find((o) => o.key === wkK)!;
+    expect(kOp).toBeDefined();
+    expect(kOp.baseVersion).toBe(0); // NOT rebased to the deleted row's version
 
     // Server converged: applied, not rejected; the row is live again at v3.
     expect(res.added).toBe(1);
