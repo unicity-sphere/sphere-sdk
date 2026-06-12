@@ -136,15 +136,17 @@ async function startFake(): Promise<{ fake: FakeWalletApi; baseUrl: string }> {
   return { fake, baseUrl };
 }
 
-/** Build a wallet over the FULL wallet-api preset (storage + delivery, custody 'inventory'). */
+/** Build a wallet over the FULL wallet-api preset (storage + delivery, custody 'inventory').
+ * Pass `kv` to share the persisted client/provider state across instances — a
+ * reloaded tab keeps its localStorage (cursor, session), not its process state. */
 function makeFullPresetWallet(
   baseUrl: string,
   network: string,
   who: { privateKey: string; chainPubkey: string },
-  deviceId: string
+  deviceId: string,
+  kv: MemoryKeyValueStore = new MemoryKeyValueStore()
 ): Wallet {
   const identity = fullIdentity(who);
-  const kv = new MemoryKeyValueStore();
   const client = new WalletApiClient({ baseUrl, network, deviceId, storage: kv });
   const tokenStorage = new WalletApiTokenStorageProvider({ client, stateStore: kv });
   tokenStorage.setIdentity(identity);
@@ -530,5 +532,57 @@ describe('E.3 resume — open intents re-run deterministically at sign-in', () =
     expect(fake.getIntent(SENDER.chainPubkey, transferId)).toMatchObject({ status: 'completed' });
     const sent = fake.getHistoryRecords(SENDER.chainPubkey).find((r) => r.dedupKey === `SENT_transfer_${transferId}`);
     expect(sent).toBeDefined();
+  });
+});
+
+describe('reload (tab refresh) — durable cursor, rebuilt view (#521)', () => {
+  it('a reloaded provider+module instance full-pulls its FIRST sync and renders the full wallet; deltas resume within the session; a third reload is idempotent', async () => {
+    const { fake, baseUrl } = await startFake();
+    const kv = new MemoryKeyValueStore(); // the SHARED persisted stateStore — survives the "refresh"
+    const cursorKey = `wallet-api-storage:cursor:${fake.network}:${SENDER.chainPubkey}`;
+
+    // Session 1 — the full mint-and-send flow that warms the DURABLE cursor:
+    // mint 1000, send 300 → the server holds exactly the 700 change row.
+    const tab1 = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-tab', kv);
+    await seedServerToken(fake, tab1, SENDER, 1000n);
+    await tab1.module.load();
+    const sent = await tab1.module.send({ recipient: '@bob', amount: '300', coinId: UCT });
+    expect(sent.status).toBe('completed');
+    expect(await tab1.client.getBalances()).toEqual([{ coinId: UCT, total: 700n, tokenCount: 1 }]);
+
+    // Session 2 — a NEW provider+module instance over the SAME persisted
+    // stateStore: the simulated tab refresh that used to delta-sync from the
+    // warm cursor into an empty process-lifetime view and render {items:[]}.
+    fake.inventoryGetLog.length = 0;
+    const tab2 = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-tab', kv);
+    await tab2.module.load();
+
+    const tokens = tab2.module.getTokens();
+    expect(tokens).toHaveLength(1);
+    expect(tokens[0]).toMatchObject({ id: expect.stringMatching(/^v2_/), amount: '700', coinId: UCT, status: 'confirmed', lazy: true });
+
+    // The doubled load() GETs (provider.load() + mergeLazyInventory): the
+    // FIRST sync of the session is a FULL pull (since-less page + the §5.1
+    // closing delta from the warm cursor); the second sync rides the
+    // now-warm session as a plain delta — never a second full pull.
+    const cursor = await kv.get(cursorKey);
+    expect(cursor).toMatch(/^[0-9]+$/);
+    expect(fake.inventoryGetLog).toEqual([null, cursor, cursor]);
+
+    // WITHIN the session the delta path keeps operating: a further load()
+    // issues delta GETs only, and the view stays converged (no duplicates).
+    fake.inventoryGetLog.length = 0;
+    await tab2.module.load();
+    expect(fake.inventoryGetLog).toEqual([cursor, cursor]);
+    expect(tab2.module.getTokens()).toHaveLength(1);
+
+    // Session 3 — a THIRD instance over the same stateStore still renders
+    // everything (the first-sync full pull is idempotent across reloads).
+    fake.inventoryGetLog.length = 0;
+    const tab3 = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-tab', kv);
+    await tab3.module.load();
+    expect(tab3.module.getTokens()).toHaveLength(1);
+    expect(tab3.module.getTokens()[0]).toMatchObject({ amount: '700', lazy: true });
+    expect(fake.inventoryGetLog).toEqual([null, cursor, cursor]);
   });
 });

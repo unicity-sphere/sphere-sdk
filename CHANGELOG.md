@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — reload renders an empty wallet (#521)
+
+- **Thin-provider reload (#521):** `WalletApiTokenStorageProvider` persisted
+  its inventory cursor durably while the item view lived only in process
+  memory, so a reloaded instance (tab refresh) delta-synced from the warm
+  cursor into an empty view and rendered an empty wallet. The first sync of
+  each instance/identity session is now always a full pull (both `load()`
+  entry paths and the lazy-view merge benefit); deltas resume within the
+  session.
+
 ### Fixed — incident 2026-06-12 hardening (#515, #516)
 
 - **Fail-closed composition invariant (#515 F1):** wallet-api CUSTODY

@@ -275,6 +275,12 @@ export class FakeWalletApi {
   challengeRequests = 0;
   verifyRequests = 0;
   refreshRequests = 0;
+  /**
+   * Every `GET /v1/inventory` `since` param in arrival order (`null` = a
+   * since-less full-pull page). Lets tests pin the full-pull/delta sequence
+   * (#521: first sync of a session is a full pull, deltas resume after).
+   */
+  readonly inventoryGetLog: (string | null)[] = [];
   private tamperChallenge: ((challenge: string) => string) | null = null;
   private failInventory = false;
   private failIntents = false;
@@ -794,6 +800,7 @@ export class FakeWalletApi {
     if (this.failInventory) throw new HttpError(500, 'INTERNAL', 'simulated inventory outage');
     const owner = this.owner(session.pubkey);
     const sinceRaw = url.searchParams.get('since');
+    this.inventoryGetLog.push(sinceRaw);
     const since = sinceRaw !== null ? BigInt(sinceRaw) : null;
 
     // §5.1: a full pull (no since) returns ACTIVE rows only; a delta returns

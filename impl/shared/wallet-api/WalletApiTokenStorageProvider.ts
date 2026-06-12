@@ -111,7 +111,10 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
   private readonly view = new Map<string, InventoryItem>();
   /**
    * Empty-import protection (§5.1): no removal is ever pushed before this
-   * flips on the first successful inventory load.
+   * flips on the first successful inventory load. Doubles as the per-session
+   * first-sync flag (#521): while false, `syncInventory` full-pulls even with
+   * a warm persisted cursor — the view Map is process-lifetime, so a reloaded
+   * instance (tab refresh) must rebuild it before deltas can resume.
    */
   private hadSuccessfulLoad = false;
 
@@ -258,7 +261,11 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
   /** Converge the local view with the server (delta when possible). */
   private async syncInventory(): Promise<void> {
     const cursor = await this.readCursor();
-    if (cursor === null) {
+    // #521: the cursor is durable but the view Map is not — a delta from a
+    // warm cursor into an empty view renders an empty wallet after a reload.
+    // The FIRST sync of each instance/identity session (the flag setIdentity
+    // resets) is therefore always a full pull; deltas resume afterwards.
+    if (cursor === null || !this.hadSuccessfulLoad) {
       await this.fullPull();
     } else if (await this.deltaLoop(cursor)) {
       await this.handleSyncEpochChange();
