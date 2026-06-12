@@ -60,6 +60,7 @@ import type {
 import { LoadDeltaTracker } from './load-delta';
 import type { LocalBaselineStore } from './load-delta';
 import type { EntryState } from './merkle';
+import { normalizeVaultNetwork } from './normalize-network';
 import { AsyncSerialQueue } from '../../impl/shared/ipfs/write-behind-buffer';
 
 const enc = (s: string): Uint8Array => new TextEncoder().encode(s);
@@ -103,6 +104,15 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
   readonly type = 'cloud' as const;
 
   private readonly config: RemoteTokenStorageConfig;
+  /**
+   * The CANONICAL vault network literal (`normalizeVaultNetwork(config.network)`).
+   * ALL vault-boundary derivations — AEAD vault key, wireKey, vault-entry AAD,
+   * history seal, the signed root + the server epoch canon — use THIS, so a
+   * wallet configured with the `'testnet'` alias and one configured with
+   * `'testnet2'` share vault keys (DESIGN §7.1). Storage SCOPING stays on the
+   * literal `config.network` (migration-v2 trap) — see the tracker's storageNetwork.
+   */
+  private readonly vaultNetwork: string;
   private identity: FullIdentity | null = null;
   private auth: VaultApiClient | null = null;
   private status: 'disconnected' | 'connecting' | 'connected' | 'error' = 'disconnected';
@@ -150,8 +160,12 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
 
   constructor(config: RemoteTokenStorageConfig) {
     this.config = config;
+    this.vaultNetwork = normalizeVaultNetwork(config.network);
     this.delta = new LoadDeltaTracker({
-      network: config.network,
+      // Sign the root + verify the epoch under the CANONICAL vault literal …
+      network: this.vaultNetwork,
+      // … but scope the local baseline STORAGE key by the LITERAL network.
+      storageNetwork: config.network,
       vaultServerKey: config.vaultServerKey,
       baseline: config.localBaseline,
     });
@@ -193,7 +207,7 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     this.localHistory.clear();
     this.historyCursor = 0;
     this.auth = new VaultApiClient({
-      network: this.config.network,
+      network: this.vaultNetwork,
       chainPubkey: identity.chainPubkey,
       privateKey: this.config.privateKey,
       deviceId: this.config.deviceId ?? 'sphere-vault',
@@ -297,7 +311,7 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
   }
 
   private sealHistory(record: HistoryRecord): { nonce: string; ct: string } {
-    return sealHistoryRecord(record, this.ownerId(), this.config.privateKey, this.config.network);
+    return sealHistoryRecord(record, this.ownerId(), this.config.privateKey, this.vaultNetwork);
   }
 
   /**
@@ -307,7 +321,7 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
    * XP-invariant address survives a wipe. Returns `null` once it is on the server.
    */
   private async planReservedAddress(): Promise<PatchOp | null> {
-    const wk = reservedAddressKey(this.config.privateKey, this.config.network);
+    const wk = reservedAddressKey(this.config.privateKey, this.vaultNetwork);
     const cur = this.known.get(wk);
     if (cur && !cur.deleted) return null; // already on the server
     const chainPubkey = this.ownerId();
@@ -315,7 +329,7 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     const payload = sealReservedAddress(
       { directAddress, chainPubkey, formatVersion: RESERVED_ADDRESS_FORMAT_VERSION },
       this.config.privateKey,
-      this.config.network,
+      this.vaultNetwork,
     );
     return { key: wk, baseVersion: 0, payload };
   }
@@ -327,7 +341,7 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
       known: this.known,
       wireKeyOf: (plainKey) => this.wireKeyFor(plainKey),
       changed: (wk, value) => this.hasChanged(wk, value),
-      reserved: new Set([reservedAddressKey(this.config.privateKey, this.config.network)]),
+      reserved: new Set([reservedAddressKey(this.config.privateKey, this.vaultNetwork)]),
     });
   }
 
@@ -375,7 +389,7 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
   /** Seal a token value AAD-bound to the version it will have AFTER apply. */
   private sealValue(key: string, version: number, value: unknown): { nonce: string; ct: string } {
     return sealVaultEntry({
-      network: this.config.network,
+      network: this.vaultNetwork,
       ownerId: this.ownerId(),
       key,
       version,
@@ -509,7 +523,7 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
 
   /** Decrypt + cache one history row, marking it pushed and advancing the cursor. */
   private absorbHistoryRow(row: { dedupKey: string; payload: { nonce: string; ct: string }; seq: number }): HistoryRecord {
-    const record = openHistoryRecord(row.dedupKey, row.payload, this.ownerId(), this.config.privateKey, this.config.network);
+    const record = openHistoryRecord(row.dedupKey, row.payload, this.ownerId(), this.config.privateKey, this.vaultNetwork);
     this.localHistory.set(record.dedupKey, record);
     this.pushedHistory.add(record.dedupKey);
     this.historyCursor = Math.max(this.historyCursor, row.seq);
@@ -555,10 +569,10 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
    * reserved row was present on this page.
    */
   private restoreReservedAddress(entries: StateEntry[]): boolean {
-    const wk = reservedAddressKey(this.config.privateKey, this.config.network);
+    const wk = reservedAddressKey(this.config.privateKey, this.vaultNetwork);
     const row = entries.find((e) => e.key === wk && !e.deleted);
     if (!row) return false;
-    const meta = openReservedAddress(row.payload, this.ownerId(), this.config.privateKey, this.config.network);
+    const meta = openReservedAddress(row.payload, this.ownerId(), this.config.privateKey, this.vaultNetwork);
     this.restoredAddress = meta.directAddress;
     return true;
   }
@@ -635,7 +649,7 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     const client = this.client();
     const { nonce } = await client.deleteNonce();
     const ownerId = this.ownerId();
-    const signature = signMessage(this.config.privateKey, deleteCanon(this.config.network, ownerId, nonce));
+    const signature = signMessage(this.config.privateKey, deleteCanon(this.vaultNetwork, ownerId, nonce));
     // Client-side freshness guard: never send a missing/empty signature.
     if (!nonce || !signature) throw new Error('vault account delete: missing fresh nonce/signature');
     const res = await client.deleteAccount(nonce, signature);
@@ -664,11 +678,11 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
   }
 
   private wireKeyFor(plainKey: string): string {
-    return wireKey(this.config.privateKey, this.config.network, plainKey);
+    return wireKey(this.config.privateKey, this.vaultNetwork, plainKey);
   }
 
   private vaultKey(): Uint8Array {
-    return deriveVaultKey(this.config.privateKey, this.config.network);
+    return deriveVaultKey(this.config.privateKey, this.vaultNetwork);
   }
 
   /** Stable content hash for no-op-update suppression (order-independent JSON). */

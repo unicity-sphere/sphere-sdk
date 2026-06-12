@@ -19,6 +19,7 @@ import type { V2TransferPayload } from '../../types/v2-transfer';
 import { isV2TransferPayload } from '../../types/v2-transfer';
 import { signMessage, verifySignedMessage } from '../../core/crypto';
 import { sealCourierEnvelope, openCourierEnvelope } from '../../vault-aead/courier';
+import { normalizeVaultNetwork } from '../../storage/remote/normalize-network';
 import { courierEntryId } from './entryId';
 import { courierAckTemplate } from './ack-template';
 import type {
@@ -91,10 +92,19 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
   readonly capabilities: TokenDeliveryCapabilities;
 
   private readonly config: CourierDeliveryConfig;
+  /**
+   * The CANONICAL vault network literal (`normalizeVaultNetwork(config.network)`).
+   * Used for the courier envelope AAD and the signed ack template, so a sender on
+   * the `'testnet'` alias and a recipient on `'testnet2'` derive the same envelope
+   * key/AAD and agree on the ack message. Storage SCOPING (read pointer, ack/sent
+   * journals) stays on the LITERAL `config.network` (migration-v2 trap).
+   */
+  private readonly vaultNetwork: string;
   private identity: FullIdentity | null = null;
 
   constructor(config: CourierDeliveryConfig) {
     this.config = config;
+    this.vaultNetwork = normalizeVaultNetwork(config.network);
     this.capabilities = {
       async: true,
       ack: true,
@@ -153,7 +163,7 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
     };
     const plaintext = new TextEncoder().encode(JSON.stringify(payload));
     return sealCourierEnvelope({
-      network: this.config.network,
+      network: this.vaultNetwork,
       senderPriv: me.privateKey,
       senderPubkey: me.chainPubkey,
       recipientPubkey: envelope.recipientChainPubkey,
@@ -219,7 +229,7 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
     item: { entryId: string; senderPubkey: string; ciphertext: string },
   ): V2TransferPayload {
     const pt = openCourierEnvelope({
-      network: this.config.network,
+      network: this.vaultNetwork,
       recipientPriv: me.privateKey,
       senderPubkey: item.senderPubkey,
       recipientPubkey: me.chainPubkey,
@@ -290,7 +300,7 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
     const me = this.requireIdentity();
     const client = this.config.httpClientFactory(me.chainPubkey);
     const { serverNonce } = await client.ackNonce(entryId);
-    const tmpl = courierAckTemplate(this.config.network, senderPubkey, entryId, serverNonce);
+    const tmpl = courierAckTemplate(this.vaultNetwork, senderPubkey, entryId, serverNonce);
     const ackSig = signMessage(me.privateKey, tmpl);
     const { result } = await client.ack({ entryId, ackSig });
     if (result === 'claimed' || result === 'alreadyClaimed') {
@@ -389,7 +399,7 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
     item: { entryId: string; recipientPubkey: string; ackSig: string | null; ackNonce: string | null },
   ): boolean {
     if (!item.ackSig || !item.ackNonce) return false;
-    const tmpl = courierAckTemplate(this.config.network, me.chainPubkey, item.entryId, item.ackNonce);
+    const tmpl = courierAckTemplate(this.vaultNetwork, me.chainPubkey, item.entryId, item.ackNonce);
     return verifySignedMessage(tmpl, item.ackSig, item.recipientPubkey);
   }
 

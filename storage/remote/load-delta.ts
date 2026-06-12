@@ -43,7 +43,19 @@ interface SignedBaseline {
 }
 
 export interface LoadDeltaConfig {
+  /**
+   * The CANONICAL vault network literal (`normalizeVaultNetwork(...)`) — binds the
+   * signed-root message and the `epochCanon` the server epochSig is verified over,
+   * so a `testnet`-aliased and a `testnet2`-configured wallet share the same root /
+   * epoch signing domain.
+   */
   network: string;
+  /**
+   * The LITERAL network name for the local baseline STORAGE key. Storage scoping
+   * stays on the literal (migration-v2 trap), NOT the canonical literal — keep it
+   * distinct from {@link LoadDeltaConfig.network}. Defaults to `network` when omitted.
+   */
+  storageNetwork?: string;
   /** Compressed server signing key (`NETWORKS[net].vaultServerKey`) for epoch verify. */
   vaultServerKey?: string;
   baseline?: LocalBaselineStore;
@@ -202,6 +214,9 @@ export class LoadDeltaTracker {
   }
 
   private baselineKey(): string {
-    return `vault_baseline:${this.config.network}:${this.ownerId}`;
+    // Storage scope uses the LITERAL network (migration-v2 trap), NOT the
+    // canonical vault literal used for signing — see LoadDeltaConfig.
+    const scope = this.config.storageNetwork ?? this.config.network;
+    return `vault_baseline:${scope}:${this.ownerId}`;
   }
 }

@@ -526,5 +526,61 @@ export type {
 // TxfToken type for serialization workflows
 export type { TxfToken } from './types/txf';
 
+// =============================================================================
+// Token-Vault v2 (remote storage + courier delivery)
+// =============================================================================
+// The Token-Vault v2 client surface: the remote (operator-blind) token storage
+// provider, the reference courier delivery transport, the `vault-aead` crypto
+// module, and `normalizeVaultNetwork` (the canonical NETWORK literal at the vault
+// AEAD/wireKey/AAD boundary — `testnet → testnet2`; storage scoping elsewhere
+// still uses the literal network name).
+
+export { RemoteTokenStorageProvider } from './storage/remote/RemoteTokenStorageProvider';
+export type { RemoteTokenStorageConfig } from './storage/remote/RemoteTokenStorageProvider';
+
+export { CourierDeliveryProvider } from './transport/courier/CourierDeliveryProvider';
+export type {
+  CourierDeliveryConfig,
+  CourierJournalStore,
+  V2TransferSink,
+} from './transport/courier/CourierDeliveryProvider';
+export type {
+  TokenDeliveryTransport,
+  TokenDeliveryCapabilities,
+  TokenEnvelope,
+  DeliveryHandle,
+  SignedReceipt,
+} from './transport/courier/types';
+
+export { normalizeVaultNetwork } from './storage/remote/normalize-network';
+
+// vault-aead public crypto API (seal/open, key derivation, on-curve guard,
+// AAD-bound vault entries, courier envelope framing).
+export {
+  seal,
+  open,
+  lengthDelim,
+  u64be,
+  u32be,
+  deriveVaultKey,
+  deriveCourierKey,
+  assertOnCurve,
+  ecdhX,
+  sealVaultEntry,
+  openVaultEntry,
+  sealCourierEnvelope,
+  openCourierEnvelope,
+  packCourier,
+  unpackCourier,
+} from './vault-aead/index';
+export type {
+  VaultEntryPayload,
+  SealVaultEntryParams,
+  OpenVaultEntryParams,
+  SealCourierParams,
+  OpenCourierParams,
+  PackedCourier,
+} from './vault-aead/index';
+
 // Master-key provider status re-export (already re-exported via ./types barrel,
 // but keeping explicit here for consumers that want to import direct types).
