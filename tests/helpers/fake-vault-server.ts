@@ -472,6 +472,23 @@ export class FakeVaultServer {
     return this.epoch;
   }
 
+  /**
+   * SANCTIONED-RESET injector (Task 8.2): wipe an owner's vault entries, reset its
+   * seq + cursor allocators to 0, and BUMP the signed epoch (so `/state` now
+   * returns `{cursor:0, entries:[]}` with a strictly-increased, validly-signed
+   * `epochSig`). This is the only thing that distinguishes a real testnet reset
+   * from a hostile rollback — the client must DROP local state + re-baseline, NOT
+   * alarm. Returns the new epoch.
+   */
+  resetOwner(ownerId: string): number {
+    for (let i = this.entries.length - 1; i >= 0; i--) {
+      if (this.entries[i].ownerId === ownerId) this.entries.splice(i, 1);
+    }
+    this.seqCounter.set(ownerId, 0);
+    this.cursorCounter.set(ownerId, 0);
+    return this.bumpEpoch();
+  }
+
   /** Force the whole-batch storage watermark (507 path). */
   setStorageFull(full: boolean): void {
     this.storageFull = full;

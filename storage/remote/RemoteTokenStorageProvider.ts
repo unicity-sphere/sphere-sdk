@@ -60,6 +60,7 @@ import type {
 import { LoadDeltaTracker } from './load-delta';
 import type { LocalBaselineStore } from './load-delta';
 import type { EntryState } from './merkle';
+import { normalizeVaultNetwork } from './normalize-network';
 import { AsyncSerialQueue } from '../../impl/shared/ipfs/write-behind-buffer';
 
 const enc = (s: string): Uint8Array => new TextEncoder().encode(s);
@@ -103,6 +104,15 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
   readonly type = 'cloud' as const;
 
   private readonly config: RemoteTokenStorageConfig;
+  /**
+   * The CANONICAL vault network literal (`normalizeVaultNetwork(config.network)`).
+   * ALL vault-boundary derivations — AEAD vault key, wireKey, vault-entry AAD,
+   * history seal, the signed root + the server epoch canon — use THIS, so a
+   * wallet configured with the `'testnet'` alias and one configured with
+   * `'testnet2'` share vault keys (DESIGN §7.1). Storage SCOPING stays on the
+   * literal `config.network` (migration-v2 trap) — see the tracker's storageNetwork.
+   */
+  private readonly vaultNetwork: string;
   private identity: FullIdentity | null = null;
   private auth: VaultApiClient | null = null;
   private status: 'disconnected' | 'connecting' | 'connected' | 'error' = 'disconnected';
@@ -150,8 +160,12 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
 
   constructor(config: RemoteTokenStorageConfig) {
     this.config = config;
+    this.vaultNetwork = normalizeVaultNetwork(config.network);
     this.delta = new LoadDeltaTracker({
-      network: config.network,
+      // Sign the root + verify the epoch under the CANONICAL vault literal …
+      network: this.vaultNetwork,
+      // … but scope the local baseline STORAGE key by the LITERAL network.
+      storageNetwork: config.network,
       vaultServerKey: config.vaultServerKey,
       baseline: config.localBaseline,
     });
@@ -193,7 +207,7 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     this.localHistory.clear();
     this.historyCursor = 0;
     this.auth = new VaultApiClient({
-      network: this.config.network,
+      network: this.vaultNetwork,
       chainPubkey: identity.chainPubkey,
       privateKey: this.config.privateKey,
       deviceId: this.config.deviceId ?? 'sphere-vault',
@@ -297,7 +311,7 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
   }
 
   private sealHistory(record: HistoryRecord): { nonce: string; ct: string } {
-    return sealHistoryRecord(record, this.ownerId(), this.config.privateKey, this.config.network);
+    return sealHistoryRecord(record, this.ownerId(), this.config.privateKey, this.vaultNetwork);
   }
 
   /**
@@ -307,7 +321,7 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
    * XP-invariant address survives a wipe. Returns `null` once it is on the server.
    */
   private async planReservedAddress(): Promise<PatchOp | null> {
-    const wk = reservedAddressKey(this.config.privateKey, this.config.network);
+    const wk = reservedAddressKey(this.config.privateKey, this.vaultNetwork);
     const cur = this.known.get(wk);
     if (cur && !cur.deleted) return null; // already on the server
     const chainPubkey = this.ownerId();
@@ -315,7 +329,7 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     const payload = sealReservedAddress(
       { directAddress, chainPubkey, formatVersion: RESERVED_ADDRESS_FORMAT_VERSION },
       this.config.privateKey,
-      this.config.network,
+      this.vaultNetwork,
     );
     return { key: wk, baseVersion: 0, payload };
   }
@@ -327,7 +341,7 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
       known: this.known,
       wireKeyOf: (plainKey) => this.wireKeyFor(plainKey),
       changed: (wk, value) => this.hasChanged(wk, value),
-      reserved: new Set([reservedAddressKey(this.config.privateKey, this.config.network)]),
+      reserved: new Set([reservedAddressKey(this.config.privateKey, this.vaultNetwork)]),
     });
   }
 
@@ -375,7 +389,7 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
   /** Seal a token value AAD-bound to the version it will have AFTER apply. */
   private sealValue(key: string, version: number, value: unknown): { nonce: string; ct: string } {
     return sealVaultEntry({
-      network: this.config.network,
+      network: this.vaultNetwork,
       ownerId: this.ownerId(),
       key,
       version,
@@ -471,6 +485,9 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
         epochSig: page.epochSig,
       });
       if (!gate.ok) return this.rollback(gate.reason);
+      // Task 8.2 / #14: a server-key-VERIFIED strict epoch bump is a SANCTIONED
+      // reset, not an alarm — drop local state and re-baseline at the new epoch.
+      if (gate.reset) return this.handleSanctionedReset();
       pages.push(...page.entries);
       lastEpochSig = page.epochSig;
       lastEpoch = page.syncEpoch;
@@ -483,6 +500,61 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     await this.delta.commitBaseline(since, lastEpoch, lastEpochSig);
     const recovered = await this.loadHistory(); // single-channel history (Task 7.4)
     return this.materialize(pages, recovered);
+  }
+
+  /**
+   * Sanctioned-reset path (Task 8.2 / finding #14). A server-key-verified strict
+   * epoch bump was recognised, so the operator legitimately reset the network (a
+   * testnet wipe). DROP all local vault state and re-paginate the fresh seq space
+   * from `since=0`, then re-baseline the signed root at the NEW epoch/cursor — NO
+   * rollback alarm. This is only ever reached AFTER `ingestPage` verified the bump
+   * against `NETWORKS[net].vaultServerKey`, so it cannot mask a hostile rollback.
+   */
+  private async handleSanctionedReset(): Promise<LoadResult<TData>> {
+    this.dropLocalVaultState();
+    this.delta.beginReset(); // empty accumulator, no stale-root gate for the re-pass
+    const { entries, cursor, epoch, epochSig } = await this.repaginateFromReset();
+    this.delta.foldReset(entries); // re-baseline root reflects the actual reset state
+    this.serverCursor = cursor;
+    await this.delta.commitBaseline(cursor, epoch, epochSig); // persist the NEW epoch
+    const recovered = await this.loadHistory();
+    return this.materialize(entries, recovered);
+  }
+
+  /** Re-pull the post-reset state from `since=0` UNGATED (the reset is sanctioned). */
+  private async repaginateFromReset(): Promise<{ entries: StateEntry[]; cursor: number; epoch: number; epochSig: string }> {
+    const client = this.client();
+    const entries: StateEntry[] = [];
+    let since = 0;
+    let cursor = 0;
+    let epoch = 0;
+    let epochSig = '';
+    for (;;) {
+      const page = await client.getState(since);
+      entries.push(...page.entries);
+      cursor = page.cursor;
+      epoch = page.syncEpoch;
+      epochSig = page.epochSig;
+      if (!page.more || page.cursor <= since) break;
+      since = page.cursor;
+    }
+    return { entries, cursor, epoch, epochSig };
+  }
+
+  /**
+   * Drop all per-owner local vault state for a sanctioned reset: the internal
+   * last-known server view, content hashes, the pagination watermark, the restored
+   * address and the history watermark. The signed baseline is re-persisted fresh by
+   * `commitBaseline`. Storage scope (the literal-network baseline KEY) is unchanged.
+   */
+  private dropLocalVaultState(): void {
+    this.known.clear();
+    this.contentHash.clear();
+    this.serverCursor = 0;
+    this.restoredAddress = null;
+    this.localHistory.clear();
+    this.pushedHistory.clear();
+    this.historyCursor = 0;
   }
 
   /**
@@ -509,7 +581,7 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
 
   /** Decrypt + cache one history row, marking it pushed and advancing the cursor. */
   private absorbHistoryRow(row: { dedupKey: string; payload: { nonce: string; ct: string }; seq: number }): HistoryRecord {
-    const record = openHistoryRecord(row.dedupKey, row.payload, this.ownerId(), this.config.privateKey, this.config.network);
+    const record = openHistoryRecord(row.dedupKey, row.payload, this.ownerId(), this.config.privateKey, this.vaultNetwork);
     this.localHistory.set(record.dedupKey, record);
     this.pushedHistory.add(record.dedupKey);
     this.historyCursor = Math.max(this.historyCursor, row.seq);
@@ -555,10 +627,10 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
    * reserved row was present on this page.
    */
   private restoreReservedAddress(entries: StateEntry[]): boolean {
-    const wk = reservedAddressKey(this.config.privateKey, this.config.network);
+    const wk = reservedAddressKey(this.config.privateKey, this.vaultNetwork);
     const row = entries.find((e) => e.key === wk && !e.deleted);
     if (!row) return false;
-    const meta = openReservedAddress(row.payload, this.ownerId(), this.config.privateKey, this.config.network);
+    const meta = openReservedAddress(row.payload, this.ownerId(), this.config.privateKey, this.vaultNetwork);
     this.restoredAddress = meta.directAddress;
     return true;
   }
@@ -635,7 +707,7 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     const client = this.client();
     const { nonce } = await client.deleteNonce();
     const ownerId = this.ownerId();
-    const signature = signMessage(this.config.privateKey, deleteCanon(this.config.network, ownerId, nonce));
+    const signature = signMessage(this.config.privateKey, deleteCanon(this.vaultNetwork, ownerId, nonce));
     // Client-side freshness guard: never send a missing/empty signature.
     if (!nonce || !signature) throw new Error('vault account delete: missing fresh nonce/signature');
     const res = await client.deleteAccount(nonce, signature);
@@ -664,11 +736,11 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
   }
 
   private wireKeyFor(plainKey: string): string {
-    return wireKey(this.config.privateKey, this.config.network, plainKey);
+    return wireKey(this.config.privateKey, this.vaultNetwork, plainKey);
   }
 
   private vaultKey(): Uint8Array {
-    return deriveVaultKey(this.config.privateKey, this.config.network);
+    return deriveVaultKey(this.config.privateKey, this.vaultNetwork);
   }
 
   /** Stable content hash for no-op-update suppression (order-independent JSON). */
