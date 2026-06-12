@@ -46,6 +46,8 @@ interface DeliveryRow {
   seq: number;
   sentSeq: number;
   ackSig: string | null;
+  /** The server nonce the claim consumed (surfaced to the sender via /sent). */
+  ackNonce: string | null;
 }
 
 let randomCounter = 0;
@@ -116,6 +118,7 @@ export class FakeCourierServer {
       seq,
       sentSeq,
       ackSig: null,
+      ackNonce: null,
     });
     return { entryId: req.entryId, seq, sentSeq, status: 'unclaimed' };
   }
@@ -164,6 +167,7 @@ export class FakeCourierServer {
     if (!verifySignedMessage(tmpl, req.ackSig, recipientId)) return { result: 'failed' };
     d.status = 'claimed';
     d.ackSig = req.ackSig;
+    d.ackNonce = nonce;
     this.advanceReadPointer(recipientId);
     return { result: 'claimed' };
   }
@@ -178,6 +182,7 @@ export class FakeCourierServer {
         recipientPubkey: d.recipientId,
         status: d.status,
         ackSig: d.ackSig,
+        ackNonce: d.ackNonce,
       }));
     return { more: false, items };
   }
@@ -189,10 +194,11 @@ export class FakeCourierServer {
    * hostile/broken server that flips the flag without a valid signature. Used to
    * prove the sender's verify-gate keeps redelivering (§6.5 negative path).
    */
-  forgeSentAckSig(entryId: string, ackSig: string): void {
+  forgeSentAckSig(entryId: string, ackSig: string, ackNonce = 'forged-nonce'): void {
     const d = this.deliveries.find((x) => x.entryId === entryId);
     if (d) {
       d.ackSig = ackSig;
+      d.ackNonce = ackNonce;
       d.status = 'claimed';
     }
   }

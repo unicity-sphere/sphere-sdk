@@ -128,6 +128,13 @@ export interface CourierSentItem {
   recipientPubkey: string;
   status: CourierDeliveryStatus;
   ackSig: string | null;
+  /**
+   * The server nonce the recipient's claim consumed — surfaced so the SENDER can
+   * rebuild the bound ack template and run `verifySignedMessage` itself. Null
+   * until claimed. (Part A coordination: the real `/sent` row must carry this so
+   * the sender's delivery gate can verify the recipient signature, §6.5.)
+   */
+  ackNonce: string | null;
 }
 
 /** `GET /v1/courier/sent?since=` response. */

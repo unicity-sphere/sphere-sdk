@@ -17,13 +17,14 @@
 import type { FullIdentity } from '../../types';
 import type { V2TransferPayload } from '../../types/v2-transfer';
 import { isV2TransferPayload } from '../../types/v2-transfer';
-import { signMessage } from '../../core/crypto';
+import { signMessage, verifySignedMessage } from '../../core/crypto';
 import { sealCourierEnvelope, openCourierEnvelope } from '../../vault-aead/courier';
 import { courierEntryId } from './entryId';
 import { courierAckTemplate } from './ack-template';
 import type {
   CourierHttpClient,
   DeliveryHandle,
+  SignedReceipt,
   TokenDeliveryCapabilities,
   TokenDeliveryTransport,
   TokenEnvelope,
@@ -38,6 +39,15 @@ export type V2TransferSink = (payload: V2TransferPayload, senderPubkey: string) 
 /** One ACK-PENDING journal entry (re-fired until the server shows `claimed`). */
 interface AckPendingEntry {
   senderPubkey: string;
+}
+
+/** Per-entry sender-side delivery state for the redelivery/backoff loop. */
+type SenderDeliveryState = 'pending' | 'delivered' | 'delivery_unconfirmed';
+
+interface SentPendingEntry {
+  recipientPubkey: string;
+  attempts: number;
+  state: SenderDeliveryState;
 }
 
 /** Minimal persistent KV the journal needs (matches PaymentsModule storage). */
@@ -57,8 +67,20 @@ export interface CourierDeliveryConfig {
   journal: CourierJournalStore;
   /** Feeds decoded incoming transfers into the existing handleV2Transfer path. */
   onV2Transfer: V2TransferSink;
+  /**
+   * Called when a delivery is CONFIRMED by a VALID recipient ackSig — the only
+   * thing that licenses removing `PENDING_V2_DELIVERIES` + GC (DESIGN §6.5).
+   * A forged/absent sig never triggers this (the sender keeps redelivering).
+   */
+  onDelivered?: (entryId: string) => Promise<void>;
   /** Max envelope bytes the courier accepts (DESIGN §6.6 default 16 MiB). */
   maxBytes?: number;
+  /** Max redelivery attempts before the entry is surfaced `delivery_unconfirmed`. */
+  maxRedeliveryAttempts?: number;
+  /** Base backoff (ms) for the redelivery loop; doubles per attempt up to a cap. */
+  backoffBaseMs?: number;
+  /** Backoff cap (ms). */
+  backoffMaxMs?: number;
 }
 
 export class CourierDeliveryProvider implements TokenDeliveryTransport {
@@ -107,6 +129,9 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
       ciphertext,
       // hint stays undefined here — a single base64 SCALAR when present (never an object).
     });
+    // Track the entry sender-side so pollSent() can gate "delivered" on a valid
+    // recipient ackSig before removing PENDING_V2_DELIVERIES (DESIGN §6.5).
+    await this.journalSentPending(entryId, envelope.recipientChainPubkey);
     return {
       entryId: res.entryId,
       transferId: envelope.transferId,
@@ -288,6 +313,119 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
         // Network failure — keep the row for the next load.
       }
     }
+  }
+
+  // ===========================================================================
+  // Sender-side delivery confirmation (Task 5.4)
+  // ===========================================================================
+
+  private sentWatermarkKey(): string {
+    return `courier_sent_watermark:${this.config.network}:${this.requireIdentity().chainPubkey}`;
+  }
+
+  private sentPendingKey(): string {
+    return `courier_sent_pending:${this.config.network}:${this.requireIdentity().chainPubkey}`;
+  }
+
+  private async loadSentPending(): Promise<Record<string, SentPendingEntry>> {
+    const raw = await this.config.journal.get(this.sentPendingKey());
+    return raw ? (JSON.parse(raw) as Record<string, SentPendingEntry>) : {};
+  }
+
+  private async saveSentPending(pending: Record<string, SentPendingEntry>): Promise<void> {
+    await this.config.journal.set(this.sentPendingKey(), JSON.stringify(pending));
+  }
+
+  private async journalSentPending(entryId: string, recipientPubkey: string): Promise<void> {
+    const pending = await this.loadSentPending();
+    if (!pending[entryId]) {
+      pending[entryId] = { recipientPubkey, attempts: 0, state: 'pending' };
+      await this.saveSentPending(pending);
+    }
+  }
+
+  /**
+   * The SENDER's delivery gate (DESIGN §6.5). Poll `/sent` since the per-sender
+   * watermark; for each row that the server marks `claimed`, the sender — NOT the
+   * server — verifies the recipient `ackSig` over the bound template. ONLY a valid
+   * signature licenses `onDelivered` (which removes `PENDING_V2_DELIVERIES` + GC).
+   * A forged flag without a valid sig is rejected → the entry stays pending and is
+   * redelivered (bounded by attempt count → `delivery_unconfirmed`).
+   */
+  async pollSent(): Promise<void> {
+    const me = this.requireIdentity();
+    const client = this.config.httpClientFactory(me.chainPubkey);
+    const since = await this.sentWatermark();
+    const res = await client.sent(since);
+    const pending = await this.loadSentPending();
+    for (const item of res.items) {
+      await this.reconcileSentItem(me, pending, item);
+    }
+    await this.saveSentPending(pending);
+  }
+
+  /** Verify one /sent row's ackSig and advance its sender-side state. */
+  private async reconcileSentItem(
+    me: FullIdentity,
+    pending: Record<string, SentPendingEntry>,
+    item: { entryId: string; recipientPubkey: string; ackSig: string | null; ackNonce: string | null },
+  ): Promise<void> {
+    const entry = pending[item.entryId];
+    if (!entry || entry.state === 'delivered') return;
+    if (this.isValidReceipt(me, item)) {
+      entry.state = 'delivered';
+      await this.config.onDelivered?.(item.entryId);
+      return;
+    }
+    // Not yet validly claimed (still unclaimed, or a FORGED ackSig that fails
+    // verification) — keep redelivering, bounded by the attempt cap.
+    entry.attempts += 1;
+    if (entry.attempts >= this.maxAttempts()) entry.state = 'delivery_unconfirmed';
+  }
+
+  /** True only for a recipient ackSig that verifies over the bound template. */
+  private isValidReceipt(
+    me: FullIdentity,
+    item: { entryId: string; recipientPubkey: string; ackSig: string | null; ackNonce: string | null },
+  ): boolean {
+    if (!item.ackSig || !item.ackNonce) return false;
+    const tmpl = courierAckTemplate(this.config.network, me.chainPubkey, item.entryId, item.ackNonce);
+    return verifySignedMessage(tmpl, item.ackSig, item.recipientPubkey);
+  }
+
+  /**
+   * Verify a delivery handle's signed receipt (DESIGN §3 port method). Returns the
+   * {@link SignedReceipt} only when the recipient's ackSig validly claims it.
+   */
+  async confirmReceipt(handle: DeliveryHandle): Promise<SignedReceipt | null> {
+    const me = this.requireIdentity();
+    const client = this.config.httpClientFactory(me.chainPubkey);
+    const res = await client.sent(0);
+    const row = res.items.find((i) => i.entryId === handle.entryId);
+    if (!row || !this.isValidReceipt(me, row)) return null;
+    return { entryId: row.entryId, ackSig: row.ackSig!, recipientChainPubkey: row.recipientPubkey };
+  }
+
+  private maxAttempts(): number {
+    return this.config.maxRedeliveryAttempts ?? 10;
+  }
+
+  /** Exponential backoff for the redelivery loop, capped (DESIGN §6.5). */
+  backoffMs(attempts: number): number {
+    const base = this.config.backoffBaseMs ?? 1000;
+    const cap = this.config.backoffMaxMs ?? 5 * 60_000;
+    return Math.min(cap, base * 2 ** attempts);
+  }
+
+  /** Current sender-side state for an entry (for the UI: pending/delivered/unconfirmed). */
+  async sentState(entryId: string): Promise<SenderDeliveryState | null> {
+    const pending = await this.loadSentPending();
+    return pending[entryId]?.state ?? null;
+  }
+
+  private async sentWatermark(): Promise<number> {
+    const raw = await this.config.journal.get(this.sentWatermarkKey());
+    return raw ? Number(raw) : 0;
   }
 
   // ===========================================================================
