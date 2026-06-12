@@ -7,8 +7,6 @@
  * bodies land in Phase 5; this is the typed skeleton from Task 0.1.
  */
 
-/* eslint-disable @typescript-eslint/no-unused-vars */
-
 import type { FullIdentity } from '../../types';
 
 export interface CourierDeliveryConfig {
