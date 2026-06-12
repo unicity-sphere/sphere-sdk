@@ -3,6 +3,8 @@
  * Default configuration values and storage keys
  */
 
+import { getPublicKey } from './core/crypto';
+
 // =============================================================================
 // Storage Keys
 // =============================================================================
@@ -398,7 +400,24 @@ export interface NetworkConfig {
   readonly electrumUrl: string;
   readonly groupRelays: readonly string[];
   readonly tokenRegistryUrl: string;
+  /** Base URL of the Token-Vault v2 deployment for this network. */
+  readonly vaultUrl: string;
+  /**
+   * Compressed secp256k1 pubkey (66-hex) of the vault deployment's signing key
+   * (`SERVER_SIGN_PRIV`). The SDK verifies the server's signed epoch (§5.4/§8.2)
+   * against this key. Must equal the public key the deployment publishes.
+   */
+  readonly vaultServerKey: string;
 }
+
+/**
+ * testnet2 vault server signing key — the compressed pubkey of the shared
+ * deployment fixture `SERVER_SIGN_PRIV = 'a'.repeat(64)`. Part A pins the SAME
+ * private key (its `auth-signing` test signs epochs with it), so the SDK can
+ * verify the server's `epochSig` byte-for-byte. Computed (not hand-written) so
+ * it can never drift from the fixture.
+ */
+const TESTNET2_VAULT_SERVER_KEY = getPublicKey('a'.repeat(64), true);
 
 /** Network configurations */
 export const NETWORKS = {
@@ -410,6 +429,10 @@ export const NETWORKS = {
     electrumUrl: DEFAULT_ELECTRUM_URL,
     groupRelays: DEFAULT_GROUP_RELAYS,
     tokenRegistryUrl: TOKEN_REGISTRY_URL,
+    vaultUrl: 'https://vault.unicity.network',
+    // Placeholder server key until the mainnet vault deployment is provisioned
+    // (compressed pubkey of priv 0x01..01); replace with the real published key.
+    vaultServerKey: '031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f',
   },
   // v1 cutover: 'testnet' now POINTS AT TESTNET2 (the v2 gateway network). The
   // old goggregator testnet spoke the removed v1 protocol — a v2 engine cannot
@@ -424,6 +447,9 @@ export const NETWORKS = {
     groupRelays: DEFAULT_GROUP_RELAYS,
     tokenRegistryUrl:
       'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.testnet2.json',
+    // 'testnet' is an alias of testnet2 — share the same vault deployment + key.
+    vaultUrl: 'https://vault.testnet.unicity.network',
+    vaultServerKey: TESTNET2_VAULT_SERVER_KEY,
   },
   testnet2: {
     name: 'Testnet2',
@@ -435,6 +461,8 @@ export const NETWORKS = {
     groupRelays: DEFAULT_GROUP_RELAYS,
     tokenRegistryUrl:
       'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.testnet2.json',
+    vaultUrl: 'https://vault.testnet.unicity.network',
+    vaultServerKey: TESTNET2_VAULT_SERVER_KEY,
   },
   // NOTE: mainnet/dev still point at v1-era aggregators. The v2 engine cannot
   // operate against them until their gateways are cut over to the v2 protocol —
@@ -447,6 +475,9 @@ export const NETWORKS = {
     electrumUrl: TEST_ELECTRUM_URL,
     groupRelays: DEFAULT_GROUP_RELAYS,
     tokenRegistryUrl: TOKEN_REGISTRY_URL,
+    vaultUrl: 'http://localhost:3000',
+    // Placeholder server key for local dev (compressed pubkey of priv 0x02..02).
+    vaultServerKey: '024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766',
   },
 } as const satisfies Record<string, NetworkConfig>;
 
