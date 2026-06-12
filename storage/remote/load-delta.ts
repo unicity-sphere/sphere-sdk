@@ -169,6 +169,23 @@ export class LoadDeltaTracker {
     this.accState = null; // close the pass regardless of whether a baseline was persisted
   }
 
+  /**
+   * Re-sign the local baseline after the wallet's OWN flush advanced the server
+   * (Task 7.1/7.3). The wallet is the only writer, so its committed writes must
+   * advance the signed root — otherwise the next `load()` would see its own
+   * entries as an unauthored delta and false-alarm a rollback. `known` is the
+   * provider's post-flush authoritative state; the epoch is carried forward.
+   */
+  async rebaseline(cursor: number, known: Map<string, EntryState>): Promise<void> {
+    if (!this.config.baseline || !this.walletPriv) return;
+    const root = computeRoot(known);
+    const epoch = this.baseline?.epoch ?? 0;
+    const sig = signRoot(this.walletPriv, this.bindingFor(cursor, root));
+    const baseline: SignedBaseline = { cursor, root, sig, epoch };
+    this.baseline = baseline;
+    await this.config.baseline.set(this.baselineKey(), JSON.stringify(baseline));
+  }
+
   private async loadBaseline(): Promise<SignedBaseline | null> {
     if (!this.config.baseline) return null;
     const raw = await this.config.baseline.get(this.baselineKey());

@@ -39,3 +39,17 @@ export const ACCOUNT_DELETE_CANON_PREFIX = 'unicity:vault:account-delete:v1';
 export function accountDeleteCanon(network: string, chainPubkey: string, nonce: string): string {
   return `${ACCOUNT_DELETE_CANON_PREFIX}\n${network}\n${chainPubkey}\n${nonce}`;
 }
+
+/** Runtime account-delete prefix — the REAL Part A literal (`account.service.ts:11`). */
+export const DELETE_CANON_PREFIX = 'unicity:vault:delete:v1';
+
+/**
+ * The REAL runtime account-delete message the wallet signs (Task 7.5, §7.4):
+ * `'unicity:vault:delete:v1\n' + network + '\n' + ownerId + '\n' + nonce`.
+ *
+ * This is the `delete:v1` template Part A's `deleteCanon` verifies — NOT the
+ * `account-delete:v1` scheme fixture above.
+ */
+export function deleteCanon(network: string, ownerId: string, nonce: string): string {
+  return `${DELETE_CANON_PREFIX}\n${network}\n${ownerId}\n${nonce}`;
+}

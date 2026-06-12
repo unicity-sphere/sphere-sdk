@@ -59,6 +59,11 @@ export interface PlanOpsParams {
   wireKeyOf: (plainKey: string) => string;
   /** True when the value differs from the last-flushed content hash (skip no-op updates). */
   changed: (wireKey: string, value: unknown) => boolean;
+  /**
+   * Provider-managed reserved wireKeys (e.g. the meta-address slot) that are NOT
+   * token entries — never swept as orphan deletes even though they live in `known`.
+   */
+  reserved?: ReadonlySet<string>;
 }
 
 /**
@@ -68,10 +73,11 @@ export interface PlanOpsParams {
  *    AGAINST the deleted row (delete-resurrect, #16 — NOT rebased to its version);
  *  - a token whose wireKey is a known LIVE row → update at the known version, but
  *    only when the value changed;
- *  - a known LIVE wireKey with no matching local token → delete.
+ *  - a known LIVE wireKey with no matching local token → delete (except reserved
+ *    provider-managed slots, which are never orphan-swept).
  */
 export function planOps(params: PlanOpsParams): PlannedOp[] {
-  const { tokens, known, wireKeyOf, changed } = params;
+  const { tokens, known, wireKeyOf, changed, reserved } = params;
   const ops: PlannedOp[] = [];
   const liveWire = new Set<string>();
   for (const [plainKey, value] of tokens) {
@@ -85,7 +91,7 @@ export function planOps(params: PlanOpsParams): PlannedOp[] {
     }
   }
   for (const [wk, cur] of known) {
-    if (!cur.deleted && !liveWire.has(wk)) {
+    if (!cur.deleted && !liveWire.has(wk) && !reserved?.has(wk)) {
       ops.push({ plainKey: '', wireKey: wk, baseVersion: cur.version, isDelete: true });
     }
   }

@@ -33,12 +33,23 @@ import type {
   TokenStorageProvider,
   TxfStorageDataBase,
 } from '../storage-provider';
+import { hexToBytes } from '../../core/crypto';
 import { sealVaultEntry } from '../../vault-aead/entry';
 import { deriveVaultKey } from '../../vault-aead/derive';
 import { wireKey } from './wire-key';
 import { VaultApiClient } from './VaultApiClient';
 import { extractTokens, planOps } from './diff';
 import type { KnownEntry, PlannedOp } from './diff';
+import {
+  reservedAddressKey,
+  sealReservedAddress,
+  openReservedAddress,
+  RESERVED_ADDRESS_FORMAT_VERSION,
+} from './reserved-address';
+import { sealHistoryRecord, openHistoryRecord } from './history-codec';
+import { deleteCanon } from '../../vault-aead/canon';
+import { signMessage } from '../../core/crypto';
+import { deriveDirectAddress } from '../../token-engine/identity';
 import type {
   PatchOp,
   PatchResponse,
@@ -49,8 +60,17 @@ import type {
 import { LoadDeltaTracker } from './load-delta';
 import type { LocalBaselineStore } from './load-delta';
 import type { EntryState } from './merkle';
+import { AsyncSerialQueue } from '../../impl/shared/ipfs/write-behind-buffer';
 
 const enc = (s: string): Uint8Array => new TextEncoder().encode(s);
+
+/** Thrown by the flush path when the identity epoch advanced across an await. */
+class IdentityFencedError extends Error {
+  constructor() {
+    super('vault flush aborted: identity changed mid-flush (epoch fenced)');
+    this.name = 'IdentityFencedError';
+  }
+}
 
 export interface RemoteTokenStorageConfig {
   /** Canonical network name (storage scope, AEAD/wireKey scope). */
@@ -97,6 +117,37 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
   private readonly listeners = new Set<StorageEventCallback>();
   private readonly delta: LoadDeltaTracker;
 
+  /**
+   * The flush gate (Task 7.1). `sync()` is a NO-OP until the FIRST successful
+   * `load()` opens it. `PaymentsModule.load()` stops at the first successful
+   * provider, so this provider may never get a caller `load()` — `initialize()`
+   * runs the first load itself. Empty-import protection: a transient load failure
+   * leaves this `false`, so an empty local snapshot can never wipe the server.
+   */
+  private initialLoadDone = false;
+
+  /** The DIRECT:// address restored from the reserved meta-address entry (Task 7.2). */
+  private restoredAddress: string | null = null;
+
+  /**
+   * Serialize flush / sync / shutdown so two flushes never interleave their CAS
+   * writes (Task 7.3). The same queue gates load too, so a load mid-flush waits.
+   */
+  private readonly queue = new AsyncSerialQueue();
+  /**
+   * Identity-epoch counter (Task 7.3). `setIdentity` bumps it; the flush path
+   * re-checks it after EVERY await and aborts on a mismatch, so a write keyed to
+   * the old identity can never reach the server after a switch.
+   */
+  private identityEpoch = 0;
+
+  /** dedupKeys already POSTed to `/v1/history` (the pushed-set, Task 7.4). */
+  private readonly pushedHistory = new Set<string>();
+  /** The history-seq watermark for `GET /v1/history?since=` (Task 7.4). */
+  private historyCursor = 0;
+  /** Decrypted history records recovered on load, by dedupKey (contract history ops). */
+  private readonly localHistory = new Map<string, HistoryRecord>();
+
   constructor(config: RemoteTokenStorageConfig) {
     this.config = config;
     this.delta = new LoadDeltaTracker({
@@ -127,7 +178,20 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
   // --- TokenStorageProvider -------------------------------------------------
 
   setIdentity(identity: FullIdentity): void {
+    // Bump the identity epoch FIRST so any in-flight flush awaiting an I/O round
+    // trip aborts the moment it next re-checks (Task 7.3) — no cross-identity write.
+    this.identityEpoch += 1;
     this.identity = identity;
+    // Switching identity resets the per-identity server view: the flush gate must
+    // re-open on the new owner's first load, and the old `known`/cursor are stale.
+    this.known.clear();
+    this.contentHash.clear();
+    this.serverCursor = 0;
+    this.restoredAddress = null;
+    this.initialLoadDone = false;
+    this.pushedHistory.clear();
+    this.localHistory.clear();
+    this.historyCursor = 0;
     this.auth = new VaultApiClient({
       network: this.config.network,
       chainPubkey: identity.chainPubkey,
@@ -139,16 +203,39 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     this.delta.setWalletPriv(this.config.privateKey);
   }
 
-  /** Phase 6 initialize: authenticate so the data client carries a JWT. */
+  /** Abort the flush path if the identity epoch advanced (Task 7.3). */
+  private assertEpoch(epoch: number): void {
+    if (epoch !== this.identityEpoch) throw new IdentityFencedError();
+  }
+
+  /**
+   * Authenticate, then run the FIRST load ourselves so the flush gate opens even
+   * when `PaymentsModule.load()` short-circuits before reaching this provider
+   * (Task 7.1). A transient first-load failure is swallowed (the gate stays SHUT,
+   * `sync()` no-ops) so an empty local import can never overwrite the server.
+   */
   async initialize(): Promise<boolean> {
     this.status = 'connecting';
     await this.requireAuth().authenticate();
     this.status = 'connected';
+    const first = await this.load();
+    if (!first.success) {
+      this.emit('storage:error', { reason: 'initial-load' }, first.error);
+    }
     return true;
   }
 
+  /** True once the first successful load opened the flush gate (Task 7.1). */
+  isInitialLoadDone(): boolean {
+    return this.initialLoadDone;
+  }
+
   async shutdown(): Promise<void> {
-    this.status = 'disconnected';
+    // Route through the queue so an in-flight flush drains first (Task 7.3).
+    await this.queue.enqueue(() => {
+      this.status = 'disconnected';
+      return Promise.resolve();
+    });
   }
 
   /** `save` routes through `sync` (the vault has no local-only persistence). */
@@ -160,16 +247,77 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
   // === sync (Task 6.2 / 6.3) ================================================
 
   async sync(localData: TData): Promise<SyncResult<TData>> {
+    // Flush gate (Task 7.1): no PATCH before a successful first load, so a
+    // transient load failure can never wipe the server with empty local data.
+    if (!this.initialLoadDone) {
+      return { success: true, merged: localData, added: 0, removed: 0, conflicts: 0 };
+    }
+    // Capture the identity epoch BEFORE queueing; the flush aborts if it advances
+    // across any await (Task 7.3). Serialized so flushes never interleave.
+    const epoch = this.identityEpoch;
+    return this.queue.enqueue(() => this.runSync(localData, epoch));
+  }
+
+  private async runSync(localData: TData, epoch: number): Promise<SyncResult<TData>> {
     this.emit('sync:started');
     try {
+      this.assertEpoch(epoch);
       const ops = this.planFlush(localData);
-      if (ops.length === 0) return this.cleanResult(localData, 0, 0, 0);
-      return await this.flush(localData, ops);
+      const reserved = await this.planReservedAddress();
+      this.assertEpoch(epoch); // re-check after the (async) reserved-address derive
+      await this.pushHistory(localData, epoch); // single-channel history (Task 7.4)
+      if (ops.length === 0 && !reserved) return this.cleanResult(localData, 0, 0, 0);
+      return await this.flush(localData, ops, reserved, epoch);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'sync failed';
       this.emit('sync:error', undefined, message);
       return { success: false, added: 0, removed: 0, conflicts: 0, error: message };
     }
+  }
+
+  /**
+   * Single-channel history (Task 7.4): diff the `_history` dedupKeys vs the pushed
+   * set and POST only NEW records (each AEAD-sealed). `appendHistory` is idempotent
+   * server-side, so a duplicate dedupKey is accepted (not an error) — only a real
+   * failure rejects, and a real error rethrows up the flush path.
+   */
+  private async pushHistory(localData: TData, epoch: number): Promise<void> {
+    const history = localData._history ?? [];
+    const fresh = history.filter((r) => !this.pushedHistory.has(r.dedupKey));
+    if (fresh.length === 0) return;
+    const records = fresh.map((r) => ({ dedupKey: r.dedupKey, payload: this.sealHistory(r) }));
+    const res = await this.client().appendHistory(records);
+    this.assertEpoch(epoch); // fence after the history POST await
+    for (const r of fresh) {
+      const wasRejected = res.rejected.some((x) => x.dedupKey === r.dedupKey);
+      if (wasRejected) continue; // keep out of the pushed set → retried next flush
+      this.pushedHistory.add(r.dedupKey);
+      this.localHistory.set(r.dedupKey, r);
+    }
+  }
+
+  private sealHistory(record: HistoryRecord): { nonce: string; ct: string } {
+    return sealHistoryRecord(record, this.ownerId(), this.config.privateKey, this.config.network);
+  }
+
+  /**
+   * The reserved meta-address op (Task 7.2, finding #17). Sealed once, from the
+   * REAL engine identity (`deriveDirectAddress(hexToBytes(chainPubkey))`), so a
+   * fresh import restores `_meta.address` without re-deriving from tokens — the
+   * XP-invariant address survives a wipe. Returns `null` once it is on the server.
+   */
+  private async planReservedAddress(): Promise<PatchOp | null> {
+    const wk = reservedAddressKey(this.config.privateKey, this.config.network);
+    const cur = this.known.get(wk);
+    if (cur && !cur.deleted) return null; // already on the server
+    const chainPubkey = this.ownerId();
+    const directAddress = await deriveDirectAddress(hexToBytes(chainPubkey));
+    const payload = sealReservedAddress(
+      { directAddress, chainPubkey, formatVersion: RESERVED_ADDRESS_FORMAT_VERSION },
+      this.config.privateKey,
+      this.config.network,
+    );
+    return { key: wk, baseVersion: 0, payload };
   }
 
   /** Diff the TXF snapshot vs internal last-known state into a list of CAS ops. */
@@ -179,6 +327,7 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
       known: this.known,
       wireKeyOf: (plainKey) => this.wireKeyFor(plainKey),
       changed: (wk, value) => this.hasChanged(wk, value),
+      reserved: new Set([reservedAddressKey(this.config.privateKey, this.config.network)]),
     });
   }
 
@@ -186,11 +335,31 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     return this.contentHash.get(wk) !== this.hashValue(value);
   }
 
-  /** PATCH the planned ops, map the response onto `SyncResult`. */
-  private async flush(localData: TData, ops: PlannedOp[]): Promise<SyncResult<TData>> {
+  /** PATCH the planned ops (token ops + the optional reserved-address op). */
+  private async flush(
+    localData: TData,
+    ops: PlannedOp[],
+    reserved: PatchOp | null,
+    epoch: number,
+  ): Promise<SyncResult<TData>> {
     const wireOps = ops.map((op) => this.toWireOp(op));
-    const res = await this.client().patchEntries(wireOps);
-    return this.applyPatchResult(localData, ops, res);
+    if (reserved) wireOps.push(reserved);
+    // Bind the client to the flush-start owner BEFORE the await so the patch can
+    // never re-target a switched identity.
+    const client = this.client();
+    const res = await client.patchEntries(wireOps);
+    // Identity fence (Task 7.3): if the identity switched across the patch await,
+    // abort WITHOUT committing local state under the wrong identity.
+    this.assertEpoch(epoch);
+    if (reserved && res.applied.includes(reserved.key)) {
+      this.known.set(reserved.key, { version: 1, deleted: false });
+    }
+    const result = this.applyPatchResult(localData, ops, res);
+    // Re-sign the local baseline so the wallet's OWN writes advance the signed
+    // root — the next load must not see them as an unauthored delta (Task 7.1).
+    await this.delta.rebaseline(this.serverCursor, this.knownAsEntryState());
+    this.assertEpoch(epoch); // re-check after the baseline persist await
+    return result;
   }
 
   /** Seal one planned op into its on-wire `{key: wireKey, baseVersion, payload?, deleted?}`. */
@@ -312,7 +481,39 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     }
     this.serverCursor = since;
     await this.delta.commitBaseline(since, lastEpoch, lastEpochSig);
-    return this.materialize(pages);
+    const recovered = await this.loadHistory(); // single-channel history (Task 7.4)
+    return this.materialize(pages, recovered);
+  }
+
+  /**
+   * Pull the single-channel history log (Task 7.4). There is no `more` flag on the
+   * wire (`GET /v1/history?since=<seq>`): the client loops `since=maxSeq` until a
+   * page comes back SHORT — fewer records than the server's full page size, which
+   * we infer as the largest page seen. Each payload is decrypted to a
+   * `HistoryRecord`, merged into the local map, and marked pushed so a later flush
+   * never re-POSTs it. Returns the records recovered THIS load.
+   */
+  private async loadHistory(): Promise<HistoryRecord[]> {
+    const client = this.client();
+    const recovered: HistoryRecord[] = [];
+    let pageSize = 0; // inferred full-page size (the largest page observed)
+    for (;;) {
+      const page = await client.historySince(this.historyCursor);
+      for (const row of page.records) recovered.push(this.absorbHistoryRow(row));
+      pageSize = Math.max(pageSize, page.records.length);
+      // A short page (fewer than a full page, or empty) ends the loop.
+      if (page.records.length === 0 || page.records.length < pageSize) break;
+    }
+    return recovered;
+  }
+
+  /** Decrypt + cache one history row, marking it pushed and advancing the cursor. */
+  private absorbHistoryRow(row: { dedupKey: string; payload: { nonce: string; ct: string }; seq: number }): HistoryRecord {
+    const record = openHistoryRecord(row.dedupKey, row.payload, this.ownerId(), this.config.privateKey, this.config.network);
+    this.localHistory.set(record.dedupKey, record);
+    this.pushedHistory.add(record.dedupKey);
+    this.historyCursor = Math.max(this.historyCursor, row.seq);
+    return record;
   }
 
   private rollback(reason: string): LoadResult<TData> {
@@ -320,21 +521,46 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     return { success: false, error: `vault rollback: ${reason}`, source: 'remote', timestamp: Date.now() };
   }
 
-  /** Build the TXF snapshot from the accumulated `/state` rows + adopt their versions. */
-  private materialize(entries: StateEntry[]): LoadResult<TData> {
-    const data: TxfStorageDataBase = {
-      _meta: {
-        version: 1,
-        address: this.identity?.directAddress ?? this.identity?.l1Address ?? '',
-        formatVersion: '2.0',
-        updatedAt: Date.now(),
-      },
-    };
+  /**
+   * Build the TXF snapshot from the accumulated `/state` rows, adopting their
+   * versions and running the 3-state machine (Task 7.2):
+   *  - LOAD_FAILED: a corrupt reserved-address entry throws → caller returns
+   *    `success:false`, the gate stays SHUT (initialLoadDone untouched).
+   *  - POPULATED: the reserved entry decodes → `_meta.address` is restored (#17).
+   *  - EMPTY: no reserved entry has ever been seen → an `isEmpty` sentinel rides
+   *    INSIDE `data` so it can never short-circuit local data (#22).
+   */
+  private materialize(entries: StateEntry[], history: HistoryRecord[]): LoadResult<TData> {
+    const reserved = this.restoreReservedAddress(entries); // may throw → LOAD_FAILED
     for (const e of entries) {
       this.known.set(e.key, { version: e.version, deleted: e.deleted });
     }
-    this.emit('storage:loaded', { entries: entries.length });
+    const isEmpty =
+      !reserved && this.restoredAddress === null && this.knownCount() === 0 && history.length === 0;
+    const data: TxfStorageDataBase & { isEmpty?: boolean } = {
+      _meta: { version: 1, address: this.restoredAddress ?? '', formatVersion: '2.0', updatedAt: Date.now() },
+    };
+    // Attach recovered history for the existing import hook (importHistoryEntries).
+    if (history.length > 0) data._history = history;
+    if (isEmpty) data.isEmpty = true;
+    this.initialLoadDone = true; // the flush gate opens on a successful load (Task 7.1)
+    this.emit('storage:loaded', { entries: entries.length, history: history.length });
     return { success: true, data: data as TData, source: 'remote', timestamp: Date.now() };
+  }
+
+  /**
+   * Find + decode the reserved meta-address entry from the page rows, caching the
+   * restored DIRECT:// address. Throws on a decrypt/verify failure (LOAD_FAILED);
+   * a missing reserved entry is fine (EMPTY / not-yet-flushed). Returns true when a
+   * reserved row was present on this page.
+   */
+  private restoreReservedAddress(entries: StateEntry[]): boolean {
+    const wk = reservedAddressKey(this.config.privateKey, this.config.network);
+    const row = entries.find((e) => e.key === wk && !e.deleted);
+    if (!row) return false;
+    const meta = openReservedAddress(row.payload, this.ownerId(), this.config.privateKey, this.config.network);
+    this.restoredAddress = meta.directAddress;
+    return true;
   }
 
   // === events ===============================================================
@@ -349,26 +575,71 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     for (const cb of this.listeners) cb(event);
   }
 
-  // === history (Phase 7) ====================================================
+  // === history (Task 7.4 — single channel) ==================================
 
-  async addHistoryEntry(_entry: HistoryRecord): Promise<void> {
-    throw new Error('history sync lands in Phase 7');
+  /**
+   * Append one history entry: seal + POST it to `/v1/history` (idempotent), then
+   * cache it locally and mark it pushed. A duplicate dedupKey is a no-op (idempotent
+   * server-side); a real append error rethrows.
+   */
+  async addHistoryEntry(entry: HistoryRecord): Promise<void> {
+    if (this.pushedHistory.has(entry.dedupKey)) {
+      this.localHistory.set(entry.dedupKey, entry);
+      return;
+    }
+    const res = await this.client().appendHistory([{ dedupKey: entry.dedupKey, payload: this.sealHistory(entry) }]);
+    if (res.rejected.some((r) => r.dedupKey === entry.dedupKey)) {
+      const reason = res.rejected.find((r) => r.dedupKey === entry.dedupKey)!.reason;
+      throw new Error(`vault history append rejected: ${reason}`);
+    }
+    this.pushedHistory.add(entry.dedupKey);
+    this.localHistory.set(entry.dedupKey, entry);
   }
 
+  /** All locally-known history records, newest first (recovered on load). */
   async getHistoryEntries(): Promise<HistoryRecord[]> {
-    return [];
+    return [...this.localHistory.values()].sort((a, b) => b.timestamp - a.timestamp);
   }
 
-  async hasHistoryEntry(_dedupKey: string): Promise<boolean> {
-    return false;
+  async hasHistoryEntry(dedupKey: string): Promise<boolean> {
+    return this.localHistory.has(dedupKey);
   }
 
+  /** Local-only clear (the server log is append-only and never truncated by a client). */
   async clearHistory(): Promise<void> {
-    // Phase 7
+    this.localHistory.clear();
   }
 
-  async importHistoryEntries(_entries: HistoryRecord[]): Promise<number> {
-    return 0;
+  /** Bulk-import history (skip existing dedupKeys); push each new record. Returns new count. */
+  async importHistoryEntries(entries: HistoryRecord[]): Promise<number> {
+    let imported = 0;
+    for (const entry of entries) {
+      if (this.localHistory.has(entry.dedupKey)) continue;
+      await this.addHistoryEntry(entry);
+      imported += 1;
+    }
+    return imported;
+  }
+
+  // === account delete (Task 7.5) ============================================
+
+  /**
+   * Fresh-signature-gated account deletion (§7.4). Fetch a fresh single-use
+   * delete-nonce, sign the REAL `delete:v1` template — `unicity:vault:delete:v1\n`
+   * + `network\nownerId\nnonce` — with the wallet key, and send `DELETE /v1/account`.
+   * A missing/stale signature is rejected CLIENT-side (we never send an empty sig),
+   * so the spend key signs only a fresh, server-issued nonce. Returns the server's
+   * `ok` (a bad/stale signature → `false`, mapping to the server's 401).
+   */
+  async deleteAccount(): Promise<boolean> {
+    const client = this.client();
+    const { nonce } = await client.deleteNonce();
+    const ownerId = this.ownerId();
+    const signature = signMessage(this.config.privateKey, deleteCanon(this.config.network, ownerId, nonce));
+    // Client-side freshness guard: never send a missing/empty signature.
+    if (!nonce || !signature) throw new Error('vault account delete: missing fresh nonce/signature');
+    const res = await client.deleteAccount(nonce, signature);
+    return res.ok;
   }
 
   // === internals ============================================================

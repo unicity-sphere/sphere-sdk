@@ -28,6 +28,9 @@ export interface ReservedAddress {
 /** Plaintext label for the reserved meta-address slot. */
 export const RESERVED_ADDRESS_PLAIN_KEY = '_vaultmeta_addr';
 
+/** Format version stamped into the reserved meta-address plaintext (DIRECT:// v1). */
+export const RESERVED_ADDRESS_FORMAT_VERSION = 1;
+
 /** Fixed version of the reserved slot (singleton — never bumped). */
 const RESERVED_ADDRESS_VERSION = 0;
 

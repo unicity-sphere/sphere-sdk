@@ -54,17 +54,17 @@ describe('paginated state load', () => {
     await seed.initialize();
     await seed.sync(txf({ a: { n: 1 }, b: { n: 2 }, c: { n: 3 }, d: { n: 4 }, e: { n: 5 } }));
 
-    // A fresh provider loads from scratch (serverCursor 0) and must paginate.
+    // A fresh provider loads from scratch (serverCursor 0) and must paginate. Under
+    // Task 7.1 the first load is performed by initialize() itself, so count its pages.
     const reader = makeProvider(server);
-    await reader.initialize();
     server.calls.state.length = 0; // count only the reader's pages
-    const res = await reader.load();
+    await reader.initialize();
 
-    expect(res.success).toBe(true);
-    // 5 entries / pageLimit 2 → since 0,2,4 → 3 pages.
+    // 5 tokens + 1 reserved-address entry = 6 rows / pageLimit 2 → since 0,2,4 → 3 pages.
     expect(server.calls.state).toEqual([0, 2, 4]);
-    // The reader adopted all 5 entries into its known state.
-    expect(reader.knownCount()).toBe(5);
+    // The reader adopted all 6 rows (5 tokens + the reserved-address slot, Task 7.2).
+    expect(reader.knownCount()).toBe(6);
+    expect(reader.isInitialLoadDone()).toBe(true);
   });
 
   it('a regressing page cursor (no sanctioned epoch) trips the rollback gate', async () => {
@@ -85,6 +85,10 @@ describe('paginated state load', () => {
           calls += 1;
           return calls === 2 ? { ...page, cursor: since - 1, more: false } : page;
         },
+        appendHistory: (records) => inner.appendHistory(records),
+        historySince: (since) => inner.historySince(since),
+        deleteNonce: () => inner.deleteNonce(),
+        deleteAccount: (nonce, sig) => inner.deleteAccount(nonce, sig),
       };
     };
 
