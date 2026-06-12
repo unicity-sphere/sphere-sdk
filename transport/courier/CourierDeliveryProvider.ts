@@ -16,7 +16,8 @@
 
 import type { FullIdentity } from '../../types';
 import type { V2TransferPayload } from '../../types/v2-transfer';
-import { sealCourierEnvelope } from '../../vault-aead/courier';
+import { isV2TransferPayload } from '../../types/v2-transfer';
+import { sealCourierEnvelope, openCourierEnvelope } from '../../vault-aead/courier';
 import { courierEntryId } from './entryId';
 import type {
   CourierHttpClient,
@@ -31,6 +32,11 @@ import type {
  * `handleV2Transfer(payload, senderPubkey)` so the receive path is unchanged.
  */
 export type V2TransferSink = (payload: V2TransferPayload, senderPubkey: string) => Promise<void>;
+
+/** One ACK-PENDING journal entry (re-fired until the server shows `claimed`). */
+interface AckPendingEntry {
+  senderPubkey: string;
+}
 
 /** Minimal persistent KV the journal needs (matches PaymentsModule storage). */
 export interface CourierJournalStore {
@@ -127,6 +133,109 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
       entryId,
       plaintext,
     });
+  }
+
+  // ===========================================================================
+  // Receive (Task 5.2)
+  // ===========================================================================
+
+  /**
+   * Pull the inbox since the server read pointer, open each envelope, decode it
+   * to a {@link TokenEnvelope}, map it to a {@link V2TransferPayload}, and feed
+   * the EXISTING `handleV2Transfer` path (via {@link V2TransferSink}) UNCHANGED.
+   *
+   * Re-pulling an already-processed-but-unclaimed item is harmless — the sink
+   * dedups by `v2_${tokenId}`. After a successful receive the entry is queued for
+   * the signed ack (Task 5.3).
+   */
+  async receive(): Promise<void> {
+    const me = this.requireIdentity();
+    const client = this.config.httpClientFactory(me.chainPubkey);
+    const since = await this.readPointer();
+    const res = await client.inbox(since);
+    for (const item of res.items) {
+      if (item.status === 'claimed') continue;
+      await this.receiveItem(me, item);
+    }
+  }
+
+  /** Open one inbox item and feed it to handleV2Transfer; then arm the ack. */
+  private async receiveItem(
+    me: FullIdentity,
+    item: { entryId: string; senderPubkey: string; ciphertext: string },
+  ): Promise<void> {
+    let payload: V2TransferPayload;
+    try {
+      payload = this.openItem(me, item);
+    } catch {
+      // A tampered / undecryptable envelope is dropped (the tag failure is the
+      // operator-blind integrity check); discovery is not wedged by one bad row.
+      return;
+    }
+    // Custody commit: hand the verified-by-engine payload to handleV2Transfer.
+    // The sender is addressed by chainPubkey; nametag enrichment no-ops over the
+    // courier (Nostr-keyed), so the RECEIVED history records the chainPubkey only.
+    await this.config.onV2Transfer(payload, item.senderPubkey);
+    // ACK-PENDING is journaled AFTER the custody commit (Task 5.3).
+    await this.journalAckPending(item.entryId, item.senderPubkey);
+  }
+
+  /**
+   * `unpackCourier` slices the first 24 bytes as the nonce; `openCourierEnvelope`
+   * rebuilds the AAD and verifies the tag, then we decode the JSON V2_TRANSFER.
+   */
+  private openItem(
+    me: FullIdentity,
+    item: { entryId: string; senderPubkey: string; ciphertext: string },
+  ): V2TransferPayload {
+    const pt = openCourierEnvelope({
+      network: this.config.network,
+      recipientPriv: me.privateKey,
+      senderPubkey: item.senderPubkey,
+      recipientPubkey: me.chainPubkey,
+      entryId: item.entryId,
+      ciphertext: item.ciphertext,
+    });
+    const decoded = JSON.parse(new TextDecoder().decode(pt)) as unknown;
+    if (!isV2TransferPayload(decoded)) {
+      throw new Error('courier: decoded envelope is not a V2_TRANSFER payload');
+    }
+    return decoded;
+  }
+
+  // ===========================================================================
+  // Journal (read pointer + ACK-PENDING)
+  // ===========================================================================
+
+  private readPointerKey(): string {
+    return `courier_read_pointer:${this.config.network}:${this.requireIdentity().chainPubkey}`;
+  }
+
+  private async readPointer(): Promise<number> {
+    const raw = await this.config.journal.get(this.readPointerKey());
+    return raw ? Number(raw) : 0;
+  }
+
+  private ackPendingKey(): string {
+    return `courier_ack_pending:${this.config.network}:${this.requireIdentity().chainPubkey}`;
+  }
+
+  private async loadAckPending(): Promise<Record<string, AckPendingEntry>> {
+    const raw = await this.config.journal.get(this.ackPendingKey());
+    return raw ? (JSON.parse(raw) as Record<string, AckPendingEntry>) : {};
+  }
+
+  /**
+   * Journal an ACK-PENDING entry keyed by entryId, written AFTER the custody
+   * commit and BEFORE the ack POST (invariant: custody-commit ≺ ack-journal ≺
+   * ack-POST). Re-fired from the journal until the server shows `claimed`.
+   */
+  private async journalAckPending(entryId: string, senderPubkey: string): Promise<void> {
+    const pending = await this.loadAckPending();
+    if (!pending[entryId]) {
+      pending[entryId] = { senderPubkey };
+      await this.config.journal.set(this.ackPendingKey(), JSON.stringify(pending));
+    }
   }
 
   // ===========================================================================
