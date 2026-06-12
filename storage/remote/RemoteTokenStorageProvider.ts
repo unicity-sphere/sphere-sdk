@@ -97,6 +97,15 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
   private readonly listeners = new Set<StorageEventCallback>();
   private readonly delta: LoadDeltaTracker;
 
+  /**
+   * The flush gate (Task 7.1). `sync()` is a NO-OP until the FIRST successful
+   * `load()` opens it. `PaymentsModule.load()` stops at the first successful
+   * provider, so this provider may never get a caller `load()` — `initialize()`
+   * runs the first load itself. Empty-import protection: a transient load failure
+   * leaves this `false`, so an empty local snapshot can never wipe the server.
+   */
+  private initialLoadDone = false;
+
   constructor(config: RemoteTokenStorageConfig) {
     this.config = config;
     this.delta = new LoadDeltaTracker({
@@ -139,12 +148,26 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     this.delta.setWalletPriv(this.config.privateKey);
   }
 
-  /** Phase 6 initialize: authenticate so the data client carries a JWT. */
+  /**
+   * Authenticate, then run the FIRST load ourselves so the flush gate opens even
+   * when `PaymentsModule.load()` short-circuits before reaching this provider
+   * (Task 7.1). A transient first-load failure is swallowed (the gate stays SHUT,
+   * `sync()` no-ops) so an empty local import can never overwrite the server.
+   */
   async initialize(): Promise<boolean> {
     this.status = 'connecting';
     await this.requireAuth().authenticate();
     this.status = 'connected';
+    const first = await this.load();
+    if (!first.success) {
+      this.emit('storage:error', { reason: 'initial-load' }, first.error);
+    }
     return true;
+  }
+
+  /** True once the first successful load opened the flush gate (Task 7.1). */
+  isInitialLoadDone(): boolean {
+    return this.initialLoadDone;
   }
 
   async shutdown(): Promise<void> {
@@ -160,6 +183,11 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
   // === sync (Task 6.2 / 6.3) ================================================
 
   async sync(localData: TData): Promise<SyncResult<TData>> {
+    // Flush gate (Task 7.1): no PATCH before a successful first load, so a
+    // transient load failure can never wipe the server with empty local data.
+    if (!this.initialLoadDone) {
+      return { success: true, merged: localData, added: 0, removed: 0, conflicts: 0 };
+    }
     this.emit('sync:started');
     try {
       const ops = this.planFlush(localData);
@@ -190,7 +218,11 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
   private async flush(localData: TData, ops: PlannedOp[]): Promise<SyncResult<TData>> {
     const wireOps = ops.map((op) => this.toWireOp(op));
     const res = await this.client().patchEntries(wireOps);
-    return this.applyPatchResult(localData, ops, res);
+    const result = this.applyPatchResult(localData, ops, res);
+    // Re-sign the local baseline so the wallet's OWN writes advance the signed
+    // root — the next load must not see them as an unauthored delta (Task 7.1).
+    await this.delta.rebaseline(this.serverCursor, this.knownAsEntryState());
+    return result;
   }
 
   /** Seal one planned op into its on-wire `{key: wireKey, baseVersion, payload?, deleted?}`. */
@@ -333,6 +365,7 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     for (const e of entries) {
       this.known.set(e.key, { version: e.version, deleted: e.deleted });
     }
+    this.initialLoadDone = true; // the flush gate opens on a successful load (Task 7.1)
     this.emit('storage:loaded', { entries: entries.length });
     return { success: true, data: data as TData, source: 'remote', timestamp: Date.now() };
   }
