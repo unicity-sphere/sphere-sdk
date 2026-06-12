@@ -286,17 +286,26 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
    */
   private async loadPaginated(): Promise<LoadResult<TData>> {
     const client = this.client();
+    await this.delta.beginLoad();
     let since = this.serverCursor;
     const pages: StateEntry[] = [];
     let lastEpochSig = '';
     let lastEpoch = 0;
     for (;;) {
       const page = await client.getState(since);
-      const gate = await this.delta.ingestPage({ since, entries: page.entries, cursor: page.cursor, epoch: page.syncEpoch, epochSig: page.epochSig });
+      const gate = await this.delta.ingestPage({
+        since,
+        entries: page.entries,
+        cursor: page.cursor,
+        epoch: page.syncEpoch,
+        epochSig: page.epochSig,
+      });
       if (!gate.ok) return this.rollback(gate.reason);
       pages.push(...page.entries);
       lastEpochSig = page.epochSig;
       lastEpoch = page.syncEpoch;
+      // Guard against a non-advancing cursor when `more` is set (would loop forever).
+      if (page.more && page.cursor <= since) return this.rollback('cursor did not advance');
       since = page.cursor;
       if (!page.more) break;
     }
@@ -393,5 +402,12 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
   /** Stable content hash for no-op-update suppression (order-independent JSON). */
   private hashValue(value: unknown): string {
     return JSON.stringify(value ?? null);
+  }
+
+  /** Live (non-tombstoned) entry count in the internal last-known state (tests/diagnostics). */
+  knownCount(): number {
+    let n = 0;
+    for (const e of this.known.values()) if (!e.deleted) n += 1;
+    return n;
   }
 }

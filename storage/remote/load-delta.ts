@@ -87,11 +87,22 @@ export class LoadDeltaTracker {
   }
 
   /**
-   * Ingest one `/state` page: monotonicity + root gate. On the first page of a
-   * pass it lazily loads + verifies the persisted signed baseline.
+   * Begin a load pass: load + verify the persisted signed baseline and seed the
+   * accumulator from it. MUST be called once before the pagination loop.
    */
+  async beginLoad(): Promise<void> {
+    this.sanctionedEpoch = false;
+    this.baseline = await this.loadBaseline();
+    this.accState = new Map();
+    if (this.baseline && !verifyRoot(this.bindingFor(this.baseline.cursor, this.baseline.root), this.baseline.sig, this.ownerPubForVerify())) {
+      // A corrupt/forged local baseline is treated as no baseline (a fresh load).
+      this.baseline = null;
+    }
+  }
+
+  /** Ingest one `/state` page: monotonicity + root gate. */
   async ingestPage(page: LoadPage): Promise<GateResult> {
-    if (this.accState === null) await this.beginPass();
+    if (this.accState === null) await this.beginLoad();
     const epochOk = this.recogniseEpoch(page);
     const mono = this.checkMonotonic(page);
     if (!mono.ok && !epochOk) return mono;
@@ -101,17 +112,6 @@ export class LoadDeltaTracker {
       if (!verdict.ok) return verdict;
     }
     return { ok: true };
-  }
-
-  /** Load + verify the persisted signed baseline; seed the accumulator from it. */
-  private async beginPass(): Promise<void> {
-    this.sanctionedEpoch = false;
-    this.baseline = await this.loadBaseline();
-    this.accState = new Map();
-    if (this.baseline && !verifyRoot(this.bindingFor(this.baseline.cursor, this.baseline.root), this.baseline.sig, this.ownerPubForVerify())) {
-      // A corrupt/forged local baseline is treated as no baseline (a fresh load).
-      this.baseline = null;
-    }
   }
 
   /** Recognise a server-verified epoch bump (sanctioned reset — 8.2 seam). */
@@ -158,12 +158,13 @@ export class LoadDeltaTracker {
    * authoritative post-load state; the root binds `(network, ownerId, cursor)`.
    */
   async commitBaseline(cursor: number, epoch: number, _epochSig: string): Promise<void> {
-    if (!this.config.baseline || !this.walletPriv) return;
-    const root = computeRoot(this.accState ?? new Map());
-    const sig = signRoot(this.walletPriv, this.bindingFor(cursor, root));
-    const baseline: SignedBaseline = { cursor, root, sig, epoch };
-    await this.config.baseline.set(this.baselineKey(), JSON.stringify(baseline));
-    this.accState = null; // close the pass
+    if (this.config.baseline && this.walletPriv) {
+      const root = computeRoot(this.accState ?? new Map());
+      const sig = signRoot(this.walletPriv, this.bindingFor(cursor, root));
+      const baseline: SignedBaseline = { cursor, root, sig, epoch };
+      await this.config.baseline.set(this.baselineKey(), JSON.stringify(baseline));
+    }
+    this.accState = null; // close the pass regardless of whether a baseline was persisted
   }
 
   /**
