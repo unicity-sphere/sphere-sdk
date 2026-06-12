@@ -191,14 +191,34 @@ export class WalletApiMailboxProvider implements DeliveryProvider {
 
     // Deposit (idempotent by entry_id — §6). The memo is S6-encrypted BEFORE
     // it leaves the device (§8.3): the operator never sees plaintext.
-    const entryId = await this.client.depositMailbox({
-      recipientPubkey,
-      key: upload.key,
-      transferId: options.transferId,
-      stateHash: keys.stateHash,
-      tokenId: keys.tokenId,
-      ...(options.memo !== undefined ? { memo: encryptField(this.fieldKey, options.memo) } : {}),
-    });
+    let entryId: string;
+    try {
+      entryId = await this.client.depositMailbox({
+        recipientPubkey,
+        key: upload.key,
+        transferId: options.transferId,
+        stateHash: keys.stateHash,
+        tokenId: keys.tokenId,
+        ...(options.memo !== undefined ? { memo: encryptField(this.fieldKey, options.memo) } : {}),
+      });
+    } catch (err) {
+      // §6 CONFLICT = the backend already holds a record of EXACTLY this
+      // (tokenId, stateHash) with different bytes. Reachable honestly in one
+      // way: a resume re-derives the byte-identical TRANSACTION (E.1), but
+      // the aggregator RECOMPUTES inclusion proofs per request (st-sdk#126),
+      // so once the tree has advanced the rebuilt token blob's proof bytes —
+      // and its content-addressed key — differ from the originally-deposited
+      // blob's. The state itself is identical and bound to this recipient by
+      // its own predicate (§8.2), so the existing entry IS this delivery:
+      // succeed idempotently with the content-derived id (the port contract —
+      // deliver is idempotent per (token, state), S7). A foreign-spend
+      // conflict can never reach here: the engine's E.2 match-verify raises
+      // TransferConflictError before anything is delivered.
+      if (err instanceof WalletApiError && err.status === 409) {
+        return { deliveryId: keys.deliveryId };
+      }
+      throw err;
+    }
 
     // covenant §3.1-4: the id is CONTENT-DERIVED — computed client-side; a
     // backend returning anything else (e.g. a row id) is a protocol violation.

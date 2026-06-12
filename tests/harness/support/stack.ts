@@ -22,20 +22,46 @@ import { getPublicKey } from '../../../core/crypto';
 export interface HarnessStack {
   /** wallet-api base URL (loopback http — allowed by the §4 client rule). */
   readonly baseUrl: string;
-  /** Mock-aggregator JSON-RPC base URL (also serves /trustbase.json). */
+  /** Aggregator JSON-RPC base URL (the stack's mock, or the REAL gateway in live mode). */
   readonly aggregatorUrl: string;
   /** Must match the backend's NETWORK env (auth challenges embed it — §4). */
   readonly network: string;
+  /** Gateway API key (live mode only — testnet2 requires it for submits). NEVER logged. */
+  readonly aggregatorApiKey?: string;
+  /**
+   * Where the trustbase JSON lives. The mock aggregator serves its own at
+   * /trustbase.json; the live suite points at the REAL pinned testnet2 root
+   * (the same URL the backend's §8.2 boot pin uses).
+   */
+  readonly trustbaseUrl?: string;
 }
 
+/**
+ * Live-mode handoff to child processes: the crash-drill runner is a separate
+ * OS process that rebuilds its stack via `stackFromEnv()`, so the live suite
+ * exports its configuration through HARNESS_LIVE_* env vars (set by
+ * tests/harness/live/support/live-stack.ts; inherited via spawn env).
+ */
 export function stackFromEnv(): HarnessStack {
   const apiPort = process.env.WALLET_API_PORT ?? '3000';
   const aggPort = process.env.AGGREGATOR_PORT ?? '3001';
-  return {
+  const base = {
     baseUrl: `http://127.0.0.1:${apiPort}`,
-    aggregatorUrl: `http://127.0.0.1:${aggPort}`,
     network: 'testnet2', // docker-compose.dev.yml NETWORK; fixture tokens stay on NetworkId.LOCAL
   };
+  const liveAggregatorUrl = process.env.HARNESS_LIVE_AGGREGATOR_URL;
+  const liveTrustbaseUrl = process.env.HARNESS_LIVE_TRUSTBASE_URL;
+  if (liveAggregatorUrl && liveTrustbaseUrl) {
+    return {
+      ...base,
+      aggregatorUrl: liveAggregatorUrl,
+      trustbaseUrl: liveTrustbaseUrl,
+      ...(process.env.HARNESS_LIVE_AGGREGATOR_KEY
+        ? { aggregatorApiKey: process.env.HARNESS_LIVE_AGGREGATOR_KEY }
+        : {}),
+    };
+  }
+  return { ...base, aggregatorUrl: `http://127.0.0.1:${aggPort}` };
 }
 
 /** The wallet-api checkout that carries docker-compose.dev.yml. */
@@ -51,10 +77,11 @@ export function walletApiDir(): string {
   return dir;
 }
 
-/** The shared LOCAL trustbase, fetched from the stack's mock aggregator. */
-export async function fetchTrustbaseJson(aggregatorUrl: string): Promise<unknown> {
-  const res = await fetch(`${aggregatorUrl}/trustbase.json`);
-  if (!res.ok) throw new Error(`trustbase fetch failed: HTTP ${res.status}`);
+/** The stack's trustbase: the mock's own LOCAL root, or the REAL pinned one in live mode. */
+export async function fetchTrustbaseJson(stack: HarnessStack): Promise<unknown> {
+  const url = stack.trustbaseUrl ?? `${stack.aggregatorUrl}/trustbase.json`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`trustbase fetch failed: HTTP ${res.status} (${url})`);
   return res.json();
 }
 

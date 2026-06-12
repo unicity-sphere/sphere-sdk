@@ -15,8 +15,10 @@ This repo is part of the wallet-api program (process: `../wallet-api/development
   in the same PR, before code.
 - **Resume is status-agnostic** (sdk-changes E.2): never key engine resume off a submit status —
   submit, always `getInclusionProof`, match-verify (`OK` = mine, `TRANSACTION_HASH_MISMATCH` =
-  `TransferConflictError`). `STATE_ID_EXISTS` is transitional aggregator lag; tolerant parsing comes
-  via state-transition-sdk-js#125.
+  `TransferConflictError`). The `STATE_ID_EXISTS` aggregator lag is OVER (M7 live e2e observed
+  2026-06-12: the gateway answers `SUCCESS` for duplicate AND conflicting submits — the status
+  carries no conflict signal; see the dated OBSERVED note in `../wallet-api/sdk-changes.md` E.2);
+  tolerant parsing shipped via state-transition-sdk-js#125 and stays.
 - **Ports rule (S7 / covenant):** storage (`TokenStorageProvider`) and delivery (`DeliveryProvider`)
   are independent, swappable, contract-test-enforced ports; the Sphere frontend is a **view** — no
   provider-specific logic outside implementations; custody (`intoInventory`) is a composition-time

@@ -84,6 +84,26 @@ describe('SIGKILL mid-send → fresh-process resume (AC-E5)', () => {
 
     await sender.kill(); // SIGKILL — the apply/complete tail never happens
 
+    // ADVANCE THE AGGREGATOR TREE between kill and resume (live reality: other
+    // users' certifications always land in between). The aggregator recomputes
+    // inclusion proofs per request (st-sdk#126), so the resume's re-fetched
+    // proof — and the rebuilt token blob's content-addressed key — differ from
+    // the originally-deposited blob's. The re-deposit then 409s under §6, and
+    // the S7 deliver contract must absorb it as idempotent success (found by
+    // the S5 live e2e, 2026-06-12; without the absorption this drill fails
+    // exactly like the live one did).
+    const treeAdvancer = await createHarnessWallet({
+      stack,
+      identity: randomIdentity(),
+      deviceId: 'crash-tree-advance',
+      custody: 'inventory',
+    });
+    wallets.push(treeAdvancer);
+    await treeAdvancer.module.load();
+    expect((await treeAdvancer.module.mintFungibleToken(HARNESS_COIN, 1n)).success).toBe(true);
+    treeAdvancer.destroy();
+    wallets.pop();
+
     // Phase 2: a FRESH process from the same seed resumes open intents.
     const resumer = spawnRunner('resume', runnerEnv);
     const resultLine = await resumer.waitForLine(RESUME_RESULT_MARKER);

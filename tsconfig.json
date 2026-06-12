@@ -38,7 +38,8 @@
     "token-engine/**/*.ts",
     "wallet-api/**/*.ts",
     "tests/harness/**/*.ts",
-    "vitest.harness.config.ts"
+    "vitest.harness.config.ts",
+    "vitest.live.config.ts"
   ],
   "exclude": [
     "node_modules",

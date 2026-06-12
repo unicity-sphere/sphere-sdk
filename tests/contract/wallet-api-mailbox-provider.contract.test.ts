@@ -142,6 +142,30 @@ describe('WalletApiMailboxProvider — provider-specific semantics', () => {
       expect(replayed.find((d) => d.deliveryId === deliveryId)).toBeUndefined();
     });
 
+    it('deliver() absorbs a §6 key-variant CONFLICT as idempotent success (proof-bytes drift on resume)', async () => {
+      // The real aggregator RECOMPUTES inclusion proofs per request
+      // (st-sdk#126), so a resume's rebuilt blob for the SAME (tokenId,
+      // stateHash) can carry different proof bytes — a different
+      // content-addressed key — than the originally-deposited blob. The
+      // backend then answers 409 CONFLICT ("entry exists with a different
+      // key"), which the S7 deliver contract (idempotent per (token, state))
+      // absorbs as success: the existing entry IS this delivery. Found by the
+      // S5 live e2e crash drill (2026-06-12); the live-equivalent
+      // reproduction is the harness drill's tree-advance.
+      const blob = h.makeBlob();
+      const first = await h.sender.deliver(h.recipientPubkey, blob.bytes, { transferId: 'tf-h1b' });
+      // Simulate the stored entry having been deposited with byte-variant
+      // bytes: same entry_id, different content key.
+      h.fake.tamperMailboxEntryKey(h.recipientPubkey, first.deliveryId);
+
+      const again = await h.sender.deliver(h.recipientPubkey, blob.bytes, { transferId: 'tf-h1b' });
+      expect(again.deliveryId).toBe(first.deliveryId);
+
+      // No duplicate was created and the recipient still claims exactly once.
+      const incoming = await drain(h.recipientProvider);
+      expect(incoming.filter((d) => d.deliveryId === first.deliveryId)).toHaveLength(1);
+    });
+
     it('claims record intoInventory:false server-side (the §6 delivery-only disposition)', async () => {
       const blob = h.makeBlob();
       const { deliveryId } = await h.sender.deliver(h.recipientPubkey, blob.bytes, { transferId: 'tf-h2' });

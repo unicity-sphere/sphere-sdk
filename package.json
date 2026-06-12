@@ -121,6 +121,7 @@
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
     "test:relay": "vitest run --config vitest.relay.config.ts",
     "test:harness": "vitest run --config vitest.harness.config.ts",
+    "test:e2e:live": "vitest run --config vitest.live.config.ts",
     "lint": "eslint . --ext .ts",
     "typecheck": "tsc --noEmit",
     "cli": "echo 'The CLI has moved to @unicity-sphere/cli — install it with: npm install -g @unicity-sphere/cli' && exit 1"

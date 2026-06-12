@@ -213,13 +213,15 @@ export interface HarnessWallet {
 
 export async function createHarnessWallet(opts: HarnessWalletOptions): Promise<HarnessWallet> {
   const identity = fullIdentity(opts.identity);
-  const trustBaseJson = await fetchTrustbaseJson(opts.stack.aggregatorUrl);
+  const trustBaseJson = await fetchTrustbaseJson(opts.stack);
   // The REAL engine over the stack's aggregator via the SDK's real wire client;
-  // networkId comes from the trustbase (LOCAL = 3).
+  // networkId comes from the trustbase (LOCAL = 3; live testnet2 = 4). In live
+  // mode the gateway API key rides along (held by the engine, never logged).
   const engine = await createSphereTokenEngine({
     aggregatorUrl: opts.stack.aggregatorUrl,
     trustBaseJson,
     privateKey: hexToBytes(opts.identity.privateKey),
+    ...(opts.stack.aggregatorApiKey ? { apiKey: opts.stack.aggregatorApiKey } : {}),
   });
 
   const storage = memoryStorage();

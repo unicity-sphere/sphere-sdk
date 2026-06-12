@@ -456,6 +456,20 @@ export class FakeWalletApi {
     }
   }
 
+  /**
+   * Test hook for the §6 dedup-mismatch path: rewrite a stored entry's s3 key,
+   * simulating an original deposit whose BYTES differed from what a later
+   * re-deliver of the same (tokenId, stateHash) carries. The real-world cause
+   * is proof-bytes instability across fetches (st-sdk#126: the aggregator
+   * recomputes inclusion proofs, so a resume's rebuilt blob keys differently)
+   * — the server then answers 409 CONFLICT, which the S7 deliver contract
+   * absorbs as idempotent success (found by the S5 live e2e, 2026-06-12).
+   */
+  tamperMailboxEntryKey(recipientPubkey: string, entryId: string): void {
+    const entry = this.owner(recipientPubkey).mailbox.get(entryId);
+    if (entry) entry.s3Key = `${entry.s3Key}-proof-variant`;
+  }
+
   /** Server-side history inspection for tests (§10). */
   getHistoryRecords(pubkey: string): Record<string, unknown>[] {
     return [...this.owner(pubkey).history.values()];

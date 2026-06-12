@@ -15,6 +15,9 @@ export default defineConfig({
     globals: true,
     environment: 'node',
     include: ['tests/harness/**/*.test.ts'],
+    // tests/harness/live/** is the S5 LIVE suite (real testnet2 gateway +
+    // AGGREGATOR_KEY) — own config: vitest.live.config.ts (`test:e2e:live`).
+    exclude: ['tests/harness/live/**'],
     globalSetup: ['tests/harness/global-setup.ts'],
     fileParallelism: false,
     testTimeout: 180_000,
