@@ -119,6 +119,23 @@ export default defineConfig([
       /^@unicitylabs\//,
     ],
   },
+  // Shared wallet-api providers (S4 composition presets) — platform-neutral,
+  // consumed by the Sphere frontend; ships dts (unlike impl/browser, whose
+  // missing types forced a consumer-side shim — sphere-sdk#511).
+  {
+    entry: { 'impl/shared/wallet-api/index': 'impl/shared/wallet-api/index.ts' },
+    format: ['esm', 'cjs'],
+    dts: true,
+    clean: false,
+    splitting: false,
+    sourcemap: true,
+    platform: 'browser',
+    target: 'es2022',
+    noExternal: [/^@noble\//],
+    external: [
+      /^@unicitylabs\//,
+    ],
+  },
   // Browser IPFS implementation (requires helia)
   // Separate entry point so users can opt-in to IPFS functionality
   {

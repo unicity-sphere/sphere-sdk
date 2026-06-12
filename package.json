@@ -35,6 +35,16 @@
         "default": "./dist/impl/nodejs/index.cjs"
       }
     },
+    "./impl/shared/wallet-api": {
+      "import": {
+        "types": "./dist/impl/shared/wallet-api/index.d.ts",
+        "default": "./dist/impl/shared/wallet-api/index.js"
+      },
+      "require": {
+        "types": "./dist/impl/shared/wallet-api/index.d.cts",
+        "default": "./dist/impl/shared/wallet-api/index.cjs"
+      }
+    },
     "./core": {
       "import": {
         "types": "./dist/core/index.d.ts",
