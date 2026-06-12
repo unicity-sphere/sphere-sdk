@@ -96,6 +96,9 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
   readonly id = 'wallet-api-token-storage';
   readonly name = 'Wallet API Token Storage';
   readonly type = 'cloud' as const;
+  /** Custody lives in the wallet-api backend — composing this provider without
+   * the wallet-api client is illegal (fail-closed, S7/#515). */
+  readonly requiresWalletApi = true;
 
   private readonly client: WalletApiClient;
   private readonly stateStore: KeyValueStore;

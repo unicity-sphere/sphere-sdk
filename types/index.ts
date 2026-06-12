@@ -397,6 +397,8 @@ export type SphereEventType =
   | 'sync:completed'
   | 'sync:provider'
   | 'sync:error'
+  | 'storage:degraded'
+  | 'walletapi:session'
   | 'connection:changed'
   | 'nametag:registered'
   | 'nametag:recovered'
@@ -477,6 +479,20 @@ export interface SphereEventMap {
   'sync:completed': { source: string; count: number };
   'sync:provider': { providerId: string; success: boolean; added?: number; removed?: number; error?: string };
   'sync:error': { source: string; error: string };
+  /**
+   * The ACTIVE custody token-storage provider failed a background save
+   * (#515 D3b): the in-memory token state is NOT durably persisted until a
+   * later save succeeds. User-facing flows (mint/send) fail loudly instead of
+   * emitting this.
+   */
+  'storage:degraded': { providerId: string; error: string };
+  /**
+   * wallet-api session state change (#515 F3): 'offline' = sign-in failed and
+   * the wallet runs degraded (no intents barrier, no server custody writes);
+   * flips to 'online' when a later sign-in succeeds. Readable any time via
+   * `sphere.walletApiSessionStatus`.
+   */
+  'walletapi:session': { status: 'online' | 'offline'; error?: string };
   'connection:changed': { provider: string; connected: boolean; status?: ProviderStatus; enabled?: boolean; error?: string };
   'nametag:registered': { nametag: string; addressIndex: number };
   'nametag:recovered': { nametag: string };

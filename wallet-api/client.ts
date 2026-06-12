@@ -83,6 +83,13 @@ interface LocalIntent {
   payload: string;
   status: 'open' | 'completed' | 'aborted';
   createdAt: number;
+  /**
+   * #516: set when the abort decision could NOT land on the server (dead
+   * backend at send-failure cleanup). {@link WalletApiClient.resyncOpenIntents}
+   * replays it (PUT + abort) so the server row converges to aborted instead of
+   * resume re-executing a send the user watched fail.
+   */
+  abortPending?: boolean;
 }
 
 function isLoopbackHost(hostname: string): boolean {
@@ -569,12 +576,20 @@ export class WalletApiClient {
     await this.storage.set(this.intentsKey(), JSON.stringify(intents));
   }
 
-  private async setLocalIntentStatus(transferId: string, status: LocalIntent['status']): Promise<void> {
+  private async setLocalIntentStatus(
+    transferId: string,
+    status: LocalIntent['status'],
+    opts: { abortPending?: boolean } = {}
+  ): Promise<void> {
     const intents = await this.readLocalIntents();
     const intent = intents[transferId];
-    if (!intent || intent.status === status) return;
+    if (!intent) return;
     if (intent.status === 'completed') return; // completed never reverts (§16)
+    const abortPending = opts.abortPending === true;
+    if (intent.status === status && (intent.abortPending === true) === abortPending) return;
     intent.status = status;
+    if (abortPending) intent.abortPending = true;
+    else delete intent.abortPending;
     await this.writeLocalIntents(intents);
   }
 
@@ -599,9 +614,23 @@ export class WalletApiClient {
     return parseIntents(await this.requestJson('GET', `/v1/intents?status=${status}`));
   }
 
-  /** `POST /v1/intents/{id}/abort` — soft, recoverable (§16). */
+  /**
+   * `POST /v1/intents/{id}/abort` — soft, recoverable (§16).
+   *
+   * #516: the LOCAL copy flips to 'aborted' even when the server abort cannot
+   * land (dead backend) — leaving it 'open' would make {@link resyncOpenIntents}
+   * re-PUT it and the next sign-in's `resumeOpenIntents` RE-EXECUTE a send the
+   * user watched fail (and possibly retried manually): a double-pay hazard.
+   * An unlanded abort is marked pending and replayed by
+   * {@link resyncOpenIntents} (PUT + abort) so the server converges too.
+   */
   async abortIntent(transferId: string): Promise<void> {
-    await this.requestJson('POST', `/v1/intents/${transferId}/abort`);
+    try {
+      await this.requestJson('POST', `/v1/intents/${transferId}/abort`);
+    } catch (err) {
+      await this.setLocalIntentStatus(transferId, 'aborted', { abortPending: true });
+      throw err;
+    }
     await this.setLocalIntentStatus(transferId, 'aborted');
   }
 
@@ -624,10 +653,23 @@ export class WalletApiClient {
    * write-once while open/completed). Called after a `syncEpoch` change
    * (server restore — §5.4): intents are the one server table not
    * re-derivable from blobs.
+   *
+   * #516: also replays locally-aborted intents whose abort never landed on
+   * the server (`abortPending`) — PUT (no-op while open/completed; (re)creates
+   * the row after a restore or a failed original PUT) then abort, so the
+   * server row lands as 'aborted' instead of an 'open' intent that resume
+   * would re-execute. Completed-wins is preserved server-side (§16).
    */
   async resyncOpenIntents(): Promise<void> {
-    for (const intent of await this.listLocalOpenIntents()) {
-      await this.requestJson('PUT', `/v1/intents/${intent.transferId}`, { payload: intent.payload });
+    const intents = await this.readLocalIntents();
+    for (const [transferId, intent] of Object.entries(intents)) {
+      if (intent.status === 'open') {
+        await this.requestJson('PUT', `/v1/intents/${transferId}`, { payload: intent.payload });
+      } else if (intent.status === 'aborted' && intent.abortPending === true) {
+        await this.requestJson('PUT', `/v1/intents/${transferId}`, { payload: intent.payload });
+        await this.requestJson('POST', `/v1/intents/${transferId}/abort`);
+        await this.setLocalIntentStatus(transferId, 'aborted'); // clears abortPending
+      }
     }
   }
 

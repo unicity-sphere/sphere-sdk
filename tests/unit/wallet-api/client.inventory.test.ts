@@ -219,6 +219,37 @@ describe('WalletApiClient — intents (E.3, §16)', () => {
     await expect(client.putIntent(tid, envelope('different'))).rejects.toMatchObject({ code: 'CONFLICT' });
   });
 
+  it("#516: a failed server abort still flips the LOCAL copy to 'aborted'; resync replays the abort", async () => {
+    const payload = envelope('abort-backstop');
+    await client.putIntent(tid, payload); // server: open
+    fake.setIntentFailure(true);
+    await expect(client.abortIntent(tid)).rejects.toThrowError(WalletApiError);
+    // The local intent is no longer 'open' — resync/resume can never re-run it.
+    expect(await client.listLocalOpenIntents()).toEqual([]);
+
+    fake.setIntentFailure(false);
+    await client.resyncOpenIntents(); // replays the unlanded abort
+    expect(fake.getIntent(identity.chainPubkey, tid)).toMatchObject({ status: 'aborted' });
+    // Stable: a second resync is a no-op (the pending abort was cleared).
+    await client.resyncOpenIntents();
+    expect(fake.getIntent(identity.chainPubkey, tid)).toMatchObject({ status: 'aborted' });
+  });
+
+  it('#516: PUT and abort both dead → resync lands the intent as ABORTED, never re-opens it', async () => {
+    const payload = envelope('double-pay-guard');
+    fake.setIntentFailure(true);
+    await expect(client.putIntent(tid, payload)).rejects.toThrowError(WalletApiError);
+    await expect(client.abortIntent(tid)).rejects.toThrowError(WalletApiError);
+    expect(await client.listLocalOpenIntents()).toEqual([]);
+
+    fake.setIntentFailure(false);
+    await client.resyncOpenIntents();
+    // The seed row exists for audit/recovery but is aborted — `resumeOpenIntents`
+    // (which lists status=open) re-executes NOTHING.
+    expect(fake.getIntent(identity.chainPubkey, tid)).toMatchObject({ status: 'aborted' });
+    expect(await client.listIntents('open')).toEqual([]);
+  });
+
   it('completion wins and never reverts (§16)', async () => {
     await client.putIntent(tid, envelope('seed'));
     await client.completeIntent(tid);

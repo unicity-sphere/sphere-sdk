@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — incident 2026-06-12 hardening (#515, #516)
+
+- **Fail-closed composition invariant (#515 F1):** wallet-api CUSTODY
+  artifacts (the thin `WalletApiTokenStorageProvider`, delivery custody
+  `'inventory'`) composed without the `walletApi` client now throw
+  `INVALID_CONFIG` at `PaymentsModule.initialize`/`Sphere.init` instead of
+  silently running local-custody semantics. `TokenStorageProvider` gains an
+  optional `requiresWalletApi` marker. `Sphere.init` now forwards the
+  `delivery`, `walletApi` and `communications` options to
+  `Sphere.create`/`Sphere.load` — previously they were silently dropped.
+- **Checked SaveResult (#515 F2):** `PaymentsModule` now checks
+  `SaveResult.success` of the ACTIVE custody provider. User-facing flows
+  (mint, the send pipeline's custody writes) fail loudly (`STORAGE_ERROR`);
+  background saves emit the new `storage:degraded` event.
+- **Surfaced wallet-api session state (#515 F3):** a failed sign-in is
+  recorded (readable via `sphere.walletApiSessionStatus`) and emitted as the
+  new `walletapi:session` event (`'offline'`/`'online'`); boot stays
+  non-blocking.
+- **Double-pay hazard (#516):** `WalletApiClient.abortIntent` flips the LOCAL
+  intent copy to `'aborted'` even when the server abort cannot land (dead
+  backend); the unlanded abort is replayed by `resyncOpenIntents`
+  (PUT + abort), so a send that failed at `putIntent` can never be re-executed
+  by `resumeOpenIntents` after reconnect.
+
 ### BREAKING — v1 state-transition-sdk removed (v2 engine cutover)
 
 The legacy `@unicitylabs/state-transition-sdk@1.6.1-rc` engine is gone. The

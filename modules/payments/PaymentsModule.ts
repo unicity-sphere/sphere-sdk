@@ -793,6 +793,58 @@ export interface PaymentsModuleDependencies {
   walletApi?: PaymentsWalletApiPort;
 }
 
+/** The provider {@link PaymentsModule.getActiveTokenStorageProvider} will pick:
+ * first non-disabled entry, mirroring getTokenStorageProviders' precedence. */
+function firstEnabledTokenStorage(
+  deps: PaymentsModuleDependencies
+): TokenStorageProvider<TxfStorageDataBase> | null {
+  const providers =
+    deps.tokenStorageProviders && deps.tokenStorageProviders.size > 0
+      ? [...deps.tokenStorageProviders.entries()]
+      : deps.tokenStorage
+        ? [[deps.tokenStorage.id, deps.tokenStorage] as const]
+        : [];
+  for (const [id, provider] of providers) {
+    if (!deps.disabledProviderIds?.has(id)) return provider;
+  }
+  return null;
+}
+
+/**
+ * Fail-closed composition invariant (#515 F1, sdk-changes S7): wallet-api
+ * CUSTODY artifacts — delivery custody `'inventory'` (acks write the server
+ * inventory) or an active token-storage provider that declares
+ * `requiresWalletApi` (the S2 thin provider) — are only legal WITH the
+ * wallet-api client. The E.3 intent barrier and §7 server apply are
+ * guard-by-presence on `deps.walletApi`, so an accidentally-degraded
+ * composition (e.g. a stale bundle dropping the client) would silently run
+ * local-custody semantics while the user believes wallet-api custody is
+ * active. Legal compositions (the composition.ts presets):
+ *  - fully local: no wallet-api artifacts, no client;
+ *  - FULL preset: thin storage + custody 'inventory' + client;
+ *  - OWN-STORAGE preset: own storage + custody 'external' + client.
+ * Own storage + custody 'external' WITHOUT a client stays legal (no custody
+ * artifact — delivery fails loudly at call time, nothing is silently lost).
+ */
+function assertLegalCustodyComposition(deps: PaymentsModuleDependencies): void {
+  if (deps.walletApi) return;
+  if (deps.delivery?.custody === 'inventory') {
+    throw new SphereError(
+      "Illegal composition (#515): delivery custody is 'inventory' (wallet-api server custody) but no `walletApi` client was provided — refusing to initialize. " +
+        "Pass the preset's `walletApi` to Sphere.init, or compose the own-storage preset (custody 'external').",
+      'INVALID_CONFIG'
+    );
+  }
+  const storage = firstEnabledTokenStorage(deps);
+  if (storage?.requiresWalletApi) {
+    throw new SphereError(
+      `Illegal composition (#515): the active token-storage provider '${storage.id}' keeps custody in the wallet-api backend but no \`walletApi\` client was provided — refusing to initialize. ` +
+        "Pass the preset's `walletApi` to Sphere.init, or compose a local storage provider.",
+      'INVALID_CONFIG'
+    );
+  }
+}
+
 // =============================================================================
 // Implementation
 // =============================================================================
@@ -960,6 +1012,9 @@ export class PaymentsModule {
    * Initialize module with dependencies
    */
   initialize(deps: PaymentsModuleDependencies): void {
+    // #515 F1: refuse illegal custody compositions BEFORE any state is touched.
+    assertLegalCustodyComposition(deps);
+
     // Clean up previous subscriptions before re-initializing
     this.unsubscribeTransfers?.();
     this.unsubscribeTransfers = null;
@@ -1450,13 +1505,15 @@ export class PaymentsModule {
       }
       result.tokens = tokensToSend;
 
-      // Mark as transferring and persist — UI shows "Pending" badge immediately
+      // Mark as transferring and persist — UI shows "Pending" badge immediately.
+      // critical (#515 F2): nothing is spent yet — an unwritable active custody
+      // provider must abort the send HERE, before the intent/engine run.
       for (const token of tokensToSend) {
         token.status = 'transferring';
         this.tokens.set(token.id, token);
         this.parsedTokenCache.delete(token.id);
       }
-      await this.save();
+      await this.save({ critical: true });
 
       // Save to outbox for recovery
       await this.saveToOutbox(result, recipientPubkey);
@@ -1608,7 +1665,10 @@ export class PaymentsModule {
             // recovery seed (a deterministic re-run rebuilds BOTH outputs), and
             // local storage follows the server apply below so the provider's
             // write-behind cannot race a second add of the same state.
-            await this.storeEngineToken(engine, changeOutput);
+            // critical (#515 F2): an unpersisted change token is value loss on
+            // reload — fail the send (the open intent resumes it) rather than
+            // report success.
+            await this.storeEngineToken(engine, changeOutput, { criticalSave: true });
           }
 
           await deliverBlob(recipientBlob);
@@ -2875,9 +2935,12 @@ export class PaymentsModule {
    *   the old state is archived and replaced with the incoming one.
    *
    * @param token - The token to add.
+   * @param opts - `criticalSave: true` on user-facing flows (mint/send): a
+   *   failed save of the ACTIVE custody provider then throws STORAGE_ERROR
+   *   (#515 F2) instead of emitting `storage:degraded`.
    * @returns `true` if the token was added, `false` if rejected as duplicate or tombstoned.
    */
-  async addToken(token: Token): Promise<boolean> {
+  async addToken(token: Token, opts: { criticalSave?: boolean } = {}): Promise<boolean> {
     this.ensureInitialized();
 
     logger.debug('Payments', `addToken called: id=${token.id.slice(0, 16)}... coinId=${token.coinId.slice(0, 16)}... status=${token.status}`);
@@ -2956,7 +3019,7 @@ export class PaymentsModule {
     // Archive the token (for recovery purposes)
     await this.archiveToken(token);
 
-    await this.save();
+    await this.save({ critical: opts.criticalSave });
     logger.debug('Payments', `addToken: saved id=${token.id.slice(0, 16)}...`);
 
     // Notify observers (e.g., AccountingModule) that a token was added
@@ -3662,6 +3725,7 @@ export class PaymentsModule {
   private async storeEngineToken(
     engine: ITokenEngine,
     token: SphereToken,
+    opts: { criticalSave?: boolean } = {},
   ): Promise<{ uiToken: Token; added: boolean }> {
     // Re-encode from the decoded blob; byte-identical to the wire blob (canonical CBOR).
     const sdkData = bytesToHex(encodeTokenBlob(engine.encodeToken(token)));
@@ -3679,7 +3743,7 @@ export class PaymentsModule {
       updatedAt: Date.now(),
       sdkData,
     };
-    const added = await this.addToken(uiToken);
+    const added = await this.addToken(uiToken, opts);
     return { uiToken, added };
   }
 
@@ -3726,7 +3790,10 @@ export class PaymentsModule {
         recipientPubkey: engine.getIdentity().chainPubkey,
         value: { assets: [{ coinId: coinIdHex, amount }] },
       });
-      const { uiToken } = await this.storeEngineToken(engine, minted);
+      // #515 F2: the mint is user-facing — a failed save of the ACTIVE custody
+      // provider must fail the mint (a RAM-only blob behind a success modal is
+      // permanent loss on reload), not report success.
+      const { uiToken } = await this.storeEngineToken(engine, minted, { criticalSave: true });
       return { success: true, token: uiToken, tokenId: engine.tokenId(minted) };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -4730,7 +4797,9 @@ export class PaymentsModule {
         { signal: AbortSignal.timeout(SEND_ENGINE_OP_TIMEOUT_MS), transferId, opIndex: payload.direct.length }
       );
       changeOutput = outputs[1];
-      if (!serverApply) await this.storeEngineToken(engine, changeOutput);
+      // critical (#515 F2): own-storage custody — persist-or-stay-open; a
+      // throw keeps the intent open and the next sign-in re-runs it.
+      if (!serverApply) await this.storeEngineToken(engine, changeOutput, { criticalSave: true });
       await deliverBlob(bytesToHex(encodeTokenBlob(engine.encodeToken(outputs[0]))));
       spent.push(payload.split.tokenId);
     }
@@ -4803,7 +4872,21 @@ export class PaymentsModule {
   // Private: Storage
   // ===========================================================================
 
-  private async save(): Promise<void> {
+  /**
+   * Persist the token state to every (non-disabled) token storage provider.
+   *
+   * #515 D3b/F2: `SaveResult.success` is CHECKED for the ACTIVE custody
+   * provider (the thin wallet-api provider deliberately returns
+   * `{success:false}` on failure instead of throwing) — silent acceptance let
+   * a mint certify on-chain with the blob in RAM only. On an active-provider
+   * failure:
+   *  - `critical: true` (user-facing mint/send paths) → throws STORAGE_ERROR,
+   *    so the flow reports failure instead of success;
+   *  - otherwise (background writers) → emits `storage:degraded`.
+   * Non-active (secondary) provider failures keep the existing log-only
+   * behavior.
+   */
+  private async save(opts: { critical?: boolean } = {}): Promise<void> {
     // Save to TokenStorageProviders (IndexedDB/files)
     const providers = this.getTokenStorageProviders();
     // Debug: log token serialization status
@@ -4813,19 +4896,29 @@ export class PaymentsModule {
     });
     logger.debug('Payments', `save(): providers=${providers.size}, tokens=[${tokenStats.join(', ')}]`);
 
-    if (providers.size > 0) {
-      const data = await this.createStorageData();
-      const dataKeys = Object.keys(data).filter(k => k.startsWith('token-'));
-      logger.debug('Payments', `save(): TXF keys=${dataKeys.length} (${dataKeys.join(', ')})`);
-      for (const [id, provider] of providers) {
-        try {
-          await provider.save(data);
-        } catch (err) {
-          logger.error('Payments', `Failed to save to provider ${id}:`, err);
-        }
-      }
-    } else {
+    if (providers.size === 0) {
       logger.debug('Payments', 'save(): No token storage providers - TXF not persisted');
+      return;
+    }
+    const data = await this.createStorageData();
+    const dataKeys = Object.keys(data).filter(k => k.startsWith('token-'));
+    logger.debug('Payments', `save(): TXF keys=${dataKeys.length} (${dataKeys.join(', ')})`);
+    const activeId = providers.keys().next().value;
+    for (const [id, provider] of providers) {
+      let error: string | null = null;
+      try {
+        const result = await provider.save(data);
+        if (!result.success) error = result.error ?? 'save failed';
+      } catch (err) {
+        error = err instanceof Error ? err.message : String(err);
+      }
+      if (error === null) continue;
+      logger.error('Payments', `Failed to save to provider ${id}: ${error}`);
+      if (id !== activeId) continue;
+      if (opts.critical) {
+        throw new SphereError(`Token storage save failed (${id}): ${error}`, 'STORAGE_ERROR');
+      }
+      this.deps!.emitEvent('storage:degraded', { providerId: id, error });
     }
   }
 

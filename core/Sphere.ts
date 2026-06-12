@@ -555,6 +555,8 @@ export class Sphere {
   private _delivery: DeliveryProvider | null = null;
   /** wallet-api session (S4) — null in fully-local compositions. */
   private _walletApi: SphereWalletApiSession | null = null;
+  /** S4 session state (#515 F3) — null until a wallet-api composition attempts sign-in. */
+  private _walletApiSessionStatus: 'online' | 'offline' | null = null;
   /** v2 token engine (built per active address from the oracle); injected into modules. */
   private _tokenEngine: ITokenEngine | undefined;
 
@@ -718,12 +720,17 @@ export class Sphere {
         transport: options.transport,
         oracle: options.oracle,
         tokenStorage: options.tokenStorage,
+        // S4/S7 ports (#515): dropping these silently degraded a wallet-api
+        // composition to the legacy local-custody one — forward them always.
+        delivery: options.delivery,
+        walletApi: options.walletApi,
         l1: options.l1,
         price: options.price,
         groupChat,
         market,
         accounting,
         swap,
+        communications: options.communications,
         password: options.password,
         discoverAddresses: options.discoverAddresses,
         onProgress: options.onProgress,
@@ -759,6 +766,10 @@ export class Sphere {
       transport: options.transport,
       oracle: options.oracle,
       tokenStorage: options.tokenStorage,
+      // S4/S7 ports (#515): dropping these silently degraded a wallet-api
+      // composition to the legacy local-custody one — forward them always.
+      delivery: options.delivery,
+      walletApi: options.walletApi,
       derivationPath: options.derivationPath,
       nametag: options.nametag,
       l1: options.l1,
@@ -767,6 +778,7 @@ export class Sphere {
       market,
       accounting,
       swap,
+      communications: options.communications,
       password: options.password,
       discoverAddresses: options.discoverAddresses,
       onProgress: options.onProgress,
@@ -4563,10 +4575,30 @@ export class Sphere {
   // ===========================================================================
 
   /**
+   * The wallet-api session state (#515 F3): `'offline'` means the last
+   * sign-in failed and the wallet runs degraded (boot stays non-blocking);
+   * `'online'` after a successful sign-in; `null` when no wallet-api session
+   * is composed (fully-local) or before the first attempt. Changes are
+   * surfaced as `walletapi:session` events.
+   */
+  get walletApiSessionStatus(): 'online' | 'offline' | null {
+    return this._walletApiSessionStatus;
+  }
+
+  /** Record + surface a wallet-api session state change (#515 F3). */
+  private noteWalletApiSession(status: 'online' | 'offline', error?: string): void {
+    if (this._walletApiSessionStatus === status) return;
+    this._walletApiSessionStatus = status;
+    this.emitEvent('walletapi:session', { status, ...(error !== undefined ? { error } : {}) });
+  }
+
+  /**
    * S4 auth lifecycle: establish the wallet-api session (sign-in on unlock —
    * silent: the wallet key is available) and resume open intents at sign-in
    * (E.3 — list + re-run via PaymentsModule, fire-and-forget). A failed
-   * sign-in degrades to offline operation; it never blocks the wallet.
+   * sign-in degrades to offline operation; it never blocks the wallet — but
+   * it is RECORDED and surfaced (`walletApiSessionStatus` + the
+   * `walletapi:session` event), never log-only (#515 F3).
    */
   private async startWalletApiSession(payments: PaymentsModule): Promise<void> {
     if (!this._walletApi) return;
@@ -4574,8 +4606,10 @@ export class Sphere {
       await this._walletApi.signIn();
     } catch (err) {
       logger.warn('Sphere', 'wallet-api sign-in failed — wallet continues offline:', err);
+      this.noteWalletApiSession('offline', err instanceof Error ? err.message : String(err));
       return;
     }
+    this.noteWalletApiSession('online');
     void payments
       .resumeOpenIntents()
       .then((outcome) => {

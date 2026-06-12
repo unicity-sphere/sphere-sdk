@@ -107,7 +107,14 @@ export interface WalletApiCompositionConfig {
 /** What the wallet-api presets add to the base bundle. */
 export interface WalletApiProviderExtras {
   delivery: DeliveryProvider;
-  /** The S1 client — pass to `Sphere.init({ walletApi })` for the S4 auth lifecycle. */
+  /**
+   * The S1 client — pass to `Sphere.init({ walletApi })` for the S4 auth
+   * lifecycle. NOT optional in spirit (#515): wallet-api CUSTODY artifacts
+   * (the thin storage provider, delivery custody `'inventory'`) without this
+   * client are an illegal composition — `Sphere.init` /
+   * `PaymentsModule.initialize` throw `INVALID_CONFIG` (fail-closed) instead
+   * of silently degrading to local-custody semantics.
+   */
   walletApi: WalletApiClient;
 }
 

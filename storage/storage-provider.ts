@@ -199,6 +199,17 @@ export interface SyncResult<T = unknown> {
  */
 export interface TokenStorageProvider<TData = unknown> extends BaseProvider {
   /**
+   * Fail-closed composition invariant (sdk-changes S7, #515): set `true` on
+   * providers whose token custody lives behind the wallet-api backend (the S2
+   * thin provider). Composing such a provider as the ACTIVE token storage
+   * without the wallet-api client (`walletApi`) is an accidentally-degraded,
+   * ILLEGAL composition — `PaymentsModule.initialize` throws `INVALID_CONFIG`
+   * instead of silently running local-custody semantics. Local/whole-blob
+   * providers omit it.
+   */
+  readonly requiresWalletApi?: boolean;
+
+  /**
    * Set identity for storage scope
    */
   setIdentity(identity: FullIdentity): void;
