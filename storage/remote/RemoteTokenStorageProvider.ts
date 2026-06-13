@@ -225,18 +225,39 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
   /**
    * Authenticate, then run the FIRST load ourselves so the flush gate opens even
    * when `PaymentsModule.load()` short-circuits before reaching this provider
-   * (Task 7.1). A transient first-load failure is swallowed (the gate stays SHUT,
-   * `sync()` no-ops) so an empty local import can never overwrite the server.
+   * (Task 7.1).
+   *
+   * FUND-SAFETY (remote-provider-init-auth-throw-bricks-wallet): this is a BACKUP
+   * provider and the wallet loads providers together — a throw here would reject
+   * the WHOLE wallet load and brick the wallet because the vault is unreachable.
+   * So `initialize()` NEVER throws on auth / network / first-load failure: it
+   * logs (via `storage:error`), leaves the flush gate SHUT (`initialLoadDone`
+   * stays false → `sync()` degrades, never wipes the server with empty local
+   * data) and RETURNS the contract's non-fatal `false` so the wallet still loads
+   * from local storage. A vault outage degrades to "remote backup inactive".
    */
   async initialize(): Promise<boolean> {
     this.status = 'connecting';
-    await this.requireAuth().authenticate();
+    try {
+      await this.requireAuth().authenticate();
+    } catch (error) {
+      this.status = 'error';
+      this.emit('storage:error', { reason: 'auth' }, this.errMsg(error, 'vault auth failed'));
+      return false; // degrade — do NOT brick the wallet
+    }
     this.status = 'connected';
-    const first = await this.load();
+    const first = await this.load(); // load() never throws (it try/catches internally)
     if (!first.success) {
+      this.status = 'error';
       this.emit('storage:error', { reason: 'initial-load' }, first.error);
+      return false; // first load failed → gate stays SHUT, wallet still loads locally
     }
     return true;
+  }
+
+  /** Extract a human message from an unknown thrown value (degraded-path logging). */
+  private errMsg(error: unknown, fallback: string): string {
+    return error instanceof Error ? error.message : fallback;
   }
 
   /** True once the first successful load opened the flush gate (Task 7.1). */
