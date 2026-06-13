@@ -52,7 +52,6 @@
 # `with_float_or_bigint_shim` helper auto-detects the CLI's accepted form:
 # it tries the float form first; on INVALID_PARAM it falls back to an
 # inline float→bigint conversion (via `python3 -c "print(int(<f> * 10**18))"`)
-# and prints a warning. Set TRADER_CLI_FLOAT_NATIVE=0 to skip the float
 # attempt entirely and go straight to the bigint shim.
 #
 # ---------------------------------------------------------------------------
@@ -74,7 +73,6 @@
 #                                (= 0.08 ETH per 1 UCT).
 #   TRADER_RATE_MAX_ETH_PER_UCT  Upper edge of the rate band. Default 0.12.
 #   TRADER_VOLUME_UCT            Volume to trade in **whole UCT**. Default 50.
-#   TRADER_CLI_FLOAT_NATIVE      0 = skip the float attempt and go straight
 #                                to the bigint shim. Default 1.
 #   TRADER_DEAL_DEADLINE_S       Wall-clock cap for negotiation + settlement.
 #                                Default 900 (15 min). Bumped from 600 to
@@ -187,7 +185,6 @@ ESCROW="${ESCROW:-@escrow-test-02}"
 TRADER_RATE_MIN_ETH_PER_UCT="${TRADER_RATE_MIN_ETH_PER_UCT:-0.08}"
 TRADER_RATE_MAX_ETH_PER_UCT="${TRADER_RATE_MAX_ETH_PER_UCT:-0.12}"
 TRADER_VOLUME_UCT="${TRADER_VOLUME_UCT:-50}"
-TRADER_CLI_FLOAT_NATIVE="${TRADER_CLI_FLOAT_NATIVE:-1}"
 
 # Decimals — UCT and ETH are both 18-decimal on testnet.
 TRADER_UCT_DECIMALS="${TRADER_UCT_DECIMALS:-18}"
@@ -216,7 +213,6 @@ echo "ESCROW=$ESCROW"
 echo "TRADER_RATE_MIN_ETH_PER_UCT=$TRADER_RATE_MIN_ETH_PER_UCT  (float)"
 echo "TRADER_RATE_MAX_ETH_PER_UCT=$TRADER_RATE_MAX_ETH_PER_UCT  (float)"
 echo "TRADER_VOLUME_UCT=$TRADER_VOLUME_UCT  (whole UCT)"
-echo "TRADER_CLI_FLOAT_NATIVE=$TRADER_CLI_FLOAT_NATIVE"
 echo "TRADER_DEAL_DEADLINE_S=$TRADER_DEAL_DEADLINE_S"
 echo "MARKET_API_URL=$MARKET_API_URL"
 echo "KEEP_HM_FLAG=${KEEP_HM_FLAG:-<auto-teardown>}"
@@ -375,15 +371,12 @@ with_retry() {
 }
 
 # ---------------------------------------------------------------------------
-# Convert a human-friendly float to a smallest-unit bigint string.
-#   float_to_bigint 0.08 18  →  80000000000000000
-#   float_to_bigint 50   18  →  50000000000000000000
-# Uses python so arbitrary precision works (bash floor div tops out at int64).
+# (Removed) float_to_bigint helper. The trader now accepts decimal strings
+# for rate and volume — see vrogojin/trader-service#27 (v0.5+) which
+# changed TradingIntent.rate_min/max/volume_min/max from bigint to string
+# throughout. Smallest-unit conversion is deferred to the wallet-
+# reservation boundary via sphere-sdk's TokenRegistry.getTokenDecimals.
 # ---------------------------------------------------------------------------
-float_to_bigint() {
-  local v="$1" dec="$2"
-  python3 -c "print(int(float('$v') * 10**$dec))"
-}
 
 # ---------------------------------------------------------------------------
 # CLI-form shim: try `sphere trader create-intent` with float values first
@@ -405,49 +398,21 @@ float_to_bigint() {
 # On bigint fallback the soak prints a one-time warning citing the
 # TODO(#474 follow-up).
 # ---------------------------------------------------------------------------
+# Send the create-intent ACP command with human-friendly decimal
+# rate + volume. The trader-service (v0.5+) accepts these directly per
+# vrogojin/trader-service#27; no bigint smallest-unit conversion at the
+# CLI surface. The helper preserves the soak's retry envelope.
 create_intent_with_shim() {
   local label="$1" tenant_nt="$2" direction="$3"
   local base="$4" quote="$5"
   local rate_min_f="$6" rate_max_f="$7" volume_f="$8"
   local expiry_ms="$9" log="${10}"
 
-  # Try float form first (post-fix CLI UX) unless the operator opted out.
-  if [[ "$TRADER_CLI_FLOAT_NATIVE" == "1" ]]; then
-    if with_retry "$label-float" \
-         bash -c "sphere trader create-intent --tenant '@$tenant_nt' --json --timeout 30000 \
-                    --direction '$direction' --base '$base' --quote '$quote' \
-                    --rate-min '$rate_min_f' --rate-max '$rate_max_f' \
-                    --volume-min '$volume_f' --volume-max '$volume_f' \
-                    --expiry-ms $expiry_ms \
-                    2>&1 | tee '$log'"; then
-      # The CLI may have accepted but the tenant may have returned an
-      # INVALID_PARAM (e.g. because the bigint-mode validator rejected
-      # a decimal string). Detect that and fall through to the shim.
-      if ! grep -qE 'INVALID_PARAM|invalid_param' "$log"; then
-        echo "INFO ($label): float form accepted"
-        return 0
-      fi
-      echo "WARN ($label): CLI accepted float syntax but the tenant returned INVALID_PARAM — falling back to bigint shim" >&2
-    else
-      echo "WARN ($label): float form failed — falling back to bigint shim" >&2
-    fi
-  fi
-
-  # Bigint shim — convert floats to smallest-unit bigints inline.
-  # Quote-side decimals (rate is "quote per base unit" — per spec §2.3).
-  local rate_min_bi rate_max_bi volume_bi
-  rate_min_bi=$(float_to_bigint "$rate_min_f" "$TRADER_ETH_DECIMALS")
-  rate_max_bi=$(float_to_bigint "$rate_max_f" "$TRADER_ETH_DECIMALS")
-  volume_bi=$(float_to_bigint "$volume_f" "$TRADER_UCT_DECIMALS")
-  echo "WARN ($label): bigint shim — TODO(#474 follow-up): CLI accepts bigint strings today, must" >&2
-  echo "  be updated to accept floats and convert internally. Shim values:" >&2
-  echo "    rate_min=$rate_min_bi rate_max=$rate_max_bi volume=$volume_bi" >&2
-
-  with_retry "$label-bigint-shim" \
+  with_retry "$label" \
     bash -c "sphere trader create-intent --tenant '@$tenant_nt' --json --timeout 30000 \
                --direction '$direction' --base '$base' --quote '$quote' \
-               --rate-min '$rate_min_bi' --rate-max '$rate_max_bi' \
-               --volume-min '$volume_bi' --volume-max '$volume_bi' \
+               --rate-min '$rate_min_f' --rate-max '$rate_max_f' \
+               --volume-min '$volume_f' --volume-max '$volume_f' \
                --expiry-ms $expiry_ms \
                2>&1 | tee '$log'"
 }
