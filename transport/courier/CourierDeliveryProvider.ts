@@ -504,11 +504,19 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
   /**
    * Verify a delivery handle's signed receipt (DESIGN §3 port method). Returns the
    * {@link SignedReceipt} only when the recipient's ackSig validly claims it.
+   *
+   * PAGINATION (finding confirmReceipt-non-paginated-sent(0)): a `/sent` page is
+   * bounded, so a plain `sent(0).find()` returns a false `null` for any handle whose
+   * row sits on page 2+. We ANCHOR the query on the handle's own `sentSeq` — the row
+   * is the FIRST one of `sent(sentSeq - 1)` (rows with `sentSeq > since`) regardless
+   * of how many other deliveries precede it, so a single cheap page always contains
+   * it. Handles minted by an older build (no `sentSeq`) fall back to `sent(0)`.
    */
   async confirmReceipt(handle: DeliveryHandle): Promise<SignedReceipt | null> {
     const me = this.requireIdentity();
     const client = this.config.httpClientFactory(me.chainPubkey);
-    const res = await client.sent(0);
+    const since = handle.sentSeq !== undefined ? handle.sentSeq - 1 : 0;
+    const res = await client.sent(since);
     const row = res.items.find((i) => i.entryId === handle.entryId);
     if (!row || !this.isValidReceipt(me, row)) return null;
     return { entryId: row.entryId, ackSig: row.ackSig!, recipientChainPubkey: row.recipientPubkey };
