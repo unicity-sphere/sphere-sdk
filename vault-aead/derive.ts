@@ -10,11 +10,9 @@
 import { hkdf } from '@noble/hashes/hkdf.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { hexToBytes } from '../core/crypto';
+import { VAULT_AEAD_DOMAIN } from '../vault/contracts';
 
 const utf8 = (s: string): Uint8Array => new TextEncoder().encode(s);
-
-/** HKDF info prefix for the per-network vault AEAD key. */
-const VAULT_KEY_INFO_PREFIX = 'unicity-vault-aead-v1:';
 
 /** 4-byte big-endian encoding of an unsigned 32-bit integer. */
 export function u32be(n: number): Uint8Array {
@@ -59,7 +57,7 @@ export function deriveVaultKey(walletPriv: string, network: string): Uint8Array 
     sha256,
     hexToBytes(walletPriv),
     undefined,
-    utf8(VAULT_KEY_INFO_PREFIX + network),
+    utf8(VAULT_AEAD_DOMAIN + network),
     32,
   );
 }

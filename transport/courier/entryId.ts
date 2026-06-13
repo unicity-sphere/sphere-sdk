@@ -19,11 +19,9 @@ import { sha256 as nobleSha256 } from '@noble/hashes/sha2.js';
 import { sha256, bytesToHex, hexToBytes } from '../../core/crypto';
 import { decodeTokenBlob } from '../../token-engine/token-blob';
 import { ecdhX } from '../../vault-aead/ecdh';
+import { ENTRYID_DOMAIN } from '../../vault/contracts';
 
 const utf8 = (s: string): Uint8Array => new TextEncoder().encode(s);
-
-/** HKDF info for the courier entryId key. */
-const ENTRYID_INFO = 'unicity-courier-entryid-v1';
 
 /**
  * The per-state hash bound into the entryId — IDENTICAL to the value
@@ -47,7 +45,7 @@ export function courierStateHash(tokenBlobHex: string): string {
 export function courierEntryId(senderPriv: string, recipientPub: string, tokenBlobHex: string): string {
   const blob = decodeTokenBlob(hexToBytes(tokenBlobHex));
   const stateHash = sha256(bytesToHex(blob.token), 'hex');
-  const kEntry = hkdf(nobleSha256, ecdhX(senderPriv, recipientPub), undefined, utf8(ENTRYID_INFO), 32);
+  const kEntry = hkdf(nobleSha256, ecdhX(senderPriv, recipientPub), undefined, utf8(ENTRYID_DOMAIN), 32);
   // tokenId ‖ stateHash, both as their utf8 hex-string bytes (the values the
   // sender and recipient both hold as strings — see tryParseBlobKeys).
   const msg = utf8(blob.tokenId + stateHash);

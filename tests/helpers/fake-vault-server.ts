@@ -32,7 +32,8 @@
 
 import { randomUUID } from 'node:crypto';
 import { recoverPubkeyFromSignature, verifySignedMessage, signMessage } from '../../core/crypto';
-import { epochCanon } from '../../vault-aead/canon';
+import { epochCanon, deleteCanon } from '../../vault-aead/canon';
+import { vaultAuthChallenge } from '../../vault/auth';
 import type { VaultEntryPayload } from '../../vault-aead/entry';
 import type {
   AccountDeleteResponse,
@@ -58,14 +59,9 @@ import type {
 /** Shared deployment-fixture server signing key — its pubkey = `NETWORKS.testnet2.vaultServerKey`. */
 export const SERVER_SIGN_PRIV = 'a'.repeat(64);
 
-const AUTH_PREFIX = 'unicity:vault:auth:v1\n';
 const CHALLENGE_TTL_MS = 5 * 60_000;
 const DEFAULT_PAGE_LIMIT = 1000;
 const DELETE_NONCE_TTL_MS = 5 * 60_000;
-
-/** REAL `deleteCanon` (account.service.ts:11) — `delete:v1`, NOT `account-delete:v1`. */
-const deleteCanon = (net: string, ownerId: string, nonce: string): string =>
-  `unicity:vault:delete:v1\n${net}\n${ownerId}\n${nonce}`;
 
 let counter = 0;
 const uniq = (p: string): string => `${p}-${++counter}-${Math.random().toString(36).slice(2)}`;
@@ -202,8 +198,8 @@ export class FakeVaultServer {
     const nonce = uniq('nonce');
     const issuedAt = new Date();
     const expiresAt = new Date(issuedAt.getTime() + CHALLENGE_TTL_MS);
-    // EXACT server template: JSON.stringify serializes Dates to ISO strings.
-    const challenge = AUTH_PREFIX + JSON.stringify({ network: this.network, pubkey, nonce, issuedAt, expiresAt });
+    // EXACT server template — built via the single-source contract (vault/auth.ts).
+    const challenge = vaultAuthChallenge({ network: this.network, pubkey, nonce, issuedAt, expiresAt });
     this.nonces.set(nonce, { pubkey, challenge, expiresAt: expiresAt.getTime() });
     return { nonce, challenge, expiresAt: expiresAt.toISOString() };
   }

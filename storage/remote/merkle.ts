@@ -15,9 +15,7 @@
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex, signMessage, verifySignedMessage } from '../../core/crypto';
 import { lengthDelim, u64be } from '../../vault-aead/derive';
-
-/** Domain-separation prefix for a vault leaf. */
-const LEAF_PREFIX = 'vault-leaf-v1';
+import { LEAF_DOMAIN } from '../../vault/contracts';
 
 /** High bit of the u64 version field — set for a tombstone (deleted) leaf. */
 const TOMBSTONE_BIT = 1n << 63n;
@@ -47,7 +45,7 @@ function concatBytes(parts: Uint8Array[]): Uint8Array {
  */
 export function leaf(key: string, version: number | bigint, deleted = false): Uint8Array {
   const v = deleted ? BigInt(version) | TOMBSTONE_BIT : BigInt(version);
-  return sha256(concatBytes([utf8(LEAF_PREFIX), utf8(key), u64be(v)]));
+  return sha256(concatBytes([utf8(LEAF_DOMAIN), utf8(key), u64be(v)]));
 }
 
 /**

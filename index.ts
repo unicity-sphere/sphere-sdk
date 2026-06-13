@@ -554,6 +554,30 @@ export type {
 
 export { normalizeVaultNetwork } from './storage/remote/normalize-network';
 
+// Single-source contract + wallet→backend auth (the token-api server imports these
+// so both sides share ONE definition of every signing template / domain separator /
+// wire-reason label, and ONE auth recipe — the `verifySphereAuth` v2 successor).
+export {
+  EPOCH_CANON_PREFIX,
+  vaultEpochCanon,
+  ACCOUNT_DELETE_CANON_PREFIX,
+  vaultAccountDeleteCanon,
+  DELETE_CANON_PREFIX,
+  vaultDeleteCanon,
+  COURIER_ACK_PREFIX,
+  courierAckTemplate,
+  WIREKEY_DOMAIN,
+  ENTRYID_DOMAIN,
+  LEAF_DOMAIN,
+  VAULT_AEAD_DOMAIN,
+  COURIER_AEAD_DOMAIN,
+  VAULT_REASON,
+  VAULT_AUTH_PREFIX,
+  vaultAuthChallenge,
+  verifyVaultAuth,
+} from './vault/index';
+export type { VaultReason, VaultAuthChallengeBody, VerifyVaultAuthParams } from './vault/index';
+
 // Real fetch HTTP clients (Task 8.3): the swap-in for the in-memory fakes — the
 // raw auth client, the authenticated vault data client, the courier client, and a
 // convenience factory that builds the two authenticated clients over one shared

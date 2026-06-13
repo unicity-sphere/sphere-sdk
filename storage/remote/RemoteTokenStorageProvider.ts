@@ -48,6 +48,7 @@ import {
 } from './reserved-address';
 import { sealHistoryRecord, openHistoryRecord } from './history-codec';
 import { deleteCanon } from '../../vault-aead/canon';
+import { VAULT_REASON } from '../../vault/contracts';
 import { signMessage } from '../../core/crypto';
 import { SphereError } from '../../core/errors';
 import { deriveDirectAddress } from '../../token-engine/identity';
@@ -273,14 +274,14 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
       await this.requireAuth().authenticate();
     } catch (error) {
       this.status = 'error';
-      this.emit('storage:error', { reason: 'auth' }, this.errMsg(error, 'vault auth failed'));
+      this.emit('storage:error', { reason: VAULT_REASON.AUTH }, this.errMsg(error, 'vault auth failed'));
       return false; // degrade — do NOT brick the wallet
     }
     this.status = 'connected';
     const first = await this.load(); // load() never throws (it try/catches internally)
     if (!first.success) {
       this.status = 'error';
-      this.emit('storage:error', { reason: 'initial-load' }, first.error);
+      this.emit('storage:error', { reason: VAULT_REASON.INITIAL_LOAD }, first.error);
       return false; // first load failed → gate stays SHUT, wallet still loads locally
     }
     return true;
@@ -340,7 +341,7 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
    * flush (gate OPEN, nothing to push), which stays success:true.
    */
   private degraded(localData: TData): SyncResult<TData> {
-    const reason = 'awaiting-initial-load';
+    const reason = VAULT_REASON.AWAITING_INITIAL_LOAD;
     this.emit('sync:error', { reason }, 'vault backup inactive: awaiting a successful initial load');
     return { success: false, merged: localData, added: 0, removed: 0, conflicts: 0, error: reason };
   }
@@ -666,7 +667,7 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
   }
 
   private rollback(reason: string): LoadResult<TData> {
-    this.emit('storage:error', { reason: 'rollback', detail: reason });
+    this.emit('storage:error', { reason: VAULT_REASON.ROLLBACK, detail: reason });
     return { success: false, error: `vault rollback: ${reason}`, source: 'remote', timestamp: Date.now() };
   }
 
