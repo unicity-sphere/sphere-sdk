@@ -32,6 +32,15 @@ export interface PlannedOp {
   /** The opaque wireKey the op targets on the wire. */
   wireKey: string;
   baseVersion: number;
+  /**
+   * The version the SERVER will assign to this entry once applied — the AAD seal
+   * version (finding vault-aead-resurrect-version-mismatch). For a fresh create it
+   * is 1 and for an update it is `baseVersion + 1`, BUT for a delete-RESURRECT
+   * (CAS `baseVersion:0` against a known tombstone) the server converges the row
+   * monotonically to `deletedRow.version + 1` — NOT 1 — so the payload AAD MUST be
+   * sealed at that version or a fresh load() cannot decrypt the resurrected entry.
+   */
+  sealVersion: number;
   /** false → create/update (carries a payload); true → delete (tombstone). */
   isDelete: boolean;
   /** The raw token value to seal (omitted on a delete). */
@@ -84,15 +93,22 @@ export function planOps(params: PlanOpsParams): PlannedOp[] {
     const wk = wireKeyOf(plainKey);
     liveWire.add(wk);
     const cur = known.get(wk);
-    if (!cur || cur.deleted) {
-      ops.push({ plainKey, wireKey: wk, baseVersion: 0, isDelete: false, value });
+    if (!cur) {
+      // Fresh create: server assigns v1; seal the AAD at v1.
+      ops.push({ plainKey, wireKey: wk, baseVersion: 0, sealVersion: 1, isDelete: false, value });
+    } else if (cur.deleted) {
+      // Delete-resurrect (#16): CAS baseVersion 0 against the tombstone, but the
+      // server converges to `deletedRow.version + 1` (monotonic) — seal at THAT
+      // version so a fresh load() can decrypt it (vault-aead-resurrect-version-mismatch).
+      ops.push({ plainKey, wireKey: wk, baseVersion: 0, sealVersion: cur.version + 1, isDelete: false, value });
     } else if (changed(wk, value)) {
-      ops.push({ plainKey, wireKey: wk, baseVersion: cur.version, isDelete: false, value });
+      // Update: CAS at the known version; server assigns `version + 1`.
+      ops.push({ plainKey, wireKey: wk, baseVersion: cur.version, sealVersion: cur.version + 1, isDelete: false, value });
     }
   }
   for (const [wk, cur] of known) {
     if (!cur.deleted && !liveWire.has(wk) && !reserved?.has(wk)) {
-      ops.push({ plainKey: '', wireKey: wk, baseVersion: cur.version, isDelete: true });
+      ops.push({ plainKey: '', wireKey: wk, baseVersion: cur.version, sealVersion: cur.version + 1, isDelete: true });
     }
   }
   return ops;
