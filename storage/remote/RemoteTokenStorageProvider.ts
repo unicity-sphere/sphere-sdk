@@ -33,7 +33,7 @@ import type {
   TokenStorageProvider,
   TxfStorageDataBase,
 } from '../storage-provider';
-import { hexToBytes } from '../../core/crypto';
+import { getPublicKey, hexToBytes } from '../../core/crypto';
 import { sealVaultEntry } from '../../vault-aead/entry';
 import { deriveVaultKey } from '../../vault-aead/derive';
 import { wireKey } from './wire-key';
@@ -49,6 +49,7 @@ import {
 import { sealHistoryRecord, openHistoryRecord } from './history-codec';
 import { deleteCanon } from '../../vault-aead/canon';
 import { signMessage } from '../../core/crypto';
+import { SphereError } from '../../core/errors';
 import { deriveDirectAddress } from '../../token-engine/identity';
 import type {
   PatchOp,
@@ -192,6 +193,15 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
   // --- TokenStorageProvider -------------------------------------------------
 
   setIdentity(identity: FullIdentity): void {
+    // FUND-SAFETY (remote-provider-multiaddress-key-desync): the AEAD vault key,
+    // wireKeys and the auth signature are all derived from the CONSTRUCTION-TIME
+    // `config.privateKey`, while `ownerId` comes from `identity`. If `identity`
+    // belongs to a DIFFERENT address (an HD address switch), the crypto would
+    // desync from the owner — blobs sealed under the wrong key, auth 401. Multi-
+    // address requires a per-address provider instance keyed to THAT address's
+    // private key (see `createForAddress()` in the contract). FAIL LOUD on a
+    // mismatch so a cross-identity write can NEVER reach the server.
+    this.assertIdentityMatchesKey(identity);
     // Bump the identity epoch FIRST so any in-flight flush awaiting an I/O round
     // trip aborts the moment it next re-checks (Task 7.3) — no cross-identity write.
     this.identityEpoch += 1;
@@ -215,6 +225,27 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     });
     this.delta.setIdentity(identity.chainPubkey);
     this.delta.setWalletPriv(this.config.privateKey);
+  }
+
+  /**
+   * Guard against a multi-address key desync (remote-provider-multiaddress-key-desync):
+   * `config.privateKey` is fixed at construction and drives ALL vault-boundary
+   * crypto (AEAD key, wireKey, auth signature), so the identity's pubkey MUST be
+   * the public key of THAT private key. A mismatch means a different HD address is
+   * being pointed at this provider — which would seal blobs under the wrong key
+   * and 401 the auth. Throw a clear error so the desync can never reach the wire;
+   * the caller must spawn a per-address provider keyed to that address instead.
+   */
+  private assertIdentityMatchesKey(identity: FullIdentity): void {
+    const expected = getPublicKey(this.config.privateKey);
+    if (identity.chainPubkey !== expected) {
+      throw new SphereError(
+        'RemoteTokenStorageProvider.setIdentity: identity pubkey does not match the ' +
+          "provider's configured private key — multi-address requires a per-address " +
+          'provider instance (createForAddress) keyed to that address.',
+        'INVALID_IDENTITY',
+      );
+    }
   }
 
   /** Abort the flush path if the identity epoch advanced (Task 7.3). */
