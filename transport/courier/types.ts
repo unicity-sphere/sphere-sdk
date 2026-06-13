@@ -127,6 +127,12 @@ export interface CourierSentItem {
   entryId: string;
   recipientPubkey: string;
   status: CourierDeliveryStatus;
+  /**
+   * The server-assigned per-sender monotonic watermark for this row (same space as
+   * the deposit `sentSeq`). Lets the sender persist a `/sent` watermark and paginate
+   * `?since=` across pages, so a delivery confirmation on page 2 is never dropped.
+   */
+  sentSeq: number;
   ackSig: string | null;
   /**
    * The server nonce the recipient's claim consumed — surfaced so the SENDER can

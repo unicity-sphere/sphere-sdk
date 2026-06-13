@@ -24,12 +24,27 @@ import { courierEntryId } from './entryId';
 import { courierAckTemplate } from './ack-template';
 import type {
   CourierHttpClient,
+  CourierInboxItem,
   DeliveryHandle,
   SignedReceipt,
   TokenDeliveryCapabilities,
   TokenDeliveryTransport,
   TokenEnvelope,
 } from './types';
+
+/** The highest `seq` across a page of rows, falling back to `fallback` when empty. */
+function highestSeq(items: ReadonlyArray<{ seq: number }>, fallback: number): number {
+  let max = fallback;
+  for (const item of items) if (item.seq > max) max = item.seq;
+  return max;
+}
+
+/** The highest `sentSeq` across a /sent page, falling back to `fallback` when empty. */
+function highestSentSeq(items: ReadonlyArray<{ sentSeq: number }>, fallback: number): number {
+  let max = fallback;
+  for (const item of items) if (item.sentSeq > max) max = item.sentSeq;
+  return max;
+}
 
 /**
  * Sink for a decoded incoming transfer — bound by PaymentsModule to its existing
@@ -49,6 +64,13 @@ interface SentPendingEntry {
   recipientPubkey: string;
   attempts: number;
   state: SenderDeliveryState;
+  /**
+   * The server-assigned per-sender watermark for this entry (from the deposit
+   * response). Lets `pollSent()` advance the persisted sent watermark by sentSeq —
+   * present on entries deposited after the watermark fix; absent (undefined) on
+   * rows journaled by an older build (watermark still advances via the /sent row).
+   */
+  sentSeq?: number;
 }
 
 /** Minimal persistent KV the journal needs (matches PaymentsModule storage). */
@@ -140,8 +162,9 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
       // hint stays undefined here — a single base64 SCALAR when present (never an object).
     });
     // Track the entry sender-side so pollSent() can gate "delivered" on a valid
-    // recipient ackSig before removing PENDING_V2_DELIVERIES (DESIGN §6.5).
-    await this.journalSentPending(entryId, envelope.recipientChainPubkey);
+    // recipient ackSig before removing PENDING_V2_DELIVERIES (DESIGN §6.5). The
+    // sentSeq is captured so pollSent() can advance the persisted sent watermark.
+    await this.journalSentPending(entryId, envelope.recipientChainPubkey, res.sentSeq);
     return {
       entryId: res.entryId,
       transferId: envelope.transferId,
@@ -177,23 +200,62 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
   // ===========================================================================
 
   /**
-   * Pull the inbox since the server read pointer, open each envelope, decode it
+   * Pull the inbox since the persisted read pointer, open each envelope, decode it
    * to a {@link TokenEnvelope}, map it to a {@link V2TransferPayload}, and feed
    * the EXISTING `handleV2Transfer` path (via {@link V2TransferSink}) UNCHANGED.
    *
-   * Re-pulling an already-processed-but-unclaimed item is harmless — the sink
-   * dedups by `v2_${tokenId}`. After a successful receive the entry is queued for
-   * the signed ack (Task 5.3).
+   * PAGINATION (finding courier-readpointer-and-watermark-never-persisted): loop
+   * `/inbox?since=` while `more` so a delivery on page 2+ is NEVER dropped (a lost
+   * transfer). After processing, PERSIST the advanced read pointer — the highest
+   * CONTIGUOUSLY-processed seq — so the next `receive()` resumes from there and not
+   * from `since=0`. The fetch cursor advances by the highest seq seen per page even
+   * if an item failed mid-page (it is re-pulled next time from the persisted, lower
+   * pointer; re-receiving is harmless — the sink dedups by `v2_${tokenId}`).
    */
   async receive(): Promise<void> {
     const me = this.requireIdentity();
     const client = this.config.httpClientFactory(me.chainPubkey);
-    const since = await this.readPointer();
-    const res = await client.inbox(since);
-    for (const item of res.items) {
-      if (item.status === 'claimed') continue;
-      await this.receiveItem(me, item);
+    const start = await this.readPointer();
+    let watermark = start;
+    try {
+      let cursor = start;
+      for (;;) {
+        const res = await client.inbox(cursor);
+        watermark = await this.processInboxPage(me, res.items, watermark);
+        const next = highestSeq(res.items, cursor);
+        // No more pages, or `more` set but the page did not advance (defensive).
+        if (!res.more || next <= cursor) break;
+        cursor = next;
+      }
+    } finally {
+      // Persist whatever contiguous progress we made — even if a later item threw,
+      // the prefix we fully processed must not be re-pulled from since=0 next time.
+      if (watermark > start) {
+        await this.config.journal.set(this.readPointerKey(), String(watermark));
+      }
     }
+  }
+
+  /**
+   * Process one inbox page IN SEQ ORDER, advancing the contiguous read-pointer
+   * watermark. An item counts as processed when it is already `claimed` (skip) or
+   * `receiveItem` completes without throwing; the FIRST item that throws breaks
+   * contiguity AND propagates (the Phase-5 crash-recovery contract), so the
+   * watermark never advances past an item we did not fully process.
+   */
+  private async processInboxPage(
+    me: FullIdentity,
+    items: ReadonlyArray<CourierInboxItem>,
+    watermark: number,
+  ): Promise<number> {
+    let advanced = watermark;
+    for (const item of items) {
+      if (item.status !== 'claimed') {
+        await this.receiveItem(me, item); // throws → propagates, watermark frozen here
+      }
+      advanced = Math.max(advanced, item.seq);
+    }
+    return advanced;
   }
 
   /** Open one inbox item and feed it to handleV2Transfer; then arm the ack. */
@@ -346,10 +408,10 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
     await this.config.journal.set(this.sentPendingKey(), JSON.stringify(pending));
   }
 
-  private async journalSentPending(entryId: string, recipientPubkey: string): Promise<void> {
+  private async journalSentPending(entryId: string, recipientPubkey: string, sentSeq?: number): Promise<void> {
     const pending = await this.loadSentPending();
     if (!pending[entryId]) {
-      pending[entryId] = { recipientPubkey, attempts: 0, state: 'pending' };
+      pending[entryId] = { recipientPubkey, attempts: 0, state: 'pending', sentSeq };
       await this.saveSentPending(pending);
     }
   }
@@ -361,17 +423,53 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
    * signature licenses `onDelivered` (which removes `PENDING_V2_DELIVERIES` + GC).
    * A forged flag without a valid sig is rejected → the entry stays pending and is
    * redelivered (bounded by attempt count → `delivery_unconfirmed`).
+   *
+   * PAGINATION + WATERMARK (finding courier-readpointer-and-watermark-never-persisted):
+   * loop `/sent?since=` while `more` so a delivery confirmation on page 2+ is NEVER
+   * dropped, then PERSIST the advanced sent watermark — the highest CONTIGUOUSLY-
+   * delivered sentSeq — so the next poll resumes past the confirmed prefix and not
+   * from `since=0`. A still-pending entry holds the watermark back (it must keep
+   * being polled), so we never advance past an unconfirmed delivery.
    */
   async pollSent(): Promise<void> {
     const me = this.requireIdentity();
     const client = this.config.httpClientFactory(me.chainPubkey);
-    const since = await this.sentWatermark();
-    const res = await client.sent(since);
+    const start = await this.sentWatermark();
     const pending = await this.loadSentPending();
-    for (const item of res.items) {
-      await this.reconcileSentItem(me, pending, item);
+    let cursor = start;
+    for (;;) {
+      const res = await client.sent(cursor);
+      for (const item of res.items) {
+        await this.reconcileSentItem(me, pending, item);
+      }
+      const next = highestSentSeq(res.items, cursor);
+      if (!res.more || next <= cursor) break;
+      cursor = next;
     }
     await this.saveSentPending(pending);
+    await this.advanceSentWatermark(start, pending);
+  }
+
+  /**
+   * Persist the sent watermark to the highest CONTIGUOUSLY-delivered sentSeq.
+   * Entries are walked in sentSeq order; the first non-`delivered` entry (pending /
+   * delivery_unconfirmed) breaks contiguity so the watermark never advances past a
+   * delivery that still needs confirming. Entries without a known sentSeq (older
+   * journal rows) are conservatively treated as a contiguity break.
+   */
+  private async advanceSentWatermark(start: number, pending: Record<string, SentPendingEntry>): Promise<void> {
+    const rows = Object.values(pending)
+      .filter((e): e is SentPendingEntry & { sentSeq: number } => typeof e.sentSeq === 'number')
+      .sort((a, b) => a.sentSeq - b.sentSeq);
+    let watermark = start;
+    for (const row of rows) {
+      if (row.sentSeq <= start) continue; // already past the watermark
+      if (row.state !== 'delivered') break; // contiguity break — do not advance further
+      watermark = row.sentSeq;
+    }
+    if (watermark > start) {
+      await this.config.journal.set(this.sentWatermarkKey(), String(watermark));
+    }
   }
 
   /** Verify one /sent row's ackSig and advance its sender-side state. */

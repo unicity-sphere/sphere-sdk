@@ -53,6 +53,12 @@ interface DeliveryRow {
 let randomCounter = 0;
 const nextNonce = (): string => `nonce-${++randomCounter}-${Math.random().toString(36).slice(2)}`;
 
+export interface FakeCourierServerOptions {
+  network?: string;
+  /** Max rows returned per `/inbox` or `/sent` page; the rest set `more:true`. */
+  pageLimit?: number;
+}
+
 /**
  * The in-memory courier server. Hold ONE instance per test; obtain a
  * caller-scoped {@link CourierHttpClient} via {@link FakeCourierServer.clientFor}.
@@ -60,6 +66,8 @@ const nextNonce = (): string => `nonce-${++randomCounter}-${Math.random().toStri
 export class FakeCourierServer {
   /** Canonical network literal baked into the ack template (DESIGN §6.4). */
   readonly network: string;
+  /** Page size for `/inbox` + `/sent` (mirrors token-api `config.PAGE_LIMIT`). */
+  private readonly pageLimit: number;
 
   private readonly deliveries: DeliveryRow[] = [];
   private readonly recipientSeq = new Map<string, number>();
@@ -78,8 +86,10 @@ export class FakeCourierServer {
     sent: number[];
   } = { deposit: [], ack: [], ackNonce: [], inbox: [], sent: [] };
 
-  constructor(network = 'testnet2') {
-    this.network = network;
+  constructor(opts: FakeCourierServerOptions | string = {}) {
+    const o = typeof opts === 'string' ? { network: opts } : opts;
+    this.network = o.network ?? 'testnet2';
+    this.pageLimit = o.pageLimit ?? 1000;
   }
 
   /** A {@link CourierHttpClient} bound to a caller (the authenticated chainPubkey). */
@@ -125,23 +135,26 @@ export class FakeCourierServer {
 
   private inbox(recipientId: string, since: number): CourierInboxResponse {
     this.calls.inbox.push(since);
-    const items = this.deliveries
+    const rows = this.deliveries
       .filter((d) => d.recipientId === recipientId && d.seq > since)
-      .sort((a, b) => a.seq - b.seq)
-      .map((d) => ({
-        entryId: d.entryId,
-        seq: d.seq,
-        status: d.status,
-        senderPubkey: d.senderId,
-        ciphertext: d.ciphertext,
-        transferId: d.transferId,
-        hint: d.hint,
-        ackSig: d.ackSig,
-      }));
+      .sort((a, b) => a.seq - b.seq);
+    // Page-limited (mirrors token-api: fetch limit+1, `more` when overshot).
+    const more = rows.length > this.pageLimit;
+    const page = more ? rows.slice(0, this.pageLimit) : rows;
+    const items = page.map((d) => ({
+      entryId: d.entryId,
+      seq: d.seq,
+      status: d.status,
+      senderPubkey: d.senderId,
+      ciphertext: d.ciphertext,
+      transferId: d.transferId,
+      hint: d.hint,
+      ackSig: d.ackSig,
+    }));
     return {
       readPointer: this.readPointers.get(recipientId) ?? 0,
       syncEpoch: this.syncEpoch,
-      more: false,
+      more,
       items,
     };
   }
@@ -174,17 +187,20 @@ export class FakeCourierServer {
 
   private sent(senderId: string, since: number): CourierSentResponse {
     this.calls.sent.push(since);
-    const items = this.deliveries
+    const rows = this.deliveries
       .filter((d) => d.senderId === senderId && d.sentSeq > since)
-      .sort((a, b) => a.sentSeq - b.sentSeq)
-      .map((d) => ({
-        entryId: d.entryId,
-        recipientPubkey: d.recipientId,
-        status: d.status,
-        ackSig: d.ackSig,
-        ackNonce: d.ackNonce,
-      }));
-    return { more: false, items };
+      .sort((a, b) => a.sentSeq - b.sentSeq);
+    const more = rows.length > this.pageLimit;
+    const page = more ? rows.slice(0, this.pageLimit) : rows;
+    const items = page.map((d) => ({
+      entryId: d.entryId,
+      recipientPubkey: d.recipientId,
+      status: d.status,
+      sentSeq: d.sentSeq,
+      ackSig: d.ackSig,
+      ackNonce: d.ackNonce,
+    }));
+    return { more, items };
   }
 
   // --- test affordances -----------------------------------------------------
