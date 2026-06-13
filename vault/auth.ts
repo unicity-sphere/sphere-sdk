@@ -97,6 +97,9 @@ export function verifyVaultAuth(params: VerifyVaultAuthParams): string | null {
 
 /** Assert the prefix and parse the JSON body; `null` on either failure. */
 function parseChallenge(challenge: string): ParsedAuthBody | null {
+  // Defense-in-depth: a non-string input must yield null, never a TypeError —
+  // the server adopts this as its auth gate and a throw here would 500 not 401.
+  if (typeof challenge !== 'string') return null;
   if (!challenge.startsWith(VAULT_AUTH_PREFIX)) return null;
   try {
     return JSON.parse(challenge.slice(VAULT_AUTH_PREFIX.length)) as ParsedAuthBody;

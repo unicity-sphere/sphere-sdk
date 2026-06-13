@@ -78,6 +78,15 @@ describe('verifyVaultAuth — server-side verifier', () => {
     ).toBeNull();
   });
 
+  it('returns null (never throws) on a non-string challenge', () => {
+    const signature = signMessage(PRIV, build());
+    for (const bad of [undefined, null, 42, {}]) {
+      expect(
+        verifyVaultAuth({ challenge: bad as unknown as string, signature, expectedPubkey: PUB, expectedNetwork: NETWORK, now: NOW }),
+      ).toBeNull();
+    }
+  });
+
   it('returns null when the embedded pubkey is not the expected one', () => {
     const challenge = build();
     const signature = signMessage(PRIV, challenge);
