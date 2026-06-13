@@ -15,10 +15,8 @@
  */
 
 import { signMessage } from '../../core/crypto';
+import { VAULT_AUTH_PREFIX } from '../../vault/auth';
 import type { AuthTokens, ChallengeResponse, VaultAuthHttpClient } from './types';
-
-/** Auth prefix the server stamps on every challenge (`services/auth.service.ts`). */
-const AUTH_PREFIX = 'unicity:vault:auth:v1\n';
 
 /** Reject challenges whose lifetime is implausibly long (a clamp on a hostile TTL). */
 const MAX_CHALLENGE_TTL_MS = 60 * 60_000; // 1 hour — the real server uses 5 min
@@ -124,7 +122,7 @@ export class VaultApiClient {
    * timestamps are implausible.
    */
   private verifyChallenge(c: ChallengeResponse): void {
-    if (!c.challenge.startsWith(AUTH_PREFIX)) {
+    if (!c.challenge.startsWith(VAULT_AUTH_PREFIX)) {
       throw new Error('vault auth: challenge missing the expected prefix — refusing to sign');
     }
     const body = this.parseBody(c.challenge);
@@ -142,7 +140,7 @@ export class VaultApiClient {
   private parseBody(challenge: string): ChallengeBody {
     let body: ChallengeBody;
     try {
-      body = JSON.parse(challenge.slice(AUTH_PREFIX.length)) as ChallengeBody;
+      body = JSON.parse(challenge.slice(VAULT_AUTH_PREFIX.length)) as ChallengeBody;
     } catch {
       throw new Error('vault auth: challenge body is not valid JSON — refusing to sign');
     }
