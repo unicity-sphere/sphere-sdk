@@ -33,7 +33,7 @@ import type {
   TokenStorageProvider,
   TxfStorageDataBase,
 } from '../storage-provider';
-import { hexToBytes } from '../../core/crypto';
+import { getPublicKey, hexToBytes } from '../../core/crypto';
 import { sealVaultEntry } from '../../vault-aead/entry';
 import { deriveVaultKey } from '../../vault-aead/derive';
 import { wireKey } from './wire-key';
@@ -49,6 +49,7 @@ import {
 import { sealHistoryRecord, openHistoryRecord } from './history-codec';
 import { deleteCanon } from '../../vault-aead/canon';
 import { signMessage } from '../../core/crypto';
+import { SphereError } from '../../core/errors';
 import { deriveDirectAddress } from '../../token-engine/identity';
 import type {
   PatchOp,
@@ -192,6 +193,15 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
   // --- TokenStorageProvider -------------------------------------------------
 
   setIdentity(identity: FullIdentity): void {
+    // FUND-SAFETY (remote-provider-multiaddress-key-desync): the AEAD vault key,
+    // wireKeys and the auth signature are all derived from the CONSTRUCTION-TIME
+    // `config.privateKey`, while `ownerId` comes from `identity`. If `identity`
+    // belongs to a DIFFERENT address (an HD address switch), the crypto would
+    // desync from the owner — blobs sealed under the wrong key, auth 401. Multi-
+    // address requires a per-address provider instance keyed to THAT address's
+    // private key (see `createForAddress()` in the contract). FAIL LOUD on a
+    // mismatch so a cross-identity write can NEVER reach the server.
+    this.assertIdentityMatchesKey(identity);
     // Bump the identity epoch FIRST so any in-flight flush awaiting an I/O round
     // trip aborts the moment it next re-checks (Task 7.3) — no cross-identity write.
     this.identityEpoch += 1;
@@ -217,6 +227,27 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     this.delta.setWalletPriv(this.config.privateKey);
   }
 
+  /**
+   * Guard against a multi-address key desync (remote-provider-multiaddress-key-desync):
+   * `config.privateKey` is fixed at construction and drives ALL vault-boundary
+   * crypto (AEAD key, wireKey, auth signature), so the identity's pubkey MUST be
+   * the public key of THAT private key. A mismatch means a different HD address is
+   * being pointed at this provider — which would seal blobs under the wrong key
+   * and 401 the auth. Throw a clear error so the desync can never reach the wire;
+   * the caller must spawn a per-address provider keyed to that address instead.
+   */
+  private assertIdentityMatchesKey(identity: FullIdentity): void {
+    const expected = getPublicKey(this.config.privateKey);
+    if (identity.chainPubkey !== expected) {
+      throw new SphereError(
+        'RemoteTokenStorageProvider.setIdentity: identity pubkey does not match the ' +
+          "provider's configured private key — multi-address requires a per-address " +
+          'provider instance (createForAddress) keyed to that address.',
+        'INVALID_IDENTITY',
+      );
+    }
+  }
+
   /** Abort the flush path if the identity epoch advanced (Task 7.3). */
   private assertEpoch(epoch: number): void {
     if (epoch !== this.identityEpoch) throw new IdentityFencedError();
@@ -225,18 +256,39 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
   /**
    * Authenticate, then run the FIRST load ourselves so the flush gate opens even
    * when `PaymentsModule.load()` short-circuits before reaching this provider
-   * (Task 7.1). A transient first-load failure is swallowed (the gate stays SHUT,
-   * `sync()` no-ops) so an empty local import can never overwrite the server.
+   * (Task 7.1).
+   *
+   * FUND-SAFETY (remote-provider-init-auth-throw-bricks-wallet): this is a BACKUP
+   * provider and the wallet loads providers together — a throw here would reject
+   * the WHOLE wallet load and brick the wallet because the vault is unreachable.
+   * So `initialize()` NEVER throws on auth / network / first-load failure: it
+   * logs (via `storage:error`), leaves the flush gate SHUT (`initialLoadDone`
+   * stays false → `sync()` degrades, never wipes the server with empty local
+   * data) and RETURNS the contract's non-fatal `false` so the wallet still loads
+   * from local storage. A vault outage degrades to "remote backup inactive".
    */
   async initialize(): Promise<boolean> {
     this.status = 'connecting';
-    await this.requireAuth().authenticate();
+    try {
+      await this.requireAuth().authenticate();
+    } catch (error) {
+      this.status = 'error';
+      this.emit('storage:error', { reason: 'auth' }, this.errMsg(error, 'vault auth failed'));
+      return false; // degrade — do NOT brick the wallet
+    }
     this.status = 'connected';
-    const first = await this.load();
+    const first = await this.load(); // load() never throws (it try/catches internally)
     if (!first.success) {
+      this.status = 'error';
       this.emit('storage:error', { reason: 'initial-load' }, first.error);
+      return false; // first load failed → gate stays SHUT, wallet still loads locally
     }
     return true;
+  }
+
+  /** Extract a human message from an unknown thrown value (degraded-path logging). */
+  private errMsg(error: unknown, fallback: string): string {
+    return error instanceof Error ? error.message : fallback;
   }
 
   /** True once the first successful load opened the flush gate (Task 7.1). */
@@ -263,13 +315,34 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
   async sync(localData: TData): Promise<SyncResult<TData>> {
     // Flush gate (Task 7.1): no PATCH before a successful first load, so a
     // transient load failure can never wipe the server with empty local data.
+    //
+    // FUND-SAFETY (remote-provider-silent-backup-failure-reports-success): while
+    // the gate is shut the backup did NOT happen, so we must NOT report a silent
+    // success — that would tell the wallet its tokens are durably backed up when
+    // nothing was persisted. We SIGNAL the degraded state: return success:false
+    // with a reason AND emit a degraded `sync:error` event (frozen union, a
+    // data.reason — never a new union member). Empty-import protection is intact:
+    // we still perform NO PATCH before a successful first load.
     if (!this.initialLoadDone) {
-      return { success: true, merged: localData, added: 0, removed: 0, conflicts: 0 };
+      return this.degraded(localData);
     }
     // Capture the identity epoch BEFORE queueing; the flush aborts if it advances
     // across any await (Task 7.3). Serialized so flushes never interleave.
     const epoch = this.identityEpoch;
     return this.queue.enqueue(() => this.runSync(localData, epoch));
+  }
+
+  /**
+   * The gate-shut degraded result (finding
+   * remote-provider-silent-backup-failure-reports-success): emit a `sync:error`
+   * degraded signal with a `data.reason` and return success:false. NO PATCH is
+   * performed (empty-import protection). Distinct from a genuine successful no-op
+   * flush (gate OPEN, nothing to push), which stays success:true.
+   */
+  private degraded(localData: TData): SyncResult<TData> {
+    const reason = 'awaiting-initial-load';
+    this.emit('sync:error', { reason }, 'vault backup inactive: awaiting a successful initial load');
+    return { success: false, merged: localData, added: 0, removed: 0, conflicts: 0, error: reason };
   }
 
   private async runSync(localData: TData, epoch: number): Promise<SyncResult<TData>> {
@@ -644,7 +717,12 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
 
   private emit(type: StorageEventType, data?: unknown, error?: string): void {
     const event: StorageEvent = { type, timestamp: Date.now(), data, error };
-    for (const cb of this.listeners) cb(event);
+    // Isolate listeners: a throwing handler must NOT propagate out of emit() —
+    // otherwise it re-rejects initialize()/load() and re-bricks the wallet,
+    // defeating the no-throw guarantee. Matches IpfsStorageProvider.emitEvent.
+    for (const cb of this.listeners) {
+      try { cb(event); } catch { /* handler errors must not break the provider */ }
+    }
   }
 
   // === history (Task 7.4 — single channel) ==================================

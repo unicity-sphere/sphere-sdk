@@ -14,7 +14,6 @@ import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { bytesToHex, hexToBytes } from '../../../core/crypto';
 import { RemoteTokenStorageProvider } from '../../../storage/remote/RemoteTokenStorageProvider';
 import { FakeVaultServer } from '../../helpers/fake-vault-server';
-import { wireKey } from '../../../storage/remote/wire-key';
 import type { TxfStorageDataBase } from '../../../storage/storage-provider';
 import type { FullIdentity } from '../../../types';
 import type { PatchResponse, StateResponse, VaultHttpClient } from '../../../storage/remote/types';
@@ -22,10 +21,7 @@ import type { PatchResponse, StateResponse, VaultHttpClient } from '../../../sto
 const NETWORK = 'testnet2';
 const PRIV_A = '11'.repeat(32);
 const PUB_A = bytesToHex(secp256k1.getPublicKey(hexToBytes(PRIV_A), true));
-const PRIV_B = '22'.repeat(32);
-const PUB_B = bytesToHex(secp256k1.getPublicKey(hexToBytes(PRIV_B), true));
 const identityA: FullIdentity = { chainPubkey: PUB_A, l1Address: 'alphaA', privateKey: PRIV_A };
-const identityB: FullIdentity = { chainPubkey: PUB_B, l1Address: 'alphaB', privateKey: PRIV_B };
 
 function txf(tokens: Record<string, unknown>): TxfStorageDataBase {
   const data: TxfStorageDataBase = {
@@ -51,7 +47,7 @@ function gatedClient(inner: VaultHttpClient, onPatch: () => Promise<void>): Vaul
 }
 
 describe('flush serialization + identity fencing', () => {
-  it('an in-flight flush that awaits across setIdentity aborts — no cross-identity write reaches the server', async () => {
+  it('an in-flight flush that awaits across setIdentity aborts on the epoch fence (no stale local commit)', async () => {
     const server = new FakeVaultServer(NETWORK);
     let release!: () => void;
     const gate = new Promise<void>((r) => { release = r; });
@@ -76,17 +72,22 @@ describe('flush serialization + identity fencing', () => {
     const flushing = provider.sync(txf({ aaa: { amt: '1' } }));
     await Promise.resolve();
 
-    // Switch identity to B mid-flush, then release the suspended patch.
-    provider.setIdentity(identityB);
+    // Bump the identity epoch mid-flush. The multi-address key guard
+    // (remote-provider-multiaddress-key-desync) forbids switching to a DIFFERENT
+    // key on the same instance, so the epoch bump uses a SAME-KEY identity variant
+    // (only l1Address differs) — exactly what exercises the epoch fence without a
+    // cross-key desync. Then release the suspended patch.
+    const identityASameKey: FullIdentity = { ...identityA, l1Address: 'alphaA-2' };
+    provider.setIdentity(identityASameKey);
     release();
     const res = await flushing;
 
-    // The flush aborted on the epoch mismatch — B's server view never got A's token,
-    // and the suspended flush did NOT commit under B (no cross-identity write).
-    const wkB = wireKey(PRIV_B, NETWORK, 'aaa');
-    expect(server.getEntry(PUB_B, wkB)).toBeUndefined();
+    // The flush aborted on the epoch mismatch: it threw the IdentityFencedError
+    // AFTER the patch await, so the local last-known state / signed baseline were
+    // NOT committed under the stale epoch and the result is a fenced failure.
     expect(res.success).toBe(false);
     expect(res.error).toMatch(/identity/i);
+    expect(provider.knownCount()).toBe(0); // no stale local commit
   });
 
   it('overlapping flushes are serialized (no interleave) by the AsyncSerialQueue', async () => {
