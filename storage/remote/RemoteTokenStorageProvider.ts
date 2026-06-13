@@ -717,7 +717,12 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
 
   private emit(type: StorageEventType, data?: unknown, error?: string): void {
     const event: StorageEvent = { type, timestamp: Date.now(), data, error };
-    for (const cb of this.listeners) cb(event);
+    // Isolate listeners: a throwing handler must NOT propagate out of emit() —
+    // otherwise it re-rejects initialize()/load() and re-bricks the wallet,
+    // defeating the no-throw guarantee. Matches IpfsStorageProvider.emitEvent.
+    for (const cb of this.listeners) {
+      try { cb(event); } catch { /* handler errors must not break the provider */ }
+    }
   }
 
   // === history (Task 7.4 — single channel) ==================================
