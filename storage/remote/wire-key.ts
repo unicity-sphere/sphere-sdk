@@ -18,11 +18,9 @@ import { hmac } from '@noble/hashes/hmac.js';
 import { hkdf } from '@noble/hashes/hkdf.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { hexToBytes, bytesToHex } from '../../core/crypto';
+import { WIREKEY_DOMAIN } from '../../vault/contracts';
 
 const utf8 = (s: string): Uint8Array => new TextEncoder().encode(s);
-
-/** HKDF info prefix for the per-network wire-key derivation. */
-const WIRE_KEY_INFO_PREFIX = 'unicity-vault-wirekey-v1:';
 
 /**
  * Derive the opaque wire key for a plaintext vault key.
@@ -33,7 +31,7 @@ export function wireKey(walletPriv: string, network: string, plainKey: string): 
     sha256,
     hexToBytes(walletPriv),
     undefined,
-    utf8(WIRE_KEY_INFO_PREFIX + network),
+    utf8(WIREKEY_DOMAIN + network),
     32,
   );
   return bytesToHex(hmac(sha256, prk, utf8(plainKey)));

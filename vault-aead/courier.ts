@@ -14,9 +14,7 @@ import { randomBytes } from '@noble/hashes/utils.js';
 import { seal, open } from './aead';
 import { deriveCourierKey, lengthDelim } from './derive';
 import { ecdhX } from './ecdh';
-
-/** HKDF info for the courier AEAD key. */
-const COURIER_KEY_INFO = 'unicity-courier-aead-v1';
+import { COURIER_AEAD_DOMAIN } from '../vault/contracts';
 
 export interface SealCourierParams {
   network: string;
@@ -66,7 +64,7 @@ function courierAad(p: { network: string; senderPubkey: string; recipientPubkey:
  * production callers omit it so a fresh random nonce is drawn.
  */
 export function sealCourierEnvelope(params: SealCourierParams, nonce?: Uint8Array): string {
-  const key = deriveCourierKey(ecdhX(params.senderPriv, params.recipientPubkey), COURIER_KEY_INFO);
+  const key = deriveCourierKey(ecdhX(params.senderPriv, params.recipientPubkey), COURIER_AEAD_DOMAIN);
   const n = nonce ?? randomBytes(24);
   const aad = courierAad(params);
   const ct = seal(key, n, params.plaintext, aad);
@@ -75,7 +73,7 @@ export function sealCourierEnvelope(params: SealCourierParams, nonce?: Uint8Arra
 
 /** Open a packed courier envelope; returns the plaintext. Throws on any tamper. */
 export function openCourierEnvelope(params: OpenCourierParams): Uint8Array {
-  const key = deriveCourierKey(ecdhX(params.recipientPriv, params.senderPubkey), COURIER_KEY_INFO);
+  const key = deriveCourierKey(ecdhX(params.recipientPriv, params.senderPubkey), COURIER_AEAD_DOMAIN);
   const { nonce, ct } = unpackCourier(params.ciphertext);
   const aad = courierAad(params);
   return open(key, nonce, ct, aad);

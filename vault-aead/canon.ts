@@ -1,55 +1,25 @@
 /**
  * Canonical signing literals shared with the token-api server (§8.1).
  *
- * These templates are the EXACT byte-strings both plans sign/verify. They are
- * pinned by the shared golden vectors (`tests/fixtures/vault-signing-vectors.json`)
- * so a divergence on either side is caught by a failing test.
+ * These templates are now DEFINED ONCE in `vault/contracts.ts` (the single-source
+ * contract module). This file is a thin compatibility shim: it re-exports them
+ * under the historical `epochCanon` / `deleteCanon` / `accountDeleteCanon` names so
+ * existing call sites keep working. No literal lives here — see `vault/contracts.ts`.
  *
  * `epochCanon` is the message the vault server signs to attest a monotonic
  * storage-epoch (§5.4/§8.2). The SDK verifies the server's `epochSig` against
  * `NETWORKS[net].vaultServerKey` — a server-signed epoch bump is the only thing
  * that distinguishes a sanctioned testnet reset from a hostile rollback.
- */
-
-/** HKDF/canon prefix for the server epoch attestation. */
-export const EPOCH_CANON_PREFIX = 'unicity:vault:epoch:v1';
-
-/**
- * Canonical epoch message: `'unicity:vault:epoch:v1\n' + network + '\n' + epoch`.
- * The epoch is concatenated as its decimal string.
- */
-export function epochCanon(network: string, epoch: number | bigint): string {
-  return `${EPOCH_CANON_PREFIX}\n${network}\n${epoch}`;
-}
-
-/**
- * Account-delete canonical template (scheme fixture — §8.1).
  *
- * NOTE: this `account-delete:v1` literal exists only as a golden scheme vector
- * (Task 2.2). The ACTUAL runtime account-delete template used by the provider
- * (Phase 7, matching Part A's delete route) is `unicity:vault:delete:v1` — do
- * NOT swap the runtime path onto this literal.
+ * The `account-delete:v1` literal exists ONLY as a golden scheme vector; the REAL
+ * runtime account-delete template is `delete:v1` (see `vault/contracts.ts`).
  */
-export const ACCOUNT_DELETE_CANON_PREFIX = 'unicity:vault:account-delete:v1';
 
-/**
- * Canonical account-delete message:
- * `'unicity:vault:account-delete:v1\n' + network + '\n' + chainPubkey + '\n' + nonce`.
- */
-export function accountDeleteCanon(network: string, chainPubkey: string, nonce: string): string {
-  return `${ACCOUNT_DELETE_CANON_PREFIX}\n${network}\n${chainPubkey}\n${nonce}`;
-}
-
-/** Runtime account-delete prefix — the REAL Part A literal (`account.service.ts:11`). */
-export const DELETE_CANON_PREFIX = 'unicity:vault:delete:v1';
-
-/**
- * The REAL runtime account-delete message the wallet signs (Task 7.5, §7.4):
- * `'unicity:vault:delete:v1\n' + network + '\n' + ownerId + '\n' + nonce`.
- *
- * This is the `delete:v1` template Part A's `deleteCanon` verifies — NOT the
- * `account-delete:v1` scheme fixture above.
- */
-export function deleteCanon(network: string, ownerId: string, nonce: string): string {
-  return `${DELETE_CANON_PREFIX}\n${network}\n${ownerId}\n${nonce}`;
-}
+export {
+  EPOCH_CANON_PREFIX,
+  vaultEpochCanon as epochCanon,
+  ACCOUNT_DELETE_CANON_PREFIX,
+  vaultAccountDeleteCanon as accountDeleteCanon,
+  DELETE_CANON_PREFIX,
+  vaultDeleteCanon as deleteCanon,
+} from '../vault/contracts';
