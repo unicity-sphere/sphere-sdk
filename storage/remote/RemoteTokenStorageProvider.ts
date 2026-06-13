@@ -284,13 +284,34 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
   async sync(localData: TData): Promise<SyncResult<TData>> {
     // Flush gate (Task 7.1): no PATCH before a successful first load, so a
     // transient load failure can never wipe the server with empty local data.
+    //
+    // FUND-SAFETY (remote-provider-silent-backup-failure-reports-success): while
+    // the gate is shut the backup did NOT happen, so we must NOT report a silent
+    // success — that would tell the wallet its tokens are durably backed up when
+    // nothing was persisted. We SIGNAL the degraded state: return success:false
+    // with a reason AND emit a degraded `sync:error` event (frozen union, a
+    // data.reason — never a new union member). Empty-import protection is intact:
+    // we still perform NO PATCH before a successful first load.
     if (!this.initialLoadDone) {
-      return { success: true, merged: localData, added: 0, removed: 0, conflicts: 0 };
+      return this.degraded(localData);
     }
     // Capture the identity epoch BEFORE queueing; the flush aborts if it advances
     // across any await (Task 7.3). Serialized so flushes never interleave.
     const epoch = this.identityEpoch;
     return this.queue.enqueue(() => this.runSync(localData, epoch));
+  }
+
+  /**
+   * The gate-shut degraded result (finding
+   * remote-provider-silent-backup-failure-reports-success): emit a `sync:error`
+   * degraded signal with a `data.reason` and return success:false. NO PATCH is
+   * performed (empty-import protection). Distinct from a genuine successful no-op
+   * flush (gate OPEN, nothing to push), which stays success:true.
+   */
+  private degraded(localData: TData): SyncResult<TData> {
+    const reason = 'awaiting-initial-load';
+    this.emit('sync:error', { reason }, 'vault backup inactive: awaiting a successful initial load');
+    return { success: false, merged: localData, added: 0, removed: 0, conflicts: 0, error: reason };
   }
 
   private async runSync(localData: TData, epoch: number): Promise<SyncResult<TData>> {

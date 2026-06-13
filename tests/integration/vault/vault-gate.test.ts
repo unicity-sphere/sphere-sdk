@@ -75,7 +75,7 @@ describe('initialize() opens the flush gate', () => {
     expect(server.getEntry(PUB, wk)?.version).toBe(1);
   });
 
-  it('a failed first load keeps the gate SHUT — a flush is a no-op (empty-import protection)', async () => {
+  it('a failed first load keeps the gate SHUT — a flush performs NO PATCH but SIGNALS degraded (empty-import protection)', async () => {
     const server = new FakeVaultServer(NETWORK);
     // Wrap the data client so the FIRST /state (run by initialize) rejects.
     const wrap = (ownerId: string): VaultHttpClient => {
@@ -100,10 +100,12 @@ describe('initialize() opens the flush gate', () => {
     await provider.initialize();
     expect(provider.isInitialLoadDone()).toBe(false);
 
-    // A flush before a successful load is a NO-OP — no PATCH reaches the server,
-    // so empty local data can never wipe the server.
+    // A flush before a successful load performs NO PATCH (empty local data can
+    // never wipe the server) BUT it must SIGNAL the degraded state, not report a
+    // silent success (remote-provider-silent-backup-failure-reports-success).
     const res = await provider.sync(txf({ aaa: { amt: '1' } }));
-    expect(res.success).toBe(true); // a no-op flush is not a failure
+    expect(res.success).toBe(false); // degraded — the backup did NOT happen
+    expect(res.error).toBeTruthy();
     expect(res.added).toBe(0);
     expect(server.calls.patch).toHaveLength(0);
     const wk = wireKey(PRIV, NETWORK, 'aaa');
