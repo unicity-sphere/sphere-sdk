@@ -18,7 +18,7 @@ import type {
   VaultAuthHttpClient,
   VerifyRequest,
 } from '../types';
-import { joinUrl, postJson, VaultHttpError } from './http-core';
+import { joinUrl, postJson, VaultHttpError, withTimeout } from './http-core';
 import type { FetchLike } from './http-core';
 
 export interface HttpVaultAuthClientConfig {
@@ -26,6 +26,8 @@ export interface HttpVaultAuthClientConfig {
   vaultUrl: string;
   /** Defaults to the global `fetch`; injectable for tests / custom agents. */
   fetchImpl?: FetchLike;
+  /** Per-request deadline (ms); defaults to `DEFAULT_REQUEST_TIMEOUT_MS`. `0` disables. */
+  timeoutMs?: number;
 }
 
 export class HttpVaultAuthClient implements VaultAuthHttpClient {
@@ -34,7 +36,7 @@ export class HttpVaultAuthClient implements VaultAuthHttpClient {
 
   constructor(config: HttpVaultAuthClientConfig) {
     this.base = config.vaultUrl;
-    this.fetchImpl = config.fetchImpl ?? fetch;
+    this.fetchImpl = withTimeout(config.fetchImpl ?? fetch, config.timeoutMs);
   }
 
   /** `POST /v1/auth/challenge {pubkey}` → the literal challenge to sign. */

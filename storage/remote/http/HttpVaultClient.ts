@@ -26,7 +26,7 @@ import type {
   StateResponse,
   VaultHttpClient,
 } from '../types';
-import { authedJson } from './http-core';
+import { authedJson, withTimeout } from './http-core';
 import type { FetchLike, VaultTokenSource } from './http-core';
 
 /** A 507 body is still a valid PatchResponse — never thrown (DESIGN §5.4). */
@@ -39,6 +39,8 @@ export interface HttpVaultClientConfig {
   auth: VaultTokenSource;
   /** Defaults to the global `fetch`; injectable for tests. */
   fetchImpl?: FetchLike;
+  /** Per-request deadline (ms); defaults to `DEFAULT_REQUEST_TIMEOUT_MS`. `0` disables. */
+  timeoutMs?: number;
 }
 
 export class HttpVaultClient implements VaultHttpClient {
@@ -49,7 +51,7 @@ export class HttpVaultClient implements VaultHttpClient {
   constructor(config: HttpVaultClientConfig) {
     this.base = config.vaultUrl;
     this.auth = config.auth;
-    this.fetchImpl = config.fetchImpl ?? fetch;
+    this.fetchImpl = withTimeout(config.fetchImpl ?? fetch, config.timeoutMs);
   }
 
   /** `PATCH /v1/entries {ops}` — 200 OR 507 both return a `PatchResponse` body. */

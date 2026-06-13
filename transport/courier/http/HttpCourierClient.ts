@@ -27,7 +27,7 @@ import type {
   CourierInboxResponse,
   CourierSentResponse,
 } from '../types';
-import { authedJson } from '../../../storage/remote/http/http-core';
+import { authedJson, withTimeout } from '../../../storage/remote/http/http-core';
 import type { FetchLike, VaultTokenSource } from '../../../storage/remote/http/http-core';
 
 export interface HttpCourierClientConfig {
@@ -37,6 +37,8 @@ export interface HttpCourierClientConfig {
   auth: VaultTokenSource;
   /** Defaults to the global `fetch`; injectable for tests. */
   fetchImpl?: FetchLike;
+  /** Per-request deadline (ms); defaults to `DEFAULT_REQUEST_TIMEOUT_MS`. `0` disables. */
+  timeoutMs?: number;
 }
 
 export class HttpCourierClient implements CourierHttpClient {
@@ -47,7 +49,7 @@ export class HttpCourierClient implements CourierHttpClient {
   constructor(config: HttpCourierClientConfig) {
     this.base = config.vaultUrl;
     this.auth = config.auth;
-    this.fetchImpl = config.fetchImpl ?? fetch;
+    this.fetchImpl = withTimeout(config.fetchImpl ?? fetch, config.timeoutMs);
   }
 
   /** `POST /v1/courier/deposit` — the caller is the sender (a 413/429 quota → throw). */
