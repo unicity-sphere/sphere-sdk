@@ -40,6 +40,45 @@ export interface VaultTokenSource {
 /** The `fetch` implementation — injectable so tests can pass a custom one if needed. */
 export type FetchLike = typeof fetch;
 
+/**
+ * Default per-request deadline (ms). Without a client-side timeout a stalled or
+ * half-open server (accepts the socket, never writes a response) would hang the
+ * wallet's flush/auth forever; this bounds every vault/courier round trip.
+ */
+export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+
+/** Synthetic status for an error that never reached an HTTP response (timeout/refused). */
+const TRANSPORT_ERROR_STATUS = 0;
+
+/**
+ * Wrap a `fetch` so every request is bounded by `timeoutMs` (an `AbortController`
+ * deadline) AND any transport failure is surfaced as a typed {@link VaultHttpError}
+ * — so a stalled server, a connection-refused, or a DNS/socket error REJECTS with a
+ * catchable error (status `0`) instead of hanging or leaking a raw `TypeError`.
+ * `0`/negative `timeoutMs` disables the deadline (no AbortController).
+ */
+export function withTimeout(fetchImpl: FetchLike, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS): FetchLike {
+  return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const controller = timeoutMs > 0 ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+    try {
+      return await fetchImpl(input, controller ? { ...init, signal: controller.signal } : init);
+    } catch (err) {
+      throw transportError(input, err, controller?.signal.aborted ?? false, timeoutMs);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+}
+
+/** Map an aborted/refused/socket fetch rejection to a typed VaultHttpError. */
+function transportError(input: RequestInfo | URL, err: unknown, aborted: boolean, timeoutMs: number): VaultHttpError {
+  const path = String(input);
+  if (aborted) return new VaultHttpError(TRANSPORT_ERROR_STATUS, path, `request timed out after ${timeoutMs}ms`);
+  const reason = err instanceof Error ? err.message : String(err);
+  return new VaultHttpError(TRANSPORT_ERROR_STATUS, path, `transport error: ${reason}`);
+}
+
 /** Build `{vaultUrl}{path}` with the base's trailing slash collapsed. */
 export function joinUrl(base: string, path: string): string {
   return `${base.replace(/\/+$/, '')}${path}`;

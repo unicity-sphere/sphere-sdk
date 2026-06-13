@@ -25,7 +25,7 @@ export { HttpVaultClient } from './HttpVaultClient';
 export type { HttpVaultClientConfig } from './HttpVaultClient';
 export { HttpCourierClient } from '../../../transport/courier/http/HttpCourierClient';
 export type { HttpCourierClientConfig } from '../../../transport/courier/http/HttpCourierClient';
-export { VaultHttpError } from './http-core';
+export { VaultHttpError, withTimeout, DEFAULT_REQUEST_TIMEOUT_MS } from './http-core';
 export type { VaultTokenSource, FetchLike } from './http-core';
 
 /** Config for the {@link createVaultHttpClients} convenience factory. */
@@ -36,6 +36,8 @@ export interface VaultHttpClientsConfig {
   auth: VaultTokenSource;
   /** Defaults to the global `fetch`; injectable for tests / custom agents. */
   fetchImpl?: FetchLike;
+  /** Per-request deadline (ms); defaults to `DEFAULT_REQUEST_TIMEOUT_MS`. `0` disables. */
+  timeoutMs?: number;
 }
 
 /** The real authenticated clients, built over one shared auth session. */
@@ -50,10 +52,10 @@ export interface VaultHttpClients {
  * wraps) is built separately — pass it as the provider's `authClient`.
  */
 export function createVaultHttpClients(config: VaultHttpClientsConfig): VaultHttpClients {
-  const { vaultUrl, auth, fetchImpl } = config;
+  const { vaultUrl, auth, fetchImpl, timeoutMs } = config;
   return {
-    vault: new HttpVaultClient({ vaultUrl, auth, fetchImpl }),
-    courier: new HttpCourierClient({ vaultUrl, auth, fetchImpl }),
+    vault: new HttpVaultClient({ vaultUrl, auth, fetchImpl, timeoutMs }),
+    courier: new HttpCourierClient({ vaultUrl, auth, fetchImpl, timeoutMs }),
   };
 }
 
