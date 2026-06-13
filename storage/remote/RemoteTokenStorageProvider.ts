@@ -455,7 +455,11 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     return {
       key: op.wireKey,
       baseVersion: op.baseVersion,
-      payload: this.sealValue(op.wireKey, op.baseVersion + 1, op.value),
+      // AAD seal version = the version the SERVER will store (op.sealVersion), NOT
+      // `baseVersion + 1`: a delete-resurrect sends baseVersion:0 but the server
+      // converges to deletedRow.version + 1, so sealing at baseVersion+1 (=1) would
+      // make the resurrected entry undecryptable on load (resurrect-version-mismatch).
+      payload: this.sealValue(op.wireKey, op.sealVersion, op.value),
     };
   }
 
