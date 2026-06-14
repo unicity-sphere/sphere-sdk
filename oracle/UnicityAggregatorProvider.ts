@@ -543,17 +543,27 @@ export class UnicityAggregatorProvider implements OracleProvider {
     // publicKey for the spent-cache key. Aligning the cache key with
     // `isSpent`'s `${publicKey}:${stateHash}` format lets a
     // validateToken-driven spent decision short-circuit a subsequent
-    // `isSpent(pubkey, sameHash)` call (and vice versa). Pre-parsing
-    // is cheap relative to the RPC fallback and is best-effort —
-    // failure here only prevents the spent-cache key from including
-    // the publicKey (cached under bare stateHash as legacy fallback).
+    // `isSpent(pubkey, sameHash)` call (and vice versa).
+    //
+    // Normalize input shape: callers pass either the parsed token object
+    // (UXF receive / transfer-in paths build it from `.toJSON()`) OR a
+    // JSON string (PaymentsModule.validate() pulls `token.sdkData` straight
+    // from storage). state-transition-sdk's `Token.fromJSON` checks
+    // `'transactions' in input` and throws InvalidJsonStructureError for
+    // string input — silently dropping us to the RPC fallback. The
+    // aggregator does not expose a `validateToken` JSON-RPC method (see
+    // rpcCall site below), so that fallback always returns invalid. The
+    // net effect was that `payments.validate()` reported every token
+    // invalid, which permanently broke `SwapModule.verifyPayout`'s retry
+    // loop. Parse once here so the SDK path runs with pure local crypto.
+    const parsedTokenData =
+      typeof tokenData === 'string' ? JSON.parse(tokenData) : tokenData;
     let sdkToken: Awaited<ReturnType<typeof SdkToken.fromJSON>> | null = null;
     try {
-      sdkToken = await SdkToken.fromJSON(tokenData);
+      sdkToken = await SdkToken.fromJSON(parsedTokenData);
     } catch {
-      // Pre-parse failed; SDK path will detect the same failure and
-      // fall through to RPC. Cache key falls back to legacy bare-
-      // stateHash form below.
+      // Pre-parse still failed (malformed token JSON) — SDK path will
+      // skip via the `sdkToken !== null` guard and fall through to RPC.
     }
 
     try {
@@ -586,7 +596,7 @@ export class UnicityAggregatorProvider implements OracleProvider {
       }
 
       // Fallback to RPC validation
-      const response = await this.rpcCall<RpcValidateResponse>('validateToken', { token: tokenData });
+      const response = await this.rpcCall<RpcValidateResponse>('validateToken', { token: parsedTokenData });
 
       const valid = response.valid ?? false;
       const spent = response.spent ?? false;
