@@ -2259,6 +2259,48 @@ export class Sphere {
   }
 
   /**
+   * Build the per-address instance of a token storage provider for an HD address
+   * switch, then identity-set + initialize it.
+   *
+   * THREE cases:
+   *  1. The vault (FUND-SAFETY): its crypto key is bound at CONSTRUCTION to the
+   *     old address's privateKey, so the arg-less `createForAddress()` cannot clone
+   *     it for a new address — and reusing the shared instance would make
+   *     `setIdentity(newIdentity)` throw INVALID_IDENTITY (or seal under the wrong
+   *     key). Instead REBUILD it from scratch via the factory with the new identity's
+   *     privateKey in scope, so the new instance is keyed to the new address.
+   *  2. A `createForAddress`-capable provider clones itself (IPFS etc.).
+   *  3. Otherwise reuse the shared instance (legacy providers that are address-agnostic).
+   */
+  private async rebuildProviderForAddress(
+    providerId: string,
+    provider: TokenStorageProvider<TxfStorageDataBase>,
+    newIdentity: FullIdentity,
+  ): Promise<TokenStorageProvider<TxfStorageDataBase>> {
+    if (providerId === VAULT_PROVIDER_ID && this._network) {
+      const rebuilt = createVaultTokenStorage({
+        identity: newIdentity,
+        network: this._network,
+        storage: this._storage,
+        vaultUrl: this._vaultConfig?.url,
+        deviceId: this._vaultConfig?.deviceId,
+      });
+      rebuilt.setIdentity(newIdentity);
+      await rebuilt.initialize();
+      return rebuilt;
+    }
+    if (provider.createForAddress) {
+      const newProvider = provider.createForAddress();
+      newProvider.setIdentity(newIdentity);
+      await newProvider.initialize();
+      return newProvider;
+    }
+    // Legacy address-agnostic provider — reuse the shared instance.
+    logger.warn('Sphere', `Token storage provider ${providerId} does not support createForAddress, reusing shared instance`);
+    return provider;
+  }
+
+  /**
    * Switch to a different address by index
    * This changes the active identity to the derived address at the specified index.
    *
@@ -2352,17 +2394,8 @@ export class Sphere {
       // Create per-address token storage providers (each address needs its own instances)
       const addressTokenProviders = new Map<string, TokenStorageProvider<TxfStorageDataBase>>();
       for (const [providerId, provider] of this._tokenStorageProviders.entries()) {
-        if (provider.createForAddress) {
-          const newProvider = provider.createForAddress();
-          newProvider.setIdentity(newIdentity);
-          await newProvider.initialize();
-          addressTokenProviders.set(providerId, newProvider);
-        } else {
-          // Fallback: reuse existing provider (legacy behavior for providers
-          // that don't support createForAddress)
-          logger.warn('Sphere', `Token storage provider ${providerId} does not support createForAddress, reusing shared instance`);
-          addressTokenProviders.set(providerId, provider);
-        }
+        const rebuilt = await this.rebuildProviderForAddress(providerId, provider, newIdentity);
+        addressTokenProviders.set(providerId, rebuilt);
       }
 
       await this.initializeAddressModules(index, newIdentity, addressTokenProviders);
