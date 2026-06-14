@@ -32,6 +32,15 @@ import type {
   TokenEnvelope,
 } from './types';
 
+/** Default base backoff (ms) for the redelivery loop; doubles per attempt. */
+const DEFAULT_BACKOFF_BASE_MS = 1000;
+/** Default backoff cap (ms) — 5 minutes. */
+const DEFAULT_BACKOFF_MAX_MS = 5 * 60_000;
+/** Default max redelivery attempts before an entry surfaces `delivery_unconfirmed`. */
+const DEFAULT_MAX_REDELIVERY_ATTEMPTS = 10;
+/** Default max envelope bytes the courier accepts (DESIGN §6.6). */
+const DEFAULT_MAX_ENVELOPE_BYTES = 16 * 1024 * 1024;
+
 /** The highest `seq` across a page of rows, falling back to `fallback` when empty. */
 function highestSeq(items: ReadonlyArray<{ seq: number }>, fallback: number): number {
   let max = fallback;
@@ -71,6 +80,15 @@ interface SentPendingEntry {
    * rows journaled by an older build (watermark still advances via the /sent row).
    */
   sentSeq?: number;
+  /**
+   * Wall-clock ms of the LAST counted redelivery attempt (the backoff anchor,
+   * finding courier-redelivery-backoff-not-enforced). `reconcileSentItem` only
+   * counts a new attempt once `backoffMs(attempts)` has elapsed since this, so a
+   * burst of polls during a short recipient-offline window does not exhaust the
+   * attempt budget. Absent (undefined) until the first attempt is counted, and on
+   * rows journaled by an older build (treated as "window elapsed" → first poll counts).
+   */
+  lastAttemptAt?: number;
 }
 
 /** Minimal persistent KV the journal needs (matches PaymentsModule storage). */
@@ -104,6 +122,8 @@ export interface CourierDeliveryConfig {
   backoffBaseMs?: number;
   /** Backoff cap (ms). */
   backoffMaxMs?: number;
+  /** Wall-clock source (ms) for the redelivery backoff gate; injectable for tests. */
+  now?: () => number;
 }
 
 export class CourierDeliveryProvider implements TokenDeliveryTransport {
@@ -131,7 +151,7 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
       async: true,
       ack: true,
       addressing: 'pubkey',
-      maxBytes: config.maxBytes ?? 16 * 1024 * 1024,
+      maxBytes: config.maxBytes ?? DEFAULT_MAX_ENVELOPE_BYTES,
     };
   }
 
@@ -148,11 +168,25 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
    * `base64(nonce24‖ct)` ciphertext, and POST `/v1/courier/deposit`. The caller
    * (sender) is `this.identity.chainPubkey`; the server keys dedup on
    * `(recipientPubkey, entryId)`.
+   *
+   * JOURNAL-FIRST (finding courier-deposit-journal-ordering-vs-design, DESIGN §6.3):
+   * the sender-side pending-delivery tracking is journaled BEFORE the POST. The
+   * entryId is derived purely locally (ECDH, no server round-trip), so it is known
+   * up front. A crash AFTER the POST therefore still has the tracking to reconcile
+   * on reload — the token was delivered AND the sender will track/GC it. The POST is
+   * idempotent (the server dedups on `(recipientPubkey, entryId)`), so a re-POST on
+   * reload is harmless. The server `sentSeq` is folded back onto the journaled entry
+   * AFTER the POST returns (it is only known then; its absence is reconciled later).
    */
   async deposit(envelope: TokenEnvelope): Promise<DeliveryHandle> {
     const me = this.requireIdentity();
     const entryId = courierEntryId(me.privateKey, envelope.recipientChainPubkey, envelope.tokenBlobHex);
     const ciphertext = this.sealEnvelope(me, envelope, entryId);
+    // Track the entry sender-side BEFORE the POST so pollSent() can gate "delivered"
+    // on a valid recipient ackSig before removing PENDING_V2_DELIVERIES (DESIGN §6.5)
+    // even if a crash interrupts the round trip. sentSeq is unknown until the POST
+    // returns — recorded below.
+    await this.journalSentPending(entryId, envelope.recipientChainPubkey);
     const client = this.config.httpClientFactory(me.chainPubkey);
     const res = await client.deposit({
       recipientPubkey: envelope.recipientChainPubkey,
@@ -161,10 +195,9 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
       ciphertext,
       // hint stays undefined here — a single base64 SCALAR when present (never an object).
     });
-    // Track the entry sender-side so pollSent() can gate "delivered" on a valid
-    // recipient ackSig before removing PENDING_V2_DELIVERIES (DESIGN §6.5). The
-    // sentSeq is captured so pollSent() can advance the persisted sent watermark.
-    await this.journalSentPending(entryId, envelope.recipientChainPubkey, res.sentSeq);
+    // Fold the server-assigned watermark onto the already-journaled entry so
+    // pollSent() can advance the persisted sent watermark by sentSeq.
+    await this.recordSentSeq(entryId, res.sentSeq);
     return {
       entryId: res.entryId,
       transferId: envelope.transferId,
@@ -408,10 +441,30 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
     await this.config.journal.set(this.sentPendingKey(), JSON.stringify(pending));
   }
 
-  private async journalSentPending(entryId: string, recipientPubkey: string, sentSeq?: number): Promise<void> {
+  /**
+   * Journal an entry's sender-side pending tracking. Written BEFORE the deposit
+   * POST (journal-first) so a crash during the round trip still leaves the entry
+   * tracked. The `sentSeq` is unknown at this point — folded in by
+   * {@link recordSentSeq} after the POST returns. Idempotent on entryId.
+   */
+  private async journalSentPending(entryId: string, recipientPubkey: string): Promise<void> {
     const pending = await this.loadSentPending();
     if (!pending[entryId]) {
-      pending[entryId] = { recipientPubkey, attempts: 0, state: 'pending', sentSeq };
+      pending[entryId] = { recipientPubkey, attempts: 0, state: 'pending' };
+      await this.saveSentPending(pending);
+    }
+  }
+
+  /**
+   * Fold the server-assigned `sentSeq` onto an already-journaled entry after the
+   * deposit POST returns (the watermark is only known then). No-op if the entry was
+   * already reconciled away. Leaves attempts/state untouched.
+   */
+  private async recordSentSeq(entryId: string, sentSeq: number): Promise<void> {
+    const pending = await this.loadSentPending();
+    const entry = pending[entryId];
+    if (entry && entry.sentSeq !== sentSeq) {
+      entry.sentSeq = sentSeq;
       await this.saveSentPending(pending);
     }
   }
@@ -480,15 +533,39 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
   ): Promise<void> {
     const entry = pending[item.entryId];
     if (!entry || entry.state === 'delivered') return;
+    // A valid recipient ackSig ALWAYS delivers — confirmation is never throttled by
+    // the backoff gate (a poll inside the window still confirms a genuine delivery).
     if (this.isValidReceipt(me, item)) {
       entry.state = 'delivered';
       await this.config.onDelivered?.(item.entryId);
       return;
     }
     // Not yet validly claimed (still unclaimed, or a FORGED ackSig that fails
-    // verification) — keep redelivering, bounded by the attempt cap.
+    // verification). ENFORCE the backoff (finding courier-redelivery-backoff-not-
+    // enforced): only COUNT an attempt once `backoffMs(attempts)` has elapsed since
+    // the last counted one, so a burst of polls during a brief recipient-offline
+    // window does not prematurely exhaust the budget and flip to delivery_unconfirmed.
+    if (!this.backoffElapsed(entry)) return;
     entry.attempts += 1;
+    entry.lastAttemptAt = this.now();
     if (entry.attempts >= this.maxAttempts()) entry.state = 'delivery_unconfirmed';
+  }
+
+  /**
+   * True once the redelivery backoff window for `entry` has elapsed — i.e. the
+   * NEXT attempt may be counted. The window is `backoffMs(entry.attempts)` (the
+   * delay before the next attempt, scaled by attempts already made). The first
+   * attempt (no `lastAttemptAt`) always counts; older journal rows without a
+   * timestamp are treated as "window elapsed" so they are never wedged.
+   */
+  private backoffElapsed(entry: SentPendingEntry): boolean {
+    if (entry.lastAttemptAt === undefined) return true;
+    return this.now() - entry.lastAttemptAt >= this.backoffMs(entry.attempts);
+  }
+
+  /** Wall-clock source (ms) — injectable for the backoff gate's tests. */
+  private now(): number {
+    return (this.config.now ?? Date.now)();
   }
 
   /** True only for a recipient ackSig that verifies over the bound template. */
@@ -523,13 +600,13 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
   }
 
   private maxAttempts(): number {
-    return this.config.maxRedeliveryAttempts ?? 10;
+    return this.config.maxRedeliveryAttempts ?? DEFAULT_MAX_REDELIVERY_ATTEMPTS;
   }
 
   /** Exponential backoff for the redelivery loop, capped (DESIGN §6.5). */
   backoffMs(attempts: number): number {
-    const base = this.config.backoffBaseMs ?? 1000;
-    const cap = this.config.backoffMaxMs ?? 5 * 60_000;
+    const base = this.config.backoffBaseMs ?? DEFAULT_BACKOFF_BASE_MS;
+    const cap = this.config.backoffMaxMs ?? DEFAULT_BACKOFF_MAX_MS;
     return Math.min(cap, base * 2 ** attempts);
   }
 

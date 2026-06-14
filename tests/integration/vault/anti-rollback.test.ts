@@ -115,3 +115,62 @@ describe('anti-rollback root comparison', () => {
     expect(events.some((e) => e.type === 'storage:error')).toBe(false);
   });
 });
+
+/**
+ * First-load baseline persistence (finding remote-anti-rollback-no-baseline-on-fresh-load).
+ *
+ * RESIDUAL (fundamental): the root gate cannot detect a TRUNCATED/withheld first
+ * load — there is no prior signed reference to fold against, so a genuinely fresh
+ * device trusts its first sync exactly like any first sync of an untrusted server.
+ * That part is unavoidable.
+ *
+ * What IS guaranteed and asserted here: the FIRST successful load PERSISTS a signed
+ * baseline (no sync needed), so EVERY subsequent load is gated against it. A fresh
+ * provider with no prior local baseline that loads then sees a server-injected
+ * delta on its NEXT load is alarmed.
+ */
+describe('anti-rollback first-load baseline', () => {
+  const baselineKey = `vault_baseline:${NETWORK}:${PUB}`;
+
+  it('the FIRST successful load persists a signed baseline even with no sync', async () => {
+    const server = new FakeVaultServer(NETWORK);
+    const store = memStore();
+    const provider = makeProvider(server, store);
+
+    // No baseline before the first load (genuinely fresh / wiped-KV device).
+    expect(await store.get(baselineKey)).toBeNull();
+
+    // initialize() runs the provider's own FIRST load. The gate is a no-op on this
+    // load (no prior baseline — the unavoidable residual), but it MUST persist one.
+    const ok = await provider.initialize();
+    expect(ok).toBe(true);
+    expect(await store.get(baselineKey)).not.toBeNull(); // baseline now durable
+  });
+
+  it('the SECOND load IS gated: a server-injected delta after the first load alarms', async () => {
+    const server = new FakeVaultServer(NETWORK);
+    const store = memStore();
+    const provider = makeProvider(server, store);
+
+    // First load on a fresh provider, with ONE real flushed entry so there is a
+    // concrete row the hostile server can mutate at the next cursor.
+    await provider.initialize();
+    await provider.sync(txf({ a: { n: 1 } }));
+    const first = await provider.load();
+    expect(first.success).toBe(true);
+    expect(await store.get(baselineKey)).not.toBeNull();
+
+    // Hostile server mutates the entry at the next monotonic cursor, no epoch bump.
+    const wkA = wireKey(PRIV, NETWORK, 'a');
+    server.mutateEntry(PUB, wkA, seal('a', 99, { n: 'tampered' }));
+
+    const events: StorageEvent[] = [];
+    provider.onEvent((e) => events.push(e));
+    const res = await provider.load(); // the SECOND load is gated against the baseline
+
+    expect(res.success).toBe(false);
+    const err = events.find((e) => e.type === 'storage:error');
+    expect(err).toBeDefined();
+    expect((err!.data as { reason: string }).reason).toBe('rollback');
+  });
+});

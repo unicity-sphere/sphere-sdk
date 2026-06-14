@@ -82,4 +82,17 @@ describe('vault-aead courier: envelope + base64(nonce‖ct) framing', () => {
     const tampered = Buffer.from(bytes).toString('base64');
     expect(() => openCourierEnvelope(openParams(tampered))).toThrow();
   });
+
+  it('cross-network isolation: opening with a different network throws (AAD binds network)', () => {
+    // Decision (courier-key-omits-network): the courier AEAD KEY deliberately omits
+    // `network` — cross-network isolation is provided by the AAD, which binds network
+    // as its first length-delimited field. A `testnet2`-sealed envelope cannot be
+    // opened under a `mainnet` AAD: the Poly1305 tag fails. This is the isolation
+    // guarantee that makes baking network into the key (wire-affecting KAT churn)
+    // unnecessary for single-network deployments.
+    const ciphertext = sealCourierEnvelope(sealParams()); // sealed on testnet2
+    expect(() => openCourierEnvelope(openParams(ciphertext, { network: 'mainnet' }))).toThrow();
+    // And it still opens on the matching network (sanity).
+    expect(() => openCourierEnvelope(openParams(ciphertext))).not.toThrow();
+  });
 });

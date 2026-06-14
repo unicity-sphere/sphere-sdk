@@ -65,6 +65,16 @@ export function deriveVaultKey(walletPriv: string, network: string): Uint8Array 
 /**
  * Derive a courier key from an ECDH shared-secret x-coordinate:
  * `HKDF-SHA256(ecdhX, info, 32)`.
+ *
+ * DELIBERATELY omits `network` from the key derivation (finding
+ * courier-key-omits-network — decision: document, not change). Unlike
+ * {@link deriveVaultKey}, cross-network isolation for the courier rests on the
+ * AEAD AAD, which binds `network` as its first length-delimited field
+ * (`vault-aead/courier.ts#courierAad`): a `testnet2`-sealed envelope cannot be
+ * opened under a `mainnet` AAD (the Poly1305 tag fails — see the cross-network
+ * isolation test). Deployments are single-network, so adding `network` to the key
+ * would be pure defense-in-depth at the cost of a wire-affecting change to the
+ * KAT-pinned courier key/entryId/packed-base64 — not worth the churn.
  */
 export function deriveCourierKey(ecdhX: Uint8Array, info: string): Uint8Array {
   return hkdf(sha256, ecdhX, undefined, utf8(info), 32);

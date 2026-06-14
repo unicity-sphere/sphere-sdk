@@ -208,6 +208,16 @@ export class LoadDeltaTracker {
   /**
    * Persist a fresh signed baseline after a clean load. `known` is the provider's
    * authoritative post-load state; the root binds `(network, ownerId, cursor)`.
+   *
+   * FIRST-LOAD RESIDUAL (finding remote-anti-rollback-no-baseline-on-fresh-load):
+   * the root gate is a no-op on a load with NO prior signed baseline (first load,
+   * post-reset, wiped local KV) — you cannot detect a truncated/withheld first load
+   * without a prior reference, so a genuinely fresh device trusts its first sync
+   * like any first sync. This is unavoidable. What IS guaranteed: this commit runs
+   * on EVERY clean load, including the first, so a durable signed baseline always
+   * exists afterward and ALL subsequent loads re-fold against it and are gated. A
+   * from-scratch reload that finds a durable baseline runs the full root gate
+   * (`beginLoad` rebuilds the accumulator from `known` and re-folds each delta).
    */
   async commitBaseline(cursor: number, epoch: number, _epochSig: string): Promise<void> {
     if (this.config.baseline && this.walletPriv) {

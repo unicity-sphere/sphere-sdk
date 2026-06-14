@@ -1,0 +1,98 @@
+# ============================================================================
+# Vault cross-repo e2e (vault-e2e-not-in-ci).
+# ============================================================================
+# The unit/integration CI (ci.yml) runs the vault suite against an in-process
+# FAKE courier/vault server. This workflow runs the REAL cross-repo e2e
+# (tests/e2e/vault.e2e.test.ts), which boots the REAL token-api in-process over
+# `mongodb-memory-server` and drives the FULL SDK path (auth + vault CAS +
+# courier) through the real fetch HTTP clients — no fakes.
+#
+# INTERIM cross-repo setup (mirror of token-api/.github/workflows/ci.yml):
+#   token-api depends on the SDK via `file:../sphere-sdk` — a LOCAL v2 build —
+#   and the e2e imports token-api's COMPILED `dist/` (loadConfig/buildDeps/
+#   buildApp). There is NO co-published stable v2 SDK + token-api on npm yet, so
+#   this job checks out BOTH repos under the workspace, builds the SDK from
+#   source, then builds token-api against that local SDK, then runs the e2e.
+#
+#   ONCE a stable v2 @unicitylabs/sphere-sdk + a published token-api exist and
+#   are CO-PUBLISHED: drop the sibling token-api checkout + its build steps,
+#   drop the SDK token, and resolve token-api from its published artifact
+#   instead (the e2e would import the installed token-api package). Until then
+#   this cross-repo checkout is the only way to run the e2e against the real
+#   server.
+#
+# Layout (so token-api's `file:../sphere-sdk` link resolves and the e2e's
+# `../token-api` boot path resolves):
+#   $GITHUB_WORKSPACE/sphere-sdk   <- this repo (the e2e runs here)
+#   $GITHUB_WORKSPACE/token-api    <- the sibling backend @ main
+#
+# Linux runner: tsup's DTS emit works here (no Windows DTS segfault), and
+# mongodb-memory-server downloads + starts a real mongod, so the e2e runs green.
+
+name: Vault e2e (cross-repo)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: vault-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  vault-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sphere-sdk
+        uses: actions/checkout@v4
+        with:
+          path: sphere-sdk
+
+      # INTERIM: check out + build the sibling token-api (no co-published
+      # artifact yet). Drop this checkout + the two build steps below once a
+      # stable token-api is published and the e2e imports it from the package.
+      - name: Checkout token-api (main)
+        uses: actions/checkout@v4
+        with:
+          repository: unicity-sphere/token-api
+          ref: main
+          path: token-api
+          # A token with read access to the sibling private repo. The default
+          # GITHUB_TOKEN is scoped to THIS repo only and cannot read the sibling.
+          token: ${{ secrets.TOKEN_API_REPO_TOKEN }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            sphere-sdk/package-lock.json
+            token-api/package-lock.json
+
+      # Build the SDK to dist/ so token-api's `file:../sphere-sdk` link resolves
+      # to a built package. Linux runner => tsup DTS emit works.
+      - name: Build sphere-sdk
+        working-directory: sphere-sdk
+        run: |
+          npm ci
+          npm run build
+
+      # token-api's `npm ci` resolves `file:../sphere-sdk` to the freshly built
+      # SDK above; `npm run build` then emits token-api's `dist/` — the e2e
+      # imports its compiled loadConfig/buildDeps/buildApp.
+      - name: Build token-api
+        working-directory: token-api
+        run: |
+          npm ci
+          npm run build
+
+      # The e2e boots token-api in-process over mongodb-memory-server (it carries
+      # its own mongod download + replica-set helper) and drives the real fetch
+      # HTTP clients. The dedicated vitest config scopes the run to tests/e2e/**.
+      - name: Run vault e2e
+        working-directory: sphere-sdk
+        run: npx vitest run --config vitest.e2e.config.ts tests/e2e/vault.e2e.test.ts
