@@ -4,9 +4,11 @@
  * MONEY-PATH invariants asserted here (the courier is ADDITIVE, flag-gated, reversible):
  *  - DEFAULT OFF: with NO deliveryTransport, send/receive/load are byte-identical to
  *    today — delivery goes over Nostr `sendTokenTransfer`, the courier is never touched.
- *  - COEXIST (courier-primary): when a deliveryTransport is present, send DEPOSITS the
- *    envelope over the courier (recipientChainPubkey = the resolved peerInfo.chainPubkey),
- *    and does NOT also send over Nostr.
+ *  - FAN-OUT (courier + Nostr): when a deliveryTransport is present, send DEPOSITS the
+ *    envelope over the courier (recipientChainPubkey = the resolved peerInfo.chainPubkey)
+ *    AND ALSO blasts the same blob over Nostr (the universal floor) — the recipient dedups.
+ *  - BLAST IS BEST-EFFORT: a failed Nostr blast never breaks the send (courier is the
+ *    durable, journaled guarantee).
  *  - NOSTR FALLBACK: a courier `deposit()` FAILURE falls back to Nostr (no lost delivery).
  *  - JOURNAL-FIRST GC GATE: PENDING_V2_DELIVERIES is written BEFORE delivery and removed
  *    ONLY on a valid-ackSig `onDelivered(entryId)` for the courier path — NOT on bare
@@ -14,8 +16,8 @@
  *  - entryId↔blob mapping: the journal entry carries the courier entryId + transport tag
  *    so onDelivered(entryId) resolves the blob to GC (idempotent).
  *  - load() starts the courier receive/poll/replay loops alongside the Nostr replay.
- *  - REPLAY ROUTING: a courier-tagged journal entry replays over the COURIER (re-deposit),
- *    a Nostr-tagged / untagged entry replays over Nostr.
+ *  - REPLAY ROUTING: a courier-tagged journal entry replays over the COURIER (re-deposit)
+ *    AND re-blasts over Nostr; a Nostr-tagged / untagged entry replays over Nostr.
  *  - DEDUP: a token delivered over BOTH courier and Nostr is stored once (handleV2Transfer
  *    dedups by genesis id) — no double-spend.
  */
@@ -210,8 +212,8 @@ describe('send() delivery — default OFF (no deliveryTransport) is byte-identic
   });
 });
 
-describe('send() delivery — courier present (coexist, courier-primary)', () => {
-  it('deposits over the courier (recipientChainPubkey) and does NOT send over Nostr', async () => {
+describe('send() delivery — courier present (FAN-OUT: courier + Nostr)', () => {
+  it('deposits over the courier (recipientChainPubkey) AND blasts over Nostr', async () => {
     const delivery = new FakeDeliveryTransport();
     const { module, engine, transport, storage } = setup({ delivery });
     await deliver(module, await v2Payload(engine, 100n));
@@ -221,13 +223,29 @@ describe('send() delivery — courier present (coexist, courier-primary)', () =>
     expect(delivery.deposits).toHaveLength(1);
     expect(delivery.deposits[0].recipientChainPubkey).toBe(BOB_CHAIN_PUBKEY);
     expect(delivery.deposits[0].senderChainPubkey).toBe(FAKE_PUBKEY);
-    // Courier-primary: Nostr is NOT also used for the happy path.
-    expect(transport.sendTokenTransfer).not.toHaveBeenCalled();
-    // Journal carries the entryId + transport tag (entryId↔blob mapping for GC).
+    // FAN-OUT: ALSO blasted over Nostr (universal floor) to the TRANSPORT pubkey.
+    expect(transport.sendTokenTransfer).toHaveBeenCalledTimes(1);
+    expect((transport.sendTokenTransfer as any).mock.calls[0][0]).toBe(BOB_TRANSPORT_PUBKEY);
+    // Journal carries the entryId + transport tag (GC stays on the courier ack).
     const entries = journal(storage);
     expect(entries).toHaveLength(1);
     expect(entries[0].transport).toBe('courier');
     expect(entries[0].entryId).toBe('entry-1');
+  });
+
+  it('a FAILED Nostr blast never breaks the send (courier is the journaled guarantee)', async () => {
+    const delivery = new FakeDeliveryTransport();
+    const { module, engine, transport, storage } = setup({ delivery });
+    (transport.sendTokenTransfer as any).mockRejectedValue(new Error('relay down'));
+    await deliver(module, await v2Payload(engine, 100n));
+
+    const res = await module.send({ recipient: '@bob', amount: '100', coinId: UCT });
+    expect(res.status).toBe('completed');           // send still completes
+    expect(delivery.deposits).toHaveLength(1);       // courier deposit succeeded
+    // Journal stays 'courier' (GC on ack) — the failed blast did not GC or corrupt it.
+    const entries = journal(storage);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].transport).toBe('courier');
   });
 
   it('does NOT GC PENDING_V2_DELIVERIES on bare deposit success — only on a valid-ackSig onDelivered', async () => {
@@ -290,20 +308,21 @@ describe('load() — starts the courier loops alongside the Nostr replay', () =>
   });
 });
 
-describe('replay routing — a courier-tagged entry replays over the courier', () => {
-  it('re-deposits a courier journal entry and does NOT push it over Nostr', async () => {
+describe('replay routing — a courier-tagged entry re-deposits over the courier (+ Nostr blast)', () => {
+  it('re-deposits a courier journal entry AND re-blasts over Nostr (recipient dedups)', async () => {
     const delivery = new FakeDeliveryTransport();
     const { module, engine, transport, storage } = setup({ delivery });
     await deliver(module, await v2Payload(engine, 100n));
     await module.send({ recipient: '@bob', amount: '100', coinId: UCT });
-    expect(delivery.deposits).toHaveLength(1); // the original deposit
-    expect(journal(storage)).toHaveLength(1);  // not yet confirmed
+    expect(delivery.deposits).toHaveLength(1);                 // the original deposit
+    expect(transport.sendTokenTransfer).toHaveBeenCalledTimes(1); // original send already blasted once (fan-out)
+    expect(journal(storage)).toHaveLength(1);                  // not yet confirmed
 
     await (module as any).replayPendingV2Deliveries();
 
-    // Courier-tagged → re-deposited over the courier, never sent over Nostr.
+    // Courier-tagged → re-deposited over the courier AND re-blasted over Nostr.
     expect(delivery.deposits).toHaveLength(2);
-    expect(transport.sendTokenTransfer).not.toHaveBeenCalled();
+    expect(transport.sendTokenTransfer).toHaveBeenCalledTimes(2);
     // Still journaled (no onDelivered yet) — replay does not GC a courier entry.
     expect(journal(storage)).toHaveLength(1);
   });
