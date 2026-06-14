@@ -143,10 +143,21 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
    */
   private readonly vaultNetwork: string;
   private identity: FullIdentity | null = null;
+  /**
+   * Live sinks. Default to the construction-time config, but may be REBOUND after
+   * construction via {@link setSinks} — the factory builds the provider with no-op
+   * placeholders and PaymentsModule binds its `handleV2Transfer` / GC methods once it
+   * initializes (the provider exists before the module deps are ready). Reading
+   * through these fields (not `config.*`) is what makes the late binding take effect.
+   */
+  private onV2TransferSink: V2TransferSink;
+  private onDeliveredSink?: (entryId: string) => Promise<void>;
 
   constructor(config: CourierDeliveryConfig) {
     this.config = config;
     this.vaultNetwork = normalizeVaultNetwork(config.network);
+    this.onV2TransferSink = config.onV2Transfer;
+    this.onDeliveredSink = config.onDelivered;
     this.capabilities = {
       async: true,
       ack: true,
@@ -157,6 +168,17 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
 
   setIdentity(identity: FullIdentity): void {
     this.identity = identity;
+  }
+
+  /**
+   * Rebind the PaymentsModule sinks AFTER construction (the factory leaves them as
+   * no-ops). `onV2Transfer` feeds the existing `handleV2Transfer` path; `onDelivered`
+   * licenses removing `PENDING_V2_DELIVERIES` on a valid recipient ackSig. Omitted
+   * fields keep their current binding.
+   */
+  setSinks(sinks: { onV2Transfer?: V2TransferSink; onDelivered?: (entryId: string) => Promise<void> }): void {
+    if (sinks.onV2Transfer) this.onV2TransferSink = sinks.onV2Transfer;
+    if (sinks.onDelivered) this.onDeliveredSink = sinks.onDelivered;
   }
 
   // ===========================================================================
@@ -307,7 +329,7 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
     // Custody commit: hand the verified-by-engine payload to handleV2Transfer.
     // The sender is addressed by chainPubkey; nametag enrichment no-ops over the
     // courier (Nostr-keyed), so the RECEIVED history records the chainPubkey only.
-    await this.config.onV2Transfer(payload, item.senderPubkey);
+    await this.onV2TransferSink(payload, item.senderPubkey);
     // INVARIANT custody-commit ≺ ack-journal ≺ ack-POST: journal ACK-PENDING
     // AFTER the custody commit, BEFORE the ack POST. A crash between the journal
     // and the POST is recovered by replayAckPending() on the next load.
@@ -537,7 +559,7 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
     // the backoff gate (a poll inside the window still confirms a genuine delivery).
     if (this.isValidReceipt(me, item)) {
       entry.state = 'delivered';
-      await this.config.onDelivered?.(item.entryId);
+      await this.onDeliveredSink?.(item.entryId);
       return;
     }
     // Not yet validly claimed (still unclaimed, or a FORGED ackSig that fails
