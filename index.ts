@@ -556,6 +556,10 @@ export type {
   CourierJournalStore,
   V2TransferSink,
 } from './transport/courier/CourierDeliveryProvider';
+export {
+  StorageCourierJournalStore,
+  COURIER_JOURNAL_KEY_PREFIX,
+} from './transport/courier/courier-journal-store';
 export type {
   TokenDeliveryTransport,
   TokenDeliveryCapabilities,
