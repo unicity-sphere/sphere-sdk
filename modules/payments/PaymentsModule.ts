@@ -3266,8 +3266,14 @@ export class PaymentsModule {
   }
 
   /**
-   * Debounced sync triggered by a storage:remote-updated event.
-   * Waits 500ms to batch rapid updates, then performs sync.
+   * Debounced reaction to a storage:remote-updated event (e.g. the vault's realtime
+   * wake on an inbound courier delivery / a peer vault write). Waits 500ms to batch
+   * rapid wakes, then:
+   *   1. receive() — pull incoming courier + Nostr transfers. This is what surfaces an
+   *      ARRIVING token WITHOUT a page reload; it is additive + dedup'd (the SAME path
+   *      as a reload), so it can never inflate or resurrect a balance.
+   *   2. sync()   — push the vault / merge IPFS (unchanged provider sync).
+   * Sequential so the two never race on the token map; each degrades on failure.
    */
   private debouncedSyncFromRemoteUpdate(providerId: string, eventData: unknown): void {
     if (this.syncDebounceTimer) {
@@ -3276,8 +3282,14 @@ export class PaymentsModule {
 
     this.syncDebounceTimer = setTimeout(() => {
       this.syncDebounceTimer = null;
-      this.sync()
-        .then((result) => {
+      void (async () => {
+        try {
+          await this.receive();
+        } catch (err) {
+          logger.debug('Payments', 'Auto-receive from remote update failed:', err);
+        }
+        try {
+          const result = await this.sync();
           const data = eventData as { name?: string; sequence?: number; cid?: string } | undefined;
           this.deps?.emitEvent('sync:remote-update', {
             providerId,
@@ -3287,10 +3299,10 @@ export class PaymentsModule {
             added: result.added,
             removed: result.removed,
           });
-        })
-        .catch((err) => {
+        } catch (err) {
           logger.debug('Payments', 'Auto-sync from remote update failed:', err);
-        });
+        }
+      })();
     }, PaymentsModule.SYNC_DEBOUNCE_MS);
   }
 

@@ -42,7 +42,8 @@ import { getPublicKey } from '../../core/crypto';
 import { sealVaultEntry, openVaultEntry } from '../../vault-aead/entry';
 import { deriveVaultKey } from '../../vault-aead/derive';
 import { wireKey } from './wire-key';
-import { VaultApiClient } from './VaultApiClient';
+import { VaultApiClient, type VaultSessionStore } from './VaultApiClient';
+import { VaultWakeClient } from './http/VaultWakeClient';
 import { extractTokens, planOps } from './diff';
 import type { KnownEntry, PlannedOp } from './diff';
 import { sealHistoryRecord, openHistoryRecord } from './history-codec';
@@ -116,6 +117,9 @@ export interface RemoteTokenStorageConfig {
   localBaseline?: LocalBaselineStore;
   /** The compressed server signing key for this network (`NETWORKS[net].vaultServerKey`). */
   vaultServerKey?: string;
+  /** Durable auth-session store — persists the JWT/refresh so a reload reuses the
+   *  session instead of re-authenticating (kills the reload→Unauthorized churn). */
+  sessionStore?: VaultSessionStore;
 }
 
 export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfStorageDataBase>
@@ -137,6 +141,10 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
   private readonly vaultNetwork: string;
   private identity: FullIdentity | null = null;
   private auth: VaultApiClient | null = null;
+  /** Realtime wake channel (token-api change-stream). On wake the provider emits
+   *  `storage:remote-updated`; PaymentsModule responds with receive() (pull incoming
+   *  — additive, the same path as a reload). NEVER drives the sync snapshot. */
+  private wakeClient: VaultWakeClient | null = null;
   private status: 'disconnected' | 'connecting' | 'connected' | 'error' = 'disconnected';
 
   /** Internal last-known server view: plainKey → {version, deleted}. */
@@ -248,12 +256,16 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     this.pushedHistory.clear();
     this.localHistory.clear();
     this.historyCursor = 0;
+    // Drop the wake channel bound to the OLD auth session — initialize() re-opens it.
+    this.wakeClient?.stop();
+    this.wakeClient = null;
     this.auth = new VaultApiClient({
       network: this.vaultNetwork,
       chainPubkey: identity.chainPubkey,
       privateKey: this.config.privateKey,
       deviceId: this.config.deviceId ?? 'sphere-vault',
       authClient: this.config.authClient,
+      sessionStore: this.config.sessionStore,
     });
     this.delta.setIdentity(identity.chainPubkey);
     this.delta.setWalletPriv(this.config.privateKey);
@@ -302,7 +314,9 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
   async initialize(): Promise<boolean> {
     this.status = 'connecting';
     try {
-      await this.requireAuth().authenticate();
+      // Reuse a persisted session if one survived the reload (sphere-api pattern),
+      // re-authenticating only when there is none — no challenge→verify per reload.
+      await this.requireAuth().ensureAuthenticated();
     } catch (error) {
       this.status = 'error';
       this.emit('storage:error', { reason: VAULT_REASON.AUTH }, this.errMsg(error, 'vault auth failed'));
@@ -315,7 +329,26 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
       this.emit('storage:error', { reason: VAULT_REASON.INITIAL_LOAD }, first.error);
       return false; // first load failed → gate stays SHUT, wallet still loads locally
     }
+    this.startWakeChannel(); // realtime: a server wake → PaymentsModule.receive() (no reload)
     return true;
+  }
+
+  /**
+   * Open the realtime wake channel (token-api change-stream). On a server wake the
+   * provider emits `storage:remote-updated`; PaymentsModule pulls incoming transfers
+   * via receive() (additive — the SAME path as a page reload), so an arriving token
+   * shows WITHOUT a reload. NARROW BY DESIGN: the wake never drives the sync snapshot
+   * (that path caused the balance-resurrection bug). Best-effort — a failure degrades
+   * to load()-time polling + the client's own 4–6 min backstop; never breaks init.
+   */
+  private startWakeChannel(): void {
+    if (this.wakeClient || !this.auth) return;
+    this.wakeClient = new VaultWakeClient({
+      vaultUrl: this.config.vaultUrl,
+      auth: this.auth,
+      onWake: () => this.emit('storage:remote-updated', { source: 'vault-wake' }),
+    });
+    this.wakeClient.start();
   }
 
   /** Extract a human message from an unknown thrown value (degraded-path logging). */
@@ -329,6 +362,8 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
   }
 
   async shutdown(): Promise<void> {
+    this.wakeClient?.stop();
+    this.wakeClient = null;
     // Route through the queue so an in-flight flush drains first (Task 7.3).
     await this.queue.enqueue(() => {
       this.status = 'disconnected';
@@ -383,6 +418,13 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
       this.assertEpoch(epoch);
       const ops = this.planFlush(localData);
       await this.pushHistory(localData, epoch); // single-channel history (Task 7.4)
+      // PUSH-ONLY (fund safety): merged = localData, never a rehydrated snapshot.
+      // Returning the rehydration map here resurrected just-spent tokens — after a
+      // send, `rehydrated` is STALE (still holds the spent input, lacks the change)
+      // until the next load() re-materializes, so PaymentsModule's merge re-added the
+      // spent token AND the change → balance inflation. Multi-device PULL belongs to
+      // load() (a FRESH /state that reflects the spend) + the wake→receive() path,
+      // NOT to sync.
       if (ops.length === 0) return this.cleanResult(localData, 0, 0, 0);
       return await this.flush(localData, ops, epoch);
     } catch (error) {
@@ -707,22 +749,39 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
       this.rehydrated.set(e.key, { plainKey: k, value: v });
     }
     // Build the FULL TXF snapshot from the accumulated rehydration map every load,
-    // so a delta-only `load()` still returns the complete token set. v2 identity is
-    // the chainPubkey, so `_meta.address` is restored to OUR chainPubkey (locally
-    // known from the key — no server entry needed); the address guard accepts it.
-    const data: TxfStorageDataBase & { isEmpty?: boolean } = {
+    // so a delta-only `load()` still returns the complete token set.
+    const data = this.buildSnapshot(history) as TxfStorageDataBase & { isEmpty?: boolean };
+    const isEmpty = this.knownCount() === 0 && history.length === 0;
+    if (isEmpty) data.isEmpty = true;
+    this.initialLoadDone = true; // the flush gate opens on a successful load (Task 7.1)
+    this.emit('storage:loaded', { entries: entries.length, tokens: this.rehydrated.size, history: history.length });
+    return { success: true, data: data as TData, source: 'remote', timestamp: Date.now() };
+  }
+
+  /**
+   * Build the FULL TXF snapshot from the persistent rehydration map — NO side
+   * effects. Used ONLY by load()'s materialize(), so a delta-only `load()` still
+   * returns the complete token set.
+   *
+   * NOT used by sync(): sync is PUSH-ONLY (`merged = localData`, see cleanResult).
+   * Returning this rehydrated snapshot as sync's `merged` resurrected just-spent
+   * tokens — between loads the map is STALE (still holds a spent input, lacks the
+   * change) → PaymentsModule re-added them → balance inflation. Multi-device PULL is
+   * owned by load() (a FRESH /state that reflects the spend) + the wake→receive()
+   * path, never sync. v2 identity is the chainPubkey, so `_meta.address` is OUR
+   * chainPubkey (locally known from the key — no server entry needed); the address
+   * guard accepts it.
+   */
+  private buildSnapshot(history: HistoryRecord[] = []): TxfStorageDataBase {
+    const data: TxfStorageDataBase = {
       _meta: { version: 1, address: this.ownerId(), formatVersion: '2.0', updatedAt: Date.now() },
     };
     for (const { plainKey, value } of this.rehydrated.values()) {
       data[`${TXF_TOKEN_KEY_PREFIX}${plainKey}` as `_${string}`] = value;
     }
-    const isEmpty = this.knownCount() === 0 && history.length === 0;
     // Attach recovered history for the existing import hook (importHistoryEntries).
     if (history.length > 0) data._history = history;
-    if (isEmpty) data.isEmpty = true;
-    this.initialLoadDone = true; // the flush gate opens on a successful load (Task 7.1)
-    this.emit('storage:loaded', { entries: entries.length, tokens: this.rehydrated.size, history: history.length });
-    return { success: true, data: data as TData, source: 'remote', timestamp: Date.now() };
+    return data;
   }
 
   /**
