@@ -59,6 +59,9 @@ import type {
 import { SphereError } from './errors';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../storage';
 import { createVaultTokenStorage } from '../storage/remote/factory';
+import { createCourierDeliveryTransport } from '../transport/courier/factory';
+import type { TokenDeliveryTransport } from '../transport/courier/types';
+import { RemoteTokenStorageProvider } from '../storage/remote/RemoteTokenStorageProvider';
 import type { TransportProvider, PeerInfo } from '../transport';
 import { MultiAddressTransportMux, AddressTransportAdapter } from '../transport/MultiAddressTransportMux';
 import type { OracleProvider } from '../oracle';
@@ -218,6 +221,8 @@ export interface SphereCreateOptions {
   discoverAddresses?: boolean | DiscoverAddressesOptions;
   /** Remote Token-Vault v2 backup/sync (additive, default OFF). */
   vault?: VaultInitConfig;
+  /** Token-Vault v2 courier delivery (additive, opt-in; Nostr stays default). */
+  courier?: CourierInitConfig;
   /** Enable debug logging (default: false) */
   debug?: boolean;
   /** Optional callback to report initialization progress steps */
@@ -265,6 +270,8 @@ export interface SphereLoadOptions {
   discoverAddresses?: boolean | DiscoverAddressesOptions;
   /** Remote Token-Vault v2 backup/sync (additive, default OFF). */
   vault?: VaultInitConfig;
+  /** Token-Vault v2 courier delivery (additive, opt-in; Nostr stays default). */
+  courier?: CourierInitConfig;
   /** Enable debug logging (default: false) */
   debug?: boolean;
   /** Optional callback to report initialization progress steps */
@@ -324,6 +331,8 @@ export interface SphereImportOptions {
   discoverAddresses?: boolean | DiscoverAddressesOptions;
   /** Remote Token-Vault v2 backup/sync (additive, default OFF). */
   vault?: VaultInitConfig;
+  /** Token-Vault v2 courier delivery (additive, opt-in; Nostr stays default). */
+  courier?: CourierInitConfig;
   /** Enable debug logging (default: false) */
   debug?: boolean;
   /** Optional callback to report initialization progress steps */
@@ -356,6 +365,24 @@ export interface VaultInitConfig {
   url?: string;
   /** Stable device id stamped into the vault auth session. */
   deviceId?: string;
+}
+
+/**
+ * Token-Vault v2 courier (token delivery) configuration. The courier is an ADDITIVE,
+ * opt-in delivery channel for finished v2 token blobs: when enabled, sends DEPOSIT
+ * over the courier (courier-primary) with a Nostr fallback, and receives pull the
+ * courier inbox in addition to Nostr. Construction is SDK-internal (the courier needs
+ * the raw spend key), so the app only flips this flag. Resolution stays on Nostr.
+ *
+ * Default OFF: when omitted or `enabled` is false, delivery is Nostr-only — existing
+ * wallets are completely unaffected. When the vault is ALSO enabled, the courier
+ * shares the vault's auth session (one JWT for vault + courier).
+ */
+export interface CourierInitConfig {
+  /** Enable the courier as an opt-in v2 token-delivery channel. Default OFF. */
+  enabled: boolean;
+  /** Override the courier base URL (defaults to `NETWORKS[network].vaultUrl`). */
+  url?: string;
 }
 
 /** Options for unified init (auto-create or load) */
@@ -419,6 +446,8 @@ export interface SphereInitOptions {
   communications?: CommunicationsModuleConfig;
   /** Remote Token-Vault v2 backup/sync (additive, default OFF). */
   vault?: VaultInitConfig;
+  /** Token-Vault v2 courier delivery (additive, opt-in; Nostr stays default). */
+  courier?: CourierInitConfig;
   /** Enable debug logging (default: false) */
   debug?: boolean;
   /** Optional callback to report initialization progress steps */
@@ -546,6 +575,8 @@ export class Sphere {
   private _network: NetworkType | undefined;
   /** Remote Token-Vault v2 backup/sync config (additive, default OFF). */
   private _vaultConfig: VaultInitConfig | undefined;
+  /** Token-Vault v2 courier delivery config (additive, opt-in; default OFF). */
+  private _courierConfig: CourierInitConfig | undefined;
 
   // Events
   private eventHandlers: Map<SphereEventType, Set<SphereEventHandler<SphereEventType>>> = new Map();
@@ -573,6 +604,7 @@ export class Sphere {
     communicationsConfig?: CommunicationsModuleConfig,
     network?: NetworkType,
     vaultConfig?: VaultInitConfig,
+    courierConfig?: CourierInitConfig,
   ) {
     this._storage = storage;
     this._transport = transport;
@@ -591,6 +623,7 @@ export class Sphere {
     this._communicationsConfig = communicationsConfig;
     this._network = network;
     this._vaultConfig = vaultConfig;
+    this._courierConfig = courierConfig;
 
     this._payments = createPaymentsModule({ l1: l1Config });
     this._communications = createCommunicationsModule(communicationsConfig);
@@ -696,6 +729,7 @@ export class Sphere {
         password: options.password,
         discoverAddresses: options.discoverAddresses,
         vault: options.vault,
+        courier: options.courier,
         onProgress: options.onProgress,
       });
       // Store dmSince for forwarding to transport/mux when subscriptions are set up
@@ -740,6 +774,7 @@ export class Sphere {
       password: options.password,
       discoverAddresses: options.discoverAddresses,
       vault: options.vault,
+      courier: options.courier,
       onProgress: options.onProgress,
     });
 
@@ -887,6 +922,7 @@ export class Sphere {
       options.communications,
       options.network,
       options.vault,
+      options.courier,
     );
     sphere._password = options.password ?? null;
 
@@ -990,6 +1026,7 @@ export class Sphere {
       options.communications,
       options.network,
       options.vault,
+      options.courier,
     );
     sphere._password = options.password ?? null;
 
@@ -1096,6 +1133,7 @@ export class Sphere {
       options.communications,
       options.network,
       options.vault,
+      options.courier,
     );
     sphere._password = options.password ?? null;
 
@@ -2413,6 +2451,7 @@ export class Sphere {
           storage: this._storage,
           tokenStorageProviders: moduleSet.tokenStorageProviders,
           transport: addressTransport,
+          deliveryTransport: this.buildCourierForIdentity(newIdentity, moduleSet.tokenStorageProviders),
           oracle: this._oracle,
           emitEvent: this.emitEvent.bind(this),
           chainCode: this._masterKey?.chainCode || undefined,
@@ -2553,6 +2592,7 @@ export class Sphere {
       storage: this._storage,
       tokenStorageProviders,
       transport: addressTransport,
+      deliveryTransport: this.buildCourierForIdentity(identity, tokenStorageProviders),
       oracle: this._oracle,
       emitEvent,
       chainCode: this._masterKey?.chainCode || undefined,
@@ -4269,6 +4309,34 @@ export class Sphere {
     this._tokenStorageProviders.set(provider.id, provider);
   }
 
+  /**
+   * Build the opt-in courier delivery transport for an address when `courier.enabled`
+   * (default OFF → returns undefined, so PaymentsModule stays Nostr-only and is
+   * byte-identical to today). Construction is SDK-internal — the courier needs the raw
+   * spend key, which only the in-scope FullIdentity carries. When the vault is ALSO
+   * enabled for this address, the courier SHARES the vault provider's auth session
+   * (`authTokenSource()`) so both use ONE JWT; otherwise the courier builds its own.
+   *
+   * The PaymentsModule binds the courier's sinks (`onV2Transfer` / `onDelivered`) in
+   * its `initialize()` once the deps are wired — here it is only constructed + keyed.
+   */
+  private buildCourierForIdentity(
+    identity: FullIdentity,
+    tokenStorageProviders: Map<string, TokenStorageProvider<TxfStorageDataBase>>,
+  ): TokenDeliveryTransport | undefined {
+    if (!this._courierConfig?.enabled || !this._network) return undefined;
+    const vaultProvider = tokenStorageProviders.get(VAULT_PROVIDER_ID);
+    const authTokenSource =
+      vaultProvider instanceof RemoteTokenStorageProvider ? vaultProvider.authTokenSource() : undefined;
+    return createCourierDeliveryTransport({
+      identity,
+      network: this._network,
+      storage: this._storage,
+      vaultUrl: this._courierConfig.url,
+      authTokenSource,
+    });
+  }
+
   private async initializeProviders(): Promise<void> {
     // Set identity on providers
     this._storage.setIdentity(this._identity!);
@@ -4458,6 +4526,7 @@ export class Sphere {
       storage: this._storage,
       tokenStorageProviders: this._tokenStorageProviders,
       transport: moduleTransport,
+      deliveryTransport: this.buildCourierForIdentity(this._identity!, this._tokenStorageProviders),
       oracle: this._oracle,
       emitEvent,
       // Pass chain code for L1 HD derivation

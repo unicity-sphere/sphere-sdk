@@ -57,6 +57,7 @@ export type {
   SphereInitResult,
   SphereImportOptions,
   VaultInitConfig,
+  CourierInitConfig,
   InitProgressStep,
   InitProgress,
   InitProgressCallback,
@@ -556,6 +557,12 @@ export type {
   CourierJournalStore,
   V2TransferSink,
 } from './transport/courier/CourierDeliveryProvider';
+export {
+  StorageCourierJournalStore,
+  COURIER_JOURNAL_KEY_PREFIX,
+} from './transport/courier/courier-journal-store';
+export { createCourierDeliveryTransport } from './transport/courier/factory';
+export type { CreateCourierDeliveryConfig } from './transport/courier/factory';
 export type {
   TokenDeliveryTransport,
   TokenDeliveryCapabilities,
