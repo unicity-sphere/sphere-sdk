@@ -4368,7 +4368,19 @@ export class Sphere {
       await this._storage.connect();
     }
     if (!this._transport.isConnected()) {
-      await this._transport.connect();
+      // OFFLINE-RESILIENT BOOT: a relay outage must NOT brick the wallet. Catch a connect
+      // failure, emit a degraded connection event, and continue — local tokens load and
+      // on-chain (aggregator) ops still work; peer send/receive is simply unavailable until
+      // the transport (re)connects (NostrClient autoReconnect, or a later setIdentity /
+      // reload / app-level `online` retry). Previously this threw TRANSPORT_ERROR and the
+      // ENTIRE wallet failed to initialize whenever relays were unreachable.
+      try {
+        await this._transport.connect();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'transport connect failed';
+        logger.warn('Sphere', `Transport connect failed — continuing in offline/degraded mode: ${msg}`);
+        this.emitConnectionChanged(this._transport.id, false, 'error', msg);
+      }
     }
     await this._oracle.initialize();
 
