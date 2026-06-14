@@ -43,22 +43,20 @@
 #
 # Required env:
 #   ESCROW          — escrow @nametag or DIRECT:// address
-#                     (default: @escrow-testnet)
+#                     (default: @escrow-test-02 — the canonical
+#                      DEFAULT_ESCROW_ADDRESS exported by sphere-sdk
+#                      since PR #468 / sphere-sdk#456)
 #
 # Requires `sphere` on PATH, outbound HTTPS+WSS to testnet, and a
 # reachable escrow service.
 #
-# Escrow nametag resolution fallback (sphere-sdk#456):
-#   If the @escrow-testnet nametag does not resolve on the testnet
-#   relay (the §2.5 `sphere swap ping` pre-flight will fail with
+# Escrow nametag resolution fallback:
+#   If the default nametag does not resolve on the testnet relay
+#   (the §2.5 `sphere swap ping` pre-flight will fail with
 #   `Could not resolve recipient`), re-run with the escrow's raw
-#   DIRECT address. The production testnet escrow currently lives at:
-#
-#     ESCROW="DIRECT://00007968fa28648e4670438bf1f3c936296e84ff46dd5ebb2e34e20092e780b652da2d3d695b" \
-#       bash manual-test-swap-roundtrip.sh
-#
-#   The nametag remains the canonical reference — switch back once
-#   the operator republishes the binding event.
+#   DIRECT address — discover it via
+#       sphere resolve @escrow-test-02
+#   on a working wallet and pass it through ESCROW=DIRECT://...
 
 set -euo pipefail
 
@@ -77,7 +75,7 @@ PEER_ALICE="$ROOT/alice-peer"
 PEER_BOB="$ROOT/bob-peer"
 mkdir -p "$PEER_ALICE" "$PEER_BOB"
 
-ESCROW="${ESCROW:-@escrow-testnet}"
+ESCROW="${ESCROW:-@escrow-test-02}"
 echo "ESCROW=$ESCROW"
 
 SCENARIO="${SCENARIO:-AB}"
@@ -228,12 +226,9 @@ sphere wallet use alice
 if ! sphere swap ping "$ESCROW" 2>&1 | tee "$SNAP/alice-escrow-ping.log"; then
   echo "ASSERT FAIL (escrow-unreachable): $ESCROW did not respond to swap ping" >&2
   echo "Hint: set ESCROW=<addr> to point at a different escrow service." >&2
-  if [[ "$ESCROW" == "@escrow-testnet" ]]; then
-    echo "Hint (sphere-sdk#456): the @escrow-testnet nametag binding may be" >&2
-    echo "  missing on the testnet relay. Re-run with the DIRECT-address fallback:" >&2
-    echo "  ESCROW=\"DIRECT://00007968fa28648e4670438bf1f3c936296e84ff46dd5ebb2e34e20092e780b652da2d3d695b\" \\" >&2
-    echo "    bash manual-test-swap-roundtrip.sh" >&2
-  fi
+  echo "  The canonical DEFAULT_ESCROW_ADDRESS is @escrow-test-02 (sphere-sdk constants.ts);" >&2
+  echo "  if its nametag binding is missing on the relay, resolve a working wallet's" >&2
+  echo "  view with 'sphere resolve @escrow-test-02' and pass the DIRECT://... directly." >&2
   exit 1
 fi
 echo "ASSERT OK (escrow-reachable): $ESCROW responded"
