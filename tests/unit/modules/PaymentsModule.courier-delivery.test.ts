@@ -342,3 +342,15 @@ describe('dedup — a token delivered over BOTH courier and Nostr is stored once
     expect(emitEvent.mock.calls.find((c: any[]) => c[0] === 'transfer:incoming')).toBeUndefined();
   });
 });
+
+describe('receive() — a courier outage DEGRADES, never throws out of receive()', () => {
+  it('swallows a courier receive() rejection (the Nostr pull already succeeded)', async () => {
+    const delivery = new FakeDeliveryTransport();
+    delivery.receive = async () => { throw new Error('courier down'); };
+    const { module, transport } = setup({ delivery });
+    // receive() must resolve despite the courier outage — the token stays in the inbox
+    // for the next pull; a courier-down state cannot break the wallet's receive().
+    await expect(module.receive()).resolves.toBeDefined();
+    expect(transport.fetchPendingEvents).toHaveBeenCalled(); // Nostr pull still ran
+  });
+});

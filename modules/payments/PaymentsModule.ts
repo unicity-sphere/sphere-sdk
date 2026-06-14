@@ -1936,8 +1936,11 @@ export class PaymentsModule {
 
     // Also pull the courier inbox (store-and-forward) so an explicit receive() sees
     // courier-delivered transfers too. Awaited here (unlike load()'s fire-and-forget)
-    // so the reload below captures them; a no-op without a deliveryTransport.
-    await this.deps!.deliveryTransport?.receive?.();
+    // so the reload below captures them; a no-op without a deliveryTransport. A courier
+    // outage must DEGRADE, never throw out of the public receive() (the Nostr pull above
+    // already succeeded) — swallow + warn, the token stays in the inbox for next pull.
+    await this.deps!.deliveryTransport?.receive?.().catch((err: unknown) =>
+      logger.warn('Payments', 'Courier receive (receive) failed:', err));
 
     // Reload from storage to get a clean, consistent state.
     // Handlers save tokens during processing (with potentially different IDs for
