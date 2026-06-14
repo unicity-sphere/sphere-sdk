@@ -57,8 +57,14 @@ function txf(tokens: Record<string, unknown>): TxfStorageDataBase {
   return data;
 }
 
-/** Decrypt a stored entry's ciphertext at the SERVER-reported version (the load-time AAD). */
-function openStored(server: FakeVaultServer, plainKey: string): unknown {
+/**
+ * Decrypt a stored token entry's ciphertext at the SERVER-reported version (the
+ * load-time AAD) and return the `{ k: plainKey, v: value }` envelope (Phase 7.2:
+ * the sealed plaintext now carries the plainKey alongside the value so a fresh
+ * device can rebuild the `_<tokenId>` TXF key). The AEAD AAD is UNCHANGED — this
+ * helper proves the resurrect-version binding still holds for the new plaintext.
+ */
+function openStored(server: FakeVaultServer, plainKey: string): { k: string; v: unknown } {
   const wk = wireKey(PRIV, NETWORK, plainKey);
   const row = server.getEntry(PUB, wk)!;
   const pt = openVaultEntry({
@@ -69,7 +75,7 @@ function openStored(server: FakeVaultServer, plainKey: string): unknown {
     payload: row.payload,
     key32: deriveVaultKey(PRIV, NETWORK),
   });
-  return JSON.parse(new TextDecoder().decode(pt));
+  return JSON.parse(new TextDecoder().decode(pt)) as { k: string; v: unknown };
 }
 
 describe('resurrect AEAD version binding', () => {
@@ -97,14 +103,15 @@ describe('resurrect AEAD version binding', () => {
 
     // PROOF: the ciphertext stored at v3 must DECRYPT when the AAD is rebuilt at the
     // server version (3) — exactly what a fresh load() does. Before the fix the AAD
-    // was sealed at version 1, so this threw (a permanently-unreadable token).
+    // was sealed at version 1, so this threw (a permanently-unreadable token). The
+    // plaintext carries the `{ k, v }` envelope (Phase 7.2): k = plainKey, v = value.
     const decoded = openStored(server, 'k');
-    expect(decoded).toEqual(resurrected);
+    expect(decoded).toEqual({ k: 'k', v: resurrected });
 
     // A fresh provider loads the resurrected row and round-trips the plaintext too.
     const reader = makeProvider(server);
     await reader.initialize();
-    expect(openStored(server, 'k')).toEqual(resurrected);
+    expect(openStored(server, 'k')).toEqual({ k: 'k', v: resurrected });
   });
 
   it('a normal create/update still seals the AAD at the server-stored version', async () => {
@@ -117,7 +124,8 @@ describe('resurrect AEAD version binding', () => {
     await provider.sync(txf({ k: { n: 2 } }));
     const row = server.getEntry(PUB, wireKey(PRIV, NETWORK, 'k'))!;
     expect(row.version).toBe(2);
-    // The update ciphertext decrypts at v2 (regression guard for the non-resurrect path).
-    expect(openStored(server, 'k')).toEqual({ n: 2 });
+    // The update ciphertext decrypts at v2 (regression guard for the non-resurrect
+    // path). The plaintext carries the `{ k, v }` envelope (Phase 7.2).
+    expect(openStored(server, 'k')).toEqual({ k: 'k', v: { n: 2 } });
   });
 });
