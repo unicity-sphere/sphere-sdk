@@ -32,6 +32,15 @@ import type {
   TokenEnvelope,
 } from './types';
 
+/** Default base backoff (ms) for the redelivery loop; doubles per attempt. */
+const DEFAULT_BACKOFF_BASE_MS = 1000;
+/** Default backoff cap (ms) — 5 minutes. */
+const DEFAULT_BACKOFF_MAX_MS = 5 * 60_000;
+/** Default max redelivery attempts before an entry surfaces `delivery_unconfirmed`. */
+const DEFAULT_MAX_REDELIVERY_ATTEMPTS = 10;
+/** Default max envelope bytes the courier accepts (DESIGN §6.6). */
+const DEFAULT_MAX_ENVELOPE_BYTES = 16 * 1024 * 1024;
+
 /** The highest `seq` across a page of rows, falling back to `fallback` when empty. */
 function highestSeq(items: ReadonlyArray<{ seq: number }>, fallback: number): number {
   let max = fallback;
@@ -71,6 +80,15 @@ interface SentPendingEntry {
    * rows journaled by an older build (watermark still advances via the /sent row).
    */
   sentSeq?: number;
+  /**
+   * Wall-clock ms of the LAST counted redelivery attempt (the backoff anchor,
+   * finding courier-redelivery-backoff-not-enforced). `reconcileSentItem` only
+   * counts a new attempt once `backoffMs(attempts)` has elapsed since this, so a
+   * burst of polls during a short recipient-offline window does not exhaust the
+   * attempt budget. Absent (undefined) until the first attempt is counted, and on
+   * rows journaled by an older build (treated as "window elapsed" → first poll counts).
+   */
+  lastAttemptAt?: number;
 }
 
 /** Minimal persistent KV the journal needs (matches PaymentsModule storage). */
@@ -104,6 +122,8 @@ export interface CourierDeliveryConfig {
   backoffBaseMs?: number;
   /** Backoff cap (ms). */
   backoffMaxMs?: number;
+  /** Wall-clock source (ms) for the redelivery backoff gate; injectable for tests. */
+  now?: () => number;
 }
 
 export class CourierDeliveryProvider implements TokenDeliveryTransport {
@@ -131,7 +151,7 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
       async: true,
       ack: true,
       addressing: 'pubkey',
-      maxBytes: config.maxBytes ?? 16 * 1024 * 1024,
+      maxBytes: config.maxBytes ?? DEFAULT_MAX_ENVELOPE_BYTES,
     };
   }
 
@@ -480,15 +500,39 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
   ): Promise<void> {
     const entry = pending[item.entryId];
     if (!entry || entry.state === 'delivered') return;
+    // A valid recipient ackSig ALWAYS delivers — confirmation is never throttled by
+    // the backoff gate (a poll inside the window still confirms a genuine delivery).
     if (this.isValidReceipt(me, item)) {
       entry.state = 'delivered';
       await this.config.onDelivered?.(item.entryId);
       return;
     }
     // Not yet validly claimed (still unclaimed, or a FORGED ackSig that fails
-    // verification) — keep redelivering, bounded by the attempt cap.
+    // verification). ENFORCE the backoff (finding courier-redelivery-backoff-not-
+    // enforced): only COUNT an attempt once `backoffMs(attempts)` has elapsed since
+    // the last counted one, so a burst of polls during a brief recipient-offline
+    // window does not prematurely exhaust the budget and flip to delivery_unconfirmed.
+    if (!this.backoffElapsed(entry)) return;
     entry.attempts += 1;
+    entry.lastAttemptAt = this.now();
     if (entry.attempts >= this.maxAttempts()) entry.state = 'delivery_unconfirmed';
+  }
+
+  /**
+   * True once the redelivery backoff window for `entry` has elapsed — i.e. the
+   * NEXT attempt may be counted. The window is `backoffMs(entry.attempts)` (the
+   * delay before the next attempt, scaled by attempts already made). The first
+   * attempt (no `lastAttemptAt`) always counts; older journal rows without a
+   * timestamp are treated as "window elapsed" so they are never wedged.
+   */
+  private backoffElapsed(entry: SentPendingEntry): boolean {
+    if (entry.lastAttemptAt === undefined) return true;
+    return this.now() - entry.lastAttemptAt >= this.backoffMs(entry.attempts);
+  }
+
+  /** Wall-clock source (ms) — injectable for the backoff gate's tests. */
+  private now(): number {
+    return (this.config.now ?? Date.now)();
   }
 
   /** True only for a recipient ackSig that verifies over the bound template. */
@@ -523,13 +567,13 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
   }
 
   private maxAttempts(): number {
-    return this.config.maxRedeliveryAttempts ?? 10;
+    return this.config.maxRedeliveryAttempts ?? DEFAULT_MAX_REDELIVERY_ATTEMPTS;
   }
 
   /** Exponential backoff for the redelivery loop, capped (DESIGN §6.5). */
   backoffMs(attempts: number): number {
-    const base = this.config.backoffBaseMs ?? 1000;
-    const cap = this.config.backoffMaxMs ?? 5 * 60_000;
+    const base = this.config.backoffBaseMs ?? DEFAULT_BACKOFF_BASE_MS;
+    const cap = this.config.backoffMaxMs ?? DEFAULT_BACKOFF_MAX_MS;
     return Math.min(cap, base * 2 ** attempts);
   }
 

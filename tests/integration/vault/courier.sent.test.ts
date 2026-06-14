@@ -114,14 +114,70 @@ describe('courier sender-gated delivery confirmation', () => {
 
   it('past the attempt cap a still-unconfirmed entry surfaces delivery_unconfirmed', async () => {
     const server = new FakeCourierServer(NETWORK);
-    const sp = makeSender(server, { maxRedeliveryAttempts: 3 });
+    // A controllable clock — each poll only counts once the backoff window elapses.
+    let now = 0;
+    const sp = makeSender(server, {
+      maxRedeliveryAttempts: 3,
+      backoffBaseMs: 1000,
+      now: () => now,
+    });
     const handle = await sp.deposit(env);
-    // Recipient never claims; each pollSent finds it unclaimed -> bumps attempts.
-    await sp.pollSent();
-    await sp.pollSent();
+    // Recipient never claims; each pollSent past the backoff window bumps attempts.
+    await sp.pollSent(); // attempt 1 (first poll always counts)
+    now += sp.backoffMs(1); // wait the window for attempt 2
+    await sp.pollSent(); // attempt 2
     expect(await sp.sentState(handle.entryId)).toBe('pending');
+    now += sp.backoffMs(2); // wait the window for attempt 3
     await sp.pollSent(); // attempts hits 3 == cap
     expect(await sp.sentState(handle.entryId)).toBe('delivery_unconfirmed');
+  });
+
+  it('rapid polls inside the backoff window do NOT exhaust the attempt budget', async () => {
+    // Regression (courier-redelivery-backoff-not-enforced): a brief recipient-
+    // offline window used to flip the entry to delivery_unconfirmed because every
+    // raw poll bumped attempts. With the backoff enforced, a burst of polls inside
+    // the window counts as a SINGLE attempt — so the entry stays pending.
+    const server = new FakeCourierServer(NETWORK);
+    let now = 0;
+    const sp = makeSender(server, {
+      maxRedeliveryAttempts: 3,
+      backoffBaseMs: 1000,
+      now: () => now,
+    });
+    const handle = await sp.deposit(env);
+    // Hammer pollSent many times WITHOUT advancing the clock (recipient briefly
+    // offline). Only the first poll counts; the rest are inside the window.
+    for (let i = 0; i < 20; i++) await sp.pollSent();
+    expect(await sp.sentState(handle.entryId)).toBe('pending');
+
+    // Advance just under the window for attempt 2 — still no new attempt counted.
+    now += sp.backoffMs(1) - 1;
+    await sp.pollSent();
+    expect(await sp.sentState(handle.entryId)).toBe('pending');
+  });
+
+  it('once the recipient comes online inside the window, a valid ack still delivers', async () => {
+    // The backoff gate must not block a genuine delivery: even a poll INSIDE the
+    // window delivers when the /sent row now carries a valid recipient ackSig.
+    const server = new FakeCourierServer(NETWORK);
+    let now = 0;
+    const delivered: string[] = [];
+    const sp = makeSender(server, {
+      onDelivered: async (id) => void delivered.push(id),
+      backoffBaseMs: 1000,
+      now: () => now,
+    });
+    const handle = await sp.deposit(env);
+    await sp.pollSent(); // attempt 1, still unclaimed -> pending
+    expect(await sp.sentState(handle.entryId)).toBe('pending');
+
+    // Recipient claims (valid signed ack). A poll INSIDE the backoff window still
+    // delivers — the gate only throttles ATTEMPT counting, never confirmation.
+    await makeRecipient(server).receive();
+    now += 1; // far inside the backoff window
+    await sp.pollSent();
+    expect(delivered).toEqual([handle.entryId]);
+    expect(await sp.sentState(handle.entryId)).toBe('delivered');
   });
 
   it('backoff is exponential and capped', async () => {
