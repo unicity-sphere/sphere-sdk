@@ -15,10 +15,15 @@
  *  - `load()` (Task 6.4/4.2) paginates `/state`, asserts cursor monotonicity, and
  *    runs the signed-root anti-rollback gate.
  *
- * The provider-initiated first-load gate, reserved-address restore, identity
- * fencing, history channel and account-delete are Phase 7 — the seams here
- * (auth client, data-client factory, local baseline store, event emitter) are
- * shaped so Phase 7 slots in without reshaping this file.
+ * The provider-initiated first-load gate, identity fencing, history channel and
+ * account-delete are Phase 7 — the seams here (auth client, data-client factory,
+ * local baseline store, event emitter) are shaped so Phase 7 slots in without
+ * reshaping this file.
+ *
+ * IDENTITY IS THE chainPubkey (v2): the vault keys everything on the wallet's
+ * chainPubkey (`ownerId`). It stores NO DIRECT:// address — `_meta.address` is
+ * restored to the chainPubkey on load, locally known from the key (no server
+ * entry needed). v1's DIRECT reserved-address slot has been removed entirely.
  */
 
 import type { FullIdentity } from '../../types';
@@ -33,25 +38,18 @@ import type {
   TokenStorageProvider,
   TxfStorageDataBase,
 } from '../storage-provider';
-import { getPublicKey, hexToBytes } from '../../core/crypto';
-import { sealVaultEntry } from '../../vault-aead/entry';
+import { getPublicKey } from '../../core/crypto';
+import { sealVaultEntry, openVaultEntry } from '../../vault-aead/entry';
 import { deriveVaultKey } from '../../vault-aead/derive';
 import { wireKey } from './wire-key';
 import { VaultApiClient } from './VaultApiClient';
 import { extractTokens, planOps } from './diff';
 import type { KnownEntry, PlannedOp } from './diff';
-import {
-  reservedAddressKey,
-  sealReservedAddress,
-  openReservedAddress,
-  RESERVED_ADDRESS_FORMAT_VERSION,
-} from './reserved-address';
 import { sealHistoryRecord, openHistoryRecord } from './history-codec';
 import { deleteCanon } from '../../vault-aead/canon';
 import { VAULT_REASON } from '../../vault/contracts';
 import { signMessage } from '../../core/crypto';
 import { SphereError } from '../../core/errors';
-import { deriveDirectAddress } from '../../token-engine/identity';
 import type {
   PatchOp,
   PatchResponse,
@@ -66,6 +64,28 @@ import { normalizeVaultNetwork } from './normalize-network';
 import { AsyncSerialQueue } from '../../impl/shared/ipfs/write-behind-buffer';
 
 const enc = (s: string): Uint8Array => new TextEncoder().encode(s);
+const dec = (b: Uint8Array): string => new TextDecoder().decode(b);
+
+/**
+ * The sealed token-entry plaintext envelope (Phase 7.2 rehydration). The entry
+ * value is sealed as `{ [VAULT_ENTRY_KEY_FIELD]: plainKey, [VAULT_ENTRY_VALUE_FIELD]: value }`
+ * so a fresh device can reconstruct the FULL TxfStorageData key (`_<tokenId>`)
+ * from the decrypted blob WITHOUT relying on the value to self-identify its key
+ * (the wireKey is a one-way HMAC and cannot be reversed). The AEAD AAD is
+ * UNCHANGED (network‖ownerId‖wireKey‖version) — only the plaintext content carries
+ * the extra key field.
+ */
+const VAULT_ENTRY_KEY_FIELD = 'k';
+const VAULT_ENTRY_VALUE_FIELD = 'v';
+
+/** The decoded token-entry envelope: the plaintext key + the token value. */
+interface VaultEntryEnvelope {
+  [VAULT_ENTRY_KEY_FIELD]: string;
+  [VAULT_ENTRY_VALUE_FIELD]: unknown;
+}
+
+/** The leading underscore that prefixes every dynamic TXF token key (`_<tokenId>`). */
+const TXF_TOKEN_KEY_PREFIX = '_';
 
 /** Thrown by the flush path when the identity epoch advanced across an await. */
 class IdentityFencedError extends Error {
@@ -138,8 +158,19 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
    */
   private initialLoadDone = false;
 
-  /** The DIRECT:// address restored from the reserved meta-address entry (Task 7.2). */
-  private restoredAddress: string | null = null;
+  /**
+   * The FULL rehydrated token snapshot, keyed by the opaque wireKey →
+   * `{ plainKey, value }` (Phase 7.2). Built by decrypting every LIVE
+   * entry and updated INCREMENTALLY per load delta: a live entry adds/updates its
+   * wireKey; a tombstone (which carries no decryptable fresh payload) just DELETES
+   * its wireKey — no decrypt needed, so a delete never risks a false LOAD_FAILED.
+   * `load()` paginates from `serverCursor` (a delta, for anti-rollback), so the FULL
+   * token snapshot must persist across loads — otherwise a second `load()` (the
+   * provider self-loads in `initialize()`, then `PaymentsModule.load()` calls again)
+   * would see an empty delta and return NO tokens, dropping the restored balance.
+   * `materialize()` reconstructs `_<plainKey>` keys from THIS map every load.
+   */
+  private readonly rehydrated = new Map<string, { plainKey: string; value: unknown }>();
 
   /**
    * Serialize flush / sync / shutdown so two flushes never interleave their CAS
@@ -211,8 +242,8 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     // re-open on the new owner's first load, and the old `known`/cursor are stale.
     this.known.clear();
     this.contentHash.clear();
+    this.rehydrated.clear();
     this.serverCursor = 0;
-    this.restoredAddress = null;
     this.initialLoadDone = false;
     this.pushedHistory.clear();
     this.localHistory.clear();
@@ -351,11 +382,9 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     try {
       this.assertEpoch(epoch);
       const ops = this.planFlush(localData);
-      const reserved = await this.planReservedAddress();
-      this.assertEpoch(epoch); // re-check after the (async) reserved-address derive
       await this.pushHistory(localData, epoch); // single-channel history (Task 7.4)
-      if (ops.length === 0 && !reserved) return this.cleanResult(localData, 0, 0, 0);
-      return await this.flush(localData, ops, reserved, epoch);
+      if (ops.length === 0) return this.cleanResult(localData, 0, 0, 0);
+      return await this.flush(localData, ops, epoch);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'sync failed';
       this.emit('sync:error', undefined, message);
@@ -388,26 +417,6 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     return sealHistoryRecord(record, this.ownerId(), this.config.privateKey, this.vaultNetwork);
   }
 
-  /**
-   * The reserved meta-address op (Task 7.2, finding #17). Sealed once, from the
-   * REAL engine identity (`deriveDirectAddress(hexToBytes(chainPubkey))`), so a
-   * fresh import restores `_meta.address` without re-deriving from tokens — the
-   * XP-invariant address survives a wipe. Returns `null` once it is on the server.
-   */
-  private async planReservedAddress(): Promise<PatchOp | null> {
-    const wk = reservedAddressKey(this.config.privateKey, this.vaultNetwork);
-    const cur = this.known.get(wk);
-    if (cur && !cur.deleted) return null; // already on the server
-    const chainPubkey = this.ownerId();
-    const directAddress = await deriveDirectAddress(hexToBytes(chainPubkey));
-    const payload = sealReservedAddress(
-      { directAddress, chainPubkey, formatVersion: RESERVED_ADDRESS_FORMAT_VERSION },
-      this.config.privateKey,
-      this.vaultNetwork,
-    );
-    return { key: wk, baseVersion: 0, payload };
-  }
-
   /** Diff the TXF snapshot vs internal last-known state into a list of CAS ops. */
   private planFlush(localData: TData): PlannedOp[] {
     return planOps({
@@ -415,7 +424,6 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
       known: this.known,
       wireKeyOf: (plainKey) => this.wireKeyFor(plainKey),
       changed: (wk, value) => this.hasChanged(wk, value),
-      reserved: new Set([reservedAddressKey(this.config.privateKey, this.vaultNetwork)]),
     });
   }
 
@@ -423,15 +431,9 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     return this.contentHash.get(wk) !== this.hashValue(value);
   }
 
-  /** PATCH the planned ops (token ops + the optional reserved-address op). */
-  private async flush(
-    localData: TData,
-    ops: PlannedOp[],
-    reserved: PatchOp | null,
-    epoch: number,
-  ): Promise<SyncResult<TData>> {
+  /** PATCH the planned token ops. */
+  private async flush(localData: TData, ops: PlannedOp[], epoch: number): Promise<SyncResult<TData>> {
     const wireOps = ops.map((op) => this.toWireOp(op));
-    if (reserved) wireOps.push(reserved);
     // Bind the client to the flush-start owner BEFORE the await so the patch can
     // never re-target a switched identity.
     const client = this.client();
@@ -439,9 +441,6 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     // Identity fence (Task 7.3): if the identity switched across the patch await,
     // abort WITHOUT committing local state under the wrong identity.
     this.assertEpoch(epoch);
-    if (reserved && res.applied.includes(reserved.key)) {
-      this.known.set(reserved.key, { version: 1, deleted: false });
-    }
     const result = this.applyPatchResult(localData, ops, res);
     // Re-sign the local baseline so the wallet's OWN writes advance the signed
     // root — the next load must not see them as an unauthored delta (Task 7.1).
@@ -460,18 +459,26 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
       // `baseVersion + 1`: a delete-resurrect sends baseVersion:0 but the server
       // converges to deletedRow.version + 1, so sealing at baseVersion+1 (=1) would
       // make the resurrected entry undecryptable on load (resurrect-version-mismatch).
-      payload: this.sealValue(op.wireKey, op.sealVersion, op.value),
+      payload: this.sealValue(op.plainKey, op.wireKey, op.sealVersion, op.value),
     };
   }
 
-  /** Seal a token value AAD-bound to the version it will have AFTER apply. */
-  private sealValue(key: string, version: number, value: unknown): { nonce: string; ct: string } {
+  /**
+   * Seal a token entry AAD-bound to the version it will have AFTER apply. The
+   * PLAINTEXT carries the `{ k: plainKey, v: value }` envelope (Phase 7.2) so a
+   * fresh-device load can reconstruct the `_<tokenId>` TXF key from the decrypted
+   * blob — the wireKey is a one-way HMAC and cannot be reversed to its plainKey.
+   * The AAD (network‖ownerId‖wireKey‖version) is UNCHANGED — only the plaintext
+   * content gains the key field, so the seal/version/CAS/root logic is untouched.
+   */
+  private sealValue(plainKey: string, wireKey: string, version: number, value: unknown): { nonce: string; ct: string } {
+    const envelope: VaultEntryEnvelope = { [VAULT_ENTRY_KEY_FIELD]: plainKey, [VAULT_ENTRY_VALUE_FIELD]: value ?? null };
     return sealVaultEntry({
       network: this.vaultNetwork,
       ownerId: this.ownerId(),
-      key,
+      key: wireKey,
       version,
-      plaintext: enc(JSON.stringify(value ?? null)),
+      plaintext: enc(JSON.stringify(envelope)),
       key32: this.vaultKey(),
     });
   }
@@ -621,15 +628,15 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
 
   /**
    * Drop all per-owner local vault state for a sanctioned reset: the internal
-   * last-known server view, content hashes, the pagination watermark, the restored
-   * address and the history watermark. The signed baseline is re-persisted fresh by
+   * last-known server view, content hashes, the rehydration map, the pagination
+   * watermark and the history watermark. The signed baseline is re-persisted fresh by
    * `commitBaseline`. Storage scope (the literal-network baseline KEY) is unchanged.
    */
   private dropLocalVaultState(): void {
     this.known.clear();
     this.contentHash.clear();
+    this.rehydrated.clear();
     this.serverCursor = 0;
-    this.restoredAddress = null;
     this.localHistory.clear();
     this.pushedHistory.clear();
     this.historyCursor = 0;
@@ -674,43 +681,67 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
   /**
    * Build the TXF snapshot from the accumulated `/state` rows, adopting their
    * versions and running the 3-state machine (Task 7.2):
-   *  - LOAD_FAILED: a corrupt reserved-address entry throws → caller returns
-   *    `success:false`, the gate stays SHUT (initialLoadDone untouched).
-   *  - POPULATED: the reserved entry decodes → `_meta.address` is restored (#17).
-   *  - EMPTY: no reserved entry has ever been seen → an `isEmpty` sentinel rides
+   *  - LOAD_FAILED: a corrupt token entry throws → caller returns `success:false`,
+   *    the gate stays SHUT (initialLoadDone untouched). A token decrypt failure is
+   *    NEVER a silent drop (money-path safety).
+   *  - POPULATED: every non-deleted token entry is REHYDRATED under its `_<tokenId>`
+   *    key so PaymentsModule import restores the actual tokens/balance. `_meta.address`
+   *    is the wallet's chainPubkey (v2 identity), known locally from the key — the
+   *    vault stores no DIRECT:// address.
+   *  - EMPTY: no token entries have ever been seen → an `isEmpty` sentinel rides
    *    INSIDE `data` so it can never short-circuit local data (#22).
    */
   private materialize(entries: StateEntry[], history: HistoryRecord[]): LoadResult<TData> {
-    const reserved = this.restoreReservedAddress(entries); // may throw → LOAD_FAILED
+    // Fold THIS page's delta into the persistent rehydration map (Phase 7.2). A
+    // tombstone DROPS its wireKey (no decrypt — the delete row's retained ciphertext
+    // is sealed at the PRE-delete AAD version and is never re-opened); a live entry
+    // decrypts + adds/updates. A decrypt failure on a LIVE token entry throws →
+    // LOAD_FAILED (never a silent drop).
     for (const e of entries) {
       this.known.set(e.key, { version: e.version, deleted: e.deleted });
+      if (e.deleted) {
+        this.rehydrated.delete(e.key);
+        continue;
+      }
+      const { k, v } = this.openTokenEntry(e); // may throw → LOAD_FAILED (no silent drop)
+      this.rehydrated.set(e.key, { plainKey: k, value: v });
     }
-    const isEmpty =
-      !reserved && this.restoredAddress === null && this.knownCount() === 0 && history.length === 0;
+    // Build the FULL TXF snapshot from the accumulated rehydration map every load,
+    // so a delta-only `load()` still returns the complete token set. v2 identity is
+    // the chainPubkey, so `_meta.address` is restored to OUR chainPubkey (locally
+    // known from the key — no server entry needed); the address guard accepts it.
     const data: TxfStorageDataBase & { isEmpty?: boolean } = {
-      _meta: { version: 1, address: this.restoredAddress ?? '', formatVersion: '2.0', updatedAt: Date.now() },
+      _meta: { version: 1, address: this.ownerId(), formatVersion: '2.0', updatedAt: Date.now() },
     };
+    for (const { plainKey, value } of this.rehydrated.values()) {
+      data[`${TXF_TOKEN_KEY_PREFIX}${plainKey}` as `_${string}`] = value;
+    }
+    const isEmpty = this.knownCount() === 0 && history.length === 0;
     // Attach recovered history for the existing import hook (importHistoryEntries).
     if (history.length > 0) data._history = history;
     if (isEmpty) data.isEmpty = true;
     this.initialLoadDone = true; // the flush gate opens on a successful load (Task 7.1)
-    this.emit('storage:loaded', { entries: entries.length, history: history.length });
+    this.emit('storage:loaded', { entries: entries.length, tokens: this.rehydrated.size, history: history.length });
     return { success: true, data: data as TData, source: 'remote', timestamp: Date.now() };
   }
 
   /**
-   * Find + decode the reserved meta-address entry from the page rows, caching the
-   * restored DIRECT:// address. Throws on a decrypt/verify failure (LOAD_FAILED);
-   * a missing reserved entry is fine (EMPTY / not-yet-flushed). Returns true when a
-   * reserved row was present on this page.
+   * Open one sealed token entry into its `{ k: plainKey, v: value }` envelope
+   * (Phase 7.2). The AAD is rebuilt from the SERVER-reported version (the same
+   * version a resurrect sealed under), so a delete-resurrected entry decrypts too.
+   * Throws on any decrypt/verify failure → the caller maps it to LOAD_FAILED so a
+   * corrupted token entry can NEVER be silently dropped (money-path safety).
    */
-  private restoreReservedAddress(entries: StateEntry[]): boolean {
-    const wk = reservedAddressKey(this.config.privateKey, this.vaultNetwork);
-    const row = entries.find((e) => e.key === wk && !e.deleted);
-    if (!row) return false;
-    const meta = openReservedAddress(row.payload, this.ownerId(), this.config.privateKey, this.vaultNetwork);
-    this.restoredAddress = meta.directAddress;
-    return true;
+  private openTokenEntry(e: StateEntry): VaultEntryEnvelope {
+    const bytes = openVaultEntry({
+      network: this.vaultNetwork,
+      ownerId: this.ownerId(),
+      key: e.key,
+      version: e.version,
+      payload: e.payload,
+      key32: this.vaultKey(),
+    });
+    return JSON.parse(dec(bytes)) as VaultEntryEnvelope;
   }
 
   // === events ===============================================================

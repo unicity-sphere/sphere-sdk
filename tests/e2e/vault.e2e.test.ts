@@ -6,8 +6,9 @@
  * fetch HTTP clients — no fakes:
  *  1. AUTH — `VaultApiClient` + `HttpVaultAuthClient`: challenge → verify → JWT.
  *  2. VAULT CAS — `RemoteTokenStorageProvider` over `HttpVaultClient`: flush a
- *     couple of token entries + the reserved meta-address, then RELOAD from a fresh
- *     provider and assert the CAS round-trip + the restored `_meta.address` (#17).
+ *     couple of token entries, then RELOAD from a fresh provider and assert the CAS
+ *     round-trip + that `_meta.address` is restored to the wallet's chainPubkey
+ *     (v2 identity — the vault stores NO DIRECT:// address).
  *  3. COURIER — `CourierDeliveryProvider` over `HttpCourierClient`: deposit a sealed
  *     envelope to a second identity, `receive()` + ack it, and confirm the SENDER
  *     sees the valid ack on `/sent`.
@@ -125,7 +126,7 @@ describe('vault e2e — in-process token-api', () => {
     expect(rotated).not.toBe(first);
   });
 
-  it('vault CAS round-trip: flush → reload restores entries + reserved address', async () => {
+  it('vault CAS round-trip: flush → reload restores entries + the chainPubkey address', async () => {
     const priv = '22'.repeat(32);
     const id = await makeIdentity(priv);
     const writer = makeVaultProvider(server.baseUrl, priv, 'writer-device');
@@ -139,7 +140,7 @@ describe('vault e2e — in-process token-api', () => {
     };
     const synced = await writer.sync(snapshot);
     expect(synced.success).toBe(true);
-    expect(writer.knownCount()).toBeGreaterThanOrEqual(2); // 2 tokens (+ reserved address)
+    expect(writer.knownCount()).toBe(2); // 2 token entries, no reserved-address slot
 
     // A FRESH provider (cold local state) reloads purely from the server. It must
     // authenticate first (load() does not — only initialize() does); we drive the
@@ -150,10 +151,10 @@ describe('vault e2e — in-process token-api', () => {
     const loaded = await reader.load();
     expect(loaded.success).toBe(true);
     const data = loaded.data as TxfStorageDataBase;
-    // The reserved meta-address entry was restored (#17 — XP-invariant address).
-    expect(data._meta.address).toBe(id.directAddress);
-    // The two token entries are back as known server rows (2 tokens + reserved slot).
-    expect(reader.knownCount()).toBeGreaterThanOrEqual(3);
+    // v2 identity: _meta.address is restored to the wallet's chainPubkey (no DIRECT).
+    expect(data._meta.address).toBe(id.chainPubkey);
+    // The two token entries are back as known server rows (no reserved slot).
+    expect(reader.knownCount()).toBe(2);
   });
 
   it('courier: deposit → receive → ack → sender sees the ack on /sent', async () => {

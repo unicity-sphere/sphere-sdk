@@ -1,17 +1,17 @@
 /**
- * load() 3-state machine + reserved-address restore (Task 7.2, findings #17/#22,
- * DESIGN §5.5) against the in-process fake server.
+ * load() 3-state machine (Task 7.2, findings #17/#22, DESIGN §5.5) against the
+ * in-process fake server.
  *
- * The load machine distinguishes three outcomes:
- *  - EMPTY (no reserved entry on the server) → success:true with an `isEmpty`
+ * v2 identity is the chainPubkey — the vault stores NO DIRECT:// address. On every
+ * load `_meta.address` is restored to the wallet's OWN chainPubkey (locally known
+ * from the key, no server entry). The three load outcomes:
+ *  - EMPTY (no token entries on the server) → success:true with an `isEmpty`
  *    sentinel INSIDE `data` so it can never short-circuit local data (#22); the
- *    gate opens; treated as a brand-new wallet.
- *  - POPULATED (#17) → on flush the provider seals a reserved-address entry from a
- *    REAL engine identity (`deriveDirectAddress(hexToBytes(chainPubkey))`); on
- *    reload it decodes the reserved entry and restores `_meta.address`. The
- *    restored address must BYTE-EQUAL an INDEPENDENT `deriveDirectAddress(...)`
- *    call imported from `token-engine/identity.ts` (not an in-test helper).
- *  - LOAD_FAILED (a reserved-entry decrypt/verify error) → success:false, the gate
+ *    gate opens; `_meta.address` is the chainPubkey; treated as a brand-new wallet.
+ *  - POPULATED → every non-deleted token entry is REHYDRATED under its `_<tokenId>`
+ *    key (so PaymentsModule import restores the tokens/balance) and `_meta.address`
+ *    is the chainPubkey.
+ *  - LOAD_FAILED (a token-entry decrypt/verify error) → success:false, the gate
  *    stays SHUT, no flush.
  */
 
@@ -20,8 +20,7 @@ import { describe, it, expect } from 'vitest';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { bytesToHex, hexToBytes } from '../../../core/crypto';
 import { RemoteTokenStorageProvider } from '../../../storage/remote/RemoteTokenStorageProvider';
-import { reservedAddressKey } from '../../../storage/remote/reserved-address';
-import { deriveDirectAddress } from '../../../token-engine/identity';
+import { wireKey } from '../../../storage/remote/wire-key';
 import { FakeVaultServer } from '../../helpers/fake-vault-server';
 import type { TxfStorageDataBase } from '../../../storage/storage-provider';
 import type { FullIdentity } from '../../../types';
@@ -56,7 +55,7 @@ interface IsEmptyData extends TxfStorageDataBase {
 }
 
 describe('load() 3-state machine', () => {
-  it('EMPTY: no reserved entry → success:true with an isEmpty sentinel inside data; gate opens (#22)', async () => {
+  it('EMPTY: no token entries → success:true with an isEmpty sentinel inside data; gate opens; address is the chainPubkey (#22)', async () => {
     const server = new FakeVaultServer(NETWORK);
     const provider = makeProvider(server);
     await provider.initialize();
@@ -65,41 +64,41 @@ describe('load() 3-state machine', () => {
     expect(res.success).toBe(true);
     expect((res.data as IsEmptyData).isEmpty).toBe(true);
     expect(provider.isInitialLoadDone()).toBe(true);
-    // No _meta.address can be restored from an empty vault.
-    expect(res.data!._meta.address).toBe('');
+    // v2 identity is the chainPubkey — restored locally even from an empty vault.
+    expect(res.data!._meta.address).toBe(PUB);
   });
 
-  it('POPULATED (#17): a flush seals a reserved-address entry; reload restores _meta.address byte-equal to deriveDirectAddress', async () => {
+  it('POPULATED: a flush stores token entries; reload rehydrates them and restores _meta.address to the chainPubkey', async () => {
     const server = new FakeVaultServer(NETWORK);
     const writer = makeProvider(server);
     await writer.initialize();
-    await writer.sync(txf({ aaa: { amt: '1' } }));
+    const token = { id: 'aaa', amt: '1' };
+    await writer.sync(txf({ aaa: token }));
 
-    // The reserved-address entry was sealed at its well-known wire key.
-    const reservedWk = reservedAddressKey(PRIV, NETWORK);
-    expect(server.getEntry(PUB, reservedWk)).toBeDefined();
+    // The token entry was stored at its opaque wire key — NO DIRECT reserved slot.
+    const tokenWk = wireKey(PRIV, NETWORK, 'aaa');
+    expect(server.getEntry(PUB, tokenWk)).toBeDefined();
 
-    // A fresh reader restores _meta.address from the reserved entry.
+    // A fresh reader rehydrates the token and restores _meta.address to the chainPubkey.
     const reader = makeProvider(server);
     const res = await reader.load();
     expect(res.success).toBe(true);
     expect((res.data as IsEmptyData).isEmpty).toBeUndefined();
-
-    // The INDEPENDENT oracle: deriveDirectAddress from token-engine/identity.ts.
-    const expected = await deriveDirectAddress(hexToBytes(PUB));
-    expect(res.data!._meta.address).toBe(expected);
+    expect(res.data!._meta.address).toBe(PUB); // v2 identity — NOT a DIRECT address
+    // The token entry is rehydrated under its `_<tokenId>` key, byte-identical.
+    expect((res.data as TxfStorageDataBase)['_aaa' as `_${string}`]).toEqual(token);
   });
 
-  it('LOAD_FAILED: a corrupt reserved entry → success:false, gate stays shut, no flush', async () => {
+  it('LOAD_FAILED: a corrupt token entry → success:false, gate stays shut, no flush', async () => {
     const server = new FakeVaultServer(NETWORK);
     const writer = makeProvider(server);
     await writer.initialize();
     await writer.sync(txf({ aaa: { amt: '1' } }));
 
-    // Corrupt the reserved-address entry's ciphertext so its AEAD tag fails.
-    const reservedWk = reservedAddressKey(PRIV, NETWORK);
-    const row = server.getEntry(PUB, reservedWk)!;
-    server.mutateEntry(PUB, reservedWk, { nonce: row.payload.nonce, ct: 'AAAA' + row.payload.ct.slice(4) });
+    // Corrupt the token entry's ciphertext so its AEAD tag fails on open.
+    const tokenWk = wireKey(PRIV, NETWORK, 'aaa');
+    const row = server.getEntry(PUB, tokenWk)!;
+    server.mutateEntry(PUB, tokenWk, { nonce: row.payload.nonce, ct: 'AAAA' + row.payload.ct.slice(4) });
 
     const reader = makeProvider(server);
     const res = await reader.load();

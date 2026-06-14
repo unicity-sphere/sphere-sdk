@@ -897,16 +897,20 @@ export class PaymentsModule {
       // Load metadata from TokenStorageProviders (archived, tombstones, forked)
       // Active tokens are NOT stored in TXF - they are loaded from token-xxx files
       const providers = this.getTokenStorageProviders();
+      // Precompute this wallet's acceptable `_meta.address` set once (the chainPubkey
+      // the vault stamps is included) so a vault restore is not rejected.
+      const ownAddresses = await this.ownMetaAddresses();
       for (const [id, provider] of providers) {
         try {
           const result = await provider.load();
           if (result.success && result.data) {
-            // Address guard: reject data from a different address
+            // Address guard: reject data from a DIFFERENT address. The stored
+            // `_meta.address` may be the L1 address (local TXF stores), the chain
+            // pubkey (the vault stamps THIS — v2 identity), or the runtime DIRECT://
+            // predicate address (local IndexedDB/file stores) — accept any of OUR own.
             const loadedMeta = (result.data as TxfStorageDataBase)?._meta;
-            const currentL1 = this.deps!.identity.l1Address;
-            const currentChain = this.deps!.identity.chainPubkey;
-            if (loadedMeta?.address && currentL1 && loadedMeta.address !== currentL1 && loadedMeta.address !== currentChain) {
-              logger.warn('Payments', `Load: rejecting data from provider ${id} — address mismatch (got=${loadedMeta.address.slice(0, 20)}... expected=${currentL1.slice(0, 20)}...)`);
+            if (!this.isOwnAddress(loadedMeta?.address, ownAddresses)) {
+              logger.warn('Payments', `Load: rejecting data from provider ${id} — address mismatch (got=${loadedMeta!.address.slice(0, 20)}... expected one of this wallet's addresses)`);
               continue;
             }
 
@@ -3097,20 +3101,24 @@ export class PaymentsModule {
       // Preserve nametags — sync providers may not include _nametags in merged data
       const savedNametags = [...this.nametags];
 
+      // Precompute this wallet's acceptable `_meta.address` set once (the chainPubkey
+      // the vault stamps is included) so a vault round-trip is not rejected.
+      const ownAddresses = await this.ownMetaAddresses();
+
       // Sync with each provider
       for (const [providerId, provider] of providers) {
         try {
           const result = await provider.sync(localData);
 
           if (result.success && result.merged) {
-            // Address guard: reject data from a different address.
+            // Address guard: reject data from a DIFFERENT address.
             // Stale IPFS records may contain tokens from a previously active
-            // address if a write-behind flush raced with an address switch.
+            // address if a write-behind flush raced with an address switch. Accept
+            // any of this wallet's own identifiers (L1 / chain pubkey [vault] /
+            // runtime DIRECT:// [local IndexedDB/file stores]).
             const mergedMeta = (result.merged as TxfStorageDataBase)?._meta;
-            const currentL1 = this.deps!.identity.l1Address;
-            const currentChain = this.deps!.identity.chainPubkey;
-            if (mergedMeta?.address && currentL1 && mergedMeta.address !== currentL1 && mergedMeta.address !== currentChain) {
-              logger.warn('Payments', `Sync: rejecting data from provider ${providerId} — address mismatch (got=${mergedMeta.address.slice(0, 20)}... expected=${currentL1.slice(0, 20)}...)`);
+            if (!this.isOwnAddress(mergedMeta?.address, ownAddresses)) {
+              logger.warn('Payments', `Sync: rejecting data from provider ${providerId} — address mismatch (got=${mergedMeta!.address.slice(0, 20)}... expected one of this wallet's addresses)`);
               continue;
             }
 
@@ -3870,6 +3878,31 @@ export class PaymentsModule {
     if (!this.deps) {
       throw new SphereError('PaymentsModule not initialized', 'NOT_INITIALIZED');
     }
+  }
+
+  /**
+   * The set of `_meta.address` values that identify THIS wallet's own data:
+   *  - the L1 address (local TXF stores stamp this);
+   *  - the chain pubkey (v2 identity — the vault stamps THIS on a restore);
+   *  - the runtime DIRECT:// predicate address (`identity.directAddress`), stamped by
+   *    the local IndexedDB/file TXF stores.
+   * The vault keys identity on the chainPubkey (already in this set), so a vault
+   * restore is accepted WITHOUT any DIRECT-derived relax. Computed once per load/sync.
+   */
+  private async ownMetaAddresses(): Promise<Set<string>> {
+    const id = this.deps!.identity;
+    const own = new Set<string>([id.l1Address, id.chainPubkey]);
+    if (id.directAddress) own.add(id.directAddress);
+    return own;
+  }
+
+  /**
+   * True when a stored `_meta.address` is one of THIS wallet's own identifiers
+   * (see {@link ownMetaAddresses}). An empty/absent stored address is permissive
+   * (legacy data with no `_meta.address`); a present address must be in the own-set.
+   */
+  private isOwnAddress(stored: string | undefined, own: Set<string>): boolean {
+    return !stored || own.has(stored);
   }
 }
 

@@ -189,10 +189,10 @@ describe('epoch-gated testnet reset', () => {
   });
 });
 
-/** The first stored vault wire key for the owner (a non-reserved test entry). */
+/** The first stored vault wire key for the owner (a token test entry). */
 function firstEntryKey(server: FakeVaultServer): string {
   // The fake stores entries privately; read one via the public getEntry probe by
-  // scanning the keys we flushed. We flushed token keys + the reserved-address key;
+  // scanning the keys we flushed. We flushed token keys only (no reserved slot);
   // any present key forces a root divergence when mutated.
   const rows = (server as unknown as { entries: { ownerId: string; key: string; deleted: boolean }[] }).entries;
   const row = rows.find((e) => e.ownerId === PUB && !e.deleted);
