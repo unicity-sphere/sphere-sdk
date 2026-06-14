@@ -75,6 +75,20 @@ export interface TokenDeliveryTransport {
   receive?(): Promise<void>;
   /** Verify + return the signed receipt for a delivery, if claimed. */
   confirmReceipt?(handle: DeliveryHandle): Promise<SignedReceipt | null>;
+  /**
+   * Bind the consumer's sinks AFTER construction (the SDK factory leaves them as
+   * no-ops). `onV2Transfer` feeds each decoded incoming transfer into the consumer's
+   * existing receive path; `onDelivered(entryId)` fires ONLY on a verified delivery
+   * receipt — it is what licenses the consumer to GC its pending-delivery journal.
+   */
+  setSinks?(sinks: {
+    onV2Transfer?: (payload: import('../../types/v2-transfer').V2TransferPayload, senderPubkey: string) => Promise<void>;
+    onDelivered?: (entryId: string) => Promise<void>;
+  }): void;
+  /** Poll for sender-side delivery confirmations (fires `onDelivered` on a valid ack). */
+  pollSent?(): Promise<void>;
+  /** Re-fire any journaled, unacked received deliveries (crash recovery). */
+  replayAckPending?(): Promise<void>;
 }
 
 // =============================================================================

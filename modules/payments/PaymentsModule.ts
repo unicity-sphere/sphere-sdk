@@ -44,6 +44,7 @@ import type {
   IncomingPaymentRequest as TransportPaymentRequest,
   IncomingPaymentRequestResponse as TransportPaymentRequestResponse,
 } from '../../transport';
+import type { TokenDeliveryTransport, TokenEnvelope } from '../../transport/courier/types';
 import type { OracleProvider } from '../../oracle';
 import type { PriceProvider } from '../../price';
 import type {
@@ -116,6 +117,20 @@ interface PendingV2Delivery {
   tokenBlob: string;
   memo?: string;
   createdAt: number;
+  /**
+   * The channel this blob was delivered over. `'courier'` entries are GC'd ONLY on a
+   * valid-ackSig `onDelivered(entryId)` and re-deposited (not Nostr-sent) on replay;
+   * `'nostr'` / undefined (legacy) entries are removed right after a successful send
+   * and replayed over Nostr — preserving today's behavior.
+   */
+  transport?: 'courier' | 'nostr';
+  /**
+   * The courier entryId for this delivery (present only on `transport: 'courier'`).
+   * `onDelivered(entryId)` resolves the blob to GC via this mapping.
+   */
+  entryId?: string;
+  /** Recipient compressed chain pubkey — the courier address (courier entries only). */
+  recipientChainPubkey?: string;
 }
 
 // =============================================================================
@@ -604,6 +619,15 @@ export interface PaymentsModuleDependencies {
   /** Multiple token storage providers (e.g., IPFS, MongoDB, file) */
   tokenStorageProviders?: Map<string, TokenStorageProvider<TxfStorageDataBase>>;
   transport: TransportProvider;
+  /**
+   * Optional v2 token-delivery transport (the courier). ADDITIVE + flag-gated: when
+   * present, finished v2 token blobs are DEPOSITED over this channel (courier-primary,
+   * with a Nostr fallback on deposit failure); when absent, delivery is Nostr-only —
+   * byte-identical to today. Resolution stays on Nostr (`transport.resolve`); the
+   * courier only consumes the already-resolved recipient chainPubkey. Its sinks
+   * (incoming feed + delivery-confirmed GC) are bound to this module in `initialize()`.
+   */
+  deliveryTransport?: TokenDeliveryTransport;
   oracle: OracleProvider;
   /**
    * Token engine (v2). Optional during migration (path B): when provided, value
@@ -826,6 +850,15 @@ export class PaymentsModule {
       this.handleIncomingTransfer(transfer)
     );
 
+    // Bind the courier (TokenDeliveryTransport) sinks to THIS module, so a
+    // courier-received transfer flows through the SAME handleV2Transfer path (dedup +
+    // verify + isOwnedBy) and a confirmed delivery GCs PENDING_V2_DELIVERIES. The
+    // courier is ADDITIVE — when absent, nothing here runs (Nostr-only, default OFF).
+    deps.deliveryTransport?.setSinks?.({
+      onV2Transfer: (payload, senderPubkey) => this.handleV2Transfer(payload, senderPubkey),
+      onDelivered: (entryId) => this.removePendingV2DeliveryByEntryId(entryId),
+    });
+
     // Subscribe to incoming payment requests (if supported)
     if (deps.transport.onPaymentRequest) {
       this.unsubscribePaymentRequests = deps.transport.onPaymentRequest((request) => {
@@ -1005,6 +1038,26 @@ export class PaymentsModule {
     // (fire-and-forget; failures are kept journaled for the next load).
     void this.replayPendingV2Deliveries().catch((err) =>
       logger.warn('Payments', 'Pending v2 delivery replay failed:', err));
+
+    // Drive the courier's store-and-forward loops once per load (additive; a no-op
+    // when no deliveryTransport is configured): pull the inbox, reconcile sender-side
+    // delivery confirmations, and re-fire any crash-interrupted acks.
+    this.runCourierLoops('load');
+  }
+
+  /**
+   * Kick the courier's receive / poll / ack-replay loops fire-and-forget. Each is
+   * optional on the {@link TokenDeliveryTransport}; a missing method (or a missing
+   * transport entirely) is simply skipped, so the Nostr-only path is unaffected.
+   */
+  private runCourierLoops(context: 'load' | 'receive'): void {
+    const courier = this.deps?.deliveryTransport;
+    if (!courier) return;
+    const warn = (op: string) => (err: unknown) =>
+      logger.warn('Payments', `Courier ${op} (${context}) failed:`, err);
+    void courier.receive?.().catch(warn('receive'));
+    void courier.pollSent?.().catch(warn('pollSent'));
+    void courier.replayAckPending?.().catch(warn('replayAckPending'));
   }
 
   /**
@@ -1202,16 +1255,6 @@ export class PaymentsModule {
         // parseInvoiceMemoForOnChain already produced the encoded bytes (or null).
         const memoData = onChainMessage ?? undefined;
 
-        // Deliver a journaled finished-token blob as a V2_TRANSFER payload.
-        const deliverBlob = async (tokenBlob: string): Promise<void> => {
-          await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
-            type: 'V2_TRANSFER',
-            version: '2.0',
-            tokenBlob,
-            memo: request.memo,
-          } as unknown as import('../../transport').TokenTransferPayload);
-        };
-
         // Whole-token direct transfers.
         for (const tw of splitPlan.tokensToTransferDirectly) {
           const finished = await engine.transfer(
@@ -1224,18 +1267,15 @@ export class PaymentsModule {
           );
           // The source state is spent on-chain from here on.
           committedOnChainTokenIds.add(tw.uiToken.id);
-          // Journal the finished blob BEFORE delivery: a transport failure or a
-          // crash must not lose the recipient's token (replayed on next load()).
+          // Journal-first then deliver (courier-primary, Nostr fallback): a transport
+          // failure or crash must not lose the recipient's token (replayed on load()).
           const tokenBlob = bytesToHex(encodeTokenBlob(engine.encodeToken(finished)));
-          await this.savePendingV2Delivery({
+          await this.deliverFinishedBlob(tokenBlob, {
             transferId: result.id,
             recipientPubkey,
-            tokenBlob,
+            recipientChainPubkey: peerInfo.chainPubkey,
             memo: request.memo,
-            createdAt: Date.now(),
           });
-          await deliverBlob(tokenBlob);
-          await this.removePendingV2Delivery(tokenBlob);
           result.tokenTransfers.push({ sourceTokenId: tw.uiToken.id, method: 'direct' });
           await this.removeToken(tw.uiToken.id, result.id);
         }
@@ -1261,17 +1301,14 @@ export class PaymentsModule {
           // the transport succeeding.
           committedOnChainTokenIds.add(splitPlan.tokenToSplit.uiToken.id);
           const recipientBlob = bytesToHex(encodeTokenBlob(engine.encodeToken(outputs[0])));
-          await this.savePendingV2Delivery({
+          await this.storeEngineToken(engine, outputs[1]); // change token, confirmed (BEFORE delivery)
+
+          await this.deliverFinishedBlob(recipientBlob, {
             transferId: result.id,
             recipientPubkey,
-            tokenBlob: recipientBlob,
+            recipientChainPubkey: peerInfo.chainPubkey,
             memo: request.memo,
-            createdAt: Date.now(),
           });
-          await this.storeEngineToken(engine, outputs[1]); // change token, confirmed
-
-          await deliverBlob(recipientBlob);
-          await this.removePendingV2Delivery(recipientBlob);
 
           result.tokenTransfers.push({ sourceTokenId: splitPlan.tokenToSplit.uiToken.id, method: 'split' });
           await this.removeToken(splitPlan.tokenToSplit.uiToken.id, result.id);
@@ -1896,6 +1933,11 @@ export class PaymentsModule {
     // with await. Event dedup in the transport layer prevents double-processing
     // with the persistent subscription.
     await this.deps!.transport.fetchPendingEvents();
+
+    // Also pull the courier inbox (store-and-forward) so an explicit receive() sees
+    // courier-delivered transfers too. Awaited here (unlike load()'s fire-and-forget)
+    // so the reload below captures them; a no-op without a deliveryTransport.
+    await this.deps!.deliveryTransport?.receive?.();
 
     // Reload from storage to get a clean, consistent state.
     // Handlers save tokens during processing (with potentially different IDs for
@@ -3618,10 +3660,107 @@ export class PaymentsModule {
   }
 
   /**
-   * Replay journaled finished-but-undelivered v2 blobs (kicked fire-and-forget
-   * from load()). The recipient dedups re-deliveries by the genesis-stable
-   * token id, so replaying an already-delivered blob is harmless. Entries that
-   * still fail to send are kept for the next load.
+   * GC a courier delivery by its courier `entryId` (the entryId↔blob mapping, concern
+   * 5). Bound to the courier's `onDelivered` sink: it fires ONLY after the courier has
+   * verified a valid recipient ackSig, so this is the ONLY thing that removes a
+   * `transport: 'courier'` journal entry. Idempotent — an unknown / already-removed
+   * entryId is a no-op (a double-fired or stale onDelivered never corrupts the journal).
+   */
+  private async removePendingV2DeliveryByEntryId(entryId: string): Promise<void> {
+    const all = await this.loadPendingV2Deliveries();
+    const filtered = all.filter((e) => e.entryId !== entryId);
+    if (filtered.length !== all.length) {
+      await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V2_DELIVERIES, JSON.stringify(filtered));
+    }
+  }
+
+  /**
+   * Deliver ONE finished v2 token blob, journal-first (DESIGN: never lose a token).
+   *
+   * COEXIST POLICY (concern 4): when a `deliveryTransport` (courier) is configured it is
+   * PRIMARY — the blob is journaled tagged `'courier'` (with the courier entryId folded
+   * in) and deposited; the journal entry is then removed ONLY by a valid-ackSig
+   * `onDelivered` (NOT here). A courier `deposit()` FAILURE falls back to Nostr (no lost
+   * delivery), removing the journal entry after the send (today's behavior). With no
+   * courier, delivery is Nostr-only, byte-identical to today. Resolution stayed on Nostr;
+   * the courier only consumes the already-resolved `recipientChainPubkey`.
+   */
+  private async deliverFinishedBlob(
+    tokenBlob: string,
+    meta: { transferId: string; recipientPubkey: string; recipientChainPubkey: string; memo?: string },
+  ): Promise<void> {
+    const courier = this.deps!.deliveryTransport;
+    if (courier) {
+      try {
+        await this.depositToCourier(courier, tokenBlob, meta);
+        return; // journaled 'courier'; GC deferred to onDelivered (valid ackSig)
+      } catch (err) {
+        logger.warn('Payments', 'Courier deposit failed — falling back to Nostr delivery:', err);
+      }
+    }
+    // Nostr path (primary when no courier, or the courier-deposit fallback).
+    await this.savePendingV2Delivery({
+      transferId: meta.transferId, recipientPubkey: meta.recipientPubkey,
+      tokenBlob, memo: meta.memo, createdAt: Date.now(), transport: 'nostr',
+    });
+    await this.sendBlobOverNostr(meta.recipientPubkey, tokenBlob, meta.memo);
+    await this.removePendingV2Delivery(tokenBlob);
+  }
+
+  /**
+   * Journal the blob tagged `'courier'` THEN deposit it. Journal-first so a crash
+   * between the journal and the deposit still has the entry to replay; the courier
+   * deposit is idempotent (server dedups on entryId). The returned `entryId` is folded
+   * onto the journal entry so `onDelivered(entryId)` can later resolve the blob to GC.
+   */
+  private async depositToCourier(
+    courier: TokenDeliveryTransport,
+    tokenBlob: string,
+    meta: { transferId: string; recipientPubkey: string; recipientChainPubkey: string; memo?: string },
+  ): Promise<void> {
+    const envelope: TokenEnvelope = {
+      recipientChainPubkey: meta.recipientChainPubkey,
+      senderChainPubkey: this.deps!.identity.chainPubkey,
+      transferId: meta.transferId,
+      tokenBlobHex: tokenBlob,
+      memo: meta.memo,
+    };
+    await this.savePendingV2Delivery({
+      transferId: meta.transferId, recipientPubkey: meta.recipientPubkey,
+      recipientChainPubkey: meta.recipientChainPubkey,
+      tokenBlob, memo: meta.memo, createdAt: Date.now(), transport: 'courier',
+    });
+    const handle = await courier.deposit(envelope);
+    await this.setPendingV2DeliveryEntryId(tokenBlob, handle.entryId);
+  }
+
+  /** Fold the courier `entryId` onto an already-journaled `'courier'` entry. */
+  private async setPendingV2DeliveryEntryId(tokenBlob: string, entryId: string): Promise<void> {
+    const all = await this.loadPendingV2Deliveries();
+    const entry = all.find((e) => e.tokenBlob === tokenBlob);
+    if (entry && entry.entryId !== entryId) {
+      entry.entryId = entryId;
+      await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V2_DELIVERIES, JSON.stringify(all));
+    }
+  }
+
+  /** Send one finished blob as a V2_TRANSFER over the Nostr transport. */
+  private async sendBlobOverNostr(recipientPubkey: string, tokenBlob: string, memo?: string): Promise<void> {
+    await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
+      type: 'V2_TRANSFER',
+      version: '2.0',
+      tokenBlob,
+      memo,
+    } as unknown as import('../../transport').TokenTransferPayload);
+  }
+
+  /**
+   * Replay journaled finished-but-undelivered v2 blobs (kicked fire-and-forget from
+   * load()). ROUTING (concern 4): a `'courier'` entry is RE-DEPOSITED over the courier
+   * (idempotent on entryId; GC stays deferred to onDelivered — NOT removed here), while
+   * a `'nostr'`/untagged (legacy) entry is re-sent over Nostr and removed on success.
+   * The recipient dedups re-deliveries by the genesis-stable token id, so replaying an
+   * already-delivered blob is harmless. Entries that still fail are kept for next load.
    */
   private async replayPendingV2Deliveries(): Promise<void> {
     const entries = await this.loadPendingV2Deliveries();
@@ -3629,18 +3768,33 @@ export class PaymentsModule {
     logger.warn('Payments', `${entries.length} undelivered v2 transfer(s) journaled from a previous session — replaying`);
     for (const e of entries) {
       try {
-        await this.deps!.transport.sendTokenTransfer(e.recipientPubkey, {
-          type: 'V2_TRANSFER',
-          version: '2.0',
-          tokenBlob: e.tokenBlob,
-          memo: e.memo,
-        } as unknown as import('../../transport').TokenTransferPayload);
-        await this.removePendingV2Delivery(e.tokenBlob);
-        logger.debug('Payments', `Replayed undelivered v2 transfer ${e.transferId.slice(0, 8)}...`);
+        await this.replayOneDelivery(e);
       } catch (err) {
         logger.warn('Payments', `Replay of undelivered v2 transfer ${e.transferId.slice(0, 8)}... failed (kept for next load):`, err);
       }
     }
+  }
+
+  /** Replay one journaled delivery over its tagged channel (courier re-deposit / Nostr). */
+  private async replayOneDelivery(e: PendingV2Delivery): Promise<void> {
+    const courier = this.deps!.deliveryTransport;
+    if (e.transport === 'courier' && courier && e.recipientChainPubkey) {
+      // Re-deposit; GC stays deferred to a valid-ackSig onDelivered (do NOT remove here).
+      const handle = await courier.deposit({
+        recipientChainPubkey: e.recipientChainPubkey,
+        senderChainPubkey: this.deps!.identity.chainPubkey,
+        transferId: e.transferId,
+        tokenBlobHex: e.tokenBlob,
+        memo: e.memo,
+      });
+      await this.setPendingV2DeliveryEntryId(e.tokenBlob, handle.entryId);
+      logger.debug('Payments', `Re-deposited undelivered courier transfer ${e.transferId.slice(0, 8)}...`);
+      return;
+    }
+    // Nostr / legacy entry: re-send and GC after success (today's behavior).
+    await this.sendBlobOverNostr(e.recipientPubkey, e.tokenBlob, e.memo);
+    await this.removePendingV2Delivery(e.tokenBlob);
+    logger.debug('Payments', `Replayed undelivered v2 transfer ${e.transferId.slice(0, 8)}...`);
   }
 
   private async createStorageData(): Promise<TxfStorageDataBase> {
