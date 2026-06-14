@@ -261,6 +261,16 @@ describe('Sphere.init vault + courier — in-process token-api', () => {
     const balBefore = sphere.payments.getBalance(COIN);
     expect(balBefore[0]?.totalAmount).toBe('1234');
 
+    // Capture the minted token's genesis id + its flushed UI record. The reload must
+    // restore THIS token byte-identical from the vault — a real backup is lossless.
+    // The stored UI record's id is `v2_<genesis tokenId>` (PaymentsModule.mintV2) and
+    // its vault/TXF storage key is `_<genesis tokenId>` (keyFromTokenId(v2TokenId)).
+    const mintedTokenId = mint.tokenId!;
+    const storedTokenId = `v2_${mintedTokenId}`;
+    const storageKey = `_${mintedTokenId}` as `_${string}`;
+    const mintedTokenBefore = sphere.payments.getTokens({ coinId: COIN }).find((t) => t.id === storedTokenId);
+    expect(mintedTokenBefore).toBeDefined();
+
     // FLUSH: sync() drives provider.sync(localData) on the vault → encrypted entries
     // + the reserved DIRECT-address slot land on the real server.
     await sphere.payments.sync();
@@ -298,14 +308,37 @@ describe('Sphere.init vault + courier — in-process token-api', () => {
     });
     expect(reloaded.created).toBe(false); // loaded, not created — same wallet recovered
 
-    // The fresh vault provider (cold internal state) reloaded purely from the server:
-    //  - the reserved DIRECT address round-trips BYTE-IDENTICAL (#17, XP-invariant);
-    //  - it re-discovered the backed-up server rows (token entry + reserved slot).
+    // The fresh vault provider (cold internal state) reloaded purely from the server.
+    // `load()` is idempotent (the rehydration map persists across loads), so it
+    // returns the FULL token snapshot even though the provider already self-loaded
+    // during init — the reserved DIRECT address (#17) + every backed-up token entry.
     const vault = (reloaded.sphere.payments as any).getTokenStorageProviders().get('remote-token-storage');
     const loaded = await vault.load();
     expect(loaded.success).toBe(true);
-    expect((loaded.data as TxfStorageDataBase)._meta.address).toBe(reservedDirect);
+    const reloadedData = loaded.data as TxfStorageDataBase;
+    expect(reloadedData._meta.address).toBe(reservedDirect); // XP-invariant DIRECT (#17)
     expect(vault.knownCount()).toBeGreaterThanOrEqual(2);
+
+    // REHYDRATION (Phase 7.2): the backed-up token entry is restored under its
+    // `_<tokenId>` key, byte-identical to the UI record that was flushed (round-trip
+    // equality — the engine re-imports the same blob). Before the fix `load()`
+    // returned only `_meta`/`_history`, so this key was ABSENT and balance was lost.
+    const tokenKeys = Object.keys(reloadedData).filter(
+      (k) => k.startsWith('_') && !['_meta', '_tombstones', '_outbox', '_sent', '_invalid', '_history'].includes(k),
+    );
+    expect(tokenKeys).toContain(storageKey);
+    const restoredRecord = reloadedData[storageKey];
+    expect(restoredRecord).toEqual(mintedTokenBefore); // lossless: byte-identical UI record
+
+    // END-TO-END MONEY PROOF: a full PaymentsModule.load() consumes the vault
+    // provider (cold local store returns nothing), parses the rehydrated `_<tokenId>`
+    // entry and restores the wallet's BALANCE — not just server rows + the address.
+    // This is the real token backup: balance survives a wipe to a fresh device.
+    await reloaded.sphere.payments.load();
+    const restoredBalance = reloaded.sphere.payments.getBalance(COIN);
+    expect(restoredBalance[0]?.totalAmount).toBe('1234'); // the backed-up token's value
+    const restoredTokens = reloaded.sphere.payments.getTokens({ coinId: COIN });
+    expect(restoredTokens.some((t) => t.id === storedTokenId)).toBe(true); // the exact token
 
     await reloaded.sphere.destroy();
   }, 120_000);
