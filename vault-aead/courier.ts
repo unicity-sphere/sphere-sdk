@@ -53,7 +53,12 @@ export function unpackCourier(b64: string): PackedCourier {
   return { nonce: bytes.slice(0, 24), ct: bytes.slice(24) };
 }
 
-/** Build the AAD that binds a courier envelope. */
+/**
+ * Build the AAD that binds a courier envelope. `network` is the FIRST field, so it
+ * is what provides cross-network isolation: the courier AEAD KEY deliberately omits
+ * network (see `deriveCourierKey`), and the AAD binds it instead — a `testnet2`
+ * envelope cannot be opened under a `mainnet` AAD (finding courier-key-omits-network).
+ */
 function courierAad(p: { network: string; senderPubkey: string; recipientPubkey: string; entryId: string }): Uint8Array {
   return lengthDelim([p.network, p.senderPubkey, p.recipientPubkey, p.entryId]);
 }
