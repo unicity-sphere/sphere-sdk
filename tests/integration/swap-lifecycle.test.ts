@@ -26,10 +26,13 @@ import {
   createMockAccountingModule,
   createMockStorageProvider,
   createMockPaymentsModule,
+  createMockOracleProvider,
   type MockAccountingModule,
   type MockStorageProvider,
   type MockPaymentsModule,
+  type MockOracleProvider,
 } from '../unit/modules/swap-test-helpers.js';
+import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token';
 
 // =============================================================================
 // Constants
@@ -361,6 +364,7 @@ interface IntegrationParty {
   accounting: MockAccountingModule;
   storage: MockStorageProvider;
   payments: MockPaymentsModule;
+  oracle: MockOracleProvider;
   events: Array<[string, unknown]>;
 }
 
@@ -422,6 +426,7 @@ function createParty(
   const accounting = createMockAccountingModule();
   const storage = createMockStorageProvider();
   const payments = createMockPaymentsModule();
+  const oracle = createMockOracleProvider();
   const events: Array<[string, unknown]> = [];
 
   const emitEvent = vi.fn().mockImplementation((type: string, data: unknown) => {
@@ -479,6 +484,7 @@ function createParty(
   const deps: SwapModuleDependencies = {
     accounting,
     payments,
+    oracle,
     communications,
     storage,
     identity,
@@ -489,7 +495,7 @@ function createParty(
 
   module.initialize(deps);
 
-  return { module, identity, accounting, storage, payments, events };
+  return { module, identity, accounting, storage, payments, oracle, events };
 }
 
 function createSwapTestPair(): SwapTestContext {
@@ -604,6 +610,34 @@ function configureAccountingForDeposit(
   });
 }
 
+/**
+ * Stub SdkToken.fromJSON to return a verify-success token so the new
+ * issue-#535 per-payout-token verification path (added in PR #536) reaches
+ * the `ok` branch in these mock-driven integration tests. Tracks whether
+ * the spy has been installed for this test run so calling
+ * `configureAccountingForPayout` multiple times in the same `it` (e.g.
+ * once for party A, once for party B) doesn't re-stub redundantly.
+ *
+ * Real SDK crypto verification is exercised by tests that wire
+ * @unicitylabs/state-transition-sdk against real tokens — out of scope
+ * for these state-machine + DM integration tests.
+ */
+let __sdkTokenStubInstalled = false;
+function installSdkTokenStub(): void {
+  if (__sdkTokenStubInstalled) return;
+  __sdkTokenStubInstalled = true;
+  vi.spyOn(SdkToken, 'fromJSON').mockImplementation(async (_input: unknown) => {
+    return {
+      verify: async () => ({ isSuccessful: true }),
+      state: {
+        calculateHash: async () => ({ toJSON: () => 'stub-state-hash' }),
+        predicate: null,
+      },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any;
+  });
+}
+
 function configureAccountingForPayout(
   party: IntegrationParty,
   _swapId: string,
@@ -612,6 +646,52 @@ function configureAccountingForPayout(
   currency: string,
   amount: string,
 ): void {
+  // Wire the new issue-#535 deps (PR #536) so verifyPayout's per-token
+  // checks reach the `ok` branch in mock-driven integration tests:
+  //
+  //   - accounting.getTokenIdsForInvoice — non-empty Set keyed by this invoice
+  //   - payments.getToken                 — returns a Token with stub sdkData
+  //                                         (finalized: genesis carries an
+  //                                         inclusionProof; verify is stubbed
+  //                                         to succeed via SdkToken.fromJSON
+  //                                         spy installed lazily)
+  //   - oracle.isSpent                    — false (not spent)
+  //   - oracle.getRootTrustBase           — non-null sentinel
+  //
+  // The defaults from `createMock{Oracle,Payments,Accounting}Provider`
+  // already return non-null trustBase and isSpent=false; we only need
+  // to override the per-invoice mappings here.
+  const stubPayoutTokenId = `stub-payout-token-${payoutInvoiceId}`;
+  const stubSdkData = JSON.stringify({
+    state: { predicate: 'stub-predicate' },
+    genesis: { inclusionProof: { __mock_proof: 1 } },
+    transactions: [],
+    nametags: [],
+  });
+  const stubToken: Token = {
+    id: stubPayoutTokenId,
+    coinId: currency,
+    symbol: currency,
+    name: currency,
+    decimals: 6,
+    amount,
+    status: 'confirmed',
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    sdkData: stubSdkData,
+  };
+  const prevGetTokenIds = party.accounting.getTokenIdsForInvoice.getMockImplementation();
+  party.accounting.getTokenIdsForInvoice.mockImplementation((invoiceId: string): Set<string> => {
+    if (invoiceId === payoutInvoiceId) return new Set([stubPayoutTokenId]);
+    return prevGetTokenIds ? prevGetTokenIds(invoiceId) : new Set();
+  });
+  const prevGetToken = party.payments.getToken.getMockImplementation();
+  party.payments.getToken.mockImplementation((id: string): Token | undefined => {
+    if (id === stubPayoutTokenId) return stubToken;
+    return prevGetToken ? prevGetToken(id) : undefined;
+  });
+  installSdkTokenStub();
+
   // Store payout invoice lookup as a separate function so the deposit mock
   // can delegate to it without circular chaining issues.
   const payoutInvoices: Map<string, unknown> = (party.accounting as any)._payoutInvoices ?? new Map();
@@ -686,6 +766,12 @@ describe('Swap Lifecycle Integration Tests', () => {
   afterEach(async () => {
     await ctx.partyA.module.destroy();
     await ctx.partyB.module.destroy();
+    // Tear down the SdkToken.fromJSON spy installed by
+    // `configureAccountingForPayout` so each test gets a fresh stub
+    // (and tests that never call configureAccountingForPayout see the
+    // real SdkToken implementation).
+    vi.restoreAllMocks();
+    __sdkTokenStubInstalled = false;
   });
 
   // ---------------------------------------------------------------------------

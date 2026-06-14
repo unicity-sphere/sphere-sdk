@@ -283,6 +283,7 @@ import {
 
 // SDK imports for token parsing and transfers
 import { PredicateEngineService } from '@unicitylabs/state-transition-sdk/lib/predicate/PredicateEngineService';
+import { extractCurrentStatePublicKeyHexFromSdkData } from './extract-state-publickey';
 import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token';
 import { CoinId } from '@unicitylabs/state-transition-sdk/lib/token/fungible/CoinId';
 import { TransferCommitment } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferCommitment';
@@ -774,67 +775,10 @@ function extractStateHashFromSdkData(sdkData: string | undefined): string {
   return parseSdkDataCached(sdkData).stateHash;
 }
 
-/**
- * Issue #245 #1 — extract the hex-encoded publicKey of the CURRENT
- * state's predicate from a token's TXF sdkData.
- *
- * Why: the canonical aggregator indexes commitments by
- * `requestId = SHA256(publicKey || stateHash)` where publicKey is
- * the OWNER of the source state being consumed. Callers that probe
- * `oracle.isSpent(publicKey, stateHash)` MUST pass the predicate's
- * actual publicKey — not the wallet's `chainPubkey` — otherwise the
- * derived requestId misses for tokens whose state.predicate was
- * constructed under a foreign or non-current key (sync race,
- * migration data, multi-address wallets where the worker runs
- * against address A while the token's predicate was constructed
- * under address B).
- *
- * Returns the hex-encoded publicKey, or `null` if the predicate
- * cannot be parsed. Callers SHOULD fall back to `chainPubkey` on
- * `null` so the probe still happens (preserves legacy behaviour for
- * wallet-owned tokens with non-parseable predicates).
- *
- * Best-effort and async — does one SDK Token parse + one
- * PredicateEngineService.createPredicate. Safe to call on the hot
- * path: each parse is bounded by a small cache (the SDK's internal
- * fromJSON caching) and the wrapper falls back to `chainPubkey` on
- * any throw.
- */
-async function extractCurrentStatePublicKeyHexFromSdkData(
-  sdkData: string | undefined,
-): Promise<string | null> {
-  if (!sdkData) return null;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(sdkData);
-  } catch {
-    return null;
-  }
-  let sdkTokenInstance;
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    sdkTokenInstance = await SdkToken.fromJSON(parsed as any);
-  } catch {
-    return null;
-  }
-  if (!sdkTokenInstance?.state?.predicate) return null;
-  let predicate;
-  try {
-    predicate = await PredicateEngineService.createPredicate(
-      sdkTokenInstance.state.predicate,
-    );
-  } catch {
-    return null;
-  }
-  // DefaultPredicate / MaskedPredicate / UnmaskedPredicate all expose
-  // `publicKey: Uint8Array`. The IPredicate interface doesn't declare
-  // it, so narrow via runtime check + cast (matches the recipe at
-  // `recoverStrandedReceivedTokens`, line ~8979).
-  const pubkey = (predicate as unknown as { publicKey?: Uint8Array })
-    .publicKey;
-  if (!(pubkey instanceof Uint8Array) || pubkey.length === 0) return null;
-  return bytesToHex(pubkey);
-}
+// Issue #245 #1 — `extractCurrentStatePublicKeyHexFromSdkData` was extracted
+// to `./extract-state-publickey.ts` (issue #535) so SwapModule.verifyPayout
+// can reuse the same logic without re-implementing predicate parsing.
+// Rationale + fall-back guidance: see that file's docstring.
 
 /**
  * Create composite key from tokenId and stateHash

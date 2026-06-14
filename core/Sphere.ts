@@ -4012,7 +4012,12 @@ export class Sphere {
             getTokenIdsForInvoice: (id: string) => acctForSwap.getTokenIdsForInvoice(id),
             on: onForSwap,
           },
-          payments: { validate: () => payments.validate() },
+          payments: { getToken: (id: string) => payments.getToken(id) },
+          oracle: {
+            isSpent: (pk: string, sh: string) => this._oracle.isSpent(pk, sh),
+            getRootTrustBase: () =>
+              (this._oracle as { getRootTrustBase?: () => unknown | null }).getRootTrustBase?.() ?? null,
+          },
           communications: {
             sendDM: async (recipientPubkey: string, content: string) => {
               const msg = await communications.sendDM(recipientPubkey, content);
@@ -7423,7 +7428,12 @@ export class Sphere {
             getTokenIdsForInvoice: (id: string) => acctForSwap.getTokenIdsForInvoice(id),
             on: onForSwap,
           },
-          payments: { validate: () => paymentsForSwap.validate() },
+          payments: { getToken: (id: string) => paymentsForSwap.getToken(id) },
+          oracle: {
+            isSpent: (pk: string, sh: string) => this._oracle.isSpent(pk, sh),
+            getRootTrustBase: () =>
+              (this._oracle as { getRootTrustBase?: () => unknown | null }).getRootTrustBase?.() ?? null,
+          },
           communications: {
             sendDM: async (recipientPubkey: string, content: string) => {
               const msg = await commsForSwap.sendDM(recipientPubkey, content);

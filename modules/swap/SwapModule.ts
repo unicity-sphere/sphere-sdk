@@ -50,6 +50,7 @@ import {
   sendRequestInvoice,
   withRetry,
 } from './escrow-client.js';
+import { verifyPayoutTokens } from './payout-verifier.js';
 import type { TransferResult } from '../../types/index.js';
 import { TokenRegistry } from '../../registry/index.js';
 import type {
@@ -2238,56 +2239,34 @@ export class SwapModule {
       }
     }
 
-    // Validate L3 inclusion proofs — but ONLY for tokens that cover this
-    // specific payout invoice. validate() checks the full wallet; any
-    // unrelated invalid token (e.g. a now-spent original UCT consumed by
-    // a split for some other operation, or an unrelated incoming transfer
-    // that hasn't finalized yet) would otherwise pin verifyPayout to false
-    // forever even when the payout itself is fully covered and valid.
-    //
-    // Multiple wallet tokens can share the same coinId (e.g. the original
-    // funded balance + the incoming payout); coinId-only filtering is too
-    // loose. Use accounting.getTokenIdsForInvoice() to get the exact set of
-    // tokens linked to THIS invoice and filter the invalid set to that.
-    const validationResult = await deps.payments.validate();
-    if (validationResult.invalid.length > 0) {
-      const payoutTokenIds = deps.accounting.getTokenIdsForInvoice(swap.payoutInvoiceId);
-
-      // SECURITY: fail-CLOSED when payoutTokenIds is empty AND there are
-      // invalid tokens we can't classify. An empty set means the reverse
-      // index (tokenInvoiceMap) hasn't been rebuilt yet OR the orphan-buffer
-      // hasn't been replayed for this invoice. We cannot determine relevance,
-      // so we cannot safely fall through to "verified". The next retry tick
-      // will pick up after the rebuild/replay completes.
-      if (payoutTokenIds.size === 0) {
-        logger.warn(
-          LOG_TAG,
-          `verifyPayout for ${swapId.slice(0, 12)}: ${validationResult.invalid.length} invalid token(s) but tokenInvoiceMap is empty for this payout invoice — failing closed until reverse index rebuilds`,
-        );
-        return returnFalse();
-      }
-
-      // Filter the validate-invalid set to tokens that are linked to THIS
-      // payout invoice via tokenInvoiceMap (populated by both
-      // _processTokenTransactions's on-chain path AND the synthetic /
-      // orphan-buffer paths after the round-1/2/3 fixes). Unrelated
-      // invalids — typically the now-spent original UCT consumed by an
-      // earlier deposit split, or unrelated incoming transfers in flight —
-      // must not block this swap's verification.
-      const relevantInvalid = validationResult.invalid.filter((t) =>
-        payoutTokenIds.has(t.id),
-      );
-      if (relevantInvalid.length > 0) {
-        logger.warn(
-          LOG_TAG,
-          `verifyPayout for ${swapId.slice(0, 12)}: L3 validation found ${relevantInvalid.length} invalid token(s) covering this payout invoice — retry after wallet sync`,
-        );
-        return returnFalse();
-      }
-      logger.debug(
+    // Issue #535 — verify the payout tokens directly using state-transition-sdk
+    // primitives (finalization → SdkToken.verify(trustBase) → oracle.isSpent),
+    // scoped to the tokens that actually back THIS payout invoice. Replaces
+    // the wallet-wide `payments.validate()` sweep that produced opaque retry
+    // hangs and could not distinguish "not finalized yet" from
+    // "cryptographically invalid" from "already spent". See
+    // `modules/swap/payout-verifier.ts` for the full rationale.
+    const payoutTokenIds = deps.accounting.getTokenIdsForInvoice(swap.payoutInvoiceId);
+    const verifyResult = await verifyPayoutTokens({
+      payoutTokenIds,
+      getToken: (id: string) => deps.payments.getToken(id),
+      trustBase: deps.oracle.getRootTrustBase(),
+      isSpent: (pk: string, sh: string) => deps.oracle.isSpent(pk, sh),
+      // Payouts are minted to OUR predicate, so the wallet's chainPubkey is
+      // the correct spent-probe target when extraction can't recover the
+      // predicate bytes from sdkData. Matches the wallet-owned fallback
+      // pattern in PaymentsModule's spent-state rescan worker.
+      fallbackPublicKey: deps.identity.chainPubkey,
+    });
+    if (verifyResult.kind === 'transient') {
+      logger.warn(
         LOG_TAG,
-        `verifyPayout for ${swapId.slice(0, 12)}: ${validationResult.invalid.length} unrelated invalid token(s) ignored (not linked to this payout invoice)`,
+        `verifyPayout for ${swapId.slice(0, 12)}: transient (${verifyResult.reason}) — will retry`,
       );
+      return returnFalse();
+    }
+    if (verifyResult.kind === 'terminal') {
+      return failPayout(verifyResult.reason);
     }
 
     // All checks passed — mark payout as verified.

@@ -792,11 +792,27 @@ export interface SwapModuleDependencies {
     on<T extends SphereEventType>(type: T, handler: (data: SphereEventMap[T]) => void): () => void;
   };
   /**
-   * PaymentsModule subset -- L3 token validation during payout verification.
+   * PaymentsModule subset — per-payout-token lookup for payout verification.
+   *
+   * Issue #535: dropped the `validate()` wallet-wide sweep in favour of
+   * a per-token `getToken(id)` + state-transition-sdk primitives. See
+   * `modules/swap/payout-verifier.ts` for the verification flow.
    */
   readonly payments: {
-    /** Validate all tokens against the aggregator */
-    validate(): Promise<{ valid: Token[]; invalid: Token[] }>;
+    /** Fetch a specific local Token (with `sdkData`) by ID. */
+    getToken(id: string): Token | undefined;
+  };
+  /**
+   * OracleProvider subset — used by `verifyPayout` to (a) probe the
+   * aggregator for already-spent payout-state (defense vs malicious
+   * escrow) and (b) fetch the bundled RootTrustBase for local
+   * cryptographic verification.
+   */
+  readonly oracle: {
+    /** Throws on RPC failure (never fail-open). */
+    isSpent(publicKey: string, stateHash: string): Promise<boolean>;
+    /** May return null when the oracle is configured with skipVerification. */
+    getRootTrustBase(): unknown | null;
   };
   /**
    * CommunicationsModule subset -- DM send/receive for peer and escrow messaging.
