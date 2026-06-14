@@ -58,6 +58,7 @@ import type {
 } from '../types';
 import { SphereError } from './errors';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../storage';
+import { createVaultTokenStorage } from '../storage/remote/factory';
 import type { TransportProvider, PeerInfo } from '../transport';
 import { MultiAddressTransportMux, AddressTransportAdapter } from '../transport/MultiAddressTransportMux';
 import type { OracleProvider } from '../oracle';
@@ -131,6 +132,12 @@ import type {
   LegacyFileType,
   DecryptionProgressCallback,
 } from '../serialization/types';
+
+/**
+ * Provider id of the remote vault token-storage provider (must match
+ * `RemoteTokenStorageProvider.id`) — used to register/look it up additively.
+ */
+const VAULT_PROVIDER_ID = 'remote-token-storage';
 
 // =============================================================================
 // Progress Callback
@@ -209,6 +216,8 @@ export interface SphereCreateOptions {
    * - false/undefined: no auto-discovery (default)
    */
   discoverAddresses?: boolean | DiscoverAddressesOptions;
+  /** Remote Token-Vault v2 backup/sync (additive, default OFF). */
+  vault?: VaultInitConfig;
   /** Enable debug logging (default: false) */
   debug?: boolean;
   /** Optional callback to report initialization progress steps */
@@ -254,6 +263,8 @@ export interface SphereLoadOptions {
    * - false/undefined: no auto-discovery (default)
    */
   discoverAddresses?: boolean | DiscoverAddressesOptions;
+  /** Remote Token-Vault v2 backup/sync (additive, default OFF). */
+  vault?: VaultInitConfig;
   /** Enable debug logging (default: false) */
   debug?: boolean;
   /** Optional callback to report initialization progress steps */
@@ -311,6 +322,8 @@ export interface SphereImportOptions {
    * - false/undefined: no auto-discovery (default)
    */
   discoverAddresses?: boolean | DiscoverAddressesOptions;
+  /** Remote Token-Vault v2 backup/sync (additive, default OFF). */
+  vault?: VaultInitConfig;
   /** Enable debug logging (default: false) */
   debug?: boolean;
   /** Optional callback to report initialization progress steps */
@@ -325,6 +338,24 @@ export interface L1Config {
   defaultFeeRate?: number;
   /** Enable vesting classification (default: true) */
   enableVesting?: boolean;
+}
+
+/**
+ * Token-Vault v2 (remote backup/sync) configuration. The vault is an ADDITIVE,
+ * operator-blind backup/sync token-storage provider — it never replaces the primary
+ * local IndexedDB/file token store. Construction is SDK-internal (the provider needs
+ * the raw spend key, which the app never has), so the app only flips this flag.
+ *
+ * Default OFF: when this is omitted or `enabled` is false, no vault provider is
+ * registered and existing wallets are completely unaffected.
+ */
+export interface VaultInitConfig {
+  /** Enable the remote vault as a backup/sync provider. Default OFF. */
+  enabled: boolean;
+  /** Override the vault base URL (defaults to `NETWORKS[network].vaultUrl`). */
+  url?: string;
+  /** Stable device id stamped into the vault auth session. */
+  deviceId?: string;
 }
 
 /** Options for unified init (auto-create or load) */
@@ -386,6 +417,8 @@ export interface SphereInitOptions {
   dmSince?: number;
   /** Communications module configuration. */
   communications?: CommunicationsModuleConfig;
+  /** Remote Token-Vault v2 backup/sync (additive, default OFF). */
+  vault?: VaultInitConfig;
   /** Enable debug logging (default: false) */
   debug?: boolean;
   /** Optional callback to report initialization progress steps */
@@ -509,6 +542,10 @@ export class Sphere {
   private _groupChatConfig: GroupChatModuleConfig | undefined;
   private _marketConfig: MarketModuleConfig | undefined;
   private _communicationsConfig: CommunicationsModuleConfig | undefined;
+  /** Network this wallet runs on — drives the vault URL/server-key resolution. */
+  private _network: NetworkType | undefined;
+  /** Remote Token-Vault v2 backup/sync config (additive, default OFF). */
+  private _vaultConfig: VaultInitConfig | undefined;
 
   // Events
   private eventHandlers: Map<SphereEventType, Set<SphereEventHandler<SphereEventType>>> = new Map();
@@ -534,6 +571,8 @@ export class Sphere {
     accountingConfig?: AccountingModuleConfig,
     swapConfig?: SwapModuleConfig,
     communicationsConfig?: CommunicationsModuleConfig,
+    network?: NetworkType,
+    vaultConfig?: VaultInitConfig,
   ) {
     this._storage = storage;
     this._transport = transport;
@@ -550,6 +589,8 @@ export class Sphere {
     this._groupChatConfig = groupChatConfig;
     this._marketConfig = marketConfig;
     this._communicationsConfig = communicationsConfig;
+    this._network = network;
+    this._vaultConfig = vaultConfig;
 
     this._payments = createPaymentsModule({ l1: l1Config });
     this._communications = createCommunicationsModule(communicationsConfig);
@@ -654,6 +695,7 @@ export class Sphere {
         swap,
         password: options.password,
         discoverAddresses: options.discoverAddresses,
+        vault: options.vault,
         onProgress: options.onProgress,
       });
       // Store dmSince for forwarding to transport/mux when subscriptions are set up
@@ -697,6 +739,7 @@ export class Sphere {
       swap,
       password: options.password,
       discoverAddresses: options.discoverAddresses,
+      vault: options.vault,
       onProgress: options.onProgress,
     });
 
@@ -842,6 +885,8 @@ export class Sphere {
       accountingConfig,
       swapConfig,
       options.communications,
+      options.network,
+      options.vault,
     );
     sphere._password = options.password ?? null;
 
@@ -943,6 +988,8 @@ export class Sphere {
       accountingConfig,
       swapConfig,
       options.communications,
+      options.network,
+      options.vault,
     );
     sphere._password = options.password ?? null;
 
@@ -1047,6 +1094,8 @@ export class Sphere {
       accountingConfig,
       swapConfig,
       options.communications,
+      options.network,
+      options.vault,
     );
     sphere._password = options.password ?? null;
 
@@ -4162,9 +4211,41 @@ export class Sphere {
   // Private: Provider & Module Initialization
   // ===========================================================================
 
+  /**
+   * Build + register the remote vault token-storage provider when the init flag is
+   * on (default OFF — a no-op otherwise, so existing wallets are unaffected).
+   *
+   * The vault is ADDITIVE: it joins `_tokenStorageProviders` alongside the primary
+   * local store, never replacing it. Construction is SDK-internal via the factory
+   * because the provider needs the raw spend key (only `_identity` carries it). The
+   * provider is added to the map but NOT yet identity-set/initialized — the caller's
+   * existing setIdentity/initialize loop does that, so the vault takes the SAME path
+   * as every other provider. A duplicate (already-registered) id is skipped.
+   */
+  private maybeRegisterVaultProvider(): void {
+    if (!this._vaultConfig?.enabled) return;
+    if (this._tokenStorageProviders.has(VAULT_PROVIDER_ID)) return;
+    if (!this._identity || !this._network) return;
+    const provider = createVaultTokenStorage({
+      identity: this._identity,
+      network: this._network,
+      storage: this._storage,
+      vaultUrl: this._vaultConfig.url,
+      deviceId: this._vaultConfig.deviceId,
+    });
+    this._tokenStorageProviders.set(provider.id, provider);
+  }
+
   private async initializeProviders(): Promise<void> {
     // Set identity on providers
     this._storage.setIdentity(this._identity!);
+
+    // Register the remote vault as an ADDITIVE backup/sync provider when enabled.
+    // Built here (not in app code) because the provider needs the raw spend key,
+    // which only the in-scope FullIdentity carries. Added to the map BEFORE the
+    // setIdentity/initialize loop below so it flows through the SAME path as every
+    // other token storage provider (and is picked up by initializeModules).
+    this.maybeRegisterVaultProvider();
 
     // Provide fallback 'since' for existing wallets so Nostr subscriptions
     // pick up events sent while this address was inactive.
