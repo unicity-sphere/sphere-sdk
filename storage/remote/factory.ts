@@ -24,6 +24,43 @@ import { RemoteTokenStorageProvider } from './RemoteTokenStorageProvider';
 import { StorageBaselineStore } from './local-baseline-store';
 import { createVaultAuthClient, createVaultHttpClients } from './http/index';
 import type { FetchLike } from './http/index';
+import type { VaultSessionStore } from './VaultApiClient';
+
+/** Storage key prefix for the persisted vault auth session (per network + owner). */
+const SESSION_KEY_PREFIX = 'sphere_vault_session';
+
+/**
+ * A durable {@link VaultSessionStore} over the wallet's KV storage so the JWT +
+ * refresh token survive a page reload (the sphere-api pattern) — without it every
+ * reload re-authenticates and flashes `Unauthorized`. Scoped by network + owner so
+ * two wallets/networks never share a session row. A corrupt/blank value reads as
+ * `null` (→ a clean re-authenticate), so a bad token never wedges the client.
+ */
+function createSessionStore(
+  storage: Pick<StorageProvider, 'get' | 'set'>,
+  network: string,
+  chainPubkey: string,
+): VaultSessionStore {
+  const key = `${SESSION_KEY_PREFIX}:${network}:${chainPubkey}`;
+  return {
+    async load() {
+      const raw = await storage.get(key);
+      if (!raw) return null;
+      try {
+        const p = JSON.parse(raw) as { jwt?: string; refreshToken?: string };
+        return p.jwt && p.refreshToken ? { jwt: p.jwt, refreshToken: p.refreshToken } : null;
+      } catch {
+        return null;
+      }
+    },
+    async save(tokens) {
+      await storage.set(key, JSON.stringify(tokens));
+    },
+    async clear() {
+      await storage.set(key, '');
+    },
+  };
+}
 
 /** Inputs for {@link createVaultTokenStorage} — only the identity carries the key. */
 export interface CreateVaultTokenStorageConfig {
@@ -55,6 +92,7 @@ export function createVaultTokenStorage(
 
   const authClient = createVaultAuthClient(vaultUrl, fetchImpl);
   const localBaseline = new StorageBaselineStore(storage, network, identity.chainPubkey);
+  const sessionStore = createSessionStore(storage, network, identity.chainPubkey);
 
   // The data client must share the provider's OWN auth session (`authTokenSource()`),
   // but the provider does not exist yet — capture a mutable ref and resolve it LAZILY
@@ -76,6 +114,7 @@ export function createVaultTokenStorage(
     vaultServerKey,
     deviceId,
     localBaseline,
+    sessionStore,
   });
   ref.provider = provider;
   return provider;
