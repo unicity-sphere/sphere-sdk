@@ -57,6 +57,7 @@ export type {
   SphereInitResult,
   SphereImportOptions,
   VaultInitConfig,
+  CourierInitConfig,
   InitProgressStep,
   InitProgress,
   InitProgressCallback,
