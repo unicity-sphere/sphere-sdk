@@ -150,5 +150,11 @@ describe('vault per-address rebuild on switchToAddress', () => {
     expect(socket.vault.getEntry(id1, wk1)).toBeDefined();
     // Nothing was ever written under address-0's owner by the address-1 flush.
     expect(socket.vault.getEntry(id0, wk1)).toBeUndefined();
+
+    // A per-address restore keys `_meta.address` on the NEW chainPubkey — v2 identity,
+    // never a DIRECT:// address (the vault stores none).
+    const loaded = await vault1.load();
+    expect(loaded.success).toBe(true);
+    expect((loaded.data as TxfStorageDataBase)._meta.address).toBe(id1);
   });
 });

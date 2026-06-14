@@ -60,10 +60,10 @@ describe('paginated state load', () => {
     server.calls.state.length = 0; // count only the reader's pages
     await reader.initialize();
 
-    // 5 tokens + 1 reserved-address entry = 6 rows / pageLimit 2 → since 0,2,4 → 3 pages.
+    // 5 token rows / pageLimit 2 → since 0,2,4 → 3 pages (no reserved-address slot).
     expect(server.calls.state).toEqual([0, 2, 4]);
-    // The reader adopted all 6 rows (5 tokens + the reserved-address slot, Task 7.2).
-    expect(reader.knownCount()).toBe(6);
+    // The reader adopted all 5 token rows (no reserved-address slot — v2 identity).
+    expect(reader.knownCount()).toBe(5);
     expect(reader.isInitialLoadDone()).toBe(true);
   });
 

@@ -11,8 +11,8 @@
  * WHAT IS REAL vs SEAMED
  *  - REAL: the token-api (vault CAS + courier store-and-forward + JWT auth), all
  *    HTTP over real fetch; the WHOLE Sphere.init create/load path; the
- *    PaymentsModule send/receive/sync/GC logic; the vault reserved-address
- *    (XP-invariant DIRECT) round-trip.
+ *    PaymentsModule send/receive/sync/GC logic; the vault token-entry + chainPubkey
+ *    `_meta.address` round-trip.
  *  - SEAMED (the smallest faithful seam): the L3 *token engine*. A live engine needs
  *    the testnet2 gateway + a funded wallet, which an in-process e2e cannot stand up
  *    deterministically. So `createSphereTokenEngine` is mocked to return the
@@ -27,8 +27,8 @@
  *  1. VAULT backup + reload: wallet A mints a token, `sphere.payments.sync()` flushes
  *     encrypted entries to the vault (the registered RemoteTokenStorageProvider).
  *     A FRESH `Sphere.load` of the SAME identity (cold local token store) restores
- *     the token FROM the vault and restores `_meta.address` to the XP-invariant
- *     DIRECT address (the vault's reserved-address slot).
+ *     the token FROM the vault and restores `_meta.address` to the wallet's
+ *     chainPubkey (v2 identity — the vault stores NO DIRECT:// address).
  *  2. COURIER A→B: A `send()`s to B's chainPubkey; the finished blob is DEPOSITED
  *     over the courier (token-api inbox count rises). B `receive()` pulls it, the
  *     bound `handleV2Transfer` verifies + stores it (B's balance reflects it) and
@@ -62,7 +62,6 @@ vi.mock('../../token-engine', async (importActual) => {
 
 import { Sphere } from '../../core/Sphere';
 import { TokenRegistry } from '../../registry';
-import { deriveDirectAddress } from '../../token-engine/identity';
 import { bootTokenApi, type BootedTokenApi } from './support/token-api-boot';
 import { STORAGE_KEYS_ADDRESS, STORAGE_KEYS_GLOBAL } from '../../constants';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../storage';
@@ -225,7 +224,7 @@ afterEach(() => {
 });
 
 describe('Sphere.init vault + courier — in-process token-api', () => {
-  it('vault: mint → sync flushes to the vault → a fresh Sphere.load restores from it (XP-invariant address)', async () => {
+  it('vault: mint → sync flushes to the vault → a fresh Sphere.load restores from it (chainPubkey address)', async () => {
     const storage = makeStorage();
     const oracle = makeOracle();
     const localTokens = makeLocalTokenStore();
@@ -246,10 +245,10 @@ describe('Sphere.init vault + courier — in-process token-api', () => {
 
     const identity = sphere.identity!;
     expect(identity.directAddress).toMatch(/^DIRECT:\/\//);
-    // The XP-invariant the vault RESERVES is deriveDirectAddress(rawChainPubkey)
-    // (see RemoteTokenStorageProvider.planReservedAddress). It is what must survive a
-    // wipe; assert the vault round-trips EXACTLY this byte-for-byte below.
-    const reservedDirect = await deriveDirectAddress(Buffer.from(identity.chainPubkey, 'hex'));
+    // v2 identity is the chainPubkey. The vault stores NO DIRECT:// address; on a
+    // fresh-device load it restores `_meta.address` to the wallet's OWN chainPubkey
+    // (locally known from the key). Assert the vault round-trips EXACTLY this below.
+    const expectedAddress = identity.chainPubkey;
 
     // The vault provider was registered ADDITIVELY alongside the local store.
     expect(sphere.hasTokenStorageProvider('remote-token-storage')).toBe(true);
@@ -271,14 +270,14 @@ describe('Sphere.init vault + courier — in-process token-api', () => {
     const mintedTokenBefore = sphere.payments.getTokens({ coinId: COIN }).find((t) => t.id === storedTokenId);
     expect(mintedTokenBefore).toBeDefined();
 
-    // FLUSH: sync() drives provider.sync(localData) on the vault → encrypted entries
-    // + the reserved DIRECT-address slot land on the real server.
+    // FLUSH: sync() drives provider.sync(localData) on the vault → encrypted token
+    // entries land on the real server (no reserved DIRECT-address slot — v2 identity).
     await sphere.payments.sync();
 
-    // The flush produced real server rows: the writer's own state now knows the token
-    // entry + the reserved address slot (>= 2). This is the durable backup landing.
+    // The flush produced real server rows: the writer's own state now knows the
+    // backed-up token entry (>= 1). This is the durable backup landing.
     const writerVault = (sphere.payments as any).getTokenStorageProviders().get('remote-token-storage');
-    expect(writerVault.knownCount()).toBeGreaterThanOrEqual(2);
+    expect(writerVault.knownCount()).toBeGreaterThanOrEqual(1);
 
     // Snapshot A's mnemonic so the reload below reads the SAME identity from a cold
     // local store (no token data) — forcing the restore to come from the VAULT.
@@ -311,13 +310,14 @@ describe('Sphere.init vault + courier — in-process token-api', () => {
     // The fresh vault provider (cold internal state) reloaded purely from the server.
     // `load()` is idempotent (the rehydration map persists across loads), so it
     // returns the FULL token snapshot even though the provider already self-loaded
-    // during init — the reserved DIRECT address (#17) + every backed-up token entry.
+    // during init — every backed-up token entry, with `_meta.address` set to the
+    // wallet's chainPubkey (v2 identity, locally known from the key).
     const vault = (reloaded.sphere.payments as any).getTokenStorageProviders().get('remote-token-storage');
     const loaded = await vault.load();
     expect(loaded.success).toBe(true);
     const reloadedData = loaded.data as TxfStorageDataBase;
-    expect(reloadedData._meta.address).toBe(reservedDirect); // XP-invariant DIRECT (#17)
-    expect(vault.knownCount()).toBeGreaterThanOrEqual(2);
+    expect(reloadedData._meta.address).toBe(expectedAddress); // chainPubkey — NOT a DIRECT address
+    expect(vault.knownCount()).toBeGreaterThanOrEqual(1);
 
     // REHYDRATION (Phase 7.2): the backed-up token entry is restored under its
     // `_<tokenId>` key, byte-identical to the UI record that was flushed (round-trip

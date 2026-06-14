@@ -6,9 +6,9 @@
  * keys and PaymentsModule import restored zero tokens (balances lost).
  *
  * The fix seals `{ k: plainKey, v: value }` as the entry plaintext (AAD unchanged:
- * network‖ownerId‖wireKey‖version). On load, every non-reserved, non-deleted entry
- * is opened and `data['_' + k] = v` is reconstructed, rebuilding the FULL
- * TxfStorageData the engine re-imports — byte-identical to what was flushed.
+ * network‖ownerId‖wireKey‖version). On load, every non-deleted entry is opened and
+ * `data['_' + k] = v` is reconstructed, rebuilding the FULL TxfStorageData the
+ * engine re-imports — byte-identical to what was flushed.
  *
  * MONEY-PATH SAFETY: the reload must reconstruct the token entries byte-for-byte
  * (round-trip equality), and a decrypt failure on a token entry is LOAD_FAILED
@@ -72,7 +72,7 @@ describe('load() rehydrates token entries (Phase 7.2)', () => {
     expect(data['_bbb' as `_${string}`]).toEqual(tokenB);
   });
 
-  it('rehydrated entries do NOT leak the reserved meta-address slot or _history into token keys', async () => {
+  it('rehydrated entries do NOT leak _meta/_history into token keys', async () => {
     const server = new FakeVaultServer(NETWORK);
     const writer = makeProvider(server);
     await writer.initialize();
@@ -83,7 +83,7 @@ describe('load() rehydrates token entries (Phase 7.2)', () => {
     expect(res.success).toBe(true);
     const data = res.data as TxfStorageDataBase;
 
-    // Exactly one token entry; the reserved slot never surfaces as a `_<...>` token key.
+    // Exactly one token entry; the meta slots never surface as a `_<...>` token key.
     const tokenKeys = Object.keys(data).filter(
       (k) => k.startsWith('_') && !['_meta', '_tombstones', '_outbox', '_sent', '_invalid', '_history'].includes(k),
     );

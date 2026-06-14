@@ -81,8 +81,7 @@ describe('CAS delete-resurrect', () => {
     // EXACTLY ONE patch call for the resurrect.
     expect(server.calls.patch.length).toBe(patchesBefore + 1);
     const ops = server.calls.patch[server.calls.patch.length - 1];
-    // The 'k' resurrect op is present (the batch may also carry the reserved-address
-    // op on the wallet's first flush — Task 7.2).
+    // The 'k' resurrect op is present (token ops only — no reserved-address slot).
     const kOp = ops.find((o) => o.key === wkK)!;
     expect(kOp).toBeDefined();
     expect(kOp.baseVersion).toBe(0); // NOT rebased to the deleted row's version

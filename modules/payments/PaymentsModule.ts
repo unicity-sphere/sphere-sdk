@@ -69,7 +69,6 @@ import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
 import { sha256, bytesToHex, hexToBytes } from '../../core/crypto';
 import { decodeTokenBlob, encodeTokenBlob } from '../../token-engine/token-blob';
-import { deriveDirectAddress } from '../../token-engine/identity';
 import { parseInvoiceMemoForOnChain } from '../accounting/memo.js';
 
 // =============================================================================
@@ -898,8 +897,8 @@ export class PaymentsModule {
       // Load metadata from TokenStorageProviders (archived, tombstones, forked)
       // Active tokens are NOT stored in TXF - they are loaded from token-xxx files
       const providers = this.getTokenStorageProviders();
-      // Precompute this wallet's acceptable `_meta.address` set once (includes the
-      // vault's XP-invariant DIRECT address) so a vault restore is not rejected.
+      // Precompute this wallet's acceptable `_meta.address` set once (the chainPubkey
+      // the vault stamps is included) so a vault restore is not rejected.
       const ownAddresses = await this.ownMetaAddresses();
       for (const [id, provider] of providers) {
         try {
@@ -907,8 +906,8 @@ export class PaymentsModule {
           if (result.success && result.data) {
             // Address guard: reject data from a DIFFERENT address. The stored
             // `_meta.address` may be the L1 address (local TXF stores), the chain
-            // pubkey, the runtime DIRECT:// predicate address, OR the vault's
-            // XP-invariant DIRECT:// reserved slot — accept any of OUR own.
+            // pubkey (the vault stamps THIS — v2 identity), or the runtime DIRECT://
+            // predicate address (local IndexedDB/file stores) — accept any of OUR own.
             const loadedMeta = (result.data as TxfStorageDataBase)?._meta;
             if (!this.isOwnAddress(loadedMeta?.address, ownAddresses)) {
               logger.warn('Payments', `Load: rejecting data from provider ${id} — address mismatch (got=${loadedMeta!.address.slice(0, 20)}... expected one of this wallet's addresses)`);
@@ -3102,8 +3101,8 @@ export class PaymentsModule {
       // Preserve nametags — sync providers may not include _nametags in merged data
       const savedNametags = [...this.nametags];
 
-      // Precompute this wallet's acceptable `_meta.address` set once (includes the
-      // vault's XP-invariant DIRECT address) so a vault round-trip is not rejected.
+      // Precompute this wallet's acceptable `_meta.address` set once (the chainPubkey
+      // the vault stamps is included) so a vault round-trip is not rejected.
       const ownAddresses = await this.ownMetaAddresses();
 
       // Sync with each provider
@@ -3115,8 +3114,8 @@ export class PaymentsModule {
             // Address guard: reject data from a DIFFERENT address.
             // Stale IPFS records may contain tokens from a previously active
             // address if a write-behind flush raced with an address switch. Accept
-            // any of this wallet's own identifiers (L1 / chain pubkey / runtime
-            // DIRECT:// / the vault's XP-invariant DIRECT:// reserved slot).
+            // any of this wallet's own identifiers (L1 / chain pubkey [vault] /
+            // runtime DIRECT:// [local IndexedDB/file stores]).
             const mergedMeta = (result.merged as TxfStorageDataBase)?._meta;
             if (!this.isOwnAddress(mergedMeta?.address, ownAddresses)) {
               logger.warn('Payments', `Sync: rejecting data from provider ${providerId} — address mismatch (got=${mergedMeta!.address.slice(0, 20)}... expected one of this wallet's addresses)`);
@@ -3884,24 +3883,16 @@ export class PaymentsModule {
   /**
    * The set of `_meta.address` values that identify THIS wallet's own data:
    *  - the L1 address (local TXF stores stamp this);
-   *  - the chain pubkey;
-   *  - the runtime DIRECT:// predicate address (`identity.directAddress`);
-   *  - the vault's XP-invariant DIRECT:// address — `deriveDirectAddress(rawChainPubkey)`
-   *    (RemoteTokenStorageProvider.planReservedAddress stamps THIS, which differs
-   *    from the prehashed runtime predicate address, so it must be accepted explicitly
-   *    or a vault restore is rejected as a foreign address and the balance is lost).
-   * Computed once per load/sync; the async XP-invariant derivation never throws here
-   * (a derive failure degrades to the non-vault identifiers, never blocks a load).
+   *  - the chain pubkey (v2 identity — the vault stamps THIS on a restore);
+   *  - the runtime DIRECT:// predicate address (`identity.directAddress`), stamped by
+   *    the local IndexedDB/file TXF stores.
+   * The vault keys identity on the chainPubkey (already in this set), so a vault
+   * restore is accepted WITHOUT any DIRECT-derived relax. Computed once per load/sync.
    */
   private async ownMetaAddresses(): Promise<Set<string>> {
     const id = this.deps!.identity;
     const own = new Set<string>([id.l1Address, id.chainPubkey]);
     if (id.directAddress) own.add(id.directAddress);
-    try {
-      own.add(await deriveDirectAddress(hexToBytes(id.chainPubkey)));
-    } catch (err) {
-      logger.warn('Payments', 'ownMetaAddresses: XP-invariant address derive failed:', err);
-    }
     return own;
   }
 
