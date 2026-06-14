@@ -5,7 +5,8 @@
  * Tests for verifyPayout() method.
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token';
 import {
   createTestSwapModule,
   createTestSwapRef,
@@ -19,6 +20,7 @@ import {
   type TestSwapModuleMocks,
 } from './swap-test-helpers.js';
 import type { SwapModule } from '../../../modules/swap/index.js';
+import type { Token } from '../../../types/index.js';
 
 /**
  * Helper: create a concluding SwapRef with payoutInvoiceId and configure
@@ -104,6 +106,66 @@ function setupVerifiableSwap(
   return ref;
 }
 
+/**
+ * Configure the new issue-#535 payout-verification path with a single
+ * valid payout token so verifyPayout reaches the success branch.
+ *
+ * Required for happy-path tests because the per-token check fail-closes
+ * when:
+ *   - `getTokenIdsForInvoice` returns an empty Set (reverse-index empty)
+ *   - `payments.getToken` returns undefined
+ *   - the token's last transaction has no inclusion proof
+ *   - `SdkToken.verify` returns isSuccessful=false
+ *   - `oracle.isSpent` returns true
+ *
+ * We mock `SdkToken.fromJSON` to bypass the real SDK crypto path —
+ * tests asserting cryptographic correctness live in
+ * `tests/unit/modules/swap/payout-verifier.test.ts`.
+ */
+function setupValidPayoutToken(
+  mocks: TestSwapModuleMocks,
+  payoutInvoiceId: string,
+  tokenId: string = 'payout-token-001',
+): void {
+  mocks.accounting.getTokenIdsForInvoice.mockImplementation((id: string): Set<string> => {
+    return id === payoutInvoiceId ? new Set([tokenId]) : new Set();
+  });
+  const stubSdkData = JSON.stringify({
+    state: {},
+    genesis: { inclusionProof: { __mock: true } },
+    transactions: [],
+    nametags: [],
+  });
+  const stubToken: Token = {
+    id: tokenId,
+    coinId: 'USDU',
+    symbol: 'USDU',
+    name: 'USDU',
+    decimals: 6,
+    amount: '500000',
+    status: 'confirmed',
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    sdkData: stubSdkData,
+  };
+  mocks.payments.getToken.mockImplementation((id: string): Token | undefined => {
+    return id === tokenId ? stubToken : undefined;
+  });
+  // SdkToken.fromJSON returns a minimal stub with verify()=success and a
+  // state hash that does not collide with anything (the spent-probe is
+  // already mocked to return false).
+  vi.spyOn(SdkToken, 'fromJSON').mockImplementation(async (_input: unknown) => {
+    return {
+      verify: async () => ({ isSuccessful: true }),
+      state: {
+        calculateHash: async () => ({ toJSON: () => 'stub-payout-state-hash' }),
+        predicate: null,
+      },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any;
+  });
+}
+
 describe('SwapModule — verifyPayout', () => {
   let module: SwapModule;
   let mocks: TestSwapModuleMocks;
@@ -115,11 +177,16 @@ describe('SwapModule — verifyPayout', () => {
     await module.load();
   });
 
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   // --------------------------------------------------------------------------
   // UT-SWAP-VERIFY-001: verifyPayout checks coverage
   // --------------------------------------------------------------------------
   it('UT-SWAP-VERIFY-001: verifyPayout checks invoice status isCovered', async () => {
     const ref = setupVerifiableSwap(module, mocks);
+    setupValidPayoutToken(mocks, ref.payoutInvoiceId!);
 
     const result = await module.verifyPayout(ref.swapId);
 
@@ -163,6 +230,7 @@ describe('SwapModule — verifyPayout', () => {
   // --------------------------------------------------------------------------
   it('UT-SWAP-VERIFY-004: verifyPayout transitions to completed on success', async () => {
     const ref = setupVerifiableSwap(module, mocks);
+    setupValidPayoutToken(mocks, ref.payoutInvoiceId!);
 
     await module.verifyPayout(ref.swapId);
 
@@ -176,6 +244,7 @@ describe('SwapModule — verifyPayout', () => {
   // --------------------------------------------------------------------------
   it('UT-SWAP-VERIFY-005: verifyPayout emits swap:completed event', async () => {
     const ref = setupVerifiableSwap(module, mocks);
+    setupValidPayoutToken(mocks, ref.payoutInvoiceId!);
 
     await module.verifyPayout(ref.swapId);
 

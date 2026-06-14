@@ -83,6 +83,7 @@ export interface MockAccountingModule {
   getInvoice: ReturnType<typeof vi.fn>;
   getInvoiceStatus: ReturnType<typeof vi.fn>;
   payInvoice: ReturnType<typeof vi.fn>;
+  getTokenIdsForInvoice: ReturnType<typeof vi.fn>;
   closeInvoice: ReturnType<typeof vi.fn>;
   cancelInvoice: ReturnType<typeof vi.fn>;
   on: ReturnType<typeof vi.fn>;
@@ -144,6 +145,12 @@ export function createMockAccountingModule(): MockAccountingModule {
     return Promise.resolve(mock._payResult);
   });
 
+  // Default: return empty Set. Tests that exercise verifyPayout's per-token
+  // checks override this to return Set<string> with the payout token IDs.
+  const getTokenIdsForInvoice = vi.fn().mockImplementation((_invoiceId: string): Set<string> => {
+    return new Set<string>();
+  });
+
   const closeInvoice = vi.fn().mockResolvedValue(undefined);
   const cancelInvoice = vi.fn().mockResolvedValue(undefined);
 
@@ -173,6 +180,7 @@ export function createMockAccountingModule(): MockAccountingModule {
     getInvoice,
     getInvoiceStatus,
     payInvoice,
+    getTokenIdsForInvoice,
     closeInvoice,
     cancelInvoice,
     on,
@@ -249,12 +257,35 @@ export function createMockCommunicationsModule(): MockCommunicationsModule {
 // =============================================================================
 
 export interface MockPaymentsModule {
-  validate: ReturnType<typeof vi.fn>;
+  getToken: ReturnType<typeof vi.fn>;
 }
 
 export function createMockPaymentsModule(): MockPaymentsModule {
   return {
-    validate: vi.fn().mockResolvedValue({ valid: [], invalid: [] }),
+    // Default: no token in wallet. Tests exercising verifyPayout's
+    // per-token checks override this to return a stub Token.
+    getToken: vi.fn().mockImplementation((_id: string): Token | undefined => undefined),
+  };
+}
+
+// =============================================================================
+// Mock: OracleProvider subset
+// =============================================================================
+
+export interface MockOracleProvider {
+  isSpent: ReturnType<typeof vi.fn>;
+  getRootTrustBase: ReturnType<typeof vi.fn>;
+}
+
+export function createMockOracleProvider(): MockOracleProvider {
+  return {
+    // Default: not spent. Tests exercising the spent-detection terminal
+    // branch override to return true.
+    isSpent: vi.fn().mockResolvedValue(false),
+    // Default: provide a non-null sentinel object so verifyPayoutTokens
+    // does not abort at the trustBase-not-loaded transient gate. The
+    // sentinel never reaches SdkToken.verify because tests stub that out.
+    getRootTrustBase: vi.fn().mockImplementation((): unknown => ({ __mock_trust_base: true })),
   };
 }
 
@@ -414,6 +445,7 @@ export function createMockEmitEvent(): MockEmitEvent {
 export interface TestSwapModuleMocks {
   accounting: MockAccountingModule;
   payments: MockPaymentsModule;
+  oracle: MockOracleProvider;
   communications: MockCommunicationsModule;
   storage: MockStorageProvider;
   emitEvent: MockEmitEvent;
@@ -436,6 +468,7 @@ export function createTestSwapModule(configOverrides?: Partial<SwapModuleConfig>
 } {
   const accounting = createMockAccountingModule();
   const payments = createMockPaymentsModule();
+  const oracle = createMockOracleProvider();
   const communications = createMockCommunicationsModule();
   const storage = createMockStorageProvider();
   const emitEvent = createMockEmitEvent();
@@ -465,6 +498,7 @@ export function createTestSwapModule(configOverrides?: Partial<SwapModuleConfig>
   const deps: SwapModuleDependencies = {
     accounting,
     payments,
+    oracle,
     communications,
     storage,
     identity,
@@ -478,6 +512,7 @@ export function createTestSwapModule(configOverrides?: Partial<SwapModuleConfig>
   const mocks: TestSwapModuleMocks = {
     accounting,
     payments,
+    oracle,
     communications,
     storage,
     emitEvent,
