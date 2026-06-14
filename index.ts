@@ -56,6 +56,7 @@ export type {
   SphereInitOptions,
   SphereInitResult,
   SphereImportOptions,
+  VaultInitConfig,
   InitProgressStep,
   InitProgress,
   InitProgressCallback,
@@ -537,6 +538,17 @@ export type { TxfToken } from './types/txf';
 
 export { RemoteTokenStorageProvider } from './storage/remote/RemoteTokenStorageProvider';
 export type { RemoteTokenStorageConfig } from './storage/remote/RemoteTokenStorageProvider';
+
+// SDK-internal vault factory + durable anti-rollback baseline store. The wallet
+// CANNOT construct the provider itself (it holds only the public identity, but the
+// provider needs the raw spend key at construction) — it flips a flag and the SDK
+// runs `createVaultTokenStorage` from a FullIdentity. `StorageBaselineStore` adapts
+// the wallet's StorageProvider into the durable LocalBaselineStore the anti-rollback
+// gate persists into.
+export { createVaultTokenStorage } from './storage/remote/factory';
+export type { CreateVaultTokenStorageConfig } from './storage/remote/factory';
+export { StorageBaselineStore, VAULT_BASELINE_KEY_PREFIX } from './storage/remote/local-baseline-store';
+export type { LocalBaselineStore } from './storage/remote/load-delta';
 
 export { CourierDeliveryProvider } from './transport/courier/CourierDeliveryProvider';
 export type {
