@@ -168,11 +168,25 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
    * `base64(nonce24‖ct)` ciphertext, and POST `/v1/courier/deposit`. The caller
    * (sender) is `this.identity.chainPubkey`; the server keys dedup on
    * `(recipientPubkey, entryId)`.
+   *
+   * JOURNAL-FIRST (finding courier-deposit-journal-ordering-vs-design, DESIGN §6.3):
+   * the sender-side pending-delivery tracking is journaled BEFORE the POST. The
+   * entryId is derived purely locally (ECDH, no server round-trip), so it is known
+   * up front. A crash AFTER the POST therefore still has the tracking to reconcile
+   * on reload — the token was delivered AND the sender will track/GC it. The POST is
+   * idempotent (the server dedups on `(recipientPubkey, entryId)`), so a re-POST on
+   * reload is harmless. The server `sentSeq` is folded back onto the journaled entry
+   * AFTER the POST returns (it is only known then; its absence is reconciled later).
    */
   async deposit(envelope: TokenEnvelope): Promise<DeliveryHandle> {
     const me = this.requireIdentity();
     const entryId = courierEntryId(me.privateKey, envelope.recipientChainPubkey, envelope.tokenBlobHex);
     const ciphertext = this.sealEnvelope(me, envelope, entryId);
+    // Track the entry sender-side BEFORE the POST so pollSent() can gate "delivered"
+    // on a valid recipient ackSig before removing PENDING_V2_DELIVERIES (DESIGN §6.5)
+    // even if a crash interrupts the round trip. sentSeq is unknown until the POST
+    // returns — recorded below.
+    await this.journalSentPending(entryId, envelope.recipientChainPubkey);
     const client = this.config.httpClientFactory(me.chainPubkey);
     const res = await client.deposit({
       recipientPubkey: envelope.recipientChainPubkey,
@@ -181,10 +195,9 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
       ciphertext,
       // hint stays undefined here — a single base64 SCALAR when present (never an object).
     });
-    // Track the entry sender-side so pollSent() can gate "delivered" on a valid
-    // recipient ackSig before removing PENDING_V2_DELIVERIES (DESIGN §6.5). The
-    // sentSeq is captured so pollSent() can advance the persisted sent watermark.
-    await this.journalSentPending(entryId, envelope.recipientChainPubkey, res.sentSeq);
+    // Fold the server-assigned watermark onto the already-journaled entry so
+    // pollSent() can advance the persisted sent watermark by sentSeq.
+    await this.recordSentSeq(entryId, res.sentSeq);
     return {
       entryId: res.entryId,
       transferId: envelope.transferId,
@@ -428,10 +441,30 @@ export class CourierDeliveryProvider implements TokenDeliveryTransport {
     await this.config.journal.set(this.sentPendingKey(), JSON.stringify(pending));
   }
 
-  private async journalSentPending(entryId: string, recipientPubkey: string, sentSeq?: number): Promise<void> {
+  /**
+   * Journal an entry's sender-side pending tracking. Written BEFORE the deposit
+   * POST (journal-first) so a crash during the round trip still leaves the entry
+   * tracked. The `sentSeq` is unknown at this point — folded in by
+   * {@link recordSentSeq} after the POST returns. Idempotent on entryId.
+   */
+  private async journalSentPending(entryId: string, recipientPubkey: string): Promise<void> {
     const pending = await this.loadSentPending();
     if (!pending[entryId]) {
-      pending[entryId] = { recipientPubkey, attempts: 0, state: 'pending', sentSeq };
+      pending[entryId] = { recipientPubkey, attempts: 0, state: 'pending' };
+      await this.saveSentPending(pending);
+    }
+  }
+
+  /**
+   * Fold the server-assigned `sentSeq` onto an already-journaled entry after the
+   * deposit POST returns (the watermark is only known then). No-op if the entry was
+   * already reconciled away. Leaves attempts/state untouched.
+   */
+  private async recordSentSeq(entryId: string, sentSeq: number): Promise<void> {
+    const pending = await this.loadSentPending();
+    const entry = pending[entryId];
+    if (entry && entry.sentSeq !== sentSeq) {
+      entry.sentSeq = sentSeq;
       await this.saveSentPending(pending);
     }
   }

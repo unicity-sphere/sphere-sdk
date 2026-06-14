@@ -120,3 +120,95 @@ describe('courier deposit', () => {
     expect(server.deliveryCount).toBe(1);
   });
 });
+
+describe('courier deposit — journal-first ordering (courier-deposit-journal-ordering-vs-design)', () => {
+  const env = {
+    recipientChainPubkey: RECIPIENT_PUB,
+    senderChainPubkey: SENDER_PUB,
+    transferId: 'tx-1',
+    tokenBlobHex: BLOB_HEX,
+  };
+
+  /** The provider's sent-pending journal key for the sender on this network. */
+  const sentPendingKey = `courier_sent_pending:${NETWORK}:${SENDER_PUB}`;
+
+  function providerWith(
+    journal: CourierJournalStore,
+    depositImpl: (req: { entryId: string }) => Promise<{ entryId: string; seq: number; sentSeq: number; status: 'unclaimed' }>,
+  ): CourierDeliveryProvider {
+    const p = new CourierDeliveryProvider({
+      vaultUrl: 'https://vault.testnet.unicity.network',
+      network: NETWORK,
+      httpClientFactory: () => ({
+        deposit: (req) => depositImpl(req),
+        inbox: async () => ({ readPointer: 0, syncEpoch: 1, more: false, items: [] }),
+        ackNonce: async () => ({ serverNonce: 'n' }),
+        ack: async () => ({ result: 'failed' as const }),
+        sent: async () => ({ more: false, items: [] }),
+      }),
+      journal,
+      onV2Transfer: async () => {},
+    });
+    p.setIdentity(senderId);
+    return p;
+  }
+
+  it('journals the sender-side pending tracking BEFORE the deposit POST (journal ≺ POST)', async () => {
+    const journal = memJournal();
+    // A crash simulated AT the POST: the journal entry must already exist, so the
+    // delivery is tracked + reconcilable even though the POST never returned.
+    let journalAtPostTime: string | null = null;
+    const provider = providerWith(journal, async () => {
+      journalAtPostTime = await journal.get(sentPendingKey); // snapshot at POST time
+      throw new Error('network down at POST');
+    });
+
+    await expect(provider.deposit(env)).rejects.toThrow('network down at POST');
+
+    // The pending tracking was journaled BEFORE the POST was attempted.
+    expect(journalAtPostTime).not.toBeNull();
+    const atPost = JSON.parse(journalAtPostTime!) as Record<string, { recipientPubkey: string; state: string }>;
+    const entries = Object.values(atPost);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].recipientPubkey).toBe(RECIPIENT_PUB);
+    expect(entries[0].state).toBe('pending');
+  });
+
+  it('records the server sentSeq onto the journaled entry after a successful POST', async () => {
+    const journal = memJournal();
+    const provider = providerWith(journal, async (req) => ({
+      entryId: req.entryId,
+      seq: 1,
+      sentSeq: 42,
+      status: 'unclaimed' as const,
+    }));
+
+    const handle = await provider.deposit(env);
+    expect(handle.sentSeq).toBe(42);
+
+    const stored = JSON.parse((await journal.get(sentPendingKey))!) as Record<string, { sentSeq?: number }>;
+    expect(Object.values(stored)[0].sentSeq).toBe(42);
+  });
+
+  it('a re-POST of an already-journaled deposit is harmless (server dedups on entryId)', async () => {
+    // After a crash AFTER the POST, a reload re-deposits. The server dedups on
+    // (recipientPubkey, entryId) so the row count stays 1 — idempotent.
+    const server = new FakeCourierServer(NETWORK);
+    const journal = memJournal();
+    const p = new CourierDeliveryProvider({
+      vaultUrl: 'https://vault.testnet.unicity.network',
+      network: NETWORK,
+      httpClientFactory: (ownerId) => server.clientFor(ownerId),
+      journal,
+      onV2Transfer: async () => {},
+    });
+    p.setIdentity(senderId);
+
+    await p.deposit(env);
+    await p.deposit(env); // re-POST after a simulated crash
+    expect(server.deliveryCount).toBe(1);
+    // A single journal entry survives the re-deposit (no duplicate tracking).
+    const stored = JSON.parse((await journal.get(sentPendingKey))!) as Record<string, unknown>;
+    expect(Object.keys(stored)).toHaveLength(1);
+  });
+});
