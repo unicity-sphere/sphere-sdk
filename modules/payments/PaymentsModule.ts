@@ -3700,13 +3700,17 @@ export class PaymentsModule {
   /**
    * Deliver ONE finished v2 token blob, journal-first (DESIGN: never lose a token).
    *
-   * COEXIST POLICY (concern 4): when a `deliveryTransport` (courier) is configured it is
-   * PRIMARY — the blob is journaled tagged `'courier'` (with the courier entryId folded
-   * in) and deposited; the journal entry is then removed ONLY by a valid-ackSig
-   * `onDelivered` (NOT here). A courier `deposit()` FAILURE falls back to Nostr (no lost
-   * delivery), removing the journal entry after the send (today's behavior). With no
-   * courier, delivery is Nostr-only, byte-identical to today. Resolution stayed on Nostr;
-   * the courier only consumes the already-resolved `recipientChainPubkey`.
+   * FAN-OUT POLICY: when a `deliveryTransport` (courier) is configured the blob goes out
+   * on BOTH channels — it is journaled tagged `'courier'` (entryId folded in) and
+   * deposited (the durable, journaled guarantee; the journal entry is GC'd ONLY by a
+   * valid-ackSig `onDelivered`, NOT here), AND it is ALSO blasted over Nostr as the
+   * universal floor (realtime + redundancy). The Nostr blast is best-effort: the
+   * recipient dedups by the genesis-stable token id (handleV2Transfer) and the chain is
+   * the spend authority, so the same token arriving on both channels credits ONCE and a
+   * failed blast loses nothing. A courier `deposit()` FAILURE falls back to Nostr-only
+   * (journal 'nostr', send, GC — today's behavior). With no courier, delivery is
+   * Nostr-only, byte-identical to today. Resolution stayed on Nostr; the courier only
+   * consumes the already-resolved `recipientChainPubkey`.
    */
   private async deliverFinishedBlob(
     tokenBlob: string,
@@ -3716,7 +3720,10 @@ export class PaymentsModule {
     if (courier) {
       try {
         await this.depositToCourier(courier, tokenBlob, meta);
-        return; // journaled 'courier'; GC deferred to onDelivered (valid ackSig)
+        // FAN-OUT: courier is journaled (GC deferred to onDelivered); ALSO blast the SAME
+        // blob over Nostr (universal floor — realtime + redundancy; recipient dedups).
+        await this.blastOverNostr(meta.recipientPubkey, tokenBlob, meta.memo);
+        return;
       } catch (err) {
         logger.warn('Payments', 'Courier deposit failed — falling back to Nostr delivery:', err);
       }
@@ -3778,6 +3785,20 @@ export class PaymentsModule {
   }
 
   /**
+   * Best-effort fan-out blast over Nostr (the universal floor), used ALONGSIDE a
+   * journaled courier deposit. NEVER throws: the recipient dedups by the genesis-stable
+   * token id and the courier is the durable, journaled guarantee, so a failed blast
+   * (relay down) loses nothing — it only forfeits the realtime/redundancy bonus.
+   */
+  private async blastOverNostr(recipientPubkey: string, tokenBlob: string, memo?: string): Promise<void> {
+    try {
+      await this.sendBlobOverNostr(recipientPubkey, tokenBlob, memo);
+    } catch (err) {
+      logger.debug('Payments', 'Fan-out Nostr blast failed (courier is the journaled guarantee):', err);
+    }
+  }
+
+  /**
    * Replay journaled finished-but-undelivered v2 blobs (kicked fire-and-forget from
    * load()). ROUTING (concern 4): a `'courier'` entry is RE-DEPOSITED over the courier
    * (idempotent on entryId; GC stays deferred to onDelivered — NOT removed here), while
@@ -3811,6 +3832,8 @@ export class PaymentsModule {
         memo: e.memo,
       });
       await this.setPendingV2DeliveryEntryId(e.tokenBlob, handle.entryId);
+      // FAN-OUT: also re-blast over Nostr (best-effort; recipient dedups by token id).
+      await this.blastOverNostr(e.recipientPubkey, e.tokenBlob, e.memo);
       logger.debug('Payments', `Re-deposited undelivered courier transfer ${e.transferId.slice(0, 8)}...`);
       return;
     }
