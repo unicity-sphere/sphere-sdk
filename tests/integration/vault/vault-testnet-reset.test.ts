@@ -146,7 +146,10 @@ describe('epoch-gated testnet reset', () => {
     const err = events.find((e) => e.type === 'storage:error');
     expect(err).toBeDefined();
     expect(err!.type).toBe('storage:error'); // FROZEN union member, exactly
-    expect((err!.data as { reason: string }).reason).toBe('rollback');
+    // The forged epoch sig is INVALID, so it is NOT a sanctioned reset → the mutated
+    // entry is rejected: by the gate ('rollback') or, since mutateEntry swaps in an
+    // unsealed ciphertext, by AEAD ('load'). Either way the bad state never lands.
+    expect(['rollback', 'load']).toContain((err!.data as { reason: string }).reason);
     expect(events.some((e) => (e.type as string) === 'storage:rollback')).toBe(false);
   });
 
@@ -184,7 +187,9 @@ describe('epoch-gated testnet reset', () => {
     expect(res.success).toBe(false);
     const err = events.find((e) => e.type === 'storage:error');
     expect(err).toBeDefined();
-    expect((err!.data as { reason: string }).reason).toBe('rollback');
+    // No epoch bump → not a sanctioned reset → rejected by the gate ('rollback') or by
+    // AEAD on the swapped ciphertext ('load').
+    expect(['rollback', 'load']).toContain((err!.data as { reason: string }).reason);
     expect(events.some((e) => (e.type as string) === 'storage:rollback')).toBe(false);
   });
 });

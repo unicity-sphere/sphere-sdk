@@ -900,33 +900,76 @@ export class PaymentsModule {
       // Precompute this wallet's acceptable `_meta.address` set once (the chainPubkey
       // the vault stamps is included) so a vault restore is not rejected.
       const ownAddresses = await this.ownMetaAddresses();
-      for (const [id, provider] of providers) {
-        try {
-          const result = await provider.load();
-          if (result.success && result.data) {
-            // Address guard: reject data from a DIFFERENT address. The stored
-            // `_meta.address` may be the L1 address (local TXF stores), the chain
-            // pubkey (the vault stamps THIS — v2 identity), or the runtime DIRECT://
-            // predicate address (local IndexedDB/file stores) — accept any of OUR own.
-            const loadedMeta = (result.data as TxfStorageDataBase)?._meta;
-            if (!this.isOwnAddress(loadedMeta?.address, ownAddresses)) {
-              logger.warn('Payments', `Load: rejecting data from provider ${id} — address mismatch (got=${loadedMeta!.address.slice(0, 20)}... expected one of this wallet's addresses)`);
-              continue;
-            }
 
-            this.loadFromStorageData(result.data);
-            // Rebuild parsedTokenCache for spend queue (loadFromStorageData bypasses addToken)
-            await this.rebuildParsedTokenCache();
-            // Import history from IPFS TXF data into local store
-            const txfData = result.data as TxfStorageDataBase;
-            if (txfData._history && txfData._history.length > 0) {
-              await this.importRemoteHistoryEntries(txfData._history as HistoryRecord[]);
-            }
-            logger.debug('Payments', `Loaded metadata from provider ${id}`);
-            break; // Use first successful provider
-          }
-        } catch (err) {
+      // Restore by MERGING every OWN provider — NOT "first successful then break".
+      // A fresh device's LOCAL store loads successfully but EMPTY, and breaking there
+      // SHADOWED the cloud VAULT, so a reinstall / logout-relogin restored ZERO tokens
+      // even though the vault held them (finding: vault-restore-shadowed-by-empty-local).
+      // Union token/archived/forked entries (first provider wins on a key collision —
+      // local is loaded first and is the freshest for THIS device) plus union
+      // tombstones + history. loadFromStorageData applies tombstones FIRST, so a token
+      // spent in one store is filtered out even if another store still lists it live.
+      let mergedData: TxfStorageDataBase | null = null;
+      const mergedHistory: HistoryRecord[] = [];
+      const tombKeys = new Set<string>();
+      for (const [id, provider] of providers) {
+        const result = await provider.load().catch((err) => {
           logger.error('Payments', `Failed to load from provider ${id}:`, err);
+          return null;
+        });
+        if (!result || !result.success || !result.data) continue;
+        const data = result.data as TxfStorageDataBase;
+        // Address guard: reject data from a DIFFERENT address. The stored
+        // `_meta.address` may be the L1 address (local TXF stores), the chain pubkey
+        // (the vault stamps THIS — v2 identity), or the runtime DIRECT:// predicate
+        // address (local IndexedDB/file stores) — accept any of OUR own.
+        if (!this.isOwnAddress(data?._meta?.address, ownAddresses)) {
+          logger.warn('Payments', `Load: rejecting data from provider ${id} — address mismatch (got=${data._meta?.address?.slice(0, 20)}... expected one of this wallet's addresses)`);
+          continue;
+        }
+        if (!mergedData) mergedData = { _meta: data._meta };
+        // Union every non-meta/history/tombstone slot; first provider wins on collision.
+        for (const [k, v] of Object.entries(data)) {
+          if (k === '_meta' || k === '_history' || k === '_tombstones') continue;
+          if (!(k in mergedData)) mergedData[k as `_${string}`] = v;
+        }
+        // Union tombstones across providers (dedup by tokenId:stateHash).
+        for (const t of data._tombstones ?? []) {
+          const tk = `${t.tokenId}:${t.stateHash}`;
+          if (tombKeys.has(tk)) continue;
+          tombKeys.add(tk);
+          (mergedData._tombstones ??= []).push(t);
+        }
+        if (data._history?.length) mergedHistory.push(...(data._history as HistoryRecord[]));
+        logger.debug('Payments', `Merged token data from provider ${id}`);
+      }
+
+      if (mergedData) {
+        // Honor cross-device spends: DROP any token the VAULT marks DELETED (spent on
+        // another device). Without this, a device that still holds the token locally
+        // would (a) INFLATE the balance by unioning it with the vault, and (b) RESURRECT
+        // it via the delete-resurrect sync path — the two devices then fight
+        // (delete ↔ resurrect) and the spent token never dies
+        // (finding: vault-cross-device-resurrect).
+        const deletionCheckers = [...providers.values()].filter(
+          (p): p is typeof p & { isPlainKeyDeleted(k: string): boolean } =>
+            typeof (p as { isPlainKeyDeleted?: unknown }).isPlainKeyDeleted === 'function',
+        );
+        if (deletionCheckers.length > 0) {
+          for (const k of Object.keys(mergedData)) {
+            if (!/^_[0-9a-f]{64}$/i.test(k)) continue; // only v2 genesis token entries
+            const plainKey = k.slice(1);
+            if (deletionCheckers.some((p) => p.isPlainKeyDeleted(plainKey))) {
+              delete mergedData[k as `_${string}`];
+              logger.debug('Payments', `load(): dropping ${plainKey.slice(0, 12)}… — vault marks it spent (cross-device)`);
+            }
+          }
+        }
+        this.loadFromStorageData(mergedData);
+        // Rebuild parsedTokenCache for spend queue (loadFromStorageData bypasses addToken)
+        await this.rebuildParsedTokenCache();
+        if (mergedHistory.length > 0) {
+          await this.importRemoteHistoryEntries(mergedHistory);
         }
       }
 
@@ -3282,11 +3325,34 @@ export class PaymentsModule {
 
     this.syncDebounceTimer = setTimeout(() => {
       this.syncDebounceTimer = null;
+      // GUARD: a realtime vault wake can fire while the wallet's local storage is
+      // mid-(re)connect or already torn down (e.g. during a reinitialize, or a stale
+      // wake from a provider whose Sphere instance was replaced). Running receive()/
+      // sync() then throws "IndexedDBStorageProvider not connected" / "db not
+      // initialized" and floods the console. Skip the wake-driven sync entirely unless
+      // the wallet storage is actually connected — a real change re-fires on the next
+      // wake / load anyway.
+      const storage = this.deps?.storage as { isConnected?: () => boolean } | undefined;
+      if (storage?.isConnected && !storage.isConnected()) {
+        logger.debug('Payments', 'Remote-update wake ignored — wallet storage not connected');
+        return;
+      }
       void (async () => {
         try {
           await this.receive();
         } catch (err) {
           logger.debug('Payments', 'Auto-receive from remote update failed:', err);
+        }
+        // Pull + reconcile the FULL vault state so a peer device's SPEND (a deletion)
+        // propagates WITHOUT a page reload. receive() only surfaces ARRIVING tokens; it
+        // cannot remove a token spent on another device. load() re-pulls every provider,
+        // merges them, and honors vault deletions (drops tokens the vault marks spent) —
+        // the same reconcile a reload does, so it can never inflate or resurrect a
+        // balance (finding: vault-cross-device-spend-not-live).
+        try {
+          await this.load();
+        } catch (err) {
+          logger.debug('Payments', 'Auto-load (reconcile) from remote update failed:', err);
         }
         try {
           const result = await this.sync();

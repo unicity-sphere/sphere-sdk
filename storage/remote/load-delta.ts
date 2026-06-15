@@ -40,6 +40,15 @@ interface SignedBaseline {
   root: string;
   sig: string;
   epoch: number;
+  /**
+   * The wallet's committed last-known server entry set (`root` = computeRoot of this).
+   * Stored so the gate detects a TRUE regression (a known entry removed or its version
+   * lowered) instead of false-alarming on a peer device's forward write
+   * (finding: vault-anti-rollback-single-writer). Optional for back-compat: a legacy
+   * root-only baseline recomputes a mismatching root → treated as a fresh load, then
+   * re-persisted WITH entries on the next clean commit.
+   */
+  entries?: Array<[string, EntryState]>;
 }
 
 export interface LoadDeltaConfig {
@@ -114,11 +123,20 @@ export class LoadDeltaTracker {
    */
   async beginLoad(known: Map<string, EntryState>): Promise<void> {
     this.baseline = await this.loadBaseline();
-    this.accState = new Map(known);
-    if (this.baseline && !verifyRoot(this.bindingFor(this.baseline.cursor, this.baseline.root), this.baseline.sig, this.ownerPubForVerify())) {
-      // A corrupt/forged local baseline is treated as no baseline (a fresh load).
-      this.baseline = null;
+    if (this.baseline) {
+      const entries = new Map(this.baseline.entries ?? []);
+      const sigOk = verifyRoot(this.bindingFor(this.baseline.cursor, this.baseline.root), this.baseline.sig, this.ownerPubForVerify());
+      // The committed entry set must hash to the SIGNED root — otherwise it was
+      // locally tampered, or it is a legacy root-only baseline. Either way, treat as
+      // no baseline (a fresh load), which re-persists a full entry set on commit.
+      const entriesOk = (this.baseline.entries?.length ?? 0) > 0 && computeRoot(entries) === this.baseline.root;
+      if (!sigOk || !entriesOk) this.baseline = null;
     }
+    // Seed the accumulator from the baseline's committed set (the authoritative
+    // last-known server state) so a DELTA or a full load both reconstruct the CURRENT
+    // server state — the regression check then has the full picture even on a cold
+    // provider instance. With no baseline (first load) seed from `known`.
+    this.accState = this.baseline ? new Map(this.baseline.entries ?? []) : new Map(known);
   }
 
   /**
@@ -152,7 +170,7 @@ export class LoadDeltaTracker {
     if (!mono.ok) return mono;
     this.fold(page.entries);
     if (this.baseline) {
-      const verdict = this.checkRoot();
+      const verdict = this.checkRegression();
       if (!verdict.ok) return verdict;
     }
     return { ok: true, reset: false };
@@ -193,14 +211,22 @@ export class LoadDeltaTracker {
   }
 
   /**
-   * The folded root must equal the signed baseline root: the wallet is the only
-   * writer, so a delta it did not author (no intervening flush advanced the
-   * baseline) means the server injected state — a rollback.
+   * Multi-device anti-rollback (finding: vault-anti-rollback-single-writer). Alarm
+   * ONLY on a REGRESSION of a committed entry — a baseline key now MISSING from, or
+   * at a LOWER version than, the folded server state. New keys and higher versions
+   * are legitimate FORWARD progress (this OR another device wrote them), never a
+   * rollback. Vault versions are strictly monotonic per key (create→update→delete→
+   * resurrect all increment), so a version going backwards (or a known entry
+   * vanishing) is the rollback signature, independent of which device authored the
+   * forward writes. (The old root-EQUALITY check assumed a SINGLE writer and so
+   * false-alarmed on every peer-device write — which broke multi-device sync.)
    */
-  private checkRoot(): { ok: true } | { ok: false; reason: string } {
-    const folded = computeRoot(this.accState!);
-    if (folded !== this.baseline!.root) {
-      return { ok: false, reason: 'rollback' };
+  private checkRegression(): { ok: true } | { ok: false; reason: string } {
+    for (const [key, base] of this.baseline!.entries ?? []) {
+      const cur = this.accState!.get(key);
+      if (!cur || cur.version < base.version) {
+        return { ok: false, reason: 'rollback' };
+      }
     }
     return { ok: true };
   }
@@ -221,9 +247,10 @@ export class LoadDeltaTracker {
    */
   async commitBaseline(cursor: number, epoch: number, _epochSig: string): Promise<void> {
     if (this.config.baseline && this.walletPriv) {
-      const root = computeRoot(this.accState ?? new Map());
+      const acc = this.accState ?? new Map<string, EntryState>();
+      const root = computeRoot(acc);
       const sig = signRoot(this.walletPriv, this.bindingFor(cursor, root));
-      const baseline: SignedBaseline = { cursor, root, sig, epoch };
+      const baseline: SignedBaseline = { cursor, root, sig, epoch, entries: [...acc] };
       await this.config.baseline.set(this.baselineKey(), JSON.stringify(baseline));
     }
     this.accState = null; // close the pass regardless of whether a baseline was persisted
@@ -241,7 +268,7 @@ export class LoadDeltaTracker {
     const root = computeRoot(known);
     const epoch = this.baseline?.epoch ?? 0;
     const sig = signRoot(this.walletPriv, this.bindingFor(cursor, root));
-    const baseline: SignedBaseline = { cursor, root, sig, epoch };
+    const baseline: SignedBaseline = { cursor, root, sig, epoch, entries: [...known] };
     this.baseline = baseline;
     await this.config.baseline.set(this.baselineKey(), JSON.stringify(baseline));
   }

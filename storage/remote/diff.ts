@@ -73,6 +73,15 @@ export interface PlanOpsParams {
    * token entries — never swept as orphan deletes even though they live in `known`.
    */
   reserved?: ReadonlySet<string>;
+  /**
+   * Plaintext token ids the wallet has POSITIVELY spent (from `_tombstones`).
+   * ONLY these are deleted from the server. An entry merely ABSENT from `tokens`
+   * is NEVER deleted: absence ≠ spend — the local snapshot can be incomplete
+   * (the load pull hasn't run, a decrypt failed, a fresh device), and deleting on
+   * absence wiped the whole vault when local was empty
+   * (finding: vault-orphan-sweep-data-loss).
+   */
+  tombstonedTokenIds?: Iterable<string>;
 }
 
 /**
@@ -82,8 +91,9 @@ export interface PlanOpsParams {
  *    AGAINST the deleted row (delete-resurrect, #16 — NOT rebased to its version);
  *  - a token whose wireKey is a known LIVE row → update at the known version, but
  *    only when the value changed;
- *  - a known LIVE wireKey with no matching local token → delete (except reserved
- *    provider-managed slots, which are never orphan-swept).
+ *  - a token POSITIVELY spent (its id in `tombstonedTokenIds`) whose wireKey is a
+ *    known LIVE row → delete. An entry merely ABSENT from `tokens` is NEVER
+ *    deleted (absence ≠ spend); reserved provider-managed slots are never touched.
  */
 export function planOps(params: PlanOpsParams): PlannedOp[] {
   const { tokens, known, wireKeyOf, changed, reserved } = params;
@@ -106,9 +116,21 @@ export function planOps(params: PlanOpsParams): PlannedOp[] {
       ops.push({ plainKey, wireKey: wk, baseVersion: cur.version, sealVersion: cur.version + 1, isDelete: false, value });
     }
   }
-  for (const [wk, cur] of known) {
-    if (!cur.deleted && !liveWire.has(wk) && !reserved?.has(wk)) {
-      ops.push({ plainKey: '', wireKey: wk, baseVersion: cur.version, sealVersion: cur.version + 1, isDelete: true });
+  // DELETE only POSITIVELY-spent tokens (explicit tombstones) — NEVER an entry that
+  // is merely absent from `tokens`. Absence is not proof of a spend: the local
+  // snapshot can be empty/partial (the load pull hasn't run, a decrypt failed, a
+  // fresh device), and deleting on absence wiped the whole vault when local was
+  // empty (vault-orphan-sweep-data-loss). A live token is keyed by its
+  // genesis-stable tokenId, so a tombstone's tokenId maps straight to its wireKey.
+  const sweptWire = new Set<string>();
+  for (const tokenId of params.tombstonedTokenIds ?? []) {
+    const wk = wireKeyOf(tokenId);
+    if (sweptWire.has(wk)) continue;
+    sweptWire.add(wk);
+    const cur = known.get(wk);
+    // Never delete a token we still hold locally (liveWire) or a reserved slot.
+    if (cur && !cur.deleted && !liveWire.has(wk) && !reserved?.has(wk)) {
+      ops.push({ plainKey: tokenId, wireKey: wk, baseVersion: cur.version, sealVersion: cur.version + 1, isDelete: true });
     }
   }
   return ops;

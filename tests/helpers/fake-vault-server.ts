@@ -534,6 +534,22 @@ export class FakeVaultServer {
     row.seq = this.nextSeq(ownerId);
   }
 
+  /**
+   * HOSTILE-REGRESSION injector: REPLAY a previously-valid entry at a LOWER version
+   * (the server kept an old, validly-sealed ciphertext and re-presents it at a fresh
+   * seq). No wallet key is needed. Because the replayed payload is genuinely sealed at
+   * `toVersion`, the AEAD open SUCCEEDS — so only the anti-rollback GATE (version
+   * monotonicity vs the signed baseline) can catch it. Tests that the gate still
+   * alarms on a true rollback after the multi-device forward-tolerance change.
+   */
+  regressEntry(ownerId: string, key: string, toVersion: number, payload: VaultEntryPayload): void {
+    const row = this.entries.find((e) => e.ownerId === ownerId && e.key === key);
+    if (!row) throw new Error(`regressEntry: no entry ${key}`);
+    row.payload = payload;
+    row.version = toVersion; // SET (may be lower) — replays an older version
+    row.seq = this.nextSeq(ownerId); // fresh seq so it surfaces in the next /state delta
+  }
+
   /** A session id for an owner (logout tests). */
   sessionIdFor(ownerId: string): string | undefined {
     return this.sessions.find((s) => s.ownerId === ownerId && !s.revoked)?.sessionId;

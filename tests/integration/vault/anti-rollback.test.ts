@@ -94,9 +94,42 @@ describe('anti-rollback root comparison', () => {
     const err = events.find((e) => e.type === 'storage:error');
     expect(err).toBeDefined();
     expect(err!.type).toBe('storage:error'); // the FROZEN union member, exactly
-    expect((err!.data as { reason: string }).reason).toBe('rollback');
+    // mutateEntry bumps the version FORWARD + swaps the ciphertext, so the multi-device
+    // gate lets it pass and the AEAD open rejects the mismatched ciphertext ('load'); a
+    // true version REGRESSION trips the gate ('rollback'). EITHER way the hostile state
+    // is REJECTED (success:false) — the security property under test.
+    expect(['rollback', 'load']).toContain((err!.data as { reason: string }).reason);
     // NEVER a 'storage:rollback' member.
     expect(events.some((e) => (e.type as string) === 'storage:rollback')).toBe(false);
+  });
+
+  it('the gate ALARMS on a true version REGRESSION (a replayed old version), even with a valid seal', async () => {
+    const server = new FakeVaultServer(NETWORK);
+    const store = memStore();
+    const provider = makeProvider(server, store);
+    await provider.initialize();
+
+    // Bump 'a' to v2 so there is an older, validly-sealed version to replay.
+    await provider.sync(txf({ a: { n: 1 } })); // a -> v1
+    await provider.sync(txf({ a: { n: 2 } })); // a -> v2
+    const first = await provider.load(); // signed baseline: a@v2
+    expect(first.success).toBe(true);
+
+    // Hostile server REPLAYS the wallet's own old v1 entry (validly sealed at v1) at a
+    // fresh seq. AEAD OPENS it (real seal), so ONLY the gate can catch the rollback:
+    // baseline a@v2, replayed a@v1 → version regresses → 'rollback' (gate fires before
+    // materialize, so the valid seal is never the deciding factor — multi-device safe).
+    const wkA = wireKey(PRIV, NETWORK, 'a');
+    server.regressEntry(PUB, wkA, 1, seal('a', 1, { n: 1 }));
+
+    const events: StorageEvent[] = [];
+    provider.onEvent((e) => events.push(e));
+    const res = await provider.load();
+
+    expect(res.success).toBe(false);
+    const err = events.find((e) => e.type === 'storage:error');
+    expect(err).toBeDefined();
+    expect((err!.data as { reason: string }).reason).toBe('rollback'); // the GATE caught it
   });
 
   it('a clean re-load (empty delta) does NOT alarm — the gate only fires on injected state', async () => {
@@ -171,6 +204,7 @@ describe('anti-rollback first-load baseline', () => {
     expect(res.success).toBe(false);
     const err = events.find((e) => e.type === 'storage:error');
     expect(err).toBeDefined();
-    expect((err!.data as { reason: string }).reason).toBe('rollback');
+    // Rejected either by the gate ('rollback') or by AEAD on the swapped ciphertext ('load').
+    expect(['rollback', 'load']).toContain((err!.data as { reason: string }).reason);
   });
 });
