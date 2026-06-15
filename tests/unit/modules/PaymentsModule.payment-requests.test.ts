@@ -9,8 +9,11 @@
  *   respond(action:'paid'); declining maps to action:'declined' (server-
  *   confirmed BEFORE the local flip — a 409 propagates);
  * - the incoming cursor is persisted per network+identity (mirroring the
- *   mailbox cursor) and a restarted module recovers still-open requests via
- *   the status=open bootstrap without re-surfacing resolved ones;
+ *   mailbox cursor) and a restarted module rebuilds the CURRENT state of ALL
+ *   incoming requests — open AND resolved — via a full `since=0` hydration
+ *   (#556, the SDK-level J12: a request resolved in a prior session is still
+ *   present with its resolved status on reopen; resolved ones never re-fire
+ *   the new-incoming handlers/events);
  * - compositions WITHOUT wallet-api keep the Nostr transport path untouched
  *   (port selection, covenant §3.1-6).
  */
@@ -342,41 +345,66 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
     });
   });
 
-  it('a restarted module bootstraps still-open requests below the persisted cursor; resolved ones stay resolved', async () => {
+  it('#556 (SDK-level J12): a restarted module rebuilds ALL incoming requests — resolved ones present with status, opens still actionable, no re-notify', async () => {
     const { fake, baseUrl } = await startFake();
     const requester = makeWalletApiWallet(baseUrl, fake.network, REQUESTER, 'pr-5');
     const payer = makeWalletApiWallet(baseUrl, fake.network, PAYER, 'pr-6');
+    await seedServerToken(fake, payer, PAYER, 1000n);
 
-    const first = await requester.module.sendPaymentRequest(PAYER.chainPubkey, { amount: '1', coinId: UCT });
-    const second = await requester.module.sendPaymentRequest(PAYER.chainPubkey, { amount: '2', coinId: UCT });
+    const paidReq = await requester.module.sendPaymentRequest(PAYER.chainPubkey, { amount: '1', coinId: UCT, message: 'invoice 1' });
+    const declinedReq = await requester.module.sendPaymentRequest(PAYER.chainPubkey, { amount: '2', coinId: UCT });
+    const openReq = await requester.module.sendPaymentRequest(PAYER.chainPubkey, { amount: '3', coinId: UCT });
 
+    // Session 1: surface all three, then RESOLVE two (pay one, decline one).
     await payer.module.load();
     await payer.module.syncPaymentRequests();
-    expect(payer.module.getPaymentRequests()).toHaveLength(2);
-    await payer.module.rejectPaymentRequest(first.requestId!);
+    expect(payer.module.getPaymentRequests()).toHaveLength(3);
+    await payer.module.payPaymentRequest(paidReq.requestId!);
+    await payer.module.rejectPaymentRequest(declinedReq.requestId!);
+    expect(fake.getPaymentRequest(paidReq.requestId!)).toMatchObject({ status: 'paid' });
+    expect(fake.getPaymentRequest(declinedReq.requestId!)).toMatchObject({ status: 'declined' });
 
-    // "Restart": a fresh module over the SAME storage/providers. The cursor
-    // (now past both seqs) is persisted, but the surfaced list is in-memory —
-    // the status=open bootstrap recovers exactly the still-open request.
-    const restarted = createPaymentsModule({ l1: null });
-    restarted.initialize({ ...payer.deps });
-    cleanups.push(() => restarted.destroy());
-    await restarted.load();
-    await restarted.syncPaymentRequests();
+    // Reopen: a fresh module over the SAME persisted stateStore/providers. The
+    // cursor (now past all seqs) is persisted, but the surfaced list is
+    // in-memory — pre-#556 only the still-open `openReq` survived, and the
+    // resolved paid/declined requests VANISHED. The #556 full `since=0`
+    // hydration must rebuild the CURRENT state of ALL incoming requests.
+    const reopened = createPaymentsModule({ l1: null });
+    reopened.initialize({ ...payer.deps });
+    cleanups.push(() => reopened.destroy());
+    const reNotified: IncomingPaymentRequest[] = [];
+    reopened.onPaymentRequest((r) => reNotified.push(r));
+    await reopened.load();
+    await reopened.syncPaymentRequests();
 
-    const recovered = restarted.getPaymentRequests();
-    expect(recovered.map((r) => r.id)).toEqual([second.requestId]);
-    expect(recovered[0].status).toBe('pending');
+    // J12: the resolved requests are PRESENT with their resolved status…
+    const byId = new Map(reopened.getPaymentRequests().map((r) => [r.id, r]));
+    expect(byId.size).toBe(3);
+    expect(byId.get(paidReq.requestId!)?.status).toBe('paid');
+    expect(byId.get(declinedReq.requestId!)?.status).toBe('rejected');
+    // …and the still-open one re-hydrates as actionable (pending).
+    expect(byId.get(openReq.requestId!)?.status).toBe('pending');
+    // The resolved request's decrypted memo survives the reload (#554/dev.12).
+    expect(byId.get(paidReq.requestId!)?.message).toBe('invoice 1');
 
-    // The tail still works from the persisted cursor: a NEW request arrives.
-    const third = await requester.module.sendPaymentRequest(PAYER.chainPubkey, { amount: '3', coinId: UCT });
-    await restarted.syncPaymentRequests();
-    expect(restarted.getPaymentRequests().map((r) => r.id).sort()).toEqual(
-      [second.requestId, third.requestId].sort()
+    // Re-notification guard: the reopened module's new-incoming handler fires
+    // ONLY for the still-open request — never for the paid/declined ones (the
+    // hydration folds resolved requests into the list silently, #556). The
+    // handler is registered on the reopened module alone, so it observes only
+    // this session's notifications.
+    expect(reNotified.map((r) => r.id)).toEqual([openReq.requestId]);
+
+    // The tail still works from the persisted cursor: a NEW request arrives,
+    // notifies, and does not disturb the hydrated resolved rows.
+    const fresh = await requester.module.sendPaymentRequest(PAYER.chainPubkey, { amount: '4', coinId: UCT });
+    await reopened.syncPaymentRequests();
+    expect(reopened.getPaymentRequests().map((r) => r.id).sort()).toEqual(
+      [paidReq.requestId, declinedReq.requestId, openReq.requestId, fresh.requestId].sort()
     );
+    expect(reNotified.map((r) => r.id).sort()).toEqual([openReq.requestId, fresh.requestId].sort());
   });
 
-  it('a failed bootstrap scan is retried on the next pump (the flag is burned only on success)', async () => {
+  it('a failed hydration is retried on the next pump (the flag is burned only on success)', async () => {
     const { fake, baseUrl } = await startFake();
     const requester = makeWalletApiWallet(baseUrl, fake.network, REQUESTER, 'pr-8');
     const payer = makeWalletApiWallet(baseUrl, fake.network, PAYER, 'pr-9');
@@ -387,8 +415,8 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
     await payer.module.syncPaymentRequests();
     expect(payer.module.getPaymentRequests()).toHaveLength(1);
 
-    // Restarted session: the bootstrap scan (the FIRST list call, since the
-    // persisted cursor > 0) hits a transient outage.
+    // Restarted session: the #556 full `since=0` hydration (the FIRST list
+    // call of the session) hits a transient outage.
     vi.spyOn(payer.client, 'listPaymentRequests').mockImplementationOnce(() =>
       Promise.reject(new Error('simulated outage'))
     );
