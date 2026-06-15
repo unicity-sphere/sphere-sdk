@@ -166,7 +166,9 @@ describe('CommunicationsModule cacheMessages option', () => {
 
       // Transport receives x-only key (02 prefix stripped by resolver)
       const xOnlyPeer = 'b'.repeat(64);
-      expect(deps.transport.sendMessage).toHaveBeenCalledWith(xOnlyPeer, 'hi');
+      // `options` arg added per sphere-sdk#555 (selfWrap opt-out); undefined
+      // when caller omits it (default behavior unchanged).
+      expect(deps.transport.sendMessage).toHaveBeenCalledWith(xOnlyPeer, 'hi', undefined);
       expect(message).toMatchObject({ content: 'hi' });
       expect(mod.getConversation(PEER_PUBKEY)).toEqual([]);
       expect(deps.storage.set).not.toHaveBeenCalled();
