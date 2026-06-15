@@ -242,6 +242,86 @@ describe('CommunicationsModule — storage & pagination', () => {
         expect.any(String),
       );
     });
+
+    // ----------------------------------------------------------------
+    // Issue #551 — save chain must NOT propagate
+    // PROFILE_NOT_INITIALIZED throws from the storage layer. The
+    // fire-and-forget call site `handleIncomingMessage → save('raw')`
+    // crashed `sphere trader spawn` on the first inbound DM when the
+    // OrbitDB adapter raced a disconnect mid-save. The in-memory
+    // messages map is durable; the next successful save re-emits the
+    // entire collection. Strict-throw semantics of
+    // ProfileStorageProvider.set() (used by AutoReturnLedger's
+    // write-first rollback) are preserved by moving the catch up to
+    // the actual fire-and-forget owner.
+    // ----------------------------------------------------------------
+
+    it('#551: sendDM swallows transient PROFILE_NOT_INITIALIZED from storage.set', async () => {
+      const deps = createDeps();
+      const profileNotInitErr = Object.assign(new Error('OrbitDB adapter is not connected'), {
+        code: 'PROFILE_NOT_INITIALIZED',
+      });
+      (deps.storage.set as ReturnType<typeof vi.fn>).mockRejectedValueOnce(profileNotInitErr);
+      mod.initialize(deps);
+
+      // sendDM awaits save() internally. With the #551 catch, the
+      // transient throw is swallowed and sendDM resolves normally.
+      await expect(mod.sendDM(PEER_A_PUBKEY, 'hello')).resolves.toMatchObject({
+        senderPubkey: MY_PUBKEY,
+      });
+    });
+
+    it('#551: save() still propagates non-PROFILE_NOT_INITIALIZED errors', async () => {
+      // Pump messages directly so we can await save() via deleteConversation,
+      // which is the simplest awaited save() path that exposes throws.
+      const deps = createDeps();
+      const realErr = new Error('disk-full');
+      (deps.storage.set as ReturnType<typeof vi.fn>).mockRejectedValueOnce(realErr);
+      mod.initialize(deps);
+
+      // deleteConversation triggers save('cache_index'). A non-PROFILE_NOT_INITIALIZED
+      // throw must propagate.
+      // Add a message first so deleteConversation has something to remove.
+      (mod as unknown as { messages: Map<string, DirectMessage> }).messages.set(
+        'm1',
+        makeMessage('m1', PEER_A_PUBKEY, MY_PUBKEY, 1000),
+      );
+      await expect(mod.deleteConversation(PEER_A_PUBKEY)).rejects.toThrow(/disk-full/);
+    });
+
+    it('#551: incoming DM handler does not crash on PROFILE_NOT_INITIALIZED', async () => {
+      const deps = createDeps();
+      let onMessageHandler: ((msg: unknown) => void) | undefined;
+      (deps.transport.onMessage as ReturnType<typeof vi.fn>).mockImplementation((cb) => {
+        onMessageHandler = cb as (msg: unknown) => void;
+        return () => {};
+      });
+      const profileNotInitErr = Object.assign(new Error('OrbitDB adapter is not connected'), {
+        code: 'PROFILE_NOT_INITIALIZED',
+      });
+      (deps.storage.set as ReturnType<typeof vi.fn>).mockRejectedValueOnce(profileNotInitErr);
+      mod.initialize(deps);
+      expect(onMessageHandler).toBeDefined();
+
+      // Simulate inbound DM — handleIncomingMessage fires save('raw')
+      // fire-and-forget. Before #551 fix this rejected the chained
+      // promise and the rejection leaked. After fix the chain catches.
+      onMessageHandler!({
+        id: 'evt-1',
+        senderTransportPubkey: PEER_A_PUBKEY,
+        recipientTransportPubkey: MY_PUBKEY,
+        content: 'inbound',
+        timestamp: Date.now(),
+        isSelfWrap: false,
+      });
+
+      // Yield to let the fire-and-forget save chain settle.
+      await new Promise((r) => setTimeout(r, 0));
+      // Drain the save chain — should resolve, not reject.
+      await expect(
+        (mod as unknown as { _saveChain: Promise<void> })._saveChain,
+      ).resolves.toBeUndefined();
+    });
   });
 
   // =========================================================================
