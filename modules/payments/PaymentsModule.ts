@@ -113,6 +113,16 @@ const MAX_SYNCED_HISTORY_ENTRIES = 5000;
 const MAX_HISTORY_HYDRATION_PAGES = 100;
 
 /**
+ * Cap on the number of gap-free `?since=` pages pulled when rebuilding the
+ * incoming payment-request view from the server on reload (the wallet-api
+ * composition — the #556 reload fix). At the §16 page limit this bounds a
+ * single hydration past any realistic payer's request history while staying
+ * finite if the server ever mis-reports `more`. Mirrors
+ * {@link MAX_HISTORY_HYDRATION_PAGES}.
+ */
+const MAX_PR_HYDRATION_PAGES = 100;
+
+/**
  * Overall timeout for a single engine transfer/split during send(). Overrides
  * the SDK's 10s default inclusion-proof abort — a slow aggregator must get a
  * fair window, because once the certification is submitted the source state is
@@ -937,10 +947,13 @@ export class PaymentsModule {
   /** Coalesces concurrent payment-request pump runs. */
   private prPumpInFlight: Promise<void> | null = null;
   /**
-   * Set after the once-per-session `status=open` bootstrap scan: the surfaced
-   * incoming list is in-memory only, so still-open requests BELOW the
-   * persisted cursor must be recovered at session start (bounded by the §5.5
-   * per-payer open cap).
+   * Set after the once-per-session full incoming hydration (#556): the surfaced
+   * incoming list is in-memory only, so on a fresh engine the CURRENT state of
+   * ALL incoming requests — open AND resolved (paid/declined/expired) — must be
+   * rebuilt from a `role=incoming&since=0` pull, not just the still-open ones.
+   * A status-filtered bootstrap (the pre-#556 `status=open` scan) dropped
+   * requests resolved in a PRIOR session, so the payer reopened and the
+   * 'Paid Successfully' request was gone (twin of #521/#549).
    */
   private prBootstrapped = false;
 
@@ -4678,27 +4691,33 @@ export class PaymentsModule {
    * mailbox-cursor pattern: the persisted `{cursor, syncEpoch}` is the resume
    * point; a `syncEpoch` change (server restore — §5.4) voids cursor
    * continuity, so the tail re-pulls from 0 and the id-dedup in
-   * {@link surfaceIncomingPaymentRequest} absorbs the replays. Because the
-   * surfaced list is in-memory only, each session ALSO starts with one
-   * `status=open` bootstrap scan from 0 — still-open requests below the
-   * cursor (bounded by the §5.5 per-payer open cap) are recovered; resolved
-   * ones are not re-surfaced.
+   * {@link surfaceIncomingPaymentRequest} absorbs the replays.
+   *
+   * Because the surfaced list is in-memory only, each session FIRST runs one
+   * full incoming hydration from `since=0` with NO status filter (#556 —
+   * mirrors {@link hydrateHistoryFromServer}): a fresh engine rebuilds the
+   * CURRENT state of ALL incoming requests — open AND resolved — so a request
+   * paid/declined/expired in a PRIOR session is still present (with its
+   * resolved status) instead of vanishing once the cursor advanced past it.
+   * Hydration NEVER fires the new-incoming handlers/events for resolved
+   * requests — only `open` ones notify (the status-aware
+   * {@link surfaceIncomingPaymentRequest}) — so reopening can't spam stale
+   * 'new request' notifications. After hydration the `since`-cursor delta poll
+   * picks up live updates from the resume point.
    */
   private async pumpIncomingPaymentRequests(api: PaymentRequestsApi): Promise<void> {
     const persisted = await this.readPrCursorState();
 
     if (!this.prBootstrapped) {
-      if (persisted !== null && persisted.cursor > 0n) {
-        let scan = await api.listPaymentRequests({ role: 'incoming', status: 'open', since: 0n });
-        for (;;) {
-          for (const wire of scan.requests) this.surfaceIncomingPaymentRequest(wire);
-          if (!scan.more) break;
-          scan = await api.listPaymentRequests({ role: 'incoming', status: 'open', since: scan.cursor });
-        }
+      let scan = await api.listPaymentRequests({ role: 'incoming', since: 0n });
+      for (let pageCount = 0; pageCount < MAX_PR_HYDRATION_PAGES; pageCount++) {
+        for (const wire of scan.requests) this.surfaceIncomingPaymentRequest(wire);
+        if (!scan.more) break;
+        scan = await api.listPaymentRequests({ role: 'incoming', since: scan.cursor });
       }
-      // Marked only after the scan SUCCEEDS — a transient failure here must
+      // Marked only after the hydration SUCCEEDS — a transient failure here must
       // not skip recovery for the rest of the session (the next poll retries;
-      // the id-dedup makes a re-scan safe).
+      // the id-dedup makes a re-hydration safe).
       this.prBootstrapped = true;
     }
 
@@ -4736,18 +4755,28 @@ export class PaymentsModule {
     }
   }
 
+  /** §16 wire status → the public {@link PaymentRequestStatus} display status. */
+  private static readonly PR_WIRE_STATUS: Record<
+    WalletApiPaymentRequest['status'],
+    PaymentRequestStatus
+  > = { open: 'pending', paid: 'paid', declined: 'rejected', expired: 'expired' };
+
   /**
    * Map a §16 wire request onto the public {@link IncomingPaymentRequest}
-   * surface and notify (event + handlers). Only `open` requests are
-   * actionable; the in-memory id-dedup doubles as the replay guard for
-   * cursor resets. Multi-asset requests surface their first asset (the
-   * module's request surface is single-asset; module-created requests
-   * always are).
+   * surface, deduped by id (the in-memory id-dedup doubles as the replay guard
+   * for cursor resets). Requests of EVERY status are surfaced so a reloaded
+   * thin wallet rebuilds the CURRENT state of its incoming view (#556) — open
+   * ones land as actionable `pending`, resolved ones carry their paid/declined
+   * (→ `rejected`)/expired status. Only `open` requests fire the new-incoming
+   * event + handlers; resolved requests are folded into the list silently, so a
+   * reload (or a `syncEpoch` re-pull) never re-notifies for already-resolved
+   * requests. Multi-asset requests surface their first asset (the module's
+   * request surface is single-asset; module-created requests always are).
    */
   private surfaceIncomingPaymentRequest(wire: WalletApiPaymentRequest): void {
-    if (wire.status !== 'open') return;
     if (this.paymentRequests.some((r) => r.id === wire.id)) return;
 
+    const status = PaymentsModule.PR_WIRE_STATUS[wire.status];
     const coinId = wire.assets[0]?.coinId ?? '';
     const coinDef = TokenRegistry.getInstance().getDefinition(coinId);
 
@@ -4757,7 +4786,9 @@ export class PaymentsModule {
     // It carries the requester's nametag AND message, so the payer renders
     // "@requester" + the message instead of a raw pubkey. An envelope not
     // addressed here, or any tamper, fails authentication and surfaces as
-    // absent — never garbage, and never thrown into the view path.
+    // absent — never garbage, and never thrown into the view path. Decrypted
+    // for resolved requests too (#554/dev.12), so a reloaded view renders the
+    // memo/nametag of a paid/declined request, not a raw pubkey.
     const { memo: message, senderNametag } = this.decryptPaymentRequestMemo(wire);
 
     const request: IncomingPaymentRequest = {
@@ -4770,21 +4801,27 @@ export class PaymentsModule {
       ...(message !== undefined ? { message } : {}),
       requestId: wire.id,
       timestamp: wire.createdAt,
-      status: 'pending',
+      status,
     };
 
     // Add to list (newest first)
     this.paymentRequests.unshift(request);
-    this.deps?.emitEvent('payment_request:incoming', request);
-    for (const handler of this.paymentRequestHandlers) {
-      try {
-        handler(request);
-      } catch (error) {
-        logger.debug('Payments', 'Payment request handler error:', error);
+
+    // Notify ONLY for actionable (open) requests — a reload-hydrated resolved
+    // request must not re-fire 'new incoming request' (#556). Open requests
+    // surfaced during hydration DO notify, exactly as the prior bootstrap did.
+    if (status === 'pending') {
+      this.deps?.emitEvent('payment_request:incoming', request);
+      for (const handler of this.paymentRequestHandlers) {
+        try {
+          handler(request);
+        } catch (error) {
+          logger.debug('Payments', 'Payment request handler error:', error);
+        }
       }
     }
 
-    logger.debug('Payments', `Incoming payment request: ${request.id} for ${request.amount} ${request.symbol}`);
+    logger.debug('Payments', `Incoming payment request: ${request.id} (${status}) for ${request.amount} ${request.symbol}`);
   }
 
   /**
