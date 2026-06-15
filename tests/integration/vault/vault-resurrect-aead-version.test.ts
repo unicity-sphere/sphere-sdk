@@ -49,11 +49,16 @@ function makeProvider(server: FakeVaultServer): RemoteTokenStorageProvider {
   return p;
 }
 
-function txf(tokens: Record<string, unknown>): TxfStorageDataBase {
+function txf(tokens: Record<string, unknown>, tombstonedIds: string[] = []): TxfStorageDataBase {
   const data: TxfStorageDataBase = {
     _meta: { version: 1, address: 'DIRECT://x', formatVersion: '2.0', updatedAt: Date.now() },
   };
   for (const [id, val] of Object.entries(tokens)) data[`_${id}` as `_${string}`] = val;
+  // Deletes are driven by EXPLICIT spend tombstones (vault-orphan-sweep-data-loss),
+  // NOT by mere absence of the key from the snapshot.
+  if (tombstonedIds.length > 0) {
+    data._tombstones = tombstonedIds.map((tokenId) => ({ tokenId, stateHash: 'sh', timestamp: 1 }));
+  }
   return data;
 }
 
@@ -89,8 +94,8 @@ describe('resurrect AEAD version binding', () => {
     await provider.sync(txf({ k: { amt: '1' } }));
     expect(server.getEntry(PUB, wk)?.version).toBe(1);
 
-    // delete -> server tombstones at v2
-    await provider.sync(txf({})); // 'k' absent → orphan delete
+    // delete -> server tombstones at v2 (driven by an EXPLICIT spend tombstone)
+    await provider.sync(txf({}, ['k']));
     expect(server.getEntry(PUB, wk)?.deleted).toBe(true);
     expect(server.getEntry(PUB, wk)?.version).toBe(2);
 

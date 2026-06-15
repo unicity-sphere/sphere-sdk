@@ -42,11 +42,16 @@ function makeProvider(server: FakeVaultServer): RemoteTokenStorageProvider {
   return p;
 }
 
-function txf(tokens: Record<string, unknown>): TxfStorageDataBase {
+function txf(tokens: Record<string, unknown>, tombstonedIds: string[] = []): TxfStorageDataBase {
   const data: TxfStorageDataBase = {
     _meta: { version: 1, address: 'DIRECT://x', formatVersion: '2.0', updatedAt: Date.now() },
   };
   for (const [id, val] of Object.entries(tokens)) data[`_${id}` as `_${string}`] = val;
+  // Deletes are driven by EXPLICIT spend tombstones (vault-orphan-sweep-data-loss),
+  // NOT by mere absence of the key from the snapshot.
+  if (tombstonedIds.length > 0) {
+    data._tombstones = tombstonedIds.map((tokenId) => ({ tokenId, stateHash: 'sh', timestamp: 1 }));
+  }
   return data;
 }
 
@@ -95,8 +100,8 @@ describe('load() rehydrates token entries (Phase 7.2)', () => {
     const writer = makeProvider(server);
     await writer.initialize();
     await writer.sync(txf({ ddd: { id: 'ddd', sdkData: 'aa' }, eee: { id: 'eee', sdkData: 'bb' } }));
-    // Drop 'ddd' → orphan delete (tombstone on the server).
-    await writer.sync(txf({ eee: { id: 'eee', sdkData: 'bb' } }));
+    // Spend 'ddd' → an EXPLICIT tombstone drives the server delete (absence alone never deletes).
+    await writer.sync(txf({ eee: { id: 'eee', sdkData: 'bb' } }, ['ddd']));
 
     const reader = makeProvider(server);
     const res = await reader.load();
@@ -137,8 +142,8 @@ describe('load() rehydrates token entries (Phase 7.2)', () => {
     const first = await reader.load();
     expect((first.data as TxfStorageDataBase)['_hhh' as `_${string}`]).toEqual({ id: 'hhh', sdkData: 'aa' });
 
-    // Tombstone hhh via the writer, then reader picks up the delete-only delta.
-    await writer.sync(txf({}));
+    // Tombstone hhh via the writer (explicit spend), then reader picks up the delete-only delta.
+    await writer.sync(txf({}, ['hhh']));
     const afterDelete = await reader.load();
     expect((afterDelete.data as TxfStorageDataBase)['_hhh' as `_${string}`]).toBeUndefined();
   });

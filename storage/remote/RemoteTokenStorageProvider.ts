@@ -346,7 +346,13 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     this.wakeClient = new VaultWakeClient({
       vaultUrl: this.config.vaultUrl,
       auth: this.auth,
-      onWake: () => this.emit('storage:remote-updated', { source: 'vault-wake' }),
+      // Only wake when this provider is actually connected. A stale wake (e.g. fired
+      // after shutdown/identity-switch, before stop() lands) must NOT drive a receive/
+      // sync against torn-down wallet storage ("IndexedDBStorageProvider not connected").
+      onWake: () => {
+        if (this.status !== 'connected') return;
+        this.emit('storage:remote-updated', { source: 'vault-wake' });
+      },
     });
     this.wakeClient.start();
   }
@@ -461,11 +467,18 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
 
   /** Diff the TXF snapshot vs internal last-known state into a list of CAS ops. */
   private planFlush(localData: TData): PlannedOp[] {
+    // Deletes are driven by EXPLICIT spend tombstones, NEVER by absence from the
+    // snapshot (vault-orphan-sweep-data-loss): an empty/partial local view — the
+    // load pull not yet run, a failed decrypt, a fresh device — must not wipe the
+    // vault. A live token is keyed by its genesis-stable tokenId, so a tombstone's
+    // tokenId maps straight to the wireKey to delete.
+    const tombstones = (localData as unknown as TxfStorageDataBase)._tombstones ?? [];
     return planOps({
       tokens: extractTokens(localData),
       known: this.known,
       wireKeyOf: (plainKey) => this.wireKeyFor(plainKey),
       changed: (wk, value) => this.hasChanged(wk, value),
+      tombstonedTokenIds: tombstones.map((t) => t.tokenId),
     });
   }
 
@@ -937,6 +950,17 @@ export class RemoteTokenStorageProvider<TData extends TxfStorageDataBase = TxfSt
     let n = 0;
     for (const e of this.known.values()) if (!e.deleted) n += 1;
     return n;
+  }
+
+  /**
+   * True if the vault's last-known view has this token's wireKey TOMBSTONED — i.e.
+   * another device SPENT it. PaymentsModule.load uses this to DROP a stale local
+   * token the vault marked spent, so the `delete-resurrect` sync path can't
+   * re-create it and inflate the balance (finding: vault-cross-device-resurrect).
+   * `plainKey` is the genesis tokenId (v2TokenId === engine.tokenId === keyFromTokenId base).
+   */
+  isPlainKeyDeleted(plainKey: string): boolean {
+    return this.known.get(this.wireKeyFor(plainKey))?.deleted === true;
   }
 
   /** Snapshot the internal last-known state as a merkle `EntryState` map. */
