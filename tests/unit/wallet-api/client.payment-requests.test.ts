@@ -288,9 +288,15 @@ describe('WalletApiClient — §5.5 per-payer open cap', () => {
     await payer.respondPaymentRequest(first.id, { action: 'declined' });
     await expect(mk(r2, PAYER.chainPubkey)).resolves.toMatchObject({ status: 'open' });
 
-    // Gap-free even through the cap bounce: the rejected create burned nothing.
+    // §16 upsert + gap-free through the cap bounce: the 429 burned no seq; the declined
+    // `first` re-surfaces at a fresh seq above its creation slot (1 → 3); the freed create → 4.
     const incoming = await payer.listPaymentRequests({ role: 'incoming', since: 0n });
-    expect(incoming.requests.map((r) => r.seq)).toEqual([1n, 2n, 3n]);
+    expect(incoming.requests.map((r) => ({ seq: r.seq, status: r.status }))).toEqual([
+      { seq: 2n, status: 'open' },
+      { seq: 3n, status: 'declined' },
+      { seq: 4n, status: 'open' },
+    ]);
+    expect(incoming.requests.find((r) => r.id === first.id)).toMatchObject({ seq: 3n, status: 'declined' });
   });
 });
 
