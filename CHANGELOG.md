@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — history disappears on reload (#549)
+
+- **History reload (#549, the HISTORY twin of #521):** in the wallet-api
+  composition `PaymentsModule.loadHistory()` read from the local token storage
+  provider's `getHistoryEntries()`, but the thin `WalletApiTokenStorageProvider`
+  keeps no history — so a reloaded instance (tab refresh) fell into an empty KV
+  fallback and rendered an empty transaction history, even though every send /
+  receive POSTs the record to the server's §10 log. `loadHistory()` now rebuilds
+  `_historyCache` from `walletApi.listHistory()` (newest-first keyset pages until
+  `more:false`, deduped by `dedupKey`) whenever the `walletApi` client is
+  present; the S6 `memo` / `counterpartyNametag` envelopes are decrypted with the
+  owner's own field key on read-back (§8.3). Compositions without `walletApi`
+  keep the legacy local path. The `PaymentsWalletApiPort` gains a `listHistory`
+  member (the READ side of the §10 client-written log). Regression: send→reload
+  (SENT record, memo decrypted) and receive→reload (RECEIVED record, sender
+  nametag + memo decrypted) against the fake backend, asserting the in-session
+  and post-reload sets match (no loss, no dupes).
+
 ### Fixed — reload renders an empty wallet (#521)
 
 - **Thin-provider reload (#521):** `WalletApiTokenStorageProvider` persisted

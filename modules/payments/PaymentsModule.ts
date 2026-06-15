@@ -100,6 +100,14 @@ function computeHistoryDedupKey(type: string, tokenId?: string, transferId?: str
 const MAX_SYNCED_HISTORY_ENTRIES = 5000;
 
 /**
+ * Cap on the number of newest-first keyset pages pulled when rebuilding history
+ * from the server on reload (the wallet-api composition). At the §16 page limit
+ * this bounds a single hydration well past any realistic wallet's recent
+ * history while staying finite if the server ever mis-reports `more`.
+ */
+const MAX_HISTORY_HYDRATION_PAGES = 100;
+
+/**
  * Overall timeout for a single engine transfer/split during send(). Overrides
  * the SDK's 10s default inclusion-proof abort — a slow aggregator must get a
  * fair window, because once the certification is submitted the source state is
@@ -653,6 +661,24 @@ export type WalletApiPaymentRequestsPage =
     };
 
 /**
+ * One §16 history wire record (§10 — the server never writes history rows).
+ * `memo` / `counterpartyNametag` are S6 `enc1.` envelopes, verbatim (§8.3) —
+ * encrypted on POST, returned encrypted on GET, decrypted by the owner only.
+ */
+export interface WalletApiHistoryRecord {
+  dedupKey: string;
+  id: string;
+  type: string;
+  ts: string;
+  assets: { coinId: string; amount: string }[];
+  transferId?: string;
+  tokenId?: string;
+  counterpartyPubkey?: string;
+  memo?: string;
+  counterpartyNametag?: string;
+}
+
+/**
  * The narrow, STRUCTURAL slice of the wallet-api client this module needs:
  * the E.3 intent lifecycle, blob uploads for spend outputs, and the §10
  * client-written history log. `WalletApiClient` satisfies it as-is; the
@@ -678,20 +704,21 @@ export interface PaymentsWalletApiPort {
   /** Upload to a presigned PUT (a 412 = already present = success — §5.2). */
   uploadBlob(putUrl: string, bytes: Uint8Array): Promise<void>;
   /** §10: client-asserted history records (§16 wire shape), deduped by dedupKey server-side. */
-  postHistoryRecords(
-    records: {
-      dedupKey: string;
-      id: string;
-      type: string;
-      ts: string;
-      assets: { coinId: string; amount: string }[];
-      transferId?: string;
-      tokenId?: string;
-      counterpartyPubkey?: string;
-      memo?: string;
-      counterpartyNametag?: string;
-    }[]
-  ): Promise<void>;
+  postHistoryRecords(records: WalletApiHistoryRecord[]): Promise<void>;
+  /**
+   * §10/§16: read the client-written history log back — newest-first keyset
+   * pages (`{records, more, cursor, syncEpoch}`). The READ side of the §10 log:
+   * a reloaded thin wallet rebuilds its history from here (the in-memory cache
+   * is process-lifetime; the durable log lives on the server). `memo` /
+   * `counterpartyNametag` come back as the verbatim S6 `enc1.` envelopes — the
+   * owner decrypts them with its own field key on display (§8.3).
+   */
+  listHistory(options?: { before?: string; limit?: number }): Promise<{
+    records: WalletApiHistoryRecord[];
+    more: boolean;
+    cursor: string | null;
+    syncEpoch: bigint;
+  }>;
 
   // ── payment requests (sdk-changes S4 — §10/§16) — OPTIONAL capability ───────
   // When the composed port carries all three endpoints (the S4 wallet-api
@@ -3522,10 +3549,20 @@ export class PaymentsModule {
   }
 
   /**
-   * Load history from the local token storage provider into the in-memory cache.
-   * Also performs one-time migration from legacy KV storage.
+   * Load history into the in-memory cache.
+   *
+   * In the wallet-api composition (the `walletApi` client is present) the
+   * durable §10 history log lives on the SERVER — the thin storage provider
+   * keeps none — so the cache is rebuilt from `walletApi.listHistory()`. The
+   * twin of the #521 inventory reload bug: `_historyCache` is process-lifetime,
+   * so a reload (tab refresh) must re-pull it or render an empty history.
+   * Compositions WITHOUT `walletApi` keep the legacy local path below.
    */
   async loadHistory(): Promise<void> {
+    if (this.deps!.walletApi?.listHistory) {
+      await this.hydrateHistoryFromServer(this.deps!.walletApi);
+      return;
+    }
     const provider = this.getLocalTokenStorageProvider();
     if (provider?.getHistoryEntries) {
       this._historyCache = await provider.getHistoryEntries();
@@ -3561,6 +3598,86 @@ export class PaymentsModule {
           this._historyCache = [];
         }
       }
+    }
+  }
+
+  /**
+   * Rebuild `_historyCache` from the server's §10 history log (the wallet-api
+   * composition). Pages newest-first via the keyset cursor until `more:false`
+   * or the page cap; dedups by `dedupKey` (a hydrate-then-receive in the same
+   * session must not double-list). The S6 `memo` / `counterpartyNametag`
+   * envelopes are decrypted with the owner's own field key on the way in.
+   *
+   * Best-effort, like the §10 history POST: history is untrusted DISPLAY data,
+   * so a backend outage during hydration must NEVER fail `load()` (the money
+   * path) — the in-session cache is left intact and the pull retries next load.
+   */
+  private async hydrateHistoryFromServer(api: PaymentsWalletApiPort): Promise<void> {
+    const byDedupKey = new Map<string, TransactionHistoryEntry>();
+    try {
+      let before: string | undefined;
+      for (let page = 0; page < MAX_HISTORY_HYDRATION_PAGES; page++) {
+        const result = await api.listHistory(before !== undefined ? { before } : {});
+        for (const wire of result.records) {
+          if (!byDedupKey.has(wire.dedupKey)) {
+            byDedupKey.set(wire.dedupKey, this.historyEntryFromWire(wire));
+          }
+        }
+        if (!result.more || result.cursor === null) break;
+        before = result.cursor;
+      }
+    } catch (err) {
+      logger.warn('Payments', 'history hydration from server failed (kept in-memory; retries next load):', err);
+      return;
+    }
+    this._historyCache = [...byDedupKey.values()];
+  }
+
+  /**
+   * Map one §16 history wire record onto the display
+   * {@link TransactionHistoryEntry}. `counterpartyNametag` lands on the role-
+   * appropriate field (sender for RECEIVED, recipient otherwise); the S6 memo +
+   * nametag envelopes decrypt under THIS wallet's field key (self-scoped at
+   * rest — §8.3), surfaced as absent if they don't decrypt rather than as
+   * ciphertext (same rule as mailbox/payment-request memos).
+   */
+  private historyEntryFromWire(wire: WalletApiHistoryRecord): TransactionHistoryEntry {
+    const asset = wire.assets[0];
+    const coinId = asset?.coinId ?? '';
+    const received = wire.type === 'RECEIVED';
+    const memo = this.tryDecryptField(wire.memo);
+    const nametag = this.tryDecryptField(wire.counterpartyNametag);
+    return {
+      id: wire.id,
+      dedupKey: wire.dedupKey,
+      type: wire.type as TransactionHistoryEntry['type'],
+      amount: asset?.amount ?? '0',
+      coinId,
+      symbol: this.getCoinSymbol(coinId),
+      timestamp: Date.parse(wire.ts),
+      ...(wire.transferId !== undefined ? { transferId: wire.transferId } : {}),
+      ...(wire.tokenId !== undefined ? { tokenId: wire.tokenId } : {}),
+      ...(wire.counterpartyPubkey !== undefined
+        ? received
+          ? { senderPubkey: wire.counterpartyPubkey }
+          : { recipientPubkey: wire.counterpartyPubkey }
+        : {}),
+      ...(nametag !== undefined
+        ? received
+          ? { senderNametag: nametag }
+          : { recipientNametag: nametag }
+        : {}),
+      ...(memo !== undefined ? { memo } : {}),
+    };
+  }
+
+  /** S6 field decrypt that surfaces an undecryptable envelope as absent (§8.3). */
+  private tryDecryptField(envelope?: string): string | undefined {
+    if (envelope === undefined) return undefined;
+    try {
+      return decryptField(this.getFieldEncryptionKey(), envelope);
+    } catch {
+      return undefined;
     }
   }
 

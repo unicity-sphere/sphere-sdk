@@ -604,3 +604,90 @@ describe('reload (tab refresh) — durable cursor, rebuilt view (#521)', () => {
     expect(fake.inventoryGetLog).toEqual([null, cursor, cursor]);
   });
 });
+
+describe('history reload (tab refresh) — rebuilt from the server log (J4/J5, #549)', () => {
+  it('J4: send → reload → the SENT record is hydrated from the server with its memo decrypted (no loss, no dupes)', async () => {
+    const { fake, baseUrl } = await startFake();
+    const kv = new MemoryKeyValueStore(); // the SHARED persisted stateStore — survives the "refresh"
+
+    // Session 1 — send; the SENT history record is POSTed to the server (§10),
+    // its memo an S6 envelope keyed by the SENDER's own field key (§8.3).
+    const tab1 = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-h4', kv);
+    await seedServerToken(fake, tab1, SENDER, 1000n);
+    await tab1.module.load();
+    const sent = await tab1.module.send({ recipient: '@bob', amount: '1000', coinId: UCT, memo: 'lunch' });
+    expect(sent.status).toBe('completed');
+
+    const inSession = tab1.module.getHistory();
+    const sentDedup = `SENT_transfer_${sent.id}`;
+    expect(inSession.filter((e) => e.dedupKey === sentDedup)).toHaveLength(1);
+    expect(inSession.find((e) => e.dedupKey === sentDedup)).toMatchObject({
+      type: 'SENT', amount: '1000', coinId: UCT, transferId: sent.id, memo: 'lunch',
+    });
+
+    // Session 2 — a NEW module instance over the SAME persisted stateStore (the
+    // tab refresh). The thin provider keeps NO history, so before #549 this
+    // rendered an empty history; now it rehydrates from walletApi.listHistory().
+    const tab2 = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-h4', kv);
+    await tab2.module.load();
+
+    const reloaded = tab2.module.getHistory();
+    const reloadedSent = reloaded.filter((e) => e.dedupKey === sentDedup);
+    expect(reloadedSent).toHaveLength(1); // present + de-duplicated
+    expect(reloadedSent[0]).toMatchObject({
+      id: expect.any(String),
+      type: 'SENT',
+      amount: '1000',
+      coinId: UCT,
+      transferId: sent.id,
+      memo: 'lunch', // S6 envelope decrypted with the owner's own field key
+    });
+    // The post-reload set matches the in-session set exactly (by dedupKey).
+    expect(new Set(reloaded.map((e) => e.dedupKey))).toEqual(new Set(inSession.map((e) => e.dedupKey)));
+  });
+
+  it('J5: receive → reload → the RECEIVED record is hydrated with the sender nametag + memo decrypted', async () => {
+    const { fake, baseUrl } = await startFake();
+    const recipientKv = new MemoryKeyValueStore(); // the recipient's persisted store — survives the refresh
+
+    // The sender (separate store) sends with a nametag + memo; both ride the
+    // recipient-addressed S6 delivery envelope (dev.10 recipient-ECDH).
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-h5-s');
+    await seedServerToken(fake, sender, SENDER, 1000n);
+    await sender.module.load();
+    await sender.module.setNametag({
+      name: 'api-1', token: {}, timestamp: Date.now(), format: 'txf', version: '2.0',
+    });
+    await sender.module.send({ recipient: '@bob', amount: '1000', coinId: UCT, memo: 'hi' });
+
+    // Recipient receives in session 1 — the RECEIVED record is POSTed to the
+    // recipient's server history with nametag + memo encrypted under the
+    // RECIPIENT's own field key.
+    const rcpt1 = makeFullPresetWallet(baseUrl, fake.network, RECIPIENT, 'd-h5-r', recipientKv);
+    await rcpt1.module.load();
+    const { transfers } = await rcpt1.module.receive();
+    expect(transfers).toHaveLength(1);
+
+    const inSession = rcpt1.module.getHistory().filter((e) => e.type === 'RECEIVED');
+    expect(inSession).toHaveLength(1);
+    expect(inSession[0]).toMatchObject({ amount: '1000', coinId: UCT, senderNametag: 'api-1', memo: 'hi' });
+    const receivedDedup = inSession[0].dedupKey;
+
+    // Session 2 — a NEW recipient module instance over the SAME persisted store
+    // (reload). History rebuilds from the server; the RECEIVED record returns
+    // with its sender nametag + memo decrypted (self-scoped at rest, §8.3).
+    const rcpt2 = makeFullPresetWallet(baseUrl, fake.network, RECIPIENT, 'd-h5-r', recipientKv);
+    await rcpt2.module.load();
+
+    const reloaded = rcpt2.module.getHistory().filter((e) => e.type === 'RECEIVED');
+    expect(reloaded).toHaveLength(1); // present + de-duplicated
+    expect(reloaded[0]).toMatchObject({
+      type: 'RECEIVED',
+      amount: '1000',
+      coinId: UCT,
+      senderNametag: 'api-1', // decrypted counterparty identity
+      memo: 'hi', // decrypted memo
+    });
+    expect(reloaded[0].dedupKey).toBe(receivedDedup); // same record, no dupes
+  });
+});
