@@ -387,6 +387,7 @@ export type SphereEventType =
   | 'payment_request:accepted'
   | 'payment_request:rejected'
   | 'payment_request:paid'
+  | 'payment_request:expired'
   | 'payment_request:response'
   | 'message:dm'
   | 'message:read'
@@ -469,6 +470,7 @@ export interface SphereEventMap {
   'payment_request:accepted': IncomingPaymentRequest;
   'payment_request:rejected': IncomingPaymentRequest;
   'payment_request:paid': IncomingPaymentRequest;
+  'payment_request:expired': IncomingPaymentRequest;
   'payment_request:response': PaymentRequestResponse;
   'message:dm': DirectMessage;
   'message:read': { messageIds: string[]; peerPubkey: string };

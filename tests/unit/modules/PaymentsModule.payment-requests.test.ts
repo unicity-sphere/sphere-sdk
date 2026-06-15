@@ -404,6 +404,43 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
     expect(reNotified.map((r) => r.id).sort()).toEqual([openReq.requestId, fresh.requestId].sort());
   });
 
+  it('cross-session: a request resolved in one window re-surfaces resolved in another via the ?since= delta + fires the resolution event (§16 upsert)', async () => {
+    const { fake, baseUrl } = await startFake();
+    const requester = makeWalletApiWallet(baseUrl, fake.network, REQUESTER, 'pr-x1');
+    const windowA = makeWalletApiWallet(baseUrl, fake.network, PAYER, 'pr-xa');
+    const windowB = makeWalletApiWallet(baseUrl, fake.network, PAYER, 'pr-xb'); // SAME wallet, 2nd window
+
+    const created = await requester.module.sendPaymentRequest(PAYER.chainPubkey, { amount: '5', coinId: UCT });
+    expect(created.success).toBe(true);
+
+    // Both windows surface it as actionable (pending), each from its own since=0 bootstrap.
+    await windowA.module.load();
+    await windowA.module.syncPaymentRequests();
+    await windowB.module.load();
+    await windowB.module.syncPaymentRequests();
+    expect(windowA.module.getPaymentRequests({ status: 'pending' })).toHaveLength(1);
+    expect(windowB.module.getPaymentRequests({ status: 'pending' })).toHaveLength(1);
+
+    // Window A declines it — the server respond re-stamps the payer's seq (PR-A).
+    await windowA.module.rejectPaymentRequest(created.requestId!);
+    expect(fake.getPaymentRequest(created.requestId!)).toMatchObject({ status: 'declined' });
+
+    // Window B's NEXT poll is a DELTA from its own cursor; the resolved row re-surfaces at a
+    // higher seq. B upserts it in place (pending → rejected) and FIRES the resolution event, so
+    // its UI drops the dead request. Pre-fix B early-returned on the dup id and stayed pending.
+    windowB.emitEvent.mockClear();
+    await windowB.module.syncPaymentRequests();
+
+    const onB = windowB.module.getPaymentRequests();
+    expect(onB).toHaveLength(1);
+    expect(onB[0].status).toBe('rejected'); // upserted, not frozen at first-seen 'pending'
+    expect(windowB.module.getPaymentRequests({ status: 'pending' })).toHaveLength(0);
+    expect(windowB.module.getPendingPaymentRequestsCount()).toBe(0);
+    expect(windowB.emitEvent.mock.calls.some((c) => c[0] === 'payment_request:rejected')).toBe(true);
+    // …and it must NOT re-fire 'incoming' for an already-surfaced request.
+    expect(windowB.emitEvent.mock.calls.some((c) => c[0] === 'payment_request:incoming')).toBe(false);
+  });
+
   it('a failed hydration is retried on the next pump (the flag is burned only on success)', async () => {
     const { fake, baseUrl } = await startFake();
     const requester = makeWalletApiWallet(baseUrl, fake.network, REQUESTER, 'pr-8');
