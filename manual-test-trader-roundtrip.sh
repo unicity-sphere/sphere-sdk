@@ -1068,20 +1068,35 @@ else
   echo "ASSERT OK (agreed-rate-matches): both sides agree on rate=$ALICE_AGREED_RATE"
 fi
 
-# Volume cross-check. Expected = TRADER_VOLUME_UCT * 10^18 in smallest UCT
-# units. Accept the field under several aliases.
-ALICE_AGREED_VOLUME="$(grep -Eo '"(volume|base_amount|amount_base|amount)"[[:space:]]*:[[:space:]]*"?[0-9]+"?' \
+# Volume cross-check. The deal-API surface is HUMAN-DECIMAL (matches
+# intents — see trader-service spec / sphere-sdk#534 commit message:
+# "intents work in human-readable decimal strings; actual swaps work in
+# exact bigint smallest-units"). The expected match is $TRADER_VOLUME_UCT
+# verbatim, NOT $EXPECTED_UCT_SMALLEST (which is the bigint smallest-units
+# form used downstream in §10's portfolio-delta assertions).
+#
+# Accept the field under several aliases. Allow fractional values so a
+# future partial-fill negotiation surface still matches.
+ALICE_AGREED_VOLUME="$(grep -Eo '"(volume|base_amount|amount_base|amount)"[[:space:]]*:[[:space:]]*"?[0-9]+(\.[0-9]+)?"?' \
   "$SNAP/alice-list-deals-final.json" 2>/dev/null \
   | head -1 \
-  | sed -E 's/.*:[[:space:]]*"?([0-9]+)"?.*/\1/' || true)"
+  | sed -E 's/.*:[[:space:]]*"?([0-9.]+)"?.*/\1/' || true)"
+BOB_AGREED_VOLUME="$(grep -Eo '"(volume|base_amount|amount_base|amount)"[[:space:]]*:[[:space:]]*"?[0-9]+(\.[0-9]+)?"?' \
+  "$SNAP/bob-list-deals-final.json" 2>/dev/null \
+  | head -1 \
+  | sed -E 's/.*:[[:space:]]*"?([0-9.]+)"?.*/\1/' || true)"
 echo "ALICE_AGREED_VOLUME=$ALICE_AGREED_VOLUME"
-if [[ -z "$ALICE_AGREED_VOLUME" ]]; then
-  echo "WARN (volume-extract): could not extract agreed volume from alice's deal JSON — skipping volume check"
-elif [[ "$ALICE_AGREED_VOLUME" != "$EXPECTED_UCT_SMALLEST" ]]; then
-  echo "ASSERT FAIL (agreed-volume): expected $EXPECTED_UCT_SMALLEST, got $ALICE_AGREED_VOLUME" >&2
+echo "BOB_AGREED_VOLUME  =$BOB_AGREED_VOLUME"
+if [[ -z "$ALICE_AGREED_VOLUME" || -z "$BOB_AGREED_VOLUME" ]]; then
+  echo "WARN (volume-extract): one or both sides did not expose a volume field — skipping volume check"
+elif [[ "$ALICE_AGREED_VOLUME" != "$BOB_AGREED_VOLUME" ]]; then
+  echo "ASSERT FAIL (agreed-volume-mismatch): alice=$ALICE_AGREED_VOLUME != bob=$BOB_AGREED_VOLUME" >&2
+  rc=1
+elif [[ "$ALICE_AGREED_VOLUME" != "$TRADER_VOLUME_UCT" ]]; then
+  echo "ASSERT FAIL (agreed-volume): expected $TRADER_VOLUME_UCT (human-decimal), got $ALICE_AGREED_VOLUME" >&2
   rc=1
 else
-  echo "ASSERT OK (agreed-volume): $ALICE_AGREED_VOLUME == $EXPECTED_UCT_SMALLEST"
+  echo "ASSERT OK (agreed-volume): both sides agree on volume=$ALICE_AGREED_VOLUME (human-decimal UCT)"
 fi
 
 # ---------------------------------------------------------------------------
