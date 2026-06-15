@@ -29,6 +29,7 @@ import { WalletApiMailboxProvider, WalletApiTokenStorageProvider } from '../../.
 import { encodeTokenBlob } from '../../../token-engine/token-blob';
 import { hexToBytes } from '../../../core/crypto';
 import { FIELD_ENVELOPE_PREFIX } from '../../../core/field-encryption';
+import { deriveDeliveryEncryptionKey, decryptDeliveryBundle } from '../../../core/delivery-envelope';
 
 const UCT = '11'.repeat(32);
 const REQUESTER = testIdentity(21);
@@ -192,6 +193,13 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
     expect(requester.transport.onPaymentRequest).not.toHaveBeenCalled();
     expect(requester.transport.onPaymentRequestResponse).not.toHaveBeenCalled();
 
+    // The requester has a nametag — it must reach the PAYER as the surfaced
+    // request's counterparty identity (the PR twin of #546/#547's "Someone"
+    // fix). Set after load so it survives to send time.
+    await requester.module.setNametag({
+      name: 'api-1', token: {}, timestamp: Date.now(), format: 'txf', version: '2.0',
+    });
+
     const result = await requester.module.sendPaymentRequest('@bob', {
       amount: '25',
       coinId: UCT,
@@ -201,7 +209,8 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
     expect(result.requestId).toBeDefined();
     expect(requester.transport.sendPaymentRequest).not.toHaveBeenCalled();
 
-    // Server-side: open, addressed payer, memo S6-ENCRYPTED — never plaintext (§8.3).
+    // Server-side: open, addressed payer, memo is a recipient-addressed `enc1.`
+    // envelope (S6) — never plaintext, neither the message nor the nametag.
     const row = fake.getPaymentRequest(result.requestId!);
     expect(row).toMatchObject({
       status: 'open',
@@ -211,6 +220,26 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
     });
     expect(row!.memo!.startsWith(FIELD_ENVELOPE_PREFIX)).toBe(true);
     expect(row!.memo).not.toContain('lunch');
+    expect(row!.memo).not.toContain('api-1');
+
+    // S6 (the fix): the memo is addressed to the PAYER via ECDH — only the
+    // payer's own key opens it; a THIRD wallet cannot. Asserted at the crypto
+    // boundary against the verbatim wire bytes.
+    const stranger = testIdentity(99);
+    expect(() =>
+      decryptDeliveryBundle(
+        deriveDeliveryEncryptionKey(stranger.privateKey, REQUESTER.chainPubkey),
+        row!.memo!
+      )
+    ).toThrow();
+    // …and the requester re-derives the SAME shared secret (ECDH symmetry), so
+    // it can still read its own sent message + nametag from the wire.
+    expect(
+      decryptDeliveryBundle(
+        deriveDeliveryEncryptionKey(REQUESTER.privateKey, PAYER.chainPubkey),
+        row!.memo!
+      )
+    ).toEqual({ senderNametag: 'api-1', memo: 'lunch?' });
 
     // Notify: the payer's polled ?since= stream surfaces it (handler + event).
     const surfaced: IncomingPaymentRequest[] = [];
@@ -226,8 +255,11 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
       coinId: UCT,
       status: 'pending',
     });
-    // S6: the requester-encrypted memo is opaque to the payer — absent, not garbage.
-    expect(surfaced[0].message).toBeUndefined();
+    // S6 (the fix): the payer DECRYPTS the requester-addressed envelope — both
+    // the message AND the requester's nametag surface (was undefined / raw
+    // pubkey before #553).
+    expect(surfaced[0].message).toBe('lunch?');
+    expect(surfaced[0].senderNametag).toBe('api-1');
     expect(payer.emitEvent.mock.calls.some((c) => c[0] === 'payment_request:incoming')).toBe(true);
     expect(payer.module.getPendingPaymentRequestsCount()).toBe(1);
 
@@ -250,7 +282,11 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
     const response: PaymentRequestResponse = await wait;
     expect(response.responseType).toBe('rejected');
     expect(response.requestId).toBe(result.requestId);
-    expect(requester.module.getOutgoingPaymentRequests()[0].status).toBe('rejected');
+    const outgoing = requester.module.getOutgoingPaymentRequests()[0];
+    expect(outgoing.status).toBe('rejected');
+    // The requester's outgoing view still reads its OWN message (held in-memory
+    // at create time; the ECDH key change never breaks the requester's read).
+    expect(outgoing.message).toBe('lunch?');
     expect(requester.emitEvent.mock.calls.some((c) => c[0] === 'payment_request:response')).toBe(true);
 
     // Respond is open-only server-side: a second decline propagates the 409.

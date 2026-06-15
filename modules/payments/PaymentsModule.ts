@@ -48,6 +48,11 @@ import type {
 import type { DeliveryProvider, IncomingDelivery } from '../../transport/delivery-provider';
 import { TransportDeliveryAdapter } from './TransportDeliveryAdapter';
 import { deriveFieldEncryptionKey, encryptField, decryptField } from '../../core/field-encryption';
+import {
+  deriveDeliveryEncryptionKey,
+  encryptDeliveryBundle,
+  decryptDeliveryBundle,
+} from '../../core/delivery-envelope';
 import type { OracleProvider } from '../../oracle';
 import type { PriceProvider } from '../../price';
 import type {
@@ -2182,13 +2187,24 @@ export class PaymentsModule {
         };
       }
 
+      // S6: the requester's nametag + message ride ONE recipient-addressed
+      // envelope keyed off ECDH(requesterPriv, PAYER chain pubkey) — symmetric,
+      // so the payer re-derives it from its own key + this request's fromPubkey
+      // (the PR twin of #546/#547). The self-scoped field key was wrong here:
+      // a memo encrypted with the requester's key could never be opened by the
+      // payer. Same `enc1.` XChaCha20-Poly1305 wire (operator-blind, backend-
+      // valid — no wire/backend change); attached whenever there is a nametag
+      // OR a message, so the payer renders "@requester" even with no message.
+      const memoEnvelope = encryptDeliveryBundle(
+        deriveDeliveryEncryptionKey(this.deps!.identity.privateKey, toPubkey),
+        { senderNametag: this.getNametag()?.name, memo: request.message }
+      );
+
       const wire = await api.createPaymentRequest({
         toPubkey,
         // Amounts are decimal strings end-to-end (§11) — BigInt round-trips them exactly.
         assets: [{ coinId: request.coinId, amount: BigInt(request.amount) }],
-        ...(request.message !== undefined
-          ? { memo: encryptField(this.getFieldEncryptionKey(), request.message) }
-          : {}),
+        ...(memoEnvelope !== undefined ? { memo: memoEnvelope } : {}),
         ...(request.expiresAt !== undefined ? { expiresAt: request.expiresAt } : {}),
       });
 
@@ -4699,6 +4715,28 @@ export class PaymentsModule {
   }
 
   /**
+   * Decrypt a payment-request's recipient-addressed memo envelope into
+   * `{ memo, senderNametag }` (the requester's message + nametag). The key is
+   * the ECDH shared secret between THIS wallet (the payer) and the requester's
+   * chain pubkey (`wire.fromPubkey`) — symmetric with the requester's
+   * create-time derivation. Returns an empty bundle (and logs at debug) on any
+   * absence/failure so the incoming view never wedges on an unreadable memo
+   * (PR twin of #546/#547).
+   */
+  private decryptPaymentRequestMemo(
+    wire: WalletApiPaymentRequest
+  ): { memo?: string; senderNametag?: string } {
+    if (wire.memo === undefined) return {};
+    try {
+      const key = deriveDeliveryEncryptionKey(this.deps!.identity.privateKey, wire.fromPubkey);
+      return decryptDeliveryBundle(key, wire.memo);
+    } catch {
+      logger.debug('Payments', `Payment request ${wire.id.slice(0, 12)}… memo not addressed here / not decryptable`);
+      return {};
+    }
+  }
+
+  /**
    * Map a §16 wire request onto the public {@link IncomingPaymentRequest}
    * surface and notify (event + handlers). Only `open` requests are
    * actionable; the in-memory id-dedup doubles as the replay guard for
@@ -4713,21 +4751,19 @@ export class PaymentsModule {
     const coinId = wire.assets[0]?.coinId ?? '';
     const coinDef = TokenRegistry.getInstance().getDefinition(coinId);
 
-    // S6: the memo decrypts only under the REQUESTER's wallet key (field keys
-    // are wallet-scoped) — for the payer it is opaque ciphertext, surfaced as
-    // absent rather than garbage (same rule as mailbox memos).
-    let message: string | undefined;
-    if (wire.memo !== undefined) {
-      try {
-        message = decryptField(this.getFieldEncryptionKey(), wire.memo);
-      } catch {
-        logger.debug('Payments', `Payment request ${wire.id.slice(0, 12)}… memo not decryptable with this wallet's key`);
-      }
-    }
+    // S6: the memo is a recipient-addressed envelope keyed off
+    // ECDH(payerPriv, requester chain pubkey = wire.fromPubkey) — symmetric
+    // with the requester's create-time derivation (the PR twin of #546/#547).
+    // It carries the requester's nametag AND message, so the payer renders
+    // "@requester" + the message instead of a raw pubkey. An envelope not
+    // addressed here, or any tamper, fails authentication and surfaces as
+    // absent — never garbage, and never thrown into the view path.
+    const { memo: message, senderNametag } = this.decryptPaymentRequestMemo(wire);
 
     const request: IncomingPaymentRequest = {
       id: wire.id,
       senderPubkey: wire.fromPubkey,
+      ...(senderNametag !== undefined ? { senderNametag } : {}),
       amount: (wire.assets[0]?.amount ?? 0n).toString(),
       coinId,
       symbol: coinDef?.symbol || coinId.slice(0, 8),
