@@ -34,15 +34,29 @@ import { configs } from '../tsup.shared.js';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 process.chdir(root);
 
-/** Files each config is expected to emit: esm (.js/.d.ts) + cjs (.cjs/.d.cts),
- *  with declarations only for `dts: true` entries, for every key in `entry`.
- *  Derived from the shared config so it stays in lockstep with the entry list. */
+// tsup output extensions for this "type": "module" package: esm -> .js/.d.ts,
+// cjs -> .cjs/.d.cts.
+const FORMAT_EXT = {
+  esm: { js: '.js', dts: '.d.ts' },
+  cjs: { js: '.cjs', dts: '.d.cts' },
+};
+
+/** Files each config is expected to emit, derived from `cfg.format` and `cfg.dts`
+ *  (not hard-coded) so the assertion stays in lockstep with the shared config:
+ *  every entry key, each declared format's JS output, plus declarations for
+ *  `dts: true` entries. An unmapped format fails loudly rather than silently
+ *  skipping its artifacts. */
 function expectedArtifacts(cfg) {
+  const formats = Array.isArray(cfg.format) ? cfg.format : [cfg.format];
   return Object.keys(cfg.entry).flatMap((entryKey) => {
     const base = `dist/${entryKey}`;
-    const files = [`${base}.js`, `${base}.cjs`];
-    if (cfg.dts) files.push(`${base}.d.ts`, `${base}.d.cts`);
-    return files;
+    return formats.flatMap((fmt) => {
+      const ext = FORMAT_EXT[fmt];
+      if (!ext) throw new Error(`[build] expectedArtifacts: unmapped tsup format '${fmt}' for '${entryKey}'`);
+      const files = [`${base}${ext.js}`];
+      if (cfg.dts) files.push(`${base}${ext.dts}`);
+      return files;
+    });
   });
 }
 
