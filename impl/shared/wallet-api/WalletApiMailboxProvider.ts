@@ -39,7 +39,11 @@ import type {
 } from '../../../transport/delivery-provider';
 import { composeDeliveryKeys, computeDeliveryId } from '../../../transport/delivery-provider';
 import { unwrapTokenBlobBytes } from '../../../token-engine/token-blob';
-import { deriveFieldEncryptionKey, decryptField, encryptField } from '../../../core/field-encryption';
+import {
+  deriveDeliveryEncryptionKey,
+  encryptDeliveryBundle,
+  decryptDeliveryBundle,
+} from '../../../core/delivery-envelope';
 import { WalletApiClient, WalletApiError } from '../../../wallet-api';
 import type { KeyValueStore, MailboxEntry } from '../../../wallet-api';
 import { logger } from '../../../core/logger';
@@ -78,8 +82,7 @@ export class WalletApiMailboxProvider implements DeliveryProvider {
   private readonly stateStore: KeyValueStore;
   private deriveKeysFn: ((blobBytes: Uint8Array) => Promise<{ tokenId: string; stateHash: string }>) | null = null;
 
-  private identity: { privateKey: string; chainPubkey: string } | null = null;
-  private fieldKey: Uint8Array | null = null;
+  private identity: { privateKey: string; chainPubkey: string; nametag?: string } | null = null;
 
   constructor(config: WalletApiMailboxProviderConfig) {
     this.client = config.client;
@@ -103,11 +106,16 @@ export class WalletApiMailboxProvider implements DeliveryProvider {
     return this.deriveKeysFn(blobBytes);
   }
 
-  /** Bind the wallet identity (derives the S6 field key; binds the client). */
-  setIdentity(identity: { privateKey: string; chainPubkey: string }): void {
+  /**
+   * Bind the wallet identity (binds the client). The optional `nametag` is the
+   * sender's own nametag — bundled into outgoing delivery envelopes so the
+   * recipient can render the human identity (it is the wallet's own public
+   * name, not a secret). Delivery memos are encrypted per-recipient (ECDH —
+   * see {@link deriveDeliveryEncryptionKey}), so no self-scoped key is held.
+   */
+  setIdentity(identity: { privateKey: string; chainPubkey: string; nametag?: string }): void {
     this.identity = identity;
-    this.fieldKey = deriveFieldEncryptionKey(identity.privateKey);
-    this.client.setIdentity(identity);
+    this.client.setIdentity({ privateKey: identity.privateKey, chainPubkey: identity.chainPubkey });
   }
 
   // ── persisted state (per network + identity) ────────────────────────────────
@@ -169,10 +177,26 @@ export class WalletApiMailboxProvider implements DeliveryProvider {
    * (§6), which is what makes the sender's journal replay safe.
    */
   async deliver(recipientPubkey: string, blob: Uint8Array, options: DeliverOptions): Promise<DeliveryReceipt> {
-    if (!this.fieldKey) {
+    if (!this.identity) {
       throw new WalletApiError('No identity set — call setIdentity() first', 'CONFIG');
     }
     const keys = composeDeliveryKeys(await this.deriveKeys(blob));
+
+    // S6: bundle the sender's nametag + memo into ONE recipient-addressed
+    // envelope. The key is the ECDH shared secret between the sender's private
+    // key and the RECIPIENT's chain pubkey (symmetric — the recipient
+    // re-derives it from its own key + this entry's senderPubkey), HKDF'd into
+    // the SAME `enc1.` XChaCha20-Poly1305 envelope the self-scoped field
+    // encryption uses (operator-blind, backend-valid — §8.3; no wire change).
+    // Attached whenever there is a nametag OR a memo (so the nametag travels
+    // even on a memo-less transfer); `undefined` ⇒ no `memo` field is sent.
+    const deliveryKey = deriveDeliveryEncryptionKey(this.identity.privateKey, recipientPubkey);
+    const envelope = encryptDeliveryBundle(deliveryKey, {
+      // The per-call nametag (threaded by PaymentsModule) wins; setIdentity's
+      // nametag is the standalone fallback.
+      senderNametag: options.senderNametag ?? this.identity.nametag,
+      memo: options.memo,
+    });
 
     // §5.2/§8.2: the wallet-api wire carries the RAW token bytes — the
     // cross-port blob argument is the sphere envelope; unwrap at the boundary
@@ -189,8 +213,9 @@ export class WalletApiMailboxProvider implements DeliveryProvider {
     }
     await this.client.uploadBlob(upload.putUrl, wire); // 412 = already present = success (§5.2)
 
-    // Deposit (idempotent by entry_id — §6). The memo is S6-encrypted BEFORE
-    // it leaves the device (§8.3): the operator never sees plaintext.
+    // Deposit (idempotent by entry_id — §6). The nametag+memo envelope is
+    // ECDH-encrypted to the recipient BEFORE it leaves the device (§8.3): the
+    // operator never sees plaintext.
     let entryId: string;
     try {
       entryId = await this.client.depositMailbox({
@@ -199,7 +224,7 @@ export class WalletApiMailboxProvider implements DeliveryProvider {
         transferId: options.transferId,
         stateHash: keys.stateHash,
         tokenId: keys.tokenId,
-        ...(options.memo !== undefined ? { memo: encryptField(this.fieldKey, options.memo) } : {}),
+        ...(envelope !== undefined ? { memo: envelope } : {}),
       });
     } catch (err) {
       // §6 CONFLICT = the backend already holds a record of EXACTLY this
@@ -277,29 +302,43 @@ export class WalletApiMailboxProvider implements DeliveryProvider {
     }
   }
 
+  /**
+   * Decrypt an entry's recipient-addressed envelope into `{ memo, senderNametag }`.
+   * Needs both the entry's `senderPubkey` (the ECDH peer) and an identity;
+   * returns an empty bundle (and logs at debug) on any absence/failure so the
+   * receive loop never wedges on an unreadable counterparty memo.
+   */
+  private decryptDeliveryEnvelope(entry: MailboxEntry): { memo?: string; senderNametag?: string } {
+    if (entry.memo === undefined || !this.identity || entry.senderPubkey === undefined) {
+      return {};
+    }
+    try {
+      const key = deriveDeliveryEncryptionKey(this.identity.privateKey, entry.senderPubkey);
+      return decryptDeliveryBundle(key, entry.memo);
+    } catch {
+      logger.debug(TAG, `delivery envelope for entry ${entry.entryId.slice(0, 12)}… not decryptable (not addressed here / tampered)`);
+      return {};
+    }
+  }
+
   private toIncomingDelivery(entry: MailboxEntry): IncomingDelivery {
     const client = this.client;
-    const fieldKey = this.fieldKey;
     const deriveKeys = (bytes: Uint8Array): Promise<{ tokenId: string; stateHash: string }> => this.deriveKeys(bytes);
 
-    // S6: decrypt the memo envelope. NOTE: the S6 key is wallet-scoped (HKDF
-    // from the wallet key), so only memos written by THIS wallet's key
-    // decrypt (self-sends / multi-device). A counterparty's memo fails
-    // authentication and is surfaced as absent rather than as ciphertext.
-    let memo: string | undefined;
-    if (entry.memo !== undefined && fieldKey) {
-      try {
-        memo = decryptField(fieldKey, entry.memo);
-      } catch {
-        logger.debug(TAG, `memo for entry ${entry.entryId.slice(0, 12)}… not decryptable with this wallet's key`);
-      }
-    }
+    // S6: decrypt the recipient-addressed envelope (nametag + memo). The key is
+    // the ECDH shared secret between THIS wallet's private key and the entry's
+    // senderPubkey (symmetric with the sender's derivation; self-sends use the
+    // own pubkey). An envelope addressed to a DIFFERENT recipient, or any
+    // tamper, fails authentication and is surfaced as absent — never as
+    // ciphertext, and never thrown into the receive loop.
+    const { memo, senderNametag } = this.decryptDeliveryEnvelope(entry);
 
     return {
       deliveryId: entry.entryId,
       transferId: entry.transferId,
       senderPubkey: entry.senderPubkey,
       ...(memo !== undefined ? { memo } : {}),
+      ...(senderNametag !== undefined ? { senderNametag } : {}),
       cursor: entry.seq.toString(),
       async fetchBlob(): Promise<Uint8Array> {
         if (entry.blobCollected || !entry.getUrl) {

@@ -18,6 +18,7 @@ import { WalletApiClient } from '../../wallet-api';
 import { WalletApiMailboxProvider } from '../../impl/shared/wallet-api';
 import type { DeliveryCustody, IncomingDelivery } from '../../transport/delivery-provider';
 import { FIELD_ENVELOPE_PREFIX } from '../../core/field-encryption';
+import { deriveDeliveryEncryptionKey, decryptDeliveryBundle } from '../../core/delivery-envelope';
 import {
   describeDeliveryProviderContract,
   type DeliveryProviderContractContext,
@@ -230,7 +231,11 @@ describe('WalletApiMailboxProvider — provider-specific semantics', () => {
       expect(h.fake.getRow(RECIPIENT.chainPubkey, blob.tokenId)).toMatchObject({ status: 'active' });
     });
 
-    it('S6: a memo travels as an enc1 envelope (never plaintext); a foreign wallet surfaces it as absent', async () => {
+    it('S6: a memo+nametag travel as ONE enc1 envelope (never plaintext); the RECIPIENT decrypts both', async () => {
+      // The sender's own nametag is bundled with the memo into one
+      // recipient-addressed (ECDH) envelope — fixes both the dropped memo and
+      // the missing sender identity ("Someone").
+      h.sender.setIdentity({ ...SENDER, nametag: 'api-1' });
       const blob = h.makeBlob();
       const { deliveryId } = await h.sender.deliver(h.recipientPubkey, blob.bytes, {
         transferId: 'tf-h4',
@@ -238,24 +243,68 @@ describe('WalletApiMailboxProvider — provider-specific semantics', () => {
       });
 
       // The wire/stored form is the S6 envelope — the operator never sees
-      // plaintext (ARCHITECTURE §8.3).
+      // plaintext (ARCHITECTURE §8.3); the wire prefix is unchanged (no backend
+      // change).
       const stored = h.fake.getMailboxEntry(h.recipientPubkey, deliveryId);
       expect(stored?.memo?.startsWith(FIELD_ENVELOPE_PREFIX)).toBe(true);
       expect(stored?.memo).not.toContain('coffee');
+      expect(stored?.memo).not.toContain('api-1');
 
-      // The S6 key is WALLET-scoped (HKDF from the wallet key): only the
-      // writing wallet's devices can decrypt. The recipient is a DIFFERENT
-      // wallet, so its provider surfaces the memo as absent — never as raw
-      // ciphertext.
+      // The envelope is ECDH-addressed to the RECIPIENT (symmetric in
+      // senderPriv+recipientPub / recipientPriv+senderPub), so the recipient
+      // — a DIFFERENT wallet — decrypts BOTH the memo and the sender nametag.
+      const incoming = await drain(h.recipientProvider);
+      const delivery = incoming.find((d) => d.deliveryId === deliveryId);
+      expect(delivery).toBeDefined();
+      expect(delivery!.memo).toBe('coffee money');
+      expect(delivery!.senderNametag).toBe('api-1');
+    });
+
+    it('S6: a memo-less transfer still delivers the sender nametag', async () => {
+      h.sender.setIdentity({ ...SENDER, nametag: 'api-1' });
+      const blob = h.makeBlob();
+      const { deliveryId } = await h.sender.deliver(h.recipientPubkey, blob.bytes, {
+        transferId: 'tf-h4-nomemo',
+      });
       const incoming = await drain(h.recipientProvider);
       const delivery = incoming.find((d) => d.deliveryId === deliveryId);
       expect(delivery).toBeDefined();
       expect(delivery!.memo).toBeUndefined();
+      expect(delivery!.senderNametag).toBe('api-1');
     });
 
-    it('S6: a SELF-send memo round-trips (the wallet-scoped key decrypts its own envelope)', async () => {
-      // Sender deposits to their own mailbox (multi-device / self-transfer).
-      const selfProvider = h.sender; // bound to SENDER's identity
+    it('S6: a THIRD wallet CANNOT decrypt the same entry (ECDH addressed to the recipient only)', async () => {
+      h.sender.setIdentity({ ...SENDER, nametag: 'api-1' });
+      const blob = h.makeBlob();
+      const { deliveryId } = await h.sender.deliver(h.recipientPubkey, blob.bytes, {
+        transferId: 'tf-h4c',
+        memo: 'coffee money',
+      });
+      const stored = h.fake.getMailboxEntry(h.recipientPubkey, deliveryId);
+      expect(stored?.memo).toBeDefined();
+
+      // The RECIPIENT opens it (sanity — it really is decryptable to the
+      // addressed party).
+      const recipientKey = deriveDeliveryEncryptionKey(RECIPIENT.privateKey, SENDER.chainPubkey);
+      expect(decryptDeliveryBundle(recipientKey, stored!.memo!)).toMatchObject({
+        memo: 'coffee money',
+        senderNametag: 'api-1',
+      });
+
+      // A third wallet (neither sender nor recipient) derives a DIFFERENT ECDH
+      // key over any (sender, *) pair — authentication fails, so it cannot open
+      // the envelope. The provider surfaces this as absent, never ciphertext
+      // and never a throw into the receive loop (covered by the unit suite).
+      const eavesdropper = testIdentity(99);
+      const intruderKey = deriveDeliveryEncryptionKey(eavesdropper.privateKey, SENDER.chainPubkey);
+      expect(() => decryptDeliveryBundle(intruderKey, stored!.memo!)).toThrow();
+    });
+
+    it('S6: a SELF-send memo+nametag round-trips (ECDH over own pubkey on both sides)', async () => {
+      // Sender deposits to their own mailbox (multi-device / self-transfer):
+      // ECDH(priv, ownPub) is identical on encrypt and decrypt.
+      const selfProvider = h.sender;
+      selfProvider.setIdentity({ ...SENDER, nametag: 'api-1' });
       const t = makeTestToken();
       const { deliveryId } = await selfProvider.deliver(SENDER.chainPubkey, t.bytes, {
         transferId: 'tf-h4b',
@@ -265,6 +314,7 @@ describe('WalletApiMailboxProvider — provider-specific semantics', () => {
       const delivery = incoming.find((d) => d.deliveryId === deliveryId);
       expect(delivery).toBeDefined();
       expect(delivery!.memo).toBe('note to self');
+      expect(delivery!.senderNametag).toBe('api-1');
     });
 
     it('blobCollected: an entry without a fetchable blob throws a typed error from fetchBlob', async () => {

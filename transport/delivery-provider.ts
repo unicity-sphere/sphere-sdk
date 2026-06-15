@@ -53,6 +53,14 @@ export interface DeliverOptions {
   transferId: string;
   /** Optional human memo. Implementations encrypt it client-side (S6). */
   memo?: string;
+  /**
+   * The SENDER's own nametag (without a leading `@`), so the recipient can
+   * render the human identity instead of a raw pubkey ("Someone"). Bundled
+   * with the memo into ONE recipient-addressed (ECDH) `enc1.` envelope (S6) —
+   * the operator never sees it. Attached whenever the sender has a nametag OR
+   * a memo (so the nametag travels even on a memo-less transfer).
+   */
+  senderNametag?: string;
 }
 
 /** One incoming delivery pulled from the feed. */
@@ -65,6 +73,14 @@ export interface IncomingDelivery {
   senderPubkey?: string;
   /** Decrypted memo (S6), when present and decryptable. */
   memo?: string;
+  /**
+   * The sender's nametag (without a leading `@`), decrypted from the same
+   * recipient-addressed delivery envelope as {@link memo} (S6). Lets the
+   * receiver render the human identity instead of a raw pubkey, with no
+   * Nostr/transport lookup. Absent when the envelope carried none or could
+   * not be decrypted.
+   */
+  senderNametag?: string;
   /** Fetch the finished token blob bytes (the encoded TokenBlob). */
   fetchBlob(): Promise<Uint8Array>;
   /** Transport-local resume cursor (opaque to callers). */

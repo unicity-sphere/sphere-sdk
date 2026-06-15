@@ -30,7 +30,7 @@ import { WalletApiClient } from '../../../wallet-api';
 import { WalletApiMailboxProvider, WalletApiTokenStorageProvider } from '../../../impl/shared/wallet-api';
 import { encodeTokenBlob } from '../../../token-engine/token-blob';
 import { bytesToHex, hexToBytes } from '../../../core/crypto';
-import { deriveFieldEncryptionKey, encryptField, FIELD_ENVELOPE_PREFIX } from '../../../core/field-encryption';
+import { deriveFieldEncryptionKey, decryptField, encryptField, FIELD_ENVELOPE_PREFIX } from '../../../core/field-encryption';
 
 const UCT = '11'.repeat(32);
 const SENDER = testIdentity(11);
@@ -302,12 +302,18 @@ describe('send — full wallet-api preset (S2 consumer + S3 + §7 pipeline)', ()
 });
 
 describe('incoming — mailbox pull feeds handleV2Transfer (S3)', () => {
-  it('receive(): fetch → local verify → store → ack claimed (handoff) → RECEIVED history POST', async () => {
+  it('receive(): fetch → local verify → store → ack claimed (handoff) → RECEIVED history POST carrying the sender nametag + memo', async () => {
     const { fake, baseUrl } = await startFake();
     const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-in-1');
     const sourceTokenId = await seedServerToken(fake, sender, SENDER, 1000n);
     await sender.module.load();
-    const result = await sender.module.send({ recipient: '@bob', amount: '1000', coinId: UCT });
+    // The sender has a nametag — it must reach the recipient as the RECEIVED
+    // record's counterparty identity (fixes "Someone"); the memo must arrive
+    // decrypted (fixes the dropped memo). Set AFTER load so it survives to send.
+    await sender.module.setNametag({
+      name: 'api-1', token: {}, timestamp: Date.now(), format: 'txf', version: '2.0',
+    });
+    const result = await sender.module.send({ recipient: '@bob', amount: '1000', coinId: UCT, memo: 'hi' });
 
     const recipient = makeFullPresetWallet(baseUrl, fake.network, RECIPIENT, 'd-in-2');
     await recipient.module.load();
@@ -324,12 +330,24 @@ describe('incoming — mailbox pull feeds handleV2Transfer (S3)', () => {
     });
     expect(fake.getRow(RECIPIENT.chainPubkey, sourceTokenId)).toMatchObject({ status: 'active' });
 
-    // transfer:incoming fired; the claim's RECEIVED record was POSTed (§10).
-    expect(recipient.emitEvent.mock.calls.some((c) => c[0] === 'transfer:incoming')).toBe(true);
+    // transfer:incoming fired carrying the sender's nametag + memo (bug A + B).
+    const incomingEvent = recipient.emitEvent.mock.calls.find((c) => c[0] === 'transfer:incoming');
+    expect(incomingEvent).toBeDefined();
+    expect(incomingEvent![1]).toMatchObject({ senderNametag: 'api-1', memo: 'hi' });
+
+    // §10: the RECEIVED record was POSTed; its counterparty nametag + memo are
+    // S6 envelopes (operator-blind), decryptable by the recipient (self-scoped
+    // at rest). The nametag came from the delivery envelope, NOT the broken
+    // Nostr chain-pubkey lookup.
     const received = fake
       .getHistoryRecords(RECIPIENT.chainPubkey)
       .find((r) => (r.dedupKey as string).startsWith('RECEIVED_'));
     expect(received).toBeDefined();
+    expect((received!.counterpartyNametag as string).startsWith(FIELD_ENVELOPE_PREFIX)).toBe(true);
+    expect((received!.memo as string).startsWith(FIELD_ENVELOPE_PREFIX)).toBe(true);
+    const recipientFieldKey = deriveFieldEncryptionKey(RECIPIENT.privateKey);
+    expect(decryptField(recipientFieldKey, received!.counterpartyNametag as string)).toBe('api-1');
+    expect(decryptField(recipientFieldKey, received!.memo as string)).toBe('hi');
     expect(result.id).toBeDefined();
   });
 

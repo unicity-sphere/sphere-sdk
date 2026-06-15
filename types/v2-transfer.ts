@@ -15,6 +15,12 @@ export interface V2TransferPayload {
   readonly tokenBlob: string;
   /** Optional opaque memo. */
   readonly memo?: string;
+  /**
+   * The sender's nametag (without a leading `@`), decrypted from the delivery
+   * envelope by the transport (S6). The PRIMARY source for the RECEIVED
+   * record's counterparty identity — no Nostr/transport lookup needed.
+   */
+  readonly senderNametag?: string;
 }
 
 /** Narrow an unknown wire payload to a {@link V2TransferPayload}. */

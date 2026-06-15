@@ -1577,6 +1577,10 @@ export class PaymentsModule {
           await delivery.deliver(recipientChainPubkeyHex, hexToBytes(tokenBlob), {
             transferId: result.id,
             memo: request.memo,
+            // Carry the sender's own nametag so the recipient renders "@name"
+            // instead of "Someone" — bundled with the memo in ONE
+            // recipient-addressed envelope (S6).
+            ...(this.getNametag()?.name !== undefined ? { senderNametag: this.getNametag()!.name } : {}),
           });
         };
 
@@ -4274,12 +4278,17 @@ export class PaymentsModule {
       logger.warn('Payments', `V2 transfer ${id.slice(0, 16)}... rejected by storage (tombstoned/duplicate) — no event emitted`);
       return 'storage-rejected';
     }
+    // The sender's nametag rides the recipient-addressed delivery envelope
+    // (S6) — the PRIMARY counterparty identity. resolveSenderInfo (a Nostr
+    // transport-pubkey lookup that does NOT understand chain pubkeys) is only a
+    // best-effort FALLBACK and never gates receive.
     const senderInfo = await this.resolveSenderInfo(senderPubkey);
+    const senderNametag = payload.senderNametag ?? senderInfo.senderNametag;
 
     this.deps!.emitEvent('transfer:incoming', {
       id,
       senderPubkey,
-      senderNametag: senderInfo.senderNametag,
+      senderNametag,
       tokens: [uiToken],
       memo: payload.memo,
       receivedAt: Date.now(),
@@ -4293,6 +4302,7 @@ export class PaymentsModule {
       timestamp: Date.now(),
       senderPubkey,
       ...senderInfo,
+      ...(senderNametag !== undefined ? { senderNametag } : {}),
       memo: payload.memo,
       tokenId: id,
     });
@@ -4409,7 +4419,11 @@ export class PaymentsModule {
       type: 'V2_TRANSFER',
       version: '2.0',
       tokenBlob: bytesToHex(bytes),
+      // memo + senderNametag both ride the recipient-addressed delivery
+      // envelope (S6) the provider already decrypted — the nametag is the
+      // PRIMARY counterparty identity (no Nostr lookup; fixes "Someone").
       memo: incoming.memo,
+      ...(incoming.senderNametag !== undefined ? { senderNametag: incoming.senderNametag } : {}),
     };
     const verdict = await this.handleV2Transfer(payload, incoming.senderPubkey ?? '');
     switch (verdict) {
@@ -4754,6 +4768,7 @@ export class PaymentsModule {
       await delivery.deliver(payload.recipient, hexToBytes(tokenBlobHex), {
         transferId,
         memo: payload.memo,
+        ...(this.getNametag()?.name !== undefined ? { senderNametag: this.getNametag()!.name } : {}),
       });
       await this.removePendingV2Delivery(tokenBlobHex);
     };
@@ -4981,6 +4996,7 @@ export class PaymentsModule {
         await this.delivery!.deliver(e.recipientPubkey, hexToBytes(e.tokenBlob), {
           transferId: e.transferId,
           memo: e.memo,
+          ...(this.getNametag()?.name !== undefined ? { senderNametag: this.getNametag()!.name } : {}),
         });
         await this.removePendingV2Delivery(e.tokenBlob);
         logger.debug('Payments', `Replayed undelivered v2 transfer ${e.transferId.slice(0, 8)}...`);
