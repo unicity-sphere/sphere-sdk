@@ -14,16 +14,18 @@
 #            negotiates terms via NP-0 over NIP-17 DMs, and executes
 #            the matched deal through SwapModule.proposeSwap against
 #            the escrow ($ESCROW, default @escrow-test-02).
-#   COMPLETE alice's trader ends up with ~+5 ETH (and -50 UCT)
-#            bob's   trader ends up with ~+50 UCT (and -~5 ETH)
+#   COMPLETE alice's trader ends up with ~+4.25 ETH (and -50 UCT)
+#            bob's   trader ends up with ~+50 UCT (and -~4.25 ETH)
 #
 # Net (tenant view):
-#     alice-trader  -50 UCT  +~5 ETH
-#     bob-trader    +50 UCT  -~5 ETH
+#     alice-trader  -50 UCT  +~4.25 ETH
+#     bob-trader    +50 UCT  -~4.25 ETH
 #   Exact split is determined by the agreed rate, which the matching
 #   code computes as floor((overlap_min + overlap_max) / 2) over the
 #   intersection of both rate bands — see §5.2 of
-#   /home/vrogojin/trader-service/docs/protocol-spec.md.
+#   /home/vrogojin/trader-service/docs/protocol-spec.md. With the default
+#   [0.08, 0.09] band on both sides the midpoint is 0.085, so bob owes
+#   0.085 × 50 = 4.25 ETH — within his 4.5 ETH deposit.
 #
 # This soak is the TRADER analog of:
 #   - manual-test-swap-roundtrip.sh       (swap roundtrip)
@@ -72,7 +74,17 @@
 #   TRADER_RATE_MIN_ETH_PER_UCT  Lower edge of the rate band, as a
 #                                **human-friendly float**. Default 0.08
 #                                (= 0.08 ETH per 1 UCT).
-#   TRADER_RATE_MAX_ETH_PER_UCT  Upper edge of the rate band. Default 0.12.
+#   TRADER_RATE_MAX_ETH_PER_UCT  Upper edge of the rate band. Default 0.09.
+#                                Defaults must satisfy
+#                                  rate_max × volume_max ≤ bob's deposit
+#                                so the negotiation cannot land on a rate
+#                                bob cannot fund. Today's hardcoded bob
+#                                deposit is 4.5 ETH and volume is 50 UCT,
+#                                hence rate_max = 4.5 ÷ 50 = 0.09. Raising
+#                                the band requires raising bob's §5
+#                                deposit by the same factor — see
+#                                trader-service#29 for the upstream pre-
+#                                flight check that would catch this for us.
 #   TRADER_VOLUME_UCT            Volume to trade in **whole UCT**. Default 50.
 #   TRADER_CLI_FLOAT_NATIVE      0 = skip the float attempt and go straight
 #                                to the bigint shim. Default 1.
@@ -185,7 +197,13 @@ ESCROW="${ESCROW:-@escrow-test-02}"
 # to smallest-units (post-fix UX). The shim mode below converts inline
 # when the CLI still demands bigints.
 TRADER_RATE_MIN_ETH_PER_UCT="${TRADER_RATE_MIN_ETH_PER_UCT:-0.08}"
-TRADER_RATE_MAX_ETH_PER_UCT="${TRADER_RATE_MAX_ETH_PER_UCT:-0.12}"
+# rate_max × volume_max must stay ≤ bob's hardcoded deposit (4.5 ETH at
+# §5 below). 0.09 × 50 = 4.5 ETH — bob can fund any rate the negotiation
+# midpoint picks within [0.08, 0.09]. Raising rate_max without raising
+# bob's deposit by the matching factor reproduces sphere-sdk#536's soak
+# halt (deal fails with VOLUME_RESERVATION_FAILED at §8). Upstream
+# defensive check tracked in trader-service#29.
+TRADER_RATE_MAX_ETH_PER_UCT="${TRADER_RATE_MAX_ETH_PER_UCT:-0.09}"
 TRADER_VOLUME_UCT="${TRADER_VOLUME_UCT:-50}"
 TRADER_CLI_FLOAT_NATIVE="${TRADER_CLI_FLOAT_NATIVE:-1}"
 
@@ -1050,20 +1068,35 @@ else
   echo "ASSERT OK (agreed-rate-matches): both sides agree on rate=$ALICE_AGREED_RATE"
 fi
 
-# Volume cross-check. Expected = TRADER_VOLUME_UCT * 10^18 in smallest UCT
-# units. Accept the field under several aliases.
-ALICE_AGREED_VOLUME="$(grep -Eo '"(volume|base_amount|amount_base|amount)"[[:space:]]*:[[:space:]]*"?[0-9]+"?' \
+# Volume cross-check. The deal-API surface is HUMAN-DECIMAL (matches
+# intents — see trader-service spec / sphere-sdk#534 commit message:
+# "intents work in human-readable decimal strings; actual swaps work in
+# exact bigint smallest-units"). The expected match is $TRADER_VOLUME_UCT
+# verbatim, NOT $EXPECTED_UCT_SMALLEST (which is the bigint smallest-units
+# form used downstream in §10's portfolio-delta assertions).
+#
+# Accept the field under several aliases. Allow fractional values so a
+# future partial-fill negotiation surface still matches.
+ALICE_AGREED_VOLUME="$(grep -Eo '"(volume|base_amount|amount_base|amount)"[[:space:]]*:[[:space:]]*"?[0-9]+(\.[0-9]+)?"?' \
   "$SNAP/alice-list-deals-final.json" 2>/dev/null \
   | head -1 \
-  | sed -E 's/.*:[[:space:]]*"?([0-9]+)"?.*/\1/' || true)"
+  | sed -E 's/.*:[[:space:]]*"?([0-9.]+)"?.*/\1/' || true)"
+BOB_AGREED_VOLUME="$(grep -Eo '"(volume|base_amount|amount_base|amount)"[[:space:]]*:[[:space:]]*"?[0-9]+(\.[0-9]+)?"?' \
+  "$SNAP/bob-list-deals-final.json" 2>/dev/null \
+  | head -1 \
+  | sed -E 's/.*:[[:space:]]*"?([0-9.]+)"?.*/\1/' || true)"
 echo "ALICE_AGREED_VOLUME=$ALICE_AGREED_VOLUME"
-if [[ -z "$ALICE_AGREED_VOLUME" ]]; then
-  echo "WARN (volume-extract): could not extract agreed volume from alice's deal JSON — skipping volume check"
-elif [[ "$ALICE_AGREED_VOLUME" != "$EXPECTED_UCT_SMALLEST" ]]; then
-  echo "ASSERT FAIL (agreed-volume): expected $EXPECTED_UCT_SMALLEST, got $ALICE_AGREED_VOLUME" >&2
+echo "BOB_AGREED_VOLUME  =$BOB_AGREED_VOLUME"
+if [[ -z "$ALICE_AGREED_VOLUME" || -z "$BOB_AGREED_VOLUME" ]]; then
+  echo "WARN (volume-extract): one or both sides did not expose a volume field — skipping volume check"
+elif [[ "$ALICE_AGREED_VOLUME" != "$BOB_AGREED_VOLUME" ]]; then
+  echo "ASSERT FAIL (agreed-volume-mismatch): alice=$ALICE_AGREED_VOLUME != bob=$BOB_AGREED_VOLUME" >&2
+  rc=1
+elif [[ "$ALICE_AGREED_VOLUME" != "$TRADER_VOLUME_UCT" ]]; then
+  echo "ASSERT FAIL (agreed-volume): expected $TRADER_VOLUME_UCT (human-decimal), got $ALICE_AGREED_VOLUME" >&2
   rc=1
 else
-  echo "ASSERT OK (agreed-volume): $ALICE_AGREED_VOLUME == $EXPECTED_UCT_SMALLEST"
+  echo "ASSERT OK (agreed-volume): both sides agree on volume=$ALICE_AGREED_VOLUME (human-decimal UCT)"
 fi
 
 # ---------------------------------------------------------------------------

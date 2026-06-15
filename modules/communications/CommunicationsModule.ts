@@ -902,7 +902,35 @@ export class CommunicationsModule {
       .catch(() => {
         /* isolate prior failure */
       })
-      .then(() => this._doSave(entryType));
+      .then(() => this._doSave(entryType))
+      .catch((err: unknown) => {
+        // #551 — PROFILE_NOT_INITIALIZED from the storage layer means the
+        // OrbitDB adapter raced a disconnect with the save (the trader-
+        // spawn host crash on a fresh wallet's first inbound DM). The
+        // in-memory messages Map IS the durable record: every save()
+        // re-emits the entire collection, so the next successful save
+        // catches up the OpLog without data loss. Swallowing here keeps
+        // the strict-throw semantics of `ProfileStorageProvider.set()`
+        // intact for callers (`AutoReturnLedger.save(critical=true)`,
+        // etc.) that rely on it to trigger write-first rollback, while
+        // still protecting CommunicationsModule's fire-and-forget save
+        // chain (`handleIncomingMessage` does not await `save('raw')`).
+        // All other errors propagate.
+        if (
+          err !== null &&
+          typeof err === 'object' &&
+          'code' in err &&
+          (err as { code: unknown }).code === 'PROFILE_NOT_INITIALIZED'
+        ) {
+          logger.warn(
+            'Communications',
+            `[#551] save race: storage layer reports OrbitDB disconnected; ` +
+              `in-memory messages map stands, OpLog sync resumes on next save (entryType=${entryType})`,
+          );
+          return;
+        }
+        throw err;
+      });
     this._saveChain = chained.then(
       () => undefined,
       () => undefined,
