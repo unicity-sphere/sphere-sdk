@@ -37,6 +37,7 @@ import type {
   DeliveryReceipt,
   IncomingDelivery,
   WakeStream,
+  WakeChannelStatus,
 } from '../../../transport/delivery-provider';
 import { composeDeliveryKeys, computeDeliveryId } from '../../../transport/delivery-provider';
 import { unwrapTokenBlobBytes } from '../../../token-engine/token-blob';
@@ -400,25 +401,29 @@ export class WalletApiMailboxProvider implements DeliveryProvider {
   // payment_requests to their respective pulls. (Previously only `mailbox`
   // was surfaced — inventory and payment-request nudges were dropped, leaving
   // a second session with no realtime path for those streams.)
-  onWake(callback: (stream: WakeStream) => void): () => void {
-    let closed = false;
-    let close: (() => void) | null = null;
-    void this.client
-      .connectWakeSocket((wake) => {
-        callback(wake.stream);
-      })
-      .then((handle) => {
-        if (closed) handle.close();
-        else close = () => handle.close();
-      })
-      .catch((err) => {
-        // Wakes are best-effort; polling remains the correctness path (§9).
-        logger.debug(TAG, 'wake socket unavailable (polling continues):', err);
-      });
-    return () => {
-      closed = true;
-      close?.();
-    };
+  //
+  // The socket SELF-HEALS via the client's supervisor (§9): it reconnects with
+  // backoff on any drop and a liveness watchdog catches a half-open socket.
+  // Because wakes missed while the socket was dead are NOT replayed, every
+  // (re)connect runs a full catch-up pull of ALL THREE streams — done by firing
+  // `callback` once per stream, which the consumer already routes to each
+  // stream's pull. This is what converges a window whose socket went dark.
+  onWake(
+    callback: (stream: WakeStream) => void,
+    onStatus?: (status: WakeChannelStatus) => void
+  ): () => void {
+    const handle = this.client.superviseWakeSocket({
+      onWake: (wake) => callback(wake.stream),
+      onReconnect: () => this.catchUpAllStreams(callback),
+      onStatus,
+    });
+    return () => handle.close();
+  }
+
+  /** §9: replay one synthetic nudge per stream so the consumer full-resyncs after a (re)connect. */
+  private catchUpAllStreams(callback: (stream: WakeStream) => void): void {
+    const streams: WakeStream[] = ['inventory', 'mailbox', 'payment_requests'];
+    for (const stream of streams) callback(stream);
   }
 }
 

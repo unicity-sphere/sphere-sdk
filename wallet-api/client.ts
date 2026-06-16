@@ -33,6 +33,11 @@ import { signMessage } from '../core/crypto';
 import { WalletApiError } from './errors';
 import { verifyChallengeTemplate } from './challenge';
 import {
+  WakeSocketSupervisor,
+  DEFAULT_WAKE_TIMING,
+  type WakeSupervisorTiming,
+} from './wake-supervisor';
+import {
   parseApplyResult,
   parseAuthChallenge,
   parseAuthTokens,
@@ -70,6 +75,8 @@ import type {
   PaymentRequestRecord,
   PaymentRequestsPage,
   RespondPaymentRequestInput,
+  SupervisedWakeSocketHandle,
+  SuperviseWakeOptions,
   UploadUrlEntry,
   UploadUrlRequest,
   WakeCallback,
@@ -77,6 +84,7 @@ import type {
   WalletApiClientConfig,
   WalletApiIdentity,
   WebSocketFactoryLike,
+  WebSocketLike,
 } from './types';
 
 interface LocalIntent {
@@ -702,16 +710,7 @@ export class WalletApiClient {
    * Wakes are nudges only; correctness comes from the `?since=` cursors.
    */
   async connectWakeSocket(onWake: WakeCallback): Promise<WakeSocketHandle> {
-    const ticket = parseWsTicket(await this.requestJson('POST', '/v1/ws-ticket'));
-    const wsBase = this.baseUrl.replace(/^http/, 'ws');
-    const ws = this.wsFactory(`${wsBase}/v1/ws?ticket=${encodeURIComponent(ticket)}`);
-
-    await new Promise<void>((resolve, reject) => {
-      ws.onopen = () => resolve();
-      ws.onerror = (err) => reject(new WalletApiError('wake socket failed to connect', 'NETWORK', undefined, err));
-      ws.onclose = () => reject(new WalletApiError('wake socket closed before connecting', 'NETWORK'));
-    });
-
+    const ws = await this.openWakeSocket();
     ws.onerror = null;
     ws.onclose = null;
     ws.onmessage = (ev) => {
@@ -720,7 +719,69 @@ export class WalletApiClient {
       void this.noteSyncEpoch(frame.syncEpoch);
       onWake(frame);
     };
-
     return { close: () => ws.close() };
+  }
+
+  /**
+   * Mint a single-use ticket (a 401 silently re-auths via {@link requestJson}),
+   * upgrade to a wake socket and resolve once it opens. ONE socket, no
+   * auto-reconnect — the building block reused by {@link connectWakeSocket} and
+   * the {@link superviseWakeSocket} supervisor.
+   */
+  private async openWakeSocket(): Promise<WebSocketLike> {
+    const ticket = parseWsTicket(await this.requestJson('POST', '/v1/ws-ticket'));
+    const wsBase = this.baseUrl.replace(/^http/, 'ws');
+    const ws = this.wsFactory(`${wsBase}/v1/ws?ticket=${encodeURIComponent(ticket)}`);
+    await new Promise<void>((resolve, reject) => {
+      ws.onopen = () => resolve();
+      ws.onerror = (err) => reject(new WalletApiError('wake socket failed to connect', 'NETWORK', undefined, err));
+      ws.onclose = () => reject(new WalletApiError('wake socket closed before connecting', 'NETWORK'));
+    });
+    return ws;
+  }
+
+  /**
+   * Open a SELF-HEALING wake channel (§9): the supervisor keeps the socket
+   * alive across drops — bounded backoff + jitter reconnects (fresh ticket each
+   * attempt; a 4401/auth-gone close also refreshes the token), a client-side
+   * liveness watchdog that force-reconnects a half-open socket, and a full
+   * catch-up pull of every stream on each (re)connect (`onReconnect`) so a dead
+   * window converges WITHOUT waiting for the poll. `onStatus` surfaces true
+   * socket liveness, decoupled from sign-in state. `close()` tears it down with
+   * no further reconnects (a deliberate logout-close never loops).
+   */
+  superviseWakeSocket(
+    options: SuperviseWakeOptions,
+    timing: WakeSupervisorTiming = DEFAULT_WAKE_TIMING
+  ): SupervisedWakeSocketHandle {
+    const supervisor = new WakeSocketSupervisor(
+      {
+        onWake: (wake) => {
+          void this.noteSyncEpoch(wake.syncEpoch);
+          options.onWake(wake);
+        },
+        onReconnect: options.onReconnect,
+        onStatus: options.onStatus,
+      },
+      {
+        openSocket: () => this.openWakeSocket(),
+        // A 4401/expiry close means the bound token is gone — drop the cached
+        // JWT so the next ticket mint re-auths (refresh → challenge fallback).
+        onAuthGone: () => {
+          this.jwt = null;
+        },
+        setTimeout: (cb, ms) => setTimeout(cb, ms),
+        clearTimeout: (h) => clearTimeout(h),
+        random: () => Math.random(),
+      },
+      timing
+    );
+    supervisor.start();
+    return {
+      close: () => supervisor.close(),
+      get status() {
+        return supervisor.currentStatus;
+      },
+    };
   }
 }

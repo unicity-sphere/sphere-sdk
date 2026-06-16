@@ -42,8 +42,17 @@ export interface WebSocketLike {
   onopen: ((ev?: unknown) => void) | null;
   onmessage: ((ev: { data: unknown }) => void) | null;
   onerror: ((ev?: unknown) => void) | null;
-  onclose: ((ev?: unknown) => void) | null;
-  close(): void;
+  onclose: ((ev?: { code?: number; reason?: string }) => void) | null;
+  /**
+   * Protocol-level ping/pong observers (the `ws` package fires `'ping'`/`'pong'`
+   * events; browsers auto-pong silently and surface neither). Optional — the
+   * liveness watchdog (§9) treats any of ping/pong/message as a sign of life and
+   * never depends on these being present. Assigned via the optional setters
+   * below so the minimal browser surface still satisfies the type.
+   */
+  onPing?: ((ev?: unknown) => void) | null;
+  onPong?: ((ev?: unknown) => void) | null;
+  close(code?: number, reason?: string): void;
 }
 
 export type WebSocketFactoryLike = (url: string) => WebSocketLike;
@@ -315,4 +324,45 @@ export type WakeCallback = (wake: WakeEvent) => void;
 /** Handle returned by the wake-socket connect. */
 export interface WakeSocketHandle {
   close(): void;
+}
+
+/**
+ * True liveness of the supervised wake socket (§9), decoupled from sign-in
+ * session state: `connected` — a socket is open and receiving; `reconnecting`
+ * — the socket dropped and the supervisor is backing off to re-establish it
+ * (the poll backstop carries correctness meanwhile); `closed` — torn down
+ * intentionally (`destroy`/logout), no further reconnects.
+ */
+export type WakeSocketStatus = 'connecting' | 'connected' | 'reconnecting' | 'closed';
+
+/**
+ * Options for {@link WalletApiClient.superviseWakeSocket} — the self-healing
+ * wake channel (§9). The socket re-mints a fresh ticket and reconnects with
+ * bounded backoff + jitter on every drop, and a client-side liveness watchdog
+ * forces a reconnect on a half-open socket (no pings/frames for 2× the server
+ * heartbeat). Wakes missed while the socket was dead are NOT replayed by the
+ * server (best-effort Redis pub/sub) — so `onReconnect` runs a full catch-up
+ * pull of every stream on each (re)connect: that pull is what guarantees
+ * convergence (correctness is the pull; the wake is only a nudge).
+ */
+export interface SuperviseWakeOptions {
+  /** A wake nudge arrived — pull that stream's cursor. */
+  onWake: WakeCallback;
+  /**
+   * Run once on every (re)connect: a full catch-up pull of ALL streams, since
+   * wakes missed during the dead window are gone. The supervisor awaits
+   * nothing — failures here are the caller's to log; the poll backstop covers
+   * a failed catch-up.
+   */
+  onReconnect?: () => void;
+  /** True socket liveness changed — surface it to the frontend (§9). */
+  onStatus?: (status: WakeSocketStatus) => void;
+}
+
+/** Handle returned by {@link WalletApiClient.superviseWakeSocket}. */
+export interface SupervisedWakeSocketHandle {
+  /** Tear down: stop the watchdog, cancel any pending reconnect, close the live socket. Idempotent. */
+  close(): void;
+  /** Current true liveness (§9). */
+  readonly status: WakeSocketStatus;
 }

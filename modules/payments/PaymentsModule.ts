@@ -1152,7 +1152,13 @@ export class PaymentsModule {
       // every stream below also has a poll backstop that is the correctness
       // path. (Before this, only `mailbox` was consumed, so a second session
       // saw no realtime inventory/payment-request convergence.)
-      this.deliveryWakeUnsub = this.injectedDelivery.onWake?.((stream) => this.handleWake(stream)) ?? null;
+      this.deliveryWakeUnsub =
+        this.injectedDelivery.onWake?.(
+          (stream) => this.handleWake(stream),
+          // §9: surface TRUE wake-socket liveness, decoupled from sign-in state,
+          // so the frontend can show a "live/reconnecting" indicator.
+          (status) => this.deps?.emitEvent('realtime:status', { status })
+        ) ?? null;
       // Poll is the correctness path; the wake is just a nudge (§9).
       this.deliveryPollTimer = setInterval(() => {
         void this.pumpIncomingDeliveries().catch((err) =>
