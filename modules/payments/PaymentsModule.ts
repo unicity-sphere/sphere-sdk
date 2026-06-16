@@ -1640,13 +1640,14 @@ export class PaymentsModule {
         // the port replaced the direct relay leg; recipients are addressed by
         // CHAIN pubkey — the canonical identity).
         const deliverBlob = async (tokenBlob: string): Promise<void> => {
+          // Carry the sender's own CANONICAL nametag so the recipient renders
+          // "@name" instead of "Someone" — bundled with the memo in ONE
+          // recipient-addressed envelope (S6).
+          const nm = this.currentNametagName();
           await delivery.deliver(recipientChainPubkeyHex, hexToBytes(tokenBlob), {
             transferId: result.id,
             memo: request.memo,
-            // Carry the sender's own nametag so the recipient renders "@name"
-            // instead of "Someone" — bundled with the memo in ONE
-            // recipient-addressed envelope (S6).
-            ...(this.getNametag()?.name !== undefined ? { senderNametag: this.getNametag()!.name } : {}),
+            ...(nm !== undefined ? { senderNametag: nm } : {}),
           });
         };
 
@@ -2231,7 +2232,7 @@ export class PaymentsModule {
       // OR a message, so the payer renders "@requester" even with no message.
       const memoEnvelope = encryptDeliveryBundle(
         deriveDeliveryEncryptionKey(this.deps!.identity.privateKey, toPubkey),
-        { senderNametag: this.getNametag()?.name, memo: request.message }
+        { senderNametag: this.currentNametagName(), memo: request.message }
       );
 
       const wire = await api.createPaymentRequest({
@@ -3812,6 +3813,23 @@ export class PaymentsModule {
   }
 
   /**
+   * The requester's CURRENT display nametag for outgoing memos: the canonical
+   * Sphere-level (Nostr-backed) store first, then the local minted-token store.
+   *
+   * The minted-token `nametags[]` is populated only by the best-effort,
+   * oracle-gated mint path, so in the real app it is empty at send time even
+   * when the user has a nametag — reading it dropped the nametag from the
+   * payment-request/delivery memo and the payer rendered a raw pubkey. The
+   * canonical store (injected via `getCurrentNametag`) is the one the UI shows
+   * and is reliably loaded on every startup. (#576, 6bd3058 regression)
+   *
+   * @returns The bare nametag name (no leading '@'), or `undefined`.
+   */
+  private currentNametagName(): string | undefined {
+    return this.deps?.getCurrentNametag?.() ?? this.nametags[0]?.name;
+  }
+
+  /**
    * Get all nametag data entries.
    *
    * @returns A copy of the nametags array.
@@ -5086,10 +5104,11 @@ export class PaymentsModule {
         memo: payload.memo,
         createdAt: Date.now(),
       });
+      const nm = this.currentNametagName();
       await delivery.deliver(payload.recipient, hexToBytes(tokenBlobHex), {
         transferId,
         memo: payload.memo,
-        ...(this.getNametag()?.name !== undefined ? { senderNametag: this.getNametag()!.name } : {}),
+        ...(nm !== undefined ? { senderNametag: nm } : {}),
       });
       await this.removePendingV2Delivery(tokenBlobHex);
     };
@@ -5314,10 +5333,11 @@ export class PaymentsModule {
     logger.warn('Payments', `${entries.length} undelivered v2 transfer(s) journaled from a previous session — replaying`);
     for (const e of entries) {
       try {
+        const nm = this.currentNametagName();
         await this.delivery!.deliver(e.recipientPubkey, hexToBytes(e.tokenBlob), {
           transferId: e.transferId,
           memo: e.memo,
-          ...(this.getNametag()?.name !== undefined ? { senderNametag: this.getNametag()!.name } : {}),
+          ...(nm !== undefined ? { senderNametag: nm } : {}),
         });
         await this.removePendingV2Delivery(e.tokenBlob);
         logger.debug('Payments', `Replayed undelivered v2 transfer ${e.transferId.slice(0, 8)}...`);

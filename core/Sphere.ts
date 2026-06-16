@@ -2438,6 +2438,7 @@ export class Sphere {
           tokenEngine: moduleSet.tokenEngine,
           delivery: this._delivery ?? undefined,
           walletApi: this._walletApi ?? undefined,
+          getCurrentNametag: () => this.getNametagForAddress(),
         });
       }
     }
@@ -2580,6 +2581,7 @@ export class Sphere {
       tokenEngine,
       delivery: this._delivery ?? undefined,
       walletApi: this._walletApi ?? undefined,
+      getCurrentNametag: () => this.getNametagForAddress(),
     });
 
     communications.initialize({
@@ -4461,6 +4463,7 @@ export class Sphere {
       tokenEngine,
       delivery: this._delivery ?? undefined,
       walletApi: this._walletApi ?? undefined,
+      getCurrentNametag: () => this.getNametagForAddress(),
     });
 
     this._communications.initialize({
