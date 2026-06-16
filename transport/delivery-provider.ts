@@ -100,6 +100,16 @@ export type DeliveryDisposition = 'claimed' | 'rejected';
 export type WakeStream = 'inventory' | 'mailbox' | 'payment_requests';
 
 /**
+ * True liveness of the realtime wake channel (§9), decoupled from sign-in
+ * session state: `connecting`/`connected` — a socket is (being) established;
+ * `reconnecting` — it dropped and is backing off to re-establish (the poll
+ * backstop carries correctness meanwhile); `closed` — torn down intentionally.
+ * The wake is a nudge, so this is informational for the frontend (a "live"
+ * indicator) — never a correctness gate.
+ */
+export type WakeChannelStatus = 'connecting' | 'connected' | 'reconnecting' | 'closed';
+
+/**
  * Custody mode (composition-time): `'inventory'` — acknowledged deliveries
  * enter the wallet-api inventory (the full wallet-api preset); `'external'` —
  * the app's own storage keeps custody and acks perform ZERO inventory writes
@@ -157,9 +167,19 @@ export interface DeliveryProvider {
    * correctness dependency, ARCHITECTURE §9). The wallet-api wake socket
    * multiplexes all three owner streams (`mailbox` | `inventory` |
    * `payment_requests`); the consumer routes each to that stream's pull.
-   * Returns an unsubscribe function.
+   *
+   * The underlying socket SELF-HEALS (§9): it reconnects with backoff on any
+   * drop and a liveness watchdog force-reconnects a half-open socket. On every
+   * (re)connect the consumer MUST run a full catch-up pull of every stream —
+   * wakes missed while the socket was dead are not replayed — so `callback`
+   * fires once for EACH stream on (re)connect (a synthetic catch-up nudge).
+   * `onStatus` (optional) surfaces true socket liveness for the frontend,
+   * decoupled from sign-in state. Returns an unsubscribe function.
    */
-  onWake?(callback: (stream: WakeStream) => void): () => void;
+  onWake?(
+    callback: (stream: WakeStream) => void,
+    onStatus?: (status: WakeChannelStatus) => void
+  ): () => void;
 
   /**
    * Late-bind the backend-true (tokenId, stateHash) derivation —

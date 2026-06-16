@@ -10,12 +10,13 @@
  * without an aggregator.
  */
 
+import WebSocket from 'ws';
 import { getPublicKey } from '../../core/crypto';
 import { decodeTokenBlob, encodeTokenBlob } from '../../token-engine/token-blob';
 import { sha256 } from '@noble/hashes/sha2.js';
 import type { TokenBlob } from '../../token-engine/types';
 import type { TxfStorageDataBase } from '../../storage';
-import type { KeyValueStore } from '../../wallet-api';
+import type { KeyValueStore, WebSocketLike } from '../../wallet-api';
 
 let tokenCounter = 0;
 
@@ -93,6 +94,34 @@ export class MemoryKeyValueStore implements KeyValueStore {
   async remove(key: string): Promise<void> {
     this.map.delete(key);
   }
+}
+
+/**
+ * Adapt the `ws` package to {@link WebSocketLike} INCLUDING the protocol
+ * `onPing`/`onPong` liveness hooks (the bare W3C `ws` surface exposes
+ * `onopen/onmessage/onerror/onclose` only — not ping/pong). The §9 wake
+ * supervisor's liveness watchdog observes these, so tests that exercise the
+ * watchdog inject sockets through this. `onclose` is forwarded WITH the close
+ * code so a 4401/auth-gone close is distinguishable from a plain drop.
+ */
+export function wsLikeWithPing(url: string): WebSocketLike {
+  const raw = new WebSocket(url);
+  const like: WebSocketLike = {
+    onopen: null,
+    onmessage: null,
+    onerror: null,
+    onclose: null,
+    onPing: null,
+    onPong: null,
+    close: (code, reason) => raw.close(code, reason),
+  };
+  raw.on('open', () => like.onopen?.());
+  raw.on('message', (data) => like.onmessage?.({ data: data.toString() }));
+  raw.on('error', (err) => like.onerror?.(err));
+  raw.on('close', (code, reason) => like.onclose?.({ code, reason: reason.toString() }));
+  raw.on('ping', () => like.onPing?.());
+  raw.on('pong', () => like.onPong?.());
+  return like;
 }
 
 /** Deterministic test identity n (secp256k1). */

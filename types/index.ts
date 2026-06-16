@@ -400,6 +400,7 @@ export type SphereEventType =
   | 'sync:error'
   | 'storage:degraded'
   | 'walletapi:session'
+  | 'realtime:status'
   | 'connection:changed'
   | 'nametag:registered'
   | 'nametag:recovered'
@@ -495,6 +496,16 @@ export interface SphereEventMap {
    * `sphere.walletApiSessionStatus`.
    */
   'walletapi:session': { status: 'online' | 'offline'; error?: string };
+  /**
+   * True liveness of the realtime wake socket (§9), DISTINCT from sign-in
+   * session state (`walletapi:session`) and from provider connectivity
+   * (`connection:changed`): `connected` — a wake socket is open; `reconnecting`
+   * — it dropped and the supervisor is backing off (the poll backstop carries
+   * correctness meanwhile); `closed` — torn down on logout/destroy. The wake is
+   * only a nudge, so this is a frontend "live" indicator, never a correctness
+   * gate.
+   */
+  'realtime:status': { status: 'connecting' | 'connected' | 'reconnecting' | 'closed' };
   'connection:changed': { provider: string; connected: boolean; status?: ProviderStatus; enabled?: boolean; error?: string };
   'nametag:registered': { nametag: string; addressIndex: number };
   'nametag:recovered': { nametag: string };

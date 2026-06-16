@@ -405,6 +405,38 @@ export class FakeWalletApi {
     return this.socketsByOwner.get(pubkey)?.size ?? 0;
   }
 
+  /**
+   * §9 reconnect-supervisor test seam: forcibly drop ALL of an owner's wake
+   * sockets server-side — the abrupt drop the supervisor must self-heal from
+   * (a proxy/idle kill, a missed-heartbeat `terminate()`, etc.). `terminate`
+   * (default) is an unclean drop with no close frame; pass `{ code }` for a
+   * clean close with a specific code (e.g. 4401 logout-close) instead. Returns
+   * the number of sockets dropped.
+   */
+  dropSockets(pubkey: string, opts: { code?: number; reason?: string } = {}): number {
+    const sockets = this.socketsByOwner.get(pubkey);
+    if (!sockets) return 0;
+    const victims = [...sockets];
+    for (const ws of victims) {
+      if (opts.code !== undefined) ws.close(opts.code, opts.reason);
+      else ws.terminate();
+    }
+    return victims.length;
+  }
+
+  /**
+   * §9 watchdog test seam: send a protocol-level ping to every one of an
+   * owner's sockets (the heartbeat the real gateway emits). Withholding these
+   * while the socket stays open server-side simulates a half-open socket — the
+   * client liveness watchdog must then force a reconnect. Returns the count.
+   */
+  pingOwner(pubkey: string): number {
+    const sockets = this.socketsByOwner.get(pubkey);
+    if (!sockets) return 0;
+    for (const ws of sockets) ws.ping();
+    return sockets.size;
+  }
+
   getIntent(pubkey: string, transferId: string): { payload: string; status: string } | null {
     const intent = this.owner(pubkey).intents.get(transferId);
     return intent ? { payload: intent.payload, status: intent.status } : null;

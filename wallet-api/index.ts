@@ -43,4 +43,7 @@ export type {
   WakeEvent,
   WakeCallback,
   WakeSocketHandle,
+  WakeSocketStatus,
+  SuperviseWakeOptions,
+  SupervisedWakeSocketHandle,
 } from './types';
