@@ -2335,6 +2335,14 @@ export class Sphere {
       throw new SphereError('Invalid Unicity ID format. Use lowercase alphanumeric, underscore, or hyphen (3-20 chars), or a valid phone number.', 'VALIDATION_ERROR');
     }
 
+    // No-op switch: already active on this index with no nametag change. Skip the
+    // logout / re-bind / re-sign-in / re-sync cycle — it would otherwise reset the
+    // wallet-api JWT, clear caches, and cause needless network traffic + inventory
+    // flicker for a call that changes nothing (Copilot review on #581).
+    if (index === this._currentAddressIndex && newNametag === undefined) {
+      return;
+    }
+
     // S4 auth lifecycle: the wallet-api session is per identity — log out
     // before switching; the new address's module init signs back in.
     if (this._walletApi && index !== this._currentAddressIndex) {
