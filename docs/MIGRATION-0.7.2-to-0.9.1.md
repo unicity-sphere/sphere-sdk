@@ -41,7 +41,7 @@ Your **call sites barely change.** `sphere.payments.send/receive/getBalance`, `s
 | **Node** | — | **≥ 22** (the v2 SDK requires it; on Node < 22 inject a `WebSocket` factory) |
 | **`network`** | optional (silently defaulted) | **required** — `Sphere.init` / `createNodeProviders` throw `INVALID_CONFIG` if missing. Use `'testnet2'` (`'testnet'` is now an alias for it). |
 | **Aggregator API key** | hardcoded default | must be **injected** (`oracle.apiKey`). testnet2 has a public default key, but pass yours explicitly. |
-| **Wallet-api URL** | n/a | `WALLET_API_URL` — the testnet2 wallet-api base URL. **Must be `https` off-loopback** (enforced at client construction). |
+| **Wallet-api URL** | n/a | `WALLET_API_URL` — the testnet2 wallet-api base URL (currently `https://wallet-api.staging.unicity.network`). **Must be `https` off-loopback** (enforced at client construction). |
 | **`deviceId`** | n/a | a **stable, persisted** id per bot/device — it holds the rotating refresh token, so a fresh value re-challenges every run. |
 | **Aggregator + trustbase** | aggregator only | both still required (the engine does state transitions client-side): `AGGREGATOR_URL`, `TRUSTBASE_URL` (declares `networkId`; testnet2 = **4**). testnet2 defaults are baked in. |
 
@@ -49,12 +49,12 @@ Example `.env` for a testnet2 bot:
 
 ```dotenv
 NETWORK=testnet2
-WALLET_API_URL=https://wallet-api.testnet2.unicity.network   # your testnet2 wallet-api deployment
+WALLET_API_URL=https://wallet-api.staging.unicity.network   # the testnet2 wallet-api deployment (note: 'staging' host, not 'testnet2')
 WALLET_API_DEVICE_ID=bot-prod-1                              # STABLE; persists the refresh token
 AGGREGATOR_KEY=sk_...                                        # aggregator/gateway API key
 # Optional overrides — testnet2 defaults are built in:
 # AGGREGATOR_URL=https://gateway.testnet2.unicity.network
-# TRUSTBASE_URL=https://raw.githubusercontent.com/unicitynetwork/unicity-ids/main/bft-trustbase.testnet2.json
+# TRUSTBASE_URL=https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/bft-trustbase.testnet2.json
 ```
 
 ---
