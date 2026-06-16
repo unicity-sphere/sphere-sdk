@@ -37,14 +37,17 @@ describe('delivery-envelope (ECDH-to-recipient S6)', () => {
 
   it('bundles nametag + memo into one enc1 envelope the RECIPIENT decrypts (bug A + B)', () => {
     const senderKey = deriveDeliveryEncryptionKey(SENDER_PRIV, RECIPIENT_PUB);
-    const envelope = encryptDeliveryBundle(senderKey, { senderNametag: 'api-1', memo: 'hi' });
+    // Leak-check plaintexts both contain a char outside the base64 alphabet ('-', '?'),
+    // so `not.toContain` is SOUND — a 2-char base64-only string like 'hi' coincidentally
+    // appears in the random ciphertext's base64 ~1-2% of the time (a flaky false positive).
+    const envelope = encryptDeliveryBundle(senderKey, { senderNametag: 'api-1', memo: 'lunch?' });
     expect(envelope).toBeDefined();
     expect(envelope!.startsWith(FIELD_ENVELOPE_PREFIX)).toBe(true); // wire shape unchanged
     expect(envelope).not.toContain('api-1');
-    expect(envelope).not.toContain('hi');
+    expect(envelope).not.toContain('lunch?');
 
     const recipientKey = deriveDeliveryEncryptionKey(RECIPIENT_PRIV, SENDER_PUB);
-    expect(decryptDeliveryBundle(recipientKey, envelope!)).toEqual({ senderNametag: 'api-1', memo: 'hi' });
+    expect(decryptDeliveryBundle(recipientKey, envelope!)).toEqual({ senderNametag: 'api-1', memo: 'lunch?' });
   });
 
   it('a self-send round-trips: ECDH(priv, ownPub) on both sides', () => {
