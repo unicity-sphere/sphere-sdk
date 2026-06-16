@@ -1,5 +1,5 @@
 /**
- * #583 — auth-generation guard (Copilot review on PR #585).
+ * #583 (auth-generation guard) — landed in PR #585.
  *
  * `setIdentity()` (and `logout()`) bump a monotonic `authGeneration`. An
  * in-flight challenge→sign / refresh attempt captures the generation at its
@@ -71,9 +71,12 @@ function defer(): Deferred {
  */
 class ScriptedAuthFetch {
   readonly verifyGates: Deferred[] = [];
+  readonly refreshGates: Deferred[] = [];
   private readonly verifyTokens: Array<{ jwt: string; refreshToken: string }> = [];
   /** Bearer tokens seen on authenticated probe requests, in order. */
   readonly bearerSeen: string[] = [];
+  /** Pubkeys that reached `/v1/auth/challenge`, in order — proves a challenge cycle ran. */
+  readonly challengeSeen: string[] = [];
 
   queueVerifyTokens(jwt: string, refreshToken: string): void {
     this.verifyTokens.push({ jwt, refreshToken });
@@ -83,7 +86,16 @@ class ScriptedAuthFetch {
     const path = url.replace(BASE_URL.replace(/\/$/, ''), '');
     if (path === '/v1/auth/challenge') {
       const pubkey = JSON.parse(String(init?.body)).pubkey as string;
+      this.challengeSeen.push(pubkey);
       return Promise.resolve(jsonResponse(200, challengeBody(pubkey)));
+    }
+    if (path === '/v1/auth/refresh') {
+      // Gated like verify, so a refresh can be held in flight across a switch.
+      const gate = defer();
+      this.refreshGates.push(gate);
+      return gate.promise.then(() =>
+        jsonResponse(200, { jwt: 'JWT-REFRESHED', refreshToken: 'REFRESH-ROTATED' }),
+      );
     }
     if (path === '/v1/auth/verify') {
       const idx = this.verifyGates.length;
@@ -101,6 +113,10 @@ class ScriptedAuthFetch {
 
   releaseVerify(index: number): void {
     this.verifyGates[index].resolve();
+  }
+
+  releaseRefresh(index: number): void {
+    this.refreshGates[index].resolve();
   }
 }
 
@@ -157,6 +173,48 @@ describe('WalletApiClient — auth-generation guard on identity switch (#583)', 
     expect(script.bearerSeen).not.toContain('JWT-A');
     expect(storage.map.get(refreshKeyFor(ownerB.chainPubkey, 'dev-1'))).toBe('REFRESH-B');
     expect(storage.map.get(refreshKeyFor(ownerA.chainPubkey, 'dev-1'))).toBeUndefined();
+  });
+
+  it('a refresh that goes stale mid-flight bails WITHOUT starting a challenge cycle for the new owner', async () => {
+    const ownerA = testIdentity(73);
+    const ownerB = testIdentity(74);
+    const storage = new MemoryKeyValueStore();
+    const script = new ScriptedAuthFetch();
+    const client = new WalletApiClient({
+      baseUrl: BASE_URL,
+      network: NETWORK,
+      deviceId: 'dev-3',
+      storage,
+      fetchFn: script.fetchFn,
+    });
+
+    // Owner A has a stored refresh token, so signIn() takes the refresh path
+    // (which we hold in flight) rather than going straight to a challenge.
+    storage.map.set(refreshKeyFor(ownerA.chainPubkey, 'dev-3'), 'REFRESH-A');
+    client.setIdentity(ownerA);
+
+    const signInA = client.signIn();
+    await settleMicrotasks();
+    expect(script.refreshGates.length).toBe(1); // parked on /v1/auth/refresh
+    expect(script.challengeSeen).toEqual([]); // no challenge yet
+
+    // Identity switches to owner B while A's refresh is still in flight.
+    client.setIdentity(ownerB);
+
+    // Release the now-stale refresh. `tryRefresh` returns false (isStale); the
+    // fix makes `signInInner` bail. Without it, signInInner would fall through to
+    // `challengeSignIn(gen)` and run a full challenge→verify cycle for owner B.
+    script.releaseRefresh(0);
+    await settleMicrotasks();
+
+    // FAILING-FIRST DISCRIMINATOR: no challenge cycle was started for ANY owner.
+    expect(script.challengeSeen).toEqual([]);
+    // Nothing was persisted for the new owner, and A's pre-existing token is
+    // left intact (a stale refresh-false neither rotates nor removes it).
+    expect(storage.map.get(refreshKeyFor(ownerB.chainPubkey, 'dev-3'))).toBeUndefined();
+    expect(storage.map.get(refreshKeyFor(ownerA.chainPubkey, 'dev-3'))).toBe('REFRESH-A');
+
+    await signInA; // resolves cleanly under the fix
   });
 
   it('the happy path (no identity change) caches the jwt and persists the refresh token', async () => {

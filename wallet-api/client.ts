@@ -276,6 +276,12 @@ export class WalletApiClient {
 
   private async signInInner(gen: number): Promise<void> {
     if (await this.tryRefresh(gen)) return;
+    // #583: `tryRefresh` returns false for TWO reasons — a genuine refresh miss
+    // (no/expired token) OR the identity moved on mid-refresh (`isStale`). In the
+    // stale case we must NOT fall through to a challenge→verify cycle: it would
+    // run under the NEW owner, hit the network, possibly throw, and be discarded
+    // by `challengeSignIn`'s own end-guard anyway. Bail cleanly instead.
+    if (this.isStale(gen)) return;
     await this.challengeSignIn(gen);
   }
 
