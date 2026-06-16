@@ -395,12 +395,18 @@ export class GroupChatModule {
     //  - Moderation events must not be missed (e.g., kicks that occurred while offline)
     const sinceTimestamp = this.getLatestKnownTimestamp(groupIds);
 
-    // Subscribe to group messages
+    // Subscribe to group messages.
+    // `limit` bounds the stored-event backlog the relay replays on (re)connect:
+    // without it, a busy global group dumps its ENTIRE history in one burst
+    // (observed: 1000 events), and each one runs synchronously through
+    // handleGroupEvent + two emitEvent fan-outs, freezing the UI. Older history
+    // is loaded on demand via fetchMessages()/getMessagesPage().
     this.trackSubscription(
       createNip29Filter({
         kinds: [NIP29_KINDS.CHAT_MESSAGE, NIP29_KINDS.THREAD_ROOT, NIP29_KINDS.THREAD_REPLY],
         '#h': groupIds,
         ...(sinceTimestamp ? { since: sinceTimestamp } : {}),
+        limit: this.config.defaultMessageLimit,
       }),
       { onEvent: (event: Event) => this.handleGroupEvent(event) },
     );
@@ -429,11 +435,14 @@ export class GroupChatModule {
 
     const sinceTimestamp = this.getLatestKnownTimestamp([groupId]);
 
+    // See subscribeToJoinedGroups(): `limit` bounds the replayed backlog so a
+    // busy group can't freeze the UI by dumping its full history on connect.
     this.trackSubscription(
       createNip29Filter({
         kinds: [NIP29_KINDS.CHAT_MESSAGE, NIP29_KINDS.THREAD_ROOT, NIP29_KINDS.THREAD_REPLY],
         '#h': [groupId],
         ...(sinceTimestamp ? { since: sinceTimestamp } : {}),
+        limit: this.config.defaultMessageLimit,
       }),
       { onEvent: (event: Event) => this.handleGroupEvent(event) },
     );
@@ -1369,26 +1378,29 @@ export class GroupChatModule {
       this.fetchGroupAdminsInternal(groupId),
     ]);
 
+    // De-dupe by pubkey in O(n) via a Map, then assign the array once.
+    // saveMemberToMemory() does a linear findIndex per insert, so calling it in
+    // a loop over a member list is O(n^2): for a global group with tens of
+    // thousands of members that is a multi-second synchronous main-thread freeze
+    // (so severe the page can't even open DevTools). Merge with whatever is
+    // already in memory so existing entries aren't dropped.
+    const adminSet = new Set(adminPubkeys);
+    const byPubkey = new Map<string, GroupMemberData>();
+    for (const existing of this.members.get(groupId) ?? []) {
+      byPubkey.set(existing.pubkey, existing);
+    }
     for (const member of members) {
-      if (adminPubkeys.includes(member.pubkey)) {
-        member.role = GroupRoleEnum.ADMIN;
-      }
-      this.saveMemberToMemory(member);
+      if (adminSet.has(member.pubkey)) member.role = GroupRoleEnum.ADMIN;
+      byPubkey.set(member.pubkey, member);
     }
-
-    // Save admins not in member list
+    // Admins not present in the member list.
     for (const pubkey of adminPubkeys) {
-      const existing = (this.members.get(groupId) || []).find((m) => m.pubkey === pubkey);
-      if (!existing) {
-        this.saveMemberToMemory({
-          pubkey,
-          groupId,
-          role: GroupRoleEnum.ADMIN,
-          joinedAt: Date.now(),
-        });
+      if (!byPubkey.has(pubkey)) {
+        byPubkey.set(pubkey, { pubkey, groupId, role: GroupRoleEnum.ADMIN, joinedAt: Date.now() });
       }
     }
 
+    this.members.set(groupId, Array.from(byPubkey.values()));
     this.schedulePersist();
   }
 
