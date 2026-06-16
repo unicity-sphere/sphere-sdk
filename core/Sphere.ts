@@ -516,6 +516,20 @@ export interface AddressModuleSet {
   tokenStorageProviders: Map<string, TokenStorageProvider<TxfStorageDataBase>>;
   /** v2 token engine for THIS address (bound to its signing key). */
   tokenEngine: ITokenEngine | undefined;
+  /**
+   * #583 per-address client isolation: this address's OWN delivery provider
+   * (cloned from the composition template, backed by its own identity-bound
+   * `WalletApiClient` + wake socket). Null in compositions without a delivery
+   * port, or when the composed provider can't isolate per address (no
+   * `createForAddress`) — then the shared template instance is reused.
+   */
+  delivery: DeliveryProvider | null;
+  /**
+   * #583: this address's OWN wallet-api session — the SAME client backing
+   * {@link delivery} (so the whole module set authenticates as one owner). Null
+   * in fully-local compositions or when isolation isn't available.
+   */
+  walletApi: SphereWalletApiSession | null;
   initialized: boolean;
 }
 
@@ -551,10 +565,28 @@ export class Sphere {
   private _transport: TransportProvider;
   private _oracle: OracleProvider;
   private _priceProvider: PriceProvider | null;
-  /** Delivery port (S7) — null = legacy transport adapter inside PaymentsModule. */
+  /**
+   * Delivery port (S7) for the ACTIVE address — null = legacy transport adapter
+   * inside PaymentsModule. #583: this now tracks the active address's OWN
+   * (per-address-isolated) instance, not a single shared one.
+   */
   private _delivery: DeliveryProvider | null = null;
-  /** wallet-api session (S4) — null in fully-local compositions. */
+  /**
+   * wallet-api session (S4) for the ACTIVE address — null in fully-local
+   * compositions. #583: reflects the active address's OWN client (so
+   * `walletApiSessionStatus` is the active owner's session state).
+   */
   private _walletApi: SphereWalletApiSession | null = null;
+  /**
+   * #583 per-address client isolation: the COMPOSITION-TIME delivery / wallet-api
+   * instances, retained as templates. Each HD address clones its OWN identity-
+   * bound delivery + session from these (via `createForAddress`) so an orphaned
+   * previous-address poll pump re-auths as ITS OWN owner — never driving a
+   * client re-bound to a different owner. Address 0 (the boot address) reuses
+   * the template instances directly; later addresses get clones.
+   */
+  private _deliveryTemplate: DeliveryProvider | null = null;
+  private _walletApiTemplate: SphereWalletApiSession | null = null;
   /** S4 session state (#515 F3) — null until a wallet-api composition attempts sign-in. */
   private _walletApiSessionStatus: 'online' | 'offline' | null = null;
   /** v2 token engine (built per active address from the oracle); injected into modules. */
@@ -611,8 +643,13 @@ export class Sphere {
     this._transport = transport;
     this._oracle = oracle;
     this._priceProvider = priceProvider ?? null;
+    // Active-address delivery/session start as the composition-time instances;
+    // they are retained as templates too (#583 — later addresses clone from
+    // them, address 0 / the boot address reuses them directly).
     this._delivery = delivery ?? null;
     this._walletApi = walletApi ?? null;
+    this._deliveryTemplate = delivery ?? null;
+    this._walletApiTemplate = walletApi ?? null;
 
     // Initialize token storage providers map
     if (tokenStorage) {
@@ -2343,15 +2380,14 @@ export class Sphere {
       return;
     }
 
-    // S4 auth lifecycle: the wallet-api session is per identity — log out
-    // before switching; the new address's module init signs back in.
-    if (this._walletApi && index !== this._currentAddressIndex) {
-      try {
-        await this._walletApi.logout();
-      } catch (err) {
-        logger.warn('Sphere', 'wallet-api logout on address switch failed (continuing):', err);
-      }
-    }
+    // #583: per-address client isolation — each HD address binds its OWN
+    // identity-bound wallet-api client (delivery + session + token storage). A
+    // switch does NOT log out the previous address's session: its modules keep
+    // running on their OWN client (the per-address architecture's "old address
+    // keeps running" contract), and the new address signs in on its own client
+    // at module init. The previous logout-before-switch existed only to stop
+    // the SINGLE shared client serving the wrong owner — now obsolete (and it
+    // would needlessly drop the previous address's still-live wake socket).
 
     // Derive the address at the given index
     const addressInfo = this.deriveAddress(index, false);
@@ -2399,7 +2435,9 @@ export class Sphere {
     // No destroy, no waitForPendingOperations — old address keeps running.
     // =========================================================================
 
-    if (!this._addressModules.has(index)) {
+    const firstVisit = !this._addressModules.has(index);
+
+    if (firstVisit) {
       // First time switching to this address — create independent modules
       logger.debug('Sphere', `switchToAddress(${index}): creating per-address modules (lazy init)`);
 
@@ -2408,31 +2446,24 @@ export class Sphere {
       // storage keys.  Without this, modules would load the previous address's data.
       this._storage.setIdentity(newIdentity);
 
-      // Create per-address token storage providers (each address needs its own instances)
-      const addressTokenProviders = new Map<string, TokenStorageProvider<TxfStorageDataBase>>();
-      for (const [providerId, provider] of this._tokenStorageProviders.entries()) {
-        if (provider.createForAddress) {
-          const newProvider = provider.createForAddress();
-          newProvider.setIdentity(newIdentity);
-          await newProvider.initialize();
-          addressTokenProviders.set(providerId, newProvider);
-        } else {
-          // Fallback: reuse existing provider (legacy behavior for providers
-          // that don't support createForAddress). The reused SHARED provider
-          // is still bound to the PREVIOUS address — rebind it to this address
-          // before it serves inventory (#580 review). Its in-memory view AND
-          // its persisted cursor are per-identity (keyed by chainPubkey), so
-          // without this setIdentity a FIRST-VISIT switch loads the previous
-          // address's tokens / a wrong delta. Mirrors the createForAddress
-          // branch above; `payments.initialize` only rebinds delivery, never
-          // the token-storage providers, so nothing else covers this.
-          logger.warn('Sphere', `Token storage provider ${providerId} does not support createForAddress, reusing shared instance`);
-          provider.setIdentity(newIdentity);
-          addressTokenProviders.set(providerId, provider);
-        }
+      // #583: build THIS address's OWN delivery + wallet-api session FIRST (one
+      // fresh identity-bound client), so the wallet-api token storage can share
+      // that SAME client — all of an address's wallet-api artifacts then run on
+      // ONE client + ONE refresh-token lineage (siblings sharing owner+deviceId
+      // would otherwise trip the server's rotation-reuse revocation).
+      const { delivery, walletApi } = this.buildAddressDelivery(newIdentity);
+      const addressTokenProviders = this.buildAddressTokenProviders(newIdentity, walletApi);
+      for (const provider of addressTokenProviders.values()) {
+        await provider.initialize();
       }
 
-      await this.initializeAddressModules(index, newIdentity, addressTokenProviders);
+      await this.initializeAddressModules({
+        index,
+        identity: newIdentity,
+        tokenStorageProviders: addressTokenProviders,
+        delivery,
+        walletApi,
+      });
     } else {
       // Modules already exist — update identity if nametag changed
       const moduleSet = this._addressModules.get(index)!;
@@ -2440,8 +2471,15 @@ export class Sphere {
         moduleSet.identity = newIdentity;
         // Use per-address transport if available
         const addressTransport: TransportProvider = moduleSet.transportAdapter ?? this._transport;
-        // Re-initialize with updated identity (nametag change). The signing key is
-        // unchanged (only the nametag label), so reuse this address's token engine.
+        // #583: re-init with THIS address's OWN (isolated) delivery + session —
+        // never the currently-active address's instances. The signing key is
+        // unchanged (only the nametag label), so reuse this address's token
+        // engine; rebind the per-address delivery's identity (nametag may ride
+        // outgoing envelopes) before payments.initialize re-wires it.
+        moduleSet.delivery?.setIdentity?.({
+          privateKey: newIdentity.privateKey,
+          chainPubkey: newIdentity.chainPubkey,
+        });
         moduleSet.payments.initialize({
           identity: newIdentity,
           storage: this._storage,
@@ -2452,19 +2490,16 @@ export class Sphere {
           chainCode: this._masterKey?.chainCode || undefined,
           price: this._priceProvider ?? undefined,
           tokenEngine: moduleSet.tokenEngine,
-          delivery: this._delivery ?? undefined,
-          walletApi: this._walletApi ?? undefined,
+          delivery: moduleSet.delivery ?? undefined,
+          walletApi: moduleSet.walletApi ?? undefined,
           getCurrentNametag: () => this.getNametagForAddress(),
         });
-      } else {
-        // No nametag change → the module is NOT re-initialized, so nothing has
-        // re-bound the SHARED wallet-api/delivery client to this address. That
-        // client holds one identity+JWT; without this rebind it keeps the
-        // previously-active address's owner and inventory loads return the WRONG
-        // address's tokens (the #580 cross-address bleed). Re-establish identity
-        // + auth on the re-visit path before the pointer swap serves inventory.
-        await this.rebindWalletApiIdentity(newIdentity, moduleSet);
       }
+      // No nametag change → no re-init needed. #583: this address already has
+      // its OWN identity-bound client (built at first visit); it never served
+      // another owner, so there is nothing to re-bind (the #580/#581 shared-
+      // client `rebindWalletApiIdentity` is retired). The pointer swap below
+      // just points the active references at this set's instances.
     }
 
     // Switch the active pointer — instant, no destroy
@@ -2477,6 +2512,25 @@ export class Sphere {
     this._communications = activeModules.communications;
     this._groupChat = activeModules.groupChat;
     this._market = activeModules.market;
+    // #583: point the active delivery/wallet-api references at THIS address's
+    // own instances so Sphere-level surfaces (walletApiSessionStatus, any
+    // delivery passthrough) reflect the ACTIVE owner — not whichever address
+    // was composed at boot. Previous addresses' instances keep running on their
+    // own clients in the background.
+    this._delivery = activeModules.delivery;
+    this._walletApi = activeModules.walletApi;
+
+    // #583: on a RE-VISIT (modules already existed, so initializeAddressModules
+    // did NOT run its sign-in), re-establish this address's session — re-sign-in
+    // (refresh-first, cheap + idempotent), refresh the Sphere-level
+    // walletApiSessionStatus to the ACTIVE owner's state (#515 F3), and re-run
+    // resumeOpenIntents (E.3) so an intent that failed to resume on an earlier
+    // visit retries. The retired rebindWalletApiIdentity used to cover this on
+    // the re-visit path; per-address isolation keeps the client itself bound,
+    // but these sign-in side effects still need re-running on each switch-back.
+    if (!firstVisit && activeModules.walletApi) {
+      await this.startWalletApiSession(activeModules.payments, activeModules.walletApi);
+    }
 
     // Persist current index
     await this._storage.set(STORAGE_KEYS_GLOBAL.CURRENT_ADDRESS_INDEX, index.toString());
@@ -2517,35 +2571,6 @@ export class Sphere {
   }
 
   /**
-   * Re-bind the SHARED wallet-api/delivery client to `identity` on a re-visit
-   * address switch that did NOT re-initialize the module (#580).
-   *
-   * The wallet-api preset composes ONE `WalletApiClient`, shared by the
-   * token-storage provider, the delivery provider and the `walletApi` session;
-   * it holds a single identity+JWT. `switchToAddress` logs out before switching
-   * and only re-authenticates inside `PaymentsModule.initialize` (via
-   * `delivery.setIdentity`) — which the no-nametag-change re-visit path skips.
-   * Without this rebind the shared client keeps the previous owner, so this
-   * address's inventory `load()` returns the WRONG address's tokens. Re-bind the
-   * delivery + wallet-api ports AND this address's wallet-api-backed token
-   * storage providers, then re-establish the session (sign-in is degradable:
-   * a failed sign-in is recorded, never thrown — boot/switch stays non-blocking).
-   */
-  private async rebindWalletApiIdentity(
-    identity: FullIdentity,
-    moduleSet: AddressModuleSet,
-  ): Promise<void> {
-    if (!this._walletApi && !this._delivery) return;
-    const idSlice = { privateKey: identity.privateKey, chainPubkey: identity.chainPubkey };
-    this._delivery?.setIdentity?.(idSlice);
-    this._walletApi?.setIdentity(idSlice);
-    for (const provider of moduleSet.tokenStorageProviders.values()) {
-      if (provider.requiresWalletApi) provider.setIdentity(identity);
-    }
-    if (this._walletApi) await this.startWalletApiSession(moduleSet.payments);
-  }
-
-  /**
    * Background transport sync and nametag operations after address switch.
    * Runs after switchToAddress returns so L1/L3 queries can start immediately.
    */
@@ -2573,6 +2598,81 @@ export class Sphere {
   }
 
   /**
+   * #583 per-address client isolation: build THIS address's OWN delivery
+   * provider + wallet-api session, both backed by ONE fresh identity-bound
+   * `WalletApiClient` cloned from the composition template. An orphaned
+   * previous-address poll pump then drives ITS OWN client (re-auths as its own
+   * owner — harmless) instead of a single shared client re-bound to the new
+   * owner, which is what stranded incoming tokens, leaked wake sockets onto the
+   * wrong owner, and bled payment-requests across addresses.
+   *
+   * Returns the composition templates unchanged when the delivery provider
+   * can't isolate per address (no `createForAddress` — e.g. a stateless legacy
+   * transport adapter); the no-op-switch guard + per-address token storage still
+   * apply. The new delivery's identity is bound here so its first pull
+   * authenticates as this address; `PaymentsModule.initialize` re-binds it (and
+   * the engine's deliveryKeys) idempotently.
+   */
+  private buildAddressDelivery(
+    identity: FullIdentity,
+  ): { delivery: DeliveryProvider | null; walletApi: SphereWalletApiSession | null } {
+    const template = this._deliveryTemplate;
+    if (!template?.createForAddress) {
+      // No isolation available — reuse the composition templates as-is.
+      return { delivery: this._deliveryTemplate, walletApi: this._walletApiTemplate };
+    }
+    const delivery = template.createForAddress();
+    delivery.setIdentity?.({ privateKey: identity.privateKey, chainPubkey: identity.chainPubkey });
+    // The wallet-api session for this address is the SAME client backing its
+    // delivery provider (so intents/history/PRs authenticate as one owner). It
+    // MUST come from the isolated clone's own `walletApiClient` — never the
+    // shared `_walletApiTemplate`: re-binding the boot address's still-active
+    // session to this address would reintroduce the very cross-owner bleed (#580)
+    // this isolation removes. A provider that isolates delivery but exposes no
+    // own client gets a null session (its delivery still works; intents/history
+    // ride the active address's session) rather than a poisoned shared one.
+    const walletApi =
+      (delivery as { walletApiClient?: SphereWalletApiSession }).walletApiClient ?? null;
+    walletApi?.setIdentity({ privateKey: identity.privateKey, chainPubkey: identity.chainPubkey });
+    return { delivery, walletApi };
+  }
+
+  /**
+   * #583: build THIS address's token storage providers. A wallet-api provider
+   * (the only kind needing per-owner auth) is cloned to share the address's
+   * `perAddressClient` — the SAME client backing its delivery + walletApi
+   * session — so all its wallet-api artifacts use ONE client + ONE refresh-token
+   * lineage. Other providers either isolate via the generic arg-less
+   * `createForAddress`, or (stateless/local) reuse the single shared instance,
+   * re-bound to this address. Returns the new (uninitialized) provider map.
+   */
+  private buildAddressTokenProviders(
+    identity: FullIdentity,
+    perAddressClient: unknown,
+  ): Map<string, TokenStorageProvider<TxfStorageDataBase>> {
+    const out = new Map<string, TokenStorageProvider<TxfStorageDataBase>>();
+    for (const [providerId, provider] of this._tokenStorageProviders.entries()) {
+      if (provider.createForAddress) {
+        // wallet-api providers accept the shared per-address client (structural
+        // arg, ignored by providers that don't take one).
+        const factory = provider.createForAddress as (c?: unknown) => TokenStorageProvider<TxfStorageDataBase>;
+        const newProvider = provider.requiresWalletApi && perAddressClient
+          ? factory.call(provider, perAddressClient)
+          : factory.call(provider);
+        newProvider.setIdentity(identity);
+        out.set(providerId, newProvider);
+      } else {
+        // Stateless/local provider: it keys all state by identity internally —
+        // re-bind it to this address and reuse the single instance.
+        logger.warn('Sphere', `Token storage provider ${providerId} does not support createForAddress, reusing shared instance`);
+        provider.setIdentity(identity);
+        out.set(providerId, provider);
+      }
+    }
+    return out;
+  }
+
+  /**
    * Create a new set of per-address modules for the given index.
    * Each address gets its own PaymentsModule, CommunicationsModule, etc.
    * Modules are fully independent — they have their own token storage,
@@ -2583,10 +2683,15 @@ export class Sphere {
    * @param tokenStorageProviders - Token storage providers for this address
    */
   private async initializeAddressModules(
-    index: number,
-    identity: FullIdentity,
-    tokenStorageProviders: Map<string, TokenStorageProvider<TxfStorageDataBase>>,
+    spec: {
+      index: number;
+      identity: FullIdentity;
+      tokenStorageProviders: Map<string, TokenStorageProvider<TxfStorageDataBase>>;
+      delivery: DeliveryProvider | null;
+      walletApi: SphereWalletApiSession | null;
+    },
   ): Promise<AddressModuleSet> {
+    const { index, identity, tokenStorageProviders, delivery, walletApi } = spec;
     // Destroy swap before accounting — swap depends on accounting.
     if (this._swap) {
       await this._swap.destroy();
@@ -2621,6 +2726,11 @@ export class Sphere {
     // v2 token engine for THIS address (bound to its signing key).
     const tokenEngine = await this.buildTokenEngine(identity);
 
+    // #583: `delivery` / `walletApi` are THIS address's OWN identity-bound
+    // instances (built by the caller via buildAddressDelivery, sharing one
+    // client with this address's token storage), so its pumps never share a
+    // client with another address.
+
     // Initialize with address-specific identity and per-address transport
     payments.initialize({
       identity,
@@ -2632,8 +2742,8 @@ export class Sphere {
       chainCode: this._masterKey?.chainCode || undefined,
       price: this._priceProvider ?? undefined,
       tokenEngine,
-      delivery: this._delivery ?? undefined,
-      walletApi: this._walletApi ?? undefined,
+      delivery: delivery ?? undefined,
+      walletApi: walletApi ?? undefined,
       getCurrentNametag: () => this.getNametagForAddress(),
     });
 
@@ -2712,8 +2822,9 @@ export class Sphere {
     await payments.load();
 
     // S4 auth lifecycle: sign in as this address's identity and resume its
-    // open intents (E.3) — sign-in on unlock / after an account switch.
-    await this.startWalletApiSession(payments);
+    // open intents (E.3) — sign-in on unlock / after an account switch. Drives
+    // THIS address's OWN session (#583), never a shared one.
+    await this.startWalletApiSession(payments, walletApi);
 
     // Non-critical modules load in parallel — failures are non-fatal
     const results = await Promise.allSettled([
@@ -2739,6 +2850,8 @@ export class Sphere {
       transportAdapter: adapter,
       tokenStorageProviders: new Map(tokenStorageProviders),
       tokenEngine,
+      delivery,
+      walletApi,
       initialized: true,
     };
 
@@ -4611,7 +4724,9 @@ export class Sphere {
     // S4 auth lifecycle: sign in on unlock and resume open intents (E.3).
     await this.startWalletApiSession(this._payments);
 
-    // Register in per-address module map
+    // Register in per-address module map. #583: the boot address reuses the
+    // composition-time delivery/session instances directly (they ARE this
+    // address's isolated client); later addresses clone their own.
     this._addressModules.set(this._currentAddressIndex, {
       index: this._currentAddressIndex,
       identity: this._identity!,
@@ -4622,6 +4737,8 @@ export class Sphere {
       transportAdapter: adapter,
       tokenStorageProviders: new Map(this._tokenStorageProviders),
       tokenEngine: this._tokenEngine,
+      delivery: this._delivery,
+      walletApi: this._walletApi,
       initialized: true,
     });
   }
@@ -4656,10 +4773,13 @@ export class Sphere {
    * it is RECORDED and surfaced (`walletApiSessionStatus` + the
    * `walletapi:session` event), never log-only (#515 F3).
    */
-  private async startWalletApiSession(payments: PaymentsModule): Promise<void> {
-    if (!this._walletApi) return;
+  private async startWalletApiSession(
+    payments: PaymentsModule,
+    session: SphereWalletApiSession | null = this._walletApi,
+  ): Promise<void> {
+    if (!session) return;
     try {
-      await this._walletApi.signIn();
+      await session.signIn();
     } catch (err) {
       logger.warn('Sphere', 'wallet-api sign-in failed — wallet continues offline:', err);
       this.noteWalletApiSession('offline', err instanceof Error ? err.message : String(err));

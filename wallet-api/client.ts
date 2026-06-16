@@ -161,6 +161,9 @@ export class WalletApiClient {
   /** Serializes concurrent re-auth attempts. */
   private authInFlight: Promise<void> | null = null;
 
+  /** The construction config, retained so {@link clone} can mint a sibling. */
+  private readonly config: WalletApiClientConfig;
+
   constructor(config: WalletApiClientConfig) {
     const url = assertSecureBaseUrl(config.baseUrl);
     this.baseUrl = url.toString().replace(/\/$/, '');
@@ -178,12 +181,36 @@ export class WalletApiClient {
       config.fetchFn ?? ((u, init) => (globalThis as unknown as { fetch: FetchLike }).fetch(u, init));
     this.wsFactory = config.webSocketFactory ?? defaultWebSocketFactory;
     this.now = config.now ?? (() => Date.now());
+    this.config = config;
+  }
+
+  /**
+   * #583: mint a FRESH, identity-less sibling client from the SAME construction
+   * config (baseUrl, network, deviceId, storage, fetch/ws factories, clock).
+   * Per-address client isolation builds one client per HD address from this, so
+   * each address's providers authenticate as their OWN owner with their OWN JWT
+   * — an orphaned previous-address poll pump can never drive a client that has
+   * been re-authed to a DIFFERENT owner. The shared `storage` is intentional:
+   * its keys are namespaced per (network, chainPubkey, deviceId), so per-owner
+   * refresh tokens / cursors stay separate (no cross-owner collision). The clone
+   * starts with no identity and no JWT — the caller binds it via setIdentity.
+   */
+  clone(): WalletApiClient {
+    return new WalletApiClient(this.config);
   }
 
   /** Bind the wallet identity this client authenticates as. Resets the session. */
   setIdentity(identity: WalletApiIdentity): void {
     this.identity = identity;
     this.jwt = null;
+    // #583: also abandon any in-flight sign-in. A pending challenge→sign cycle
+    // for the PREVIOUS identity could otherwise resolve here and cache a JWT
+    // for the wrong owner (`authInFlight` is keyed to the identity at the time
+    // the promise was created). Per-address client isolation makes a shared
+    // re-bind rare, but a defense-in-depth clear keeps `signIn()` re-minting
+    // for the new identity from a clean slate. The orphaned promise still runs
+    // to completion harmlessly (its `.finally` only nulls a field we've reset).
+    this.authInFlight = null;
   }
 
   // ── storage keys (scoped per network + pubkey + device) ────────────────────
@@ -210,10 +237,15 @@ export class WalletApiClient {
    */
   async signIn(): Promise<void> {
     if (this.authInFlight) return this.authInFlight;
-    this.authInFlight = this.signInInner().finally(() => {
-      this.authInFlight = null;
+    const inFlight = this.signInInner().finally(() => {
+      // #583: only clear the slot if it still holds THIS promise. setIdentity()
+      // may null `authInFlight` (abandoning a stale sign-in) and a fresh signIn()
+      // may have stored a NEW promise; an unconditional clear here would clobber
+      // that newer in-flight sign-in and break the de-dup guarantee.
+      if (this.authInFlight === inFlight) this.authInFlight = null;
     });
-    return this.authInFlight;
+    this.authInFlight = inFlight;
+    return inFlight;
   }
 
   private async signInInner(): Promise<void> {

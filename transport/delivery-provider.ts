@@ -132,6 +132,19 @@ export interface DeliveryProvider {
   setIdentity?(identity: { privateKey: string; chainPubkey: string }): void;
 
   /**
+   * #583 per-address client isolation: mint an INDEPENDENT delivery provider for
+   * a different HD address, backed by its OWN authenticated client + wake socket
+   * (mirrors `TokenStorageProvider.createForAddress`). Implementations that hold
+   * a single mutable identity+session per instance (e.g. the wallet-api mailbox
+   * over one `WalletApiClient`) provide this so `Sphere.switchToAddress` can give
+   * each address its OWN delivery instance — an orphaned previous-address pump
+   * then re-auths as ITS OWN owner (harmless) instead of driving a client that
+   * was re-bound to the new owner. Stateless transports may omit it (the same
+   * instance serves every address).
+   */
+  createForAddress?(): DeliveryProvider;
+
+  /**
    * Hand a finished token blob to a recipient. `recipientPubkey` is the
    * recipient's CHAIN pubkey (33-byte compressed secp256k1, hex) — the
    * canonical Unicity identity (ARCHITECTURE §4); transports that address

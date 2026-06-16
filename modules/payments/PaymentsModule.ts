@@ -3665,6 +3665,12 @@ export class PaymentsModule {
    * path) — the in-session cache is left intact and the pull retries next load.
    */
   private async hydrateHistoryFromServer(api: PaymentsWalletApiPort): Promise<void> {
+    // #583 defense-in-depth owner guard: capture the owner this hydration ran
+    // for and refuse to OVERWRITE `_historyCache` if the module's identity
+    // changed under us (a re-init mid-pull). Per-address isolation pins the
+    // client per owner so this can't normally happen; the guard ensures a stale
+    // pull never replaces the active owner's history with another owner's.
+    const owner = this.deps!.identity.chainPubkey;
     const byDedupKey = new Map<string, TransactionHistoryEntry>();
     try {
       let before: string | undefined;
@@ -3680,6 +3686,10 @@ export class PaymentsModule {
       }
     } catch (err) {
       logger.warn('Payments', 'history hydration from server failed (kept in-memory; retries next load):', err);
+      return;
+    }
+    if (this.deps!.identity.chainPubkey !== owner) {
+      logger.warn('Payments', 'history hydration owner changed mid-pull — discarding stale result (owner guard)');
       return;
     }
     this._historyCache = [...byDedupKey.values()];
@@ -4911,6 +4921,21 @@ export class PaymentsModule {
    * request surface is single-asset; module-created requests always are).
    */
   private surfaceIncomingPaymentRequest(wire: WalletApiPaymentRequest): void {
+    // #583 defense-in-depth owner guard: only surface requests actually
+    // addressed to THIS module's owner. Per-address client isolation means an
+    // orphaned previous-address PR pump runs against its OWN client (its own
+    // owner), so a wire for a different owner should never arrive here — but if
+    // any shared state ever slips through, this drops it (and keeps it out of
+    // the wrong owner's actionable view + cursor) rather than bleeding a foreign
+    // request across addresses. Mirrors the engine.isOwnedBy delivery guard.
+    if (wire.toPubkey !== this.deps!.identity.chainPubkey) {
+      logger.warn(
+        'Payments',
+        `Incoming payment request ${wire.id.slice(0, 12)}… addressed to a different owner — skipping (owner guard)`
+      );
+      return;
+    }
+
     const status = PaymentsModule.PR_WIRE_STATUS[wire.status];
 
     // §16 upsert: a request re-surfaces in the incoming ?since= delta at a higher seq when it is

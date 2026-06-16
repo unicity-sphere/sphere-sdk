@@ -93,6 +93,17 @@ export class WalletApiMailboxProvider implements DeliveryProvider {
     this.deriveKeysFn = config.deliveryKeys ?? null;
   }
 
+  /**
+   * #583: the underlying authenticated client. Sphere's per-address wiring uses
+   * the SAME client for an address's delivery provider AND its `walletApi`
+   * session (intents/history/payment-requests), so one address holds ONE
+   * identity-bound client across its whole module set — not three siblings that
+   * would each sign in separately.
+   */
+  get walletApiClient(): WalletApiClient {
+    return this.client;
+  }
+
   /** @inheritDoc — wired by PaymentsModule at init (engine-owning seam). */
   bindDeliveryKeys(derive: (blobBytes: Uint8Array) => Promise<{ tokenId: string; stateHash: string }>): void {
     this.deriveKeysFn = derive;
@@ -118,6 +129,29 @@ export class WalletApiMailboxProvider implements DeliveryProvider {
   setIdentity(identity: { privateKey: string; chainPubkey: string; nametag?: string }): void {
     this.identity = identity;
     this.client.setIdentity({ privateKey: identity.privateKey, chainPubkey: identity.chainPubkey });
+  }
+
+  /**
+   * #583 per-address client isolation: mint an INDEPENDENT delivery provider
+   * for a different HD address, backed by a FRESH {@link WalletApiClient} cloned
+   * from the same composition config (same composition-time `custody`). Each
+   * address's delivery provider then drives its OWN identity-bound client + wake
+   * socket — an orphaned previous-address delivery pump re-auths as ITS OWN
+   * owner (correct, harmless) instead of rejecting + marking-seen the NEW
+   * owner's mailbox entries through a re-bound shared client (the silent
+   * incoming-token loss / wrong-owner wake-routing class collapses). The cloned
+   * client starts identity-less; `Sphere.switchToAddress` / `PaymentsModule.
+   * initialize` bind identity + the engine's deliveryKeys before it pumps. The
+   * shared `stateStore` is fine — the seen-set / cursor keys are namespaced per
+   * (network, chainPubkey), so per-owner state stays separate.
+   */
+  createForAddress(): WalletApiMailboxProvider {
+    return new WalletApiMailboxProvider({
+      client: this.client.clone(),
+      custody: this.custody,
+      stateStore: this.stateStore,
+      ...(this.deriveKeysFn !== null ? { deliveryKeys: this.deriveKeysFn } : {}),
+    });
   }
 
   // ── persisted state (per network + identity) ────────────────────────────────
