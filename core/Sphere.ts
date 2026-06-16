@@ -2410,8 +2410,16 @@ export class Sphere {
           addressTokenProviders.set(providerId, newProvider);
         } else {
           // Fallback: reuse existing provider (legacy behavior for providers
-          // that don't support createForAddress)
+          // that don't support createForAddress). The reused SHARED provider
+          // is still bound to the PREVIOUS address — rebind it to this address
+          // before it serves inventory (#580 review). Its in-memory view AND
+          // its persisted cursor are per-identity (keyed by chainPubkey), so
+          // without this setIdentity a FIRST-VISIT switch loads the previous
+          // address's tokens / a wrong delta. Mirrors the createForAddress
+          // branch above; `payments.initialize` only rebinds delivery, never
+          // the token-storage providers, so nothing else covers this.
           logger.warn('Sphere', `Token storage provider ${providerId} does not support createForAddress, reusing shared instance`);
+          provider.setIdentity(newIdentity);
           addressTokenProviders.set(providerId, provider);
         }
       }
