@@ -4280,7 +4280,14 @@ export class Sphere {
 
     if (encryptedMnemonic) {
       const mnemonic = this.decrypt(encryptedMnemonic);
-      if (!mnemonic) {
+      // A wrong password can decrypt to non-empty GARBAGE: `decryptSimple` uses
+      // unauthenticated AES-CBC, so ~1/256 of wrong keys produce byte-valid PKCS#7
+      // padding and a non-null result instead of throwing. A wallet is only ever
+      // persisted with a VALID BIP39 phrase, so a decrypted value that fails BIP39
+      // validation deterministically means wrong-password / corruption — surface
+      // the SAME "Failed to decrypt mnemonic" instead of leaking a misleading
+      // "Invalid mnemonic phrase" from downstream identity init.
+      if (!mnemonic || !validateBip39Mnemonic(mnemonic)) {
         throw new SphereError('Failed to decrypt mnemonic', 'STORAGE_ERROR');
       }
       this._mnemonic = mnemonic;

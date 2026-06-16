@@ -218,6 +218,44 @@ describe('Wallet password encryption', () => {
       ).rejects.toThrow('Failed to decrypt mnemonic');
     });
 
+    // De-flake regression: an unauthenticated AES-CBC decrypt with the WRONG
+    // password yields, ~1/256 of the time, byte-valid PKCS#7 padding → a
+    // non-empty GARBAGE string instead of a clean failure. Previously that
+    // garbage flowed into BIP39 init and surfaced the misleading
+    // 'Invalid mnemonic phrase'. This fixture is a hand-found (ciphertext,
+    // wrong-password) pair that DETERMINISTICALLY hits that path: the wrong
+    // password decrypts to a 2-char garbage string. The wallet MUST still report
+    // the consistent 'Failed to decrypt mnemonic'. (RED before the fix:
+    // 'Invalid mnemonic phrase'.)
+    it('reports "Failed to decrypt mnemonic" even when a wrong password decrypts to garbage', async () => {
+      // ciphertext = encryptMnemonic('legal winner thank year wave sausage worth
+      //   useful legal winner thank yellow', 'correct-horse-battery-staple');
+      // decryptSimple(ciphertext, 'wrong-password-20') === <2-char garbage> (non-empty, not BIP39)
+      const GARBAGE_CIPHERTEXT =
+        'U2FsdGVkX18hJUu5YmclTG/FlK5AU7fZj+/kD6u1b1HQjqeQl+ZTIQG2W1Y7Rk9J3orcy25Tvg3zvsT90LVwT8Ya3y2cg6xpLE/ljAz+vs03rCj5eirJHBrR9pKahd5b';
+      const WRONG_PASSWORD_YIELDING_GARBAGE = 'wrong-password-20';
+
+      writeWalletJson(DATA_DIR, {
+        [STORAGE_KEYS_GLOBAL.MNEMONIC]: GARBAGE_CIPHERTEXT,
+        [STORAGE_KEYS_GLOBAL.WALLET_EXISTS]: 'true',
+        [STORAGE_KEYS_GLOBAL.WALLET_SOURCE]: 'mnemonic',
+      });
+
+      const storage = new FileStorageProvider({ dataDir: DATA_DIR });
+      const tokenStorage = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
+
+      await expect(
+        Sphere.init({
+          storage,
+          tokenStorage,
+          transport: createMockTransport(),
+          oracle: createMockOracle(),
+          network: TEST_NETWORK,
+          password: WRONG_PASSWORD_YIELDING_GARBAGE,
+        })
+      ).rejects.toThrow('Failed to decrypt mnemonic');
+    });
+
     it('should fail without password when wallet is encrypted', async () => {
       await createAndDestroy({ password: TEST_PASSWORD });
 
