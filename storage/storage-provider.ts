@@ -305,8 +305,16 @@ export interface TokenStorageProvider<TData = unknown> extends BaseProvider {
    * Used by per-address module architecture — each address gets its own
    * TokenStorageProvider instance to avoid cross-address data contamination.
    * If not implemented, the provider cannot be used in multi-address mode.
+   *
+   * `sharedClient` (#583): an optional, provider-specific per-address context —
+   * for wallet-api-backed providers it is the address's already-built
+   * `WalletApiClient`, so all of an address's wallet-api artifacts share ONE
+   * client + one refresh-token lineage (separate sibling clients of the same
+   * owner+deviceId would trip the server's rotation-reuse revocation). Typed as
+   * `unknown` to keep this generic storage contract decoupled from the
+   * wallet-api layer; providers that don't need it ignore the argument.
    */
-  createForAddress?(): TokenStorageProvider<TData>;
+  createForAddress?(sharedClient?: unknown): TokenStorageProvider<TData>;
 
   /**
    * Subscribe to storage events

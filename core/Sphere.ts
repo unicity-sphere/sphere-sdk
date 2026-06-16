@@ -2653,12 +2653,12 @@ export class Sphere {
     const out = new Map<string, TokenStorageProvider<TxfStorageDataBase>>();
     for (const [providerId, provider] of this._tokenStorageProviders.entries()) {
       if (provider.createForAddress) {
-        // wallet-api providers accept the shared per-address client (structural
-        // arg, ignored by providers that don't take one).
-        const factory = provider.createForAddress as (c?: unknown) => TokenStorageProvider<TxfStorageDataBase>;
+        // `createForAddress(sharedClient?)` accepts an optional per-address
+        // context (the storage contract types it `unknown`): wallet-api
+        // providers reuse the address's already-built client; others ignore it.
         const newProvider = provider.requiresWalletApi && perAddressClient
-          ? factory.call(provider, perAddressClient)
-          : factory.call(provider);
+          ? provider.createForAddress(perAddressClient)
+          : provider.createForAddress();
         newProvider.setIdentity(identity);
         out.set(providerId, newProvider);
       } else {

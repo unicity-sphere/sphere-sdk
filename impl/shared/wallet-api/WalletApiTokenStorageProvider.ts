@@ -151,9 +151,12 @@ export class WalletApiTokenStorageProvider implements TokenStorageProvider<TxfSt
    * is fine — keys are namespaced per (network, chainPubkey), so per-owner
    * cursors / known-spend sets stay separate.
    */
-  createForAddress(sharedClient?: WalletApiClient): WalletApiTokenStorageProvider {
+  createForAddress(sharedClient?: unknown): WalletApiTokenStorageProvider {
+    // The generic TokenStorageProvider contract types the context as `unknown`;
+    // for this provider it is the address's WalletApiClient (or absent → clone).
+    const client = sharedClient instanceof WalletApiClient ? sharedClient : this.client.clone();
     return new WalletApiTokenStorageProvider({
-      client: sharedClient ?? this.client.clone(),
+      client,
       stateStore: this.stateStore,
       verifyToken: this.verifyToken,
     });
