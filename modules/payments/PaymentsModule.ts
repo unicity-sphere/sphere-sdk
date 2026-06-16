@@ -2409,7 +2409,8 @@ export class PaymentsModule {
       const eventType = `payment_request:${status}` as const;
       if (eventType === 'payment_request:accepted' ||
           eventType === 'payment_request:rejected' ||
-          eventType === 'payment_request:paid') {
+          eventType === 'payment_request:paid' ||
+          eventType === 'payment_request:expired') {
         this.deps?.emitEvent(eventType, request);
       }
     }
@@ -4846,6 +4847,13 @@ export class PaymentsModule {
     PaymentRequestStatus
   > = { open: 'pending', paid: 'paid', declined: 'rejected', expired: 'expired' };
 
+  /** Terminal local statuses: a re-surfaced wire may advance a request INTO one, never out of it. */
+  private static readonly PR_TERMINAL: ReadonlySet<PaymentRequestStatus> = new Set([
+    'paid',
+    'rejected',
+    'expired',
+  ]);
+
   /**
    * Map a §16 wire request onto the public {@link IncomingPaymentRequest}
    * surface, deduped by id (the in-memory id-dedup doubles as the replay guard
@@ -4859,9 +4867,21 @@ export class PaymentsModule {
    * request surface is single-asset; module-created requests always are).
    */
   private surfaceIncomingPaymentRequest(wire: WalletApiPaymentRequest): void {
-    if (this.paymentRequests.some((r) => r.id === wire.id)) return;
-
     const status = PaymentsModule.PR_WIRE_STATUS[wire.status];
+
+    // §16 upsert: a request re-surfaces in the incoming ?since= delta at a higher seq when it is
+    // resolved (paid/declined) or expired — on another device OR by THIS wallet's other session.
+    // If we already hold it, advance a still-actionable request to its terminal server state and
+    // emit the resolution event (so every session drops it from the actionable view); never
+    // downgrade, and never re-notify a request we've already surfaced.
+    const existing = this.paymentRequests.find((r) => r.id === wire.id);
+    if (existing !== undefined) {
+      if (PaymentsModule.PR_TERMINAL.has(status) && !PaymentsModule.PR_TERMINAL.has(existing.status)) {
+        this.updatePaymentRequestStatus(wire.id, status);
+      }
+      return;
+    }
+
     const coinId = wire.assets[0]?.coinId ?? '';
     const coinDef = TokenRegistry.getInstance().getDefinition(coinId);
 

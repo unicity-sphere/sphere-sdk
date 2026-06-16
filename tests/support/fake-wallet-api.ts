@@ -513,6 +513,9 @@ export class FakeWalletApi {
       for (const row of state.paymentRequests.values()) {
         if (row.status !== 'open' || row.expiresAt === null || Date.parse(row.expiresAt) > now) continue;
         row.status = 'expired';
+        // §16: re-stamp seq so the expired row re-surfaces in the payer's incoming ?since= delta
+        state.prSeq += 1n;
+        row.seq = state.prSeq;
         this.wakeOwner(row.toPubkey, 'payment_requests');
         this.wakeOwner(row.fromPubkey, 'payment_requests');
         flipped++;
@@ -1911,7 +1914,14 @@ export class FakeWalletApi {
     }
     row.status = action;
     row.transferId = action === 'paid' ? (transferId as string) : null;
-    this.wakeOwner(row.fromPubkey, 'payment_requests'); // §9: nudge the requester
+    // §16: re-stamp seq (under the payer's counter) so the resolved row re-surfaces in the
+    // payer's incoming ?since= delta — mirrors wallet-api src/payments/{service,repository}.ts.
+    const payer = this.owner(row.toPubkey);
+    payer.prSeq += 1n;
+    row.seq = payer.prSeq;
+    // §9: nudge BOTH parties — the requester AND the payer's own other sessions
+    this.wakeOwner(row.fromPubkey, 'payment_requests');
+    this.wakeOwner(row.toPubkey, 'payment_requests');
     this.json(res, 200, this.paymentRequestToWire(row));
   }
 
