@@ -133,6 +133,16 @@ describe('two sessions of the same owner converge over the real wake socket (#52
     const a = await newSession('owner-pr-a', owner);
     const b = await newSession('owner-pr-b', owner);
 
+    // The requester publishes a nametag — it rides INSIDE the S6 memo envelope
+    // (ECDH-addressed to the payer), so the payer renders "@requester" in the
+    // request's "From" field instead of a raw pubkey. This MUST survive the
+    // cross-session resolution upsert — the exact staging report ("From" field
+    // regressed to the raw pubkey once the request flipped to paid in both
+    // windows). Set AFTER load so it is live at send time.
+    await requester.module.setNametag({
+      name: 'requester-tag', token: {}, timestamp: Date.now(), format: 'txf', version: '2.0',
+    });
+
     // Fund session A so it can actually pay (mint converges on B too, but the
     // PR is the property under test here).
     expect((await a.module.mintFungibleToken(HARNESS_COIN, 1000n)).success).toBe(true);
@@ -147,9 +157,13 @@ describe('two sessions of the same owner converge over the real wake socket (#52
     const requestId = created.requestId as string;
     expect(requestId).toBeDefined();
 
-    // BOTH sessions surface it as actionable `pending` from the wake alone.
-    await waitFor(() => a.module.getPaymentRequests().find((r) => r.id === requestId && r.status === 'pending'));
-    await waitFor(() => b.module.getPaymentRequests().find((r) => r.id === requestId && r.status === 'pending'));
+    // BOTH sessions surface it as actionable `pending` from the wake alone, AND
+    // decrypt the requester's nametag from the memo envelope (the "From" field).
+    const pendingOnA = await waitFor(() => a.module.getPaymentRequests().find((r) => r.id === requestId && r.status === 'pending'));
+    const pendingOnB = await waitFor(() => b.module.getPaymentRequests().find((r) => r.id === requestId && r.status === 'pending'));
+    expect(pendingOnA.senderNametag).toBe('requester-tag');
+    expect(pendingOnB.senderNametag).toBe('requester-tag');
+    expect(pendingOnB.message).toBe('multi-session invoice');
 
     // Session A pays it (send + respond('paid', transferId) — the §16 linkage).
     const payResult = await a.module.payPaymentRequest(requestId);
@@ -162,6 +176,10 @@ describe('two sessions of the same owner converge over the real wake socket (#52
       b.module.getPaymentRequests().find((r) => r.id === requestId && r.status === 'paid')
     );
     expect(resolved?.status).toBe('paid');
+    // The resolved row STILL carries the requester's nametag — the upsert mutated
+    // status in place without dropping the counterparty identity. This is the
+    // real-backend proof for the staging "From shows pubkey on resolve" report.
+    expect(resolved?.senderNametag).toBe('requester-tag');
     expect(b.module.getPaymentRequests({ status: 'pending' }).some((r) => r.id === requestId)).toBe(false);
 
     // Session B fired the resolution event so the UI can drop the action card.

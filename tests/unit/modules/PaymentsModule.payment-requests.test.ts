@@ -410,7 +410,16 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
     const windowA = makeWalletApiWallet(baseUrl, fake.network, PAYER, 'pr-xa');
     const windowB = makeWalletApiWallet(baseUrl, fake.network, PAYER, 'pr-xb'); // SAME wallet, 2nd window
 
-    const created = await requester.module.sendPaymentRequest(PAYER.chainPubkey, { amount: '5', coinId: UCT });
+    // The requester has a nametag — it rides INSIDE the S6 memo envelope, so the
+    // payer renders "@requester" in the request's "From" field rather than a raw
+    // pubkey. It must SURVIVE the cross-session upsert (the staging report: the
+    // request flipped to paid in both windows but the "From" field regressed to
+    // the raw pubkey on the resolved row).
+    await requester.module.setNametag({
+      name: 'api-1', token: {}, timestamp: Date.now(), format: 'txf', version: '2.0',
+    });
+
+    const created = await requester.module.sendPaymentRequest(PAYER.chainPubkey, { amount: '5', coinId: UCT, message: 'cross-session' });
     expect(created.success).toBe(true);
 
     // Both windows surface it as actionable (pending), each from its own since=0 bootstrap.
@@ -420,6 +429,9 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
     await windowB.module.syncPaymentRequests();
     expect(windowA.module.getPaymentRequests({ status: 'pending' })).toHaveLength(1);
     expect(windowB.module.getPaymentRequests({ status: 'pending' })).toHaveLength(1);
+    // Both windows decrypt the requester's nametag from the memo envelope while pending.
+    expect(windowA.module.getPaymentRequests({ status: 'pending' })[0].senderNametag).toBe('api-1');
+    expect(windowB.module.getPaymentRequests({ status: 'pending' })[0].senderNametag).toBe('api-1');
 
     // Window A declines it — the server respond re-stamps the payer's seq (PR-A).
     await windowA.module.rejectPaymentRequest(created.requestId!);
@@ -434,11 +446,57 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
     const onB = windowB.module.getPaymentRequests();
     expect(onB).toHaveLength(1);
     expect(onB[0].status).toBe('rejected'); // upserted, not frozen at first-seen 'pending'
+    // The status-only upsert must NOT clear the nametag/message the request was
+    // first surfaced with — the "From" field stays "@api-1" on the resolved row
+    // (the staging regression: "shows pubkey" == senderNametag lost on resolve).
+    expect(onB[0].senderNametag).toBe('api-1');
+    expect(onB[0].message).toBe('cross-session');
     expect(windowB.module.getPaymentRequests({ status: 'pending' })).toHaveLength(0);
     expect(windowB.module.getPendingPaymentRequestsCount()).toBe(0);
     expect(windowB.emitEvent.mock.calls.some((c) => c[0] === 'payment_request:rejected')).toBe(true);
     // …and it must NOT re-fire 'incoming' for an already-surfaced request.
     expect(windowB.emitEvent.mock.calls.some((c) => c[0] === 'payment_request:incoming')).toBe(false);
+
+    // The resolution event payload itself carries the nametag (the UI re-renders
+    // the action card from it), proving the upsert mutated status in place
+    // without dropping the counterparty identity.
+    const rejectedEvent = windowB.emitEvent.mock.calls.find((c) => c[0] === 'payment_request:rejected');
+    expect((rejectedEvent?.[1] as IncomingPaymentRequest | undefined)?.senderNametag).toBe('api-1');
+  });
+
+  it('a request first SEEN already-resolved (existing===undefined, status≠open) still decrypts the requester nametag/memo (#553 twin on the resolved path)', async () => {
+    const { fake, baseUrl } = await startFake();
+    const requester = makeWalletApiWallet(baseUrl, fake.network, REQUESTER, 'pr-r1');
+    const payer = makeWalletApiWallet(baseUrl, fake.network, PAYER, 'pr-r2');
+    await requester.module.setNametag({
+      name: 'api-1', token: {}, timestamp: Date.now(), format: 'txf', version: '2.0',
+    });
+
+    // The request is created AND declined before this payer session ever surfaces
+    // it — so its FIRST sight of the row is already-resolved (the cross-session
+    // case where a window opens after the other already paid/declined). This
+    // takes the `existing===undefined` branch of surfaceIncomingPaymentRequest
+    // with a terminal status, which DOES decrypt the memo envelope.
+    const created = await requester.module.sendPaymentRequest(PAYER.chainPubkey, { amount: '9', coinId: UCT, message: 'already done' });
+    expect(created.success).toBe(true);
+    await payer.module.load();
+    await payer.module.syncPaymentRequests();
+    await payer.module.rejectPaymentRequest(created.requestId!);
+    expect(fake.getPaymentRequest(created.requestId!)).toMatchObject({ status: 'declined' });
+
+    // A brand-new session of the SAME payer (a freshly-opened third window) sees
+    // the resolved row for the first time via its own since=0 bootstrap.
+    const fresh = makeWalletApiWallet(baseUrl, fake.network, PAYER, 'pr-r3');
+    await fresh.module.load();
+    await fresh.module.syncPaymentRequests();
+
+    const surfaced = fresh.module.getPaymentRequests();
+    expect(surfaced).toHaveLength(1);
+    expect(surfaced[0].status).toBe('rejected');
+    // The "From" field renders "@api-1" even though the row was first seen
+    // already-resolved — the memo envelope is decrypted on the resolved path too.
+    expect(surfaced[0].senderNametag).toBe('api-1');
+    expect(surfaced[0].message).toBe('already done');
   });
 
   it('a failed hydration is retried on the next pump (the flag is burned only on success)', async () => {
