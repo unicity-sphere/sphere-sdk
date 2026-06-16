@@ -90,6 +90,16 @@ export interface IncomingDelivery {
 export type DeliveryDisposition = 'claimed' | 'rejected';
 
 /**
+ * The §9 wake streams a backend may nudge: `mailbox` (incoming deliveries),
+ * `inventory` (owned-token set changed — e.g. a top-up or a claim on another
+ * device), and `payment_requests` (a request created/answered). A wake on any
+ * of these is a NUDGE — the consumer pulls that stream's cursor; correctness
+ * never depends on the wake arriving (the poll backstop is the source of
+ * truth).
+ */
+export type WakeStream = 'inventory' | 'mailbox' | 'payment_requests';
+
+/**
  * Custody mode (composition-time): `'inventory'` — acknowledged deliveries
  * enter the wallet-api inventory (the full wallet-api preset); `'external'` —
  * the app's own storage keeps custody and acks perform ZERO inventory writes
@@ -142,11 +152,14 @@ export interface DeliveryProvider {
   ack(deliveryId: string, disposition: DeliveryDisposition): Promise<void>;
 
   /**
-   * Optional wake hook: `callback` fires when new deliveries may be available
-   * (e.g. a WS nudge — never a correctness dependency, ARCHITECTURE §9).
+   * Optional wake hook: `callback` fires with the {@link WakeStream} that was
+   * nudged when new data may be available on it (e.g. a WS nudge — never a
+   * correctness dependency, ARCHITECTURE §9). The wallet-api wake socket
+   * multiplexes all three owner streams (`mailbox` | `inventory` |
+   * `payment_requests`); the consumer routes each to that stream's pull.
    * Returns an unsubscribe function.
    */
-  onWake?(callback: () => void): () => void;
+  onWake?(callback: (stream: WakeStream) => void): () => void;
 
   /**
    * Late-bind the backend-true (tokenId, stateHash) derivation —

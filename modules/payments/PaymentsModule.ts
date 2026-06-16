@@ -45,7 +45,7 @@ import type {
   IncomingPaymentRequest as TransportPaymentRequest,
   IncomingPaymentRequestResponse as TransportPaymentRequestResponse,
 } from '../../transport';
-import type { DeliveryProvider, IncomingDelivery } from '../../transport/delivery-provider';
+import type { DeliveryProvider, IncomingDelivery, WakeStream } from '../../transport/delivery-provider';
 import { TransportDeliveryAdapter } from './TransportDeliveryAdapter';
 import { deriveFieldEncryptionKey, encryptField, decryptField } from '../../core/field-encryption';
 import {
@@ -937,6 +937,12 @@ export class PaymentsModule {
   private injectedDelivery: DeliveryProvider | null = null;
   private deliveryWakeUnsub: (() => void) | null = null;
   private deliveryPollTimer: ReturnType<typeof setInterval> | null = null;
+  /**
+   * Low-frequency inventory poll (§9): the correctness backstop that converges
+   * the owned-token set even when an `inventory` wake is missed. Mirrors the
+   * delivery/PR pumps' interval; the wake is just a nudge that pulls sooner.
+   */
+  private inventoryPollTimer: ReturnType<typeof setInterval> | null = null;
   /** Coalesces concurrent incoming-pump runs. */
   private pumpInFlight: Promise<number> | null = null;
   /** S6 field-encryption key (intent payloads, history memos) — per identity. */
@@ -1141,16 +1147,23 @@ export class PaymentsModule {
     // token-transfer subscription is not installed. Without one, the relay
     // push subscription stays exactly as before.
     if (this.injectedDelivery) {
-      this.deliveryWakeUnsub =
-        this.injectedDelivery.onWake?.(() => {
-          void this.pumpIncomingDeliveries().catch((err) =>
-            logger.warn('Payments', 'Incoming delivery pump (wake) failed:', err)
-          );
-        }) ?? null;
+      // One wake socket multiplexes all three owner streams (§9): route each
+      // nudge to its own (debounced/coalesced) pull. The wake is best-effort —
+      // every stream below also has a poll backstop that is the correctness
+      // path. (Before this, only `mailbox` was consumed, so a second session
+      // saw no realtime inventory/payment-request convergence.)
+      this.deliveryWakeUnsub = this.injectedDelivery.onWake?.((stream) => this.handleWake(stream)) ?? null;
       // Poll is the correctness path; the wake is just a nudge (§9).
       this.deliveryPollTimer = setInterval(() => {
         void this.pumpIncomingDeliveries().catch((err) =>
           logger.warn('Payments', 'Incoming delivery pump (poll) failed:', err)
+        );
+      }, DELIVERY_POLL_INTERVAL_MS);
+      // Inventory poll backstop (§9): converges the owned-token set even if an
+      // `inventory` wake is missed, mirroring the delivery/PR pumps' interval.
+      this.inventoryPollTimer = setInterval(() => {
+        void this.resyncInventory().catch((err) =>
+          logger.warn('Payments', 'Inventory resync (poll) failed:', err)
         );
       }, DELIVERY_POLL_INTERVAL_MS);
     } else {
@@ -4508,6 +4521,78 @@ export class PaymentsModule {
       clearInterval(this.deliveryPollTimer);
       this.deliveryPollTimer = null;
     }
+    if (this.inventoryPollTimer !== null) {
+      clearInterval(this.inventoryPollTimer);
+      this.inventoryPollTimer = null;
+    }
+  }
+
+  /**
+   * Route a §9 wake nudge to the matching stream's pull. The wake is
+   * best-effort — each branch also runs on a poll backstop, so a dropped wake
+   * only delays convergence, never breaks it:
+   * - `mailbox` → drain incoming deliveries;
+   * - `inventory` → debounced inventory resync (the owned-token set changed —
+   *   e.g. a top-up or a claim on another device/session);
+   * - `payment_requests` → pump the payment-request streams.
+   */
+  private handleWake(stream: WakeStream): void {
+    switch (stream) {
+      case 'mailbox':
+        void this.pumpIncomingDeliveries().catch((err) =>
+          logger.warn('Payments', 'Incoming delivery pump (wake) failed:', err)
+        );
+        return;
+      case 'inventory':
+        this.debouncedInventorySyncFromWake();
+        return;
+      case 'payment_requests':
+        void this.pumpPaymentRequests().catch((err) =>
+          logger.warn('Payments', 'Payment-request pump (wake) failed:', err)
+        );
+        return;
+    }
+  }
+
+  /**
+   * Debounced inventory resync driven by an `inventory` wake — coalesces a
+   * burst of wakes into one pull. Runs the same {@link resyncInventory} as the
+   * poll backstop: a wake just makes it fire sooner.
+   */
+  private debouncedInventorySyncFromWake(): void {
+    if (this.syncDebounceTimer) {
+      clearTimeout(this.syncDebounceTimer);
+    }
+    this.syncDebounceTimer = setTimeout(() => {
+      this.syncDebounceTimer = null;
+      void this.resyncInventory().catch((err) =>
+        logger.debug('Payments', 'Inventory resync (wake) failed:', err)
+      );
+    }, PaymentsModule.SYNC_DEBOUNCE_MS);
+  }
+
+  /**
+   * Pull the wallet-api inventory delta and re-merge the lazy view (§5.1/§9):
+   * a fresh {@link load} re-pulls from the durable cursor and re-merges the
+   * owned-token set, then emits the existing `sync:remote-update` so the
+   * frontend's realtime view lights up (the same event the storage `onEvent`
+   * path emits — DEAD in custodial mode without this). The owned-token count
+   * delta stands in for the per-provider add/remove counts (the thin provider's
+   * `sync()` reports none). Used by BOTH the `inventory` wake and the poll
+   * backstop, so convergence never depends on a wake arriving.
+   */
+  private async resyncInventory(): Promise<void> {
+    const before = this.tokens.size;
+    await this.load();
+    const after = this.tokens.size;
+    this.deps?.emitEvent('sync:remote-update', {
+      providerId: 'wallet-api',
+      name: 'inventory',
+      sequence: 0,
+      cid: '',
+      added: Math.max(0, after - before),
+      removed: Math.max(0, before - after),
+    });
   }
 
   /**

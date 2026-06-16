@@ -36,6 +36,7 @@ import type {
   DeliveryProvider,
   DeliveryReceipt,
   IncomingDelivery,
+  WakeStream,
 } from '../../../transport/delivery-provider';
 import { composeDeliveryKeys, computeDeliveryId } from '../../../transport/delivery-provider';
 import { unwrapTokenBlobBytes } from '../../../token-engine/token-blob';
@@ -394,12 +395,17 @@ export class WalletApiMailboxProvider implements DeliveryProvider {
 
   // ── wake (optional hook — §9: a nudge, never a correctness dependency) ──────
 
-  onWake(callback: () => void): () => void {
+  // The wallet-api wake socket multiplexes all three owner streams; forward
+  // each so the consumer (PaymentsModule) can route mailbox/inventory/
+  // payment_requests to their respective pulls. (Previously only `mailbox`
+  // was surfaced — inventory and payment-request nudges were dropped, leaving
+  // a second session with no realtime path for those streams.)
+  onWake(callback: (stream: WakeStream) => void): () => void {
     let closed = false;
     let close: (() => void) | null = null;
     void this.client
       .connectWakeSocket((wake) => {
-        if (wake.stream === 'mailbox') callback();
+        callback(wake.stream);
       })
       .then((handle) => {
         if (closed) handle.close();

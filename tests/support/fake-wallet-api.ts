@@ -400,6 +400,11 @@ export class FakeWalletApi {
     return row ? { status: row.status, removal: row.removal } : null;
   }
 
+  /** Number of live wake sockets subscribed to this owner (§9 — test seam). */
+  socketCount(pubkey: string): number {
+    return this.socketsByOwner.get(pubkey)?.size ?? 0;
+  }
+
   getIntent(pubkey: string, transferId: string): { payload: string; status: string } | null {
     const intent = this.owner(pubkey).intents.get(transferId);
     return intent ? { payload: intent.payload, status: intent.status } : null;
