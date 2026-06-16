@@ -2335,6 +2335,14 @@ export class Sphere {
       throw new SphereError('Invalid Unicity ID format. Use lowercase alphanumeric, underscore, or hyphen (3-20 chars), or a valid phone number.', 'VALIDATION_ERROR');
     }
 
+    // No-op switch: already active on this index with no nametag change. Skip the
+    // logout / re-bind / re-sign-in / re-sync cycle — it would otherwise reset the
+    // wallet-api JWT, clear caches, and cause needless network traffic + inventory
+    // flicker for a call that changes nothing (Copilot review on #581).
+    if (index === this._currentAddressIndex && newNametag === undefined) {
+      return;
+    }
+
     // S4 auth lifecycle: the wallet-api session is per identity — log out
     // before switching; the new address's module init signs back in.
     if (this._walletApi && index !== this._currentAddressIndex) {
@@ -2410,8 +2418,16 @@ export class Sphere {
           addressTokenProviders.set(providerId, newProvider);
         } else {
           // Fallback: reuse existing provider (legacy behavior for providers
-          // that don't support createForAddress)
+          // that don't support createForAddress). The reused SHARED provider
+          // is still bound to the PREVIOUS address — rebind it to this address
+          // before it serves inventory (#580 review). Its in-memory view AND
+          // its persisted cursor are per-identity (keyed by chainPubkey), so
+          // without this setIdentity a FIRST-VISIT switch loads the previous
+          // address's tokens / a wrong delta. Mirrors the createForAddress
+          // branch above; `payments.initialize` only rebinds delivery, never
+          // the token-storage providers, so nothing else covers this.
           logger.warn('Sphere', `Token storage provider ${providerId} does not support createForAddress, reusing shared instance`);
+          provider.setIdentity(newIdentity);
           addressTokenProviders.set(providerId, provider);
         }
       }
@@ -2440,6 +2456,14 @@ export class Sphere {
           walletApi: this._walletApi ?? undefined,
           getCurrentNametag: () => this.getNametagForAddress(),
         });
+      } else {
+        // No nametag change → the module is NOT re-initialized, so nothing has
+        // re-bound the SHARED wallet-api/delivery client to this address. That
+        // client holds one identity+JWT; without this rebind it keeps the
+        // previously-active address's owner and inventory loads return the WRONG
+        // address's tokens (the #580 cross-address bleed). Re-establish identity
+        // + auth on the re-visit path before the pointer swap serves inventory.
+        await this.rebindWalletApiIdentity(newIdentity, moduleSet);
       }
     }
 
@@ -2490,6 +2514,35 @@ export class Sphere {
     this.postSwitchSync(index, newNametag).catch(err => {
       logger.warn('Sphere', `Post-switch sync failed for address ${index}:`, err);
     });
+  }
+
+  /**
+   * Re-bind the SHARED wallet-api/delivery client to `identity` on a re-visit
+   * address switch that did NOT re-initialize the module (#580).
+   *
+   * The wallet-api preset composes ONE `WalletApiClient`, shared by the
+   * token-storage provider, the delivery provider and the `walletApi` session;
+   * it holds a single identity+JWT. `switchToAddress` logs out before switching
+   * and only re-authenticates inside `PaymentsModule.initialize` (via
+   * `delivery.setIdentity`) — which the no-nametag-change re-visit path skips.
+   * Without this rebind the shared client keeps the previous owner, so this
+   * address's inventory `load()` returns the WRONG address's tokens. Re-bind the
+   * delivery + wallet-api ports AND this address's wallet-api-backed token
+   * storage providers, then re-establish the session (sign-in is degradable:
+   * a failed sign-in is recorded, never thrown — boot/switch stays non-blocking).
+   */
+  private async rebindWalletApiIdentity(
+    identity: FullIdentity,
+    moduleSet: AddressModuleSet,
+  ): Promise<void> {
+    if (!this._walletApi && !this._delivery) return;
+    const idSlice = { privateKey: identity.privateKey, chainPubkey: identity.chainPubkey };
+    this._delivery?.setIdentity?.(idSlice);
+    this._walletApi?.setIdentity(idSlice);
+    for (const provider of moduleSet.tokenStorageProviders.values()) {
+      if (provider.requiresWalletApi) provider.setIdentity(identity);
+    }
+    if (this._walletApi) await this.startWalletApiSession(moduleSet.payments);
   }
 
   /**
