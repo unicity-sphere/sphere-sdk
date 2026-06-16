@@ -35,7 +35,7 @@ import {
   type SphereBaseProviders,
 } from '../../../impl/shared/wallet-api';
 import { WalletApiClient } from '../../../wallet-api';
-import type { FetchLike, KeyValueStore } from '../../../wallet-api';
+import type { FetchLike, KeyValueStore, WebSocketFactoryLike } from '../../../wallet-api';
 import {
   createPaymentsModule,
   type PaymentsModule,
@@ -200,6 +200,12 @@ export interface HarnessWalletOptions {
   readonly custody: 'inventory' | 'external';
   /** Injectable fetch for the wallet-api client (the crash drill's kill hook). */
   readonly fetchFn?: FetchLike;
+  /**
+   * Injectable WebSocket factory for the wallet-api client — the multi-session
+   * drill wraps it to grab a handle on the live wake socket and force-close it
+   * (exercising the §9 reconnect supervisor's catch-up over the REAL backend).
+   */
+  readonly webSocketFactory?: WebSocketFactoryLike;
 }
 
 export interface HarnessWallet {
@@ -237,6 +243,7 @@ export async function createHarnessWallet(opts: HarnessWalletOptions): Promise<H
     deviceId: opts.deviceId,
     stateStore: storage.kv,
     ...(opts.fetchFn ? { fetchFn: opts.fetchFn } : {}),
+    ...(opts.webSocketFactory ? { webSocketFactory: opts.webSocketFactory } : {}),
     verifyToken: async (blob: TokenBlob): Promise<boolean> =>
       (await engine.verify(await engine.decodeToken(blob))).ok,
   };
