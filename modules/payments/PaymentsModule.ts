@@ -833,6 +833,8 @@ export interface PaymentsModuleDependencies {
    * ones.
    */
   walletApi?: PaymentsWalletApiPort;
+  /** Current address's canonical display nametag (bare, no '@'), from the Sphere-level Nostr-backed store. Preferred over the local minted-token nametags[] for outgoing memos. */
+  getCurrentNametag?: () => string | undefined;
 }
 
 /** The provider {@link PaymentsModule.getActiveTokenStorageProvider} will pick:

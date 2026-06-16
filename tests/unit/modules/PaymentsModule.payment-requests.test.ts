@@ -141,12 +141,19 @@ async function startFake(): Promise<{ fake: FakeWalletApi; baseUrl: string }> {
   return { fake, baseUrl };
 }
 
-/** A wallet over the FULL wallet-api preset (the S4 composition). */
+/** A wallet over the FULL wallet-api preset (the S4 composition).
+ *
+ * `getCurrentNametag` mirrors the Sphere wiring of the canonical (Nostr-backed)
+ * display nametag store — the one the real app reliably loads on every startup.
+ * When supplied, outgoing memos read it WITHOUT the local minted-token
+ * `setNametag()` path ever being populated (the real-app state the #553 fix
+ * regressed on). */
 function makeWalletApiWallet(
   baseUrl: string,
   network: string,
   who: { privateKey: string; chainPubkey: string },
-  deviceId: string
+  deviceId: string,
+  getCurrentNametag?: () => string | undefined
 ): Wallet {
   const identity = fullIdentity(who);
   const kv = new MemoryKeyValueStore();
@@ -168,6 +175,7 @@ function makeWalletApiWallet(
     tokenEngine: engine,
     delivery,
     walletApi: client,
+    ...(getCurrentNametag !== undefined ? { getCurrentNametag } : {}),
   };
   const module = createPaymentsModule({ l1: null });
   module.initialize(deps);
@@ -297,6 +305,53 @@ describe('payment requests ride wallet-api (S4 AC: create → notify → respond
       code: 'CONFLICT',
       status: 409,
     });
+  });
+
+  it('real-app scenario: the requester nametag rides the memo from the CANONICAL store even when the minted-token nametags[] is empty (6bd3058 regression)', async () => {
+    // The #553 fix read the requester nametag from `this.nametags` — populated
+    // ONLY by the best-effort, oracle-gated minted-token path. In the real app
+    // that array is EMPTY at send time; the nametag the UI shows lives in the
+    // Sphere-level Nostr-backed store (getNametagForAddress). So the memo
+    // dropped the nametag and the payer rendered the raw pubkey. Here the
+    // requester has the canonical nametag (`getCurrentNametag`) but NEVER calls
+    // setNametag() — exactly that real-app state. Cross-check: the existing
+    // setNametag('api-1') test above still passes via the nametags[] fallback.
+    const { fake, baseUrl } = await startFake();
+    const requester = makeWalletApiWallet(baseUrl, fake.network, REQUESTER, 'pr-canon-1', () => 'api-1');
+    const payer = makeWalletApiWallet(baseUrl, fake.network, PAYER, 'pr-canon-2');
+
+    // No setNametag() — the minted-token store stays empty (the regression's
+    // precondition). The memo must still carry the canonical nametag.
+    expect(requester.module.hasNametag()).toBe(false);
+
+    const result = await requester.module.sendPaymentRequest('@bob', {
+      amount: '25',
+      coinId: UCT,
+      message: 'hi',
+    });
+    expect(result.success).toBe(true);
+
+    // At the crypto boundary: the requester-addressed envelope carries BOTH the
+    // canonical nametag AND the message (pre-fix the plaintext was `{"t":"hi"}`
+    // — no `senderNametag` field at all).
+    const row = fake.getPaymentRequest(result.requestId!);
+    expect(
+      decryptDeliveryBundle(
+        deriveDeliveryEncryptionKey(REQUESTER.privateKey, PAYER.chainPubkey),
+        row!.memo!
+      )
+    ).toEqual({ senderNametag: 'api-1', memo: 'hi' });
+
+    // …and through the payer surface: the "From" field renders "@api-1", not the
+    // raw pubkey.
+    const surfaced: IncomingPaymentRequest[] = [];
+    payer.module.onPaymentRequest((request) => surfaced.push(request));
+    await payer.module.load();
+    await payer.module.syncPaymentRequests();
+
+    expect(surfaced).toHaveLength(1);
+    expect(surfaced[0].senderNametag).toBe('api-1');
+    expect(surfaced[0].message).toBe('hi');
   });
 
   it("paying a request links the fulfilling send's transferId via respond(action:'paid')", async () => {
