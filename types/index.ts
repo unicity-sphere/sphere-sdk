@@ -515,7 +515,7 @@ export interface SphereEventMap {
    * auto-retried, so it does not sit undelivered invisibly. `attempts` counts
    * failed replay PASSES (one per `load()`), NOT underlying delivery calls — each
    * pass internally retries with backoff, so the real number of delivery attempts
-   * is higher. Surfacing trips once `attempts` crosses the bounded budget.
+   * is higher. Surfacing trips once `attempts` reaches the bounded budget.
    */
   'delivery:undeliverable': { transferId: string; recipientPubkey: string; attempts: number; error: string };
   /**

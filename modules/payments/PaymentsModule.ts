@@ -142,8 +142,8 @@ const DELIVERY_POLL_INTERVAL_MS = 30_000;
  * Bounded replay budget for journaled finished-but-undelivered v2 blobs (#517
  * item 1). Each load()'s replay pass makes at most {@link DELIVERY_REPLAY_RETRIES}
  * + 1 attempts per entry with exponential backoff; the cumulative failed-attempt
- * count is journaled across loads. Once it crosses
- * {@link MAX_DELIVERY_REPLAY_ATTEMPTS} the entry is surfaced as poison
+ * count is journaled across loads. Once it reaches
+ * {@link MAX_DELIVERY_REPLAY_ATTEMPTS} (inclusive) the entry is surfaced as poison
  * (`delivery:undeliverable`) and left journaled but no longer auto-retried —
  * the deposit is idempotent, so a later app version may still land it.
  */
@@ -167,7 +167,7 @@ interface PendingV2Delivery {
   createdAt: number;
   /**
    * Cumulative failed replay attempts across load()s. Surfaced as poison and
-   * marked `undeliverable` once it crosses {@link MAX_DELIVERY_REPLAY_ATTEMPTS}
+   * marked `undeliverable` once it reaches {@link MAX_DELIVERY_REPLAY_ATTEMPTS}
    * so journaled blobs never sit undelivered invisibly (#517).
    */
   attempts?: number;
