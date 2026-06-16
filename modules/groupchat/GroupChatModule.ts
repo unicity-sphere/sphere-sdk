@@ -94,7 +94,11 @@ export class GroupChatModule {
   // In-memory state
   private groups: Map<string, GroupData> = new Map();
   private messages: Map<string, GroupMessageData[]> = new Map(); // groupId -> messages
-  private members: Map<string, GroupMemberData[]> = new Map();   // groupId -> members
+  // groupId -> (pubkey -> member). Inner Map keyed by pubkey so membership
+  // lookups/upserts are O(1); at global-channel scale (tens of thousands of
+  // members) an array-backed store made saveMemberToMemory/updateMemberNametag
+  // O(n) per call, which compounded into multi-second main-thread stalls.
+  private members: Map<string, Map<string, GroupMemberData>> = new Map();
   private processedEventIds: Set<string> = new Set();
   private pendingLeaves: Set<string> = new Set();
 
@@ -184,10 +188,12 @@ export class GroupChatModule {
         const parsed: GroupMemberData[] = JSON.parse(membersJson);
         for (const m of parsed) {
           const groupId = m.groupId;
-          if (!this.members.has(groupId)) {
-            this.members.set(groupId, []);
+          let byPubkey = this.members.get(groupId);
+          if (!byPubkey) {
+            byPubkey = new Map();
+            this.members.set(groupId, byPubkey);
           }
-          this.members.get(groupId)!.push(m);
+          byPubkey.set(m.pubkey, m);
         }
       } catch {
         // Corrupted data, start fresh
@@ -395,12 +401,18 @@ export class GroupChatModule {
     //  - Moderation events must not be missed (e.g., kicks that occurred while offline)
     const sinceTimestamp = this.getLatestKnownTimestamp(groupIds);
 
-    // Subscribe to group messages
+    // Subscribe to group messages.
+    // `limit` bounds the stored-event backlog the relay replays on (re)connect:
+    // without it, a busy global group dumps its ENTIRE history in one burst
+    // (observed: 1000 events), and each one runs synchronously through
+    // handleGroupEvent + two emitEvent fan-outs, freezing the UI. Older history
+    // is loaded on demand via fetchMessages()/getMessagesPage().
     this.trackSubscription(
       createNip29Filter({
         kinds: [NIP29_KINDS.CHAT_MESSAGE, NIP29_KINDS.THREAD_ROOT, NIP29_KINDS.THREAD_REPLY],
         '#h': groupIds,
         ...(sinceTimestamp ? { since: sinceTimestamp } : {}),
+        limit: this.config.defaultMessageLimit,
       }),
       { onEvent: (event: Event) => this.handleGroupEvent(event) },
     );
@@ -429,11 +441,14 @@ export class GroupChatModule {
 
     const sinceTimestamp = this.getLatestKnownTimestamp([groupId]);
 
+    // See subscribeToJoinedGroups(): `limit` bounds the replayed backlog so a
+    // busy group can't freeze the UI by dumping its full history on connect.
     this.trackSubscription(
       createNip29Filter({
         kinds: [NIP29_KINDS.CHAT_MESSAGE, NIP29_KINDS.THREAD_ROOT, NIP29_KINDS.THREAD_REPLY],
         '#h': [groupId],
         ...(sinceTimestamp ? { since: sinceTimestamp } : {}),
+        limit: this.config.defaultMessageLimit,
       }),
       { onEvent: (event: Event) => this.handleGroupEvent(event) },
     );
@@ -605,11 +620,11 @@ export class GroupChatModule {
 
   private updateAdminsFromEvent(groupId: string, event: Event): void {
     const pTags = event.tags.filter((t: string[]) => t[0] === 'p');
-    const existingMembers = this.members.get(groupId) || [];
+    const existingMembers = this.members.get(groupId);
 
     for (const tag of pTags) {
       const pubkey = tag[1];
-      const existing = existingMembers.find((m) => m.pubkey === pubkey);
+      const existing = existingMembers?.get(pubkey);
 
       if (existing) {
         existing.role = GroupRoleEnum.ADMIN;
@@ -1122,13 +1137,13 @@ export class GroupChatModule {
   }
 
   getMembers(groupId: string): GroupMemberData[] {
-    return (this.members.get(groupId) || [])
-      .sort((a, b) => a.joinedAt - b.joinedAt);
+    const byPubkey = this.members.get(groupId);
+    if (!byPubkey) return [];
+    return Array.from(byPubkey.values()).sort((a, b) => a.joinedAt - b.joinedAt);
   }
 
   getMember(groupId: string, pubkey: string): GroupMemberData | null {
-    const members = this.members.get(groupId) || [];
-    return members.find((m) => m.pubkey === pubkey) || null;
+    return this.members.get(groupId)?.get(pubkey) ?? null;
   }
 
   getTotalUnreadCount(): number {
@@ -1369,26 +1384,27 @@ export class GroupChatModule {
       this.fetchGroupAdminsInternal(groupId),
     ]);
 
+    // Build the group's pubkey->member map in O(n), seeded with whatever is
+    // already in memory so existing entries aren't dropped, then assign once.
+    const adminSet = new Set(adminPubkeys);
+    const byPubkey = new Map<string, GroupMemberData>(this.members.get(groupId));
     for (const member of members) {
-      if (adminPubkeys.includes(member.pubkey)) {
-        member.role = GroupRoleEnum.ADMIN;
-      }
-      this.saveMemberToMemory(member);
+      if (adminSet.has(member.pubkey)) member.role = GroupRoleEnum.ADMIN;
+      // The relay GROUP_MEMBERS event carries no nametag; preserve one already
+      // learned (from messages or storage) so the merge + next persist doesn't
+      // erase it.
+      const existing = byPubkey.get(member.pubkey);
+      if (existing?.nametag && !member.nametag) member.nametag = existing.nametag;
+      byPubkey.set(member.pubkey, member);
     }
-
-    // Save admins not in member list
+    // Admins not present in the member list.
     for (const pubkey of adminPubkeys) {
-      const existing = (this.members.get(groupId) || []).find((m) => m.pubkey === pubkey);
-      if (!existing) {
-        this.saveMemberToMemory({
-          pubkey,
-          groupId,
-          role: GroupRoleEnum.ADMIN,
-          joinedAt: Date.now(),
-        });
+      if (!byPubkey.has(pubkey)) {
+        byPubkey.set(pubkey, { pubkey, groupId, role: GroupRoleEnum.ADMIN, joinedAt: Date.now() });
       }
     }
 
+    this.members.set(groupId, byPubkey);
     this.schedulePersist();
   }
 
@@ -1468,28 +1484,20 @@ export class GroupChatModule {
 
   private saveMemberToMemory(member: GroupMemberData): void {
     const groupId = member.groupId;
-    if (!this.members.has(groupId)) {
-      this.members.set(groupId, []);
+    let byPubkey = this.members.get(groupId);
+    if (!byPubkey) {
+      byPubkey = new Map();
+      this.members.set(groupId, byPubkey);
     }
-    const mems = this.members.get(groupId)!;
-    const idx = mems.findIndex((m) => m.pubkey === member.pubkey);
-    if (idx >= 0) {
-      mems[idx] = member;
-    } else {
-      mems.push(member);
-    }
+    byPubkey.set(member.pubkey, member);
   }
 
   private removeMemberFromMemory(groupId: string, pubkey: string): void {
-    const mems = this.members.get(groupId);
-    if (mems) {
-      const idx = mems.findIndex((m) => m.pubkey === pubkey);
-      if (idx >= 0) mems.splice(idx, 1);
-    }
+    this.members.get(groupId)?.delete(pubkey);
     // Update member count
     const group = this.groups.get(groupId);
     if (group) {
-      group.memberCount = (this.members.get(groupId) || []).length;
+      group.memberCount = this.members.get(groupId)?.size ?? 0;
       this.groups.set(groupId, group);
     }
   }
@@ -1515,8 +1523,7 @@ export class GroupChatModule {
     nametag: string,
     joinedAt: number,
   ): void {
-    const members = this.members.get(groupId) || [];
-    const existing = members.find((m) => m.pubkey === pubkey);
+    const existing = this.members.get(groupId)?.get(pubkey);
 
     if (existing) {
       if (existing.nametag !== nametag) {
@@ -1603,8 +1610,11 @@ export class GroupChatModule {
   private async persistMembers(): Promise<void> {
     if (!this.deps) return;
     const allMembers: GroupMemberData[] = [];
-    for (const mems of this.members.values()) {
-      allMembers.push(...mems);
+    for (const byPubkey of this.members.values()) {
+      // Iterate rather than push(...spread): a 70k-member group would spread
+      // tens of thousands of args into one call and can throw a RangeError
+      // (V8 max-arguments limit).
+      for (const member of byPubkey.values()) allMembers.push(member);
     }
     await this.deps.storage.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MEMBERS, JSON.stringify(allMembers));
   }
