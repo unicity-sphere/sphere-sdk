@@ -512,8 +512,10 @@ export interface SphereEventMap {
    * A journaled finished-but-undelivered v2 transfer blob (#517) has exhausted
    * its bounded replay budget and is now POISON: it stays journaled (the deposit
    * is idempotent, so a later app version may still land it) but is no longer
-   * auto-retried, so it does not sit undelivered invisibly. `attempts` is the
-   * cumulative failed-replay count that tripped the surfacing.
+   * auto-retried, so it does not sit undelivered invisibly. `attempts` counts
+   * failed replay PASSES (one per `load()`), NOT underlying delivery calls — each
+   * pass internally retries with backoff, so the real number of delivery attempts
+   * is higher. Surfacing trips once `attempts` crosses the bounded budget.
    */
   'delivery:undeliverable': { transferId: string; recipientPubkey: string; attempts: number; error: string };
   /**
