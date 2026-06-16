@@ -2704,7 +2704,7 @@ export class PaymentsModule {
     // port's incoming feed (mailbox pull) — Nostr is not used for assets.
     if (this.injectedDelivery) {
       const tokensBefore = new Set(this.tokens.keys());
-      await this.pumpIncomingDeliveries();
+      await this.pumpIncomingDeliveriesFresh();
       const received: IncomingTransfer[] = [];
       for (const [tokenId, token] of this.tokens) {
         if (tokensBefore.has(tokenId)) continue;
@@ -4622,6 +4622,24 @@ export class PaymentsModule {
       this.pumpInFlight = null;
     });
     return this.pumpInFlight;
+  }
+
+  /**
+   * receive() must observe deliveries present as of NOW — it must never coalesce
+   * onto a background pump (§9 wake/poll) that began before a just-arrived
+   * delivery, which would return without loading it. Await any in-flight pump,
+   * then start a fresh pull (a background pump's failure must not fail receive()).
+   */
+  private async pumpIncomingDeliveriesFresh(): Promise<number> {
+    const inFlight = this.pumpInFlight;
+    if (inFlight) {
+      try {
+        await inFlight;
+      } catch {
+        // re-pull regardless: a stale background pump's failure is not receive()'s
+      }
+    }
+    return this.pumpIncomingDeliveries();
   }
 
   private async doPumpIncomingDeliveries(): Promise<number> {
