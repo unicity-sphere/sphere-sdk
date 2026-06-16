@@ -20,6 +20,7 @@
  * second window had no realtime path for those streams.
  */
 
+import WebSocket from 'ws';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { createPaymentsModule, type PaymentsModule, type PaymentsModuleDependencies } from '../../../modules/payments/PaymentsModule';
 import type { FullIdentity, IncomingPaymentRequest } from '../../../types';
@@ -29,7 +30,7 @@ import type { StorageProvider } from '../../../storage';
 import { FakeTokenEngine, decodeFakeTokenAssets, decodeFakeTokenId } from '../token-engine/FakeTokenEngine';
 import { FakeWalletApi } from '../../support/fake-wallet-api';
 import { MemoryKeyValueStore, testIdentity } from '../../support/wallet-api-test-helpers';
-import { WalletApiClient } from '../../../wallet-api';
+import { WalletApiClient, type WebSocketLike } from '../../../wallet-api';
 import { WalletApiMailboxProvider, WalletApiTokenStorageProvider } from '../../../impl/shared/wallet-api';
 import { encodeTokenBlob } from '../../../token-engine/token-blob';
 import { hexToBytes } from '../../../core/crypto';
@@ -117,7 +118,15 @@ function makeWallet(
 ): Wallet {
   const identity = fullIdentity(who);
   const kv = new MemoryKeyValueStore();
-  const client = new WalletApiClient({ baseUrl, network, deviceId, storage: kv });
+  // Node < 22 has no global WebSocket — inject `ws` so the wake socket connects on every
+  // CI node version (the wake path is the whole point of this suite). Mirrors client.ws.test.ts.
+  const client = new WalletApiClient({
+    baseUrl,
+    network,
+    deviceId,
+    storage: kv,
+    webSocketFactory: (url) => new WebSocket(url) as unknown as WebSocketLike,
+  });
   const tokenStorage = new WalletApiTokenStorageProvider({ client, stateStore: kv });
   tokenStorage.setIdentity(identity);
   const delivery = new WalletApiMailboxProvider({ client, custody: 'inventory', stateStore: kv });
