@@ -158,7 +158,6 @@ describe('GroupChatModule — member ingestion scaling', () => {
     const durationMs = performance.now() - t0;
     eld.disable();
 
-    // eslint-disable-next-line no-console
     console.log(`[nametag-update] updates=${MEMBER_COUNT} ms=${Math.round(durationMs)} eldMaxMs=${(eld.max / 1e6).toFixed(0)}`);
 
     // Correctness: updates mutate in place, no duplicate members created.
@@ -171,5 +170,37 @@ describe('GroupChatModule — member ingestion scaling', () => {
       durationMs,
       `${MEMBER_COUNT} nametag updates took ${Math.round(durationMs)}ms — per-message membership lookup is O(n)`,
     ).toBeLessThan(MAX_INGEST_MS);
+  });
+
+  // The relay GROUP_MEMBERS event carries no nametag. fetchAndSaveMembers()
+  // merges the fetched list over what's already in memory, so it must not clobber
+  // a nametag already learned (from messages/storage) — otherwise the next
+  // persist erases it from disk.
+  it('preserves a learned nametag when re-fetching members from the relay', async () => {
+    const pubkey = 'a'.repeat(64);
+
+    const identity: FullIdentity = {
+      privateKey: '01'.padStart(64, '0'),
+      chainPubkey: '02' + 'a'.repeat(64),
+      l1Address: 'alpha1testdummy',
+    };
+
+    const mod = new GroupChatModule();
+    mod.initialize({ identity, storage: createMockStorage(), emitEvent: vi.fn() });
+    (mod as unknown as { client: unknown }).client = makeMockClient(
+      makeMembersEvent([pubkey]), // relay event has NO nametag for this member
+      makeAdminsEvent([]),
+    );
+
+    // Learn a nametag first (as a message would via handleGroupEvent).
+    (mod as unknown as {
+      updateMemberNametag(g: string, pk: string, n: string, j: number): void;
+    }).updateMemberNametag(GROUP_ID, pubkey, 'alice', 1000);
+    expect(mod.getMember(GROUP_ID, pubkey)?.nametag).toBe('alice');
+
+    // Re-fetch members from the relay — must not drop the learned nametag.
+    await (mod as unknown as { fetchAndSaveMembers(id: string): Promise<void> }).fetchAndSaveMembers(GROUP_ID);
+
+    expect(mod.getMember(GROUP_ID, pubkey)?.nametag).toBe('alice');
   });
 });

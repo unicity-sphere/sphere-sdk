@@ -1390,6 +1390,11 @@ export class GroupChatModule {
     const byPubkey = new Map<string, GroupMemberData>(this.members.get(groupId));
     for (const member of members) {
       if (adminSet.has(member.pubkey)) member.role = GroupRoleEnum.ADMIN;
+      // The relay GROUP_MEMBERS event carries no nametag; preserve one already
+      // learned (from messages or storage) so the merge + next persist doesn't
+      // erase it.
+      const existing = byPubkey.get(member.pubkey);
+      if (existing?.nametag && !member.nametag) member.nametag = existing.nametag;
       byPubkey.set(member.pubkey, member);
     }
     // Admins not present in the member list.
@@ -1606,7 +1611,10 @@ export class GroupChatModule {
     if (!this.deps) return;
     const allMembers: GroupMemberData[] = [];
     for (const byPubkey of this.members.values()) {
-      allMembers.push(...byPubkey.values());
+      // Iterate rather than push(...spread): a 70k-member group would spread
+      // tens of thousands of args into one call and can throw a RangeError
+      // (V8 max-arguments limit).
+      for (const member of byPubkey.values()) allMembers.push(member);
     }
     await this.deps.storage.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MEMBERS, JSON.stringify(allMembers));
   }
