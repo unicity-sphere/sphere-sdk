@@ -522,6 +522,37 @@ describe('journaled-delivery replay: bounded backoff + poison surfacing (#517 it
     /* eslint-enable @typescript-eslint/no-explicit-any */
   });
 
+  it('two overlapping replay passes deliver each journaled entry ONCE — the in-flight guard serializes them', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-concurrent-1');
+    await sender.module.load();
+
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    // One journaled finished blob; delivery resolves so a pass delivers + clears it.
+    const deliverSpy = vi
+      .spyOn(sender.delivery, 'deliver')
+      .mockResolvedValue({ deliveryId: 'concurrent-d1' } as any);
+    await (sender.module as any).savePendingV2Delivery({
+      transferId: 'concurrent-tx',
+      recipientPubkey: RECIPIENT.chainPubkey,
+      tokenBlob: 'bb'.repeat(40),
+      createdAt: Date.now(),
+    });
+
+    // Kick TWO passes WITHOUT awaiting between them — mirrors load()'s fire-and-
+    // forget replay racing a receive()→load(). The guard (set synchronously before
+    // the first await) must drop the second pass.
+    const p1 = (sender.module as any).replayPendingV2Deliveries();
+    const p2 = (sender.module as any).replayPendingV2Deliveries();
+    await Promise.all([p1, p2]);
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+
+    // Delivered exactly once. RED without the guard: 2 — both passes read the same
+    // journal snapshot and re-deliver (and race the per-entry attempts RMW).
+    expect(deliverSpy.mock.calls).toHaveLength(1);
+    expect(JSON.parse(sender.storage.map.get('pending_v2_deliveries') ?? '[]')).toHaveLength(0);
+  });
+
   it('a blob that recovers within the budget is delivered and the journal is cleared — no poison event', async () => {
     const { fake, baseUrl } = await startFake();
     const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-poison-2');

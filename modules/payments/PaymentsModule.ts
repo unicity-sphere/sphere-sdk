@@ -1030,6 +1030,14 @@ export class PaymentsModule {
    * waiting real time — never mutated in production.
    */
   private replayBackoffBaseMs = DELIVERY_REPLAY_BASE_DELAY_MS;
+  /**
+   * #517: serializes {@link replayPendingV2Deliveries}. `load()` kicks replay
+   * off fire-and-forget and `receive()` calls `load()`, so two passes can
+   * overlap — duplicating delivery attempts and clobbering each other's
+   * `attempts` increments (both read the same stale value, both write N+1,
+   * delaying poison surfacing). Only one pass runs per module instance at a time.
+   */
+  private replayInFlight = false;
 
   constructor(config?: PaymentsModuleConfig) {
     this.moduleConfig = {
@@ -5419,11 +5427,21 @@ export class PaymentsModule {
    * so a journaled blob never sits undelivered invisibly.
    */
   private async replayPendingV2Deliveries(): Promise<void> {
-    const entries = (await this.loadPendingV2Deliveries()).filter((e) => !e.undeliverable);
-    if (entries.length === 0) return;
-    logger.warn('Payments', `${entries.length} undelivered v2 transfer(s) journaled from a previous session — replaying`);
-    for (const e of entries) {
-      await this.replayOneDelivery(e);
+    // #517: drop an overlapping pass — a replay started while one is in flight
+    // would read the same journal snapshot, re-deliver the same entries, and
+    // race the per-entry `attempts` read/modify/write. Dropped entries stay
+    // journaled and replay on the next load(), so nothing is lost.
+    if (this.replayInFlight) return;
+    this.replayInFlight = true;
+    try {
+      const entries = (await this.loadPendingV2Deliveries()).filter((e) => !e.undeliverable);
+      if (entries.length === 0) return;
+      logger.warn('Payments', `${entries.length} undelivered v2 transfer(s) journaled from a previous session — replaying`);
+      for (const e of entries) {
+        await this.replayOneDelivery(e);
+      }
+    } finally {
+      this.replayInFlight = false;
     }
   }
 
