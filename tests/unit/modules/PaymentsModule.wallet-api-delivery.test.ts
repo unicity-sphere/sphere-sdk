@@ -553,6 +553,29 @@ describe('journaled-delivery replay: bounded backoff + poison surfacing (#517 it
     expect(JSON.parse(sender.storage.map.get('pending_v2_deliveries') ?? '[]')).toHaveLength(0);
   });
 
+  it('concurrent journal mutations do NOT clobber each other — the journal lock serializes RMW', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-journal-lock-1');
+    await sender.module.load();
+
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    const m = sender.module as any;
+    // Two journal writes kicked WITHOUT awaiting between them — mirrors a send()
+    // journaling a finished blob while a fire-and-forget replay mutates the journal.
+    // Without the lock both read the same snapshot, mutate, and the last write wins.
+    await Promise.all([
+      m.savePendingV2Delivery({ transferId: 'tx-A', recipientPubkey: RECIPIENT.chainPubkey, tokenBlob: 'aa'.repeat(40), createdAt: Date.now() }),
+      m.savePendingV2Delivery({ transferId: 'tx-B', recipientPubkey: RECIPIENT.chainPubkey, tokenBlob: 'bb'.repeat(40), createdAt: Date.now() }),
+    ]);
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+
+    // BOTH entries survive. RED without the lock: 1 — the second save reads the
+    // pre-first snapshot and clobbers the first entry (the crash-safety blob is lost).
+    const journal = JSON.parse(sender.storage.map.get('pending_v2_deliveries') ?? '[]');
+    expect(journal).toHaveLength(2);
+    expect(journal.map((e: { transferId: string }) => e.transferId).sort()).toEqual(['tx-A', 'tx-B']);
+  });
+
   it('a blob that recovers within the budget is delivered and the journal is cleared — no poison event', async () => {
     const { fake, baseUrl } = await startFake();
     const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-poison-2');

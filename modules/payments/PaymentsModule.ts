@@ -1038,6 +1038,14 @@ export class PaymentsModule {
    * delaying poison surfacing). Only one pass runs per module instance at a time.
    */
   private replayInFlight = false;
+  /**
+   * #517: serializes every read-modify-write of the PENDING_V2_DELIVERIES journal.
+   * save/remove/update each load → mutate → store the WHOLE blob, so a replay
+   * (fire-and-forget from load()) overlapping a send()'s journal write could
+   * clobber a newly-saved undelivered entry and lose it — defeating the crash-
+   * safety guarantee. A promise-chain mutex makes each whole RMW atomic.
+   */
+  private journalMutation: Promise<unknown> = Promise.resolve();
 
   constructor(config?: PaymentsModuleConfig) {
     this.moduleConfig = {
@@ -5396,20 +5404,31 @@ export class PaymentsModule {
     return data ? (JSON.parse(data) as PendingV2Delivery[]) : [];
   }
 
+  /** #517: run a journal read-modify-write atomically against all other journal mutations. */
+  private withJournalLock<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.journalMutation.then(fn, fn);
+    this.journalMutation = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
   private async savePendingV2Delivery(entry: PendingV2Delivery): Promise<void> {
-    const all = await this.loadPendingV2Deliveries();
-    if (!all.some((e) => e.tokenBlob === entry.tokenBlob)) {
-      all.push(entry);
-      await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V2_DELIVERIES, JSON.stringify(all));
-    }
+    await this.withJournalLock(async () => {
+      const all = await this.loadPendingV2Deliveries();
+      if (!all.some((e) => e.tokenBlob === entry.tokenBlob)) {
+        all.push(entry);
+        await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V2_DELIVERIES, JSON.stringify(all));
+      }
+    });
   }
 
   private async removePendingV2Delivery(tokenBlob: string): Promise<void> {
-    const all = await this.loadPendingV2Deliveries();
-    const filtered = all.filter((e) => e.tokenBlob !== tokenBlob);
-    if (filtered.length !== all.length) {
-      await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V2_DELIVERIES, JSON.stringify(filtered));
-    }
+    await this.withJournalLock(async () => {
+      const all = await this.loadPendingV2Deliveries();
+      const filtered = all.filter((e) => e.tokenBlob !== tokenBlob);
+      if (filtered.length !== all.length) {
+        await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V2_DELIVERIES, JSON.stringify(filtered));
+      }
+    });
   }
 
   /**
@@ -5505,11 +5524,13 @@ export class PaymentsModule {
 
   /** Mutate one journaled entry in place (keyed by tokenBlob) and persist. No-op if gone. */
   private async updatePendingV2Delivery(tokenBlob: string, mutate: (e: PendingV2Delivery) => void): Promise<void> {
-    const all = await this.loadPendingV2Deliveries();
-    const target = all.find((e) => e.tokenBlob === tokenBlob);
-    if (!target) return;
-    mutate(target);
-    await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V2_DELIVERIES, JSON.stringify(all));
+    await this.withJournalLock(async () => {
+      const all = await this.loadPendingV2Deliveries();
+      const target = all.find((e) => e.tokenBlob === tokenBlob);
+      if (!target) return;
+      mutate(target);
+      await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V2_DELIVERIES, JSON.stringify(all));
+    });
   }
 
   private async createStorageData(): Promise<TxfStorageDataBase> {
