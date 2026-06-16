@@ -119,4 +119,57 @@ describe('GroupChatModule — member ingestion scaling', () => {
       `member ingestion took ${Math.round(durationMs)}ms — O(n^2) dedup is freezing the main thread`,
     ).toBeLessThan(MAX_INGEST_MS);
   });
+
+  // Follow-up to the ingestion fix (#587): the member store must also keep
+  // per-message membership mutations O(1). updateMemberNametag() fires on every
+  // nametag-bearing message via handleGroupEvent(); with the old array-backed
+  // store its per-call findIndex made steady traffic in a 70k-member group an
+  // accumulating O(n)-per-message main-thread cost. The Map-backed store makes
+  // each update O(1).
+  it('applies per-message nametag updates on a huge group without O(n)-per-call cost', async () => {
+    const pubkeys = Array.from({ length: MEMBER_COUNT }, (_, i) => i.toString(16).padStart(64, '0'));
+
+    const identity: FullIdentity = {
+      privateKey: '01'.padStart(64, '0'),
+      chainPubkey: '02' + 'a'.repeat(64),
+      l1Address: 'alpha1testdummy',
+    };
+
+    const mod = new GroupChatModule();
+    mod.initialize({ identity, storage: createMockStorage(), emitEvent: vi.fn() });
+    (mod as unknown as { client: unknown }).client = makeMockClient(
+      makeMembersEvent(pubkeys),
+      makeAdminsEvent([]),
+    );
+    // Seed the store with the full member list first (proven O(n) above).
+    await (mod as unknown as { fetchAndSaveMembers(id: string): Promise<void> }).fetchAndSaveMembers(GROUP_ID);
+
+    const update = (mod as unknown as {
+      updateMemberNametag(g: string, pk: string, n: string, j: number): void;
+    }).updateMemberNametag.bind(mod);
+
+    const eld = monitorEventLoopDelay({ resolution: 1 });
+    eld.enable();
+    const t0 = performance.now();
+    // One nametag update per existing member — simulates a full pass of traffic.
+    for (let i = 0; i < MEMBER_COUNT; i++) {
+      update(GROUP_ID, pubkeys[i], `name-${i}`, 1000 + i);
+    }
+    const durationMs = performance.now() - t0;
+    eld.disable();
+
+    // eslint-disable-next-line no-console
+    console.log(`[nametag-update] updates=${MEMBER_COUNT} ms=${Math.round(durationMs)} eldMaxMs=${(eld.max / 1e6).toFixed(0)}`);
+
+    // Correctness: updates mutate in place, no duplicate members created.
+    expect(mod.getMembers(GROUP_ID).length).toBe(MEMBER_COUNT);
+    expect(mod.getMember(GROUP_ID, pubkeys[0])?.nametag).toBe('name-0');
+    expect(mod.getMember(GROUP_ID, pubkeys[MEMBER_COUNT - 1])?.nametag).toBe(`name-${MEMBER_COUNT - 1}`);
+
+    // O(1)-per-update gate: the old array findIndex made this O(n^2) overall.
+    expect(
+      durationMs,
+      `${MEMBER_COUNT} nametag updates took ${Math.round(durationMs)}ms — per-message membership lookup is O(n)`,
+    ).toBeLessThan(MAX_INGEST_MS);
+  });
 });

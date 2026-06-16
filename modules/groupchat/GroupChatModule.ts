@@ -94,7 +94,11 @@ export class GroupChatModule {
   // In-memory state
   private groups: Map<string, GroupData> = new Map();
   private messages: Map<string, GroupMessageData[]> = new Map(); // groupId -> messages
-  private members: Map<string, GroupMemberData[]> = new Map();   // groupId -> members
+  // groupId -> (pubkey -> member). Inner Map keyed by pubkey so membership
+  // lookups/upserts are O(1); at global-channel scale (tens of thousands of
+  // members) an array-backed store made saveMemberToMemory/updateMemberNametag
+  // O(n) per call, which compounded into multi-second main-thread stalls.
+  private members: Map<string, Map<string, GroupMemberData>> = new Map();
   private processedEventIds: Set<string> = new Set();
   private pendingLeaves: Set<string> = new Set();
 
@@ -184,10 +188,12 @@ export class GroupChatModule {
         const parsed: GroupMemberData[] = JSON.parse(membersJson);
         for (const m of parsed) {
           const groupId = m.groupId;
-          if (!this.members.has(groupId)) {
-            this.members.set(groupId, []);
+          let byPubkey = this.members.get(groupId);
+          if (!byPubkey) {
+            byPubkey = new Map();
+            this.members.set(groupId, byPubkey);
           }
-          this.members.get(groupId)!.push(m);
+          byPubkey.set(m.pubkey, m);
         }
       } catch {
         // Corrupted data, start fresh
@@ -614,11 +620,11 @@ export class GroupChatModule {
 
   private updateAdminsFromEvent(groupId: string, event: Event): void {
     const pTags = event.tags.filter((t: string[]) => t[0] === 'p');
-    const existingMembers = this.members.get(groupId) || [];
+    const existingMembers = this.members.get(groupId);
 
     for (const tag of pTags) {
       const pubkey = tag[1];
-      const existing = existingMembers.find((m) => m.pubkey === pubkey);
+      const existing = existingMembers?.get(pubkey);
 
       if (existing) {
         existing.role = GroupRoleEnum.ADMIN;
@@ -1131,13 +1137,13 @@ export class GroupChatModule {
   }
 
   getMembers(groupId: string): GroupMemberData[] {
-    return (this.members.get(groupId) || [])
-      .sort((a, b) => a.joinedAt - b.joinedAt);
+    const byPubkey = this.members.get(groupId);
+    if (!byPubkey) return [];
+    return Array.from(byPubkey.values()).sort((a, b) => a.joinedAt - b.joinedAt);
   }
 
   getMember(groupId: string, pubkey: string): GroupMemberData | null {
-    const members = this.members.get(groupId) || [];
-    return members.find((m) => m.pubkey === pubkey) || null;
+    return this.members.get(groupId)?.get(pubkey) ?? null;
   }
 
   getTotalUnreadCount(): number {
@@ -1378,17 +1384,10 @@ export class GroupChatModule {
       this.fetchGroupAdminsInternal(groupId),
     ]);
 
-    // De-dupe by pubkey in O(n) via a Map, then assign the array once.
-    // saveMemberToMemory() does a linear findIndex per insert, so calling it in
-    // a loop over a member list is O(n^2): for a global group with tens of
-    // thousands of members that is a multi-second synchronous main-thread freeze
-    // (so severe the page can't even open DevTools). Merge with whatever is
-    // already in memory so existing entries aren't dropped.
+    // Build the group's pubkey->member map in O(n), seeded with whatever is
+    // already in memory so existing entries aren't dropped, then assign once.
     const adminSet = new Set(adminPubkeys);
-    const byPubkey = new Map<string, GroupMemberData>();
-    for (const existing of this.members.get(groupId) ?? []) {
-      byPubkey.set(existing.pubkey, existing);
-    }
+    const byPubkey = new Map<string, GroupMemberData>(this.members.get(groupId));
     for (const member of members) {
       if (adminSet.has(member.pubkey)) member.role = GroupRoleEnum.ADMIN;
       byPubkey.set(member.pubkey, member);
@@ -1400,7 +1399,7 @@ export class GroupChatModule {
       }
     }
 
-    this.members.set(groupId, Array.from(byPubkey.values()));
+    this.members.set(groupId, byPubkey);
     this.schedulePersist();
   }
 
@@ -1480,28 +1479,20 @@ export class GroupChatModule {
 
   private saveMemberToMemory(member: GroupMemberData): void {
     const groupId = member.groupId;
-    if (!this.members.has(groupId)) {
-      this.members.set(groupId, []);
+    let byPubkey = this.members.get(groupId);
+    if (!byPubkey) {
+      byPubkey = new Map();
+      this.members.set(groupId, byPubkey);
     }
-    const mems = this.members.get(groupId)!;
-    const idx = mems.findIndex((m) => m.pubkey === member.pubkey);
-    if (idx >= 0) {
-      mems[idx] = member;
-    } else {
-      mems.push(member);
-    }
+    byPubkey.set(member.pubkey, member);
   }
 
   private removeMemberFromMemory(groupId: string, pubkey: string): void {
-    const mems = this.members.get(groupId);
-    if (mems) {
-      const idx = mems.findIndex((m) => m.pubkey === pubkey);
-      if (idx >= 0) mems.splice(idx, 1);
-    }
+    this.members.get(groupId)?.delete(pubkey);
     // Update member count
     const group = this.groups.get(groupId);
     if (group) {
-      group.memberCount = (this.members.get(groupId) || []).length;
+      group.memberCount = this.members.get(groupId)?.size ?? 0;
       this.groups.set(groupId, group);
     }
   }
@@ -1527,8 +1518,7 @@ export class GroupChatModule {
     nametag: string,
     joinedAt: number,
   ): void {
-    const members = this.members.get(groupId) || [];
-    const existing = members.find((m) => m.pubkey === pubkey);
+    const existing = this.members.get(groupId)?.get(pubkey);
 
     if (existing) {
       if (existing.nametag !== nametag) {
@@ -1615,8 +1605,8 @@ export class GroupChatModule {
   private async persistMembers(): Promise<void> {
     if (!this.deps) return;
     const allMembers: GroupMemberData[] = [];
-    for (const mems of this.members.values()) {
-      allMembers.push(...mems);
+    for (const byPubkey of this.members.values()) {
+      allMembers.push(...byPubkey.values());
     }
     await this.deps.storage.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MEMBERS, JSON.stringify(allMembers));
   }
