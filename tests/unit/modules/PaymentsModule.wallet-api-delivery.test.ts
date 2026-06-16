@@ -24,6 +24,7 @@ import type { TransportProvider } from '../../../transport';
 import type { OracleProvider } from '../../../oracle';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase, HistoryRecord } from '../../../storage';
 import { FakeTokenEngine, decodeFakeTokenAssets, decodeFakeTokenId } from '../token-engine/FakeTokenEngine';
+import { TransferConflictError } from '../../../token-engine';
 import { FakeWalletApi } from '../../support/fake-wallet-api';
 import { MemoryKeyValueStore, testIdentity } from '../../support/wallet-api-test-helpers';
 import { WalletApiClient } from '../../../wallet-api';
@@ -469,6 +470,95 @@ describe('interrupted deposit — journal replay on next load (S3 AC)', () => {
   });
 });
 
+describe('journaled-delivery replay: bounded backoff + poison surfacing (#517 item 1)', () => {
+  it('a persistently-undeliverable blob is SURFACED as poison after the bounded budget, then no longer auto-retried', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-poison-1');
+    await sender.module.load();
+
+    // Drive the backoff loop without waiting real time.
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    (sender.module as any).replayBackoffBaseMs = 0;
+
+    // A journaled finished blob whose delivery ALWAYS fails (a wrong/rotated
+    // recipient key, a permanently-rejecting rail — the "poison" class).
+    const deliverSpy = vi.spyOn(sender.delivery, 'deliver').mockRejectedValue(new Error('rail rejects: bad recipient'));
+    await (sender.module as any).savePendingV2Delivery({
+      transferId: 'poison-tx',
+      recipientPubkey: RECIPIENT.chainPubkey,
+      tokenBlob: 'aa'.repeat(40),
+      createdAt: Date.now(),
+    });
+
+    // Each replay pass bumps the cumulative attempt count by 1; the entry stays
+    // journaled (un-poisoned) and NOT surfaced until the budget is crossed.
+    const budget = 6; // MAX_DELIVERY_REPLAY_ATTEMPTS
+    for (let i = 0; i < budget - 1; i++) {
+      await (sender.module as any).replayPendingV2Deliveries();
+      const journal = JSON.parse(sender.storage.map.get('pending_v2_deliveries')!);
+      expect(journal).toHaveLength(1);
+      expect(journal[0].undeliverable).toBeUndefined();
+      expect(journal[0].attempts).toBe(i + 1);
+    }
+    expect(sender.emitEvent.mock.calls.filter((c) => c[0] === 'delivery:undeliverable')).toHaveLength(0);
+
+    // The pass that crosses the budget surfaces it as poison — ONE event,
+    // entry kept journaled but flagged so it does not sit undelivered invisibly.
+    await (sender.module as any).replayPendingV2Deliveries();
+    const poisonCalls = sender.emitEvent.mock.calls.filter((c) => c[0] === 'delivery:undeliverable');
+    expect(poisonCalls).toHaveLength(1);
+    expect(poisonCalls[0][1]).toMatchObject({ transferId: 'poison-tx', recipientPubkey: RECIPIENT.chainPubkey, attempts: budget });
+    expect(poisonCalls[0][1].error).toContain('rail rejects');
+    const poisoned = JSON.parse(sender.storage.map.get('pending_v2_deliveries')!);
+    expect(poisoned).toHaveLength(1);
+    expect(poisoned[0]).toMatchObject({ undeliverable: true, attempts: budget });
+
+    // Poison is terminal for auto-replay: a further pass touches the rail no more
+    // and emits no duplicate surfacing.
+    const deliverCallsBefore = deliverSpy.mock.calls.length;
+    await (sender.module as any).replayPendingV2Deliveries();
+    expect(deliverSpy.mock.calls.length).toBe(deliverCallsBefore);
+    expect(sender.emitEvent.mock.calls.filter((c) => c[0] === 'delivery:undeliverable')).toHaveLength(1);
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+  });
+
+  it('a blob that recovers within the budget is delivered and the journal is cleared — no poison event', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-poison-2');
+    await seedServerToken(fake, sender, SENDER, 1000n);
+    await sender.module.load();
+
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    (sender.module as any).replayBackoffBaseMs = 0;
+
+    // Capture a REAL deliverable blob by sending once, then re-journal it and
+    // make delivery fail twice (transient outage) before recovering.
+    let captured: Uint8Array | null = null;
+    const realDeliver = sender.delivery.deliver.bind(sender.delivery);
+    let failures = 2;
+    vi.spyOn(sender.delivery, 'deliver').mockImplementation((a, b, c) => {
+      captured = b;
+      return failures-- > 0 ? Promise.reject(new Error('mailbox flapping')) : realDeliver(a, b, c);
+    });
+    const result = await sender.module.send({ recipient: '@bob', amount: '1000', coinId: UCT })
+      .catch(() => null);
+    // The send itself failed mid-deliver, journaling the finished blob.
+    expect(captured).not.toBeNull();
+    const journalAfterSend = JSON.parse(sender.storage.map.get('pending_v2_deliveries') ?? '[]');
+    expect(journalAfterSend).toHaveLength(1);
+    void result;
+
+    // failures is now 1 → the next replay pass retries within-pass (backoff) and
+    // recovers; the blob lands and the journal clears with NO poison event.
+    await (sender.module as any).replayPendingV2Deliveries();
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+
+    expect(JSON.parse(sender.storage.map.get('pending_v2_deliveries') ?? '[]')).toHaveLength(0);
+    expect(fake.listMailboxEntries(RECIPIENT.chainPubkey)).toHaveLength(1);
+    expect(sender.emitEvent.mock.calls.filter((c) => c[0] === 'delivery:undeliverable')).toHaveLength(0);
+  });
+});
+
 describe('own-storage + wallet-api delivery (S7 AC: delivery-only composition)', () => {
   it('sender: deposits without EVER calling apply; the send closes via intents/complete alone', async () => {
     const { fake, baseUrl } = await startFake();
@@ -550,6 +640,47 @@ describe('E.3 resume — open intents re-run deterministically at sign-in', () =
     expect(fake.getIntent(SENDER.chainPubkey, transferId)).toMatchObject({ status: 'completed' });
     const sent = fake.getHistoryRecords(SENDER.chainPubkey).find((r) => r.dedupKey === `SENT_transfer_${transferId}`);
     expect(sent).toBeDefined();
+  });
+});
+
+describe('stale-inventory conflict is SURFACED, not silent (#517 item 2)', () => {
+  it('a send that loses the race on a stale source emits inventory:conflict (E.2 TransferConflictError)', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-conf-1');
+    await seedServerToken(fake, sender, SENDER, 1000n);
+    await sender.module.load();
+
+    // Coin-selection planned from the lazy view, but another device already
+    // spent the source: the engine's match-verify raises TransferConflictError
+    // (Part E.2 — the predictable stale-view race the incident flagged).
+    vi.spyOn(sender.engine, 'transfer').mockRejectedValue(
+      new TransferConflictError('TRANSACTION_HASH_MISMATCH: source already spent')
+    );
+
+    await expect(sender.module.send({ recipient: '@bob', amount: '1000', coinId: UCT }))
+      .rejects.toBeInstanceOf(TransferConflictError);
+
+    // The recoverable condition is now OBSERVABLE — a distinct event, not just a
+    // generic transfer:failed buried in a string.
+    const conflictCalls = sender.emitEvent.mock.calls.filter((c) => c[0] === 'inventory:conflict');
+    expect(conflictCalls).toHaveLength(1);
+    expect(conflictCalls[0][1]).toMatchObject({ coinId: UCT });
+    expect(typeof conflictCalls[0][1].transferId).toBe('string');
+    expect(conflictCalls[0][1].error).toContain('TRANSACTION_HASH_MISMATCH');
+  });
+
+  it('a plain (non-conflict) send failure does NOT emit inventory:conflict', async () => {
+    const { fake, baseUrl } = await startFake();
+    const sender = makeFullPresetWallet(baseUrl, fake.network, SENDER, 'd-conf-2');
+    await seedServerToken(fake, sender, SENDER, 1000n);
+    await sender.module.load();
+
+    vi.spyOn(sender.engine, 'transfer').mockRejectedValue(new Error('engine boom'));
+
+    await expect(sender.module.send({ recipient: '@bob', amount: '1000', coinId: UCT }))
+      .rejects.toThrow('engine boom');
+
+    expect(sender.emitEvent.mock.calls.filter((c) => c[0] === 'inventory:conflict')).toHaveLength(0);
   });
 });
 

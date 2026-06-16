@@ -705,7 +705,7 @@ describe('getAssets()', () => {
     expect(assets[0]?.totalAmount).toBe('1000000000000000000');
   });
 
-  it('should include confirmed, unconfirmed, and transferring tokens but exclude spent/invalid', async () => {
+  it('counts confirmed + unconfirmed as balance; transferring (in-flight) is tracked separately, NOT spendable', async () => {
     const module = createModuleWithTokens([
       { id: 't1', coinId: '0xaaa', symbol: 'UCT', name: 'Unicity', decimals: 18, amount: '1000', status: 'confirmed' },
       { id: 't2', coinId: '0xaaa', symbol: 'UCT', name: 'Unicity', decimals: 18, amount: '2000', status: 'pending' },
@@ -716,13 +716,18 @@ describe('getAssets()', () => {
 
     const assets = await module.getAssets();
     expect(assets.length).toBe(1);
-    expect(assets[0]?.totalAmount).toBe('6000'); // 1000 confirmed + 2000 pending + 3000 transferring
-    expect(assets[0]?.tokenCount).toBe(3); // t1 + t2 + t3
-    expect(assets[0]?.confirmedAmount).toBe('1000');
-    expect(assets[0]?.unconfirmedAmount).toBe('5000'); // 2000 pending + 3000 transferring
+    // totalAmount is the wallet's holdings — confirmed (1000) + unconfirmed (2000).
+    // The 3000 in-flight token is LEAVING the wallet, so it must NOT inflate the
+    // balance the user sees as theirs.
+    expect(assets[0]?.totalAmount).toBe('3000'); // 1000 confirmed + 2000 pending; NOT the 3000 transferring
+    expect(assets[0]?.tokenCount).toBe(2); // t1 + t2 (transferring not counted in tokenCount)
+    expect(assets[0]?.confirmedAmount).toBe('1000'); // spendable
+    expect(assets[0]?.unconfirmedAmount).toBe('2000'); // pending only — NOT the transferring token
     expect(assets[0]?.confirmedTokenCount).toBe(1);
-    expect(assets[0]?.unconfirmedTokenCount).toBe(2); // pending + transferring
+    expect(assets[0]?.unconfirmedTokenCount).toBe(1); // pending only
+    // The in-flight token is surfaced on its own field for the "Sending" UI badge.
     expect(assets[0]?.transferringTokenCount).toBe(1);
+    expect(assets[0]?.transferringAmount).toBe('3000');
   });
 
   it('should filter by coinId when provided', async () => {

@@ -97,8 +97,16 @@ export interface Asset {
   readonly confirmedTokenCount: number;
   /** Number of unconfirmed tokens aggregated */
   readonly unconfirmedTokenCount: number;
-  /** Number of tokens currently being sent */
+  /** Number of tokens currently being sent (in-flight, NOT spendable) */
   readonly transferringTokenCount: number;
+  /**
+   * Sum of in-flight (`'transferring'`) token amounts (smallest units). These
+   * tokens are LEAVING the wallet during an active send, so they are excluded
+   * from {@link totalAmount}, {@link confirmedAmount}, and
+   * {@link unconfirmedAmount} — surfaced here so a UI can still show a "Sending"
+   * badge without inflating the spendable balance.
+   */
+  readonly transferringAmount: string;
   /** Price per whole unit in USD (null if PriceProvider not configured) */
   readonly priceUsd: number | null;
   /** Price per whole unit in EUR (null if PriceProvider not configured) */
@@ -399,6 +407,8 @@ export type SphereEventType =
   | 'sync:provider'
   | 'sync:error'
   | 'storage:degraded'
+  | 'inventory:conflict'
+  | 'delivery:undeliverable'
   | 'walletapi:session'
   | 'realtime:status'
   | 'connection:changed'
@@ -489,6 +499,23 @@ export interface SphereEventMap {
    * emitting this.
    */
   'storage:degraded': { providerId: string; error: string };
+  /**
+   * A send lost a race on a source token (#517): coin-selection planned from a
+   * lazy-inventory view that was stale (missing another device's spend), so the
+   * engine raised `TransferConflictError` (Part E.2 — `TRANSACTION_HASH_MISMATCH`).
+   * The send fails cleanly and the conflicted source is reconciled to 'spent';
+   * this surfaces the otherwise-silent recoverable condition so a UI can prompt
+   * "refresh and retry". `transferId` is the aborted send's id.
+   */
+  'inventory:conflict': { transferId: string; coinId: string; error: string };
+  /**
+   * A journaled finished-but-undelivered v2 transfer blob (#517) has exhausted
+   * its bounded replay budget and is now POISON: it stays journaled (the deposit
+   * is idempotent, so a later app version may still land it) but is no longer
+   * auto-retried, so it does not sit undelivered invisibly. `attempts` is the
+   * cumulative failed-replay count that tripped the surfacing.
+   */
+  'delivery:undeliverable': { transferId: string; recipientPubkey: string; attempts: number; error: string };
   /**
    * wallet-api session state change (#515 F3): 'offline' = sign-in failed and
    * the wallet runs degraded (no intents barrier, no server custody writes);

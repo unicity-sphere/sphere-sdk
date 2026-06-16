@@ -76,6 +76,7 @@ import { TokenRegistry } from '../../registry';
 import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
 import { sha256, bytesToHex, hexToBytes } from '../../core/crypto';
+import { sleep } from '../../core/utils';
 import { decodeTokenBlob, encodeTokenBlob, unwrapTokenBlobBytes, TOKEN_BLOB_VERSION } from '../../token-engine/token-blob';
 import { parseInvoiceMemoForOnChain } from '../accounting/memo.js';
 
@@ -138,6 +139,20 @@ const SEND_ENGINE_OP_TIMEOUT_MS = 60_000;
 const DELIVERY_POLL_INTERVAL_MS = 30_000;
 
 /**
+ * Bounded replay budget for journaled finished-but-undelivered v2 blobs (#517
+ * item 1). Each load()'s replay pass makes at most {@link DELIVERY_REPLAY_RETRIES}
+ * + 1 attempts per entry with exponential backoff; the cumulative failed-attempt
+ * count is journaled across loads. Once it crosses
+ * {@link MAX_DELIVERY_REPLAY_ATTEMPTS} the entry is surfaced as poison
+ * (`delivery:undeliverable`) and left journaled but no longer auto-retried —
+ * the deposit is idempotent, so a later app version may still land it.
+ */
+const DELIVERY_REPLAY_RETRIES = 2;
+const MAX_DELIVERY_REPLAY_ATTEMPTS = 6;
+const DELIVERY_REPLAY_BASE_DELAY_MS = 1_000;
+const DELIVERY_REPLAY_MAX_DELAY_MS = 8_000;
+
+/**
  * A FINISHED v2 token blob awaiting transport delivery. Journaled the moment
  * the transfer/split output is certified on-chain (the source is already
  * spent) and removed after successful delivery, so a transport failure or a
@@ -150,6 +165,29 @@ interface PendingV2Delivery {
   tokenBlob: string;
   memo?: string;
   createdAt: number;
+  /**
+   * Cumulative failed replay attempts across load()s. Surfaced as poison and
+   * marked `undeliverable` once it crosses {@link MAX_DELIVERY_REPLAY_ATTEMPTS}
+   * so journaled blobs never sit undelivered invisibly (#517).
+   */
+  attempts?: number;
+  /** Set once the entry is surfaced as poison; it stays journaled but is no longer auto-retried. */
+  undeliverable?: boolean;
+}
+
+/** Running per-coin totals folded by {@link PaymentsModule.aggregateTokens}. */
+interface AssetAccumulator {
+  coinId: string;
+  symbol: string;
+  name: string;
+  decimals: number;
+  iconUrl?: string;
+  confirmedAmount: bigint;
+  unconfirmedAmount: bigint;
+  transferringAmount: bigint;
+  confirmedTokenCount: number;
+  unconfirmedTokenCount: number;
+  transferringTokenCount: number;
 }
 
 // =============================================================================
@@ -986,6 +1024,12 @@ export class PaymentsModule {
   private spendQueue: SpendQueue;
   /** Cache of parsed SdkToken data for synchronous queue re-evaluation */
   private readonly parsedTokenCache: Map<string, ParsedTokenEntry> = new Map();
+  /**
+   * Base delay (ms) for the journaled-delivery replay backoff (#517 item 1).
+   * A field, not a const, so tests can drive the bounded retry loop without
+   * waiting real time — never mutated in production.
+   */
+  private replayBackoffBaseMs = DELIVERY_REPLAY_BASE_DELAY_MS;
 
   constructor(config?: PaymentsModuleConfig) {
     this.moduleConfig = {
@@ -1848,6 +1892,19 @@ export class PaymentsModule {
       result.error = error instanceof TransferConflictError
         ? `Send conflicted: a source token was already spent by a concurrent transfer — re-plan and retry (${error.message})`
         : error instanceof Error ? error.message : String(error);
+
+      // #517 item 2: a TransferConflictError here is the predictable stale-view
+      // race — coin-selection planned from a lazy-inventory view that missed
+      // another device's spend. It is handled (abort + reconcile below) but was
+      // otherwise SILENT; surface it as a distinct, recoverable signal so a UI
+      // can prompt "refresh and retry" instead of just showing a generic failure.
+      if (error instanceof TransferConflictError) {
+        this.deps!.emitEvent('inventory:conflict', {
+          transferId: result.id,
+          coinId: request.coinId,
+          error: error.message,
+        });
+      }
 
       // Intent disposition on failure (E.2/E.3):
       //  - a TransferConflictError aborts (the prescribed recovery — the
@@ -2813,8 +2870,11 @@ export class PaymentsModule {
    * Get token balances grouped by coin type.
    *
    * Returns an array of {@link Asset} objects, one per coin type held.
-   * Each entry includes confirmed and unconfirmed breakdowns. Tokens with
-   * status `'spent'`, `'invalid'`, or `'transferring'` are excluded.
+   * Each entry includes confirmed and unconfirmed breakdowns. `'spent'` and
+   * `'invalid'` tokens are excluded entirely. In-flight (`'transferring'`)
+   * tokens are NOT counted toward the spendable balance (`totalAmount`,
+   * `confirmedAmount`, `unconfirmedAmount`) — they are reported only in the
+   * `transferring*` fields (#517 item 3).
    *
    * This is synchronous — no price data is included. Use {@link getAssets}
    * for the async version with fiat pricing.
@@ -2828,7 +2888,10 @@ export class PaymentsModule {
 
   /**
    * Get aggregated assets (tokens grouped by coinId) with price data.
-   * Includes both confirmed and unconfirmed tokens with breakdown.
+   * Confirmed + unconfirmed tokens make up the spendable balance; in-flight
+   * (`'transferring'`) tokens are reported only in the `transferring*` fields
+   * and excluded from `totalAmount` (#517 item 3). Fiat value derives from
+   * `totalAmount`, so it likewise excludes in-flight value.
    */
   async getAssets(coinId?: string): Promise<Asset[]> {
     const rawAssets = this.aggregateTokens(coinId);
@@ -2890,82 +2953,79 @@ export class PaymentsModule {
   }
 
   /**
-   * Aggregate tokens by coinId with confirmed/unconfirmed breakdown.
+   * Aggregate tokens by coinId with confirmed/unconfirmed/transferring breakdown.
    * Excludes tokens with status 'spent' or 'invalid'.
-   * Tokens with status 'transferring' are counted as unconfirmed (visible in UI as "Sending").
+   *
+   * In-flight (`'transferring'`) tokens are LEAVING the wallet during an active
+   * send, so they are NOT counted as spendable: they are tracked in their own
+   * `transferring*` fields and excluded from `totalAmount`/`unconfirmedAmount`.
+   * Counting them as balance would show the user value they cannot spend (the
+   * #517 incident follow-up).
    */
   private aggregateTokens(coinId?: string): Asset[] {
-    const assetsMap = new Map<string, {
-      coinId: string;
-      symbol: string;
-      name: string;
-      decimals: number;
-      iconUrl?: string;
-      confirmedAmount: bigint;
-      unconfirmedAmount: bigint;
-      confirmedTokenCount: number;
-      unconfirmedTokenCount: number;
-      transferringTokenCount: number;
-    }>();
+    const assetsMap = new Map<string, AssetAccumulator>();
 
     for (const token of this.tokens.values()) {
-      // Skip spent and invalid tokens; transferring tokens remain visible
+      // Skip spent and invalid tokens; transferring tokens are tracked separately.
       if (token.status === 'spent' || token.status === 'invalid') continue;
       if (coinId && token.coinId !== coinId) continue;
-
-      const key = token.coinId;
-      const amount = BigInt(token.amount);
-      const isConfirmed = token.status === 'confirmed';
-      const isTransferring = token.status === 'transferring';
-      const existing = assetsMap.get(key);
-
-      if (existing) {
-        if (isConfirmed) {
-          existing.confirmedAmount += amount;
-          existing.confirmedTokenCount++;
-        } else {
-          existing.unconfirmedAmount += amount;
-          existing.unconfirmedTokenCount++;
-        }
-        if (isTransferring) existing.transferringTokenCount++;
-      } else {
-        assetsMap.set(key, {
-          coinId: token.coinId,
-          symbol: token.symbol,
-          name: token.name,
-          decimals: token.decimals,
-          iconUrl: token.iconUrl,
-          confirmedAmount: isConfirmed ? amount : 0n,
-          unconfirmedAmount: isConfirmed ? 0n : amount,
-          confirmedTokenCount: isConfirmed ? 1 : 0,
-          unconfirmedTokenCount: isConfirmed ? 0 : 1,
-          transferringTokenCount: isTransferring ? 1 : 0,
-        });
-      }
+      this.accumulateToken(assetsMap, token);
     }
 
-    return Array.from(assetsMap.values()).map((raw) => {
-      const totalAmount = (raw.confirmedAmount + raw.unconfirmedAmount).toString();
-      return {
-        coinId: raw.coinId,
-        symbol: raw.symbol,
-        name: raw.name,
-        decimals: raw.decimals,
-        iconUrl: raw.iconUrl,
-        totalAmount,
-        tokenCount: raw.confirmedTokenCount + raw.unconfirmedTokenCount,
-        confirmedAmount: raw.confirmedAmount.toString(),
-        unconfirmedAmount: raw.unconfirmedAmount.toString(),
-        confirmedTokenCount: raw.confirmedTokenCount,
-        unconfirmedTokenCount: raw.unconfirmedTokenCount,
-        transferringTokenCount: raw.transferringTokenCount,
-        priceUsd: null,
-        priceEur: null,
-        change24h: null,
-        fiatValueUsd: null,
-        fiatValueEur: null,
-      };
-    });
+    return Array.from(assetsMap.values()).map((raw) => ({
+      coinId: raw.coinId,
+      symbol: raw.symbol,
+      name: raw.name,
+      decimals: raw.decimals,
+      iconUrl: raw.iconUrl,
+      // Spendable + soon-spendable holdings ONLY — the in-flight token is omitted.
+      totalAmount: (raw.confirmedAmount + raw.unconfirmedAmount).toString(),
+      tokenCount: raw.confirmedTokenCount + raw.unconfirmedTokenCount,
+      confirmedAmount: raw.confirmedAmount.toString(),
+      unconfirmedAmount: raw.unconfirmedAmount.toString(),
+      confirmedTokenCount: raw.confirmedTokenCount,
+      unconfirmedTokenCount: raw.unconfirmedTokenCount,
+      transferringTokenCount: raw.transferringTokenCount,
+      transferringAmount: raw.transferringAmount.toString(),
+      priceUsd: null,
+      priceEur: null,
+      change24h: null,
+      fiatValueUsd: null,
+      fiatValueEur: null,
+    }));
+  }
+
+  /** Fold one token into its coin's running totals (see {@link aggregateTokens}). */
+  private accumulateToken(assetsMap: Map<string, AssetAccumulator>, token: Token): void {
+    const acc = assetsMap.get(token.coinId) ?? this.newAssetAccumulator(token);
+    assetsMap.set(token.coinId, acc);
+    const amount = BigInt(token.amount);
+    if (token.status === 'transferring') {
+      acc.transferringAmount += amount;
+      acc.transferringTokenCount++;
+    } else if (token.status === 'confirmed') {
+      acc.confirmedAmount += amount;
+      acc.confirmedTokenCount++;
+    } else {
+      acc.unconfirmedAmount += amount;
+      acc.unconfirmedTokenCount++;
+    }
+  }
+
+  private newAssetAccumulator(token: Token): AssetAccumulator {
+    return {
+      coinId: token.coinId,
+      symbol: token.symbol,
+      name: token.name,
+      decimals: token.decimals,
+      iconUrl: token.iconUrl,
+      confirmedAmount: 0n,
+      unconfirmedAmount: 0n,
+      transferringAmount: 0n,
+      confirmedTokenCount: 0,
+      unconfirmedTokenCount: 0,
+      transferringTokenCount: 0,
+    };
   }
 
   /**
@@ -5345,31 +5405,93 @@ export class PaymentsModule {
   }
 
   /**
-   * Replay journaled finished-but-undelivered v2 blobs (kicked fire-and-forget
-   * from load()) through the delivery port (sdk-changes S3). Idempotent end to
-   * end: the mailbox deposit is idempotent by the content-derived entry_id —
-   * it succeeds even after the recipient claimed (§6) — and the relay path's
-   * recipient dedups by the genesis-stable token id. Entries that still fail
-   * to send are kept for the next load.
+   * Replay journaled finished-but-undelivered v2 blobs (kicked from load())
+   * through the delivery port (sdk-changes S3). Idempotent end to end: the
+   * mailbox deposit is idempotent by the content-derived entry_id — it succeeds
+   * even after the recipient claimed (§6) — and the relay path's recipient
+   * dedups by the genesis-stable token id.
+   *
+   * #517 item 1: instead of a silent unbounded fire-and-forget, each entry is
+   * retried with bounded exponential backoff, its cumulative failed-attempt
+   * count is journaled across loads, and an entry that exhausts
+   * {@link MAX_DELIVERY_REPLAY_ATTEMPTS} is SURFACED as poison
+   * (`delivery:undeliverable`) and left journaled but no longer auto-retried —
+   * so a journaled blob never sits undelivered invisibly.
    */
   private async replayPendingV2Deliveries(): Promise<void> {
-    const entries = await this.loadPendingV2Deliveries();
+    const entries = (await this.loadPendingV2Deliveries()).filter((e) => !e.undeliverable);
     if (entries.length === 0) return;
     logger.warn('Payments', `${entries.length} undelivered v2 transfer(s) journaled from a previous session — replaying`);
     for (const e of entries) {
+      await this.replayOneDelivery(e);
+    }
+  }
+
+  /** Replay a single journaled entry: backoff retries → success/removal, or → bounded poison. */
+  private async replayOneDelivery(entry: PendingV2Delivery): Promise<void> {
+    const tag = entry.transferId.slice(0, 8);
+    try {
+      await this.attemptDeliveryWithBackoff(entry);
+      await this.removePendingV2Delivery(entry.tokenBlob);
+      logger.debug('Payments', `Replayed undelivered v2 transfer ${tag}...`);
+    } catch (err) {
+      const attempts = (entry.attempts ?? 0) + 1;
+      const message = err instanceof Error ? err.message : String(err);
+      if (attempts >= MAX_DELIVERY_REPLAY_ATTEMPTS) {
+        await this.markDeliveryPoison(entry, attempts, message);
+        return;
+      }
+      await this.bumpDeliveryAttempts(entry.tokenBlob, attempts);
+      logger.warn('Payments', `Replay of undelivered v2 transfer ${tag}... failed (attempt ${attempts}/${MAX_DELIVERY_REPLAY_ATTEMPTS}, kept for next load):`, err);
+    }
+  }
+
+  /** One delivery with in-pass exponential backoff; throws the last error if all attempts fail. */
+  private async attemptDeliveryWithBackoff(entry: PendingV2Delivery): Promise<void> {
+    const nm = this.currentNametagName();
+    let lastErr: unknown;
+    for (let attempt = 0; attempt <= DELIVERY_REPLAY_RETRIES; attempt++) {
+      if (attempt > 0) {
+        const delay = Math.min(this.replayBackoffBaseMs * 2 ** (attempt - 1), DELIVERY_REPLAY_MAX_DELAY_MS);
+        if (delay > 0) await sleep(delay);
+      }
       try {
-        const nm = this.currentNametagName();
-        await this.delivery!.deliver(e.recipientPubkey, hexToBytes(e.tokenBlob), {
-          transferId: e.transferId,
-          memo: e.memo,
+        await this.delivery!.deliver(entry.recipientPubkey, hexToBytes(entry.tokenBlob), {
+          transferId: entry.transferId,
+          memo: entry.memo,
           ...(nm !== undefined ? { senderNametag: nm } : {}),
         });
-        await this.removePendingV2Delivery(e.tokenBlob);
-        logger.debug('Payments', `Replayed undelivered v2 transfer ${e.transferId.slice(0, 8)}...`);
+        return;
       } catch (err) {
-        logger.warn('Payments', `Replay of undelivered v2 transfer ${e.transferId.slice(0, 8)}... failed (kept for next load):`, err);
+        lastErr = err;
       }
     }
+    throw lastErr;
+  }
+
+  /** Mark a journal entry poison (keep it, stop retrying) and surface it (#517 item 1). */
+  private async markDeliveryPoison(entry: PendingV2Delivery, attempts: number, error: string): Promise<void> {
+    await this.updatePendingV2Delivery(entry.tokenBlob, (e) => { e.attempts = attempts; e.undeliverable = true; });
+    logger.error('Payments', `Undelivered v2 transfer ${entry.transferId.slice(0, 8)}... is POISON after ${attempts} attempts — surfaced, kept journaled, no longer auto-retried:`, error);
+    this.deps!.emitEvent('delivery:undeliverable', {
+      transferId: entry.transferId,
+      recipientPubkey: entry.recipientPubkey,
+      attempts,
+      error,
+    });
+  }
+
+  private async bumpDeliveryAttempts(tokenBlob: string, attempts: number): Promise<void> {
+    await this.updatePendingV2Delivery(tokenBlob, (e) => { e.attempts = attempts; });
+  }
+
+  /** Mutate one journaled entry in place (keyed by tokenBlob) and persist. No-op if gone. */
+  private async updatePendingV2Delivery(tokenBlob: string, mutate: (e: PendingV2Delivery) => void): Promise<void> {
+    const all = await this.loadPendingV2Deliveries();
+    const target = all.find((e) => e.tokenBlob === tokenBlob);
+    if (!target) return;
+    mutate(target);
+    await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V2_DELIVERIES, JSON.stringify(all));
   }
 
   private async createStorageData(): Promise<TxfStorageDataBase> {

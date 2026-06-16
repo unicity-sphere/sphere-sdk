@@ -283,13 +283,14 @@ interface Asset {
   readonly name: string;         // e.g., 'Unicity'
   readonly decimals: number;     // e.g., 18
   readonly iconUrl?: string;     // Token icon URL
-  readonly totalAmount: string;  // Sum of all token amounts (smallest units)
-  readonly tokenCount: number;   // Number of tokens aggregated
+  readonly totalAmount: string;  // Spendable balance: confirmed + unconfirmed (in-flight EXCLUDED), smallest units
+  readonly tokenCount: number;   // Number of confirmed + unconfirmed tokens aggregated
   readonly confirmedAmount: string;     // Confirmed token amounts
-  readonly unconfirmedAmount: string;   // Unconfirmed token amounts
+  readonly unconfirmedAmount: string;   // Unconfirmed token amounts (NOT in-flight)
   readonly confirmedTokenCount: number; // Number of confirmed tokens
   readonly unconfirmedTokenCount: number; // Number of unconfirmed tokens
-  readonly transferringTokenCount: number; // Number of tokens currently being sent
+  readonly transferringTokenCount: number; // Number of in-flight tokens (NOT spendable)
+  readonly transferringAmount: string;  // Sum of in-flight token amounts — excluded from totalAmount
   readonly priceUsd: number | null;     // Price per unit in USD
   readonly priceEur: number | null;     // Price per unit in EUR
   readonly change24h: number | null;    // 24h price change %
@@ -454,8 +455,9 @@ if (result.success) {
 Get token balances grouped by coin type. **Synchronous** (no await needed) — returns the same
 `Asset` shape as `getAssets()` but with all price fields `null` (use `getAssets()` for prices).
 
-Skips tokens with status `'spent'` or `'invalid'`. Tokens with status `'transferring'` remain
-visible (counted in `unconfirmedAmount` and `transferringTokenCount`).
+Skips tokens with status `'spent'` or `'invalid'`. In-flight (`'transferring'`) tokens are NOT
+counted toward the spendable balance (`totalAmount`/`confirmedAmount`/`unconfirmedAmount`) — they
+are reported only via `transferringTokenCount`/`transferringAmount` for a "Sending" badge.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -1245,6 +1247,8 @@ type SphereEventType =
   | 'sync:provider'
   | 'sync:error'
   | 'sync:remote-update'
+  | 'inventory:conflict'
+  | 'delivery:undeliverable'
   | 'connection:changed'
   | 'nametag:registered'
   | 'nametag:recovered'
@@ -1279,6 +1283,10 @@ interface SphereEventMap {
   'sync:provider': { providerId: string; success: boolean; added?: number; removed?: number; error?: string };
   'sync:error': { source: string; error: string };
   'sync:remote-update': { providerId: string; name: string; sequence: number; cid: string; added: number; removed: number };
+  // A send lost a race on a stale-inventory source (Part E.2 TransferConflictError) — surfaced so a UI can prompt refresh+retry.
+  'inventory:conflict': { transferId: string; coinId: string; error: string };
+  // A journaled undelivered transfer blob exhausted its bounded replay budget — surfaced as poison (kept journaled, no longer auto-retried).
+  'delivery:undeliverable': { transferId: string; recipientPubkey: string; attempts: number; error: string };
   'connection:changed': { provider: string; connected: boolean; status?: ProviderStatus; enabled?: boolean; error?: string };
   'nametag:registered': { nametag: string; addressIndex: number };
   'nametag:recovered': { nametag: string };
