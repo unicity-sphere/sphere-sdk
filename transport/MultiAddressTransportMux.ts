@@ -1089,7 +1089,18 @@ export class MultiAddressTransportMux {
   private async handleEvent(event: NostrEvent): Promise<void> {
     // Dedup — bounded set with FIFO eviction. Issue #275 persists this
     // set so cross-process CLI invocations short-circuit at this gate.
-    if (event.id && this.processedEventIds.has(event.id)) return;
+    if (event.id && this.processedEventIds.has(event.id)) {
+      // [#559-diag] cross-process dedup hit — the prior CLI process's
+      // persisted MUX_PROCESSED_EVENT_IDS caught this replay. If this fires
+      // in §3 of trader-soak, the OrbitDB Profile flush survived
+      // process exit and (A.2) requires a different fix surface.
+      logger.info(
+        'Mux',
+        `[#559-diag] dedup hit on event ${event.id.slice(0, 12)}... ` +
+        `(kind=${event.kind}, total dedup set size=${this.processedEventIds.size})`,
+      );
+      return;
+    }
     if (event.id) {
       this.processedEventIds.add(event.id);
       // FIFO half-flush — preserves the legacy "evict half on overflow"
@@ -1840,6 +1851,18 @@ export class MultiAddressTransportMux {
     logger.debug(
       'Mux',
       `[#275] Mux dedup hydrated: ${this.processedEventIds.size} event IDs`,
+    );
+    // [#559-diag] Promote post-hydration size to INFO so it appears in
+    // production CLI logs without DEBUG_LOG=1. Discriminator for #559:
+    //   hydrated=0 in §3 SET_STRATEGY → cross-process flush is failing
+    //     (OrbitDB Profile durability — see #234/#239/#266/#268 family)
+    //   hydrated=N>0 + no dedup-hit log → events arrive via a path that
+    //     bypasses the Mux handleEvent gate (look at outer
+    //     NostrTransportProvider.processedEventIds and fetchPendingEvents).
+    logger.info(
+      'Mux',
+      `[#559-diag] hydrated: ${this.processedEventIds.size} event IDs ` +
+      `(storage=${this.storage ? 'present' : 'absent'})`,
     );
   }
 
