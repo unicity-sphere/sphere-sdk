@@ -1,5 +1,5 @@
 // connect/compatibility.ts — pure, dependency-free compatibility decision for the Connect gate.
-import { ERROR_CODES, SPHERE_CONNECT_VERSION } from './protocol';
+import { ERROR_CODES } from './protocol';
 import type { SphereRpcError, NetworkInfo } from './protocol';
 import { majorOf, compareSemver } from './semver';
 
@@ -26,6 +26,12 @@ function fail(
   return { ok: false, error: { code, message, data: { reason, ...extra } } };
 }
 
+/**
+ * Decide whether a connecting peer is compatible. Runs four ordered checks
+ * (protocol MAJOR → optional MINOR floor → optional SDK floor → network) and
+ * returns {ok:true} or {ok:false, error}. A malformed clientProtocol (NaN MAJOR)
+ * is treated as protocol-incompatible.
+ */
 export function checkCompatibility(input: CompatInput): CompatResult {
   const { clientProtocol, walletProtocol, minMinor, clientSdkVersion, minSdkVersion } = input;
 
@@ -35,8 +41,10 @@ export function checkCompatibility(input: CompatInput): CompatResult {
       'Incompatible Connect protocol version', { walletProtocol, clientProtocol });
   }
 
+  const walletMajor = majorOf(walletProtocol);
+
   // 2. Optional MINOR floor within the MAJOR.
-  if (minMinor !== undefined && compareSemver(clientProtocol, `${majorOf(walletProtocol)}.${minMinor}`) < 0) {
+  if (minMinor !== undefined && compareSemver(clientProtocol, `${walletMajor}.${minMinor}`) < 0) {
     return fail(ERROR_CODES.UNSUPPORTED_PROTOCOL_VERSION, 'protocol_incompatible',
       'Connect protocol below the required minimum', { walletProtocol, clientProtocol });
   }
@@ -57,5 +65,3 @@ export function checkCompatibility(input: CompatInput): CompatResult {
   return { ok: true };
 }
 
-// Re-export the wallet's own protocol for callers building responses.
-export { SPHERE_CONNECT_VERSION };

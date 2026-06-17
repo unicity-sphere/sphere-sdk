@@ -48,4 +48,16 @@ describe('checkCompatibility', () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error.code).toBe(ERROR_CODES.UNSUPPORTED_PROTOCOL_VERSION);
   });
+  it('passes when the MINOR floor is met or exceeded', () => {
+    expect(checkCompatibility({ clientProtocol: '2.1', walletProtocol: W, clientNetwork: { id: NET }, walletNetworkId: NET, minMinor: 1 }).ok).toBe(true);
+    expect(checkCompatibility({ clientProtocol: '2.2', walletProtocol: W, clientNetwork: { id: NET }, walletNetworkId: NET, minMinor: 1 }).ok).toBe(true);
+  });
+  it('passes when the SDK floor is met', () => {
+    expect(checkCompatibility({ clientProtocol: '2.0', walletProtocol: W, clientNetwork: { id: NET }, walletNetworkId: NET, clientSdkVersion: '0.10.0', minSdkVersion: '0.10.0' }).ok).toBe(true);
+  });
+  it('rejects when minSdkVersion is set but the client sends no sdkVersion', () => {
+    const r = checkCompatibility({ clientProtocol: '2.0', walletProtocol: W, clientNetwork: { id: NET }, walletNetworkId: NET, minSdkVersion: '0.10.0' });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error.code).toBe(ERROR_CODES.UNSUPPORTED_PROTOCOL_VERSION);
+  });
 });
