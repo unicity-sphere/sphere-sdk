@@ -1299,12 +1299,16 @@ export class PaymentsModule {
         try {
           const result = await provider.load();
           if (result.success && result.data) {
-            // Address guard: reject data from a different address
+            // Address guard: reject data persisted under a different address.
+            // _meta.address holds chainPubkey for current writes; legacy records
+            // hold an alpha1 value (pre-L1-removal) and are tolerated — the token
+            // store is partitioned by chainPubkey, and the record is rewritten to
+            // chainPubkey on the next save.
             const loadedMeta = (result.data as TxfStorageDataBase)?._meta;
-            const currentL1 = this.deps!.identity.l1Address;
             const currentChain = this.deps!.identity.chainPubkey;
-            if (loadedMeta?.address && currentL1 && loadedMeta.address !== currentL1 && loadedMeta.address !== currentChain) {
-              logger.warn('Payments', `Load: rejecting data from provider ${id} — address mismatch (got=${loadedMeta.address.slice(0, 20)}... expected=${currentL1.slice(0, 20)}...)`);
+            const isLegacyAlpha = loadedMeta?.address?.startsWith('alpha1') ?? false;
+            if (loadedMeta?.address && currentChain && !isLegacyAlpha && loadedMeta.address !== currentChain) {
+              logger.warn('Payments', `Load: rejecting data from provider ${id} — address mismatch (got=${loadedMeta.address.slice(0, 20)}... expected=${currentChain.slice(0, 20)}...)`);
               continue;
             }
 
@@ -4144,10 +4148,10 @@ export class PaymentsModule {
             // Stale IPFS records may contain tokens from a previously active
             // address if a write-behind flush raced with an address switch.
             const mergedMeta = (result.merged as TxfStorageDataBase)?._meta;
-            const currentL1 = this.deps!.identity.l1Address;
             const currentChain = this.deps!.identity.chainPubkey;
-            if (mergedMeta?.address && currentL1 && mergedMeta.address !== currentL1 && mergedMeta.address !== currentChain) {
-              logger.warn('Payments', `Sync: rejecting data from provider ${providerId} — address mismatch (got=${mergedMeta.address.slice(0, 20)}... expected=${currentL1.slice(0, 20)}...)`);
+            const isLegacyAlpha = mergedMeta?.address?.startsWith('alpha1') ?? false;
+            if (mergedMeta?.address && currentChain && !isLegacyAlpha && mergedMeta.address !== currentChain) {
+              logger.warn('Payments', `Sync: rejecting data from provider ${providerId} — address mismatch (got=${mergedMeta.address.slice(0, 20)}... expected=${currentChain.slice(0, 20)}...)`);
               continue;
             }
 
@@ -5539,7 +5543,7 @@ export class PaymentsModule {
       Array.from(this.tokens.values()),
       {
         version: 1,
-        address: this.deps!.identity.l1Address,
+        address: this.deps!.identity.chainPubkey,
         ipnsName: this.deps!.identity.ipnsName ?? '',
       },
       {
