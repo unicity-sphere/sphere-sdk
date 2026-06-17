@@ -36,6 +36,45 @@ The wallet's network id comes from `Sphere.networkId`, which is derived from the
 
 ---
 
+## Network Configuration
+
+### SPHERE_NETWORKS — the recommended way to declare a network
+
+Use `SPHERE_NETWORKS` (exported from `@unicitylabs/sphere-sdk/connect`) instead of a raw `{ id, name }` literal. It is derived directly from `constants.NETWORKS` so the numeric id can never drift from the SDK's embedded trust base:
+
+```typescript
+import { SPHERE_NETWORKS } from '@unicitylabs/sphere-sdk/connect';
+
+// With ConnectClient:
+const client = new ConnectClient({ /* ... */, network: SPHERE_NETWORKS.testnet2 });
+
+// With autoConnect:
+const result = await autoConnect({ /* ... */, network: SPHERE_NETWORKS.testnet2 });
+```
+
+`SPHERE_NETWORKS` is also importable by backend services from `@unicitylabs/sphere-sdk/connect` — this entry point has no browser-only deps, so it is safe to use in Node.js and `sphere-api` without pulling in DOM APIs.
+
+The registry currently exposes exactly one entry: `SPHERE_NETWORKS.testnet2` = `{ id: 4, name: 'testnet2' }`. Richer descriptor fields (`gatewayUrl`, `symbol`, `explorer`, `icon`) and runtime switch/add-network are deferred to a future multi-network effort. The legacy `testnet` alias is intentionally absent from `SPHERE_NETWORKS`.
+
+### NetworkInfo
+
+`NetworkInfo` is the descriptor type for a Unicity network:
+
+```typescript
+interface NetworkInfo {
+  readonly id: number;    // canonical match key — RootTrustBase.networkId (testnet2 = 4)
+  readonly name?: string; // human-readable metadata only
+}
+```
+
+`id` is the canonical key used by the gate (analogous to EIP-155 chainId). The wallet matches solely on `id`; `name` is optional metadata. Custom or future networks use the same shape: `network: { id, name }`.
+
+### Single source of truth
+
+`SPHERE_NETWORKS` is derived from `constants.NETWORKS` (which holds the `networkId` of each network's embedded trust base). This ensures the registry value is always byte-identical to the network id the wallet sees at runtime. Issue [#597](https://github.com/unicity-sphere/sphere-sdk/issues/597).
+
+---
+
 ## Architecture
 
 ```
@@ -196,11 +235,12 @@ The simplest way to connect from a browser dApp. Auto-detects the best transport
 
 ```typescript
 import { autoConnect } from '@unicitylabs/sphere-sdk/connect/browser';
+import { SPHERE_NETWORKS } from '@unicitylabs/sphere-sdk/connect';
 
 const result = await autoConnect({
   dapp: { name: 'My App', url: location.origin },
   walletUrl: 'https://sphere.unicity.network',
-  network: { id: 4, name: 'testnet2' }, // required by the v2 compatibility gate
+  network: SPHERE_NETWORKS.testnet2, // required by the v2 compatibility gate
   silent: true, // auto-reconnect without UI if already approved
 });
 
@@ -268,7 +308,7 @@ interface AutoConnectResult {
 ## Setting up ConnectClient (dApp side)
 
 ```typescript
-import { ConnectClient } from '@unicitylabs/sphere-sdk/connect';
+import { ConnectClient, SPHERE_NETWORKS } from '@unicitylabs/sphere-sdk/connect';
 import type { NetworkInfo } from '@unicitylabs/sphere-sdk/connect';
 
 const client = new ConnectClient({
@@ -281,8 +321,9 @@ const client = new ConnectClient({
 
   // REQUIRED for the v2 compatibility gate: the network this dApp targets.
   // The wallet rejects the handshake with INCOMPATIBLE_NETWORK (4008) if it does not match.
-  // testnet2 = { id: 4 }
-  network: { id: 4, name: 'testnet2' } satisfies NetworkInfo,
+  // Use SPHERE_NETWORKS for the canonical value — it is derived from constants.NETWORKS
+  // so the numeric id cannot drift. Custom networks use the same shape: { id, name }.
+  network: SPHERE_NETWORKS.testnet2,
 
   // Set to true for silent auto-connect checks (no approval popup shown)
   silent: false,
