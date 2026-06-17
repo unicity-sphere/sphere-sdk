@@ -67,7 +67,7 @@ export interface ConnectHostConfig {
   /** Notify-only: the compatibility gate rejected a connection. Lets the wallet surface the reason
    *  in its UI. Does NOT affect the decision (the host already decided). `silent` is true for
    *  auto-connect attempts — the wallet should not show UI for those. */
-  onConnectionRejected?: (dapp: DAppMetadata | undefined, error: SphereRpcError, silent: boolean) => void;
+  onConnectionRejected?: (dapp: DAppMetadata | undefined, error: SphereRpcError, silent?: boolean) => void;
 
   /** Session time-to-live in ms. Default: 86400000 (24h). 0 = no expiry. */
   sessionTtlMs?: number;
