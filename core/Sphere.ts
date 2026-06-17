@@ -1441,6 +1441,18 @@ export class Sphere {
     return this._initialized;
   }
 
+  /** The active network id, from the oracle's root trust base (RootTrustBase.networkId,
+   *  e.g. testnet2 = 4). Undefined if the oracle has no trust base. Used by ConnectHost
+   *  to gate cross-network dApp connections. */
+  get networkId(): number | undefined {
+    const tb = this._oracle.getTrustBaseJson();
+    if (tb && typeof tb === 'object') {
+      const id = (tb as Record<string, unknown>).networkId;
+      if (typeof id === 'number') return id;
+    }
+    return undefined;
+  }
+
   // ===========================================================================
   // Public Methods - Signing
   // ===========================================================================

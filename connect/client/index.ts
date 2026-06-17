@@ -1,1 +1,1 @@
-export { ConnectClient } from './ConnectClient';
+export { ConnectClient, ConnectError } from './ConnectClient';

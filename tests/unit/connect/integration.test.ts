@@ -5,6 +5,7 @@ import type { ConnectTransport, SphereConnectMessage } from '../../../connect/ty
 import { PERMISSION_SCOPES } from '../../../connect/permissions';
 import { ERROR_CODES, RPC_METHODS, INTENT_ACTIONS } from '../../../connect/protocol';
 import type { PermissionScope } from '../../../connect/permissions';
+import { ConnectError } from '../../../connect';
 
 // =============================================================================
 // Mock Transport: connects two sides in-memory
@@ -55,6 +56,7 @@ function createMockSphere() {
       directAddress: 'DIRECT://test',
       nametag: 'alice',
     },
+    networkId: 4,
     payments: {
       getBalance: vi.fn().mockReturnValue([{ coinId: 'UCT', totalAmount: '1000000' }]),
       getAssets: vi.fn().mockResolvedValue([{ coinId: 'UCT', symbol: 'UCT', totalAmount: '1000000' }]),
@@ -127,6 +129,7 @@ describe('Sphere Connect Integration', () => {
     client = new ConnectClient({
       transport: transports.client,
       dapp: defaultDapp,
+      network: { id: 4 },
       ...overrides,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any);
@@ -548,5 +551,45 @@ describe('Sphere Connect Integration', () => {
       expect(result).toHaveLength(1);
       expect(result[0].peerNametag).toBeUndefined();
     });
+  });
+});
+
+describe('end-to-end gate over the mock transport pair', () => {
+  it('connects when protocol + network match', async () => {
+    const { host: hostT, client: clientT } = createMockTransportPair();
+    new ConnectHost({
+      sphere: createMockSphere(),
+      transport: hostT,
+      onConnectionRequest: async () => ({ approved: true, grantedPermissions: [PERMISSION_SCOPES.IDENTITY_READ] }),
+      onIntent: async () => ({}),
+    });
+    const client = new ConnectClient({
+      transport: clientT,
+      dapp: { name: 'd', url: 'https://d' },
+      permissions: [PERMISSION_SCOPES.IDENTITY_READ],
+      network: { id: 4 },
+    });
+    const res = await client.connect();
+    expect(res.sessionId).toBeTypeOf('string');
+    expect(client.walletNetwork?.id).toBe(4);
+  });
+
+  it('rejects a wrong-network client with a ConnectError', async () => {
+    const { host: hostT, client: clientT } = createMockTransportPair();
+    new ConnectHost({
+      sphere: createMockSphere(),
+      transport: hostT,
+      onConnectionRequest: async () => ({ approved: true, grantedPermissions: [] }),
+      onIntent: async () => ({}),
+    });
+    const client = new ConnectClient({
+      transport: clientT,
+      dapp: { name: 'd', url: 'https://d' },
+      permissions: [],
+      network: { id: 1 },
+    });
+    const err = await client.connect().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ConnectError);
+    expect((err as ConnectError).code).toBe(ERROR_CODES.INCOMPATIBLE_NETWORK);
   });
 });

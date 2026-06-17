@@ -16,6 +16,8 @@ import type {
   SphereIntentRequest,
   SphereHandshake,
   PublicIdentity,
+  SphereRpcError,
+  NetworkInfo,
 } from '../protocol';
 import {
   SPHERE_CONNECT_NAMESPACE,
@@ -25,6 +27,8 @@ import {
   WALLET_EVENTS,
   createRequestId,
 } from '../protocol';
+import { checkCompatibility } from '../compatibility';
+import { SDK_VERSION } from '../version';
 import {
   DEFAULT_PERMISSIONS,
   hasMethodPermission,
@@ -36,6 +40,7 @@ import type { PermissionScope } from '../permissions';
 // ConnectHost only needs these public methods from Sphere.
 interface SphereInstance {
   readonly identity: { chainPubkey: string; l1Address: string; directAddress?: string; nametag?: string } | null;
+  readonly networkId?: number;
   readonly payments: {
     getBalance(coinId?: string): unknown[];
     getAssets(coinId?: string): Promise<unknown[]>;
@@ -222,10 +227,40 @@ export class ConnectHost {
 
   private async handleHandshake(msg: SphereHandshake): Promise<void> {
     const dapp = msg.dapp;
+    // A handshake without dapp metadata is malformed — deny silently (no session).
+    // The compatibility gate and onConnectionRejected are intentionally not consulted
+    // here: there is no app to gate or to surface a rejection reason for.
     if (!dapp) {
       this.sendHandshakeResponse([], undefined, undefined);
       return;
     }
+
+    // Compatibility gate — runs BEFORE resume and BEFORE onConnectionRequest, so an
+    // incompatible/old client cannot slip through on a stale sessionId.
+    const result = checkCompatibility({
+      clientProtocol: msg.v,
+      walletProtocol: SPHERE_CONNECT_VERSION,
+      clientNetwork: msg.network,
+      walletNetworkId: this.sphere.networkId ?? -1,
+      minMinor: this.config.minMinorVersion,
+      clientSdkVersion: msg.sdkVersion,
+      minSdkVersion: this.config.minSdkVersion,
+    });
+    if (!result.ok) {
+      logger.warn('ConnectHost', 'Rejected handshake', {
+        dapp: dapp.name,
+        reason: (result.error.data as { reason?: string } | undefined)?.reason,
+        clientProtocol: msg.v,
+        walletProtocol: SPHERE_CONNECT_VERSION,
+        clientNetwork: msg.network ?? null,
+        walletNetwork: this.sphere.networkId ?? null,
+      });
+      this.config.onConnectionRejected?.(dapp, result.error, !!msg.silent);
+      this.sendHandshakeResponse([], undefined, undefined, result.error, msg.v);
+      return;
+    }
+
+    const clientInfo = { protocolVersion: msg.v, network: msg.network, sdkVersion: msg.sdkVersion };
 
     // Session resumption: if the client presents a valid existing sessionId,
     // skip the approval popup and restore the session without user interaction.
@@ -241,6 +276,7 @@ export class ConnectHost {
       dapp,
       requestedPermissions,
       msg.silent,
+      clientInfo,
     );
 
     if (!approved) {
@@ -273,19 +309,30 @@ export class ConnectHost {
     this.sendHandshakeResponse(allPermissions, sessionId, identity);
   }
 
+  // `warning` is a forward-compatible deprecation-notice slot (see SphereHandshake.warning);
+  // no call site emits one yet — reserved for the deprecation-window policy.
   private sendHandshakeResponse(
     permissions: string[],
     sessionId: string | undefined,
     identity: PublicIdentity | undefined,
+    error?: SphereRpcError,
+    echoV?: string,
+    warning?: SphereRpcError,
   ): void {
+    const network: NetworkInfo | undefined =
+      typeof this.sphere.networkId === 'number' ? { id: this.sphere.networkId } : undefined;
     this.transport.send({
       ns: SPHERE_CONNECT_NAMESPACE,
-      v: SPHERE_CONNECT_VERSION,
+      v: (error && echoV ? echoV : SPHERE_CONNECT_VERSION) as typeof SPHERE_CONNECT_VERSION,
       type: 'handshake',
       direction: 'response',
       permissions,
       sessionId,
       identity,
+      network,
+      sdkVersion: SDK_VERSION,
+      error,
+      warning,
     });
   }
 
