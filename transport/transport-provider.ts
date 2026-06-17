@@ -23,9 +23,14 @@ export interface TransportProvider extends BaseProvider {
   /**
    * Send encrypted direct message
    * @param recipientTransportPubkey - Transport-specific pubkey for messaging
-   * @returns Event ID
+   * @param options - Optional behaviors (see {@link SendMessageOptions})
+   * @returns Event ID of the gift-wrap to the recipient (NOT the self-wrap)
    */
-  sendMessage(recipientTransportPubkey: string, content: string): Promise<string>;
+  sendMessage(
+    recipientTransportPubkey: string,
+    content: string,
+    options?: SendMessageOptions,
+  ): Promise<string>;
 
   /**
    * Subscribe to incoming direct messages
@@ -401,6 +406,26 @@ export interface IncomingMessage {
 }
 
 export type MessageHandler = (message: IncomingMessage) => void;
+
+/**
+ * Per-call options for {@link TransportProvider.sendMessage}.
+ *
+ * Default behavior — when `options` is omitted or `selfWrap` is unset — is
+ * unchanged from before these options existed (gift-wrap + self-wrap both
+ * publish).
+ */
+export interface SendMessageOptions {
+  /**
+   * When `true` (default), publish a second NIP-17 gift-wrap addressed to the
+   * sender's own pubkey so a returning client can replay outbound history on
+   * reconnect.
+   *
+   * When `false`, skip the self-wrap publish. Use for short-lived senders
+   * (e.g. one-shot CLI RPC like `sphere trader portfolio`) that exit before
+   * they could ever read their own self-wrap — see sphere-sdk#555.
+   */
+  selfWrap?: boolean;
+}
 
 // =============================================================================
 // Token Transfer Types
