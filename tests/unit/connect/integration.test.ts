@@ -65,10 +65,6 @@ function createMockSphere() {
       getHistory: vi.fn().mockReturnValue([
         { type: 'sent', amount: '500', coinId: 'UCT', timestamp: 1700000000 },
       ]),
-      l1: {
-        getBalance: vi.fn().mockResolvedValue({ confirmed: '100000', total: '100000' }),
-        getHistory: vi.fn().mockResolvedValue([]),
-      },
     },
     resolve: vi.fn().mockResolvedValue({
       nametag: 'bob',
@@ -227,11 +223,6 @@ describe('Sphere Connect Integration', () => {
     it('gets history', async () => {
       const history = await client.query(RPC_METHODS.GET_HISTORY);
       expect(history).toHaveLength(1);
-    });
-
-    it('gets L1 balance', async () => {
-      const balance = await client.query(RPC_METHODS.L1_GET_BALANCE);
-      expect(balance).toEqual({ confirmed: '100000', total: '100000' });
     });
 
     it('resolves nametag', async () => {

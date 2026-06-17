@@ -1,73 +1,16 @@
 /**
  * Tests for modules/payments/PaymentsModule.ts
- * Covers L1 optional initialization and configuration
+ * Covers module configuration
  */
 
 import { describe, it, expect, vi } from 'vitest';
 import { createPaymentsModule } from '../../../modules/payments/PaymentsModule';
-import { L1PaymentsModule } from '../../../modules/payments/L1PaymentsModule';
-
-// =============================================================================
-// Mock L1 SDK functions to avoid network calls
-// =============================================================================
-
-vi.mock('../../../l1/network', () => ({
-  connect: vi.fn().mockResolvedValue(undefined),
-  disconnect: vi.fn(),
-  isWebSocketConnected: vi.fn().mockReturnValue(false),
-}));
 
 // =============================================================================
 // Tests
 // =============================================================================
 
 describe('PaymentsModule', () => {
-  describe('L1 optional initialization', () => {
-    it('should have l1 enabled by default when no config is provided', () => {
-      const module = createPaymentsModule();
-      expect(module.l1).not.toBeNull();
-      expect(module.l1).toBeInstanceOf(L1PaymentsModule);
-    });
-
-    it('should have l1 enabled when empty l1 config is provided', () => {
-      const module = createPaymentsModule({ l1: {} });
-      expect(module.l1).not.toBeNull();
-      expect(module.l1).toBeInstanceOf(L1PaymentsModule);
-    });
-
-    it('should have l1 enabled when l1 config has empty electrumUrl', () => {
-      const module = createPaymentsModule({ l1: { electrumUrl: '' } });
-      expect(module.l1).not.toBeNull();
-      expect(module.l1).toBeInstanceOf(L1PaymentsModule);
-    });
-
-    it('should have l1 enabled when l1 is undefined', () => {
-      const module = createPaymentsModule({ l1: undefined });
-      expect(module.l1).not.toBeNull();
-      expect(module.l1).toBeInstanceOf(L1PaymentsModule);
-    });
-
-    it('should have l1 as null when l1 is explicitly null', () => {
-      const module = createPaymentsModule({ l1: null });
-      expect(module.l1).toBeNull();
-    });
-
-    it('should initialize l1 when electrumUrl is provided', () => {
-      const module = createPaymentsModule({
-        l1: { electrumUrl: 'wss://test.example.com:50004' },
-      });
-      expect(module.l1).not.toBeNull();
-      expect(module.l1).toBeInstanceOf(L1PaymentsModule);
-    });
-
-    it('should initialize l1 with default fulcrum URL', () => {
-      const module = createPaymentsModule({
-        l1: { electrumUrl: 'wss://fulcrum.alpha.unicity.network:50004' },
-      });
-      expect(module.l1).not.toBeNull();
-    });
-  });
-
   describe('Module configuration defaults', () => {
     it('should have correct default config values', () => {
       const module = createPaymentsModule();
@@ -99,21 +42,9 @@ describe('PaymentsModule', () => {
   });
 
   describe('destroy()', () => {
-    it('should not throw when l1 is null', () => {
-      const module = createPaymentsModule({ l1: null });
-      expect(module.l1).toBeNull();
+    it('should not throw on a fresh module', () => {
+      const module = createPaymentsModule();
       expect(() => module.destroy()).not.toThrow();
-    });
-
-    it('should call l1.destroy() when l1 is enabled', () => {
-      const module = createPaymentsModule({
-        l1: { electrumUrl: 'wss://test.example.com:50004' },
-      });
-      expect(module.l1).not.toBeNull();
-
-      const destroySpy = vi.spyOn(module.l1!, 'destroy');
-      module.destroy();
-      expect(destroySpy).toHaveBeenCalled();
     });
   });
 });
@@ -188,38 +119,6 @@ describe('Incoming transfer payload format detection', () => {
     expect(typeof outgoingPayload.transferTx).toBe('string');
     expect(() => JSON.parse(outgoingPayload.sourceToken)).not.toThrow();
     expect(() => JSON.parse(outgoingPayload.transferTx)).not.toThrow();
-  });
-});
-
-describe('L1PaymentsModule', () => {
-  describe('configuration defaults', () => {
-    it('should have default electrumUrl when created with config', () => {
-      // Note: L1PaymentsModule is only created when electrumUrl is provided
-      // via PaymentsModule, but directly it still has defaults
-      const l1 = new L1PaymentsModule();
-      // Access private config for testing
-      const config = (l1 as unknown as { _config: Record<string, unknown> })._config;
-
-      expect(config.electrumUrl).toBe('wss://fulcrum.unicity.network:50004');
-      expect(config.network).toBe('mainnet');
-      expect(config.defaultFeeRate).toBe(10);
-      expect(config.enableVesting).toBe(true);
-    });
-
-    it('should allow overriding config values', () => {
-      const l1 = new L1PaymentsModule({
-        electrumUrl: 'wss://custom.example.com:50004',
-        network: 'testnet',
-        defaultFeeRate: 5,
-        enableVesting: false,
-      });
-      const config = (l1 as unknown as { _config: Record<string, unknown> })._config;
-
-      expect(config.electrumUrl).toBe('wss://custom.example.com:50004');
-      expect(config.network).toBe('testnet');
-      expect(config.defaultFeeRate).toBe(5);
-      expect(config.enableVesting).toBe(false);
-    });
   });
 });
 

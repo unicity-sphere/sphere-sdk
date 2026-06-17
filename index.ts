@@ -438,22 +438,6 @@ export type {
 // L1 SDK (ALPHA Blockchain)
 // =============================================================================
 
-export {
-  // L1 Payments Module
-  L1PaymentsModule,
-  createL1PaymentsModule,
-} from './modules/payments';
-
-export type {
-  L1PaymentsModuleConfig,
-  L1PaymentsModuleDependencies,
-  L1SendRequest,
-  L1SendResult,
-  L1Balance,
-  L1Utxo,
-  L1Transaction,
-} from './modules/payments';
-
 // L1 Low-level SDK
 export * as L1 from './l1';
 

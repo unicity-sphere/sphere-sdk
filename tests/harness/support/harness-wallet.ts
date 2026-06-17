@@ -267,7 +267,7 @@ export async function createHarnessWallet(opts: HarnessWalletOptions): Promise<H
     delivery: providers.delivery,
     walletApi: providers.walletApi,
   };
-  const module = createPaymentsModule({ l1: null });
+  const module = createPaymentsModule({});
   module.initialize(deps);
 
   return {

@@ -9,13 +9,6 @@ import type { TransportProvider } from '../../../transport';
 import type { OracleProvider } from '../../../oracle';
 import type { ProviderStatus, SphereEventMap } from '../../../types';
 
-// Mock L1 network module before importing Sphere
-vi.mock('../../../l1/network', () => ({
-  connect: vi.fn().mockResolvedValue(undefined),
-  disconnect: vi.fn(),
-  isWebSocketConnected: vi.fn().mockReturnValue(false),
-}));
-
 import { Sphere } from '../../../core/Sphere';
 import { TEST_NETWORK } from '../../test-network';
 
@@ -164,7 +157,6 @@ describe('Sphere Status & Provider Management', () => {
   });
 
   async function initSphere(options?: {
-    l1?: { electrumUrl?: string };
     price?: { platform: string };
   }) {
     const initOpts: Record<string, unknown> = {
@@ -175,9 +167,6 @@ describe('Sphere Status & Provider Management', () => {
       network: TEST_NETWORK,
       autoGenerate: true,
     };
-    if (options?.l1) {
-      initOpts.l1 = options.l1;
-    }
     if (options?.price) {
       initOpts.price = {
         platform: options.price.platform,
@@ -246,14 +235,6 @@ describe('Sphere Status & Provider Management', () => {
       expect(status.tokenStorage).toHaveLength(1);
       expect(status.tokenStorage[0].id).toBe('indexeddb-tokens');
       expect(status.tokenStorage[0].role).toBe('token-storage');
-    });
-
-    it('should show L1 array (may have default module)', async () => {
-      const sphere = await initSphere();
-      const status = sphere.getStatus();
-
-      // L1 array is present (may or may not have entries depending on module config)
-      expect(status.l1).toBeInstanceOf(Array);
     });
 
     it('should show price as empty when not configured', async () => {
@@ -497,44 +478,6 @@ describe('Sphere Status & Provider Management', () => {
   });
 
   // ===========================================================================
-  // L1 status in getStatus()
-  // ===========================================================================
-
-  describe('L1 in getStatus()', () => {
-    it('should show L1 provider when configured', async () => {
-      const sphere = await initSphere({
-        l1: { electrumUrl: 'wss://test-fulcrum:50004' },
-      });
-      const status = sphere.getStatus();
-
-      expect(status.l1).toHaveLength(1);
-      expect(status.l1[0].id).toBe('l1-alpha');
-      expect(status.l1[0].role).toBe('l1');
-      expect(status.l1[0].name).toBe('ALPHA L1');
-    });
-
-    it('should show L1 as disconnected when WebSocket not connected', async () => {
-      const sphere = await initSphere({
-        l1: { electrumUrl: 'wss://test-fulcrum:50004' },
-      });
-      const status = sphere.getStatus();
-
-      // isWebSocketConnected() is mocked to return false
-      expect(status.l1[0].connected).toBe(false);
-      expect(status.l1[0].status).toBe('disconnected');
-    });
-
-    it('should show L1 enabled by default', async () => {
-      const sphere = await initSphere({
-        l1: { electrumUrl: 'wss://test-fulcrum:50004' },
-      });
-      const status = sphere.getStatus();
-
-      expect(status.l1[0].enabled).toBe(true);
-    });
-  });
-
-  // ===========================================================================
   // Price provider in getStatus()
   // ===========================================================================
 
@@ -640,78 +583,6 @@ describe('Sphere Status & Provider Management', () => {
 
       expect(indexeddb!.enabled).toBe(true);
       expect(file!.enabled).toBe(false);
-    });
-  });
-
-  // ===========================================================================
-  // L1 disable/enable
-  // ===========================================================================
-
-  describe('L1 disable/enable', () => {
-    it('should disable L1 provider', async () => {
-      const sphere = await initSphere({
-        l1: { electrumUrl: 'wss://test-fulcrum:50004' },
-      });
-      const events: SphereEventMap['connection:changed'][] = [];
-      sphere.on('connection:changed', (e) => events.push(e));
-
-      const result = await sphere.disableProvider('l1-alpha');
-      expect(result).toBe(true);
-      expect(sphere.isProviderEnabled('l1-alpha')).toBe(false);
-
-      const status = sphere.getStatus();
-      expect(status.l1[0].enabled).toBe(false);
-
-      // Should emit connection:changed
-      expect(events).toHaveLength(1);
-      expect(events[0].provider).toBe('l1-alpha');
-      expect(events[0].enabled).toBe(false);
-    });
-
-    it('should re-enable L1 provider with lazy reconnect', async () => {
-      const sphere = await initSphere({
-        l1: { electrumUrl: 'wss://test-fulcrum:50004' },
-      });
-
-      await sphere.disableProvider('l1-alpha');
-      expect(sphere.isProviderEnabled('l1-alpha')).toBe(false);
-
-      const events: SphereEventMap['connection:changed'][] = [];
-      sphere.on('connection:changed', (e) => events.push(e));
-
-      const result = await sphere.enableProvider('l1-alpha');
-      expect(result).toBe(true);
-      expect(sphere.isProviderEnabled('l1-alpha')).toBe(true);
-
-      // L1 re-enable emits disconnected status (lazy — will connect on first use)
-      expect(events).toHaveLength(1);
-      expect(events[0].provider).toBe('l1-alpha');
-      expect(events[0].enabled).toBe(true);
-      expect(events[0].connected).toBe(false);
-      expect(events[0].status).toBe('disconnected');
-    });
-
-    it('should block L1 operations while disabled', async () => {
-      const sphere = await initSphere({
-        l1: { electrumUrl: 'wss://test-fulcrum:50004' },
-      });
-
-      await sphere.disableProvider('l1-alpha');
-
-      // L1 getBalance should throw because ensureConnected checks _disabled
-      await expect(sphere.payments.l1!.getBalance()).rejects.toThrow('L1 provider is disabled');
-    });
-
-    it('should allow L1 operations after re-enable', async () => {
-      const sphere = await initSphere({
-        l1: { electrumUrl: 'wss://test-fulcrum:50004' },
-      });
-
-      await sphere.disableProvider('l1-alpha');
-      await sphere.enableProvider('l1-alpha');
-
-      // L1 disabled flag should be cleared — ensureConnected won't throw
-      expect(sphere.payments.l1!.disabled).toBe(false);
     });
   });
 
