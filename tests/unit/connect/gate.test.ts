@@ -127,6 +127,8 @@ describe('ConnectHost gate', () => {
   it('accepts a same-MAJOR newer MINOR client and includes wallet network/sdkVersion', async () => {
     const h = makeHostHarness();
     h.send({ v: '2.1', dapp: { name: 'd', url: 'https://d' }, network: { id: WALLET_NET } });
+    // onConnectionRequest is async, so the success path settles on a macrotask — flush it.
+    // (The rejection tests above are synchronous and only need a microtask.)
     await new Promise((r) => setTimeout(r, 0));
     const resp = handshakeResponses(h.sent)[0];
     expect(resp.sessionId).toBeTypeOf('string');

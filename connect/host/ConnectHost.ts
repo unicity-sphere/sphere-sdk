@@ -227,6 +227,9 @@ export class ConnectHost {
 
   private async handleHandshake(msg: SphereHandshake): Promise<void> {
     const dapp = msg.dapp;
+    // A handshake without dapp metadata is malformed — deny silently (no session).
+    // The compatibility gate and onConnectionRejected are intentionally not consulted
+    // here: there is no app to gate or to surface a rejection reason for.
     if (!dapp) {
       this.sendHandshakeResponse([], undefined, undefined);
       return;
@@ -306,6 +309,8 @@ export class ConnectHost {
     this.sendHandshakeResponse(allPermissions, sessionId, identity);
   }
 
+  // `warning` is a forward-compatible deprecation-notice slot (see SphereHandshake.warning);
+  // no call site emits one yet — reserved for the deprecation-window policy.
   private sendHandshakeResponse(
     permissions: string[],
     sessionId: string | undefined,
