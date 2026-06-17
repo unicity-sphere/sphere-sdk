@@ -122,6 +122,7 @@
     "LICENSE"
   ],
   "scripts": {
+    "prebuild": "node scripts/gen-version.mjs",
     "build": "node scripts/build.mjs",
     "build:watch": "tsup --watch",
     "clean": "rm -rf dist",
