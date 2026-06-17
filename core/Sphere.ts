@@ -1445,9 +1445,10 @@ export class Sphere {
    *  e.g. testnet2 = 4). Undefined if the oracle has no trust base. Used by ConnectHost
    *  to gate cross-network dApp connections. */
   get networkId(): number | undefined {
-    const tb = (this._oracle as { getTrustBaseJson?: () => unknown }).getTrustBaseJson?.();
-    if (tb && typeof tb === 'object' && typeof (tb as { networkId?: unknown }).networkId === 'number') {
-      return (tb as { networkId: number }).networkId;
+    const tb = this._oracle.getTrustBaseJson();
+    if (tb && typeof tb === 'object') {
+      const id = (tb as Record<string, unknown>).networkId;
+      if (typeof id === 'number') return id;
     }
     return undefined;
   }
