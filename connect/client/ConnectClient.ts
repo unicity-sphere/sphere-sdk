@@ -13,6 +13,7 @@ import { SphereError } from '../../core/errors';
 import type { ConnectTransport, ConnectClientConfig, ConnectResult, ConnectEventHandler } from '../types';
 import type {
   SphereConnectMessage,
+  SphereHandshake,
   DAppMetadata,
   PublicIdentity,
   NetworkInfo,
@@ -292,7 +293,7 @@ export class ConnectClient {
 
     clearTimeout(this.handshakeResolver.timer);
 
-    const m = msg as typeof msg & { error?: { code: number; message: string; data?: unknown }; network?: NetworkInfo; warning?: { message: string } };
+    const m = msg as SphereHandshake;
 
     if (m.error) {
       this.handshakeResolver.reject(new ConnectError(m.error.message, m.error.code, m.error.data));
@@ -359,5 +360,6 @@ export class ConnectClient {
     this.sessionId = null;
     this.grantedPermissions = [];
     this.identity = null;
+    this.walletNet = null;
   }
 }

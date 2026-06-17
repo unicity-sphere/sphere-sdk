@@ -52,4 +52,18 @@ describe('ConnectClient gate', () => {
     h.reply({}); // no sessionId, no identity, no error
     await expect(p).rejects.toThrow('Connection rejected by wallet');
   });
+
+  it('exposes the wallet network after a successful handshake', async () => {
+    const h = makeClientHarness();
+    const p = h.client.connect();
+    await Promise.resolve();
+    h.reply({
+      sessionId: 's1',
+      permissions: [PERMISSION_SCOPES.IDENTITY_READ],
+      identity: { chainPubkey: '02', l1Address: 'alpha1', directAddress: 'DIRECT://x' },
+      network: { id: WALLET_NET },
+    });
+    await p;
+    expect(h.client.walletNetwork?.id).toBe(WALLET_NET);
+  });
 });
