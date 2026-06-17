@@ -13,10 +13,8 @@ import { SphereError } from '../../core/errors';
 import type { ConnectTransport, ConnectClientConfig, ConnectResult, ConnectEventHandler } from '../types';
 import type {
   SphereConnectMessage,
-  SphereHandshake,
   DAppMetadata,
   PublicIdentity,
-  NetworkInfo,
 } from '../protocol';
 import {
   SPHERE_CONNECT_NAMESPACE,
@@ -24,18 +22,8 @@ import {
   RPC_METHODS,
   createRequestId,
 } from '../protocol';
-import { SDK_VERSION } from '../version';
 import { ALL_PERMISSIONS } from '../permissions';
 import type { PermissionScope } from '../permissions';
-
-/** Error thrown by ConnectClient carrying the host's structured rejection.
- *  Discriminate on the numeric `.code` (bundle-safe), not `instanceof`. */
-export class ConnectError extends Error {
-  constructor(message: string, public readonly code: number, public readonly data?: unknown) {
-    super(message);
-    this.name = 'ConnectError';
-  }
-}
 
 const DEFAULT_TIMEOUT = 30000;
 const DEFAULT_INTENT_TIMEOUT = 120000;
@@ -55,12 +43,10 @@ export class ConnectClient {
 
   private readonly resumeSessionId: string | null;
   private readonly silent: boolean;
-  private readonly network: NetworkInfo | undefined;
 
   private sessionId: string | null = null;
   private grantedPermissions: PermissionScope[] = [];
   private identity: PublicIdentity | null = null;
-  private walletNet: NetworkInfo | null = null;
   private connected = false;
 
   private pendingRequests: Map<string, PendingRequest> = new Map();
@@ -82,7 +68,6 @@ export class ConnectClient {
     this.intentTimeout = config.intentTimeout ?? DEFAULT_INTENT_TIMEOUT;
     this.resumeSessionId = config.resumeSessionId ?? null;
     this.silent = config.silent ?? false;
-    this.network = config.network;
   }
 
   // ===========================================================================
@@ -110,8 +95,6 @@ export class ConnectClient {
         direction: 'request',
         permissions: this.requestedPermissions,
         dapp: this.dapp,
-        sdkVersion: SDK_VERSION,
-        ...(this.network ? { network: this.network } : {}),
         ...(this.resumeSessionId ? { sessionId: this.resumeSessionId } : {}),
         ...(this.silent ? { silent: true } : {}),
       });
@@ -148,11 +131,6 @@ export class ConnectClient {
   /** Public identity received during handshake */
   get walletIdentity(): PublicIdentity | null {
     return this.identity;
-  }
-
-  /** Wallet's active network, received during handshake. */
-  get walletNetwork(): NetworkInfo | null {
-    return this.walletNet;
   }
 
   // ===========================================================================
@@ -293,21 +271,12 @@ export class ConnectClient {
 
     clearTimeout(this.handshakeResolver.timer);
 
-    const m = msg as SphereHandshake;
-
-    if (m.error) {
-      this.handshakeResolver.reject(new ConnectError(m.error.message, m.error.code, m.error.data));
-      this.handshakeResolver = null;
-      return;
-    }
-
     if (msg.sessionId && msg.identity) {
       this.sessionId = msg.sessionId;
       this.grantedPermissions = msg.permissions as PermissionScope[];
       this.identity = msg.identity;
-      this.walletNet = m.network ?? null;
       this.connected = true;
-      if (m.warning) logger.warn('Connect', 'Wallet deprecation notice', m.warning.message);
+
       this.handshakeResolver.resolve({
         sessionId: msg.sessionId,
         permissions: this.grantedPermissions,
@@ -332,7 +301,10 @@ export class ConnectClient {
     this.pendingRequests.delete(id);
 
     if (error) {
-      pending.reject(new ConnectError(error.message, error.code, error.data));
+      const err = new Error(error.message);
+      (err as Error & { code: number }).code = error.code;
+      (err as Error & { data: unknown }).data = error.data;
+      pending.reject(err);
     } else {
       pending.resolve(result);
     }
@@ -360,6 +332,5 @@ export class ConnectClient {
     this.sessionId = null;
     this.grantedPermissions = [];
     this.identity = null;
-    this.walletNet = null;
   }
 }

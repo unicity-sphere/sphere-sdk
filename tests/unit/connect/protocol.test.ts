@@ -39,7 +39,7 @@ describe('Protocol', () => {
       })).toBe(false);
     });
 
-    it('returns false for non-handshake traffic with a different MAJOR', () => {
+    it('returns false for wrong version', () => {
       expect(isSphereConnectMessage({
         ns: SPHERE_CONNECT_NAMESPACE,
         v: '99.0',
@@ -81,30 +81,5 @@ describe('Protocol', () => {
       expect(ERROR_CODES.USER_REJECTED).toBe(4003);
       expect(ERROR_CODES.INTENT_CANCELLED).toBe(4200);
     });
-  });
-});
-
-describe('protocol v2 gate surface', () => {
-  it('Connect version is bumped to 2.0', () => {
-    expect(SPHERE_CONNECT_VERSION).toBe('2.0');
-  });
-  it('has the new error codes', () => {
-    expect(ERROR_CODES.UNSUPPORTED_PROTOCOL_VERSION).toBe(4007);
-    expect(ERROR_CODES.INCOMPATIBLE_NETWORK).toBe(4008);
-  });
-  it('filter accepts same-MAJOR session traffic, drops other-MAJOR', () => {
-    const base = { ns: SPHERE_CONNECT_NAMESPACE };
-    expect(isSphereConnectMessage({ ...base, v: '2.0', type: 'request' })).toBe(true);
-    expect(isSphereConnectMessage({ ...base, v: '2.1', type: 'request' })).toBe(true);
-    expect(isSphereConnectMessage({ ...base, v: '1.0', type: 'request' })).toBe(false);
-  });
-  it('filter lets ANY-version handshake through (decided in the handler, not dropped)', () => {
-    const base = { ns: SPHERE_CONNECT_NAMESPACE };
-    expect(isSphereConnectMessage({ ...base, v: '1.0', type: 'handshake', direction: 'request', permissions: [] })).toBe(true);
-    expect(isSphereConnectMessage({ ...base, v: '3.0', type: 'handshake', direction: 'request', permissions: [] })).toBe(true);
-  });
-  it('still rejects non-namespace / non-objects', () => {
-    expect(isSphereConnectMessage({ ns: 'other', v: '2.0', type: 'request' })).toBe(false);
-    expect(isSphereConnectMessage(null)).toBe(false);
   });
 });

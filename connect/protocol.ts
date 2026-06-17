@@ -3,21 +3,14 @@
  * JSON-RPC-like message types for wallet ↔ dApp communication.
  */
 
-import { majorOf } from './semver';
-
 // =============================================================================
 // Constants
 // =============================================================================
 
 export const SPHERE_CONNECT_NAMESPACE = 'sphere-connect';
-export const SPHERE_CONNECT_VERSION = '2.0';   // Connect protocol version (semver MAJOR.MINOR)
+export const SPHERE_CONNECT_VERSION = '1.0';
 
-export { HOST_READY_TYPE, HOST_READY_TIMEOUT, SPHERE_NETWORKS } from '../constants';
-// Import for local use (e.g. SphereHandshake.network) AND re-export for connect consumers.
-// A bare `export type { NetworkInfo } from '../constants'` would re-export without bringing
-// the name into this module's scope, breaking the local references (TS2304).
-import type { NetworkInfo } from '../constants';
-export type { NetworkInfo };
+export { HOST_READY_TYPE, HOST_READY_TIMEOUT } from '../constants';
 
 // =============================================================================
 // RPC Method Names (query — return data, no UI)
@@ -89,8 +82,6 @@ export const ERROR_CODES = {
   SESSION_EXPIRED: 4004,
   ORIGIN_BLOCKED: 4005,
   RATE_LIMITED: 4006,
-  UNSUPPORTED_PROTOCOL_VERSION: 4007, // Connect MAJOR mismatch (incompatible era)
-  INCOMPATIBLE_NETWORK:         4008, // dApp targets a different network than the wallet
   INSUFFICIENT_BALANCE: 4100,
   INVALID_RECIPIENT: 4101,
   TRANSFER_FAILED: 4102,
@@ -157,14 +148,6 @@ export interface SphereHandshake extends SphereMessageBase {
   readonly identity?: PublicIdentity;
   /** If true, wallet must NOT open any approval UI. Immediately reject if origin is not already approved. */
   readonly silent?: boolean;
-  /** request: dApp target network; response: wallet active network */
-  readonly network?: NetworkInfo;
-  /** Informational: the dApp's npm SDK version. */
-  readonly sdkVersion?: string;
-  /** Response: structured rejection reason when the gate refuses the connection. */
-  readonly error?: SphereRpcError;
-  /** Response: non-fatal deprecation notice (does not block the connection). */
-  readonly warning?: SphereRpcError;
 }
 
 export interface SphereRpcError {
@@ -223,18 +206,11 @@ export type WalletEvent = (typeof WALLET_EVENTS)[keyof typeof WALLET_EVENTS];
 // Helpers
 // =============================================================================
 
-/** Check if a message belongs to the Sphere Connect protocol.
- *  Handshakes are accepted at ANY version (the version decision happens in the
- *  handshake handler so an incompatible peer gets a clean typed error instead of a
- *  silently-dropped message → timeout). All other (session) traffic must share the
- *  same MAJOR (so MINOR versions interoperate, e.g. 2.0 ↔ 2.1). */
+/** Check if a message belongs to the Sphere Connect protocol */
 export function isSphereConnectMessage(msg: unknown): msg is SphereConnectMessage {
   if (!msg || typeof msg !== 'object') return false;
   const m = msg as Record<string, unknown>;
-  if (m.ns !== SPHERE_CONNECT_NAMESPACE) return false;
-  if (m.type === 'handshake') return true;
-  if (typeof m.v !== 'string') return false;
-  return majorOf(m.v) === majorOf(SPHERE_CONNECT_VERSION);
+  return m.ns === SPHERE_CONNECT_NAMESPACE && m.v === SPHERE_CONNECT_VERSION;
 }
 
 /** Create a unique request ID */
