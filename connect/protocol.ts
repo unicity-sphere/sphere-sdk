@@ -13,7 +13,11 @@ export const SPHERE_CONNECT_NAMESPACE = 'sphere-connect';
 export const SPHERE_CONNECT_VERSION = '2.0';   // Connect protocol version (semver MAJOR.MINOR)
 
 export { HOST_READY_TYPE, HOST_READY_TIMEOUT, SPHERE_NETWORKS } from '../constants';
-export type { NetworkInfo } from '../constants';
+// Import for local use (e.g. SphereHandshake.network) AND re-export for connect consumers.
+// A bare `export type { NetworkInfo } from '../constants'` would re-export without bringing
+// the name into this module's scope, breaking the local references (TS2304).
+import type { NetworkInfo } from '../constants';
+export type { NetworkInfo };
 
 // =============================================================================
 // RPC Method Names (query — return data, no UI)
