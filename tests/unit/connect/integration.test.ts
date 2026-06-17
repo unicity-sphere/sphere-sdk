@@ -588,6 +588,8 @@ describe('end-to-end gate over the mock transport pair', () => {
       permissions: [],
       network: { id: 1 },
     });
-    await expect(client.connect()).rejects.toBeInstanceOf(ConnectError);
+    const err = await client.connect().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ConnectError);
+    expect((err as ConnectError).code).toBe(ERROR_CODES.INCOMPATIBLE_NETWORK);
   });
 });
