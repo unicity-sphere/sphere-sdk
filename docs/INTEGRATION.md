@@ -13,13 +13,12 @@
 2. [Wallet Operations](#wallet-operations)
 3. [L3 Payments](#l3-payments)
 4. [Payment Requests](#payment-requests)
-5. [L1 Payments](#l1-payments)
-6. [Communications](#communications)
-7. [Invoicing / Accounting](#invoicing--accounting)
-8. [Custom Providers](#custom-providers)
-9. [Events](#events)
-10. [Error Handling](#error-handling)
-11. [Testing](#testing)
+5. [Communications](#communications)
+6. [Invoicing / Accounting](#invoicing--accounting)
+7. [Custom Providers](#custom-providers)
+8. [Events](#events)
+9. [Error Handling](#error-handling)
+10. [Testing](#testing)
 
 ---
 
@@ -103,9 +102,8 @@ if (created && generatedMnemonic) {
   console.log('Save this mnemonic:', generatedMnemonic);
 }
 
-// Wallet is ready — L3 and L1 payments are available
+// Wallet is ready — L3 payments are available
 console.log('Address:', sphere.identity?.directAddress);  // DIRECT://... (L3)
-console.log('L1:', sphere.identity?.l1Address);           // alpha1... (L1)
 ```
 
 ---
@@ -147,7 +145,6 @@ const { sphere } = await Sphere.init({
 ```typescript
 const identity = sphere.identity;
 
-console.log('L1 Address:', identity.l1Address);       // alpha1...
 console.log('Chain Pubkey:', identity.chainPubkey);   // 33-byte compressed secp256k1
 console.log('Direct Address:', identity.directAddress); // DIRECT://... (L3)
 console.log('Nametag:', identity.nametag);            // e.g., 'alice'
@@ -194,7 +191,6 @@ Each derived address has its own keypair but shares the same master seed:
 interface AddressInfo {
   privateKey: string;  // Unique per address
   publicKey: string;   // Unique per address
-  address: string;     // alpha1... format
   path: string;        // Full BIP32 path
   index: number;       // Address index
 }
@@ -208,8 +204,7 @@ The SDK tracks which addresses have been activated (via create, switchToAddress,
 // Get all active (non-hidden) addresses
 const addresses = sphere.getActiveAddresses();
 for (const addr of addresses) {
-  console.log(`#${addr.index}: ${addr.l1Address}`);
-  console.log(`  DIRECT: ${addr.directAddress}`);
+  console.log(`#${addr.index}: ${addr.directAddress}`);
   console.log(`  Nametag: ${addr.nametag ?? 'none'}`);
   console.log(`  Created: ${new Date(addr.createdAt)}`);
 }
@@ -371,7 +366,7 @@ if (result.error) {
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `recipient` | Yes | `@nametag`, `DIRECT://...`, chain pubkey, or `alpha1...` address |
+| `recipient` | Yes | `@nametag`, `DIRECT://...`, or chain pubkey |
 | `amount` | Yes | Amount in smallest unit (string) |
 | `coinId` | Yes | Token coin ID (e.g., `'UCT'`) |
 | `memo` | No | Optional message to recipient |
@@ -468,7 +463,6 @@ const peer = await sphere.resolve('@alice');
 if (peer) {
   console.log('Chain pubkey:', peer.chainPubkey);
   console.log('Direct address:', peer.directAddress);
-  console.log('L1 address:', peer.l1Address);
   console.log('Nametag:', peer.nametag);
 }
 ```
@@ -707,86 +701,6 @@ const pendingOutgoing = sphere.payments.getOutgoingPaymentRequests({ status: 'pe
 
 // Clear completed/expired requests
 sphere.payments.clearCompletedOutgoingPaymentRequests();
-```
-
----
-
-## L1 Payments
-
-L1 module handles ALPHA blockchain transactions with vesting classification support.
-L1 is **enabled by default** — the Fulcrum WebSocket connection is lazy (deferred until first L1 operation).
-To explicitly disable L1, pass `l1: null` in the `PaymentsModuleConfig`.
-
-### Get L1 Balance
-
-```typescript
-const balance = await sphere.payments.l1.getBalance();
-
-console.log('Total:', balance.total);           // Total in satoshis
-console.log('Confirmed:', balance.confirmed);   // Confirmed balance
-console.log('Unconfirmed:', balance.unconfirmed);
-console.log('Vested:', balance.vested);         // Coins from blocks ≤280,000
-console.log('Unvested:', balance.unvested);     // Coins from blocks >280,000
-```
-
-### Get UTXOs
-
-```typescript
-const utxos = await sphere.payments.l1.getUtxos();
-
-for (const utxo of utxos) {
-  console.log(`${utxo.txid}:${utxo.vout} - ${utxo.amount} sats`);
-  console.log(`  Vested: ${utxo.isVested}`);
-  console.log(`  Confirmations: ${utxo.confirmations}`);
-  if (utxo.coinbaseHeight) {
-    console.log(`  Coinbase height: ${utxo.coinbaseHeight}`);
-  }
-}
-```
-
-### Send L1 Transaction
-
-```typescript
-const result = await sphere.payments.l1.send({
-  to: 'alpha1abc123...',
-  amount: '10000000',  // in satoshis
-});
-
-if (result.success) {
-  console.log('TX Hash:', result.txHash);
-} else {
-  console.error('Error:', result.error);
-}
-```
-
-### Get Transaction History
-
-```typescript
-const history = await sphere.payments.l1.getHistory(10);  // last 10 transactions
-
-for (const tx of history) {
-  console.log(`${tx.type}: ${tx.amount} sats`);
-  console.log(`  Confirmations: ${tx.confirmations}`);
-  console.log(`  Timestamp: ${new Date(tx.timestamp * 1000)}`);
-}
-```
-
-### Vesting Classification
-
-ALPHA coins are classified as "vested" or "unvested" based on their coinbase origin:
-- **Vested**: Coins traced back to coinbase transactions in blocks ≤280,000
-- **Unvested**: Coins from blocks >280,000
-
-The vesting classifier traces each UTXO through the transaction chain to its coinbase origin. Results are cached in IndexedDB (`SphereVestingCacheV5`) for performance. In Node.js, where IndexedDB is not available, the cache is memory-only (re-fetched from network each session).
-
-```typescript
-// Vesting is enabled by default. Configure via providers:
-const providers = createBrowserProviders({
-  network: 'mainnet',
-  l1: {
-    enableVesting: true,  // default: true
-  },
-});
 ```
 
 ---
@@ -1391,7 +1305,7 @@ interface TransportProvider {
   resolveAddressInfo?(address: string): Promise<PeerInfo | null>;
 
   // Identity binding (optional)
-  publishIdentityBinding?(chainPubkey: string, l1Address: string, directAddress: string, nametag?: string): Promise<boolean>;
+  publishIdentityBinding?(chainPubkey: string, directAddress: string, nametag?: string): Promise<boolean>;
 
   // Broadcast (optional)
   publishBroadcast?(content: string, tags?: string[]): Promise<string>;
@@ -1461,7 +1375,7 @@ sphere.on('nametag:registered', ({ nametag, addressIndex }) => { });
 sphere.on('nametag:recovered', ({ nametag }) => { });
 
 // Identity events
-sphere.on('identity:changed', ({ l1Address, directAddress, chainPubkey, nametag, addressIndex }) => { });
+sphere.on('identity:changed', ({ directAddress, chainPubkey, nametag, addressIndex }) => { });
 
 // Address tracking events
 sphere.on('address:activated', ({ address }) => { });  // New address tracked
@@ -1807,7 +1721,6 @@ The suite spans ~170 test files. Major areas:
 | `tests/unit/core` | Crypto (BIP39/BIP32), bech32, currency, encryption, Sphere lifecycle |
 | `tests/unit/token-engine` | v2 engine adapter: mint, transfer, split, verify, Unicity ID mint |
 | `tests/unit/modules` | PaymentsModule (v2 send/receive/mint/validate, spend queue, history), AccountingModule (full invoice lifecycle), Communications, GroupChat, Market |
-| `tests/unit/l1` | L1 addresses, transactions, vesting, history |
 | `tests/unit/serialization` | TXF format, wallet text/dat backups |
 | `tests/unit/transport` | Nostr P2P messaging, event timestamp persistence |
 | `tests/unit/validation` | Engine-based TokenValidator |
@@ -1825,7 +1738,6 @@ tests/
 │   ├── core/            # crypto, bech32, currency, encryption, Sphere.*
 │   ├── token-engine/    # v2 engine adapter + Unicity ID minter
 │   ├── modules/         # PaymentsModule.*, AccountingModule.*, Communications*, ...
-│   ├── l1/
 │   ├── price/
 │   ├── transport/
 │   ├── serialization/

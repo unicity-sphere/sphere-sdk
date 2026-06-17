@@ -25,8 +25,8 @@ const SAMPLE_CHAIN_CODE = 'b'.repeat(64);
 const PASSWORD = 'test-password-123';
 
 const SAMPLE_ADDRESSES = [
-  { index: 0, address: 'alpha1abc123', path: "m/84'/1'/0'/0/0" },
-  { index: 1, address: 'alpha1def456', path: "m/84'/1'/0'/0/1" },
+  { index: 0, address: '02abc123', path: "m/84'/1'/0'/0/0" },
+  { index: 1, address: '02def456', path: "m/84'/1'/0'/0/1" },
 ];
 
 // Sample unencrypted wallet text
@@ -47,8 +47,8 @@ ENCRYPTION STATUS: Not encrypted
 This key is in plaintext and not protected. Anyone with this file can access your wallet.
 
 YOUR ADDRESSES:
-Address 1: alpha1abc123 (Path: m/84'/1'/0'/0/0)
-Address 2: alpha1def456 (Path: m/84'/1'/0'/0/1)
+Address 1: 02abc123 (Path: m/84'/1'/0'/0/0)
+Address 2: 02def456 (Path: m/84'/1'/0'/0/1)
 
 Generated on: 1/27/2026, 12:00:00 PM
 
@@ -73,7 +73,7 @@ ENCRYPTION STATUS: Encrypted with password
 To use this key, you will need the password you set in the wallet.
 
 YOUR ADDRESSES:
-Address 1: alpha1abc123 (Path: m/84'/1'/0'/0/0)
+Address 1: 02abc123 (Path: m/84'/1'/0'/0/0)
 
 Generated on: 1/27/2026, 12:00:00 PM
 
@@ -93,7 +93,7 @@ ENCRYPTION STATUS: Not encrypted
 This key is in plaintext and not protected. Anyone with this file can access your wallet.
 
 YOUR ADDRESSES:
-Address 1: alpha1abc123 (Path: m/44'/0'/0')
+Address 1: 02abc123 (Path: m/44'/0'/0')
 
 Generated on: 1/27/2026, 12:00:00 PM
 
@@ -314,8 +314,8 @@ describe('serializeWalletToText()', () => {
   it('should include addresses', () => {
     const text = serializeWalletToText(params);
 
-    expect(text).toContain('alpha1abc123');
-    expect(text).toContain('alpha1def456');
+    expect(text).toContain('02abc123');
+    expect(text).toContain('02def456');
     expect(text).toContain("m/84'/1'/0'/0/0");
   });
 
@@ -323,7 +323,7 @@ describe('serializeWalletToText()', () => {
     const hmacParams: WalletTextExportParams = {
       masterPrivateKey: SAMPLE_MASTER_KEY,
       isBIP32: false,
-      addresses: [{ index: 0, address: 'alpha1test' }],
+      addresses: [{ index: 0, address: '02test' }],
     };
 
     const text = serializeWalletToText(hmacParams);
@@ -430,7 +430,7 @@ describe('Round-trip serialization', () => {
     const params: WalletTextExportParams = {
       masterPrivateKey: SAMPLE_MASTER_KEY,
       isBIP32: false,
-      addresses: [{ index: 0, address: 'alpha1test' }],
+      addresses: [{ index: 0, address: '02test' }],
     };
 
     const serialized = serializeWalletToText(params);

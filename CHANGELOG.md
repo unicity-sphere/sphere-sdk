@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- **BREAKING:** Removed the entire L1 (ALPHA blockchain) layer — `sphere.payments.l1`, the `L1` namespace, `L1Config`, `identity.l1Address`, the `sphere_l1GetBalance` / `sphere_l1GetHistory` Connect queries, the `l1_send` intent, and the `l1:read` / `l1:transfer` permission scopes. Wallets are now L3-only.
+
 ### Fixed — history disappears on reload (#549)
 
 - **History reload (#549, the HISTORY twin of #521):** in the wallet-api

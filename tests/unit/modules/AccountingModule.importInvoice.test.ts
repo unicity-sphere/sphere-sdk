@@ -378,7 +378,7 @@ describe('UT-IMPORT-009: Multi-target terms parsed correctly', () => {
         },
         {
           address: 'DIRECT://target_2',
-          assets: [{ coin: ['ALPHA', '500'] as [string, string] }],
+          assets: [{ coin: ['TUSD', '500'] as [string, string] }],
         },
       ],
     });

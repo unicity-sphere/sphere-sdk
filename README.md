@@ -1,11 +1,10 @@
 # Sphere SDK
 
-A modular TypeScript SDK for Unicity wallet operations supporting both Layer 1 (ALPHA blockchain) and Layer 3 (Unicity state transition network).
+A modular TypeScript SDK for Unicity wallet operations on Layer 3 (Unicity state transition network).
 
 ## Features
 
 - **Wallet Management** - BIP39/BIP32 key derivation, AES-256 encryption
-- **L1 Payments** - ALPHA blockchain transactions via Fulcrum WebSocket
 - **L3 Payments** - Token transfers via the v2 state-transition token engine, concurrent-send safety (SpendQueue)
 - **Invoicing / Accounting** - On-chain invoice lifecycle with payment attribution, auto-return, privacy-preserving hashed invoice IDs; invoices travel as v2 data-token blobs (hex strings) — `createInvoice()` returns the blob, `importInvoice()` accepts it
 - **Token Swaps** - P2P atomic swaps via escrow with DM-based negotiation protocol
@@ -99,12 +98,12 @@ console.log('Address 1:', addr1.address);
 
 The SDK ships network presets that configure all services automatically. `network` is **required** — there is no default:
 
-| Network | Aggregator (gateway) | Nostr Relay | Electrum (L1) |
-|---------|----------------------|-------------|---------------|
-| `testnet` | gateway.testnet2.unicity.network (v2) | nostr-relay.testnet.unicity.network | fulcrum.unicity.network |
-| `testnet2` | alias of `testnet` (same configuration) | nostr-relay.testnet.unicity.network | fulcrum.unicity.network |
-| `mainnet` | aggregator.unicity.network (v1-era) | relay.unicity.network (+ public relays) | fulcrum.unicity.network |
-| `dev` | dev-aggregator.dyndns.org (v1-era) | nostr-relay.testnet.unicity.network | fulcrum.unicity.network |
+| Network | Aggregator (gateway) | Nostr Relay |
+|---------|----------------------|-------------|
+| `testnet` | gateway.testnet2.unicity.network (v2) | nostr-relay.testnet.unicity.network |
+| `testnet2` | alias of `testnet` (same configuration) | nostr-relay.testnet.unicity.network |
+| `mainnet` | aggregator.unicity.network (v1-era) | relay.unicity.network (+ public relays) |
+| `dev` | dev-aggregator.dyndns.org (v1-era) | nostr-relay.testnet.unicity.network |
 
 > **v1 → v2 cutover:** `testnet` now points at **testnet2**, the v2 state-transition gateway network (network id 4, taken from the trust base; own testnet2 token registry). The old `goggregator-test` testnet spoke the removed v1 protocol and is gone. `mainnet` and `dev` still point at v1-era aggregators — wallet operations that move money (`send`, `mintFungibleToken`, invoices) **fail loudly** (`AGGREGATOR_ERROR`) on those networks until their gateways are cut over to the v2 protocol. The only supported transfer wire payload is the finished v2 token blob — incoming v1-era payloads are dropped with an explicit error log, so peers must run a >= 0.8 wallet to send to this wallet.
 
@@ -116,12 +115,6 @@ const providers = createBrowserProviders({ network: 'testnet' });
 const providers = createBrowserProviders({
   network: 'testnet',
   oracle: { url: 'https://custom-gateway.example.com' }, // custom v2 gateway
-});
-
-// L1 is enabled by default — customize if needed
-const providers = createBrowserProviders({
-  network: 'testnet',
-  l1: { enableVesting: true },  // uses network electrum URL automatically
 });
 ```
 
@@ -209,7 +202,7 @@ const currentIndex = sphere.getCurrentAddressIndex(); // 0
 
 // Switch to a different address
 await sphere.switchToAddress(1);
-console.log(sphere.identity?.l1Address); // alpha1... (address at index 1)
+console.log(sphere.identity?.directAddress); // DIRECT://... (address at index 1)
 
 // Register nametag for this address (independent per address)
 await sphere.registerNametag('bob');
@@ -231,13 +224,12 @@ console.log(addr2.address, addr2.publicKey);
 
 ### Identity Properties
 
-**Important:** L3 (DIRECT address) is the primary address for the Unicity network. L1 address is only used for ALPHA blockchain operations.
+**Important:** The L3 DIRECT address is the primary address for the Unicity network.
 
 ```typescript
 interface Identity {
   chainPubkey: string;         // 33-byte compressed secp256k1 public key (for L3 chain)
   directAddress?: string;      // L3 DIRECT address (DIRECT://...) - PRIMARY ADDRESS
-  l1Address: string;           // L1 address (alpha1...) - for ALPHA blockchain only
   ipnsName?: string;           // IPNS name for token sync
   nametag?: string;            // Registered nametag (@username)
 }
@@ -245,7 +237,6 @@ interface Identity {
 // Access identity - use directAddress as primary
 console.log(sphere.identity?.directAddress);    // DIRECT://0000be36... (PRIMARY)
 console.log(sphere.identity?.nametag);          // alice (human-readable)
-console.log(sphere.identity?.l1Address);        // alpha1qw3e... (L1 only)
 console.log(sphere.identity?.chainPubkey);      // 02abc123... (33-byte compressed)
 ```
 
@@ -255,7 +246,6 @@ console.log(sphere.identity?.chainPubkey);      // 02abc123... (33-byte compress
 // Listen for address switches
 sphere.on('identity:changed', (event) => {
   console.log('Switched to address index:', event.data.addressIndex);
-  console.log('L1 address:', event.data.l1Address);
   console.log('L3 address:', event.data.directAddress);
   console.log('Chain pubkey:', event.data.chainPubkey);
   console.log('Nametag:', event.data.nametag);
@@ -523,53 +513,6 @@ When `cacheMessages` is `false`:
 - `getConversation()` / `getConversations()` return empty results
 - Deduplication is skipped (duplicate relay deliveries may trigger duplicate events)
 
-## L1 (ALPHA Blockchain) Operations
-
-Access L1 payments through `sphere.payments.l1`:
-
-```typescript
-// L1 is enabled by default with lazy Fulcrum connection.
-// Connection to Fulcrum is deferred until first L1 operation.
-const { sphere } = await Sphere.init({
-  ...providers,
-  autoGenerate: true,
-  // L1 config is optional — defaults are applied automatically:
-  // electrumUrl: network-specific (default: wss://fulcrum.unicity.network:50004)
-  // defaultFeeRate: 10 sat/byte
-  // enableVesting: true
-});
-
-// To explicitly disable L1:
-// const { sphere } = await Sphere.init({ ...providers, l1: null });
-
-// Get L1 balance
-const balance = await sphere.payments.l1.getBalance();
-console.log('L1 Balance:', balance.total);
-console.log('Vested:', balance.vested);
-console.log('Unvested:', balance.unvested);
-
-// Get UTXOs
-const utxos = await sphere.payments.l1.getUtxos();
-console.log('UTXOs:', utxos.length);
-
-// Send L1 transaction
-const result = await sphere.payments.l1.send({
-  to: 'alpha1qxyz...',
-  amount: '100000',  // in satoshis
-  feeRate: 5,        // optional, sat/byte
-});
-
-if (result.success) {
-  console.log('TX Hash:', result.txHash);
-}
-
-// Get transaction history
-const history = await sphere.payments.l1.getHistory(10);
-
-// Estimate fee
-const { fee, feeRate } = await sphere.payments.l1.estimateFee('alpha1...', '50000');
-```
-
 ## Alternative: Manual Create/Load
 
 ```typescript
@@ -694,7 +637,7 @@ if (result.needsPassword) {
 
 if (result.success) {
   const sphere = result.sphere;
-  console.log('Imported wallet:', sphere.identity?.l1Address);
+  console.log('Imported wallet:', sphere.identity?.directAddress);
 }
 
 // Import from text backup file
@@ -721,9 +664,8 @@ import {
   // Crypto
   bytesToHex, hexToBytes,
   generateMnemonic, validateMnemonic,
-  sha256, ripemd160, hash160,
+  sha256,
   getPublicKey, createKeyPair,
-  deriveAddressInfo,
 
   // Currency conversion
   toSmallestUnit,    // "1.5" → 1500000000000000000n
@@ -765,7 +707,7 @@ console.log(txf.genesis.data.tokenId);
 // Build storage data for IPFS
 const storageData = await buildTxfStorageData(tokens, {
   version: 1,
-  address: 'alpha1...',
+  address: '02abc123...',  // chain pubkey
   ipnsName: 'k51...',
 });
 ```
@@ -783,7 +725,7 @@ A standalone `TokenValidator` also exists (`createTokenValidator(engine)`, expor
 
 ## Architecture
 
-**Single Identity Model**: L1 and L3 share the same secp256k1 key pair. One mnemonic = one wallet for both layers.
+**Single Identity Model**: A single secp256k1 key pair backs the L3 identity. One mnemonic = one wallet.
 
 ```
 mnemonic → master key → BIP32 derivation → identity
@@ -792,22 +734,20 @@ mnemonic → master key → BIP32 derivation → identity
                         │              shared keys                  │
                         │  privateKey:   "abc..."  (hex secp256k1)  │
                         │  chainPubkey:  "02def..." (33-byte comp.) │
-                        │  l1Address:    "alpha1..." (bech32)       │
                         │  directAddress: "DIRECT://..." (L3)       │
                         └─────────────────────┬─────────────────────┘
                                               ↓
-              ┌──────────────────┬──────────────────┬──────────────────┐
-              ↓                  ↓                  ↓                  ↓
-         L1 (ALPHA)        L3 (Unicity)        Group Chat           Nostr
-     sphere.payments.l1  sphere.payments    sphere.groupChat  sphere.communications
-      UTXOs, blockchain  Tokens, v2 engine   NIP-29 messaging    P2P messaging
+              ┌──────────────────┬──────────────────┐
+              ↓                  ↓                  ↓
+         L3 (Unicity)        Group Chat           Nostr
+       sphere.payments    sphere.groupChat  sphere.communications
+      Tokens, v2 engine   NIP-29 messaging    P2P messaging
 ```
 
 ```
 Sphere (main entry point)
 ├── identity       - Wallet identity (address, publicKey, nametag)
 ├── payments       - L3 token operations
-│   └── l1         - L1 ALPHA transactions (via sphere.payments.l1)
 ├── accounting     - Invoice lifecycle (via sphere.accounting)
 ├── swap           - P2P token swaps (via sphere.swap)
 ├── market         - Intent bulletin board (via sphere.market)
@@ -858,7 +798,6 @@ Both browser and Node.js implementations share common configuration interfaces a
 import type {
   BaseTransportConfig,  // Common transport options
   BaseOracleConfig,     // Common oracle options
-  L1Config,             // L1 configuration (same for all platforms)
   BaseProviders,        // Common result structure
 } from '@unicitylabs/sphere-sdk/impl/shared';
 
@@ -867,7 +806,6 @@ import {
   getNetworkConfig,        // Get mainnet/testnet/dev config
   resolveTransportConfig,  // Apply extend/override pattern for relays
   resolveOracleConfig,     // Resolve oracle URL with fallback
-  resolveL1Config,         // Resolve L1 with network defaults
   resolveArrayConfig,      // Generic array merge helper
 } from '@unicitylabs/sphere-sdk/impl/shared';
 ```
@@ -952,9 +890,6 @@ const providers = createNodeProviders({
     apiKey: 'my-api-key',
     trustBasePath: './trustbase.json',  // Node.js specific
   },
-  l1: {
-    enableVesting: true,
-  },
 });
 ```
 
@@ -994,7 +929,7 @@ The SDK uses an **extend/override pattern** for flexible configuration:
 | `additionalRelays` | **Adds** to default relays |
 | `gateways` | **Replaces** default IPFS gateways |
 | `additionalGateways` | **Adds** to default gateways |
-| `url`, `electrumUrl` | **Replaces** default URL (uses network default if not set) |
+| `url` | **Replaces** default URL (uses network default if not set) |
 
 ```typescript
 // Simple: use network preset
@@ -1043,11 +978,6 @@ const providers = createBrowserProviders({
     url: 'https://custom-aggregator.com',
     apiKey: 'secret',
     timeout: 60000,
-  },
-  l1: {
-    electrumUrl: 'wss://custom-fulcrum.com:50004',
-    defaultFeeRate: 5,
-    enableVesting: true,
   },
   tokenSync: {
     ipfs: {
@@ -1145,7 +1075,7 @@ class MyCustomStorageProvider implements TokenStorageProvider<TxfStorageDataBase
     // Load tokens from your storage
     return {
       success: true,
-      data: { _meta: { version: 1, address: this.identity?.l1Address ?? '', formatVersion: '2.0', updatedAt: Date.now() } },
+      data: { _meta: { version: 1, address: this.identity?.chainPubkey ?? '', formatVersion: '2.0', updatedAt: Date.now() } },
       source: 'remote',
       timestamp: Date.now(),
     };

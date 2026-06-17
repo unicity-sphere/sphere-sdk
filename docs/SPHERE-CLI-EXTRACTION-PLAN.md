@@ -438,7 +438,7 @@ protocols/
 - `Sphere.init` / `Sphere.load` / `Sphere.exists` (wallet lifecycle)
 - `sphere.identity.chainPubkey` / `sphere.identity.directAddress`
 - `sphere.communications.sendDM(recipient, content)` / `sphere.on('message:dm', ...)`
-- `sphere.payments.send(...)` / token registry / L1 crypto primitives
+- `sphere.payments.send(...)` / token registry / crypto primitives
 - All the existing sphere-sdk/cli/index.ts surface
 
 The SDK is already published and versioned. `sphere-cli` declares `"@unicitylabs/sphere-sdk": "^0.7.0"`. No breaking change required in the SDK.

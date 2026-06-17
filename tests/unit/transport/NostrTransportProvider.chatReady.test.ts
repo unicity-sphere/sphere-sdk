@@ -70,7 +70,6 @@ function createProvider() {
 const TEST_IDENTITY = {
   privateKey: '0000000000000000000000000000000000000000000000000000000000000001',
   chainPubkey: '0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798',
-  l1Address: 'alpha1test',
 };
 
 /** Find and invoke the onEndOfStoredEvents callback from the last chat subscription */

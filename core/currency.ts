@@ -65,8 +65,8 @@ export function toHumanReadable(amount: bigint | string, decimals: number = DEFA
  *
  * @example
  * ```ts
- * formatAmount(1500000000000000000n, { decimals: 18, symbol: 'ALPHA' })
- * // '1.5 ALPHA'
+ * formatAmount(1500000000000000000n, { decimals: 18, symbol: 'UCT' })
+ * // '1.5 UCT'
  * ```
  */
 export function formatAmount(

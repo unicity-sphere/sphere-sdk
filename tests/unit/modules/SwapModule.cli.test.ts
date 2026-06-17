@@ -53,7 +53,6 @@ function createMockSphere(swapModule: MockSwapModule) {
     identity: {
       chainPubkey: '02' + 'a'.repeat(64),
       directAddress: 'DIRECT://0000aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa1',
-      l1Address: 'alpha1partyaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
       nametag: 'alice',
       privateKey: 'a'.repeat(64),
     },

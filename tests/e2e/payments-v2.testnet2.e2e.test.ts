@@ -101,7 +101,7 @@ function mockOracle(): OracleProvider {
 function buildModule(engine: ITokenEngine, recipientChainPubkey: string) {
   const identity: FullIdentity = {
     chainPubkey: bytesToHex(engine.getIdentity().chainPubkey),
-    l1Address: 'alpha1x', directAddress: 'DIRECT://x',
+    directAddress: 'DIRECT://x',
     privateKey: '00', transportPubkey: 'dd'.repeat(32),
   };
   const tsp = new Map<string, TokenStorageProvider<TxfStorageDataBase>>();

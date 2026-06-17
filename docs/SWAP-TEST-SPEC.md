@@ -555,9 +555,8 @@ Validates that both `cancelled` and `failed` are valid targets from `proposed`, 
 | UT-SWAP-VAL-001 | `partyA = 'DIRECT://...'` | Accepted |
 | UT-SWAP-VAL-002 | `partyA = '@alice'` | Accepted (resolved) |
 | UT-SWAP-VAL-003 | `partyA = '02aaaa...'` | Accepted (chain pubkey) |
-| UT-SWAP-VAL-004 | `partyA = 'alpha1...'` | Accepted (L1 address) |
-| UT-SWAP-VAL-005 | `partyA = ''` | Rejected: SWAP_INVALID_DEAL |
-| UT-SWAP-VAL-006 | `partyA = null` | Rejected: SWAP_INVALID_DEAL |
+| UT-SWAP-VAL-004 | `partyA = ''` | Rejected: SWAP_INVALID_DEAL |
+| UT-SWAP-VAL-005 | `partyA = null` | Rejected: SWAP_INVALID_DEAL |
 
 #### Amount Format Validation
 

@@ -151,7 +151,6 @@ const mockQueryBindingByNametag = vi.fn().mockImplementation(async (nametagId: s
   return {
     transportPubkey: event.pubkey,
     publicKey: content.public_key || undefined,
-    l1Address: content.l1_address || undefined,
     directAddress: content.direct_address || undefined,
     proxyAddress: content.proxy_address || undefined,
     nametag: content.nametag || undefined,
@@ -194,7 +193,6 @@ type WebSocketFactory = import('../../../transport/websocket').WebSocketFactory;
 
 const TEST_PRIVATE_KEY = 'a'.repeat(64);
 const TEST_COMPRESSED_PUBKEY = '02' + 'b'.repeat(64); // 33-byte compressed
-const TEST_L1_ADDRESS = 'alpha1testaddress123';
 const TEST_DIRECT_ADDRESS = 'DIRECT://testdirectaddress';
 const TEST_NAMETAG = 'alice';
 
@@ -212,7 +210,6 @@ function createNametagEvent(options: {
   nametag: string;
   nostrPubkey: string;
   chainPubkey?: string;
-  l1Address?: string;
   directAddress?: string;
   encryptedNametag?: string;
   timestamp?: number;
@@ -222,9 +219,6 @@ function createNametagEvent(options: {
 
   if (options.chainPubkey) {
     content.public_key = options.chainPubkey;
-  }
-  if (options.l1Address) {
-    content.l1_address = options.l1Address;
   }
   if (options.directAddress) {
     content.direct_address = options.directAddress;
@@ -350,7 +344,6 @@ describe('NostrTransportProvider.resolveNametagInfo()', () => {
     provider.setIdentity({
       privateKey: TEST_PRIVATE_KEY,
       chainPubkey: TEST_COMPRESSED_PUBKEY,
-      l1Address: TEST_L1_ADDRESS,
     });
   });
 
@@ -362,7 +355,6 @@ describe('NostrTransportProvider.resolveNametagInfo()', () => {
       nametag: TEST_NAMETAG,
       nostrPubkey,
       chainPubkey: TEST_COMPRESSED_PUBKEY,
-      l1Address: TEST_L1_ADDRESS,
       directAddress: TEST_DIRECT_ADDRESS,
     });
 
@@ -375,7 +367,6 @@ describe('NostrTransportProvider.resolveNametagInfo()', () => {
     expect(info!.nametag).toBe(TEST_NAMETAG);
     expect(info!.transportPubkey).toBe(nostrPubkey);
     expect(info!.chainPubkey).toBe(TEST_COMPRESSED_PUBKEY);
-    expect(info!.l1Address).toBe(TEST_L1_ADDRESS);
     expect(info!.directAddress).toBe(TEST_DIRECT_ADDRESS);
     expect(info!.timestamp).toBeGreaterThan(0);
   });
@@ -409,10 +400,9 @@ describe('NostrTransportProvider.resolveNametagInfo()', () => {
     expect(info!.nametag).toBe('legacy');
     expect(info!.transportPubkey).toBe(nostrPubkey);
     expect(info!.chainPubkey).toBe('');
-    expect(info!.l1Address).toBe('');
   });
 
-  it('should handle event with content fields (pubkey and l1 in content)', async () => {
+  it('should parse chainPubkey from content and ignore a legacy l1_address field', async () => {
     const hashedNametag = hashNametag('tagged');
     const nostrPubkey = 'f'.repeat(64);
 
@@ -426,7 +416,8 @@ describe('NostrTransportProvider.resolveNametagInfo()', () => {
       ],
       content: JSON.stringify({
         public_key: TEST_COMPRESSED_PUBKEY,
-        l1_address: TEST_L1_ADDRESS,
+        // Legacy bindings may still carry l1_address — it must be ignored.
+        l1_address: 'legacy-address-123',
       }),
       sig: 'mocksig',
     };
@@ -438,7 +429,7 @@ describe('NostrTransportProvider.resolveNametagInfo()', () => {
 
     expect(info).not.toBeNull();
     expect(info!.chainPubkey).toBe(TEST_COMPRESSED_PUBKEY);
-    expect(info!.l1Address).toBe(TEST_L1_ADDRESS);
+    expect(info).not.toHaveProperty('l1Address');
   });
 });
 
@@ -461,7 +452,6 @@ describe('NostrTransportProvider.recoverNametag()', () => {
     provider.setIdentity({
       privateKey: TEST_PRIVATE_KEY,
       chainPubkey: TEST_COMPRESSED_PUBKEY,
-      l1Address: TEST_L1_ADDRESS,
     });
 
     nostrPubkey = provider.getNostrPubkey();
@@ -482,7 +472,6 @@ describe('NostrTransportProvider.recoverNametag()', () => {
       nametag: TEST_NAMETAG,
       nostrPubkey,
       chainPubkey: TEST_COMPRESSED_PUBKEY,
-      l1Address: TEST_L1_ADDRESS,
       encryptedNametag,
     });
 
@@ -505,7 +494,6 @@ describe('NostrTransportProvider.recoverNametag()', () => {
       nametag: TEST_NAMETAG,
       nostrPubkey,
       chainPubkey: TEST_COMPRESSED_PUBKEY,
-      l1Address: TEST_L1_ADDRESS,
     });
 
     storedQueryEvents.set(`author:${nostrPubkey}`, [event]);
@@ -523,7 +511,6 @@ describe('NostrTransportProvider.recoverNametag()', () => {
       nametag: TEST_NAMETAG,
       nostrPubkey,
       chainPubkey: TEST_COMPRESSED_PUBKEY,
-      l1Address: TEST_L1_ADDRESS,
       encryptedNametag: encryptedWithDifferentKey,
     });
 
@@ -593,7 +580,6 @@ describe('NostrTransportProvider.publishIdentityBinding() with nametag', () => {
     provider.setIdentity({
       privateKey: TEST_PRIVATE_KEY,
       chainPubkey: TEST_COMPRESSED_PUBKEY,
-      l1Address: TEST_L1_ADDRESS,
       directAddress: TEST_DIRECT_ADDRESS,
     });
   });
@@ -602,7 +588,7 @@ describe('NostrTransportProvider.publishIdentityBinding() with nametag', () => {
     await provider.connect();
 
     const success = await provider.publishIdentityBinding(
-      TEST_COMPRESSED_PUBKEY, TEST_L1_ADDRESS, TEST_DIRECT_ADDRESS, TEST_NAMETAG,
+      TEST_COMPRESSED_PUBKEY, TEST_DIRECT_ADDRESS, TEST_NAMETAG,
     );
 
     expect(success).toBe(true);
@@ -614,7 +600,6 @@ describe('NostrTransportProvider.publishIdentityBinding() with nametag', () => {
       expect.any(String),
       expect.objectContaining({
         publicKey: TEST_COMPRESSED_PUBKEY,
-        l1Address: TEST_L1_ADDRESS,
         directAddress: TEST_DIRECT_ADDRESS,
       }),
     );
@@ -624,7 +609,7 @@ describe('NostrTransportProvider.publishIdentityBinding() with nametag', () => {
     await provider.connect();
 
     const success = await provider.publishIdentityBinding(
-      TEST_COMPRESSED_PUBKEY, TEST_L1_ADDRESS, TEST_DIRECT_ADDRESS,
+      TEST_COMPRESSED_PUBKEY, TEST_DIRECT_ADDRESS,
     );
 
     expect(success).toBe(true);
@@ -634,7 +619,6 @@ describe('NostrTransportProvider.publishIdentityBinding() with nametag', () => {
     expect(clientInstance.publishIdentityBinding).toHaveBeenCalledWith(
       expect.objectContaining({
         publicKey: TEST_COMPRESSED_PUBKEY,
-        l1Address: TEST_L1_ADDRESS,
         directAddress: TEST_DIRECT_ADDRESS,
       }),
     );

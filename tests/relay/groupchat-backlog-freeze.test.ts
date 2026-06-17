@@ -156,7 +156,6 @@ describe('GroupChatModule — global-chat backlog freeze', () => {
       const identity: FullIdentity = {
         privateKey: TEST_PRIVATE_KEY,
         chainPubkey: '02' + getXOnlyPubkey(TEST_PRIVATE_KEY),
-        l1Address: 'alpha1testdummy',
       };
 
       const events: Array<{ type: string; data: unknown }> = [];

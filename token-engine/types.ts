@@ -30,7 +30,7 @@ export type SphereNetwork = 'mainnet' | 'testnet' | 'local';
 
 /**
  * Coin identifier. Canonical form is the lowercase hex of the v2 AssetId;
- * human symbols (e.g. "ALPHA") are resolved to hex via the registry before use.
+ * human symbols (e.g. "UCT") are resolved to hex via the registry before use.
  */
 export type CoinId = string;
 

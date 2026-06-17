@@ -49,7 +49,6 @@ function createIdentity(directAddress: string): FullIdentity {
   return {
     privateKey: '0'.repeat(64),
     chainPubkey: '02' + Buffer.from(directAddress).toString('hex').padEnd(64, '0').slice(0, 64),
-    l1Address: 'alpha1testaddr',
     directAddress,
     nametag: 'testuser',
   } as unknown as FullIdentity;
@@ -59,7 +58,7 @@ function createTxfData(tokenIds: string[]): TxfStorageDataBase {
   const data: TxfStorageDataBase = {
     _meta: {
       version: 1,
-      address: 'alpha1test',
+      address: 'addr-test',
       formatVersion: '2.0',
       updatedAt: Date.now(),
     },

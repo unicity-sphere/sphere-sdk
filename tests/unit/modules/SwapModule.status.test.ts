@@ -102,7 +102,7 @@ describe('SwapModule — getSwapStatus / getSwaps', () => {
       deal: {
         partyA: 'DIRECT://0000aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa1',
         partyB: 'DIRECT://0000bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb2',
-        partyACurrency: 'ALPHA',
+        partyACurrency: 'TUSD',
         partyAAmount: '2000000',
         partyBCurrency: 'USDU',
         partyBAmount: '1000000',
@@ -143,7 +143,7 @@ describe('SwapModule — getSwapStatus / getSwaps', () => {
       deal: {
         partyA: 'DIRECT://0000aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa1',
         partyB: 'DIRECT://0000bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb2',
-        partyACurrency: 'ALPHA',
+        partyACurrency: 'TUSD',
         partyAAmount: '2000000',
         partyBCurrency: 'USDU',
         partyBAmount: '1000000',
@@ -185,7 +185,7 @@ describe('SwapModule — getSwapStatus / getSwaps', () => {
       deal: {
         partyA: 'DIRECT://0000aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa1',
         partyB: 'DIRECT://0000bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb2',
-        partyACurrency: 'ALPHA',
+        partyACurrency: 'TUSD',
         partyAAmount: '2000000',
         partyBCurrency: 'USDU',
         partyBAmount: '1000000',
@@ -212,7 +212,7 @@ describe('SwapModule — getSwapStatus / getSwaps', () => {
       deal: {
         partyA: 'DIRECT://0000aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa1',
         partyB: 'DIRECT://0000bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb2',
-        partyACurrency: 'ALPHA',
+        partyACurrency: 'TUSD',
         partyAAmount: '2000000',
         partyBCurrency: 'USDU',
         partyBAmount: '1000000',

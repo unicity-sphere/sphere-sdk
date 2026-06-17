@@ -108,7 +108,6 @@ Because balances reset (D1), **this section is the real work.** The wallet's ide
 |-------|--------------|--------------------|----------------|
 | **`chainPubkey`** (33-byte secp256k1) | mnemonic → BIP32 → `getPublicKey` (`elliptic`) | **No** | **No — PROVEN** |
 | **Nostr `npub`** (= `chainPubkey.slice(2)`) | same key, via `nostr-js-sdk` | No | No |
-| **L1 `alpha1…` address** | bech32(hash160(pubkey)) | No | No |
 | **Private key / signing** | BIP32 | No | No |
 | **L3 `DIRECT://` address** | `UnmaskedPredicateReference(...).toAddress()` (v1 SDK) | **Yes** | **Yes** (different predicate encoding) |
 
@@ -147,15 +146,15 @@ Since `directAddress` changes under naive v2, a naive migration makes existing u
   - Bonus: identity becomes `chainPubkey` everywhere; but **the Nostr binding check stays** (anti-bot, D6).
 
 ### 4.3 Nostr identity binding — extend, don't break
-Today: `publishIdentityBinding(chainPubkey, l1Address, directAddress, nametag?)`.
+Today: `publishIdentityBinding(chainPubkey, directAddress, nametag?)`.
 
 - **Anti-bot gate (D6) — keep.** The binding resolution at login filters bots (no binding → no access). The migration must NOT drop it. *Verified: the gate is `auth.service.verifyAndIssueJwt` → `resolveStrict(chainPubkey)` against the Nostr `kind:30078` binding, rejecting only on a missing `directAddress` (`NO_IDENTITY_BINDING`); `nametag` is an optional, never-on-chain-verified field. So keeping the binding (Path A binds `directAddress`) keeps the gate intact — no nametag token involved.*
 - **Do NOT publish `receivePredicate` in the binding — it's redundant.** `receivePredicate = SignaturePredicate(chainPubkey)` is a *pure function of `chainPubkey`*, which is already the binding key. Any sender derives it itself. The engine builds it on the fly at send time (`deriveReceivePredicate`). The binding stays minimal:
   ```
-  chainPubkey → { l1Address, nametag, directAddress? }
+  chainPubkey → { nametag, directAddress? }
   ```
   (Only publish a predicate explicitly **if** the receive predicate ever stops being pubkey-only — e.g. a `UnicityIdPredicate` or a scheme with extra params. Not the case under D5.)
-- **New users (SDK+Nostr level):** bind `chainPubkey + l1 + nametag`; **Path A** also binds `directAddress` (identity), **Path B** omits it.
+- **New users (SDK+Nostr level):** bind `chainPubkey + nametag`; **Path A** also binds `directAddress` (identity), **Path B** omits it.
 - **`getAddressId()` storage namespacing:** re-base on `chainPubkey` (not `directAddress`) so it's stable regardless of A/B.
 
 ### 4.4 Nametag / Unicity ID = transport-resolved name, no on-chain token (D5) — ✅ CONFIRMED

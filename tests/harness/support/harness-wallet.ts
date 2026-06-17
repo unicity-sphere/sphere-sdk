@@ -53,7 +53,6 @@ export function fullIdentity(id: { privateKey: string; chainPubkey: string }): F
   return {
     chainPubkey: id.chainPubkey,
     privateKey: id.privateKey,
-    l1Address: `alpha1${id.chainPubkey.slice(0, 8)}`,
     directAddress: `DIRECT://${id.chainPubkey.slice(0, 12)}`,
   };
 }

@@ -174,7 +174,6 @@ export interface DAppMetadata {
 
 export interface PublicIdentity {
   readonly chainPubkey: string;
-  readonly l1Address: string;
   readonly directAddress?: string;
   readonly nametag?: string;
 }

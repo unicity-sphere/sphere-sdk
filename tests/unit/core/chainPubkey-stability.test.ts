@@ -1,8 +1,8 @@
 /**
  * chainPubkey stability cross-check (D9, merge-gate item #7).
  *
- * `chainPubkey` is the wallet's identity anchor (Nostr npub, L1 address, and the L3
- * recipient predicate all hang off it). The v1→v2 migration must NOT change it. sphere
+ * `chainPubkey` is the wallet's identity anchor (Nostr npub and the L3
+ * recipient predicate both hang off it). The v1→v2 migration must NOT change it. sphere
  * derives it with `elliptic` (core/crypto); the v2 state-transition SDK derives signing
  * keys with `@noble/curves`. This test locks that, for a fixed private key, both produce
  * the BYTE-IDENTICAL 33-byte compressed secp256k1 public key — so chainPubkey is stable

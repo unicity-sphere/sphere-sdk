@@ -204,9 +204,8 @@ type WebSocketFactory = import('../../transport/websocket').WebSocketFactory;
 const TEST_IDENTITY = {
   privateKey: 'a'.repeat(64),
   publicKey: 'b'.repeat(64), // This is NOT used by publishIdentityBinding
-  address: 'alpha1testaddress',
+  address: 'addr-testaddress',
   chainPubkey: '02' + 'b'.repeat(64),
-  l1Address: 'alpha1testaddress',
   directAddress: 'DIRECT://testdirectaddress',
   ipnsName: '12D3KooWtest',
   nametag: undefined,
@@ -244,7 +243,6 @@ describe('Nametag roundtrip integration', () => {
 
     const result = await provider.publishIdentityBinding(
       TEST_IDENTITY.chainPubkey,
-      TEST_IDENTITY.l1Address,
       TEST_IDENTITY.directAddress!,
       nametag,
     );
@@ -256,7 +254,6 @@ describe('Nametag roundtrip integration', () => {
       expect.any(String),
       expect.objectContaining({
         publicKey: TEST_IDENTITY.chainPubkey,
-        l1Address: TEST_IDENTITY.l1Address,
         directAddress: TEST_IDENTITY.directAddress,
       }),
     );
@@ -272,7 +269,6 @@ describe('Nametag roundtrip integration', () => {
     // Publish first
     await provider.publishIdentityBinding(
       TEST_IDENTITY.chainPubkey,
-      TEST_IDENTITY.l1Address,
       TEST_IDENTITY.directAddress!,
       nametag,
     );
@@ -300,7 +296,6 @@ describe('Nametag roundtrip integration', () => {
     // Publish first time
     const result1 = await provider.publishIdentityBinding(
       TEST_IDENTITY.chainPubkey,
-      TEST_IDENTITY.l1Address,
       TEST_IDENTITY.directAddress!,
       nametag,
     );
@@ -309,7 +304,6 @@ describe('Nametag roundtrip integration', () => {
     // Publish second time — should succeed (same pubkey)
     const result2 = await provider.publishIdentityBinding(
       TEST_IDENTITY.chainPubkey,
-      TEST_IDENTITY.l1Address,
       TEST_IDENTITY.directAddress!,
       nametag,
     );
@@ -347,7 +341,6 @@ describe('Nametag roundtrip integration', () => {
     // Try to publish with our identity — should fail
     const result = await provider.publishIdentityBinding(
       TEST_IDENTITY.chainPubkey,
-      TEST_IDENTITY.l1Address,
       TEST_IDENTITY.directAddress!,
       nametag,
     );
@@ -363,7 +356,6 @@ describe('Nametag roundtrip integration', () => {
 
     await provider.publishIdentityBinding(
       TEST_IDENTITY.chainPubkey,
-      TEST_IDENTITY.l1Address,
       TEST_IDENTITY.directAddress!,
       nametag,
     );

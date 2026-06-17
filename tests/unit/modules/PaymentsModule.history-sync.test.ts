@@ -156,7 +156,6 @@ function createMockDeps() {
 
   const mockIdentity: FullIdentity = {
     chainPubkey: '02' + 'a'.repeat(64),
-    l1Address: 'alpha1testaddress',
     directAddress: 'DIRECT://testaddress',
     privateKey: '0x' + 'b'.repeat(64),
   };
@@ -262,7 +261,7 @@ describe('PaymentsModule History Sync', () => {
       loadFn.mockResolvedValue({
         success: true,
         data: {
-          _meta: { version: 1, address: 'alpha1testaddress', ipnsName: '', formatVersion: '2.0' },
+          _meta: { version: 1, address: '02' + 'a'.repeat(64), ipnsName: '', formatVersion: '2.0' },
           _history: remoteHistory,
         },
         source: 'remote',
@@ -283,7 +282,7 @@ describe('PaymentsModule History Sync', () => {
       loadFn.mockResolvedValue({
         success: true,
         data: {
-          _meta: { version: 1, address: 'alpha1testaddress', ipnsName: '', formatVersion: '2.0' },
+          _meta: { version: 1, address: '02' + 'a'.repeat(64), ipnsName: '', formatVersion: '2.0' },
         },
         source: 'remote',
         timestamp: Date.now(),
@@ -308,7 +307,7 @@ describe('PaymentsModule History Sync', () => {
       syncFn.mockResolvedValue({
         success: true,
         merged: {
-          _meta: { version: 2, address: 'alpha1testaddress', ipnsName: '', formatVersion: '2.0' },
+          _meta: { version: 2, address: '02' + 'a'.repeat(64), ipnsName: '', formatVersion: '2.0' },
           _history: mergedHistory,
         },
         added: 1,
@@ -342,7 +341,7 @@ describe('PaymentsModule History Sync', () => {
       syncFn.mockResolvedValue({
         success: true,
         merged: {
-          _meta: { version: 2, address: 'alpha1testaddress', ipnsName: '', formatVersion: '2.0' },
+          _meta: { version: 2, address: '02' + 'a'.repeat(64), ipnsName: '', formatVersion: '2.0' },
           _history: mergedHistory,
         },
         added: 1,
@@ -365,7 +364,7 @@ describe('PaymentsModule History Sync', () => {
       syncFn.mockResolvedValue({
         success: true,
         merged: {
-          _meta: { version: 2, address: 'alpha1testaddress', ipnsName: '', formatVersion: '2.0' },
+          _meta: { version: 2, address: '02' + 'a'.repeat(64), ipnsName: '', formatVersion: '2.0' },
         },
         added: 0,
         removed: 0,
@@ -391,7 +390,7 @@ describe('PaymentsModule History Sync', () => {
       loadFn.mockResolvedValue({
         success: true,
         data: {
-          _meta: { version: 1, address: 'alpha1testaddress', ipnsName: '', formatVersion: '2.0' },
+          _meta: { version: 1, address: '02' + 'a'.repeat(64), ipnsName: '', formatVersion: '2.0' },
           _history: entries,
         },
         source: 'remote',
@@ -413,7 +412,7 @@ describe('PaymentsModule History Sync', () => {
       loadFn.mockResolvedValue({
         success: true,
         data: {
-          _meta: { version: 1, address: 'alpha1testaddress', ipnsName: '', formatVersion: '2.0' },
+          _meta: { version: 1, address: '02' + 'a'.repeat(64), ipnsName: '', formatVersion: '2.0' },
           _history: entries,
         },
         source: 'remote',

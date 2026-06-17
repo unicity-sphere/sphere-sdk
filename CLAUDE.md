@@ -82,7 +82,6 @@ if (created && generatedMnemonic) {
 // 3. Identity is ready
 const identity = sphere.identity!;
 console.log('L3 address:', identity.directAddress);  // DIRECT://... (primary)
-console.log('L1 address:', identity.l1Address);      // alpha1...
 console.log('Unicity ID:', identity.nametag);        // alice
 
 // 4. Check tokens and balance
@@ -99,7 +98,7 @@ const filtered = sphere.payments.getTokens({ coinId: '...' }); // filter by coin
 // 5. Send tokens (L3) — v2 engine path. Requires the token engine (v2 oracle
 //    config) and a recipient with a PUBLISHED chain pubkey; fails loudly otherwise.
 const result = await sphere.payments.send({
-  recipient: '@bob',           // @nametag, DIRECT://..., chain pubkey (02...), or alpha1...
+  recipient: '@bob',           // @nametag, DIRECT://..., or chain pubkey (02...)
   amount: '1000000',           // in smallest unit (string)
   coinId: 'UCT',               // coin ID (64-hex canonical; short symbols resolved via registry)
   memo: 'Payment for coffee',  // optional
@@ -122,14 +121,6 @@ sphere.on('transfer:incoming', (transfer) => {
 const mint = await sphere.payments.mintFungibleToken(coinIdHex, 1000000n);
 // { success: true, token, tokenId } | { success: false, error }
 
-// 8. L1 operations (enabled by default, lazy Fulcrum connection)
-const l1Balance = await sphere.payments.l1!.getBalance();
-// { confirmed, unconfirmed, vested, unvested, total } — all strings in satoshis
-
-const l1Result = await sphere.payments.l1!.send({
-  to: 'alpha1...', amount: '100000', feeRate: 5,
-});
-
 // 9. Sync with remote storage (IPFS etc.)
 const syncResult = await sphere.payments.sync(); // { added, removed }
 
@@ -138,7 +129,7 @@ const history = sphere.payments.getHistory(); // TransactionHistoryEntry[]
 
 // 11. Peer resolution (Unicity ID → addresses)
 const peer = await sphere.resolve('@bob');
-// PeerInfo | null: { nametag?, transportPubkey, chainPubkey, l1Address, directAddress, timestamp }
+// PeerInfo | null: { nametag?, transportPubkey, chainPubkey, directAddress, timestamp }
 
 // 12. Multi-address
 await sphere.switchToAddress(1);
@@ -191,11 +182,11 @@ Typed RPC layer for dApp ↔ wallet communication. Full guide: [`docs/CONNECT.md
 
 **Transports:** `PostMessageTransport` (iframe/popup), `ExtensionTransport` (browser extension), `WebSocketTransport` (Node.js).
 
-**Queries (18):** `sphere_getIdentity`, `sphere_getBalance`, `sphere_getAssets`, `sphere_getFiatBalance`, `sphere_getTokens`, `sphere_getHistory`, `sphere_l1GetBalance`, `sphere_l1GetHistory`, `sphere_resolve`, `sphere_subscribe`, `sphere_unsubscribe`, `sphere_disconnect`, `sphere_getConversations`, `sphere_getMessages`, `sphere_getDMUnreadCount`, `sphere_markAsRead`, `sphere_getInvoices`, `sphere_getInvoiceStatus`.
+**Queries (16):** `sphere_getIdentity`, `sphere_getBalance`, `sphere_getAssets`, `sphere_getFiatBalance`, `sphere_getTokens`, `sphere_getHistory`, `sphere_resolve`, `sphere_subscribe`, `sphere_unsubscribe`, `sphere_disconnect`, `sphere_getConversations`, `sphere_getMessages`, `sphere_getDMUnreadCount`, `sphere_markAsRead`, `sphere_getInvoices`, `sphere_getInvoiceStatus`.
 
-**Intents (15):** `send`, `l1_send`, `dm`, `payment_request`, `receive`, `sign_message`, `create_invoice`, `close_invoice`, `cancel_invoice`, `pay_invoice`, `return_invoice_payment`, `import_invoice`, `send_invoice_receipts`, `send_cancellation_notices`, `set_auto_return`.
+**Intents (14):** `send`, `dm`, `payment_request`, `receive`, `sign_message`, `create_invoice`, `close_invoice`, `cancel_invoice`, `pay_invoice`, `return_invoice_payment`, `import_invoice`, `send_invoice_receipts`, `send_cancellation_notices`, `set_auto_return`.
 
-**Permission scopes (16):** `identity:read`, `balance:read`, `tokens:read`, `history:read`, `l1:read`, `events:subscribe`, `resolve:peer`, `transfer:request`, `l1:transfer`, `dm:request`, `dm:read`, `dm:manage`, `payment:request`, `sign:request`, `invoice:read`, `invoice:write`.
+**Permission scopes (14):** `identity:read`, `balance:read`, `tokens:read`, `history:read`, `events:subscribe`, `resolve:peer`, `transfer:request`, `dm:request`, `dm:read`, `dm:manage`, `payment:request`, `sign:request`, `invoice:read`, `invoice:write`.
 
 **Silent mode:** `new ConnectClient({ ..., silent: true })` — fast-check approved list without UI popup.
 
@@ -211,8 +202,6 @@ Typed RPC layer for dApp ↔ wallet communication. Full guide: [`docs/CONNECT.md
 | Token Storage | IndexedDB per-address | File-based per-address |
 | Transport (Nostr) | Native WebSocket | `ws` package (install separately) |
 | Oracle (network config) | Embedded trust base per network; API key injected via `oracle.apiKey` | Same (+ optional `trustBasePath` file) |
-| L1 (ALPHA blockchain) | Enabled, lazy Fulcrum connect | Enabled, lazy Fulcrum connect |
-| L1 Vesting Cache | IndexedDB (`SphereVestingCacheV5`) | Memory-only (no persistence) |
 | Price (CoinGecko) | Optional (`price` config) | Optional (`price` config) |
 | Token Registry | Remote fetch + persistent cache | Remote fetch + file cache |
 | IPFS sync | Opt-in (`tokenSync.ipfs.enabled`) | Opt-in |
@@ -235,9 +224,6 @@ Typed RPC layer for dApp ↔ wallet communication. Full guide: [`docs/CONNECT.md
 | `sphere.payments.sync()` | `{ added, removed }` | Sync with remote storage |
 | `sphere.payments.validate()` | `{ valid, invalid }` | Verify tokens (engine for v2 blobs, legacy RPC for v1 TXF) |
 | `sphere.payments.getHistory()` | `TransactionHistoryEntry[]` | Transaction history |
-| `sphere.payments.l1.getBalance()` | `L1Balance` | L1 balance (strings in sats) |
-| `sphere.payments.l1.send(request)` | `L1SendResult` | Send L1 transaction |
-| `sphere.payments.l1.getHistory(limit?)` | `L1Transaction[]` | L1 tx history |
 | `sphere.resolve(identifier)` | `PeerInfo \| null` | Resolve @nametag/address/pubkey |
 | `sphere.communications.resolvePeerNametag(pubkey)` | `string \| undefined` | Resolve peer Unicity ID via transport |
 | `sphere.registerNametag(name)` | `void` | Register Unicity ID (Nostr binding + best-effort v2 token mint) |
@@ -266,7 +252,7 @@ nullable getters — `null` unless the module was enabled in init options.
 | `transfer:incoming` | `IncomingTransfer` (`{ senderPubkey, senderNametag?, tokens, receivedAt }`) | Received tokens via Nostr |
 | `transfer:confirmed` | `TransferResult` | Outgoing transfer confirmed |
 | `transfer:failed` | `TransferResult` | Outgoing transfer failed |
-| `identity:changed` | `{ l1Address, directAddress?, chainPubkey, nametag?, addressIndex }` | Address switch |
+| `identity:changed` | `{ directAddress?, chainPubkey, nametag?, addressIndex }` | Address switch |
 | `nametag:registered` | `{ nametag, addressIndex }` | Unicity ID registered |
 | `nametag:recovered` | `{ nametag }` | Unicity ID recovered from Nostr on import |
 | `address:activated` | `{ address: TrackedAddress }` | New address tracked |
@@ -290,8 +276,7 @@ See [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) and [QUICKSTART-NODEJS.m
 ## Project Overview
 
 **Sphere SDK** (`@unicitylabs/sphere-sdk`) is a modular TypeScript SDK for Unicity wallet operations supporting:
-- **L1 (ALPHA blockchain)** - UTXO-based blockchain transactions via Electrum (Fulcrum)
-- **L3 (Unicity state transition network)** - Token transfers via the **v2 state-transition SDK**, consumed exclusively through the `token-engine/` port
+- **L3 (Unicity state transition network)** - Token transfers via the **v2 state-transition SDK**, consumed exclusively through the `token-engine/` port. Wallets are L3-only.
 
 **Version:** `0.9.1-dev.#` line — see `package.json` for the exact current version (post v1-cutover; see CHANGELOG `[Unreleased]`)
 **License:** MIT
@@ -335,7 +320,6 @@ sphere-sdk/
 ├── modules/                 # Feature modules
 │   ├── payments/
 │   │   ├── PaymentsModule.ts      # L3 token operations (~139KB)
-│   │   ├── L1PaymentsModule.ts    # ALPHA blockchain operations
 │   │   ├── SpendQueue.ts          # Concurrent-send queueing (waits for change tokens)
 │   │   ├── TokenSplitCalculator.ts # Split planning
 │   │   └── TokenReservationLedger.ts # Token reservations for concurrent sends
@@ -366,7 +350,6 @@ sphere-sdk/
 ├── validation/              # TokenValidator
 ├── serialization/           # TXF + legacy wallet file parsing (.txt / .dat)
 ├── connect/                 # Sphere Connect protocol (client/, host/, protocol, permissions)
-├── l1/                      # ALPHA blockchain utilities (address, tx, vesting, ...)
 ├── assets/                  # Embedded trust bases per network (trustbase.ts)
 │
 ├── impl/                    # Platform-specific implementations
@@ -406,14 +389,13 @@ The canonical package name resolves to the **v2 SDK, pinned `2.0.0-rc.68bc1e5`**
   invoice errors) when the oracle does not supply a v2 trust base + gateway URL.
 
 ### Single Identity Model
-L1 and L3 share the same secp256k1 key pair:
+A single secp256k1 key pair backs the L3 identity:
 
 ```
 mnemonic → master key → BIP32 derivation → identity
                                               ↓
                         ┌─────────────────────┴─────────────────────┐
                         │  chainPubkey:   33-byte compressed pubkey │
-                        │  l1Address:     alpha1... (bech32)        │
                         │  directAddress: DIRECT://... (L3)         │
                         │  transportPubkey: derived for Nostr       │
                         └─────────────────────────────────────────────┘
@@ -429,7 +411,6 @@ on it.
 ```typescript
 interface Identity {
   chainPubkey: string;      // 33-byte compressed secp256k1 (for L3)
-  l1Address: string;        // L1 bech32 address (alpha1...)
   directAddress?: string;   // L3 DIRECT address
   ipnsName?: string;        // IPFS/IPNS identifier
   nametag?: string;         // Unicity ID (@username)
@@ -440,7 +421,7 @@ interface FullIdentity extends Identity {
 }
 
 interface TransferRequest {
-  recipient: string;        // @nametag, DIRECT://..., chain pubkey, alpha1...
+  recipient: string;        // @nametag, DIRECT://..., chain pubkey
   amount: string;           // Amount in smallest unit
   coinId: string;           // Coin ID (64-hex canonical; short symbols resolved via registry)
   memo?: string;            // Optional message
@@ -499,7 +480,7 @@ Custom `OracleProvider` implementations MUST provide the three config accessors.
 | `dev` | `dev-aggregator.dyndns.org/rpc` | v1-era aggregator — wallet operations fail loudly (`AGGREGATOR_ERROR`) until cut over |
 
 All networks share Nostr relays (`nostr-relay.testnet.unicity.network` for test
-nets), IPFS gateways, Fulcrum electrum and group relays per `NETWORKS`.
+nets), IPFS gateways and group relays per `NETWORKS`.
 `assertNetworkConsistency()` (impl/shared/network.ts) refuses provably-broken
 networks at provider creation (null or networkId-mismatched trust base).
 
@@ -624,15 +605,9 @@ authoritative for build success.
 - State machine: `proposed -> accepted -> announced -> depositing -> concluding
   -> completed` (or `cancelled`/`failed`).
 
-### L1 Payments (Enabled by Default)
-- L1 module (`sphere.payments.l1`) is created automatically; Fulcrum WebSocket
-  connection is **lazy** — deferred until first L1 operation.
-- Set `l1: null` in init options to disable L1 entirely.
-- **Vesting cache:** IndexedDB (`SphereVestingCacheV5`) in browser; memory-only in Node.js.
-
 ### Peer Resolution
 - `sphere.resolve(identifier)` — unified lookup via transport.
-- Accepts: `@nametag`, `DIRECT://...`, `alpha1...`, chain pubkey (`02`/`03`),
+- Accepts: `@nametag`, `DIRECT://...`, chain pubkey (`02`/`03`),
   transport pubkey (64-hex). Returns `PeerInfo` or `null`.
 - Identity binding event published on init/load — wallet discoverable without a Unicity ID.
 
@@ -660,7 +635,6 @@ authoritative for build success.
 |----------|----------|---------|
 | `sphere-storage` | `IndexedDBStorageProvider` | Wallet keys, per-address data |
 | `sphere-token-storage-*` | `IndexedDBTokenStorageProvider` | Token data per address |
-| `SphereVestingCacheV5` | `VestingClassifier` | L1 UTXO→coinbase tracing cache |
 
 `Sphere.clear({ storage, tokenStorage })` deletes all of them.
 

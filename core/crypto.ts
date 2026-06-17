@@ -8,7 +8,6 @@
 import * as bip39 from 'bip39';
 import CryptoJS from 'crypto-js';
 import elliptic from 'elliptic';
-import { encodeBech32 } from './bech32';
 import { SphereError } from './errors';
 
 // =============================================================================
@@ -45,7 +44,6 @@ export interface KeyPair {
 }
 
 export interface AddressInfo extends KeyPair {
-  address: string;
   path: string;
   index: number;
 }
@@ -297,49 +295,6 @@ export function doubleSha256(data: string, inputEncoding: 'hex' | 'utf8' = 'hex'
   return sha256(first, 'hex');
 }
 
-/**
- * Alias for hash160 (L1 SDK compatibility)
- */
-export const computeHash160 = hash160;
-
-/**
- * Convert hex string to Uint8Array for witness program
- */
-export function hash160ToBytes(hash160Hex: string): Uint8Array {
-  const matches = hash160Hex.match(/../g);
-  if (!matches) return new Uint8Array(0);
-  return Uint8Array.from(matches.map((x) => parseInt(x, 16)));
-}
-
-/**
- * Generate bech32 address from public key
- * @param publicKey - Compressed public key as hex string
- * @param prefix - Address prefix (default: "alpha")
- * @param witnessVersion - Witness version (default: 0 for P2WPKH)
- * @returns Bech32 encoded address
- */
-export function publicKeyToAddress(
-  publicKey: string,
-  prefix: string = 'alpha',
-  witnessVersion: number = 0
-): string {
-  const pubKeyHash = hash160(publicKey);
-  const programBytes = hash160ToBytes(pubKeyHash);
-  return encodeBech32(prefix, witnessVersion, programBytes);
-}
-
-/**
- * Get address info from private key
- */
-export function privateKeyToAddressInfo(
-  privateKey: string,
-  prefix: string = 'alpha'
-): { address: string; publicKey: string } {
-  const publicKey = getPublicKey(privateKey);
-  const address = publicKeyToAddress(publicKey, prefix);
-  return { address, publicKey };
-}
-
 // =============================================================================
 // Utility Functions
 // =============================================================================
@@ -406,63 +361,56 @@ export function identityFromMnemonicSync(
 }
 
 /**
- * Derive address info at a specific path
+ * Derive key info at a specific path
  * @param masterKey - Master key with privateKey and chainCode
  * @param basePath - Base derivation path (e.g., "m/44'/0'/0'")
  * @param index - Address index
  * @param isChange - Whether this is a change address (chain 1 vs 0)
- * @param prefix - Address prefix (default: "alpha")
  */
 export function deriveAddressInfo(
   masterKey: MasterKey,
   basePath: string,
   index: number,
-  isChange: boolean = false,
-  prefix: string = 'alpha'
+  isChange: boolean = false
 ): AddressInfo {
   const chain = isChange ? 1 : 0;
   const fullPath = `${basePath}/${chain}/${index}`;
 
   const derived = deriveKeyAtPath(masterKey.privateKey, masterKey.chainCode, fullPath);
   const publicKey = getPublicKey(derived.privateKey);
-  const address = publicKeyToAddress(publicKey, prefix);
 
   return {
     privateKey: derived.privateKey,
     publicKey,
-    address,
     path: fullPath,
     index,
   };
 }
 
 /**
- * Generate full address info from private key with index and path
- * (L1 SDK compatibility)
+ * Generate full key info from private key with index and path
  */
 export function generateAddressInfo(
   privateKey: string,
   index: number,
-  path: string,
-  prefix: string = 'alpha'
+  path: string
 ): AddressInfo {
-  const { address, publicKey } = privateKeyToAddressInfo(privateKey, prefix);
+  const publicKey = getPublicKey(privateKey);
   return {
     privateKey,
     publicKey,
-    address,
     path,
     index,
   };
 }
 
 /**
- * Generate address from master private key using HMAC-SHA512 derivation
+ * Generate key info from master private key using HMAC-SHA512 derivation
  * This matches exactly the original index.html implementation
  * NOTE: This is NON-STANDARD derivation for legacy wallet compatibility.
  *
  * Dual-use: in `wif_hmac` derivation mode (legacy wallet import) this derives
- * the wallet's chainPubkey (used for L3 identity), not just an alpha address.
+ * the wallet's chainPubkey (used for L3 identity).
  *
  * @param masterPrivateKey - 32-byte hex private key (64 chars)
  * @param index - Address index

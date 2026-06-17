@@ -63,13 +63,13 @@ describe('encodeBech32()', () => {
     expect(address).toBe('bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4');
   });
 
-  it('should encode with alpha hrp', () => {
+  it('should encode with a custom hrp', () => {
     const program = new Uint8Array([
       0x75, 0x1e, 0x76, 0xe8, 0x19, 0x91, 0x96, 0xd4, 0x54, 0x94, 0x1c, 0x45, 0xd1, 0xb3, 0xa3,
       0x23, 0xf1, 0x43, 0x3b, 0xd6,
     ]);
-    const address = encodeBech32('alpha', 0, program);
-    expect(address.startsWith('alpha1q')).toBe(true);
+    const address = encodeBech32('test', 0, program);
+    expect(address.startsWith('test1q')).toBe(true);
   });
 
   it('should handle different witness versions', () => {
@@ -116,16 +116,16 @@ describe('decodeBech32()', () => {
     );
   });
 
-  it('should decode alpha address', () => {
+  it('should decode test address', () => {
     // First encode an address
     const program = new Uint8Array([
       0x75, 0x1e, 0x76, 0xe8, 0x19, 0x91, 0x96, 0xd4, 0x54, 0x94, 0x1c, 0x45, 0xd1, 0xb3, 0xa3,
       0x23, 0xf1, 0x43, 0x3b, 0xd6,
     ]);
-    const address = encodeBech32('alpha', 0, program);
+    const address = encodeBech32('test', 0, program);
     const result = decodeBech32(address);
     expect(result).not.toBeNull();
-    expect(result!.hrp).toBe('alpha');
+    expect(result!.hrp).toBe('test');
     expect(result!.witnessVersion).toBe(0);
     expect(result!.data).toEqual(program);
   });
@@ -174,8 +174,8 @@ describe('decodeBech32()', () => {
 describe('Encode/Decode Round-trip', () => {
   it('should round-trip for various programs', () => {
     const testCases = [
-      { hrp: 'alpha', version: 0, program: new Uint8Array(20).fill(0) },
-      { hrp: 'alpha', version: 0, program: new Uint8Array(20).fill(0xff) },
+      { hrp: 'test', version: 0, program: new Uint8Array(20).fill(0) },
+      { hrp: 'test', version: 0, program: new Uint8Array(20).fill(0xff) },
       { hrp: 'bc', version: 1, program: new Uint8Array(32).fill(0xab) },
       { hrp: 'test', version: 0, program: new Uint8Array(20).map((_, i) => i) },
     ];
@@ -206,9 +206,9 @@ describe('isValidBech32()', () => {
     expect(isValidBech32('bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5')).toBe(false); // bad checksum
   });
 
-  it('should validate alpha addresses', () => {
+  it('should validate test addresses', () => {
     const program = new Uint8Array(20).fill(0xab);
-    const address = encodeBech32('alpha', 0, program);
+    const address = encodeBech32('test', 0, program);
     expect(isValidBech32(address)).toBe(true);
   });
 });
@@ -220,15 +220,15 @@ describe('isValidBech32()', () => {
 describe('createAddress()', () => {
   it('should create address from Uint8Array', () => {
     const hash = new Uint8Array(20).fill(0xab);
-    const address = createAddress('alpha', hash);
-    expect(address.startsWith('alpha1p')).toBe(true); // witness version 1
+    const address = createAddress('test', hash);
+    expect(address.startsWith('test1p')).toBe(true); // witness version 1
     expect(isValidBech32(address)).toBe(true);
   });
 
   it('should create address from hex string', () => {
     const hash = 'abababababababababababababababababababab';
-    const address = createAddress('alpha', hash);
-    expect(address.startsWith('alpha1p')).toBe(true);
+    const address = createAddress('test', hash);
+    expect(address.startsWith('test1p')).toBe(true);
     expect(isValidBech32(address)).toBe(true);
   });
 
@@ -239,8 +239,8 @@ describe('createAddress()', () => {
       0x23, 0xf1, 0x43, 0x3b, 0xd6,
     ]);
 
-    const addressFromHex = createAddress('alpha', hashHex);
-    const addressFromBytes = createAddress('alpha', hashBytes);
+    const addressFromHex = createAddress('test', hashHex);
+    const addressFromBytes = createAddress('test', hashBytes);
     expect(addressFromHex).toBe(addressFromBytes);
   });
 });
@@ -261,10 +261,10 @@ describe('getAddressHrp()', () => {
     expect(getAddressHrp('invalid')).toBeNull();
   });
 
-  it('should extract HRP from alpha address', () => {
+  it('should extract HRP from test address', () => {
     const program = new Uint8Array(20).fill(0xab);
-    const address = encodeBech32('alpha', 0, program);
-    expect(getAddressHrp(address)).toBe('alpha');
+    const address = encodeBech32('test', 0, program);
+    expect(getAddressHrp(address)).toBe('test');
   });
 });
 

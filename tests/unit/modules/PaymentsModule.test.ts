@@ -754,7 +754,6 @@ describe('Nametag preservation during sync', () => {
     const module = createPaymentsModule();
     const mockIdentity = {
       chainPubkey: '02' + '0'.repeat(64),
-      l1Address: 'alpha1test',
       directAddress: 'DIRECT://test',
       privateKey: '0'.repeat(64),
     };

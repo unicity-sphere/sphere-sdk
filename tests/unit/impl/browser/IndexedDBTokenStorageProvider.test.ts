@@ -35,7 +35,6 @@ function createIdentity(directAddress: string): FullIdentity {
     // MUST have distinct pubkeys. The token DB is now keyed by chainPubkey, so vary it
     // per address — otherwise this fixture would (unrealistically) collide two addresses.
     chainPubkey: '02' + Buffer.from(directAddress).toString('hex').padEnd(64, '0').slice(0, 64),
-    l1Address: 'alpha1testaddr',
     directAddress,
     nametag: 'testuser',
   };
@@ -45,7 +44,7 @@ function createTxfData(tokenIds: string[]): TxfStorageDataBase {
   const data: TxfStorageDataBase = {
     _meta: {
       version: 1,
-      address: 'alpha1test',
+      address: '02abtest',
       formatVersion: '2.0',
       updatedAt: Date.now(),
     },

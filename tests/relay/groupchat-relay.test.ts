@@ -154,7 +154,6 @@ function createTestModule(privateKeyHex: string, relayUrl: string): TestModule {
   const identity: FullIdentity = {
     privateKey: privateKeyHex,
     chainPubkey: '02' + getXOnlyPubkey(privateKeyHex),
-    l1Address: 'alpha1testdummy',
   };
 
   const storage = new InMemoryStorageProvider();
@@ -741,7 +740,6 @@ describe('GroupChatModule Relay Integration', () => {
       const identity: FullIdentity = {
         privateKey: USER_A_PRIVATE_KEY,
         chainPubkey: '02' + getXOnlyPubkey(USER_A_PRIVATE_KEY),
-        l1Address: 'alpha1testdummy',
       };
 
       freshModule.initialize({

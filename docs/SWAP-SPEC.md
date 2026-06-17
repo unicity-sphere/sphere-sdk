@@ -53,7 +53,7 @@ Protocol version is determined at proposal time. When `proposeSwap()` is called,
 - **Escrow logic duplication.** The module does not validate deposits, compute coverage, manage timeouts authoritatively, or execute payouts. Those responsibilities belong to the escrow service.
 - **Price discovery or order matching.** The module does not find counterparties or negotiate exchange rates. Deal terms arrive fully specified from the application layer.
 - **Multi-party swaps.** The current design supports exactly two parties (A and B). Multi-leg swaps require a different protocol.
-- **Cross-chain swaps.** Both sides of the swap use L3 tokens on the Unicity network. L1 (ALPHA) swaps are out of scope.
+- **Cross-chain swaps.** Both sides of the swap use L3 tokens on the Unicity network. Swaps against other chains are out of scope.
 
 ### 1.4 Relationship to AccountingModule
 

@@ -145,7 +145,7 @@ if (created && generatedMnemonic) console.log('SAVE THIS MNEMONIC:', generatedMn
 - `Sphere.getProxyAddress()` → **removed.** Use `sphere.identity.directAddress` (or `sphere.resolve('@name')`).
 - `AddressMode` lost `'proxy'` (now `'auto' | 'direct'`). Remove any `addressMode: 'proxy'`.
 - **Send now gates on the recipient's published `chainPubkey`.** A recipient with no published chain pubkey is unsendable — handle `INVALID_RECIPIENT`.
-- `FullIdentity` is **unchanged**: `{ chainPubkey, l1Address, directAddress?, ipnsName?, nametag?, privateKey }`. The pubkey field is `chainPubkey` (never `pubkey`/`signingPubkey`); L1 is `l1Address`; L3 is `directAddress`.
+- `FullIdentity` is now L3-only: `{ chainPubkey, directAddress?, ipnsName?, nametag?, privateKey }`. The pubkey field is `chainPubkey` (never `pubkey`/`signingPubkey`); L3 is `directAddress`.
 
 ### 4.2 Sending
 

@@ -61,7 +61,6 @@ export const DEFAULT_TEST_ESCROW_ADDRESS = 'DIRECT://0000eee333eee333eee333eee33
 export const DEFAULT_TEST_IDENTITY: FullIdentity = {
   chainPubkey: DEFAULT_TEST_PARTY_A_PUBKEY,
   directAddress: DEFAULT_TEST_PARTY_A_ADDRESS,
-  l1Address: 'alpha1partyaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
   nametag: 'alice',
   privateKey: 'a'.repeat(64),
 };
@@ -345,7 +344,6 @@ export function createMockResolve(): MockResolve {
     chainPubkey: DEFAULT_TEST_PARTY_A_PUBKEY,
     directAddress: DEFAULT_TEST_PARTY_A_ADDRESS,
     transportPubkey: 'a'.repeat(64),
-    l1Address: 'alpha1partyaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     nametag: 'alice',
     timestamp: Date.now(),
   };
@@ -357,7 +355,6 @@ export function createMockResolve(): MockResolve {
     chainPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
     directAddress: DEFAULT_TEST_PARTY_B_ADDRESS,
     transportPubkey: 'b'.repeat(64),
-    l1Address: 'alpha1partybbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
     nametag: 'bob',
     timestamp: Date.now(),
   };
@@ -369,7 +366,6 @@ export function createMockResolve(): MockResolve {
     chainPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
     directAddress: DEFAULT_TEST_ESCROW_ADDRESS,
     transportPubkey: 'e'.repeat(64),
-    l1Address: 'alpha1escroweeeeeeeeeeeeeeeeeeeeeeeeeeee',
     nametag: 'escrow',
     timestamp: Date.now(),
   };
@@ -445,7 +441,6 @@ export function createTestSwapModule(configOverrides?: Partial<SwapModuleConfig>
   const defaultTrackedAddress: TrackedAddress = {
     index: 0,
     addressId: 'DIRECT_party_a_aaa111',
-    l1Address: identity.l1Address,
     directAddress: identity.directAddress!,
     chainPubkey: identity.chainPubkey,
     nametag: identity.nametag,

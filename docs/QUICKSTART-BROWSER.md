@@ -106,7 +106,7 @@ function App() {
 
   return (
     <div>
-      <p>Address: {sphere?.identity?.l1Address}</p>
+      <p>Address: {sphere?.identity?.directAddress}</p>
       <p>Nametag: {sphere?.identity?.nametag || 'Not registered'}</p>
     </div>
   );
@@ -154,7 +154,7 @@ onUnmounted(() => {
     <code>{{ mnemonic }}</code>
   </div>
   <div v-else>
-    <p>Address: {{ sphere?.identity?.l1Address }}</p>
+    <p>Address: {{ sphere?.identity?.directAddress }}</p>
   </div>
 </template>
 ```
@@ -192,7 +192,7 @@ export default function WalletPage() {
 
   if (!sphere) return <div>Loading...</div>;
 
-  return <div>Address: {sphere.identity?.l1Address}</div>;
+  return <div>Address: {sphere.identity?.directAddress}</div>;
 }
 ```
 
@@ -234,12 +234,6 @@ const providers = createBrowserProviders({
   // createUnicityAggregatorProvider({ url, apiKey, trustBaseUrl, network })
   // from '@unicitylabs/sphere-sdk/impl/browser'.
 
-  // L1 blockchain options
-  l1: {
-    electrumUrl: 'wss://custom-electrum:50004',
-    enableVesting: true,
-  },
-
   // Price provider (optional — enables fiat value display)
   price: {
     platform: 'coingecko',    // Currently supported: 'coingecko'
@@ -264,7 +258,6 @@ const providers = createBrowserProviders({
 ```typescript
 const identity = sphere.identity;
 
-console.log('L1 Address:', identity?.l1Address);      // alpha1...
 console.log('L3 Address:', identity?.directAddress);  // DIRECT://...
 console.log('Public Key:', identity?.chainPubkey);    // 02abc...
 console.log('Nametag:', identity?.nametag);           // @username
@@ -289,9 +282,6 @@ const balances = sphere.payments.getBalance();
 const totalUsd = await sphere.payments.getFiatBalance();
 document.getElementById('balance').textContent =
   totalUsd != null ? `$${totalUsd.toFixed(2)}` : 'N/A';
-
-// L1 (ALPHA) balance (payments.l1 is null when L1 is disabled via l1: null)
-const l1Balance = await sphere.payments.l1?.getBalance();
 ```
 
 ### Top Up (Testnet Self-Mint)
@@ -690,7 +680,7 @@ function WalletApp() {
       {sphere && (
         <>
           <div style={{ marginBottom: 20 }}>
-            <strong>Address:</strong> {sphere.identity?.l1Address}
+            <strong>Address:</strong> {sphere.identity?.directAddress}
             <br />
             <strong>Nametag:</strong> {sphere.identity?.nametag || 'Not registered'}
             <br />

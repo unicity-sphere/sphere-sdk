@@ -239,7 +239,7 @@ const client = new ConnectClient({
 
 // Connect — returns identity, sessionId, permissions
 const result = await client.connect();
-// result.identity   → { chainPubkey, l1Address, directAddress?, nametag? }
+// result.identity   → { chainPubkey, directAddress?, nametag? }
 // result.sessionId  → string (save for resumeSessionId on next load)
 // result.permissions → PermissionScope[]
 
@@ -299,8 +299,6 @@ The wallet's `onConnectionRequest` receives `silent=true` and must return `{ app
 | `sphere_getFiatBalance` | — | `{ fiatBalance }` |
 | `sphere_getTokens` | `coinId?` | token array |
 | `sphere_getHistory` | — | transaction history |
-| `sphere_l1GetBalance` | — | L1 balance |
-| `sphere_l1GetHistory` | `limit?` | L1 history |
 | `sphere_resolve` | `identifier` | resolved address info |
 | `sphere_getInvoices` | `state?, createdByMe?, targetingMe?, limit?, offset?, sortBy?, sortOrder?` | `InvoiceRef[]` |
 | `sphere_getInvoiceStatus` | `invoiceId` | `InvoiceStatus` |
@@ -313,7 +311,6 @@ The wallet's `onConnectionRequest` receives `silent=true` and must return `{ app
 | Action | Params |
 |--------|--------|
 | `send` | `recipient, amount, coinId` |
-| `l1_send` | `recipient, amount` |
 | `dm` | `recipient, content` |
 | `payment_request` | `amount, coinId, description?` |
 | `receive` | `coinId?` |
@@ -414,10 +411,8 @@ Permissions are requested during handshake and checked on every request:
 | `assets:read` | `sphere_getAssets` |
 | `tokens:read` | `sphere_getTokens` |
 | `history:read` | `sphere_getHistory` |
-| `l1:read` | `sphere_l1GetBalance`, `sphere_l1GetHistory` |
 | `events:subscribe` | `sphere_subscribe/unsubscribe` |
 | `intent:send` | `send` intent |
-| `intent:l1_send` | `l1_send` intent |
 | `intent:dm` | `dm` intent |
 | `intent:payment_request` | `payment_request` intent |
 | `intent:receive` | `receive` intent |

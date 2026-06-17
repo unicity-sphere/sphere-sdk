@@ -108,8 +108,8 @@ function bech32Checksum(hrp: string, data: number[]): number[] {
  *
  * @example
  * ```ts
- * const address = encodeBech32('alpha', 1, pubkeyHash);
- * // 'alpha1qw...'
+ * const address = encodeBech32('bc', 1, pubkeyHash);
+ * // 'bc1qw...'
  * ```
  */
 export function encodeBech32(
@@ -143,8 +143,8 @@ export function encodeBech32(
  *
  * @example
  * ```ts
- * const result = decodeBech32('alpha1qw...');
- * // { hrp: 'alpha', witnessVersion: 1, data: Uint8Array }
+ * const result = decodeBech32('bc1qw...');
+ * // { hrp: 'bc', witnessVersion: 1, data: Uint8Array }
  * ```
  */
 export function decodeBech32(
@@ -189,8 +189,8 @@ export function decodeBech32(
  *
  * @example
  * ```ts
- * const address = createAddress('alpha', pubkeyHash);
- * // 'alpha1...'
+ * const address = createAddress('bc', pubkeyHash);
+ * // 'bc1...'
  * ```
  */
 export function createAddress(hrp: string, pubkeyHash: Uint8Array | string): string {
@@ -215,12 +215,3 @@ export function getAddressHrp(addr: string): string | null {
   const result = decodeBech32(addr);
   return result?.hrp ?? null;
 }
-
-// =============================================================================
-// Aliases for L1 SDK compatibility
-// =============================================================================
-
-/**
- * Alias for encodeBech32 (L1 SDK compatibility)
- */
-export const createBech32 = encodeBech32;

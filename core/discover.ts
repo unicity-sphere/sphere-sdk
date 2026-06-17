@@ -28,8 +28,6 @@ export interface DiscoverAddressProgress {
 export interface DiscoveredAddress {
   /** HD derivation index */
   index: number;
-  /** L1 bech32 address (alpha1...) */
-  l1Address: string;
   /** L3 DIRECT address */
   directAddress: string;
   /** 33-byte compressed chain pubkey */
@@ -140,7 +138,6 @@ export async function discoverAddressesImpl(
         const derived = pubkeyToInfo.get(peer.transportPubkey)!;
         discovered.set(index, {
           index,
-          l1Address: peer.l1Address || '',
           directAddress: peer.directAddress || derived.directAddress,
           chainPubkey: peer.chainPubkey || derived.chainPubkey,
           nametag: peer.nametag,

@@ -55,7 +55,6 @@ function createIdentity(directAddress = 'DIRECT://abcdef1234567890'): FullIdenti
     privateKey: '0'.repeat(64),
     publicKey: '02' + 'f'.repeat(64),
     chainPubkey: '02' + Buffer.from(directAddress).toString('hex').padEnd(64, '0').slice(0, 64),
-    l1Address: 'alpha1testaddr',
     directAddress,
   } as unknown as FullIdentity;
 }

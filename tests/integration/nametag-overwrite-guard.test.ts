@@ -92,20 +92,19 @@ function createMockTransport(options: {
           // Look up by directAddress
           const binding = relayBindings.get(identifier);
           if (binding) return Promise.resolve(binding);
-          // Look up by chainPubkey, l1Address, or x-only pubkey (chainPubkey without 02/03 prefix)
+          // Look up by chainPubkey or x-only pubkey (chainPubkey without 02/03 prefix)
           for (const b of relayBindings.values()) {
-            if (b.chainPubkey === identifier || b.l1Address === identifier || b.chainPubkey.slice(2) === identifier) {
+            if (b.chainPubkey === identifier || b.chainPubkey.slice(2) === identifier) {
               return Promise.resolve(b);
             }
           }
           return Promise.resolve(null);
         }),
 
-    publishIdentityBinding: vi.fn((chainPubkey: string, l1Address: string, directAddress: string, nametag?: string) => {
+    publishIdentityBinding: vi.fn((chainPubkey: string, directAddress: string, nametag?: string) => {
       // Store on relay (simulates what the real relay does)
       relayBindings.set(directAddress, {
         chainPubkey,
-        l1Address,
         directAddress,
         transportPubkey: 'transport-' + chainPubkey.slice(0, 8),
         nametag: nametag || undefined,
@@ -517,7 +516,6 @@ describe('Nametag overwrite guard (syncIdentityWithTransport)', () => {
     // Re-published in new format (migration)
     expect(transport.publishIdentityBinding).toHaveBeenCalledWith(
       chainPubkey,
-      expect.any(String),
       directAddr,
       'legacy_user',
     );

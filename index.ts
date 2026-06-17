@@ -26,7 +26,7 @@
  *
  * // Payments
  * await sphere.payments.send({
- *   coinId: 'ALPHA',
+ *   coinId: 'UCT',
  *   amount: '1000000',
  *   recipient: '@alice',
  * });

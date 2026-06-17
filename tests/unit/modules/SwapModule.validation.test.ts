@@ -63,13 +63,13 @@ describe('SwapModule input validation', () => {
       expect(result.swapId).toMatch(/^[0-9a-f]{64}$/);
     });
 
-    it('UT-SWAP-VAL-004: accepts L1 address for partyA', async () => {
-      const l1Addr = 'alpha1partyaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
-      // Register L1 address in resolve mock
+    it('UT-SWAP-VAL-004: accepts an arbitrary resolvable address for partyA', async () => {
+      const altAddr = 'DIRECT://0000aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa1';
+      // Register the alternate address in resolve mock
       const peerA = mocks.resolve._peers.get(DEFAULT_TEST_PARTY_A_ADDRESS)!;
-      mocks.resolve._peers.set(l1Addr, peerA);
+      mocks.resolve._peers.set(altAddr, peerA);
 
-      const deal = createTestSwapDeal({ partyA: l1Addr });
+      const deal = createTestSwapDeal({ partyA: altAddr });
       const result = await module.proposeSwap(deal);
       expect(result.swapId).toMatch(/^[0-9a-f]{64}$/);
     });

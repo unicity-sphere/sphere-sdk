@@ -130,7 +130,7 @@ describe('formatAmount()', () => {
   });
 
   it('should format with symbol', () => {
-    expect(formatAmount(1500000000000000000n, { decimals: 18, symbol: 'ALPHA' })).toBe('1.5 ALPHA');
+    expect(formatAmount(1500000000000000000n, { decimals: 18, symbol: 'TOKEN' })).toBe('1.5 TOKEN');
   });
 
   it('should limit fraction digits', () => {
@@ -167,7 +167,7 @@ describe('formatAmount()', () => {
   });
 
   it('should handle zero with symbol', () => {
-    expect(formatAmount(0n, { decimals: 18, symbol: 'ALPHA' })).toBe('0 ALPHA');
+    expect(formatAmount(0n, { decimals: 18, symbol: 'TOKEN' })).toBe('0 TOKEN');
   });
 
   it('should handle string input', () => {

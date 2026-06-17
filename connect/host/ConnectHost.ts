@@ -35,7 +35,7 @@ import type { PermissionScope } from '../permissions';
 // Use a minimal interface for the Sphere dependency to avoid circular imports.
 // ConnectHost only needs these public methods from Sphere.
 interface SphereInstance {
-  readonly identity: { chainPubkey: string; l1Address: string; directAddress?: string; nametag?: string } | null;
+  readonly identity: { chainPubkey: string; directAddress?: string; nametag?: string } | null;
   readonly payments: {
     getBalance(coinId?: string): unknown[];
     getAssets(coinId?: string): Promise<unknown[]>;
@@ -598,7 +598,6 @@ export class ConnectHost {
     if (!id) return undefined;
     return {
       chainPubkey: id.chainPubkey,
-      l1Address: id.l1Address,
       directAddress: id.directAddress,
       nametag: id.nametag,
     };

@@ -49,7 +49,6 @@ const { MultiAddressTransportMux } = await import('../../../transport/MultiAddre
 
 const TEST_IDENTITY = {
   chainPubkey: '02' + 'ab'.repeat(32),
-  l1Address: 'alpha1testaddr',
   directAddress: 'DIRECT://test',
   transportPubkey: 'cc'.repeat(32),
   privateKey: 'dd'.repeat(32),

@@ -49,7 +49,6 @@ const UCT = '11'.repeat(32); // v2 coin ids are lowercase hex
 function createMockIdentity(): FullIdentity {
   return {
     chainPubkey: FAKE_PUBKEY,
-    l1Address: 'alpha1testaddr',
     directAddress: 'DIRECT://testaddr',
     privateKey: FAKE_PRIVATE_KEY,
     transportPubkey: 'dd'.repeat(32),

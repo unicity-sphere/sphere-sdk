@@ -1,7 +1,7 @@
 /**
- * Integration tests for wallet address derivation consistency
+ * Integration tests for wallet key derivation consistency
  *
- * Verifies that the same private key produces identical addresses regardless
+ * Verifies that the same private key produces identical public keys regardless
  * of the import format (.dat, .txt, .json) or derivation path used.
  *
  * Two wallet types are tested:
@@ -21,7 +21,6 @@ import {
   deriveAddressInfo,
   generateAddressFromMasterKey,
   getPublicKey,
-  publicKeyToAddress,
   type MasterKey,
 } from '../../core/crypto';
 
@@ -36,11 +35,11 @@ const BIP32_WALLET = {
   descriptorPath: "84'/1'/0'",
   basePath: "m/84'/1'/0'",
   derivationMode: 'bip32' as const,
-  /** Expected addresses at indices 0, 1, 2 */
-  expectedAddresses: [
-    'alpha1q64c7vmezvqd43l4g0hg8l72uttc0sc5cqrhpqz',
-    'alpha1qpanlhfjynerdp3vwjfd6uctexa2n6c9pusnsja',
-    'alpha1q8m2m2sele36p3js0ju8rfcrk4ynjylvjnjl4x7',
+  /** Expected compressed public keys at indices 0, 1, 2 */
+  expectedPublicKeys: [
+    '0293660bf11e778ad850274d8a2ff0054327b3027cbd1e935adb23d291e89f24eb',
+    '0202cf879e569e8acf34261d32d2f67d5398c71966a9401fa3499032c5fe5c0d1b',
+    '030887f2deb018100c32786763fa6058e7dd48202129e3198ee72dfc5b6630f141',
   ],
 };
 
@@ -52,10 +51,10 @@ const BIP32_WALLET = {
 const WIF_WALLET = {
   masterKey: '86f38045ecb4f6ae0d655e866f13937b9892fbd1ff4b3ade8998df7422b4dd1b',
   derivationMode: 'wif_hmac' as const,
-  /** Expected addresses at indices 0, 1 */
-  expectedAddresses: [
-    'alpha1qr82m4mgx7ngy32cfr5jkrcrmqw4j4as8spu8al',
-    'alpha1qm4x7zc4ewz058kszsut73x9ujrgt0vdw5fw3jr',
+  /** Expected compressed public keys at indices 0, 1 */
+  expectedPublicKeys: [
+    '03a4d15c66922c27046ab9865a1afd71728ca9cc88c6fc606ba95b25a229d77c0d',
+    '02ae8992f4904eb60f9a058024f7583cc777d0fb6ae14b4c4f129df0dbffaf1061',
   ],
 };
 
@@ -71,26 +70,26 @@ describe('BIP32 HD wallet derivation', () => {
 
   it('should derive correct address at index 0', () => {
     const info = deriveAddressInfo(masterKey, BIP32_WALLET.basePath, 0, false);
-    const address = publicKeyToAddress(info.publicKey, 'alpha');
-    expect(address).toBe(BIP32_WALLET.expectedAddresses[0]);
+    const address = info.publicKey;
+    expect(address).toBe(BIP32_WALLET.expectedPublicKeys[0]);
   });
 
   it('should derive correct address at index 1', () => {
     const info = deriveAddressInfo(masterKey, BIP32_WALLET.basePath, 1, false);
-    const address = publicKeyToAddress(info.publicKey, 'alpha');
-    expect(address).toBe(BIP32_WALLET.expectedAddresses[1]);
+    const address = info.publicKey;
+    expect(address).toBe(BIP32_WALLET.expectedPublicKeys[1]);
   });
 
   it('should derive correct address at index 2', () => {
     const info = deriveAddressInfo(masterKey, BIP32_WALLET.basePath, 2, false);
-    const address = publicKeyToAddress(info.publicKey, 'alpha');
-    expect(address).toBe(BIP32_WALLET.expectedAddresses[2]);
+    const address = info.publicKey;
+    expect(address).toBe(BIP32_WALLET.expectedPublicKeys[2]);
   });
 
   it('should match core deriveAddressInfo function', () => {
-    for (let i = 0; i < BIP32_WALLET.expectedAddresses.length; i++) {
+    for (let i = 0; i < BIP32_WALLET.expectedPublicKeys.length; i++) {
       const addr = deriveAddressInfo(masterKey, BIP32_WALLET.basePath, i, false);
-      expect(addr.address).toBe(BIP32_WALLET.expectedAddresses[i]);
+      expect(addr.publicKey).toBe(BIP32_WALLET.expectedPublicKeys[i]);
     }
   });
 
@@ -98,9 +97,9 @@ describe('BIP32 HD wallet derivation', () => {
     const results = Array.from({ length: 5 }, () =>
       deriveAddressInfo(masterKey, BIP32_WALLET.basePath, 0, false),
     );
-    const addresses = results.map((r) => publicKeyToAddress(r.publicKey, 'alpha'));
+    const addresses = results.map((r) => r.publicKey);
     expect(new Set(addresses).size).toBe(1);
-    expect(addresses[0]).toBe(BIP32_WALLET.expectedAddresses[0]);
+    expect(addresses[0]).toBe(BIP32_WALLET.expectedPublicKeys[0]);
   });
 });
 
@@ -111,12 +110,12 @@ describe('BIP32 HD wallet derivation', () => {
 describe('WIF/HMAC wallet derivation', () => {
   it('should derive correct address at index 0', () => {
     const addr = generateAddressFromMasterKey(WIF_WALLET.masterKey, 0);
-    expect(addr.address).toBe(WIF_WALLET.expectedAddresses[0]);
+    expect(addr.publicKey).toBe(WIF_WALLET.expectedPublicKeys[0]);
   });
 
   it('should derive correct address at index 1', () => {
     const addr = generateAddressFromMasterKey(WIF_WALLET.masterKey, 1);
-    expect(addr.address).toBe(WIF_WALLET.expectedAddresses[1]);
+    expect(addr.publicKey).toBe(WIF_WALLET.expectedPublicKeys[1]);
   });
 
   it('should use HMAC path m/44\'/0\'/{index}\'', () => {
@@ -130,18 +129,18 @@ describe('WIF/HMAC wallet derivation', () => {
     const results = Array.from({ length: 5 }, () =>
       generateAddressFromMasterKey(WIF_WALLET.masterKey, 0),
     );
-    expect(new Set(results.map((r) => r.address)).size).toBe(1);
-    expect(results[0].address).toBe(WIF_WALLET.expectedAddresses[0]);
+    expect(new Set(results.map((r) => r.publicKey)).size).toBe(1);
+    expect(results[0].publicKey).toBe(WIF_WALLET.expectedPublicKeys[0]);
   });
 
   it('should differ from BIP32 derivation with the same key', () => {
     // If we were to incorrectly use the WIF key as a raw private key
     // (no HMAC), the address would be wrong
     const rawPubKey = getPublicKey(WIF_WALLET.masterKey);
-    const rawAddress = publicKeyToAddress(rawPubKey, 'alpha');
+    const rawAddress = rawPubKey;
 
     // The raw address should NOT match the expected WIF address
-    expect(rawAddress).not.toBe(WIF_WALLET.expectedAddresses[0]);
+    expect(rawAddress).not.toBe(WIF_WALLET.expectedPublicKeys[0]);
   });
 });
 
@@ -159,12 +158,12 @@ describe('BIP32 vs WIF derivation produces different addresses', () => {
       chainCode: BIP32_WALLET.chainCode,
     };
     const bip32Info = deriveAddressInfo(masterKey, BIP32_WALLET.basePath, 0, false);
-    const bip32Addr = publicKeyToAddress(bip32Info.publicKey, 'alpha');
+    const bip32Addr = bip32Info.publicKey;
 
     // WIF/HMAC derivation (no chain code)
     const wifAddr = generateAddressFromMasterKey(key, 0);
 
-    expect(bip32Addr).not.toBe(wifAddr.address);
+    expect(bip32Addr).not.toBe(wifAddr.publicKey);
   });
 });
 
@@ -190,7 +189,7 @@ ENCRYPTION STATUS: Not encrypted
 This key is in plaintext and not protected. Anyone with this file can access your wallet.
 
 YOUR ADDRESSES:
-Address 1: ${BIP32_WALLET.expectedAddresses[0]} (Path: m/84'/1'/0'/0/0)
+Address 1: ${BIP32_WALLET.expectedPublicKeys[0]} (Path: m/84'/1'/0'/0/0)
 
 Generated on: 12/4/2025, 5:22:59 PM
 
@@ -213,10 +212,10 @@ Anyone with your master private key can access all your funds.`;
     };
     const basePath = `m/${result.data!.descriptorPath}`;
 
-    for (let i = 0; i < BIP32_WALLET.expectedAddresses.length; i++) {
+    for (let i = 0; i < BIP32_WALLET.expectedPublicKeys.length; i++) {
       const info = deriveAddressInfo(mk, basePath, i, false);
-      const address = publicKeyToAddress(info.publicKey, 'alpha');
-      expect(address).toBe(BIP32_WALLET.expectedAddresses[i]);
+      const address = info.publicKey;
+      expect(address).toBe(BIP32_WALLET.expectedPublicKeys[i]);
     }
   });
 
@@ -237,7 +236,7 @@ ENCRYPTION STATUS: Encrypted with password
 To use this key, you will need the password you set in the wallet.
 
 YOUR ADDRESSES:
-Address 1: ${BIP32_WALLET.expectedAddresses[0]}
+Address 1: ${BIP32_WALLET.expectedPublicKeys[0]}
 
 Generated on: 12/4/2025, 5:22:59 PM
 
@@ -259,7 +258,7 @@ Anyone with your master private key can access all your funds.`;
       chainCode: BIP32_WALLET.chainCode,
       descriptorPath: BIP32_WALLET.descriptorPath,
       isBIP32: true,
-      addresses: [{ index: 0, address: BIP32_WALLET.expectedAddresses[0] }],
+      addresses: [{ index: 0, address: BIP32_WALLET.expectedPublicKeys[0] }],
     });
 
     const result = parseAndDecryptWalletText(encryptedTxt, password);
@@ -273,7 +272,7 @@ Anyone with your master private key can access all your funds.`;
     };
     const basePath = `m/${result.data!.descriptorPath}`;
     const info = deriveAddressInfo(mk, basePath, 0, false);
-    expect(publicKeyToAddress(info.publicKey, 'alpha')).toBe(BIP32_WALLET.expectedAddresses[0]);
+    expect(info.publicKey).toBe(BIP32_WALLET.expectedPublicKeys[0]);
   });
 
   it('should default descriptorPath to 84\'/1\'/0\' for BIP32 without explicit path', () => {
@@ -295,7 +294,7 @@ ENCRYPTION STATUS: Encrypted with password
 To use this key, you will need the password you set in the wallet.
 
 YOUR ADDRESSES:
-Address 1: ${BIP32_WALLET.expectedAddresses[0]}
+Address 1: ${BIP32_WALLET.expectedPublicKeys[0]}
 
 Generated on: 12/4/2025, 5:22:59 PM
 
@@ -314,7 +313,7 @@ Anyone with your master private key can access all your funds.`;
     };
     const basePath = `m/${result.data!.descriptorPath}`;
     const info = deriveAddressInfo(mk, basePath, 0, false);
-    expect(publicKeyToAddress(info.publicKey, 'alpha')).toBe(BIP32_WALLET.expectedAddresses[0]);
+    expect(info.publicKey).toBe(BIP32_WALLET.expectedPublicKeys[0]);
   });
 });
 
@@ -338,7 +337,7 @@ ENCRYPTION STATUS: Not encrypted
 This key is in plaintext and not protected. Anyone with this file can access your wallet.
 
 YOUR ADDRESSES:
-Address 1: ${WIF_WALLET.expectedAddresses[0]} (Path: m/44'/0'/0')
+Address 1: ${WIF_WALLET.expectedPublicKeys[0]} (Path: m/44'/0'/0')
 
 Generated on: 2/10/2026, 3:54:42 AM
 
@@ -354,9 +353,9 @@ Anyone with your master private key can access all your funds.`;
     expect(result.data!.derivationMode).toBe('wif_hmac');
 
     // Derive addresses using HMAC
-    for (let i = 0; i < WIF_WALLET.expectedAddresses.length; i++) {
+    for (let i = 0; i < WIF_WALLET.expectedPublicKeys.length; i++) {
       const addr = generateAddressFromMasterKey(result.data!.masterKey, i);
-      expect(addr.address).toBe(WIF_WALLET.expectedAddresses[i]);
+      expect(addr.publicKey).toBe(WIF_WALLET.expectedPublicKeys[i]);
     }
   });
 
@@ -386,10 +385,10 @@ describe('JSON format → address consistency', () => {
     };
     const basePath = `m/${json.descriptorPath}`;
 
-    for (let i = 0; i < BIP32_WALLET.expectedAddresses.length; i++) {
+    for (let i = 0; i < BIP32_WALLET.expectedPublicKeys.length; i++) {
       const info = deriveAddressInfo(mk, basePath, i, false);
-      const address = publicKeyToAddress(info.publicKey, 'alpha');
-      expect(address).toBe(BIP32_WALLET.expectedAddresses[i]);
+      const address = info.publicKey;
+      expect(address).toBe(BIP32_WALLET.expectedPublicKeys[i]);
     }
   });
 
@@ -399,9 +398,9 @@ describe('JSON format → address consistency', () => {
       derivationMode: 'wif_hmac',
     };
 
-    for (let i = 0; i < WIF_WALLET.expectedAddresses.length; i++) {
+    for (let i = 0; i < WIF_WALLET.expectedPublicKeys.length; i++) {
       const addr = generateAddressFromMasterKey(json.masterPrivateKey, i);
-      expect(addr.address).toBe(WIF_WALLET.expectedAddresses[i]);
+      expect(addr.publicKey).toBe(WIF_WALLET.expectedPublicKeys[i]);
     }
   });
 
@@ -421,7 +420,7 @@ describe('JSON format → address consistency', () => {
     };
     const basePath = "m/84'/1'/0'"; // Default for BIP32 Alpha
     const info = deriveAddressInfo(mk, basePath, 0, false);
-    expect(publicKeyToAddress(info.publicKey, 'alpha')).toBe(BIP32_WALLET.expectedAddresses[0]);
+    expect(info.publicKey).toBe(BIP32_WALLET.expectedPublicKeys[0]);
   });
 
   it('should infer WIF mode from missing chainCode in JSON', () => {
@@ -490,13 +489,13 @@ Anyone with your master private key can access all your funds.`;
 
     for (let i = 0; i < 3; i++) {
       const txtInfo = deriveAddressInfo(txtMk, txtBasePath, i, false);
-      const txtAddr = publicKeyToAddress(txtInfo.publicKey, 'alpha');
+      const txtAddr = txtInfo.publicKey;
 
       const jsonInfo = deriveAddressInfo(jsonMk, jsonBasePath, i, false);
-      const jsonAddr = publicKeyToAddress(jsonInfo.publicKey, 'alpha');
+      const jsonAddr = jsonInfo.publicKey;
 
       expect(txtAddr).toBe(jsonAddr);
-      expect(txtAddr).toBe(BIP32_WALLET.expectedAddresses[i]);
+      expect(txtAddr).toBe(BIP32_WALLET.expectedPublicKeys[i]);
     }
   });
 
@@ -509,7 +508,7 @@ Anyone with your master private key can access all your funds.`;
       chainCode: BIP32_WALLET.chainCode,
       descriptorPath: BIP32_WALLET.descriptorPath,
       isBIP32: true,
-      addresses: [{ index: 0, address: BIP32_WALLET.expectedAddresses[0] }],
+      addresses: [{ index: 0, address: BIP32_WALLET.expectedPublicKeys[0] }],
     });
 
     // Encrypted
@@ -519,7 +518,7 @@ Anyone with your master private key can access all your funds.`;
       chainCode: BIP32_WALLET.chainCode,
       descriptorPath: BIP32_WALLET.descriptorPath,
       isBIP32: true,
-      addresses: [{ index: 0, address: BIP32_WALLET.expectedAddresses[0] }],
+      addresses: [{ index: 0, address: BIP32_WALLET.expectedPublicKeys[0] }],
     });
 
     const unencResult = parseWalletText(unencryptedTxt);
@@ -541,17 +540,11 @@ Anyone with your master private key can access all your funds.`;
     };
     const basePath = `m/${BIP32_WALLET.descriptorPath}`;
 
-    const addr1 = publicKeyToAddress(
-      deriveAddressInfo(mk1, basePath, 0, false).publicKey,
-      'alpha',
-    );
-    const addr2 = publicKeyToAddress(
-      deriveAddressInfo(mk2, basePath, 0, false).publicKey,
-      'alpha',
-    );
+    const addr1 = deriveAddressInfo(mk1, basePath, 0, false).publicKey;
+    const addr2 = deriveAddressInfo(mk2, basePath, 0, false).publicKey;
 
     expect(addr1).toBe(addr2);
-    expect(addr1).toBe(BIP32_WALLET.expectedAddresses[0]);
+    expect(addr1).toBe(BIP32_WALLET.expectedPublicKeys[0]);
   });
 });
 
@@ -585,8 +578,8 @@ Anyone with your master private key can access all your funds.`;
     // Address from direct key
     const directAddr = generateAddressFromMasterKey(WIF_WALLET.masterKey, 0);
 
-    expect(txtAddr.address).toBe(directAddr.address);
-    expect(txtAddr.address).toBe(WIF_WALLET.expectedAddresses[0]);
+    expect(txtAddr.publicKey).toBe(directAddr.publicKey);
+    expect(txtAddr.publicKey).toBe(WIF_WALLET.expectedPublicKeys[0]);
   });
 });
 
@@ -604,10 +597,10 @@ describe('Derivation edge cases', () => {
 
     const defaultPath = "m/84'/1'/0'";
     const info = deriveAddressInfo(mk, defaultPath, 0, false);
-    const address = publicKeyToAddress(info.publicKey, 'alpha');
+    const address = info.publicKey;
 
     // This should match because 84'/1'/0' IS the correct default
-    expect(address).toBe(BIP32_WALLET.expectedAddresses[0]);
+    expect(address).toBe(BIP32_WALLET.expectedPublicKeys[0]);
   });
 
   it('should produce WRONG address with incorrect base path', () => {
@@ -619,10 +612,10 @@ describe('Derivation edge cases', () => {
     // Wrong base path — this is the generic default, not Alpha network
     const wrongPath = "m/44'/0'/0'";
     const info = deriveAddressInfo(mk, wrongPath, 0, false);
-    const address = publicKeyToAddress(info.publicKey, 'alpha');
+    const address = info.publicKey;
 
     // Should NOT match the expected address
-    expect(address).not.toBe(BIP32_WALLET.expectedAddresses[0]);
+    expect(address).not.toBe(BIP32_WALLET.expectedPublicKeys[0]);
   });
 
   it('should produce different addresses for different indices', () => {
@@ -631,11 +624,11 @@ describe('Derivation edge cases', () => {
       privateKey: BIP32_WALLET.masterKey,
       chainCode: BIP32_WALLET.chainCode,
     };
-    const addrs = BIP32_WALLET.expectedAddresses;
+    const addrs = BIP32_WALLET.expectedPublicKeys;
     expect(new Set(addrs).size).toBe(addrs.length);
 
     // WIF
-    const wifAddrs = WIF_WALLET.expectedAddresses;
+    const wifAddrs = WIF_WALLET.expectedPublicKeys;
     expect(new Set(wifAddrs).size).toBe(wifAddrs.length);
   });
 

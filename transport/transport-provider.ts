@@ -47,7 +47,7 @@ export interface TransportProvider extends BaseProvider {
 
   /**
    * Resolve any identifier to full peer information.
-   * Accepts @nametag, bare nametag, DIRECT://, PROXY://, L1 address, chain pubkey, or transport pubkey.
+   * Accepts @nametag, bare nametag, DIRECT://, chain pubkey, or transport pubkey.
    * @param identifier - Any supported identifier format
    * @returns PeerInfo or null if not found
    */
@@ -60,14 +60,14 @@ export interface TransportProvider extends BaseProvider {
 
   /**
    * Resolve nametag to full peer information
-   * Returns transportPubkey, chainPubkey, l1Address, directAddress
+   * Returns transportPubkey, chainPubkey, directAddress
    */
   resolveNametagInfo?(nametag: string): Promise<PeerInfo | null>;
 
   /**
-   * Resolve a DIRECT://, PROXY://, or L1 address to full peer info.
+   * Resolve a DIRECT:// or PROXY:// address to full peer info.
    * Performs reverse lookup: address → binding event → PeerInfo.
-   * @param address - L3 address (DIRECT://... or PROXY://...) or L1 address (alpha1...)
+   * @param address - L3 address (DIRECT://... or PROXY://...)
    * @returns PeerInfo or null if no binding found for this address
    */
   resolveAddressInfo?(address: string): Promise<PeerInfo | null>;
@@ -98,14 +98,13 @@ export interface TransportProvider extends BaseProvider {
 
   /**
    * Publish identity binding event.
-   * Without nametag: publishes base binding (chainPubkey, l1Address, directAddress).
+   * Without nametag: publishes base binding (chainPubkey, directAddress).
    * With nametag: adds nametag hash, proxy address, encrypted nametag for recovery.
    * Uses parameterized replaceable event (kind 30078, d=hash(nostrPubkey)).
    * @returns true if successful, false if nametag is taken by another pubkey
    */
   publishIdentityBinding?(
     chainPubkey: string,
-    l1Address: string,
     directAddress: string,
     nametag?: string,
   ): Promise<boolean>;
@@ -464,8 +463,6 @@ export interface PeerInfo {
   transportPubkey: string;
   /** 33-byte compressed secp256k1 public key (for L3 chain) */
   chainPubkey: string;
-  /** L1 address (alpha1...) */
-  l1Address: string;
   /** L3 DIRECT address (DIRECT://...) */
   directAddress: string;
   /** Event timestamp */

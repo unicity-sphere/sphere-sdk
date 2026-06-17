@@ -51,7 +51,6 @@ function createMockSphere() {
   return {
     identity: {
       chainPubkey: '02abc123',
-      l1Address: 'alpha1test',
       directAddress: 'DIRECT://test',
       nametag: 'alice',
     },
@@ -69,7 +68,6 @@ function createMockSphere() {
     resolve: vi.fn().mockResolvedValue({
       nametag: 'bob',
       chainPubkey: '03def456',
-      l1Address: 'alpha1bob',
       directAddress: 'DIRECT://bob',
       transportPubkey: 'ff00ff',
     }),
@@ -191,7 +189,6 @@ describe('Sphere Connect Integration', () => {
       const identity = await client.query(RPC_METHODS.GET_IDENTITY);
       expect(identity).toEqual({
         chainPubkey: '02abc123',
-        l1Address: 'alpha1test',
         directAddress: 'DIRECT://test',
         nametag: 'alice',
       });

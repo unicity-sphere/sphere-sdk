@@ -192,7 +192,6 @@ describe('Sphere Status & Provider Management', () => {
       expect(status.tokenStorage).toBeInstanceOf(Array);
       expect(status.transport).toBeInstanceOf(Array);
       expect(status.oracle).toBeInstanceOf(Array);
-      expect(status.l1).toBeInstanceOf(Array);
       expect(status.price).toBeInstanceOf(Array);
     });
 

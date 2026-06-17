@@ -20,7 +20,6 @@ describeStorageProviderContract('FileTokenStorageProvider (default whole-blob ad
   provider.setIdentity({
     privateKey: identity.privateKey,
     chainPubkey: identity.chainPubkey,
-    l1Address: 'alpha1contracttest',
   } as FullIdentity);
   await provider.initialize();
 

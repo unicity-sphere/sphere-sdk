@@ -84,18 +84,6 @@
   {
     "network": "unicity:testnet",
     "assetKind": "fungible",
-    "name": "alpha_test",
-    "symbol": "ALPHT",
-    "decimals": 8,
-    "description": "ALPHA testnet coin on Unicity",
-    "icons": [
-      { "url": "https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/alpha_coin.png" }
-    ],
-    "id": "cde78ded16ef65818a51f43138031c4284e519300ab0cb60c30a8f9078080e5f"
-  },
-  {
-    "network": "unicity:testnet",
-    "assetKind": "fungible",
     "name": "tether",
     "symbol": "USDT",
     "decimals": 6,

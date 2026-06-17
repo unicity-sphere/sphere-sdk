@@ -376,7 +376,7 @@ describe('AccountingModule.closeInvoice()', () => {
   // -------------------------------------------------------------------------
   it('UT-CLOSE-008: for CLOSED invoices, non-latest senders have netBalance 0 in frozen snapshot', async () => {
     const invoiceId = '08'.repeat(32);
-    const sender1 = 'DIRECT://sender_one_alpha111';
+    const sender1 = 'DIRECT://sender_one_aaa111';
     const sender2 = 'DIRECT://sender_two_beta222'; // latest sender
     const terms = buildTerms();
     seedInvoice(module, invoiceId, terms);

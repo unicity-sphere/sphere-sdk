@@ -55,7 +55,6 @@ function fullIdentity(id: { privateKey: string; chainPubkey: string }): FullIden
   return {
     chainPubkey: id.chainPubkey,
     privateKey: id.privateKey,
-    l1Address: `alpha1${id.chainPubkey.slice(0, 8)}`,
     directAddress: `DIRECT://${id.chainPubkey.slice(0, 12)}`,
     transportPubkey: id.chainPubkey.slice(2),
   };

@@ -96,7 +96,6 @@ sphere wallet <TAB>             # list create use current delete
 | `send <to> <amount> <symbol>` | Send L3 tokens |
 | `receive` | Check for incoming transfers |
 | `history [limit]` | Transaction history |
-| `l1-balance` | L1 (ALPHA) balance |
 | `topup [<amount> <symbol>]` | Top up by self-minting test tokens (v2 engine — no faucet) |
 | `addresses` | List tracked addresses |
 | `switch <index>` | Switch to HD address |
@@ -216,7 +215,6 @@ Wallet initialized successfully!
 
 Identity:
 {
-  "l1Address": "alpha1qxy...",
   "directAddress": "DIRECT://0000be36...",
   "chainPubkey": "02abc123...",
   "nametag": "alice"
@@ -259,7 +257,6 @@ Wallet Status:
 ──────────────────────────────────────────────────
 Profile:       alice
 Network:       testnet
-L1 Address:    alpha1qxy...
 Direct Addr:   DIRECT://0000be36...
 Chain Pubkey:  02abc123...
 Nametag:       alice
@@ -528,12 +525,9 @@ Example output:
 ```
 Tracked Addresses:
 ──────────────────────────────────────────────────────────────────────
-→ #0: alpha1qxy... @alice
-    DIRECT: DIRECT://0000be36...
-  #1: alpha1rzp... @alice-work
-    DIRECT: DIRECT://0001cafe...
-  #2: alpha1abc... [hidden]
-    DIRECT: DIRECT://0002dead...
+→ #0: DIRECT://0000be36... @alice
+  #1: DIRECT://0001cafe... @alice-work
+  #2: DIRECT://0002dead... [hidden]
 ──────────────────────────────────────────────────────────────────────
 ```
 
@@ -561,14 +555,11 @@ sphere send @bob 100 UCT
 # Send to a DIRECT:// address
 sphere send DIRECT://0000be36... 50 UCT
 
-# Send to an L1 address (alpha1...)
-sphere send alpha1qxy... 0.001 BTC
-
 # Send to a raw chain pubkey (02... or 03...)
 sphere send 02abc123def456... 1000000 UCT
 ```
 
-**Available coin symbols:** UCT, BTC, ETH, SOL, USDT, USDC, USDU, EURU, ALPHT
+**Available coin symbols:** UCT, BTC, ETH, SOL, USDT, USDC, USDU, EURU
 
 **Amounts** are specified as human-readable decimals (e.g., `0.5`, `100`, `1000000`). The CLI converts to the smallest unit automatically.
 
@@ -601,7 +592,6 @@ Example output:
 Receive Address:
 ──────────────────────────────────────────────────
 L3 (Direct): DIRECT://0000be36...
-L1 (ALPHA):  alpha1qxy...
 Nametag:     @alice
 ──────────────────────────────────────────────────
 
@@ -627,28 +617,7 @@ sphere topup 200 BTC
 
 ---
 
-## 7. L1 (ALPHA Blockchain)
-
-L1 operations use the ALPHA blockchain (UTXO-based, RandomX PoW). The Fulcrum WebSocket connection is lazy — it only connects when you first run an L1 command.
-
-```bash
-# Check L1 balance
-sphere l1-balance
-```
-
-```
-L1 (ALPHA) Balance:
-──────────────────────────────────────────────────
-Confirmed: 0.00100000 ALPHA
-Unconfirmed: 0.00000000 ALPHA
-──────────────────────────────────────────────────
-```
-
-> **Note:** L1 send and history operations are available via the SDK (`sphere.payments.l1.send()`, `sphere.payments.l1.getHistory()`) but are not exposed as CLI commands in the current version. Use the API directly for those operations. See [QUICKSTART-NODEJS.md](./QUICKSTART-NODEJS.md) for L1 API examples.
-
----
-
-## 8. Communications
+## 7. Communications
 
 ### Direct Messages
 
@@ -748,7 +717,7 @@ sphere group-leave trading-chat-abc123
 
 ---
 
-## 9. Market (Intent Bulletin Board)
+## 8. Market (Intent Bulletin Board)
 
 The market module lets you post buy/sell/service intents and search for matching offers using semantic search.
 
@@ -826,7 +795,7 @@ sphere market-feed --rest
 
 ---
 
-## 10. Invoicing (Accounting Module)
+## 9. Invoicing (Accounting Module)
 
 Invoices are on-chain tokens that encode payment terms: target address, coin, amount, due date, and memo. Both issuer and payer can track payment state in real time.
 
@@ -1032,7 +1001,7 @@ sphere invoice-parse-memo "INV:a1b2c3d4...:F"
 
 ---
 
-## 11. Token Swaps
+## 10. Token Swaps
 
 The swap module enables trustless two-party token swaps via an escrow service. Both parties agree on terms, deposit their tokens into the escrow, and the escrow executes the exchange atomically -- either both parties receive their tokens, or both deposits are returned.
 
@@ -1240,7 +1209,7 @@ sphere-cli swap-cancel 3611a464...
 
 ---
 
-## 12. Event Daemon
+## 11. Event Daemon
 
 The daemon runs in the background and reacts to wallet events — incoming transfers, DMs, payment requests — by triggering actions such as auto-receive, webhook calls, bash scripts, or log writes.
 
@@ -1349,7 +1318,7 @@ For complex setups, write a JSON config file at `.sphere-cli/daemon.json`:
 
 ---
 
-## 13. Utility Commands
+## 12. Utility Commands
 
 ### Encryption
 
@@ -1384,11 +1353,11 @@ These commands work without a wallet and are useful for low-level key management
 ```bash
 # Generate a fresh secp256k1 key pair (private key hidden by default)
 sphere generate-key
-# Output: Public Key: 02abc... / Address: alpha1...
+# Output: Public Key: 02abc... / Direct Address: DIRECT://0000be36...
 
 # Show private key and WIF (use with caution — never in scripts/CI)
 sphere generate-key --unsafe-print
-# Output: { privateKey, publicKey, wif, address }
+# Output: { privateKey, publicKey, wif, directAddress }
 
 # Validate a private key
 sphere validate-key 64-char-hex-string
@@ -1399,7 +1368,7 @@ sphere hex-to-wif 64-char-hex-string
 # Derive the compressed public key from a private key
 sphere derive-pubkey 64-char-hex-string
 
-# Derive the L1 address at a given HD index (default: 0)
+# Derive the DIRECT:// address at a given HD index (default: 0)
 sphere derive-address 64-char-hex-string
 sphere derive-address 64-char-hex-string 3
 ```
@@ -1432,7 +1401,7 @@ sphere base58-decode Xm4A9...
 
 ---
 
-## 14. Global Flags
+## 13. Global Flags
 
 These flags are accepted by all commands:
 
@@ -1447,7 +1416,7 @@ sphere init --network testnet --no-nostr
 
 ---
 
-## 15. Common Workflows
+## 14. Common Workflows
 
 ### Create Wallet, Register Nametag, Send Tokens
 

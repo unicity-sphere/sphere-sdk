@@ -113,7 +113,6 @@ describe('Sphere.registerNametag() — Nostr-binding only (D5, no on-chain mint)
     // Published the binding with the nametag…
     expect(transport.publishIdentityBinding).toHaveBeenCalledWith(
       sphere.identity!.chainPubkey,
-      sphere.identity!.l1Address,
       expect.any(String),
       'alice',
     );

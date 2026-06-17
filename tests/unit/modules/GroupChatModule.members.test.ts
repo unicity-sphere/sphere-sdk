@@ -86,7 +86,6 @@ describe('GroupChatModule — member ingestion scaling', () => {
     const identity: FullIdentity = {
       privateKey: '01'.padStart(64, '0'),
       chainPubkey: '02' + 'a'.repeat(64),
-      l1Address: 'alpha1testdummy',
     };
 
     const mod = new GroupChatModule();
@@ -132,7 +131,6 @@ describe('GroupChatModule — member ingestion scaling', () => {
     const identity: FullIdentity = {
       privateKey: '01'.padStart(64, '0'),
       chainPubkey: '02' + 'a'.repeat(64),
-      l1Address: 'alpha1testdummy',
     };
 
     const mod = new GroupChatModule();
@@ -182,7 +180,6 @@ describe('GroupChatModule — member ingestion scaling', () => {
     const identity: FullIdentity = {
       privateKey: '01'.padStart(64, '0'),
       chainPubkey: '02' + 'a'.repeat(64),
-      l1Address: 'alpha1testdummy',
     };
 
     const mod = new GroupChatModule();

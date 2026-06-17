@@ -107,7 +107,7 @@ describe('Wallet clear end-to-end', () => {
 
     expect(created).toBe(true);
     expect(sphere.identity!.nametag).toBe(nametag);
-    console.log(`Wallet created: ${sphere.identity!.l1Address}`);
+    console.log(`Wallet created: ${sphere.identity!.chainPubkey}`);
     console.log(`Chain pubkey: ${sphere.identity!.chainPubkey}`);
 
     // Verify storage has data
@@ -311,7 +311,7 @@ describe('Wallet clear end-to-end', () => {
     });
     spheres.push(sphere1);
 
-    const addr1 = sphere1.identity!.l1Address;
+    const addr1 = sphere1.identity!.chainPubkey;
     console.log(`Wallet 1: ${addr1}`);
 
     await sphere1.destroy();
@@ -337,9 +337,9 @@ describe('Wallet clear end-to-end', () => {
     expect(created).toBe(true);
     expect(sphere2.identity!.nametag).toBe(nametag2);
     // Different mnemonic → different address
-    expect(sphere2.identity!.l1Address).not.toBe(addr1);
+    expect(sphere2.identity!.chainPubkey).not.toBe(addr1);
 
-    console.log(`Wallet 2: ${sphere2.identity!.l1Address}`);
+    console.log(`Wallet 2: ${sphere2.identity!.chainPubkey}`);
     console.log('Clean slate wallet creation succeeded.');
 
     await sphere2.destroy();

@@ -24,8 +24,7 @@
 8. **Party resolution from manifest** — resolves party transport pubkeys from `party_a_address`/`party_b_address` DIRECT addresses, NOT from DM senders
 9. **DM dedup via `isRead`** — leverages SDK's `markAsRead()` persistence
 10. **DM processing queue** — bounded queue with drain, not drop-on-overflow
-11. **L1 disabled** — escrow doesn't need ALPHA blockchain
-12. **New wallet identity** — `@test-escrow-swap2` with fresh keypair
+11. **New wallet identity** — `@test-escrow-swap2` with fresh keypair
 
 ## Current E2E Test Status
 

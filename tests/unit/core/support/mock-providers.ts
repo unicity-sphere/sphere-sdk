@@ -153,8 +153,6 @@ export interface MockProviders {
   transport: TransportProvider & { _simulateEvent: (e: unknown) => void };
   oracle: OracleProvider & { _simulateEvent: (e: unknown) => void };
   tokenStorage: TokenStorageProvider<TxfStorageDataBase>;
-  /** L1 disabled so tests don't reach Fulcrum. */
-  l1: null;
 }
 
 export interface MakeMockProvidersOptions {
@@ -186,6 +184,5 @@ export function makeMockProviders(options: MakeMockProvidersOptions = {}): MockP
     transport: createMockTransport() as TransportProvider & { _simulateEvent: (e: unknown) => void },
     oracle: createMockOracle() as OracleProvider & { _simulateEvent: (e: unknown) => void },
     tokenStorage: createMockTokenStorage('indexeddb-tokens', 'IndexedDB'),
-    l1: null,
   };
 }

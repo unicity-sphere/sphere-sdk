@@ -174,7 +174,6 @@ async function main() {
   }
 
   // 4. Use the wallet
-  console.log('Address:', sphere.identity?.l1Address);
   console.log('Direct Address:', sphere.identity?.directAddress);
 
   // 5. Cleanup
@@ -226,12 +225,6 @@ const providers = createNodeProviders({
     url: 'https://gateway.testnet2.unicity.network',  // Replace default gateway URL
     trustBasePath: './trustbase.json',                // Local trust base file (optional)
     apiKey: 'sk_ddc3cfcc001e4a28ac3fad7407f99590',    // Gateway API key (public testnet2 key)
-  },
-
-  // L1 blockchain options
-  l1: {
-    electrumUrl: 'wss://custom-electrum:50004',
-    enableVesting: true,
   },
 
   // Price provider (optional — enables fiat value display)
@@ -288,10 +281,6 @@ const balances = sphere.payments.getBalance(); // Asset[]
 // Total portfolio value in USD (null if PriceProvider not configured)
 const totalUsd = await sphere.payments.getFiatBalance();
 console.log('Total USD:', totalUsd); // number | null
-
-// L1 (ALPHA) balance (payments.l1 is null when L1 is disabled via l1: null)
-const l1Balance = await sphere.payments.l1?.getBalance();
-console.log('L1 Balance:', l1Balance);
 ```
 
 ### Top Up (Testnet Self-Mint)
@@ -510,7 +499,7 @@ const index = sphere.getCurrentAddressIndex(); // 0
 
 // Switch to different address
 await sphere.switchToAddress(1);
-console.log('New address:', sphere.identity?.l1Address);
+console.log('New address:', sphere.identity?.directAddress);
 
 // Register nametag for this address
 await sphere.registerNametag('myname-work');
@@ -808,7 +797,6 @@ async function main() {
     console.log('==========================\n');
   }
 
-  console.log('L1 Address:', sphere.identity?.l1Address);
   console.log('Direct Address:', sphere.identity?.directAddress);
   console.log('Nametag:', sphere.identity?.nametag || '(not registered)');
 

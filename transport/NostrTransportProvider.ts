@@ -834,11 +834,6 @@ export class NostrTransportProvider implements TransportProvider {
       return this.resolveAddressInfo(identifier);
     }
 
-    // L1 address (alpha1... or alphat1...)
-    if (identifier.startsWith('alpha1') || identifier.startsWith('alphat1')) {
-      return this.resolveAddressInfo(identifier);
-    }
-
     // 66-char hex starting with 02/03 → compressed chain pubkey (33 bytes)
     if (/^0[23][0-9a-f]{64}$/i.test(identifier)) {
       return this.resolveAddressInfo(identifier);
@@ -873,7 +868,7 @@ export class NostrTransportProvider implements TransportProvider {
   }
 
   /**
-   * Resolve a DIRECT://, PROXY://, or L1 address to full peer info.
+   * Resolve a DIRECT:// or PROXY:// address to full peer info.
    * Performs reverse lookup via nostr-js-sdk with first-seen-wins anti-hijacking.
    */
   async resolveAddressInfo(address: string): Promise<PeerInfo | null> {
@@ -893,7 +888,6 @@ export class NostrTransportProvider implements TransportProvider {
       nametag: nametag || binding.nametag,
       transportPubkey: binding.transportPubkey,
       chainPubkey: binding.publicKey || '',
-      l1Address: binding.l1Address || '',
       directAddress: binding.directAddress || '',
       timestamp: binding.timestamp,
     };
@@ -925,7 +919,6 @@ export class NostrTransportProvider implements TransportProvider {
         nametag: content.nametag || undefined,
         transportPubkey: bindingEvent.pubkey,
         chainPubkey: content.public_key || '',
-        l1Address: content.l1_address || '',
         directAddress: content.direct_address || '',
         timestamp: bindingEvent.created_at * 1000,
       };
@@ -933,7 +926,6 @@ export class NostrTransportProvider implements TransportProvider {
       return {
         transportPubkey: bindingEvent.pubkey,
         chainPubkey: '',
-        l1Address: '',
         directAddress: '',
         timestamp: bindingEvent.created_at * 1000,
       };
@@ -974,7 +966,6 @@ export class NostrTransportProvider implements TransportProvider {
           nametag: content.nametag || undefined,
           transportPubkey: pubkey,
           chainPubkey: content.public_key || '',
-          l1Address: content.l1_address || '',
           directAddress: content.direct_address || '',
           timestamp: event.created_at * 1000,
         });
@@ -1045,7 +1036,7 @@ export class NostrTransportProvider implements TransportProvider {
 
   /**
    * Publish identity binding event on Nostr.
-   * Without nametag: publishes base binding (chainPubkey, l1Address, directAddress)
+   * Without nametag: publishes base binding (chainPubkey, directAddress)
    * using a per-identity d-tag for address discovery.
    * With nametag: delegates to nostr-js-sdk's publishNametagBinding which handles
    * conflict detection (first-seen-wins), encryption, and indexed tags.
@@ -1054,7 +1045,6 @@ export class NostrTransportProvider implements TransportProvider {
    */
   async publishIdentityBinding(
     chainPubkey: string,
-    l1Address: string,
     directAddress: string,
     nametag?: string,
   ): Promise<boolean> {
@@ -1074,7 +1064,6 @@ export class NostrTransportProvider implements TransportProvider {
           nostrPubkey,
           {
             publicKey: chainPubkey,
-            l1Address,
             directAddress,
           },
         );
@@ -1096,7 +1085,6 @@ export class NostrTransportProvider implements TransportProvider {
     // No nametag — delegate to nostr-js-sdk for base identity binding
     const success = await this.nostrClient!.publishIdentityBinding({
       publicKey: chainPubkey,
-      l1Address,
       directAddress,
     });
 

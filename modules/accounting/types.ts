@@ -22,7 +22,7 @@ import type { CommunicationsModule } from '../communications/CommunicationsModul
 /**
  * A fungible coin entry — same [coinId, amount] tuple used in TxfGenesisData.coinData.
  *
- * Examples: ["UCT", "1000000"], ["USDU", "500000000"], ["ALPHA", "200000"]
+ * Examples: ["UCT", "1000000"], ["USDU", "500000000"]
  *
  * This is the EXISTING format from TxfGenesisData.coinData: [string, string][].
  * Invoice targets reuse this exact type for consistency.

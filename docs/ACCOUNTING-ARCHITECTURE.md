@@ -153,7 +153,7 @@ Invoice #abc123 (encoded in tokenData):
     - coin: ["USDU", "500000000"]
     - coin: ["UCT", "1000000"]
   Target 2: DIRECT://bob...
-    - coin: ["ALPHA", "200000"]
+    - coin: ["USDU", "200000"]
 ```
 
 The invoice is **fully covered** only when every target address has received every requested asset in full.
@@ -791,7 +791,7 @@ Invoice OPEN
   <- receive 1000 UCT to target[0] (memo: INV:xxx:F) -> target[0] COVERED
   -- recipient spends the 500 USDU token on something else (no invoice ref) --
   -- ^^^ this does NOT affect the invoice balance (no INV: memo) --
-  <- receive 200 ALPHA to target[1] (memo: INV:xxx:F) -> COVERED (all targets met)
+  <- receive 200 USDU to target[1] (memo: INV:xxx:F) -> COVERED (all targets met)
   ... all tokens confirmed -> CLOSED (implicit)
 ```
 
@@ -993,7 +993,6 @@ These are **not** in scope for v1 but inform the architecture:
 - **Recurring invoices**: Repeat an invoice template on a schedule
 - **Invoice templates**: Reusable invoice definitions without minting
 - **Multi-signature approval**: Require N-of-M signers before invoice is valid
-- **L1 payment matching**: Match L1 (ALPHA) transfers to invoice targets via L1 history
 - **Cross-chain invoices**: Targets on different chains/networks
 - **Invoice negotiation**: Counter-offers modifying invoice terms via transport messages
 - **Payment reminders**: Use the `contacts` array (from `InvoiceSenderBalance`, accumulated from `inv.ct` on-chain payloads) to send structured reminder messages to payers when payment is overdue. Contact resolution priority: `contacts[0].address → senderAddress → null`. The `contact.url` field enables delivery via non-Nostr transports (HTTPS webhooks, WebSocket endpoints). (Note: **Receipts** and **cancellation notices** are now fully specified — see `sendInvoiceReceipts()` and `sendCancellationNotices()` in ACCOUNTING-SPEC.md §2.1, §4.10, and §4.11.)

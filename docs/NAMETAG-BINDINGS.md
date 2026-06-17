@@ -49,7 +49,7 @@ Sphere.init()
        ├─ recoverNametagFromTransport()  ← try to find existing nametag
        └─ syncIdentityWithTransport()    ← publish identity binding
             ├─ resolve(transportPubkey)   ← check for existing event
-            └─ publishIdentityBinding(chainPubkey, l1Address, directAddress)
+            └─ publishIdentityBinding(chainPubkey, directAddress)
                  └─ publishEvent(baseBindingEvent)  ← kind 30078, no nametag
 ```
 
@@ -71,7 +71,7 @@ await sphere.registerNametag('alice');
 1. Base identity binding: `d = SHA256('unicity:identity:' + nostrPubkey)`
 2. Nametag binding: `d = SHA256('unicity:nametag:alice')`
 
-Both events share address `#t` tags (hashed chainPubkey, l1Address, directAddress), so address-based reverse lookups find both.
+Both events share address `#t` tags (hashed chainPubkey, directAddress), so address-based reverse lookups find both.
 
 ## Event Formats
 
@@ -91,8 +91,6 @@ Published by `registerNametag()` via nostr-js-sdk's `publishNametagBinding()`.
     ["address", "<nostrPubkey>"],
     ["t", "<SHA256('unicity:address:' + chainPubkey)>"],
     ["pubkey", "<chainPubkey>"],
-    ["t", "<SHA256('unicity:address:' + l1Address)>"],
-    ["l1", "<l1Address>"],
     ["t", "<SHA256('unicity:address:' + directAddress)>"]
   ],
   "content": {
@@ -102,7 +100,6 @@ Published by `registerNametag()` via nostr-js-sdk's `publishNametagBinding()`.
     "nametag": "alice",
     "encrypted_nametag": "<AES-GCM encrypted>",
     "public_key": "02abc...",
-    "l1_address": "alpha1...",
     "direct_address": "DIRECT://..."
   }
 }
@@ -122,12 +119,10 @@ Published by `syncIdentityWithTransport()` when no nametag is set.
   "tags": [
     ["d", "<SHA256('unicity:identity:' + nostrPubkey)>"],
     ["t", "<SHA256('unicity:address:' + chainPubkey)>"],
-    ["t", "<SHA256('unicity:address:' + directAddress)>"],
-    ["t", "<SHA256('unicity:address:' + l1Address)>"]
+    ["t", "<SHA256('unicity:address:' + directAddress)>"]
   ],
   "content": {
     "public_key": "02abc...",
-    "l1_address": "alpha1...",
     "direct_address": "DIRECT://..."
   }
 }
@@ -179,7 +174,7 @@ Since the v1→v2 cutover, the Nostr binding alone IS the registration — there
 - Addresses are **hashed** in `t` tags: `SHA256('unicity:address:' + address)` — same relay-level privacy
 - **Plaintext nametag is stored in event content** (`content.nametag`). This is intentional: nametags must be publicly resolvable for the system to work (sending tokens to `@alice` requires resolving her addresses). The tag hashing provides relay-level indexing privacy, while content is publicly readable for kind 30078 events.
 - `encrypted_nametag` (AES-GCM) is a separate copy encrypted with the author's private key, enabling wallet recovery on import without relying on the plaintext field
-- `pubkey` and `l1` tags contain unhashed values for backward-compatible lookups
+- the `pubkey` tag contains an unhashed value for backward-compatible lookups
 
 ## SDK API
 
@@ -191,7 +186,7 @@ Since the v1→v2 cutover, the Nostr binding alone IS the registration — there
 await sphere.registerNametag('alice');
 
 // Low-level: publish identity binding directly
-await transport.publishIdentityBinding(chainPubkey, l1Address, directAddress, 'alice');
+await transport.publishIdentityBinding(chainPubkey, directAddress, 'alice');
 ```
 
 ### Resolving
@@ -199,12 +194,12 @@ await transport.publishIdentityBinding(chainPubkey, l1Address, directAddress, 'a
 ```typescript
 // Unified resolution (accepts @nametag, address, pubkey)
 const peer = await sphere.resolve('@alice');
-// { nametag, transportPubkey, chainPubkey, l1Address, directAddress, timestamp }
+// { nametag, transportPubkey, chainPubkey, directAddress, timestamp }
 
 // Low-level nostr-js-sdk methods
 const pubkey = await nostrClient.queryPubkeyByNametag('alice');
 const info = await nostrClient.queryBindingByNametag('alice');
-const info = await nostrClient.queryBindingByAddress('alpha1...');
+const info = await nostrClient.queryBindingByAddress('DIRECT://...');
 ```
 
 ### Recovery

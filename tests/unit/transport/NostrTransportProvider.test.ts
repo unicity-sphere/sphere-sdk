@@ -249,7 +249,6 @@ describe('Reconnect re-subscription', () => {
     provider.setIdentity({
       privateKey: 'a'.repeat(64),
       chainPubkey: '02' + 'b'.repeat(64),
-      l1Address: 'alpha1test',
       directAddress: 'DIRECT://test',
     });
 
@@ -375,7 +374,6 @@ describe('Event subscription pubkey format', () => {
     provider.setIdentity({
       privateKey: 'b'.repeat(64),
       chainPubkey: compressedPubkey, // 33-byte compressed
-      l1Address: 'alpha1test',
     });
 
     await provider.connect();
@@ -413,7 +411,6 @@ describe('Event subscription pubkey format', () => {
     provider.setIdentity({
       privateKey: 'b'.repeat(64),
       chainPubkey: '02' + 'a'.repeat(64),
-      l1Address: 'alpha1test',
     });
 
     await provider.connect();
@@ -446,7 +443,6 @@ describe('Event subscription pubkey format', () => {
     provider.setIdentity({
       privateKey: 'd'.repeat(64),
       chainPubkey: compressedPubkey,
-      l1Address: 'alpha1test',
     });
 
     const nostrPubkey = provider.getNostrPubkey();
@@ -560,7 +556,6 @@ describe('Last event timestamp persistence', () => {
     provider.setIdentity({
       privateKey: 'b'.repeat(64),
       chainPubkey: '02' + 'a'.repeat(64),
-      l1Address: 'alpha1test',
     });
   }
 

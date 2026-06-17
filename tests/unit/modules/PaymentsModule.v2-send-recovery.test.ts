@@ -35,7 +35,7 @@ const BOB_CHAIN_PUBKEY = '02' + 'ee'.repeat(32);
 
 function mockIdentity(): FullIdentity {
   return {
-    chainPubkey: FAKE_PUBKEY, l1Address: 'alpha1x', directAddress: 'DIRECT://x',
+    chainPubkey: FAKE_PUBKEY, directAddress: 'DIRECT://x',
     privateKey: FAKE_PRIVATE_KEY, transportPubkey: 'dd'.repeat(32),
   };
 }

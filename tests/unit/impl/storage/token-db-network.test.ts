@@ -14,7 +14,6 @@ import type { FullIdentity } from '../../../../types';
 const identity = {
   chainPubkey: '03aabb',
   directAddress: 'DIRECT://xyz',
-  l1Address: 'alpha1xyz',
   privateKey: 'priv',
   publicKey: 'pub',
 } as unknown as FullIdentity;

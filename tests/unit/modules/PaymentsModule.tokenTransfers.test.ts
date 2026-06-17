@@ -29,7 +29,7 @@ const BOB_DIRECT_ADDRESS = 'DIRECT://0000b97b4a83dc3fe636d4f21dbfe4c93149e073675
 
 function mockIdentity(): FullIdentity {
   return {
-    chainPubkey: FAKE_PUBKEY, l1Address: 'alpha1x', directAddress: 'DIRECT://x',
+    chainPubkey: FAKE_PUBKEY, directAddress: 'DIRECT://x',
     privateKey: FAKE_PRIVATE_KEY, transportPubkey: 'dd'.repeat(32),
   };
 }

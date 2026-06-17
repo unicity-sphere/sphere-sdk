@@ -104,7 +104,7 @@ describe('BUG-002 Fix 3: _executeTerminationReturns per-send timeout', () => {
   // ---------------------------------------------------------------------------
   it('UT-TERM-TIMEOUT-001: times out individual sends without blocking subsequent returns', async () => {
     const invoiceId = randomHex64();
-    const sender1 = 'DIRECT://sender_one_alpha111';
+    const sender1 = 'DIRECT://sender_one_aaa111';
     const sender2 = 'DIRECT://sender_two_beta222';
     const terms = buildTerms();
     seedInvoice(module, invoiceId, terms);

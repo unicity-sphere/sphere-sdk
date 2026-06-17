@@ -80,7 +80,6 @@ function createMockIdentity(): FullIdentity {
   return {
     privateKey: '01'.padStart(64, '0'), // valid non-zero key
     chainPubkey: MY_PUBKEY,
-    l1Address: 'alpha1testaddr',
     directAddress: 'DIRECT://testaddr',
     nametag: 'testuser',
   };

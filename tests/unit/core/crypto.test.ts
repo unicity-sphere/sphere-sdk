@@ -21,8 +21,6 @@ import {
   ripemd160,
   hash160,
   doubleSha256,
-  publicKeyToAddress,
-  privateKeyToAddressInfo,
   hexToBytes,
   bytesToHex,
   randomBytes,
@@ -329,35 +327,14 @@ describe('Hash Functions', () => {
 // =============================================================================
 
 describe('Address Generation', () => {
-  describe('publicKeyToAddress()', () => {
-    it('should generate bech32 address from public key', () => {
-      const address = publicKeyToAddress(ADDRESS_VECTORS[0].publicKey, 'alpha', 0);
-      expect(address.startsWith('alpha1')).toBe(true);
-    });
-
-    it('should generate address with custom prefix', () => {
-      const address = publicKeyToAddress(ADDRESS_VECTORS[0].publicKey, 'test', 0);
-      expect(address.startsWith('test1')).toBe(true);
-    });
-  });
-
-  describe('privateKeyToAddressInfo()', () => {
-    it('should return address and public key', () => {
-      const info = privateKeyToAddressInfo(ADDRESS_VECTORS[0].privateKey, 'alpha');
-      expect(info.publicKey).toBe(ADDRESS_VECTORS[0].publicKey);
-      expect(info.address.startsWith('alpha1')).toBe(true);
-    });
-  });
-
   describe('deriveAddressInfo()', () => {
-    it('should derive address info at index', () => {
+    it('should derive key info at index', () => {
       const seed = BIP39_VECTORS[0].seed;
       const masterKey = generateMasterKey(seed);
       const info = deriveAddressInfo(masterKey, "m/44'/0'/0'", 0);
 
       expect(info.privateKey).toHaveLength(64);
       expect(info.publicKey).toHaveLength(66);
-      expect(info.address.startsWith('alpha1')).toBe(true);
       expect(info.path).toBe("m/44'/0'/0'/0/0");
       expect(info.index).toBe(0);
     });
@@ -370,7 +347,7 @@ describe('Address Generation', () => {
 
       expect(receiving.path).toBe("m/44'/0'/0'/0/0");
       expect(change.path).toBe("m/44'/0'/0'/1/0");
-      expect(receiving.address).not.toBe(change.address);
+      expect(receiving.publicKey).not.toBe(change.publicKey);
     });
   });
 });

@@ -87,7 +87,7 @@ describe('SwapModule — manifest (computeSwapId, buildManifest, validateManifes
     const fields1: ManifestFields = {
       party_a_address: 'DIRECT://aaa',
       party_b_address: 'DIRECT://bbb',
-      party_a_currency_to_change: 'ALPHA',
+      party_a_currency_to_change: 'TUSD',
       party_a_value_to_change: '999',
       party_b_currency_to_change: 'BETA',
       party_b_value_to_change: '111',
@@ -99,7 +99,7 @@ describe('SwapModule — manifest (computeSwapId, buildManifest, validateManifes
       party_b_value_to_change: '111',
       party_a_address: 'DIRECT://aaa',
       timeout: 120,
-      party_a_currency_to_change: 'ALPHA',
+      party_a_currency_to_change: 'TUSD',
       party_b_address: 'DIRECT://bbb',
       party_b_currency_to_change: 'BETA',
       party_a_value_to_change: '999',

@@ -208,7 +208,6 @@ function createMockDeps(engine: FakeTokenEngine): PaymentsModuleDependencies {
 
   const mockIdentity: FullIdentity = {
     chainPubkey: 'aabbccdd11223344556677889900aabbccdd11223344556677889900aabbccdd11',
-    l1Address: 'alpha1testaddress',
     directAddress: 'DIRECT://test',
     privateKey: '0011223344556677889900aabbccddeeff0011223344556677889900aabbccddee',
   };

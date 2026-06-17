@@ -30,8 +30,6 @@ export interface BaseProvider extends ProviderMetadata {
 export interface Identity {
   /** 33-byte compressed secp256k1 public key (for L3 chain) */
   readonly chainPubkey: string;
-  /** L1 address (alpha1...) */
-  readonly l1Address: string;
   /** L3 DIRECT address (DIRECT://...) */
   readonly directAddress?: string;
   readonly ipnsName?: string;
@@ -372,8 +370,6 @@ export interface TrackedAddressEntry {
 export interface TrackedAddress extends TrackedAddressEntry {
   /** Short address identifier (e.g., "DIRECT_abc123_xyz789") */
   readonly addressId: string;
-  /** L1 bech32 address (alpha1...) */
-  readonly l1Address: string;
   /** L3 DIRECT address (DIRECT://...) */
   readonly directAddress: string;
   /** 33-byte compressed secp256k1 public key */
@@ -538,7 +534,7 @@ export interface SphereEventMap {
   'connection:changed': { provider: string; connected: boolean; status?: ProviderStatus; enabled?: boolean; error?: string };
   'nametag:registered': { nametag: string; addressIndex: number };
   'nametag:recovered': { nametag: string };
-  'identity:changed': { l1Address: string; directAddress?: string; chainPubkey: string; nametag?: string; addressIndex: number };
+  'identity:changed': { directAddress?: string; chainPubkey: string; nametag?: string; addressIndex: number };
   'address:activated': { address: TrackedAddress };
   'address:hidden': { index: number; addressId: string };
   'address:unhidden': { index: number; addressId: string };
@@ -696,6 +692,7 @@ export interface WalletInfo {
   readonly hasChainCode: boolean;
   readonly derivationMode: DerivationMode;
   readonly basePath: string;
+  /** Primary public address at index 0 (chain pubkey — display/reference only) */
   readonly address0: string | null;
 }
 
@@ -710,6 +707,7 @@ export interface WalletJSON {
     readonly masterPrivateKey?: string;
     readonly chainCode?: string;
     readonly addresses: ReadonlyArray<{
+      /** Public address (chain pubkey) — display/reference only; re-import keys on masterPrivateKey + path */
       readonly address: string;
       readonly publicKey: string;
       readonly path: string;
@@ -779,7 +777,6 @@ export interface NetworkHealthResult {
   services: {
     relay?: ServiceHealthResult;
     oracle?: ServiceHealthResult;
-    l1?: ServiceHealthResult;
     /** Custom service results keyed by user-provided name */
     [key: string]: ServiceHealthResult | undefined;
   };
@@ -792,7 +789,7 @@ export interface NetworkHealthResult {
 // =============================================================================
 
 /** Role of a provider in the system */
-export type ProviderRole = 'storage' | 'token-storage' | 'transport' | 'oracle' | 'l1' | 'price';
+export type ProviderRole = 'storage' | 'token-storage' | 'transport' | 'oracle' | 'price';
 
 /**
  * Rich status information for a single provider (used in getStatus())
@@ -822,6 +819,5 @@ export interface SphereStatus {
   tokenStorage: ProviderStatusInfo[];
   transport: ProviderStatusInfo[];
   oracle: ProviderStatusInfo[];
-  l1: ProviderStatusInfo[];
   price: ProviderStatusInfo[];
 }

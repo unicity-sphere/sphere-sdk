@@ -44,7 +44,6 @@ function createIdentity(index: number, seed: string): FullIdentity {
   return {
     privateKey: hex(`priv-${seed}-${index}`),
     chainPubkey: '02' + hex(`pub-${seed}-${index}`),
-    l1Address: `alpha1${seed}${index}`,
     directAddress: `DIRECT://${seed}_addr_${index}`,
     nametag: index === 0 ? `user-${seed}` : undefined,
   };
@@ -93,14 +92,14 @@ async function simulateCreateWallet(
   tokens: string[],
 ): Promise<void> {
   await storage.connect();
-  await storage.set(STORAGE_KEYS_GLOBAL.MNEMONIC, 'test mnemonic for ' + identity.l1Address);
+  await storage.set(STORAGE_KEYS_GLOBAL.MNEMONIC, 'test mnemonic for ' + identity.chainPubkey);
   await storage.set(STORAGE_KEYS_GLOBAL.WALLET_EXISTS, 'true');
-  await storage.set(STORAGE_KEYS_GLOBAL.MASTER_KEY, 'master-key-' + identity.l1Address);
+  await storage.set(STORAGE_KEYS_GLOBAL.MASTER_KEY, 'master-key-' + identity.chainPubkey);
 
   tokenStorage.setIdentity(identity);
   await tokenStorage.initialize();
   if (tokens.length > 0) {
-    await tokenStorage.save(createTxfData(identity.l1Address, tokens));
+    await tokenStorage.save(createTxfData(identity.chainPubkey, tokens));
   }
 }
 
@@ -198,7 +197,7 @@ describe('E2E: IndexedDB wallet lifecycle with leaked connections', () => {
 
       // Old data gone
       expect(await storage2.get(STORAGE_KEYS_GLOBAL.MNEMONIC)).toBe(
-        'test mnemonic for ' + identity2.l1Address,
+        'test mnemonic for ' + identity2.chainPubkey,
       );
       const load2 = await tokenStorage2.load();
       expect(countTokens(load2.data!)).toBe(1);
@@ -308,7 +307,7 @@ describe('E2E: IndexedDB wallet lifecycle with leaked connections', () => {
       const ts0 = createTokenStorage(tokenPrefix);
       ts0.setIdentity(identity0);
       await ts0.initialize();
-      await ts0.save(createTxfData(identity0.l1Address, ['addr0_token1', 'addr0_token2']));
+      await ts0.save(createTxfData(identity0.chainPubkey, ['addr0_token1', 'addr0_token2']));
       await ts0.shutdown();
 
       // === Address 1: save tokens ===
@@ -316,7 +315,7 @@ describe('E2E: IndexedDB wallet lifecycle with leaked connections', () => {
       const ts1 = createTokenStorage(tokenPrefix);
       ts1.setIdentity(identity1);
       await ts1.initialize();
-      await ts1.save(createTxfData(identity1.l1Address, ['addr1_token1']));
+      await ts1.save(createTxfData(identity1.chainPubkey, ['addr1_token1']));
 
       // === Leaked connection to address 1 (StrictMode) ===
       const leaked = createTokenStorage(tokenPrefix);
@@ -348,7 +347,7 @@ describe('E2E: IndexedDB wallet lifecycle with leaked connections', () => {
       const newTs0 = createTokenStorage(tokenPrefix);
       newTs0.setIdentity(identity0);
       await newTs0.initialize();
-      await newTs0.save(createTxfData(identity0.l1Address, ['new_token']));
+      await newTs0.save(createTxfData(identity0.chainPubkey, ['new_token']));
       const newLoad = await newTs0.load();
       expect(countTokens(newLoad.data!)).toBe(1);
 
@@ -480,7 +479,7 @@ describe('E2E: IndexedDB wallet lifecycle with leaked connections', () => {
       await simulateCreateWallet(tabA_storage2, tabA_tokens2, newIdentity, ['new_token']);
 
       // Tab A sees new data
-      expect(await tabA_storage2.get(STORAGE_KEYS_GLOBAL.MNEMONIC)).toContain(newIdentity.l1Address);
+      expect(await tabA_storage2.get(STORAGE_KEYS_GLOBAL.MNEMONIC)).toContain(newIdentity.chainPubkey);
       const newLoad = await tabA_tokens2.load();
       expect(countTokens(newLoad.data!)).toBe(1);
 
@@ -521,7 +520,7 @@ describe('E2E: IndexedDB wallet lifecycle with leaked connections', () => {
       tokenStorage1.setIdentity(identity1);
       await tokenStorage1.initialize();
       // Partial token data
-      await tokenStorage1.save(createTxfData(identity1.l1Address, ['partial_token']));
+      await tokenStorage1.save(createTxfData(identity1.chainPubkey, ['partial_token']));
 
       // Error cleanup (as SphereProvider.createWallet does on failure):
       // Sphere.clear() with 3s timeout
@@ -540,7 +539,7 @@ describe('E2E: IndexedDB wallet lifecycle with leaked connections', () => {
       await simulateCreateWallet(storage2, tokenStorage2, identity2, ['success_token']);
 
       // No partial data leaked
-      expect(await storage2.get(STORAGE_KEYS_GLOBAL.MNEMONIC)).toContain(identity2.l1Address);
+      expect(await storage2.get(STORAGE_KEYS_GLOBAL.MNEMONIC)).toContain(identity2.chainPubkey);
       const load = await tokenStorage2.load();
       expect(countTokens(load.data!)).toBe(1);
       expect(load.data!['_partial_token' as keyof TxfStorageDataBase]).toBeUndefined();

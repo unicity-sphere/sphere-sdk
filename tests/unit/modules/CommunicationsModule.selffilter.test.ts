@@ -66,7 +66,6 @@ function createMockIdentity(chainPubkey = MY_PUBKEY): FullIdentity {
   return {
     privateKey: '0'.repeat(64),
     chainPubkey,
-    l1Address: 'alpha1testaddr',
     directAddress: 'DIRECT://testaddr',
     nametag: 'testuser',
   };

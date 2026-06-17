@@ -248,9 +248,9 @@ function enrichWithRegistry(info: ParsedTokenInfo): ParsedTokenInfo {
  */
 export async function parseTokenInfo(tokenData: unknown, engine?: ITokenEngine): Promise<ParsedTokenInfo> {
   const defaultInfo: ParsedTokenInfo = {
-    coinId: 'ALPHA',
-    symbol: 'ALPHA',
-    name: 'Alpha Token',
+    coinId: 'UNKNOWN',
+    symbol: 'UNKNOWN',
+    name: 'Unknown Token',
     decimals: 0,
     amount: '0',
   };

@@ -48,7 +48,6 @@ function makeDevice(
   provider.setIdentity({
     privateKey: identity.privateKey,
     chainPubkey: identity.chainPubkey,
-    l1Address: 'alpha1wallettest',
   } as FullIdentity);
   return { client, provider, pubkey: identity.chainPubkey };
 }

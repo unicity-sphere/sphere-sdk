@@ -74,7 +74,7 @@ function createMockTransport(): TransportProvider {
     resolveNametag: vi.fn((nametag: string) => {
       return Promise.resolve(nostrRelayNametags.get(nametag) ?? null);
     }),
-    publishIdentityBinding: vi.fn((chainPubkey: string, _l1Address: string, _directAddress: string, nametag?: string) => {
+    publishIdentityBinding: vi.fn((chainPubkey: string, _directAddress: string, nametag?: string) => {
       if (nametag) {
         const existing = nostrRelayNametags.get(nametag);
         if (existing && existing !== chainPubkey) {
@@ -264,7 +264,7 @@ describe('Sphere.clear() integration', () => {
       await tokenStorage.save({
         _meta: {
           version: 1,
-          address: identity.l1Address!,
+          address: identity.chainPubkey,
           formatVersion: '2.0',
           updatedAt: Date.now(),
         },
@@ -329,7 +329,7 @@ describe('Sphere.clear() integration', () => {
         nametag: 'firstwallet',
       });
 
-      const firstAddress = sphere1.identity!.l1Address;
+      const firstAddress = sphere1.identity!.chainPubkey;
       await sphere1.destroy();
 
       // Clear
@@ -354,8 +354,8 @@ describe('Sphere.clear() integration', () => {
 
       expect(created).toBe(true);
       expect(sphere2.identity!.nametag).toBe('secondwallet');
-      // Different mnemonic = different address
-      expect(sphere2.identity!.l1Address).not.toBe(firstAddress);
+      // Different mnemonic = different identity
+      expect(sphere2.identity!.chainPubkey).not.toBe(firstAddress);
 
       await sphere2.destroy();
     });
@@ -382,13 +382,13 @@ describe('Sphere.clear() integration', () => {
       const addr1 = sphere.deriveAddress(1);
       const addr2 = sphere.deriveAddress(2);
 
-      expect(addr0.address).toBeDefined();
-      expect(addr1.address).toBeDefined();
-      expect(addr2.address).toBeDefined();
+      expect(addr0.publicKey).toBeDefined();
+      expect(addr1.publicKey).toBeDefined();
+      expect(addr2.publicKey).toBeDefined();
 
       // All should be different
-      expect(addr0.address).not.toBe(addr1.address);
-      expect(addr1.address).not.toBe(addr2.address);
+      expect(addr0.publicKey).not.toBe(addr1.publicKey);
+      expect(addr1.publicKey).not.toBe(addr2.publicKey);
 
       // Verify tracked addresses are stored
       const trackedJson = await storage.get(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES);
@@ -429,7 +429,7 @@ describe('Sphere.clear() integration', () => {
       await tokenStorage.save({
         _meta: {
           version: 1,
-          address: identity.l1Address!,
+          address: identity.chainPubkey,
           formatVersion: '2.0',
           updatedAt: Date.now(),
         },

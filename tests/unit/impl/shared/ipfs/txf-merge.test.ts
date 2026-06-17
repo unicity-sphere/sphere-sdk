@@ -170,15 +170,15 @@ describe('mergeTxfData', () => {
     it('should count each conflicting token separately', () => {
       const local: TxfStorageDataBase = {
         _meta: makeMeta(),
-        [tokenKey(1)]: { v: 'L1' },
-        [tokenKey(2)]: { v: 'L2' },
-        [tokenKey(3)]: { v: 'L3' },
+        [tokenKey(1)]: { v: 'local-1' },
+        [tokenKey(2)]: { v: 'local-2' },
+        [tokenKey(3)]: { v: 'local-3' },
       };
       const remote: TxfStorageDataBase = {
         _meta: makeMeta(),
-        [tokenKey(1)]: { v: 'R1' },
-        [tokenKey(2)]: { v: 'R2' },
-        [tokenKey(3)]: { v: 'R3' },
+        [tokenKey(1)]: { v: 'remote-1' },
+        [tokenKey(2)]: { v: 'remote-2' },
+        [tokenKey(3)]: { v: 'remote-3' },
       };
 
       const { conflicts } = mergeTxfData(local, remote);

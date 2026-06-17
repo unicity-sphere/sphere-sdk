@@ -186,7 +186,6 @@ describe('Sphere per-network storage isolation (shared backing dir)', () => {
       const a = await buildWallet(NETWORK_A);
 
       const addrA = a.identity!.directAddress;
-      const l1A = a.identity!.l1Address;
       const pkA = a.identity!.chainPubkey;
       expect(pkA).toBeTruthy();
 
@@ -253,7 +252,6 @@ describe('Sphere per-network storage isolation (shared backing dir)', () => {
       // 5) IDENTITY-SHARED — same address/chainPubkey (network-agnostic).
       // -------------------------------------------------------------------
       expect(b.identity!.chainPubkey).toBe(pkA);
-      expect(b.identity!.l1Address).toBe(l1A);
       expect(b.identity!.directAddress).toBe(addrA);
 
       // -------------------------------------------------------------------

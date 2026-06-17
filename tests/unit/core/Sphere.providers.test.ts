@@ -156,7 +156,7 @@ describe('TokenStorageProvider Management', () => {
       const identity: FullIdentity = {
         privateKey: 'a'.repeat(64),
         publicKey: 'b'.repeat(64),
-        address: 'alpha1test',
+        address: '02abtest',
         ipnsName: '12D3KooWtest',
       };
 
@@ -179,7 +179,7 @@ describe('TokenStorageProvider Management', () => {
       const testData: TxfStorageDataBase = {
         _meta: {
           version: 1,
-          address: 'alpha1test',
+          address: '02abtest',
           formatVersion: '2.0',
           updatedAt: Date.now(),
         },
@@ -201,7 +201,7 @@ describe('TokenStorageProvider Management', () => {
       const testData: TxfStorageDataBase = {
         _meta: {
           version: 1,
-          address: 'alpha1test',
+          address: '02abtest',
           formatVersion: '2.0',
           updatedAt: Date.now(),
         },

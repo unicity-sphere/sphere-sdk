@@ -34,7 +34,7 @@
  * }
  *
  * // Use the wallet
- * await sphere.payments.send({ coinId: 'ALPHA', amount: '1000', recipient: '@alice' });
+ * await sphere.payments.send({ coinId: 'UCT', amount: '1000', recipient: '@alice' });
  * ```
  */
 
@@ -93,7 +93,6 @@ import {
   getPublicKey,
   sha256,
   hexToBytes,
-  publicKeyToAddress,
   generateAddressFromMasterKey,
   signMessage as signMessageCrypto,
   type MasterKey,
@@ -518,6 +517,9 @@ export interface AddressModuleSet {
 export class Sphere {
   // Singleton
   private static instance: Sphere | null = null;
+
+  // One-time best-effort cleanup of the orphaned vesting cache (prior versions).
+  private static _orphanCacheCleaned = false;
 
   // State
   private _initialized = false;
@@ -1318,7 +1320,29 @@ export class Sphere {
     } else {
       logger.debug('Sphere', 'KV storage not connected, skipping');
     }
+
+    // 5. Best-effort: drop the orphaned vesting cache from prior versions.
+    Sphere.cleanupOrphanedVestingCache(false);
+
     logger.debug('Sphere', 'Done');
+  }
+
+  /**
+   * Best-effort delete of the orphaned `SphereVestingCacheV5` IndexedDB left by
+   * prior versions. Browser-only; never throws.
+   * @param once When true, runs at most once per process (load/init path); when
+   *             false, always runs (explicit clear()).
+   */
+  private static cleanupOrphanedVestingCache(once: boolean): void {
+    if (once) {
+      if (Sphere._orphanCacheCleaned) return;
+      Sphere._orphanCacheCleaned = true;
+    }
+    try {
+      if (typeof indexedDB !== 'undefined') {
+        indexedDB.deleteDatabase('SphereVestingCacheV5');
+      }
+    } catch { /* ignore — cleanup is best-effort */ }
   }
 
   /**
@@ -1354,7 +1378,7 @@ export class Sphere {
   // Public Properties - Modules
   // ===========================================================================
 
-  /** Payments module (L3 + L1) */
+  /** Payments module (L3) */
   get payments(): PaymentsModule {
     this.ensureReady();
     return this._payments;
@@ -1395,7 +1419,6 @@ export class Sphere {
     if (!this._identity) return null;
     return {
       chainPubkey: this._identity.chainPubkey,
-      l1Address: this._identity.l1Address,
       directAddress: this._identity.directAddress,
       ipnsName: this._identity.ipnsName,
       nametag: this._identity.nametag,
@@ -1579,10 +1602,10 @@ export class Sphere {
   getWalletInfo(): WalletInfo {
     let address0: string | null = null;
     try {
-      if (this._masterKey) {
-        address0 = this.deriveAddress(0).address;
-      } else if (this._identity) {
-        address0 = this._identity.l1Address;
+      if (this._identity) {
+        address0 = this._identity.chainPubkey;
+      } else if (this._masterKey) {
+        address0 = this.deriveAddress(0).publicKey;
       }
     } catch {
       // Ignore errors
@@ -1633,7 +1656,7 @@ export class Sphere {
       try {
         const addr = this.deriveAddress(i, false);
         addresses.push({
-          address: addr.address,
+          address: addr.publicKey,
           publicKey: addr.publicKey,
           path: addr.path,
           index: addr.index,
@@ -1642,7 +1665,7 @@ export class Sphere {
         // Stop if we can't derive more addresses (e.g., no masterKey)
         if (i === 0 && this._identity) {
           addresses.push({
-            address: this._identity.l1Address,
+            address: this._identity.chainPubkey,
             publicKey: this._identity.chainPubkey,
             path: this.getDefaultAddressPath(),
             index: 0,
@@ -1733,7 +1756,7 @@ export class Sphere {
       try {
         const addr = this.deriveAddress(i, false);
         addresses.push({
-          address: addr.address,
+          address: addr.publicKey,
           path: addr.path,
           index: addr.index,
           isChange: false,
@@ -1742,7 +1765,7 @@ export class Sphere {
         // Stop if we can't derive more addresses
         if (i === 0 && this._identity) {
           addresses.push({
-            address: this._identity.l1Address,
+            address: this._identity.chainPubkey,
             path: this.getDefaultAddressPath(),
             index: 0,
             isChange: false,
@@ -2312,7 +2335,7 @@ export class Sphere {
    * ```ts
    * // Switch to second address
    * await sphere.switchToAddress(1);
-   * console.log(sphere.identity?.address); // alpha1... (address at index 1)
+   * console.log(sphere.identity?.directAddress); // DIRECT://... (address at index 1)
    *
    * // Register nametag for this address
    * await sphere.registerNametag('bob');
@@ -2390,7 +2413,6 @@ export class Sphere {
     const newIdentity: MutableFullIdentity = {
       privateKey: addressInfo.privateKey,
       chainPubkey: addressInfo.publicKey,
-      l1Address: addressInfo.address,
       directAddress: predicateAddress,
       ipnsName: '12D3KooW' + ipnsHash,
       nametag,
@@ -2520,14 +2542,13 @@ export class Sphere {
     }
 
     this.emitEvent('identity:changed', {
-      l1Address: this._identity.l1Address,
       directAddress: this._identity.directAddress,
       chainPubkey: this._identity.chainPubkey,
       nametag: this._identity.nametag,
       addressIndex: index,
     });
 
-    logger.debug('Sphere', `Switched to address ${index}:`, this._identity.l1Address);
+    logger.debug('Sphere', `Switched to address ${index}:`, this._identity.chainPubkey);
 
     // Run transport sync and nametag operations in background
     this.postSwitchSync(index, newNametag).catch(err => {
@@ -2537,7 +2558,7 @@ export class Sphere {
 
   /**
    * Background transport sync and nametag operations after address switch.
-   * Runs after switchToAddress returns so L1/L3 queries can start immediately.
+   * Runs after switchToAddress returns so L3 queries can start immediately.
    */
   private async postSwitchSync(index: number, newNametag?: string): Promise<void> {
     // Sync identity with transport — recovers nametag from existing Nostr bindings
@@ -2898,13 +2919,13 @@ export class Sphere {
    *
    * @param index - Address index (0, 1, 2, ...)
    * @param isChange - Whether this is a change address (default: false)
-   * @returns Address info with privateKey, publicKey, address, path, index
+   * @returns Address info with privateKey, publicKey, path, index
    *
    * @example
    * ```ts
    * // Derive first receiving address
    * const addr0 = sphere.deriveAddress(0);
-   * console.log(addr0.address); // alpha1...
+   * console.log(addr0.publicKey); // 02... (compressed chain pubkey)
    *
    * // Derive second receiving address
    * const addr1 = sphere.deriveAddress(1);
@@ -2949,18 +2970,12 @@ export class Sphere {
       return generateAddressFromMasterKey(this._masterKey.privateKey, index);
     }
 
-    const info = deriveAddressInfo(
+    return deriveAddressInfo(
       this._masterKey,
       this._basePath,
       index,
       isChange
     );
-
-    // Convert to proper bech32 address format
-    return {
-      ...info,
-      address: publicKeyToAddress(info.publicKey, 'alpha'),
-    };
   }
 
   /**
@@ -2996,7 +3011,6 @@ export class Sphere {
     return {
       privateKey: derived.privateKey,
       publicKey,
-      address: publicKeyToAddress(publicKey, 'alpha'),
       path,
       index,
     };
@@ -3182,7 +3196,6 @@ export class Sphere {
       ),
       transport: [mkInfo(this._transport, 'transport', transportMeta)],
       oracle: [mkInfo(this._oracle, 'oracle')],
-      l1: [],
       price: priceProviders,
     };
   }
@@ -3384,13 +3397,13 @@ export class Sphere {
 
   /**
    * Resolve any identifier to full peer information.
-   * Accepts @nametag, bare nametag, DIRECT://, PROXY://, L1 address, or transport pubkey.
+   * Accepts @nametag, bare nametag, DIRECT://, PROXY://, chain pubkey, or transport pubkey.
    *
    * @example
    * ```ts
    * const peer = await sphere.resolve('@alice');
    * const peer = await sphere.resolve('DIRECT://...');
-   * const peer = await sphere.resolve('alpha1...');
+   * const peer = await sphere.resolve('02ab12...'); // 33-byte compressed chain pubkey
    * const peer = await sphere.resolve('ab12cd...'); // 64-char hex transport pubkey
    * ```
    */
@@ -3459,7 +3472,6 @@ export class Sphere {
     if (this._transport.publishIdentityBinding) {
       const success = await this._transport.publishIdentityBinding(
         this._identity!.chainPubkey,
-        this._identity!.l1Address,
         this._identity!.directAddress || '',
         cleanNametag,
       );
@@ -3608,7 +3620,6 @@ export class Sphere {
           const entry: TrackedAddress = {
             ...stored,
             addressId,
-            l1Address: addrInfo.address,
             directAddress,
             chainPubkey: addrInfo.publicKey,
           };
@@ -3671,7 +3682,6 @@ export class Sphere {
           const entry: TrackedAddress = {
             index: i,
             addressId,
-            l1Address: addrInfo.address,
             directAddress,
             chainPubkey: addrInfo.publicKey,
             nametag: nametagMap.get(0),
@@ -3710,7 +3720,6 @@ export class Sphere {
     const entry: TrackedAddress = {
       index,
       addressId,
-      l1Address: addrInfo.address,
       directAddress,
       chainPubkey: addrInfo.publicKey,
       nametag,
@@ -3766,7 +3775,7 @@ export class Sphere {
 
   /**
    * Publish identity binding via transport.
-   * Always publishes base identity (chainPubkey, l1Address, directAddress).
+   * Always publishes base identity (chainPubkey, directAddress).
    * If nametag is set, also publishes nametag hash, proxy address, encrypted nametag.
    */
   private async syncIdentityWithTransport(): Promise<void> {
@@ -3819,7 +3828,6 @@ export class Sphere {
               if (fromLegacy) {
                 await this._transport.publishIdentityBinding!(
                   this._identity!.chainPubkey,
-                  this._identity!.l1Address,
                   this._identity!.directAddress || '',
                   recoveredNametag,
                 );
@@ -3831,7 +3839,6 @@ export class Sphere {
             // Check if existing binding is missing critical fields — re-publish if so
             const needsUpdate =
               !existing.directAddress ||
-              !existing.l1Address ||
               !existing.chainPubkey ||
               (this._identity?.nametag && !existing.nametag);
 
@@ -3839,7 +3846,6 @@ export class Sphere {
               logger.debug('Sphere', 'Existing binding incomplete, re-publishing with full data');
               await this._transport.publishIdentityBinding!(
                 this._identity!.chainPubkey,
-                this._identity!.l1Address,
                 this._identity!.directAddress || '',
                 this._identity?.nametag || existing.nametag || undefined,
               );
@@ -3862,7 +3868,6 @@ export class Sphere {
       const nametag = this._identity?.nametag;
       const success = await this._transport.publishIdentityBinding(
         this._identity!.chainPubkey,
-        this._identity!.l1Address,
         this._identity!.directAddress || '',
         nametag || undefined,
       );
@@ -3890,23 +3895,10 @@ export class Sphere {
 
     let recoveredNametag: string | null = null;
 
-    // Strategy 1: Decrypt nametag from own Nostr binding events (private-key based)
+    // Decrypt nametag from own Nostr binding events (private-key based)
     if (this._transport.recoverNametag) {
       try {
         recoveredNametag = await this._transport.recoverNametag();
-      } catch {
-        // Non-fatal — try fallback
-      }
-    }
-
-    // Strategy 2: Forward lookup by L1 address hash (public, same as scanAddresses).
-    // Covers edge cases where the encrypted binding event was lost from relay.
-    if (!recoveredNametag && this._transport.resolveAddressInfo && this._identity?.l1Address) {
-      try {
-        const info = await this._transport.resolveAddressInfo(this._identity.l1Address);
-        if (info?.nametag) {
-          recoveredNametag = info.nametag;
-        }
       } catch {
         // Non-fatal
       }
@@ -4182,13 +4174,12 @@ export class Sphere {
       this._identity = {
         privateKey: addressInfo.privateKey,
         chainPubkey: addressInfo.publicKey,
-        l1Address: addressInfo.address,
         directAddress: predicateAddress,
         ipnsName: '12D3KooW' + ipnsHash,
         nametag,
       };
       this._storage.setIdentity(this._identity);
-      logger.debug('Sphere', `Restored to address ${this._currentAddressIndex}:`, this._identity.l1Address);
+      logger.debug('Sphere', `Restored to address ${this._currentAddressIndex}:`, this._identity.chainPubkey);
     } else if (this._identity && nametag) {
       // Restore nametag from cache
       this._identity.nametag = nametag;
@@ -4216,9 +4207,6 @@ export class Sphere {
     // Get public key from derived private key
     const publicKey = getPublicKey(derivedKey.privateKey);
 
-    // Generate proper bech32 address
-    const address = publicKeyToAddress(publicKey, 'alpha');
-
     // Generate IPNS name from public key hash
     const ipnsHash = sha256(publicKey, 'hex').slice(0, 40);
 
@@ -4228,7 +4216,6 @@ export class Sphere {
     this._identity = {
       privateKey: derivedKey.privateKey,
       chainPubkey: publicKey,
-      l1Address: address,
       directAddress: predicateAddress,
       ipnsName: '12D3KooW' + ipnsHash,
     };
@@ -4273,7 +4260,6 @@ export class Sphere {
     }
 
     const publicKey = getPublicKey(privateKey);
-    const address = publicKeyToAddress(publicKey, 'alpha');
     const ipnsHash = sha256(publicKey, 'hex').slice(0, 40);
 
     // Derive L3 predicate address (DIRECT://...)
@@ -4282,7 +4268,6 @@ export class Sphere {
     this._identity = {
       privateKey,
       chainPubkey: publicKey,
-      l1Address: address,
       directAddress: predicateAddress,
       ipnsName: '12D3KooW' + ipnsHash,
     };
@@ -4293,6 +4278,9 @@ export class Sphere {
   // ===========================================================================
 
   private async initializeProviders(): Promise<void> {
+    // Best-effort one-time: drop the orphaned vesting cache from prior versions.
+    Sphere.cleanupOrphanedVestingCache(true);
+
     // Set identity on providers
     this._storage.setIdentity(this._identity!);
 

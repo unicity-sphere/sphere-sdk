@@ -4,7 +4,7 @@
  * When an engine is passed and tokenData is the v2 engine blob (hex of
  * CBOR(TokenBlob)), the coin/amount come from engine.readValue and the
  * genesis-stable tokenId from engine.tokenId. Without an engine the legacy v1
- * TXF parsing is used (and a blob string falls through to the ALPHA defaults).
+ * TXF parsing is used (and a blob string falls through to the UNKNOWN defaults).
  */
 import { describe, it, expect } from 'vitest';
 import { parseTokenInfo } from '../../../modules/payments/PaymentsModule';
@@ -41,16 +41,16 @@ describe('parseTokenInfo — v2 engine path (B1)', () => {
     const info = await parseTokenInfo(sdkData, fake);
 
     expect(info.tokenId).toBe(fake.tokenId(dt));
-    expect(info.coinId).toBe('ALPHA'); // value-less → defaults for coin fields
+    expect(info.coinId).toBe('UNKNOWN'); // value-less → defaults for coin fields
   });
 
-  it('without an engine, a blob string falls through to ALPHA defaults', async () => {
+  it('without an engine, a blob string falls through to UNKNOWN defaults', async () => {
     const fake = new FakeTokenEngine();
     const sdkData = await blobSdkData(fake, UCT, 100n);
 
     const info = await parseTokenInfo(sdkData); // no engine
 
-    expect(info.coinId).toBe('ALPHA');
+    expect(info.coinId).toBe('UNKNOWN');
     expect(info.amount).toBe('0');
   });
 });

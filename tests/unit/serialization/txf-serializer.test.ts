@@ -32,7 +32,7 @@ const REGISTRY_DEFS = [
   { network: 'unicity:testnet', assetKind: 'fungible', name: 'solana', symbol: 'SOL', decimals: 9, description: '', id: 'dee5f8ce778562eec90e9c38a91296a023210ccc76ff4c29d527ac3eb64ade93' },
   { network: 'unicity:testnet', assetKind: 'fungible', name: 'ethereum', symbol: 'ETH', decimals: 18, description: '', id: '3c2450f2fd867e7bb60c6a69d7ad0e53ce967078c201a3ecaa6074ed4c0deafb' },
   { network: 'unicity:testnet', assetKind: 'fungible', name: 'unicity-eur', symbol: 'EURU', decimals: 6, description: '', id: '5e160d5e9fdbb03b553fb9c3f6e6c30efa41fa807be39fb4f18e43776e492925' },
-  { network: 'unicity:testnet', assetKind: 'fungible', name: 'alpha_test', symbol: 'ALPHT', decimals: 8, description: '', id: 'cde78ded16ef65818a51f43138031c4284e519300ab0cb60c30a8f9078080e5f' },
+  { network: 'unicity:testnet', assetKind: 'fungible', name: 'tether_test', symbol: 'TUSD', decimals: 8, description: '', id: 'aabbccdd16ef65818a51f43138031c4284e519300ab0cb60c30a8f9078080e5f' },
   { network: 'unicity:testnet', assetKind: 'fungible', name: 'tether', symbol: 'USDT', decimals: 6, description: '', id: '40d25444648418fe7efd433e147187a3a6adf049ac62bc46038bda5b960bf690' },
   { network: 'unicity:testnet', assetKind: 'fungible', name: 'usd-coin', symbol: 'USDC', decimals: 6, description: '', id: '2265121770fa6f41131dd9a6cc571e28679263d09a53eb2642e145b5b9a5b0a2' },
 ];
@@ -85,7 +85,7 @@ const createMockTxf = (): TxfToken => ({
       tokenId: 'abc123def456789',
       tokenType: 'fungible_type_hash',
       salt: 'random_salt_hex',
-      coinData: [['ALPHA_HEX', '1000000000000000000']],
+      coinData: [['TOKEN_HEX', '1000000000000000000']],
       tokenData: '',
       recipient: 'DIRECT://abc123def456789',
       recipientDataHash: null,
@@ -108,7 +108,7 @@ const createMockToken = (overrides: Partial<Token> = {}): Token => {
   const txf = createMockTxf();
   return {
     id: 'abc123def456789',
-    coinId: 'ALPHA_HEX',
+    coinId: 'TOKEN_HEX',
     symbol: 'UCT',
     name: 'Token',
     decimals: 8,
@@ -292,7 +292,7 @@ describe('txfToToken()', () => {
     const token = txfToToken('abc123def456789', txf);
 
     expect(token.id).toBe('abc123def456789');
-    expect(token.coinId).toBe('ALPHA_HEX');
+    expect(token.coinId).toBe('TOKEN_HEX');
     expect(token.amount).toBe('1000000000000000000');
     expect(token.status).toBe('confirmed');
     expect(token.sdkData).toBeDefined();
@@ -373,7 +373,7 @@ describe('txfToToken()', () => {
 describe('buildTxfStorageData()', () => {
   it('should build storage data with meta', async () => {
     const tokens = [createMockToken()];
-    const meta = { version: 1, address: 'alpha1test', ipnsName: 'k51test' };
+    const meta = { version: 1, address: '02test', ipnsName: 'k51test' };
 
     const result = await buildTxfStorageData(tokens, meta);
 
@@ -384,7 +384,7 @@ describe('buildTxfStorageData()', () => {
 
   it('should add tokens with underscore prefix', async () => {
     const token = createMockToken();
-    const meta = { version: 1, address: 'alpha1test', ipnsName: '' };
+    const meta = { version: 1, address: '02test', ipnsName: '' };
 
     const result = await buildTxfStorageData([token], meta);
 
@@ -398,7 +398,7 @@ describe('buildTxfStorageData()', () => {
   });
 
   it('should NOT include nametag in TXF (saved separately as nametag-{name}.json)', async () => {
-    const meta = { version: 1, address: 'alpha1test', ipnsName: '' };
+    const meta = { version: 1, address: '02test', ipnsName: '' };
     const nametag = {
       name: 'alice',
       token: { genesis: {}, state: {} },
@@ -415,7 +415,7 @@ describe('buildTxfStorageData()', () => {
   });
 
   it('should include tombstones if provided', async () => {
-    const meta = { version: 1, address: 'alpha1test', ipnsName: '' };
+    const meta = { version: 1, address: '02test', ipnsName: '' };
     const tombstones = [
       { tokenId: 'abc', stateHash: 'hash', timestamp: Date.now(), reason: 'transferred' as const },
     ];
@@ -426,7 +426,7 @@ describe('buildTxfStorageData()', () => {
   });
 
   it('should not include empty arrays', async () => {
-    const meta = { version: 1, address: 'alpha1test', ipnsName: '' };
+    const meta = { version: 1, address: '02test', ipnsName: '' };
 
     const result = await buildTxfStorageData([], meta, { tombstones: [] });
 
@@ -434,7 +434,7 @@ describe('buildTxfStorageData()', () => {
   });
 
   it('should include historyEntries as _history if provided', async () => {
-    const meta = { version: 1, address: 'alpha1test', ipnsName: '' };
+    const meta = { version: 1, address: '02test', ipnsName: '' };
     const historyEntries = [
       {
         dedupKey: 'RECEIVED_token1',
@@ -453,7 +453,7 @@ describe('buildTxfStorageData()', () => {
   });
 
   it('should not include _history if historyEntries is empty', async () => {
-    const meta = { version: 1, address: 'alpha1test', ipnsName: '' };
+    const meta = { version: 1, address: '02test', ipnsName: '' };
 
     const result = await buildTxfStorageData([], meta, { historyEntries: [] });
 
@@ -468,7 +468,7 @@ describe('buildTxfStorageData()', () => {
 describe('parseTxfStorageData()', () => {
   it('should parse valid storage data', async () => {
     const tokens = [createMockToken()];
-    const meta = { version: 1, address: 'alpha1test', ipnsName: '' };
+    const meta = { version: 1, address: '02test', ipnsName: '' };
     const storageData = await buildTxfStorageData(tokens, meta);
 
     const parsed = parseTxfStorageData(storageData);
@@ -479,7 +479,7 @@ describe('parseTxfStorageData()', () => {
   });
 
   it('should extract meta and nametag (backwards compatibility)', async () => {
-    const meta = { version: 2, address: 'alpha1abc', ipnsName: '' };
+    const meta = { version: 2, address: '02abc', ipnsName: '' };
     const nametag = {
       name: 'bob',
       token: { genesis: {}, state: {} },
@@ -500,7 +500,7 @@ describe('parseTxfStorageData()', () => {
   });
 
   it('should extract tombstones', async () => {
-    const meta = { version: 1, address: 'alpha1test', ipnsName: '' };
+    const meta = { version: 1, address: '02test', ipnsName: '' };
     const tombstones = [
       { tokenId: 'dead', stateHash: 'hash1', timestamp: 12345, reason: 'transferred' as const },
     ];
@@ -526,7 +526,7 @@ describe('parseTxfStorageData()', () => {
   });
 
   it('should extract history entries from _history', async () => {
-    const meta = { version: 1, address: 'alpha1test', ipnsName: '' };
+    const meta = { version: 1, address: '02test', ipnsName: '' };
     const historyEntries = [
       {
         dedupKey: 'RECEIVED_token1',
@@ -561,7 +561,7 @@ describe('parseTxfStorageData()', () => {
 
   it('should skip malformed history entries', () => {
     const storageData = {
-      _meta: { version: 1, address: 'alpha1test', ipnsName: '', formatVersion: '2.0' },
+      _meta: { version: 1, address: '02test', ipnsName: '', formatVersion: '2.0' },
       _history: [
         { dedupKey: 'valid', type: 'RECEIVED', amount: '100', coinId: 'UCT', symbol: 'UCT', timestamp: 1000, id: 'x' },
         { notADedupKey: 'bad' },        // missing dedupKey
@@ -754,7 +754,7 @@ const BTC_COIN_ID = '86bc190fcf7b2d07c6078de93db803578760148b16d4431aa2f42a3241f
 const UCT_COIN_ID = '455ad8720656b08e8dbd5bac1f3c73eeea5431565f6c1c3af742b1aa12d41d89';
 const USDU_COIN_ID = '8f0f3d7a5e7297be0ee98c63b81bcebb2740f43f616566fc290f9823a54f52d7';
 const EURU_COIN_ID = '5e160d5e9fdbb03b553fb9c3f6e6c30efa41fa807be39fb4f18e43776e492925';
-const ALPHT_COIN_ID = 'cde78ded16ef65818a51f43138031c4284e519300ab0cb60c30a8f9078080e5f';
+const TUSD_COIN_ID = 'aabbccdd16ef65818a51f43138031c4284e519300ab0cb60c30a8f9078080e5f';
 const USDT_COIN_ID = '40d25444648418fe7efd433e147187a3a6adf049ac62bc46038bda5b960bf690';
 const USDC_COIN_ID = '2265121770fa6f41131dd9a6cc571e28679263d09a53eb2642e145b5b9a5b0a2';
 
@@ -774,7 +774,7 @@ describe('buildTxfStorageData() multi-coin', () => {
       { coinId: UCT_COIN_ID, symbol: 'UCT', decimals: 18, amount: '100000000000000000000' },
       { coinId: USDU_COIN_ID, symbol: 'USDU', decimals: 6, amount: '1000000000' },
       { coinId: EURU_COIN_ID, symbol: 'EURU', decimals: 6, amount: '500000000' },
-      { coinId: ALPHT_COIN_ID, symbol: 'ALPHT', decimals: 8, amount: '200000000' },
+      { coinId: TUSD_COIN_ID, symbol: 'TUSD', decimals: 8, amount: '200000000' },
       { coinId: USDT_COIN_ID, symbol: 'USDT', decimals: 6, amount: '1000000000' },
       { coinId: USDC_COIN_ID, symbol: 'USDC', decimals: 6, amount: '1000000000' },
     ];
@@ -791,7 +791,7 @@ describe('buildTxfStorageData() multi-coin', () => {
       });
     });
 
-    const meta = { version: 1, address: 'alpha1test', ipnsName: '' };
+    const meta = { version: 1, address: '02test', ipnsName: '' };
     const result = await buildTxfStorageData(tokens, meta);
 
     const reservedKeys = ['_meta', '_nametag', '_tombstones', '_outbox', '_mintOutbox', '_invalidatedNametags'];
@@ -811,7 +811,7 @@ describe('parseTxfStorageData() multi-coin', () => {
       { coinId: UCT_COIN_ID, symbol: 'UCT', decimals: 18, amount: '100000000000000000000' },
       { coinId: USDU_COIN_ID, symbol: 'USDU', decimals: 6, amount: '1000000000' },
       { coinId: EURU_COIN_ID, symbol: 'EURU', decimals: 6, amount: '500000000' },
-      { coinId: ALPHT_COIN_ID, symbol: 'ALPHT', decimals: 8, amount: '200000000' },
+      { coinId: TUSD_COIN_ID, symbol: 'TUSD', decimals: 8, amount: '200000000' },
       { coinId: USDT_COIN_ID, symbol: 'USDT', decimals: 6, amount: '1000000000' },
       { coinId: USDC_COIN_ID, symbol: 'USDC', decimals: 6, amount: '1000000000' },
     ];
@@ -828,7 +828,7 @@ describe('parseTxfStorageData() multi-coin', () => {
       });
     });
 
-    const meta = { version: 1, address: 'alpha1test', ipnsName: '' };
+    const meta = { version: 1, address: '02test', ipnsName: '' };
     const storageData = await buildTxfStorageData(tokens, meta);
     const parsed = parseTxfStorageData(storageData);
 
@@ -854,7 +854,7 @@ describe('multi-coin round-trip', () => {
       { coinId: UCT_COIN_ID, symbol: 'UCT', decimals: 18, amount: '100000000000000000000' },
       { coinId: USDU_COIN_ID, symbol: 'USDU', decimals: 6, amount: '1000000000' },
       { coinId: EURU_COIN_ID, symbol: 'EURU', decimals: 6, amount: '500000000' },
-      { coinId: ALPHT_COIN_ID, symbol: 'ALPHT', decimals: 8, amount: '200000000' },
+      { coinId: TUSD_COIN_ID, symbol: 'TUSD', decimals: 8, amount: '200000000' },
       { coinId: USDT_COIN_ID, symbol: 'USDT', decimals: 6, amount: '750000000' },
       { coinId: USDC_COIN_ID, symbol: 'USDC', decimals: 6, amount: '250000000' },
     ];
@@ -871,7 +871,7 @@ describe('multi-coin round-trip', () => {
       });
     });
 
-    const meta = { version: 1, address: 'alpha1test', ipnsName: 'k51test' };
+    const meta = { version: 1, address: '02test', ipnsName: 'k51test' };
     const storageData = await buildTxfStorageData(tokens, meta);
     const parsed = parseTxfStorageData(storageData);
 
@@ -895,7 +895,7 @@ describe('multi-coin round-trip', () => {
       { coinId: UCT_COIN_ID, symbol: 'UCT', name: 'Unicity', decimals: 18 },
       { coinId: USDU_COIN_ID, symbol: 'USDU', name: 'Unicity-usd', decimals: 6 },
       { coinId: EURU_COIN_ID, symbol: 'EURU', name: 'Unicity-eur', decimals: 6 },
-      { coinId: ALPHT_COIN_ID, symbol: 'ALPHT', name: 'Alpha_test', decimals: 8 },
+      { coinId: TUSD_COIN_ID, symbol: 'TUSD', name: 'Tether_test', decimals: 8 },
       { coinId: USDT_COIN_ID, symbol: 'USDT', name: 'Tether', decimals: 6 },
       { coinId: USDC_COIN_ID, symbol: 'USDC', name: 'Usd-coin', decimals: 6 },
     ];
