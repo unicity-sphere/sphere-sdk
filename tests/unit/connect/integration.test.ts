@@ -55,6 +55,7 @@ function createMockSphere() {
       directAddress: 'DIRECT://test',
       nametag: 'alice',
     },
+    networkId: 4,
     payments: {
       getBalance: vi.fn().mockReturnValue([{ coinId: 'UCT', totalAmount: '1000000' }]),
       getAssets: vi.fn().mockResolvedValue([{ coinId: 'UCT', symbol: 'UCT', totalAmount: '1000000' }]),
@@ -127,6 +128,7 @@ describe('Sphere Connect Integration', () => {
     client = new ConnectClient({
       transport: transports.client,
       dapp: defaultDapp,
+      network: { id: 4 },
       ...overrides,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any);
