@@ -3,7 +3,7 @@
  * Session, configuration, and callback types.
  */
 
-import type { SphereConnectMessage, DAppMetadata, PublicIdentity } from './protocol';
+import type { SphereConnectMessage, DAppMetadata, PublicIdentity, NetworkInfo, SphereRpcError } from './protocol';
 import type { PermissionScope } from './permissions';
 
 // =============================================================================
@@ -51,6 +51,7 @@ export interface ConnectHostConfig {
     dapp: DAppMetadata,
     requestedPermissions: PermissionScope[],
     silent?: boolean,
+    clientInfo?: { protocolVersion: string; network?: NetworkInfo; sdkVersion?: string },
   ) => Promise<{ approved: boolean; grantedPermissions: PermissionScope[] }>;
 
   /** Called when dApp sends an intent. Wallet opens corresponding UI. */
@@ -63,8 +64,18 @@ export interface ConnectHostConfig {
   /** Called when dApp explicitly disconnects. Wallet can revoke persisted permissions. */
   onDisconnect?: (session: ConnectSession) => void | Promise<void>;
 
+  /** Notify-only: the compatibility gate rejected a connection. Lets the wallet surface the reason
+   *  in its UI. Does NOT affect the decision (the host already decided). `silent` is true for
+   *  auto-connect attempts — the wallet should not show UI for those. */
+  onConnectionRejected?: (dapp: DAppMetadata | undefined, error: SphereRpcError, silent: boolean) => void;
+
   /** Session time-to-live in ms. Default: 86400000 (24h). 0 = no expiry. */
   sessionTtlMs?: number;
+
+  /** Optional secondary npm-SDK floor (rarely needed — the Connect protocol version is the era gate). */
+  minSdkVersion?: string;
+  /** Optional MINOR floor within the current Connect MAJOR. */
+  minMinorVersion?: number;
 
   /** Max requests per second per session. Default: 20. */
   maxRequestsPerSecond?: number;
@@ -97,6 +108,10 @@ export interface ConnectClientConfig {
   /** If true, the connection will silently fail if the origin is not already approved by the wallet.
    *  No approval UI will be shown. Used for auto-connect on page load. */
   silent?: boolean;
+
+  /** The network this dApp is built for. Sent in the handshake; the wallet rejects a mismatch
+   *  with INCOMPATIBLE_NETWORK. */
+  network?: NetworkInfo;
 }
 
 // =============================================================================
@@ -119,4 +134,4 @@ export type ConnectEventHandler = (data: unknown) => void;
 // Re-exports for convenience
 // =============================================================================
 
-export type { DAppMetadata, PublicIdentity, SphereConnectMessage } from './protocol';
+export type { DAppMetadata, PublicIdentity, SphereConnectMessage, NetworkInfo, SphereRpcError } from './protocol';
