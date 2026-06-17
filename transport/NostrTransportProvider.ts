@@ -39,6 +39,7 @@ import { SphereError } from '../core/errors';
 import type {
   TransportProvider,
   MessageHandler,
+  SendMessageOptions,
   ComposingHandler,
   TokenTransferHandler,
   BroadcastHandler,
@@ -786,7 +787,11 @@ export class NostrTransportProvider implements TransportProvider {
     return this.keyManager.getPublicKeyHex();
   }
 
-  async sendMessage(recipientPubkey: string, content: string): Promise<string> {
+  async sendMessage(
+    recipientPubkey: string,
+    content: string,
+    options?: SendMessageOptions,
+  ): Promise<string> {
     this.ensureReady();
 
     // NIP-17 requires 32-byte x-only pubkey; strip 02/03 prefix if present
@@ -807,18 +812,24 @@ export class NostrTransportProvider implements TransportProvider {
 
     // NIP-17 self-wrap: send a copy to ourselves so relay can replay sent messages.
     // Content includes recipientPubkey and originalId for dedup against the live-sent record.
-    const selfWrapContent = JSON.stringify({
-      selfWrap: true,
-      originalId: giftWrap.id,
-      recipientPubkey,
-      senderNametag,
-      text: content,
-    });
-    const selfPubkey = this.keyManager!.getPublicKeyHex();
-    const selfGiftWrap = NIP17.createGiftWrap(this.keyManager!, selfPubkey, selfWrapContent);
-    this.publishEvent(selfGiftWrap).catch(err => {
-      logger.debug('Nostr', 'Self-wrap publish failed:', err);
-    });
+    //
+    // Skipped when `options.selfWrap === false` — short-lived senders (CLI RPC,
+    // sphere-sdk#555) exit before they could ever read their own self-wrap, so
+    // the publish is pure relay-index pollution for them.
+    if (options?.selfWrap !== false) {
+      const selfWrapContent = JSON.stringify({
+        selfWrap: true,
+        originalId: giftWrap.id,
+        recipientPubkey,
+        senderNametag,
+        text: content,
+      });
+      const selfPubkey = this.keyManager!.getPublicKeyHex();
+      const selfGiftWrap = NIP17.createGiftWrap(this.keyManager!, selfPubkey, selfWrapContent);
+      this.publishEvent(selfGiftWrap).catch(err => {
+        logger.debug('Nostr', 'Self-wrap publish failed:', err);
+      });
+    }
 
     this.emitEvent({
       type: 'message:sent',

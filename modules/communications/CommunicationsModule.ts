@@ -16,7 +16,12 @@ import type {
   SphereEventMap,
 } from '../../types';
 import type { StorageProvider } from '../../storage';
-import type { TransportProvider, IncomingMessage, IncomingBroadcast } from '../../transport';
+import type {
+  TransportProvider,
+  IncomingMessage,
+  IncomingBroadcast,
+  SendMessageOptions,
+} from '../../transport';
 import { STORAGE_KEYS_ADDRESS } from '../../constants';
 
 // =============================================================================
@@ -334,15 +339,26 @@ export class CommunicationsModule {
 
   /**
    * Send direct message
+   *
+   * @param recipient - @nametag, DIRECT://, PROXY://, L1 address, or chain/transport pubkey
+   * @param content   - Message body
+   * @param options   - Optional per-call transport behaviors. The most common
+   *                    use is `{ selfWrap: false }` for short-lived senders
+   *                    (CLI RPC) that exit before they could ever read their
+   *                    own self-wrap — see sphere-sdk#555.
    */
-  async sendDM(recipient: string, content: string): Promise<DirectMessage> {
+  async sendDM(
+    recipient: string,
+    content: string,
+    options?: SendMessageOptions,
+  ): Promise<DirectMessage> {
     this.ensureInitialized();
 
     // Resolve recipient
     const resolved = await this.resolveRecipient(recipient);
 
     // Send via transport
-    const eventId = await this.deps!.transport.sendMessage(resolved.pubkey, content);
+    const eventId = await this.deps!.transport.sendMessage(resolved.pubkey, content, options);
 
     // Create message record
     // isRead=false for sent messages means "not yet read by recipient".

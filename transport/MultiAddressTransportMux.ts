@@ -33,6 +33,7 @@ import type { ProviderStatus, FullIdentity } from '../types';
 import type {
   TransportProvider,
   MessageHandler,
+  SendMessageOptions,
   ComposingHandler,
   TokenTransferHandler,
   BroadcastHandler,
@@ -1589,11 +1590,17 @@ export class MultiAddressTransportMux {
 
   /**
    * Create and publish a NIP-17 gift wrap message for a specific address.
+   *
+   * When `options.selfWrap === false`, the self-wrap copy that normally goes
+   * to the sender's own pubkey is skipped. Used by short-lived senders (CLI
+   * RPC, sphere-sdk#555) that exit before they could ever read their own
+   * self-wrap.
    */
   async sendGiftWrap(
     addressIndex: number,
     recipientPubkey: string,
-    content: string
+    content: string,
+    options?: SendMessageOptions,
   ): Promise<string> {
     const entry = this.addresses.get(addressIndex);
     if (!entry) throw new SphereError('Address not registered in mux', 'NOT_INITIALIZED');
@@ -1609,21 +1616,23 @@ export class MultiAddressTransportMux {
     const giftWrapEvent = NostrEventClass.fromJSON(giftWrap);
     await this.nostrClient.publishEvent(giftWrapEvent);
 
-    // Self-wrap for relay replay
-    const selfPubkey = entry.keyManager.getPublicKeyHex();
-    const senderNametag = entry.identity.nametag;
-    const selfWrapContent = JSON.stringify({
-      selfWrap: true,
-      originalId: giftWrap.id,
-      recipientPubkey,
-      senderNametag,
-      text: content,
-    });
-    const selfGiftWrap = NIP17.createGiftWrap(entry.keyManager, selfPubkey, selfWrapContent);
-    const selfGiftWrapEvent = NostrEventClass.fromJSON(selfGiftWrap);
-    this.nostrClient.publishEvent(selfGiftWrapEvent).catch((err: unknown) => {
-      logger.debug('Mux', 'Self-wrap publish failed:', err);
-    });
+    // Self-wrap for relay replay (skipped when opted out — see sphere-sdk#555)
+    if (options?.selfWrap !== false) {
+      const selfPubkey = entry.keyManager.getPublicKeyHex();
+      const senderNametag = entry.identity.nametag;
+      const selfWrapContent = JSON.stringify({
+        selfWrap: true,
+        originalId: giftWrap.id,
+        recipientPubkey,
+        senderNametag,
+        text: content,
+      });
+      const selfGiftWrap = NIP17.createGiftWrap(entry.keyManager, selfPubkey, selfWrapContent);
+      const selfGiftWrapEvent = NostrEventClass.fromJSON(selfGiftWrap);
+      this.nostrClient.publishEvent(selfGiftWrapEvent).catch((err: unknown) => {
+        logger.debug('Mux', 'Self-wrap publish failed:', err);
+      });
+    }
 
     return giftWrap.id;
   }
@@ -2046,13 +2055,17 @@ export class AddressTransportAdapter implements TransportProvider {
   // Sending — delegates to mux with this address's keyManager
   // ===========================================================================
 
-  async sendMessage(recipientPubkey: string, content: string): Promise<string> {
+  async sendMessage(
+    recipientPubkey: string,
+    content: string,
+    options?: SendMessageOptions,
+  ): Promise<string> {
     const senderNametag = this.identity.nametag;
     const wrappedContent = senderNametag
       ? JSON.stringify({ senderNametag, text: content })
       : content;
 
-    return this.mux.sendGiftWrap(this.addressIndex, recipientPubkey, wrappedContent);
+    return this.mux.sendGiftWrap(this.addressIndex, recipientPubkey, wrappedContent, options);
   }
 
   async sendTokenTransfer(recipientPubkey: string, payload: TokenTransferPayload): Promise<string> {
