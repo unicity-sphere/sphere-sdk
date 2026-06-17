@@ -1103,6 +1103,17 @@ export class MultiAddressTransportMux {
     }
     if (event.id) {
       this.processedEventIds.add(event.id);
+      // [#559-diag] new event arrived — never seen before this process.
+      // Combined with the dedup-hit log + final set-size, this tells us
+      // exactly how many "fresh" events leaked past dedup → reached
+      // CommunicationsModule → AcpDmTransport.handleIncoming. That's the
+      // number that the M9 `buffered=K` would have measured.
+      logger.info(
+        'Mux',
+        `[#559-diag] new event ${event.id.slice(0, 12)}... ` +
+        `(kind=${event.kind}, sender=${(event.pubkey ?? '').slice(0, 12)}..., ` +
+        `total dedup set size=${this.processedEventIds.size})`,
+      );
       // FIFO half-flush — preserves the legacy "evict half on overflow"
       // behavior to avoid thrashing at the cap boundary under bursts.
       if (this.processedEventIds.size > MultiAddressTransportMux.MAX_PROCESSED_IDS) {
