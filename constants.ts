@@ -343,21 +343,9 @@ export const DEFAULT_DERIVATION_PATH = `${DEFAULT_BASE_PATH}/0/0` as const;
 
 /** Coin types */
 export const COIN_TYPES = {
-  /** ALPHA token (L1 blockchain) */
-  ALPHA: 'ALPHA',
   /** Test token */
   TEST: 'TEST',
 } as const;
-
-// =============================================================================
-// L1 (ALPHA Blockchain) Defaults
-// =============================================================================
-
-/** Default Fulcrum electrum server for mainnet */
-export const DEFAULT_ELECTRUM_URL = 'wss://fulcrum.unicity.network:50004' as const;
-
-/** Testnet Fulcrum electrum server */
-export const TEST_ELECTRUM_URL = 'wss://fulcrum.unicity.network:50004' as const;
 
 // =============================================================================
 // Token Registry Defaults
@@ -395,7 +383,6 @@ export interface NetworkConfig {
   readonly aggregatorUrl: string;
   readonly nostrRelays: readonly string[];
   readonly ipfsGateways: readonly string[];
-  readonly electrumUrl: string;
   readonly groupRelays: readonly string[];
   readonly tokenRegistryUrl: string;
 }
@@ -407,7 +394,6 @@ export const NETWORKS = {
     aggregatorUrl: DEFAULT_AGGREGATOR_URL,
     nostrRelays: DEFAULT_NOSTR_RELAYS,
     ipfsGateways: DEFAULT_IPFS_GATEWAYS,
-    electrumUrl: DEFAULT_ELECTRUM_URL,
     groupRelays: DEFAULT_GROUP_RELAYS,
     tokenRegistryUrl: TOKEN_REGISTRY_URL,
   },
@@ -418,9 +404,8 @@ export const NETWORKS = {
     name: 'Testnet2',
     // v2 state-transition gateway (networkId 4 comes from the trust base). apiKey is env-injected.
     aggregatorUrl: 'https://gateway.testnet2.unicity.network',
-    nostrRelays: TEST_NOSTR_RELAYS, // reuse testnet infra (shared relays/ipfs/electrum)
+    nostrRelays: TEST_NOSTR_RELAYS, // reuse testnet infra (shared relays/ipfs)
     ipfsGateways: DEFAULT_IPFS_GATEWAYS,
-    electrumUrl: TEST_ELECTRUM_URL,
     groupRelays: DEFAULT_GROUP_RELAYS,
     tokenRegistryUrl:
       'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.testnet2.json',
@@ -429,9 +414,8 @@ export const NETWORKS = {
     name: 'Testnet2',
     // v2 state-transition gateway (networkId 4 comes from the trust base). apiKey is env-injected.
     aggregatorUrl: 'https://gateway.testnet2.unicity.network',
-    nostrRelays: TEST_NOSTR_RELAYS, // reuse testnet infra (shared relays/ipfs/electrum)
+    nostrRelays: TEST_NOSTR_RELAYS, // reuse testnet infra (shared relays/ipfs)
     ipfsGateways: DEFAULT_IPFS_GATEWAYS,
-    electrumUrl: TEST_ELECTRUM_URL,
     groupRelays: DEFAULT_GROUP_RELAYS,
     tokenRegistryUrl:
       'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.testnet2.json',
@@ -444,7 +428,6 @@ export const NETWORKS = {
     aggregatorUrl: DEV_AGGREGATOR_URL,
     nostrRelays: TEST_NOSTR_RELAYS,
     ipfsGateways: DEFAULT_IPFS_GATEWAYS,
-    electrumUrl: TEST_ELECTRUM_URL,
     groupRelays: DEFAULT_GROUP_RELAYS,
     tokenRegistryUrl: TOKEN_REGISTRY_URL,
   },

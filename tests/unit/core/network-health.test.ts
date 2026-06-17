@@ -72,7 +72,6 @@ describe('checkNetworkHealth', () => {
 
       expect(result.services.oracle).toBeDefined();
       expect(result.services.relay).toBeUndefined();
-      expect(result.services.l1).toBeUndefined();
     });
   });
 
@@ -127,7 +126,7 @@ describe('checkNetworkHealth', () => {
     });
   });
 
-  describe('WebSocket checks (relay, l1)', () => {
+  describe('WebSocket checks (relay)', () => {
     let originalWS: unknown;
 
     beforeEach(() => {
@@ -152,16 +151,6 @@ describe('checkNetworkHealth', () => {
       expect(result.services.relay!.error).toContain('WebSocket not available');
     });
 
-    it('should report l1 unhealthy when WebSocket not available', async () => {
-      (globalThis as Record<string, unknown>).WebSocket = undefined;
-
-      const result = await checkNetworkHealth('testnet', { services: ['l1'] });
-
-      expect(result.services.l1).toBeDefined();
-      expect(result.services.l1!.healthy).toBe(false);
-      expect(result.services.l1!.error).toContain('WebSocket not available');
-    });
-
     it('should report relay healthy when WebSocket connects successfully', async () => {
       // Mock WebSocket that fires onopen immediately
       (globalThis as Record<string, unknown>).WebSocket = class MockWebSocket {
@@ -179,23 +168,6 @@ describe('checkNetworkHealth', () => {
       expect(result.services.relay!.healthy).toBe(true);
       expect(result.services.relay!.responseTimeMs).toBeGreaterThanOrEqual(0);
       expect(result.services.relay!.url).toContain('wss://');
-    });
-
-    it('should report l1 healthy when WebSocket connects successfully', async () => {
-      (globalThis as Record<string, unknown>).WebSocket = class MockWebSocket {
-        onopen: (() => void) | null = null;
-        onerror: (() => void) | null = null;
-        onclose: (() => void) | null = null;
-        constructor() {
-          setTimeout(() => this.onopen?.(), 1);
-        }
-        close() {}
-      };
-
-      const result = await checkNetworkHealth('testnet', { services: ['l1'] });
-
-      expect(result.services.l1!.healthy).toBe(true);
-      expect(result.services.l1!.responseTimeMs).toBeGreaterThanOrEqual(0);
     });
 
     it('should report relay unhealthy when WebSocket errors', async () => {
@@ -266,7 +238,7 @@ describe('checkNetworkHealth', () => {
 
   describe('parallel checks', () => {
     it('should check all services in parallel', async () => {
-      // Mock WebSocket for relay + l1
+      // Mock WebSocket for relay
       (globalThis as Record<string, unknown>).WebSocket = class MockWebSocket {
         onopen: (() => void) | null = null;
         onerror: (() => void) | null = null;
@@ -283,15 +255,13 @@ describe('checkNetworkHealth', () => {
       );
 
       const result = await checkNetworkHealth('testnet', {
-        services: ['relay', 'oracle', 'l1'],
+        services: ['relay', 'oracle'],
       });
 
       expect(result.services.relay).toBeDefined();
       expect(result.services.oracle).toBeDefined();
-      expect(result.services.l1).toBeDefined();
       expect(result.services.relay!.healthy).toBe(true);
       expect(result.services.oracle!.healthy).toBe(true);
-      expect(result.services.l1!.healthy).toBe(true);
       expect(result.healthy).toBe(true);
     });
 
@@ -326,7 +296,6 @@ describe('checkNetworkHealth', () => {
       expect(result.healthy).toBe(true);
       expect(result.services.relay).toBeUndefined();
       expect(result.services.oracle).toBeUndefined();
-      expect(result.services.l1).toBeUndefined();
       expect(result.totalTimeMs).toBeGreaterThanOrEqual(0);
     });
 
@@ -399,28 +368,6 @@ describe('checkNetworkHealth', () => {
 
       expect(result.services.relay!.healthy).toBe(true);
       expect(result.services.relay!.url).toBe('wss://my-custom-relay.example.com');
-    });
-
-    it('should use custom l1 URL from urls option', async () => {
-      (globalThis as Record<string, unknown>).WebSocket = class MockWebSocket {
-        url: string;
-        onopen: (() => void) | null = null;
-        onerror: (() => void) | null = null;
-        onclose: (() => void) | null = null;
-        constructor(url: string) {
-          this.url = url;
-          setTimeout(() => this.onopen?.(), 1);
-        }
-        close() {}
-      };
-
-      const result = await checkNetworkHealth('testnet', {
-        services: ['l1'],
-        urls: { l1: 'wss://my-custom-fulcrum.example.com:50004' },
-      });
-
-      expect(result.services.l1!.healthy).toBe(true);
-      expect(result.services.l1!.url).toBe('wss://my-custom-fulcrum.example.com:50004');
     });
 
     it('should mix custom and default URLs', async () => {
@@ -595,8 +542,8 @@ describe('checkNetworkHealth', () => {
   });
 
   describe('default behavior', () => {
-    it('should check all three services when no filter specified', async () => {
-      // WebSocket for relay + l1
+    it('should check relay and oracle when no filter specified', async () => {
+      // WebSocket for relay
       (globalThis as Record<string, unknown>).WebSocket = class MockWebSocket {
         onopen: (() => void) | null = null;
         onerror: (() => void) | null = null;
@@ -613,10 +560,9 @@ describe('checkNetworkHealth', () => {
 
       const result = await checkNetworkHealth('testnet');
 
-      // All three services should be checked
+      // Both built-in services should be checked
       expect(result.services.relay).toBeDefined();
       expect(result.services.oracle).toBeDefined();
-      expect(result.services.l1).toBeDefined();
     });
   });
 });

@@ -1,6 +1,6 @@
 /**
  * Tests for shared configuration resolvers
- * Covers extend/override pattern for transport, oracle, and L1 configs
+ * Covers extend/override pattern for transport and oracle configs
  */
 
 import { describe, it, expect } from 'vitest';
@@ -8,7 +8,6 @@ import {
   getNetworkConfig,
   resolveTransportConfig,
   resolveOracleConfig,
-  resolveL1Config,
   resolveArrayConfig,
   resolveMarketConfig,
 } from '../../../../impl/shared/resolvers';
@@ -196,52 +195,6 @@ describe('resolveOracleConfig', () => {
 });
 
 // =============================================================================
-// resolveL1Config
-// =============================================================================
-
-describe('resolveL1Config', () => {
-  it('should return undefined when config is undefined', () => {
-    const result = resolveL1Config('testnet', undefined);
-    expect(result).toBeUndefined();
-  });
-
-  it('should return config with network defaults when empty config provided', () => {
-    const result = resolveL1Config('testnet', {});
-    expect(result).toBeDefined();
-    expect(result?.electrumUrl).toBe(NETWORKS.testnet.electrumUrl);
-  });
-
-  it('should override electrumUrl when specified', () => {
-    const customUrl = 'wss://custom.fulcrum:50004';
-    const result = resolveL1Config('testnet', { electrumUrl: customUrl });
-    expect(result?.electrumUrl).toBe(customUrl);
-  });
-
-  it('should use network default electrumUrl when not specified', () => {
-    const result = resolveL1Config('testnet', { defaultFeeRate: 5 });
-    expect(result?.electrumUrl).toBe(NETWORKS.testnet.electrumUrl);
-  });
-
-  it('should pass through defaultFeeRate', () => {
-    const result = resolveL1Config('testnet', { defaultFeeRate: 20 });
-    expect(result?.defaultFeeRate).toBe(20);
-  });
-
-  it('should pass through enableVesting', () => {
-    const result = resolveL1Config('testnet', { enableVesting: true });
-    expect(result?.enableVesting).toBe(true);
-  });
-
-  it('should use different defaults for different networks', () => {
-    const mainnet = resolveL1Config('mainnet', {});
-    const testnet = resolveL1Config('testnet', {});
-
-    expect(mainnet?.electrumUrl).toBe(NETWORKS.mainnet.electrumUrl);
-    expect(testnet?.electrumUrl).toBe(NETWORKS.testnet.electrumUrl);
-  });
-});
-
-// =============================================================================
 // resolveArrayConfig
 // =============================================================================
 
@@ -352,10 +305,6 @@ describe('resolver integration', () => {
       apiKey: 'test-key',
     });
 
-    const l1 = resolveL1Config(network, {
-      enableVesting: true,
-    });
-
     // Transport should have defaults + extra relay
     expect(transport.relays.length).toBeGreaterThan(1);
     expect(transport.relays).toContain('wss://extra.relay');
@@ -364,10 +313,6 @@ describe('resolver integration', () => {
     // Oracle should have testnet URL
     expect(oracle.url).toBe(NETWORKS.testnet.aggregatorUrl);
     expect(oracle.apiKey).toBe('test-key');
-
-    // L1 should have testnet electrum URL
-    expect(l1?.electrumUrl).toBe(NETWORKS.testnet.electrumUrl);
-    expect(l1?.enableVesting).toBe(true);
   });
 
   it('should handle minimal config (just network)', () => {
@@ -375,10 +320,8 @@ describe('resolver integration', () => {
 
     const transport = resolveTransportConfig(network);
     const oracle = resolveOracleConfig(network);
-    const l1 = resolveL1Config(network, undefined);
 
     expect(transport.relays).toEqual([...NETWORKS.mainnet.nostrRelays]);
     expect(oracle.url).toBe(NETWORKS.mainnet.aggregatorUrl);
-    expect(l1).toBeUndefined();
   });
 });

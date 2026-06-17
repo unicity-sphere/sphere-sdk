@@ -71,7 +71,6 @@ describe.each(Object.keys(NETWORKS) as NetworkType[])('network "%s" config', (ne
   test('urls')('has all required URL fields present and truthy', () => {
     expect(config.tokenRegistryUrl).toBeTruthy();
     expect(config.aggregatorUrl).toBeTruthy();
-    expect(config.electrumUrl).toBeTruthy();
     expect(config.nostrRelays.length).toBeGreaterThan(0);
     expect(config.groupRelays.length).toBeGreaterThan(0);
   });

@@ -22,7 +22,6 @@ export * from './download';
 export type {
   BaseTransportConfig,
   BaseOracleConfig,
-  L1Config,
   BaseProviders,
 } from '../shared';
 
@@ -51,11 +50,9 @@ import {
   type BaseOracleConfig,
   type BasePriceConfig,
   type BaseMarketConfig,
-  type L1Config,
   type BrowserTransportExtensions,
   resolveTransportConfig,
   resolveOracleConfig,
-  resolveL1Config,
   resolvePriceConfig,
   resolveArrayConfig,
   getNetworkConfig,
@@ -178,8 +175,6 @@ export interface BrowserProvidersConfig {
   transport?: TransportConfig;
   /** Oracle (Aggregator) configuration - supports extend/override pattern */
   oracle?: OracleConfig;
-  /** L1 (ALPHA blockchain) configuration */
-  l1?: L1Config;
   /**
    * Token sync backends configuration
    * Supports multiple backends: IPFS, file, cloud (future)
@@ -200,8 +195,6 @@ export interface BrowserProviders {
   oracle: OracleProvider;
   /** Token storage provider for local persistence (IndexedDB) */
   tokenStorage: TokenStorageProvider<TxfStorageDataBase>;
-  /** L1 configuration (for passing to Sphere.init) */
-  l1?: L1Config;
   /** Price provider (optional — enables fiat value display) */
   price?: PriceProvider;
   /** IPFS token storage provider (when tokenSync.ipfs.enabled is true) */
@@ -388,7 +381,6 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
   // Resolve configurations using shared utilities
   const transportConfig = resolveTransportConfig(network, config?.transport);
   const oracleConfig = resolveOracleConfig(network, config?.oracle);
-  const l1Config = resolveL1Config(network, config?.l1);
   const tokenSyncConfig = resolveTokenSyncConfig(network, config?.tokenSync);
 
   const storage = createIndexedDBStorageProvider({ ...config?.storage, network });
@@ -436,7 +428,6 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
       network,
     }),
     tokenStorage: createIndexedDBTokenStorageProvider({ network }),
-    l1: l1Config,
     price: priceConfig ? createPriceProvider(priceConfig) : undefined,
     ipfsTokenStorage,
     tokenSyncConfig,

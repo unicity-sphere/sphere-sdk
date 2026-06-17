@@ -69,23 +69,6 @@ export interface NodeOracleExtensions {
 }
 
 // =============================================================================
-// L1 Configuration
-// =============================================================================
-
-/**
- * L1 (ALPHA blockchain) configuration
- * Same for all platforms
- */
-export interface L1Config {
-  /** Fulcrum WebSocket URL (if not set, uses network default) */
-  electrumUrl?: string;
-  /** Default fee rate in sat/byte */
-  defaultFeeRate?: number;
-  /** Enable vesting classification */
-  enableVesting?: boolean;
-}
-
-// =============================================================================
 // Price Configuration
 // =============================================================================
 
@@ -138,8 +121,6 @@ export interface BaseProvidersConfig {
   transport?: BaseTransportConfig;
   /** Oracle (Aggregator) configuration - supports extend/override pattern */
   oracle?: BaseOracleConfig;
-  /** L1 (ALPHA blockchain) configuration */
-  l1?: L1Config;
   /** Price provider configuration (optional — enables fiat value display) */
   price?: BasePriceConfig;
 }
@@ -157,8 +138,6 @@ export interface BaseProviders {
   tokenStorage: TokenStorageProvider<TxfStorageDataBase>;
   transport: TransportProvider;
   oracle: OracleProvider;
-  /** L1 configuration (for passing to Sphere.init). Pass null to disable L1 entirely. */
-  l1?: L1Config | null;
   /** Price provider (optional — enables fiat value display) */
   price?: PriceProvider;
 }

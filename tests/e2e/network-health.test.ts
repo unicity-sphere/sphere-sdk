@@ -53,35 +53,19 @@ describe('checkNetworkHealth — live testnet', () => {
     }
   }, 20000);
 
-  it('should check L1 (Electrum) on testnet', async () => {
-    const result = await checkNetworkHealth('testnet', {
-      services: ['l1'],
-      timeoutMs: 15000,
-    });
-
-    expect(result.services.l1).toBeDefined();
-    expect(result.services.l1!.url).toContain('wss://');
-    expect(typeof result.services.l1!.healthy).toBe('boolean');
-
-    if (result.services.l1!.healthy) {
-      expect(result.services.l1!.responseTimeMs).toBeGreaterThanOrEqual(0);
-    }
-  }, 20000);
-
   it('should check all services in parallel on testnet', async () => {
     const result = await checkNetworkHealth('testnet', {
       timeoutMs: 15000,
     });
 
-    // All three services should be present
+    // Both built-in services should be present
     expect(result.services.oracle).toBeDefined();
     expect(result.services.relay).toBeDefined();
-    expect(result.services.l1).toBeDefined();
 
     // Overall result
     expect(typeof result.healthy).toBe('boolean');
     expect(result.totalTimeMs).toBeGreaterThanOrEqual(0);
-    // Parallel checks — total time should be less than 3 × individual timeouts
+    // Parallel checks — total time should be less than 2 × individual timeouts
     expect(result.totalTimeMs).toBeLessThan(45000);
 
     // Log results for debugging

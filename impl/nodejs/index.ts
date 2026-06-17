@@ -19,7 +19,6 @@ export * from '../shared/wallet-api';
 export type {
   BaseTransportConfig,
   BaseOracleConfig,
-  L1Config,
   BaseProviders,
 } from '../shared';
 
@@ -49,11 +48,9 @@ import {
   type BaseOracleConfig,
   type BasePriceConfig,
   type BaseMarketConfig,
-  type L1Config,
   type NodeOracleExtensions,
   resolveTransportConfig,
   resolveOracleConfig,
-  resolveL1Config,
   resolvePriceConfig,
   resolveGroupChatConfig,
   resolveMarketConfig,
@@ -75,12 +72,6 @@ export type NodeTransportConfig = BaseTransportConfig;
  * Extends base with trustBasePath for file-based trust base
  */
 export type NodeOracleConfig = BaseOracleConfig & NodeOracleExtensions;
-
-/**
- * Node.js L1 configuration
- * Same as base
- */
-export type NodeL1Config = L1Config;
 
 // =============================================================================
 // Node.js Providers Configuration
@@ -115,8 +106,6 @@ export interface NodeProvidersConfig {
   transport?: NodeTransportConfig;
   /** Oracle (Aggregator) configuration */
   oracle?: NodeOracleConfig;
-  /** L1 (ALPHA blockchain) configuration */
-  l1?: NodeL1Config;
   /** Price provider configuration (optional — enables fiat value display) */
   price?: BasePriceConfig;
   /** Token sync backends configuration */
@@ -132,8 +121,6 @@ export interface NodeProviders {
   tokenStorage: TokenStorageProvider<TxfStorageDataBase>;
   transport: TransportProvider;
   oracle: OracleProvider;
-  /** L1 configuration (for passing to Sphere.init) */
-  l1?: L1Config;
   /** Price provider (optional — enables fiat value display) */
   price?: PriceProvider;
   /** IPFS token storage provider (when tokenSync.ipfs.enabled is true) */
@@ -171,9 +158,6 @@ export interface NodeProviders {
  *   oracle: {
  *     apiKey: 'my-api-key',
  *     trustBasePath: './trustbase.json',
- *   },
- *   l1: {
- *     enableVesting: true,
  *   },
  * });
  *
@@ -224,7 +208,6 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
   // Resolve configurations using shared utilities
   const transportConfig = resolveTransportConfig(network, config?.transport);
   const oracleConfig = resolveOracleConfig(network, config?.oracle);
-  const l1Config = resolveL1Config(network, config?.l1);
 
   const storage = createFileStorageProvider({
     dataDir: config?.dataDir ?? './sphere-data',
@@ -273,7 +256,6 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
       debug: oracleConfig.debug,
       network,
     }),
-    l1: l1Config,
     price: priceConfig ? createPriceProvider(priceConfig) : undefined,
     ipfsTokenStorage,
   };

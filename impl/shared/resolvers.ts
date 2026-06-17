@@ -9,7 +9,6 @@ import type {
   BaseOracleConfig,
   BasePriceConfig,
   BaseMarketConfig,
-  L1Config,
   ResolvedTransportConfig,
   ResolvedOracleConfig,
 } from './config';
@@ -116,44 +115,6 @@ export function resolveOracleConfig(
     debug: config?.debug,
     // Node.js-specific
     trustBasePath: config?.trustBasePath,
-  };
-}
-
-// =============================================================================
-// L1 Resolution
-// =============================================================================
-
-/**
- * Resolve L1 configuration with override pattern
- *
- * Only returns config if l1 is explicitly provided (L1 is optional)
- *
- * @example
- * ```ts
- * // No L1 config - returns undefined
- * resolveL1Config('testnet', undefined);
- *
- * // Enable L1 with defaults
- * resolveL1Config('testnet', {});
- *
- * // Override electrum URL
- * resolveL1Config('testnet', { electrumUrl: 'wss://custom.fulcrum:50004' });
- * ```
- */
-export function resolveL1Config(
-  network: NetworkType,
-  config?: L1Config
-): L1Config | undefined {
-  if (config === undefined) {
-    return undefined;
-  }
-
-  const networkConfig = getNetworkConfig(network);
-
-  return {
-    electrumUrl: config.electrumUrl ?? networkConfig.electrumUrl,
-    defaultFeeRate: config.defaultFeeRate,
-    enableVesting: config.enableVesting,
   };
 }
 
