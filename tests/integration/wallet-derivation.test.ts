@@ -19,14 +19,11 @@ import {
 } from '../../serialization/wallet-text';
 import {
   deriveAddressInfo,
+  generateAddressFromMasterKey,
   getPublicKey,
   publicKeyToAddress,
   type MasterKey,
 } from '../../core/crypto';
-import {
-  generateAddressFromMasterKey,
-  generateHDAddressBIP32,
-} from '../../l1/address';
 
 // =============================================================================
 // Test Wallet: BIP32 HD (with chain code)
@@ -90,14 +87,9 @@ describe('BIP32 HD wallet derivation', () => {
     expect(address).toBe(BIP32_WALLET.expectedAddresses[2]);
   });
 
-  it('should match L1 generateHDAddressBIP32 function', () => {
+  it('should match core deriveAddressInfo function', () => {
     for (let i = 0; i < BIP32_WALLET.expectedAddresses.length; i++) {
-      const addr = generateHDAddressBIP32(
-        BIP32_WALLET.masterKey,
-        BIP32_WALLET.chainCode,
-        i,
-        BIP32_WALLET.basePath,
-      );
+      const addr = deriveAddressInfo(masterKey, BIP32_WALLET.basePath, i, false);
       expect(addr.address).toBe(BIP32_WALLET.expectedAddresses[i]);
     }
   });

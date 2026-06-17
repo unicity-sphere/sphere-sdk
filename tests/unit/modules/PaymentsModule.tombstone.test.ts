@@ -33,13 +33,6 @@ import { sha256, bytesToHex } from '../../../core/crypto';
 // Mock platform modules (NOT the token SDK) to avoid network / file I/O
 // =============================================================================
 
-// Mock L1 network to prevent actual connection attempts
-vi.mock('../../../l1/network', () => ({
-  connect: vi.fn().mockResolvedValue(undefined),
-  disconnect: vi.fn(),
-  isWebSocketConnected: vi.fn().mockReturnValue(false),
-}));
-
 // Mock the registry to prevent file I/O
 vi.mock('../../../registry', () => ({
   TokenRegistry: {

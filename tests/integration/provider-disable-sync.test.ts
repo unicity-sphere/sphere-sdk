@@ -18,13 +18,6 @@ import type { TransportProvider, OracleProvider, TokenStorageProvider, TxfStorag
 import type { ProviderStatus } from '../../types';
 import { TEST_NETWORK } from '../test-network';
 
-// Mock L1 to avoid real WebSocket connections
-vi.mock('../../l1/network', () => ({
-  connect: vi.fn().mockResolvedValue(undefined),
-  disconnect: vi.fn(),
-  isWebSocketConnected: vi.fn().mockReturnValue(false),
-}));
-
 // =============================================================================
 // Test directories
 // =============================================================================

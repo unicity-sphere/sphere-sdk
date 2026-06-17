@@ -11,13 +11,6 @@ import type { TransportProvider } from '../../../transport';
 import type { OracleProvider } from '../../../oracle';
 import type { ProviderStatus, SphereEventMap } from '../../../types';
 
-// Mock L1 network module before importing Sphere
-vi.mock('../../../l1/network', () => ({
-  connect: vi.fn().mockResolvedValue(undefined),
-  disconnect: vi.fn(),
-  isWebSocketConnected: vi.fn().mockReturnValue(false),
-}));
-
 import { Sphere, type SphereWalletApiSession } from '../../../core/Sphere';
 import type { PaymentsModule } from '../../../modules/payments';
 import { TEST_NETWORK } from '../../test-network';

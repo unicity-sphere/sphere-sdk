@@ -456,6 +456,34 @@ export function generateAddressInfo(
   };
 }
 
+/**
+ * Generate address from master private key using HMAC-SHA512 derivation
+ * This matches exactly the original index.html implementation
+ * NOTE: This is NON-STANDARD derivation for legacy wallet compatibility.
+ *
+ * Dual-use: in `wif_hmac` derivation mode (legacy wallet import) this derives
+ * the wallet's chainPubkey (used for L3 identity), not just an alpha address.
+ *
+ * @param masterPrivateKey - 32-byte hex private key (64 chars)
+ * @param index - Address index
+ */
+export function generateAddressFromMasterKey(
+  masterPrivateKey: string,
+  index: number
+): AddressInfo {
+  const derivationPath = `m/44'/0'/${index}'`;
+
+  // HMAC-SHA512 with path as key (matching index.html exactly)
+  const hmacInput = CryptoJS.enc.Hex.parse(masterPrivateKey);
+  const hmacKey = CryptoJS.enc.Utf8.parse(derivationPath);
+  const hmacOutput = CryptoJS.HmacSHA512(hmacInput, hmacKey).toString();
+
+  // Use left 32 bytes for private key
+  const childPrivateKey = hmacOutput.substring(0, 64);
+
+  return generateAddressInfo(childPrivateKey, index, derivationPath);
+}
+
 // =============================================================================
 // Message Signing (secp256k1 ECDSA with recoverable signature)
 // =============================================================================

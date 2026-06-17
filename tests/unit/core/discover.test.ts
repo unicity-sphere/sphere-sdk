@@ -14,7 +14,6 @@ function makeDeriveFunc() {
   return (index: number) => ({
     transportPubkey: `pubkey_${index}`,
     chainPubkey: `02pubkey_${index}`,
-    l1Address: `alpha1_${index}`,
     directAddress: `DIRECT://addr_${index}`,
   });
 }
@@ -163,9 +162,9 @@ describe('discoverAddressesImpl', () => {
     );
 
     expect(result.addresses).toHaveLength(1);
-    // Should fallback to derived values
+    // Should fallback to derived values (l1Address has no derived fallback —
+    // it can only come from the binding event, so it stays empty here)
     expect(result.addresses[0].chainPubkey).toBe('02pubkey_0');
-    expect(result.addresses[0].l1Address).toBe('alpha1_0');
     expect(result.addresses[0].directAddress).toBe('DIRECT://addr_0');
   });
 

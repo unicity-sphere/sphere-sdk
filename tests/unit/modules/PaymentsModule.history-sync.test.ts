@@ -24,12 +24,6 @@ import { FakeTokenEngine } from '../token-engine/FakeTokenEngine';
 // Mock platform modules (NOT the token SDK) to avoid network / file I/O
 // =============================================================================
 
-vi.mock('../../../l1/network', () => ({
-  connect: vi.fn().mockResolvedValue(undefined),
-  disconnect: vi.fn(),
-  isWebSocketConnected: vi.fn().mockReturnValue(false),
-}));
-
 vi.mock('../../../registry', () => ({
   TokenRegistry: {
     getInstance: () => ({

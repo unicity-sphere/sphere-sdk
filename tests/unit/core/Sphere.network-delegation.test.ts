@@ -23,13 +23,6 @@ import { Sphere } from '../../../core/Sphere';
 import { makeMockProviders } from './support/mock-providers';
 import { TEST_NETWORK } from '../../test-network';
 
-// Mock L1 network module so init() never reaches Fulcrum (mirrors other core tests).
-vi.mock('../../../l1/network', () => ({
-  connect: vi.fn().mockResolvedValue(undefined),
-  disconnect: vi.fn(),
-  isWebSocketConnected: vi.fn().mockReturnValue(false),
-}));
-
 /**
  * Install a fetch spy that records every requested URL and returns a minimal,
  * valid token-definitions response ('[]' with HTTP 200) so refreshFromRemote()

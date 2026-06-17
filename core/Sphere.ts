@@ -94,6 +94,7 @@ import {
   sha256,
   hexToBytes,
   publicKeyToAddress,
+  generateAddressFromMasterKey,
   signMessage as signMessageCrypto,
   type MasterKey,
   type AddressInfo,
@@ -101,7 +102,6 @@ import {
 import { encryptSimple, decryptSimple, decryptWithSalt } from './encryption';
 import { discoverAddressesImpl } from './discover';
 import type { DiscoverAddressesOptions, DiscoverAddressesResult } from './discover';
-import { generateAddressFromMasterKey } from '../l1/address';
 import {
   parseWalletText,
   parseAndDecryptWalletText,
@@ -226,7 +226,7 @@ export interface SphereCreateOptions {
   password?: string;
   /**
    * Auto-discover previously used HD addresses after creation.
-   * - true: discover with defaults (Nostr + L1 scan, autoTrack: true)
+   * - true: discover with defaults (Nostr binding-event scan, autoTrack: true)
    * - DiscoverAddressesOptions: custom config
    * - false/undefined: no auto-discovery (default)
    */
@@ -281,7 +281,7 @@ export interface SphereLoadOptions {
   password?: string;
   /**
    * Auto-discover previously used HD addresses on load.
-   * - true: discover with defaults (Nostr + L1 scan, autoTrack: true)
+   * - true: discover with defaults (Nostr binding-event scan, autoTrack: true)
    * - DiscoverAddressesOptions: custom config
    * - false/undefined: no auto-discovery (default)
    */
@@ -348,7 +348,7 @@ export interface SphereImportOptions {
   password?: string;
   /**
    * Auto-discover previously used HD addresses after import.
-   * - true: discover with defaults (Nostr + L1 scan, autoTrack: true)
+   * - true: discover with defaults (Nostr binding-event scan, autoTrack: true)
    * - DiscoverAddressesOptions: custom config
    * - false/undefined: no auto-discovery (default)
    */
@@ -415,7 +415,7 @@ export interface SphereInitOptions {
   /**
    * Auto-discover previously used HD addresses when creating from mnemonic.
    * Only applies when wallet is newly created (not on load of existing wallet).
-   * - true: discover with defaults (Nostr + L1 scan, autoTrack: true)
+   * - true: discover with defaults (Nostr binding-event scan, autoTrack: true)
    * - DiscoverAddressesOptions: custom config
    * - false/undefined: no auto-discovery (default)
    */
@@ -3099,7 +3099,6 @@ export class Sphere {
         return {
           transportPubkey: addrInfo.publicKey.slice(2), // x-only 32 bytes
           chainPubkey: addrInfo.publicKey,
-          l1Address: addrInfo.address,
           directAddress: '', // not needed for discovery query
         };
       },
