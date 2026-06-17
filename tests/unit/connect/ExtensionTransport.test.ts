@@ -23,7 +23,7 @@ import type { SphereConnectMessage } from '../../../connect';
 function makeMsg(id = 'test-1'): SphereConnectMessage {
   return {
     ns: 'sphere-connect',
-    v: '1.0',
+    v: '2.0',
     type: 'rpc',
     id,
     method: 'sphere_getBalance',
