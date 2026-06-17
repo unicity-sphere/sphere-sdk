@@ -398,6 +398,9 @@ export interface NetworkConfig {
   readonly electrumUrl: string;
   readonly groupRelays: readonly string[];
   readonly tokenRegistryUrl: string;
+  /** Canonical numeric network id (= RootTrustBase.networkId; testnet2 = 4).
+   *  Optional: only set for networks that have a live v2 trust base. */
+  readonly networkId?: number;
 }
 
 /** Network configurations */
@@ -416,6 +419,7 @@ export const NETWORKS = {
   // run against it. 'testnet2' stays as an alias of the same configuration.
   testnet: {
     name: 'Testnet2',
+    networkId: 4,
     // v2 state-transition gateway (networkId 4 comes from the trust base). apiKey is env-injected.
     aggregatorUrl: 'https://gateway.testnet2.unicity.network',
     nostrRelays: TEST_NOSTR_RELAYS, // reuse testnet infra (shared relays/ipfs/electrum)
@@ -427,6 +431,7 @@ export const NETWORKS = {
   },
   testnet2: {
     name: 'Testnet2',
+    networkId: 4,
     // v2 state-transition gateway (networkId 4 comes from the trust base). apiKey is env-injected.
     aggregatorUrl: 'https://gateway.testnet2.unicity.network',
     nostrRelays: TEST_NOSTR_RELAYS, // reuse testnet infra (shared relays/ipfs/electrum)
@@ -451,6 +456,27 @@ export const NETWORKS = {
 } as const satisfies Record<string, NetworkConfig>;
 
 export type NetworkType = keyof typeof NETWORKS;
+
+/**
+ * A network descriptor — the canonical way to identify a Unicity network across
+ * the SDK and the Connect protocol. `id` is the canonical key (= RootTrustBase
+ * networkId, analogous to an EIP-155 chainId); `name` is human-readable metadata.
+ * Richer fields (gateway/symbol/explorer/icon) and switch/add-network are deferred.
+ */
+export interface NetworkInfo {
+  readonly id: number;
+  readonly name?: string;
+}
+
+/**
+ * Registry of known networks for dApps and wallets. Single-sourced from NETWORKS
+ * so it cannot drift. Use as `network: SPHERE_NETWORKS.testnet2`. Custom networks
+ * are the same shape: `network: { id, name }`. Only live v2 networks appear here;
+ * the legacy `testnet` alias is intentionally not surfaced.
+ */
+export const SPHERE_NETWORKS = {
+  testnet2: { id: NETWORKS.testnet2.networkId as number, name: 'testnet2' },
+} as const satisfies Record<string, NetworkInfo>;
 
 // =============================================================================
 // Timeouts & Limits
