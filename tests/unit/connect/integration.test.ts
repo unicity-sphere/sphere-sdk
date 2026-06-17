@@ -5,6 +5,7 @@ import type { ConnectTransport, SphereConnectMessage } from '../../../connect/ty
 import { PERMISSION_SCOPES } from '../../../connect/permissions';
 import { ERROR_CODES, RPC_METHODS, INTENT_ACTIONS } from '../../../connect/protocol';
 import type { PermissionScope } from '../../../connect/permissions';
+import { ConnectError } from '../../../connect';
 
 // =============================================================================
 // Mock Transport: connects two sides in-memory
@@ -550,5 +551,43 @@ describe('Sphere Connect Integration', () => {
       expect(result).toHaveLength(1);
       expect(result[0].peerNametag).toBeUndefined();
     });
+  });
+});
+
+describe('end-to-end gate over the mock transport pair', () => {
+  it('connects when protocol + network match', async () => {
+    const { host: hostT, client: clientT } = createMockTransportPair();
+    new ConnectHost({
+      sphere: createMockSphere(),
+      transport: hostT,
+      onConnectionRequest: async () => ({ approved: true, grantedPermissions: [PERMISSION_SCOPES.IDENTITY_READ] }),
+      onIntent: async () => ({}),
+    });
+    const client = new ConnectClient({
+      transport: clientT,
+      dapp: { name: 'd', url: 'https://d' },
+      permissions: [PERMISSION_SCOPES.IDENTITY_READ],
+      network: { id: 4 },
+    });
+    const res = await client.connect();
+    expect(res.sessionId).toBeTypeOf('string');
+    expect(client.walletNetwork?.id).toBe(4);
+  });
+
+  it('rejects a wrong-network client with a ConnectError', async () => {
+    const { host: hostT, client: clientT } = createMockTransportPair();
+    new ConnectHost({
+      sphere: createMockSphere(),
+      transport: hostT,
+      onConnectionRequest: async () => ({ approved: true, grantedPermissions: [] }),
+      onIntent: async () => ({}),
+    });
+    const client = new ConnectClient({
+      transport: clientT,
+      dapp: { name: 'd', url: 'https://d' },
+      permissions: [],
+      network: { id: 1 },
+    });
+    await expect(client.connect()).rejects.toBeInstanceOf(ConnectError);
   });
 });
