@@ -39,7 +39,7 @@ describe('Protocol', () => {
       })).toBe(false);
     });
 
-    it('returns false for wrong version', () => {
+    it('returns false for non-handshake traffic with a different MAJOR', () => {
       expect(isSphereConnectMessage({
         ns: SPHERE_CONNECT_NAMESPACE,
         v: '99.0',

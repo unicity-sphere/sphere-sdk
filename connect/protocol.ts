@@ -10,7 +10,7 @@ import { majorOf } from './semver';
 // =============================================================================
 
 export const SPHERE_CONNECT_NAMESPACE = 'sphere-connect';
-export const SPHERE_CONNECT_VERSION = '2.0';   // BUMPED from '1.0' (v1→v2 era boundary)
+export const SPHERE_CONNECT_VERSION = '2.0';   // Connect protocol version (semver MAJOR.MINOR)
 
 export { HOST_READY_TYPE, HOST_READY_TIMEOUT } from '../constants';
 
@@ -152,10 +152,14 @@ export interface SphereHandshake extends SphereMessageBase {
   readonly identity?: PublicIdentity;
   /** If true, wallet must NOT open any approval UI. Immediately reject if origin is not already approved. */
   readonly silent?: boolean;
-  readonly network?: NetworkInfo;    // request: dApp target; response: wallet active
-  readonly sdkVersion?: string;      // informational (npm version)
-  readonly error?: SphereRpcError;   // response: structured rejection reason
-  readonly warning?: SphereRpcError; // response: non-fatal deprecation notice
+  /** request: dApp target network; response: wallet active network */
+  readonly network?: NetworkInfo;
+  /** Informational: the dApp's npm SDK version. */
+  readonly sdkVersion?: string;
+  /** Response: structured rejection reason when the gate refuses the connection. */
+  readonly error?: SphereRpcError;
+  /** Response: non-fatal deprecation notice (does not block the connection). */
+  readonly warning?: SphereRpcError;
 }
 
 export interface SphereRpcError {

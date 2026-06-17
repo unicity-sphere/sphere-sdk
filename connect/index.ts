@@ -40,6 +40,7 @@ export type {
   SphereConnectMessage,
   DAppMetadata,
   PublicIdentity,
+  NetworkInfo,
 } from './protocol';
 
 // Permissions
