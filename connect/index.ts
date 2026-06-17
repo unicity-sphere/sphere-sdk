@@ -21,6 +21,7 @@ export {
   INTENT_ACTIONS,
   ERROR_CODES,
   WALLET_EVENTS,
+  SPHERE_NETWORKS,
   isSphereConnectMessage,
   createRequestId,
 } from './protocol';

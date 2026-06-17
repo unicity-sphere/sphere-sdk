@@ -12,7 +12,8 @@ import { majorOf } from './semver';
 export const SPHERE_CONNECT_NAMESPACE = 'sphere-connect';
 export const SPHERE_CONNECT_VERSION = '2.0';   // Connect protocol version (semver MAJOR.MINOR)
 
-export { HOST_READY_TYPE, HOST_READY_TIMEOUT } from '../constants';
+export { HOST_READY_TYPE, HOST_READY_TIMEOUT, SPHERE_NETWORKS } from '../constants';
+export type { NetworkInfo } from '../constants';
 
 // =============================================================================
 // RPC Method Names (query — return data, no UI)
@@ -179,11 +180,6 @@ export type SphereConnectMessage =
 // =============================================================================
 // Shared Types
 // =============================================================================
-
-export interface NetworkInfo {
-  readonly id: number;    // RootTrustBase.networkId (testnet2 = 4)
-  readonly name?: string; // 'testnet2' | 'mainnet' | ... (informational)
-}
 
 export interface DAppMetadata {
   readonly name: string;
