@@ -5,8 +5,6 @@
  * duplicate targets/coins, too many targets/assets, memo length limits,
  * payInvoice to non-target, returnInvoicePayment exceeding balance, and
  * MODULE_DESTROYED guard.
- *
- * @see docs/ACCOUNTING-TEST-SPEC.md §6 (cross-cutting concerns)
  */
 
 /* eslint-disable @typescript-eslint/no-explicit-any */

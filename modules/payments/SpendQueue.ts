@@ -6,8 +6,6 @@
  * no await anywhere in those methods. This guarantees atomicity between
  * free-amount reads, split calculation, and reservation writes within
  * JavaScript's single-threaded event loop.
- *
- * @see docs/SPEC-TOKEN-SPEND-QUEUE.md for the full design rationale.
  */
 
 /* eslint-disable @typescript-eslint/no-explicit-any */

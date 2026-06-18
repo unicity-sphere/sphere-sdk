@@ -6,10 +6,6 @@
  * and sender verification. All functions are pure/stateless — state lives in
  * SwapModule and SwapRef.
  *
- * @see docs/SWAP-SPEC.md §5 (acceptSwap escrow announcement)
- * @see docs/SWAP-SPEC.md §8 (status query)
- * @see docs/SWAP-IMPLEMENTATION-PLAN.md T1.2
- *
  * @module
  */
 

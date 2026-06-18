@@ -8,8 +8,6 @@
  * Used by AccountingModule.setAutoReturn() and the inbound event handler to ensure
  * each forward payment to a terminated invoice is returned at most once, even under
  * crash recovery or Nostr re-delivery.
- *
- * @see docs/ACCOUNTING-SPEC.md §7.5, §5.9
  */
 
 import type { StorageProvider } from '../../storage/storage-provider.js';

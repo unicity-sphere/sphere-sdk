@@ -2,7 +2,6 @@
  * AccountingModule — Events (Idempotency & Firing)
  *
  * Tests that all event types fire with correct payloads.
- * Corresponds to §3.13 of ACCOUNTING-TEST-SPEC.md.
  *
  * Test IDs: UT-EVENTS-001 through UT-EVENTS-025
  */

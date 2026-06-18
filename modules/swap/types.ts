@@ -4,8 +4,6 @@
  * All types for the SwapModule: deal/manifest, state machine, swap references,
  * DM message formats, escrow inbound messages, event payloads, configuration,
  * dependencies, and storage schemas.
- *
- * @see docs/SWAP-SPEC.md - Section 2
  */
 
 import type {

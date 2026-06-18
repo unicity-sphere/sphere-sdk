@@ -10,8 +10,6 @@
  * (INVOICE_MINT_FAILED / SphereError passthrough) is covered in
  * AccountingModule.createInvoice.test.ts; blob storage + import round-trips in
  * AccountingModule.v2-createInvoice.test.ts.
- *
- * @see docs/ACCOUNTING-TEST-SPEC.md §3.2 (UT-MINT subset)
  */
 
 /* eslint-disable @typescript-eslint/no-explicit-any */

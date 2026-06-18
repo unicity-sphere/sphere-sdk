@@ -2,7 +2,6 @@
  * AccountingModule — autoTerminateOnReturn
  *
  * Tests for the autoTerminateOnReturn config option.
- * Corresponds to §3.18 of ACCOUNTING-TEST-SPEC.md.
  *
  * Production scenario: autoTerminate fires when the wallet (acting as a target)
  * observes its OWN outgoing :RC/:RX return transfer. The Nostr transport echoes

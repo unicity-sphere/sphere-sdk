@@ -9,8 +9,6 @@
  * so the harness injects a FakeTokenEngine (no SDK vi.mock). Blob storage,
  * import round-trips and attribution mechanics on the same harness live in
  * AccountingModule.v2-createInvoice.test.ts.
- *
- * @see docs/ACCOUNTING-TEST-SPEC.md §3.2
  */
 
 /* eslint-disable @typescript-eslint/no-explicit-any */

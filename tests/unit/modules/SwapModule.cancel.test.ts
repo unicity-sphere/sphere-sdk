@@ -4,8 +4,6 @@
  *
  * 7 tests total:
  *   UT-SWAP-CANCEL-001 through UT-SWAP-CANCEL-007
- *
- * @see docs/SWAP-TEST-SPEC.md §3.7
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';

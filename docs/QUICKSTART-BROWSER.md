@@ -881,5 +881,4 @@ logger.setTagDebug('Nostr', true);
 
 - [API Reference](./API.md) - Full API documentation
 - [Integration Guide](./INTEGRATION.md) - Advanced integration patterns
-- [IPFS Storage Guide](./IPFS-STORAGE.md) - IPFS/IPNS token sync configuration
 - [Node.js Quick Start](./QUICKSTART-NODEJS.md) - For server-side usage

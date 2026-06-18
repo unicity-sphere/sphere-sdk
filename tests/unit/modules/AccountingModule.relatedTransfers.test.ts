@@ -4,8 +4,6 @@
  * Validates getRelatedTransfers(): empty array for unknown invoice,
  * all transfers for known invoice, direction filtering (forward/back),
  * both directions, and timestamp ordering.
- *
- * @see docs/ACCOUNTING-TEST-SPEC.md §3.8
  */
 
 /* eslint-disable @typescript-eslint/no-explicit-any */

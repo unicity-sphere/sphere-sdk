@@ -5,8 +5,6 @@
  * 15 tests total:
  *   UT-SWAP-ACCEPT-001 through UT-SWAP-ACCEPT-010 (10 accept tests)
  *   UT-SWAP-REJECT-001 through UT-SWAP-REJECT-005 (5 reject tests)
- *
- * @see docs/SWAP-TEST-SPEC.md §3.3
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';

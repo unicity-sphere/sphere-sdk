@@ -4,8 +4,6 @@
  * Tests for persisted data: cancelled/closed sets, frozen balances,
  * auto-return settings, ledger index, crash recovery, and storage
  * write order.
- *
- * @see docs/ACCOUNTING-TEST-SPEC.md §6
  */
 
 /* eslint-disable @typescript-eslint/no-explicit-any */

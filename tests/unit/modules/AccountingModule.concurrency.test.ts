@@ -4,8 +4,6 @@
  * Tests for per-invoice async mutex (§5.9): serialization of concurrent
  * operations on same invoice, parallel operations on different invoices,
  * gate release on error, and close+pay race condition handling.
- *
- * @see docs/ACCOUNTING-TEST-SPEC.md §6 (cross-cutting: concurrency)
  */
 
 /* eslint-disable @typescript-eslint/no-explicit-any */

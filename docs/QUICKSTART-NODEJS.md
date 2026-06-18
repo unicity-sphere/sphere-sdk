@@ -259,8 +259,6 @@ console.log(`Sync: +${result.added} -${result.removed}`);
 
 **Recovery after local data loss:** Re-initialize the wallet with the same mnemonic and call `sync()`. Tokens stored on IPFS will be restored automatically.
 
-See [IPFS Storage Guide](./IPFS-STORAGE.md) for full configuration, caching details, and troubleshooting.
-
 ## Common Operations
 
 ### Check Balance & Assets
@@ -884,5 +882,4 @@ logger.configure({
 
 - [API Reference](./API.md) - Full API documentation
 - [Integration Guide](./INTEGRATION.md) - Advanced integration patterns
-- [IPFS Storage Guide](./IPFS-STORAGE.md) - IPFS/IPNS token sync configuration
 - [Browser Quick Start](./QUICKSTART-BROWSER.md) - For web applications

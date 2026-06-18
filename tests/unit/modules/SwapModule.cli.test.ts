@@ -12,8 +12,6 @@
  * switch-case logic and verifying it calls the SwapModule methods
  * correctly. This avoids the fragility of importing the CLI module
  * with mocked globals.
- *
- * @see docs/SWAP-TEST-SPEC.md section 3 (UT-SWAP-CLI-001 to 033)
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';

@@ -4,8 +4,6 @@
  * Uses TWO SwapModule instances (party A and party B) connected via a mock
  * DM relay, plus an escrow simulator that responds to announce DMs with
  * deposit invoices, detects coverage, and delivers payout invoices.
- *
- * @see docs/SWAP-TEST-SPEC.md — INT-SWAP-001 through INT-SWAP-006
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';

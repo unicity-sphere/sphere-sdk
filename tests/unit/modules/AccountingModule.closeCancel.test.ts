@@ -5,8 +5,6 @@
  * 16 tests total:
  *   UT-CLOSE-001 through UT-CLOSE-010 (10 close tests)
  *   UT-CANCEL-001 through UT-CANCEL-006 (6 cancel tests)
- *
- * @see docs/ACCOUNTING-TEST-SPEC.md §3.7, §3.8
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';

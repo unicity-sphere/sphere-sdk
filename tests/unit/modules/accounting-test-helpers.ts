@@ -3,8 +3,6 @@
  *
  * Provides mock factories, fixture factories, and utility functions used
  * across all accounting test files.
- *
- * @see docs/ACCOUNTING-TEST-SPEC.md §2
  */
 
 import { vi } from 'vitest';

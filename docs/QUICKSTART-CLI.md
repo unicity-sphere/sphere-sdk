@@ -1553,5 +1553,4 @@ sphere daemon start --event transfer:incoming --action auto-receive
 - [Node.js Quick Start](./QUICKSTART-NODEJS.md) — SDK integration guide for Node.js applications
 - [Browser Quick Start](./QUICKSTART-BROWSER.md) — SDK integration guide for web applications
 - [API Reference](./API.md) — Full API documentation
-- [IPFS Storage Guide](./IPFS-STORAGE.md) — IPFS/IPNS token sync and recovery
 - [Connect Protocol](./CONNECT.md) — dApp-to-wallet RPC integration

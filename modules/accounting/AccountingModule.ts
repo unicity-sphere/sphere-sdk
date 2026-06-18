@@ -5,8 +5,6 @@
  * Sphere SDK. Persists invoice tokens, terminal-state sets, frozen balances, and
  * auto-return settings. Builds and maintains an incremental invoice-transfer index
  * (§5.4) for efficient per-invoice balance computation without full history rescans.
- *
- * @see docs/ACCOUNTING-SPEC.md
  */
 
 import { logger } from '../../core/logger.js';
@@ -115,8 +113,6 @@ const INV_LEDGER_PREFIX = 'inv_ledger:';
  * 3. `await load()` — load persisted state, populate index, subscribe to events
  * 4. Use public API methods
  * 5. `destroy()` — cleanup subscriptions and in-memory state
- *
- * @see docs/ACCOUNTING-SPEC.md §2.1
  */
 export class AccountingModule {
   // ---------------------------------------------------------------------------

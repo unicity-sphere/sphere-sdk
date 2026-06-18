@@ -4,8 +4,6 @@
  * Tests encodeTransferMessage / decodeTransferMessage round-trip, forward and
  * return payment parsing, invalid JSON handling, missing fields, and forward
  * compatibility (extra fields ignored).
- *
- * @see docs/ACCOUNTING-TEST-SPEC.md §4 (memo encoding)
  */
 
 import { describe, it, expect, afterEach, vi } from 'vitest';

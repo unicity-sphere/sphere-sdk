@@ -3,8 +3,6 @@
  *
  * UT-PAY-001 – UT-PAY-014  (14 tests)
  * UT-RETURN-001 – UT-RETURN-007 (7 tests)
- *
- * @see docs/ACCOUNTING-TEST-SPEC.md §3.9, §3.10
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';

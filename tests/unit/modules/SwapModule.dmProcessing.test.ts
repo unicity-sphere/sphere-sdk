@@ -6,8 +6,6 @@
  * Tests the handleIncomingDM private method indirectly via
  * _simulateIncomingDM() on the mock CommunicationsModule.
  * The DM handler is registered during load().
- *
- * @see docs/SWAP-TEST-SPEC.md section 3.8
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';

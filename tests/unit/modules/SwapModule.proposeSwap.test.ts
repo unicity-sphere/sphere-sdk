@@ -2,7 +2,6 @@
  * SwapModule.proposeSwap() unit tests.
  *
  * Test IDs: UT-SWAP-PROP-001 through UT-SWAP-PROP-019
- * @see docs/SWAP-TEST-SPEC.md section 3.2
  */
 
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';

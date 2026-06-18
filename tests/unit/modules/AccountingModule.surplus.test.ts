@@ -8,8 +8,6 @@
  * 2. Remaining surplus distributed to other senders in reverse iteration order
  * 3. Each sender capped at their net contribution
  * 4. Surplus prevents exploitation (1-unit last payment cannot capture entire surplus)
- *
- * @see docs/ACCOUNTING-SPEC.md §5.2, §7.3
  */
 
 import { describe, it, expect } from 'vitest';

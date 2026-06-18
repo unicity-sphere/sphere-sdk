@@ -2,7 +2,6 @@
  * AccountingModule — Payer-Side DM Processing
  *
  * Tests that incoming DMs are correctly parsed and dispatched as events.
- * Corresponds to §3.17 of ACCOUNTING-TEST-SPEC.md.
  *
  * Test IDs: UT-DM-001 through UT-DM-010
  */

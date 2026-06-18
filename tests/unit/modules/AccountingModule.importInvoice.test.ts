@@ -14,8 +14,6 @@
  * Uses the FakeTokenEngine harness (no SDK vi.mock): valid import blobs are
  * produced by minting a data token with crafted terms on the SAME engine
  * instance the module is wired with.
- *
- * @see docs/ACCOUNTING-TEST-SPEC.md §3.3
  */
 
 /* eslint-disable @typescript-eslint/no-explicit-any */

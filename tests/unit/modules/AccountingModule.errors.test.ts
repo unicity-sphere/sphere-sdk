@@ -10,8 +10,6 @@
  * only a v2 engine blob hex string (legacy v1 TXF objects → INVOICE_INVALID_DATA)
  * and createInvoice() mints via engine.mintDataToken. Engine-path cases use the
  * FakeTokenEngine harness (no SDK mocks).
- *
- * @see docs/ACCOUNTING-TEST-SPEC.md §6, Appendix B
  */
 
 /* eslint-disable @typescript-eslint/no-explicit-any */

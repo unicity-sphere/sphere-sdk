@@ -6,8 +6,6 @@
  * EXPIRED states; balance formulas; self-payment exclusion; multi-target and
  * multi-asset coverage; implicit close; per-sender tracking; and state
  * precedence rules.
- *
- * @see docs/ACCOUNTING-TEST-SPEC.md §3.4
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';

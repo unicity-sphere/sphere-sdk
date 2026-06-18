@@ -2,7 +2,6 @@
  * SwapModule input validation unit tests.
  *
  * Test IDs: UT-SWAP-VAL-001 through UT-SWAP-VAL-020
- * @see docs/SWAP-TEST-SPEC.md section 3.14
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';

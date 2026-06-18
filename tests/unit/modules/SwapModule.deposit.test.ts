@@ -4,8 +4,6 @@
  *
  * 8 tests total:
  *   UT-SWAP-DEP-001 through UT-SWAP-DEP-008
- *
- * @see docs/SWAP-TEST-SPEC.md §3.4
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';

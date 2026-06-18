@@ -429,8 +429,6 @@ const result = await sphere.payments.sync();
 console.log(`Added: ${result.added}, Removed: ${result.removed}`);
 ```
 
-See [IPFS Storage Guide](./IPFS-STORAGE.md) for full configuration, caching, merge rules, and troubleshooting.
-
 ### Transaction History
 
 ```typescript

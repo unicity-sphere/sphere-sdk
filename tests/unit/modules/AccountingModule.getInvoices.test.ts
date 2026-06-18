@@ -4,8 +4,6 @@
  * Validates listing, filtering (role, state), sorting, and pagination.
  * Tests inject invoices directly into private fields to avoid needing
  * the full minting flow.
- *
- * @see docs/ACCOUNTING-TEST-SPEC.md §3.5
  */
 
 /* eslint-disable @typescript-eslint/no-explicit-any */

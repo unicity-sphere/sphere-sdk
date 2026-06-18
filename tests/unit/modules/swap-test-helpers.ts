@@ -3,8 +3,6 @@
  *
  * Provides mock factories, fixture factories, DM simulation helpers, and
  * the orchestrator function used across all swap test files.
- *
- * @see docs/SWAP-TEST-SPEC.md section 2
  */
 
 import { vi } from 'vitest';

@@ -2,8 +2,8 @@
  * AccountingModule — sendInvoiceReceipts() + sendCancellationNotices()
  *
  * Combined receipt and cancellation notice tests.
- * Corresponds to §3.22 (UT-RECEIPTS-001 through UT-RECEIPTS-016) and
- * §3.23 (UT-NOTICES-001 through UT-NOTICES-014) of ACCOUNTING-TEST-SPEC.md.
+ * Test IDs: UT-RECEIPTS-001 through UT-RECEIPTS-016 and
+ * UT-NOTICES-001 through UT-NOTICES-014.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';

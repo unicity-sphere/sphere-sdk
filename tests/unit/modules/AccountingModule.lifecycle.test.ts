@@ -3,8 +3,6 @@
  *
  * Covers module initialization, load(), destroy(), MODULE_DESTROYED guard,
  * exempt-method behaviour, and the load-subscribe gap re-scan (§7.6 step 7b).
- *
- * @see docs/ACCOUNTING-TEST-SPEC.md §3.1
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';

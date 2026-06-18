@@ -4,8 +4,6 @@
  * UT-SWAP-ERR-001 through UT-SWAP-ERR-015
  *
  * Tests that each error code is thrown with the correct SphereError.code.
- *
- * @see docs/SWAP-TEST-SPEC.md section 3.15
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';

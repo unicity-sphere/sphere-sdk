@@ -6,8 +6,6 @@
  * Tests the setupInvoiceEventSubscriptions private method by triggering
  * invoice events via _emit() on the mock AccountingModule. The invoice
  * event handlers are registered during load().
- *
- * @see docs/SWAP-TEST-SPEC.md section 3.9
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';

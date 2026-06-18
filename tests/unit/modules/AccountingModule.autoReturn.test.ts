@@ -1,7 +1,7 @@
 /**
  * AccountingModule — setAutoReturn() / getAutoReturnSettings()
  *
- * Tests for the auto-return settings management (§3.11 of ACCOUNTING-TEST-SPEC.md).
+ * Tests for the auto-return settings management.
  *
  * Test IDs: UT-AUTORET-001 through UT-AUTORET-009
  */

@@ -5,8 +5,6 @@
  *
  * All functions under test are pure (no side effects, no module state).
  * Tests do NOT require a module instance.
- *
- * @see docs/ACCOUNTING-TEST-SPEC.md §3.12
  */
 
 import { describe, it, expect } from 'vitest';

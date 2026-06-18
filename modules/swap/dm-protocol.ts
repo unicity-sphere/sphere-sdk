@@ -17,8 +17,6 @@
  * The universal parser {@link parseSwapDM} accepts any DM content and returns
  * a typed discriminated union or `null` for unrecognized content.
  *
- * @see docs/SWAP-SPEC.md sections 2.4-2.5 for message type definitions
- * @see docs/SWAP-SPEC.md section 12 for DM processing handlers
  * @see escrow-service/docs/protocol-spec.md for escrow wire format
  *
  * @module

@@ -4,7 +4,7 @@
  * Produces a deterministic JSON string from an InvoiceTerms object, suitable
  * for use as the input to SHA-256 when deriving an invoice token ID.
  *
- * Serialization rules (per §3.4 of ACCOUNTING-SPEC.md):
+ * Serialization rules:
  *
  * 1. Sort targets by address (lexicographic, ascending).
  * 2. Within each target, sort assets: coins before NFTs; coins sorted by

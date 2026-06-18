@@ -10,8 +10,6 @@
  * compute coverage, or execute payouts. Those responsibilities belong to the
  * escrow service. The module manages the wallet-side state machine, DM protocol,
  * and local persistence.
- *
- * @see docs/SWAP-SPEC.md
  */
 
 import { logger } from '../../core/logger.js';
@@ -172,7 +170,7 @@ export class SwapModule {
   /**
    * Load persisted state from storage and subscribe to event streams.
    *
-   * Steps (per SWAP-SPEC section 3.4):
+   * Steps:
    * 1. Load persisted swap records from storage.
    * 2. Purge terminal swaps older than terminalPurgeTtlMs.
    * 3. Clean up stale proposals (proposer-side timeout).

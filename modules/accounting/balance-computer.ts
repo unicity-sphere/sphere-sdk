@@ -11,8 +11,6 @@
  * - Self-payments (sender == destination == wallet address) are excluded
  * - DIRECT:// address comparisons are case-sensitive exact string matches
  * - Terminal state (frozen) takes full priority over dynamic computation
- *
- * @see docs/ACCOUNTING-SPEC.md §5.1, §5.2, §7.3
  */
 
 import type {
@@ -79,8 +77,6 @@ interface TargetAccumulator {
  *
  * Accepts "0" (zero value). Rejects empty strings, negative values, and
  * strings exceeding 78 chars (defense against CPU exhaustion via BigInt).
- *
- * @see docs/ACCOUNTING-SPEC.md §5.2
  */
 function isValidAmount(amount: string): boolean {
   if (amount.length === 0 || amount.length > 78) return false;
@@ -309,8 +305,6 @@ function buildTargetStatus(
  * @param entries        - All InvoiceTransferRef entries for this invoice
  * @param frozenBalances - Frozen snapshot if terminal; null if non-terminal
  * @param walletAddresses - All wallet DIRECT:// addresses (for self-payment detection)
- *
- * @see docs/ACCOUNTING-SPEC.md §5.1
  */
 export function computeInvoiceStatus(
   invoiceId: string,
@@ -604,8 +598,6 @@ export function computeInvoiceStatus(
  * derived dynamically. This function sets it to `true` as a placeholder;
  * the caller (AccountingModule) must update it by checking token confirmation
  * status via PaymentsModule.
- *
- * @see docs/ACCOUNTING-SPEC.md §7.3
  */
 function reconstructFromFrozen(
   invoiceId: string,
@@ -720,8 +712,6 @@ function reconstructSenderBalanceFromFrozen(fsb: FrozenSenderBalance): InvoiceSe
  * @param latestSenderMap   - Optional: target address -> coinId -> senderAddress
  *                            Used for CLOSED to assign surplus to the latest sender.
  *                            Ignored for CANCELLED.
- *
- * @see docs/ACCOUNTING-SPEC.md §7.3, §5.2
  */
 export function freezeBalances(
   terms: InvoiceTerms,

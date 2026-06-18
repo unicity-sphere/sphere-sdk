@@ -3,8 +3,6 @@
  *
  * All types for the AccountingModule: invoices, status, receipts,
  * cancellation notices, storage schemas, and method parameters.
- *
- * @see docs/ACCOUNTING-SPEC.md
  */
 
 import type { FullIdentity, TrackedAddress, SphereEventType, SphereEventMap, TransferResult, Token } from '../../types';

@@ -11,7 +11,6 @@
  *    `TransferTransactionData.message`. Embedded in the aggregator's Sparse
  *    Merkle Tree and verifiable against its root. Authoritative source.
  *
- * @see ACCOUNTING-SPEC.md §4 — Invoice Reference Encoding
  */
 
 import { sha256 } from '@noble/hashes/sha2.js';
@@ -31,7 +30,6 @@ import type { InvoiceMemoRef, TransferMessagePayload } from './types.js';
  *   [2] direction code — `F`, `B`, `RC`, or `RX` (optional; defaults to `F`)
  *   [3] free text — everything after the first space (optional)
  *
- * @see ACCOUNTING-SPEC.md §4.4
  */
 export const INVOICE_MEMO_REGEX = /^INV:([0-9a-fA-F]{64,68})(?::(F|B|RC|RX))?(?: (.+))?$/;
 
@@ -63,7 +61,6 @@ export function hashInvoiceId(invoiceId: string): string {
 /**
  * Maps the canonical payment direction name to its wire code.
  *
- * @see ACCOUNTING-SPEC.md §4.2
  */
 export const DIRECTION_TO_CODE: Readonly<Record<InvoiceMemoRef['paymentDirection'], 'F' | 'B' | 'RC' | 'RX'>> = {
   forward: 'F',
@@ -75,7 +72,6 @@ export const DIRECTION_TO_CODE: Readonly<Record<InvoiceMemoRef['paymentDirection
 /**
  * Maps the wire direction code to the canonical payment direction name.
  *
- * @see ACCOUNTING-SPEC.md §4.2
  */
 export const CODE_TO_DIRECTION: Readonly<Record<'F' | 'B' | 'RC' | 'RX', InvoiceMemoRef['paymentDirection']>> = {
   F: 'forward',
@@ -104,7 +100,6 @@ export const CODE_TO_DIRECTION: Readonly<Record<'F' | 'B' | 'RC' | 'RX', Invoice
  * @returns Parsed {@link InvoiceMemoRef} with a lowercase `invoiceId`, or `null`
  *   if the string does not match the `INV:` format.
  *
- * @see ACCOUNTING-SPEC.md §4.5
  *
  * @example
  * ```ts
@@ -168,7 +163,6 @@ export function parseInvoiceMemo(memo: string): InvoiceMemoRef | null {
  * @throws {SphereError} `INVOICE_INVALID_ID` if `invoiceId` is not a 64-char
  *   hex string.
  *
- * @see ACCOUNTING-SPEC.md §4.6
  */
 export function buildInvoiceMemo(
   invoiceId: string,
@@ -223,7 +217,6 @@ export function buildInvoiceMemo(
  * @returns Validated {@link TransferMessagePayload}, or `null` if absent or
  *   malformed.
  *
- * @see ACCOUNTING-SPEC.md §4.1
  */
 export function decodeTransferMessage(messageBytes: Uint8Array | null | undefined): TransferMessagePayload | null {
   if (messageBytes == null || messageBytes.length === 0) return null;
@@ -356,7 +349,6 @@ export function decodeTransferMessage(messageBytes: Uint8Array | null | undefine
  * @param payload - The structured invoice payload to serialize.
  * @returns UTF-8 encoded JSON bytes.
  *
- * @see ACCOUNTING-SPEC.md §4.1
  */
 export function encodeTransferMessage(payload: TransferMessagePayload): Uint8Array {
   return new TextEncoder().encode(JSON.stringify(payload));
@@ -393,7 +385,6 @@ export function encodeTransferMessage(payload: TransferMessagePayload): Uint8Arr
  * @returns UTF-8 JSON bytes for the on-chain message, or `null` if the memo
  *   is absent or non-invoice.
  *
- * @see ACCOUNTING-SPEC.md §4.7
  */
 export function parseInvoiceMemoForOnChain(
   memo: string | undefined,

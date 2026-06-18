@@ -9,7 +9,7 @@ A modular TypeScript SDK for Unicity wallet operations on Layer 3 (Unicity state
 - **Invoicing / Accounting** - On-chain invoice lifecycle with payment attribution, auto-return, privacy-preserving hashed invoice IDs; invoices travel as v2 data-token blobs (hex strings) — `createInvoice()` returns the blob, `importInvoice()` accepts it
 - **Token Swaps** - P2P atomic swaps via escrow with DM-based negotiation protocol
 - **Payment Requests** - Request payments with async response tracking
-- **Market (Intents)** - Signed intent bulletin board with semantic search and live feed — see [docs/MARKET.md](docs/MARKET.md)
+- **Market (Intents)** - Signed intent bulletin board with semantic search and live feed
 - **Group Chat** - NIP-29 relay-based group messaging with moderation
 - **Nostr Transport** - Resilient P2P messaging with verified publish, health checks, NIP-17 gift-wrap
 - **IPFS Storage** - Decentralized token backup via HTTP API (browser + Node.js)
@@ -1352,10 +1352,6 @@ await sphere.registerNametag('bob');
 const aliceTag = sphere.getNametagForAddress(0);  // 'alice'
 const bobTag = sphere.getNametagForAddress(1);    // 'bob'
 ```
-
----
-
-See [IPFS Storage Guide](docs/IPFS-STORAGE.md) for complete IPFS/IPNS documentation including configuration, caching, merge rules, and troubleshooting.
 
 ---
 

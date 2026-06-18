@@ -2126,8 +2126,6 @@ Sync Flow:
   (if no remote: save local as initial)
 ```
 
-See [IPFS Storage Guide](./IPFS-STORAGE.md) for complete documentation.
-
 ---
 
 ## AccountingModule (Invoicing)
