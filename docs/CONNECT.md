@@ -686,6 +686,8 @@ Connect uses semver MAJOR.MINOR. The rules:
 | Change or remove an existing message / field | MAJOR | Breaking — requires a deprecation window |
 | Behaviour fix with no wire change | PATCH (no Connect bump) | Invisible to peers |
 
+**Enforced in CI:** `tests/unit/connect/protocol-surface.test.ts` snapshots the full wire surface (intents, scopes, methods) + `SPHERE_CONNECT_VERSION`. Any change to the surface fails that test until you bump the version and update its snapshot — so the bump can't be forgotten.
+
 **Deprecation window for MAJOR changes:** announce the upcoming MAJOR → soft-warn via the handshake response `warning` field (non-fatal, logged by the client) → reject (MAJOR bumped). Never a flag-day cut except the current v1 → v2 migration (v1 peers are genuinely incompatible — no transition period is possible).
 
 The `warning` field in `SphereHandshake` is reserved for this deprecation flow. No call site emits one yet.
