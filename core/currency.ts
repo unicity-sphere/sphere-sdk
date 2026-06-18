@@ -3,7 +3,7 @@
  * Conversion between human-readable amounts and smallest units (bigint)
  */
 
-import { logger } from './logger';
+import { SphereError } from './errors';
 
 // =============================================================================
 // Constants
@@ -17,28 +17,56 @@ export const DEFAULT_TOKEN_DECIMALS = 18;
 // =============================================================================
 
 /**
- * Convert human-readable amount to smallest unit (bigint)
+ * Parse a human-readable decimal amount into smallest units (bigint) — STRICT.
+ *
+ * Mirrors ethers `parseUnits`: throws `SphereError('INVALID_AMOUNT')` on invalid
+ * input rather than silently corrupting the value. Rejects empty/non-string
+ * values, non-decimal strings (sign, scientific notation, hex, junk), and more
+ * fractional digits than `decimals` (NO silent truncation). `'0'` is valid; the
+ * `> 0` business rule is the caller's responsibility.
+ *
+ * For money movement always use this (or {@link safeParseTokenAmount} for live UI
+ * input). Use {@link toHumanReadable} / {@link formatAmount} for display.
  *
  * @example
  * ```ts
- * toSmallestUnit('1.5', 18) // 1500000000000000000n
- * toSmallestUnit('100', 6)  // 100000000n
+ * parseTokenAmount('1.5', 18) // 1500000000000000000n
+ * parseTokenAmount('100', 6)  // 100000000n
+ * parseTokenAmount('1.5', 0)  // throws SphereError('INVALID_AMOUNT')
  * ```
  */
-export function toSmallestUnit(amount: number | string, decimals: number = DEFAULT_TOKEN_DECIMALS): bigint {
-  if (!amount) return 0n;
+export function parseTokenAmount(value: string, decimals: number = DEFAULT_TOKEN_DECIMALS): bigint {
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new SphereError('Amount must be a non-empty string', 'INVALID_AMOUNT');
+  }
+  if (!Number.isInteger(decimals) || decimals < 0) {
+    throw new SphereError(`Invalid decimals: ${decimals}`, 'INVALID_AMOUNT');
+  }
+  const str = value.trim();
+  // Unsigned decimal only — no leading '-', no scientific notation, no hex.
+  if (!/^\d+(\.\d+)?$/.test(str)) {
+    throw new SphereError(`Invalid amount: "${value}"`, 'INVALID_AMOUNT');
+  }
+  const [integer, fraction = ''] = str.split('.');
+  if (fraction.length > decimals) {
+    throw new SphereError(`Amount "${value}" exceeds ${decimals} decimal place(s)`, 'INVALID_AMOUNT');
+  }
+  return BigInt(integer + fraction.padEnd(decimals, '0'));
+}
 
+/**
+ * Non-throwing variant of {@link parseTokenAmount} for live UI input: returns
+ * `null` when the value is not (yet) a valid amount. `null` is distinct from a
+ * genuine `0n`, so callers can tell "invalid / mid-typing" from "zero".
+ */
+export function safeParseTokenAmount(
+  value: string,
+  decimals: number = DEFAULT_TOKEN_DECIMALS,
+): bigint | null {
   try {
-    const str = amount.toString();
-    const [integer, fraction = ''] = str.split('.');
-
-    // Pad fraction to exact decimal places, truncate if longer
-    const paddedFraction = fraction.padEnd(decimals, '0').slice(0, decimals);
-
-    return BigInt(integer + paddedFraction);
-  } catch (err) {
-    logger.debug('Currency', 'toSmallestUnit conversion failed', err);
-    return 0n;
+    return parseTokenAmount(value, decimals);
+  } catch {
+    return null;
   }
 }
 
@@ -97,7 +125,8 @@ export function formatAmount(
 // =============================================================================
 
 export const CurrencyUtils = {
-  toSmallestUnit,
+  parseTokenAmount,
+  safeParseTokenAmount,
   toHumanReadable,
   format: formatAmount,
 };

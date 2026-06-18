@@ -7,7 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `parseTokenAmount(value, decimals)` / `safeParseTokenAmount(value, decimals)` — strict
+  human-readable → smallest-units parsing with ethers `parseUnits` semantics. `parseTokenAmount`
+  throws `SphereError('INVALID_AMOUNT')` on empty/non-string input, non-decimal strings (sign,
+  scientific notation, hex), and fractional digits exceeding `decimals` (no silent truncation);
+  `safeParseTokenAmount` returns `null` instead of throwing (for live UI input). Adds the
+  `INVALID_AMOUNT` error code.
+
 ### Removed
+- **BREAKING:** Removed `toSmallestUnit` — it silently returned `0n` on invalid input and
+  truncated excess precision (a money-safety footgun). Use `parseTokenAmount` (strict) or
+  `safeParseTokenAmount` (UI input). Display helpers `toHumanReadable` / `formatAmount` are unchanged.
 - **BREAKING:** Removed the entire L1 (ALPHA blockchain) layer — `sphere.payments.l1`, the `L1` namespace, `L1Config`, `identity.l1Address`, the `sphere_l1GetBalance` / `sphere_l1GetHistory` Connect queries, the `l1_send` intent, and the `l1:read` / `l1:transfer` permission scopes. Wallets are now L3-only.
 
 ### Fixed — history disappears on reload (#549)

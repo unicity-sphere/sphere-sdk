@@ -106,7 +106,8 @@ export {
   identityFromMnemonicSync,
   deriveAddressInfo,
   // Currency
-  toSmallestUnit,
+  parseTokenAmount,
+  safeParseTokenAmount,
   toHumanReadable,
   formatAmount,
   // Bech32

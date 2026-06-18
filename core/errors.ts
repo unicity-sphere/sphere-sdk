@@ -39,6 +39,7 @@ export type SphereErrorCode =
   | 'TRANSPORT_ERROR'
   | 'AGGREGATOR_ERROR'
   | 'VALIDATION_ERROR'
+  | 'INVALID_AMOUNT'
   | 'NETWORK_ERROR'
   | 'TIMEOUT'
   | 'DECRYPTION_ERROR'

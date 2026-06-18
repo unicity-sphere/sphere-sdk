@@ -5,69 +5,115 @@
 
 import { describe, it, expect } from 'vitest';
 import {
-  toSmallestUnit,
+  parseTokenAmount,
+  safeParseTokenAmount,
   toHumanReadable,
   formatAmount,
   DEFAULT_TOKEN_DECIMALS,
   CurrencyUtils,
 } from '../../../core/currency';
+import { SphereError } from '../../../core/errors';
 
 // =============================================================================
-// toSmallestUnit Tests
+// parseTokenAmount Tests (strict — throws on invalid input)
 // =============================================================================
 
-describe('toSmallestUnit()', () => {
+describe('parseTokenAmount()', () => {
   it('should convert integer amounts', () => {
-    expect(toSmallestUnit('1', 18)).toBe(1000000000000000000n);
-    expect(toSmallestUnit('100', 18)).toBe(100000000000000000000n);
+    expect(parseTokenAmount('1', 18)).toBe(1000000000000000000n);
+    expect(parseTokenAmount('100', 18)).toBe(100000000000000000000n);
   });
 
   it('should convert decimal amounts', () => {
-    expect(toSmallestUnit('1.5', 18)).toBe(1500000000000000000n);
-    expect(toSmallestUnit('0.1', 18)).toBe(100000000000000000n);
+    expect(parseTokenAmount('1.5', 18)).toBe(1500000000000000000n);
+    expect(parseTokenAmount('0.1', 18)).toBe(100000000000000000n);
   });
 
   it('should handle different decimal places', () => {
-    expect(toSmallestUnit('1.5', 6)).toBe(1500000n);
-    expect(toSmallestUnit('100', 6)).toBe(100000000n);
-    expect(toSmallestUnit('1.23', 2)).toBe(123n);
+    expect(parseTokenAmount('1.5', 6)).toBe(1500000n);
+    expect(parseTokenAmount('100', 6)).toBe(100000000n);
+    expect(parseTokenAmount('1.23', 2)).toBe(123n);
   });
 
-  it('should handle number input', () => {
-    expect(toSmallestUnit(1.5, 18)).toBe(1500000000000000000n);
-    expect(toSmallestUnit(100, 6)).toBe(100000000n);
+  it('should pad short fractions', () => {
+    expect(parseTokenAmount('1.5', 18)).toBe(1500000000000000000n);
+    expect(parseTokenAmount('1.05', 18)).toBe(1050000000000000000n);
   });
 
-  it('should truncate extra decimal places', () => {
-    // 1.123456789012345678901 with 18 decimals should truncate to 18
-    expect(toSmallestUnit('1.1234567890123456789', 18)).toBe(1123456789012345678n);
-  });
-
-  it('should pad short decimal places', () => {
-    expect(toSmallestUnit('1.5', 18)).toBe(1500000000000000000n);
-    expect(toSmallestUnit('1.05', 18)).toBe(1050000000000000000n);
-  });
-
-  it('should return 0n for empty/falsy input', () => {
-    expect(toSmallestUnit('', 18)).toBe(0n);
-    expect(toSmallestUnit(0, 18)).toBe(0n);
-  });
-
-  it('should handle zero amounts', () => {
-    expect(toSmallestUnit('0', 18)).toBe(0n);
-    expect(toSmallestUnit('0.0', 18)).toBe(0n);
+  it('should accept zero', () => {
+    expect(parseTokenAmount('0', 18)).toBe(0n);
+    expect(parseTokenAmount('0.0', 18)).toBe(0n);
   });
 
   it('should use default decimals (18)', () => {
-    expect(toSmallestUnit('1')).toBe(1000000000000000000n);
+    expect(parseTokenAmount('1')).toBe(1000000000000000000n);
   });
 
-  it('should handle very large amounts', () => {
-    expect(toSmallestUnit('1000000000', 18)).toBe(1000000000000000000000000000n);
+  it('should handle very large and very small amounts', () => {
+    expect(parseTokenAmount('1000000000', 18)).toBe(1000000000000000000000000000n);
+    expect(parseTokenAmount('0.000000000000000001', 18)).toBe(1n);
   });
 
-  it('should handle very small amounts', () => {
-    expect(toSmallestUnit('0.000000000000000001', 18)).toBe(1n);
+  // Strict behaviour: throw instead of silently returning 0n / truncating.
+
+  it('should throw on empty or whitespace input', () => {
+    expect(() => parseTokenAmount('')).toThrow(SphereError);
+    expect(() => parseTokenAmount('   ')).toThrow(SphereError);
+  });
+
+  it('should throw on non-decimal input', () => {
+    expect(() => parseTokenAmount('abc')).toThrow(SphereError);
+    expect(() => parseTokenAmount('1e18')).toThrow(SphereError);
+    expect(() => parseTokenAmount('0x10')).toThrow(SphereError);
+    expect(() => parseTokenAmount('1.')).toThrow(SphereError);
+    expect(() => parseTokenAmount('.5')).toThrow(SphereError);
+  });
+
+  it('should throw on negative amounts', () => {
+    expect(() => parseTokenAmount('-1', 18)).toThrow(SphereError);
+  });
+
+  it('should throw on excess precision instead of truncating', () => {
+    expect(() => parseTokenAmount('1.1234567890123456789', 18)).toThrow(SphereError);
+    expect(() => parseTokenAmount('1.5', 0)).toThrow(SphereError);
+  });
+
+  it('should throw on invalid decimals', () => {
+    expect(() => parseTokenAmount('1', -1)).toThrow(SphereError);
+    expect(() => parseTokenAmount('1', 1.5)).toThrow(SphereError);
+  });
+
+  it('should use the INVALID_AMOUNT error code', () => {
+    let caught: unknown;
+    try {
+      parseTokenAmount('nope');
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(SphereError);
+    expect((caught as SphereError).code).toBe('INVALID_AMOUNT');
+  });
+});
+
+// =============================================================================
+// safeParseTokenAmount Tests (non-throwing — null on invalid input)
+// =============================================================================
+
+describe('safeParseTokenAmount()', () => {
+  it('should return the parsed value for valid input', () => {
+    expect(safeParseTokenAmount('1.5', 18)).toBe(1500000000000000000n);
+    expect(safeParseTokenAmount('100', 6)).toBe(100000000n);
+  });
+
+  it('should return 0n for a genuine zero', () => {
+    expect(safeParseTokenAmount('0', 18)).toBe(0n);
+  });
+
+  it('should return null (not 0n) for invalid / mid-typing input', () => {
+    expect(safeParseTokenAmount('', 18)).toBeNull();
+    expect(safeParseTokenAmount('1.', 18)).toBeNull();
+    expect(safeParseTokenAmount('abc', 18)).toBeNull();
+    expect(safeParseTokenAmount('1.5', 0)).toBeNull();
   });
 });
 
@@ -180,8 +226,12 @@ describe('formatAmount()', () => {
 // =============================================================================
 
 describe('CurrencyUtils namespace', () => {
-  it('should export toSmallestUnit', () => {
-    expect(CurrencyUtils.toSmallestUnit('1', 18)).toBe(1000000000000000000n);
+  it('should export parseTokenAmount', () => {
+    expect(CurrencyUtils.parseTokenAmount('1', 18)).toBe(1000000000000000000n);
+  });
+
+  it('should export safeParseTokenAmount', () => {
+    expect(CurrencyUtils.safeParseTokenAmount('bad', 18)).toBeNull();
   });
 
   it('should export toHumanReadable', () => {
@@ -210,28 +260,28 @@ describe('DEFAULT_TOKEN_DECIMALS', () => {
 describe('Round-trip conversions', () => {
   it('should round-trip integer amounts', () => {
     const original = '123';
-    const smallest = toSmallestUnit(original, 18);
+    const smallest = parseTokenAmount(original, 18);
     const back = toHumanReadable(smallest, 18);
     expect(back).toBe(original);
   });
 
   it('should round-trip decimal amounts', () => {
     const original = '1.5';
-    const smallest = toSmallestUnit(original, 18);
+    const smallest = parseTokenAmount(original, 18);
     const back = toHumanReadable(smallest, 18);
     expect(back).toBe(original);
   });
 
   it('should round-trip with different decimals', () => {
     const original = '123.456';
-    const smallest = toSmallestUnit(original, 6);
+    const smallest = parseTokenAmount(original, 6);
     const back = toHumanReadable(smallest, 6);
     expect(back).toBe(original);
   });
 
   it('should round-trip zero', () => {
     const original = '0';
-    const smallest = toSmallestUnit(original, 18);
+    const smallest = parseTokenAmount(original, 18);
     const back = toHumanReadable(smallest, 18);
     expect(back).toBe(original);
   });

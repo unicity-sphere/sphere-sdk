@@ -1492,9 +1492,14 @@ verifySignedMessage(message: string, signature: string, expectedPubkey: string):
 ### Currency Functions
 
 ```typescript
-// Convert human-readable to smallest unit
-toSmallestUnit(amount: number | string, decimals?: number): bigint
+// Parse a human-readable decimal string into smallest units — STRICT.
+// Throws SphereError('INVALID_AMOUNT') on invalid input / excess precision,
+// like ethers `parseUnits` (never silently returns 0n or truncates).
+parseTokenAmount(value: string, decimals?: number): bigint
 // "1.5" with 18 decimals → 1500000000000000000n
+
+// Non-throwing variant for live UI input — returns null (not 0n) when invalid.
+safeParseTokenAmount(value: string, decimals?: number): bigint | null
 
 // Convert smallest unit to human-readable
 toHumanReadable(amount: bigint | string, decimals?: number): string

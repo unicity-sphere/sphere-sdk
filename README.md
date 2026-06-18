@@ -668,9 +668,10 @@ import {
   getPublicKey, createKeyPair,
 
   // Currency conversion
-  toSmallestUnit,    // "1.5" → 1500000000000000000n
-  toHumanReadable,   // 1500000000000000000n → "1.5"
-  formatAmount,      // Format with decimals and symbol
+  parseTokenAmount,     // "1.5" → 1500000000000000000n (strict; throws on invalid input)
+  safeParseTokenAmount, // like parseTokenAmount but returns null instead of throwing
+  toHumanReadable,      // 1500000000000000000n → "1.5"
+  formatAmount,         // Format with decimals and symbol
 
   // Address encoding
   encodeBech32, decodeBech32,
