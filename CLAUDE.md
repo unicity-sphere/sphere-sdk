@@ -184,9 +184,9 @@ Typed RPC layer for dApp ↔ wallet communication. Full guide: [`docs/CONNECT.md
 
 **Queries (16):** `sphere_getIdentity`, `sphere_getBalance`, `sphere_getAssets`, `sphere_getFiatBalance`, `sphere_getTokens`, `sphere_getHistory`, `sphere_resolve`, `sphere_subscribe`, `sphere_unsubscribe`, `sphere_disconnect`, `sphere_getConversations`, `sphere_getMessages`, `sphere_getDMUnreadCount`, `sphere_markAsRead`, `sphere_getInvoices`, `sphere_getInvoiceStatus`.
 
-**Intents (14):** `send`, `dm`, `payment_request`, `receive`, `sign_message`, `create_invoice`, `close_invoice`, `cancel_invoice`, `pay_invoice`, `return_invoice_payment`, `import_invoice`, `send_invoice_receipts`, `send_cancellation_notices`, `set_auto_return`.
+**Intents (15):** `send`, `dm`, `payment_request`, `receive`, `sign_message`, `create_invoice`, `close_invoice`, `cancel_invoice`, `pay_invoice`, `return_invoice_payment`, `import_invoice`, `send_invoice_receipts`, `send_cancellation_notices`, `set_auto_return`, `mint`. (The invoice/accounting intents are experimental and not enabled in the Sphere wallet — see `docs/CONNECT.md`.)
 
-**Permission scopes (14):** `identity:read`, `balance:read`, `tokens:read`, `history:read`, `events:subscribe`, `resolve:peer`, `transfer:request`, `dm:request`, `dm:read`, `dm:manage`, `payment:request`, `sign:request`, `invoice:read`, `invoice:write`.
+**Permission scopes (15):** `identity:read`, `balance:read`, `tokens:read`, `history:read`, `events:subscribe`, `resolve:peer`, `transfer:request`, `dm:request`, `dm:read`, `dm:manage`, `payment:request`, `sign:request`, `mint:request`, `invoice:read`, `invoice:write`.
 
 **Silent mode:** `new ConnectClient({ ..., silent: true })` — fast-check approved list without UI popup.
 

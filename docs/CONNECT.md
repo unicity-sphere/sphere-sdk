@@ -246,7 +246,7 @@ const result = await autoConnect({
 
 // Use the client
 const balance = await result.client.query('sphere_getBalance');
-await result.client.intent('send', { recipient: '@alice', amount: '1000000', coinId: 'UCT' });
+await result.client.intent('send', { to: '@alice', amount: '10', coinId: '<lowercase 64-hex coin id>' });
 result.client.on('transfer:incoming', (data) => console.log(data));
 
 // Disconnect
@@ -348,9 +348,9 @@ const assets  = await client.query('sphere_getAssets');
 
 // Intents — wallet opens UI for user confirmation
 const txResult = await client.intent('send', {
-  recipient: '@alice',
-  amount: 100,
-  coinId: 'USDC',
+  to: '@alice',
+  amount: '10',                          // whole-token amount, as a string
+  coinId: '<lowercase 64-hex coin id>',
 });
 
 // Sign a message (e.g. challenge-response auth)
@@ -399,31 +399,36 @@ The wallet's `onConnectionRequest` receives `silent=true` and must return `{ app
 | `sphere_getTokens` | `coinId?` | token array |
 | `sphere_getHistory` | — | transaction history |
 | `sphere_resolve` | `identifier` | resolved address info |
-| `sphere_getInvoices` | `state?, createdByMe?, targetingMe?, limit?, offset?, sortBy?, sortOrder?` | `InvoiceRef[]` |
-| `sphere_getInvoiceStatus` | `invoiceId` | `InvoiceStatus` |
+| `sphere_getConversations` | — | DM conversation list |
+| `sphere_getMessages` | `peerPubkey, limit?, before?` | DM message page |
+| `sphere_getDMUnreadCount` | `peerPubkey?` | unread count |
+| `sphere_markAsRead` | `messageIds` | acknowledgement |
 | `sphere_subscribe` | `event` | `{ subscribed, event }` |
 | `sphere_unsubscribe` | `event` | `{ unsubscribed, event }` |
 | `sphere_disconnect` | — | `{ disconnected }` |
+
+> Invoice queries (`sphere_getInvoices`, `sphere_getInvoiceStatus`) exist in the protocol but
+> are experimental and not enabled in the Sphere wallet — see [Experimental](#experimental--not-supported-by-the-sphere-wallet).
 
 ## Intent Actions (require user confirmation)
 
 | Action | Params |
 |--------|--------|
-| `send` | `recipient, amount, coinId` |
-| `dm` | `recipient, content` |
-| `payment_request` | `amount, coinId, description?` |
-| `receive` | `coinId?` |
+| `send` | `to, amount, coinId` |
+| `dm` | `to, message` |
+| `payment_request` | `to, amount, coinId, message?` |
+| `receive` | — |
 | `sign_message` | `message` |
-| `create_invoice` | `targets, dueDate?, memo?, deliveryMethods?, anonymous?` |
-| `close_invoice` | `invoiceId, autoReturn?` |
-| `cancel_invoice` | `invoiceId, autoReturn?` |
-| `pay_invoice` | `invoiceId, targetIndex, assetIndex?, amount?, freeText?, refundAddress?, contact?` |
-| `return_invoice_payment` | `invoiceId, recipient, amount, coinId, freeText?` |
-| `import_invoice` | `token` |
-| `send_invoice_receipts` | `invoiceId, memo?, includeZeroBalance?` |
-| `send_cancellation_notices` | `invoiceId, reason?, dealDescription?, includeZeroBalance?` |
-| `set_auto_return` | `invoiceId, enabled` |
 | `mint` | `coinId` (lowercase hex), `amount` (smallest units) |
+
+> **Amount units:** for `send` and `payment_request`, `amount` is the **whole-token display
+> amount** (what the wallet shows). For `mint`, `amount` is in **smallest units**. Both differ
+> from the token engine's `mintFungibleToken(coinId, amount: bigint)`, which takes base units.
+> `coinId` is always the canonical lowercase 64-hex id (a symbol like `UCT` is rejected).
+>
+> Invoice/accounting intents (`create_invoice` … `set_auto_return`) exist in the protocol but
+> are experimental and not enabled in the Sphere wallet — see
+> [Experimental](#experimental--not-supported-by-the-sphere-wallet).
 
 ### sign_message Intent
 
@@ -470,16 +475,32 @@ const result = await client.intent('mint', {
 
 Requires the `mint:request` permission scope. Minting only succeeds on networks that allow standalone self-mint (testnet2 today); on networks where it is unavailable the wallet returns an error from the token engine.
 
+## Experimental — not supported by the Sphere wallet
+
+Invoicing/accounting is **defined in the protocol** for forward-compatibility but is
+**experimental and not enabled in the Sphere wallet**: it is implemented in the SDK and
+unit-tested, but has no live/e2e verification and is not wired into the wallet. The wallet
+rejects these intents with `METHOD_NOT_FOUND`, and the invoice queries error with
+`MODULE_NOT_AVAILABLE`. **Do not use them yet.**
+
+- **Intents** (scope `invoice:write`, or `transfer:request` for the paying ones):
+  `create_invoice`, `close_invoice`, `cancel_invoice`, `pay_invoice`,
+  `return_invoice_payment`, `import_invoice`, `send_invoice_receipts`,
+  `send_cancellation_notices`, `set_auto_return`.
+- **Queries** (scope `invoice:read`): `sphere_getInvoices`, `sphere_getInvoiceStatus`.
+
 ## Events (wallet → dApp push)
 
-| Event | Payload |
-|-------|---------|
-| `transfer:incoming` | token transfer received |
-| `transfer:confirmed` | transfer confirmed on chain |
-| `transfer:failed` | transfer failed |
-| `balance:updated` | balance changed |
-| `identity:updated` | identity info changed |
-| `session:expired` | session TTL reached |
+| Event | Payload | Delivery |
+|-------|---------|----------|
+| `transfer:incoming` | token transfer received | via `sphere_subscribe` |
+| `transfer:confirmed` | transfer confirmed on chain | via `sphere_subscribe` |
+| `transfer:failed` | transfer failed | via `sphere_subscribe` |
+| `wallet:locked` | wallet locked / logged out | auto-pushed (no subscribe) |
+| `identity:changed` | active identity changed | auto-pushed (no subscribe) |
+
+> Session expiry is **not** an event — the next request after the TTL is rejected with
+> error `4004 SESSION_EXPIRED`.
 
 ### Wallet Lock Handling
 
@@ -501,14 +522,14 @@ client.on('wallet:locked', async () => {
 
 #### Extension / iframe mode (P1, P2)
 
-The wallet's background service worker or parent frame stays alive. Instead of disconnecting, set a `isWalletLocked` flag and wait for the user to unlock. When the wallet is unlocked, the host calls `updateSphere(newSphere)` and fires an `identity:updated` event, which signals the dApp to resume:
+The wallet's background service worker or parent frame stays alive. Instead of disconnecting, set a `isWalletLocked` flag and wait for the user to unlock. When the wallet is unlocked, the host calls `updateSphere(newSphere)` and fires an `identity:changed` event, which signals the dApp to resume:
 
 ```typescript
 client.on('wallet:locked', () => {
   setIsWalletLocked(true);
 });
 
-client.on('identity:updated', (identity) => {
+client.on('identity:changed', (identity) => {
   setIsWalletLocked(false);
   // Refresh UI with new identity if it changed
 });
@@ -587,22 +608,21 @@ Permissions are requested during handshake and checked on every request:
 
 | Scope | Grants access to |
 |-------|-----------------|
-| `identity:read` | `sphere_getIdentity` |
-| `balance:read` | `sphere_getBalance`, `sphere_getFiatBalance` |
-| `assets:read` | `sphere_getAssets` |
+| `identity:read` | `sphere_getIdentity`, `receive` intent (always granted) |
+| `balance:read` | `sphere_getBalance`, `sphere_getFiatBalance`, `sphere_getAssets` |
 | `tokens:read` | `sphere_getTokens` |
 | `history:read` | `sphere_getHistory` |
-| `events:subscribe` | `sphere_subscribe/unsubscribe` |
-| `intent:send` | `send` intent |
-| `intent:dm` | `dm` intent |
-| `intent:payment_request` | `payment_request` intent |
-| `intent:receive` | `receive` intent |
-| `intent:sign_message` | `sign_message` intent |
+| `events:subscribe` | `sphere_subscribe`, `sphere_unsubscribe` |
+| `resolve:peer` | `sphere_resolve` |
+| `transfer:request` | `send` intent |
+| `dm:request` | `dm` intent |
+| `dm:read` | `sphere_getConversations`, `sphere_getMessages`, `sphere_getDMUnreadCount` |
+| `dm:manage` | `sphere_markAsRead` |
+| `payment:request` | `payment_request` intent |
+| `sign:request` | `sign_message` intent |
 | `mint:request` | `mint` intent (self-mint a fungible token) |
-| `comms:read` | DM conversations |
-| `comms:write` | send DMs |
-| `invoice:read` | `sphere_getInvoices`, `sphere_getInvoiceStatus` |
-| `invoice:write` | `create_invoice`, `close_invoice`, `cancel_invoice`, `import_invoice`, `send_invoice_receipts`, `send_cancellation_notices`, `set_auto_return` intents |
+| `invoice:read` | invoice queries (experimental — see above) |
+| `invoice:write` | invoice intents (experimental — see above) |
 
 ---
 
