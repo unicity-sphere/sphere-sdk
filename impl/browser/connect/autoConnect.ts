@@ -23,7 +23,7 @@
 import { ConnectClient } from '../../../connect/client/ConnectClient';
 import { HOST_READY_TYPE, HOST_READY_TIMEOUT } from '../../../connect/protocol';
 import type { ConnectTransport, ConnectResult, ConnectClientConfig } from '../../../connect/types';
-import type { DAppMetadata, SphereConnectMessage } from '../../../connect/protocol';
+import type { DAppMetadata, SphereConnectMessage, NetworkInfo } from '../../../connect/protocol';
 import type { PermissionScope } from '../../../connect/permissions';
 import { PostMessageTransport } from './PostMessageTransport';
 import { ExtensionTransport } from './ExtensionTransport';
@@ -89,6 +89,13 @@ export interface AutoConnectConfig {
    * Default: false.
    */
   silent?: boolean;
+
+  /**
+   * The network this dApp targets ({ id, name? }). Sent in the handshake; the wallet's
+   * compatibility gate rejects a mismatch with INCOMPATIBLE_NETWORK. Set this to the
+   * network your dApp is built for (e.g. testnet2 = { id: 4, name: 'testnet2' }).
+   */
+  network?: NetworkInfo;
 
   /** Existing session ID to resume (for popup mode). */
   resumeSessionId?: string;
@@ -289,6 +296,7 @@ async function createAndConnect(
     intentTimeout: config.intentTimeout,
     resumeSessionId: config.resumeSessionId,
     silent: config.silent,
+    network: config.network,
   };
 
   const client = new ConnectClient(clientConfig);

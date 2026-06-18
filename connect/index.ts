@@ -9,7 +9,7 @@
  */
 
 export { ConnectHost } from './host/ConnectHost';
-export { ConnectClient } from './client/ConnectClient';
+export { ConnectClient, ConnectError } from './client/ConnectClient';
 
 // Protocol
 export {
@@ -21,6 +21,7 @@ export {
   INTENT_ACTIONS,
   ERROR_CODES,
   WALLET_EVENTS,
+  SPHERE_NETWORKS,
   isSphereConnectMessage,
   createRequestId,
 } from './protocol';
@@ -40,6 +41,7 @@ export type {
   SphereConnectMessage,
   DAppMetadata,
   PublicIdentity,
+  NetworkInfo,
 } from './protocol';
 
 // Permissions
