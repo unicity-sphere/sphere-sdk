@@ -2,15 +2,15 @@ import { describe, it, expect } from 'vitest';
 import { checkCompatibility } from '../../../connect/compatibility';
 import { ERROR_CODES, SPHERE_CONNECT_VERSION } from '../../../connect/protocol';
 
-const W = SPHERE_CONNECT_VERSION;     // '2.0'
+const W = SPHERE_CONNECT_VERSION;     // '2.1'
 const NET = 4;                        // testnet2
 
 describe('checkCompatibility', () => {
   it('ok when same MAJOR and matching network', () => {
     expect(checkCompatibility({ clientProtocol: '2.0', walletProtocol: W, clientNetwork: { id: NET }, walletNetworkId: NET }).ok).toBe(true);
   });
-  it('ok for a newer MINOR (2.1 client, 2.0 wallet)', () => {
-    expect(checkCompatibility({ clientProtocol: '2.1', walletProtocol: W, clientNetwork: { id: NET }, walletNetworkId: NET }).ok).toBe(true);
+  it('ok for a newer MINOR (2.2 client, 2.1 wallet)', () => {
+    expect(checkCompatibility({ clientProtocol: '2.2', walletProtocol: W, clientNetwork: { id: NET }, walletNetworkId: NET }).ok).toBe(true);
   });
   it('rejects a different MAJOR with UNSUPPORTED_PROTOCOL_VERSION', () => {
     const r = checkCompatibility({ clientProtocol: '1.0', walletProtocol: W, clientNetwork: { id: NET }, walletNetworkId: NET });

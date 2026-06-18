@@ -118,6 +118,13 @@ consumed exclusively through the `token-engine/` port. Consequences:
   `UnicityIdMintResult` (token-engine).
 
 ### Added
+- **Sphere Connect `mint` intent (#595):** the existing public
+  `PaymentsModule.mintFungibleToken` is now exposed as a `mint` Connect intent
+  (params `{ coinId, amount }`) behind a new `mint:request` permission scope, so a
+  connected dApp can request the user's wallet to self-mint a fungible token after
+  explicit approval (succeeds only where the network allows standalone self-mint,
+  e.g. testnet2). Connect protocol version bumped **2.0 → 2.1** (backward-compatible
+  MINOR); dApps that require it can set `minMinorVersion: 1`.
 - **Thin-wallet core (wallet-api program, sdk-changes S1/S2/S6/S7)** —
   - **`WalletApiClient`** (new `wallet-api/` module + `./wallet-api` subpath export): challenge→sign→JWT auth with mandatory challenge-template verification (`unicity:wallet-api:auth:v1\n` prefix, own-pubkey + plausible-timestamp checks — the spend key never signs unverified server text), rotating refresh tokens (`v1.<sessionId>.<secretHex>`) with rotation-reuse-revocation fallback to a fresh challenge cycle, logout; typed REST for the §16 inventory/intents/blob endpoints (amounts are decimal strings on the wire, `bigint` in types); WS wake channel via the single-use ticket flow; refresh token kept only in injected storage (never logged); non-loopback base URLs must be `https:`. The client keeps the normative LOCAL copy of open intents (E.3) and re-PUTs them on a `syncEpoch` change.
   - **S6 field encryption** (`core/field-encryption.ts`): `deriveFieldEncryptionKey` = HKDF-SHA256(wallet privkey, `sphere-fieldenc-v1`); XChaCha20-Poly1305 envelopes `"enc1." + base64(nonce ‖ ciphertext)`; `assertFieldEnvelopeShape` is the server-side prefix/base64/size-cap check (ARCHITECTURE §8.3). New dependency `@noble/ciphers`.

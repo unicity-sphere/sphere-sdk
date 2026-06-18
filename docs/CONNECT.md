@@ -4,7 +4,7 @@ Sphere Connect is a secure wallet-dApp communication protocol. It allows web app
 
 ## Protocol Version
 
-The current Connect protocol version is **`2.0`** (`SPHERE_CONNECT_VERSION = '2.0'`).
+The current Connect protocol version is **`2.1`** (`SPHERE_CONNECT_VERSION = '2.1'`). **2.1** added the `mint` intent (backward-compatible MINOR addition); a dApp that requires it can set `minMinorVersion: 1` so the handshake is rejected by wallets older than 2.1.
 
 ### Compatibility policy
 

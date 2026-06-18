@@ -85,8 +85,8 @@ describe('Protocol', () => {
 });
 
 describe('protocol v2 gate surface', () => {
-  it('Connect version is bumped to 2.0', () => {
-    expect(SPHERE_CONNECT_VERSION).toBe('2.0');
+  it('Connect version is bumped to 2.1', () => {
+    expect(SPHERE_CONNECT_VERSION).toBe('2.1');
   });
   it('has the new error codes', () => {
     expect(ERROR_CODES.UNSUPPORTED_PROTOCOL_VERSION).toBe(4007);

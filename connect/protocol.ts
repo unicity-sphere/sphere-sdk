@@ -10,7 +10,7 @@ import { majorOf } from './semver';
 // =============================================================================
 
 export const SPHERE_CONNECT_NAMESPACE = 'sphere-connect';
-export const SPHERE_CONNECT_VERSION = '2.0';   // Connect protocol version (semver MAJOR.MINOR)
+export const SPHERE_CONNECT_VERSION = '2.1';   // Connect protocol version (semver MAJOR.MINOR) — 2.1 adds the mint intent
 
 export { HOST_READY_TYPE, HOST_READY_TIMEOUT, SPHERE_NETWORKS } from '../constants';
 // Import for local use (e.g. SphereHandshake.network) AND re-export for connect consumers.
