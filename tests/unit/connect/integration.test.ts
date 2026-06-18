@@ -286,6 +286,30 @@ describe('Sphere Connect Integration', () => {
       expect(result.messageId).toBe('msg123');
     });
 
+    it('requests a mint intent', async () => {
+      host.destroy();
+      transports = createMockTransportPair();
+      const onIntent = vi.fn().mockResolvedValue({
+        result: { tokenId: 'aa'.repeat(32), coinId: '11'.repeat(32), amount: '500' },
+      });
+      createHost({ onIntent });
+      createClient();
+      await client.connect();
+
+      const result = await client.intent<{ tokenId: string; coinId: string; amount: string }>(
+        INTENT_ACTIONS.MINT,
+        { coinId: '11'.repeat(32), amount: '500' },
+      );
+
+      expect(onIntent).toHaveBeenCalledWith(
+        'mint',
+        { coinId: '11'.repeat(32), amount: '500' },
+        expect.any(Object),
+      );
+      expect(result.tokenId).toBe('aa'.repeat(32));
+      expect(result.amount).toBe('500');
+    });
+
     it('handles user rejection', async () => {
       host.destroy();
       transports = createMockTransportPair();
@@ -377,6 +401,21 @@ describe('Sphere Connect Integration', () => {
 
       await expect(
         client.intent(INTENT_ACTIONS.SEND, { to: '@bob', amount: '1', coinId: 'UCT' }),
+      ).rejects.toThrow('Permission denied');
+    });
+
+    it('denies mint intent without mint:request', async () => {
+      createHost({
+        onConnectionRequest: vi.fn().mockResolvedValue({
+          approved: true,
+          grantedPermissions: [PERMISSION_SCOPES.TRANSFER_REQUEST] as PermissionScope[],
+        }),
+      });
+      createClient({ permissions: [PERMISSION_SCOPES.TRANSFER_REQUEST] });
+      await client.connect();
+
+      await expect(
+        client.intent(INTENT_ACTIONS.MINT, { coinId: '11'.repeat(32), amount: '500' }),
       ).rejects.toThrow('Permission denied');
     });
   });
