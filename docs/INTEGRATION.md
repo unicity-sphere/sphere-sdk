@@ -747,6 +747,11 @@ await sphere.communications.broadcast('Hello world!', ['general']);
 
 ## Invoicing / Accounting
 
+> **⚠️ Experimental — not production-ready.** Invoicing/accounting is implemented and
+> unit-tested, but it has no live/e2e verification, is used by no shipped app, and is **not
+> enabled in the Sphere wallet** (nor supported over Connect — see [CONNECT.md](CONNECT.md)).
+> NFT line-items and external delivery methods are placeholders. Treat the API as unstable.
+
 The `AccountingModule` manages the full lifecycle of on-chain invoices: creation, sharing, payment attribution, status tracking, returns, and receipts. An invoice is a v2 **data token** minted via the token engine on the Unicity gateway. Its terms (payment targets, amounts, due date, memo) are embedded in the token's genesis data, making them tamper-evident and independently verifiable by any party who holds the token.
 
 > Invoice creation and import **require the v2 token engine** (oracle with a v2 trust base +

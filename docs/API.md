@@ -2130,6 +2130,11 @@ Sync Flow:
 
 ## AccountingModule (Invoicing)
 
+> **⚠️ Experimental — not production-ready.** Invoicing/accounting is implemented and
+> unit-tested, but it has no live/e2e verification, is used by no shipped app, and is **not
+> enabled in the Sphere wallet** (nor supported over Connect — see [CONNECT.md](CONNECT.md)).
+> NFT line-items and external delivery methods are placeholders. Treat the API as unstable.
+
 Access via `sphere.accounting` (once registered on the `Sphere` instance).
 
 Manages the full invoice lifecycle: creation, import, payment attribution, status tracking, balance computation, auto-return, and receipt/cancellation-notice delivery. Persists invoice tokens, terminal-state sets, frozen balances, and an incremental invoice-transfer index (§5.4).

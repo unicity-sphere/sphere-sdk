@@ -533,6 +533,10 @@ unsubscribe(); // Stop listening
 
 ## Invoicing
 
+> **⚠️ Experimental — not production-ready.** Invoicing/accounting is implemented and
+> unit-tested, but it has no live/e2e verification, is used by no shipped app, and is **not
+> enabled in the Sphere wallet** (nor supported over Connect). Treat the API as unstable.
+
 The `AccountingModule` handles the full invoice lifecycle — creation, status queries, payment, and closing. Enable it by passing `accounting: true` to `Sphere.init()`.
 
 > **Note:** The accounting module requires the Oracle provider (v2 gateway config), which is included by default with `createNodeProviders()`. Invoices are minted as data tokens via the v2 token engine.

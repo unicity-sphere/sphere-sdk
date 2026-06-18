@@ -412,6 +412,10 @@ await sphere.communications.sendDM('@alice', 'Hello from the browser!');
 
 ### Invoicing
 
+> **⚠️ Experimental — not production-ready.** Invoicing/accounting is implemented and
+> unit-tested, but it has no live/e2e verification, is used by no shipped app, and is **not
+> enabled in the Sphere wallet** (nor supported over Connect). Treat the API as unstable.
+
 Enable the accounting module when initializing the wallet:
 
 ```typescript

@@ -6,7 +6,7 @@ A modular TypeScript SDK for Unicity wallet operations on Layer 3 (Unicity state
 
 - **Wallet Management** - BIP39/BIP32 key derivation, AES-256 encryption
 - **L3 Payments** - Token transfers via the v2 state-transition token engine, concurrent-send safety (SpendQueue)
-- **Invoicing / Accounting** - On-chain invoice lifecycle with payment attribution, auto-return, privacy-preserving hashed invoice IDs; invoices travel as v2 data-token blobs (hex strings) — `createInvoice()` returns the blob, `importInvoice()` accepts it
+- **Invoicing / Accounting** *(experimental — not production-ready, not enabled in the Sphere wallet)* - On-chain invoice lifecycle with payment attribution, auto-return, privacy-preserving hashed invoice IDs; invoices travel as v2 data-token blobs (hex strings) — `createInvoice()` returns the blob, `importInvoice()` accepts it
 - **Token Swaps** - P2P atomic swaps via escrow with DM-based negotiation protocol
 - **Payment Requests** - Request payments with async response tracking
 - **Market (Intents)** - Signed intent bulletin board with semantic search and live feed
