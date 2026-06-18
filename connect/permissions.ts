@@ -24,6 +24,7 @@ export const PERMISSION_SCOPES = {
   DM_MANAGE: 'dm:manage',
   PAYMENT_REQUEST: 'payment:request',
   SIGN_REQUEST: 'sign:request',
+  MINT_REQUEST: 'mint:request',
   INVOICE_READ: 'invoice:read',
   INVOICE_WRITE: 'invoice:write',
 } as const;
@@ -82,6 +83,7 @@ export const INTENT_PERMISSIONS: Record<string, PermissionScope> = {
   [INTENT_ACTIONS.SEND_INVOICE_RECEIPTS]: PERMISSION_SCOPES.INVOICE_WRITE,
   [INTENT_ACTIONS.SEND_CANCELLATION_NOTICES]: PERMISSION_SCOPES.INVOICE_WRITE,
   [INTENT_ACTIONS.SET_AUTO_RETURN]: PERMISSION_SCOPES.INVOICE_WRITE,
+  [INTENT_ACTIONS.MINT]: PERMISSION_SCOPES.MINT_REQUEST,
 };
 
 // =============================================================================

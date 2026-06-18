@@ -50,6 +50,16 @@ describe('Permissions', () => {
       expect(hasIntentPermission(granted, INTENT_ACTIONS.DM)).toBe(true);
     });
 
+    it('mint:request allows mint intent', () => {
+      const granted = new Set([PERMISSION_SCOPES.MINT_REQUEST]);
+      expect(hasIntentPermission(granted, INTENT_ACTIONS.MINT)).toBe(true);
+    });
+
+    it('transfer:request does NOT allow mint intent', () => {
+      const granted = new Set([PERMISSION_SCOPES.TRANSFER_REQUEST]);
+      expect(hasIntentPermission(granted, INTENT_ACTIONS.MINT)).toBe(false);
+    });
+
     it('returns false for unknown actions', () => {
       const granted = new Set(ALL_PERMISSIONS);
       expect(hasIntentPermission(granted, 'unknown_action')).toBe(false);
@@ -82,6 +92,14 @@ describe('Permissions', () => {
       for (const action of Object.values(INTENT_ACTIONS)) {
         expect(INTENT_PERMISSIONS[action]).toBeDefined();
       }
+    });
+
+    it('mint intent maps to mint:request scope', () => {
+      expect(INTENT_PERMISSIONS[INTENT_ACTIONS.MINT]).toBe(PERMISSION_SCOPES.MINT_REQUEST);
+    });
+
+    it('mint:request is a known scope', () => {
+      expect(ALL_PERMISSIONS).toContain(PERMISSION_SCOPES.MINT_REQUEST);
     });
 
     it('default permissions include identity:read', () => {
