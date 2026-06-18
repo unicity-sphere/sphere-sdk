@@ -426,6 +426,7 @@ The wallet's `onConnectionRequest` receives `silent=true` and must return `{ app
 | `send_invoice_receipts` | `invoiceId, memo?, includeZeroBalance?` |
 | `send_cancellation_notices` | `invoiceId, reason?, dealDescription?, includeZeroBalance?` |
 | `set_auto_return` | `invoiceId, enabled` |
+| `mint` | `coinId` (lowercase hex), `amount` (smallest units) |
 
 ### sign_message Intent
 
@@ -455,6 +456,22 @@ const isValid = verifySignedMessage(originalMessage, signature, expectedPubkey);
 - Recoverable signature — server can verify without storing the public key
 - Canonical signatures — prevents signature malleability attacks
 - The wallet displays the full message text for user review before signing
+
+### mint Intent
+
+The `mint` intent lets a dApp ask the connected wallet to **self-mint** a fungible token to the user's own wallet (the v2 replacement for the testnet faucet). The wallet always asks the user to confirm; minting is never silent.
+
+```typescript
+// dApp requests a self-mint (coinId is lowercase hex, amount in smallest units)
+const result = await client.intent('mint', {
+  coinId: '1111111111111111111111111111111111111111111111111111111111111111',
+  amount: '1000000',
+});
+
+// result = { tokenId: '…64-hex…', coinId: '…', amount: '1000000' }
+```
+
+Requires the `mint:request` permission scope. Minting only succeeds on networks that allow standalone self-mint (testnet2 today); on networks where it is unavailable the wallet returns an error from the token engine.
 
 ## Events (wallet → dApp push)
 
@@ -586,6 +603,7 @@ Permissions are requested during handshake and checked on every request:
 | `intent:payment_request` | `payment_request` intent |
 | `intent:receive` | `receive` intent |
 | `intent:sign_message` | `sign_message` intent |
+| `mint:request` | `mint` intent (self-mint a fungible token) |
 | `comms:read` | DM conversations |
 | `comms:write` | send DMs |
 | `invoice:read` | `sphere_getInvoices`, `sphere_getInvoiceStatus` |
