@@ -246,7 +246,7 @@ const result = await autoConnect({
 
 // Use the client
 const balance = await result.client.query('sphere_getBalance');
-await result.client.intent('send', { to: '@alice', amount: '10', coinId: '<lowercase 64-hex coin id>' });
+await result.client.intent('send', { to: '@alice', amount: '1000000000000000000', coinId: '<lowercase 64-hex coin id>' }); // amount in base units
 result.client.on('transfer:incoming', (data) => console.log(data));
 
 // Disconnect
@@ -349,7 +349,7 @@ const assets  = await client.query('sphere_getAssets');
 // Intents — wallet opens UI for user confirmation
 const txResult = await client.intent('send', {
   to: '@alice',
-  amount: '10',                          // whole-token amount, as a string
+  amount: '1000000000000000000',         // base units (smallest unit), as a string
   coinId: '<lowercase 64-hex coin id>',
 });
 
@@ -421,9 +421,10 @@ The wallet's `onConnectionRequest` receives `silent=true` and must return `{ app
 | `sign_message` | `message` |
 | `mint` | `coinId` (lowercase hex), `amount` (smallest units) |
 
-> **Amount units:** for `send` and `payment_request`, `amount` is the **whole-token display
-> amount** (what the wallet shows). For `mint`, `amount` is in **smallest units**. Both differ
-> from the token engine's `mintFungibleToken(coinId, amount: bigint)`, which takes base units.
+> **Amount units:** `amount` is always in **base units** (the smallest indivisible unit), as a
+> string — the same convention as `mint`, the token engine (`mintFungibleToken(coinId, amount: bigint)`)
+> and the SDK's `payments.send`. Convert from a human amount at the dApp edge with the SDK's
+> `parseTokenAmount('1.5', decimals)` (or ethers/viem `parseUnits`); display with `formatAmount`.
 > `coinId` is always the canonical lowercase 64-hex id (a symbol like `UCT` is rejected).
 >
 > Invoice/accounting intents (`create_invoice` … `set_auto_return`) exist in the protocol but
