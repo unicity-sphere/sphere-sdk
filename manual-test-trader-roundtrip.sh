@@ -548,8 +548,14 @@ except Exception:
 m = re.search(r'(\{|\[)', raw)
 if not m:
     print("0"); sys.exit(0)
+# Use raw_decode so we only consume the FIRST complete JSON value and
+# tolerate trailing log lines (e.g. `[ipfs-client] WARN ...`) that tee
+# can append AFTER the portfolio JSON. Previous version used json.loads
+# which fails with "Extra data" on any trailing text and silently
+# returned 0 for every snapshot — yielding 0-delta in §10 even after a
+# real settlement.
 try:
-    data = json.loads(raw[m.start():])
+    data, _ = json.JSONDecoder().raw_decode(raw[m.start():])
 except Exception:
     print("0"); sys.exit(0)
 def find_balances(obj):
