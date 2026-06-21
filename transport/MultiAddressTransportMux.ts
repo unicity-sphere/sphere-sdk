@@ -1090,9 +1090,31 @@ export class MultiAddressTransportMux {
   private async handleEvent(event: NostrEvent): Promise<void> {
     // Dedup — bounded set with FIFO eviction. Issue #275 persists this
     // set so cross-process CLI invocations short-circuit at this gate.
-    if (event.id && this.processedEventIds.has(event.id)) return;
+    if (event.id && this.processedEventIds.has(event.id)) {
+      // [#559-diag] cross-process dedup hit — the prior CLI process's
+      // persisted MUX_PROCESSED_EVENT_IDS caught this replay. If this fires
+      // in §3 of trader-soak, the OrbitDB Profile flush survived
+      // process exit and (A.2) requires a different fix surface.
+      logger.info(
+        'Mux',
+        `[#559-diag] dedup hit on event ${event.id.slice(0, 12)}... ` +
+        `(kind=${event.kind}, total dedup set size=${this.processedEventIds.size})`,
+      );
+      return;
+    }
     if (event.id) {
       this.processedEventIds.add(event.id);
+      // [#559-diag] new event arrived — never seen before this process.
+      // Combined with the dedup-hit log + final set-size, this tells us
+      // exactly how many "fresh" events leaked past dedup → reached
+      // CommunicationsModule → AcpDmTransport.handleIncoming. That's the
+      // number that the M9 `buffered=K` would have measured.
+      logger.info(
+        'Mux',
+        `[#559-diag] new event ${event.id.slice(0, 12)}... ` +
+        `(kind=${event.kind}, sender=${(event.pubkey ?? '').slice(0, 12)}..., ` +
+        `total dedup set size=${this.processedEventIds.size})`,
+      );
       // FIFO half-flush — preserves the legacy "evict half on overflow"
       // behavior to avoid thrashing at the cap boundary under bursts.
       if (this.processedEventIds.size > MultiAddressTransportMux.MAX_PROCESSED_IDS) {
@@ -1849,6 +1871,20 @@ export class MultiAddressTransportMux {
     logger.debug(
       'Mux',
       `[#275] Mux dedup hydrated: ${this.processedEventIds.size} event IDs`,
+    );
+    // [#559-diag] Post-hydration size at INFO so it appears with
+    // SPHERE_DEBUG=Mux=info (default min-level is warn — quiet otherwise).
+    // Discriminator semantics for #559:
+    //   hydrated=0 across processes → cross-process persistence is failing
+    //     (OrbitDB Profile durability — see #234/#239/#266/#268 family).
+    //     Empirically ruled out for Node.js FileStorage in #559's verdict.
+    //   hydrated=N>0 + no dedup-hit log → events arrive via a path that
+    //     bypasses the Mux handleEvent gate (look at outer
+    //     NostrTransportProvider.processedEventIds and fetchPendingEvents).
+    logger.info(
+      'Mux',
+      `[#559-diag] hydrated: ${this.processedEventIds.size} event IDs ` +
+      `(storage=${this.storage ? 'present' : 'absent'})`,
     );
   }
 
