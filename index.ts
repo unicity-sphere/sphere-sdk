@@ -195,6 +195,7 @@ export type {
   TransportEvent,
   TransportEventType,
   TransportEventCallback,
+  SendMessageOptions,
 } from './transport';
 
 export type {
