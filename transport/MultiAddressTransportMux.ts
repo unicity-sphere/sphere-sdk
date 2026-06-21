@@ -1872,10 +1872,12 @@ export class MultiAddressTransportMux {
       'Mux',
       `[#275] Mux dedup hydrated: ${this.processedEventIds.size} event IDs`,
     );
-    // [#559-diag] Promote post-hydration size to INFO so it appears in
-    // production CLI logs without DEBUG_LOG=1. Discriminator for #559:
-    //   hydrated=0 in §3 SET_STRATEGY → cross-process flush is failing
-    //     (OrbitDB Profile durability — see #234/#239/#266/#268 family)
+    // [#559-diag] Post-hydration size at INFO so it appears with
+    // SPHERE_DEBUG=Mux=info (default min-level is warn — quiet otherwise).
+    // Discriminator semantics for #559:
+    //   hydrated=0 across processes → cross-process persistence is failing
+    //     (OrbitDB Profile durability — see #234/#239/#266/#268 family).
+    //     Empirically ruled out for Node.js FileStorage in #559's verdict.
     //   hydrated=N>0 + no dedup-hit log → events arrive via a path that
     //     bypasses the Mux handleEvent gate (look at outer
     //     NostrTransportProvider.processedEventIds and fetchPendingEvents).
