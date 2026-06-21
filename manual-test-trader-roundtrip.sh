@@ -487,20 +487,35 @@ create_intent_with_shim() {
 wait_for_tenant_running() {
   local peer="$1" wallet="$2" instance="$3" tenant_nt="$4" log="$5" timeout_s="$6"
   local deadline=$(( $(date +%s) + timeout_s ))
+  local iter=0
   cd "$peer"
   sphere wallet use "$wallet"
+  # BUG FIX (2026-06-21): previous version used a pipeline
+  #   `sphere ... 2>&1 | tee "$log" | grep -qE '"balances"|balances'`
+  # which under `set -o pipefail` (set at the top of this script) ALWAYS
+  # returned non-zero because `grep -q` exits on the first match,
+  # triggering SIGPIPE upstream → tee/sphere die with rc=141 → pipefail
+  # surfaces 141 → the `if` evaluates false. Every probe iteration
+  # SUCCEEDED at the ACP level (the tenant responded with a valid
+  # `"balances": []` JSON payload) but the harness interpreted every
+  # response as a failure, then asserted FAIL at the 180s deadline.
+  # Rewriting to a temp-file pattern eliminates the SIGPIPE race.
+  : > "$log"  # truncate at start of loop
   while (( $(date +%s) < deadline )); do
-    if sphere trader portfolio --tenant "@$tenant_nt" --timeout 20000 \
-         2>&1 | tee "$log" \
-         | grep -qE '"balances"|balances'; then
-      echo "INFO: $instance accepted ACP probe (portfolio)"
+    iter=$(( iter + 1 ))
+    echo "===== probe iter #${iter} at $(date +%H:%M:%S) ($(date +%s)) =====" >> "$log"
+    local iter_out
+    iter_out=$(sphere trader portfolio --tenant "@$tenant_nt" --timeout 20000 2>&1) || true
+    printf '%s\n' "$iter_out" >> "$log"
+    if printf '%s' "$iter_out" | grep -qE '"balances"|balances'; then
+      echo "INFO: $instance accepted ACP probe (portfolio) at iter #${iter}"
       return 0
     fi
-    echo "  $instance ACP probe not ready yet — sleeping 5 s…"
+    echo "  $instance ACP probe not ready yet (iter #${iter}) — sleeping 5 s…"
     sleep 5
   done
-  echo "ASSERT FAIL (tenant-running): $instance did not pass ACP probe within ${timeout_s}s" >&2
-  tail -30 "$log" >&2 || true
+  echo "ASSERT FAIL (tenant-running): $instance did not pass ACP probe within ${timeout_s}s (iters=${iter})" >&2
+  tail -60 "$log" >&2 || true
   return 1
 }
 
