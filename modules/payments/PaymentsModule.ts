@@ -75,7 +75,7 @@ import { TokenRegistry } from '../../registry';
 import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
 import { sha256, bytesToHex, hexToBytes } from '../../core/crypto';
-import { sleep } from '../../core/utils';
+import { sleep, timeoutSignal } from '../../core/utils';
 import { decodeTokenBlob, encodeTokenBlob, unwrapTokenBlobBytes, TOKEN_BLOB_VERSION } from '../../token-engine/token-blob';
 import { parseInvoiceMemoForOnChain } from '../accounting/memo.js';
 
@@ -1703,7 +1703,7 @@ export class PaymentsModule {
             },
             // opIndex = position in the persisted intent's `direct` order — the
             // stable (transferId, opIndex) pairing resume replays (§8.1).
-            { signal: AbortSignal.timeout(SEND_ENGINE_OP_TIMEOUT_MS), transferId: result.id, opIndex },
+            { signal: timeoutSignal(SEND_ENGINE_OP_TIMEOUT_MS), transferId: result.id, opIndex },
           );
           // The source state is spent on-chain from here on.
           committedOnChainTokenIds.add(tw.uiToken.id);
@@ -1747,7 +1747,7 @@ export class PaymentsModule {
             // Same per-send seed; the split's opIndex follows the direct ops
             // (stable across resume — it is derived from the intent's order).
             {
-              signal: AbortSignal.timeout(SEND_ENGINE_OP_TIMEOUT_MS),
+              signal: timeoutSignal(SEND_ENGINE_OP_TIMEOUT_MS),
               transferId: result.id,
               opIndex: splitPlan.tokensToTransferDirectly.length,
             },
@@ -5196,7 +5196,7 @@ export class PaymentsModule {
       const finished = await engine.transfer(
         { token: source, recipientPubkey: recipientChainPubkey, data: memoData },
         // (transferId, opIndex) pairing replayed from the intent's persisted order (§8.1)
-        { signal: AbortSignal.timeout(SEND_ENGINE_OP_TIMEOUT_MS), transferId, opIndex }
+        { signal: timeoutSignal(SEND_ENGINE_OP_TIMEOUT_MS), transferId, opIndex }
       );
       await deliverBlob(bytesToHex(encodeTokenBlob(engine.encodeToken(finished))));
       spent.push(genesisId);
@@ -5225,7 +5225,7 @@ export class PaymentsModule {
           ],
         },
         // Split opIndex follows the direct ops — replayed from the intent's order (§8.1).
-        { signal: AbortSignal.timeout(SEND_ENGINE_OP_TIMEOUT_MS), transferId, opIndex: payload.direct.length }
+        { signal: timeoutSignal(SEND_ENGINE_OP_TIMEOUT_MS), transferId, opIndex: payload.direct.length }
       );
       changeOutput = outputs[1];
       // critical (#515 F2): own-storage custody — persist-or-stay-open; a

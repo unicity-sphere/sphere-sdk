@@ -202,3 +202,35 @@ export function randomUUID(): string {
   const nodeCrypto = require('crypto');
   return nodeCrypto.randomUUID();
 }
+
+// =============================================================================
+// Abort / Timeout Signals
+// =============================================================================
+
+/**
+ * Create an {@link AbortSignal} that aborts after `ms` milliseconds.
+ *
+ * Prefers the native `AbortSignal.timeout` (Chrome 103+, Firefox 100+,
+ * Safari 16+ / iOS 16+). Falls back to an `AbortController` + `setTimeout` on
+ * runtimes that lack it — older mobile Safari (iOS 15), older Android WebViews,
+ * and in-app/embedded browsers — which would otherwise throw
+ * `AbortSignal.timeout is not a function` the moment a timed fetch or engine
+ * op runs (sphere-sdk#617: Swap / Top Up crash). The native fast-path is kept
+ * for modern runtimes; the fallback aborts with a `TimeoutError` to match
+ * native semantics. Mirrors the feature-detect idiom used by
+ * {@link randomUUID} / {@link randomHex}.
+ */
+export function timeoutSignal(ms: number): AbortSignal {
+  if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+    return AbortSignal.timeout(ms);
+  }
+  const controller = new AbortController();
+  setTimeout(() => {
+    controller.abort(
+      typeof DOMException !== 'undefined'
+        ? new DOMException('The operation timed out.', 'TimeoutError')
+        : new Error('The operation timed out.'),
+    );
+  }, ms);
+  return controller.signal;
+}

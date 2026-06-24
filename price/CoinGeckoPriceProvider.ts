@@ -8,6 +8,7 @@
 
 import { logger } from '../core/logger';
 import { SphereError } from '../core/errors';
+import { timeoutSignal } from '../core/utils';
 import { STORAGE_KEYS_GLOBAL } from '../constants';
 import type { StorageProvider } from '../storage';
 import type { PriceProvider, PricePlatform, TokenPrice, PriceProviderConfig } from './price-provider';
@@ -168,7 +169,7 @@ export class CoinGeckoPriceProvider implements PriceProvider {
 
       const response = await fetch(url, {
         headers,
-        signal: AbortSignal.timeout(this.timeout),
+        signal: timeoutSignal(this.timeout),
       });
 
       if (!response.ok) {
